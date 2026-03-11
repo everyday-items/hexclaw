@@ -2,7 +2,7 @@
 
 **企业级安全的个人 AI Agent** — 安全 · 开源 · 自托管 · 易用 · 功能全面
 
-> 基于 [Hexagon 六边形战士](https://github.com/everyday-items/hexagon) AI Agent 框架构建
+> 基于 [Hexagon](https://github.com/everyday-items/hexagon) AI Agent 全能型框架构建
 
 ## 特性
 
@@ -42,17 +42,17 @@
 | 微信公众号 | XML 消息 + 被动/客服回复 | ✅ |
 | REST API | HTTP | ✅ |
 
-### 部署
-- **零配置启动** — 设置 API Key 即可运行，所有安全选项默认开启
-- **单二进制部署** — Go 编译，无依赖，容器友好
-- **桌面集成** — 系统通知、剪贴板、快捷键（macOS/Linux/Windows）
-
 ## 快速开始
 
 ### 安装
 
 ```bash
+# 从源码安装
 go install github.com/everyday-items/hexclaw/cmd/hexclaw@latest
+
+# 或使用预编译二进制（从 Releases 下载）
+curl -sSL https://github.com/everyday-items/hexclaw/releases/latest/download/hexclaw-$(uname -s)-$(uname -m).tar.gz | tar xz
+sudo mv hexclaw /usr/local/bin/
 ```
 
 ### 启动服务
@@ -96,6 +96,8 @@ hexclaw init
 # 使用自定义配置启动
 hexclaw serve --config ~/.hexclaw/hexclaw.yaml
 ```
+
+> 详细的安装和部署指南请参考 [docs/install.md](docs/install.md)
 
 ## 配置
 
@@ -215,42 +217,47 @@ storage:
 
 ```
 hexclaw/
-├── cmd/hexclaw/              # CLI 入口 (serve/init/security audit/skill)
-├── internal/
-│   ├── adapter/              # 平台适配器
-│   │   ├── web/              #   Web WebSocket
-│   │   ├── feishu/           #   飞书 Bot
-│   │   ├── telegram/         #   Telegram Bot
-│   │   ├── dingtalk/         #   钉钉 Bot
-│   │   ├── discord/          #   Discord Bot
-│   │   ├── slack/            #   Slack Bot
-│   │   ├── wecom/            #   企业微信
-│   │   └── wechat/           #   微信公众号
-│   ├── agents/               # Agent 角色 (6种预置角色)
-│   ├── api/                  # REST API 服务 (50+ 端点)
-│   ├── audit/                # 安全审计 (7类检查)
-│   ├── cache/                # 语义缓存
-│   ├── canvas/               # Canvas/A2UI (8种组件)
-│   ├── config/               # 配置管理
-│   ├── cron/                 # 定时任务
-│   ├── desktop/              # 桌面集成 (通知/剪贴板)
-│   ├── engine/               # Agent 引擎（ReAct）
-│   ├── gateway/              # 六层安全网关
-│   ├── heartbeat/            # 心跳巡查
-│   ├── knowledge/            # 知识库 (FTS5 + 向量混合检索)
-│   ├── llmrouter/            # LLM 智能路由
-│   ├── mcp/                  # MCP Client
-│   ├── memory/               # 文件记忆 (MEMORY.md + 日记)
-│   ├── router/               # 多 Agent 路由
-│   ├── session/              # 会话管理 + 上下文压缩
-│   ├── skill/                # Skill 系统
-│   │   ├── builtin/          #   内置 Skill
-│   │   ├── marketplace/      #   Markdown 技能市场
-│   │   └── sandbox/          #   沙箱执行
-│   ├── storage/              # 数据存储
-│   │   └── sqlite/           #   SQLite 驱动
-│   ├── voice/                # 语音交互 (STT/TTS)
-│   └── webhook/              # Webhook 接收
+├── hexclaw.go               # 根包（版本信息 + 包文档）
+├── cmd/hexclaw/             # CLI 入口 (serve/init/security audit/skill)
+├── adapter/                 # 平台适配器
+│   ├── web/                 #   Web WebSocket
+│   ├── feishu/              #   飞书 Bot
+│   ├── telegram/            #   Telegram Bot
+│   ├── dingtalk/            #   钉钉 Bot
+│   ├── discord/             #   Discord Bot
+│   ├── slack/               #   Slack Bot
+│   ├── wecom/               #   企业微信
+│   └── wechat/              #   微信公众号
+├── agents/                  # Agent 角色 (6 种预置角色)
+├── api/                     # REST API 服务 (50+ 端点)
+│   ├── server.go            #   核心服务器 + 聊天
+│   ├── handler_knowledge.go #   知识库 API
+│   ├── handler_webhook.go   #   Webhook API
+│   ├── handler_cron.go      #   定时任务 API
+│   └── handler_misc.go      #   记忆/MCP/技能/路由/Canvas/语音 API
+├── audit/                   # 安全审计 (7 类检查)
+├── cache/                   # LLM 响应语义缓存
+├── canvas/                  # Canvas/A2UI (8 种组件)
+├── config/                  # 配置管理 (YAML + 环境变量)
+├── cron/                    # 定时任务调度
+├── desktop/                 # 桌面集成 (通知/剪贴板)
+├── engine/                  # Agent 引擎（ReAct 推理循环）
+├── gateway/                 # 六层安全网关
+├── heartbeat/               # 心跳巡查
+├── knowledge/               # 知识库 (FTS5 + 向量混合检索)
+├── llmrouter/               # LLM 智能路由
+├── mcp/                     # MCP Client (stdio + SSE)
+├── memory/                  # 文件记忆 (MEMORY.md + 日记)
+├── router/                  # 多 Agent 路由
+├── session/                 # 会话管理 + 上下文压缩
+├── skill/                   # Skill 系统
+│   ├── builtin/             #   内置 Skill (搜索/天气/翻译/摘要)
+│   ├── marketplace/         #   Markdown 技能市场
+│   └── sandbox/             #   沙箱执行
+├── storage/                 # 数据存储
+│   └── sqlite/              #   SQLite 驱动
+├── voice/                   # 语音交互 (STT/TTS)
+├── webhook/                 # Webhook 接收
 ├── go.mod
 └── Makefile
 ```
@@ -272,8 +279,35 @@ hexclaw/
 | DELETE | `/api/v1/knowledge/documents/{id}` | 删除文档 |
 | POST | `/api/v1/knowledge/search` | 搜索 |
 
-### Cron / Webhook / 记忆 / MCP / 技能 / Agent 路由 / Canvas / 语音 / 桌面
-详见 `internal/api/server.go` 中的路由注册。
+### 定时任务
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/cron/jobs` | 任务列表 |
+| POST | `/api/v1/cron/jobs` | 添加任务 |
+| DELETE | `/api/v1/cron/jobs/{id}` | 删除任务 |
+| POST | `/api/v1/cron/jobs/{id}/pause` | 暂停任务 |
+| POST | `/api/v1/cron/jobs/{id}/resume` | 恢复任务 |
+
+### Webhook
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/v1/webhooks/{name}` | 接收 Webhook 事件 |
+| GET | `/api/v1/webhooks` | 列表 |
+| POST | `/api/v1/webhooks` | 注册 |
+| DELETE | `/api/v1/webhooks/{name}` | 删除 |
+
+### 其他端点
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET/POST | `/api/v1/memory` | 获取/保存记忆 |
+| GET | `/api/v1/memory/search` | 搜索记忆 |
+| GET | `/api/v1/mcp/tools` | MCP 工具列表 |
+| GET | `/api/v1/mcp/servers` | MCP Server 列表 |
+| GET | `/api/v1/skills` | 已安装技能 |
+| POST | `/api/v1/skills/install` | 安装技能 |
+| GET/POST/DELETE | `/api/v1/agents` | Agent 路由管理 |
+| GET | `/api/v1/canvas/panels` | Canvas 面板列表 |
+| GET | `/api/v1/voice/status` | 语音服务状态 |
 
 ## 开发
 
@@ -284,15 +318,19 @@ go build ./...
 # 运行测试
 go test ./...
 
+# 运行指定测试
+go test -run TestName ./package/
+
 # 代码检查
 go vet ./...
+golangci-lint run
 ```
 
 ## 技术栈
 
 | 组件 | 技术 |
 |------|------|
-| 语言 | Go 1.23+ |
+| 语言 | Go 1.25+ |
 | Agent 框架 | [Hexagon](https://github.com/everyday-items/hexagon) |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | 配置 | YAML + 环境变量 |
@@ -307,6 +345,6 @@ MIT License
 
 ## 致谢
 
-- [Hexagon](https://github.com/everyday-items/hexagon) — 六边形战士 AI Agent 框架
+- [Hexagon](https://github.com/everyday-items/hexagon) — AI Agent 全能型框架
 - [ai-core](https://github.com/everyday-items/ai-core) — AI 基础能力库
 - [toolkit](https://github.com/everyday-items/toolkit) — Go 通用工具库

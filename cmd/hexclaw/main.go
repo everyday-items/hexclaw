@@ -23,35 +23,35 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/everyday-items/hexclaw/internal/adapter"
-	"github.com/everyday-items/hexclaw/internal/adapter/dingtalk"
-	"github.com/everyday-items/hexclaw/internal/adapter/discord"
-	"github.com/everyday-items/hexclaw/internal/adapter/feishu"
-	"github.com/everyday-items/hexclaw/internal/adapter/slack"
-	"github.com/everyday-items/hexclaw/internal/adapter/telegram"
-	webadapter "github.com/everyday-items/hexclaw/internal/adapter/web"
-	"github.com/everyday-items/hexclaw/internal/adapter/wechat"
-	"github.com/everyday-items/hexclaw/internal/adapter/wecom"
-	"github.com/everyday-items/hexclaw/internal/api"
-	"github.com/everyday-items/hexclaw/internal/audit"
-	"github.com/everyday-items/hexclaw/internal/canvas"
-	"github.com/everyday-items/hexclaw/internal/config"
-	"github.com/everyday-items/hexclaw/internal/desktop"
-	"github.com/everyday-items/hexclaw/internal/cron"
-	"github.com/everyday-items/hexclaw/internal/engine"
-	"github.com/everyday-items/hexclaw/internal/gateway"
-	"github.com/everyday-items/hexclaw/internal/heartbeat"
-	"github.com/everyday-items/hexclaw/internal/knowledge"
-	"github.com/everyday-items/hexclaw/internal/llmrouter"
-	hexmcp "github.com/everyday-items/hexclaw/internal/mcp"
-	"github.com/everyday-items/hexclaw/internal/memory"
-	agentrouter "github.com/everyday-items/hexclaw/internal/router"
-	"github.com/everyday-items/hexclaw/internal/skill"
-	"github.com/everyday-items/hexclaw/internal/skill/builtin"
-	"github.com/everyday-items/hexclaw/internal/skill/marketplace"
-	sqlitestore "github.com/everyday-items/hexclaw/internal/storage/sqlite"
-	"github.com/everyday-items/hexclaw/internal/voice"
-	"github.com/everyday-items/hexclaw/internal/webhook"
+	"github.com/everyday-items/hexclaw/adapter"
+	"github.com/everyday-items/hexclaw/adapter/dingtalk"
+	"github.com/everyday-items/hexclaw/adapter/discord"
+	"github.com/everyday-items/hexclaw/adapter/feishu"
+	"github.com/everyday-items/hexclaw/adapter/slack"
+	"github.com/everyday-items/hexclaw/adapter/telegram"
+	webadapter "github.com/everyday-items/hexclaw/adapter/web"
+	"github.com/everyday-items/hexclaw/adapter/wechat"
+	"github.com/everyday-items/hexclaw/adapter/wecom"
+	"github.com/everyday-items/hexclaw/api"
+	"github.com/everyday-items/hexclaw/audit"
+	"github.com/everyday-items/hexclaw/canvas"
+	"github.com/everyday-items/hexclaw/config"
+	"github.com/everyday-items/hexclaw/desktop"
+	"github.com/everyday-items/hexclaw/cron"
+	"github.com/everyday-items/hexclaw/engine"
+	"github.com/everyday-items/hexclaw/gateway"
+	"github.com/everyday-items/hexclaw/heartbeat"
+	"github.com/everyday-items/hexclaw/knowledge"
+	"github.com/everyday-items/hexclaw/llmrouter"
+	hexmcp "github.com/everyday-items/hexclaw/mcp"
+	"github.com/everyday-items/hexclaw/memory"
+	agentrouter "github.com/everyday-items/hexclaw/router"
+	"github.com/everyday-items/hexclaw/skill"
+	"github.com/everyday-items/hexclaw/skill/builtin"
+	"github.com/everyday-items/hexclaw/skill/marketplace"
+	sqlitestore "github.com/everyday-items/hexclaw/storage/sqlite"
+	"github.com/everyday-items/hexclaw/voice"
+	"github.com/everyday-items/hexclaw/webhook"
 )
 
 // 版本信息，通过 -ldflags 注入
@@ -335,7 +335,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string) error
 	var fileMem *memory.FileMemory
 	if cfg.FileMemory.Enabled {
 		var err error
-		fileMem, err = memory.New(memory.Config{
+		fileMem, err = memory.New(memory.Options{
 			Enabled:   true,
 			Dir:       cfg.FileMemory.Dir,
 			MaxMemory: cfg.FileMemory.MaxMemory,
@@ -471,7 +471,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string) error
 	}
 
 	// 12. 初始化多 Agent 路由（Phase 5）
-	var agentRouter *agentrouter.Router
+	var agentRouter *agentrouter.Dispatcher
 	if cfg.Router.Enabled {
 		agentRouter = agentrouter.New()
 		srv.SetAgentRouter(agentRouter)
