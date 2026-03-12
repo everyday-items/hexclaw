@@ -283,6 +283,30 @@ type SecurityConfig struct {
 	ContentFilter      ContentFilterConfig   `yaml:"content_filter"`
 	Cost               CostConfig            `yaml:"cost"`
 	RateLimit          RateLimitConfig       `yaml:"rate_limit"`
+	RBAC               RBACConfig            `yaml:"rbac"`
+}
+
+// RBACConfig 角色权限控制配置
+//
+// 基于角色的访问控制，支持按用户绑定角色，按角色配置平台和工具权限。
+// 未匹配任何角色的用户回退到 guest 角色（如配置），无 guest 角色则放行。
+type RBACConfig struct {
+	Enabled bool         `yaml:"enabled"` // 是否启用 RBAC
+	Roles   []RoleConfig `yaml:"roles"`   // 角色定义列表
+}
+
+// RoleConfig 角色定义
+//
+// 每个角色可绑定多个用户 ID，并设置平台白名单、工具黑白名单等权限。
+// 角色匹配优先级：按用户 ID 精确匹配，未匹配则回退到 guest 角色。
+type RoleConfig struct {
+	Name       string   `yaml:"name"`        // 角色名称（如 admin, user, guest）
+	UserIDs    []string `yaml:"user_ids"`    // 绑定的用户 ID 列表
+	Platforms  []string `yaml:"platforms"`   // 允许的平台列表（空=全部允许）
+	AllowTools []string `yaml:"allow_tools"` // 允许使用的工具名称（空=全部允许）
+	DenyTools  []string `yaml:"deny_tools"`  // 禁止使用的工具名称
+	MaxTokens  int      `yaml:"max_tokens"`  // 单次最大 token 数（0=不限）
+	RateLimit  int      `yaml:"rate_limit"`  // 每分钟最大请求数（0=不限）
 }
 
 // AuthConfig 认证配置

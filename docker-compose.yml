@@ -1,0 +1,25 @@
+# HexClaw Docker Compose 部署
+#
+# 用法:
+#   docker compose up -d
+#
+# 环境变量:
+#   DEEPSEEK_API_KEY - DeepSeek API Key（必须）
+#   OPENAI_API_KEY   - OpenAI API Key（可选）
+
+services:
+  hexclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "6060:6060"
+    volumes:
+      - hexclaw-data:/data
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    restart: unless-stopped
+
+volumes:
+  hexclaw-data:

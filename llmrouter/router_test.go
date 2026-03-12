@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/everyday-items/hexagon"
 	"github.com/everyday-items/hexclaw/config"
 )
 
@@ -99,6 +100,177 @@ func TestRouter_Fallback(t *testing.T) {
 	_, _, err = r.Fallback("fallback")
 	if err != nil {
 		// primary 还在，所以不会报错
+	}
+}
+
+// newTestSelectorDirect 创建测试用的 Selector（直接构造，跳过 Provider 创建）
+//
+// 由于真实 Provider 需要 API Key，测试路由选择逻辑时使用 nil Provider 占位。
+func newTestSelectorDirect(providers []string, defaultP string, routing config.LLMRoutingConfig) *Selector {
+	s := &Selector{
+		providers: make(map[string]hexagon.Provider),
+		cfg: config.LLMConfig{
+			Default: defaultP,
+			Routing: routing,
+		},
+		defaultP: defaultP,
+	}
+	for _, name := range providers {
+		s.providers[name] = nil
+	}
+	return s
+}
+
+// TestRoute_DefaultStrategy 测试默认策略（路由未启用）返回默认 Provider
+func TestRoute_DefaultStrategy(t *testing.T) {
+	s := newTestSelectorDirect(
+		[]string{"openai", "deepseek"},
+		"openai",
+		config.LLMRoutingConfig{Enabled: false},
+	)
+
+	_, name, err := s.Route(context.Background())
+	if err != nil {
+		t.Fatalf("Route 返回错误: %v", err)
+	}
+	if name != "openai" {
+		t.Errorf("期望 openai，得到 %s", name)
+	}
+}
+
+// TestRoute_CostAware 测试 cost-aware 策略选择最低成本 Provider
+func TestRoute_CostAware(t *testing.T) {
+	s := newTestSelectorDirect(
+		[]string{"openai", "deepseek", "anthropic"},
+		"openai",
+		config.LLMRoutingConfig{Enabled: true, Strategy: "cost-aware"},
+	)
+
+	_, name, err := s.Route(context.Background())
+	if err != nil {
+		t.Fatalf("Route 返回错误: %v", err)
+	}
+	if name != "deepseek" {
+		t.Errorf("cost-aware 期望 deepseek，得到 %s", name)
+	}
+}
+
+// TestRoute_CostAwareWithOllama 测试有 ollama 时 cost-aware 选择 ollama
+func TestRoute_CostAwareWithOllama(t *testing.T) {
+	s := newTestSelectorDirect(
+		[]string{"openai", "deepseek", "ollama"},
+		"openai",
+		config.LLMRoutingConfig{Enabled: true, Strategy: "cost-aware"},
+	)
+
+	_, name, err := s.Route(context.Background())
+	if err != nil {
+		t.Fatalf("Route 返回错误: %v", err)
+	}
+	if name != "ollama" {
+		t.Errorf("cost-aware 期望 ollama，得到 %s", name)
+	}
+}
+
+// TestRoute_QualityFirst 测试 quality-first 策略选择最高质量 Provider
+func TestRoute_QualityFirst(t *testing.T) {
+	s := newTestSelectorDirect(
+		[]string{"openai", "deepseek", "anthropic"},
+		"deepseek",
+		config.LLMRoutingConfig{Enabled: true, Strategy: "quality-first"},
+	)
+
+	_, name, err := s.Route(context.Background())
+	if err != nil {
+		t.Fatalf("Route 返回错误: %v", err)
+	}
+	if name != "anthropic" {
+		t.Errorf("quality-first 期望 anthropic，得到 %s", name)
+	}
+}
+
+// TestRoute_QualityFirstWithoutAnthropic 测试没有 anthropic 时 quality-first 选择 openai
+func TestRoute_QualityFirstWithoutAnthropic(t *testing.T) {
+	s := newTestSelectorDirect(
+		[]string{"openai", "deepseek", "ollama"},
+		"deepseek",
+		config.LLMRoutingConfig{Enabled: true, Strategy: "quality-first"},
+	)
+
+	_, name, err := s.Route(context.Background())
+	if err != nil {
+		t.Fatalf("Route 返回错误: %v", err)
+	}
+	if name != "openai" {
+		t.Errorf("quality-first 期望 openai，得到 %s", name)
+	}
+}
+
+// TestRoute_LatencyFirst 测试 latency-first 策略选择最低延迟 Provider
+func TestRoute_LatencyFirst(t *testing.T) {
+	s := newTestSelectorDirect(
+		[]string{"openai", "deepseek", "anthropic"},
+		"anthropic",
+		config.LLMRoutingConfig{Enabled: true, Strategy: "latency-first"},
+	)
+
+	_, name, err := s.Route(context.Background())
+	if err != nil {
+		t.Fatalf("Route 返回错误: %v", err)
+	}
+	if name != "deepseek" {
+		t.Errorf("latency-first 期望 deepseek，得到 %s", name)
+	}
+}
+
+// TestRoute_UnknownStrategy 测试未知策略回退到默认 Provider
+func TestRoute_UnknownStrategy(t *testing.T) {
+	s := newTestSelectorDirect(
+		[]string{"openai", "deepseek"},
+		"openai",
+		config.LLMRoutingConfig{Enabled: true, Strategy: "random"},
+	)
+
+	_, name, err := s.Route(context.Background())
+	if err != nil {
+		t.Fatalf("Route 返回错误: %v", err)
+	}
+	if name != "openai" {
+		t.Errorf("未知策略期望回退到 openai，得到 %s", name)
+	}
+}
+
+// TestFallback_Excludes 测试 Fallback 排除指定 Provider
+func TestFallback_Excludes(t *testing.T) {
+	s := newTestSelectorDirect(
+		[]string{"openai", "deepseek"},
+		"openai",
+		config.LLMRoutingConfig{},
+	)
+
+	_, name, err := s.Fallback("openai")
+	if err != nil {
+		t.Fatalf("Fallback 返回错误: %v", err)
+	}
+	if name == "openai" {
+		t.Error("Fallback 不应返回被排除的 openai")
+	}
+	if name != "deepseek" {
+		t.Errorf("Fallback 期望 deepseek，得到 %s", name)
+	}
+}
+
+// TestFallback_NoAlternative 测试只有一个 Provider 时 Fallback 失败
+func TestFallback_NoAlternative(t *testing.T) {
+	s := newTestSelectorDirect(
+		[]string{"openai"},
+		"openai",
+		config.LLMRoutingConfig{},
+	)
+
+	_, _, err := s.Fallback("openai")
+	if err == nil {
+		t.Error("只有一个 Provider 时 Fallback 应返回错误")
 	}
 }
 

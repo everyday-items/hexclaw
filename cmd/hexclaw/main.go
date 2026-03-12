@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -102,6 +103,7 @@ func newServeCmd() *cobra.Command {
 		feishuAppID   string
 		feishuSecret  string
 		telegramToken string
+		desktopMode   bool
 	)
 
 	cmd := &cobra.Command{
@@ -112,9 +114,10 @@ func newServeCmd() *cobra.Command {
 示例:
   hexclaw serve
   hexclaw serve --config hexclaw.yaml
+  hexclaw serve --desktop
   hexclaw serve --feishu-app-id xxx --feishu-app-secret xxx`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runServe(configFile, feishuAppID, feishuSecret, telegramToken)
+			return runServe(configFile, feishuAppID, feishuSecret, telegramToken, desktopMode)
 		},
 	}
 
@@ -122,6 +125,7 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&feishuAppID, "feishu-app-id", "", "飞书 App ID")
 	cmd.Flags().StringVar(&feishuSecret, "feishu-app-secret", "", "飞书 App Secret")
 	cmd.Flags().StringVar(&telegramToken, "telegram-token", "", "Telegram Bot Token")
+	cmd.Flags().BoolVar(&desktopMode, "desktop", false, "桌面客户端模式（仅监听 localhost）")
 
 	return cmd
 }
@@ -179,11 +183,18 @@ func newSkillCmd() *cobra.Command {
 // runServe 启动服务主流程
 //
 // 初始化顺序：配置 → 存储 → LLM 路由 → Skill → 引擎 → HTTP 服务
-func runServe(configFile, feishuAppID, feishuSecret, telegramToken string) error {
+func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, desktopMode bool) error {
 	// 1. 加载配置
 	cfg, err := config.Load(configFile)
 	if err != nil {
 		return fmt.Errorf("加载配置失败: %w", err)
+	}
+
+	// 桌面客户端模式：仅监听 localhost，自动启用 WebSocket
+	if desktopMode {
+		cfg.Server.Host = "127.0.0.1"
+		cfg.Platforms.Web.Enabled = true
+		log.Println("桌面模式: 仅监听 localhost")
 	}
 
 	// 命令行参数覆盖配置文件
@@ -297,9 +308,21 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string) error
 			// 创建 Embedder（使用配置的 LLM Provider 生成向量）
 			var embedder knowledge.Embedder
 			if cfg.Knowledge.Embedding.Provider != "" {
-				// TODO: 根据配置创建对应的 Embedder
-				// 当前先使用 nil（退化为纯关键词搜索）
-				log.Printf("Embedding Provider: %s (待集成)", cfg.Knowledge.Embedding.Provider)
+				providerName := cfg.Knowledge.Embedding.Provider
+				if pc, ok := cfg.LLM.Providers[providerName]; ok && pc.APIKey != "" {
+					model := cfg.Knowledge.Embedding.Model
+					if model == "" {
+						model = "text-embedding-3-small"
+					}
+					var opts []knowledge.EmbedderOption
+					if pc.BaseURL != "" {
+						opts = append(opts, knowledge.WithBaseURL(pc.BaseURL))
+					}
+					embedder = knowledge.NewOpenAIEmbedder(pc.APIKey, model, opts...)
+					log.Printf("Embedding 已启用: provider=%s, model=%s", providerName, model)
+				} else {
+					log.Printf("Embedding Provider %q 未配置 API Key，退化为纯关键词搜索", providerName)
+				}
 			}
 
 			// 混合检索配置
@@ -489,10 +512,38 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string) error
 	// 14. 初始化语音服务（Phase 5）
 	var voiceSvc *voice.Service
 	if cfg.Voice.Enabled {
-		// TODO: 根据配置创建具体的 STT/TTS Provider
-		voiceSvc = voice.NewService(nil, nil)
+		var stt voice.STTProvider
+		var tts voice.TTSProvider
+
+		// 创建 STT Provider
+		// 从 provider 名称中提取 LLM provider 名用于获取 API Key
+		// 如 "openai-whisper" → "openai"
+		if cfg.Voice.STT.Provider != "" {
+			llmName := extractLLMName(cfg.Voice.STT.Provider)
+			if pc, ok := cfg.LLM.Providers[llmName]; ok && pc.APIKey != "" {
+				var sttOpts []voice.STTOption
+				if pc.BaseURL != "" {
+					sttOpts = append(sttOpts, voice.STTWithBaseURL(pc.BaseURL))
+				}
+				stt = voice.NewOpenAISTT(pc.APIKey, cfg.Voice.STT.Model, sttOpts...)
+			}
+		}
+
+		// 创建 TTS Provider
+		if cfg.Voice.TTS.Provider != "" {
+			llmName := extractLLMName(cfg.Voice.TTS.Provider)
+			if pc, ok := cfg.LLM.Providers[llmName]; ok && pc.APIKey != "" {
+				var ttsOpts []voice.TTSOption
+				if pc.BaseURL != "" {
+					ttsOpts = append(ttsOpts, voice.TTSWithBaseURL(pc.BaseURL))
+				}
+				tts = voice.NewOpenAITTS(pc.APIKey, "", ttsOpts...)
+			}
+		}
+
+		voiceSvc = voice.NewService(stt, tts)
 		srv.SetVoice(voiceSvc)
-		log.Printf("语音服务已启用 (STT: %s, TTS: %s)", cfg.Voice.STT.Provider, cfg.Voice.TTS.Provider)
+		log.Printf("语音服务已启用 (STT: %s, TTS: %s)", voiceSvc.STTName(), voiceSvc.TTSName())
 	}
 
 	// 15. 初始化桌面集成服务（Phase 6）
@@ -721,4 +772,19 @@ func (w *markdownSkillWrapper) Execute(ctx context.Context, args map[string]any)
 		Content:  result.Content,
 		Metadata: result.Metadata,
 	}, nil
+}
+
+// extractLLMName 从 Provider 名称中提取 LLM Provider 名
+//
+// 语音 Provider 名称通常包含 LLM 前缀（如 "openai-whisper"、"openai-tts"），
+// 需要提取 LLM 名称（如 "openai"）以从配置中查找对应的 API Key。
+//
+// 示例:
+//   - "openai-whisper" → "openai"
+//   - "openai-tts" → "openai"
+//   - "openai" → "openai"
+//   - "deepseek-stt" → "deepseek"
+func extractLLMName(providerName string) string {
+	parts := strings.SplitN(providerName, "-", 2)
+	return parts[0]
 }
