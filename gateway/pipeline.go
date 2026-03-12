@@ -54,8 +54,10 @@ func NewPipeline(cfg *config.SecurityConfig, store storage.Store) *Pipeline {
 		p.layers = append(p.layers, NewInputSafetyLayer(cfg))
 	}
 
-	// Layer 5: 权限校验（暂用占位，Week 5-6 后续完善）
-	// TODO: RBAC 集成
+	// Layer 5: 权限校验 (RBAC)
+	if cfg.RBAC.Enabled && len(cfg.RBAC.Roles) > 0 {
+		p.layers = append(p.layers, NewRBACLayer(cfg.RBAC))
+	}
 
 	// Layer 6: 审计记录（始终启用，记录所有请求）
 	p.layers = append(p.layers, NewAuditLayer())

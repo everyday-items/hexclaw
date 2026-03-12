@@ -16,11 +16,36 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 
 	"github.com/everyday-items/hexagon"
 	"github.com/everyday-items/hexclaw/config"
 )
+
+// costPriority 成本优先策略的 Provider 优先级（数字越小越优先）
+//
+// 优先选择低成本 Provider：本地模型 > 国产模型 > 国际大厂
+var costPriority = map[string]int{
+	"ollama": 1, "deepseek": 2, "qwen": 3, "ark": 4,
+	"gemini": 5, "openai": 6, "anthropic": 7,
+}
+
+// qualityPriority 质量优先策略的 Provider 优先级（数字越小越优先）
+//
+// 优先选择高质量 Provider：顶级模型 > 中端模型 > 本地模型
+var qualityPriority = map[string]int{
+	"anthropic": 1, "openai": 2, "gemini": 3,
+	"deepseek": 4, "qwen": 5, "ark": 6, "ollama": 7,
+}
+
+// latencyPriority 延迟优先策略的 Provider 优先级（数字越小越优先）
+//
+// 优先选择低延迟 Provider：本地模型 > 轻量 API > 重量级 API
+var latencyPriority = map[string]int{
+	"ollama": 1, "deepseek": 2, "openai": 3,
+	"gemini": 4, "qwen": 5, "ark": 6, "anthropic": 7,
+}
 
 // Selector LLM 智能路由选择器
 //
@@ -114,17 +139,80 @@ func (r *Selector) DefaultName() string {
 
 // Route 根据策略选择最优 Provider
 //
-// 当前实现：返回默认 Provider。
-// TODO: 实现 cost-aware / quality-first / latency-first 策略
+// 策略说明：
+//   - "default": 使用默认 Provider
+//   - "cost-aware": 优先选择低成本 Provider（DeepSeek > Qwen > Ollama > OpenAI > Claude）
+//   - "quality-first": 优先选择高质量 Provider（Claude > OpenAI > Gemini > DeepSeek > Qwen）
+//   - "latency-first": 优先选择低延迟 Provider（Ollama > DeepSeek > OpenAI > Claude）
 func (r *Selector) Route(_ context.Context) (hexagon.Provider, string, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	p, ok := r.providers[r.defaultP]
-	if !ok {
-		return nil, "", fmt.Errorf("默认 Provider %s 不可用", r.defaultP)
+	// 如果路由未启用或策略为空/default，直接返回默认 Provider
+	strategy := r.cfg.Routing.Strategy
+	if !r.cfg.Routing.Enabled || strategy == "" || strategy == "default" {
+		p, ok := r.providers[r.defaultP]
+		if !ok {
+			return nil, "", fmt.Errorf("默认 Provider %s 不可用", r.defaultP)
+		}
+		return p, r.defaultP, nil
 	}
-	return p, r.defaultP, nil
+
+	// 根据策略选择优先级映射
+	var priorities map[string]int
+	switch strategy {
+	case "cost-aware":
+		priorities = costPriority
+	case "quality-first":
+		priorities = qualityPriority
+	case "latency-first":
+		priorities = latencyPriority
+	default:
+		// 未知策略，回退到默认 Provider
+		log.Printf("未知路由策略 %q，使用默认 Provider", strategy)
+		p, ok := r.providers[r.defaultP]
+		if !ok {
+			return nil, "", fmt.Errorf("默认 Provider %s 不可用", r.defaultP)
+		}
+		return p, r.defaultP, nil
+	}
+
+	// 按优先级排序可用的 Provider
+	best := r.selectByPriority(priorities)
+	if best == "" {
+		return nil, "", fmt.Errorf("没有可用的 Provider (策略: %s)", strategy)
+	}
+	return r.providers[best], best, nil
+}
+
+// selectByPriority 根据优先级映射选择最优的已注册 Provider
+//
+// 遍历所有已加载的 Provider，按照优先级映射中的数值排序，返回优先级最高（数值最小）的 Provider 名称。
+// 未在映射中的 Provider 赋予最低优先级（999）。
+func (r *Selector) selectByPriority(priorities map[string]int) string {
+	type ranked struct {
+		name     string
+		priority int
+	}
+
+	var candidates []ranked
+	for name := range r.providers {
+		p, ok := priorities[name]
+		if !ok {
+			p = 999 // 未知 Provider 排到最后
+		}
+		candidates = append(candidates, ranked{name: name, priority: p})
+	}
+
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].priority < candidates[j].priority
+	})
+
+	return candidates[0].name
 }
 
 // Fallback 降级到备用 Provider
