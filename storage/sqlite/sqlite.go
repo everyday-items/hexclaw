@@ -167,6 +167,12 @@ func (s *Store) SaveMessage(ctx context.Context, msg *storage.MessageRecord) err
 	return err
 }
 
+// DeleteMessage 删除单条消息
+func (s *Store) DeleteMessage(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM messages WHERE id = ?`, id)
+	return err
+}
+
 // ListMessages 获取会话的消息历史
 func (s *Store) ListMessages(ctx context.Context, sessionID string, limit, offset int) ([]*storage.MessageRecord, error) {
 	rows, err := s.db.QueryContext(ctx,

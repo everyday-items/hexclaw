@@ -44,12 +44,13 @@ const (
 // Webhook 配置
 type Webhook struct {
 	ID          string      `json:"id"`
-	Name        string      `json:"name"`         // 名称（也是 URL 路径）
-	Type        WebhookType `json:"type"`         // 类型
-	Secret      string      `json:"secret"`       // 签名验证 Secret
-	Prompt      string      `json:"prompt"`       // Agent 处理指令
-	UserID      string      `json:"user_id"`      // 所属用户
-	Enabled     bool        `json:"enabled"`      // 是否启用
+	Name        string      `json:"name"`                  // 名称（也是 URL 路径）
+	Type        WebhookType `json:"type"`                  // 类型
+	Secret      string      `json:"-"`                     // 签名验证 Secret（JSON 序列化时隐藏）
+	HasSecret   bool        `json:"has_secret"`            // 是否配置了 Secret
+	Prompt      string      `json:"prompt"`                // Agent 处理指令
+	UserID      string      `json:"user_id"`               // 所属用户
+	Enabled     bool        `json:"enabled"`               // 是否启用
 	LastEventAt time.Time   `json:"last_event_at"`
 	EventCount  int         `json:"event_count"`
 	CreatedAt   time.Time   `json:"created_at"`
@@ -182,6 +183,7 @@ func (m *Manager) List(ctx context.Context, userID string) ([]*Webhook, error) {
 			return nil, err
 		}
 		wh.Enabled = enabled == 1
+		wh.HasSecret = wh.Secret != ""
 		if lastEvent.Valid {
 			wh.LastEventAt = lastEvent.Time
 		}
@@ -284,9 +286,9 @@ func (m *Manager) verifySignature(wh *Webhook, r *http.Request, body []byte) boo
 		return hmac.Equal([]byte(sig), []byte(expected))
 
 	case TypeGitLab:
-		// GitLab 使用 X-Gitlab-Token 头
+		// GitLab 使用 X-Gitlab-Token 头（使用常量时间比较防止 timing attack）
 		token := r.Header.Get("X-Gitlab-Token")
-		return token == wh.Secret
+		return hmac.Equal([]byte(token), []byte(wh.Secret))
 
 	default:
 		// 通用：X-Webhook-Signature 或 X-Signature
@@ -406,6 +408,7 @@ func (m *Manager) loadWebhooks(ctx context.Context) error {
 			return err
 		}
 		wh.Enabled = enabled == 1
+		wh.HasSecret = wh.Secret != ""
 		if lastEvent.Valid {
 			wh.LastEventAt = lastEvent.Time
 		}

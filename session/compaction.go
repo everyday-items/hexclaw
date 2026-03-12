@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/everyday-items/hexagon"
 
 	"github.com/everyday-items/hexclaw/storage"
+	"github.com/everyday-items/toolkit/util/idgen"
 )
 
 // CompactionConfig 上下文压缩配置
@@ -59,7 +61,9 @@ func NewCompactor(store storage.Store, cfg CompactionConfig) *Compactor {
 
 // NeedsCompaction 检查会话是否需要压缩
 func (c *Compactor) NeedsCompaction(ctx context.Context, sessionID string) (bool, error) {
-	msgs, err := c.store.ListMessages(ctx, sessionID, 0, 0)
+	// 使用 MaxMessages+1 作为 limit 来判断是否超过阈值，
+	// 避免 limit=0 时 SQLite LIMIT 0 返回空结果的问题
+	msgs, err := c.store.ListMessages(ctx, sessionID, c.config.MaxMessages+1, 0)
 	if err != nil {
 		return false, err
 	}
@@ -71,8 +75,8 @@ func (c *Compactor) NeedsCompaction(ctx context.Context, sessionID string) (bool
 // provider 用于调用 LLM 生成摘要。
 // 返回压缩后删除的消息数。
 func (c *Compactor) Compact(ctx context.Context, sessionID string, provider hexagon.Provider) (int, error) {
-	// 获取所有消息
-	msgs, err := c.store.ListMessages(ctx, sessionID, 0, 0)
+	// 获取所有消息（使用足够大的 limit）
+	msgs, err := c.store.ListMessages(ctx, sessionID, 100000, 0)
 	if err != nil {
 		return 0, fmt.Errorf("获取消息列表失败: %w", err)
 	}
@@ -99,16 +103,24 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, provider hexa
 	}
 
 	// 在事务中执行：删除旧消息 + 插入摘要
-	// 插入摘要消息（作为 system 角色）
-	// 注：旧消息的清理通过消息 ID 的排序自然实现——
-	// 查询时只取最近 N 条消息，旧消息自然被淘汰
-	summaryMsg := &storage.MessageRecord{
-		ID:        "summary-" + sessionID,
-		SessionID: sessionID,
-		Role:      "system",
-		Content:   "[上下文摘要] " + summary,
-	}
-	err = c.store.SaveMessage(ctx, summaryMsg)
+	err = c.store.WithTx(ctx, func(txStore storage.Store) error {
+		// 删除旧消息
+		for _, msg := range oldMsgs {
+			if err := txStore.DeleteMessage(ctx, msg.ID); err != nil {
+				return fmt.Errorf("删除旧消息失败: %w", err)
+			}
+		}
+
+		// 插入摘要消息（使用唯一 ID，避免多次压缩主键冲突）
+		summaryMsg := &storage.MessageRecord{
+			ID:        "summary-" + idgen.ShortID(),
+			SessionID: sessionID,
+			Role:      "system",
+			Content:   "[上下文摘要] " + summary,
+			CreatedAt: time.Now(),
+		}
+		return txStore.SaveMessage(ctx, summaryMsg)
+	})
 	if err != nil {
 		return 0, fmt.Errorf("保存压缩结果失败: %w", err)
 	}

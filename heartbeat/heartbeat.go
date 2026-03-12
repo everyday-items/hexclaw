@@ -264,10 +264,20 @@ func parseHourMinute(s string) (int, int) {
 	}
 	h, m := 0, 0
 	for _, c := range parts[0] {
+		if c < '0' || c > '9' {
+			return 0, 0 // 非数字字符，返回零值
+		}
 		h = h*10 + int(c-'0')
 	}
 	for _, c := range parts[1] {
+		if c < '0' || c > '9' {
+			return 0, 0 // 非数字字符，返回零值
+		}
 		m = m*10 + int(c-'0')
+	}
+	// 范围校验
+	if h > 23 || m > 59 {
+		return 0, 0
 	}
 	return h, m
 }

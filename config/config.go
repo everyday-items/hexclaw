@@ -311,9 +311,11 @@ type RoleConfig struct {
 
 // AuthConfig 认证配置
 type AuthConfig struct {
-	Enabled        bool   `yaml:"enabled"`
-	Method         string `yaml:"method"`          // token / oauth / api_key
-	AllowAnonymous bool   `yaml:"allow_anonymous"`
+	Enabled        bool     `yaml:"enabled"`
+	Method         string   `yaml:"method"`          // token / oauth / api_key
+	AllowAnonymous bool     `yaml:"allow_anonymous"`
+	Tokens         []string `yaml:"tokens"`           // 预配置的合法 Token 列表
+	Secret         string   `yaml:"secret"`           // HMAC-SHA256 签名密钥（用于签名 Token 验证）
 }
 
 // InjectionConfig Prompt 注入检测配置

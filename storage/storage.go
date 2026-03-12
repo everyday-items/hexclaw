@@ -80,6 +80,9 @@ type Store interface {
 	// SaveMessage 保存消息
 	SaveMessage(ctx context.Context, msg *MessageRecord) error
 
+	// DeleteMessage 删除单条消息
+	DeleteMessage(ctx context.Context, id string) error
+
 	// ListMessages 获取会话的消息历史（按创建时间正序）
 	ListMessages(ctx context.Context, sessionID string, limit, offset int) ([]*MessageRecord, error)
 

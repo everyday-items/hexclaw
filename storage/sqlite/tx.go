@@ -97,6 +97,11 @@ func (s *txStore) SaveMessage(ctx context.Context, msg *storage.MessageRecord) e
 	return err
 }
 
+func (s *txStore) DeleteMessage(ctx context.Context, id string) error {
+	_, err := s.tx.ExecContext(ctx, `DELETE FROM messages WHERE id = ?`, id)
+	return err
+}
+
 func (s *txStore) ListMessages(ctx context.Context, sessionID string, limit, offset int) ([]*storage.MessageRecord, error) {
 	rows, err := s.tx.QueryContext(ctx,
 		`SELECT id, session_id, role, content, metadata, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?`,

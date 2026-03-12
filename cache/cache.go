@@ -125,6 +125,18 @@ func (c *Cache) Put(input, response, provider, model string) {
 	// 淘汰过期和超量条目
 	c.evictLocked()
 
+	// 如果 key 已存在，只更新条目内容，不重复追加到 order 切片
+	if _, exists := c.entries[key]; exists {
+		c.entries[key] = &Entry{
+			Key:       key,
+			Response:  response,
+			Provider:  provider,
+			Model:     model,
+			CreatedAt: time.Now(),
+		}
+		return
+	}
+
 	c.entries[key] = &Entry{
 		Key:       key,
 		Response:  response,

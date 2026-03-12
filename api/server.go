@@ -300,9 +300,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 解析请求
+	// 解析请求（限制请求体大小为 1MB，防止 OOM 攻击）
+	const maxRequestBodySize = 1 << 20 // 1MB
 	var req ChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBodySize)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "请求格式错误: " + err.Error(),
 		})

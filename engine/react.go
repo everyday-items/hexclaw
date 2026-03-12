@@ -212,31 +212,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 
 	// 7. 创建 Agent（支持角色选择）
 	roleName := msg.Metadata["role"] // 从消息元数据中获取角色
-	var reactAgent hexagon.Agent
-
-	if roleName != "" {
-		// 使用指定角色创建 Agent
-		agent, roleErr := e.factory.CreateAgent(roleName, provider)
-		if roleErr != nil {
-			log.Printf("创建角色 Agent 失败: %v，降级到默认", roleErr)
-			reactAgent = hexagon.NewReActAgent(
-				hexagon.AgentWithName("hexclaw"),
-				hexagon.AgentWithLLM(provider),
-				hexagon.AgentWithSystemPrompt(systemPrompt),
-				hexagon.AgentWithMaxIterations(10),
-			)
-		} else {
-			reactAgent = agent
-		}
-	} else {
-		// 默认 Agent
-		reactAgent = hexagon.NewReActAgent(
-			hexagon.AgentWithName("hexclaw"),
-			hexagon.AgentWithLLM(provider),
-			hexagon.AgentWithSystemPrompt(systemPrompt),
-			hexagon.AgentWithMaxIterations(10),
-		)
-	}
+	reactAgent := e.createAgent(roleName, provider)
 
 	// 构建 Agent 输入
 	agentInput := hexagon.Input{
@@ -268,18 +244,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		}
 		log.Printf("Provider %s 失败，降级到 %s: %v", providerName, fbName, err)
 
-		// 使用备用 Provider 重建 Agent
-		if roleName != "" {
-			reactAgent, _ = e.factory.CreateAgent(roleName, fallbackP)
-		}
-		if reactAgent == nil {
-			reactAgent = hexagon.NewReActAgent(
-				hexagon.AgentWithName("hexclaw"),
-				hexagon.AgentWithLLM(fallbackP),
-				hexagon.AgentWithSystemPrompt(systemPrompt),
-				hexagon.AgentWithMaxIterations(10),
-			)
-		}
+		reactAgent = e.createAgent(roleName, fallbackP)
 		output, err = reactAgent.Run(ctx, agentInput)
 		if err != nil {
 			return nil, fmt.Errorf("Agent 执行失败（降级后）: %w", err)
@@ -292,8 +257,9 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		log.Printf("保存助手回复失败: %v", err)
 	}
 
-	// 8. 写入语义缓存
-	e.cache.Put(msg.Content, output.Content, providerName, e.cfg.LLM.Providers[providerName].Model)
+	// 8. 写入语义缓存（安全获取 model 名称，避免 map 访问空值）
+	modelName := e.getProviderModel(providerName)
+	e.cache.Put(msg.Content, output.Content, providerName, modelName)
 
 	// 9. 记录 Token 使用（用于成本控制）
 	if output.Usage.TotalTokens > 0 {
@@ -301,7 +267,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 			ID:        "cost-" + fmt.Sprintf("%d", time.Now().UnixNano()),
 			UserID:    msg.UserID,
 			Provider:  providerName,
-			Model:     e.cfg.LLM.Providers[providerName].Model,
+			Model:     modelName,
 			Tokens:    output.Usage.TotalTokens,
 			CreatedAt: time.Now(),
 		}
@@ -314,9 +280,35 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		Content: output.Content,
 		Metadata: map[string]string{
 			"provider": providerName,
-			"model":    e.cfg.LLM.Providers[providerName].Model,
+			"model":    modelName,
 		},
 	}, nil
+}
+
+// createAgent 创建 Agent 实例（消除重复代码）
+func (e *ReActEngine) createAgent(roleName string, provider hexagon.Provider) hexagon.Agent {
+	if roleName != "" {
+		agent, err := e.factory.CreateAgent(roleName, provider)
+		if err != nil {
+			log.Printf("创建角色 Agent 失败: %v，降级到默认", err)
+		} else {
+			return agent
+		}
+	}
+	return hexagon.NewReActAgent(
+		hexagon.AgentWithName("hexclaw"),
+		hexagon.AgentWithLLM(provider),
+		hexagon.AgentWithSystemPrompt(systemPrompt),
+		hexagon.AgentWithMaxIterations(10),
+	)
+}
+
+// getProviderModel 安全获取 Provider 的模型名称
+func (e *ReActEngine) getProviderModel(providerName string) string {
+	if pc, ok := e.cfg.LLM.Providers[providerName]; ok {
+		return pc.Model
+	}
+	return providerName // 回退到 Provider 名称本身
 }
 
 // ProcessStream 流式处理消息

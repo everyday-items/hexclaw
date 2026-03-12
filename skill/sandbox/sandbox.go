@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"strings"
 	"time"
 
@@ -129,13 +130,26 @@ func (s *Sandbox) Execute(ctx context.Context, sk skill.Skill, args map[string]a
 // isAllowedDomain 检查域名是否在白名单中
 //
 // 如果白名单为空，则允许所有域名。
+// 解析 URL 的 host 部分进行精确匹配，防止通过查询参数绕过白名单。
 func (s *Sandbox) isAllowedDomain(urlStr string) bool {
 	if len(s.cfg.Network.AllowedDomains) == 0 {
 		return true // 无限制
 	}
 
+	// 解析 URL 提取 host
+	parsed, err := url.Parse(urlStr)
+	if err != nil {
+		return false // 无法解析的 URL 一律拒绝
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" {
+		return false
+	}
+
 	for _, domain := range s.cfg.Network.AllowedDomains {
-		if strings.Contains(urlStr, domain) {
+		domain = strings.ToLower(domain)
+		// 精确匹配或子域名匹配（如 api.example.com 匹配 example.com）
+		if host == domain || strings.HasSuffix(host, "."+domain) {
 			return true
 		}
 	}

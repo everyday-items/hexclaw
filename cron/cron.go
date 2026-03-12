@@ -378,21 +378,23 @@ func (s *Scheduler) updateJobStatus(ctx context.Context, jobID string, status Jo
 func nextRunTime(schedule string, jobType JobType, from time.Time) (time.Time, error) {
 	schedule = strings.TrimSpace(schedule)
 
-	// 快捷方式
+	// 快捷方式（使用本地时区计算，而非 UTC）
 	switch schedule {
 	case "@daily":
-		next := from.Truncate(24 * time.Hour).Add(24 * time.Hour)
+		// 明天本地时间 00:00（使用 time.Date 避免 Truncate 的 UTC 问题）
+		next := time.Date(from.Year(), from.Month(), from.Day()+1, 0, 0, 0, 0, from.Location())
 		return next, nil
 	case "@hourly":
 		next := from.Truncate(time.Hour).Add(time.Hour)
 		return next, nil
 	case "@weekly":
-		// 下周一 00:00
+		// 下周一本地时间 00:00
 		daysUntilMonday := (8 - int(from.Weekday())) % 7
 		if daysUntilMonday == 0 {
 			daysUntilMonday = 7
 		}
-		next := from.Truncate(24 * time.Hour).Add(time.Duration(daysUntilMonday) * 24 * time.Hour)
+		today := time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, from.Location())
+		next := today.AddDate(0, 0, daysUntilMonday)
 		return next, nil
 	}
 

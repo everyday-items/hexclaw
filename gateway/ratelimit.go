@@ -61,6 +61,14 @@ func (l *RateLimitLayer) Check(_ context.Context, msg *adapter.Message) error {
 	w.minuteRequests = filterAfter(w.minuteRequests, minuteAgo)
 	w.hourRequests = filterAfter(w.hourRequests, hourAgo)
 
+	// 清理无活动用户的窗口，防止内存泄漏
+	if len(w.minuteRequests) == 0 && len(w.hourRequests) == 0 && ok {
+		delete(l.windows, userID)
+		// 重新创建当前用户的窗口以继续处理
+		w = &userWindow{}
+		l.windows[userID] = w
+	}
+
 	// 检查每分钟限制
 	if l.cfg.RequestsPerMinute > 0 && len(w.minuteRequests) >= l.cfg.RequestsPerMinute {
 		return &GatewayError{

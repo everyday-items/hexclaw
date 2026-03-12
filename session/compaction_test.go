@@ -35,8 +35,24 @@ func (s *mockStore) SaveMessage(_ context.Context, msg *storage.MessageRecord) e
 	return nil
 }
 
-func (s *mockStore) ListMessages(_ context.Context, sessionID string, _, _ int) ([]*storage.MessageRecord, error) {
-	return s.messages[sessionID], nil
+func (s *mockStore) DeleteMessage(_ context.Context, id string) error {
+	for sid, msgs := range s.messages {
+		for i, msg := range msgs {
+			if msg.ID == id {
+				s.messages[sid] = append(msgs[:i], msgs[i+1:]...)
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+func (s *mockStore) ListMessages(_ context.Context, sessionID string, limit, _ int) ([]*storage.MessageRecord, error) {
+	msgs := s.messages[sessionID]
+	if limit > 0 && limit < len(msgs) {
+		return msgs[:limit], nil
+	}
+	return msgs, nil
 }
 
 func (s *mockStore) SaveCost(_ context.Context, _ *storage.CostRecord) error  { return nil }

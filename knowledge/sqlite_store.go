@@ -288,6 +288,16 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int) ([
 		return nil, err
 	}
 
+	// 批量获取 chunk 完整信息（避免 N+1 查询）
+	chunkMap := make(map[string]*Chunk, len(raw))
+	if len(raw) > 0 {
+		ids := make([]string, len(raw))
+		for i, r := range raw {
+			ids[i] = r.chunkID
+		}
+		chunkMap = s.getChunksByIDs(ctx, ids)
+	}
+
 	// 归一化 BM25 分数到 0-1
 	scoreRange := maxScore - minScore
 	for _, r := range raw {
@@ -296,8 +306,7 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int) ([
 			normalizedScore = (r.score - minScore) / scoreRange
 		}
 
-		// 从 kb_chunks 获取完整信息
-		chunk := s.getChunkByID(ctx, r.chunkID)
+		chunk := chunkMap[r.chunkID]
 		if chunk == nil {
 			chunk = &Chunk{
 				ID:      r.chunkID,
@@ -366,19 +375,47 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 
 // getChunkByID 根据 ID 获取完整的 chunk 信息
 func (s *SQLiteStore) getChunkByID(ctx context.Context, chunkID string) *Chunk {
-	chunk := &Chunk{}
-	var embBlob []byte
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id, doc_id, content, chunk_index, embedding, created_at FROM kb_chunks WHERE id = ?`,
-		chunkID,
-	).Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &embBlob, &chunk.CreatedAt)
+	result := s.getChunksByIDs(ctx, []string{chunkID})
+	return result[chunkID]
+}
+
+// getChunksByIDs 批量获取 chunk 信息（避免 N+1 查询）
+func (s *SQLiteStore) getChunksByIDs(ctx context.Context, ids []string) map[string]*Chunk {
+	result := make(map[string]*Chunk, len(ids))
+	if len(ids) == 0 {
+		return result
+	}
+
+	// 构建 IN 查询
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	query := fmt.Sprintf(
+		`SELECT id, doc_id, content, chunk_index, embedding, created_at FROM kb_chunks WHERE id IN (%s)`,
+		strings.Join(placeholders, ","),
+	)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil
+		return result
 	}
-	if len(embBlob) > 0 {
-		chunk.Embedding = decodeFloat32Slice(embBlob)
+	defer rows.Close()
+
+	for rows.Next() {
+		chunk := &Chunk{}
+		var embBlob []byte
+		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &embBlob, &chunk.CreatedAt); err != nil {
+			continue
+		}
+		if len(embBlob) > 0 {
+			chunk.Embedding = decodeFloat32Slice(embBlob)
+		}
+		result[chunk.ID] = chunk
 	}
-	return chunk
+	return result
 }
 
 // --- 向量序列化/反序列化 ---
