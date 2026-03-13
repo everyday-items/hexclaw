@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    name: Build binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout hexagon
+        uses: actions/checkout@v4
+        with:
+          repository: everyday-items/hexagon
+          path: ../hexagon
+
+      - name: Checkout toolkit
+        uses: actions/checkout@v4
+        with:
+          repository: everyday-items/toolkit
+          path: ../toolkit
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: go.sum
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EXT=""
+          if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
+          CGO_ENABLED=0 go build \
+            -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" \
+            -o hexclaw${EXT} ./cmd/hexclaw/
+          tar czf hexclaw-${GOOS}-${GOARCH}.tar.gz hexclaw${EXT}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hexclaw-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: hexclaw-*.tar.gz
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: sha256sum hexclaw-*.tar.gz > checksums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            hexclaw-*.tar.gz
+            checksums.txt
+
+  docker:
+    name: Docker Image
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout hexagon
+        uses: actions/checkout@v4
+        with:
+          repository: everyday-items/hexagon
+          path: ../hexagon
+
+      - name: Checkout toolkit
+        uses: actions/checkout@v4
+        with:
+          repository: everyday-items/toolkit
+          path: ../toolkit
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/everyday-items/hexclaw
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
