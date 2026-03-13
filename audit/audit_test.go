@@ -272,7 +272,7 @@ func secureConfig() *config.Config {
 	return &config.Config{
 		Server: config.ServerConfig{
 			Host: "127.0.0.1",
-			Port: 6060,
+			Port: 16060,
 			Mode: "production",
 		},
 		LLM: config.LLMConfig{

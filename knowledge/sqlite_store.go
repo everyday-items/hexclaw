@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"math"
+	"sort"
 	"strings"
 )
 
@@ -110,10 +112,12 @@ func (s *SQLiteStore) AddDocument(ctx context.Context, doc *Document, chunks []*
 		}
 
 		// 同步到 FTS5 索引
-		tx.ExecContext(ctx,
+		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO kb_chunks_fts (content, chunk_id) VALUES (?, ?)`,
 			chunk.Content, chunk.ID,
-		)
+		); err != nil {
+			return fmt.Errorf("fts5 索引插入失败: %w", err)
+		}
 	}
 
 	return tx.Commit()
@@ -128,10 +132,12 @@ func (s *SQLiteStore) DeleteDocument(ctx context.Context, docID string) error {
 	defer tx.Rollback()
 
 	// 删除 FTS5 索引中的对应记录
-	tx.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM kb_chunks_fts WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE doc_id = ?)`,
 		docID,
-	)
+	); err != nil {
+		return fmt.Errorf("fts5 索引删除失败: %w", err)
+	}
 
 	// 删除 chunk 和文档
 	if _, err := tx.ExecContext(ctx, `DELETE FROM kb_chunks WHERE doc_id = ?`, docID); err != nil {
@@ -173,8 +179,9 @@ func (s *SQLiteStore) ListDocuments(ctx context.Context) ([]*Document, error) {
 // 对于个人知识库（通常 < 10万 chunk），这种全扫描方式
 // 性能完全够用（10万个 1536 维向量约需 ~100ms）。
 func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK int) ([]*SearchResult, error) {
+	// 只查询 id 和 embedding 进行评分，避免加载全部 content 到内存
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, doc_id, content, chunk_index, embedding, created_at FROM kb_chunks WHERE embedding IS NOT NULL`,
+		`SELECT id, doc_id, chunk_index, embedding FROM kb_chunks WHERE embedding IS NOT NULL`,
 	)
 	if err != nil {
 		return nil, err
@@ -183,46 +190,56 @@ func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK
 
 	// 计算所有 chunk 与查询向量的余弦相似度
 	type scored struct {
-		chunk *Chunk
-		sim   float64
+		id         string
+		docID      string
+		chunkIndex int
+		sim        float64
 	}
 	var all []scored
 
 	for rows.Next() {
-		chunk := &Chunk{}
+		var s scored
 		var embBlob []byte
-		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &embBlob, &chunk.CreatedAt); err != nil {
+		if err := rows.Scan(&s.id, &s.docID, &s.chunkIndex, &embBlob); err != nil {
 			return nil, err
 		}
 
 		if len(embBlob) > 0 {
-			chunk.Embedding = decodeFloat32Slice(embBlob)
-			sim := cosineSimilarity(queryVec, chunk.Embedding)
-			// 余弦相似度归一化到 0-1（原始范围 -1 到 1）
-			normalizedSim := (sim + 1) / 2
-			all = append(all, scored{chunk: chunk, sim: normalizedSim})
+			embedding := decodeFloat32Slice(embBlob)
+			sim := cosineSimilarity(queryVec, embedding)
+			s.sim = (sim + 1) / 2 // 归一化到 0-1
+			all = append(all, s)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	// 按相似度降序排序
-	for i := 1; i < len(all); i++ {
-		for j := i; j > 0 && all[j].sim > all[j-1].sim; j-- {
-			all[j], all[j-1] = all[j-1], all[j]
-		}
-	}
+	// O(n log n) 排序替代 O(n²) 插入排序
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].sim > all[j].sim
+	})
 
 	// 取 topK
 	if len(all) > topK {
 		all = all[:topK]
 	}
 
+	// 批量加载 topK 条完整 chunk（而不是全部）
+	ids := make([]string, len(all))
+	for i, s := range all {
+		ids[i] = s.id
+	}
+	chunkMap := s.getChunksByIDs(ctx, ids)
+
 	results := make([]*SearchResult, len(all))
 	for i, s := range all {
+		chunk := chunkMap[s.id]
+		if chunk == nil {
+			chunk = &Chunk{ID: s.id, DocID: s.docID, Index: s.chunkIndex}
+		}
 		results[i] = &SearchResult{
-			Chunk:       s.chunk,
+			Chunk:       chunk,
 			VectorScore: s.sim,
 		}
 	}
@@ -328,8 +345,10 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 	var conditions []string
 	var args []any
 	for _, kw := range keywords {
-		conditions = append(conditions, "content LIKE ?")
-		args = append(args, "%"+kw+"%")
+		conditions = append(conditions, "content LIKE ? ESCAPE '\\'")
+		// 转义 LIKE 通配符，防止注入
+		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(kw)
+		args = append(args, "%"+escaped+"%")
 	}
 
 	whereClause := strings.Join(conditions, " OR ")
@@ -373,12 +392,6 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 	return results, rows.Err()
 }
 
-// getChunkByID 根据 ID 获取完整的 chunk 信息
-func (s *SQLiteStore) getChunkByID(ctx context.Context, chunkID string) *Chunk {
-	result := s.getChunksByIDs(ctx, []string{chunkID})
-	return result[chunkID]
-}
-
 // getChunksByIDs 批量获取 chunk 信息（避免 N+1 查询）
 func (s *SQLiteStore) getChunksByIDs(ctx context.Context, ids []string) map[string]*Chunk {
 	result := make(map[string]*Chunk, len(ids))
@@ -414,6 +427,9 @@ func (s *SQLiteStore) getChunksByIDs(ctx context.Context, ids []string) map[stri
 			chunk.Embedding = decodeFloat32Slice(embBlob)
 		}
 		result[chunk.ID] = chunk
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("读取 chunks 时出错: %v", err)
 	}
 	return result
 }

@@ -92,7 +92,7 @@ func (a *DingtalkAdapter) Send(ctx context.Context, chatID string, reply *adapte
 		"robotCode": a.cfg.RobotCode,
 		"userIds":   []string{chatID},
 		"msgKey":    "sampleText",
-		"msgParam":  fmt.Sprintf(`{"content":"%s"}`, escapeJSON(reply.Content)),
+		"msgParam":  marshalTextContent(reply.Content),
 	})
 
 	url := apiBase + "/v1.0/robot/oToMessages/batchSend"
@@ -256,7 +256,7 @@ func (a *DingtalkAdapter) verifySign(timestamp, sign string) bool {
 	h := hmac.New(sha256.New, []byte(a.cfg.AppSecret))
 	h.Write([]byte(stringToSign))
 	expected := base64.StdEncoding.EncodeToString(h.Sum(nil))
-	return expected == sign
+	return hmac.Equal([]byte(expected), []byte(sign))
 }
 
 // dtEvent 钉钉消息事件
@@ -271,10 +271,8 @@ type dtEvent struct {
 	MsgType string `json:"msgtype"`
 }
 
-// escapeJSON 转义 JSON 字符串
-func escapeJSON(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	s = strings.ReplaceAll(s, "\n", `\n`)
-	return s
+// marshalTextContent 安全地序列化文本消息内容为 JSON 字符串
+func marshalTextContent(text string) string {
+	b, _ := json.Marshal(map[string]string{"content": text})
+	return string(b)
 }

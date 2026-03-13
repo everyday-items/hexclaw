@@ -54,21 +54,27 @@ func TestFeishuAdapter_InvalidToken(t *testing.T) {
 	}
 }
 
-// TestEscapeJSON 测试 JSON 转义
-func TestEscapeJSON(t *testing.T) {
+// TestMarshalTextContent 测试安全 JSON 序列化
+func TestMarshalTextContent(t *testing.T) {
 	tests := []struct {
-		input    string
-		expected string
+		input string
 	}{
-		{`hello`, `hello`},
-		{`he"llo`, `he\"llo`},
-		{"line1\nline2", `line1\nline2`},
+		{`hello`},
+		{`he"llo`},
+		{"line1\nline2"},
+		{"含\x00null字节"},
+		{"含\b退格符"},
 	}
 
 	for _, tt := range tests {
-		result := escapeJSON(tt.input)
-		if result != tt.expected {
-			t.Errorf("escapeJSON(%q) = %q, 期望 %q", tt.input, result, tt.expected)
+		result := marshalTextContent(tt.input)
+		// 结果必须是合法 JSON
+		var parsed map[string]string
+		if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+			t.Errorf("marshalTextContent(%q) 产生非法 JSON: %s, err: %v", tt.input, result, err)
+		}
+		if parsed["text"] != tt.input {
+			t.Errorf("marshalTextContent(%q) 反序列化后不匹配: %q", tt.input, parsed["text"])
 		}
 	}
 }

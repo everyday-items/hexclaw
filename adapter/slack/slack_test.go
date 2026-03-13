@@ -1,12 +1,15 @@
 package slack
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/everyday-items/hexclaw/adapter"
 	"github.com/everyday-items/hexclaw/config"
@@ -29,7 +32,7 @@ func TestNew(t *testing.T) {
 // TestStart_EmptyToken 测试空 Token
 func TestStart_EmptyToken(t *testing.T) {
 	a := New(config.SlackConfig{})
-	err := a.Start(nil, nil)
+	err := a.Start(context.TODO(), nil)
 	if err == nil {
 		t.Error("空 Token 应返回错误")
 	}
@@ -38,7 +41,7 @@ func TestStart_EmptyToken(t *testing.T) {
 // TestStop_NotStarted 测试未启动时停止
 func TestStop_NotStarted(t *testing.T) {
 	a := New(config.SlackConfig{Token: "test"})
-	if err := a.Stop(nil); err != nil {
+	if err := a.Stop(context.TODO()); err != nil {
 		t.Errorf("未启动时停止应无错: %v", err)
 	}
 }
@@ -48,7 +51,7 @@ func TestVerifySignature(t *testing.T) {
 	secret := "test-signing-secret-12345"
 	a := New(config.SlackConfig{SigningSecret: secret})
 
-	timestamp := "1234567890"
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 	body := []byte(`{"type":"event_callback"}`)
 
 	// 计算正确的签名

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -100,7 +101,7 @@ func (s *Sandbox) Execute(ctx context.Context, sk skill.Skill, args map[string]a
 			if r := recover(); r != nil {
 				log.Printf("沙箱: Skill %q panic 已恢复: %v", sk.Name(), r)
 				ch <- execResult{
-					err:       fmt.Errorf("Skill 执行异常: %v", r),
+					err:       fmt.Errorf("skill 执行异常: %v", r),
 					recovered: true,
 				}
 			}
@@ -122,7 +123,7 @@ func (s *Sandbox) Execute(ctx context.Context, sk skill.Skill, args map[string]a
 	case <-ctx.Done():
 		return &Result{
 			Duration: time.Since(start),
-			Error:    fmt.Errorf("Skill %q 执行超时（限制 %v）", sk.Name(), s.timeout),
+			Error:    fmt.Errorf("skill %q 执行超时（限制 %v）", sk.Name(), s.timeout),
 		}
 	}
 }
@@ -164,8 +165,10 @@ func (s *Sandbox) isAllowedPath(path string) bool {
 		return true // 无限制
 	}
 
+	cleanPath := filepath.Clean(path)
 	for _, allowed := range s.cfg.Filesystem.AllowedPaths {
-		if strings.HasPrefix(path, allowed) {
+		cleanAllowed := filepath.Clean(allowed)
+		if cleanPath == cleanAllowed || strings.HasPrefix(cleanPath, cleanAllowed+string(filepath.Separator)) {
 			return true
 		}
 	}

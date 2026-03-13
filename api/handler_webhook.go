@@ -43,7 +43,7 @@ type RegisterWebhookRequest struct {
 // handleRegisterWebhook 注册新 Webhook
 func (s *Server) handleRegisterWebhook(w http.ResponseWriter, r *http.Request) {
 	var req RegisterWebhookRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "请求格式错误: " + err.Error(),
 		})

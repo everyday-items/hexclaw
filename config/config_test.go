@@ -13,8 +13,8 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Server.Host != "127.0.0.1" {
 		t.Errorf("期望 Host=127.0.0.1，得到 %s", cfg.Server.Host)
 	}
-	if cfg.Server.Port != 6060 {
-		t.Errorf("期望 Port=6060，得到 %d", cfg.Server.Port)
+	if cfg.Server.Port != 16060 {
+		t.Errorf("期望 Port=16060，得到 %d", cfg.Server.Port)
 	}
 
 	// 安全默认值：全部开启
@@ -83,8 +83,8 @@ func TestLoadNonExistentFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("不应返回错误: %v", err)
 	}
-	if cfg.Server.Port != 6060 {
-		t.Errorf("应返回默认端口 6060，得到 %d", cfg.Server.Port)
+	if cfg.Server.Port != 16060 {
+		t.Errorf("应返回默认端口 16060，得到 %d", cfg.Server.Port)
 	}
 }
 

@@ -147,12 +147,19 @@ func (s *Store) DeleteSession(ctx context.Context, id string) error {
 	return tx.Commit()
 }
 
-// SaveMessage 保存消息
+// SaveMessage 保存消息（事务保证原子性）
 func (s *Store) SaveMessage(ctx context.Context, msg *storage.MessageRecord) error {
 	if msg.CreatedAt.IsZero() {
 		msg.CreatedAt = time.Now()
 	}
-	_, err := s.db.ExecContext(ctx,
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO messages (id, session_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
 		msg.ID, msg.SessionID, msg.Role, msg.Content, msg.Metadata, msg.CreatedAt,
 	)
@@ -161,10 +168,14 @@ func (s *Store) SaveMessage(ctx context.Context, msg *storage.MessageRecord) err
 	}
 
 	// 更新会话的 updated_at
-	_, err = s.db.ExecContext(ctx,
+	_, err = tx.ExecContext(ctx,
 		`UPDATE sessions SET updated_at = ? WHERE id = ?`, time.Now(), msg.SessionID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 // DeleteMessage 删除单条消息
@@ -176,7 +187,9 @@ func (s *Store) DeleteMessage(ctx context.Context, id string) error {
 // ListMessages 获取会话的消息历史
 func (s *Store) ListMessages(ctx context.Context, sessionID string, limit, offset int) ([]*storage.MessageRecord, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, session_id, role, content, metadata, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?`,
+		`SELECT id, session_id, role, content, metadata, created_at FROM (
+			SELECT id, session_id, role, content, metadata, created_at FROM messages WHERE session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?
+		) ORDER BY created_at ASC`,
 		sessionID, limit, offset,
 	)
 	if err != nil {

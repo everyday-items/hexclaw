@@ -24,6 +24,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/everyday-items/hexclaw/adapter"
 	"github.com/everyday-items/hexclaw/config"
@@ -51,8 +52,9 @@ type DiscordAdapter struct {
 	mu          sync.Mutex       // 保护 conn
 	sessionID   string           // Gateway 会话 ID（用于恢复连接）
 	seq         atomic.Int64     // 最新序列号
-	stopped     atomic.Bool      // 是否已停止
-	heartbeatCh chan struct{}     // 心跳停止信号
+	stopped       atomic.Bool      // 是否已停止
+	heartbeatCh   chan struct{}     // 心跳停止信号
+	heartbeatStop chan struct{}     // 当前连接的心跳停止信号
 }
 
 // New 创建 Discord 适配器
@@ -76,7 +78,7 @@ func (a *DiscordAdapter) Start(_ context.Context, handler adapter.MessageHandler
 	a.stopped.Store(false)
 
 	if a.cfg.Token == "" {
-		return fmt.Errorf("Discord Bot Token 不能为空")
+		return fmt.Errorf("discord bot token 不能为空")
 	}
 
 	go a.connectLoop()
@@ -162,7 +164,7 @@ func (a *DiscordAdapter) connect() error {
 
 	conn, _, err := dialer.Dial(gatewayURL, nil)
 	if err != nil {
-		return fmt.Errorf("WebSocket 连接失败: %w", err)
+		return fmt.Errorf("webSocket 连接失败: %w", err)
 	}
 
 	a.mu.Lock()
@@ -203,8 +205,15 @@ func (a *DiscordAdapter) connect() error {
 		return fmt.Errorf("发送 Identify 失败: %w", err)
 	}
 
-	// 启动心跳
-	go a.heartbeat(conn, heartbeatInterval)
+	// 停止旧心跳并启动新心跳
+	a.mu.Lock()
+	if a.heartbeatStop != nil {
+		close(a.heartbeatStop)
+	}
+	a.heartbeatStop = make(chan struct{})
+	stopCh := a.heartbeatStop
+	a.mu.Unlock()
+	go a.heartbeat(conn, heartbeatInterval, stopCh)
 
 	// 读取事件循环
 	for !a.stopped.Load() {
@@ -238,7 +247,7 @@ func (a *DiscordAdapter) sendIdentify(conn *websocket.Conn) error {
 }
 
 // heartbeat 定期发送心跳
-func (a *DiscordAdapter) heartbeat(conn *websocket.Conn, interval time.Duration) {
+func (a *DiscordAdapter) heartbeat(conn *websocket.Conn, interval time.Duration, stopCh <-chan struct{}) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -255,6 +264,8 @@ func (a *DiscordAdapter) heartbeat(conn *websocket.Conn, interval time.Duration)
 				return
 			}
 		case <-a.heartbeatCh:
+			return
+		case <-stopCh:
 			return
 		}
 	}
@@ -361,8 +372,9 @@ func (a *DiscordAdapter) createMessage(ctx context.Context, channelID, content s
 	url := fmt.Sprintf("%s/channels/%s/messages", apiBase, channelID)
 
 	// Discord 消息最大 2000 字符，超长时分段发送
-	if len(content) > 2000 {
-		content = content[:1997] + "..."
+	if utf8.RuneCountInString(content) > 2000 {
+		runes := []rune(content)
+		content = string(runes[:1997]) + "..."
 	}
 
 	body := map[string]string{"content": content}
@@ -383,13 +395,15 @@ func (a *DiscordAdapter) createMessage(ctx context.Context, channelID, content s
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("Discord API 错误 (%d): %s", resp.StatusCode, string(respBody))
+		return "", fmt.Errorf("discord API 错误 (%d): %s", resp.StatusCode, string(respBody))
 	}
 
 	var result struct {
 		ID string `json:"id"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("解析 Discord 响应失败: %w", err)
+	}
 	return result.ID, nil
 }
 
@@ -397,8 +411,9 @@ func (a *DiscordAdapter) createMessage(ctx context.Context, channelID, content s
 func (a *DiscordAdapter) editMessage(ctx context.Context, channelID, messageID, content string) error {
 	url := fmt.Sprintf("%s/channels/%s/messages/%s", apiBase, channelID, messageID)
 
-	if len(content) > 2000 {
-		content = content[:1997] + "..."
+	if utf8.RuneCountInString(content) > 2000 {
+		runes := []rune(content)
+		content = string(runes[:1997]) + "..."
 	}
 
 	body := map[string]string{"content": content}

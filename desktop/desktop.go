@@ -23,6 +23,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/everyday-items/toolkit/util/idgen"
 )
 
 // NotificationType 通知类型
@@ -86,7 +88,7 @@ func (s *Service) SetNotifyCallback(fn func(n Notification)) {
 // 将通知添加到队列，同时触发回调（如果设置）。
 func (s *Service) Notify(title, body string, notifyType NotificationType) {
 	n := Notification{
-		ID:        fmt.Sprintf("notif-%d", time.Now().UnixNano()),
+		ID:        "notif-" + idgen.ShortID(),
 		Title:     title,
 		Body:      body,
 		Type:      notifyType,
@@ -294,7 +296,10 @@ func sendSystemNotification(title, body string) {
 
 	switch runtime.GOOS {
 	case "darwin":
-		script := fmt.Sprintf(`display notification "%s" with title "%s"`, body, title)
+		// 转义 AppleScript 双引号和反斜杠，防止命令注入
+		safeBody := strings.ReplaceAll(strings.ReplaceAll(body, `\`, `\\`), `"`, `\"`)
+		safeTitle := strings.ReplaceAll(strings.ReplaceAll(title, `\`, `\\`), `"`, `\"`)
+		script := fmt.Sprintf(`display notification "%s" with title "%s"`, safeBody, safeTitle)
 		cmd = exec.Command("osascript", "-e", script)
 	case "linux":
 		cmd = exec.Command("notify-send", title, body)
@@ -304,5 +309,7 @@ func sendSystemNotification(title, body string) {
 
 	if err := cmd.Start(); err != nil {
 		log.Printf("发送系统通知失败: %v", err)
+		return
 	}
+	go cmd.Wait()
 }

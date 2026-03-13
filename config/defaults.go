@@ -8,7 +8,7 @@ func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
 			Host: "127.0.0.1",
-			Port: 6060,
+			Port: 16060,
 			Mode: "production",
 		},
 		LLM: LLMConfig{
@@ -70,6 +70,7 @@ func DefaultConfig() *Config {
 				Weather:   true,
 				Translate: true,
 				Summary:   true,
+				Browser:   true,
 				Code:      false, // 高风险，默认关闭
 				Shell:     false, // 高风险，默认关闭
 			},

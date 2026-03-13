@@ -537,7 +537,7 @@ func TestGetUpdatesURLFormat(t *testing.T) {
 	var capturedURL string
 
 	a := newTestAdapter()
-	a.offset = 42
+	a.offset.Store(42)
 	a.client = &http.Client{
 		Transport: &mockTransport{
 			handler: func(req *http.Request) (*http.Response, error) {

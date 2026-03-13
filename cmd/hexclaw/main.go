@@ -227,12 +227,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 	log.Println("存储已初始化: SQLite")
 
-	// 3. 初始化 LLM 路由
+	// 3. 初始化 LLM 路由（允许无 Provider 降级运行）
 	router, err := llmrouter.New(cfg.LLM)
 	if err != nil {
-		return fmt.Errorf("初始化 LLM 路由失败: %w", err)
+		log.Printf("LLM 路由初始化跳过: %v（请在设置中配置 API Key）", err)
+	} else {
+		fmt.Printf("  LLM Providers: %v\n", router.Providers())
 	}
-	fmt.Printf("  LLM Providers: %v\n", router.Providers())
 
 	// 4. 初始化 Skill 注册中心
 	skills := skill.NewRegistry()
@@ -271,7 +272,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		var mcpConfigs []hexmcp.ServerConfig
 		for _, s := range cfg.MCP.Servers {
 			enabled := s.Enabled
-			if !enabled && s.Command != "" || s.Endpoint != "" {
+			if !enabled && (s.Command != "" || s.Endpoint != "") {
 				enabled = true // 兼容未显式设置 enabled 的配置
 			}
 			mcpConfigs = append(mcpConfigs, hexmcp.ServerConfig{
@@ -406,7 +407,6 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				})
 				return err
 			})
-			defer scheduler.Stop()
 			log.Println("定时任务调度器已启动")
 		}
 	}
@@ -437,6 +437,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 
 	// 11. 初始化心跳巡查
+	var hb *heartbeat.Heartbeat
 	if cfg.Heartbeat.Enabled {
 		intervalMins := cfg.Heartbeat.IntervalMins
 		if intervalMins <= 0 {
@@ -454,7 +455,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			},
 		}
 
-		hb := heartbeat.New(hbCfg)
+		hb = heartbeat.New(hbCfg)
 		executor := func(ctx context.Context, instructions string) (string, error) {
 			reply, err := eng.Process(ctx, &adapter.Message{
 				Platform: adapter.PlatformAPI,
@@ -473,7 +474,6 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			return nil
 		}
 		hb.Start(ctx, executor, notifier)
-		defer hb.Stop()
 		log.Printf("心跳巡查已启动（间隔 %d 分钟）", intervalMins)
 	}
 
@@ -683,18 +683,27 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		}
 	}
 
-	// 优雅关闭
-	shutdownCtx := context.Background()
+	// 优雅关闭（30 秒超时，防止永久阻塞）
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	// 先停止心跳和定时任务，再关闭 HTTP 服务
+	if hb != nil {
+		hb.Stop()
+	}
+	if scheduler != nil {
+		scheduler.Stop()
+	}
+
+	if err := srv.Stop(shutdownCtx); err != nil {
+		log.Printf("关闭服务器出错: %v", err)
+	}
 
 	// 关闭平台适配器
 	for _, a := range adapters {
 		if err := a.Stop(shutdownCtx); err != nil {
 			log.Printf("关闭 %s 适配器出错: %v", a.Name(), err)
 		}
-	}
-
-	if err := srv.Stop(shutdownCtx); err != nil {
-		log.Printf("关闭服务器出错: %v", err)
 	}
 
 	log.Println("HexClaw 已停止")

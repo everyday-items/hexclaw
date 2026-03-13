@@ -17,6 +17,7 @@ import (
 	"github.com/everyday-items/hexclaw/session"
 	"github.com/everyday-items/hexclaw/skill"
 	"github.com/everyday-items/hexclaw/storage"
+	"github.com/everyday-items/toolkit/util/idgen"
 )
 
 // ReActEngine 基于 Hexagon ReAct Agent 的引擎实现
@@ -83,11 +84,15 @@ func NewReActEngine(
 // 设置后，引擎在处理消息时会自动检索知识库，
 // 将相关内容作为上下文注入 Agent。
 func (e *ReActEngine) SetKnowledgeBase(kb *knowledge.Manager) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.kb = kb
 }
 
 // KnowledgeBase 获取知识库管理器
 func (e *ReActEngine) KnowledgeBase() *knowledge.Manager {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.kb
 }
 
@@ -155,7 +160,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 			"user_id": msg.UserID,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("Skill %s 执行失败: %w", matched.Name(), err)
+			return nil, fmt.Errorf("skill %s 执行失败: %w", matched.Name(), err)
 		}
 
 		// 保存助手回复
@@ -207,7 +212,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	// 6. 获取 LLM Provider
 	provider, providerName, err := e.router.Route(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("LLM 路由失败: %w", err)
+		return nil, fmt.Errorf("llm 路由失败: %w", err)
 	}
 
 	// 7. 创建 Agent（支持角色选择）
@@ -240,14 +245,14 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		// 尝试降级到备用 Provider
 		fallbackP, fbName, fbErr := e.router.Fallback(providerName)
 		if fbErr != nil {
-			return nil, fmt.Errorf("Agent 执行失败且无可用备用: %w", err)
+			return nil, fmt.Errorf("agent 执行失败且无可用备用: %w", err)
 		}
 		log.Printf("Provider %s 失败，降级到 %s: %v", providerName, fbName, err)
 
 		reactAgent = e.createAgent(roleName, fallbackP)
 		output, err = reactAgent.Run(ctx, agentInput)
 		if err != nil {
-			return nil, fmt.Errorf("Agent 执行失败（降级后）: %w", err)
+			return nil, fmt.Errorf("agent 执行失败（降级后）: %w", err)
 		}
 		providerName = fbName
 	}
@@ -264,7 +269,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	// 9. 记录 Token 使用（用于成本控制）
 	if output.Usage.TotalTokens > 0 {
 		costRecord := &storage.CostRecord{
-			ID:        "cost-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+			ID:        "cost-" + idgen.ShortID(),
 			UserID:    msg.UserID,
 			Provider:  providerName,
 			Model:     modelName,

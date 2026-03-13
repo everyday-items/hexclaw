@@ -83,37 +83,31 @@ func (c *Cache) Get(input string) (string, bool) {
 
 	key := hashInput(input)
 
-	c.mu.RLock()
-	entry, ok := c.entries[key]
-	c.mu.RUnlock()
+	// 单次加写锁完成全部操作，避免 RLock→Unlock→Lock 之间的 TOCTOU 竞态
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
+	entry, ok := c.entries[key]
 	if !ok {
-		c.mu.Lock()
 		c.misses++
-		c.mu.Unlock()
 		return "", false
 	}
 
 	// 检查是否过期
 	if time.Since(entry.CreatedAt) > c.ttl {
-		c.mu.Lock()
 		delete(c.entries, key)
 		c.misses++
-		c.mu.Unlock()
 		return "", false
 	}
 
-	c.mu.Lock()
 	entry.HitCount++
 	c.hits++
-	c.mu.Unlock()
-
 	return entry.Response, true
 }
 
 // Put 存入缓存
 func (c *Cache) Put(input, response, provider, model string) {
-	if !c.enabled || response == "" {
+	if !c.enabled {
 		return
 	}
 
@@ -178,8 +172,8 @@ func (c *Cache) Stats() Stats {
 func (c *Cache) evictLocked() {
 	now := time.Now()
 
-	// 淘汰过期条目
-	validOrder := c.order[:0]
+	// 淘汰过期条目（新建 slice 避免 backing array 泄漏）
+	validOrder := make([]string, 0, len(c.order))
 	for _, key := range c.order {
 		entry, ok := c.entries[key]
 		if !ok {
@@ -191,14 +185,14 @@ func (c *Cache) evictLocked() {
 		}
 		validOrder = append(validOrder, key)
 	}
-	c.order = validOrder
 
 	// 超量淘汰（移除最早的条目）
-	for len(c.entries) >= c.maxEntries && len(c.order) > 0 {
-		oldKey := c.order[0]
-		c.order = c.order[1:]
-		delete(c.entries, oldKey)
+	evictCount := 0
+	for len(c.entries)-evictCount >= c.maxEntries && evictCount < len(validOrder) {
+		delete(c.entries, validOrder[evictCount])
+		evictCount++
 	}
+	c.order = validOrder[evictCount:]
 }
 
 // hashInput 对输入进行归一化和哈希
