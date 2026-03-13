@@ -43,8 +43,8 @@ func (l *AuthLayer) Name() string { return "auth" }
 //   - 平台消息（有 UserID）：视为已认证
 //   - API 消息：校验 auth_token（预配置列表 或 HMAC-SHA256 签名验证）
 func (l *AuthLayer) Check(_ context.Context, msg *adapter.Message) error {
-	// 允许匿名访问
-	if l.cfg.AllowAnonymous {
+	// 允许匿名访问（仅 API 平台）
+	if l.cfg.AllowAnonymous && msg.Platform == adapter.PlatformAPI {
 		return nil
 	}
 
@@ -109,7 +109,12 @@ func (l *AuthLayer) validateToken(token string) bool {
 		if err != nil {
 			return false
 		}
-		if time.Since(ts) > 24*time.Hour {
+		// 拒绝未来时间戳（防止生成永不过期的 Token）和过期 Token
+		now := time.Now()
+		if ts.After(now.Add(5 * time.Minute)) {
+			return false
+		}
+		if now.Sub(ts) > 24*time.Hour {
 			return false
 		}
 

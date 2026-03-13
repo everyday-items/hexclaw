@@ -82,6 +82,7 @@ type Scheduler struct {
 	jobs     map[string]*Job // id -> job
 	stopCh   chan struct{}
 	stopped  bool
+	running  sync.Map // map[string]bool — 正在执行的任务 ID
 }
 
 // NewScheduler 创建调度器
@@ -272,6 +273,11 @@ func (s *Scheduler) checkAndExecute(now time.Time) {
 
 // executeJob 执行单个任务
 func (s *Scheduler) executeJob(job *Job) {
+	if _, loaded := s.running.LoadOrStore(job.ID, true); loaded {
+		return // 上一次执行尚未完成
+	}
+	defer s.running.Delete(job.ID)
+
 	s.mu.RLock()
 	executor := s.executor
 	s.mu.RUnlock()
@@ -310,13 +316,20 @@ func (s *Scheduler) executeJob(job *Job) {
 	s.mu.Unlock()
 
 	// 持久化状态
+	// 使用独立 context 更新数据库（不受 executor 超时影响）
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dbCancel()
 	if job.Type == JobTypeOnce {
-		s.db.ExecContext(ctx, `UPDATE cron_jobs SET status = 'done', last_run_at = ?, run_count = run_count + 1 WHERE id = ?`,
-			now, job.ID)
+		if _, err := s.db.ExecContext(dbCtx, `UPDATE cron_jobs SET status = 'done', last_run_at = ?, run_count = run_count + 1 WHERE id = ?`,
+			now, job.ID); err != nil {
+			log.Printf("Cron: 更新任务状态失败: %v", err)
+		}
 	} else {
 		next, _ := nextRunTime(job.Schedule, job.Type, now)
-		s.db.ExecContext(ctx, `UPDATE cron_jobs SET last_run_at = ?, next_run_at = ?, run_count = run_count + 1 WHERE id = ?`,
-			now, next, job.ID)
+		if _, err := s.db.ExecContext(dbCtx, `UPDATE cron_jobs SET last_run_at = ?, next_run_at = ?, run_count = run_count + 1 WHERE id = ?`,
+			now, next, job.ID); err != nil {
+			log.Printf("Cron: 更新任务状态失败: %v", err)
+		}
 	}
 }
 
@@ -445,6 +458,18 @@ func parseCron5(expr string, from time.Time) (time.Time, error) {
 	if err != nil {
 		return time.Time{}, fmt.Errorf("小时字段无效: %w", err)
 	}
+	day, err := parseCronField(fields[2], 1, 31)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("日期字段无效: %w", err)
+	}
+	month, err := parseCronField(fields[3], 1, 12)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("月份字段无效: %w", err)
+	}
+	dow, err := parseCronField(fields[4], 0, 6)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("星期字段无效: %w", err)
+	}
 
 	// 从 from 的下一分钟开始搜索
 	candidate := from.Truncate(time.Minute).Add(time.Minute)
@@ -454,8 +479,10 @@ func parseCron5(expr string, from time.Time) (time.Time, error) {
 	for i := 0; i < maxIter; i++ {
 		minMatch := minute == -1 || candidate.Minute() == minute
 		hourMatch := hour == -1 || candidate.Hour() == hour
-		// 日/月/周暂用通配符简化处理
-		if minMatch && hourMatch {
+		dayMatch := day == -1 || candidate.Day() == day
+		monthMatch := month == -1 || int(candidate.Month()) == month
+		dowMatch := dow == -1 || int(candidate.Weekday()) == dow
+		if minMatch && hourMatch && dayMatch && monthMatch && dowMatch {
 			return candidate, nil
 		}
 		candidate = candidate.Add(time.Minute)

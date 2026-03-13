@@ -281,7 +281,9 @@ func (a *WechatAdapter) getAccessToken(ctx context.Context) (string, error) {
 		ErrCode     int    `json:"errcode"`
 		ErrMsg      string `json:"errmsg"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("解析微信 Token 响应失败: %w", err)
+	}
 
 	if result.ErrCode != 0 {
 		return "", fmt.Errorf("微信 API 错误 (%d): %s", result.ErrCode, result.ErrMsg)
@@ -325,7 +327,9 @@ func (a *WechatAdapter) sendCustomMessage(ctx context.Context, toUser, content s
 		ErrCode int    `json:"errcode"`
 		ErrMsg  string `json:"errmsg"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("解析微信发送响应失败: %w", err)
+	}
 
 	if result.ErrCode != 0 {
 		return fmt.Errorf("微信客服消息失败 (%d): %s", result.ErrCode, result.ErrMsg)

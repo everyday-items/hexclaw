@@ -3,6 +3,8 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"path/filepath"
+	"strings"
 
 	"github.com/everyday-items/hexclaw/canvas"
 	"github.com/everyday-items/hexclaw/engine"
@@ -58,7 +60,7 @@ type SaveMemoryRequest struct {
 // handleSaveMemory 保存记忆
 func (s *Server) handleSaveMemory(w http.ResponseWriter, r *http.Request) {
 	var req SaveMemoryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "请求格式错误: " + err.Error(),
 		})
@@ -159,7 +161,7 @@ type InstallSkillRequest struct {
 // handleInstallSkill 安装技能
 func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 	var req InstallSkillRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "请求格式错误: " + err.Error(),
 		})
@@ -169,6 +171,14 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 	if req.Source == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "source 不能为空",
+		})
+		return
+	}
+
+	// 禁止绝对路径和路径穿越
+	if filepath.IsAbs(req.Source) || strings.Contains(req.Source, "..") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "source 路径不安全",
 		})
 		return
 	}
@@ -224,7 +234,7 @@ type RegisterAgentRequest struct {
 // handleRegisterAgent 注册 Agent
 func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	var req RegisterAgentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
 		return
 	}
@@ -302,7 +312,7 @@ type CanvasEventRequest struct {
 // handleCanvasEvent 处理 Canvas 事件
 func (s *Server) handleCanvasEvent(w http.ResponseWriter, r *http.Request) {
 	var req CanvasEventRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
 		return
 	}

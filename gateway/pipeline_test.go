@@ -3,48 +3,10 @@ package gateway
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/everyday-items/hexclaw/adapter"
 	"github.com/everyday-items/hexclaw/config"
 )
-
-// mockStore 测试用存储 mock
-type mockStore struct {
-	userCost   float64
-	globalCost float64
-	costErr    error
-}
-
-func (m *mockStore) Init(_ context.Context) error                         { return nil }
-func (m *mockStore) Close() error                                         { return nil }
-func (m *mockStore) CreateSession(_ context.Context, _ *mockSession) error { return nil }
-func (m *mockStore) GetSession(_ context.Context, _ string) (*mockSession, error) {
-	return nil, nil
-}
-func (m *mockStore) ListSessions(_ context.Context, _ string, _, _ int) ([]*mockSession, error) {
-	return nil, nil
-}
-func (m *mockStore) DeleteSession(_ context.Context, _ string) error { return nil }
-func (m *mockStore) SaveMessage(_ context.Context, _ *mockMessageRecord) error {
-	return nil
-}
-func (m *mockStore) ListMessages(_ context.Context, _ string, _, _ int) ([]*mockMessageRecord, error) {
-	return nil, nil
-}
-func (m *mockStore) SaveCost(_ context.Context, _ *mockCostRecord) error { return nil }
-func (m *mockStore) GetUserCost(_ context.Context, _ string, _ time.Time) (float64, error) {
-	return m.userCost, m.costErr
-}
-func (m *mockStore) GetGlobalCost(_ context.Context, _ time.Time) (float64, error) {
-	return m.globalCost, m.costErr
-}
-func (m *mockStore) WithTx(_ context.Context, fn func(interface{}) error) error { return nil }
-
-// mock 类型占位（避免引入 storage 包的循环依赖）
-type mockSession struct{}
-type mockMessageRecord struct{}
-type mockCostRecord struct{}
 
 func TestPipeline_EmptyConfig(t *testing.T) {
 	cfg := &config.SecurityConfig{}

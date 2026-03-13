@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/everyday-items/hexclaw/adapter"
@@ -231,10 +232,13 @@ func (s *Server) Start(ctx context.Context) error {
 		mux.Handle("/ws", s.wsHandler)
 	}
 
+	// 管理 API 认证中间件
+	handler := s.apiAuthMiddleware(corsMiddleware(mux))
+
 	addr := fmt.Sprintf("%s:%d", s.cfg.Server.Host, s.cfg.Server.Port)
 	s.server = &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      120 * time.Second, // 流式输出需要更长的超时
 		IdleTimeout:       120 * time.Second,
@@ -249,14 +253,12 @@ func (s *Server) Start(ctx context.Context) error {
 
 // Stop 优雅关闭服务器
 //
-// 等待所有正在处理的请求完成（最多等待 30 秒）
+// 使用调用方传入的 context 控制超时，避免双重超时。
 func (s *Server) Stop(ctx context.Context) error {
 	if s.server == nil {
 		return nil
 	}
-	shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	return s.server.Shutdown(shutdownCtx)
+	return s.server.Shutdown(ctx)
 }
 
 // handleHealth 健康检查端点
@@ -376,6 +378,91 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+
+// corsMiddleware 处理跨域请求
+//
+// 允许 Tauri 桌面端 (tauri://localhost, http://tauri.localhost)
+// 和本地开发服务 (http://localhost:*) 的跨域访问。
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+
+		// 允许 Tauri 和本地开发环境的 origin
+		isLocalhost := false
+		if strings.HasPrefix(origin, "http://localhost:") {
+			// 确保端口部分是纯数字，防止 http://localhost:evil.com 绕过
+			port := origin[17:]
+			isLocalhost = len(port) > 0 && len(port) <= 5
+			for _, c := range port {
+				if c < '0' || c > '9' {
+					isLocalhost = false
+					break
+				}
+			}
+		}
+		if origin == "tauri://localhost" ||
+			origin == "http://tauri.localhost" ||
+			isLocalhost {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Max-Age", "3600")
+		}
+
+		// 预检请求直接返回
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// apiAuthMiddleware 管理 API 认证中间件
+//
+// 对 /api/v1/ 下的写操作（POST/PUT/DELETE）进行认证。
+// 如果配置了 APIToken，需要 Authorization: Bearer <token>。
+// 未配置 Token 时，仅允许 localhost 访问管理端点。
+// GET 请求和 /health、/ws 不需要认证。
+func (s *Server) apiAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 只对 /api/v1/ 下的写操作进行认证
+		path := r.URL.Path
+		isWriteOp := r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete
+		// 排除聊天端点和 webhook 事件接收端点（外部服务用自己的签名验证）
+		isWebhookReceiver := r.Method == http.MethodPost && strings.HasPrefix(path, "/api/v1/webhooks/") && path != "/api/v1/webhooks"
+		needsAuth := isWriteOp && strings.HasPrefix(path, "/api/v1/") && path != "/api/v1/chat" && !isWebhookReceiver
+
+		if !needsAuth {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		token := s.cfg.Server.APIToken
+		if token != "" {
+			// 配置了 Token：验证 Authorization header
+			auth := r.Header.Get("Authorization")
+			if auth == "" || auth != "Bearer "+token {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{
+					"error": "未授权：需要有效的 API Token",
+				})
+				return
+			}
+		} else {
+			// 未配置 Token：仅允许 localhost
+			host, _, _ := net.SplitHostPort(r.RemoteAddr)
+			if host != "127.0.0.1" && host != "::1" && host != "localhost" {
+				writeJSON(w, http.StatusForbidden, map[string]string{
+					"error": "未配置 API Token，仅允许本地访问管理端点",
+				})
+				return
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
 
 // writeJSON 写入 JSON 响应
 func writeJSON(w http.ResponseWriter, status int, data any) {

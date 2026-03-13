@@ -114,6 +114,9 @@ func (e *OpenAIEmbedder) Embed(ctx context.Context, texts []string) ([][]float32
 		Model: e.model,
 		Input: texts,
 	}
+	if e.dimension > 0 {
+		reqBody.Dimensions = e.dimension
+	}
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -136,7 +139,7 @@ func (e *OpenAIEmbedder) Embed(ctx context.Context, texts []string) ([][]float32
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Embedding API 返回 %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("embedding API 返回 %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var result embeddingResponse
@@ -164,8 +167,9 @@ func (e *OpenAIEmbedder) Dimension() int {
 
 // embeddingRequest OpenAI Embedding API 请求体
 type embeddingRequest struct {
-	Model string   `json:"model"`
-	Input []string `json:"input"`
+	Model      string   `json:"model"`
+	Input      []string `json:"input"`
+	Dimensions int      `json:"dimensions,omitempty"`
 }
 
 // embeddingResponse OpenAI Embedding API 响应体

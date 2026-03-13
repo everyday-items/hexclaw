@@ -214,12 +214,12 @@ func (m *Manager) Handler() http.HandlerFunc {
 		}
 
 		// 读取请求体
+		defer r.Body.Close()
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxPayloadSize))
 		if err != nil {
 			http.Error(w, "read body failed", http.StatusBadRequest)
 			return
 		}
-		defer r.Body.Close()
 
 		// 签名验证
 		if wh.Secret != "" {
@@ -240,9 +240,11 @@ func (m *Manager) Handler() http.HandlerFunc {
 
 		// 更新统计
 		now := time.Now()
-		m.db.ExecContext(r.Context(),
+		if _, err := m.db.ExecContext(r.Context(),
 			`UPDATE webhooks SET last_event_at = ?, event_count = event_count + 1 WHERE id = ?`,
-			now, wh.ID)
+			now, wh.ID); err != nil {
+			log.Printf("Webhook: 更新统计失败: %v", err)
+		}
 		m.mu.Lock()
 		wh.LastEventAt = now
 		wh.EventCount++

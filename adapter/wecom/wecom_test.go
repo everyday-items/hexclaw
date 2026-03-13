@@ -1,6 +1,7 @@
 package wecom
 
 import (
+	"context"
 	"crypto/sha1"
 	"fmt"
 	"sort"
@@ -32,7 +33,7 @@ func TestNew(t *testing.T) {
 // TestStart_EmptyConfig 测试空配置
 func TestStart_EmptyConfig(t *testing.T) {
 	a := New(config.WecomConfig{})
-	err := a.Start(nil, nil)
+	err := a.Start(context.TODO(), nil)
 	if err == nil {
 		t.Error("空 CorpID/Secret 应返回错误")
 	}
@@ -41,7 +42,7 @@ func TestStart_EmptyConfig(t *testing.T) {
 // TestStop_NotStarted 测试未启动时停止
 func TestStop_NotStarted(t *testing.T) {
 	a := New(config.WecomConfig{CorpID: "corp", Secret: "secret"})
-	if err := a.Stop(nil); err != nil {
+	if err := a.Stop(context.TODO()); err != nil {
 		t.Errorf("未启动时停止应无错: %v", err)
 	}
 }

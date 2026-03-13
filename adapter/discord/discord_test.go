@@ -1,6 +1,7 @@
 package discord
 
 import (
+	"context"
 	"testing"
 
 	"github.com/everyday-items/hexclaw/adapter"
@@ -24,7 +25,7 @@ func TestNew(t *testing.T) {
 // TestStart_EmptyToken 测试空 Token 启动
 func TestStart_EmptyToken(t *testing.T) {
 	a := New(config.DiscordConfig{})
-	err := a.Start(nil, nil)
+	err := a.Start(context.TODO(), nil)
 	if err == nil {
 		t.Error("空 Token 应返回错误")
 	}
@@ -34,7 +35,7 @@ func TestStart_EmptyToken(t *testing.T) {
 func TestStop(t *testing.T) {
 	a := New(config.DiscordConfig{Token: "test"})
 	// 未启动时停止应不报错
-	if err := a.Stop(nil); err != nil {
+	if err := a.Stop(context.TODO()); err != nil {
 		t.Errorf("停止应无错: %v", err)
 	}
 }

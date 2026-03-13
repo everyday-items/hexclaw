@@ -17,7 +17,7 @@ type AddDocumentRequest struct {
 // handleAddDocument 添加文档到知识库
 func (s *Server) handleAddDocument(w http.ResponseWriter, r *http.Request) {
 	var req AddDocumentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "请求格式错误: " + err.Error(),
 		})
@@ -94,7 +94,7 @@ type SearchKnowledgeRequest struct {
 // handleSearchKnowledge 搜索知识库
 func (s *Server) handleSearchKnowledge(w http.ResponseWriter, r *http.Request) {
 	var req SearchKnowledgeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "请求格式错误: " + err.Error(),
 		})

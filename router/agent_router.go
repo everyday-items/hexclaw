@@ -89,14 +89,14 @@ func New() *Dispatcher {
 // Register 注册 Agent
 func (r *Dispatcher) Register(cfg AgentConfig) error {
 	if cfg.Name == "" {
-		return fmt.Errorf("Agent 名称不能为空")
+		return fmt.Errorf("agent 名称不能为空")
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if _, exists := r.agents[cfg.Name]; exists {
-		return fmt.Errorf("Agent %q 已注册", cfg.Name)
+		return fmt.Errorf("agent %q 已注册", cfg.Name)
 	}
 
 	r.agents[cfg.Name] = &cfg
@@ -116,7 +116,7 @@ func (r *Dispatcher) Unregister(name string) error {
 	defer r.mu.Unlock()
 
 	if _, exists := r.agents[name]; !exists {
-		return fmt.Errorf("Agent %q 未注册", name)
+		return fmt.Errorf("agent %q 未注册", name)
 	}
 
 	delete(r.agents, name)
@@ -148,7 +148,7 @@ func (r *Dispatcher) SetDefault(name string) error {
 	defer r.mu.Unlock()
 
 	if _, exists := r.agents[name]; !exists {
-		return fmt.Errorf("Agent %q 未注册", name)
+		return fmt.Errorf("agent %q 未注册", name)
 	}
 	r.defaultAgent = name
 	return nil
@@ -164,7 +164,7 @@ func (r *Dispatcher) AddRule(rule Rule) error {
 	defer r.mu.Unlock()
 
 	if _, exists := r.agents[rule.AgentName]; !exists {
-		return fmt.Errorf("Agent %q 未注册", rule.AgentName)
+		return fmt.Errorf("agent %q 未注册", rule.AgentName)
 	}
 
 	r.rules = append(r.rules, rule)

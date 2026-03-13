@@ -73,7 +73,7 @@ func (s *SearchSkill) Execute(ctx context.Context, args map[string]any) (*skill.
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // 2MB 限制
 	if err != nil {
 		return &skill.Result{Content: "搜索结果读取失败"}, nil
 	}

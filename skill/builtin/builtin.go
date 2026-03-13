@@ -44,5 +44,11 @@ func RegisterAll(registry *skill.DefaultRegistry, cfg config.BuiltinConfig) {
 		}
 	}
 
+	if cfg.Browser {
+		if err := registry.Register(NewBrowserSkill()); err != nil {
+			log.Printf("注册浏览器 Skill 失败: %v", err)
+		}
+	}
+
 	log.Printf("内置 Skill 已注册: %d 个", len(registry.All()))
 }

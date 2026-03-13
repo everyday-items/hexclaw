@@ -75,8 +75,12 @@ func (c *Compactor) NeedsCompaction(ctx context.Context, sessionID string) (bool
 // provider 用于调用 LLM 生成摘要。
 // 返回压缩后删除的消息数。
 func (c *Compactor) Compact(ctx context.Context, sessionID string, provider hexagon.Provider) (int, error) {
-	// 获取所有消息（使用足够大的 limit）
-	msgs, err := c.store.ListMessages(ctx, sessionID, 100000, 0)
+	// 获取消息（上限为 MaxMessages 的 2 倍，防止 OOM）
+	loadLimit := c.config.MaxMessages * 2
+	if loadLimit < 200 {
+		loadLimit = 200
+	}
+	msgs, err := c.store.ListMessages(ctx, sessionID, loadLimit, 0)
 	if err != nil {
 		return 0, fmt.Errorf("获取消息列表失败: %w", err)
 	}

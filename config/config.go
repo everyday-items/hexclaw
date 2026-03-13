@@ -56,23 +56,35 @@ type AuditConfig struct {
 // VoiceConfig 语音交互配置
 //
 // 支持 STT（语音转文本）和 TTS（文本转语音）。
+// Provider: openai-whisper / azure-stt / openai-tts / azure-tts / edge-tts
 type VoiceConfig struct {
 	Enabled bool             `yaml:"enabled"`  // 是否启用语音
 	STT     VoiceSTTConfig   `yaml:"stt"`      // STT 配置
 	TTS     VoiceTTSConfig   `yaml:"tts"`      // TTS 配置
+	Wake    VoiceWakeConfig  `yaml:"wake"`     // 语音唤醒配置
 }
 
 // VoiceSTTConfig STT 配置
 type VoiceSTTConfig struct {
-	Provider string `yaml:"provider"` // STT Provider（如 openai-whisper）
+	Provider string `yaml:"provider"` // STT Provider: openai-whisper / azure-stt
 	Model    string `yaml:"model"`    // 模型名称
+	Region   string `yaml:"region"`   // Azure 区域（仅 Azure）
+	APIKey   string `yaml:"api_key"`  // Provider API Key
 }
 
 // VoiceTTSConfig TTS 配置
 type VoiceTTSConfig struct {
-	Provider string `yaml:"provider"` // TTS Provider（如 openai-tts）
-	Voice    string `yaml:"voice"`    // 默认音色
-	Speed    float64 `yaml:"speed"`   // 默认语速
+	Provider string  `yaml:"provider"` // TTS Provider: openai-tts / azure-tts / edge-tts
+	Voice    string  `yaml:"voice"`    // 默认音色
+	Speed    float64 `yaml:"speed"`    // 默认语速
+	Region   string  `yaml:"region"`   // Azure 区域（仅 Azure）
+	APIKey   string  `yaml:"api_key"`  // Provider API Key
+}
+
+// VoiceWakeConfig 语音唤醒配置
+type VoiceWakeConfig struct {
+	Enabled bool     `yaml:"enabled"` // 是否启用语音唤醒
+	Words   []string `yaml:"words"`   // 唤醒词列表（如 "河蟹", "hexclaw"）
 }
 
 // HeartbeatConfig 心跳巡查配置
@@ -169,9 +181,10 @@ type EmbeddingConfig struct {
 
 // ServerConfig 服务器配置
 type ServerConfig struct {
-	Host string `yaml:"host"` // 监听地址，默认 127.0.0.1
-	Port int    `yaml:"port"` // 监听端口，默认 6060
-	Mode string `yaml:"mode"` // 运行模式: production / development
+	Host     string `yaml:"host"`      // 监听地址，默认 127.0.0.1
+	Port     int    `yaml:"port"`      // 监听端口，默认 16060
+	Mode     string `yaml:"mode"`      // 运行模式: production / development
+	APIToken string `yaml:"api_token"` // 管理 API Token（为空则允许 localhost 免认证）
 }
 
 // LLMConfig LLM 配置
@@ -206,14 +219,17 @@ type LLMCacheConfig struct {
 
 // PlatformsConfig 平台适配配置
 type PlatformsConfig struct {
-	Telegram TelegramConfig `yaml:"telegram"`
-	Discord  DiscordConfig  `yaml:"discord"`
-	Slack    SlackConfig    `yaml:"slack"`
-	Feishu   FeishuConfig   `yaml:"feishu"`
-	Dingtalk DingtalkConfig `yaml:"dingtalk"`
-	Wechat   WechatConfig   `yaml:"wechat"`
-	Wecom    WecomConfig    `yaml:"wecom"`
-	Web      WebConfig      `yaml:"web"`
+	Telegram TelegramConfig  `yaml:"telegram"`
+	Discord  DiscordConfig   `yaml:"discord"`
+	Slack    SlackConfig     `yaml:"slack"`
+	Feishu   FeishuConfig    `yaml:"feishu"`
+	Dingtalk DingtalkConfig  `yaml:"dingtalk"`
+	Wechat   WechatConfig    `yaml:"wechat"`
+	Wecom    WecomConfig     `yaml:"wecom"`
+	Web      WebConfig       `yaml:"web"`
+	WhatsApp WhatsAppConfig  `yaml:"whatsapp"`
+	LINE     LINEConfig      `yaml:"line"`
+	Matrix   MatrixConfig    `yaml:"matrix"`
 }
 
 // TelegramConfig Telegram 配置
@@ -273,6 +289,29 @@ type WecomConfig struct {
 // WebConfig Web UI 配置
 type WebConfig struct {
 	Enabled bool `yaml:"enabled"`
+}
+
+// WhatsAppConfig WhatsApp Business API 配置
+type WhatsAppConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Token       string `yaml:"token"`        // Cloud API Token
+	PhoneID     string `yaml:"phone_id"`     // 电话号码 ID
+	VerifyToken string `yaml:"verify_token"` // Webhook 验证 Token
+}
+
+// LINEConfig LINE Messaging API 配置
+type LINEConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	ChannelSecret string `yaml:"channel_secret"` // Channel Secret
+	ChannelToken  string `yaml:"channel_token"`  // Channel Access Token
+}
+
+// MatrixConfig Matrix 协议配置
+type MatrixConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	HomeserverURL string `yaml:"homeserver_url"` // Homeserver URL
+	AccessToken   string `yaml:"access_token"`   // Bot Access Token
+	UserID        string `yaml:"user_id"`        // Bot User ID
 }
 
 // SecurityConfig 安全配置
@@ -387,6 +426,7 @@ type BuiltinConfig struct {
 	Weather   bool `yaml:"weather"`
 	Translate bool `yaml:"translate"`
 	Summary   bool `yaml:"summary"`
+	Browser   bool `yaml:"browser"`
 	Code      bool `yaml:"code"`
 	Shell     bool `yaml:"shell"`
 }
@@ -412,6 +452,19 @@ type PostgresConfig struct {
 type MemoryConfig struct {
 	Conversation ConversationMemoryConfig `yaml:"conversation"`
 	LongTerm     LongTermMemoryConfig     `yaml:"long_term"`
+	Vector       VectorMemoryConfig       `yaml:"vector"`
+}
+
+// VectorMemoryConfig 向量语义记忆配置
+//
+// 复用 hexagon 的向量存储（Milvus/Weaviate 等）实现语义搜索。
+type VectorMemoryConfig struct {
+	Enabled    bool    `yaml:"enabled"`
+	Backend    string  `yaml:"backend"`    // 向量存储后端: milvus / weaviate / memory
+	TopK       int     `yaml:"top_k"`      // 搜索返回条目数，默认 5
+	MinScore   float32 `yaml:"min_score"`  // 最低相似度阈值，默认 0.7
+	Collection string  `yaml:"collection"` // 集合名称
+	AutoSave   bool    `yaml:"auto_save"`  // 自动保存对话到向量库
 }
 
 // ConversationMemoryConfig 对话记忆配置

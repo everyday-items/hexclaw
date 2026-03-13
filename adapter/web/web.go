@@ -125,6 +125,9 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 限制客户端消息大小为 64KB，防止 OOM
+	conn.SetReadLimit(64 * 1024)
+
 	chatID := "ws-" + idgen.ShortID()
 	a.conns.Store(chatID, conn)
 	defer func() {

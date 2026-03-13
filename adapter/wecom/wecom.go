@@ -272,7 +272,9 @@ func (a *WecomAdapter) getAccessToken(ctx context.Context) (string, error) {
 		AccessToken string `json:"access_token"`
 		ExpiresIn   int    `json:"expires_in"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("解析企业微信 Token 响应失败: %w", err)
+	}
 
 	if result.ErrCode != 0 {
 		return "", fmt.Errorf("企业微信 API 错误 (%d): %s", result.ErrCode, result.ErrMsg)
@@ -317,7 +319,9 @@ func (a *WecomAdapter) sendTextMessage(ctx context.Context, toUser, content stri
 		ErrCode int    `json:"errcode"`
 		ErrMsg  string `json:"errmsg"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("解析企业微信发送响应失败: %w", err)
+	}
 
 	if result.ErrCode != 0 {
 		return fmt.Errorf("企业微信发送消息失败 (%d): %s", result.ErrCode, result.ErrMsg)
@@ -342,12 +346,12 @@ func (a *WecomAdapter) checkSignature(msgSignature, timestamp, nonce, encrypt st
 // decrypt 解密消息
 func (a *WecomAdapter) decrypt(encrypted string) (string, error) {
 	if len(a.aesKey) == 0 {
-		return "", fmt.Errorf("AES Key 未配置")
+		return "", fmt.Errorf("aes key 未配置")
 	}
 
 	ciphertext, err := base64.StdEncoding.DecodeString(encrypted)
 	if err != nil {
-		return "", fmt.Errorf("Base64 解码失败: %w", err)
+		return "", fmt.Errorf("base64 解码失败: %w", err)
 	}
 
 	block, err := aes.NewCipher(a.aesKey)
@@ -363,10 +367,15 @@ func (a *WecomAdapter) decrypt(encrypted string) (string, error) {
 	mode := cipher.NewCBCDecrypter(block, iv)
 	mode.CryptBlocks(ciphertext, ciphertext)
 
-	// 去除 PKCS7 填充
+	// 去除 PKCS7 填充（完整校验所有填充字节）
 	padLen := int(ciphertext[len(ciphertext)-1])
-	if padLen > aes.BlockSize || padLen == 0 {
+	if padLen > aes.BlockSize || padLen == 0 || padLen > len(ciphertext) {
 		return "", fmt.Errorf("无效的 PKCS7 填充")
+	}
+	for i := 0; i < padLen; i++ {
+		if ciphertext[len(ciphertext)-1-i] != byte(padLen) {
+			return "", fmt.Errorf("无效的 PKCS7 填充")
+		}
 	}
 	ciphertext = ciphertext[:len(ciphertext)-padLen]
 

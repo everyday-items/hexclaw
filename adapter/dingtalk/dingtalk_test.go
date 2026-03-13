@@ -438,25 +438,28 @@ func TestGetAccessTokenExpired(t *testing.T) {
 	}
 }
 
-// TestEscapeJSON 测试 JSON 字符串转义
-func TestEscapeJSON(t *testing.T) {
+// TestMarshalTextContent 测试安全 JSON 序列化
+func TestMarshalTextContent(t *testing.T) {
 	tests := []struct {
 		input string
-		want  string
 	}{
-		{"hello", "hello"},
-		{`say "hello"`, `say \"hello\"`},
-		{"line1\nline2", `line1\nline2`},
-		{`back\slash`, `back\\slash`},
-		{`"quotes" and \back and\nnewline`, `\"quotes\" and \\back and\\nnewline`},
-		{"", ""},
+		{"hello"},
+		{`say "hello"`},
+		{"line1\nline2"},
+		{`back\slash`},
+		{"含\x00null字节"},
+		{""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			got := escapeJSON(tt.input)
-			if got != tt.want {
-				t.Errorf("escapeJSON(%q) = %q, 期望 %q", tt.input, got, tt.want)
+			result := marshalTextContent(tt.input)
+			var parsed map[string]string
+			if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+				t.Errorf("marshalTextContent(%q) 产生非法 JSON: %s", tt.input, result)
+			}
+			if parsed["content"] != tt.input {
+				t.Errorf("marshalTextContent(%q) 反序列化后不匹配: %q", tt.input, parsed["content"])
 			}
 		})
 	}

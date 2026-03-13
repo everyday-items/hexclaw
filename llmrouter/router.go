@@ -222,10 +222,16 @@ func (r *Selector) Fallback(exclude string) (hexagon.Provider, string, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	for name, p := range r.providers {
+	// 确定性选择：按名称排序后取第一个非排除项
+	names := make([]string, 0, len(r.providers))
+	for name := range r.providers {
 		if name != exclude {
-			return p, name, nil
+			names = append(names, name)
 		}
+	}
+	sort.Strings(names)
+	if len(names) > 0 {
+		return r.providers[names[0]], names[0], nil
 	}
 	return nil, "", fmt.Errorf("没有可用的备用 Provider")
 }

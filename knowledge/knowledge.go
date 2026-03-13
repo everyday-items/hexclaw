@@ -17,6 +17,8 @@ import (
 	"math"
 	"strings"
 	"time"
+
+	"github.com/everyday-items/toolkit/util/idgen"
 )
 
 // Embedder 向量嵌入接口
@@ -154,7 +156,7 @@ func (m *Manager) AddDocument(ctx context.Context, title, content, source string
 	}
 
 	doc := &Document{
-		ID:        fmt.Sprintf("doc-%d", time.Now().UnixNano()),
+		ID:        "doc-" + idgen.ShortID(),
 		Title:     title,
 		Content:   content,
 		Source:    source,

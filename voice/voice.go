@@ -143,7 +143,7 @@ func NewService(stt STTProvider, tts TTSProvider) *Service {
 // 使用配置的 STT Provider 将音频转为文本。
 func (s *Service) Transcribe(ctx context.Context, audio []byte, opts TranscribeOptions) (*TranscribeResult, error) {
 	if s.stt == nil {
-		return nil, fmt.Errorf("STT Provider 未配置")
+		return nil, fmt.Errorf("stt provider 未配置")
 	}
 	if len(audio) == 0 {
 		return nil, fmt.Errorf("音频数据为空")
@@ -156,7 +156,7 @@ func (s *Service) Transcribe(ctx context.Context, audio []byte, opts TranscribeO
 // 使用配置的 TTS Provider 将文本合成为音频。
 func (s *Service) Synthesize(ctx context.Context, text string, opts SynthesizeOptions) (*SynthesizeResult, error) {
 	if s.tts == nil {
-		return nil, fmt.Errorf("TTS Provider 未配置")
+		return nil, fmt.Errorf("tts provider 未配置")
 	}
 	if text == "" {
 		return nil, fmt.Errorf("文本内容为空")

@@ -113,7 +113,7 @@ func (a *FeishuAdapter) Send(ctx context.Context, chatID string, reply *adapter.
 	body := map[string]any{
 		"receive_id": chatID,
 		"msg_type":   "text",
-		"content":    fmt.Sprintf(`{"text":"%s"}`, escapeJSON(reply.Content)),
+		"content":    marshalTextContent(reply.Content),
 	}
 	bodyJSON, _ := json.Marshal(body)
 
@@ -365,12 +365,8 @@ type feishuEvent struct {
 	} `json:"event"`
 }
 
-// escapeJSON 转义 JSON 字符串中的特殊字符
-func escapeJSON(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	s = strings.ReplaceAll(s, "\n", `\n`)
-	s = strings.ReplaceAll(s, "\r", `\r`)
-	s = strings.ReplaceAll(s, "\t", `\t`)
-	return s
+// marshalTextContent 安全地序列化文本消息内容为 JSON 字符串
+func marshalTextContent(text string) string {
+	b, _ := json.Marshal(map[string]string{"text": text})
+	return string(b)
 }

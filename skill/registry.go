@@ -31,7 +31,7 @@ func (r *DefaultRegistry) Register(skill Skill) error {
 
 	name := skill.Name()
 	if _, exists := r.skills[name]; exists {
-		return fmt.Errorf("Skill %q 已注册", name)
+		return fmt.Errorf("skill %q 已注册", name)
 	}
 
 	r.skills[name] = skill

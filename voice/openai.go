@@ -156,7 +156,7 @@ func (s *OpenAISTT) Transcribe(ctx context.Context, audio []byte, opts Transcrib
 	// 检查响应状态码
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("STT API 返回 %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("stt API 返回 %d: %s", resp.StatusCode, string(body))
 	}
 
 	// 解析响应
@@ -318,11 +318,11 @@ func (t *OpenAITTS) Synthesize(ctx context.Context, text string, opts Synthesize
 	// 检查响应状态码
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("TTS API 返回 %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("tts API 返回 %d: %s", resp.StatusCode, string(body))
 	}
 
-	// 读取音频数据
-	audio, err := io.ReadAll(resp.Body)
+	// 读取音频数据（50MB 限制）
+	audio, err := io.ReadAll(io.LimitReader(resp.Body, 50<<20))
 	if err != nil {
 		return nil, fmt.Errorf("读取音频数据失败: %w", err)
 	}

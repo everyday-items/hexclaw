@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -43,6 +44,7 @@ func Load(configFile string) (*Config, error) {
 		if os.IsNotExist(err) {
 			// 配置文件不存在，使用默认配置 + 环境变量
 			applyEnvProviders(cfg)
+			expandTildePaths(cfg)
 			return cfg, nil
 		}
 		return nil, fmt.Errorf("读取配置文件失败: %w", err)
@@ -58,6 +60,9 @@ func Load(configFile string) (*Config, error) {
 
 	// 补充环境变量中的 Provider
 	applyEnvProviders(cfg)
+
+	// 展开路径中的 ~
+	expandTildePaths(cfg)
 
 	return cfg, nil
 }
@@ -141,13 +146,34 @@ func applyEnvProviders(cfg *Config) {
 		}
 	}
 
-	// 如果默认 Provider 在配置中不存在，选择第一个可用的
-	if _, exists := cfg.LLM.Providers[cfg.LLM.Default]; !exists {
+	// 如果默认 Provider 在配置中不存在，按名称排序选择第一个（确保确定性）
+	if _, exists := cfg.LLM.Providers[cfg.LLM.Default]; !exists && len(cfg.LLM.Providers) > 0 {
+		names := make([]string, 0, len(cfg.LLM.Providers))
 		for name := range cfg.LLM.Providers {
-			cfg.LLM.Default = name
-			break
+			names = append(names, name)
 		}
+		sort.Strings(names)
+		cfg.LLM.Default = names[0]
 	}
+}
+
+// expandTildePaths 展开配置中所有路径的 ~ 前缀为用户主目录
+func expandTildePaths(cfg *Config) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	expandTilde := func(p string) string {
+		if strings.HasPrefix(p, "~/") {
+			return filepath.Join(home, p[2:])
+		}
+		if p == "~" {
+			return home
+		}
+		return p
+	}
+	cfg.Storage.SQLite.Path = expandTilde(cfg.Storage.SQLite.Path)
+	cfg.FileMemory.Dir = expandTilde(cfg.FileMemory.Dir)
 }
 
 // defaultConfigYAML 默认配置模板
@@ -160,7 +186,7 @@ var defaultConfigYAML = strings.TrimSpace(`
 
 server:
   host: "127.0.0.1"
-  port: 6060
+  port: 16060
   mode: "production"
 
 # LLM 配置

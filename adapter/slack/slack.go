@@ -23,6 +23,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,7 +62,7 @@ func (a *SlackAdapter) Start(_ context.Context, handler adapter.MessageHandler) 
 	a.handler = handler
 
 	if a.cfg.Token == "" {
-		return fmt.Errorf("Slack Bot Token 不能为空")
+		return fmt.Errorf("slack bot token 不能为空")
 	}
 
 	// 获取 Bot 自身的 User ID
@@ -217,9 +218,13 @@ func (a *SlackAdapter) processEvent(data json.RawMessage) {
 	if reply != nil {
 		// 如果原消息在线程中，回复到同一线程
 		if event.ThreadTS != "" {
-			a.postThreadMessage(ctx, event.Channel, event.ThreadTS, reply.Content)
+			if err := a.postThreadMessage(ctx, event.Channel, event.ThreadTS, reply.Content); err != nil {
+				log.Printf("Slack 线程回复失败: %v", err)
+			}
 		} else {
-			a.postMessage(ctx, event.Channel, reply.Content)
+			if err := a.postMessage(ctx, event.Channel, reply.Content); err != nil {
+				log.Printf("Slack 回复失败: %v", err)
+			}
 		}
 	}
 }
@@ -232,6 +237,15 @@ func (a *SlackAdapter) verifySignature(r *http.Request, body []byte) bool {
 	signature := r.Header.Get("X-Slack-Signature")
 
 	if timestamp == "" || signature == "" {
+		return false
+	}
+
+	// 防重放攻击：时间戳偏差超过 5 分钟则拒绝
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return false
+	}
+	if abs64(time.Now().Unix()-ts) > 300 {
 		return false
 	}
 
@@ -279,10 +293,12 @@ func (a *SlackAdapter) postMessageWithTS(ctx context.Context, channel, text stri
 		Error string `json:"error"`
 		TS    string `json:"ts"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("解析 Slack 响应失败: %w", err)
+	}
 
 	if !result.OK {
-		return "", fmt.Errorf("Slack API 错误: %s", result.Error)
+		return "", fmt.Errorf("slack API 错误: %s", result.Error)
 	}
 	return result.TS, nil
 }
@@ -353,7 +369,10 @@ func (a *SlackAdapter) fetchBotID() {
 	var result struct {
 		UserID string `json:"user_id"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Printf("解析 Slack auth.test 响应失败: %v", err)
+		return
+	}
 	a.botID = result.UserID
 }
 
@@ -369,4 +388,11 @@ type slackEvent struct {
 	TS       string `json:"ts"`
 	ThreadTS string `json:"thread_ts"`
 	BotID    string `json:"bot_id"`
+}
+
+func abs64(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }

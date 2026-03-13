@@ -28,7 +28,7 @@ type TelegramAdapter struct {
 	cfg     config.TelegramConfig
 	handler adapter.MessageHandler
 	client  *http.Client
-	offset  int64 // 长轮询偏移量
+	offset  atomic.Int64 // 长轮询偏移量
 	stopped atomic.Bool
 }
 
@@ -90,7 +90,7 @@ func (a *TelegramAdapter) pollLoop() {
 		}
 
 		for _, update := range updates {
-			a.offset = int64(update.UpdateID) + 1
+			a.offset.Store(int64(update.UpdateID) + 1)
 			if update.Message != nil && update.Message.Text != "" {
 				go a.handleMessage(update.Message)
 			}
@@ -100,7 +100,7 @@ func (a *TelegramAdapter) pollLoop() {
 
 // getUpdates 获取新消息（长轮询）
 func (a *TelegramAdapter) getUpdates() ([]tgUpdate, error) {
-	url := fmt.Sprintf("%s%s/getUpdates?offset=%d&timeout=30", baseURL, a.cfg.Token, a.offset)
+	url := fmt.Sprintf("%s%s/getUpdates?offset=%d&timeout=30", baseURL, a.cfg.Token, a.offset.Load())
 
 	resp, err := a.client.Get(url)
 	if err != nil {
@@ -116,7 +116,7 @@ func (a *TelegramAdapter) getUpdates() ([]tgUpdate, error) {
 		return nil, err
 	}
 	if !result.OK {
-		return nil, fmt.Errorf("Telegram API 返回失败")
+		return nil, fmt.Errorf("telegram API 返回失败")
 	}
 
 	return result.Result, nil
@@ -180,7 +180,7 @@ func (a *TelegramAdapter) sendMessage(ctx context.Context, chatID, text string) 
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("Telegram API 返回 %d: %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("telegram API 返回 %d: %s", resp.StatusCode, string(respBody))
 	}
 	return nil
 }

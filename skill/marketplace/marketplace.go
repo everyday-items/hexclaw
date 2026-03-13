@@ -125,6 +125,11 @@ func (m *Marketplace) Install(source string) (*MarkdownSkill, error) {
 			skill.Meta.Name = info.Name()
 		}
 
+		safeName := filepath.Base(skill.Meta.Name)
+		if safeName != skill.Meta.Name || strings.Contains(skill.Meta.Name, "..") {
+			return nil, fmt.Errorf("非法技能名称: %s", skill.Meta.Name)
+		}
+
 		// 复制到技能目录
 		destDir := filepath.Join(m.skillDir, skill.Meta.Name)
 		if err := copyDir(source, destDir); err != nil {
@@ -140,6 +145,11 @@ func (m *Marketplace) Install(source string) (*MarkdownSkill, error) {
 		}
 		if skill.Meta.Name == "" {
 			skill.Meta.Name = strings.TrimSuffix(info.Name(), ".md")
+		}
+
+		safeName := filepath.Base(skill.Meta.Name)
+		if safeName != skill.Meta.Name || strings.Contains(skill.Meta.Name, "..") {
+			return nil, fmt.Errorf("非法技能名称: %s", skill.Meta.Name)
 		}
 
 		// 复制到技能目录
@@ -168,6 +178,12 @@ func (m *Marketplace) Install(source string) (*MarkdownSkill, error) {
 
 // Uninstall 删除已安装的技能
 func (m *Marketplace) Uninstall(name string) error {
+	// 校验技能名称，防止路径穿越
+	safeName := filepath.Base(name)
+	if safeName != name || strings.Contains(name, "..") {
+		return fmt.Errorf("非法技能名称: %s", name)
+	}
+
 	m.mu.Lock()
 	skill, ok := m.skills[name]
 	if !ok {
@@ -177,10 +193,15 @@ func (m *Marketplace) Uninstall(name string) error {
 	delete(m.skills, name)
 	m.mu.Unlock()
 
-	// 删除文件/目录
+	// 删除文件/目录 — 验证路径在 skillDir 内
 	dir := filepath.Dir(skill.FilePath)
-	base := filepath.Base(dir)
+	absDir, _ := filepath.Abs(dir)
+	absSkillDir, _ := filepath.Abs(m.skillDir)
+	if !strings.HasPrefix(absDir+string(filepath.Separator), absSkillDir+string(filepath.Separator)) && absDir != absSkillDir {
+		return fmt.Errorf("路径逃逸: %s 不在 %s 内", absDir, absSkillDir)
+	}
 
+	base := filepath.Base(dir)
 	// 如果是子目录（名称等于技能名），删除整个目录
 	if base == name {
 		if err := os.RemoveAll(dir); err != nil {
