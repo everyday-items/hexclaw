@@ -3,7 +3,7 @@
 # 阶段 1: 编译 Go 二进制
 # 阶段 2: 最小运行时镜像
 
-FROM golang:1.23-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /src
 COPY go.mod go.sum ./

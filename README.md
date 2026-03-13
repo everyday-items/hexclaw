@@ -1,8 +1,15 @@
-# HexClaw 河蟹 🦀
+<div align="center">
+  <img src=".github/assets/logo.jpg" alt="HexClaw Logo" width="180" />
+  <h1>HexClaw 河蟹</h1>
+  <p><strong>企业级安全的个人 AI Agent</strong> — 安全 · 开源 · 自托管 · 易用 · 功能全面</p>
 
-**企业级安全的个人 AI Agent** — 安全 · 开源 · 自托管 · 易用 · 功能全面
+  [![CI](https://github.com/everyday-items/hexclaw/workflows/CI/badge.svg)](https://github.com/everyday-items/hexclaw/actions)
+  [![Release](https://img.shields.io/github/v/release/everyday-items/hexclaw?include_prereleases)](https://github.com/everyday-items/hexclaw/releases)
+  [![License](https://img.shields.io/github/license/everyday-items/hexclaw)](https://github.com/everyday-items/hexclaw/blob/main/LICENSE)
+  [![Go Report Card](https://goreportcard.com/badge/github.com/everyday-items/hexclaw)](https://goreportcard.com/report/github.com/everyday-items/hexclaw)
 
-> 基于 [Hexagon](https://github.com/everyday-items/hexagon) AI Agent 全能型框架构建
+  > 基于 [Hexagon](https://github.com/everyday-items/hexagon) AI Agent 全能型框架构建
+</div>
 
 ## 特性
 
@@ -65,6 +72,17 @@ export DEEPSEEK_API_KEY="sk-xxx"
 
 # 启动服务
 hexclaw serve
+```
+
+### Docker
+
+```bash
+docker run -d \
+  --name hexclaw \
+  -p 6060:6060 \
+  -e DEEPSEEK_API_KEY="sk-xxx" \
+  -v hexclaw-data:/data/.hexclaw \
+  ghcr.io/everyday-items/hexclaw:latest
 ```
 
 服务启动后：
@@ -311,6 +329,29 @@ hexclaw/
 
 ## 开发
 
+### 前置要求
+
+| 工具 | 版本要求 |
+|------|---------|
+| Go | >= 1.25 |
+| golangci-lint | 最新版（可选） |
+
+### Make 命令
+
+| 命令 | 说明 |
+|------|------|
+| `make build` | 构建二进制到 `bin/` |
+| `make run` | 构建并启动服务 |
+| `make test` | 运行所有测试 |
+| `make test-cover` | 运行测试（含覆盖率） |
+| `make fmt` | 代码格式化 |
+| `make vet` | 静态检查 |
+| `make lint` | golangci-lint 检查 |
+| `make clean` | 清理构建产物 |
+| `make init` | 初始化默认配置 |
+
+### 手动命令
+
 ```bash
 # 构建
 go build ./...
@@ -339,12 +380,47 @@ golangci-lint run
 | MCP | modelcontextprotocol/go-sdk |
 | 安全 | Hexagon Guard Chain |
 
+## 贡献指南
+
+### 工作流程
+
+1. Fork 本仓库
+2. 创建功能分支: `git checkout -b feat/your-feature`
+3. 提交更改: `git commit -m "feat: 添加新功能"`
+4. 推送分支: `git push origin feat/your-feature`
+5. 创建 Pull Request
+
+### Commit Message 格式
+
+遵循 [Conventional Commits](https://www.conventionalcommits.org/) 规范：
+
+```
+feat: 添加新功能
+fix: 修复问题
+docs: 文档更新
+refactor: 重构
+test: 测试相关
+chore: 构建/工具链
+```
+
+### 代码规范
+
+- 格式化: `make fmt`
+- 静态检查: `make vet`
+- Lint: `make lint`
+- 提交前请确保 `make test` 全部通过
+
+## 相关项目
+
+| 项目 | 说明 | 仓库 |
+|------|------|------|
+| **Hexagon** | Go AI Agent 框架 (核心引擎) | [hexagon](https://github.com/everyday-items/hexagon) |
+| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) | [ai-core](https://github.com/everyday-items/ai-core) |
+| **toolkit** | Go 通用工具库 | [toolkit](https://github.com/everyday-items/toolkit) |
+| **hexagon-ui** | Hexagon Dev UI 观测面板 (Vue 3) | [hexagon-ui](https://github.com/everyday-items/hexagon-ui) |
+| **hexclaw-desktop** | HexClaw 桌面客户端 (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/everyday-items/hexclaw-desktop) |
+| **hexclaw-ui** | HexClaw Web 前端 (Vue 3) | [hexclaw-ui](https://github.com/everyday-items/hexclaw-ui) |
+
 ## 许可证
 
-MIT License
-
-## 致谢
-
-- [Hexagon](https://github.com/everyday-items/hexagon) — AI Agent 全能型框架
-- [ai-core](https://github.com/everyday-items/ai-core) — AI 基础能力库
-- [toolkit](https://github.com/everyday-items/toolkit) — Go 通用工具库
+[MIT](LICENSE)
