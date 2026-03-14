@@ -163,6 +163,10 @@ func (s *Server) Start(ctx context.Context) error {
 		mux.HandleFunc("POST /api/v1/knowledge/search", s.handleSearchKnowledge)
 	}
 
+	// 配置 API
+	mux.HandleFunc("GET /api/v1/config/llm", s.handleGetLLMConfig)
+	mux.HandleFunc("PUT /api/v1/config/llm", s.handleUpdateLLMConfig)
+
 	// 角色列表 API
 	mux.HandleFunc("GET /api/v1/roles", s.handleListRoles)
 

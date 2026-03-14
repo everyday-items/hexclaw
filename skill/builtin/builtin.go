@@ -50,5 +50,17 @@ func RegisterAll(registry *skill.DefaultRegistry, cfg config.BuiltinConfig) {
 		}
 	}
 
+	if cfg.Code {
+		if err := registry.Register(NewCodeSkill()); err != nil {
+			log.Printf("注册代码执行 Skill 失败: %v", err)
+		}
+	}
+
+	if cfg.Shell {
+		if err := registry.Register(NewShellSkill()); err != nil {
+			log.Printf("注册 Shell Skill 失败: %v", err)
+		}
+	}
+
 	log.Printf("内置 Skill 已注册: %d 个", len(registry.All()))
 }

@@ -97,6 +97,47 @@ func Init() (string, error) {
 	return cfgPath, nil
 }
 
+// Save 将当前配置持久化到 YAML 文件
+//
+// 如果 configFile 为空则写入 ~/.hexclaw/hexclaw.yaml
+func Save(cfg *Config, configFile string) error {
+	if configFile == "" {
+		dir, err := configDir()
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return fmt.Errorf("创建配置目录失败: %w", err)
+		}
+		configFile = filepath.Join(dir, "hexclaw.yaml")
+	}
+
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("序列化配置失败: %w", err)
+	}
+
+	if err := os.WriteFile(configFile, data, 0600); err != nil {
+		return fmt.Errorf("写入配置文件失败: %w", err)
+	}
+	return nil
+}
+
+// MaskAPIKey 对 API Key 脱敏显示
+//
+// 保留最后 4 位，前面用 **** 替代。空 key 返回空字符串。
+func MaskAPIKey(key string) string {
+	if len(key) <= 4 {
+		return key
+	}
+	return "****" + key[len(key)-4:]
+}
+
+// IsMaskedKey 检查是否为脱敏后的 Key（以 **** 开头）
+func IsMaskedKey(key string) bool {
+	return strings.HasPrefix(key, "****")
+}
+
 // expandEnvVars 展开字符串中的 ${VAR_NAME} 为环境变量值
 func expandEnvVars(s string) string {
 	return os.Expand(s, func(key string) string {
