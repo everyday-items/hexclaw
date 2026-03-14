@@ -18,6 +18,7 @@ import (
 	"github.com/everyday-items/hexclaw/adapter"
 	"github.com/everyday-items/hexclaw/config"
 	"github.com/everyday-items/hexclaw/storage"
+	"github.com/everyday-items/toolkit/lang/stringx"
 	"github.com/everyday-items/toolkit/util/idgen"
 )
 
@@ -158,9 +159,5 @@ func toRole(role string) hexagon.LLMRole {
 // 取消息前 30 个字符作为标题。
 // 后续可接入 LLM 自动生成更好的标题。
 func generateTitle(content string) string {
-	runes := []rune(content)
-	if len(runes) <= 30 {
-		return content
-	}
-	return string(runes[:30]) + "..."
+	return stringx.Truncate(content, 30)
 }

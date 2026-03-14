@@ -45,7 +45,7 @@ func (g *mockGateway) RecordUsage(_ context.Context, _ *adapter.Message, _ *gate
 func TestServer_Health(t *testing.T) {
 	cfg := config.DefaultConfig()
 	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
-	srv := NewServer(cfg, eng, nil)
+	srv := NewServer(cfg, eng, nil, nil)
 
 	req := httptest.NewRequest("GET", "/health", nil)
 	w := httptest.NewRecorder()
@@ -72,7 +72,7 @@ func TestServer_Chat(t *testing.T) {
 			Metadata: map[string]string{"provider": "test"},
 		},
 	}
-	srv := NewServer(cfg, eng, nil)
+	srv := NewServer(cfg, eng, nil, nil)
 
 	body := `{"message": "你好", "user_id": "test-user"}`
 	req := httptest.NewRequest("POST", "/api/v1/chat", strings.NewReader(body))
@@ -96,7 +96,7 @@ func TestServer_Chat(t *testing.T) {
 func TestServer_ChatEmptyMessage(t *testing.T) {
 	cfg := config.DefaultConfig()
 	eng := &mockEngine{}
-	srv := NewServer(cfg, eng, nil)
+	srv := NewServer(cfg, eng, nil, nil)
 
 	body := `{"message": ""}`
 	req := httptest.NewRequest("POST", "/api/v1/chat", strings.NewReader(body))
@@ -120,7 +120,7 @@ func TestServer_GatewayReject(t *testing.T) {
 			Message: "请求过于频繁",
 		},
 	}
-	srv := NewServer(cfg, eng, gw)
+	srv := NewServer(cfg, eng, gw, nil)
 
 	body := `{"message": "你好", "user_id": "test-user"}`
 	req := httptest.NewRequest("POST", "/api/v1/chat", strings.NewReader(body))
@@ -143,7 +143,7 @@ func TestServer_GatewayReject(t *testing.T) {
 func TestServer_InvalidJSON(t *testing.T) {
 	cfg := config.DefaultConfig()
 	eng := &mockEngine{}
-	srv := NewServer(cfg, eng, nil)
+	srv := NewServer(cfg, eng, nil, nil)
 
 	body := `{invalid json}`
 	req := httptest.NewRequest("POST", "/api/v1/chat", strings.NewReader(body))

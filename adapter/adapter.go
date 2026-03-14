@@ -51,6 +51,18 @@ type Message struct {
 	Timestamp time.Time         // 消息时间
 }
 
+// Usage Token 使用统计
+//
+// 记录单次请求的 Token 消耗和费用信息。
+type Usage struct {
+	InputTokens  int     `json:"input_tokens"`            // 输入 Token 数
+	OutputTokens int     `json:"output_tokens"`           // 输出 Token 数
+	TotalTokens  int     `json:"total_tokens"`            // 总 Token 数
+	Provider     string  `json:"provider"`                // LLM Provider 名称
+	Model        string  `json:"model"`                   // 模型名称
+	Cost         float64 `json:"cost,omitempty"`          // 费用（美元）
+}
+
 // Reply 同步回复
 //
 // 引擎处理完消息后返回的完整回复。
@@ -58,16 +70,18 @@ type Message struct {
 type Reply struct {
 	Content  string            // 回复文本内容
 	Metadata map[string]string // 附加元数据（如工具调用结果、引用来源等）
+	Usage    *Usage            // Token 使用统计（可选）
 }
 
 // ReplyChunk 流式回复片段
 //
 // 用于流式输出场景，引擎通过 channel 逐块发送回复。
-// Done=true 表示流式输出结束。
+// Done=true 表示流式输出结束，此时 Usage 字段包含本次请求的 Token 统计。
 type ReplyChunk struct {
 	Content string // 当前片段的文本内容（增量）
 	Done    bool   // 是否为最后一个片段
 	Error   error  // 出错时的错误信息
+	Usage   *Usage // Token 使用统计（仅在 Done=true 时填充）
 }
 
 // MessageHandler 消息处理回调（同步模式）

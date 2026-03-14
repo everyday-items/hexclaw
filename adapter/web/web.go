@@ -115,6 +115,7 @@ func (a *WebAdapter) SendStream(ctx context.Context, chatID string, chunks <-cha
 			Type:    "chunk",
 			Content: chunk.Content,
 			Done:    chunk.Done,
+			Usage:   chunk.Usage,
 		}
 		if err := wsjson.Write(ctx, conn, msg); err != nil {
 			return err
@@ -233,10 +234,11 @@ func (a *WebAdapter) getConn(chatID string) (*websocket.Conn, bool) {
 
 // wsMessage WebSocket 消息格式
 type wsMessage struct {
-	Type      string `json:"type"`                 // message / reply / chunk / error
-	Content   string `json:"content"`              // 消息内容
-	SessionID string `json:"session_id,omitempty"`  // 会话 ID
-	Done      bool   `json:"done,omitempty"`        // 流式输出是否结束
+	Type      string         `json:"type"`                 // message / reply / chunk / error
+	Content   string         `json:"content"`              // 消息内容
+	SessionID string         `json:"session_id,omitempty"`  // 会话 ID
+	Done      bool           `json:"done,omitempty"`        // 流式输出是否结束
+	Usage     *adapter.Usage `json:"usage,omitempty"`       // Token 使用统计（仅在 done=true 时）
 }
 
 // MarshalJSON 自定义序列化（省略空字段）

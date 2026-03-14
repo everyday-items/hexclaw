@@ -283,12 +283,25 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		}
 	}
 
+	// 构建 Usage 信息
+	var usage *adapter.Usage
+	if output.Usage.TotalTokens > 0 {
+		usage = &adapter.Usage{
+			InputTokens:  output.Usage.PromptTokens,
+			OutputTokens: output.Usage.CompletionTokens,
+			TotalTokens:  output.Usage.TotalTokens,
+			Provider:     providerName,
+			Model:        modelName,
+		}
+	}
+
 	return &adapter.Reply{
 		Content: output.Content,
 		Metadata: map[string]string{
 			"provider": providerName,
 			"model":    modelName,
 		},
+		Usage: usage,
 	}, nil
 }
 
@@ -455,11 +468,22 @@ func (e *ReActEngine) pipeStream(
 		}
 	}
 
-	// 发送结束标记
-	ch <- &adapter.ReplyChunk{Done: true}
-
 	// 获取最终结果（含 Usage 统计）
 	result := llmStream.Result()
+
+	// 发送结束标记（携带 Usage 信息）
+	doneChunk := &adapter.ReplyChunk{Done: true}
+	if result != nil && result.Usage.TotalTokens > 0 {
+		modelName := e.getProviderModel(providerName)
+		doneChunk.Usage = &adapter.Usage{
+			InputTokens:  result.Usage.PromptTokens,
+			OutputTokens: result.Usage.CompletionTokens,
+			TotalTokens:  result.Usage.TotalTokens,
+			Provider:     providerName,
+			Model:        modelName,
+		}
+	}
+	ch <- doneChunk
 	content := fullContent.String()
 
 	// 保存助手回复

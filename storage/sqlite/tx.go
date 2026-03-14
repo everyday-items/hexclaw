@@ -34,18 +34,18 @@ func (s *txStore) CreateSession(ctx context.Context, session *storage.Session) e
 		session.UpdatedAt = now
 	}
 	_, err := s.tx.ExecContext(ctx,
-		`INSERT INTO sessions (id, user_id, platform, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		session.ID, session.UserID, session.Platform, session.Title, session.CreatedAt, session.UpdatedAt,
+		`INSERT INTO sessions (id, user_id, platform, title, parent_session_id, branch_message_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		session.ID, session.UserID, session.Platform, session.Title, session.ParentSessionID, session.BranchMessageID, session.CreatedAt, session.UpdatedAt,
 	)
 	return err
 }
 
 func (s *txStore) GetSession(ctx context.Context, id string) (*storage.Session, error) {
 	row := s.tx.QueryRowContext(ctx,
-		`SELECT id, user_id, platform, title, created_at, updated_at FROM sessions WHERE id = ?`, id,
+		`SELECT id, user_id, platform, title, parent_session_id, branch_message_id, created_at, updated_at FROM sessions WHERE id = ?`, id,
 	)
 	var sess storage.Session
-	if err := row.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.Title, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+	if err := row.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.Title, &sess.ParentSessionID, &sess.BranchMessageID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &sess, nil
@@ -53,7 +53,7 @@ func (s *txStore) GetSession(ctx context.Context, id string) (*storage.Session, 
 
 func (s *txStore) ListSessions(ctx context.Context, userID string, limit, offset int) ([]*storage.Session, error) {
 	rows, err := s.tx.QueryContext(ctx,
-		`SELECT id, user_id, platform, title, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+		`SELECT id, user_id, platform, title, parent_session_id, branch_message_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
 		userID, limit, offset,
 	)
 	if err != nil {
@@ -64,7 +64,7 @@ func (s *txStore) ListSessions(ctx context.Context, userID string, limit, offset
 	var sessions []*storage.Session
 	for rows.Next() {
 		var sess storage.Session
-		if err := rows.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.Title, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.Title, &sess.ParentSessionID, &sess.BranchMessageID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
 			return nil, err
 		}
 		sessions = append(sessions, &sess)
@@ -85,8 +85,8 @@ func (s *txStore) SaveMessage(ctx context.Context, msg *storage.MessageRecord) e
 		msg.CreatedAt = time.Now()
 	}
 	_, err := s.tx.ExecContext(ctx,
-		`INSERT INTO messages (id, session_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		msg.ID, msg.SessionID, msg.Role, msg.Content, msg.Metadata, msg.CreatedAt,
+		`INSERT INTO messages (id, session_id, parent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		msg.ID, msg.SessionID, msg.ParentID, msg.Role, msg.Content, msg.Metadata, msg.CreatedAt,
 	)
 	if err != nil {
 		return err
@@ -104,7 +104,7 @@ func (s *txStore) DeleteMessage(ctx context.Context, id string) error {
 
 func (s *txStore) ListMessages(ctx context.Context, sessionID string, limit, offset int) ([]*storage.MessageRecord, error) {
 	rows, err := s.tx.QueryContext(ctx,
-		`SELECT id, session_id, role, content, metadata, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?`,
+		`SELECT id, session_id, parent_id, role, content, metadata, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?`,
 		sessionID, limit, offset,
 	)
 	if err != nil {
@@ -115,7 +115,7 @@ func (s *txStore) ListMessages(ctx context.Context, sessionID string, limit, off
 	var messages []*storage.MessageRecord
 	for rows.Next() {
 		var msg storage.MessageRecord
-		if err := rows.Scan(&msg.ID, &msg.SessionID, &msg.Role, &msg.Content, &msg.Metadata, &msg.CreatedAt); err != nil {
+		if err := rows.Scan(&msg.ID, &msg.SessionID, &msg.ParentID, &msg.Role, &msg.Content, &msg.Metadata, &msg.CreatedAt); err != nil {
 			return nil, err
 		}
 		messages = append(messages, &msg)
@@ -155,6 +155,27 @@ func (s *txStore) GetGlobalCost(ctx context.Context, since time.Time) (float64, 
 		return 0, err
 	}
 	return total.Float64, nil
+}
+
+func (s *txStore) UpdateSession(ctx context.Context, session *storage.Session) error {
+	session.UpdatedAt = time.Now()
+	_, err := s.tx.ExecContext(ctx,
+		`UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?`,
+		session.Title, session.UpdatedAt, session.ID,
+	)
+	return err
+}
+
+func (s *txStore) SearchMessages(_ context.Context, _, _ string, _, _ int) ([]*storage.SearchResult, int, error) {
+	return nil, 0, fmt.Errorf("不支持在事务中搜索消息")
+}
+
+func (s *txStore) ForkSession(_ context.Context, _, _, _ string) (*storage.Session, error) {
+	return nil, fmt.Errorf("不支持在事务中创建分支")
+}
+
+func (s *txStore) ListSessionBranches(_ context.Context, _ string) ([]*storage.Session, error) {
+	return nil, fmt.Errorf("不支持在事务中列出分支")
 }
 
 func (s *txStore) WithTx(_ context.Context, _ func(storage.Store) error) error {
