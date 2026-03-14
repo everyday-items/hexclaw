@@ -63,12 +63,13 @@ func New(dbPath string) (*Store, error) {
 
 // Init 初始化数据库表
 func (s *Store) Init(ctx context.Context) error {
+	// 先执行增量迁移：对已有数据库添加新字段，确保旧表结构兼容新 schema
+	s.runMigrations(ctx)
+
 	_, err := s.db.ExecContext(ctx, schema)
 	if err != nil {
 		return fmt.Errorf("初始化数据库表失败: %w", err)
 	}
-	// 增量迁移：对已有数据库添加新字段（ALTER TABLE 忽略 "duplicate column" 错误）
-	s.runMigrations(ctx)
 	return nil
 }
 

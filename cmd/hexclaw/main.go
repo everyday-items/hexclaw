@@ -494,13 +494,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		srv.SetMarketplace(mp)
 	}
 
-	// 12. 初始化多 Agent 路由（Phase 5）
-	var agentRouter *agentrouter.Dispatcher
-	if cfg.Router.Enabled {
-		agentRouter = agentrouter.New()
-		srv.SetAgentRouter(agentRouter)
-		log.Println("多 Agent 路由已启用")
-	}
+	// 12. 初始化多 Agent 路由（桌面端必须，始终启用）
+	agentRouter := agentrouter.New()
+	srv.SetAgentRouter(agentRouter)
+	log.Println("多 Agent 路由已启用")
 
 	// 13. 初始化 Canvas/A2UI 服务（Phase 5）
 	var canvasSvc *canvas.Service
