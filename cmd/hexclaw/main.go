@@ -383,7 +383,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	defer eng.Stop(context.Background())
 
 	// 8. 启动 HTTP 服务
-	srv := api.NewServer(cfg, eng, gw)
+	srv := api.NewServer(cfg, eng, gw, store)
 
 	// 挂载知识库 API
 	if eng.KnowledgeBase() != nil {

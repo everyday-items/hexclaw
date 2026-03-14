@@ -1,9 +1,15 @@
 // Package api 提供 HexClaw HTTP API 服务
 //
 // 包含以下端点：
-//   - GET  /health          健康检查
-//   - POST /api/v1/chat     同步聊天
-//   - GET  /api/v1/sessions 会话列表
+//   - GET    /health                        健康检查
+//   - POST   /api/v1/chat                   同步聊天
+//   - GET    /api/v1/sessions               会话列表
+//   - GET    /api/v1/sessions/{id}          会话详情
+//   - DELETE /api/v1/sessions/{id}          删除会话
+//   - GET    /api/v1/sessions/{id}/messages 消息历史
+//   - GET    /api/v1/sessions/{id}/branches 会话分支列表
+//   - POST   /api/v1/sessions/{id}/fork     创建对话分支
+//   - GET    /api/v1/messages/search        全文搜索消息
 //
 // 服务器支持优雅关闭：收到 SIGINT/SIGTERM 后等待请求处理完毕再退出。
 package api
@@ -30,6 +36,7 @@ import (
 	hexmcp "github.com/everyday-items/hexclaw/mcp"
 	"github.com/everyday-items/hexclaw/router"
 	"github.com/everyday-items/hexclaw/skill/marketplace"
+	"github.com/everyday-items/hexclaw/storage"
 	"github.com/everyday-items/hexclaw/voice"
 	"github.com/everyday-items/hexclaw/webhook"
 	"github.com/everyday-items/toolkit/util/idgen"
@@ -40,6 +47,7 @@ type Server struct {
 	cfg        *config.Config
 	engine     engine.Engine
 	gateway    gateway.Gateway
+	store      storage.Store        // 数据存储层
 	kb         *knowledge.Manager  // 知识库管理器（可选）
 	webhookMgr *webhook.Manager    // Webhook 管理器（可选）
 	scheduler  *cron.Scheduler     // Cron 调度器（可选）
@@ -57,11 +65,13 @@ type Server struct {
 // NewServer 创建 API 服务器
 //
 // gw 可为 nil，此时跳过安全检查（仅限开发模式）。
-func NewServer(cfg *config.Config, eng engine.Engine, gw gateway.Gateway) *Server {
+// store 可为 nil，此时会话/搜索/分支 API 不可用。
+func NewServer(cfg *config.Config, eng engine.Engine, gw gateway.Gateway, store storage.Store) *Server {
 	return &Server{
 		cfg:     cfg,
 		engine:  eng,
 		gateway: gw,
+		store:   store,
 	}
 }
 
@@ -161,6 +171,17 @@ func (s *Server) Start(ctx context.Context) error {
 		mux.HandleFunc("GET /api/v1/knowledge/documents", s.handleListDocuments)
 		mux.HandleFunc("DELETE /api/v1/knowledge/documents/{id}", s.handleDeleteDocument)
 		mux.HandleFunc("POST /api/v1/knowledge/search", s.handleSearchKnowledge)
+	}
+
+	// 会话 / 搜索 / 分支 API
+	if s.store != nil {
+		mux.HandleFunc("GET /api/v1/sessions", s.handleListSessions)
+		mux.HandleFunc("GET /api/v1/sessions/{id}", s.handleGetSession)
+		mux.HandleFunc("DELETE /api/v1/sessions/{id}", s.handleDeleteSession)
+		mux.HandleFunc("GET /api/v1/sessions/{id}/messages", s.handleListMessages)
+		mux.HandleFunc("GET /api/v1/sessions/{id}/branches", s.handleListBranches)
+		mux.HandleFunc("POST /api/v1/sessions/{id}/fork", s.handleForkSession)
+		mux.HandleFunc("GET /api/v1/messages/search", s.handleSearchMessages)
 	}
 
 	// 配置 API
@@ -292,6 +313,7 @@ type ChatResponse struct {
 	Reply     string            `json:"reply"`                // 回复内容
 	SessionID string            `json:"session_id"`           // 会话 ID
 	Metadata  map[string]string `json:"metadata,omitempty"`   // 元数据
+	Usage     *adapter.Usage    `json:"usage,omitempty"`      // Token 使用统计
 }
 
 // handleChat 同步聊天端点
@@ -379,6 +401,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Reply:     reply.Content,
 		SessionID: msg.SessionID,
 		Metadata:  reply.Metadata,
+		Usage:     reply.Usage,
 	})
 }
 

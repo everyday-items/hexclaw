@@ -55,6 +55,16 @@ func (s *mockStore) ListMessages(_ context.Context, sessionID string, limit, _ i
 	return msgs, nil
 }
 
+func (s *mockStore) UpdateSession(_ context.Context, _ *storage.Session) error { return nil }
+func (s *mockStore) SearchMessages(_ context.Context, _, _ string, _, _ int) ([]*storage.SearchResult, int, error) {
+	return nil, 0, nil
+}
+func (s *mockStore) ForkSession(_ context.Context, _, _, _ string) (*storage.Session, error) {
+	return nil, nil
+}
+func (s *mockStore) ListSessionBranches(_ context.Context, _ string) ([]*storage.Session, error) {
+	return nil, nil
+}
 func (s *mockStore) SaveCost(_ context.Context, _ *storage.CostRecord) error  { return nil }
 func (s *mockStore) GetUserCost(_ context.Context, _ string, _ time.Time) (float64, error) {
 	return 0, nil

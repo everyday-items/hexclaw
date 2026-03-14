@@ -19,22 +19,32 @@ var ErrNotFound = errors.New("not found")
 
 // Session 会话记录
 type Session struct {
-	ID        string    // 会话 ID
-	UserID    string    // 用户 ID
-	Platform  string    // 平台
-	Title     string    // 会话标题（自动生成或用户设置）
-	CreatedAt time.Time // 创建时间
-	UpdatedAt time.Time // 最后更新时间
+	ID              string    // 会话 ID
+	UserID          string    // 用户 ID
+	Platform        string    // 平台
+	Title           string    // 会话标题（自动生成或用户设置）
+	ParentSessionID string    // 父会话 ID（分支来源，空表示原始会话）
+	BranchMessageID string    // 分支起点消息 ID（从父会话的哪条消息开始分支）
+	CreatedAt       time.Time // 创建时间
+	UpdatedAt       time.Time // 最后更新时间
 }
 
 // MessageRecord 消息记录
 type MessageRecord struct {
 	ID        string    // 消息 ID
 	SessionID string    // 所属会话 ID
+	ParentID  string    // 父消息 ID（分支场景，空表示线性对话）
 	Role      string    // 角色: user / assistant / system / tool
 	Content   string    // 消息内容
 	Metadata  string    // JSON 格式的元数据
 	CreatedAt time.Time // 创建时间
+}
+
+// SearchResult 消息搜索结果
+type SearchResult struct {
+	Message   *MessageRecord // 匹配的消息
+	SessionTitle string     // 所属会话标题
+	Rank      float64       // 搜索排名分数
 }
 
 // CostRecord 成本记录
@@ -85,6 +95,24 @@ type Store interface {
 
 	// ListMessages 获取会话的消息历史（按创建时间正序）
 	ListMessages(ctx context.Context, sessionID string, limit, offset int) ([]*MessageRecord, error)
+
+	// UpdateSession 更新会话信息（标题等）
+	UpdateSession(ctx context.Context, session *Session) error
+
+	// --- 消息搜索 ---
+
+	// SearchMessages 全文搜索消息内容
+	// 返回匹配的消息列表和总数
+	SearchMessages(ctx context.Context, userID, query string, limit, offset int) ([]*SearchResult, int, error)
+
+	// --- 对话分支 ---
+
+	// ForkSession 从指定消息处创建分支会话
+	// 复制源会话中 messageID 之前（含）的所有消息到新会话
+	ForkSession(ctx context.Context, sourceSessionID, messageID, userID string) (*Session, error)
+
+	// ListSessionBranches 列出会话的所有分支
+	ListSessionBranches(ctx context.Context, sessionID string) ([]*Session, error)
 
 	// --- 成本管理 ---
 

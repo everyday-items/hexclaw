@@ -91,6 +91,9 @@ func DefaultConfig() *Config {
 				Backend: "sqlite",
 			},
 		},
+		Router: RouterConfig{
+			Enabled: true,
+		},
 		Observe: ObserveConfig{
 			LogLevel: "info",
 			Metrics: MetricsConfig{
