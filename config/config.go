@@ -205,16 +205,16 @@ type LLMProviderConfig struct {
 
 // LLMRoutingConfig 智能路由配置
 type LLMRoutingConfig struct {
-	Enabled  bool   `yaml:"enabled"`  // 是否启用智能路由
-	Strategy string `yaml:"strategy"` // 路由策略: cost-aware / quality-first / latency-first
+	Enabled  bool   `yaml:"enabled" json:"enabled"`   // 是否启用智能路由
+	Strategy string `yaml:"strategy" json:"strategy"` // 路由策略: cost-aware / quality-first / latency-first
 }
 
 // LLMCacheConfig 语义缓存配置
 type LLMCacheConfig struct {
-	Enabled    bool    `yaml:"enabled"`    // 是否启用语义缓存
-	Similarity float64 `yaml:"similarity"` // 相似度阈值
-	TTL        string  `yaml:"ttl"`        // 缓存过期时间
-	MaxEntries int     `yaml:"max_entries"` // 最大缓存条目数
+	Enabled    bool    `yaml:"enabled" json:"enabled"`         // 是否启用语义缓存
+	Similarity float64 `yaml:"similarity" json:"similarity"`   // 相似度阈值
+	TTL        string  `yaml:"ttl" json:"ttl"`                 // 缓存过期时间
+	MaxEntries int     `yaml:"max_entries" json:"max_entries"` // 最大缓存条目数
 }
 
 // PlatformsConfig 平台适配配置

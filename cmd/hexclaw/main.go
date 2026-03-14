@@ -190,11 +190,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		return fmt.Errorf("加载配置失败: %w", err)
 	}
 
-	// 桌面客户端模式：仅监听 localhost，自动启用 WebSocket
+	// 桌面客户端模式：仅监听 localhost，自动启用 WebSocket，跳过认证
 	if desktopMode {
 		cfg.Server.Host = "127.0.0.1"
 		cfg.Platforms.Web.Enabled = true
-		log.Println("桌面模式: 仅监听 localhost")
+		cfg.Security.Auth.AllowAnonymous = true
+		log.Println("桌面模式: 仅监听 localhost，允许匿名访问")
 	}
 
 	// 命令行参数覆盖配置文件
@@ -573,6 +574,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		if err := wa.Start(ctx, messageHandler); err != nil {
 			log.Printf("Web 适配器启动失败: %v", err)
 		} else {
+			// 注册流式处理器，WebSocket 消息优先走流式通道
+			wa.SetStreamHandler(func(ctx context.Context, msg *adapter.Message) (<-chan *adapter.ReplyChunk, error) {
+				if err := gw.Check(ctx, msg); err != nil {
+					return nil, fmt.Errorf("安全检查未通过: %w", err)
+				}
+				return eng.ProcessStream(ctx, msg)
+			})
 			srv.SetWebSocketHandler(wa.Handler())
 			adapters = append(adapters, wa)
 			fmt.Println("  WebSocket: ws://" + fmt.Sprintf("%s:%d/ws", cfg.Server.Host, cfg.Server.Port))

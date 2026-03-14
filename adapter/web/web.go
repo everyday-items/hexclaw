@@ -30,8 +30,17 @@ import (
 // 管理 WebSocket 连接，将 Web 消息转换为统一格式。
 // 每个 WebSocket 连接分配唯一 chatID。
 type WebAdapter struct {
-	handler adapter.MessageHandler
-	conns   sync.Map // chatID → *websocket.Conn
+	handler       adapter.MessageHandler
+	streamHandler adapter.StreamMessageHandler
+	conns         sync.Map // chatID → *websocket.Conn
+}
+
+// SetStreamHandler 设置流式消息处理器
+//
+// 设置后 WebSocket 消息将使用流式处理，逐 chunk 推送给客户端（打字机效果）。
+// 未设置时降级为同步处理。
+func (a *WebAdapter) SetStreamHandler(h adapter.StreamMessageHandler) {
+	a.streamHandler = h
 }
 
 // New 创建 Web 适配器
@@ -141,9 +150,14 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 	for {
 		var incoming wsMessage
 		if err := wsjson.Read(r.Context(), conn, &incoming); err != nil {
-			// 连接关闭
 			log.Printf("WebSocket 连接断开: %s", chatID)
 			return
+		}
+
+		// 处理心跳 ping
+		if incoming.Type == "ping" {
+			_ = wsjson.Write(r.Context(), conn, wsMessage{Type: "pong"})
+			continue
 		}
 
 		if incoming.Type != "message" || incoming.Content == "" {
@@ -155,7 +169,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			ID:        "web-" + idgen.ShortID(),
 			Platform:  adapter.PlatformWeb,
 			ChatID:    chatID,
-			UserID:    "web-user", // Web 用户暂用默认 ID
+			UserID:    "web-user",
 			UserName:  "Web User",
 			SessionID: incoming.SessionID,
 			Content:   incoming.Content,
@@ -167,6 +181,27 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
 
+			// 优先使用流式处理
+			if a.streamHandler != nil {
+				chunks, err := a.streamHandler(ctx, msg)
+				if err != nil {
+					log.Printf("Web: 流式处理失败: %v", err)
+					errMsg := wsMessage{Type: "error", Content: "处理消息时出现错误，请稍后重试。"}
+					_ = wsjson.Write(ctx, conn, errMsg)
+					return
+				}
+				if err := a.SendStream(ctx, chatID, chunks); err != nil {
+					log.Printf("Web: 流式发送失败: %v", err)
+					// 客户端断开 → 取消 context → 通知 pipeStream 停止消费 LLM
+					cancel()
+					// drain 剩余 chunks 防止 pipeStream 阻塞
+					for range chunks {
+					}
+				}
+				return
+			}
+
+			// 降级为同步处理
 			reply, err := a.handler(ctx, msg)
 			if err != nil {
 				log.Printf("Web: 处理消息失败: %v", err)

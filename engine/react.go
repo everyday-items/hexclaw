@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/everyday-items/ai-core/streamx"
 	"github.com/everyday-items/hexagon"
 	"github.com/everyday-items/hexclaw/adapter"
 	"github.com/everyday-items/hexclaw/agents"
@@ -318,28 +320,210 @@ func (e *ReActEngine) getProviderModel(providerName string) string {
 
 // ProcessStream 流式处理消息
 //
-// 当前实现：先同步处理再包装为流式输出。
-// TODO: 后续接入 Hexagon Agent 的原生流式能力。
+// 使用 LLM Provider 的原生 Stream 接口实现逐 token 输出。
+// 流程与 Process 相同（会话/缓存/知识库/历史），但最终调用
+// provider.Stream() 而非 agent.Run()，以实现打字机效果。
+//
+// 对于快速路径（Skill/缓存命中）降级为单 chunk 输出。
 func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (<-chan *adapter.ReplyChunk, error) {
-	ch := make(chan *adapter.ReplyChunk, 1)
+	// 1. 获取或创建会话
+	sess, err := e.sessions.GetOrCreate(ctx, msg)
+	if err != nil {
+		return nil, fmt.Errorf("会话管理失败: %w", err)
+	}
+	msg.SessionID = sess.ID
 
-	go func() {
-		defer close(ch)
-
-		reply, err := e.Process(ctx, msg)
+	// 2. 尝试快速路径: Skill 匹配 → 单 chunk 返回
+	if matched, ok := e.skills.Match(msg); ok {
+		// 快速路径也需保存用户消息
+		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg.Content); err != nil {
+			log.Printf("保存用户消息失败: %v", err)
+		}
+		result, err := matched.Execute(ctx, map[string]any{
+			"query":   msg.Content,
+			"user_id": msg.UserID,
+		})
 		if err != nil {
-			ch <- &adapter.ReplyChunk{Error: err, Done: true}
-			return
+			return nil, fmt.Errorf("skill %s 执行失败: %w", matched.Name(), err)
 		}
+		if err := e.sessions.SaveAssistantMessage(ctx, sess.ID, result.Content); err != nil {
+			log.Printf("保存助手回复失败: %v", err)
+		}
+		return singleChunk(result.Content), nil
+	}
 
-		// 将完整回复作为单个 chunk 输出
-		ch <- &adapter.ReplyChunk{
-			Content: reply.Content,
-			Done:    true,
+	// 3. 语义缓存命中 → 单 chunk 返回
+	if cached, ok := e.cache.Get(msg.Content); ok {
+		log.Printf("语义缓存命中: %s", msg.Content[:min(20, len(msg.Content))])
+		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg.Content); err != nil {
+			log.Printf("保存用户消息失败: %v", err)
 		}
-	}()
+		if err := e.sessions.SaveAssistantMessage(ctx, sess.ID, cached); err != nil {
+			log.Printf("保存助手回复失败: %v", err)
+		}
+		return singleChunk(cached), nil
+	}
+
+	// 4. 构建对话上下文（在保存用户消息之前，避免 history 中重复包含当前消息）
+	history, err := e.sessions.BuildContext(ctx, sess.ID)
+	if err != nil {
+		log.Printf("构建上下文失败: %v", err)
+	}
+
+	// 5. 保存用户消息（在 BuildContext 之后，确保 history 不含当前消息）
+	if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg.Content); err != nil {
+		log.Printf("保存用户消息失败: %v", err)
+	}
+
+	// 5.5 知识库检索（RAG）
+	var kbContext string
+	if e.kb != nil && e.cfg.Knowledge.Enabled {
+		topK := e.cfg.Knowledge.TopK
+		if topK <= 0 {
+			topK = 3
+		}
+		kbResult, kbErr := e.kb.Query(ctx, msg.Content, topK)
+		if kbErr != nil {
+			log.Printf("知识库检索失败: %v", kbErr)
+		} else if kbResult != "" {
+			kbContext = kbResult
+			log.Printf("知识库命中: 查询=%s", msg.Content[:min(20, len(msg.Content))])
+		}
+	}
+
+	// 6. 获取 LLM Provider
+	provider, providerName, err := e.router.Route(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("llm 路由失败: %w", err)
+	}
+
+	// 7. 构建 CompletionRequest（含 system prompt + 历史 + 知识库 + 用户消息）
+	roleName := msg.Metadata["role"]
+	messages := e.buildStreamMessages(roleName, history, kbContext, msg.Content)
+	req := hexagon.CompletionRequest{
+		Messages: messages,
+	}
+
+	// 8. 调用 provider.Stream()
+	llmStream, err := provider.Stream(ctx, req)
+	if err != nil {
+		// 降级到备用 Provider
+		fallbackP, fbName, fbErr := e.router.Fallback(providerName)
+		if fbErr != nil {
+			return nil, fmt.Errorf("流式调用失败且无可用备用: %w", err)
+		}
+		log.Printf("Provider %s 流式调用失败，降级到 %s: %v", providerName, fbName, err)
+		llmStream, err = fallbackP.Stream(ctx, req)
+		if err != nil {
+			return nil, fmt.Errorf("流式调用失败（降级后）: %w", err)
+		}
+		providerName = fbName
+	}
+
+	// 9. 启动 goroutine 将 streamx.Chunk 转发为 adapter.ReplyChunk
+	ch := make(chan *adapter.ReplyChunk, 16)
+	go e.pipeStream(ctx, ch, llmStream, sess.ID, msg, providerName)
 
 	return ch, nil
+}
+
+// pipeStream 将 LLM 流式响应转发到适配器 channel，流结束后保存回复/缓存/成本
+func (e *ReActEngine) pipeStream(
+	ctx context.Context,
+	ch chan<- *adapter.ReplyChunk,
+	llmStream *streamx.Stream,
+	sessionID string,
+	msg *adapter.Message,
+	providerName string,
+) {
+	defer close(ch)
+	defer llmStream.Close()
+
+	var fullContent strings.Builder
+
+	for chunk := range llmStream.Chunks() {
+		if chunk.Content == "" {
+			continue
+		}
+		fullContent.WriteString(chunk.Content)
+
+		select {
+		case ch <- &adapter.ReplyChunk{Content: chunk.Content}:
+		case <-ctx.Done():
+			ch <- &adapter.ReplyChunk{Error: ctx.Err(), Done: true}
+			return
+		}
+	}
+
+	// 发送结束标记
+	ch <- &adapter.ReplyChunk{Done: true}
+
+	// 获取最终结果（含 Usage 统计）
+	result := llmStream.Result()
+	content := fullContent.String()
+
+	// 保存助手回复
+	if err := e.sessions.SaveAssistantMessage(ctx, sessionID, content); err != nil {
+		log.Printf("保存助手回复失败: %v", err)
+	}
+
+	// 写入语义缓存
+	modelName := e.getProviderModel(providerName)
+	e.cache.Put(msg.Content, content, providerName, modelName)
+
+	// 记录 Token 使用
+	if result != nil && result.Usage.TotalTokens > 0 {
+		costRecord := &storage.CostRecord{
+			ID:        "cost-" + idgen.ShortID(),
+			UserID:    msg.UserID,
+			Provider:  providerName,
+			Model:     modelName,
+			Tokens:    result.Usage.TotalTokens,
+			CreatedAt: time.Now(),
+		}
+		if err := e.store.SaveCost(ctx, costRecord); err != nil {
+			log.Printf("记录成本失败: %v", err)
+		}
+	}
+}
+
+// buildStreamMessages 构建流式请求的消息列表
+func (e *ReActEngine) buildStreamMessages(roleName string, history []hexagon.Message, kbContext, userQuery string) []hexagon.Message {
+	var messages []hexagon.Message
+
+	// System prompt（支持角色选择）
+	sysContent := systemPrompt
+	if roleName != "" {
+		if role, ok := e.factory.GetRole(roleName); ok {
+			sysContent = role.ToSystemPrompt()
+		}
+	}
+	if kbContext != "" {
+		sysContent += "\n\n[参考知识]\n" + kbContext
+	}
+	messages = append(messages, hexagon.Message{
+		Role:    "system",
+		Content: sysContent,
+	})
+
+	// 历史消息
+	messages = append(messages, history...)
+
+	// 当前用户消息
+	messages = append(messages, hexagon.Message{
+		Role:    "user",
+		Content: userQuery,
+	})
+
+	return messages
+}
+
+// singleChunk 将完整内容包装为单 chunk channel（用于快速路径）
+func singleChunk(content string) <-chan *adapter.ReplyChunk {
+	ch := make(chan *adapter.ReplyChunk, 1)
+	ch <- &adapter.ReplyChunk{Content: content, Done: true}
+	close(ch)
+	return ch
 }
 
 // systemPrompt HexClaw 系统提示词
