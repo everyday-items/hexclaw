@@ -197,7 +197,7 @@ func (m *Marketplace) Uninstall(name string) error {
 	dir := filepath.Dir(skill.FilePath)
 	absDir, _ := filepath.Abs(dir)
 	absSkillDir, _ := filepath.Abs(m.skillDir)
-	if !strings.HasPrefix(absDir+string(filepath.Separator), absSkillDir+string(filepath.Separator)) && absDir != absSkillDir {
+	if !strings.HasPrefix(absDir, filepath.Clean(absSkillDir)+string(filepath.Separator)) && absDir != filepath.Clean(absSkillDir) {
 		return fmt.Errorf("路径逃逸: %s 不在 %s 内", absDir, absSkillDir)
 	}
 

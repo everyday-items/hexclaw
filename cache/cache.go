@@ -10,9 +10,12 @@ package cache
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // Entry 缓存条目
@@ -29,13 +32,18 @@ type Entry struct {
 //
 // 线程安全的内存缓存，支持 TTL 过期和最大条目数限制。
 // 使用 LRU 淘汰策略（当前简化为时间淘汰）。
+// 使用 singleflight 防止缓存击穿（同一 key 多并发请求只触发一次 LLM 调用）。
 type Cache struct {
 	mu         sync.RWMutex
 	entries    map[string]*Entry
 	order      []string // 插入顺序，用于淘汰
 	ttl        time.Duration
+	ttlJitter  time.Duration // TTL 抖动量，防止缓存雪崩
 	maxEntries int
 	enabled    bool
+
+	// singleflight 防止缓存击穿
+	group singleflight.Group
 
 	// 统计
 	hits   int64
@@ -52,7 +60,10 @@ type Options struct {
 // New 创建缓存实例
 func New(cfg Options) *Cache {
 	if !cfg.Enabled {
-		return &Cache{enabled: false}
+		return &Cache{
+			enabled: false,
+			entries: make(map[string]*Entry),
+		}
 	}
 
 	ttl := cfg.TTL
@@ -67,21 +78,19 @@ func New(cfg Options) *Cache {
 	return &Cache{
 		entries:    make(map[string]*Entry),
 		ttl:        ttl,
+		ttlJitter:  ttl / 10, // 10% 随机抖动防止缓存雪崩
 		maxEntries: maxEntries,
 		enabled:    true,
 	}
 }
 
-// Get 查询缓存
-//
-// 对输入进行归一化和哈希，查找匹配的缓存条目。
-// 命中时返回响应内容和 true，未命中返回空字符串和 false。
-func (c *Cache) Get(input string) (string, bool) {
+// Get 查询缓存（按 input + provider 隔离，避免不同模型回复互相命中）
+func (c *Cache) Get(input, provider string) (string, bool) {
 	if !c.enabled {
 		return "", false
 	}
 
-	key := hashInput(input)
+	key := hashInput(input, provider)
 
 	// 单次加写锁完成全部操作，避免 RLock→Unlock→Lock 之间的 TOCTOU 竞态
 	c.mu.Lock()
@@ -105,13 +114,49 @@ func (c *Cache) Get(input string) (string, bool) {
 	return entry.Response, true
 }
 
+// Do 缓存击穿防护：对同一 key 的并发请求只执行一次 fn
+//
+// 如果缓存命中直接返回；否则使用 singleflight 确保
+// 同一 key 只有一个 goroutine 调用 fn（LLM 调用等耗时操作）。
+func (c *Cache) Do(input, provider string, fn func() (response, model string, err error)) (string, error) {
+	if !c.enabled {
+		resp, _, err := fn()
+		return resp, err
+	}
+
+	// 先查缓存
+	if cached, ok := c.Get(input, provider); ok {
+		return cached, nil
+	}
+
+	key := hashInput(input, provider)
+
+	// singleflight：同一 key 只执行一次
+	v, err, _ := c.group.Do(key, func() (any, error) {
+		// double-check：可能在排队期间另一个请求已填充缓存
+		if cached, ok := c.Get(input, provider); ok {
+			return cached, nil
+		}
+		resp, model, err := fn()
+		if err != nil {
+			return nil, err
+		}
+		c.Put(input, resp, provider, model)
+		return resp, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return v.(string), nil
+}
+
 // Put 存入缓存
 func (c *Cache) Put(input, response, provider, model string) {
 	if !c.enabled {
 		return
 	}
 
-	key := hashInput(input)
+	key := hashInput(input, provider)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -119,15 +164,12 @@ func (c *Cache) Put(input, response, provider, model string) {
 	// 淘汰过期和超量条目
 	c.evictLocked()
 
-	// 如果 key 已存在，只更新条目内容，不重复追加到 order 切片
-	if _, exists := c.entries[key]; exists {
-		c.entries[key] = &Entry{
-			Key:       key,
-			Response:  response,
-			Provider:  provider,
-			Model:     model,
-			CreatedAt: time.Now(),
-		}
+	// 如果 key 已存在，只更新条目内容，保留 HitCount
+	if existing, exists := c.entries[key]; exists {
+		existing.Response = response
+		existing.Provider = provider
+		existing.Model = model
+		existing.CreatedAt = c.jitteredNow()
 		return
 	}
 
@@ -136,7 +178,7 @@ func (c *Cache) Put(input, response, provider, model string) {
 		Response:  response,
 		Provider:  provider,
 		Model:     model,
-		CreatedAt: time.Now(),
+		CreatedAt: c.jitteredNow(),
 	}
 	c.order = append(c.order, key)
 }
@@ -172,7 +214,7 @@ func (c *Cache) Stats() Stats {
 func (c *Cache) evictLocked() {
 	now := time.Now()
 
-	// 淘汰过期条目（新建 slice 避免 backing array 泄漏）
+	// 淘汰过期条目
 	validOrder := make([]string, 0, len(c.order))
 	for _, key := range c.order {
 		entry, ok := c.entries[key]
@@ -186,29 +228,37 @@ func (c *Cache) evictLocked() {
 		validOrder = append(validOrder, key)
 	}
 
-	// 超量淘汰（移除最早的条目）
+	// 超量淘汰（移除最早的条目，使用 > 确保淘汰后 entries < maxEntries）
 	evictCount := 0
-	for len(c.entries)-evictCount >= c.maxEntries && evictCount < len(validOrder) {
+	for len(c.entries)-evictCount > c.maxEntries-1 && evictCount < len(validOrder) {
 		delete(c.entries, validOrder[evictCount])
 		evictCount++
 	}
-	c.order = validOrder[evictCount:]
+
+	// 重新分配 slice 避免 backing array 泄漏
+	c.order = append([]string(nil), validOrder[evictCount:]...)
+}
+
+// jitteredNow 返回带随机抖动的当前时间（防止缓存雪崩）
+func (c *Cache) jitteredNow() time.Time {
+	if c.ttlJitter <= 0 {
+		return time.Now()
+	}
+	jitter := time.Duration(rand.Int64N(int64(c.ttlJitter)))
+	return time.Now().Add(-jitter)
 }
 
 // hashInput 对输入进行归一化和哈希
-//
-// 归一化步骤：
-//  1. 去除首尾空白
-//  2. 转小写
-//  3. 合并连续空白为单个空格
-//  4. SHA-256 哈希
-func hashInput(input string) string {
-	// 归一化
+func hashInput(input, provider string) string {
 	normalized := strings.TrimSpace(input)
 	normalized = strings.ToLower(normalized)
 	normalized = strings.Join(strings.Fields(normalized), " ")
 
-	// 哈希
-	h := sha256.Sum256([]byte(normalized))
+	var builder strings.Builder
+	builder.WriteString(normalized)
+	builder.WriteByte('\x00')
+	builder.WriteString(strings.ToLower(strings.TrimSpace(provider)))
+
+	h := sha256.Sum256([]byte(builder.String()))
 	return hex.EncodeToString(h[:])
 }

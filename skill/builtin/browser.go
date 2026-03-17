@@ -310,8 +310,10 @@ func isPrivateHost(host string) bool {
 		return true
 	}
 
-	// 云元数据地址
-	if host == "169.254.169.254" || host == "metadata.google.internal" {
+	// 云元数据地址（AWS/GCP/Azure/阿里云）
+	switch host {
+	case "169.254.169.254", "metadata.google.internal",
+		"168.63.129.16", "100.100.100.200":
 		return true
 	}
 
@@ -356,9 +358,16 @@ func isPrivateIP(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return true
 	}
-	// 云元数据 169.254.169.254
-	if ip.Equal(net.ParseIP("169.254.169.254")) {
-		return true
+	// 云元数据地址
+	cloudMetaIPs := []string{
+		"169.254.169.254", // AWS/GCP
+		"168.63.129.16",   // Azure
+		"100.100.100.200", // 阿里云
+	}
+	for _, metaIP := range cloudMetaIPs {
+		if ip.Equal(net.ParseIP(metaIP)) {
+			return true
+		}
 	}
 	// RFC 6598 (CGNAT)
 	_, cgnat, _ := net.ParseCIDR("100.64.0.0/10")

@@ -220,6 +220,12 @@ func (fm *FileMemory) Search(query string) []SearchResult {
 		return results[i].Score > results[j].Score
 	})
 
+	// 限制返回结果数量，防止 OOM
+	const maxResults = 100
+	if len(results) > maxResults {
+		results = results[:maxResults]
+	}
+
 	return results
 }
 
@@ -229,6 +235,64 @@ type SearchResult struct {
 	Line    int     `json:"line"`    // 行号
 	Content string  `json:"content"` // 匹配的行内容
 	Score   float64 `json:"score"`   // 匹配分数 (0-1)
+}
+
+// UpdateMemory 替换 MEMORY.md 全部内容
+func (fm *FileMemory) UpdateMemory(content string) error {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+
+	path := filepath.Join(fm.dir, "MEMORY.md")
+	return os.WriteFile(path, []byte(content), 0644)
+}
+
+// ClearAll 清空所有记忆文件
+func (fm *FileMemory) ClearAll() error {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+
+	entries, err := os.ReadDir(fm.dir)
+	if err != nil {
+		return fmt.Errorf("读取记忆目录失败: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		path := filepath.Join(fm.dir, entry.Name())
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("删除文件 %s 失败: %w", entry.Name(), err)
+		}
+	}
+	return nil
+}
+
+// DeleteFile 删除指定记忆文件
+func (fm *FileMemory) DeleteFile(filename string) error {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+
+	// 安全检查：只允许删除 .md 文件，不允许路径穿越
+	if filename == "" || strings.Contains(filename, "..") ||
+		strings.ContainsAny(filename, "/\\") || filepath.Base(filename) != filename {
+		return fmt.Errorf("不安全的文件名: %s", filename)
+	}
+	if !strings.HasSuffix(filename, ".md") {
+		return fmt.Errorf("只能删除 .md 文件")
+	}
+
+	path := filepath.Join(fm.dir, filename)
+	// 二次验证：确保最终路径在记忆目录内
+	absPath, _ := filepath.Abs(path)
+	absDir, _ := filepath.Abs(fm.dir)
+	if !strings.HasPrefix(absPath, filepath.Clean(absDir)+string(filepath.Separator)) {
+		return fmt.Errorf("路径越界: %s", filename)
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return fmt.Errorf("文件不存在: %s", filename)
+	}
+	return os.Remove(path)
 }
 
 // Dir 返回记忆目录路径

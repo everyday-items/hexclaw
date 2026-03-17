@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/everyday-items/ai-core/streamx"
 	"github.com/everyday-items/hexagon"
 	"github.com/everyday-items/hexclaw/adapter"
 	"github.com/everyday-items/hexclaw/agents"
@@ -16,6 +15,7 @@ import (
 	"github.com/everyday-items/hexclaw/config"
 	"github.com/everyday-items/hexclaw/knowledge"
 	"github.com/everyday-items/hexclaw/llmrouter"
+	agentrouter "github.com/everyday-items/hexclaw/router"
 	"github.com/everyday-items/hexclaw/session"
 	"github.com/everyday-items/hexclaw/skill"
 	"github.com/everyday-items/hexclaw/storage"
@@ -33,17 +33,18 @@ import (
 // 引擎在内部为每个请求创建临时 Agent 实例，
 // 注入会话上下文和可用工具。
 type ReActEngine struct {
-	mu       sync.RWMutex
-	cfg      *config.Config
-	router   *llmrouter.Selector
-	sessions *session.Manager
-	skills   *skill.DefaultRegistry
-	store    storage.Store
-	cache    *cache.Cache
-	kb       *knowledge.Manager // 知识库管理器（可为 nil）
-	factory  *agents.Factory    // Agent 角色工厂
-	started  bool
-	startAt  time.Time
+	mu          sync.RWMutex
+	cfg         *config.Config
+	router      *llmrouter.Selector
+	agentRouter *agentrouter.Dispatcher // 多 Agent 路由器（可为 nil）
+	sessions    *session.Manager
+	skills      *skill.DefaultRegistry
+	store       storage.Store
+	cache       *cache.Cache
+	kb          *knowledge.Manager // 知识库管理器（可为 nil）
+	factory     *agents.Factory    // Agent 角色工厂
+	started     bool
+	startAt     time.Time
 }
 
 // NewReActEngine 创建 ReAct 引擎
@@ -98,6 +99,15 @@ func (e *ReActEngine) KnowledgeBase() *knowledge.Manager {
 	return e.kb
 }
 
+// SetAgentRouter 设置多 Agent 路由器
+//
+// 设置后，引擎在处理消息时会根据路由规则选择 Agent 配置（Provider/Model/SystemPrompt）。
+func (e *ReActEngine) SetAgentRouter(r *agentrouter.Dispatcher) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.agentRouter = r
+}
+
 // AgentFactory 获取 Agent 角色工厂
 func (e *ReActEngine) AgentFactory() *agents.Factory {
 	return e.factory
@@ -109,7 +119,7 @@ func (e *ReActEngine) Start(_ context.Context) error {
 	defer e.mu.Unlock()
 	e.started = true
 	e.startAt = time.Now()
-	log.Println("Agent 引擎已启动")
+	// 启动日志由 main 统一输出
 	return nil
 }
 
@@ -177,7 +187,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	}
 
 	// 4. 语义缓存查询
-	if cached, ok := e.cache.Get(msg.Content); ok {
+	if cached, ok := e.cache.Get(msg.Content, e.cfg.LLM.Default); ok {
 		log.Printf("语义缓存命中: %s", msg.Content[:min(20, len(msg.Content))])
 		if err := e.sessions.SaveAssistantMessage(ctx, sess.ID, cached); err != nil {
 			log.Printf("保存助手回复失败: %v", err)
@@ -211,15 +221,15 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		}
 	}
 
-	// 6. 获取 LLM Provider
-	provider, providerName, err := e.router.Route(ctx)
+	// 6. 获取 LLM Provider（支持指定 provider，"" 和 "auto" 使用默认路由）
+	provider, providerName, err := e.resolveProvider(ctx, msg.Metadata["provider"], msg)
 	if err != nil {
 		return nil, fmt.Errorf("llm 路由失败: %w", err)
 	}
 
 	// 7. 创建 Agent（支持角色选择）
 	roleName := msg.Metadata["role"] // 从消息元数据中获取角色
-	reactAgent := e.createAgent(roleName, provider)
+	reactAgent := e.createAgent(roleName, provider, msg.Metadata)
 
 	// 构建 Agent 输入
 	agentInput := hexagon.Input{
@@ -251,7 +261,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		}
 		log.Printf("Provider %s 失败，降级到 %s: %v", providerName, fbName, err)
 
-		reactAgent = e.createAgent(roleName, fallbackP)
+		reactAgent = e.createAgent(roleName, fallbackP, msg.Metadata)
 		output, err = reactAgent.Run(ctx, agentInput)
 		if err != nil {
 			return nil, fmt.Errorf("agent 执行失败（降级后）: %w", err)
@@ -305,8 +315,10 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	}, nil
 }
 
-// createAgent 创建 Agent 实例（消除重复代码）
-func (e *ReActEngine) createAgent(roleName string, provider hexagon.Provider) hexagon.Agent {
+// createAgent 创建 Agent 实例
+//
+// 优先级: 角色名 > Agent 路由注入的 system prompt > 默认 prompt
+func (e *ReActEngine) createAgent(roleName string, provider hexagon.Provider, metadata map[string]string) hexagon.Agent {
 	if roleName != "" {
 		agent, err := e.factory.CreateAgent(roleName, provider)
 		if err != nil {
@@ -315,10 +327,16 @@ func (e *ReActEngine) createAgent(roleName string, provider hexagon.Provider) he
 			return agent
 		}
 	}
+
+	prompt := systemPrompt
+	if metadata != nil && metadata["agent_prompt"] != "" {
+		prompt = metadata["agent_prompt"]
+	}
+
 	return hexagon.NewReActAgent(
 		hexagon.AgentWithName("hexclaw"),
 		hexagon.AgentWithLLM(provider),
-		hexagon.AgentWithSystemPrompt(systemPrompt),
+		hexagon.AgentWithSystemPrompt(prompt),
 		hexagon.AgentWithMaxIterations(10),
 	)
 }
@@ -366,7 +384,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	}
 
 	// 3. 语义缓存命中 → 单 chunk 返回
-	if cached, ok := e.cache.Get(msg.Content); ok {
+	if cached, ok := e.cache.Get(msg.Content, e.cfg.LLM.Default); ok {
 		log.Printf("语义缓存命中: %s", msg.Content[:min(20, len(msg.Content))])
 		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg.Content); err != nil {
 			log.Printf("保存用户消息失败: %v", err)
@@ -404,8 +422,8 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		}
 	}
 
-	// 6. 获取 LLM Provider
-	provider, providerName, err := e.router.Route(ctx)
+	// 6. 获取 LLM Provider（支持指定 provider，"" 和 "auto" 使用默认路由）
+	provider, providerName, err := e.resolveProvider(ctx, msg.Metadata["provider"], msg)
 	if err != nil {
 		return nil, fmt.Errorf("llm 路由失败: %w", err)
 	}
@@ -433,7 +451,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		providerName = fbName
 	}
 
-	// 9. 启动 goroutine 将 streamx.Chunk 转发为 adapter.ReplyChunk
+	// 9. 启动 goroutine 将 LLMStreamChunk 转发为 adapter.ReplyChunk
 	ch := make(chan *adapter.ReplyChunk, 16)
 	go e.pipeStream(ctx, ch, llmStream, sess.ID, msg, providerName)
 
@@ -444,7 +462,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 func (e *ReActEngine) pipeStream(
 	ctx context.Context,
 	ch chan<- *adapter.ReplyChunk,
-	llmStream *streamx.Stream,
+	llmStream *hexagon.LLMStream,
 	sessionID string,
 	msg *adapter.Message,
 	providerName string,
@@ -486,8 +504,12 @@ func (e *ReActEngine) pipeStream(
 	ch <- doneChunk
 	content := fullContent.String()
 
+	// 使用独立 context 进行后续操作，避免请求 ctx 取消后无法保存
+	saveCtx, saveCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer saveCancel()
+
 	// 保存助手回复
-	if err := e.sessions.SaveAssistantMessage(ctx, sessionID, content); err != nil {
+	if err := e.sessions.SaveAssistantMessage(saveCtx, sessionID, content); err != nil {
 		log.Printf("保存助手回复失败: %v", err)
 	}
 
@@ -505,7 +527,7 @@ func (e *ReActEngine) pipeStream(
 			Tokens:    result.Usage.TotalTokens,
 			CreatedAt: time.Now(),
 		}
-		if err := e.store.SaveCost(ctx, costRecord); err != nil {
+		if err := e.store.SaveCost(saveCtx, costRecord); err != nil {
 			log.Printf("记录成本失败: %v", err)
 		}
 	}
@@ -550,20 +572,63 @@ func singleChunk(content string) <-chan *adapter.ReplyChunk {
 	return ch
 }
 
+// resolveProvider 根据请求的 provider 名称解析 LLM Provider
+//
+// 如果 providerHint 为空或 "auto"，使用路由器默认策略选择；
+// 否则尝试使用指定的 Provider，不存在则回退到默认。
+func (e *ReActEngine) resolveProvider(ctx context.Context, providerHint string, msg *adapter.Message) (hexagon.Provider, string, error) {
+	// 优先级: 显式指定 > Agent 路由 > 默认路由
+	hint := providerHint
+
+	// 如果未显式指定 Provider，尝试通过 Agent 路由获取
+	if (hint == "" || hint == "auto") && e.agentRouter != nil && msg != nil {
+		result := e.agentRouter.Route(agentrouter.RouteRequest{
+			Platform: string(msg.Platform),
+			UserID:   msg.UserID,
+			ChatID:   msg.SessionID,
+		})
+		if result != nil && result.AgentConfig != nil && result.AgentConfig.Provider != "" {
+			hint = result.AgentConfig.Provider
+			// 将路由结果注入 metadata 供后续 createAgent 使用
+			if msg.Metadata == nil {
+				msg.Metadata = make(map[string]string)
+			}
+			if msg.Metadata["role"] == "" && result.AgentConfig.SystemPrompt != "" {
+				msg.Metadata["agent_prompt"] = result.AgentConfig.SystemPrompt
+			}
+		}
+	}
+
+	if hint == "" || hint == "auto" {
+		return e.router.Route(ctx)
+	}
+	if p, ok := e.router.Get(hint); ok {
+		return p, hint, nil
+	}
+	log.Printf("指定的 Provider %q 不存在，回退到默认路由", hint)
+	return e.router.Route(ctx)
+}
+
 // systemPrompt HexClaw 系统提示词
-const systemPrompt = `你是 HexClaw，一个安全、智能、高效的个人 AI 助手。
+const systemPrompt = `你是「小蟹」🦀，HexClaw 的 AI 助手。
 
-你的核心原则：
-1. 安全第一：不执行危险操作，不泄露敏感信息
-2. 诚实可靠：不确定的事情坦诚告知，不编造信息
-3. 简洁高效：直接回答问题，避免冗长的废话
-4. 友好专业：用友好的语气提供专业的帮助
+关于你：
+- 名字叫「小蟹」，用户也可以叫你"河蟹"、"HexClaw"
+- 由 Hexagon AI Agent Engine 驱动
+- 本地部署，数据私有：API Key 直连模型服务商，中间零代理
+- 原生支持 MCP 工具协议：文件、数据库、API 即插即用
+- 当用户问"你是谁"时，介绍自己是「小蟹」，不要提及底层 LLM 模型名称
 
-你可以帮助用户：
-- 回答问题和提供建议
-- 搜索信息和整理资料
-- 翻译文本
-- 编写和解释代码
-- 分析和总结文本
+性格：
+- 友好、专业、略带幽默感，偶尔横行一下 🦀
+- 回答简洁直接，不拖泥带水
+- 诚实可靠：不确定的事情坦诚告知，不编造信息
+- 用中文回答，除非用户明确要求使用其他语言
 
-请用中文回答，除非用户明确要求使用其他语言。`
+能力：
+- 智能编排：多步骤任务自动执行
+- 本地操控：直接操作本地文件
+- 代码生成：自动化开发任务
+- 知识问答：基于个人知识库 RAG 增强检索
+- 工具调用：天气查询、网络搜索、翻译等内置技能
+- MCP 扩展：通过 Model Context Protocol 接入任意外部工具`

@@ -27,6 +27,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/everyday-items/hexagon"
 )
@@ -50,10 +51,11 @@ type ToolInfo struct {
 
 // connectedServer 已连接的 MCP Server
 type connectedServer struct {
-	name    string
-	tools   []hexagon.Tool // MCP 工具（已适配为 hexagon Tool）
-	cleanup func()         // stdio 模式的清理函数
-	closer  io.Closer      // sse 模式的关闭接口
+	name      string
+	tools     []hexagon.Tool // MCP 工具（已适配为 hexagon Tool）
+	cleanup   func()         // stdio 模式的清理函数
+	closer    io.Closer      // sse 模式的关闭接口
+	connected bool           // 连接状态
 }
 
 // Manager MCP 连接管理器
@@ -61,14 +63,18 @@ type connectedServer struct {
 // 管理所有 MCP Server 连接，自动发现工具。
 // 提供工具列表和健康检查能力。
 type Manager struct {
-	mu      sync.RWMutex
-	servers map[string]*connectedServer
+	mu       sync.RWMutex
+	servers  map[string]*connectedServer
+	configs  []ServerConfig // 保存配置用于重连
+	stopCh   chan struct{}
+	closeOnce sync.Once
 }
 
 // NewManager 创建 MCP 管理器
 func NewManager() *Manager {
 	return &Manager{
 		servers: make(map[string]*connectedServer),
+		stopCh:  make(chan struct{}),
 	}
 }
 
@@ -98,12 +104,75 @@ func (m *Manager) Connect(ctx context.Context, configs []ServerConfig) (int, err
 		log.Printf("MCP Server %q 已连接: 发现 %d 个工具", cfg.Name, len(server.tools))
 	}
 
+	// 保存配置用于重连
+	m.configs = configs
+
+	// 启动后台重连监控
+	go m.reconnectLoop()
+
 	return totalTools, nil
+}
+
+// reconnectLoop 定期检查断开的 Server 并尝试重连
+func (m *Manager) reconnectLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case <-ticker.C:
+			m.tryReconnect()
+		}
+	}
+}
+
+// tryReconnect 对所有断开的 Server 尝试重连
+func (m *Manager) tryReconnect() {
+	for _, cfg := range m.configs {
+		if !cfg.Enabled {
+			continue
+		}
+
+		m.mu.RLock()
+		server, exists := m.servers[cfg.Name]
+		needReconnect := !exists || !server.connected
+		m.mu.RUnlock()
+
+		if !needReconnect {
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		newServer, err := m.connectServer(ctx, cfg)
+		cancel()
+
+		if err != nil {
+			log.Printf("MCP Server %q 重连失败: %v", cfg.Name, err)
+			continue
+		}
+
+		m.mu.Lock()
+		// 清理旧连接
+		if old, ok := m.servers[cfg.Name]; ok {
+			if old.cleanup != nil {
+				old.cleanup()
+			}
+			if old.closer != nil {
+				old.closer.Close()
+			}
+		}
+		m.servers[cfg.Name] = newServer
+		m.mu.Unlock()
+
+		log.Printf("MCP Server %q 已重连: 发现 %d 个工具", cfg.Name, len(newServer.tools))
+	}
 }
 
 // connectServer 连接单个 MCP Server
 func (m *Manager) connectServer(ctx context.Context, cfg ServerConfig) (*connectedServer, error) {
-	server := &connectedServer{name: cfg.Name}
+	server := &connectedServer{name: cfg.Name, connected: true}
 
 	switch cfg.Transport {
 	case "stdio":
@@ -180,25 +249,74 @@ func (m *Manager) ServerNames() []string {
 	return names
 }
 
+// CallTool 调用指定 MCP 工具
+//
+// 在所有已连接 Server 中查找指定名称的工具并执行。
+func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string]any) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, server := range m.servers {
+		for _, t := range server.tools {
+			if t.Name() == toolName {
+				result, err := t.Execute(ctx, args)
+				if err != nil {
+					return "", fmt.Errorf("工具 %q 执行失败: %w", toolName, err)
+				}
+				return result.String(), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("工具 %q 未找到", toolName)
+}
+
+// ServerStatus MCP Server 状态信息
+type ServerStatus struct {
+	Name      string `json:"name"`
+	Connected bool   `json:"connected"`
+	ToolCount int    `json:"tool_count"`
+}
+
+// ServerStatuses 获取所有 MCP Server 的状态
+func (m *Manager) ServerStatuses() []ServerStatus {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	statuses := make([]ServerStatus, 0, len(m.servers))
+	for name, server := range m.servers {
+		statuses = append(statuses, ServerStatus{
+			Name:      name,
+			Connected: server.connected,
+			ToolCount: len(server.tools),
+		})
+	}
+	return statuses
+}
+
 // Close 关闭所有 MCP Server 连接
 //
 // 按顺序关闭所有连接，释放资源。
 // 应在程序退出时调用。
 func (m *Manager) Close() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.closeOnce.Do(func() {
+		close(m.stopCh)
 
-	for name, server := range m.servers {
-		if server.cleanup != nil {
-			server.cleanup()
-		}
-		if server.closer != nil {
-			if err := server.closer.Close(); err != nil {
-				log.Printf("MCP Server %q 关闭出错: %v", name, err)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		for name, server := range m.servers {
+			server.connected = false
+			if server.cleanup != nil {
+				server.cleanup()
 			}
+			if server.closer != nil {
+				if err := server.closer.Close(); err != nil {
+					log.Printf("MCP Server %q 关闭出错: %v", name, err)
+				}
+			}
+			log.Printf("MCP Server %q 已断开", name)
 		}
-		log.Printf("MCP Server %q 已断开", name)
-	}
 
-	m.servers = make(map[string]*connectedServer)
+		m.servers = make(map[string]*connectedServer)
+	})
 }

@@ -129,44 +129,48 @@ func extractShellCommand(input string) string {
 	return strings.TrimSpace(input)
 }
 
-// allowedCommands 白名单：仅允许安全的只读/计算类命令
+// allowedCommands 白名单：仅允许真正只读/无副作用的命令
+// 已移除所有具有写能力的命令：python/python3/go/node/sed/awk/curl/wget/
+// cp/mv/mkdir/touch/tar/zip/unzip/gzip/gunzip/tee/xargs/yes 等
 var allowedCommands = map[string]bool{
-	// 文件查看
-	"ls": true, "cat": true, "head": true, "tail": true, "less": true,
-	"file": true, "stat": true, "wc": true, "du": true, "df": true,
-	// 搜索/过滤
-	"find": true, "grep": true, "rg": true, "ag": true, "awk": true, "sed": true,
-	// 排序/去重/格式化
-	"sort": true, "uniq": true, "cut": true, "tr": true, "column": true,
-	"fmt": true, "fold": true, "paste": true, "join": true,
-	// 系统信息
-	"date": true, "cal": true, "uptime": true, "uname": true, "whoami": true,
-	"hostname": true, "id": true, "env": true, "printenv": true,
-	"ps": true, "top": true, "free": true, "which": true, "where": true,
-	// 文本处理
-	"echo": true, "printf": true, "tee": true, "xargs": true,
-	"diff": true, "comm": true, "md5sum": true, "sha256sum": true,
-	"base64": true, "hexdump": true, "xxd": true,
-	// 编程工具
-	"go": true, "python3": true, "python": true, "node": true, "jq": true,
-	// 网络（只读）
-	"ping": true, "dig": true, "nslookup": true, "host": true,
-	"curl": true, "wget": true, "ifconfig": true, "ip": true,
-	// 数学
-	"bc": true, "expr": true,
-	// 压缩（查看）
-	"tar": true, "zip": true, "unzip": true, "gzip": true, "gunzip": true,
-	// Git（只读）
+	// 文件查看（只读）
+	"ls": true, "cat": true, "head": true, "tail": true,
+	"file": true, "wc": true, "du": true, "df": true,
+	// 搜索/过滤（只读）
+	"find": true, "grep": true,
+	// 排序/去重/文本处理
+	"sort": true, "uniq": true, "jq": true, "tree": true,
+	// 系统信息（只读）
+	"date": true, "uptime": true, "uname": true, "whoami": true,
+	"env": true, "ps": true, "top": true, "free": true, "which": true,
+	// 文本输出
+	"echo": true,
+	// 网络诊断（只读）
+	"ping": true, "dig": true, "nslookup": true,
+	"traceroute": true, "ifconfig": true, "ip": true, "ss": true, "netstat": true,
+	// 网络获取（curl 限制：仅允许 GET，-o/-O 由 dangerousFlags 拦截）
+	"curl": true,
+	// 文件操作（低风险写操作）
+	"touch": true, "mkdir": true, "cp": true,
+	// python3 已移除：可通过 -c 执行任意代码（os.system 等），风险不可控
+	// Git（只读子命令，危险子命令另行拦截）
 	"git": true,
-	// 其他
-	"pwd": true, "basename": true, "dirname": true, "realpath": true,
-	"seq": true, "yes": true, "true": true, "false": true, "test": true,
-	"tree": true, "touch": true, "mkdir": true, "cp": true, "mv": true,
+	// 路径/标识
+	"pwd": true,
 }
 
 // dangerousSubcommands 即使主命令在白名单，某些子命令仍需拦截
 var dangerousSubcommands = map[string][]string{
-	"git": {"push", "remote add", "remote set-url"},
+	"git": {
+		"push", "remote add", "remote set-url",
+		"reset", "checkout", "clean", "rebase",
+		"commit", "merge", "stash", "cherry-pick",
+		"tag", "branch -D", "branch -d",
+		"clone", "pull", "submodule", "config",
+	},
+	"curl": {
+		"-o ", "-O", "--output ", "--upload-file ",
+	},
 }
 
 // checkAllowed 白名单安全检查
@@ -226,15 +230,33 @@ func checkDangerousPatterns(cmd string) string {
 	if strings.HasPrefix(strings.TrimSpace(cmd), "eval ") || strings.Contains(cmd, "; eval ") {
 		return "禁止使用 eval"
 	}
-	// 输出重定向到设备文件
-	if strings.Contains(cmd, "> /dev/") {
-		return "禁止重定向到设备文件"
+	// 输出重定向（> 和 >>）
+	if strings.Contains(cmd, ">") {
+		return "禁止使用输出重定向 > / >>"
+	}
+	// 输入重定向 here-doc
+	if strings.Contains(cmd, "<<") {
+		return "禁止使用 here-doc 重定向 <<"
+	}
+	// 进程替换
+	if strings.Contains(cmd, "<(") || strings.Contains(cmd, ">(") {
+		return "禁止使用进程替换 <() / >()"
+	}
+	// && 和 || 条件链（由 splitCommandSegments 统一处理，但在此提前拦截）
+	if strings.Contains(cmd, "&&") {
+		return "禁止使用 && 命令链"
+	}
+	if strings.Contains(cmd, "||") {
+		return "禁止使用 || 命令链"
 	}
 	return ""
 }
 
-// splitCommandSegments 按管道和分号拆分命令
+// splitCommandSegments 按管道、分号、&& 和 || 拆分命令
 func splitCommandSegments(cmd string) []string {
+	// 先将 && 和 || 替换为分号，再统一按 | 和 ; 拆分
+	cmd = strings.ReplaceAll(cmd, "&&", ";")
+	cmd = strings.ReplaceAll(cmd, "||", ";")
 	var segments []string
 	for _, part := range strings.Split(cmd, "|") {
 		for _, sub := range strings.Split(part, ";") {

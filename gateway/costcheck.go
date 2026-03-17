@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/everyday-items/hexclaw/adapter"
@@ -38,7 +39,12 @@ func (l *CostCheckLayer) Check(ctx context.Context, msg *adapter.Message) error 
 	if l.cfg.BudgetPerUser > 0 && msg.UserID != "" {
 		userCost, err := l.store.GetUserCost(ctx, msg.UserID, monthStart)
 		if err != nil {
-			return nil // 查询失败不阻止请求
+			log.Printf("查询用户成本失败（fail-closed）: %v", err)
+			return &GatewayError{
+				Layer:   "cost_check",
+				Code:    "cost_query_error",
+				Message: "预算查询服务异常，请稍后重试",
+			}
 		}
 
 		if userCost >= l.cfg.BudgetPerUser {
@@ -54,7 +60,12 @@ func (l *CostCheckLayer) Check(ctx context.Context, msg *adapter.Message) error 
 	if l.cfg.BudgetGlobal > 0 {
 		globalCost, err := l.store.GetGlobalCost(ctx, monthStart)
 		if err != nil {
-			return nil // 查询失败不阻止请求
+			log.Printf("查询全局成本失败（fail-closed）: %v", err)
+			return &GatewayError{
+				Layer:   "cost_check",
+				Code:    "cost_query_error",
+				Message: "预算查询服务异常，请稍后重试",
+			}
 		}
 
 		if globalCost >= l.cfg.BudgetGlobal {

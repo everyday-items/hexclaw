@@ -3,29 +3,35 @@
   <h1>HexClaw 河蟹</h1>
   <p><strong>企业级安全的个人 AI Agent</strong> — 安全 · 开源 · 自托管 · 易用 · 功能全面</p>
 
-  [![CI](https://github.com/everyday-items/hexclaw/workflows/CI/badge.svg)](https://github.com/everyday-items/hexclaw/actions)
-  [![Release](https://img.shields.io/github/v/release/everyday-items/hexclaw?include_prereleases)](https://github.com/everyday-items/hexclaw/releases)
-  [![License](https://img.shields.io/github/license/everyday-items/hexclaw)](https://github.com/everyday-items/hexclaw/blob/main/LICENSE)
-  [![Go Report Card](https://goreportcard.com/badge/github.com/everyday-items/hexclaw)](https://goreportcard.com/report/github.com/everyday-items/hexclaw)
+  [![CI](https://github.com/hexagon-codes/hexclaw/workflows/CI/badge.svg)](https://github.com/hexagon-codes/hexclaw/actions)
+  [![Release](https://img.shields.io/github/v/release/hexagon-codes/hexclaw?include_prereleases)](https://github.com/hexagon-codes/hexclaw/releases)
+  [![License](https://img.shields.io/github/license/hexagon-codes/hexclaw)](https://github.com/hexagon-codes/hexclaw/blob/main/LICENSE)
+  [![Go Report Card](https://goreportcard.com/badge/github.com/hexagon-codes/hexclaw)](https://goreportcard.com/report/github.com/hexagon-codes/hexclaw)
 
-  > 基于 [Hexagon](https://github.com/everyday-items/hexagon) AI Agent 全能型框架构建
+  > 基于 [Hexagon](https://github.com/hexagon-codes/hexagon) AI Agent 全能型框架构建
 </div>
 
 ## 特性
 
 ### 核心能力
-- **ReAct Agent 引擎** — 推理 + 行动循环，支持多轮工具调用
+- **ReAct Agent 引擎** — 推理 + 行动循环，支持多轮工具调用与流式输出
 - **六层安全网关** — 认证、限流、成本控制、注入检测、权限校验、审计日志
 - **LLM 智能路由** — 多 Provider 自动切换，故障降级，成本优化
-- **Skill 系统** — 内置搜索/天气/翻译/摘要，沙箱安全执行
+- **Skill 系统** — 内置搜索/天气/翻译/摘要，沙箱安全执行，Shell 白名单防护
+- **语义缓存** — Singleflight 防击穿 + TTL 抖动防雪崩 + 空值缓存防穿透
 - **知识库** — FTS5 + 向量混合检索，RAG 上下文增强
+
+### 会话与数据
+- **会话管理** — 创建/查询/删除会话，消息历史，会话分支 (fork)
+- **全文搜索** — FTS5 驱动的消息搜索
+- **上下文压缩** — LLM 驱动的旧消息摘要，防止 token 爆炸
+- **文件驱动记忆** — MEMORY.md 长期记忆 + 每日日记，可审查可版本控制
 
 ### 自主行为
 - **Heartbeat 主动巡查** — Agent 定期自主检查待办事项并通知
-- **Cron 定时任务** — 定时报告、提醒、巡检（cron 表达式 + @every/@daily）
+- **Cron 定时任务** — 定时报告、提醒、巡检（cron 表达式 + @every/@daily/@weekly）
 - **Webhooks** — GitHub/GitLab/通用 JSON，HMAC-SHA256 签名验证
-- **上下文压缩** — LLM 驱动的旧消息摘要，防止 token 爆炸
-- **文件驱动记忆** — MEMORY.md 长期记忆 + 每日日记，可审查可版本控制
+- **工作流引擎** — 可视化编排多步骤 Agent 工作流（Canvas Workflow）
 
 ### 生态扩展
 - **MCP 原生支持** — 兼容 3200+ MCP Server（stdio + SSE 传输）
@@ -33,9 +39,11 @@
 - **多 Agent 路由** — 一个实例托管多个 Agent，按平台/用户/群组路由
 - **Canvas / A2UI** — Agent 生成交互式 UI（图表、表单、看板等 8 种组件）
 - **安全审计 CLI** — `hexclaw security audit` 一键安全检查 + 修复建议
-- **语音交互** — STT/TTS 接口定义，支持多 Provider 接入
+- **语音交互** — STT/TTS 转写与合成，支持多 Provider 接入
+- **桌面集成** — 系统通知、剪贴板交互（Tauri 桌面端）
+- **实时日志** — WebSocket 日志流 + 统计分析
 
-### 多平台接入
+### 多平台接入（13 种）
 
 | 平台 | 方式 | 状态 |
 |------|------|:----:|
@@ -47,6 +55,10 @@
 | Slack | Events API | ✅ |
 | 企业微信 | HTTP 回调 + AES 加解密 | ✅ |
 | 微信公众号 | XML 消息 + 被动/客服回复 | ✅ |
+| WhatsApp | Cloud API Webhook | ✅ |
+| LINE | Messaging API Webhook | ✅ |
+| Matrix | Client-Server API | ✅ |
+| Email | IMAP/SMTP | ✅ |
 | REST API | HTTP | ✅ |
 
 ## 快速开始
@@ -55,10 +67,10 @@
 
 ```bash
 # 从源码安装
-go install github.com/everyday-items/hexclaw/cmd/hexclaw@latest
+go install github.com/hexagon-codes/hexclaw/cmd/hexclaw@latest
 
 # 或使用预编译二进制（从 Releases 下载）
-curl -sSL https://github.com/everyday-items/hexclaw/releases/latest/download/hexclaw-$(uname -s)-$(uname -m).tar.gz | tar xz
+curl -sSL https://github.com/hexagon-codes/hexclaw/releases/latest/download/hexclaw-$(uname -s)-$(uname -m).tar.gz | tar xz
 sudo mv hexclaw /usr/local/bin/
 ```
 
@@ -82,7 +94,7 @@ docker run -d \
   -p 6060:6060 \
   -e DEEPSEEK_API_KEY="sk-xxx" \
   -v hexclaw-data:/data/.hexclaw \
-  ghcr.io/everyday-items/hexclaw:latest
+  ghcr.io/hexagon-codes/hexclaw:latest
 ```
 
 服务启动后：
@@ -213,23 +225,27 @@ storage:
 ## 架构
 
 ```
-用户 → 平台适配器(8种) → 安全网关(6层) → Agent 路由 → Agent 引擎 → LLM Provider
+用户 → 平台适配器(13种) → 安全网关(6层) → Agent 路由 → Agent 引擎 → LLM Provider
          │                    │              │            │            │
    Web/飞书/Telegram    认证→限流→成本    多Agent路由   ReAct 推理    DeepSeek/OpenAI
-   Discord/Slack/...    →安全→权限→审计                 Skill/MCP    Claude/Qwen/...
-   钉钉/企微/微信                                       知识库RAG
+   Discord/Slack/...    →安全→权限→审计   工作流引擎    Skill/MCP    Claude/Qwen/...
+   钉钉/企微/微信/...                                   知识库RAG
+   WhatsApp/LINE/...                                    会话分支
+   Matrix/Email
 ```
 
 ### 六层安全网关
 
-| 层级 | 名称 | 功能 |
-|:---:|------|------|
-| 1 | Auth | 身份认证（Token/API Key） |
-| 2 | RateLimit | 滑动窗口限流（每分钟/每小时） |
-| 3 | CostCheck | 用户/全局月度预算检查 |
-| 4 | InputSafety | Prompt 注入检测 + PII 脱敏 |
-| 5 | Permission | RBAC 权限校验 |
-| 6 | Audit | 请求审计日志 |
+| 层级 | 名称 | 功能 | 异常策略 |
+|:---:|------|------|---------|
+| 1 | Auth | 身份认证（Token/API Key，constant-time 比较） | 拒绝 |
+| 2 | RateLimit | 滑动窗口限流（每分钟/每小时，100K 窗口上限） | 拒绝 |
+| 3 | CostCheck | 用户/全局月度预算检查 | **Fail-closed** |
+| 4 | InputSafety | Prompt 注入检测 + PII 脱敏 | **Fail-closed** |
+| 5 | Permission | RBAC 权限校验 | 拒绝 |
+| 6 | Audit | 请求审计日志 | 放行（仅记录） |
+
+> 第 3/4 层在服务异常时拒绝请求（fail-closed），而非静默放行。详见 [SECURITY.md](SECURITY.md)。
 
 ### 目录结构
 
@@ -245,10 +261,16 @@ hexclaw/
 │   ├── discord/             #   Discord Bot
 │   ├── slack/               #   Slack Bot
 │   ├── wecom/               #   企业微信
-│   └── wechat/              #   微信公众号
+│   ├── wechat/              #   微信公众号
+│   ├── whatsapp/            #   WhatsApp
+│   ├── line/                #   LINE
+│   ├── matrix/              #   Matrix
+│   └── email/               #   Email (IMAP/SMTP)
 ├── agents/                  # Agent 角色 (6 种预置角色)
-├── api/                     # REST API 服务 (50+ 端点)
-│   ├── server.go            #   核心服务器 + 聊天
+├── api/                     # REST API 服务 (71 个路由)
+│   ├── server.go            #   核心服务器 + 聊天 + 路由注册
+│   ├── handler_extended.go  #   工作流/配置/版本/统计 API
+│   ├── handler_logs.go      #   日志查询/统计/实时流 API
 │   ├── handler_knowledge.go #   知识库 API
 │   ├── handler_webhook.go   #   Webhook API
 │   ├── handler_cron.go      #   定时任务 API
@@ -280,14 +302,36 @@ hexclaw/
 └── Makefile
 ```
 
-## API 端点
+## API 端点（71 个路由）
 
 ### 核心
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/health` | 健康检查 |
-| POST | `/api/v1/chat` | 聊天（支持角色选择） |
+| POST | `/api/v1/chat` | 聊天（支持流式/同步、角色选择） |
 | GET | `/api/v1/roles` | 角色列表 |
+| GET | `/api/v1/version` | 版本信息 |
+| GET | `/api/v1/stats` | 系统统计 |
+| GET | `/api/v1/models` | 已配置 LLM 模型列表 |
+
+### 会话管理
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/sessions` | 会话列表 |
+| GET | `/api/v1/sessions/{id}` | 会话详情 |
+| DELETE | `/api/v1/sessions/{id}` | 删除会话 |
+| GET | `/api/v1/sessions/{id}/messages` | 消息历史 |
+| GET | `/api/v1/sessions/{id}/branches` | 会话分支列表 |
+| POST | `/api/v1/sessions/{id}/fork` | 分支对话 |
+| GET | `/api/v1/messages/search` | 全文搜索消息 |
+
+### 配置
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/config` | 获取完整配置 |
+| PUT | `/api/v1/config` | 更新配置 |
+| GET | `/api/v1/config/llm` | 获取 LLM 配置 |
+| PUT | `/api/v1/config/llm` | 更新 LLM 配置 |
 
 ### 知识库
 | 方法 | 路径 | 说明 |
@@ -305,6 +349,8 @@ hexclaw/
 | DELETE | `/api/v1/cron/jobs/{id}` | 删除任务 |
 | POST | `/api/v1/cron/jobs/{id}/pause` | 暂停任务 |
 | POST | `/api/v1/cron/jobs/{id}/resume` | 恢复任务 |
+| POST | `/api/v1/cron/jobs/{id}/trigger` | 手动触发 |
+| GET | `/api/v1/cron/jobs/{id}/history` | 执行历史 |
 
 ### Webhook
 | 方法 | 路径 | 说明 |
@@ -314,18 +360,75 @@ hexclaw/
 | POST | `/api/v1/webhooks` | 注册 |
 | DELETE | `/api/v1/webhooks/{name}` | 删除 |
 
-### 其他端点
+### 记忆
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET/POST | `/api/v1/memory` | 获取/保存记忆 |
+| GET | `/api/v1/memory` | 获取记忆 |
+| POST | `/api/v1/memory` | 创建记忆 |
+| PUT | `/api/v1/memory` | 更新记忆 |
+| DELETE | `/api/v1/memory` | 清空记忆 |
+| DELETE | `/api/v1/memory/{id}` | 删除指定记忆 |
 | GET | `/api/v1/memory/search` | 搜索记忆 |
-| GET | `/api/v1/mcp/tools` | MCP 工具列表 |
-| GET | `/api/v1/mcp/servers` | MCP Server 列表 |
+
+### MCP
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/mcp/tools` | 工具列表 |
+| GET | `/api/v1/mcp/servers` | Server 列表 |
+| GET | `/api/v1/mcp/status` | 连接状态 |
+| POST | `/api/v1/mcp/tools/call` | 调用工具 |
+
+### 技能
+| 方法 | 路径 | 说明 |
+|------|------|------|
 | GET | `/api/v1/skills` | 已安装技能 |
 | POST | `/api/v1/skills/install` | 安装技能 |
-| GET/POST/DELETE | `/api/v1/agents` | Agent 路由管理 |
-| GET | `/api/v1/canvas/panels` | Canvas 面板列表 |
+| DELETE | `/api/v1/skills/{name}` | 卸载技能 |
+| GET | `/api/v1/clawhub/search` | ClawHub 技能搜索 |
+
+### Agent 路由
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/agents` | Agent 列表 |
+| POST | `/api/v1/agents` | 注册 Agent |
+| PUT | `/api/v1/agents/{name}` | 更新 Agent |
+| DELETE | `/api/v1/agents/{name}` | 删除 Agent |
+
+### Canvas / 工作流
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/canvas/panels` | 面板列表 |
+| GET | `/api/v1/canvas/panels/{id}` | 面板详情 |
+| POST | `/api/v1/canvas/events` | 推送事件 |
+| GET | `/api/v1/canvas/workflows` | 工作流列表 |
+| POST | `/api/v1/canvas/workflows` | 保存工作流 |
+| DELETE | `/api/v1/canvas/workflows/{id}` | 删除工作流 |
+| POST | `/api/v1/canvas/workflows/{id}/run` | 执行工作流 |
+| GET | `/api/v1/canvas/runs/{id}` | 执行结果 |
+
+### 语音
+| 方法 | 路径 | 说明 |
+|------|------|------|
 | GET | `/api/v1/voice/status` | 语音服务状态 |
+| POST | `/api/v1/voice/transcribe` | 语音转文字 (STT) |
+| POST | `/api/v1/voice/synthesize` | 文字转语音 (TTS) |
+
+### 桌面集成
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/desktop/info` | 桌面环境信息 |
+| GET | `/api/v1/desktop/notifications` | 通知列表 |
+| POST | `/api/v1/desktop/notifications` | 发送通知 |
+| DELETE | `/api/v1/desktop/notifications` | 清空通知 |
+| GET | `/api/v1/desktop/clipboard` | 读取剪贴板 |
+| POST | `/api/v1/desktop/clipboard` | 写入剪贴板 |
+
+### 日志与监控
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/logs` | 查询日志 |
+| GET | `/api/v1/logs/stats` | 日志统计 |
+| GET | `/api/v1/logs/stream` | 实时日志流 (WebSocket) |
 
 ## 开发
 
@@ -372,7 +475,7 @@ golangci-lint run
 | 组件 | 技术 |
 |------|------|
 | 语言 | Go 1.25+ |
-| Agent 框架 | [Hexagon](https://github.com/everyday-items/hexagon) |
+| Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | 配置 | YAML + 环境变量 |
 | 存储 | SQLite (modernc.org/sqlite) |
@@ -414,12 +517,19 @@ chore: 构建/工具链
 
 | 项目 | 说明 | 仓库 |
 |------|------|------|
-| **Hexagon** | Go AI Agent 框架 (核心引擎) | [hexagon](https://github.com/everyday-items/hexagon) |
-| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) | [ai-core](https://github.com/everyday-items/ai-core) |
-| **toolkit** | Go 通用工具库 | [toolkit](https://github.com/everyday-items/toolkit) |
-| **hexagon-ui** | Hexagon Dev UI 观测面板 (Vue 3) | [hexagon-ui](https://github.com/everyday-items/hexagon-ui) |
-| **hexclaw-desktop** | HexClaw 桌面客户端 (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/everyday-items/hexclaw-desktop) |
-| **hexclaw-ui** | HexClaw Web 前端 (Vue 3) | [hexclaw-ui](https://github.com/everyday-items/hexclaw-ui) |
+| **Hexagon** | Go AI Agent 框架 (核心引擎) | [hexagon](https://github.com/hexagon-codes/hexagon) |
+| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **toolkit** | Go 通用工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) |
+| **hexagon-ui** | Hexagon Dev UI 观测面板 (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
+| **hexclaw-desktop** | HexClaw 桌面客户端 (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
+| **hexclaw-ui** | HexClaw Web 前端 (Vue 3) | [hexclaw-ui](https://github.com/hexagon-codes/hexclaw-ui) |
+
+## 联系我们
+
+- 河蟹 AI: ai@hexclaw.net
+- 河蟹支持: support@hexclaw.net
+- Issues: [GitHub Issues](https://github.com/hexagon-codes/hexclaw/issues)
+- 安全漏洞: 请参阅 [SECURITY.md](SECURITY.md)
 
 ## 许可证
 

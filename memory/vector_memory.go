@@ -152,6 +152,8 @@ func (vm *VectorMemory) Count(ctx context.Context) (int, error) {
 
 // Close 关闭向量存储连接
 func (vm *VectorMemory) Close() error {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
 	return vm.store.Close()
 }
 
@@ -344,6 +346,9 @@ func (sc *SessionContext) Clear() {
 // generateMemoryID 生成唯一记忆 ID
 func generateMemoryID() string {
 	b := make([]byte, 8)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand 在正常系统上不会失败，panic 是合理的
+		panic(fmt.Sprintf("crypto/rand.Read failed: %v", err))
+	}
 	return fmt.Sprintf("mem_%x", b)
 }

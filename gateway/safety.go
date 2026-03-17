@@ -72,8 +72,12 @@ func (l *InputSafetyLayer) Check(ctx context.Context, msg *adapter.Message) erro
 
 	result, err := l.guardChain.Check(ctx, msg.Content)
 	if err != nil {
-		log.Printf("安全守卫检查异常: %v", err)
-		return nil
+		log.Printf("安全守卫检查异常（fail-closed）: %v", err)
+		return &GatewayError{
+			Layer:   "input_safety",
+			Code:    "safety_check_error",
+			Message: "安全检查服务异常，请稍后重试",
+		}
 	}
 
 	if !result.Passed {

@@ -218,7 +218,7 @@ func (h *Hub) Install(ctx context.Context, name string) error {
 	// 二次验证：确保最终路径在 skillsDir 内
 	absPath, _ := filepath.Abs(path)
 	absDir, _ := filepath.Abs(h.skillsDir)
-	if !strings.HasPrefix(absPath, absDir+string(filepath.Separator)) {
+	if !strings.HasPrefix(absPath, filepath.Clean(absDir)+string(filepath.Separator)) {
 		return fmt.Errorf("路径越界: %s", name)
 	}
 	if err := os.WriteFile(path, content, 0o644); err != nil {

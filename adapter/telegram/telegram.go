@@ -65,16 +65,100 @@ func (a *TelegramAdapter) Send(ctx context.Context, chatID string, reply *adapte
 	return a.sendMessage(ctx, chatID, reply.Content)
 }
 
-// SendStream 流式发送（先发初始消息，后续编辑更新）
+// SendStream 流式发送（先发初始消息，后续编辑更新模拟打字机）
 func (a *TelegramAdapter) SendStream(ctx context.Context, chatID string, chunks <-chan *adapter.ReplyChunk) error {
 	var sb strings.Builder
+	var messageID int64
+	lastUpdateLen := 0
+	const updateThreshold = 50
+
 	for chunk := range chunks {
 		if chunk.Error != nil {
 			return chunk.Error
 		}
 		sb.WriteString(chunk.Content)
+		if chunk.Done {
+			break
+		}
+
+		if messageID == 0 && sb.Len() >= updateThreshold {
+			var err error
+			messageID, err = a.sendAndGetID(ctx, chatID, sb.String()+"…")
+			if err != nil {
+				continue
+			}
+			lastUpdateLen = sb.Len()
+			continue
+		}
+
+		if messageID != 0 && sb.Len()-lastUpdateLen >= updateThreshold {
+			_ = a.editMessage(ctx, chatID, messageID, sb.String()+"…")
+			lastUpdateLen = sb.Len()
+		}
 	}
-	return a.sendMessage(ctx, chatID, sb.String())
+
+	finalContent := sb.String()
+	if finalContent == "" {
+		return nil
+	}
+	if messageID != 0 {
+		return a.editMessage(ctx, chatID, messageID, finalContent)
+	}
+	return a.sendMessage(ctx, chatID, finalContent)
+}
+
+// sendAndGetID 发送消息并返回 message_id
+func (a *TelegramAdapter) sendAndGetID(ctx context.Context, chatID, text string) (int64, error) {
+	body, _ := json.Marshal(map[string]any{
+		"chat_id":    chatID,
+		"text":       text,
+		"parse_mode": "Markdown",
+	})
+
+	url := fmt.Sprintf("%s%s/sendMessage", baseURL, a.cfg.Token)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Result struct {
+			MessageID int64 `json:"message_id"`
+		} `json:"result"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result.Result.MessageID, nil
+}
+
+// editMessage 编辑已发送的消息
+func (a *TelegramAdapter) editMessage(ctx context.Context, chatID string, messageID int64, text string) error {
+	body, _ := json.Marshal(map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"text":       text,
+		"parse_mode": "Markdown",
+	})
+
+	url := fmt.Sprintf("%s%s/editMessageText", baseURL, a.cfg.Token)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
 }
 
 // pollLoop 长轮询循环

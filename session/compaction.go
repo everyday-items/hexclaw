@@ -100,28 +100,27 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, provider hexa
 		return 0, nil
 	}
 
-	// 生成摘要
+	// 生成摘要（在事务外执行，避免持有 DB 锁期间进行 LLM API 调用）
 	summary, err := c.generateSummary(ctx, oldMsgs, provider)
 	if err != nil {
 		return 0, fmt.Errorf("生成摘要失败: %w", err)
 	}
 
-	// 在事务中执行：删除旧消息 + 插入摘要
+	// 提前构造摘要消息
+	summaryMsg := &storage.MessageRecord{
+		ID:        "summary-" + idgen.ShortID(),
+		SessionID: sessionID,
+		Role:      "system",
+		Content:   "[上下文摘要] " + summary,
+		CreatedAt: time.Now(),
+	}
+
+	// 在事务中仅执行快速的数据库操作：删除旧消息 + 插入摘要
 	err = c.store.WithTx(ctx, func(txStore storage.Store) error {
-		// 删除旧消息
 		for _, msg := range oldMsgs {
 			if err := txStore.DeleteMessage(ctx, msg.ID); err != nil {
 				return fmt.Errorf("删除旧消息失败: %w", err)
 			}
-		}
-
-		// 插入摘要消息（使用唯一 ID，避免多次压缩主键冲突）
-		summaryMsg := &storage.MessageRecord{
-			ID:        "summary-" + idgen.ShortID(),
-			SessionID: sessionID,
-			Role:      "system",
-			Content:   "[上下文摘要] " + summary,
-			CreatedAt: time.Now(),
 		}
 		return txStore.SaveMessage(ctx, summaryMsg)
 	})

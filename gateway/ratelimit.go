@@ -62,13 +62,32 @@ func (l *RateLimitLayer) Check(_ context.Context, msg *adapter.Message) error {
 	w.hourRequests = filterAfter(w.hourRequests, hourAgo)
 
 	// 清理不活跃用户窗口，防止内存泄漏
-	// 仅在当前用户无历史记录且不是新用户时跳过清理（ok=true 表示之前存在）
+	// 先收集待删除的 key，再统一删除，避免迭代中删除的语义歧义
+	const maxWindows = 100000
+	var toDelete []string
 	for uid, uw := range l.windows {
 		if uid == userID {
 			continue
 		}
 		if len(uw.minuteRequests) == 0 && len(uw.hourRequests) == 0 {
+			toDelete = append(toDelete, uid)
+		}
+	}
+	for _, uid := range toDelete {
+		delete(l.windows, uid)
+	}
+	// 如果窗口数仍超过上限，强制淘汰（最终安全阀）
+	if len(l.windows) > maxWindows {
+		count := 0
+		for uid := range l.windows {
+			if uid == userID {
+				continue
+			}
 			delete(l.windows, uid)
+			count++
+			if len(l.windows) <= maxWindows {
+				break
+			}
 		}
 	}
 
