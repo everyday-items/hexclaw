@@ -104,7 +104,7 @@ hexclaw init
 ├── data.db          # SQLite 数据库（自动创建）
 ├── memory/          # 文件记忆目录
 │   ├── MEMORY.md    # 长期记忆
-│   └── 2026-03-18.md # 每日日记（以当天日期命名）
+│   └── YYYY-MM-DD.md  # 每日日记（以当天日期命名）
 └── skills/          # 技能安装目录
 ```
 
@@ -379,7 +379,7 @@ platforms:
 ### 飞书 Bot
 
 1. 在[飞书开放平台](https://open.feishu.cn/)创建应用，获取 App ID 和 App Secret
-2. 配置事件订阅 URL: `http://YOUR_HOST:6060/feishu/webhook`（或使用命令行参数）
+2. 配置事件订阅 URL: `http://YOUR_HOST:6061/feishu/webhook`（或使用命令行参数）
 3. 启用配置：
 
 ```yaml

@@ -1,7 +1,7 @@
 // Package hexclaw 提供企业级安全的个人 AI Agent
 //
 // HexClaw（河蟹）是一个安全、开源、可自托管的个人 AI Agent，
-// 支持多平台接入（飞书/钉钉/微信/Telegram/Discord/Slack/Web），
+// 支持多平台接入（飞书/钉钉/微信/企微/Telegram/Discord/Slack/WhatsApp/LINE/Matrix/Email/Web），
 // 六层安全网关、LLM 智能路由、Skill 沙箱执行等企业级能力。
 //
 // 快速开始:
@@ -12,7 +12,7 @@
 // 架构概览:
 //
 //	cmd/hexclaw/     入口
-//	adapter/         平台适配器 (8 个)
+//	adapter/         平台适配器 (12 个)
 //	engine/          ReAct 引擎
 //	gateway/         六层安全网关
 //	api/             HTTP/WebSocket API

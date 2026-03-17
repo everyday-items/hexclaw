@@ -6,7 +6,7 @@ If you discover a security vulnerability in HexClaw, please report it responsibl
 
 **DO NOT** open a public GitHub issue for security vulnerabilities.
 
-Instead, please email: **hexclaw.dev@gmail.com**
+Instead, please email: **security@hexclaw.net**
 
 Include:
 - Description of the vulnerability

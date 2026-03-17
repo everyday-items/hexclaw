@@ -482,7 +482,7 @@ golangci-lint run
 | 配置 | YAML + 环境变量 |
 | 存储 | SQLite (modernc.org/sqlite) |
 | WebSocket | nhooyr.io/websocket + gorilla/websocket |
-| MCP | modelcontextprotocol/go-sdk |
+| MCP | modelcontextprotocol/go-sdk v1.3.0 |
 | 安全 | Hexagon Guard Chain |
 
 ## 贡献指南
