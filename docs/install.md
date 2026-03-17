@@ -38,17 +38,18 @@ go install github.com/hexagon-codes/hexclaw/cmd/hexclaw@latest
 
 ```bash
 hexclaw version
+# HexClaw v0.0.1
 ```
 
 ### 方式二：从源码编译
 
 ```bash
-git clone https://github.com/hexagon-codes/hexclaw.git
+git clone https://github.com/everyday-items/hexclaw.git
 cd hexclaw
 go build -o hexclaw ./cmd/hexclaw/
 
 # 可选：带版本信息编译
-go build -ldflags "-X main.version=0.1.0 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o hexclaw ./cmd/hexclaw/
+go build -ldflags "-X main.version=v0.0.1 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o hexclaw ./cmd/hexclaw/
 
 # 移动到 PATH
 sudo mv hexclaw /usr/local/bin/
@@ -56,15 +57,15 @@ sudo mv hexclaw /usr/local/bin/
 
 ### 方式三：预编译二进制
 
-从 [GitHub Releases](https://github.com/hexagon-codes/hexclaw/releases) 下载对应平台的二进制：
+从 [GitHub Releases](https://github.com/everyday-items/hexclaw/releases) 下载对应平台的二进制：
 
 ```bash
 # Linux amd64
-curl -sSL https://github.com/hexagon-codes/hexclaw/releases/latest/download/hexclaw-linux-amd64.tar.gz | tar xz
+curl -sSL https://github.com/everyday-items/hexclaw/releases/latest/download/hexclaw-linux-amd64.tar.gz | tar xz
 sudo mv hexclaw /usr/local/bin/
 
 # macOS arm64 (Apple Silicon)
-curl -sSL https://github.com/hexagon-codes/hexclaw/releases/latest/download/hexclaw-darwin-arm64.tar.gz | tar xz
+curl -sSL https://github.com/everyday-items/hexclaw/releases/latest/download/hexclaw-darwin-arm64.tar.gz | tar xz
 sudo mv hexclaw /usr/local/bin/
 ```
 
@@ -77,7 +78,7 @@ docker run -d \
   -p 6060:6060 \
   -e DEEPSEEK_API_KEY="sk-xxx" \
   -v hexclaw-data:/root/.hexclaw \
-  ghcr.io/hexagon-codes/hexclaw:latest
+  ghcr.io/everyday-items/hexclaw:latest
 
 # 或从源码构建
 docker build -t hexclaw .
@@ -103,7 +104,7 @@ hexclaw init
 ├── data.db          # SQLite 数据库（自动创建）
 ├── memory/          # 文件记忆目录
 │   ├── MEMORY.md    # 长期记忆
-│   └── 2026-03-11.md # 每日日记
+│   └── 2026-03-18.md # 每日日记（以当天日期命名）
 └── skills/          # 技能安装目录
 ```
 
@@ -243,7 +244,7 @@ version: "3.8"
 
 services:
   hexclaw:
-    image: ghcr.io/hexagon-codes/hexclaw:latest
+    image: ghcr.io/everyday-items/hexclaw:latest
     # 或使用本地构建
     # build: .
     container_name: hexclaw
@@ -297,7 +298,7 @@ spec:
     spec:
       containers:
         - name: hexclaw
-          image: ghcr.io/hexagon-codes/hexclaw:latest
+          image: ghcr.io/everyday-items/hexclaw:latest
           ports:
             - containerPort: 6060
           env:
@@ -512,6 +513,18 @@ docker logs -f hexclaw
 hexclaw serve 2>&1 | tee /var/log/hexclaw.log
 ```
 
+实时日志也可通过 API 获取：
+
+```bash
+# 查询日志（支持 level/source/keyword 过滤）
+curl -H "Authorization: Bearer TOKEN" \
+  "http://127.0.0.1:6060/api/v1/logs?level=error&limit=50"
+
+# WebSocket 实时流
+wscat -H "Authorization: Bearer TOKEN" \
+  -c "ws://127.0.0.1:6060/api/v1/logs/stream"
+```
+
 ### 数据备份
 
 SQLite 数据库和记忆文件位于 `~/.hexclaw/`：
@@ -521,7 +534,7 @@ SQLite 数据库和记忆文件位于 `~/.hexclaw/`：
 tar czf hexclaw-backup-$(date +%Y%m%d).tar.gz ~/.hexclaw/
 
 # 恢复
-tar xzf hexclaw-backup-20260311.tar.gz -C ~/
+tar xzf hexclaw-backup-20260318.tar.gz -C ~/
 ```
 
 ### 安全审计
@@ -548,7 +561,7 @@ hexclaw security audit
 go install github.com/hexagon-codes/hexclaw/cmd/hexclaw@latest
 
 # 二进制替换
-wget https://github.com/hexagon-codes/hexclaw/releases/latest/download/hexclaw-linux-amd64.tar.gz
+wget https://github.com/everyday-items/hexclaw/releases/latest/download/hexclaw-linux-amd64.tar.gz
 tar xzf hexclaw-linux-amd64.tar.gz
 sudo mv hexclaw /usr/local/bin/
 sudo systemctl restart hexclaw

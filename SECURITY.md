@@ -20,20 +20,25 @@ We will acknowledge receipt within 48 hours and provide a detailed response with
 
 | Version | Supported |
 |---------|-----------|
-| latest  | Yes       |
+| v0.0.1 (latest) | ✅ Yes |
 
 ## Security Features
 
 HexClaw includes a 6-layer security gateway:
 
-1. **Authentication** - HMAC-SHA256 token validation with constant-time comparison
+1. **Authentication** - HMAC-SHA256 token validation with constant-time comparison (`crypto/subtle`)
 2. **Rate Limiting** - Per-user sliding window with memory upper bound (100K windows)
 3. **Cost Control** - Budget enforcement per user/global, **fail-closed** on DB errors
 4. **Input Safety** - Prompt injection detection + PII redaction, **fail-closed** on errors
 5. **RBAC** - Role-based access control
 6. **Audit** - Request logging
 
-## Security Hardening (v0.x)
+## Security Hardening (v0.0.1)
+
+### API Authentication
+- Token comparison uses `crypto/subtle.ConstantTimeCompare` to prevent timing attacks
+- Logs API (`/api/v1/logs*`) always requires authentication regardless of source IP
+- `isLogsAPI` uses exact prefix `/api/v1/logs` to avoid matching `/api/v1/login` etc.
 
 ### Shell Skill
 - **White-list only** command execution model
@@ -53,6 +58,7 @@ HexClaw includes a 6-layer security gateway:
 ### Path Traversal Prevention
 - All file operations validate with `filepath.Base()` + absolute path prefix check
 - Memory system: `DeleteFile()` double-validates with `filepath.Clean()` + prefix match
+- Memory item ID validated at handler layer (rejects `..`, `/`, `\`)
 - Skill Hub/Marketplace: install paths verified against skill directory boundary
 
 ### Cache Security
@@ -65,8 +71,14 @@ HexClaw includes a 6-layer security gateway:
 - Input Safety layer rejects requests when guard chain errors (not silently passes)
 - Cost Check layer rejects requests when budget DB query fails (not silently passes)
 
+### CORS
+- Origin validated against allowlist: `http://localhost:{port}`, `tauri://localhost`, `http://tauri.localhost`
+- Port must be 1–5 digits numeric; paths, non-numeric ports, and non-http schemes rejected
+- OPTIONS preflight returns 204 without invoking auth middleware
+
 ### WebSocket
 - Origin validation via `OriginPatterns` (replaced `InsecureSkipVerify`)
+- Log stream WebSocket requires Bearer token authentication
 
 ### MCP
 - `sync.Once` protected `Close()` prevents double-close panics
@@ -75,3 +87,7 @@ HexClaw includes a 6-layer security gateway:
 ### Workflow Execution
 - 10-minute timeout context for async workflow execution
 - Prevents unbounded resource consumption from hanging workflows
+- Run history bounded with LRU eviction (max 1000 entries)
+
+### Plugin Registry
+- `Register`/`Unregister` release write lock before emitting events to prevent same-goroutine deadlock

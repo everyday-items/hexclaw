@@ -35,6 +35,9 @@ type Plugin interface {
 }
 ```
 
+> **注意**：`Register` 和 `Unregister` 会在写锁释放后再触发事件回调，
+> 插件的 `OnLoaded`/`OnUnloaded` 处理器中可安全调用 Registry 的其他方法。
+
 ## 快速开始
 
 ### 1. 创建 Skill 插件
@@ -162,9 +165,11 @@ plugins:
 4. **配置验证** — 在 `Init()` 中验证必需配置项
 5. **错误处理** — Skill 执行失败时返回明确的错误信息
 6. **超时控制** — 使用 `ctx` 上下文控制超时，避免阻塞
+7. **事件处理器安全** — `OnLoaded`/`OnUnloaded` 中可安全调用 Registry 方法（锁已释放）
 
 ## 参考
 
 - [Hexagon Plugin 包](https://github.com/hexagon-codes/hexagon/tree/main/plugin) — 基础插件接口和注册表
 - [HexClaw Skill 接口](../skill/skill.go) — Skill 接口定义
 - [HexClaw Adapter 接口](../adapter/adapter.go) — 适配器接口定义
+- [GitHub Issues](https://github.com/everyday-items/hexclaw/issues) — 问题反馈

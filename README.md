@@ -3,9 +3,9 @@
   <h1>HexClaw 河蟹</h1>
   <p><strong>企业级安全的个人 AI Agent</strong> — 安全 · 开源 · 自托管 · 易用 · 功能全面</p>
 
-  [![CI](https://github.com/hexagon-codes/hexclaw/workflows/CI/badge.svg)](https://github.com/hexagon-codes/hexclaw/actions)
-  [![Release](https://img.shields.io/github/v/release/hexagon-codes/hexclaw?include_prereleases)](https://github.com/hexagon-codes/hexclaw/releases)
-  [![License](https://img.shields.io/github/license/hexagon-codes/hexclaw)](https://github.com/hexagon-codes/hexclaw/blob/main/LICENSE)
+  [![CI](https://github.com/everyday-items/hexclaw/workflows/CI/badge.svg)](https://github.com/everyday-items/hexclaw/actions)
+  [![Release](https://img.shields.io/github/v/release/everyday-items/hexclaw?include_prereleases)](https://github.com/everyday-items/hexclaw/releases)
+  [![License](https://img.shields.io/github/license/everyday-items/hexclaw)](https://github.com/everyday-items/hexclaw/blob/main/LICENSE)
   [![Go Report Card](https://goreportcard.com/badge/github.com/hexagon-codes/hexclaw)](https://goreportcard.com/report/github.com/hexagon-codes/hexclaw)
 
   > 基于 [Hexagon](https://github.com/hexagon-codes/hexagon) AI Agent 全能型框架构建
@@ -70,7 +70,7 @@
 go install github.com/hexagon-codes/hexclaw/cmd/hexclaw@latest
 
 # 或使用预编译二进制（从 Releases 下载）
-curl -sSL https://github.com/hexagon-codes/hexclaw/releases/latest/download/hexclaw-$(uname -s)-$(uname -m).tar.gz | tar xz
+curl -sSL https://github.com/everyday-items/hexclaw/releases/latest/download/hexclaw-$(uname -s)-$(uname -m).tar.gz | tar xz
 sudo mv hexclaw /usr/local/bin/
 ```
 
@@ -94,7 +94,7 @@ docker run -d \
   -p 6060:6060 \
   -e DEEPSEEK_API_KEY="sk-xxx" \
   -v hexclaw-data:/data/.hexclaw \
-  ghcr.io/hexagon-codes/hexclaw:latest
+  ghcr.io/everyday-items/hexclaw:latest
 ```
 
 服务启动后：
@@ -328,7 +328,7 @@ hexclaw/
 ### 配置
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/v1/config` | 获取完整配置 |
+| GET | `/api/v1/config` | 获取完整配置（不含 API Key 明文） |
 | PUT | `/api/v1/config` | 更新配置 |
 | GET | `/api/v1/config/llm` | 获取 LLM 配置 |
 | PUT | `/api/v1/config/llm` | 更新 LLM 配置 |
@@ -365,8 +365,8 @@ hexclaw/
 |------|------|------|
 | GET | `/api/v1/memory` | 获取记忆 |
 | POST | `/api/v1/memory` | 创建记忆 |
-| PUT | `/api/v1/memory` | 更新记忆 |
-| DELETE | `/api/v1/memory` | 清空记忆 |
+| PUT | `/api/v1/memory` | 更新记忆（允许清空） |
+| DELETE | `/api/v1/memory` | 清空全部记忆 |
 | DELETE | `/api/v1/memory/{id}` | 删除指定记忆 |
 | GET | `/api/v1/memory/search` | 搜索记忆 |
 
@@ -375,7 +375,7 @@ hexclaw/
 |------|------|------|
 | GET | `/api/v1/mcp/tools` | 工具列表 |
 | GET | `/api/v1/mcp/servers` | Server 列表 |
-| GET | `/api/v1/mcp/status` | 连接状态 |
+| GET | `/api/v1/mcp/status` | 连接状态快照 |
 | POST | `/api/v1/mcp/tools/call` | 调用工具 |
 
 ### 技能
@@ -403,8 +403,8 @@ hexclaw/
 | GET | `/api/v1/canvas/workflows` | 工作流列表 |
 | POST | `/api/v1/canvas/workflows` | 保存工作流 |
 | DELETE | `/api/v1/canvas/workflows/{id}` | 删除工作流 |
-| POST | `/api/v1/canvas/workflows/{id}/run` | 执行工作流 |
-| GET | `/api/v1/canvas/runs/{id}` | 执行结果 |
+| POST | `/api/v1/canvas/workflows/{id}/run` | 异步执行工作流 |
+| GET | `/api/v1/canvas/runs/{id}` | 查询执行结果 |
 
 ### 语音
 | 方法 | 路径 | 说明 |
@@ -426,9 +426,9 @@ hexclaw/
 ### 日志与监控
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/v1/logs` | 查询日志 |
-| GET | `/api/v1/logs/stats` | 日志统计 |
-| GET | `/api/v1/logs/stream` | 实时日志流 (WebSocket) |
+| GET | `/api/v1/logs` | 查询日志（支持 level/source/keyword 过滤 + 分页） |
+| GET | `/api/v1/logs/stats` | 日志统计（按 level/source 分类计数） |
+| GET | `/api/v1/logs/stream` | 实时日志流 (WebSocket，需 Token 认证) |
 
 ## 开发
 
@@ -476,6 +476,8 @@ golangci-lint run
 |------|------|
 | 语言 | Go 1.25+ |
 | Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) |
+| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.0.4 |
+| 工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.3 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | 配置 | YAML + 环境变量 |
 | 存储 | SQLite (modernc.org/sqlite) |
@@ -518,17 +520,17 @@ chore: 构建/工具链
 | 项目 | 说明 | 仓库 |
 |------|------|------|
 | **Hexagon** | Go AI Agent 框架 (核心引擎) | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) | [ai-core](https://github.com/hexagon-codes/ai-core) |
-| **toolkit** | Go 通用工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) |
+| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.0.4 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **toolkit** | Go 通用工具库 v0.0.3 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI 观测面板 (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
-| **hexclaw-desktop** | HexClaw 桌面客户端 (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
-| **hexclaw-ui** | HexClaw Web 前端 (Vue 3) | [hexclaw-ui](https://github.com/hexagon-codes/hexclaw-ui) |
+| **hexclaw-desktop** | HexClaw 桌面客户端 (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/everyday-items/hexclaw-desktop) |
+| **hexclaw-ui** | HexClaw Web 前端 (Vue 3) | [hexclaw-ui](https://github.com/everyday-items/hexclaw-ui) |
 
 ## 联系我们
 
 - 河蟹 AI: ai@hexclaw.net
 - 河蟹支持: support@hexclaw.net
-- Issues: [GitHub Issues](https://github.com/hexagon-codes/hexclaw/issues)
+- Issues: [GitHub Issues](https://github.com/everyday-items/hexclaw/issues)
 - 安全漏洞: 请参阅 [SECURITY.md](SECURITY.md)
 
 ## 许可证
