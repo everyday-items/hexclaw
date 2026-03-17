@@ -1,65 +1,65 @@
-# HexClaw 安装与部署指南
+# HexClaw Installation & Deployment Guide
 
-**[English](install.en.md) | 中文**
+**English | [中文](install.md)**
 
-## 目录
+## Table of Contents
 
-- [系统要求](#系统要求)
-- [安装方式](#安装方式)
-- [配置](#配置)
-- [部署方式](#部署方式)
-- [平台接入](#平台接入)
-- [运维](#运维)
-- [故障排查](#故障排查)
-
----
-
-## 系统要求
-
-| 项目 | 最低要求 | 推荐 |
-|------|---------|------|
-| 操作系统 | Linux / macOS / Windows | Linux (Ubuntu 22.04+) |
-| Go | >= 1.25 | 最新稳定版 |
-| 内存 | 128 MB | 512 MB+ |
-| 磁盘 | 100 MB | 1 GB+（含知识库数据） |
-| 网络 | 可访问 LLM API | 低延迟连接 |
-
-HexClaw 编译为单二进制文件，无外部运行时依赖（SQLite 使用纯 Go 实现）。
+- [System Requirements](#system-requirements)
+- [Installation Methods](#installation-methods)
+- [Configuration](#configuration)
+- [Deployment Methods](#deployment-methods)
+- [Platform Integration](#platform-integration)
+- [Operations](#operations)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
-## 安装方式
+## System Requirements
 
-### 方式一：go install（推荐开发者使用）
+| Item | Minimum | Recommended |
+|------|---------|-------------|
+| OS | Linux / macOS / Windows | Linux (Ubuntu 22.04+) |
+| Go | >= 1.25 | Latest stable |
+| Memory | 128 MB | 512 MB+ |
+| Disk | 100 MB | 1 GB+ (including knowledge base data) |
+| Network | Access to LLM API | Low-latency connection |
+
+HexClaw compiles to a single binary with no external runtime dependencies (SQLite uses a pure Go implementation).
+
+---
+
+## Installation Methods
+
+### Method 1: go install (recommended for developers)
 
 ```bash
 go install github.com/hexagon-codes/hexclaw/cmd/hexclaw@latest
 ```
 
-验证安装：
+Verify installation:
 
 ```bash
 hexclaw version
 # HexClaw v0.1.0
 ```
 
-### 方式二：从源码编译
+### Method 2: Build from source
 
 ```bash
 git clone https://github.com/hexagon-codes/hexclaw.git
 cd hexclaw
 go build -o hexclaw ./cmd/hexclaw/
 
-# 可选：带版本信息编译
+# Optional: build with version info
 go build -ldflags "-X main.version=v0.1.0 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o hexclaw ./cmd/hexclaw/
 
-# 移动到 PATH
+# Move to PATH
 sudo mv hexclaw /usr/local/bin/
 ```
 
-### 方式三：预编译二进制
+### Method 3: Pre-built binary
 
-从 [GitHub Releases](https://github.com/hexagon-codes/hexclaw/releases) 下载对应平台的二进制：
+Download the binary for your platform from [GitHub Releases](https://github.com/hexagon-codes/hexclaw/releases):
 
 ```bash
 # Linux amd64
@@ -71,10 +71,10 @@ curl -sSL https://github.com/hexagon-codes/hexclaw/releases/latest/download/hexc
 sudo mv hexclaw /usr/local/bin/
 ```
 
-### 方式四：Docker
+### Method 4: Docker
 
 ```bash
-# 使用官方镜像
+# Use official image
 docker run -d \
   --name hexclaw \
   -p 6060:6060 \
@@ -82,45 +82,45 @@ docker run -d \
   -v hexclaw-data:/root/.hexclaw \
   ghcr.io/hexagon-codes/hexclaw:latest
 
-# 或从源码构建
+# Or build from source
 docker build -t hexclaw .
 docker run -d --name hexclaw -p 6060:6060 -e DEEPSEEK_API_KEY="sk-xxx" hexclaw
 ```
 
 ---
 
-## 配置
+## Configuration
 
-### 初始化配置
+### Initialize Configuration
 
 ```bash
 hexclaw init
-# 生成: ~/.hexclaw/hexclaw.yaml
+# Generates: ~/.hexclaw/hexclaw.yaml
 ```
 
-默认配置目录为 `~/.hexclaw/`，包含以下文件：
+The default config directory is `~/.hexclaw/`, containing:
 
 ```
 ~/.hexclaw/
-├── hexclaw.yaml     # 主配置文件
-├── data.db          # SQLite 数据库（自动创建）
-├── memory/          # 文件记忆目录
-│   ├── MEMORY.md    # 长期记忆
-│   └── YYYY-MM-DD.md  # 每日日记（以当天日期命名）
-└── skills/          # 技能安装目录
+├── hexclaw.yaml     # Main config file
+├── data.db          # SQLite database (auto-created)
+├── memory/          # File memory directory
+│   ├── MEMORY.md    # Long-term memory
+│   └── YYYY-MM-DD.md  # Daily journal (named by date)
+└── skills/          # Skill installation directory
 ```
 
-### 环境变量
+### Environment Variables
 
-所有敏感配置建议通过环境变量设置：
+All sensitive config values should be set via environment variables:
 
 ```bash
-# LLM API Key（至少设置一个）
+# LLM API Keys (set at least one)
 export DEEPSEEK_API_KEY="sk-xxx"
 export OPENAI_API_KEY="sk-xxx"
 export ANTHROPIC_API_KEY="sk-xxx"
 
-# 平台 Token（按需设置）
+# Platform tokens (as needed)
 export TELEGRAM_BOT_TOKEN="xxx"
 export DISCORD_BOT_TOKEN="xxx"
 export SLACK_BOT_TOKEN="xoxb-xxx"
@@ -129,7 +129,7 @@ export FEISHU_APP_ID="cli_xxx"
 export FEISHU_APP_SECRET="xxx"
 ```
 
-配置文件中使用 `${VAR_NAME}` 引用环境变量：
+Reference environment variables in the config file using `${VAR_NAME}`:
 
 ```yaml
 llm:
@@ -138,44 +138,44 @@ llm:
       api_key: ${DEEPSEEK_API_KEY}
 ```
 
-### 配置优先级
+### Configuration Priority
 
-从高到低：
+From highest to lowest:
 
-1. 命令行参数（`--feishu-app-id`）
-2. 环境变量（`DEEPSEEK_API_KEY`）
-3. 配置文件（`hexclaw.yaml`）
-4. 安全默认值
+1. Command-line arguments (`--feishu-app-id`)
+2. Environment variables (`DEEPSEEK_API_KEY`)
+3. Config file (`hexclaw.yaml`)
+4. Secure defaults
 
-### 最小配置
+### Minimal Configuration
 
-只需一个 LLM API Key 即可启动：
+Only one LLM API key is needed to start:
 
 ```bash
 export DEEPSEEK_API_KEY="sk-xxx"
 hexclaw serve
 ```
 
-所有安全选项默认开启，存储使用 SQLite 自动创建。
+All security options are enabled by default. SQLite storage is created automatically.
 
-### 完整配置示例
+### Full Configuration Example
 
-参考 [README.md](../README.md#配置) 中的完整配置文件。
+See the complete config file in [README.en.md](../README.en.md#configuration).
 
 ---
 
-## 部署方式
+## Deployment Methods
 
-### 1. 直接运行（开发/测试）
+### 1. Direct Run (development/testing)
 
 ```bash
 hexclaw serve
 hexclaw serve --config /path/to/hexclaw.yaml
 ```
 
-### 2. systemd 服务（Linux 生产部署推荐）
+### 2. systemd Service (recommended for Linux production)
 
-创建服务文件 `/etc/systemd/system/hexclaw.service`：
+Create service file `/etc/systemd/system/hexclaw.service`:
 
 ```ini
 [Unit]
@@ -191,16 +191,16 @@ ExecStart=/usr/local/bin/hexclaw serve --config /opt/hexclaw/hexclaw.yaml
 Restart=always
 RestartSec=5
 
-# 环境变量
+# Environment variables
 EnvironmentFile=/opt/hexclaw/.env
 
-# 安全加固
+# Security hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/opt/hexclaw
 
-# 资源限制
+# Resource limits
 LimitNOFILE=65536
 MemoryMax=1G
 
@@ -208,38 +208,38 @@ MemoryMax=1G
 WantedBy=multi-user.target
 ```
 
-创建环境变量文件 `/opt/hexclaw/.env`：
+Create environment variables file `/opt/hexclaw/.env`:
 
 ```bash
 DEEPSEEK_API_KEY=sk-xxx
 # OPENAI_API_KEY=sk-xxx
 ```
 
-启动服务：
+Start the service:
 
 ```bash
-# 创建用户
+# Create user
 sudo useradd -r -s /bin/false hexclaw
 sudo mkdir -p /opt/hexclaw
 sudo chown hexclaw:hexclaw /opt/hexclaw
 
-# 复制配置和二进制
+# Copy config and binary
 sudo cp hexclaw /usr/local/bin/
 sudo cp hexclaw.yaml /opt/hexclaw/
 
-# 启动
+# Start
 sudo systemctl daemon-reload
 sudo systemctl enable hexclaw
 sudo systemctl start hexclaw
 
-# 查看状态
+# Check status
 sudo systemctl status hexclaw
 sudo journalctl -u hexclaw -f
 ```
 
-### 3. Docker Compose（容器化部署推荐）
+### 3. Docker Compose (recommended for containerized deployment)
 
-创建 `docker-compose.yml`：
+Create `docker-compose.yml`:
 
 ```yaml
 version: "3.8"
@@ -247,7 +247,7 @@ version: "3.8"
 services:
   hexclaw:
     image: ghcr.io/hexagon-codes/hexclaw:latest
-    # 或使用本地构建
+    # Or use local build
     # build: .
     container_name: hexclaw
     restart: unless-stopped
@@ -271,13 +271,13 @@ volumes:
 ```
 
 ```bash
-# 启动
+# Start
 docker compose up -d
 
-# 查看日志
+# View logs
 docker compose logs -f hexclaw
 
-# 停止
+# Stop
 docker compose down
 ```
 
@@ -349,28 +349,28 @@ spec:
   type: ClusterIP
 ```
 
-创建 Secret 和 ConfigMap：
+Create Secret and ConfigMap:
 
 ```bash
-# 创建密钥
+# Create secret
 kubectl create secret generic hexclaw-secrets \
   --from-literal=deepseek-api-key=sk-xxx
 
-# 创建配置
+# Create config
 kubectl create configmap hexclaw-config \
   --from-file=hexclaw.yaml
 
-# 部署
+# Deploy
 kubectl apply -f hexclaw-k8s.yaml
 ```
 
 ---
 
-## 平台接入
+## Platform Integration
 
 ### Web UI
 
-默认启用。启动后访问 `http://127.0.0.1:6060`。
+Enabled by default. Access at `http://127.0.0.1:6060` after startup.
 
 ```yaml
 platforms:
@@ -378,11 +378,11 @@ platforms:
     enabled: true
 ```
 
-### 飞书 Bot
+### Feishu Bot
 
-1. 在[飞书开放平台](https://open.feishu.cn/)创建应用，获取 App ID 和 App Secret
-2. 配置事件订阅 URL: `http://YOUR_HOST:6061/feishu/webhook`（或使用命令行参数）
-3. 启用配置：
+1. Create an app on [Feishu Open Platform](https://open.feishu.cn/), get App ID and App Secret
+2. Configure event subscription URL: `http://YOUR_HOST:6061/feishu/webhook` (or use CLI args)
+3. Enable in config:
 
 ```yaml
 platforms:
@@ -393,7 +393,7 @@ platforms:
     verification_token: ${FEISHU_VERIFICATION_TOKEN}
 ```
 
-或通过命令行参数：
+Or via CLI:
 
 ```bash
 hexclaw serve --feishu-app-id cli_xxx --feishu-app-secret xxx
@@ -401,8 +401,8 @@ hexclaw serve --feishu-app-id cli_xxx --feishu-app-secret xxx
 
 ### Telegram Bot
 
-1. 通过 [@BotFather](https://t.me/BotFather) 创建 Bot，获取 Token
-2. 启用配置：
+1. Create a bot via [@BotFather](https://t.me/BotFather), get the token
+2. Enable in config:
 
 ```yaml
 platforms:
@@ -411,13 +411,13 @@ platforms:
     token: ${TELEGRAM_BOT_TOKEN}
 ```
 
-Telegram 使用长轮询模式，无需公网 IP。
+Telegram uses long polling — no public IP required.
 
 ### Discord Bot
 
-1. 在 [Discord Developer Portal](https://discord.com/developers/applications) 创建应用
-2. 获取 Bot Token，启用 Message Content Intent
-3. 启用配置：
+1. Create an application on [Discord Developer Portal](https://discord.com/developers/applications)
+2. Get Bot Token, enable Message Content Intent
+3. Enable in config:
 
 ```yaml
 platforms:
@@ -428,10 +428,10 @@ platforms:
 
 ### Slack Bot
 
-1. 在 [Slack API](https://api.slack.com/apps) 创建应用
-2. 配置 Events Request URL: `http://YOUR_HOST:6063/slack/events`
-3. 订阅 `message.im` 事件
-4. 启用配置：
+1. Create an app on [Slack API](https://api.slack.com/apps)
+2. Configure Events Request URL: `http://YOUR_HOST:6063/slack/events`
+3. Subscribe to `message.im` event
+4. Enable in config:
 
 ```yaml
 platforms:
@@ -441,11 +441,11 @@ platforms:
     signing_secret: ${SLACK_SIGNING_SECRET}
 ```
 
-### 钉钉 Bot
+### DingTalk Bot
 
-1. 在[钉钉开放平台](https://open-dev.dingtalk.com/)创建企业内部应用
-2. 配置消息接收地址: `http://YOUR_HOST:6062/dingtalk/webhook`
-3. 启用配置：
+1. Create an internal app on [DingTalk Open Platform](https://open-dev.dingtalk.com/)
+2. Configure message receive URL: `http://YOUR_HOST:6062/dingtalk/webhook`
+3. Enable in config:
 
 ```yaml
 platforms:
@@ -456,11 +456,11 @@ platforms:
     robot_code: ${DINGTALK_ROBOT_CODE}
 ```
 
-### 企业微信
+### WeCom (Enterprise WeChat)
 
-1. 在[企业微信管理后台](https://work.weixin.qq.com/)创建自建应用
-2. 配置接收消息 URL: `http://YOUR_HOST:6064/wecom/callback`
-3. 启用配置：
+1. Create an internal app in [WeCom Admin Console](https://work.weixin.qq.com/)
+2. Configure message receive URL: `http://YOUR_HOST:6064/wecom/callback`
+3. Enable in config:
 
 ```yaml
 platforms:
@@ -473,11 +473,11 @@ platforms:
     aes_key: ${WECOM_AES_KEY}
 ```
 
-### 微信公众号
+### WeChat Official Account
 
-1. 在[微信公众平台](https://mp.weixin.qq.com/)配置服务器
-2. 服务器 URL: `http://YOUR_HOST:6065/wechat/callback`
-3. 启用配置：
+1. Configure server on [WeChat Official Platform](https://mp.weixin.qq.com/)
+2. Server URL: `http://YOUR_HOST:6065/wechat/callback`
+3. Enable in config:
 
 ```yaml
 platforms:
@@ -491,18 +491,18 @@ platforms:
 
 ---
 
-## 运维
+## Operations
 
-### 健康检查
+### Health Check
 
 ```bash
 curl http://127.0.0.1:6060/health
 # {"status":"healthy"}
 ```
 
-### 日志
+### Logs
 
-HexClaw 使用标准 `log` 输出到 stderr，可通过系统日志工具管理：
+HexClaw uses standard `log` output to stderr, manageable via system log tools:
 
 ```bash
 # systemd
@@ -511,58 +511,58 @@ journalctl -u hexclaw -f
 # Docker
 docker logs -f hexclaw
 
-# 重定向到文件
+# Redirect to file
 hexclaw serve 2>&1 | tee /var/log/hexclaw.log
 ```
 
-实时日志也可通过 API 获取：
+Real-time logs also available via API:
 
 ```bash
-# 查询日志（支持 level/source/keyword 过滤）
+# Query logs (supports level/source/keyword filtering)
 curl -H "Authorization: Bearer TOKEN" \
   "http://127.0.0.1:6060/api/v1/logs?level=error&limit=50"
 
-# WebSocket 实时流
+# WebSocket real-time stream
 wscat -H "Authorization: Bearer TOKEN" \
   -c "ws://127.0.0.1:6060/api/v1/logs/stream"
 ```
 
-### 数据备份
+### Data Backup
 
-SQLite 数据库和记忆文件位于 `~/.hexclaw/`：
+SQLite database and memory files are located in `~/.hexclaw/`:
 
 ```bash
-# 备份
+# Backup
 tar czf hexclaw-backup-$(date +%Y%m%d).tar.gz ~/.hexclaw/
 
-# 恢复
+# Restore
 tar xzf hexclaw-backup-20260318.tar.gz -C ~/
 ```
 
-### 安全审计
+### Security Audit
 
-定期运行安全审计检查配置安全性：
+Run security audit periodically to check configuration security:
 
 ```bash
 hexclaw security audit
 ```
 
-审计检查项：
-- 配置文件权限
-- API Key 是否泄露
-- 网络暴露风险
-- 安全选项是否启用
-- 工具权限检查
-- 成本预算检查
-- 沙箱配置检查
+Audit checks:
+- Config file permissions
+- API key exposure
+- Network exposure risks
+- Security options status
+- Tool permissions
+- Cost budget settings
+- Sandbox configuration
 
-### 升级
+### Upgrade
 
 ```bash
-# go install 方式
+# go install method
 go install github.com/hexagon-codes/hexclaw/cmd/hexclaw@latest
 
-# 二进制替换
+# Binary replacement
 wget https://github.com/hexagon-codes/hexclaw/releases/latest/download/hexclaw-linux-amd64.tar.gz
 tar xzf hexclaw-linux-amd64.tar.gz
 sudo mv hexclaw /usr/local/bin/
@@ -573,98 +573,98 @@ docker compose pull
 docker compose up -d
 ```
 
-配置文件向后兼容，通常无需修改即可升级。
+Config files are backward-compatible — upgrades typically require no config changes.
 
 ---
 
-## 故障排查
+## Troubleshooting
 
-### 启动失败
+### Startup Failures
 
-**"没有可用的 LLM Provider"**
+**"No LLM provider available"**
 
-至少需要设置一个 LLM API Key：
+At least one LLM API key must be set:
 
 ```bash
 export DEEPSEEK_API_KEY="sk-xxx"
 ```
 
-**"初始化存储失败"**
+**"Failed to initialize storage"**
 
-检查数据目录权限：
+Check data directory permissions:
 
 ```bash
 ls -la ~/.hexclaw/
-# 确保当前用户有读写权限
+# Ensure current user has read/write permissions
 chmod 700 ~/.hexclaw/
 ```
 
-**端口被占用**
+**Port already in use**
 
-修改监听端口：
+Change the listen port:
 
 ```yaml
 server:
-  port: 7070  # 改为其他端口
+  port: 7070  # Change to another port
 ```
 
-### 连接问题
+### Connection Issues
 
-**LLM API 超时**
+**LLM API timeout**
 
-检查网络连接，或配置代理：
+Check network connectivity, or configure a proxy:
 
 ```bash
 export HTTPS_PROXY="http://proxy:8080"
 hexclaw serve
 ```
 
-对于国内用户，可配置 API 中转：
+For users with restricted access to certain APIs, configure an API relay:
 
 ```yaml
 llm:
   providers:
     openai:
       api_key: ${OPENAI_API_KEY}
-      base_url: https://your-proxy.com/v1  # API 中转地址
+      base_url: https://your-proxy.com/v1  # API relay URL
       model: gpt-4o
 ```
 
-**平台 Webhook 收不到消息**
+**Platform webhook not receiving messages**
 
-1. 确认服务器公网可达
-2. 检查防火墙是否放行对应端口
-3. 使用 ngrok 或 frp 进行内网穿透（开发阶段）：
+1. Confirm the server is publicly accessible
+2. Check firewall rules for the relevant port
+3. Use ngrok or frp for intranet tunneling (development stage):
 
 ```bash
 ngrok http 6060
-# 使用 ngrok 提供的 HTTPS URL 配置 Webhook
+# Use the HTTPS URL provided by ngrok to configure the webhook
 ```
 
-### 性能问题
+### Performance Issues
 
-**响应慢**
+**Slow responses**
 
-- 启用语义缓存减少重复请求：
+- Enable semantic cache to reduce duplicate requests:
   ```yaml
   llm:
     cache:
       enabled: true
       ttl: 24h
   ```
-- 使用低成本模型处理简单任务
-- 检查知识库大小，适当调整 `chunk_size` 和 `top_k`
+- Use lower-cost models for simple tasks
+- Check knowledge base size, adjust `chunk_size` and `top_k` as needed
 
-**内存占用高**
+**High memory usage**
 
-- 减少上下文保留消息数：
+- Reduce the number of messages retained in context:
   ```yaml
   compaction:
     enabled: true
     max_messages: 30
     keep_recent: 5
   ```
-- 减小语义缓存条目数：
+- Reduce semantic cache entry count:
   ```yaml
   llm:
     cache:

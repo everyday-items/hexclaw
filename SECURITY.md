@@ -1,5 +1,7 @@
 # Security Policy
 
+**[中文](SECURITY.zh.md) | English**
+
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability in HexClaw, please report it responsibly.

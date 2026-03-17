@@ -1,5 +1,7 @@
 # HexClaw 插件开发指南
 
+**[English](plugin-dev.en.md) | 中文**
+
 ## 概述
 
 HexClaw 的插件系统基于 [Hexagon](https://github.com/hexagon-codes/hexagon) 框架的 `plugin` 包构建，扩展了 HexClaw 专属插件类型。
