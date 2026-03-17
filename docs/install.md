@@ -44,7 +44,7 @@ hexclaw version
 ### 方式二：从源码编译
 
 ```bash
-git clone https://github.com/everyday-items/hexclaw.git
+git clone https://github.com/hexagon-codes/hexclaw.git
 cd hexclaw
 go build -o hexclaw ./cmd/hexclaw/
 
@@ -57,15 +57,15 @@ sudo mv hexclaw /usr/local/bin/
 
 ### 方式三：预编译二进制
 
-从 [GitHub Releases](https://github.com/everyday-items/hexclaw/releases) 下载对应平台的二进制：
+从 [GitHub Releases](https://github.com/hexagon-codes/hexclaw/releases) 下载对应平台的二进制：
 
 ```bash
 # Linux amd64
-curl -sSL https://github.com/everyday-items/hexclaw/releases/latest/download/hexclaw-linux-amd64.tar.gz | tar xz
+curl -sSL https://github.com/hexagon-codes/hexclaw/releases/latest/download/hexclaw-linux-amd64.tar.gz | tar xz
 sudo mv hexclaw /usr/local/bin/
 
 # macOS arm64 (Apple Silicon)
-curl -sSL https://github.com/everyday-items/hexclaw/releases/latest/download/hexclaw-darwin-arm64.tar.gz | tar xz
+curl -sSL https://github.com/hexagon-codes/hexclaw/releases/latest/download/hexclaw-darwin-arm64.tar.gz | tar xz
 sudo mv hexclaw /usr/local/bin/
 ```
 
@@ -78,7 +78,7 @@ docker run -d \
   -p 6060:6060 \
   -e DEEPSEEK_API_KEY="sk-xxx" \
   -v hexclaw-data:/root/.hexclaw \
-  ghcr.io/everyday-items/hexclaw:latest
+  ghcr.io/hexagon-codes/hexclaw:latest
 
 # 或从源码构建
 docker build -t hexclaw .
@@ -244,7 +244,7 @@ version: "3.8"
 
 services:
   hexclaw:
-    image: ghcr.io/everyday-items/hexclaw:latest
+    image: ghcr.io/hexagon-codes/hexclaw:latest
     # 或使用本地构建
     # build: .
     container_name: hexclaw
@@ -298,7 +298,7 @@ spec:
     spec:
       containers:
         - name: hexclaw
-          image: ghcr.io/everyday-items/hexclaw:latest
+          image: ghcr.io/hexagon-codes/hexclaw:latest
           ports:
             - containerPort: 6060
           env:
@@ -561,7 +561,7 @@ hexclaw security audit
 go install github.com/hexagon-codes/hexclaw/cmd/hexclaw@latest
 
 # 二进制替换
-wget https://github.com/everyday-items/hexclaw/releases/latest/download/hexclaw-linux-amd64.tar.gz
+wget https://github.com/hexagon-codes/hexclaw/releases/latest/download/hexclaw-linux-amd64.tar.gz
 tar xzf hexclaw-linux-amd64.tar.gz
 sudo mv hexclaw /usr/local/bin/
 sudo systemctl restart hexclaw

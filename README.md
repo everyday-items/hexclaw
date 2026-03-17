@@ -3,9 +3,9 @@
   <h1>HexClaw 河蟹</h1>
   <p><strong>企业级安全的个人 AI Agent</strong> — 安全 · 开源 · 自托管 · 易用 · 功能全面</p>
 
-  [![CI](https://github.com/everyday-items/hexclaw/workflows/CI/badge.svg)](https://github.com/everyday-items/hexclaw/actions)
-  [![Release](https://img.shields.io/github/v/release/everyday-items/hexclaw?include_prereleases)](https://github.com/everyday-items/hexclaw/releases)
-  [![License](https://img.shields.io/github/license/everyday-items/hexclaw)](https://github.com/everyday-items/hexclaw/blob/main/LICENSE)
+  [![CI](https://github.com/hexagon-codes/hexclaw/workflows/CI/badge.svg)](https://github.com/hexagon-codes/hexclaw/actions)
+  [![Release](https://img.shields.io/github/v/release/hexagon-codes/hexclaw?include_prereleases)](https://github.com/hexagon-codes/hexclaw/releases)
+  [![License](https://img.shields.io/github/license/hexagon-codes/hexclaw)](https://github.com/hexagon-codes/hexclaw/blob/main/LICENSE)
   [![Go Report Card](https://goreportcard.com/badge/github.com/hexagon-codes/hexclaw)](https://goreportcard.com/report/github.com/hexagon-codes/hexclaw)
 
   > 基于 [Hexagon](https://github.com/hexagon-codes/hexagon) AI Agent 全能型框架构建
@@ -70,7 +70,7 @@
 go install github.com/hexagon-codes/hexclaw/cmd/hexclaw@latest
 
 # 或使用预编译二进制（从 Releases 下载）
-curl -sSL https://github.com/everyday-items/hexclaw/releases/latest/download/hexclaw-$(uname -s)-$(uname -m).tar.gz | tar xz
+curl -sSL https://github.com/hexagon-codes/hexclaw/releases/latest/download/hexclaw-$(uname -s)-$(uname -m).tar.gz | tar xz
 sudo mv hexclaw /usr/local/bin/
 ```
 
@@ -94,7 +94,7 @@ docker run -d \
   -p 6060:6060 \
   -e DEEPSEEK_API_KEY="sk-xxx" \
   -v hexclaw-data:/data/.hexclaw \
-  ghcr.io/everyday-items/hexclaw:latest
+  ghcr.io/hexagon-codes/hexclaw:latest
 ```
 
 服务启动后：
@@ -523,14 +523,14 @@ chore: 构建/工具链
 | **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.0.4 | [ai-core](https://github.com/hexagon-codes/ai-core) |
 | **toolkit** | Go 通用工具库 v0.0.3 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI 观测面板 (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
-| **hexclaw-desktop** | HexClaw 桌面客户端 (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/everyday-items/hexclaw-desktop) |
-| **hexclaw-ui** | HexClaw Web 前端 (Vue 3) | [hexclaw-ui](https://github.com/everyday-items/hexclaw-ui) |
+| **hexclaw-desktop** | HexClaw 桌面客户端 (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
+| **hexclaw-ui** | HexClaw Web 前端 (Vue 3) | [hexclaw-ui](https://github.com/hexagon-codes/hexclaw-ui) |
 
 ## 联系我们
 
 - 河蟹 AI: ai@hexclaw.net
 - 河蟹支持: support@hexclaw.net
-- Issues: [GitHub Issues](https://github.com/everyday-items/hexclaw/issues)
+- Issues: [GitHub Issues](https://github.com/hexagon-codes/hexclaw/issues)
 - 安全漏洞: 请参阅 [SECURITY.md](SECURITY.md)
 
 ## 许可证

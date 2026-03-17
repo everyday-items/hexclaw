@@ -172,4 +172,4 @@ plugins:
 - [Hexagon Plugin 包](https://github.com/hexagon-codes/hexagon/tree/main/plugin) — 基础插件接口和注册表
 - [HexClaw Skill 接口](../skill/skill.go) — Skill 接口定义
 - [HexClaw Adapter 接口](../adapter/adapter.go) — 适配器接口定义
-- [GitHub Issues](https://github.com/everyday-items/hexclaw/issues) — 问题反馈
+- [GitHub Issues](https://github.com/hexagon-codes/hexclaw/issues) — 问题反馈
