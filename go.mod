@@ -4,7 +4,7 @@ go 1.25.5
 
 require (
 	github.com/gorilla/websocket v1.5.3
-	github.com/hexagon-codes/hexagon v0.0.1
+	github.com/hexagon-codes/hexagon v0.3.1-beta
 	github.com/hexagon-codes/toolkit v0.0.3
 	github.com/spf13/cobra v1.9.1
 	golang.org/x/sync v0.19.0
@@ -36,4 +36,3 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-replace github.com/hexagon-codes/hexagon => ../hexagon
