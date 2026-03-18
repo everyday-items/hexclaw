@@ -120,7 +120,7 @@ func (a *SlackAdapter) SendStream(ctx context.Context, chatID string, chunks <-c
 			ts = msgTS
 		} else {
 			// 更新已有消息
-			a.updateMessage(ctx, chatID, ts, sb.String())
+			_ = a.updateMessage(ctx, chatID, ts, sb.String())
 		}
 	}
 	return nil
@@ -160,7 +160,7 @@ func (a *SlackAdapter) handleEvents(w http.ResponseWriter, r *http.Request) {
 	case "url_verification":
 		// Slack URL 验证回调
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"challenge": envelope.Challenge})
+		_ = json.NewEncoder(w).Encode(map[string]string{"challenge": envelope.Challenge})
 		return
 
 	case "event_callback":
@@ -212,7 +212,7 @@ func (a *SlackAdapter) processEvent(data json.RawMessage) {
 	reply, err := a.handler(ctx, unified)
 	if err != nil {
 		log.Printf("Slack 消息处理失败: %v", err)
-		a.postMessage(ctx, event.Channel, "处理消息时出错，请稍后重试。")
+		_ = a.postMessage(ctx, event.Channel, "处理消息时出错，请稍后重试。")
 		return
 	}
 	if reply != nil {
@@ -286,7 +286,7 @@ func (a *SlackAdapter) postMessageWithTS(ctx context.Context, channel, text stri
 	if err != nil {
 		return "", fmt.Errorf("发送 Slack 消息失败: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var result struct {
 		OK    bool   `json:"ok"`
@@ -323,7 +323,7 @@ func (a *SlackAdapter) postThreadMessage(ctx context.Context, channel, threadTS,
 	if err != nil {
 		return fmt.Errorf("发送 Slack 线程消息失败: %w", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	return nil
 }
 
@@ -347,7 +347,7 @@ func (a *SlackAdapter) updateMessage(ctx context.Context, channel, ts, text stri
 	if err != nil {
 		return fmt.Errorf("更新 Slack 消息失败: %w", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	return nil
 }
 

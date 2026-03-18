@@ -175,13 +175,13 @@ func (a *EmailAdapter) sendEmail(to, subject, body string) error {
 		// 回退到 STARTTLS
 		return smtp.SendMail(addr, auth, cfg.From, []string{to}, []byte(msg))
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	client, err := smtp.NewClient(conn, cfg.Host)
 	if err != nil {
 		return fmt.Errorf("创建 SMTP 客户端失败: %w", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	if err := client.Auth(auth); err != nil {
 		return fmt.Errorf("smtp 认证失败: %w", err)

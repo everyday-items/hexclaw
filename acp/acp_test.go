@@ -37,7 +37,7 @@ func TestBusSendNotify(t *testing.T) {
 	bus := NewBus()
 	received := make(chan string, 1)
 
-	bus.Register("receiver", func(ctx context.Context, msg *Message) (*Message, error) {
+	_ = bus.Register("receiver", func(ctx context.Context, msg *Message) (*Message, error) {
 		received <- msg.Content
 		return nil, nil
 	})
@@ -65,7 +65,7 @@ func TestBusSendNotify(t *testing.T) {
 func TestBusRequest(t *testing.T) {
 	bus := NewBus()
 
-	bus.Register("echo", func(ctx context.Context, msg *Message) (*Message, error) {
+	_ = bus.Register("echo", func(ctx context.Context, msg *Message) (*Message, error) {
 		return &Message{
 			Type:    TypeResponse,
 			From:    "echo",
@@ -93,7 +93,7 @@ func TestBusRequest(t *testing.T) {
 func TestBusRequestTimeout(t *testing.T) {
 	bus := NewBus()
 
-	bus.Register("slow", func(ctx context.Context, msg *Message) (*Message, error) {
+	_ = bus.Register("slow", func(ctx context.Context, msg *Message) (*Message, error) {
 		time.Sleep(5 * time.Second)
 		return &Message{Content: "too late"}, nil
 	})
