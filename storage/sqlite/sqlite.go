@@ -154,7 +154,7 @@ func (s *Store) ListSessions(ctx context.Context, userID string, limit, offset i
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var sessions []*storage.Session
 	for rows.Next() {
@@ -173,7 +173,7 @@ func (s *Store) DeleteSession(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE session_id = ?`, id); err != nil {
 		return err
@@ -192,7 +192,7 @@ func (s *Store) CleanupOldSessions(ctx context.Context, olderThanDays int) (int6
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// 先删子表消息，再删父表会话（维护引用完整性）
 	if _, err := tx.ExecContext(ctx,
@@ -222,7 +222,7 @@ func (s *Store) SaveMessage(ctx context.Context, msg *storage.MessageRecord) err
 	if err != nil {
 		return fmt.Errorf("开启事务失败: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO messages (id, session_id, parent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -260,7 +260,7 @@ func (s *Store) ListMessages(ctx context.Context, sessionID string, limit, offse
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var messages []*storage.MessageRecord
 	for rows.Next() {
@@ -363,7 +363,7 @@ func (s *Store) SearchMessages(ctx context.Context, userID, query string, limit,
 	if err != nil {
 		return s.searchMessagesLike(ctx, userID, query, limit, offset)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []*storage.SearchResult
 	for rows.Next() {
@@ -405,7 +405,7 @@ func (s *Store) searchMessagesLike(ctx context.Context, userID, query string, li
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []*storage.SearchResult
 	var total int
@@ -430,7 +430,7 @@ func (s *Store) ForkSession(ctx context.Context, sourceSessionID, messageID, use
 	if err != nil {
 		return nil, fmt.Errorf("开启事务失败: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// 1. 验证源会话存在并获取 platform
 	var sourceTitle, sourcePlatform string
@@ -505,7 +505,7 @@ func (s *Store) ListSessionBranches(ctx context.Context, sessionID string) ([]*s
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var sessions []*storage.Session
 	for rows.Next() {
@@ -524,7 +524,7 @@ func (s *Store) WithTx(ctx context.Context, fn func(storage.Store) error) error 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	txStore := &txStore{tx: tx}
 	if err := fn(txStore); err != nil {

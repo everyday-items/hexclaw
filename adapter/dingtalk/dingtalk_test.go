@@ -483,7 +483,7 @@ func TestSend(t *testing.T) {
 				}
 				capturedToken = req.Header.Get("x-acs-dingtalk-access-token")
 				body, _ := io.ReadAll(req.Body)
-				json.Unmarshal(body, &capturedBody)
+				_ = json.Unmarshal(body, &capturedBody)
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Body:       io.NopCloser(strings.NewReader(`{}`)),
@@ -522,7 +522,7 @@ func TestSendStream(t *testing.T) {
 					}, nil
 				}
 				body, _ := io.ReadAll(req.Body)
-				json.Unmarshal(body, &capturedBody)
+				_ = json.Unmarshal(body, &capturedBody)
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Body:       io.NopCloser(strings.NewReader(`{}`)),

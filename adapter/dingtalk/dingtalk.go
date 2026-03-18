@@ -135,7 +135,7 @@ func (a *DingtalkAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "读取请求体失败", http.StatusBadRequest)
 		return
 	}
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 
 	// 验证签名
 	timestamp := r.Header.Get("timestamp")

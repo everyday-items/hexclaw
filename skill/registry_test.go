@@ -48,8 +48,8 @@ func TestRegistry_RegisterAndGet(t *testing.T) {
 
 func TestRegistry_Match(t *testing.T) {
 	reg := NewRegistry()
-	reg.Register(&mockSkill{name: "weather", desc: "天气", prefix: "/天气"})
-	reg.Register(&mockSkill{name: "translate", desc: "翻译", prefix: "/翻译"})
+	_ = reg.Register(&mockSkill{name: "weather", desc: "天气", prefix: "/天气"})
+	_ = reg.Register(&mockSkill{name: "translate", desc: "翻译", prefix: "/翻译"})
 
 	// 匹配天气
 	msg := &adapter.Message{Content: "/天气 北京"}
@@ -81,9 +81,9 @@ func TestRegistry_Match(t *testing.T) {
 
 func TestRegistry_All(t *testing.T) {
 	reg := NewRegistry()
-	reg.Register(&mockSkill{name: "a", desc: "A", prefix: "/a"})
-	reg.Register(&mockSkill{name: "b", desc: "B", prefix: "/b"})
-	reg.Register(&mockSkill{name: "c", desc: "C", prefix: "/c"})
+	_ = reg.Register(&mockSkill{name: "a", desc: "A", prefix: "/a"})
+	_ = reg.Register(&mockSkill{name: "b", desc: "B", prefix: "/b"})
+	_ = reg.Register(&mockSkill{name: "c", desc: "C", prefix: "/c"})
 
 	all := reg.All()
 	if len(all) != 3 {
