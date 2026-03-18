@@ -5,12 +5,23 @@
 
 FROM golang:1.25-alpine AS builder
 
+RUN apk add --no-cache git
+
+ARG GOPRIVATE=github.com/hexagon-codes/*
+ENV GOPRIVATE=${GOPRIVATE}
+
+ARG VERSION=dev
+ARG COMMIT=none
+ARG DATE=unknown
+
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=secret,id=netrc,target=/root/.netrc go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /hexclaw ./cmd/hexclaw
+RUN CGO_ENABLED=0 go build \
+    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" \
+    -o /hexclaw ./cmd/hexclaw
 
 # ---
 

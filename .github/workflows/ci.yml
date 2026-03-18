@@ -28,9 +28,15 @@ jobs:
           GOPRIVATE: github.com/hexagon-codes/*
 
       - name: Run tests
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
         env:
           GOPRIVATE: github.com/hexagon-codes/*
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
 
       - name: Run vet
         run: go vet ./...
