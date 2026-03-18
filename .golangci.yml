@@ -1,19 +1,1 @@
 version: "2"
-
-issues:
-  exclude-rules:
-    # 测试文件中允许忽略更多错误
-    - path: _test\.go
-      linters:
-        - errcheck
-
-linters:
-  enable:
-    - errcheck
-    - govet
-    - staticcheck
-
-linters-settings:
-  errcheck:
-    # 默认不检查写操作和关闭操作
-    ignore: ""
