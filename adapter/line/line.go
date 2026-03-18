@@ -110,7 +110,7 @@ func (a *LineAdapter) Send(ctx context.Context, chatID string, reply *adapter.Re
 	if err != nil {
 		return fmt.Errorf("发送消息失败: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -152,7 +152,7 @@ func (a *LineAdapter) replyMessage(ctx context.Context, replyToken, text string)
 	if err != nil {
 		return fmt.Errorf("发送回复失败: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)

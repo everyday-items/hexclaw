@@ -116,7 +116,7 @@ func (a *WhatsAppAdapter) Send(ctx context.Context, chatID string, reply *adapte
 	if err != nil {
 		return fmt.Errorf("发送消息失败: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -147,7 +147,7 @@ func (a *WhatsAppAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 
 		if mode == "subscribe" && token == a.config.VerifyToken {
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, challenge)
+			_, _ = fmt.Fprint(w, challenge)
 			return
 		}
 		http.Error(w, "Forbidden", http.StatusForbidden)

@@ -69,7 +69,7 @@ func TestScheduler_RemoveJob(t *testing.T) {
 
 	ctx := context.Background()
 	s := NewScheduler(db)
-	s.Init(ctx)
+	_ = s.Init(ctx)
 
 	job := &Job{
 		Name:     "测试任务",
@@ -77,7 +77,7 @@ func TestScheduler_RemoveJob(t *testing.T) {
 		Prompt:   "测试",
 		UserID:   "user-1",
 	}
-	s.AddJob(ctx, job)
+	_ = s.AddJob(ctx, job)
 
 	if err := s.RemoveJob(ctx, job.ID); err != nil {
 		t.Fatalf("删除任务失败: %v", err)
@@ -96,7 +96,7 @@ func TestScheduler_PauseResumeJob(t *testing.T) {
 
 	ctx := context.Background()
 	s := NewScheduler(db)
-	s.Init(ctx)
+	_ = s.Init(ctx)
 
 	job := &Job{
 		Name:     "测试任务",
@@ -104,7 +104,7 @@ func TestScheduler_PauseResumeJob(t *testing.T) {
 		Prompt:   "测试",
 		UserID:   "user-1",
 	}
-	s.AddJob(ctx, job)
+	_ = s.AddJob(ctx, job)
 
 	// 暂停
 	if err := s.PauseJob(ctx, job.ID); err != nil {
