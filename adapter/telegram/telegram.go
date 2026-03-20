@@ -28,19 +28,27 @@ type TelegramAdapter struct {
 	cfg     config.TelegramConfig
 	handler adapter.MessageHandler
 	client  *http.Client
+	queue   *adapter.SendQueue
 	offset  atomic.Int64 // 长轮询偏移量
 	stopped atomic.Bool
 }
 
 // New 创建 Telegram 适配器
 func New(cfg config.TelegramConfig) *TelegramAdapter {
-	return &TelegramAdapter{
+	a := &TelegramAdapter{
 		cfg:    cfg,
 		client: &http.Client{Timeout: 40 * time.Second},
 	}
+	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformTelegram, a.sendMessageNow)
+	return a
 }
 
-func (a *TelegramAdapter) Name() string              { return "telegram" }
+func (a *TelegramAdapter) Name() string {
+	if a.cfg.Name != "" {
+		return a.cfg.Name
+	}
+	return "telegram"
+}
 func (a *TelegramAdapter) Platform() adapter.Platform { return adapter.PlatformTelegram }
 
 // Start 启动长轮询
@@ -56,13 +64,19 @@ func (a *TelegramAdapter) Start(_ context.Context, handler adapter.MessageHandle
 // Stop 停止长轮询
 func (a *TelegramAdapter) Stop(_ context.Context) error {
 	a.stopped.Store(true)
+	if a.queue != nil {
+		_ = a.queue.Stop(context.Background())
+	}
 	log.Println("Telegram 适配器已停止")
 	return nil
 }
 
 // Send 发送消息
 func (a *TelegramAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
-	return a.sendMessage(ctx, chatID, reply.Content)
+	if a.queue == nil {
+		return a.sendMessageNow(ctx, chatID, reply)
+	}
+	return a.queue.Send(ctx, chatID, reply)
 }
 
 // SendStream 流式发送（先发初始消息，后续编辑更新模拟打字机）
@@ -104,7 +118,7 @@ func (a *TelegramAdapter) SendStream(ctx context.Context, chatID string, chunks 
 	if messageID != 0 {
 		return a.editMessage(ctx, chatID, messageID, finalContent)
 	}
-	return a.sendMessage(ctx, chatID, finalContent)
+	return a.Send(ctx, chatID, &adapter.Reply{Content: finalContent})
 }
 
 // sendAndGetID 发送消息并返回 message_id
@@ -213,13 +227,14 @@ func (a *TelegramAdapter) handleMessage(tgMsg *tgMessage) {
 	}
 
 	msg := &adapter.Message{
-		ID:        "tg-" + idgen.ShortID(),
-		Platform:  adapter.PlatformTelegram,
-		ChatID:    fmt.Sprintf("%d", tgMsg.Chat.ID),
-		UserID:    fmt.Sprintf("%d", tgMsg.From.ID),
-		UserName:  tgMsg.From.Username,
-		Content:   tgMsg.Text,
-		Timestamp: time.Now(),
+		ID:         "tg-" + idgen.ShortID(),
+		Platform:   adapter.PlatformTelegram,
+		InstanceID: a.Name(),
+		ChatID:     fmt.Sprintf("%d", tgMsg.Chat.ID),
+		UserID:     fmt.Sprintf("%d", tgMsg.From.ID),
+		UserName:   tgMsg.From.Username,
+		Content:    tgMsg.Text,
+		Timestamp:  time.Now(),
 		Metadata: map[string]string{
 			"message_id": fmt.Sprintf("%d", tgMsg.MessageID),
 			"chat_type":  tgMsg.Chat.Type,
@@ -232,20 +247,41 @@ func (a *TelegramAdapter) handleMessage(tgMsg *tgMessage) {
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
 		log.Printf("Telegram: 处理消息失败: %v", err)
-		_ = a.sendMessage(ctx, msg.ChatID, "处理消息时出现错误，请稍后重试。")
+		_ = a.Send(ctx, msg.ChatID, &adapter.Reply{Content: "处理消息时出现错误，请稍后重试。"})
 		return
 	}
-
-	if err := a.sendMessage(ctx, msg.ChatID, reply.Content); err != nil {
+	if reply == nil {
+		return
+	}
+	if err := a.Send(ctx, msg.ChatID, reply); err != nil {
 		log.Printf("Telegram: 发送回复失败: %v", err)
 	}
 }
 
-// sendMessage 发送文本消息
+// Health 返回适配器健康状态。
+func (a *TelegramAdapter) Health(_ context.Context) error {
+	if a.cfg.Token == "" {
+		return fmt.Errorf("telegram token 不能为空")
+	}
+	if a.stopped.Load() {
+		return fmt.Errorf("telegram adapter stopped")
+	}
+	return nil
+}
+
+// sendMessage 保持旧测试兼容。
 func (a *TelegramAdapter) sendMessage(ctx context.Context, chatID, text string) error {
+	return a.sendMessageNow(ctx, chatID, &adapter.Reply{Content: text})
+}
+
+// sendMessageNow 立即发送文本消息。
+func (a *TelegramAdapter) sendMessageNow(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	if reply == nil {
+		return nil
+	}
 	body, _ := json.Marshal(map[string]any{
 		"chat_id":    chatID,
-		"text":       text,
+		"text":       reply.Content,
 		"parse_mode": "Markdown",
 	})
 

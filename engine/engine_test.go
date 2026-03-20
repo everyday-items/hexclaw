@@ -181,7 +181,7 @@ func TestBuildStreamMessages(t *testing.T) {
 	eng := NewReActEngine(cfg, router, store, skills)
 
 	// 无历史、无知识库、无角色
-	msgs := eng.buildStreamMessages("", nil, "", "你好")
+	msgs := eng.buildStreamMessages("", nil, "", "你好", nil)
 	if len(msgs) != 2 {
 		t.Fatalf("期望 2 条消息（system+user），得到 %d", len(msgs))
 	}
@@ -193,7 +193,7 @@ func TestBuildStreamMessages(t *testing.T) {
 	}
 
 	// 有知识库上下文
-	msgs = eng.buildStreamMessages("", nil, "相关知识内容", "你好")
+	msgs = eng.buildStreamMessages("", nil, "相关知识内容", "你好", nil)
 	if len(msgs) != 2 {
 		t.Fatalf("期望 2 条消息，得到 %d", len(msgs))
 	}
@@ -206,7 +206,7 @@ func TestBuildStreamMessages(t *testing.T) {
 		{Role: "user", Content: "之前的问题"},
 		{Role: "assistant", Content: "之前的回答"},
 	}
-	msgs = eng.buildStreamMessages("", history, "", "新问题")
+	msgs = eng.buildStreamMessages("", history, "", "新问题", nil)
 	if len(msgs) != 4 {
 		t.Fatalf("期望 4 条消息（system+2history+user），得到 %d", len(msgs))
 	}
@@ -215,7 +215,7 @@ func TestBuildStreamMessages(t *testing.T) {
 	}
 
 	// 有角色
-	msgs = eng.buildStreamMessages("coder", nil, "", "写代码")
+	msgs = eng.buildStreamMessages("coder", nil, "", "写代码", nil)
 	if len(msgs) != 2 {
 		t.Fatalf("期望 2 条消息，得到 %d", len(msgs))
 	}
@@ -223,13 +223,18 @@ func TestBuildStreamMessages(t *testing.T) {
 	if msgs[0].Content == systemPrompt {
 		t.Error("指定 coder 角色后 system prompt 应不同于默认")
 	}
+
+	msgs = eng.buildStreamMessages("", nil, "", "按路由执行", map[string]string{"agent_prompt": "custom prompt"})
+	if msgs[0].Content != "custom prompt" {
+		t.Fatalf("agent_prompt 未生效: %q", msgs[0].Content)
+	}
 }
 
 // echoSkill 测试用的 echo Skill
 type echoSkill struct{}
 
 func (s *echoSkill) Name() string        { return "echo" }
-func (s *echoSkill) Description() string  { return "回显输入" }
+func (s *echoSkill) Description() string { return "回显输入" }
 func (s *echoSkill) Match(content string) bool {
 	return len(content) > 6 && content[:6] == "/echo "
 }

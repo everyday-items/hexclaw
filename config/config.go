@@ -9,6 +9,12 @@
 // 所有配置项都有安全的默认值，零配置即可运行（只需设置至少一个 LLM API Key）。
 package config
 
+import (
+	"encoding/json"
+
+	"gopkg.in/yaml.v3"
+)
+
 
 // Config HexClaw 全局配置
 type Config struct {
@@ -36,9 +42,39 @@ type Config struct {
 
 // RouterConfig 多 Agent 路由配置
 //
-// 支持多个 Agent 实例，根据平台/用户/群组路由消息。
+// 支持多个 Agent 实例，根据平台/实例/用户/群组路由消息。
+// Agents 和 Rules 可在配置文件中静态声明，启动后也可通过 API 动态管理。
+// 所有 Agent 和 Rule 持久化到 SQLite，配置文件中的定义在首次启动时写入 DB。
 type RouterConfig struct {
-	Enabled bool `yaml:"enabled"` // 是否启用多 Agent 路由
+	Enabled        bool                `yaml:"enabled"`         // 是否启用多 Agent 路由
+	DefaultAgent   string              `yaml:"default_agent"`   // 默认 Agent 名称
+	LLMFallback    bool                `yaml:"llm_fallback"`    // 规则不命中时是否启用 LLM 语义路由
+	Agents         []AgentStaticConfig `yaml:"agents"`          // 静态 Agent 定义
+	Rules          []RuleStaticConfig  `yaml:"rules"`           // 静态路由规则
+}
+
+// AgentStaticConfig 配置文件中的 Agent 声明
+type AgentStaticConfig struct {
+	Name         string            `yaml:"name"`
+	DisplayName  string            `yaml:"display_name"`
+	Description  string            `yaml:"description"`
+	Model        string            `yaml:"model"`
+	Provider     string            `yaml:"provider"`
+	SystemPrompt string            `yaml:"system_prompt"`
+	Skills       []string          `yaml:"skills"`
+	MaxTokens    int               `yaml:"max_tokens"`
+	Temperature  float64           `yaml:"temperature"`
+	Metadata     map[string]string `yaml:"metadata"`
+}
+
+// RuleStaticConfig 配置文件中的路由规则声明
+type RuleStaticConfig struct {
+	Platform   string `yaml:"platform"`
+	InstanceID string `yaml:"instance_id"`
+	UserID     string `yaml:"user_id"`
+	ChatID     string `yaml:"chat_id"`
+	AgentName  string `yaml:"agent_name"`
+	Priority   int    `yaml:"priority"`
 }
 
 // CanvasConfig Canvas/A2UI 配置
@@ -218,42 +254,136 @@ type LLMCacheConfig struct {
 }
 
 // PlatformsConfig 平台适配配置
+//
+// 除 Web 外，所有平台均支持多实例（slice），同一平台可配置多个 Bot。
 type PlatformsConfig struct {
-	Telegram TelegramConfig  `yaml:"telegram"`
-	Discord  DiscordConfig   `yaml:"discord"`
-	Slack    SlackConfig     `yaml:"slack"`
-	Feishu   FeishuConfig    `yaml:"feishu"`
-	Dingtalk DingtalkConfig  `yaml:"dingtalk"`
-	Wechat   WechatConfig    `yaml:"wechat"`
-	Wecom    WecomConfig     `yaml:"wecom"`
-	Web      WebConfig       `yaml:"web"`
-	WhatsApp WhatsAppConfig  `yaml:"whatsapp"`
-	LINE     LINEConfig      `yaml:"line"`
-	Matrix   MatrixConfig    `yaml:"matrix"`
+	Feishu   []FeishuConfig   `yaml:"feishu"`
+	Dingtalk []DingtalkConfig `yaml:"dingtalk"`
+	Wecom    []WecomConfig    `yaml:"wecom"`
+	Slack    []SlackConfig    `yaml:"slack"`
+	Discord  []DiscordConfig  `yaml:"discord"`
+	Telegram []TelegramConfig `yaml:"telegram"`
+	Wechat   []WechatConfig   `yaml:"wechat"`
+	Web      WebConfig        `yaml:"web"`
+	WhatsApp []WhatsAppConfig `yaml:"whatsapp"`
+	LINE     []LINEConfig     `yaml:"line"`
+	Matrix   []MatrixConfig   `yaml:"matrix"`
+}
+
+// UnmarshalYAML 实现向后兼容的 YAML 解析
+//
+// 旧配置格式为单个对象: feishu: {enabled: true, ...}
+// 新配置格式为数组:      feishu: [{name: ..., enabled: true, ...}]
+// 此方法自动检测并兼容两种格式。
+func (p *PlatformsConfig) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind != yaml.MappingNode {
+		return nil
+	}
+
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		keyNode := value.Content[i]
+		valNode := value.Content[i+1]
+
+		switch keyNode.Value {
+		case "web":
+			if err := valNode.Decode(&p.Web); err != nil {
+				return err
+			}
+		case "feishu":
+			if err := decodeSliceOrSingle(valNode, &p.Feishu); err != nil {
+				return err
+			}
+		case "dingtalk":
+			if err := decodeSliceOrSingle(valNode, &p.Dingtalk); err != nil {
+				return err
+			}
+		case "wecom":
+			if err := decodeSliceOrSingle(valNode, &p.Wecom); err != nil {
+				return err
+			}
+		case "slack":
+			if err := decodeSliceOrSingle(valNode, &p.Slack); err != nil {
+				return err
+			}
+		case "discord":
+			if err := decodeSliceOrSingle(valNode, &p.Discord); err != nil {
+				return err
+			}
+		case "telegram":
+			if err := decodeSliceOrSingle(valNode, &p.Telegram); err != nil {
+				return err
+			}
+		case "wechat":
+			if err := decodeSliceOrSingle(valNode, &p.Wechat); err != nil {
+				return err
+			}
+		case "whatsapp":
+			if err := decodeSliceOrSingle(valNode, &p.WhatsApp); err != nil {
+				return err
+			}
+		case "line":
+			if err := decodeSliceOrSingle(valNode, &p.LINE); err != nil {
+				return err
+			}
+		case "matrix":
+			if err := decodeSliceOrSingle(valNode, &p.Matrix); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// decodeSliceOrSingle 尝试将 YAML 节点解析为 slice；
+// 如果节点是 mapping（单个对象），则包装为单元素 slice。
+// T 必须是 slice 类型的指针。
+func decodeSliceOrSingle[T any](node *yaml.Node, dst *[]T) error {
+	if node.Kind == yaml.SequenceNode {
+		return node.Decode(dst)
+	}
+	// 单个对象 → 包装为 slice
+	var single T
+	if err := node.Decode(&single); err != nil {
+		return err
+	}
+	*dst = []T{single}
+	return nil
+}
+
+// MarshalJSON 自定义 JSON 序列化：空 slice 输出为 null 而非 []
+func (p PlatformsConfig) MarshalJSON() ([]byte, error) {
+	type Alias PlatformsConfig
+	return json.Marshal(Alias(p))
 }
 
 // TelegramConfig Telegram 配置
 type TelegramConfig struct {
+	Name    string `yaml:"name"`
 	Enabled bool   `yaml:"enabled"`
 	Token   string `yaml:"token"`
 }
 
 // DiscordConfig Discord 配置
 type DiscordConfig struct {
+	Name    string `yaml:"name"`
 	Enabled bool   `yaml:"enabled"`
 	Token   string `yaml:"token"`
 }
 
 // SlackConfig Slack 配置
 type SlackConfig struct {
+	Name          string `yaml:"name"`
 	Enabled       bool   `yaml:"enabled"`
+	WebhookPort   int    `yaml:"webhook_port"`
 	Token         string `yaml:"token"`
 	SigningSecret string `yaml:"signing_secret"`
 }
 
 // FeishuConfig 飞书配置
 type FeishuConfig struct {
+	Name              string `yaml:"name"`
 	Enabled           bool   `yaml:"enabled"`
+	WebhookPort       int    `yaml:"webhook_port"`
 	AppID             string `yaml:"app_id"`
 	AppSecret         string `yaml:"app_secret"`
 	VerificationToken string `yaml:"verification_token"`
@@ -261,14 +391,17 @@ type FeishuConfig struct {
 
 // DingtalkConfig 钉钉配置
 type DingtalkConfig struct {
-	Enabled   bool   `yaml:"enabled"`
-	AppKey    string `yaml:"app_key"`
-	AppSecret string `yaml:"app_secret"`
-	RobotCode string `yaml:"robot_code"`
+	Name        string `yaml:"name"`
+	Enabled     bool   `yaml:"enabled"`
+	WebhookPort int    `yaml:"webhook_port"`
+	AppKey      string `yaml:"app_key"`
+	AppSecret   string `yaml:"app_secret"`
+	RobotCode   string `yaml:"robot_code"`
 }
 
 // WechatConfig 微信配置
 type WechatConfig struct {
+	Name      string `yaml:"name"`
 	Enabled   bool   `yaml:"enabled"`
 	AppID     string `yaml:"app_id"`
 	AppSecret string `yaml:"app_secret"`
@@ -278,12 +411,14 @@ type WechatConfig struct {
 
 // WecomConfig 企业微信配置
 type WecomConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	CorpID  string `yaml:"corp_id"`
-	AgentID string `yaml:"agent_id"`
-	Secret  string `yaml:"secret"`
-	Token   string `yaml:"token"`
-	AESKey  string `yaml:"aes_key"`
+	Name        string `yaml:"name"`
+	Enabled     bool   `yaml:"enabled"`
+	WebhookPort int    `yaml:"webhook_port"`
+	CorpID      string `yaml:"corp_id"`
+	AgentID     string `yaml:"agent_id"`
+	Secret      string `yaml:"secret"`
+	Token       string `yaml:"token"`
+	AESKey      string `yaml:"aes_key"`
 }
 
 // WebConfig Web UI 配置
@@ -293,6 +428,7 @@ type WebConfig struct {
 
 // WhatsAppConfig WhatsApp Business API 配置
 type WhatsAppConfig struct {
+	Name        string `yaml:"name"`
 	Enabled     bool   `yaml:"enabled"`
 	Token       string `yaml:"token"`        // Cloud API Token
 	PhoneID     string `yaml:"phone_id"`     // 电话号码 ID
@@ -301,6 +437,7 @@ type WhatsAppConfig struct {
 
 // LINEConfig LINE Messaging API 配置
 type LINEConfig struct {
+	Name          string `yaml:"name"`
 	Enabled       bool   `yaml:"enabled"`
 	ChannelSecret string `yaml:"channel_secret"` // Channel Secret
 	ChannelToken  string `yaml:"channel_token"`  // Channel Access Token
@@ -308,6 +445,7 @@ type LINEConfig struct {
 
 // MatrixConfig Matrix 协议配置
 type MatrixConfig struct {
+	Name          string `yaml:"name"`
 	Enabled       bool   `yaml:"enabled"`
 	HomeserverURL string `yaml:"homeserver_url"` // Homeserver URL
 	AccessToken   string `yaml:"access_token"`   // Bot Access Token

@@ -17,15 +17,15 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/internal/testutil/httpmock"
 )
 
-// mockTransport 自定义 HTTP 传输，用于拦截请求
 type mockTransport struct {
-	handler func(req *http.Request) (*http.Response, error)
+	handler httpmock.RoundTripFunc
 }
 
 func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	return m.handler(req)
+	return m.handler.RoundTrip(req)
 }
 
 // newTestAdapter 创建测试用钉钉适配器
@@ -177,15 +177,13 @@ func TestHandleWebhookNoSignatureCheck(t *testing.T) {
 	}
 	// 使用 mock transport 避免真实 HTTP 调用（handleMessage 中的 Send 会发请求）
 	a.client = &http.Client{
-		Transport: &mockTransport{
-			handler: func(req *http.Request) (*http.Response, error) {
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(`{"accessToken":"test","expireIn":7200}`)),
-					Header:     make(http.Header),
-				}, nil
-			},
-		},
+		Transport: httpmock.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"accessToken":"test","expireIn":7200}`)),
+				Header:     make(http.Header),
+			}, nil
+		}),
 	}
 
 	body := `{"text":{"content":"hello"},"senderStaffId":"user1","senderNick":"Test"}`

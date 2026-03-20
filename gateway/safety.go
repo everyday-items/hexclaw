@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 
 	"github.com/hexagon-codes/hexagon/security/guard"
 	"github.com/hexagon-codes/hexclaw/adapter"
@@ -46,7 +47,9 @@ func NewInputSafetyLayer(cfg *config.SecurityConfig) *InputSafetyLayer {
 
 	// 内容过滤
 	if cfg.ContentFilter.Enabled {
-		log.Printf("警告: ContentFilter 已启用但尚无实现，将跳过内容过滤")
+		cfGuard := newContentFilterGuard(cfg.ContentFilter.BlockCategories)
+		guards = append(guards, cfGuard)
+		log.Printf("ContentFilter 已启用，阻断类别: %v", cfg.ContentFilter.BlockCategories)
 	}
 
 	// 组装守卫链
@@ -89,4 +92,67 @@ func (l *InputSafetyLayer) Check(ctx context.Context, msg *adapter.Message) erro
 	}
 
 	return nil
+}
+
+// contentFilterGuard 基于关键词的内容过滤守卫
+//
+// 实现 guard.Guard 接口，根据配置的 blockCategories 匹配预定义关键词。
+// 这是一个基础的本地规则引擎；后续可扩展为调用外部审核 API。
+type contentFilterGuard struct {
+	categories map[string][]string // category → keywords
+	enabled    []string
+}
+
+var defaultBlockKeywords = map[string][]string{
+	"violence": {"杀人", "炸弹", "枪支", "暗杀", "爆炸物", "how to kill", "make a bomb", "weapon"},
+	"illegal":  {"贩毒", "洗钱", "走私", "伪造", "黑客攻击", "drug trafficking", "money laundering"},
+	"adult":    {"色情", "裸体", "性交", "pornography", "explicit sexual"},
+	"self_harm": {"自杀方法", "自残", "suicide method", "self-harm instructions"},
+}
+
+func newContentFilterGuard(blockCategories []string) *contentFilterGuard {
+	enabled := blockCategories
+	if len(enabled) == 0 {
+		enabled = []string{"violence", "illegal", "self_harm"}
+	}
+	return &contentFilterGuard{
+		categories: defaultBlockKeywords,
+		enabled:    enabled,
+	}
+}
+
+func (g *contentFilterGuard) Name() string    { return "content_filter" }
+func (g *contentFilterGuard) Enabled() bool   { return len(g.enabled) > 0 }
+
+func (g *contentFilterGuard) Check(_ context.Context, input string) (*guard.CheckResult, error) {
+	lower := strings.ToLower(input)
+	var findings []guard.Finding
+
+	for _, cat := range g.enabled {
+		keywords, ok := g.categories[cat]
+		if !ok {
+			continue
+		}
+		for _, kw := range keywords {
+			if strings.Contains(lower, strings.ToLower(kw)) {
+				findings = append(findings, guard.Finding{
+					Type:     cat,
+					Text:     kw,
+					Severity: "high",
+				})
+			}
+		}
+	}
+
+	if len(findings) > 0 {
+		return &guard.CheckResult{
+			Passed:   false,
+			Score:    1.0,
+			Category: findings[0].Type,
+			Reason:   fmt.Sprintf("内容触发 %s 类过滤规则", findings[0].Type),
+			Findings: findings,
+		}, nil
+	}
+
+	return &guard.CheckResult{Passed: true, Score: 0}, nil
 }

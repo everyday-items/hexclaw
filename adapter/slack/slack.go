@@ -4,10 +4,10 @@
 // 通过 Web API 发送回复。支持流式更新（chat.update）。
 //
 // 配置方式：
-//   1. 创建 Slack App，启用 Event Subscriptions
-//   2. 设置 Request URL 为 http://your-host:6063/slack/events
-//   3. 订阅 message.channels 和 message.im 事件
-//   4. 添加 Bot Token Scopes: chat:write, channels:history, im:history
+//  1. 创建 Slack App，启用 Event Subscriptions
+//  2. 设置 Request URL 为 http://your-host:6063/slack/events
+//  3. 订阅 message.channels 和 message.im 事件
+//  4. 添加 Bot Token Scopes: chat:write, channels:history, im:history
 //
 // 对标 OpenClaw Slack 集成。
 package slack
@@ -43,36 +43,55 @@ type SlackAdapter struct {
 	handler adapter.MessageHandler
 	server  *http.Server
 	client  *http.Client
+	queue   *adapter.SendQueue
 	botID   string // Bot 自身的 User ID（避免处理自己的消息）
 }
 
 // New 创建 Slack 适配器
 func New(cfg config.SlackConfig) *SlackAdapter {
-	return &SlackAdapter{
+	a := &SlackAdapter{
 		cfg:    cfg,
 		client: &http.Client{Timeout: 30 * time.Second},
 	}
+	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformSlack, a.sendReplyNow)
+	return a
 }
 
-func (a *SlackAdapter) Name() string              { return "slack" }
+func (a *SlackAdapter) Name() string {
+	if a.cfg.Name != "" {
+		return a.cfg.Name
+	}
+	return "slack"
+}
 func (a *SlackAdapter) Platform() adapter.Platform { return adapter.PlatformSlack }
 
-// Start 启动 Slack Events API 服务器
-func (a *SlackAdapter) Start(_ context.Context, handler adapter.MessageHandler) error {
+// Attach 注册消息处理器，但不启动独立 HTTP 服务器。
+func (a *SlackAdapter) Attach(handler adapter.MessageHandler) error {
 	a.handler = handler
-
 	if a.cfg.Token == "" {
 		return fmt.Errorf("slack bot token 不能为空")
 	}
-
-	// 获取 Bot 自身的 User ID
 	a.fetchBotID()
+	return nil
+}
+
+// Start 启动 Slack Events API 服务器
+func (a *SlackAdapter) Start(_ context.Context, handler adapter.MessageHandler) error {
+	if err := a.Attach(handler); err != nil {
+		return err
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /slack/events", a.handleEvents)
 
+	port := a.cfg.WebhookPort
+	if port <= 0 {
+		port = 6063
+	}
+	addr := fmt.Sprintf(":%d", port)
+
 	a.server = &http.Server{
-		Addr:              ":6063",
+		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -89,15 +108,26 @@ func (a *SlackAdapter) Start(_ context.Context, handler adapter.MessageHandler) 
 
 // Stop 停止适配器
 func (a *SlackAdapter) Stop(ctx context.Context) error {
+	if a.queue != nil {
+		_ = a.queue.Stop(context.Background())
+	}
 	if a.server != nil {
 		return a.server.Shutdown(ctx)
 	}
 	return nil
 }
 
+// Handler 返回统一 ingress 使用的处理器。
+func (a *SlackAdapter) Handler() http.Handler {
+	return http.HandlerFunc(a.handleEvents)
+}
+
 // Send 发送同步回复
 func (a *SlackAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
-	return a.postMessage(ctx, chatID, reply.Content)
+	if a.queue == nil {
+		return a.sendReplyNow(ctx, chatID, reply)
+	}
+	return a.queue.Send(ctx, chatID, reply)
 }
 
 // SendStream 流式发送（先发初始消息，后续 chat.update 更新）
@@ -194,12 +224,13 @@ func (a *SlackAdapter) processEvent(data json.RawMessage) {
 
 	// 转换为统一消息格式
 	unified := &adapter.Message{
-		ID:        "slack-" + idgen.ShortID(),
-		Platform:  adapter.PlatformSlack,
-		ChatID:    event.Channel,
-		UserID:    event.User,
-		Content:   event.Text,
-		Timestamp: time.Now(),
+		ID:         "slack-" + idgen.ShortID(),
+		Platform:   adapter.PlatformSlack,
+		InstanceID: a.Name(),
+		ChatID:     event.Channel,
+		UserID:     event.User,
+		Content:    event.Text,
+		Timestamp:  time.Now(),
 		Metadata: map[string]string{
 			"thread_ts": event.ThreadTS,
 			"ts":        event.TS,
@@ -212,19 +243,18 @@ func (a *SlackAdapter) processEvent(data json.RawMessage) {
 	reply, err := a.handler(ctx, unified)
 	if err != nil {
 		log.Printf("Slack 消息处理失败: %v", err)
-		_ = a.postMessage(ctx, event.Channel, "处理消息时出错，请稍后重试。")
+		_ = a.Send(ctx, event.Channel, &adapter.Reply{Content: "处理消息时出错，请稍后重试。"})
 		return
 	}
 	if reply != nil {
-		// 如果原消息在线程中，回复到同一线程
 		if event.ThreadTS != "" {
-			if err := a.postThreadMessage(ctx, event.Channel, event.ThreadTS, reply.Content); err != nil {
-				log.Printf("Slack 线程回复失败: %v", err)
+			if reply.Metadata == nil {
+				reply.Metadata = make(map[string]string, 1)
 			}
-		} else {
-			if err := a.postMessage(ctx, event.Channel, reply.Content); err != nil {
-				log.Printf("Slack 回复失败: %v", err)
-			}
+			reply.Metadata["thread_ts"] = event.ThreadTS
+		}
+		if err := a.Send(ctx, event.Channel, reply); err != nil {
+			log.Printf("Slack 回复失败: %v", err)
 		}
 	}
 }
@@ -265,6 +295,16 @@ func (a *SlackAdapter) verifySignature(r *http.Request, body []byte) bool {
 func (a *SlackAdapter) postMessage(ctx context.Context, channel, text string) error {
 	_, err := a.postMessageWithTS(ctx, channel, text)
 	return err
+}
+
+func (a *SlackAdapter) sendReplyNow(ctx context.Context, channel string, reply *adapter.Reply) error {
+	if reply == nil {
+		return nil
+	}
+	if threadTS := reply.Metadata["thread_ts"]; threadTS != "" {
+		return a.postThreadMessage(ctx, channel, threadTS, reply.Content)
+	}
+	return a.postMessage(ctx, channel, reply.Content)
 }
 
 // postMessageWithTS 发送消息并返回 ts（消息 ID）
@@ -374,6 +414,20 @@ func (a *SlackAdapter) fetchBotID() {
 		return
 	}
 	a.botID = result.UserID
+}
+
+// Health 返回当前实例的基本健康状态。
+func (a *SlackAdapter) Health(_ context.Context) error {
+	if a.cfg.Token == "" {
+		return fmt.Errorf("slack bot token 不能为空")
+	}
+	if a.handler == nil {
+		return fmt.Errorf("slack handler 未附加")
+	}
+	if a.botID == "" {
+		return fmt.Errorf("slack bot id 未初始化")
+	}
+	return nil
 }
 
 // ============== 数据模型 ==============

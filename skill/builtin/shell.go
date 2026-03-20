@@ -130,8 +130,13 @@ func extractShellCommand(input string) string {
 }
 
 // allowedCommands 白名单：仅允许真正只读/无副作用的命令
-// 已移除所有具有写能力的命令：python/python3/go/node/sed/awk/curl/wget/
-// cp/mv/mkdir/touch/tar/zip/unzip/gzip/gunzip/tee/xargs/yes 等
+//
+// 已移除所有具有写能力或数据窃取风险的命令：
+//   python/python3/go/node/sed/awk/wget/cp/mv/mkdir/touch/
+//   tar/zip/unzip/gzip/gunzip/tee/xargs/yes/curl 等
+//
+// curl 已移除：即使拦截 -o/-O，仍可通过 -d @file / -F file=@path /
+// --data-binary @path 窃取本地文件到外部服务器，风险不可控。
 var allowedCommands = map[string]bool{
 	// 文件查看（只读）
 	"ls": true, "cat": true, "head": true, "tail": true,
@@ -148,11 +153,6 @@ var allowedCommands = map[string]bool{
 	// 网络诊断（只读）
 	"ping": true, "dig": true, "nslookup": true,
 	"traceroute": true, "ifconfig": true, "ip": true, "ss": true, "netstat": true,
-	// 网络获取（curl 限制：仅允许 GET，-o/-O 由 dangerousFlags 拦截）
-	"curl": true,
-	// 文件操作（低风险写操作）
-	"touch": true, "mkdir": true, "cp": true,
-	// python3 已移除：可通过 -c 执行任意代码（os.system 等），风险不可控
 	// Git（只读子命令，危险子命令另行拦截）
 	"git": true,
 	// 路径/标识
@@ -167,9 +167,6 @@ var dangerousSubcommands = map[string][]string{
 		"commit", "merge", "stash", "cherry-pick",
 		"tag", "branch -D", "branch -d",
 		"clone", "pull", "submodule", "config",
-	},
-	"curl": {
-		"-o ", "-O", "--output ", "--upload-file ",
 	},
 }
 

@@ -70,12 +70,24 @@ func (l *RBACLayer) Check(_ context.Context, msg *adapter.Message) error {
 	}
 
 	// 检查平台权限
+	// 支持两种格式: "feishu"（平台级）或 "feishu:support-bot"（实例级）
 	if len(role.Platforms) > 0 {
 		allowed := false
+		msgPlatform := string(msg.Platform)
+		msgInstance := msg.InstanceID
 		for _, p := range role.Platforms {
-			if strings.EqualFold(p, string(msg.Platform)) {
-				allowed = true
-				break
+			if idx := strings.IndexByte(p, ':'); idx >= 0 {
+				// 实例级匹配: "feishu:support-bot"
+				if strings.EqualFold(p[:idx], msgPlatform) && strings.EqualFold(p[idx+1:], msgInstance) {
+					allowed = true
+					break
+				}
+			} else {
+				// 平台级匹配: "feishu"
+				if strings.EqualFold(p, msgPlatform) {
+					allowed = true
+					break
+				}
 			}
 		}
 		if !allowed {

@@ -47,26 +47,34 @@ type DiscordAdapter struct {
 	cfg     config.DiscordConfig
 	handler adapter.MessageHandler
 	client  *http.Client
+	queue   *adapter.SendQueue
 
-	conn        *websocket.Conn  // WebSocket 连接
-	mu          sync.Mutex       // 保护 conn
-	sessionID   string           // Gateway 会话 ID（用于恢复连接）
-	seq         atomic.Int64     // 最新序列号
-	stopped       atomic.Bool      // 是否已停止
-	heartbeatCh   chan struct{}     // 心跳停止信号
-	heartbeatStop chan struct{}     // 当前连接的心跳停止信号
+	conn          *websocket.Conn // WebSocket 连接
+	mu            sync.Mutex      // 保护 conn
+	sessionID     string          // Gateway 会话 ID（用于恢复连接）
+	seq           atomic.Int64    // 最新序列号
+	stopped       atomic.Bool     // 是否已停止
+	heartbeatCh   chan struct{}   // 心跳停止信号
+	heartbeatStop chan struct{}   // 当前连接的心跳停止信号
 }
 
 // New 创建 Discord 适配器
 func New(cfg config.DiscordConfig) *DiscordAdapter {
-	return &DiscordAdapter{
+	a := &DiscordAdapter{
 		cfg:         cfg,
 		client:      &http.Client{Timeout: 30 * time.Second},
 		heartbeatCh: make(chan struct{}),
 	}
+	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformDiscord, a.sendReplyNow)
+	return a
 }
 
-func (a *DiscordAdapter) Name() string              { return "discord" }
+func (a *DiscordAdapter) Name() string {
+	if a.cfg.Name != "" {
+		return a.cfg.Name
+	}
+	return "discord"
+}
 func (a *DiscordAdapter) Platform() adapter.Platform { return adapter.PlatformDiscord }
 
 // Start 启动 Discord Bot
@@ -106,13 +114,20 @@ func (a *DiscordAdapter) Stop(_ context.Context) error {
 	}
 	a.mu.Unlock()
 
+	if a.queue != nil {
+		_ = a.queue.Stop(context.Background())
+	}
+
 	log.Println("Discord 适配器已停止")
 	return nil
 }
 
 // Send 发送同步回复
 func (a *DiscordAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
-	return a.sendMessage(ctx, chatID, reply.Content)
+	if a.queue == nil {
+		return a.sendReplyNow(ctx, chatID, reply)
+	}
+	return a.queue.Send(ctx, chatID, reply)
 }
 
 // SendStream 流式发送（发送初始消息，后续编辑更新）
@@ -329,13 +344,14 @@ func (a *DiscordAdapter) handleMessageCreate(data json.RawMessage) {
 
 	// 转换为统一消息格式
 	unified := &adapter.Message{
-		ID:        "discord-" + idgen.ShortID(),
-		Platform:  adapter.PlatformDiscord,
-		ChatID:    msg.ChannelID,
-		UserID:    msg.Author.ID,
-		UserName:  msg.Author.Username,
-		Content:   msg.Content,
-		Timestamp: time.Now(),
+		ID:         "discord-" + idgen.ShortID(),
+		Platform:   adapter.PlatformDiscord,
+		InstanceID: a.Name(),
+		ChatID:     msg.ChannelID,
+		UserID:     msg.Author.ID,
+		UserName:   msg.Author.Username,
+		Content:    msg.Content,
+		Timestamp:  time.Now(),
 		Metadata: map[string]string{
 			"guild_id":   msg.GuildID,
 			"message_id": msg.ID,
@@ -350,11 +366,11 @@ func (a *DiscordAdapter) handleMessageCreate(data json.RawMessage) {
 		reply, err := a.handler(ctx, unified)
 		if err != nil {
 			log.Printf("Discord 消息处理失败: %v", err)
-			a.sendMessage(ctx, msg.ChannelID, "处理消息时出错，请稍后重试。")
+			_ = a.Send(ctx, msg.ChannelID, &adapter.Reply{Content: "处理消息时出错，请稍后重试。"})
 			return
 		}
 		if reply != nil {
-			a.sendMessage(ctx, msg.ChannelID, reply.Content)
+			_ = a.Send(ctx, msg.ChannelID, reply)
 		}
 	}()
 }
@@ -365,6 +381,13 @@ func (a *DiscordAdapter) handleMessageCreate(data json.RawMessage) {
 func (a *DiscordAdapter) sendMessage(ctx context.Context, channelID, content string) error {
 	_, err := a.createMessage(ctx, channelID, content)
 	return err
+}
+
+func (a *DiscordAdapter) sendReplyNow(ctx context.Context, channelID string, reply *adapter.Reply) error {
+	if reply == nil {
+		return nil
+	}
+	return a.sendMessage(ctx, channelID, reply.Content)
 }
 
 // createMessage 创建消息并返回消息 ID
@@ -434,6 +457,22 @@ func (a *DiscordAdapter) editMessage(ctx context.Context, channelID, messageID, 
 	return nil
 }
 
+// Health 返回当前连接健康状态。
+func (a *DiscordAdapter) Health(_ context.Context) error {
+	if a.cfg.Token == "" {
+		return fmt.Errorf("discord bot token 不能为空")
+	}
+	if a.stopped.Load() {
+		return fmt.Errorf("discord adapter stopped")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.conn == nil {
+		return fmt.Errorf("discord gateway 未连接")
+	}
+	return nil
+}
+
 // ============== 数据模型 ==============
 
 // gatewayEvent Discord Gateway 事件
@@ -446,12 +485,12 @@ type gatewayEvent struct {
 
 // discordMessage Discord 消息
 type discordMessage struct {
-	ID        string        `json:"id"`
-	ChannelID string        `json:"channel_id"`
-	GuildID   string        `json:"guild_id"`
-	Author    discordUser   `json:"author"`
-	Content   string        `json:"content"`
-	Timestamp string        `json:"timestamp"`
+	ID        string      `json:"id"`
+	ChannelID string      `json:"channel_id"`
+	GuildID   string      `json:"guild_id"`
+	Author    discordUser `json:"author"`
+	Content   string      `json:"content"`
+	Timestamp string      `json:"timestamp"`
 }
 
 // discordUser Discord 用户

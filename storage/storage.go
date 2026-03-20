@@ -19,43 +19,45 @@ var ErrNotFound = errors.New("not found")
 
 // Session 会话记录
 type Session struct {
-	ID              string    // 会话 ID
-	UserID          string    // 用户 ID
-	Platform        string    // 平台
-	Title           string    // 会话标题（自动生成或用户设置）
-	ParentSessionID string    // 父会话 ID（分支来源，空表示原始会话）
-	BranchMessageID string    // 分支起点消息 ID（从父会话的哪条消息开始分支）
-	CreatedAt       time.Time // 创建时间
-	UpdatedAt       time.Time // 最后更新时间
+	ID              string    `json:"id"`
+	UserID          string    `json:"user_id"`
+	Platform        string    `json:"platform"`
+	InstanceID      string    `json:"instance_id"`
+	ChatID          string    `json:"chat_id"`
+	Title           string    `json:"title"`
+	ParentSessionID string    `json:"parent_session_id"`
+	BranchMessageID string    `json:"branch_message_id"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // MessageRecord 消息记录
 type MessageRecord struct {
-	ID        string    // 消息 ID
-	SessionID string    // 所属会话 ID
-	ParentID  string    // 父消息 ID（分支场景，空表示线性对话）
-	Role      string    // 角色: user / assistant / system / tool
-	Content   string    // 消息内容
-	Metadata  string    // JSON 格式的元数据
-	CreatedAt time.Time // 创建时间
+	ID        string    `json:"id"`
+	SessionID string    `json:"session_id"`
+	ParentID  string    `json:"parent_id"`
+	Role      string    `json:"role"`
+	Content   string    `json:"content"`
+	Metadata  string    `json:"metadata"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // SearchResult 消息搜索结果
 type SearchResult struct {
-	Message   *MessageRecord // 匹配的消息
-	SessionTitle string     // 所属会话标题
-	Rank      float64       // 搜索排名分数
+	Message      *MessageRecord `json:"message"`
+	SessionTitle string         `json:"session_title"`
+	Rank         float64        `json:"rank"`
 }
 
 // CostRecord 成本记录
 type CostRecord struct {
-	ID        string    // 记录 ID
-	UserID    string    // 用户 ID
-	Provider  string    // LLM Provider 名称
-	Model     string    // 模型名称
-	Tokens    int       // 消耗 Token 数
-	Cost      float64   // 费用（美元）
-	CreatedAt time.Time // 创建时间
+	ID        string    `json:"id"`
+	UserID    string    `json:"user_id"`
+	Provider  string    `json:"provider"`
+	Model     string    `json:"model"`
+	Tokens    int       `json:"tokens"`
+	Cost      float64   `json:"cost"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Store 存储接口
@@ -78,6 +80,9 @@ type Store interface {
 
 	// GetSession 获取会话
 	GetSession(ctx context.Context, id string) (*Session, error)
+
+	// FindSessionByScope 按会话作用域查找最近活跃会话
+	FindSessionByScope(ctx context.Context, userID, platform, instanceID, chatID string) (*Session, error)
 
 	// ListSessions 列出用户的会话（按更新时间倒序）
 	ListSessions(ctx context.Context, userID string, limit, offset int) ([]*Session, error)

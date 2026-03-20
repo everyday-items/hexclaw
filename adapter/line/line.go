@@ -31,10 +31,12 @@ type LineAdapter struct {
 	handler adapter.MessageHandler
 	server  *http.Server
 	client  *http.Client
+	queue   *adapter.SendQueue
 }
 
 // Config LINE 适配器配置
 type Config struct {
+	Name          string `yaml:"name"`
 	ChannelSecret string `yaml:"channel_secret"` // Channel Secret（用于签名验证）
 	ChannelToken  string `yaml:"channel_token"`  // Channel Access Token
 	WebhookPort   int    `yaml:"webhook_port"`   // Webhook 端口，默认 6064
@@ -48,18 +50,33 @@ func New(cfg Config) *LineAdapter {
 	if cfg.WebhookPort == 0 {
 		cfg.WebhookPort = 6064
 	}
-	return &LineAdapter{
+	a := &LineAdapter{
 		config: cfg,
 		client: &http.Client{Timeout: 30 * time.Second},
 	}
+	a.queue = adapter.NewPlatformSendQueue(PlatformLINE, a.sendReplyNow)
+	return a
 }
 
-func (a *LineAdapter) Name() string              { return "line" }
+func (a *LineAdapter) Name() string {
+	if a.config.Name != "" {
+		return a.config.Name
+	}
+	return "line"
+}
 func (a *LineAdapter) Platform() adapter.Platform { return PlatformLINE }
+
+// Attach 注册消息处理器，但不启动独立 HTTP 服务器。
+func (a *LineAdapter) Attach(handler adapter.MessageHandler) error {
+	a.handler = handler
+	return nil
+}
 
 // Start 启动 Webhook 服务器
 func (a *LineAdapter) Start(ctx context.Context, handler adapter.MessageHandler) error {
-	a.handler = handler
+	if err := a.Attach(handler); err != nil {
+		return err
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/webhook/line", a.handleWebhook)
@@ -83,14 +100,35 @@ func (a *LineAdapter) Start(ctx context.Context, handler adapter.MessageHandler)
 
 // Stop 停止适配器
 func (a *LineAdapter) Stop(ctx context.Context) error {
+	if a.queue != nil {
+		_ = a.queue.Stop(context.Background())
+	}
 	if a.server != nil {
 		return a.server.Shutdown(ctx)
 	}
 	return nil
 }
 
+// Handler 返回统一 ingress 使用的处理器。
+func (a *LineAdapter) Handler() http.Handler {
+	return http.HandlerFunc(a.handleWebhook)
+}
+
 // Send 发送消息（Push Message）
 func (a *LineAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	if a.queue == nil {
+		return a.sendReplyNow(ctx, chatID, reply)
+	}
+	return a.queue.Send(ctx, chatID, reply)
+}
+
+func (a *LineAdapter) sendReplyNow(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	if reply == nil {
+		return nil
+	}
+	if replyToken := reply.Metadata["reply_token"]; replyToken != "" {
+		return a.replyMessage(ctx, replyToken, reply.Content)
+	}
 	payload := map[string]any{
 		"to": chatID,
 		"messages": []map[string]string{
@@ -197,12 +235,13 @@ func (a *LineAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 
 		msg := &adapter.Message{
-			ID:        event.Message.ID,
-			Platform:  PlatformLINE,
-			ChatID:    event.Source.UserID,
-			UserID:    event.Source.UserID,
-			Content:   event.Message.Text,
-			Timestamp: time.UnixMilli(event.Timestamp),
+			ID:         event.Message.ID,
+			Platform:   PlatformLINE,
+			InstanceID: a.Name(),
+			ChatID:     event.Source.UserID,
+			UserID:     event.Source.UserID,
+			Content:    event.Message.Text,
+			Timestamp:  time.UnixMilli(event.Timestamp),
 			Metadata: map[string]string{
 				"reply_token": event.ReplyToken,
 				"source_type": event.Source.Type,
@@ -219,20 +258,31 @@ func (a *LineAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if reply != nil {
-					// 优先使用 Reply API
 					replyToken := m.Metadata["reply_token"]
 					if replyToken != "" {
-						if err := a.replyMessage(ctx, replyToken, reply.Content); err != nil {
-							log.Printf("[LINE] Reply 失败, 降级 Push: %v", err)
-							_ = a.Send(ctx, m.ChatID, reply)
+						if reply.Metadata == nil {
+							reply.Metadata = make(map[string]string, 1)
 						}
-					} else {
-						_ = a.Send(ctx, m.ChatID, reply)
+						reply.Metadata["reply_token"] = replyToken
+					}
+					if err := a.Send(ctx, m.ChatID, reply); err != nil {
+						log.Printf("[LINE] 发送回复失败: %v", err)
 					}
 				}
 			}
 		}(msg)
 	}
+}
+
+// Health 返回适配器健康状态。
+func (a *LineAdapter) Health(_ context.Context) error {
+	if a.handler == nil {
+		return fmt.Errorf("line handler 未附加")
+	}
+	if a.config.ChannelSecret == "" || a.config.ChannelToken == "" {
+		return fmt.Errorf("line channel_secret/channel_token 未配置")
+	}
+	return nil
 }
 
 // verifySignature 验证 LINE Webhook 签名

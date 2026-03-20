@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -161,6 +162,44 @@ func TestSearchMessages_Pagination(t *testing.T) {
 	results2, _, _ := store.SearchMessages(ctx, "user-1", "测试", 2, 2)
 	if len(results2) != 2 {
 		t.Errorf("第二页应返回 2 条，实际 %d", len(results2))
+	}
+}
+
+func TestSearchMessages_CacheInvalidatedOnSaveMessage(t *testing.T) {
+	store := newTestStoreV2(t)
+	ctx := context.Background()
+
+	if err := store.CreateSession(ctx, &storage.Session{
+		ID: "sess-cache", UserID: "user-1", Platform: "web", Title: "缓存测试",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+	if err := store.SaveMessage(ctx, &storage.MessageRecord{
+		ID: "msg-cache-1", SessionID: "sess-cache", Role: "user", Content: "Kubernetes guide", Metadata: "{}",
+	}); err != nil {
+		t.Fatalf("保存消息失败: %v", err)
+	}
+
+	results, total, err := store.SearchMessages(ctx, "user-1", "Kubernetes", 10, 0)
+	if err != nil {
+		t.Fatalf("首次搜索失败: %v", err)
+	}
+	if total != 1 || len(results) != 1 {
+		t.Fatalf("首次搜索 total=%d len=%d, want 1", total, len(results))
+	}
+
+	if err := store.SaveMessage(ctx, &storage.MessageRecord{
+		ID: "msg-cache-2", SessionID: "sess-cache", Role: "user", Content: "Kubernetes operator", Metadata: "{}",
+	}); err != nil {
+		t.Fatalf("保存第二条消息失败: %v", err)
+	}
+
+	results, total, err = store.SearchMessages(ctx, "user-1", "Kubernetes", 10, 0)
+	if err != nil {
+		t.Fatalf("再次搜索失败: %v", err)
+	}
+	if total != 2 || len(results) != 2 {
+		t.Fatalf("缓存失效后 total=%d len=%d, want 2", total, len(results))
 	}
 }
 
@@ -440,13 +479,54 @@ func TestForkSession_LongTitle(t *testing.T) {
 	}
 }
 
+func TestForkSession_UsesUpdatedTitleAfterSourceRename(t *testing.T) {
+	store := newTestStoreV2(t)
+	ctx := context.Background()
+
+	if err := store.CreateSession(ctx, &storage.Session{
+		ID: "sess-rename", UserID: "user-1", Platform: "web", Title: "旧标题",
+	}); err != nil {
+		t.Fatalf("CreateSession 失败: %v", err)
+	}
+	if err := store.SaveMessage(ctx, &storage.MessageRecord{
+		ID: "msg-rename", SessionID: "sess-rename", Role: "user", Content: "hello", Metadata: "{}",
+	}); err != nil {
+		t.Fatalf("SaveMessage 失败: %v", err)
+	}
+
+	firstFork, err := store.ForkSession(ctx, "sess-rename", "msg-rename", "user-1")
+	if err != nil {
+		t.Fatalf("首次 ForkSession 失败: %v", err)
+	}
+	if !strings.Contains(firstFork.Title, "旧标题") {
+		t.Fatalf("首次分支标题未使用旧标题: %q", firstFork.Title)
+	}
+
+	if err := store.UpdateSession(ctx, &storage.Session{ID: "sess-rename", Title: "新标题"}); err != nil {
+		t.Fatalf("UpdateSession 失败: %v", err)
+	}
+
+	secondFork, err := store.ForkSession(ctx, "sess-rename", "msg-rename", "user-1")
+	if err != nil {
+		t.Fatalf("二次 ForkSession 失败: %v", err)
+	}
+	if !strings.Contains(secondFork.Title, "新标题") {
+		t.Fatalf("分支标题未反映更新后的源标题: %q", secondFork.Title)
+	}
+}
+
 // --- 性能基准测试 ---
 
 func BenchmarkSearchMessages_FTS(b *testing.B) {
 	dir := b.TempDir()
 	dbPath := filepath.Join(dir, "bench.db")
-	store, _ := New(dbPath)
-	store.Init(context.Background())
+	store, err := New(dbPath)
+	if err != nil {
+		b.Fatalf("New 失败: %v", err)
+	}
+	if err := store.Init(context.Background()); err != nil {
+		b.Fatalf("Init 失败: %v", err)
+	}
 	defer store.Close()
 
 	ctx := context.Background()
@@ -460,45 +540,71 @@ func BenchmarkSearchMessages_FTS(b *testing.B) {
 			ID:        "msg-bench-" + os.Getenv("") + string(rune(i/26000+'A')) + string(rune(i%26+'a')) + string(rune(i/26%26+'a')),
 			SessionID: "sess-bench",
 			Role:      "user",
-			Content:   "这是一条关于 Go 语言和 Kubernetes 的消息，编号 " + string(rune(i%26+'a')),
+			Content:   fmt.Sprintf("这是一条关于 Go 语言和 Kubernetes topic-%03d 的消息", i),
 			Metadata:  "{}",
 		})
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		store.SearchMessages(ctx, "user-1", "Kubernetes", 20, 0)
+		store.invalidateSearchCache()
+		if _, _, err := store.SearchMessages(ctx, "user-1", fmt.Sprintf("topic-%03d", i%1000), 20, 0); err != nil {
+			b.Fatalf("SearchMessages 失败: %v", err)
+		}
 	}
 }
 
 func BenchmarkForkSession(b *testing.B) {
 	dir := b.TempDir()
 	dbPath := filepath.Join(dir, "bench.db")
-	store, _ := New(dbPath)
-	store.Init(context.Background())
+	store, err := New(dbPath)
+	if err != nil {
+		b.Fatalf("New 失败: %v", err)
+	}
+	if err := store.Init(context.Background()); err != nil {
+		b.Fatalf("Init 失败: %v", err)
+	}
 	defer store.Close()
 
 	ctx := context.Background()
 
-	// 预填充 100 条消息
-	store.CreateSession(ctx, &storage.Session{
-		ID: "sess-fork-bench", UserID: "user-1", Platform: "web", Title: "fork bench",
-	})
-	var lastMsgID string
-	for i := 0; i < 100; i++ {
-		lastMsgID = "msg-fb-" + string(rune(i/26+'A')) + string(rune(i%26+'a'))
-		store.SaveMessage(ctx, &storage.MessageRecord{
-			ID:        lastMsgID,
-			SessionID: "sess-fork-bench",
-			Role:      "user",
-			Content:   "消息内容",
-			Metadata:  "{}",
-			CreatedAt: time.Now().Add(time.Duration(i) * time.Millisecond),
-		})
-	}
-
-	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		store.ForkSession(ctx, "sess-fork-bench", lastMsgID, "user-1")
+		sourceSessionID := fmt.Sprintf("sess-fork-bench-%d", i)
+		lastSourceMsgID := ""
+
+		b.StopTimer()
+		if err := store.CreateSession(ctx, &storage.Session{
+			ID: sourceSessionID, UserID: "user-1", Platform: "web", Title: "fork bench",
+		}); err != nil {
+			b.Fatalf("CreateSession 失败: %v", err)
+		}
+		for j := 0; j < 100; j++ {
+			lastSourceMsgID = fmt.Sprintf("msg-fb-%d-%03d", i, j)
+			if err := store.SaveMessage(ctx, &storage.MessageRecord{
+				ID:        lastSourceMsgID,
+				SessionID: sourceSessionID,
+				Role:      "user",
+				Content:   "消息内容",
+				Metadata:  "{}",
+				CreatedAt: time.Now().Add(time.Duration(j) * time.Millisecond),
+			}); err != nil {
+				b.Fatalf("SaveMessage 失败: %v", err)
+			}
+		}
+		b.StartTimer()
+
+		newSession, err := store.ForkSession(ctx, sourceSessionID, lastSourceMsgID, "user-1")
+		if err != nil {
+			b.Fatalf("ForkSession 失败: %v", err)
+		}
+
+		b.StopTimer()
+		if err := store.DeleteSession(ctx, newSession.ID); err != nil {
+			b.Fatalf("DeleteSession(branch) 失败: %v", err)
+		}
+		if err := store.DeleteSession(ctx, sourceSessionID); err != nil {
+			b.Fatalf("DeleteSession(source) 失败: %v", err)
+		}
+		b.StartTimer()
 	}
 }

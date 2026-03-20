@@ -304,74 +304,50 @@ func extractURL(text string) string {
 
 // isPrivateHost 检查是否为内网/保留地址（SSRF 防护）
 func isPrivateHost(host string) bool {
-	// 特殊主机名
 	switch strings.ToLower(host) {
-	case "localhost", "":
-		return true
-	}
-
-	// 云元数据地址（AWS/GCP/Azure/阿里云）
-	switch host {
-	case "169.254.169.254", "metadata.google.internal",
-		"168.63.129.16", "100.100.100.200":
+	case "localhost", "", "metadata.google.internal":
 		return true
 	}
 
 	ip := net.ParseIP(host)
 	if ip == nil {
-		// 可能带端口，尝试解析
 		h, _, err := net.SplitHostPort(host)
 		if err == nil {
 			ip = net.ParseIP(h)
 		}
 	}
 	if ip == nil {
-		return false // 域名，允许（DNS 解析可能指向内网，但这是基础防护）
+		return false
 	}
-
-	// RFC 1918 / RFC 6598 / 回环 / 链路本地
-	privateRanges := []struct {
-		network string
-	}{
-		{"10.0.0.0/8"},
-		{"172.16.0.0/12"},
-		{"192.168.0.0/16"},
-		{"127.0.0.0/8"},
-		{"169.254.0.0/16"},
-		{"100.64.0.0/10"},
-		{"::1/128"},
-		{"fc00::/7"},
-		{"fe80::/10"},
-	}
-
-	for _, r := range privateRanges {
-		_, cidr, _ := net.ParseCIDR(r.network)
-		if cidr.Contains(ip) {
-			return true
-		}
-	}
-	return false
+	return isPrivateIP(ip)
 }
 
-// isPrivateIP 检查 IP 是否为内网/保留地址（用于 DNS 解析后的二次检查）
+// cloudMetaIPs 云元数据 IP（AWS/GCP、Azure、阿里云），编译期只解析一次
+var cloudMetaIPs = func() []net.IP {
+	raw := []string{"169.254.169.254", "168.63.129.16", "100.100.100.200"}
+	ips := make([]net.IP, 0, len(raw))
+	for _, s := range raw {
+		ips = append(ips, net.ParseIP(s))
+	}
+	return ips
+}()
+
+var cgnatNet = func() *net.IPNet {
+	_, n, _ := net.ParseCIDR("100.64.0.0/10")
+	return n
+}()
+
+// isPrivateIP 检查 IP 是否为内网/保留/云元数据地址
 func isPrivateIP(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return true
 	}
-	// 云元数据地址
-	cloudMetaIPs := []string{
-		"169.254.169.254", // AWS/GCP
-		"168.63.129.16",   // Azure
-		"100.100.100.200", // 阿里云
-	}
 	for _, metaIP := range cloudMetaIPs {
-		if ip.Equal(net.ParseIP(metaIP)) {
+		if ip.Equal(metaIP) {
 			return true
 		}
 	}
-	// RFC 6598 (CGNAT)
-	_, cgnat, _ := net.ParseCIDR("100.64.0.0/10")
-	if cgnat.Contains(ip) {
+	if cgnatNet.Contains(ip) {
 		return true
 	}
 	return false

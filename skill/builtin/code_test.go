@@ -103,3 +103,15 @@ func TestTruncateOutput(t *testing.T) {
 		t.Error("should contain truncation hint")
 	}
 }
+
+func TestTruncateOutput_ZeroMaxLen(t *testing.T) {
+	if got := truncateOutput("hello", 0); got != "" {
+		t.Fatalf("truncateOutput(_, 0) = %q, want empty", got)
+	}
+}
+
+func TestTruncateOutput_NegativeMaxLen(t *testing.T) {
+	if got := truncateOutput("hello", -1); got != "" {
+		t.Fatalf("truncateOutput(_, -1) = %q, want empty", got)
+	}
+}

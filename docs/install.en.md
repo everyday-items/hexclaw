@@ -40,7 +40,7 @@ Verify installation:
 
 ```bash
 hexclaw version
-# HexClaw v0.1.0
+# HexClaw v0.1.1
 ```
 
 ### Method 2: Build from source
@@ -51,7 +51,7 @@ cd hexclaw
 go build -o hexclaw ./cmd/hexclaw/
 
 # Optional: build with version info
-go build -ldflags "-X main.version=v0.1.0 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o hexclaw ./cmd/hexclaw/
+go build -ldflags "-X main.version=v0.1.1 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o hexclaw ./cmd/hexclaw/
 
 # Move to PATH
 sudo mv hexclaw /usr/local/bin/

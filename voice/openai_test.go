@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"testing"
+
+	"github.com/hexagon-codes/hexclaw/internal/testutil/httpmock"
 )
 
 // TestNewOpenAISTT_DefaultModel 测试默认模型名称
@@ -81,55 +82,55 @@ func TestOpenAISTT_SupportedLanguages(t *testing.T) {
 // TestOpenAISTT_Transcribe_Success 测试成功转录
 func TestOpenAISTT_Transcribe_Success(t *testing.T) {
 	// 创建模拟服务器
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 验证请求方法和路径
-		if r.Method != "POST" {
-			t.Errorf("请求方法应为 POST，实际为 %s", r.Method)
-		}
-		if r.URL.Path != "/audio/transcriptions" {
-			t.Errorf("请求路径不匹配: %s", r.URL.Path)
-		}
+	stt := NewOpenAISTT("test-key", "",
+		STTWithBaseURL("https://voice.test"),
+		STTWithHTTPClient(httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 验证请求方法和路径
+			if r.Method != "POST" {
+				t.Errorf("请求方法应为 POST，实际为 %s", r.Method)
+			}
+			if r.URL.Path != "/audio/transcriptions" {
+				t.Errorf("请求路径不匹配: %s", r.URL.Path)
+			}
 
-		// 验证 Authorization 头
-		auth := r.Header.Get("Authorization")
-		if auth != "Bearer test-key" {
-			t.Errorf("Authorization 头不匹配: %s", auth)
-		}
+			// 验证 Authorization 头
+			auth := r.Header.Get("Authorization")
+			if auth != "Bearer test-key" {
+				t.Errorf("Authorization 头不匹配: %s", auth)
+			}
 
-		// 验证 Content-Type 是 multipart
-		ct := r.Header.Get("Content-Type")
-		if ct == "" {
-			t.Error("Content-Type 不应为空")
-		}
+			// 验证 Content-Type 是 multipart
+			ct := r.Header.Get("Content-Type")
+			if ct == "" {
+				t.Error("Content-Type 不应为空")
+			}
 
-		// 解析 multipart form
-		if err := r.ParseMultipartForm(10 << 20); err != nil {
-			t.Errorf("解析 multipart 失败: %v", err)
-		}
+			// 解析 multipart form
+			if err := r.ParseMultipartForm(10 << 20); err != nil {
+				t.Errorf("解析 multipart 失败: %v", err)
+			}
 
-		// 验证 model 字段
-		model := r.FormValue("model")
-		if model != "whisper-1" {
-			t.Errorf("model 字段不匹配: %s", model)
-		}
+			// 验证 model 字段
+			model := r.FormValue("model")
+			if model != "whisper-1" {
+				t.Errorf("model 字段不匹配: %s", model)
+			}
 
-		// 验证 language 字段
-		lang := r.FormValue("language")
-		if lang != "zh" {
-			t.Errorf("language 字段不匹配: %s", lang)
-		}
+			// 验证 language 字段
+			lang := r.FormValue("language")
+			if lang != "zh" {
+				t.Errorf("language 字段不匹配: %s", lang)
+			}
 
-		// 返回模拟响应
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(whisperResponse{
-			Text:     "你好世界",
-			Language: "chinese",
-			Duration: 2.5,
-		})
-	}))
-	defer server.Close()
-
-	stt := NewOpenAISTT("test-key", "", STTWithBaseURL(server.URL))
+			// 返回模拟响应
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(whisperResponse{
+				Text:     "你好世界",
+				Language: "chinese",
+				Duration: 2.5,
+			})
+		}))),
+	)
 	result, err := stt.Transcribe(context.Background(), []byte("fake-audio"), TranscribeOptions{
 		Language: "zh",
 		Format:   FormatWAV,
@@ -160,13 +161,13 @@ func TestOpenAISTT_Transcribe_EmptyAudio(t *testing.T) {
 
 // TestOpenAISTT_Transcribe_APIError 测试 API 返回错误
 func TestOpenAISTT_Transcribe_APIError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error":{"message":"Invalid file format"}}`))
-	}))
-	defer server.Close()
-
-	stt := NewOpenAISTT("test-key", "", STTWithBaseURL(server.URL))
+	stt := NewOpenAISTT("test-key", "",
+		STTWithBaseURL("https://voice.test"),
+		STTWithHTTPClient(httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"Invalid file format"}}`))
+		}))),
+	)
 	_, err := stt.Transcribe(context.Background(), []byte("bad-audio"), TranscribeOptions{})
 	if err == nil {
 		t.Error("API 错误应传播")
@@ -175,23 +176,23 @@ func TestOpenAISTT_Transcribe_APIError(t *testing.T) {
 
 // TestOpenAISTT_Transcribe_WithPrompt 测试带提示词的转录
 func TestOpenAISTT_Transcribe_WithPrompt(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.ParseMultipartForm(10 << 20)
-		prompt := r.FormValue("prompt")
-		if prompt != "HexClaw Agent" {
-			t.Errorf("prompt 字段不匹配: %s", prompt)
-		}
+	stt := NewOpenAISTT("test-key", "",
+		STTWithBaseURL("https://voice.test"),
+		STTWithHTTPClient(httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.ParseMultipartForm(10 << 20)
+			prompt := r.FormValue("prompt")
+			if prompt != "HexClaw Agent" {
+				t.Errorf("prompt 字段不匹配: %s", prompt)
+			}
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(whisperResponse{
-			Text:     "启动 HexClaw Agent",
-			Language: "chinese",
-			Duration: 1.0,
-		})
-	}))
-	defer server.Close()
-
-	stt := NewOpenAISTT("test-key", "", STTWithBaseURL(server.URL))
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(whisperResponse{
+				Text:     "启动 HexClaw Agent",
+				Language: "chinese",
+				Duration: 1.0,
+			})
+		}))),
+	)
 	result, err := stt.Transcribe(context.Background(), []byte("audio"), TranscribeOptions{
 		Prompt: "HexClaw Agent",
 	})
@@ -292,52 +293,52 @@ func TestOpenAITTS_Voices(t *testing.T) {
 func TestOpenAITTS_Synthesize_Success(t *testing.T) {
 	fakeAudio := []byte("fake-mp3-audio-data-bytes")
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 验证请求方法和路径
-		if r.Method != "POST" {
-			t.Errorf("请求方法应为 POST，实际为 %s", r.Method)
-		}
-		if r.URL.Path != "/audio/speech" {
-			t.Errorf("请求路径不匹配: %s", r.URL.Path)
-		}
+	tts := NewOpenAITTS("test-key", "",
+		TTSWithBaseURL("https://voice.test"),
+		TTSWithHTTPClient(httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 验证请求方法和路径
+			if r.Method != "POST" {
+				t.Errorf("请求方法应为 POST，实际为 %s", r.Method)
+			}
+			if r.URL.Path != "/audio/speech" {
+				t.Errorf("请求路径不匹配: %s", r.URL.Path)
+			}
 
-		// 验证 Authorization 头
-		auth := r.Header.Get("Authorization")
-		if auth != "Bearer test-key" {
-			t.Errorf("Authorization 头不匹配: %s", auth)
-		}
+			// 验证 Authorization 头
+			auth := r.Header.Get("Authorization")
+			if auth != "Bearer test-key" {
+				t.Errorf("Authorization 头不匹配: %s", auth)
+			}
 
-		// 验证 Content-Type
-		ct := r.Header.Get("Content-Type")
-		if ct != "application/json" {
-			t.Errorf("Content-Type 应为 application/json，实际为 %s", ct)
-		}
+			// 验证 Content-Type
+			ct := r.Header.Get("Content-Type")
+			if ct != "application/json" {
+				t.Errorf("Content-Type 应为 application/json，实际为 %s", ct)
+			}
 
-		// 解析请求体
-		body, _ := io.ReadAll(r.Body)
-		var req map[string]any
-		if err := json.Unmarshal(body, &req); err != nil {
-			t.Fatalf("解析请求体失败: %v", err)
-		}
+			// 解析请求体
+			body, _ := io.ReadAll(r.Body)
+			var req map[string]any
+			if err := json.Unmarshal(body, &req); err != nil {
+				t.Fatalf("解析请求体失败: %v", err)
+			}
 
-		// 验证请求参数
-		if req["model"] != "tts-1" {
-			t.Errorf("model 不匹配: %v", req["model"])
-		}
-		if req["input"] != "你好世界" {
-			t.Errorf("input 不匹配: %v", req["input"])
-		}
-		if req["voice"] != "nova" {
-			t.Errorf("voice 不匹配: %v", req["voice"])
-		}
+			// 验证请求参数
+			if req["model"] != "tts-1" {
+				t.Errorf("model 不匹配: %v", req["model"])
+			}
+			if req["input"] != "你好世界" {
+				t.Errorf("input 不匹配: %v", req["input"])
+			}
+			if req["voice"] != "nova" {
+				t.Errorf("voice 不匹配: %v", req["voice"])
+			}
 
-		// 返回模拟音频数据
-		w.Header().Set("Content-Type", "audio/mpeg")
-		w.Write(fakeAudio)
-	}))
-	defer server.Close()
-
-	tts := NewOpenAITTS("test-key", "", TTSWithBaseURL(server.URL))
+			// 返回模拟音频数据
+			w.Header().Set("Content-Type", "audio/mpeg")
+			_, _ = w.Write(fakeAudio)
+		}))),
+	)
 	result, err := tts.Synthesize(context.Background(), "你好世界", SynthesizeOptions{
 		Voice:  "nova",
 		Format: FormatMP3,
@@ -368,30 +369,30 @@ func TestOpenAITTS_Synthesize_EmptyText(t *testing.T) {
 
 // TestOpenAITTS_Synthesize_Defaults 测试默认参数
 func TestOpenAITTS_Synthesize_Defaults(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		var req map[string]any
-		json.Unmarshal(body, &req)
+	tts := NewOpenAITTS("test-key", "",
+		TTSWithBaseURL("https://voice.test"),
+		TTSWithHTTPClient(httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			var req map[string]any
+			_ = json.Unmarshal(body, &req)
 
-		// 验证默认音色
-		if req["voice"] != "alloy" {
-			t.Errorf("默认音色应为 alloy，实际为 %v", req["voice"])
-		}
-		// 验证默认格式
-		if req["response_format"] != "mp3" {
-			t.Errorf("默认格式应为 mp3，实际为 %v", req["response_format"])
-		}
-		// 验证默认语速
-		speed, ok := req["speed"].(float64)
-		if !ok || speed != 1.0 {
-			t.Errorf("默认语速应为 1.0，实际为 %v", req["speed"])
-		}
+			// 验证默认音色
+			if req["voice"] != "alloy" {
+				t.Errorf("默认音色应为 alloy，实际为 %v", req["voice"])
+			}
+			// 验证默认格式
+			if req["response_format"] != "mp3" {
+				t.Errorf("默认格式应为 mp3，实际为 %v", req["response_format"])
+			}
+			// 验证默认语速
+			speed, ok := req["speed"].(float64)
+			if !ok || speed != 1.0 {
+				t.Errorf("默认语速应为 1.0，实际为 %v", req["speed"])
+			}
 
-		w.Write([]byte("audio"))
-	}))
-	defer server.Close()
-
-	tts := NewOpenAITTS("test-key", "", TTSWithBaseURL(server.URL))
+			_, _ = w.Write([]byte("audio"))
+		}))),
+	)
 	_, err := tts.Synthesize(context.Background(), "test", SynthesizeOptions{})
 	if err != nil {
 		t.Fatalf("合成失败: %v", err)
@@ -400,13 +401,13 @@ func TestOpenAITTS_Synthesize_Defaults(t *testing.T) {
 
 // TestOpenAITTS_Synthesize_APIError 测试 API 返回错误
 func TestOpenAITTS_Synthesize_APIError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
-		w.Write([]byte(`{"error":{"message":"Rate limit exceeded"}}`))
-	}))
-	defer server.Close()
-
-	tts := NewOpenAITTS("test-key", "", TTSWithBaseURL(server.URL))
+	tts := NewOpenAITTS("test-key", "",
+		TTSWithBaseURL("https://voice.test"),
+		TTSWithHTTPClient(httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"Rate limit exceeded"}}`))
+		}))),
+	)
 	_, err := tts.Synthesize(context.Background(), "test", SynthesizeOptions{})
 	if err == nil {
 		t.Error("API 错误应传播")
@@ -415,13 +416,15 @@ func TestOpenAITTS_Synthesize_APIError(t *testing.T) {
 
 // TestOpenAISTT_Transcribe_ContextCanceled 测试上下文取消
 func TestOpenAISTT_Transcribe_ContextCanceled(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 不响应，等待超时
-		<-r.Context().Done()
-	}))
-	defer server.Close()
-
-	stt := NewOpenAISTT("test-key", "", STTWithBaseURL(server.URL))
+	stt := NewOpenAISTT("test-key", "",
+		STTWithBaseURL("https://voice.test"),
+		STTWithHTTPClient(&http.Client{
+			Transport: httpmock.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			}),
+		}),
+	)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 立即取消
 
@@ -433,12 +436,15 @@ func TestOpenAISTT_Transcribe_ContextCanceled(t *testing.T) {
 
 // TestOpenAITTS_Synthesize_ContextCanceled 测试上下文取消
 func TestOpenAITTS_Synthesize_ContextCanceled(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done()
-	}))
-	defer server.Close()
-
-	tts := NewOpenAITTS("test-key", "", TTSWithBaseURL(server.URL))
+	tts := NewOpenAITTS("test-key", "",
+		TTSWithBaseURL("https://voice.test"),
+		TTSWithHTTPClient(&http.Client{
+			Transport: httpmock.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			}),
+		}),
+	)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 

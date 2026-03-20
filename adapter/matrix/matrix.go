@@ -18,6 +18,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
@@ -29,12 +30,15 @@ type MatrixAdapter struct {
 	config    Config
 	handler   adapter.MessageHandler
 	client    *http.Client
+	queue     *adapter.SendQueue
 	stopCh    chan struct{}
 	nextBatch string // sync 的 since token
+	stopped   atomic.Bool
 }
 
 // Config Matrix 适配器配置
 type Config struct {
+	Name          string `yaml:"name"`
 	HomeserverURL string `yaml:"homeserver_url"` // Homeserver URL（如 https://matrix.org）
 	AccessToken   string `yaml:"access_token"`   // Bot 的 Access Token
 	UserID        string `yaml:"user_id"`        // Bot 的 User ID（如 @bot:matrix.org）
@@ -49,19 +53,27 @@ func New(cfg Config) *MatrixAdapter {
 	if cfg.SyncTimeout == 0 {
 		cfg.SyncTimeout = 30
 	}
-	return &MatrixAdapter{
+	a := &MatrixAdapter{
 		config: cfg,
 		client: &http.Client{Timeout: time.Duration(cfg.SyncTimeout+10) * time.Second},
 		stopCh: make(chan struct{}),
 	}
+	a.queue = adapter.NewPlatformSendQueue(PlatformMatrix, a.sendReplyNow)
+	return a
 }
 
-func (a *MatrixAdapter) Name() string              { return "matrix" }
+func (a *MatrixAdapter) Name() string {
+	if a.config.Name != "" {
+		return a.config.Name
+	}
+	return "matrix"
+}
 func (a *MatrixAdapter) Platform() adapter.Platform { return PlatformMatrix }
 
 // Start 启动同步轮询
 func (a *MatrixAdapter) Start(ctx context.Context, handler adapter.MessageHandler) error {
 	a.handler = handler
+	a.stopped.Store(false)
 
 	log.Printf("[Matrix] 连接到 %s", a.config.HomeserverURL)
 
@@ -71,12 +83,26 @@ func (a *MatrixAdapter) Start(ctx context.Context, handler adapter.MessageHandle
 
 // Stop 停止适配器
 func (a *MatrixAdapter) Stop(_ context.Context) error {
+	a.stopped.Store(true)
+	if a.queue != nil {
+		_ = a.queue.Stop(context.Background())
+	}
 	close(a.stopCh)
 	return nil
 }
 
 // Send 发送消息到 Room
 func (a *MatrixAdapter) Send(ctx context.Context, roomID string, reply *adapter.Reply) error {
+	if a.queue == nil {
+		return a.sendReplyNow(ctx, roomID, reply)
+	}
+	return a.queue.Send(ctx, roomID, reply)
+}
+
+func (a *MatrixAdapter) sendReplyNow(ctx context.Context, roomID string, reply *adapter.Reply) error {
+	if reply == nil {
+		return nil
+	}
 	txnID := "hc_" + idgen.ShortID()
 	url := fmt.Sprintf("%s/_matrix/client/v3/rooms/%s/send/m.room.message/%s",
 		a.config.HomeserverURL, roomID, txnID)
@@ -196,12 +222,13 @@ func (a *MatrixAdapter) handleEvent(roomID string, event matrixEvent) {
 	}
 
 	msg := &adapter.Message{
-		ID:        event.EventID,
-		Platform:  PlatformMatrix,
-		ChatID:    roomID,
-		UserID:    event.Sender,
-		Content:   body,
-		Timestamp: time.UnixMilli(event.OriginServerTS),
+		ID:         event.EventID,
+		Platform:   PlatformMatrix,
+		InstanceID: a.Name(),
+		ChatID:     roomID,
+		UserID:     event.Sender,
+		Content:    body,
+		Timestamp:  time.UnixMilli(event.OriginServerTS),
 	}
 
 	go func(m *adapter.Message) {
@@ -220,10 +247,24 @@ func (a *MatrixAdapter) handleEvent(roomID string, event matrixEvent) {
 	}(msg)
 }
 
+// Health 返回适配器健康状态。
+func (a *MatrixAdapter) Health(_ context.Context) error {
+	if a.handler == nil {
+		return fmt.Errorf("matrix handler 未附加")
+	}
+	if a.config.HomeserverURL == "" || a.config.AccessToken == "" || a.config.UserID == "" {
+		return fmt.Errorf("matrix homeserver/access_token/user_id 未配置")
+	}
+	if a.stopped.Load() {
+		return fmt.Errorf("matrix adapter stopped")
+	}
+	return nil
+}
+
 // Matrix 同步响应结构
 type matrixSyncResponse struct {
-	NextBatch string         `json:"next_batch"`
-	Rooms     matrixRooms    `json:"rooms"`
+	NextBatch string      `json:"next_batch"`
+	Rooms     matrixRooms `json:"rooms"`
 }
 
 type matrixRooms struct {

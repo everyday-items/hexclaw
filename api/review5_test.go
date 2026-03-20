@@ -4,12 +4,17 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/cron"
+	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
+	"github.com/hexagon-codes/hexclaw/memory"
 )
 
 // ════════════════════════════════════════════════
@@ -19,23 +24,20 @@ import (
 // ── 1. UpdateAgent 部分更新语义：零值字段不应清空 ──
 
 func TestUpdateAgent_ZeroValueDoesNotClear(t *testing.T) {
-	// UpdateAgent 用 "if cfg.MaxTokens > 0" 做判断
-	// 问题：无法将 MaxTokens 从 4096 更新为 0
-	// 同理 Temperature > 0 无法设为 0
-	// 这是 partial-update 经典难题 — 用测试标注
-	t.Log("DESIGN: UpdateAgent cannot set MaxTokens=0 or Temperature=0 due to zero-value check")
-	t.Log("FIX: Use pointer fields (*int, *float64) or a separate 'fields to update' mask")
+	t.Skip("covered by TestHandleUpdateAgent_AllowsZeroValueOverrides")
 }
 
 // ── 2. TriggerJob 浅拷贝竞态 ──
 
 func TestTriggerJob_ShallowCopy(t *testing.T) {
-	// cron.go: j := *job (浅拷贝)
-	// 如果 Job 有 map/slice 字段（如 Metadata），浅拷贝共享引用
-	// executeJob 和外部可能同时修改 → 竞态
-	// 当前 Job 的字段都是基础类型（string/int/time），暂无问题
-	// 但 Prompt/Name 是 string 且不可变，安全
-	t.Log("OK: TriggerJob shallow copy is safe — Job has only value-type fields")
+	jobType := reflect.TypeOf(cron.Job{})
+	for i := 0; i < jobType.NumField(); i++ {
+		field := jobType.Field(i)
+		switch field.Type.Kind() {
+		case reflect.Map, reflect.Slice, reflect.Pointer, reflect.Interface:
+			t.Fatalf("Job contains reference-type field %q, shallow copy may become unsafe", field.Name)
+		}
+	}
 }
 
 // ── 3. ClearAll 路径穿越 ──
@@ -47,11 +49,11 @@ func TestDeleteFile_PathTraversal(t *testing.T) {
 		wantErr bool
 	}{
 		{"MEMORY.md", false},          // 正常
-		{"2024-01-01.md", false},       // 日记
-		{"../../../etc/passwd", true},  // 路径穿越
-		{"foo/bar.md", true},           // 子目录
-		{"test.txt", true},             // 非 .md
-		{".md", false},                 // 边界: 仅后缀
+		{"2024-01-01.md", false},      // 日记
+		{"../../../etc/passwd", true}, // 路径穿越
+		{"foo/bar.md", true},          // 子目录
+		{"test.txt", true},            // 非 .md
+		{".md", false},                // 边界: 仅后缀
 	}
 
 	for _, tt := range tests {
@@ -198,24 +200,52 @@ func itoa(n int) string {
 // ── 6. WorkflowStore runs 无上限 → OOM ──
 
 func TestWorkflowStore_RunsNoLimit(t *testing.T) {
-	// 每次 handleRunWorkflow 都往 runs map 追加，永远不清理
-	// 长期运行 → OOM
-	store := NewWorkflowStore()
-	store.workflows["wf-1"] = &WorkflowData{ID: "wf-1", Name: "test"}
+	ws := &WorkflowStore{
+		workflows: make(map[string]*WorkflowData),
+		runs:      make(map[string]*WorkflowRun),
+		maxRuns:   2,
+	}
 
-	t.Log("ISSUE: WorkflowStore.runs grows unboundedly — no eviction, no size limit")
-	t.Log("FIX: Add maxRuns limit or TTL-based eviction")
+	ws.addRun(&WorkflowRun{ID: "run-1"})
+	ws.addRun(&WorkflowRun{ID: "run-2"})
+	ws.addRun(&WorkflowRun{ID: "run-3"})
+
+	if len(ws.runs) != 2 {
+		t.Fatalf("runs=%d, want 2", len(ws.runs))
+	}
+	if _, ok := ws.runs["run-1"]; ok {
+		t.Fatal("oldest run should be evicted")
+	}
+	if len(ws.runOrder) != 2 || ws.runOrder[0] != "run-2" || ws.runOrder[1] != "run-3" {
+		t.Fatalf("unexpected runOrder: %#v", ws.runOrder)
+	}
 }
 
 // ── 7. handleMCPStatus 调了两次 mcpMgr ──
 
 func TestHandleMCPStatus_DoubleCall(t *testing.T) {
-	// handler_extended.go:141-144:
-	//   "servers": s.mcpMgr.ServerStatuses(),  ← 第一次加锁
-	//   "total":   len(s.mcpMgr.ServerNames()), ← 第二次加锁
-	// 两次调用之间状态可能变化 → total 和 servers 不一致
-	t.Log("ISSUE: handleMCPStatus calls ServerStatuses() and ServerNames() separately — inconsistent snapshot")
-	t.Log("FIX: Use len(statuses) instead of separate ServerNames() call")
+	s := &Server{
+		cfg:          config.DefaultConfig(),
+		logCollector: NewLogCollector(10),
+		mcpMgr:       hexmcp.NewManager(),
+	}
+
+	w := httptest.NewRecorder()
+	s.handleMCPStatus(w, httptest.NewRequest(http.MethodGet, "/api/v1/mcp/status", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", w.Code)
+	}
+
+	var resp struct {
+		Servers []hexmcp.ServerStatus `json:"servers"`
+		Total   int                   `json:"total"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if resp.Total != len(resp.Servers) {
+		t.Fatalf("total=%d, len(servers)=%d", resp.Total, len(resp.Servers))
+	}
 }
 
 // ── 8. handleSaveWorkflow 不验证 Content-Type ──
@@ -272,9 +302,27 @@ func TestGetFullConfig_SensitiveFields(t *testing.T) {
 // ── 11. handleUpdateMemory 接受空 content（覆盖 MEMORY.md 为空） ──
 
 func TestUpdateMemory_EmptyContent(t *testing.T) {
-	// SaveMemoryRequest.Content 可以为空 — handleUpdateMemory 不检查
-	// 这意味着 PUT /api/v1/memory 传 {"content":""} 会清空 MEMORY.md
-	// 这是否是预期行为？如果是，handleSaveMemory 的验证逻辑和 handleUpdateMemory 不一致
-	t.Log("NOTE: handleUpdateMemory allows empty content (clears MEMORY.md)")
-	t.Log("handleSaveMemory rejects empty content — inconsistent validation")
+	fm, err := memory.New(memory.Options{Dir: filepath.Join(t.TempDir(), "memory")})
+	if err != nil {
+		t.Fatalf("创建 FileMemory 失败: %v", err)
+	}
+	if err := fm.UpdateMemory("existing content"); err != nil {
+		t.Fatalf("预写入记忆失败: %v", err)
+	}
+
+	s := &Server{
+		cfg:          config.DefaultConfig(),
+		logCollector: NewLogCollector(10),
+		fileMem:      fm,
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/memory", strings.NewReader(`{"content":""}`))
+	w := httptest.NewRecorder()
+	s.handleUpdateMemory(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", w.Code)
+	}
+	if got := fm.GetMemory(); got != "" {
+		t.Fatalf("memory should be cleared, got %q", got)
+	}
 }

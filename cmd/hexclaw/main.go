@@ -24,24 +24,19 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/adapter"
-	"github.com/hexagon-codes/hexclaw/adapter/dingtalk"
-	"github.com/hexagon-codes/hexclaw/adapter/discord"
-	"github.com/hexagon-codes/hexclaw/adapter/feishu"
-	"github.com/hexagon-codes/hexclaw/adapter/slack"
-	"github.com/hexagon-codes/hexclaw/adapter/telegram"
 	webadapter "github.com/hexagon-codes/hexclaw/adapter/web"
-	"github.com/hexagon-codes/hexclaw/adapter/wechat"
-	"github.com/hexagon-codes/hexclaw/adapter/wecom"
 	"github.com/hexagon-codes/hexclaw/api"
 	"github.com/hexagon-codes/hexclaw/audit"
 	"github.com/hexagon-codes/hexclaw/canvas"
 	"github.com/hexagon-codes/hexclaw/config"
-	"github.com/hexagon-codes/hexclaw/desktop"
 	"github.com/hexagon-codes/hexclaw/cron"
+	"github.com/hexagon-codes/hexclaw/desktop"
 	"github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/hexclaw/gateway"
 	"github.com/hexagon-codes/hexclaw/heartbeat"
+	"github.com/hexagon-codes/hexclaw/instances"
 	"github.com/hexagon-codes/hexclaw/knowledge"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
@@ -57,7 +52,7 @@ import (
 
 // 版本信息，通过 -ldflags 注入
 var (
-	version = "v0.1.0"
+	version = "v0.1.1"
 	commit  = "none"
 	date    = "unknown"
 )
@@ -198,17 +193,25 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		// 桌面模式日志在 banner 后统一输出
 	}
 
-	// 命令行参数覆盖配置文件
-	if feishuAppID != "" {
-		cfg.Platforms.Feishu.Enabled = true
-		cfg.Platforms.Feishu.AppID = feishuAppID
-	}
-	if feishuSecret != "" {
-		cfg.Platforms.Feishu.AppSecret = feishuSecret
+	// 命令行参数覆盖配置文件（向 slice 首元素写入，无则创建）
+	if feishuAppID != "" || feishuSecret != "" {
+		if len(cfg.Platforms.Feishu) == 0 {
+			cfg.Platforms.Feishu = []config.FeishuConfig{{Name: "feishu"}}
+		}
+		if feishuAppID != "" {
+			cfg.Platforms.Feishu[0].Enabled = true
+			cfg.Platforms.Feishu[0].AppID = feishuAppID
+		}
+		if feishuSecret != "" {
+			cfg.Platforms.Feishu[0].AppSecret = feishuSecret
+		}
 	}
 	if telegramToken != "" {
-		cfg.Platforms.Telegram.Enabled = true
-		cfg.Platforms.Telegram.Token = telegramToken
+		if len(cfg.Platforms.Telegram) == 0 {
+			cfg.Platforms.Telegram = []config.TelegramConfig{{Name: "telegram"}}
+		}
+		cfg.Platforms.Telegram[0].Enabled = true
+		cfg.Platforms.Telegram[0].Token = telegramToken
 	}
 
 	fmt.Println()
@@ -263,6 +266,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			for _, mdSkill := range mp.List() {
 				wrapper := &markdownSkillWrapper{skill: mdSkill}
 				if err := skills.Register(wrapper); err == nil {
+					_ = skills.SetEnabled(mdSkill.Meta.Name, mp.IsEnabled(mdSkill.Meta.Name))
 					mdCount++
 				}
 			}
@@ -541,11 +545,92 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		srv.SetMarketplace(mp)
 	}
 
-	// 12. 初始化多 Agent 路由（桌面端必须，始终启用）
+	// 12. 初始化多 Agent 路由 + 持久化
 	agentRouter := agentrouter.New()
+	agentStore := agentrouter.NewSQLiteStore(store.DB())
+	if err := agentStore.Init(ctx); err != nil {
+		log.Printf("Agent 存储初始化失败: %v", err)
+	}
+
+	// 先从 DB 加载已持久化的 Agent 和规则
+	agents, defaultName, _ := agentStore.LoadAgents(ctx)
+	rules, _ := agentStore.LoadRules(ctx)
+
+	// 如果 DB 为空，从配置文件种子数据初始化
+	if len(agents) == 0 && len(cfg.Router.Agents) > 0 {
+		for _, ac := range cfg.Router.Agents {
+			agents = append(agents, agentrouter.AgentConfig{
+				Name:         ac.Name,
+				DisplayName:  ac.DisplayName,
+				Description:  ac.Description,
+				Model:        ac.Model,
+				Provider:     ac.Provider,
+				SystemPrompt: ac.SystemPrompt,
+				Skills:       ac.Skills,
+				MaxTokens:    ac.MaxTokens,
+				Temperature:  ac.Temperature,
+				Metadata:     ac.Metadata,
+			})
+		}
+		for _, rc := range cfg.Router.Rules {
+			rules = append(rules, agentrouter.Rule{
+				Platform:   rc.Platform,
+				InstanceID: rc.InstanceID,
+				UserID:     rc.UserID,
+				ChatID:     rc.ChatID,
+				AgentName:  rc.AgentName,
+				Priority:   rc.Priority,
+			})
+		}
+		if cfg.Router.DefaultAgent != "" {
+			defaultName = cfg.Router.DefaultAgent
+		}
+	}
+
+	agentRouter.LoadAll(agents, defaultName, rules)
+
+	// 配置种子写入 DB（幂等）
+	if len(agents) > 0 {
+		_ = agentrouter.Sync(ctx, agentStore, agentRouter)
+	}
+
+	// LLM 语义路由 fallback：规则不命中时用 LLM 分类
+	if cfg.Router.LLMFallback && router != nil {
+		classifier := agentrouter.NewLLMClassifier(func(ctx context.Context, systemPrompt, userMessage string) (string, error) {
+			provider, _, err := router.Route(ctx)
+			if err != nil {
+				return "", err
+			}
+			resp, err := provider.Complete(ctx, hexagon.CompletionRequest{
+				Messages: []hexagon.Message{
+					{Role: hexagon.RoleSystem, Content: systemPrompt},
+					{Role: hexagon.RoleUser, Content: userMessage},
+				},
+				MaxTokens: 64,
+			})
+			if err != nil {
+				return "", err
+			}
+			return resp.Content, nil
+		})
+		agentRouter.SetClassifier(classifier)
+	}
+
 	eng.SetAgentRouter(agentRouter)
 	srv.SetAgentRouter(agentRouter)
-	fmt.Println("  ✓ Agents      多 Agent 路由")
+	srv.SetAgentStore(agentStore)
+
+	agentCount := len(agentRouter.ListAgents())
+	ruleCount := len(agentRouter.ListRules())
+	if agentCount > 0 {
+		fmt.Printf("  ✓ Agents      %d 个 Agent, %d 条规则", agentCount, ruleCount)
+		if cfg.Router.LLMFallback {
+			fmt.Print(" + LLM fallback")
+		}
+		fmt.Println()
+	} else {
+		fmt.Println("  ✓ Agents      多 Agent 路由（空）")
+	}
 
 	// 13. 初始化 Canvas/A2UI 服务（Phase 5）
 	var canvasSvc *canvas.Service
@@ -601,15 +686,22 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	_ = canvasSvc
 	_ = voiceSvc
 
-	// 启动平台适配器
-	var adapters []adapter.Adapter
-
 	messageHandler := func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
 		if err := gw.Check(ctx, msg); err != nil {
 			return &adapter.Reply{Content: "安全检查未通过: " + err.Error()}, nil
 		}
 		return eng.Process(ctx, msg)
 	}
+
+	instanceMgr := instances.NewManager(store.DB())
+	if err := instanceMgr.Init(ctx); err != nil {
+		return fmt.Errorf("初始化平台实例运行时失败: %w", err)
+	}
+	if err := instanceMgr.SeedFromConfig(ctx, cfg); err != nil {
+		return fmt.Errorf("写入平台实例种子失败: %w", err)
+	}
+	instanceMgr.SetHandler(messageHandler)
+	srv.SetInstanceManager(instanceMgr)
 
 	// Web WebSocket 适配器
 	if cfg.Platforms.Web.Enabled {
@@ -624,52 +716,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				return eng.ProcessStream(ctx, msg)
 			})
 			srv.SetWebSocketHandler(wa.Handler())
-			adapters = append(adapters, wa)
 		}
 	}
-
-	// 启动适配器的辅助函数
-	startAdapter := func(a adapter.Adapter) {
-		if err := a.Start(ctx, messageHandler); err != nil {
-			fmt.Printf("  ✗ Adapter     %s 启动失败: %v\n", a.Name(), err)
-		} else {
-			adapters = append(adapters, a)
-		}
-	}
-
-	// 飞书 Bot 适配器
-	if cfg.Platforms.Feishu.Enabled {
-		startAdapter(feishu.New(cfg.Platforms.Feishu))
-	}
-
-	// Telegram Bot 适配器
-	if cfg.Platforms.Telegram.Enabled {
-		startAdapter(telegram.New(cfg.Platforms.Telegram))
-	}
-
-	// 钉钉 Bot 适配器
-	if cfg.Platforms.Dingtalk.Enabled {
-		startAdapter(dingtalk.New(cfg.Platforms.Dingtalk))
-	}
-
-	// Discord Bot 适配器
-	if cfg.Platforms.Discord.Enabled {
-		startAdapter(discord.New(cfg.Platforms.Discord))
-	}
-
-	// Slack Bot 适配器
-	if cfg.Platforms.Slack.Enabled {
-		startAdapter(slack.New(cfg.Platforms.Slack))
-	}
-
-	// 企业微信适配器
-	if cfg.Platforms.Wecom.Enabled {
-		startAdapter(wecom.New(cfg.Platforms.Wecom))
-	}
-
-	// 微信公众号适配器
-	if cfg.Platforms.Wechat.Enabled {
-		startAdapter(wechat.New(cfg.Platforms.Wechat))
+	if err := instanceMgr.StartEnabled(ctx); err != nil {
+		return fmt.Errorf("启动平台实例失败: %w", err)
 	}
 
 	// 监听退出信号，优雅关闭
@@ -685,12 +735,16 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}()
 
 	// 适配器列表
-	if len(adapters) > 0 {
+	if instanceList, err := instanceMgr.List(ctx); err == nil && len(instanceList) > 0 {
 		var names []string
-		for _, a := range adapters {
-			names = append(names, a.Name())
+		for _, inst := range instanceList {
+			if inst.Enabled {
+				names = append(names, inst.Name)
+			}
 		}
-		fmt.Printf("  ✓ Adapters    %s\n", strings.Join(names, ", "))
+		if len(names) > 0 {
+			fmt.Printf("  ✓ Adapters    %s\n", strings.Join(names, ", "))
+		}
 	}
 
 	fmt.Println("  ──────────────────────────────────────────────")
@@ -730,11 +784,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		log.Printf("关闭服务器出错: %v", err)
 	}
 
-	// 关闭平台适配器
-	for _, a := range adapters {
-		if err := a.Stop(shutdownCtx); err != nil {
-			log.Printf("关闭 %s 适配器出错: %v", a.Name(), err)
-		}
+	if err := instanceMgr.StopAll(shutdownCtx); err != nil {
+		log.Printf("关闭平台实例出错: %v", err)
 	}
 
 	fmt.Println("  🦀 HexClaw 已停止")
@@ -799,8 +850,8 @@ type markdownSkillWrapper struct {
 	skill *marketplace.MarkdownSkill
 }
 
-func (w *markdownSkillWrapper) Name() string        { return w.skill.Name() }
-func (w *markdownSkillWrapper) Description() string  { return w.skill.Description() }
+func (w *markdownSkillWrapper) Name() string              { return w.skill.Name() }
+func (w *markdownSkillWrapper) Description() string       { return w.skill.Description() }
 func (w *markdownSkillWrapper) Match(content string) bool { return w.skill.Match(content) }
 
 func (w *markdownSkillWrapper) Execute(ctx context.Context, args map[string]any) (*skill.Result, error) {

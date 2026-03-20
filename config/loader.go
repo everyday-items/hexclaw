@@ -263,16 +263,25 @@ llm:
     ttl: "24h"
     max_entries: 10000
 
-# 平台适配
+# 平台适配（支持多实例，每个平台可配置多个 Bot）
 platforms:
   feishu:
-    enabled: false
-    app_id: "${FEISHU_APP_ID}"
-    app_secret: "${FEISHU_APP_SECRET}"
-    verification_token: "${FEISHU_VERIFICATION_TOKEN}"
+    - name: "feishu-default"
+      enabled: false
+      # webhook_port: 6061
+      app_id: "${FEISHU_APP_ID}"
+      app_secret: "${FEISHU_APP_SECRET}"
+      verification_token: "${FEISHU_VERIFICATION_TOKEN}"
+  # dingtalk:
+  #   - name: "dingtalk-default"
+  #     enabled: false
+  #     # webhook_port: 6062
+  #     app_key: "${DINGTALK_APP_KEY}"
+  #     app_secret: "${DINGTALK_APP_SECRET}"
   # telegram:
-  #   enabled: false
-  #   token: "${TELEGRAM_BOT_TOKEN}"
+  #   - name: "telegram-default"
+  #     enabled: false
+  #     token: "${TELEGRAM_BOT_TOKEN}"
   web:
     enabled: true
 

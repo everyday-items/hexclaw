@@ -1,7 +1,10 @@
 package email
 
 import (
+	"context"
 	"testing"
+
+	"github.com/hexagon-codes/hexclaw/adapter"
 )
 
 func TestParseEmailAddress(t *testing.T) {
@@ -54,3 +57,58 @@ func TestNameAndPlatform(t *testing.T) {
 		t.Errorf("Platform() = %s, want email", a.Platform())
 	}
 }
+
+func TestFetchAndProcess_ProcessesUnreadEmail(t *testing.T) {
+	rawMessage := "From: Alice <alice@example.com>\r\n" +
+		"Subject: Hello\r\n" +
+		"Message-ID: <msg-1@example.com>\r\n" +
+		"Date: Fri, 20 Mar 2026 10:00:00 +0800\r\n" +
+		"\r\n" +
+		"email body\r\n"
+
+	client := &fakeIMAPClient{rawMessage: rawMessage}
+
+	a := New(EmailConfig{MaxFetch: 1})
+	a.dialIMAP = func(ctx context.Context, cfg IMAPConfig) (imapSession, error) {
+		return client, nil
+	}
+
+	var gotEmail, gotSubject, gotContent string
+	a.handler = func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
+		gotEmail = msg.UserID
+		gotSubject = msg.Metadata["subject"]
+		gotContent = msg.Content
+		return nil, nil
+	}
+
+	a.fetchAndProcess(context.Background())
+
+	if gotEmail != "alice@example.com" {
+		t.Fatalf("handler user id = %q, want alice@example.com", gotEmail)
+	}
+	if gotSubject != "Hello" {
+		t.Fatalf("handler subject = %q, want Hello", gotSubject)
+	}
+	if gotContent != "email body" {
+		t.Fatalf("handler content = %q, want %q", gotContent, "email body")
+	}
+	if !client.sawStoreSeen {
+		t.Fatal("expected STORE +FLAGS (\\Seen) after processing message")
+	}
+}
+
+type fakeIMAPClient struct {
+	rawMessage   string
+	sawStoreSeen bool
+}
+
+func (c *fakeIMAPClient) Close() error                                { return nil }
+func (c *fakeIMAPClient) Login(username, password string) error       { return nil }
+func (c *fakeIMAPClient) Select(folder string) error                  { return nil }
+func (c *fakeIMAPClient) SearchUnseen(maxFetch int) ([]string, error) { return []string{"1"}, nil }
+func (c *fakeIMAPClient) FetchRFC822(id string) ([]byte, error)       { return []byte(c.rawMessage), nil }
+func (c *fakeIMAPClient) MarkSeen(id string) error {
+	c.sawStoreSeen = true
+	return nil
+}
+func (c *fakeIMAPClient) Logout() error { return nil }

@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/internal/testutil/httpmock"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
 
@@ -141,8 +141,8 @@ func TestExtractQuery(t *testing.T) {
 		{"搜索 Go 语言", "Go 语言"},
 		{"search golang", "golang"},
 		{"查找 kubernetes", "kubernetes"},
-		{"hello world", "hello world"},           // 没有前缀，返回原文
-		{"搜索", "搜索"},                              // 前缀后面没有内容，继续尝试下一个前缀，最终返回原文
+		{"hello world", "hello world"}, // 没有前缀，返回原文
+		{"搜索", "搜索"},                   // 前缀后面没有内容，继续尝试下一个前缀，最终返回原文
 	}
 
 	for _, tt := range tests {
@@ -236,20 +236,10 @@ func TestSearchSkillExecuteWithMockServer(t *testing.T) {
 	</html>
 	`
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s := NewSearchSkill()
+	s.client = httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, mockHTML)
 	}))
-	defer server.Close()
-
-	s := NewSearchSkill()
-	// 使用自定义 client 将请求重定向到 mock 服务器
-	s.client = &http.Client{
-		Transport: &roundTripFunc{fn: func(req *http.Request) (*http.Response, error) {
-			req.URL.Scheme = "http"
-			req.URL.Host = strings.TrimPrefix(server.URL, "http://")
-			return http.DefaultTransport.RoundTrip(req)
-		}},
-	}
 
 	result, err := s.Execute(context.Background(), map[string]any{
 		"query": "搜索 Go 语言",
@@ -267,19 +257,10 @@ func TestSearchSkillExecuteWithMockServer(t *testing.T) {
 
 // TestSearchSkillExecuteNoResults 测试没有搜索结果的情况
 func TestSearchSkillExecuteNoResults(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s := NewSearchSkill()
+	s.client = httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "<html><body>No results</body></html>")
 	}))
-	defer server.Close()
-
-	s := NewSearchSkill()
-	s.client = &http.Client{
-		Transport: &roundTripFunc{fn: func(req *http.Request) (*http.Response, error) {
-			req.URL.Scheme = "http"
-			req.URL.Host = strings.TrimPrefix(server.URL, "http://")
-			return http.DefaultTransport.RoundTrip(req)
-		}},
-	}
 
 	result, err := s.Execute(context.Background(), map[string]any{
 		"query": "搜索 xyznonexistent12345",
@@ -344,8 +325,8 @@ func TestExtractCity(t *testing.T) {
 		{"天气北京", "北京"},
 		{"北京天气", "北京"},
 		{"weather beijing", "beijing"},
-		{"北京的天气", "北京的"},  // "天气"后缀先匹配，留下"的"
-		{"天气", ""},           // 只有关键词没有城市
+		{"北京的天气", "北京的"}, // "天气"后缀先匹配，留下"的"
+		{"天气", ""},       // 只有关键词没有城市
 		{"气温上海", "上海"},
 	}
 
@@ -503,20 +484,11 @@ func TestWeatherSkillExecuteWithMockServer(t *testing.T) {
 	}
 	data, _ := json.Marshal(weatherJSON)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(data)
-	}))
-	defer server.Close()
-
 	s := NewWeatherSkill()
-	s.client = &http.Client{
-		Transport: &roundTripFunc{fn: func(req *http.Request) (*http.Response, error) {
-			req.URL.Scheme = "http"
-			req.URL.Host = strings.TrimPrefix(server.URL, "http://")
-			return http.DefaultTransport.RoundTrip(req)
-		}},
-	}
+	s.client = httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(data)
+	}))
 
 	result, err := s.Execute(context.Background(), map[string]any{
 		"query": "天气北京",
@@ -545,7 +517,7 @@ func TestTranslateSkillMeta(t *testing.T) {
 	}
 }
 
-// TestTranslateSkillMatch 测试翻译 Skill 匹配（始终返回 false）
+// TestTranslateSkillMatch 测试翻译 Skill 匹配
 func TestTranslateSkillMatch(t *testing.T) {
 	s := NewTranslateSkill()
 
@@ -553,10 +525,10 @@ func TestTranslateSkillMatch(t *testing.T) {
 		input string
 		want  bool
 	}{
-		{"翻译 hello", false},
-		{"translate this", false},
-		{"英译中 hello", false},
-		{"中译英 你好", false},
+		{"翻译 hello", true},
+		{"translate this", true},
+		{"英译中 hello", true},
+		{"中译英 你好", true},
 		{"hello world", false},
 		{"", false},
 	}
@@ -565,13 +537,13 @@ func TestTranslateSkillMatch(t *testing.T) {
 		t.Run(tt.input, func(t *testing.T) {
 			got := s.Match(tt.input)
 			if got != tt.want {
-				t.Errorf("Match(%q) = %v, 期望 %v（翻译 Skill 应始终返回 false）", tt.input, got, tt.want)
+				t.Errorf("Match(%q) = %v, 期望 %v", tt.input, got, tt.want)
 			}
 		})
 	}
 }
 
-// TestTranslateSkillExecute 测试翻译 Skill 执行（占位实现）
+// TestTranslateSkillExecute 测试翻译 Skill 执行
 func TestTranslateSkillExecute(t *testing.T) {
 	s := NewTranslateSkill()
 
@@ -587,9 +559,25 @@ func TestTranslateSkillExecute(t *testing.T) {
 	if result.Content == "" {
 		t.Error("内容不应为空")
 	}
-	// 占位实现应提示通过 AI 完成
-	if !strings.Contains(result.Content, "翻译") {
-		t.Errorf("占位结果应包含'翻译'，实际: %q", result.Content)
+	if !strings.Contains(result.Content, "你好世界") {
+		t.Errorf("结果应包含实际译文，实际: %q", result.Content)
+	}
+}
+
+func TestTranslateSkillExecuteExplicitDirection(t *testing.T) {
+	s := NewTranslateSkill()
+
+	result, err := s.Execute(context.Background(), map[string]any{
+		"query": "中译英 你好 世界",
+	})
+	if err != nil {
+		t.Fatalf("Execute 失败: %v", err)
+	}
+	if !strings.Contains(result.Content, "hello world") {
+		t.Fatalf("结果应包含 hello world，实际: %q", result.Content)
+	}
+	if result.Metadata["direction"] != "zh-en" {
+		t.Fatalf("direction = %q, want zh-en", result.Metadata["direction"])
 	}
 }
 
@@ -603,6 +591,9 @@ func TestTranslateSkillExecuteEmptyQuery(t *testing.T) {
 	}
 	if result == nil {
 		t.Fatal("结果不应为 nil")
+	}
+	if !strings.Contains(result.Content, "请提供") {
+		t.Fatalf("空查询应返回提示，实际: %q", result.Content)
 	}
 }
 
@@ -619,7 +610,7 @@ func TestSummarySkillMeta(t *testing.T) {
 	}
 }
 
-// TestSummarySkillMatch 测试摘要 Skill 匹配（始终返回 false）
+// TestSummarySkillMatch 测试摘要 Skill 匹配
 func TestSummarySkillMatch(t *testing.T) {
 	s := NewSummarySkill()
 
@@ -627,9 +618,9 @@ func TestSummarySkillMatch(t *testing.T) {
 		input string
 		want  bool
 	}{
-		{"摘要一下", false},
-		{"summary this", false},
-		{"帮我总结", false},
+		{"摘要一下 今天下雨，记得带伞", true},
+		{"summary this", true},
+		{"总结一下 这篇文章", true},
 		{"hello", false},
 		{"", false},
 	}
@@ -638,17 +629,19 @@ func TestSummarySkillMatch(t *testing.T) {
 		t.Run(tt.input, func(t *testing.T) {
 			got := s.Match(tt.input)
 			if got != tt.want {
-				t.Errorf("Match(%q) = %v, 期望 %v（摘要 Skill 应始终返回 false）", tt.input, got, tt.want)
+				t.Errorf("Match(%q) = %v, 期望 %v", tt.input, got, tt.want)
 			}
 		})
 	}
 }
 
-// TestSummarySkillExecute 测试摘要 Skill 执行（占位实现）
+// TestSummarySkillExecute 测试摘要 Skill 执行
 func TestSummarySkillExecute(t *testing.T) {
 	s := NewSummarySkill()
 
-	result, err := s.Execute(context.Background(), nil)
+	result, err := s.Execute(context.Background(), map[string]any{
+		"query": "摘要 这篇文章介绍 Go 语言的并发模型。文章重点讲解 goroutine、channel 和 context 的配合方式。最后给出一个 HTTP 服务示例。",
+	})
 	if err != nil {
 		t.Fatalf("Execute 失败: %v", err)
 	}
@@ -658,20 +651,24 @@ func TestSummarySkillExecute(t *testing.T) {
 	if result.Content == "" {
 		t.Error("内容不应为空")
 	}
-	if !strings.Contains(result.Content, "摘要") {
-		t.Errorf("占位结果应包含'摘要'，实际: %q", result.Content)
+	if !strings.Contains(result.Content, "Go 语言") {
+		t.Errorf("摘要应包含关键信息，实际: %q", result.Content)
+	}
+	if !strings.HasPrefix(result.Content, "摘要：") {
+		t.Errorf("摘要应带固定前缀，实际: %q", result.Content)
 	}
 }
 
-// ===================== 测试辅助 =====================
+func TestSummarySkillExecuteEmptyQuery(t *testing.T) {
+	s := NewSummarySkill()
 
-// roundTripFunc 用于在测试中自定义 HTTP 传输
-type roundTripFunc struct {
-	fn func(req *http.Request) (*http.Response, error)
-}
-
-func (f *roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f.fn(req)
+	result, err := s.Execute(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Execute 失败: %v", err)
+	}
+	if !strings.Contains(result.Content, "请提供") {
+		t.Fatalf("空查询应返回提示，实际: %q", result.Content)
+	}
 }
 
 // TestExtractText 测试 HTML 文本提取辅助函数

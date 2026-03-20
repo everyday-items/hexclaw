@@ -9,6 +9,8 @@ import (
 	"math"
 	"sort"
 	"strings"
+
+	"github.com/hexagon-codes/hexclaw/internal/sqliteutil"
 )
 
 // SQLiteStore SQLite 知识库存储（FTS5 + 向量）
@@ -46,7 +48,11 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 			content TEXT NOT NULL,
 			source TEXT DEFAULT '',
 			chunk_count INTEGER DEFAULT 0,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			status TEXT NOT NULL DEFAULT 'indexed',
+			error_message TEXT NOT NULL DEFAULT '',
+			source_type TEXT NOT NULL DEFAULT 'manual'
 		)`,
 
 		// Chunk 表（含向量嵌入 BLOB）
@@ -75,6 +81,17 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 			return fmt.Errorf("初始化知识库表失败: %w", err)
 		}
 	}
+	migrations := []string{
+		`ALTER TABLE kb_documents ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP`,
+		`ALTER TABLE kb_documents ADD COLUMN status TEXT NOT NULL DEFAULT 'indexed'`,
+		`ALTER TABLE kb_documents ADD COLUMN error_message TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE kb_documents ADD COLUMN source_type TEXT NOT NULL DEFAULT 'manual'`,
+	}
+	for _, stmt := range migrations {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return fmt.Errorf("迁移知识库表失败: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -88,8 +105,9 @@ func (s *SQLiteStore) AddDocument(ctx context.Context, doc *Document, chunks []*
 
 	// 插入文档
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO kb_documents (id, title, content, source, chunk_count, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		doc.ID, doc.Title, doc.Content, doc.Source, doc.ChunkCount, doc.CreatedAt,
+		`INSERT INTO kb_documents (id, title, content, source, chunk_count, created_at, updated_at, status, error_message, source_type)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		doc.ID, doc.Title, doc.Content, doc.Source, doc.ChunkCount, doc.CreatedAt, doc.UpdatedAt, doc.Status, doc.ErrorMessage, doc.SourceType,
 	)
 	if err != nil {
 		return fmt.Errorf("插入文档失败: %w", err)
@@ -117,6 +135,54 @@ func (s *SQLiteStore) AddDocument(ctx context.Context, doc *Document, chunks []*
 			chunk.Content, chunk.ID,
 		); err != nil {
 			return fmt.Errorf("fts5 索引插入失败: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// ReplaceDocument 使用同一文档 ID 重建索引。
+func (s *SQLiteStore) ReplaceDocument(ctx context.Context, doc *Document, chunks []*Chunk) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM kb_chunks_fts WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE doc_id = ?)`,
+		doc.ID,
+	); err != nil {
+		return fmt.Errorf("fts5 索引删除失败: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM kb_chunks WHERE doc_id = ?`, doc.ID); err != nil {
+		return fmt.Errorf("删除旧 chunk 失败: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE kb_documents
+		 SET title = ?, content = ?, source = ?, chunk_count = ?, updated_at = ?, status = ?, error_message = ?, source_type = ?
+		 WHERE id = ?`,
+		doc.Title, doc.Content, doc.Source, doc.ChunkCount, doc.UpdatedAt, doc.Status, doc.ErrorMessage, doc.SourceType, doc.ID,
+	); err != nil {
+		return fmt.Errorf("更新文档失败: %w", err)
+	}
+
+	for _, chunk := range chunks {
+		var embBlob []byte
+		if len(chunk.Embedding) > 0 {
+			embBlob = encodeFloat32Slice(chunk.Embedding)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO kb_chunks (id, doc_id, content, chunk_index, embedding, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			chunk.ID, chunk.DocID, chunk.Content, chunk.Index, embBlob, chunk.CreatedAt,
+		); err != nil {
+			return fmt.Errorf("插入重建 chunk 失败: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO kb_chunks_fts (content, chunk_id) VALUES (?, ?)`,
+			chunk.Content, chunk.ID,
+		); err != nil {
+			return fmt.Errorf("重建 fts5 索引失败: %w", err)
 		}
 	}
 
@@ -153,7 +219,8 @@ func (s *SQLiteStore) DeleteDocument(ctx context.Context, docID string) error {
 // ListDocuments 列出所有文档
 func (s *SQLiteStore) ListDocuments(ctx context.Context) ([]*Document, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, title, source, chunk_count, created_at FROM kb_documents ORDER BY created_at DESC`,
+		`SELECT id, title, source, chunk_count, created_at, updated_at, status, error_message, source_type
+		 FROM kb_documents ORDER BY created_at DESC`,
 	)
 	if err != nil {
 		return nil, err
@@ -163,7 +230,7 @@ func (s *SQLiteStore) ListDocuments(ctx context.Context) ([]*Document, error) {
 	var docs []*Document
 	for rows.Next() {
 		doc := &Document{}
-		if err := rows.Scan(&doc.ID, &doc.Title, &doc.Source, &doc.ChunkCount, &doc.CreatedAt); err != nil {
+		if err := rows.Scan(&doc.ID, &doc.Title, &doc.Source, &doc.ChunkCount, &doc.CreatedAt, &doc.UpdatedAt, &doc.Status, &doc.ErrorMessage, &doc.SourceType); err != nil {
 			return nil, err
 		}
 		docs = append(docs, doc)
@@ -171,17 +238,38 @@ func (s *SQLiteStore) ListDocuments(ctx context.Context) ([]*Document, error) {
 	return docs, rows.Err()
 }
 
+// GetDocument 获取单个文档详情。
+func (s *SQLiteStore) GetDocument(ctx context.Context, docID string) (*Document, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, title, content, source, chunk_count, created_at, updated_at, status, error_message, source_type
+		 FROM kb_documents WHERE id = ?`,
+		docID,
+	)
+
+	doc := &Document{}
+	if err := row.Scan(&doc.ID, &doc.Title, &doc.Content, &doc.Source, &doc.ChunkCount, &doc.CreatedAt, &doc.UpdatedAt, &doc.Status, &doc.ErrorMessage, &doc.SourceType); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("文档不存在")
+		}
+		return nil, err
+	}
+	return doc, nil
+}
+
 // VectorSearch 向量搜索
 //
-// 加载所有 chunk 的向量，在 Go 层计算余弦相似度，
+// 加载 chunk 的向量，在 Go 层计算余弦相似度，
 // 返回相似度最高的 topK 个结果。
 //
+// 限制最多扫描 maxVectorScanRows 行，防止知识库过大时 OOM。
 // 对于个人知识库（通常 < 10万 chunk），这种全扫描方式
 // 性能完全够用（10万个 1536 维向量约需 ~100ms）。
+const maxVectorScanRows = 100000
+
 func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK int) ([]*SearchResult, error) {
-	// 只查询 id 和 embedding 进行评分，避免加载全部 content 到内存
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, doc_id, chunk_index, embedding FROM kb_chunks WHERE embedding IS NOT NULL`,
+		`SELECT id, doc_id, chunk_index, embedding FROM kb_chunks WHERE embedding IS NOT NULL LIMIT ?`,
+		maxVectorScanRows,
 	)
 	if err != nil {
 		return nil, err
@@ -346,9 +434,7 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 	var args []any
 	for _, kw := range keywords {
 		conditions = append(conditions, "content LIKE ? ESCAPE '\\'")
-		// 转义 LIKE 通配符，防止注入
-		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(kw)
-		args = append(args, "%"+escaped+"%")
+		args = append(args, "%"+sqliteutil.EscapeLike(kw)+"%")
 	}
 
 	whereClause := strings.Join(conditions, " OR ")
@@ -407,7 +493,10 @@ func (s *SQLiteStore) getChunksByIDs(ctx context.Context, ids []string) map[stri
 		args[i] = id
 	}
 	query := fmt.Sprintf(
-		`SELECT id, doc_id, content, chunk_index, embedding, created_at FROM kb_chunks WHERE id IN (%s)`,
+		`SELECT c.id, c.doc_id, d.title, d.source, d.chunk_count, c.content, c.chunk_index, c.embedding, c.created_at
+		 FROM kb_chunks c
+		 JOIN kb_documents d ON d.id = c.doc_id
+		 WHERE c.id IN (%s)`,
 		strings.Join(placeholders, ","),
 	)
 
@@ -420,7 +509,7 @@ func (s *SQLiteStore) getChunksByIDs(ctx context.Context, ids []string) map[stri
 	for rows.Next() {
 		chunk := &Chunk{}
 		var embBlob []byte
-		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &embBlob, &chunk.CreatedAt); err != nil {
+		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.DocTitle, &chunk.Source, &chunk.ChunkCount, &chunk.Content, &chunk.Index, &embBlob, &chunk.CreatedAt); err != nil {
 			continue
 		}
 		if len(embBlob) > 0 {

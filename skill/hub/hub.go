@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	fileutil "github.com/hexagon-codes/toolkit/util/file"
 )
 
 // HubConfig 技能市场配置
@@ -33,7 +35,7 @@ type SkillMeta struct {
 	Author      string   `json:"author"`
 	Category    string   `json:"category"`
 	Tags        []string `json:"tags"`
-	URL         string   `json:"url"`       // 技能文件下载 URL
+	URL         string   `json:"url"` // 技能文件下载 URL
 	Downloads   int      `json:"downloads"`
 	Rating      float64  `json:"rating"`
 }
@@ -210,7 +212,7 @@ func (h *Hub) Install(ctx context.Context, name string) error {
 	}
 
 	// 写入本地目录
-	if err := os.MkdirAll(h.skillsDir, 0o755); err != nil {
+	if err := fileutil.MkdirAll(h.skillsDir); err != nil {
 		return fmt.Errorf("创建技能目录失败: %w", err)
 	}
 

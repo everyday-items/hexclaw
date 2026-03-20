@@ -1,17 +1,39 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/canvas"
 	"github.com/hexagon-codes/hexclaw/engine"
+	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/voice"
 )
+
+type skillRuntimeController interface {
+	SetSkillEnabled(name string, enabled bool) error
+	SkillEnabled(name string) (bool, bool)
+}
+
+type skillStatusResponse struct {
+	Name             string   `json:"name,omitempty"`
+	Description      string   `json:"description,omitempty"`
+	Author           string   `json:"author,omitempty"`
+	Version          string   `json:"version,omitempty"`
+	Triggers         []string `json:"triggers,omitempty"`
+	Tags             []string `json:"tags,omitempty"`
+	Enabled          bool     `json:"enabled"`
+	EffectiveEnabled bool     `json:"effective_enabled"`
+	RequiresRestart  bool     `json:"requires_restart"`
+	Message          string   `json:"message,omitempty"`
+}
 
 // --- 角色 API ---
 
@@ -21,13 +43,17 @@ func (s *Server) handleListRoles(w http.ResponseWriter, r *http.Request) {
 		factory := eng.AgentFactory()
 		roles := factory.ListRoles()
 
-		var roleList []map[string]string
+		roleList := make([]map[string]any, 0, len(roles))
 		for _, name := range roles {
 			role, _ := factory.GetRole(name)
-			roleList = append(roleList, map[string]string{
-				"name":  name,
-				"title": role.Title,
-				"goal":  role.Goal,
+			roleList = append(roleList, map[string]any{
+				"name":        name,
+				"title":       role.Title,
+				"goal":        role.Goal,
+				"backstory":   role.Backstory,
+				"expertise":   role.Expertise,
+				"tools":       role.Tools,
+				"constraints": role.Constraints,
 			})
 		}
 
@@ -38,7 +64,7 @@ func (s *Server) handleListRoles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"roles": []string{},
+		"roles": []map[string]any{},
 	})
 }
 
@@ -130,21 +156,97 @@ func (s *Server) handleListMCPServers(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleAddMCPServer 动态添加 MCP Server
+func (s *Server) handleAddMCPServer(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name      string   `json:"name"`
+		Command   string   `json:"command"`
+		Args      []string `json:"args"`
+		Transport string   `json:"transport"`
+		Endpoint  string   `json:"endpoint"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
+		return
+	}
+	if req.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name 不能为空"})
+		return
+	}
+
+	transport := req.Transport
+	if transport == "" {
+		if req.Endpoint != "" {
+			transport = "sse"
+		} else {
+			transport = "stdio"
+		}
+	}
+
+	if transport == "stdio" && req.Command == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "stdio 模式需要指定 command"})
+		return
+	}
+	if transport == "sse" && req.Endpoint == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "sse 模式需要指定 endpoint"})
+		return
+	}
+
+	cfg := hexmcp.ServerConfig{
+		Name:      req.Name,
+		Transport: transport,
+		Command:   req.Command,
+		Args:      req.Args,
+		Endpoint:  req.Endpoint,
+		Enabled:   true,
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	if err := s.mcpMgr.AddServer(ctx, cfg); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("MCP Server %q 已添加", req.Name)})
+}
+
+// handleRemoveMCPServer 动态移除 MCP Server
+func (s *Server) handleRemoveMCPServer(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "server name 不能为空"})
+		return
+	}
+
+	if err := s.mcpMgr.RemoveServer(name); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("MCP Server %q 已移除", name)})
+}
+
 // --- 技能市场 API ---
 
 // handleListSkills 列出所有已安装的 Markdown 技能
 func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
 	skills := s.mp.List()
 
-	var list []map[string]any
+	list := make([]skillStatusResponse, 0, len(skills))
 	for _, sk := range skills {
-		list = append(list, map[string]any{
-			"name":        sk.Meta.Name,
-			"description": sk.Meta.Description,
-			"author":      sk.Meta.Author,
-			"version":     sk.Meta.Version,
-			"triggers":    sk.Meta.Triggers,
-			"tags":        sk.Meta.Tags,
+		enabled := s.mp.IsEnabled(sk.Meta.Name)
+		effective, requiresRestart, message := s.skillEffectiveState(sk.Meta.Name, enabled)
+		list = append(list, skillStatusResponse{
+			Name:             sk.Meta.Name,
+			Description:      sk.Meta.Description,
+			Author:           sk.Meta.Author,
+			Version:          sk.Meta.Version,
+			Triggers:         sk.Meta.Triggers,
+			Tags:             sk.Meta.Tags,
+			Enabled:          enabled,
+			EffectiveEnabled: effective,
+			RequiresRestart:  requiresRestart,
+			Message:          message,
 		})
 	}
 
@@ -152,6 +254,62 @@ func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
 		"skills": list,
 		"total":  len(list),
 		"dir":    s.mp.Dir(),
+	})
+}
+
+// SkillStatusRequest 技能状态请求
+type SkillStatusRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+// handleSkillStatus 设置技能启用/禁用状态
+func (s *Server) handleSkillStatus(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name 不能为空"})
+		return
+	}
+	if filepath.Base(name) != name || strings.Contains(name, "..") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "非法技能名称"})
+		return
+	}
+	if _, ok := s.mp.Get(name); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "技能未安装"})
+		return
+	}
+	var req SkillStatusRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误"})
+		return
+	}
+	if err := s.mp.SetEnabled(name, req.Enabled); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存状态失败: " + err.Error()})
+		return
+	}
+
+	effective := req.Enabled
+	requiresRestart := false
+	message := "技能状态已更新并立即生效"
+	if runtime, ok := s.engine.(skillRuntimeController); ok {
+		if err := runtime.SetSkillEnabled(name, req.Enabled); err != nil {
+			requiresRestart = true
+			message = "技能状态已保存，但当前运行时未生效: " + err.Error()
+			if current, exists := runtime.SkillEnabled(name); exists {
+				effective = current
+			} else {
+				effective = false
+			}
+		}
+	} else {
+		requiresRestart = true
+		message = "技能状态已保存，当前运行时不支持热更新，重启后生效"
+	}
+
+	writeJSON(w, http.StatusOK, skillStatusResponse{
+		Enabled:          req.Enabled,
+		EffectiveEnabled: effective,
+		RequiresRestart:  requiresRestart,
+		Message:          message,
 	})
 }
 
@@ -213,61 +371,321 @@ func (s *Server) handleUninstallSkill(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "技能已删除"})
 }
 
+func (s *Server) skillEffectiveState(name string, enabled bool) (bool, bool, string) {
+	runtime, ok := s.engine.(skillRuntimeController)
+	if !ok {
+		if enabled {
+			return enabled, true, "当前运行时不支持技能状态探测，可能需要重启后生效"
+		}
+		return enabled, false, ""
+	}
+
+	effective, exists := runtime.SkillEnabled(name)
+	if !exists {
+		if enabled {
+			return false, true, "技能已安装，但当前运行时未注册，重启后生效"
+		}
+		return false, false, ""
+	}
+	if effective != enabled {
+		return effective, true, "配置已保存，但运行时状态尚未与持久化配置对齐"
+	}
+	return effective, false, ""
+}
+
 // --- 多 Agent 路由 API ---
 
-// handleListAgents 列出已注册的 Agent
+// handleListAgents 列出已注册的 Agent 和路由规则
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
+	if s.agentRouter == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"agents":  []any{},
+			"rules":   []any{},
+			"total":   0,
+			"default": "",
+		})
+		return
+	}
 	agents := s.agentRouter.ListAgents()
+	rules := s.agentRouter.ListRules()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"agents":  agents,
+		"rules":   rules,
 		"total":   len(agents),
 		"default": s.agentRouter.DefaultAgent(),
 	})
 }
 
-// RegisterAgentRequest 注册 Agent 请求
+// RegisterAgentRequest 注册/更新 Agent 请求
 type RegisterAgentRequest struct {
-	Name        string `json:"name"`
-	DisplayName string `json:"display_name"`
-	Model       string `json:"model"`
-	Provider    string `json:"provider"`
+	Name         string            `json:"name"`
+	DisplayName  string            `json:"display_name"`
+	Description  string            `json:"description"`
+	Model        string            `json:"model"`
+	Provider     string            `json:"provider"`
+	SystemPrompt string            `json:"system_prompt"`
+	Skills       []string          `json:"skills"`
+	MaxTokens    int               `json:"max_tokens"`
+	Temperature  float64           `json:"temperature"`
+	Metadata     map[string]string `json:"metadata"`
 }
 
-// handleRegisterAgent 注册 Agent
+type UpdateAgentRequest struct {
+	DisplayName  *string            `json:"display_name"`
+	Description  *string            `json:"description"`
+	Model        *string            `json:"model"`
+	Provider     *string            `json:"provider"`
+	SystemPrompt *string            `json:"system_prompt"`
+	Skills       *[]string          `json:"skills"`
+	MaxTokens    *int               `json:"max_tokens"`
+	Temperature  *float64           `json:"temperature"`
+	Metadata     *map[string]string `json:"metadata"`
+}
+
+// handleRegisterAgent 注册 Agent（内存 + 持久化）
 func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	var req RegisterAgentRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
 		return
 	}
-
 	if req.Name == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name 不能为空"})
 		return
 	}
 
-	err := s.agentRouter.Register(router.AgentConfig{
-		Name:        req.Name,
-		DisplayName: req.DisplayName,
-		Model:       req.Model,
-		Provider:    req.Provider,
-	})
-	if err != nil {
+	cfg := router.AgentConfig{
+		Name:         req.Name,
+		DisplayName:  req.DisplayName,
+		Description:  req.Description,
+		Model:        req.Model,
+		Provider:     req.Provider,
+		SystemPrompt: req.SystemPrompt,
+		Skills:       req.Skills,
+		MaxTokens:    req.MaxTokens,
+		Temperature:  req.Temperature,
+		Metadata:     req.Metadata,
+	}
+
+	if err := s.agentRouter.Register(cfg); err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
+	}
+	if s.agentStore != nil {
+		_ = s.agentStore.SaveAgent(r.Context(), &cfg)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Agent 已注册", "name": req.Name})
 }
 
-// handleUnregisterAgent 注销 Agent
+// handleUpdateAgent 更新 Agent 配置（内存 + 持久化）
+func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var req UpdateAgentRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
+		return
+	}
+	existing, ok := s.agentRouter.GetAgent(name)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "agent \"" + name + "\" 未注册"})
+		return
+	}
+	cfg := *existing
+	cfg.Name = name
+	if req.DisplayName != nil {
+		cfg.DisplayName = *req.DisplayName
+	}
+	if req.Description != nil {
+		cfg.Description = *req.Description
+	}
+	if req.Model != nil {
+		cfg.Model = *req.Model
+	}
+	if req.Provider != nil {
+		cfg.Provider = *req.Provider
+	}
+	if req.SystemPrompt != nil {
+		cfg.SystemPrompt = *req.SystemPrompt
+	}
+	if req.Skills != nil {
+		cfg.Skills = *req.Skills
+	}
+	if req.MaxTokens != nil {
+		cfg.MaxTokens = *req.MaxTokens
+	}
+	if req.Temperature != nil {
+		cfg.Temperature = *req.Temperature
+	}
+	if req.Metadata != nil {
+		cfg.Metadata = *req.Metadata
+	}
+	if err := s.agentRouter.UpdateAgent(cfg); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if s.agentStore != nil {
+		updated, ok := s.agentRouter.GetAgent(name)
+		if !ok {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "更新后读取 Agent 失败"})
+			return
+		}
+		if err := s.agentStore.SaveAgent(r.Context(), updated); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + err.Error()})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "Agent 已更新", "name": name})
+}
+
+// handleUnregisterAgent 注销 Agent（内存 + 持久化）
 func (s *Server) handleUnregisterAgent(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if err := s.agentRouter.Unregister(name); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
+	if s.agentStore != nil {
+		_ = s.agentStore.DeleteAgent(r.Context(), name)
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Agent 已注销"})
+}
+
+// handleSetDefaultAgent 设置默认 Agent
+func (s *Server) handleSetDefaultAgent(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误"})
+		return
+	}
+	if err := s.agentRouter.SetDefault(req.Name); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if s.agentStore != nil {
+		_ = s.agentStore.SetDefault(r.Context(), req.Name)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "默认 Agent 已设置", "name": req.Name})
+}
+
+// --- 路由规则 API ---
+
+// handleListRules 列出所有路由规则
+func (s *Server) handleListRules(w http.ResponseWriter, r *http.Request) {
+	if s.agentRouter == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"rules": []any{},
+			"total": 0,
+		})
+		return
+	}
+	rules := s.agentRouter.ListRules()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"rules": rules,
+		"total": len(rules),
+	})
+}
+
+// AddRuleRequest 添加路由规则
+type AddRuleRequest struct {
+	Platform   string `json:"platform"`
+	InstanceID string `json:"instance_id"`
+	UserID     string `json:"user_id"`
+	ChatID     string `json:"chat_id"`
+	AgentName  string `json:"agent_name"`
+	Priority   int    `json:"priority"`
+}
+
+// handleAddRule 添加路由规则（内存 + 持久化）
+func (s *Server) handleAddRule(w http.ResponseWriter, r *http.Request) {
+	var req AddRuleRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误"})
+		return
+	}
+	rule := router.Rule{
+		Platform:   req.Platform,
+		InstanceID: req.InstanceID,
+		UserID:     req.UserID,
+		ChatID:     req.ChatID,
+		AgentName:  req.AgentName,
+		Priority:   req.Priority,
+	}
+	if s.agentStore != nil {
+		if err := s.agentStore.SaveRule(r.Context(), &rule); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + err.Error()})
+			return
+		}
+	}
+	if err := s.agentRouter.AddRule(rule); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"message": "规则已添加", "id": rule.ID})
+}
+
+type TestRouteRequest struct {
+	Platform   string `json:"platform"`
+	InstanceID string `json:"instance_id"`
+	UserID     string `json:"user_id"`
+	ChatID     string `json:"chat_id"`
+	Message    string `json:"message"`
+}
+
+// handleTestRoute 返回路由规则命中详情，便于前端解释“为什么这样回答”。
+func (s *Server) handleTestRoute(w http.ResponseWriter, r *http.Request) {
+	var req TestRouteRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误"})
+		return
+	}
+
+	explanation := s.agentRouter.Explain(r.Context(), router.RouteRequest{
+		Platform:   req.Platform,
+		InstanceID: req.InstanceID,
+		UserID:     req.UserID,
+		ChatID:     req.ChatID,
+	}, req.Message)
+
+	message := "未命中任何规则"
+	switch explanation.Source {
+	case router.RouteSourceRule:
+		message = "命中显式路由规则"
+	case router.RouteSourceLLM:
+		message = "未命中显式规则，已通过 LLM 语义路由选择 Agent"
+	case router.RouteSourceDefault:
+		message = "未命中规则，已回退到默认 Agent"
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"matched":    explanation.Matched,
+		"agent_name": explanation.AgentName,
+		"source":     explanation.Source,
+		"rule":       explanation.Rule,
+		"score":      explanation.Score,
+		"matches":    explanation.Matches,
+		"message":    message,
+	})
+}
+
+// handleDeleteRule 删除单条路由规则
+func (s *Server) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	var id int
+	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "无效的规则 ID"})
+		return
+	}
+	if err := s.agentRouter.RemoveRule(id); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if s.agentStore != nil {
+		_ = s.agentStore.DeleteRule(r.Context(), id)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "规则已删除"})
 }
 
 // --- Canvas/A2UI API ---

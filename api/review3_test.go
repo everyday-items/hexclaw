@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,42 +9,48 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
-	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
 // ════════════════════════════════════════════════
 // Round 3: 安全、中间件、边界、规范
 // ════════════════════════════════════════════════
 
-// ── 1. API Token 时序攻击 ──
+// ── 1. API Token 需要精确匹配 ──
 
-func TestApiAuth_TokenComparison_IsNotConstantTime(t *testing.T) {
-	// server.go:504: auth != "Bearer "+token
-	// 使用 != 做字符串比较，Go 的 == 会在第一个不匹配字节处短路返回
-	// 攻击者可以通过精确计时逐字节猜出 token
-	secret := "my-super-secret-token-12345678"
-	correct := "Bearer " + secret
+func TestApiAuth_TokenComparison_ExactMatchRequired(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Server.APIToken = "secret-token"
+	s := &Server{cfg: cfg, logCollector: NewLogCollector(10)}
 
-	shortCircuit := func(auth, expected string) bool {
-		return auth != expected
+	handler := s.apiAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	tests := []struct {
+		name   string
+		auth   string
+		expect int
+	}{
+		{name: "exact", auth: "Bearer secret-token", expect: http.StatusOK},
+		{name: "wrong", auth: "Bearer wrong", expect: http.StatusUnauthorized},
+		{name: "shorter", auth: "Bearer secret", expect: http.StatusUnauthorized},
+		{name: "longer", auth: "Bearer secret-token-extra", expect: http.StatusUnauthorized},
 	}
-	constantTime := func(auth, expected string) bool {
-		return subtle.ConstantTimeCompare([]byte(auth), []byte(expected)) != 1
-	}
 
-	if shortCircuit(correct, correct) {
-		t.Fatal("should match")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/logs", nil)
+			req.RemoteAddr = "192.168.1.100:12345"
+			req.Header.Set("Authorization", tt.auth)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+			if w.Code != tt.expect {
+				t.Fatalf("status=%d, want %d", w.Code, tt.expect)
+			}
+		})
 	}
-	if constantTime(correct, correct) {
-		t.Fatal("should match")
-	}
-
-	_ = shortCircuit("wrong", correct)
-	_ = constantTime("wrong", correct)
-
-	t.Log("SECURITY: apiAuthMiddleware uses != for token comparison (timing attack vulnerable)")
-	t.Log("FIX: use crypto/subtle.ConstantTimeCompare")
 }
 
 // ── 2. CORS 中间件边界测试 ──
@@ -68,10 +73,10 @@ func TestCorsMiddleware_AllowedOrigins(t *testing.T) {
 		{"http://tauri.localhost", true},
 
 		// 应被拒绝
-		{"http://localhost:", false},         // 空端口
-		{"http://localhost:abc", false},       // 非数字端口
-		{"http://localhost:123456", false},    // 超过 5 位
-		{"http://localhost:0evil", false},     // 混入字母
+		{"http://localhost:", false},       // 空端口
+		{"http://localhost:abc", false},    // 非数字端口
+		{"http://localhost:123456", false}, // 超过 5 位
+		{"http://localhost:0evil", false},  // 混入字母
 		{"http://evil.com", false},
 		{"http://localhost", false},           // 无端口
 		{"https://localhost:3000", false},     // https (非 http)
@@ -251,14 +256,19 @@ func TestLogsApi_RequiresAuth(t *testing.T) {
 // ── 5. handleChat 日志泄露用户消息 ──
 
 func TestHandleChat_LogsUserMessage(t *testing.T) {
-	s := &Server{logCollector: NewLogCollector(100)}
-
 	sensitiveMsg := "我的银行卡密码是 123456"
-	s.logCollector.Info("chat", fmt.Sprintf("← user: %s", stringx.Truncate(sensitiveMsg, 80)))
+	s := NewServer(config.DefaultConfig(), &mockEngine{reply: &adapter.Reply{Content: "ok"}}, nil, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", strings.NewReader(`{"user_id":"u1","message":"`+sensitiveMsg+`"}`))
+	w := httptest.NewRecorder()
+	s.handleChat(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", w.Code)
+	}
 
 	entries, _ := s.logCollector.Query("", "", "银行卡", 10, 0)
-	if len(entries) > 0 {
-		t.Log("SECURITY: user messages containing PII are stored in accessible logs")
+	if len(entries) != 0 {
+		t.Fatalf("sensitive content leaked into logs: %+v", entries)
 	}
 }
 
@@ -273,8 +283,11 @@ func TestWriteJSON_EncoderErrorIgnored(t *testing.T) {
 
 	w2 := httptest.NewRecorder()
 	writeJSON(w2, http.StatusOK, map[string]any{"bad": make(chan int)})
-	if w2.Body.Len() == 0 {
-		t.Log("ISSUE: writeJSON with unseriazable data returns 200 + empty body")
+	if w2.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500", w2.Code)
+	}
+	if !strings.Contains(w2.Body.String(), "响应序列化失败") {
+		t.Fatalf("unexpected body: %q", w2.Body.String())
 	}
 }
 
@@ -283,9 +296,8 @@ func TestWriteJSON_EncoderErrorIgnored(t *testing.T) {
 func TestLogCollector_FieldNameShadowsBuiltin(t *testing.T) {
 	c := NewLogCollector(10)
 	if c.capacity != 10 {
-		t.Errorf("cap = %d, want 10", c.capacity)
+		t.Errorf("capacity = %d, want 10", c.capacity)
 	}
-	t.Log("STYLE: struct field 'cap' shadows builtin cap() — consider renaming to 'capacity'")
 }
 
 // ── 8. LogEntry.Timestamp 是 string 而非 time.Time ──

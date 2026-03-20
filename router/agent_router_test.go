@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"testing"
 )
 
@@ -219,5 +220,36 @@ func TestRouter_GetAgent(t *testing.T) {
 	_, ok = r.GetAgent("nonexistent")
 	if ok {
 		t.Error("获取不存在的 Agent 应返回 false")
+	}
+}
+
+func TestRouter_RouteWithFallback_UsesLLMBeforeDefault(t *testing.T) {
+	r := New()
+	if err := r.Register(AgentConfig{Name: "default"}); err != nil {
+		t.Fatalf("注册 default 失败: %v", err)
+	}
+	if err := r.Register(AgentConfig{Name: "semantic"}); err != nil {
+		t.Fatalf("注册 semantic 失败: %v", err)
+	}
+	if err := r.SetDefault("default"); err != nil {
+		t.Fatalf("设置默认 Agent 失败: %v", err)
+	}
+
+	r.SetClassifier(NewLLMClassifier(func(_ context.Context, _, _ string) (string, error) {
+		return `{"agent":"semantic","confidence":0.92}`, nil
+	}))
+
+	result, source := r.RouteWithFallback(context.Background(), RouteRequest{
+		Platform: "unknown",
+		UserID:   "user-1",
+	}, "帮我写代码")
+	if result == nil {
+		t.Fatal("期望命中 LLM fallback")
+	}
+	if result.AgentName != "semantic" {
+		t.Fatalf("期望路由到 semantic，实际 %q", result.AgentName)
+	}
+	if source != RouteSourceLLM {
+		t.Fatalf("期望 route source = %q，实际 %q", RouteSourceLLM, source)
 	}
 }

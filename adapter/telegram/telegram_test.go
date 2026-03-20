@@ -5,22 +5,21 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/internal/testutil/httpmock"
 )
 
-// mockTransport 自定义 HTTP 传输，用于拦截请求
 type mockTransport struct {
-	handler func(req *http.Request) (*http.Response, error)
+	handler httpmock.RoundTripFunc
 }
 
 func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	return m.handler(req)
+	return m.handler.RoundTrip(req)
 }
 
 // newTestAdapter 创建测试用 Telegram 适配器
@@ -79,27 +78,14 @@ func TestSendMessage(t *testing.T) {
 	var capturedURL string
 	var capturedContentType string
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	a := newTestAdapter()
+	a.client = httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedURL = r.URL.Path
 		capturedContentType = r.Header.Get("Content-Type")
 		body, _ := io.ReadAll(r.Body)
-		json.Unmarshal(body, &capturedReq)
+		_ = json.Unmarshal(body, &capturedReq)
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer server.Close()
-
-	a := newTestAdapter()
-	// 使用自定义传输将请求重定向到测试服务器
-	a.client = &http.Client{
-		Transport: &mockTransport{
-			handler: func(req *http.Request) (*http.Response, error) {
-				// 将请求重定向到测试服务器
-				req.URL.Scheme = "http"
-				req.URL.Host = strings.TrimPrefix(server.URL, "http://")
-				return http.DefaultTransport.RoundTrip(req)
-			},
-		},
-	}
 
 	ctx := context.Background()
 	err := a.sendMessage(ctx, "12345", "hello world")
@@ -128,15 +114,13 @@ func TestSendMessage(t *testing.T) {
 func TestSendMessageError(t *testing.T) {
 	a := newTestAdapter()
 	a.client = &http.Client{
-		Transport: &mockTransport{
-			handler: func(req *http.Request) (*http.Response, error) {
-				return &http.Response{
-					StatusCode: http.StatusForbidden,
-					Body:       io.NopCloser(strings.NewReader(`{"ok":false,"description":"Forbidden"}`)),
-					Header:     make(http.Header),
-				}, nil
-			},
-		},
+		Transport: httpmock.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Body:       io.NopCloser(strings.NewReader(`{"ok":false,"description":"Forbidden"}`)),
+				Header:     make(http.Header),
+			}, nil
+		}),
 	}
 
 	err := a.sendMessage(context.Background(), "123", "test")
@@ -154,17 +138,15 @@ func TestSend(t *testing.T) {
 
 	a := newTestAdapter()
 	a.client = &http.Client{
-		Transport: &mockTransport{
-			handler: func(req *http.Request) (*http.Response, error) {
-				body, _ := io.ReadAll(req.Body)
-				json.Unmarshal(body, &capturedBody)
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader("")),
-					Header:     make(http.Header),
-				}, nil
-			},
-		},
+		Transport: httpmock.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			body, _ := io.ReadAll(req.Body)
+			_ = json.Unmarshal(body, &capturedBody)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Header:     make(http.Header),
+			}, nil
+		}),
 	}
 
 	err := a.Send(context.Background(), "chat-1", &adapter.Reply{Content: "hello"})
@@ -208,15 +190,13 @@ func TestGetUpdates(t *testing.T) {
 
 	a := newTestAdapter()
 	a.client = &http.Client{
-		Transport: &mockTransport{
-			handler: func(req *http.Request) (*http.Response, error) {
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(response)),
-					Header:     make(http.Header),
-				}, nil
-			},
-		},
+		Transport: httpmock.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(response)),
+				Header:     make(http.Header),
+			}, nil
+		}),
 	}
 
 	updates, err := a.getUpdates()

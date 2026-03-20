@@ -3,26 +3,23 @@ package builtin
 import (
 	"context"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
+
+	"github.com/hexagon-codes/hexclaw/internal/testutil/httpmock"
 )
 
 func TestBrowserSkillFetch(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte(`<html><head><title>Test Page</title></head><body><p>Hello World</p></body></html>`))
-	}))
-	defer server.Close()
-
 	s := &BrowserSkill{
-		client:       &http.Client{Timeout: 30 * time.Second},
-		allowPrivate: true, // 测试服务器使用 127.0.0.1
+		client: httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html><head><title>Test Page</title></head><body><p>Hello World</p></body></html>`))
+		})),
+		allowPrivate: false,
 	}
 	result, err := s.Execute(context.Background(), map[string]any{
 		"action": "fetch",
-		"url":    server.URL,
+		"url":    "https://example.com/test",
 	})
 	if err != nil {
 		t.Fatalf("fetch 失败: %v", err)
@@ -48,20 +45,17 @@ func TestBrowserSkillExtract(t *testing.T) {
 </body>
 </html>`
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(html))
-	}))
-	defer server.Close()
-
 	s := &BrowserSkill{
-		client:       &http.Client{Timeout: 30 * time.Second},
-		allowPrivate: true,
+		client: httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(html))
+		})),
+		allowPrivate: false,
 	}
 
 	// 提取标题
 	result, err := s.Execute(context.Background(), map[string]any{
 		"action":   "extract",
-		"url":      server.URL,
+		"url":      "https://example.com/page",
 		"selector": "title",
 	})
 	if err != nil {
@@ -74,7 +68,7 @@ func TestBrowserSkillExtract(t *testing.T) {
 	// 提取 meta
 	result, err = s.Execute(context.Background(), map[string]any{
 		"action":   "extract",
-		"url":      server.URL,
+		"url":      "https://example.com/page",
 		"selector": "meta",
 	})
 	if err != nil {
@@ -87,7 +81,7 @@ func TestBrowserSkillExtract(t *testing.T) {
 	// 提取链接
 	result, err = s.Execute(context.Background(), map[string]any{
 		"action":   "extract",
-		"url":      server.URL,
+		"url":      "https://example.com/page",
 		"selector": "links",
 	})
 	if err != nil {

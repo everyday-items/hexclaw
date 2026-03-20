@@ -4,8 +4,8 @@
 // 通过被动回复或客服消息接口发送回复。
 //
 // 配置方式：
-//   1. 微信公众平台设置消息接收 URL: http://your-host:6065/wechat/callback
-//   2. 获取 AppID、AppSecret、Token、EncodingAESKey
+//  1. 微信公众平台设置消息接收 URL: http://your-host:6065/wechat/callback
+//  2. 获取 AppID、AppSecret、Token、EncodingAESKey
 //
 // 注意：
 //   - 微信公众号被动回复要求 5 秒内响应
@@ -47,6 +47,7 @@ type WechatAdapter struct {
 	handler adapter.MessageHandler
 	server  *http.Server
 	client  *http.Client
+	queue   *adapter.SendQueue
 
 	mu          sync.RWMutex
 	accessToken string
@@ -55,21 +56,35 @@ type WechatAdapter struct {
 
 // New 创建微信公众号适配器
 func New(cfg config.WechatConfig) *WechatAdapter {
-	return &WechatAdapter{
+	a := &WechatAdapter{
 		cfg:    cfg,
 		client: &http.Client{Timeout: 10 * time.Second},
 	}
+	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformWechat, a.sendReplyNow)
+	return a
 }
 
-func (a *WechatAdapter) Name() string              { return "wechat" }
+func (a *WechatAdapter) Name() string {
+	if a.cfg.Name != "" {
+		return a.cfg.Name
+	}
+	return "wechat"
+}
 func (a *WechatAdapter) Platform() adapter.Platform { return adapter.PlatformWechat }
+
+// Attach 注册消息处理器，但不启动独立 HTTP 服务器。
+func (a *WechatAdapter) Attach(handler adapter.MessageHandler) error {
+	a.handler = handler
+	if a.cfg.AppID == "" || a.cfg.AppSecret == "" {
+		return fmt.Errorf("微信公众号 AppID 和 AppSecret 不能为空")
+	}
+	return nil
+}
 
 // Start 启动消息回调服务器
 func (a *WechatAdapter) Start(_ context.Context, handler adapter.MessageHandler) error {
-	a.handler = handler
-
-	if a.cfg.AppID == "" || a.cfg.AppSecret == "" {
-		return fmt.Errorf("微信公众号 AppID 和 AppSecret 不能为空")
+	if err := a.Attach(handler); err != nil {
+		return err
 	}
 
 	mux := http.NewServeMux()
@@ -94,14 +109,41 @@ func (a *WechatAdapter) Start(_ context.Context, handler adapter.MessageHandler)
 
 // Stop 停止适配器
 func (a *WechatAdapter) Stop(ctx context.Context) error {
+	if a.queue != nil {
+		_ = a.queue.Stop(context.Background())
+	}
 	if a.server != nil {
 		return a.server.Shutdown(ctx)
 	}
 	return nil
 }
 
+// Handler 返回统一 ingress 使用的处理器。
+func (a *WechatAdapter) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			a.handleVerify(w, r)
+		case http.MethodPost:
+			a.handleMessage(w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+}
+
 // Send 发送消息（通过客服接口）
 func (a *WechatAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	if a.queue == nil {
+		return a.sendReplyNow(ctx, chatID, reply)
+	}
+	return a.queue.Send(ctx, chatID, reply)
+}
+
+func (a *WechatAdapter) sendReplyNow(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	if reply == nil {
+		return nil
+	}
 	return a.sendCustomMessage(ctx, chatID, reply.Content)
 }
 
@@ -171,12 +213,13 @@ func (a *WechatAdapter) handleMessage(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer cancel()
 		unified := &adapter.Message{
-			ID:        "wechat-" + idgen.ShortID(),
-			Platform:  adapter.PlatformWechat,
-			ChatID:    msg.FromUserName,
-			UserID:    msg.FromUserName,
-			Content:   msg.Content,
-			Timestamp: time.Now(),
+			ID:         "wechat-" + idgen.ShortID(),
+			Platform:   adapter.PlatformWechat,
+			InstanceID: a.Name(),
+			ChatID:     msg.FromUserName,
+			UserID:     msg.FromUserName,
+			Content:    msg.Content,
+			Timestamp:  time.Now(),
 			Metadata: map[string]string{
 				"msg_id": fmt.Sprintf("%d", msg.MsgID),
 			},
@@ -219,7 +262,7 @@ func (a *WechatAdapter) handleMessage(w http.ResponseWriter, r *http.Request) {
 			select {
 			case content := <-replyCh:
 				bgCtx := context.Background()
-				a.sendCustomMessage(bgCtx, msg.FromUserName, content)
+				_ = a.Send(bgCtx, msg.FromUserName, &adapter.Reply{Content: content})
 			case <-time.After(120 * time.Second):
 				// 超时放弃
 			}
@@ -333,6 +376,17 @@ func (a *WechatAdapter) sendCustomMessage(ctx context.Context, toUser, content s
 
 	if result.ErrCode != 0 {
 		return fmt.Errorf("微信客服消息失败 (%d): %s", result.ErrCode, result.ErrMsg)
+	}
+	return nil
+}
+
+// Health 返回适配器健康状态。
+func (a *WechatAdapter) Health(_ context.Context) error {
+	if a.handler == nil {
+		return fmt.Errorf("wechat handler 未附加")
+	}
+	if a.cfg.AppID == "" || a.cfg.AppSecret == "" || a.cfg.Token == "" {
+		return fmt.Errorf("wechat app_id/app_secret/token 未配置")
 	}
 	return nil
 }

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -113,6 +114,28 @@ func (e *ReActEngine) AgentFactory() *agents.Factory {
 	return e.factory
 }
 
+// SetSkillEnabled 设置技能的运行时启用状态。
+func (e *ReActEngine) SetSkillEnabled(name string, enabled bool) error {
+	e.mu.RLock()
+	skills := e.skills
+	e.mu.RUnlock()
+	if skills == nil {
+		return fmt.Errorf("skill registry 未设置")
+	}
+	return skills.SetEnabled(name, enabled)
+}
+
+// SkillEnabled 返回技能是否在运行时生效。
+func (e *ReActEngine) SkillEnabled(name string) (bool, bool) {
+	e.mu.RLock()
+	skills := e.skills
+	e.mu.RUnlock()
+	if skills == nil {
+		return false, false
+	}
+	return skills.IsEnabled(name)
+}
+
 // Start 启动引擎
 func (e *ReActEngine) Start(_ context.Context) error {
 	e.mu.Lock()
@@ -160,35 +183,43 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	}
 	msg.SessionID = sess.ID
 
-	// 2. 保存用户消息
-	if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg.Content); err != nil {
-		log.Printf("保存用户消息失败: %v", err)
-	}
-
-	// 3. 尝试快速路径: Skill 关键词匹配
+	// 2. 尝试快速路径: Skill 关键词匹配
 	if matched, ok := e.skills.Match(msg); ok {
-		result, err := matched.Execute(ctx, map[string]any{
+		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg.Content); err != nil {
+			log.Printf("保存用户消息失败: %v", err)
+		}
+		skillArgs := map[string]any{
 			"query":   msg.Content,
 			"user_id": msg.UserID,
-		})
+		}
+		result, err := matched.Execute(ctx, skillArgs)
 		if err != nil {
 			return nil, fmt.Errorf("skill %s 执行失败: %w", matched.Name(), err)
 		}
 
-		// 保存助手回复
 		if err := e.sessions.SaveAssistantMessage(ctx, sess.ID, result.Content); err != nil {
 			log.Printf("保存助手回复失败: %v", err)
 		}
 
+		argsJSON, _ := json.Marshal(skillArgs)
 		return &adapter.Reply{
 			Content:  result.Content,
 			Metadata: result.Metadata,
+			ToolCalls: []adapter.ToolCall{{
+				ID:        "tc-" + idgen.ShortID(),
+				Name:      matched.Name(),
+				Arguments: string(argsJSON),
+				Result:    truncateResult(result.Content, 500),
+			}},
 		}, nil
 	}
 
-	// 4. 语义缓存查询
+	// 3. 语义缓存查询
 	if cached, ok := e.cache.Get(msg.Content, e.cfg.LLM.Default); ok {
 		log.Printf("语义缓存命中: %s", msg.Content[:min(20, len(msg.Content))])
+		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg.Content); err != nil {
+			log.Printf("保存用户消息失败: %v", err)
+		}
 		if err := e.sessions.SaveAssistantMessage(ctx, sess.ID, cached); err != nil {
 			log.Printf("保存助手回复失败: %v", err)
 		}
@@ -198,11 +229,15 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		}, nil
 	}
 
-	// 5. 主路径: 构建对话上下文
+	// 4. 主路径: 构建对话上下文（在 SaveUserMessage 之前，避免 history 重复包含当前消息）
 	history, err := e.sessions.BuildContext(ctx, sess.ID)
 	if err != nil {
 		log.Printf("构建上下文失败: %v", err)
-		// 不中断，继续无上下文处理
+	}
+
+	// 5. 保存用户消息（在 BuildContext 之后，确保 history 不含当前消息）
+	if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg.Content); err != nil {
+		log.Printf("保存用户消息失败: %v", err)
 	}
 
 	// 5.5 知识库检索（RAG 上下文增强）
@@ -305,13 +340,35 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		}
 	}
 
+	replyMeta := map[string]string{
+		"provider": providerName,
+		"model":    modelName,
+	}
+	if msg.Metadata != nil {
+		if v := msg.Metadata["route_source"]; v != "" {
+			replyMeta["route_source"] = v
+		}
+		if v := msg.Metadata["routed_agent"]; v != "" {
+			replyMeta["routed_agent"] = v
+		}
+	}
+
+	var toolCalls []adapter.ToolCall
+	for _, tc := range output.ToolCalls {
+		argsJSON, _ := json.Marshal(tc.Arguments)
+		toolCalls = append(toolCalls, adapter.ToolCall{
+			ID:        "tc-" + idgen.ShortID(),
+			Name:      tc.Name,
+			Arguments: string(argsJSON),
+			Result:    truncateResult(tc.Result.String(), 500),
+		})
+	}
+
 	return &adapter.Reply{
-		Content: output.Content,
-		Metadata: map[string]string{
-			"provider": providerName,
-			"model":    modelName,
-		},
-		Usage: usage,
+		Content:   output.Content,
+		Metadata:  replyMeta,
+		Usage:     usage,
+		ToolCalls: toolCalls,
 	}, nil
 }
 
@@ -366,21 +423,28 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 
 	// 2. 尝试快速路径: Skill 匹配 → 单 chunk 返回
 	if matched, ok := e.skills.Match(msg); ok {
-		// 快速路径也需保存用户消息
 		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg.Content); err != nil {
 			log.Printf("保存用户消息失败: %v", err)
 		}
-		result, err := matched.Execute(ctx, map[string]any{
+		skillArgs := map[string]any{
 			"query":   msg.Content,
 			"user_id": msg.UserID,
-		})
+		}
+		result, err := matched.Execute(ctx, skillArgs)
 		if err != nil {
 			return nil, fmt.Errorf("skill %s 执行失败: %w", matched.Name(), err)
 		}
 		if err := e.sessions.SaveAssistantMessage(ctx, sess.ID, result.Content); err != nil {
 			log.Printf("保存助手回复失败: %v", err)
 		}
-		return singleChunk(result.Content), nil
+		argsJSON, _ := json.Marshal(skillArgs)
+		tc := []adapter.ToolCall{{
+			ID:        "tc-" + idgen.ShortID(),
+			Name:      matched.Name(),
+			Arguments: string(argsJSON),
+			Result:    truncateResult(result.Content, 500),
+		}}
+		return singleChunkWithTools(result.Content, tc), nil
 	}
 
 	// 3. 语义缓存命中 → 单 chunk 返回
@@ -430,9 +494,23 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 
 	// 7. 构建 CompletionRequest（含 system prompt + 历史 + 知识库 + 用户消息）
 	roleName := msg.Metadata["role"]
-	messages := e.buildStreamMessages(roleName, history, kbContext, msg.Content)
+	messages := e.buildStreamMessages(roleName, history, kbContext, msg.Content, msg.Metadata)
 	req := hexagon.CompletionRequest{
 		Messages: messages,
+	}
+	if m := msg.Metadata["agent_model"]; m != "" {
+		req.Model = m
+	}
+	if v := msg.Metadata["agent_max_tokens"]; v != "" {
+		if n, err := fmt.Sscanf(v, "%d", new(int)); n == 1 && err == nil {
+			fmt.Sscanf(v, "%d", &req.MaxTokens)
+		}
+	}
+	if v := msg.Metadata["agent_temperature"]; v != "" {
+		var t float64
+		if _, err := fmt.Sscanf(v, "%f", &t); err == nil {
+			req.Temperature = &t
+		}
 	}
 
 	// 8. 调用 provider.Stream()
@@ -534,15 +612,17 @@ func (e *ReActEngine) pipeStream(
 }
 
 // buildStreamMessages 构建流式请求的消息列表
-func (e *ReActEngine) buildStreamMessages(roleName string, history []hexagon.Message, kbContext, userQuery string) []hexagon.Message {
+func (e *ReActEngine) buildStreamMessages(roleName string, history []hexagon.Message, kbContext, userQuery string, metadata map[string]string) []hexagon.Message {
 	var messages []hexagon.Message
 
-	// System prompt（支持角色选择）
+	// System prompt 优先级: 角色名 > Agent 路由注入 > 默认
 	sysContent := systemPrompt
 	if roleName != "" {
 		if role, ok := e.factory.GetRole(roleName); ok {
 			sysContent = role.ToSystemPrompt()
 		}
+	} else if metadata != nil && metadata["agent_prompt"] != "" {
+		sysContent = metadata["agent_prompt"]
 	}
 	if kbContext != "" {
 		sysContent += "\n\n[参考知识]\n" + kbContext
@@ -572,6 +652,13 @@ func singleChunk(content string) <-chan *adapter.ReplyChunk {
 	return ch
 }
 
+func singleChunkWithTools(content string, toolCalls []adapter.ToolCall) <-chan *adapter.ReplyChunk {
+	ch := make(chan *adapter.ReplyChunk, 1)
+	ch <- &adapter.ReplyChunk{Content: content, Done: true, ToolCalls: toolCalls}
+	close(ch)
+	return ch
+}
+
 // resolveProvider 根据请求的 provider 名称解析 LLM Provider
 //
 // 如果 providerHint 为空或 "auto"，使用路由器默认策略选择；
@@ -581,20 +668,35 @@ func (e *ReActEngine) resolveProvider(ctx context.Context, providerHint string, 
 	hint := providerHint
 
 	// 如果未显式指定 Provider，尝试通过 Agent 路由获取
+	// 优先规则路由；规则未命中时尝试 LLM 语义分类（如已配置）
 	if (hint == "" || hint == "auto") && e.agentRouter != nil && msg != nil {
-		result := e.agentRouter.Route(agentrouter.RouteRequest{
-			Platform: string(msg.Platform),
-			UserID:   msg.UserID,
-			ChatID:   msg.SessionID,
-		})
-		if result != nil && result.AgentConfig != nil && result.AgentConfig.Provider != "" {
-			hint = result.AgentConfig.Provider
-			// 将路由结果注入 metadata 供后续 createAgent 使用
-			if msg.Metadata == nil {
-				msg.Metadata = make(map[string]string)
+		req := agentrouter.RouteRequest{
+			Platform:   string(msg.Platform),
+			InstanceID: msg.InstanceID,
+			UserID:     msg.UserID,
+			ChatID:     msg.ChatID,
+		}
+		result, routeSource := e.agentRouter.RouteWithFallback(ctx, req, msg.Content)
+		if msg.Metadata == nil {
+			msg.Metadata = make(map[string]string)
+		}
+		msg.Metadata["route_source"] = string(routeSource)
+		if result != nil && result.AgentConfig != nil {
+			msg.Metadata["routed_agent"] = result.AgentName
+			if result.AgentConfig.Provider != "" {
+				hint = result.AgentConfig.Provider
 			}
-			if msg.Metadata["role"] == "" && result.AgentConfig.SystemPrompt != "" {
+			if result.AgentConfig.Model != "" {
+				msg.Metadata["agent_model"] = result.AgentConfig.Model
+			}
+			if result.AgentConfig.SystemPrompt != "" && msg.Metadata["role"] == "" {
 				msg.Metadata["agent_prompt"] = result.AgentConfig.SystemPrompt
+			}
+			if result.AgentConfig.MaxTokens > 0 {
+				msg.Metadata["agent_max_tokens"] = fmt.Sprintf("%d", result.AgentConfig.MaxTokens)
+			}
+			if result.AgentConfig.Temperature > 0 {
+				msg.Metadata["agent_temperature"] = fmt.Sprintf("%.2f", result.AgentConfig.Temperature)
 			}
 		}
 	}
@@ -632,3 +734,11 @@ const systemPrompt = `你是「小蟹」🦀，HexClaw 的 AI 助手。
 - 知识问答：基于个人知识库 RAG 增强检索
 - 工具调用：天气查询、网络搜索、翻译等内置技能
 - MCP 扩展：通过 Model Context Protocol 接入任意外部工具`
+
+func truncateResult(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "..."
+}

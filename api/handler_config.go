@@ -1,19 +1,23 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
+	"time"
 
+	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/config"
 )
 
 // LLMConfigResponse GET /api/v1/config/llm 响应
 type LLMConfigResponse struct {
-	Default   string                              `json:"default"`
+	Default   string                               `json:"default"`
 	Providers map[string]LLMProviderConfigResponse `json:"providers"`
-	Routing   config.LLMRoutingConfig             `json:"routing"`
-	Cache     config.LLMCacheConfig               `json:"cache"`
+	Routing   config.LLMRoutingConfig              `json:"routing"`
+	Cache     config.LLMCacheConfig                `json:"cache"`
 }
 
 // LLMProviderConfigResponse 脱敏后的 Provider 配置
@@ -26,10 +30,10 @@ type LLMProviderConfigResponse struct {
 
 // LLMConfigUpdateRequest PUT /api/v1/config/llm 请求
 type LLMConfigUpdateRequest struct {
-	Default   string                                `json:"default"`
+	Default   string                                 `json:"default"`
 	Providers map[string]LLMProviderConfigUpdateItem `json:"providers"`
-	Routing   *config.LLMRoutingConfig              `json:"routing,omitempty"`
-	Cache     *config.LLMCacheConfig                `json:"cache,omitempty"`
+	Routing   *config.LLMRoutingConfig               `json:"routing,omitempty"`
+	Cache     *config.LLMCacheConfig                 `json:"cache,omitempty"`
 }
 
 // LLMProviderConfigUpdateItem 更新请求中的 Provider 项
@@ -38,6 +42,40 @@ type LLMProviderConfigUpdateItem struct {
 	BaseURL    string `json:"base_url"`
 	Model      string `json:"model"`
 	Compatible string `json:"compatible"`
+}
+
+type llmConnectionTestProvider struct {
+	Type    string `json:"type"`
+	BaseURL string `json:"base_url"`
+	APIKey  string `json:"api_key"`
+	Model   string `json:"model"`
+}
+
+type LLMConnectionTestRequest struct {
+	Provider llmConnectionTestProvider `json:"provider"`
+}
+
+type LLMConnectionTestResponse struct {
+	OK        bool   `json:"ok"`
+	Message   string `json:"message"`
+	Provider  string `json:"provider,omitempty"`
+	Model     string `json:"model,omitempty"`
+	LatencyMS int64  `json:"latency_ms,omitempty"`
+}
+
+type completionProvider interface {
+	Complete(context.Context, hexagon.CompletionRequest) (*hexagon.CompletionResponse, error)
+}
+
+var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvider {
+	opts := []hexagon.OpenAIOption{}
+	if cfg.BaseURL != "" {
+		opts = append(opts, hexagon.OpenAIWithBaseURL(cfg.BaseURL))
+	}
+	if cfg.Model != "" {
+		opts = append(opts, hexagon.OpenAIWithModel(cfg.Model))
+	}
+	return hexagon.NewOpenAI(cfg.APIKey, opts...)
 }
 
 // handleGetLLMConfig GET /api/v1/config/llm
@@ -120,5 +158,61 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 	log.Printf("LLM 配置已更新并持久化")
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status": "ok",
+	})
+}
+
+// handleTestLLMConfig POST /api/v1/config/llm/test
+//
+// 只测试单个 provider 配置是否可连通，不会持久化。
+func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
+	var req LLMConnectionTestRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "请求格式错误: " + err.Error(),
+		})
+		return
+	}
+
+	providerType := strings.TrimSpace(req.Provider.Type)
+	model := strings.TrimSpace(req.Provider.Model)
+	apiKey := strings.TrimSpace(req.Provider.APIKey)
+	if providerType == "" || model == "" || apiKey == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "provider.type、provider.api_key、provider.model 不能为空",
+		})
+		return
+	}
+
+	provider := llmTestProviderFactory(req.Provider)
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err := provider.Complete(ctx, hexagon.CompletionRequest{
+		Messages: []hexagon.Message{{
+			Role:    "user",
+			Content: "Reply with OK.",
+		}},
+		MaxTokens: 8,
+	})
+	latency := time.Since(start).Milliseconds()
+
+	if err != nil {
+		writeJSON(w, http.StatusOK, LLMConnectionTestResponse{
+			OK:        false,
+			Message:   "连接测试失败: " + err.Error(),
+			Provider:  providerType,
+			Model:     model,
+			LatencyMS: latency,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, LLMConnectionTestResponse{
+		OK:        true,
+		Message:   "连接测试通过",
+		Provider:  providerType,
+		Model:     model,
+		LatencyMS: latency,
 	})
 }

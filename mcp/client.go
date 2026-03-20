@@ -293,6 +293,110 @@ func (m *Manager) ServerStatuses() []ServerStatus {
 	return statuses
 }
 
+// AddServer 动态添加并连接 MCP Server
+//
+// 在运行时添加新的 MCP Server（无需重启）。
+// 如果同名 Server 已存在，先断开旧连接再连接新的。
+func (m *Manager) AddServer(ctx context.Context, cfg ServerConfig) error {
+	if cfg.Name == "" {
+		return fmt.Errorf("server name 不能为空")
+	}
+	if !cfg.Enabled {
+		cfg.Enabled = true
+	}
+
+	select {
+	case <-m.stopCh:
+		return fmt.Errorf("Manager 已关闭")
+	default:
+	}
+
+	server, err := m.connectServer(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("连接 MCP Server %q 失败: %w", cfg.Name, err)
+	}
+
+	m.mu.Lock()
+	// double-check: Close 可能在 connectServer 期间被调用
+	select {
+	case <-m.stopCh:
+		m.mu.Unlock()
+		if server.cleanup != nil {
+			server.cleanup()
+		}
+		if server.closer != nil {
+			server.closer.Close()
+		}
+		return fmt.Errorf("Manager 已关闭")
+	default:
+	}
+	if old, ok := m.servers[cfg.Name]; ok {
+		if old.cleanup != nil {
+			old.cleanup()
+		}
+		if old.closer != nil {
+			old.closer.Close()
+		}
+	}
+	m.servers[cfg.Name] = server
+
+	// 同步更新 configs 以支持重连
+	found := false
+	for i, c := range m.configs {
+		if c.Name == cfg.Name {
+			m.configs[i] = cfg
+			found = true
+			break
+		}
+	}
+	if !found {
+		m.configs = append(m.configs, cfg)
+	}
+	m.mu.Unlock()
+
+	log.Printf("MCP Server %q 已动态添加: 发现 %d 个工具", cfg.Name, len(server.tools))
+	return nil
+}
+
+// RemoveServer 动态移除 MCP Server
+//
+// 断开指定 Server 的连接并从管理器中移除。
+func (m *Manager) RemoveServer(name string) error {
+	select {
+	case <-m.stopCh:
+		return fmt.Errorf("Manager 已关闭")
+	default:
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	server, ok := m.servers[name]
+	if !ok {
+		return fmt.Errorf("MCP Server %q 不存在", name)
+	}
+
+	server.connected = false
+	if server.cleanup != nil {
+		server.cleanup()
+	}
+	if server.closer != nil {
+		server.closer.Close()
+	}
+	delete(m.servers, name)
+
+	// 从 configs 中移除
+	for i, c := range m.configs {
+		if c.Name == name {
+			m.configs = append(m.configs[:i], m.configs[i+1:]...)
+			break
+		}
+	}
+
+	log.Printf("MCP Server %q 已动态移除", name)
+	return nil
+}
+
 // Close 关闭所有 MCP Server 连接
 //
 // 按顺序关闭所有连接，释放资源。

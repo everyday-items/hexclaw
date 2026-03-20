@@ -22,7 +22,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
@@ -32,9 +35,10 @@ import (
 	"github.com/hexagon-codes/hexclaw/desktop"
 	"github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/hexclaw/gateway"
+	"github.com/hexagon-codes/hexclaw/instances"
 	"github.com/hexagon-codes/hexclaw/knowledge"
-	"github.com/hexagon-codes/hexclaw/memory"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
+	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
 	"github.com/hexagon-codes/hexclaw/storage"
@@ -45,25 +49,32 @@ import (
 
 // Server HTTP API 服务器
 type Server struct {
-	cfg        *config.Config
-	engine     engine.Engine
-	gateway    gateway.Gateway
-	store      storage.Store        // 数据存储层
-	kb         *knowledge.Manager  // 知识库管理器（可选）
-	webhookMgr *webhook.Manager    // Webhook 管理器（可选）
-	scheduler  *cron.Scheduler     // Cron 调度器（可选）
-	fileMem    *memory.FileMemory         // 文件记忆（可选）
-	mcpMgr      *hexmcp.Manager           // MCP 管理器（可选）
-	mp          *marketplace.Marketplace  // 技能市场（可选）
-	agentRouter *router.Dispatcher            // 多 Agent 路由器（可选）
-	canvasSvc   *canvas.Service           // Canvas/A2UI 服务（可选）
-	voiceSvc    *voice.Service            // 语音服务（可选）
+	cfg           *config.Config
+	engine        engine.Engine
+	gateway       gateway.Gateway
+	store         storage.Store            // 数据存储层
+	kb            *knowledge.Manager       // 知识库管理器（可选）
+	webhookMgr    *webhook.Manager         // Webhook 管理器（可选）
+	scheduler     *cron.Scheduler          // Cron 调度器（可选）
+	fileMem       *memory.FileMemory       // 文件记忆（可选）
+	mcpMgr        *hexmcp.Manager          // MCP 管理器（可选）
+	mp            *marketplace.Marketplace // 技能市场（可选）
+	agentRouter   *router.Dispatcher       // 多 Agent 路由器（可选）
+	agentStore    router.Store             // Agent/Rule 持久化（可选）
+	instanceMgr   *instances.Manager       // 平台实例运行时（可选）
+	canvasSvc     *canvas.Service          // Canvas/A2UI 服务（可选）
+	voiceSvc      *voice.Service           // 语音服务（可选）
 	desktopSvc    *desktop.Service         // 桌面集成服务（可选）
 	wsHandler     http.Handler             // WebSocket Handler（可选）
 	logCollector  *LogCollector            // 日志收集器
 	workflowStore *WorkflowStore           // 工作流存储
+	teamStore     *TeamStore               // 团队数据存储
 	version       string                   // 版本号
 	server        *http.Server
+	statsMu       sync.Mutex
+	statsCache    statsResponse
+	statsJSON     []byte
+	statsCacheAt  time.Time
 }
 
 // NewServer 创建 API 服务器
@@ -78,7 +89,16 @@ func NewServer(cfg *config.Config, eng engine.Engine, gw gateway.Gateway, store 
 		store:         store,
 		logCollector:  NewLogCollector(5000),
 		workflowStore: NewWorkflowStore(),
+		teamStore:     NewTeamStore(defaultDataDir()),
 	}
+}
+
+func defaultDataDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".hexclaw"
+	}
+	return filepath.Join(home, ".hexclaw")
 }
 
 // SetWebSocketHandler 设置 WebSocket Handler
@@ -137,6 +157,16 @@ func (s *Server) SetAgentRouter(r *router.Dispatcher) {
 	s.agentRouter = r
 }
 
+// SetAgentStore 设置 Agent/Rule 持久化层
+func (s *Server) SetAgentStore(store router.Store) {
+	s.agentStore = store
+}
+
+// SetInstanceManager 设置平台实例运行时管理器。
+func (s *Server) SetInstanceManager(mgr *instances.Manager) {
+	s.instanceMgr = mgr
+}
+
 // SetCanvas 设置 Canvas/A2UI 服务
 //
 // 设置后启用面板管理 API。
@@ -168,11 +198,7 @@ func (s *Server) SetDesktop(svc *desktop.Service) {
 	s.desktopSvc = svc
 }
 
-// Start 启动 HTTP 服务器
-//
-// 注册路由并开始监听。此方法会阻塞直到服务器停止。
-// 使用 Stop() 方法触发优雅关闭。
-func (s *Server) Start(ctx context.Context) error {
+func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 
 	// 健康检查
@@ -184,8 +210,10 @@ func (s *Server) Start(ctx context.Context) error {
 	// 知识库 API
 	if s.kb != nil {
 		mux.HandleFunc("POST /api/v1/knowledge/documents", s.handleAddDocument)
+		mux.HandleFunc("POST /api/v1/knowledge/upload", s.handleUploadDocument)
 		mux.HandleFunc("GET /api/v1/knowledge/documents", s.handleListDocuments)
 		mux.HandleFunc("DELETE /api/v1/knowledge/documents/{id}", s.handleDeleteDocument)
+		mux.HandleFunc("POST /api/v1/knowledge/documents/{id}/reindex", s.handleReindexDocument)
 		mux.HandleFunc("POST /api/v1/knowledge/search", s.handleSearchKnowledge)
 	} else {
 		mux.HandleFunc("GET /api/v1/knowledge/documents", emptyList("documents"))
@@ -205,6 +233,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// 配置 API
 	mux.HandleFunc("GET /api/v1/config/llm", s.handleGetLLMConfig)
 	mux.HandleFunc("PUT /api/v1/config/llm", s.handleUpdateLLMConfig)
+	mux.HandleFunc("POST /api/v1/config/llm/test", s.handleTestLLMConfig)
 
 	// 角色列表 API
 	mux.HandleFunc("GET /api/v1/roles", s.handleListRoles)
@@ -252,6 +281,8 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.mcpMgr != nil {
 		mux.HandleFunc("GET /api/v1/mcp/tools", s.handleListMCPTools)
 		mux.HandleFunc("GET /api/v1/mcp/servers", s.handleListMCPServers)
+		mux.HandleFunc("POST /api/v1/mcp/servers", s.handleAddMCPServer)
+		mux.HandleFunc("DELETE /api/v1/mcp/servers/{name}", s.handleRemoveMCPServer)
 		mux.HandleFunc("POST /api/v1/mcp/tools/call", s.handleCallMCPTool)
 		mux.HandleFunc("GET /api/v1/mcp/status", s.handleMCPStatus)
 	} else {
@@ -268,6 +299,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// 技能市场 API
 	if s.mp != nil {
 		mux.HandleFunc("GET /api/v1/skills", s.handleListSkills)
+		mux.HandleFunc("PUT /api/v1/skills/{name}/status", s.handleSkillStatus)
 		mux.HandleFunc("POST /api/v1/skills/install", s.handleInstallSkill)
 		mux.HandleFunc("DELETE /api/v1/skills/{name}", s.handleUninstallSkill)
 	}
@@ -278,6 +310,41 @@ func (s *Server) Start(ctx context.Context) error {
 		mux.HandleFunc("POST /api/v1/agents", s.handleRegisterAgent)
 		mux.HandleFunc("PUT /api/v1/agents/{name}", s.handleUpdateAgent)
 		mux.HandleFunc("DELETE /api/v1/agents/{name}", s.handleUnregisterAgent)
+		mux.HandleFunc("POST /api/v1/agents/default", s.handleSetDefaultAgent)
+		mux.HandleFunc("GET /api/v1/agents/rules", s.handleListRules)
+		mux.HandleFunc("POST /api/v1/agents/rules", s.handleAddRule)
+		mux.HandleFunc("POST /api/v1/agents/rules/test", s.handleTestRoute)
+		mux.HandleFunc("DELETE /api/v1/agents/rules/{id}", s.handleDeleteRule)
+	} else {
+		mux.HandleFunc("GET /api/v1/agents", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"agents":  []any{},
+				"rules":   []any{},
+				"total":   0,
+				"default": "",
+			})
+		})
+		mux.HandleFunc("GET /api/v1/agents/rules", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"rules": []any{},
+				"total": 0,
+			})
+		})
+	}
+
+	if s.instanceMgr != nil {
+		mux.HandleFunc("GET /api/v1/platforms/instances", s.handleListInstances)
+		mux.HandleFunc("GET /api/v1/platforms/instances/health", s.handleListInstanceHealth)
+		mux.HandleFunc("POST /api/v1/platforms/instances", s.handleUpsertInstance)
+		mux.HandleFunc("PUT /api/v1/platforms/instances/{name}", s.handleUpsertInstance)
+		mux.HandleFunc("DELETE /api/v1/platforms/instances/{name}", s.handleDeleteInstance)
+		mux.HandleFunc("GET /api/v1/platforms/instances/{name}/health", s.handleGetInstanceHealth)
+		mux.HandleFunc("POST /api/v1/platforms/instances/{name}/test", s.handleTestInstance)
+		mux.HandleFunc("POST /api/v1/platforms/instances/{name}/start", s.handleStartInstance)
+		mux.HandleFunc("POST /api/v1/platforms/instances/{name}/stop", s.handleStopInstance)
+		mux.HandleFunc("POST /api/v1/im/channels/{provider}/test", s.handleTestChannelConfig)
+		mux.HandleFunc("GET /api/v1/platforms/hooks/{provider}/{name}", s.handlePlatformHook)
+		mux.HandleFunc("POST /api/v1/platforms/hooks/{provider}/{name}", s.handlePlatformHook)
 	}
 
 	// Canvas/A2UI API
@@ -316,6 +383,14 @@ func (s *Server) Start(ctx context.Context) error {
 	// ClawHub 搜索（Skill 市场）
 	mux.HandleFunc("GET /api/v1/clawhub/search", s.handleClawHubSearch)
 
+	// Team API（共享 Agent + 团队成员）
+	mux.HandleFunc("GET /api/v1/team/agents", s.handleListSharedAgents)
+	mux.HandleFunc("POST /api/v1/team/agents", s.handleShareAgent)
+	mux.HandleFunc("DELETE /api/v1/team/agents/{id}", s.handleDeleteSharedAgent)
+	mux.HandleFunc("GET /api/v1/team/members", s.handleListTeamMembers)
+	mux.HandleFunc("POST /api/v1/team/members", s.handleInviteTeamMember)
+	mux.HandleFunc("DELETE /api/v1/team/members/{id}", s.handleRemoveTeamMember)
+
 	// 桌面集成 API
 	if s.desktopSvc != nil {
 		s.desktopSvc.RegisterRoutes(mux)
@@ -327,8 +402,15 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	// 管理 API 认证中间件
-	handler := s.apiAuthMiddleware(corsMiddleware(mux))
+	return s.apiAuthMiddleware(corsMiddleware(mux))
+}
 
+// Start 启动 HTTP 服务器
+//
+// 注册路由并开始监听。此方法会阻塞直到服务器停止。
+// 使用 Stop() 方法触发优雅关闭。
+func (s *Server) Start(ctx context.Context) error {
+	handler := s.routes()
 	addr := fmt.Sprintf("%s:%d", s.cfg.Server.Host, s.cfg.Server.Port)
 	s.server = &http.Server{
 		Addr:              addr,
@@ -378,17 +460,18 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // ChatRequest 聊天请求
 type ChatRequest struct {
 	Message   string `json:"message"`              // 用户消息内容
-	SessionID string `json:"session_id,omitempty"`  // 会话 ID（可选，空则创建新会话）
-	UserID    string `json:"user_id,omitempty"`     // 用户 ID（可选）
-	Role      string `json:"role,omitempty"`        // Agent 角色（可选：assistant/researcher/writer/coder/translator/analyst）
+	SessionID string `json:"session_id,omitempty"` // 会话 ID（可选，空则创建新会话）
+	UserID    string `json:"user_id,omitempty"`    // 用户 ID（可选）
+	Role      string `json:"role,omitempty"`       // Agent 角色（可选：assistant/researcher/writer/coder/translator/analyst）
 }
 
 // ChatResponse 聊天回复
 type ChatResponse struct {
-	Reply     string            `json:"reply"`                // 回复内容
-	SessionID string            `json:"session_id"`           // 会话 ID
-	Metadata  map[string]string `json:"metadata,omitempty"`   // 元数据
-	Usage     *adapter.Usage    `json:"usage,omitempty"`      // Token 使用统计
+	Reply     string              `json:"reply"`                // 回复内容
+	SessionID string              `json:"session_id"`           // 会话 ID
+	Metadata  map[string]string   `json:"metadata,omitempty"`   // 元数据
+	Usage     *adapter.Usage      `json:"usage,omitempty"`      // Token 使用统计
+	ToolCalls []adapter.ToolCall  `json:"tool_calls,omitempty"` // 工具调用记录
 }
 
 // handleChat 同步聊天端点
@@ -480,9 +563,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		SessionID: msg.SessionID,
 		Metadata:  reply.Metadata,
 		Usage:     reply.Usage,
+		ToolCalls: reply.ToolCalls,
 	})
 }
-
 
 // corsMiddleware 处理跨域请求
 //
@@ -537,7 +620,9 @@ func (s *Server) apiAuthMiddleware(next http.Handler) http.Handler {
 		// 2. 日志 API（GET /api/v1/logs*）需认证（可能含敏感信息）
 		path := r.URL.Path
 		isWriteOp := r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete
-		isWebhookReceiver := r.Method == http.MethodPost && strings.HasPrefix(path, "/api/v1/webhooks/") && path != "/api/v1/webhooks"
+		isWebhookReceiver := (r.Method == http.MethodPost && strings.HasPrefix(path, "/api/v1/webhooks/") && path != "/api/v1/webhooks") ||
+			((r.Method == http.MethodGet || r.Method == http.MethodPost) &&
+				strings.HasPrefix(path, "/api/v1/platforms/hooks/"))
 		isLogsAPI := path == "/api/v1/logs" || strings.HasPrefix(path, "/api/v1/logs/")
 		needsAuth := isLogsAPI || (isWriteOp && strings.HasPrefix(path, "/api/v1/") && path != "/api/v1/chat" && !isWebhookReceiver)
 
@@ -574,9 +659,20 @@ func (s *Server) apiAuthMiddleware(next http.Handler) http.Handler {
 
 // writeJSON 写入 JSON 响应
 func writeJSON(w http.ResponseWriter, status int, data any) {
+	body, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("writeJSON encode error: %v", err)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("{\"error\":\"响应序列化失败\"}\n"))
+		return
+	}
+	writeJSONBytes(w, status, body)
+}
+
+func writeJSONBytes(w http.ResponseWriter, status int, body []byte) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Printf("writeJSON encode error: %v", err)
-	}
+	_, _ = w.Write(body)
+	_, _ = w.Write([]byte{'\n'})
 }

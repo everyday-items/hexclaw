@@ -35,23 +35,44 @@ type Embedder interface {
 
 // Document 文档
 type Document struct {
-	ID         string    `json:"id"`          // 文档 ID
-	Title      string    `json:"title"`       // 文档标题
-	Content    string    `json:"content"`     // 原始内容
-	Source     string    `json:"source"`      // 来源（文件路径/URL/手动输入）
-	ChunkCount int      `json:"chunk_count"` // 分割后的 chunk 数
-	CreatedAt  time.Time `json:"created_at"`  // 创建时间
+	ID           string    `json:"id"`                      // 文档 ID
+	Title        string    `json:"title"`                   // 文档标题
+	Content      string    `json:"content,omitempty"`       // 原始内容
+	Source       string    `json:"source"`                  // 来源（文件路径/URL/手动输入）
+	ChunkCount   int       `json:"chunk_count"`             // 分割后的 chunk 数
+	CreatedAt    time.Time `json:"created_at"`              // 创建时间
+	UpdatedAt    time.Time `json:"updated_at,omitempty"`    // 最后更新时间
+	Status       string    `json:"status,omitempty"`        // processing / indexed / failed
+	ErrorMessage string    `json:"error_message,omitempty"` // 失败原因
+	SourceType   string    `json:"source_type,omitempty"`   // manual / upload / url / file
 }
 
 // Chunk 文档片段
 type Chunk struct {
-	ID        string    `json:"id"`        // Chunk ID
-	DocID     string    `json:"doc_id"`    // 所属文档 ID
-	Content   string    `json:"content"`   // 片段内容
-	Index     int       `json:"index"`     // 在文档中的序号
-	Embedding []float32 `json:"-"`         // 向量嵌入（不序列化）
-	Score     float64   `json:"score"`     // 最终综合分数
-	CreatedAt time.Time `json:"created_at"`
+	ID         string    `json:"id"`        // Chunk ID
+	DocID      string    `json:"doc_id"`    // 所属文档 ID
+	DocTitle   string    `json:"doc_title"` // 所属文档标题
+	Source     string    `json:"source"`    // 所属文档来源
+	ChunkCount int       `json:"chunk_count"`
+	Content    string    `json:"content"` // 片段内容
+	Index      int       `json:"index"`   // 在文档中的序号
+	Embedding  []float32 `json:"-"`       // 向量嵌入（不序列化）
+	Score      float64   `json:"score"`   // 最终综合分数
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// SearchHit 结构化知识库搜索结果。
+type SearchHit struct {
+	DocID      string         `json:"doc_id"`
+	DocTitle   string         `json:"doc_title"`
+	Source     string         `json:"source,omitempty"`
+	ChunkID    string         `json:"chunk_id"`
+	ChunkIndex int            `json:"chunk_index"`
+	ChunkCount int            `json:"chunk_count"`
+	Content    string         `json:"content"`
+	Score      float64        `json:"score"`
+	CreatedAt  time.Time      `json:"created_at,omitempty"`
+	Metadata   map[string]any `json:"metadata,omitempty"`
 }
 
 // SearchResult 单条搜索结果（内部使用）
@@ -90,6 +111,12 @@ type Store interface {
 	// DeleteDocument 删除文档及其所有 chunk
 	DeleteDocument(ctx context.Context, docID string) error
 
+	// GetDocument 获取单个文档详情
+	GetDocument(ctx context.Context, docID string) (*Document, error)
+
+	// ReplaceDocument 使用同一文档 ID 重建文档索引
+	ReplaceDocument(ctx context.Context, doc *Document, chunks []*Chunk) error
+
 	// ListDocuments 列出所有文档
 	ListDocuments(ctx context.Context) ([]*Document, error)
 
@@ -105,11 +132,11 @@ type Store interface {
 // 负责文档管理和混合检索，为 Agent 引擎提供 RAG 上下文增强。
 // 内部协调 Embedder 和 Store 完成向量+关键词的混合检索。
 type Manager struct {
-	store    Store
-	embedder Embedder     // 向量嵌入生成器
-	config   HybridConfig // 混合检索配置
-	chunkSize   int       // 每个 chunk 的最大字符数
-	chunkOverlap int      // chunk 间的重叠字符数
+	store        Store
+	embedder     Embedder     // 向量嵌入生成器
+	config       HybridConfig // 混合检索配置
+	chunkSize    int          // 每个 chunk 的最大字符数
+	chunkOverlap int          // chunk 间的重叠字符数
 }
 
 // ManagerOption Manager 配置选项
@@ -155,43 +182,21 @@ func (m *Manager) AddDocument(ctx context.Context, title, content, source string
 		return nil, fmt.Errorf("文档内容不能为空")
 	}
 
-	doc := &Document{
-		ID:        "doc-" + idgen.ShortID(),
-		Title:     title,
-		Content:   content,
-		Source:    source,
-		CreatedAt: time.Now(),
-	}
-
-	// 分块（带重叠）
-	chunkTexts := splitIntoChunks(content, m.chunkSize, m.chunkOverlap)
-	doc.ChunkCount = len(chunkTexts)
-
-	// 生成向量嵌入
-	var embeddings [][]float32
-	if m.embedder != nil && len(chunkTexts) > 0 {
-		var err error
-		embeddings, err = m.embedder.Embed(ctx, chunkTexts)
-		if err != nil {
-			return nil, fmt.Errorf("生成向量嵌入失败: %w", err)
-		}
-	}
-
-	// 构建 Chunk 列表
-	chunks := make([]*Chunk, len(chunkTexts))
 	now := time.Now()
-	for i, text := range chunkTexts {
-		chunk := &Chunk{
-			ID:        fmt.Sprintf("%s-chunk-%d", doc.ID, i),
-			DocID:     doc.ID,
-			Content:   text,
-			Index:     i,
-			CreatedAt: now,
-		}
-		if i < len(embeddings) {
-			chunk.Embedding = embeddings[i]
-		}
-		chunks[i] = chunk
+	doc := &Document{
+		ID:         "doc-" + idgen.ShortID(),
+		Title:      title,
+		Content:    content,
+		Source:     source,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Status:     "indexed",
+		SourceType: sourceTypeFromSource(source),
+	}
+
+	chunks, err := m.buildChunks(ctx, doc, now)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := m.store.AddDocument(ctx, doc, chunks); err != nil {
@@ -199,6 +204,61 @@ func (m *Manager) AddDocument(ctx context.Context, title, content, source string
 	}
 
 	return doc, nil
+}
+
+// ReindexDocument 重新切分并重建指定文档的 chunk/向量/FTS 索引。
+func (m *Manager) ReindexDocument(ctx context.Context, docID string) (*Document, error) {
+	doc, err := m.store.GetDocument(ctx, docID)
+	if err != nil {
+		return nil, err
+	}
+	if doc == nil {
+		return nil, fmt.Errorf("文档不存在")
+	}
+	if strings.TrimSpace(doc.Content) == "" {
+		return nil, fmt.Errorf("文档内容为空，无法重建索引")
+	}
+
+	doc.UpdatedAt = time.Now()
+	doc.Status = "indexed"
+	doc.ErrorMessage = ""
+	if doc.SourceType == "" {
+		doc.SourceType = sourceTypeFromSource(doc.Source)
+	}
+
+	chunks, err := m.buildChunks(ctx, doc, doc.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := m.store.ReplaceDocument(ctx, doc, chunks); err != nil {
+		return nil, fmt.Errorf("重建文档索引失败: %w", err)
+	}
+	return doc, nil
+}
+
+// Search 返回结构化搜索结果，供 API/UI 展示来源和命中片段。
+func (m *Manager) Search(ctx context.Context, query string, topK int) ([]SearchHit, error) {
+	selected, err := m.searchResults(ctx, query, topK)
+	if err != nil {
+		return nil, err
+	}
+
+	hits := make([]SearchHit, 0, len(selected))
+	for _, r := range selected {
+		hits = append(hits, SearchHit{
+			DocID:      r.Chunk.DocID,
+			DocTitle:   r.Chunk.DocTitle,
+			Source:     r.Chunk.Source,
+			ChunkID:    r.Chunk.ID,
+			ChunkIndex: r.Chunk.Index,
+			ChunkCount: r.Chunk.ChunkCount,
+			Content:    r.Chunk.Content,
+			Score:      r.Chunk.Score,
+			CreatedAt:  r.Chunk.CreatedAt,
+		})
+	}
+	return hits, nil
 }
 
 // Query 混合检索知识库，返回格式化的 LLM 上下文
@@ -211,6 +271,14 @@ func (m *Manager) AddDocument(ctx context.Context, title, content, source string
 //  5. MMR 去重选取最终结果
 //  6. 格式化为 LLM 可用的上下文字符串
 func (m *Manager) Query(ctx context.Context, query string, topK int) (string, error) {
+	hits, err := m.Search(ctx, query, topK)
+	if err != nil {
+		return "", err
+	}
+	return formatSearchHits(hits), nil
+}
+
+func (m *Manager) searchResults(ctx context.Context, query string, topK int) ([]*SearchResult, error) {
 	if topK <= 0 {
 		topK = 3
 	}
@@ -251,7 +319,7 @@ func (m *Manager) Query(ctx context.Context, query string, topK int) (string, er
 	}
 
 	if len(resultMap) == 0 {
-		return "", nil
+		return nil, nil
 	}
 
 	// 3. 计算混合分数 + 时间衰减
@@ -263,21 +331,7 @@ func (m *Manager) Query(ctx context.Context, query string, topK int) (string, er
 
 	// 4. MMR 去重选取
 	selected := m.mmrSelect(candidates, topK)
-
-	if len(selected) == 0 {
-		return "", nil
-	}
-
-	// 5. 格式化输出
-	var sb strings.Builder
-	sb.WriteString("以下是从个人知识库中检索到的相关信息：\n\n")
-	for i, r := range selected {
-		sb.WriteString(fmt.Sprintf("--- 参考 %d (相关度: %.0f%%) ---\n%s\n\n",
-			i+1, r.Chunk.Score*100, r.Chunk.Content))
-	}
-	sb.WriteString("请基于以上参考信息回答用户的问题。如果参考信息不足以回答，请如实告知。\n")
-
-	return sb.String(), nil
+	return selected, nil
 }
 
 // DeleteDocument 删除文档
@@ -288,6 +342,43 @@ func (m *Manager) DeleteDocument(ctx context.Context, docID string) error {
 // ListDocuments 列出所有文档
 func (m *Manager) ListDocuments(ctx context.Context) ([]*Document, error) {
 	return m.store.ListDocuments(ctx)
+}
+
+func formatSearchHits(hits []SearchHit) string {
+	if len(hits) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("以下是从个人知识库中检索到的相关信息：\n\n")
+	for i, hit := range hits {
+		sb.WriteString(fmt.Sprintf("--- 参考 %d (相关度: %.0f%%) ---\n", i+1, hit.Score*100))
+		if hit.DocTitle != "" {
+			sb.WriteString(hit.DocTitle)
+			if hit.Source != "" {
+				sb.WriteString(" · ")
+				sb.WriteString(hit.Source)
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString(hit.Content)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString("请基于以上参考信息回答用户的问题。如果参考信息不足以回答，请如实告知。\n")
+	return sb.String()
+}
+
+func sourceTypeFromSource(source string) string {
+	switch {
+	case source == "":
+		return "manual"
+	case strings.HasPrefix(source, "upload:"):
+		return "upload"
+	case strings.HasPrefix(source, "http://"), strings.HasPrefix(source, "https://"):
+		return "url"
+	default:
+		return "file"
+	}
 }
 
 // hybridScore 计算混合分数（向量 + 关键词 + 时间衰减）
@@ -411,6 +502,41 @@ func cosineSimilarity(a, b []float32) float64 {
 }
 
 // --- 文本分块 ---
+
+// buildChunks 对文档内容分块并生成向量嵌入，返回 Chunk 列表。
+// 同时更新 doc.ChunkCount。
+func (m *Manager) buildChunks(ctx context.Context, doc *Document, ts time.Time) ([]*Chunk, error) {
+	chunkTexts := splitIntoChunks(doc.Content, m.chunkSize, m.chunkOverlap)
+	doc.ChunkCount = len(chunkTexts)
+
+	var embeddings [][]float32
+	if m.embedder != nil && len(chunkTexts) > 0 {
+		var err error
+		embeddings, err = m.embedder.Embed(ctx, chunkTexts)
+		if err != nil {
+			return nil, fmt.Errorf("生成向量嵌入失败: %w", err)
+		}
+	}
+
+	chunks := make([]*Chunk, len(chunkTexts))
+	for i, text := range chunkTexts {
+		chunk := &Chunk{
+			ID:         fmt.Sprintf("%s-chunk-%d", doc.ID, i),
+			DocID:      doc.ID,
+			DocTitle:   doc.Title,
+			Source:     doc.Source,
+			ChunkCount: doc.ChunkCount,
+			Content:    text,
+			Index:      i,
+			CreatedAt:  ts,
+		}
+		if i < len(embeddings) {
+			chunk.Embedding = embeddings[i]
+		}
+		chunks[i] = chunk
+	}
+	return chunks, nil
+}
 
 // splitIntoChunks 将文本分割为带重叠的 chunk
 //

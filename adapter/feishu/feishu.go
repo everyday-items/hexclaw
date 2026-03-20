@@ -43,6 +43,7 @@ type FeishuAdapter struct {
 	handler adapter.MessageHandler
 	server  *http.Server
 	client  *http.Client
+	queue   *adapter.SendQueue
 
 	// Access Token 缓存
 	mu          sync.RWMutex
@@ -52,35 +53,56 @@ type FeishuAdapter struct {
 
 // New 创建飞书适配器
 func New(cfg config.FeishuConfig) *FeishuAdapter {
-	return &FeishuAdapter{
+	a := &FeishuAdapter{
 		cfg: cfg,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
 	}
+	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformFeishu, a.sendReplyNow)
+	return a
 }
 
-func (a *FeishuAdapter) Name() string              { return "feishu" }
+func (a *FeishuAdapter) Name() string {
+	if a.cfg.Name != "" {
+		return a.cfg.Name
+	}
+	return "feishu"
+}
 func (a *FeishuAdapter) Platform() adapter.Platform { return adapter.PlatformFeishu }
+
+// Attach 注册消息处理器，但不启动独立 HTTP 服务器。
+func (a *FeishuAdapter) Attach(handler adapter.MessageHandler) error {
+	a.handler = handler
+	return nil
+}
 
 // Start 启动飞书 Webhook 服务器
 //
 // 监听 /feishu/webhook 路径，接收飞书事件回调。
 // 服务器默认监听 :6061 端口（与主 API 分开）。
 func (a *FeishuAdapter) Start(_ context.Context, handler adapter.MessageHandler) error {
-	a.handler = handler
+	if err := a.Attach(handler); err != nil {
+		return err
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /feishu/webhook", a.handleWebhook)
 
+	port := a.cfg.WebhookPort
+	if port <= 0 {
+		port = 6061
+	}
+	addr := fmt.Sprintf(":%d", port)
+
 	a.server = &http.Server{
-		Addr:              ":6061",
+		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      30 * time.Second,
 	}
 
-	log.Println("飞书适配器已启动: :6061/feishu/webhook")
+	log.Printf("飞书适配器 [%s] 已启动: %s/feishu/webhook", a.Name(), addr)
 
 	go func() {
 		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -93,6 +115,9 @@ func (a *FeishuAdapter) Start(_ context.Context, handler adapter.MessageHandler)
 
 // Stop 停止飞书适配器
 func (a *FeishuAdapter) Stop(ctx context.Context) error {
+	if a.queue != nil {
+		_ = a.queue.Stop(context.Background())
+	}
 	if a.server == nil {
 		return nil
 	}
@@ -104,6 +129,16 @@ func (a *FeishuAdapter) Stop(ctx context.Context) error {
 //
 // 通过飞书 OpenAPI 发送文本消息到指定会话。
 func (a *FeishuAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	if a.queue == nil {
+		return a.sendReplyNow(ctx, chatID, reply)
+	}
+	return a.queue.Send(ctx, chatID, reply)
+}
+
+func (a *FeishuAdapter) sendReplyNow(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	if reply == nil {
+		return nil
+	}
 	token, err := a.getAccessToken(ctx)
 	if err != nil {
 		return fmt.Errorf("获取 Access Token 失败: %w", err)
@@ -255,9 +290,7 @@ func (a *FeishuAdapter) patchMessage(ctx context.Context, messageID, text string
 
 // Handler 返回 HTTP Handler（供外部挂载使用）
 func (a *FeishuAdapter) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /feishu/webhook", a.handleWebhook)
-	return mux
+	return http.HandlerFunc(a.handleWebhook)
 }
 
 // handleWebhook 处理飞书事件回调
@@ -333,13 +366,14 @@ func (a *FeishuAdapter) handleMessage(event feishuEvent) {
 
 	// 构建统一消息
 	msg := &adapter.Message{
-		ID:        "feishu-" + idgen.ShortID(),
-		Platform:  adapter.PlatformFeishu,
-		ChatID:    msgEvent.Message.ChatID,
-		UserID:    msgEvent.Sender.SenderID.OpenID,
-		UserName:  msgEvent.Sender.SenderID.OpenID, // 飞书需要额外 API 获取用户名
-		Content:   content,
-		Timestamp: time.Now(),
+		ID:         "feishu-" + idgen.ShortID(),
+		Platform:   adapter.PlatformFeishu,
+		InstanceID: a.Name(),
+		ChatID:     msgEvent.Message.ChatID,
+		UserID:     msgEvent.Sender.SenderID.OpenID,
+		UserName:   msgEvent.Sender.SenderID.OpenID, // 飞书需要额外 API 获取用户名
+		Content:    content,
+		Timestamp:  time.Now(),
 		Metadata: map[string]string{
 			"message_id":   msgEvent.Message.MessageID,
 			"chat_type":    msgEvent.Message.ChatType,
@@ -360,9 +394,23 @@ func (a *FeishuAdapter) handleMessage(event feishuEvent) {
 		return
 	}
 
+	if reply == nil {
+		return
+	}
 	if err := a.Send(ctx, msg.ChatID, reply); err != nil {
 		log.Printf("飞书: 发送回复失败: %v", err)
 	}
+}
+
+// Health 返回适配器健康状态。
+func (a *FeishuAdapter) Health(_ context.Context) error {
+	if a.handler == nil {
+		return fmt.Errorf("feishu handler 未附加")
+	}
+	if a.cfg.AppID == "" || a.cfg.AppSecret == "" {
+		return fmt.Errorf("feishu app_id/app_secret 未配置")
+	}
+	return nil
 }
 
 // getAccessToken 获取飞书 Tenant Access Token（带缓存）

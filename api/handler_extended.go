@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -12,53 +13,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hexagon-codes/hexclaw/adapter"
-	"github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
 // ═══════════════════════════════════════════════
 // 桌面端对齐：补齐缺失的 API 端点
 // ═══════════════════════════════════════════════
-
-// ─── Agent: PUT /api/v1/agents/{name} ──
-
-type UpdateAgentRequest struct {
-	DisplayName  string            `json:"display_name"`
-	Description  string            `json:"description"`
-	Model        string            `json:"model"`
-	Provider     string            `json:"provider"`
-	SystemPrompt string            `json:"system_prompt"`
-	Skills       []string          `json:"skills"`
-	MaxTokens    int               `json:"max_tokens"`
-	Temperature  float64           `json:"temperature"`
-	Metadata     map[string]string `json:"metadata"`
-}
-
-func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	var req UpdateAgentRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
-		return
-	}
-	if err := s.agentRouter.UpdateAgent(router.AgentConfig{
-		Name:         name,
-		DisplayName:  req.DisplayName,
-		Description:  req.Description,
-		Model:        req.Model,
-		Provider:     req.Provider,
-		SystemPrompt: req.SystemPrompt,
-		Skills:       req.Skills,
-		MaxTokens:    req.MaxTokens,
-		Temperature:  req.Temperature,
-		Metadata:     req.Metadata,
-	}); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"message": "Agent 已更新"})
-}
 
 // ─── Cron: POST /api/v1/cron/jobs/{id}/trigger ──
 
@@ -111,8 +71,7 @@ func (s *Server) handleDeleteMemory(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteMemoryItem(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	// 防御路径穿越：在 handler 层拦截，避免恶意输入到达文件系统
-	if strings.ContainsAny(id, "../\\") || id == "" {
+	if id == "" || strings.Contains(id, "..") || strings.ContainsRune(id, '/') || strings.ContainsRune(id, '\\') {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "无效的记忆 ID"})
 		return
 	}
@@ -174,11 +133,49 @@ func (s *Server) handleGetFullConfig(w http.ResponseWriter, r *http.Request) {
 		"webhook":   map[string]any{"enabled": s.cfg.Webhook.Enabled},
 		"canvas":    map[string]any{"enabled": s.cfg.Canvas.Enabled},
 		"voice":     map[string]any{"enabled": s.cfg.Voice.Enabled},
+		"security": map[string]any{
+			"gateway_enabled":        s.cfg.Security.Auth.Enabled || s.cfg.Security.RateLimit.RequestsPerMinute > 0 || s.cfg.Security.RateLimit.RequestsPerHour > 0,
+			"injection_detection":    s.cfg.Security.InjectionDetection.Enabled,
+			"pii_filter":             s.cfg.Security.PIIRedaction.Enabled,
+			"content_filter":         s.cfg.Security.ContentFilter.Enabled,
+			"rate_limit_rpm":         s.cfg.Security.RateLimit.RequestsPerMinute,
+			"max_tokens_per_request": s.cfg.Security.Cost.BudgetPerUser,
+		},
 	})
 }
 
 func (s *Server) handleUpdateFullConfig(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"message": "请使用 PUT /api/v1/config/llm 更新 LLM 配置"})
+	var body struct {
+		Security *struct {
+			GatewayEnabled      *bool `json:"gateway_enabled"`
+			InjectionDetection  *bool `json:"injection_detection"`
+			PIIFilter           *bool `json:"pii_filter"`
+			ContentFilter       *bool `json:"content_filter"`
+			RateLimitRPM        *int  `json:"rate_limit_rpm"`
+			MaxTokensPerRequest *int  `json:"max_tokens_per_request"`
+		} `json:"security"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "无效的请求体"})
+		return
+	}
+
+	if sec := body.Security; sec != nil {
+		if sec.InjectionDetection != nil {
+			s.cfg.Security.InjectionDetection.Enabled = *sec.InjectionDetection
+		}
+		if sec.PIIFilter != nil {
+			s.cfg.Security.PIIRedaction.Enabled = *sec.PIIFilter
+		}
+		if sec.ContentFilter != nil {
+			s.cfg.Security.ContentFilter.Enabled = *sec.ContentFilter
+		}
+		if sec.RateLimitRPM != nil {
+			s.cfg.Security.RateLimit.RequestsPerMinute = *sec.RateLimitRPM
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "配置已更新（LLM 配置请使用 PUT /api/v1/config/llm）"})
 }
 
 // ─── Models: GET /api/v1/models ──
@@ -195,17 +192,72 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 
 // ─── Stats: GET /api/v1/stats ──
 
+type statsResponse struct {
+	UptimeSeconds float64 `json:"uptime_seconds"`
+	Goroutines    int     `json:"goroutines"`
+	MemoryAllocMB float64 `json:"memory_alloc_mb"`
+	MemorySysMB   float64 `json:"memory_sys_mb"`
+	GCCycles      uint32  `json:"gc_cycles"`
+	LogEntries    int     `json:"log_entries"`
+}
+
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	if body := s.getStatsJSON(); len(body) > 0 {
+		writeJSONBytes(w, http.StatusOK, body)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.getStatsResponse())
+}
+
+const statsCacheTTL = 250 * time.Millisecond
+
+func (s *Server) getStatsResponse() statsResponse {
+	now := time.Now()
+
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+
+	if !s.statsCacheAt.IsZero() && now.Sub(s.statsCacheAt) < statsCacheTTL {
+		return s.statsCache
+	}
+
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"uptime_seconds":  time.Since(s.logCollector.startTime).Seconds(),
-		"goroutines":      runtime.NumGoroutine(),
-		"memory_alloc_mb": float64(m.Alloc) / 1024 / 1024,
-		"memory_sys_mb":   float64(m.Sys) / 1024 / 1024,
-		"gc_cycles":       m.NumGC,
-		"log_entries":     s.logCollector.Stats().Total,
-	})
+
+	s.statsCache = statsResponse{
+		UptimeSeconds: time.Since(s.logCollector.startTime).Seconds(),
+		Goroutines:    runtime.NumGoroutine(),
+		MemoryAllocMB: float64(m.Alloc) / 1024 / 1024,
+		MemorySysMB:   float64(m.Sys) / 1024 / 1024,
+		GCCycles:      m.NumGC,
+		LogEntries:    s.logCollector.Total(),
+	}
+	s.statsJSON = nil
+	s.statsCacheAt = now
+	return s.statsCache
+}
+
+func (s *Server) getStatsJSON() []byte {
+	now := time.Now()
+
+	s.statsMu.Lock()
+	if !s.statsCacheAt.IsZero() && now.Sub(s.statsCacheAt) < statsCacheTTL && len(s.statsJSON) > 0 {
+		cached := s.statsJSON
+		s.statsMu.Unlock()
+		return cached
+	}
+	s.statsMu.Unlock()
+
+	resp := s.getStatsResponse()
+	body, err := json.Marshal(resp)
+	if err != nil {
+		return nil
+	}
+
+	s.statsMu.Lock()
+	s.statsJSON = body
+	s.statsMu.Unlock()
+	return body
 }
 
 // ─── Version: GET /api/v1/version ──
@@ -236,16 +288,16 @@ type WorkflowData struct {
 }
 
 // WorkflowRun 工作流执行记录
-//
-// 当前为 stub 实现：handleRunWorkflow 立即返回 completed，
-// 不执行真正的 DAG 编排。真正的执行引擎应在 hexagon 层实现。
 type WorkflowRun struct {
-	ID         string    `json:"id"`
-	WorkflowID string    `json:"workflow_id"`
-	Status     string    `json:"status"`
-	Output     string    `json:"output,omitempty"`
-	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at,omitempty"`
+	ID          string            `json:"id"`
+	WorkflowID  string            `json:"workflow_id"`
+	Status      string            `json:"status"`
+	Input       string            `json:"input,omitempty"`
+	Output      string            `json:"output,omitempty"`
+	Error       string            `json:"error,omitempty"`
+	NodeResults []WorkflowNodeRun `json:"node_results,omitempty"`
+	StartedAt   time.Time         `json:"started_at"`
+	FinishedAt  time.Time         `json:"finished_at,omitempty"`
 }
 
 // WorkflowStore 工作流存储（内存 + JSON 文件持久化）
@@ -397,89 +449,44 @@ func (s *Server) handleRunWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var req RunWorkflowRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
+			return
+		}
+	}
+
 	run := &WorkflowRun{
 		ID:         "run-" + idgen.ShortID(),
 		WorkflowID: wf.ID,
 		Status:     "running",
+		Input:      req.Input,
 		StartedAt:  time.Now(),
 	}
 	s.workflowStore.mu.Lock()
 	s.workflowStore.addRun(run)
 	s.workflowStore.mu.Unlock()
 
-	// 真正执行：遍历节点，依次调用引擎处理（超时 10 分钟）
 	wfCtx, wfCancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	go func() {
 		defer wfCancel()
-		s.executeWorkflow(wfCtx, wf, run)
+		s.executeWorkflow(wfCtx, wf, run, req)
 	}()
 
-	// 返回 run 的快照（避免与 goroutine 并发修改竞态）
+	// 深拷贝 run 快照，避免与 goroutine 并发修改竞态（浅拷贝共享 NodeResults 底层数组）
 	snapshot := *run
+	if len(run.NodeResults) > 0 {
+		snapshot.NodeResults = make([]WorkflowNodeRun, len(run.NodeResults))
+		copy(snapshot.NodeResults, run.NodeResults)
+	}
 	writeJSON(w, http.StatusOK, &snapshot)
 }
 
 // executeWorkflow 异步执行工作流
-func (s *Server) executeWorkflow(_ context.Context, wf *WorkflowData, run *WorkflowRun) {
-	var outputs []string
-
-	for _, nodeRaw := range wf.Nodes {
-		nodeMap, ok := nodeRaw.(map[string]any)
-		if !ok {
-			continue
-		}
-		nodeType, _ := nodeMap["type"].(string)
-		label, _ := nodeMap["label"].(string)
-		data, _ := nodeMap["data"].(map[string]any)
-
-		switch nodeType {
-		case "agent":
-			prompt, _ := data["prompt"].(string)
-			if prompt == "" {
-				prompt = label
-			}
-			if prompt == "" {
-				continue
-			}
-			if s.engine != nil {
-				reply, err := s.engine.Process(context.Background(), &adapter.Message{
-					Platform: adapter.PlatformAPI,
-					UserID:   "workflow-" + wf.ID,
-					Content:  prompt,
-				})
-				if err != nil {
-					outputs = append(outputs, "["+label+"] 错误: "+err.Error())
-				} else {
-					outputs = append(outputs, "["+label+"] "+reply.Content)
-				}
-			}
-		case "tool":
-			toolName, _ := data["tool"].(string)
-			if toolName != "" && s.mcpMgr != nil {
-				args, _ := data["args"].(map[string]any)
-				result, err := s.mcpMgr.CallTool(context.Background(), toolName, args)
-				if err != nil {
-					outputs = append(outputs, "["+label+"] 工具错误: "+err.Error())
-				} else {
-					outputs = append(outputs, "["+label+"] "+result)
-				}
-			}
-		case "output":
-			// 输出节点：收集所有前置结果
-		default:
-			outputs = append(outputs, "["+label+"] 跳过 ("+nodeType+")")
-		}
-	}
-
-	// 更新 run 状态（替换整个对象，避免与读取方竞态）
-	finished := &WorkflowRun{
-		ID:         run.ID,
-		WorkflowID: run.WorkflowID,
-		Status:     "completed",
-		Output:     strings.Join(outputs, "\n\n"),
-		StartedAt:  run.StartedAt,
-		FinishedAt: time.Now(),
-	}
+func (s *Server) executeWorkflow(ctx context.Context, wf *WorkflowData, run *WorkflowRun, req RunWorkflowRequest) {
+	exec := newWorkflowExecutor(s, wf, req)
+	finished := exec.execute(ctx, run)
 	s.workflowStore.mu.Lock()
 	s.workflowStore.runs[run.ID] = finished
 	s.workflowStore.mu.Unlock()
@@ -490,7 +497,11 @@ func (s *Server) handleGetWorkflowRun(w http.ResponseWriter, r *http.Request) {
 	run, ok := s.workflowStore.runs[r.PathValue("id")]
 	var snapshot WorkflowRun
 	if ok {
-		snapshot = *run // 在锁内复制，避免与 executeWorkflow 竞态
+		snapshot = *run
+		if len(run.NodeResults) > 0 {
+			snapshot.NodeResults = make([]WorkflowNodeRun, len(run.NodeResults))
+			copy(snapshot.NodeResults, run.NodeResults)
+		}
 	}
 	s.workflowStore.mu.RUnlock()
 	if !ok {

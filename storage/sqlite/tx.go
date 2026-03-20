@@ -34,18 +34,37 @@ func (s *txStore) CreateSession(ctx context.Context, session *storage.Session) e
 		session.UpdatedAt = now
 	}
 	_, err := s.tx.ExecContext(ctx,
-		`INSERT INTO sessions (id, user_id, platform, title, parent_session_id, branch_message_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		session.ID, session.UserID, session.Platform, session.Title, session.ParentSessionID, session.BranchMessageID, session.CreatedAt, session.UpdatedAt,
+		`INSERT INTO sessions (id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		session.ID, session.UserID, session.Platform, session.InstanceID, session.ChatID, session.Title, session.ParentSessionID, session.BranchMessageID, session.CreatedAt, session.UpdatedAt,
 	)
 	return err
 }
 
 func (s *txStore) GetSession(ctx context.Context, id string) (*storage.Session, error) {
 	row := s.tx.QueryRowContext(ctx,
-		`SELECT id, user_id, platform, title, parent_session_id, branch_message_id, created_at, updated_at FROM sessions WHERE id = ?`, id,
+		`SELECT id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, created_at, updated_at FROM sessions WHERE id = ?`, id,
 	)
 	var sess storage.Session
-	if err := row.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.Title, &sess.ParentSessionID, &sess.BranchMessageID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+	if err := row.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.InstanceID, &sess.ChatID, &sess.Title, &sess.ParentSessionID, &sess.BranchMessageID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+		return nil, err
+	}
+	return &sess, nil
+}
+
+func (s *txStore) FindSessionByScope(ctx context.Context, userID, platform, instanceID, chatID string) (*storage.Session, error) {
+	row := s.tx.QueryRowContext(ctx,
+		`SELECT id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, created_at, updated_at
+		 FROM sessions
+		 WHERE user_id = ? AND platform = ? AND instance_id = ? AND chat_id = ?
+		 ORDER BY updated_at DESC, created_at DESC
+		 LIMIT 1`,
+		userID, platform, instanceID, chatID,
+	)
+	var sess storage.Session
+	if err := row.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.InstanceID, &sess.ChatID, &sess.Title, &sess.ParentSessionID, &sess.BranchMessageID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, storage.ErrNotFound
+		}
 		return nil, err
 	}
 	return &sess, nil
@@ -53,7 +72,7 @@ func (s *txStore) GetSession(ctx context.Context, id string) (*storage.Session, 
 
 func (s *txStore) ListSessions(ctx context.Context, userID string, limit, offset int) ([]*storage.Session, error) {
 	rows, err := s.tx.QueryContext(ctx,
-		`SELECT id, user_id, platform, title, parent_session_id, branch_message_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+		`SELECT id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
 		userID, limit, offset,
 	)
 	if err != nil {
@@ -64,7 +83,7 @@ func (s *txStore) ListSessions(ctx context.Context, userID string, limit, offset
 	var sessions []*storage.Session
 	for rows.Next() {
 		var sess storage.Session
-		if err := rows.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.Title, &sess.ParentSessionID, &sess.BranchMessageID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.InstanceID, &sess.ChatID, &sess.Title, &sess.ParentSessionID, &sess.BranchMessageID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
 			return nil, err
 		}
 		sessions = append(sessions, &sess)

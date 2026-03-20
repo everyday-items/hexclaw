@@ -65,13 +65,17 @@ type RealtimeExtension struct {
 	mu                  sync.RWMutex
 	subscribers         map[string]*Subscriber          // subscriber ID → subscriber
 	interactionHandlers map[string]InteractionHandler    // panel ID → handler
+	maxSubscribers      int                              // 最大订阅数，防止恶意连接导致 OOM
 }
 
 // NewRealtimeExtension 创建实时扩展
+const defaultMaxSubscribers = 1024
+
 func NewRealtimeExtension() *RealtimeExtension {
 	return &RealtimeExtension{
 		subscribers:         make(map[string]*Subscriber),
 		interactionHandlers: make(map[string]InteractionHandler),
+		maxSubscribers:      defaultMaxSubscribers,
 	}
 }
 
@@ -79,9 +83,13 @@ func NewRealtimeExtension() *RealtimeExtension {
 //
 // panelID 为具体面板 ID 或 "*" 表示订阅所有面板。
 // 返回 Subscriber，通过其 Ch 接收更新。
-func (rt *RealtimeExtension) Subscribe(panelID string) *Subscriber {
+func (rt *RealtimeExtension) Subscribe(panelID string) (*Subscriber, error) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+
+	if len(rt.subscribers) >= rt.maxSubscribers {
+		return nil, fmt.Errorf("已达到最大订阅数 %d，请先关闭其他连接", rt.maxSubscribers)
+	}
 
 	sub := &Subscriber{
 		ID:      "sub-" + idgen.ShortID(),
@@ -90,7 +98,7 @@ func (rt *RealtimeExtension) Subscribe(panelID string) *Subscriber {
 		done:    make(chan struct{}),
 	}
 	rt.subscribers[sub.ID] = sub
-	return sub
+	return sub, nil
 }
 
 // Unsubscribe 取消订阅

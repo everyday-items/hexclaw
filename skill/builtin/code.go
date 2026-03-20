@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/skill"
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
 // CodeSkill 代码执行 Skill
@@ -40,8 +41,10 @@ func NewCodeSkill() *CodeSkill {
 	}
 }
 
-func (s *CodeSkill) Name() string        { return "code" }
-func (s *CodeSkill) Description() string { return "执行代码片段（Go/Python/JavaScript），返回运行结果" }
+func (s *CodeSkill) Name() string { return "code" }
+func (s *CodeSkill) Description() string {
+	return "执行代码片段（Go/Python/JavaScript），返回运行结果"
+}
 
 // Match 匹配代码执行命令
 //
@@ -245,18 +248,22 @@ func parseCodeInput(input string) (lang, code string) {
 
 // truncateOutput 截断过长的输出
 func truncateOutput(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	const suffix = "\n... (输出已截断)"
+	if maxLen <= 0 {
+		return ""
+	}
+	if len([]rune(s)) <= maxLen {
 		return s
 	}
-	return s[:maxLen] + "\n... (输出已截断)"
+	return stringx.TruncateWithSuffix(s, maxLen, suffix)
 }
 
 // limitedWriter 是一个带上限的 io.Writer。
 // 写入超过 maxBytes 字节后，后续写入被静默丢弃，并在最终输出中追加截断提示。
 // 设计目的：在子进程仍在运行期间即时限制缓冲区增长，防止 OOM。
 type limitedWriter struct {
-	buf      bytes.Buffer
-	maxBytes int
+	buf       bytes.Buffer
+	maxBytes  int
 	truncated bool
 }
 

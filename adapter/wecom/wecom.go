@@ -5,9 +5,9 @@
 // 消息体使用 AES-256-CBC 加解密。
 //
 // 配置方式：
-//   1. 企业微信管理后台创建自建应用
-//   2. 设置接收消息 URL 为 http://your-host:6064/wecom/callback
-//   3. 获取 Token、EncodingAESKey、CorpID、AgentID、Secret
+//  1. 企业微信管理后台创建自建应用
+//  2. 设置接收消息 URL 为 http://your-host:6064/wecom/callback
+//  3. 获取 Token、EncodingAESKey、CorpID、AgentID、Secret
 //
 // 对标 OpenClaw 企业微信集成。
 package wecom
@@ -47,6 +47,7 @@ type WecomAdapter struct {
 	handler adapter.MessageHandler
 	server  *http.Server
 	client  *http.Client
+	queue   *adapter.SendQueue
 
 	mu          sync.RWMutex
 	accessToken string
@@ -67,26 +68,45 @@ func New(cfg config.WecomConfig) *WecomAdapter {
 			a.aesKey = key
 		}
 	}
+	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformWecom, a.sendReplyNow)
 	return a
 }
 
-func (a *WecomAdapter) Name() string              { return "wecom" }
+func (a *WecomAdapter) Name() string {
+	if a.cfg.Name != "" {
+		return a.cfg.Name
+	}
+	return "wecom"
+}
 func (a *WecomAdapter) Platform() adapter.Platform { return adapter.PlatformWecom }
+
+// Attach 注册消息处理器，但不启动独立 HTTP 服务器。
+func (a *WecomAdapter) Attach(handler adapter.MessageHandler) error {
+	a.handler = handler
+	if a.cfg.CorpID == "" || a.cfg.Secret == "" {
+		return fmt.Errorf("企业微信 CorpID 和 Secret 不能为空")
+	}
+	return nil
+}
 
 // Start 启动回调服务器
 func (a *WecomAdapter) Start(_ context.Context, handler adapter.MessageHandler) error {
-	a.handler = handler
-
-	if a.cfg.CorpID == "" || a.cfg.Secret == "" {
-		return fmt.Errorf("企业微信 CorpID 和 Secret 不能为空")
+	if err := a.Attach(handler); err != nil {
+		return err
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /wecom/callback", a.handleVerify)
 	mux.HandleFunc("POST /wecom/callback", a.handleCallback)
 
+	port := a.cfg.WebhookPort
+	if port <= 0 {
+		port = 6064
+	}
+	addr := fmt.Sprintf(":%d", port)
+
 	a.server = &http.Server{
-		Addr:              ":6064",
+		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -103,14 +123,41 @@ func (a *WecomAdapter) Start(_ context.Context, handler adapter.MessageHandler) 
 
 // Stop 停止适配器
 func (a *WecomAdapter) Stop(ctx context.Context) error {
+	if a.queue != nil {
+		_ = a.queue.Stop(context.Background())
+	}
 	if a.server != nil {
 		return a.server.Shutdown(ctx)
 	}
 	return nil
 }
 
+// Handler 返回统一 ingress 使用的处理器。
+func (a *WecomAdapter) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			a.handleVerify(w, r)
+		case http.MethodPost:
+			a.handleCallback(w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+}
+
 // Send 发送消息
 func (a *WecomAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	if a.queue == nil {
+		return a.sendReplyNow(ctx, chatID, reply)
+	}
+	return a.queue.Send(ctx, chatID, reply)
+}
+
+func (a *WecomAdapter) sendReplyNow(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	if reply == nil {
+		return nil
+	}
 	return a.sendTextMessage(ctx, chatID, reply.Content)
 }
 
@@ -209,12 +256,13 @@ func (a *WecomAdapter) processMessage(msg wecomMessage) {
 	}
 
 	unified := &adapter.Message{
-		ID:        "wecom-" + idgen.ShortID(),
-		Platform:  adapter.PlatformWecom,
-		ChatID:    msg.FromUserName,
-		UserID:    msg.FromUserName,
-		Content:   msg.Content,
-		Timestamp: time.Now(),
+		ID:         "wecom-" + idgen.ShortID(),
+		Platform:   adapter.PlatformWecom,
+		InstanceID: a.Name(),
+		ChatID:     msg.FromUserName,
+		UserID:     msg.FromUserName,
+		Content:    msg.Content,
+		Timestamp:  time.Now(),
 		Metadata: map[string]string{
 			"agent_id": a.cfg.AgentID,
 			"msg_id":   fmt.Sprintf("%d", msg.MsgID),
@@ -230,7 +278,9 @@ func (a *WecomAdapter) processMessage(msg wecomMessage) {
 		return
 	}
 	if reply != nil {
-		a.sendTextMessage(ctx, msg.FromUserName, reply.Content)
+		if err := a.Send(ctx, msg.FromUserName, reply); err != nil {
+			log.Printf("企业微信发送回复失败: %v", err)
+		}
 	}
 }
 
@@ -325,6 +375,20 @@ func (a *WecomAdapter) sendTextMessage(ctx context.Context, toUser, content stri
 
 	if result.ErrCode != 0 {
 		return fmt.Errorf("企业微信发送消息失败 (%d): %s", result.ErrCode, result.ErrMsg)
+	}
+	return nil
+}
+
+// Health 返回适配器健康状态。
+func (a *WecomAdapter) Health(_ context.Context) error {
+	if a.handler == nil {
+		return fmt.Errorf("wecom handler 未附加")
+	}
+	if a.cfg.CorpID == "" || a.cfg.Secret == "" || a.cfg.AgentID == "" {
+		return fmt.Errorf("wecom corp_id/secret/agent_id 未配置")
+	}
+	if len(a.aesKey) == 0 {
+		return fmt.Errorf("wecom aes key 未配置")
 	}
 	return nil
 }

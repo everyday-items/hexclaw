@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/storage"
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
 // mockStore 测试用存储
@@ -19,16 +20,19 @@ func newMockStore() *mockStore {
 	}
 }
 
-func (s *mockStore) Init(_ context.Context) error   { return nil }
-func (s *mockStore) Close() error                    { return nil }
+func (s *mockStore) Init(_ context.Context) error                              { return nil }
+func (s *mockStore) Close() error                                              { return nil }
 func (s *mockStore) CreateSession(_ context.Context, _ *storage.Session) error { return nil }
 func (s *mockStore) GetSession(_ context.Context, _ string) (*storage.Session, error) {
+	return nil, storage.ErrNotFound
+}
+func (s *mockStore) FindSessionByScope(_ context.Context, _, _, _, _ string) (*storage.Session, error) {
 	return nil, storage.ErrNotFound
 }
 func (s *mockStore) ListSessions(_ context.Context, _ string, _, _ int) ([]*storage.Session, error) {
 	return nil, nil
 }
-func (s *mockStore) DeleteSession(_ context.Context, _ string) error { return nil }
+func (s *mockStore) DeleteSession(_ context.Context, _ string) error            { return nil }
 func (s *mockStore) CleanupOldSessions(_ context.Context, _ int) (int64, error) { return 0, nil }
 
 func (s *mockStore) SaveMessage(_ context.Context, msg *storage.MessageRecord) error {
@@ -66,7 +70,7 @@ func (s *mockStore) ForkSession(_ context.Context, _, _, _ string) (*storage.Ses
 func (s *mockStore) ListSessionBranches(_ context.Context, _ string) ([]*storage.Session, error) {
 	return nil, nil
 }
-func (s *mockStore) SaveCost(_ context.Context, _ *storage.CostRecord) error  { return nil }
+func (s *mockStore) SaveCost(_ context.Context, _ *storage.CostRecord) error { return nil }
 func (s *mockStore) GetUserCost(_ context.Context, _ string, _ time.Time) (float64, error) {
 	return 0, nil
 }
@@ -121,23 +125,25 @@ func TestCompactor_Config(t *testing.T) {
 	}
 }
 
-// TestTruncate 测试文本截断
-func TestTruncate(t *testing.T) {
+// TestStringxTruncateContract 验证 compaction 复用的 toolkit 截断行为
+func TestStringxTruncateContract(t *testing.T) {
 	tests := []struct {
 		input  string
 		maxLen int
 		want   string
 	}{
 		{"短文本", 10, "短文本"},
-		{"这是一段比较长的中文文本", 5, "这是一段比..."},
+		{"这是一段比较长的中文文本", 5, "这是..."},
 		{"", 5, ""},
 		{"ab", 5, "ab"},
+		{"hello", 0, ""},
+		{"hello", -1, ""},
 	}
 
 	for _, tt := range tests {
-		got := truncate(tt.input, tt.maxLen)
+		got := stringx.Truncate(tt.input, tt.maxLen)
 		if got != tt.want {
-			t.Errorf("truncate(%q, %d) = %q, want %q", tt.input, tt.maxLen, got, tt.want)
+			t.Errorf("stringx.Truncate(%q, %d) = %q, want %q", tt.input, tt.maxLen, got, tt.want)
 		}
 	}
 }

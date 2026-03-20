@@ -9,7 +9,10 @@ func TestSubscribeAndNotify(t *testing.T) {
 	svc := NewService()
 	rt := NewRealtimeExtension()
 
-	sub := rt.Subscribe("panel-1")
+	sub, err := rt.Subscribe("panel-1")
+	if err != nil {
+		t.Fatalf("订阅失败: %v", err)
+	}
 	defer rt.Unsubscribe(sub.ID)
 
 	if rt.SubscriberCount() != 1 {
@@ -41,7 +44,10 @@ func TestSubscribeWildcard(t *testing.T) {
 	svc := NewService()
 	rt := NewRealtimeExtension()
 
-	sub := rt.Subscribe("*") // 订阅所有面板
+	sub, err := rt.Subscribe("*") // 订阅所有面板
+	if err != nil {
+		t.Fatalf("订阅失败: %v", err)
+	}
 	defer rt.Unsubscribe(sub.ID)
 
 	panel := NewPanel("any-panel", "任意面板")
@@ -64,7 +70,10 @@ func TestRemoveAndNotify(t *testing.T) {
 	panel := NewPanel("to-remove", "待移除")
 	svc.Publish(panel, nil)
 
-	sub := rt.Subscribe("to-remove")
+	sub, err := rt.Subscribe("to-remove")
+	if err != nil {
+		t.Fatalf("订阅失败: %v", err)
+	}
 	defer rt.Unsubscribe(sub.ID)
 
 	rt.RemoveAndNotify(svc, "to-remove")
@@ -96,12 +105,15 @@ func TestUpdateComponent(t *testing.T) {
 	panel.Add(md)
 	svc.Publish(panel, nil)
 
-	sub := rt.Subscribe("comp-test")
+	sub, err := rt.Subscribe("comp-test")
+	if err != nil {
+		t.Fatalf("订阅失败: %v", err)
+	}
 	defer rt.Unsubscribe(sub.ID)
 
 	newComp := Markdown("更新内容")
 	newComp.ID = md.ID // 保持 ID 一致
-	err := rt.UpdateComponent(svc, "comp-test", md.ID, newComp)
+	err = rt.UpdateComponent(svc, "comp-test", md.ID, newComp)
 	if err != nil {
 		t.Fatalf("更新组件失败: %v", err)
 	}
@@ -153,7 +165,10 @@ func TestHandleInteraction(t *testing.T) {
 		}, nil
 	})
 
-	sub := rt.Subscribe("interactive")
+	sub, err2 := rt.Subscribe("interactive")
+	if err2 != nil {
+		t.Fatalf("订阅失败: %v", err2)
+	}
 	defer rt.Unsubscribe(sub.ID)
 
 	update, err := rt.HandleInteraction(&Interaction{
@@ -194,7 +209,10 @@ func TestHandleInteractionNoHandler(t *testing.T) {
 
 func TestUnsubscribe(t *testing.T) {
 	rt := NewRealtimeExtension()
-	sub := rt.Subscribe("test")
+	sub, err := rt.Subscribe("test")
+	if err != nil {
+		t.Fatalf("订阅失败: %v", err)
+	}
 	if rt.SubscriberCount() != 1 {
 		t.Fatal("应有 1 个订阅者")
 	}

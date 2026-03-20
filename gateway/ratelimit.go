@@ -16,10 +16,14 @@ import (
 //   - 每用户每小时请求数限制
 //
 // 使用内存存储计数器，重启后重置。
+// 空窗口清理由后台 goroutine 定期执行（每 30 秒），
+// 避免在每次 Check 时做 O(n) 全量扫描。
 type RateLimitLayer struct {
-	cfg     config.RateLimitConfig
-	mu      sync.Mutex
-	windows map[string]*userWindow // key: userID
+	cfg       config.RateLimitConfig
+	mu        sync.Mutex
+	windows   map[string]*userWindow // key: userID
+	cleanOnce sync.Once
+	stopClean chan struct{}
 }
 
 // userWindow 用户请求窗口
@@ -30,9 +34,53 @@ type userWindow struct {
 
 // NewRateLimitLayer 创建速率限制层
 func NewRateLimitLayer(cfg config.RateLimitConfig) *RateLimitLayer {
-	return &RateLimitLayer{
-		cfg:     cfg,
-		windows: make(map[string]*userWindow),
+	l := &RateLimitLayer{
+		cfg:       cfg,
+		windows:   make(map[string]*userWindow),
+		stopClean: make(chan struct{}),
+	}
+	go l.periodicCleanup()
+	return l
+}
+
+// periodicCleanup 后台定期清理空窗口，避免每次 Check 做 O(n) 扫描
+func (l *RateLimitLayer) periodicCleanup() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			l.cleanupEmptyWindows()
+		case <-l.stopClean:
+			return
+		}
+	}
+}
+
+func (l *RateLimitLayer) cleanupEmptyWindows() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := time.Now()
+	minuteAgo := now.Add(-1 * time.Minute)
+	hourAgo := now.Add(-1 * time.Hour)
+
+	for uid, uw := range l.windows {
+		uw.minuteRequests = filterAfterCopy(uw.minuteRequests, minuteAgo)
+		uw.hourRequests = filterAfterCopy(uw.hourRequests, hourAgo)
+		if len(uw.minuteRequests) == 0 && len(uw.hourRequests) == 0 {
+			delete(l.windows, uid)
+		}
+	}
+
+	const maxWindows = 100000
+	if len(l.windows) > maxWindows {
+		for uid := range l.windows {
+			delete(l.windows, uid)
+			if len(l.windows) <= maxWindows {
+				break
+			}
+		}
 	}
 }
 
@@ -55,41 +103,11 @@ func (l *RateLimitLayer) Check(_ context.Context, msg *adapter.Message) error {
 		l.windows[userID] = w
 	}
 
-	// 清理过期记录
+	// 仅清理当前用户的过期记录（O(1) per user, not O(N) global scan）
 	minuteAgo := now.Add(-1 * time.Minute)
 	hourAgo := now.Add(-1 * time.Hour)
-	w.minuteRequests = filterAfter(w.minuteRequests, minuteAgo)
-	w.hourRequests = filterAfter(w.hourRequests, hourAgo)
-
-	// 清理不活跃用户窗口，防止内存泄漏
-	// 先收集待删除的 key，再统一删除，避免迭代中删除的语义歧义
-	const maxWindows = 100000
-	var toDelete []string
-	for uid, uw := range l.windows {
-		if uid == userID {
-			continue
-		}
-		if len(uw.minuteRequests) == 0 && len(uw.hourRequests) == 0 {
-			toDelete = append(toDelete, uid)
-		}
-	}
-	for _, uid := range toDelete {
-		delete(l.windows, uid)
-	}
-	// 如果窗口数仍超过上限，强制淘汰（最终安全阀）
-	if len(l.windows) > maxWindows {
-		count := 0
-		for uid := range l.windows {
-			if uid == userID {
-				continue
-			}
-			delete(l.windows, uid)
-			count++
-			if len(l.windows) <= maxWindows {
-				break
-			}
-		}
-	}
+	w.minuteRequests = filterAfterCopy(w.minuteRequests, minuteAgo)
+	w.hourRequests = filterAfterCopy(w.hourRequests, hourAgo)
 
 	// 检查每分钟限制
 	if l.cfg.RequestsPerMinute > 0 && len(w.minuteRequests) >= l.cfg.RequestsPerMinute {
@@ -116,9 +134,10 @@ func (l *RateLimitLayer) Check(_ context.Context, msg *adapter.Message) error {
 	return nil
 }
 
-// filterAfter 过滤出 after 之后的时间戳
-func filterAfter(times []time.Time, after time.Time) []time.Time {
-	result := times[:0]
+// filterAfterCopy 过滤出 after 之后的时间戳
+// 使用新切片避免旧引用在底层数组中驻留（[:0] 会保留已过滤元素的引用）
+func filterAfterCopy(times []time.Time, after time.Time) []time.Time {
+	var result []time.Time
 	for _, t := range times {
 		if t.After(after) {
 			result = append(result, t)

@@ -26,4 +26,4 @@
 package hexclaw
 
 // Version 当前版本号，通过 -ldflags 在构建时注入
-const Version = "0.1.0"
+const Version = "0.1.1"

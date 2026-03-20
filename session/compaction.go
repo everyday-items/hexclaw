@@ -10,6 +10,7 @@ import (
 	"github.com/hexagon-codes/hexagon"
 
 	"github.com/hexagon-codes/hexclaw/storage"
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -161,7 +162,7 @@ func (c *Compactor) generateSummary(ctx context.Context, msgs []*storage.Message
 		case "system":
 			role = "系统"
 		}
-		sb.WriteString(fmt.Sprintf("%s: %s\n", role, truncate(msg.Content, 500)))
+		sb.WriteString(fmt.Sprintf("%s: %s\n", role, stringx.Truncate(msg.Content, 500)))
 	}
 
 	sb.WriteString("\n--- 请求 ---\n")
@@ -188,13 +189,4 @@ func (c *Compactor) generateSummary(ctx context.Context, msgs []*storage.Message
 	}
 
 	return resp.Content, nil
-}
-
-// truncate 截断文本到指定长度
-func truncate(s string, maxLen int) string {
-	runes := []rune(s)
-	if len(runes) <= maxLen {
-		return s
-	}
-	return string(runes[:maxLen]) + "..."
 }

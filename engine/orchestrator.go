@@ -40,11 +40,27 @@ type Step struct {
 }
 
 // StepResult 单步执行结果
+//
+// ErrorMsg 是 error 的字符串表示，确保 JSON 序列化时输出为字符串而非空对象。
 type StepResult struct {
 	AgentRole string        `json:"agent_role"`
 	Content   string        `json:"content"`
 	Duration  time.Duration `json:"duration"`
-	Error     error         `json:"error,omitempty"`
+	ErrorMsg  string        `json:"error,omitempty"`
+	err       error
+}
+
+func newStepResult(role, content string, d time.Duration, err error) StepResult {
+	sr := StepResult{
+		AgentRole: role,
+		Content:   content,
+		Duration:  d,
+		err:       err,
+	}
+	if err != nil {
+		sr.ErrorMsg = err.Error()
+	}
+	return sr
 }
 
 // OrchestratorResult 编排执行结果
@@ -160,12 +176,7 @@ func (o *Orchestrator) executePipeline(ctx context.Context, wf *Workflow, input 
 		}
 
 		content, err := o.runAgent(ctx, step, prompt)
-		sr := StepResult{
-			AgentRole: step.AgentRole,
-			Content:   content,
-			Duration:  time.Since(start),
-			Error:     err,
-		}
+		sr := newStepResult(step.AgentRole, content, time.Since(start), err)
 		steps = append(steps, sr)
 
 		if err != nil {
@@ -191,10 +202,7 @@ func (o *Orchestrator) executeParallel(ctx context.Context, wf *Workflow, input 
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					results[idx] = StepResult{
-						AgentRole: s.AgentRole,
-						Error:     fmt.Errorf("agent panic: %v", r),
-					}
+					results[idx] = newStepResult(s.AgentRole, "", 0, fmt.Errorf("agent panic: %v", r))
 				}
 			}()
 			start := time.Now()
@@ -203,12 +211,7 @@ func (o *Orchestrator) executeParallel(ctx context.Context, wf *Workflow, input 
 				prompt = s.Instruction + "\n\n" + input
 			}
 			content, err := o.runAgent(ctx, s, prompt)
-			results[idx] = StepResult{
-				AgentRole: s.AgentRole,
-				Content:   content,
-				Duration:  time.Since(start),
-				Error:     err,
-			}
+			results[idx] = newStepResult(s.AgentRole, content, time.Since(start), err)
 		}(i, step)
 	}
 	wg.Wait()
@@ -216,8 +219,8 @@ func (o *Orchestrator) executeParallel(ctx context.Context, wf *Workflow, input 
 	// 合并结果
 	var parts []string
 	for _, r := range results {
-		if r.Error != nil {
-			return &OrchestratorResult{Steps: results}, fmt.Errorf("步骤 %s 失败: %w", r.AgentRole, r.Error)
+		if r.err != nil {
+			return &OrchestratorResult{Steps: results}, fmt.Errorf("步骤 %s 失败: %w", r.AgentRole, r.err)
 		}
 		parts = append(parts, fmt.Sprintf("=== %s ===\n%s", r.AgentRole, r.Content))
 	}
@@ -241,12 +244,7 @@ func (o *Orchestrator) executeRouter(ctx context.Context, wf *Workflow, input st
 
 	start := time.Now()
 	chosen, err := o.runAgent(ctx, routerStep, routerPrompt)
-	routerResult := StepResult{
-		AgentRole: routerStep.AgentRole,
-		Content:   chosen,
-		Duration:  time.Since(start),
-		Error:     err,
-	}
+	routerResult := newStepResult(routerStep.AgentRole, chosen, time.Since(start), err)
 	if err != nil {
 		return &OrchestratorResult{Steps: []StepResult{routerResult}}, err
 	}
@@ -267,12 +265,7 @@ func (o *Orchestrator) executeRouter(ctx context.Context, wf *Workflow, input st
 	// 第二步：执行选中的 Agent
 	start = time.Now()
 	content, err := o.runAgent(ctx, *targetStep, input)
-	execResult := StepResult{
-		AgentRole: targetStep.AgentRole,
-		Content:   content,
-		Duration:  time.Since(start),
-		Error:     err,
-	}
+	execResult := newStepResult(targetStep.AgentRole, content, time.Since(start), err)
 
 	return &OrchestratorResult{
 		FinalContent: content,
@@ -282,9 +275,19 @@ func (o *Orchestrator) executeRouter(ctx context.Context, wf *Workflow, input st
 
 // runAgent 执行单个 Agent
 func (o *Orchestrator) runAgent(ctx context.Context, step Step, input string) (string, error) {
-	provider, _, err := o.router.Route(ctx)
-	if err != nil {
-		return "", fmt.Errorf("llm 路由失败: %w", err)
+	var provider hexagon.Provider
+	if step.Provider != "" {
+		p, ok := o.router.Get(step.Provider)
+		if !ok {
+			return "", fmt.Errorf("步骤指定的 Provider %q 不存在", step.Provider)
+		}
+		provider = p
+	} else {
+		var err error
+		provider, _, err = o.router.Route(ctx)
+		if err != nil {
+			return "", fmt.Errorf("llm 路由失败: %w", err)
+		}
 	}
 
 	agent, err := o.factory.CreateAgent(step.AgentRole, provider)

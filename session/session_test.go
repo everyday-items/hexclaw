@@ -121,6 +121,53 @@ func TestBuildContext(t *testing.T) {
 	}
 }
 
+func TestGetOrCreate_ReusesSessionByScope(t *testing.T) {
+	mgr, _ := newTestManager(t)
+	ctx := context.Background()
+
+	msg1 := &adapter.Message{
+		Platform:   adapter.PlatformTelegram,
+		InstanceID: "telegram-main",
+		ChatID:     "chat-001",
+		UserID:     "user-001",
+		Content:    "第一条消息",
+	}
+	sess1, err := mgr.GetOrCreate(ctx, msg1)
+	if err != nil {
+		t.Fatalf("创建首个会话失败: %v", err)
+	}
+
+	msg2 := &adapter.Message{
+		Platform:   adapter.PlatformTelegram,
+		InstanceID: "telegram-main",
+		ChatID:     "chat-001",
+		UserID:     "user-001",
+		Content:    "第二条消息",
+	}
+	sess2, err := mgr.GetOrCreate(ctx, msg2)
+	if err != nil {
+		t.Fatalf("按 scope 复用会话失败: %v", err)
+	}
+	if sess2.ID != sess1.ID {
+		t.Fatalf("同一 scope 应复用同一会话，得到 %s 和 %s", sess1.ID, sess2.ID)
+	}
+
+	msg3 := &adapter.Message{
+		Platform:   adapter.PlatformTelegram,
+		InstanceID: "telegram-main",
+		ChatID:     "chat-002",
+		UserID:     "user-001",
+		Content:    "第三条消息",
+	}
+	sess3, err := mgr.GetOrCreate(ctx, msg3)
+	if err != nil {
+		t.Fatalf("创建新 scope 会话失败: %v", err)
+	}
+	if sess3.ID == sess1.ID {
+		t.Fatalf("不同 chat_id 不应复用同一会话: %s", sess3.ID)
+	}
+}
+
 func TestGenerateTitle(t *testing.T) {
 	tests := []struct {
 		input    string

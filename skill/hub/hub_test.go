@@ -3,12 +3,14 @@ package hub
 import (
 	"context"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"net/http"
+
+	"github.com/hexagon-codes/hexclaw/internal/testutil/httpmock"
 )
 
 func TestHubRefreshAndSearch(t *testing.T) {
@@ -22,21 +24,17 @@ func TestHubRefreshAndSearch(t *testing.T) {
 		},
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(catalog)
-	}))
-	defer server.Close()
-
 	h := New(HubConfig{
 		Enabled: true,
-		RepoURL: server.URL,
+		RepoURL: "https://clawhub.test/repo",
 		Branch:  "main",
 	}, t.TempDir())
-	// 覆盖 catalogURL 以使用测试服务器
-	h.client = server.Client()
-
-	// 手动设置 catalog 因为 URL 转换不适用于测试服务器
-	h.catalog = &catalog
+	h.client = httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(catalog)
+	}))
+	if err := h.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh 失败: %v", err)
+	}
 
 	// 搜索
 	results := h.Search("search")
@@ -86,16 +84,14 @@ func TestHubListByCategory(t *testing.T) {
 
 func TestHubInstallAndUninstall(t *testing.T) {
 	skillContent := "---\nname: test-skill\n---\n# Test Skill"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(skillContent))
-	}))
-	defer server.Close()
-
 	dir := t.TempDir()
-	h := New(HubConfig{RepoURL: server.URL, Branch: "main"}, dir)
+	h := New(HubConfig{RepoURL: "https://clawhub.test/repo", Branch: "main"}, dir)
+	h.client = httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(skillContent))
+	}))
 	h.catalog = &Catalog{
 		Skills: []SkillMeta{
-			{Name: "test-skill", URL: server.URL + "/skills/test-skill.md"},
+			{Name: "test-skill", URL: "https://clawhub.test/repo/skills/test-skill.md"},
 		},
 	}
 

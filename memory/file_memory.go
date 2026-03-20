@@ -23,14 +23,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	fileutil "github.com/hexagon-codes/toolkit/util/file"
 )
 
 // Options 记忆配置选项
 type Options struct {
-	Enabled    bool   `yaml:"enabled"`     // 是否启用文件记忆
-	Dir        string `yaml:"dir"`         // 记忆文件目录，默认 ~/.hexclaw/memory/
-	MaxMemory  int    `yaml:"max_memory"`  // MEMORY.md 最大行数，默认 200
-	DailyDays  int    `yaml:"daily_days"`  // 加载最近几天的日记，默认 2
+	Enabled   bool   `yaml:"enabled"`    // 是否启用文件记忆
+	Dir       string `yaml:"dir"`        // 记忆文件目录，默认 ~/.hexclaw/memory/
+	MaxMemory int    `yaml:"max_memory"` // MEMORY.md 最大行数，默认 200
+	DailyDays int    `yaml:"daily_days"` // 加载最近几天的日记，默认 2
 }
 
 // FileMemory 文件驱动的记忆系统
@@ -61,7 +63,7 @@ func New(cfg Options) (*FileMemory, error) {
 	}
 
 	// 确保目录存在
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := fileutil.MkdirAll(dir); err != nil {
 		return nil, fmt.Errorf("创建记忆目录失败: %w", err)
 	}
 

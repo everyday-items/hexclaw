@@ -5,12 +5,15 @@
 package marketplace
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	fileutil "github.com/hexagon-codes/toolkit/util/file"
 )
 
 // Marketplace 技能市场管理器
@@ -50,7 +53,7 @@ func NewMarketplace(skillDir string) *Marketplace {
 // 只读取 frontmatter（按需加载策略），不加载完整内容。
 func (m *Marketplace) Init() error {
 	// 确保目录存在
-	if err := os.MkdirAll(m.skillDir, 0755); err != nil {
+	if err := fileutil.MkdirAll(m.skillDir); err != nil {
 		return fmt.Errorf("创建技能目录失败: %w", err)
 	}
 
@@ -223,11 +226,70 @@ func (m *Marketplace) Dir() string {
 	return m.skillDir
 }
 
+// disabledPath 返回禁用列表文件路径
+func (m *Marketplace) disabledPath() string {
+	return filepath.Join(m.skillDir, "disabled.json")
+}
+
+// IsEnabled 检查技能是否启用（默认启用）
+func (m *Marketplace) IsEnabled(name string) bool {
+	disabled := m.getDisabled()
+	return !disabled[name]
+}
+
+// SetEnabled 设置技能启用状态
+func (m *Marketplace) SetEnabled(name string, enabled bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	disabled := m.getDisabledLocked()
+	if enabled {
+		delete(disabled, name)
+	} else {
+		disabled[name] = true
+	}
+	return m.saveDisabledLocked(disabled)
+}
+
+func (m *Marketplace) getDisabled() map[string]bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.getDisabledLocked()
+}
+
+func (m *Marketplace) getDisabledLocked() map[string]bool {
+	data, err := os.ReadFile(m.disabledPath())
+	if err != nil {
+		return make(map[string]bool)
+	}
+	var list []string
+	if err := json.Unmarshal(data, &list); err != nil {
+		return make(map[string]bool)
+	}
+	out := make(map[string]bool)
+	for _, n := range list {
+		out[n] = true
+	}
+	return out
+}
+
+func (m *Marketplace) saveDisabledLocked(disabled map[string]bool) error {
+	var list []string
+	for n := range disabled {
+		list = append(list, n)
+	}
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(m.disabledPath(), data, 0644)
+}
+
 // ============== 内部工具 ==============
 
 // copyDir 递归复制目录
 func copyDir(src, dst string) error {
-	if err := os.MkdirAll(dst, 0755); err != nil {
+	if err := fileutil.MkdirAll(dst); err != nil {
 		return err
 	}
 

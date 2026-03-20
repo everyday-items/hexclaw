@@ -3,8 +3,8 @@
 // 内置 Skill 包括：
 //   - search: 网络搜索（DuckDuckGo）
 //   - weather: 天气查询（wttr.in）
-//   - translate: 翻译（占位，走 LLM 主路径）
-//   - summary: 摘要（占位，走 LLM 主路径）
+//   - translate: 翻译（本地规则引擎）
+//   - summary: 摘要（本地抽取式摘要）
 //
 // 所有内置 Skill 可通过配置独立开关。
 package builtin

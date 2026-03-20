@@ -11,6 +11,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -41,6 +42,7 @@ func NewManager(store storage.Store, cfg config.MemoryConfig) *Manager {
 
 // GetOrCreate 获取或创建会话
 //
+// 会话 scope = (UserID, Platform, InstanceID, ChatID)，确保多实例不串上下文。
 // 如果 sessionID 不为空且存在，返回已有会话。
 // 如果 sessionID 为空或不存在，创建新会话。
 func (m *Manager) GetOrCreate(ctx context.Context, msg *adapter.Message) (*storage.Session, error) {
@@ -50,22 +52,34 @@ func (m *Manager) GetOrCreate(ctx context.Context, msg *adapter.Message) (*stora
 		if err == nil {
 			return sess, nil
 		}
-		// 会话不存在，创建新的（使用请求中的 ID）
 	}
 
-	// 创建新会话
+	// 对 IM/WebSocket 等无显式 SessionID 的场景，按 scope 复用最近会话。
+	if msg.ChatID != "" || msg.InstanceID != "" {
+		sess, err := m.store.FindSessionByScope(ctx, msg.UserID, string(msg.Platform), msg.InstanceID, msg.ChatID)
+		if err == nil {
+			return sess, nil
+		}
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("按 scope 查找会话失败: %w", err)
+		}
+	}
+
+	// 创建新会话，scope 包含 InstanceID 以隔离多实例
 	sessionID := msg.SessionID
 	if sessionID == "" {
 		sessionID = "sess-" + idgen.ShortID()
 	}
 
 	sess := &storage.Session{
-		ID:        sessionID,
-		UserID:    msg.UserID,
-		Platform:  string(msg.Platform),
-		Title:     generateTitle(msg.Content),
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		ID:         sessionID,
+		UserID:     msg.UserID,
+		Platform:   string(msg.Platform),
+		InstanceID: msg.InstanceID,
+		ChatID:     msg.ChatID,
+		Title:      generateTitle(msg.Content),
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
 	}
 
 	if err := m.store.CreateSession(ctx, sess); err != nil {

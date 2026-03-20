@@ -32,6 +32,7 @@ type DingtalkAdapter struct {
 	handler adapter.MessageHandler
 	server  *http.Server
 	client  *http.Client
+	queue   *adapter.SendQueue
 
 	mu          sync.RWMutex
 	accessToken string
@@ -40,30 +41,51 @@ type DingtalkAdapter struct {
 
 // New 创建钉钉适配器
 func New(cfg config.DingtalkConfig) *DingtalkAdapter {
-	return &DingtalkAdapter{
+	a := &DingtalkAdapter{
 		cfg:    cfg,
 		client: &http.Client{Timeout: 10 * time.Second},
 	}
+	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformDingtalk, a.sendReplyNow)
+	return a
 }
 
-func (a *DingtalkAdapter) Name() string              { return "dingtalk" }
+func (a *DingtalkAdapter) Name() string {
+	if a.cfg.Name != "" {
+		return a.cfg.Name
+	}
+	return "dingtalk"
+}
 func (a *DingtalkAdapter) Platform() adapter.Platform { return adapter.PlatformDingtalk }
+
+// Attach 注册消息处理器，但不启动独立 HTTP 服务器。
+func (a *DingtalkAdapter) Attach(handler adapter.MessageHandler) error {
+	a.handler = handler
+	return nil
+}
 
 // Start 启动钉钉 Webhook 服务器
 func (a *DingtalkAdapter) Start(_ context.Context, handler adapter.MessageHandler) error {
-	a.handler = handler
+	if err := a.Attach(handler); err != nil {
+		return err
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /dingtalk/webhook", a.handleWebhook)
 
+	port := a.cfg.WebhookPort
+	if port <= 0 {
+		port = 6062
+	}
+	addr := fmt.Sprintf(":%d", port)
+
 	a.server = &http.Server{
-		Addr:              ":6062",
+		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      30 * time.Second,
 	}
 
-	log.Println("钉钉适配器已启动: :6062/dingtalk/webhook")
+	log.Printf("钉钉适配器 [%s] 已启动: %s/dingtalk/webhook", a.Name(), addr)
 	go func() {
 		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("钉钉 Webhook 服务器错误: %v", err)
@@ -75,14 +97,32 @@ func (a *DingtalkAdapter) Start(_ context.Context, handler adapter.MessageHandle
 
 // Stop 停止钉钉适配器
 func (a *DingtalkAdapter) Stop(ctx context.Context) error {
+	if a.queue != nil {
+		_ = a.queue.Stop(context.Background())
+	}
 	if a.server == nil {
 		return nil
 	}
 	return a.server.Shutdown(ctx)
 }
 
+// Handler 返回统一 ingress 使用的处理器。
+func (a *DingtalkAdapter) Handler() http.Handler {
+	return http.HandlerFunc(a.handleWebhook)
+}
+
 // Send 发送消息
 func (a *DingtalkAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	if a.queue == nil {
+		return a.sendReplyNow(ctx, chatID, reply)
+	}
+	return a.queue.Send(ctx, chatID, reply)
+}
+
+func (a *DingtalkAdapter) sendReplyNow(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	if reply == nil {
+		return nil
+	}
 	token, err := a.getAccessToken(ctx)
 	if err != nil {
 		return fmt.Errorf("获取 Access Token 失败: %w", err)
@@ -172,15 +212,16 @@ func (a *DingtalkAdapter) handleMessage(event dtEvent) {
 	}
 
 	msg := &adapter.Message{
-		ID:        "dt-" + idgen.ShortID(),
-		Platform:  adapter.PlatformDingtalk,
-		ChatID:    event.SenderStaffId,
-		UserID:    event.SenderStaffId,
-		UserName:  event.SenderNick,
-		Content:   content,
-		Timestamp: time.Now(),
+		ID:         "dt-" + idgen.ShortID(),
+		Platform:   adapter.PlatformDingtalk,
+		InstanceID: a.Name(),
+		ChatID:     event.SenderStaffId,
+		UserID:     event.SenderStaffId,
+		UserName:   event.SenderNick,
+		Content:    content,
+		Timestamp:  time.Now(),
 		Metadata: map[string]string{
-			"conversation_id": event.ConversationId,
+			"conversation_id":   event.ConversationId,
 			"conversation_type": event.ConversationType,
 		},
 	}
@@ -192,6 +233,9 @@ func (a *DingtalkAdapter) handleMessage(event dtEvent) {
 	if err != nil {
 		log.Printf("钉钉: 处理消息失败: %v", err)
 		_ = a.Send(ctx, msg.ChatID, &adapter.Reply{Content: "处理消息时出现错误，请稍后重试。"})
+		return
+	}
+	if reply == nil {
 		return
 	}
 
@@ -275,4 +319,15 @@ type dtEvent struct {
 func marshalTextContent(text string) string {
 	b, _ := json.Marshal(map[string]string{"content": text})
 	return string(b)
+}
+
+// Health 返回适配器健康状态。
+func (a *DingtalkAdapter) Health(_ context.Context) error {
+	if a.handler == nil {
+		return fmt.Errorf("dingtalk handler 未附加")
+	}
+	if a.cfg.AppKey == "" || a.cfg.AppSecret == "" || a.cfg.RobotCode == "" {
+		return fmt.Errorf("dingtalk app_key/app_secret/robot_code 未配置")
+	}
+	return nil
 }

@@ -92,25 +92,31 @@ func (c *Cache) Get(input, provider string) (string, bool) {
 
 	key := hashInput(input, provider)
 
-	// 单次加写锁完成全部操作，避免 RLock→Unlock→Lock 之间的 TOCTOU 竞态
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	resp, ok := c.getLocked(key)
+	if ok {
+		c.hits++
+	} else {
+		c.misses++
+	}
+	return resp, ok
+}
+
+// getLocked 内部查询（调用者须持有写锁），不更新统计计数
+func (c *Cache) getLocked(key string) (string, bool) {
 	entry, ok := c.entries[key]
 	if !ok {
-		c.misses++
 		return "", false
 	}
 
-	// 检查是否过期
 	if time.Since(entry.CreatedAt) > c.ttl {
 		delete(c.entries, key)
-		c.misses++
 		return "", false
 	}
 
 	entry.HitCount++
-	c.hits++
 	return entry.Response, true
 }
 
@@ -133,13 +139,17 @@ func (c *Cache) Do(input, provider string, fn func() (response, model string, er
 
 	// singleflight：同一 key 只执行一次
 	v, err, _ := c.group.Do(key, func() (any, error) {
-		// double-check：可能在排队期间另一个请求已填充缓存
-		if cached, ok := c.Get(input, provider); ok {
+		// double-check 不更新统计，避免同一逻辑请求重复计数
+		c.mu.Lock()
+		if cached, ok := c.getLocked(key); ok {
+			c.mu.Unlock()
 			return cached, nil
 		}
-		resp, model, err := fn()
-		if err != nil {
-			return nil, err
+		c.mu.Unlock()
+
+		resp, model, fnErr := fn()
+		if fnErr != nil {
+			return nil, fnErr
 		}
 		c.Put(input, resp, provider, model)
 		return resp, nil
@@ -240,12 +250,16 @@ func (c *Cache) evictLocked() {
 }
 
 // jitteredNow 返回带随机抖动的当前时间（防止缓存雪崩）
+//
+// 抖动范围: [-ttlJitter/2, +ttlJitter/2]，使过期时间均匀分布在 TTL 附近，
+// 而非全部偏向提前过期。
 func (c *Cache) jitteredNow() time.Time {
 	if c.ttlJitter <= 0 {
 		return time.Now()
 	}
-	jitter := time.Duration(rand.Int64N(int64(c.ttlJitter)))
-	return time.Now().Add(-jitter)
+	half := c.ttlJitter / 2
+	jitter := time.Duration(rand.Int64N(int64(c.ttlJitter))) - half
+	return time.Now().Add(jitter)
 }
 
 // hashInput 对输入进行归一化和哈希

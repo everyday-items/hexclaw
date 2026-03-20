@@ -30,28 +30,30 @@ import (
 //
 // 定义一个 Agent 实例的完整配置。
 type AgentConfig struct {
-	Name        string            `json:"name" yaml:"name"`                // Agent 名称（唯一标识）
-	DisplayName string            `json:"display_name" yaml:"display_name"` // 显示名称
-	Description string            `json:"description" yaml:"description"`  // Agent 描述
-	Model       string            `json:"model" yaml:"model"`              // 使用的 LLM 模型
-	Provider    string            `json:"provider" yaml:"provider"`        // 使用的 LLM Provider
-	SystemPrompt string           `json:"system_prompt" yaml:"system_prompt"` // 系统提示词
-	Skills      []string          `json:"skills" yaml:"skills"`            // 启用的技能列表
-	MaxTokens   int               `json:"max_tokens" yaml:"max_tokens"`    // 最大 token 数
-	Temperature float64           `json:"temperature" yaml:"temperature"`  // 温度参数
-	Metadata    map[string]string `json:"metadata" yaml:"metadata"`        // 自定义元数据
+	Name         string            `json:"name" yaml:"name"`                   // Agent 名称（唯一标识）
+	DisplayName  string            `json:"display_name" yaml:"display_name"`   // 显示名称
+	Description  string            `json:"description" yaml:"description"`     // Agent 描述
+	Model        string            `json:"model" yaml:"model"`                 // 使用的 LLM 模型
+	Provider     string            `json:"provider" yaml:"provider"`           // 使用的 LLM Provider
+	SystemPrompt string            `json:"system_prompt" yaml:"system_prompt"` // 系统提示词
+	Skills       []string          `json:"skills" yaml:"skills"`               // 启用的技能列表
+	MaxTokens    int               `json:"max_tokens" yaml:"max_tokens"`       // 最大 token 数
+	Temperature  float64           `json:"temperature" yaml:"temperature"`     // 温度参数
+	Metadata     map[string]string `json:"metadata" yaml:"metadata"`           // 自定义元数据
 }
 
 // Rule 路由规则
 //
 // 定义消息到 Agent 的映射关系。
-// Platform 和 UserID 可组合使用，越精确的规则优先级越高。
+// Platform、InstanceID、UserID、ChatID 可组合使用，越精确的规则优先级越高。
 type Rule struct {
-	Platform  string `json:"platform" yaml:"platform"`     // 消息平台（如 telegram, feishu, api）
-	UserID    string `json:"user_id" yaml:"user_id"`       // 用户 ID
-	ChatID    string `json:"chat_id" yaml:"chat_id"`       // 群组/频道 ID
-	AgentName string `json:"agent_name" yaml:"agent_name"` // 目标 Agent 名称
-	Priority  int    `json:"priority" yaml:"priority"`     // 优先级（数字越大越优先）
+	ID         int    `json:"id" yaml:"-"`                    // 持久化 ID（仅 DB 使用）
+	Platform   string `json:"platform" yaml:"platform"`       // 消息平台（如 telegram, feishu, api）
+	InstanceID string `json:"instance_id" yaml:"instance_id"` // 平台实例标识（如 feishu-support）
+	UserID     string `json:"user_id" yaml:"user_id"`         // 用户 ID
+	ChatID     string `json:"chat_id" yaml:"chat_id"`         // 群组/频道 ID
+	AgentName  string `json:"agent_name" yaml:"agent_name"`   // 目标 Agent 名称
+	Priority   int    `json:"priority" yaml:"priority"`       // 优先级（数字越大越优先）
 }
 
 // RoutingResult 路由结果
@@ -63,20 +65,23 @@ type RoutingResult struct {
 
 // RouteRequest 路由请求
 type RouteRequest struct {
-	Platform string // 消息平台
-	UserID   string // 用户 ID
-	ChatID   string // 群组/频道 ID
+	Platform   string // 消息平台
+	InstanceID string // 平台实例标识
+	UserID     string // 用户 ID
+	ChatID     string // 群组/频道 ID
 }
 
 // Dispatcher 多 Agent 路由器
 //
 // 管理多个 Agent 实例，根据规则将消息路由到对应 Agent。
 // 线程安全，支持动态添加/删除 Agent 和规则。
+// 可选挂载 LLMClassifier 实现语义路由 fallback。
 type Dispatcher struct {
 	mu           sync.RWMutex
 	agents       map[string]*AgentConfig // name -> config
 	rules        []Rule                  // 路由规则列表
 	defaultAgent string                  // 默认 Agent 名称
+	classifier   *LLMClassifier          // 可选：LLM 语义分类器
 }
 
 // New 创建路由器
@@ -185,6 +190,45 @@ func (r *Dispatcher) RemoveRules(agentName string) {
 	r.rules = filtered
 }
 
+// RemoveRule 删除指定 ID 的单条规则
+func (r *Dispatcher) RemoveRule(id int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for i, rule := range r.rules {
+		if rule.ID == id {
+			r.rules = append(r.rules[:i], r.rules[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("规则 ID=%d 不存在", id)
+}
+
+// LoadAll 批量加载 Agent 和规则（启动时从持久化层恢复）
+func (r *Dispatcher) LoadAll(agents []AgentConfig, defaultAgent string, rules []Rule) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.agents = make(map[string]*AgentConfig, len(agents))
+	for i := range agents {
+		a := agents[i]
+		r.agents[a.Name] = &a
+	}
+	r.rules = rules
+	if defaultAgent != "" {
+		if _, ok := r.agents[defaultAgent]; ok {
+			r.defaultAgent = defaultAgent
+		}
+	}
+	if r.defaultAgent == "" && len(r.agents) > 0 {
+		for n := range r.agents {
+			r.defaultAgent = n
+			break
+		}
+	}
+	log.Printf("Agent 路由已加载: %d 个 Agent, %d 条规则, 默认=%s", len(r.agents), len(r.rules), r.defaultAgent)
+}
+
 // Route 路由消息到对应 Agent
 //
 // 按规则优先级匹配：
@@ -194,29 +238,13 @@ func (r *Dispatcher) RemoveRules(agentName string) {
 //  4. 平台匹配（Platform 匹配）
 //  5. 默认 Agent
 func (r *Dispatcher) Route(req RouteRequest) *RoutingResult {
+	ruleResult := r.routeRulesOnly(req)
+	if ruleResult != nil {
+		return ruleResult
+	}
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-
-	var bestRule *Rule
-	bestScore := -1
-
-	for i := range r.rules {
-		rule := &r.rules[i]
-		score := r.matchScore(rule, req)
-		if score > bestScore {
-			bestScore = score
-			bestRule = rule
-		}
-	}
-
-	if bestRule != nil {
-		cfg := r.agents[bestRule.AgentName]
-		return &RoutingResult{
-			AgentName:   bestRule.AgentName,
-			AgentConfig: cfg,
-			Rule:        bestRule,
-		}
-	}
 
 	// 使用默认 Agent
 	if r.defaultAgent != "" {
@@ -230,11 +258,44 @@ func (r *Dispatcher) Route(req RouteRequest) *RoutingResult {
 	return nil
 }
 
+// routeRulesOnly 仅匹配显式规则，不包含默认 Agent。
+func (r *Dispatcher) routeRulesOnly(req RouteRequest) *RoutingResult {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.routeRulesOnlyLocked(req)
+}
+
+func (r *Dispatcher) routeRulesOnlyLocked(req RouteRequest) *RoutingResult {
+	var bestRule *Rule
+	bestScore := -1
+
+	for i := range r.rules {
+		rule := &r.rules[i]
+		score := r.matchScore(rule, req)
+		if score > bestScore {
+			bestScore = score
+			bestRule = rule
+		}
+	}
+
+	if bestRule == nil {
+		return nil
+	}
+
+	cfg := r.agents[bestRule.AgentName]
+	return &RoutingResult{
+		AgentName:   bestRule.AgentName,
+		AgentConfig: cfg,
+		Rule:        bestRule,
+	}
+}
+
 // matchScore 计算规则匹配得分
 //
 // 得分规则：
 //   - UserID 匹配: +100
 //   - ChatID 匹配: +50
+//   - InstanceID 匹配: +25
 //   - Platform 匹配: +10
 //   - Priority 加成: +priority
 //   - 不匹配: -1
@@ -247,13 +308,22 @@ func (r *Dispatcher) matchScore(rule *Rule, req RouteRequest) int {
 			score += 100
 			matched = true
 		} else {
-			return -1 // UserID 不匹配，规则不适用
+			return -1
 		}
 	}
 
 	if rule.ChatID != "" {
 		if rule.ChatID == req.ChatID {
 			score += 50
+			matched = true
+		} else {
+			return -1
+		}
+	}
+
+	if rule.InstanceID != "" {
+		if rule.InstanceID == req.InstanceID {
+			score += 25
 			matched = true
 		} else {
 			return -1
@@ -270,7 +340,7 @@ func (r *Dispatcher) matchScore(rule *Rule, req RouteRequest) int {
 	}
 
 	if !matched {
-		return -1 // 空规则不匹配
+		return -1
 	}
 
 	score += rule.Priority
@@ -308,39 +378,11 @@ func (r *Dispatcher) UpdateAgent(cfg AgentConfig) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	existing, ok := r.agents[cfg.Name]
-	if !ok {
+	if _, ok := r.agents[cfg.Name]; !ok {
 		return fmt.Errorf("agent %q 未注册", cfg.Name)
 	}
-
-	// 只更新非空字段
-	if cfg.DisplayName != "" {
-		existing.DisplayName = cfg.DisplayName
-	}
-	if cfg.Description != "" {
-		existing.Description = cfg.Description
-	}
-	if cfg.Model != "" {
-		existing.Model = cfg.Model
-	}
-	if cfg.Provider != "" {
-		existing.Provider = cfg.Provider
-	}
-	if cfg.SystemPrompt != "" {
-		existing.SystemPrompt = cfg.SystemPrompt
-	}
-	if cfg.Skills != nil {
-		existing.Skills = cfg.Skills
-	}
-	if cfg.MaxTokens > 0 {
-		existing.MaxTokens = cfg.MaxTokens
-	}
-	if cfg.Temperature > 0 {
-		existing.Temperature = cfg.Temperature
-	}
-	if cfg.Metadata != nil {
-		existing.Metadata = cfg.Metadata
-	}
+	updated := cfg
+	r.agents[cfg.Name] = &updated
 
 	log.Printf("Agent 已更新: %s", cfg.Name)
 	return nil

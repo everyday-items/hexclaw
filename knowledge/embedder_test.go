@@ -3,16 +3,18 @@ package knowledge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
-	"net/http/httptest"
 	"testing"
+
+	"github.com/hexagon-codes/hexclaw/internal/testutil/httpmock"
 )
 
 // TestNewOpenAIEmbedder_DefaultDimensions 测试不同模型的默认维度
 func TestNewOpenAIEmbedder_DefaultDimensions(t *testing.T) {
 	tests := []struct {
-		model     string
-		wantDim   int
+		model   string
+		wantDim int
 	}{
 		{"text-embedding-3-small", 1536},
 		{"text-embedding-3-large", 3072},
@@ -63,48 +65,46 @@ func TestNewOpenAIEmbedder_WithHTTPClient(t *testing.T) {
 // TestOpenAIEmbedder_Embed_Success 测试正常的 Embedding 调用
 func TestOpenAIEmbedder_Embed_Success(t *testing.T) {
 	// 模拟 OpenAI API 返回
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 验证请求
-		if r.Method != "POST" {
-			t.Errorf("Method = %q, want POST", r.Method)
-		}
-		if r.URL.Path != "/embeddings" {
-			t.Errorf("Path = %q, want /embeddings", r.URL.Path)
-		}
-		if r.Header.Get("Authorization") != "Bearer test-key" {
-			t.Errorf("Authorization = %q, want %q", r.Header.Get("Authorization"), "Bearer test-key")
-		}
-		if r.Header.Get("Content-Type") != "application/json" {
-			t.Errorf("Content-Type = %q, want application/json", r.Header.Get("Content-Type"))
-		}
-
-		// 解析请求体
-		var req embeddingRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("解析请求体失败: %v", err)
-		}
-		if req.Model != "text-embedding-3-small" {
-			t.Errorf("Model = %q, want text-embedding-3-small", req.Model)
-		}
-		if len(req.Input) != 2 {
-			t.Errorf("Input len = %d, want 2", len(req.Input))
-		}
-
-		// 返回模拟响应（故意乱序返回以测试 index 排序）
-		resp := embeddingResponse{
-			Data: []embeddingData{
-				{Index: 1, Embedding: []float32{0.4, 0.5, 0.6}},
-				{Index: 0, Embedding: []float32{0.1, 0.2, 0.3}},
-			},
-			Model: "text-embedding-3-small",
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	}))
-	defer server.Close()
-
 	e := NewOpenAIEmbedder("test-key", "text-embedding-3-small",
-		WithBaseURL(server.URL),
+		WithBaseURL("https://embedder.test"),
+		WithHTTPClient(httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 验证请求
+			if r.Method != "POST" {
+				t.Errorf("Method = %q, want POST", r.Method)
+			}
+			if r.URL.Path != "/embeddings" {
+				t.Errorf("Path = %q, want /embeddings", r.URL.Path)
+			}
+			if r.Header.Get("Authorization") != "Bearer test-key" {
+				t.Errorf("Authorization = %q, want %q", r.Header.Get("Authorization"), "Bearer test-key")
+			}
+			if r.Header.Get("Content-Type") != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json", r.Header.Get("Content-Type"))
+			}
+
+			// 解析请求体
+			var req embeddingRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("解析请求体失败: %v", err)
+			}
+			if req.Model != "text-embedding-3-small" {
+				t.Errorf("Model = %q, want text-embedding-3-small", req.Model)
+			}
+			if len(req.Input) != 2 {
+				t.Errorf("Input len = %d, want 2", len(req.Input))
+			}
+
+			// 返回模拟响应（故意乱序返回以测试 index 排序）
+			resp := embeddingResponse{
+				Data: []embeddingData{
+					{Index: 1, Embedding: []float32{0.4, 0.5, 0.6}},
+					{Index: 0, Embedding: []float32{0.1, 0.2, 0.3}},
+				},
+				Model: "text-embedding-3-small",
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))),
 	)
 
 	vectors, err := e.Embed(context.Background(), []string{"hello", "world"})
@@ -148,13 +148,13 @@ func TestOpenAIEmbedder_Embed_EmptyInput(t *testing.T) {
 
 // TestOpenAIEmbedder_Embed_APIError 测试 API 返回非 200 状态码
 func TestOpenAIEmbedder_Embed_APIError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
-		w.Write([]byte(`{"error": {"message": "Rate limit exceeded"}}`))
-	}))
-	defer server.Close()
-
-	e := NewOpenAIEmbedder("test-key", "test-model", WithBaseURL(server.URL))
+	e := NewOpenAIEmbedder("test-key", "test-model",
+		WithBaseURL("https://embedder.test"),
+		WithHTTPClient(httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error": {"message": "Rate limit exceeded"}}`))
+		}))),
+	)
 
 	_, err := e.Embed(context.Background(), []string{"test"})
 	if err == nil {
@@ -173,13 +173,15 @@ func TestOpenAIEmbedder_Embed_APIError(t *testing.T) {
 
 // TestOpenAIEmbedder_Embed_ContextCanceled 测试上下文取消
 func TestOpenAIEmbedder_Embed_ContextCanceled(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 不响应，让客户端超时
-		<-r.Context().Done()
-	}))
-	defer server.Close()
-
-	e := NewOpenAIEmbedder("test-key", "test-model", WithBaseURL(server.URL))
+	e := NewOpenAIEmbedder("test-key", "test-model",
+		WithBaseURL("https://embedder.test"),
+		WithHTTPClient(&http.Client{
+			Transport: httpmock.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			}),
+		}),
+	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 立即取消
@@ -188,17 +190,20 @@ func TestOpenAIEmbedder_Embed_ContextCanceled(t *testing.T) {
 	if err == nil {
 		t.Fatal("Embed() expected error for canceled context, got nil")
 	}
+	if !errors.Is(err, context.Canceled) && !contains(err.Error(), "canceled") {
+		t.Fatalf("Embed() error = %v, want context canceled", err)
+	}
 }
 
 // TestOpenAIEmbedder_Embed_InvalidJSON 测试 API 返回无效 JSON
 func TestOpenAIEmbedder_Embed_InvalidJSON(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{invalid json`))
-	}))
-	defer server.Close()
-
-	e := NewOpenAIEmbedder("test-key", "test-model", WithBaseURL(server.URL))
+	e := NewOpenAIEmbedder("test-key", "test-model",
+		WithBaseURL("https://embedder.test"),
+		WithHTTPClient(httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{invalid json`))
+		}))),
+	)
 
 	_, err := e.Embed(context.Background(), []string{"test"})
 	if err == nil {

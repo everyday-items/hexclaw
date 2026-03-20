@@ -14,12 +14,14 @@ type DefaultRegistry struct {
 	mu     sync.RWMutex
 	skills map[string]Skill
 	order  []string // 保持注册顺序，用于确定性的 Match 遍历
+	enabled map[string]bool
 }
 
 // NewRegistry 创建 Skill 注册中心
 func NewRegistry() *DefaultRegistry {
 	return &DefaultRegistry{
 		skills: make(map[string]Skill),
+		enabled: make(map[string]bool),
 	}
 }
 
@@ -36,6 +38,7 @@ func (r *DefaultRegistry) Register(skill Skill) error {
 
 	r.skills[name] = skill
 	r.order = append(r.order, name)
+	r.enabled[name] = true
 	return nil
 }
 
@@ -57,6 +60,9 @@ func (r *DefaultRegistry) Match(msg *adapter.Message) (Skill, bool) {
 
 	for _, name := range r.order {
 		s := r.skills[name]
+		if !r.enabled[name] {
+			continue
+		}
 		if s.Match(msg.Content) {
 			return s, true
 		}
@@ -74,4 +80,31 @@ func (r *DefaultRegistry) All() []Skill {
 		result = append(result, r.skills[name])
 	}
 	return result
+}
+
+// SetEnabled 设置技能的运行时启用状态。
+func (r *DefaultRegistry) SetEnabled(name string, enabled bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, ok := r.skills[name]; !ok {
+		return fmt.Errorf("skill %q 未注册", name)
+	}
+	r.enabled[name] = enabled
+	return nil
+}
+
+// IsEnabled 返回技能的运行时启用状态。
+func (r *DefaultRegistry) IsEnabled(name string) (bool, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if _, ok := r.skills[name]; !ok {
+		return false, false
+	}
+	enabled, ok := r.enabled[name]
+	if !ok {
+		return true, true
+	}
+	return enabled, true
 }

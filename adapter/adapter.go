@@ -11,6 +11,7 @@ package adapter
 
 import (
 	"context"
+	"net/http"
 	"time"
 )
 
@@ -39,28 +40,40 @@ const (
 // 所有平台的消息都被转换为此格式，引擎层只处理 Message。
 // 适配器负责将平台特定格式与 Message 互相转换。
 type Message struct {
-	ID        string            // 消息唯一 ID
-	Platform  Platform          // 来源平台
-	ChatID    string            // 会话 ID（平台维度，如飞书群 ID）
-	UserID    string            // 用户 ID（平台内唯一）
-	UserName  string            // 用户名（展示用）
-	SessionID string            // HexClaw 会话 ID（跨平台统一）
-	Content   string            // 消息文本内容
-	ReplyTo   string            // 引用的消息 ID（可选）
-	Metadata  map[string]string // 平台特定的元数据
-	Timestamp time.Time         // 消息时间
+	ID         string            // 消息唯一 ID
+	Platform   Platform          // 来源平台
+	InstanceID string            // 平台实例标识（如 "feishu-support"），支持同平台多实例
+	ChatID     string            // 会话 ID（平台维度，如飞书群 ID）
+	UserID     string            // 用户 ID（平台内唯一）
+	UserName   string            // 用户名（展示用）
+	SessionID  string            // HexClaw 会话 ID（跨平台统一）
+	Content    string            // 消息文本内容
+	ReplyTo    string            // 引用的消息 ID（可选）
+	Metadata   map[string]string // 平台特定的元数据
+	Timestamp  time.Time         // 消息时间
 }
 
 // Usage Token 使用统计
 //
 // 记录单次请求的 Token 消耗和费用信息。
 type Usage struct {
-	InputTokens  int     `json:"input_tokens"`            // 输入 Token 数
-	OutputTokens int     `json:"output_tokens"`           // 输出 Token 数
-	TotalTokens  int     `json:"total_tokens"`            // 总 Token 数
-	Provider     string  `json:"provider"`                // LLM Provider 名称
-	Model        string  `json:"model"`                   // 模型名称
-	Cost         float64 `json:"cost,omitempty"`          // 费用（美元）
+	InputTokens  int     `json:"input_tokens"`   // 输入 Token 数
+	OutputTokens int     `json:"output_tokens"`  // 输出 Token 数
+	TotalTokens  int     `json:"total_tokens"`   // 总 Token 数
+	Provider     string  `json:"provider"`       // LLM Provider 名称
+	Model        string  `json:"model"`          // 模型名称
+	Cost         float64 `json:"cost,omitempty"` // 费用（美元）
+}
+
+// ToolCall 工具/技能调用记录
+//
+// 记录 Agent 在处理过程中调用的工具，
+// 让前端可以结构化展示工具调用链。
+type ToolCall struct {
+	ID        string `json:"id"`                  // 调用 ID
+	Name      string `json:"name"`                // 工具/技能名称
+	Arguments string `json:"arguments"`           // 调用参数（JSON 字符串）
+	Result    string `json:"result,omitempty"`     // 调用结果
 }
 
 // Reply 同步回复
@@ -68,20 +81,22 @@ type Usage struct {
 // 引擎处理完消息后返回的完整回复。
 // 适用于非流式场景。
 type Reply struct {
-	Content  string            // 回复文本内容
-	Metadata map[string]string // 附加元数据（如工具调用结果、引用来源等）
-	Usage    *Usage            // Token 使用统计（可选）
+	Content   string            // 回复文本内容
+	Metadata  map[string]string // 附加元数据（如工具调用结果、引用来源等）
+	Usage     *Usage            // Token 使用统计（可选）
+	ToolCalls []ToolCall        // 工具调用记录（可选）
 }
 
 // ReplyChunk 流式回复片段
 //
 // 用于流式输出场景，引擎通过 channel 逐块发送回复。
-// Done=true 表示流式输出结束，此时 Usage 字段包含本次请求的 Token 统计。
+// Done=true 表示流式输出结束，此时 Usage 和 ToolCalls 字段可被填充。
 type ReplyChunk struct {
-	Content string // 当前片段的文本内容（增量）
-	Done    bool   // 是否为最后一个片段
-	Error   error  // 出错时的错误信息
-	Usage   *Usage // Token 使用统计（仅在 Done=true 时填充）
+	Content   string     // 当前片段的文本内容（增量）
+	Done      bool       // 是否为最后一个片段
+	Error     error      // 出错时的错误信息
+	Usage     *Usage     // Token 使用统计（仅在 Done=true 时填充）
+	ToolCalls []ToolCall // 工具调用记录（仅在 Done=true 时填充）
 }
 
 // MessageHandler 消息处理回调（同步模式）
@@ -119,4 +134,15 @@ type Adapter interface {
 	// 从 chunks channel 读取并逐块发送给用户
 	// 实现"打字机效果"：飞书/Telegram 通过"发送+编辑"，Web 通过 WebSocket 推送
 	SendStream(ctx context.Context, chatID string, chunks <-chan *ReplyChunk) error
+}
+
+// WebhookAdapter 表示可挂载到统一 HTTP ingress 的适配器。
+type WebhookAdapter interface {
+	Adapter
+
+	// Attach 注册统一消息处理回调，但不自行启动 HTTP 服务器。
+	Attach(handler MessageHandler) error
+
+	// Handler 返回统一 ingress 下使用的处理器。
+	Handler() http.Handler
 }

@@ -112,10 +112,11 @@ func (a *WebAdapter) SendStream(ctx context.Context, chatID string, chunks <-cha
 		}
 
 		msg := wsMessage{
-			Type:    "chunk",
-			Content: chunk.Content,
-			Done:    chunk.Done,
-			Usage:   chunk.Usage,
+			Type:      "chunk",
+			Content:   chunk.Content,
+			Done:      chunk.Done,
+			Usage:     chunk.Usage,
+			ToolCalls: chunk.ToolCalls,
 		}
 		if err := wsjson.Write(ctx, conn, msg); err != nil {
 			return err
@@ -167,9 +168,10 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 
 		// 构建统一消息
 		msg := &adapter.Message{
-			ID:        "web-" + idgen.ShortID(),
-			Platform:  adapter.PlatformWeb,
-			ChatID:    chatID,
+			ID:         "web-" + idgen.ShortID(),
+			Platform:   adapter.PlatformWeb,
+			InstanceID: a.Name(),
+			ChatID:     chatID,
 			UserID:    "web-user",
 			UserName:  "Web User",
 			SessionID: incoming.SessionID,
@@ -234,11 +236,12 @@ func (a *WebAdapter) getConn(chatID string) (*websocket.Conn, bool) {
 
 // wsMessage WebSocket 消息格式
 type wsMessage struct {
-	Type      string         `json:"type"`                 // message / reply / chunk / error
-	Content   string         `json:"content"`              // 消息内容
-	SessionID string         `json:"session_id,omitempty"`  // 会话 ID
-	Done      bool           `json:"done,omitempty"`        // 流式输出是否结束
-	Usage     *adapter.Usage `json:"usage,omitempty"`       // Token 使用统计（仅在 done=true 时）
+	Type      string              `json:"type"`                 // message / reply / chunk / error
+	Content   string              `json:"content"`              // 消息内容
+	SessionID string              `json:"session_id,omitempty"` // 会话 ID
+	Done      bool                `json:"done,omitempty"`       // 流式输出是否结束
+	Usage     *adapter.Usage      `json:"usage,omitempty"`      // Token 使用统计（仅在 done=true 时）
+	ToolCalls []adapter.ToolCall  `json:"tool_calls,omitempty"` // 工具调用记录（仅在 done=true 时）
 }
 
 // MarshalJSON 自定义序列化（省略空字段）
