@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/instances"
 )
 
@@ -160,8 +161,8 @@ func (s *Server) handleTestInstance(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTestChannelConfig(w http.ResponseWriter, r *http.Request) {
 	provider := r.PathValue("provider")
-	var cfg map[string]any
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&cfg); err != nil {
+	var raw json.RawMessage
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&raw); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
 		return
 	}
@@ -169,15 +170,41 @@ func (s *Server) handleTestChannelConfig(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider 不能为空"})
 		return
 	}
-	if len(cfg) == 0 {
+	if len(raw) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "配置不能为空"})
 		return
+	}
+
+	inst := &instances.Instance{
+		Provider: provider,
+		Name:     "__test__",
+		Config:   raw,
+	}
+	adp, err := instances.BuildAdapter(inst)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success":  false,
+			"provider": provider,
+			"message":  "配置解析失败: " + err.Error(),
+		})
+		return
+	}
+
+	if hc, ok := adp.(adapter.HealthChecker); ok {
+		if err := hc.Health(r.Context()); err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"success":  false,
+				"provider": provider,
+				"message":  err.Error(),
+			})
+			return
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":  true,
 		"provider": provider,
-		"message":  "配置结构校验通过",
+		"message":  "配置校验通过",
 	})
 }
 

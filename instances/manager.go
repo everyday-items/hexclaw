@@ -265,7 +265,7 @@ func (m *Manager) Start(ctx context.Context, name string) error {
 		return fmt.Errorf("instance message handler 未设置")
 	}
 
-	adp, err := buildAdapter(inst)
+	adp, err := BuildAdapter(inst)
 	if err != nil {
 		_ = m.setStatus(ctx, name, StatusError, err.Error())
 		return err
@@ -534,7 +534,7 @@ func instancesFromConfig(cfg *config.Config) ([]Instance, error) {
 	return out, nil
 }
 
-func buildAdapter(inst *Instance) (adapter.Adapter, error) {
+func BuildAdapter(inst *Instance) (adapter.Adapter, error) {
 	switch inst.Provider {
 	case "feishu":
 		var cfg config.FeishuConfig

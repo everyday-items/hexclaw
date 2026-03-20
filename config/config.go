@@ -358,67 +358,67 @@ func (p PlatformsConfig) MarshalJSON() ([]byte, error) {
 
 // TelegramConfig Telegram 配置
 type TelegramConfig struct {
-	Name    string `yaml:"name"`
-	Enabled bool   `yaml:"enabled"`
-	Token   string `yaml:"token"`
+	Name    string `yaml:"name" json:"name,omitempty"`
+	Enabled bool   `yaml:"enabled" json:"enabled,omitempty"`
+	Token   string `yaml:"token" json:"token"`
 }
 
 // DiscordConfig Discord 配置
 type DiscordConfig struct {
-	Name    string `yaml:"name"`
-	Enabled bool   `yaml:"enabled"`
-	Token   string `yaml:"token"`
+	Name    string `yaml:"name" json:"name,omitempty"`
+	Enabled bool   `yaml:"enabled" json:"enabled,omitempty"`
+	Token   string `yaml:"token" json:"token"`
 }
 
 // SlackConfig Slack 配置
 type SlackConfig struct {
-	Name          string `yaml:"name"`
-	Enabled       bool   `yaml:"enabled"`
-	WebhookPort   int    `yaml:"webhook_port"`
-	Token         string `yaml:"token"`
-	SigningSecret string `yaml:"signing_secret"`
+	Name          string `yaml:"name" json:"name,omitempty"`
+	Enabled       bool   `yaml:"enabled" json:"enabled,omitempty"`
+	WebhookPort   int    `yaml:"webhook_port" json:"webhook_port,omitempty"`
+	Token         string `yaml:"token" json:"token"`
+	SigningSecret string `yaml:"signing_secret" json:"signing_secret"`
 }
 
 // FeishuConfig 飞书配置
 type FeishuConfig struct {
-	Name              string `yaml:"name"`
-	Enabled           bool   `yaml:"enabled"`
-	WebhookPort       int    `yaml:"webhook_port"`
-	AppID             string `yaml:"app_id"`
-	AppSecret         string `yaml:"app_secret"`
-	VerificationToken string `yaml:"verification_token"`
+	Name              string `yaml:"name" json:"name,omitempty"`
+	Enabled           bool   `yaml:"enabled" json:"enabled,omitempty"`
+	WebhookPort       int    `yaml:"webhook_port" json:"webhook_port,omitempty"`
+	AppID             string `yaml:"app_id" json:"app_id"`
+	AppSecret         string `yaml:"app_secret" json:"app_secret"`
+	VerificationToken string `yaml:"verification_token" json:"verification_token,omitempty"`
 }
 
 // DingtalkConfig 钉钉配置
 type DingtalkConfig struct {
-	Name        string `yaml:"name"`
-	Enabled     bool   `yaml:"enabled"`
-	WebhookPort int    `yaml:"webhook_port"`
-	AppKey      string `yaml:"app_key"`
-	AppSecret   string `yaml:"app_secret"`
-	RobotCode   string `yaml:"robot_code"`
+	Name        string `yaml:"name" json:"name,omitempty"`
+	Enabled     bool   `yaml:"enabled" json:"enabled,omitempty"`
+	WebhookPort int    `yaml:"webhook_port" json:"webhook_port,omitempty"`
+	AppKey      string `yaml:"app_key" json:"app_key"`
+	AppSecret   string `yaml:"app_secret" json:"app_secret"`
+	RobotCode   string `yaml:"robot_code" json:"robot_code"`
 }
 
 // WechatConfig 微信配置
 type WechatConfig struct {
-	Name      string `yaml:"name"`
-	Enabled   bool   `yaml:"enabled"`
-	AppID     string `yaml:"app_id"`
-	AppSecret string `yaml:"app_secret"`
-	Token     string `yaml:"token"`
-	AESKey    string `yaml:"aes_key"`
+	Name      string `yaml:"name" json:"name,omitempty"`
+	Enabled   bool   `yaml:"enabled" json:"enabled,omitempty"`
+	AppID     string `yaml:"app_id" json:"app_id"`
+	AppSecret string `yaml:"app_secret" json:"app_secret"`
+	Token     string `yaml:"token" json:"token"`
+	AESKey    string `yaml:"aes_key" json:"aes_key"`
 }
 
 // WecomConfig 企业微信配置
 type WecomConfig struct {
-	Name        string `yaml:"name"`
-	Enabled     bool   `yaml:"enabled"`
-	WebhookPort int    `yaml:"webhook_port"`
-	CorpID      string `yaml:"corp_id"`
-	AgentID     string `yaml:"agent_id"`
-	Secret      string `yaml:"secret"`
-	Token       string `yaml:"token"`
-	AESKey      string `yaml:"aes_key"`
+	Name        string `yaml:"name" json:"name,omitempty"`
+	Enabled     bool   `yaml:"enabled" json:"enabled,omitempty"`
+	WebhookPort int    `yaml:"webhook_port" json:"webhook_port,omitempty"`
+	CorpID      string `yaml:"corp_id" json:"corp_id"`
+	AgentID     string `yaml:"agent_id" json:"agent_id"`
+	Secret      string `yaml:"secret" json:"secret"`
+	Token       string `yaml:"token" json:"token"`
+	AESKey      string `yaml:"aes_key" json:"aes_key"`
 }
 
 // WebConfig Web UI 配置
@@ -428,28 +428,28 @@ type WebConfig struct {
 
 // WhatsAppConfig WhatsApp Business API 配置
 type WhatsAppConfig struct {
-	Name        string `yaml:"name"`
-	Enabled     bool   `yaml:"enabled"`
-	Token       string `yaml:"token"`        // Cloud API Token
-	PhoneID     string `yaml:"phone_id"`     // 电话号码 ID
-	VerifyToken string `yaml:"verify_token"` // Webhook 验证 Token
+	Name        string `yaml:"name" json:"name,omitempty"`
+	Enabled     bool   `yaml:"enabled" json:"enabled,omitempty"`
+	Token       string `yaml:"token" json:"token"`
+	PhoneID     string `yaml:"phone_id" json:"phone_id"`
+	VerifyToken string `yaml:"verify_token" json:"verify_token,omitempty"`
 }
 
 // LINEConfig LINE Messaging API 配置
 type LINEConfig struct {
-	Name          string `yaml:"name"`
-	Enabled       bool   `yaml:"enabled"`
-	ChannelSecret string `yaml:"channel_secret"` // Channel Secret
-	ChannelToken  string `yaml:"channel_token"`  // Channel Access Token
+	Name          string `yaml:"name" json:"name,omitempty"`
+	Enabled       bool   `yaml:"enabled" json:"enabled,omitempty"`
+	ChannelSecret string `yaml:"channel_secret" json:"channel_secret"`
+	ChannelToken  string `yaml:"channel_token" json:"channel_token"`
 }
 
 // MatrixConfig Matrix 协议配置
 type MatrixConfig struct {
-	Name          string `yaml:"name"`
-	Enabled       bool   `yaml:"enabled"`
-	HomeserverURL string `yaml:"homeserver_url"` // Homeserver URL
-	AccessToken   string `yaml:"access_token"`   // Bot Access Token
-	UserID        string `yaml:"user_id"`        // Bot User ID
+	Name          string `yaml:"name" json:"name,omitempty"`
+	Enabled       bool   `yaml:"enabled" json:"enabled,omitempty"`
+	HomeserverURL string `yaml:"homeserver_url" json:"homeserver_url"`
+	AccessToken   string `yaml:"access_token" json:"access_token"`
+	UserID        string `yaml:"user_id" json:"user_id"`
 }
 
 // SecurityConfig 安全配置
