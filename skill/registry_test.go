@@ -95,3 +95,23 @@ func TestRegistry_All(t *testing.T) {
 		t.Error("Skill 顺序不正确")
 	}
 }
+
+func TestRegistry_Unregister(t *testing.T) {
+	reg := NewRegistry()
+	_ = reg.Register(&mockSkill{name: "a", desc: "A", prefix: "/a"})
+	_ = reg.Register(&mockSkill{name: "b", desc: "B", prefix: "/b"})
+
+	if err := reg.Unregister("a"); err != nil {
+		t.Fatalf("Unregister: %v", err)
+	}
+	if _, ok := reg.Get("a"); ok {
+		t.Fatal("a 应已移除")
+	}
+	all := reg.All()
+	if len(all) != 1 || all[0].Name() != "b" {
+		t.Fatalf("期望仅剩 b，得到 %v", all)
+	}
+	if err := reg.Unregister("a"); err == nil {
+		t.Error("重复 Unregister 应报错")
+	}
+}

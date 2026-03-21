@@ -42,6 +42,26 @@ func (r *DefaultRegistry) Register(skill Skill) error {
 	return nil
 }
 
+// Unregister 移除已注册的 Skill（用于技能市场卸载或同步）
+func (r *DefaultRegistry) Unregister(name string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, ok := r.skills[name]; !ok {
+		return fmt.Errorf("skill %q 未注册", name)
+	}
+	delete(r.skills, name)
+	delete(r.enabled, name)
+	newOrder := make([]string, 0, len(r.order))
+	for _, n := range r.order {
+		if n != name {
+			newOrder = append(newOrder, n)
+		}
+	}
+	r.order = newOrder
+	return nil
+}
+
 // Get 按名称获取 Skill
 func (r *DefaultRegistry) Get(name string) (Skill, bool) {
 	r.mu.RLock()

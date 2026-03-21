@@ -1,6 +1,6 @@
 // Package hub 提供 HexClaw 在线技能市场
 //
-// 从远程 Git 仓库（默认 ClawHub）获取技能目录，
+// 从远程 Git 仓库（默认 hexagon-codes/hexclaw-hub）获取技能目录，
 // 支持搜索、浏览、安装和卸载技能。
 package hub
 
@@ -22,7 +22,7 @@ import (
 // HubConfig 技能市场配置
 type HubConfig struct {
 	Enabled bool   `yaml:"enabled"`
-	RepoURL string `yaml:"repo_url"` // 默认: https://github.com/hexagon-codes/clawhub
+	RepoURL string `yaml:"repo_url"` // 默认: https://github.com/hexagon-codes/hexclaw-hub
 	Branch  string `yaml:"branch"`   // 默认: main
 }
 
@@ -59,7 +59,7 @@ type Hub struct {
 // New 创建技能市场客户端
 func New(cfg HubConfig, skillsDir string) *Hub {
 	if cfg.RepoURL == "" {
-		cfg.RepoURL = "https://github.com/hexagon-codes/clawhub"
+		cfg.RepoURL = "https://github.com/hexagon-codes/hexclaw-hub"
 	}
 	if cfg.Branch == "" {
 		cfg.Branch = "main"

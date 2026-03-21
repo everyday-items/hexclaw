@@ -457,6 +457,30 @@ func (a *DiscordAdapter) editMessage(ctx context.Context, channelID, messageID, 
 	return nil
 }
 
+// ValidateConfig validates credentials by calling /users/@me.
+func (a *DiscordAdapter) ValidateConfig(ctx context.Context) error {
+	if a.cfg.Token == "" {
+		return fmt.Errorf("discord bot token 未配置")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiBase+"/users/@me", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bot "+a.cfg.Token)
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("discord /users/@me 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("discord token 验证失败 (%d): %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 // Health 返回当前连接健康状态。
 func (a *DiscordAdapter) Health(_ context.Context) error {
 	if a.cfg.Token == "" {

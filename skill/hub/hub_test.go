@@ -137,11 +137,11 @@ func TestHubInstallNotFound(t *testing.T) {
 
 func TestCatalogURL(t *testing.T) {
 	h := New(HubConfig{
-		RepoURL: "https://github.com/hexagon-codes/clawhub",
+		RepoURL: "https://github.com/hexagon-codes/hexclaw-hub",
 		Branch:  "main",
 	}, "")
 
-	expected := "https://raw.githubusercontent.com/hexagon-codes/clawhub/main/index.json"
+	expected := "https://raw.githubusercontent.com/hexagon-codes/hexclaw-hub/main/index.json"
 	if got := h.catalogURL(); got != expected {
 		t.Errorf("catalogURL 不匹配:\n期望: %s\n得到: %s", expected, got)
 	}

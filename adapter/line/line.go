@@ -274,6 +274,33 @@ func (a *LineAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ValidateConfig validates credentials by fetching bot profile.
+func (a *LineAdapter) ValidateConfig(ctx context.Context) error {
+	if a.config.ChannelSecret == "" {
+		return fmt.Errorf("line channel_secret 未配置")
+	}
+	if a.config.ChannelToken == "" {
+		return fmt.Errorf("line channel_token 未配置")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.line.me/v2/bot/info", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.config.ChannelToken)
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("line bot info 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("line token 验证失败 (%d): %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 // Health 返回适配器健康状态。
 func (a *LineAdapter) Health(_ context.Context) error {
 	if a.handler == nil {

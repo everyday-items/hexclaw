@@ -190,17 +190,11 @@ func (s *Server) handleTestChannelConfig(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Only use ConfigValidator for pre-save testing. Never call Health()
+	// on a freshly built adapter because it hasn't been Start()-ed
+	// (handler is nil, connections not established, etc.).
 	if cv, ok := adp.(adapter.ConfigValidator); ok {
 		if err := cv.ValidateConfig(r.Context()); err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"success":  false,
-				"provider": provider,
-				"message":  err.Error(),
-			})
-			return
-		}
-	} else if hc, ok := adp.(adapter.HealthChecker); ok {
-		if err := hc.Health(r.Context()); err != nil {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"success":  false,
 				"provider": provider,

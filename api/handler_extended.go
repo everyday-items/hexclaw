@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/skill/hub"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -514,5 +515,52 @@ func (s *Server) handleGetWorkflowRun(w http.ResponseWriter, r *http.Request) {
 // ─── ClawHub: GET /api/v1/clawhub/search ──
 
 func (s *Server) handleClawHubSearch(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"skills": []any{}, "total": 0, "source": "clawhub"})
+	if s.skillHub == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"skills": []any{}, "total": 0, "source": "clawhub"})
+		return
+	}
+
+	if s.skillHub.GetCatalog() == nil {
+		if err := s.skillHub.Refresh(r.Context()); err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"skills": []any{},
+				"total":  0,
+				"source": "clawhub",
+				"error":  "获取目录失败: " + err.Error(),
+			})
+			return
+		}
+	}
+
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	category := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("category")))
+	var skills []hub.SkillMeta
+	if query != "" {
+		skills = s.skillHub.Search(query)
+		if category != "" && category != "all" {
+			var filtered []hub.SkillMeta
+			for _, sm := range skills {
+				if strings.ToLower(sm.Category) == category {
+					filtered = append(filtered, sm)
+				}
+			}
+			skills = filtered
+		}
+	} else if category != "" && category != "all" {
+		skills = s.skillHub.ListByCategory(category)
+	} else {
+		catalog := s.skillHub.GetCatalog()
+		if catalog != nil {
+			skills = catalog.Skills
+		}
+	}
+	if skills == nil {
+		skills = []hub.SkillMeta{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"skills": skills,
+		"total":  len(skills),
+		"source": "clawhub",
+	})
 }

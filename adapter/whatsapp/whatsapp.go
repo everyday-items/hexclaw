@@ -250,6 +250,34 @@ func (a *WhatsAppAdapter) getContactName(contacts []whatsappContact, waID string
 	return waID
 }
 
+// ValidateConfig validates credentials by verifying the phone number ID.
+func (a *WhatsAppAdapter) ValidateConfig(ctx context.Context) error {
+	if a.config.Token == "" {
+		return fmt.Errorf("whatsapp token 未配置")
+	}
+	if a.config.PhoneID == "" {
+		return fmt.Errorf("whatsapp phone_id 未配置")
+	}
+	url := fmt.Sprintf("%s/%s", a.config.BaseURL, a.config.PhoneID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.config.Token)
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("whatsapp 验证请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("whatsapp 凭证验证失败 (%d): %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 // Health 返回适配器健康状态。
 func (a *WhatsAppAdapter) Health(_ context.Context) error {
 	if a.handler == nil {

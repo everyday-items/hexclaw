@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -319,6 +320,10 @@ type InstallSkillRequest struct {
 }
 
 // handleInstallSkill 安装技能
+//
+// source 支持两种格式:
+//   - clawhub://skill-name  — 从 ClawHub 在线安装
+//   - 本地相对路径           — 从本地文件系统安装
 func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 	var req InstallSkillRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
@@ -335,7 +340,42 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 禁止绝对路径和路径穿越
+	// ClawHub 在线安装
+	if strings.HasPrefix(req.Source, "clawhub://") {
+		skillName := strings.TrimPrefix(req.Source, "clawhub://")
+		if s.skillHub == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"error": "ClawHub 未启用",
+			})
+			return
+		}
+		if s.skillHub.GetCatalog() == nil {
+			if err := s.skillHub.Refresh(r.Context()); err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]string{
+					"error": "获取 ClawHub 技能目录失败: " + err.Error(),
+				})
+				return
+			}
+		}
+		if err := s.skillHub.Install(r.Context(), skillName); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "安装技能失败: " + err.Error(),
+			})
+			return
+		}
+		// Reload marketplace so the new skill appears in List()
+		_ = s.mp.Init()
+		s.syncEngineMarketplaceSkills()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"name":              skillName,
+			"message":           "技能已从 ClawHub 安装并已同步到运行引擎",
+			"requires_restart":  false,
+			"runtime_registered": true,
+		})
+		return
+	}
+
+	// 本地安装: 禁止绝对路径和路径穿越
 	if filepath.IsAbs(req.Source) || strings.Contains(req.Source, "..") {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "source 路径不安全",
@@ -351,11 +391,14 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.syncEngineMarketplaceSkills()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name":        sk.Meta.Name,
-		"description": sk.Meta.Description,
-		"version":     sk.Meta.Version,
-		"message":     "技能已安装",
+		"name":               sk.Meta.Name,
+		"description":        sk.Meta.Description,
+		"version":            sk.Meta.Version,
+		"message":            "技能已安装并已同步到运行引擎",
+		"requires_restart":   false,
+		"runtime_registered": true,
 	})
 }
 
@@ -368,7 +411,8 @@ func (s *Server) handleUninstallSkill(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"message": "技能已删除"})
+	s.syncEngineMarketplaceSkills()
+	writeJSON(w, http.StatusOK, map[string]string{"message": "技能已删除并已同步运行引擎"})
 }
 
 func (s *Server) skillEffectiveState(name string, enabled bool) (bool, bool, string) {
@@ -863,4 +907,18 @@ func (s *Server) handleVoiceSynthesize(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(result.Audio)
+}
+
+// syncEngineMarketplaceSkills 将磁盘上的 Markdown 技能与 ReAct 引擎注册表对齐（安装/卸载后调用）
+func (s *Server) syncEngineMarketplaceSkills() {
+	if s.mp == nil {
+		return
+	}
+	e, ok := s.engine.(*engine.ReActEngine)
+	if !ok {
+		return
+	}
+	if err := e.SyncMarkdownSkillsFromMarketplace(s.mp); err != nil {
+		log.Printf("技能市场: 同步引擎注册表失败: %v", err)
+	}
 }

@@ -258,6 +258,36 @@ func (a *TelegramAdapter) handleMessage(tgMsg *tgMessage) {
 	}
 }
 
+// ValidateConfig validates credentials by calling getMe.
+func (a *TelegramAdapter) ValidateConfig(ctx context.Context) error {
+	if a.cfg.Token == "" {
+		return fmt.Errorf("telegram token 未配置")
+	}
+	url := fmt.Sprintf("%s%s/getMe", baseURL, a.cfg.Token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("telegram getMe 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("解析 telegram getMe 响应失败: %w", err)
+	}
+	if !result.OK {
+		return fmt.Errorf("telegram token 验证失败: %s", result.Description)
+	}
+	return nil
+}
+
 // Health 返回适配器健康状态。
 func (a *TelegramAdapter) Health(_ context.Context) error {
 	if a.cfg.Token == "" {

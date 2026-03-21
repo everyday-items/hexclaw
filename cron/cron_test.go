@@ -155,9 +155,9 @@ func TestScheduler_Execute(t *testing.T) {
 	s.mu.Unlock()
 
 	var executed atomic.Int32
-	s.Start(ctx, func(_ context.Context, j *Job) error {
+	s.Start(ctx, func(_ context.Context, j *Job) (string, error) {
 		executed.Add(1)
-		return nil
+		return "", nil
 	})
 	defer s.Stop()
 

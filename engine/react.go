@@ -46,6 +46,8 @@ type ReActEngine struct {
 	factory     *agents.Factory    // Agent 角色工厂
 	started     bool
 	startAt     time.Time
+	// 由技能市场安装/卸载同步维护：仅这些名称允许 Unregister，避免误删内置 Skill
+	mpTracked map[string]struct{}
 }
 
 // NewReActEngine 创建 ReAct 引擎

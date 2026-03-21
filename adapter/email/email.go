@@ -124,6 +124,30 @@ func (a *EmailAdapter) SendStream(ctx context.Context, chatID string, chunks <-c
 	return a.Send(ctx, chatID, &adapter.Reply{Content: buf.String()})
 }
 
+// ValidateConfig validates IMAP/SMTP configuration by attempting an IMAP login.
+func (a *EmailAdapter) ValidateConfig(ctx context.Context) error {
+	if a.cfg.IMAP.Host == "" || a.cfg.IMAP.Username == "" || a.cfg.IMAP.Password == "" {
+		return fmt.Errorf("email imap host/username/password 未配置")
+	}
+	if a.cfg.SMTP.Host == "" || a.cfg.SMTP.Username == "" || a.cfg.SMTP.Password == "" {
+		return fmt.Errorf("email smtp host/username/password 未配置")
+	}
+	if a.cfg.SMTP.From == "" {
+		return fmt.Errorf("email smtp from 未配置")
+	}
+	client, err := a.dialIMAP(ctx, a.cfg.IMAP)
+	if err != nil {
+		return fmt.Errorf("email IMAP 连接失败: %w", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	if err := client.Login(a.cfg.IMAP.Username, a.cfg.IMAP.Password); err != nil {
+		return fmt.Errorf("email IMAP 登录失败: %w", err)
+	}
+	_ = client.Logout()
+	return nil
+}
+
 func (a *EmailAdapter) pollLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(a.cfg.PollInterval) * time.Second)
 	defer ticker.Stop()

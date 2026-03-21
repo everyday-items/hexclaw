@@ -247,6 +247,37 @@ func (a *MatrixAdapter) handleEvent(roomID string, event matrixEvent) {
 	}(msg)
 }
 
+// ValidateConfig validates credentials by calling /account/whoami.
+func (a *MatrixAdapter) ValidateConfig(ctx context.Context) error {
+	if a.config.HomeserverURL == "" {
+		return fmt.Errorf("matrix homeserver_url 未配置")
+	}
+	if a.config.AccessToken == "" {
+		return fmt.Errorf("matrix access_token 未配置")
+	}
+	if a.config.UserID == "" {
+		return fmt.Errorf("matrix user_id 未配置")
+	}
+	url := a.config.HomeserverURL + "/_matrix/client/v3/account/whoami"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.config.AccessToken)
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("matrix whoami 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("matrix 凭证验证失败 (%d): %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 // Health 返回适配器健康状态。
 func (a *MatrixAdapter) Health(_ context.Context) error {
 	if a.handler == nil {

@@ -42,6 +42,7 @@ type FeishuAdapter struct {
 	mu          sync.RWMutex
 	accessToken string
 	tokenExpiry time.Time
+	lastError   string
 
 	wsClient  *larkws.Client
 	connected atomic.Bool
@@ -91,10 +92,16 @@ func (a *FeishuAdapter) Start(_ context.Context, handler adapter.MessageHandler)
 	go func() {
 		log.Printf("飞书适配器 [%s] 正在连接 WebSocket...", a.Name())
 		a.connected.Store(true)
+		a.mu.Lock()
+		a.lastError = ""
+		a.mu.Unlock()
 		if err := a.wsClient.Start(context.Background()); err != nil {
 			a.connected.Store(false)
 			if !a.stopped.Load() {
 				log.Printf("飞书 WebSocket 连接失败: %v", err)
+				a.mu.Lock()
+				a.lastError = err.Error()
+				a.mu.Unlock()
 			}
 		}
 	}()
@@ -460,12 +467,13 @@ func (a *FeishuAdapter) handleMessage(event feishuEvent) {
 	}
 }
 
-// ValidateConfig 仅校验配置是否完整（不需要 Start）
-func (a *FeishuAdapter) ValidateConfig(_ context.Context) error {
+// ValidateConfig validates credentials by attempting to fetch a tenant access token.
+func (a *FeishuAdapter) ValidateConfig(ctx context.Context) error {
 	if a.cfg.AppID == "" || a.cfg.AppSecret == "" {
 		return fmt.Errorf("feishu app_id/app_secret 未配置")
 	}
-	return nil
+	_, err := a.getAccessToken(ctx)
+	return err
 }
 
 // Health 返回适配器运行时健康状态
@@ -474,13 +482,19 @@ func (a *FeishuAdapter) Health(_ context.Context) error {
 		return fmt.Errorf("feishu app_id/app_secret 未配置")
 	}
 	if a.handler == nil {
-		return fmt.Errorf("feishu handler 未附加")
+		return fmt.Errorf("feishu handler 未附加，请重启引擎")
 	}
 	if a.stopped.Load() {
 		return fmt.Errorf("feishu adapter stopped")
 	}
 	if !a.connected.Load() {
-		return fmt.Errorf("feishu WebSocket 未连接")
+		a.mu.RLock()
+		lastErr := a.lastError
+		a.mu.RUnlock()
+		if lastErr != "" {
+			return fmt.Errorf("feishu WebSocket 未连接: %s", lastErr)
+		}
+		return fmt.Errorf("feishu WebSocket 未连接，请检查飞书开放平台是否已启用机器人和长连接事件订阅")
 	}
 	return nil
 }

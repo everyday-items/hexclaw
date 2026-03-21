@@ -40,6 +40,7 @@ import (
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/router"
+	"github.com/hexagon-codes/hexclaw/skill/hub"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
 	"github.com/hexagon-codes/hexclaw/storage"
 	"github.com/hexagon-codes/hexclaw/voice"
@@ -59,6 +60,7 @@ type Server struct {
 	fileMem       *memory.FileMemory       // 文件记忆（可选）
 	mcpMgr        *hexmcp.Manager          // MCP 管理器（可选）
 	mp            *marketplace.Marketplace // 技能市场（可选）
+	skillHub      *hub.Hub                 // 在线技能市场（可选）
 	agentRouter   *router.Dispatcher       // 多 Agent 路由器（可选）
 	agentStore    router.Store             // Agent/Rule 持久化（可选）
 	instanceMgr   *instances.Manager       // 平台实例运行时（可选）
@@ -146,8 +148,15 @@ func (s *Server) SetMCPManager(mgr *hexmcp.Manager) {
 // SetMarketplace 设置技能市场
 //
 // 设置后启用技能安装/列表/删除 API。
+// 同时初始化 Hub 客户端用于 ClawHub 在线安装（仓库 URL / 分支见配置 skills.hub）。
 func (s *Server) SetMarketplace(mp *marketplace.Marketplace) {
 	s.mp = mp
+	hc := hub.HubConfig{Enabled: true}
+	if s.cfg != nil {
+		hc.RepoURL = s.cfg.Skills.Hub.RepoURL
+		hc.Branch = s.cfg.Skills.Hub.Branch
+	}
+	s.skillHub = hub.New(hc, mp.Dir())
 }
 
 // SetAgentRouter 设置多 Agent 路由器

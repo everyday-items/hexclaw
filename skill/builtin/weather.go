@@ -76,13 +76,28 @@ func (s *WeatherSkill) Execute(ctx context.Context, args map[string]any) (*skill
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return &skill.Result{Content: "天气数据读取失败"}, nil
+		return &skill.Result{Content: fmt.Sprintf("天气数据读取失败：%v", err)}, nil
 	}
 
-	// 解析天气数据
+	if resp.StatusCode != http.StatusOK {
+		return &skill.Result{
+			Content: fmt.Sprintf("天气查询失败（HTTP %d），请稍后再试", resp.StatusCode),
+		}, nil
+	}
+
+	// wttr.in may return HTML on error (rate limit, unknown city, etc.)
+	trimmed := strings.TrimSpace(string(body))
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return &skill.Result{
+			Content: fmt.Sprintf("天气服务返回了非预期格式（可能是网络限制），城市：%s", city),
+		}, nil
+	}
+
 	var weather wttrResponse
 	if err := json.Unmarshal(body, &weather); err != nil {
-		return &skill.Result{Content: "天气数据解析失败"}, nil
+		return &skill.Result{
+			Content: fmt.Sprintf("天气数据解析失败：%v（响应前100字符：%s）", err, truncate(string(body), 100)),
+		}, nil
 	}
 
 	return &skill.Result{
@@ -92,9 +107,26 @@ func (s *WeatherSkill) Execute(ctx context.Context, args map[string]any) (*skill
 
 // extractCity 从查询中提取城市名
 func extractCity(query string) string {
-	// 去掉常见的天气前缀关键词
+	result := strings.TrimSpace(query)
+
+	// Strip common noise words / phrases around the city name
+	noiseWords := []string{
+		"查下", "查一下", "查询", "帮我查", "告诉我",
+		"今天", "明天", "后天", "现在", "最近",
+		"什么", "怎么样", "如何", "的", "吗", "呢",
+		"天气", "天气预报", "气温", "温度", "下雨", "下雪", "weather",
+	}
+	for _, w := range noiseWords {
+		result = strings.ReplaceAll(result, w, "")
+	}
+	result = strings.TrimSpace(result)
+	if result != "" {
+		return result
+	}
+
+	// Fallback: try prefix/suffix stripping on original
 	prefixes := []string{"天气", "weather", "气温", "下雨吗", "下雪吗", "下雨", "下雪"}
-	result := query
+	result = query
 	for _, prefix := range prefixes {
 		result = strings.TrimPrefix(strings.ToLower(result), prefix)
 	}
@@ -103,15 +135,11 @@ func extractCity(query string) string {
 		return ""
 	}
 
-	// 如果原始查询和处理后一样长，可能城市名在前面
-	if len(result) == len(query) {
-		// 尝试去掉后缀关键词
-		suffixes := []string{"天气", "的天气", "weather", "气温", "温度"}
-		for _, suffix := range suffixes {
-			if strings.HasSuffix(strings.ToLower(result), suffix) {
-				result = strings.TrimSpace(result[:len(result)-len(suffix)])
-				break
-			}
+	suffixes := []string{"天气", "的天气", "weather", "气温", "温度"}
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(strings.ToLower(result), suffix) {
+			result = strings.TrimSpace(result[:len(result)-len(suffix)])
+			break
 		}
 	}
 
@@ -180,4 +208,11 @@ type wttrWeather struct {
 // wttrValue 通用值
 type wttrValue struct {
 	Value string `json:"value"`
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

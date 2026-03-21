@@ -177,9 +177,16 @@ type MCPServerConfig struct {
 //
 // 管理 Markdown 技能的加载和安装。
 type SkillsConfig struct {
-	Enabled  bool   `yaml:"enabled"`   // 是否启用技能市场
-	Dir      string `yaml:"dir"`       // 技能安装目录，默认 ~/.hexclaw/skills/
-	AutoLoad bool   `yaml:"auto_load"` // 启动时自动加载，默认 true
+	Enabled  bool            `yaml:"enabled"`   // 是否启用技能市场
+	Dir      string          `yaml:"dir"`       // 技能安装目录，默认 ~/.hexclaw/skills/
+	AutoLoad bool            `yaml:"auto_load"` // 启动时自动加载，默认 true
+	Hub      SkillsHubConfig `yaml:"hub"`       // 在线技能目录（hexclaw-hub）
+}
+
+// SkillsHubConfig 在线技能市场 Git 源
+type SkillsHubConfig struct {
+	RepoURL string `yaml:"repo_url"` // 默认 github.com/hexagon-codes/hexclaw-hub
+	Branch  string `yaml:"branch"`   // 默认 main
 }
 
 // FileMemoryConfig 文件记忆配置

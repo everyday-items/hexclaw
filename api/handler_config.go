@@ -176,14 +176,27 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 	providerType := strings.TrimSpace(req.Provider.Type)
 	model := strings.TrimSpace(req.Provider.Model)
 	apiKey := strings.TrimSpace(req.Provider.APIKey)
-	if providerType == "" || model == "" || apiKey == "" {
+	baseURL := strings.TrimSpace(req.Provider.BaseURL)
+	if providerType == "" || model == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "provider.type、provider.api_key、provider.model 不能为空",
+			"error": "provider.type、provider.model 不能为空",
+		})
+		return
+	}
+	// Ollama 本地通常无需 API Key
+	if apiKey == "" && !strings.EqualFold(providerType, "ollama") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "provider.api_key 不能为空",
 		})
 		return
 	}
 
-	provider := llmTestProviderFactory(req.Provider)
+	provider := llmTestProviderFactory(llmConnectionTestProvider{
+		Type:    providerType,
+		BaseURL: baseURL,
+		APIKey:  apiKey,
+		Model:   model,
+	})
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 

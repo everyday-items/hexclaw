@@ -82,3 +82,41 @@ func TestHandleTestLLMConfig_ReturnsFailurePayload(t *testing.T) {
 		t.Fatalf("失败信息不正确: %+v", resp)
 	}
 }
+
+func TestHandleTestLLMConfig_OllamaAllowsEmptyAPIKey(t *testing.T) {
+	oldFactory := llmTestProviderFactory
+	llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvider {
+		if cfg.Type != "ollama" || cfg.Model != "llama3.1" || cfg.APIKey != "" {
+			t.Fatalf("工厂收到错误参数: %+v", cfg)
+		}
+		return &mockCompletionProvider{}
+	}
+	defer func() { llmTestProviderFactory = oldFactory }()
+
+	srv := NewServer(config.DefaultConfig(), &mockEngine{}, nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/config/llm/test", strings.NewReader(`{"provider":{"type":"ollama","base_url":"http://localhost:11434/v1","api_key":"","model":"llama3.1"}}`))
+	w := httptest.NewRecorder()
+
+	srv.handleTestLLMConfig(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+	var resp LLMConnectionTestResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("期望 ok=true，实际 %+v", resp)
+	}
+}
+
+func TestHandleTestLLMConfig_RejectsEmptyAPIKeyForOpenAI(t *testing.T) {
+	srv := NewServer(config.DefaultConfig(), &mockEngine{}, nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/config/llm/test", strings.NewReader(`{"provider":{"type":"openai","api_key":"","model":"gpt-4o-mini"}}`))
+	w := httptest.NewRecorder()
+
+	srv.handleTestLLMConfig(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("期望 400，实际 %d: %s", w.Code, w.Body.String())
+	}
+}

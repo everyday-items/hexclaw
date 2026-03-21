@@ -265,8 +265,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			// 静默，后面统一报告
 		} else {
 			for _, mdSkill := range mp.List() {
-				wrapper := &markdownSkillWrapper{skill: mdSkill}
-				if err := skills.Register(wrapper); err == nil {
+				w := marketplace.WrapAsSkill(mdSkill)
+				if err := skills.Register(w); err == nil {
 					_ = skills.SetEnabled(mdSkill.Meta.Name, mp.IsEnabled(mdSkill.Meta.Name))
 					mdCount++
 				}
@@ -441,14 +441,20 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		if err := scheduler.Init(ctx); err != nil {
 			scheduler = nil
 		} else {
-			scheduler.Start(ctx, func(ctx context.Context, job *cron.Job) error {
-				_, err := eng.Process(ctx, &adapter.Message{
+			scheduler.Start(ctx, func(ctx context.Context, job *cron.Job) (string, error) {
+				reply, err := eng.Process(ctx, &adapter.Message{
 					Platform: adapter.PlatformAPI,
 					UserID:   job.UserID,
 					Content:  job.Prompt,
 					Metadata: map[string]string{"source": "cron", "job_id": job.ID},
 				})
-				return err
+				if err != nil {
+					return "", err
+				}
+				if reply != nil {
+					return reply.Content, nil
+				}
+				return "", nil
 			})
 			cronOK = true
 		}
@@ -842,28 +848,6 @@ func newSecurityCmd() *cobra.Command {
 
 	cmd.AddCommand(auditCmd)
 	return cmd
-}
-
-// markdownSkillWrapper 将 Markdown 技能适配为 skill.Skill 接口
-//
-// 桥接 marketplace.MarkdownSkill 和 skill.Skill 接口。
-type markdownSkillWrapper struct {
-	skill *marketplace.MarkdownSkill
-}
-
-func (w *markdownSkillWrapper) Name() string              { return w.skill.Name() }
-func (w *markdownSkillWrapper) Description() string       { return w.skill.Description() }
-func (w *markdownSkillWrapper) Match(content string) bool { return w.skill.Match(content) }
-
-func (w *markdownSkillWrapper) Execute(ctx context.Context, args map[string]any) (*skill.Result, error) {
-	result, err := w.skill.Execute(ctx, args)
-	if err != nil {
-		return nil, err
-	}
-	return &skill.Result{
-		Content:  result.Content,
-		Metadata: result.Metadata,
-	}, nil
 }
 
 // extractLLMName 从 Provider 名称中提取 LLM Provider 名

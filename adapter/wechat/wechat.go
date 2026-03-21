@@ -380,6 +380,18 @@ func (a *WechatAdapter) sendCustomMessage(ctx context.Context, toUser, content s
 	return nil
 }
 
+// ValidateConfig validates credentials by attempting to fetch an access token.
+func (a *WechatAdapter) ValidateConfig(ctx context.Context) error {
+	if a.cfg.AppID == "" || a.cfg.AppSecret == "" {
+		return fmt.Errorf("wechat app_id/app_secret 未配置")
+	}
+	if a.cfg.Token == "" {
+		return fmt.Errorf("wechat token 未配置")
+	}
+	_, err := a.getAccessToken(ctx)
+	return err
+}
+
 // Health 返回适配器健康状态。
 func (a *WechatAdapter) Health(_ context.Context) error {
 	if a.handler == nil {

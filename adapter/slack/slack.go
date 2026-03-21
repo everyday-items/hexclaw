@@ -416,6 +416,36 @@ func (a *SlackAdapter) fetchBotID() {
 	a.botID = result.UserID
 }
 
+// ValidateConfig validates credentials by calling auth.test.
+func (a *SlackAdapter) ValidateConfig(ctx context.Context) error {
+	if a.cfg.Token == "" {
+		return fmt.Errorf("slack bot token 未配置")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, slackAPIBase+"/auth.test", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.cfg.Token)
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("slack auth.test 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("解析 slack auth.test 响应失败: %w", err)
+	}
+	if !result.OK {
+		return fmt.Errorf("slack auth.test 失败: %s", result.Error)
+	}
+	return nil
+}
+
 // Health 返回当前实例的基本健康状态。
 func (a *SlackAdapter) Health(_ context.Context) error {
 	if a.cfg.Token == "" {

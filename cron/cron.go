@@ -16,8 +16,9 @@
 //	    Prompt:   "总结今天的待办事项和重要邮件",
 //	    UserID:   "user-1",
 //	})
-//	scheduler.Start(ctx, func(ctx context.Context, job *cron.Job) error {
-//	    // 调用引擎处理
+//	scheduler.Start(ctx, func(ctx context.Context, job *cron.Job) (string, error) {
+//	    // 调用引擎处理，返回 (结果摘要, 错误)
+//	    return "", nil
 //	})
 package cron
 
@@ -68,8 +69,8 @@ type Job struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
-// JobExecutor 任务执行回调
-type JobExecutor func(ctx context.Context, job *Job) error
+// JobExecutor 任务执行回调，返回 (结果文本, 错误)
+type JobExecutor func(ctx context.Context, job *Job) (string, error)
 
 // Scheduler 定时任务调度器
 //
@@ -119,6 +120,7 @@ func (s *Scheduler) Init(ctx context.Context) error {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		job_id TEXT NOT NULL,
 		status TEXT NOT NULL DEFAULT 'success',
+		result TEXT DEFAULT '',
 		error TEXT DEFAULT '',
 		duration_ms INTEGER DEFAULT 0,
 		run_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -127,6 +129,9 @@ func (s *Scheduler) Init(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("初始化 cron 历史表失败: %w", err)
 	}
+
+	// 兼容升级：为旧表添加 result 列
+	_, _ = s.db.ExecContext(ctx, `ALTER TABLE cron_job_runs ADD COLUMN result TEXT DEFAULT ''`)
 
 	// 加载所有活跃任务
 	return s.loadJobs(ctx)
@@ -283,6 +288,7 @@ type JobHistory struct {
 	ID         int64     `json:"id"`
 	JobID      string    `json:"job_id"`
 	Status     string    `json:"status"`      // success / failed
+	Result     string    `json:"result,omitempty"`
 	Error      string    `json:"error,omitempty"`
 	DurationMs int64     `json:"duration_ms"`
 	RunAt      time.Time `json:"run_at"`
@@ -298,7 +304,7 @@ func (s *Scheduler) GetJobHistory(ctx context.Context, jobID string) ([]JobHisto
 	}
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, job_id, status, error, duration_ms, run_at
+		`SELECT id, job_id, status, COALESCE(result,''), error, duration_ms, run_at
 		 FROM cron_job_runs WHERE job_id = ? ORDER BY run_at DESC LIMIT 50`, jobID)
 	if err != nil {
 		return nil, fmt.Errorf("查询执行历史失败: %w", err)
@@ -308,7 +314,7 @@ func (s *Scheduler) GetJobHistory(ctx context.Context, jobID string) ([]JobHisto
 	var history []JobHistory
 	for rows.Next() {
 		var h JobHistory
-		if err := rows.Scan(&h.ID, &h.JobID, &h.Status, &h.Error, &h.DurationMs, &h.RunAt); err != nil {
+		if err := rows.Scan(&h.ID, &h.JobID, &h.Status, &h.Result, &h.Error, &h.DurationMs, &h.RunAt); err != nil {
 			return nil, fmt.Errorf("读取历史记录失败: %w", err)
 		}
 		history = append(history, h)
@@ -372,11 +378,13 @@ func (s *Scheduler) executeJob(job *Job) {
 	log.Printf("Cron 执行任务: %s (%s)", job.Name, job.ID)
 
 	startAt := time.Now()
-	execErr := executor(ctx, job)
+	result, execErr := executor(ctx, job)
 	durationMs := time.Since(startAt).Milliseconds()
 
 	if execErr != nil {
 		log.Printf("Cron 任务执行失败: %s: %v", job.Name, execErr)
+	} else if result != "" {
+		log.Printf("Cron 任务执行成功: %s (%dms, %d chars)", job.Name, durationMs, len(result))
 	}
 
 	// 更新任务状态
@@ -416,7 +424,7 @@ func (s *Scheduler) executeJob(job *Job) {
 		}
 	}
 
-	// 写入执行历史
+	// 写入执行历史（包含 LLM 返回的结果）
 	runStatus := "success"
 	runError := ""
 	if execErr != nil {
@@ -424,8 +432,8 @@ func (s *Scheduler) executeJob(job *Job) {
 		runError = execErr.Error()
 	}
 	if _, err := s.db.ExecContext(dbCtx,
-		`INSERT INTO cron_job_runs (job_id, status, error, duration_ms, run_at) VALUES (?, ?, ?, ?, ?)`,
-		job.ID, runStatus, runError, durationMs, now); err != nil {
+		`INSERT INTO cron_job_runs (job_id, status, result, error, duration_ms, run_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		job.ID, runStatus, result, runError, durationMs, now); err != nil {
 		log.Printf("Cron: 写入执行历史失败: %v", err)
 	}
 }
