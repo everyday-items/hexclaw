@@ -189,6 +189,9 @@ skills:
   enabled: true
   dir: ~/.hexclaw/skills/
   auto_load: true
+  hub:
+    repo_url: https://github.com/hexagon-codes/hexclaw-hub
+    branch: main
 
 heartbeat:
   enabled: false
@@ -334,7 +337,7 @@ hexclaw/
 | PUT | `/api/v1/config` | Update config |
 | GET | `/api/v1/config/llm` | Get LLM config |
 | PUT | `/api/v1/config/llm` | Update LLM config |
-| POST | `/api/v1/config/llm/test` | Test one provider config without persisting it |
+| POST | `/api/v1/config/llm/test` | Test one provider config without persisting it; local Ollama may omit the key |
 
 ### Knowledge Base
 | Method | Path | Description |
@@ -388,9 +391,12 @@ hexclaw/
 |--------|------|-------------|
 | GET | `/api/v1/skills` | Installed skills |
 | PUT | `/api/v1/skills/{name}/status` | Enable/disable a skill with runtime status fields |
-| POST | `/api/v1/skills/install` | Install skill |
+| POST | `/api/v1/skills/install` | Install skill from `clawhub://name` or a local relative path |
 | DELETE | `/api/v1/skills/{name}` | Uninstall skill |
-| GET | `/api/v1/clawhub/search` | ClawHub skill search |
+| GET | `/api/v1/clawhub/search` | ClawHub skill search with `q` / `category` filters |
+
+Default skill catalog repo: `https://github.com/hexagon-codes/hexclaw-hub` (`index.json` + `skills/*.md`).
+Installing or uninstalling Markdown skills automatically syncs the runtime skill registry; a sidecar restart is usually unnecessary.
 
 ### Agent Routing
 | Method | Path | Description |
@@ -467,8 +473,10 @@ hexclaw/
 
 ### Desktop-Aligned Response Semantics
 
-- `POST /api/v1/config/llm/test` returns `ok`, `message`, `provider`, `model`, and `latency_ms` so the Welcome flow can verify real API credentials and model availability.
+- `POST /api/v1/config/llm/test` returns `ok`, `message`, `provider`, `model`, and `latency_ms`; when `provider.type=ollama`, `api_key` may be empty for local OpenAI-compatible connectivity checks.
 - `GET /api/v1/skills` always returns `enabled`; `PUT /api/v1/skills/{name}/status` additionally returns `effective_enabled`, `requires_restart`, and `message`.
+- `POST /api/v1/skills/install` accepts `clawhub://skill-name` and local relative paths; on success it returns `requires_restart=false` and `runtime_registered=true`, meaning the runtime engine has already hot-synced.
+- `GET /api/v1/cron/jobs/{id}/history` includes `result` in each history entry so the latest execution output summary can be shown directly.
 - `POST /api/v1/knowledge/search` returns structured chunk results with document title, source, chunk position, content, and similarity score so the UI can show citations directly.
 - `GET /api/v1/knowledge/documents` includes `status`, `error_message`, `updated_at`, and `source_type`; `POST /api/v1/knowledge/upload` returns `status`, `source`, `chunk_count`, and `warnings`.
 - `POST /api/v1/agents/rules/test` returns matched rules and scores so the UI can explain why a request was routed to a given agent.

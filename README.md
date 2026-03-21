@@ -189,6 +189,9 @@ skills:
   enabled: true
   dir: ~/.hexclaw/skills/
   auto_load: true
+  hub:
+    repo_url: https://github.com/hexagon-codes/hexclaw-hub
+    branch: main
 
 heartbeat:
   enabled: false
@@ -334,7 +337,7 @@ hexclaw/
 | PUT | `/api/v1/config` | 更新配置 |
 | GET | `/api/v1/config/llm` | 获取 LLM 配置 |
 | PUT | `/api/v1/config/llm` | 更新 LLM 配置 |
-| POST | `/api/v1/config/llm/test` | 测试单个 Provider 连通性（不落盘） |
+| POST | `/api/v1/config/llm/test` | 测试单个 Provider 连通性（不落盘；本地 Ollama 可无 Key） |
 
 ### 知识库
 | 方法 | 路径 | 说明 |
@@ -388,9 +391,12 @@ hexclaw/
 |------|------|------|
 | GET | `/api/v1/skills` | 已安装技能 |
 | PUT | `/api/v1/skills/{name}/status` | 启用/禁用技能（返回运行态字段） |
-| POST | `/api/v1/skills/install` | 安装技能 |
+| POST | `/api/v1/skills/install` | 安装技能（`clawhub://name` 或本地相对路径） |
 | DELETE | `/api/v1/skills/{name}` | 卸载技能 |
-| GET | `/api/v1/clawhub/search` | ClawHub 技能搜索 |
+| GET | `/api/v1/clawhub/search` | ClawHub 技能搜索（支持 `q` / `category`） |
+
+默认技能目录仓库：`https://github.com/hexagon-codes/hexclaw-hub`（`index.json` + `skills/*.md`）。
+安装或卸载 Markdown 技能后，会自动同步运行时技能注册表；通常无需重启 sidecar。
 
 ### Agent 路由
 | 方法 | 路径 | 说明 |
@@ -467,8 +473,10 @@ hexclaw/
 
 ### 与桌面端对齐的响应语义
 
-- `POST /api/v1/config/llm/test` 返回 `ok`、`message`、`provider`、`model`、`latency_ms`，用于 Welcome 页真实测试 Key/模型可用性。
+- `POST /api/v1/config/llm/test` 返回 `ok`、`message`、`provider`、`model`、`latency_ms`；当 `provider.type=ollama` 时可省略 `api_key`，便于测试本地 OpenAI 兼容端点。
 - `GET /api/v1/skills` 稳定返回 `enabled`；`PUT /api/v1/skills/{name}/status` 额外返回 `effective_enabled`、`requires_restart`、`message`。
+- `POST /api/v1/skills/install` 支持 `clawhub://skill-name` 和本地相对路径；成功时返回 `requires_restart=false` 与 `runtime_registered=true`，表示已热同步到运行引擎。
+- `GET /api/v1/cron/jobs/{id}/history` 的历史项包含 `result`，可直接查看最近一次执行输出摘要。
 - `POST /api/v1/knowledge/search` 返回结构化结果数组，包含文档标题、来源、chunk 位置、内容和相似度分数，适合直接在前端展示引用来源。
 - `GET /api/v1/knowledge/documents` 返回 `status`、`error_message`、`updated_at`、`source_type`；`POST /api/v1/knowledge/upload` 返回 `status`、`source`、`chunk_count`、`warnings`。
 - `POST /api/v1/agents/rules/test` 会返回命中规则与分数，便于解释“为什么路由到这个 Agent”。

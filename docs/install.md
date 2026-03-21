@@ -110,6 +110,21 @@ hexclaw init
 └── skills/          # 技能安装目录
 ```
 
+### 技能市场（hexclaw-hub）
+
+桌面端「技能市场」从在线目录拉取 `index.json` 与 `skills/*.md`。默认仓库为 **`hexagon-codes/hexclaw-hub`**（`main` 分支）。自建镜像时可覆盖：
+
+```yaml
+skills:
+  enabled: true
+  hub:
+    repo_url: https://github.com/hexagon-codes/hexclaw-hub
+    branch: main
+```
+
+安装或卸载 Markdown 技能后，引擎会**自动同步**运行时技能注册表，一般**无需重启** sidecar。
+通过 API 在线安装时，`source` 可写为 `clawhub://skill-name`；`GET /api/v1/clawhub/search` 支持 `q` 和 `category` 参数。
+
 ### 环境变量
 
 所有敏感配置建议通过环境变量设置：
@@ -517,18 +532,39 @@ curl -X POST http://127.0.0.1:16060/api/v1/config/llm/test \
     }
   }'
 
-# 2. 检查 Skills 运行态字段
+# 1b. 本地 Ollama 连通性测试可不填 api_key
+curl -X POST http://127.0.0.1:16060/api/v1/config/llm/test \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": {
+      "type": "ollama",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "api_key": "",
+      "model": "llama3.1"
+    }
+  }'
+
+# 2. 搜索并在线安装 ClawHub 技能
+curl "http://127.0.0.1:16060/api/v1/clawhub/search?q=calendar&category=automation"
+curl -X POST http://127.0.0.1:16060/api/v1/skills/install \
+  -H "Content-Type: application/json" \
+  -d '{"source":"clawhub://<SKILL_NAME>"}'
+
+# 3. 检查 Skills 运行态字段
 curl http://127.0.0.1:16060/api/v1/skills
 curl -X PUT http://127.0.0.1:16060/api/v1/skills/example/status \
   -H "Content-Type: application/json" \
   -d '{"enabled":true}'
 
-# 3. 验证知识库结构化搜索
+# 4. 查看 Cron 历史结果字段
+curl http://127.0.0.1:16060/api/v1/cron/jobs/<JOB_ID>/history
+
+# 5. 验证知识库结构化搜索
 curl -X POST http://127.0.0.1:16060/api/v1/knowledge/search \
   -H "Content-Type: application/json" \
   -d '{"query":"RAG","limit":5}'
 
-# 4. 检查平台实例与 IM 通道测试接口
+# 6. 检查平台实例与 IM 通道测试接口
 curl http://127.0.0.1:16060/api/v1/platforms/instances
 curl -X POST http://127.0.0.1:16060/api/v1/im/channels/telegram/test \
   -H "Content-Type: application/json" \
@@ -537,8 +573,10 @@ curl -X POST http://127.0.0.1:16060/api/v1/im/channels/telegram/test \
 
 重点返回语义：
 
-- `/api/v1/config/llm/test` 返回 `ok/message/provider/model/latency_ms`
+- `/api/v1/config/llm/test` 返回 `ok/message/provider/model/latency_ms`；当 `provider.type=ollama` 时允许空 `api_key` 做本地连通性测试
 - `/api/v1/skills` 和 `/api/v1/skills/{name}/status` 返回 `enabled/effective_enabled/requires_restart/message`
+- `/api/v1/skills/install` 支持 `clawhub://skill-name` 或本地相对路径；在线安装成功时返回 `requires_restart=false/runtime_registered=true`
+- `/api/v1/cron/jobs/{id}/history` 的历史项包含 `result`，便于直接展示执行输出摘要
 - `/api/v1/knowledge/search` 返回结构化 chunk 结果，不再只是拼接后的上下文字符串
 - `/api/v1/knowledge/documents` 返回 `status/error_message/updated_at/source_type`
 - `/api/v1/logs` 支持 `domain` 过滤，便于按功能域诊断问题
@@ -631,6 +669,8 @@ docker compose up -d
 ```bash
 export DEEPSEEK_API_KEY="sk-xxx"
 ```
+
+本地 Ollama 的空 `api_key` 目前只适用于 `POST /api/v1/config/llm/test` 连通性测试；主服务启动仍需要至少一个带 API Key 的 Provider。
 
 **"初始化存储失败"**
 

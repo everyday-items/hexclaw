@@ -110,6 +110,21 @@ The default config directory is `~/.hexclaw/`, containing:
 └── skills/          # Skill installation directory
 ```
 
+### Skill marketplace (hexclaw-hub)
+
+The desktop **Skill Marketplace** fetches `index.json` and `skills/*.md` from a GitHub repo. The default is **`hexagon-codes/hexclaw-hub`** on `main`. Override for a mirror:
+
+```yaml
+skills:
+  enabled: true
+  hub:
+    repo_url: https://github.com/hexagon-codes/hexclaw-hub
+    branch: main
+```
+
+After installing or uninstalling a Markdown skill, the engine **syncs** the runtime skill registry; you usually **do not need** to restart the sidecar.
+For online installs through the API, `source` may be `clawhub://skill-name`; `GET /api/v1/clawhub/search` supports `q` and `category`.
+
 ### Environment Variables
 
 All sensitive config values should be set via environment variables:
@@ -517,18 +532,39 @@ curl -X POST http://127.0.0.1:16060/api/v1/config/llm/test \
     }
   }'
 
-# 2. Check runtime skill status fields
+# 1b. Local Ollama connectivity test can leave api_key empty
+curl -X POST http://127.0.0.1:16060/api/v1/config/llm/test \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": {
+      "type": "ollama",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "api_key": "",
+      "model": "llama3.1"
+    }
+  }'
+
+# 2. Search and install a ClawHub skill online
+curl "http://127.0.0.1:16060/api/v1/clawhub/search?q=calendar&category=automation"
+curl -X POST http://127.0.0.1:16060/api/v1/skills/install \
+  -H "Content-Type: application/json" \
+  -d '{"source":"clawhub://<SKILL_NAME>"}'
+
+# 3. Check runtime skill status fields
 curl http://127.0.0.1:16060/api/v1/skills
 curl -X PUT http://127.0.0.1:16060/api/v1/skills/example/status \
   -H "Content-Type: application/json" \
   -d '{"enabled":true}'
 
-# 3. Verify structured knowledge search
+# 4. Check Cron history result fields
+curl http://127.0.0.1:16060/api/v1/cron/jobs/<JOB_ID>/history
+
+# 5. Verify structured knowledge search
 curl -X POST http://127.0.0.1:16060/api/v1/knowledge/search \
   -H "Content-Type: application/json" \
   -d '{"query":"RAG","limit":5}'
 
-# 4. Check platform instances and IM channel test APIs
+# 6. Check platform instances and IM channel test APIs
 curl http://127.0.0.1:16060/api/v1/platforms/instances
 curl -X POST http://127.0.0.1:16060/api/v1/im/channels/telegram/test \
   -H "Content-Type: application/json" \
@@ -537,8 +573,10 @@ curl -X POST http://127.0.0.1:16060/api/v1/im/channels/telegram/test \
 
 Key response semantics:
 
-- `/api/v1/config/llm/test` returns `ok/message/provider/model/latency_ms`
+- `/api/v1/config/llm/test` returns `ok/message/provider/model/latency_ms`; when `provider.type=ollama`, an empty `api_key` is allowed for local connectivity checks
 - `/api/v1/skills` and `/api/v1/skills/{name}/status` return `enabled/effective_enabled/requires_restart/message`
+- `/api/v1/skills/install` accepts `clawhub://skill-name` or a local relative path; successful online installs return `requires_restart=false/runtime_registered=true`
+- `/api/v1/cron/jobs/{id}/history` includes `result` in each history item so execution output summaries can be shown directly
 - `/api/v1/knowledge/search` returns structured chunk results instead of one concatenated context string
 - `/api/v1/knowledge/documents` returns `status/error_message/updated_at/source_type`
 - `/api/v1/logs` supports `domain` filtering for functional diagnostics
@@ -631,6 +669,8 @@ At least one LLM API key must be set:
 ```bash
 export DEEPSEEK_API_KEY="sk-xxx"
 ```
+
+An empty `api_key` for local Ollama currently applies only to `POST /api/v1/config/llm/test`; the main service still needs at least one provider configured with an API key.
 
 **"Failed to initialize storage"**
 
