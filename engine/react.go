@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/ai-core/streamx"
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/adapter"
@@ -52,6 +53,65 @@ type ReActEngine struct {
 	mpTracked map[string]struct{}
 }
 
+type modelOverrideProvider struct {
+	inner hexagon.Provider
+	model string
+}
+
+func (p *modelOverrideProvider) Name() string { return p.inner.Name() }
+
+func (p *modelOverrideProvider) Complete(ctx context.Context, req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+	req.Model = p.model
+	return p.inner.Complete(ctx, req)
+}
+
+func (p *modelOverrideProvider) Stream(ctx context.Context, req hexagon.CompletionRequest) (*hexagon.LLMStream, error) {
+	req.Model = p.model
+	return p.inner.Stream(ctx, req)
+}
+
+func (p *modelOverrideProvider) Models() []llm.ModelInfo {
+	return p.inner.Models()
+}
+
+func (p *modelOverrideProvider) CountTokens(messages []llm.Message) (int, error) {
+	return p.inner.CountTokens(messages)
+}
+
+type llmSelection struct {
+	provider         hexagon.Provider
+	providerName     string
+	modelName        string
+	explicitProvider bool
+}
+
+func llmCacheOptions(cfg config.LLMConfig) cache.Options {
+	cacheTTL := 24 * time.Hour
+	if cfg.Cache.TTL != "" {
+		if d, err := time.ParseDuration(cfg.Cache.TTL); err == nil {
+			cacheTTL = d
+		}
+	}
+	maxEntries := cfg.Cache.MaxEntries
+	if maxEntries == 0 {
+		maxEntries = 10000
+	}
+	return cache.Options{
+		Enabled:    cfg.Cache.Enabled,
+		TTL:        cacheTTL,
+		MaxEntries: maxEntries,
+	}
+}
+
+func cloneLLMConfig(cfg config.LLMConfig) config.LLMConfig {
+	cloned := cfg
+	cloned.Providers = make(map[string]config.LLMProviderConfig, len(cfg.Providers))
+	for name, provider := range cfg.Providers {
+		cloned.Providers[name] = provider
+	}
+	return cloned
+}
+
 // NewReActEngine 创建 ReAct 引擎
 func NewReActEngine(
 	cfg *config.Config,
@@ -59,22 +119,7 @@ func NewReActEngine(
 	store storage.Store,
 	skills *skill.DefaultRegistry,
 ) *ReActEngine {
-	// 初始化语义缓存
-	cacheTTL := 24 * time.Hour
-	if cfg.LLM.Cache.TTL != "" {
-		if d, err := time.ParseDuration(cfg.LLM.Cache.TTL); err == nil {
-			cacheTTL = d
-		}
-	}
-	maxEntries := cfg.LLM.Cache.MaxEntries
-	if maxEntries == 0 {
-		maxEntries = 10000
-	}
-	llmCache := cache.New(cache.Options{
-		Enabled:    cfg.LLM.Cache.Enabled,
-		TTL:        cacheTTL,
-		MaxEntries: maxEntries,
-	})
+	llmCache := cache.New(llmCacheOptions(cfg.LLM))
 
 	return &ReActEngine{
 		cfg:      cfg,
@@ -85,6 +130,35 @@ func NewReActEngine(
 		cache:    llmCache,
 		factory:  agents.NewFactory(),
 	}
+}
+
+// ActiveLLMConfig 返回当前已经生效的 LLM 配置快照。
+func (e *ReActEngine) ActiveLLMConfig() config.LLMConfig {
+	e.mu.RLock()
+	router := e.router
+	cfg := cloneLLMConfig(e.cfg.LLM)
+	e.mu.RUnlock()
+
+	if router != nil {
+		return router.ActiveConfig()
+	}
+	return cfg
+}
+
+// ReloadLLMConfig 原地热更新 LLM 路由与缓存配置。
+func (e *ReActEngine) ReloadLLMConfig(_ context.Context, llmCfg config.LLMConfig) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.router == nil {
+		e.router = llmrouter.NewWithProviders(llmCfg, map[string]hexagon.Provider{})
+	}
+	if err := e.router.Reload(llmCfg); err != nil {
+		return err
+	}
+	e.cache.Reconfigure(llmCacheOptions(llmCfg))
+	e.cfg.LLM = cloneLLMConfig(llmCfg)
+	return nil
 }
 
 // SetKnowledgeBase 设置知识库管理器
@@ -226,9 +300,13 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	}
 
 	cacheInput := adapter.AttachmentCacheKey(msg.Content, msg.Attachments)
+	selection, err := e.resolveLLMSelection(ctx, msg)
+	if err != nil {
+		return nil, fmt.Errorf("llm 路由失败: %w", err)
+	}
 
 	// 3. 语义缓存查询
-	if cached, ok := e.cache.Get(cacheInput, e.cfg.LLM.Default); ok {
+	if cached, ok := e.cache.Get(cacheInput, selection.providerName, selection.modelName); ok {
 		log.Printf("语义缓存命中: %s", msg.Content[:min(20, len(msg.Content))])
 		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
 			log.Printf("保存用户消息失败: %v", err)
@@ -240,8 +318,12 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 			assistantMessageID = record.ID
 		}
 		return &adapter.Reply{
-			Content:  cached,
-			Metadata: withAssistantMessageID(map[string]string{"source": "cache"}, assistantMessageID),
+			Content: cached,
+			Metadata: withAssistantMessageID(map[string]string{
+				"source":   "cache",
+				"provider": selection.providerName,
+				"model":    selection.modelName,
+			}, assistantMessageID),
 		}, nil
 	}
 
@@ -272,19 +354,24 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		}
 	}
 
-	// 6. 获取 LLM Provider（支持指定 provider，"" 和 "auto" 使用默认路由）
-	provider, providerName, err := e.resolveProvider(ctx, msg.Metadata["provider"], msg)
-	if err != nil {
-		return nil, fmt.Errorf("llm 路由失败: %w", err)
-	}
-
 	if shouldUseDirectCompletion(history, kbContext, msg.Attachments) {
-		return e.completeDirect(ctx, sess.ID, msg, history, kbContext, provider, providerName, cacheInput)
+		return e.completeDirect(
+			ctx,
+			sess.ID,
+			msg,
+			history,
+			kbContext,
+			selection.provider,
+			selection.providerName,
+			selection.modelName,
+			selection.explicitProvider,
+			cacheInput,
+		)
 	}
 
 	// 7. 创建 Agent（支持角色选择）
 	roleName := msg.Metadata["role"] // 从消息元数据中获取角色
-	reactAgent := e.createAgent(roleName, provider, msg.Metadata)
+	reactAgent := e.createAgent(roleName, selection.provider, msg.Metadata)
 
 	// 构建 Agent 输入
 	agentInput := hexagon.Input{
@@ -293,7 +380,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 			"session_id": sess.ID,
 			"user_id":    msg.UserID,
 			"platform":   string(msg.Platform),
-			"provider":   providerName,
+			"provider":   selection.providerName,
 		},
 	}
 
@@ -309,19 +396,23 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 
 	output, err := reactAgent.Run(ctx, agentInput)
 	if err != nil {
+		if selection.explicitProvider {
+			return nil, fmt.Errorf("provider %s 调用失败: %w", selection.providerName, err)
+		}
 		// 尝试降级到备用 Provider
-		fallbackP, fbName, fbErr := e.router.Fallback(providerName)
+		fallbackP, fbName, fbErr := e.router.Fallback(selection.providerName)
 		if fbErr != nil {
 			return nil, fmt.Errorf("agent 执行失败且无可用备用: %w", err)
 		}
-		log.Printf("Provider %s 失败，降级到 %s: %v", providerName, fbName, err)
+		log.Printf("Provider %s 失败，降级到 %s: %v", selection.providerName, fbName, err)
 
 		reactAgent = e.createAgent(roleName, fallbackP, msg.Metadata)
 		output, err = reactAgent.Run(ctx, agentInput)
 		if err != nil {
 			return nil, fmt.Errorf("agent 执行失败（降级后）: %w", err)
 		}
-		providerName = fbName
+		selection.providerName = fbName
+		selection.modelName = e.getProviderModel(fbName, msg.Metadata)
 	}
 
 	// 7. 保存助手回复
@@ -333,16 +424,15 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	}
 
 	// 8. 写入语义缓存（安全获取 model 名称，避免 map 访问空值）
-	modelName := e.getProviderModel(providerName)
-	e.cache.Put(cacheInput, output.Content, providerName, modelName)
+	e.cache.Put(cacheInput, output.Content, selection.providerName, selection.modelName)
 
 	// 9. 记录 Token 使用（用于成本控制）
 	if output.Usage.TotalTokens > 0 {
 		costRecord := &storage.CostRecord{
 			ID:        "cost-" + idgen.ShortID(),
 			UserID:    msg.UserID,
-			Provider:  providerName,
-			Model:     modelName,
+			Provider:  selection.providerName,
+			Model:     selection.modelName,
 			Tokens:    output.Usage.TotalTokens,
 			CreatedAt: time.Now(),
 		}
@@ -358,12 +448,12 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 			InputTokens:  output.Usage.PromptTokens,
 			OutputTokens: output.Usage.CompletionTokens,
 			TotalTokens:  output.Usage.TotalTokens,
-			Provider:     providerName,
-			Model:        modelName,
+			Provider:     selection.providerName,
+			Model:        selection.modelName,
 		}
 	}
 
-	replyMeta := buildReplyMetadata(msg.Metadata, providerName, modelName, assistantMessageID)
+	replyMeta := buildReplyMetadata(msg.Metadata, selection.providerName, selection.modelName, assistantMessageID)
 
 	var toolCalls []adapter.ToolCall
 	for _, tc := range output.ToolCalls {
@@ -411,9 +501,17 @@ func (e *ReActEngine) createAgent(roleName string, provider hexagon.Provider, me
 }
 
 // getProviderModel 安全获取 Provider 的模型名称
-func (e *ReActEngine) getProviderModel(providerName string) string {
-	if pc, ok := e.cfg.LLM.Providers[providerName]; ok {
-		return pc.Model
+func (e *ReActEngine) getProviderModel(providerName string, metadata map[string]string) string {
+	if model := requestedModel(metadata); model != "" {
+		return model
+	}
+	e.mu.RLock()
+	router := e.router
+	e.mu.RUnlock()
+	if router != nil {
+		if model := router.ProviderModel(providerName); model != "" {
+			return model
+		}
 	}
 	return providerName // 回退到 Provider 名称本身
 }
@@ -467,9 +565,13 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	}
 
 	cacheInput := adapter.AttachmentCacheKey(msg.Content, msg.Attachments)
+	selection, err := e.resolveLLMSelection(ctx, msg)
+	if err != nil {
+		return nil, fmt.Errorf("llm 路由失败: %w", err)
+	}
 
 	// 3. 语义缓存命中 → 单 chunk 返回
-	if cached, ok := e.cache.Get(cacheInput, e.cfg.LLM.Default); ok {
+	if cached, ok := e.cache.Get(cacheInput, selection.providerName, selection.modelName); ok {
 		log.Printf("语义缓存命中: %s", msg.Content[:min(20, len(msg.Content))])
 		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
 			log.Printf("保存用户消息失败: %v", err)
@@ -480,7 +582,11 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		} else {
 			assistantMessageID = record.ID
 		}
-		return singleChunk(cached, withAssistantMessageID(map[string]string{"source": "cache"}, assistantMessageID)), nil
+		return singleChunk(cached, withAssistantMessageID(map[string]string{
+			"source":   "cache",
+			"provider": selection.providerName,
+			"model":    selection.modelName,
+		}, assistantMessageID)), nil
 	}
 
 	// 4. 构建对话上下文（在保存用户消息之前，避免 history 中重复包含当前消息）
@@ -510,34 +616,32 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		}
 	}
 
-	// 6. 获取 LLM Provider（支持指定 provider，"" 和 "auto" 使用默认路由）
-	provider, providerName, err := e.resolveProvider(ctx, msg.Metadata["provider"], msg)
-	if err != nil {
-		return nil, fmt.Errorf("llm 路由失败: %w", err)
-	}
-
 	// 7. 构建 CompletionRequest（含 system prompt + 历史 + 知识库 + 用户消息）
 	req := e.buildCompletionRequest(msg, history, kbContext)
 
 	// 8. 调用 provider.Stream()
-	llmStream, err := provider.Stream(ctx, req)
+	llmStream, err := selection.provider.Stream(ctx, req)
 	if err != nil {
+		if selection.explicitProvider {
+			return nil, fmt.Errorf("provider %s 流式调用失败: %w", selection.providerName, err)
+		}
 		// 降级到备用 Provider
-		fallbackP, fbName, fbErr := e.router.Fallback(providerName)
+		fallbackP, fbName, fbErr := e.router.Fallback(selection.providerName)
 		if fbErr != nil {
 			return nil, fmt.Errorf("流式调用失败且无可用备用: %w", err)
 		}
-		log.Printf("Provider %s 流式调用失败，降级到 %s: %v", providerName, fbName, err)
+		log.Printf("Provider %s 流式调用失败，降级到 %s: %v", selection.providerName, fbName, err)
 		llmStream, err = fallbackP.Stream(ctx, req)
 		if err != nil {
 			return nil, fmt.Errorf("流式调用失败（降级后）: %w", err)
 		}
-		providerName = fbName
+		selection.providerName = fbName
+		selection.modelName = e.getProviderModel(fbName, msg.Metadata)
 	}
 
 	// 9. 启动 goroutine 将 LLMStreamChunk 转发为 adapter.ReplyChunk
 	ch := make(chan *adapter.ReplyChunk, 16)
-	go e.pipeStream(ctx, ch, llmStream, sess.ID, msg, providerName, cacheInput)
+	go e.pipeStream(ctx, ch, llmStream, sess.ID, msg, selection.providerName, selection.modelName, cacheInput)
 
 	return ch, nil
 }
@@ -550,6 +654,7 @@ func (e *ReActEngine) pipeStream(
 	sessionID string,
 	msg *adapter.Message,
 	providerName string,
+	modelName string,
 	cacheInput string,
 ) {
 	defer close(ch)
@@ -589,7 +694,6 @@ func (e *ReActEngine) pipeStream(
 	}
 
 	// 写入语义缓存
-	modelName := e.getProviderModel(providerName)
 	e.cache.Put(cacheInput, content, providerName, modelName)
 
 	// 发送结束标记（携带 Usage 和元数据）
@@ -673,11 +777,16 @@ func (e *ReActEngine) completeDirect(
 	kbContext string,
 	provider hexagon.Provider,
 	providerName string,
+	modelName string,
+	explicitProvider bool,
 	cacheInput string,
 ) (*adapter.Reply, error) {
 	req := e.buildCompletionRequest(msg, history, kbContext)
 	resp, err := provider.Complete(ctx, req)
 	if err != nil {
+		if explicitProvider {
+			return nil, fmt.Errorf("provider %s 调用失败: %w", providerName, err)
+		}
 		fallbackP, fbName, fbErr := e.router.Fallback(providerName)
 		if fbErr != nil {
 			return nil, fmt.Errorf("多模态补全失败且无可用备用: %w", err)
@@ -688,6 +797,7 @@ func (e *ReActEngine) completeDirect(
 			return nil, fmt.Errorf("多模态补全失败（降级后）: %w", err)
 		}
 		providerName = fbName
+		modelName = e.getProviderModel(fbName, msg.Metadata)
 	}
 
 	assistantMessageID := ""
@@ -697,7 +807,6 @@ func (e *ReActEngine) completeDirect(
 		assistantMessageID = record.ID
 	}
 
-	modelName := e.getProviderModel(providerName)
 	e.cache.Put(cacheInput, resp.Content, providerName, modelName)
 
 	if resp.Usage.TotalTokens > 0 {
@@ -741,7 +850,7 @@ func applyCompletionOverrides(req *hexagon.CompletionRequest, metadata map[strin
 	if metadata == nil {
 		return
 	}
-	if model := metadata["agent_model"]; model != "" {
+	if model := requestedModel(metadata); model != "" {
 		req.Model = model
 	}
 	if raw := metadata["agent_max_tokens"]; raw != "" {
@@ -842,8 +951,15 @@ func singleChunkWithTools(content string, metadata map[string]string, toolCalls 
 // resolveProvider 根据请求的 provider 名称解析 LLM Provider
 //
 // 如果 providerHint 为空或 "auto"，使用路由器默认策略选择；
-// 否则尝试使用指定的 Provider，不存在则回退到默认。
+// 否则尝试使用指定的 Provider，不存在则直接报错。
 func (e *ReActEngine) resolveProvider(ctx context.Context, providerHint string, msg *adapter.Message) (hexagon.Provider, string, error) {
+	e.mu.RLock()
+	router := e.router
+	e.mu.RUnlock()
+	if router == nil {
+		return nil, "", fmt.Errorf("没有可用的 LLM Provider")
+	}
+
 	// 优先级: 显式指定 > Agent 路由 > 默认路由
 	hint := providerHint
 
@@ -882,13 +998,53 @@ func (e *ReActEngine) resolveProvider(ctx context.Context, providerHint string, 
 	}
 
 	if hint == "" || hint == "auto" {
-		return e.router.Route(ctx)
+		return router.Route(ctx)
 	}
-	if p, ok := e.router.Get(hint); ok {
+	if p, ok := router.Get(hint); ok {
 		return p, hint, nil
 	}
-	log.Printf("指定的 Provider %q 不存在，回退到默认路由", hint)
-	return e.router.Route(ctx)
+	return nil, "", fmt.Errorf("指定的 provider %q 不存在", hint)
+}
+
+func (e *ReActEngine) resolveLLMSelection(ctx context.Context, msg *adapter.Message) (llmSelection, error) {
+	providerHint := requestedProvider(msg.Metadata)
+	provider, providerName, err := e.resolveProvider(ctx, providerHint, msg)
+	if err != nil {
+		return llmSelection{}, err
+	}
+
+	modelName := e.getProviderModel(providerName, msg.Metadata)
+	if modelName != "" {
+		provider = &modelOverrideProvider{inner: provider, model: modelName}
+	}
+
+	return llmSelection{
+		provider:         provider,
+		providerName:     providerName,
+		modelName:        modelName,
+		explicitProvider: providerHint != "",
+	}, nil
+}
+
+func requestedProvider(metadata map[string]string) string {
+	if metadata == nil {
+		return ""
+	}
+	provider := strings.TrimSpace(metadata["provider"])
+	if strings.EqualFold(provider, "auto") {
+		return ""
+	}
+	return provider
+}
+
+func requestedModel(metadata map[string]string) string {
+	if metadata == nil {
+		return ""
+	}
+	if model := strings.TrimSpace(metadata["model"]); model != "" && !strings.EqualFold(model, "auto") {
+		return model
+	}
+	return strings.TrimSpace(metadata["agent_model"])
 }
 
 // systemPrompt HexClaw 系统提示词

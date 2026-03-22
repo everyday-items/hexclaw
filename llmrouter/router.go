@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/hexagon-codes/hexagon"
@@ -54,7 +55,7 @@ var latencyPriority = map[string]int{
 type Selector struct {
 	mu        sync.RWMutex
 	providers map[string]hexagon.Provider // 已初始化的 Provider
-	cfg       config.LLMConfig            // LLM 配置
+	cfg       config.LLMConfig            // 当前活跃的 LLM 配置（仅包含已加载 Provider）
 	defaultP  string                      // 默认 Provider 名称
 }
 
@@ -63,36 +64,15 @@ type Selector struct {
 // 根据配置初始化所有 Provider。
 // 支持官方 API、API 中转、私有部署等多种接入方式。
 func New(cfg config.LLMConfig) (*Selector, error) {
-	r := &Selector{
-		providers: make(map[string]hexagon.Provider),
-		cfg:       cfg,
-		defaultP:  cfg.Default,
-	}
-
-	// 初始化所有配置的 Provider
-	for name, pc := range cfg.Providers {
-		if pc.APIKey == "" {
-			continue // 跳过无 API Key 的 Provider
-		}
-		provider := r.createProvider(name, pc)
-		r.providers[name] = provider
-		// 启动日志由 main 统一输出
-	}
-
-	if len(r.providers) == 0 {
+	providers, activeCfg, defaultP := buildSelectorState(cfg)
+	if len(providers) == 0 {
 		return nil, fmt.Errorf("没有可用的 LLM Provider，请检查 API Key 配置")
 	}
-
-	// 如果默认 Provider 不可用，选择第一个可用的
-	if _, ok := r.providers[r.defaultP]; !ok {
-		for name := range r.providers {
-			r.defaultP = name
-			break
-		}
-		log.Printf("默认 Provider 不可用，已切换到: %s", r.defaultP)
-	}
-
-	return r, nil
+	return &Selector{
+		providers: providers,
+		cfg:       activeCfg,
+		defaultP:  defaultP,
+	}, nil
 }
 
 // NewWithProviders 使用显式注入的 Provider 创建路由器。
@@ -101,7 +81,7 @@ func New(cfg config.LLMConfig) (*Selector, error) {
 func NewWithProviders(cfg config.LLMConfig, providers map[string]hexagon.Provider) *Selector {
 	r := &Selector{
 		providers: make(map[string]hexagon.Provider, len(providers)),
-		cfg:       cfg,
+		cfg:       cloneLLMConfig(cfg),
 		defaultP:  cfg.Default,
 	}
 	for name, provider := range providers {
@@ -114,6 +94,47 @@ func NewWithProviders(cfg config.LLMConfig, providers map[string]hexagon.Provide
 		}
 	}
 	return r
+}
+
+func buildSelectorState(cfg config.LLMConfig) (map[string]hexagon.Provider, config.LLMConfig, string) {
+	providers := make(map[string]hexagon.Provider)
+	activeCfg := cloneLLMConfig(cfg)
+	activeCfg.Providers = make(map[string]config.LLMProviderConfig)
+
+	providerNames := make([]string, 0, len(cfg.Providers))
+	for name, pc := range cfg.Providers {
+		if strings.TrimSpace(pc.APIKey) == "" {
+			continue
+		}
+		providerNames = append(providerNames, name)
+		activeCfg.Providers[name] = pc
+	}
+	sort.Strings(providerNames)
+
+	for _, name := range providerNames {
+		providers[name] = (&Selector{}).createProvider(name, cfg.Providers[name])
+	}
+
+	defaultP := strings.TrimSpace(cfg.Default)
+	if _, ok := providers[defaultP]; !ok {
+		if len(providerNames) > 0 {
+			defaultP = providerNames[0]
+			log.Printf("默认 Provider 不可用，已切换到: %s", defaultP)
+		} else {
+			defaultP = ""
+		}
+	}
+	activeCfg.Default = defaultP
+	return providers, activeCfg, defaultP
+}
+
+func cloneLLMConfig(cfg config.LLMConfig) config.LLMConfig {
+	cloned := cfg
+	cloned.Providers = make(map[string]config.LLMProviderConfig, len(cfg.Providers))
+	for name, provider := range cfg.Providers {
+		cloned.Providers[name] = provider
+	}
+	return cloned
 }
 
 // createProvider 根据配置创建 Provider 实例
@@ -169,6 +190,10 @@ func (r *Selector) Route(_ context.Context) (hexagon.Provider, string, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	if len(r.providers) == 0 {
+		return nil, "", fmt.Errorf("没有可用的 LLM Provider")
+	}
+
 	// 如果路由未启用或策略为空/default，直接返回默认 Provider
 	strategy := r.cfg.Routing.Strategy
 	if !r.cfg.Routing.Enabled || strategy == "" || strategy == "default" {
@@ -204,6 +229,35 @@ func (r *Selector) Route(_ context.Context) (hexagon.Provider, string, error) {
 		return nil, "", fmt.Errorf("没有可用的 Provider (策略: %s)", strategy)
 	}
 	return r.providers[best], best, nil
+}
+
+// Reload 使用新配置重建 Provider 集合并立即生效。
+func (r *Selector) Reload(cfg config.LLMConfig) error {
+	providers, activeCfg, defaultP := buildSelectorState(cfg)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.providers = providers
+	r.cfg = activeCfg
+	r.defaultP = defaultP
+	return nil
+}
+
+// ActiveConfig 返回当前已加载 Provider 的活跃配置快照。
+func (r *Selector) ActiveConfig() config.LLMConfig {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return cloneLLMConfig(r.cfg)
+}
+
+// ProviderModel 返回当前活跃配置中某个 Provider 的默认模型。
+func (r *Selector) ProviderModel(name string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if provider, ok := r.cfg.Providers[name]; ok {
+		return provider.Model
+	}
+	return ""
 }
 
 // selectByPriority 根据优先级映射选择最优的已注册 Provider

@@ -24,7 +24,7 @@ func TestNew_SkipEmptyAPIKey(t *testing.T) {
 	cfg := config.LLMConfig{
 		Default: "openai",
 		Providers: map[string]config.LLMProviderConfig{
-			"openai": {APIKey: "", Model: "gpt-4o"},       // 空 key，跳过
+			"openai":   {APIKey: "", Model: "gpt-4o"},               // 空 key，跳过
 			"deepseek": {APIKey: "sk-test", Model: "deepseek-chat"}, // 有 key
 		},
 	}
@@ -257,6 +257,38 @@ func TestFallback_Excludes(t *testing.T) {
 	}
 	if name != "deepseek" {
 		t.Errorf("Fallback 期望 deepseek，得到 %s", name)
+	}
+}
+
+func TestSelector_ReloadUpdatesActiveConfig(t *testing.T) {
+	s := NewWithProviders(config.LLMConfig{
+		Default: "openai",
+		Providers: map[string]config.LLMProviderConfig{
+			"openai": {APIKey: "sk-openai", Model: "gpt-4o"},
+		},
+	}, map[string]hexagon.Provider{
+		"openai": nil,
+	})
+
+	next := config.LLMConfig{
+		Default: "智谱",
+		Providers: map[string]config.LLMProviderConfig{
+			"智谱": {APIKey: "sk-zhipu", Model: "glm-5"},
+		},
+	}
+	if err := s.Reload(next); err != nil {
+		t.Fatalf("Reload 失败: %v", err)
+	}
+
+	active := s.ActiveConfig()
+	if active.Default != "智谱" {
+		t.Fatalf("期望默认 provider 为智谱，实际 %q", active.Default)
+	}
+	if got := s.ProviderModel("智谱"); got != "glm-5" {
+		t.Fatalf("期望 provider model 为 glm-5，实际 %q", got)
+	}
+	if _, ok := active.Providers["openai"]; ok {
+		t.Fatalf("旧 provider 不应保留: %+v", active.Providers)
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
@@ -187,6 +188,16 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			Content:     incoming.Content,
 			Attachments: incoming.Attachments,
 			Timestamp:   time.Now(),
+			Metadata:    make(map[string]string),
+		}
+		if incoming.Role != "" {
+			msg.Metadata["role"] = incoming.Role
+		}
+		if incoming.Provider != "" {
+			msg.Metadata["provider"] = incoming.Provider
+		}
+		if incoming.Model != "" {
+			msg.Metadata["model"] = incoming.Model
 		}
 
 		// 异步处理消息
@@ -199,7 +210,11 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 				chunks, err := a.streamHandler(ctx, msg)
 				if err != nil {
 					log.Printf("Web: 流式处理失败: %v", err)
-					errMsg := wsMessage{Type: "error", Content: "处理消息时出现错误，请稍后重试。"}
+					errMsg := wsMessage{
+						Type:      "error",
+						Content:   upstreamerr.PublicMessage(err, "处理消息失败"),
+						SessionID: msg.SessionID,
+					}
 					_ = wsjson.Write(ctx, conn, errMsg)
 					return
 				}
@@ -218,7 +233,11 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			reply, err := a.handler(ctx, msg)
 			if err != nil {
 				log.Printf("Web: 处理消息失败: %v", err)
-				errMsg := wsMessage{Type: "error", Content: "处理消息时出现错误，请稍后重试。"}
+				errMsg := wsMessage{
+					Type:      "error",
+					Content:   upstreamerr.PublicMessage(err, "处理消息失败"),
+					SessionID: msg.SessionID,
+				}
 				_ = wsjson.Write(ctx, conn, errMsg)
 				return
 			}
@@ -250,6 +269,9 @@ type wsMessage struct {
 	Type        string               `json:"type"`                  // message / reply / chunk / error
 	Content     string               `json:"content"`               // 消息内容
 	SessionID   string               `json:"session_id,omitempty"`  // 会话 ID
+	Provider    string               `json:"provider,omitempty"`    // 显式指定的 Provider
+	Model       string               `json:"model,omitempty"`       // 显式指定的模型
+	Role        string               `json:"role,omitempty"`        // Agent 角色
 	Done        bool                 `json:"done,omitempty"`        // 流式输出是否结束
 	Metadata    map[string]string    `json:"metadata,omitempty"`    // 附加元数据
 	Usage       *adapter.Usage       `json:"usage,omitempty"`       // Token 使用统计（仅在 done=true 时）

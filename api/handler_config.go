@@ -67,6 +67,11 @@ type completionProvider interface {
 	Complete(context.Context, hexagon.CompletionRequest) (*hexagon.CompletionResponse, error)
 }
 
+type llmConfigRuntime interface {
+	ActiveLLMConfig() config.LLMConfig
+	ReloadLLMConfig(context.Context, config.LLMConfig) error
+}
+
 var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvider {
 	opts := []hexagon.OpenAIOption{}
 	if cfg.BaseURL != "" {
@@ -82,8 +87,13 @@ var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvi
 //
 // 返回当前 LLM 配置，API Key 脱敏显示。
 func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
-	providers := make(map[string]LLMProviderConfigResponse, len(s.cfg.LLM.Providers))
-	for name, p := range s.cfg.LLM.Providers {
+	llmCfg := s.cfg.LLM
+	if runtime, ok := s.engine.(llmConfigRuntime); ok {
+		llmCfg = runtime.ActiveLLMConfig()
+	}
+
+	providers := make(map[string]LLMProviderConfigResponse, len(llmCfg.Providers))
+	for name, p := range llmCfg.Providers {
 		providers[name] = LLMProviderConfigResponse{
 			APIKey:     config.MaskAPIKey(p.APIKey),
 			BaseURL:    p.BaseURL,
@@ -93,10 +103,10 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, LLMConfigResponse{
-		Default:   s.cfg.LLM.Default,
+		Default:   llmCfg.Default,
 		Providers: providers,
-		Routing:   s.cfg.LLM.Routing,
-		Cache:     s.cfg.LLM.Cache,
+		Routing:   llmCfg.Routing,
+		Cache:     llmCfg.Cache,
 	})
 }
 
@@ -113,6 +123,9 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	oldLLM := s.cfg.LLM
+	nextLLM := oldLLM
+
 	// 更新 Providers
 	if req.Providers != nil {
 		newProviders := make(map[string]config.LLMProviderConfig, len(req.Providers))
@@ -120,7 +133,7 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 			apiKey := p.APIKey
 			// 脱敏值 → 保留原有 Key
 			if config.IsMaskedKey(apiKey) {
-				if old, ok := s.cfg.LLM.Providers[name]; ok {
+				if old, ok := oldLLM.Providers[name]; ok {
 					apiKey = old.APIKey
 				}
 			}
@@ -131,23 +144,26 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 				Compatible: p.Compatible,
 			}
 		}
-		s.cfg.LLM.Providers = newProviders
+		nextLLM.Providers = newProviders
 	}
 
 	if req.Default != "" {
-		s.cfg.LLM.Default = req.Default
+		nextLLM.Default = req.Default
 	}
 
 	if req.Routing != nil {
-		s.cfg.LLM.Routing = *req.Routing
+		nextLLM.Routing = *req.Routing
 	}
 
 	if req.Cache != nil {
-		s.cfg.LLM.Cache = *req.Cache
+		nextLLM.Cache = *req.Cache
 	}
 
-	// 持久化到文件
-	if err := config.Save(s.cfg, ""); err != nil {
+	nextCfg := *s.cfg
+	nextCfg.LLM = nextLLM
+
+	// 先持久化到文件，再热更新引擎；热更新失败时回滚文件，保证磁盘与运行时一致。
+	if err := config.Save(&nextCfg, ""); err != nil {
 		log.Printf("保存配置失败: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "保存配置失败: " + err.Error(),
@@ -155,7 +171,23 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("LLM 配置已更新并持久化")
+	if runtime, ok := s.engine.(llmConfigRuntime); ok {
+		if err := runtime.ReloadLLMConfig(r.Context(), nextLLM); err != nil {
+			rollbackCfg := *s.cfg
+			rollbackCfg.LLM = oldLLM
+			if saveErr := config.Save(&rollbackCfg, ""); saveErr != nil {
+				log.Printf("LLM 热更新失败且回滚配置失败: reload=%v rollback=%v", err, saveErr)
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "LLM 配置应用失败: " + err.Error(),
+			})
+			return
+		}
+	}
+
+	s.cfg.LLM = nextLLM
+
+	log.Printf("LLM 配置已更新、持久化并热生效")
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status": "ok",
 	})

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,10 +16,13 @@ import (
 
 // mockEngine 测试用引擎
 type mockEngine struct {
-	reply   *adapter.Reply
-	err     error
-	lastMsg *adapter.Message
-	calls   int
+	reply       *adapter.Reply
+	err         error
+	lastMsg     *adapter.Message
+	calls       int
+	activeLLM   config.LLMConfig
+	reloadErr   error
+	reloadCalls int
 }
 
 func (e *mockEngine) Start(_ context.Context) error  { return nil }
@@ -31,6 +35,15 @@ func (e *mockEngine) Process(_ context.Context, msg *adapter.Message) (*adapter.
 }
 func (e *mockEngine) ProcessStream(_ context.Context, _ *adapter.Message) (<-chan *adapter.ReplyChunk, error) {
 	return nil, nil
+}
+func (e *mockEngine) ActiveLLMConfig() config.LLMConfig { return e.activeLLM }
+func (e *mockEngine) ReloadLLMConfig(_ context.Context, cfg config.LLMConfig) error {
+	e.reloadCalls++
+	if e.reloadErr != nil {
+		return e.reloadErr
+	}
+	e.activeLLM = cfg
+	return nil
 }
 
 // mockGateway 测试用安全网关
@@ -96,6 +109,90 @@ func TestServer_Chat(t *testing.T) {
 	}
 	if eng.lastMsg == nil || eng.lastMsg.Content != "你好" {
 		t.Fatalf("引擎未收到正确消息: %#v", eng.lastMsg)
+	}
+}
+
+func TestServer_ChatForwardsExplicitProviderAndModel(t *testing.T) {
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{
+		reply: &adapter.Reply{
+			Content:  "收到",
+			Metadata: map[string]string{"provider": "智谱", "model": "glm-5"},
+		},
+	}
+	srv := NewServer(cfg, eng, nil, nil)
+
+	body := `{"message":"你好","user_id":"test-user","provider":"智谱","model":"glm-5","role":"analyst"}`
+	req := httptest.NewRequest("POST", "/api/v1/chat", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d, body: %s", w.Code, w.Body.String())
+	}
+	if eng.lastMsg == nil {
+		t.Fatal("引擎未收到消息")
+	}
+	if got := eng.lastMsg.Metadata["provider"]; got != "智谱" {
+		t.Fatalf("provider 未透传，实际 %q", got)
+	}
+	if got := eng.lastMsg.Metadata["model"]; got != "glm-5" {
+		t.Fatalf("model 未透传，实际 %q", got)
+	}
+	if got := eng.lastMsg.Metadata["role"]; got != "analyst" {
+		t.Fatalf("role 未透传，实际 %q", got)
+	}
+}
+
+func TestServer_ChatReturnsUnderlyingErrorMessage(t *testing.T) {
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{err: context.DeadlineExceeded}
+	srv := NewServer(cfg, eng, nil, nil)
+
+	req := httptest.NewRequest("POST", "/api/v1/chat", strings.NewReader(`{"message":"你好"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("期望 500，实际 %d", w.Code)
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if got := resp["error"]; got != context.DeadlineExceeded.Error() {
+		t.Fatalf("错误文案未透传，实际 %q", got)
+	}
+}
+
+func TestServer_ChatSanitizesProviderErrorBody(t *testing.T) {
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{
+		err: errors.New(`openai api error: 400 Bad Request, body: {"error":{"message":"Access denied, please make sure your account is in good standing.","type":"Arrearage","code":"Arrearage"},"id":"chatcmpl-123","request_id":"req-123"}`),
+	}
+	srv := NewServer(cfg, eng, nil, nil)
+
+	req := httptest.NewRequest("POST", "/api/v1/chat", strings.NewReader(`{"message":"你好"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("期望 500，实际 %d", w.Code)
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	want := "Access denied, please make sure your account is in good standing. (code: Arrearage)"
+	if got := resp["error"]; got != want {
+		t.Fatalf("错误文案未脱敏，期望 %q，实际 %q", want, got)
 	}
 }
 

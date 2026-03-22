@@ -25,6 +25,7 @@ type Entry struct {
 	Provider  string    // 生成响应的 Provider
 	Model     string    // 生成响应的模型
 	CreatedAt time.Time // 创建时间
+	ExpiresAt time.Time // 过期时间（含抖动）
 	HitCount  int       // 命中次数
 }
 
@@ -84,13 +85,38 @@ func New(cfg Options) *Cache {
 	}
 }
 
-// Get 查询缓存（按 input + provider 隔离，避免不同模型回复互相命中）
-func (c *Cache) Get(input, provider string) (string, bool) {
+// Reconfigure 原地更新缓存配置，避免热更新时替换整个缓存实例。
+func (c *Cache) Reconfigure(cfg Options) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.enabled = cfg.Enabled
+
+	ttl := cfg.TTL
+	if ttl == 0 {
+		ttl = 24 * time.Hour
+	}
+	c.ttl = ttl
+	c.ttlJitter = ttl / 10
+
+	maxEntries := cfg.MaxEntries
+	if maxEntries == 0 {
+		maxEntries = 10000
+	}
+	c.maxEntries = maxEntries
+
+	if c.enabled {
+		c.evictLocked()
+	}
+}
+
+// Get 查询缓存（按 input + provider + model 隔离，避免不同模型回复互相命中）
+func (c *Cache) Get(input, provider, model string) (string, bool) {
 	if !c.enabled {
 		return "", false
 	}
 
-	key := hashInput(input, provider)
+	key := hashInput(input, provider, model)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -111,7 +137,7 @@ func (c *Cache) getLocked(key string) (string, bool) {
 		return "", false
 	}
 
-	if time.Since(entry.CreatedAt) > c.ttl {
+	if c.isExpired(entry, time.Now()) {
 		delete(c.entries, key)
 		return "", false
 	}
@@ -124,18 +150,18 @@ func (c *Cache) getLocked(key string) (string, bool) {
 //
 // 如果缓存命中直接返回；否则使用 singleflight 确保
 // 同一 key 只有一个 goroutine 调用 fn（LLM 调用等耗时操作）。
-func (c *Cache) Do(input, provider string, fn func() (response, model string, err error)) (string, error) {
+func (c *Cache) Do(input, provider, model string, fn func() (response, model string, err error)) (string, error) {
 	if !c.enabled {
 		resp, _, err := fn()
 		return resp, err
 	}
 
 	// 先查缓存
-	if cached, ok := c.Get(input, provider); ok {
+	if cached, ok := c.Get(input, provider, model); ok {
 		return cached, nil
 	}
 
-	key := hashInput(input, provider)
+	key := hashInput(input, provider, model)
 
 	// singleflight：同一 key 只执行一次
 	v, err, _ := c.group.Do(key, func() (any, error) {
@@ -166,7 +192,7 @@ func (c *Cache) Put(input, response, provider, model string) {
 		return
 	}
 
-	key := hashInput(input, provider)
+	key := hashInput(input, provider, model)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -179,18 +205,22 @@ func (c *Cache) Put(input, response, provider, model string) {
 		existing.Response = response
 		existing.Provider = provider
 		existing.Model = model
-		existing.CreatedAt = c.jitteredNow()
+		existing.CreatedAt = time.Now()
+		existing.ExpiresAt = c.jitteredExpiry(existing.CreatedAt)
 		return
 	}
 
+	createdAt := time.Now()
 	c.entries[key] = &Entry{
 		Key:       key,
 		Response:  response,
 		Provider:  provider,
 		Model:     model,
-		CreatedAt: c.jitteredNow(),
+		CreatedAt: createdAt,
+		ExpiresAt: c.jitteredExpiry(createdAt),
 	}
 	c.order = append(c.order, key)
+	c.evictLocked()
 }
 
 // Stats 返回缓存统计
@@ -235,16 +265,16 @@ func (c *Cache) evictLocked() {
 		if !ok {
 			continue
 		}
-		if now.Sub(entry.CreatedAt) > c.ttl {
+		if c.isExpired(entry, now) {
 			delete(c.entries, key)
 			continue
 		}
 		validOrder = append(validOrder, key)
 	}
 
-	// 超量淘汰（移除最早的条目，使用 > 确保淘汰后 entries < maxEntries）
+	// 超量淘汰（移除最早的条目，确保淘汰后 entries <= maxEntries）
 	evictCount := 0
-	for len(c.entries)-evictCount > c.maxEntries-1 && evictCount < len(validOrder) {
+	for len(c.entries)-evictCount > c.maxEntries && evictCount < len(validOrder) {
 		delete(c.entries, validOrder[evictCount])
 		evictCount++
 	}
@@ -253,21 +283,31 @@ func (c *Cache) evictLocked() {
 	c.order = append([]string(nil), validOrder[evictCount:]...)
 }
 
-// jitteredNow 返回带随机抖动的当前时间（防止缓存雪崩）
+func (c *Cache) isExpired(entry *Entry, now time.Time) bool {
+	if entry == nil {
+		return true
+	}
+	if !entry.ExpiresAt.IsZero() {
+		return !now.Before(entry.ExpiresAt)
+	}
+	return now.Sub(entry.CreatedAt) > c.ttl
+}
+
+// jitteredExpiry 返回带随机抖动的过期时间（防止缓存雪崩）
 //
 // 抖动范围: [-ttlJitter/2, +ttlJitter/2]，使过期时间均匀分布在 TTL 附近，
 // 而非全部偏向提前过期。
-func (c *Cache) jitteredNow() time.Time {
+func (c *Cache) jitteredExpiry(createdAt time.Time) time.Time {
 	if c.ttlJitter <= 0 {
-		return time.Now()
+		return createdAt.Add(c.ttl)
 	}
 	half := c.ttlJitter / 2
 	jitter := time.Duration(rand.Int64N(int64(c.ttlJitter))) - half
-	return time.Now().Add(jitter)
+	return createdAt.Add(c.ttl + jitter)
 }
 
 // hashInput 对输入进行归一化和哈希
-func hashInput(input, provider string) string {
+func hashInput(input, provider, model string) string {
 	normalized := strings.TrimSpace(input)
 	normalized = strings.ToLower(normalized)
 	normalized = strings.Join(strings.Fields(normalized), " ")
@@ -276,6 +316,8 @@ func hashInput(input, provider string) string {
 	builder.WriteString(normalized)
 	builder.WriteByte('\x00')
 	builder.WriteString(strings.ToLower(strings.TrimSpace(provider)))
+	builder.WriteByte('\x00')
+	builder.WriteString(strings.ToLower(strings.TrimSpace(model)))
 
 	h := sha256.Sum256([]byte(builder.String()))
 	return hex.EncodeToString(h[:])

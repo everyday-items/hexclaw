@@ -252,6 +252,53 @@ func TestBuildStreamMessages(t *testing.T) {
 	}
 }
 
+func TestReActEngine_ReloadLLMConfig(t *testing.T) {
+	dir := t.TempDir()
+	store, err := sqlitestore.New(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("创建存储失败: %v", err)
+	}
+	defer store.Close()
+	store.Init(context.Background())
+
+	cfg := config.DefaultConfig()
+	cfg.LLM.Default = "openai"
+	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
+		"openai": {APIKey: "sk-openai", Model: "gpt-4o"},
+	}
+	router := llmrouter.NewWithProviders(cfg.LLM, map[string]hexagon.Provider{
+		"openai": nil,
+	})
+
+	eng := NewReActEngine(cfg, router, store, skill.NewRegistry())
+	next := config.LLMConfig{
+		Default: "智谱",
+		Providers: map[string]config.LLMProviderConfig{
+			"智谱": {APIKey: "sk-zhipu", Model: "glm-5"},
+		},
+		Cache: config.LLMCacheConfig{
+			Enabled:    true,
+			TTL:        "1h",
+			MaxEntries: 128,
+		},
+	}
+
+	if err := eng.ReloadLLMConfig(context.Background(), next); err != nil {
+		t.Fatalf("ReloadLLMConfig 失败: %v", err)
+	}
+
+	active := eng.ActiveLLMConfig()
+	if active.Default != "智谱" {
+		t.Fatalf("期望默认 provider 为智谱，实际 %q", active.Default)
+	}
+	if _, ok := active.Providers["智谱"]; !ok {
+		t.Fatalf("期望活跃配置包含智谱，实际 %+v", active.Providers)
+	}
+	if _, ok := active.Providers["openai"]; ok {
+		t.Fatalf("旧 provider 不应保留: %+v", active.Providers)
+	}
+}
+
 func TestReActEngine_ProcessUsesDirectCompletionForAttachments(t *testing.T) {
 	provider := mockllm.NewLLMProvider("test").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
 		last := req.Messages[len(req.Messages)-1]
@@ -467,6 +514,86 @@ func TestReActEngine_ProcessUsesMultimodalHistory(t *testing.T) {
 	}
 }
 
+func TestReActEngine_ProcessHonorsExplicitProviderModelAndDisablesFallback(t *testing.T) {
+	primary := mockllm.NewLLMProvider("zhipu").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+		if req.Model != "glm-5" {
+			t.Fatalf("显式模型未生效，实际 %q", req.Model)
+		}
+		return nil, context.DeadlineExceeded
+	})
+	fallback := mockllm.NewLLMProvider("qwen").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+		return &hexagon.CompletionResponse{Content: "fallback should not run"}, nil
+	})
+
+	eng := newEngineWithProviders(t, map[string]hexagon.Provider{
+		"智谱": primary,
+		"通义": fallback,
+	}, map[string]config.LLMProviderConfig{
+		"智谱": {Model: "glm-4"},
+		"通义": {Model: "qwen-max"},
+	}, "智谱")
+
+	_, err := eng.Process(context.Background(), &adapter.Message{
+		ID:       "msg-explicit",
+		Platform: adapter.PlatformAPI,
+		UserID:   "user-001",
+		Content:  "你好",
+		Metadata: map[string]string{
+			"provider": "智谱",
+			"model":    "glm-5",
+		},
+	})
+	if err == nil {
+		t.Fatal("期望显式 provider 失败时直接返回错误")
+	}
+	if !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("错误未透传底层原因: %v", err)
+	}
+	if fallback.CallCount() != 0 {
+		t.Fatalf("显式 provider 失败时不应跨 provider fallback，实际调用 %d 次", fallback.CallCount())
+	}
+}
+
+func TestReActEngine_ProcessStreamHonorsExplicitProviderModelAndDisablesFallback(t *testing.T) {
+	primary := mockllm.NewLLMProvider("zhipu").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+		if req.Model != "glm-5" {
+			t.Fatalf("流式显式模型未生效，实际 %q", req.Model)
+		}
+		return nil, context.DeadlineExceeded
+	})
+	fallback := mockllm.NewLLMProvider("qwen").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+		return &hexagon.CompletionResponse{Content: "fallback should not run"}, nil
+	})
+
+	eng := newEngineWithProviders(t, map[string]hexagon.Provider{
+		"智谱": primary,
+		"通义": fallback,
+	}, map[string]config.LLMProviderConfig{
+		"智谱": {Model: "glm-4"},
+		"通义": {Model: "qwen-max"},
+	}, "智谱")
+
+	_, err := eng.ProcessStream(context.Background(), &adapter.Message{
+		ID:       "msg-explicit-stream",
+		Platform: adapter.PlatformAPI,
+		UserID:   "user-001",
+		Content:  "你好",
+		Metadata: map[string]string{
+			"provider": "智谱",
+			"model":    "glm-5",
+		},
+	})
+	if err == nil {
+		t.Fatal("期望流式显式 provider 失败时直接返回错误")
+	}
+	if !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("流式错误未透传底层原因: %v", err)
+	}
+	if fallback.CallCount() != 0 {
+		t.Fatalf("流式显式 provider 失败时不应跨 provider fallback，实际调用 %d 次", fallback.CallCount())
+	}
+}
+
 // echoSkill 测试用的 echo Skill
 type echoSkill struct{}
 
@@ -501,6 +628,37 @@ func newEngineWithProvider(t *testing.T, provider hexagon.Provider) *ReActEngine
 	router := llmrouter.NewWithProviders(cfg.LLM, map[string]hexagon.Provider{
 		"test": provider,
 	})
+
+	eng := NewReActEngine(cfg, router, store, skill.NewRegistry())
+	if err := eng.Start(context.Background()); err != nil {
+		t.Fatalf("启动引擎失败: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Stop(context.Background()) })
+	return eng
+}
+
+func newEngineWithProviders(
+	t *testing.T,
+	providers map[string]hexagon.Provider,
+	providerCfg map[string]config.LLMProviderConfig,
+	defaultProvider string,
+) *ReActEngine {
+	t.Helper()
+
+	dir := t.TempDir()
+	store, err := sqlitestore.New(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("创建存储失败: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	if err := store.Init(context.Background()); err != nil {
+		t.Fatalf("初始化存储失败: %v", err)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.LLM.Default = defaultProvider
+	cfg.LLM.Providers = providerCfg
+	router := llmrouter.NewWithProviders(cfg.LLM, providers)
 
 	eng := NewReActEngine(cfg, router, store, skill.NewRegistry())
 	if err := eng.Start(context.Background()); err != nil {

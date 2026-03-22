@@ -36,6 +36,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/hexclaw/gateway"
 	"github.com/hexagon-codes/hexclaw/instances"
+	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
 	"github.com/hexagon-codes/hexclaw/knowledge"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
@@ -473,6 +474,8 @@ type ChatRequest struct {
 	SessionID   string               `json:"session_id,omitempty"`  // 会话 ID（可选，空则创建新会话）
 	UserID      string               `json:"user_id,omitempty"`     // 用户 ID（可选）
 	Role        string               `json:"role,omitempty"`        // Agent 角色（可选：assistant/researcher/writer/coder/translator/analyst）
+	Provider    string               `json:"provider,omitempty"`    // 显式指定 Provider（可选）
+	Model       string               `json:"model,omitempty"`       // 显式指定模型（可选）
 	Platform    string               `json:"platform,omitempty"`    // 来源平台（可选：api/desktop，未传时自动推断）
 	Attachments []adapter.Attachment `json:"attachments,omitempty"` // 图片附件列表（可选）
 }
@@ -555,6 +558,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if req.Role != "" {
 		msg.Metadata["role"] = req.Role
 	}
+	if req.Provider != "" {
+		msg.Metadata["provider"] = req.Provider
+	}
+	if req.Model != "" {
+		msg.Metadata["model"] = req.Model
+	}
 
 	// 安全网关检查
 	if s.gateway != nil {
@@ -580,8 +589,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	reply, err := s.engine.Process(r.Context(), msg)
 	if err != nil {
 		s.logCollector.Error("chat", fmt.Sprintf("处理失败: user=%s err=%v", userID, err))
+		message := upstreamerr.PublicMessage(err, "处理消息失败")
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"error": "处理消息失败，请稍后重试",
+			"error": message,
 		})
 		return
 	}

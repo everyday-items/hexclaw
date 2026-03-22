@@ -119,12 +119,18 @@ func TestWsMessageJSON(t *testing.T) {
 				Type:      "reply",
 				Content:   "hello world",
 				SessionID: "sess-123",
+				Provider:  "智谱",
+				Model:     "glm-5",
+				Role:      "analyst",
 				Done:      true,
 			},
 			want: map[string]any{
 				"type":       "reply",
 				"content":    "hello world",
 				"session_id": "sess-123",
+				"provider":   "智谱",
+				"model":      "glm-5",
+				"role":       "analyst",
 				"done":       true,
 			},
 		},
@@ -202,6 +208,15 @@ func TestWsMessageJSON(t *testing.T) {
 					t.Errorf("done = %v, 期望 %v", got["done"], wantDone)
 				}
 			}
+			if wantProvider, ok := tt.want["provider"]; ok && got["provider"] != wantProvider {
+				t.Errorf("provider = %v, 期望 %v", got["provider"], wantProvider)
+			}
+			if wantModel, ok := tt.want["model"]; ok && got["model"] != wantModel {
+				t.Errorf("model = %v, 期望 %v", got["model"], wantModel)
+			}
+			if wantRole, ok := tt.want["role"]; ok && got["role"] != wantRole {
+				t.Errorf("role = %v, 期望 %v", got["role"], wantRole)
+			}
 			if len(tt.msg.Attachments) > 0 {
 				raw, ok := got["attachments"].([]any)
 				if !ok || len(raw) != len(tt.msg.Attachments) {
@@ -214,7 +229,7 @@ func TestWsMessageJSON(t *testing.T) {
 
 // TestWsMessageJSONDeserialization 测试 wsMessage JSON 反序列化
 func TestWsMessageJSONDeserialization(t *testing.T) {
-	input := `{"type":"message","content":"你好","session_id":"sess-abc"}`
+	input := `{"type":"message","content":"你好","session_id":"sess-abc","provider":"智谱","model":"glm-5","role":"analyst"}`
 
 	var msg wsMessage
 	if err := json.Unmarshal([]byte(input), &msg); err != nil {
@@ -229,6 +244,15 @@ func TestWsMessageJSONDeserialization(t *testing.T) {
 	}
 	if msg.SessionID != "sess-abc" {
 		t.Errorf("SessionID = %q, 期望 %q", msg.SessionID, "sess-abc")
+	}
+	if msg.Provider != "智谱" {
+		t.Errorf("Provider = %q, 期望 %q", msg.Provider, "智谱")
+	}
+	if msg.Model != "glm-5" {
+		t.Errorf("Model = %q, 期望 %q", msg.Model, "glm-5")
+	}
+	if msg.Role != "analyst" {
+		t.Errorf("Role = %q, 期望 %q", msg.Role, "analyst")
 	}
 }
 
