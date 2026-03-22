@@ -72,6 +72,18 @@ type llmConfigRuntime interface {
 	ReloadLLMConfig(context.Context, config.LLMConfig) error
 }
 
+func effectiveLLMConfig(base config.LLMConfig, runtime llmConfigRuntime) config.LLMConfig {
+	if runtime == nil {
+		return base
+	}
+
+	live := runtime.ActiveLLMConfig()
+	if len(live.Providers) == 0 {
+		return base
+	}
+	return live
+}
+
 var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvider {
 	opts := []hexagon.OpenAIOption{}
 	if cfg.BaseURL != "" {
@@ -89,7 +101,7 @@ var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvi
 func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	llmCfg := s.cfg.LLM
 	if runtime, ok := s.engine.(llmConfigRuntime); ok {
-		llmCfg = runtime.ActiveLLMConfig()
+		llmCfg = effectiveLLMConfig(llmCfg, runtime)
 	}
 
 	providers := make(map[string]LLMProviderConfigResponse, len(llmCfg.Providers))

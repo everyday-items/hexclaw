@@ -112,14 +112,14 @@ The default config directory is `~/.hexclaw/`, containing:
 
 ### Skill marketplace (hexclaw-hub)
 
-The desktop **Skill Marketplace** fetches `index.json` and `skills/*.md` from a GitHub repo. The default is **`hexagon-codes/hexclaw-hub`** on `main`. Override for a mirror:
+The desktop **Skill Marketplace** fetches `index.json` and `skills/*.md` from a GitHub repo. The default is **`hexagon-codes/hexclaw-hub`** on tag **`v0.0.1`**. Override for a mirror:
 
 ```yaml
 skills:
   enabled: true
   hub:
     repo_url: https://github.com/hexagon-codes/hexclaw-hub
-    branch: main
+    branch: v0.0.1
 ```
 
 After installing or uninstalling a Markdown skill, the engine **syncs** the runtime skill registry; you usually **do not need** to restart the sidecar.

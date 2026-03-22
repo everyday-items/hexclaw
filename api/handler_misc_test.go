@@ -137,7 +137,11 @@ func TestHandleUpdateAgent_PreservesPersistedFields(t *testing.T) {
 		t.Fatalf("保存初始 Agent 失败: %v", err)
 	}
 
-	srv := NewServer(config.DefaultConfig(), &mockEngine{}, nil, store)
+	cfg := config.DefaultConfig()
+	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
+		"openai": {APIKey: "sk-openai", BaseURL: "https://api.openai.com/v1", Model: "gpt-4o"},
+	}
+	srv := NewServer(cfg, &mockEngine{}, nil, store)
 	srv.SetAgentRouter(dispatcher)
 	srv.SetAgentStore(agentStore)
 
@@ -219,7 +223,11 @@ func TestHandleUpdateAgent_AllowsZeroValueOverrides(t *testing.T) {
 		t.Fatalf("保存初始 Agent 失败: %v", err)
 	}
 
-	srv := NewServer(config.DefaultConfig(), &mockEngine{}, nil, store)
+	cfg := config.DefaultConfig()
+	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
+		"openai": {APIKey: "sk-openai", BaseURL: "https://api.openai.com/v1", Model: "gpt-4o"},
+	}
+	srv := NewServer(cfg, &mockEngine{}, nil, store)
 	srv.SetAgentRouter(dispatcher)
 	srv.SetAgentStore(agentStore)
 
@@ -258,6 +266,31 @@ func TestHandleUpdateAgent_AllowsZeroValueOverrides(t *testing.T) {
 	}
 	if got.Model != "gpt-4o" || got.Provider != "openai" {
 		t.Fatalf("未提交字段被意外修改: model=%q provider=%q", got.Model, got.Provider)
+	}
+}
+
+func TestHandleRegisterAgent_RejectsUnknownProvider(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
+		"智谱": {APIKey: "sk-zhipu", BaseURL: "https://open.bigmodel.cn/api/paas/v4", Model: "glm-5"},
+	}
+
+	srv := NewServer(cfg, &mockEngine{}, nil, nil)
+	srv.SetAgentRouter(agentrouter.New())
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/agents",
+		strings.NewReader(`{"name":"review-agent","display_name":"Review Agent","provider":"unknown-provider","model":"ghost-model"}`),
+	)
+	w := httptest.NewRecorder()
+
+	srv.handleRegisterAgent(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("期望 400，实际 %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "provider") {
+		t.Fatalf("期望返回 provider 错误，实际 %s", w.Body.String())
 	}
 }
 

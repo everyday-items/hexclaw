@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/canvas"
+	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/engine"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/router"
@@ -367,9 +368,9 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		_ = s.mp.Init()
 		s.syncEngineMarketplaceSkills()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"name":              skillName,
-			"message":           "技能已从 ClawHub 安装并已同步到运行引擎",
-			"requires_restart":  false,
+			"name":               skillName,
+			"message":            "技能已从 ClawHub 安装并已同步到运行引擎",
+			"requires_restart":   false,
 			"runtime_registered": true,
 		})
 		return
@@ -486,6 +487,53 @@ type UpdateAgentRequest struct {
 	Metadata     *map[string]string `json:"metadata"`
 }
 
+func (s *Server) activeLLMConfig() config.LLMConfig {
+	llmCfg := s.cfg.LLM
+	if runtime, ok := s.engine.(llmConfigRuntime); ok {
+		llmCfg = effectiveLLMConfig(llmCfg, runtime)
+	}
+	return llmCfg
+}
+
+func findLLMProviderKey(llmCfg config.LLMConfig, provider string) (string, bool) {
+	trimmedProvider := strings.TrimSpace(provider)
+	if trimmedProvider == "" {
+		return "", false
+	}
+	if _, ok := llmCfg.Providers[trimmedProvider]; ok {
+		return trimmedProvider, true
+	}
+
+	normalizedProvider := strings.ToLower(trimmedProvider)
+	for name := range llmCfg.Providers {
+		if strings.ToLower(strings.TrimSpace(name)) == normalizedProvider {
+			return name, true
+		}
+	}
+
+	return "", false
+}
+
+func (s *Server) validateAgentLLMConfig(cfg *router.AgentConfig) error {
+	cfg.Provider = strings.TrimSpace(cfg.Provider)
+	cfg.Model = strings.TrimSpace(cfg.Model)
+
+	if cfg.Provider == "" && cfg.Model == "" {
+		return nil
+	}
+	if cfg.Provider == "" || cfg.Model == "" {
+		return fmt.Errorf("provider 和 model 必须同时指定")
+	}
+
+	llmCfg := s.activeLLMConfig()
+	providerKey, ok := findLLMProviderKey(llmCfg, cfg.Provider)
+	if !ok {
+		return fmt.Errorf("指定的 provider %q 不存在", cfg.Provider)
+	}
+	cfg.Provider = providerKey
+	return nil
+}
+
 // handleRegisterAgent 注册 Agent（内存 + 持久化）
 func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	var req RegisterAgentRequest
@@ -509,6 +557,11 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		MaxTokens:    req.MaxTokens,
 		Temperature:  req.Temperature,
 		Metadata:     req.Metadata,
+	}
+
+	if err := s.validateAgentLLMConfig(&cfg); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
 	}
 
 	if err := s.agentRouter.Register(cfg); err != nil {
@@ -563,6 +616,10 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Metadata != nil {
 		cfg.Metadata = *req.Metadata
+	}
+	if err := s.validateAgentLLMConfig(&cfg); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
 	}
 	if err := s.agentRouter.UpdateAgent(cfg); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})

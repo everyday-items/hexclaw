@@ -191,7 +191,7 @@ skills:
   auto_load: true
   hub:
     repo_url: https://github.com/hexagon-codes/hexclaw-hub
-    branch: main
+    branch: v0.0.1
 
 heartbeat:
   enabled: false
@@ -395,7 +395,7 @@ hexclaw/
 | DELETE | `/api/v1/skills/{name}` | 卸载技能 |
 | GET | `/api/v1/clawhub/search` | ClawHub 技能搜索（支持 `q` / `category`） |
 
-默认技能目录仓库：`https://github.com/hexagon-codes/hexclaw-hub`（`index.json` + `skills/*.md`）。
+默认技能目录仓库：`https://github.com/hexagon-codes/hexclaw-hub` 的 `v0.0.1` 标签（`index.json` + `skills/*.md`）。
 安装或卸载 Markdown 技能后，会自动同步运行时技能注册表；通常无需重启 sidecar。
 
 ### Agent 路由
@@ -527,14 +527,14 @@ golangci-lint run
 | 组件 | 技术 |
 |------|------|
 | 语言 | Go 1.25+ |
-| Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.3.1-beta |
+| Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.3.2-beta |
 | AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.0.4 |
 | 工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.3 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | 配置 | YAML + 环境变量 |
 | 存储 | SQLite (modernc.org/sqlite) |
 | WebSocket | nhooyr.io/websocket + gorilla/websocket |
-| MCP | modelcontextprotocol/go-sdk v1.3.0 |
+| MCP | modelcontextprotocol/go-sdk v1.4.1 |
 | 安全 | Hexagon Guard Chain |
 
 ## 贡献指南
@@ -571,7 +571,7 @@ chore: 构建/工具链
 
 | 项目 | 说明 | 仓库 |
 |------|------|------|
-| **Hexagon** | Go AI Agent 框架 (核心引擎) v0.3.1-beta | [hexagon](https://github.com/hexagon-codes/hexagon) |
+| **Hexagon** | Go AI Agent 框架 (核心引擎) v0.3.2-beta | [hexagon](https://github.com/hexagon-codes/hexagon) |
 | **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.0.4 | [ai-core](https://github.com/hexagon-codes/ai-core) |
 | **toolkit** | Go 通用工具库 v0.0.3 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI 观测面板 (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |

@@ -367,6 +367,9 @@ func (e *workflowExecutor) executeAgent(ctx context.Context, node *workflowNode,
 	if provider := stringValue(node.Data["provider"]); provider != "" {
 		metadata["provider"] = provider
 	}
+	if model := stringValue(node.Data["model"]); model != "" {
+		metadata["model"] = model
+	}
 	metadata["workflow_id"] = e.wf.ID
 	metadata["workflow_node_id"] = node.ID
 

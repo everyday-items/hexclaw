@@ -13,13 +13,16 @@ import (
 	"github.com/hexagon-codes/hexclaw/config"
 )
 
-type workflowTestEngine struct{}
+type workflowTestEngine struct {
+	lastMsg *adapter.Message
+}
 
 func (e *workflowTestEngine) Start(context.Context) error  { return nil }
 func (e *workflowTestEngine) Stop(context.Context) error   { return nil }
 func (e *workflowTestEngine) Health(context.Context) error { return nil }
 
 func (e *workflowTestEngine) Process(_ context.Context, msg *adapter.Message) (*adapter.Reply, error) {
+	e.lastMsg = msg
 	role := ""
 	if msg.Metadata != nil {
 		role = msg.Metadata["role"]
@@ -181,6 +184,50 @@ func TestWorkflowRun_CycleFails(t *testing.T) {
 	}
 	if !strings.Contains(got.Error, "DAG") {
 		t.Fatalf("期望 DAG 错误，实际 %q", got.Error)
+	}
+}
+
+func TestWorkflowRun_PassesExplicitProviderAndModelToEngine(t *testing.T) {
+	s := newWorkflowTestServer()
+	s.workflowStore.workflows["wf-model"] = &WorkflowData{
+		ID:   "wf-model",
+		Name: "model",
+		Nodes: []any{
+			map[string]any{"id": "input", "type": "input", "data": map[string]any{"value": "{{input}}"}},
+			map[string]any{"id": "agent", "type": "agent", "data": map[string]any{"provider": "智谱", "model": "glm-5", "prompt": "{{previous}}"}},
+			map[string]any{"id": "out", "type": "output"},
+		},
+		Edges: []any{
+			map[string]any{"source": "input", "target": "agent"},
+			map[string]any{"source": "agent", "target": "out"},
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/canvas/workflows/wf-model/run", strings.NewReader(`{"input":"hello"}`))
+	req.SetPathValue("id", "wf-model")
+	w := httptest.NewRecorder()
+
+	s.handleRunWorkflow(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+
+	var run WorkflowRun
+	if err := json.Unmarshal(w.Body.Bytes(), &run); err != nil {
+		t.Fatalf("解析运行响应失败: %v", err)
+	}
+
+	waitForRunCompletion(t, s, run.ID)
+
+	eng := s.engine.(*workflowTestEngine)
+	if eng.lastMsg == nil {
+		t.Fatal("workflow engine 未收到消息")
+	}
+	if got := eng.lastMsg.Metadata["provider"]; got != "智谱" {
+		t.Fatalf("provider 未透传，实际 %q", got)
+	}
+	if got := eng.lastMsg.Metadata["model"]; got != "glm-5" {
+		t.Fatalf("model 未透传，实际 %q", got)
 	}
 }
 

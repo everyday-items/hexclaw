@@ -135,13 +135,27 @@ func TestHubInstallNotFound(t *testing.T) {
 	}
 }
 
+func TestNewDefaultsToTaggedHubCatalog(t *testing.T) {
+	h := New(HubConfig{}, t.TempDir())
+
+	if h.cfg.RepoURL != "https://github.com/hexagon-codes/hexclaw-hub" {
+		t.Fatalf("RepoURL 默认值不匹配: %s", h.cfg.RepoURL)
+	}
+	if h.cfg.Branch != "v0.0.1" {
+		t.Fatalf("Branch 默认值不匹配: %s", h.cfg.Branch)
+	}
+	if got := h.catalogURL(); got != "https://raw.githubusercontent.com/hexagon-codes/hexclaw-hub/v0.0.1/index.json" {
+		t.Fatalf("catalogURL 默认值不匹配: %s", got)
+	}
+}
+
 func TestCatalogURL(t *testing.T) {
 	h := New(HubConfig{
 		RepoURL: "https://github.com/hexagon-codes/hexclaw-hub",
-		Branch:  "main",
+		Branch:  "v0.0.1",
 	}, "")
 
-	expected := "https://raw.githubusercontent.com/hexagon-codes/hexclaw-hub/main/index.json"
+	expected := "https://raw.githubusercontent.com/hexagon-codes/hexclaw-hub/v0.0.1/index.json"
 	if got := h.catalogURL(); got != expected {
 		t.Errorf("catalogURL 不匹配:\n期望: %s\n得到: %s", expected, got)
 	}
