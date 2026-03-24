@@ -38,7 +38,7 @@ type knowledgeDocumentResponse struct {
 // handleAddDocument 添加文档到知识库
 func (s *Server) handleAddDocument(w http.ResponseWriter, r *http.Request) {
 	var req AddDocumentRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 200<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "请求格式错误: " + err.Error(),
 		})
@@ -65,7 +65,7 @@ func (s *Server) handleAddDocument(w http.ResponseWriter, r *http.Request) {
 
 // handleUploadDocument 上传文件到知识库（支持 TXT/MD/CSV/JSON/DOCX）
 func (s *Server) handleUploadDocument(w http.ResponseWriter, r *http.Request) {
-	const maxUpload = 10 << 20 // 10MB
+	const maxUpload = 200 << 20 // 200MB
 	if err := r.ParseMultipartForm(maxUpload); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "解析上传失败: " + err.Error(),

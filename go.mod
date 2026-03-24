@@ -4,6 +4,7 @@ go 1.25.5
 
 require (
 	github.com/gorilla/websocket v1.5.3
+	github.com/hexagon-codes/ai-core v0.0.4
 	github.com/hexagon-codes/hexagon v0.3.2-beta
 	github.com/hexagon-codes/toolkit v0.0.3
 	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
@@ -21,7 +22,6 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/google/jsonschema-go v0.4.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/hexagon-codes/ai-core v0.0.4 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/modelcontextprotocol/go-sdk v1.4.1 // indirect

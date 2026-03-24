@@ -92,13 +92,15 @@ func (p *Pipeline) RecordUsage(ctx context.Context, msg *adapter.Message, usage 
 	}
 
 	record := &storage.CostRecord{
-		ID:        "cost-" + msg.ID,
-		UserID:    msg.UserID,
-		Provider:  usage.Provider,
-		Model:     usage.Model,
-		Tokens:    usage.InputTokens + usage.OutputTokens,
-		Cost:      usage.Cost,
-		CreatedAt: time.Now(),
+		ID:               "cost-" + msg.ID,
+		UserID:           msg.UserID,
+		Provider:         usage.Provider,
+		Model:            usage.Model,
+		PromptTokens:     usage.InputTokens,
+		CompletionTokens: usage.OutputTokens,
+		TotalTokens:      usage.InputTokens + usage.OutputTokens,
+		Cost:             usage.Cost,
+		CreatedAt:        time.Now(),
 	}
 	return p.store.SaveCost(ctx, record)
 }

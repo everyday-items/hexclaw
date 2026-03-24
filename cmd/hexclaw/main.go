@@ -25,6 +25,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/hexagon-codes/hexagon"
+	aiopenai "github.com/hexagon-codes/ai-core/llm/openai"
+	ragembedder "github.com/hexagon-codes/hexagon/rag/embedder"
+	"github.com/hexagon-codes/hexagon/rag/splitter"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	webadapter "github.com/hexagon-codes/hexclaw/adapter/web"
 	"github.com/hexagon-codes/hexclaw/api"
@@ -319,11 +322,17 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	eng := engine.NewReActEngine(cfg, router, store, skills)
 
 	// 6.5 初始化知识库（向量搜索 + FTS5 混合检索）
+	//
+	// 分层架构:
+	//   embedder: ai-core OpenAI Provider → hexagon rag/embedder 包装
+	//   splitter: hexagon rag/splitter.RecursiveSplitter
+	//   store:    hexclaw SQLite (文档元数据 + FTS5 + 向量 BLOB)
 	kbOK := false
 	if cfg.Knowledge.Enabled {
 		kbStore := knowledge.NewSQLiteStore(store.DB())
 		if err := kbStore.Init(ctx); err == nil {
-			var embedder knowledge.Embedder
+			// 1. 构造 embedder: ai-core Provider → hexagon embedder 包装
+			var emb *ragembedder.OpenAIEmbedder
 			if cfg.Knowledge.Embedding.Provider != "" {
 				providerName := cfg.Knowledge.Embedding.Provider
 				if pc, ok := cfg.LLM.Providers[providerName]; ok && pc.APIKey != "" {
@@ -331,14 +340,34 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					if model == "" {
 						model = "text-embedding-3-small"
 					}
-					var opts []knowledge.EmbedderOption
+					var providerOpts []aiopenai.Option
 					if pc.BaseURL != "" {
-						opts = append(opts, knowledge.WithBaseURL(pc.BaseURL))
+						providerOpts = append(providerOpts, aiopenai.WithBaseURL(pc.BaseURL))
 					}
-					embedder = knowledge.NewOpenAIEmbedder(pc.APIKey, model, opts...)
+					aiProvider := aiopenai.New(pc.APIKey, providerOpts...)
+					dim := aiopenai.EmbeddingDimension(model)
+					emb = ragembedder.NewOpenAIEmbedder(aiProvider,
+						ragembedder.WithModel(model),
+						ragembedder.WithDimension(dim),
+					)
 				}
 			}
 
+			// 2. 构造 splitter: hexagon RecursiveSplitter
+			chunkSize := cfg.Knowledge.ChunkSize
+			if chunkSize <= 0 {
+				chunkSize = 400
+			}
+			chunkOverlap := cfg.Knowledge.ChunkOverlap
+			if chunkOverlap <= 0 {
+				chunkOverlap = 80
+			}
+			sp := splitter.NewRecursiveSplitter(
+				splitter.WithRecursiveChunkSize(chunkSize),
+				splitter.WithRecursiveChunkOverlap(chunkOverlap),
+			)
+
+			// 3. 混合检索配置
 			hybridCfg := knowledge.DefaultHybridConfig()
 			if cfg.Knowledge.VectorWeight > 0 {
 				hybridCfg.VectorWeight = cfg.Knowledge.VectorWeight
@@ -351,25 +380,23 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			}
 			hybridCfg.TimeDecayDays = cfg.Knowledge.TimeDecayDays
 
-			var opts []knowledge.ManagerOption
-			if cfg.Knowledge.ChunkSize > 0 {
-				opts = append(opts, knowledge.WithChunkSize(cfg.Knowledge.ChunkSize))
-			}
-			if cfg.Knowledge.ChunkOverlap > 0 {
-				opts = append(opts, knowledge.WithChunkOverlap(cfg.Knowledge.ChunkOverlap))
-			}
-			opts = append(opts, knowledge.WithHybridConfig(hybridCfg))
-
-			kbMgr := knowledge.NewManager(kbStore, embedder, opts...)
+			// 4. 创建 Manager (kbStore 同时实现 DocumentRepository + ChunkSearcher)
+			kbMgr := knowledge.NewManager(kbStore, kbStore, emb,
+				knowledge.WithSplitter(sp),
+				knowledge.WithHybridConfig(hybridCfg),
+			)
 			eng.SetKnowledgeBase(kbMgr)
 			kbOK = true
 		}
 	}
 	if kbOK {
-		fmt.Println("  ✓ Knowledge   FTS5 + 向量混合检索")
+		fmt.Println("  ✓ Knowledge   FTS5 + 向量混合检索 (hexagon RAG)")
 	} else {
 		fmt.Println("  ✗ Knowledge   未启用")
 	}
+
+	// 6.6 从 SQLite 恢复 LLM 缓存（减少冷启动后的 API 开销）
+	eng.LLMCache().LoadFromDB(store.DB())
 
 	// 7. 初始化文件记忆系统
 	var fileMem *memory.FileMemory
@@ -786,6 +813,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	if scheduler != nil {
 		scheduler.Stop()
 	}
+
+	// 持久化 LLM 缓存到 SQLite（下次启动恢复）
+	eng.LLMCache().PersistToDB(store.DB())
 
 	if err := srv.Stop(shutdownCtx); err != nil {
 		log.Printf("关闭服务器出错: %v", err)

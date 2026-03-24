@@ -2,7 +2,7 @@
 //
 // 内置 Skill 包括：
 //   - search: 网络搜索（DuckDuckGo）
-//   - weather: 天气查询（wttr.in）
+//   - weather: 天气查询（wttr.in，带自动重试）
 //   - translate: 翻译（本地规则引擎）
 //   - summary: 摘要（本地抽取式摘要）
 //

@@ -11,7 +11,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +21,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/internal/sqliteutil"
 	"github.com/hexagon-codes/hexclaw/storage"
+	"github.com/hexagon-codes/hexclaw/storage/migrate"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
@@ -108,26 +108,27 @@ func New(dbPath string) (*Store, error) {
 }
 
 // Init 初始化数据库表
+//
+// 使用集中式版本迁移系统，所有 DDL 定义在 storage/migrate/migrations.go。
 func (s *Store) Init(ctx context.Context) error {
-	// 先建表（CREATE TABLE IF NOT EXISTS），确保表存在后再执行 ALTER TABLE 迁移
-	if _, err := s.db.ExecContext(ctx, schema); err != nil {
-		return fmt.Errorf("初始化数据库表失败: %w", err)
+	if err := migrate.Run(ctx, s.db, migrate.All); err != nil {
+		return fmt.Errorf("数据库迁移失败: %w", err)
 	}
-
-	// 再执行增量迁移：对已有表添加新字段/索引/触发器
-	s.runMigrations(ctx)
 	s.prepareHotStatements()
 	return nil
 }
 
+// searchMsgCols 搜索结果 Scan 用的消息子集（搜索结果只需要核心字段）
+const searchMsgCols = `m.id, m.session_id, m.parent_id, m.role, m.content, m.content_type, m.metadata, m.feedback, m.model_name, m.prompt_tokens, m.completion_tokens, m.finish_reason, m.latency_ms, m.request_id, m.meta, m.created_at`
+
 func (s *Store) prepareHotStatements() {
 	if stmt, err := s.db.Prepare(`
-		SELECT m.id, m.session_id, m.parent_id, m.role, m.content, m.metadata, m.created_at,
+		SELECT ` + searchMsgCols + `,
 		       s.title, bm25(messages_fts) AS rank
 		FROM messages_fts
 		JOIN messages m ON m.rowid = messages_fts.rowid
 		JOIN sessions s ON s.id = m.session_id
-		WHERE messages_fts MATCH ? AND s.user_id = ?
+		WHERE messages_fts MATCH ? AND s.user_id = ? AND s.status >= 0
 		ORDER BY rank
 		LIMIT ? OFFSET ?`); err == nil {
 		s.searchFTSStmt = stmt
@@ -138,48 +139,18 @@ func (s *Store) prepareHotStatements() {
 		FROM messages_fts
 		JOIN messages m ON m.rowid = messages_fts.rowid
 		JOIN sessions s ON s.id = m.session_id
-		WHERE messages_fts MATCH ? AND s.user_id = ?`); err == nil {
+		WHERE messages_fts MATCH ? AND s.user_id = ? AND s.status >= 0`); err == nil {
 		s.searchFTSCountStmt = stmt
 	}
 
 	if stmt, err := s.db.Prepare(`
-		SELECT m.id, m.session_id, m.parent_id, m.role, m.content, m.metadata, m.created_at,
+		SELECT ` + searchMsgCols + `,
 		       s.title, COUNT(*) OVER() AS total_count
 		FROM messages m JOIN sessions s ON s.id = m.session_id
-		WHERE m.content LIKE ? ESCAPE '\' AND s.user_id = ?
+		WHERE m.content LIKE ? ESCAPE '\' AND s.user_id = ? AND s.status >= 0
 		ORDER BY m.created_at DESC
-		 LIMIT ? OFFSET ?`); err == nil {
+		LIMIT ? OFFSET ?`); err == nil {
 		s.searchLikeStmt = stmt
-	}
-}
-
-// runMigrations 执行增量迁移
-//
-// 每条 ALTER TABLE 独立执行，忽略已存在的列/索引错误。
-// FTS5 虚拟表和触发器使用 IF NOT EXISTS 保证幂等。
-func (s *Store) runMigrations(ctx context.Context) {
-	stmts := []string{
-		`ALTER TABLE sessions ADD COLUMN parent_session_id TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE sessions ADD COLUMN branch_message_id TEXT NOT NULL DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id)`,
-		`ALTER TABLE sessions ADD COLUMN instance_id TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE sessions ADD COLUMN chat_id TEXT NOT NULL DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_sessions_scope ON sessions(user_id, platform, instance_id, chat_id, updated_at)`,
-		`ALTER TABLE messages ADD COLUMN parent_id TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE messages ADD COLUMN feedback TEXT NOT NULL DEFAULT ''`,
-		`CREATE INDEX IF NOT EXISTS idx_messages_parent_id ON messages(parent_id)`,
-		`CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content='messages', content_rowid='rowid')`,
-		`CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content); END`,
-		`CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.rowid, old.content); END`,
-		`CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.rowid, old.content); INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content); END`,
-	}
-	for _, stmt := range stmts {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			// 忽略 "duplicate column" 等已存在的错误
-			if !strings.Contains(err.Error(), "duplicate") && !strings.Contains(err.Error(), "already exists") {
-				log.Printf("sqlite migration warning: %v (stmt: %.80s)", err, stmt)
-			}
-		}
 	}
 }
 
@@ -202,6 +173,62 @@ func (s *Store) Close() error {
 // 供知识库等模块共享数据库连接使用。
 func (s *Store) DB() *sql.DB {
 	return s.db
+}
+
+// ─── SQL 列定义 + Scan 辅助（减少重复） ───────────────
+
+const sessionCols = `id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, status, message_count, total_prompt_tokens, total_completion_tokens, last_message_preview, meta, created_at, updated_at`
+
+const messageCols = `id, session_id, parent_id, role, content, content_type, metadata, feedback, model_name, prompt_tokens, completion_tokens, finish_reason, latency_ms, request_id, meta, created_at`
+
+type scannable interface{ Scan(dest ...any) error }
+
+func scanSession(sc scannable) (*storage.Session, error) {
+	var s storage.Session
+	if err := sc.Scan(
+		&s.ID, &s.UserID, &s.Platform, &s.InstanceID, &s.ChatID,
+		&s.Title, &s.ParentSessionID, &s.BranchMessageID,
+		&s.Status, &s.MessageCount, &s.TotalPromptTokens, &s.TotalCompletionTokens,
+		&s.LastMessagePreview, &s.Meta,
+		&s.CreatedAt, &s.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+func scanMessage(sc scannable) (*storage.MessageRecord, error) {
+	var m storage.MessageRecord
+	if err := sc.Scan(
+		&m.ID, &m.SessionID, &m.ParentID, &m.Role, &m.Content,
+		&m.ContentType, &m.Metadata, &m.Feedback,
+		&m.ModelName, &m.PromptTokens, &m.CompletionTokens,
+		&m.FinishReason, &m.LatencyMs, &m.RequestID, &m.Meta,
+		&m.CreatedAt,
+	); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func sessionInsertArgs(s *storage.Session) []any {
+	return []any{
+		s.ID, s.UserID, s.Platform, s.InstanceID, s.ChatID,
+		s.Title, s.ParentSessionID, s.BranchMessageID,
+		s.Status, s.MessageCount, s.TotalPromptTokens, s.TotalCompletionTokens,
+		s.LastMessagePreview, s.Meta,
+		s.CreatedAt, s.UpdatedAt,
+	}
+}
+
+func messageInsertArgs(m *storage.MessageRecord) []any {
+	return []any{
+		m.ID, m.SessionID, m.ParentID, m.Role, m.Content,
+		m.ContentType, m.Metadata, m.Feedback,
+		m.ModelName, m.PromptTokens, m.CompletionTokens,
+		m.FinishReason, m.LatencyMs, m.RequestID, m.Meta,
+		m.CreatedAt,
+	}
 }
 
 func (s *Store) invalidateSearchCache() {
@@ -295,9 +322,15 @@ func (s *Store) CreateSession(ctx context.Context, session *storage.Session) err
 	if session.UpdatedAt.IsZero() {
 		session.UpdatedAt = now
 	}
+	if session.Status == 0 {
+		session.Status = 1 // 默认 active
+	}
+	if session.Meta == "" {
+		session.Meta = "{}"
+	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO sessions (id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		session.ID, session.UserID, session.Platform, session.InstanceID, session.ChatID, session.Title, session.ParentSessionID, session.BranchMessageID, session.CreatedAt, session.UpdatedAt,
+		`INSERT INTO sessions (`+sessionCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sessionInsertArgs(session)...,
 	)
 	return err
 }
@@ -305,42 +338,42 @@ func (s *Store) CreateSession(ctx context.Context, session *storage.Session) err
 // GetSession 获取会话
 func (s *Store) GetSession(ctx context.Context, id string) (*storage.Session, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, created_at, updated_at FROM sessions WHERE id = ?`, id,
+		`SELECT `+sessionCols+` FROM sessions WHERE id = ?`, id,
 	)
-	var sess storage.Session
-	if err := row.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.InstanceID, &sess.ChatID, &sess.Title, &sess.ParentSessionID, &sess.BranchMessageID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+	sess, err := scanSession(row)
+	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, storage.ErrNotFound
 		}
 		return nil, err
 	}
-	return &sess, nil
+	return sess, nil
 }
 
-// FindSessionByScope 按 scope 查找最近活跃会话。
+// FindSessionByScope 按 scope 查找最近活跃会话（仅 active）
 func (s *Store) FindSessionByScope(ctx context.Context, userID, platform, instanceID, chatID string) (*storage.Session, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, created_at, updated_at
+		`SELECT `+sessionCols+`
 		 FROM sessions
-		 WHERE user_id = ? AND platform = ? AND instance_id = ? AND chat_id = ?
+		 WHERE user_id = ? AND platform = ? AND instance_id = ? AND chat_id = ? AND status = 1
 		 ORDER BY updated_at DESC, created_at DESC
 		 LIMIT 1`,
 		userID, platform, instanceID, chatID,
 	)
-	var sess storage.Session
-	if err := row.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.InstanceID, &sess.ChatID, &sess.Title, &sess.ParentSessionID, &sess.BranchMessageID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+	sess, err := scanSession(row)
+	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, storage.ErrNotFound
 		}
 		return nil, err
 	}
-	return &sess, nil
+	return sess, nil
 }
 
-// ListSessions 列出用户的会话
+// ListSessions 列出用户的会话（仅 active + archived，排除 deleted）
 func (s *Store) ListSessions(ctx context.Context, userID string, limit, offset int) ([]*storage.Session, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+		`SELECT `+sessionCols+` FROM sessions WHERE user_id = ? AND status >= 0 ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
 		userID, limit, offset,
 	)
 	if err != nil {
@@ -350,35 +383,26 @@ func (s *Store) ListSessions(ctx context.Context, userID string, limit, offset i
 
 	var sessions []*storage.Session
 	for rows.Next() {
-		var sess storage.Session
-		if err := rows.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.InstanceID, &sess.ChatID, &sess.Title, &sess.ParentSessionID, &sess.BranchMessageID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+		sess, err := scanSession(rows)
+		if err != nil {
 			return nil, err
 		}
-		sessions = append(sessions, &sess)
+		sessions = append(sessions, sess)
 	}
 	return sessions, rows.Err()
 }
 
-// DeleteSession 删除会话及其所有消息
+// DeleteSession 软删除会话（标记 status=-1）
 func (s *Store) DeleteSession(ctx context.Context, id string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET status = -1, updated_at = ? WHERE id = ?`,
+		time.Now(), id,
+	)
+	if err == nil {
+		s.invalidateSearchCache()
+		s.invalidateForkCache()
 	}
-	defer func() { _ = tx.Rollback() }()
-
-	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE session_id = ?`, id); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE id = ?`, id); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	s.invalidateSearchCache()
-	s.invalidateForkCache()
-	return nil
+	return err
 }
 
 // CleanupOldSessions 删除超过指定天数未活跃的会话及其消息
@@ -411,10 +435,16 @@ func (s *Store) CleanupOldSessions(ctx context.Context, olderThanDays int) (int6
 	return result.RowsAffected()
 }
 
-// SaveMessage 保存消息（事务保证原子性）
+// SaveMessage 保存消息 + 原子更新会话冗余统计字段
 func (s *Store) SaveMessage(ctx context.Context, msg *storage.MessageRecord) error {
 	if msg.CreatedAt.IsZero() {
 		msg.CreatedAt = time.Now()
+	}
+	if msg.ContentType == "" {
+		msg.ContentType = "text"
+	}
+	if msg.Meta == "" {
+		msg.Meta = "{}"
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -424,16 +454,27 @@ func (s *Store) SaveMessage(ctx context.Context, msg *storage.MessageRecord) err
 	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO messages (id, session_id, parent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		msg.ID, msg.SessionID, msg.ParentID, msg.Role, msg.Content, msg.Metadata, msg.CreatedAt,
+		`INSERT INTO messages (`+messageCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		messageInsertArgs(msg)...,
 	)
 	if err != nil {
 		return err
 	}
 
-	// 更新会话的 updated_at
+	// 原子更新会话冗余字段：message_count, token 汇总, last_message_preview, updated_at
+	preview := msg.Content
+	if len(preview) > 200 {
+		preview = preview[:200]
+	}
 	_, err = tx.ExecContext(ctx,
-		`UPDATE sessions SET updated_at = ? WHERE id = ?`, time.Now(), msg.SessionID,
+		`UPDATE sessions SET
+			updated_at = ?,
+			message_count = message_count + 1,
+			total_prompt_tokens = total_prompt_tokens + ?,
+			total_completion_tokens = total_completion_tokens + ?,
+			last_message_preview = ?
+		 WHERE id = ?`,
+		time.Now(), msg.PromptTokens, msg.CompletionTokens, preview, msg.SessionID,
 	)
 	if err != nil {
 		return err
@@ -459,8 +500,8 @@ func (s *Store) DeleteMessage(ctx context.Context, id string) error {
 // ListMessages 获取会话的消息历史
 func (s *Store) ListMessages(ctx context.Context, sessionID string, limit, offset int) ([]*storage.MessageRecord, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, session_id, parent_id, role, content, metadata, created_at FROM (
-			SELECT id, session_id, parent_id, role, content, metadata, created_at FROM messages WHERE session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?
+		`SELECT `+messageCols+` FROM (
+			SELECT `+messageCols+` FROM messages WHERE session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?
 		) ORDER BY created_at ASC`,
 		sessionID, limit, offset,
 	)
@@ -471,11 +512,11 @@ func (s *Store) ListMessages(ctx context.Context, sessionID string, limit, offse
 
 	var messages []*storage.MessageRecord
 	for rows.Next() {
-		var msg storage.MessageRecord
-		if err := rows.Scan(&msg.ID, &msg.SessionID, &msg.ParentID, &msg.Role, &msg.Content, &msg.Metadata, &msg.CreatedAt); err != nil {
+		msg, err := scanMessage(rows)
+		if err != nil {
 			return nil, err
 		}
-		messages = append(messages, &msg)
+		messages = append(messages, msg)
 	}
 	return messages, rows.Err()
 }
@@ -508,9 +549,13 @@ func (s *Store) SaveCost(ctx context.Context, record *storage.CostRecord) error 
 	if record.CreatedAt.IsZero() {
 		record.CreatedAt = time.Now()
 	}
+	if record.Meta == "" {
+		record.Meta = "{}"
+	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO cost_records (id, user_id, provider, model, tokens, cost, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		record.ID, record.UserID, record.Provider, record.Model, record.Tokens, record.Cost, record.CreatedAt,
+		`INSERT INTO cost_records (id, user_id, session_id, message_id, provider, model, prompt_tokens, completion_tokens, total_tokens, cost, meta, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		record.ID, record.UserID, record.SessionID, record.MessageID, record.Provider, record.Model,
+		record.PromptTokens, record.CompletionTokens, record.TotalTokens, record.Cost, record.Meta, record.CreatedAt,
 	)
 	return err
 }
@@ -573,12 +618,12 @@ func (s *Store) SearchMessages(ctx context.Context, userID, query string, limit,
 		rows, err = s.searchFTSStmt.QueryContext(ctx, query, userID, limit, offset)
 	} else {
 		rows, err = s.db.QueryContext(ctx,
-			`SELECT m.id, m.session_id, m.parent_id, m.role, m.content, m.metadata, m.created_at,
-			        s.title, bm25(messages_fts) AS rank, COUNT(*) OVER() AS total_count
+			`SELECT `+searchMsgCols+`,
+			        s.title, bm25(messages_fts) AS rank
 			 FROM messages_fts
 			 JOIN messages m ON m.rowid = messages_fts.rowid
 			 JOIN sessions s ON s.id = m.session_id
-			 WHERE messages_fts MATCH ? AND s.user_id = ?
+			 WHERE messages_fts MATCH ? AND s.user_id = ? AND s.status >= 0
 			 ORDER BY rank
 			 LIMIT ? OFFSET ?`,
 			query, userID, limit, offset,
@@ -591,12 +636,19 @@ func (s *Store) SearchMessages(ctx context.Context, userID, query string, limit,
 
 	results := make([]*storage.SearchResult, 0, limit)
 	for rows.Next() {
-		var msg storage.MessageRecord
+		var m storage.MessageRecord
 		var r storage.SearchResult
-		if err := rows.Scan(&msg.ID, &msg.SessionID, &msg.ParentID, &msg.Role, &msg.Content, &msg.Metadata, &msg.CreatedAt, &r.SessionTitle, &r.Rank); err != nil {
+		if err := rows.Scan(
+			&m.ID, &m.SessionID, &m.ParentID, &m.Role, &m.Content,
+			&m.ContentType, &m.Metadata, &m.Feedback,
+			&m.ModelName, &m.PromptTokens, &m.CompletionTokens,
+			&m.FinishReason, &m.LatencyMs, &m.RequestID, &m.Meta,
+			&m.CreatedAt,
+			&r.SessionTitle, &r.Rank,
+		); err != nil {
 			return nil, 0, err
 		}
-		r.Message = &msg
+		r.Message = &m
 		results = append(results, &r)
 	}
 	if err := rows.Err(); err != nil {
@@ -656,10 +708,10 @@ func (s *Store) searchMessagesLike(ctx context.Context, userID, query string, li
 		rows, err = s.searchLikeStmt.QueryContext(ctx, likeQuery, userID, limit, offset)
 	} else {
 		rows, err = s.db.QueryContext(ctx,
-			`SELECT m.id, m.session_id, m.parent_id, m.role, m.content, m.metadata, m.created_at,
+			`SELECT `+searchMsgCols+`,
 			        s.title, COUNT(*) OVER() AS total_count
 			 FROM messages m JOIN sessions s ON s.id = m.session_id
-			 WHERE m.content LIKE ? ESCAPE '\' AND s.user_id = ?
+			 WHERE m.content LIKE ? ESCAPE '\' AND s.user_id = ? AND s.status >= 0
 			 ORDER BY m.created_at DESC
 			 LIMIT ? OFFSET ?`,
 			likeQuery, userID, limit, offset,
@@ -673,12 +725,19 @@ func (s *Store) searchMessagesLike(ctx context.Context, userID, query string, li
 	results := make([]*storage.SearchResult, 0, limit)
 	var total int
 	for rows.Next() {
-		var msg storage.MessageRecord
+		var m storage.MessageRecord
 		var r storage.SearchResult
-		if err := rows.Scan(&msg.ID, &msg.SessionID, &msg.ParentID, &msg.Role, &msg.Content, &msg.Metadata, &msg.CreatedAt, &r.SessionTitle, &total); err != nil {
+		if err := rows.Scan(
+			&m.ID, &m.SessionID, &m.ParentID, &m.Role, &m.Content,
+			&m.ContentType, &m.Metadata, &m.Feedback,
+			&m.ModelName, &m.PromptTokens, &m.CompletionTokens,
+			&m.FinishReason, &m.LatencyMs, &m.RequestID, &m.Meta,
+			&m.CreatedAt,
+			&r.SessionTitle, &total,
+		); err != nil {
 			return nil, 0, err
 		}
-		r.Message = &msg
+		r.Message = &m
 		results = append(results, &r)
 	}
 	return results, total, rows.Err()
@@ -732,9 +791,15 @@ func (s *Store) ForkSession(ctx context.Context, sourceSessionID, messageID, use
 	newSessionID := "sess-" + idgen.ShortID()
 	branchTitle := stringx.Truncate(sourceTitle+" (分支)", 60)
 
+	forkSession := &storage.Session{
+		ID: newSessionID, UserID: userID, Platform: sourcePlatform, InstanceID: sourceInstanceID,
+		ChatID: sourceChatID, Title: branchTitle, ParentSessionID: sourceSessionID,
+		BranchMessageID: messageID, Status: 1, Meta: "{}",
+		CreatedAt: now, UpdatedAt: now,
+	}
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO sessions (id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		newSessionID, userID, sourcePlatform, sourceInstanceID, sourceChatID, branchTitle, sourceSessionID, messageID, now, now,
+		`INSERT INTO sessions (`+sessionCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sessionInsertArgs(forkSession)...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("创建分支会话失败: %w", err)
@@ -745,8 +810,9 @@ func (s *Store) ForkSession(ctx context.Context, sourceSessionID, messageID, use
 	// 不依赖插入顺序；读取时仍按 created_at 排序
 	forkPrefix := "msg-fork-" + strings.TrimPrefix(newSessionID, "sess-") + "-"
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO messages (id, session_id, parent_id, role, content, metadata, feedback, created_at)
-			 SELECT ? || rowid, ?, parent_id, role, content, metadata, feedback, created_at
+		`INSERT INTO messages (`+messageCols+`)
+			 SELECT ? || rowid, ?, parent_id, role, content, content_type, metadata, feedback,
+			        model_name, prompt_tokens, completion_tokens, finish_reason, latency_ms, request_id, meta, created_at
 			 FROM messages
 			 WHERE session_id = ? AND rowid <= ?`,
 		forkPrefix, newSessionID, sourceSessionID, msgRowID,
@@ -760,25 +826,13 @@ func (s *Store) ForkSession(ctx context.Context, sourceSessionID, messageID, use
 	}
 	s.invalidateSearchCache()
 
-	return &storage.Session{
-		ID:              newSessionID,
-		UserID:          userID,
-		Platform:        sourcePlatform,
-		InstanceID:      sourceInstanceID,
-		ChatID:          sourceChatID,
-		Title:           branchTitle,
-		ParentSessionID: sourceSessionID,
-		BranchMessageID: messageID,
-		CreatedAt:       now,
-		UpdatedAt:       now,
-	}, nil
+	return forkSession, nil
 }
 
 // ListSessionBranches 列出会话的所有分支
 func (s *Store) ListSessionBranches(ctx context.Context, sessionID string) ([]*storage.Session, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, created_at, updated_at
-		 FROM sessions WHERE parent_session_id = ? ORDER BY created_at DESC`,
+		`SELECT `+sessionCols+` FROM sessions WHERE parent_session_id = ? AND status >= 0 ORDER BY created_at DESC`,
 		sessionID,
 	)
 	if err != nil {
@@ -788,11 +842,11 @@ func (s *Store) ListSessionBranches(ctx context.Context, sessionID string) ([]*s
 
 	var sessions []*storage.Session
 	for rows.Next() {
-		var sess storage.Session
-		if err := rows.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.InstanceID, &sess.ChatID, &sess.Title, &sess.ParentSessionID, &sess.BranchMessageID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+		sess, err := scanSession(rows)
+		if err != nil {
 			return nil, err
 		}
-		sessions = append(sessions, &sess)
+		sessions = append(sessions, sess)
 	}
 	return sessions, rows.Err()
 }
@@ -812,48 +866,4 @@ func (s *Store) WithTx(ctx context.Context, fn func(storage.Store) error) error 
 	return tx.Commit()
 }
 
-// schema 数据库建表 SQL
-const schema = `
-CREATE TABLE IF NOT EXISTS sessions (
-    id                TEXT PRIMARY KEY,
-    user_id           TEXT NOT NULL,
-    platform          TEXT NOT NULL DEFAULT 'web',
-    instance_id       TEXT NOT NULL DEFAULT '',
-    chat_id           TEXT NOT NULL DEFAULT '',
-    title             TEXT NOT NULL DEFAULT '',
-    parent_session_id TEXT NOT NULL DEFAULT '',
-    branch_message_id TEXT NOT NULL DEFAULT '',
-    created_at        DATETIME NOT NULL,
-    updated_at        DATETIME NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id         TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(id),
-    parent_id  TEXT NOT NULL DEFAULT '',
-    role       TEXT NOT NULL,
-    content    TEXT NOT NULL,
-    metadata   TEXT NOT NULL DEFAULT '{}',
-    feedback   TEXT NOT NULL DEFAULT '',
-    created_at DATETIME NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
-CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
-
-CREATE TABLE IF NOT EXISTS cost_records (
-    id         TEXT PRIMARY KEY,
-    user_id    TEXT NOT NULL,
-    provider   TEXT NOT NULL,
-    model      TEXT NOT NULL,
-    tokens     INTEGER NOT NULL DEFAULT 0,
-    cost       REAL NOT NULL DEFAULT 0,
-    created_at DATETIME NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_cost_records_user_id ON cost_records(user_id);
-CREATE INDEX IF NOT EXISTS idx_cost_records_created_at ON cost_records(created_at);
-`
+// schema 已迁移到 storage/migrate/migrations.go，不再在此定义。

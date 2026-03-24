@@ -167,9 +167,9 @@ func TestCostTracking(t *testing.T) {
 
 	// 记录成本
 	records := []*storage.CostRecord{
-		{ID: "cost-001", UserID: "user-001", Provider: "deepseek", Model: "deepseek-chat", Tokens: 1000, Cost: 0.001},
-		{ID: "cost-002", UserID: "user-001", Provider: "openai", Model: "gpt-4o-mini", Tokens: 500, Cost: 0.01},
-		{ID: "cost-003", UserID: "user-002", Provider: "deepseek", Model: "deepseek-chat", Tokens: 2000, Cost: 0.002},
+		{ID: "cost-001", UserID: "user-001", Provider: "deepseek", Model: "deepseek-chat", TotalTokens: 1000, Cost: 0.001},
+		{ID: "cost-002", UserID: "user-001", Provider: "openai", Model: "gpt-4o-mini", TotalTokens: 500, Cost: 0.01},
+		{ID: "cost-003", UserID: "user-002", Provider: "deepseek", Model: "deepseek-chat", TotalTokens: 2000, Cost: 0.002},
 	}
 	for _, r := range records {
 		if err := store.SaveCost(ctx, r); err != nil {

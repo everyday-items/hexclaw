@@ -15,7 +15,7 @@ func TestManager_SearchReturnsStructuredHits(t *testing.T) {
 		t.Fatalf("初始化失败: %v", err)
 	}
 
-	mgr := NewManager(store, nil)
+	mgr := NewManager(store, store, nil, WithSplitter(testSplitter()))
 	doc, err := mgr.AddDocument(ctx, "SQLite Guide", "SQLite is a lightweight embedded database.", "upload:sqlite.txt")
 	if err != nil {
 		t.Fatalf("添加文档失败: %v", err)
@@ -51,7 +51,7 @@ func TestManager_ReindexDocumentUpdatesUpdatedAt(t *testing.T) {
 		t.Fatalf("初始化失败: %v", err)
 	}
 
-	mgr := NewManager(store, nil)
+	mgr := NewManager(store, store, nil, WithSplitter(testSplitter()))
 	doc, err := mgr.AddDocument(ctx, "Doc", "first sentence. second sentence.", "manual")
 	if err != nil {
 		t.Fatalf("添加文档失败: %v", err)

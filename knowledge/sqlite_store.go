@@ -13,29 +13,32 @@ import (
 	"github.com/hexagon-codes/hexclaw/internal/sqliteutil"
 )
 
-// SQLiteStore SQLite 知识库存储（FTS5 + 向量）
+// SQLiteStore SQLite 知识库存储
+//
+// 同时实现 DocumentRepository（写路径）和 ChunkSearcher（读路径）。
+// 两个接口共享同一个 *sql.DB 连接，事务由 Repository 方法内部管理。
 //
 // 存储结构：
 //   - kb_documents: 文档元信息
 //   - kb_chunks: 文档片段 + 向量嵌入（BLOB）
-//   - kb_chunks_fts: FTS5 全文索引虚拟表（自动同步 kb_chunks）
+//   - kb_chunks_fts: FTS5 全文索引虚拟表
 //
 // 向量存储采用 float32 序列化为 BLOB 的方式，
 // 余弦相似度在 Go 层计算。对于个人知识库规模（< 10万 chunk），
 // 这种方案性能完全够用，且避免了 CGO/sqlite-vec 的编译依赖。
-//
-// FTS5 使用 SQLite 内置的全文搜索引擎，支持 BM25 排名。
 type SQLiteStore struct {
-	db        *sql.DB
-	chunkSize int
+	db *sql.DB
 }
+
+// 编译期接口满足性检查
+var (
+	_ DocumentRepository = (*SQLiteStore)(nil)
+	_ ChunkSearcher      = (*SQLiteStore)(nil)
+)
 
 // NewSQLiteStore 创建 SQLite 知识库存储
 func NewSQLiteStore(db *sql.DB) *SQLiteStore {
-	return &SQLiteStore{
-		db:        db,
-		chunkSize: 400,
-	}
+	return &SQLiteStore{db: db}
 }
 
 // Init 初始化知识库表 + FTS5 索引
@@ -95,8 +98,8 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 	return nil
 }
 
-// AddDocument 添加文档及其 chunk（含向量和 FTS5 索引）
-func (s *SQLiteStore) AddDocument(ctx context.Context, doc *Document, chunks []*Chunk) error {
+// Add 添加文档及其 chunk（含向量和 FTS5 索引）
+func (s *SQLiteStore) Add(ctx context.Context, doc *Document, chunks []*Chunk) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -141,8 +144,8 @@ func (s *SQLiteStore) AddDocument(ctx context.Context, doc *Document, chunks []*
 	return tx.Commit()
 }
 
-// ReplaceDocument 使用同一文档 ID 重建索引。
-func (s *SQLiteStore) ReplaceDocument(ctx context.Context, doc *Document, chunks []*Chunk) error {
+// Replace 使用同一文档 ID 重建索引
+func (s *SQLiteStore) Replace(ctx context.Context, doc *Document, chunks []*Chunk) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -189,8 +192,8 @@ func (s *SQLiteStore) ReplaceDocument(ctx context.Context, doc *Document, chunks
 	return tx.Commit()
 }
 
-// DeleteDocument 删除文档及其 chunk + FTS5 索引
-func (s *SQLiteStore) DeleteDocument(ctx context.Context, docID string) error {
+// Delete 删除文档及其 chunk + FTS5 索引
+func (s *SQLiteStore) Delete(ctx context.Context, docID string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -216,8 +219,8 @@ func (s *SQLiteStore) DeleteDocument(ctx context.Context, docID string) error {
 	return tx.Commit()
 }
 
-// ListDocuments 列出所有文档
-func (s *SQLiteStore) ListDocuments(ctx context.Context) ([]*Document, error) {
+// List 列出所有文档
+func (s *SQLiteStore) List(ctx context.Context) ([]*Document, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, title, source, chunk_count, created_at, updated_at, status, error_message, source_type
 		 FROM kb_documents ORDER BY created_at DESC`,
@@ -238,8 +241,8 @@ func (s *SQLiteStore) ListDocuments(ctx context.Context) ([]*Document, error) {
 	return docs, rows.Err()
 }
 
-// GetDocument 获取单个文档详情。
-func (s *SQLiteStore) GetDocument(ctx context.Context, docID string) (*Document, error) {
+// Get 获取单个文档详情
+func (s *SQLiteStore) Get(ctx context.Context, docID string) (*Document, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, title, content, source, chunk_count, created_at, updated_at, status, error_message, source_type
 		 FROM kb_documents WHERE id = ?`,
@@ -286,10 +289,18 @@ func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK
 	var all []scored
 
 	for rows.Next() {
+		// 每 1000 行检查 context，避免长时间扫描不可取消
+		if len(all)%1000 == 0 {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+		}
+
 		var s scored
 		var embBlob []byte
 		if err := rows.Scan(&s.id, &s.docID, &s.chunkIndex, &embBlob); err != nil {
-			return nil, err
+			log.Printf("[knowledge] VectorSearch scan 失败: %v", err)
+			continue
 		}
 
 		if len(embBlob) > 0 {
@@ -318,7 +329,10 @@ func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK
 	for i, s := range all {
 		ids[i] = s.id
 	}
-	chunkMap := s.getChunksByIDs(ctx, ids)
+	chunkMap, chunkErr := s.getChunksByIDs(ctx, ids)
+	if chunkErr != nil {
+		log.Printf("[knowledge] VectorSearch 加载 chunks 失败: %v", chunkErr)
+	}
 
 	results := make([]*SearchResult, len(all))
 	for i, s := range all {
@@ -400,7 +414,11 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int) ([
 		for i, r := range raw {
 			ids[i] = r.chunkID
 		}
-		chunkMap = s.getChunksByIDs(ctx, ids)
+		var chunkLoadErr error
+		chunkMap, chunkLoadErr = s.getChunksByIDs(ctx, ids)
+		if chunkLoadErr != nil {
+			log.Printf("[knowledge] TextSearch 加载 chunks 失败: %v", chunkLoadErr)
+		}
 	}
 
 	// 归一化 BM25 分数到 0-1
@@ -430,21 +448,21 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int) ([
 
 // fallbackTextSearch FTS5 不可用时的降级搜索（LIKE 匹配）
 func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string, topK int) ([]*SearchResult, error) {
-	var conditions []string
+	var query strings.Builder
 	var args []any
-	for _, kw := range keywords {
-		conditions = append(conditions, "content LIKE ? ESCAPE '\\'")
+
+	query.WriteString("SELECT id, doc_id, content, chunk_index, embedding, created_at FROM kb_chunks WHERE ")
+	for i, kw := range keywords {
+		if i > 0 {
+			query.WriteString(" OR ")
+		}
+		query.WriteString("content LIKE ? ESCAPE '\\'")
 		args = append(args, "%"+sqliteutil.EscapeLike(kw)+"%")
 	}
-
-	whereClause := strings.Join(conditions, " OR ")
-	q := fmt.Sprintf(
-		`SELECT id, doc_id, content, chunk_index, embedding, created_at FROM kb_chunks WHERE %s LIMIT ?`,
-		whereClause,
-	)
+	query.WriteString(" LIMIT ?")
 	args = append(args, topK)
 
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.db.QueryContext(ctx, query.String(), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -455,7 +473,8 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 		chunk := &Chunk{}
 		var embBlob []byte
 		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &embBlob, &chunk.CreatedAt); err != nil {
-			return nil, err
+			log.Printf("[knowledge] fallbackTextSearch scan 失败: %v", err)
+			continue
 		}
 		if len(embBlob) > 0 {
 			chunk.Embedding = decodeFloat32Slice(embBlob)
@@ -479,30 +498,30 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 }
 
 // getChunksByIDs 批量获取 chunk 信息（避免 N+1 查询）
-func (s *SQLiteStore) getChunksByIDs(ctx context.Context, ids []string) map[string]*Chunk {
+func (s *SQLiteStore) getChunksByIDs(ctx context.Context, ids []string) (map[string]*Chunk, error) {
 	result := make(map[string]*Chunk, len(ids))
 	if len(ids) == 0 {
-		return result
+		return result, nil
 	}
 
-	// 构建 IN 查询
 	placeholders := make([]string, len(ids))
 	args := make([]any, len(ids))
 	for i, id := range ids {
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	query := fmt.Sprintf(
-		`SELECT c.id, c.doc_id, d.title, d.source, d.chunk_count, c.content, c.chunk_index, c.embedding, c.created_at
+
+	var query strings.Builder
+	query.WriteString(`SELECT c.id, c.doc_id, d.title, d.source, d.chunk_count, c.content, c.chunk_index, c.embedding, c.created_at
 		 FROM kb_chunks c
 		 JOIN kb_documents d ON d.id = c.doc_id
-		 WHERE c.id IN (%s)`,
-		strings.Join(placeholders, ","),
-	)
+		 WHERE c.id IN (`)
+	query.WriteString(strings.Join(placeholders, ","))
+	query.WriteString(")")
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.QueryContext(ctx, query.String(), args...)
 	if err != nil {
-		return result
+		return nil, fmt.Errorf("批量获取 chunks 失败: %w", err)
 	}
 	defer rows.Close()
 
@@ -510,6 +529,7 @@ func (s *SQLiteStore) getChunksByIDs(ctx context.Context, ids []string) map[stri
 		chunk := &Chunk{}
 		var embBlob []byte
 		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.DocTitle, &chunk.Source, &chunk.ChunkCount, &chunk.Content, &chunk.Index, &embBlob, &chunk.CreatedAt); err != nil {
+			log.Printf("[knowledge] scan chunk %s 失败: %v", chunk.ID, err)
 			continue
 		}
 		if len(embBlob) > 0 {
@@ -518,9 +538,9 @@ func (s *SQLiteStore) getChunksByIDs(ctx context.Context, ids []string) map[stri
 		result[chunk.ID] = chunk
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("读取 chunks 时出错: %v", err)
+		return result, fmt.Errorf("遍历 chunks 行时出错: %w", err)
 	}
-	return result
+	return result, nil
 }
 
 // --- 向量序列化/反序列化 ---

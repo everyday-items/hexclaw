@@ -171,6 +171,11 @@ func (e *ReActEngine) SetKnowledgeBase(kb *knowledge.Manager) {
 	e.kb = kb
 }
 
+// LLMCache 返回 LLM 响应缓存实例，用于启动加载和关闭持久化。
+func (e *ReActEngine) LLMCache() *cache.Cache {
+	return e.cache
+}
+
 // KnowledgeBase 获取知识库管理器
 func (e *ReActEngine) KnowledgeBase() *knowledge.Manager {
 	e.mu.RLock()
@@ -429,12 +434,14 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	// 9. 记录 Token 使用（用于成本控制）
 	if output.Usage.TotalTokens > 0 {
 		costRecord := &storage.CostRecord{
-			ID:        "cost-" + idgen.ShortID(),
-			UserID:    msg.UserID,
-			Provider:  selection.providerName,
-			Model:     selection.modelName,
-			Tokens:    output.Usage.TotalTokens,
-			CreatedAt: time.Now(),
+			ID:               "cost-" + idgen.ShortID(),
+			UserID:           msg.UserID,
+			Provider:         selection.providerName,
+			Model:            selection.modelName,
+			PromptTokens:     output.Usage.PromptTokens,
+			CompletionTokens: output.Usage.CompletionTokens,
+			TotalTokens:      output.Usage.TotalTokens,
+			CreatedAt:        time.Now(),
 		}
 		if err := e.store.SaveCost(ctx, costRecord); err != nil {
 			log.Printf("记录成本失败: %v", err)
@@ -715,12 +722,14 @@ func (e *ReActEngine) pipeStream(
 	// 记录 Token 使用
 	if result != nil && result.Usage.TotalTokens > 0 {
 		costRecord := &storage.CostRecord{
-			ID:        "cost-" + idgen.ShortID(),
-			UserID:    msg.UserID,
-			Provider:  providerName,
-			Model:     modelName,
-			Tokens:    result.Usage.TotalTokens,
-			CreatedAt: time.Now(),
+			ID:               "cost-" + idgen.ShortID(),
+			UserID:           msg.UserID,
+			Provider:         providerName,
+			Model:            modelName,
+			PromptTokens:     result.Usage.PromptTokens,
+			CompletionTokens: result.Usage.CompletionTokens,
+			TotalTokens:      result.Usage.TotalTokens,
+			CreatedAt:        time.Now(),
 		}
 		if err := e.store.SaveCost(saveCtx, costRecord); err != nil {
 			log.Printf("记录成本失败: %v", err)
@@ -811,12 +820,14 @@ func (e *ReActEngine) completeDirect(
 
 	if resp.Usage.TotalTokens > 0 {
 		costRecord := &storage.CostRecord{
-			ID:        "cost-" + idgen.ShortID(),
-			UserID:    msg.UserID,
-			Provider:  providerName,
-			Model:     modelName,
-			Tokens:    resp.Usage.TotalTokens,
-			CreatedAt: time.Now(),
+			ID:               "cost-" + idgen.ShortID(),
+			UserID:           msg.UserID,
+			Provider:         providerName,
+			Model:            modelName,
+			PromptTokens:     resp.Usage.PromptTokens,
+			CompletionTokens: resp.Usage.CompletionTokens,
+			TotalTokens:      resp.Usage.TotalTokens,
+			CreatedAt:        time.Now(),
 		}
 		if err := e.store.SaveCost(ctx, costRecord); err != nil {
 			log.Printf("记录成本失败: %v", err)

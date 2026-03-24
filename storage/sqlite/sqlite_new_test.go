@@ -35,12 +35,12 @@ func TestCostRecord_Persistence(t *testing.T) {
 	ctx := context.Background()
 
 	record := &storage.CostRecord{
-		ID:       "cost-test-1",
-		UserID:   "user-1",
-		Provider: "deepseek",
-		Model:    "deepseek-chat",
-		Tokens:   1500,
-		Cost:     0.0015,
+		ID:          "cost-test-1",
+		UserID:      "user-1",
+		Provider:    "deepseek",
+		Model:       "deepseek-chat",
+		TotalTokens: 1500,
+		Cost:        0.0015,
 	}
 	if err := store.SaveCost(ctx, record); err != nil {
 		t.Fatalf("SaveCost 失败: %v", err)

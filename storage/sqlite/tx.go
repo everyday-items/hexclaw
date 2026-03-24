@@ -33,49 +33,55 @@ func (s *txStore) CreateSession(ctx context.Context, session *storage.Session) e
 	if session.UpdatedAt.IsZero() {
 		session.UpdatedAt = now
 	}
+	if session.Status == 0 {
+		session.Status = 1
+	}
+	if session.Meta == "" {
+		session.Meta = "{}"
+	}
 	_, err := s.tx.ExecContext(ctx,
-		`INSERT INTO sessions (id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		session.ID, session.UserID, session.Platform, session.InstanceID, session.ChatID, session.Title, session.ParentSessionID, session.BranchMessageID, session.CreatedAt, session.UpdatedAt,
+		`INSERT INTO sessions (`+sessionCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sessionInsertArgs(session)...,
 	)
 	return err
 }
 
 func (s *txStore) GetSession(ctx context.Context, id string) (*storage.Session, error) {
 	row := s.tx.QueryRowContext(ctx,
-		`SELECT id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, created_at, updated_at FROM sessions WHERE id = ?`, id,
+		`SELECT `+sessionCols+` FROM sessions WHERE id = ?`, id,
 	)
-	var sess storage.Session
-	if err := row.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.InstanceID, &sess.ChatID, &sess.Title, &sess.ParentSessionID, &sess.BranchMessageID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+	sess, err := scanSession(row)
+	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, storage.ErrNotFound
 		}
 		return nil, err
 	}
-	return &sess, nil
+	return sess, nil
 }
 
 func (s *txStore) FindSessionByScope(ctx context.Context, userID, platform, instanceID, chatID string) (*storage.Session, error) {
 	row := s.tx.QueryRowContext(ctx,
-		`SELECT id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, created_at, updated_at
+		`SELECT `+sessionCols+`
 		 FROM sessions
-		 WHERE user_id = ? AND platform = ? AND instance_id = ? AND chat_id = ?
+		 WHERE user_id = ? AND platform = ? AND instance_id = ? AND chat_id = ? AND status = 1
 		 ORDER BY updated_at DESC, created_at DESC
 		 LIMIT 1`,
 		userID, platform, instanceID, chatID,
 	)
-	var sess storage.Session
-	if err := row.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.InstanceID, &sess.ChatID, &sess.Title, &sess.ParentSessionID, &sess.BranchMessageID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+	sess, err := scanSession(row)
+	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, storage.ErrNotFound
 		}
 		return nil, err
 	}
-	return &sess, nil
+	return sess, nil
 }
 
 func (s *txStore) ListSessions(ctx context.Context, userID string, limit, offset int) ([]*storage.Session, error) {
 	rows, err := s.tx.QueryContext(ctx,
-		`SELECT id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+		`SELECT `+sessionCols+` FROM sessions WHERE user_id = ? AND status >= 0 ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
 		userID, limit, offset,
 	)
 	if err != nil {
@@ -85,20 +91,20 @@ func (s *txStore) ListSessions(ctx context.Context, userID string, limit, offset
 
 	var sessions []*storage.Session
 	for rows.Next() {
-		var sess storage.Session
-		if err := rows.Scan(&sess.ID, &sess.UserID, &sess.Platform, &sess.InstanceID, &sess.ChatID, &sess.Title, &sess.ParentSessionID, &sess.BranchMessageID, &sess.CreatedAt, &sess.UpdatedAt); err != nil {
+		sess, err := scanSession(rows)
+		if err != nil {
 			return nil, err
 		}
-		sessions = append(sessions, &sess)
+		sessions = append(sessions, sess)
 	}
 	return sessions, rows.Err()
 }
 
 func (s *txStore) DeleteSession(ctx context.Context, id string) error {
-	if _, err := s.tx.ExecContext(ctx, `DELETE FROM messages WHERE session_id = ?`, id); err != nil {
-		return err
-	}
-	_, err := s.tx.ExecContext(ctx, `DELETE FROM sessions WHERE id = ?`, id)
+	_, err := s.tx.ExecContext(ctx,
+		`UPDATE sessions SET status = -1, updated_at = ? WHERE id = ?`,
+		time.Now(), id,
+	)
 	return err
 }
 
@@ -106,15 +112,33 @@ func (s *txStore) SaveMessage(ctx context.Context, msg *storage.MessageRecord) e
 	if msg.CreatedAt.IsZero() {
 		msg.CreatedAt = time.Now()
 	}
+	if msg.ContentType == "" {
+		msg.ContentType = "text"
+	}
+	if msg.Meta == "" {
+		msg.Meta = "{}"
+	}
 	_, err := s.tx.ExecContext(ctx,
-		`INSERT INTO messages (id, session_id, parent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		msg.ID, msg.SessionID, msg.ParentID, msg.Role, msg.Content, msg.Metadata, msg.CreatedAt,
+		`INSERT INTO messages (`+messageCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		messageInsertArgs(msg)...,
 	)
 	if err != nil {
 		return err
 	}
+
+	preview := msg.Content
+	if len(preview) > 200 {
+		preview = preview[:200]
+	}
 	_, err = s.tx.ExecContext(ctx,
-		`UPDATE sessions SET updated_at = ? WHERE id = ?`, time.Now(), msg.SessionID,
+		`UPDATE sessions SET
+			updated_at = ?,
+			message_count = message_count + 1,
+			total_prompt_tokens = total_prompt_tokens + ?,
+			total_completion_tokens = total_completion_tokens + ?,
+			last_message_preview = ?
+		 WHERE id = ?`,
+		time.Now(), msg.PromptTokens, msg.CompletionTokens, preview, msg.SessionID,
 	)
 	return err
 }
@@ -126,7 +150,7 @@ func (s *txStore) DeleteMessage(ctx context.Context, id string) error {
 
 func (s *txStore) ListMessages(ctx context.Context, sessionID string, limit, offset int) ([]*storage.MessageRecord, error) {
 	rows, err := s.tx.QueryContext(ctx,
-		`SELECT id, session_id, parent_id, role, content, metadata, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?`,
+		`SELECT `+messageCols+` FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?`,
 		sessionID, limit, offset,
 	)
 	if err != nil {
@@ -136,11 +160,11 @@ func (s *txStore) ListMessages(ctx context.Context, sessionID string, limit, off
 
 	var messages []*storage.MessageRecord
 	for rows.Next() {
-		var msg storage.MessageRecord
-		if err := rows.Scan(&msg.ID, &msg.SessionID, &msg.ParentID, &msg.Role, &msg.Content, &msg.Metadata, &msg.CreatedAt); err != nil {
+		msg, err := scanMessage(rows)
+		if err != nil {
 			return nil, err
 		}
-		messages = append(messages, &msg)
+		messages = append(messages, msg)
 	}
 	return messages, rows.Err()
 }
@@ -170,9 +194,13 @@ func (s *txStore) SaveCost(ctx context.Context, record *storage.CostRecord) erro
 	if record.CreatedAt.IsZero() {
 		record.CreatedAt = time.Now()
 	}
+	if record.Meta == "" {
+		record.Meta = "{}"
+	}
 	_, err := s.tx.ExecContext(ctx,
-		`INSERT INTO cost_records (id, user_id, provider, model, tokens, cost, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		record.ID, record.UserID, record.Provider, record.Model, record.Tokens, record.Cost, record.CreatedAt,
+		`INSERT INTO cost_records (id, user_id, session_id, message_id, provider, model, prompt_tokens, completion_tokens, total_tokens, cost, meta, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		record.ID, record.UserID, record.SessionID, record.MessageID, record.Provider, record.Model,
+		record.PromptTokens, record.CompletionTokens, record.TotalTokens, record.Cost, record.Meta, record.CreatedAt,
 	)
 	return err
 }
