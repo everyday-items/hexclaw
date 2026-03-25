@@ -63,6 +63,8 @@
 | Email | IMAP/SMTP | ✅ |
 | REST API | HTTP | ✅ |
 
+> **WebSocket Security**: The Web WebSocket endpoint now validates the Origin header, allowing only localhost and Tauri (`tauri://localhost`) origins. `InsecureSkipVerify` is no longer used.
+
 ## Quick Start
 
 ### Installation
@@ -209,8 +211,13 @@ file_memory:
   enabled: true
   dir: ~/.hexclaw/memory/
 
+compaction:
+  enabled: true
+  max_messages: 50
+  keep_recent: 10
+
 knowledge:
-  enabled: false
+  enabled: true
   chunk_size: 400
   top_k: 3
 
@@ -345,9 +352,10 @@ hexclaw/
 | POST | `/api/v1/knowledge/documents` | Upload document |
 | POST | `/api/v1/knowledge/upload` | Upload file and return indexing result |
 | GET | `/api/v1/knowledge/documents` | Document list |
+| GET | `/api/v1/knowledge/documents/{id}` | Single document detail with full content |
 | DELETE | `/api/v1/knowledge/documents/{id}` | Delete document |
 | POST | `/api/v1/knowledge/documents/{id}/reindex` | Reindex/retry one document |
-| POST | `/api/v1/knowledge/search` | Structured search with chunks, sources, and scores |
+| POST | `/api/v1/knowledge/search` | Structured search — both `result` and `results` return `[]SearchHit` with chunks, sources, and scores |
 
 ### Cron Jobs
 | Method | Path | Description |
@@ -477,7 +485,8 @@ Installing or uninstalling Markdown skills automatically syncs the runtime skill
 - `GET /api/v1/skills` always returns `enabled`; `PUT /api/v1/skills/{name}/status` additionally returns `effective_enabled`, `requires_restart`, and `message`.
 - `POST /api/v1/skills/install` accepts `clawhub://skill-name` and local relative paths; on success it returns `requires_restart=false` and `runtime_registered=true`, meaning the runtime engine has already hot-synced.
 - `GET /api/v1/cron/jobs/{id}/history` includes `result` in each history entry so the latest execution output summary can be shown directly.
-- `POST /api/v1/knowledge/search` returns structured chunk results with document title, source, chunk position, content, and similarity score so the UI can show citations directly.
+- `POST /api/v1/knowledge/search` returns structured chunk results (both `result` and `results` fields are now `[]SearchHit`) with document title, source, chunk position, content, and similarity score so the UI can show citations directly. `result` is no longer a concatenated plain string.
+- `GET /api/v1/knowledge/documents/{id}` returns a single document with its full content.
 - `GET /api/v1/knowledge/documents` includes `status`, `error_message`, `updated_at`, and `source_type`; `POST /api/v1/knowledge/upload` returns `status`, `source`, `chunk_count`, and `warnings`.
 - `POST /api/v1/agents/rules/test` returns matched rules and scores so the UI can explain why a request was routed to a given agent.
 - Log entries returned by `GET /api/v1/logs` include a stable `domain` field for filtering by functional area such as `chat`, `knowledge`, `integration`, `automation`, or `engine`.

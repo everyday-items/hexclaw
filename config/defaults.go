@@ -91,6 +91,40 @@ func DefaultConfig() *Config {
 				Backend: "sqlite",
 			},
 		},
+		Knowledge: KnowledgeConfig{
+			Enabled:       true,
+			ChunkSize:     400,
+			ChunkOverlap:  80,
+			TopK:          3,
+			VectorWeight:  0.7,
+			TextWeight:    0.3,
+			MMRLambda:     0.7,
+			TimeDecayDays: 30,
+		},
+		Compaction: CompactionConfig{
+			Enabled:     true,
+			MaxMessages: 50,
+			KeepRecent:  10,
+		},
+		FileMemory: FileMemoryConfig{
+			Enabled:   true,
+			Dir:       "~/.hexclaw/memory/",
+			MaxMemory: 200,
+			DailyDays: 2,
+		},
+		Skills: SkillsConfig{
+			Enabled:  true,
+			Dir:      "~/.hexclaw/skills/",
+			AutoLoad: true,
+			Hub: SkillsHubConfig{
+				RepoURL: "github.com/hexagon-codes/hexclaw-hub",
+				Branch:  "v0.0.1",
+			},
+		},
+		Heartbeat: HeartbeatConfig{
+			Enabled:      false,
+			IntervalMins: 15,
+		},
 		Router: RouterConfig{
 			Enabled: true,
 		},

@@ -577,8 +577,9 @@ curl -X POST http://127.0.0.1:16060/api/v1/im/channels/telegram/test \
 - `/api/v1/skills` 和 `/api/v1/skills/{name}/status` 返回 `enabled/effective_enabled/requires_restart/message`
 - `/api/v1/skills/install` 支持 `clawhub://skill-name` 或本地相对路径；在线安装成功时返回 `requires_restart=false/runtime_registered=true`
 - `/api/v1/cron/jobs/{id}/history` 的历史项包含 `result`，便于直接展示执行输出摘要
-- `/api/v1/knowledge/search` 返回结构化 chunk 结果，不再只是拼接后的上下文字符串
+- `/api/v1/knowledge/search` 返回结构化 chunk 结果（`result` 和 `results` 字段均为 `[]SearchHit` 数组），不再只是拼接后的上下文字符串
 - `/api/v1/knowledge/documents` 返回 `status/error_message/updated_at/source_type`
+- `/api/v1/knowledge/documents/{id}` 返回单个文档的完整内容
 - `/api/v1/logs` 支持 `domain` 过滤，便于按功能域诊断问题
 
 ### 日志

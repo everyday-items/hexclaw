@@ -18,6 +18,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/cache"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/knowledge"
+	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/session"
@@ -46,6 +47,7 @@ type ReActEngine struct {
 	store       storage.Store
 	cache       *cache.Cache
 	kb          *knowledge.Manager // 知识库管理器（可为 nil）
+	fileMem     *memory.FileMemory // 文件记忆系统（可为 nil）
 	factory     *agents.Factory    // Agent 角色工厂
 	started     bool
 	startAt     time.Time
@@ -169,6 +171,13 @@ func (e *ReActEngine) SetKnowledgeBase(kb *knowledge.Manager) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.kb = kb
+}
+
+// SetFileMemory 设置文件记忆系统，启用自动记忆提取。
+func (e *ReActEngine) SetFileMemory(fm *memory.FileMemory) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.fileMem = fm
 }
 
 // LLMCache 返回 LLM 响应缓存实例，用于启动加载和关闭持久化。
@@ -472,6 +481,9 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 			Result:    truncateResult(tc.Result.String(), 500),
 		})
 	}
+
+	// 自动记忆提取（异步，不阻塞回复）
+	e.autoExtractMemory(msg.Content, output.Content)
 
 	return &adapter.Reply{
 		Content:   output.Content,

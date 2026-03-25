@@ -193,6 +193,31 @@ func (s *Server) handleListDocuments(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleGetDocument 获取单个知识库文档详情（含正文）
+func (s *Server) handleGetDocument(w http.ResponseWriter, r *http.Request) {
+	docID := r.PathValue("id")
+	if docID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "文档 ID 不能为空",
+		})
+		return
+	}
+
+	doc, err := s.kb.GetDocument(r.Context(), docID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "不存在") {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{
+			"error": "获取文档失败: " + err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, doc)
+}
+
 // handleDeleteDocument 删除知识库文档
 func (s *Server) handleDeleteDocument(w http.ResponseWriter, r *http.Request) {
 	docID := r.PathValue("id")
@@ -277,17 +302,8 @@ func (s *Server) handleSearchKnowledge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	context, err := s.kb.Query(r.Context(), req.Query, topK)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"error": "搜索失败: " + err.Error(),
-		})
-		return
-	}
-
 	writeJSON(w, http.StatusOK, map[string]any{
-		"result":  context,
-		"context": context,
+		"result":  results,
 		"results": results,
 		"total":   len(results),
 	})

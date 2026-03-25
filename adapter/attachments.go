@@ -15,20 +15,30 @@ func HasMessageInput(content string, attachments []Attachment) bool {
 	return strings.TrimSpace(content) != "" || len(attachments) > 0
 }
 
-// ValidateAttachments 校验当前支持的附件格式。
+// MaxAttachments 单条消息最大附件数（防止 token 爆炸）
+const MaxAttachments = 20
+
+// ValidateAttachments 校验附件格式和数量。
 func ValidateAttachments(attachments []Attachment) error {
-	for i, attachment := range attachments {
+	if len(attachments) > MaxAttachments {
+		return fmt.Errorf("一次最多上传 %d 个文件哦，当前选了 %d 个", MaxAttachments, len(attachments))
+	}
+	for _, attachment := range attachments {
 		if attachment.URL == "" && attachment.Data == "" {
-			return fmt.Errorf("attachments[%d] 缺少 data 或 url", i)
-		}
-		if attachment.URL != "" && attachment.Data != "" {
-			return fmt.Errorf("attachments[%d] 不能同时提供 data 和 url", i)
+			return fmt.Errorf("文件 %s 内容为空，请重新选择", nameOrDefault(attachment.Name))
 		}
 		if !IsImageAttachment(attachment) {
-			return fmt.Errorf("attachments[%d] 仅支持图片附件", i)
+			return fmt.Errorf("目前仅支持发送图片，文档请先用文字方式粘贴内容。不支持的文件：%s", nameOrDefault(attachment.Name))
 		}
 	}
 	return nil
+}
+
+func nameOrDefault(name string) string {
+	if name != "" {
+		return name
+	}
+	return "未知文件"
 }
 
 // IsImageAttachment 判断附件是否为图片。

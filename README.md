@@ -63,6 +63,8 @@
 | Email | IMAP/SMTP | ✅ |
 | REST API | HTTP | ✅ |
 
+> **WebSocket 安全**：Web WebSocket 连接启用了 Origin 校验，仅允许 localhost 和 Tauri（`tauri://localhost`）来源，不再使用 `InsecureSkipVerify`。
+
 ## 快速开始
 
 ### 安装
@@ -209,8 +211,13 @@ file_memory:
   enabled: true
   dir: ~/.hexclaw/memory/
 
+compaction:
+  enabled: true
+  max_messages: 50
+  keep_recent: 10
+
 knowledge:
-  enabled: false
+  enabled: true
   chunk_size: 400
   top_k: 3
 
@@ -345,9 +352,10 @@ hexclaw/
 | POST | `/api/v1/knowledge/documents` | 上传文档 |
 | POST | `/api/v1/knowledge/upload` | 上传文件并返回索引结果 |
 | GET | `/api/v1/knowledge/documents` | 文档列表 |
+| GET | `/api/v1/knowledge/documents/{id}` | 单个文档详情（含完整内容） |
 | DELETE | `/api/v1/knowledge/documents/{id}` | 删除文档 |
 | POST | `/api/v1/knowledge/documents/{id}/reindex` | 重建/重试单个文档索引 |
-| POST | `/api/v1/knowledge/search` | 结构化搜索（返回分片、来源、分数） |
+| POST | `/api/v1/knowledge/search` | 结构化搜索（`result` 和 `results` 均返回 `[]SearchHit` 数组，包含分片、来源、分数） |
 
 ### 定时任务
 | 方法 | 路径 | 说明 |
@@ -477,7 +485,8 @@ hexclaw/
 - `GET /api/v1/skills` 稳定返回 `enabled`；`PUT /api/v1/skills/{name}/status` 额外返回 `effective_enabled`、`requires_restart`、`message`。
 - `POST /api/v1/skills/install` 支持 `clawhub://skill-name` 和本地相对路径；成功时返回 `requires_restart=false` 与 `runtime_registered=true`，表示已热同步到运行引擎。
 - `GET /api/v1/cron/jobs/{id}/history` 的历史项包含 `result`，可直接查看最近一次执行输出摘要。
-- `POST /api/v1/knowledge/search` 返回结构化结果数组，包含文档标题、来源、chunk 位置、内容和相似度分数，适合直接在前端展示引用来源。
+- `POST /api/v1/knowledge/search` 返回结构化结果数组（`result` 和 `results` 字段均为 `[]SearchHit`），包含文档标题、来源、chunk 位置、内容和相似度分数，适合直接在前端展示引用来源。`result` 不再是拼接后的纯字符串。
+- `GET /api/v1/knowledge/documents/{id}` 返回单个文档的完整信息，包含全部内容。
 - `GET /api/v1/knowledge/documents` 返回 `status`、`error_message`、`updated_at`、`source_type`；`POST /api/v1/knowledge/upload` 返回 `status`、`source`、`chunk_count`、`warnings`。
 - `POST /api/v1/agents/rules/test` 会返回命中规则与分数，便于解释“为什么路由到这个 Agent”。
 - `GET /api/v1/logs` 的日志项包含稳定 `domain` 字段，可按 `chat / knowledge / integration / automation / engine` 等功能域过滤。

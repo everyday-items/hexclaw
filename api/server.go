@@ -222,6 +222,7 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /api/v1/knowledge/documents", s.handleAddDocument)
 		mux.HandleFunc("POST /api/v1/knowledge/upload", s.handleUploadDocument)
 		mux.HandleFunc("GET /api/v1/knowledge/documents", s.handleListDocuments)
+		mux.HandleFunc("GET /api/v1/knowledge/documents/{id}", s.handleGetDocument)
 		mux.HandleFunc("DELETE /api/v1/knowledge/documents/{id}", s.handleDeleteDocument)
 		mux.HandleFunc("POST /api/v1/knowledge/documents/{id}/reindex", s.handleReindexDocument)
 		mux.HandleFunc("POST /api/v1/knowledge/search", s.handleSearchKnowledge)

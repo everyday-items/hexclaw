@@ -254,6 +254,11 @@ func (m *Manager) DeleteDocument(ctx context.Context, docID string) error {
 	return m.repo.Delete(ctx, docID)
 }
 
+// GetDocument 获取单个文档详情（含正文）
+func (m *Manager) GetDocument(ctx context.Context, docID string) (*Document, error) {
+	return m.repo.Get(ctx, docID)
+}
+
 // ListDocuments 列出所有文档
 func (m *Manager) ListDocuments(ctx context.Context) ([]*Document, error) {
 	return m.repo.List(ctx)

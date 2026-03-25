@@ -300,14 +300,28 @@ func (a *FeishuAdapter) sendReplyNow(ctx context.Context, chatID string, reply *
 }
 
 // SendStream 发送流式回复
+//
+// 先立即发送"思考中..."占位消息，收到内容后逐步更新，
+// 让用户知道 Agent 正在处理（类似飞书"正在输入..."体验）。
 func (a *FeishuAdapter) SendStream(ctx context.Context, chatID string, chunks <-chan *adapter.ReplyChunk) error {
+	// 立即发送思考状态占位消息（随机表情增加趣味性）
+	messageID, err := a.sendAndGetID(ctx, chatID, randomThinkingMessage())
+	if err != nil {
+		log.Printf("[feishu] 发送思考占位消息失败（将降级为直接回复）: %v", err)
+	}
+
 	var sb strings.Builder
-	var messageID string
 	lastUpdateLen := 0
-	const updateThreshold = 50
+	lastUpdateTime := time.Now()
+	const updateThreshold = 50          // 最少积累 50 字符才更新
+	const updateInterval = time.Second  // 最少间隔 1 秒才更新（防限流）
 
 	for chunk := range chunks {
 		if chunk.Error != nil {
+			// 出错时更新占位消息为错误提示
+			if messageID != "" {
+				_ = a.patchMessage(ctx, messageID, "⚠️ 处理失败，请重试")
+			}
 			return chunk.Error
 		}
 		if chunk.Done {
@@ -315,24 +329,22 @@ func (a *FeishuAdapter) SendStream(ctx context.Context, chatID string, chunks <-
 		}
 		sb.WriteString(chunk.Content)
 
-		if messageID == "" && sb.Len() >= updateThreshold {
-			var err error
-			messageID, err = a.sendAndGetID(ctx, chatID, sb.String()+"…")
-			if err != nil {
-				continue
+		// 收到内容后逐步更新占位消息（限流保护）
+		if messageID != "" && sb.Len()-lastUpdateLen >= updateThreshold && time.Since(lastUpdateTime) >= updateInterval {
+			if pErr := a.patchMessage(ctx, messageID, sb.String()+"…"); pErr != nil {
+				log.Printf("[feishu] 更新流式消息失败: %v", pErr)
 			}
 			lastUpdateLen = sb.Len()
-			continue
-		}
-
-		if messageID != "" && sb.Len()-lastUpdateLen >= updateThreshold {
-			_ = a.patchMessage(ctx, messageID, sb.String()+"…")
-			lastUpdateLen = sb.Len()
+			lastUpdateTime = time.Now()
 		}
 	}
 
 	finalContent := sb.String()
 	if finalContent == "" {
+		// 没有内容，删除占位消息或更新为空回复
+		if messageID != "" {
+			_ = a.patchMessage(ctx, messageID, "(空回复)")
+		}
 		return nil
 	}
 	if messageID != "" {
@@ -404,6 +416,21 @@ func (a *FeishuAdapter) patchMessage(ctx context.Context, messageID, text string
 	}
 	_ = resp.Body.Close()
 	return nil
+}
+
+// randomThinkingMessage 随机返回一条思考状态消息
+func randomThinkingMessage() string {
+	messages := []string{
+		"🤔 思考中...",
+		"⌨️ 正在输入...",
+		"🧠 让我想想...",
+		"💭 思考中...",
+		"📝 正在整理思路...",
+		"🔍 查找中...",
+		"⏳ 稍等一下...",
+		"🎯 正在分析...",
+	}
+	return messages[time.Now().UnixNano()%int64(len(messages))]
 }
 
 // handleMessage 处理消息事件（webhook 兼容路径）

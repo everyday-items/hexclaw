@@ -577,8 +577,9 @@ Key response semantics:
 - `/api/v1/skills` and `/api/v1/skills/{name}/status` return `enabled/effective_enabled/requires_restart/message`
 - `/api/v1/skills/install` accepts `clawhub://skill-name` or a local relative path; successful online installs return `requires_restart=false/runtime_registered=true`
 - `/api/v1/cron/jobs/{id}/history` includes `result` in each history item so execution output summaries can be shown directly
-- `/api/v1/knowledge/search` returns structured chunk results instead of one concatenated context string
+- `/api/v1/knowledge/search` returns structured chunk results (both `result` and `results` are now `[]SearchHit` arrays) instead of one concatenated context string
 - `/api/v1/knowledge/documents` returns `status/error_message/updated_at/source_type`
+- `/api/v1/knowledge/documents/{id}` returns a single document with full content
 - `/api/v1/logs` supports `domain` filtering for functional diagnostics
 
 ### Logs

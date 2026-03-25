@@ -40,6 +40,73 @@ func TestDefaultConfig(t *testing.T) {
 	if !cfg.Platforms.Web.Enabled {
 		t.Error("Web 平台应默认开启")
 	}
+
+	// Knowledge 默认值
+	if !cfg.Knowledge.Enabled {
+		t.Error("Knowledge 应默认开启")
+	}
+	if cfg.Knowledge.ChunkSize != 400 {
+		t.Errorf("期望 ChunkSize=400，得到 %d", cfg.Knowledge.ChunkSize)
+	}
+	if cfg.Knowledge.ChunkOverlap != 80 {
+		t.Errorf("期望 ChunkOverlap=80，得到 %d", cfg.Knowledge.ChunkOverlap)
+	}
+	if cfg.Knowledge.TopK != 3 {
+		t.Errorf("期望 TopK=3，得到 %d", cfg.Knowledge.TopK)
+	}
+	if cfg.Knowledge.VectorWeight != 0.7 {
+		t.Errorf("期望 VectorWeight=0.7，得到 %f", cfg.Knowledge.VectorWeight)
+	}
+	if cfg.Knowledge.TextWeight != 0.3 {
+		t.Errorf("期望 TextWeight=0.3，得到 %f", cfg.Knowledge.TextWeight)
+	}
+	if cfg.Knowledge.MMRLambda != 0.7 {
+		t.Errorf("期望 MMRLambda=0.7，得到 %f", cfg.Knowledge.MMRLambda)
+	}
+	if cfg.Knowledge.TimeDecayDays != 30 {
+		t.Errorf("期望 TimeDecayDays=30，得到 %d", cfg.Knowledge.TimeDecayDays)
+	}
+
+	// Compaction 默认值
+	if !cfg.Compaction.Enabled {
+		t.Error("Compaction 应默认开启")
+	}
+	if cfg.Compaction.MaxMessages != 50 {
+		t.Errorf("期望 MaxMessages=50，得到 %d", cfg.Compaction.MaxMessages)
+	}
+	if cfg.Compaction.KeepRecent != 10 {
+		t.Errorf("期望 KeepRecent=10，得到 %d", cfg.Compaction.KeepRecent)
+	}
+
+	// FileMemory 默认值
+	if !cfg.FileMemory.Enabled {
+		t.Error("FileMemory 应默认开启")
+	}
+	if cfg.FileMemory.Dir != "~/.hexclaw/memory/" {
+		t.Errorf("期望 Dir=~/.hexclaw/memory/，得到 %s", cfg.FileMemory.Dir)
+	}
+	if cfg.FileMemory.MaxMemory != 200 {
+		t.Errorf("期望 MaxMemory=200，得到 %d", cfg.FileMemory.MaxMemory)
+	}
+	if cfg.FileMemory.DailyDays != 2 {
+		t.Errorf("期望 DailyDays=2，得到 %d", cfg.FileMemory.DailyDays)
+	}
+
+	// Skills 默认值
+	if !cfg.Skills.Enabled {
+		t.Error("Skills 应默认开启")
+	}
+	if !cfg.Skills.AutoLoad {
+		t.Error("Skills.AutoLoad 应默认开启")
+	}
+
+	// Heartbeat 默认值
+	if cfg.Heartbeat.Enabled {
+		t.Error("Heartbeat 应默认关闭")
+	}
+	if cfg.Heartbeat.IntervalMins != 15 {
+		t.Errorf("期望 IntervalMins=15，得到 %d", cfg.Heartbeat.IntervalMins)
+	}
 }
 
 func TestLoadFromFile(t *testing.T) {

@@ -415,7 +415,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		}
 	}
 	if memCtxLen > 0 {
-		fmt.Printf("  ✓ Memory      文件记忆 (%d 字符)\n", memCtxLen)
+		fmt.Printf("  ✓ Memory      文件记忆 (%d 字符) + 自动记忆\n", memCtxLen)
+		eng.SetFileMemory(fileMem)
 	} else {
 		fmt.Println("  ✗ Memory      未启用")
 	}

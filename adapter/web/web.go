@@ -131,8 +131,12 @@ func (a *WebAdapter) SendStream(ctx context.Context, chatID string, chunks <-cha
 // handleWS 处理 WebSocket 连接
 func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// 允许跨域（开发模式）
-		InsecureSkipVerify: true,
+		OriginPatterns: []string{
+			"localhost:*",
+			"127.0.0.1:*",
+			"tauri://localhost",
+			"https://tauri.localhost",
+		},
 	})
 	if err != nil {
 		log.Printf("WebSocket 握手失败: %v", err)
