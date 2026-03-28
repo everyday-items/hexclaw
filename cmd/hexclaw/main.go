@@ -403,7 +403,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				}
 			}
 
-			sharedEmbedder = emb // 共享给 VectorMemory 和语义搜索
+			if emb != nil {
+				sharedEmbedder = emb // 共享给 VectorMemory 和语义搜索
+			}
 			// 2. 构造 splitter: hexagon RecursiveSplitter
 			chunkSize := cfg.Knowledge.ChunkSize
 			if chunkSize <= 0 {
