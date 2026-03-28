@@ -112,14 +112,14 @@ hexclaw init
 
 ### 技能市场（hexclaw-hub）
 
-桌面端「技能市场」从在线目录拉取 `index.json` 与 `skills/*.md`。默认仓库为 **`hexagon-codes/hexclaw-hub`** 的 **`v0.0.1`** 标签。自建镜像时可覆盖：
+桌面端「技能市场」从在线目录拉取 `index.json` 与 `skills/*.md`。默认仓库为 **`hexagon-codes/hexclaw-hub`** 的 **`v0.0.2`** 标签。自建镜像时可覆盖：
 
 ```yaml
 skills:
   enabled: true
   hub:
     repo_url: https://github.com/hexagon-codes/hexclaw-hub
-    branch: v0.0.1
+    branch: v0.0.2
 ```
 
 安装或卸载 Markdown 技能后，引擎会**自动同步**运行时技能注册表，一般**无需重启** sidecar。

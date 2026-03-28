@@ -11,6 +11,7 @@ package skill
 import (
 	"context"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/adapter"
 )
 
@@ -35,6 +36,10 @@ type Skill interface {
 	// Execute 执行 Skill
 	// args 为参数映射，来自 LLM Tool Use 或 Match 后的解析结果
 	Execute(ctx context.Context, args map[string]any) (*Result, error)
+
+	// ToolDefinition 返回 LLM 工具定义
+	// 包含名称、描述和参数 Schema，供 ToolCollector 收集并注册到 LLM
+	ToolDefinition() llm.ToolDefinition
 }
 
 // Result Skill 执行结果

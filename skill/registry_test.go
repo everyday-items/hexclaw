@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/adapter"
 )
 
@@ -16,12 +17,15 @@ type mockSkill struct {
 }
 
 func (s *mockSkill) Name() string        { return s.name }
-func (s *mockSkill) Description() string  { return s.desc }
+func (s *mockSkill) Description() string { return s.desc }
 func (s *mockSkill) Match(content string) bool {
 	return strings.HasPrefix(content, s.prefix)
 }
 func (s *mockSkill) Execute(_ context.Context, args map[string]any) (*Result, error) {
 	return &Result{Content: "executed: " + s.name}, nil
+}
+func (s *mockSkill) ToolDefinition() llm.ToolDefinition {
+	return llm.NewToolDefinition(s.name, s.desc, nil)
 }
 
 func TestRegistry_RegisterAndGet(t *testing.T) {

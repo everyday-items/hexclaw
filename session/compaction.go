@@ -42,8 +42,9 @@ func DefaultCompactionConfig() CompactionConfig {
 //
 // 对标 OpenClaw 的 Context Compaction 机制。
 type Compactor struct {
-	store  storage.Store
-	config CompactionConfig
+	store    storage.Store
+	config   CompactionConfig
+	archiver *Archiver // 会话归档器（可为 nil）
 }
 
 // NewCompactor 创建上下文压缩器
@@ -55,8 +56,9 @@ func NewCompactor(store storage.Store, cfg CompactionConfig) *Compactor {
 		cfg.KeepRecent = 10
 	}
 	return &Compactor{
-		store:  store,
-		config: cfg,
+		store:    store,
+		config:   cfg,
+		archiver: NewArchiver(""),
 	}
 }
 
@@ -99,6 +101,13 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, provider hexa
 	oldMsgs := msgs[:len(msgs)-keepCount]
 	if len(oldMsgs) == 0 {
 		return 0, nil
+	}
+
+	// 归档旧消息到文件 (D7: 链路④ 会话转录)
+	if c.archiver != nil {
+		if _, archErr := c.archiver.Archive(sessionID, oldMsgs); archErr != nil {
+			log.Printf("会话归档失败 (非致命): %v", archErr)
+		}
 	}
 
 	// 生成摘要（在事务外执行，避免持有 DB 锁期间进行 LLM API 调用）

@@ -537,7 +537,7 @@ golangci-lint run
 |-----------|-----------|
 | Language | Go 1.25+ |
 | Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.3.1-beta |
-| AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.0.4 |
+| AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.0.5 |
 | Utility Library | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.3 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | Configuration | YAML + environment variables |
@@ -581,7 +581,7 @@ chore: build/toolchain updates
 | Project | Description | Repository |
 |---------|-------------|------------|
 | **Hexagon** | Go AI Agent framework (core engine) v0.3.1-beta | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI core library (LLM/Tool/Memory) v0.0.4 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **ai-core** | AI core library (LLM/Tool/Memory) v0.0.5 | [ai-core](https://github.com/hexagon-codes/ai-core) |
 | **toolkit** | Go utility library v0.0.3 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI dashboard (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
 | **hexclaw-desktop** | HexClaw desktop client (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |

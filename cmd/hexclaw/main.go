@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -26,8 +27,6 @@ import (
 
 	"github.com/hexagon-codes/hexagon"
 	aiopenai "github.com/hexagon-codes/ai-core/llm/openai"
-	ragembedder "github.com/hexagon-codes/hexagon/rag/embedder"
-	"github.com/hexagon-codes/hexagon/rag/splitter"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	webadapter "github.com/hexagon-codes/hexclaw/adapter/web"
 	"github.com/hexagon-codes/hexclaw/api"
@@ -45,6 +44,7 @@ import (
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
+	"github.com/hexagon-codes/hexclaw/session"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/skill/builtin"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
@@ -88,6 +88,7 @@ func newRootCmd() *cobra.Command {
 		newInitCmd(),
 		newVersionCmd(),
 		newSkillCmd(),
+		newMCPCmd(),
 		newSecurityCmd(),
 	)
 
@@ -313,6 +314,15 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		defer mcpMgr.Close()
 	}
 
+	// 4.7 注册高级 Skill (需依赖注入: sandbox/hub/mcp)
+	builtin.RegisterAdvanced(skills, cfg.Skill.Builtin, builtin.SkillDeps{
+		McpMgr: mcpMgr,
+	})
+	advCount := len(skills.All()) - builtinCount - mdCount
+	if advCount > 0 {
+		fmt.Printf("  ✓ Advanced    %d 个高级 Skill (SkillWriter/Installer/FileOps)\n", advCount)
+	}
+
 	// 5. 初始化安全网关
 	gw := gateway.NewPipeline(&cfg.Security, store)
 	gwLayers := gw.LayerNames()
@@ -321,6 +331,45 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 6. 创建并启动 Agent 引擎
 	eng := engine.NewReActEngine(cfg, router, store, skills)
 
+	// 6.1 接入统一工具循环 (D1-D3 产出)
+	toolCollector := engine.NewToolCollector(skills, mcpMgr, 40)
+	toolExecutor := engine.NewToolExecutor(skills, mcpMgr)
+	toolExecutor.AddHook(&engine.AuditHook{})
+	toolExecutor.AddHook(&engine.TruncateHook{MaxChars: 8000})
+	toolExecutor.AddHook(&engine.SanitizeHook{}) // Phase 9: prompt injection defense
+
+	// 6.1.1 接入权限审批 Hook (D24)
+	permHub := engine.NewPermissionHub(60 * time.Second)
+	permHook := engine.NewPermissionHook(permHub)
+	toolExecutor.AddHook(permHook)
+
+	// 6.1.2 接入 per-tool 权限控制 (Phase 9 D40)
+	if len(cfg.Security.ToolPermissions.Deny) > 0 || len(cfg.Security.ToolPermissions.Allow) > 0 {
+		perms := engine.NewToolPermissions(cfg.Security.ToolPermissions.Allow, cfg.Security.ToolPermissions.Deny)
+		toolExecutor.AddHook(engine.NewToolPermissionHook(perms))
+	}
+
+	eng.SetToolCollector(toolCollector)
+	eng.SetToolExecutor(toolExecutor)
+	eng.SetSessionLock(session.NewSessionLock())
+	fmt.Printf("  ✓ Tools       %d 个工具 (Skill + MCP)\n", len(toolCollector.Collect()))
+
+	// 6.2 接入预算控制器 (G1: 三维预算 - token/duration/cost)
+	budgetDuration := 30 * time.Minute
+	if cfg.Budget.MaxDuration != "" {
+		if d, err := time.ParseDuration(cfg.Budget.MaxDuration); err == nil {
+			budgetDuration = d
+		}
+	}
+	budgetCtrl := engine.NewBudgetController(engine.BudgetConfig{
+		MaxTokens:   cfg.Budget.MaxTokens,
+		MaxDuration: budgetDuration,
+		MaxCost:     cfg.Budget.MaxCost,
+	})
+	eng.SetBudget(budgetCtrl)
+	fmt.Printf("  ✓ Budget      max_tokens=%d, max_duration=%v, max_cost=$%.2f\n",
+		cfg.Budget.MaxTokens, budgetDuration, cfg.Budget.MaxCost)
+
 	// 6.5 初始化知识库（向量搜索 + FTS5 混合检索）
 	//
 	// 分层架构:
@@ -328,11 +377,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	//   splitter: hexagon rag/splitter.RecursiveSplitter
 	//   store:    hexclaw SQLite (文档元数据 + FTS5 + 向量 BLOB)
 	kbOK := false
+	var sharedEmbedder hexagon.VectorEmbedder // 共享 embedder: KB + VectorMemory + 语义搜索
 	if cfg.Knowledge.Enabled {
 		kbStore := knowledge.NewSQLiteStore(store.DB())
 		if err := kbStore.Init(ctx); err == nil {
 			// 1. 构造 embedder: ai-core Provider → hexagon embedder 包装
-			var emb *ragembedder.OpenAIEmbedder
+			var emb *hexagon.OpenAIEmbedder
 			if cfg.Knowledge.Embedding.Provider != "" {
 				providerName := cfg.Knowledge.Embedding.Provider
 				if pc, ok := cfg.LLM.Providers[providerName]; ok && pc.APIKey != "" {
@@ -346,13 +396,14 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					}
 					aiProvider := aiopenai.New(pc.APIKey, providerOpts...)
 					dim := aiopenai.EmbeddingDimension(model)
-					emb = ragembedder.NewOpenAIEmbedder(aiProvider,
-						ragembedder.WithModel(model),
-						ragembedder.WithDimension(dim),
+					emb = hexagon.NewOpenAIEmbedder(aiProvider,
+						hexagon.WithEmbedderModel(model),
+						hexagon.WithEmbedderDimension(dim),
 					)
 				}
 			}
 
+			sharedEmbedder = emb // 共享给 VectorMemory 和语义搜索
 			// 2. 构造 splitter: hexagon RecursiveSplitter
 			chunkSize := cfg.Knowledge.ChunkSize
 			if chunkSize <= 0 {
@@ -362,9 +413,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			if chunkOverlap <= 0 {
 				chunkOverlap = 80
 			}
-			sp := splitter.NewRecursiveSplitter(
-				splitter.WithRecursiveChunkSize(chunkSize),
-				splitter.WithRecursiveChunkOverlap(chunkOverlap),
+			sp := hexagon.NewRecursiveSplitter(
+				hexagon.WithRecursiveChunkSize(chunkSize),
+				hexagon.WithRecursiveChunkOverlap(chunkOverlap),
 			)
 
 			// 3. 混合检索配置
@@ -419,6 +470,19 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		eng.SetFileMemory(fileMem)
 	} else {
 		fmt.Println("  ✗ Memory      未启用")
+	}
+
+	// 7.5 初始化向量语义记忆 (D4: 链路④修复)
+	if cfg.Memory.Vector.Enabled && sharedEmbedder != nil {
+		vecStore := hexagon.NewMemoryVectorStore(sharedEmbedder.Dimension())
+		vecMem := memory.NewVectorMemory(vecStore, sharedEmbedder, memory.VectorMemoryConfig{
+			Enabled:  true,
+			TopK:     cfg.Memory.Vector.TopK,
+			MinScore: float32(cfg.Memory.Vector.MinScore),
+			AutoSave: cfg.Memory.Vector.AutoSave,
+		})
+		eng.SetVectorMemory(vecMem)
+		fmt.Println("  ✓ VectorMem   语义记忆 (内存向量库)")
 	}
 
 	if err := eng.Start(ctx); err != nil {
@@ -571,10 +635,17 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	if fileMem != nil {
 		srv.SetFileMemory(fileMem)
 	}
+	if vm := eng.GetVectorMemory(); vm != nil {
+		srv.SetVectorMemory(vm)
+	}
 
 	// 挂载 Phase 4 API 端点
 	if mcpMgr != nil {
 		srv.SetMCPManager(mcpMgr)
+	}
+	// MCP 动态添加持久化 (P0 修复: HTTP API 添加的 MCP server 也要持久化)
+	if home, err := os.UserHomeDir(); err == nil {
+		srv.SetCfgWriter(config.NewWriter(filepath.Join(home, ".hexclaw", "hexclaw.yaml")))
 	}
 	if mp != nil {
 		srv.SetMarketplace(mp)
@@ -654,6 +725,32 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	eng.SetAgentRouter(agentRouter)
 	srv.SetAgentRouter(agentRouter)
 	srv.SetAgentStore(agentStore)
+
+	// 注册需要 dispatcher/executor 的 Agent 级 Skill
+	if err := skills.Register(engine.NewHandoffSkill(agentRouter)); err != nil {
+		log.Printf("注册 HandoffSkill 失败: %v", err)
+	}
+	// OrchestrateSkill + SpawnSkill 共享 executor: 通过 engine.Process 执行子任务
+	agentExecFn := func(ctx context.Context, agentName, task string) (string, error) {
+		msg := &adapter.Message{
+			ID:       "sub-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+			Platform: adapter.PlatformAPI,
+			UserID:   "system",
+			Content:  task,
+			Metadata: map[string]string{"role": agentName},
+		}
+		reply, err := eng.Process(ctx, msg)
+		if err != nil {
+			return "", err
+		}
+		return reply.Content, nil
+	}
+	if err := skills.Register(engine.NewOrchestrateSkill(agentExecFn)); err != nil {
+		log.Printf("注册 OrchestrateSkill 失败: %v", err)
+	}
+	if err := skills.Register(engine.NewSpawnSkill(agentExecFn)); err != nil {
+		log.Printf("注册 SpawnSkill 失败: %v", err)
+	}
 
 	agentCount := len(agentRouter.ListAgents())
 	ruleCount := len(agentRouter.ListRules())
@@ -751,6 +848,17 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				return eng.ProcessStream(ctx, msg)
 			})
 			srv.SetWebSocketHandler(wa.Handler())
+
+			// 接通工具审批: WebAdapter ↔ PermissionHub
+			wa.SetApprovalResponseHandler(func(reqID string, approved, remember bool) {
+				permHub.HandleResponse(engine.PermissionResponse{
+					RequestID: reqID,
+					Approved:  approved,
+					Remember:  remember,
+				})
+			})
+			permHub.SetSender(&webPermissionBridge{wa: wa})
+			fmt.Println("  ✓ Permission  WebSocket 审批已接通")
 		}
 	}
 	if err := instanceMgr.StartEnabled(ctx); err != nil {
@@ -828,6 +936,22 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	fmt.Println("  🦀 HexClaw 已停止")
 	return nil
+}
+
+// webPermissionBridge adapts WebAdapter to engine.PermissionSender interface.
+// Breaks circular dependency: engine → adapter/web.
+type webPermissionBridge struct {
+	wa *webadapter.WebAdapter
+}
+
+func (b *webPermissionBridge) SendPermissionRequest(ctx context.Context, sessionID string, req *engine.PermissionRequest) error {
+	return b.wa.SendPermissionRequest(ctx, sessionID, &webadapter.PermissionRequestData{
+		ID:        req.ID,
+		ToolName:  req.ToolName,
+		Arguments: req.Arguments,
+		Risk:      req.Risk,
+		Reason:    req.Reason,
+	})
 }
 
 // runInit 初始化配置

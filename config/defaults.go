@@ -73,6 +73,8 @@ func DefaultConfig() *Config {
 				Browser:   true,
 				Code:      false, // 高风险，默认关闭
 				Shell:     false, // 高风险，默认关闭
+				CodeExec:  false, // 需沙箱，默认关闭
+				FileOps:   true,  // 受限于 workspace，默认开启
 			},
 		},
 		Storage: StorageConfig{
@@ -138,6 +140,11 @@ func DefaultConfig() *Config {
 				Enabled:  false,
 				Exporter: "otlp",
 			},
+		},
+		Budget: BudgetConfig{
+			MaxTokens:   500000,
+			MaxDuration: "30m",
+			MaxCost:     5.0,
 		},
 	}
 }

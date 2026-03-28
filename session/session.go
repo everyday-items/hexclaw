@@ -169,6 +169,27 @@ func (m *Manager) BuildContext(ctx context.Context, sessionID string) ([]hexagon
 		})
 	}
 
+	// Token 预算兜底：按字符数近似估算，从最新消息往回保留
+	// 预留 40% 给 system prompt + knowledge context + 新回复
+	tokenBudget := m.cfg.Conversation.TokenBudget
+	if tokenBudget <= 0 {
+		tokenBudget = 60000 // 默认 6 万 token（适配 128K 上下文窗口的 ~47%）
+	}
+	// 近似：1 token ≈ 3 个字符（中文偏保守）
+	charBudget := tokenBudget * 3
+	totalChars := 0
+	cutIdx := 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		totalChars += len(messages[i].Content)
+		if totalChars > charBudget {
+			cutIdx = i + 1
+			break
+		}
+	}
+	if cutIdx > 0 && cutIdx < len(messages) {
+		messages = messages[cutIdx:]
+	}
+
 	return messages, nil
 }
 

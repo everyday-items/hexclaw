@@ -38,6 +38,14 @@ type Config struct {
 	Canvas     CanvasConfig     `yaml:"canvas"`
 	Audit      AuditConfig      `yaml:"audit"`
 	Voice      VoiceConfig      `yaml:"voice"`
+	Budget     BudgetConfig     `yaml:"budget"`
+}
+
+// BudgetConfig 单任务三维预算控制 (G1 前置关卡)
+type BudgetConfig struct {
+	MaxTokens   int64  `yaml:"max_tokens"`   // 单任务 token 上限，0 表示使用默认值 500000
+	MaxDuration string `yaml:"max_duration"` // 单任务时间上限，如 "30m"，空表示使用默认值
+	MaxCost     float64 `yaml:"max_cost"`    // 单任务成本上限 USD，0 表示使用默认值 5.00
 }
 
 // RouterConfig 多 Agent 路由配置
@@ -165,12 +173,22 @@ type MCPConfig struct {
 
 // MCPServerConfig 单个 MCP Server 配置
 type MCPServerConfig struct {
-	Name      string   `yaml:"name"`      // 名称标识
-	Transport string   `yaml:"transport"` // 传输: stdio / sse
-	Command   string   `yaml:"command"`   // stdio 命令（如 npx, uvx）
-	Args      []string `yaml:"args"`      // stdio 命令参数
-	Endpoint  string   `yaml:"endpoint"`  // sse 端点 URL
-	Enabled   bool     `yaml:"enabled"`   // 是否启用，默认 true
+	Name      string          `yaml:"name"`      // 名称标识
+	Transport string          `yaml:"transport"` // 传输: stdio / sse / streamable
+	Command   string          `yaml:"command"`   // stdio 命令（如 npx, uvx）
+	Args      []string        `yaml:"args"`      // stdio 命令参数
+	Endpoint  string          `yaml:"endpoint"`  // sse/streamable 端点 URL
+	Enabled   bool            `yaml:"enabled"`   // 是否启用，默认 true
+	Auth      *MCPAuthConfig  `yaml:"auth,omitempty"` // OAuth 配置（可选）
+}
+
+// MCPAuthConfig MCP server OAuth 认证配置
+type MCPAuthConfig struct {
+	Type     string   `yaml:"type"`      // "oauth"
+	ClientID string   `yaml:"client_id"`
+	AuthURL  string   `yaml:"auth_url"`
+	TokenURL string   `yaml:"token_url"`
+	Scopes   []string `yaml:"scopes,omitempty"`
 }
 
 // SkillsConfig 技能市场配置
@@ -468,6 +486,13 @@ type SecurityConfig struct {
 	Cost               CostConfig            `yaml:"cost"`
 	RateLimit          RateLimitConfig       `yaml:"rate_limit"`
 	RBAC               RBACConfig            `yaml:"rbac"`
+	ToolPermissions    ToolPermissionsConfig `yaml:"tool_permissions"`
+}
+
+// ToolPermissionsConfig per-tool allow/deny 权限 (Phase 9 D40)
+type ToolPermissionsConfig struct {
+	Allow []string `yaml:"allow"` // glob patterns, empty = allow all
+	Deny  []string `yaml:"deny"`  // glob patterns, deny overrides allow
 }
 
 // RBACConfig 角色权限控制配置
@@ -542,11 +567,12 @@ type SkillConfig struct {
 
 // SandboxConfig 沙箱配置
 type SandboxConfig struct {
-	Enabled   bool              `yaml:"enabled"`
-	Timeout   string            `yaml:"timeout"`
-	MaxMemory string            `yaml:"max_memory"`
-	Network   SandboxNetwork    `yaml:"network"`
+	Enabled    bool              `yaml:"enabled"`
+	Timeout    string            `yaml:"timeout"`
+	MaxMemory  string            `yaml:"max_memory"`
+	Network    SandboxNetwork    `yaml:"network"`
 	Filesystem SandboxFilesystem `yaml:"filesystem"`
+	Windows    WindowsSandboxConfig `yaml:"windows"` // Phase 8: Windows 专属配置
 }
 
 // SandboxNetwork 沙箱网络配置
@@ -557,6 +583,15 @@ type SandboxNetwork struct {
 // SandboxFilesystem 沙箱文件系统配置
 type SandboxFilesystem struct {
 	AllowedPaths []string `yaml:"allowed_paths"`
+}
+
+// WindowsSandboxConfig Windows 沙箱专属配置 (Phase 8)
+type WindowsSandboxConfig struct {
+	Mode       string `yaml:"mode"`          // readonly / workspace-write / full-access
+	NetworkMode string `yaml:"network_mode"` // offline / online
+	MemoryMB   int    `yaml:"memory_mb"`     // Job Object 内存限制 (MB)
+	MaxProcs   int    `yaml:"max_processes"`  // Job Object 进程数限制
+	UseDesktop bool   `yaml:"use_desktop"`   // 是否创建隔离桌面
 }
 
 // VerificationConfig Skill 签名验证配置
@@ -574,6 +609,8 @@ type BuiltinConfig struct {
 	Browser   bool `yaml:"browser"`
 	Code      bool `yaml:"code"`
 	Shell     bool `yaml:"shell"`
+	CodeExec  bool `yaml:"code_exec"` // 沙箱代码执行 (需 sandbox 初始化)
+	FileOps   bool `yaml:"file_ops"`  // 文件读写编辑 (受限于 workspace)
 }
 
 // StorageConfig 存储配置
@@ -616,6 +653,7 @@ type VectorMemoryConfig struct {
 type ConversationMemoryConfig struct {
 	MaxTurns     int `yaml:"max_turns"`
 	SummaryAfter int `yaml:"summary_after"`
+	TokenBudget  int `yaml:"token_budget"` // Token 预算上限（近似值），默认 60000
 }
 
 // LongTermMemoryConfig 长期记忆配置

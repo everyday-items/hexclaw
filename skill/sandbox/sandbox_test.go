@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
@@ -20,6 +21,9 @@ func (s *mockSkill) Description() string { return "test" }
 func (s *mockSkill) Match(_ string) bool { return false }
 func (s *mockSkill) Execute(ctx context.Context, args map[string]any) (*skill.Result, error) {
 	return s.execFn(ctx, args)
+}
+func (s *mockSkill) ToolDefinition() llm.ToolDefinition {
+	return llm.NewToolDefinition(s.name, "test", nil)
 }
 
 // TestSandbox_Normal 测试正常执行

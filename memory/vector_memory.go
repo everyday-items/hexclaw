@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hexagon-codes/hexagon/store/vector"
+	"github.com/hexagon-codes/hexagon"
 )
 
 // VectorMemory 基于向量存储的语义记忆
@@ -24,8 +24,8 @@ import (
 //  4. SemanticVector - 向量语义记忆（本层，hexagon 向量存储）
 type VectorMemory struct {
 	mu       sync.RWMutex
-	store    vector.Store
-	embedder vector.Embedder
+	store    hexagon.VectorMemoryStoreInterface
+	embedder hexagon.VectorEmbedder
 	config   VectorMemoryConfig
 }
 
@@ -42,7 +42,7 @@ type VectorMemoryConfig struct {
 //
 // store: hexagon 向量存储实例（Milvus/Weaviate/Qdrant/Memory 等）
 // embedder: 向量生成器（将文本转为向量）
-func NewVectorMemory(store vector.Store, embedder vector.Embedder, cfg VectorMemoryConfig) *VectorMemory {
+func NewVectorMemory(store hexagon.VectorMemoryStoreInterface, embedder hexagon.VectorEmbedder, cfg VectorMemoryConfig) *VectorMemory {
 	if cfg.TopK <= 0 {
 		cfg.TopK = 5
 	}
@@ -76,7 +76,7 @@ func (vm *VectorMemory) Save(ctx context.Context, content string, metadata map[s
 	}
 	metadata["saved_at"] = time.Now().Format(time.RFC3339)
 
-	doc := vector.Document{
+	doc := hexagon.VectorDocument{
 		ID:        generateMemoryID(),
 		Content:   content,
 		Embedding: embedding,
@@ -87,7 +87,7 @@ func (vm *VectorMemory) Save(ctx context.Context, content string, metadata map[s
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 
-	if err := vm.store.Add(ctx, []vector.Document{doc}); err != nil {
+	if err := vm.store.Add(ctx, []hexagon.VectorDocument{doc}); err != nil {
 		return fmt.Errorf("保存向量记忆失败: %w", err)
 	}
 
@@ -118,7 +118,7 @@ func (vm *VectorMemory) Search(ctx context.Context, query string, topK int) ([]V
 	defer vm.mu.RUnlock()
 
 	// 向量搜索
-	docs, err := vm.store.Search(ctx, queryEmbedding, topK, vector.WithMinScore(vm.config.MinScore))
+	docs, err := vm.store.Search(ctx, queryEmbedding, topK, hexagon.WithVectorMinScore(vm.config.MinScore))
 	if err != nil {
 		return nil, fmt.Errorf("向量搜索失败: %w", err)
 	}

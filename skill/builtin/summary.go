@@ -7,6 +7,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
@@ -24,6 +25,18 @@ func NewSummarySkill() *SummarySkill {
 
 func (s *SummarySkill) Name() string        { return "summary" }
 func (s *SummarySkill) Description() string { return "对文本内容进行摘要概括" }
+
+// ToolDefinition 返回摘要工具的 LLM 定义
+func (s *SummarySkill) ToolDefinition() llm.ToolDefinition {
+	return llm.NewToolDefinition("summary", "对文本内容进行摘要概括", &llm.Schema{
+		Type: "object",
+		Properties: map[string]*llm.Schema{
+			"text":       {Type: "string", Description: "要摘要的文本内容"},
+			"max_length": {Type: "integer", Description: "摘要最大长度（字符数）"},
+		},
+		Required: []string{"text"},
+	})
+}
 
 // Match 匹配摘要关键词
 func (s *SummarySkill) Match(content string) bool {

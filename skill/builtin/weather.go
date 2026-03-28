@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
 
@@ -28,6 +29,17 @@ func NewWeatherSkill() *WeatherSkill {
 
 func (s *WeatherSkill) Name() string        { return "weather" }
 func (s *WeatherSkill) Description() string { return "查询城市天气信息" }
+
+// ToolDefinition 返回天气工具的 LLM 定义
+func (s *WeatherSkill) ToolDefinition() llm.ToolDefinition {
+	return llm.NewToolDefinition("weather", "查询城市天气信息", &llm.Schema{
+		Type: "object",
+		Properties: map[string]*llm.Schema{
+			"location": {Type: "string", Description: "城市名称，如 北京、上海、Tokyo"},
+		},
+		Required: []string{"location"},
+	})
+}
 
 func (s *WeatherSkill) Match(content string) bool {
 	lower := strings.ToLower(content)

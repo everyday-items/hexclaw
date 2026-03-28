@@ -11,10 +11,25 @@ package builtin
 
 import (
 	"log"
+	"os"
+	"path/filepath"
 
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/sandbox"
+	"github.com/hexagon-codes/hexclaw/security"
 	"github.com/hexagon-codes/hexclaw/skill"
+	"github.com/hexagon-codes/hexclaw/skill/hub"
+	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 )
+
+// SkillDeps holds optional dependencies for skills that need external services.
+type SkillDeps struct {
+	SkillHub  *hub.Hub
+	McpHub    *hub.McpHub
+	McpMgr    *hexmcp.Manager
+	CfgWriter *config.Writer
+	Workspace string // workspace dir for file ops (default ~/.hexclaw/workspace)
+}
 
 // RegisterAll 注册所有内置 Skill
 //
@@ -64,5 +79,64 @@ func RegisterAll(registry *skill.DefaultRegistry, cfg config.BuiltinConfig) {
 		}
 	}
 
+	if cfg.FileOps {
+		ws := defaultWorkspace()
+		if err := registry.Register(NewFileOpsSkill(ws)); err != nil {
+			log.Printf("注册文件操作 Skill 失败: %v", err)
+		}
+	}
+
 	// 启动日志由 main 统一输出
+}
+
+// RegisterAdvanced registers skills that require external dependencies.
+// Called from main.go after all services are initialized.
+func RegisterAdvanced(registry *skill.DefaultRegistry, cfg config.BuiltinConfig, deps SkillDeps) {
+	if cfg.CodeExec {
+		sb, err := sandbox.New(sandbox.Config{
+			Workspace: deps.Workspace,
+			Timeout:   30,
+			Network:   false,
+		})
+		if err != nil {
+			log.Printf("沙箱初始化失败，CodeExecSkill 不可用: %v", err)
+		} else {
+			if err := registry.Register(NewCodeExecSkill(sb)); err != nil {
+				log.Printf("注册 CodeExecSkill 失败: %v", err)
+			}
+		}
+	}
+
+	// SkillWriter + Scanner
+	scanner := security.NewSkillScanner()
+	skillDir := defaultSkillDir()
+	if err := registry.Register(NewSkillWriterSkill(skillDir, scanner)); err != nil {
+		log.Printf("注册 SkillWriter 失败: %v", err)
+	}
+
+	// SkillInstaller (hub)
+	if deps.SkillHub != nil {
+		if err := registry.Register(NewSkillInstallerSkill(deps.SkillHub)); err != nil {
+			log.Printf("注册 SkillInstaller 失败: %v", err)
+		}
+	}
+
+	// McpInstaller (hub + manager + persistence)
+	if deps.McpHub != nil && deps.McpMgr != nil {
+		if err := registry.Register(NewMcpInstallerSkill(deps.McpHub, deps.McpMgr, deps.CfgWriter)); err != nil {
+			log.Printf("注册 McpInstaller 失败: %v", err)
+		}
+	}
+}
+
+func defaultWorkspace() string {
+	home, _ := os.UserHomeDir()
+	ws := filepath.Join(home, ".hexclaw", "workspace")
+	os.MkdirAll(ws, 0755)
+	return ws
+}
+
+func defaultSkillDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".hexclaw", "skills")
 }

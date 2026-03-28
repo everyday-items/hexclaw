@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
 
@@ -33,6 +34,17 @@ func NewShellSkill() *ShellSkill {
 
 func (s *ShellSkill) Name() string        { return "shell" }
 func (s *ShellSkill) Description() string { return "执行 Shell 命令，返回命令输出" }
+
+// ToolDefinition 返回 Shell 工具的 LLM 定义
+func (s *ShellSkill) ToolDefinition() llm.ToolDefinition {
+	return llm.NewToolDefinition("shell", "执行 Shell 命令，返回命令输出", &llm.Schema{
+		Type: "object",
+		Properties: map[string]*llm.Schema{
+			"command": {Type: "string", Description: "要执行的 Shell 命令"},
+		},
+		Required: []string{"command"},
+	})
+}
 
 // Match 匹配 Shell 命令
 //

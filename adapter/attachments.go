@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/hexagon-codes/ai-core/template"
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
 )
 
@@ -74,9 +74,9 @@ func BuildUserMessage(content string, attachments []Attachment) hexagon.Message 
 
 // BuildMultimodalUserMessage 构建包含图片的多模态用户消息。
 func BuildMultimodalUserMessage(text string, images []Attachment) hexagon.Message {
-	parts := make([]template.ContentPart, 0, 1+len(images))
+	parts := make([]llm.ContentPart, 0, 1+len(images))
 	if text != "" {
-		parts = append(parts, template.NewTextPart(text))
+		parts = append(parts, llm.NewTextPart(text))
 	}
 	for _, image := range images {
 		var imageURL string
@@ -90,7 +90,7 @@ func BuildMultimodalUserMessage(text string, images []Attachment) hexagon.Messag
 			imageURL = "data:" + mime + ";base64," + image.Data
 		}
 		if imageURL != "" {
-			parts = append(parts, template.NewImageURLPart(imageURL, "auto"))
+			parts = append(parts, llm.NewImageURLPart(imageURL, "auto"))
 		}
 	}
 	return hexagon.Message{

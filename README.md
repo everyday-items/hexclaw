@@ -403,7 +403,7 @@ hexclaw/
 | DELETE | `/api/v1/skills/{name}` | 卸载技能 |
 | GET | `/api/v1/clawhub/search` | ClawHub 技能搜索（支持 `q` / `category`） |
 
-默认技能目录仓库：`https://github.com/hexagon-codes/hexclaw-hub` 的 `v0.0.1` 标签（`index.json` + `skills/*.md`）。
+默认技能目录仓库：`https://github.com/hexagon-codes/hexclaw-hub` 的 `v0.0.2` 标签（`index.json` + `skills/*.md`）。
 安装或卸载 Markdown 技能后，会自动同步运行时技能注册表；通常无需重启 sidecar。
 
 ### Agent 路由
@@ -537,7 +537,7 @@ golangci-lint run
 |------|------|
 | 语言 | Go 1.25+ |
 | Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.3.2-beta |
-| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.0.4 |
+| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.0.5 |
 | 工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.3 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | 配置 | YAML + 环境变量 |
@@ -581,7 +581,7 @@ chore: 构建/工具链
 | 项目 | 说明 | 仓库 |
 |------|------|------|
 | **Hexagon** | Go AI Agent 框架 (核心引擎) v0.3.2-beta | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.0.4 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.0.5 | [ai-core](https://github.com/hexagon-codes/ai-core) |
 | **toolkit** | Go 通用工具库 v0.0.3 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI 观测面板 (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
 | **hexclaw-desktop** | HexClaw 桌面客户端 (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
@@ -589,10 +589,19 @@ chore: 构建/工具链
 
 ## 联系我们
 
+- 官网: [hexclaw.net](https://hexclaw.net)
 - 河蟹 AI: ai@hexclaw.net
 - 河蟹支持: support@hexclaw.net
 - Issues: [GitHub Issues](https://github.com/hexagon-codes/hexclaw/issues)
 - 安全漏洞: 请参阅 [SECURITY.md](SECURITY.md)
+
+### 微信公众号
+
+关注 HexClaw 微信公众号，获取最新动态、使用教程和版本更新：
+
+<p align="center">
+  <img src=".github/assets/wechat-qrcode.jpg" alt="HexClaw 微信公众号" width="200" />
+</p>
 
 ## 许可证
 

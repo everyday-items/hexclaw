@@ -24,7 +24,7 @@ import (
 type HubConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	RepoURL string `yaml:"repo_url"` // 默认: https://github.com/hexagon-codes/hexclaw-hub
-	Branch  string `yaml:"branch"`   // 默认: v0.0.1
+	Branch  string `yaml:"branch"`   // 默认: v0.0.2
 }
 
 // SkillMeta 技能元数据
@@ -35,8 +35,9 @@ type SkillMeta struct {
 	Version     string   `json:"version"`
 	Author      string   `json:"author"`
 	Category    string   `json:"category"`
-	Tags        []string `json:"tags"`
-	URL         string   `json:"url"` // 技能文件下载 URL
+	Tags         []string `json:"tags"`
+	Dependencies []string `json:"dependencies,omitempty"` // Skill 依赖列表
+	URL          string   `json:"url"`                    // 技能文件下载 URL
 	Downloads   int      `json:"downloads"`
 	Rating      float64  `json:"rating"`
 }
@@ -63,7 +64,7 @@ func New(cfg HubConfig, skillsDir string) *Hub {
 		cfg.RepoURL = "https://github.com/hexagon-codes/hexclaw-hub"
 	}
 	if cfg.Branch == "" {
-		cfg.Branch = "v0.0.1"
+		cfg.Branch = "v0.0.2"
 	}
 
 	return &Hub{

@@ -14,8 +14,8 @@
 //	└─────────────────────────────────────────────────────┘
 //
 // 外部依赖（hexagon / ai-core）:
-//   - 向量嵌入：vector.Embedder (ai-core 接口, hexagon embedder 实现)
-//   - 文本分块：rag.Splitter   (hexagon 接口 + RecursiveSplitter 实现)
+//   - 向量嵌入：hexagon.VectorEmbedder (ai-core 接口, hexagon embedder 实现)
+//   - 文本分块：hexagon.Splitter   (hexagon 接口 + RecursiveSplitter 实现)
 package knowledge
 
 import (
@@ -27,8 +27,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hexagon-codes/hexagon/rag"
-	"github.com/hexagon-codes/hexagon/store/vector"
+	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -150,8 +149,8 @@ type ChunkSearcher interface {
 type Manager struct {
 	repo     DocumentRepository // 写路径: 文档 + Chunk CRUD
 	searcher ChunkSearcher      // 读路径: 向量搜索 + 关键词搜索
-	embedder vector.Embedder    // hexagon/ai-core 向量嵌入（可为 nil）
-	splitter rag.Splitter       // hexagon 文本分块器
+	embedder hexagon.VectorEmbedder    // hexagon/ai-core 向量嵌入（可为 nil）
+	splitter hexagon.Splitter       // hexagon 文本分块器
 	config   HybridConfig
 }
 
@@ -163,8 +162,8 @@ func WithHybridConfig(cfg HybridConfig) ManagerOption {
 	return func(m *Manager) { m.config = cfg }
 }
 
-// WithSplitter 设置文本分块器（hexagon rag.Splitter）
-func WithSplitter(s rag.Splitter) ManagerOption {
+// WithSplitter 设置文本分块器（hexagon hexagon.Splitter）
+func WithSplitter(s hexagon.Splitter) ManagerOption {
 	return func(m *Manager) { m.splitter = s }
 }
 
@@ -172,7 +171,7 @@ func WithSplitter(s rag.Splitter) ManagerOption {
 //
 // repo 和 searcher 通常由同一个 SQLiteStore 实例同时实现。
 // embedder 可为 nil，此时退化为纯关键词搜索模式。
-func NewManager(repo DocumentRepository, searcher ChunkSearcher, embedder vector.Embedder, opts ...ManagerOption) *Manager {
+func NewManager(repo DocumentRepository, searcher ChunkSearcher, embedder hexagon.VectorEmbedder, opts ...ManagerOption) *Manager {
 	m := &Manager{
 		repo:     repo,
 		searcher: searcher,
@@ -367,7 +366,7 @@ func (m *Manager) buildChunks(ctx context.Context, doc *Document, ts time.Time) 
 		return nil, fmt.Errorf("文档内容为空或仅含空白字符")
 	}
 
-	ragDocs, err := m.splitter.Split(ctx, []rag.Document{
+	ragDocs, err := m.splitter.Split(ctx, []hexagon.Document{
 		{ID: doc.ID, Content: doc.Content, Source: doc.Source},
 	})
 	if err != nil {

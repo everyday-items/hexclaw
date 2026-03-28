@@ -59,6 +59,7 @@ type Server struct {
 	webhookMgr    *webhook.Manager         // Webhook 管理器（可选）
 	scheduler     *cron.Scheduler          // Cron 调度器（可选）
 	fileMem       *memory.FileMemory       // 文件记忆（可选）
+	vectorMem     *memory.VectorMemory     // 向量语义记忆（可选）
 	mcpMgr        *hexmcp.Manager          // MCP 管理器（可选）
 	mp            *marketplace.Marketplace // 技能市场（可选）
 	skillHub      *hub.Hub                 // 在线技能市场（可选）
@@ -68,6 +69,7 @@ type Server struct {
 	canvasSvc     *canvas.Service          // Canvas/A2UI 服务（可选）
 	voiceSvc      *voice.Service           // 语音服务（可选）
 	desktopSvc    *desktop.Service         // 桌面集成服务（可选）
+	cfgWriter     *config.Writer           // 配置文件写入器（MCP 持久化用）
 	wsHandler     http.Handler             // WebSocket Handler（可选）
 	logCollector  *LogCollector            // 日志收集器
 	workflowStore *WorkflowStore           // 工作流存储
@@ -132,6 +134,11 @@ func (s *Server) SetCronScheduler(scheduler *cron.Scheduler) {
 	s.scheduler = scheduler
 }
 
+// SetVectorMemory 设置向量语义记忆
+func (s *Server) SetVectorMemory(vm *memory.VectorMemory) {
+	s.vectorMem = vm
+}
+
 // SetFileMemory 设置文件记忆系统
 //
 // 设置后启用记忆管理 API。
@@ -144,6 +151,11 @@ func (s *Server) SetFileMemory(fm *memory.FileMemory) {
 // 设置后启用 MCP 工具列表 API。
 func (s *Server) SetMCPManager(mgr *hexmcp.Manager) {
 	s.mcpMgr = mgr
+}
+
+// SetCfgWriter 设置配置文件写入器（MCP 动态添加持久化用）
+func (s *Server) SetCfgWriter(w *config.Writer) {
+	s.cfgWriter = w
 }
 
 // SetMarketplace 设置技能市场
@@ -355,6 +367,8 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /api/v1/platforms/instances/{name}/start", s.handleStartInstance)
 		mux.HandleFunc("POST /api/v1/platforms/instances/{name}/stop", s.handleStopInstance)
 		mux.HandleFunc("POST /api/v1/im/channels/{provider}/test", s.handleTestChannelConfig)
+		mux.HandleFunc("POST /api/v1/channels/wechat/qr-stream", s.handleWechatQRStream)
+		mux.HandleFunc("GET /api/v1/channels/wecom/guide", s.handleWecomGuide)
 		mux.HandleFunc("GET /api/v1/platforms/hooks/{provider}/{name}", s.handlePlatformHook)
 		mux.HandleFunc("POST /api/v1/platforms/hooks/{provider}/{name}", s.handlePlatformHook)
 	}
@@ -391,6 +405,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/config", s.handleGetFullConfig)
 	mux.HandleFunc("PUT /api/v1/config", s.handleUpdateFullConfig)
 	mux.HandleFunc("GET /api/v1/models", s.handleListModels)
+	mux.HandleFunc("GET /api/v1/ollama/status", s.handleOllamaStatus)
 
 	// ClawHub 搜索（Skill 市场）
 	mux.HandleFunc("GET /api/v1/clawhub/search", s.handleClawHubSearch)

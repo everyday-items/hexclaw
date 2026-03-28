@@ -29,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
 )
 
@@ -197,8 +198,19 @@ func (m *Manager) connectServer(ctx context.Context, cfg ServerConfig) (*connect
 		server.tools = tools
 		server.closer = closer
 
+	case "streamable", "http":
+		if cfg.Endpoint == "" {
+			return nil, fmt.Errorf("streamable HTTP 传输需要指定 endpoint")
+		}
+		tools, closer, err := hexagon.ConnectMCPStreamable(ctx, cfg.Endpoint)
+		if err != nil {
+			return nil, fmt.Errorf("streamable HTTP 连接失败: %w", err)
+		}
+		server.tools = tools
+		server.closer = closer
+
 	default:
-		return nil, fmt.Errorf("不支持的传输方式: %q（支持 stdio/sse）", cfg.Transport)
+		return nil, fmt.Errorf("不支持的传输方式: %q（支持 stdio/sse/streamable）", cfg.Transport)
 	}
 
 	return server, nil
@@ -231,6 +243,50 @@ func (m *Manager) ToolInfos() []ToolInfo {
 				Name:        t.Name(),
 				Description: t.Description(),
 				ServerName:  server.name,
+			})
+		}
+	}
+	return infos
+}
+
+// ListToolDefinitions returns all discovered MCP tools as LLM tool definitions.
+// Used by ToolCollector to inject MCP tools into LLM requests.
+func (m *Manager) ListToolDefinitions() []llm.ToolDefinition {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var defs []llm.ToolDefinition
+	for _, srv := range m.servers {
+		if !srv.connected {
+			continue
+		}
+		for _, t := range srv.tools {
+			// Convert hexagon.Tool (ai-core/tool.Tool) to llm.ToolDefinition
+			// tool.Tool has: Name(), Description(), Schema() *schema.Schema
+			// llm.ToolDefinition has: Type="function", Function{Name, Description, Parameters *Schema}
+			// llm.Schema = schema.Schema, so Schema() output can be used directly
+			def := llm.NewToolDefinition(t.Name(), t.Description(), t.Schema())
+			defs = append(defs, def)
+		}
+	}
+	return defs
+}
+
+// ListToolInfos returns tool metadata for all connected servers.
+func (m *Manager) ListToolInfos() []ToolInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var infos []ToolInfo
+	for _, srv := range m.servers {
+		if !srv.connected {
+			continue
+		}
+		for _, t := range srv.tools {
+			infos = append(infos, ToolInfo{
+				Name:        t.Name(),
+				Description: t.Description(),
+				ServerName:  srv.name,
 			})
 		}
 	}

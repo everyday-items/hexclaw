@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
@@ -44,6 +45,18 @@ func NewCodeSkill() *CodeSkill {
 func (s *CodeSkill) Name() string { return "code" }
 func (s *CodeSkill) Description() string {
 	return "执行代码片段（Go/Python/JavaScript），返回运行结果"
+}
+
+// ToolDefinition 返回代码执行工具的 LLM 定义
+func (s *CodeSkill) ToolDefinition() llm.ToolDefinition {
+	return llm.NewToolDefinition("code", "执行代码片段（Go/Python/JavaScript），返回运行结果", &llm.Schema{
+		Type: "object",
+		Properties: map[string]*llm.Schema{
+			"language": {Type: "string", Description: "编程语言", Enum: []any{"python", "javascript", "go"}},
+			"code":     {Type: "string", Description: "要执行的代码"},
+		},
+		Required: []string{"language", "code"},
+	})
 }
 
 // Match 匹配代码执行命令

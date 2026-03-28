@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
 
@@ -29,6 +30,17 @@ func NewSearchSkill() *SearchSkill {
 
 func (s *SearchSkill) Name() string        { return "search" }
 func (s *SearchSkill) Description() string { return "网络搜索，帮你查找互联网上的信息" }
+
+// ToolDefinition 返回搜索工具的 LLM 定义
+func (s *SearchSkill) ToolDefinition() llm.ToolDefinition {
+	return llm.NewToolDefinition("search", "网络搜索，帮你查找互联网上的信息", &llm.Schema{
+		Type: "object",
+		Properties: map[string]*llm.Schema{
+			"query": {Type: "string", Description: "搜索关键词"},
+		},
+		Required: []string{"query"},
+	})
+}
 
 // Match 匹配搜索关键词
 func (s *SearchSkill) Match(content string) bool {

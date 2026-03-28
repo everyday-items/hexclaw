@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
 	mockllm "github.com/hexagon-codes/hexagon/testing/mock"
 	"github.com/hexagon-codes/hexclaw/adapter"
@@ -606,6 +607,9 @@ func (s *echoSkill) Execute(_ context.Context, args map[string]any) (*skill.Resu
 	query := args["query"].(string)
 	return &skill.Result{Content: "echo: " + query[6:]}, nil
 }
+func (s *echoSkill) ToolDefinition() llm.ToolDefinition {
+	return llm.NewToolDefinition("echo", "回显输入", nil)
+}
 
 func newEngineWithProvider(t *testing.T, provider hexagon.Provider) *ReActEngine {
 	t.Helper()
@@ -621,6 +625,7 @@ func newEngineWithProvider(t *testing.T, provider hexagon.Provider) *ReActEngine
 	}
 
 	cfg := config.DefaultConfig()
+	cfg.Compaction.Enabled = false // 禁用压缩，防止后台 goroutine 与测试 DB 竞争
 	cfg.LLM.Default = "test"
 	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
 		"test": {Model: "mock-model"},
@@ -656,6 +661,7 @@ func newEngineWithProviders(
 	}
 
 	cfg := config.DefaultConfig()
+	cfg.Compaction.Enabled = false // 禁用压缩
 	cfg.LLM.Default = defaultProvider
 	cfg.LLM.Providers = providerCfg
 	router := llmrouter.NewWithProviders(cfg.LLM, providers)

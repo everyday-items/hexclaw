@@ -14,6 +14,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -31,9 +32,11 @@ import (
 // 管理 WebSocket 连接，将 Web 消息转换为统一格式。
 // 每个 WebSocket 连接分配唯一 chatID。
 type WebAdapter struct {
-	handler       adapter.MessageHandler
-	streamHandler adapter.StreamMessageHandler
-	conns         sync.Map // chatID → *websocket.Conn
+	handler             adapter.MessageHandler
+	streamHandler       adapter.StreamMessageHandler
+	conns               sync.Map // chatID → *websocket.Conn
+	sessionConns        sync.Map // sessionID → chatID (for permission requests)
+	onApprovalResponse  func(requestID string, approved, remember bool) // callback for tool approval
 }
 
 // SetStreamHandler 设置流式消息处理器
@@ -73,6 +76,44 @@ func (a *WebAdapter) Stop(_ context.Context) error {
 	})
 	log.Println("Web 适配器已停止")
 	return nil
+}
+
+// SetApprovalResponseHandler sets the callback for tool approval responses from the frontend.
+func (a *WebAdapter) SetApprovalResponseHandler(fn func(requestID string, approved, remember bool)) {
+	a.onApprovalResponse = fn
+}
+
+// PermissionRequestData is the data needed to send a tool approval request.
+// Defined here to avoid circular dependency with engine package.
+type PermissionRequestData struct {
+	ID        string
+	ToolName  string
+	Arguments map[string]any
+	Risk      string
+	Reason    string
+}
+
+// SendPermissionRequest sends a tool approval request to the frontend via WebSocket.
+func (a *WebAdapter) SendPermissionRequest(ctx context.Context, sessionID string, data *PermissionRequestData) error {
+	chatID, ok := a.sessionConns.Load(sessionID)
+	if !ok {
+		return fmt.Errorf("no WebSocket connection for session %s", sessionID)
+	}
+	conn, ok := a.getConn(chatID.(string))
+	if !ok {
+		return fmt.Errorf("WebSocket connection %s disconnected", chatID)
+	}
+	msg := wsMessage{
+		Type:      "tool_approval_request",
+		SessionID: sessionID,
+		Content:   data.Reason,
+		Metadata: map[string]string{
+			"request_id": data.ID,
+			"tool_name":  data.ToolName,
+			"risk":       data.Risk,
+		},
+	}
+	return wsjson.Write(ctx, conn, msg)
 }
 
 // Handler 返回 WebSocket HTTP Handler
@@ -150,6 +191,13 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 	a.conns.Store(chatID, conn)
 	defer func() {
 		a.conns.Delete(chatID)
+		// Clean up sessionConns entries pointing to this chatID
+		a.sessionConns.Range(func(key, value any) bool {
+			if value.(string) == chatID {
+				a.sessionConns.Delete(key)
+			}
+			return true
+		})
 		_ = conn.Close(websocket.StatusNormalClosure, "")
 	}()
 
@@ -166,6 +214,22 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 		// 处理心跳 ping
 		if incoming.Type == "ping" {
 			_ = wsjson.Write(r.Context(), conn, wsMessage{Type: "pong"})
+			continue
+		}
+
+		// 处理流式取消请求 — 前端 stopStreaming 时发送
+		if incoming.Type == "cancel" {
+			log.Printf("WebSocket cancel request: session=%s", incoming.SessionID)
+			// 取消由 context 传播: 前端断开 WS 或发 cancel 时, 由 context.WithTimeout 自动取消
+			continue
+		}
+
+		// 处理工具审批响应
+		if incoming.Type == "tool_approval_response" && a.onApprovalResponse != nil {
+			reqID, _ := incoming.Metadata["request_id"]
+			approved := incoming.Content == "approved"
+			remember := incoming.Content == "approved_remember"
+			a.onApprovalResponse(reqID, approved || remember, remember)
 			continue
 		}
 
@@ -194,6 +258,11 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			Timestamp:   time.Now(),
 			Metadata:    make(map[string]string),
 		}
+		// 记录 sessionID → chatID 映射 (用于 Permission 请求推送)
+		if incoming.SessionID != "" {
+			a.sessionConns.Store(incoming.SessionID, chatID)
+		}
+
 		if incoming.Role != "" {
 			msg.Metadata["role"] = incoming.Role
 		}

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/hexclaw/security"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
 
@@ -55,7 +57,19 @@ func NewBrowserSkill() *BrowserSkill {
 }
 
 func (s *BrowserSkill) Name() string        { return "browser" }
-func (s *BrowserSkill) Description() string  { return "网页获取、内容提取和表单提交" }
+func (s *BrowserSkill) Description() string { return "网页获取、内容提取和表单提交" }
+
+// ToolDefinition 返回浏览器工具的 LLM 定义
+func (s *BrowserSkill) ToolDefinition() llm.ToolDefinition {
+	return llm.NewToolDefinition("browser", "网页获取、内容提取和表单提交", &llm.Schema{
+		Type: "object",
+		Properties: map[string]*llm.Schema{
+			"url":    {Type: "string", Description: "目标网页 URL"},
+			"action": {Type: "string", Description: "操作类型", Enum: []any{"fetch", "extract", "post"}},
+		},
+		Required: []string{"url"},
+	})
+}
 
 func (s *BrowserSkill) Match(content string) bool {
 	lower := strings.ToLower(content)
@@ -83,15 +97,22 @@ func (s *BrowserSkill) Execute(ctx context.Context, args map[string]any) (*skill
 		return nil, fmt.Errorf("缺少 url 参数")
 	}
 
+	// (security.ValidateURL 已在下方统一校验)
+
 	// 验证 URL
 	parsed, err := url.Parse(targetURL)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return nil, fmt.Errorf("无效 URL: %s", targetURL)
 	}
 
-	// SSRF 防护：屏蔽内网/保留地址
-	if !s.allowPrivate && isPrivateHost(parsed.Hostname()) {
-		return nil, fmt.Errorf("禁止访问内网地址: %s", parsed.Hostname())
+	// SSRF 防护：使用集中校验 (security/ssrf.go) + 原有 isPrivateHost 兜底
+	if !s.allowPrivate {
+		if err := security.ValidateURL(targetURL); err != nil {
+			return nil, fmt.Errorf("禁止访问内网地址: %s", parsed.Hostname())
+		}
+		if isPrivateHost(parsed.Hostname()) {
+			return nil, fmt.Errorf("禁止访问内网地址: %s", parsed.Hostname())
+		}
 	}
 
 	switch action {

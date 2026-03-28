@@ -121,7 +121,7 @@ func (s *Server) handleSaveMemory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "记忆已保存"})
 }
 
-// handleSearchMemory 搜索记忆
+// handleSearchMemory 搜索记忆 (FileMemory 关键词 + VectorMemory 语义)
 func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
 	if query == "" {
@@ -131,10 +131,32 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := s.fileMem.Search(query)
+	// 1. FileMemory 关键词搜索
+	fileResults := s.fileMem.Search(query)
+
+	// 2. VectorMemory 语义搜索 (D7: 链路④ 记忆闭环)
+	type vectorResult struct {
+		Content  string  `json:"content"`
+		Score    float32 `json:"score"`
+		Source   string  `json:"source"`
+	}
+	var vecResults []vectorResult
+	if s.vectorMem != nil {
+		if vr, err := s.vectorMem.Search(r.Context(), query, 5); err == nil {
+			for _, r := range vr {
+				vecResults = append(vecResults, vectorResult{
+					Content: r.Content,
+					Score:   r.Score,
+					Source:  "vector",
+				})
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"results": results,
-		"total":   len(results),
+		"results":        fileResults,
+		"vector_results": vecResults,
+		"total":          len(fileResults) + len(vecResults),
 	})
 }
 
@@ -210,6 +232,12 @@ func (s *Server) handleAddMCPServer(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	// 持久化到配置文件，重启后不丢失
+	if s.cfgWriter != nil {
+		if err := s.cfgWriter.AppendMCPServer(req.Name, transport, req.Command, req.Args, req.Endpoint); err != nil {
+			log.Printf("MCP Server %q 添加成功但持久化失败: %v", req.Name, err)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("MCP Server %q 已添加", req.Name)})
 }
 
@@ -224,6 +252,10 @@ func (s *Server) handleRemoveMCPServer(w http.ResponseWriter, r *http.Request) {
 	if err := s.mcpMgr.RemoveServer(name); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
+	}
+	// 从配置文件中移除
+	if s.cfgWriter != nil {
+		_ = s.cfgWriter.RemoveMCPServer(name)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("MCP Server %q 已移除", name)})
 }

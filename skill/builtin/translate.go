@@ -7,6 +7,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
@@ -24,6 +25,19 @@ func NewTranslateSkill() *TranslateSkill {
 
 func (s *TranslateSkill) Name() string        { return "translate" }
 func (s *TranslateSkill) Description() string { return "翻译文本内容，支持中英互译" }
+
+// ToolDefinition 返回翻译工具的 LLM 定义
+func (s *TranslateSkill) ToolDefinition() llm.ToolDefinition {
+	return llm.NewToolDefinition("translate", "翻译文本内容，支持中英互译", &llm.Schema{
+		Type: "object",
+		Properties: map[string]*llm.Schema{
+			"text": {Type: "string", Description: "要翻译的文本"},
+			"from": {Type: "string", Description: "源语言（如 zh、en），留空自动检测"},
+			"to":   {Type: "string", Description: "目标语言（如 zh、en），留空自动检测"},
+		},
+		Required: []string{"text"},
+	})
+}
 
 // Match 匹配翻译关键词
 func (s *TranslateSkill) Match(content string) bool {
