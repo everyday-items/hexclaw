@@ -438,7 +438,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			hybridCfg.TimeDecayDays = cfg.Knowledge.TimeDecayDays
 
 			// 4. 创建 Manager (kbStore 同时实现 DocumentRepository + ChunkSearcher)
-			kbMgr := knowledge.NewManager(kbStore, kbStore, emb,
+			// 注意: 传 sharedEmbedder（接口类型）而非 emb（*OpenAIEmbedder），
+			// 避免 Go 接口 nil 陷阱（typed nil pointer 使接口非 nil 但 receiver 为 nil）
+			kbMgr := knowledge.NewManager(kbStore, kbStore, sharedEmbedder,
 				knowledge.WithSplitter(sp),
 				knowledge.WithHybridConfig(hybridCfg),
 			)
