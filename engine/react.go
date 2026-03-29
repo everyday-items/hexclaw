@@ -531,9 +531,20 @@ func (e *ReActEngine) completeWithTools(
 			}
 		}
 
+		// 当 provider 未返回 token 统计时，使用 tokenizer 估算
+		if resp.Usage.TotalTokens == 0 {
+			p, c, t := estimateResponseUsage(providerName, messages, resp.Content)
+			resp.Usage.PromptTokens = p
+			resp.Usage.CompletionTokens = c
+			resp.Usage.TotalTokens = t
+		}
+
 		// 记录 token 使用到 Budget
 		if useBudget && resp.Usage.TotalTokens > 0 {
 			budget.RecordTokens(resp.Usage.TotalTokens)
+			if cost := EstimateCost(providerName, modelName, resp.Usage.PromptTokens, resp.Usage.CompletionTokens); cost > 0 {
+				budget.RecordCost(cost)
+			}
 		}
 
 		// 无 tool_calls → 最终回复 (最常见路径，零额外延迟)
@@ -855,9 +866,20 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 			}
 		}
 
+		// 当 provider 未返回 token 统计时，使用 tokenizer 估算
+		if resp.Usage.TotalTokens == 0 {
+			p, c, t := estimateResponseUsage(selection.providerName, messages, resp.Content)
+			resp.Usage.PromptTokens = p
+			resp.Usage.CompletionTokens = c
+			resp.Usage.TotalTokens = t
+		}
+
 		// G1: 记录 token 使用到 Budget (ProcessStream 路径)
 		if useBudgetStream && resp.Usage.TotalTokens > 0 {
 			budget.RecordTokens(resp.Usage.TotalTokens)
+			if cost := EstimateCost(selection.providerName, selection.modelName, resp.Usage.PromptTokens, resp.Usage.CompletionTokens); cost > 0 {
+				budget.RecordCost(cost)
+			}
 		}
 
 		// 无 tool_calls → 最终轮，切换到流式返回
@@ -974,6 +996,13 @@ func (e *ReActEngine) pipeStream(
 	// 写入语义缓存
 	e.cache.Put(cacheInput, content, providerName, modelName)
 
+	// 当 provider 未返回 token 统计时，使用 tokenizer 估算 (streaming 路径仅估算 completion)
+	if result != nil && result.Usage.TotalTokens == 0 && content != "" {
+		_, c, t := estimateResponseUsage(providerName, nil, content)
+		result.Usage.CompletionTokens = c
+		result.Usage.TotalTokens = t
+	}
+
 	// 发送结束标记（携带 Usage 和元数据）
 	doneChunk := &adapter.ReplyChunk{
 		Done:     true,
@@ -1073,6 +1102,13 @@ func (e *ReActEngine) pipeStreamWithTools(
 	}
 
 	e.cache.Put(cacheInput, content, providerName, modelName)
+
+	// 当 provider 未返回 token 统计时，使用 tokenizer 估算 (streaming 路径仅估算 completion)
+	if result != nil && result.Usage.TotalTokens == 0 && content != "" {
+		_, c, t := estimateResponseUsage(providerName, nil, content)
+		result.Usage.CompletionTokens = c
+		result.Usage.TotalTokens = t
+	}
 
 	doneChunk := &adapter.ReplyChunk{
 		Done:      true,
@@ -1179,6 +1215,14 @@ func (e *ReActEngine) completeDirect(
 		}
 		providerName = fbName
 		modelName = e.getProviderModel(fbName, msg.Metadata)
+	}
+
+	// 当 provider 未返回 token 统计时，使用 tokenizer 估算
+	if resp.Usage.TotalTokens == 0 {
+		p, c, t := estimateResponseUsage(providerName, req.Messages, resp.Content)
+		resp.Usage.PromptTokens = p
+		resp.Usage.CompletionTokens = c
+		resp.Usage.TotalTokens = t
 	}
 
 	assistantMessageID := ""

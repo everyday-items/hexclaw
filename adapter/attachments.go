@@ -27,6 +27,9 @@ func ValidateAttachments(attachments []Attachment) error {
 		if attachment.URL == "" && attachment.Data == "" {
 			return fmt.Errorf("文件 %s 内容为空，请重新选择", nameOrDefault(attachment.Name))
 		}
+		if attachment.URL != "" && attachment.Data != "" {
+			return fmt.Errorf("文件 %s 同时包含 URL 和 Data，只能选择一种方式", nameOrDefault(attachment.Name))
+		}
 		if !IsImageAttachment(attachment) {
 			return fmt.Errorf("目前仅支持发送图片，文档请先用文字方式粘贴内容。不支持的文件：%s", nameOrDefault(attachment.Name))
 		}

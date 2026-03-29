@@ -119,8 +119,11 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
-	if limit <= 0 {
+	if limit <= 0 || limit > 200 {
 		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
 	}
 
 	messages, err := s.store.ListMessages(r.Context(), sessionID, limit, offset)
@@ -134,9 +137,15 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		messages = []*storage.MessageRecord{}
 	}
 
+	// 获取真实总数用于分页
+	total := len(messages) + offset // 近似值，实际由 store 提供
+	if ct, err := s.store.CountMessages(r.Context(), sessionID); err == nil {
+		total = ct
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"messages": messages,
-		"total":    len(messages),
+		"total":    total,
 	})
 }
 

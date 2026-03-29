@@ -8,11 +8,11 @@
 package cache
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"math/rand/v2"
 	"strings"
 	"sync"
+
+	"github.com/hexagon-codes/toolkit/util/hash"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -319,6 +319,5 @@ func hashInput(input, provider, model string) string {
 	builder.WriteByte('\x00')
 	builder.WriteString(strings.ToLower(strings.TrimSpace(model)))
 
-	h := sha256.Sum256([]byte(builder.String()))
-	return hex.EncodeToString(h[:])
+	return hash.SHA256(builder.String())
 }

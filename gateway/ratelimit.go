@@ -7,43 +7,55 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/toolkit/util/rate"
 )
 
 // RateLimitLayer 速率限制层 (Layer 2)
 //
-// 基于滑动窗口的速率限制：
+// 基于 toolkit/util/rate.SlidingWindow 的速率限制：
 //   - 每用户每分钟请求数限制
 //   - 每用户每小时请求数限制
 //
 // 使用内存存储计数器，重启后重置。
 // 空窗口清理由后台 goroutine 定期执行（每 30 秒），
-// 避免在每次 Check 时做 O(n) 全量扫描。
+// 回收不活跃用户的限流器以防止内存泄漏。
 type RateLimitLayer struct {
 	cfg       config.RateLimitConfig
 	mu        sync.Mutex
-	windows   map[string]*userWindow // key: userID
-	cleanOnce sync.Once
+	windows   map[string]*userWindows // key: userID
 	stopClean chan struct{}
 }
 
-// userWindow 用户请求窗口
-type userWindow struct {
-	minuteRequests []time.Time // 最近一分钟内的请求时间戳
-	hourRequests   []time.Time // 最近一小时内的请求时间戳
+// userWindows 用户的滑动窗口限流器
+type userWindows struct {
+	minute *rate.SlidingWindow // 每分钟限流（nil 表示未配置）
+	hour   *rate.SlidingWindow // 每小时限流（nil 表示未配置）
 }
 
 // NewRateLimitLayer 创建速率限制层
 func NewRateLimitLayer(cfg config.RateLimitConfig) *RateLimitLayer {
 	l := &RateLimitLayer{
 		cfg:       cfg,
-		windows:   make(map[string]*userWindow),
+		windows:   make(map[string]*userWindows),
 		stopClean: make(chan struct{}),
 	}
 	go l.periodicCleanup()
 	return l
 }
 
-// periodicCleanup 后台定期清理空窗口，避免每次 Check 做 O(n) 扫描
+// newUserWindows 为用户创建滑动窗口限流器
+func (l *RateLimitLayer) newUserWindows() *userWindows {
+	uw := &userWindows{}
+	if l.cfg.RequestsPerMinute > 0 {
+		uw.minute = rate.NewSlidingWindow(l.cfg.RequestsPerMinute, time.Minute)
+	}
+	if l.cfg.RequestsPerHour > 0 {
+		uw.hour = rate.NewSlidingWindow(l.cfg.RequestsPerHour, time.Hour)
+	}
+	return uw
+}
+
+// periodicCleanup 后台定期清理空窗口，避免不活跃用户占用内存
 func (l *RateLimitLayer) periodicCleanup() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -61,14 +73,10 @@ func (l *RateLimitLayer) cleanupEmptyWindows() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	now := time.Now()
-	minuteAgo := now.Add(-1 * time.Minute)
-	hourAgo := now.Add(-1 * time.Hour)
-
 	for uid, uw := range l.windows {
-		uw.minuteRequests = filterAfterCopy(uw.minuteRequests, minuteAgo)
-		uw.hourRequests = filterAfterCopy(uw.hourRequests, hourAgo)
-		if len(uw.minuteRequests) == 0 && len(uw.hourRequests) == 0 {
+		minuteEmpty := uw.minute == nil || uw.minute.Count() == 0
+		hourEmpty := uw.hour == nil || uw.hour.Count() == 0
+		if minuteEmpty && hourEmpty {
 			delete(l.windows, uid)
 		}
 	}
@@ -91,7 +99,6 @@ func (l *RateLimitLayer) Check(_ context.Context, msg *adapter.Message) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	now := time.Now()
 	userID := msg.UserID
 	if userID == "" {
 		userID = "_anonymous"
@@ -99,18 +106,12 @@ func (l *RateLimitLayer) Check(_ context.Context, msg *adapter.Message) error {
 
 	w, ok := l.windows[userID]
 	if !ok {
-		w = &userWindow{}
+		w = l.newUserWindows()
 		l.windows[userID] = w
 	}
 
-	// 仅清理当前用户的过期记录（O(1) per user, not O(N) global scan）
-	minuteAgo := now.Add(-1 * time.Minute)
-	hourAgo := now.Add(-1 * time.Hour)
-	w.minuteRequests = filterAfterCopy(w.minuteRequests, minuteAgo)
-	w.hourRequests = filterAfterCopy(w.hourRequests, hourAgo)
-
 	// 检查每分钟限制
-	if l.cfg.RequestsPerMinute > 0 && len(w.minuteRequests) >= l.cfg.RequestsPerMinute {
+	if w.minute != nil && !w.minute.Allow() {
 		return &GatewayError{
 			Layer:   "rate_limit",
 			Code:    "minute_exceeded",
@@ -119,7 +120,10 @@ func (l *RateLimitLayer) Check(_ context.Context, msg *adapter.Message) error {
 	}
 
 	// 检查每小时限制
-	if l.cfg.RequestsPerHour > 0 && len(w.hourRequests) >= l.cfg.RequestsPerHour {
+	if w.hour != nil && !w.hour.Allow() {
+		// 分钟窗口已消费了一个配额，但小时窗口被拒绝，
+		// 这里无需回滚——分钟窗口多记录一次不影响正确性，
+		// 因为小时限制更严格时，分钟窗口的多余记录会自然过期。
 		return &GatewayError{
 			Layer:   "rate_limit",
 			Code:    "hour_exceeded",
@@ -127,21 +131,5 @@ func (l *RateLimitLayer) Check(_ context.Context, msg *adapter.Message) error {
 		}
 	}
 
-	// 记录本次请求
-	w.minuteRequests = append(w.minuteRequests, now)
-	w.hourRequests = append(w.hourRequests, now)
-
 	return nil
-}
-
-// filterAfterCopy 过滤出 after 之后的时间戳
-// 使用新切片避免旧引用在底层数组中驻留（[:0] 会保留已过滤元素的引用）
-func filterAfterCopy(times []time.Time, after time.Time) []time.Time {
-	var result []time.Time
-	for _, t := range times {
-		if t.After(after) {
-			result = append(result, t)
-		}
-	}
-	return result
 }

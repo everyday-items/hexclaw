@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -214,6 +215,21 @@ func (s *Server) handleAddMCPServer(w http.ResponseWriter, r *http.Request) {
 	if transport == "sse" && req.Endpoint == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "sse 模式需要指定 endpoint"})
 		return
+	}
+
+	// 安全校验：stdio command 必须是已知安全的可执行文件，禁止 shell 元字符
+	if transport == "stdio" {
+		if err := validateMCPCommand(req.Command, req.Args); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	// 安全校验：sse/streamable endpoint 必须是合法 URL
+	if (transport == "sse" || transport == "streamable") && req.Endpoint != "" {
+		if err := validateMCPEndpoint(req.Endpoint); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
 	}
 
 	cfg := hexmcp.ServerConfig{
@@ -1010,4 +1026,56 @@ func (s *Server) syncEngineMarketplaceSkills() {
 	if err := e.SyncMarkdownSkillsFromMarketplace(s.mp); err != nil {
 		log.Printf("技能市场: 同步引擎注册表失败: %v", err)
 	}
+}
+
+// ─── MCP 安全校验 ────────────────────────────────────
+
+// mcpAllowedCommands stdio 模式允许的命令白名单
+var mcpAllowedCommands = map[string]bool{
+	"npx": true, "node": true, "uvx": true, "uv": true, "python": true, "python3": true,
+	"docker": true, "deno": true, "bun": true, "go": true, "cargo": true,
+}
+
+// mcpDangerousChars shell 元字符 + 控制字符，禁止出现在 command/args 中
+const mcpDangerousChars = "`$|;&><(){}!\\'\"~\n\r\x00"
+
+func validateMCPCommand(command string, args []string) error {
+	if command == "" {
+		return fmt.Errorf("command 不能为空")
+	}
+	// 解析 symlink 防止伪装绕过白名单
+	resolved := command
+	if filepath.IsAbs(command) {
+		if real, err := filepath.EvalSymlinks(command); err == nil {
+			resolved = real
+		}
+	}
+	base := filepath.Base(resolved)
+	if !mcpAllowedCommands[base] {
+		return fmt.Errorf("不允许的命令 %q，仅支持: npx, node, uvx, uv, python, python3, docker, deno, bun, go, cargo", base)
+	}
+	// 禁止 shell 元字符
+	if strings.ContainsAny(command, mcpDangerousChars) {
+		return fmt.Errorf("command 包含不允许的字符")
+	}
+	for i, arg := range args {
+		if strings.ContainsAny(arg, mcpDangerousChars) {
+			return fmt.Errorf("args[%d] 包含不允许的字符", i)
+		}
+	}
+	return nil
+}
+
+func validateMCPEndpoint(endpoint string) error {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("endpoint URL 格式错误: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("endpoint 仅支持 http/https 协议，收到: %s", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("endpoint 缺少 host")
+	}
+	return nil
 }

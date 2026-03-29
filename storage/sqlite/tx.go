@@ -169,6 +169,14 @@ func (s *txStore) ListMessages(ctx context.Context, sessionID string, limit, off
 	return messages, rows.Err()
 }
 
+func (s *txStore) CountMessages(ctx context.Context, sessionID string) (int, error) {
+	var count int
+	err := s.tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM messages WHERE session_id = ?`, sessionID,
+	).Scan(&count)
+	return count, err
+}
+
 func (s *txStore) UpdateMessageFeedback(ctx context.Context, id, feedback string) error {
 	switch feedback {
 	case "", "like", "dislike":

@@ -7,9 +7,10 @@ package config
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Host: "127.0.0.1",
-			Port: 16060,
-			Mode: "production",
+			Host:    "127.0.0.1",
+			Port:    16060,
+			MCPPort: 16070, // 预留: MCP Server 模式端口
+			Mode:    "production",
 		},
 		LLM: LLMConfig{
 			Default:   "deepseek",
@@ -75,6 +76,9 @@ func DefaultConfig() *Config {
 				Shell:     false, // 高风险，默认关闭
 				CodeExec:  false, // 需沙箱，默认关闭
 				FileOps:   true,  // 受限于 workspace，默认开启
+				CodeExecPolicy: CodeExecPolicyConfig{
+					RequireApproval: boolPtr(true), // 安全默认：需要用户审批
+				},
 			},
 		},
 		Storage: StorageConfig{
@@ -147,4 +151,9 @@ func DefaultConfig() *Config {
 			MaxCost:     5.0,
 		},
 	}
+}
+
+// boolPtr returns a pointer to the given bool value.
+func boolPtr(b bool) *bool {
+	return &b
 }

@@ -3,6 +3,8 @@ package engine
 import (
 	"context"
 	"fmt"
+	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -22,9 +24,9 @@ type BudgetController struct {
 	maxCost     float64 // USD
 
 	usedTokens atomic.Int64
-	usedCost   atomic.Int64 // 存储 cost * 10000 (避免浮点原子操作)
-	startTime  time.Time
-	started    atomic.Bool
+	usedCost   atomic.Int64 // 存储 cost * 1_000_000 micro-dollars (避免浮点原子操作)
+	startTime  atomic.Int64 // UnixNano，用 atomic 避免数据竞争
+	startOnce  sync.Once
 
 	cancelFunc context.CancelFunc // 级联取消子 Agent
 }
@@ -68,29 +70,76 @@ func (b *BudgetController) Check() error {
 	if b.usedTokens.Load() >= b.maxTokens {
 		return fmt.Errorf("token budget exhausted: %d/%d", b.usedTokens.Load(), b.maxTokens)
 	}
-	if b.started.Load() && time.Since(b.startTime) > b.maxDuration {
-		return fmt.Errorf("duration budget exhausted: %v/%v", time.Since(b.startTime).Round(time.Second), b.maxDuration)
+	if st := b.startTime.Load(); st > 0 && time.Since(time.Unix(0, st)) > b.maxDuration {
+		return fmt.Errorf("duration budget exhausted: %v/%v", time.Since(time.Unix(0, st)).Round(time.Second), b.maxDuration)
 	}
 	usedCostCents := b.usedCost.Load()
-	maxCostCents := int64(b.maxCost * 10000)
+	maxCostCents := int64(b.maxCost * 1_000_000)
 	if usedCostCents >= maxCostCents {
-		return fmt.Errorf("cost budget exhausted: $%.4f/$%.2f", float64(usedCostCents)/10000, b.maxCost)
+		return fmt.Errorf("cost budget exhausted: $%.4f/$%.2f", float64(usedCostCents)/1_000_000, b.maxCost)
 	}
 	return nil
 }
 
 // RecordTokens 记录 token 使用量
 func (b *BudgetController) RecordTokens(tokens int) {
-	if !b.started.Load() {
-		b.started.Store(true)
-		b.startTime = time.Now()
-	}
+	b.startOnce.Do(func() { b.startTime.Store(time.Now().UnixNano()) })
 	b.usedTokens.Add(int64(tokens))
 }
 
 // RecordCost 记录成本 (USD)
+//
+// 内部以 micro-dollar (1/1,000,000 USD) 存储，支持 $0.000001 精度，
+// 避免 Gemini Flash 等低价模型的微小成本累积丢失。
 func (b *BudgetController) RecordCost(cost float64) {
-	b.usedCost.Add(int64(cost * 10000))
+	b.usedCost.Add(int64(math.Round(cost * 1_000_000)))
+}
+
+// modelPrice 每 1K token 的价格 (USD)
+type modelPrice struct {
+	Input  float64 // 每 1K 输入 token 价格
+	Output float64 // 每 1K 输出 token 价格
+}
+
+// pricingTable 常见 provider+model 组合的定价表
+//
+// 价格单位: USD per 1K tokens，基于 2025 年公开定价。
+// 未匹配的 model 返回零成本（不阻断流程）。
+var pricingTable = map[string]map[string]modelPrice{
+	"openai": {
+		"gpt-4o":      {Input: 0.0025, Output: 0.01},
+		"gpt-4o-mini": {Input: 0.00015, Output: 0.0006},
+		"gpt-4.1":     {Input: 0.002, Output: 0.008},
+		"o3-mini":     {Input: 0.0011, Output: 0.0044},
+	},
+	"anthropic": {
+		"claude-sonnet-4-6": {Input: 0.003, Output: 0.015},
+		"claude-haiku-4-5":  {Input: 0.0008, Output: 0.004},
+		"claude-opus-4-6":   {Input: 0.015, Output: 0.075},
+	},
+	"google": {
+		"gemini-2.0-flash": {Input: 0.0001, Output: 0.0004},
+		"gemini-2.5-pro":   {Input: 0.00125, Output: 0.01},
+	},
+	"deepseek": {
+		"deepseek-chat":     {Input: 0.00014, Output: 0.00028},
+		"deepseek-reasoner": {Input: 0.00055, Output: 0.0022},
+	},
+}
+
+// EstimateCost 根据定价表估算本次调用成本 (USD)
+//
+// 未匹配的 provider/model 返回 0（不阻断流程，只是不计费）。
+func EstimateCost(provider, model string, inputTokens, outputTokens int) float64 {
+	models, ok := pricingTable[provider]
+	if !ok {
+		return 0
+	}
+	price, ok := models[model]
+	if !ok {
+		return 0
+	}
+	return float64(inputTokens)/1000*price.Input + float64(outputTokens)/1000*price.Output
 }
 
 // Allocate 从当前预算预分配一份子预算
@@ -114,7 +163,7 @@ func (b *BudgetController) Release(parent *BudgetController) {
 	if unusedTokens > 0 {
 		parent.usedTokens.Add(-unusedTokens) // 归还
 	}
-	unusedCostCents := int64(b.maxCost*10000) - b.usedCost.Load()
+	unusedCostCents := int64(b.maxCost*1_000_000) - b.usedCost.Load()
 	if unusedCostCents > 0 {
 		parent.usedCost.Add(-unusedCostCents)
 	}
@@ -134,14 +183,14 @@ func (b *BudgetController) Remaining() BudgetRemaining {
 		tokens = 0
 	}
 	dur := b.maxDuration
-	if b.started.Load() {
-		dur = b.maxDuration - time.Since(b.startTime)
+	if st := b.startTime.Load(); st > 0 {
+		dur = b.maxDuration - time.Since(time.Unix(0, st))
 		if dur < 0 {
 			dur = 0
 		}
 	}
-	costCents := int64(b.maxCost*10000) - b.usedCost.Load()
-	cost := float64(costCents) / 10000
+	costCents := int64(b.maxCost*1_000_000) - b.usedCost.Load()
+	cost := float64(costCents) / 1_000_000
 	if cost < 0 {
 		cost = 0
 	}
@@ -152,8 +201,47 @@ func (b *BudgetController) Remaining() BudgetRemaining {
 func (b *BudgetController) Summary() string {
 	return fmt.Sprintf("tokens: %d/%d, duration: %v/%v, cost: $%.4f/$%.2f",
 		b.usedTokens.Load(), b.maxTokens,
-		time.Since(b.startTime).Round(time.Second), b.maxDuration,
-		float64(b.usedCost.Load())/10000, b.maxCost)
+		time.Since(time.Unix(0, b.startTime.Load())).Round(time.Second), b.maxDuration,
+		float64(b.usedCost.Load())/1_000_000, b.maxCost)
+}
+
+// BudgetStatus 预算状态快照
+type BudgetStatus struct {
+	TokensUsed     int64   `json:"tokens_used"`
+	TokensMax      int64   `json:"tokens_max"`
+	TokensRemain   int64   `json:"tokens_remaining"`
+	CostUsed       float64 `json:"cost_used"`
+	CostMax        float64 `json:"cost_max"`
+	CostRemain     float64 `json:"cost_remaining"`
+	DurationUsed   string  `json:"duration_used"`
+	DurationMax    string  `json:"duration_max"`
+	DurationRemain string  `json:"duration_remaining"`
+	Exhausted      bool    `json:"exhausted"`
+}
+
+// Status 返回结构化的预算状态快照
+func (b *BudgetController) Status() BudgetStatus {
+	rem := b.Remaining()
+	usedTokens := b.usedTokens.Load()
+	usedCost := float64(b.usedCost.Load()) / 1_000_000
+
+	var durUsed time.Duration
+	if st := b.startTime.Load(); st > 0 {
+		durUsed = time.Since(time.Unix(0, st))
+	}
+
+	return BudgetStatus{
+		TokensUsed:     usedTokens,
+		TokensMax:      b.maxTokens,
+		TokensRemain:   rem.Tokens,
+		CostUsed:       usedCost,
+		CostMax:        b.maxCost,
+		CostRemain:     rem.Cost,
+		DurationUsed:   durUsed.Round(time.Second).String(),
+		DurationMax:    b.maxDuration.String(),
+		DurationRemain: rem.Duration.Round(time.Second).String(),
+		Exhausted:      b.Check() != nil,
+	}
 }
 
 // SetCancelFunc 设置级联取消函数 (用于 Orchestrate 子 Agent 取消)

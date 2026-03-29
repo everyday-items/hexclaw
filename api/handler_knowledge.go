@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -90,10 +91,16 @@ func (s *Server) handleUploadDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := io.ReadAll(file)
+	data, err := io.ReadAll(io.LimitReader(file, maxUpload+1))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "读取文件失败: " + err.Error(),
+		})
+		return
+	}
+	if int64(len(data)) > maxUpload {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("文件过大，最大允许 %dMB", maxUpload>>20),
 		})
 		return
 	}
@@ -151,12 +158,14 @@ func extractDocxText(data []byte) (string, error) {
 	if docXML == nil {
 		return "", nil
 	}
+	// 防 zip bomb: 限制解压后读取量（header 中的 UncompressedSize64 可伪造，不可信赖）
+	const maxDocXMLSize = 100 << 20 // 100MB
 	rc, err := docXML.Open()
 	if err != nil {
 		return "", err
 	}
 	defer rc.Close()
-	raw, err := io.ReadAll(rc)
+	raw, err := io.ReadAll(io.LimitReader(rc, maxDocXMLSize))
 	if err != nil {
 		return "", err
 	}

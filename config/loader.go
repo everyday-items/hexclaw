@@ -117,7 +117,7 @@ func Save(cfg *Config, configFile string) error {
 		return fmt.Errorf("序列化配置失败: %w", err)
 	}
 
-	if err := os.WriteFile(configFile, data, 0600); err != nil {
+	if err := atomicWriteFile(configFile, data, 0600); err != nil {
 		return fmt.Errorf("写入配置文件失败: %w", err)
 	}
 	return nil

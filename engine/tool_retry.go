@@ -6,12 +6,14 @@ import (
 	"log"
 	"strings"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/util/retry"
 )
 
 // ToolRetryConfig configures per-tool timeout and retry behavior.
 type ToolRetryConfig struct {
-	DefaultTimeout  time.Duration // default 30s
-	DefaultRetries  int           // default 0 (no retry)
+	DefaultTimeout   time.Duration            // default 30s
+	DefaultRetries   int                      // default 0 (no retry)
 	TimeoutOverrides map[string]time.Duration // tool_name → custom timeout
 	RetryOverrides   map[string]int           // tool_name → max retries
 }
@@ -22,8 +24,8 @@ func DefaultToolRetryConfig() ToolRetryConfig {
 		DefaultTimeout: 30 * time.Second,
 		DefaultRetries: 0,
 		TimeoutOverrides: map[string]time.Duration{
-			"browser":    120 * time.Second,
-			"code_exec":  60 * time.Second,
+			"browser":   120 * time.Second,
+			"code_exec": 60 * time.Second,
 		},
 		RetryOverrides: map[string]int{
 			"search":  2, // network tool → retry on transient errors
@@ -43,6 +45,7 @@ func NewToolRetryWrapper(cfg ToolRetryConfig) *ToolRetryWrapper {
 }
 
 // Execute wraps a tool execution with timeout + exponential backoff retry.
+// Uses toolkit/util/retry for backoff and jitter.
 func (w *ToolRetryWrapper) Execute(
 	ctx context.Context,
 	toolName string,
@@ -58,35 +61,29 @@ func (w *ToolRetryWrapper) Execute(
 		maxRetries = override
 	}
 
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			// Exponential backoff: 1s, 2s, 4s
-			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
-			log.Printf("[retry] %s attempt %d/%d after %v", toolName, attempt+1, maxRetries+1, backoff)
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return "", ctx.Err()
-			}
-		}
-
+	var result string
+	err := retry.DoWithContext(ctx, func() error {
 		execCtx, cancel := context.WithTimeout(ctx, timeout)
-		result, err := execFn(execCtx)
-		cancel()
+		defer cancel()
 
-		if err == nil {
-			return result, nil
-		}
-		lastErr = err
+		var execErr error
+		result, execErr = execFn(execCtx)
+		return execErr
+	},
+		retry.Attempts(maxRetries+1),
+		retry.Delay(time.Second),
+		retry.MaxDelay(8*time.Second),
+		retry.Multiplier(2.0),
+		retry.RetryIf(isTransientError),
+		retry.OnRetry(func(n int, err error) {
+			log.Printf("[retry] %s attempt %d/%d: %v", toolName, n+1, maxRetries+1, err)
+		}),
+	)
 
-		// Only retry on transient errors
-		if !isTransientError(err) {
-			return "", err
-		}
+	if err != nil {
+		return "", fmt.Errorf("tool %q failed: %w", toolName, err)
 	}
-
-	return "", fmt.Errorf("tool %q failed after %d attempts: %w", toolName, maxRetries+1, lastErr)
+	return result, nil
 }
 
 // isTransientError checks if an error is worth retrying.

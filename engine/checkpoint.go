@@ -66,6 +66,42 @@ func (cm *CheckpointManager) Save(ctx context.Context, data CheckpointData) (str
 	return id, nil
 }
 
+// CheckpointSummary 检查点简要信息 (用于列表 API)
+type CheckpointSummary struct {
+	ID        string `json:"id"`
+	SessionID string `json:"session_id"`
+	AgentName string `json:"agent_name,omitempty"`
+	Turn      int    `json:"turn"`
+	CreatedAt string `json:"created_at"`
+}
+
+// List 列出某个会话的所有检查点
+func (cm *CheckpointManager) List(ctx context.Context, sessionID string) ([]CheckpointSummary, error) {
+	msgs, err := cm.store.ListMessages(ctx, sessionID, 500, 0)
+	if err != nil {
+		return nil, fmt.Errorf("list messages: %w", err)
+	}
+
+	var out []CheckpointSummary
+	for _, msg := range msgs {
+		if msg.Role != "checkpoint" {
+			continue
+		}
+		var data CheckpointData
+		if err := json.Unmarshal([]byte(msg.Content), &data); err != nil {
+			continue
+		}
+		out = append(out, CheckpointSummary{
+			ID:        msg.ID,
+			SessionID: data.SessionID,
+			AgentName: data.AgentName,
+			Turn:      data.Turn,
+			CreatedAt: msg.CreatedAt.Format(time.RFC3339),
+		})
+	}
+	return out, nil
+}
+
 // Load 加载最新检查点
 func (cm *CheckpointManager) Load(ctx context.Context, sessionID string) (*CheckpointData, error) {
 	// 查找最近的 checkpoint 消息

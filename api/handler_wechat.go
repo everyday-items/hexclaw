@@ -1,49 +1,13 @@
 package api
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
-	"time"
 )
-
-// handleWechatQRStream 微信扫码登录 SSE 流
-//
-// POST /api/v1/channels/wechat/qr-stream
-// SSE 事件类型:
-//   - status: 进度状态 (generating / waiting / scanning)
-//   - qr:     二维码内容 (base64 encoded image data)
-//   - result: 登录成功 (nickname + avatar)
-//   - error:  登录失败 (message)
-//
-// 对标 OpenClaw 的微信扫码 SSE 流。
-func (s *Server) handleWechatQRStream(w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "SSE not supported", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
-	// Send status event
-	sendSSE(w, flusher, "status", map[string]string{"status": "generating", "message": "正在生成二维码..."})
-
-	// TODO: Integrate with openwechat library for actual QR generation
-	// For now, send a placeholder that tells the user this feature is pending
-	time.Sleep(500 * time.Millisecond)
-	sendSSE(w, flusher, "status", map[string]string{"status": "pending", "message": "微信扫码功能开发中，请先通过配置文件接入"})
-
-	// Timeout after informing the user
-	sendSSE(w, flusher, "error", map[string]string{"message": "微信扫码接入需要 openwechat 库支持，当前版本请通过 hexclaw.yaml 配置微信适配器"})
-}
 
 // handleWecomGuide 企业微信接入引导
 //
 // GET /api/v1/channels/wecom/guide
-// 返回企业微信接入的步骤说明和需要填写的配置字段。
 func (s *Server) handleWecomGuide(w http.ResponseWriter, r *http.Request) {
 	guide := map[string]any{
 		"steps": []map[string]string{
@@ -69,10 +33,4 @@ func (s *Server) port() int {
 		return s.cfg.Server.Port
 	}
 	return 16060
-}
-
-func sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data any) {
-	jsonData, _ := json.Marshal(data)
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(jsonData))
-	flusher.Flush()
 }

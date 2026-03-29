@@ -81,6 +81,13 @@ func (p *ToolPermissions) DisableForSession(sessionID, toolName string) {
 	p.sessions[sessionID].disabled[toolName] = true
 }
 
+// Rules returns the current allow and deny glob patterns.
+func (p *ToolPermissions) Rules() (allow, deny []string) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return append([]string(nil), p.allow...), append([]string(nil), p.deny...)
+}
+
 // ClearSession removes session-level overrides.
 func (p *ToolPermissions) ClearSession(sessionID string) {
 	p.mu.Lock()

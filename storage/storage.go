@@ -140,6 +140,9 @@ type Store interface {
 	// ListMessages 获取会话的消息历史（按创建时间正序）
 	ListMessages(ctx context.Context, sessionID string, limit, offset int) ([]*MessageRecord, error)
 
+	// CountMessages 获取会话消息总数
+	CountMessages(ctx context.Context, sessionID string) (int, error)
+
 	// UpdateMessageFeedback 更新消息反馈（like / dislike / 空字符串清除）
 	UpdateMessageFeedback(ctx context.Context, id, feedback string) error
 

@@ -68,6 +68,9 @@ type LogCollector struct {
 	// 最大并发订阅者数
 	maxSubscribers int
 
+	// 文件持久化 (可选，通过 AttachToCollector 挂载)
+	fileSink *LogFileSink
+
 	queryCacheMu sync.RWMutex
 	queryCache   map[logQueryKey]logQueryCacheEntry
 	queryOrder   []logQueryKey
@@ -160,7 +163,13 @@ func (c *LogCollector) Add(level, source, message string, fields map[string]any)
 	}
 	c.version++
 	c.statsDirty = true
+	sink := c.fileSink
 	c.mu.Unlock()
+
+	// 持久化到文件 (JSONL + 轮转)
+	if sink != nil {
+		sink.Write(entry)
+	}
 
 	// 广播给 WebSocket 订阅者
 	c.subMu.RLock()

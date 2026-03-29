@@ -521,6 +521,15 @@ func (s *Store) ListMessages(ctx context.Context, sessionID string, limit, offse
 	return messages, rows.Err()
 }
 
+// CountMessages 获取会话消息总数
+func (s *Store) CountMessages(ctx context.Context, sessionID string) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM messages WHERE session_id = ?`, sessionID,
+	).Scan(&count)
+	return count, err
+}
+
 // UpdateMessageFeedback 更新消息反馈。
 func (s *Store) UpdateMessageFeedback(ctx context.Context, id, feedback string) error {
 	switch feedback {

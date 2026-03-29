@@ -1,15 +1,20 @@
 // Package api 提供 HexClaw HTTP API 服务
 //
 // 包含以下端点：
-//   - GET    /health                        健康检查
-//   - POST   /api/v1/chat                   同步聊天
-//   - GET    /api/v1/sessions               会话列表
-//   - GET    /api/v1/sessions/{id}          会话详情
-//   - DELETE /api/v1/sessions/{id}          删除会话
-//   - GET    /api/v1/sessions/{id}/messages 消息历史
-//   - GET    /api/v1/sessions/{id}/branches 会话分支列表
-//   - POST   /api/v1/sessions/{id}/fork     创建对话分支
-//   - GET    /api/v1/messages/search        全文搜索消息
+//   - GET    /health                            健康检查
+//   - POST   /api/v1/chat                       同步聊天
+//   - GET    /api/v1/sessions                   会话列表
+//   - GET    /api/v1/sessions/{id}              会话详情
+//   - DELETE /api/v1/sessions/{id}              删除会话
+//   - GET    /api/v1/sessions/{id}/messages     消息历史
+//   - GET    /api/v1/sessions/{id}/branches     会话分支列表
+//   - POST   /api/v1/sessions/{id}/fork         创建对话分支
+//   - GET    /api/v1/sessions/{id}/checkpoints  检查点列表
+//   - GET    /api/v1/messages/search            全文搜索消息
+//   - GET    /api/v1/budget/status              预算使用状态
+//   - GET    /api/v1/tools/cache/stats          工具缓存统计
+//   - GET    /api/v1/tools/metrics              工具调用指标
+//   - GET    /api/v1/tools/permissions          工具权限规则
 //
 // 服务器支持优雅关闭：收到 SIGINT/SIGTERM 后等待请求处理完毕再退出。
 package api
@@ -74,6 +79,11 @@ type Server struct {
 	logCollector  *LogCollector            // 日志收集器
 	workflowStore *WorkflowStore           // 工作流存储
 	teamStore     *TeamStore               // 团队数据存储
+	budgetCtrl    *engine.BudgetController // 预算控制器（可选）
+	toolCache     *engine.ToolCache        // 工具缓存（可选）
+	toolMetrics   *engine.ToolMetricsCollector // 工具指标（可选）
+	toolPerms     *engine.ToolPermissions  // 工具权限（可选）
+	checkpointMgr *engine.CheckpointManager // 检查点管理器（可选）
 	version       string                   // 版本号
 	server        *http.Server
 	statsMu       sync.Mutex
@@ -87,12 +97,23 @@ type Server struct {
 // gw 可为 nil，此时跳过安全检查（仅限开发模式）。
 // store 可为 nil，此时会话/搜索/分支 API 不可用。
 func NewServer(cfg *config.Config, eng engine.Engine, gw gateway.Gateway, store storage.Store) *Server {
+	collector := NewLogCollector(5000)
+
+	// 挂载日志文件持久化 (JSONL + 轮转)
+	sink, err := NewLogFileSink(LogFileSinkConfig{})
+	if err != nil {
+		log.Printf("[warn] 日志文件持久化初始化失败: %v (仅使用内存日志)", err)
+	} else {
+		AttachToCollector(collector, sink)
+		log.Printf("[info] 日志文件: %s (10MB 轮转, 保留 100 份)", sink.Path())
+	}
+
 	return &Server{
 		cfg:           cfg,
 		engine:        eng,
 		gateway:       gw,
 		store:         store,
-		logCollector:  NewLogCollector(5000),
+		logCollector:  collector,
 		workflowStore: NewWorkflowStore(),
 		teamStore:     NewTeamStore(defaultDataDir()),
 	}
@@ -218,6 +239,41 @@ func (s *Server) SetVersion(v string) {
 // 设置后启用桌面通知、剪贴板等 API。
 func (s *Server) SetDesktop(svc *desktop.Service) {
 	s.desktopSvc = svc
+}
+
+// SetBudgetController 设置预算控制器
+//
+// 设置后启用预算状态 API。
+func (s *Server) SetBudgetController(b *engine.BudgetController) {
+	s.budgetCtrl = b
+}
+
+// SetToolCache 设置工具缓存
+//
+// 设置后启用工具缓存统计 API。
+func (s *Server) SetToolCache(tc *engine.ToolCache) {
+	s.toolCache = tc
+}
+
+// SetToolMetrics 设置工具指标收集器
+//
+// 设置后启用工具指标 API。
+func (s *Server) SetToolMetrics(tm *engine.ToolMetricsCollector) {
+	s.toolMetrics = tm
+}
+
+// SetToolPermissions 设置工具权限控制器
+//
+// 设置后启用工具权限查询 API。
+func (s *Server) SetToolPermissions(tp *engine.ToolPermissions) {
+	s.toolPerms = tp
+}
+
+// SetCheckpointManager 设置检查点管理器
+//
+// 设置后启用检查点列表 API。
+func (s *Server) SetCheckpointManager(cm *engine.CheckpointManager) {
+	s.checkpointMgr = cm
 }
 
 func (s *Server) routes() http.Handler {
@@ -367,7 +423,6 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /api/v1/platforms/instances/{name}/start", s.handleStartInstance)
 		mux.HandleFunc("POST /api/v1/platforms/instances/{name}/stop", s.handleStopInstance)
 		mux.HandleFunc("POST /api/v1/im/channels/{provider}/test", s.handleTestChannelConfig)
-		mux.HandleFunc("POST /api/v1/channels/wechat/qr-stream", s.handleWechatQRStream)
 		mux.HandleFunc("GET /api/v1/channels/wecom/guide", s.handleWecomGuide)
 		mux.HandleFunc("GET /api/v1/platforms/hooks/{provider}/{name}", s.handlePlatformHook)
 		mux.HandleFunc("POST /api/v1/platforms/hooks/{provider}/{name}", s.handlePlatformHook)
@@ -417,6 +472,35 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/team/members", s.handleListTeamMembers)
 	mux.HandleFunc("POST /api/v1/team/members", s.handleInviteTeamMember)
 	mux.HandleFunc("DELETE /api/v1/team/members/{id}", s.handleRemoveTeamMember)
+
+	// 预算状态 API
+	if s.budgetCtrl != nil {
+		mux.HandleFunc("GET /api/v1/budget/status", s.handleBudgetStatus)
+	}
+
+	// 工具缓存统计 API
+	if s.toolCache != nil {
+		mux.HandleFunc("GET /api/v1/tools/cache/stats", s.handleToolCacheStats)
+	}
+
+	// 工具指标 API
+	if s.toolMetrics != nil {
+		mux.HandleFunc("GET /api/v1/tools/metrics", s.handleToolMetrics)
+	}
+
+	// 工具权限 API
+	if s.toolPerms != nil {
+		mux.HandleFunc("GET /api/v1/tools/permissions", s.handleToolPermissions)
+	}
+
+	// 检查点列表 API
+	if s.checkpointMgr != nil {
+		mux.HandleFunc("GET /api/v1/sessions/{id}/checkpoints", s.handleListCheckpoints)
+	}
+
+	// TODO: Tool Approval API (engine/tool_approval.go)
+	// ToolApprovalGate 需要 WebSocket 双向通信，已通过 WebAdapter ↔ PermissionHub 实现。
+	// 未来可添加 REST API 查询待审批请求列表或审批历史。
 
 	// 桌面集成 API
 	if s.desktopSvc != nil {

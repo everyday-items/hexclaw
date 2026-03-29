@@ -19,28 +19,6 @@ type Resource struct {
 	MimeType    string `json:"mimeType,omitempty"`
 }
 
-// Prompt represents an MCP Prompt (parameterized template).
-//
-// Prompts are reusable prompt templates with parameters.
-type Prompt struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	Arguments   []PromptArg    `json:"arguments,omitempty"`
-}
-
-// PromptArg is a prompt argument definition.
-type PromptArg struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	Required    bool   `json:"required,omitempty"`
-}
-
-// PromptMessage is a resolved prompt message.
-type PromptMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
 // ListResources returns all resources from all connected MCP servers.
 func (m *Manager) ListResources(ctx context.Context) []Resource {
 	m.mu.RLock()
@@ -73,35 +51,6 @@ func (m *Manager) ReadResource(ctx context.Context, uri string) (string, error) 
 		_ = server
 	}
 	return "", fmt.Errorf("resource %q not found", uri)
-}
-
-// ListPrompts returns all prompts from all connected MCP servers.
-func (m *Manager) ListPrompts(ctx context.Context) []Prompt {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var prompts []Prompt
-	for _, server := range m.servers {
-		if !server.connected {
-			continue
-		}
-		_ = server
-	}
-	return prompts
-}
-
-// GetPrompt resolves a prompt with arguments and returns messages.
-func (m *Manager) GetPrompt(ctx context.Context, name string, args map[string]string) ([]PromptMessage, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	for _, server := range m.servers {
-		if !server.connected {
-			continue
-		}
-		_ = server
-	}
-	return nil, fmt.Errorf("prompt %q not found", name)
 }
 
 // InjectResourceContext adds available resources as context to the system prompt.

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 )
 
 type workflowTestEngine struct {
+	mu      sync.Mutex
 	lastMsg *adapter.Message
 }
 
@@ -22,7 +24,9 @@ func (e *workflowTestEngine) Stop(context.Context) error   { return nil }
 func (e *workflowTestEngine) Health(context.Context) error { return nil }
 
 func (e *workflowTestEngine) Process(_ context.Context, msg *adapter.Message) (*adapter.Reply, error) {
+	e.mu.Lock()
 	e.lastMsg = msg
+	e.mu.Unlock()
 	role := ""
 	if msg.Metadata != nil {
 		role = msg.Metadata["role"]

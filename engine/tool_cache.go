@@ -122,6 +122,13 @@ func (c *ToolCache) Stats() (hits, misses int64) {
 	return c.hits, c.misses
 }
 
+// EntryCount returns the number of entries currently in the cache.
+func (c *ToolCache) EntryCount() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.entries)
+}
+
 func (c *ToolCache) evictOldest() {
 	var oldestKey string
 	var oldestTime time.Time

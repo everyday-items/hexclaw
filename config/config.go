@@ -241,9 +241,14 @@ type EmbeddingConfig struct {
 }
 
 // ServerConfig 服务器配置
+//
+// 端口规划:
+//   - 16060: HexClaw HTTP API + WebSocket + SSE (主服务)
+//   - 16070: 预留，未来用于 MCP Server 模式 (让 Claude Code/Cursor 等调用 HexClaw)
 type ServerConfig struct {
 	Host     string `yaml:"host"`      // 监听地址，默认 127.0.0.1
-	Port     int    `yaml:"port"`      // 监听端口，默认 16060
+	Port     int    `yaml:"port"`      // 主服务端口，默认 16060
+	MCPPort  int    `yaml:"mcp_port"`  // MCP Server 端口，默认 16070 (预留，暂未启用)
 	Mode     string `yaml:"mode"`      // 运行模式: production / development
 	APIToken string `yaml:"api_token"` // 管理 API Token（为空则允许 localhost 免认证）
 }
@@ -611,6 +616,25 @@ type BuiltinConfig struct {
 	Shell     bool `yaml:"shell"`
 	CodeExec  bool `yaml:"code_exec"` // 沙箱代码执行 (需 sandbox 初始化)
 	FileOps   bool `yaml:"file_ops"`  // 文件读写编辑 (受限于 workspace)
+	CodeExecPolicy CodeExecPolicyConfig `yaml:"code_exec_policy"`
+}
+
+// CodeExecPolicyConfig 代码执行审批策略
+//
+// RequireApproval 为 true 时，code_exec 工具被分类为 "dangerous"，
+// 每次执行前需要用户确认。设为 false 表示信任沙箱隔离，跳过审批。
+// 默认值为 true（安全优先）。
+type CodeExecPolicyConfig struct {
+	RequireApproval *bool `yaml:"require_approval"` // nil 视为 true（安全默认）
+}
+
+// CodeExecRequiresApproval 返回 code_exec 是否需要用户审批
+// nil（未设置）视为 true，安全优先。
+func (c CodeExecPolicyConfig) CodeExecRequiresApproval() bool {
+	if c.RequireApproval == nil {
+		return true
+	}
+	return *c.RequireApproval
 }
 
 // StorageConfig 存储配置

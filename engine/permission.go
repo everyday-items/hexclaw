@@ -142,9 +142,22 @@ type PermissionHook struct {
 	sensitiveTools  map[string]bool // tools that require approval on first use
 }
 
+// PermissionHookOption configures a PermissionHook.
+type PermissionHookOption func(*PermissionHook)
+
+// WithCodeExecApproval controls whether code_exec requires user approval.
+// When disabled, code_exec is removed from the dangerous tools list.
+func WithCodeExecApproval(require bool) PermissionHookOption {
+	return func(h *PermissionHook) {
+		if !require {
+			delete(h.dangerousTools, "code_exec")
+		}
+	}
+}
+
 // NewPermissionHook creates a permission hook.
-func NewPermissionHook(hub *PermissionHub) *PermissionHook {
-	return &PermissionHook{
+func NewPermissionHook(hub *PermissionHub, opts ...PermissionHookOption) *PermissionHook {
+	h := &PermissionHook{
 		hub: hub,
 		dangerousTools: map[string]bool{
 			"shell":     true,
@@ -157,6 +170,10 @@ func NewPermissionHook(hub *PermissionHub) *PermissionHook {
 			"manage_mcp_server":  true,
 		},
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo) error {

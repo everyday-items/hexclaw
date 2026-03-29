@@ -219,16 +219,24 @@ func (m *Manager) Upsert(ctx context.Context, inst *Instance) error {
 }
 
 func (m *Manager) Delete(ctx context.Context, name string) error {
-	_ = m.Stop(ctx, name)
+	m.mu.Lock()
+	// Remove from DB and maps atomically under lock so concurrent Start()
+	// cannot find this instance anymore after we release
 	_, err := m.db.ExecContext(ctx, `DELETE FROM platform_instances WHERE name = ?`, name)
 	if err != nil {
+		m.mu.Unlock()
 		return err
 	}
-	m.mu.Lock()
+	adp := m.running[name]
 	delete(m.metadata, name)
 	delete(m.inbound, name)
 	delete(m.running, name)
 	m.mu.Unlock()
+
+	// Stop adapter outside lock (may take time)
+	if adp != nil {
+		_ = adp.Stop(ctx)
+	}
 	return nil
 }
 

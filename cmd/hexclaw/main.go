@@ -340,7 +340,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	// 6.1.1 接入权限审批 Hook (D24)
 	permHub := engine.NewPermissionHub(60 * time.Second)
-	permHook := engine.NewPermissionHook(permHub)
+	permHook := engine.NewPermissionHook(permHub,
+		engine.WithCodeExecApproval(cfg.Skill.Builtin.CodeExecPolicy.CodeExecRequiresApproval()),
+	)
 	toolExecutor.AddHook(permHook)
 
 	// 6.1.2 接入 per-tool 权限控制 (Phase 9 D40)
