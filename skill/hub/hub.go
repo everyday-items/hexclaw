@@ -27,7 +27,7 @@ type HubConfig struct {
 	Branch  string `yaml:"branch"`   // 默认: v0.0.2
 }
 
-// SkillMeta 技能元数据
+// SkillMeta 技能/MCP Server 元数据
 type SkillMeta struct {
 	Name        string   `json:"name"`
 	DisplayName string   `json:"display_name"`
@@ -35,9 +35,13 @@ type SkillMeta struct {
 	Version     string   `json:"version"`
 	Author      string   `json:"author"`
 	Category    string   `json:"category"`
+	Type        string   `json:"type,omitempty"`         // "skill" (default) 或 "mcp"
 	Tags         []string `json:"tags"`
 	Dependencies []string `json:"dependencies,omitempty"` // Skill 依赖列表
 	URL          string   `json:"url"`                    // 技能文件下载 URL
+	Command      string   `json:"command,omitempty"`      // MCP: 启动命令
+	Args         []string `json:"args,omitempty"`         // MCP: 命令参数
+	ConfigHint   string   `json:"config_hint,omitempty"`  // MCP: 配置提示
 	Downloads   int      `json:"downloads"`
 	Rating      float64  `json:"rating"`
 }
@@ -79,13 +83,27 @@ func (h *Hub) catalogURL() string {
 	if dir, ok := h.localRepoDir(); ok {
 		return filepath.Join(dir, "index.json")
 	}
-	// https://github.com/org/repo → https://raw.githubusercontent.com/org/repo/branch/index.json
 	repoURL := strings.TrimSuffix(h.cfg.RepoURL, ".git")
 	repoURL = strings.Replace(repoURL, "github.com", "raw.githubusercontent.com", 1)
 	return repoURL + "/" + h.cfg.Branch + "/index.json"
 }
 
-// Refresh 从远程获取最新技能目录
+// mcpRegistryURL 构造 mcp-registry.json 的 raw URL
+func (h *Hub) mcpRegistryURL() string {
+	if dir, ok := h.localRepoDir(); ok {
+		return filepath.Join(dir, "mcp-registry.json")
+	}
+	repoURL := strings.TrimSuffix(h.cfg.RepoURL, ".git")
+	repoURL = strings.Replace(repoURL, "github.com", "raw.githubusercontent.com", 1)
+	return repoURL + "/" + h.cfg.Branch + "/mcp-registry.json"
+}
+
+// mcpRegistry MCP Server 注册表
+type mcpRegistry struct {
+	Servers []SkillMeta `json:"servers"`
+}
+
+// Refresh 从远程获取最新技能目录（含 MCP 注册表）
 func (h *Hub) Refresh(ctx context.Context) error {
 	body, err := h.readCatalog(ctx)
 	if err != nil {
@@ -95,6 +113,24 @@ func (h *Hub) Refresh(ctx context.Context) error {
 	var catalog Catalog
 	if err := json.Unmarshal(body, &catalog); err != nil {
 		return fmt.Errorf("解析技能目录失败: %w", err)
+	}
+
+	// 标记 skill 类型
+	for i := range catalog.Skills {
+		if catalog.Skills[i].Type == "" {
+			catalog.Skills[i].Type = "skill"
+		}
+	}
+
+	// 加载 MCP 注册表并合并
+	if mcpBody, err := h.readURL(ctx, h.mcpRegistryURL()); err == nil {
+		var reg mcpRegistry
+		if err := json.Unmarshal(mcpBody, &reg); err == nil {
+			for i := range reg.Servers {
+				reg.Servers[i].Type = "mcp"
+			}
+			catalog.Skills = append(catalog.Skills, reg.Servers...)
+		}
 	}
 
 	h.mu.Lock()
@@ -238,28 +274,32 @@ func (h *Hub) localRepoDir() (string, bool) {
 }
 
 func (h *Hub) readCatalog(ctx context.Context) ([]byte, error) {
-	if dir, ok := h.localRepoDir(); ok {
-		path := filepath.Join(dir, "index.json")
-		body, err := os.ReadFile(path)
+	return h.readURL(ctx, h.catalogURL())
+}
+
+func (h *Hub) readURL(ctx context.Context, url string) ([]byte, error) {
+	// 本地文件路径
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		body, err := os.ReadFile(url)
 		if err != nil {
-			return nil, fmt.Errorf("读取本地技能目录失败: %w", err)
+			return nil, fmt.Errorf("读取本地文件失败: %w", err)
 		}
 		return body, nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.catalogURL(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("创建请求失败: %w", err)
 	}
 
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("获取技能目录失败: %w", err)
+		return nil, fmt.Errorf("获取远程文件失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("获取技能目录失败: HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("获取远程文件失败: HTTP %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))

@@ -283,35 +283,37 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		fmt.Printf("  ✓ Skills      %d 内置\n", builtinCount)
 	}
 
-	// 4.6 连接 MCP Server
+	// 4.6 连接 MCP Server（即使无预配 Server 也初始化 Manager，支持动态添加）
 	var mcpMgr *hexmcp.Manager
-	if cfg.MCP.Enabled && len(cfg.MCP.Servers) > 0 {
+	if cfg.MCP.Enabled {
 		mcpMgr = hexmcp.NewManager()
-		var mcpConfigs []hexmcp.ServerConfig
-		for _, s := range cfg.MCP.Servers {
-			enabled := s.Enabled
-			if !enabled && (s.Command != "" || s.Endpoint != "") {
-				enabled = true
-			}
-			mcpConfigs = append(mcpConfigs, hexmcp.ServerConfig{
-				Name:      s.Name,
-				Transport: s.Transport,
-				Command:   s.Command,
-				Args:      s.Args,
-				Endpoint:  s.Endpoint,
-				Enabled:   enabled,
-			})
-		}
-		totalTools, err := mcpMgr.Connect(ctx, mcpConfigs)
-		if err != nil {
-			fmt.Printf("  ✗ MCP         连接出错: %v\n", err)
-		}
-		if totalTools > 0 {
-			fmt.Printf("  ✓ MCP         %d 个工具 (%d Server)\n", totalTools, len(mcpMgr.ServerNames()))
-		} else if err == nil {
-			fmt.Println("  ✗ MCP         未连接")
-		}
 		defer mcpMgr.Close()
+		if len(cfg.MCP.Servers) > 0 {
+			var mcpConfigs []hexmcp.ServerConfig
+			for _, s := range cfg.MCP.Servers {
+				enabled := s.Enabled
+				if !enabled && (s.Command != "" || s.Endpoint != "") {
+					enabled = true
+				}
+				mcpConfigs = append(mcpConfigs, hexmcp.ServerConfig{
+					Name:      s.Name,
+					Transport: s.Transport,
+					Command:   s.Command,
+					Args:      s.Args,
+					Endpoint:  s.Endpoint,
+					Enabled:   enabled,
+				})
+			}
+			totalTools, err := mcpMgr.Connect(ctx, mcpConfigs)
+			if err != nil {
+				fmt.Printf("  ✗ MCP         连接出错: %v\n", err)
+			}
+			if totalTools > 0 {
+				fmt.Printf("  ✓ MCP         %d 个工具 (%d Server)\n", totalTools, len(mcpMgr.ServerNames()))
+			} else if err == nil {
+				fmt.Println("  ✗ MCP         未连接")
+			}
+		}
 	}
 
 	// 4.7 注册高级 Skill (需依赖注入: sandbox/hub/mcp)

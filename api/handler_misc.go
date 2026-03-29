@@ -245,7 +245,9 @@ func (s *Server) handleAddMCPServer(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	if err := s.mcpMgr.AddServer(ctx, cfg); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("MCP Server %q 连接失败: %v", req.Name, err),
+		})
 		return
 	}
 	// 持久化到配置文件，重启后不丢失

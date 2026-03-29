@@ -124,7 +124,7 @@ func DefaultConfig() *Config {
 			AutoLoad: true,
 			Hub: SkillsHubConfig{
 				RepoURL: "github.com/hexagon-codes/hexclaw-hub",
-				Branch:  "v0.0.1",
+				Branch:  "v0.0.2",
 			},
 		},
 		Heartbeat: HeartbeatConfig{
@@ -144,6 +144,9 @@ func DefaultConfig() *Config {
 				Enabled:  false,
 				Exporter: "otlp",
 			},
+		},
+		MCP: MCPConfig{
+			Enabled: true,
 		},
 		Budget: BudgetConfig{
 			MaxTokens:   500000,
