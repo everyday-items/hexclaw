@@ -28,10 +28,10 @@ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aN
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs4luLUK2k=
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
-github.com/hexagon-codes/ai-core v0.0.5 h1:OMdJksBRaBt8LlLr4HwGb1W8LC1vjCngnHl90/sQ1bI=
-github.com/hexagon-codes/ai-core v0.0.5/go.mod h1:wpzzLI21IyhUxKDSNUgaJCdPuen7HtE2bVy2t7Lt2fI=
-github.com/hexagon-codes/hexagon v0.4.0 h1:H+ooAFN3Ou58vaW8fh79gOND5QvD3lt4pycP8IhdkQo=
-github.com/hexagon-codes/hexagon v0.4.0/go.mod h1:9A1R/Ovr4f6tEbNnmXIsjDmLV8pD2AJiyWZ++vo4cxI=
+github.com/hexagon-codes/ai-core v0.0.6 h1:GBWJwMP70TF9XOeLh5eIsAUb3NHvUYeZcBzcmPOcm2E=
+github.com/hexagon-codes/ai-core v0.0.6/go.mod h1:wpzzLI21IyhUxKDSNUgaJCdPuen7HtE2bVy2t7Lt2fI=
+github.com/hexagon-codes/hexagon v0.4.1 h1:o+V1ya8Q+dYuZBgANlUt0D7K7BVWxDwcbZ3ymZVID7U=
+github.com/hexagon-codes/hexagon v0.4.1/go.mod h1:HBcTygz/0WO86US299MCDJPFuFdcDxdAlL9lK8MN7AI=
 github.com/hexagon-codes/toolkit v0.0.4 h1:nh5+qOVlWLfXvX/W2eTYnt3BqAZmtke2hiDwAbKtWsE=
 github.com/hexagon-codes/toolkit v0.0.4/go.mod h1:Wd/k/gGVDdPDjZgyt27Jl88naMNr7dEK7NmVE1oUNVA=
 github.com/inconshreveable/mousetrap v1.1.0 h1:wN+x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2s0bqwp9tc8=

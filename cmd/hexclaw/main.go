@@ -528,6 +528,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	lc.Info("system", fmt.Sprintf("Web UI: http://%s:%d | Chat API: POST /api/v1/chat", cfg.Server.Host, cfg.Server.Port))
 	lc.Info("system", "🦀 HexClaw 已就绪 — 数据全在本地，横行无忧")
 
+	// 挂载预算控制器 API
+	srv.SetBudgetController(budgetCtrl)
+
 	// 挂载知识库 API
 	if eng.KnowledgeBase() != nil {
 		srv.SetKnowledgeBase(eng.KnowledgeBase())

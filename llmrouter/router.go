@@ -96,6 +96,11 @@ func NewWithProviders(cfg config.LLMConfig, providers map[string]hexagon.Provide
 	return r
 }
 
+// isLocalProvider 检查 provider 是否为本地部署（如 Ollama），本地 provider 不需要 API Key
+func isLocalProvider(pc config.LLMProviderConfig) bool {
+	return strings.Contains(pc.BaseURL, "localhost") || strings.Contains(pc.BaseURL, "127.0.0.1")
+}
+
 func buildSelectorState(cfg config.LLMConfig) (map[string]hexagon.Provider, config.LLMConfig, string) {
 	providers := make(map[string]hexagon.Provider)
 	activeCfg := cloneLLMConfig(cfg)
@@ -103,9 +108,11 @@ func buildSelectorState(cfg config.LLMConfig) (map[string]hexagon.Provider, conf
 
 	providerNames := make([]string, 0, len(cfg.Providers))
 	for name, pc := range cfg.Providers {
-		if strings.TrimSpace(pc.APIKey) == "" {
+		if strings.TrimSpace(pc.APIKey) == "" && !isLocalProvider(pc) {
+			log.Printf("[router] 跳过无 API Key 的远程 provider: %s (base_url=%s)", name, pc.BaseURL)
 			continue
 		}
+		log.Printf("[router] 加载 provider: %s (base_url=%s, local=%v)", name, pc.BaseURL, isLocalProvider(pc))
 		providerNames = append(providerNames, name)
 		activeCfg.Providers[name] = pc
 	}

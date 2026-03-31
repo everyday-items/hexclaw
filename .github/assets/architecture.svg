@@ -1,0 +1,171 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 520" font-family="system-ui,-apple-system,sans-serif" font-size="13">
+  <defs>
+    <linearGradient id="g1" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3B82F6"/><stop offset="100%" stop-color="#2563EB"/></linearGradient>
+    <linearGradient id="g2" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#8B5CF6"/><stop offset="100%" stop-color="#7C3AED"/></linearGradient>
+    <linearGradient id="g3" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#F59E0B"/><stop offset="100%" stop-color="#D97706"/></linearGradient>
+    <linearGradient id="g4" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#10B981"/><stop offset="100%" stop-color="#059669"/></linearGradient>
+    <linearGradient id="g5" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#EF4444"/><stop offset="100%" stop-color="#DC2626"/></linearGradient>
+    <linearGradient id="g6" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#6366F1"/><stop offset="100%" stop-color="#4F46E5"/></linearGradient>
+    <linearGradient id="g7" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#64748B"/><stop offset="100%" stop-color="#475569"/></linearGradient>
+  </defs>
+  <style>
+    text { fill: white; }
+    .title { font-size: 18px; font-weight: 700; fill: #1E293B; }
+    .subtitle { font-size: 11px; fill: #64748B; }
+    .layer-label { font-size: 11px; fill: #94A3B8; font-weight: 600; }
+    .box text { font-size: 11.5px; }
+    .small { font-size: 10px; fill: rgba(255,255,255,0.85); }
+  </style>
+
+  <text x="400" y="28" text-anchor="middle" class="title">HexClaw Application Architecture</text>
+  <text x="400" y="46" text-anchor="middle" class="subtitle">企业级安全的个人 AI Agent &#183; 25+ Go 包 &#183; 71 API 端点 &#183; 13 平台</text>
+
+  <!-- Layer 1: Platform Adapter -->
+  <text x="16" y="76" class="layer-label">Platform Adapter</text>
+  <rect x="16" y="82" width="768" height="42" rx="6" fill="url(#g1)" opacity="0.9"/>
+  <text x="44" y="107" class="box"><tspan font-size="11">Web</tspan></text>
+  <text x="88" y="107" class="box"><tspan font-size="11">飞书</tspan></text>
+  <text x="136" y="107" class="box"><tspan font-size="11">Telegram</tspan></text>
+  <text x="210" y="107" class="box"><tspan font-size="11">钉钉</tspan></text>
+  <text x="258" y="107" class="box"><tspan font-size="11">Discord</tspan></text>
+  <text x="328" y="107" class="box"><tspan font-size="11">Slack</tspan></text>
+  <text x="380" y="107" class="box"><tspan font-size="11">企微</tspan></text>
+  <text x="424" y="107" class="box"><tspan font-size="11">微信</tspan></text>
+  <text x="472" y="107" class="box"><tspan font-size="11">WhatsApp</tspan></text>
+  <text x="548" y="107" class="box"><tspan font-size="11">LINE</tspan></text>
+  <text x="594" y="107" class="box"><tspan font-size="11">Matrix</tspan></text>
+  <text x="652" y="107" class="box"><tspan font-size="11">Email</tspan></text>
+  <text x="710" y="107" class="box"><tspan font-size="11">REST API</tspan></text>
+
+  <!-- Arrow -->
+  <path d="M400 124 L400 136" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <defs><marker id="arrow" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94A3B8"/></marker></defs>
+
+  <!-- Layer 2: Security Gateway -->
+  <text x="16" y="148" class="layer-label">Security Gateway (6-Layer)</text>
+  <rect x="16" y="154" width="768" height="38" rx="6" fill="url(#g5)" opacity="0.85"/>
+  <text x="60" y="177" class="box"><tspan font-size="11">Auth</tspan></text>
+  <text x="170" y="177" class="box"><tspan font-size="11">RateLimit</tspan></text>
+  <text x="298" y="177" class="box"><tspan font-size="11">CostCheck</tspan></text>
+  <text x="428" y="177" class="box"><tspan font-size="11">InputSafety</tspan></text>
+  <text x="558" y="177" class="box"><tspan font-size="11">Permission</tspan></text>
+  <text x="688" y="177" class="box"><tspan font-size="11">Audit</tspan></text>
+  <!-- arrows between -->
+  <text x="118" y="178" class="box" font-size="11">→</text>
+  <text x="244" y="178" class="box" font-size="11">→</text>
+  <text x="378" y="178" class="box" font-size="11">→</text>
+  <text x="508" y="178" class="box" font-size="11">→</text>
+  <text x="638" y="178" class="box" font-size="11">→</text>
+
+  <!-- Arrow -->
+  <path d="M400 192 L400 204" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Layer 3: Agent Engine -->
+  <text x="16" y="216" class="layer-label">Agent Engine</text>
+  <rect x="16" y="222" width="768" height="58" rx="6" fill="url(#g2)" opacity="0.9"/>
+  <rect x="28" y="230" width="120" height="20" rx="4" fill="rgba(255,255,255,0.15)"/>
+  <text x="88" y="244" text-anchor="middle" class="box" font-size="11">ReAct Loop</text>
+  <rect x="160" y="230" width="120" height="20" rx="4" fill="rgba(255,255,255,0.15)"/>
+  <text x="220" y="244" text-anchor="middle" class="box" font-size="11">3D Budget</text>
+  <rect x="292" y="230" width="120" height="20" rx="4" fill="rgba(255,255,255,0.15)"/>
+  <text x="352" y="244" text-anchor="middle" class="box" font-size="11">Tool Executor</text>
+  <rect x="424" y="230" width="120" height="20" rx="4" fill="rgba(255,255,255,0.15)"/>
+  <text x="484" y="244" text-anchor="middle" class="box" font-size="11">Tool Approval</text>
+  <rect x="556" y="230" width="110" height="20" rx="4" fill="rgba(255,255,255,0.15)"/>
+  <text x="611" y="244" text-anchor="middle" class="box" font-size="11">Checkpoint</text>
+  <rect x="678" y="230" width="95" height="20" rx="4" fill="rgba(255,255,255,0.15)"/>
+  <text x="725" y="244" text-anchor="middle" class="box" font-size="11">AutoMemory</text>
+  <!-- second row -->
+  <rect x="28" y="256" width="140" height="18" rx="4" fill="rgba(255,255,255,0.1)"/>
+  <text x="98" y="269" text-anchor="middle" class="small">Session Manager</text>
+  <rect x="180" y="256" width="140" height="18" rx="4" fill="rgba(255,255,255,0.1)"/>
+  <text x="250" y="269" text-anchor="middle" class="small">Context Compaction</text>
+  <rect x="332" y="256" width="140" height="18" rx="4" fill="rgba(255,255,255,0.1)"/>
+  <text x="402" y="269" text-anchor="middle" class="small">Multi-Agent Router</text>
+  <rect x="484" y="256" width="140" height="18" rx="4" fill="rgba(255,255,255,0.1)"/>
+  <text x="554" y="269" text-anchor="middle" class="small">Two-Pass Streaming</text>
+  <rect x="636" y="256" width="140" height="18" rx="4" fill="rgba(255,255,255,0.1)"/>
+  <text x="706" y="269" text-anchor="middle" class="small">Token Estimator</text>
+
+  <!-- Arrow -->
+  <path d="M400 280 L400 292" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Layer 4: Capability -->
+  <text x="16" y="304" class="layer-label">Capability Layer</text>
+  <g transform="translate(16,310)">
+    <rect width="148" height="36" rx="5" fill="url(#g4)" opacity="0.9"/>
+    <text x="74" y="17" text-anchor="middle" fill="white" font-size="12" font-weight="600">Skill System</text>
+    <text x="74" y="30" text-anchor="middle" class="small">Builtin + Market + MCP</text>
+  </g>
+  <g transform="translate(172,310)">
+    <rect width="148" height="36" rx="5" fill="url(#g4)" opacity="0.9"/>
+    <text x="74" y="17" text-anchor="middle" fill="white" font-size="12" font-weight="600">Knowledge (RAG)</text>
+    <text x="74" y="30" text-anchor="middle" class="small">FTS5 + Vector + MMR</text>
+  </g>
+  <g transform="translate(328,310)">
+    <rect width="148" height="36" rx="5" fill="url(#g4)" opacity="0.9"/>
+    <text x="74" y="17" text-anchor="middle" fill="white" font-size="12" font-weight="600">LLM Router</text>
+    <text x="74" y="30" text-anchor="middle" class="small">Cost/Quality/Latency</text>
+  </g>
+  <g transform="translate(484,310)">
+    <rect width="148" height="36" rx="5" fill="url(#g4)" opacity="0.9"/>
+    <text x="74" y="17" text-anchor="middle" fill="white" font-size="12" font-weight="600">Memory</text>
+    <text x="74" y="30" text-anchor="middle" class="small">File + Vector + Diary</text>
+  </g>
+  <g transform="translate(640,310)">
+    <rect width="144" height="36" rx="5" fill="url(#g4)" opacity="0.9"/>
+    <text x="72" y="17" text-anchor="middle" fill="white" font-size="12" font-weight="600">Semantic Cache</text>
+    <text x="72" y="30" text-anchor="middle" class="small">Singleflight + LRU</text>
+  </g>
+
+  <!-- Arrow -->
+  <path d="M400 346 L400 358" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Layer 5: Infrastructure -->
+  <text x="16" y="370" class="layer-label">Infrastructure</text>
+  <g transform="translate(16,376)">
+    <rect width="122" height="36" rx="5" fill="url(#g3)" opacity="0.85"/>
+    <text x="61" y="17" text-anchor="middle" fill="white" font-size="12" font-weight="600">Sandbox</text>
+    <text x="61" y="30" text-anchor="middle" class="small">Seatbelt/NS/Win32</text>
+  </g>
+  <g transform="translate(146,376)">
+    <rect width="122" height="36" rx="5" fill="url(#g3)" opacity="0.85"/>
+    <text x="61" y="17" text-anchor="middle" fill="white" font-size="12" font-weight="600">MCP Client</text>
+    <text x="61" y="30" text-anchor="middle" class="small">stdio + SSE + HTTP</text>
+  </g>
+  <g transform="translate(276,376)">
+    <rect width="122" height="36" rx="5" fill="url(#g3)" opacity="0.85"/>
+    <text x="61" y="17" text-anchor="middle" fill="white" font-size="12" font-weight="600">Cron + Webhook</text>
+    <text x="61" y="30" text-anchor="middle" class="small">定时 + 事件驱动</text>
+  </g>
+  <g transform="translate(406,376)">
+    <rect width="122" height="36" rx="5" fill="url(#g3)" opacity="0.85"/>
+    <text x="61" y="17" text-anchor="middle" fill="white" font-size="12" font-weight="600">REST API</text>
+    <text x="61" y="30" text-anchor="middle" class="small">71 端点 + WebSocket</text>
+  </g>
+  <g transform="translate(536,376)">
+    <rect width="122" height="36" rx="5" fill="url(#g3)" opacity="0.85"/>
+    <text x="61" y="17" text-anchor="middle" fill="white" font-size="12" font-weight="600">Canvas / A2UI</text>
+    <text x="61" y="30" text-anchor="middle" class="small">8 种交互组件</text>
+  </g>
+  <g transform="translate(666,376)">
+    <rect width="118" height="36" rx="5" fill="url(#g3)" opacity="0.85"/>
+    <text x="59" y="17" text-anchor="middle" fill="white" font-size="12" font-weight="600">Voice</text>
+    <text x="59" y="30" text-anchor="middle" class="small">STT + TTS</text>
+  </g>
+
+  <!-- Arrow -->
+  <path d="M400 412 L400 424" stroke="#94A3B8" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Layer 6: Storage -->
+  <text x="16" y="436" class="layer-label">Storage &amp; Config</text>
+  <rect x="16" y="442" width="768" height="34" rx="6" fill="url(#g7)" opacity="0.85"/>
+  <text x="100" y="463" text-anchor="middle" fill="white" font-size="11.5">SQLite (WAL)</text>
+  <text x="250" y="463" text-anchor="middle" fill="white" font-size="11.5">FTS5 全文搜索</text>
+  <text x="400" y="463" text-anchor="middle" fill="white" font-size="11.5">YAML + ENV 配置</text>
+  <text x="550" y="463" text-anchor="middle" fill="white" font-size="11.5">Audit Log (JSONL)</text>
+  <text x="700" y="463" text-anchor="middle" fill="white" font-size="11.5">File Memory (.md)</text>
+
+  <!-- Footer -->
+  <text x="400" y="500" text-anchor="middle" class="subtitle">Powered by Hexagon AI Agent Framework &#183; ai-core &#183; toolkit</text>
+</svg>

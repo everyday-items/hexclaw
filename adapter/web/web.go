@@ -147,6 +147,8 @@ func (a *WebAdapter) SendStream(ctx context.Context, chatID string, chunks <-cha
 		return nil
 	}
 
+	chunkCount := 0
+	reasoningCount := 0
 	for chunk := range chunks {
 		if chunk.Error != nil {
 			errMsg := wsMessage{Type: "error", Content: chunk.Error.Error()}
@@ -154,9 +156,18 @@ func (a *WebAdapter) SendStream(ctx context.Context, chatID string, chunks <-cha
 			return chunk.Error
 		}
 
+		chunkCount++
+		if chunk.Reasoning != "" {
+			reasoningCount++
+			if reasoningCount == 1 {
+				log.Printf("[WS SendStream] 首个 reasoning chunk: %q (chunkCount=%d)", chunk.Reasoning[:min(30, len(chunk.Reasoning))], chunkCount)
+			}
+		}
+
 		msg := wsMessage{
 			Type:      "chunk",
 			Content:   chunk.Content,
+			Reasoning: chunk.Reasoning,
 			Done:      chunk.Done,
 			Metadata:  chunk.Metadata,
 			Usage:     chunk.Usage,
@@ -166,18 +177,14 @@ func (a *WebAdapter) SendStream(ctx context.Context, chatID string, chunks <-cha
 			return err
 		}
 	}
+	log.Printf("[WS SendStream] 完成: %d chunks, %d reasoning chunks", chunkCount, reasoningCount)
 	return nil
 }
 
 // handleWS 处理 WebSocket 连接
 func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: []string{
-			"localhost:*",
-			"127.0.0.1:*",
-			"tauri://localhost",
-			"https://tauri.localhost",
-		},
+		InsecureSkipVerify: true, // desktop 模式仅监听 127.0.0.1，无外部风险
 	})
 	if err != nil {
 		log.Printf("WebSocket 握手失败: %v", err)
@@ -245,12 +252,16 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 构建统一消息
+		userID := incoming.UserID
+		if userID == "" {
+			userID = "web-user"
+		}
 		msg := &adapter.Message{
 			ID:          "web-" + idgen.ShortID(),
 			Platform:    adapter.PlatformWeb,
 			InstanceID:  a.Name(),
 			ChatID:      chatID,
-			UserID:      "web-user",
+			UserID:      userID,
 			UserName:    "Web User",
 			SessionID:   incoming.SessionID,
 			Content:     incoming.Content,
@@ -275,7 +286,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 
 		// 异步处理消息
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
 
 			// 优先使用流式处理
@@ -341,7 +352,9 @@ func (a *WebAdapter) getConn(chatID string) (*websocket.Conn, bool) {
 type wsMessage struct {
 	Type        string               `json:"type"`                  // message / reply / chunk / error
 	Content     string               `json:"content"`               // 消息内容
+	Reasoning   string               `json:"reasoning,omitempty"`   // 推理/思考过程（流式 thinking）
 	SessionID   string               `json:"session_id,omitempty"`  // 会话 ID
+	UserID      string               `json:"user_id,omitempty"`     // 用户 ID（桌面端传 desktop-user）
 	Provider    string               `json:"provider,omitempty"`    // 显式指定的 Provider
 	Model       string               `json:"model,omitempty"`       // 显式指定的模型
 	Role        string               `json:"role,omitempty"`        // Agent 角色

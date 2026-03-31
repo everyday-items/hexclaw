@@ -684,16 +684,59 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 调用引擎处理（日志只记录长度，不记录原文，防止 PII 泄露）
+	// 调用引擎处理（优先走流式路径，避免 thinking 模型阻塞工具探测）
 	s.logCollector.Info("chat", fmt.Sprintf("← %s (%d 字符)", userID, len([]rune(req.Message))))
-	reply, err := s.engine.Process(r.Context(), msg)
-	if err != nil {
-		s.logCollector.Error("chat", fmt.Sprintf("处理失败: user=%s err=%v", userID, err))
-		message := upstreamerr.PublicMessage(err, "处理消息失败")
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"error": message,
-		})
-		return
+
+	type streamEngine interface {
+		ProcessStream(ctx context.Context, msg *adapter.Message) (<-chan *adapter.ReplyChunk, error)
+	}
+
+	var reply *adapter.Reply
+	if se, ok := s.engine.(streamEngine); ok {
+		chunks, err := se.ProcessStream(r.Context(), msg)
+		if err != nil {
+			s.logCollector.Error("chat", fmt.Sprintf("处理失败: user=%s err=%v", userID, err))
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": upstreamerr.PublicMessage(err, "处理消息失败"),
+			})
+			return
+		}
+		// 消费流式 channel，收集完整回复
+		var content strings.Builder
+		var metadata map[string]string
+		var usage *adapter.Usage
+		var toolCalls []adapter.ToolCall
+		for chunk := range chunks {
+			if chunk.Error != nil {
+				s.logCollector.Error("chat", fmt.Sprintf("处理失败: user=%s err=%v", userID, chunk.Error))
+				writeJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": upstreamerr.PublicMessage(chunk.Error, "处理消息失败"),
+				})
+				return
+			}
+			content.WriteString(chunk.Content)
+			if chunk.Done {
+				metadata = chunk.Metadata
+				usage = chunk.Usage
+				toolCalls = chunk.ToolCalls
+			}
+		}
+		reply = &adapter.Reply{
+			Content:   content.String(),
+			Metadata:  metadata,
+			Usage:     usage,
+			ToolCalls: toolCalls,
+		}
+	} else {
+		var err error
+		reply, err = s.engine.Process(r.Context(), msg)
+		if err != nil {
+			s.logCollector.Error("chat", fmt.Sprintf("处理失败: user=%s err=%v", userID, err))
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": upstreamerr.PublicMessage(err, "处理消息失败"),
+			})
+			return
+		}
 	}
 
 	s.logCollector.Info("chat", fmt.Sprintf("→ %s (%d 字符)", userID, len([]rune(reply.Content))))

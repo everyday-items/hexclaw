@@ -482,9 +482,12 @@ func (e *ReActEngine) completeWithTools(
 	}
 	useBudget := budget != nil
 
-	// 收集工具定义
+	// 收集工具定义（本地模型跳过）
 	var tools []llm.ToolDefinition
-	if e.toolCollector != nil {
+	isLocal := strings.Contains(providerName, "本地") ||
+		strings.Contains(strings.ToLower(providerName), "ollama") ||
+		strings.Contains(strings.ToLower(providerName), "local")
+	if e.toolCollector != nil && !isLocal {
 		tools = e.toolCollector.Collect()
 	}
 
@@ -492,6 +495,27 @@ func (e *ReActEngine) completeWithTools(
 	req := e.buildCompletionRequest(msg, history, kbContext)
 	if len(tools) > 0 {
 		req.Tools = tools
+	}
+
+	// 无工具时直接 Complete，不走工具循环
+	if len(tools) == 0 {
+		resp, err := provider.Complete(ctx, req)
+		if err != nil {
+			if !explicitProvider {
+				fallbackP, fbName, fbErr := e.router.Fallback(providerName)
+				if fbErr == nil {
+					log.Printf("Provider %s 失败，降级到 %s: %v", providerName, fbName, err)
+					provider = fallbackP
+					providerName = fbName
+					modelName = e.getProviderModel(fbName, msg.Metadata)
+					resp, err = provider.Complete(ctx, req)
+				}
+			}
+			if err != nil {
+				return nil, fmt.Errorf("provider %s 调用失败: %w", providerName, err)
+			}
+		}
+		return e.finalizeReply(ctx, sessionID, msg, resp, providerName, modelName, cacheInput, nil)
 	}
 
 	var allToolCalls []adapter.ToolCall
@@ -822,12 +846,60 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	if e.toolCollector != nil {
 		tools = e.toolCollector.Collect()
 	}
+	// 本地模型（Ollama）不注入工具定义 — 小模型处理大量工具描述极慢
+	isLocal := strings.Contains(selection.providerName, "本地") ||
+		strings.Contains(strings.ToLower(selection.providerName), "ollama") ||
+		strings.Contains(strings.ToLower(selection.providerName), "local")
+	if isLocal {
+		tools = nil
+	}
+	log.Printf("[ProcessStream] tools=%d, provider=%s, local=%v", len(tools), selection.providerName, isLocal)
 	if len(tools) > 0 {
 		req.Tools = tools
 	}
 
-	// 7.5 工具循环: 中间轮用 Complete (非流式)，最终轮用 Stream (流式)
-	// G1: Budget 接入 ProcessStream — 有 Budget 时由 Budget 兜底，无 Budget 时硬限 5 轮
+	// 7.5 第一轮直接流式推给前端（thinking + 回复实时可见）
+
+	llmStream, err := selection.provider.Stream(ctx, req)
+	if err != nil {
+		if !selection.explicitProvider {
+			fallbackP, fbName, fbErr := e.router.Fallback(selection.providerName)
+			if fbErr == nil {
+				log.Printf("Provider %s 失败，降级到 %s: %v", selection.providerName, fbName, err)
+				selection.provider = fallbackP
+				selection.providerName = fbName
+				selection.modelName = e.getProviderModel(fbName, msg.Metadata)
+				llmStream, err = selection.provider.Stream(ctx, req)
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("provider %s 调用失败: %w", selection.providerName, err)
+		}
+	}
+
+	// 第一轮直接推流（pipeStream 内部完成保存/缓存等后处理）
+	if len(tools) == 0 {
+		ch := make(chan *adapter.ReplyChunk, 16)
+		go e.pipeStream(ctx, ch, llmStream, sess.ID, msg, selection.providerName, selection.modelName, cacheInput)
+		return ch, nil
+	}
+
+	// 有工具：直接推流给前端（thinking + 回复实时可见）
+	// 工具调用在流结束后通过 pipeStreamWithTools 处理
+	ch := make(chan *adapter.ReplyChunk, 16)
+	go e.pipeStreamWithTools(ctx, ch, llmStream, sess.ID, msg, selection.providerName, selection.modelName, cacheInput, nil)
+	return ch, nil
+}
+
+// processStreamToolLoop 多轮工具循环（后续版本启用）
+func (e *ReActEngine) processStreamToolLoop(
+	ctx context.Context,
+	req hexagon.CompletionRequest,
+	selection *llmSelection,
+	sess *storage.Session,
+	msg *adapter.Message,
+	cacheInput string,
+) (<-chan *adapter.ReplyChunk, error) {
 	const maxStreamToolTurns = 5
 	var budget *BudgetController
 	if e.budgetCfg != nil {
@@ -846,8 +918,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		}
 		req.Messages = messages
 
-		// 先用 Complete 探测是否有 tool_calls
-		resp, err := selection.provider.Complete(ctx, req)
+		llmStream, err := selection.provider.Stream(ctx, req)
 		if err != nil {
 			if selection.explicitProvider || turn > 0 {
 				return nil, fmt.Errorf("provider %s 调用失败: %w", selection.providerName, err)
@@ -860,55 +931,62 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 			selection.provider = fallbackP
 			selection.providerName = fbName
 			selection.modelName = e.getProviderModel(fbName, msg.Metadata)
-			resp, err = selection.provider.Complete(ctx, req)
+			llmStream, err = selection.provider.Stream(ctx, req)
 			if err != nil {
 				return nil, fmt.Errorf("调用失败（降级后）: %w", err)
 			}
 		}
 
+		// 消费流，收集完整结果（用于检测 tool_calls）
+		for range llmStream.Chunks() {
+			// drain chunks — 中间轮不推给前端
+		}
+		result := llmStream.Result()
+
 		// 当 provider 未返回 token 统计时，使用 tokenizer 估算
-		if resp.Usage.TotalTokens == 0 {
-			p, c, t := estimateResponseUsage(selection.providerName, messages, resp.Content)
-			resp.Usage.PromptTokens = p
-			resp.Usage.CompletionTokens = c
-			resp.Usage.TotalTokens = t
+		if result.Usage.TotalTokens == 0 {
+			p, c, t := estimateResponseUsage(selection.providerName, messages, result.Content)
+			result.Usage.PromptTokens = p
+			result.Usage.CompletionTokens = c
+			result.Usage.TotalTokens = t
 		}
 
 		// G1: 记录 token 使用到 Budget (ProcessStream 路径)
-		if useBudgetStream && resp.Usage.TotalTokens > 0 {
-			budget.RecordTokens(resp.Usage.TotalTokens)
-			if cost := EstimateCost(selection.providerName, selection.modelName, resp.Usage.PromptTokens, resp.Usage.CompletionTokens); cost > 0 {
+		if useBudgetStream && result.Usage.TotalTokens > 0 {
+			budget.RecordTokens(result.Usage.TotalTokens)
+			if cost := EstimateCost(selection.providerName, selection.modelName, result.Usage.PromptTokens, result.Usage.CompletionTokens); cost > 0 {
 				budget.RecordCost(cost)
 			}
 		}
 
-		// 无 tool_calls → 最终轮，切换到流式返回
-		if !resp.HasToolCalls() {
-			// 重新发起流式请求 (不含上一次的 Complete 结果)
-			llmStream, sErr := selection.provider.Stream(ctx, req)
+		// 无 tool_calls → 最终轮，重新发起流式请求推给前端
+		hasToolCalls := len(result.ToolCalls) > 0
+		if !hasToolCalls {
+			finalStream, sErr := selection.provider.Stream(ctx, req)
 			if sErr != nil {
-				// 流式失败则直接用 Complete 结果
+				// 流式失败则直接用已收集的结果
 				return singleChunkWithTools(
-					resp.Content,
+					result.Content,
 					buildReplyMetadata(msg.Metadata, selection.providerName, selection.modelName, ""),
 					allToolCalls,
 				), nil
 			}
 			ch := make(chan *adapter.ReplyChunk, 16)
-			go e.pipeStreamWithTools(ctx, ch, llmStream, sess.ID, msg, selection.providerName, selection.modelName, cacheInput, allToolCalls)
+			go e.pipeStreamWithTools(ctx, ch, finalStream, sess.ID, msg, selection.providerName, selection.modelName, cacheInput, allToolCalls)
 			return ch, nil
 		}
 
+		// 有 tool_calls → 构建 tool transcript 并执行
 		// G2: 结构化 tool transcript (ProcessStream 路径)
 		var streamToolRefs []llm.ToolCallRef
-		for _, tc := range resp.ToolCalls {
+		for _, tc := range result.ToolCalls {
 			streamToolRefs = append(streamToolRefs, llm.ToolCallRef{
 				ID: tc.ID, Name: tc.Name, Arguments: tc.Arguments,
 			})
 		}
-		messages = append(messages, llm.AssistantToolCallMessage(resp.Content, streamToolRefs))
+		messages = append(messages, llm.AssistantToolCallMessage(result.Content, streamToolRefs))
 
-		for _, tc := range resp.ToolCalls {
+		for _, tc := range result.ToolCalls {
 			var toolArgs map[string]any
 			if tc.Arguments != "" {
 				json.Unmarshal([]byte(tc.Arguments), &toolArgs)
@@ -933,17 +1011,15 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		}
 	}
 
-	// 超过最大轮次，用最后一次 Complete 结果
+	// 超过最大轮次，用最后一次流式结果
 	log.Printf("流式工具循环达到上限 %d 轮", maxStreamToolTurns)
-	lastResp, err := selection.provider.Complete(ctx, req)
+	finalStream, err := selection.provider.Stream(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("最终补全失败: %w", err)
 	}
-	return singleChunkWithTools(
-		lastResp.Content,
-		buildReplyMetadata(msg.Metadata, selection.providerName, selection.modelName, ""),
-		allToolCalls,
-	), nil
+	ch := make(chan *adapter.ReplyChunk, 16)
+	go e.pipeStreamWithTools(ctx, ch, finalStream, sess.ID, msg, selection.providerName, selection.modelName, cacheInput, allToolCalls)
+	return ch, nil
 }
 
 // pipeStream 将 LLM 流式响应转发到适配器 channel，流结束后保存回复/缓存/成本
@@ -962,14 +1038,19 @@ func (e *ReActEngine) pipeStream(
 
 	var fullContent strings.Builder
 
+	reasoningLogged := false
 	for chunk := range llmStream.Chunks() {
-		if chunk.Content == "" {
+		if chunk.Content == "" && chunk.Reasoning == "" {
 			continue
+		}
+		if chunk.Reasoning != "" && !reasoningLogged {
+			log.Printf("[pipeStream] 首个 reasoning chunk: %q", chunk.Reasoning[:min(50, len(chunk.Reasoning))])
+			reasoningLogged = true
 		}
 		fullContent.WriteString(chunk.Content)
 
 		select {
-		case ch <- &adapter.ReplyChunk{Content: chunk.Content}:
+		case ch <- &adapter.ReplyChunk{Content: chunk.Content, Reasoning: chunk.Reasoning}:
 		case <-ctx.Done():
 			ch <- &adapter.ReplyChunk{Error: ctx.Err(), Done: true}
 			return
@@ -1076,12 +1157,12 @@ func (e *ReActEngine) pipeStreamWithTools(
 
 	var fullContent strings.Builder
 	for chunk := range llmStream.Chunks() {
-		if chunk.Content == "" {
+		if chunk.Content == "" && chunk.Reasoning == "" {
 			continue
 		}
 		fullContent.WriteString(chunk.Content)
 		select {
-		case ch <- &adapter.ReplyChunk{Content: chunk.Content}:
+		case ch <- &adapter.ReplyChunk{Content: chunk.Content, Reasoning: chunk.Reasoning}:
 		case <-ctx.Done():
 			ch <- &adapter.ReplyChunk{Error: ctx.Err(), Done: true}
 			return

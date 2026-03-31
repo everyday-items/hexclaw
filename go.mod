@@ -4,8 +4,8 @@ go 1.25.5
 
 require (
 	github.com/gorilla/websocket v1.5.3
-	github.com/hexagon-codes/ai-core v0.0.5
-	github.com/hexagon-codes/hexagon v0.4.0
+	github.com/hexagon-codes/ai-core v0.0.6
+	github.com/hexagon-codes/hexagon v0.4.1
 	github.com/hexagon-codes/toolkit v0.0.4
 	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
 	github.com/spf13/cobra v1.9.1
