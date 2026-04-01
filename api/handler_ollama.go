@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -99,4 +102,61 @@ func (s *Server) handleOllamaStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, status)
+}
+
+// handleOllamaPull 下载 Ollama 模型，流式返回下载进度 (SSE)
+//
+// POST /api/v1/ollama/pull
+// Body: {"model": "llama3.1"}
+// Response: text/event-stream
+//
+//	data: {"status":"pulling manifest"}
+//	data: {"status":"downloading","completed":1234567,"total":4567890}
+//	data: {"status":"success"}
+func (s *Server) handleOllamaPull(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Model == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "model is required"})
+		return
+	}
+
+	// 调用 Ollama pull API (POST /api/pull, 流式 JSON)
+	pullBody, _ := json.Marshal(map[string]any{"name": req.Model, "stream": true})
+	pullReq, _ := http.NewRequestWithContext(r.Context(), "POST", "http://localhost:11434/api/pull", bytes.NewReader(pullBody))
+	pullReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Minute} // 大模型下载可能很久
+	pullResp, err := client.Do(pullReq)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("Ollama 连接失败: %v", err)})
+		return
+	}
+	defer pullResp.Body.Close()
+
+	// SSE 流式推送进度
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming not supported"})
+		return
+	}
+
+	scanner := bufio.NewScanner(pullResp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 256*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		fmt.Fprintf(w, "data: %s\n\n", line)
+		flusher.Flush()
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(w, "data: {\"status\":\"error\",\"error\":%q}\n\n", err.Error())
+		flusher.Flush()
+	}
 }
