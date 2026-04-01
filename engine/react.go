@@ -1675,15 +1675,59 @@ func (e *ReActEngine) buildCapabilityContext(ctx context.Context) string {
 	sb.WriteString("- 当前时间：" + time.Now().Format("2006-01-02 15:04 (Monday)") + "\n")
 	sb.WriteString("- 操作系统：" + runtime.GOOS + "/" + runtime.GOARCH + "\n")
 	e.mu.RLock()
-	if e.router != nil {
-		if p, name, err := e.router.Route(ctx); err == nil && p != nil {
-			model := e.router.ProviderModel(name)
-			sb.WriteString("- 当前模型：" + name + " / " + model + "\n")
-		}
-	}
+	router := e.router
+	agentRtr := e.agentRouter
+	cfg := e.cfg
 	e.mu.RUnlock()
 
+	// 当前模型
+	if router != nil {
+		if p, name, err := router.Route(ctx); err == nil && p != nil {
+			model := router.ProviderModel(name)
+			sb.WriteString("- 当前模型：" + name + " / " + model + "\n")
+		}
+		// 可用 Provider 列表
+		providers := router.Providers()
+		if len(providers) > 0 {
+			sb.WriteString("- 可用模型：" + strings.Join(providers, "、") + "\n")
+		}
+	}
+
+	// 5. Agent 列表
+	if agentRtr != nil {
+		if agents := agentRtr.ListAgents(); len(agents) > 0 {
+			sb.WriteString("\n[已配置的 Agent]\n")
+			for _, a := range agents {
+				desc := a.Description
+				if desc == "" {
+					desc = a.DisplayName
+				}
+				if len(desc) > 50 {
+					desc = desc[:50] + "..."
+				}
+				sb.WriteString("- @" + a.Name + "：" + desc + "\n")
+			}
+		}
+	}
+
+	// 6. 应用设置摘要
+	if cfg != nil {
+		sb.WriteString("\n[应用设置]\n")
+		sb.WriteString("- 知识库：" + boolZh(cfg.Knowledge.Enabled) + "\n")
+		sb.WriteString("- MCP 工具：" + boolZh(cfg.MCP.Enabled) + "\n")
+		sb.WriteString("- 定时任务：" + boolZh(cfg.Cron.Enabled) + "\n")
+		sb.WriteString("- Webhook：" + boolZh(cfg.Webhook.Enabled) + "\n")
+		sb.WriteString("- 长期记忆：" + boolZh(cfg.FileMemory.Enabled) + "\n")
+	}
+
 	return sb.String()
+}
+
+func boolZh(b bool) string {
+	if b {
+		return "已启用"
+	}
+	return "未启用"
 }
 
 // systemPrompt HexClaw 系统提示词
