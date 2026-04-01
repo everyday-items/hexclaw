@@ -463,6 +463,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/models", s.handleListModels)
 	mux.HandleFunc("GET /api/v1/ollama/status", s.handleOllamaStatus)
 	mux.HandleFunc("POST /api/v1/ollama/pull", s.handleOllamaPull)
+	mux.HandleFunc("GET /api/v1/ollama/running", s.handleOllamaRunning)
+	mux.HandleFunc("POST /api/v1/ollama/unload", s.handleOllamaUnload)
+	mux.HandleFunc("DELETE /api/v1/ollama/models/{name}", s.handleOllamaDelete)
 
 	// ClawHub 搜索（Skill 市场）
 	mux.HandleFunc("GET /api/v1/clawhub/search", s.handleClawHubSearch)

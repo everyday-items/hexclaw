@@ -104,6 +104,109 @@ func (s *Server) handleOllamaStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, status)
 }
 
+// handleOllamaRunning 获取当前加载到内存的模型列表
+//
+// GET /api/v1/ollama/running
+func (s *Server) handleOllamaRunning(w http.ResponseWriter, r *http.Request) {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://localhost:11434/api/ps")
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("Ollama 连接失败: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Models []struct {
+			Name          string `json:"name"`
+			Size          int64  `json:"size"`
+			SizeVRAM      int64  `json:"size_vram"`
+			ExpiresAt     string `json:"expires_at"`
+			ContextLength int    `json:"context_length"`
+			Details       struct {
+				Family            string `json:"family"`
+				ParameterSize     string `json:"parameter_size"`
+				QuantizationLevel string `json:"quantization_level"`
+			} `json:"details"`
+		} `json:"models"`
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if json.Unmarshal(body, &result) != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}})
+		return
+	}
+
+	type runningModel struct {
+		Name      string `json:"name"`
+		Size      int64  `json:"size"`
+		SizeVRAM  int64  `json:"size_vram"`
+		ExpiresAt string `json:"expires_at"`
+		Params    string `json:"parameter_size,omitempty"`
+		Quant     string `json:"quantization_level,omitempty"`
+		Context   int    `json:"context_length"`
+	}
+	models := make([]runningModel, 0, len(result.Models))
+	for _, m := range result.Models {
+		models = append(models, runningModel{
+			Name: m.Name, Size: m.Size, SizeVRAM: m.SizeVRAM,
+			ExpiresAt: m.ExpiresAt, Context: m.ContextLength,
+			Params: m.Details.ParameterSize, Quant: m.Details.QuantizationLevel,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"models": models})
+}
+
+// handleOllamaUnload 从内存中卸载模型
+//
+// POST /api/v1/ollama/unload  Body: {"model": "qwen3:8b"}
+func (s *Server) handleOllamaUnload(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Model == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "model is required"})
+		return
+	}
+	// keep_alive=0 让 Ollama 立即卸载模型
+	unloadBody, _ := json.Marshal(map[string]any{"model": req.Model, "keep_alive": 0})
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post("http://localhost:11434/api/generate", "application/json", bytes.NewReader(unloadBody))
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("卸载失败: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body) // drain
+	writeJSON(w, http.StatusOK, map[string]string{"status": "unloaded"})
+}
+
+// handleOllamaDelete 删除已下载的模型
+//
+// DELETE /api/v1/ollama/models/:name
+func (s *Server) handleOllamaDelete(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "model name required"})
+		return
+	}
+	delBody, _ := json.Marshal(map[string]string{"name": name})
+	req2, _ := http.NewRequestWithContext(r.Context(), "DELETE", "http://localhost:11434/api/delete", bytes.NewReader(delBody))
+	req2.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req2)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("删除失败: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode >= 400 {
+		writeJSON(w, resp.StatusCode, map[string]string{"error": "Ollama 删除失败"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
 // handleOllamaPull 下载 Ollama 模型，流式返回下载进度 (SSE)
 //
 // POST /api/v1/ollama/pull
