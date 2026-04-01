@@ -1307,6 +1307,8 @@ func (e *ReActEngine) buildStreamMessages(roleName string, history []hexagon.Mes
 	if kbContext != "" {
 		sysContent += "\n\n[参考知识]\n" + kbContext
 	}
+	// 追加能力上下文：知识库文件列表、Skill/MCP 工具、记忆
+	sysContent += e.buildCapabilityContext(context.Background())
 	messages = append(messages, hexagon.Message{
 		Role:    "system",
 		Content: sysContent,
@@ -1615,6 +1617,59 @@ func requestedModel(metadata map[string]string) string {
 		return model
 	}
 	return strings.TrimSpace(metadata["agent_model"])
+}
+
+// buildCapabilityContext 构建能力上下文，注入 system prompt 末尾
+//
+// 让模型了解自己当前的能力：知识库文档列表、Skill/MCP 工具、长期记忆。
+// 参考 Claude Projects / Coze 的设计：模型应知道自己能做什么。
+func (e *ReActEngine) buildCapabilityContext(ctx context.Context) string {
+	var sb strings.Builder
+
+	// 1. 知识库文档列表
+	if e.kb != nil && e.cfg.Knowledge.Enabled {
+		if docs, err := e.kb.ListDocuments(ctx); err == nil && len(docs) > 0 {
+			sb.WriteString("\n\n[你的知识库]\n")
+			sb.WriteString("用户已上传以下文档，你可以基于这些文档回答问题：\n")
+			for _, d := range docs {
+				title := d.Title
+				if title == "" {
+					title = d.Source
+				}
+				sb.WriteString("- " + title + "\n")
+			}
+		}
+	}
+
+	// 2. Skill/MCP 工具列表
+	if e.toolCollector != nil {
+		tools := e.toolCollector.Collect()
+		if len(tools) > 0 {
+			sb.WriteString("\n[你可用的工具]\n")
+			sb.WriteString("你可以调用以下工具来完成任务：\n")
+			for _, t := range tools {
+				desc := t.Function.Description
+				if len(desc) > 60 {
+					desc = desc[:60] + "..."
+				}
+				sb.WriteString("- " + t.Function.Name + "：" + desc + "\n")
+			}
+		}
+	}
+
+	// 3. 长期记忆
+	if e.fileMem != nil {
+		if mem := e.fileMem.GetMemory(); mem != "" {
+			if len(mem) > 500 {
+				mem = mem[:500] + "\n..."
+			}
+			sb.WriteString("\n[用户长期记忆]\n")
+			sb.WriteString("以下是你对该用户的了解（跨会话持久记忆）：\n")
+			sb.WriteString(mem + "\n")
+		}
+	}
+
+	return sb.String()
 }
 
 // systemPrompt HexClaw 系统提示词
