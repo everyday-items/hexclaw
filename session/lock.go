@@ -34,7 +34,7 @@ func (sl *SessionLock) Acquire(sessionID string) func() {
 	entry := val.(*lockEntry)
 	entry.mu.Lock()
 
-	return func() {
+	return sync.OnceFunc(func() {
 		entry.mu.Unlock()
-	}
+	})
 }
