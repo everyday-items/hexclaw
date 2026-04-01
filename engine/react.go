@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,8 +23,13 @@ import (
 	"github.com/hexagon-codes/hexclaw/session"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/storage"
+	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
+
+type ctxKey string
+
+const ctxKeySessionUnlock ctxKey = "session_unlock"
 
 // ReActEngine 基于 Hexagon ReAct Agent 的引擎实现
 //
@@ -302,13 +307,13 @@ func (e *ReActEngine) Start(_ context.Context) error {
 }
 
 // Stop 停止引擎
-func (e *ReActEngine) Stop(_ context.Context) error {
+func (e *ReActEngine) Stop(ctx context.Context) error {
 	// G3: 等待后台 goroutine（压缩/记忆提取）完成，防止 DB close 后写入
 	e.bgWg.Wait()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.started = false
-	log.Println("Agent 引擎已停止")
+	trace.L(ctx).Info("Agent 引擎已停止")
 	return nil
 }
 
@@ -336,6 +341,9 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	if err := validateIncomingMessage(msg); err != nil {
 		return nil, err
 	}
+	if trace.L(ctx) == slog.Default() {
+		ctx = trace.WithLogger(ctx, trace.NewRequest(msg.UserID, msg.SessionID))
+	}
 
 	// 1. 获取或创建会话
 	sess, err := e.sessions.GetOrCreate(ctx, msg)
@@ -353,7 +361,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	// 2. 尝试快速路径: Skill 关键词匹配
 	if matched, ok := e.skills.Match(msg); ok {
 		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
-			log.Printf("保存用户消息失败: %v", err)
+			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
 		}
 		skillArgs := map[string]any{
 			"query":   msg.Content,
@@ -366,7 +374,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 
 		assistantMessageID := ""
 		if record, err := e.sessions.SaveAssistantMessageRecord(ctx, sess.ID, result.Content); err != nil {
-			log.Printf("保存助手回复失败: %v", err)
+			trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
 		} else {
 			assistantMessageID = record.ID
 		}
@@ -392,13 +400,13 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 
 	// 3. 语义缓存查询
 	if cached, ok := e.cache.Get(cacheInput, selection.providerName, selection.modelName); ok {
-		log.Printf("语义缓存命中: %s", msg.Content[:min(20, len(msg.Content))])
+		trace.L(ctx).Info("语义缓存命中", "query", msg.Content[:min(20, len(msg.Content))], "session", sess.ID)
 		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
-			log.Printf("保存用户消息失败: %v", err)
+			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
 		}
 		assistantMessageID := ""
 		if record, err := e.sessions.SaveAssistantMessageRecord(ctx, sess.ID, cached); err != nil {
-			log.Printf("保存助手回复失败: %v", err)
+			trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
 		} else {
 			assistantMessageID = record.ID
 		}
@@ -415,12 +423,12 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	// 4. 主路径: 构建对话上下文（在 SaveUserMessage 之前，避免 history 重复包含当前消息）
 	history, err := e.sessions.BuildContext(ctx, sess.ID)
 	if err != nil {
-		log.Printf("构建上下文失败: %v", err)
+		trace.L(ctx).Error("构建上下文失败", "err", err, "session", sess.ID)
 	}
 
 	// 5. 保存用户消息（在 BuildContext 之后，确保 history 不含当前消息）
 	if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
-		log.Printf("保存用户消息失败: %v", err)
+		trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
 	}
 
 	// 5.5 知识库检索（RAG 上下文增强）
@@ -432,10 +440,10 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		}
 		kbResult, kbErr := e.kb.Query(ctx, msg.Content, topK)
 		if kbErr != nil {
-			log.Printf("知识库检索失败: %v", kbErr)
+			trace.L(ctx).Error("知识库检索失败", "err", kbErr, "session", sess.ID)
 		} else if kbResult != "" {
 			kbContext = kbResult
-			log.Printf("知识库命中: 查询=%s", msg.Content[:min(20, len(msg.Content))])
+			trace.L(ctx).Info("知识库命中", "query", msg.Content[:min(20, len(msg.Content))], "session", sess.ID)
 		}
 	}
 
@@ -496,6 +504,11 @@ func (e *ReActEngine) completeWithTools(
 	if len(tools) > 0 {
 		req.Tools = tools
 	}
+	// 本地 thinking 模型注入 /no_think（与流式路径对齐）
+	if isLocal && msg.Metadata["thinking"] != "on" && isLocalThinkingModel(modelName) {
+		injectNoThink(req.Messages)
+		trace.L(ctx).Info("注入 /no_think", "model", modelName)
+	}
 
 	// 无工具时直接 Complete，不走工具循环
 	if len(tools) == 0 {
@@ -504,7 +517,7 @@ func (e *ReActEngine) completeWithTools(
 			if !explicitProvider {
 				fallbackP, fbName, fbErr := e.router.Fallback(providerName)
 				if fbErr == nil {
-					log.Printf("Provider %s 失败，降级到 %s: %v", providerName, fbName, err)
+					trace.L(ctx).Warn("Provider 降级", "from", providerName, "to", fbName, "err", err, "session", sessionID)
 					provider = fallbackP
 					providerName = fbName
 					modelName = e.getProviderModel(fbName, msg.Metadata)
@@ -525,7 +538,7 @@ func (e *ReActEngine) completeWithTools(
 		// Budget 检查 (每轮开始前)
 		if useBudget {
 			if err := budget.Check(); err != nil {
-				log.Printf("预算耗尽 (turn %d): %v", turn, err)
+				trace.L(ctx).Warn("预算耗尽", "turn", turn, "err", err, "session", sessionID)
 				break
 			}
 		} else if turn >= 5 {
@@ -544,7 +557,7 @@ func (e *ReActEngine) completeWithTools(
 			if fbErr != nil {
 				return nil, fmt.Errorf("补全失败且无可用备用: %w", err)
 			}
-			log.Printf("Provider %s 失败，降级到 %s: %v", providerName, fbName, err)
+			trace.L(ctx).Warn("Provider 降级", "from", providerName, "to", fbName, "err", err, "session", sessionID)
 			provider = fallbackP
 			providerName = fbName
 			modelName = e.getProviderModel(fbName, msg.Metadata)
@@ -590,14 +603,16 @@ func (e *ReActEngine) completeWithTools(
 		for _, tc := range resp.ToolCalls {
 			var toolArgs map[string]any
 			if tc.Arguments != "" {
-				json.Unmarshal([]byte(tc.Arguments), &toolArgs)
+				if uerr := json.Unmarshal([]byte(tc.Arguments), &toolArgs); uerr != nil {
+					trace.L(ctx).Error("工具参数解析失败", "tool", tc.Name, "err", uerr, "session", sessionID)
+				}
 			}
 
 			var toolResult string
 			if e.toolExecutor != nil {
 				toolResult, err = e.toolExecutor.Execute(ctx, tc.Name, toolArgs)
 				if err != nil {
-					log.Printf("[tool] %s 执行失败: %v", tc.Name, err)
+					trace.L(ctx).Error("工具执行失败", "tool", tc.Name, "err", err, "session", sessionID)
 					toolResult = fmt.Sprintf("Error: tool %q execution failed", tc.Name)
 				}
 			} else {
@@ -620,9 +635,9 @@ func (e *ReActEngine) completeWithTools(
 
 	// 超过上限（Budget 耗尽或硬限），返回最后一轮内容 + 警告
 	if useBudget {
-		log.Printf("预算耗尽，工具循环结束: %s", budget.Summary())
+		trace.L(ctx).Warn("预算耗尽，工具循环结束", "summary", budget.Summary(), "session", sessionID)
 	} else {
-		log.Printf("工具循环达到硬限 5 轮，强制返回")
+		trace.L(ctx).Warn("工具循环达到硬限", "maxTurns", 5, "session", sessionID)
 	}
 	lastResp, err := provider.Complete(ctx, req)
 	if err != nil {
@@ -642,7 +657,7 @@ func (e *ReActEngine) finalizeReply(
 ) (*adapter.Reply, error) {
 	assistantMessageID := ""
 	if record, err := e.sessions.SaveAssistantMessageRecord(ctx, sessionID, resp.Content); err != nil {
-		log.Printf("保存助手回复失败: %v", err)
+		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
 	}
@@ -661,7 +676,7 @@ func (e *ReActEngine) finalizeReply(
 			CreatedAt:        time.Now(),
 		}
 		if err := e.store.SaveCost(ctx, costRecord); err != nil {
-			log.Printf("记录成本失败: %v", err)
+			trace.L(ctx).Error("记录成本失败", "err", err, "session", sessionID)
 		}
 		// Note: token 已在 completeWithTools 循环中按轮记录到 per-request budget
 	}
@@ -671,14 +686,15 @@ func (e *ReActEngine) finalizeReply(
 
 	// 上下文压缩（异步，G3: 串行化后台写入）
 	if e.compactor != nil {
+		reqLogger := trace.L(ctx) // 捕获请求 logger 传入 goroutine
 		e.bgWg.Add(1)
 		go func() {
 			defer e.bgWg.Done()
-			// 用独立 context，5 分钟超时防泄漏
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
+			bgCtx = trace.WithLogger(bgCtx, reqLogger)
 			if err := e.compactor.CompactIfNeeded(bgCtx, sessionID, nil); err != nil {
-				log.Printf("上下文压缩失败: %v", err)
+				trace.L(bgCtx).Error("上下文压缩失败", "err", err, "session", sessionID)
 			}
 		}()
 	}
@@ -698,7 +714,7 @@ func (e *ReActEngine) createAgent(roleName string, provider hexagon.Provider, me
 	if roleName != "" {
 		agent, err := e.factory.CreateAgent(roleName, provider)
 		if err != nil {
-			log.Printf("创建角色 Agent 失败: %v，降级到默认", err)
+			trace.L(context.Background()).Error("创建角色 Agent 失败", "err", err, "role", roleName)
 		} else {
 			return agent
 		}
@@ -744,6 +760,9 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	if err := validateIncomingMessage(msg); err != nil {
 		return nil, err
 	}
+	if trace.L(ctx) == slog.Default() {
+		ctx = trace.WithLogger(ctx, trace.NewRequest(msg.UserID, msg.SessionID))
+	}
 
 	// 1. 获取或创建会话
 	sess, err := e.sessions.GetOrCreate(ctx, msg)
@@ -756,13 +775,13 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	if e.sessionLock != nil {
 		unlock := e.sessionLock.Acquire(sess.ID)
 		// unlock 在 pipeStreamWithTools goroutine 结束时调用
-		ctx = context.WithValue(ctx, "session_unlock", unlock)
+		ctx = context.WithValue(ctx, ctxKeySessionUnlock, unlock)
 	}
 
 	// 2. 尝试快速路径: Skill 匹配 → 单 chunk 返回
 	if matched, ok := e.skills.Match(msg); ok {
 		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
-			log.Printf("保存用户消息失败: %v", err)
+			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
 		}
 		skillArgs := map[string]any{
 			"query":   msg.Content,
@@ -774,7 +793,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		}
 		assistantMessageID := ""
 		if record, err := e.sessions.SaveAssistantMessageRecord(ctx, sess.ID, result.Content); err != nil {
-			log.Printf("保存助手回复失败: %v", err)
+			trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
 		} else {
 			assistantMessageID = record.ID
 		}
@@ -796,13 +815,13 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 
 	// 3. 语义缓存命中 → 单 chunk 返回
 	if cached, ok := e.cache.Get(cacheInput, selection.providerName, selection.modelName); ok {
-		log.Printf("语义缓存命中: %s", msg.Content[:min(20, len(msg.Content))])
+		trace.L(ctx).Info("语义缓存命中", "query", msg.Content[:min(20, len(msg.Content))], "session", sess.ID)
 		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
-			log.Printf("保存用户消息失败: %v", err)
+			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
 		}
 		assistantMessageID := ""
 		if record, err := e.sessions.SaveAssistantMessageRecord(ctx, sess.ID, cached); err != nil {
-			log.Printf("保存助手回复失败: %v", err)
+			trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
 		} else {
 			assistantMessageID = record.ID
 		}
@@ -816,12 +835,12 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	// 4. 构建对话上下文（在保存用户消息之前，避免 history 中重复包含当前消息）
 	history, err := e.sessions.BuildContext(ctx, sess.ID)
 	if err != nil {
-		log.Printf("构建上下文失败: %v", err)
+		trace.L(ctx).Error("构建上下文失败", "err", err, "session", sess.ID)
 	}
 
 	// 5. 保存用户消息（在 BuildContext 之后，确保 history 不含当前消息）
 	if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
-		log.Printf("保存用户消息失败: %v", err)
+		trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
 	}
 
 	// 5.5 知识库检索（RAG）
@@ -833,10 +852,10 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		}
 		kbResult, kbErr := e.kb.Query(ctx, msg.Content, topK)
 		if kbErr != nil {
-			log.Printf("知识库检索失败: %v", kbErr)
+			trace.L(ctx).Error("知识库检索失败", "err", kbErr, "session", sess.ID)
 		} else if kbResult != "" {
 			kbContext = kbResult
-			log.Printf("知识库命中: 查询=%s", msg.Content[:min(20, len(msg.Content))])
+			trace.L(ctx).Info("知识库命中", "query", msg.Content[:min(20, len(msg.Content))], "session", sess.ID)
 		}
 	}
 
@@ -852,8 +871,13 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		strings.Contains(strings.ToLower(selection.providerName), "local")
 	if isLocal {
 		tools = nil
+		// 本地 thinking 模型（qwen3、deepseek-r1 等）：前端未显式开启 thinking 时注入 /no_think
+		if msg.Metadata["thinking"] != "on" && isLocalThinkingModel(selection.modelName) {
+			injectNoThink(req.Messages)
+			trace.L(ctx).Info("注入 /no_think", "model", selection.modelName)
+		}
 	}
-	log.Printf("[ProcessStream] tools=%d, provider=%s, local=%v", len(tools), selection.providerName, isLocal)
+	trace.L(ctx).Info("LLM 调用准备", "tools", len(tools), "provider", selection.providerName, "model", selection.modelName, "local", isLocal)
 	if len(tools) > 0 {
 		req.Tools = tools
 	}
@@ -865,7 +889,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		if !selection.explicitProvider {
 			fallbackP, fbName, fbErr := e.router.Fallback(selection.providerName)
 			if fbErr == nil {
-				log.Printf("Provider %s 失败，降级到 %s: %v", selection.providerName, fbName, err)
+				trace.L(ctx).Warn("Provider 降级", "from", selection.providerName, "to", fbName, "err", err)
 				selection.provider = fallbackP
 				selection.providerName = fbName
 				selection.modelName = e.getProviderModel(fbName, msg.Metadata)
@@ -912,7 +936,7 @@ func (e *ReActEngine) processStreamToolLoop(
 	for turn := 0; turn < maxStreamToolTurns; turn++ {
 		if useBudgetStream {
 			if err := budget.Check(); err != nil {
-				log.Printf("[stream] 预算耗尽 (turn %d): %v", turn, err)
+				trace.L(ctx).Warn("流式预算耗尽", "turn", turn, "err", err, "session", sess.ID)
 				break
 			}
 		}
@@ -927,7 +951,7 @@ func (e *ReActEngine) processStreamToolLoop(
 			if fbErr != nil {
 				return nil, fmt.Errorf("调用失败且无可用备用: %w", err)
 			}
-			log.Printf("Provider %s 失败，降级到 %s: %v", selection.providerName, fbName, err)
+			trace.L(ctx).Warn("Provider 降级", "from", selection.providerName, "to", fbName, "err", err, "session", sess.ID)
 			selection.provider = fallbackP
 			selection.providerName = fbName
 			selection.modelName = e.getProviderModel(fbName, msg.Metadata)
@@ -989,13 +1013,15 @@ func (e *ReActEngine) processStreamToolLoop(
 		for _, tc := range result.ToolCalls {
 			var toolArgs map[string]any
 			if tc.Arguments != "" {
-				json.Unmarshal([]byte(tc.Arguments), &toolArgs)
+				if uerr := json.Unmarshal([]byte(tc.Arguments), &toolArgs); uerr != nil {
+					trace.L(ctx).Error("工具参数解析失败", "tool", tc.Name, "err", uerr, "session", sess.ID)
+				}
 			}
 			var toolResult string
 			if e.toolExecutor != nil {
 				toolResult, err = e.toolExecutor.Execute(ctx, tc.Name, toolArgs)
 				if err != nil {
-					log.Printf("[tool] %s 执行失败: %v", tc.Name, err)
+					trace.L(ctx).Error("工具执行失败", "tool", tc.Name, "err", err, "session", sess.ID)
 					toolResult = fmt.Sprintf("Error: tool %q execution failed", tc.Name)
 				}
 			} else {
@@ -1012,7 +1038,7 @@ func (e *ReActEngine) processStreamToolLoop(
 	}
 
 	// 超过最大轮次，用最后一次流式结果
-	log.Printf("流式工具循环达到上限 %d 轮", maxStreamToolTurns)
+	trace.L(ctx).Warn("流式工具循环达到上限", "maxTurns", maxStreamToolTurns, "session", sess.ID)
 	finalStream, err := selection.provider.Stream(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("最终补全失败: %w", err)
@@ -1033,6 +1059,10 @@ func (e *ReActEngine) pipeStream(
 	modelName string,
 	cacheInput string,
 ) {
+	// 释放 SessionLock — 与 pipeStreamWithTools 对齐，避免无工具路径死锁
+	if unlock, ok := ctx.Value(ctxKeySessionUnlock).(func()); ok && unlock != nil {
+		defer unlock()
+	}
 	defer close(ch)
 	defer llmStream.Close()
 
@@ -1044,7 +1074,7 @@ func (e *ReActEngine) pipeStream(
 			continue
 		}
 		if chunk.Reasoning != "" && !reasoningLogged {
-			log.Printf("[pipeStream] 首个 reasoning chunk: %q", chunk.Reasoning[:min(50, len(chunk.Reasoning))])
+			trace.L(ctx).Info("首个 chunk", "type", "reasoning", "preview", chunk.Reasoning[:min(50, len(chunk.Reasoning))])
 			reasoningLogged = true
 		}
 		fullContent.WriteString(chunk.Content)
@@ -1065,11 +1095,12 @@ func (e *ReActEngine) pipeStream(
 	// 使用独立 context 进行后续操作，避免请求 ctx 取消后无法保存
 	saveCtx, saveCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer saveCancel()
+	saveCtx = trace.WithLogger(saveCtx, trace.L(ctx))
 
 	// 保存助手回复
 	assistantMessageID := ""
 	if record, err := e.sessions.SaveAssistantMessageRecord(saveCtx, sessionID, content); err != nil {
-		log.Printf("保存助手回复失败: %v", err)
+		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
 	}
@@ -1113,7 +1144,7 @@ func (e *ReActEngine) pipeStream(
 			CreatedAt:        time.Now(),
 		}
 		if err := e.store.SaveCost(saveCtx, costRecord); err != nil {
-			log.Printf("记录成本失败: %v", err)
+			trace.L(ctx).Error("记录成本失败", "err", err, "session", sessionID)
 		}
 		// Note: stream 最终轮的 token 记录在 ProcessStream 的 per-request budget 中
 		// pipeStream 不再引用全局 budget (已改为 per-request)
@@ -1121,14 +1152,16 @@ func (e *ReActEngine) pipeStream(
 
 	// 上下文压缩（异步，G3: 串行化后台写入）
 	if e.compactor != nil {
+		pipeLogger := trace.L(ctx)
 		e.bgWg.Add(1)
 		go func() {
 			defer e.bgWg.Done()
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
+			bgCtx = trace.WithLogger(bgCtx, pipeLogger)
 			if p, ok := e.router.Get(providerName); ok && p != nil {
 				if err := e.compactor.CompactIfNeeded(bgCtx, sessionID, p); err != nil {
-					log.Printf("上下文压缩失败: %v", err)
+					trace.L(bgCtx).Error("上下文压缩失败", "err", err, "session", sessionID)
 				}
 			}
 		}()
@@ -1148,7 +1181,7 @@ func (e *ReActEngine) pipeStreamWithTools(
 	toolCalls []adapter.ToolCall,
 ) {
 	// 释放 SessionLock (流式路径在 goroutine 结束时释放)
-	if unlock, ok := ctx.Value("session_unlock").(func()); ok && unlock != nil {
+	if unlock, ok := ctx.Value(ctxKeySessionUnlock).(func()); ok && unlock != nil {
 		defer unlock()
 	}
 
@@ -1174,10 +1207,11 @@ func (e *ReActEngine) pipeStreamWithTools(
 
 	saveCtx, saveCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer saveCancel()
+	saveCtx = trace.WithLogger(saveCtx, trace.L(ctx))
 
 	assistantMessageID := ""
 	if record, err := e.sessions.SaveAssistantMessageRecord(saveCtx, sessionID, content); err != nil {
-		log.Printf("保存助手回复失败: %v", err)
+		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
 	}
@@ -1191,10 +1225,29 @@ func (e *ReActEngine) pipeStreamWithTools(
 		result.Usage.TotalTokens = t
 	}
 
+	// 合并参数传入的 toolCalls 和 result 中 LLM 返回的 ToolCalls
+	finalToolCalls := toolCalls
+	if result != nil && len(result.ToolCalls) > 0 {
+		for _, tc := range result.ToolCalls {
+			finalToolCalls = append(finalToolCalls, adapter.ToolCall{
+				ID:        tc.ID,
+				Name:      tc.Name,
+				Arguments: tc.Arguments,
+			})
+		}
+		trace.L(ctx).Info("LLM 返回工具调用", "count", len(result.ToolCalls),
+			"tools", func() string {
+				names := make([]string, len(result.ToolCalls))
+				for i, t := range result.ToolCalls {
+					names[i] = t.Name
+				}
+				return strings.Join(names, ",")
+			}(), "session", sessionID)
+	}
 	doneChunk := &adapter.ReplyChunk{
 		Done:      true,
 		Metadata:  buildReplyMetadata(msg.Metadata, providerName, modelName, assistantMessageID),
-		ToolCalls: toolCalls,
+		ToolCalls: finalToolCalls,
 	}
 	if result != nil && result.Usage.TotalTokens > 0 {
 		doneChunk.Usage = &adapter.Usage{
@@ -1219,7 +1272,7 @@ func (e *ReActEngine) pipeStreamWithTools(
 			CreatedAt:        time.Now(),
 		}
 		if err := e.store.SaveCost(saveCtx, costRecord); err != nil {
-			log.Printf("记录成本失败: %v", err)
+			trace.L(ctx).Error("记录成本失败", "err", err, "session", sessionID)
 		}
 	}
 
@@ -1289,7 +1342,7 @@ func (e *ReActEngine) completeDirect(
 		if fbErr != nil {
 			return nil, fmt.Errorf("多模态补全失败且无可用备用: %w", err)
 		}
-		log.Printf("Provider %s 多模态补全失败，降级到 %s: %v", providerName, fbName, err)
+		trace.L(ctx).Warn("Provider 多模态降级", "from", providerName, "to", fbName, "err", err, "session", sessionID)
 		resp, err = fallbackP.Complete(ctx, req)
 		if err != nil {
 			return nil, fmt.Errorf("多模态补全失败（降级后）: %w", err)
@@ -1308,7 +1361,7 @@ func (e *ReActEngine) completeDirect(
 
 	assistantMessageID := ""
 	if record, err := e.sessions.SaveAssistantMessageRecord(ctx, sessionID, resp.Content); err != nil {
-		log.Printf("保存助手回复失败: %v", err)
+		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
 	}
@@ -1327,7 +1380,7 @@ func (e *ReActEngine) completeDirect(
 			CreatedAt:        time.Now(),
 		}
 		if err := e.store.SaveCost(ctx, costRecord); err != nil {
-			log.Printf("记录成本失败: %v", err)
+			trace.L(ctx).Error("记录成本失败", "err", err, "session", sessionID)
 		}
 	}
 
@@ -1578,6 +1631,34 @@ const systemPrompt = `你是「小蟹」🦀，HexClaw 的 AI 助手。
 - 知识问答：基于个人知识库 RAG 增强检索
 - 工具调用：天气查询、网络搜索、翻译等内置技能
 - MCP 扩展：通过 Model Context Protocol 接入任意外部工具`
+
+// isLocalThinkingModel 检测是否为支持 thinking 模式的本地模型
+func isLocalThinkingModel(model string) bool {
+	m := strings.ToLower(model)
+	// qwen3 系列、deepseek-r1 系列默认开启 thinking
+	return strings.Contains(m, "qwen3") ||
+		strings.Contains(m, "deepseek-r1") ||
+		strings.Contains(m, "qwq")
+}
+
+// injectNoThink 在请求的最后一条用户消息中追加 /no_think 指令，兼容纯文本和多模态消息
+func injectNoThink(messages []hexagon.Message) {
+	last := len(messages) - 1
+	if last < 0 || messages[last].Role != "user" {
+		return
+	}
+	if messages[last].HasMultiContent() {
+		// 多模态消息：找到第一个 text part 追加
+		for i, part := range messages[last].MultiContent {
+			if part.Type == "text" {
+				messages[last].MultiContent[i].Text += " /no_think"
+				return
+			}
+		}
+	} else {
+		messages[last].Content += " /no_think"
+	}
+}
 
 func truncateResult(s string, maxRunes int) string {
 	runes := []rune(s)

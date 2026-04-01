@@ -115,7 +115,15 @@ func NewLogCollector(maxSize int) *LogCollector {
 
 // Add 添加日志条目
 func (c *LogCollector) Add(level, source, message string, fields map[string]any) {
-	// 克隆 fields map 防止调用方后续修改影响已存储条目
+	c.addEntry(level, source, message, "", fields)
+}
+
+// AddTrace 添加带 trace ID 和结构化字段的日志条目（实现 trace.Collector 接口）
+func (c *LogCollector) AddTrace(level, source, message, traceID string, fields map[string]any) {
+	c.addEntry(level, source, message, traceID, fields)
+}
+
+func (c *LogCollector) addEntry(level, source, message, traceID string, fields map[string]any) {
 	var clonedFields map[string]any
 	if len(fields) > 0 {
 		clonedFields = make(map[string]any, len(fields))
@@ -132,10 +140,10 @@ func (c *LogCollector) Add(level, source, message string, fields map[string]any)
 		Domain:    inferLogDomain(source),
 		Message:   message,
 		Fields:    clonedFields,
+		TraceID:   traceID,
 	}
 
 	c.mu.Lock()
-	// 如果覆盖旧 entry，减去旧 entry 的统计
 	if c.size == c.capacity {
 		old := c.entries[c.head]
 		c.byLevel[old.Level]--
@@ -149,14 +157,11 @@ func (c *LogCollector) Add(level, source, message string, fields map[string]any)
 			}
 		}
 	}
-
 	c.entries[c.head] = entry
 	c.head = (c.head + 1) % c.capacity
 	if c.size < c.capacity {
 		c.size++
 	}
-
-	// 增量更新统计
 	c.byLevel[level]++
 	if source != "" {
 		c.bySource[source]++
@@ -166,18 +171,15 @@ func (c *LogCollector) Add(level, source, message string, fields map[string]any)
 	sink := c.fileSink
 	c.mu.Unlock()
 
-	// 持久化到文件 (JSONL + 轮转)
 	if sink != nil {
 		sink.Write(entry)
 	}
 
-	// 广播给 WebSocket 订阅者
 	c.subMu.RLock()
 	for _, ch := range c.subscribers {
 		select {
 		case ch <- entry:
 		default:
-			// 跳过慢消费者
 		}
 	}
 	c.subMu.RUnlock()

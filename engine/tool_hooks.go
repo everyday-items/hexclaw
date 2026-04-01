@@ -3,9 +3,9 @@ package engine
 import (
 	"context"
 	"fmt"
-	"log"
 
 	"github.com/hexagon-codes/hexclaw/security"
+	"github.com/hexagon-codes/hexclaw/trace"
 )
 
 // ToolCallInfo holds metadata about a tool call for hooks
@@ -39,17 +39,17 @@ type AfterToolHook interface {
 // D24 will add SQLite persistence (gap 1.1 in 19D).
 type AuditHook struct{}
 
-func (h *AuditHook) BeforeToolCall(_ context.Context, call *ToolCallInfo) error {
-	log.Printf("[audit] tool_call: name=%s source=%s", call.Name, call.Source)
+func (h *AuditHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo) error {
+	trace.L(ctx).Info("工具调用", "tool", call.Name, "source", call.Source)
 	return nil
 }
 
-func (h *AuditHook) AfterToolCall(_ context.Context, call *ToolCallInfo, result *ToolCallResult) {
+func (h *AuditHook) AfterToolCall(ctx context.Context, call *ToolCallInfo, result *ToolCallResult) {
 	status := "success"
 	if result.Error != nil {
 		status = "error"
 	}
-	log.Printf("[audit] tool_result: name=%s status=%s content_len=%d", call.Name, status, len(result.Content))
+	trace.L(ctx).Info("工具结果", "tool", call.Name, "status", status, "content_len", len(result.Content))
 }
 
 // TruncateHook truncates long tool results.

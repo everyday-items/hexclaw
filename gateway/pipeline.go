@@ -2,12 +2,12 @@ package gateway
 
 import (
 	"context"
-	"log"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/storage"
+	"github.com/hexagon-codes/hexclaw/trace"
 )
 
 // Pipeline 六层安全网关管道实现
@@ -78,7 +78,7 @@ func (p *Pipeline) LayerNames() []string {
 func (p *Pipeline) Check(ctx context.Context, msg *adapter.Message) error {
 	for _, layer := range p.layers {
 		if err := layer.Check(ctx, msg); err != nil {
-			log.Printf("安全检查被 %s 层拒绝: user=%s, error=%v", layer.Name(), msg.UserID, err)
+			trace.L(ctx).Warn("安全检查拒绝", "layer", layer.Name(), "err", err)
 			return err
 		}
 	}

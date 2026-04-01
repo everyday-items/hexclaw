@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -49,6 +50,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/skill/builtin"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
 	sqlitestore "github.com/hexagon-codes/hexclaw/storage/sqlite"
+	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/hexclaw/voice"
 	"github.com/hexagon-codes/hexclaw/webhook"
 )
@@ -503,7 +505,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	srv.SetVersion(version)
 	lc := srv.LogCollector()
 
-	// 桥接 Go 标准 log 到 LogCollector（让 log.Printf 的输出也进入日志系统）
+	// 初始化 slog → LogCollector 桥接（结构化日志 + trace ID 贯穿）
+	slogHandler := trace.NewCollectorHandler(lc, slog.LevelInfo)
+	slog.SetDefault(slog.New(slogHandler))
+	// 桥接 Go 标准 log 到 LogCollector（兼容遗留 log.Printf）
 	log.SetOutput(lc.StdLogWriter())
 
 	// 写入启动摘要日志

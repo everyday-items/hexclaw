@@ -33,8 +33,22 @@ func (e *mockEngine) Process(_ context.Context, msg *adapter.Message) (*adapter.
 	e.lastMsg = msg
 	return e.reply, e.err
 }
-func (e *mockEngine) ProcessStream(_ context.Context, _ *adapter.Message) (<-chan *adapter.ReplyChunk, error) {
-	return nil, nil
+func (e *mockEngine) ProcessStream(_ context.Context, msg *adapter.Message) (<-chan *adapter.ReplyChunk, error) {
+	e.calls++
+	e.lastMsg = msg
+	if e.err != nil {
+		return nil, e.err
+	}
+	ch := make(chan *adapter.ReplyChunk, 1)
+	ch <- &adapter.ReplyChunk{
+		Content:   e.reply.Content,
+		Done:      true,
+		Metadata:  e.reply.Metadata,
+		Usage:     e.reply.Usage,
+		ToolCalls: e.reply.ToolCalls,
+	}
+	close(ch)
+	return ch, nil
 }
 func (e *mockEngine) ActiveLLMConfig() config.LLMConfig { return e.activeLLM }
 func (e *mockEngine) ReloadLLMConfig(_ context.Context, cfg config.LLMConfig) error {

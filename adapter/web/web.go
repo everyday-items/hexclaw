@@ -15,13 +15,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
+	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
@@ -36,6 +37,7 @@ type WebAdapter struct {
 	streamHandler       adapter.StreamMessageHandler
 	conns               sync.Map // chatID → *websocket.Conn
 	sessionConns        sync.Map // sessionID → chatID (for permission requests)
+	cancelFuncs         sync.Map // sessionID → context.CancelFunc (用于取消正在进行的请求)
 	onApprovalResponse  func(requestID string, approved, remember bool) // callback for tool approval
 }
 
@@ -74,7 +76,7 @@ func (a *WebAdapter) Stop(_ context.Context) error {
 		a.conns.Delete(key)
 		return true
 	})
-	log.Println("Web 适配器已停止")
+	slog.Info("Web 适配器已停止")
 	return nil
 }
 
@@ -160,7 +162,7 @@ func (a *WebAdapter) SendStream(ctx context.Context, chatID string, chunks <-cha
 		if chunk.Reasoning != "" {
 			reasoningCount++
 			if reasoningCount == 1 {
-				log.Printf("[WS SendStream] 首个 reasoning chunk: %q (chunkCount=%d)", chunk.Reasoning[:min(30, len(chunk.Reasoning))], chunkCount)
+				trace.L(ctx).Info("首个 chunk", "type", "reasoning", "chunk_count", chunkCount)
 			}
 		}
 
@@ -177,7 +179,7 @@ func (a *WebAdapter) SendStream(ctx context.Context, chatID string, chunks <-cha
 			return err
 		}
 	}
-	log.Printf("[WS SendStream] 完成: %d chunks, %d reasoning chunks", chunkCount, reasoningCount)
+	trace.L(ctx).Info("流式输出完成", "chunks", chunkCount, "reasoning_chunks", reasoningCount)
 	return nil
 }
 
@@ -187,7 +189,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 		InsecureSkipVerify: true, // desktop 模式仅监听 127.0.0.1，无外部风险
 	})
 	if err != nil {
-		log.Printf("WebSocket 握手失败: %v", err)
+		slog.Error("WebSocket 握手失败", "err", err)
 		return
 	}
 
@@ -208,13 +210,13 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Close(websocket.StatusNormalClosure, "")
 	}()
 
-	log.Printf("WebSocket 连接建立: %s", chatID)
+	slog.Info("WebSocket 连接建立", "chat_id", chatID)
 
 	// 读取消息循环
 	for {
 		var incoming wsMessage
 		if err := wsjson.Read(r.Context(), conn, &incoming); err != nil {
-			log.Printf("WebSocket 连接断开: %s", chatID)
+			slog.Info("WebSocket 连接断开", "chat_id", chatID)
 			return
 		}
 
@@ -226,8 +228,10 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 
 		// 处理流式取消请求 — 前端 stopStreaming 时发送
 		if incoming.Type == "cancel" {
-			log.Printf("WebSocket cancel request: session=%s", incoming.SessionID)
-			// 取消由 context 传播: 前端断开 WS 或发 cancel 时, 由 context.WithTimeout 自动取消
+			slog.Info("WebSocket cancel", "session", incoming.SessionID)
+			if cancelFn, ok := a.cancelFuncs.LoadAndDelete(incoming.SessionID); ok {
+				cancelFn.(context.CancelFunc)()
+			}
 			continue
 		}
 
@@ -283,17 +287,33 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 		if incoming.Model != "" {
 			msg.Metadata["model"] = incoming.Model
 		}
+		// 合并前端 metadata（如 thinking 开关等）
+		for k, v := range incoming.Metadata {
+			if _, exists := msg.Metadata[k]; !exists {
+				msg.Metadata[k] = v
+			}
+		}
+
+		// 创建请求级 logger
+		logger := trace.NewRequest(msg.UserID, msg.SessionID).With("source", "chat", "provider", incoming.Provider, "model", incoming.Model)
 
 		// 异步处理消息
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
+			if msg.SessionID != "" {
+				a.cancelFuncs.Store(msg.SessionID, cancel)
+				defer a.cancelFuncs.Delete(msg.SessionID)
+			}
+
+			ctx = trace.WithLogger(ctx, logger)
+			logger.Info("← 收到消息", "content_len", len([]rune(msg.Content)), "platform", string(msg.Platform), "attachments", len(msg.Attachments))
 
 			// 优先使用流式处理
 			if a.streamHandler != nil {
 				chunks, err := a.streamHandler(ctx, msg)
 				if err != nil {
-					log.Printf("Web: 流式处理失败: %v", err)
+					trace.L(ctx).Error("流式处理失败", "err", err)
 					errMsg := wsMessage{
 						Type:      "error",
 						Content:   upstreamerr.PublicMessage(err, "处理消息失败"),
@@ -303,7 +323,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if err := a.SendStream(ctx, chatID, chunks); err != nil {
-					log.Printf("Web: 流式发送失败: %v", err)
+					trace.L(ctx).Error("流式发送失败", "err", err)
 					// 客户端断开 → 取消 context → 通知 pipeStream 停止消费 LLM
 					cancel()
 					// drain 剩余 chunks 防止 pipeStream 阻塞
@@ -316,7 +336,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			// 降级为同步处理
 			reply, err := a.handler(ctx, msg)
 			if err != nil {
-				log.Printf("Web: 处理消息失败: %v", err)
+				trace.L(ctx).Error("处理消息失败", "err", err)
 				errMsg := wsMessage{
 					Type:      "error",
 					Content:   upstreamerr.PublicMessage(err, "处理消息失败"),
@@ -333,7 +353,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 				Metadata:  reply.Metadata,
 			}
 			if err := wsjson.Write(ctx, conn, respMsg); err != nil {
-				log.Printf("Web: 发送回复失败: %v", err)
+				trace.L(ctx).Error("发送回复失败", "err", err)
 			}
 		}()
 	}

@@ -49,6 +49,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/skill/hub"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
 	"github.com/hexagon-codes/hexclaw/storage"
+	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/hexclaw/voice"
 	"github.com/hexagon-codes/hexclaw/webhook"
 	"github.com/hexagon-codes/toolkit/util/idgen"
@@ -594,6 +595,8 @@ type ChatResponse struct {
 // 请求体: {"message": "你好", "session_id": "optional", "user_id": "optional"}
 // 响应: {"reply": "你好！有什么可以帮助你的？", "session_id": "sess-xxx"}
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
 	if s.engine == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "引擎未就绪",
@@ -665,11 +668,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		msg.Metadata["model"] = req.Model
 	}
 
+	// 请求级结构化日志
+	logger := trace.NewRequest(userID, "").With("source", "chat", "provider", req.Provider, "model", req.Model)
+	ctx := trace.WithLogger(r.Context(), logger)
+	logger.Info("← 收到消息", "content_len", len([]rune(req.Message)), "platform", string(msg.Platform))
+
 	// 安全网关检查
 	if s.gateway != nil {
-		if err := s.gateway.Check(r.Context(), msg); err != nil {
+		if err := s.gateway.Check(ctx, msg); err != nil {
 			if gwErr, ok := err.(*gateway.GatewayError); ok {
-				log.Printf("安全检查拒绝: layer=%s code=%s user=%s", gwErr.Layer, gwErr.Code, msg.UserID)
+				trace.L(ctx).Warn("安全检查拒绝", "layer", gwErr.Layer, "code", gwErr.Code)
 				writeJSON(w, http.StatusForbidden, map[string]string{
 					"error": gwErr.Message,
 					"code":  gwErr.Code,
@@ -685,7 +693,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 调用引擎处理（优先走流式路径，避免 thinking 模型阻塞工具探测）
-	s.logCollector.Info("chat", fmt.Sprintf("← %s (%d 字符)", userID, len([]rune(req.Message))))
 
 	type streamEngine interface {
 		ProcessStream(ctx context.Context, msg *adapter.Message) (<-chan *adapter.ReplyChunk, error)
@@ -693,9 +700,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	var reply *adapter.Reply
 	if se, ok := s.engine.(streamEngine); ok {
-		chunks, err := se.ProcessStream(r.Context(), msg)
+		chunks, err := se.ProcessStream(ctx, msg)
 		if err != nil {
-			s.logCollector.Error("chat", fmt.Sprintf("处理失败: user=%s err=%v", userID, err))
+			trace.L(ctx).Error("处理失败", "err", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{
 				"error": upstreamerr.PublicMessage(err, "处理消息失败"),
 			})
@@ -708,7 +715,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		var toolCalls []adapter.ToolCall
 		for chunk := range chunks {
 			if chunk.Error != nil {
-				s.logCollector.Error("chat", fmt.Sprintf("处理失败: user=%s err=%v", userID, chunk.Error))
+				trace.L(ctx).Error("处理失败", "err", chunk.Error)
 				writeJSON(w, http.StatusInternalServerError, map[string]string{
 					"error": upstreamerr.PublicMessage(chunk.Error, "处理消息失败"),
 				})
@@ -721,6 +728,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				toolCalls = chunk.ToolCalls
 			}
 		}
+		trace.L(ctx).Info("流式消费完成", "content_len", content.Len())
 		reply = &adapter.Reply{
 			Content:   content.String(),
 			Metadata:  metadata,
@@ -729,9 +737,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		var err error
-		reply, err = s.engine.Process(r.Context(), msg)
+		reply, err = s.engine.Process(ctx, msg)
 		if err != nil {
-			s.logCollector.Error("chat", fmt.Sprintf("处理失败: user=%s err=%v", userID, err))
+			trace.L(ctx).Error("处理失败", "err", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{
 				"error": upstreamerr.PublicMessage(err, "处理消息失败"),
 			})
@@ -739,7 +747,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.logCollector.Info("chat", fmt.Sprintf("→ %s (%d 字符)", userID, len([]rune(reply.Content))))
+	trace.L(ctx).Info("→ 回复", "content_len", len([]rune(reply.Content)), "elapsed_ms", time.Since(start).Milliseconds())
 
 	// 返回响应
 	writeJSON(w, http.StatusOK, ChatResponse{

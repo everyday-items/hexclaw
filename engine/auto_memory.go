@@ -3,11 +3,11 @@ package engine
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
 	hexagon "github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/hexclaw/trace"
 )
 
 // autoExtractMemory 异步从对话中提取值得记忆的信息
@@ -37,8 +37,9 @@ func (e *ReActEngine) autoExtractMemory(userText, assistantText string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 
-		provider, _, err := e.selectLLMForMemory()
+		provider, providerName, err := e.selectLLMForMemory()
 		if err != nil {
+			trace.L(ctx).Warn("auto-memory: 无可用 LLM", "err", err)
 			return
 		}
 
@@ -54,7 +55,7 @@ func (e *ReActEngine) autoExtractMemory(userText, assistantText string) {
 			Temperature: &temp,
 		})
 		if err != nil {
-			log.Printf("[auto-memory] LLM 调用失败: %v", err)
+			trace.L(ctx).Error("auto-memory: LLM 调用失败", "err", err, "provider", providerName)
 			return
 		}
 
@@ -63,12 +64,11 @@ func (e *ReActEngine) autoExtractMemory(userText, assistantText string) {
 			return
 		}
 
-		// 写入长期记忆
 		if err := e.fileMem.SaveMemory(result); err != nil {
-			log.Printf("[auto-memory] 写入记忆失败: %v", err)
+			trace.L(ctx).Error("auto-memory: 写入记忆失败", "err", err)
 			return
 		}
-		log.Printf("[auto-memory] 已自动记忆: %s", truncateForLog(result, 80))
+		trace.L(ctx).Info("auto-memory: 已自动记忆", "content", truncateForLog(result, 80))
 	}()
 }
 
