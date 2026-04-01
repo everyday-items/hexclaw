@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1668,6 +1669,19 @@ func (e *ReActEngine) buildCapabilityContext(ctx context.Context) string {
 			sb.WriteString(mem + "\n")
 		}
 	}
+
+	// 4. 环境感知
+	sb.WriteString("\n[当前环境]\n")
+	sb.WriteString("- 当前时间：" + time.Now().Format("2006-01-02 15:04 (Monday)") + "\n")
+	sb.WriteString("- 操作系统：" + runtime.GOOS + "/" + runtime.GOARCH + "\n")
+	e.mu.RLock()
+	if e.router != nil {
+		if p, name, err := e.router.Route(ctx); err == nil && p != nil {
+			model := e.router.ProviderModel(name)
+			sb.WriteString("- 当前模型：" + name + " / " + model + "\n")
+		}
+	}
+	e.mu.RUnlock()
 
 	return sb.String()
 }

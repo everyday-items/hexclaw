@@ -233,7 +233,7 @@ func TestBuildStreamMessages(t *testing.T) {
 	}
 
 	msgs = eng.buildStreamMessages("", nil, "", "按路由执行", map[string]string{"agent_prompt": "custom prompt"}, nil)
-	if msgs[0].Content != "custom prompt" {
+	if !strings.HasPrefix(msgs[0].Content, "custom prompt") {
 		t.Fatalf("agent_prompt 未生效: %q", msgs[0].Content)
 	}
 
