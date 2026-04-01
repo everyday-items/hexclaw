@@ -771,12 +771,21 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	}
 	msg.SessionID = sess.ID
 
-	// 1.5 Session 锁 (注意: 流式路径在 goroutine 中释放锁)
+	// 1.5 Session 锁
+	// unlock 存入 ctx，由 pipeStream/pipeStreamWithTools goroutine 在结束时释放。
+	// 对于提前 return 的路径（Skill/缓存/Stream 失败），必须在此 defer 兜底释放。
+	var sessionUnlock func()
 	if e.sessionLock != nil {
-		unlock := e.sessionLock.Acquire(sess.ID)
-		// unlock 在 pipeStreamWithTools goroutine 结束时调用
-		ctx = context.WithValue(ctx, ctxKeySessionUnlock, unlock)
+		sessionUnlock = e.sessionLock.Acquire(sess.ID)
+		ctx = context.WithValue(ctx, ctxKeySessionUnlock, sessionUnlock)
 	}
+	// unlockOnReturn 标记：goroutine 启动后设为 false，防止 defer 重复释放
+	goroutineLaunched := false
+	defer func() {
+		if !goroutineLaunched && sessionUnlock != nil {
+			sessionUnlock()
+		}
+	}()
 
 	// 2. 尝试快速路径: Skill 匹配 → 单 chunk 返回
 	if matched, ok := e.skills.Match(msg); ok {
@@ -902,6 +911,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	}
 
 	// 第一轮直接推流（pipeStream 内部完成保存/缓存等后处理）
+	goroutineLaunched = true // goroutine 内的 defer unlock() 接管锁释放
 	if len(tools) == 0 {
 		ch := make(chan *adapter.ReplyChunk, 16)
 		go e.pipeStream(ctx, ch, llmStream, sess.ID, msg, selection.providerName, selection.modelName, cacheInput)
@@ -909,7 +919,6 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	}
 
 	// 有工具：直接推流给前端（thinking + 回复实时可见）
-	// 工具调用在流结束后通过 pipeStreamWithTools 处理
 	ch := make(chan *adapter.ReplyChunk, 16)
 	go e.pipeStreamWithTools(ctx, ch, llmStream, sess.ID, msg, selection.providerName, selection.modelName, cacheInput, nil)
 	return ch, nil
