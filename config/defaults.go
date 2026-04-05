@@ -123,7 +123,7 @@ func DefaultConfig() *Config {
 			Dir:      "~/.hexclaw/skills/",
 			AutoLoad: true,
 			Hub: SkillsHubConfig{
-				RepoURL: "github.com/hexagon-codes/hexclaw-hub",
+				RepoURL: "https://github.com/hexagon-codes/hexclaw-hub",
 				Branch:  "v0.0.2",
 			},
 		},

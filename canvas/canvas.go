@@ -105,10 +105,10 @@ func Markdown(content string) *Component {
 
 // ChartProps 图表属性
 type ChartProps struct {
-	ChartType string     `json:"chart_type"` // line/bar/pie/area
-	Title     string     `json:"title"`
-	Labels    []string   `json:"labels"`
-	Datasets  []Dataset  `json:"datasets"`
+	ChartType string    `json:"chart_type"` // line/bar/pie/area
+	Title     string    `json:"title"`
+	Labels    []string  `json:"labels"`
+	Datasets  []Dataset `json:"datasets"`
 }
 
 // Dataset 数据集
@@ -158,9 +158,9 @@ type ButtonsProps struct {
 
 // ButtonDef 按钮定义
 type ButtonDef struct {
-	Label  string `json:"label"`            // 按钮文字
-	Action string `json:"action"`           // 事件动作名
-	Style  string `json:"style,omitempty"`  // primary/danger/default
+	Label  string `json:"label"`           // 按钮文字
+	Action string `json:"action"`          // 事件动作名
+	Style  string `json:"style,omitempty"` // primary/danger/default
 }
 
 // Buttons 创建按钮组组件
@@ -187,7 +187,7 @@ func Buttons(labels ...string) *Component {
 type FormField struct {
 	Name        string   `json:"name"`
 	Label       string   `json:"label"`
-	Type        string   `json:"type"`                  // text/number/select/textarea/checkbox
+	Type        string   `json:"type"` // text/number/select/textarea/checkbox
 	Placeholder string   `json:"placeholder,omitempty"`
 	Required    bool     `json:"required,omitempty"`
 	Options     []string `json:"options,omitempty"` // select 类型的选项
@@ -215,9 +215,9 @@ func Form(submitText string, fields []FormField) *Component {
 
 // ProgressProps 进度条属性
 type ProgressProps struct {
-	Value   float64 `json:"value"`   // 当前值 (0-100)
-	Label   string  `json:"label"`   // 标签
-	Color   string  `json:"color"`   // 颜色
+	Value float64 `json:"value"` // 当前值 (0-100)
+	Label string  `json:"label"` // 标签
+	Color string  `json:"color"` // 颜色
 }
 
 // Progress 创建进度条组件
@@ -241,10 +241,10 @@ func Progress(label string, value float64) *Component {
 
 // ImageProps 图片属性
 type ImageProps struct {
-	URL     string `json:"url"`
-	Alt     string `json:"alt,omitempty"`
-	Width   int    `json:"width,omitempty"`
-	Height  int    `json:"height,omitempty"`
+	URL    string `json:"url"`
+	Alt    string `json:"alt,omitempty"`
+	Width  int    `json:"width,omitempty"`
+	Height int    `json:"height,omitempty"`
 }
 
 // Image 创建图片组件
@@ -280,8 +280,8 @@ type EventHandler func(event *Event) (*Panel, error)
 // 管理所有活跃面板和事件处理。
 type Service struct {
 	mu       sync.RWMutex
-	panels   map[string]*Panel        // panelID -> panel
-	handlers map[string]EventHandler  // panelID -> handler
+	panels   map[string]*Panel       // panelID -> panel
+	handlers map[string]EventHandler // panelID -> handler
 }
 
 // NewService 创建 Canvas 服务

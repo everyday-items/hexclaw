@@ -5,7 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -79,7 +80,7 @@ func (s *SQLiteStore) runMigrations(ctx context.Context) {
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			if !strings.Contains(err.Error(), "duplicate") && !strings.Contains(err.Error(), "already exists") {
-				log.Printf("agent router migration warning: %v (stmt: %.80s)", err, stmt)
+				logger.Warn("agent router migration warning", "warning", err, "stmt", stmt)
 			}
 		}
 	}
@@ -107,8 +108,12 @@ func (s *SQLiteStore) LoadAgents(ctx context.Context) ([]AgentConfig, string, er
 			&a.Temperature, &metaJSON, &isDefault); err != nil {
 			return nil, "", err
 		}
-		_ = json.Unmarshal([]byte(skillsJSON), &a.Skills)
-		_ = json.Unmarshal([]byte(metaJSON), &a.Metadata)
+		if err := json.Unmarshal([]byte(skillsJSON), &a.Skills); err != nil {
+			slog.Warn("failed to parse agent skills JSON", "agent", a.Name, "error", err)
+		}
+		if err := json.Unmarshal([]byte(metaJSON), &a.Metadata); err != nil {
+			slog.Warn("failed to parse agent metadata JSON", "agent", a.Name, "error", err)
+		}
 		if isDefault == 1 {
 			defaultName = a.Name
 		}
@@ -244,7 +249,7 @@ func Sync(ctx context.Context, store Store, d *Dispatcher) error {
 	agents := d.ListAgents()
 	for i := range agents {
 		if err := store.SaveAgent(ctx, &agents[i]); err != nil {
-			log.Printf("sync agent %q: %v", agents[i].Name, err)
+			logger.Info("sync agent", "name", agents[i].Name, "error", err)
 		}
 	}
 	defaultName := d.DefaultAgent()
@@ -254,7 +259,7 @@ func Sync(ctx context.Context, store Store, d *Dispatcher) error {
 	for _, r := range d.ListRules() {
 		rule := r
 		if err := store.SaveRule(ctx, &rule); err != nil {
-			log.Printf("sync rule for %q: %v", r.AgentName, err)
+			logger.Info("sync rule for", "agent_name", r.AgentName, "error", err)
 		}
 	}
 	return nil

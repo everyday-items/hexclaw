@@ -3,7 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"net/http"
 	"strings"
 	"time"
@@ -176,7 +176,7 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 
 	// 先持久化到文件，再热更新引擎；热更新失败时回滚文件，保证磁盘与运行时一致。
 	if err := config.Save(&nextCfg, ""); err != nil {
-		log.Printf("保存配置失败: %v", err)
+		logger.Error("error", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "保存配置失败: " + err.Error(),
 		})
@@ -188,7 +188,7 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 			rollbackCfg := *s.cfg
 			rollbackCfg.LLM = oldLLM
 			if saveErr := config.Save(&rollbackCfg, ""); saveErr != nil {
-				log.Printf("LLM 热更新失败且回滚配置失败: reload=%v rollback=%v", err, saveErr)
+				logger.Error("LLM 热更新失败且回滚配置失败: reload", "reload", err, "rollback", saveErr)
 			}
 			writeJSON(w, http.StatusInternalServerError, map[string]string{
 				"error": "LLM 配置应用失败: " + err.Error(),
@@ -199,7 +199,7 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 
 	s.cfg.LLM = nextLLM
 
-	log.Printf("LLM 配置已更新、持久化并热生效")
+	logger.Info("LLM 配置已更新、持久化并热生效")
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status": "ok",
 	})

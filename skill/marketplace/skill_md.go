@@ -39,7 +39,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,7 +85,7 @@ func (s *MarkdownSkill) Description() string {
 // Match 快速路径匹配
 //
 // 检查消息内容是否包含技能的触发关键词。
-// 支持前缀匹配（如 "搜索 xxx"）和包含匹配。
+// 使用包含匹配，支持关键词出现在消息任意位置（如 "介绍下前女友"）。
 func (s *MarkdownSkill) Match(content string) bool {
 	if len(s.Meta.Triggers) == 0 {
 		return false
@@ -94,7 +94,7 @@ func (s *MarkdownSkill) Match(content string) bool {
 	contentLower := strings.ToLower(strings.TrimSpace(content))
 	for _, trigger := range s.Meta.Triggers {
 		triggerLower := strings.ToLower(trigger)
-		if strings.HasPrefix(contentLower, triggerLower) {
+		if strings.Contains(contentLower, triggerLower) {
 			return true
 		}
 	}
@@ -206,7 +206,7 @@ func LoadSkillsFromDir(dir string) ([]*MarkdownSkill, error) {
 			}
 			skill, err := LoadSkillFromFile(skillFile)
 			if err != nil {
-				log.Printf("加载技能 %q 失败: %v", entry.Name(), err)
+				logger.Error("加载技能", "name", entry.Name(), "error", err)
 				continue
 			}
 			// 如果 frontmatter 没有 name，用目录名
@@ -219,7 +219,7 @@ func LoadSkillsFromDir(dir string) ([]*MarkdownSkill, error) {
 			// 单文件技能
 			skill, err := LoadSkillFromFile(path)
 			if err != nil {
-				log.Printf("加载技能 %q 失败: %v", entry.Name(), err)
+				logger.Error("加载技能", "name", entry.Name(), "error", err)
 				continue
 			}
 			// 如果 frontmatter 没有 name，用文件名（去掉 .md）

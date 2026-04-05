@@ -26,7 +26,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,34 +39,34 @@ import (
 type JobType string
 
 const (
-	JobTypeCron   JobType = "cron"   // 周期任务（cron 表达式）
-	JobTypeOnce   JobType = "once"   // 一次性任务（定时提醒）
+	JobTypeCron JobType = "cron" // 周期任务（cron 表达式）
+	JobTypeOnce JobType = "once" // 一次性任务（定时提醒）
 )
 
 // JobStatus 任务状态
 type JobStatus string
 
 const (
-	StatusActive  JobStatus = "active"  // 活跃
-	StatusPaused  JobStatus = "paused"  // 暂停
-	StatusDone    JobStatus = "done"    // 已完成（一次性任务执行后）
+	StatusActive JobStatus = "active" // 活跃
+	StatusPaused JobStatus = "paused" // 暂停
+	StatusDone   JobStatus = "done"   // 已完成（一次性任务执行后）
 )
 
 // Job 定时任务
 type Job struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`        // 任务名称
-	Type       JobType   `json:"type"`        // 任务类型
-	Schedule   string    `json:"schedule"`    // cron 表达式或时间点
-	Prompt     string    `json:"prompt"`      // 发送给 Agent 的提示词
-	UserID     string    `json:"user_id"`     // 所属用户
-	Platform   string    `json:"platform"`    // 通知平台
-	ChatID     string    `json:"chat_id"`     // 通知目标
-	Status     JobStatus `json:"status"`      // 任务状态
-	LastRunAt  time.Time `json:"last_run_at"` // 上次执行时间
-	NextRunAt  time.Time `json:"next_run_at"` // 下次执行时间
-	RunCount   int       `json:"run_count"`   // 已执行次数
-	CreatedAt  time.Time `json:"created_at"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`        // 任务名称
+	Type      JobType   `json:"type"`        // 任务类型
+	Schedule  string    `json:"schedule"`    // cron 表达式或时间点
+	Prompt    string    `json:"prompt"`      // 发送给 Agent 的提示词
+	UserID    string    `json:"user_id"`     // 所属用户
+	Platform  string    `json:"platform"`    // 通知平台
+	ChatID    string    `json:"chat_id"`     // 通知目标
+	Status    JobStatus `json:"status"`      // 任务状态
+	LastRunAt time.Time `json:"last_run_at"` // 上次执行时间
+	NextRunAt time.Time `json:"next_run_at"` // 下次执行时间
+	RunCount  int       `json:"run_count"`   // 已执行次数
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // JobExecutor 任务执行回调，返回 (结果文本, 错误)
@@ -149,7 +149,7 @@ func (s *Scheduler) Start(_ context.Context, executor JobExecutor) {
 	s.mu.Unlock()
 
 	go s.runLoop()
-	log.Println("Cron 调度器已启动")
+	logger.Info("Cron 调度器已启动")
 }
 
 // Stop 停止调度器
@@ -159,7 +159,7 @@ func (s *Scheduler) Stop() {
 	if !s.stopped {
 		s.stopped = true
 		close(s.stopCh)
-		log.Println("Cron 调度器已停止")
+		logger.Info("Cron 调度器已停止")
 	}
 }
 
@@ -200,7 +200,7 @@ func (s *Scheduler) AddJob(ctx context.Context, job *Job) error {
 	s.jobs[job.ID] = job
 	s.mu.Unlock()
 
-	log.Printf("Cron 任务已添加: %s (%s) 下次执行: %s", job.Name, job.Schedule, job.NextRunAt.Format(time.RFC3339))
+	logger.Info("Cron 任务已添加", "name", job.Name, "schedule", job.Schedule, "下次执行", job.NextRunAt.Format(time.RFC3339))
 	return nil
 }
 
@@ -287,7 +287,7 @@ func (s *Scheduler) TriggerJob(ctx context.Context, jobID string) error {
 type JobHistory struct {
 	ID         int64     `json:"id"`
 	JobID      string    `json:"job_id"`
-	Status     string    `json:"status"`      // success / failed
+	Status     string    `json:"status"` // success / failed
 	Result     string    `json:"result,omitempty"`
 	Error      string    `json:"error,omitempty"`
 	DurationMs int64     `json:"duration_ms"`
@@ -375,16 +375,16 @@ func (s *Scheduler) executeJob(job *Job) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	log.Printf("Cron 执行任务: %s (%s)", job.Name, job.ID)
+	logger.Info("Cron 执行任务", "name", job.Name, "id", job.ID)
 
 	startAt := time.Now()
 	result, execErr := executor(ctx, job)
 	durationMs := time.Since(startAt).Milliseconds()
 
 	if execErr != nil {
-		log.Printf("Cron 任务执行失败: %s: %v", job.Name, execErr)
+		logger.Error("Cron 任务执行失败", "name", job.Name, "execErr", execErr)
 	} else if result != "" {
-		log.Printf("Cron 任务执行成功: %s (%dms, %d chars)", job.Name, durationMs, len(result))
+		logger.Info("Cron 任务执行成功", "name", job.Name, "durationMs", durationMs, "len", len(result))
 	}
 
 	// 更新任务状态
@@ -414,13 +414,13 @@ func (s *Scheduler) executeJob(job *Job) {
 	if job.Type == JobTypeOnce {
 		if _, err := s.db.ExecContext(dbCtx, `UPDATE cron_jobs SET status = 'done', last_run_at = ?, run_count = run_count + 1 WHERE id = ?`,
 			now, job.ID); err != nil {
-			log.Printf("Cron: 更新任务状态失败: %v", err)
+			logger.Error("Cron: 更新任务状态失败", "error", err)
 		}
 	} else {
 		next, _ := nextRunTime(job.Schedule, job.Type, now)
 		if _, err := s.db.ExecContext(dbCtx, `UPDATE cron_jobs SET last_run_at = ?, next_run_at = ?, run_count = run_count + 1 WHERE id = ?`,
 			now, next, job.ID); err != nil {
-			log.Printf("Cron: 更新任务状态失败: %v", err)
+			logger.Error("Cron: 更新任务状态失败", "error", err)
 		}
 	}
 
@@ -434,7 +434,7 @@ func (s *Scheduler) executeJob(job *Job) {
 	if _, err := s.db.ExecContext(dbCtx,
 		`INSERT INTO cron_job_runs (job_id, status, result, error, duration_ms, run_at) VALUES (?, ?, ?, ?, ?, ?)`,
 		job.ID, runStatus, result, runError, durationMs, now); err != nil {
-		log.Printf("Cron: 写入执行历史失败: %v", err)
+		logger.Error("Cron: 写入执行历史失败", "error", err)
 	}
 }
 
@@ -463,7 +463,7 @@ func (s *Scheduler) loadJobs(ctx context.Context) error {
 		s.jobs[job.ID] = job
 	}
 
-	log.Printf("Cron 已加载 %d 个活跃任务", len(s.jobs))
+	logger.Info("Cron 已加载", "len", len(s.jobs))
 	return rows.Err()
 }
 

@@ -144,8 +144,9 @@ func extractShellCommand(input string) string {
 // allowedCommands 白名单：仅允许真正只读/无副作用的命令
 //
 // 已移除所有具有写能力或数据窃取风险的命令：
-//   python/python3/go/node/sed/awk/wget/cp/mv/mkdir/touch/
-//   tar/zip/unzip/gzip/gunzip/tee/xargs/yes/curl 等
+//
+//	python/python3/go/node/sed/awk/wget/cp/mv/mkdir/touch/
+//	tar/zip/unzip/gzip/gunzip/tee/xargs/yes/curl 等
 //
 // curl 已移除：即使拦截 -o/-O，仍可通过 -d @file / -F file=@path /
 // --data-binary @path 窃取本地文件到外部服务器，风险不可控。

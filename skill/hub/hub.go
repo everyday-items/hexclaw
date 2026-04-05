@@ -29,21 +29,21 @@ type HubConfig struct {
 
 // SkillMeta 技能/MCP Server 元数据
 type SkillMeta struct {
-	Name        string   `json:"name"`
-	DisplayName string   `json:"display_name"`
-	Description string   `json:"description"`
-	Version     string   `json:"version"`
-	Author      string   `json:"author"`
-	Category    string   `json:"category"`
-	Type        string   `json:"type,omitempty"`         // "skill" (default) 或 "mcp"
+	Name         string   `json:"name"`
+	DisplayName  string   `json:"display_name"`
+	Description  string   `json:"description"`
+	Version      string   `json:"version"`
+	Author       string   `json:"author"`
+	Category     string   `json:"category"`
+	Type         string   `json:"type,omitempty"` // "skill" (default) 或 "mcp"
 	Tags         []string `json:"tags"`
 	Dependencies []string `json:"dependencies,omitempty"` // Skill 依赖列表
 	URL          string   `json:"url"`                    // 技能文件下载 URL
 	Command      string   `json:"command,omitempty"`      // MCP: 启动命令
 	Args         []string `json:"args,omitempty"`         // MCP: 命令参数
 	ConfigHint   string   `json:"config_hint,omitempty"`  // MCP: 配置提示
-	Downloads   int      `json:"downloads"`
-	Rating      float64  `json:"rating"`
+	Downloads    int      `json:"downloads"`
+	Rating       float64  `json:"rating"`
 }
 
 // Catalog 技能目录
@@ -66,6 +66,8 @@ type Hub struct {
 func New(cfg HubConfig, skillsDir string) *Hub {
 	if cfg.RepoURL == "" {
 		cfg.RepoURL = "https://github.com/hexagon-codes/hexclaw-hub"
+	} else if !strings.HasPrefix(cfg.RepoURL, "http://") && !strings.HasPrefix(cfg.RepoURL, "https://") && !strings.HasPrefix(cfg.RepoURL, "file://") && !strings.HasPrefix(cfg.RepoURL, "/") && !strings.HasPrefix(cfg.RepoURL, "~") && !strings.HasPrefix(cfg.RepoURL, ".") {
+		cfg.RepoURL = "https://" + cfg.RepoURL
 	}
 	if cfg.Branch == "" {
 		cfg.Branch = "v0.0.2"

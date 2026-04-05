@@ -74,8 +74,8 @@ func TestToolRetry_PermanentErrorNoRetry(t *testing.T) {
 
 func TestToolRetry_Timeout(t *testing.T) {
 	cfg := ToolRetryConfig{
-		DefaultTimeout: 100 * time.Millisecond,
-		DefaultRetries: 0,
+		DefaultTimeout:   100 * time.Millisecond,
+		DefaultRetries:   0,
 		TimeoutOverrides: map[string]time.Duration{},
 		RetryOverrides:   map[string]int{},
 	}

@@ -2,7 +2,7 @@ package gateway
 
 import (
 	"context"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 )
@@ -30,7 +30,6 @@ func (l *AuditLayer) Name() string { return "audit" }
 // 审计层不拒绝请求，只记录日志。
 // 后续可替换为 hexagon/security/audit 的结构化审计存储。
 func (l *AuditLayer) Check(_ context.Context, msg *adapter.Message) error {
-	log.Printf("[审计] 请求通过安全检查: platform=%s, user=%s, content_len=%d",
-		msg.Platform, msg.UserID, len(msg.Content))
+	logger.Info("[审计] 请求通过安全检查: platform", "platform", msg.Platform, "user", msg.UserID, "content_len", len(msg.Content))
 	return nil
 }

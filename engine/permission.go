@@ -3,7 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"strings"
 	"sync"
 	"time"
@@ -33,11 +33,11 @@ type PermissionSender interface {
 
 // PermissionHub manages pending approval requests and their responses.
 type PermissionHub struct {
-	mu       sync.Mutex
-	pending  map[string]chan PermissionResponse // requestID → response channel
-	allowed  map[string]map[string]bool         // sessionID → set of always-allowed tool names
-	sender   PermissionSender
-	timeout  time.Duration
+	mu      sync.Mutex
+	pending map[string]chan PermissionResponse // requestID → response channel
+	allowed map[string]map[string]bool         // sessionID → set of always-allowed tool names
+	sender  PermissionSender
+	timeout time.Duration
 }
 
 // NewPermissionHub creates a permission hub.
@@ -79,7 +79,7 @@ func (h *PermissionHub) RequestApproval(ctx context.Context, sessionID string, r
 	if h.sender == nil {
 		h.mu.Unlock()
 		// No frontend connected — use default policy (deny)
-		log.Printf("[permission] no sender available, denying %s", req.ToolName)
+		logger.Info("[permission] no sender available, denying", "tool_name", req.ToolName)
 		return false, nil
 	}
 
@@ -137,9 +137,9 @@ func (h *PermissionHub) HandleResponse(resp PermissionResponse) {
 
 // PermissionHook is a BeforeToolHook that asks for user approval on sensitive/dangerous tools.
 type PermissionHook struct {
-	hub             *PermissionHub
-	dangerousTools  map[string]bool // tools that always require approval
-	sensitiveTools  map[string]bool // tools that require approval on first use
+	hub            *PermissionHub
+	dangerousTools map[string]bool // tools that always require approval
+	sensitiveTools map[string]bool // tools that require approval on first use
 }
 
 // PermissionHookOption configures a PermissionHook.
@@ -165,9 +165,9 @@ func NewPermissionHook(hub *PermissionHub, opts ...PermissionHookOption) *Permis
 			"code_exec": true,
 		},
 		sensitiveTools: map[string]bool{
-			"browser":            true,
-			"create_skill":       true,
-			"manage_mcp_server":  true,
+			"browser":           true,
+			"create_skill":      true,
+			"manage_mcp_server": true,
 		},
 	}
 	for _, opt := range opts {
@@ -202,7 +202,7 @@ func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo)
 
 	approved, err := h.hub.RequestApproval(ctx, sessionID, req)
 	if err != nil {
-		log.Printf("[permission] approval error for %s: %v", call.Name, err)
+		logger.Error("[permission] approval error for", "name", call.Name, "error", err)
 		return fmt.Errorf("tool %q: approval failed: %w", call.Name, err)
 	}
 	if !approved {

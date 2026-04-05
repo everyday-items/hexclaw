@@ -13,10 +13,10 @@ import (
 // Key = sha256(tool_name + json(args)). TTL is per-tool configurable.
 // Destructive tools (shell, code_exec, file_ops write/edit) skip cache.
 type ToolCache struct {
-	mu         sync.RWMutex
-	entries    map[string]*cacheEntry
-	maxEntries int
-	defaultTTL time.Duration
+	mu           sync.RWMutex
+	entries      map[string]*cacheEntry
+	maxEntries   int
+	defaultTTL   time.Duration
 	ttlOverrides map[string]time.Duration // tool_name → custom TTL
 
 	hits   int64

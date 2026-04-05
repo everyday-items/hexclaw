@@ -24,9 +24,11 @@ func NewOrchestrateSkill(execFn func(ctx context.Context, agentName, task string
 	return &OrchestrateSkill{executeFunc: execFn}
 }
 
-func (o *OrchestrateSkill) Name() string        { return "orchestrate" }
-func (o *OrchestrateSkill) Description() string  { return "Dispatch subtasks to specialized agents in parallel, collect results" }
-func (o *OrchestrateSkill) Match(_ string) bool  { return false }
+func (o *OrchestrateSkill) Name() string { return "orchestrate" }
+func (o *OrchestrateSkill) Description() string {
+	return "Dispatch subtasks to specialized agents in parallel, collect results"
+}
+func (o *OrchestrateSkill) Match(_ string) bool { return false }
 
 func (o *OrchestrateSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition("orchestrate",

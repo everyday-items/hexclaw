@@ -4,7 +4,7 @@ package sandbox
 
 import (
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"os/exec"
 )
 
@@ -33,7 +33,7 @@ func (p *WindowsProxyIntegration) Apply() error {
 	// Use netsh to set proxy (affects current user context)
 	cmd := exec.Command("netsh", "winhttp", "set", "proxy", fmt.Sprintf("proxy-server=%s", p.proxyAddr))
 	if out, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("[netproxy-windows] netsh proxy failed: %s, falling back to env vars", string(out))
+		logger.Error("[netproxy-windows] netsh proxy failed", "failed", string(out))
 		return nil // graceful degradation
 	}
 	p.applied = true

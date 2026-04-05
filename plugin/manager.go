@@ -3,10 +3,10 @@ package plugin
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"sync"
 
-	"github.com/hexagon-codes/hexagon/plugin"
+	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
@@ -18,20 +18,20 @@ import (
 // 按顺序执行 HookPlugin 链。
 type Manager struct {
 	mu       sync.RWMutex
-	registry *plugin.Registry
-	plugins  []plugin.Plugin // 保持注册顺序
+	registry *hexagon.PluginRegistry
+	plugins  []hexagon.PluginPlugin // 保持注册顺序
 	hooks    []HookPlugin
 }
 
 // NewManager 创建插件管理器
 func NewManager() *Manager {
 	return &Manager{
-		registry: plugin.NewRegistry(),
+		registry: hexagon.NewPluginRegistry(),
 	}
 }
 
 // Register 注册插件
-func (m *Manager) Register(p plugin.Plugin) error {
+func (m *Manager) Register(p hexagon.PluginPlugin) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -44,7 +44,7 @@ func (m *Manager) Register(p plugin.Plugin) error {
 		m.hooks = append(m.hooks, hook)
 	}
 
-	log.Printf("插件已注册: %s (%s)", p.Info().Name, p.Info().Type)
+	logger.Info("name", "name", p.Info().Name, "type", p.Info().Type)
 	return nil
 }
 
@@ -62,7 +62,7 @@ func (m *Manager) StartAll(ctx context.Context, configs map[string]map[string]an
 		if err := p.Start(ctx); err != nil {
 			return fmt.Errorf("启动插件 %s 失败: %w", name, err)
 		}
-		log.Printf("插件已启动: %s", name)
+		logger.Info("name", "name", name)
 	}
 	return nil
 }
@@ -75,7 +75,7 @@ func (m *Manager) StopAll(ctx context.Context) {
 	for i := len(m.plugins) - 1; i >= 0; i-- {
 		name := m.plugins[i].Info().Name
 		if err := m.plugins[i].Stop(ctx); err != nil {
-			log.Printf("停止插件 %s 失败: %v", name, err)
+			logger.Error("停止插件", "name", name, "error", err)
 		}
 	}
 }
@@ -145,11 +145,11 @@ func (m *Manager) RunReplyHooks(ctx context.Context, reply *adapter.Reply) (*ada
 }
 
 // List 列出所有已注册插件信息
-func (m *Manager) List() []plugin.PluginInfo {
+func (m *Manager) List() []hexagon.PluginInfo {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	infos := make([]plugin.PluginInfo, len(m.plugins))
+	infos := make([]hexagon.PluginInfo, len(m.plugins))
 	for i, p := range m.plugins {
 		infos[i] = p.Info()
 	}

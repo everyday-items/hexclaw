@@ -254,9 +254,9 @@ func TestIsLikelyAPIKey(t *testing.T) {
 		{"key-abcdefghijklmnopqrst12345", true},
 		{"gsk_abcdefghijklmnopqrst12345", true},
 		{"AIzaabcdefghijklmnopqrstuvw", true},
-		{"short", false},                            // 太短
-		{"${DEEPSEEK_API_KEY}", false},              // 不以已知前缀开头
-		{"hello-world-not-a-key-really", false},     // 不以已知前缀开头
+		{"short", false},                        // 太短
+		{"${DEEPSEEK_API_KEY}", false},          // 不以已知前缀开头
+		{"hello-world-not-a-key-really", false}, // 不以已知前缀开头
 	}
 
 	for _, tt := range tests {

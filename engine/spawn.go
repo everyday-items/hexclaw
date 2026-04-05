@@ -23,8 +23,8 @@ func NewSpawnSkill(execFn func(ctx context.Context, agentName, task string) (str
 }
 
 func (s *SpawnSkill) Name() string        { return "spawn_agent" }
-func (s *SpawnSkill) Description() string  { return "Spawn a child agent to handle a task" }
-func (s *SpawnSkill) Match(_ string) bool  { return false }
+func (s *SpawnSkill) Description() string { return "Spawn a child agent to handle a task" }
+func (s *SpawnSkill) Match(_ string) bool { return false }
 
 func (s *SpawnSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition("spawn_agent",

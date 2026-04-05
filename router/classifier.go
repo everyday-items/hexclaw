@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"sort"
 	"strings"
 	"sync"
@@ -116,7 +116,7 @@ func (r *Dispatcher) RouteWithFallback(ctx context.Context, req RouteRequest, me
 			cfg, ok := r.agents[agentName]
 			r.mu.RUnlock()
 			if ok {
-				log.Printf("LLM 路由: %q (confidence=%.2f)", agentName, confidence)
+				logger.Info("LLM 路由", "agent", agentName, "confidence", confidence)
 				return &RoutingResult{
 					AgentName:   agentName,
 					AgentConfig: cfg,
@@ -125,8 +125,7 @@ func (r *Dispatcher) RouteWithFallback(ctx context.Context, req RouteRequest, me
 		}
 		// 低置信度 → 回退默认
 		if confidence > 0 {
-			log.Printf("LLM 路由置信度不足: %q (confidence=%.2f < threshold=%.2f), 回退默认",
-				agentName, confidence, classifier.confidenceThreshold)
+			logger.Info("LLM 路由置信度不足", "agent", agentName, "confidence", confidence, "threshold", classifier.confidenceThreshold)
 		}
 	}
 
@@ -216,7 +215,7 @@ func (c *LLMClassifier) classify_with_cache(ctx context.Context, agents map[stri
 	prompt := buildClassifierPrompt(agents)
 	raw, err := c.classify(ctx, prompt, message)
 	if err != nil {
-		log.Printf("LLM 路由分类失败: %v", err)
+		logger.Error("LLM 路由分类失败", "error", err)
 		return "", 0
 	}
 

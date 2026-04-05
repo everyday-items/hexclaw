@@ -25,7 +25,7 @@ package heartbeat
 
 import (
 	"context"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"os"
 	"path/filepath"
 	"strings"
@@ -105,7 +105,7 @@ func (h *Heartbeat) Start(_ context.Context, executor Executor, notifier NotifyF
 	h.mu.Unlock()
 
 	go h.runLoop()
-	log.Printf("Heartbeat 已启动: 间隔=%s", h.config.Interval)
+	logger.Info("Heartbeat 已启动: 间隔", "interval", h.config.Interval)
 }
 
 // Stop 停止心跳巡查
@@ -115,7 +115,7 @@ func (h *Heartbeat) Stop() {
 	if !h.stopped {
 		h.stopped = true
 		close(h.stopCh)
-		log.Println("Heartbeat 已停止")
+		logger.Info("Heartbeat 已停止")
 	}
 }
 
@@ -176,12 +176,12 @@ func (h *Heartbeat) beat() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	log.Println("Heartbeat: 开始巡查")
+	logger.Info("Heartbeat: 开始巡查")
 
 	// 执行巡查
 	result, err := executor(ctx, instructions)
 	if err != nil {
-		log.Printf("Heartbeat: 巡查执行失败: %v", err)
+		logger.Error("Heartbeat: 巡查执行失败", "error", err)
 		return
 	}
 
@@ -198,9 +198,9 @@ func (h *Heartbeat) beat() {
 		// Agent 返回空字符串或 "NO_NOTIFY" 表示无需通知
 		if result != "" && result != "NO_NOTIFY" && result != "无需通知" {
 			if err := notifier(ctx, result); err != nil {
-				log.Printf("Heartbeat: 通知发送失败: %v", err)
+				logger.Error("Heartbeat: 通知发送失败", "error", err)
 			} else {
-				log.Printf("Heartbeat: 已发送通知")
+				logger.Info("Heartbeat: 已发送通知")
 			}
 		}
 	}
@@ -247,7 +247,7 @@ func (h *Heartbeat) loadInstructions(input string) string {
 		}
 		data, err := os.ReadFile(input)
 		if err != nil {
-			log.Printf("Heartbeat: 读取指令文件失败: %v，使用默认指令", err)
+			logger.Error("Heartbeat: 读取指令文件失败", "error", err)
 			return defaultInstructions
 		}
 		return string(data)

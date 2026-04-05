@@ -26,11 +26,11 @@ const (
 
 // WindowsSandboxPolicy combines all sandbox settings.
 type WindowsSandboxPolicy struct {
-	Mode        SandboxMode `yaml:"mode"`         // filesystem isolation level
-	Network     NetworkMode `yaml:"network"`       // network access level
-	MemoryMB    int         `yaml:"memory_mb"`     // memory limit in MB
-	MaxProcs    int         `yaml:"max_processes"` // max child processes
-	UseDesktop  bool        `yaml:"use_desktop"`   // create alternate desktop
+	Mode       SandboxMode `yaml:"mode"`          // filesystem isolation level
+	Network    NetworkMode `yaml:"network"`       // network access level
+	MemoryMB   int         `yaml:"memory_mb"`     // memory limit in MB
+	MaxProcs   int         `yaml:"max_processes"` // max child processes
+	UseDesktop bool        `yaml:"use_desktop"`   // create alternate desktop
 }
 
 // DefaultWindowsPolicy returns the recommended secure defaults.

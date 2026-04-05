@@ -43,10 +43,10 @@ type trusteeW struct {
 }
 
 var (
-	modAdvapi32ACL              = syscall.NewLazyDLL("advapi32.dll")
-	procSetEntriesInAclW        = modAdvapi32ACL.NewProc("SetEntriesInAclW")
-	procSetNamedSecurityInfoW2  = modAdvapi32ACL.NewProc("SetNamedSecurityInfoW")
-	procGetNamedSecurityInfoW   = modAdvapi32ACL.NewProc("GetNamedSecurityInfoW")
+	modAdvapi32ACL             = syscall.NewLazyDLL("advapi32.dll")
+	procSetEntriesInAclW       = modAdvapi32ACL.NewProc("SetEntriesInAclW")
+	procSetNamedSecurityInfoW2 = modAdvapi32ACL.NewProc("SetNamedSecurityInfoW")
+	procGetNamedSecurityInfoW  = modAdvapi32ACL.NewProc("GetNamedSecurityInfoW")
 )
 
 // aclConfig holds the original DACL for restoration.

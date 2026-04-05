@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/internal/testutil/httpmock"
 	"github.com/hexagon-codes/hexclaw/skill"
@@ -294,13 +295,26 @@ func TestWeatherSkillMatch(t *testing.T) {
 		input string
 		want  bool
 	}{
+		// 正向：直接天气查询
 		{"天气 北京", true},
 		{"weather beijing", true},
 		{"北京天气", true},
 		{"气温多少", true},
 		{"下雨吗", true},
-		{"下雪了", true},
-		{"今天天气怎么样", true},
+		{"上海天气怎么样", true},
+		{"查天气 广州", true},
+		{"看天气", true},
+		{"明天冷吗", true},
+		{"杭州多少度", true},
+
+		// 反向：编程意图含天气关键词不应匹配
+		{"帮我写一个抓取天气的Python脚本", false},
+		{"写一个天气API接口", false},
+		{"开发天气爬虫程序", false},
+		{"用golang调用天气api", false},
+		{"实现一个天气查询代码", false},
+
+		// 反向：无关内容
 		{"hello world", false},
 		{"搜索 something", false},
 		{"", false},
@@ -326,7 +340,7 @@ func TestExtractCity(t *testing.T) {
 		{"北京天气", "北京"},
 		{"weather beijing", "beijing"},
 		{"北京的天气", "北京"},
-		{"天气", ""},       // 只有关键词没有城市
+		{"天气", ""}, // 只有关键词没有城市
 		{"气温上海", "上海"},
 	}
 
@@ -692,5 +706,56 @@ func TestExtractText(t *testing.T) {
 				t.Errorf("extractText(%q, %q, %q) = %q, 期望 %q", tt.s, tt.start, tt.end, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestWeatherSkill_RegistryIntegration 复现用户报告的 Bug：
+//
+// 用户在"编程高手"Agent 中发送"帮我写一个抓取天气的Python脚本"，
+// 被 WeatherSkill 快速路径截获，返回天气查询错误而不是代码。
+// 此测试验证：在完整 Registry 中，编程请求不会被 WeatherSkill 截获。
+func TestWeatherSkill_RegistryIntegration(t *testing.T) {
+	// 按 RegisterAll 的真实注册顺序构建 Registry
+	registry := skill.NewRegistry()
+	RegisterAll(registry, config.BuiltinConfig{
+		Search:    true,
+		Weather:   true,
+		Translate: true,
+		Summary:   true,
+	})
+
+	// 用户实际输入 — 编程请求中包含"天气"关键词
+	codingMessages := []string{
+		"帮我写一个抓取天气的Python脚本",
+		"写一个天气API接口",
+		"帮我用Go开发一个天气查询服务",
+		"用JavaScript实现天气爬虫",
+		"写代码调用和风天气API获取气温",
+	}
+	for _, content := range codingMessages {
+		msg := &adapter.Message{Content: content}
+		matched, ok := registry.Match(msg)
+		if ok {
+			t.Errorf("编程请求 %q 不应被 Skill 截获，但被 %q 匹配",
+				content, matched.Name())
+		}
+	}
+
+	// 真正的天气查询 — 仍应正确匹配
+	weatherMessages := []string{
+		"天气 北京",
+		"上海天气怎么样",
+		"明天下雨吗",
+	}
+	for _, content := range weatherMessages {
+		msg := &adapter.Message{Content: content}
+		matched, ok := registry.Match(msg)
+		if !ok {
+			t.Errorf("天气查询 %q 应被匹配", content)
+			continue
+		}
+		if matched.Name() != "weather" {
+			t.Errorf("天气查询 %q 应匹配 weather，实际匹配 %q", content, matched.Name())
+		}
 	}
 }

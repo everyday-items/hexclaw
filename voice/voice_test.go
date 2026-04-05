@@ -8,17 +8,17 @@ import (
 
 // mockSTT 模拟 STT Provider
 type mockSTT struct {
-	name      string
-	result    *TranscribeResult
-	err       error
+	name   string
+	result *TranscribeResult
+	err    error
 }
 
 func (m *mockSTT) Name() string { return m.name }
 func (m *mockSTT) Transcribe(_ context.Context, _ []byte, _ TranscribeOptions) (*TranscribeResult, error) {
 	return m.result, m.err
 }
-func (m *mockSTT) SupportedFormats() []AudioFormat    { return []AudioFormat{FormatWAV, FormatMP3} }
-func (m *mockSTT) SupportedLanguages() []string       { return []string{"zh", "en"} }
+func (m *mockSTT) SupportedFormats() []AudioFormat { return []AudioFormat{FormatWAV, FormatMP3} }
+func (m *mockSTT) SupportedLanguages() []string    { return []string{"zh", "en"} }
 
 // mockTTS 模拟 TTS Provider
 type mockTTS struct {

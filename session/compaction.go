@@ -3,7 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"strings"
 	"time"
 
@@ -106,7 +106,7 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, provider hexa
 	// 归档旧消息到文件 (D7: 链路④ 会话转录)
 	if c.archiver != nil {
 		if _, archErr := c.archiver.Archive(sessionID, oldMsgs); archErr != nil {
-			log.Printf("会话归档失败 (非致命): %v", archErr)
+			logger.Error("error", "archErr", archErr)
 		}
 	}
 
@@ -139,7 +139,7 @@ func (c *Compactor) Compact(ctx context.Context, sessionID string, provider hexa
 	}
 
 	compactedCount := len(oldMsgs)
-	log.Printf("上下文压缩完成: session=%s 压缩了 %d 条消息", sessionID, compactedCount)
+	logger.Info("上下文压缩完成: session", "session", sessionID, "compactedCount", compactedCount)
 	return compactedCount, nil
 }
 

@@ -94,9 +94,9 @@ type TranscribeOptions struct {
 // TranscribeResult STT 转录结果
 type TranscribeResult struct {
 	Text       string  `json:"text"`                 // 转录文本
-	Language   string  `json:"language,omitempty"`    // 检测到的语言
-	Duration   float64 `json:"duration,omitempty"`    // 音频时长（秒）
-	Confidence float64 `json:"confidence,omitempty"`  // 置信度 (0-1)
+	Language   string  `json:"language,omitempty"`   // 检测到的语言
+	Duration   float64 `json:"duration,omitempty"`   // 音频时长（秒）
+	Confidence float64 `json:"confidence,omitempty"` // 置信度 (0-1)
 }
 
 // SynthesizeOptions TTS 合成选项
@@ -108,10 +108,10 @@ type SynthesizeOptions struct {
 
 // SynthesizeResult TTS 合成结果
 type SynthesizeResult struct {
-	Audio    []byte      `json:"-"`               // 音频数据
-	Format   AudioFormat `json:"format"`          // 输出格式
-	Duration float64     `json:"duration"`        // 音频时长（秒）
-	Size     int         `json:"size"`            // 数据大小（字节）
+	Audio    []byte      `json:"-"`        // 音频数据
+	Format   AudioFormat `json:"format"`   // 输出格式
+	Duration float64     `json:"duration"` // 音频时长（秒）
+	Size     int         `json:"size"`     // 数据大小（字节）
 }
 
 // VoiceInfo 音色信息

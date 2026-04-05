@@ -8,11 +8,29 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/gateway"
 )
+
+func TestServer_BuildHTTPServerLeavesWriteTimeoutUnlimitedForStreaming(t *testing.T) {
+	cfg := config.DefaultConfig()
+	srv := NewServer(cfg, nil, nil, nil)
+
+	httpServer := srv.buildHTTPServer(context.Background())
+
+	if httpServer.WriteTimeout != 0 {
+		t.Fatalf("WriteTimeout = %v, want 0 for long-lived streaming responses", httpServer.WriteTimeout)
+	}
+	if httpServer.ReadHeaderTimeout != 10*time.Second {
+		t.Fatalf("ReadHeaderTimeout = %v, want %v", httpServer.ReadHeaderTimeout, 10*time.Second)
+	}
+	if httpServer.IdleTimeout != 120*time.Second {
+		t.Fatalf("IdleTimeout = %v, want %v", httpServer.IdleTimeout, 120*time.Second)
+	}
+}
 
 // mockEngine 测试用引擎
 type mockEngine struct {

@@ -11,16 +11,16 @@ import (
 //
 // 线程安全，支持动态注册/查找 Skill。
 type DefaultRegistry struct {
-	mu     sync.RWMutex
-	skills map[string]Skill
-	order  []string // 保持注册顺序，用于确定性的 Match 遍历
+	mu      sync.RWMutex
+	skills  map[string]Skill
+	order   []string // 保持注册顺序，用于确定性的 Match 遍历
 	enabled map[string]bool
 }
 
 // NewRegistry 创建 Skill 注册中心
 func NewRegistry() *DefaultRegistry {
 	return &DefaultRegistry{
-		skills: make(map[string]Skill),
+		skills:  make(map[string]Skill),
 		enabled: make(map[string]bool),
 	}
 }

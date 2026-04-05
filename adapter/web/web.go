@@ -33,12 +33,12 @@ import (
 // 管理 WebSocket 连接，将 Web 消息转换为统一格式。
 // 每个 WebSocket 连接分配唯一 chatID。
 type WebAdapter struct {
-	handler             adapter.MessageHandler
-	streamHandler       adapter.StreamMessageHandler
-	conns               sync.Map // chatID → *websocket.Conn
-	sessionConns        sync.Map // sessionID → chatID (for permission requests)
-	cancelFuncs         sync.Map // sessionID → context.CancelFunc (用于取消正在进行的请求)
-	onApprovalResponse  func(requestID string, approved, remember bool) // callback for tool approval
+	handler            adapter.MessageHandler
+	streamHandler      adapter.StreamMessageHandler
+	conns              sync.Map                                        // chatID → *websocket.Conn
+	sessionConns       sync.Map                                        // sessionID → chatID (for permission requests)
+	cancelFuncs        sync.Map                                        // sessionID → context.CancelFunc (用于取消正在进行的请求)
+	onApprovalResponse func(requestID string, approved, remember bool) // callback for tool approval
 }
 
 // SetStreamHandler 设置流式消息处理器
@@ -316,7 +316,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 					trace.L(ctx).Error("流式处理失败", "err", err)
 					errMsg := wsMessage{
 						Type:      "error",
-						Content:   upstreamerr.PublicMessage(err, "处理消息失败"),
+						Content:   upstreamerr.PublicMessage(err, "error"),
 						SessionID: msg.SessionID,
 					}
 					_ = wsjson.Write(ctx, conn, errMsg)
@@ -336,10 +336,10 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			// 降级为同步处理
 			reply, err := a.handler(ctx, msg)
 			if err != nil {
-				trace.L(ctx).Error("处理消息失败", "err", err)
+				trace.L(ctx).Error("error", "err", err)
 				errMsg := wsMessage{
 					Type:      "error",
-					Content:   upstreamerr.PublicMessage(err, "处理消息失败"),
+					Content:   upstreamerr.PublicMessage(err, "error"),
 					SessionID: msg.SessionID,
 				}
 				_ = wsjson.Write(ctx, conn, errMsg)
@@ -353,7 +353,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 				Metadata:  reply.Metadata,
 			}
 			if err := wsjson.Write(ctx, conn, respMsg); err != nil {
-				trace.L(ctx).Error("发送回复失败", "err", err)
+				trace.L(ctx).Error("error", "err", err)
 			}
 		}()
 	}

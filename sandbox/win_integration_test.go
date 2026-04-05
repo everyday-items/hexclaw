@@ -128,9 +128,9 @@ func TestWindows_PathValidation(t *testing.T) {
 	}{
 		{`C:\Users\test\file.txt`, true},
 		{`file.txt`, true},
-		{`\\server\share\file`, false},   // UNC
-		{`\\.\PhysicalDrive0`, false},     // device handle
-		{`file.txt:hidden`, false},        // ADS (non-absolute)
+		{`\\server\share\file`, false}, // UNC
+		{`\\.\PhysicalDrive0`, false},  // device handle
+		{`file.txt:hidden`, false},     // ADS (non-absolute)
 	}
 
 	for _, tt := range tests {
@@ -153,7 +153,7 @@ func TestWindows_EscapeVectors(t *testing.T) {
 		{"python", []string{"script.py"}, true},
 		{"node", []string{"app.js"}, true},
 		{"powershell", []string{"-Command", "Get-Process"}, false}, // blocked
-		{"cmd.exe", []string{"/c", "whoami"}, false},                // blocked
+		{"cmd.exe", []string{"/c", "whoami"}, false},               // blocked
 		{"python", []string{`\\server\share\evil.py`}, false},      // UNC in args
 	}
 

@@ -11,10 +11,10 @@ import (
 // Phase 8 D31: Low Box Token network isolation
 
 var (
-	modNtdll              = syscall.NewLazyDLL("ntdll.dll")
-	procNtCreateLowBoxToken = modNtdll.NewProc("NtCreateLowBoxToken")
+	modNtdll                        = syscall.NewLazyDLL("ntdll.dll")
+	procNtCreateLowBoxToken         = modNtdll.NewProc("NtCreateLowBoxToken")
 	procRtlAllocateAndInitializeSid = modNtdll.NewProc("RtlAllocateAndInitializeSid")
-	procRtlFreeSid = modNtdll.NewProc("RtlFreeSid")
+	procRtlFreeSid                  = modNtdll.NewProc("RtlFreeSid")
 )
 
 // sidIdentifierAuthority is the SID authority structure.

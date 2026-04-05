@@ -13,7 +13,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"time"
 )
 
@@ -61,12 +61,11 @@ func Run(ctx context.Context, db *sql.DB, migrations []Migration) error {
 			return fmt.Errorf("迁移 v%d (%s) 失败: %w", m.Version, m.Description, err)
 		}
 		applied++
-		log.Printf("[migrate] 已应用 v%d: %s", m.Version, m.Description)
+		logger.Info("[migrate] 已应用 v", "version", m.Version, "description", m.Description)
 	}
 
 	if applied > 0 {
-		log.Printf("[migrate] 共应用 %d 个迁移（当前版本: v%d → v%d）",
-			applied, currentVersion, migrations[len(migrations)-1].Version)
+		logger.Info("[migrate] 共应用", "applied", applied, "currentVersion", currentVersion, "version", migrations[len(migrations)-1].Version)
 	}
 	return nil
 }

@@ -25,10 +25,10 @@ var (
 	procAdjustTokenPrivileges = modAdvapi32.NewProc("AdjustTokenPrivileges")
 
 	// Job Object
-	procCreateJobObjectW            = modKernel32.NewProc("CreateJobObjectW")
-	procSetInformationJobObject     = modKernel32.NewProc("SetInformationJobObject")
-	procAssignProcessToJobObject    = modKernel32.NewProc("AssignProcessToJobObject")
-	procTerminateJobObject          = modKernel32.NewProc("TerminateJobObject")
+	procCreateJobObjectW         = modKernel32.NewProc("CreateJobObjectW")
+	procSetInformationJobObject  = modKernel32.NewProc("SetInformationJobObject")
+	procAssignProcessToJobObject = modKernel32.NewProc("AssignProcessToJobObject")
+	procTerminateJobObject       = modKernel32.NewProc("TerminateJobObject")
 
 	// ACL / Security
 	procSetNamedSecurityInfoW = modAdvapi32.NewProc("SetNamedSecurityInfoW")
@@ -45,10 +45,10 @@ const (
 
 // Job Object limit flags
 const (
-	JOB_OBJECT_LIMIT_PROCESS_MEMORY      = 0x00000100
-	JOB_OBJECT_LIMIT_JOB_MEMORY          = 0x00000200
-	JOB_OBJECT_LIMIT_ACTIVE_PROCESS      = 0x00000008
-	JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE   = 0x00002000
+	JOB_OBJECT_LIMIT_PROCESS_MEMORY    = 0x00000100
+	JOB_OBJECT_LIMIT_JOB_MEMORY        = 0x00000200
+	JOB_OBJECT_LIMIT_ACTIVE_PROCESS    = 0x00000008
+	JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 )
 
 // Placeholder: actual Win32 struct definitions will be filled on Windows
@@ -73,8 +73,8 @@ type (
 			WriteTransferCount  uint64
 			OtherTransferCount  uint64
 		}
-		ProcessMemoryLimit uintptr
-		JobMemoryLimit     uintptr
+		ProcessMemoryLimit    uintptr
+		JobMemoryLimit        uintptr
 		PeakProcessMemoryUsed uintptr
 		PeakJobMemoryUsed     uintptr
 	}
@@ -85,7 +85,7 @@ func createRestrictedToken(existingToken syscall.Token) (syscall.Token, error) {
 	var newToken syscall.Token
 	r, _, err := procCreateRestrictedToken.Call(
 		uintptr(existingToken),
-		0, // flags: DISABLE_MAX_PRIVILEGE
+		0,    // flags: DISABLE_MAX_PRIVILEGE
 		0, 0, // SIDs to disable
 		0, 0, // privileges to delete
 		0, 0, // restricting SIDs

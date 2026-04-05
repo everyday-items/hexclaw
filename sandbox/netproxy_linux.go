@@ -4,7 +4,7 @@ package sandbox
 
 import (
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"os/exec"
 )
 
@@ -27,7 +27,7 @@ func NewLinuxProxyIntegration(proxyAddr string, uid int) *LinuxProxyIntegration 
 func (p *LinuxProxyIntegration) Apply() error {
 	// Check if iptables is available
 	if _, err := exec.LookPath("iptables"); err != nil {
-		log.Printf("[netproxy-linux] iptables not available, falling back to env var proxy")
+		logger.Info("[netproxy-linux] iptables not available, falling back to env var proxy")
 		return nil // graceful degradation
 	}
 

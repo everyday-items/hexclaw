@@ -18,8 +18,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -73,7 +73,7 @@ func (a *DingtalkAdapter) Start(_ context.Context, handler adapter.MessageHandle
 	a.handler = handler
 	a.stopped.Store(false)
 	go a.connectLoop()
-	log.Printf("钉钉适配器 [%s] 已启动（Stream 长连接模式）", a.Name())
+	logger.Info("钉钉适配器 [", "name", a.Name())
 	return nil
 }
 
@@ -111,7 +111,7 @@ func (a *DingtalkAdapter) connectLoop() {
 	for !a.stopped.Load() {
 		if err := a.connectAndListen(); err != nil {
 			if !a.stopped.Load() {
-				log.Printf("钉钉 Stream 断开: %v，%v 后重连...", err, backoff)
+				logger.Info("钉钉 Stream 断开", "error", err, "backoff", backoff)
 				time.Sleep(backoff)
 				backoff = min(backoff*2, maxBackoff)
 			}
@@ -148,7 +148,7 @@ func (a *DingtalkAdapter) connectAndListen() error {
 		a.connMu.Unlock()
 	}()
 
-	log.Printf("钉钉 Stream 连接已建立")
+	logger.Info("钉钉 Stream 连接已建立")
 
 	stopPing := make(chan struct{})
 	go a.pingLoop(conn, 30*time.Second, stopPing)
@@ -218,7 +218,7 @@ type streamFrame struct {
 func (a *DingtalkAdapter) handleStreamMessage(conn *websocket.Conn, raw []byte) {
 	var frame streamFrame
 	if err := json.Unmarshal(raw, &frame); err != nil {
-		log.Printf("钉钉 Stream: 解析消息失败: %v", err)
+		logger.Error("钉钉 Stream: 解析消息失败", "error", err)
 		return
 	}
 
@@ -230,7 +230,7 @@ func (a *DingtalkAdapter) handleStreamMessage(conn *websocket.Conn, raw []byte) 
 	case "EVENT", "CALLBACK":
 		go a.handleStreamEvent(conn, frame)
 	default:
-		log.Printf("钉钉 Stream: 未知消息类型: %s", frame.Type)
+		logger.Info("钉钉 Stream: 未知消息类型", "type", frame.Type)
 	}
 }
 
@@ -238,10 +238,10 @@ func (a *DingtalkAdapter) handleStreamMessage(conn *websocket.Conn, raw []byte) 
 func (a *DingtalkAdapter) sendStreamAck(conn *websocket.Conn, frame streamFrame, body string) {
 	msgID := frame.Headers["messageId"]
 	ack := map[string]any{
-		"code":      200,
-		"headers":   map[string]string{"contentType": "application/json", "messageId": msgID},
-		"message":   "OK",
-		"data":      body,
+		"code":    200,
+		"headers": map[string]string{"contentType": "application/json", "messageId": msgID},
+		"message": "OK",
+		"data":    body,
 	}
 	data, _ := json.Marshal(ack)
 
@@ -262,7 +262,7 @@ func (a *DingtalkAdapter) handleStreamEvent(conn *websocket.Conn, frame streamFr
 
 	var event dtEvent
 	if err := json.Unmarshal([]byte(frame.Data), &event); err != nil {
-		log.Printf("钉钉 Stream: 解析事件数据失败: %v", err)
+		logger.Error("钉钉 Stream: 解析事件数据失败", "error", err)
 		return
 	}
 
@@ -303,13 +303,13 @@ func (a *DingtalkAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 	timestamp := r.Header.Get("timestamp")
 	sign := r.Header.Get("sign")
 	if a.cfg.AppSecret != "" && !a.verifySign(timestamp, sign) {
-		http.Error(w, "签名验证失败", http.StatusUnauthorized)
+		http.Error(w, "name", http.StatusUnauthorized)
 		return
 	}
 
 	var event dtEvent
 	if err := json.Unmarshal(body, &event); err != nil {
-		http.Error(w, "解析事件失败", http.StatusBadRequest)
+		http.Error(w, "error", http.StatusBadRequest)
 		return
 	}
 
@@ -410,16 +410,20 @@ func (a *DingtalkAdapter) handleMessage(event dtEvent) {
 
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
-		log.Printf("钉钉: 处理消息失败: %v", err)
-		_ = a.Send(ctx, msg.ChatID, &adapter.Reply{Content: "处理消息时出现错误，请稍后重试。"})
+		logger.Error("钉钉: 处理消息失败", "error", err)
+		errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer errCancel()
+		_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{Content: "处理消息时出现错误，请稍后重试。"})
 		return
 	}
 	if reply == nil {
 		return
 	}
 
-	if err := a.Send(ctx, msg.ChatID, reply); err != nil {
-		log.Printf("钉钉: 发送回复失败: %v", err)
+	sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer sendCancel()
+	if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
+		logger.Error("钉钉: 发送回复失败", "error", err)
 	}
 }
 

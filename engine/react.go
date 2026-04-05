@@ -18,8 +18,8 @@ import (
 	"github.com/hexagon-codes/hexclaw/cache"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/knowledge"
-	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
+	"github.com/hexagon-codes/hexclaw/memory"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/session"
 	"github.com/hexagon-codes/hexclaw/skill"
@@ -51,9 +51,9 @@ type ReActEngine struct {
 	skills      *skill.DefaultRegistry
 	store       storage.Store
 	cache       *cache.Cache
-	kb          *knowledge.Manager // 知识库管理器（可为 nil）
-	compactor   *session.Compactor // 上下文压缩器
-	fileMem     *memory.FileMemory    // 文件记忆系统（可为 nil）
+	kb          *knowledge.Manager   // 知识库管理器（可为 nil）
+	compactor   *session.Compactor   // 上下文压缩器
+	fileMem     *memory.FileMemory   // 文件记忆系统（可为 nil）
 	vectorMem   *memory.VectorMemory // 向量语义记忆（可为 nil）
 	factory     *agents.Factory      // Agent 角色工厂
 	started     bool
@@ -62,11 +62,11 @@ type ReActEngine struct {
 	mpTracked map[string]struct{}
 
 	// D1-D2: 统一工具循环基础设施
-	toolCollector *ToolCollector        // 工具收集器 (Skill + MCP)
-	toolExecutor  *ToolExecutor         // 工具执行器 (含 Hook 链)
-	sessionLock   *session.SessionLock  // 会话并发锁
-	budgetCfg     *BudgetConfig         // D17: 预算配置 (非 nil 时每次请求创建独立 BudgetController)
-	bgWg          sync.WaitGroup        // G3: 等待后台 goroutine (压缩/记忆) 完成
+	toolCollector *ToolCollector       // 工具收集器 (Skill + MCP)
+	toolExecutor  *ToolExecutor        // 工具执行器 (含 Hook 链)
+	sessionLock   *session.SessionLock // 会话并发锁
+	budgetCfg     *BudgetConfig        // D17: 预算配置 (非 nil 时每次请求创建独立 BudgetController)
+	bgWg          sync.WaitGroup       // G3: 等待后台 goroutine (压缩/记忆) 完成
 }
 
 type modelOverrideProvider struct {
@@ -491,13 +491,15 @@ func (e *ReActEngine) completeWithTools(
 	}
 	useBudget := budget != nil
 
-	// 收集工具定义（本地模型跳过）
+	// 收集工具定义（根据全局工具配置决定是否注入）
 	var tools []llm.ToolDefinition
-	isLocal := strings.Contains(providerName, "本地") ||
-		strings.Contains(strings.ToLower(providerName), "ollama") ||
-		strings.Contains(strings.ToLower(providerName), "local")
-	if e.toolCollector != nil && !isLocal {
+	isLocal := isLocalProvider(providerName)
+	toolsCfg := e.cfg.LLM.Tools
+	if e.toolCollector != nil && resolveToolsEnabled(toolsCfg, isLocal) {
 		tools = e.toolCollector.Collect()
+		if toolsCfg.MaxTools > 0 && len(tools) > toolsCfg.MaxTools {
+			tools = tools[:toolsCfg.MaxTools]
+		}
 	}
 
 	// 构建初始请求
@@ -875,17 +877,18 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	if e.toolCollector != nil {
 		tools = e.toolCollector.Collect()
 	}
-	// 本地模型（Ollama）不注入工具定义 — 小模型处理大量工具描述极慢
-	isLocal := strings.Contains(selection.providerName, "本地") ||
-		strings.Contains(strings.ToLower(selection.providerName), "ollama") ||
-		strings.Contains(strings.ToLower(selection.providerName), "local")
-	if isLocal {
+	// 根据 Provider 配置决定是否注入工具（用户可在设置中手动开关）
+	isLocal := isLocalProvider(selection.providerName)
+	streamToolsCfg := e.cfg.LLM.Tools
+	if !resolveToolsEnabled(streamToolsCfg, isLocal) {
 		tools = nil
 		// 本地 thinking 模型（qwen3、deepseek-r1 等）：前端未显式开启 thinking 时注入 /no_think
 		if msg.Metadata["thinking"] != "on" && isLocalThinkingModel(selection.modelName) {
 			injectNoThink(req.Messages)
 			trace.L(ctx).Info("注入 /no_think", "model", selection.modelName)
 		}
+	} else if streamToolsCfg.MaxTools > 0 && len(tools) > streamToolsCfg.MaxTools {
+		tools = tools[:streamToolsCfg.MaxTools]
 	}
 	trace.L(ctx).Info("LLM 调用准备", "tools", len(tools), "provider", selection.providerName, "model", selection.modelName, "local", isLocal)
 	if len(tools) > 0 {
@@ -1102,6 +1105,25 @@ func (e *ReActEngine) pipeStream(
 
 	content := fullContent.String()
 
+	// LLM 返回空内容时生成诊断提示，避免前端显示空消息
+	if content == "" {
+		finishReason := ""
+		if result != nil {
+			finishReason = result.FinishReason
+		}
+		trace.L(ctx).Warn("LLM 返回空内容",
+			"provider", providerName,
+			"model", modelName,
+			"finish_reason", finishReason,
+			"session", sessionID,
+		)
+		content = fmt.Sprintf("模型未返回有效内容，请检查：\n"+
+			"1. 当前模型（%s）是否已正确配置 API Key\n"+
+			"2. 模型服务是否正常运行\n"+
+			"3. 请求是否被内容过滤拦截",
+			modelName)
+	}
+
 	// 使用独立 context 进行后续操作，避免请求 ctx 取消后无法保存
 	saveCtx, saveCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer saveCancel()
@@ -1214,6 +1236,25 @@ func (e *ReActEngine) pipeStreamWithTools(
 
 	result := llmStream.Result()
 	content := fullContent.String()
+
+	// LLM 返回空内容时生成诊断提示，避免前端显示空消息
+	if content == "" {
+		finishReason := ""
+		if result != nil {
+			finishReason = result.FinishReason
+		}
+		trace.L(ctx).Warn("LLM 返回空内容",
+			"provider", providerName,
+			"model", modelName,
+			"finish_reason", finishReason,
+			"session", sessionID,
+		)
+		content = fmt.Sprintf("模型未返回有效内容，请检查：\n"+
+			"1. 当前模型（%s）是否已正确配置 API Key\n"+
+			"2. 模型服务是否正常运行\n"+
+			"3. 请求是否被内容过滤拦截",
+			modelName)
+	}
 
 	saveCtx, saveCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer saveCancel()
@@ -1788,4 +1829,26 @@ func truncateResult(s string, maxRunes int) string {
 		return s
 	}
 	return string(runes[:maxRunes]) + "..."
+}
+
+// isLocalProvider 判断 provider 是否为本地模型
+func isLocalProvider(providerName string) bool {
+	lower := strings.ToLower(providerName)
+	return strings.Contains(lower, "ollama") ||
+		strings.Contains(lower, "本地") ||
+		strings.Contains(lower, "local")
+}
+
+// resolveToolsEnabled 根据全局工具配置决定是否启用工具注入
+//
+// 优先级：全局设置 on/off > auto（本地模型默认关闭，云模型默认开启）
+func resolveToolsEnabled(toolsCfg config.LLMToolsConfig, isLocal bool) bool {
+	switch toolsCfg.Enabled {
+	case "on":
+		return true
+	case "off":
+		return false
+	default: // "auto" 或空
+		return !isLocal
+	}
 }

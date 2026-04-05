@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -137,9 +138,9 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 
 	// 2. VectorMemory 语义搜索 (D7: 链路④ 记忆闭环)
 	type vectorResult struct {
-		Content  string  `json:"content"`
-		Score    float32 `json:"score"`
-		Source   string  `json:"source"`
+		Content string  `json:"content"`
+		Score   float32 `json:"score"`
+		Source  string  `json:"source"`
 	}
 	var vecResults []vectorResult
 	if s.vectorMem != nil {
@@ -253,7 +254,7 @@ func (s *Server) handleAddMCPServer(w http.ResponseWriter, r *http.Request) {
 	// 持久化到配置文件，重启后不丢失
 	if s.cfgWriter != nil {
 		if err := s.cfgWriter.AppendMCPServer(req.Name, transport, req.Command, req.Args, req.Endpoint); err != nil {
-			log.Printf("MCP Server %q 添加成功但持久化失败: %v", req.Name, err)
+			logger.Error("MCP Server", "name", req.Name, "添加成功但持久化失败", err)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("MCP Server %q 已添加", req.Name)})
@@ -367,14 +368,18 @@ func (s *Server) handleSkillStatus(w http.ResponseWriter, r *http.Request) {
 
 // InstallSkillRequest 安装技能请求
 type InstallSkillRequest struct {
-	Source string `json:"source"` // 源路径（本地文件/目录）
+	Source string `json:"source"`          // 源路径 / URL / clawhub 技能名
+	Type   string `json:"type,omitempty"` // "file" | "url" | "clawhub"（缺省时自动推断）
 }
 
 // handleInstallSkill 安装技能
 //
-// source 支持两种格式:
-//   - clawhub://skill-name  — 从 ClawHub 在线安装
-//   - 本地相对路径           — 从本地文件系统安装
+// type 支持三种来源:
+//   - "clawhub" 或 source 前缀 clawhub:// — 从 ClawHub 在线安装
+//   - "file"                              — 从本地文件系统安装（允许绝对路径，供桌面端文件选择器使用）
+//   - "url"                               — 从 HTTPS URL 下载后安装
+//
+// type 为空时按 source 前缀自动推断（向后兼容）。
 func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 	var req InstallSkillRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
@@ -391,50 +396,103 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ClawHub 在线安装
-	if strings.HasPrefix(req.Source, "clawhub://") {
-		skillName := strings.TrimPrefix(req.Source, "clawhub://")
-		if s.skillHub == nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-				"error": "ClawHub 未启用",
-			})
-			return
+	// 自动推断 type（向后兼容无 type 字段的旧请求）
+	if req.Type == "" {
+		switch {
+		case strings.HasPrefix(req.Source, "clawhub://"):
+			req.Type = "clawhub"
+			req.Source = strings.TrimPrefix(req.Source, "clawhub://")
+		case strings.HasPrefix(req.Source, "https://"):
+			req.Type = "url"
+		default:
+			req.Type = "file"
 		}
-		if s.skillHub.GetCatalog() == nil {
-			if err := s.skillHub.Refresh(r.Context()); err != nil {
-				writeJSON(w, http.StatusBadGateway, map[string]string{
-					"error": "获取 ClawHub 技能目录失败: " + err.Error(),
-				})
-				return
-			}
-		}
-		if err := s.skillHub.Install(r.Context(), skillName); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{
-				"error": "安装技能失败: " + err.Error(),
-			})
-			return
-		}
-		// Reload marketplace so the new skill appears in List()
-		_ = s.mp.Init()
-		s.syncEngineMarketplaceSkills()
-		writeJSON(w, http.StatusOK, map[string]any{
-			"name":               skillName,
-			"message":            "技能已从 ClawHub 安装并已同步到运行引擎",
-			"requires_restart":   false,
-			"runtime_registered": true,
+	}
+
+	switch req.Type {
+	case "clawhub":
+		s.installSkillFromClawHub(w, r, strings.TrimPrefix(req.Source, "clawhub://"))
+	case "file":
+		s.installSkillFromFile(w, req.Source)
+	case "url":
+		s.installSkillFromURL(w, r, req.Source)
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "不支持的安装类型: " + req.Type,
+		})
+	}
+}
+
+// installSkillFromClawHub 从 ClawHub 在线安装
+func (s *Server) installSkillFromClawHub(w http.ResponseWriter, r *http.Request, skillName string) {
+	if s.skillHub == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "ClawHub 未启用",
 		})
 		return
 	}
+	if s.skillHub.GetCatalog() == nil {
+		if err := s.skillHub.Refresh(r.Context()); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{
+				"error": "获取 ClawHub 技能目录失败: " + err.Error(),
+			})
+			return
+		}
+	}
+	if err := s.skillHub.Install(r.Context(), skillName); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "安装技能失败: " + err.Error(),
+		})
+		return
+	}
+	_ = s.mp.Init()
+	s.syncEngineMarketplaceSkills()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":               skillName,
+		"message":            "技能已从 ClawHub 安装并已同步到运行引擎",
+		"requires_restart":   false,
+		"runtime_registered": true,
+	})
+}
 
-	// 本地安装: 禁止绝对路径和路径穿越
-	if filepath.IsAbs(req.Source) || strings.Contains(req.Source, "..") {
+// installSkillFromFile 从本地文件安装
+//
+// 允许绝对路径（桌面端文件选择器返回绝对路径）。
+// 安全校验：后缀 .md、无路径穿越、文件大小 < 1 MB。
+func (s *Server) installSkillFromFile(w http.ResponseWriter, source string) {
+	// 路径穿越检查
+	if strings.Contains(source, "..") {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "source 路径不安全",
 		})
 		return
 	}
 
-	sk, err := s.mp.Install(req.Source)
+	info, err := os.Stat(source)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "文件不存在: " + err.Error(),
+		})
+		return
+	}
+
+	// 单文件校验
+	if !info.IsDir() {
+		if !strings.HasSuffix(strings.ToLower(source), ".md") {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "仅支持 .md 技能文件",
+			})
+			return
+		}
+		if info.Size() > 1<<20 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "文件过大（上限 1 MB）",
+			})
+			return
+		}
+	}
+
+	sk, err := s.mp.Install(source)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "安装技能失败: " + err.Error(),
@@ -448,6 +506,116 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		"description":        sk.Meta.Description,
 		"version":            sk.Meta.Version,
 		"message":            "技能已安装并已同步到运行引擎",
+		"requires_restart":   false,
+		"runtime_registered": true,
+	})
+}
+
+const skillURLMaxSize = 1 << 20 // 1 MB
+
+// installSkillFromURL 从 HTTPS URL 下载后安装
+func (s *Server) installSkillFromURL(w http.ResponseWriter, r *http.Request, rawURL string) {
+	if !strings.HasPrefix(rawURL, "https://") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "仅支持 HTTPS URL",
+		})
+		return
+	}
+
+	// 校验 URL 格式
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "URL 格式无效",
+		})
+		return
+	}
+
+	// 下载
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "创建请求失败: " + err.Error(),
+		})
+		return
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{
+			"error": "下载失败: " + err.Error(),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		writeJSON(w, http.StatusBadGateway, map[string]string{
+			"error": fmt.Sprintf("下载失败: HTTP %d", resp.StatusCode),
+		})
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, skillURLMaxSize+1))
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{
+			"error": "读取响应失败: " + err.Error(),
+		})
+		return
+	}
+	if len(body) > skillURLMaxSize {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "远程文件过大（上限 1 MB）",
+		})
+		return
+	}
+
+	// 基本内容校验：必须包含 frontmatter 标记
+	content := string(body)
+	if !strings.HasPrefix(strings.TrimSpace(content), "---") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "文件内容不是有效的 Skill 格式（缺少 frontmatter）",
+		})
+		return
+	}
+
+	// 写入临时文件
+	tmpFile, err := os.CreateTemp("", "hexclaw-skill-*.md")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "创建临时文件失败: " + err.Error(),
+		})
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmpFile.Write(body); err != nil {
+		tmpFile.Close()
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "写入临时文件失败: " + err.Error(),
+		})
+		return
+	}
+	tmpFile.Close()
+
+	sk, err := s.mp.Install(tmpPath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "安装技能失败: " + err.Error(),
+		})
+		return
+	}
+
+	s.syncEngineMarketplaceSkills()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":               sk.Meta.Name,
+		"description":        sk.Meta.Description,
+		"version":            sk.Meta.Version,
+		"message":            "技能已从远程 URL 安装并已同步到运行引擎",
 		"requires_restart":   false,
 		"runtime_registered": true,
 	})
@@ -1026,7 +1194,7 @@ func (s *Server) syncEngineMarketplaceSkills() {
 		return
 	}
 	if err := e.SyncMarkdownSkillsFromMarketplace(s.mp); err != nil {
-		log.Printf("技能市场: 同步引擎注册表失败: %v", err)
+		logger.Error("技能市场: 同步引擎注册表失败", "error", err)
 	}
 }
 

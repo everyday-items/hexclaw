@@ -3,7 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 
 	"github.com/hexagon-codes/ai-core/llm"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
@@ -24,8 +24,8 @@ func NewHandoffSkill(dispatcher *agentrouter.Dispatcher) *HandoffSkill {
 }
 
 func (h *HandoffSkill) Name() string        { return "transfer_to_agent" }
-func (h *HandoffSkill) Description() string  { return "Transfer conversation to a specialized agent" }
-func (h *HandoffSkill) Match(_ string) bool  { return false }
+func (h *HandoffSkill) Description() string { return "Transfer conversation to a specialized agent" }
+func (h *HandoffSkill) Match(_ string) bool { return false }
 
 func (h *HandoffSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition("transfer_to_agent",
@@ -52,7 +52,7 @@ func (h *HandoffSkill) Execute(ctx context.Context, args map[string]any) (*skill
 		return nil, fmt.Errorf("agent router not available")
 	}
 
-	log.Printf("Agent handoff: → %s (context: %s)", agentName, handoffCtx)
+	logger.Info("Agent handoff: →", "agentName", agentName, "context", handoffCtx)
 
 	return &skill.Result{
 		Content: fmt.Sprintf("Conversation transferred to agent '%s'. Context: %s", agentName, handoffCtx),

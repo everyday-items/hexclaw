@@ -20,8 +20,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -44,13 +44,13 @@ const (
 // Webhook 配置
 type Webhook struct {
 	ID          string      `json:"id"`
-	Name        string      `json:"name"`                  // 名称（也是 URL 路径）
-	Type        WebhookType `json:"type"`                  // 类型
-	Secret      string      `json:"-"`                     // 签名验证 Secret（JSON 序列化时隐藏）
-	HasSecret   bool        `json:"has_secret"`            // 是否配置了 Secret
-	Prompt      string      `json:"prompt"`                // Agent 处理指令
-	UserID      string      `json:"user_id"`               // 所属用户
-	Enabled     bool        `json:"enabled"`               // 是否启用
+	Name        string      `json:"name"`       // 名称（也是 URL 路径）
+	Type        WebhookType `json:"type"`       // 类型
+	Secret      string      `json:"-"`          // 签名验证 Secret（JSON 序列化时隐藏）
+	HasSecret   bool        `json:"has_secret"` // 是否配置了 Secret
+	Prompt      string      `json:"prompt"`     // Agent 处理指令
+	UserID      string      `json:"user_id"`    // 所属用户
+	Enabled     bool        `json:"enabled"`    // 是否启用
 	LastEventAt time.Time   `json:"last_event_at"`
 	EventCount  int         `json:"event_count"`
 	CreatedAt   time.Time   `json:"created_at"`
@@ -61,9 +61,9 @@ type Event struct {
 	WebhookID   string         `json:"webhook_id"`
 	WebhookName string         `json:"webhook_name"`
 	Type        WebhookType    `json:"type"`
-	EventType   string         `json:"event_type"`   // 事件类型（如 push, pull_request）
-	Payload     map[string]any `json:"payload"`      // 原始 payload
-	Summary     string         `json:"summary"`      // 解析后的摘要
+	EventType   string         `json:"event_type"` // 事件类型（如 push, pull_request）
+	Payload     map[string]any `json:"payload"`    // 原始 payload
+	Summary     string         `json:"summary"`    // 解析后的摘要
 	ReceivedAt  time.Time      `json:"received_at"`
 }
 
@@ -146,7 +146,7 @@ func (m *Manager) Register(ctx context.Context, wh *Webhook) error {
 	m.webhooks[wh.Name] = wh
 	m.mu.Unlock()
 
-	log.Printf("Webhook 已注册: %s (类型: %s)", wh.Name, wh.Type)
+	logger.Info("Webhook 已注册", "name", wh.Name, "type", wh.Type)
 	return nil
 }
 
@@ -224,7 +224,7 @@ func (m *Manager) Handler() http.HandlerFunc {
 		// 签名验证
 		if wh.Secret != "" {
 			if !m.verifySignature(wh, r, body) {
-				log.Printf("Webhook %s: 签名验证失败", name)
+				logger.Error("Webhook", "name", name)
 				http.Error(w, "signature verification failed", http.StatusUnauthorized)
 				return
 			}
@@ -233,7 +233,7 @@ func (m *Manager) Handler() http.HandlerFunc {
 		// 解析事件
 		event, err := m.parseEvent(wh, r, body)
 		if err != nil {
-			log.Printf("Webhook %s: 解析事件失败: %v", name, err)
+			logger.Error("Webhook", "name", name, "error", err)
 			http.Error(w, "parse event failed", http.StatusBadRequest)
 			return
 		}
@@ -243,7 +243,7 @@ func (m *Manager) Handler() http.HandlerFunc {
 		if _, err := m.db.ExecContext(r.Context(),
 			`UPDATE webhooks SET last_event_at = ?, event_count = event_count + 1 WHERE id = ?`,
 			now, wh.ID); err != nil {
-			log.Printf("Webhook: 更新统计失败: %v", err)
+			logger.Error("Webhook: 更新统计失败", "error", err)
 		}
 		m.mu.Lock()
 		wh.LastEventAt = now
@@ -260,7 +260,7 @@ func (m *Manager) Handler() http.HandlerFunc {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 				defer cancel()
 				if err := handler(ctx, event, wh.Prompt); err != nil {
-					log.Printf("Webhook %s: 处理事件失败: %v", name, err)
+					logger.Error("Webhook", "name", name, "处理事件失败", err)
 				}
 			}()
 		}
@@ -417,6 +417,6 @@ func (m *Manager) loadWebhooks(ctx context.Context) error {
 		m.webhooks[wh.Name] = wh
 	}
 
-	log.Printf("Webhook 已加载 %d 个", len(m.webhooks))
+	logger.Info("Webhook 已加载", "len", len(m.webhooks))
 	return rows.Err()
 }

@@ -20,8 +20,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -98,11 +98,11 @@ func (a *SlackAdapter) Start(_ context.Context, handler adapter.MessageHandler) 
 
 	go func() {
 		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Slack 事件服务器错误: %v", err)
+			logger.Error("Slack 事件服务器错误", "error", err)
 		}
 	}()
 
-	log.Println("Slack 适配器已启动（Events API 模式）")
+	logger.Info("Slack 适配器已启动（Events API 模式）")
 	return nil
 }
 
@@ -170,7 +170,7 @@ func (a *SlackAdapter) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// 验证签名
 	if a.cfg.SigningSecret != "" {
 		if !a.verifySignature(r, body) {
-			http.Error(w, "签名验证失败", http.StatusUnauthorized)
+			http.Error(w, "name", http.StatusUnauthorized)
 			return
 		}
 	}
@@ -205,7 +205,7 @@ func (a *SlackAdapter) handleEvents(w http.ResponseWriter, r *http.Request) {
 func (a *SlackAdapter) processEvent(data json.RawMessage) {
 	var event slackEvent
 	if err := json.Unmarshal(data, &event); err != nil {
-		log.Printf("解析 Slack 事件失败: %v", err)
+		logger.Error("解析 Slack 事件失败", "error", err)
 		return
 	}
 
@@ -242,8 +242,10 @@ func (a *SlackAdapter) processEvent(data json.RawMessage) {
 
 	reply, err := a.handler(ctx, unified)
 	if err != nil {
-		log.Printf("Slack 消息处理失败: %v", err)
-		_ = a.Send(ctx, event.Channel, &adapter.Reply{Content: "处理消息时出错，请稍后重试。"})
+		logger.Error("Slack 消息处理失败", "error", err)
+		errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer errCancel()
+		_ = a.Send(errCtx, event.Channel, &adapter.Reply{Content: "处理消息时出错，请稍后重试。"})
 		return
 	}
 	if reply != nil {
@@ -253,8 +255,10 @@ func (a *SlackAdapter) processEvent(data json.RawMessage) {
 			}
 			reply.Metadata["thread_ts"] = event.ThreadTS
 		}
-		if err := a.Send(ctx, event.Channel, reply); err != nil {
-			log.Printf("Slack 回复失败: %v", err)
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer sendCancel()
+		if err := a.Send(sendCtx, event.Channel, reply); err != nil {
+			logger.Error("Slack 回复失败", "error", err)
 		}
 	}
 }
@@ -401,7 +405,7 @@ func (a *SlackAdapter) fetchBotID() {
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		log.Printf("获取 Slack Bot ID 失败: %v", err)
+		logger.Error("获取 Slack Bot ID 失败", "error", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -410,7 +414,7 @@ func (a *SlackAdapter) fetchBotID() {
 		UserID string `json:"user_id"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		log.Printf("解析 Slack auth.test 响应失败: %v", err)
+		logger.Error("解析 Slack auth.test 响应失败", "error", err)
 		return
 	}
 	a.botID = result.UserID

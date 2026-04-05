@@ -10,8 +10,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net"
 	"net/mail"
 	"net/smtp"
@@ -90,14 +90,14 @@ func (a *EmailAdapter) Start(ctx context.Context, handler adapter.MessageHandler
 	a.stopped.Store(false)
 
 	go a.pollLoop(ctx)
-	log.Printf("邮件适配器已启动，轮询间隔: %ds", a.cfg.PollInterval)
+	logger.Info("邮件适配器已启动，轮询间隔", "interval_seconds", a.cfg.PollInterval)
 	return nil
 }
 
 // Stop 停止轮询
 func (a *EmailAdapter) Stop(_ context.Context) error {
 	a.stopped.Store(true)
-	log.Println("邮件适配器已停止")
+	logger.Info("邮件适配器已停止")
 	return nil
 }
 
@@ -173,53 +173,52 @@ func (a *EmailAdapter) fetchAndProcess(ctx context.Context) {
 		return
 	}
 
-	log.Printf("邮件适配器: 检查新邮件 (%s@%s:%d)",
-		a.cfg.IMAP.Username, a.cfg.IMAP.Host, a.cfg.IMAP.Port)
+	logger.Info("邮件适配器: 检查新邮件 (", "username", a.cfg.IMAP.Username, "host", a.cfg.IMAP.Host, "port", a.cfg.IMAP.Port)
 
 	client, err := a.dialIMAP(ctx, a.cfg.IMAP)
 	if err != nil {
-		log.Printf("邮件适配器: IMAP 连接失败: %v", err)
+		logger.Error("邮件适配器: IMAP 连接失败", "error", err)
 		return
 	}
 	defer func() { _ = client.Close() }()
 
 	if err := client.Login(a.cfg.IMAP.Username, a.cfg.IMAP.Password); err != nil {
-		log.Printf("邮件适配器: IMAP 登录失败: %v", err)
+		logger.Error("邮件适配器: IMAP 登录失败", "error", err)
 		return
 	}
 	defer func() {
 		if err := client.Logout(); err != nil {
-			log.Printf("邮件适配器: IMAP 登出失败: %v", err)
+			logger.Error("邮件适配器: IMAP 登出失败", "error", err)
 		}
 	}()
 
 	if err := client.Select(a.cfg.IMAP.Folder); err != nil {
-		log.Printf("邮件适配器: 选择邮箱失败: %v", err)
+		logger.Error("邮件适配器: 选择邮箱失败", "error", err)
 		return
 	}
 
 	ids, err := client.SearchUnseen(a.cfg.MaxFetch)
 	if err != nil {
-		log.Printf("邮件适配器: 搜索未读邮件失败: %v", err)
+		logger.Error("邮件适配器: 搜索未读邮件失败", "error", err)
 		return
 	}
 
 	for _, id := range ids {
 		raw, err := client.FetchRFC822(id)
 		if err != nil {
-			log.Printf("邮件适配器: 拉取邮件失败: id=%s err=%v", id, err)
+			logger.Error("邮件适配器: 拉取邮件失败: id", "id", id, "err", err)
 			continue
 		}
 
 		msg, subject, err := parseIncomingEmail(raw)
 		if err != nil {
-			log.Printf("邮件适配器: 解析邮件失败: id=%s err=%v", id, err)
+			logger.Error("邮件适配器: 解析邮件失败: id", "id", id, "err", err)
 			continue
 		}
 
 		reply, err := a.handler(ctx, msg)
 		if err != nil {
-			log.Printf("邮件适配器: 处理邮件失败: id=%s err=%v", id, err)
+			logger.Error("邮件适配器: 处理邮件失败: id", "id", id, "err", err)
 			continue
 		}
 		if reply != nil {
@@ -230,12 +229,12 @@ func (a *EmailAdapter) fetchAndProcess(ctx context.Context) {
 				reply.Metadata["subject"] = subject
 			}
 			if err := a.Send(ctx, msg.ChatID, reply); err != nil {
-				log.Printf("邮件适配器: 发送回复失败: id=%s err=%v", id, err)
+				logger.Error("邮件适配器: 发送回复失败: id", "id", id, "err", err)
 			}
 		}
 
 		if err := client.MarkSeen(id); err != nil {
-			log.Printf("邮件适配器: 标记已读失败: id=%s err=%v", id, err)
+			logger.Error("邮件适配器: 标记已读失败: id", "id", id, "err", err)
 		}
 	}
 }

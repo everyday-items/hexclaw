@@ -215,7 +215,7 @@ func TestParseGitHubSummary(t *testing.T) {
 		{
 			"push",
 			map[string]any{
-				"ref": "refs/heads/main",
+				"ref":        "refs/heads/main",
 				"repository": map[string]any{"full_name": "org/repo"},
 				"commits":    []any{map[string]any{}, map[string]any{}},
 			},

@@ -4,8 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -69,7 +69,7 @@ func (p *NetProxy) Start(ctx context.Context, addr string) (string, error) {
 
 	go func() {
 		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
-			log.Printf("[netproxy] serve error: %v", err)
+			logger.Error("[netproxy] serve error", "error", err)
 		}
 	}()
 	go func() {

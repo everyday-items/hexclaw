@@ -20,9 +20,11 @@ func NewSkillInstallerSkill(h *hub.Hub) *SkillInstallerSkill {
 	return &SkillInstallerSkill{hub: h}
 }
 
-func (s *SkillInstallerSkill) Name() string        { return "manage_skill" }
-func (s *SkillInstallerSkill) Description() string  { return "Search, install, or remove skills from HexClaw Hub" }
-func (s *SkillInstallerSkill) Match(_ string) bool  { return false }
+func (s *SkillInstallerSkill) Name() string { return "manage_skill" }
+func (s *SkillInstallerSkill) Description() string {
+	return "Search, install, or remove skills from HexClaw Hub"
+}
+func (s *SkillInstallerSkill) Match(_ string) bool { return false }
 
 func (s *SkillInstallerSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition("manage_skill",

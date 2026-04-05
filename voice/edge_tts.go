@@ -122,4 +122,3 @@ func (t *EdgeTTS) Synthesize(ctx context.Context, text string, opts SynthesizeOp
 		Size:   len(audio),
 	}, nil
 }
-

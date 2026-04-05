@@ -9,8 +9,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -57,7 +57,7 @@ func (a *TelegramAdapter) Start(_ context.Context, handler adapter.MessageHandle
 	a.stopped.Store(false)
 
 	go a.pollLoop()
-	log.Println("Telegram 适配器已启动（长轮询模式）")
+	logger.Info("Telegram 适配器已启动（长轮询模式）")
 	return nil
 }
 
@@ -67,7 +67,7 @@ func (a *TelegramAdapter) Stop(_ context.Context) error {
 	if a.queue != nil {
 		_ = a.queue.Stop(context.Background())
 	}
-	log.Println("Telegram 适配器已停止")
+	logger.Info("Telegram 适配器已停止")
 	return nil
 }
 
@@ -181,7 +181,7 @@ func (a *TelegramAdapter) pollLoop() {
 		updates, err := a.getUpdates()
 		if err != nil {
 			if !a.stopped.Load() {
-				log.Printf("Telegram: 获取更新失败: %v", err)
+				logger.Error("Telegram: 获取更新失败", "error", err)
 				time.Sleep(3 * time.Second)
 			}
 			continue
@@ -246,15 +246,19 @@ func (a *TelegramAdapter) handleMessage(tgMsg *tgMessage) {
 
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
-		log.Printf("Telegram: 处理消息失败: %v", err)
-		_ = a.Send(ctx, msg.ChatID, &adapter.Reply{Content: "处理消息时出现错误，请稍后重试。"})
+		logger.Error("Telegram: 处理消息失败", "error", err)
+		errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer errCancel()
+		_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{Content: "处理消息时出现错误，请稍后重试。"})
 		return
 	}
 	if reply == nil {
 		return
 	}
-	if err := a.Send(ctx, msg.ChatID, reply); err != nil {
-		log.Printf("Telegram: 发送回复失败: %v", err)
+	sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer sendCancel()
+	if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
+		logger.Error("Telegram: 发送回复失败", "error", err)
 	}
 }
 

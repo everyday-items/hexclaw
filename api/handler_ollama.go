@@ -3,21 +3,25 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os/exec"
+	goruntime "runtime"
 	"strings"
+	"syscall"
 	"time"
 )
 
 // OllamaStatus Ollama 运行时状态 (14.15 本地 LLM 管理)
 type OllamaStatus struct {
-	Running    bool          `json:"running"`              // Ollama 服务是否在运行
-	Version    string        `json:"version,omitempty"`    // Ollama 版本号
-	Models     []OllamaModel `json:"models,omitempty"`     // 已下载的模型列表
-	Associated bool          `json:"associated"`           // 是否已关联为 LLM Provider
-	ModelCount int           `json:"model_count"`          // 模型数量
+	Running    bool          `json:"running"`           // Ollama 服务是否在运行
+	Version    string        `json:"version,omitempty"` // Ollama 版本号
+	Models     []OllamaModel `json:"models,omitempty"`  // 已下载的模型列表
+	Associated bool          `json:"associated"`        // 是否已关联为 LLM Provider
+	ModelCount int           `json:"model_count"`       // 模型数量
 }
 
 // OllamaModel Ollama 已下载的模型
@@ -207,6 +211,60 @@ func (s *Server) handleOllamaDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
+// handleOllamaRestart 重启 Ollama 服务
+//
+// POST /api/v1/ollama/restart
+// macOS: open -a Ollama（桌面应用自带 serve）
+// Linux: systemctl restart ollama 或 ollama serve
+func (s *Server) handleOllamaRestart(w http.ResponseWriter, r *http.Request) {
+	// 先检测当前是否在运行
+	client := &http.Client{Timeout: 2 * time.Second}
+	wasRunning := false
+	if resp, err := client.Get("http://localhost:11434/api/version"); err == nil {
+		resp.Body.Close()
+		wasRunning = true
+	}
+
+	var cmd *exec.Cmd
+	switch goruntime.GOOS {
+	case "darwin":
+		// macOS: 通过桌面应用启动（最可靠）
+		if wasRunning {
+			// 先关再开
+			exec.Command("osascript", "-e", `quit app "Ollama"`).Run()
+			time.Sleep(2 * time.Second)
+		}
+		cmd = exec.Command("open", "-a", "Ollama")
+	case "linux":
+		if wasRunning {
+			exec.Command("systemctl", "restart", "ollama").Run()
+			writeJSON(w, http.StatusOK, map[string]string{"status": "restarting"})
+			return
+		}
+		cmd = exec.Command("ollama", "serve")
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	default:
+		// Windows: start ollama
+		cmd = exec.Command("ollama", "serve")
+	}
+
+	if err := cmd.Start(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("启动失败: %v", err)})
+		return
+	}
+
+	// 等待 Ollama 启动（最多 10 秒）
+	for i := 0; i < 20; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if resp, err := client.Get("http://localhost:11434/api/version"); err == nil {
+			resp.Body.Close()
+			writeJSON(w, http.StatusOK, map[string]string{"status": "running"})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "starting"})
+}
+
 // handleOllamaPull 下载 Ollama 模型，流式返回下载进度 (SSE)
 //
 // POST /api/v1/ollama/pull
@@ -226,8 +284,11 @@ func (s *Server) handleOllamaPull(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 调用 Ollama pull API (POST /api/pull, 流式 JSON)
+	// 使用独立 context（不绑定前端 SSE 连接）：前端断开只停止推送进度，不中断 Ollama 下载。
+	pullCtx, pullCancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer pullCancel()
 	pullBody, _ := json.Marshal(map[string]any{"name": req.Model, "stream": true})
-	pullReq, _ := http.NewRequestWithContext(r.Context(), "POST", "http://localhost:11434/api/pull", bytes.NewReader(pullBody))
+	pullReq, _ := http.NewRequestWithContext(pullCtx, "POST", "http://localhost:11434/api/pull", bytes.NewReader(pullBody))
 	pullReq.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{Timeout: 30 * time.Minute} // 大模型下载可能很久

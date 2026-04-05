@@ -3,7 +3,7 @@ package gateway
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
@@ -39,7 +39,7 @@ func (l *CostCheckLayer) Check(ctx context.Context, msg *adapter.Message) error 
 	if l.cfg.BudgetPerUser > 0 && msg.UserID != "" {
 		userCost, err := l.store.GetUserCost(ctx, msg.UserID, monthStart)
 		if err != nil {
-			log.Printf("查询用户成本失败（fail-closed）: %v", err)
+			logger.Error("error", "error", err)
 			return &GatewayError{
 				Layer:   "cost_check",
 				Code:    "cost_query_error",
@@ -60,7 +60,7 @@ func (l *CostCheckLayer) Check(ctx context.Context, msg *adapter.Message) error 
 	if l.cfg.BudgetGlobal > 0 {
 		globalCost, err := l.store.GetGlobalCost(ctx, monthStart)
 		if err != nil {
-			log.Printf("查询全局成本失败（fail-closed）: %v", err)
+			logger.Error("error", "error", err)
 			return &GatewayError{
 				Layer:   "cost_check",
 				Code:    "cost_query_error",

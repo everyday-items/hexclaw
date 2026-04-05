@@ -3,8 +3,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -102,7 +102,7 @@ func (s *Server) handleCallMCPTool(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.mcpMgr.CallTool(r.Context(), req.Name, req.Arguments)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusOK, map[string]string{"error": "工具 \"" + req.Name + "\" 执行失败: " + err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"result": result})
@@ -343,17 +343,17 @@ func (ws *WorkflowStore) loadFromFile() {
 	data, err := os.ReadFile(ws.filePath)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			log.Printf("加载工作流持久化文件失败: %v", err)
+			logger.Error("error", "error", err)
 		}
 		return
 	}
 	var workflows map[string]*WorkflowData
 	if err := json.Unmarshal(data, &workflows); err != nil {
-		log.Printf("解析工作流持久化文件失败: %v", err)
+		logger.Error("error", "error", err)
 		return
 	}
 	ws.workflows = workflows
-	log.Printf("从文件加载 %d 个工作流", len(workflows))
+	logger.Info("从文件加载", "len", len(workflows))
 }
 
 // persistToFile 将工作流数据持久化到 JSON 文件
@@ -364,16 +364,16 @@ func (ws *WorkflowStore) persistToFile() {
 	}
 	dir := filepath.Dir(ws.filePath)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
-		log.Printf("创建工作流持久化目录失败: %v", err)
+		logger.Error("error", "error", err)
 		return
 	}
 	data, err := json.MarshalIndent(ws.workflows, "", "  ")
 	if err != nil {
-		log.Printf("序列化工作流数据失败: %v", err)
+		logger.Error("error", "error", err)
 		return
 	}
 	if err := os.WriteFile(ws.filePath, data, 0o640); err != nil {
-		log.Printf("写入工作流持久化文件失败: %v", err)
+		logger.Error("error", "error", err)
 	}
 }
 

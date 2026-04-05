@@ -16,7 +16,7 @@ package memory
 
 import (
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"os"
 	"path/filepath"
 	"sort"
@@ -79,7 +79,7 @@ func New(cfg Options) (*FileMemory, error) {
 		dir:    dir,
 	}
 
-	log.Printf("文件记忆系统已初始化: %s", dir)
+	logger.Info("dir", "dir", dir)
 	return fm, nil
 }
 

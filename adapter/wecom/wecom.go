@@ -23,8 +23,8 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -113,11 +113,11 @@ func (a *WecomAdapter) Start(_ context.Context, handler adapter.MessageHandler) 
 
 	go func() {
 		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("企业微信回调服务器错误: %v", err)
+			logger.Error("error", "error", err)
 		}
 	}()
 
-	log.Println("企业微信适配器已启动")
+	logger.Info("企业微信适配器已启动")
 	return nil
 }
 
@@ -184,7 +184,7 @@ func (a *WecomAdapter) handleVerify(w http.ResponseWriter, r *http.Request) {
 
 	// 验证签名
 	if !a.checkSignature(msgSignature, timestamp, nonce, echoStr) {
-		http.Error(w, "签名验证失败", http.StatusForbidden)
+		http.Error(w, "name", http.StatusForbidden)
 		return
 	}
 
@@ -223,7 +223,7 @@ func (a *WecomAdapter) handleCallback(w http.ResponseWriter, r *http.Request) {
 	nonce := r.URL.Query().Get("nonce")
 
 	if !a.checkSignature(msgSignature, timestamp, nonce, encMsg.Encrypt) {
-		http.Error(w, "签名验证失败", http.StatusForbidden)
+		http.Error(w, "name", http.StatusForbidden)
 		return
 	}
 
@@ -237,7 +237,7 @@ func (a *WecomAdapter) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// 解析明文消息
 	var msg wecomMessage
 	if err := xml.Unmarshal([]byte(plaintext), &msg); err != nil {
-		http.Error(w, "解析消息失败", http.StatusBadRequest)
+		http.Error(w, "error", http.StatusBadRequest)
 		return
 	}
 
@@ -274,12 +274,14 @@ func (a *WecomAdapter) processMessage(msg wecomMessage) {
 
 	reply, err := a.handler(ctx, unified)
 	if err != nil {
-		log.Printf("企业微信消息处理失败: %v", err)
+		logger.Error("error", "error", err)
 		return
 	}
 	if reply != nil {
-		if err := a.Send(ctx, msg.FromUserName, reply); err != nil {
-			log.Printf("企业微信发送回复失败: %v", err)
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer sendCancel()
+		if err := a.Send(sendCtx, msg.FromUserName, reply); err != nil {
+			logger.Error("error", "error", err)
 		}
 	}
 }

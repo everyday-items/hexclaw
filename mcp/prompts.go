@@ -27,7 +27,7 @@ type PromptMessage struct {
 
 // PromptContent holds the content of a prompt message.
 type PromptContent struct {
-	Type        string `json:"type"`                  // "text" or "resource"
+	Type        string `json:"type"`                   // "text" or "resource"
 	Text        string `json:"text,omitempty"`         // for type="text"
 	ResourceURI string `json:"resource_uri,omitempty"` // for type="resource"
 }

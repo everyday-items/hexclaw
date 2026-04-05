@@ -181,4 +181,3 @@ func AttachToCollector(collector *LogCollector, sink *LogFileSink) {
 	collector.fileSink = sink
 	collector.mu.Unlock()
 }
-

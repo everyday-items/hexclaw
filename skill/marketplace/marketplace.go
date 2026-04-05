@@ -7,7 +7,7 @@ package marketplace
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,7 +68,7 @@ func (m *Marketplace) Init() error {
 	}
 	m.mu.Unlock()
 
-	log.Printf("技能市场已初始化: %d 个技能 (目录: %s)", len(skills), m.skillDir)
+	logger.Info("count", "count", len(skills), "dir", m.skillDir)
 	return nil
 }
 
@@ -175,7 +175,7 @@ func (m *Marketplace) Install(source string) (*MarkdownSkill, error) {
 	m.skills[skill.Meta.Name] = skill
 	m.mu.Unlock()
 
-	log.Printf("技能已安装: %s (v%s by %s)", skill.Meta.Name, skill.Meta.Version, skill.Meta.Author)
+	logger.Info("name", "name", skill.Meta.Name, "version", skill.Meta.Version, "author", skill.Meta.Author)
 	return skill, nil
 }
 
@@ -217,7 +217,7 @@ func (m *Marketplace) Uninstall(name string) error {
 		}
 	}
 
-	log.Printf("技能已删除: %s", name)
+	logger.Info("name", "name", name)
 	return nil
 }
 

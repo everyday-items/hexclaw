@@ -11,28 +11,28 @@ package plugin
 import (
 	"context"
 
-	"github.com/hexagon-codes/hexagon/plugin"
+	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
 
 // HexClaw 扩展插件类型
 const (
-	TypeSkill   plugin.PluginType = "skill"
-	TypeAdapter plugin.PluginType = "adapter"
-	TypeHook    plugin.PluginType = "hook"
+	TypeSkill   hexagon.PluginType = "skill"
+	TypeAdapter hexagon.PluginType = "adapter"
+	TypeHook    hexagon.PluginType = "hook"
 )
 
 // SkillPlugin 提供额外 Skill 的插件
 type SkillPlugin interface {
-	plugin.Plugin
+	hexagon.PluginPlugin
 	// Skills 返回该插件提供的 Skill 列表
 	Skills() []skill.Skill
 }
 
 // AdapterPlugin 提供平台适配器的插件
 type AdapterPlugin interface {
-	plugin.Plugin
+	hexagon.PluginPlugin
 	// Adapter 返回该插件提供的适配器实例
 	Adapter() adapter.Adapter
 }
@@ -42,7 +42,7 @@ type AdapterPlugin interface {
 // 在消息进入引擎前和回复发出前执行。
 // 可用于日志、过滤、消息变换等。
 type HookPlugin interface {
-	plugin.Plugin
+	hexagon.PluginPlugin
 	// OnMessage 消息预处理（入站）
 	OnMessage(ctx context.Context, msg *adapter.Message) (*adapter.Message, error)
 	// OnReply 回复后处理（出站）

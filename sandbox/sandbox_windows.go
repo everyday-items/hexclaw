@@ -14,11 +14,11 @@ import (
 )
 
 // windowsSandbox implements Sandbox using Win32 five-layer isolation:
-//   1. Restricted Token — strip privileges, Untrusted IL
-//   2. ACL — workspace-only read/write
-//   3. Job Object — memory/process limits + UI restrictions
-//   4. Low Box Token — kernel-level network isolation
-//   5. Alternate Desktop — GUI isolation
+//  1. Restricted Token — strip privileges, Untrusted IL
+//  2. ACL — workspace-only read/write
+//  3. Job Object — memory/process limits + UI restrictions
+//  4. Low Box Token — kernel-level network isolation
+//  5. Alternate Desktop — GUI isolation
 type windowsSandbox struct {
 	cfg    Config
 	policy WindowsSandboxPolicy

@@ -31,11 +31,11 @@ type Gateway interface {
 
 // Usage 资源使用记录
 type Usage struct {
-	Provider    string  // LLM Provider 名称
-	Model       string  // 模型名称
-	InputTokens int     // 输入 Token 数
-	OutputTokens int    // 输出 Token 数
-	Cost        float64 // 费用（美元）
+	Provider     string  // LLM Provider 名称
+	Model        string  // 模型名称
+	InputTokens  int     // 输入 Token 数
+	OutputTokens int     // 输出 Token 数
+	Cost         float64 // 费用（美元）
 }
 
 // GatewayError 网关拒绝错误

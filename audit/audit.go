@@ -42,12 +42,12 @@ const (
 type Category string
 
 const (
-	CategoryConfig    Category = "config"    // 配置安全
-	CategoryNetwork   Category = "network"   // 网络暴露
-	CategoryAuth      Category = "auth"      // 认证授权
-	CategoryTool      Category = "tool"      // 工具权限
-	CategoryData      Category = "data"      // 数据安全
-	CategoryRuntime   Category = "runtime"   // 运行时安全
+	CategoryConfig  Category = "config"  // 配置安全
+	CategoryNetwork Category = "network" // 网络暴露
+	CategoryAuth    Category = "auth"    // 认证授权
+	CategoryTool    Category = "tool"    // 工具权限
+	CategoryData    Category = "data"    // 数据安全
+	CategoryRuntime Category = "runtime" // 运行时安全
 )
 
 // Finding 审计发现
@@ -62,8 +62,8 @@ type Finding struct {
 
 // Report 审计报告
 type Report struct {
-	Timestamp time.Time `json:"timestamp"`  // 审计时间
-	Findings  []Finding `json:"findings"`   // 发现列表
+	Timestamp time.Time `json:"timestamp"`   // 审计时间
+	Findings  []Finding `json:"findings"`    // 发现列表
 	Duration  int64     `json:"duration_ms"` // 审计耗时（毫秒）
 }
 

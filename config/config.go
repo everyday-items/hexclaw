@@ -15,7 +15,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-
 // Config HexClaw 全局配置
 type Config struct {
 	Server     ServerConfig     `yaml:"server"`
@@ -43,9 +42,9 @@ type Config struct {
 
 // BudgetConfig 单任务三维预算控制 (G1 前置关卡)
 type BudgetConfig struct {
-	MaxTokens   int64  `yaml:"max_tokens"`   // 单任务 token 上限，0 表示使用默认值 500000
-	MaxDuration string `yaml:"max_duration"` // 单任务时间上限，如 "30m"，空表示使用默认值
-	MaxCost     float64 `yaml:"max_cost"`    // 单任务成本上限 USD，0 表示使用默认值 5.00
+	MaxTokens   int64   `yaml:"max_tokens"`   // 单任务 token 上限，0 表示使用默认值 500000
+	MaxDuration string  `yaml:"max_duration"` // 单任务时间上限，如 "30m"，空表示使用默认值
+	MaxCost     float64 `yaml:"max_cost"`     // 单任务成本上限 USD，0 表示使用默认值 5.00
 }
 
 // RouterConfig 多 Agent 路由配置
@@ -54,11 +53,11 @@ type BudgetConfig struct {
 // Agents 和 Rules 可在配置文件中静态声明，启动后也可通过 API 动态管理。
 // 所有 Agent 和 Rule 持久化到 SQLite，配置文件中的定义在首次启动时写入 DB。
 type RouterConfig struct {
-	Enabled        bool                `yaml:"enabled"`         // 是否启用多 Agent 路由
-	DefaultAgent   string              `yaml:"default_agent"`   // 默认 Agent 名称
-	LLMFallback    bool                `yaml:"llm_fallback"`    // 规则不命中时是否启用 LLM 语义路由
-	Agents         []AgentStaticConfig `yaml:"agents"`          // 静态 Agent 定义
-	Rules          []RuleStaticConfig  `yaml:"rules"`           // 静态路由规则
+	Enabled      bool                `yaml:"enabled"`       // 是否启用多 Agent 路由
+	DefaultAgent string              `yaml:"default_agent"` // 默认 Agent 名称
+	LLMFallback  bool                `yaml:"llm_fallback"`  // 规则不命中时是否启用 LLM 语义路由
+	Agents       []AgentStaticConfig `yaml:"agents"`        // 静态 Agent 定义
+	Rules        []RuleStaticConfig  `yaml:"rules"`         // 静态路由规则
 }
 
 // AgentStaticConfig 配置文件中的 Agent 声明
@@ -102,10 +101,10 @@ type AuditConfig struct {
 // 支持 STT（语音转文本）和 TTS（文本转语音）。
 // Provider: openai-whisper / azure-stt / openai-tts / azure-tts / edge-tts
 type VoiceConfig struct {
-	Enabled bool             `yaml:"enabled"`  // 是否启用语音
-	STT     VoiceSTTConfig   `yaml:"stt"`      // STT 配置
-	TTS     VoiceTTSConfig   `yaml:"tts"`      // TTS 配置
-	Wake    VoiceWakeConfig  `yaml:"wake"`     // 语音唤醒配置
+	Enabled bool            `yaml:"enabled"` // 是否启用语音
+	STT     VoiceSTTConfig  `yaml:"stt"`     // STT 配置
+	TTS     VoiceTTSConfig  `yaml:"tts"`     // TTS 配置
+	Wake    VoiceWakeConfig `yaml:"wake"`    // 语音唤醒配置
 }
 
 // VoiceSTTConfig STT 配置
@@ -137,10 +136,10 @@ type VoiceWakeConfig struct {
 // 支持安静时段设置，避免深夜打扰。
 type HeartbeatConfig struct {
 	Enabled      bool   `yaml:"enabled"`       // 是否启用心跳巡查
-	IntervalMins int    `yaml:"interval_mins"`  // 巡查间隔（分钟），默认 15
-	QuietStart   string `yaml:"quiet_start"`    // 安静时段开始（如 "22:00"），默认 ""
-	QuietEnd     string `yaml:"quiet_end"`      // 安静时段结束（如 "08:00"），默认 ""
-	Instructions string `yaml:"instructions"`   // 巡查指令（文本或文件路径）
+	IntervalMins int    `yaml:"interval_mins"` // 巡查间隔（分钟），默认 15
+	QuietStart   string `yaml:"quiet_start"`   // 安静时段开始（如 "22:00"），默认 ""
+	QuietEnd     string `yaml:"quiet_end"`     // 安静时段结束（如 "08:00"），默认 ""
+	Instructions string `yaml:"instructions"`  // 巡查指令（文本或文件路径）
 }
 
 // CronConfig 定时任务配置
@@ -173,18 +172,18 @@ type MCPConfig struct {
 
 // MCPServerConfig 单个 MCP Server 配置
 type MCPServerConfig struct {
-	Name      string          `yaml:"name"`      // 名称标识
-	Transport string          `yaml:"transport"` // 传输: stdio / sse / streamable
-	Command   string          `yaml:"command"`   // stdio 命令（如 npx, uvx）
-	Args      []string        `yaml:"args"`      // stdio 命令参数
-	Endpoint  string          `yaml:"endpoint"`  // sse/streamable 端点 URL
-	Enabled   bool            `yaml:"enabled"`   // 是否启用，默认 true
-	Auth      *MCPAuthConfig  `yaml:"auth,omitempty"` // OAuth 配置（可选）
+	Name      string         `yaml:"name"`           // 名称标识
+	Transport string         `yaml:"transport"`      // 传输: stdio / sse / streamable
+	Command   string         `yaml:"command"`        // stdio 命令（如 npx, uvx）
+	Args      []string       `yaml:"args"`           // stdio 命令参数
+	Endpoint  string         `yaml:"endpoint"`       // sse/streamable 端点 URL
+	Enabled   bool           `yaml:"enabled"`        // 是否启用，默认 true
+	Auth      *MCPAuthConfig `yaml:"auth,omitempty"` // OAuth 配置（可选）
 }
 
 // MCPAuthConfig MCP server OAuth 认证配置
 type MCPAuthConfig struct {
-	Type     string   `yaml:"type"`      // "oauth"
+	Type     string   `yaml:"type"` // "oauth"
 	ClientID string   `yaml:"client_id"`
 	AuthURL  string   `yaml:"auth_url"`
 	TokenURL string   `yaml:"token_url"`
@@ -223,21 +222,21 @@ type FileMemoryConfig struct {
 // 支持向量搜索 + FTS5 关键词搜索的混合检索模式。
 // 需要配置 Embedding Provider 来生成向量。
 type KnowledgeConfig struct {
-	Enabled       bool    `yaml:"enabled"`         // 是否启用知识库
-	ChunkSize     int     `yaml:"chunk_size"`      // 分块大小（字符数），默认 400
-	ChunkOverlap  int     `yaml:"chunk_overlap"`   // 分块重叠（字符数），默认 80
-	TopK          int     `yaml:"top_k"`           // 检索返回的最大 chunk 数，默认 3
-	VectorWeight  float64 `yaml:"vector_weight"`   // 向量搜索权重，默认 0.7
-	TextWeight    float64 `yaml:"text_weight"`     // 关键词搜索权重，默认 0.3
-	MMRLambda     float64 `yaml:"mmr_lambda"`      // MMR 多样性参数（0=最多样, 1=最相关），默认 0.7
-	TimeDecayDays int     `yaml:"time_decay_days"` // 时间衰减半衰期（天），默认 30，0=不衰减
-	Embedding     EmbeddingConfig `yaml:"embedding"` // Embedding 配置
+	Enabled       bool            `yaml:"enabled"`         // 是否启用知识库
+	ChunkSize     int             `yaml:"chunk_size"`      // 分块大小（字符数），默认 400
+	ChunkOverlap  int             `yaml:"chunk_overlap"`   // 分块重叠（字符数），默认 80
+	TopK          int             `yaml:"top_k"`           // 检索返回的最大 chunk 数，默认 3
+	VectorWeight  float64         `yaml:"vector_weight"`   // 向量搜索权重，默认 0.7
+	TextWeight    float64         `yaml:"text_weight"`     // 关键词搜索权重，默认 0.3
+	MMRLambda     float64         `yaml:"mmr_lambda"`      // MMR 多样性参数（0=最多样, 1=最相关），默认 0.7
+	TimeDecayDays int             `yaml:"time_decay_days"` // 时间衰减半衰期（天），默认 30，0=不衰减
+	Embedding     EmbeddingConfig `yaml:"embedding"`       // Embedding 配置
 }
 
 // EmbeddingConfig 向量嵌入配置
 type EmbeddingConfig struct {
-	Provider string `yaml:"provider"`  // 使用哪个 LLM Provider 生成 embedding
-	Model    string `yaml:"model"`     // Embedding 模型名称（如 text-embedding-3-small）
+	Provider string `yaml:"provider"` // 使用哪个 LLM Provider 生成 embedding
+	Model    string `yaml:"model"`    // Embedding 模型名称（如 text-embedding-3-small）
 }
 
 // ServerConfig 服务器配置
@@ -259,14 +258,23 @@ type LLMConfig struct {
 	Providers map[string]LLMProviderConfig `yaml:"providers"` // Provider 列表
 	Routing   LLMRoutingConfig             `yaml:"routing"`   // 智能路由
 	Cache     LLMCacheConfig               `yaml:"cache"`     // 语义缓存
+	Tools     LLMToolsConfig               `yaml:"tools"`     // 工具注入（全局）
+}
+
+// LLMToolsConfig 工具注入全局配置
+type LLMToolsConfig struct {
+	Enabled  string `yaml:"enabled" json:"enabled"`     // "auto"（默认）/ "on" / "off"
+	MaxTools int    `yaml:"max_tools" json:"max_tools"` // 最大注入工具数，0=不限制
 }
 
 // LLMProviderConfig 单个 LLM Provider 配置
 type LLMProviderConfig struct {
-	APIKey     string `yaml:"api_key"`    // API Key
-	BaseURL    string `yaml:"base_url"`   // 自定义 API 端点（支持中转/私有部署）
-	Model      string `yaml:"model"`      // 模型名称
-	Compatible string `yaml:"compatible"` // 兼容协议: "openai"（用于中转/私有部署）
+	APIKey       string `yaml:"api_key"`                 // API Key
+	BaseURL      string `yaml:"base_url"`                // 自定义 API 端点（支持中转/私有部署）
+	Model        string `yaml:"model"`                   // 模型名称
+	Compatible   string `yaml:"compatible"`              // 兼容协议: "openai"（用于中转/私有部署）
+	ToolsEnabled *bool  `yaml:"tools_enabled,omitempty"` // 是否启用工具注入（nil=自动判断, true=强制开启, false=强制关闭）
+	MaxTools     int    `yaml:"max_tools,omitempty"`     // 最大注入工具数（0=不限制）
 }
 
 // LLMRoutingConfig 智能路由配置
@@ -526,10 +534,10 @@ type RoleConfig struct {
 // AuthConfig 认证配置
 type AuthConfig struct {
 	Enabled        bool     `yaml:"enabled"`
-	Method         string   `yaml:"method"`          // token / oauth / api_key
+	Method         string   `yaml:"method"` // token / oauth / api_key
 	AllowAnonymous bool     `yaml:"allow_anonymous"`
-	Tokens         []string `yaml:"tokens"`           // 预配置的合法 Token 列表
-	Secret         string   `yaml:"secret"`           // HMAC-SHA256 签名密钥（用于签名 Token 验证）
+	Tokens         []string `yaml:"tokens"` // 预配置的合法 Token 列表
+	Secret         string   `yaml:"secret"` // HMAC-SHA256 签名密钥（用于签名 Token 验证）
 }
 
 // InjectionConfig Prompt 注入检测配置
@@ -552,9 +560,9 @@ type ContentFilterConfig struct {
 
 // CostConfig 成本控制配置
 type CostConfig struct {
-	BudgetPerUser  float64 `yaml:"budget_per_user"`  // 每用户每月预算
-	BudgetGlobal   float64 `yaml:"budget_global"`    // 全局每月预算
-	AlertThreshold float64 `yaml:"alert_threshold"`  // 告警阈值比例
+	BudgetPerUser  float64 `yaml:"budget_per_user"` // 每用户每月预算
+	BudgetGlobal   float64 `yaml:"budget_global"`   // 全局每月预算
+	AlertThreshold float64 `yaml:"alert_threshold"` // 告警阈值比例
 }
 
 // RateLimitConfig 速率限制配置
@@ -572,11 +580,11 @@ type SkillConfig struct {
 
 // SandboxConfig 沙箱配置
 type SandboxConfig struct {
-	Enabled    bool              `yaml:"enabled"`
-	Timeout    string            `yaml:"timeout"`
-	MaxMemory  string            `yaml:"max_memory"`
-	Network    SandboxNetwork    `yaml:"network"`
-	Filesystem SandboxFilesystem `yaml:"filesystem"`
+	Enabled    bool                 `yaml:"enabled"`
+	Timeout    string               `yaml:"timeout"`
+	MaxMemory  string               `yaml:"max_memory"`
+	Network    SandboxNetwork       `yaml:"network"`
+	Filesystem SandboxFilesystem    `yaml:"filesystem"`
 	Windows    WindowsSandboxConfig `yaml:"windows"` // Phase 8: Windows 专属配置
 }
 
@@ -592,11 +600,11 @@ type SandboxFilesystem struct {
 
 // WindowsSandboxConfig Windows 沙箱专属配置 (Phase 8)
 type WindowsSandboxConfig struct {
-	Mode       string `yaml:"mode"`          // readonly / workspace-write / full-access
-	NetworkMode string `yaml:"network_mode"` // offline / online
-	MemoryMB   int    `yaml:"memory_mb"`     // Job Object 内存限制 (MB)
-	MaxProcs   int    `yaml:"max_processes"`  // Job Object 进程数限制
-	UseDesktop bool   `yaml:"use_desktop"`   // 是否创建隔离桌面
+	Mode        string `yaml:"mode"`          // readonly / workspace-write / full-access
+	NetworkMode string `yaml:"network_mode"`  // offline / online
+	MemoryMB    int    `yaml:"memory_mb"`     // Job Object 内存限制 (MB)
+	MaxProcs    int    `yaml:"max_processes"` // Job Object 进程数限制
+	UseDesktop  bool   `yaml:"use_desktop"`   // 是否创建隔离桌面
 }
 
 // VerificationConfig Skill 签名验证配置
@@ -607,15 +615,15 @@ type VerificationConfig struct {
 
 // BuiltinConfig 内置 Skill 开关
 type BuiltinConfig struct {
-	Search    bool `yaml:"search"`
-	Weather   bool `yaml:"weather"`
-	Translate bool `yaml:"translate"`
-	Summary   bool `yaml:"summary"`
-	Browser   bool `yaml:"browser"`
-	Code      bool `yaml:"code"`
-	Shell     bool `yaml:"shell"`
-	CodeExec  bool `yaml:"code_exec"` // 沙箱代码执行 (需 sandbox 初始化)
-	FileOps   bool `yaml:"file_ops"`  // 文件读写编辑 (受限于 workspace)
+	Search         bool                 `yaml:"search"`
+	Weather        bool                 `yaml:"weather"`
+	Translate      bool                 `yaml:"translate"`
+	Summary        bool                 `yaml:"summary"`
+	Browser        bool                 `yaml:"browser"`
+	Code           bool                 `yaml:"code"`
+	Shell          bool                 `yaml:"shell"`
+	CodeExec       bool                 `yaml:"code_exec"` // 沙箱代码执行 (需 sandbox 初始化)
+	FileOps        bool                 `yaml:"file_ops"`  // 文件读写编辑 (受限于 workspace)
 	CodeExecPolicy CodeExecPolicyConfig `yaml:"code_exec_policy"`
 }
 

@@ -150,8 +150,8 @@ func (s *BrowserSkill) doFetch(ctx context.Context, targetURL string) (*skill.Re
 	return &skill.Result{
 		Content: text,
 		Metadata: map[string]string{
-			"url":         targetURL,
-			"status":      fmt.Sprintf("%d", resp.StatusCode),
+			"url":          targetURL,
+			"status":       fmt.Sprintf("%d", resp.StatusCode),
 			"content_type": resp.Header.Get("Content-Type"),
 		},
 	}, nil
@@ -246,15 +246,15 @@ func (s *BrowserSkill) doPost(ctx context.Context, targetURL string, args map[st
 // HTML 处理辅助函数
 
 var (
-	reTag      = regexp.MustCompile(`<[^>]*>`)
-	reSpace    = regexp.MustCompile(`\s{2,}`)
-	reScript   = regexp.MustCompile(`(?is)<script.*?</script>`)
-	reStyle    = regexp.MustCompile(`(?is)<style.*?</style>`)
-	reTitle    = regexp.MustCompile(`(?i)<title[^>]*>(.*?)</title>`)
-	reLink     = regexp.MustCompile(`(?i)<a[^>]+href=["']([^"']+)["']`)
-	reMeta     = regexp.MustCompile(`(?i)<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']`)
-	reMetaAlt  = regexp.MustCompile(`(?i)<meta[^>]+content=["']([^"']*)["'][^>]+name=["']description["']`)
-	reURL      = regexp.MustCompile(`https?://[^\s<>"']+`)
+	reTag     = regexp.MustCompile(`<[^>]*>`)
+	reSpace   = regexp.MustCompile(`\s{2,}`)
+	reScript  = regexp.MustCompile(`(?is)<script.*?</script>`)
+	reStyle   = regexp.MustCompile(`(?is)<style.*?</style>`)
+	reTitle   = regexp.MustCompile(`(?i)<title[^>]*>(.*?)</title>`)
+	reLink    = regexp.MustCompile(`(?i)<a[^>]+href=["']([^"']+)["']`)
+	reMeta    = regexp.MustCompile(`(?i)<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']`)
+	reMetaAlt = regexp.MustCompile(`(?i)<meta[^>]+content=["']([^"']*)["'][^>]+name=["']description["']`)
+	reURL     = regexp.MustCompile(`https?://[^\s<>"']+`)
 )
 
 func stripHTML(html string) string {

@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"strings"
 	"sync"
 	"time"
@@ -32,10 +32,10 @@ type VectorMemory struct {
 // VectorMemoryConfig 向量记忆配置
 type VectorMemoryConfig struct {
 	Enabled    bool    `yaml:"enabled"`
-	TopK       int     `yaml:"top_k"`        // 语义搜索返回的最大条目数，默认 5
-	MinScore   float32 `yaml:"min_score"`     // 最低相似度阈值，默认 0.7
-	Collection string  `yaml:"collection"`    // 向量集合名称
-	AutoSave   bool    `yaml:"auto_save"`     // 是否自动将对话保存到向量库
+	TopK       int     `yaml:"top_k"`      // 语义搜索返回的最大条目数，默认 5
+	MinScore   float32 `yaml:"min_score"`  // 最低相似度阈值，默认 0.7
+	Collection string  `yaml:"collection"` // 向量集合名称
+	AutoSave   bool    `yaml:"auto_save"`  // 是否自动将对话保存到向量库
 }
 
 // NewVectorMemory 创建向量语义记忆
@@ -173,8 +173,8 @@ type VectorSearchResult struct {
 // 提供统一的记忆读写和搜索接口。
 type LayeredMemory struct {
 	session *SessionContext // 第 1 层：会话上下文
-	file    *FileMemory    // 第 2/3 层：日记 + 长期记忆
-	vector  *VectorMemory  // 第 4 层：语义向量记忆（可选）
+	file    *FileMemory     // 第 2/3 层：日记 + 长期记忆
+	vector  *VectorMemory   // 第 4 层：语义向量记忆（可选）
 }
 
 // NewLayeredMemory 创建 4 层记忆管理器
@@ -223,7 +223,7 @@ func (lm *LayeredMemory) SemanticSearch(ctx context.Context, query string, topK 
 	if lm.vector != nil {
 		vResults, err := lm.vector.Search(ctx, query, topK)
 		if err != nil {
-			log.Printf("向量搜索失败: %v", err)
+			logger.Error("error", "error", err)
 		} else {
 			results = append(results, vResults...)
 		}

@@ -3,7 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 
 	hexagon "github.com/hexagon-codes/hexagon"
 )
@@ -70,4 +70,5 @@ func (m *Manager) InjectResourceContext(ctx context.Context) string {
 
 // Suppress unused import warning for hexagon
 var _ = hexagon.ConnectMCPStreamable
-func init() { _ = log.Println }
+
+func init() { _ = logger.Info }

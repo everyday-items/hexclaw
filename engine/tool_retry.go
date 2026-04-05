@@ -3,7 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"strings"
 	"time"
 
@@ -76,7 +76,7 @@ func (w *ToolRetryWrapper) Execute(
 		retry.Multiplier(2.0),
 		retry.RetryIf(isTransientError),
 		retry.OnRetry(func(n int, err error) {
-			log.Printf("[retry] %s attempt %d/%d: %v", toolName, n+1, maxRetries+1, err)
+			logger.Info("[retry]", "toolName", toolName, "value", n+1, "value", maxRetries+1, "error", err)
 		}),
 	)
 

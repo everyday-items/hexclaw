@@ -42,13 +42,41 @@ func (s *WeatherSkill) ToolDefinition() llm.ToolDefinition {
 }
 
 func (s *WeatherSkill) Match(content string) bool {
-	lower := strings.ToLower(content)
-	keywords := []string{"天气", "weather", "气温", "下雨", "下雪"}
-	for _, kw := range keywords {
-		if strings.Contains(lower, kw) {
+	lower := strings.ToLower(strings.TrimSpace(content))
+
+	// 编程意图关键词 — 包含这些词时说明用户想写代码，不是查天气
+	codeIndicators := []string{
+		"写", "代码", "脚本", "程序", "开发", "实现", "编程",
+		"��取", "爬虫", "api", "sdk", "接口", "调用",
+		"python", "java", "go ", "golang", "node", "javascript",
+		"rust", "c++", "swift", "kotlin", "typescript",
+		"function", "import", "class", "def ",
+	}
+	for _, ci := range codeIndicators {
+		if strings.Contains(lower, ci) {
+			return false
+		}
+	}
+
+	// 前缀匹配（与 SearchSkill / TranslateSkill 等保持一致）
+	prefixes := []string{"天气", "weather", "气温", "查天气", "看天气"}
+	for _, p := range prefixes {
+		if strings.HasPrefix(lower, p) {
 			return true
 		}
 	}
+
+	// 尾部句式匹配（"北京天气怎么样" "上海下雨吗"）
+	suffixes := []string{
+		"天气", "天气怎么样", "天气如何", "天气好吗",
+		"下雨吗", "下雪吗", "多少度", "冷吗", "热吗",
+	}
+	for _, sf := range suffixes {
+		if strings.HasSuffix(lower, sf) {
+			return true
+		}
+	}
+
 	return false
 }
 

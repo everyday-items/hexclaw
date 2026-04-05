@@ -18,8 +18,8 @@ type testSkill struct {
 }
 
 func (s *testSkill) Name() string        { return s.name }
-func (s *testSkill) Description() string  { return "test skill" }
-func (s *testSkill) Match(_ string) bool  { return false }
+func (s *testSkill) Description() string { return "test skill" }
+func (s *testSkill) Match(_ string) bool { return false }
 func (s *testSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition(s.name, "test", nil)
 }

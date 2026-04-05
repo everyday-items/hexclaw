@@ -13,11 +13,25 @@ import (
 // --- 会话管理 API ---
 
 func sessionUserIDFromRequest(r *http.Request) string {
+	// 优先从 query parameter 读取，其次从请求体 JSON 读取
 	userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
-	if userID == "" {
-		return "api-user"
+	if userID != "" {
+		return userID
 	}
-	return userID
+	return "api-user"
+}
+
+// sessionUserIDFromRequestOrBody 从 query 或 body 中提取 user_id
+func sessionUserIDFromRequestOrBody(r *http.Request, bodyUserID string) string {
+	userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
+	if userID != "" {
+		return userID
+	}
+	bodyUserID = strings.TrimSpace(bodyUserID)
+	if bodyUserID != "" {
+		return bodyUserID
+	}
+	return "api-user"
 }
 
 func validMessageFeedback(feedback string) bool {
@@ -149,6 +163,32 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleDeleteMessage 删除单条消息
+func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
+	messageID := r.PathValue("id")
+	if messageID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "消息 ID 不能为空",
+		})
+		return
+	}
+
+	if err := s.store.DeleteMessage(r.Context(), messageID); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{
+				"error": "消息不存在",
+			})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "删除消息失败: " + err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "消息已删除"})
+}
+
 type updateMessageFeedbackRequest struct {
 	Feedback string `json:"feedback"`
 }
@@ -192,6 +232,113 @@ func (s *Server) handleUpdateMessageFeedback(w http.ResponseWriter, r *http.Requ
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"message": "反馈已更新",
+	})
+}
+
+// --- 创建 / 更新会话 API ---
+
+// createSessionRequest 创建会话请求
+type createSessionRequest struct {
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	UserID string `json:"user_id"`
+}
+
+// handleCreateSession 创建新会话
+func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
+	var req createSessionRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "请求格式错误: " + err.Error(),
+		})
+		return
+	}
+	if req.ID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "id 不能为空",
+		})
+		return
+	}
+
+	userID := sessionUserIDFromRequestOrBody(r, req.UserID)
+	sess := &storage.Session{
+		ID:       req.ID,
+		UserID:   userID,
+		Platform: "web",
+		Title:    req.Title,
+		Status:   1,
+	}
+	if err := s.store.CreateSession(r.Context(), sess); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "创建会话失败: " + err.Error(),
+		})
+		return
+	}
+
+	// 重新读取以获取数据库生成的 created_at
+	created, err := s.store.GetSession(r.Context(), req.ID)
+	if err != nil {
+		// 创建成功但读取失败，返回原始对象
+		writeJSON(w, http.StatusCreated, map[string]string{
+			"id":         sess.ID,
+			"title":      sess.Title,
+			"created_at": sess.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{
+		"id":         created.ID,
+		"title":      created.Title,
+		"created_at": created.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+	})
+}
+
+// updateSessionRequest 更新会话请求
+type updateSessionRequest struct {
+	Title string `json:"title"`
+}
+
+// handleUpdateSession 更新会话（标题）
+func (s *Server) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	userID := sessionUserIDFromRequest(r)
+
+	sess, err := s.getOwnedSession(r, id, userID)
+	if err != nil {
+		writeSessionLookupError(w, err)
+		return
+	}
+
+	var req updateSessionRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "请求格式错误: " + err.Error(),
+		})
+		return
+	}
+
+	sess.Title = req.Title
+	if err := s.store.UpdateSession(r.Context(), sess); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "更新会话失败: " + err.Error(),
+		})
+		return
+	}
+
+	// 重新读取以获取数据库更新的 updated_at
+	updated, err := s.store.GetSession(r.Context(), id)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]string{
+			"id":         sess.ID,
+			"title":      sess.Title,
+			"updated_at": sess.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id":         updated.ID,
+		"title":      updated.Title,
+		"updated_at": updated.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 	})
 }
 

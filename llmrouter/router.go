@@ -15,7 +15,7 @@ package llmrouter
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"sort"
 	"strings"
 	"sync"
@@ -109,10 +109,10 @@ func buildSelectorState(cfg config.LLMConfig) (map[string]hexagon.Provider, conf
 	providerNames := make([]string, 0, len(cfg.Providers))
 	for name, pc := range cfg.Providers {
 		if strings.TrimSpace(pc.APIKey) == "" && !isLocalProvider(pc) {
-			log.Printf("[router] 跳过无 API Key 的远程 provider: %s (base_url=%s)", name, pc.BaseURL)
+			logger.Warn("[router] 跳过无 API Key 的远程 provider", "provider", name, "base_url", pc.BaseURL)
 			continue
 		}
-		log.Printf("[router] 加载 provider: %s (base_url=%s, local=%v)", name, pc.BaseURL, isLocalProvider(pc))
+		logger.Info("[router] 加载 provider", "provider", name, "base_url", pc.BaseURL, "local", isLocalProvider(pc))
 		providerNames = append(providerNames, name)
 		activeCfg.Providers[name] = pc
 	}
@@ -126,7 +126,7 @@ func buildSelectorState(cfg config.LLMConfig) (map[string]hexagon.Provider, conf
 	if _, ok := providers[defaultP]; !ok {
 		if len(providerNames) > 0 {
 			defaultP = providerNames[0]
-			log.Printf("默认 Provider 不可用，已切换到: %s", defaultP)
+			logger.Info("默认 Provider 不可用，已切换到", "provider", defaultP)
 		} else {
 			defaultP = ""
 		}
@@ -222,7 +222,7 @@ func (r *Selector) Route(_ context.Context) (hexagon.Provider, string, error) {
 		priorities = latencyPriority
 	default:
 		// 未知策略，回退到默认 Provider
-		log.Printf("未知路由策略 %q，使用默认 Provider", strategy)
+		logger.Info("未知路由策略", "strategy", strategy)
 		p, ok := r.providers[r.defaultP]
 		if !ok {
 			return nil, "", fmt.Errorf("默认 Provider %s 不可用", r.defaultP)

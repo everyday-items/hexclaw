@@ -15,7 +15,7 @@ type AddCronJobRequest struct {
 	Schedule string `json:"schedule"` // cron 表达式或 @every/@daily 等
 	Prompt   string `json:"prompt"`   // Agent 处理指令
 	UserID   string `json:"user_id"`
-	Type     string `json:"type"`     // cron 或 once
+	Type     string `json:"type"` // cron 或 once
 }
 
 // handleListCronJobs 列出定时任务

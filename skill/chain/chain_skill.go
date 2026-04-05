@@ -22,8 +22,8 @@ func NewChainSkill(def *ChainDef, executor *Executor) *ChainSkill {
 }
 
 func (s *ChainSkill) Name() string        { return s.def.Name }
-func (s *ChainSkill) Description() string  { return s.def.Description }
-func (s *ChainSkill) Match(_ string) bool  { return false }
+func (s *ChainSkill) Description() string { return s.def.Description }
+func (s *ChainSkill) Match(_ string) bool { return false }
 
 func (s *ChainSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition(s.def.Name, s.def.Description, &llm.Schema{

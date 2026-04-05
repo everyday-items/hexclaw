@@ -11,6 +11,7 @@
 //   - POST   /api/v1/sessions/{id}/fork         创建对话分支
 //   - GET    /api/v1/sessions/{id}/checkpoints  检查点列表
 //   - GET    /api/v1/messages/search            全文搜索消息
+//   - DELETE /api/v1/messages/{id}              删除单条消息
 //   - GET    /api/v1/budget/status              预算使用状态
 //   - GET    /api/v1/tools/cache/stats          工具缓存统计
 //   - GET    /api/v1/tools/metrics              工具调用指标
@@ -24,7 +25,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"net"
 	"net/http"
 	"os"
@@ -60,32 +61,32 @@ type Server struct {
 	cfg           *config.Config
 	engine        engine.Engine
 	gateway       gateway.Gateway
-	store         storage.Store            // 数据存储层
-	kb            *knowledge.Manager       // 知识库管理器（可选）
-	webhookMgr    *webhook.Manager         // Webhook 管理器（可选）
-	scheduler     *cron.Scheduler          // Cron 调度器（可选）
-	fileMem       *memory.FileMemory       // 文件记忆（可选）
-	vectorMem     *memory.VectorMemory     // 向量语义记忆（可选）
-	mcpMgr        *hexmcp.Manager          // MCP 管理器（可选）
-	mp            *marketplace.Marketplace // 技能市场（可选）
-	skillHub      *hub.Hub                 // 在线技能市场（可选）
-	agentRouter   *router.Dispatcher       // 多 Agent 路由器（可选）
-	agentStore    router.Store             // Agent/Rule 持久化（可选）
-	instanceMgr   *instances.Manager       // 平台实例运行时（可选）
-	canvasSvc     *canvas.Service          // Canvas/A2UI 服务（可选）
-	voiceSvc      *voice.Service           // 语音服务（可选）
-	desktopSvc    *desktop.Service         // 桌面集成服务（可选）
-	cfgWriter     *config.Writer           // 配置文件写入器（MCP 持久化用）
-	wsHandler     http.Handler             // WebSocket Handler（可选）
-	logCollector  *LogCollector            // 日志收集器
-	workflowStore *WorkflowStore           // 工作流存储
-	teamStore     *TeamStore               // 团队数据存储
-	budgetCtrl    *engine.BudgetController // 预算控制器（可选）
-	toolCache     *engine.ToolCache        // 工具缓存（可选）
+	store         storage.Store                // 数据存储层
+	kb            *knowledge.Manager           // 知识库管理器（可选）
+	webhookMgr    *webhook.Manager             // Webhook 管理器（可选）
+	scheduler     *cron.Scheduler              // Cron 调度器（可选）
+	fileMem       *memory.FileMemory           // 文件记忆（可选）
+	vectorMem     *memory.VectorMemory         // 向量语义记忆（可选）
+	mcpMgr        *hexmcp.Manager              // MCP 管理器（可选）
+	mp            *marketplace.Marketplace     // 技能市场（可选）
+	skillHub      *hub.Hub                     // 在线技能市场（可选）
+	agentRouter   *router.Dispatcher           // 多 Agent 路由器（可选）
+	agentStore    router.Store                 // Agent/Rule 持久化（可选）
+	instanceMgr   *instances.Manager           // 平台实例运行时（可选）
+	canvasSvc     *canvas.Service              // Canvas/A2UI 服务（可选）
+	voiceSvc      *voice.Service               // 语音服务（可选）
+	desktopSvc    *desktop.Service             // 桌面集成服务（可选）
+	cfgWriter     *config.Writer               // 配置文件写入器（MCP 持久化用）
+	wsHandler     http.Handler                 // WebSocket Handler（可选）
+	logCollector  *LogCollector                // 日志收集器
+	workflowStore *WorkflowStore               // 工作流存储
+	teamStore     *TeamStore                   // 团队数据存储
+	budgetCtrl    *engine.BudgetController     // 预算控制器（可选）
+	toolCache     *engine.ToolCache            // 工具缓存（可选）
 	toolMetrics   *engine.ToolMetricsCollector // 工具指标（可选）
-	toolPerms     *engine.ToolPermissions  // 工具权限（可选）
-	checkpointMgr *engine.CheckpointManager // 检查点管理器（可选）
-	version       string                   // 版本号
+	toolPerms     *engine.ToolPermissions      // 工具权限（可选）
+	checkpointMgr *engine.CheckpointManager    // 检查点管理器（可选）
+	version       string                       // 版本号
 	server        *http.Server
 	statsMu       sync.Mutex
 	statsCache    statsResponse
@@ -103,10 +104,10 @@ func NewServer(cfg *config.Config, eng engine.Engine, gw gateway.Gateway, store 
 	// 挂载日志文件持久化 (JSONL + 轮转)
 	sink, err := NewLogFileSink(LogFileSinkConfig{})
 	if err != nil {
-		log.Printf("[warn] 日志文件持久化初始化失败: %v (仅使用内存日志)", err)
+		logger.Error("[warn] 日志文件持久化初始化失败", "error", err)
 	} else {
 		AttachToCollector(collector, sink)
-		log.Printf("[info] 日志文件: %s (10MB 轮转, 保留 100 份)", sink.Path())
+		logger.Info("[info] 日志文件", "path", sink.Path())
 	}
 
 	return &Server{
@@ -301,13 +302,16 @@ func (s *Server) routes() http.Handler {
 
 	// 会话 / 搜索 / 分支 API
 	if s.store != nil {
+		mux.HandleFunc("POST /api/v1/sessions", s.handleCreateSession)
 		mux.HandleFunc("GET /api/v1/sessions", s.handleListSessions)
 		mux.HandleFunc("GET /api/v1/sessions/{id}", s.handleGetSession)
+		mux.HandleFunc("PATCH /api/v1/sessions/{id}", s.handleUpdateSession)
 		mux.HandleFunc("DELETE /api/v1/sessions/{id}", s.handleDeleteSession)
 		mux.HandleFunc("GET /api/v1/sessions/{id}/messages", s.handleListMessages)
 		mux.HandleFunc("GET /api/v1/sessions/{id}/branches", s.handleListBranches)
 		mux.HandleFunc("POST /api/v1/sessions/{id}/fork", s.handleForkSession)
 		mux.HandleFunc("GET /api/v1/messages/search", s.handleSearchMessages)
+		mux.HandleFunc("DELETE /api/v1/messages/{id}", s.handleDeleteMessage)
 		mux.HandleFunc("PUT /api/v1/messages/{id}/feedback", s.handleUpdateMessageFeedback)
 	}
 
@@ -466,6 +470,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/ollama/running", s.handleOllamaRunning)
 	mux.HandleFunc("POST /api/v1/ollama/unload", s.handleOllamaUnload)
 	mux.HandleFunc("DELETE /api/v1/ollama/models/{name}", s.handleOllamaDelete)
+	mux.HandleFunc("POST /api/v1/ollama/restart", s.handleOllamaRestart)
 
 	// ClawHub 搜索（Skill 市场）
 	mux.HandleFunc("GET /api/v1/clawhub/search", s.handleClawHubSearch)
@@ -526,20 +531,22 @@ func (s *Server) routes() http.Handler {
 // 注册路由并开始监听。此方法会阻塞直到服务器停止。
 // 使用 Stop() 方法触发优雅关闭。
 func (s *Server) Start(ctx context.Context) error {
+	s.server = s.buildHTTPServer(ctx)
+	return s.server.ListenAndServe()
+}
+
+func (s *Server) buildHTTPServer(ctx context.Context) *http.Server {
 	handler := s.routes()
 	addr := fmt.Sprintf("%s:%d", s.cfg.Server.Host, s.cfg.Server.Port)
-	s.server = &http.Server{
+	return &http.Server{
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      120 * time.Second, // 流式输出需要更长的超时
 		IdleTimeout:       120 * time.Second,
 		BaseContext: func(_ net.Listener) context.Context {
 			return ctx
 		},
 	}
-
-	return s.server.ListenAndServe()
 }
 
 // emptyList 返回空列表响应（用于未启用模块的 fallback）
@@ -708,7 +715,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			trace.L(ctx).Error("处理失败", "err", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{
-				"error": upstreamerr.PublicMessage(err, "处理消息失败"),
+				"error": upstreamerr.PublicMessage(err, "error"),
 			})
 			return
 		}
@@ -721,7 +728,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if chunk.Error != nil {
 				trace.L(ctx).Error("处理失败", "err", chunk.Error)
 				writeJSON(w, http.StatusInternalServerError, map[string]string{
-					"error": upstreamerr.PublicMessage(chunk.Error, "处理消息失败"),
+					"error": upstreamerr.PublicMessage(chunk.Error, "error"),
 				})
 				return
 			}
@@ -745,7 +752,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			trace.L(ctx).Error("处理失败", "err", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{
-				"error": upstreamerr.PublicMessage(err, "处理消息失败"),
+				"error": upstreamerr.PublicMessage(err, "error"),
 			})
 			return
 		}
@@ -893,7 +900,7 @@ func (s *Server) apiAuthMiddleware(next http.Handler) http.Handler {
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	body, err := json.Marshal(data)
 	if err != nil {
-		log.Printf("writeJSON encode error: %v", err)
+		logger.Error("writeJSON encode error", "error", err)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte("{\"error\":\"响应序列化失败\"}\n"))

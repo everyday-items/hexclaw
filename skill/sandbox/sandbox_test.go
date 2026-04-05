@@ -12,8 +12,8 @@ import (
 
 // mockSkill 测试用 Skill
 type mockSkill struct {
-	name     string
-	execFn   func(ctx context.Context, args map[string]any) (*skill.Result, error)
+	name   string
+	execFn func(ctx context.Context, args map[string]any) (*skill.Result, error)
 }
 
 func (s *mockSkill) Name() string        { return s.name }

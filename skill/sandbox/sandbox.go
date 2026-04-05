@@ -13,7 +13,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -48,10 +48,10 @@ func New(cfg config.SandboxConfig) (*Sandbox, error) {
 
 // Result 沙箱执行结果
 type Result struct {
-	*skill.Result              // 嵌入原始 Skill 结果
-	Duration  time.Duration    // 执行耗时
-	Recovered bool            // 是否从 panic 恢复
-	Error     error            // 执行错误
+	*skill.Result               // 嵌入原始 Skill 结果
+	Duration      time.Duration // 执行耗时
+	Recovered     bool          // 是否从 panic 恢复
+	Error         error         // 执行错误
 }
 
 // Execute 在沙箱中执行 Skill
@@ -99,7 +99,7 @@ func (s *Sandbox) Execute(ctx context.Context, sk skill.Skill, args map[string]a
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("沙箱: Skill %q panic 已恢复: %v", sk.Name(), r)
+				logger.Info("沙箱: Skill", "name", sk.Name(), "已恢复", r)
 				ch <- execResult{
 					err:       fmt.Errorf("skill 执行异常: %v", r),
 					recovered: true,

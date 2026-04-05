@@ -2,7 +2,7 @@ package api
 
 import (
 	"encoding/json"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -78,15 +78,15 @@ func (ts *TeamStore) saveJSON(filename string, data any) {
 	path := filepath.Join(ts.dataDir, filename)
 	body, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
-		log.Printf("TeamStore: marshal %s 失败: %v", filename, err)
+		logger.Error("TeamStore: marshal", "filename", filename, "error", err)
 		return
 	}
 	if err := os.MkdirAll(ts.dataDir, 0o755); err != nil {
-		log.Printf("TeamStore: 创建目录 %s 失败: %v", ts.dataDir, err)
+		logger.Error("TeamStore: 创建目录", "data_dir", ts.dataDir, "error", err)
 		return
 	}
 	if err := os.WriteFile(path, body, 0o644); err != nil {
-		log.Printf("TeamStore: 写入 %s 失败: %v", path, err)
+		logger.Error("TeamStore: 写入", "path", path, "error", err)
 	}
 }
 

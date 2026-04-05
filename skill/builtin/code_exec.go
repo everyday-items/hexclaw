@@ -25,9 +25,11 @@ func NewCodeExecSkill(sb sandbox.Sandbox) *CodeExecSkill {
 	return &CodeExecSkill{sb: sb}
 }
 
-func (s *CodeExecSkill) Name() string        { return "code_exec" }
-func (s *CodeExecSkill) Description() string  { return "Execute code in a sandboxed environment (Python, JavaScript, Go)" }
-func (s *CodeExecSkill) Match(_ string) bool  { return false } // LLM-only, no keyword trigger
+func (s *CodeExecSkill) Name() string { return "code_exec" }
+func (s *CodeExecSkill) Description() string {
+	return "Execute code in a sandboxed environment (Python, JavaScript, Go)"
+}
+func (s *CodeExecSkill) Match(_ string) bool { return false } // LLM-only, no keyword trigger
 
 func (s *CodeExecSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition("code_exec", "Execute code in a sandboxed environment. Supports Python, JavaScript, and Go.", &llm.Schema{

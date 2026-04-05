@@ -14,9 +14,9 @@ import (
 // User Interface Privilege Isolation (UIPI) blocks low→high integrity messages.
 
 var (
-	modUser32           = syscall.NewLazyDLL("user32.dll")
-	procCreateDesktopW  = modUser32.NewProc("CreateDesktopW")
-	procCloseDesktop    = modUser32.NewProc("CloseDesktop")
+	modUser32          = syscall.NewLazyDLL("user32.dll")
+	procCreateDesktopW = modUser32.NewProc("CreateDesktopW")
+	procCloseDesktop   = modUser32.NewProc("CloseDesktop")
 )
 
 const (

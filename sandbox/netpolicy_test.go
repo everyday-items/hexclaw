@@ -131,9 +131,9 @@ func TestIsAllowed_BlacklistOverridesWhitelist(t *testing.T) {
 
 func TestIsAllowed_PortFilter(t *testing.T) {
 	p := &NetPolicy{
-		Mode:            "allow-all",
-		AllowedPorts:    []int{80, 443},
-		counters:        make(map[string]*rateBucket),
+		Mode:         "allow-all",
+		AllowedPorts: []int{80, 443},
+		counters:     make(map[string]*rateBucket),
 	}
 
 	if p.IsAllowed("example.com", 8080) {

@@ -17,7 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"net/http"
 	"os/exec"
 	"runtime"
@@ -309,7 +309,7 @@ func sendSystemNotification(title, body string) {
 	}
 
 	if err := cmd.Start(); err != nil {
-		log.Printf("发送系统通知失败: %v", err)
+		logger.Error("error", "error", err)
 		return
 	}
 	go cmd.Wait()

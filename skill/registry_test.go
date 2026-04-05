@@ -11,9 +11,9 @@ import (
 
 // mockSkill 测试用 Skill 实现
 type mockSkill struct {
-	name    string
-	desc    string
-	prefix  string // Match 匹配的前缀
+	name   string
+	desc   string
+	prefix string // Match 匹配的前缀
 }
 
 func (s *mockSkill) Name() string        { return s.name }

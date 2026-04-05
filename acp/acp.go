@@ -48,7 +48,7 @@ type Handler func(ctx context.Context, msg *Message) (*Message, error)
 type Bus struct {
 	mu       sync.RWMutex
 	handlers map[string]Handler       // agent name → handler
-	pending  map[string]chan *Message  // msg ID → response channel
+	pending  map[string]chan *Message // msg ID → response channel
 }
 
 // NewBus 创建消息总线

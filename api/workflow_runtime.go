@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexagon"
-	hxgraph "github.com/hexagon-codes/hexagon/orchestration/graph"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 )
@@ -117,7 +116,7 @@ func (e *workflowExecutor) execute(ctx context.Context, run *WorkflowRun) *Workf
 		return e.failedRun(run, err)
 	}
 
-	state := hxgraph.MapState{
+	state := hexagon.MapState{
 		stateKeyInput:          e.req.Input,
 		stateKeyNodeOutputs:    map[string]string{},
 		stateKeyNodeHandoffs:   map[string]string{},
@@ -259,29 +258,29 @@ func (e *workflowExecutor) buildStages() error {
 	return nil
 }
 
-func (e *workflowExecutor) buildGraph() (*hxgraph.Graph[hxgraph.MapState], error) {
-	builder := hexagon.NewGraph[hxgraph.MapState](e.wf.Name)
+func (e *workflowExecutor) buildGraph() (*hexagon.Graph[hexagon.MapState], error) {
+	builder := hexagon.NewGraph[hexagon.MapState](e.wf.Name)
 
 	for _, stage := range e.stages {
 		if len(stage.NodeIDs) == 1 {
 			nodeID := stage.NodeIDs[0]
-			builder.AddNode(stage.ID, func(ctx context.Context, state hxgraph.MapState) (hxgraph.MapState, error) {
+			builder.AddNode(stage.ID, func(ctx context.Context, state hexagon.MapState) (hexagon.MapState, error) {
 				return e.executeNode(ctx, state, e.nodes[nodeID])
 			})
 			continue
 		}
 
-		handlers := make([]hxgraph.NodeHandler[hxgraph.MapState], 0, len(stage.NodeIDs))
+		handlers := make([]hexagon.NodeHandler[hexagon.MapState], 0, len(stage.NodeIDs))
 		for _, nodeID := range stage.NodeIDs {
 			id := nodeID
-			handlers = append(handlers, func(ctx context.Context, state hxgraph.MapState) (hxgraph.MapState, error) {
+			handlers = append(handlers, func(ctx context.Context, state hexagon.MapState) (hexagon.MapState, error) {
 				return e.executeNode(ctx, state, e.nodes[id])
 			})
 		}
 
-		builder.AddNodeWithBuilder(hxgraph.ParallelNodeWithMerger(
+		builder.AddNodeWithBuilder(hexagon.ParallelNodeWithMerger(
 			stage.ID,
-			func(original hxgraph.MapState, outputs []hxgraph.MapState) hxgraph.MapState {
+			func(original hexagon.MapState, outputs []hexagon.MapState) hexagon.MapState {
 				return mergeWorkflowStates(original, outputs)
 			},
 			handlers...,
@@ -296,7 +295,7 @@ func (e *workflowExecutor) buildGraph() (*hxgraph.Graph[hxgraph.MapState], error
 	return builder.Build()
 }
 
-func (e *workflowExecutor) executeNode(ctx context.Context, state hxgraph.MapState, node *workflowNode) (hxgraph.MapState, error) {
+func (e *workflowExecutor) executeNode(ctx context.Context, state hexagon.MapState, node *workflowNode) (hexagon.MapState, error) {
 	if node == nil {
 		return state, nil
 	}
@@ -390,7 +389,7 @@ func (e *workflowExecutor) executeAgent(ctx context.Context, node *workflowNode,
 	return reply.Content, nil
 }
 
-func (e *workflowExecutor) executeTool(ctx context.Context, node *workflowNode, inputText string, state hxgraph.MapState) (string, error) {
+func (e *workflowExecutor) executeTool(ctx context.Context, node *workflowNode, inputText string, state hexagon.MapState) (string, error) {
 	if e.server.mcpMgr == nil {
 		return "", fmt.Errorf("mcp manager 未初始化")
 	}
@@ -452,7 +451,7 @@ func (e *workflowExecutor) successorAgentRoles(nodeID string) []string {
 	return roles
 }
 
-func (e *workflowExecutor) resolveNodeInput(state hxgraph.MapState, node *workflowNode) string {
+func (e *workflowExecutor) resolveNodeInput(state hexagon.MapState, node *workflowNode) string {
 	upstream := e.upstreamOutputs(state, node.ID)
 	rendered := renderTemplate(firstNonEmpty(stringValue(node.Data["prompt"]), stringValue(node.Data["input"])), state)
 	switch {
@@ -469,7 +468,7 @@ func (e *workflowExecutor) resolveNodeInput(state hxgraph.MapState, node *workfl
 	}
 }
 
-func (e *workflowExecutor) upstreamOutputs(state hxgraph.MapState, nodeID string) string {
+func (e *workflowExecutor) upstreamOutputs(state hexagon.MapState, nodeID string) string {
 	outputs := stringMapStateValue(state, stateKeyNodeOutputs)
 	preds := append([]string(nil), e.incoming[nodeID]...)
 	sort.Slice(preds, func(i, j int) bool {
@@ -485,7 +484,7 @@ func (e *workflowExecutor) upstreamOutputs(state hxgraph.MapState, nodeID string
 	return strings.Join(parts, "\n\n")
 }
 
-func (e *workflowExecutor) selectedHandoffForNode(state hxgraph.MapState, node *workflowNode) string {
+func (e *workflowExecutor) selectedHandoffForNode(state hexagon.MapState, node *workflowNode) string {
 	handoffs := stringMapStateValue(state, stateKeyNodeHandoffs)
 	preds := append([]string(nil), e.incoming[node.ID]...)
 	sort.Slice(preds, func(i, j int) bool {
@@ -513,7 +512,7 @@ func (e *workflowExecutor) selectedHandoffForNode(state hxgraph.MapState, node *
 	return ""
 }
 
-func (e *workflowExecutor) collectFinalOutput(state hxgraph.MapState) string {
+func (e *workflowExecutor) collectFinalOutput(state hexagon.MapState) string {
 	outputs := stringMapStateValue(state, stateKeyNodeOutputs)
 	var selected []string
 	for _, sink := range e.sinks {
@@ -606,8 +605,8 @@ func (e *workflowExecutor) listNodeRuns() []WorkflowNodeRun {
 	return list
 }
 
-func mergeWorkflowStates(original hxgraph.MapState, outputs []hxgraph.MapState) hxgraph.MapState {
-	merged := original.Clone().(hxgraph.MapState)
+func mergeWorkflowStates(original hexagon.MapState, outputs []hexagon.MapState) hexagon.MapState {
+	merged := original.Clone().(hexagon.MapState)
 	combinedOutputs := stringMapStateValue(merged, stateKeyNodeOutputs)
 	combinedHandoffs := stringMapStateValue(merged, stateKeyNodeHandoffs)
 	var workflowOutputs []string
@@ -632,7 +631,7 @@ func mergeWorkflowStates(original hxgraph.MapState, outputs []hxgraph.MapState) 
 	return merged
 }
 
-func stringMapStateValue(state hxgraph.MapState, key string) map[string]string {
+func stringMapStateValue(state hexagon.MapState, key string) map[string]string {
 	if state == nil {
 		return map[string]string{}
 	}
@@ -645,15 +644,15 @@ func stringMapStateValue(state hxgraph.MapState, key string) map[string]string {
 	return dst
 }
 
-func putStringMapStateValue(state hxgraph.MapState, key, entryKey, entryValue string) hxgraph.MapState {
-	next := state.Clone().(hxgraph.MapState)
+func putStringMapStateValue(state hexagon.MapState, key, entryKey, entryValue string) hexagon.MapState {
+	next := state.Clone().(hexagon.MapState)
 	values := stringMapStateValue(next, key)
 	values[entryKey] = entryValue
 	next.Set(key, values)
 	return next
 }
 
-func stringStateValue(state hxgraph.MapState, key string) string {
+func stringStateValue(state hexagon.MapState, key string) string {
 	if state == nil {
 		return ""
 	}
@@ -662,13 +661,13 @@ func stringStateValue(state hxgraph.MapState, key string) string {
 	return s
 }
 
-func setStringStateValue(state hxgraph.MapState, key, value string) hxgraph.MapState {
-	next := state.Clone().(hxgraph.MapState)
+func setStringStateValue(state hexagon.MapState, key, value string) hexagon.MapState {
+	next := state.Clone().(hexagon.MapState)
 	next.Set(key, value)
 	return next
 }
 
-func renderTemplate(input string, state hxgraph.MapState) string {
+func renderTemplate(input string, state hexagon.MapState) string {
 	if input == "" {
 		return ""
 	}
@@ -703,7 +702,7 @@ func renderTemplate(input string, state hxgraph.MapState) string {
 	return strings.NewReplacer(replacements...).Replace(input)
 }
 
-func renderValue(v any, state hxgraph.MapState) any {
+func renderValue(v any, state hexagon.MapState) any {
 	switch x := v.(type) {
 	case string:
 		return renderTemplate(x, state)

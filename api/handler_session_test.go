@@ -272,6 +272,164 @@ func TestGetSession_StorageErrorReturns500(t *testing.T) {
 	}
 }
 
+// --- 创建会话测试 ---
+
+func TestCreateSession_Success(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	body := `{"id":"sess-new","title":"新会话"}`
+	req := httptest.NewRequest("POST", "/api/v1/sessions?user_id=test", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.handleCreateSession(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("期望 201，实际 %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["id"] != "sess-new" {
+		t.Errorf("id=%q, want sess-new", resp["id"])
+	}
+	if resp["title"] != "新会话" {
+		t.Errorf("title=%q, want 新会话", resp["title"])
+	}
+	if resp["created_at"] == "" {
+		t.Error("created_at 不应为空")
+	}
+}
+
+func TestCreateSession_MissingID(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	body := `{"title":"无 ID"}`
+	req := httptest.NewRequest("POST", "/api/v1/sessions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.handleCreateSession(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("缺少 id 应返回 400，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateSession_EmptyBody(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	req := httptest.NewRequest("POST", "/api/v1/sessions", strings.NewReader(""))
+	w := httptest.NewRecorder()
+	srv.handleCreateSession(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("空 body 应返回 400，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// --- 更新会话测试 ---
+
+func TestUpdateSession_Success(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	// 先创建会话
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-update", UserID: "test", Platform: "web", Title: "旧标题",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+
+	body := `{"title":"新标题"}`
+	req := httptest.NewRequest("PATCH", "/api/v1/sessions/sess-update?user_id=test", strings.NewReader(body))
+	req.SetPathValue("id", "sess-update")
+	w := httptest.NewRecorder()
+	srv.handleUpdateSession(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["title"] != "新标题" {
+		t.Errorf("title=%q, want 新标题", resp["title"])
+	}
+	if resp["updated_at"] == "" {
+		t.Error("updated_at 不应为空")
+	}
+}
+
+func TestUpdateSession_NotFound(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	body := `{"title":"新标题"}`
+	req := httptest.NewRequest("PATCH", "/api/v1/sessions/nonexistent?user_id=test", strings.NewReader(body))
+	req.SetPathValue("id", "nonexistent")
+	w := httptest.NewRecorder()
+	srv.handleUpdateSession(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("不存在的会话应返回 404，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestUpdateSession_CrossUser(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-private", UserID: "user-a", Platform: "web", Title: "机密",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+
+	body := `{"title":"被篡改"}`
+	req := httptest.NewRequest("PATCH", "/api/v1/sessions/sess-private?user_id=user-b", strings.NewReader(body))
+	req.SetPathValue("id", "sess-private")
+	w := httptest.NewRecorder()
+	srv.handleUpdateSession(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("跨用户更新应返回 404，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestUpdateSession_EmptyBody(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-empty-body", UserID: "test", Platform: "web", Title: "原标题",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+
+	req := httptest.NewRequest("PATCH", "/api/v1/sessions/sess-empty-body?user_id=test", strings.NewReader(""))
+	req.SetPathValue("id", "sess-empty-body")
+	w := httptest.NewRecorder()
+	srv.handleUpdateSession(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("空 body 应返回 400，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // 测试 ChatResponse 中 Usage 的序列化
 func TestChatResponse_UsageSerialization(t *testing.T) {
 	cfg := config.DefaultConfig()

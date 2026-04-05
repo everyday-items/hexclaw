@@ -24,8 +24,9 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -47,7 +48,8 @@ type ServerConfig struct {
 type ToolInfo struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
-	ServerName  string `json:"server_name"` // 来源 MCP Server
+	ServerName  string `json:"server_name"`            // 来源 MCP Server
+	InputSchema any    `json:"input_schema,omitempty"` // 参数 JSON Schema
 }
 
 // connectedServer 已连接的 MCP Server
@@ -64,10 +66,10 @@ type connectedServer struct {
 // 管理所有 MCP Server 连接，自动发现工具。
 // 提供工具列表和健康检查能力。
 type Manager struct {
-	mu       sync.RWMutex
-	servers  map[string]*connectedServer
-	configs  []ServerConfig // 保存配置用于重连
-	stopCh   chan struct{}
+	mu        sync.RWMutex
+	servers   map[string]*connectedServer
+	configs   []ServerConfig // 保存配置用于重连
+	stopCh    chan struct{}
 	closeOnce sync.Once
 }
 
@@ -93,7 +95,7 @@ func (m *Manager) Connect(ctx context.Context, configs []ServerConfig) (int, err
 
 		server, err := m.connectServer(ctx, cfg)
 		if err != nil {
-			log.Printf("MCP Server %q 连接失败: %v", cfg.Name, err)
+			logger.Error("MCP Server", "name", cfg.Name, "error", err)
 			continue
 		}
 
@@ -102,7 +104,7 @@ func (m *Manager) Connect(ctx context.Context, configs []ServerConfig) (int, err
 		m.mu.Unlock()
 
 		totalTools += len(server.tools)
-		log.Printf("MCP Server %q 已连接: 发现 %d 个工具", cfg.Name, len(server.tools))
+		logger.Info("MCP Server", "name", cfg.Name, "len", len(server.tools))
 	}
 
 	// 保存配置用于重连
@@ -150,7 +152,7 @@ func (m *Manager) tryReconnect() {
 		cancel()
 
 		if err != nil {
-			log.Printf("MCP Server %q 重连失败: %v", cfg.Name, err)
+			logger.Error("MCP Server", "name", cfg.Name, "error", err)
 			continue
 		}
 
@@ -167,7 +169,7 @@ func (m *Manager) tryReconnect() {
 		m.servers[cfg.Name] = newServer
 		m.mu.Unlock()
 
-		log.Printf("MCP Server %q 已重连: 发现 %d 个工具", cfg.Name, len(newServer.tools))
+		logger.Info("MCP Server", "name", cfg.Name, "len", len(newServer.tools))
 	}
 }
 
@@ -180,7 +182,18 @@ func (m *Manager) connectServer(ctx context.Context, cfg ServerConfig) (*connect
 		if cfg.Command == "" {
 			return nil, fmt.Errorf("stdio 传输需要指定 command")
 		}
-		tools, cleanup, err := hexagon.ConnectMCPStdio(ctx, cfg.Command, cfg.Args...)
+		// 解析 args 中的符号链接路径（macOS /tmp → /private/tmp 等）
+		resolvedArgs := make([]string, len(cfg.Args))
+		for i, arg := range cfg.Args {
+			if filepath.IsAbs(arg) {
+				if resolved, err := filepath.EvalSymlinks(arg); err == nil {
+					resolvedArgs[i] = resolved
+					continue
+				}
+			}
+			resolvedArgs[i] = arg
+		}
+		tools, cleanup, err := hexagon.ConnectMCPStdio(ctx, cfg.Command, resolvedArgs...)
 		if err != nil {
 			return nil, fmt.Errorf("stdio 连接失败: %w", err)
 		}
@@ -239,11 +252,15 @@ func (m *Manager) ToolInfos() []ToolInfo {
 	var infos []ToolInfo
 	for _, server := range m.servers {
 		for _, t := range server.tools {
-			infos = append(infos, ToolInfo{
+			info := ToolInfo{
 				Name:        t.Name(),
 				Description: t.Description(),
 				ServerName:  server.name,
-			})
+			}
+			if s := t.Schema(); s != nil {
+				info.InputSchema = s
+			}
+			infos = append(infos, info)
 		}
 	}
 	return infos
@@ -410,7 +427,7 @@ func (m *Manager) AddServer(ctx context.Context, cfg ServerConfig) error {
 	}
 	m.mu.Unlock()
 
-	log.Printf("MCP Server %q 已动态添加: 发现 %d 个工具", cfg.Name, len(server.tools))
+	logger.Info("MCP Server", "name", cfg.Name, "len", len(server.tools))
 	return nil
 }
 
@@ -449,7 +466,7 @@ func (m *Manager) RemoveServer(name string) error {
 		}
 	}
 
-	log.Printf("MCP Server %q 已动态移除", name)
+	logger.Info("MCP Server", "name", name)
 	return nil
 }
 
@@ -471,10 +488,10 @@ func (m *Manager) Close() {
 			}
 			if server.closer != nil {
 				if err := server.closer.Close(); err != nil {
-					log.Printf("MCP Server %q 关闭出错: %v", name, err)
+					logger.Error("MCP Server", "name", name, "error", err)
 				}
 			}
-			log.Printf("MCP Server %q 已断开", name)
+			logger.Info("MCP Server", "name", name)
 		}
 
 		m.servers = make(map[string]*connectedServer)

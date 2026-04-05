@@ -36,7 +36,7 @@ func (s *Server) handleToolCacheStats(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleToolMetrics(w http.ResponseWriter, _ *http.Request) {
 	stats, err := s.toolMetrics.ReadStats(20)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusOK, map[string]any{"tools": []any{}, "error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"tools": stats})

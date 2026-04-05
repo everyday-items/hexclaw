@@ -17,8 +17,8 @@ type SemanticSearch struct {
 }
 
 type searchDoc struct {
-	name string
-	text string // combined name + description + tags for search
+	name  string
+	text  string // combined name + description + tags for search
 	tfidf map[string]float64
 }
 

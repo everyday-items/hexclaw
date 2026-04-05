@@ -2,7 +2,7 @@ package cache
 
 import (
 	"database/sql"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"time"
 )
 
@@ -19,7 +19,7 @@ func (c *Cache) LoadFromDB(db *sql.DB) {
 		 FROM llm_cache WHERE expires_at > ?`, time.Now(),
 	)
 	if err != nil {
-		log.Printf("[cache] 从 SQLite 加载缓存失败: %v", err)
+		logger.Error("[cache] 从 SQLite 加载缓存失败", "error", err)
 		return
 	}
 	defer rows.Close()
@@ -45,7 +45,7 @@ func (c *Cache) LoadFromDB(db *sql.DB) {
 	}
 
 	if loaded > 0 {
-		log.Printf("[cache] 从 SQLite 恢复 %d 条缓存", loaded)
+		logger.Info("[cache] 从 SQLite 恢复", "loaded", loaded)
 	}
 }
 
@@ -73,7 +73,7 @@ func (c *Cache) PersistToDB(db *sql.DB) {
 
 	tx, err := db.Begin()
 	if err != nil {
-		log.Printf("[cache] 开启持久化事务失败: %v", err)
+		logger.Error("[cache] 开启持久化事务失败", "error", err)
 		return
 	}
 	defer tx.Rollback()
@@ -86,7 +86,7 @@ func (c *Cache) PersistToDB(db *sql.DB) {
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
-		log.Printf("[cache] 准备持久化语句失败: %v", err)
+		logger.Error("[cache] 准备持久化语句失败", "error", err)
 		return
 	}
 	defer stmt.Close()
@@ -94,16 +94,16 @@ func (c *Cache) PersistToDB(db *sql.DB) {
 	persisted := 0
 	for _, e := range entries {
 		if _, err := stmt.Exec(e.Key, e.Response, e.Provider, e.Model, e.HitCount, e.CreatedAt, e.ExpiresAt); err != nil {
-			log.Printf("[cache] 持久化条目失败: %v", err)
+			logger.Error("[cache] 持久化条目失败", "error", err)
 			continue
 		}
 		persisted++
 	}
 
 	if err := tx.Commit(); err != nil {
-		log.Printf("[cache] 提交持久化事务失败: %v", err)
+		logger.Error("[cache] 提交持久化事务失败", "error", err)
 		return
 	}
 
-	log.Printf("[cache] 持久化 %d 条缓存到 SQLite", persisted)
+	logger.Info("[cache] 持久化", "persisted", persisted)
 }

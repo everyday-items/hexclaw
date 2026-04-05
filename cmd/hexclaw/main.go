@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"net/http"
 	"os"
 	"os/signal"
@@ -27,7 +29,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/hexagon-codes/hexagon"
-	aiopenai "github.com/hexagon-codes/ai-core/llm/openai"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	webadapter "github.com/hexagon-codes/hexclaw/adapter/web"
 	"github.com/hexagon-codes/hexclaw/api"
@@ -389,23 +390,61 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		if err := kbStore.Init(ctx); err == nil {
 			// 1. 构造 embedder: ai-core Provider → hexagon embedder 包装
 			var emb *hexagon.OpenAIEmbedder
-			if cfg.Knowledge.Embedding.Provider != "" {
-				providerName := cfg.Knowledge.Embedding.Provider
-				if pc, ok := cfg.LLM.Providers[providerName]; ok && pc.APIKey != "" {
-					model := cfg.Knowledge.Embedding.Model
-					if model == "" {
-						model = "text-embedding-3-small"
+
+			// 确定 embedding provider：显式配置 > 自动检测（Ollama nomic-embed-text > 有 API Key 的云服务）
+			embProviderName := cfg.Knowledge.Embedding.Provider
+			embModel := cfg.Knowledge.Embedding.Model
+
+			if embProviderName == "" {
+				// 自动检测：优先 Ollama（本地、免费、无需 API Key）
+				for name, pc := range cfg.LLM.Providers {
+					lower := strings.ToLower(name)
+					isOllamaProvider := strings.Contains(lower, "ollama") || strings.Contains(strings.ToLower(pc.BaseURL), "localhost:11434")
+					if isOllamaProvider {
+						embProviderName = name
+						if embModel == "" {
+							embModel = "nomic-embed-text"
+						}
+						logger.Info("[knowledge] 自动选择 Ollama 作为 embedding provider", "name", name, "model", embModel)
+						break
 					}
-					var providerOpts []aiopenai.Option
-					if pc.BaseURL != "" {
-						providerOpts = append(providerOpts, aiopenai.WithBaseURL(pc.BaseURL))
+				}
+			}
+			if embProviderName == "" {
+				// 其次：找第一个有 API Key 的云 provider
+				for name, pc := range cfg.LLM.Providers {
+					if pc.APIKey != "" {
+						embProviderName = name
+						logger.Info("[knowledge] 自动选择云服务作为 embedding provider", "name", name)
+						break
 					}
-					aiProvider := aiopenai.New(pc.APIKey, providerOpts...)
-					dim := aiopenai.EmbeddingDimension(model)
-					emb = hexagon.NewOpenAIEmbedder(aiProvider,
-						hexagon.WithEmbedderModel(model),
-						hexagon.WithEmbedderDimension(dim),
-					)
+				}
+			}
+
+			if embProviderName != "" {
+				if pc, ok := cfg.LLM.Providers[embProviderName]; ok {
+					if embModel == "" {
+						embModel = "text-embedding-3-small"
+					}
+					// Ollama 不需要 API Key，云服务需要
+					isOllama := strings.ToLower(embProviderName) == "ollama" || strings.Contains(strings.ToLower(pc.BaseURL), "localhost:11434")
+					if isOllama || pc.APIKey != "" {
+						var providerOpts []hexagon.OpenAIOption
+						if pc.BaseURL != "" {
+							providerOpts = append(providerOpts, hexagon.OpenAIWithBaseURL(pc.BaseURL))
+						}
+						apiKey := pc.APIKey
+						if apiKey == "" {
+							apiKey = "ollama" // Ollama 不需要真实 key，但 OpenAI client 要求非空
+						}
+						aiProvider := hexagon.NewOpenAI(apiKey, providerOpts...)
+						dim := hexagon.OpenAIEmbeddingDimension(embModel)
+						emb = hexagon.NewOpenAIEmbedder(aiProvider,
+							hexagon.WithEmbedderModel(embModel),
+							hexagon.WithEmbedderDimension(dim),
+						)
+						logger.Info("[knowledge] 自动配置 embedding", "provider", embProviderName, "model", embModel)
+					}
 				}
 			}
 
@@ -671,7 +710,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	agentRouter := agentrouter.New()
 	agentStore := agentrouter.NewSQLiteStore(store.DB())
 	if err := agentStore.Init(ctx); err != nil {
-		log.Printf("Agent 存储初始化失败: %v", err)
+		logger.Error("Agent 存储初始化失败", "error", err)
 	}
 
 	// 先从 DB 加载已持久化的 Agent 和规则
@@ -744,7 +783,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	// 注册需要 dispatcher/executor 的 Agent 级 Skill
 	if err := skills.Register(engine.NewHandoffSkill(agentRouter)); err != nil {
-		log.Printf("注册 HandoffSkill 失败: %v", err)
+		logger.Error("注册 HandoffSkill 失败", "error", err)
 	}
 	// OrchestrateSkill + SpawnSkill 共享 executor: 通过 engine.Process 执行子任务
 	agentExecFn := func(ctx context.Context, agentName, task string) (string, error) {
@@ -762,10 +801,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		return reply.Content, nil
 	}
 	if err := skills.Register(engine.NewOrchestrateSkill(agentExecFn)); err != nil {
-		log.Printf("注册 OrchestrateSkill 失败: %v", err)
+		logger.Error("注册 OrchestrateSkill 失败", "error", err)
 	}
 	if err := skills.Register(engine.NewSpawnSkill(agentExecFn)); err != nil {
-		log.Printf("注册 SpawnSkill 失败: %v", err)
+		logger.Error("注册 SpawnSkill 失败", "error", err)
 	}
 
 	agentCount := len(agentRouter.ListAgents())
@@ -943,11 +982,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	eng.LLMCache().PersistToDB(store.DB())
 
 	if err := srv.Stop(shutdownCtx); err != nil {
-		log.Printf("关闭服务器出错: %v", err)
+		logger.Error("error", "error", err)
 	}
 
 	if err := instanceMgr.StopAll(shutdownCtx); err != nil {
-		log.Printf("关闭平台实例出错: %v", err)
+		logger.Error("error", "error", err)
 	}
 
 	fmt.Println("  🦀 HexClaw 已停止")

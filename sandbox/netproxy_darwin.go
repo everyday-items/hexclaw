@@ -3,7 +3,7 @@
 package sandbox
 
 import (
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // DarwinProxyIntegration configures proxy for sandboxed processes on macOS.
@@ -41,7 +41,7 @@ func (p *DarwinProxyIntegration) SeatbeltNetworkRule() string {
 
 // Apply configures the proxy (env vars only on macOS).
 func (p *DarwinProxyIntegration) Apply() error {
-	log.Printf("[netproxy-darwin] proxy configured via env vars: %s", p.proxyAddr)
+	logger.Info("[netproxy-darwin] proxy configured via env vars", "vars", p.proxyAddr)
 	return nil
 }
 

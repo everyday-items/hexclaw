@@ -113,10 +113,10 @@ func (s *AzureSTT) Transcribe(ctx context.Context, audio []byte, opts Transcribe
 }
 
 type azureSTTResponse struct {
-	RecognitionStatus string         `json:"RecognitionStatus"`
-	DisplayText       string         `json:"DisplayText"`
-	Duration          int64          `json:"Duration"`
-	NBest             []azureNBest   `json:"NBest"`
+	RecognitionStatus string       `json:"RecognitionStatus"`
+	DisplayText       string       `json:"DisplayText"`
+	Duration          int64        `json:"Duration"`
+	NBest             []azureNBest `json:"NBest"`
 }
 
 type azureNBest struct {

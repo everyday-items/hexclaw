@@ -89,10 +89,10 @@ func (c *ToolMetricsCollector) ReadStats(limit int) ([]ToolStats, error) {
 	}
 
 	type agg struct {
-		calls    int
-		success  int
-		cached   int
-		totalMs  int64
+		calls   int
+		success int
+		cached  int
+		totalMs int64
 	}
 	m := make(map[string]*agg)
 

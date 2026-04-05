@@ -5,12 +5,13 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
-	"log"
 	"math"
 	"sort"
 	"strings"
 
+	"github.com/hexagon-codes/hexagon/rag/splitter"
 	"github.com/hexagon-codes/hexclaw/internal/sqliteutil"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // SQLiteStore SQLite 知识库存储
@@ -95,6 +96,14 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 			return fmt.Errorf("迁移知识库表失败: %w", err)
 		}
 	}
+
+	// 启动时清理孤儿 FTS5 记录（chunk 已删除但 FTS5 索引残留）
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM kb_chunks_fts WHERE chunk_id NOT IN (SELECT id FROM kb_chunks)`,
+	); err != nil {
+		logger.Error("[knowledge] 清理孤儿 FTS5 记录失败", "error", err)
+	}
+
 	return nil
 }
 
@@ -299,7 +308,7 @@ func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK
 		var s scored
 		var embBlob []byte
 		if err := rows.Scan(&s.id, &s.docID, &s.chunkIndex, &embBlob); err != nil {
-			log.Printf("[knowledge] VectorSearch scan 失败: %v", err)
+			logger.Error("[knowledge] VectorSearch scan 失败", "error", err)
 			continue
 		}
 
@@ -331,7 +340,7 @@ func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK
 	}
 	chunkMap, chunkErr := s.getChunksByIDs(ctx, ids)
 	if chunkErr != nil {
-		log.Printf("[knowledge] VectorSearch 加载 chunks 失败: %v", chunkErr)
+		logger.Error("[knowledge] VectorSearch 加载 chunks 失败", "error", chunkErr)
 	}
 
 	results := make([]*SearchResult, len(all))
@@ -354,7 +363,7 @@ func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK
 // BM25 分数越小（负数绝对值越大）越相关，需要归一化到 0-1。
 func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int) ([]*SearchResult, error) {
 	// 构建 FTS5 查询：将查询分词后用 OR 连接
-	keywords := tokenize(query)
+	keywords := splitter.SearchTokenize(query)
 	if len(keywords) == 0 {
 		return nil, nil
 	}
@@ -417,7 +426,7 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int) ([
 		var chunkLoadErr error
 		chunkMap, chunkLoadErr = s.getChunksByIDs(ctx, ids)
 		if chunkLoadErr != nil {
-			log.Printf("[knowledge] TextSearch 加载 chunks 失败: %v", chunkLoadErr)
+			logger.Error("[knowledge] TextSearch 加载 chunks 失败", "error", chunkLoadErr)
 		}
 	}
 
@@ -443,10 +452,14 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int) ([
 		})
 	}
 
+	// FTS5 返回空时降级到 LIKE 搜索（解决中文 tokenizer 不匹配的问题）
+	if len(results) == 0 {
+		return s.fallbackTextSearch(ctx, keywords, topK)
+	}
 	return results, nil
 }
 
-// fallbackTextSearch FTS5 不可用时的降级搜索（LIKE 匹配）
+// fallbackTextSearch FTS5 不可用或结果为空时的降级搜索（LIKE 匹配）
 func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string, topK int) ([]*SearchResult, error) {
 	var query strings.Builder
 	var args []any
@@ -473,7 +486,7 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 		chunk := &Chunk{}
 		var embBlob []byte
 		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &embBlob, &chunk.CreatedAt); err != nil {
-			log.Printf("[knowledge] fallbackTextSearch scan 失败: %v", err)
+			logger.Error("[knowledge] fallbackTextSearch scan 失败", "error", err)
 			continue
 		}
 		if len(embBlob) > 0 {
@@ -529,7 +542,7 @@ func (s *SQLiteStore) getChunksByIDs(ctx context.Context, ids []string) (map[str
 		chunk := &Chunk{}
 		var embBlob []byte
 		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.DocTitle, &chunk.Source, &chunk.ChunkCount, &chunk.Content, &chunk.Index, &embBlob, &chunk.CreatedAt); err != nil {
-			log.Printf("[knowledge] scan chunk %s 失败: %v", chunk.ID, err)
+			logger.Error("[knowledge] scan chunk", "id", chunk.ID, "error", err)
 			continue
 		}
 		if len(embBlob) > 0 {
@@ -568,26 +581,5 @@ func decodeFloat32Slice(buf []byte) []float32 {
 
 // --- 分词 ---
 
-// tokenize 简单分词
-//
-// 按空格和常见标点分割，过滤短词（< 2 字符）。
-// 用于 FTS5 查询和降级搜索。
-func tokenize(text string) []string {
-	replacer := strings.NewReplacer(
-		"，", " ", "。", " ", "？", " ", "！", " ",
-		",", " ", ".", " ", "?", " ", "!", " ",
-		"、", " ", "：", " ", "；", " ",
-		"\"", " ", "'", " ", "(", " ", ")", " ",
-	)
-	text = replacer.Replace(text)
-
-	words := strings.Fields(text)
-	var result []string
-	for _, w := range words {
-		w = strings.TrimSpace(w)
-		if len(w) >= 2 {
-			result = append(result, w)
-		}
-	}
-	return result
-}
+// 搜索分词已迁移到 hexagon/rag/splitter.SearchTokenize
+// 提供 CJK bigram + 原词保留 + 去重，供 FTS5 查询和 LIKE 降级搜索使用。

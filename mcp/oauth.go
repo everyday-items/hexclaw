@@ -42,9 +42,9 @@ func (t *OAuthToken) IsExpired() bool {
 
 // OAuthManager handles OAuth flows for MCP servers.
 type OAuthManager struct {
-	mu       sync.Mutex
-	credDir  string // ~/.hexclaw/credentials/
-	tokens   map[string]*OAuthToken
+	mu      sync.Mutex
+	credDir string // ~/.hexclaw/credentials/
+	tokens  map[string]*OAuthToken
 }
 
 // NewOAuthManager creates an OAuth manager.

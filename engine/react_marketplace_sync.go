@@ -2,7 +2,7 @@ package engine
 
 import (
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
 )
@@ -61,7 +61,7 @@ func (e *ReActEngine) SyncMarkdownSkillsFromMarketplace(mp *marketplace.Marketpl
 	sk := e.skills
 	for _, name := range toRemove {
 		if err := sk.Unregister(name); err != nil {
-			log.Printf("技能市场同步: 注销 %q 跳过: %v", name, err)
+			logger.Warn("技能市场同步: 注销", "name", name, "跳过", err)
 		}
 	}
 
@@ -73,12 +73,12 @@ func (e *ReActEngine) SyncMarkdownSkillsFromMarketplace(mp *marketplace.Marketpl
 		if _, ok := sk.Get(n); !ok {
 			w := marketplace.WrapAsSkill(md)
 			if err := sk.Register(w); err != nil {
-				log.Printf("技能市场同步: 注册 %q 失败: %v", n, err)
+				logger.Error("技能市场同步: 注册", "n", n, "error", err)
 				continue
 			}
 		}
 		if err := sk.SetEnabled(n, mp.IsEnabled(n)); err != nil {
-			log.Printf("技能市场同步: 设置 %q 启用状态失败: %v", n, err)
+			logger.Error("技能市场同步: 设置", "n", n, "启用状态失败", err)
 		}
 	}
 

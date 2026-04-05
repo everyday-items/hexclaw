@@ -9,8 +9,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -24,6 +24,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -90,7 +91,7 @@ func (a *FeishuAdapter) Start(_ context.Context, handler adapter.MessageHandler)
 	)
 
 	go func() {
-		log.Printf("飞书适配器 [%s] 正在连接 WebSocket...", a.Name())
+		logger.Info("飞书适配器 [", "name", a.Name())
 		a.connected.Store(true)
 		a.mu.Lock()
 		a.lastError = ""
@@ -98,7 +99,7 @@ func (a *FeishuAdapter) Start(_ context.Context, handler adapter.MessageHandler)
 		if err := a.wsClient.Start(context.Background()); err != nil {
 			a.connected.Store(false)
 			if !a.stopped.Load() {
-				log.Printf("飞书 WebSocket 连接失败: %v", err)
+				logger.Error("飞书 WebSocket 连接失败", "error", err)
 				a.mu.Lock()
 				a.lastError = err.Error()
 				a.mu.Unlock()
@@ -106,7 +107,7 @@ func (a *FeishuAdapter) Start(_ context.Context, handler adapter.MessageHandler)
 		}
 	}()
 
-	log.Printf("飞书适配器 [%s] 已启动（WebSocket 长连接模式 - 官方 SDK）", a.Name())
+	logger.Info("飞书适配器 [", "name", a.Name())
 	return nil
 }
 
@@ -117,7 +118,7 @@ func (a *FeishuAdapter) Stop(_ context.Context) error {
 	if a.queue != nil {
 		_ = a.queue.Stop(context.Background())
 	}
-	log.Println("飞书适配器停止中...")
+	logger.Info("飞书适配器停止中...")
 	return nil
 }
 
@@ -135,7 +136,7 @@ func (a *FeishuAdapter) handleSDKMessage(event *larkim.P2MessageReceiveV1) {
 	msgEvent := event.Event
 	if msgEvent.Message.MessageType == nil || *msgEvent.Message.MessageType != "text" {
 		if msgEvent.Message.MessageType != nil {
-			log.Printf("飞书: 暂不支持 %s 类型消息", *msgEvent.Message.MessageType)
+			logger.Info("飞书: 暂不支持", "message_type", *msgEvent.Message.MessageType)
 		}
 		return
 	}
@@ -148,7 +149,7 @@ func (a *FeishuAdapter) handleSDKMessage(event *larkim.P2MessageReceiveV1) {
 		Text string `json:"text"`
 	}
 	if err := json.Unmarshal([]byte(*msgEvent.Message.Content), &textContent); err != nil {
-		log.Printf("飞书: 解析文本内容失败: %v", err)
+		logger.Error("飞书: 解析文本内容失败", "error", err)
 		return
 	}
 
@@ -199,9 +200,12 @@ func (a *FeishuAdapter) handleSDKMessage(event *larkim.P2MessageReceiveV1) {
 
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
-		log.Printf("飞书: 处理消息失败: %v", err)
-		_ = a.Send(ctx, msg.ChatID, &adapter.Reply{
-			Content: "处理消息时出现错误，请稍后重试。",
+		logger.Error("飞书: 处理消息失败", "error", err)
+		// 错误恢复用独立 context — 原 ctx 可能已 deadline exceeded
+		errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer errCancel()
+		_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{
+			Content: "处理消息时出现错误：" + upstreamerr.PublicMessage(err, "未知错误") + "\n请检查 LLM Provider 配置后重试。",
 		})
 		return
 	}
@@ -209,8 +213,11 @@ func (a *FeishuAdapter) handleSDKMessage(event *larkim.P2MessageReceiveV1) {
 	if reply == nil {
 		return
 	}
-	if err := a.Send(ctx, msg.ChatID, reply); err != nil {
-		log.Printf("飞书: 发送回复失败: %v", err)
+	// 正常回复也用独立 context，避免处理耗时接近 deadline 时发送失败
+	sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer sendCancel()
+	if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
+		logger.Error("飞书: 发送回复失败", "error", err)
 	}
 }
 
@@ -225,7 +232,7 @@ func (a *FeishuAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	var event feishuEvent
 	if err := json.Unmarshal(body, &event); err != nil {
-		http.Error(w, "解析事件失败", http.StatusBadRequest)
+		http.Error(w, "error", http.StatusBadRequest)
 		return
 	}
 
@@ -307,14 +314,14 @@ func (a *FeishuAdapter) SendStream(ctx context.Context, chatID string, chunks <-
 	// 立即发送思考状态占位消息（随机表情增加趣味性）
 	messageID, err := a.sendAndGetID(ctx, chatID, randomThinkingMessage())
 	if err != nil {
-		log.Printf("[feishu] 发送思考占位消息失败（将降级为直接回复）: %v", err)
+		logger.Error("[feishu] 发送思考占位消息失败（将降级为直接回复）", "error", err)
 	}
 
 	var sb strings.Builder
 	lastUpdateLen := 0
 	lastUpdateTime := time.Now()
-	const updateThreshold = 50          // 最少积累 50 字符才更新
-	const updateInterval = time.Second  // 最少间隔 1 秒才更新（防限流）
+	const updateThreshold = 50         // 最少积累 50 字符才更新
+	const updateInterval = time.Second // 最少间隔 1 秒才更新（防限流）
 
 	for chunk := range chunks {
 		if chunk.Error != nil {
@@ -332,7 +339,7 @@ func (a *FeishuAdapter) SendStream(ctx context.Context, chatID string, chunks <-
 		// 收到内容后逐步更新占位消息（限流保护）
 		if messageID != "" && sb.Len()-lastUpdateLen >= updateThreshold && time.Since(lastUpdateTime) >= updateInterval {
 			if pErr := a.patchMessage(ctx, messageID, sb.String()+"…"); pErr != nil {
-				log.Printf("[feishu] 更新流式消息失败: %v", pErr)
+				logger.Error("[feishu] 更新流式消息失败", "error", pErr)
 			}
 			lastUpdateLen = sb.Len()
 			lastUpdateTime = time.Now()
@@ -441,7 +448,7 @@ func (a *FeishuAdapter) handleMessage(event feishuEvent) {
 
 	msgEvent := event.Event
 	if msgEvent.Message.MessageType != "text" {
-		log.Printf("飞书: 暂不支持 %s 类型消息", msgEvent.Message.MessageType)
+		logger.Info("飞书: 暂不支持", "message_type", msgEvent.Message.MessageType)
 		return
 	}
 
@@ -449,7 +456,7 @@ func (a *FeishuAdapter) handleMessage(event feishuEvent) {
 		Text string `json:"text"`
 	}
 	if err := json.Unmarshal([]byte(msgEvent.Message.Content), &textContent); err != nil {
-		log.Printf("飞书: 解析文本内容失败: %v", err)
+		logger.Error("飞书: 解析文本内容失败", "error", err)
 		return
 	}
 
@@ -479,9 +486,11 @@ func (a *FeishuAdapter) handleMessage(event feishuEvent) {
 
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
-		log.Printf("飞书: 处理消息失败: %v", err)
-		_ = a.Send(ctx, msg.ChatID, &adapter.Reply{
-			Content: "处理消息时出现错误，请稍后重试。",
+		logger.Error("飞书: 处理消息失败", "error", err)
+		errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer errCancel()
+		_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{
+			Content: "处理消息时出现错误：" + upstreamerr.PublicMessage(err, "未知错误") + "\n请检查 LLM Provider 配置后重试。",
 		})
 		return
 	}
@@ -489,8 +498,10 @@ func (a *FeishuAdapter) handleMessage(event feishuEvent) {
 	if reply == nil {
 		return
 	}
-	if err := a.Send(ctx, msg.ChatID, reply); err != nil {
-		log.Printf("飞书: 发送回复失败: %v", err)
+	sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer sendCancel()
+	if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
+		logger.Error("飞书: 发送回复失败", "error", err)
 	}
 }
 
@@ -578,7 +589,7 @@ func (a *FeishuAdapter) getAccessToken(ctx context.Context) (string, error) {
 
 	a.accessToken = result.TenantAccessToken
 	a.tokenExpiry = time.Now().Add(time.Duration(result.Expire) * time.Second)
-	log.Printf("飞书 Access Token 已刷新, 有效期 %d 秒", result.Expire)
+	logger.Info("飞书 Access Token 已刷新, 有效期", "expire", result.Expire)
 
 	return a.accessToken, nil
 }

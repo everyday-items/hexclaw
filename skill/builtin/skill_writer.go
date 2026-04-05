@@ -35,8 +35,8 @@ func NewSkillWriterSkill(skillDir string, scanner *security.SkillScanner) *Skill
 }
 
 func (s *SkillWriterSkill) Name() string        { return "create_skill" }
-func (s *SkillWriterSkill) Description() string  { return "Create a new reusable skill" }
-func (s *SkillWriterSkill) Match(_ string) bool  { return false }
+func (s *SkillWriterSkill) Description() string { return "Create a new reusable skill" }
+func (s *SkillWriterSkill) Match(_ string) bool { return false }
 
 func (s *SkillWriterSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition("create_skill",

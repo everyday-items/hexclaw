@@ -14,8 +14,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -75,7 +75,7 @@ func (a *MatrixAdapter) Start(ctx context.Context, handler adapter.MessageHandle
 	a.handler = handler
 	a.stopped.Store(false)
 
-	log.Printf("[Matrix] 连接到 %s", a.config.HomeserverURL)
+	logger.Info("[Matrix] 连接到", "homeserver_u_r_l", a.config.HomeserverURL)
 
 	go a.syncLoop(ctx)
 	return nil
@@ -155,7 +155,7 @@ func (a *MatrixAdapter) syncLoop(ctx context.Context) {
 			return
 		default:
 			if err := a.doSync(ctx); err != nil {
-				log.Printf("[Matrix] 同步错误: %v", err)
+				logger.Error("[Matrix] 同步错误", "error", err)
 				time.Sleep(5 * time.Second)
 			}
 		}
@@ -235,12 +235,12 @@ func (a *MatrixAdapter) handleEvent(roomID string, event matrixEvent) {
 		if a.handler != nil {
 			reply, err := a.handler(context.Background(), m)
 			if err != nil {
-				log.Printf("[Matrix] 处理消息错误: %v", err)
+				logger.Error("[Matrix] 处理消息错误", "error", err)
 				return
 			}
 			if reply != nil {
 				if err := a.Send(context.Background(), m.ChatID, reply); err != nil {
-					log.Printf("[Matrix] 发送回复错误: %v", err)
+					logger.Error("[Matrix] 发送回复错误", "error", err)
 				}
 			}
 		}

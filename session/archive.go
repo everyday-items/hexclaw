@@ -2,7 +2,7 @@ package session
 
 import (
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,6 +63,6 @@ func (a *Archiver) Archive(sessionID string, messages []*storage.MessageRecord) 
 		return "", fmt.Errorf("write archive: %w", err)
 	}
 
-	log.Printf("会话归档完成: session=%s file=%s messages=%d", sessionID, filename, len(messages))
+	logger.Info("会话归档完成: session", "session", sessionID, "file", filename, "messages", len(messages))
 	return path, nil
 }

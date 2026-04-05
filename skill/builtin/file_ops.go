@@ -26,8 +26,8 @@ func NewFileOpsSkill(workspace string) *FileOpsSkill {
 }
 
 func (s *FileOpsSkill) Name() string        { return "file_ops" }
-func (s *FileOpsSkill) Description() string  { return "Read, write, or edit files in the workspace" }
-func (s *FileOpsSkill) Match(_ string) bool  { return false }
+func (s *FileOpsSkill) Description() string { return "Read, write, or edit files in the workspace" }
+func (s *FileOpsSkill) Match(_ string) bool { return false }
 
 func (s *FileOpsSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition("file_ops",

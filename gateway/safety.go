@@ -3,10 +3,10 @@ package gateway
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"strings"
 
-	"github.com/hexagon-codes/hexagon/security/guard"
+	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
 )
@@ -21,9 +21,9 @@ import (
 // 所有检查通过 hexagon 框架的 Guard 接口实现，
 // 不重复造轮子。
 type InputSafetyLayer struct {
-	injectionGuard *guard.PromptInjectionGuard
-	piiGuard       *guard.PIIGuard
-	guardChain     *guard.GuardChain
+	injectionGuard *hexagon.PromptInjectionGuard
+	piiGuard       *hexagon.PIIGuard
+	guardChain     *hexagon.GuardChain
 	cfg            *config.SecurityConfig
 }
 
@@ -31,17 +31,17 @@ type InputSafetyLayer struct {
 func NewInputSafetyLayer(cfg *config.SecurityConfig) *InputSafetyLayer {
 	l := &InputSafetyLayer{cfg: cfg}
 
-	var guards []guard.Guard
+	var guards []hexagon.Guard
 
 	// 注入检测
 	if cfg.InjectionDetection.Enabled {
-		l.injectionGuard = guard.NewPromptInjectionGuard()
+		l.injectionGuard = hexagon.NewPromptInjectionGuard()
 		guards = append(guards, l.injectionGuard)
 	}
 
 	// PII 检测
 	if cfg.PIIRedaction.Enabled {
-		l.piiGuard = guard.NewPIIGuard()
+		l.piiGuard = hexagon.NewPIIGuard()
 		guards = append(guards, l.piiGuard)
 	}
 
@@ -49,12 +49,12 @@ func NewInputSafetyLayer(cfg *config.SecurityConfig) *InputSafetyLayer {
 	if cfg.ContentFilter.Enabled {
 		cfGuard := newContentFilterGuard(cfg.ContentFilter.BlockCategories)
 		guards = append(guards, cfGuard)
-		log.Printf("ContentFilter 已启用，阻断类别: %v", cfg.ContentFilter.BlockCategories)
+		logger.Info("ContentFilter 已启用，阻断类别", "categories", cfg.ContentFilter.BlockCategories)
 	}
 
 	// 组装守卫链
 	if len(guards) > 0 {
-		l.guardChain = guard.NewGuardChain(guard.ChainModeAll, guards...)
+		l.guardChain = hexagon.NewGuardChain(hexagon.ChainModeAll, guards...)
 	}
 
 	return l
@@ -75,7 +75,7 @@ func (l *InputSafetyLayer) Check(ctx context.Context, msg *adapter.Message) erro
 
 	result, err := l.guardChain.Check(ctx, msg.Content)
 	if err != nil {
-		log.Printf("安全守卫检查异常（fail-closed）: %v", err)
+		logger.Error("error", "error", err)
 		return &GatewayError{
 			Layer:   "input_safety",
 			Code:    "safety_check_error",
@@ -104,9 +104,9 @@ type contentFilterGuard struct {
 }
 
 var defaultBlockKeywords = map[string][]string{
-	"violence": {"杀人", "炸弹", "枪支", "暗杀", "爆炸物", "how to kill", "make a bomb", "weapon"},
-	"illegal":  {"贩毒", "洗钱", "走私", "伪造", "黑客攻击", "drug trafficking", "money laundering"},
-	"adult":    {"色情", "裸体", "性交", "pornography", "explicit sexual"},
+	"violence":  {"杀人", "炸弹", "枪支", "暗杀", "爆炸物", "how to kill", "make a bomb", "weapon"},
+	"illegal":   {"贩毒", "洗钱", "走私", "伪造", "黑客攻击", "drug trafficking", "money laundering"},
+	"adult":     {"色情", "裸体", "性交", "pornography", "explicit sexual"},
 	"self_harm": {"自杀方法", "自残", "suicide method", "self-harm instructions"},
 }
 
@@ -121,12 +121,12 @@ func newContentFilterGuard(blockCategories []string) *contentFilterGuard {
 	}
 }
 
-func (g *contentFilterGuard) Name() string    { return "content_filter" }
-func (g *contentFilterGuard) Enabled() bool   { return len(g.enabled) > 0 }
+func (g *contentFilterGuard) Name() string  { return "content_filter" }
+func (g *contentFilterGuard) Enabled() bool { return len(g.enabled) > 0 }
 
-func (g *contentFilterGuard) Check(_ context.Context, input string) (*guard.CheckResult, error) {
+func (g *contentFilterGuard) Check(_ context.Context, input string) (*hexagon.CheckResult, error) {
 	lower := strings.ToLower(input)
-	var findings []guard.Finding
+	var findings []hexagon.GuardFinding
 
 	for _, cat := range g.enabled {
 		keywords, ok := g.categories[cat]
@@ -135,7 +135,7 @@ func (g *contentFilterGuard) Check(_ context.Context, input string) (*guard.Chec
 		}
 		for _, kw := range keywords {
 			if strings.Contains(lower, strings.ToLower(kw)) {
-				findings = append(findings, guard.Finding{
+				findings = append(findings, hexagon.GuardFinding{
 					Type:     cat,
 					Text:     kw,
 					Severity: "high",
@@ -145,7 +145,7 @@ func (g *contentFilterGuard) Check(_ context.Context, input string) (*guard.Chec
 	}
 
 	if len(findings) > 0 {
-		return &guard.CheckResult{
+		return &hexagon.CheckResult{
 			Passed:   false,
 			Score:    1.0,
 			Category: findings[0].Type,
@@ -154,5 +154,5 @@ func (g *contentFilterGuard) Check(_ context.Context, input string) (*guard.Chec
 		}, nil
 	}
 
-	return &guard.CheckResult{Passed: true, Score: 0}, nil
+	return &hexagon.CheckResult{Passed: true, Score: 0}, nil
 }

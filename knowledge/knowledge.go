@@ -21,7 +21,7 @@ package knowledge
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"math"
 	"sort"
 	"strings"
@@ -147,9 +147,9 @@ type ChunkSearcher interface {
 // 协调写路径（DocumentRepository）和读路径（ChunkSearcher），
 // 加上 hexagon 的 Splitter / Embedder，完成完整的 RAG 管线。
 type Manager struct {
-	repo     DocumentRepository // 写路径: 文档 + Chunk CRUD
-	searcher ChunkSearcher      // 读路径: 向量搜索 + 关键词搜索
-	embedder hexagon.VectorEmbedder    // hexagon/ai-core 向量嵌入（可为 nil）
+	repo     DocumentRepository     // 写路径: 文档 + Chunk CRUD
+	searcher ChunkSearcher          // 读路径: 向量搜索 + 关键词搜索
+	embedder hexagon.VectorEmbedder // hexagon/ai-core 向量嵌入（可为 nil）
 	splitter hexagon.Splitter       // hexagon 文本分块器
 	config   HybridConfig
 }
@@ -314,11 +314,11 @@ func (m *Manager) searchResults(ctx context.Context, query string, topK int) ([]
 	if m.embedder != nil {
 		queryVecs, embedErr := m.embedder.Embed(ctx, []string{query})
 		if embedErr != nil {
-			log.Printf("[knowledge] 查询向量嵌入失败: %v", embedErr)
+			logger.Error("[knowledge] 查询向量嵌入失败", "error", embedErr)
 		} else if len(queryVecs) > 0 {
 			vectorResults, vecErr := m.searcher.VectorSearch(ctx, queryVecs[0], candidateK)
 			if vecErr != nil {
-				log.Printf("[knowledge] 向量搜索失败: %v", vecErr)
+				logger.Error("[knowledge] 向量搜索失败", "error", vecErr)
 			} else {
 				for _, r := range vectorResults {
 					resultMap[r.Chunk.ID] = r
@@ -330,7 +330,7 @@ func (m *Manager) searchResults(ctx context.Context, query string, topK int) ([]
 	// 2. FTS5 关键词搜索（读路径）
 	textResults, textErr := m.searcher.TextSearch(ctx, query, candidateK)
 	if textErr != nil {
-		log.Printf("[knowledge] 关键词搜索失败: %v", textErr)
+		logger.Error("[knowledge] 关键词搜索失败", "error", textErr)
 	} else {
 		for _, r := range textResults {
 			if existing, ok := resultMap[r.Chunk.ID]; ok {

@@ -22,8 +22,8 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -99,11 +99,11 @@ func (a *WechatAdapter) Start(_ context.Context, handler adapter.MessageHandler)
 
 	go func() {
 		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("微信回调服务器错误: %v", err)
+			logger.Error("error", "error", err)
 		}
 	}()
 
-	log.Println("微信公众号适配器已启动")
+	logger.Info("微信公众号适配器已启动")
 	return nil
 }
 
@@ -171,7 +171,7 @@ func (a *WechatAdapter) handleVerify(w http.ResponseWriter, r *http.Request) {
 	if a.checkSignature(signature, timestamp, nonce) {
 		_, _ = w.Write([]byte(echoStr))
 	} else {
-		http.Error(w, "签名验证失败", http.StatusForbidden)
+		http.Error(w, "name", http.StatusForbidden)
 	}
 }
 
@@ -182,7 +182,7 @@ func (a *WechatAdapter) handleMessage(w http.ResponseWriter, r *http.Request) {
 	timestamp := r.URL.Query().Get("timestamp")
 	nonce := r.URL.Query().Get("nonce")
 	if !a.checkSignature(signature, timestamp, nonce) {
-		http.Error(w, "签名验证失败", http.StatusForbidden)
+		http.Error(w, "name", http.StatusForbidden)
 		return
 	}
 
@@ -227,7 +227,7 @@ func (a *WechatAdapter) handleMessage(w http.ResponseWriter, r *http.Request) {
 
 		reply, err := a.handler(context.Background(), unified)
 		if err != nil {
-			log.Printf("微信消息处理失败: %v", err)
+			logger.Error("error", "error", err)
 			return
 		}
 		if reply != nil {

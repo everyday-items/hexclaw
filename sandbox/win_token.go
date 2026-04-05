@@ -17,10 +17,10 @@ const (
 	DISABLE_MAX_PRIVILEGE = 0x1
 	SANDBOX_INERT         = 0x2
 
-	TokenIntegrityLevel   = 25 // TOKEN_INFORMATION_CLASS
-	SE_GROUP_INTEGRITY    = 0x00000020
+	TokenIntegrityLevel = 25 // TOKEN_INFORMATION_CLASS
+	SE_GROUP_INTEGRITY  = 0x00000020
 
-	WinUntrustedLabelSid  = 66 // WELL_KNOWN_SID_TYPE
+	WinUntrustedLabelSid = 66 // WELL_KNOWN_SID_TYPE
 )
 
 // tokenMandatoryLabel removed — inlined in setTokenIntegrityLevel

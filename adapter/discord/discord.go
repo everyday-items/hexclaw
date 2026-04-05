@@ -17,8 +17,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -90,7 +90,7 @@ func (a *DiscordAdapter) Start(_ context.Context, handler adapter.MessageHandler
 	}
 
 	go a.connectLoop()
-	log.Println("Discord 适配器已启动")
+	logger.Info("Discord 适配器已启动")
 	return nil
 }
 
@@ -118,7 +118,7 @@ func (a *DiscordAdapter) Stop(_ context.Context) error {
 		_ = a.queue.Stop(context.Background())
 	}
 
-	log.Println("Discord 适配器已停止")
+	logger.Info("Discord 适配器已停止")
 	return nil
 }
 
@@ -161,7 +161,7 @@ func (a *DiscordAdapter) SendStream(ctx context.Context, chatID string, chunks <
 func (a *DiscordAdapter) connectLoop() {
 	for !a.stopped.Load() {
 		if err := a.connect(); err != nil {
-			log.Printf("Discord Gateway 连接失败: %v", err)
+			logger.Error("Discord Gateway 连接失败", "error", err)
 		}
 		if a.stopped.Load() {
 			return
@@ -235,7 +235,7 @@ func (a *DiscordAdapter) connect() error {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			if !a.stopped.Load() {
-				log.Printf("Discord 读取消息出错: %v", err)
+				logger.Error("Discord 读取消息出错", "error", err)
 			}
 			return err
 		}
@@ -275,7 +275,7 @@ func (a *DiscordAdapter) heartbeat(conn *websocket.Conn, interval time.Duration,
 			err := conn.WriteJSON(data)
 			a.mu.Unlock()
 			if err != nil {
-				log.Printf("Discord 心跳发送失败: %v", err)
+				logger.Error("Discord 心跳发送失败", "error", err)
 				return
 			}
 		case <-a.heartbeatCh:
@@ -304,7 +304,7 @@ func (a *DiscordAdapter) handleEvent(raw []byte) {
 	case 11: // Heartbeat ACK
 		// 正常，不需要处理
 	case 7: // Reconnect
-		log.Println("Discord 要求重连")
+		logger.Info("Discord 要求重连")
 		a.mu.Lock()
 		if a.conn != nil {
 			a.conn.Close()
@@ -322,7 +322,7 @@ func (a *DiscordAdapter) handleDispatch(eventType string, data json.RawMessage) 
 		}
 		json.Unmarshal(data, &ready)
 		a.sessionID = ready.SessionID
-		log.Println("Discord Bot 已就绪")
+		logger.Info("Discord Bot 已就绪")
 
 	case "MESSAGE_CREATE":
 		a.handleMessageCreate(data)
@@ -333,7 +333,7 @@ func (a *DiscordAdapter) handleDispatch(eventType string, data json.RawMessage) 
 func (a *DiscordAdapter) handleMessageCreate(data json.RawMessage) {
 	var msg discordMessage
 	if err := json.Unmarshal(data, &msg); err != nil {
-		log.Printf("解析 Discord 消息失败: %v", err)
+		logger.Error("error", "error", err)
 		return
 	}
 
@@ -365,12 +365,16 @@ func (a *DiscordAdapter) handleMessageCreate(data json.RawMessage) {
 
 		reply, err := a.handler(ctx, unified)
 		if err != nil {
-			log.Printf("Discord 消息处理失败: %v", err)
-			_ = a.Send(ctx, msg.ChannelID, &adapter.Reply{Content: "处理消息时出错，请稍后重试。"})
+			logger.Error("Discord 消息处理失败", "error", err)
+			errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer errCancel()
+			_ = a.Send(errCtx, msg.ChannelID, &adapter.Reply{Content: "处理消息时出错，请稍后重试。"})
 			return
 		}
 		if reply != nil {
-			_ = a.Send(ctx, msg.ChannelID, reply)
+			sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer sendCancel()
+			_ = a.Send(sendCtx, msg.ChannelID, reply)
 		}
 	}()
 }

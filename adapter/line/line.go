@@ -16,8 +16,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -87,11 +87,11 @@ func (a *LineAdapter) Start(ctx context.Context, handler adapter.MessageHandler)
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Printf("[LINE] Webhook 监听端口 %d", a.config.WebhookPort)
+	logger.Info("[LINE] Webhook 监听端口", "webhook_port", a.config.WebhookPort)
 
 	go func() {
 		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("[LINE] 服务器错误: %v", err)
+			logger.Error("[LINE] 服务器错误", "error", err)
 		}
 	}()
 
@@ -254,7 +254,7 @@ func (a *LineAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			if a.handler != nil {
 				reply, err := a.handler(ctx, m)
 				if err != nil {
-					log.Printf("[LINE] 处理消息错误: %v", err)
+					logger.Error("[LINE] 处理消息错误", "error", err)
 					return
 				}
 				if reply != nil {
@@ -265,8 +265,10 @@ func (a *LineAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) {
 						}
 						reply.Metadata["reply_token"] = replyToken
 					}
-					if err := a.Send(ctx, m.ChatID, reply); err != nil {
-						log.Printf("[LINE] 发送回复失败: %v", err)
+					sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer sendCancel()
+					if err := a.Send(sendCtx, m.ChatID, reply); err != nil {
+						logger.Error("[LINE] 发送回复失败", "error", err)
 					}
 				}
 			}

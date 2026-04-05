@@ -13,8 +13,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -83,11 +83,11 @@ func (a *WhatsAppAdapter) Start(ctx context.Context, handler adapter.MessageHand
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Printf("[WhatsApp] Webhook 监听端口 %d", a.config.WebhookPort)
+	logger.Info("[WhatsApp] Webhook 监听端口", "webhook_port", a.config.WebhookPort)
 
 	go func() {
 		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("[WhatsApp] 服务器错误: %v", err)
+			logger.Error("[WhatsApp] 服务器错误", "error", err)
 		}
 	}()
 
@@ -225,12 +225,12 @@ func (a *WhatsAppAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 					if a.handler != nil {
 						reply, err := a.handler(context.Background(), m)
 						if err != nil {
-							log.Printf("[WhatsApp] 处理消息错误: %v", err)
+							logger.Error("[WhatsApp] 处理消息错误", "error", err)
 							return
 						}
 						if reply != nil {
 							if err := a.Send(context.Background(), m.ChatID, reply); err != nil {
-								log.Printf("[WhatsApp] 发送回复错误: %v", err)
+								logger.Error("[WhatsApp] 发送回复错误", "error", err)
 							}
 						}
 					}

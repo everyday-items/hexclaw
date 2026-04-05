@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/storage"
@@ -62,7 +62,7 @@ func (cm *CheckpointManager) Save(ctx context.Context, data CheckpointData) (str
 		return "", fmt.Errorf("save checkpoint: %w", err)
 	}
 
-	log.Printf("检查点已保存: id=%s session=%s turn=%d", id, data.SessionID, data.Turn)
+	logger.Info("检查点已保存: id", "id", id, "session", data.SessionID, "turn", data.Turn)
 	return id, nil
 }
 

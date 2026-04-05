@@ -28,9 +28,11 @@ func NewMcpInstallerSkill(mcpHub *hub.McpHub, mcpMgr *mcp.Manager, cfgWriter *co
 	}
 }
 
-func (m *McpInstallerSkill) Name() string        { return "manage_mcp_server" }
-func (m *McpInstallerSkill) Description() string  { return "Search, install, or remove MCP servers from HexClaw Hub" }
-func (m *McpInstallerSkill) Match(_ string) bool  { return false }
+func (m *McpInstallerSkill) Name() string { return "manage_mcp_server" }
+func (m *McpInstallerSkill) Description() string {
+	return "Search, install, or remove MCP servers from HexClaw Hub"
+}
+func (m *McpInstallerSkill) Match(_ string) bool { return false }
 
 func (m *McpInstallerSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition("manage_mcp_server",

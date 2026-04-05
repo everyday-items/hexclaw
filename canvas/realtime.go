@@ -63,9 +63,9 @@ type InteractionHandler func(interaction *Interaction) (*PanelUpdate, error)
 // RealtimeExtension 负责实时推送和交互处理。
 type RealtimeExtension struct {
 	mu                  sync.RWMutex
-	subscribers         map[string]*Subscriber          // subscriber ID → subscriber
-	interactionHandlers map[string]InteractionHandler    // panel ID → handler
-	maxSubscribers      int                              // 最大订阅数，防止恶意连接导致 OOM
+	subscribers         map[string]*Subscriber        // subscriber ID → subscriber
+	interactionHandlers map[string]InteractionHandler // panel ID → handler
+	maxSubscribers      int                           // 最大订阅数，防止恶意连接导致 OOM
 }
 
 // NewRealtimeExtension 创建实时扩展

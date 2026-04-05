@@ -22,7 +22,7 @@ package router
 
 import (
 	"fmt"
-	"log"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"sync"
 )
 
@@ -111,7 +111,7 @@ func (r *Dispatcher) Register(cfg AgentConfig) error {
 		r.defaultAgent = cfg.Name
 	}
 
-	log.Printf("Agent 已注册: %s (%s)", cfg.Name, cfg.DisplayName)
+	logger.Info("Agent 已注册", "name", cfg.Name, "display_name", cfg.DisplayName)
 	return nil
 }
 
@@ -226,7 +226,7 @@ func (r *Dispatcher) LoadAll(agents []AgentConfig, defaultAgent string, rules []
 			break
 		}
 	}
-	log.Printf("Agent 路由已加载: %d 个 Agent, %d 条规则, 默认=%s", len(r.agents), len(r.rules), r.defaultAgent)
+	logger.Info("Agent 路由已加载", "agents", len(r.agents), "len", len(r.rules), "default", r.defaultAgent)
 }
 
 // Route 路由消息到对应 Agent
@@ -384,7 +384,7 @@ func (r *Dispatcher) UpdateAgent(cfg AgentConfig) error {
 	updated := cfg
 	r.agents[cfg.Name] = &updated
 
-	log.Printf("Agent 已更新: %s", cfg.Name)
+	logger.Info("Agent 已更新", "name", cfg.Name)
 	return nil
 }
 
