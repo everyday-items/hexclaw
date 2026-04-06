@@ -183,6 +183,29 @@ func (s *Server) handleOllamaUnload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "unloaded"})
 }
 
+// handleOllamaLoad 预热模型到内存
+//
+// POST /api/v1/ollama/load  Body: {"model": "qwen3:8b"}
+func (s *Server) handleOllamaLoad(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Model == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "model is required"})
+		return
+	}
+	loadBody, _ := json.Marshal(map[string]any{"model": req.Model, "prompt": "", "keep_alive": "5m"})
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Post("http://localhost:11434/api/generate", "application/json", bytes.NewReader(loadBody))
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("预热失败: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body) // drain
+	writeJSON(w, http.StatusOK, map[string]string{"status": "loaded"})
+}
+
 // handleOllamaDelete 删除已下载的模型
 //
 // DELETE /api/v1/ollama/models/:name
