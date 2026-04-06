@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	goruntime "runtime"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -242,7 +241,7 @@ func (s *Server) handleOllamaRestart(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cmd = exec.Command("ollama", "serve")
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.SysProcAttr = sysProcAttr()
 	default:
 		// Windows: start ollama
 		cmd = exec.Command("ollama", "serve")
