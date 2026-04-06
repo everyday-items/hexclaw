@@ -12,11 +12,8 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"log/slog"
 
@@ -575,9 +572,6 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	lc.Info("system", fmt.Sprintf("Web UI: http://%s:%d | Chat API: POST /api/v1/chat", cfg.Server.Host, cfg.Server.Port))
 	lc.Info("system", "🦀 HexClaw 已就绪 — 数据全在本地，横行无忧")
 
-	// Ollama 模型自动预热（异步，不阻塞启动）
-	go warmupOllama(lc)
-
 	// 挂载预算控制器 API
 	srv.SetBudgetController(budgetCtrl)
 
@@ -1079,53 +1073,4 @@ func newSecurityCmd() *cobra.Command {
 func extractLLMName(providerName string) string {
 	parts := strings.SplitN(providerName, "-", 2)
 	return parts[0]
-}
-
-// warmupOllama 启动时自动预热 Ollama 模型
-// 条件：Ollama 运行中 + 有已下载模型 + 无模型在内存中 → 加载第一个模型
-func warmupOllama(lc interface{ Info(string, string) }) {
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	// 检查 Ollama 是否运行
-	statusResp, err := client.Get("http://localhost:11434/api/tags")
-	if err != nil {
-		return // Ollama 未运行，静默跳过
-	}
-	defer statusResp.Body.Close()
-
-	var tags struct {
-		Models []struct {
-			Name string `json:"name"`
-		} `json:"models"`
-	}
-	if err := json.NewDecoder(statusResp.Body).Decode(&tags); err != nil || len(tags.Models) == 0 {
-		return // 无已下载模型
-	}
-
-	// 检查是否已有模型在运行
-	psResp, err := client.Get("http://localhost:11434/api/ps")
-	if err == nil {
-		defer psResp.Body.Close()
-		var ps struct {
-			Models []struct {
-				Name string `json:"name"`
-			} `json:"models"`
-		}
-		if json.NewDecoder(psResp.Body).Decode(&ps) == nil && len(ps.Models) > 0 {
-			return // 已有模型在运行，无需预热
-		}
-	}
-
-	// 预热第一个已下载模型
-	modelName := tags.Models[0].Name
-	lc.Info("ollama", fmt.Sprintf("自动预热模型: %s", modelName))
-	loadBody, _ := json.Marshal(map[string]any{"model": modelName, "prompt": "", "keep_alive": "5m"})
-	resp, err := client.Post("http://localhost:11434/api/generate", "application/json", bytes.NewReader(loadBody))
-	if err != nil {
-		lc.Info("ollama", fmt.Sprintf("预热失败（不影响启动）: %v", err))
-		return
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-	lc.Info("ollama", fmt.Sprintf("预热完成: %s", modelName))
 }
