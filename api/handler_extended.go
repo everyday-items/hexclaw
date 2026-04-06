@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
 	"net/http"
@@ -264,7 +265,11 @@ func (s *Server) getStatsJSON() []byte {
 // ─── Version: GET /api/v1/version ──
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"version": s.version, "engine": "Hexagon"})
+	writeJSON(w, http.StatusOK, map[string]string{
+		"version":        s.version,
+		"engine":         "Hexagon",
+		"engine_version": hexagon.Version,
+	})
 }
 
 // ─── Canvas Workflow CRUD + 执行 ──
