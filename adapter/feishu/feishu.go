@@ -455,12 +455,22 @@ func (a *FeishuAdapter) replyAndGetID(ctx context.Context, replyToMsgID, text st
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("飞书 reply 返回 %d: %s", resp.StatusCode, string(respBody))
+	}
+
 	var result struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
 		Data struct {
 			MessageID string `json:"message_id"`
 		} `json:"data"`
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&result)
+	_ = json.Unmarshal(respBody, &result)
+	if result.Code != 0 {
+		return "", fmt.Errorf("飞书 reply 业务错误 code=%d: %s", result.Code, result.Msg)
+	}
 	return result.Data.MessageID, nil
 }
 
