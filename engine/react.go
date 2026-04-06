@@ -658,14 +658,21 @@ func (e *ReActEngine) finalizeReply(
 	providerName, modelName, cacheInput string,
 	toolCalls []adapter.ToolCall,
 ) (*adapter.Reply, error) {
+	// 兜底解析：某些模型在 content 中嵌入 <think>/<thinking> 标签（同步路径）
+	content := resp.Content
+	if cleaned, extracted := extractThinkTags(content); extracted != "" {
+		resp.Content = cleaned
+		content = cleaned
+	}
+
 	assistantMessageID := ""
-	if record, err := e.sessions.SaveAssistantMessageRecord(ctx, sessionID, resp.Content); err != nil {
+	if record, err := e.sessions.SaveAssistantMessageRecord(ctx, sessionID, content); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
 	}
 
-	e.cache.Put(cacheInput, resp.Content, providerName, modelName)
+	e.cache.Put(cacheInput, content, providerName, modelName)
 
 	if resp.Usage.TotalTokens > 0 {
 		costRecord := &storage.CostRecord{
@@ -703,7 +710,7 @@ func (e *ReActEngine) finalizeReply(
 	}
 
 	return &adapter.Reply{
-		Content:   resp.Content,
+		Content:   content,
 		Metadata:  buildReplyMetadata(msg.Metadata, providerName, modelName, assistantMessageID),
 		Usage:     buildUsage(resp.Usage, providerName, modelName),
 		ToolCalls: toolCalls,
@@ -1108,8 +1115,17 @@ func (e *ReActEngine) pipeStream(
 
 	content := fullContent.String()
 
+	// 兜底解析：某些模型（如智谱 glm-z1）在 content 中嵌入 <think>/<thinking> 标签
+	if cleaned, extracted := extractThinkTags(content); extracted != "" && fullReasoning.Len() == 0 {
+		fullReasoning.WriteString(extracted)
+		content = cleaned
+	} else {
+		content = cleaned
+	}
+
 	// LLM 返回空内容时生成诊断提示，避免前端显示空消息
-	if content == "" {
+	// 当 reasoning 存在时，content 为空是正常的（模型仅产生了思考过程）
+	if content == "" && fullReasoning.Len() == 0 {
 		finishReason := ""
 		if result != nil {
 			finishReason = result.FinishReason
@@ -1245,8 +1261,17 @@ func (e *ReActEngine) pipeStreamWithTools(
 	result := llmStream.Result()
 	content := fullContent.String()
 
+	// 兜底解析：某些模型（如智谱 glm-z1）在 content 中嵌入 <think>/<thinking> 标签
+	if cleaned, extracted := extractThinkTags(content); extracted != "" && fullReasoning.Len() == 0 {
+		fullReasoning.WriteString(extracted)
+		content = cleaned
+	} else {
+		content = cleaned
+	}
+
 	// LLM 返回空内容时生成诊断提示，避免前端显示空消息
-	if content == "" {
+	// 当 reasoning 存在时，content 为空是正常的（模型仅产生了思考过程）
+	if content == "" && fullReasoning.Len() == 0 {
 		finishReason := ""
 		if result != nil {
 			finishReason = result.FinishReason
@@ -1854,4 +1879,27 @@ func resolveToolsEnabled(toolsCfg config.LLMToolsConfig, isLocal bool) bool {
 	default: // "auto" 或空
 		return !isLocal
 	}
+}
+
+// extractThinkTags 从 content 开头提取 <think>/<thinking> 标签内容。
+// 返回清理后的 content 和提取出的 reasoning。
+// 仅匹配开头标签，避免误匹配正文中的字面量。
+func extractThinkTags(content string) (cleanContent string, reasoning string) {
+	content = strings.TrimSpace(content)
+	for _, tag := range []string{"thinking", "think"} {
+		open := "<" + tag + ">"
+		close := "</" + tag + ">"
+		if strings.HasPrefix(content, open) {
+			if endIdx := strings.Index(content, close); endIdx != -1 {
+				reasoning = strings.TrimSpace(content[len(open):endIdx])
+				cleanContent = strings.TrimSpace(content[endIdx+len(close):])
+			} else {
+				// 未闭合标签，整段视为 reasoning
+				reasoning = strings.TrimSpace(content[len(open):])
+				cleanContent = ""
+			}
+			return
+		}
+	}
+	return content, ""
 }

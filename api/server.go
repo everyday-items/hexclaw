@@ -741,8 +741,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		trace.L(ctx).Info("流式消费完成", "content_len", content.Len())
+		// 兜底提取 <think>/<thinking> 标签（某些模型在 content chunk 中嵌入）
+		finalContent := strings.TrimSpace(content.String())
+		for _, tag := range []string{"thinking", "think"} {
+			open := "<" + tag + ">"
+			close := "</" + tag + ">"
+			if strings.HasPrefix(finalContent, open) {
+				if endIdx := strings.Index(finalContent, close); endIdx != -1 {
+					finalContent = strings.TrimSpace(finalContent[endIdx+len(close):])
+				}
+				break
+			}
+		}
 		reply = &adapter.Reply{
-			Content:   content.String(),
+			Content:   finalContent,
 			Metadata:  metadata,
 			Usage:     usage,
 			ToolCalls: toolCalls,
