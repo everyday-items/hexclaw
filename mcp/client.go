@@ -26,7 +26,9 @@ import (
 	"fmt"
 	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -182,9 +184,18 @@ func (m *Manager) connectServer(ctx context.Context, cfg ServerConfig) (*connect
 		if cfg.Command == "" {
 			return nil, fmt.Errorf("stdio 传输需要指定 command")
 		}
-		// 解析 args 中的符号链接路径（macOS /tmp → /private/tmp 等）
+		// 解析 args 中的路径：~ 展开 + 符号链接解析（macOS /tmp → /private/tmp 等）
+		homeDir, _ := os.UserHomeDir()
 		resolvedArgs := make([]string, len(cfg.Args))
 		for i, arg := range cfg.Args {
+			// ~ 展开（跨平台：macOS/Linux/Windows 均由 os.UserHomeDir 处理）
+			if homeDir != "" {
+				if arg == "~" {
+					arg = homeDir
+				} else if strings.HasPrefix(arg, "~/") {
+					arg = filepath.Join(homeDir, arg[2:])
+				}
+			}
 			if filepath.IsAbs(arg) {
 				if resolved, err := filepath.EvalSymlinks(arg); err == nil {
 					resolvedArgs[i] = resolved

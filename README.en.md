@@ -16,7 +16,7 @@
 ## Features
 
 ### Core Capabilities
-- **ReAct Agent Engine** — Reasoning + Action loop with multi-turn tool calls and streaming output
+- **ReAct Agent Engine** — Reasoning + Action loop with multi-turn tool calls and streaming output, full streaming tool execution loop (execute → feed results → continue reasoning), reasoning/thinking content persistence
 - **6-Layer Security Gateway** — Auth, rate limiting, cost control, injection detection, permission check, audit logging
 - **LLM Smart Router** — Multi-provider auto-switching, failover, and cost optimization
 - **Skill System** — Built-in search/weather/translation/summary, sandboxed execution, shell allowlist protection
@@ -50,7 +50,7 @@
 | Platform | Method | Status |
 |----------|--------|:------:|
 | Web UI | WebSocket | ✅ |
-| Feishu | HTTP Webhook | ✅ |
+| Feishu | SDK WebSocket + HTTP Webhook | ✅ |
 | Telegram | Long polling | ✅ |
 | DingTalk | HTTP Webhook | ✅ |
 | Discord | Gateway WebSocket | ✅ |
@@ -281,6 +281,7 @@ hexclaw/
 ├── agents/                  # Agent roles (6 preset roles)
 ├── api/                     # REST API server (71 routes)
 │   ├── server.go            #   Core server + chat + route registration
+│   ├── handler_config.go    #   LLM config query/update/test/model discovery API
 │   ├── handler_extended.go  #   Workflow/config/version/stats API
 │   ├── handler_logs.go      #   Log query/stats/stream API
 │   ├── handler_knowledge.go #   Knowledge base API
@@ -345,6 +346,7 @@ hexclaw/
 | GET | `/api/v1/config/llm` | Get LLM config |
 | PUT | `/api/v1/config/llm` | Update LLM config |
 | POST | `/api/v1/config/llm/test` | Test one provider config without persisting it; local Ollama may omit the key |
+| POST | `/api/v1/config/llm/models` | Dynamically fetch available models from a provider (proxies to provider `/models` API) |
 
 ### Knowledge Base
 | Method | Path | Description |
@@ -490,6 +492,7 @@ Installing or uninstalling Markdown skills automatically syncs the runtime skill
 - `GET /api/v1/knowledge/documents` includes `status`, `error_message`, `updated_at`, and `source_type`; `POST /api/v1/knowledge/upload` returns `status`, `source`, `chunk_count`, and `warnings`.
 - `POST /api/v1/agents/rules/test` returns matched rules and scores so the UI can explain why a request was routed to a given agent.
 - Log entries returned by `GET /api/v1/logs` include a stable `domain` field for filtering by functional area such as `chat`, `knowledge`, `integration`, `automation`, or `engine`.
+- `POST /api/v1/config/llm/models` proxies to a provider's `/models` endpoint and returns a normalized model list (`{ models: [{ id, name }] }`); auto-adapts between OpenAI standard format and alternative formats.
 
 ## Development
 
@@ -536,14 +539,14 @@ golangci-lint run
 | Component | Technology |
 |-----------|-----------|
 | Language | Go 1.25+ |
-| Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.3.1-beta |
-| AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.0.5 |
-| Utility Library | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.3 |
+| Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.4.3 |
+| AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.0.8 |
+| Utility Library | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.5 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | Configuration | YAML + environment variables |
 | Storage | SQLite (modernc.org/sqlite) |
 | WebSocket | nhooyr.io/websocket + gorilla/websocket |
-| MCP | modelcontextprotocol/go-sdk v1.3.0 |
+| MCP | modelcontextprotocol/go-sdk v1.4.1 |
 | Security | Hexagon Guard Chain |
 
 ## Contributing
@@ -580,12 +583,25 @@ chore: build/toolchain updates
 
 | Project | Description | Repository |
 |---------|-------------|------------|
-| **Hexagon** | Go AI Agent framework (core engine) v0.3.1-beta | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI core library (LLM/Tool/Memory) v0.0.5 | [ai-core](https://github.com/hexagon-codes/ai-core) |
-| **toolkit** | Go utility library v0.0.3 | [toolkit](https://github.com/hexagon-codes/toolkit) |
+| **Hexagon** | Go AI Agent framework (core engine) v0.4.3 | [hexagon](https://github.com/hexagon-codes/hexagon) |
+| **ai-core** | AI core library (LLM/Tool/Memory) v0.0.8 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **toolkit** | Go utility library v0.0.5 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI dashboard (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
 | **hexclaw-desktop** | HexClaw desktop client (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
 | **hexclaw-ui** | HexClaw web frontend (Vue 3) | [hexclaw-ui](https://github.com/hexagon-codes/hexclaw-ui) |
+
+## Changelog
+
+### v0.3.0
+
+**New Features**
+- **Dynamic Model Discovery** — New `POST /api/v1/config/llm/models` endpoint that proxies to a provider's `/models` API for dynamic model listing. Supports both OpenAI format (`{ data: [...] }`) and alternative format (`{ models: [...] }`)
+- **MCP `~` Path Expansion** — `~` and `~/subpath` in MCP server args are now automatically expanded to the user's home directory, cross-platform via `os.UserHomeDir()` (macOS/Linux/Windows)
+
+**Bug Fixes**
+- **Feishu Thinking Placeholder** — The Feishu adapter now sends a thinking placeholder message (e.g., "🤔 Thinking...") immediately upon receiving a message, then replaces it with the final reply via `patchMessage`. Both SDK (WebSocket) and Webhook paths are covered
+- **Streaming Tool Execution Fix** — `ProcessStream` with tools previously used `pipeStreamWithTools` which did not execute tools. Fixed to use `processStreamToolLoop` which performs full tool execution → feed results → continue LLM reasoning loop
+- **Reasoning Content Persistence** — `pipeStream` and `pipeStreamWithTools` streamed reasoning/thinking content to the frontend but did not collect it for persistence. Added `fullReasoning` collection and new `SaveAssistantMessageWithMeta()` method that saves reasoning to message metadata JSON
 
 ## Contact
 

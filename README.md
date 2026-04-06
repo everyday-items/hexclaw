@@ -16,7 +16,7 @@
 ## 特性
 
 ### 核心能力
-- **ReAct Agent 引擎** — 推理 + 行动循环，支持多轮工具调用与流式输出
+- **ReAct Agent 引擎** — 推理 + 行动循环，支持多轮工具调用与流式输出，流式工具执行完整闭环（执行 → 反馈 → 继续推理），reasoning/thinking 内容持久化
 - **六层安全网关** — 认证、限流、成本控制、注入检测、权限校验、审计日志
 - **LLM 智能路由** — 多 Provider 自动切换，故障降级，成本优化
 - **Skill 系统** — 内置搜索/天气/翻译/摘要，沙箱安全执行，Shell 白名单防护
@@ -50,7 +50,7 @@
 | 平台 | 方式 | 状态 |
 |------|------|:----:|
 | Web UI | WebSocket | ✅ |
-| 飞书 | HTTP Webhook | ✅ |
+| 飞书 | SDK WebSocket + HTTP Webhook | ✅ |
 | Telegram | 长轮询 | ✅ |
 | 钉钉 | HTTP Webhook | ✅ |
 | Discord | Gateway WebSocket | ✅ |
@@ -281,6 +281,7 @@ hexclaw/
 ├── agents/                  # Agent 角色 (6 种预置角色)
 ├── api/                     # REST API 服务 (71 个路由)
 │   ├── server.go            #   核心服务器 + 聊天 + 路由注册
+│   ├── handler_config.go    #   LLM 配置查询/更新/测试/模型发现 API
 │   ├── handler_extended.go  #   工作流/配置/版本/统计 API
 │   ├── handler_logs.go      #   日志查询/统计/实时流 API
 │   ├── handler_knowledge.go #   知识库 API
@@ -345,6 +346,7 @@ hexclaw/
 | GET | `/api/v1/config/llm` | 获取 LLM 配置 |
 | PUT | `/api/v1/config/llm` | 更新 LLM 配置 |
 | POST | `/api/v1/config/llm/test` | 测试单个 Provider 连通性（不落盘；本地 Ollama 可无 Key） |
+| POST | `/api/v1/config/llm/models` | 动态获取 Provider 可用模型列表（代理到 Provider `/models` API） |
 
 ### 知识库
 | 方法 | 路径 | 说明 |
@@ -490,6 +492,7 @@ hexclaw/
 - `GET /api/v1/knowledge/documents` 返回 `status`、`error_message`、`updated_at`、`source_type`；`POST /api/v1/knowledge/upload` 返回 `status`、`source`、`chunk_count`、`warnings`。
 - `POST /api/v1/agents/rules/test` 会返回命中规则与分数，便于解释“为什么路由到这个 Agent”。
 - `GET /api/v1/logs` 的日志项包含稳定 `domain` 字段，可按 `chat / knowledge / integration / automation / engine` 等功能域过滤。
+- `POST /api/v1/config/llm/models` 向 Provider 的 `/models` 端点发起代理请求，返回标准化的模型列表（`{ models: [{ id, name }] }`）；支持 OpenAI 标准格式和替代格式的自动适配。
 
 ## 开发
 
@@ -536,9 +539,9 @@ golangci-lint run
 | 组件 | 技术 |
 |------|------|
 | 语言 | Go 1.25+ |
-| Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.3.2-beta |
-| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.0.5 |
-| 工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.3 |
+| Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.4.3 |
+| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.0.8 |
+| 工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.5 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | 配置 | YAML + 环境变量 |
 | 存储 | SQLite (modernc.org/sqlite) |
@@ -580,12 +583,25 @@ chore: 构建/工具链
 
 | 项目 | 说明 | 仓库 |
 |------|------|------|
-| **Hexagon** | Go AI Agent 框架 (核心引擎) v0.3.2-beta | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.0.5 | [ai-core](https://github.com/hexagon-codes/ai-core) |
-| **toolkit** | Go 通用工具库 v0.0.3 | [toolkit](https://github.com/hexagon-codes/toolkit) |
+| **Hexagon** | Go AI Agent 框架 (核心引擎) v0.4.3 | [hexagon](https://github.com/hexagon-codes/hexagon) |
+| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.0.8 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **toolkit** | Go 通用工具库 v0.0.5 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI 观测面板 (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
 | **hexclaw-desktop** | HexClaw 桌面客户端 (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
 | **hexclaw-ui** | HexClaw Web 前端 (Vue 3) | [hexclaw-ui](https://github.com/hexagon-codes/hexclaw-ui) |
+
+## 更新日志
+
+### v0.3.0
+
+**新功能**
+- **动态模型发现** — 新增 `POST /api/v1/config/llm/models` 端点，代理到 Provider 的 `/models` API 获取可用模型列表，支持 OpenAI 格式（`{ data: [...] }`）和替代格式（`{ models: [...] }`）
+- **MCP 路径 `~` 展开** — MCP Server 参数中的 `~` 和 `~/subpath` 自动展开为用户主目录，跨平台支持（macOS/Linux/Windows，基于 `os.UserHomeDir()`）
+
+**修复**
+- **飞书思考占位消息** — 飞书适配器收到消息后立即发送思考占位消息（如 "🤔 思考中..."），AI 处理完成后通过 `patchMessage` 替换为最终回复，SDK（WebSocket）和 Webhook 两条路径均已覆盖
+- **流式工具调用修复** — `ProcessStream` 带工具时原使用 `pipeStreamWithTools`（不执行工具），修复为使用 `processStreamToolLoop`，完整执行工具 → 反馈结果 → 继续 LLM 推理循环
+- **Reasoning 内容持久化** — `pipeStream` 和 `pipeStreamWithTools` 将 reasoning/thinking 内容流式推送给前端但未收集用于持久化，新增 `fullReasoning` 收集逻辑和 `SaveAssistantMessageWithMeta()` 方法，将 reasoning 保存到消息元数据 JSON
 
 ## 联系我们
 

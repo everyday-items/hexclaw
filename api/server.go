@@ -319,6 +319,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/config/llm", s.handleGetLLMConfig)
 	mux.HandleFunc("PUT /api/v1/config/llm", s.handleUpdateLLMConfig)
 	mux.HandleFunc("POST /api/v1/config/llm/test", s.handleTestLLMConfig)
+	mux.HandleFunc("POST /api/v1/config/llm/models", s.handleFetchProviderModels)
 
 	// 角色列表 API
 	mux.HandleFunc("GET /api/v1/roles", s.handleListRoles)

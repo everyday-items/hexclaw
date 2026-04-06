@@ -198,26 +198,46 @@ func (a *FeishuAdapter) handleSDKMessage(event *larkim.P2MessageReceiveV1) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	// 先发送思考占位消息，让用户知道 Agent 正在处理
+	thinkingMsgID, thinkErr := a.sendAndGetID(ctx, msg.ChatID, randomThinkingMessage())
+	if thinkErr != nil {
+		logger.Error("[feishu] 发送思考占位消息失败（将降级为直接回复）", "error", thinkErr)
+	}
+
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
 		logger.Error("飞书: 处理消息失败", "error", err)
-		// 错误恢复用独立 context — 原 ctx 可能已 deadline exceeded
-		errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer errCancel()
-		_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{
-			Content: "处理消息时出现错误：" + upstreamerr.PublicMessage(err, "未知错误") + "\n请检查 LLM Provider 配置后重试。",
-		})
+		errContent := "处理消息时出现错误：" + upstreamerr.PublicMessage(err, "未知错误") + "\n请检查 LLM Provider 配置后重试。"
+		if thinkingMsgID != "" {
+			_ = a.patchMessage(ctx, thinkingMsgID, "⚠️ "+errContent)
+		} else {
+			errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer errCancel()
+			_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{Content: errContent})
+		}
 		return
 	}
 
 	if reply == nil {
+		if thinkingMsgID != "" {
+			_ = a.patchMessage(ctx, thinkingMsgID, "(空回复)")
+		}
 		return
 	}
-	// 正常回复也用独立 context，避免处理耗时接近 deadline 时发送失败
-	sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer sendCancel()
-	if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
-		logger.Error("飞书: 发送回复失败", "error", err)
+	// 用最终回复内容替换占位消息
+	if thinkingMsgID != "" {
+		if pErr := a.patchMessage(ctx, thinkingMsgID, reply.Content); pErr != nil {
+			logger.Error("[feishu] 更新占位消息失败，降级为新消息", "error", pErr)
+			sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer sendCancel()
+			_ = a.Send(sendCtx, msg.ChatID, reply)
+		}
+	} else {
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer sendCancel()
+		if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
+			logger.Error("飞书: 发送回复失败", "error", err)
+		}
 	}
 }
 
@@ -484,24 +504,45 @@ func (a *FeishuAdapter) handleMessage(event feishuEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	// 先发送思考占位消息
+	thinkingMsgID, thinkErr := a.sendAndGetID(ctx, msg.ChatID, randomThinkingMessage())
+	if thinkErr != nil {
+		logger.Error("[feishu] 发送思考占位消息失败（将降级为直接回复）", "error", thinkErr)
+	}
+
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
 		logger.Error("飞书: 处理消息失败", "error", err)
-		errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer errCancel()
-		_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{
-			Content: "处理消息时出现错误：" + upstreamerr.PublicMessage(err, "未知错误") + "\n请检查 LLM Provider 配置后重试。",
-		})
+		errContent := "处理消息时出现错误：" + upstreamerr.PublicMessage(err, "未知错误") + "\n请检查 LLM Provider 配置后重试。"
+		if thinkingMsgID != "" {
+			_ = a.patchMessage(ctx, thinkingMsgID, "⚠️ "+errContent)
+		} else {
+			errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer errCancel()
+			_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{Content: errContent})
+		}
 		return
 	}
 
 	if reply == nil {
+		if thinkingMsgID != "" {
+			_ = a.patchMessage(ctx, thinkingMsgID, "(空回复)")
+		}
 		return
 	}
-	sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer sendCancel()
-	if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
-		logger.Error("飞书: 发送回复失败", "error", err)
+	if thinkingMsgID != "" {
+		if pErr := a.patchMessage(ctx, thinkingMsgID, reply.Content); pErr != nil {
+			logger.Error("[feishu] 更新占位消息失败，降级为新消息", "error", pErr)
+			sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer sendCancel()
+			_ = a.Send(sendCtx, msg.ChatID, reply)
+		}
+	} else {
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer sendCancel()
+		if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
+			logger.Error("飞书: 发送回复失败", "error", err)
+		}
 	}
 }
 

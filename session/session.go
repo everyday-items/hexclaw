@@ -126,12 +126,24 @@ func (m *Manager) SaveAssistantMessage(ctx context.Context, sessionID, content s
 
 // SaveAssistantMessageRecord 保存助手回复并返回消息记录。
 func (m *Manager) SaveAssistantMessageRecord(ctx context.Context, sessionID, content string) (*storage.MessageRecord, error) {
+	return m.SaveAssistantMessageWithMeta(ctx, sessionID, content, "")
+}
+
+// SaveAssistantMessageWithMeta 保存助手回复（含 reasoning 等元数据）并返回消息记录。
+func (m *Manager) SaveAssistantMessageWithMeta(ctx context.Context, sessionID, content, reasoning string) (*storage.MessageRecord, error) {
+	meta := "{}"
+	if reasoning != "" {
+		metaJSON, err := json.Marshal(map[string]string{"reasoning": reasoning})
+		if err == nil {
+			meta = string(metaJSON)
+		}
+	}
 	msg := &storage.MessageRecord{
 		ID:        "msg-" + idgen.ShortID(),
 		SessionID: sessionID,
 		Role:      "assistant",
 		Content:   content,
-		Metadata:  "{}",
+		Metadata:  meta,
 		CreatedAt: time.Now(),
 	}
 	if err := m.store.SaveMessage(ctx, msg); err != nil {

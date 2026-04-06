@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/hexagon-codes/toolkit/util/logger"
 	"net/http"
 	"strings"
@@ -276,4 +277,95 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 		Model:     model,
 		LatencyMS: latency,
 	})
+}
+
+// handleFetchProviderModels POST /api/v1/config/llm/models
+//
+// 动态获取 Provider 的可用模型列表。
+// 向 {base_url}/models 发请求（OpenAI 兼容格式），返回标准化的模型列表。
+func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		BaseURL string `json:"base_url"`
+		APIKey  string `json:"api_key"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误"})
+		return
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
+	if baseURL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "base_url 不能为空"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	modelsURL := baseURL + "/models"
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", modelsURL, nil)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}})
+		return
+	}
+	if apiKey := strings.TrimSpace(req.APIKey); apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}, "error": err.Error()})
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}, "error": fmt.Sprintf("HTTP %d", resp.StatusCode)})
+		return
+	}
+
+	// OpenAI 格式: { "data": [{ "id": "gpt-4o", ... }] }
+	// 部分 Provider 用 { "models": [...] }
+	var body struct {
+		Data   []json.RawMessage `json:"data"`
+		Models []json.RawMessage `json:"models"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, resp.Body, 1<<20)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}})
+		return
+	}
+
+	rawModels := body.Data
+	if len(rawModels) == 0 {
+		rawModels = body.Models
+	}
+
+	type modelInfo struct {
+		ID   string `json:"id"`
+		Name string `json:"name,omitempty"`
+	}
+	models := make([]modelInfo, 0, len(rawModels))
+	for _, raw := range rawModels {
+		var m struct {
+			ID      string `json:"id"`
+			Name    string `json:"name"`
+			ModelID string `json:"model_id"`
+		}
+		if err := json.Unmarshal(raw, &m); err != nil {
+			continue
+		}
+		id := m.ID
+		if id == "" {
+			id = m.ModelID
+		}
+		if id == "" {
+			continue
+		}
+		name := m.Name
+		if name == "" {
+			name = id
+		}
+		models = append(models, modelInfo{ID: id, Name: name})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"models": models})
 }

@@ -922,10 +922,9 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		return ch, nil
 	}
 
-	// 有工具：直接推流给前端（thinking + 回复实时可见）
-	ch := make(chan *adapter.ReplyChunk, 16)
-	go e.pipeStreamWithTools(ctx, ch, llmStream, sess.ID, msg, selection.providerName, selection.modelName, cacheInput, nil)
-	return ch, nil
+	// 有工具：走完整工具循环（执行 tool_calls → 喂回结果 → 继续对话）
+	llmStream.Close() // 关闭首轮流，由 processStreamToolLoop 重新发起
+	return e.processStreamToolLoop(ctx, req, &selection, sess, msg, cacheInput)
 }
 
 // processStreamToolLoop 多轮工具循环（后续版本启用）
@@ -1080,15 +1079,19 @@ func (e *ReActEngine) pipeStream(
 	defer llmStream.Close()
 
 	var fullContent strings.Builder
+	var fullReasoning strings.Builder
 
 	reasoningLogged := false
 	for chunk := range llmStream.Chunks() {
 		if chunk.Content == "" && chunk.Reasoning == "" {
 			continue
 		}
-		if chunk.Reasoning != "" && !reasoningLogged {
-			trace.L(ctx).Info("首个 chunk", "type", "reasoning", "preview", chunk.Reasoning[:min(50, len(chunk.Reasoning))])
-			reasoningLogged = true
+		if chunk.Reasoning != "" {
+			fullReasoning.WriteString(chunk.Reasoning)
+			if !reasoningLogged {
+				trace.L(ctx).Info("首个 chunk", "type", "reasoning", "preview", chunk.Reasoning[:min(50, len(chunk.Reasoning))])
+				reasoningLogged = true
+			}
 		}
 		fullContent.WriteString(chunk.Content)
 
@@ -1129,9 +1132,10 @@ func (e *ReActEngine) pipeStream(
 	defer saveCancel()
 	saveCtx = trace.WithLogger(saveCtx, trace.L(ctx))
 
-	// 保存助手回复
+	// 保存助手回复（含 reasoning）
 	assistantMessageID := ""
-	if record, err := e.sessions.SaveAssistantMessageRecord(saveCtx, sessionID, content); err != nil {
+	reasoning := fullReasoning.String()
+	if record, err := e.sessions.SaveAssistantMessageWithMeta(saveCtx, sessionID, content, reasoning); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
@@ -1221,11 +1225,15 @@ func (e *ReActEngine) pipeStreamWithTools(
 	defer llmStream.Close()
 
 	var fullContent strings.Builder
+	var fullReasoning strings.Builder
 	for chunk := range llmStream.Chunks() {
 		if chunk.Content == "" && chunk.Reasoning == "" {
 			continue
 		}
 		fullContent.WriteString(chunk.Content)
+		if chunk.Reasoning != "" {
+			fullReasoning.WriteString(chunk.Reasoning)
+		}
 		select {
 		case ch <- &adapter.ReplyChunk{Content: chunk.Content, Reasoning: chunk.Reasoning}:
 		case <-ctx.Done():
@@ -1261,7 +1269,8 @@ func (e *ReActEngine) pipeStreamWithTools(
 	saveCtx = trace.WithLogger(saveCtx, trace.L(ctx))
 
 	assistantMessageID := ""
-	if record, err := e.sessions.SaveAssistantMessageRecord(saveCtx, sessionID, content); err != nil {
+	reasoning := fullReasoning.String()
+	if record, err := e.sessions.SaveAssistantMessageWithMeta(saveCtx, sessionID, content, reasoning); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
