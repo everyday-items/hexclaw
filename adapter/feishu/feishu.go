@@ -198,10 +198,21 @@ func (a *FeishuAdapter) handleSDKMessage(event *larkim.P2MessageReceiveV1) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// 先发送思考占位消息，让用户知道 Agent 正在处理
-	thinkingMsgID, thinkErr := a.sendAndGetID(ctx, msg.ChatID, randomThinkingMessage())
-	if thinkErr != nil {
-		logger.Error("[feishu] 发送思考占位消息失败（将降级为直接回复）", "error", thinkErr)
+	// 先以回复形式发送思考占位消息，让用户知道 Agent 正在处理
+	var thinkingMsgID string
+	if messageID != "" {
+		var thinkErr error
+		thinkingMsgID, thinkErr = a.replyAndGetID(ctx, messageID, randomThinkingMessage())
+		if thinkErr != nil {
+			logger.Error("[feishu] 发送思考占位消息失败（将降级为直接回复）", "error", thinkErr)
+		}
+	}
+	if thinkingMsgID == "" {
+		var thinkErr error
+		thinkingMsgID, thinkErr = a.sendAndGetID(ctx, msg.ChatID, randomThinkingMessage())
+		if thinkErr != nil {
+			logger.Error("[feishu] 发送思考占位消息失败", "error", thinkErr)
+		}
 	}
 
 	reply, err := a.handler(ctx, msg)
@@ -417,6 +428,42 @@ func (a *FeishuAdapter) sendAndGetID(ctx context.Context, chatID, text string) (
 	return result.Data.MessageID, nil
 }
 
+// replyAndGetID 以回复形式回复指定消息，返回新消息的 message_id
+func (a *FeishuAdapter) replyAndGetID(ctx context.Context, replyToMsgID, text string) (string, error) {
+	token, err := a.getAccessToken(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	body := map[string]any{
+		"msg_type": "text",
+		"content":  marshalTextContent(text),
+	}
+	bodyJSON, _ := json.Marshal(body)
+
+	url := baseURL + "/im/v1/messages/" + replyToMsgID + "/reply"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyJSON))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var result struct {
+		Data struct {
+			MessageID string `json:"message_id"`
+		} `json:"data"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&result)
+	return result.Data.MessageID, nil
+}
+
 // patchMessage 编辑已发送的消息
 func (a *FeishuAdapter) patchMessage(ctx context.Context, messageID, text string) error {
 	token, err := a.getAccessToken(ctx)
@@ -425,7 +472,8 @@ func (a *FeishuAdapter) patchMessage(ctx context.Context, messageID, text string
 	}
 
 	body := map[string]any{
-		"content": marshalTextContent(text),
+		"msg_type": "text",
+		"content":  marshalTextContent(text),
 	}
 	bodyJSON, _ := json.Marshal(body)
 
@@ -441,7 +489,12 @@ func (a *FeishuAdapter) patchMessage(ctx context.Context, messageID, text string
 	if err != nil {
 		return err
 	}
-	_ = resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("飞书 PATCH 消息返回 %d: %s", resp.StatusCode, string(respBody))
+	}
 	return nil
 }
 
@@ -504,10 +557,22 @@ func (a *FeishuAdapter) handleMessage(event feishuEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// 先发送思考占位消息
-	thinkingMsgID, thinkErr := a.sendAndGetID(ctx, msg.ChatID, randomThinkingMessage())
-	if thinkErr != nil {
-		logger.Error("[feishu] 发送思考占位消息失败（将降级为直接回复）", "error", thinkErr)
+	// 先以回复形式发送思考占位消息
+	origMsgID := msgEvent.Message.MessageID
+	var thinkingMsgID string
+	if origMsgID != "" {
+		var thinkErr error
+		thinkingMsgID, thinkErr = a.replyAndGetID(ctx, origMsgID, randomThinkingMessage())
+		if thinkErr != nil {
+			logger.Error("[feishu] 发送思考占位消息失败（将降级为直接回复）", "error", thinkErr)
+		}
+	}
+	if thinkingMsgID == "" {
+		var thinkErr error
+		thinkingMsgID, thinkErr = a.sendAndGetID(ctx, msg.ChatID, randomThinkingMessage())
+		if thinkErr != nil {
+			logger.Error("[feishu] 发送思考占位消息失败", "error", thinkErr)
+		}
 	}
 
 	reply, err := a.handler(ctx, msg)
