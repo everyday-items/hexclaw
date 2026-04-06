@@ -22,10 +22,11 @@ type LLMConfigResponse struct {
 
 // LLMProviderConfigResponse 脱敏后的 Provider 配置
 type LLMProviderConfigResponse struct {
-	APIKey     string `json:"api_key"`
-	BaseURL    string `json:"base_url"`
-	Model      string `json:"model"`
-	Compatible string `json:"compatible"`
+	APIKey     string   `json:"api_key"`
+	BaseURL    string   `json:"base_url"`
+	Model      string   `json:"model"`
+	Models     []string `json:"models,omitempty"`
+	Compatible string   `json:"compatible"`
 }
 
 // LLMConfigUpdateRequest PUT /api/v1/config/llm 请求
@@ -38,10 +39,11 @@ type LLMConfigUpdateRequest struct {
 
 // LLMProviderConfigUpdateItem 更新请求中的 Provider 项
 type LLMProviderConfigUpdateItem struct {
-	APIKey     string `json:"api_key"`
-	BaseURL    string `json:"base_url"`
-	Model      string `json:"model"`
-	Compatible string `json:"compatible"`
+	APIKey     string   `json:"api_key"`
+	BaseURL    string   `json:"base_url"`
+	Model      string   `json:"model"`
+	Models     []string `json:"models,omitempty"`
+	Compatible string   `json:"compatible"`
 }
 
 type llmConnectionTestProvider struct {
@@ -110,6 +112,7 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 			APIKey:     config.MaskAPIKey(p.APIKey),
 			BaseURL:    p.BaseURL,
 			Model:      p.Model,
+			Models:     p.Models,
 			Compatible: p.Compatible,
 		}
 	}
@@ -153,6 +156,7 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 				APIKey:     apiKey,
 				BaseURL:    p.BaseURL,
 				Model:      p.Model,
+				Models:     p.Models,
 				Compatible: p.Compatible,
 			}
 		}

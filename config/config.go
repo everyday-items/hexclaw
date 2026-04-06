@@ -269,12 +269,13 @@ type LLMToolsConfig struct {
 
 // LLMProviderConfig 单个 LLM Provider 配置
 type LLMProviderConfig struct {
-	APIKey       string `yaml:"api_key"`                 // API Key
-	BaseURL      string `yaml:"base_url"`                // 自定义 API 端点（支持中转/私有部署）
-	Model        string `yaml:"model"`                   // 模型名称
-	Compatible   string `yaml:"compatible"`              // 兼容协议: "openai"（用于中转/私有部署）
-	ToolsEnabled *bool  `yaml:"tools_enabled,omitempty"` // 是否启用工具注入（nil=自动判断, true=强制开启, false=强制关闭）
-	MaxTools     int    `yaml:"max_tools,omitempty"`     // 最大注入工具数（0=不限制）
+	APIKey       string   `yaml:"api_key"`                 // API Key
+	BaseURL      string   `yaml:"base_url"`                // 自定义 API 端点（支持中转/私有部署）
+	Model        string   `yaml:"model"`                   // 当前选中的模型
+	Models       []string `yaml:"models,omitempty"`        // 已配置的模型列表（桌面端持久化用）
+	Compatible   string   `yaml:"compatible"`              // 兼容协议: "openai"（用于中转/私有部署）
+	ToolsEnabled *bool    `yaml:"tools_enabled,omitempty"` // 是否启用工具注入（nil=自动判断, true=强制开启, false=强制关闭）
+	MaxTools     int      `yaml:"max_tools,omitempty"`     // 最大注入工具数（0=不限制）
 }
 
 // LLMRoutingConfig 智能路由配置

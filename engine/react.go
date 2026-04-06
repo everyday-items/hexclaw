@@ -1804,22 +1804,16 @@ func isLocalThinkingModel(model string) bool {
 		strings.Contains(m, "qwq")
 }
 
-// injectNoThink 在请求的最后一条用户消息中追加 /no_think 指令，兼容纯文本和多模态消息
+// injectNoThink 在 system prompt 末尾追加 /no_think 指令
+//
+// qwen3/deepseek-r1 等 thinking 模型通过 /no_think 关闭内部推理。
+// 必须放在 system prompt 中，放在用户消息中会被模型当作普通文本输出。
 func injectNoThink(messages []hexagon.Message) {
-	last := len(messages) - 1
-	if last < 0 || messages[last].Role != "user" {
-		return
-	}
-	if messages[last].HasMultiContent() {
-		// 多模态消息：找到第一个 text part 追加
-		for i, part := range messages[last].MultiContent {
-			if part.Type == "text" {
-				messages[last].MultiContent[i].Text += " /no_think"
-				return
-			}
+	for i, msg := range messages {
+		if msg.Role == "system" {
+			messages[i].Content += "\n/no_think"
+			return
 		}
-	} else {
-		messages[last].Content += " /no_think"
 	}
 }
 
