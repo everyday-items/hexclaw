@@ -386,7 +386,8 @@ func (m *Manager) buildChunks(ctx context.Context, doc *Document, ts time.Time) 
 	if m.embedder != nil && len(chunkTexts) > 0 {
 		embeddings, err = m.embedder.Embed(ctx, chunkTexts)
 		if err != nil {
-			return nil, fmt.Errorf("生成向量嵌入失败: %w", err)
+			logger.Warn("[knowledge] 生成向量嵌入失败，降级为纯文本索引", "title", doc.Title, "error", err)
+			embeddings = nil
 		}
 	}
 

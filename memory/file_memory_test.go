@@ -126,8 +126,10 @@ func TestLoadContext_MaxMemoryTruncation(t *testing.T) {
 	dir := t.TempDir()
 	fm, _ := New(Options{Dir: dir, MaxMemory: 3})
 
-	// 写入超过 3 行的内容
-	path := filepath.Join(dir, "MEMORY.md")
+	// 写入超过 3 行的内容到 _global 子目录
+	globalDir := filepath.Join(dir, "_global")
+	os.MkdirAll(globalDir, 0755)
+	path := filepath.Join(globalDir, "MEMORY.md")
 	content := "第一行\n第二行\n第三行\n第四行\n第五行\n"
 	os.WriteFile(path, []byte(content), 0644)
 

@@ -118,6 +118,21 @@ func (a *WebAdapter) SendPermissionRequest(ctx context.Context, sessionID string
 	return wsjson.Write(ctx, conn, msg)
 }
 
+// Broadcast 向所有活跃 WebSocket 连接广播消息
+func (a *WebAdapter) Broadcast(msgType, content string, metadata map[string]string) {
+	msg := wsMessage{
+		Type:     msgType,
+		Content:  content,
+		Metadata: metadata,
+	}
+	a.conns.Range(func(_, value any) bool {
+		if conn, ok := value.(*websocket.Conn); ok {
+			_ = wsjson.Write(context.Background(), conn, msg)
+		}
+		return true
+	})
+}
+
 // Handler 返回 WebSocket HTTP Handler
 //
 // 挂载到主 API 服务器的 /ws 路径：
@@ -256,42 +271,11 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 构建统一消息
-		userID := incoming.UserID
-		if userID == "" {
-			userID = "web-user"
-		}
-		msg := &adapter.Message{
-			ID:          "web-" + idgen.ShortID(),
-			Platform:    adapter.PlatformWeb,
-			InstanceID:  a.Name(),
-			ChatID:      chatID,
-			UserID:      userID,
-			UserName:    "Web User",
-			SessionID:   incoming.SessionID,
-			Content:     incoming.Content,
-			Attachments: incoming.Attachments,
-			Timestamp:   time.Now(),
-			Metadata:    make(map[string]string),
-		}
+		msg := buildAdapterMessage(chatID, incoming)
+		msg.InstanceID = a.Name()
 		// 记录 sessionID → chatID 映射 (用于 Permission 请求推送)
 		if incoming.SessionID != "" {
 			a.sessionConns.Store(incoming.SessionID, chatID)
-		}
-
-		if incoming.Role != "" {
-			msg.Metadata["role"] = incoming.Role
-		}
-		if incoming.Provider != "" {
-			msg.Metadata["provider"] = incoming.Provider
-		}
-		if incoming.Model != "" {
-			msg.Metadata["model"] = incoming.Model
-		}
-		// 合并前端 metadata（如 thinking 开关等）
-		for k, v := range incoming.Metadata {
-			if _, exists := msg.Metadata[k]; !exists {
-				msg.Metadata[k] = v
-			}
 		}
 
 		// 创建请求级 logger
@@ -374,6 +358,7 @@ type wsMessage struct {
 	Content     string               `json:"content"`               // 消息内容
 	Reasoning   string               `json:"reasoning,omitempty"`   // 推理/思考过程（流式 thinking）
 	SessionID   string               `json:"session_id,omitempty"`  // 会话 ID
+	RequestID   string               `json:"request_id,omitempty"`  // 客户端请求 ID
 	UserID      string               `json:"user_id,omitempty"`     // 用户 ID（桌面端传 desktop-user）
 	Provider    string               `json:"provider,omitempty"`    // 显式指定的 Provider
 	Model       string               `json:"model,omitempty"`       // 显式指定的模型
@@ -389,4 +374,40 @@ type wsMessage struct {
 func (m wsMessage) MarshalJSON() ([]byte, error) {
 	type Alias wsMessage
 	return json.Marshal((Alias)(m))
+}
+
+func buildAdapterMessage(chatID string, incoming wsMessage) *adapter.Message {
+	userID := incoming.UserID
+	if userID == "" {
+		userID = "web-user"
+	}
+	metadata := make(map[string]string, len(incoming.Metadata)+4)
+	for k, v := range incoming.Metadata {
+		metadata[k] = v
+	}
+	if incoming.RequestID != "" {
+		metadata["request_id"] = incoming.RequestID
+	}
+	if incoming.Role != "" {
+		metadata["role"] = incoming.Role
+	}
+	if incoming.Provider != "" {
+		metadata["provider"] = incoming.Provider
+	}
+	if incoming.Model != "" {
+		metadata["model"] = incoming.Model
+	}
+
+	return &adapter.Message{
+		ID:          "web-" + idgen.ShortID(),
+		Platform:    adapter.PlatformWeb,
+		ChatID:      chatID,
+		UserID:      userID,
+		UserName:    "Web User",
+		SessionID:   incoming.SessionID,
+		Content:     incoming.Content,
+		Attachments: incoming.Attachments,
+		Timestamp:   time.Now(),
+		Metadata:    metadata,
+	}
 }

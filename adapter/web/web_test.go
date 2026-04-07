@@ -271,6 +271,40 @@ func TestWsMessageJSONDeserializationWithAttachments(t *testing.T) {
 	}
 }
 
+func TestBuildAdapterMessagePreservesRequestIDAndExplicitModelRouting(t *testing.T) {
+	incoming := wsMessage{
+		Type:      "message",
+		Content:   "你好",
+		SessionID: "sess-123",
+		UserID:    "desktop-user",
+		RequestID: "req-ws-001",
+		Provider:  "ollama",
+		Model:     "qwen3.5:9b",
+		Metadata: map[string]string{
+			"thinking": "off",
+			"provider": "ignored",
+		},
+	}
+
+	msg := buildAdapterMessage("chat-1", incoming)
+
+	if msg.ID == "" {
+		t.Fatal("消息 ID 不能为空")
+	}
+	if msg.Metadata["request_id"] != "req-ws-001" {
+		t.Fatalf("request_id 未透传，实际 %q", msg.Metadata["request_id"])
+	}
+	if msg.Metadata["thinking"] != "off" {
+		t.Fatalf("thinking metadata 未透传，实际 %q", msg.Metadata["thinking"])
+	}
+	if msg.Metadata["provider"] != "ollama" {
+		t.Fatalf("显式 provider 应覆盖 metadata provider，实际 %q", msg.Metadata["provider"])
+	}
+	if msg.Metadata["model"] != "qwen3.5:9b" {
+		t.Fatalf("model 未透传，实际 %q", msg.Metadata["model"])
+	}
+}
+
 // TestConnManagement 测试连接管理基本操作
 func TestConnManagement(t *testing.T) {
 	a := New()

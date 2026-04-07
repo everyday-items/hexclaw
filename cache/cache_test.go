@@ -1,8 +1,11 @@
 package cache
 
 import (
+	"database/sql"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 // TestCache_PutAndGet 测试基本存取
@@ -131,6 +134,76 @@ func TestCache_ModelIsolation(t *testing.T) {
 	}
 	if resp, ok := c.Get("你好", "zhipu", "glm-5"); !ok || resp != "glm-5 响应" {
 		t.Fatalf("相同 provider/model 应命中缓存，resp=%q ok=%v", resp, ok)
+	}
+}
+
+func TestCache_SkipsEmptyResponses(t *testing.T) {
+	c := New(Options{Enabled: true, TTL: time.Hour, MaxEntries: 10})
+
+	c.Put("你好", "", "ollama", "qwen3.5:9b")
+	c.Put("你是谁", "   ", "ollama", "qwen3.5:9b")
+
+	if resp, ok := c.Get("你好", "ollama", "qwen3.5:9b"); ok {
+		t.Fatalf("空回复不应写入缓存，实际命中 %q", resp)
+	}
+	if resp, ok := c.Get("你是谁", "ollama", "qwen3.5:9b"); ok {
+		t.Fatalf("空白回复不应写入缓存，实际命中 %q", resp)
+	}
+	if stats := c.Stats(); stats.Entries != 0 {
+		t.Fatalf("空回复不应占用缓存条目，实际 %d", stats.Entries)
+	}
+}
+
+func TestCache_DoDoesNotStoreEmptyResponse(t *testing.T) {
+	c := New(Options{Enabled: true, TTL: time.Hour, MaxEntries: 10})
+
+	resp, err := c.Do("你好", "ollama", "qwen3.5:9b", func() (string, string, error) {
+		return "", "qwen3.5:9b", nil
+	})
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	if resp != "" {
+		t.Fatalf("Do() response = %q, want empty", resp)
+	}
+
+	if cached, ok := c.Get("你好", "ollama", "qwen3.5:9b"); ok {
+		t.Fatalf("Do 不应缓存空回复，实际命中 %q", cached)
+	}
+}
+
+func TestCache_LoadFromDBSkipsEmptyResponses(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`CREATE TABLE llm_cache (
+		key TEXT PRIMARY KEY,
+		response TEXT NOT NULL,
+		provider TEXT NOT NULL,
+		model TEXT NOT NULL,
+		hit_count INTEGER NOT NULL,
+		created_at TIMESTAMP NOT NULL,
+		expires_at TIMESTAMP NOT NULL
+	)`)
+	if err != nil {
+		t.Fatalf("create llm_cache: %v", err)
+	}
+
+	key := hashInput("你好", "ollama", "qwen3.5:9b")
+	_, err = db.Exec(`INSERT INTO llm_cache (key, response, provider, model, hit_count, created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, key, "", "ollama", "qwen3.5:9b", 0, time.Now(), time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("insert empty cache: %v", err)
+	}
+
+	c := New(Options{Enabled: true, TTL: time.Hour, MaxEntries: 10})
+	c.LoadFromDB(db)
+
+	if resp, ok := c.Get("你好", "ollama", "qwen3.5:9b"); ok {
+		t.Fatalf("SQLite 空回复不应恢复到内存缓存，实际命中 %q", resp)
 	}
 }
 

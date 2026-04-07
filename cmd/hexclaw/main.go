@@ -914,6 +914,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			})
 			permHub.SetSender(&webPermissionBridge{wa: wa})
 			fmt.Println("  ✓ Permission  WebSocket 审批已接通")
+
+			// 接通记忆提取通知: Engine → WebAdapter → 前端
+			eng.SetOnMemorySaved(func(content string) {
+				wa.Broadcast("memory_saved", content, nil)
+			})
 		}
 	}
 	if err := instanceMgr.StartEnabled(ctx); err != nil {

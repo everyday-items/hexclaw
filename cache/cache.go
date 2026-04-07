@@ -141,6 +141,10 @@ func (c *Cache) getLocked(key string) (string, bool) {
 		delete(c.entries, key)
 		return "", false
 	}
+	if strings.TrimSpace(entry.Response) == "" {
+		delete(c.entries, key)
+		return "", false
+	}
 
 	entry.HitCount++
 	return entry.Response, true
@@ -189,6 +193,9 @@ func (c *Cache) Do(input, provider, model string, fn func() (response, model str
 // Put 存入缓存
 func (c *Cache) Put(input, response, provider, model string) {
 	if !c.enabled {
+		return
+	}
+	if strings.TrimSpace(response) == "" {
 		return
 	}
 

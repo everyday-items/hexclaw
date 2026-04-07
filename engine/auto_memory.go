@@ -20,7 +20,7 @@ import (
 //   - 只提取用户层面的长期信息，不记忆临时任务
 //   - 不记忆敏感信息（密码、密钥等）
 //   - 异步执行，不阻塞回复
-func (e *ReActEngine) autoExtractMemory(userText, assistantText string) {
+func (e *ReActEngine) autoExtractMemoryForRole(userText, assistantText, role string) {
 	if e.fileMem == nil {
 		return
 	}
@@ -64,11 +64,15 @@ func (e *ReActEngine) autoExtractMemory(userText, assistantText string) {
 			return
 		}
 
-		if err := e.fileMem.SaveMemory(result); err != nil {
+		if err := e.fileMem.SaveEntryForRole(result, "", "chat_extract", role); err != nil {
 			trace.L(ctx).Error("auto-memory: 写入记忆失败", "err", err)
 			return
 		}
 		trace.L(ctx).Info("auto-memory: 已自动记忆", "content", truncateForLog(result, 80))
+
+		if e.onMemorySaved != nil {
+			e.onMemorySaved(result)
+		}
 	}()
 }
 

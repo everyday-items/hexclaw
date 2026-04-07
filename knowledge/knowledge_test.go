@@ -3,6 +3,7 @@ package knowledge
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/hexagon-codes/hexagon/rag/splitter"
@@ -49,6 +50,20 @@ func (m *mockEmbedder) EmbedOne(_ context.Context, text string) ([]float32, erro
 
 func (m *mockEmbedder) Dimension() int {
 	return m.dim
+}
+
+type failingEmbedder struct{}
+
+func (f failingEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+	return nil, errors.New("embedding model missing")
+}
+
+func (f failingEmbedder) EmbedOne(context.Context, string) ([]float32, error) {
+	return nil, errors.New("embedding model missing")
+}
+
+func (f failingEmbedder) Dimension() int {
+	return 8
 }
 
 func testSplitter() *splitter.RecursiveSplitter {
@@ -115,6 +130,35 @@ func TestManager_AddAndQuery_NoEmbedder(t *testing.T) {
 	}
 	if result == "" {
 		t.Fatal("关键词搜索结果不应为空")
+	}
+}
+
+func TestManager_AddDocumentFallsBackToTextIndexWhenEmbeddingFails(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	store := NewSQLiteStore(db)
+	ctx := context.Background()
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("初始化失败: %v", err)
+	}
+
+	mgr := NewManager(store, store, failingEmbedder{}, WithSplitter(testSplitter()))
+
+	doc, err := mgr.AddDocument(ctx, "本地知识库", "本地知识库应在 embedding 模型缺失时仍可写入，并使用 FTS5 文本检索。", "test")
+	if err != nil {
+		t.Fatalf("embedding 失败时应降级为文本索引，实际错误: %v", err)
+	}
+	if doc.ChunkCount == 0 {
+		t.Fatal("降级写入后 chunk 数不应为 0")
+	}
+
+	result, err := mgr.Query(ctx, "FTS5 文本检索", 3)
+	if err != nil {
+		t.Fatalf("降级写入后的文本检索不应失败: %v", err)
+	}
+	if result == "" {
+		t.Fatal("降级写入后应可通过关键词检索到文档")
 	}
 }
 

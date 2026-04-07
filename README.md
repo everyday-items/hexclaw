@@ -540,7 +540,7 @@ golangci-lint run
 |------|------|
 | 语言 | Go 1.25+ |
 | Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.4.3 |
-| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.0.8 |
+| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.0.9 |
 | 工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.5 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | 配置 | YAML + 环境变量 |
@@ -584,7 +584,7 @@ chore: 构建/工具链
 | 项目 | 说明 | 仓库 |
 |------|------|------|
 | **Hexagon** | Go AI Agent 框架 (核心引擎) v0.4.3 | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.0.8 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.0.9 | [ai-core](https://github.com/hexagon-codes/ai-core) |
 | **toolkit** | Go 通用工具库 v0.0.5 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI 观测面板 (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
 | **hexclaw-desktop** | HexClaw 桌面客户端 (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |

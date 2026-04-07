@@ -113,6 +113,7 @@ func (m *Manager) SaveUserMessage(ctx context.Context, sessionID string, msg *ad
 		Role:      "user",
 		Content:   msg.Content,
 		Metadata:  metadata,
+		RequestID: requestIDFromMetadata(msg.Metadata),
 		CreatedAt: time.Now(),
 	}
 	return m.store.SaveMessage(ctx, record)
@@ -131,6 +132,11 @@ func (m *Manager) SaveAssistantMessageRecord(ctx context.Context, sessionID, con
 
 // SaveAssistantMessageWithMeta 保存助手回复（含 reasoning 等元数据）并返回消息记录。
 func (m *Manager) SaveAssistantMessageWithMeta(ctx context.Context, sessionID, content, reasoning string) (*storage.MessageRecord, error) {
+	return m.SaveAssistantMessageWithMetaAndRequestID(ctx, sessionID, content, reasoning, "")
+}
+
+// SaveAssistantMessageWithMetaAndRequestID 保存助手回复（含 reasoning 和 request_id）并返回消息记录。
+func (m *Manager) SaveAssistantMessageWithMetaAndRequestID(ctx context.Context, sessionID, content, reasoning, requestID string) (*storage.MessageRecord, error) {
 	meta := "{}"
 	if reasoning != "" {
 		metaJSON, err := json.Marshal(map[string]string{"reasoning": reasoning})
@@ -144,12 +150,20 @@ func (m *Manager) SaveAssistantMessageWithMeta(ctx context.Context, sessionID, c
 		Role:      "assistant",
 		Content:   content,
 		Metadata:  meta,
+		RequestID: requestID,
 		CreatedAt: time.Now(),
 	}
 	if err := m.store.SaveMessage(ctx, msg); err != nil {
 		return nil, err
 	}
 	return msg, nil
+}
+
+func requestIDFromMetadata(metadata map[string]string) string {
+	if metadata == nil {
+		return ""
+	}
+	return metadata["request_id"]
 }
 
 // BuildContext 构建对话上下文

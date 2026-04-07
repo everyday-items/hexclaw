@@ -2,8 +2,10 @@ package cache
 
 import (
 	"database/sql"
-	"github.com/hexagon-codes/toolkit/util/logger"
+	"strings"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // LoadFromDB 从 SQLite 加载未过期的缓存条目到内存
@@ -12,6 +14,9 @@ import (
 func (c *Cache) LoadFromDB(db *sql.DB) {
 	if !c.enabled || db == nil {
 		return
+	}
+	if _, err := db.Exec("DELETE FROM llm_cache WHERE trim(response) = ''"); err != nil {
+		logger.Error("[cache] 清理空回复缓存失败", "error", err)
 	}
 
 	rows, err := db.Query(
@@ -31,6 +36,9 @@ func (c *Cache) LoadFromDB(db *sql.DB) {
 	for rows.Next() {
 		var e Entry
 		if err := rows.Scan(&e.Key, &e.Response, &e.Provider, &e.Model, &e.HitCount, &e.CreatedAt, &e.ExpiresAt); err != nil {
+			continue
+		}
+		if strings.TrimSpace(e.Response) == "" {
 			continue
 		}
 		if _, exists := c.entries[e.Key]; exists {
@@ -61,7 +69,7 @@ func (c *Cache) PersistToDB(db *sql.DB) {
 	entries := make([]*Entry, 0, len(c.entries))
 	now := time.Now()
 	for _, e := range c.entries {
-		if !c.isExpired(e, now) {
+		if !c.isExpired(e, now) && strings.TrimSpace(e.Response) != "" {
 			entries = append(entries, e)
 		}
 	}
@@ -79,7 +87,7 @@ func (c *Cache) PersistToDB(db *sql.DB) {
 	defer tx.Rollback()
 
 	// 清理过期条目
-	tx.Exec("DELETE FROM llm_cache WHERE expires_at <= ?", now)
+	tx.Exec("DELETE FROM llm_cache WHERE expires_at <= ? OR trim(response) = ''", now)
 
 	stmt, err := tx.Prepare(
 		`INSERT OR REPLACE INTO llm_cache (key, response, provider, model, hit_count, created_at, expires_at)

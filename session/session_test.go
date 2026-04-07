@@ -217,6 +217,45 @@ func TestBuildContextPreservesImageAttachments(t *testing.T) {
 	}
 }
 
+func TestSaveMessagesPersistRequestID(t *testing.T) {
+	mgr, store := newTestManager(t)
+	ctx := context.Background()
+
+	sess, err := mgr.GetOrCreate(ctx, &adapter.Message{
+		Platform: adapter.PlatformWeb,
+		UserID:   "user-001",
+		Content:  "你好",
+	})
+	if err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+
+	err = mgr.SaveUserMessage(ctx, sess.ID, &adapter.Message{
+		Content:  "你好",
+		Metadata: map[string]string{"request_id": "req-001"},
+	})
+	if err != nil {
+		t.Fatalf("保存用户消息失败: %v", err)
+	}
+	_, err = mgr.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, "回答", "", "req-001")
+	if err != nil {
+		t.Fatalf("保存助手消息失败: %v", err)
+	}
+
+	records, err := store.ListMessages(ctx, sess.ID, 10, 0)
+	if err != nil {
+		t.Fatalf("查询消息失败: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("期望 2 条消息，实际 %d", len(records))
+	}
+	for _, record := range records {
+		if record.RequestID != "req-001" {
+			t.Fatalf("%s 消息 request_id 未持久化，实际 %q", record.Role, record.RequestID)
+		}
+	}
+}
+
 func TestGetOrCreate_ReusesSessionByScope(t *testing.T) {
 	mgr, _ := newTestManager(t)
 	ctx := context.Background()

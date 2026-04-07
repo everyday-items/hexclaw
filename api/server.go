@@ -347,16 +347,13 @@ func (s *Server) routes() http.Handler {
 	if s.fileMem != nil {
 		mux.HandleFunc("GET /api/v1/memory", s.handleGetMemory)
 		mux.HandleFunc("POST /api/v1/memory", s.handleSaveMemory)
-		mux.HandleFunc("PUT /api/v1/memory", s.handleUpdateMemory)
-		mux.HandleFunc("DELETE /api/v1/memory", s.handleDeleteMemory)
+		mux.HandleFunc("PUT /api/v1/memory/{id}", s.handleUpdateMemory)
 		mux.HandleFunc("DELETE /api/v1/memory/{id}", s.handleDeleteMemoryItem)
+		mux.HandleFunc("DELETE /api/v1/memory", s.handleDeleteMemory)
 		mux.HandleFunc("GET /api/v1/memory/search", s.handleSearchMemory)
 	} else {
 		mux.HandleFunc("GET /api/v1/memory", func(w http.ResponseWriter, r *http.Request) {
-			writeJSON(w, http.StatusOK, map[string]string{"content": "", "type": "memory"})
-		})
-		mux.HandleFunc("PUT /api/v1/memory", func(w http.ResponseWriter, r *http.Request) {
-			writeJSON(w, http.StatusOK, map[string]string{"message": "记忆模块未启用"})
+			writeJSON(w, http.StatusOK, map[string]any{"entries": []any{}, "summary": "", "capacity": map[string]int{"used": 0, "max": 0}})
 		})
 		mux.HandleFunc("DELETE /api/v1/memory", func(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]string{"message": "记忆模块未启用"})
@@ -592,6 +589,8 @@ type ChatRequest struct {
 	Model       string               `json:"model,omitempty"`       // 显式指定模型（可选）
 	Platform    string               `json:"platform,omitempty"`    // 来源平台（可选：api/desktop，未传时自动推断）
 	Attachments []adapter.Attachment `json:"attachments,omitempty"` // 图片附件列表（可选）
+	Metadata    map[string]string    `json:"metadata,omitempty"`    // 请求级元数据（如 thinking/memory）
+	RequestID   string               `json:"request_id,omitempty"`  // 客户端请求 ID（用于幂等/流式恢复关联）
 }
 
 // ChatResponse 聊天回复
@@ -670,7 +669,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Metadata:    make(map[string]string),
 	}
 
-	// 如果指定了角色，通过元数据传递给引擎
+	for k, v := range req.Metadata {
+		msg.Metadata[k] = v
+	}
+	if req.RequestID != "" {
+		msg.Metadata["request_id"] = req.RequestID
+	}
+
+	// 如果指定了角色，通过元数据传递给引擎；显式字段优先级高于 metadata。
 	if req.Role != "" {
 		msg.Metadata["role"] = req.Role
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/canvas"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/engine"
+	"github.com/hexagon-codes/hexclaw/memory"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/voice"
@@ -74,22 +75,27 @@ func (s *Server) handleListRoles(w http.ResponseWriter, r *http.Request) {
 
 // --- 文件记忆 API ---
 
-// handleGetMemory 获取长期记忆内容
+// handleGetMemory 获取结构化记忆列表
 func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
-	content := s.fileMem.GetMemory()
+	entries := s.fileMem.ParseEntries()
+	if entries == nil {
+		entries = []memory.MemoryEntry{}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"content": content,
-		"context": s.fileMem.LoadContext(),
+		"entries":  entries,
+		"summary":  s.fileMem.LoadContext(),
+		"capacity": s.fileMem.Capacity(),
 	})
 }
 
 // SaveMemoryRequest 保存记忆请求
 type SaveMemoryRequest struct {
 	Content string `json:"content"` // 记忆内容
-	Type    string `json:"type"`    // memory 或 daily
+	Type    string `json:"type"`    // identity/preference/fact/instruction/context
+	Source  string `json:"source"`  // manual/chat_explicit/chat_extract/system
 }
 
-// handleSaveMemory 保存记忆
+// handleSaveMemory 创建单条记忆
 func (s *Server) handleSaveMemory(w http.ResponseWriter, r *http.Request) {
 	var req SaveMemoryRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
@@ -106,21 +112,20 @@ func (s *Server) handleSaveMemory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var err error
-	if req.Type == "daily" {
-		err = s.fileMem.SaveDaily(req.Content)
-	} else {
-		err = s.fileMem.SaveMemory(req.Content)
-	}
-
-	if err != nil {
+	if err := s.fileMem.SaveEntry(req.Content, req.Type, req.Source); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "保存记忆失败: " + err.Error(),
 		})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"message": "记忆已保存"})
+	// 返回刚创建的条目（取最后一条）
+	entries := s.fileMem.ParseEntries()
+	if len(entries) > 0 {
+		writeJSON(w, http.StatusOK, entries[len(entries)-1])
+	} else {
+		writeJSON(w, http.StatusOK, map[string]string{"message": "记忆已保存"})
+	}
 }
 
 // handleSearchMemory 搜索记忆 (FileMemory 关键词 + VectorMemory 语义)

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime"
@@ -31,6 +32,10 @@ import (
 type ctxKey string
 
 const ctxKeySessionUnlock ctxKey = "session_unlock"
+
+const reasoningOnlyFallbackContent = "模型只完成了思考，没有输出最终回答，请重试一次。"
+
+var thinkingOnCompletionTimeout = 90 * time.Second
 
 // ReActEngine 基于 Hexagon ReAct Agent 的引擎实现
 //
@@ -67,6 +72,16 @@ type ReActEngine struct {
 	sessionLock   *session.SessionLock // 会话并发锁
 	budgetCfg     *BudgetConfig        // D17: 预算配置 (非 nil 时每次请求创建独立 BudgetController)
 	bgWg          sync.WaitGroup       // G3: 等待后台 goroutine (压缩/记忆) 完成
+
+	// 记忆提取通知回调 — auto_memory 提取成功后调用，用于通知前端
+	onMemorySaved func(content string)
+}
+
+// SetOnMemorySaved 设置记忆提取成功的通知回调
+func (e *ReActEngine) SetOnMemorySaved(fn func(content string)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.onMemorySaved = fn
 }
 
 type modelOverrideProvider struct {
@@ -374,7 +389,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		}
 
 		assistantMessageID := ""
-		if record, err := e.sessions.SaveAssistantMessageRecord(ctx, sess.ID, result.Content); err != nil {
+		if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, result.Content, "", messageRequestID(msg)); err != nil {
 			trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
 		} else {
 			assistantMessageID = record.ID
@@ -393,7 +408,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		}, nil
 	}
 
-	cacheInput := adapter.AttachmentCacheKey(msg.Content, msg.Attachments)
+	cacheInput := buildLLMCacheInput(msg)
 	selection, err := e.resolveLLMSelection(ctx, msg)
 	if err != nil {
 		return nil, fmt.Errorf("llm 路由失败: %w", err)
@@ -406,7 +421,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
 		}
 		assistantMessageID := ""
-		if record, err := e.sessions.SaveAssistantMessageRecord(ctx, sess.ID, cached); err != nil {
+		if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, cached, "", messageRequestID(msg)); err != nil {
 			trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
 		} else {
 			assistantMessageID = record.ID
@@ -515,8 +530,17 @@ func (e *ReActEngine) completeWithTools(
 
 	// 无工具时直接 Complete，不走工具循环
 	if len(tools) == 0 {
-		resp, err := provider.Complete(ctx, req)
+		resp, thinkingTimedOut, err := e.completeWithThinkingTimeout(ctx, provider, providerName, modelName, req)
 		if err != nil {
+			if thinkingTimedOut {
+				ensureMessageMetadata(msg)
+				msg.Metadata["finish_reason"] = "thinking_timeout"
+				if recovered, ok := e.recoverReasoningOnly(ctx, provider, req); ok {
+					msg.Metadata["recovered_from_reasoning_only"] = "true"
+					resp = &llm.CompletionResponse{Content: recovered}
+					return e.finalizeReply(ctx, sessionID, msg, provider, req, resp, providerName, modelName, cacheInput, nil)
+				}
+			}
 			if !explicitProvider {
 				fallbackP, fbName, fbErr := e.router.Fallback(providerName)
 				if fbErr == nil {
@@ -524,14 +548,14 @@ func (e *ReActEngine) completeWithTools(
 					provider = fallbackP
 					providerName = fbName
 					modelName = e.getProviderModel(fbName, msg.Metadata)
-					resp, err = provider.Complete(ctx, req)
+					resp, _, err = e.completeWithThinkingTimeout(ctx, provider, providerName, modelName, req)
 				}
 			}
 			if err != nil {
 				return nil, fmt.Errorf("provider %s 调用失败: %w", providerName, err)
 			}
 		}
-		return e.finalizeReply(ctx, sessionID, msg, resp, providerName, modelName, cacheInput, nil)
+		return e.finalizeReply(ctx, sessionID, msg, provider, req, resp, providerName, modelName, cacheInput, nil)
 	}
 
 	var allToolCalls []adapter.ToolCall
@@ -550,8 +574,17 @@ func (e *ReActEngine) completeWithTools(
 		}
 
 		req.Messages = messages
-		resp, err := provider.Complete(ctx, req)
+		resp, thinkingTimedOut, err := e.completeWithThinkingTimeout(ctx, provider, providerName, modelName, req)
 		if err != nil {
+			if thinkingTimedOut {
+				ensureMessageMetadata(msg)
+				msg.Metadata["finish_reason"] = "thinking_timeout"
+				if recovered, ok := e.recoverReasoningOnly(ctx, provider, req); ok {
+					msg.Metadata["recovered_from_reasoning_only"] = "true"
+					resp = &llm.CompletionResponse{Content: recovered}
+					return e.finalizeReply(ctx, sessionID, msg, provider, req, resp, providerName, modelName, cacheInput, allToolCalls)
+				}
+			}
 			if explicitProvider || turn > 0 {
 				return nil, fmt.Errorf("provider %s 调用失败: %w", providerName, err)
 			}
@@ -565,7 +598,7 @@ func (e *ReActEngine) completeWithTools(
 			providerName = fbName
 			modelName = e.getProviderModel(fbName, msg.Metadata)
 			// 降级后需重新收集工具（不同 provider 可能支持不同数量）
-			resp, err = provider.Complete(ctx, req)
+			resp, _, err = e.completeWithThinkingTimeout(ctx, provider, providerName, modelName, req)
 			if err != nil {
 				return nil, fmt.Errorf("补全失败（降级后）: %w", err)
 			}
@@ -589,7 +622,7 @@ func (e *ReActEngine) completeWithTools(
 
 		// 无 tool_calls → 最终回复 (最常见路径，零额外延迟)
 		if !resp.HasToolCalls() {
-			return e.finalizeReply(ctx, sessionID, msg, resp, providerName, modelName, cacheInput, allToolCalls)
+			return e.finalizeReply(ctx, sessionID, msg, provider, req, resp, providerName, modelName, cacheInput, allToolCalls)
 		}
 
 		// 有 tool_calls → 执行工具并追加到 messages
@@ -646,7 +679,7 @@ func (e *ReActEngine) completeWithTools(
 	if err != nil {
 		return nil, fmt.Errorf("最终补全失败: %w", err)
 	}
-	return e.finalizeReply(ctx, sessionID, msg, lastResp, providerName, modelName, cacheInput, allToolCalls)
+	return e.finalizeReply(ctx, sessionID, msg, provider, req, lastResp, providerName, modelName, cacheInput, allToolCalls)
 }
 
 // finalizeReply 完成回复的保存、缓存、成本记录等后处理
@@ -654,25 +687,48 @@ func (e *ReActEngine) finalizeReply(
 	ctx context.Context,
 	sessionID string,
 	msg *adapter.Message,
+	provider hexagon.Provider,
+	req hexagon.CompletionRequest,
 	resp *llm.CompletionResponse,
 	providerName, modelName, cacheInput string,
 	toolCalls []adapter.ToolCall,
 ) (*adapter.Reply, error) {
 	// 兜底解析：某些模型在 content 中嵌入 <think>/<thinking> 标签（同步路径）
 	content := resp.Content
+	reasoning := ""
 	if cleaned, extracted := extractThinkTags(content); extracted != "" {
 		resp.Content = cleaned
 		content = cleaned
+		reasoning = extracted
+	}
+	cacheable := true
+	if msg.Metadata["finish_reason"] == "thinking_timeout" || msg.Metadata["recovered_from_reasoning_only"] == "true" {
+		cacheable = false
+	}
+	if strings.TrimSpace(content) == "" && strings.TrimSpace(reasoning) != "" {
+		cacheable = false
+		ensureMessageMetadata(msg)
+		msg.Metadata["finish_reason"] = "reasoning_only"
+		if recovered, ok := e.recoverReasoningOnly(ctx, provider, req); ok {
+			content = recovered
+			resp.Content = recovered
+			msg.Metadata["recovered_from_reasoning_only"] = "true"
+		} else {
+			content = reasoningOnlyFallbackContent
+			resp.Content = content
+		}
 	}
 
 	assistantMessageID := ""
-	if record, err := e.sessions.SaveAssistantMessageRecord(ctx, sessionID, content); err != nil {
+	if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sessionID, content, "", messageRequestID(msg)); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
 	}
 
-	e.cache.Put(cacheInput, content, providerName, modelName)
+	if cacheable {
+		e.cache.Put(cacheInput, content, providerName, modelName)
+	}
 
 	if resp.Usage.TotalTokens > 0 {
 		costRecord := &storage.CostRecord{
@@ -691,8 +747,14 @@ func (e *ReActEngine) finalizeReply(
 		// Note: token 已在 completeWithTools 循环中按轮记录到 per-request budget
 	}
 
-	// 自动记忆提取（异步）
-	e.autoExtractMemory(msg.Content, resp.Content)
+	// 自动记忆提取（异步，尊重全局开关）
+	if msg.Metadata == nil || msg.Metadata["memory"] != "off" {
+		role := ""
+		if msg.Metadata != nil {
+			role = msg.Metadata["role"]
+		}
+		e.autoExtractMemoryForRole(msg.Content, resp.Content, role)
+	}
 
 	// 上下文压缩（异步，G3: 串行化后台写入）
 	if e.compactor != nil {
@@ -715,6 +777,60 @@ func (e *ReActEngine) finalizeReply(
 		Usage:     buildUsage(resp.Usage, providerName, modelName),
 		ToolCalls: toolCalls,
 	}, nil
+}
+
+func (e *ReActEngine) completeWithThinkingTimeout(
+	ctx context.Context,
+	provider hexagon.Provider,
+	providerName, modelName string,
+	req hexagon.CompletionRequest,
+) (*llm.CompletionResponse, bool, error) {
+	if !shouldBoundThinkingCompletion(providerName, modelName, req) {
+		resp, err := provider.Complete(ctx, req)
+		return resp, false, err
+	}
+
+	timeout := thinkingOnCompletionTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			resp, err := provider.Complete(ctx, req)
+			return resp, false, err
+		}
+		if remaining < timeout {
+			timeout = remaining
+		}
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	resp, err := provider.Complete(callCtx, req)
+	if err != nil && errors.Is(err, context.DeadlineExceeded) {
+		trace.L(ctx).Warn("thinking:on 补全超时，准备降级为 thinking:off 重试", "provider", providerName, "model", modelName, "timeout", timeout)
+		return nil, true, err
+	}
+	return resp, false, err
+}
+
+func shouldBoundThinkingCompletion(providerName, modelName string, req hexagon.CompletionRequest) bool {
+	if !isLocalProvider(providerName) || !isLocalThinkingModel(modelName) {
+		return false
+	}
+	if req.Metadata == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(fmt.Sprint(req.Metadata["thinking"])), "on")
+}
+
+func shouldBoundThinkingMessage(providerName, modelName string, metadata map[string]string) bool {
+	if metadata == nil {
+		return false
+	}
+	if !isLocalProvider(providerName) || !isLocalThinkingModel(modelName) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(metadata["thinking"]), "on")
 }
 
 // createAgent 创建 Agent 实例
@@ -811,7 +927,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 			return nil, fmt.Errorf("skill %s 执行失败: %w", matched.Name(), err)
 		}
 		assistantMessageID := ""
-		if record, err := e.sessions.SaveAssistantMessageRecord(ctx, sess.ID, result.Content); err != nil {
+		if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, result.Content, "", messageRequestID(msg)); err != nil {
 			trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
 		} else {
 			assistantMessageID = record.ID
@@ -826,7 +942,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		return singleChunkWithTools(result.Content, withAssistantMessageID(result.Metadata, assistantMessageID), tc), nil
 	}
 
-	cacheInput := adapter.AttachmentCacheKey(msg.Content, msg.Attachments)
+	cacheInput := buildLLMCacheInput(msg)
 	selection, err := e.resolveLLMSelection(ctx, msg)
 	if err != nil {
 		return nil, fmt.Errorf("llm 路由失败: %w", err)
@@ -839,7 +955,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
 		}
 		assistantMessageID := ""
-		if record, err := e.sessions.SaveAssistantMessageRecord(ctx, sess.ID, cached); err != nil {
+		if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, cached, "", messageRequestID(msg)); err != nil {
 			trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
 		} else {
 			assistantMessageID = record.ID
@@ -876,6 +992,44 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 			kbContext = kbResult
 			trace.L(ctx).Info("知识库命中", "query", msg.Content[:min(20, len(msg.Content))], "session", sess.ID)
 		}
+	}
+
+	if shouldBoundThinkingMessage(selection.providerName, selection.modelName, msg.Metadata) {
+		trace.L(ctx).Info("thinking:on 流式请求切换为有界补全", "provider", selection.providerName, "model", selection.modelName, "session", sess.ID)
+		goroutineLaunched = true
+		ch := make(chan *adapter.ReplyChunk, 2)
+		go func() {
+			defer close(ch)
+			if sessionUnlock != nil {
+				defer sessionUnlock()
+			}
+			reply, err := e.completeWithTools(
+				ctx,
+				sess.ID,
+				msg,
+				history,
+				kbContext,
+				selection.provider,
+				selection.providerName,
+				selection.modelName,
+				selection.explicitProvider,
+				cacheInput,
+			)
+			if err != nil {
+				ch <- &adapter.ReplyChunk{Error: err, Done: true}
+				return
+			}
+			if reply.Content != "" {
+				ch <- &adapter.ReplyChunk{Content: reply.Content}
+			}
+			ch <- &adapter.ReplyChunk{
+				Done:      true,
+				Metadata:  reply.Metadata,
+				Usage:     reply.Usage,
+				ToolCalls: reply.ToolCalls,
+			}
+		}()
+		return ch, nil
 	}
 
 	// 7. 构建 CompletionRequest（含 tools + system prompt + 历史 + 知识库 + 用户消息）
@@ -925,7 +1079,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	goroutineLaunched = true // goroutine 内的 defer unlock() 接管锁释放
 	if len(tools) == 0 {
 		ch := make(chan *adapter.ReplyChunk, 16)
-		go e.pipeStream(ctx, ch, llmStream, sess.ID, msg, selection.providerName, selection.modelName, cacheInput)
+		go e.pipeStream(ctx, ch, llmStream, sess.ID, msg, selection.provider, req, selection.providerName, selection.modelName, cacheInput)
 		return ch, nil
 	}
 
@@ -1015,7 +1169,7 @@ func (e *ReActEngine) processStreamToolLoop(
 				), nil
 			}
 			ch := make(chan *adapter.ReplyChunk, 16)
-			go e.pipeStreamWithTools(ctx, ch, finalStream, sess.ID, msg, selection.providerName, selection.modelName, cacheInput, allToolCalls)
+			go e.pipeStreamWithTools(ctx, ch, finalStream, sess.ID, msg, selection.provider, req, selection.providerName, selection.modelName, cacheInput, allToolCalls)
 			return ch, nil
 		}
 
@@ -1063,7 +1217,7 @@ func (e *ReActEngine) processStreamToolLoop(
 		return nil, fmt.Errorf("最终补全失败: %w", err)
 	}
 	ch := make(chan *adapter.ReplyChunk, 16)
-	go e.pipeStreamWithTools(ctx, ch, finalStream, sess.ID, msg, selection.providerName, selection.modelName, cacheInput, allToolCalls)
+	go e.pipeStreamWithTools(ctx, ch, finalStream, sess.ID, msg, selection.provider, req, selection.providerName, selection.modelName, cacheInput, allToolCalls)
 	return ch, nil
 }
 
@@ -1074,6 +1228,8 @@ func (e *ReActEngine) pipeStream(
 	llmStream *hexagon.LLMStream,
 	sessionID string,
 	msg *adapter.Message,
+	provider hexagon.Provider,
+	req hexagon.CompletionRequest,
 	providerName string,
 	modelName string,
 	cacheInput string,
@@ -1114,6 +1270,8 @@ func (e *ReActEngine) pipeStream(
 	result := llmStream.Result()
 
 	content := fullContent.String()
+	generatedContent := false
+	cacheable := true
 
 	// 兜底解析：某些模型（如智谱 glm-z1）在 content 中嵌入 <think>/<thinking> 标签
 	if cleaned, extracted := extractThinkTags(content); extracted != "" && fullReasoning.Len() == 0 {
@@ -1123,9 +1281,21 @@ func (e *ReActEngine) pipeStream(
 		content = cleaned
 	}
 
+	if strings.TrimSpace(content) == "" && fullReasoning.Len() > 0 {
+		cacheable = false
+		generatedContent = true
+		ensureMessageMetadata(msg)
+		msg.Metadata["finish_reason"] = "reasoning_only"
+		if recovered, ok := e.recoverReasoningOnly(ctx, provider, req); ok {
+			content = recovered
+			msg.Metadata["recovered_from_reasoning_only"] = "true"
+		} else {
+			content = reasoningOnlyFallbackContent
+		}
+	}
+
 	// LLM 返回空内容时生成诊断提示，避免前端显示空消息
-	// 当 reasoning 存在时，content 为空是正常的（模型仅产生了思考过程）
-	if content == "" && fullReasoning.Len() == 0 {
+	if strings.TrimSpace(content) == "" && fullReasoning.Len() == 0 {
 		finishReason := ""
 		if result != nil {
 			finishReason = result.FinishReason
@@ -1141,6 +1311,16 @@ func (e *ReActEngine) pipeStream(
 			"2. 模型服务是否正常运行\n"+
 			"3. 请求是否被内容过滤拦截",
 			modelName)
+		generatedContent = true
+		cacheable = false
+	}
+	if generatedContent && strings.TrimSpace(content) != "" {
+		select {
+		case ch <- &adapter.ReplyChunk{Content: content}:
+		case <-ctx.Done():
+			ch <- &adapter.ReplyChunk{Error: ctx.Err(), Done: true}
+			return
+		}
 	}
 
 	// 使用独立 context 进行后续操作，避免请求 ctx 取消后无法保存
@@ -1151,14 +1331,16 @@ func (e *ReActEngine) pipeStream(
 	// 保存助手回复（含 reasoning）
 	assistantMessageID := ""
 	reasoning := fullReasoning.String()
-	if record, err := e.sessions.SaveAssistantMessageWithMeta(saveCtx, sessionID, content, reasoning); err != nil {
+	if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(saveCtx, sessionID, content, reasoning, messageRequestID(msg)); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
 	}
 
 	// 写入语义缓存
-	e.cache.Put(cacheInput, content, providerName, modelName)
+	if cacheable {
+		e.cache.Put(cacheInput, content, providerName, modelName)
+	}
 
 	// 当 provider 未返回 token 统计时，使用 tokenizer 估算 (streaming 路径仅估算 completion)
 	if result != nil && result.Usage.TotalTokens == 0 && content != "" {
@@ -1227,6 +1409,8 @@ func (e *ReActEngine) pipeStreamWithTools(
 	llmStream *hexagon.LLMStream,
 	sessionID string,
 	msg *adapter.Message,
+	provider hexagon.Provider,
+	req hexagon.CompletionRequest,
 	providerName string,
 	modelName string,
 	cacheInput string,
@@ -1260,6 +1444,8 @@ func (e *ReActEngine) pipeStreamWithTools(
 
 	result := llmStream.Result()
 	content := fullContent.String()
+	generatedContent := false
+	cacheable := true
 
 	// 兜底解析：某些模型（如智谱 glm-z1）在 content 中嵌入 <think>/<thinking> 标签
 	if cleaned, extracted := extractThinkTags(content); extracted != "" && fullReasoning.Len() == 0 {
@@ -1269,9 +1455,21 @@ func (e *ReActEngine) pipeStreamWithTools(
 		content = cleaned
 	}
 
+	if strings.TrimSpace(content) == "" && fullReasoning.Len() > 0 {
+		cacheable = false
+		generatedContent = true
+		ensureMessageMetadata(msg)
+		msg.Metadata["finish_reason"] = "reasoning_only"
+		if recovered, ok := e.recoverReasoningOnly(ctx, provider, req); ok {
+			content = recovered
+			msg.Metadata["recovered_from_reasoning_only"] = "true"
+		} else {
+			content = reasoningOnlyFallbackContent
+		}
+	}
+
 	// LLM 返回空内容时生成诊断提示，避免前端显示空消息
-	// 当 reasoning 存在时，content 为空是正常的（模型仅产生了思考过程）
-	if content == "" && fullReasoning.Len() == 0 {
+	if strings.TrimSpace(content) == "" && fullReasoning.Len() == 0 {
 		finishReason := ""
 		if result != nil {
 			finishReason = result.FinishReason
@@ -1287,6 +1485,16 @@ func (e *ReActEngine) pipeStreamWithTools(
 			"2. 模型服务是否正常运行\n"+
 			"3. 请求是否被内容过滤拦截",
 			modelName)
+		generatedContent = true
+		cacheable = false
+	}
+	if generatedContent && strings.TrimSpace(content) != "" {
+		select {
+		case ch <- &adapter.ReplyChunk{Content: content}:
+		case <-ctx.Done():
+			ch <- &adapter.ReplyChunk{Error: ctx.Err(), Done: true}
+			return
+		}
 	}
 
 	saveCtx, saveCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1295,13 +1503,15 @@ func (e *ReActEngine) pipeStreamWithTools(
 
 	assistantMessageID := ""
 	reasoning := fullReasoning.String()
-	if record, err := e.sessions.SaveAssistantMessageWithMeta(saveCtx, sessionID, content, reasoning); err != nil {
+	if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(saveCtx, sessionID, content, reasoning, messageRequestID(msg)); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
 	}
 
-	e.cache.Put(cacheInput, content, providerName, modelName)
+	if cacheable {
+		e.cache.Put(cacheInput, content, providerName, modelName)
+	}
 
 	// 当 provider 未返回 token 统计时，使用 tokenizer 估算 (streaming 路径仅估算 completion)
 	if result != nil && result.Usage.TotalTokens == 0 && content != "" {
@@ -1361,7 +1571,13 @@ func (e *ReActEngine) pipeStreamWithTools(
 		}
 	}
 
-	e.autoExtractMemory(msg.Content, content)
+	if msg.Metadata == nil || msg.Metadata["memory"] != "off" {
+		role := ""
+		if msg.Metadata != nil {
+			role = msg.Metadata["role"]
+		}
+		e.autoExtractMemoryForRole(msg.Content, content, role)
+	}
 }
 
 // buildStreamMessages 构建流式请求的消息列表
@@ -1384,7 +1600,7 @@ func (e *ReActEngine) buildStreamMessages(roleName string, history []hexagon.Mes
 		sysContent += "\n\n[参考知识]\n" + kbContext
 	}
 	// 追加能力上下文：知识库文件列表、Skill/MCP 工具、记忆
-	sysContent += e.buildCapabilityContext(context.Background())
+	sysContent += e.buildCapabilityContext(context.Background(), metadata)
 	messages = append(messages, hexagon.Message{
 		Role:    "system",
 		Content: sysContent,
@@ -1447,7 +1663,7 @@ func (e *ReActEngine) completeDirect(
 	}
 
 	assistantMessageID := ""
-	if record, err := e.sessions.SaveAssistantMessageRecord(ctx, sessionID, resp.Content); err != nil {
+	if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sessionID, resp.Content, "", messageRequestID(msg)); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
@@ -1498,6 +1714,7 @@ func applyCompletionOverrides(req *hexagon.CompletionRequest, metadata map[strin
 	if metadata == nil {
 		return
 	}
+	copyProviderMetadata(req, metadata)
 	if model := requestedModel(metadata); model != "" {
 		req.Model = model
 	}
@@ -1509,6 +1726,93 @@ func applyCompletionOverrides(req *hexagon.CompletionRequest, metadata map[strin
 	if raw := metadata["agent_temperature"]; raw != "" {
 		if temperature, err := strconv.ParseFloat(raw, 64); err == nil {
 			req.Temperature = &temperature
+		}
+	}
+}
+
+func buildLLMCacheInput(msg *adapter.Message) string {
+	if msg == nil {
+		return ""
+	}
+	base := adapter.AttachmentCacheKey(msg.Content, msg.Attachments)
+	var b strings.Builder
+	b.WriteString(base)
+	for _, item := range []struct {
+		key   string
+		value string
+	}{
+		{key: "thinking", value: msg.Metadata["thinking"]},
+		{key: "memory", value: msg.Metadata["memory"]},
+		{key: "role", value: msg.Metadata["role"]},
+		{key: "agent_prompt", value: msg.Metadata["agent_prompt"]},
+		{key: "routed_agent", value: msg.Metadata["routed_agent"]},
+		{key: "agent_model", value: msg.Metadata["agent_model"]},
+	} {
+		if item.value == "" {
+			continue
+		}
+		b.WriteString("\n")
+		b.WriteString(item.key)
+		b.WriteString("=")
+		b.WriteString(item.value)
+	}
+	return b.String()
+}
+
+func ensureMessageMetadata(msg *adapter.Message) {
+	if msg.Metadata == nil {
+		msg.Metadata = make(map[string]string)
+	}
+}
+
+func messageRequestID(msg *adapter.Message) string {
+	if msg == nil || msg.Metadata == nil {
+		return ""
+	}
+	return msg.Metadata["request_id"]
+}
+
+func (e *ReActEngine) recoverReasoningOnly(ctx context.Context, provider hexagon.Provider, req hexagon.CompletionRequest) (string, bool) {
+	if provider == nil {
+		return "", false
+	}
+	retry := req
+	retry.Tools = nil
+	if retry.Metadata == nil {
+		retry.Metadata = make(map[string]any, 1)
+	}
+	retry.Metadata["thinking"] = "off"
+	injectDirectAnswerNoThink(retry.Messages)
+
+	retryCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	resp, err := provider.Complete(retryCtx, retry)
+	if err != nil || resp == nil {
+		return "", false
+	}
+	if cleaned, _ := extractThinkTags(resp.Content); strings.TrimSpace(cleaned) != "" {
+		return strings.TrimSpace(cleaned), true
+	}
+	return "", false
+}
+
+func injectDirectAnswerNoThink(messages []hexagon.Message) {
+	const instruction = "\n/no_think\n请关闭思考过程，只输出最终回答，不要输出 <think>、<thinking> 或角色设定原文。"
+	for i, msg := range messages {
+		if msg.Role == "system" {
+			messages[i].Content += instruction
+			return
+		}
+	}
+}
+
+func copyProviderMetadata(req *hexagon.CompletionRequest, metadata map[string]string) {
+	for _, key := range []string{"thinking", "memory"} {
+		if value := strings.TrimSpace(metadata[key]); value != "" {
+			if req.Metadata == nil {
+				req.Metadata = make(map[string]any, 2)
+			}
+			req.Metadata[key] = value
 		}
 	}
 }
@@ -1539,6 +1843,11 @@ func buildReplyMetadata(metadata map[string]string, providerName, modelName, ass
 	}
 	if v := metadata["routed_agent"]; v != "" {
 		replyMeta["routed_agent"] = v
+	}
+	for _, key := range []string{"request_id", "finish_reason", "recovered_from_reasoning_only"} {
+		if v := metadata[key]; v != "" {
+			replyMeta[key] = v
+		}
 	}
 	return withAssistantMessageID(replyMeta, assistantMessageID)
 }
@@ -1699,7 +2008,7 @@ func requestedModel(metadata map[string]string) string {
 //
 // 让模型了解自己当前的能力：知识库文档列表、Skill/MCP 工具、长期记忆。
 // 参考 Claude Projects / Coze 的设计：模型应知道自己能做什么。
-func (e *ReActEngine) buildCapabilityContext(ctx context.Context) string {
+func (e *ReActEngine) buildCapabilityContext(ctx context.Context, metadata map[string]string) string {
 	var sb strings.Builder
 
 	// 1. 知识库文档列表
@@ -1733,9 +2042,14 @@ func (e *ReActEngine) buildCapabilityContext(ctx context.Context) string {
 		}
 	}
 
-	// 3. 长期记忆
-	if e.fileMem != nil {
-		if mem := e.fileMem.GetMemory(); mem != "" {
+	// 3. 长期记忆（按角色隔离，尊重全局开关）
+	memoryOff := metadata != nil && metadata["memory"] == "off"
+	if e.fileMem != nil && !memoryOff {
+		role := ""
+		if metadata != nil {
+			role = metadata["role"]
+		}
+		if mem := e.fileMem.LoadContextForRole(role); mem != "" {
 			if len(mem) > 500 {
 				mem = mem[:500] + "\n..."
 			}

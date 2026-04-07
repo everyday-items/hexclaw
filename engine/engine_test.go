@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/hexagon-codes/ai-core/llm"
@@ -253,6 +254,29 @@ func TestBuildStreamMessages(t *testing.T) {
 	}
 }
 
+func TestBuildCompletionRequestForwardsThinkingMetadata(t *testing.T) {
+	eng := newEngineWithProvider(t, mockllm.NewLLMProvider("test"))
+
+	req := eng.buildCompletionRequest(&adapter.Message{
+		Content: "你好",
+		Metadata: map[string]string{
+			"thinking": "off",
+			"memory":   "off",
+			"model":    "qwen3.5:9b",
+		},
+	}, nil, "")
+
+	if req.Model != "qwen3.5:9b" {
+		t.Fatalf("model override 未生效，实际 %q", req.Model)
+	}
+	if got := req.Metadata["thinking"]; got != "off" {
+		t.Fatalf("thinking metadata 未进入 CompletionRequest，实际 %#v", req.Metadata)
+	}
+	if got := req.Metadata["memory"]; got != "off" {
+		t.Fatalf("memory metadata 未进入 CompletionRequest，实际 %#v", req.Metadata)
+	}
+}
+
 func TestReActEngine_ReloadLLMConfig(t *testing.T) {
 	dir := t.TempDir()
 	store, err := sqlitestore.New(filepath.Join(dir, "test.db"))
@@ -461,6 +485,250 @@ func TestReActEngine_ProcessCacheSeparatesAttachments(t *testing.T) {
 	}
 }
 
+func TestReActEngine_ProcessCacheSeparatesThinkingMode(t *testing.T) {
+	provider := mockllm.NewLLMProvider("test").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+		mode, _ := req.Metadata["thinking"].(string)
+		if mode == "" {
+			mode = "auto"
+		}
+		return &hexagon.CompletionResponse{
+			Content: "reply-" + mode,
+			Usage:   hexagon.Usage{TotalTokens: 10},
+		}, nil
+	})
+
+	eng := newEngineWithProvider(t, provider)
+	baseMsg := adapter.Message{
+		Platform: adapter.PlatformAPI,
+		UserID:   "user-001",
+		Content:  "同一个问题",
+	}
+
+	off := baseMsg
+	off.ID = "msg-thinking-off"
+	off.Metadata = map[string]string{"thinking": "off"}
+	replyOff, err := eng.Process(context.Background(), &off)
+	if err != nil {
+		t.Fatalf("thinking=off 请求失败: %v", err)
+	}
+
+	on := baseMsg
+	on.ID = "msg-thinking-on"
+	on.Metadata = map[string]string{"thinking": "on"}
+	replyOn, err := eng.Process(context.Background(), &on)
+	if err != nil {
+		t.Fatalf("thinking=on 请求失败: %v", err)
+	}
+
+	if replyOff.Content != "reply-off" {
+		t.Fatalf("thinking=off 回复不匹配: %q", replyOff.Content)
+	}
+	if replyOn.Content != "reply-on" {
+		t.Fatalf("thinking=on 不应命中 off 缓存，实际 %q", replyOn.Content)
+	}
+	if provider.CallCount() != 2 {
+		t.Fatalf("不同 thinking mode 应分别调用 provider，实际 %d 次", provider.CallCount())
+	}
+}
+
+func TestReActEngine_ProcessRecoversReasoningOnlyResponse(t *testing.T) {
+	var calls int32
+	provider := mockllm.NewLLMProvider("test").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+		call := atomic.AddInt32(&calls, 1)
+		if call == 1 {
+			return &hexagon.CompletionResponse{
+				Content: "<think>只生成了思考过程",
+				Usage:   hexagon.Usage{TotalTokens: 10},
+			}, nil
+		}
+		if got := req.Metadata["thinking"]; got != "off" {
+			t.Fatalf("reasoning-only 恢复请求应关闭 thinking，实际 %#v", req.Metadata)
+		}
+		return &hexagon.CompletionResponse{
+			Content: "最终回答",
+			Usage:   hexagon.Usage{TotalTokens: 8},
+		}, nil
+	})
+
+	eng := newEngineWithProvider(t, provider)
+
+	reply, err := eng.Process(context.Background(), &adapter.Message{
+		ID:       "msg-reasoning-only",
+		Platform: adapter.PlatformAPI,
+		UserID:   "user-001",
+		Content:  "你想吃点什么？",
+		Metadata: map[string]string{"thinking": "on"},
+	})
+	if err != nil {
+		t.Fatalf("Process 失败: %v", err)
+	}
+
+	if reply.Content != "最终回答" {
+		t.Fatalf("reasoning-only 应自动恢复为最终回答，实际 %q", reply.Content)
+	}
+	if reply.Metadata["recovered_from_reasoning_only"] != "true" {
+		t.Fatalf("恢复标记未返回，metadata=%#v", reply.Metadata)
+	}
+	if provider.CallCount() != 2 {
+		t.Fatalf("应执行一次恢复重试，实际调用 %d 次", provider.CallCount())
+	}
+}
+
+func TestReActEngine_ProcessRecoversThinkingTimeout(t *testing.T) {
+	var calls int32
+	provider := mockllm.NewLLMProvider("ollama").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+		call := atomic.AddInt32(&calls, 1)
+		if call == 1 {
+			if got := req.Metadata["thinking"]; got != "on" {
+				t.Fatalf("首个请求应保留 thinking:on，实际 %#v", req.Metadata)
+			}
+			return nil, context.DeadlineExceeded
+		}
+		if got := req.Metadata["thinking"]; got != "off" {
+			t.Fatalf("timeout 恢复请求应关闭 thinking，实际 %#v", req.Metadata)
+		}
+		return &hexagon.CompletionResponse{
+			Content: "直接回答",
+			Usage:   hexagon.Usage{TotalTokens: 8},
+		}, nil
+	})
+
+	eng := newEngineWithProviders(t, map[string]hexagon.Provider{
+		"ollama": provider,
+	}, map[string]config.LLMProviderConfig{
+		"ollama": {Model: "qwen3.5:9b"},
+	}, "ollama")
+
+	reply, err := eng.Process(context.Background(), &adapter.Message{
+		ID:       "msg-thinking-timeout",
+		Platform: adapter.PlatformAPI,
+		UserID:   "user-001",
+		Content:  "你想吃点什么？",
+		Metadata: map[string]string{"thinking": "on"},
+	})
+	if err != nil {
+		t.Fatalf("Process 失败: %v", err)
+	}
+
+	if reply.Content != "直接回答" {
+		t.Fatalf("thinking timeout 应自动恢复为直接回答，实际 %q", reply.Content)
+	}
+	if reply.Metadata["finish_reason"] != "thinking_timeout" {
+		t.Fatalf("timeout 标记未返回，metadata=%#v", reply.Metadata)
+	}
+	if reply.Metadata["recovered_from_reasoning_only"] != "true" {
+		t.Fatalf("恢复标记未返回，metadata=%#v", reply.Metadata)
+	}
+	if provider.CallCount() != 2 {
+		t.Fatalf("应执行一次 timeout 恢复重试，实际调用 %d 次", provider.CallCount())
+	}
+}
+
+func TestReActEngine_ProcessStreamRecoversReasoningOnlyResponse(t *testing.T) {
+	provider := &reasoningOnlyStreamProvider{}
+	eng := newEngineWithProvider(t, provider)
+
+	ch, err := eng.ProcessStream(context.Background(), &adapter.Message{
+		ID:       "msg-stream-reasoning-only",
+		Platform: adapter.PlatformAPI,
+		UserID:   "user-001",
+		Content:  "你想吃点什么？",
+		Metadata: map[string]string{"thinking": "on"},
+	})
+	if err != nil {
+		t.Fatalf("ProcessStream 失败: %v", err)
+	}
+
+	var content strings.Builder
+	var done *adapter.ReplyChunk
+	for chunk := range ch {
+		content.WriteString(chunk.Content)
+		if chunk.Done {
+			copied := *chunk
+			done = &copied
+		}
+	}
+
+	if content.String() != "最终回答" {
+		t.Fatalf("reasoning-only 流式回复应恢复为最终回答，实际 %q", content.String())
+	}
+	if done == nil {
+		t.Fatal("未收到 done chunk")
+	}
+	if done.Metadata["recovered_from_reasoning_only"] != "true" {
+		t.Fatalf("恢复标记未返回，metadata=%#v", done.Metadata)
+	}
+	if atomic.LoadInt32(&provider.completeCalls) != 1 {
+		t.Fatalf("应执行一次 Complete 恢复重试，实际 %d", provider.completeCalls)
+	}
+}
+
+func TestReActEngine_ProcessStreamRecoversThinkingTimeout(t *testing.T) {
+	var calls int32
+	provider := mockllm.NewLLMProvider("ollama").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+		call := atomic.AddInt32(&calls, 1)
+		if call == 1 {
+			if got := req.Metadata["thinking"]; got != "on" {
+				t.Fatalf("首个流式降级请求应保留 thinking:on，实际 %#v", req.Metadata)
+			}
+			return nil, context.DeadlineExceeded
+		}
+		if got := req.Metadata["thinking"]; got != "off" {
+			t.Fatalf("stream timeout 恢复请求应关闭 thinking，实际 %#v", req.Metadata)
+		}
+		return &hexagon.CompletionResponse{
+			Content: "流式直接回答",
+			Usage:   hexagon.Usage{TotalTokens: 8},
+		}, nil
+	})
+
+	eng := newEngineWithProviders(t, map[string]hexagon.Provider{
+		"ollama": provider,
+	}, map[string]config.LLMProviderConfig{
+		"ollama": {Model: "qwen3.5:9b"},
+	}, "ollama")
+
+	ch, err := eng.ProcessStream(context.Background(), &adapter.Message{
+		ID:       "msg-stream-thinking-timeout",
+		Platform: adapter.PlatformAPI,
+		UserID:   "user-001",
+		Content:  "你想吃点什么？",
+		Metadata: map[string]string{"thinking": "on"},
+	})
+	if err != nil {
+		t.Fatalf("ProcessStream 失败: %v", err)
+	}
+
+	var content strings.Builder
+	var done *adapter.ReplyChunk
+	for chunk := range ch {
+		if chunk.Error != nil {
+			t.Fatalf("chunk error: %v", chunk.Error)
+		}
+		content.WriteString(chunk.Content)
+		if chunk.Done {
+			copied := *chunk
+			done = &copied
+		}
+	}
+
+	if content.String() != "流式直接回答" {
+		t.Fatalf("thinking timeout 流式回复应恢复为直接回答，实际 %q", content.String())
+	}
+	if done == nil {
+		t.Fatal("未收到 done chunk")
+	}
+	if done.Metadata["finish_reason"] != "thinking_timeout" {
+		t.Fatalf("timeout 标记未返回，metadata=%#v", done.Metadata)
+	}
+	if done.Metadata["recovered_from_reasoning_only"] != "true" {
+		t.Fatalf("恢复标记未返回，metadata=%#v", done.Metadata)
+	}
+	if provider.CallCount() != 2 {
+		t.Fatalf("应执行一次 stream timeout 恢复重试，实际调用 %d 次", provider.CallCount())
+	}
+}
+
 func TestReActEngine_ProcessUsesMultimodalHistory(t *testing.T) {
 	provider := mockllm.NewLLMProvider("test").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
 		if len(req.Messages) >= 3 {
@@ -609,6 +877,39 @@ func (s *echoSkill) Execute(_ context.Context, args map[string]any) (*skill.Resu
 }
 func (s *echoSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition("echo", "回显输入", nil)
+}
+
+type reasoningOnlyStreamProvider struct {
+	completeCalls int32
+	streamCalls   int32
+}
+
+func (p *reasoningOnlyStreamProvider) Name() string { return "test" }
+
+func (p *reasoningOnlyStreamProvider) Complete(_ context.Context, req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+	atomic.AddInt32(&p.completeCalls, 1)
+	if got := req.Metadata["thinking"]; got != "off" {
+		return nil, context.DeadlineExceeded
+	}
+	return &hexagon.CompletionResponse{
+		Content: "最终回答",
+		Usage:   hexagon.Usage{TotalTokens: 8},
+	}, nil
+}
+
+func (p *reasoningOnlyStreamProvider) Stream(_ context.Context, _ hexagon.CompletionRequest) (*hexagon.LLMStream, error) {
+	atomic.AddInt32(&p.streamCalls, 1)
+	body := `data: {"choices":[{"index":0,"delta":{"reasoning":"只生成了思考过程"}}]}` + "\n\n" +
+		`data: [DONE]` + "\n\n"
+	return llm.NewStream(strings.NewReader(body), llm.StreamOpenAIFormat), nil
+}
+
+func (p *reasoningOnlyStreamProvider) Models() []llm.ModelInfo {
+	return []llm.ModelInfo{{ID: "mock-model", Name: "Mock Model"}}
+}
+
+func (p *reasoningOnlyStreamProvider) CountTokens([]llm.Message) (int, error) {
+	return 0, nil
 }
 
 func newEngineWithProvider(t *testing.T, provider hexagon.Provider) *ReActEngine {

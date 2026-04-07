@@ -178,6 +178,43 @@ func TestServer_ChatForwardsExplicitProviderAndModel(t *testing.T) {
 	}
 }
 
+func TestServer_ChatForwardsMetadataAndRequestID(t *testing.T) {
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{
+		reply: &adapter.Reply{Content: "收到"},
+	}
+	srv := NewServer(cfg, eng, nil, nil)
+
+	body := `{"message":"你好","user_id":"test-user","request_id":"req-chat-001","metadata":{"thinking":"off","memory":"off","provider":"ignored"},"provider":"ollama","model":"qwen3.5:9b"}`
+	req := httptest.NewRequest("POST", "/api/v1/chat", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d, body: %s", w.Code, w.Body.String())
+	}
+	if eng.lastMsg == nil {
+		t.Fatal("引擎未收到消息")
+	}
+	if got := eng.lastMsg.Metadata["thinking"]; got != "off" {
+		t.Fatalf("thinking metadata 未透传，实际 %q", got)
+	}
+	if got := eng.lastMsg.Metadata["memory"]; got != "off" {
+		t.Fatalf("memory metadata 未透传，实际 %q", got)
+	}
+	if got := eng.lastMsg.Metadata["request_id"]; got != "req-chat-001" {
+		t.Fatalf("request_id 未透传到 metadata，实际 %q", got)
+	}
+	if got := eng.lastMsg.Metadata["provider"]; got != "ollama" {
+		t.Fatalf("显式 provider 应覆盖 metadata provider，实际 %q", got)
+	}
+	if got := eng.lastMsg.Metadata["model"]; got != "qwen3.5:9b" {
+		t.Fatalf("model 未透传，实际 %q", got)
+	}
+}
+
 func TestServer_ChatReturnsUnderlyingErrorMessage(t *testing.T) {
 	cfg := config.DefaultConfig()
 	eng := &mockEngine{err: context.DeadlineExceeded}
