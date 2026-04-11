@@ -27,12 +27,12 @@ func NewCodeExecSkill(sb sandbox.Sandbox) *CodeExecSkill {
 
 func (s *CodeExecSkill) Name() string { return "code_exec" }
 func (s *CodeExecSkill) Description() string {
-	return "Execute code in a sandboxed environment (Python, JavaScript, Go)"
+	return "Execute code directly and return output. Supports network access, auto-installs missing packages. Use this instead of write_file for any code execution task."
 }
 func (s *CodeExecSkill) Match(_ string) bool { return false } // LLM-only, no keyword trigger
 
 func (s *CodeExecSkill) ToolDefinition() llm.ToolDefinition {
-	return llm.NewToolDefinition("code_exec", "Execute code in a sandboxed environment. Supports Python, JavaScript, and Go.", &llm.Schema{
+	return llm.NewToolDefinition("code_exec", "Execute code and return output immediately. Preferred tool for: web scraping, data processing, calculations, API calls, file parsing. Supports Python/JavaScript/Go with network access and auto dependency install (e.g. requests, pandas). Do NOT use write_file to create scripts — use code_exec to run them directly.", &llm.Schema{
 		Type: "object",
 		Properties: map[string]*llm.Schema{
 			"language": {Type: "string", Description: "Programming language: python, javascript, go"},
