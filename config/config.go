@@ -628,13 +628,24 @@ type BuiltinConfig struct {
 	CodeExecPolicy CodeExecPolicyConfig `yaml:"code_exec_policy"`
 }
 
-// CodeExecPolicyConfig 代码执行审批策略
+// CodeExecPolicyConfig 代码执行审批与沙箱策略
 //
 // RequireApproval 为 true 时，code_exec 工具被分类为 "dangerous"，
 // 每次执行前需要用户确认。设为 false 表示信任沙箱隔离，跳过审批。
 // 默认值为 true（安全优先）。
+//
+// Network 控制沙箱是否允许网络访问。默认 true 以支持抓取网页、调用 API 等场景。
 type CodeExecPolicyConfig struct {
 	RequireApproval *bool `yaml:"require_approval"` // nil 视为 true（安全默认）
+	Network         *bool `yaml:"network"`           // nil 视为 true（允许网络）
+}
+
+// CodeExecNetworkAllowed 返回沙箱是否允许网络访问
+func (c CodeExecPolicyConfig) CodeExecNetworkAllowed() bool {
+	if c.Network == nil {
+		return true
+	}
+	return *c.Network
 }
 
 // CodeExecRequiresApproval 返回 code_exec 是否需要用户审批

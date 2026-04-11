@@ -74,10 +74,11 @@ func DefaultConfig() *Config {
 				Browser:   true,
 				Code:      false, // 高风险，默认关闭
 				Shell:     false, // 高风险，默认关闭
-				CodeExec:  false, // 需沙箱，默认关闭
-				FileOps:   true,  // 受限于 workspace，默认开启
+				CodeExec:  true, // 沙箱代码执行（Python/JS/Go），支持抓取网页、数据处理等
+				FileOps:   true, // 受限于 workspace，默认开启
 				CodeExecPolicy: CodeExecPolicyConfig{
-					RequireApproval: boolPtr(true), // 安全默认：需要用户审批
+					RequireApproval: boolPtr(true),  // 安全默认：需要用户审批
+					Network:         boolPtr(true),  // 允许网络访问：抓取网页、调用 API
 				},
 			},
 		},

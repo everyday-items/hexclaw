@@ -229,7 +229,7 @@ func TestBuildStreamMessages(t *testing.T) {
 		t.Fatalf("期望 2 条消息，得到 %d", len(msgs))
 	}
 	// coder 角色的 system prompt 应不同于默认
-	if msgs[0].Content == systemPrompt {
+	if msgs[0].Content == defaultSystemPrompt {
 		t.Error("指定 coder 角色后 system prompt 应不同于默认")
 	}
 

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/storage"
@@ -328,5 +330,55 @@ func TestGenerateTitleForImageOnlyMessage(t *testing.T) {
 	})
 	if title != "图片消息" {
 		t.Fatalf("图片消息标题不匹配: %q", title)
+	}
+}
+
+type titleSuggestProvider struct {
+	response string
+	err      error
+}
+
+func (p *titleSuggestProvider) Name() string { return "mock" }
+func (p *titleSuggestProvider) Complete(_ context.Context, _ hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
+	return &hexagon.CompletionResponse{Content: p.response}, nil
+}
+func (p *titleSuggestProvider) Stream(context.Context, hexagon.CompletionRequest) (*hexagon.LLMStream, error) {
+	return nil, nil
+}
+func (p *titleSuggestProvider) Models() []llm.ModelInfo {
+	return []llm.ModelInfo{{ID: "mock", Name: "Mock"}}
+}
+func (p *titleSuggestProvider) CountTokens([]llm.Message) (int, error) {
+	return 0, nil
+}
+
+func TestSuggestTitle_NormalizesModelOutput(t *testing.T) {
+	title, err := SuggestTitle(context.Background(), &titleSuggestProvider{
+		response: "标题：周末露营与装备准备\n",
+	}, []*storage.MessageRecord{
+		{Role: "user", Content: "帮我规划这个周末去杭州露营需要带什么"},
+		{Role: "assistant", Content: "可以先从帐篷、睡袋和炊具开始准备"},
+	})
+	if err != nil {
+		t.Fatalf("SuggestTitle 返回错误: %v", err)
+	}
+	if title != "周末露营与装备准备" {
+		t.Fatalf("title=%q, want %q", title, "周末露营与装备准备")
+	}
+}
+
+func TestSuggestTitle_FallsBackWhenProviderReturnsEmpty(t *testing.T) {
+	title, err := SuggestTitle(context.Background(), &titleSuggestProvider{}, []*storage.MessageRecord{
+		{Role: "user", Content: "请帮我写一个 Go 的重试中间件"},
+		{Role: "assistant", Content: "可以先定义回退策略和最大重试次数"},
+	})
+	if err != nil {
+		t.Fatalf("SuggestTitle 返回错误: %v", err)
+	}
+	if title != "请帮我写一个 Go 的重试中间件" {
+		t.Fatalf("fallback title=%q", title)
 	}
 }

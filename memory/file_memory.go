@@ -20,11 +20,27 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	fileutil "github.com/hexagon-codes/toolkit/util/file"
+)
+
+const (
+	memoryActiveFile  = "MEMORY.md"
+	memoryArchiveFile = "MEMORY.archive.md"
+
+	MemoryViewActive   = "active"
+	MemoryViewArchived = "archived"
+	MemoryViewAll      = "all"
+
+	MemoryStatusActive   = "active"
+	MemoryStatusArchived = "archived"
+
+	defaultListLimit = 50
+	maxListLimit     = 200
 )
 
 // Options 记忆配置选项
@@ -109,7 +125,7 @@ func (fm *FileMemory) SaveDaily(content string) error {
 func (fm *FileMemory) GetMemory() string {
 	fm.mu.RLock()
 	defer fm.mu.RUnlock()
-	return fm.readFileFrom(fm.roleDir(""), "MEMORY.md")
+	return fm.readFileFrom(fm.roleDir(""), memoryActiveFile)
 }
 
 // GetDaily 获取指定日期的日记
@@ -198,19 +214,39 @@ type SearchResult struct {
 
 // MemoryEntry 结构化记忆条目（从 MEMORY.md 行解析而来）
 type MemoryEntry struct {
-	ID        string `json:"id"`         // 行号 hash，如 "m-7"
-	Content   string `json:"content"`    // 记忆正文
-	Type      string `json:"type"`       // identity/preference/fact/instruction/context
-	Source    string `json:"source"`     // manual/chat_explicit/chat_extract/system
-	CreatedAt string `json:"created_at"` // ISO 时间
-	UpdatedAt string `json:"updated_at"` // ISO 时间
-	HitCount  int    `json:"hit_count"`  // 命中次数（预留）
+	ID         string `json:"id"`         // 行号 hash，如 "m-7"
+	Content    string `json:"content"`    // 记忆正文
+	Type       string `json:"type"`       // identity/preference/fact/instruction/context
+	Source     string `json:"source"`     // manual/chat_explicit/chat_extract/system
+	CreatedAt  string `json:"created_at"` // ISO 时间
+	UpdatedAt  string `json:"updated_at"` // ISO 时间
+	HitCount   int    `json:"hit_count"`  // 命中次数（预留）
+	Status     string `json:"status"`     // active/archived
+	ArchivedAt string `json:"archived_at,omitempty"`
 }
 
 // MemoryCapacity 容量信息
 type MemoryCapacity struct {
-	Used int `json:"used"`
-	Max  int `json:"max"`
+	Used     int `json:"used"`
+	Max      int `json:"max"`
+	Archived int `json:"archived,omitempty"`
+}
+
+// ListOptions 记忆列表查询选项。
+type ListOptions struct {
+	View   string
+	Limit  int
+	Cursor string
+	Type   string
+	Source string
+}
+
+// ListResult 记忆列表分页结果。
+type ListResult struct {
+	Entries    []MemoryEntry `json:"entries"`
+	Total      int           `json:"total"`
+	NextCursor string        `json:"next_cursor,omitempty"`
+	HasMore    bool          `json:"has_more"`
 }
 
 // ParseEntries 将 _global 的 MEMORY.md 解析为结构化条目列表（向后兼容）
@@ -220,20 +256,106 @@ func (fm *FileMemory) ParseEntries() []MemoryEntry {
 
 // Capacity 返回 _global 的容量信息（向后兼容）
 func (fm *FileMemory) Capacity() MemoryCapacity {
-	entries := fm.ParseEntries()
+	entries := fm.parseEntriesFromDir(fm.roleDir(""))
+	archived := fm.parseEntriesFromFile(fm.roleDir(""), memoryArchiveFile, MemoryStatusArchived, "a")
 	return MemoryCapacity{
-		Used: len(entries),
-		Max:  fm.config.MaxMemory,
+		Used:     len(entries),
+		Max:      fm.config.MaxMemory,
+		Archived: len(archived),
 	}
 }
 
 // CapacityForRole 返回合并后的容量信息
 func (fm *FileMemory) CapacityForRole(role string) MemoryCapacity {
 	entries := fm.ParseEntriesForRole(role)
-	return MemoryCapacity{
-		Used: len(entries),
-		Max:  fm.config.MaxMemory,
+	archived := fm.parseEntriesFromFile(fm.roleDir(""), memoryArchiveFile, MemoryStatusArchived, "a")
+	if role != "" {
+		archived = append(archived, fm.parseEntriesFromFile(fm.roleDir(role), memoryArchiveFile, MemoryStatusArchived, "a")...)
 	}
+	return MemoryCapacity{
+		Used:     len(entries),
+		Max:      fm.config.MaxMemory,
+		Archived: len(archived),
+	}
+}
+
+// ListEntries 返回 _global 记忆列表。默认只返回活跃记忆，归档记忆需要显式 view=archived。
+func (fm *FileMemory) ListEntries(opts ListOptions) (ListResult, error) {
+	view := opts.View
+	if view == "" {
+		view = MemoryViewActive
+	}
+
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = defaultListLimit
+	}
+	if limit > maxListLimit {
+		limit = maxListLimit
+	}
+
+	start := 0
+	if opts.Cursor != "" {
+		n, err := strconv.Atoi(opts.Cursor)
+		if err != nil || n < 0 {
+			return ListResult{}, fmt.Errorf("无效的 cursor: %s", opts.Cursor)
+		}
+		start = n
+	}
+
+	globalDir := fm.roleDir("")
+	var entries []MemoryEntry
+	switch view {
+	case MemoryViewActive:
+		entries = fm.parseEntriesFromDir(globalDir)
+	case MemoryViewArchived:
+		entries = fm.parseEntriesFromFile(globalDir, memoryArchiveFile, MemoryStatusArchived, "a")
+	case MemoryViewAll:
+		entries = append(entries, fm.parseEntriesFromDir(globalDir)...)
+		entries = append(entries, fm.parseEntriesFromFile(globalDir, memoryArchiveFile, MemoryStatusArchived, "a")...)
+	default:
+		return ListResult{}, fmt.Errorf("无效的 view: %s", view)
+	}
+	entries = filterMemoryEntries(entries, opts)
+
+	total := len(entries)
+	if start > total {
+		start = total
+	}
+	end := start + limit
+	if end > total {
+		end = total
+	}
+
+	result := ListResult{
+		Entries: entries[start:end],
+		Total:   total,
+		HasMore: end < total,
+	}
+	if result.HasMore {
+		result.NextCursor = strconv.Itoa(end)
+	}
+	if result.Entries == nil {
+		result.Entries = []MemoryEntry{}
+	}
+	return result, nil
+}
+
+func filterMemoryEntries(entries []MemoryEntry, opts ListOptions) []MemoryEntry {
+	if opts.Type == "" && opts.Source == "" {
+		return entries
+	}
+	filtered := make([]MemoryEntry, 0, len(entries))
+	for _, entry := range entries {
+		if opts.Type != "" && entry.Type != opts.Type {
+			continue
+		}
+		if opts.Source != "" && entry.Source != opts.Source {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
 }
 
 // SaveEntry 保存带元数据的记忆条目
@@ -275,7 +397,7 @@ func (fm *FileMemory) SaveEntryForRole(content, memType, source, role string) er
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 
-	path := filepath.Join(targetDir, "MEMORY.md")
+	path := filepath.Join(targetDir, memoryActiveFile)
 	if err := fileutil.MkdirAll(targetDir); err != nil {
 		return fmt.Errorf("创建记忆目录失败: %w", err)
 	}
@@ -328,7 +450,7 @@ func (fm *FileMemory) LoadContextForRole(role string) string {
 	var sb strings.Builder
 
 	// 全局记忆
-	globalMem := fm.readFileFrom(fm.roleDir(""), "MEMORY.md")
+	globalMem := fm.readFileFrom(fm.roleDir(""), memoryActiveFile)
 	if globalMem != "" {
 		lines := strings.Split(globalMem, "\n")
 		if len(lines) > fm.config.MaxMemory {
@@ -341,7 +463,7 @@ func (fm *FileMemory) LoadContextForRole(role string) string {
 
 	// 角色专属记忆
 	if role != "" {
-		roleMem := fm.readFileFrom(fm.roleDir(role), "MEMORY.md")
+		roleMem := fm.readFileFrom(fm.roleDir(role), memoryActiveFile)
 		if roleMem != "" {
 			sb.WriteString(fmt.Sprintf("## 角色记忆 (%s)\n\n", role))
 			sb.WriteString(roleMem)
@@ -385,7 +507,7 @@ func (fm *FileMemory) readFileFrom(dir, filename string) string {
 // isDuplicate 检查新内容是否与已有记忆高度相似
 func (fm *FileMemory) isDuplicate(dir, content string) bool {
 	fm.mu.RLock()
-	raw := fm.readFileFrom(dir, "MEMORY.md")
+	raw := fm.readFileFrom(dir, memoryActiveFile)
 	fm.mu.RUnlock()
 
 	if raw == "" {
@@ -472,7 +594,7 @@ func jaccardSimilarity(a, b string) float64 {
 
 // ─── 容量淘汰（加权评分） ────────────────────────────────
 
-// evictIfNeeded 当容量已满时淘汰评分最低的条目
+// evictIfNeeded 当容量已满时将评分最低的条目降级到归档，避免系统自动删除记忆。
 func (fm *FileMemory) evictIfNeeded(dir string) {
 	entries := fm.parseEntriesFromDir(dir)
 	if len(entries) < fm.config.MaxMemory {
@@ -500,21 +622,7 @@ func (fm *FileMemory) evictIfNeeded(dir string) {
 		return // 全是 instruction，无法淘汰
 	}
 
-	// 删除该行
-	fm.mu.Lock()
-	defer fm.mu.Unlock()
-
-	path := filepath.Join(dir, "MEMORY.md")
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	lines := strings.Split(string(raw), "\n")
-	if lowestIdx >= len(lines) {
-		return
-	}
-	lines = append(lines[:lowestIdx], lines[lowestIdx+1:]...)
-	_ = os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
+	_ = fm.moveEntryLine(dir, memoryActiveFile, memoryArchiveFile, lowestIdx)
 }
 
 // entryEvictionScore 计算条目的保留评分（越高越不该被淘汰）
@@ -554,12 +662,20 @@ func entryEvictionScore(e MemoryEntry, now time.Time) float64 {
 	return hitScore + recencyScore + typeScore + sourceScore
 }
 
-// parseEntriesFromDir 从指定目录解析 MEMORY.md
+// parseEntriesFromDir 从指定目录解析活跃 MEMORY.md
 func (fm *FileMemory) parseEntriesFromDir(dir string) []MemoryEntry {
+	return fm.parseEntriesFromFile(dir, memoryActiveFile, MemoryStatusActive, "m")
+}
+
+func (fm *FileMemory) parseEntriesFromFile(dir, filename, status, idPrefix string) []MemoryEntry {
 	fm.mu.RLock()
 	defer fm.mu.RUnlock()
 
-	raw := fm.readFileFrom(dir, "MEMORY.md")
+	data, err := os.ReadFile(filepath.Join(dir, filename))
+	if err != nil {
+		return nil
+	}
+	raw := string(data)
 	if raw == "" {
 		return nil
 	}
@@ -575,11 +691,15 @@ func (fm *FileMemory) parseEntriesFromDir(dir string) []MemoryEntry {
 		}
 
 		e := MemoryEntry{
-			ID:        fmt.Sprintf("m-%d", i),
+			ID:        fmt.Sprintf("%s-%d", idPrefix, i),
 			Type:      "fact",
 			Source:    "manual",
 			CreatedAt: today + "T00:00:00Z",
 			UpdatedAt: today + "T00:00:00Z",
+			Status:    status,
+		}
+		if status == MemoryStatusArchived {
+			e.ArchivedAt = e.UpdatedAt
 		}
 
 		if strings.HasPrefix(line, "- ") {
@@ -612,19 +732,62 @@ func (fm *FileMemory) parseEntriesFromDir(dir string) []MemoryEntry {
 	return entries
 }
 
+func (fm *FileMemory) moveEntryLine(dir, fromFile, toFile string, lineIdx int) error {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+
+	fromPath := filepath.Join(dir, fromFile)
+	raw, err := os.ReadFile(fromPath)
+	if err != nil {
+		return fmt.Errorf("读取记忆文件失败: %w", err)
+	}
+	lines := strings.Split(string(raw), "\n")
+	if lineIdx < 0 || lineIdx >= len(lines) {
+		return fmt.Errorf("记忆条目不存在")
+	}
+
+	line := lines[lineIdx]
+	if strings.TrimSpace(line) == "" {
+		return fmt.Errorf("记忆条目不存在")
+	}
+
+	lines = append(lines[:lineIdx], lines[lineIdx+1:]...)
+	if err := os.WriteFile(fromPath, []byte(strings.Join(lines, "\n")), 0644); err != nil {
+		return fmt.Errorf("更新记忆文件失败: %w", err)
+	}
+
+	if err := fileutil.MkdirAll(dir); err != nil {
+		return fmt.Errorf("创建记忆目录失败: %w", err)
+	}
+	toPath := filepath.Join(dir, toFile)
+	f, err := os.OpenFile(toPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("打开目标记忆文件失败: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(strings.TrimRight(line, "\n") + "\n"); err != nil {
+		return fmt.Errorf("写入目标记忆文件失败: %w", err)
+	}
+	return nil
+}
+
 // UpdateEntry 更新指定 ID 的记忆条目内容
 func (fm *FileMemory) UpdateEntry(id, content string) error {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 
-	path := filepath.Join(fm.dir, "MEMORY.md")
+	filename, lineIdx := parseEntryFileAndLine(id)
+	if lineIdx < 0 {
+		return fmt.Errorf("记忆条目不存在: %s", id)
+	}
+
+	path := filepath.Join(fm.roleDir(""), filename)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("读取记忆文件失败: %w", err)
 	}
 
 	lines := strings.Split(string(raw), "\n")
-	lineIdx := parseEntryLineIndex(id)
 	if lineIdx < 0 || lineIdx >= len(lines) {
 		return fmt.Errorf("记忆条目不存在: %s", id)
 	}
@@ -642,14 +805,18 @@ func (fm *FileMemory) DeleteEntry(id string) error {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 
-	path := filepath.Join(fm.dir, "MEMORY.md")
+	filename, lineIdx := parseEntryFileAndLine(id)
+	if lineIdx < 0 {
+		return fmt.Errorf("记忆条目不存在: %s", id)
+	}
+
+	path := filepath.Join(fm.roleDir(""), filename)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("读取记忆文件失败: %w", err)
 	}
 
 	lines := strings.Split(string(raw), "\n")
-	lineIdx := parseEntryLineIndex(id)
 	if lineIdx < 0 || lineIdx >= len(lines) {
 		return fmt.Errorf("记忆条目不存在: %s", id)
 	}
@@ -660,16 +827,50 @@ func (fm *FileMemory) DeleteEntry(id string) error {
 	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
 }
 
+// ArchiveEntry 将活跃记忆降级到归档。
+func (fm *FileMemory) ArchiveEntry(id string) error {
+	filename, lineIdx := parseEntryFileAndLine(id)
+	if filename != memoryActiveFile || lineIdx < 0 {
+		return fmt.Errorf("只能归档活跃记忆: %s", id)
+	}
+	return fm.moveEntryLine(fm.roleDir(""), memoryActiveFile, memoryArchiveFile, lineIdx)
+}
+
+// RestoreEntry 将归档记忆恢复为活跃记忆。
+func (fm *FileMemory) RestoreEntry(id string) error {
+	filename, lineIdx := parseEntryFileAndLine(id)
+	if filename != memoryArchiveFile || lineIdx < 0 {
+		return fmt.Errorf("只能恢复归档记忆: %s", id)
+	}
+	fm.evictIfNeeded(fm.roleDir(""))
+	return fm.moveEntryLine(fm.roleDir(""), memoryArchiveFile, memoryActiveFile, lineIdx)
+}
+
 // parseEntryLineIndex 从 "m-7" 格式的 ID 解析出行号
 func parseEntryLineIndex(id string) int {
-	if !strings.HasPrefix(id, "m-") {
-		return -1
+	_, idx := parseEntryFileAndLine(id)
+	return idx
+}
+
+func parseEntryFileAndLine(id string) (string, int) {
+	var prefix string
+	switch {
+	case strings.HasPrefix(id, "m-"):
+		prefix = "m-"
+	case strings.HasPrefix(id, "a-"):
+		prefix = "a-"
+	default:
+		return "", -1
 	}
+
 	var n int
-	if _, err := fmt.Sscanf(id[2:], "%d", &n); err != nil {
-		return -1
+	if _, err := fmt.Sscanf(id[len(prefix):], "%d", &n); err != nil {
+		return "", -1
 	}
-	return n
+	if prefix == "a-" {
+		return memoryArchiveFile, n
+	}
+	return memoryActiveFile, n
 }
 
 // rebuildEntryLine 保留行的时间戳和元数据，替换内容部分
@@ -711,7 +912,7 @@ func (fm *FileMemory) UpdateMemory(content string) error {
 
 	dir := fm.roleDir("")
 	_ = fileutil.MkdirAll(dir)
-	path := filepath.Join(dir, "MEMORY.md")
+	path := filepath.Join(dir, memoryActiveFile)
 	return os.WriteFile(path, []byte(content), 0644)
 }
 
@@ -720,19 +921,19 @@ func (fm *FileMemory) ClearAll() error {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 
-	entries, err := os.ReadDir(fm.dir)
-	if err != nil {
-		return fmt.Errorf("读取记忆目录失败: %w", err)
-	}
-
-	for _, entry := range entries {
+	if err := filepath.WalkDir(fm.dir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
-			continue
+			return nil
 		}
-		path := filepath.Join(fm.dir, entry.Name())
 		if err := os.Remove(path); err != nil {
-			return fmt.Errorf("删除文件 %s 失败: %w", entry.Name(), err)
+			return fmt.Errorf("删除文件 %s 失败: %w", path, err)
 		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("清空记忆目录失败: %w", err)
 	}
 	return nil
 }

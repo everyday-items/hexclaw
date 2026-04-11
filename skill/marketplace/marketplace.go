@@ -6,15 +6,20 @@ package marketplace
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/hexagon-codes/toolkit/util/logger"
+
 	fileutil "github.com/hexagon-codes/toolkit/util/file"
 )
+
+// ErrSkillNotInstalled is returned when operating on a skill that is not installed.
+var ErrSkillNotInstalled = errors.New("skill not installed")
 
 // Marketplace 技能市场管理器
 //
@@ -191,7 +196,7 @@ func (m *Marketplace) Uninstall(name string) error {
 	skill, ok := m.skills[name]
 	if !ok {
 		m.mu.Unlock()
-		return fmt.Errorf("技能 %q 未安装", name)
+		return fmt.Errorf("技能 %q: %w", name, ErrSkillNotInstalled)
 	}
 	delete(m.skills, name)
 	m.mu.Unlock()

@@ -54,6 +54,14 @@ func (s *Server) handleUpdateMemory(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
 		return
 	}
+	if id == "" {
+		if err := s.fileMem.UpdateMemory(req.Content); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "更新记忆失败: " + err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"message": "记忆已更新"})
+		return
+	}
 	if req.Content == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "content 不能为空"})
 		return
@@ -88,6 +96,36 @@ func (s *Server) handleDeleteMemoryItem(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "记忆已删除"})
+}
+
+// ─── Memory: POST /api/v1/memory/{id}/archive ──
+
+func (s *Server) handleArchiveMemoryItem(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "无效的记忆 ID"})
+		return
+	}
+	if err := s.fileMem.ArchiveEntry(id); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "记忆已归档"})
+}
+
+// ─── Memory: POST /api/v1/memory/{id}/restore ──
+
+func (s *Server) handleRestoreMemoryItem(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "无效的记忆 ID"})
+		return
+	}
+	if err := s.fileMem.RestoreEntry(id); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "记忆已恢复"})
 }
 
 // ─── MCP: POST /api/v1/mcp/tools/call ──

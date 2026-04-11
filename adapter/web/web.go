@@ -1,14 +1,7 @@
 // Package web 提供 Web UI WebSocket 适配器
 //
 // 通过 WebSocket 实现 Web 前端与 HexClaw 引擎的实时双向通信。
-// 支持同步回复和流式输出（打字机效果）。
-//
-// 消息协议（JSON）：
-//
-//	客户端 → 服务端: {"type":"message","content":"你好","session_id":"可选"}
-//	服务端 → 客户端: {"type":"reply","content":"你好！","session_id":"sess-xxx"}
-//	服务端 → 客户端: {"type":"chunk","content":"你","done":false}
-//	服务端 → 客户端: {"type":"error","content":"错误信息"}
+// 支持同步回复、流式输出、以及请求级流恢复。
 package web
 
 import (
@@ -22,52 +15,86 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
+	"github.com/hexagon-codes/hexclaw/streamstate"
 	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 )
 
-// WebAdapter Web UI WebSocket 适配器
+// WebAdapter Web UI WebSocket 适配器。
 //
 // 管理 WebSocket 连接，将 Web 消息转换为统一格式。
-// 每个 WebSocket 连接分配唯一 chatID。
+// 每个 WebSocket 连接分配唯一 chatID；每个流式请求分配唯一 requestID。
 type WebAdapter struct {
 	handler            adapter.MessageHandler
 	streamHandler      adapter.StreamMessageHandler
-	conns              sync.Map                                        // chatID → *websocket.Conn
-	sessionConns       sync.Map                                        // sessionID → chatID (for permission requests)
-	cancelFuncs        sync.Map                                        // sessionID → context.CancelFunc (用于取消正在进行的请求)
+	conns              sync.Map // chatID → *websocket.Conn
+	sessionConns       sync.Map // sessionID → chatID (for permission requests)
+	sessionRequests    sync.Map // sessionID → requestID
+	requestConns       sync.Map // requestID → *requestSubscribers
+	cancelFuncs        sync.Map // requestID → context.CancelFunc
+	streams            *streamstate.Registry
 	onApprovalResponse func(requestID string, approved, remember bool) // callback for tool approval
 }
 
-// SetStreamHandler 设置流式消息处理器
-//
-// 设置后 WebSocket 消息将使用流式处理，逐 chunk 推送给客户端（打字机效果）。
-// 未设置时降级为同步处理。
+type requestSubscribers struct {
+	mu      sync.RWMutex
+	chatIDs map[string]struct{}
+}
+
+func newRequestSubscribers() *requestSubscribers {
+	return &requestSubscribers{chatIDs: make(map[string]struct{})}
+}
+
+func (s *requestSubscribers) Add(chatID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.chatIDs[chatID] = struct{}{}
+}
+
+func (s *requestSubscribers) Delete(chatID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.chatIDs, chatID)
+}
+
+func (s *requestSubscribers) Snapshot() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.chatIDs))
+	for chatID := range s.chatIDs {
+		out = append(out, chatID)
+	}
+	return out
+}
+
+func (s *requestSubscribers) Len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.chatIDs)
+}
+
+// SetStreamHandler 设置流式消息处理器。
 func (a *WebAdapter) SetStreamHandler(h adapter.StreamMessageHandler) {
 	a.streamHandler = h
 }
 
-// New 创建 Web 适配器
+// New 创建 Web 适配器。
 func New() *WebAdapter {
-	return &WebAdapter{}
+	return &WebAdapter{streams: streamstate.NewRegistry(2 * time.Minute)}
 }
 
 func (a *WebAdapter) Name() string               { return "web" }
 func (a *WebAdapter) Platform() adapter.Platform { return adapter.PlatformWeb }
 
-// Start 注册消息处理器
-//
-// Web 适配器不自己启动 HTTP 服务器，而是通过 Handler() 返回 http.Handler
-// 供主 API 服务器挂载到 /ws 路径。
+// Start 注册消息处理器。
 func (a *WebAdapter) Start(_ context.Context, handler adapter.MessageHandler) error {
 	a.handler = handler
-	// 启动日志由 main 统一输出
 	return nil
 }
 
-// Stop 关闭所有 WebSocket 连接
+// Stop 关闭所有 WebSocket 连接。
 func (a *WebAdapter) Stop(_ context.Context) error {
 	a.conns.Range(func(key, value any) bool {
 		if conn, ok := value.(*websocket.Conn); ok {
@@ -80,13 +107,28 @@ func (a *WebAdapter) Stop(_ context.Context) error {
 	return nil
 }
 
+// ListActiveStreams 返回指定用户当前仍在进行中的流式请求。
+func (a *WebAdapter) ListActiveStreams(userID string) []streamstate.Snapshot {
+	if a.streams == nil {
+		return nil
+	}
+	return a.streams.ListActiveStreams(userID)
+}
+
+// GetStreamSnapshot 返回指定请求的最新快照，用于刷新/断线恢复。
+func (a *WebAdapter) GetStreamSnapshot(userID, requestID string) (*streamstate.Snapshot, bool) {
+	if a.streams == nil {
+		return nil, false
+	}
+	return a.streams.GetStreamSnapshot(userID, requestID)
+}
+
 // SetApprovalResponseHandler sets the callback for tool approval responses from the frontend.
 func (a *WebAdapter) SetApprovalResponseHandler(fn func(requestID string, approved, remember bool)) {
 	a.onApprovalResponse = fn
 }
 
 // PermissionRequestData is the data needed to send a tool approval request.
-// Defined here to avoid circular dependency with engine package.
 type PermissionRequestData struct {
 	ID        string
 	ToolName  string
@@ -108,6 +150,7 @@ func (a *WebAdapter) SendPermissionRequest(ctx context.Context, sessionID string
 	msg := wsMessage{
 		Type:      "tool_approval_request",
 		SessionID: sessionID,
+		RequestID: data.ID,
 		Content:   data.Reason,
 		Metadata: map[string]string{
 			"request_id": data.ID,
@@ -118,7 +161,7 @@ func (a *WebAdapter) SendPermissionRequest(ctx context.Context, sessionID string
 	return wsjson.Write(ctx, conn, msg)
 }
 
-// Broadcast 向所有活跃 WebSocket 连接广播消息
+// Broadcast 向所有活跃 WebSocket 连接广播消息。
 func (a *WebAdapter) Broadcast(msgType, content string, metadata map[string]string) {
 	msg := wsMessage{
 		Type:     msgType,
@@ -133,43 +176,45 @@ func (a *WebAdapter) Broadcast(msgType, content string, metadata map[string]stri
 	})
 }
 
-// Handler 返回 WebSocket HTTP Handler
-//
-// 挂载到主 API 服务器的 /ws 路径：
-//
-//	mux.Handle("/ws", webAdapter.Handler())
+// Handler 返回 WebSocket HTTP Handler。
 func (a *WebAdapter) Handler() http.Handler {
 	return http.HandlerFunc(a.handleWS)
 }
 
-// Send 发送同步回复到指定连接
+// Send 发送同步回复到指定连接。
 func (a *WebAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
-	conn, ok := a.getConn(chatID)
-	if !ok {
-		return nil // 连接已断开，静默忽略
-	}
-
-	msg := wsMessage{
-		Type:     "reply",
-		Content:  reply.Content,
-		Metadata: reply.Metadata,
-	}
-	return wsjson.Write(ctx, conn, msg)
-}
-
-// SendStream 流式发送回复（打字机效果）
-func (a *WebAdapter) SendStream(ctx context.Context, chatID string, chunks <-chan *adapter.ReplyChunk) error {
 	conn, ok := a.getConn(chatID)
 	if !ok {
 		return nil
 	}
+	msg := wsMessage{Type: "reply", Content: reply.Content, Metadata: reply.Metadata}
+	if reply.Metadata != nil {
+		msg.SessionID = reply.Metadata["session_id"]
+		msg.RequestID = reply.Metadata["request_id"]
+	}
+	return wsjson.Write(ctx, conn, msg)
+}
 
+// SendStream 流式发送回复（兼容 Adapter 接口）。
+func (a *WebAdapter) SendStream(ctx context.Context, chatID string, chunks <-chan *adapter.ReplyChunk) error {
+	return a.sendStreamWithIDs(ctx, chatID, "", "", chunks)
+}
+
+func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, requestID string, chunks <-chan *adapter.ReplyChunk) error {
 	chunkCount := 0
 	reasoningCount := 0
 	for chunk := range chunks {
 		if chunk.Error != nil {
-			errMsg := wsMessage{Type: "error", Content: chunk.Error.Error()}
-			_ = wsjson.Write(ctx, conn, errMsg)
+			if requestID != "" && a.streams != nil {
+				a.streams.Fail(requestID, chunk.Error)
+			}
+			errMsg := wsMessage{
+				Type:      "error",
+				Content:   chunk.Error.Error(),
+				SessionID: sessionID,
+				RequestID: requestID,
+			}
+			_ = a.sendToTargets(ctx, chatID, requestID, errMsg)
 			return chunk.Error
 		}
 
@@ -180,17 +225,30 @@ func (a *WebAdapter) SendStream(ctx context.Context, chatID string, chunks <-cha
 				trace.L(ctx).Info("首个 chunk", "type", "reasoning", "chunk_count", chunkCount)
 			}
 		}
+		if requestID != "" && a.streams != nil {
+			a.streams.Append(requestID, chunk)
+		}
 
 		msg := wsMessage{
 			Type:      "chunk",
 			Content:   chunk.Content,
 			Reasoning: chunk.Reasoning,
 			Done:      chunk.Done,
+			SessionID: sessionID,
+			RequestID: requestID,
 			Metadata:  chunk.Metadata,
 			Usage:     chunk.Usage,
 			ToolCalls: chunk.ToolCalls,
 		}
-		if err := wsjson.Write(ctx, conn, msg); err != nil {
+		if msg.Metadata != nil {
+			if msg.SessionID == "" {
+				msg.SessionID = msg.Metadata["session_id"]
+			}
+			if msg.RequestID == "" {
+				msg.RequestID = msg.Metadata["request_id"]
+			}
+		}
+		if err := a.sendToTargets(ctx, chatID, requestID, msg); err != nil {
 			return err
 		}
 	}
@@ -198,24 +256,23 @@ func (a *WebAdapter) SendStream(ctx context.Context, chatID string, chunks <-cha
 	return nil
 }
 
-// handleWS 处理 WebSocket 连接
+// handleWS 处理 WebSocket 连接。
 func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true, // desktop 模式仅监听 127.0.0.1，无外部风险
+		InsecureSkipVerify: true,
 	})
 	if err != nil {
 		slog.Error("WebSocket 握手失败", "err", err)
 		return
 	}
 
-	// 限制客户端消息大小为 20MB，支持图片附件
 	conn.SetReadLimit(20 * 1024 * 1024)
 
 	chatID := "ws-" + idgen.ShortID()
 	a.conns.Store(chatID, conn)
 	defer func() {
 		a.conns.Delete(chatID)
-		// Clean up sessionConns entries pointing to this chatID
+		a.removeChatID(chatID)
 		a.sessionConns.Range(func(key, value any) bool {
 			if value.(string) == chatID {
 				a.sessionConns.Delete(key)
@@ -227,7 +284,6 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("WebSocket 连接建立", "chat_id", chatID)
 
-	// 读取消息循环
 	for {
 		var incoming wsMessage
 		if err := wsjson.Read(r.Context(), conn, &incoming); err != nil {
@@ -235,27 +291,55 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 处理心跳 ping
-		if incoming.Type == "ping" {
+		switch incoming.Type {
+		case "ping":
 			_ = wsjson.Write(r.Context(), conn, wsMessage{Type: "pong"})
 			continue
-		}
-
-		// 处理流式取消请求 — 前端 stopStreaming 时发送
-		if incoming.Type == "cancel" {
-			slog.Info("WebSocket cancel", "session", incoming.SessionID)
-			if cancelFn, ok := a.cancelFuncs.LoadAndDelete(incoming.SessionID); ok {
-				cancelFn.(context.CancelFunc)()
+		case "cancel":
+			requestID := stringsTrim(incoming.RequestID)
+			if requestID == "" && incoming.SessionID != "" {
+				if bound, ok := a.sessionRequests.Load(incoming.SessionID); ok {
+					requestID = bound.(string)
+				}
+			}
+			slog.Info("WebSocket cancel", "session", incoming.SessionID, "request_id", requestID)
+			if requestID != "" {
+				if cancelFn, ok := a.cancelFuncs.LoadAndDelete(requestID); ok {
+					cancelFn.(context.CancelFunc)()
+				}
+				if a.streams != nil {
+					a.streams.Cancel(requestID)
+				}
 			}
 			continue
-		}
-
-		// 处理工具审批响应
-		if incoming.Type == "tool_approval_response" && a.onApprovalResponse != nil {
-			reqID, _ := incoming.Metadata["request_id"]
-			approved := incoming.Content == "approved"
-			remember := incoming.Content == "approved_remember"
-			a.onApprovalResponse(reqID, approved || remember, remember)
+		case "resume":
+			userID := incoming.UserID
+			if userID == "" {
+				userID = "web-user"
+			}
+			snapshot, ok := a.GetStreamSnapshot(userID, incoming.RequestID)
+			if !ok {
+				_ = wsjson.Write(r.Context(), conn, wsMessage{
+					Type:      "error",
+					Content:   "stream not found",
+					RequestID: incoming.RequestID,
+				})
+				continue
+			}
+			if !snapshot.Done {
+				a.addSubscriber(snapshot.RequestID, chatID)
+				a.sessionConns.Store(snapshot.SessionID, chatID)
+				a.sessionRequests.Store(snapshot.SessionID, snapshot.RequestID)
+			}
+			_ = wsjson.Write(r.Context(), conn, snapshotToMessage(snapshot))
+			continue
+		case "tool_approval_response":
+			if a.onApprovalResponse != nil {
+				reqID, _ := incoming.Metadata["request_id"]
+				approved := incoming.Content == "approved"
+				remember := incoming.Content == "approved_remember"
+				a.onApprovalResponse(reqID, approved || remember, remember)
+			}
 			continue
 		}
 
@@ -263,61 +347,62 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if err := adapter.ValidateAttachments(incoming.Attachments); err != nil {
-			_ = wsjson.Write(r.Context(), conn, wsMessage{
-				Type:    "error",
-				Content: err.Error(),
-			})
+			_ = wsjson.Write(r.Context(), conn, wsMessage{Type: "error", Content: err.Error()})
 			continue
 		}
-
-		// 构建统一消息
-		msg := buildAdapterMessage(chatID, incoming)
-		msg.InstanceID = a.Name()
-		// 记录 sessionID → chatID 映射 (用于 Permission 请求推送)
-		if incoming.SessionID != "" {
-			a.sessionConns.Store(incoming.SessionID, chatID)
+		if incoming.RequestID == "" {
+			incoming.RequestID = "req-" + idgen.ShortID()
 		}
 
-		// 创建请求级 logger
-		logger := trace.NewRequest(msg.UserID, msg.SessionID).With("source", "chat", "provider", incoming.Provider, "model", incoming.Model)
+		msg := buildAdapterMessage(chatID, incoming)
+		msg.InstanceID = a.Name()
+		if incoming.SessionID != "" {
+			a.sessionConns.Store(incoming.SessionID, chatID)
+			a.sessionRequests.Store(incoming.SessionID, incoming.RequestID)
+		}
 
-		// 异步处理消息
-		go func() {
+		logger := trace.NewRequest(msg.UserID, msg.SessionID).With("source", "chat", "provider", incoming.Provider, "model", incoming.Model, "request_id", incoming.RequestID)
+
+		go func(incoming wsMessage, msg *adapter.Message) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
-			if msg.SessionID != "" {
-				a.cancelFuncs.Store(msg.SessionID, cancel)
-				defer a.cancelFuncs.Delete(msg.SessionID)
+			if incoming.RequestID != "" {
+				a.cancelFuncs.Store(incoming.RequestID, cancel)
+				defer a.cancelFuncs.Delete(incoming.RequestID)
 			}
 
 			ctx = trace.WithLogger(ctx, logger)
 			logger.Info("← 收到消息", "content_len", len([]rune(msg.Content)), "platform", string(msg.Platform), "attachments", len(msg.Attachments))
 
-			// 优先使用流式处理
 			if a.streamHandler != nil {
+				a.addSubscriber(incoming.RequestID, chatID)
+				if a.streams != nil {
+					a.streams.Start(msg.UserID, msg.SessionID, incoming.RequestID)
+				}
 				chunks, err := a.streamHandler(ctx, msg)
 				if err != nil {
+					if a.streams != nil {
+						a.streams.Fail(incoming.RequestID, err)
+					}
 					trace.L(ctx).Error("流式处理失败", "err", err)
 					errMsg := wsMessage{
 						Type:      "error",
 						Content:   upstreamerr.PublicMessage(err, "error"),
 						SessionID: msg.SessionID,
+						RequestID: incoming.RequestID,
 					}
-					_ = wsjson.Write(ctx, conn, errMsg)
+					_ = a.sendToTargets(ctx, chatID, incoming.RequestID, errMsg)
 					return
 				}
-				if err := a.SendStream(ctx, chatID, chunks); err != nil {
+				if err := a.sendStreamWithIDs(ctx, chatID, msg.SessionID, incoming.RequestID, chunks); err != nil {
 					trace.L(ctx).Error("流式发送失败", "err", err)
-					// 客户端断开 → 取消 context → 通知 pipeStream 停止消费 LLM
 					cancel()
-					// drain 剩余 chunks 防止 pipeStream 阻塞
 					for range chunks {
 					}
 				}
 				return
 			}
 
-			// 降级为同步处理
 			reply, err := a.handler(ctx, msg)
 			if err != nil {
 				trace.L(ctx).Error("error", "err", err)
@@ -325,25 +410,100 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 					Type:      "error",
 					Content:   upstreamerr.PublicMessage(err, "error"),
 					SessionID: msg.SessionID,
+					RequestID: incoming.RequestID,
 				}
-				_ = wsjson.Write(ctx, conn, errMsg)
+				_ = a.sendToTargets(ctx, chatID, "", errMsg)
 				return
 			}
-
 			respMsg := wsMessage{
 				Type:      "reply",
 				Content:   reply.Content,
 				SessionID: msg.SessionID,
+				RequestID: incoming.RequestID,
 				Metadata:  reply.Metadata,
+				Usage:     reply.Usage,
+				ToolCalls: reply.ToolCalls,
 			}
-			if err := wsjson.Write(ctx, conn, respMsg); err != nil {
+			if reply.Metadata == nil {
+				respMsg.Metadata = map[string]string{}
+			}
+			respMsg.Metadata["request_id"] = incoming.RequestID
+			if respMsg.Metadata["session_id"] == "" && msg.SessionID != "" {
+				respMsg.Metadata["session_id"] = msg.SessionID
+			}
+			if err := a.sendToTargets(ctx, chatID, "", respMsg); err != nil {
 				trace.L(ctx).Error("error", "err", err)
 			}
-		}()
+		}(incoming, msg)
 	}
 }
 
-// getConn 获取指定 chatID 的 WebSocket 连接
+func (a *WebAdapter) addSubscriber(requestID, chatID string) {
+	if requestID == "" || chatID == "" {
+		return
+	}
+	value, _ := a.requestConns.LoadOrStore(requestID, newRequestSubscribers())
+	value.(*requestSubscribers).Add(chatID)
+}
+
+func (a *WebAdapter) removeChatID(chatID string) {
+	a.requestConns.Range(func(key, value any) bool {
+		subs := value.(*requestSubscribers)
+		subs.Delete(chatID)
+		if subs.Len() == 0 {
+			a.requestConns.Delete(key)
+		}
+		return true
+	})
+}
+
+func (a *WebAdapter) sendToTargets(ctx context.Context, chatID, requestID string, msg wsMessage) error {
+	if requestID == "" {
+		return a.writeMessage(ctx, chatID, msg)
+	}
+	value, ok := a.requestConns.Load(requestID)
+	if !ok {
+		return a.writeMessage(ctx, chatID, msg)
+	}
+	var firstErr error
+	for _, targetID := range value.(*requestSubscribers).Snapshot() {
+		if err := a.writeMessage(ctx, targetID, msg); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (a *WebAdapter) writeMessage(ctx context.Context, chatID string, msg wsMessage) error {
+	conn, ok := a.getConn(chatID)
+	if !ok {
+		return nil
+	}
+	return wsjson.Write(ctx, conn, msg)
+}
+
+func snapshotToMessage(snapshot *streamstate.Snapshot) wsMessage {
+	if snapshot == nil {
+		return wsMessage{Type: "error", Content: "stream not found"}
+	}
+	return wsMessage{
+		Type:      "stream_snapshot",
+		Content:   snapshot.Content,
+		Reasoning: snapshot.Reasoning,
+		SessionID: snapshot.SessionID,
+		RequestID: snapshot.RequestID,
+		Done:      snapshot.Done,
+		Metadata:  snapshot.Metadata,
+		Usage:     snapshot.Usage,
+		ToolCalls: snapshot.ToolCalls,
+	}
+}
+
+func stringsTrim(v string) string {
+	return v
+}
+
+// getConn 获取指定 chatID 的 WebSocket 连接。
 func (a *WebAdapter) getConn(chatID string) (*websocket.Conn, bool) {
 	v, ok := a.conns.Load(chatID)
 	if !ok {
@@ -352,25 +512,25 @@ func (a *WebAdapter) getConn(chatID string) (*websocket.Conn, bool) {
 	return v.(*websocket.Conn), true
 }
 
-// wsMessage WebSocket 消息格式
+// wsMessage WebSocket 消息格式。
 type wsMessage struct {
-	Type        string               `json:"type"`                  // message / reply / chunk / error
-	Content     string               `json:"content"`               // 消息内容
-	Reasoning   string               `json:"reasoning,omitempty"`   // 推理/思考过程（流式 thinking）
-	SessionID   string               `json:"session_id,omitempty"`  // 会话 ID
-	RequestID   string               `json:"request_id,omitempty"`  // 客户端请求 ID
-	UserID      string               `json:"user_id,omitempty"`     // 用户 ID（桌面端传 desktop-user）
-	Provider    string               `json:"provider,omitempty"`    // 显式指定的 Provider
-	Model       string               `json:"model,omitempty"`       // 显式指定的模型
-	Role        string               `json:"role,omitempty"`        // Agent 角色
-	Done        bool                 `json:"done,omitempty"`        // 流式输出是否结束
-	Metadata    map[string]string    `json:"metadata,omitempty"`    // 附加元数据
-	Usage       *adapter.Usage       `json:"usage,omitempty"`       // Token 使用统计（仅在 done=true 时）
-	ToolCalls   []adapter.ToolCall   `json:"tool_calls,omitempty"`  // 工具调用记录（仅在 done=true 时）
-	Attachments []adapter.Attachment `json:"attachments,omitempty"` // 图片附件列表
+	Type        string               `json:"type"` // message / reply / chunk / error / resume / stream_snapshot
+	Content     string               `json:"content"`
+	Reasoning   string               `json:"reasoning,omitempty"`
+	SessionID   string               `json:"session_id,omitempty"`
+	RequestID   string               `json:"request_id,omitempty"`
+	UserID      string               `json:"user_id,omitempty"`
+	Provider    string               `json:"provider,omitempty"`
+	Model       string               `json:"model,omitempty"`
+	Role        string               `json:"role,omitempty"`
+	Done        bool                 `json:"done,omitempty"`
+	Metadata    map[string]string    `json:"metadata,omitempty"`
+	Usage       *adapter.Usage       `json:"usage,omitempty"`
+	ToolCalls   []adapter.ToolCall   `json:"tool_calls,omitempty"`
+	Attachments []adapter.Attachment `json:"attachments,omitempty"`
 }
 
-// MarshalJSON 自定义序列化（省略空字段）
+// MarshalJSON 自定义序列化（省略空字段）。
 func (m wsMessage) MarshalJSON() ([]byte, error) {
 	type Alias wsMessage
 	return json.Marshal((Alias)(m))

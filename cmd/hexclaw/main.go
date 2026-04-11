@@ -903,6 +903,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				return eng.ProcessStream(ctx, msg)
 			})
 			srv.SetWebSocketHandler(wa.Handler())
+			srv.SetStreamStateProvider(wa)
 
 			// 接通工具审批: WebAdapter ↔ PermissionHub
 			wa.SetApprovalResponseHandler(func(reqID string, approved, remember bool) {

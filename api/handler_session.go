@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -298,6 +299,14 @@ type updateSessionRequest struct {
 	Title string `json:"title"`
 }
 
+type suggestSessionTitleRequest struct {
+	ExpectedTitle string `json:"expected_title"`
+}
+
+type sessionTitleSuggester interface {
+	SuggestSessionTitle(context.Context, []*storage.MessageRecord) (string, error)
+}
+
 // handleUpdateSession 更新会话（标题）
 func (s *Server) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -338,6 +347,98 @@ func (s *Server) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"id":         updated.ID,
 		"title":      updated.Title,
+		"updated_at": updated.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+	})
+}
+
+// handleSuggestSessionTitle 基于现有对话生成更自然的标题。
+//
+// 这是 best-effort 接口：如果标题已经被用户改过，或标题生成失败，
+// 返回当前标题且 updated=false，不影响主聊天链路。
+func (s *Server) handleSuggestSessionTitle(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	userID := sessionUserIDFromRequest(r)
+
+	sess, err := s.getOwnedSession(r, id, userID)
+	if err != nil {
+		writeSessionLookupError(w, err)
+		return
+	}
+
+	var req suggestSessionTitleRequest
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "请求格式错误: " + err.Error(),
+			})
+			return
+		}
+	}
+
+	if strings.TrimSpace(req.ExpectedTitle) != "" && strings.TrimSpace(sess.Title) != strings.TrimSpace(req.ExpectedTitle) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":         sess.ID,
+			"title":      sess.Title,
+			"updated":    false,
+			"updated_at": sess.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		})
+		return
+	}
+
+	messages, err := s.store.ListMessages(r.Context(), id, 6, 0)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "加载会话消息失败: " + err.Error(),
+		})
+		return
+	}
+
+	suggester, ok := s.engine.(sessionTitleSuggester)
+	if !ok || len(messages) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":         sess.ID,
+			"title":      sess.Title,
+			"updated":    false,
+			"updated_at": sess.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		})
+		return
+	}
+
+	title, err := suggester.SuggestSessionTitle(r.Context(), messages)
+	title = strings.TrimSpace(title)
+	if err != nil || title == "" || title == sess.Title {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":         sess.ID,
+			"title":      sess.Title,
+			"updated":    false,
+			"updated_at": sess.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		})
+		return
+	}
+
+	sess.Title = title
+	if err := s.store.UpdateSession(r.Context(), sess); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "更新会话失败: " + err.Error(),
+		})
+		return
+	}
+
+	updated, err := s.store.GetSession(r.Context(), id)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":         sess.ID,
+			"title":      sess.Title,
+			"updated":    true,
+			"updated_at": sess.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":         updated.ID,
+		"title":      updated.Title,
+		"updated":    true,
 		"updated_at": updated.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 	})
 }

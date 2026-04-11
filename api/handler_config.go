@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/security"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // LLMConfigResponse GET /api/v1/config/llm 响应
@@ -96,6 +97,14 @@ var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvi
 		opts = append(opts, hexagon.OpenAIWithModel(cfg.Model))
 	}
 	return hexagon.NewOpenAI(cfg.APIKey, opts...)
+}
+
+func validateExternalProviderBaseURL(providerType, baseURL string) error {
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL == "" || strings.EqualFold(providerType, "ollama") {
+		return nil
+	}
+	return security.ValidateURL(baseURL)
 }
 
 // handleGetLLMConfig GET /api/v1/config/llm
@@ -239,6 +248,12 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if err := validateExternalProviderBaseURL(providerType, baseURL); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "base_url 不安全: " + err.Error(),
+		})
+		return
+	}
 
 	provider := llmTestProviderFactory(llmConnectionTestProvider{
 		Type:    providerType,
@@ -295,6 +310,10 @@ func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Reques
 	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
 	if baseURL == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "base_url 不能为空"})
+		return
+	}
+	if err := validateExternalProviderBaseURL("external", baseURL); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "base_url 不安全: " + err.Error()})
 		return
 	}
 

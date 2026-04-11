@@ -673,7 +673,7 @@ func (e *ReActEngine) completeWithTools(
 	if useBudget {
 		trace.L(ctx).Warn("预算耗尽，工具循环结束", "summary", budget.Summary(), "session", sessionID)
 	} else {
-		trace.L(ctx).Warn("工具循环达到硬限", "maxTurns", 5, "session", sessionID)
+		trace.L(ctx).Warn("工具循环达到硬限", "maxTurns", hardMaxTurns, "session", sessionID)
 	}
 	lastResp, err := provider.Complete(ctx, req)
 	if err != nil {
@@ -846,7 +846,7 @@ func (e *ReActEngine) createAgent(roleName string, provider hexagon.Provider, me
 		}
 	}
 
-	prompt := systemPrompt
+	prompt := systemPrompt(metadata)
 	if metadata != nil && metadata["agent_prompt"] != "" {
 		prompt = metadata["agent_prompt"]
 	}
@@ -1097,7 +1097,7 @@ func (e *ReActEngine) processStreamToolLoop(
 	msg *adapter.Message,
 	cacheInput string,
 ) (<-chan *adapter.ReplyChunk, error) {
-	const maxStreamToolTurns = 5
+	const maxStreamToolTurns = 25
 	var budget *BudgetController
 	if e.budgetCfg != nil {
 		budget = NewBudgetController(*e.budgetCfg)
@@ -1588,7 +1588,7 @@ func (e *ReActEngine) buildStreamMessages(roleName string, history []hexagon.Mes
 	var messages []hexagon.Message
 
 	// System prompt 优先级: 角色名 > Agent 路由注入 > 默认
-	sysContent := systemPrompt
+	sysContent := systemPrompt(metadata)
 	if roleName != "" {
 		if role, ok := e.factory.GetRole(roleName); ok {
 			sysContent = role.ToSystemPrompt()
@@ -2119,29 +2119,55 @@ func boolZh(b bool) string {
 	return "未启用"
 }
 
-// systemPrompt HexClaw 系统提示词
-const systemPrompt = `你是「小蟹」🦀，HexClaw 的 AI 助手。
+// defaultSystemPrompt HexClaw 默认系统提示词（不含模型信息）
+const defaultSystemPrompt = `你是「小蟹」🦀，HexClaw 的 AI 助手。
 
 关于你：
 - 名字叫「小蟹」，用户也可以叫你"河蟹"、"HexClaw"
 - 由 Hexagon AI Agent Engine 驱动
 - 本地部署，数据私有：API Key 直连模型服务商，中间零代理
 - 原生支持 MCP 工具协议：文件、数据库、API 即插即用
-- 当用户问"你是谁"时，介绍自己是「小蟹」，不要提及底层 LLM 模型名称
 
 性格：
 - 友好、专业、略带幽默感，偶尔横行一下 🦀
-- 回答简洁直接，不拖泥带水
+- 回答简洁直接，高效不啰嗦
 - 诚实可靠：不确定的事情坦诚告知，不编造信息
 - 用中文回答，除非用户明确要求使用其他语言
 
 能力：
 - 智能编排：多步骤任务自动执行
 - 本地操控：直接操作本地文件
-- 代码生成：自动化开发任务
+- 代码执行：通过 code_exec 工具在沙箱中直接运行 Python/JavaScript/Go 代码，支持网络访问
 - 知识问答：基于个人知识库 RAG 增强检索
 - 工具调用：天气查询、网络搜索、翻译等内置技能
-- MCP 扩展：通过 Model Context Protocol 接入任意外部工具`
+- MCP 扩展：通过 Model Context Protocol 接入任意外部工具
+
+工具使用偏好：
+- 当用户要求执行代码、抓取网页、数据处理、计算等任务时，优先使用 code_exec 工具直接执行，而不是用 write_file 写文件
+- code_exec 支持网络访问，可以直接 import requests 等库抓取网页（缺失的依赖会自动安装）
+- 只有用户明确要求"保存为文件"时才使用 write_file`
+
+// systemPrompt 生成包含当前模型信息的系统提示词。
+// 品牌与模型的关系类似汽车品牌与发动机：小蟹是品牌，模型是驱动力。
+func systemPrompt(metadata map[string]string) string {
+	model := requestedModel(metadata)
+	provider := ""
+	if metadata != nil {
+		provider = strings.TrimSpace(metadata["provider"])
+	}
+	if model == "" {
+		return defaultSystemPrompt
+	}
+	identity := "- 当前搭载 " + model + " 作为语言引擎"
+	if provider != "" {
+		identity = "- 当前搭载 " + provider + " 的 " + model + " 作为语言引擎"
+	}
+	// 在"关于你"段落末尾注入模型身份
+	return strings.Replace(defaultSystemPrompt,
+		"- 原生支持 MCP 工具协议：文件、数据库、API 即插即用",
+		"- 原生支持 MCP 工具协议：文件、数据库、API 即插即用\n"+identity,
+		1)
+}
 
 // isLocalThinkingModel 检测是否为支持 thinking 模式的本地模型
 func isLocalThinkingModel(model string) bool {

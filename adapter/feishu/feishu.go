@@ -198,55 +198,51 @@ func (a *FeishuAdapter) handleSDKMessage(event *larkim.P2MessageReceiveV1) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// 先以回复形式发送思考占位消息，让用户知道 Agent 正在处理
-	var thinkingMsgID string
+	// 给用户消息贴一个 Reaction 表情，表示 Agent 正在处理
+	var reactionID string
 	if messageID != "" {
-		var thinkErr error
-		thinkingMsgID, thinkErr = a.replyAndGetID(ctx, messageID, randomThinkingMessage())
-		if thinkErr != nil {
-			logger.Error("[feishu] 发送思考占位消息失败（将降级为直接回复）", "error", thinkErr)
+		var rErr error
+		reactionID, rErr = a.addReaction(ctx, messageID, randomThinkingEmojiType())
+		if rErr != nil {
+			logger.Error("[feishu] 添加思考 Reaction 失败", "error", rErr)
 		}
 	}
-	if thinkingMsgID == "" {
-		var thinkErr error
-		thinkingMsgID, thinkErr = a.sendAndGetID(ctx, msg.ChatID, randomThinkingMessage())
-		if thinkErr != nil {
-			logger.Error("[feishu] 发送思考占位消息失败", "error", thinkErr)
+
+	// 回收思考 Reaction 的 helper
+	recallThinking := func() {
+		if reactionID == "" || messageID == "" {
+			return
 		}
+		if dErr := a.removeReaction(ctx, messageID, reactionID); dErr != nil {
+			logger.Error("[feishu] 回收思考 Reaction 失败", "error", dErr)
+		}
+		reactionID = ""
 	}
 
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
 		logger.Error("飞书: 处理消息失败", "error", err)
-		errContent := "处理消息时出现错误：" + upstreamerr.PublicMessage(err, "未知错误") + "\n请检查 LLM Provider 配置后重试。"
-		if thinkingMsgID != "" {
-			_ = a.patchMessage(ctx, thinkingMsgID, "⚠️ "+errContent)
-		} else {
-			errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer errCancel()
-			_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{Content: errContent})
-		}
+		recallThinking()
+		errContent := "⚠️ 处理消息时出现错误：" + upstreamerr.PublicMessage(err, "未知错误") + "\n请检查 LLM Provider 配置后重试。"
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer sendCancel()
+		_ = a.Send(sendCtx, msg.ChatID, &adapter.Reply{Content: errContent})
 		return
 	}
 
+	recallThinking()
+
 	if reply == nil {
-		if thinkingMsgID != "" {
-			_ = a.patchMessage(ctx, thinkingMsgID, "(空回复)")
-		}
 		return
 	}
-	// 用最终回复内容替换占位消息
-	if thinkingMsgID != "" {
-		if pErr := a.patchMessage(ctx, thinkingMsgID, reply.Content); pErr != nil {
-			logger.Error("[feishu] 更新占位消息失败，降级为新消息", "error", pErr)
-			sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer sendCancel()
-			_ = a.Send(sendCtx, msg.ChatID, reply)
+	// 发送实际回复（emoji 已回收，发新消息）
+	if messageID != "" {
+		if _, rErr := a.replyAndGetID(ctx, messageID, reply.Content); rErr != nil {
+			logger.Error("[feishu] 回复消息失败，降级为直接发送", "error", rErr)
+			_ = a.Send(ctx, msg.ChatID, reply)
 		}
 	} else {
-		sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer sendCancel()
-		if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
+		if err := a.Send(ctx, msg.ChatID, reply); err != nil {
 			logger.Error("飞书: 发送回复失败", "error", err)
 		}
 	}
@@ -339,15 +335,11 @@ func (a *FeishuAdapter) sendReplyNow(ctx context.Context, chatID string, reply *
 
 // SendStream 发送流式回复
 //
-// 先立即发送"思考中..."占位消息，收到内容后逐步更新，
-// 让用户知道 Agent 正在处理（类似飞书"正在输入..."体验）。
+// 收到第一段内容后创建消息，然后逐步更新内容，
+// 让用户实时看到 Agent 的输出（类似飞书"正在输入..."体验）。
+// 注：SendStream 接口无 messageID，无法使用 Reaction，直接流式输出。
 func (a *FeishuAdapter) SendStream(ctx context.Context, chatID string, chunks <-chan *adapter.ReplyChunk) error {
-	// 立即发送思考状态占位消息（随机表情增加趣味性）
-	messageID, err := a.sendAndGetID(ctx, chatID, randomThinkingMessage())
-	if err != nil {
-		logger.Error("[feishu] 发送思考占位消息失败（将降级为直接回复）", "error", err)
-	}
-
+	var contentMsgID string
 	var sb strings.Builder
 	lastUpdateLen := 0
 	lastUpdateTime := time.Now()
@@ -356,9 +348,8 @@ func (a *FeishuAdapter) SendStream(ctx context.Context, chatID string, chunks <-
 
 	for chunk := range chunks {
 		if chunk.Error != nil {
-			// 出错时更新占位消息为错误提示
-			if messageID != "" {
-				_ = a.patchMessage(ctx, messageID, "⚠️ 处理失败，请重试")
+			if contentMsgID != "" {
+				_ = a.patchMessage(ctx, contentMsgID, "⚠️ 处理失败，请重试")
 			}
 			return chunk.Error
 		}
@@ -367,9 +358,17 @@ func (a *FeishuAdapter) SendStream(ctx context.Context, chatID string, chunks <-
 		}
 		sb.WriteString(chunk.Content)
 
-		// 收到内容后逐步更新占位消息（限流保护）
-		if messageID != "" && sb.Len()-lastUpdateLen >= updateThreshold && time.Since(lastUpdateTime) >= updateInterval {
-			if pErr := a.patchMessage(ctx, messageID, sb.String()+"…"); pErr != nil {
+		// 收到第一段内容时创建消息
+		if contentMsgID == "" && sb.Len() > 0 {
+			contentMsgID, _ = a.sendAndGetID(ctx, chatID, sb.String()+"…")
+			lastUpdateLen = sb.Len()
+			lastUpdateTime = time.Now()
+			continue
+		}
+
+		// 后续内容逐步更新消息（限流保护）
+		if contentMsgID != "" && sb.Len()-lastUpdateLen >= updateThreshold && time.Since(lastUpdateTime) >= updateInterval {
+			if pErr := a.patchMessage(ctx, contentMsgID, sb.String()+"…"); pErr != nil {
 				logger.Error("[feishu] 更新流式消息失败", "error", pErr)
 			}
 			lastUpdateLen = sb.Len()
@@ -379,14 +378,10 @@ func (a *FeishuAdapter) SendStream(ctx context.Context, chatID string, chunks <-
 
 	finalContent := sb.String()
 	if finalContent == "" {
-		// 没有内容，删除占位消息或更新为空回复
-		if messageID != "" {
-			_ = a.patchMessage(ctx, messageID, "(空回复)")
-		}
 		return nil
 	}
-	if messageID != "" {
-		return a.patchMessage(ctx, messageID, finalContent)
+	if contentMsgID != "" {
+		return a.patchMessage(ctx, contentMsgID, finalContent)
 	}
 	return a.Send(ctx, chatID, &adapter.Reply{Content: finalContent})
 }
@@ -508,19 +503,89 @@ func (a *FeishuAdapter) patchMessage(ctx context.Context, messageID, text string
 	return nil
 }
 
-// randomThinkingMessage 随机返回一条思考状态消息
-func randomThinkingMessage() string {
-	messages := []string{
-		"🤔 思考中...",
-		"⌨️ 正在输入...",
-		"🧠 让我想想...",
-		"💭 思考中...",
-		"📝 正在整理思路...",
-		"🔍 查找中...",
-		"⏳ 稍等一下...",
-		"🎯 正在分析...",
+// thinkingEmojiTypes 飞书 Reaction API 支持的表情类型（表示正在思考/处理）
+// 飞书官方 emoji_type 列表：https://open.feishu.cn/document/server-docs/im-v1/message-reaction/emojis-introduce
+var thinkingEmojiTypes = []string{
+	"MUSCLE",      // 💪 努力处理中
+	"COFFEE",      // ☕ 正在酝酿
+	"FIRE",        // 🔥 马上来
+	"FIST",        // ✊ 收到，处理中
+	"THUMBSUP",    // 👍 问得好（保留少量出现）
+	"CLAP",        // 👏 好问题
+}
+
+// randomThinkingEmojiType 随机返回一个飞书 Reaction emoji_type
+func randomThinkingEmojiType() string {
+	return thinkingEmojiTypes[time.Now().UnixNano()%int64(len(thinkingEmojiTypes))]
+}
+
+// addReaction 给消息添加表情回应，返回 reaction_id 用于后续回收
+func (a *FeishuAdapter) addReaction(ctx context.Context, messageID, emojiType string) (string, error) {
+	token, err := a.getAccessToken(ctx)
+	if err != nil {
+		return "", err
 	}
-	return messages[time.Now().UnixNano()%int64(len(messages))]
+
+	body := map[string]any{
+		"reaction_type": map[string]string{"emoji_type": emojiType},
+	}
+	bodyJSON, _ := json.Marshal(body)
+
+	url := baseURL + "/im/v1/messages/" + messageID + "/reactions"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyJSON))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("飞书添加 Reaction 返回 %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Data struct {
+			ReactionID string `json:"reaction_id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", err
+	}
+	return result.Data.ReactionID, nil
+}
+
+// removeReaction 移除消息上的表情回应
+func (a *FeishuAdapter) removeReaction(ctx context.Context, messageID, reactionID string) error {
+	token, err := a.getAccessToken(ctx)
+	if err != nil {
+		return err
+	}
+
+	url := baseURL + "/im/v1/messages/" + messageID + "/reactions/" + reactionID
+	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("飞书移除 Reaction 返回 %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
 }
 
 // handleMessage 处理消息事件（webhook 兼容路径）
@@ -567,55 +632,50 @@ func (a *FeishuAdapter) handleMessage(event feishuEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// 先以回复形式发送思考占位消息
+	// 给用户消息贴一个 Reaction 表情，表示 Agent 正在处理
 	origMsgID := msgEvent.Message.MessageID
-	var thinkingMsgID string
+	var reactionID string
 	if origMsgID != "" {
-		var thinkErr error
-		thinkingMsgID, thinkErr = a.replyAndGetID(ctx, origMsgID, randomThinkingMessage())
-		if thinkErr != nil {
-			logger.Error("[feishu] 发送思考占位消息失败（将降级为直接回复）", "error", thinkErr)
+		var rErr error
+		reactionID, rErr = a.addReaction(ctx, origMsgID, randomThinkingEmojiType())
+		if rErr != nil {
+			logger.Error("[feishu] 添加思考 Reaction 失败", "error", rErr)
 		}
 	}
-	if thinkingMsgID == "" {
-		var thinkErr error
-		thinkingMsgID, thinkErr = a.sendAndGetID(ctx, msg.ChatID, randomThinkingMessage())
-		if thinkErr != nil {
-			logger.Error("[feishu] 发送思考占位消息失败", "error", thinkErr)
+
+	recallThinking := func() {
+		if reactionID == "" || origMsgID == "" {
+			return
 		}
+		if dErr := a.removeReaction(ctx, origMsgID, reactionID); dErr != nil {
+			logger.Error("[feishu] 回收思考 Reaction 失败", "error", dErr)
+		}
+		reactionID = ""
 	}
 
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
 		logger.Error("飞书: 处理消息失败", "error", err)
-		errContent := "处理消息时出现错误：" + upstreamerr.PublicMessage(err, "未知错误") + "\n请检查 LLM Provider 配置后重试。"
-		if thinkingMsgID != "" {
-			_ = a.patchMessage(ctx, thinkingMsgID, "⚠️ "+errContent)
-		} else {
-			errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer errCancel()
-			_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{Content: errContent})
-		}
+		recallThinking()
+		errContent := "⚠️ 处理消息时出现错误：" + upstreamerr.PublicMessage(err, "未知错误") + "\n请检查 LLM Provider 配置后重试。"
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer sendCancel()
+		_ = a.Send(sendCtx, msg.ChatID, &adapter.Reply{Content: errContent})
 		return
 	}
 
+	recallThinking()
+
 	if reply == nil {
-		if thinkingMsgID != "" {
-			_ = a.patchMessage(ctx, thinkingMsgID, "(空回复)")
-		}
 		return
 	}
-	if thinkingMsgID != "" {
-		if pErr := a.patchMessage(ctx, thinkingMsgID, reply.Content); pErr != nil {
-			logger.Error("[feishu] 更新占位消息失败，降级为新消息", "error", pErr)
-			sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer sendCancel()
-			_ = a.Send(sendCtx, msg.ChatID, reply)
+	if origMsgID != "" {
+		if _, rErr := a.replyAndGetID(ctx, origMsgID, reply.Content); rErr != nil {
+			logger.Error("[feishu] 回复消息失败，降级为直接发送", "error", rErr)
+			_ = a.Send(ctx, msg.ChatID, reply)
 		}
 	} else {
-		sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer sendCancel()
-		if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
+		if err := a.Send(ctx, msg.ChatID, reply); err != nil {
 			logger.Error("飞书: 发送回复失败", "error", err)
 		}
 	}

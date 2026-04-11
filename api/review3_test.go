@@ -67,6 +67,8 @@ func TestCorsMiddleware_AllowedOrigins(t *testing.T) {
 	}{
 		{"http://localhost:3000", true},
 		{"http://localhost:8080", true},
+		{"http://127.0.0.1:3000", true},
+		{"http://127.0.0.1:5173", true},
 		{"http://localhost:1", true},
 		{"http://localhost:65535", true},
 		{"tauri://localhost", true},
@@ -77,6 +79,8 @@ func TestCorsMiddleware_AllowedOrigins(t *testing.T) {
 		{"http://localhost:abc", false},    // 非数字端口
 		{"http://localhost:123456", false}, // 超过 5 位
 		{"http://localhost:0evil", false},  // 混入字母
+		{"http://127.0.0.1:", false},       // 空端口
+		{"http://127.0.0.1:evil", false},   // 非数字端口
 		{"http://evil.com", false},
 		{"http://localhost", false},           // 无端口
 		{"https://localhost:3000", false},     // https (非 http)

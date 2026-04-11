@@ -147,11 +147,15 @@ func (r *Dispatcher) Unregister(name string) error {
 	return nil
 }
 
-// SetDefault 设置默认 Agent
+// SetDefault 设置默认 Agent（空字符串清除默认设置）
 func (r *Dispatcher) SetDefault(name string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if name == "" {
+		r.defaultAgent = ""
+		return nil
+	}
 	if _, exists := r.agents[name]; !exists {
 		return fmt.Errorf("agent %q 未注册", name)
 	}

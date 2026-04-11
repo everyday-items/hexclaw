@@ -15,6 +15,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/skill"
+	"github.com/hexagon-codes/hexclaw/skill/hub"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
 	sqlitestore "github.com/hexagon-codes/hexclaw/storage/sqlite"
 )
@@ -50,6 +51,27 @@ func newTestReActEngine(t *testing.T) *engine.ReActEngine {
 	}
 
 	return engine.NewReActEngine(cfg, router, newTestStoreForAPI(t), skill.NewRegistry())
+}
+
+func writeLocalHubCatalog(t *testing.T, repoDir string, indexJSON string, mcpRegistryJSON string, skillFiles map[string]string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(repoDir, "skills"), 0o755); err != nil {
+		t.Fatalf("创建本地 hub skills 目录失败: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "index.json"), []byte(indexJSON), 0o644); err != nil {
+		t.Fatalf("写入本地 hub index.json 失败: %v", err)
+	}
+	if mcpRegistryJSON == "" {
+		mcpRegistryJSON = `{"servers":[]}`
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "mcp-registry.json"), []byte(mcpRegistryJSON), 0o644); err != nil {
+		t.Fatalf("写入本地 hub mcp-registry.json 失败: %v", err)
+	}
+	for name, content := range skillFiles {
+		if err := os.WriteFile(filepath.Join(repoDir, "skills", name+".md"), []byte(content), 0o644); err != nil {
+			t.Fatalf("写入本地 hub skill %s 失败: %v", name, err)
+		}
+	}
 }
 
 func TestHandleListRoles_ExposesRoleDetails(t *testing.T) {
@@ -266,6 +288,78 @@ func TestHandleUpdateAgent_AllowsZeroValueOverrides(t *testing.T) {
 	}
 	if got.Model != "gpt-4o" || got.Provider != "openai" {
 		t.Fatalf("未提交字段被意外修改: model=%q provider=%q", got.Model, got.Provider)
+	}
+}
+
+func TestHandleInstallSkill_ClawHubSkillEntry_InstallsMarkdownSkill(t *testing.T) {
+	repoDir := t.TempDir()
+	skillsDir := t.TempDir()
+	writeLocalHubCatalog(
+		t,
+		repoDir,
+		`{"version":"1.0.0","updated_at":"2026-04-08T00:00:00Z","skills":[{"name":"lawyer","display_name":"Lawyer","description":"desc","category":"productivity","tags":["legal"],"type":"skill"}]}`,
+		`{"servers":[]}`,
+		map[string]string{
+			"lawyer": "---\nname: lawyer\n---\n# Lawyer Skill",
+		},
+	)
+
+	mp := marketplace.NewMarketplace(skillsDir)
+	srv := NewServer(config.DefaultConfig(), &mockEngine{}, nil, nil)
+	srv.mp = mp
+	srv.skillHub = hub.New(hub.HubConfig{
+		Enabled: true,
+		RepoURL: "file://" + repoDir,
+		Branch:  "main",
+	}, mp.Dir())
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/skills/install", strings.NewReader(`{"source":"clawhub://lawyer"}`))
+	w := httptest.NewRecorder()
+
+	srv.handleInstallSkill(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(skillsDir, "lawyer.md")); err != nil {
+		t.Fatalf("期望已安装 lawyer.md，实际错误: %v", err)
+	}
+}
+
+func TestHandleInstallSkill_ClawHubMCPEntry_DoesNotFallbackToMarkdownSkillInstall(t *testing.T) {
+	repoDir := t.TempDir()
+	skillsDir := t.TempDir()
+	writeLocalHubCatalog(
+		t,
+		repoDir,
+		`{"version":"1.0.0","updated_at":"2026-04-08T00:00:00Z","skills":[]}`,
+		`{"servers":[{"name":"filesystem","display_name":"Filesystem","description":"Read local files","category":"automation","type":"mcp","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem"],"downloads":1,"rating":4.8}]}`,
+		nil,
+	)
+
+	mp := marketplace.NewMarketplace(skillsDir)
+	srv := NewServer(config.DefaultConfig(), &mockEngine{}, nil, nil)
+	srv.mp = mp
+	srv.skillHub = hub.New(hub.HubConfig{
+		Enabled: true,
+		RepoURL: "file://" + repoDir,
+		Branch:  "main",
+	}, mp.Dir())
+	srv.mcpMgr = nil
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/skills/install", strings.NewReader(`{"source":"clawhub://filesystem"}`))
+	w := httptest.NewRecorder()
+
+	srv.handleInstallSkill(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("期望 503，实际 %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(skillsDir, "filesystem.md")); !os.IsNotExist(err) {
+		t.Fatalf("MCP 条目不应被写成 markdown skill，stat err=%v", err)
+	}
+	if !strings.Contains(w.Body.String(), "MCP") {
+		t.Fatalf("期望错误提示明确指出 MCP 安装不可用，实际: %s", w.Body.String())
 	}
 }
 

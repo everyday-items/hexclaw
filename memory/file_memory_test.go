@@ -224,3 +224,176 @@ func TestSearch_EmptyQuery(t *testing.T) {
 		t.Error("空查询应返回 nil")
 	}
 }
+
+func TestSaveMemory_ArchivesOverflowInsteadOfDeleting(t *testing.T) {
+	dir := t.TempDir()
+	fm, _ := New(Options{Dir: dir, MaxMemory: 2})
+
+	if err := fm.SaveEntry("第一条活跃记忆", "context", "chat_extract"); err != nil {
+		t.Fatalf("save first: %v", err)
+	}
+	if err := fm.SaveEntry("第二条活跃记忆", "fact", "manual"); err != nil {
+		t.Fatalf("save second: %v", err)
+	}
+	if err := fm.SaveEntry("第三条触发归档", "fact", "manual"); err != nil {
+		t.Fatalf("save third: %v", err)
+	}
+
+	active := fm.ParseEntries()
+	if len(active) != 2 {
+		t.Fatalf("active entries len=%d, want 2", len(active))
+	}
+
+	archived, err := fm.ListEntries(ListOptions{View: MemoryViewArchived, Limit: 10})
+	if err != nil {
+		t.Fatalf("list archived: %v", err)
+	}
+	if len(archived.Entries) != 1 {
+		t.Fatalf("archived entries len=%d, want 1", len(archived.Entries))
+	}
+	if archived.Entries[0].Status != MemoryStatusArchived {
+		t.Fatalf("archived status=%q, want %q", archived.Entries[0].Status, MemoryStatusArchived)
+	}
+	if archived.Entries[0].Content != "第一条活跃记忆" {
+		t.Fatalf("archived content=%q, want first entry", archived.Entries[0].Content)
+	}
+
+	capacity := fm.Capacity()
+	if capacity.Used != 2 || capacity.Archived != 1 {
+		t.Fatalf("capacity=%+v, want used=2 archived=1", capacity)
+	}
+}
+
+func TestListEntries_CursorPagination(t *testing.T) {
+	dir := t.TempDir()
+	fm, _ := New(Options{Dir: dir, MaxMemory: 10})
+
+	for _, content := range []string{"记忆 A", "记忆 B", "记忆 C"} {
+		if err := fm.SaveMemory(content); err != nil {
+			t.Fatalf("save %q: %v", content, err)
+		}
+	}
+
+	firstPage, err := fm.ListEntries(ListOptions{View: MemoryViewActive, Limit: 2})
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if len(firstPage.Entries) != 2 {
+		t.Fatalf("first page len=%d, want 2", len(firstPage.Entries))
+	}
+	if !firstPage.HasMore || firstPage.NextCursor == "" {
+		t.Fatalf("first page cursor=%q has_more=%v, want next cursor", firstPage.NextCursor, firstPage.HasMore)
+	}
+
+	secondPage, err := fm.ListEntries(ListOptions{View: MemoryViewActive, Limit: 2, Cursor: firstPage.NextCursor})
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if len(secondPage.Entries) != 1 {
+		t.Fatalf("second page len=%d, want 1", len(secondPage.Entries))
+	}
+	if secondPage.HasMore || secondPage.NextCursor != "" {
+		t.Fatalf("second page cursor=%q has_more=%v, want end", secondPage.NextCursor, secondPage.HasMore)
+	}
+}
+
+func TestListEntries_FiltersByTypeAndSource(t *testing.T) {
+	dir := t.TempDir()
+	fm, _ := New(Options{Dir: dir, MaxMemory: 10})
+
+	if err := fm.SaveEntry("用户偏好中文", "preference", "manual"); err != nil {
+		t.Fatalf("save preference: %v", err)
+	}
+	if err := fm.SaveEntry("对话提取事实", "fact", "chat_extract"); err != nil {
+		t.Fatalf("save extracted fact: %v", err)
+	}
+
+	preferences, err := fm.ListEntries(ListOptions{View: MemoryViewActive, Type: "preference", Limit: 10})
+	if err != nil {
+		t.Fatalf("list by type: %v", err)
+	}
+	if len(preferences.Entries) != 1 || preferences.Entries[0].Content != "用户偏好中文" {
+		t.Fatalf("preferences=%+v, want only preference entry", preferences.Entries)
+	}
+
+	extracted, err := fm.ListEntries(ListOptions{View: MemoryViewActive, Source: "chat_extract", Limit: 10})
+	if err != nil {
+		t.Fatalf("list by source: %v", err)
+	}
+	if len(extracted.Entries) != 1 || extracted.Entries[0].Content != "对话提取事实" {
+		t.Fatalf("extracted=%+v, want only chat_extract entry", extracted.Entries)
+	}
+}
+
+func TestArchiveAndRestoreEntry(t *testing.T) {
+	dir := t.TempDir()
+	fm, _ := New(Options{Dir: dir, MaxMemory: 2})
+
+	if err := fm.SaveMemory("可归档记忆"); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := fm.ArchiveEntry("m-1"); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+
+	active := fm.ParseEntries()
+	if len(active) != 0 {
+		t.Fatalf("active len=%d, want 0", len(active))
+	}
+
+	archived, err := fm.ListEntries(ListOptions{View: MemoryViewArchived, Limit: 10})
+	if err != nil {
+		t.Fatalf("list archived: %v", err)
+	}
+	if len(archived.Entries) != 1 || archived.Entries[0].Status != MemoryStatusArchived {
+		t.Fatalf("archived entries=%+v, want one archived entry", archived.Entries)
+	}
+
+	if err := fm.RestoreEntry(archived.Entries[0].ID); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	restored := fm.ParseEntries()
+	if len(restored) != 1 || restored[0].Content != "可归档记忆" || restored[0].Status != MemoryStatusActive {
+		t.Fatalf("restored entries=%+v, want one active restored entry", restored)
+	}
+}
+
+func TestRestoreEntryKeepsActiveCapacity(t *testing.T) {
+	dir := t.TempDir()
+	fm, _ := New(Options{Dir: dir, MaxMemory: 1})
+
+	if err := fm.SaveMemory("先归档的记忆"); err != nil {
+		t.Fatalf("save archived candidate: %v", err)
+	}
+	if err := fm.ArchiveEntry("m-1"); err != nil {
+		t.Fatalf("archive candidate: %v", err)
+	}
+	if err := fm.SaveMemory("当前活跃记忆"); err != nil {
+		t.Fatalf("save active: %v", err)
+	}
+
+	archived, err := fm.ListEntries(ListOptions{View: MemoryViewArchived, Limit: 10})
+	if err != nil {
+		t.Fatalf("list archived: %v", err)
+	}
+	if len(archived.Entries) != 1 {
+		t.Fatalf("archived len=%d, want 1", len(archived.Entries))
+	}
+
+	if err := fm.RestoreEntry(archived.Entries[0].ID); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	active := fm.ParseEntries()
+	if len(active) != 1 || active[0].Content != "先归档的记忆" {
+		t.Fatalf("active=%+v, want restored entry only", active)
+	}
+
+	archived, err = fm.ListEntries(ListOptions{View: MemoryViewArchived, Limit: 10})
+	if err != nil {
+		t.Fatalf("list archived after restore: %v", err)
+	}
+	if len(archived.Entries) != 1 || archived.Entries[0].Content != "当前活跃记忆" {
+		t.Fatalf("archived=%+v, want previous active entry archived", archived.Entries)
+	}
+}

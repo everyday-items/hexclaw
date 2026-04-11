@@ -13,6 +13,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/gateway"
+	"github.com/hexagon-codes/hexclaw/storage"
 )
 
 func TestServer_BuildHTTPServerLeavesWriteTimeoutUnlimitedForStreaming(t *testing.T) {
@@ -41,6 +42,8 @@ type mockEngine struct {
 	activeLLM   config.LLMConfig
 	reloadErr   error
 	reloadCalls int
+	title       string
+	titleErr    error
 }
 
 func (e *mockEngine) Start(_ context.Context) error  { return nil }
@@ -76,6 +79,9 @@ func (e *mockEngine) ReloadLLMConfig(_ context.Context, cfg config.LLMConfig) er
 	}
 	e.activeLLM = cfg
 	return nil
+}
+func (e *mockEngine) SuggestSessionTitle(_ context.Context, _ []*storage.MessageRecord) (string, error) {
+	return e.title, e.titleErr
 }
 
 // mockGateway 测试用安全网关

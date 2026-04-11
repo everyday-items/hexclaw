@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/hexagon-codes/hexclaw/cron"
 )
@@ -74,7 +75,12 @@ func (s *Server) handleAddCronJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.scheduler.AddJob(r.Context(), job); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
+		// Schedule validation errors are client input errors (400), not server failures (500)
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "无效的调度表达式") || strings.Contains(err.Error(), "invalid") {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, map[string]string{
 			"error": "添加任务失败: " + err.Error(),
 		})
 		return

@@ -64,6 +64,9 @@ func ValidateURL(rawURL string) error {
 		if ip == nil {
 			continue
 		}
+		if ip.IsUnspecified() {
+			return fmt.Errorf("SSRF blocked: %q resolves to unspecified address %s", host, ipStr)
+		}
 		for _, cidr := range privateRanges {
 			if cidr.Contains(ip) {
 				return fmt.Errorf("SSRF blocked: %q resolves to private IP %s", host, ipStr)

@@ -5,6 +5,7 @@
 //   - POST   /api/v1/chat                       同步聊天
 //   - GET    /api/v1/sessions                   会话列表
 //   - GET    /api/v1/sessions/{id}              会话详情
+//   - POST   /api/v1/sessions/{id}/suggest-title 自动生成会话标题
 //   - DELETE /api/v1/sessions/{id}              删除会话
 //   - GET    /api/v1/sessions/{id}/messages     消息历史
 //   - GET    /api/v1/sessions/{id}/branches     会话分支列表
@@ -50,6 +51,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/skill/hub"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
 	"github.com/hexagon-codes/hexclaw/storage"
+	"github.com/hexagon-codes/hexclaw/streamstate"
 	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/hexclaw/voice"
 	"github.com/hexagon-codes/hexclaw/webhook"
@@ -78,6 +80,7 @@ type Server struct {
 	desktopSvc    *desktop.Service             // 桌面集成服务（可选）
 	cfgWriter     *config.Writer               // 配置文件写入器（MCP 持久化用）
 	wsHandler     http.Handler                 // WebSocket Handler（可选）
+	streamStates  streamstate.Provider         // 流式 in-flight 状态（可选）
 	logCollector  *LogCollector                // 日志收集器
 	workflowStore *WorkflowStore               // 工作流存储
 	teamStore     *TeamStore                   // 团队数据存储
@@ -134,6 +137,11 @@ func defaultDataDir() string {
 // 挂载到 /ws 路径，供 Web UI 使用。
 func (s *Server) SetWebSocketHandler(h http.Handler) {
 	s.wsHandler = h
+}
+
+// SetStreamStateProvider 设置流式 in-flight 状态提供器。
+func (s *Server) SetStreamStateProvider(p streamstate.Provider) {
+	s.streamStates = p
 }
 
 // SetKnowledgeBase 设置知识库管理器
@@ -306,6 +314,7 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("GET /api/v1/sessions", s.handleListSessions)
 		mux.HandleFunc("GET /api/v1/sessions/{id}", s.handleGetSession)
 		mux.HandleFunc("PATCH /api/v1/sessions/{id}", s.handleUpdateSession)
+		mux.HandleFunc("POST /api/v1/sessions/{id}/suggest-title", s.handleSuggestSessionTitle)
 		mux.HandleFunc("DELETE /api/v1/sessions/{id}", s.handleDeleteSession)
 		mux.HandleFunc("GET /api/v1/sessions/{id}/messages", s.handleListMessages)
 		mux.HandleFunc("GET /api/v1/sessions/{id}/branches", s.handleListBranches)
@@ -313,6 +322,11 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("GET /api/v1/messages/search", s.handleSearchMessages)
 		mux.HandleFunc("DELETE /api/v1/messages/{id}", s.handleDeleteMessage)
 		mux.HandleFunc("PUT /api/v1/messages/{id}/feedback", s.handleUpdateMessageFeedback)
+	}
+
+	if s.streamStates != nil {
+		mux.HandleFunc("GET /api/v1/streams/active", s.handleListActiveStreams)
+		mux.HandleFunc("GET /api/v1/streams/{request_id}", s.handleGetStreamSnapshot)
 	}
 
 	// 配置 API
@@ -347,7 +361,10 @@ func (s *Server) routes() http.Handler {
 	if s.fileMem != nil {
 		mux.HandleFunc("GET /api/v1/memory", s.handleGetMemory)
 		mux.HandleFunc("POST /api/v1/memory", s.handleSaveMemory)
+		mux.HandleFunc("PUT /api/v1/memory", s.handleUpdateMemory)
 		mux.HandleFunc("PUT /api/v1/memory/{id}", s.handleUpdateMemory)
+		mux.HandleFunc("POST /api/v1/memory/{id}/archive", s.handleArchiveMemoryItem)
+		mux.HandleFunc("POST /api/v1/memory/{id}/restore", s.handleRestoreMemoryItem)
 		mux.HandleFunc("DELETE /api/v1/memory/{id}", s.handleDeleteMemoryItem)
 		mux.HandleFunc("DELETE /api/v1/memory", s.handleDeleteMemory)
 		mux.HandleFunc("GET /api/v1/memory/search", s.handleSearchMemory)
@@ -812,26 +829,17 @@ func resolveChatPlatform(req ChatRequest, r *http.Request) (adapter.Platform, er
 // corsMiddleware 处理跨域请求
 //
 // 允许 Tauri 桌面端 (tauri://localhost, http://tauri.localhost)
-// 和本地开发服务 (http://localhost:*) 的跨域访问。
+// 和本地开发服务 (http://localhost:* / http://127.0.0.1:*) 的跨域访问。
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 
 		// 允许 Tauri 和本地开发环境的 origin
-		isLocalhost := false
-		if strings.HasPrefix(origin, "http://localhost:") {
-			// 确保端口部分是纯数字，防止 http://localhost:evil.com 绕过
-			port := origin[17:]
-			isLocalhost = len(port) > 0 && len(port) <= 5
-			for _, c := range port {
-				if c < '0' || c > '9' {
-					isLocalhost = false
-					break
-				}
-			}
-		}
+		isLocalhost := isLoopbackOrigin(origin, "http://localhost:")
+		isLoopback127 := isLoopbackOrigin(origin, "http://127.0.0.1:")
 		if isDesktopOrigin(origin) ||
-			isLocalhost {
+			isLocalhost ||
+			isLoopback127 {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -850,6 +858,22 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 func isDesktopOrigin(origin string) bool {
 	return origin == "tauri://localhost" || origin == "http://tauri.localhost"
+}
+
+func isLoopbackOrigin(origin, prefix string) bool {
+	if !strings.HasPrefix(origin, prefix) {
+		return false
+	}
+	port := origin[len(prefix):]
+	if len(port) == 0 || len(port) > 5 {
+		return false
+	}
+	for _, c := range port {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func isLoopbackRequest(r *http.Request) bool {

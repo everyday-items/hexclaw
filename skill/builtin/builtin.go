@@ -96,7 +96,7 @@ func RegisterAdvanced(registry *skill.DefaultRegistry, cfg config.BuiltinConfig,
 		sb, err := sandbox.New(sandbox.Config{
 			Workspace: deps.Workspace,
 			Timeout:   30,
-			Network:   false,
+			Network:   cfg.CodeExecPolicy.CodeExecNetworkAllowed(),
 		})
 		if err != nil {
 			logger.Error("沙箱初始化失败，CodeExecSkill 不可用", "error", err)

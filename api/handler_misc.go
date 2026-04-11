@@ -3,23 +3,26 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/canvas"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/engine"
-	"github.com/hexagon-codes/hexclaw/memory"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
+	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/router"
+	"github.com/hexagon-codes/hexclaw/skill/marketplace"
 	"github.com/hexagon-codes/hexclaw/voice"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 type skillRuntimeController interface {
@@ -77,14 +80,36 @@ func (s *Server) handleListRoles(w http.ResponseWriter, r *http.Request) {
 
 // handleGetMemory 获取结构化记忆列表
 func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
-	entries := s.fileMem.ParseEntries()
-	if entries == nil {
-		entries = []memory.MemoryEntry{}
+	q := r.URL.Query()
+	limit := 0
+	if rawLimit := q.Get("limit"); rawLimit != "" {
+		n, err := strconv.Atoi(rawLimit)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit 参数无效"})
+			return
+		}
+		limit = n
 	}
+
+	result, err := s.fileMem.ListEntries(memory.ListOptions{
+		View:   q.Get("view"),
+		Limit:  limit,
+		Cursor: q.Get("cursor"),
+		Type:   q.Get("type"),
+		Source: q.Get("source"),
+	})
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"entries":  entries,
-		"summary":  s.fileMem.LoadContext(),
-		"capacity": s.fileMem.Capacity(),
+		"entries":     result.Entries,
+		"summary":     s.fileMem.LoadContext(),
+		"capacity":    s.fileMem.Capacity(),
+		"total":       result.Total,
+		"next_cursor": result.NextCursor,
+		"has_more":    result.HasMore,
 	})
 }
 
@@ -373,7 +398,7 @@ func (s *Server) handleSkillStatus(w http.ResponseWriter, r *http.Request) {
 
 // InstallSkillRequest 安装技能请求
 type InstallSkillRequest struct {
-	Source string `json:"source"`          // 源路径 / URL / clawhub 技能名
+	Source string `json:"source"`         // 源路径 / URL / clawhub 技能名
 	Type   string `json:"type,omitempty"` // "file" | "url" | "clawhub"（缺省时自动推断）
 }
 
@@ -444,6 +469,18 @@ func (s *Server) installSkillFromClawHub(w http.ResponseWriter, r *http.Request,
 			return
 		}
 	}
+	meta, ok := s.findClawHubEntry(skillName)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error": "技能未找到: " + skillName,
+		})
+		return
+	}
+	metaType := strings.ToLower(strings.TrimSpace(meta.Type))
+	if metaType == "mcp" {
+		s.installMCPFromClawHubEntry(w, r, skillName, meta.Command, meta.Args, meta.ConfigHint)
+		return
+	}
 	if err := s.skillHub.Install(r.Context(), skillName); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "安装技能失败: " + err.Error(),
@@ -455,8 +492,80 @@ func (s *Server) installSkillFromClawHub(w http.ResponseWriter, r *http.Request,
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name":               skillName,
 		"message":            "技能已从 ClawHub 安装并已同步到运行引擎",
+			"requires_restart":   false,
+			"runtime_registered": true,
+		})
+}
+
+func (s *Server) findClawHubEntry(skillName string) (meta struct {
+	Type       string
+	Command    string
+	Args       []string
+	ConfigHint string
+}, ok bool) {
+	if s.skillHub == nil {
+		return meta, false
+	}
+	catalog := s.skillHub.GetCatalog()
+	if catalog == nil {
+		return meta, false
+	}
+	for _, entry := range catalog.Skills {
+		if entry.Name != skillName {
+			continue
+		}
+		meta.Type = entry.Type
+		meta.Command = entry.Command
+		meta.Args = entry.Args
+		meta.ConfigHint = entry.ConfigHint
+		return meta, true
+	}
+	return meta, false
+}
+
+func (s *Server) installMCPFromClawHubEntry(w http.ResponseWriter, r *http.Request, name, command string, args []string, configHint string) {
+	if s.mcpMgr == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "MCP 模块未启用，无法安装 MCP 市场条目: " + name,
+		})
+		return
+	}
+	if err := validateMCPCommand(command, args); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "MCP 市场条目配置无效: " + err.Error(),
+		})
+		return
+	}
+
+	cfg := hexmcp.ServerConfig{
+		Name:      name,
+		Transport: "stdio",
+		Command:   command,
+		Args:      args,
+		Enabled:   true,
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	if err := s.mcpMgr.AddServer(ctx, cfg); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("MCP Server %q 连接失败: %v", name, err),
+		})
+		return
+	}
+	if s.cfgWriter != nil {
+		if err := s.cfgWriter.AppendMCPServer(name, cfg.Transport, cfg.Command, cfg.Args, cfg.Endpoint); err != nil {
+			logger.Error("MCP Server", "name", name, "添加成功但持久化失败", err)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":               name,
+		"type":               "mcp",
+		"message":            "MCP 条目已从 ClawHub 安装并已连接",
 		"requires_restart":   false,
 		"runtime_registered": true,
+		"config_hint":        configHint,
 	})
 }
 
@@ -630,7 +739,11 @@ func (s *Server) installSkillFromURL(w http.ResponseWriter, r *http.Request, raw
 func (s *Server) handleUninstallSkill(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if err := s.mp.Uninstall(name); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
+		status := http.StatusInternalServerError
+		if errors.Is(err, marketplace.ErrSkillNotInstalled) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{
 			"error": "删除技能失败: " + err.Error(),
 		})
 		return
@@ -891,7 +1004,11 @@ func (s *Server) handleSetDefaultAgent(w http.ResponseWriter, r *http.Request) {
 	if s.agentStore != nil {
 		_ = s.agentStore.SetDefault(r.Context(), req.Name)
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"message": "默认 Agent 已设置", "name": req.Name})
+	msg := "默认 Agent 已设置"
+	if req.Name == "" {
+		msg = "默认 Agent 已清除"
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": msg, "name": req.Name})
 }
 
 // --- 路由规则 API ---
@@ -927,6 +1044,10 @@ func (s *Server) handleAddRule(w http.ResponseWriter, r *http.Request) {
 	var req AddRuleRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误"})
+		return
+	}
+	if req.AgentName == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent_name 不能为空"})
 		return
 	}
 	rule := router.Rule{

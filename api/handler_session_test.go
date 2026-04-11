@@ -11,6 +11,7 @@ import (
 
 	"context"
 	"path/filepath"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
@@ -101,6 +102,106 @@ func TestSearchMessages_MissingQuery(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("缺少 q 参数应返回 400，实际 %d", w.Code)
+	}
+}
+
+func TestSearchMessages_Success_PaginationAndUserIsolation(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	for _, session := range []*storage.Session{
+		{ID: "sess-a-1", UserID: "user-a", Platform: "web", Title: "会话 A1", CreatedAt: time.Now(), UpdatedAt: time.Now()},
+		{ID: "sess-a-2", UserID: "user-a", Platform: "web", Title: "会话 A2", CreatedAt: time.Now(), UpdatedAt: time.Now()},
+		{ID: "sess-b-1", UserID: "user-b", Platform: "web", Title: "会话 B1", CreatedAt: time.Now(), UpdatedAt: time.Now()},
+	} {
+		if err := store.CreateSession(context.Background(), session); err != nil {
+			t.Fatalf("创建会话失败: %v", err)
+		}
+	}
+
+	for _, msg := range []*storage.MessageRecord{
+		{ID: "msg-a-1", SessionID: "sess-a-1", Role: "user", Content: "Vue 测试一", Metadata: "{}", CreatedAt: time.Now()},
+		{ID: "msg-a-2", SessionID: "sess-a-2", Role: "assistant", Content: "Vue 测试二", Metadata: "{}", CreatedAt: time.Now()},
+		{ID: "msg-b-1", SessionID: "sess-b-1", Role: "user", Content: "Vue 测试三", Metadata: "{}", CreatedAt: time.Now()},
+	} {
+		if err := store.SaveMessage(context.Background(), msg); err != nil {
+			t.Fatalf("保存消息失败: %v", err)
+		}
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/messages/search?q=Vue%20测试&user_id=user-a&limit=1&offset=1", nil)
+	w := httptest.NewRecorder()
+	srv.handleSearchMessages(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Results []storage.SearchResult `json:"results"`
+		Total   int                    `json:"total"`
+		Query   string                 `json:"query"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if resp.Total != 2 {
+		t.Fatalf("total=%d, want 2", resp.Total)
+	}
+	if len(resp.Results) != 1 {
+		t.Fatalf("len(results)=%d, want 1", len(resp.Results))
+	}
+	if resp.Query != "Vue 测试" {
+		t.Fatalf("query=%q, want %q", resp.Query, "Vue 测试")
+	}
+	if resp.Results[0].Message == nil {
+		t.Fatal("result message should not be nil")
+	}
+	if resp.Results[0].Message.SessionID == "sess-b-1" {
+		t.Fatalf("cross-user result leaked into response: %+v", resp.Results[0])
+	}
+}
+
+func TestSearchMessages_DefaultUserIDAndDefaultLimit(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-api-user", UserID: "api-user", Platform: "web", Title: "默认用户会话", CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+	if err := store.SaveMessage(context.Background(), &storage.MessageRecord{
+		ID: "msg-api-user", SessionID: "sess-api-user", Role: "user", Content: "默认用户查询命中", Metadata: "{}", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("保存消息失败: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/messages/search?q=默认用户", nil)
+	w := httptest.NewRecorder()
+	srv.handleSearchMessages(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Results []storage.SearchResult `json:"results"`
+		Total   int                    `json:"total"`
+		Query   string                 `json:"query"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if resp.Total != 1 || len(resp.Results) != 1 {
+		t.Fatalf("expected one default-user result, got total=%d len=%d", resp.Total, len(resp.Results))
+	}
+	if resp.Results[0].Message == nil || resp.Results[0].Message.SessionID != "sess-api-user" {
+		t.Fatalf("unexpected default-user result: %+v", resp.Results[0])
 	}
 }
 
@@ -427,6 +528,101 @@ func TestUpdateSession_EmptyBody(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("空 body 应返回 400，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSuggestSessionTitle_UpdatesWhenExpectedTitleMatches(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{
+		reply: &adapter.Reply{Content: "ok"},
+		title: "杭州周末露营计划",
+	}
+	srv := NewServer(cfg, eng, nil, store)
+
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-suggest", UserID: "test", Platform: "web", Title: "帮我规划这个周末去杭州露营需要带什么",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+	for _, msg := range []*storage.MessageRecord{
+		{ID: "msg-1", SessionID: "sess-suggest", Role: "user", Content: "帮我规划这个周末去杭州露营需要带什么", Metadata: "{}", CreatedAt: time.Now()},
+		{ID: "msg-2", SessionID: "sess-suggest", Role: "assistant", Content: "可以从帐篷、睡袋、炊具、照明和衣物开始准备", Metadata: "{}", CreatedAt: time.Now()},
+	} {
+		if err := store.SaveMessage(context.Background(), msg); err != nil {
+			t.Fatalf("保存消息失败: %v", err)
+		}
+	}
+
+	body := `{"expected_title":"帮我规划这个周末去杭州露营需要带什么"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/sess-suggest/suggest-title?user_id=test", strings.NewReader(body))
+	req.SetPathValue("id", "sess-suggest")
+	w := httptest.NewRecorder()
+	srv.handleSuggestSessionTitle(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if updated, _ := resp["updated"].(bool); !updated {
+		t.Fatalf("expected updated=true, got %+v", resp)
+	}
+	if title, _ := resp["title"].(string); title != "杭州周末露营计划" {
+		t.Fatalf("title=%q", title)
+	}
+
+	updatedSession, err := store.GetSession(context.Background(), "sess-suggest")
+	if err != nil {
+		t.Fatalf("读取会话失败: %v", err)
+	}
+	if updatedSession.Title != "杭州周末露营计划" {
+		t.Fatalf("session title not persisted: %q", updatedSession.Title)
+	}
+}
+
+func TestSuggestSessionTitle_DoesNotOverrideManualRename(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{
+		reply: &adapter.Reply{Content: "ok"},
+		title: "自动摘要标题",
+	}
+	srv := NewServer(cfg, eng, nil, store)
+
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-manual", UserID: "test", Platform: "web", Title: "我手动改过的标题",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+	if err := store.SaveMessage(context.Background(), &storage.MessageRecord{
+		ID: "msg-manual-1", SessionID: "sess-manual", Role: "user", Content: "帮我整理一份杭州露营清单", Metadata: "{}", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("保存消息失败: %v", err)
+	}
+
+	body := `{"expected_title":"帮我整理一份杭州露营清单"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/sess-manual/suggest-title?user_id=test", strings.NewReader(body))
+	req.SetPathValue("id", "sess-manual")
+	w := httptest.NewRecorder()
+	srv.handleSuggestSessionTitle(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if updated, _ := resp["updated"].(bool); updated {
+		t.Fatalf("manual title should not be overridden: %+v", resp)
+	}
+	if title, _ := resp["title"].(string); title != "我手动改过的标题" {
+		t.Fatalf("title=%q", title)
 	}
 }
 

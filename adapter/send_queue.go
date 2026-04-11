@@ -56,11 +56,17 @@ func (q *SendQueue) Send(ctx context.Context, chatID string, reply *Reply) error
 	if reply == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if q == nil {
 		return fmt.Errorf("send queue 未初始化")
 	}
 	if q.stopped.Load() {
 		return fmt.Errorf("send queue 已停止")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	task := &sendTask{
 		ctx:    ctx,
