@@ -1258,6 +1258,7 @@ func (e *ReActEngine) pipeStream(
 
 	var fullContent strings.Builder
 	var fullReasoning strings.Builder
+	var reasoningStartTime time.Time
 
 	reasoningLogged := false
 	for chunk := range llmStream.Chunks() {
@@ -1265,6 +1266,9 @@ func (e *ReActEngine) pipeStream(
 			continue
 		}
 		if chunk.Reasoning != "" {
+			if reasoningStartTime.IsZero() {
+				reasoningStartTime = time.Now()
+			}
 			fullReasoning.WriteString(chunk.Reasoning)
 			if !reasoningLogged {
 				trace.L(ctx).Info("首个 chunk", "type", "reasoning", "preview", chunk.Reasoning[:min(50, len(chunk.Reasoning))])
@@ -1342,10 +1346,14 @@ func (e *ReActEngine) pipeStream(
 	defer saveCancel()
 	saveCtx = trace.WithLogger(saveCtx, trace.L(ctx))
 
-	// 保存助手回复（含 reasoning）
+	// 保存助手回复（含 reasoning + thinking duration）
 	assistantMessageID := ""
 	reasoning := fullReasoning.String()
-	if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(saveCtx, sessionID, content, reasoning, messageRequestID(msg)); err != nil {
+	var thinkingDuration int
+	if !reasoningStartTime.IsZero() && reasoning != "" {
+		thinkingDuration = int(time.Since(reasoningStartTime).Seconds())
+	}
+	if record, err := e.sessions.SaveAssistantMessageFull(saveCtx, sessionID, content, reasoning, thinkingDuration, messageRequestID(msg)); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
@@ -1448,12 +1456,16 @@ func (e *ReActEngine) pipeStreamWithTools(
 
 	var fullContent strings.Builder
 	var fullReasoning strings.Builder
+	var reasoningStartTime2 time.Time
 	for chunk := range llmStream.Chunks() {
 		if chunk.Content == "" && chunk.Reasoning == "" {
 			continue
 		}
 		fullContent.WriteString(chunk.Content)
 		if chunk.Reasoning != "" {
+			if reasoningStartTime2.IsZero() {
+				reasoningStartTime2 = time.Now()
+			}
 			fullReasoning.WriteString(chunk.Reasoning)
 		}
 		select {
@@ -1524,7 +1536,11 @@ func (e *ReActEngine) pipeStreamWithTools(
 
 	assistantMessageID := ""
 	reasoning := fullReasoning.String()
-	if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(saveCtx, sessionID, content, reasoning, messageRequestID(msg)); err != nil {
+	var thinkingDuration2 int
+	if !reasoningStartTime2.IsZero() && reasoning != "" {
+		thinkingDuration2 = int(time.Since(reasoningStartTime2).Seconds())
+	}
+	if record, err := e.sessions.SaveAssistantMessageFull(saveCtx, sessionID, content, reasoning, thinkingDuration2, messageRequestID(msg)); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID

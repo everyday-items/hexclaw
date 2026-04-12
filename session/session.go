@@ -159,6 +159,36 @@ func (m *Manager) SaveAssistantMessageWithMetaAndRequestID(ctx context.Context, 
 	return msg, nil
 }
 
+// SaveAssistantMessageFull 保存助手回复（含 reasoning、thinking_duration 和 request_id）。
+func (m *Manager) SaveAssistantMessageFull(ctx context.Context, sessionID, content, reasoning string, thinkingDuration int, requestID string) (*storage.MessageRecord, error) {
+	metaMap := map[string]any{}
+	if reasoning != "" {
+		metaMap["reasoning"] = reasoning
+	}
+	if thinkingDuration > 0 {
+		metaMap["thinking_duration"] = thinkingDuration
+	}
+	meta := "{}"
+	if len(metaMap) > 0 {
+		if b, err := json.Marshal(metaMap); err == nil {
+			meta = string(b)
+		}
+	}
+	msg := &storage.MessageRecord{
+		ID:        "msg-" + idgen.ShortID(),
+		SessionID: sessionID,
+		Role:      "assistant",
+		Content:   content,
+		Metadata:  meta,
+		RequestID: requestID,
+		CreatedAt: time.Now(),
+	}
+	if err := m.store.SaveMessage(ctx, msg); err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
+
 func requestIDFromMetadata(metadata map[string]string) string {
 	if metadata == nil {
 		return ""
