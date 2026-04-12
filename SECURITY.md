@@ -22,7 +22,7 @@ We will acknowledge receipt within 48 hours and provide a detailed response with
 
 | Version | Supported |
 |---------|-----------|
-| v0.3.9 (latest) | ✅ Yes |
+| v0.3.10 (latest) | ✅ Yes |
 
 ## Security Features
 
@@ -35,7 +35,7 @@ HexClaw includes a 6-layer security gateway:
 5. **RBAC** - Role-based access control
 6. **Audit** - Request logging
 
-## Security Hardening (v0.3.9)
+## Security Hardening (v0.3.10)
 
 ### API Authentication
 - Token comparison uses `crypto/subtle.ConstantTimeCompare` to prevent timing attacks

@@ -730,7 +730,12 @@ func (e *ReActEngine) finalizeReply(
 	}
 
 	assistantMessageID := ""
-	if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sessionID, content, "", messageRequestID(msg)); err != nil {
+	if record, err := e.sessions.SaveAssistantReply(ctx, sessionID, content, session.AssistantMeta{
+		Provider:  providerName,
+		Model:     modelName,
+		AgentName: msg.Metadata["role"],
+		RequestID: messageRequestID(msg),
+	}); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
@@ -783,6 +788,8 @@ func (e *ReActEngine) finalizeReply(
 			}
 		}()
 	}
+
+	// 自动标题生成（异步，首轮对话后自动提炼标题）
 
 	return &adapter.Reply{
 		Content:   content,
@@ -1259,6 +1266,7 @@ func (e *ReActEngine) pipeStream(
 	var fullContent strings.Builder
 	var fullReasoning strings.Builder
 	var reasoningStartTime time.Time
+	var reasoningEndTime time.Time
 
 	reasoningLogged := false
 	for chunk := range llmStream.Chunks() {
@@ -1274,6 +1282,10 @@ func (e *ReActEngine) pipeStream(
 				trace.L(ctx).Info("首个 chunk", "type", "reasoning", "preview", chunk.Reasoning[:min(50, len(chunk.Reasoning))])
 				reasoningLogged = true
 			}
+		}
+		// reasoning 结束标记：已有 reasoning 且首次收到 content
+		if chunk.Content != "" && !reasoningStartTime.IsZero() && reasoningEndTime.IsZero() {
+			reasoningEndTime = time.Now()
 		}
 		fullContent.WriteString(chunk.Content)
 
@@ -1351,9 +1363,20 @@ func (e *ReActEngine) pipeStream(
 	reasoning := fullReasoning.String()
 	var thinkingDuration int
 	if !reasoningStartTime.IsZero() && reasoning != "" {
-		thinkingDuration = int(time.Since(reasoningStartTime).Seconds())
+		end := reasoningEndTime
+		if end.IsZero() {
+			end = time.Now() // 纯 reasoning 无 content 的情况
+		}
+		thinkingDuration = int(end.Sub(reasoningStartTime).Seconds())
 	}
-	if record, err := e.sessions.SaveAssistantMessageFull(saveCtx, sessionID, content, reasoning, thinkingDuration, messageRequestID(msg)); err != nil {
+	if record, err := e.sessions.SaveAssistantReply(saveCtx, sessionID, content, session.AssistantMeta{
+		Reasoning:        reasoning,
+		ThinkingDuration: thinkingDuration,
+		Provider:         providerName,
+		Model:            modelName,
+		AgentName:        msgMeta["role"],
+		RequestID:        messageRequestID(msg),
+	}); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
@@ -1457,17 +1480,21 @@ func (e *ReActEngine) pipeStreamWithTools(
 	var fullContent strings.Builder
 	var fullReasoning strings.Builder
 	var reasoningStartTime2 time.Time
+	var reasoningEndTime2 time.Time
 	for chunk := range llmStream.Chunks() {
 		if chunk.Content == "" && chunk.Reasoning == "" {
 			continue
 		}
-		fullContent.WriteString(chunk.Content)
 		if chunk.Reasoning != "" {
 			if reasoningStartTime2.IsZero() {
 				reasoningStartTime2 = time.Now()
 			}
 			fullReasoning.WriteString(chunk.Reasoning)
 		}
+		if chunk.Content != "" && !reasoningStartTime2.IsZero() && reasoningEndTime2.IsZero() {
+			reasoningEndTime2 = time.Now()
+		}
+		fullContent.WriteString(chunk.Content)
 		select {
 		case ch <- &adapter.ReplyChunk{Content: chunk.Content, Reasoning: chunk.Reasoning}:
 		case <-ctx.Done():
@@ -1538,9 +1565,20 @@ func (e *ReActEngine) pipeStreamWithTools(
 	reasoning := fullReasoning.String()
 	var thinkingDuration2 int
 	if !reasoningStartTime2.IsZero() && reasoning != "" {
-		thinkingDuration2 = int(time.Since(reasoningStartTime2).Seconds())
+		end := reasoningEndTime2
+		if end.IsZero() {
+			end = time.Now()
+		}
+		thinkingDuration2 = int(end.Sub(reasoningStartTime2).Seconds())
 	}
-	if record, err := e.sessions.SaveAssistantMessageFull(saveCtx, sessionID, content, reasoning, thinkingDuration2, messageRequestID(msg)); err != nil {
+	if record, err := e.sessions.SaveAssistantReply(saveCtx, sessionID, content, session.AssistantMeta{
+		Reasoning:        reasoning,
+		ThinkingDuration: thinkingDuration2,
+		Provider:         providerName,
+		Model:            modelName,
+		AgentName:        msgMeta["role"],
+		RequestID:        messageRequestID(msg),
+	}); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
 	} else {
 		assistantMessageID = record.ID
@@ -1611,6 +1649,8 @@ func (e *ReActEngine) pipeStreamWithTools(
 	if msgMeta["memory"] != "off" {
 		e.autoExtractMemoryForRole(msg.Content, content, msgMeta["role"])
 	}
+
+	// 自动标题生成（异步，首轮对话后自动提炼标题）
 }
 
 // buildStreamMessages 构建流式请求的消息列表
@@ -2150,7 +2190,7 @@ const defaultSystemPrompt = `你是「小蟹」🦀，HexClaw 的 AI 助手。
 - 友好、专业、略带幽默感，偶尔横行一下 🦀
 - 回答简洁直接，高效不啰嗦
 - 诚实可靠：不确定的事情坦诚告知，不编造信息
-- 用中文回答，除非用户明确要求使用其他语言
+- 用中文回答和思考，除非用户明确要求使用其他语言
 
 能力：
 - 智能编排：多步骤任务自动执行

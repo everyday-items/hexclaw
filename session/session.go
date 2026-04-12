@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/hexagon-codes/hexagon"
@@ -116,7 +117,13 @@ func (m *Manager) SaveUserMessage(ctx context.Context, sessionID string, msg *ad
 		RequestID: requestIDFromMetadata(msg.Metadata),
 		CreatedAt: time.Now(),
 	}
-	return m.store.SaveMessage(ctx, record)
+	if err := m.store.SaveMessage(ctx, record); err != nil {
+		return err
+	}
+
+	// 首条用户消息时自动更新默认标题（同步、无 LLM 依赖）
+	m.autoUpdateDefaultTitle(ctx, sessionID, msg.Content)
+	return nil
 }
 
 // SaveAssistantMessage 保存助手回复到会话
@@ -130,43 +137,58 @@ func (m *Manager) SaveAssistantMessageRecord(ctx context.Context, sessionID, con
 	return m.SaveAssistantMessageWithMeta(ctx, sessionID, content, "")
 }
 
+// AssistantMeta 助手消息的完整元数据。
+type AssistantMeta struct {
+	Reasoning        string
+	ThinkingDuration int
+	Provider         string
+	Model            string
+	AgentName        string
+	RequestID        string
+}
+
 // SaveAssistantMessageWithMeta 保存助手回复（含 reasoning 等元数据）并返回消息记录。
 func (m *Manager) SaveAssistantMessageWithMeta(ctx context.Context, sessionID, content, reasoning string) (*storage.MessageRecord, error) {
 	return m.SaveAssistantMessageWithMetaAndRequestID(ctx, sessionID, content, reasoning, "")
 }
 
 // SaveAssistantMessageWithMetaAndRequestID 保存助手回复（含 reasoning 和 request_id）并返回消息记录。
+// Deprecated: 新代码请使用 SaveAssistantReply。
 func (m *Manager) SaveAssistantMessageWithMetaAndRequestID(ctx context.Context, sessionID, content, reasoning, requestID string) (*storage.MessageRecord, error) {
-	meta := "{}"
-	if reasoning != "" {
-		metaJSON, err := json.Marshal(map[string]string{"reasoning": reasoning})
-		if err == nil {
-			meta = string(metaJSON)
-		}
-	}
-	msg := &storage.MessageRecord{
-		ID:        "msg-" + idgen.ShortID(),
-		SessionID: sessionID,
-		Role:      "assistant",
-		Content:   content,
-		Metadata:  meta,
+	return m.SaveAssistantReply(ctx, sessionID, content, AssistantMeta{
+		Reasoning: reasoning,
 		RequestID: requestID,
-		CreatedAt: time.Now(),
-	}
-	if err := m.store.SaveMessage(ctx, msg); err != nil {
-		return nil, err
-	}
-	return msg, nil
+	})
 }
 
 // SaveAssistantMessageFull 保存助手回复（含 reasoning、thinking_duration 和 request_id）。
+// Deprecated: 新代码请使用 SaveAssistantReply。
 func (m *Manager) SaveAssistantMessageFull(ctx context.Context, sessionID, content, reasoning string, thinkingDuration int, requestID string) (*storage.MessageRecord, error) {
+	return m.SaveAssistantReply(ctx, sessionID, content, AssistantMeta{
+		Reasoning:        reasoning,
+		ThinkingDuration: thinkingDuration,
+		RequestID:        requestID,
+	})
+}
+
+// SaveAssistantReply 统一的助手消息保存方法。
+// 所有元数据（reasoning、duration、provider、model、agent）一次性写入 meta 字段。
+func (m *Manager) SaveAssistantReply(ctx context.Context, sessionID, content string, am AssistantMeta) (*storage.MessageRecord, error) {
 	metaMap := map[string]any{}
-	if reasoning != "" {
-		metaMap["reasoning"] = reasoning
+	if am.Reasoning != "" {
+		metaMap["reasoning"] = am.Reasoning
 	}
-	if thinkingDuration > 0 {
-		metaMap["thinking_duration"] = thinkingDuration
+	if am.ThinkingDuration > 0 {
+		metaMap["thinking_duration"] = am.ThinkingDuration
+	}
+	if am.Provider != "" {
+		metaMap["provider"] = am.Provider
+	}
+	if am.Model != "" {
+		metaMap["model"] = am.Model
+	}
+	if am.AgentName != "" {
+		metaMap["agent_name"] = am.AgentName
 	}
 	meta := "{}"
 	if len(metaMap) > 0 {
@@ -180,7 +202,7 @@ func (m *Manager) SaveAssistantMessageFull(ctx context.Context, sessionID, conte
 		Role:      "assistant",
 		Content:   content,
 		Metadata:  meta,
-		RequestID: requestID,
+		RequestID: am.RequestID,
 		CreatedAt: time.Now(),
 	}
 	if err := m.store.SaveMessage(ctx, msg); err != nil {
@@ -284,6 +306,24 @@ func toRole(role string) hexagon.LLMRole {
 	default:
 		return hexagon.RoleUser
 	}
+}
+
+// autoUpdateDefaultTitle 当 session 标题为默认值时，用消息内容同步更新。
+func (m *Manager) autoUpdateDefaultTitle(ctx context.Context, sessionID, content string) {
+	sess, err := m.store.GetSession(ctx, sessionID)
+	if err != nil || sess == nil {
+		return
+	}
+	title := strings.ToLower(strings.TrimSpace(sess.Title))
+	if title != "" && title != "new chat" && title != "新对话" && title != "新会话" {
+		return // 已有自定义标题
+	}
+	newTitle := generateTitle(content)
+	if newTitle == "" {
+		return
+	}
+	sess.Title = newTitle
+	_ = m.store.UpdateSession(ctx, sess)
 }
 
 // generateTitle 从消息内容生成会话标题

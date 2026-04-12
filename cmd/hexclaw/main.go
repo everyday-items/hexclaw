@@ -58,7 +58,7 @@ import (
 
 // 版本信息，通过 -ldflags 注入
 var (
-	version = "v0.3.9"
+	version = "v0.3.10"
 	commit  = "none"
 	date    = "unknown"
 )

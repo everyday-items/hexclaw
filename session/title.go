@@ -109,6 +109,11 @@ func normalizeSuggestedTitle(raw string) string {
 	return stringx.Truncate(title, 24)
 }
 
+// FallbackTitle 从消息中提取用户第一条消息作为标题（不依赖 LLM）。
+func FallbackTitle(messages []*storage.MessageRecord) string {
+	return fallbackTitleFromMessages(messages)
+}
+
 func fallbackTitleFromMessages(messages []*storage.MessageRecord) string {
 	for _, msg := range messages {
 		if msg == nil {
