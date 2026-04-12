@@ -4,12 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // VectorMemory 基于向量存储的语义记忆
@@ -215,7 +216,7 @@ func (lm *LayeredMemory) LoadContext() string {
 
 // SemanticSearch 语义搜索（跨所有层）
 //
-// 先搜索向量记忆，再搜索文件记忆，合并去重。
+// 先搜索向量记忆，再搜索文件记忆，合并去重后按分数降序截断到 topK。
 func (lm *LayeredMemory) SemanticSearch(ctx context.Context, query string, topK int) []VectorSearchResult {
 	var results []VectorSearchResult
 
@@ -239,6 +240,28 @@ func (lm *LayeredMemory) SemanticSearch(ctx context.Context, query string, topK 
 				Score:   float32(r.Score * 0.8), // 关键词匹配权重稍低
 			})
 		}
+	}
+
+	// Fix 9: 按内容去重，避免向量搜索和文件搜索返回相同条目
+	seen := make(map[string]struct{}, len(results))
+	deduped := make([]VectorSearchResult, 0, len(results))
+	for _, r := range results {
+		if _, exists := seen[r.Content]; exists {
+			continue
+		}
+		seen[r.Content] = struct{}{}
+		deduped = append(deduped, r)
+	}
+	results = deduped
+
+	// Fix 9: 按分数降序排序
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
+
+	// Fix 9: 截断到 topK
+	if topK > 0 && len(results) > topK {
+		results = results[:topK]
 	}
 
 	return results

@@ -12,6 +12,10 @@ import (
 
 // handleListWebhooks 列出用户的 Webhook
 func (s *Server) handleListWebhooks(w http.ResponseWriter, r *http.Request) {
+	if s.webhookMgr == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"webhooks": []any{}, "total": 0})
+		return
+	}
 	userID := r.URL.Query().Get("user_id")
 	if userID == "" {
 		userID = "api-user"
@@ -69,6 +73,10 @@ func (s *Server) handleRegisterWebhook(w http.ResponseWriter, r *http.Request) {
 		UserID: req.UserID,
 	}
 
+	if s.webhookMgr == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Webhook 未启用"})
+		return
+	}
 	if err := s.webhookMgr.Register(r.Context(), wh); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "注册 Webhook 失败: " + err.Error(),
@@ -85,6 +93,10 @@ func (s *Server) handleRegisterWebhook(w http.ResponseWriter, r *http.Request) {
 
 // handleDeleteWebhook 删除 Webhook
 func (s *Server) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
+	if s.webhookMgr == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Webhook 未启用"})
+		return
+	}
 	name := r.PathValue("name")
 	if err := s.webhookMgr.Unregister(r.Context(), name); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{

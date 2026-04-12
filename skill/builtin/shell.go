@@ -56,13 +56,16 @@ func (s *ShellSkill) Match(content string) bool {
 
 // Execute 执行 Shell 命令
 func (s *ShellSkill) Execute(ctx context.Context, args map[string]any) (*skill.Result, error) {
-	query, _ := args["query"].(string)
-	if query == "" {
+	cmd, _ := args["command"].(string)
+	if cmd == "" {
+		cmd, _ = args["query"].(string) // fallback for quick-path
+	}
+	if cmd == "" {
 		return &skill.Result{Content: "请提供命令，格式：/sh ls -la"}, nil
 	}
 
 	// 提取命令内容
-	command := extractShellCommand(query)
+	command := extractShellCommand(cmd)
 	if command == "" {
 		return &skill.Result{Content: "请提供要执行的命令"}, nil
 	}
@@ -215,8 +218,17 @@ func checkAllowed(command string) string {
 		// 检查子命令限制
 		if blocked, ok := dangerousSubcommands[cmd]; ok {
 			rest := strings.TrimSpace(seg[len(cmd):])
+			// 提取实际子命令：跳过所有 flag（以 - 开头的 token）
+			parts := strings.Fields(rest)
+			subcommand := ""
+			for _, p := range parts {
+				if !strings.HasPrefix(p, "-") {
+					subcommand = p
+					break
+				}
+			}
 			for _, sub := range blocked {
-				if strings.HasPrefix(rest, sub) {
+				if subcommand == sub || strings.HasPrefix(rest, sub) {
 					return fmt.Sprintf("命令 %s %s 被禁止", cmd, sub)
 				}
 			}
@@ -247,6 +259,10 @@ func checkDangerousPatterns(cmd string) string {
 	// 输入重定向 here-doc
 	if strings.Contains(cmd, "<<") {
 		return "禁止使用 here-doc 重定向 <<"
+	}
+	// 输入重定向 < (单独的 <，不含 << 和 <( 已在上面拦截)
+	if strings.Contains(cmd, " < ") || strings.HasPrefix(cmd, "< ") {
+		return "禁止使用输入重定向 <"
 	}
 	// 进程替换
 	if strings.Contains(cmd, "<(") || strings.Contains(cmd, ">(") {

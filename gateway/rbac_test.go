@@ -175,14 +175,14 @@ func TestRBACLayer_UnknownUserNoGuestRole(t *testing.T) {
 	layer := NewRBACLayer(cfg)
 	ctx := context.Background()
 
-	// 未知用户且无 guest 角色 → 直接放行
+	// 未知用户且无 guest 角色 → 拒绝（有角色定义时默认拒绝）
 	msg := &adapter.Message{
 		UserID:   "unknown-user",
 		Platform: adapter.PlatformTelegram,
 		Metadata: map[string]string{"tool_name": "shell"},
 	}
-	if err := layer.Check(ctx, msg); err != nil {
-		t.Fatalf("无 guest 角色时未知用户应放行: %v", err)
+	if err := layer.Check(ctx, msg); err == nil {
+		t.Fatalf("有角色定义但无 guest 角色时未知用户应被拒绝")
 	}
 }
 

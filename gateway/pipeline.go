@@ -40,6 +40,10 @@ func NewPipeline(cfg *config.SecurityConfig, store storage.Store) *Pipeline {
 	}
 
 	// Layer 2: 速率限制
+	// 当配置值为 0 时设置安全默认值，防止无限速
+	if cfg.RateLimit.RequestsPerMinute == 0 && cfg.RateLimit.RequestsPerHour == 0 {
+		cfg.RateLimit.RequestsPerMinute = 60 // safe default
+	}
 	if cfg.RateLimit.RequestsPerMinute > 0 || cfg.RateLimit.RequestsPerHour > 0 {
 		p.layers = append(p.layers, NewRateLimitLayer(cfg.RateLimit))
 	}

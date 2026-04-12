@@ -8,6 +8,7 @@ import (
 
 	hexagon "github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/trace"
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
 // autoExtractMemory 异步从对话中提取值得记忆的信息
@@ -33,11 +34,15 @@ func (e *ReActEngine) autoExtractMemoryForRole(userText, assistantText, role str
 		return
 	}
 
+	// Fix 5: 使用 bgWg 追踪后台 goroutine，确保 shutdown 时等待完成。
+	// 使用 30s 超时（而非 context.Background()），防止孤儿 goroutine 无限运行。
+	e.bgWg.Add(1)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer e.bgWg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		provider, providerName, err := e.selectLLMForMemory()
+		provider, providerName, err := e.selectLLMForMemory(ctx)
 		if err != nil {
 			trace.L(ctx).Warn("auto-memory: 无可用 LLM", "err", err)
 			return
@@ -68,7 +73,7 @@ func (e *ReActEngine) autoExtractMemoryForRole(userText, assistantText, role str
 			trace.L(ctx).Error("auto-memory: 写入记忆失败", "err", err)
 			return
 		}
-		trace.L(ctx).Info("auto-memory: 已自动记忆", "content", truncateForLog(result, 80))
+		trace.L(ctx).Info("auto-memory: 已自动记忆", "content", stringx.TruncateWithSuffix(strings.ReplaceAll(result, "\n", " "), 80, "..."))
 
 		if e.onMemorySaved != nil {
 			e.onMemorySaved(result)
@@ -77,8 +82,8 @@ func (e *ReActEngine) autoExtractMemoryForRole(userText, assistantText, role str
 }
 
 // selectLLMForMemory 选择一个可用的 LLM 用于记忆提取
-func (e *ReActEngine) selectLLMForMemory() (hexagon.Provider, string, error) {
-	provider, name, err := e.router.Route(context.Background())
+func (e *ReActEngine) selectLLMForMemory(ctx context.Context) (hexagon.Provider, string, error) {
+	provider, name, err := e.router.Route(ctx)
 	if err != nil {
 		return nil, "", fmt.Errorf("无可用 LLM: %w", err)
 	}
@@ -109,19 +114,13 @@ const memoryExtractionSystemPrompt = `你是一个记忆提取器。从对话中
 用户偏好简洁的代码风格`
 
 func buildMemoryExtractionPrompt(userText, assistantText, existingMemory string) string {
-	if len(userText) > 500 {
-		userText = userText[:500] + "..."
-	}
-	if len(assistantText) > 500 {
-		assistantText = assistantText[:500] + "..."
-	}
+	userText = stringx.TruncateWithSuffix(userText, 500, "...")
+	assistantText = stringx.TruncateWithSuffix(assistantText, 500, "...")
 
 	var sb strings.Builder
 	if existingMemory != "" {
 		// 截断已有记忆，避免 token 过多
-		if len(existingMemory) > 800 {
-			existingMemory = existingMemory[:800] + "\n..."
-		}
+		existingMemory = stringx.TruncateWithSuffix(existingMemory, 800, "\n...")
 		sb.WriteString("已有记忆（不要重复记录这些内容）：\n")
 		sb.WriteString(existingMemory)
 		sb.WriteString("\n\n---\n\n")
@@ -157,10 +156,3 @@ func mayContainMemorableInfo(text string) bool {
 	return false
 }
 
-func truncateForLog(s string, n int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
-}

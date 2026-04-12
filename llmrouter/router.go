@@ -15,13 +15,14 @@ package llmrouter
 import (
 	"context"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"sort"
 	"strings"
 	"sync"
 
+	"github.com/hexagon-codes/ai-core/llm/anthropic"
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // costPriority 成本优先策略的 Provider 优先级（数字越小越优先）
@@ -154,6 +155,19 @@ func cloneLLMConfig(cfg config.LLMConfig) config.LLMConfig {
 // 这意味着：DeepSeek、Qwen 等声明 OpenAI 兼容的 Provider，
 // 以及任何 API 中转/私有部署，都可以通过此方式接入。
 func (r *Selector) createProvider(name string, pc config.LLMProviderConfig) hexagon.Provider {
+	// Anthropic 使用原生 SDK（非 OpenAI 兼容协议）
+	if name == "anthropic" {
+		var aopts []anthropic.Option
+		if pc.BaseURL != "" {
+			aopts = append(aopts, anthropic.WithBaseURL(pc.BaseURL))
+		}
+		if pc.Model != "" {
+			aopts = append(aopts, anthropic.WithModel(pc.Model))
+		}
+		return anthropic.New(pc.APIKey, aopts...)
+	}
+
+	// 其他 Provider 统一使用 OpenAI 兼容协议
 	opts := []hexagon.OpenAIOption{}
 	if pc.BaseURL != "" {
 		opts = append(opts, hexagon.OpenAIWithBaseURL(pc.BaseURL))
@@ -300,14 +314,20 @@ func (r *Selector) selectByPriority(priorities map[string]int) string {
 // Fallback 降级到备用 Provider
 //
 // 当指定的 Provider 不可用时，返回第一个可用的其他 Provider。
-func (r *Selector) Fallback(exclude string) (hexagon.Provider, string, error) {
+// 支持排除多个 Provider（用于级联降级场景）。
+func (r *Selector) Fallback(exclude ...string) (hexagon.Provider, string, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+
+	excludeSet := make(map[string]bool, len(exclude))
+	for _, e := range exclude {
+		excludeSet[e] = true
+	}
 
 	// 确定性选择：按名称排序后取第一个非排除项
 	names := make([]string, 0, len(r.providers))
 	for name := range r.providers {
-		if name != exclude {
+		if !excludeSet[name] {
 			names = append(names, name)
 		}
 	}

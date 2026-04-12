@@ -24,11 +24,13 @@ type LLMConfigResponse struct {
 
 // LLMProviderConfigResponse 脱敏后的 Provider 配置
 type LLMProviderConfigResponse struct {
-	APIKey     string   `json:"api_key"`
-	BaseURL    string   `json:"base_url"`
-	Model      string   `json:"model"`
-	Models     []string `json:"models,omitempty"`
-	Compatible string   `json:"compatible"`
+	APIKey       string   `json:"api_key"`
+	BaseURL      string   `json:"base_url"`
+	Model        string   `json:"model"`
+	Models       []string `json:"models,omitempty"`
+	Compatible   string   `json:"compatible"`
+	ToolsEnabled *bool    `json:"tools_enabled,omitempty"`
+	MaxTools     int      `json:"max_tools,omitempty"`
 }
 
 // LLMConfigUpdateRequest PUT /api/v1/config/llm 请求
@@ -41,11 +43,13 @@ type LLMConfigUpdateRequest struct {
 
 // LLMProviderConfigUpdateItem 更新请求中的 Provider 项
 type LLMProviderConfigUpdateItem struct {
-	APIKey     string   `json:"api_key"`
-	BaseURL    string   `json:"base_url"`
-	Model      string   `json:"model"`
-	Models     []string `json:"models,omitempty"`
-	Compatible string   `json:"compatible"`
+	APIKey       string   `json:"api_key"`
+	BaseURL      string   `json:"base_url"`
+	Model        string   `json:"model"`
+	Models       []string `json:"models,omitempty"`
+	Compatible   string   `json:"compatible"`
+	ToolsEnabled *bool    `json:"tools_enabled,omitempty"`
+	MaxTools     int      `json:"max_tools,omitempty"`
 }
 
 type llmConnectionTestProvider struct {
@@ -119,11 +123,13 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	providers := make(map[string]LLMProviderConfigResponse, len(llmCfg.Providers))
 	for name, p := range llmCfg.Providers {
 		providers[name] = LLMProviderConfigResponse{
-			APIKey:     config.MaskAPIKey(p.APIKey),
-			BaseURL:    p.BaseURL,
-			Model:      p.Model,
-			Models:     p.Models,
-			Compatible: p.Compatible,
+			APIKey:       config.MaskAPIKey(p.APIKey),
+			BaseURL:      p.BaseURL,
+			Model:        p.Model,
+			Models:       p.Models,
+			Compatible:   p.Compatible,
+			ToolsEnabled: p.ToolsEnabled,
+			MaxTools:     p.MaxTools,
 		}
 	}
 
@@ -163,11 +169,13 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			newProviders[name] = config.LLMProviderConfig{
-				APIKey:     apiKey,
-				BaseURL:    p.BaseURL,
-				Model:      p.Model,
-				Models:     p.Models,
-				Compatible: p.Compatible,
+				APIKey:       apiKey,
+				BaseURL:      p.BaseURL,
+				Model:        p.Model,
+				Models:       p.Models,
+				Compatible:   p.Compatible,
+				ToolsEnabled: p.ToolsEnabled,
+				MaxTools:     p.MaxTools,
 			}
 		}
 		nextLLM.Providers = newProviders

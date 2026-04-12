@@ -385,17 +385,18 @@ func (fm *FileMemory) SaveEntryForRole(content, memType, source, role string) er
 		targetDir = fm.roleDir("")
 	}
 
-	// 1. 语义去重：检查是否已存在高度相似的记忆
-	if fm.isDuplicate(targetDir, content) {
+	// Fix: 在同一把写锁内完成去重检查、容量淘汰、追加写入，
+	// 消除 isDuplicate/evictIfNeeded 与写入之间的 TOCTOU 竞态。
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+
+	// 1. 语义去重（在写锁内直接检查，不调用 isDuplicate 避免死锁）
+	if fm.isDuplicateUnlocked(targetDir, content) {
 		return nil // 静默跳过重复
 	}
 
-	// 2. 容量淘汰：超限时删除评分最低的条目
-	fm.evictIfNeeded(targetDir)
-
-	// 3. 追加写入
-	fm.mu.Lock()
-	defer fm.mu.Unlock()
+	// 2. 容量淘汰（在写锁内直接执行，不调用 evictIfNeeded 避免死锁）
+	fm.evictIfNeededUnlocked(targetDir)
 
 	path := filepath.Join(targetDir, memoryActiveFile)
 	if err := fileutil.MkdirAll(targetDir); err != nil {
@@ -504,11 +505,16 @@ func (fm *FileMemory) readFileFrom(dir, filename string) string {
 
 // ─── 语义去重 ────────────────────────────────────────────
 
-// isDuplicate 检查新内容是否与已有记忆高度相似
+// isDuplicate 检查新内容是否与已有记忆高度相似（带 RLock，供外部调用）
 func (fm *FileMemory) isDuplicate(dir, content string) bool {
 	fm.mu.RLock()
+	defer fm.mu.RUnlock()
+	return fm.isDuplicateUnlocked(dir, content)
+}
+
+// isDuplicateUnlocked 检查新内容是否与已有记忆高度相似（调用方已持有锁）
+func (fm *FileMemory) isDuplicateUnlocked(dir, content string) bool {
 	raw := fm.readFileFrom(dir, memoryActiveFile)
-	fm.mu.RUnlock()
 
 	if raw == "" {
 		return false
@@ -594,9 +600,16 @@ func jaccardSimilarity(a, b string) float64 {
 
 // ─── 容量淘汰（加权评分） ────────────────────────────────
 
-// evictIfNeeded 当容量已满时将评分最低的条目降级到归档，避免系统自动删除记忆。
+// evictIfNeeded 当容量已满时将评分最低的条目降级到归档（带锁，供外部调用）。
 func (fm *FileMemory) evictIfNeeded(dir string) {
-	entries := fm.parseEntriesFromDir(dir)
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	fm.evictIfNeededUnlocked(dir)
+}
+
+// evictIfNeededUnlocked 当容量已满时将评分最低的条目降级到归档（调用方已持有写锁）。
+func (fm *FileMemory) evictIfNeededUnlocked(dir string) {
+	entries := fm.parseEntriesFromDirUnlocked(dir)
 	if len(entries) < fm.config.MaxMemory {
 		return
 	}
@@ -622,7 +635,7 @@ func (fm *FileMemory) evictIfNeeded(dir string) {
 		return // 全是 instruction，无法淘汰
 	}
 
-	_ = fm.moveEntryLine(dir, memoryActiveFile, memoryArchiveFile, lowestIdx)
+	_ = fm.moveEntryLineUnlocked(dir, memoryActiveFile, memoryArchiveFile, lowestIdx)
 }
 
 // entryEvictionScore 计算条目的保留评分（越高越不该被淘汰）
@@ -662,16 +675,27 @@ func entryEvictionScore(e MemoryEntry, now time.Time) float64 {
 	return hitScore + recencyScore + typeScore + sourceScore
 }
 
-// parseEntriesFromDir 从指定目录解析活跃 MEMORY.md
+// parseEntriesFromDir 从指定目录解析活跃 MEMORY.md（带 RLock）
 func (fm *FileMemory) parseEntriesFromDir(dir string) []MemoryEntry {
 	return fm.parseEntriesFromFile(dir, memoryActiveFile, MemoryStatusActive, "m")
+}
+
+// parseEntriesFromDirUnlocked 从指定目录解析活跃 MEMORY.md（调用方已持有锁）
+func (fm *FileMemory) parseEntriesFromDirUnlocked(dir string) []MemoryEntry {
+	return fm.parseEntriesFromFileUnlocked(dir, memoryActiveFile, MemoryStatusActive, "m")
 }
 
 func (fm *FileMemory) parseEntriesFromFile(dir, filename, status, idPrefix string) []MemoryEntry {
 	fm.mu.RLock()
 	defer fm.mu.RUnlock()
+	return fm.parseEntriesFromFileUnlocked(dir, filename, status, idPrefix)
+}
 
-	data, err := os.ReadFile(filepath.Join(dir, filename))
+// parseEntriesFromFileUnlocked 解析记忆文件（调用方已持有锁）。
+// Fix 8: 使用文件 ModTime 作为无显式时间戳条目的默认日期，避免全部设为 today 破坏时间衰减淘汰。
+func (fm *FileMemory) parseEntriesFromFileUnlocked(dir, filename, status, idPrefix string) []MemoryEntry {
+	filePath := filepath.Join(dir, filename)
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil
 	}
@@ -680,7 +704,13 @@ func (fm *FileMemory) parseEntriesFromFile(dir, filename, status, idPrefix strin
 		return nil
 	}
 
-	today := time.Now().Format("2006-01-02")
+	// Fix 8: 使用文件修改时间作为默认日期（而非 time.Now()），
+	// 避免所有无显式时间戳的条目都被当成"今天"创建的，破坏时间衰减淘汰。
+	defaultDate := time.Now().Format("2006-01-02")
+	if info, statErr := os.Stat(filePath); statErr == nil {
+		defaultDate = info.ModTime().Format("2006-01-02")
+	}
+
 	lines := strings.Split(raw, "\n")
 	var entries []MemoryEntry
 
@@ -694,8 +724,8 @@ func (fm *FileMemory) parseEntriesFromFile(dir, filename, status, idPrefix strin
 			ID:        fmt.Sprintf("%s-%d", idPrefix, i),
 			Type:      "fact",
 			Source:    "manual",
-			CreatedAt: today + "T00:00:00Z",
-			UpdatedAt: today + "T00:00:00Z",
+			CreatedAt: defaultDate + "T00:00:00Z",
+			UpdatedAt: defaultDate + "T00:00:00Z",
 			Status:    status,
 		}
 		if status == MemoryStatusArchived {
@@ -709,7 +739,7 @@ func (fm *FileMemory) parseEntriesFromFile(dir, filename, status, idPrefix strin
 			if idx := strings.Index(line, "]"); idx > 0 && idx <= 6 {
 				ts := line[1:idx]
 				line = strings.TrimSpace(line[idx+1:])
-				e.CreatedAt = today + "T" + ts + ":00Z"
+				e.CreatedAt = defaultDate + "T" + ts + ":00Z"
 				e.UpdatedAt = e.CreatedAt
 			}
 		}
@@ -735,7 +765,17 @@ func (fm *FileMemory) parseEntriesFromFile(dir, filename, status, idPrefix strin
 func (fm *FileMemory) moveEntryLine(dir, fromFile, toFile string, lineIdx int) error {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
+	return fm.moveEntryLineUnlocked(dir, fromFile, toFile, lineIdx)
+}
 
+// moveEntryLineUnlocked 将一行从 fromFile 移动到 toFile（调用方已持有写锁）。
+//
+// Fix 1: 使用 write-to-temp-then-rename 模式保证原子性：
+//  1. 先将目标文件（含新行）写到临时文件，rename 到目标路径（原子）
+//  2. 再更新源文件（删除该行）
+//
+// 如果步骤 2 失败，条目同时存在于两个文件中（重复优于丢失）。
+func (fm *FileMemory) moveEntryLineUnlocked(dir, fromFile, toFile string, lineIdx int) error {
 	fromPath := filepath.Join(dir, fromFile)
 	raw, err := os.ReadFile(fromPath)
 	if err != nil {
@@ -751,27 +791,37 @@ func (fm *FileMemory) moveEntryLine(dir, fromFile, toFile string, lineIdx int) e
 		return fmt.Errorf("记忆条目不存在")
 	}
 
-	lines = append(lines[:lineIdx], lines[lineIdx+1:]...)
-	if err := os.WriteFile(fromPath, []byte(strings.Join(lines, "\n")), 0644); err != nil {
-		return fmt.Errorf("更新记忆文件失败: %w", err)
-	}
-
 	if err := fileutil.MkdirAll(dir); err != nil {
 		return fmt.Errorf("创建记忆目录失败: %w", err)
 	}
+
+	// Step 1: 将目标文件内容 + 新行写到临时文件，然后 rename（原子操作）
 	toPath := filepath.Join(dir, toFile)
-	f, err := os.OpenFile(toPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("打开目标记忆文件失败: %w", err)
+	existingDest, _ := os.ReadFile(toPath) // 可能不存在，忽略错误
+	newDest := string(existingDest) + strings.TrimRight(line, "\n") + "\n"
+
+	tmpPath := toPath + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(newDest), 0644); err != nil {
+		return fmt.Errorf("写入临时文件失败: %w", err)
 	}
-	defer f.Close()
-	if _, err := f.WriteString(strings.TrimRight(line, "\n") + "\n"); err != nil {
-		return fmt.Errorf("写入目标记忆文件失败: %w", err)
+	if err := os.Rename(tmpPath, toPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("原子替换目标文件失败: %w", err)
+	}
+
+	// Step 2: 更新源文件（删除该行）
+	// 如果此步失败，条目存在于两个文件中（重复优于丢失）
+	lines = append(lines[:lineIdx], lines[lineIdx+1:]...)
+	if err := os.WriteFile(fromPath, []byte(strings.Join(lines, "\n")), 0644); err != nil {
+		return fmt.Errorf("更新记忆文件失败: %w", err)
 	}
 	return nil
 }
 
 // UpdateEntry 更新指定 ID 的记忆条目内容
+//
+// Fix 4: 根据 ID 前缀确定正确的目录，而非总是使用 _global。
+// "r-" 前缀的条目需要搜索角色目录。
 func (fm *FileMemory) UpdateEntry(id, content string) error {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
@@ -781,7 +831,8 @@ func (fm *FileMemory) UpdateEntry(id, content string) error {
 		return fmt.Errorf("记忆条目不存在: %s", id)
 	}
 
-	path := filepath.Join(fm.roleDir(""), filename)
+	dir := fm.resolveEntryDir(id)
+	path := filepath.Join(dir, filename)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("读取记忆文件失败: %w", err)
@@ -801,6 +852,8 @@ func (fm *FileMemory) UpdateEntry(id, content string) error {
 }
 
 // DeleteEntry 删除指定 ID 的记忆条目
+//
+// Fix 4: 根据 ID 前缀确定正确的目录，而非总是使用 _global。
 func (fm *FileMemory) DeleteEntry(id string) error {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
@@ -810,7 +863,8 @@ func (fm *FileMemory) DeleteEntry(id string) error {
 		return fmt.Errorf("记忆条目不存在: %s", id)
 	}
 
-	path := filepath.Join(fm.roleDir(""), filename)
+	dir := fm.resolveEntryDir(id)
+	path := filepath.Join(dir, filename)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("读取记忆文件失败: %w", err)
@@ -859,6 +913,8 @@ func parseEntryFileAndLine(id string) (string, int) {
 		prefix = "m-"
 	case strings.HasPrefix(id, "a-"):
 		prefix = "a-"
+	case strings.HasPrefix(id, "r-"):
+		prefix = "r-"
 	default:
 		return "", -1
 	}
@@ -871,6 +927,35 @@ func parseEntryFileAndLine(id string) (string, int) {
 		return memoryArchiveFile, n
 	}
 	return memoryActiveFile, n
+}
+
+// resolveEntryDir 根据 ID 前缀确定记忆条目所在的目录。
+//
+// Fix 4: "r-" 前缀表示角色目录中的条目，需搜索所有角色子目录。
+// "m-" 和 "a-" 前缀的条目在 _global 目录中。
+func (fm *FileMemory) resolveEntryDir(id string) string {
+	if strings.HasPrefix(id, "r-") {
+		// 搜索所有角色子目录，找到包含该行号的目录
+		_, lineIdx := parseEntryFileAndLine(id)
+		topEntries, err := os.ReadDir(fm.dir)
+		if err == nil {
+			for _, e := range topEntries {
+				if !e.IsDir() || e.Name() == "_global" {
+					continue
+				}
+				dir := filepath.Join(fm.dir, e.Name())
+				data, readErr := os.ReadFile(filepath.Join(dir, memoryActiveFile))
+				if readErr != nil {
+					continue
+				}
+				lines := strings.Split(string(data), "\n")
+				if lineIdx >= 0 && lineIdx < len(lines) && strings.TrimSpace(lines[lineIdx]) != "" {
+					return dir
+				}
+			}
+		}
+	}
+	return fm.roleDir("")
 }
 
 // rebuildEntryLine 保留行的时间戳和元数据，替换内容部分

@@ -58,7 +58,7 @@ import (
 
 // 版本信息，通过 -ldflags 注入
 var (
-	version = "v0.3.6"
+	version = "v0.3.8"
 	commit  = "none"
 	date    = "unknown"
 )
@@ -320,9 +320,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 
 	// 4.7 注册高级 Skill (需依赖注入: sandbox/hub/mcp)
-	builtin.RegisterAdvanced(skills, cfg.Skill.Builtin, builtin.SkillDeps{
+	skillDeps := builtin.SkillDeps{
 		McpMgr: mcpMgr,
-	})
+	}
+	builtin.RegisterAdvanced(skills, cfg.Skill.Builtin, &skillDeps)
 	advCount := len(skills.All()) - builtinCount - mdCount
 	if advCount > 0 {
 		fmt.Printf("  ✓ Advanced    %d 个高级 Skill (SkillWriter/Installer/FileOps)\n", advCount)
@@ -542,6 +543,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 8. 启动 HTTP 服务
 	srv := api.NewServer(cfg, eng, gw, store)
 	srv.SetVersion(version)
+
+	// 8.0.1 接入沙箱网络热更新 (Bug2 修复)
+	if skillDeps.CodeExecSkill != nil {
+		srv.SetSandboxCallbacks(skillDeps.CodeExecSkill.UpdateNetwork, skillDeps.CodeExecSkill.NetworkEnabled)
+	}
 	lc := srv.LogCollector()
 
 	// 初始化 slog → LogCollector 桥接（结构化日志 + trace ID 贯穿）

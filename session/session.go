@@ -213,7 +213,13 @@ func (m *Manager) BuildContext(ctx context.Context, sessionID string) ([]hexagon
 		}
 	}
 	if cutIdx > 0 && cutIdx < len(messages) {
-		messages = messages[cutIdx:]
+		// Fix 12: 确保截断后以 user 消息开头，避免孤立的 assistant 消息
+		for cutIdx < len(messages) && messages[cutIdx].Role != "user" {
+			cutIdx++
+		}
+		if cutIdx < len(messages) {
+			messages = messages[cutIdx:]
+		}
 	}
 
 	return messages, nil

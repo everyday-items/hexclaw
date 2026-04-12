@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -66,7 +67,16 @@ func (l *RBACLayer) Check(_ context.Context, msg *adapter.Message) error {
 
 	role := l.resolveRole(msg.UserID)
 	if role == nil {
-		return nil // 无角色配置，放行
+		// 有角色定义但用户未匹配任何角色且无 guest 角色 → 拒绝
+		// 空 RBAC 配置（无角色定义）→ 放行（未实质启用）
+		if len(l.roles) > 0 {
+			return &GatewayError{
+				Layer:   "permission",
+				Code:    "NO_ROLE",
+				Message: fmt.Sprintf("access denied: no role configured for user %q and no guest role defined", msg.UserID),
+			}
+		}
+		return nil
 	}
 
 	// 检查平台权限

@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
 // ═══════════════════════════════════════════════════════════
@@ -395,9 +397,9 @@ func TestRealAPI_GLMz1_SystemTest(t *testing.T) {
 		if reasoning == "" {
 			t.Error("❌ extractThinkTags 后 reasoning 为空")
 		}
-		t.Logf("✅ 前端兜底: reasoning=%s content=%s", truncate(reasoning, 60), truncate(content, 60))
+		t.Logf("✅ 前端兜底: reasoning=%s content=%s", stringx.TruncateWithSuffix(reasoning, 60, "..."), stringx.TruncateWithSuffix(content, 60, "..."))
 	} else {
-		t.Logf("✅ reply 干净: %s", truncate(resp.Reply, 100))
+		t.Logf("✅ reply 干净: %s", stringx.TruncateWithSuffix(resp.Reply, 100, "..."))
 	}
 }
 
@@ -416,7 +418,7 @@ func TestRealAPI_Qwen35_SystemTest(t *testing.T) {
 	if strings.Contains(resp.Reply, "<think>") {
 		t.Error("❌ reply 不应含 <think> 标签（Ollama 应走原生 reasoning）")
 	}
-	t.Logf("✅ qwen3.5:9b: %s", truncate(resp.Reply, 100))
+	t.Logf("✅ qwen3.5:9b: %s", stringx.TruncateWithSuffix(resp.Reply, 100, "..."))
 }
 
 // ─── 辅助函数 ────────────────────────────────────────
@@ -448,10 +450,55 @@ func callChatAPI(message, model, provider string) (*chatAPIResponse, error) {
 	return &result, nil
 }
 
-func truncate(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
+// ═══════════════════════════════════════════════════════════
+// isLocalThinkingModel 单元测试
+// ═══════════════════════════════════════════════════════════
+
+func TestIsLocalThinkingModel(t *testing.T) {
+	positive := []string{
+		"qwen3:8b", "qwen3.5:9b", "qwen3-coder:14b",
+		"deepseek-r1:7b", "deepseek-r1:14b", "deepseek-r1",
+		"qwq:32b", "QWQ",
+		"gemma4:e4b", "gemma4:26b", "gemma4:31b", "Gemma4:E2B",
 	}
-	return string(r[:n]) + "..."
+	for _, m := range positive {
+		if !isLocalThinkingModel(m) {
+			t.Errorf("isLocalThinkingModel(%q) = false, want true", m)
+		}
+	}
+
+	negative := []string{
+		"llama3.3:70b", "phi4", "mistral", "gemma3:12b",
+		"command-r", "starcoder2", "nomic-embed-text",
+		"gpt-4o", "claude-3.5-sonnet",
+	}
+	for _, m := range negative {
+		if isLocalThinkingModel(m) {
+			t.Errorf("isLocalThinkingModel(%q) = true, want false", m)
+		}
+	}
 }
+
+func TestNeedsNoThinkInjection(t *testing.T) {
+	// Qwen3/DeepSeek-R1/QWQ 需要 /no_think 注入
+	needsInjection := []string{
+		"qwen3:8b", "qwen3.5:9b", "deepseek-r1:7b", "qwq:32b",
+	}
+	for _, m := range needsInjection {
+		if !needsNoThinkInjection(m) {
+			t.Errorf("needsNoThinkInjection(%q) = false, want true", m)
+		}
+	}
+
+	// Gemma 4 通过 Ollama 模板层控制 thinking，不需要 /no_think 注入
+	noInjection := []string{
+		"gemma4:e4b", "gemma4:26b", "gemma4:31b", "Gemma4:E2B",
+		"llama3.3:70b", "phi4", "gemma3:12b",
+	}
+	for _, m := range noInjection {
+		if needsNoThinkInjection(m) {
+			t.Errorf("needsNoThinkInjection(%q) = true, want false", m)
+		}
+	}
+}
+

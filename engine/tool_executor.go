@@ -60,7 +60,12 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 		}
 	}
 
-	// 2. Try MCP Manager
+	// 2. Prevent MCP tools from shadowing builtin skill names
+	if e.skills != nil && e.isBuiltinSkillName(toolName) {
+		return "", fmt.Errorf("tool %q is a reserved builtin skill name", toolName)
+	}
+
+	// 3. Try MCP Manager
 	if e.mcpMgr != nil {
 		call.Source = "mcp"
 		return e.executeWithHooks(ctx, call, func(ctx context.Context) (string, error) {
@@ -86,6 +91,12 @@ func (e *ToolExecutor) HasTool(toolName string) bool {
 		}
 	}
 	return false
+}
+
+// isBuiltinSkillName checks whether the given tool name is registered as a builtin skill.
+func (e *ToolExecutor) isBuiltinSkillName(name string) bool {
+	_, ok := e.skills.Get(name)
+	return ok
 }
 
 func (e *ToolExecutor) executeWithHooks(ctx context.Context, call *ToolCallInfo, exec func(context.Context) (string, error)) (string, error) {

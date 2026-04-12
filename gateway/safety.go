@@ -3,12 +3,13 @@ package gateway
 import (
 	"context"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"strings"
+	"unicode"
 
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // InputSafetyLayer 输入安全层 (Layer 4)
@@ -124,8 +125,20 @@ func newContentFilterGuard(blockCategories []string) *contentFilterGuard {
 func (g *contentFilterGuard) Name() string  { return "content_filter" }
 func (g *contentFilterGuard) Enabled() bool { return len(g.enabled) > 0 }
 
+// normalizeForFilter strips zero-width/format characters and lowercases input
+// to prevent Unicode-based filter bypass (e.g. zero-width joiners between keyword characters).
+func normalizeForFilter(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if !unicode.Is(unicode.Cf, r) { // Cf = format characters (zero-width, etc.)
+			b.WriteRune(r)
+		}
+	}
+	return strings.ToLower(b.String())
+}
+
 func (g *contentFilterGuard) Check(_ context.Context, input string) (*hexagon.CheckResult, error) {
-	lower := strings.ToLower(input)
+	lower := normalizeForFilter(input)
 	var findings []hexagon.GuardFinding
 
 	for _, cat := range g.enabled {

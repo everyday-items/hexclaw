@@ -196,6 +196,10 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 
 // handleListMCPTools 列出所有已发现的 MCP 工具
 func (s *Server) handleListMCPTools(w http.ResponseWriter, r *http.Request) {
+	if s.mcpMgr == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"tools": []any{}, "total": 0})
+		return
+	}
 	infos := s.mcpMgr.ToolInfos()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"tools": infos,
@@ -205,6 +209,10 @@ func (s *Server) handleListMCPTools(w http.ResponseWriter, r *http.Request) {
 
 // handleListMCPServers 列出已连接的 MCP Server
 func (s *Server) handleListMCPServers(w http.ResponseWriter, r *http.Request) {
+	if s.mcpMgr == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"servers": []any{}, "total": 0})
+		return
+	}
 	names := s.mcpMgr.ServerNames()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"servers": names,
@@ -263,6 +271,11 @@ func (s *Server) handleAddMCPServer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if s.mcpMgr == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "MCP 未启用"})
+		return
+	}
+
 	cfg := hexmcp.ServerConfig{
 		Name:      req.Name,
 		Transport: transport,
@@ -298,6 +311,10 @@ func (s *Server) handleRemoveMCPServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.mcpMgr == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "MCP 未启用"})
+		return
+	}
 	if err := s.mcpMgr.RemoveServer(name); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return

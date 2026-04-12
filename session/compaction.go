@@ -3,8 +3,8 @@ package session
 import (
 	"context"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hexagon-codes/hexagon"
@@ -12,6 +12,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/storage"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // CompactionConfig 上下文压缩配置
@@ -42,9 +43,10 @@ func DefaultCompactionConfig() CompactionConfig {
 //
 // 对标 OpenClaw 的 Context Compaction 机制。
 type Compactor struct {
-	store    storage.Store
-	config   CompactionConfig
-	archiver *Archiver // 会话归档器（可为 nil）
+	store      storage.Store
+	config     CompactionConfig
+	archiver   *Archiver // 会话归档器（可为 nil）
+	compacting sync.Map  // Fix 10: 记录正在压缩的 session，防止双重压缩
 }
 
 // NewCompactor 创建上下文压缩器
@@ -77,7 +79,14 @@ func (c *Compactor) NeedsCompaction(ctx context.Context, sessionID string) (bool
 //
 // provider 用于调用 LLM 生成摘要。
 // 返回压缩后删除的消息数。
+//
+// Fix 10: 使用 sync.Map 防止同一 session 的并发双重压缩。
 func (c *Compactor) Compact(ctx context.Context, sessionID string, provider hexagon.Provider) (int, error) {
+	if _, loaded := c.compacting.LoadOrStore(sessionID, true); loaded {
+		return 0, nil // 已在压缩中，跳过
+	}
+	defer c.compacting.Delete(sessionID)
+
 	// 获取消息（上限为 MaxMessages 的 2 倍，防止 OOM）
 	loadLimit := c.config.MaxMessages * 2
 	if loadLimit < 200 {

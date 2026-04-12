@@ -40,7 +40,7 @@ func TestPermissionHub_ApproveFlow(t *testing.T) {
 		}
 	}()
 
-	ctx := context.WithValue(context.Background(), "session_id", "sess-1")
+	ctx := context.WithValue(context.Background(), ctxKeySessionID, "sess-1")
 	req := &PermissionRequest{ID: "perm-test-1", ToolName: "shell", Risk: "dangerous", Reason: "test"}
 	approved, err := hub.RequestApproval(ctx, "sess-1", req)
 	if err != nil {
@@ -120,7 +120,7 @@ func TestPermissionHub_RememberAllow(t *testing.T) {
 func TestPermissionHook_SafeToolSkipped(t *testing.T) {
 	hub := NewPermissionHub(5 * time.Second)
 	hook := NewPermissionHook(hub)
-	ctx := context.WithValue(context.Background(), "session_id", "sess-1")
+	ctx := context.WithValue(context.Background(), ctxKeySessionID, "sess-1")
 	if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "search", Source: "skill"}); err != nil {
 		t.Fatalf("safe tool should not require approval: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestPermissionHook_SafeToolSkipped(t *testing.T) {
 func TestPermissionHook_NoSenderDenied(t *testing.T) {
 	hub := NewPermissionHub(5 * time.Second)
 	hook := NewPermissionHook(hub)
-	ctx := context.WithValue(context.Background(), "session_id", "sess-1")
+	ctx := context.WithValue(context.Background(), ctxKeySessionID, "sess-1")
 	if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "shell", Source: "skill"}); err == nil {
 		t.Fatal("dangerous tool with no sender should be denied")
 	}

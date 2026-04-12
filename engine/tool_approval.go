@@ -66,7 +66,7 @@ func (g *ToolApprovalGate) classifyRisk(toolName string) string {
 	switch toolName {
 	case "shell", "code", "code_exec":
 		return "dangerous"
-	case "browser", "create_skill", "manage_mcp_server":
+	case "browser", "create_skill", "manage_mcp_server", "file_edit":
 		return "sensitive"
 	default:
 		return "safe"
@@ -80,10 +80,10 @@ func (g *ToolApprovalGate) BeforeToolCall(ctx context.Context, call *ToolCallInf
 		return nil
 	}
 
-	sessionID, _ := ctx.Value("session_id").(string)
+	sessionID, _ := ctx.Value(ctxKeySessionID).(string)
 
-	// Check session-level "always allow"
-	if g.isAlwaysAllowed(sessionID, call.Name) {
+	// Check session-level "always allow" (skip for anonymous sessions to prevent shared state)
+	if sessionID != "" && g.isAlwaysAllowed(sessionID, call.Name) {
 		return nil
 	}
 
@@ -111,7 +111,7 @@ func (g *ToolApprovalGate) BeforeToolCall(ctx context.Context, call *ToolCallInf
 		return fmt.Errorf("tool %q blocked by user: %s", call.Name, reason)
 	}
 
-	if resp.AlwaysAllow {
+	if resp.AlwaysAllow && sessionID != "" {
 		g.setAlwaysAllowed(sessionID, call.Name)
 	}
 

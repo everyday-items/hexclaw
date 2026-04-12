@@ -60,6 +60,17 @@ func (s *mockStore) ListMessages(_ context.Context, sessionID string, limit, _ i
 	return msgs, nil
 }
 
+func (s *mockStore) GetMessage(_ context.Context, id string) (*storage.MessageRecord, error) {
+	for _, msgs := range s.messages {
+		for _, msg := range msgs {
+			if msg.ID == id {
+				return msg, nil
+			}
+		}
+	}
+	return nil, storage.ErrNotFound
+}
+
 func (s *mockStore) CountMessages(_ context.Context, sessionID string) (int, error) {
 	return len(s.messages[sessionID]), nil
 }

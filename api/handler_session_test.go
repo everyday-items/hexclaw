@@ -263,7 +263,7 @@ func TestUpdateMessageFeedback(t *testing.T) {
 		t.Fatalf("保存消息失败: %v", err)
 	}
 
-	req := httptest.NewRequest("PUT", "/api/v1/messages/msg-feedback/feedback", strings.NewReader(`{"feedback":"like"}`))
+	req := httptest.NewRequest("PUT", "/api/v1/messages/msg-feedback/feedback?user_id=test", strings.NewReader(`{"feedback":"like"}`))
 	req.SetPathValue("id", "msg-feedback")
 	w := httptest.NewRecorder()
 
@@ -663,6 +663,464 @@ func TestChatResponse_UsageSerialization(t *testing.T) {
 	}
 	if resp.Usage.TotalTokens != 150 {
 		t.Errorf("TotalTokens 应为 150，实际 %d", resp.Usage.TotalTokens)
+	}
+}
+
+// --- 删除会话测试 ---
+
+func TestDeleteSession_Success(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-del", UserID: "test", Platform: "web", Title: "待删除会话",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/sess-del?user_id=test", nil)
+	req.SetPathValue("id", "sess-del")
+	w := httptest.NewRecorder()
+	srv.handleDeleteSession(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["message"] != "会话已删除" {
+		t.Errorf("message=%q, want 会话已删除", resp["message"])
+	}
+
+	// 确认会话已被软删除（status = -1）
+	sess, err := store.GetSession(context.Background(), "sess-del")
+	if err != nil {
+		t.Fatalf("GetSession 应仍能返回软删除的会话，实际 err=%v", err)
+	}
+	if sess.Status != -1 {
+		t.Fatalf("软删除后 status=%d, want -1", sess.Status)
+	}
+
+	// 确认不再出现在列表中（ListSessions 过滤 status >= 0）
+	sessions, err := store.ListSessions(context.Background(), "test", 20, 0)
+	if err != nil {
+		t.Fatalf("ListSessions err=%v", err)
+	}
+	for _, s := range sessions {
+		if s.ID == "sess-del" {
+			t.Fatal("软删除的会话不应出现在 ListSessions 结果中")
+		}
+	}
+}
+
+func TestDeleteSession_NotFound(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/nonexistent?user_id=test", nil)
+	req.SetPathValue("id", "nonexistent")
+	w := httptest.NewRecorder()
+	srv.handleDeleteSession(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("删除不存在的会话应返回 404，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDeleteSession_CrossUser(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-other", UserID: "user-a", Platform: "web", Title: "别人的会话",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/sess-other?user_id=user-b", nil)
+	req.SetPathValue("id", "sess-other")
+	w := httptest.NewRecorder()
+	srv.handleDeleteSession(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("跨用户删除应返回 404，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// --- 删除消息测试 ---
+
+func TestDeleteMessage_Success(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-msg-del", UserID: "test", Platform: "web", Title: "消息测试",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+	if err := store.SaveMessage(context.Background(), &storage.MessageRecord{
+		ID: "msg-del-1", SessionID: "sess-msg-del", Role: "user", Content: "待删除消息", Metadata: "{}",
+	}); err != nil {
+		t.Fatalf("保存消息失败: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/messages/msg-del-1?user_id=test", nil)
+	req.SetPathValue("id", "msg-del-1")
+	w := httptest.NewRecorder()
+	srv.handleDeleteMessage(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["message"] != "消息已删除" {
+		t.Errorf("message=%q, want 消息已删除", resp["message"])
+	}
+
+	// 确认消息已被删除
+	_, err := store.GetMessage(context.Background(), "msg-del-1")
+	if err == nil {
+		t.Fatal("消息删除后 GetMessage 应返回错误")
+	}
+}
+
+func TestDeleteMessage_NotFound(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/messages/nonexistent?user_id=test", nil)
+	req.SetPathValue("id", "nonexistent")
+	w := httptest.NewRecorder()
+	srv.handleDeleteMessage(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("删除不存在的消息应返回 404，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDeleteMessage_EmptyID(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/messages/?user_id=test", nil)
+	req.SetPathValue("id", "")
+	w := httptest.NewRecorder()
+	srv.handleDeleteMessage(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("空消息 ID 应返回 400，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDeleteMessage_CrossUser(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-msg-cross", UserID: "user-a", Platform: "web", Title: "他人会话",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+	if err := store.SaveMessage(context.Background(), &storage.MessageRecord{
+		ID: "msg-cross-1", SessionID: "sess-msg-cross", Role: "user", Content: "机密消息", Metadata: "{}",
+	}); err != nil {
+		t.Fatalf("保存消息失败: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/messages/msg-cross-1?user_id=user-b", nil)
+	req.SetPathValue("id", "msg-cross-1")
+	w := httptest.NewRecorder()
+	srv.handleDeleteMessage(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("跨用户删除消息应返回 403，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// --- 分支列表测试 ---
+
+func TestListBranches_Empty(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-no-branch", UserID: "test", Platform: "web", Title: "无分支会话",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions/sess-no-branch/branches?user_id=test", nil)
+	req.SetPathValue("id", "sess-no-branch")
+	w := httptest.NewRecorder()
+	srv.handleListBranches(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Branches []any `json:"branches"`
+		Total    int   `json:"total"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if resp.Total != 0 {
+		t.Errorf("total=%d, want 0", resp.Total)
+	}
+	if resp.Branches == nil {
+		t.Error("branches 字段不应为 null")
+	}
+	if len(resp.Branches) != 0 {
+		t.Errorf("branches 应为空数组，实际长度 %d", len(resp.Branches))
+	}
+}
+
+func TestListBranches_WithBranches(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	// 创建主会话
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-main-br", UserID: "test", Platform: "web", Title: "主会话",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+	// 创建消息用于 fork
+	if err := store.SaveMessage(context.Background(), &storage.MessageRecord{
+		ID: "msg-br-1", SessionID: "sess-main-br", Role: "user", Content: "分支前的消息", Metadata: "{}",
+	}); err != nil {
+		t.Fatalf("保存消息失败: %v", err)
+	}
+
+	// 通过 ForkSession 创建分支
+	_, err := store.ForkSession(context.Background(), "sess-main-br", "msg-br-1", "test")
+	if err != nil {
+		t.Fatalf("创建分支失败: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions/sess-main-br/branches?user_id=test", nil)
+	req.SetPathValue("id", "sess-main-br")
+	w := httptest.NewRecorder()
+	srv.handleListBranches(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Branches []map[string]any `json:"branches"`
+		Total    int              `json:"total"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if resp.Total != 1 {
+		t.Errorf("total=%d, want 1", resp.Total)
+	}
+	if len(resp.Branches) != 1 {
+		t.Fatalf("branches 长度=%d, want 1", len(resp.Branches))
+	}
+}
+
+func TestListBranches_NotFound(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions/nonexistent/branches?user_id=test", nil)
+	req.SetPathValue("id", "nonexistent")
+	w := httptest.NewRecorder()
+	srv.handleListBranches(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("不存在的会话应返回 404，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// --- 消息反馈测试 (补充) ---
+
+func TestMessageFeedback_Success_Like(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-fb", UserID: "test", Platform: "web", Title: "反馈测试",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+	if err := store.SaveMessage(context.Background(), &storage.MessageRecord{
+		ID: "msg-fb-like", SessionID: "sess-fb", Role: "assistant", Content: "答复", Metadata: "{}",
+	}); err != nil {
+		t.Fatalf("保存消息失败: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/messages/msg-fb-like/feedback?user_id=test",
+		strings.NewReader(`{"feedback":"like"}`))
+	req.SetPathValue("id", "msg-fb-like")
+	w := httptest.NewRecorder()
+	srv.handleUpdateMessageFeedback(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["message"] != "反馈已更新" {
+		t.Errorf("message=%q, want 反馈已更新", resp["message"])
+	}
+}
+
+func TestMessageFeedback_Success_Dislike(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-fb2", UserID: "test", Platform: "web", Title: "反馈测试2",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+	if err := store.SaveMessage(context.Background(), &storage.MessageRecord{
+		ID: "msg-fb-dislike", SessionID: "sess-fb2", Role: "assistant", Content: "答复", Metadata: "{}",
+	}); err != nil {
+		t.Fatalf("保存消息失败: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/messages/msg-fb-dislike/feedback?user_id=test",
+		strings.NewReader(`{"feedback":"dislike"}`))
+	req.SetPathValue("id", "msg-fb-dislike")
+	w := httptest.NewRecorder()
+	srv.handleUpdateMessageFeedback(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestMessageFeedback_Success_ClearFeedback(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	if err := store.CreateSession(context.Background(), &storage.Session{
+		ID: "sess-fb3", UserID: "test", Platform: "web", Title: "反馈测试3",
+	}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+	if err := store.SaveMessage(context.Background(), &storage.MessageRecord{
+		ID: "msg-fb-clear", SessionID: "sess-fb3", Role: "assistant", Content: "答复", Metadata: "{}",
+	}); err != nil {
+		t.Fatalf("保存消息失败: %v", err)
+	}
+
+	// 空字符串 feedback 用于清除反馈
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/messages/msg-fb-clear/feedback?user_id=test",
+		strings.NewReader(`{"feedback":""}`))
+	req.SetPathValue("id", "msg-fb-clear")
+	w := httptest.NewRecorder()
+	srv.handleUpdateMessageFeedback(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("清除反馈应返回 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestMessageFeedback_InvalidValue_Rejected(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	invalidValues := []string{"love", "hate", "thumbsup", "1", "true"}
+	for _, val := range invalidValues {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/messages/msg-any/feedback",
+			strings.NewReader(`{"feedback":"`+val+`"}`))
+		req.SetPathValue("id", "msg-any")
+		w := httptest.NewRecorder()
+		srv.handleUpdateMessageFeedback(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("feedback=%q 应返回 400，实际 %d", val, w.Code)
+		}
+	}
+}
+
+func TestMessageFeedback_EmptyMessageID(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/messages//feedback",
+		strings.NewReader(`{"feedback":"like"}`))
+	req.SetPathValue("id", "")
+	w := httptest.NewRecorder()
+	srv.handleUpdateMessageFeedback(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("空消息 ID 应返回 400，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestMessageFeedback_MessageNotFound(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/messages/nonexistent/feedback?user_id=test",
+		strings.NewReader(`{"feedback":"like"}`))
+	req.SetPathValue("id", "nonexistent")
+	w := httptest.NewRecorder()
+	srv.handleUpdateMessageFeedback(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("不存在的消息应返回 404，实际 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestMessageFeedback_InvalidJSON(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(cfg, eng, nil, store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/messages/msg-any/feedback",
+		strings.NewReader(`{invalid json}`))
+	req.SetPathValue("id", "msg-any")
+	w := httptest.NewRecorder()
+	srv.handleUpdateMessageFeedback(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("无效 JSON 应返回 400，实际 %d: %s", w.Code, w.Body.String())
 	}
 }
 

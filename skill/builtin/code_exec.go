@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/sandbox"
@@ -17,12 +18,39 @@ import (
 // 含依赖自动安装: ModuleNotFoundError → pip install → 重试。
 // 对标 Codex CodeExecSkill。
 type CodeExecSkill struct {
-	sb sandbox.Sandbox
+	mu  sync.RWMutex
+	sb  sandbox.Sandbox
+	cfg sandbox.Config // 保留配置以支持热更新
 }
 
 // NewCodeExecSkill 创建代码执行 Skill
-func NewCodeExecSkill(sb sandbox.Sandbox) *CodeExecSkill {
-	return &CodeExecSkill{sb: sb}
+func NewCodeExecSkill(sb sandbox.Sandbox, cfg sandbox.Config) *CodeExecSkill {
+	return &CodeExecSkill{sb: sb, cfg: cfg}
+}
+
+// UpdateNetwork 热更新沙箱网络策略。重建沙箱实例。
+func (s *CodeExecSkill) UpdateNetwork(enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cfg.Network == enabled {
+		return nil // 没变化
+	}
+	nextCfg := s.cfg
+	nextCfg.Network = enabled
+	newSb, err := sandbox.New(nextCfg)
+	if err != nil {
+		return fmt.Errorf("rebuild sandbox failed: %w", err)
+	}
+	s.cfg = nextCfg
+	s.sb = newSb
+	return nil
+}
+
+// NetworkEnabled 返回当前网络策略。
+func (s *CodeExecSkill) NetworkEnabled() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg.Network
 }
 
 func (s *CodeExecSkill) Name() string { return "code_exec" }
@@ -50,8 +78,12 @@ func (s *CodeExecSkill) Execute(ctx context.Context, args map[string]any) (*skil
 		return nil, fmt.Errorf("language and code are required")
 	}
 
+	s.mu.RLock()
+	sb := s.sb
+	s.mu.RUnlock()
+
 	// 第一次执行
-	result, err := s.sb.ExecCode(ctx, language, code)
+	result, err := sb.ExecCode(ctx, language, code)
 	if err != nil {
 		return nil, fmt.Errorf("code execution failed: %w", err)
 	}
@@ -65,10 +97,10 @@ func (s *CodeExecSkill) Execute(ctx context.Context, args map[string]any) (*skil
 	if result.ExitCode != 0 {
 		if missingPkgs := detectMissingPackages(language, result.Stderr); len(missingPkgs) > 0 {
 			installCmd := buildInstallCommand(language, missingPkgs)
-			installResult, installErr := s.sb.Exec(ctx, "sh", []string{"-c", installCmd})
+			installResult, installErr := sb.Exec(ctx, "sh", []string{"-c", installCmd})
 			if installErr == nil && installResult.ExitCode == 0 {
 				// 重试
-				result, err = s.sb.ExecCode(ctx, language, code)
+				result, err = sb.ExecCode(ctx, language, code)
 				if err != nil {
 					return nil, fmt.Errorf("code execution failed after install: %w", err)
 				}

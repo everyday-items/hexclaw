@@ -143,6 +143,15 @@ func (s *txStore) SaveMessage(ctx context.Context, msg *storage.MessageRecord) e
 	return err
 }
 
+func (s *txStore) GetMessage(ctx context.Context, id string) (*storage.MessageRecord, error) {
+	row := s.tx.QueryRowContext(ctx, `SELECT `+messageCols+` FROM messages WHERE id = ?`, id)
+	msg, err := scanMessage(row)
+	if err != nil {
+		return nil, storage.ErrNotFound
+	}
+	return msg, nil
+}
+
 func (s *txStore) DeleteMessage(ctx context.Context, id string) error {
 	_, err := s.tx.ExecContext(ctx, `DELETE FROM messages WHERE id = ?`, id)
 	return err

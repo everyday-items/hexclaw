@@ -134,6 +134,9 @@ type Store interface {
 	// SaveMessage 保存消息
 	SaveMessage(ctx context.Context, msg *MessageRecord) error
 
+	// GetMessage 获取单条消息
+	GetMessage(ctx context.Context, id string) (*MessageRecord, error)
+
 	// DeleteMessage 删除单条消息
 	DeleteMessage(ctx context.Context, id string) error
 

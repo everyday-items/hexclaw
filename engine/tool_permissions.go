@@ -123,6 +123,6 @@ func NewToolPermissionHook(perms *ToolPermissions) *ToolPermissionHook {
 }
 
 func (h *ToolPermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo) error {
-	sessionID, _ := ctx.Value("session_id").(string)
+	sessionID, _ := ctx.Value(ctxKeySessionID).(string)
 	return h.perms.Check(call.Name, sessionID)
 }

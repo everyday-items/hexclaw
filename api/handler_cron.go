@@ -21,6 +21,10 @@ type AddCronJobRequest struct {
 
 // handleListCronJobs 列出定时任务
 func (s *Server) handleListCronJobs(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"jobs": []any{}, "total": 0})
+		return
+	}
 	userID := r.URL.Query().Get("user_id")
 	if userID == "" {
 		userID = "api-user"
@@ -74,6 +78,10 @@ func (s *Server) handleAddCronJob(w http.ResponseWriter, r *http.Request) {
 		UserID:   req.UserID,
 	}
 
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "定时任务未启用"})
+		return
+	}
 	if err := s.scheduler.AddJob(r.Context(), job); err != nil {
 		// Schedule validation errors are client input errors (400), not server failures (500)
 		status := http.StatusInternalServerError
@@ -95,6 +103,10 @@ func (s *Server) handleAddCronJob(w http.ResponseWriter, r *http.Request) {
 
 // handleDeleteCronJob 删除定时任务
 func (s *Server) handleDeleteCronJob(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "定时任务未启用"})
+		return
+	}
 	jobID := r.PathValue("id")
 	if err := s.scheduler.RemoveJob(r.Context(), jobID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
@@ -107,6 +119,10 @@ func (s *Server) handleDeleteCronJob(w http.ResponseWriter, r *http.Request) {
 
 // handlePauseCronJob 暂停定时任务
 func (s *Server) handlePauseCronJob(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "定时任务未启用"})
+		return
+	}
 	jobID := r.PathValue("id")
 	if err := s.scheduler.PauseJob(r.Context(), jobID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
@@ -119,6 +135,10 @@ func (s *Server) handlePauseCronJob(w http.ResponseWriter, r *http.Request) {
 
 // handleResumeCronJob 恢复定时任务
 func (s *Server) handleResumeCronJob(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "定时任务未启用"})
+		return
+	}
 	jobID := r.PathValue("id")
 	if err := s.scheduler.ResumeJob(r.Context(), jobID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{

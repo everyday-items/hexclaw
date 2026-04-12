@@ -110,7 +110,9 @@ func (m *Manager) Connect(ctx context.Context, configs []ServerConfig) (int, err
 	}
 
 	// 保存配置用于重连
+	m.mu.Lock()
 	m.configs = configs
+	m.mu.Unlock()
 
 	// 启动后台重连监控
 	go m.reconnectLoop()
@@ -135,7 +137,13 @@ func (m *Manager) reconnectLoop() {
 
 // tryReconnect 对所有断开的 Server 尝试重连
 func (m *Manager) tryReconnect() {
-	for _, cfg := range m.configs {
+	// 在锁下复制 configs，避免迭代时数据竞争
+	m.mu.RLock()
+	cfgsCopy := make([]ServerConfig, len(m.configs))
+	copy(cfgsCopy, m.configs)
+	m.mu.RUnlock()
+
+	for _, cfg := range cfgsCopy {
 		if !cfg.Enabled {
 			continue
 		}
@@ -337,21 +345,31 @@ func (m *Manager) ServerNames() []string {
 //
 // 在所有已连接 Server 中查找指定名称的工具并执行。
 func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string]any) (string, error) {
+	// Copy the tool reference under lock, then release before executing
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
+	var found hexagon.Tool
 	for _, server := range m.servers {
 		for _, t := range server.tools {
 			if t.Name() == toolName {
-				result, err := t.Execute(ctx, args)
-				if err != nil {
-					return "", fmt.Errorf("工具 %q 执行失败: %w", toolName, err)
-				}
-				return result.String(), nil
+				found = t
+				break
 			}
 		}
+		if found != nil {
+			break
+		}
 	}
-	return "", fmt.Errorf("工具 %q 未找到", toolName)
+	m.mu.RUnlock()
+
+	if found == nil {
+		return "", fmt.Errorf("工具 %q 未找到", toolName)
+	}
+
+	result, err := found.Execute(ctx, args)
+	if err != nil {
+		return "", fmt.Errorf("工具 %q 执行失败: %w", toolName, err)
+	}
+	return result.String(), nil
 }
 
 // ServerStatus MCP Server 状态信息

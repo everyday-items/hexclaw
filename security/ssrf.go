@@ -55,8 +55,8 @@ func ValidateURL(rawURL string) error {
 	// 解析 IP
 	ips, err := net.LookupHost(host)
 	if err != nil {
-		// DNS 解析失败可能是正常域名暂时不可达，允许通过
-		return nil
+		// DNS 解析失败时拒绝请求，防止 DNS rebinding 攻击
+		return fmt.Errorf("DNS lookup failed for %s: %w", host, err)
 	}
 
 	for _, ipStr := range ips {

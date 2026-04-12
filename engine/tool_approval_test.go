@@ -15,7 +15,7 @@ func TestToolApprovalGate_SafeToolPassesThrough(t *testing.T) {
 		return ApprovalResponse{Approved: true}, nil
 	}, 5*time.Second)
 
-	ctx := context.WithValue(context.Background(), "session_id", "sess-1")
+	ctx := context.WithValue(context.Background(), ctxKeySessionID, "sess-1")
 	call := &ToolCallInfo{Name: "search", Arguments: map[string]any{"q": "test"}}
 
 	err := gate.BeforeToolCall(ctx, call)
@@ -38,7 +38,7 @@ func TestToolApprovalGate_DangerousToolApproved(t *testing.T) {
 		return ApprovalResponse{Approved: true}, nil
 	}, 5*time.Second)
 
-	ctx := context.WithValue(context.Background(), "session_id", "sess-1")
+	ctx := context.WithValue(context.Background(), ctxKeySessionID, "sess-1")
 	call := &ToolCallInfo{Name: "shell", Arguments: map[string]any{"cmd": "ls"}}
 
 	err := gate.BeforeToolCall(ctx, call)
@@ -52,7 +52,7 @@ func TestToolApprovalGate_DangerousToolDenied(t *testing.T) {
 		return ApprovalResponse{Approved: false, Reason: "too risky"}, nil
 	}, 5*time.Second)
 
-	ctx := context.WithValue(context.Background(), "session_id", "sess-1")
+	ctx := context.WithValue(context.Background(), ctxKeySessionID, "sess-1")
 	call := &ToolCallInfo{Name: "shell", Arguments: map[string]any{"cmd": "rm -rf /"}}
 
 	err := gate.BeforeToolCall(ctx, call)
@@ -69,7 +69,7 @@ func TestToolApprovalGate_DangerousToolDenied_NoReason(t *testing.T) {
 		return ApprovalResponse{Approved: false}, nil
 	}, 5*time.Second)
 
-	ctx := context.WithValue(context.Background(), "session_id", "sess-1")
+	ctx := context.WithValue(context.Background(), ctxKeySessionID, "sess-1")
 	call := &ToolCallInfo{Name: "shell"}
 
 	err := gate.BeforeToolCall(ctx, call)
@@ -88,7 +88,7 @@ func TestToolApprovalGate_CallbackTimeout(t *testing.T) {
 		return ApprovalResponse{}, ctx.Err()
 	}, 50*time.Millisecond) // very short timeout
 
-	ctx := context.WithValue(context.Background(), "session_id", "sess-1")
+	ctx := context.WithValue(context.Background(), ctxKeySessionID, "sess-1")
 	call := &ToolCallInfo{Name: "code_exec"}
 
 	err := gate.BeforeToolCall(ctx, call)
@@ -105,7 +105,7 @@ func TestToolApprovalGate_CallbackError(t *testing.T) {
 		return ApprovalResponse{}, errors.New("websocket disconnected")
 	}, 5*time.Second)
 
-	ctx := context.WithValue(context.Background(), "session_id", "sess-1")
+	ctx := context.WithValue(context.Background(), ctxKeySessionID, "sess-1")
 	call := &ToolCallInfo{Name: "shell"}
 
 	err := gate.BeforeToolCall(ctx, call)
@@ -124,7 +124,7 @@ func TestToolApprovalGate_AlwaysAllow(t *testing.T) {
 		return ApprovalResponse{Approved: true, AlwaysAllow: true}, nil
 	}, 5*time.Second)
 
-	ctx := context.WithValue(context.Background(), "session_id", "sess-1")
+	ctx := context.WithValue(context.Background(), ctxKeySessionID, "sess-1")
 	call := &ToolCallInfo{Name: "shell"}
 
 	// First call: callback should be invoked
@@ -151,8 +151,8 @@ func TestToolApprovalGate_AlwaysAllow_DifferentSession(t *testing.T) {
 		return ApprovalResponse{Approved: true, AlwaysAllow: true}, nil
 	}, 5*time.Second)
 
-	ctx1 := context.WithValue(context.Background(), "session_id", "sess-1")
-	ctx2 := context.WithValue(context.Background(), "session_id", "sess-2")
+	ctx1 := context.WithValue(context.Background(), ctxKeySessionID, "sess-1")
+	ctx2 := context.WithValue(context.Background(), ctxKeySessionID, "sess-2")
 	call := &ToolCallInfo{Name: "shell"}
 
 	gate.BeforeToolCall(ctx1, call)
@@ -174,7 +174,7 @@ func TestToolApprovalGate_ClearSession(t *testing.T) {
 		return ApprovalResponse{Approved: true, AlwaysAllow: true}, nil
 	}, 5*time.Second)
 
-	ctx := context.WithValue(context.Background(), "session_id", "sess-1")
+	ctx := context.WithValue(context.Background(), ctxKeySessionID, "sess-1")
 	call := &ToolCallInfo{Name: "shell"}
 
 	// First call sets AlwaysAllow
@@ -220,7 +220,7 @@ func TestToolApprovalGate_SensitiveTool(t *testing.T) {
 		return ApprovalResponse{Approved: true}, nil
 	}, 5*time.Second)
 
-	ctx := context.WithValue(context.Background(), "session_id", "sess-1")
+	ctx := context.WithValue(context.Background(), ctxKeySessionID, "sess-1")
 	call := &ToolCallInfo{Name: "browser"}
 
 	err := gate.BeforeToolCall(ctx, call)
@@ -248,7 +248,7 @@ func TestToolApprovalGate_CustomClassifier(t *testing.T) {
 		return ApprovalResponse{Approved: true}, nil
 	}
 
-	ctx := context.WithValue(context.Background(), "session_id", "sess-1")
+	ctx := context.WithValue(context.Background(), ctxKeySessionID, "sess-1")
 
 	// "shell" should now be safe (custom classifier)
 	gate.BeforeToolCall(ctx, &ToolCallInfo{Name: "shell"})

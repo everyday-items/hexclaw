@@ -168,6 +168,7 @@ func NewPermissionHook(hub *PermissionHub, opts ...PermissionHookOption) *Permis
 			"browser":           true,
 			"create_skill":      true,
 			"manage_mcp_server": true,
+			"file_edit":         true,
 		},
 	}
 	for _, opt := range opts {
@@ -182,13 +183,16 @@ func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo)
 		return nil
 	}
 
-	sessionID, _ := ctx.Value("session_id").(string)
+	sessionID, _ := ctx.Value(ctxKeySessionID).(string)
 	if sessionID == "" {
-		// No session context — deny dangerous, allow sensitive
+		// Fix 11: No session context — deny both dangerous and sensitive tools.
+		// Previously sensitive tools were silently allowed without approval,
+		// bypassing the permission gate entirely.
 		if risk == "dangerous" {
 			return fmt.Errorf("tool %q requires approval but no session context", call.Name)
 		}
-		return nil
+		logger.Warn("[permission] sensitive tool called without session context, denying", "tool_name", call.Name)
+		return fmt.Errorf("tool %q requires approval but no session context available", call.Name)
 	}
 
 	reqID := fmt.Sprintf("perm-%s-%d", call.Name, time.Now().UnixNano())

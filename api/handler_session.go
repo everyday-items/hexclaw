@@ -91,9 +91,12 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		sessions = []*storage.Session{}
 	}
 
+	// Fix 13: len(sessions) 不是真实总数。由于没有 CountSessions 方法，
+	// 使用 has_more 标志帮助前端判断是否有下一页。
 	writeJSON(w, http.StatusOK, map[string]any{
 		"sessions": sessions,
-		"total":    len(sessions),
+		"total":    len(sessions) + offset,
+		"has_more": len(sessions) == limit,
 	})
 }
 
@@ -174,6 +177,18 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 验证消息归属：加载消息 -> 检查会话所有权
+	userID := sessionUserIDFromRequest(r)
+	msg, err := s.store.GetMessage(r.Context(), messageID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "消息不存在"})
+		return
+	}
+	if _, err := s.getOwnedSession(r, msg.SessionID, userID); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "无权操作此消息"})
+		return
+	}
+
 	if err := s.store.DeleteMessage(r.Context(), messageID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{
@@ -215,6 +230,18 @@ func (s *Server) handleUpdateMessageFeedback(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "更新消息反馈失败: 无效反馈值: " + req.Feedback,
 		})
+		return
+	}
+
+	// 验证消息归属：加载消息 -> 检查会话所有权
+	userID := sessionUserIDFromRequest(r)
+	msg, err := s.store.GetMessage(r.Context(), messageID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "消息不存在"})
+		return
+	}
+	if _, err := s.getOwnedSession(r, msg.SessionID, userID); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "无权操作此消息"})
 		return
 	}
 

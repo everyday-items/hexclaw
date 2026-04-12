@@ -196,6 +196,11 @@ func (s *Server) handleListDocuments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fix 14: 防止 nil slice 被序列化为 JSON null
+	if docs == nil {
+		docs = []*knowledge.Document{}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"documents": docs,
 		"total":     len(docs),
@@ -311,8 +316,8 @@ func (s *Server) handleSearchKnowledge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fix 16: 只返回 "results"（复数），移除冗余的 "result" 字段
 	writeJSON(w, http.StatusOK, map[string]any{
-		"result":  results,
 		"results": results,
 		"total":   len(results),
 	})

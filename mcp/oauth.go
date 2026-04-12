@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -200,11 +201,10 @@ func (m *OAuthManager) refreshToken(ctx context.Context, cfg *OAuthConfig, refre
 }
 
 func (m *OAuthManager) tokenRequest(ctx context.Context, tokenURL string, data url.Values) (*OAuthToken, error) {
-	req, err := http.NewRequestWithContext(ctx, "POST", tokenURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "POST", tokenURL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, err
 	}
-	req.URL.RawQuery = data.Encode()
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -213,7 +213,10 @@ func (m *OAuthManager) tokenRequest(ctx context.Context, tokenURL string, data u
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		return nil, fmt.Errorf("failed to read token response body: %w", readErr)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("token request returned %d: %s", resp.StatusCode, string(body))
 	}
@@ -237,7 +240,8 @@ func (m *OAuthManager) tokenRequest(ctx context.Context, tokenURL string, data u
 }
 
 func (m *OAuthManager) loadToken(serverName string) (*OAuthToken, error) {
-	path := filepath.Join(m.credDir, serverName+".json")
+	safeName := filepath.Base(serverName) // strips directory components to prevent path traversal
+	path := filepath.Join(m.credDir, safeName+".json")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -254,7 +258,8 @@ func (m *OAuthManager) saveToken(serverName string, token *OAuthToken) error {
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(m.credDir, serverName+".json")
+	safeName := filepath.Base(serverName) // strips directory components to prevent path traversal
+	path := filepath.Join(m.credDir, safeName+".json")
 	return os.WriteFile(path, data, 0600)
 }
 

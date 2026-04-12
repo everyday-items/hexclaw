@@ -487,6 +487,16 @@ func (s *Store) SaveMessage(ctx context.Context, msg *storage.MessageRecord) err
 	return nil
 }
 
+// GetMessage 获取单条消息
+func (s *Store) GetMessage(ctx context.Context, id string) (*storage.MessageRecord, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+messageCols+` FROM messages WHERE id = ?`, id)
+	msg, err := scanMessage(row)
+	if err != nil {
+		return nil, storage.ErrNotFound
+	}
+	return msg, nil
+}
+
 // DeleteMessage 删除单条消息
 func (s *Store) DeleteMessage(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM messages WHERE id = ?`, id)

@@ -12,12 +12,15 @@ func TestPipeline_EmptyConfig(t *testing.T) {
 	cfg := &config.SecurityConfig{}
 	p := NewPipeline(cfg, nil)
 
-	// 空配置应只有审计层
-	if len(p.layers) != 1 {
-		t.Fatalf("期望 1 层（审计），实际 %d 层", len(p.layers))
+	// 空配置应有速率限制层（默认 60 RPM）+ 审计层
+	if len(p.layers) != 2 {
+		t.Fatalf("期望 2 层（速率限制+审计），实际 %d 层", len(p.layers))
 	}
-	if p.layers[0].Name() != "audit" {
-		t.Fatalf("期望审计层，实际 %s", p.layers[0].Name())
+	if p.layers[0].Name() != "rate_limit" {
+		t.Fatalf("期望速率限制层，实际 %s", p.layers[0].Name())
+	}
+	if p.layers[1].Name() != "audit" {
+		t.Fatalf("期望审计层，实际 %s", p.layers[1].Name())
 	}
 }
 

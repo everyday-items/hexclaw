@@ -26,12 +26,14 @@ import (
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/storage"
 	"github.com/hexagon-codes/hexclaw/trace"
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
 type ctxKey string
 
 const ctxKeySessionUnlock ctxKey = "session_unlock"
+const ctxKeySessionID ctxKey = "session_id"
 
 const reasoningOnlyFallbackContent = "模型只完成了思考，没有输出最终回答，请重试一次。"
 
@@ -403,7 +405,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 				ID:        "tc-" + idgen.ShortID(),
 				Name:      matched.Name(),
 				Arguments: string(argsJSON),
-				Result:    truncateResult(result.Content, 500),
+				Result:    stringx.TruncateWithSuffix(result.Content, 500, "..."),
 			}},
 		}, nil
 	}
@@ -518,12 +520,13 @@ func (e *ReActEngine) completeWithTools(
 	}
 
 	// 构建初始请求
-	req := e.buildCompletionRequest(msg, history, kbContext)
+	req := e.buildCompletionRequest(ctx, msg, history, kbContext)
 	if len(tools) > 0 {
 		req.Tools = tools
 	}
 	// 本地 thinking 模型注入 /no_think（与流式路径对齐）
-	if isLocal && msg.Metadata["thinking"] != "on" && isLocalThinkingModel(modelName) {
+	// Qwen3/DeepSeek-R1 通过 /no_think 抑制；Gemma 4 由 Ollama 模板层控制，不注入
+	if isLocal && msg.Metadata["thinking"] != "on" && needsNoThinkInjection(modelName) {
 		injectNoThink(req.Messages)
 		trace.L(ctx).Info("注入 /no_think", "model", modelName)
 	}
@@ -573,6 +576,8 @@ func (e *ReActEngine) completeWithTools(
 			break
 		}
 
+		// P4: 工具循环内上下文压缩
+		messages = compressContextIfNeeded(ctx, messages, provider, sessionID)
 		req.Messages = messages
 		resp, thinkingTimedOut, err := e.completeWithThinkingTimeout(ctx, provider, providerName, modelName, req)
 		if err != nil {
@@ -636,23 +641,28 @@ func (e *ReActEngine) completeWithTools(
 		messages = append(messages, llm.AssistantToolCallMessage(resp.Content, toolCallRefs))
 
 		// 执行每个 tool_call 并追加结构化 tool result
+		// P0 自我纠错: 错误信息携带完整原因，让 LLM 能分析并自主决策下一步
 		for _, tc := range resp.ToolCalls {
 			var toolArgs map[string]any
+			var toolResult string
+
 			if tc.Arguments != "" {
 				if uerr := json.Unmarshal([]byte(tc.Arguments), &toolArgs); uerr != nil {
 					trace.L(ctx).Error("工具参数解析失败", "tool", tc.Name, "err", uerr, "session", sessionID)
+					toolResult = fmt.Sprintf("Error: invalid arguments for tool %q: %s", tc.Name, uerr.Error())
 				}
 			}
 
-			var toolResult string
-			if e.toolExecutor != nil {
-				toolResult, err = e.toolExecutor.Execute(ctx, tc.Name, toolArgs)
-				if err != nil {
-					trace.L(ctx).Error("工具执行失败", "tool", tc.Name, "err", err, "session", sessionID)
-					toolResult = fmt.Sprintf("Error: tool %q execution failed", tc.Name)
+			if toolResult == "" {
+				if e.toolExecutor != nil {
+					toolResult, err = e.toolExecutor.Execute(ctx, tc.Name, toolArgs)
+					if err != nil {
+						trace.L(ctx).Error("工具执行失败", "tool", tc.Name, "err", err, "session", sessionID)
+						toolResult = fmt.Sprintf("Error executing tool %q: %s", tc.Name, err.Error())
+					}
+				} else {
+					toolResult = "Error: tool executor not available"
 				}
-			} else {
-				toolResult = "Error: tool executor not available"
 			}
 
 			// G2: 结构化 tool result — Role=tool + ToolCallID 关联
@@ -664,7 +674,7 @@ func (e *ReActEngine) completeWithTools(
 				ID:        tc.ID,
 				Name:      tc.Name,
 				Arguments: string(argsJSON),
-				Result:    truncateResult(toolResult, 500),
+				Result:    stringx.TruncateWithSuffix(toolResult, 500, "..."),
 			})
 		}
 	}
@@ -757,15 +767,18 @@ func (e *ReActEngine) finalizeReply(
 	}
 
 	// 上下文压缩（异步，G3: 串行化后台写入）
+	// Fix: pass the resolved provider instead of nil to avoid nil pointer dereference
+	// when compaction triggers provider.Complete() for LLM-based summarization.
 	if e.compactor != nil {
 		reqLogger := trace.L(ctx) // 捕获请求 logger 传入 goroutine
+		compactProvider := provider
 		e.bgWg.Add(1)
 		go func() {
 			defer e.bgWg.Done()
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 			bgCtx = trace.WithLogger(bgCtx, reqLogger)
-			if err := e.compactor.CompactIfNeeded(bgCtx, sessionID, nil); err != nil {
+			if err := e.compactor.CompactIfNeeded(bgCtx, sessionID, compactProvider); err != nil {
 				trace.L(bgCtx).Error("上下文压缩失败", "err", err, "session", sessionID)
 			}
 		}()
@@ -831,32 +844,6 @@ func shouldBoundThinkingMessage(providerName, modelName string, metadata map[str
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(metadata["thinking"]), "on")
-}
-
-// createAgent 创建 Agent 实例
-//
-// 优先级: 角色名 > Agent 路由注入的 system prompt > 默认 prompt
-func (e *ReActEngine) createAgent(roleName string, provider hexagon.Provider, metadata map[string]string) hexagon.Agent {
-	if roleName != "" {
-		agent, err := e.factory.CreateAgent(roleName, provider)
-		if err != nil {
-			trace.L(context.Background()).Error("创建角色 Agent 失败", "err", err, "role", roleName)
-		} else {
-			return agent
-		}
-	}
-
-	prompt := systemPrompt(metadata)
-	if metadata != nil && metadata["agent_prompt"] != "" {
-		prompt = metadata["agent_prompt"]
-	}
-
-	return hexagon.NewReActAgent(
-		hexagon.AgentWithName("hexclaw"),
-		hexagon.AgentWithLLM(provider),
-		hexagon.AgentWithSystemPrompt(prompt),
-		hexagon.AgentWithMaxIterations(10),
-	)
 }
 
 // getProviderModel 安全获取 Provider 的模型名称
@@ -937,7 +924,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 			ID:        "tc-" + idgen.ShortID(),
 			Name:      matched.Name(),
 			Arguments: string(argsJSON),
-			Result:    truncateResult(result.Content, 500),
+			Result:    stringx.TruncateWithSuffix(result.Content, 500, "..."),
 		}}
 		return singleChunkWithTools(result.Content, withAssistantMessageID(result.Metadata, assistantMessageID), tc), nil
 	}
@@ -1033,7 +1020,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	}
 
 	// 7. 构建 CompletionRequest（含 tools + system prompt + 历史 + 知识库 + 用户消息）
-	req := e.buildCompletionRequest(msg, history, kbContext)
+	req := e.buildCompletionRequest(ctx, msg, history, kbContext)
 	var tools []llm.ToolDefinition
 	if e.toolCollector != nil {
 		tools = e.toolCollector.Collect()
@@ -1043,8 +1030,9 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	streamToolsCfg := e.cfg.LLM.Tools
 	if !resolveToolsEnabled(streamToolsCfg, isLocal) {
 		tools = nil
-		// 本地 thinking 模型（qwen3、deepseek-r1 等）：前端未显式开启 thinking 时注入 /no_think
-		if msg.Metadata["thinking"] != "on" && isLocalThinkingModel(selection.modelName) {
+		// 本地 thinking 模型：前端未显式开启 thinking 时注入 /no_think
+		// Qwen3/DeepSeek-R1 通过 /no_think 抑制；Gemma 4 由 Ollama 模板层控制，不注入
+		if msg.Metadata["thinking"] != "on" && needsNoThinkInjection(selection.modelName) {
 			injectNoThink(req.Messages)
 			trace.L(ctx).Info("注入 /no_think", "model", selection.modelName)
 		}
@@ -1097,6 +1085,12 @@ func (e *ReActEngine) processStreamToolLoop(
 	msg *adapter.Message,
 	cacheInput string,
 ) (<-chan *adapter.ReplyChunk, error) {
+	// Fix: ensure session lock is always released on all return paths (error or success).
+	// Previously, error returns before launching a goroutine would permanently deadlock the session.
+	if unlock, ok := ctx.Value(ctxKeySessionUnlock).(func()); ok && unlock != nil {
+		defer unlock()
+	}
+
 	const maxStreamToolTurns = 25
 	var budget *BudgetController
 	if e.budgetCfg != nil {
@@ -1112,7 +1106,12 @@ func (e *ReActEngine) processStreamToolLoop(
 				trace.L(ctx).Warn("流式预算耗尽", "turn", turn, "err", err, "session", sess.ID)
 				break
 			}
+		} else if turn >= 5 {
+			// Fix 5: match non-streaming behavior — cap at 5 turns when no budget is configured
+			break
 		}
+		// P4: 工具循环内上下文压缩
+		messages = compressContextIfNeeded(ctx, messages, selection.provider, sess.ID)
 		req.Messages = messages
 
 		llmStream, err := selection.provider.Stream(ctx, req)
@@ -1156,21 +1155,27 @@ func (e *ReActEngine) processStreamToolLoop(
 			}
 		}
 
-		// 无 tool_calls → 最终轮，重新发起流式请求推给前端
+		// 无 tool_calls → 最终轮
+		// Fix 4: use the already-consumed content instead of making a redundant
+		// second provider.Stream() call that doubles LLM cost.
 		hasToolCalls := len(result.ToolCalls) > 0
 		if !hasToolCalls {
-			finalStream, sErr := selection.provider.Stream(ctx, req)
-			if sErr != nil {
-				// 流式失败则直接用已收集的结果
-				return singleChunkWithTools(
-					result.Content,
-					buildReplyMetadata(msg.Metadata, selection.providerName, selection.modelName, ""),
-					allToolCalls,
-				), nil
+			// Save assistant reply and build metadata (reuse finalizeReply logic inline)
+			assistantMessageID := ""
+			saveCtx, saveCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			saveCtx = trace.WithLogger(saveCtx, trace.L(ctx))
+			if record, sErr := e.sessions.SaveAssistantMessageWithMetaAndRequestID(saveCtx, sess.ID, result.Content, "", messageRequestID(msg)); sErr != nil {
+				trace.L(ctx).Error("保存助手回复失败", "err", sErr, "session", sess.ID)
+			} else {
+				assistantMessageID = record.ID
 			}
-			ch := make(chan *adapter.ReplyChunk, 16)
-			go e.pipeStreamWithTools(ctx, ch, finalStream, sess.ID, msg, selection.provider, req, selection.providerName, selection.modelName, cacheInput, allToolCalls)
-			return ch, nil
+			e.cache.Put(cacheInput, result.Content, selection.providerName, selection.modelName)
+			saveCancel()
+			return singleChunkWithTools(
+				result.Content,
+				buildReplyMetadata(msg.Metadata, selection.providerName, selection.modelName, assistantMessageID),
+				allToolCalls,
+			), nil
 		}
 
 		// 有 tool_calls → 构建 tool transcript 并执行
@@ -1183,29 +1188,35 @@ func (e *ReActEngine) processStreamToolLoop(
 		}
 		messages = append(messages, llm.AssistantToolCallMessage(result.Content, streamToolRefs))
 
+		// P0 自我纠错: 错误信息携带完整原因，让 LLM 能分析并自主决策下一步
 		for _, tc := range result.ToolCalls {
 			var toolArgs map[string]any
+			var toolResult string
+
 			if tc.Arguments != "" {
 				if uerr := json.Unmarshal([]byte(tc.Arguments), &toolArgs); uerr != nil {
 					trace.L(ctx).Error("工具参数解析失败", "tool", tc.Name, "err", uerr, "session", sess.ID)
+					toolResult = fmt.Sprintf("Error: invalid arguments for tool %q: %s", tc.Name, uerr.Error())
 				}
 			}
-			var toolResult string
-			if e.toolExecutor != nil {
-				toolResult, err = e.toolExecutor.Execute(ctx, tc.Name, toolArgs)
-				if err != nil {
-					trace.L(ctx).Error("工具执行失败", "tool", tc.Name, "err", err, "session", sess.ID)
-					toolResult = fmt.Sprintf("Error: tool %q execution failed", tc.Name)
+
+			if toolResult == "" {
+				if e.toolExecutor != nil {
+					toolResult, err = e.toolExecutor.Execute(ctx, tc.Name, toolArgs)
+					if err != nil {
+						trace.L(ctx).Error("工具执行失败", "tool", tc.Name, "err", err, "session", sess.ID)
+						toolResult = fmt.Sprintf("Error executing tool %q: %s", tc.Name, err.Error())
+					}
+				} else {
+					toolResult = "Error: tool executor not available"
 				}
-			} else {
-				toolResult = "Error: tool executor not available"
 			}
 			messages = append(messages, llm.ToolResultMessage(tc.ID, toolResult))
 			argsJSON, _ := json.Marshal(toolArgs)
 			allToolCalls = append(allToolCalls, adapter.ToolCall{
 				ID: tc.ID, Name: tc.Name,
 				Arguments: string(argsJSON),
-				Result:    truncateResult(toolResult, 500),
+				Result:    stringx.TruncateWithSuffix(toolResult, 500, "..."),
 			})
 		}
 	}
@@ -1240,6 +1251,10 @@ func (e *ReActEngine) pipeStream(
 	}
 	defer close(ch)
 	defer llmStream.Close()
+
+	// Fix 3: clone msg.Metadata so goroutine writes don't race with external reads.
+	// All writes below use the local msgMeta copy instead of msg.Metadata directly.
+	msgMeta := cloneStringMap(msg.Metadata)
 
 	var fullContent strings.Builder
 	var fullReasoning strings.Builder
@@ -1284,11 +1299,10 @@ func (e *ReActEngine) pipeStream(
 	if strings.TrimSpace(content) == "" && fullReasoning.Len() > 0 {
 		cacheable = false
 		generatedContent = true
-		ensureMessageMetadata(msg)
-		msg.Metadata["finish_reason"] = "reasoning_only"
+		msgMeta["finish_reason"] = "reasoning_only"
 		if recovered, ok := e.recoverReasoningOnly(ctx, provider, req); ok {
 			content = recovered
-			msg.Metadata["recovered_from_reasoning_only"] = "true"
+			msgMeta["recovered_from_reasoning_only"] = "true"
 		} else {
 			content = reasoningOnlyFallbackContent
 		}
@@ -1352,7 +1366,7 @@ func (e *ReActEngine) pipeStream(
 	// 发送结束标记（携带 Usage 和元数据）
 	doneChunk := &adapter.ReplyChunk{
 		Done:     true,
-		Metadata: buildReplyMetadata(msg.Metadata, providerName, modelName, assistantMessageID),
+		Metadata: buildReplyMetadata(msgMeta, providerName, modelName, assistantMessageID),
 	}
 	if result != nil && result.Usage.TotalTokens > 0 {
 		doneChunk.Usage = &adapter.Usage{
@@ -1417,12 +1431,20 @@ func (e *ReActEngine) pipeStreamWithTools(
 	toolCalls []adapter.ToolCall,
 ) {
 	// 释放 SessionLock (流式路径在 goroutine 结束时释放)
+	// Note: processStreamToolLoop now owns the unlock via its own defer,
+	// so pipeStreamWithTools launched from processStreamToolLoop should NOT
+	// double-unlock. However, pipeStreamWithTools is also called from the
+	// final-stream path where processStreamToolLoop already deferred unlock.
+	// The ctx value is consumed once; the first defer wins.
 	if unlock, ok := ctx.Value(ctxKeySessionUnlock).(func()); ok && unlock != nil {
 		defer unlock()
 	}
 
 	defer close(ch)
 	defer llmStream.Close()
+
+	// Fix 3: clone msg.Metadata so goroutine writes don't race with external reads.
+	msgMeta := cloneStringMap(msg.Metadata)
 
 	var fullContent strings.Builder
 	var fullReasoning strings.Builder
@@ -1458,11 +1480,10 @@ func (e *ReActEngine) pipeStreamWithTools(
 	if strings.TrimSpace(content) == "" && fullReasoning.Len() > 0 {
 		cacheable = false
 		generatedContent = true
-		ensureMessageMetadata(msg)
-		msg.Metadata["finish_reason"] = "reasoning_only"
+		msgMeta["finish_reason"] = "reasoning_only"
 		if recovered, ok := e.recoverReasoningOnly(ctx, provider, req); ok {
 			content = recovered
-			msg.Metadata["recovered_from_reasoning_only"] = "true"
+			msgMeta["recovered_from_reasoning_only"] = "true"
 		} else {
 			content = reasoningOnlyFallbackContent
 		}
@@ -1541,7 +1562,7 @@ func (e *ReActEngine) pipeStreamWithTools(
 	}
 	doneChunk := &adapter.ReplyChunk{
 		Done:      true,
-		Metadata:  buildReplyMetadata(msg.Metadata, providerName, modelName, assistantMessageID),
+		Metadata:  buildReplyMetadata(msgMeta, providerName, modelName, assistantMessageID),
 		ToolCalls: finalToolCalls,
 	}
 	if result != nil && result.Usage.TotalTokens > 0 {
@@ -1571,12 +1592,8 @@ func (e *ReActEngine) pipeStreamWithTools(
 		}
 	}
 
-	if msg.Metadata == nil || msg.Metadata["memory"] != "off" {
-		role := ""
-		if msg.Metadata != nil {
-			role = msg.Metadata["role"]
-		}
-		e.autoExtractMemoryForRole(msg.Content, content, role)
+	if msgMeta["memory"] != "off" {
+		e.autoExtractMemoryForRole(msg.Content, content, msgMeta["role"])
 	}
 }
 
@@ -1584,7 +1601,7 @@ func (e *ReActEngine) pipeStreamWithTools(
 //
 // 当 attachments 包含图片时，用户消息会构建为 MultiContent 格式（文本 + image_url），
 // 底层 ai-core Provider 会自动识别并发送为多模态 API 请求。
-func (e *ReActEngine) buildStreamMessages(roleName string, history []hexagon.Message, kbContext, userQuery string, metadata map[string]string, attachments []adapter.Attachment) []hexagon.Message {
+func (e *ReActEngine) buildStreamMessages(ctx context.Context, roleName string, history []hexagon.Message, kbContext, userQuery string, metadata map[string]string, attachments []adapter.Attachment) []hexagon.Message {
 	var messages []hexagon.Message
 
 	// System prompt 优先级: 角色名 > Agent 路由注入 > 默认
@@ -1600,7 +1617,7 @@ func (e *ReActEngine) buildStreamMessages(roleName string, history []hexagon.Mes
 		sysContent += "\n\n[参考知识]\n" + kbContext
 	}
 	// 追加能力上下文：知识库文件列表、Skill/MCP 工具、记忆
-	sysContent += e.buildCapabilityContext(context.Background(), metadata)
+	sysContent += e.buildCapabilityContext(ctx, metadata)
 	messages = append(messages, hexagon.Message{
 		Role:    "system",
 		Content: sysContent,
@@ -1615,9 +1632,9 @@ func (e *ReActEngine) buildStreamMessages(roleName string, history []hexagon.Mes
 	return messages
 }
 
-func (e *ReActEngine) buildCompletionRequest(msg *adapter.Message, history []hexagon.Message, kbContext string) hexagon.CompletionRequest {
+func (e *ReActEngine) buildCompletionRequest(ctx context.Context, msg *adapter.Message, history []hexagon.Message, kbContext string) hexagon.CompletionRequest {
 	req := hexagon.CompletionRequest{
-		Messages: e.buildStreamMessages(msg.Metadata["role"], history, kbContext, msg.Content, msg.Metadata, msg.Attachments),
+		Messages: e.buildStreamMessages(ctx, msg.Metadata["role"], history, kbContext, msg.Content, msg.Metadata, msg.Attachments),
 	}
 	applyCompletionOverrides(&req, msg.Metadata)
 	return req
@@ -1635,7 +1652,7 @@ func (e *ReActEngine) completeDirect(
 	explicitProvider bool,
 	cacheInput string,
 ) (*adapter.Reply, error) {
-	req := e.buildCompletionRequest(msg, history, kbContext)
+	req := e.buildCompletionRequest(ctx, msg, history, kbContext)
 	resp, err := provider.Complete(ctx, req)
 	if err != nil {
 		if explicitProvider {
@@ -1693,21 +1710,6 @@ func (e *ReActEngine) completeDirect(
 		Usage:     buildUsage(resp.Usage, providerName, modelName),
 		ToolCalls: translateProviderToolCalls(resp.ToolCalls),
 	}, nil
-}
-
-func shouldUseDirectCompletion(history []hexagon.Message, kbContext string, attachments []adapter.Attachment) bool {
-	if len(history) > 0 || kbContext != "" {
-		return true
-	}
-	if len(adapter.FilterImageAttachments(attachments)) > 0 {
-		return true
-	}
-	for _, msg := range history {
-		if msg.HasMultiContent() {
-			return true
-		}
-	}
-	return false
 }
 
 func applyCompletionOverrides(req *hexagon.CompletionRequest, metadata map[string]string) {
@@ -2145,7 +2147,15 @@ const defaultSystemPrompt = `你是「小蟹」🦀，HexClaw 的 AI 助手。
 工具使用偏好：
 - 当用户要求执行代码、抓取网页、数据处理、计算等任务时，优先使用 code_exec 工具直接执行，而不是用 write_file 写文件
 - code_exec 支持网络访问，可以直接 import requests 等库抓取网页（缺失的依赖会自动安装）
-- 只有用户明确要求"保存为文件"时才使用 write_file`
+- 只有用户明确要求"保存为文件"时才使用 write_file
+- 修改文件时，先用 file_ops(read) 或 read_file 查看内容，再用 file_edit 精确替换，避免全量覆盖
+- 探索代码库时，用 grep 搜索内容、glob 查找文件，而不是让用户告诉你文件在哪
+
+自主工作方式：
+- 对于复杂任务（涉及多个文件或多个步骤），先制定计划再逐步执行
+- 逐步执行时，每步用工具验证结果后再进入下一步
+- 工具调用失败时，分析错误原因，自主决定：修正参数重试、换用其他工具、或向用户说明原因
+- 不要因为一次失败就放弃整个任务——尝试不同的方法解决问题`
 
 // systemPrompt 生成包含当前模型信息的系统提示词。
 // 品牌与模型的关系类似汽车品牌与发动机：小蟹是品牌，模型是驱动力。
@@ -2169,10 +2179,21 @@ func systemPrompt(metadata map[string]string) string {
 		1)
 }
 
-// isLocalThinkingModel 检测是否为支持 thinking 模式的本地模型
+// isLocalThinkingModel 检测是否为支持 thinking 模式的本地模型。
+// 用于 thinking 超时保护和 /no_think 注入判断。
 func isLocalThinkingModel(model string) bool {
 	m := strings.ToLower(model)
-	// qwen3 系列、deepseek-r1 系列默认开启 thinking
+	return strings.Contains(m, "qwen3") ||
+		strings.Contains(m, "deepseek-r1") ||
+		strings.Contains(m, "qwq") ||
+		strings.Contains(m, "gemma4")
+}
+
+// needsNoThinkInjection 检测模型是否需要通过 system prompt 注入 /no_think 来抑制 thinking。
+// Qwen3/DeepSeek-R1 通过 /no_think 文本指令控制；
+// Gemma 4 通过 Ollama 模板层 <|think|> token 控制，不需要此注入。
+func needsNoThinkInjection(model string) bool {
+	m := strings.ToLower(model)
 	return strings.Contains(m, "qwen3") ||
 		strings.Contains(m, "deepseek-r1") ||
 		strings.Contains(m, "qwq")
@@ -2191,13 +2212,16 @@ func injectNoThink(messages []hexagon.Message) {
 	}
 }
 
-func truncateResult(s string, maxRunes int) string {
-	runes := []rune(s)
-	if len(runes) <= maxRunes {
-		return s
+// cloneStringMap returns a shallow copy of a map[string]string.
+// If the input is nil, returns an initialized empty map (safe for writes).
+func cloneStringMap(m map[string]string) map[string]string {
+	clone := make(map[string]string, len(m))
+	for k, v := range m {
+		clone[k] = v
 	}
-	return string(runes[:maxRunes]) + "..."
+	return clone
 }
+
 
 // isLocalProvider 判断 provider 是否为本地模型
 func isLocalProvider(providerName string) bool {

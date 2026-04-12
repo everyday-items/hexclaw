@@ -308,6 +308,70 @@ func TestClose_WithoutSession(t *testing.T) {
 	}
 }
 
+func TestClose_WithSessionSendsDeleteAndClearsSession(t *testing.T) {
+	var gotMethod, gotSessionID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotSessionID = r.Header.Get("Mcp-Session-Id")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	transport := NewHTTPTransport(server.URL)
+	transport.sessionID = "session-42"
+
+	if err := transport.Close(); err != nil {
+		t.Fatalf("close with session should not error, got: %v", err)
+	}
+	if gotMethod != http.MethodDelete {
+		t.Fatalf("expected DELETE, got %q", gotMethod)
+	}
+	if gotSessionID != "session-42" {
+		t.Fatalf("expected Mcp-Session-Id header %q, got %q", "session-42", gotSessionID)
+	}
+	if sid := transport.SessionID(); sid != "" {
+		t.Fatalf("session should be cleared after close, got %q", sid)
+	}
+}
+
+func TestClose_NotFoundClearsSession(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	transport := NewHTTPTransport(server.URL)
+	transport.sessionID = "expired-session"
+
+	if err := transport.Close(); err != nil {
+		t.Fatalf("404 on close should be treated as already closed, got: %v", err)
+	}
+	if sid := transport.SessionID(); sid != "" {
+		t.Fatalf("session should be cleared after 404 close, got %q", sid)
+	}
+}
+
+func TestClose_ServerErrorKeepsSession(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	transport := NewHTTPTransport(server.URL)
+	transport.sessionID = "session-still-open"
+
+	err := transport.Close()
+	if err == nil {
+		t.Fatal("500 on close should return error")
+	}
+	if !strings.Contains(err.Error(), "500") {
+		t.Fatalf("expected 500 in error, got %v", err)
+	}
+	if sid := transport.SessionID(); sid != "session-still-open" {
+		t.Fatalf("session should be kept after failed close, got %q", sid)
+	}
+}
+
 func TestSend_SSEResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

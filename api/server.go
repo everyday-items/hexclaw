@@ -90,6 +90,9 @@ type Server struct {
 	toolPerms     *engine.ToolPermissions      // 工具权限（可选）
 	checkpointMgr *engine.CheckpointManager    // 检查点管理器（可选）
 	version       string                       // 版本号
+	// 沙箱网络热更新回调（由 main.go 注入）
+	onSandboxNetworkUpdate func(enabled bool) error
+	sandboxNetworkEnabled  func() bool
 	server        *http.Server
 	statsMu       sync.Mutex
 	statsCache    statsResponse
@@ -232,6 +235,12 @@ func (s *Server) SetCanvas(svc *canvas.Service) {
 // 设置后启用语音转录/合成 API。
 func (s *Server) SetVoice(svc *voice.Service) {
 	s.voiceSvc = svc
+}
+
+// SetSandboxCallbacks 注入沙箱网络热更新回调
+func (s *Server) SetSandboxCallbacks(updater func(bool) error, getter func() bool) {
+	s.onSandboxNetworkUpdate = updater
+	s.sandboxNetworkEnabled = getter
 }
 
 // LogCollector 返回日志收集器，供外部模块写入日志

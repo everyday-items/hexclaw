@@ -82,7 +82,11 @@ func (s *WeatherSkill) Match(content string) bool {
 
 // Execute 查询天气（带自动重试）
 func (s *WeatherSkill) Execute(ctx context.Context, args map[string]any) (*skill.Result, error) {
-	query, _ := args["query"].(string)
+	// 优先读 schema 定义的 location，兼容旧的 query 参数
+	query, _ := args["location"].(string)
+	if query == "" {
+		query, _ = args["query"].(string)
+	}
 	if query == "" {
 		return &skill.Result{Content: "请告诉我要查询哪个城市的天气，例如：天气 北京"}, nil
 	}
@@ -116,7 +120,7 @@ func (s *WeatherSkill) Execute(ctx context.Context, args map[string]any) (*skill
 			continue
 		}
 
-		body, err = io.ReadAll(resp.Body)
+		body, err = io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB 上限
 		resp.Body.Close()
 		if err != nil {
 			lastErr = "数据读取失败"
@@ -242,9 +246,3 @@ type wttrValue struct {
 	Value string `json:"value"`
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
-}

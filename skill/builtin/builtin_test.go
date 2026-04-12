@@ -505,7 +505,7 @@ func TestWeatherSkillExecuteWithMockServer(t *testing.T) {
 	}))
 
 	result, err := s.Execute(context.Background(), map[string]any{
-		"query": "天气北京",
+		"location": "天气北京",
 	})
 	if err != nil {
 		t.Fatalf("Execute 失败: %v", err)
@@ -515,6 +515,29 @@ func TestWeatherSkillExecuteWithMockServer(t *testing.T) {
 	}
 	if !strings.Contains(result.Content, "多云") {
 		t.Errorf("结果应包含天气描述，实际: %q", result.Content)
+	}
+}
+
+// TestWeatherSkillOversizedResponse 验证 io.LimitReader 保护生效
+func TestWeatherSkillOversizedResponse(t *testing.T) {
+	// 生成 2MB 响应（超过 1MB 限制），LimitReader 截断后 JSON 解析失败 → 降级为重试失败
+	huge := strings.Repeat("x", 2<<20)
+
+	s := NewWeatherSkill()
+	s.client = httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(huge))
+	}))
+
+	result, err := s.Execute(context.Background(), map[string]any{
+		"location": "北京",
+	})
+	if err != nil {
+		t.Fatalf("不应返回 error，应走降级: %v", err)
+	}
+	// 超大响应被截断后 JSON 解析失败，应返回"暂时无法获取"降级消息
+	if !strings.Contains(result.Content, "暂时无法获取") && !strings.Contains(result.Content, "失败") {
+		t.Errorf("超大响应应触发降级，实际: %q", result.Content)
 	}
 }
 

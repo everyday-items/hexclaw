@@ -24,11 +24,12 @@ import (
 
 // SkillDeps holds optional dependencies for skills that need external services.
 type SkillDeps struct {
-	SkillHub  *hub.Hub
-	McpHub    *hub.McpHub
-	McpMgr    *hexmcp.Manager
-	CfgWriter *config.Writer
-	Workspace string // workspace dir for file ops (default ~/.hexclaw/workspace)
+	SkillHub      *hub.Hub
+	McpHub        *hub.McpHub
+	McpMgr        *hexmcp.Manager
+	CfgWriter     *config.Writer
+	Workspace     string         // workspace dir for file ops (default ~/.hexclaw/workspace)
+	CodeExecSkill *CodeExecSkill // populated by RegisterAdvanced if code_exec enabled
 }
 
 // RegisterAll 注册所有内置 Skill
@@ -84,6 +85,15 @@ func RegisterAll(registry *skill.DefaultRegistry, cfg config.BuiltinConfig) {
 		if err := registry.Register(NewFileOpsSkill(ws)); err != nil {
 			logger.Error("注册文件操作 Skill 失败", "error", err)
 		}
+		if err := registry.Register(NewFileEditSkill(ws)); err != nil {
+			logger.Error("注册文件编辑 Skill 失败", "error", err)
+		}
+		if err := registry.Register(NewGrepSkill(ws)); err != nil {
+			logger.Error("注册 Grep Skill 失败", "error", err)
+		}
+		if err := registry.Register(NewGlobSkill(ws)); err != nil {
+			logger.Error("注册 Glob Skill 失败", "error", err)
+		}
 	}
 
 	// 启动日志由 main 统一输出
@@ -91,19 +101,26 @@ func RegisterAll(registry *skill.DefaultRegistry, cfg config.BuiltinConfig) {
 
 // RegisterAdvanced registers skills that require external dependencies.
 // Called from main.go after all services are initialized.
-func RegisterAdvanced(registry *skill.DefaultRegistry, cfg config.BuiltinConfig, deps SkillDeps) {
+func RegisterAdvanced(registry *skill.DefaultRegistry, cfg config.BuiltinConfig, deps *SkillDeps) {
 	if cfg.CodeExec {
-		sb, err := sandbox.New(sandbox.Config{
-			Workspace: deps.Workspace,
+		ws := deps.Workspace
+		if ws == "" {
+			ws = defaultWorkspace()
+		}
+		sbCfg := sandbox.Config{
+			Workspace: ws,
 			Timeout:   30,
 			Network:   cfg.CodeExecPolicy.CodeExecNetworkAllowed(),
-		})
+		}
+		sb, err := sandbox.New(sbCfg)
 		if err != nil {
 			logger.Error("沙箱初始化失败，CodeExecSkill 不可用", "error", err)
 		} else {
-			if err := registry.Register(NewCodeExecSkill(sb)); err != nil {
+			codeExec := NewCodeExecSkill(sb, sbCfg)
+			if err := registry.Register(codeExec); err != nil {
 				logger.Error("注册 CodeExecSkill 失败", "error", err)
 			}
+			deps.CodeExecSkill = codeExec
 		}
 	}
 

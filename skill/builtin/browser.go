@@ -206,14 +206,15 @@ func (s *BrowserSkill) doExtract(ctx context.Context, targetURL string, args map
 }
 
 func (s *BrowserSkill) doPost(ctx context.Context, targetURL string, args map[string]any) (*skill.Result, error) {
-	data, _ := args["data"].(map[string]string)
-	if data == nil {
+	// JSON unmarshals to map[string]any, so accept that and convert values to strings
+	rawData, _ := args["data"].(map[string]any)
+	if rawData == nil {
 		return nil, fmt.Errorf("post 请求缺少 data 参数")
 	}
 
 	form := url.Values{}
-	for k, v := range data {
-		form.Set(k, v)
+	for k, v := range rawData {
+		form.Set(k, fmt.Sprint(v))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, strings.NewReader(form.Encode()))

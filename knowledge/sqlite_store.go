@@ -276,7 +276,9 @@ func (s *SQLiteStore) Get(ctx context.Context, docID string) (*Document, error) 
 // 限制最多扫描 maxVectorScanRows 行，防止知识库过大时 OOM。
 // 对于个人知识库（通常 < 10万 chunk），这种全扫描方式
 // 性能完全够用（10万个 1536 维向量约需 ~100ms）。
-const maxVectorScanRows = 100000
+// Fix 6: 降低扫描上限到 10000 行，防止大知识库 OOM（10K × 6KB ≈ 60MB，可控）。
+// 未来可引入 ANN 索引（如 sqlite-vec）来避免全表扫描。
+const maxVectorScanRows = 10000
 
 func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK int) ([]*SearchResult, error) {
 	rows, err := s.db.QueryContext(ctx,
@@ -433,7 +435,9 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int) ([
 	// 归一化 BM25 分数到 0-1
 	scoreRange := maxScore - minScore
 	for _, r := range raw {
-		normalizedScore := 0.5 // 只有一个结果时
+		// Fix 7: 当 scoreRange == 0（所有结果分数相同，包括只有 1 个结果），
+		// 设为 1.0（都是最佳匹配），而非 0.5 导致完美匹配被低估。
+		normalizedScore := 1.0
 		if scoreRange > 0 {
 			normalizedScore = (r.score - minScore) / scoreRange
 		}
@@ -464,7 +468,8 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 	var query strings.Builder
 	var args []any
 
-	query.WriteString("SELECT id, doc_id, content, chunk_index, embedding, created_at FROM kb_chunks WHERE ")
+	// Fix 15: 不查询 embedding 列，文本降级搜索无需加载向量 BLOB
+	query.WriteString("SELECT id, doc_id, content, chunk_index, created_at FROM kb_chunks WHERE ")
 	for i, kw := range keywords {
 		if i > 0 {
 			query.WriteString(" OR ")
@@ -484,13 +489,10 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 	var results []*SearchResult
 	for rows.Next() {
 		chunk := &Chunk{}
-		var embBlob []byte
-		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &embBlob, &chunk.CreatedAt); err != nil {
+		// Fix 15: Scan 与 SELECT 对齐（已移除 embedding 列）
+		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &chunk.CreatedAt); err != nil {
 			logger.Error("[knowledge] fallbackTextSearch scan 失败", "error", err)
 			continue
-		}
-		if len(embBlob) > 0 {
-			chunk.Embedding = decodeFloat32Slice(embBlob)
 		}
 
 		// 简单评分：匹配关键词数 / 总关键词数

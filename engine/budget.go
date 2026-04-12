@@ -121,6 +121,11 @@ var pricingTable = map[string]map[string]modelPrice{
 		"gemini-2.0-flash": {Input: 0.0001, Output: 0.0004},
 		"gemini-2.5-pro":   {Input: 0.00125, Output: 0.01},
 	},
+	// Fix 8: router uses "gemini" as provider name, not "google"
+	"gemini": {
+		"gemini-2.0-flash": {Input: 0.0001, Output: 0.0004},
+		"gemini-2.5-pro":   {Input: 0.00125, Output: 0.01},
+	},
 	"deepseek": {
 		"deepseek-chat":     {Input: 0.00014, Output: 0.00028},
 		"deepseek-reasoner": {Input: 0.00055, Output: 0.0022},
@@ -156,16 +161,33 @@ func (b *BudgetController) Allocate(fraction float64) *BudgetController {
 	return child
 }
 
-// Release 将子预算未用部分归还父预算
+// Release 将子预算未用部分归还父预算。
+//
+// Fix: cap the subtraction so parent counters never go below 0.
+// Without pre-deduction in Allocate(), blindly subtracting the unused
+// portion would drive parent.usedTokens / usedCost negative.
 func (b *BudgetController) Release(parent *BudgetController) {
 	// 未用 = 分配额 - 已用
 	unusedTokens := b.maxTokens - b.usedTokens.Load()
 	if unusedTokens > 0 {
-		parent.usedTokens.Add(-unusedTokens) // 归还
+		// Only subtract down to 0, never below
+		current := parent.usedTokens.Load()
+		if unusedTokens > current {
+			unusedTokens = current
+		}
+		if unusedTokens > 0 {
+			parent.usedTokens.Add(-unusedTokens)
+		}
 	}
 	unusedCostCents := int64(b.maxCost*1_000_000) - b.usedCost.Load()
 	if unusedCostCents > 0 {
-		parent.usedCost.Add(-unusedCostCents)
+		currentCost := parent.usedCost.Load()
+		if unusedCostCents > currentCost {
+			unusedCostCents = currentCost
+		}
+		if unusedCostCents > 0 {
+			parent.usedCost.Add(-unusedCostCents)
+		}
 	}
 }
 

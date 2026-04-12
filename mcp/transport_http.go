@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // HTTPTransport implements the MCP 2025-03-26 Streamable HTTP transport.
@@ -132,7 +133,9 @@ func (t *HTTPTransport) Close() error {
 		return nil
 	}
 
-	req, err := http.NewRequest(http.MethodDelete, t.endpoint, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, t.endpoint, nil)
 	if err != nil {
 		return err
 	}
@@ -144,6 +147,19 @@ func (t *HTTPTransport) Close() error {
 		return err
 	}
 	resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		t.mu.Lock()
+		t.sessionID = ""
+		t.mu.Unlock()
+		return nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("MCP HTTP %d: %s", resp.StatusCode, resp.Status)
+	}
+
+	t.mu.Lock()
+	t.sessionID = ""
+	t.mu.Unlock()
 	return nil
 }
 
@@ -242,13 +258,20 @@ func (t *HTTPTransport) collectSSEResult(body io.Reader) (json.RawMessage, error
 	return last, nil
 }
 
+const maxTotalSSEBytes = 100 * 1024 * 1024 // 100 MB total SSE stream limit
+
 func (t *HTTPTransport) streamSSE(body io.Reader, handler func(json.RawMessage)) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 1MB max line for large tool results
 	var dataLines []string
+	var totalBytes int64
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		totalBytes += int64(len(line)) + 1 // +1 for newline
+		if totalBytes > maxTotalSSEBytes {
+			return fmt.Errorf("SSE stream exceeded maximum size of %d bytes", maxTotalSSEBytes)
+		}
 
 		if line == "" {
 			// Blank line = end of event

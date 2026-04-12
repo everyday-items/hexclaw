@@ -37,7 +37,7 @@ func TestHandleTestLLMConfig_Success(t *testing.T) {
 	defer func() { llmTestProviderFactory = oldFactory }()
 
 	srv := NewServer(config.DefaultConfig(), &mockEngine{}, nil, nil)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/config/llm/test", strings.NewReader(`{"provider":{"type":"openai","base_url":"https://example.com","api_key":"sk-test","model":"gpt-4o-mini"}}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/config/llm/test", strings.NewReader(`{"provider":{"type":"openai","api_key":"sk-test","model":"gpt-4o-mini"}}`))
 	w := httptest.NewRecorder()
 
 	srv.handleTestLLMConfig(w, req)

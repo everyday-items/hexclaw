@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/skill/hub"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
@@ -25,6 +26,10 @@ import (
 // ─── Cron: POST /api/v1/cron/jobs/{id}/trigger ──
 
 func (s *Server) handleTriggerCronJob(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "定时任务未启用"})
+		return
+	}
 	if err := s.scheduler.TriggerJob(r.Context(), r.PathValue("id")); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
@@ -35,6 +40,10 @@ func (s *Server) handleTriggerCronJob(w http.ResponseWriter, r *http.Request) {
 // ─── Cron: GET /api/v1/cron/jobs/{id}/history ──
 
 func (s *Server) handleCronJobHistory(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "定时任务未启用"})
+		return
+	}
 	history, err := s.scheduler.GetJobHistory(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
@@ -145,6 +154,10 @@ func (s *Server) handleCallMCPTool(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name 不能为空"})
 		return
 	}
+	if s.mcpMgr == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "MCP 未启用"})
+		return
+	}
 	result, err := s.mcpMgr.CallTool(r.Context(), req.Name, req.Arguments)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]string{"error": "工具 \"" + req.Name + "\" 执行失败: " + err.Error()})
@@ -156,6 +169,10 @@ func (s *Server) handleCallMCPTool(w http.ResponseWriter, r *http.Request) {
 // ─── MCP: GET /api/v1/mcp/status ──
 
 func (s *Server) handleMCPStatus(w http.ResponseWriter, r *http.Request) {
+	if s.mcpMgr == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"servers": []any{}, "total": 0})
+		return
+	}
 	statuses := s.mcpMgr.ServerStatuses()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"servers": statuses,
@@ -170,6 +187,12 @@ func (s *Server) handleGetFullConfig(w http.ResponseWriter, r *http.Request) {
 	for name, p := range s.cfg.LLM.Providers {
 		providers[name] = map[string]any{"model": p.Model, "base_url": p.BaseURL, "has_key": p.APIKey != ""}
 	}
+	// sandbox 网络状态：优先读运行时真值，回退到配置
+	sandboxNetworkEnabled := s.cfg.Skill.Builtin.CodeExecPolicy.CodeExecNetworkAllowed()
+	if s.sandboxNetworkEnabled != nil {
+		sandboxNetworkEnabled = s.sandboxNetworkEnabled()
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"server":    map[string]any{"host": s.cfg.Server.Host, "port": s.cfg.Server.Port, "mode": s.cfg.Server.Mode},
 		"llm":       map[string]any{"default": s.cfg.LLM.Default, "providers": providers},
@@ -180,12 +203,14 @@ func (s *Server) handleGetFullConfig(w http.ResponseWriter, r *http.Request) {
 		"canvas":    map[string]any{"enabled": s.cfg.Canvas.Enabled},
 		"voice":     map[string]any{"enabled": s.cfg.Voice.Enabled},
 		"security": map[string]any{
-			"gateway_enabled":        s.cfg.Security.Auth.Enabled || s.cfg.Security.RateLimit.RequestsPerMinute > 0 || s.cfg.Security.RateLimit.RequestsPerHour > 0,
-			"injection_detection":    s.cfg.Security.InjectionDetection.Enabled,
-			"pii_filter":             s.cfg.Security.PIIRedaction.Enabled,
-			"content_filter":         s.cfg.Security.ContentFilter.Enabled,
-			"rate_limit_rpm":         s.cfg.Security.RateLimit.RequestsPerMinute,
-			"max_tokens_per_request": s.cfg.Security.Cost.BudgetPerUser,
+			"gateway_enabled":     s.cfg.Security.Auth.Enabled,
+			"injection_detection": s.cfg.Security.InjectionDetection.Enabled,
+			"pii_filter":          s.cfg.Security.PIIRedaction.Enabled,
+			"content_filter":      s.cfg.Security.ContentFilter.Enabled,
+			"rate_limit_rpm":      s.cfg.Security.RateLimit.RequestsPerMinute,
+		},
+		"sandbox": map[string]any{
+			"network_enabled": sandboxNetworkEnabled,
 		},
 	})
 }
@@ -193,34 +218,78 @@ func (s *Server) handleGetFullConfig(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUpdateFullConfig(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Security *struct {
-			GatewayEnabled      *bool `json:"gateway_enabled"`
-			InjectionDetection  *bool `json:"injection_detection"`
-			PIIFilter           *bool `json:"pii_filter"`
-			ContentFilter       *bool `json:"content_filter"`
-			RateLimitRPM        *int  `json:"rate_limit_rpm"`
-			MaxTokensPerRequest *int  `json:"max_tokens_per_request"`
+			GatewayEnabled     *bool `json:"gateway_enabled"`
+			InjectionDetection *bool `json:"injection_detection"`
+			PIIFilter          *bool `json:"pii_filter"`
+			ContentFilter      *bool `json:"content_filter"`
+			RateLimitRPM       *int  `json:"rate_limit_rpm"`
+			// max_tokens_per_request 已废弃，前端可能仍发送但后端忽略
 		} `json:"security"`
+		Sandbox *struct {
+			NetworkEnabled *bool `json:"network_enabled"`
+		} `json:"sandbox"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "无效的请求体"})
 		return
 	}
 
+	// 先在副本上构建新配置，持久化成功后再应用到 runtime
+	nextCfg := *s.cfg
+
 	if sec := body.Security; sec != nil {
+		if sec.GatewayEnabled != nil {
+			nextCfg.Security.Auth.Enabled = *sec.GatewayEnabled
+		}
 		if sec.InjectionDetection != nil {
-			s.cfg.Security.InjectionDetection.Enabled = *sec.InjectionDetection
+			nextCfg.Security.InjectionDetection.Enabled = *sec.InjectionDetection
 		}
 		if sec.PIIFilter != nil {
-			s.cfg.Security.PIIRedaction.Enabled = *sec.PIIFilter
+			nextCfg.Security.PIIRedaction.Enabled = *sec.PIIFilter
 		}
 		if sec.ContentFilter != nil {
-			s.cfg.Security.ContentFilter.Enabled = *sec.ContentFilter
+			nextCfg.Security.ContentFilter.Enabled = *sec.ContentFilter
 		}
 		if sec.RateLimitRPM != nil {
-			s.cfg.Security.RateLimit.RequestsPerMinute = *sec.RateLimitRPM
+			nextCfg.Security.RateLimit.RequestsPerMinute = *sec.RateLimitRPM
 		}
 	}
 
+	sandboxChanged := false
+	var newNetworkEnabled bool
+	if sb := body.Sandbox; sb != nil && sb.NetworkEnabled != nil {
+		nextCfg.Skill.Builtin.CodeExecPolicy.Network = sb.NetworkEnabled
+		sandboxChanged = true
+		newNetworkEnabled = *sb.NetworkEnabled
+	}
+
+	// 先持久化，失败则什么都不变（runtime + 磁盘一致）
+	if err := config.Save(&nextCfg, ""); err != nil {
+		logger.Error("配置持久化失败", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "配置保存失败: " + err.Error()})
+		return
+	}
+
+	// 沙箱网络热更新；失败时回滚刚刚持久化的新配置，保持 runtime/内存/磁盘一致
+	if sandboxChanged && s.onSandboxNetworkUpdate != nil {
+		if err := s.onSandboxNetworkUpdate(newNetworkEnabled); err != nil {
+			logger.Error("沙箱网络策略热更新失败", "error", err)
+			if rollbackErr := config.Save(s.cfg, ""); rollbackErr != nil {
+				logger.Error("沙箱网络策略热更新失败，且配置回滚失败", "error", rollbackErr)
+				writeJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "沙箱网络热更新失败，且配置回滚失败: " + rollbackErr.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "沙箱网络热更新失败，配置已回滚: " + err.Error(),
+			})
+			return
+		}
+	}
+
+	// 直到磁盘与 runtime 都成功后，才提交内存配置
+	*s.cfg = nextCfg
 	writeJSON(w, http.StatusOK, map[string]string{"message": "配置已更新（LLM 配置请使用 PUT /api/v1/config/llm）"})
 }
 
