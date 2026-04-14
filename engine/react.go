@@ -111,6 +111,40 @@ func (p *modelOverrideProvider) CountTokens(messages []llm.Message) (int, error)
 	return p.inner.CountTokens(messages)
 }
 
+// GenerateImage 转发图片生成请求到内层 Provider。
+// 如果内层 Provider 未实现 ImageProvider 接口，返回明确错误。
+func (p *modelOverrideProvider) GenerateImage(ctx context.Context, req llm.ImageRequest) (*llm.ImageResponse, error) {
+	imgProvider, ok := p.inner.(llm.ImageProvider)
+	if !ok {
+		return nil, fmt.Errorf("provider %s 不支持图片生成", p.inner.Name())
+	}
+	if req.Model == "" {
+		req.Model = p.model
+	}
+	return imgProvider.GenerateImage(ctx, req)
+}
+
+// CreateVideoTask 转发视频生成任务到内层 Provider。
+func (p *modelOverrideProvider) CreateVideoTask(ctx context.Context, req llm.VideoRequest) (*llm.VideoTask, error) {
+	vidProvider, ok := p.inner.(llm.VideoProvider)
+	if !ok {
+		return nil, fmt.Errorf("provider %s 不支持视频生成", p.inner.Name())
+	}
+	if req.Model == "" {
+		req.Model = p.model
+	}
+	return vidProvider.CreateVideoTask(ctx, req)
+}
+
+// QueryVideoTask 转发视频任务查询到内层 Provider。
+func (p *modelOverrideProvider) QueryVideoTask(ctx context.Context, taskID string) (*llm.VideoTask, error) {
+	vidProvider, ok := p.inner.(llm.VideoProvider)
+	if !ok {
+		return nil, fmt.Errorf("provider %s 不支持视频生成", p.inner.Name())
+	}
+	return vidProvider.QueryVideoTask(ctx, taskID)
+}
+
 type llmSelection struct {
 	provider         hexagon.Provider
 	providerName     string
@@ -940,6 +974,80 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	selection, err := e.resolveLLMSelection(ctx, msg)
 	if err != nil {
 		return nil, fmt.Errorf("llm 路由失败: %w", err)
+	}
+
+	// 2.5 图片生成拦截 → ImageProvider 接口生成 + 下载内嵌 data URI
+	if isImageGeneration(selection.modelName, msg.Metadata) {
+		trace.L(ctx).Info("检测到图片生成请求", "model", selection.modelName, "provider", selection.providerName, "session", sess.ID)
+		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
+			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
+		}
+		goroutineLaunched = true
+		ch := make(chan *adapter.ReplyChunk, 2)
+		go func() {
+			defer close(ch)
+			if sessionUnlock != nil {
+				defer sessionUnlock()
+			}
+			results, imgErr := generateImage(ctx, selection.provider, selection.modelName, msg.Content)
+			if imgErr != nil {
+				ch <- &adapter.ReplyChunk{Error: fmt.Errorf("图片生成失败: %w", imgErr), Done: true}
+				return
+			}
+			content := formatImageMarkdown(results)
+			assistantMessageID := ""
+			if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, content, "", messageRequestID(msg)); err != nil {
+				trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
+			} else {
+				assistantMessageID = record.ID
+			}
+			metadata := withAssistantMessageID(map[string]string{
+				"provider": selection.providerName,
+				"model":    selection.modelName,
+				"source":   "image_generation",
+			}, assistantMessageID)
+			if len(results) > 0 && results[0].RevisedPrompt != "" {
+				metadata["revised_prompt"] = results[0].RevisedPrompt
+			}
+			ch <- &adapter.ReplyChunk{Content: content, Done: true, Metadata: metadata}
+		}()
+		return ch, nil
+	}
+
+	// 2.6 视频生成拦截 → VideoProvider 异步任务 + 轮询 + 封面内嵌
+	if isVideoGeneration(selection.modelName, msg.Metadata) {
+		trace.L(ctx).Info("检测到视频生成请求", "model", selection.modelName, "provider", selection.providerName, "session", sess.ID)
+		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
+			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
+		}
+		goroutineLaunched = true
+		ch := make(chan *adapter.ReplyChunk, 2)
+		go func() {
+			defer close(ch)
+			if sessionUnlock != nil {
+				defer sessionUnlock()
+			}
+			videoURL, coverDataURI, vidErr := generateVideo(ctx, selection.provider, selection.modelName, msg.Content)
+			if vidErr != nil {
+				ch <- &adapter.ReplyChunk{Error: fmt.Errorf("视频生成失败: %w", vidErr), Done: true}
+				return
+			}
+			content := formatVideoMarkdown(videoURL, coverDataURI)
+			assistantMessageID := ""
+			if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, content, "", messageRequestID(msg)); err != nil {
+				trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
+			} else {
+				assistantMessageID = record.ID
+			}
+			metadata := withAssistantMessageID(map[string]string{
+				"provider":  selection.providerName,
+				"model":     selection.modelName,
+				"source":    "video_generation",
+				"video_url": videoURL,
+			}, assistantMessageID)
+			ch <- &adapter.ReplyChunk{Content: content, Done: true, Metadata: metadata}
+		}()
+		return ch, nil
 	}
 
 	// 3. 语义缓存命中 → 单 chunk 返回
@@ -2277,7 +2385,6 @@ func cloneStringMap(m map[string]string) map[string]string {
 	}
 	return clone
 }
-
 
 // isLocalProvider 判断 provider 是否为本地模型
 func isLocalProvider(providerName string) bool {

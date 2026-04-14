@@ -43,6 +43,68 @@ const (
 	maxListLimit     = 200
 )
 
+// entryBlock 表示文件中一条记忆条目的行范围。
+//
+// 一条条目以 "- [HH:MM]" 开头，后续不以此模式开头的非空行属于同一条目。
+// startLine 和 endLine 为文件行号（含 startLine，不含 endLine）。
+type entryBlock struct {
+	startLine int    // 起始行号（含）
+	endLine   int    // 结束行号（不含）
+	text      string // 完整文本（多行拼接，含首行前缀）
+}
+
+// splitEntryBlocks 将文件按记忆条目分块。
+//
+// 规则：以 "- [HH:MM]" 开头的行是新条目的开始，
+// 后续行如果不匹配此模式则属于上一条目。
+// 兼容旧格式：不以 "- [" 开头的独立行视为独立条目。
+func splitEntryBlocks(raw string) []entryBlock {
+	lines := strings.Split(raw, "\n")
+	var blocks []entryBlock
+	var current *entryBlock
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if isEntryHeader(trimmed) {
+			// 关闭上一个块
+			if current != nil {
+				current.endLine = i
+				blocks = append(blocks, *current)
+			}
+			current = &entryBlock{startLine: i, text: trimmed}
+		} else if current != nil {
+			// 续行：追加到当前块
+			current.text += "\n" + trimmed
+		} else {
+			// 不以 "- [HH:MM]" 开头的独立行（兼容旧格式）
+			blocks = append(blocks, entryBlock{startLine: i, endLine: i + 1, text: trimmed})
+		}
+	}
+	if current != nil {
+		current.endLine = len(lines)
+		blocks = append(blocks, *current)
+	}
+	return blocks
+}
+
+// isEntryHeader 判断一行是否为条目起始（以 "- [HH:MM]" 开头）
+func isEntryHeader(line string) bool {
+	if !strings.HasPrefix(line, "- [") {
+		return false
+	}
+	// 匹配 "- [H:MM]" 或 "- [HH:MM]"
+	rest := line[3:] // 去掉 "- ["
+	idx := strings.Index(rest, "]")
+	if idx < 0 || idx > 5 {
+		return false
+	}
+	ts := rest[:idx]
+	return strings.Contains(ts, ":")
+}
+
 // Options 记忆配置选项
 type Options struct {
 	Enabled   bool   `yaml:"enabled"`    // 是否启用文件记忆
@@ -711,17 +773,12 @@ func (fm *FileMemory) parseEntriesFromFileUnlocked(dir, filename, status, idPref
 		defaultDate = info.ModTime().Format("2006-01-02")
 	}
 
-	lines := strings.Split(raw, "\n")
+	blocks := splitEntryBlocks(raw)
 	var entries []MemoryEntry
 
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
+	for _, block := range blocks {
 		e := MemoryEntry{
-			ID:        fmt.Sprintf("%s-%d", idPrefix, i),
+			ID:        fmt.Sprintf("%s-%d", idPrefix, block.startLine),
 			Type:      "fact",
 			Source:    "manual",
 			CreatedAt: defaultDate + "T00:00:00Z",
@@ -732,6 +789,8 @@ func (fm *FileMemory) parseEntriesFromFileUnlocked(dir, filename, status, idPref
 			e.ArchivedAt = e.UpdatedAt
 		}
 
+		// 解析首行前缀：- [HH:MM] [type:source] content
+		line := block.text
 		if strings.HasPrefix(line, "- ") {
 			line = line[2:]
 		}
@@ -768,11 +827,34 @@ func (fm *FileMemory) moveEntryLine(dir, fromFile, toFile string, lineIdx int) e
 	return fm.moveEntryLineUnlocked(dir, fromFile, toFile, lineIdx)
 }
 
-// moveEntryLineUnlocked 将一行从 fromFile 移动到 toFile（调用方已持有写锁）。
+// findBlockByStartLine 在文件内容中找到以 startLine 开头的条目块。
+// 返回块的起止行号。未找到时返回 -1, -1。
+func findBlockByStartLine(raw string, startLine int) (blockStart, blockEnd int) {
+	for _, b := range splitEntryBlocks(raw) {
+		if b.startLine == startLine {
+			return b.startLine, b.endLine
+		}
+	}
+	return -1, -1
+}
+
+// removeLineRange 从 lines 切片中删除 [start, end) 范围的行
+func removeLineRange(lines []string, start, end int) []string {
+	return append(lines[:start], lines[end:]...)
+}
+
+// extractLineRange 从 lines 切片中提取 [start, end) 范围的行并拼接
+func extractLineRange(lines []string, start, end int) string {
+	return strings.Join(lines[start:end], "\n")
+}
+
+// moveEntryLineUnlocked 将一条记忆从 fromFile 移动到 toFile（调用方已持有写锁）。
 //
-// Fix 1: 使用 write-to-temp-then-rename 模式保证原子性：
-//  1. 先将目标文件（含新行）写到临时文件，rename 到目标路径（原子）
-//  2. 再更新源文件（删除该行）
+// 支持多行条目：根据 startLine 找到完整的条目块，整块移动。
+//
+// 使用 write-to-temp-then-rename 模式保证原子性：
+//  1. 先将目标文件（含新条目）写到临时文件，rename 到目标路径（原子）
+//  2. 再更新源文件（删除该条目）
 //
 // 如果步骤 2 失败，条目同时存在于两个文件中（重复优于丢失）。
 func (fm *FileMemory) moveEntryLineUnlocked(dir, fromFile, toFile string, lineIdx int) error {
@@ -781,13 +863,16 @@ func (fm *FileMemory) moveEntryLineUnlocked(dir, fromFile, toFile string, lineId
 	if err != nil {
 		return fmt.Errorf("读取记忆文件失败: %w", err)
 	}
-	lines := strings.Split(string(raw), "\n")
-	if lineIdx < 0 || lineIdx >= len(lines) {
+	rawStr := string(raw)
+	lines := strings.Split(rawStr, "\n")
+
+	blockStart, blockEnd := findBlockByStartLine(rawStr, lineIdx)
+	if blockStart < 0 {
 		return fmt.Errorf("记忆条目不存在")
 	}
 
-	line := lines[lineIdx]
-	if strings.TrimSpace(line) == "" {
+	entryText := extractLineRange(lines, blockStart, blockEnd)
+	if strings.TrimSpace(entryText) == "" {
 		return fmt.Errorf("记忆条目不存在")
 	}
 
@@ -795,10 +880,10 @@ func (fm *FileMemory) moveEntryLineUnlocked(dir, fromFile, toFile string, lineId
 		return fmt.Errorf("创建记忆目录失败: %w", err)
 	}
 
-	// Step 1: 将目标文件内容 + 新行写到临时文件，然后 rename（原子操作）
+	// Step 1: 将目标文件内容 + 新条目写到临时文件，然后 rename（原子操作）
 	toPath := filepath.Join(dir, toFile)
-	existingDest, _ := os.ReadFile(toPath) // 可能不存在，忽略错误
-	newDest := string(existingDest) + strings.TrimRight(line, "\n") + "\n"
+	existingDest, _ := os.ReadFile(toPath)
+	newDest := string(existingDest) + strings.TrimRight(entryText, "\n") + "\n"
 
 	tmpPath := toPath + ".tmp"
 	if err := os.WriteFile(tmpPath, []byte(newDest), 0644); err != nil {
@@ -809,9 +894,8 @@ func (fm *FileMemory) moveEntryLineUnlocked(dir, fromFile, toFile string, lineId
 		return fmt.Errorf("原子替换目标文件失败: %w", err)
 	}
 
-	// Step 2: 更新源文件（删除该行）
-	// 如果此步失败，条目存在于两个文件中（重复优于丢失）
-	lines = append(lines[:lineIdx], lines[lineIdx+1:]...)
+	// Step 2: 更新源文件（删除该条目的所有行）
+	lines = removeLineRange(lines, blockStart, blockEnd)
 	if err := os.WriteFile(fromPath, []byte(strings.Join(lines, "\n")), 0644); err != nil {
 		return fmt.Errorf("更新记忆文件失败: %w", err)
 	}
@@ -820,8 +904,8 @@ func (fm *FileMemory) moveEntryLineUnlocked(dir, fromFile, toFile string, lineId
 
 // UpdateEntry 更新指定 ID 的记忆条目内容
 //
-// Fix 4: 根据 ID 前缀确定正确的目录，而非总是使用 _global。
-// "r-" 前缀的条目需要搜索角色目录。
+// 支持多行条目：保留首行的时间戳和元数据前缀，替换内容部分。
+// 新内容可以包含换行（多行记忆）。
 func (fm *FileMemory) UpdateEntry(id, content string) error {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
@@ -837,23 +921,28 @@ func (fm *FileMemory) UpdateEntry(id, content string) error {
 	if err != nil {
 		return fmt.Errorf("读取记忆文件失败: %w", err)
 	}
+	rawStr := string(raw)
+	lines := strings.Split(rawStr, "\n")
 
-	lines := strings.Split(string(raw), "\n")
-	if lineIdx < 0 || lineIdx >= len(lines) {
+	blockStart, blockEnd := findBlockByStartLine(rawStr, lineIdx)
+	if blockStart < 0 {
 		return fmt.Errorf("记忆条目不存在: %s", id)
 	}
 
-	// 保留原行的时间戳和元数据前缀，只替换内容
-	oldLine := strings.TrimSpace(lines[lineIdx])
-	newLine := rebuildEntryLine(oldLine, strings.TrimSpace(content))
-	lines[lineIdx] = newLine
+	// 保留首行的时间戳和元数据前缀，替换内容部分
+	oldFirstLine := strings.TrimSpace(lines[blockStart])
+	newFirstLine := rebuildEntryLine(oldFirstLine, strings.TrimSpace(content))
 
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
+	// 用新内容替换整个块（新内容可能也是多行的）
+	newLines := append(lines[:blockStart], newFirstLine)
+	newLines = append(newLines, lines[blockEnd:]...)
+
+	return os.WriteFile(path, []byte(strings.Join(newLines, "\n")), 0644)
 }
 
 // DeleteEntry 删除指定 ID 的记忆条目
 //
-// Fix 4: 根据 ID 前缀确定正确的目录，而非总是使用 _global。
+// 支持多行条目：删除条目的所有行。
 func (fm *FileMemory) DeleteEntry(id string) error {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
@@ -869,14 +958,15 @@ func (fm *FileMemory) DeleteEntry(id string) error {
 	if err != nil {
 		return fmt.Errorf("读取记忆文件失败: %w", err)
 	}
+	rawStr := string(raw)
+	lines := strings.Split(rawStr, "\n")
 
-	lines := strings.Split(string(raw), "\n")
-	if lineIdx < 0 || lineIdx >= len(lines) {
+	blockStart, blockEnd := findBlockByStartLine(rawStr, lineIdx)
+	if blockStart < 0 {
 		return fmt.Errorf("记忆条目不存在: %s", id)
 	}
 
-	// 删除该行
-	lines = append(lines[:lineIdx], lines[lineIdx+1:]...)
+	lines = removeLineRange(lines, blockStart, blockEnd)
 
 	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
 }

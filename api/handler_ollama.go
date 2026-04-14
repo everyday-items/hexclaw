@@ -307,13 +307,20 @@ func (s *Server) handleOllamaPull(w http.ResponseWriter, r *http.Request) {
 
 	// 调用 Ollama pull API (POST /api/pull, 流式 JSON)
 	// 使用独立 context（不绑定前端 SSE 连接）：前端断开只停止推送进度，不中断 Ollama 下载。
-	pullCtx, pullCancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	// 超时设 4 小时（大模型如 DeepSeek 70B 在慢速网络可能需要数小时）。
+	pullCtx, pullCancel := context.WithTimeout(context.Background(), 4*time.Hour)
 	defer pullCancel()
 	pullBody, _ := json.Marshal(map[string]any{"name": req.Model, "stream": true})
 	pullReq, _ := http.NewRequestWithContext(pullCtx, "POST", "http://localhost:11434/api/pull", bytes.NewReader(pullBody))
 	pullReq.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Minute} // 大模型下载可能很久
+	// 流式下载不设全局 Timeout（它会在 body 读取阶段触发超时）。
+	// 仅用 ResponseHeaderTimeout 控制等待首个响应头的时间。
+	client := &http.Client{
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: 30 * time.Second,
+		},
+	}
 	pullResp, err := client.Do(pullReq)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("Ollama 连接失败: %v", err)})

@@ -9,13 +9,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/util/logger"
 
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
@@ -503,20 +505,16 @@ func (a *FeishuAdapter) patchMessage(ctx context.Context, messageID, text string
 	return nil
 }
 
-// thinkingEmojiTypes 飞书 Reaction API 支持的表情类型（表示正在思考/处理）
+// thinkingEmojiTypes 飞书 Reaction API 表示 AI 正在处理的表情
 // 飞书官方 emoji_type 列表：https://open.feishu.cn/document/server-docs/im-v1/message-reaction/emojis-introduce
 var thinkingEmojiTypes = []string{
-	"MUSCLE",      // 💪 努力处理中
-	"COFFEE",      // ☕ 正在酝酿
-	"FIRE",        // 🔥 马上来
-	"FIST",        // ✊ 收到，处理中
-	"THUMBSUP",    // 👍 问得好（保留少量出现）
-	"CLAP",        // 👏 好问题
+	"Typing",   // ⌨️ 正在输入
+	"THINKING", // 🤔 思考中
 }
 
 // randomThinkingEmojiType 随机返回一个飞书 Reaction emoji_type
 func randomThinkingEmojiType() string {
-	return thinkingEmojiTypes[time.Now().UnixNano()%int64(len(thinkingEmojiTypes))]
+	return thinkingEmojiTypes[rand.IntN(len(thinkingEmojiTypes))]
 }
 
 // addReaction 给消息添加表情回应，返回 reaction_id 用于后续回收

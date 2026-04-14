@@ -281,6 +281,14 @@ func (r *Selector) ProviderModel(name string) string {
 	return ""
 }
 
+// ProviderConfig 返回指定 Provider 的配置（BaseURL、APIKey 等）。
+func (r *Selector) ProviderConfig(name string) (config.LLMProviderConfig, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	pc, ok := r.cfg.Providers[name]
+	return pc, ok
+}
+
 // selectByPriority 根据优先级映射选择最优的已注册 Provider
 //
 // 遍历所有已加载的 Provider，按照优先级映射中的数值排序，返回优先级最高（数值最小）的 Provider 名称。
