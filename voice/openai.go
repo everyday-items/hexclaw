@@ -8,8 +8,37 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"regexp"
+	"strings"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/net/httpx"
 )
+
+// 脱敏正则：URL / 文件路径 / API Key 片段
+var sanitizePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`https?://[^\s"]+`),                   // URL
+	regexp.MustCompile(`/[A-Za-z0-9_\-./]*\.go:\d+`),         // Go 源码位置
+	regexp.MustCompile(`sk-[A-Za-z0-9_\-]{20,}`),             // OpenAI key
+	regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9_\-\.]{10,}`), // Bearer token
+	regexp.MustCompile(`(?i)"api[_-]?key"\s*:\s*"[^"]+"`),    // JSON api_key
+}
+
+// sanitizeUpstreamError 脱敏上游 error body，防泄漏内部 URL / stack trace / API Key。
+// 保留上游业务错误消息，让用户仍可读到"余额不足"/"模型不存在"等有用信息。
+func sanitizeUpstreamError(body []byte) string {
+	s := strings.TrimSpace(string(body))
+	if s == "" {
+		return "(empty)"
+	}
+	if len(s) > 2048 {
+		s = s[:2048] + "...(truncated)"
+	}
+	for _, re := range sanitizePatterns {
+		s = re.ReplaceAllString(s, "[redacted]")
+	}
+	return s
+}
 
 // OpenAISTT OpenAI Whisper 语音转文本 Provider
 //
@@ -62,7 +91,7 @@ func NewOpenAISTT(apiKey, model string, opts ...STTOption) *OpenAISTT {
 		apiKey:  apiKey,
 		model:   model,
 		baseURL: "https://api.openai.com/v1",
-		client:  &http.Client{Timeout: 60 * time.Second},
+		client:  httpx.RawClient(httpx.WithRawTimeout(60 * time.Second)),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -153,10 +182,10 @@ func (s *OpenAISTT) Transcribe(ctx context.Context, audio []byte, opts Transcrib
 	}
 	defer resp.Body.Close()
 
-	// 检查响应状态码
+	// 检查响应状态码（限 64KB 错误体，脱敏内部 URL / stack trace）
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("stt API 返回 %d: %s", resp.StatusCode, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return nil, fmt.Errorf("stt API 返回 %d: %s", resp.StatusCode, sanitizeUpstreamError(body))
 	}
 
 	// 解析响应
@@ -231,7 +260,7 @@ func NewOpenAITTS(apiKey, model string, opts ...TTSOption) *OpenAITTS {
 		apiKey:  apiKey,
 		model:   model,
 		baseURL: "https://api.openai.com/v1",
-		client:  &http.Client{Timeout: 60 * time.Second},
+		client:  httpx.RawClient(httpx.WithRawTimeout(60 * time.Second)),
 	}
 	for _, opt := range opts {
 		opt(t)
@@ -315,10 +344,10 @@ func (t *OpenAITTS) Synthesize(ctx context.Context, text string, opts Synthesize
 	}
 	defer resp.Body.Close()
 
-	// 检查响应状态码
+	// 检查响应状态码（限 64KB 错误体，脱敏）
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("tts API 返回 %d: %s", resp.StatusCode, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return nil, fmt.Errorf("tts API 返回 %d: %s", resp.StatusCode, sanitizeUpstreamError(body))
 	}
 
 	// 读取音频数据（50MB 限制）

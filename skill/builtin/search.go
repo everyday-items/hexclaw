@@ -11,6 +11,7 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/skill"
+	"github.com/hexagon-codes/toolkit/net/httpx"
 )
 
 // SearchSkill 网络搜索 Skill
@@ -24,7 +25,7 @@ type SearchSkill struct {
 // NewSearchSkill 创建搜索 Skill
 func NewSearchSkill() *SearchSkill {
 	return &SearchSkill{
-		client: &http.Client{Timeout: 10 * time.Second},
+		client: httpx.RawClient(httpx.WithRawTimeout(10 * time.Second)),
 	}
 }
 

@@ -4,10 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/net/httpx"
 )
 
 // McpServerMeta MCP 服务器元数据
@@ -42,14 +43,15 @@ func NewMcpHub(repoURL string) *McpHub {
 
 // Refresh 从远程刷新 MCP 服务器列表
 func (h *McpHub) Refresh() error {
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := httpx.RawClient(httpx.WithRawTimeout(15 * time.Second))
 	resp, err := client.Get(h.repoURL)
 	if err != nil {
 		return fmt.Errorf("fetch mcp registry: %w", err)
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	// 限 10MB 防恶意上游返回巨大响应导致 OOM（MCP registry 正常 << 1MB）
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
 		return fmt.Errorf("read mcp registry: %w", err)
 	}

@@ -13,9 +13,6 @@ package dingtalk
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"github.com/hexagon-codes/toolkit/util/logger"
@@ -29,6 +26,8 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	sign_ "github.com/hexagon-codes/toolkit/crypto/sign"
+	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -54,7 +53,7 @@ type DingtalkAdapter struct {
 func New(cfg config.DingtalkConfig) *DingtalkAdapter {
 	a := &DingtalkAdapter{
 		cfg:    cfg,
-		client: &http.Client{Timeout: 10 * time.Second},
+		client: httpx.RawClient(httpx.WithRawTimeout(10 * time.Second)),
 	}
 	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformDingtalk, a.sendReplyNow)
 	return a
@@ -477,15 +476,13 @@ func (a *DingtalkAdapter) getAccessToken(ctx context.Context) (string, error) {
 }
 
 // verifySign 验证钉钉签名（用于向后兼容 Webhook 模式）
+// v0.3.12 C2：复用 toolkit/crypto/sign 的常量时间比较实现
 func (a *DingtalkAdapter) verifySign(timestamp, sign string) bool {
 	if timestamp == "" || sign == "" {
 		return false
 	}
 	stringToSign := timestamp + "\n" + a.cfg.AppSecret
-	h := hmac.New(sha256.New, []byte(a.cfg.AppSecret))
-	h.Write([]byte(stringToSign))
-	expected := base64.StdEncoding.EncodeToString(h.Sum(nil))
-	return hmac.Equal([]byte(expected), []byte(sign))
+	return sign_.VerifyHMACSHA256Base64([]byte(stringToSign), []byte(a.cfg.AppSecret), sign)
 }
 
 // Health 返回适配器健康状态。

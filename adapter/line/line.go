@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/toolkit/net/httpx"
 )
 
 // LineAdapter LINE Messaging API 适配器
@@ -52,7 +53,7 @@ func New(cfg Config) *LineAdapter {
 	}
 	a := &LineAdapter{
 		config: cfg,
-		client: &http.Client{Timeout: 30 * time.Second},
+		client: httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
 	}
 	a.queue = adapter.NewPlatformSendQueue(PlatformLINE, a.sendReplyNow)
 	return a

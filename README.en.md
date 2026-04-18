@@ -539,14 +539,14 @@ golangci-lint run
 | Component | Technology |
 |-----------|-----------|
 | Language | Go 1.25+ |
-| Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.4.5 |
-| AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.1.1 |
-| Utility Library | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.5 |
+| Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.4.6 |
+| AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.1.2 |
+| Utility Library | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.6 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | Configuration | YAML + environment variables |
 | Storage | SQLite (modernc.org/sqlite) |
 | WebSocket | nhooyr.io/websocket + gorilla/websocket |
-| MCP | modelcontextprotocol/go-sdk v1.4.1 |
+| MCP | modelcontextprotocol/go-sdk v1.5.0 |
 | Security | Hexagon Guard Chain |
 
 ## Contributing
@@ -583,9 +583,9 @@ chore: build/toolchain updates
 
 | Project | Description | Repository |
 |---------|-------------|------------|
-| **Hexagon** | Go AI Agent framework (core engine) v0.4.5 | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI core library (LLM/Tool/Memory) v0.1.1 | [ai-core](https://github.com/hexagon-codes/ai-core) |
-| **toolkit** | Go utility library v0.0.5 | [toolkit](https://github.com/hexagon-codes/toolkit) |
+| **Hexagon** | Go AI Agent framework (core engine) v0.4.6 | [hexagon](https://github.com/hexagon-codes/hexagon) |
+| **ai-core** | AI core library (LLM/Tool/Memory) v0.1.2 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **toolkit** | Go utility library v0.0.6 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI dashboard (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
 | **hexclaw-desktop** | HexClaw desktop client (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
 | **hexclaw-ui** | HexClaw web frontend (Vue 3) | [hexclaw-ui](https://github.com/hexagon-codes/hexclaw-ui) |

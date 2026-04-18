@@ -29,6 +29,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -51,7 +52,7 @@ type SlackAdapter struct {
 func New(cfg config.SlackConfig) *SlackAdapter {
 	a := &SlackAdapter{
 		cfg:    cfg,
-		client: &http.Client{Timeout: 30 * time.Second},
+		client: httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
 	}
 	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformSlack, a.sendReplyNow)
 	return a

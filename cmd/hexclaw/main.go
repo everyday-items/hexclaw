@@ -39,7 +39,9 @@ import (
 	"github.com/hexagon-codes/hexclaw/desktop"
 	"github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/hexclaw/gateway"
+	"github.com/hexagon-codes/hexclaw/genstore"
 	"github.com/hexagon-codes/hexclaw/heartbeat"
+	"github.com/hexagon-codes/hexclaw/imagegen"
 	"github.com/hexagon-codes/hexclaw/instances"
 	"github.com/hexagon-codes/hexclaw/knowledge"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
@@ -52,13 +54,15 @@ import (
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
 	sqlitestore "github.com/hexagon-codes/hexclaw/storage/sqlite"
 	"github.com/hexagon-codes/hexclaw/trace"
+	"github.com/hexagon-codes/hexclaw/videogen"
 	"github.com/hexagon-codes/hexclaw/voice"
+	"github.com/hexagon-codes/hexclaw/voicechat"
 	"github.com/hexagon-codes/hexclaw/webhook"
 )
 
 // 版本信息，通过 -ldflags 注入
 var (
-	version = "v0.3.11"
+	version = "v0.3.12"
 	commit  = "none"
 	date    = "unknown"
 )
@@ -237,7 +241,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 	fmt.Println("  ──────────────────────────────────────────────")
 
-	// 2. 初始化存储
+	// 2. 初始化存储（含健康检查）
+	checkDBHealth(cfg.Storage.SQLite.Path)
 	store, err := sqlitestore.New(cfg.Storage.SQLite.Path)
 	if err != nil {
 		return fmt.Errorf("初始化存储失败: %w", err)
@@ -575,8 +580,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	if memCtxLen > 0 {
 		lc.Info("memory", fmt.Sprintf("文件记忆已加载 (%d 字符) — 跨会话长期记忆", memCtxLen))
 	}
-	lc.Info("system", fmt.Sprintf("Web UI: http://%s:%d | Chat API: POST /api/v1/chat", cfg.Server.Host, cfg.Server.Port))
-	lc.Info("system", "🦀 HexClaw 已就绪 — 数据全在本地，横行无忧")
+	// Note: "已就绪" 日志迁移到 onReady 回调，仅在 HTTP 端口真实 bind 成功后才打印。
 
 	// 挂载预算控制器 API
 	srv.SetBudgetController(budgetCtrl)
@@ -853,13 +857,23 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		}
 
 		if cfg.Voice.TTS.Provider != "" {
-			llmName := extractLLMName(cfg.Voice.TTS.Provider)
-			if pc, ok := cfg.LLM.Providers[llmName]; ok && pc.APIKey != "" {
-				var ttsOpts []voice.TTSOption
-				if pc.BaseURL != "" {
-					ttsOpts = append(ttsOpts, voice.TTSWithBaseURL(pc.BaseURL))
+			// Edge TTS 免费、无需 API Key，优先识别
+			// （原代码只初始化 OpenAI TTS，edge-tts Provider 名被静默忽略 —— H5 修复）
+			if cfg.Voice.TTS.Provider == "edge-tts" || cfg.Voice.TTS.Provider == "edge" {
+				var edgeOpts []voice.EdgeTTSOption
+				if cfg.Voice.TTS.Voice != "" {
+					edgeOpts = append(edgeOpts, voice.EdgeTTSWithVoice(cfg.Voice.TTS.Voice))
 				}
-				tts = voice.NewOpenAITTS(pc.APIKey, "", ttsOpts...)
+				tts = voice.NewEdgeTTS(edgeOpts...)
+			} else {
+				llmName := extractLLMName(cfg.Voice.TTS.Provider)
+				if pc, ok := cfg.LLM.Providers[llmName]; ok && pc.APIKey != "" {
+					var ttsOpts []voice.TTSOption
+					if pc.BaseURL != "" {
+						ttsOpts = append(ttsOpts, voice.TTSWithBaseURL(pc.BaseURL))
+					}
+					tts = voice.NewOpenAITTS(pc.APIKey, "", ttsOpts...)
+				}
 			}
 		}
 
@@ -870,6 +884,104 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		fmt.Println("  ✗ Voice       未启用")
 	}
 
+	// 14.4 生成内容存储（图像/视频持久化）
+	// 与 SQLite 同目录，便于备份；位置 ~/.hexclaw/generated/
+	{
+		home, _ := os.UserHomeDir()
+		genStoreRoot := filepath.Join(home, ".hexclaw", "generated")
+		if gs, gErr := genstore.NewStore(genStoreRoot); gErr == nil {
+			srv.SetGenStore(gs)
+			fmt.Printf("  ✓ GenStore    %s\n", genStoreRoot)
+		} else {
+			fmt.Printf("  ✗ GenStore    初始化失败: %v\n", gErr)
+		}
+	}
+
+	// 14.5 初始化/热更新 image/video/voice chat 生成服务
+	//
+	// 从已配置的 LLM Provider 派生：任何带 API Key 的 provider 都可以参与生成能力。
+	// 用闭包封装以便 LLM 配置热更新后重建（用户通过 UI 补 API Key → 这里重新拉 cfg）。
+	// Provider map 的 key 是用户起的名字（可能是中文"智谱 AI"），不是 provider type，
+	// 硬编码 cfg.LLM.Providers["zhipu"] 永远查不到。按 BaseURL 特征识别：
+	findProviderByBaseURL := func(substrs ...string) (apiKey, baseURL string) {
+		for _, p := range cfg.LLM.Providers {
+			if p.APIKey == "" {
+				continue
+			}
+			lowered := strings.ToLower(p.BaseURL)
+			for _, s := range substrs {
+				if strings.Contains(lowered, s) {
+					return p.APIKey, p.BaseURL
+				}
+			}
+		}
+		return "", ""
+	}
+	reloadGenServices := func(verbose bool) (ig *imagegen.Service, vg *videogen.Service, vc *voicechat.Service) {
+		// Image gen: OpenAI DALL-E / 智谱 CogView
+		ip := map[string]imagegen.Provider{}
+		if k, b := findProviderByBaseURL("openai.com", "/v1"); k != "" && strings.Contains(strings.ToLower(b), "openai") {
+			ip["openai-dalle"] = imagegen.NewOpenAIDallE(k, b)
+		}
+		if k, b := findProviderByBaseURL("bigmodel.cn"); k != "" {
+			ip["zhipu-cogview"] = imagegen.NewZhipuCogView(k, b)
+		}
+		igDefault := ""
+		if _, ok := ip["openai-dalle"]; ok {
+			igDefault = "openai-dalle"
+		} else if _, ok := ip["zhipu-cogview"]; ok {
+			igDefault = "zhipu-cogview"
+		}
+		ig = imagegen.NewService(ip, igDefault)
+		srv.SetImageGen(ig)
+
+		// Video gen: 智谱 CogVideoX
+		vp := map[string]videogen.Provider{}
+		if k, b := findProviderByBaseURL("bigmodel.cn"); k != "" {
+			vp["zhipu-cogvideox"] = videogen.NewZhipuCogVideoX(k, b)
+		}
+		vgDefault := ""
+		if _, ok := vp["zhipu-cogvideox"]; ok {
+			vgDefault = "zhipu-cogvideox"
+		}
+		vg = videogen.NewService(vp, vgDefault)
+		srv.SetVideoGen(vg)
+
+		// Voice chat: OpenAI gpt-4o-audio
+		cp := map[string]voicechat.Provider{}
+		if k, b := findProviderByBaseURL("openai.com"); k != "" {
+			cp["openai-gpt4o-audio"] = voicechat.NewOpenAIVoiceChat(k, b)
+		}
+		vcDefault := ""
+		if _, ok := cp["openai-gpt4o-audio"]; ok {
+			vcDefault = "openai-gpt4o-audio"
+		}
+		vc = voicechat.NewService(cp, vcDefault)
+		srv.SetVoiceChat(vc)
+
+		if verbose {
+			if ig.HasProvider() {
+				fmt.Printf("  ✓ ImageGen    %d providers (%v)\n", len(ip), ig.Providers())
+			} else {
+				fmt.Println("  ✗ ImageGen    无可用 Provider（需要配置 OpenAI 或智谱 API Key）")
+			}
+			if vg.HasProvider() {
+				fmt.Printf("  ✓ VideoGen    %d providers (%v)\n", len(vp), vg.Providers())
+			} else {
+				fmt.Println("  ✗ VideoGen    无可用 Provider（需要配置智谱 API Key）")
+			}
+			if vc.HasProvider() {
+				fmt.Printf("  ✓ VoiceChat   %d providers (%v)\n", len(cp), vc.Providers())
+			} else {
+				fmt.Println("  ✗ VoiceChat   无可用 Provider（需要 OpenAI API Key + gpt-4o-audio-preview）")
+			}
+		}
+		return
+	}
+	imagegenSvc, videogenSvc, voiceChatSvc := reloadGenServices(true)
+	// 配置热更新时重建 gen services（读最新 cfg.LLM.Providers）
+	srv.SetGenServicesReloader(func() { reloadGenServices(false) })
+
 	// 15. 初始化桌面集成服务（Phase 6）
 	desktopSvc := desktop.NewService(version)
 	srv.SetDesktop(desktopSvc)
@@ -878,6 +990,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	_ = agentRouter
 	_ = canvasSvc
 	_ = voiceSvc
+	_ = imagegenSvc
+	_ = videogenSvc
+	_ = voiceChatSvc
 
 	messageHandler := func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
 		if err := gw.Check(ctx, msg); err != nil {
@@ -937,11 +1052,34 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	defer stop()
 
 	errCh := make(chan error, 1)
+	readyCh := make(chan struct{})
+	onReady := func() {
+		// 端口真实 bind 成功后才打印"已就绪"相关信息，历史 bug：先打印再 bind，
+		// 启动卡住时用户看日志以为已启动，实际 HTTP 从未监听。
+		lc.Info("system", fmt.Sprintf("Web UI: http://%s:%d | Chat API: POST /api/v1/chat", cfg.Server.Host, cfg.Server.Port))
+		lc.Info("system", "🦀 HexClaw 已就绪 — 数据全在本地，横行无忧")
+		close(readyCh)
+	}
 	go func() {
-		if err := srv.Start(sigCtx); err != nil && err != http.ErrServerClosed {
+		if err := srv.Start(sigCtx, onReady); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
 		close(errCh)
+	}()
+
+	// 启动 watchdog：30 秒内若 HTTP 未 bind 成功则主动退出，避免"进程在跑但端口死"的无响应状态
+	go func() {
+		const startupDeadline = 30 * time.Second
+		select {
+		case <-readyCh:
+			return
+		case <-time.After(startupDeadline):
+			logger.Error("启动超时：HTTP 服务未在 30 秒内 bind 端口，主动退出以便上层重启或诊断",
+				"host", cfg.Server.Host, "port", cfg.Server.Port)
+			os.Exit(1)
+		case <-sigCtx.Done():
+			return
+		}
 	}()
 
 	// 适配器列表

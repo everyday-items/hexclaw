@@ -64,6 +64,11 @@ func Load(configFile string) (*Config, error) {
 	// 展开路径中的 ~
 	expandTildePaths(cfg)
 
+	// 启动时校验（H6：精确到字段，家长可看懂错误；fail-fast 优于静默运行异常配置）
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("%s\n配置文件位置：%s", err, configFile)
+	}
+
 	return cfg, nil
 }
 

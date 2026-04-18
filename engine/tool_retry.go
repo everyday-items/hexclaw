@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"github.com/hexagon-codes/toolkit/util/logger"
-	"strings"
 	"time"
 
 	"github.com/hexagon-codes/toolkit/util/retry"
@@ -86,24 +85,24 @@ func (w *ToolRetryWrapper) Execute(
 	return result, nil
 }
 
-// isTransientError checks if an error is worth retrying.
+// isTransientError checks if an error is worth retrying at **tool execution** layer.
+//
+// 从 v0.3.12 起改用 ClassifyError 做精确分类（替代字符串 substring 匹配）。
+// tool 层策略：只对明确的瞬时错误重试，未知错误保守处理。
+//   - FailRateLimit / FailProviderDown → 重试（网络 / 上游抖动）
+//   - FailInvalidKey / FailModelNotFound / FailQuotaExceeded / FailContextTooLong → 不重试（重试无意义）
+//   - FailUnknown → 不重试（可能是工具逻辑错，盲目重试浪费时间）
+//
+// 若需要 LLM 层"未知也重试一次"策略，使用 HandleFailover + 单独的 LLM retry
+// wrapper，不在本函数里承担。
 func isTransientError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	transientPatterns := []string{
-		"timeout", "deadline exceeded",
-		"connection refused", "connection reset",
-		"429", "too many requests",
-		"503", "service unavailable",
-		"502", "bad gateway",
-		"temporary", "transient",
+	switch ClassifyError(err, 0, "") {
+	case FailRateLimit, FailProviderDown:
+		return true
+	default:
+		return false
 	}
-	for _, pattern := range transientPatterns {
-		if strings.Contains(msg, pattern) {
-			return true
-		}
-	}
-	return false
 }

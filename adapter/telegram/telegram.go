@@ -18,6 +18,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -37,7 +38,7 @@ type TelegramAdapter struct {
 func New(cfg config.TelegramConfig) *TelegramAdapter {
 	a := &TelegramAdapter{
 		cfg:    cfg,
-		client: &http.Client{Timeout: 40 * time.Second},
+		client: httpx.RawClient(httpx.WithRawTimeout(40 * time.Second)),
 	}
 	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformTelegram, a.sendMessageNow)
 	return a

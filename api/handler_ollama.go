@@ -12,6 +12,8 @@ import (
 	goruntime "runtime"
 	"strings"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/net/httpx"
 )
 
 // OllamaStatus Ollama 运行时状态 (14.15 本地 LLM 管理)
@@ -39,7 +41,7 @@ type OllamaModel struct {
 //
 //	detecting → not_installed / installed_not_running / running_not_associated / associated / updatable
 func (s *Server) handleOllamaStatus(w http.ResponseWriter, r *http.Request) {
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := httpx.RawClient(httpx.WithRawTimeout(3 * time.Second))
 
 	status := OllamaStatus{}
 
@@ -111,7 +113,7 @@ func (s *Server) handleOllamaStatus(w http.ResponseWriter, r *http.Request) {
 //
 // GET /api/v1/ollama/running
 func (s *Server) handleOllamaRunning(w http.ResponseWriter, r *http.Request) {
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := httpx.RawClient(httpx.WithRawTimeout(3 * time.Second))
 	resp, err := client.Get("http://localhost:11434/api/ps")
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("Ollama 连接失败: %v", err)})
@@ -172,7 +174,7 @@ func (s *Server) handleOllamaUnload(w http.ResponseWriter, r *http.Request) {
 	}
 	// keep_alive=0 让 Ollama 立即卸载模型
 	unloadBody, _ := json.Marshal(map[string]any{"model": req.Model, "keep_alive": 0})
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := httpx.RawClient(httpx.WithRawTimeout(10 * time.Second))
 	resp, err := client.Post("http://localhost:11434/api/generate", "application/json", bytes.NewReader(unloadBody))
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("卸载失败: %v", err)})
@@ -195,7 +197,7 @@ func (s *Server) handleOllamaLoad(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	loadBody, _ := json.Marshal(map[string]any{"model": req.Model, "prompt": "", "keep_alive": "5m"})
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := httpx.RawClient(httpx.WithRawTimeout(30 * time.Second))
 	resp, err := client.Post("http://localhost:11434/api/generate", "application/json", bytes.NewReader(loadBody))
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("预热失败: %v", err)})
@@ -218,7 +220,7 @@ func (s *Server) handleOllamaDelete(w http.ResponseWriter, r *http.Request) {
 	delBody, _ := json.Marshal(map[string]string{"name": name})
 	req2, _ := http.NewRequestWithContext(r.Context(), "DELETE", "http://localhost:11434/api/delete", bytes.NewReader(delBody))
 	req2.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := httpx.RawClient(httpx.WithRawTimeout(10 * time.Second))
 	resp, err := client.Do(req2)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("删除失败: %v", err)})
@@ -240,7 +242,7 @@ func (s *Server) handleOllamaDelete(w http.ResponseWriter, r *http.Request) {
 // Linux: systemctl restart ollama 或 ollama serve
 func (s *Server) handleOllamaRestart(w http.ResponseWriter, r *http.Request) {
 	// 先检测当前是否在运行
-	client := &http.Client{Timeout: 2 * time.Second}
+	client := httpx.RawClient(httpx.WithRawTimeout(2 * time.Second))
 	wasRunning := false
 	if resp, err := client.Get("http://localhost:11434/api/version"); err == nil {
 		resp.Body.Close()
@@ -316,11 +318,7 @@ func (s *Server) handleOllamaPull(w http.ResponseWriter, r *http.Request) {
 
 	// 流式下载不设全局 Timeout（它会在 body 读取阶段触发超时）。
 	// 仅用 ResponseHeaderTimeout 控制等待首个响应头的时间。
-	client := &http.Client{
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: 30 * time.Second,
-		},
-	}
+	client := httpx.RawClient(httpx.WithResponseHeaderTimeout(30 * time.Second))
 	pullResp, err := client.Do(pullReq)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("Ollama 连接失败: %v", err)})

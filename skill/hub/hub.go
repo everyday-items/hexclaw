@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/toolkit/net/httpx"
 	fileutil "github.com/hexagon-codes/toolkit/util/file"
 )
 
@@ -75,7 +76,7 @@ func New(cfg HubConfig, skillsDir string) *Hub {
 
 	return &Hub{
 		cfg:       cfg,
-		client:    &http.Client{Timeout: 30 * time.Second},
+		client:    httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
 		skillsDir: skillsDir,
 	}
 }

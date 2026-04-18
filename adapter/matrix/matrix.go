@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -55,7 +56,7 @@ func New(cfg Config) *MatrixAdapter {
 	}
 	a := &MatrixAdapter{
 		config: cfg,
-		client: &http.Client{Timeout: time.Duration(cfg.SyncTimeout+10) * time.Second},
+		client: httpx.RawClient(httpx.WithRawTimeout(time.Duration(cfg.SyncTimeout+10) * time.Second)),
 		stopCh: make(chan struct{}),
 	}
 	a.queue = adapter.NewPlatformSendQueue(PlatformMatrix, a.sendReplyNow)

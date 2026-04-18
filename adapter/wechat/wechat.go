@@ -32,6 +32,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -58,7 +59,7 @@ type WechatAdapter struct {
 func New(cfg config.WechatConfig) *WechatAdapter {
 	a := &WechatAdapter{
 		cfg:    cfg,
-		client: &http.Client{Timeout: 10 * time.Second},
+		client: httpx.RawClient(httpx.WithRawTimeout(10 * time.Second)),
 	}
 	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformWechat, a.sendReplyNow)
 	return a

@@ -15,14 +15,14 @@ import (
 
 // SharedAgent 共享 Agent 配置
 type SharedAgent struct {
-	ID          string                 `json:"id"`
-	Name        string                 `json:"name"`
-	Author      string                 `json:"author"`
-	Description string                 `json:"description"`
-	Downloads   int                    `json:"downloads"`
-	Visibility  string                 `json:"visibility"`
-	UpdatedAt   string                 `json:"updated_at"`
-	Config      map[string]interface{} `json:"config,omitempty"`
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Author      string         `json:"author"`
+	Description string         `json:"description"`
+	Downloads   int            `json:"downloads"`
+	Visibility  string         `json:"visibility"`
+	UpdatedAt   string         `json:"updated_at"`
+	Config      map[string]any `json:"config,omitempty"`
 }
 
 // TeamMember 团队成员

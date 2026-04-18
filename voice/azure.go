@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/net/httpx"
 )
 
 // AzureSTT Azure 语音转文本 Provider
@@ -36,7 +38,7 @@ func NewAzureSTT(subscriptionKey, region string, opts ...AzureSTTOption) *AzureS
 		subscriptionKey: subscriptionKey,
 		region:          region,
 		language:        "zh-CN",
-		client:          &http.Client{Timeout: 60 * time.Second},
+		client:          httpx.RawClient(httpx.WithRawTimeout(60 * time.Second)),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -149,7 +151,7 @@ func NewAzureTTS(subscriptionKey, region string, opts ...AzureTTSOption) *AzureT
 		subscriptionKey: subscriptionKey,
 		region:          region,
 		defaultVoice:    "zh-CN-XiaoxiaoNeural",
-		client:          &http.Client{Timeout: 60 * time.Second},
+		client:          httpx.RawClient(httpx.WithRawTimeout(60 * time.Second)),
 	}
 	for _, opt := range opts {
 		opt(t)

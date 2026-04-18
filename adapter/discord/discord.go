@@ -28,6 +28,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 
 	"github.com/gorilla/websocket"
@@ -62,7 +63,7 @@ type DiscordAdapter struct {
 func New(cfg config.DiscordConfig) *DiscordAdapter {
 	a := &DiscordAdapter{
 		cfg:         cfg,
-		client:      &http.Client{Timeout: 30 * time.Second},
+		client:      httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
 		heartbeatCh: make(chan struct{}),
 	}
 	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformDiscord, a.sendReplyNow)

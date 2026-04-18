@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/storage"
+	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
 // --- 会话管理 API ---
@@ -587,5 +589,170 @@ func (s *Server) handleListBranches(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"branches": branches,
 		"total":    len(branches),
+	})
+}
+
+// appendMessageRequest 前端构造的完整消息 — 用于图像/视频/语音对话生成模式下
+// 绕过 chat handler 直接写入消息历史。
+type appendMessageRequest struct {
+	ID               string          `json:"id,omitempty"`           // 前端生成的 ID；空则后端生成
+	Role             string          `json:"role"`                   // user / assistant
+	Content          string          `json:"content"`                // 主文本内容
+	ContentType      string          `json:"content_type,omitempty"` // text / multimodal_json
+	Metadata         json.RawMessage `json:"metadata,omitempty"`     // attachments / mode / model 等
+	ModelName        string          `json:"model_name,omitempty"`
+	PromptTokens     int             `json:"prompt_tokens,omitempty"`
+	CompletionTokens int             `json:"completion_tokens,omitempty"`
+	FinishReason     string          `json:"finish_reason,omitempty"`
+	ParentID         string          `json:"parent_id,omitempty"`
+	RequestID        string          `json:"request_id,omitempty"`
+}
+
+// handleAppendMessage POST /api/v1/sessions/{id}/messages
+//
+// 把前端构造的消息写入 SQLite。用于生成模式（image_gen / video_gen / voice_chat）
+// 直接落库，弥补 WebSocket chat 路径外的消息持久化缺口。
+//
+// 鉴权：复用 getOwnedSession 校验会话归属。
+// 幂等：若客户端 ID 已存在，SaveMessage 会 UPSERT（由 storage 层保证）。
+func (s *Server) handleAppendMessage(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "storage 未启用"})
+		return
+	}
+	sessionID := r.PathValue("id")
+	if _, err := s.getOwnedSession(r, sessionID, sessionUserIDFromRequest(r)); err != nil {
+		writeSessionLookupError(w, err)
+		return
+	}
+
+	const maxBody = 8 << 20 // 8MB — 足以容纳 metadata 里的 URL/路径引用，但拒绝塞大 base64
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+
+	var req appendMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
+		return
+	}
+	if req.Role != "user" && req.Role != "assistant" && req.Role != "system" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "role 必须是 user/assistant/system"})
+		return
+	}
+	if req.ContentType == "" {
+		if len(req.Metadata) > 0 {
+			req.ContentType = "multimodal_json"
+		} else {
+			req.ContentType = "text"
+		}
+	}
+
+	record := buildMessageRecord(sessionID, &req)
+	if err := s.store.SaveMessage(r.Context(), record); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":         record.ID,
+		"session_id": sessionID,
+	})
+}
+
+// buildMessageRecord 把前端请求规格化成存储记录，补齐默认字段。
+// 单/批量 handler 共用。
+func buildMessageRecord(sessionID string, req *appendMessageRequest) *storage.MessageRecord {
+	if req.ContentType == "" {
+		if len(req.Metadata) > 0 {
+			req.ContentType = "multimodal_json"
+		} else {
+			req.ContentType = "text"
+		}
+	}
+	id := strings.TrimSpace(req.ID)
+	if id == "" {
+		id = "msg-" + idgen.ShortID()
+	}
+	return &storage.MessageRecord{
+		ID:               id,
+		SessionID:        sessionID,
+		ParentID:         req.ParentID,
+		Role:             req.Role,
+		Content:          req.Content,
+		ContentType:      req.ContentType,
+		Metadata:         string(req.Metadata),
+		ModelName:        req.ModelName,
+		PromptTokens:     req.PromptTokens,
+		CompletionTokens: req.CompletionTokens,
+		FinishReason:     req.FinishReason,
+		RequestID:        req.RequestID,
+	}
+}
+
+// handleBatchAppendMessages POST /api/v1/sessions/{id}/messages/batch
+//
+// 批量写入多条消息，全部走同一事务 — 要么全部落库要么全部回滚，
+// 解决"user 写入成功后 assistant 写失败"导致的数据不一致。
+func (s *Server) handleBatchAppendMessages(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "storage 未启用"})
+		return
+	}
+	sessionID := r.PathValue("id")
+	if _, err := s.getOwnedSession(r, sessionID, sessionUserIDFromRequest(r)); err != nil {
+		writeSessionLookupError(w, err)
+		return
+	}
+
+	const maxBody = 16 << 20 // 16MB：批量最多 ~50 条消息（单条 metadata 可 ≤8MB）
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+
+	var req struct {
+		Messages []appendMessageRequest `json:"messages"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
+		return
+	}
+	if len(req.Messages) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "messages 不能为空"})
+		return
+	}
+	if len(req.Messages) > 50 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "单次批量最多 50 条"})
+		return
+	}
+	// 先校验所有 role（避免事务开启后再回滚）
+	for i := range req.Messages {
+		m := &req.Messages[i]
+		if m.Role != "user" && m.Role != "assistant" && m.Role != "system" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("messages[%d].role 必须是 user/assistant/system", i),
+			})
+			return
+		}
+	}
+
+	records := make([]*storage.MessageRecord, len(req.Messages))
+	ids := make([]string, len(req.Messages))
+	for i := range req.Messages {
+		records[i] = buildMessageRecord(sessionID, &req.Messages[i])
+		ids[i] = records[i].ID
+	}
+
+	// 单事务保证原子性
+	err := s.store.WithTx(r.Context(), func(tx storage.Store) error {
+		for _, rec := range records {
+			if err := tx.SaveMessage(r.Context(), rec); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "批量持久化失败: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"ids":        ids,
+		"session_id": sessionID,
 	})
 }

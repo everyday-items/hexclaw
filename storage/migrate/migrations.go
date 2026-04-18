@@ -233,6 +233,9 @@ CREATE TABLE IF NOT EXISTS agent_rules (
     created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_agent_rules_agent ON agent_rules(agent_name);
+-- 5 元组唯一约束：防 Sync 重复写入导致指数膨胀（历史 bug：373MB data.db 来源于此）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_rules_unique
+    ON agent_rules(platform, instance_id, user_id, chat_id, agent_name);
 
 -- ========== 平台实例 ==========
 CREATE TABLE IF NOT EXISTS platform_instances (
@@ -258,6 +261,43 @@ CREATE TABLE IF NOT EXISTS platform_events (
     PRIMARY KEY (instance_name, event_id)
 );
 CREATE INDEX IF NOT EXISTS idx_platform_events_created_at ON platform_events(created_at);
+`,
+	},
+	{
+		Version:     2,
+		Description: "v0.3.12 H8 全表 UNIQUE 约束审计：kb_documents / cron_jobs 防重复累积",
+		SQL: `
+-- ========== v0.3.12 H8：kb_documents 防同文件多次上传累积 ==========
+-- 场景：家长同一教材 PDF 重传一次 → 产生 2 条记录但 id 不同；未来 Sync 逻辑可能累积
+-- 策略：(source, title) 非空组合唯一；先 dedupe 历史重复
+-- tiebreak 用 rowid（deterministic，保留最早插入的那条），避免 created_at 毫秒级碰撞
+-- 导致多行同时匹配 MAX → UNIQUE INDEX 创建失败
+DELETE FROM kb_documents
+WHERE source != ''
+  AND rowid NOT IN (
+    SELECT MIN(rowid) FROM kb_documents
+    WHERE source != ''
+    GROUP BY source, title
+  );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_documents_unique
+    ON kb_documents(source, title) WHERE source != '';
+
+-- ========== v0.3.12 H8：cron_jobs 防同用户重复声明 ==========
+-- 场景：家长通过配置 + API 双写同名任务 → 重复触发
+-- 策略：(user_id, name) 唯一；同样用 MIN(rowid) 做 deterministic tiebreak
+-- NULL 保护：GROUP BY 对 NULL 的处理 SQLite 会把所有 NULL 归一组；
+-- 虽然 schema 里 user_id/name 都是 NOT NULL DEFAULT ''，历史数据不一定严格遵守，显式过滤
+DELETE FROM cron_jobs
+WHERE user_id IS NOT NULL AND name IS NOT NULL
+  AND rowid NOT IN (
+    SELECT MIN(rowid) FROM cron_jobs
+    WHERE user_id IS NOT NULL AND name IS NOT NULL
+    GROUP BY user_id, name
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_jobs_user_name
+    ON cron_jobs(user_id, name);
 `,
 	},
 }

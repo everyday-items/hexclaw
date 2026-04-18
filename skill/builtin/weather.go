@@ -12,6 +12,7 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/skill"
+	"github.com/hexagon-codes/toolkit/net/httpx"
 )
 
 // WeatherSkill 天气查询 Skill
@@ -23,7 +24,7 @@ type WeatherSkill struct {
 
 func NewWeatherSkill() *WeatherSkill {
 	return &WeatherSkill{
-		client: &http.Client{Timeout: 10 * time.Second},
+		client: httpx.RawClient(httpx.WithRawTimeout(10 * time.Second)),
 	}
 }
 
@@ -245,4 +246,3 @@ type wttrWeather struct {
 type wttrValue struct {
 	Value string `json:"value"`
 }
-

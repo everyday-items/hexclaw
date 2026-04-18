@@ -36,7 +36,9 @@ func NewSQLiteStore(db *sql.DB) *SQLiteStore {
 
 // Init 建表（幂等）
 func (s *SQLiteStore) Init(ctx context.Context) error {
-	stmts := []string{
+	// 顺序很关键：先创建基础表 → 去重历史数据 → 再创建 UNIQUE 索引
+	// 否则对已有重复数据的库升级时，UNIQUE 索引会因冲突创建失败
+	base := []string{
 		`CREATE TABLE IF NOT EXISTS agents (
 			name         TEXT PRIMARY KEY,
 			display_name TEXT NOT NULL DEFAULT '',
@@ -64,12 +66,19 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_rules_agent ON agent_rules(agent_name)`,
 	}
-	for _, stmt := range stmts {
+	for _, stmt := range base {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("init agent store: %w", err)
 		}
 	}
 	s.runMigrations(ctx)
+	// 必须在 UNIQUE 索引创建之前去重
+	s.dedupeAgentRules(ctx)
+	if _, err := s.db.ExecContext(ctx,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_rules_unique
+			ON agent_rules(platform, instance_id, user_id, chat_id, agent_name)`); err != nil {
+		return fmt.Errorf("create unique index: %w", err)
+	}
 	return nil
 }
 
@@ -83,6 +92,22 @@ func (s *SQLiteStore) runMigrations(ctx context.Context) {
 				logger.Warn("agent router migration warning", "warning", err, "stmt", stmt)
 			}
 		}
+	}
+	// dedupeAgentRules 的调用已移到 Init 中，保证时序：dedup 先于 UNIQUE 索引创建。
+}
+
+// dedupeAgentRules 清理历史遗留的重复路由规则（见 Fix #8 背景）
+// 使用 MIN(id) 保留最早一条，删除其余重复项。
+func (s *SQLiteStore) dedupeAgentRules(ctx context.Context) {
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM agent_rules
+		WHERE id NOT IN (
+			SELECT MIN(id) FROM agent_rules
+			GROUP BY platform, instance_id, user_id, chat_id, agent_name
+		)
+	`)
+	if err != nil {
+		logger.Warn("agent_rules dedup warning", "error", err)
 	}
 }
 
@@ -210,19 +235,34 @@ func (s *SQLiteStore) LoadRules(ctx context.Context) ([]Rule, error) {
 	return rules, rows.Err()
 }
 
-// SaveRule 插入规则，回写 rule.ID
+// SaveRule 插入或更新规则（upsert，基于 5 元组唯一约束），回写 rule.ID
+//
+// 使用 ON CONFLICT DO UPDATE 防御重复 INSERT：
+//   - 内存与 DB 通过 Sync 双向同步时，同一规则可能被重复写入
+//   - 历史 bug：每次启动 rules 数量指数翻倍（2^n），最终触发 DB 膨胀至 GB 级
+//
+// priority 更新采用"取最大值"策略，保护手动调整的优先级不被默认值覆盖。
 func (s *SQLiteStore) SaveRule(ctx context.Context, rule *Rule) error {
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO agent_rules (platform, instance_id, user_id, chat_id, agent_name, priority)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(platform, instance_id, user_id, chat_id, agent_name)
+		 DO UPDATE SET priority = MAX(priority, excluded.priority)`,
 		rule.Platform, rule.InstanceID, rule.UserID, rule.ChatID, rule.AgentName, rule.Priority,
 	)
 	if err != nil {
 		return err
 	}
-	id, _ := res.LastInsertId()
-	rule.ID = int(id)
-	return nil
+	if id, idErr := res.LastInsertId(); idErr == nil && id > 0 {
+		rule.ID = int(id)
+		return nil
+	}
+	// 冲突路径：LastInsertId 不可靠，回查 ID
+	return s.db.QueryRowContext(ctx,
+		`SELECT id FROM agent_rules
+		 WHERE platform=? AND instance_id=? AND user_id=? AND chat_id=? AND agent_name=?`,
+		rule.Platform, rule.InstanceID, rule.UserID, rule.ChatID, rule.AgentName,
+	).Scan(&rule.ID)
 }
 
 // DeleteRule 删除单条规则
@@ -245,6 +285,9 @@ func (s *SQLiteStore) DeleteRulesByAgent(ctx context.Context, agentName string) 
 }
 
 // Sync 将 Dispatcher 当前内存状态全量同步到 DB（用于从配置文件初始化）
+//
+// Rule 侧已通过 UNIQUE 约束 + ON CONFLICT 兜底重复写入；
+// 这里仍保留全量 upsert 语义以便 priority 或其他字段能被覆盖刷新。
 func Sync(ctx context.Context, store Store, d *Dispatcher) error {
 	agents := d.ListAgents()
 	for i := range agents {

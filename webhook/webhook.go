@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -256,13 +257,16 @@ func (m *Manager) Handler() http.HandlerFunc {
 		m.mu.RUnlock()
 
 		if handler != nil {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			// v0.3.12 H7：用 trace.Go 保留父 ctx 的 logger 链路（session_id / trace_id）
+			// + panic recover（防止 handler 崩了静默吞）。
+			// 父 ctx 来自 HTTP r.Context()；Detach 断开父取消但保留 Values。
+			trace.Go(r.Context(), "webhook.handle-"+name, func(ctx context.Context) {
+				ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 				defer cancel()
 				if err := handler(ctx, event, wh.Prompt); err != nil {
 					logger.Error("Webhook", "name", name, "处理事件失败", err)
 				}
-			}()
+			})
 		}
 
 		w.WriteHeader(http.StatusOK)

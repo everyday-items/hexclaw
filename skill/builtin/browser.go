@@ -14,6 +14,7 @@ import (
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/security"
 	"github.com/hexagon-codes/hexclaw/skill"
+	"github.com/hexagon-codes/toolkit/net/httpx"
 )
 
 // BrowserSkill 网页浏览技能
@@ -52,7 +53,7 @@ func NewBrowserSkill() *BrowserSkill {
 		},
 	}
 	return &BrowserSkill{
-		client: &http.Client{Timeout: 30 * time.Second, Transport: transport},
+		client: httpx.RawClient(httpx.WithRawTimeout(30*time.Second), httpx.WithRawTransport(transport)),
 	}
 }
 

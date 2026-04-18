@@ -89,14 +89,40 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("创建数据目录失败: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_pragma=foreign_keys(1)")
+	// modernc.org/sqlite 只认 _pragma=NAME(VALUE) 形式，原 DSN 的 _journal_mode=WAL / _busy_timeout=5000 是无效参数（历史 bug：
+	// WAL 从未生效，所以启动恢复时出现 data.db-journal 且主线程被 rollback 阻塞 4 分钟）。
+	dsn := dbPath +
+		"?_pragma=journal_mode(WAL)" +
+		"&_pragma=busy_timeout(5000)" +
+		"&_pragma=foreign_keys(1)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=wal_autocheckpoint(1000)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("打开数据库失败: %w", err)
 	}
 
-	// 确保外键约束对已有连接生效（连接池复用时 DSN pragma 可能不触发）
-	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
-		return nil, fmt.Errorf("启用外键约束失败: %w", err)
+	// 显式 PRAGMA 兜底：连接池每个物理连接都应走一次，以防 DSN pragma 在复用连接时不触发
+	for _, pragma := range []string{
+		"PRAGMA journal_mode = WAL",
+		"PRAGMA busy_timeout = 5000",
+		"PRAGMA foreign_keys = ON",
+		"PRAGMA synchronous = NORMAL",
+		"PRAGMA wal_autocheckpoint = 1000",
+	} {
+		if _, err := db.Exec(pragma); err != nil {
+			return nil, fmt.Errorf("%s 失败: %w", pragma, err)
+		}
+	}
+
+	// 验证 WAL 模式真实生效（防 DSN 语法变化导致静默失败）
+	var journalMode string
+	if err := db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		return nil, fmt.Errorf("查询 journal_mode 失败: %w", err)
+	}
+	if !strings.EqualFold(journalMode, "wal") && !strings.EqualFold(journalMode, "memory") {
+		// :memory: 数据库不支持 WAL，返回 memory 是正常的
+		return nil, fmt.Errorf("journal_mode 启用失败，当前为 %q（期望 wal）", journalMode)
 	}
 
 	// SQLite WAL 模式下允许多个并发读连接
@@ -221,12 +247,40 @@ func sessionInsertArgs(s *storage.Session) []any {
 	}
 }
 
+// 单字段大小限制（见 Fix #3 背景：本地推理 reasoning 动辄 5000+ 字，
+// AI 生成 HTML 模板单条 500KB+，历史 messages 最大单条达 500,002 字节）
+const (
+	maxMessageContentBytes  = 128 * 1024 // 128 KB：单条 content
+	maxMessageMetadataBytes = 64 * 1024  // 64 KB：metadata（含 reasoning）
+	truncationSuffix        = "\n\n…[truncated by hexclaw to protect DB size]"
+)
+
+// truncateLarge 按字节限制截断（UTF-8 安全：切到 valid boundary）
+func truncateLarge(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	// 回退到有效 UTF-8 边界（避免半个字符）
+	cut := limit - len(truncationSuffix)
+	if cut < 0 {
+		cut = 0
+	}
+	for cut > 0 && (s[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return s[:cut] + truncationSuffix
+}
+
 func messageInsertArgs(m *storage.MessageRecord) []any {
 	return []any{
-		m.ID, m.SessionID, m.ParentID, m.Role, m.Content,
-		m.ContentType, m.Metadata, m.Feedback,
+		m.ID, m.SessionID, m.ParentID, m.Role,
+		truncateLarge(m.Content, maxMessageContentBytes),
+		m.ContentType,
+		truncateLarge(m.Metadata, maxMessageMetadataBytes),
+		m.Feedback,
 		m.ModelName, m.PromptTokens, m.CompletionTokens,
-		m.FinishReason, m.LatencyMs, m.RequestID, m.Meta,
+		m.FinishReason, m.LatencyMs, m.RequestID,
+		truncateLarge(m.Meta, maxMessageMetadataBytes),
 		m.CreatedAt,
 	}
 }

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/toolkit/net/httpx"
 )
 
 // WhatsAppAdapter WhatsApp Business API 适配器
@@ -51,7 +52,7 @@ func New(cfg Config) *WhatsAppAdapter {
 	}
 	a := &WhatsAppAdapter{
 		config: cfg,
-		client: &http.Client{Timeout: 30 * time.Second},
+		client: httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
 	}
 	a.queue = adapter.NewPlatformSendQueue(PlatformWhatsApp, a.sendReplyNow)
 	return a

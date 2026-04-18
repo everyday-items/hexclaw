@@ -27,6 +27,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
+	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -55,10 +56,8 @@ type FeishuAdapter struct {
 // New 创建飞书适配器
 func New(cfg config.FeishuConfig) *FeishuAdapter {
 	a := &FeishuAdapter{
-		cfg: cfg,
-		client: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		cfg:    cfg,
+		client: httpx.RawClient(httpx.WithRawTimeout(10 * time.Second)),
 	}
 	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformFeishu, a.sendReplyNow)
 	return a
@@ -340,13 +339,14 @@ func (a *FeishuAdapter) sendReplyNow(ctx context.Context, chatID string, reply *
 // 收到第一段内容后创建消息，然后逐步更新内容，
 // 让用户实时看到 Agent 的输出（类似飞书"正在输入..."体验）。
 // 注：SendStream 接口无 messageID，无法使用 Reaction，直接流式输出。
+//
+// v0.3.12 H3：限流策略统一改用 adapter.StreamEditLimiter，支持连续 3 次失败自适应降级，
+// 替换原本硬编码的 50 字符 / 1 秒阈值。
 func (a *FeishuAdapter) SendStream(ctx context.Context, chatID string, chunks <-chan *adapter.ReplyChunk) error {
 	var contentMsgID string
 	var sb strings.Builder
-	lastUpdateLen := 0
-	lastUpdateTime := time.Now()
-	const updateThreshold = 50         // 最少积累 50 字符才更新
-	const updateInterval = time.Second // 最少间隔 1 秒才更新（防限流）
+	// 40 字符 + 1 秒默认，最大 5 秒降级（符合飞书 5 QPS 限流基线）
+	limiter := adapter.NewStreamEditLimiter()
 
 	for chunk := range chunks {
 		if chunk.Error != nil {
@@ -360,21 +360,30 @@ func (a *FeishuAdapter) SendStream(ctx context.Context, chatID string, chunks <-
 		}
 		sb.WriteString(chunk.Content)
 
-		// 收到第一段内容时创建消息
+		// 收到第一段内容时创建消息（v0.3.12 G4：修复错误忽略）
 		if contentMsgID == "" && sb.Len() > 0 {
-			contentMsgID, _ = a.sendAndGetID(ctx, chatID, sb.String()+"…")
-			lastUpdateLen = sb.Len()
-			lastUpdateTime = time.Now()
+			id, err := a.sendAndGetID(ctx, chatID, sb.String()+"…")
+			if err != nil || id == "" {
+				// 创建失败：记日志，不记为 Emitted（避免误 reset 降级计数），
+				// 下次 chunk 仍会重试创建
+				logger.Error("[feishu] 创建流式消息失败", "error", err)
+				continue
+			}
+			contentMsgID = id
+			limiter.Emitted(sb.Len())
 			continue
 		}
 
-		// 后续内容逐步更新消息（限流保护）
-		if contentMsgID != "" && sb.Len()-lastUpdateLen >= updateThreshold && time.Since(lastUpdateTime) >= updateInterval {
+		// 后续内容逐步更新消息（字符阈值 + 时间间隔 + 失败降级）
+		if contentMsgID != "" && limiter.ShouldEmit(sb.Len()) {
 			if pErr := a.patchMessage(ctx, contentMsgID, sb.String()+"…"); pErr != nil {
 				logger.Error("[feishu] 更新流式消息失败", "error", pErr)
+				if degraded := limiter.Failed(); degraded {
+					logger.Warn("[feishu] 流式限流降级", "delay", limiter.CurrentDelay())
+				}
+			} else {
+				limiter.Emitted(sb.Len())
 			}
-			lastUpdateLen = sb.Len()
-			lastUpdateTime = time.Now()
 		}
 	}
 

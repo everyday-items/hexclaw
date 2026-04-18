@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/net/httpx"
 )
 
 // EdgeTTS Microsoft Edge 免费 TTS Provider
@@ -30,7 +32,7 @@ func EdgeTTSWithVoice(voice string) EdgeTTSOption {
 func NewEdgeTTS(opts ...EdgeTTSOption) *EdgeTTS {
 	t := &EdgeTTS{
 		defaultVoice: "zh-CN-XiaoxiaoNeural",
-		client:       &http.Client{Timeout: 60 * time.Second},
+		client:       httpx.RawClient(httpx.WithRawTimeout(60 * time.Second)),
 	}
 	for _, opt := range opts {
 		opt(t)

@@ -42,6 +42,8 @@ import (
 	"github.com/hexagon-codes/hexclaw/desktop"
 	"github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/hexclaw/gateway"
+	"github.com/hexagon-codes/hexclaw/genstore"
+	"github.com/hexagon-codes/hexclaw/imagegen"
 	"github.com/hexagon-codes/hexclaw/instances"
 	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
 	"github.com/hexagon-codes/hexclaw/knowledge"
@@ -53,51 +55,58 @@ import (
 	"github.com/hexagon-codes/hexclaw/storage"
 	"github.com/hexagon-codes/hexclaw/streamstate"
 	"github.com/hexagon-codes/hexclaw/trace"
+	"github.com/hexagon-codes/hexclaw/videogen"
 	"github.com/hexagon-codes/hexclaw/voice"
+	"github.com/hexagon-codes/hexclaw/voicechat"
 	"github.com/hexagon-codes/hexclaw/webhook"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
 // Server HTTP API 服务器
 type Server struct {
-	cfg           *config.Config
-	engine        engine.Engine
-	gateway       gateway.Gateway
-	store         storage.Store                // 数据存储层
-	kb            *knowledge.Manager           // 知识库管理器（可选）
-	webhookMgr    *webhook.Manager             // Webhook 管理器（可选）
-	scheduler     *cron.Scheduler              // Cron 调度器（可选）
-	fileMem       *memory.FileMemory           // 文件记忆（可选）
-	vectorMem     *memory.VectorMemory         // 向量语义记忆（可选）
-	mcpMgr        *hexmcp.Manager              // MCP 管理器（可选）
-	mp            *marketplace.Marketplace     // 技能市场（可选）
-	skillHub      *hub.Hub                     // 在线技能市场（可选）
-	agentRouter   *router.Dispatcher           // 多 Agent 路由器（可选）
-	agentStore    router.Store                 // Agent/Rule 持久化（可选）
-	instanceMgr   *instances.Manager           // 平台实例运行时（可选）
-	canvasSvc     *canvas.Service              // Canvas/A2UI 服务（可选）
-	voiceSvc      *voice.Service               // 语音服务（可选）
-	desktopSvc    *desktop.Service             // 桌面集成服务（可选）
-	cfgWriter     *config.Writer               // 配置文件写入器（MCP 持久化用）
-	wsHandler     http.Handler                 // WebSocket Handler（可选）
-	streamStates  streamstate.Provider         // 流式 in-flight 状态（可选）
-	logCollector  *LogCollector                // 日志收集器
-	workflowStore *WorkflowStore               // 工作流存储
-	teamStore     *TeamStore                   // 团队数据存储
-	budgetCtrl    *engine.BudgetController     // 预算控制器（可选）
-	toolCache     *engine.ToolCache            // 工具缓存（可选）
-	toolMetrics   *engine.ToolMetricsCollector // 工具指标（可选）
-	toolPerms     *engine.ToolPermissions      // 工具权限（可选）
-	checkpointMgr *engine.CheckpointManager    // 检查点管理器（可选）
-	version       string                       // 版本号
+	cfg               *config.Config
+	engine            engine.Engine
+	gateway           gateway.Gateway
+	store             storage.Store                // 数据存储层
+	kb                *knowledge.Manager           // 知识库管理器（可选）
+	webhookMgr        *webhook.Manager             // Webhook 管理器（可选）
+	scheduler         *cron.Scheduler              // Cron 调度器（可选）
+	fileMem           *memory.FileMemory           // 文件记忆（可选）
+	vectorMem         *memory.VectorMemory         // 向量语义记忆（可选）
+	mcpMgr            *hexmcp.Manager              // MCP 管理器（可选）
+	mp                *marketplace.Marketplace     // 技能市场（可选）
+	skillHub          *hub.Hub                     // 在线技能市场（可选）
+	agentRouter       *router.Dispatcher           // 多 Agent 路由器（可选）
+	agentStore        router.Store                 // Agent/Rule 持久化（可选）
+	instanceMgr       *instances.Manager           // 平台实例运行时（可选）
+	canvasSvc         *canvas.Service              // Canvas/A2UI 服务（可选）
+	voiceSvc          *voice.Service               // 语音服务（可选）
+	voiceChatSvc      *voicechat.Service           // 语音对话服务（可选）
+	imagegenSvc       *imagegen.Service            // 图像生成服务（可选）
+	videogenSvc       *videogen.Service            // 视频生成服务（可选）
+	genStore          *genstore.Store              // 生成内容持久化（图像/视频）
+	reloadGenServices func()                       // LLM 配置变更后重建 gen 服务（main.go 注入）
+	desktopSvc        *desktop.Service             // 桌面集成服务（可选）
+	cfgWriter         *config.Writer               // 配置文件写入器（MCP 持久化用）
+	wsHandler         http.Handler                 // WebSocket Handler（可选）
+	streamStates      streamstate.Provider         // 流式 in-flight 状态（可选）
+	logCollector      *LogCollector                // 日志收集器
+	workflowStore     *WorkflowStore               // 工作流存储
+	teamStore         *TeamStore                   // 团队数据存储
+	budgetCtrl        *engine.BudgetController     // 预算控制器（可选）
+	toolCache         *engine.ToolCache            // 工具缓存（可选）
+	toolMetrics       *engine.ToolMetricsCollector // 工具指标（可选）
+	toolPerms         *engine.ToolPermissions      // 工具权限（可选）
+	checkpointMgr     *engine.CheckpointManager    // 检查点管理器（可选）
+	version           string                       // 版本号
 	// 沙箱网络热更新回调（由 main.go 注入）
 	onSandboxNetworkUpdate func(enabled bool) error
 	sandboxNetworkEnabled  func() bool
-	server        *http.Server
-	statsMu       sync.Mutex
-	statsCache    statsResponse
-	statsJSON     []byte
-	statsCacheAt  time.Time
+	server                 *http.Server
+	statsMu                sync.Mutex
+	statsCache             statsResponse
+	statsJSON              []byte
+	statsCacheAt           time.Time
 }
 
 // NewServer 创建 API 服务器
@@ -237,6 +246,97 @@ func (s *Server) SetVoice(svc *voice.Service) {
 	s.voiceSvc = svc
 }
 
+// SetImageGen 设置图像生成服务
+//
+// 设置后启用 /api/v1/images/* 端点。
+func (s *Server) SetImageGen(svc *imagegen.Service) {
+	s.imagegenSvc = svc
+}
+
+// SetVideoGen 设置视频生成服务
+//
+// 设置后启用 /api/v1/videos/* 端点（含异步轮询）。
+func (s *Server) SetVideoGen(svc *videogen.Service) {
+	s.videogenSvc = svc
+}
+
+// SetVoiceChat 设置语音对话服务
+//
+// 设置后启用 /api/v1/voicechat/* 端点。
+func (s *Server) SetVoiceChat(svc *voicechat.Service) {
+	s.voiceChatSvc = svc
+}
+
+// SetGenStore 设置生成内容存储。
+//
+// 注入后 image/video 生成结果会持久化到磁盘，并通过 /api/v1/files/generated/{path} 提供访问。
+func (s *Server) SetGenStore(st *genstore.Store) {
+	s.genStore = st
+}
+
+// SetGenServicesReloader 注册"LLM 配置变更后重建 image/video/voice chat 生成服务"的回调。
+//
+// 为什么：gen services 在启动时根据 cfg.LLM.Providers 里的 API Key 构建 provider。
+// 用户通过 UI 后补 API Key 后，LLM config 会热更新，但 gen services 仍是旧的（无 provider）。
+// 此回调让 handleUpdateLLMConfig 在配置保存 + LLM 引擎热更新后主动触发 gen services 重建。
+func (s *Server) SetGenServicesReloader(fn func()) {
+	s.reloadGenServices = fn
+}
+
+// handleGeneratedFile GET /api/v1/files/generated/{path...}
+//
+// 流式返回 genStore 中的文件。MIME 由扩展名推断。
+func (s *Server) handleGeneratedFile(w http.ResponseWriter, r *http.Request) {
+	if s.genStore == nil {
+		http.Error(w, "genstore disabled", http.StatusServiceUnavailable)
+		return
+	}
+	rel := r.PathValue("path")
+	if rel == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+	f, err := s.genStore.Open(rel)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	stat, err := f.Stat()
+	if err != nil {
+		http.Error(w, "stat failed", http.StatusInternalServerError)
+		return
+	}
+	// MIME 推断
+	ct := "application/octet-stream"
+	switch ext := strings.ToLower(filepath.Ext(rel)); ext {
+	case ".png":
+		ct = "image/png"
+	case ".jpg", ".jpeg":
+		ct = "image/jpeg"
+	case ".webp":
+		ct = "image/webp"
+	case ".gif":
+		ct = "image/gif"
+	case ".mp4":
+		ct = "video/mp4"
+	case ".webm":
+		ct = "video/webm"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	// ?download=1 或 ?download=<filename> → Content-Disposition: attachment 触发浏览器下载
+	// 用途：Tauri WKWebView 下 <a download> 和 blob URL 都不可靠，走 HTTP header 最稳
+	if dl := r.URL.Query().Get("download"); dl != "" {
+		name := dl
+		if name == "1" || name == "true" {
+			name = stat.Name()
+		}
+		w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	}
+	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
+}
+
 // SetSandboxCallbacks 注入沙箱网络热更新回调
 func (s *Server) SetSandboxCallbacks(updater func(bool) error, getter func() bool) {
 	s.onSandboxNetworkUpdate = updater
@@ -326,6 +426,8 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /api/v1/sessions/{id}/suggest-title", s.handleSuggestSessionTitle)
 		mux.HandleFunc("DELETE /api/v1/sessions/{id}", s.handleDeleteSession)
 		mux.HandleFunc("GET /api/v1/sessions/{id}/messages", s.handleListMessages)
+		mux.HandleFunc("POST /api/v1/sessions/{id}/messages", s.handleAppendMessage)
+		mux.HandleFunc("POST /api/v1/sessions/{id}/messages/batch", s.handleBatchAppendMessages)
 		mux.HandleFunc("GET /api/v1/sessions/{id}/branches", s.handleListBranches)
 		mux.HandleFunc("POST /api/v1/sessions/{id}/fork", s.handleForkSession)
 		mux.HandleFunc("GET /api/v1/messages/search", s.handleSearchMessages)
@@ -478,6 +580,22 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /api/v1/voice/synthesize", s.handleVoiceSynthesize)
 	}
 
+	// 图像生成 API（status 始终注册，便于前端探测；generate 仅在配置后可用）
+	mux.HandleFunc("GET /api/v1/images/status", s.handleImageGenStatus)
+	mux.HandleFunc("POST /api/v1/images/generate", s.handleImageGenGenerate)
+
+	// 视频生成 API（异步两步：submit + poll）
+	mux.HandleFunc("GET /api/v1/videos/status", s.handleVideoGenStatus)
+	mux.HandleFunc("POST /api/v1/videos/generate", s.handleVideoGenSubmit)
+	mux.HandleFunc("GET /api/v1/videos/tasks/{id}", s.handleVideoGenPoll)
+
+	// 语音对话 API（audio-to-audio，gpt-4o-audio）
+	mux.HandleFunc("GET /api/v1/voicechat/status", s.handleVoiceChatStatus)
+	mux.HandleFunc("POST /api/v1/voicechat/chat", s.handleVoiceChat)
+
+	// 生成内容文件服务（图像 / 视频 / 语音持久化产物）
+	mux.HandleFunc("GET /api/v1/files/generated/{path...}", s.handleGeneratedFile)
+
 	// 日志 API（始终启用）
 	mux.HandleFunc("GET /api/v1/logs", s.handleGetLogs)
 	mux.HandleFunc("GET /api/v1/logs/stats", s.handleGetLogStats)
@@ -555,9 +673,21 @@ func (s *Server) routes() http.Handler {
 //
 // 注册路由并开始监听。此方法会阻塞直到服务器停止。
 // 使用 Stop() 方法触发优雅关闭。
-func (s *Server) Start(ctx context.Context) error {
+// Start 启动 HTTP 服务。
+//
+// 行为顺序：bind 端口 → 调用 onReady → 进入 Serve 循环。
+// 任何 bind 错误同步返回，便于调用方 fail-fast 并输出真实错误。
+// onReady 在端口已监听后触发，用于"已就绪"这种只应在真实就绪后展示的日志。
+func (s *Server) Start(ctx context.Context, onReady func()) error {
 	s.server = s.buildHTTPServer(ctx)
-	return s.server.ListenAndServe()
+	listener, err := net.Listen("tcp", s.server.Addr)
+	if err != nil {
+		return fmt.Errorf("监听 %s 失败: %w", s.server.Addr, err)
+	}
+	if onReady != nil {
+		onReady()
+	}
+	return s.server.Serve(listener)
 }
 
 func (s *Server) buildHTTPServer(ctx context.Context) *http.Server {
@@ -774,18 +904,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		trace.L(ctx).Info("流式消费完成", "content_len", content.Len())
-		// 兜底提取 <think>/<thinking> 标签（某些模型在 content chunk 中嵌入）
-		finalContent := strings.TrimSpace(content.String())
-		for _, tag := range []string{"thinking", "think"} {
-			open := "<" + tag + ">"
-			close := "</" + tag + ">"
-			if strings.HasPrefix(finalContent, open) {
-				if endIdx := strings.Index(finalContent, close); endIdx != -1 {
-					finalContent = strings.TrimSpace(finalContent[endIdx+len(close):])
-				}
-				break
-			}
-		}
+		// v0.3.12 H4：改用 engine.StripAllThinking 统一剥离
+		// 覆盖 <think>/<thinking>/<reasoning> 三种标签、任意位置（含中间嵌入）、多段、未闭合残段
+		finalContent := engine.StripAllThinking(content.String())
 		reply = &adapter.Reply{
 			Content:   finalContent,
 			Metadata:  metadata,

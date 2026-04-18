@@ -16,6 +16,7 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/toolkit/net/httpx"
 )
 
 // imageModelPrefixes 已知的图片生成模型前缀（API 调用方的兼容回退）
@@ -93,7 +94,7 @@ func generateImage(ctx context.Context, provider hexagon.Provider, model, prompt
 }
 
 // imageHTTPClient 图片下载专用 HTTP client（复用连接池）
-var imageHTTPClient = &http.Client{Timeout: 60 * time.Second}
+var imageHTTPClient = httpx.RawClient(httpx.WithRawTimeout(60 * time.Second))
 
 // downloadAsDataURI 下载图片并转为 base64 data URI
 func downloadAsDataURI(ctx context.Context, url string) (string, error) {

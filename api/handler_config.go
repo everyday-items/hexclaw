@@ -221,6 +221,11 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 
 	s.cfg.LLM = nextLLM
 
+	// LLM 配置变更后，重建 image/video/voice 生成服务（用新 API Key 构建 Provider）
+	if s.reloadGenServices != nil {
+		s.reloadGenServices()
+	}
+
 	logger.Info("LLM 配置已更新、持久化并热生效")
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status": "ok",
