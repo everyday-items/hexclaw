@@ -7,8 +7,17 @@ import (
 	"testing"
 
 	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/hexclaw/featureflag"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
+
+// withFlagOn 注入指定 flag 为 true 的 ctx（用于 G2 / H8 等 flag-gated 路径测试）
+func withFlagOn(ctx context.Context, name string) context.Context {
+	flags := featureflag.NewStatic(featureflag.Registered(), map[string]bool{
+		name: true,
+	})
+	return featureflag.WithContext(ctx, flags)
+}
 
 // testSkill is a minimal Skill implementation for testing.
 type testSkill struct {
@@ -143,5 +152,39 @@ func TestToolExecutor_HasTool(t *testing.T) {
 	}
 	if executor.HasTool("nonexistent") {
 		t.Error("HasTool should return false for unregistered tool")
+	}
+}
+
+// v0.4.0 G2: flag skill.pipeline.v1 ON 走 7 阶段 pipeline；OFF 走 s.Execute
+func TestToolExecutor_SkillPipeline_FlagOff_DirectExecute(t *testing.T) {
+	reg := skill.NewRegistry()
+	reg.Register(&testSkill{name: "weather", result: "Direct path"})
+
+	executor := NewToolExecutor(reg, nil)
+
+	// 默认 ctx 没注入 flag → flag OFF → 走老路径
+	result, err := executor.Execute(context.Background(), "weather", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "Direct path" {
+		t.Errorf("got %q, want %q", result, "Direct path")
+	}
+}
+
+func TestToolExecutor_SkillPipeline_FlagOn_PipelinePath(t *testing.T) {
+	reg := skill.NewRegistry()
+	reg.Register(&testSkill{name: "weather", result: "Pipeline path"})
+
+	executor := NewToolExecutor(reg, nil)
+
+	// 注入 flag ON
+	ctx := withFlagOn(context.Background(), skill.FlagSkillPipelineV1)
+	result, err := executor.Execute(ctx, "weather", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "Pipeline path" {
+		t.Errorf("got %q, want %q", result, "Pipeline path")
 	}
 }

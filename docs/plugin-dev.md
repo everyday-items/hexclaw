@@ -40,6 +40,40 @@ type Plugin interface {
 > **注意**：`Register` 和 `Unregister` 会在写锁释放后再触发事件回调，
 > 插件的 `OnLoaded`/`OnUnloaded` 处理器中可安全调用 Registry 的其他方法。
 
+## ExtensionPlugin Manifest v1
+
+v0.4 新增 `ExtensionPlugin` 协议，用于在插件加载前声明版本、最低 Host 版本、
+依赖与能力范围。开启 `plugin.extension.v1` 后，Manager 会校验 Manifest，并按
+capabilities 构造最小权限的 `ExtensionContext`。
+
+```go
+type MyPlugin struct {
+    plugin.BasePlugin
+}
+
+func (p *MyPlugin) Manifest() hcplugin.Manifest {
+    return hcplugin.Manifest{
+        Name:           "com.example.my-plugin",
+        Version:        "1.0.0",
+        MinHostVersion: "0.4.0",
+        Capabilities: []hcplugin.Capability{
+            hcplugin.CapReadSkills,
+            hcplugin.CapEmitEvents,
+        },
+        Description: "示例插件",
+    }
+}
+```
+
+已定义能力：
+- `skills.read`：读取 Host 的 Skill registry
+- `events.emit`：投递结构化事件
+- `network`：发起网络请求
+- `fs.read`：读取 Host 沙箱目录文件
+- `fs.write`：写入 `.pending` 风格的待审核文件
+
+不声明的能力不会出现在 `ExtensionContext` 中；插件需要对 nil 字段做降级处理。
+
 ## 快速开始
 
 ### 1. 创建 Skill 插件

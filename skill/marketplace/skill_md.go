@@ -38,37 +38,68 @@ package marketplace
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/hexagon-codes/hexclaw/skill"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // SkillMeta 技能元数据（从 YAML frontmatter 解析）
 //
 // 启动时只加载元数据，不加载完整 Prompt 内容。
 // 每个技能约 24 tokens，支持海量技能注册。
+//
+// v0.4.x Phase 2 扩展字段（when/not_when/preferred_mode）支持条件激活：
+//
+//	---
+//	name: math-tutor
+//	when:
+//	  - subject=math
+//	  - grade=小学
+//	not_when:
+//	  - mode=react
+//	preferred_mode: tot
+//	---
 type SkillMeta struct {
-	Name        string   `yaml:"name"`        // 唯一标识（必需）
-	Description string   `yaml:"description"` // 描述（供 LLM 理解）
-	Author      string   `yaml:"author"`      // 作者
-	Version     string   `yaml:"version"`     // 版本
-	Triggers    []string `yaml:"triggers"`    // 快速路径触发关键词
-	Tags        []string `yaml:"tags"`        // 分类标签
-	Signature   string   `yaml:"signature"`   // 签名（安全验证用）
+	Name          string   `yaml:"name"`           // 唯一标识（必需）
+	Description   string   `yaml:"description"`    // 描述（供 LLM 理解）
+	Author        string   `yaml:"author"`         // 作者
+	Version       string   `yaml:"version"`        // 版本
+	Triggers      []string `yaml:"triggers"`       // 快速路径触发关键词
+	Tags          []string `yaml:"tags"`           // 分类标签
+	Signature     string   `yaml:"signature"`      // 签名（安全验证用）
+	When          []string `yaml:"when"`           // Phase 2: 激活条件 AND
+	NotWhen       []string `yaml:"not_when"`       // Phase 2: 排除条件
+	PreferredMode string   `yaml:"preferred_mode"` // Phase 2: 推荐 Agent 模式
+
+	// v0.4.0 F5: 工具集依赖（硬依赖：列出 Skill 执行时会调用的工具/Skill 名）。
+	// 加载或选择时若环境中缺少其中之一，应跳过此 Skill，避免运行时崩溃。
+	// 例：tools: [calculator, web-search]
+	Tools []string `yaml:"tools"`
+	// v0.4.0 F5: 环境能力依赖（软依赖：抽象的能力标签，如 "knowledge-base" / "fs-write"）。
+	// 用于上层做"环境画像"路由判断；不强制为可执行工具名。
+	Requires []string `yaml:"requires"`
 }
 
 // MarkdownSkill Markdown 格式的技能
 //
 // 兼容 OpenClaw Custom Commands 格式。
 // 实现 skill.Skill 接口，可注册到 Skill 注册中心。
+//
+// v0.4.0 F10 TOCTOU 防御：首次加载文件时计算 SHA256 并缓存；后续调用 LoadContent
+// 会重新读盘并比对 hash —— 若磁盘文件被替换（time-of-check 与 time-of-use 之间），
+// 立即返回错误而非把可能被篡改的内容喂给 LLM。
 type MarkdownSkill struct {
 	Meta     SkillMeta // 元数据
 	FilePath string    // 技能文件路径
 	Content  string    // 完整 Prompt 内容（懒加载）
 	loaded   bool      // 内容是否已加载
+	hash     [32]byte  // 首次加载时计算的 SHA256，用于后续 TOCTOU 校验
 	mu       sync.RWMutex
 }
 
@@ -80,6 +111,22 @@ func (s *MarkdownSkill) Name() string {
 // Description 返回技能描述
 func (s *MarkdownSkill) Description() string {
 	return s.Meta.Description
+}
+
+// SkillMeta 实现 skill.MetaProvider，让 select.go 的 SelectByQuery / SelectByContext
+// 能利用 frontmatter 的 triggers/tags/when/not_when/preferred_mode。
+func (s *MarkdownSkill) SkillMeta() skill.SkillMetaInfo {
+	return skill.SkillMetaInfo{
+		Name:          s.Meta.Name,
+		Description:   s.Meta.Description,
+		Triggers:      s.Meta.Triggers,
+		Tags:          s.Meta.Tags,
+		When:          s.Meta.When,
+		NotWhen:       s.Meta.NotWhen,
+		PreferredMode: s.Meta.PreferredMode,
+		Tools:         s.Meta.Tools,
+		Requires:      s.Meta.Requires,
+	}
 }
 
 // Match 快速路径匹配
@@ -131,9 +178,13 @@ type SkillResult struct {
 	Metadata map[string]string
 }
 
-// LoadContent 懒加载技能完整内容
+// LoadContent 懒加载技能完整内容（v0.4.0 F10 TOCTOU 加固版）。
 //
-// 首次调用时从文件读取完整 Prompt 内容，后续调用使用缓存。
+// 首次调用：读盘 → 解析 frontmatter → 缓存 content + 文件 SHA256。
+// 后续调用：返回缓存内容（fast path）。
+//
+// VerifyContent 在每次"使用前 / 加载到 LLM context 前"应被显式调用，它会重读文件
+// 比对 hash；若磁盘文件被替换则返回错误，避免 LLM 接受被篡改的 prompt。
 func (s *MarkdownSkill) LoadContent() (string, error) {
 	s.mu.RLock()
 	if s.loaded {
@@ -158,9 +209,57 @@ func (s *MarkdownSkill) LoadContent() (string, error) {
 
 	_, content := parseFrontmatter(string(data))
 	s.Content = content
+	s.hash = sha256.Sum256(data)
 	s.loaded = true
 
 	return content, nil
+}
+
+// VerifyContent 重读技能文件并校验 SHA256，确认与首次加载时的内容一致。
+//
+// 用法：在把 Skill 内容塞进 LLM context 之前调用一次：
+//
+//	if err := s.VerifyContent(); err != nil {
+//	    log.Warn("skill tampered or missing", "skill", s.Name(), "err", err)
+//	    continue
+//	}
+//	prompt, _ := s.LoadContent()
+//
+// 首次加载之前调用直接返回 nil（首次加载时会自动计算 hash）。
+func (s *MarkdownSkill) VerifyContent() error {
+	s.mu.RLock()
+	loaded := s.loaded
+	expectedHash := s.hash
+	path := s.FilePath
+	s.mu.RUnlock()
+
+	if !loaded {
+		return nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("TOCTOU: skill 文件已不可读: %w", err)
+	}
+	got := sha256.Sum256(data)
+	if got != expectedHash {
+		return fmt.Errorf("TOCTOU: skill 文件内容已被篡改（%s）", path)
+	}
+	return nil
+}
+
+// TrustLevel 实现 skill.TrustProvider —— 默认按"是否有签名 + 是否本地文件"判定：
+//   - 有 signature 字段视作 TrustSigned（注：当前仅相信字段存在，签名验证由
+//     security 包负责，未通过校验的 Skill 应在加载阶段就被拒绝注册）
+//   - 否则视作 TrustLocal（用户本地文件、可见但要审批写入）
+//
+// 来源不明 / 网络下载的 Skill 应在 import 阶段被显式标 TrustUntrusted（通过
+// 自定义 wrapper 覆盖此方法），不依赖默认值。
+func (s *MarkdownSkill) TrustLevel() skill.TrustLevel {
+	if strings.TrimSpace(s.Meta.Signature) != "" {
+		return skill.TrustSigned
+	}
+	return skill.TrustLocal
 }
 
 // ============== 技能加载 ==============
@@ -294,6 +393,14 @@ func parseFrontmatter(text string) (SkillMeta, string) {
 				meta.Triggers = listValues
 			case "tags":
 				meta.Tags = listValues
+			case "when":
+				meta.When = listValues
+			case "not_when":
+				meta.NotWhen = listValues
+			case "tools":
+				meta.Tools = listValues
+			case "requires":
+				meta.Requires = listValues
 			}
 		}
 		listValues = nil
@@ -342,7 +449,9 @@ func parseFrontmatter(text string) (SkillMeta, string) {
 			meta.Version = value
 		case "signature":
 			meta.Signature = value
-		case "triggers", "tags":
+		case "preferred_mode":
+			meta.PreferredMode = value
+		case "triggers", "tags", "when", "not_when", "tools", "requires":
 			// 如果值在同一行 [a, b, c]
 			if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
 				inner := value[1 : len(value)-1]

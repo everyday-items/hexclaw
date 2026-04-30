@@ -16,12 +16,12 @@
 ## Features
 
 ### Core Capabilities
-- **ReAct Agent Engine** — Reasoning + Action loop with multi-turn tool calls and streaming output, full streaming tool execution loop (execute → feed results → continue reasoning), reasoning/thinking content persistence
+- **ReAct Agent Engine** — Reasoning + Action loop with multi-turn tool calls, streaming output, structured interactive replies, and Agent modes such as `plan-execute`, `reflection`, and `tot`
 - **6-Layer Security Gateway** — Auth, rate limiting, cost control, injection detection, permission check, audit logging
-- **LLM Smart Router** — Multi-provider auto-switching, failover, and cost optimization
-- **Skill System** — Built-in search/weather/translation/summary, sandboxed execution, shell allowlist protection
+- **LLM Smart Router** — Multi-provider auto-switching, failover, cost optimization, and model tool-call capability probing
+- **Skill System** — Built-in search/weather/translation/summary, 7-phase pipeline, `.pending` approval flow, TrustLevel filtering, and TOCTOU checks
 - **Semantic Cache** — Singleflight anti-stampede + TTL jitter anti-avalanche + empty-value anti-penetration
-- **Knowledge Base** — FTS5 + vector hybrid retrieval, RAG context augmentation
+- **Knowledge Base** — FTS5 + vector hybrid retrieval, 5-stage RAG pipeline, and context augmentation
 
 ### Session & Data
 - **Session Management** — Create/query/delete sessions, message history, session forking
@@ -41,7 +41,7 @@
 - **Multi-Agent Routing** — Host multiple agents in one instance, route by platform/user/group
 - **Canvas / A2UI** — Agent-generated interactive UIs (charts, forms, kanban, and 8+ component types)
 - **Security Audit CLI** — `hexclaw security audit` one-click security check + remediation suggestions
-- **Voice Interaction** — STT/TTS transcription and synthesis, multi-provider support
+- **Voice Interaction** — STT/TTS transcription and synthesis with chained MiniMax / Edge / OpenAI / Azure TTS fallback
 - **Desktop Integration** — System notifications, clipboard interaction (Tauri desktop client)
 - **Real-Time Logs** — WebSocket log streaming + analytics
 
@@ -221,6 +221,13 @@ knowledge:
   chunk_size: 400
   top_k: 3
 
+features:
+  # v0.4 capabilities are alpha-gated and fail-closed unless explicitly enabled.
+  model.gateway.v1: false
+  skill.pipeline.v1: false
+  config.tx.hotload.v1: false
+  events.transport.v1: false
+
 skill:
   sandbox:
     enabled: true
@@ -233,6 +240,22 @@ storage:
 ```
 
 All config values support environment variable substitution (`${VAR_NAME}`).
+
+### Feature Flags
+
+v0.4 capabilities are enabled through the `features:` section. Unknown flags always
+resolve to disabled, and `alpha` flags are forced off by default even when their
+registered default is true.
+
+Common flags:
+- `agent.factory.real`: allow `dispatch_role` to invoke a real `hexagon.Agent`
+- `skill.pipeline.v1`: enable the 7-phase Skill execution pipeline
+- `interactive.render.v1`: use native platform renderers for interactive replies; disabled uses text fallback
+- `config.tx.hotload.v1`: update LLM config through transactional hot reload
+- `model.gateway.v1`: enable the Provider middleware chain
+- `events.transport.v1`: enable structured event sink delivery
+- `rag.pipeline.v1`: enable the 5-stage knowledge RAG pipeline
+- `voice.tts.chain.v1`: enable chained TTS provider fallback
 
 ## Architecture
 
@@ -279,9 +302,10 @@ hexclaw/
 │   ├── matrix/              #   Matrix
 │   └── email/               #   Email (IMAP/SMTP)
 ├── agents/                  # Agent roles (6 preset roles)
-├── api/                     # REST API server (71 routes)
+├── api/                     # REST API server
 │   ├── server.go            #   Core server + chat + route registration
 │   ├── handler_config.go    #   LLM config query/update/test/model discovery API
+│   ├── handler_capabilities.go # Model tool-call capability probe API
 │   ├── handler_extended.go  #   Workflow/config/version/stats API
 │   ├── handler_logs.go      #   Log query/stats/stream API
 │   ├── handler_knowledge.go #   Knowledge base API
@@ -295,13 +319,19 @@ hexclaw/
 ├── cron/                    # Cron job scheduler
 ├── desktop/                 # Desktop integration (notifications/clipboard)
 ├── engine/                  # Agent engine (ReAct loop)
+├── events/                  # Structured event protocol and sinks
+├── eval/                    # Pre-release eval suites
+├── featureflag/             # Feature flag registry and runtime lookup
 ├── gateway/                 # 6-layer security gateway
 ├── heartbeat/               # Heartbeat patrol
 ├── knowledge/               # Knowledge base (FTS5 + vector hybrid)
 ├── llmrouter/               # LLM smart router
 ├── mcp/                     # MCP client (stdio + SSE)
 ├── memory/                  # File memory (MEMORY.md + journal)
+├── plugin/                  # Plugin Manifest / Capability extensions
+├── release/                 # Release gates and canary state machine
 ├── router/                  # Multi-agent router
+├── runtime/                 # Sandbox and checkpoint rollback
 ├── session/                 # Session management + context compaction
 ├── skill/                   # Skill system
 │   ├── builtin/             #   Built-in skills (search/weather/translate/summary)
@@ -347,6 +377,8 @@ hexclaw/
 | PUT | `/api/v1/config/llm` | Update LLM config |
 | POST | `/api/v1/config/llm/test` | Test one provider config without persisting it; local Ollama may omit the key |
 | POST | `/api/v1/config/llm/models` | Dynamically fetch available models from a provider (proxies to provider `/models` API) |
+| GET | `/api/v1/llm/capabilities` | List cached model tool-call capability probe results |
+| POST | `/api/v1/llm/capabilities/probe` | Probe the tool-call reliability for a given `provider` + `model` |
 
 ### Knowledge Base
 | Method | Path | Description |
@@ -493,6 +525,7 @@ Installing or uninstalling Markdown skills automatically syncs the runtime skill
 - `POST /api/v1/agents/rules/test` returns matched rules and scores so the UI can explain why a request was routed to a given agent.
 - Log entries returned by `GET /api/v1/logs` include a stable `domain` field for filtering by functional area such as `chat`, `knowledge`, `integration`, `automation`, or `engine`.
 - `POST /api/v1/config/llm/models` proxies to a provider's `/models` endpoint and returns a normalized model list (`{ models: [{ id, name }] }`); auto-adapts between OpenAI standard format and alternative formats.
+- `GET /api/v1/llm/capabilities` returns `{ provider_name, model_name, tool_call, tool_call_text, last_probe, probe_error }`; `POST /api/v1/llm/capabilities/probe?provider=X&model=Y` probes immediately and writes the SQLite cache.
 
 ## Development
 
@@ -532,6 +565,9 @@ go test -run TestName ./package/
 # Code check
 go vet ./...
 golangci-lint run
+
+# Release gate + Eval + canary dry-run
+go run ./cmd/verify-release -repo . -version 0.4.0 -version-files package.json
 ```
 
 ## Tech Stack
@@ -539,7 +575,7 @@ golangci-lint run
 | Component | Technology |
 |-----------|-----------|
 | Language | Go 1.25+ |
-| Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.4.6 |
+| Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.4.7 |
 | AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.1.2 |
 | Utility Library | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.6 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
@@ -583,7 +619,7 @@ chore: build/toolchain updates
 
 | Project | Description | Repository |
 |---------|-------------|------------|
-| **Hexagon** | Go AI Agent framework (core engine) v0.4.6 | [hexagon](https://github.com/hexagon-codes/hexagon) |
+| **Hexagon** | Go AI Agent framework (core engine) v0.4.7 | [hexagon](https://github.com/hexagon-codes/hexagon) |
 | **ai-core** | AI core library (LLM/Tool/Memory) v0.1.2 | [ai-core](https://github.com/hexagon-codes/ai-core) |
 | **toolkit** | Go utility library v0.0.6 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI dashboard (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
@@ -591,6 +627,16 @@ chore: build/toolchain updates
 | **hexclaw-ui** | HexClaw web frontend (Vue 3) | [hexclaw-ui](https://github.com/hexagon-codes/hexclaw-ui) |
 
 ## Changelog
+
+### v0.4.0
+
+**New Features**
+- **Feature flag foundation** — The `features:` config section controls v0.4 capabilities; unknown flags fail closed and alpha flags default off
+- **Model capability probing** — New `/api/v1/llm/capabilities` and `/probe` endpoints cache model tool-call reliability
+- **Skill lifecycle loop** — Adds the 7-phase Pipeline, `skill_view` progressive disclosure, `.pending` approvals, TrustLevel filtering, and TOCTOU protection
+- **Interactive replies** — `Reply.Interactive` supports buttons/select/approval/card with IM text fallback
+- **Runtime governance** — Adds Provider middleware, structured events, permission policies, MCP lifecycle hooks, RAG Pipeline, Runtime Sandbox, and release gates
+- **Voice improvements** — Adds MiniMax TTS and chained multi-provider TTS fallback
 
 ### v0.3.0
 

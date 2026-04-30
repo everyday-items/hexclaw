@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/net/httpx"
 )
 
@@ -129,12 +130,13 @@ func (a *WhatsAppAdapter) sendReplyNow(ctx context.Context, chatID string, reply
 	if reply == nil {
 		return nil
 	}
+	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给家长
 	payload := map[string]any{
 		"messaging_product": "whatsapp",
 		"to":                chatID,
 		"type":              "text",
 		"text": map[string]string{
-			"body": reply.Content,
+			"body": adapter.StripThinking(reply.Content),
 		},
 	}
 
@@ -223,16 +225,20 @@ func (a *WhatsAppAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 					Timestamp:  time.Now(),
 				}
 				go func(m *adapter.Message) {
-					if a.handler != nil {
-						reply, err := a.handler(context.Background(), m)
-						if err != nil {
-							logger.Error("[WhatsApp] 处理消息错误", "error", err)
-							return
-						}
-						if reply != nil {
-							if err := a.Send(context.Background(), m.ChatID, reply); err != nil {
-								logger.Error("[WhatsApp] 发送回复错误", "error", err)
-							}
+					if a.handler == nil {
+						return
+					}
+					// H7: Detach(r.Context()) 保留 logger，脱离 webhook 响应返回后的 cancel
+					bgCtx, cancel := context.WithTimeout(trace.Detach(r.Context()), 2*time.Minute)
+					defer cancel()
+					reply, err := a.handler(bgCtx, m)
+					if err != nil {
+						logger.Error("[WhatsApp] 处理消息错误", "error", err)
+						return
+					}
+					if reply != nil {
+						if err := a.Send(bgCtx, m.ChatID, reply); err != nil {
+							logger.Error("[WhatsApp] 发送回复错误", "error", err)
 						}
 					}
 				}(msg)

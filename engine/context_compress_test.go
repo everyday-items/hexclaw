@@ -300,6 +300,81 @@ func TestLlmToolSummary_FallbackOnError(t *testing.T) {
 	}
 }
 
+// v0.4.0 F4: 双路径路由 — 小幅超限走 HeuristicCompress（不调 LLM）
+func TestCompressContextIfNeeded_HeuristicPath_SmallOverflow(t *testing.T) {
+	// 构造 totalChars ∈ [40K, 80K)：每对 (assistant + tool) = 2 * 2500 = 5K，
+	// 10 对 ≈ 50K，落在启发式区间（小幅超限）。
+	msgs := []llm.Message{{Role: "system", Content: "system prompt"}}
+	chunk := strings.Repeat("x", 2500)
+	for i := 0; i < 10; i++ {
+		msgs = append(msgs,
+			llm.Message{Role: "assistant", Content: chunk, ToolCalls: []llm.ToolCallRef{
+				{Name: "grep", Arguments: `{"pattern":"test"}`},
+			}},
+			llm.Message{Role: "tool", Content: chunk},
+		)
+	}
+
+	// nil provider — 走 LLM 路径会爆，走启发式路径不会调 LLM
+	result := compressContextIfNeeded(context.Background(), msgs, nil, "test-session-h")
+
+	// 启发式路径：返回 HeuristicCompress 后的 history，不会插入 "Prior tool interactions summary"
+	for _, m := range result {
+		if strings.Contains(m.Content, "Prior tool interactions summary") {
+			t.Error("heuristic path should NOT insert 'Prior tool interactions summary' marker")
+		}
+	}
+
+	// system 消息保留
+	if result[0].Role != "system" {
+		t.Errorf("first message should still be system, got %s", result[0].Role)
+	}
+
+	// 应该比原始短（删了重复 user / 老 tool pair / 截断了 assistant）
+	if len(result) > len(msgs) {
+		t.Errorf("heuristic path should not grow message count; got %d > %d", len(result), len(msgs))
+	}
+}
+
+// v0.4.0 F4: 双路径路由 — 大幅超限走 LLM 摘要
+func TestCompressContextIfNeeded_LLMPath_LargeOverflow(t *testing.T) {
+	provider := &mockSummaryProvider{response: "Routed-to-LLM-summary"}
+
+	msgs := []llm.Message{
+		{Role: "system", Content: "system prompt"},
+	}
+	bigContent := strings.Repeat("x", 5000)
+	// 20 pairs * 10K per pair = 200K chars，远超 2x threshold (80K)
+	for i := 0; i < 20; i++ {
+		msgs = append(msgs,
+			llm.Message{Role: "assistant", Content: bigContent, ToolCalls: []llm.ToolCallRef{
+				{Name: "grep", Arguments: `{"pattern":"test"}`},
+			}},
+			llm.Message{Role: "tool", Content: bigContent},
+		)
+	}
+
+	result := compressContextIfNeeded(context.Background(), msgs, provider, "test-session-llm")
+
+	// LLM 路径：应该有 "Prior tool interactions summary" 消息
+	hasSummaryMarker := false
+	hasMockResponse := false
+	for _, m := range result {
+		if strings.Contains(m.Content, "Prior tool interactions summary") {
+			hasSummaryMarker = true
+		}
+		if strings.Contains(m.Content, "Routed-to-LLM-summary") {
+			hasMockResponse = true
+		}
+	}
+	if !hasSummaryMarker {
+		t.Error("LLM path should insert 'Prior tool interactions summary' marker")
+	}
+	if !hasMockResponse {
+		t.Error("LLM path should use mock provider response")
+	}
+}
+
 func TestCompressContextIfNeeded_LLMSummaryPath(t *testing.T) {
 	provider := &mockSummaryProvider{response: "Previously: searched codebase and edited 3 files."}
 

@@ -94,6 +94,53 @@ tags: ["tag1", "tag2"]
 	}
 }
 
+// TestParseFrontmatter_ToolsRequires 校验 v0.4.0 F5 新增的 tools / requires 字段
+// 既能解析多行列表也能解析内联列表。
+func TestParseFrontmatter_ToolsRequires(t *testing.T) {
+	input := `---
+name: math-tutor
+tools:
+  - calculator
+  - graph-render
+requires: [knowledge-base, fs-write]
+---
+
+正文`
+
+	meta, _ := parseFrontmatter(input)
+	if len(meta.Tools) != 2 {
+		t.Fatalf("tools: got %d, want 2", len(meta.Tools))
+	}
+	if meta.Tools[0] != "calculator" || meta.Tools[1] != "graph-render" {
+		t.Errorf("tools: got %v", meta.Tools)
+	}
+	if len(meta.Requires) != 2 {
+		t.Fatalf("requires: got %d, want 2", len(meta.Requires))
+	}
+	if meta.Requires[0] != "knowledge-base" || meta.Requires[1] != "fs-write" {
+		t.Errorf("requires: got %v", meta.Requires)
+	}
+}
+
+// TestMarkdownSkill_SkillMeta_PropagatesToolsRequires 校验 SkillMeta() 输出
+// 把 tools/requires 透传给 skill.SkillMetaInfo（select.go MissingDependencies 依赖）。
+func TestMarkdownSkill_SkillMeta_PropagatesToolsRequires(t *testing.T) {
+	s := &MarkdownSkill{
+		Meta: SkillMeta{
+			Name:     "x",
+			Tools:    []string{"a", "b"},
+			Requires: []string{"r1"},
+		},
+	}
+	info := s.SkillMeta()
+	if len(info.Tools) != 2 || info.Tools[0] != "a" || info.Tools[1] != "b" {
+		t.Errorf("tools 未透传: %v", info.Tools)
+	}
+	if len(info.Requires) != 1 || info.Requires[0] != "r1" {
+		t.Errorf("requires 未透传: %v", info.Requires)
+	}
+}
+
 // TestMarkdownSkill_Match 测试技能匹配
 func TestMarkdownSkill_Match(t *testing.T) {
 	skill := &MarkdownSkill{

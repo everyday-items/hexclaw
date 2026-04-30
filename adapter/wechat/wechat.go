@@ -32,6 +32,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
@@ -157,7 +158,8 @@ func (a *WechatAdapter) SendStream(ctx context.Context, chatID string, chunks <-
 		}
 		sb.WriteString(chunk.Content)
 	}
-	return a.sendCustomMessage(ctx, chatID, sb.String())
+	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给家长
+	return a.sendCustomMessage(ctx, chatID, adapter.StripThinking(sb.String()))
 }
 
 // ============== 回调处理 ==============
@@ -226,7 +228,8 @@ func (a *WechatAdapter) handleMessage(w http.ResponseWriter, r *http.Request) {
 			},
 		}
 
-		reply, err := a.handler(context.Background(), unified)
+		// H7: Detach(ctx) 保留 logger/Values，脱离 4.5s 被动回复超时 —— handler 可能要跑更久
+		reply, err := a.handler(trace.Detach(ctx), unified)
 		if err != nil {
 			logger.Error("error", "error", err)
 			return
@@ -262,8 +265,8 @@ func (a *WechatAdapter) handleMessage(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			select {
 			case content := <-replyCh:
-				bgCtx := context.Background()
-				_ = a.Send(bgCtx, msg.FromUserName, &adapter.Reply{Content: content})
+				// H7: Detach 保留 logger/Values，脱离已取消的 ctx 发送客服消息
+				_ = a.Send(trace.Detach(ctx), msg.FromUserName, &adapter.Reply{Content: content})
 			case <-time.After(120 * time.Second):
 				// 超时放弃
 			}

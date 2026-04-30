@@ -20,6 +20,7 @@ package knowledge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/hexagon-codes/toolkit/util/logger"
 	"math"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/hexclaw/featureflag"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -290,7 +292,29 @@ func (m *Manager) Search(ctx context.Context, query string, topK int) ([]SearchH
 }
 
 // Query 混合检索知识库，返回格式化的 LLM 上下文
+//
+// v0.4.0 H7：当 flag rag.pipeline.v1 开启时，本方法走 5 阶段 RAGPipeline
+// （QueryRewriter → Retriever → Reranker → ContextBuilder → Answerer），
+// flag 关闭时退化到原 Search + formatSearchHits 路径，行为完全一致。
 func (m *Manager) Query(ctx context.Context, query string, topK int) (string, error) {
+	if featureflag.Enabled(ctx, FlagRAGPipelineV1) {
+		p := &Pipeline{
+			Retriever: NewManagerRetriever(m),
+			ContextBuilder: SimpleContextBuilder{},
+		}
+		res, err := p.RunRAG(ctx, query, topK)
+		if err != nil {
+			// pipeline 层错误就回退到老路径，让用户体感无差别
+			if errors.Is(err, ErrPipelineDisabled) {
+				// 罕见：flag 在 RunRAG 入口仍 OFF（race condition），fallthrough 到老路径
+			} else {
+				return "", err
+			}
+		} else if res != nil {
+			return res.Context, nil
+		}
+	}
+
 	hits, err := m.Search(ctx, query, topK)
 	if err != nil {
 		return "", err

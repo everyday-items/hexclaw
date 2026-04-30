@@ -21,7 +21,7 @@ import (
 //   - 只提取用户层面的长期信息，不记忆临时任务
 //   - 不记忆敏感信息（密码、密钥等）
 //   - 异步执行，不阻塞回复
-func (e *ReActEngine) autoExtractMemoryForRole(userText, assistantText, role string) {
+func (e *ReActEngine) autoExtractMemoryForRole(parentCtx context.Context, userText, assistantText, role string) {
 	if e.fileMem == nil {
 		return
 	}
@@ -34,12 +34,13 @@ func (e *ReActEngine) autoExtractMemoryForRole(userText, assistantText, role str
 		return
 	}
 
-	// Fix 5: 使用 bgWg 追踪后台 goroutine，确保 shutdown 时等待完成。
-	// 使用 30s 超时（而非 context.Background()），防止孤儿 goroutine 无限运行。
+	// H7: 用 trace.Detach 保留 trace_id/session/user_id 等 Values，但脱离父 ctx 的 cancel，
+	// 防止请求结束后后台 goroutine 被杀。再套 30s 超时避免孤儿无限运行。
+	// 使用 bgWg 追踪后台 goroutine，确保 shutdown 时等待完成。
 	e.bgWg.Add(1)
 	go func() {
 		defer e.bgWg.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(trace.Detach(parentCtx), 30*time.Second)
 		defer cancel()
 
 		provider, providerName, err := e.selectLLMForMemory(ctx)
@@ -51,7 +52,20 @@ func (e *ReActEngine) autoExtractMemoryForRole(userText, assistantText, role str
 		existingMemory := e.fileMem.GetMemory()
 		prompt := buildMemoryExtractionPrompt(userText, assistantText, existingMemory)
 		var temp float64 = 0
-		resp, err := provider.Complete(ctx, hexagon.CompletionRequest{
+		// v0.4.0 E4：用 CompleteWithFailover；接 router.Fallback 让 auto-memory 在
+		// 主 Provider down 时尝试备用，不过 401/404 仍 fail-fast 避免无效重试。
+		log := trace.L(ctx)
+		fc := &LLMCallContext{
+			Provider:     provider,
+			ProviderName: providerName,
+			Fallback: func(exclude ...string) (hexagon.Provider, string, error) {
+				return e.router.Fallback(exclude...)
+			},
+			Logger: func(msg string, fields ...any) {
+				log.Warn(msg, fields...)
+			},
+		}
+		resp, err := CompleteWithFailover(ctx, fc, hexagon.CompletionRequest{
 			Messages: []hexagon.Message{
 				{Role: "system", Content: memoryExtractionSystemPrompt},
 				{Role: "user", Content: prompt},
@@ -60,7 +74,7 @@ func (e *ReActEngine) autoExtractMemoryForRole(userText, assistantText, role str
 			Temperature: &temp,
 		})
 		if err != nil {
-			trace.L(ctx).Error("auto-memory: LLM 调用失败", "err", err, "provider", providerName)
+			trace.L(ctx).Error("auto-memory: LLM 调用失败", "err", err, "provider", fc.ProviderName)
 			return
 		}
 

@@ -624,6 +624,67 @@ func TestReActEngine_ProcessRecoversThinkingTimeout(t *testing.T) {
 	}
 }
 
+func TestReActEngine_ProcessToolsPathRecoversThinkingTimeout(t *testing.T) {
+	var calls int32
+	provider := mockllm.NewLLMProvider("ollama").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+		call := atomic.AddInt32(&calls, 1)
+		if call == 1 {
+			if got := req.Metadata["thinking"]; got != "on" {
+				t.Fatalf("工具路径首个请求应保留 thinking:on，实际 %#v", req.Metadata)
+			}
+			if len(req.Tools) == 0 {
+				t.Fatal("工具路径请求应携带 tools")
+			}
+			return nil, context.DeadlineExceeded
+		}
+		if got := req.Metadata["thinking"]; got != "off" {
+			t.Fatalf("工具路径 timeout 恢复请求应关闭 thinking，实际 %#v", req.Metadata)
+		}
+		if len(req.Tools) != 0 {
+			t.Fatalf("工具路径恢复请求不应继续携带 tools，实际 %d 个", len(req.Tools))
+		}
+		return &hexagon.CompletionResponse{
+			Content: "工具路径直接回答",
+			Usage:   hexagon.Usage{TotalTokens: 8},
+		}, nil
+	})
+
+	eng := newEngineWithProviders(t, map[string]hexagon.Provider{
+		"ollama": provider,
+	}, map[string]config.LLMProviderConfig{
+		"ollama": {Model: "qwen3.5:9b"},
+	}, "ollama")
+	eng.cfg.LLM.Tools.Enabled = "on"
+	reg := skill.NewRegistry()
+	reg.Register(&echoSkill{})
+	eng.SetToolCollector(NewToolCollector(reg, nil, 40))
+	eng.SetToolExecutor(NewToolExecutor(reg, nil))
+
+	reply, err := eng.Process(context.Background(), &adapter.Message{
+		ID:       "msg-thinking-timeout-tools",
+		Platform: adapter.PlatformAPI,
+		UserID:   "user-001",
+		Content:  "请结合工具能力回答这个问题",
+		Metadata: map[string]string{"thinking": "on"},
+	})
+	if err != nil {
+		t.Fatalf("Process 失败: %v", err)
+	}
+
+	if reply.Content != "工具路径直接回答" {
+		t.Fatalf("工具路径 thinking timeout 应自动恢复为直接回答，实际 %q", reply.Content)
+	}
+	if reply.Metadata["finish_reason"] != "thinking_timeout" {
+		t.Fatalf("timeout 标记未返回，metadata=%#v", reply.Metadata)
+	}
+	if reply.Metadata["recovered_from_reasoning_only"] != "true" {
+		t.Fatalf("恢复标记未返回，metadata=%#v", reply.Metadata)
+	}
+	if provider.CallCount() != 2 {
+		t.Fatalf("应执行一次工具路径 timeout 恢复重试，实际调用 %d 次", provider.CallCount())
+	}
+}
+
 func TestReActEngine_ProcessStreamRecoversReasoningOnlyResponse(t *testing.T) {
 	provider := &reasoningOnlyStreamProvider{}
 	eng := newEngineWithProvider(t, provider)
@@ -726,6 +787,43 @@ func TestReActEngine_ProcessStreamRecoversThinkingTimeout(t *testing.T) {
 	}
 	if provider.CallCount() != 2 {
 		t.Fatalf("应执行一次 stream timeout 恢复重试，实际调用 %d 次", provider.CallCount())
+	}
+}
+
+func TestReActEngine_ProcessStreamEstimatesUsageWhenProviderOmitsUsage(t *testing.T) {
+	eng := newEngineWithProvider(t, &usageLessStreamProvider{})
+
+	ch, err := eng.ProcessStream(context.Background(), &adapter.Message{
+		ID:       "msg-stream-usage-estimate",
+		Platform: adapter.PlatformAPI,
+		UserID:   "user-001",
+		Content:  "hello",
+	})
+	if err != nil {
+		t.Fatalf("ProcessStream 失败: %v", err)
+	}
+
+	var content strings.Builder
+	var done *adapter.ReplyChunk
+	for chunk := range ch {
+		if chunk.Error != nil {
+			t.Fatalf("chunk error: %v", chunk.Error)
+		}
+		content.WriteString(chunk.Content)
+		if chunk.Done {
+			copied := *chunk
+			done = &copied
+		}
+	}
+
+	if content.String() != "stream usage answer" {
+		t.Fatalf("流式回复内容不匹配，实际 %q", content.String())
+	}
+	if done == nil {
+		t.Fatal("未收到 done chunk")
+	}
+	if done.Usage == nil || done.Usage.TotalTokens <= 0 {
+		t.Fatalf("provider 省略 usage 时应返回估算 usage，got=%#v", done.Usage)
 	}
 }
 
@@ -910,6 +1008,36 @@ func (p *reasoningOnlyStreamProvider) Models() []llm.ModelInfo {
 
 func (p *reasoningOnlyStreamProvider) CountTokens([]llm.Message) (int, error) {
 	return 0, nil
+}
+
+type usageLessStreamProvider struct{}
+
+func (p *usageLessStreamProvider) Name() string { return "test" }
+
+func (p *usageLessStreamProvider) Complete(context.Context, hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+	return &hexagon.CompletionResponse{Content: "stream usage answer"}, nil
+}
+
+func (p *usageLessStreamProvider) Stream(context.Context, hexagon.CompletionRequest) (*hexagon.LLMStream, error) {
+	body := strings.Join([]string{
+		`data: {"id":"c1","model":"mock-model","choices":[{"delta":{"content":"stream usage "}}]}`,
+		`data: {"id":"c1","model":"mock-model","choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n")
+	return llm.NewStream(strings.NewReader(body), llm.StreamOpenAIFormat), nil
+}
+
+func (p *usageLessStreamProvider) Models() []llm.ModelInfo {
+	return []llm.ModelInfo{{ID: "mock-model", Name: "Mock Model"}}
+}
+
+func (p *usageLessStreamProvider) CountTokens(messages []llm.Message) (int, error) {
+	total := 0
+	for _, msg := range messages {
+		total += len(msg.Content) / 4
+	}
+	return total, nil
 }
 
 func newEngineWithProvider(t *testing.T, provider hexagon.Provider) *ReActEngine {

@@ -18,6 +18,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
@@ -32,6 +33,9 @@ type TelegramAdapter struct {
 	queue   *adapter.SendQueue
 	offset  atomic.Int64 // 长轮询偏移量
 	stopped atomic.Bool
+	// v0.4.0 E5：Start 收到的 ctx，仅作 logger/trace 链路源头使用；
+	// 实际异步 handler 处理用 trace.Detach(baseCtx) 派生新 ctx，避免被父 cancel 杀死。
+	baseCtx context.Context
 }
 
 // New 创建 Telegram 适配器
@@ -53,9 +57,14 @@ func (a *TelegramAdapter) Name() string {
 func (a *TelegramAdapter) Platform() adapter.Platform { return adapter.PlatformTelegram }
 
 // Start 启动长轮询
-func (a *TelegramAdapter) Start(_ context.Context, handler adapter.MessageHandler) error {
+func (a *TelegramAdapter) Start(ctx context.Context, handler adapter.MessageHandler) error {
 	a.handler = handler
 	a.stopped.Store(false)
+	// v0.4.0 E5：保留 Start ctx，handleMessage 用 Detach 派生异步处理 ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.baseCtx = ctx
 
 	go a.pollLoop()
 	logger.Info("Telegram 适配器已启动（长轮询模式）")
@@ -73,7 +82,12 @@ func (a *TelegramAdapter) Stop(_ context.Context) error {
 }
 
 // Send 发送消息
+//
+// v0.4.0 F6：reply.Interactive 非空时，flag interactive.render.v1 OFF 自动追加文本
+// fallback，让按钮/选项/审批/卡片在 Telegram 基础可用；flag ON 时 no-op，等待后续
+// Inline Keyboard 原生 renderer。
 func (a *TelegramAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	adapter.MaybeApplyTextFallback(ctx, reply)
 	if a.queue == nil {
 		return a.sendMessageNow(ctx, chatID, reply)
 	}
@@ -81,11 +95,14 @@ func (a *TelegramAdapter) Send(ctx context.Context, chatID string, reply *adapte
 }
 
 // SendStream 流式发送（先发初始消息，后续编辑更新模拟打字机）
+//
+// v0.4.0 E1：替换原硬编码 50 字阈值为 adapter.StreamEditLimiter，
+// 支持字符阈值 + 时间间隔 + 连续 3 次失败自适应降级（封顶 maxInterval）。
+// Telegram editMessageText 限制约 30 次/秒/聊天，限流器避免触发 429。
 func (a *TelegramAdapter) SendStream(ctx context.Context, chatID string, chunks <-chan *adapter.ReplyChunk) error {
 	var sb strings.Builder
 	var messageID int64
-	lastUpdateLen := 0
-	const updateThreshold = 50
+	limiter := adapter.NewStreamEditLimiter()
 
 	for chunk := range chunks {
 		if chunk.Error != nil {
@@ -96,23 +113,36 @@ func (a *TelegramAdapter) SendStream(ctx context.Context, chatID string, chunks 
 			break
 		}
 
-		if messageID == 0 && sb.Len() >= updateThreshold {
-			var err error
-			messageID, err = a.sendAndGetID(ctx, chatID, sb.String()+"…")
-			if err != nil {
+		if messageID == 0 {
+			if !limiter.ShouldEmit(sb.Len()) {
 				continue
 			}
-			lastUpdateLen = sb.Len()
+			id, err := a.sendAndGetID(ctx, chatID, adapter.StripThinking(sb.String())+"…")
+			if err != nil {
+				if degraded := limiter.Failed(); degraded {
+					logger.Warn("[telegram] 流式限流降级", "delay", limiter.CurrentDelay())
+				}
+				continue
+			}
+			messageID = id
+			limiter.Emitted(sb.Len())
 			continue
 		}
 
-		if messageID != 0 && sb.Len()-lastUpdateLen >= updateThreshold {
-			_ = a.editMessage(ctx, chatID, messageID, sb.String()+"…")
-			lastUpdateLen = sb.Len()
+		if limiter.ShouldEmit(sb.Len()) {
+			if err := a.editMessage(ctx, chatID, messageID, adapter.StripThinking(sb.String())+"…"); err != nil {
+				logger.Error("[telegram] 编辑流式消息失败", "error", err)
+				if degraded := limiter.Failed(); degraded {
+					logger.Warn("[telegram] 流式限流降级", "delay", limiter.CurrentDelay())
+				}
+			} else {
+				limiter.Emitted(sb.Len())
+			}
 		}
 	}
 
-	finalContent := sb.String()
+	// v0.4.0 E2：最终发送前 strip thinking 防泄漏给家长
+	finalContent := adapter.StripThinking(sb.String())
 	if finalContent == "" {
 		return nil
 	}
@@ -222,6 +252,9 @@ func (a *TelegramAdapter) getUpdates() ([]tgUpdate, error) {
 }
 
 // handleMessage 处理收到的消息
+//
+// v0.4.0 E5：所有派生 ctx 一律走 trace.Detach(baseCtx)，保留 logger/Values
+// 链路，又脱离 Start ctx 的 cancel（消息处理可能比 Start 提前结束更长）。
 func (a *TelegramAdapter) handleMessage(tgMsg *tgMessage) {
 	if a.handler == nil {
 		return
@@ -242,13 +275,18 @@ func (a *TelegramAdapter) handleMessage(tgMsg *tgMessage) {
 		},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	base := a.baseCtx
+	if base == nil {
+		base = context.Background()
+	}
+
+	ctx, cancel := context.WithTimeout(trace.Detach(base), 2*time.Minute)
 	defer cancel()
 
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
 		logger.Error("Telegram: 处理消息失败", "error", err)
-		errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		errCtx, errCancel := context.WithTimeout(trace.Detach(base), 10*time.Second)
 		defer errCancel()
 		_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{Content: "处理消息时出现错误，请稍后重试。"})
 		return
@@ -256,7 +294,7 @@ func (a *TelegramAdapter) handleMessage(tgMsg *tgMessage) {
 	if reply == nil {
 		return
 	}
-	sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	sendCtx, sendCancel := context.WithTimeout(trace.Detach(base), 30*time.Second)
 	defer sendCancel()
 	if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
 		logger.Error("Telegram: 发送回复失败", "error", err)

@@ -40,6 +40,42 @@ type Plugin interface {
 > **Note**: `Register` and `Unregister` emit event callbacks after releasing the write lock,
 > so it is safe to call other Registry methods from within `OnLoaded`/`OnUnloaded` handlers.
 
+## ExtensionPlugin Manifest v1
+
+v0.4 adds the `ExtensionPlugin` protocol so a plugin declares its version, minimum
+host version, dependencies, and requested capabilities before it is loaded. When
+`plugin.extension.v1` is enabled, the Manager validates the Manifest and builds a
+least-privilege `ExtensionContext` from the requested capabilities.
+
+```go
+type MyPlugin struct {
+    plugin.BasePlugin
+}
+
+func (p *MyPlugin) Manifest() hcplugin.Manifest {
+    return hcplugin.Manifest{
+        Name:           "com.example.my-plugin",
+        Version:        "1.0.0",
+        MinHostVersion: "0.4.0",
+        Capabilities: []hcplugin.Capability{
+            hcplugin.CapReadSkills,
+            hcplugin.CapEmitEvents,
+        },
+        Description: "Example plugin",
+    }
+}
+```
+
+Defined capabilities:
+- `skills.read`: read the host Skill registry
+- `events.emit`: emit structured events
+- `network`: make network requests
+- `fs.read`: read files inside the host sandbox
+- `fs.write`: write `.pending`-style files for later review
+
+Capabilities that are not declared are left nil in `ExtensionContext`; plugins
+should degrade gracefully when a field is nil.
+
 ## Quick Start
 
 ### 1. Create a Skill Plugin

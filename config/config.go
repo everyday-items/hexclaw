@@ -38,6 +38,7 @@ type Config struct {
 	Audit      AuditConfig      `yaml:"audit"`
 	Voice      VoiceConfig      `yaml:"voice"`
 	Budget     BudgetConfig     `yaml:"budget"`
+	Features   map[string]bool  `yaml:"features"` // v0.4.0 feature flag override（key=flag name）
 }
 
 // BudgetConfig 单任务三维预算控制 (G1 前置关卡)

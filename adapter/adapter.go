@@ -97,6 +97,10 @@ type Reply struct {
 	Metadata  map[string]string // 附加元数据（如工具调用结果、引用来源等）
 	Usage     *Usage            // Token 使用统计（可选）
 	ToolCalls []ToolCall        // 工具调用记录（可选）
+	// Interactive 结构化交互载荷（v0.4.0 G3）。
+	// 替代旧的 metadata["interactive_buttons"] JSON 字符串嵌入做法。
+	// 桌面端 / IM 适配器按 Type 渲染按钮 / 选项 / 审批 / 卡片。
+	Interactive *InteractivePayload
 }
 
 // ReplyChunk 流式回复片段
@@ -111,6 +115,8 @@ type ReplyChunk struct {
 	Metadata  map[string]string // 附加元数据（仅在 Done=true 时填充）
 	Usage     *Usage            // Token 使用统计（仅在 Done=true 时填充）
 	ToolCalls []ToolCall        // 工具调用记录（仅在 Done=true 时填充）
+	// Interactive 结构化交互载荷（仅在 Done=true 时填充；与 Reply.Interactive 同语义）。
+	Interactive *InteractivePayload
 }
 
 // MessageHandler 消息处理回调（同步模式）

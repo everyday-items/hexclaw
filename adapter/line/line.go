@@ -127,13 +127,15 @@ func (a *LineAdapter) sendReplyNow(ctx context.Context, chatID string, reply *ad
 	if reply == nil {
 		return nil
 	}
+	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给家长（同时覆盖 reply/push 两条路径）
+	clean := adapter.StripThinking(reply.Content)
 	if replyToken := reply.Metadata["reply_token"]; replyToken != "" {
-		return a.replyMessage(ctx, replyToken, reply.Content)
+		return a.replyMessage(ctx, replyToken, clean)
 	}
 	payload := map[string]any{
 		"to": chatID,
 		"messages": []map[string]string{
-			{"type": "text", "text": reply.Content},
+			{"type": "text", "text": clean},
 		},
 	}
 

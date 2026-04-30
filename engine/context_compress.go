@@ -21,6 +21,11 @@ const (
 	// ~20K tokens for Chinese-heavy content, ~10K for English.
 	contextCompressCharThreshold = 40000
 
+	// contextHeuristicMaxChars 启发式路径上限。超过则降级到 LLM 摘要。
+	// 设为 threshold 的 2 倍：小幅超限走启发式（快、便宜、稳定），
+	// 大幅超限走 LLM（保留语义）。
+	contextHeuristicMaxChars = contextCompressCharThreshold * 2
+
 	// contextKeepRecent 保留最近 N 条消息不压缩。
 	// 这些是当前工作的"短期记忆"，LLM 需要完整上下文。
 	contextKeepRecent = 8
@@ -54,6 +59,17 @@ func compressContextIfNeeded(
 
 	if totalChars < contextCompressCharThreshold {
 		return messages
+	}
+
+	// 双路径路由（v0.4.0 F4）：
+	//   - 小幅超限（< 2x 阈值）→ HeuristicCompress 全量启发式（无 LLM 调用，快/便宜/稳定）
+	//   - 大幅超限（>= 2x 阈值）→ LLM 摘要（保留语义）
+	if totalChars < contextHeuristicMaxChars {
+		compressed := HeuristicCompress(messages, HeuristicCompressOptions{})
+		trace.L(ctx).Info("工具循环上下文压缩: 启发式路径",
+			"before", len(messages), "after", len(compressed),
+			"chars_before", totalChars, "session", sessionID)
+		return compressed
 	}
 
 	// 分割消息: system | old (可压缩) | recent (保留)
@@ -139,7 +155,13 @@ func llmToolSummary(ctx context.Context, msgs []llm.Message, provider hexagon.Pr
 	defer cancel()
 
 	var temp float64 = 0
-	resp, err := provider.Complete(summaryCtx, hexagon.CompletionRequest{
+	// v0.4.0 E4：用 CompleteWithFailover 做 ClassifyError-aware 重试（同 Provider，
+	// 无 Fallback —— 这函数本身是压缩，再压缩没意义；429/未知会自动退避重试）。
+	fc := &LLMCallContext{
+		Provider:     provider,
+		ProviderName: provider.Name(),
+	}
+	resp, err := CompleteWithFailover(summaryCtx, fc, hexagon.CompletionRequest{
 		Messages: []hexagon.Message{
 			{Role: "user", Content: sb.String()},
 		},

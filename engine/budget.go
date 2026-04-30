@@ -135,7 +135,14 @@ var pricingTable = map[string]map[string]modelPrice{
 // EstimateCost 根据定价表估算本次调用成本 (USD)
 //
 // 未匹配的 provider/model 返回 0（不阻断流程，只是不计费）。
+//
+// v0.4.0 F8 接入：若 SetGlobalPricer 已注入了 ChainPricer，本函数优先用它
+// （UserOverride > Cache > Remote > BuiltinFallback）。flag pricing.layered.v1
+// 关闭时全局 pricer 也是 nil → 退化到老 pricingTable，行为与 v0.3 完全一致。
 func EstimateCost(provider, model string, inputTokens, outputTokens int) float64 {
+	if cp := getGlobalPricer(); cp != nil {
+		return cp.EstimateCost(provider, model, inputTokens, outputTokens)
+	}
 	models, ok := pricingTable[provider]
 	if !ok {
 		return 0
@@ -145,6 +152,22 @@ func EstimateCost(provider, model string, inputTokens, outputTokens int) float64
 		return 0
 	}
 	return float64(inputTokens)/1000*price.Input + float64(outputTokens)/1000*price.Output
+}
+
+// globalPricer 是 SetGlobalPricer 注入的 ChainPricer（可空）。
+// 注：使用 atomic.Pointer 而非 sync.RWMutex，因为读路径在 react.go 1477 等热点上，
+// atomic 比 mutex 快 1-2 个数量级。
+var globalPricer atomic.Pointer[ChainPricer]
+
+// SetGlobalPricer 注入全局 ChainPricer。在 cmd/hexclaw 启动时调一次。
+// 传 nil 会清除注入，回退到老 pricingTable 路径。
+func SetGlobalPricer(p *ChainPricer) {
+	globalPricer.Store(p)
+}
+
+// getGlobalPricer 取出当前全局 pricer（可空）。
+func getGlobalPricer() *ChainPricer {
+	return globalPricer.Load()
 }
 
 // Allocate 从当前预算预分配一份子预算

@@ -16,11 +16,17 @@ import (
 // 基于 Hexagon plugin.Registry，扩展 HexClaw 专属能力：
 // 收集所有 SkillPlugin 的 Skill、所有 AdapterPlugin 的 Adapter、
 // 按顺序执行 HookPlugin 链。
+//
+// v0.4.0 H5：当 plugin 实现 ExtensionPlugin（暴露 Manifest）且 flag
+// plugin.extension.v1 开启时，Register 会校验 Manifest 兼容性 + capability
+// 白名单；校验失败拒绝注册。
 type Manager struct {
-	mu       sync.RWMutex
-	registry *hexagon.PluginRegistry
-	plugins  []hexagon.PluginPlugin // 保持注册顺序
-	hooks    []HookPlugin
+	mu          sync.RWMutex
+	registry    *hexagon.PluginRegistry
+	plugins     []hexagon.PluginPlugin // 保持注册顺序
+	hooks       []HookPlugin
+	hostVersion string                          // 用于 Manifest.MinHostVersion 校验
+	hostFlags   featureflagFlagsAdapter         // featureflag.Flags 适配（接受 nil）
 }
 
 // NewManager 创建插件管理器
@@ -30,10 +36,41 @@ func NewManager() *Manager {
 	}
 }
 
+// SetHostContext 注入 host 版本号 + featureflag.Flags，供 Register 时校验 Manifest 用。
+//
+// 在 cmd/hexclaw 启动后立刻调一次：
+//
+//	mgr.SetHostContext("0.4.0", flags)
+//
+// 不调时 Register 表现等价于 v0.3（不校验 Manifest）。
+func (m *Manager) SetHostContext(hostVersion string, flags featureflagFlagsAdapter) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hostVersion = hostVersion
+	m.hostFlags = flags
+}
+
+// featureflagFlagsAdapter 是 featureflag.Flags 的薄类型别名，避免 plugin 包
+// 反向 import featureflag（已在 extension.go 中 import 过）。
+type featureflagFlagsAdapter interface {
+	IsEnabled(name string) bool
+}
+
 // Register 注册插件
 func (m *Manager) Register(p hexagon.PluginPlugin) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// v0.4.0 H5：在 flag 开启 + plugin 实现 ExtensionPlugin 时强制校验 Manifest
+	if ext, ok := p.(ExtensionPlugin); ok && m.hostFlags != nil && m.hostFlags.IsEnabled(FlagPluginExtensionV1) {
+		hostV := m.hostVersion
+		if hostV == "" {
+			hostV = "0.0.0"
+		}
+		if err := ValidateManifest(ext.Manifest(), hostV); err != nil {
+			return fmt.Errorf("注册插件 %s 失败: manifest 校验未通过: %w", p.Info().Name, err)
+		}
+	}
 
 	if err := m.registry.Register(p); err != nil {
 		return fmt.Errorf("注册插件 %s 失败: %w", p.Info().Name, err)

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
@@ -108,9 +109,10 @@ func (a *MatrixAdapter) sendReplyNow(ctx context.Context, roomID string, reply *
 	url := fmt.Sprintf("%s/_matrix/client/v3/rooms/%s/send/m.room.message/%s",
 		a.config.HomeserverURL, roomID, txnID)
 
+	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给家长
 	payload := map[string]string{
 		"msgtype": "m.text",
-		"body":    reply.Content,
+		"body":    adapter.StripThinking(reply.Content),
 	}
 
 	body, _ := json.Marshal(payload)
@@ -198,7 +200,7 @@ func (a *MatrixAdapter) doSync(ctx context.Context) error {
 	// 处理 room 消息
 	for roomID, room := range syncResp.Rooms.Join {
 		for _, event := range room.Timeline.Events {
-			a.handleEvent(roomID, event)
+			a.handleEvent(ctx, roomID, event)
 		}
 	}
 
@@ -206,7 +208,7 @@ func (a *MatrixAdapter) doSync(ctx context.Context) error {
 }
 
 // handleEvent 处理 Matrix 事件
-func (a *MatrixAdapter) handleEvent(roomID string, event matrixEvent) {
+func (a *MatrixAdapter) handleEvent(ctx context.Context, roomID string, event matrixEvent) {
 	// 只处理文本消息，忽略自己发的
 	if event.Type != "m.room.message" || event.Sender == a.config.UserID {
 		return
@@ -233,16 +235,20 @@ func (a *MatrixAdapter) handleEvent(roomID string, event matrixEvent) {
 	}
 
 	go func(m *adapter.Message) {
-		if a.handler != nil {
-			reply, err := a.handler(context.Background(), m)
-			if err != nil {
-				logger.Error("[Matrix] 处理消息错误", "error", err)
-				return
-			}
-			if reply != nil {
-				if err := a.Send(context.Background(), m.ChatID, reply); err != nil {
-					logger.Error("[Matrix] 发送回复错误", "error", err)
-				}
+		if a.handler == nil {
+			return
+		}
+		// H7: Detach(syncCtx) 保留 logger，脱离 sync loop cancel 避免消息处理半途被杀
+		bgCtx, cancel := context.WithTimeout(trace.Detach(ctx), 2*time.Minute)
+		defer cancel()
+		reply, err := a.handler(bgCtx, m)
+		if err != nil {
+			logger.Error("[Matrix] 处理消息错误", "error", err)
+			return
+		}
+		if reply != nil {
+			if err := a.Send(bgCtx, m.ChatID, reply); err != nil {
+				logger.Error("[Matrix] 发送回复错误", "error", err)
 			}
 		}
 	}(msg)

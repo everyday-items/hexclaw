@@ -28,6 +28,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 
@@ -49,6 +50,9 @@ type DiscordAdapter struct {
 	handler adapter.MessageHandler
 	client  *http.Client
 	queue   *adapter.SendQueue
+	// v0.4.0 E5：Start 收到的 ctx，仅作 logger/trace 链路源头使用；
+	// 实际异步处理用 trace.Detach(baseCtx) 派生新 ctx，避免被父 cancel 杀死。
+	baseCtx context.Context
 
 	conn          *websocket.Conn // WebSocket 连接
 	mu            sync.Mutex      // 保护 conn
@@ -82,9 +86,14 @@ func (a *DiscordAdapter) Platform() adapter.Platform { return adapter.PlatformDi
 //
 // 连接 Gateway WebSocket，开始接收消息。
 // 自动维持心跳和处理重连。
-func (a *DiscordAdapter) Start(_ context.Context, handler adapter.MessageHandler) error {
+func (a *DiscordAdapter) Start(ctx context.Context, handler adapter.MessageHandler) error {
 	a.handler = handler
 	a.stopped.Store(false)
+	// v0.4.0 E5：保留 Start ctx，handleMessageCreate 用 Detach 派生异步处理 ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.baseCtx = ctx
 
 	if a.cfg.Token == "" {
 		return fmt.Errorf("discord bot token 不能为空")
@@ -124,7 +133,12 @@ func (a *DiscordAdapter) Stop(_ context.Context) error {
 }
 
 // Send 发送同步回复
+//
+// v0.4.0 F6：reply.Interactive 非空时，flag interactive.render.v1 OFF 自动追加文本
+// fallback，让按钮/选项/审批/卡片在 Discord 基础可用；flag ON 时 no-op，等待后续
+// Embed Components 原生 renderer。
 func (a *DiscordAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	adapter.MaybeApplyTextFallback(ctx, reply)
 	if a.queue == nil {
 		return a.sendReplyNow(ctx, chatID, reply)
 	}
@@ -132,9 +146,13 @@ func (a *DiscordAdapter) Send(ctx context.Context, chatID string, reply *adapter
 }
 
 // SendStream 流式发送（发送初始消息，后续编辑更新）
+//
+// v0.4.0 E1：接入 adapter.StreamEditLimiter，避免高频 PATCH 触发 Discord
+// channel-level 限流（默认 5 req/5s/channel）。三级保护：字符阈值 + 时间间隔 + 失败降级。
 func (a *DiscordAdapter) SendStream(ctx context.Context, chatID string, chunks <-chan *adapter.ReplyChunk) error {
 	var sb strings.Builder
 	var msgID string
+	limiter := adapter.NewStreamEditLimiter()
 
 	for chunk := range chunks {
 		if chunk.Error != nil {
@@ -142,18 +160,43 @@ func (a *DiscordAdapter) SendStream(ctx context.Context, chatID string, chunks <
 		}
 		sb.WriteString(chunk.Content)
 
-		// 首个 chunk 发送新消息，后续编辑
+		// v0.4.0 E2：每次发送/编辑都 strip thinking
+		clean := adapter.StripThinking(sb.String())
 		if msgID == "" {
-			id, err := a.createMessage(ctx, chatID, sb.String())
+			if !limiter.ShouldEmit(sb.Len()) {
+				continue
+			}
+			id, err := a.createMessage(ctx, chatID, clean)
 			if err != nil {
+				if degraded := limiter.Failed(); degraded {
+					logger.Warn("[discord] 流式限流降级", "delay", limiter.CurrentDelay())
+				}
 				return err
 			}
 			msgID = id
-		} else {
-			a.editMessage(ctx, chatID, msgID, sb.String())
+			limiter.Emitted(sb.Len())
+		} else if limiter.ShouldEmit(sb.Len()) {
+			if err := a.editMessage(ctx, chatID, msgID, clean); err != nil {
+				logger.Error("[discord] 编辑流式消息失败", "error", err)
+				if degraded := limiter.Failed(); degraded {
+					logger.Warn("[discord] 流式限流降级", "delay", limiter.CurrentDelay())
+				}
+			} else {
+				limiter.Emitted(sb.Len())
+			}
 		}
 	}
-	return nil
+
+	// 收尾：限流期间残留内容必须落地
+	finalClean := adapter.StripThinking(sb.String())
+	if finalClean == "" {
+		return nil
+	}
+	if msgID == "" {
+		_, err := a.createMessage(ctx, chatID, finalClean)
+		return err
+	}
+	return a.editMessage(ctx, chatID, msgID, finalClean)
 }
 
 // ============== Gateway 连接 ==============
@@ -360,20 +403,25 @@ func (a *DiscordAdapter) handleMessageCreate(data json.RawMessage) {
 	}
 
 	// 异步处理消息
+	// v0.4.0 E5：Detach(baseCtx) 保留 logger/Values，但脱离 Start ctx cancel
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		base := a.baseCtx
+		if base == nil {
+			base = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(trace.Detach(base), 120*time.Second)
 		defer cancel()
 
 		reply, err := a.handler(ctx, unified)
 		if err != nil {
 			logger.Error("Discord 消息处理失败", "error", err)
-			errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			errCtx, errCancel := context.WithTimeout(trace.Detach(base), 10*time.Second)
 			defer errCancel()
 			_ = a.Send(errCtx, msg.ChannelID, &adapter.Reply{Content: "处理消息时出错，请稍后重试。"})
 			return
 		}
 		if reply != nil {
-			sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			sendCtx, sendCancel := context.WithTimeout(trace.Detach(base), 30*time.Second)
 			defer sendCancel()
 			_ = a.Send(sendCtx, msg.ChannelID, reply)
 		}

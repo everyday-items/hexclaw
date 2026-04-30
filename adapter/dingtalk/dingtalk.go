@@ -322,7 +322,11 @@ func (a *DingtalkAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 // ============== 消息处理 ==============
 
 // Send 发送消息
+//
+// v0.4.0 F6：reply.Interactive 非空且 flag interactive.render.v1 OFF 时，
+// 自动追加文本 fallback 让按钮/选项/审批/卡片在钉钉基础可用。
 func (a *DingtalkAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	adapter.MaybeApplyTextFallback(ctx, reply)
 	if a.queue == nil {
 		return a.sendReplyNow(ctx, chatID, reply)
 	}
@@ -375,7 +379,8 @@ func (a *DingtalkAdapter) SendStream(ctx context.Context, chatID string, chunks 
 		}
 		sb.WriteString(chunk.Content)
 	}
-	return a.Send(ctx, chatID, &adapter.Reply{Content: sb.String()})
+	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给家长
+	return a.Send(ctx, chatID, &adapter.Reply{Content: adapter.StripThinking(sb.String())})
 }
 
 // handleMessage 处理消息

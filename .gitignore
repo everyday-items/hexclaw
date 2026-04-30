@@ -42,3 +42,6 @@ vendor/
 .DS_Store
 Thumbs.db
 /hexclaw
+/hexclaw-sidecar
+/verify-release
+/.codex-write-check

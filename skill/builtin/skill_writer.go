@@ -17,14 +17,24 @@ var validSkillName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
 
 // SkillWriterSkill allows the LLM to create new Skills as SKILL.md files.
 //
+// v0.4.0 F2 K12 安全底线（强制 .pending 流）：
+//   - LLM 永远不直接覆盖 production 的 SKILL.md
+//   - 所有写入落到 SKILL.md.pending；marketplace loader 不会扫描 .pending
+//   - 用户/家长通过 manage_skill_pending(approve|reject) 审核闭环
+//
 // Security:
 //   - Name validation (no path traversal)
 //   - Content scanned by SkillScanner before writing
-//   - Written to user's skill directory only
+//   - Written to user's skill directory only as .pending file
 type SkillWriterSkill struct {
 	skillDir string
 	scanner  *security.SkillScanner
 }
+
+// PendingSuffix 是 LLM-written Skill 文件的待审批后缀。marketplace loader 不会
+// 把这些文件加载进 registry，必须经 SkillPendingSkill.approve 改名为 SKILL.md
+// 才会生效。
+const PendingSuffix = ".pending"
 
 // NewSkillWriterSkill creates a new SkillWriterSkill.
 func NewSkillWriterSkill(skillDir string, scanner *security.SkillScanner) *SkillWriterSkill {
@@ -34,13 +44,17 @@ func NewSkillWriterSkill(skillDir string, scanner *security.SkillScanner) *Skill
 	}
 }
 
-func (s *SkillWriterSkill) Name() string        { return "create_skill" }
-func (s *SkillWriterSkill) Description() string { return "Create a new reusable skill" }
+func (s *SkillWriterSkill) Name() string { return "create_skill" }
+func (s *SkillWriterSkill) Description() string {
+	return "Draft a new reusable skill (writes to SKILL.md.pending; user must approve before activation)"
+}
 func (s *SkillWriterSkill) Match(_ string) bool { return false }
 
 func (s *SkillWriterSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition("create_skill",
-		"Create a new reusable skill as a SKILL.md file. The skill will be available for future tool calls. Use when you need a capability that doesn't exist yet.",
+		"Draft a new reusable skill. The content is saved as SKILL.md.pending and is NOT loaded "+
+			"into the live skill registry until the user runs manage_skill_pending(action='approve'). "+
+			"Use when a needed capability doesn't yet exist.",
 		&llm.Schema{
 			Type: "object",
 			Properties: map[string]*llm.Schema{
@@ -73,7 +87,7 @@ func (s *SkillWriterSkill) Execute(_ context.Context, args map[string]any) (*ski
 		return nil, fmt.Errorf("security scan failed: %w", err)
 	}
 
-	// 3. Write to disk (with symlink protection)
+	// 3. Write to disk as .pending (with symlink protection)
 	dir := filepath.Join(s.skillDir, name)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create skill directory: %w", err)
@@ -87,12 +101,31 @@ func (s *SkillWriterSkill) Execute(_ context.Context, args map[string]any) (*ski
 	if !strings.HasPrefix(resolvedDir, resolvedBase) {
 		return nil, fmt.Errorf("skill directory escapes base path (symlink attack?)")
 	}
-	path := filepath.Join(resolvedDir, "SKILL.md")
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		return nil, fmt.Errorf("failed to write skill file: %w", err)
+	pendingPath := filepath.Join(resolvedDir, "SKILL.md"+PendingSuffix)
+	if err := os.WriteFile(pendingPath, []byte(content), 0644); err != nil {
+		return nil, fmt.Errorf("failed to write skill pending file: %w", err)
+	}
+
+	livePath := filepath.Join(resolvedDir, "SKILL.md")
+	exists := false
+	if _, err := os.Stat(livePath); err == nil {
+		exists = true
+	}
+
+	verb := "drafted"
+	if exists {
+		verb = "drafted (overwrites existing)"
 	}
 
 	return &skill.Result{
-		Content: fmt.Sprintf("Skill '%s' created at %s. Restart to load, or use manage_skill to hot-reload.", name, path),
+		Content: fmt.Sprintf(
+			"Skill '%s' %s at %s. NOT YET ACTIVE — call manage_skill_pending(action='approve', name='%s') after the user reviews it.",
+			name, verb, pendingPath, name,
+		),
+		Metadata: map[string]string{
+			"skill_name":   name,
+			"pending_path": pendingPath,
+			"overwrites":   fmt.Sprintf("%t", exists),
+		},
 	}, nil
 }

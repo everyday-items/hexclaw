@@ -67,12 +67,18 @@ type connectedServer struct {
 //
 // 管理所有 MCP Server 连接，自动发现工具。
 // 提供工具列表和健康检查能力。
+//
+// v0.4.0 H3：通过 AddLifecycleHook 接收连接状态变更事件；
+// 通过 RegisterServer / UnregisterServer 在运行时动态加挂 / 卸载 server
+// （flag mcp.lifecycle.v2 控制 hook 是否触发；动态 API 始终可用）。
 type Manager struct {
 	mu        sync.RWMutex
 	servers   map[string]*connectedServer
 	configs   []ServerConfig // 保存配置用于重连
 	stopCh    chan struct{}
 	closeOnce sync.Once
+
+	hooks hooksRegistry // v0.4.0 H3 LifecycleHook 列表
 }
 
 // NewManager 创建 MCP 管理器
@@ -81,6 +87,14 @@ func NewManager() *Manager {
 		servers: make(map[string]*connectedServer),
 		stopCh:  make(chan struct{}),
 	}
+}
+
+// AddLifecycleHook 注册一个 LifecycleHook。flag mcp.lifecycle.v2 关闭时 hook
+// 会被记录但不会触发；flag 开启时所有 hook 在 server 连接 / 断连时被调用。
+//
+// 多次调用会按注册顺序追加 hook 列表；nil hook 会被安静跳过。
+func (m *Manager) AddLifecycleHook(h LifecycleHook) {
+	m.hooks.add(h)
 }
 
 // Connect 连接所有配置的 MCP Server
@@ -107,6 +121,8 @@ func (m *Manager) Connect(ctx context.Context, configs []ServerConfig) (int, err
 
 		totalTools += len(server.tools)
 		logger.Info("MCP Server", "name", cfg.Name, "len", len(server.tools))
+		// v0.4.0 H3：触发 lifecycle hook（flag OFF 时为 no-op）
+		m.hooks.fireConnected(ctx, cfg.Name, len(server.tools))
 	}
 
 	// 保存配置用于重连
@@ -118,6 +134,100 @@ func (m *Manager) Connect(ctx context.Context, configs []ServerConfig) (int, err
 	go m.reconnectLoop()
 
 	return totalTools, nil
+}
+
+// RegisterServer 在运行时动态注册并连接单个 MCP server。
+//
+// v0.4.0 H3：相对于批量 Connect，本 API 适合在用户从 UI 添加 MCP server 时
+// 立即连接，无需重启。同名已存在会先 Unregister 再连接。
+//
+// 触发 OnServerConnected lifecycle hook（如果 flag 开启）。
+func (m *Manager) RegisterServer(ctx context.Context, cfg ServerConfig) error {
+	if cfg.Name == "" {
+		return fmt.Errorf("RegisterServer: empty name")
+	}
+	if !cfg.Enabled {
+		// 不抛错，但也不连接 —— 调用方意图明确：先注册到 configs，后续手动 enable
+		m.mu.Lock()
+		m.configs = appendOrReplaceConfig(m.configs, cfg)
+		m.mu.Unlock()
+		return nil
+	}
+
+	server, err := m.connectServer(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("connect %q: %w", cfg.Name, err)
+	}
+
+	m.mu.Lock()
+	// 替换旧连接
+	if old, ok := m.servers[cfg.Name]; ok {
+		closeServer(old)
+		delete(m.servers, cfg.Name)
+	}
+	m.servers[cfg.Name] = server
+	m.configs = appendOrReplaceConfig(m.configs, cfg)
+	m.mu.Unlock()
+
+	logger.Info("MCP Server registered", "name", cfg.Name, "tools", len(server.tools))
+	m.hooks.fireConnected(ctx, cfg.Name, len(server.tools))
+	return nil
+}
+
+// UnregisterServer 卸载并断开单个 MCP server。返回是否真的存在并被卸载。
+//
+// 触发 OnServerDisconnected lifecycle hook（如果 flag 开启）。
+func (m *Manager) UnregisterServer(ctx context.Context, name string) bool {
+	m.mu.Lock()
+	server, ok := m.servers[name]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+	closeServer(server)
+	delete(m.servers, name)
+	m.configs = removeConfig(m.configs, name)
+	m.mu.Unlock()
+
+	logger.Info("MCP Server unregistered", "name", name)
+	m.hooks.fireDisconnected(ctx, name, "manual unregister")
+	return true
+}
+
+// closeServer 调用 cleanup / closer 关闭单个 server 的传输层。
+func closeServer(s *connectedServer) {
+	if s == nil {
+		return
+	}
+	if s.cleanup != nil {
+		s.cleanup()
+	}
+	if s.closer != nil {
+		_ = s.closer.Close()
+	}
+	s.connected = false
+}
+
+// appendOrReplaceConfig 替换同名 config 或追加。
+func appendOrReplaceConfig(list []ServerConfig, cfg ServerConfig) []ServerConfig {
+	for i, c := range list {
+		if c.Name == cfg.Name {
+			list[i] = cfg
+			return list
+		}
+	}
+	return append(list, cfg)
+}
+
+// removeConfig 移除同名 config。
+func removeConfig(list []ServerConfig, name string) []ServerConfig {
+	out := list[:0]
+	for _, c := range list {
+		if c.Name != name {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // reconnectLoop 定期检查断开的 Server 并尝试重连

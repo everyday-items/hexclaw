@@ -289,7 +289,12 @@ func (a *FeishuAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) {
 // ============== 消息处理 ==============
 
 // Send 发送同步回复
+//
+// v0.4.0 F6：reply.Interactive 非空且 flag interactive.render.v1 OFF 时，
+// 自动追加文本 fallback；flag ON 时 no-op 等待飞书原生卡片 renderer 接入
+// （飞书已有 send_card / patch_card 路径，留给 v0.4.x 后续迭代）。
 func (a *FeishuAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	adapter.MaybeApplyTextFallback(ctx, reply)
 	if a.queue == nil {
 		return a.sendReplyNow(ctx, chatID, reply)
 	}

@@ -1,6 +1,7 @@
 package matrix
 
 import (
+	"context"
 	"testing"
 )
 
@@ -36,7 +37,7 @@ func TestMatrixAdapter_HandleEvent_SkipSelf(t *testing.T) {
 	}
 
 	// handler 未设置，handleEvent 应跳过自己的消息不 panic
-	a.handleEvent("!room:example.com", event)
+	a.handleEvent(context.Background(), "!room:example.com", event)
 }
 
 func TestMatrixAdapter_HandleEvent_SkipNonText(t *testing.T) {
@@ -49,5 +50,5 @@ func TestMatrixAdapter_HandleEvent_SkipNonText(t *testing.T) {
 		Content: map[string]any{"msgtype": "m.image", "url": "mxc://..."},
 	}
 
-	a.handleEvent("!room:example.com", event)
+	a.handleEvent(context.Background(), "!room:example.com", event)
 }

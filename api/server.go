@@ -47,6 +47,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/instances"
 	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
 	"github.com/hexagon-codes/hexclaw/knowledge"
+	"github.com/hexagon-codes/hexclaw/llmrouter"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/router"
@@ -84,6 +85,7 @@ type Server struct {
 	voiceChatSvc      *voicechat.Service           // 语音对话服务（可选）
 	imagegenSvc       *imagegen.Service            // 图像生成服务（可选）
 	videogenSvc       *videogen.Service            // 视频生成服务（可选）
+	capabilities      *llmrouter.CapabilityService // A7 模型 tool_call 能力探测（可选）
 	genStore          *genstore.Store              // 生成内容持久化（图像/视频）
 	reloadGenServices func()                       // LLM 配置变更后重建 gen 服务（main.go 注入）
 	desktopSvc        *desktop.Service             // 桌面集成服务（可选）
@@ -98,6 +100,7 @@ type Server struct {
 	toolMetrics       *engine.ToolMetricsCollector // 工具指标（可选）
 	toolPerms         *engine.ToolPermissions      // 工具权限（可选）
 	checkpointMgr     *engine.CheckpointManager    // 检查点管理器（可选）
+	cfgTxMgr          *config.TransactionManager   // v0.4.0 F9 配置事务热加载（可选）
 	version           string                       // 版本号
 	// 沙箱网络热更新回调（由 main.go 注入）
 	onSandboxNetworkUpdate func(enabled bool) error
@@ -199,6 +202,12 @@ func (s *Server) SetMCPManager(mgr *hexmcp.Manager) {
 // SetCfgWriter 设置配置文件写入器（MCP 动态添加持久化用）
 func (s *Server) SetCfgWriter(w *config.Writer) {
 	s.cfgWriter = w
+}
+
+// SetCapabilityService 设置模型 tool_call 能力探测服务（A7）。
+// 设置后启用 GET /api/v1/llm/capabilities + POST /probe 端点。
+func (s *Server) SetCapabilityService(svc *llmrouter.CapabilityService) {
+	s.capabilities = svc
 }
 
 // SetMarketplace 设置技能市场
@@ -391,6 +400,14 @@ func (s *Server) SetToolPermissions(tp *engine.ToolPermissions) {
 // SetCheckpointManager 设置检查点管理器
 //
 // 设置后启用检查点列表 API。
+// SetConfigTxManager 注入 v0.4.0 F9 事务热加载 manager。
+//
+// 设置后 PUT /api/v1/config/llm 走 Begin → Stage → Save → Commit/Rollback 路径，
+// flag config.tx.hotload.v1 OFF 时自动降级到原有 ReloadLLMConfig 静态路径。
+func (s *Server) SetConfigTxManager(tm *config.TransactionManager) {
+	s.cfgTxMgr = tm
+}
+
 func (s *Server) SetCheckpointManager(cm *engine.CheckpointManager) {
 	s.checkpointMgr = cm
 }
@@ -445,6 +462,12 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("PUT /api/v1/config/llm", s.handleUpdateLLMConfig)
 	mux.HandleFunc("POST /api/v1/config/llm/test", s.handleTestLLMConfig)
 	mux.HandleFunc("POST /api/v1/config/llm/models", s.handleFetchProviderModels)
+
+	// A7 模型 tool_call 能力探测
+	if s.capabilities != nil {
+		mux.HandleFunc("GET /api/v1/llm/capabilities", s.handleListCapabilities)
+		mux.HandleFunc("POST /api/v1/llm/capabilities/probe", s.handleProbeCapability)
+	}
 
 	// 角色列表 API
 	mux.HandleFunc("GET /api/v1/roles", s.handleListRoles)

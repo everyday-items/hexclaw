@@ -300,4 +300,43 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_jobs_user_name
     ON cron_jobs(user_id, name);
 `,
 	},
+	{
+		Version:     3,
+		Description: "v0.4.0 A7 模型工具调用能力探测缓存",
+		SQL: `
+-- 每个 (provider, model) 一条记录；30 天 TTL 由应用层判断
+-- tool_call 取值：0=unknown / 1=good / 2=partial / 3=bad（对应 llmrouter.ReliabilityLevel）
+CREATE TABLE IF NOT EXISTS model_capabilities (
+    provider_name   TEXT     NOT NULL,
+    model_name      TEXT     NOT NULL,
+    tool_call       INTEGER  NOT NULL DEFAULT 0,
+    last_probe      DATETIME NOT NULL,
+    probe_error     TEXT     NOT NULL DEFAULT '',
+    PRIMARY KEY (provider_name, model_name)
+);
+`,
+	},
+	{
+		Version:     4,
+		Description: "v0.4.0 E3 H8 真表 UNIQUE 收口：kb_chunks(doc_id, chunk_index) 防重复入库膨胀",
+		SQL: `
+-- ========== v0.4.0 E3：kb_chunks 防同文档同位置重复 chunk 累积 ==========
+-- 场景：知识库 ingestion 失败 retry / 重新分块 → 旧 chunk 未删导致 (doc_id, chunk_index) 多行
+-- 业务唯一键：(doc_id, chunk_index)
+-- 策略：先 dedupe 历史重复（用 MIN(rowid) 做 deterministic tiebreak），再 CREATE UNIQUE INDEX
+-- 注意：kb_chunks_fts FTS5 trigger 会随主表 DELETE 自动同步（content='kb_chunks' 的 external content）
+DELETE FROM kb_chunks
+WHERE rowid NOT IN (
+    SELECT MIN(rowid) FROM kb_chunks
+    GROUP BY doc_id, chunk_index
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_chunks_doc_index
+    ON kb_chunks(doc_id, chunk_index);
+
+-- 注：messages 表 id 是 PRIMARY KEY，业务唯一性已由 PK 保证，无需补复合 UNIQUE。
+--     E3 评审时一度计划补 messages(session_id, seq_no)，但 schema 无 seq_no 字段，
+--     且 id 已是 PK，重复持久化会被 PK 冲突拒绝，无需复合 UNIQUE。
+`,
+	},
 }

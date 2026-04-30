@@ -16,12 +16,12 @@
 ## 特性
 
 ### 核心能力
-- **ReAct Agent 引擎** — 推理 + 行动循环，支持多轮工具调用与流式输出，流式工具执行完整闭环（执行 → 反馈 → 继续推理），reasoning/thinking 内容持久化
+- **ReAct Agent 引擎** — 推理 + 行动循环，支持多轮工具调用、流式输出、结构化交互消息，以及 `plan-execute` / `reflection` / `tot` 等 Agent 模式
 - **六层安全网关** — 认证、限流、成本控制、注入检测、权限校验、审计日志
-- **LLM 智能路由** — 多 Provider 自动切换，故障降级，成本优化
-- **Skill 系统** — 内置搜索/天气/翻译/摘要，沙箱安全执行，Shell 白名单防护
+- **LLM 智能路由** — 多 Provider 自动切换，故障降级，成本优化，模型 tool_call 能力探测
+- **Skill 系统** — 内置搜索/天气/翻译/摘要，7 阶段流水线，`.pending` 审批闭环，TrustLevel 与 TOCTOU 校验
 - **语义缓存** — Singleflight 防击穿 + TTL 抖动防雪崩 + 空值缓存防穿透
-- **知识库** — FTS5 + 向量混合检索，RAG 上下文增强
+- **知识库** — FTS5 + 向量混合检索，RAG 5 阶段 Pipeline，上下文增强
 
 ### 会话与数据
 - **会话管理** — 创建/查询/删除会话，消息历史，会话分支 (fork)
@@ -41,7 +41,7 @@
 - **多 Agent 路由** — 一个实例托管多个 Agent，按平台/用户/群组路由
 - **Canvas / A2UI** — Agent 生成交互式 UI（图表、表单、看板等 8 种组件）
 - **安全审计 CLI** — `hexclaw security audit` 一键安全检查 + 修复建议
-- **语音交互** — STT/TTS 转写与合成，支持多 Provider 接入
+- **语音交互** — STT/TTS 转写与合成，支持 MiniMax / Edge / OpenAI / Azure TTS 串联 fallback
 - **桌面集成** — 系统通知、剪贴板交互（Tauri 桌面端）
 - **实时日志** — WebSocket 日志流 + 统计分析
 
@@ -221,6 +221,13 @@ knowledge:
   chunk_size: 400
   top_k: 3
 
+features:
+  # v0.4 新能力默认按 alpha flag fail-closed，需要显式开启后才改变运行时路径。
+  model.gateway.v1: false
+  skill.pipeline.v1: false
+  config.tx.hotload.v1: false
+  events.transport.v1: false
+
 skill:
   sandbox:
     enabled: true
@@ -233,6 +240,21 @@ storage:
 ```
 
 所有配置项支持环境变量替换（`${VAR_NAME}`）。
+
+### Feature Flags
+
+v0.4 新增能力统一通过 `features:` 段启用。未注册的 flag 永远返回关闭，`alpha`
+阶段即使代码默认值写 true 也会强制关闭，避免实验能力意外进入生产路径。
+
+常见 flag：
+- `agent.factory.real`：允许按 `dispatch_role` 分派到真实 `hexagon.Agent`
+- `skill.pipeline.v1`：启用 Skill 7 阶段执行流水线
+- `interactive.render.v1`：交互消息走平台原生 renderer；关闭时使用文本 fallback
+- `config.tx.hotload.v1`：LLM 配置保存走事务热加载
+- `model.gateway.v1`：启用 Provider middleware 链路
+- `events.transport.v1`：启用结构化事件 Sink 投递
+- `rag.pipeline.v1`：启用知识库 5 阶段 RAG Pipeline
+- `voice.tts.chain.v1`：启用多 TTS Provider 串联 fallback
 
 ## 架构
 
@@ -279,9 +301,10 @@ hexclaw/
 │   ├── matrix/              #   Matrix
 │   └── email/               #   Email (IMAP/SMTP)
 ├── agents/                  # Agent 角色 (6 种预置角色)
-├── api/                     # REST API 服务 (71 个路由)
+├── api/                     # REST API 服务
 │   ├── server.go            #   核心服务器 + 聊天 + 路由注册
 │   ├── handler_config.go    #   LLM 配置查询/更新/测试/模型发现 API
+│   ├── handler_capabilities.go # 模型 tool_call 能力探测 API
 │   ├── handler_extended.go  #   工作流/配置/版本/统计 API
 │   ├── handler_logs.go      #   日志查询/统计/实时流 API
 │   ├── handler_knowledge.go #   知识库 API
@@ -295,13 +318,19 @@ hexclaw/
 ├── cron/                    # 定时任务调度
 ├── desktop/                 # 桌面集成 (通知/剪贴板)
 ├── engine/                  # Agent 引擎（ReAct 推理循环）
+├── events/                  # 结构化事件协议与 Sink
+├── eval/                    # 发版前评测套件
+├── featureflag/             # Feature flag 注册与运行时查询
 ├── gateway/                 # 六层安全网关
 ├── heartbeat/               # 心跳巡查
 ├── knowledge/               # 知识库 (FTS5 + 向量混合检索)
 ├── llmrouter/               # LLM 智能路由
 ├── mcp/                     # MCP Client (stdio + SSE)
 ├── memory/                  # 文件记忆 (MEMORY.md + 日记)
+├── plugin/                  # 插件 Manifest / Capability 扩展
+├── release/                 # 发版门禁与 canary 状态机
 ├── router/                  # 多 Agent 路由
+├── runtime/                 # 沙箱与 Checkpoint 回滚
 ├── session/                 # 会话管理 + 上下文压缩
 ├── skill/                   # Skill 系统
 │   ├── builtin/             #   内置 Skill (搜索/天气/翻译/摘要)
@@ -347,6 +376,8 @@ hexclaw/
 | PUT | `/api/v1/config/llm` | 更新 LLM 配置 |
 | POST | `/api/v1/config/llm/test` | 测试单个 Provider 连通性（不落盘；本地 Ollama 可无 Key） |
 | POST | `/api/v1/config/llm/models` | 动态获取 Provider 可用模型列表（代理到 Provider `/models` API） |
+| GET | `/api/v1/llm/capabilities` | 列出已缓存的模型 tool_call 能力探测结果 |
+| POST | `/api/v1/llm/capabilities/probe` | 立即探测指定 `provider` + `model` 的 tool_call 可靠度 |
 
 ### 知识库
 | 方法 | 路径 | 说明 |
@@ -493,6 +524,7 @@ hexclaw/
 - `POST /api/v1/agents/rules/test` 会返回命中规则与分数，便于解释“为什么路由到这个 Agent”。
 - `GET /api/v1/logs` 的日志项包含稳定 `domain` 字段，可按 `chat / knowledge / integration / automation / engine` 等功能域过滤。
 - `POST /api/v1/config/llm/models` 向 Provider 的 `/models` 端点发起代理请求，返回标准化的模型列表（`{ models: [{ id, name }] }`）；支持 OpenAI 标准格式和替代格式的自动适配。
+- `GET /api/v1/llm/capabilities` 返回 `{ provider_name, model_name, tool_call, tool_call_text, last_probe, probe_error }`；`POST /api/v1/llm/capabilities/probe?provider=X&model=Y` 会实时重测并写入 SQLite 缓存。
 
 ## 开发
 
@@ -532,6 +564,9 @@ go test -run TestName ./package/
 # 代码检查
 go vet ./...
 golangci-lint run
+
+# 发版前门禁 + Eval + canary dry-run
+go run ./cmd/verify-release -repo . -version 0.4.0 -version-files package.json
 ```
 
 ## 技术栈
@@ -539,7 +574,7 @@ golangci-lint run
 | 组件 | 技术 |
 |------|------|
 | 语言 | Go 1.25+ |
-| Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.4.6 |
+| Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.4.7 |
 | AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.1.2 |
 | 工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.6 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
@@ -583,7 +618,7 @@ chore: 构建/工具链
 
 | 项目 | 说明 | 仓库 |
 |------|------|------|
-| **Hexagon** | Go AI Agent 框架 (核心引擎) v0.4.6 | [hexagon](https://github.com/hexagon-codes/hexagon) |
+| **Hexagon** | Go AI Agent 框架 (核心引擎) v0.4.7 | [hexagon](https://github.com/hexagon-codes/hexagon) |
 | **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.1.2 | [ai-core](https://github.com/hexagon-codes/ai-core) |
 | **toolkit** | Go 通用工具库 v0.0.6 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI 观测面板 (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
@@ -591,6 +626,16 @@ chore: 构建/工具链
 | **hexclaw-ui** | HexClaw Web 前端 (Vue 3) | [hexclaw-ui](https://github.com/hexagon-codes/hexclaw-ui) |
 
 ## 更新日志
+
+### v0.4.0
+
+**新功能**
+- **Feature flag 基建** — `features:` 配置段统一控制 v0.4 新能力，未注册 flag fail-closed，alpha 默认关闭
+- **模型能力探测** — 新增 `/api/v1/llm/capabilities` 与 `/probe`，缓存模型 tool_call 可靠度
+- **Skill 闭环** — 新增 7 阶段 Pipeline、`skill_view` 渐进披露、`.pending` 审批、TrustLevel 与 TOCTOU 防护
+- **交互式回复** — `Reply.Interactive` 支持 buttons/select/approval/card，并在 IM 适配器中提供文本 fallback
+- **运行时治理** — 新增 Provider middleware、结构化事件、权限策略、MCP 生命周期 hook、RAG Pipeline、Runtime Sandbox 与发版门禁
+- **语音增强** — 新增 MiniMax TTS 与多 Provider TTS 串联 fallback
 
 ### v0.3.0
 

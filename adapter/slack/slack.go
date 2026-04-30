@@ -29,6 +29,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
@@ -124,7 +125,12 @@ func (a *SlackAdapter) Handler() http.Handler {
 }
 
 // Send 发送同步回复
+//
+// v0.4.0 F6：reply.Interactive 非空时，flag interactive.render.v1 OFF 自动追加
+// 文本 fallback（"1) 是  2) 不是"），让按钮/选项/审批在 Slack 基础可用；flag ON
+// 时 no-op，等待后续 Block Kit 原生 renderer 接入。
 func (a *SlackAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	adapter.MaybeApplyTextFallback(ctx, reply)
 	if a.queue == nil {
 		return a.sendReplyNow(ctx, chatID, reply)
 	}
@@ -132,9 +138,13 @@ func (a *SlackAdapter) Send(ctx context.Context, chatID string, reply *adapter.R
 }
 
 // SendStream 流式发送（先发初始消息，后续 chat.update 更新）
+//
+// v0.4.0 E1：接入 adapter.StreamEditLimiter，避免高频 chat.update 触发 Slack
+// 限流（Tier 2 限流约 50 次/分钟）。结合字符阈值 + 时间间隔 + 失败降级三级保护。
 func (a *SlackAdapter) SendStream(ctx context.Context, chatID string, chunks <-chan *adapter.ReplyChunk) error {
 	var sb strings.Builder
 	var ts string // Slack 消息的 timestamp（作为 ID）
+	limiter := adapter.NewStreamEditLimiter()
 
 	for chunk := range chunks {
 		if chunk.Error != nil {
@@ -142,19 +152,44 @@ func (a *SlackAdapter) SendStream(ctx context.Context, chatID string, chunks <-c
 		}
 		sb.WriteString(chunk.Content)
 
+		// v0.4.0 E2：每次 update 都 strip thinking，防止半截 <think> 标签闪现给用户
+		clean := adapter.StripThinking(sb.String())
+		// 首次 post 必发；后续 update 走限流器
 		if ts == "" {
-			// 发送初始消息
-			msgTS, err := a.postMessageWithTS(ctx, chatID, sb.String())
+			if !limiter.ShouldEmit(sb.Len()) {
+				continue
+			}
+			msgTS, err := a.postMessageWithTS(ctx, chatID, clean)
 			if err != nil {
+				if degraded := limiter.Failed(); degraded {
+					logger.Warn("[slack] 流式限流降级", "delay", limiter.CurrentDelay())
+				}
 				return err
 			}
 			ts = msgTS
-		} else {
-			// 更新已有消息
-			_ = a.updateMessage(ctx, chatID, ts, sb.String())
+			limiter.Emitted(sb.Len())
+		} else if limiter.ShouldEmit(sb.Len()) {
+			if err := a.updateMessage(ctx, chatID, ts, clean); err != nil {
+				logger.Error("[slack] 更新流式消息失败", "error", err)
+				if degraded := limiter.Failed(); degraded {
+					logger.Warn("[slack] 流式限流降级", "delay", limiter.CurrentDelay())
+				}
+			} else {
+				limiter.Emitted(sb.Len())
+			}
 		}
 	}
-	return nil
+
+	// 收尾：如果限流期间一直没 post，仍要把完整结果落地
+	finalClean := adapter.StripThinking(sb.String())
+	if finalClean == "" {
+		return nil
+	}
+	if ts == "" {
+		_, err := a.postMessageWithTS(ctx, chatID, finalClean)
+		return err
+	}
+	return a.updateMessage(ctx, chatID, ts, finalClean)
 }
 
 // ============== Events API 处理 ==============
@@ -197,13 +232,18 @@ func (a *SlackAdapter) handleEvents(w http.ResponseWriter, r *http.Request) {
 	case "event_callback":
 		// 立即返回 200（Slack 要求 3 秒内响应）
 		w.WriteHeader(http.StatusOK)
-		// 异步处理事件
-		go a.processEvent(envelope.Event)
+		// v0.4.0 E5：透传 r.Context() 到异步处理，processEvent 内部用 trace.Detach
+		// 保留 logger/Values，同时脱离 webhook 响应返回后的 ctx cancel
+		go a.processEvent(r.Context(), envelope.Event)
 	}
 }
 
 // processEvent 异步处理事件
-func (a *SlackAdapter) processEvent(data json.RawMessage) {
+//
+// v0.4.0 E5：reqCtx 是 webhook 请求的 ctx，仅用作 logger/trace 链路源头。
+// 内部一律用 trace.Detach(reqCtx) 派生子 ctx，避免 webhook 响应完成后 cancel
+// 把消息处理半路杀掉。
+func (a *SlackAdapter) processEvent(reqCtx context.Context, data json.RawMessage) {
 	var event slackEvent
 	if err := json.Unmarshal(data, &event); err != nil {
 		logger.Error("解析 Slack 事件失败", "error", err)
@@ -238,13 +278,14 @@ func (a *SlackAdapter) processEvent(data json.RawMessage) {
 		},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	// H7: Detach(reqCtx) 保留 logger/Values，脱离 webhook 响应后的 cancel
+	bgCtx, cancel := context.WithTimeout(trace.Detach(reqCtx), 120*time.Second)
 	defer cancel()
 
-	reply, err := a.handler(ctx, unified)
+	reply, err := a.handler(bgCtx, unified)
 	if err != nil {
 		logger.Error("Slack 消息处理失败", "error", err)
-		errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		errCtx, errCancel := context.WithTimeout(trace.Detach(reqCtx), 10*time.Second)
 		defer errCancel()
 		_ = a.Send(errCtx, event.Channel, &adapter.Reply{Content: "处理消息时出错，请稍后重试。"})
 		return
@@ -256,7 +297,7 @@ func (a *SlackAdapter) processEvent(data json.RawMessage) {
 			}
 			reply.Metadata["thread_ts"] = event.ThreadTS
 		}
-		sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		sendCtx, sendCancel := context.WithTimeout(trace.Detach(reqCtx), 30*time.Second)
 		defer sendCancel()
 		if err := a.Send(sendCtx, event.Channel, reply); err != nil {
 			logger.Error("Slack 回复失败", "error", err)

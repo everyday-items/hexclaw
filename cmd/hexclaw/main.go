@@ -30,6 +30,7 @@ import (
 
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/agents"
 	webadapter "github.com/hexagon-codes/hexclaw/adapter/web"
 	"github.com/hexagon-codes/hexclaw/api"
 	"github.com/hexagon-codes/hexclaw/audit"
@@ -38,6 +39,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/cron"
 	"github.com/hexagon-codes/hexclaw/desktop"
 	"github.com/hexagon-codes/hexclaw/engine"
+	"github.com/hexagon-codes/hexclaw/events"
 	"github.com/hexagon-codes/hexclaw/gateway"
 	"github.com/hexagon-codes/hexclaw/genstore"
 	"github.com/hexagon-codes/hexclaw/heartbeat"
@@ -49,6 +51,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/memory"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/session"
+	"github.com/hexagon-codes/hexclaw/featureflag"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/skill/builtin"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
@@ -249,7 +252,30 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 	defer store.Close()
 
-	ctx := context.Background()
+	// v0.4.0 方案 A：构造 Feature Flag Static 实例并注入 root ctx。
+	// 所有 P1 重构项（Agent factory v2 / Skill 7 阶段 / MCP v2 等）必须挂 flag，
+	// 默认 OFF；用户在 hexclaw.yaml 的 features: 段或 Settings 显式开启。
+	// 业务路径用 featureflag.Enabled(ctx, "name") 查询，fail-closed。
+	flags := featureflag.NewStatic(featureflag.Registered(), cfg.Features)
+	ctx := featureflag.WithContext(context.Background(), flags)
+	if registered := featureflag.Registered(); len(registered) > 0 {
+		fmt.Printf("  ✓ Features    %d 个 flag 注册（其中 %d 启用）\n",
+			len(registered), countEnabledFlags(flags))
+	}
+
+	// v0.4.0 H6 接入：注入 Emitter 到 root ctx —— flag events.transport.v1 OFF 时
+	// Emit 仍是 noop；flag ON 后 tool/llm/mcp 关键点埋的 Emit 会真投递到 sink。
+	// 默认用 MemorySink（进程内缓存），生产可在此切到 FileSink / HTTPSink。
+	emitter := events.NewEmitter(events.NewMemorySink(), "hexclaw")
+	ctx = events.WithEmitter(ctx, emitter)
+
+	// v0.4.0 F8 接入：注入全局 ChainPricer —— flag pricing.layered.v1 OFF 时
+	// EstimateCost 仍走老 pricingTable；flag ON 时优先 user override → builtin。
+	engine.SetGlobalPricer(engine.NewDefaultPricer(
+		engine.NewUserOverridePricer(nil),
+		nil, // RemoteFetcher 留待 v0.4.x 后续接 openrouter
+		time.Hour,
+	))
 	if err := store.Init(ctx); err != nil {
 		return fmt.Errorf("初始化数据库表失败: %w", err)
 	}
@@ -334,6 +360,14 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		fmt.Printf("  ✓ Advanced    %d 个高级 Skill (SkillWriter/Installer/FileOps)\n", advCount)
 	}
 
+	// v0.4.0 H3：MCP Manager 内部的 lifecycle hook 自取 ctx 中的 flags，
+	// 所以这里无需额外注入；mcpMgr 仅作为引用保留供下游使用。
+	//
+	// v0.4.0 H5 plugin Manager 当前未在 main 实例化 —— 协议（plugin/extension.go）
+	// 已就绪，待 v0.4.x 第三方 plugin 真接入时再由那时的入口调用 plugin.NewManager
+	// 并 SetHostContext("0.4.x", flags)。本次不引入空 Manager 避免误导。
+	_ = mcpMgr
+
 	// 5. 初始化安全网关
 	gw := gateway.NewPipeline(&cfg.Security, store)
 	gwLayers := gw.LayerNames()
@@ -341,6 +375,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	// 6. 创建并启动 Agent 引擎
 	eng := engine.NewReActEngine(cfg, router, store, skills)
+
+	// v0.4.0 H8 接入：注入默认 ObserveMiddleware → events.Emitter。
+	// flag model.gateway.v1 OFF 时 Chain 自动 no-op；flag ON 时每次 Provider
+	// Complete/Stream 都会投递 "llm.call.observed" 结构化事件到 emitter sink。
+	eng.SetDefaultLLMMiddlewares([]engine.ProviderMiddleware{
+		engine.ObserveMiddleware(engine.NewEventsRecorder(emitter, "engine.llm_observe")),
+	})
 
 	// 6.1 接入统一工具循环 (D1-D3 产出)
 	toolCollector := engine.NewToolCollector(skills, mcpMgr, 40)
@@ -350,9 +391,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	toolExecutor.AddHook(&engine.SanitizeHook{}) // Phase 9: prompt injection defense
 
 	// 6.1.1 接入权限审批 Hook (D24)
+	// v0.4.0 H2 接入：默认挂上 baseline policy；flag tool.policy.engine ON 时自动启用
+	// 声明式规则；flag OFF 时退化到 classifyRisk 老路径，行为不变。
 	permHub := engine.NewPermissionHub(60 * time.Second)
 	permHook := engine.NewPermissionHook(permHub,
 		engine.WithCodeExecApproval(cfg.Skill.Builtin.CodeExecPolicy.CodeExecRequiresApproval()),
+		engine.WithPolicy(engine.DefaultBaselinePolicy()),
 	)
 	toolExecutor.AddHook(permHook)
 
@@ -362,8 +406,40 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		toolExecutor.AddHook(engine.NewToolPermissionHook(perms))
 	}
 
+	// 6.1.3 v0.4.x C3 自改进：ImproveStore + ImproveHook + LLM-as-judge
+	// draft 写到 <skills-dir>/.drafts/，用户审核后手动 mv 到 skills/。
+	// Judge 用 default provider 采样评分（10% 概率走 LLM，避免每次工具调用都消耗配额）。
+	userHome, _ := os.UserHomeDir()
+	skillDraftDir := computeSkillDraftDir(cfg.Skills.Dir, userHome)
+	improveStore := skill.NewImproveStore(skillDraftDir)
+	if defaultProv := router.Default(); defaultProv != nil {
+		improveStore.Judge = engine.NewLLMSkillJudge(
+			defaultProv,
+			router.ProviderModel(router.DefaultName()),
+			engine.LLMSkillJudgeOptions{SampleRate: 0.1},
+		)
+	}
+	if hook := engine.NewImproveHook(improveStore); hook != nil {
+		toolExecutor.AddHook(hook)
+	}
+
 	eng.SetToolCollector(toolCollector)
 	eng.SetToolExecutor(toolExecutor)
+
+	// v0.4.0 H1 闭环：启动时调一次 InitLifecycle，让所有实现 LifecycleTool 接口的 Skill
+	// 在请求到达前完成一次性资源初始化（数据库连接 / 索引预热 / 远程 token 预换）。
+	// flag tool.lifecycle.v2 OFF 时本调用是 no-op，不影响老路径。
+	if err := toolExecutor.InitLifecycle(ctx); err != nil {
+		fmt.Printf("  ⚠ Lifecycle init 失败：%v（继续启动，受影响的 Skill 可能首次调用变慢）\n", err)
+	}
+
+	// v0.4.0 G1 接入：构造 HexagonDispatcher 让 engine 可按 metadata.dispatch_role
+	// 路由到 hexagon.Agent。flag agent.factory.real OFF 时 Dispatch 立即返回
+	// ErrDispatchDisabled，调用方走 ReAct 老路径。
+	if router != nil && router.Default() != nil {
+		factory := agents.NewFactory()
+		eng.SetHexagonDispatcher(agents.NewHexagonDispatcher(factory, router.Default()))
+	}
 	eng.SetSessionLock(session.NewSessionLock())
 	fmt.Printf("  ✓ Tools       %d 个工具 (Skill + MCP)\n", len(toolCollector.Collect()))
 
@@ -588,6 +664,20 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 挂载知识库 API
 	if eng.KnowledgeBase() != nil {
 		srv.SetKnowledgeBase(eng.KnowledgeBase())
+	}
+
+	// 挂载 A7 模型 tool_call 能力探测服务
+	if router != nil && store != nil {
+		srv.SetCapabilityService(llmrouter.NewCapabilityService(router, store))
+	}
+
+	// v0.4.0 F9：挂载配置事务热加载 manager（flag config.tx.hotload.v1 OFF 时自动降级到老路径）
+	if router != nil {
+		txMgr := config.NewTransactionManager(cfg,
+			[]config.Validator{config.BuiltinValidator{}},
+			[]config.Applier{llmrouter.NewSelectorApplier(router)},
+		)
+		srv.SetConfigTxManager(txMgr)
 	}
 
 	// 9. 初始化定时任务调度器
@@ -877,6 +967,27 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			}
 		}
 
+		// v0.4.0 F7 接入：当 cfg.Voice.TTS.Provider == "minimax,edge" 这类 chain 形式
+		// 时（用 ',' 分隔的 provider 列表），自动构造 ChainedTTS。flag voice.tts.chain.v1
+		// OFF 时只调第一个 provider。
+		if strings.Contains(cfg.Voice.TTS.Provider, ",") {
+			var multiCfg []voice.MultiTTSConfig
+			for _, name := range strings.Split(cfg.Voice.TTS.Provider, ",") {
+				name = strings.TrimSpace(name)
+				switch name {
+				case "minimax":
+					if pc, ok := cfg.LLM.Providers["minimax"]; ok {
+						multiCfg = append(multiCfg, voice.MultiTTSConfig{Provider: "minimax", APIKey: pc.APIKey, BaseURL: pc.BaseURL, GroupID: cfg.Voice.TTS.Region})
+					}
+				case "edge", "edge-tts":
+					multiCfg = append(multiCfg, voice.MultiTTSConfig{Provider: "edge-tts"})
+				}
+			}
+			if chained := voice.BuildMultiTTS(multiCfg); chained != nil {
+				tts = chained
+			}
+		}
+
 		voiceSvc = voice.NewService(stt, tts)
 		srv.SetVoice(voiceSvc)
 		fmt.Printf("  ✓ Voice       STT=%s, TTS=%s\n", voiceSvc.STTName(), voiceSvc.TTSName())
@@ -1082,6 +1193,42 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		}
 	}()
 
+	// v0.4.x C4 组合学习 ticker：每 30 分钟扫一次最近窗口，把高频成功序列写成 meta-Skill 草稿。
+	// shutdown 时随 sigCtx 退出，不阻塞 graceful shutdown。
+	go func() {
+		const interval = 30 * time.Minute
+		// 启动后等 5 分钟再开第一轮，避免冷启窗口为空时空跑
+		warmup := time.NewTimer(5 * time.Minute)
+		defer warmup.Stop()
+		select {
+		case <-sigCtx.Done():
+			return
+		case <-warmup.C:
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		runOnce := func() {
+			cands := improveStore.SuggestMetaSkills()
+			for _, c := range cands {
+				if err := improveStore.WriteMetaDraft(c); err != nil {
+					logger.Warn("写 meta-skill 草稿失败", "steps", c.Steps, "error", err)
+				} else {
+					logger.Info("写出 meta-skill 草稿", "steps", c.Steps,
+						"occur", c.OccurCount, "success_rate", c.SuccessRate)
+				}
+			}
+		}
+		runOnce()
+		for {
+			select {
+			case <-sigCtx.Done():
+				return
+			case <-ticker.C:
+				runOnce()
+			}
+		}
+	}()
+
 	// 适配器列表
 	if instanceList, err := instanceMgr.List(ctx); err == nil && len(instanceList) > 0 {
 		var names []string
@@ -1208,6 +1355,17 @@ func newSecurityCmd() *cobra.Command {
 
 	cmd.AddCommand(auditCmd)
 	return cmd
+}
+
+// countEnabledFlags 统计当前 Flags 实例中"启用"的 flag 数量。仅启动日志展示用。
+func countEnabledFlags(flags featureflag.Flags) int {
+	count := 0
+	for _, s := range flags.Snapshot() {
+		if s.Enabled {
+			count++
+		}
+	}
+	return count
 }
 
 // extractLLMName 从 Provider 名称中提取 LLM Provider 名

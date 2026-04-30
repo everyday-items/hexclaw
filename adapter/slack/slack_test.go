@@ -92,7 +92,7 @@ func TestProcessEvent_IgnoreBotMessage(t *testing.T) {
 
 	// bot_id 非空的消息应被忽略（不 panic）
 	event := []byte(`{"type":"message","channel":"C123","user":"U456","text":"hello","bot_id":"B789"}`)
-	a.processEvent(event)
+	a.processEvent(context.Background(), event)
 }
 
 // TestProcessEvent_IgnoreSubtype 测试忽略子类型消息
@@ -101,7 +101,7 @@ func TestProcessEvent_IgnoreSubtype(t *testing.T) {
 
 	// 有 subtype 的消息应被忽略
 	event := []byte(`{"type":"message","subtype":"message_changed","channel":"C123","user":"U456"}`)
-	a.processEvent(event)
+	a.processEvent(context.Background(), event)
 }
 
 // TestProcessEvent_IgnoreNonMessage 测试忽略非消息事件
@@ -110,5 +110,5 @@ func TestProcessEvent_IgnoreNonMessage(t *testing.T) {
 
 	// 非 message 类型应被忽略
 	event := []byte(`{"type":"reaction_added","channel":"C123"}`)
-	a.processEvent(event)
+	a.processEvent(context.Background(), event)
 }

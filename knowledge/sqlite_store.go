@@ -71,6 +71,8 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 		)`,
 
 		`CREATE INDEX IF NOT EXISTS idx_kb_chunks_doc ON kb_chunks(doc_id)`,
+		// v0.4.0 E3：复合 UNIQUE 防同 doc 同位置 chunk 累积（与 storage/migrate v4 一致）
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_chunks_doc_index ON kb_chunks(doc_id, chunk_index)`,
 
 		// FTS5 全文索引
 		// 存储 chunk 内容和 chunk_id，用于关键词搜索
@@ -133,8 +135,16 @@ func (s *SQLiteStore) Add(ctx context.Context, doc *Document, chunks []*Chunk) e
 			embBlob = encodeFloat32Slice(chunk.Embedding)
 		}
 
+		// v0.4.0 E3：kb_chunks (doc_id, chunk_index) UNIQUE 收口；
+		// ingestion retry / 重新分块时同位置覆盖而非累积（防 v0.3.12 故障复发）
 		_, err = tx.ExecContext(ctx,
-			`INSERT INTO kb_chunks (id, doc_id, content, chunk_index, embedding, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO kb_chunks (id, doc_id, content, chunk_index, embedding, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(doc_id, chunk_index) DO UPDATE SET
+			   id = excluded.id,
+			   content = excluded.content,
+			   embedding = excluded.embedding,
+			   created_at = excluded.created_at`,
 			chunk.ID, chunk.DocID, chunk.Content, chunk.Index, embBlob, chunk.CreatedAt,
 		)
 		if err != nil {

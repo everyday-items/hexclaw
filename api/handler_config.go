@@ -196,7 +196,53 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 	nextCfg := *s.cfg
 	nextCfg.LLM = nextLLM
 
-	// 先持久化到文件，再热更新引擎；热更新失败时回滚文件，保证磁盘与运行时一致。
+	// v0.4.0 F9：当注入了 cfgTxMgr 且 flag config.tx.hotload.v1 ON 时，
+	// 走事务路径（Begin → Stage 校验 → Save → Commit/Rollback）。
+	// flag OFF / 未注入 manager 时自动降级到原静态路径，保持完全向后兼容。
+	if s.cfgTxMgr != nil {
+		tx, beginErr := s.cfgTxMgr.Begin(r.Context())
+		if beginErr == nil {
+			// flag ON：事务路径
+			if stageErr := tx.Stage(r.Context(), &nextCfg); stageErr != nil {
+				_ = tx.Rollback()
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": "配置校验失败: " + stageErr.Error(),
+				})
+				return
+			}
+			if saveErr := config.Save(&nextCfg, ""); saveErr != nil {
+				_ = tx.Rollback()
+				logger.Error("error", "error", saveErr)
+				writeJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "保存配置失败: " + saveErr.Error(),
+				})
+				return
+			}
+			if commitErr := tx.Commit(r.Context()); commitErr != nil {
+				// Commit 内部已逆序回滚已 Apply 的 Applier；这里只需把磁盘配置回滚
+				rollbackCfg := *s.cfg
+				rollbackCfg.LLM = oldLLM
+				if saveErr := config.Save(&rollbackCfg, ""); saveErr != nil {
+					logger.Error("LLM 事务 Commit 失败且回滚磁盘失败", "commit", commitErr, "rollback", saveErr)
+				}
+				writeJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "LLM 配置应用失败: " + commitErr.Error(),
+				})
+				return
+			}
+			s.cfg.LLM = nextLLM
+			if s.reloadGenServices != nil {
+				s.reloadGenServices()
+			}
+			logger.Info("LLM 配置已通过事务热加载生效")
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+		// beginErr 非 nil（flag OFF / 已有事务） → 降级到老路径
+	}
+
+	// 老路径（flag OFF 或未注入 manager）：先持久化到文件，再热更新引擎；
+	// 热更新失败时回滚文件，保证磁盘与运行时一致。
 	if err := config.Save(&nextCfg, ""); err != nil {
 		logger.Error("error", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{

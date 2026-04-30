@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hexagon-codes/hexclaw/featureflag"
 )
 
 // PermissionRequest is sent to the frontend for user approval.
@@ -136,10 +138,16 @@ func (h *PermissionHub) HandleResponse(resp PermissionResponse) {
 }
 
 // PermissionHook is a BeforeToolHook that asks for user approval on sensitive/dangerous tools.
+//
+// v0.4.0 H2：当 feature flag tool.policy.engine 启用时，先调 PermissionPolicy.Evaluate
+// 做声明式决策；命中 ActionDeny 立即拒绝，命中 ActionRequireApproval 走 PermissionHub，
+// ActionAllow 直接放行。flag 关闭或 policy=nil 时退化为 classifyRisk 黑名单路径，
+// 行为与 v0.3 完全一致。
 type PermissionHook struct {
 	hub            *PermissionHub
 	dangerousTools map[string]bool // tools that always require approval
 	sensitiveTools map[string]bool // tools that require approval on first use
+	policy         *PermissionPolicy
 }
 
 // PermissionHookOption configures a PermissionHook.
@@ -154,6 +162,43 @@ func WithCodeExecApproval(require bool) PermissionHookOption {
 		}
 	}
 }
+
+// WithPolicy 注入 v0.4.0 H2 PermissionPolicy；仅在 feature flag tool.policy.engine
+// 开启时生效，flag 关闭仍走 classifyRisk 老路径。
+func WithPolicy(p *PermissionPolicy) PermissionHookOption {
+	return func(h *PermissionHook) {
+		h.policy = p
+	}
+}
+
+// DefaultBaselinePolicy 返回与老 classifyRisk 黑名单等价的 PermissionPolicy。
+//
+// 用法（cmd/hexclaw 启动时）：
+//
+//	hook := engine.NewPermissionHook(hub, engine.WithPolicy(engine.DefaultBaselinePolicy()))
+//
+// flag tool.policy.engine 开启时此 policy 生效；关闭时被忽略，老 classifyRisk 黑名单
+// 继续工作。这样一行代码同时启用了 H2 + 默认安全模型。
+func DefaultBaselinePolicy() *PermissionPolicy {
+	return NewPermissionPolicy(ActionAllow,
+		// dangerous：必须用户审批
+		PolicyRule{Name: "shell-dangerous", ToolPattern: "shell", Action: ActionRequireApproval, Risk: "dangerous", Reason: "shell 命令执行"},
+		PolicyRule{Name: "code-dangerous", ToolPattern: "code", Action: ActionRequireApproval, Risk: "dangerous", Reason: "代码执行"},
+		PolicyRule{Name: "code-exec-dangerous", ToolPattern: "code_exec", Action: ActionRequireApproval, Risk: "dangerous", Reason: "代码执行（exec）"},
+		// sensitive：首次需用户审批
+		PolicyRule{Name: "browser-sensitive", ToolPattern: "browser", Action: ActionRequireApproval, Risk: "sensitive", Reason: "浏览器自动化"},
+		PolicyRule{Name: "create-skill-sensitive", ToolPattern: "create_skill", Action: ActionRequireApproval, Risk: "sensitive", Reason: "创建新 Skill"},
+		PolicyRule{Name: "manage-mcp-sensitive", ToolPattern: "manage_mcp_server", Action: ActionRequireApproval, Risk: "sensitive", Reason: "管理 MCP server"},
+		PolicyRule{Name: "file-edit-sensitive", ToolPattern: "file_edit", Action: ActionRequireApproval, Risk: "sensitive", Reason: "文件编辑"},
+		// patch_skill / manage_skill_pending（v0.4.0 F2）也归 sensitive
+		PolicyRule{Name: "patch-skill-sensitive", ToolPattern: "patch_skill", Action: ActionRequireApproval, Risk: "sensitive", Reason: "修改既有 Skill"},
+		PolicyRule{Name: "manage-pending-sensitive", ToolPattern: "manage_skill_pending", Action: ActionRequireApproval, Risk: "sensitive", Reason: "审批 Skill 草稿"},
+	)
+}
+
+// Priority 把 PermissionHook 排在最前（before 链）—— 拒绝必须最早发生，避免
+// 后续 hook 先做副作用再被否决。flag tool.lifecycle.v2 OFF 时不参与排序。
+func (h *PermissionHook) Priority() int { return 10 }
 
 // NewPermissionHook creates a permission hook.
 func NewPermissionHook(hub *PermissionHub, opts ...PermissionHookOption) *PermissionHook {
@@ -178,16 +223,49 @@ func NewPermissionHook(hub *PermissionHub, opts ...PermissionHookOption) *Permis
 }
 
 func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo) error {
+	// v0.4.0 H2: feature-flag-gated PolicyEngine 优先
+	if h.policy != nil && featureflag.Enabled(ctx, FlagToolPolicyEngine) {
+		dec := h.policy.Evaluate(call)
+		switch dec.Action {
+		case ActionAllow:
+			return nil
+		case ActionDeny:
+			logger.Info("[permission] policy deny",
+				"tool", call.Name, "rule", dec.MatchedRule, "reason", dec.Reason)
+			reason := dec.Reason
+			if reason == "" {
+				reason = "policy denies execution"
+			}
+			return fmt.Errorf("tool %q blocked by policy %q: %s", call.Name, dec.MatchedRule, reason)
+		case ActionRequireApproval:
+			risk := dec.Risk
+			if risk == "" {
+				risk = "sensitive"
+			}
+			reason := dec.Reason
+			if reason == "" {
+				reason = fmt.Sprintf("Agent wants to execute %s(%s)", call.Name, summarizeArgs(call.Arguments))
+			}
+			return h.requestApproval(ctx, call, risk, reason)
+		default:
+			logger.Warn("[permission] unknown policy action, falling back to legacy path",
+				"action", dec.Action, "tool", call.Name)
+		}
+	}
+
+	// Legacy path: hardcoded dangerous/sensitive lists
 	risk := h.classifyRisk(call.Name)
 	if risk == "safe" {
 		return nil
 	}
+	return h.requestApproval(ctx, call, risk,
+		fmt.Sprintf("Agent wants to execute %s(%s)", call.Name, summarizeArgs(call.Arguments)))
+}
 
+// requestApproval 抽出来给 policy / classifyRisk 两条路径共用。
+func (h *PermissionHook) requestApproval(ctx context.Context, call *ToolCallInfo, risk, reason string) error {
 	sessionID, _ := ctx.Value(ctxKeySessionID).(string)
 	if sessionID == "" {
-		// Fix 11: No session context — deny both dangerous and sensitive tools.
-		// Previously sensitive tools were silently allowed without approval,
-		// bypassing the permission gate entirely.
 		if risk == "dangerous" {
 			return fmt.Errorf("tool %q requires approval but no session context", call.Name)
 		}
@@ -201,7 +279,7 @@ func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo)
 		ToolName:  call.Name,
 		Arguments: call.Arguments,
 		Risk:      risk,
-		Reason:    fmt.Sprintf("Agent wants to execute %s(%s)", call.Name, summarizeArgs(call.Arguments)),
+		Reason:    reason,
 	}
 
 	approved, err := h.hub.RequestApproval(ctx, sessionID, req)

@@ -148,7 +148,11 @@ func (a *WecomAdapter) Handler() http.Handler {
 }
 
 // Send 发送消息
+//
+// v0.4.0 F6：reply.Interactive 非空且 flag interactive.render.v1 OFF 时，
+// 自动追加文本 fallback 让按钮/选项/审批/卡片在企业微信基础可用。
 func (a *WecomAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	adapter.MaybeApplyTextFallback(ctx, reply)
 	if a.queue == nil {
 		return a.sendReplyNow(ctx, chatID, reply)
 	}
@@ -159,7 +163,8 @@ func (a *WecomAdapter) sendReplyNow(ctx context.Context, chatID string, reply *a
 	if reply == nil {
 		return nil
 	}
-	return a.sendTextMessage(ctx, chatID, reply.Content)
+	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给家长
+	return a.sendTextMessage(ctx, chatID, adapter.StripThinking(reply.Content))
 }
 
 // SendStream 流式发送（企业微信不支持消息编辑，直接合并后发送）
@@ -171,7 +176,8 @@ func (a *WecomAdapter) SendStream(ctx context.Context, chatID string, chunks <-c
 		}
 		sb.WriteString(chunk.Content)
 	}
-	return a.sendTextMessage(ctx, chatID, sb.String())
+	// v0.4.0 E2：流式分支同样 strip thinking（绕过 queue 直发）
+	return a.sendTextMessage(ctx, chatID, adapter.StripThinking(sb.String()))
 }
 
 // ============== 回调处理 ==============
