@@ -5,18 +5,24 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/hexagon-codes/hexagon/runtime"
 	"github.com/hexagon-codes/hexclaw/cron"
 )
 
 // --- Cron API ---
 
 // AddCronJobRequest 添加定时任务请求
+//
+// v2：Prompt 仍是用户自然语言需求；服务端会调 LLM 编译成 JobSpec（Python 脚本）。
+// Type 仅支持 "cron"（一次性任务暂未接入编译路径）。
 type AddCronJobRequest struct {
 	Name     string `json:"name"`     // 任务名称
 	Schedule string `json:"schedule"` // cron 表达式或 @every/@daily 等
-	Prompt   string `json:"prompt"`   // Agent 处理指令
+	Prompt   string `json:"prompt"`   // 自然语言任务需求（会被编译成脚本）
 	UserID   string `json:"user_id"`
-	Type     string `json:"type"` // cron 或 once
+	Type     string `json:"type"` // cron 或 once（once 暂未接入编译）
+	Platform string `json:"platform,omitempty"`
+	ChatID   string `json:"chat_id,omitempty"`
 }
 
 // handleListCronJobs 列出定时任务
@@ -44,61 +50,156 @@ func (s *Server) handleListCronJobs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleAddCronJob 添加定时任务
+// handleAddCronJob 添加定时任务。
+//
+// 按 Accept header 双模式：
+//   - text/event-stream → SSE 流式编译，实时推送 progress/done/error 事件
+//   - 默认（application/json）→ 同步阻塞，等编译完成后一次性返回 JSON
+//
+// 双模式共用同一 AddCronJobRequest 与同一业务逻辑（Scheduler.AddJobFromPromptWithProgress）。
 func (s *Server) handleAddCronJob(w http.ResponseWriter, r *http.Request) {
+	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+		s.handleAddCronJobSSE(w, r)
+		return
+	}
+	s.handleAddCronJobJSON(w, r)
+}
+
+// handleAddCronJobJSON 经典阻塞模式（保留给非浏览器客户端 / curl / 老前端）。
+func (s *Server) handleAddCronJobJSON(w http.ResponseWriter, r *http.Request) {
+	req, ok := s.parseAddCronJobRequest(w, r)
+	if !ok {
+		return
+	}
+
+	job, err := s.scheduler.AddJobFromPrompt(r.Context(), cron.AddJobRequest{
+		Name:         req.Name,
+		Schedule:     req.Schedule,
+		Prompt:       req.Prompt,
+		UserID:       req.UserID,
+		Platform:     req.Platform,
+		ChatID:       req.ChatID,
+		LocalAPIBase: s.localAPIBase(),
+	})
+	if err != nil {
+		status, code := classifyCronCreateError(err)
+		// D2.3 错误友好化 — 永不把 openai api error / 500 / request_id / tool_use_id 暴露给用户
+		writeAPIError(w, status, code, "添加任务失败: "+humanizeError(err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"job":          job,
+		"spec_preview": job.Spec,
+	})
+}
+
+// handleAddCronJobSSE 流式模式：每完成一个编译阶段就 flush 一帧。
+//
+// 事件格式（标准 W3C SSE）：
+//   event: progress
+//   data: {"stage":"calling_llm","message":"调用 LLM…"}
+//
+//   event: done
+//   data: {"job":{...},"spec_preview":{...}}
+//
+//   event: error
+//   data: {"error":"..."}
+//
+// 客户端断流（fetch abort / EventSource.close）= 取消，r.Context() 会随之 Done。
+func (s *Server) handleAddCronJobSSE(w http.ResponseWriter, r *http.Request) {
+	req, ok := s.parseAddCronJobRequest(w, r)
+	if !ok {
+		return
+	}
+
+	// hexagon SSEEventSink：headers + flush + 线程安全锁 + Close 语义都由它管。
+	// 业务事件（progress/done/error）经 EmitRaw 走，wire 与改造前完全一致以保持
+	// 前端契约不变（参考 hexclaw-desktop src/api/tasks.ts parseSSEFrame）。
+	sink, err := runtime.NewSSEEventSink(w)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	defer sink.Close()
+	w.WriteHeader(http.StatusOK)
+
+	ctx := r.Context()
+	onProgress := func(p cron.CompileProgress) {
+		_ = sink.EmitRaw(ctx, "progress", map[string]any{
+			"stage":   string(p.Stage),
+			"message": p.Message,
+		})
+	}
+
+	job, err := s.scheduler.AddJobFromPromptWithProgress(ctx, cron.AddJobRequest{
+		Name:         req.Name,
+		Schedule:     req.Schedule,
+		Prompt:       req.Prompt,
+		UserID:       req.UserID,
+		Platform:     req.Platform,
+		ChatID:       req.ChatID,
+		LocalAPIBase: s.localAPIBase(),
+	}, onProgress)
+	if err != nil {
+		// D2.3 错误友好化 — SSE error event 永不漏底层 openai/anthropic 原文给前端
+		_ = sink.EmitRaw(ctx, "error", map[string]string{"error": "添加任务失败: " + humanizeError(err)})
+		return
+	}
+	_ = sink.EmitRaw(ctx, "done", map[string]any{
+		"job":          job,
+		"spec_preview": job.Spec,
+	})
+}
+
+// parseAddCronJobRequest 共用的 body 解析与基础校验。错误直接写回 w 返 false。
+//
+// 返 APIError 标准化结构（含 code + message + legacy error 兼容字段）。
+func (s *Server) parseAddCronJobRequest(w http.ResponseWriter, r *http.Request) (*AddCronJobRequest, bool) {
 	var req AddCronJobRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "请求格式错误: " + err.Error(),
-		})
-		return
+		writeAPIError(w, http.StatusBadRequest, CodeBadRequest, "请求格式错误: "+err.Error())
+		return nil, false
 	}
-
 	if req.Name == "" || req.Schedule == "" || req.Prompt == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "name、schedule 和 prompt 不能为空",
-		})
-		return
+		writeAPIError(w, http.StatusBadRequest, CodeBadRequest, "name、schedule 和 prompt 不能为空")
+		return nil, false
 	}
-
 	if req.UserID == "" {
 		req.UserID = "api-user"
 	}
-
-	jobType := cron.JobTypeCron
-	if req.Type == "once" {
-		jobType = cron.JobTypeOnce
-	}
-
-	job := &cron.Job{
-		Name:     req.Name,
-		Type:     jobType,
-		Schedule: req.Schedule,
-		Prompt:   req.Prompt,
-		UserID:   req.UserID,
-	}
-
 	if s.scheduler == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "定时任务未启用"})
-		return
+		writeAPIError(w, http.StatusServiceUnavailable, CodeCronDisabled, "定时任务未启用")
+		return nil, false
 	}
-	if err := s.scheduler.AddJob(r.Context(), job); err != nil {
-		// Schedule validation errors are client input errors (400), not server failures (500)
-		status := http.StatusInternalServerError
-		if strings.Contains(err.Error(), "无效的调度表达式") || strings.Contains(err.Error(), "invalid") {
-			status = http.StatusBadRequest
-		}
-		writeJSON(w, status, map[string]string{
-			"error": "添加任务失败: " + err.Error(),
-		})
-		return
+	if req.Type == "once" {
+		writeAPIError(w, http.StatusBadRequest, CodeCronNotSupported, "v2 暂不支持 once 类型；请使用 schedule 表达式")
+		return nil, false
 	}
+	return &req, true
+}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id":          job.ID,
-		"name":        job.Name,
-		"next_run_at": job.NextRunAt,
-	})
+// classifyCronCreateError 把 AddJobFromPrompt 的错误映射到 (HTTP 状态码, APIError code)。
+func classifyCronCreateError(err error) (int, string) {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "编译失败"):
+		return http.StatusBadRequest, CodeCronCompileFailed
+	case strings.Contains(msg, "校验失败"):
+		return http.StatusBadRequest, CodeCronValidateFailed
+	case strings.Contains(msg, "无效的调度表达式") || strings.Contains(msg, "invalid"):
+		return http.StatusBadRequest, CodeCronInvalidSched
+	default:
+		return http.StatusInternalServerError, CodeInternalError
+	}
+}
+
+// localAPIBase 返回 hexclaw 自身 HTTP API 的 base URL，传给 compiler 让 LLM
+// 在生成的脚本里能引用 /api/v1/knowledge/* 等本地端点。
+//
+// 当前简化：固定 http://127.0.0.1:16060（hexclaw 默认 port）。
+// 若 port 从配置可读取，可在 Server 注入。
+func (s *Server) localAPIBase() string {
+	return "http://127.0.0.1:16060"
 }
 
 // handleDeleteCronJob 删除定时任务

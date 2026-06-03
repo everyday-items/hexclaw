@@ -3,12 +3,34 @@ package cron
 import (
 	"context"
 	"database/sql"
-	"sync/atomic"
+	"errors"
+	"os/exec"
 	"testing"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+var errStubCompile = errors.New("stub compile error")
+
+// stubCompiler 实现 JobSpecCompiler，用于测试不实际调 LLM 的 Compile 路径。
+type stubCompiler struct {
+	ret  *JobSpec
+	err  error
+	last struct {
+		Prompt string
+		Hints  CompileHints
+	}
+}
+
+func (s *stubCompiler) Compile(_ context.Context, prompt string, hints CompileHints) (*JobSpec, error) {
+	s.last.Prompt = prompt
+	s.last.Hints = hints
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.ret, nil
+}
 
 func setupTestDB(t *testing.T) *sql.DB {
 	t.Helper()
@@ -19,24 +41,41 @@ func setupTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
+// newTestScheduler 构造一个无 compiler / 自定义 ScriptExecutor 的 Scheduler。
+// 用于测试 prebuilt-Spec 路径（不走 LLM 编译）。
+func newTestScheduler(t *testing.T, db *sql.DB) *Scheduler {
+	t.Helper()
+	exec := NewScriptExecutor().WithWorkdir(t.TempDir()).WithVenvCache(t.TempDir())
+	return NewScheduler(db, nil, exec)
+}
+
+// minimalSpec 一个合规的最小 JobSpec — 仅用于测试 AddJob 等不实际执行的路径。
+func minimalSpec() *JobSpec {
+	return &JobSpec{
+		Runtime:    "python3",
+		Script:     `import json; print(json.dumps({"status":"success"}))`,
+		TimeoutSec: 10,
+	}
+}
+
 // TestScheduler_AddAndListJobs 测试添加和列出任务
 func TestScheduler_AddAndListJobs(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
 
 	ctx := context.Background()
-	s := NewScheduler(db)
+	s := newTestScheduler(t, db)
 	if err := s.Init(ctx); err != nil {
 		t.Fatalf("初始化失败: %v", err)
 	}
 
-	// 添加任务
 	job := &Job{
-		Name:     "每日摘要",
-		Type:     JobTypeCron,
-		Schedule: "@daily",
-		Prompt:   "总结今天的待办事项",
-		UserID:   "user-1",
+		Name:         "每日摘要",
+		Type:         JobTypeCron,
+		Schedule:     "@daily",
+		SourcePrompt: "总结今天的待办事项",
+		Spec:         minimalSpec(),
+		UserID:       "user-1",
 	}
 	if err := s.AddJob(ctx, job); err != nil {
 		t.Fatalf("添加任务失败: %v", err)
@@ -49,7 +88,6 @@ func TestScheduler_AddAndListJobs(t *testing.T) {
 		t.Fatal("下次执行时间不应为空")
 	}
 
-	// 列出任务
 	jobs, err := s.ListJobs(ctx, "user-1")
 	if err != nil {
 		t.Fatalf("列出任务失败: %v", err)
@@ -62,66 +100,62 @@ func TestScheduler_AddAndListJobs(t *testing.T) {
 	}
 }
 
-// TestScheduler_RemoveJob 测试删除任务
+func TestScheduler_AddJob_RejectsMissingSpec(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	s := newTestScheduler(t, db)
+	_ = s.Init(ctx)
+
+	err := s.AddJob(ctx, &Job{Name: "x", Schedule: "@hourly", SourcePrompt: "y", UserID: "u1"})
+	if err == nil {
+		t.Fatal("无 Spec 的 Job 应被拒收")
+	}
+}
+
 func TestScheduler_RemoveJob(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
 
 	ctx := context.Background()
-	s := NewScheduler(db)
+	s := newTestScheduler(t, db)
 	_ = s.Init(ctx)
 
-	job := &Job{
-		Name:     "测试任务",
-		Schedule: "@hourly",
-		Prompt:   "测试",
-		UserID:   "user-1",
-	}
+	job := &Job{Name: "测试任务", Schedule: "@hourly", SourcePrompt: "测试", Spec: minimalSpec(), UserID: "user-1"}
 	_ = s.AddJob(ctx, job)
 
 	if err := s.RemoveJob(ctx, job.ID); err != nil {
 		t.Fatalf("删除任务失败: %v", err)
 	}
-
 	jobs, _ := s.ListJobs(ctx, "user-1")
 	if len(jobs) != 0 {
 		t.Fatalf("删除后应无任务，实际 %d 个", len(jobs))
 	}
 }
 
-// TestScheduler_PauseResumeJob 测试暂停/恢复任务
 func TestScheduler_PauseResumeJob(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
 
 	ctx := context.Background()
-	s := NewScheduler(db)
+	s := newTestScheduler(t, db)
 	_ = s.Init(ctx)
 
-	job := &Job{
-		Name:     "测试任务",
-		Schedule: "@hourly",
-		Prompt:   "测试",
-		UserID:   "user-1",
-	}
+	job := &Job{Name: "测试任务", Schedule: "@hourly", SourcePrompt: "测试", Spec: minimalSpec(), UserID: "user-1"}
 	_ = s.AddJob(ctx, job)
 
-	// 暂停
 	if err := s.PauseJob(ctx, job.ID); err != nil {
-		t.Fatalf("暂停任务失败: %v", err)
+		t.Fatalf("暂停: %v", err)
 	}
-
 	s.mu.RLock()
 	if s.jobs[job.ID].Status != StatusPaused {
 		t.Error("任务应为暂停状态")
 	}
 	s.mu.RUnlock()
 
-	// 恢复
 	if err := s.ResumeJob(ctx, job.ID); err != nil {
-		t.Fatalf("恢复任务失败: %v", err)
+		t.Fatalf("恢复: %v", err)
 	}
-
 	s.mu.RLock()
 	if s.jobs[job.ID].Status != StatusActive {
 		t.Error("任务应为活跃状态")
@@ -129,43 +163,113 @@ func TestScheduler_PauseResumeJob(t *testing.T) {
 	s.mu.RUnlock()
 }
 
-// TestScheduler_Execute 测试任务执行
-func TestScheduler_Execute(t *testing.T) {
+// TestScheduler_ExecuteJobInvokesScriptExecutor v2：tick 触发后 ScriptExecutor.Run
+// 真实跑 Python 沙箱，history 写入完整 stdout/exit_code/data。
+func TestScheduler_ExecuteJobInvokesScriptExecutor(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("跳过：本机无 python3")
+	}
 	db := setupTestDB(t)
 	defer db.Close()
-
 	ctx := context.Background()
-	s := NewScheduler(db)
-	s.Init(ctx)
 
-	// 添加一个立即执行的任务（过去时间）
+	s := newTestScheduler(t, db)
+	_ = s.Init(ctx)
+
 	job := &Job{
 		Name:     "立即执行",
 		Type:     JobTypeCron,
 		Schedule: "@every 1s",
-		Prompt:   "测试执行",
-		UserID:   "user-1",
-		Status:   StatusActive,
+		Spec: &JobSpec{
+			Runtime:    "python3",
+			Script:     `import json; print(json.dumps({"status":"success","data":42}))`,
+			TimeoutSec: 10,
+		},
+		SourcePrompt: "测试",
+		UserID:       "user-1",
+		Status:       StatusActive,
 	}
-	s.AddJob(ctx, job)
+	if err := s.AddJob(ctx, job); err != nil {
+		t.Fatalf("AddJob: %v", err)
+	}
 
 	// 手动设置 NextRunAt 为过去
 	s.mu.Lock()
 	s.jobs[job.ID].NextRunAt = time.Now().Add(-time.Second)
 	s.mu.Unlock()
 
-	var executed atomic.Int32
-	s.Start(ctx, func(_ context.Context, j *Job) (string, error) {
-		executed.Add(1)
-		return "", nil
-	})
+	s.Start(ctx)
 	defer s.Stop()
 
-	// 等待执行
-	time.Sleep(2 * time.Second)
+	// 等待 tick 触发 + 沙箱跑完
+	time.Sleep(3 * time.Second)
 
-	if executed.Load() == 0 {
-		t.Error("任务应该被执行至少一次")
+	history, err := s.GetJobHistory(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobHistory: %v", err)
+	}
+	if len(history) == 0 {
+		t.Fatal("应至少有 1 条 history")
+	}
+	h := history[0]
+	if h.Status != "success" {
+		t.Errorf("Status: %s err=%s stderr=%q", h.Status, h.Error, h.Stderr)
+	}
+	if h.Data != float64(42) {
+		t.Errorf("Data: %v (%T)", h.Data, h.Data)
+	}
+}
+
+// TestScheduler_AddJobFromPrompt_CompilesAndPersists 验证 compiler 注入路径。
+func TestScheduler_AddJobFromPrompt_CompilesAndPersists(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	stubSpec := &JobSpec{Runtime: "python3", Script: `import json; print(json.dumps({"status":"success"}))`, TimeoutSec: 60}
+	c := &stubCompiler{ret: stubSpec}
+	s := NewScheduler(db, c,
+		NewScriptExecutor().WithWorkdir(t.TempDir()).WithVenvCache(t.TempDir()))
+	_ = s.Init(ctx)
+
+	job, err := s.AddJobFromPrompt(ctx, AddJobRequest{
+		Name: "采集", Schedule: "@daily", Prompt: "每天采微博", UserID: "u1",
+		AvailableSkills: []string{"web-search"},
+	})
+	if err != nil {
+		t.Fatalf("AddJobFromPrompt: %v", err)
+	}
+	if job.SourcePrompt != "每天采微博" {
+		t.Errorf("SourcePrompt: %q", job.SourcePrompt)
+	}
+	if job.Spec == nil || job.Spec.Script == "" {
+		t.Error("Spec 未写入")
+	}
+	if c.last.Prompt != "每天采微博" || len(c.last.Hints.AvailableSkills) != 1 {
+		t.Errorf("compiler 入参未透传: %+v", c.last)
+	}
+}
+
+func TestScheduler_AddJobFromPrompt_CompileErrorBlocksInsert(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	c := &stubCompiler{err: errStubCompile}
+	s := NewScheduler(db, c,
+		NewScriptExecutor().WithWorkdir(t.TempDir()).WithVenvCache(t.TempDir()))
+	_ = s.Init(ctx)
+
+	_, err := s.AddJobFromPrompt(ctx, AddJobRequest{
+		Name: "x", Schedule: "@daily", Prompt: "p", UserID: "u1",
+	})
+	if err == nil {
+		t.Fatal("compile 失败应阻断入库")
+	}
+	var n int
+	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cron_jobs`).Scan(&n)
+	if n != 0 {
+		t.Errorf("失败任务不应入库，实际 %d 行", n)
 	}
 }
 

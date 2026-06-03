@@ -17,11 +17,18 @@ import (
 	"time"
 )
 
-// Migration 单次迁移定义
+// Migration 单次迁移定义。
+//
+// 两种模式（互斥）：
+//   - SQL: 纯 SQL 串（最常见），整段在一个事务里跑
+//   - Func: Go 函数（用于需要 schema 检测 / 条件分支的迁移，事务由 Func 自己管理）
+//
+// 若两者都填，Func 优先；都空则 NOOP（仅写 schema_migrations 占位）。
 type Migration struct {
 	Version     int
 	Description string
 	SQL         string
+	Func        func(ctx context.Context, db *sql.DB) error
 }
 
 // Run 执行所有未应用的迁移
@@ -71,18 +78,33 @@ func Run(ctx context.Context, db *sql.DB, migrations []Migration) error {
 }
 
 func applyMigration(ctx context.Context, db *sql.DB, m Migration) error {
+	// Func 模式：DDL 由 Func 自管事务（SQLite ALTER 等不能与 DML 共事务）。
+	if m.Func != nil {
+		if err := m.Func(ctx, db); err != nil {
+			return fmt.Errorf("执行 Func 失败: %w", err)
+		}
+		if _, err := db.ExecContext(ctx,
+			"INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
+			m.Version, m.Description, time.Now().Unix(),
+		); err != nil {
+			return fmt.Errorf("记录迁移版本失败: %w", err)
+		}
+		return nil
+	}
+
+	// SQL 模式：整段 SQL 在单个事务里跑（默认幂等不强求；DDL 中 fail 整体 rollback）
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	// 执行迁移 SQL
-	if _, err := tx.ExecContext(ctx, m.SQL); err != nil {
-		return fmt.Errorf("执行 SQL 失败: %w", err)
+	if m.SQL != "" {
+		if _, err := tx.ExecContext(ctx, m.SQL); err != nil {
+			return fmt.Errorf("执行 SQL 失败: %w", err)
+		}
 	}
 
-	// 记录迁移版本
 	if _, err := tx.ExecContext(ctx,
 		"INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
 		m.Version, m.Description, time.Now().Unix(),

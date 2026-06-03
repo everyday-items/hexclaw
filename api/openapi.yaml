@@ -1,0 +1,309 @@
+openapi: 3.1.0
+info:
+  title: HexClaw API
+  description: |
+    HexClaw 桌面端 sidecar HTTP API。
+
+    所有 endpoint 都在 `http://127.0.0.1:16060` 监听，桌面端模式下：
+      - 仅 localhost 可达
+      - 默认匿名（无认证）
+      - 端到端 SSE / WebSocket 支持
+
+    Contract 测试见 `api/contract_test.go`，CI 跑 `spectral lint api/openapi.yaml` 校验规范。
+
+    本 MVP 仅覆盖 cron 与核心 health；imagegen/videogen/chat 在后续 milestone 补全。
+  version: 0.4.1
+servers:
+  - url: http://127.0.0.1:16060
+    description: 桌面端本地 sidecar
+
+paths:
+  /api/v1/cron/jobs:
+    get:
+      summary: 列出当前用户的定时任务
+      tags: [cron]
+      parameters:
+        - in: query
+          name: user_id
+          schema: { type: string }
+          required: true
+      responses:
+        '200':
+          description: 任务列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items: { $ref: '#/components/schemas/CronJob' }
+                  total: { type: integer }
+
+    post:
+      summary: 创建定时任务（双模式：JSON 阻塞 / SSE 流式编译）
+      description: |
+        按 `Accept` header 路由：
+          - `text/event-stream` → SSE 流，4 阶段 progress + done/error 事件
+          - 默认 → 同步 JSON（编译完才返回）
+
+        SSE 帧示例：
+        ```
+        event: progress
+        data: {"stage":"analyzing","message":"解析需求…"}
+
+        event: progress
+        data: {"stage":"calling_llm","message":"调用 LLM…"}
+
+        event: done
+        data: {"job": {...}, "spec_preview": {...}}
+        ```
+      tags: [cron]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddCronJobRequest' }
+      responses:
+        '200':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job: { $ref: '#/components/schemas/CronJob' }
+                  spec_preview: { $ref: '#/components/schemas/JobSpec' }
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE 事件流（progress* + done | error）
+        '400':
+          description: 请求参数错误 / 编译失败 / 校验失败
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/APIError' }
+        '503':
+          description: 定时任务模块未启用
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/APIError' }
+
+  /api/v1/cron/jobs/{id}:
+    delete:
+      summary: 删除任务
+      tags: [cron]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+
+  /api/v1/cron/jobs/{id}/pause:
+    post:
+      summary: 暂停任务
+      tags: [cron]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/cron/jobs/{id}/resume:
+    post:
+      summary: 恢复任务
+      tags: [cron]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+
+  /api/v1/cron/jobs/{id}/trigger:
+    post:
+      summary: 立即触发任务执行（沙箱执行 Spec.script）
+      tags: [cron]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: 触发成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+
+  /api/v1/cron/jobs/{id}/history:
+    get:
+      summary: 任务执行历史
+      tags: [cron]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: 历史记录
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  history:
+                    type: array
+                    items: { $ref: '#/components/schemas/JobHistory' }
+
+components:
+  schemas:
+    CronJob:
+      type: object
+      required: [id, name, schedule, user_id, status]
+      properties:
+        id: { type: string, example: "cron-abc123" }
+        name: { type: string }
+        type:
+          type: string
+          enum: [cron, once]
+        schedule:
+          type: string
+          description: 'Cron 表达式（"0 9 * * *"） / @daily / @every 5m'
+        user_id: { type: string }
+        platform: { type: string }
+        chat_id: { type: string }
+        status:
+          type: string
+          enum: [active, paused, done]
+        last_run_at: { type: string, format: date-time }
+        next_run_at: { type: string, format: date-time }
+        run_count: { type: integer }
+        created_at: { type: string, format: date-time }
+        source_prompt:
+          type: string
+          description: 用户原始需求（仅 UI 展示）
+        spec:
+          oneOf:
+            - { $ref: '#/components/schemas/JobSpec' }
+            - { type: 'null' }
+
+    JobSpec:
+      type: object
+      required: [runtime, script, deps, timeout_s, compiled]
+      properties:
+        runtime:
+          type: string
+          enum: [python3]
+        script:
+          type: string
+          description: 完整 Python 源码（沙箱执行）
+        deps:
+          type: array
+          items: { type: string }
+          description: pip 依赖（已过滤 stdlib）
+        inputs:
+          type: object
+          additionalProperties: true
+        timeout_s:
+          type: integer
+          minimum: 1
+        compiled:
+          type: object
+          required: [model, at, hash]
+          properties:
+            model: { type: string }
+            at: { type: string, format: date-time }
+            tokens_in: { type: integer }
+            tokens_out: { type: integer }
+            hash:
+              type: string
+              description: sha256(script + deps)，venv 缓存键
+
+    AddCronJobRequest:
+      type: object
+      required: [name, schedule, prompt]
+      properties:
+        name: { type: string }
+        schedule: { type: string }
+        prompt:
+          type: string
+          description: 自然语言需求（后端 LLM 编译成 JobSpec）
+        user_id: { type: string }
+        type:
+          type: string
+          enum: [cron, once]
+          default: cron
+        platform: { type: string }
+        chat_id: { type: string }
+
+    JobHistory:
+      type: object
+      properties:
+        id: { type: integer }
+        job_id: { type: string }
+        status:
+          type: string
+          enum: [success, failed, error, timeout]
+        result: { type: string }
+        error: { type: string }
+        duration_ms: { type: integer }
+        run_at: { type: string, format: date-time }
+        stdout: { type: string }
+        stderr: { type: string }
+        exit_code: { type: integer }
+        data: {}
+
+    APIError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: 机器可读错误码（蛇形大写）
+          enum:
+            - BAD_REQUEST
+            - INTERNAL_ERROR
+            - NOT_FOUND
+            - UNAUTHORIZED
+            - RATE_LIMITED
+            - SERVICE_UNAVAILABLE
+            - CRON_DISABLED
+            - CRON_INVALID_SCHEDULE
+            - CRON_COMPILE_FAILED
+            - CRON_VALIDATE_FAILED
+            - CRON_NOT_SUPPORTED
+        message:
+          type: string
+          description: 用户可读错误描述
+        details: {}
+        docs_url:
+          type: string
+          description: 帮助文档链接
+        error:
+          type: string
+          deprecated: true
+          description: '向后兼容字段（=== message）'

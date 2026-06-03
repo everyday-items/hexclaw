@@ -20,8 +20,10 @@ import (
 	"github.com/hexagon-codes/toolkit/util/logger"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -49,6 +51,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
+	"github.com/hexagon-codes/hexclaw/render"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/session"
 	"github.com/hexagon-codes/hexclaw/featureflag"
@@ -65,7 +68,7 @@ import (
 
 // 版本信息，通过 -ldflags 注入
 var (
-	version = "v0.3.12"
+	version = "v0.4.1"
 	commit  = "none"
 	date    = "unknown"
 )
@@ -197,6 +200,19 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	cfg, err := config.Load(configFile)
 	if err != nil {
 		return fmt.Errorf("加载配置失败: %w", err)
+	}
+
+	// 1.5 桌面端单实例锁：避免重复启动 / stale 进程占端口。
+	// 服务端模式（desktopMode=false）通常用容器编排，无需 lock。
+	var sidecarLock *SidecarLock
+	if desktopMode {
+		home, _ := os.UserHomeDir()
+		l, lockErr := AcquireSidecarLock(home)
+		if lockErr != nil {
+			return fmt.Errorf("启动失败: %w", lockErr)
+		}
+		sidecarLock = l
+		defer sidecarLock.Release()
 	}
 
 	// 桌面客户端模式：仅监听 localhost，自动启用 WebSocket，跳过认证
@@ -680,35 +696,42 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		srv.SetConfigTxManager(txMgr)
 	}
 
-	// 9. 初始化定时任务调度器
+	// 9. 初始化定时任务调度器（v2 脚本编译架构）
+	//
+	// 创建任务时由 LLMCompiler 一次性把用户 prompt 编译成 Python 脚本（JobSpec）；
+	// 运行时由 ScriptExecutor 在沙箱中执行，全程零 LLM 调用。
 	var scheduler *cron.Scheduler
 	cronOK := false
 	if cfg.Cron.Enabled {
-		scheduler = cron.NewScheduler(store.DB())
-		if err := scheduler.Init(ctx); err != nil {
-			scheduler = nil
+		if router == nil {
+			fmt.Println("  ✗ Cron        未启用 (LLM router 未初始化)")
 		} else {
-			scheduler.Start(ctx, func(ctx context.Context, job *cron.Job) (string, error) {
-				reply, err := eng.Process(ctx, &adapter.Message{
-					Platform: adapter.PlatformAPI,
-					UserID:   job.UserID,
-					Content:  job.Prompt,
-					Metadata: map[string]string{"source": "cron", "job_id": job.ID},
-				})
-				if err != nil {
-					return "", err
-				}
-				if reply != nil {
-					return reply.Content, nil
-				}
-				return "", nil
-			})
-			cronOK = true
+			// 动态 resolver — 每次 Compile 时查最新 default。
+			// 用户在 GUI 切 chat 模型立即生效（无需重启），且模型无效时 fail-loud。
+			resolver := buildCronProviderResolver(router)
+			// 启动期试探一次：仅验证基础可用（不阻塞启动；用户可后续在 UI 改配置）
+			if _, model, err := resolver(); err != nil {
+				fmt.Printf("  ⚠ Cron        编译 LLM 暂不可用 (%v) — 创建任务时会重新尝试\n", err)
+				logger.Warn("[cron] 启动期 resolver 失败", "err", err.Error())
+			} else {
+				fmt.Printf("  ⓘ Cron        编译模型：%s（远程 chat 优先，对话仍用默认）\n", model)
+				logger.Info("[cron] 编译目标已解析", "compile_model", model)
+			}
+			compiler := cron.NewLLMCompiler(resolver)
+			scriptExec := cron.NewScriptExecutor()
+			scheduler = cron.NewScheduler(store.DB(), compiler, scriptExec)
+			if err := scheduler.Init(ctx); err != nil {
+				scheduler = nil
+				fmt.Printf("  ✗ Cron        Init 失败 (%v)\n", err)
+			} else {
+				scheduler.Start(ctx)
+				cronOK = true
+			}
 		}
 	}
 	if cronOK {
-		fmt.Println("  ✓ Cron        调度器已启动")
-	} else {
+		fmt.Println("  ✓ Cron        调度器已启动 (v2 脚本编译模式)")
+	} else if !cfg.Cron.Enabled {
 		fmt.Println("  ✗ Cron        未启用")
 	}
 
@@ -786,6 +809,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 挂载 Phase 3 API 端点
 	if scheduler != nil {
 		srv.SetCronScheduler(scheduler)
+		// D2.1 Layer 2 cron 自然语言解析 — 启动期取当前默认；后续会被 SetCronParserResolver 替换
+		// （TODO 后续：parse 端点也走 resolver 路径，跟随 UI 切换）
+		if resolver := buildCronProviderResolver(router); resolver != nil {
+			if p, m, err := resolver(); err == nil && p != nil {
+				srv.SetCronParser(p, m)
+			}
+		}
 	}
 	if fileMem != nil {
 		srv.SetFileMemory(fileMem)
@@ -1097,6 +1127,22 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	desktopSvc := desktop.NewService(version)
 	srv.SetDesktop(desktopSvc)
 
+	// 16. 文档渲染服务（POST /api/v1/render）
+	//
+	// markdown → docx/pdf/epub/odt/rtf/txt/html/md 通过 pandoc 渲染。
+	// 详见 .claude/doc-generation-architecture.md
+	if renderSvc, err := buildRenderService(); err == nil && renderSvc != nil {
+		srv.SetRenderService(renderSvc)
+		logger.Info("[info] 文档渲染服务已启用",
+			"engine", "pandoc",
+			"endpoint", "/api/v1/render")
+	} else if err != nil {
+		logger.Warn("[warn] 文档渲染服务未启用", "reason", err.Error())
+	} else {
+		logger.Info("[info] 文档渲染服务未启用",
+			"reason", "系统未安装 pandoc，POST /api/v1/render 端点不挂载")
+	}
+
 	// 抑制未使用变量警告
 	_ = agentRouter
 	_ = canvasSvc
@@ -1381,4 +1427,259 @@ func countEnabledFlags(flags featureflag.Flags) int {
 func extractLLMName(providerName string) string {
 	parts := strings.SplitN(providerName, "-", 2)
 	return parts[0]
+}
+
+// pickCronCompilerProvider 为 cron 编译挑一个可用 LLM provider。
+//
+// Cron 编译需要稳定快速的远端模型（典型 prompt ~600 tokens，期望 < 15s）。
+// 本地 Ollama 在 9B-级模型上 p50 ~ 30-60s + 拖慢用户机器，不适合做 cron 编译。
+//
+// 优先级：
+//   1. 远端 provider（含 api_key，且名字含 openrouter / anthropic / openai /
+//      claude / gpt / deepseek / 智谱 等关键词）
+//   2. 任意非 Ollama 的 provider（可能用户私有 gateway 命名规律不可知）
+//   3. Ollama 兜底（仅作为最后的选项，避免完全跑不了）
+//
+// 显式忽略 router.Default()，因为它可能被配置漂移指向不存在的 key
+// 或 fallback 到 Ollama，掩盖更快的远端 provider。
+// cronRouterView 是 buildCronProviderResolver 选型逻辑所需的 router 最小只读视图。
+// *llmrouter.Selector 天然满足它；抽成接口纯为单测可注入 fake（见 cron_compile_target_test.go）。
+type cronRouterView interface {
+	DefaultName() string
+	Providers() []string
+	ProviderConfig(name string) (config.LLMProviderConfig, bool)
+	Get(name string) (hexagon.Provider, bool)
+}
+
+// buildCronProviderResolver 构造一个 closure — 每次 Compile 时调用，
+// 解析 cron 脚本编译用的 provider + model（动态跟随用户 UI 切换，无需重启）。
+//
+// 选型优先级（用户决策 2026-05-29：cron 编译优先走「可用的远程快模型」，
+// 对话仍用用户选中的默认 —— 显式的子系统分流，不是偷偷兜底）：
+//   1. 默认 provider 本身就是「远程 + chat」→ 直接用默认（尊重用户显式选择）。
+//   2. 默认是本地（如 Ollama，9B 编译 cron 实测 >300s）→ 挑一个「远程 + chat」
+//      provider 跑编译（装机环境自动命中智谱 glm-5.1）。
+//   3. 没有任何远程可用 → 退回默认（本地），保留非 chat 模型守卫；模型太慢时
+//      由 llmcall/SSE 链路返回 humanize 后的友好错误（不会静默卡死）。
+//
+// 全程不静默换成「错误类别」的模型：非 chat（图像/嵌入/语音）一律跳过并最终友好报错。
+func buildCronProviderResolver(r *llmrouter.Selector) cron.ProviderResolver {
+	return func() (hexagon.Provider, string, error) {
+		if r == nil {
+			return nil, "", fmt.Errorf("LLM router 未初始化")
+		}
+		return pickCronCompileTarget(r)
+	}
+}
+
+// pickCronCompileTarget 按「远程 chat 优先、本地兜底」优先级选 cron 编译目标。
+func pickCronCompileTarget(rv cronRouterView) (hexagon.Provider, string, error) {
+	defName := rv.DefaultName()
+	if defName == "" {
+		return nil, "", fmt.Errorf("未配置默认 LLM provider — 请到设置 → LLM 选一个 chat 模型作为默认")
+	}
+	// 优先尝试远程 chat 候选（默认若为远程则排最前，其余远程按名字稳定排序）。
+	for _, name := range cronCompileCandidates(rv, defName) {
+		if p, model, err := resolveChatProvider(rv, name); err == nil {
+			return p, model, nil
+		}
+	}
+	// 没有远程 chat 可用 → 退回默认（本地）；返回其详细错误语义（成功则走本地慢路径）。
+	return resolveChatProvider(rv, defName)
+}
+
+// cronCompileCandidates 返回远程 chat 候选的有序列表：
+// 默认 provider 若为远程排最前（尊重用户显式选择），其余远程 provider 按名字排序。
+// 默认为本地时不在此列出（由 pickCronCompileTarget 末尾兜底）。
+func cronCompileCandidates(rv cronRouterView, defName string) []string {
+	var remotes []string
+	for _, name := range rv.Providers() {
+		if name == defName || !isRemoteProvider(rv, name) {
+			continue
+		}
+		remotes = append(remotes, name)
+	}
+	sort.Strings(remotes)
+	out := make([]string, 0, len(remotes)+1)
+	if isRemoteProvider(rv, defName) {
+		out = append(out, defName)
+	}
+	return append(out, remotes...)
+}
+
+// isRemoteProvider 判定 provider 是否为远程（非 localhost / 127.0.0.1）。
+func isRemoteProvider(rv cronRouterView, name string) bool {
+	pc, ok := rv.ProviderConfig(name)
+	if !ok {
+		return false
+	}
+	return !strings.Contains(pc.BaseURL, "localhost") && !strings.Contains(pc.BaseURL, "127.0.0.1")
+}
+
+// resolveChatProvider 校验单个 provider 可用且为 chat completion 类，返回 provider+model 或详细错误。
+func resolveChatProvider(rv cronRouterView, name string) (hexagon.Provider, string, error) {
+	p, ok := rv.Get(name)
+	if !ok || p == nil {
+		return nil, "", fmt.Errorf("LLM provider (%s) 不可用 — 检查 API key / 网络", name)
+	}
+	pc, ok := rv.ProviderConfig(name)
+	if !ok {
+		return nil, "", fmt.Errorf("LLM provider (%s) 配置缺失", name)
+	}
+	model := pc.Model
+	if model == "" {
+		return nil, "", fmt.Errorf("LLM provider (%s) 未指定 model", name)
+	}
+	if isNonChatModel(model) {
+		return nil, "", fmt.Errorf("LLM (%s / %s) 不是 chat completion 模型（疑似图像/嵌入/语音类）— 请到设置 → LLM 改选 chat 类模型", name, model)
+	}
+	return p, model, nil
+}
+
+// isNonChatModel 识别图像/嵌入/语音等非 chat completion 类模型名。
+// 装机时智谱默认 cogview-4 是图像模型，喂给 LLMCompiler 会返 content=array 触发 json 解析失败。
+func isNonChatModel(m string) bool {
+	n := strings.ToLower(m)
+	for _, kw := range []string{
+		"cogview", "dall", "midjourney", "stable-diffusion", "sd-",
+		"embedding", "embed-", "bge-", "m3e", "text-embedding", "nomic-embed",
+		"whisper", "tts", "audio-", "voice-",
+		"cogvideo", "video-",
+	} {
+		if strings.Contains(n, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// pickFastCompileModel 已删除（2026-05-27 用户反馈）：
+// 不再偷换模型 — cron compiler 直接用用户在设置中选中的默认 provider.Model。
+
+// buildRenderService 装配文档渲染服务。
+//
+// 资产路径：
+//   - sandbox: ~/.hexclaw/render/sandbox（temp file 存放）
+//   - cache:   ~/.hexclaw/render/cache  （sha256 → file 命中复用）
+//
+// 仅当系统 PATH 上有 pandoc 时才返回非空 Service；否则返回 nil（端点不启用，
+// 走 fallback 错误码 ENGINE_MISSING）。typst 缺失时仍可启用（PDF 单独失败）。
+//
+// engine_version 字符串由 pandoc / typst 二进制版本拼接，参与缓存键计算；
+// 升级二进制后字符串变化 → 旧缓存自动失效。
+func buildRenderService() (*render.Service, error) {
+	// 必须有 pandoc 才启用
+	if _, err := exec.LookPath("pandoc"); err != nil {
+		return nil, nil //nolint:nilnil // 不报错，只是不启用
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("user home dir: %w", err)
+	}
+	sandbox := filepath.Join(home, ".hexclaw", "render", "sandbox")
+	cacheDir := filepath.Join(home, ".hexclaw", "render", "cache")
+
+	renderer, err := render.NewPandocRenderer("", "", sandbox)
+	if err != nil {
+		return nil, err
+	}
+
+	// engine_version 拼接 pandoc + typst 版本
+	engineVer := pandocVersion()
+	if tv := typstVersion(); tv != "" {
+		engineVer += "+" + tv
+	}
+
+	// 计算 renderer_assets_hash：P0 内置资产清单（任一资产改动让缓存失效）；
+	// 同时把第一份资产（默认 reference.docx）注入 PandocRenderer，让 pandoc 实际消费它。
+	assetPaths := resolveRenderAssetPaths()
+	assetsHash, err := render.AssetsHash(assetPaths)
+	if err != nil {
+		return nil, fmt.Errorf("compute assets hash: %w", err)
+	}
+	if len(assetPaths) > 0 {
+		if _, statErr := os.Stat(assetPaths[0]); statErr == nil {
+			renderer.ReferenceDocPath = assetPaths[0]
+		}
+	}
+
+	cache, err := render.NewCache(render.CacheConfig{
+		Dir:           cacheDir,
+		MaxBytes:      render.CacheMaxBytes,
+		TTL:           render.CacheTTL,
+		EngineVersion: engineVer,
+		AssetsHash:    assetsHash,
+		DefaultLocale: "zh-CN",
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return render.NewService(render.ServiceConfig{Renderer: renderer, Cache: cache})
+}
+
+// resolveRenderAssetPaths 返回 renderer_assets_hash 计算用的 P0 资产清单。
+//
+// 当前内置资产：
+//   - reference.docx：默认 docx 字体/页边距/标题样式
+//
+// 资产文件不存在时 AssetsHash 视为零字节（不阻塞启动）；release 真正捆绑后
+// 此清单自动生效，hash 变化让缓存失效。
+func resolveRenderAssetPaths() []string {
+	candidates := []string{}
+	// 桌面 .app 捆绑：HEXCLAW_RESOURCE_DIR 由 Tauri sidecar.rs 注入，指向 Contents/Resources/
+	if dir := os.Getenv("HEXCLAW_RESOURCE_DIR"); dir != "" {
+		candidates = append(candidates, filepath.Join(dir, "assets", "render", "reference.docx"))
+	}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "assets", "render", "reference.docx"))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(cwd, "render", "assets", "reference.docx"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".hexclaw", "render", "assets", "reference.docx"))
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return []string{p}
+		}
+	}
+	if len(candidates) > 0 {
+		return []string{candidates[0]}
+	}
+	return nil
+}
+
+// pandocVersion 取 pandoc 版本号（用于 engine_version 缓存键维度）。
+// 失败返回 "pandoc-unknown"，不阻塞启动。
+func pandocVersion() string {
+	out, err := exec.Command("pandoc", "--version").Output()
+	if err != nil {
+		return "pandoc-unknown"
+	}
+	// 第一行形如 "pandoc 3.9.0.2"
+	first := strings.SplitN(string(out), "\n", 2)[0]
+	parts := strings.Fields(first)
+	if len(parts) >= 2 {
+		return "pandoc-" + parts[1]
+	}
+	return "pandoc-unknown"
+}
+
+// typstVersion 取 typst 版本号；缺失返回空串。
+func typstVersion() string {
+	if _, err := exec.LookPath("typst"); err != nil {
+		return ""
+	}
+	out, err := exec.Command("typst", "--version").Output()
+	if err != nil {
+		return "typst-unknown"
+	}
+	parts := strings.Fields(string(out))
+	if len(parts) >= 2 {
+		return "typst-" + parts[1]
+	}
+	return "typst-unknown"
 }

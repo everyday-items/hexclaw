@@ -2078,6 +2078,14 @@ func (e *ReActEngine) buildCompletionRequest(ctx context.Context, msg *adapter.M
 		Messages: e.buildStreamMessages(ctx, msg.Metadata["role"], history, kbContext, msg.Content, msg.Metadata, msg.Attachments),
 	}
 	applyCompletionOverrides(&req, msg.Metadata)
+	// D2.2 Layer 3：cron-like 但前端没拦住的兜底
+	//   - msg.Metadata["cron_context"] == "true" → 前端显式标记（来自 useChatSend Layer 3 路径）
+	//   - 后端关键词扫描兜底（Layer 1/2 都没拦时的最后防线）
+	if msg.Metadata["cron_context"] == "true" {
+		applyCronIntentGuidance(&req)
+	} else if hit, _ := detectCronIntent(msg.Content); hit {
+		applyCronIntentGuidance(&req)
+	}
 	return req
 }
 
@@ -2612,7 +2620,19 @@ const defaultSystemPrompt = `你是「小蟹」🦀，HexClaw 的 AI 助手。
 工具使用偏好：
 - 当用户要求执行代码、抓取网页、数据处理、计算等任务时，优先使用 code_exec 工具直接执行，而不是用 write_file 写文件
 - code_exec 支持网络访问，可以直接 import requests 等库抓取网页（缺失的依赖会自动安装）
-- 只有用户明确要求"保存为文件"时才使用 write_file
+- 只有用户**明确要求"保存到本地 / 写到文件 / 保存到 ~/xxx"**时才使用 write_file。
+  当用户说"生成一个 md / 写成 markdown / 生成 docx"等不带明确落盘意图的表达时，**不要调用 write_file**——
+  直接在回答里输出 markdown 代码块即可。桌面端会自动把代码块识别为"产物"渲染到右侧面板，
+  用户可在面板里点 Download 自行保存到本地。
+- **严禁**说"文件已成功保存为 X.md / 已生成文件 X / 文件保存在 Y"等措辞，**除非你实际调用了 write_file 工具且工具返回了绝对路径**——
+  否则磁盘上根本没文件，是在向用户撒谎。
+  没调工具时的正确说法："已为你生成 markdown 产物，可在右侧面板查看和下载" 或 "以下是 markdown 内容："+代码块。
+- **关于 PDF / Word / docx / odt / rtf / epub / html / txt 等"非 markdown 格式"的导出**：
+  桌面端会把 markdown 产物渲染到右侧面板，用户在 artifact 卡片右上角点击 Download 旁的下拉箭头，
+  可以选择导出为 8 种格式（**PDF / docx (Word) / odt / rtf / html / epub / md / txt**），全部由内置渲染引擎完成。
+  **严禁**说"我无法生成 PDF / 我不能生成 Word / 需要外部工具转换"等否定回答——这是错的，能力是存在的，
+  你只需要正常生成 markdown 内容，导出格式由用户在 UI 上选择。
+  正确说法："已生成 markdown 产物，可在右侧面板下拉菜单选择导出为 PDF / Word 等格式" 或 直接生成 markdown 不必特别提及。
 - 修改文件时，先用 file_ops(read) 或 read_file 查看内容，再用 file_edit 精确替换，避免全量覆盖
 - 探索代码库时，用 grep 搜索内容、glob 查找文件，而不是让用户告诉你文件在哪
 

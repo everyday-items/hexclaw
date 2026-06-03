@@ -1,12 +1,30 @@
 package engine
 
 import (
+	"log/slog"
+	"regexp"
 	"sort"
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
+
+// llmToolNamePattern 上游 OpenAI / Anthropic 通用的 tool name 校验正则。
+//
+// BUG-20260523 教训：marketplace 用户 skill 名字含中文（"前女友" / "前leader"），
+// 注入到 Claude tools[].function.name 立即被 400 拒收：
+//   String should match pattern '^[a-zA-Z0-9_-]{1,128}$'
+//
+// 任何 source（builtin / marketplace / chain / MCP）的 tool name 必须过这道关。
+// 不合规的 skip + warn 日志（不影响 trigger 词召唤路径——中文 skill 仍可被
+// trigger 词激活，只是不出现在 LLM tools 列表中）。
+var llmToolNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
+
+// isValidLLMToolName 检查 name 是否符合上游 LLM 标识符规范。
+func isValidLLMToolName(name string) bool {
+	return llmToolNamePattern.MatchString(name)
+}
 
 // ToolCollector gathers tool definitions from multiple sources.
 //
@@ -62,6 +80,16 @@ func (tc *ToolCollector) CollectFiltered(query string, act skill.Activation) []l
 			if def.Function.Name == "" {
 				continue
 			}
+			if !isValidLLMToolName(def.Function.Name) {
+				// BUG-20260523: 非法 name（含中文 / 空格 / 点号 / 冒号 / 斜杠等）
+				// 上游 Claude 会立即 400。skip + warn，trigger 词召唤路径仍然可用。
+				slog.Warn("[ToolCollector] skip skill — name 不符合 LLM 标识符正则",
+					"name", def.Function.Name,
+					"source", "skill",
+					"pattern", `^[a-zA-Z0-9_-]{1,128}$`,
+					"hint", "重命名 skill 用 ASCII / 数字 / 下划线 / 短横线；中文仍可通过 trigger 词召唤")
+				continue
+			}
 			if seen[def.Function.Name] {
 				continue
 			}
@@ -77,6 +105,15 @@ func (tc *ToolCollector) CollectFiltered(query string, act skill.Activation) []l
 	if tc.mcpMgr != nil {
 		for _, def := range tc.mcpMgr.ListToolDefinitions() {
 			if def.Function.Name == "" {
+				continue
+			}
+			if !isValidLLMToolName(def.Function.Name) {
+				// BUG-20260523: 同上 —— MCP server 也可能暴露非法 name 工具。
+				slog.Warn("[ToolCollector] skip MCP tool — name 不符合 LLM 标识符正则",
+					"name", def.Function.Name,
+					"source", "mcp",
+					"pattern", `^[a-zA-Z0-9_-]{1,128}$`,
+					"hint", "联系 MCP server 维护者修正 tool name 命名规范")
 				continue
 			}
 			if seen[def.Function.Name] {

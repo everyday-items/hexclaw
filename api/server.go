@@ -50,6 +50,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
+	"github.com/hexagon-codes/hexclaw/render"
 	"github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/skill/hub"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
@@ -60,6 +61,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/voice"
 	"github.com/hexagon-codes/hexclaw/voicechat"
 	"github.com/hexagon-codes/hexclaw/webhook"
+	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -85,6 +87,7 @@ type Server struct {
 	voiceChatSvc      *voicechat.Service           // 语音对话服务（可选）
 	imagegenSvc       *imagegen.Service            // 图像生成服务（可选）
 	videogenSvc       *videogen.Service            // 视频生成服务（可选）
+	renderSvc         *render.Service              // 文档渲染服务（可选）
 	capabilities      *llmrouter.CapabilityService // A7 模型 tool_call 能力探测（可选）
 	genStore          *genstore.Store              // 生成内容持久化（图像/视频）
 	reloadGenServices func()                       // LLM 配置变更后重建 gen 服务（main.go 注入）
@@ -101,6 +104,8 @@ type Server struct {
 	toolPerms         *engine.ToolPermissions      // 工具权限（可选）
 	checkpointMgr     *engine.CheckpointManager    // 检查点管理器（可选）
 	cfgTxMgr          *config.TransactionManager   // v0.4.0 F9 配置事务热加载（可选）
+	cronParseProvider hexagon.Provider             // D2.1 Layer 2 cron parse LLM provider
+	cronParseModel    string                       // D2.1 cron parse 模型名（建议 haiku/mini 类快模型）
 	version           string                       // 版本号
 	// 沙箱网络热更新回调（由 main.go 注入）
 	onSandboxNetworkUpdate func(enabled bool) error
@@ -178,6 +183,17 @@ func (s *Server) SetWebhookManager(mgr *webhook.Manager) {
 // 设置后启用定时任务管理 API。
 func (s *Server) SetCronScheduler(scheduler *cron.Scheduler) {
 	s.scheduler = scheduler
+}
+
+// SetCronParser 注入 Layer 2 cron 自然语言 → JSON 解析所需的 LLM provider + model（D2.1）。
+//
+// 该 provider 配合 ResponseFormat=json_object + Tools=nil + Metadata.cron_context=true
+// 强制走"纯文本/JSON"路径，从协议层根除 tool_use_id 链路 400 bug。
+//
+// 入参可为 nil（cron parse 端点会返 needs_clarification 让前端 fallback 到 Layer 3）。
+func (s *Server) SetCronParser(provider hexagon.Provider, model string) {
+	s.cronParseProvider = provider
+	s.cronParseModel = model
 }
 
 // SetVectorMemory 设置向量语义记忆
@@ -267,6 +283,14 @@ func (s *Server) SetImageGen(svc *imagegen.Service) {
 // 设置后启用 /api/v1/videos/* 端点（含异步轮询）。
 func (s *Server) SetVideoGen(svc *videogen.Service) {
 	s.videogenSvc = svc
+}
+
+// SetRenderService 设置文档渲染服务。
+//
+// 设置后启用 POST /api/v1/render 端点。Markdown → docx/pdf/epub/odt/rtf/txt/html/md
+// 详见 .claude/doc-generation-architecture.md
+func (s *Server) SetRenderService(svc *render.Service) {
+	s.renderSvc = svc
 }
 
 // SetVoiceChat 设置语音对话服务
@@ -421,6 +445,11 @@ func (s *Server) routes() http.Handler {
 	// API v1
 	mux.HandleFunc("POST /api/v1/chat", s.handleChat)
 
+	// 文档渲染 API（markdown → docx/pdf/epub/odt/rtf/txt/html/md）
+	if s.renderSvc != nil {
+		mux.HandleFunc("POST /api/v1/render", s.handleRender)
+	}
+
 	// 知识库 API
 	if s.kb != nil {
 		mux.HandleFunc("POST /api/v1/knowledge/documents", s.handleAddDocument)
@@ -480,14 +509,15 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("DELETE /api/v1/webhooks/{name}", s.handleDeleteWebhook)
 	}
 
-	// Cron API
+	// Cron API（v0.4.x：统一为单 endpoint 7-action 入口，决策 B 完全替换）
 	if s.scheduler != nil {
-		mux.HandleFunc("GET /api/v1/cron/jobs", s.handleListCronJobs)
-		mux.HandleFunc("POST /api/v1/cron/jobs", s.handleAddCronJob)
-		mux.HandleFunc("DELETE /api/v1/cron/jobs/{id}", s.handleDeleteCronJob)
-		mux.HandleFunc("POST /api/v1/cron/jobs/{id}/pause", s.handlePauseCronJob)
-		mux.HandleFunc("POST /api/v1/cron/jobs/{id}/resume", s.handleResumeCronJob)
-		mux.HandleFunc("POST /api/v1/cron/jobs/{id}/trigger", s.handleTriggerCronJob)
+		// 主入口：D1.2 统一 endpoint（create/update/list/pause/resume/remove/run）
+		mux.HandleFunc("POST /api/v1/cronjob", s.handleCronjobUnified)
+		// Layer 2 LLM JSON 解析（cron_context 守卫强制 tools=nil 绕开 tool_use_id 400 链路）
+		mux.HandleFunc("POST /api/v1/cron/parse", s.handleCronParse)
+		// SSE 创建仍保留（流式编译进度需要 EventSource，无法塞进 unified JSON）
+		mux.HandleFunc("POST /api/v1/cron/jobs/stream", s.handleAddCronJobSSE)
+		// 历史查询保留（与 unified action 概念正交）
 		mux.HandleFunc("GET /api/v1/cron/jobs/{id}/history", s.handleCronJobHistory)
 	}
 
@@ -896,6 +926,25 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		ProcessStream(ctx context.Context, msg *adapter.Message) (<-chan *adapter.ReplyChunk, error)
 	}
 
+	// BUG-20260523-v2 架构修复：检测 SSE 流式请求
+	// 当客户端声明 Accept: text/event-stream 时，HTTP 层与 ProcessStream 同步流式输出，
+	// 不再把所有 chunk 攒成完整 JSON 才返回。
+	// 避免前端因"LLM 推理时长不可预测"被迫设固定 HTTP 总时长 timeout。
+	wantsSSE := strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+
+	if wantsSSE {
+		se, ok := s.engine.(streamEngine)
+		if !ok {
+			trace.L(ctx).Error("引擎不支持流式但收到 SSE 请求")
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "engine does not support streaming",
+			})
+			return
+		}
+		s.handleChatSSE(ctx, w, msg, se, start)
+		return
+	}
+
 	var reply *adapter.Reply
 	if se, ok := s.engine.(streamEngine); ok {
 		chunks, err := se.ProcessStream(ctx, msg)
@@ -958,6 +1007,109 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Usage:     reply.Usage,
 		ToolCalls: reply.ToolCalls,
 	})
+}
+
+// handleChatSSE 处理 SSE 流式聊天请求（BUG-20260523-v2）。
+//
+// 把 ProcessStream 的 chunk channel 直接以 SSE 格式（`data: <json>\n\n`）写到 HTTP 响应，
+// 让前端能逐 chunk 拿到内容（包括 reasoning / tool_calls 增量），
+// 不再被迫等"完整推理时长"。
+//
+// 协议：
+//   - 每个 chunk：`data: {"content":"...","reasoning":"...","done":false}\n\n`
+//   - 错误 chunk：`data: {"error":"...","done":true}\n\n`
+//   - 结束标记：`data: [DONE]\n\n`
+//
+// 每个节点都有结构化日志，便于排查（BUG-20260523 教训）。
+func (s *Server) handleChatSSE(
+	ctx context.Context,
+	w http.ResponseWriter,
+	msg *adapter.Message,
+	se interface {
+		ProcessStream(ctx context.Context, msg *adapter.Message) (<-chan *adapter.ReplyChunk, error)
+	},
+	start time.Time,
+) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		trace.L(ctx).Error("[SSE] ResponseWriter 不支持 Flush — http.Server 配置异常")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "server does not support streaming",
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // 关 nginx 反向代理缓冲
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	trace.L(ctx).Info("[SSE] 开始流式响应", "session", msg.SessionID, "user", msg.UserID)
+
+	chunks, err := se.ProcessStream(ctx, msg)
+	if err != nil {
+		trace.L(ctx).Error("[SSE] ProcessStream 启动失败", "err", err)
+		errPayload, _ := json.Marshal(map[string]any{
+			"error": upstreamerr.PublicMessage(err, "error"),
+			"done":  true,
+		})
+		fmt.Fprintf(w, "data: %s\n\n", errPayload)
+		flusher.Flush()
+		return
+	}
+
+	var (
+		chunkCount     int
+		contentBytes   int
+		reasoningBytes int
+		toolCallCount  int
+		hadError       bool
+	)
+
+	for chunk := range chunks {
+		if chunk.Error != nil {
+			hadError = true
+			trace.L(ctx).Error("[SSE] chunk 错误", "err", chunk.Error, "chunks_so_far", chunkCount)
+			errPayload, _ := json.Marshal(map[string]any{
+				"error": upstreamerr.PublicMessage(chunk.Error, "error"),
+				"done":  true,
+			})
+			fmt.Fprintf(w, "data: %s\n\n", errPayload)
+			flusher.Flush()
+			return
+		}
+
+		chunkCount++
+		contentBytes += len(chunk.Content)
+		reasoningBytes += len(chunk.Reasoning)
+		if len(chunk.ToolCalls) > 0 {
+			toolCallCount = len(chunk.ToolCalls)
+		}
+
+		payload, err := json.Marshal(chunk)
+		if err != nil {
+			trace.L(ctx).Error("[SSE] 序列化 chunk 失败", "err", err, "chunks_so_far", chunkCount)
+			continue
+		}
+		fmt.Fprintf(w, "data: %s\n\n", payload)
+		flusher.Flush()
+	}
+
+	if !hadError {
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}
+
+	trace.L(ctx).Info("[SSE] 流式响应结束",
+		"chunks", chunkCount,
+		"content_bytes", contentBytes,
+		"reasoning_bytes", reasoningBytes,
+		"tool_calls", toolCallCount,
+		"had_error", hadError,
+		"elapsed_ms", time.Since(start).Milliseconds(),
+	)
 }
 
 const defaultDesktopUserID = "desktop-user"

@@ -64,16 +64,53 @@ type Selector struct {
 //
 // 根据配置初始化所有 Provider。
 // 支持官方 API、API 中转、私有部署等多种接入方式。
+//
+// 启动校验：cfg.Default 必须在 providers map 中，否则自动选第一个可用 provider
+// 并 log warn —— 避免配置漂移（如 default: apimart 但 providers 里没这个 key）
+// 导致 router.Default() 返 nil 触发隐式 fallback 到首个 provider（参考本次
+// "default→Ollama" 错配踩坑教训）。
 func New(cfg config.LLMConfig) (*Selector, error) {
 	providers, activeCfg, defaultP := buildSelectorState(cfg)
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("没有可用的 LLM Provider，请检查 API Key 配置")
+	}
+	// 校验 default 名字
+	if _, ok := providers[defaultP]; !ok {
+		picked := pickFallbackDefault(providers)
+		logger.Warn("[llmrouter] 配置 default 漂移：在 providers 中找不到，自动改用 fallback",
+			"configured_default", defaultP, "fallback", picked,
+			"available", providerNames(providers))
+		defaultP = picked
 	}
 	return &Selector{
 		providers: providers,
 		cfg:       activeCfg,
 		defaultP:  defaultP,
 	}, nil
+}
+
+// pickFallbackDefault 当配置 default 缺失时挑一个合理的 fallback。
+// 偏好远端 provider（避免桌面端 Ollama 在没安装时尝试连）。
+func pickFallbackDefault(providers map[string]hexagon.Provider) string {
+	// 第一遍：偏好远端 (非 ollama 名)
+	for name := range providers {
+		if !strings.Contains(strings.ToLower(name), "ollama") {
+			return name
+		}
+	}
+	// 第二遍：只剩 ollama 兜底
+	for name := range providers {
+		return name
+	}
+	return ""
+}
+
+func providerNames(m map[string]hexagon.Provider) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 // NewWithProviders 使用显式注入的 Provider 创建路由器。

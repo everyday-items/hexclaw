@@ -1,0 +1,99 @@
+name: render
+
+# 文档渲染管线 CI smoke：三平台跑 render 包测试 + 黄金回归。
+# 详见 .claude/doc-generation-architecture.md §4 P0g。
+#
+# 触发：
+#   - render/ 或 api/handler_render*.go 改动
+#   - cmd/hexclaw/main.go 改动
+#   - 每周一 02:00 UTC 拉 latest pandoc/typst 跑回归（监测上游升级）
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'render/**'
+      - 'api/handler_render*.go'
+      - 'cmd/hexclaw/main.go'
+      - '.github/workflows/render.yml'
+  pull_request:
+    paths:
+      - 'render/**'
+      - 'api/handler_render*.go'
+      - 'cmd/hexclaw/main.go'
+  schedule:
+    # 每周一 02:00 UTC 跑黄金回归 + 监测最新上游版本
+    - cron: '0 2 * * 1'
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # 安装 pandoc + typst（与 versions.json pin 的版本一致即可，CI 用 brew/apt 简化）
+      - name: Install pandoc + typst (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # pandoc：用官方 deb（apt 包版本通常落后）
+          curl -fSL https://github.com/jgm/pandoc/releases/download/3.9.0.2/pandoc-3.9.0.2-1-amd64.deb -o /tmp/pandoc.deb
+          sudo dpkg -i /tmp/pandoc.deb
+          pandoc --version | head -1
+
+          # typst：cargo install 太慢，下载官方二进制
+          curl -fSL https://github.com/typst/typst/releases/download/v0.13.1/typst-x86_64-unknown-linux-musl.tar.xz | \
+            tar xJ --strip-components=1 -C /usr/local/bin typst-x86_64-unknown-linux-musl/typst
+          sudo chmod +x /usr/local/bin/typst
+          typst --version
+
+      - name: Install pandoc + typst (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install pandoc typst
+          pandoc --version | head -1
+          typst --version
+
+      - name: Install pandoc + typst (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install -y pandoc typst
+          pandoc --version
+          typst --version
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test render package
+        run: go test ./render/... -v -timeout 5m
+
+      - name: Test api render handler
+        run: go test ./api/... -run "Render" -v -timeout 5m
+
+  upstream-version-check:
+    # schedule 触发时，检查上游 pandoc/typst 是否有新版本。
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check pandoc latest
+        run: |
+          latest=$(curl -fsSL https://api.github.com/repos/jgm/pandoc/releases/latest | jq -r .tag_name)
+          echo "Pandoc latest: $latest"
+          # 当前 pin 版本与最新对比；非阻塞，只发提醒
+          echo "::notice::Pandoc upstream latest=$latest. Manual review for upgrade."
+
+      - name: Check typst latest
+        run: |
+          latest=$(curl -fsSL https://api.github.com/repos/typst/typst/releases/latest | jq -r .tag_name)
+          echo "Typst latest: $latest"
+          echo "::notice::Typst upstream latest=$latest. Manual review for upgrade."

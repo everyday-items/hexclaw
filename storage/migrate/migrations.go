@@ -1,5 +1,11 @@
 package migrate
 
+import (
+	"context"
+	"database/sql"
+	"fmt"
+)
+
 // All 定义所有数据库迁移，按版本顺序执行。
 //
 // 设计原则：
@@ -339,4 +345,185 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_chunks_doc_index
 --     且 id 已是 PK，重复持久化会被 PK 冲突拒绝，无需复合 UNIQUE。
 `,
 	},
+	{
+		Version:     5,
+		Description: "v0.4.1 cron v2 脚本编译架构：删 prompt NOT NULL + 加 spec_json/source_prompt 与执行结果字段",
+		Func:        migrateCronV2,
+	},
+}
+
+// migrateCronV2 把 cron v1 schema 升级到 v2（详见 .claude/cron-script-compilation-design.md）。
+//
+// 用 Func 而非 SQL 是因为：
+//   - SQLite 不支持 conditional ALTER（基于 pragma 结果分支）
+//   - 需要根据现有 cron_jobs 列状态动态构造 SELECT/INSERT
+//   - DDL（ALTER/DROP/CREATE）在事务里行为复杂，分阶段更稳
+//
+// 流程：
+//   1. cron_jobs 不存在 → CREATE 全新 v2 schema 就行（migrate v1 应该已建表，这里兜底）
+//   2. cron_jobs 已存在但缺 spec_json 列（v1 schema）→ 表重建迁移
+//   3. cron_jobs 已含 spec_json（v2 部分迁移过的旧库）→ 检查是否还有 prompt 列；有就重建
+//   4. cron_job_runs 同理补 stdout/stderr/exit_code/data_json
+func migrateCronV2(ctx context.Context, db *sql.DB) error {
+	// — cron_jobs —
+	hasJobs, err := tableExists(ctx, db, "cron_jobs")
+	if err != nil {
+		return fmt.Errorf("检查 cron_jobs: %w", err)
+	}
+	if !hasJobs {
+		// v1 schema 应该已建表；兜底直接建 v2 schema
+		if _, err := db.ExecContext(ctx, cronJobsV2DDL); err != nil {
+			return fmt.Errorf("创建 v2 cron_jobs: %w", err)
+		}
+	} else {
+		hasSpecJSON, _ := columnExists(ctx, db, "cron_jobs", "spec_json")
+		hasPrompt, _ := columnExists(ctx, db, "cron_jobs", "prompt")
+		// 任一不一致都走表重建（涵盖：v1 schema / 半 v2 / 完全 v2 但 prompt 残留）
+		if !hasSpecJSON || hasPrompt {
+			if err := rebuildCronJobs(ctx, db, hasSpecJSON); err != nil {
+				return fmt.Errorf("重建 cron_jobs: %w", err)
+			}
+		}
+	}
+
+	// — cron_job_runs —
+	hasRuns, err := tableExists(ctx, db, "cron_job_runs")
+	if err != nil {
+		return fmt.Errorf("检查 cron_job_runs: %w", err)
+	}
+	if !hasRuns {
+		if _, err := db.ExecContext(ctx, cronJobRunsV2DDL); err != nil {
+			return fmt.Errorf("创建 v2 cron_job_runs: %w", err)
+		}
+	} else {
+		for _, col := range []struct{ name, def string }{
+			{"stdout", "TEXT NOT NULL DEFAULT ''"},
+			{"stderr", "TEXT NOT NULL DEFAULT ''"},
+			{"exit_code", "INTEGER NOT NULL DEFAULT 0"},
+			{"data_json", "TEXT NOT NULL DEFAULT ''"},
+		} {
+			has, _ := columnExists(ctx, db, "cron_job_runs", col.name)
+			if has {
+				continue
+			}
+			stmt := fmt.Sprintf(`ALTER TABLE cron_job_runs ADD COLUMN %s %s`, col.name, col.def)
+			if _, err := db.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("ALTER cron_job_runs ADD %s: %w", col.name, err)
+			}
+		}
+	}
+	return nil
+}
+
+const cronJobsV2DDL = `CREATE TABLE cron_jobs (
+    id            TEXT     PRIMARY KEY,
+    name          TEXT     NOT NULL,
+    type          TEXT     NOT NULL DEFAULT 'cron',
+    schedule      TEXT     NOT NULL,
+    spec_json     TEXT     NOT NULL DEFAULT '',
+    source_prompt TEXT     NOT NULL DEFAULT '',
+    user_id       TEXT     NOT NULL,
+    platform      TEXT     DEFAULT '',
+    chat_id       TEXT     DEFAULT '',
+    status        TEXT     NOT NULL DEFAULT 'active',
+    last_run_at   DATETIME,
+    next_run_at   DATETIME NOT NULL,
+    run_count     INTEGER  DEFAULT 0,
+    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+)`
+
+const cronJobRunsV2DDL = `CREATE TABLE cron_job_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id      TEXT    NOT NULL,
+    status      TEXT    NOT NULL DEFAULT 'success',
+    result      TEXT    NOT NULL DEFAULT '',
+    error       TEXT    NOT NULL DEFAULT '',
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    run_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    stdout      TEXT    NOT NULL DEFAULT '',
+    stderr      TEXT    NOT NULL DEFAULT '',
+    exit_code   INTEGER NOT NULL DEFAULT 0,
+    data_json   TEXT    NOT NULL DEFAULT ''
+)`
+
+// rebuildCronJobs 重建 cron_jobs：保留 spec_json 非空的 v2 任务，丢弃 v1 任务。
+// hasSpecJSON 控制 INSERT SELECT 是否引用旧 spec_json 列。
+func rebuildCronJobs(ctx context.Context, db *sql.DB, hasSpecJSON bool) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE cron_jobs_v5_new (
+        id            TEXT     PRIMARY KEY,
+        name          TEXT     NOT NULL,
+        type          TEXT     NOT NULL DEFAULT 'cron',
+        schedule      TEXT     NOT NULL,
+        spec_json     TEXT     NOT NULL DEFAULT '',
+        source_prompt TEXT     NOT NULL DEFAULT '',
+        user_id       TEXT     NOT NULL,
+        platform      TEXT     DEFAULT '',
+        chat_id       TEXT     DEFAULT '',
+        status        TEXT     NOT NULL DEFAULT 'active',
+        last_run_at   DATETIME,
+        next_run_at   DATETIME NOT NULL,
+        run_count     INTEGER  DEFAULT 0,
+        created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`); err != nil {
+		return err
+	}
+
+	if hasSpecJSON {
+		// 已 v2 部分迁移过：保留 spec_json 非空的 v2 任务
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cron_jobs_v5_new
+            (id, name, type, schedule, spec_json, source_prompt, user_id, platform, chat_id, status,
+             last_run_at, next_run_at, run_count, created_at)
+            SELECT id, name, COALESCE(type,'cron'), schedule,
+                   COALESCE(spec_json,''), COALESCE(source_prompt,''),
+                   user_id, COALESCE(platform,''), COALESCE(chat_id,''), COALESCE(status,'active'),
+                   last_run_at, next_run_at, COALESCE(run_count,0),
+                   COALESCE(created_at, CURRENT_TIMESTAMP)
+            FROM cron_jobs
+            WHERE spec_json IS NOT NULL AND spec_json != ''`); err != nil {
+			return err
+		}
+	}
+	// 否则纯 v1 schema：v1 任务在 v2 架构下无法运行（没编译 Spec），不复制即丢弃
+
+	if _, err := tx.ExecContext(ctx, `DROP TABLE cron_jobs`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE cron_jobs_v5_new RENAME TO cron_jobs`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func tableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
+	var n int
+	err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&n)
+	return n > 0, err
+}
+
+func columnExists(ctx context.Context, db *sql.DB, table, col string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == col {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }

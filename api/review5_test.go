@@ -28,13 +28,27 @@ func TestUpdateAgent_ZeroValueDoesNotClear(t *testing.T) {
 }
 
 // ── 2. TriggerJob 浅拷贝竞态 ──
-
+//
+// Scheduler 用 `j := *job` 浅拷贝再 go executeJob(&j) 避免并发修改可变字段（LastRunAt/RunCount/Status）。
+// 浅拷贝下 reference-type 字段会被共享，因此原则上禁止 Job 含 map/slice/pointer/interface。
+//
+// 例外（v2 架构）：
+//   - Spec *JobSpec —— 编译后的 read-only 产物，运行时不写，共享指针语义上安全。
+//
+// 任何新增的引用类型字段，要么改成值类型，要么在下面 allow-list 里显式说明为何只读。
 func TestTriggerJob_ShallowCopy(t *testing.T) {
+	readOnlyShared := map[string]bool{
+		"Spec":    true, // *JobSpec：LLM 编译产物，运行时不变。详见 .claude/cron-script-compilation-design.md §3.1
+		"Deliver": true, // []string：D4.2 多 deliver 渠道列表 — 创建期写入，运行时只读
+	}
 	jobType := reflect.TypeOf(cron.Job{})
 	for i := 0; i < jobType.NumField(); i++ {
 		field := jobType.Field(i)
 		switch field.Type.Kind() {
 		case reflect.Map, reflect.Slice, reflect.Pointer, reflect.Interface:
+			if readOnlyShared[field.Name] {
+				continue
+			}
 			t.Fatalf("Job contains reference-type field %q, shallow copy may become unsafe", field.Name)
 		}
 	}
