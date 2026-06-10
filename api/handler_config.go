@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -407,7 +408,8 @@ func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Reques
 		Data   []json.RawMessage `json:"data"`
 		Models []json.RawMessage `json:"models"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, resp.Body, 1<<20)).Decode(&body); err != nil {
+	// OpenRouter 等聚合商返回全量目录（数百模型 + 元数据），1MB 不够用
+	if err := json.NewDecoder(http.MaxBytesReader(w, resp.Body, 8<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}})
 		return
 	}
@@ -417,33 +419,86 @@ func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Reques
 		rawModels = body.Models
 	}
 
-	type modelInfo struct {
-		ID   string `json:"id"`
-		Name string `json:"name,omitempty"`
-	}
-	models := make([]modelInfo, 0, len(rawModels))
+	models := make([]providerModelInfo, 0, len(rawModels))
 	for _, raw := range rawModels {
-		var m struct {
-			ID      string `json:"id"`
-			Name    string `json:"name"`
-			ModelID string `json:"model_id"`
+		if m, ok := parseProviderModel(raw); ok {
+			models = append(models, m)
 		}
-		if err := json.Unmarshal(raw, &m); err != nil {
-			continue
-		}
-		id := m.ID
-		if id == "" {
-			id = m.ModelID
-		}
-		if id == "" {
-			continue
-		}
-		name := m.Name
-		if name == "" {
-			name = id
-		}
-		models = append(models, modelInfo{ID: id, Name: name})
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"models": models})
+}
+
+// providerModelInfo 标准化的模型条目。
+//
+// 除 id/name 外的字段为可选元数据，来自 OpenRouter 等聚合商的扩展格式
+// （pricing / architecture.input_modalities / supported_parameters / context_length）。
+// 标准 OpenAI /models 只有裸 id，这些字段会缺省——前端按"有则展示、无则启发式兜底"处理。
+type providerModelInfo struct {
+	ID              string   `json:"id"`
+	Name            string   `json:"name,omitempty"`
+	ContextLength   int64    `json:"context_length,omitempty"`
+	PromptPrice     string   `json:"prompt_price,omitempty"`
+	CompletionPrice string   `json:"completion_price,omitempty"`
+	InputModalities []string `json:"input_modalities,omitempty"`
+	SupportsTools   bool     `json:"supports_tools,omitempty"`
+}
+
+// parseProviderModel 容错解析单个模型条目。
+//
+// 不同 Provider 的字段类型不统一（pricing 可能是 string 或 number），
+// 用 map[string]any 逐字段提取，单字段类型不符只丢该字段、不丢整个模型。
+func parseProviderModel(raw json.RawMessage) (providerModelInfo, bool) {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return providerModelInfo{}, false
+	}
+	id, _ := m["id"].(string)
+	if id == "" {
+		id, _ = m["model_id"].(string)
+	}
+	if id == "" {
+		return providerModelInfo{}, false
+	}
+	info := providerModelInfo{ID: id, Name: id}
+	if name, _ := m["name"].(string); name != "" {
+		info.Name = name
+	}
+	if ctx, ok := m["context_length"].(float64); ok && ctx > 0 {
+		info.ContextLength = int64(ctx)
+	}
+	if pricing, ok := m["pricing"].(map[string]any); ok {
+		info.PromptPrice = anyPriceToString(pricing["prompt"])
+		info.CompletionPrice = anyPriceToString(pricing["completion"])
+	}
+	if arch, ok := m["architecture"].(map[string]any); ok {
+		if mods, ok := arch["input_modalities"].([]any); ok {
+			for _, v := range mods {
+				if s, ok := v.(string); ok {
+					info.InputModalities = append(info.InputModalities, s)
+				}
+			}
+		}
+	}
+	if params, ok := m["supported_parameters"].([]any); ok {
+		for _, v := range params {
+			if s, ok := v.(string); ok && s == "tools" {
+				info.SupportsTools = true
+				break
+			}
+		}
+	}
+	return info, true
+}
+
+// anyPriceToString 把 string / number 形式的价格统一为字符串；无法识别返回空。
+func anyPriceToString(v any) string {
+	switch p := v.(type) {
+	case string:
+		return p
+	case float64:
+		return strconv.FormatFloat(p, 'f', -1, 64)
+	default:
+		return ""
+	}
 }
