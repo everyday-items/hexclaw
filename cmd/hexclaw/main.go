@@ -195,6 +195,17 @@ func newSkillCmd() *cobra.Command {
 // runServe 启动服务主流程
 //
 // 初始化顺序：配置 → 存储 → LLM 路由 → Skill → 引擎 → HTTP 服务
+// applyDesktopOverrides 桌面客户端模式的配置覆盖：仅监听 localhost、
+// 启用 WebSocket、跳过认证，并打开 UI 提供入口的本地功能（Cron / Canvas / Webhook）。
+func applyDesktopOverrides(cfg *config.Config) {
+	cfg.Server.Host = "127.0.0.1"
+	cfg.Platforms.Web.Enabled = true
+	cfg.Security.Auth.AllowAnonymous = true
+	cfg.Cron.Enabled = true
+	cfg.Canvas.Enabled = true
+	cfg.Webhook.Enabled = true
+}
+
 func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, desktopMode bool) error {
 	// 1. 加载配置
 	cfg, err := config.Load(configFile)
@@ -215,13 +226,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		defer sidecarLock.Release()
 	}
 
-	// 桌面客户端模式：仅监听 localhost，自动启用 WebSocket，跳过认证
 	if desktopMode {
-		cfg.Server.Host = "127.0.0.1"
-		cfg.Platforms.Web.Enabled = true
-		cfg.Security.Auth.AllowAnonymous = true
-		cfg.Cron.Enabled = true
-		cfg.Canvas.Enabled = true
+		applyDesktopOverrides(cfg)
 	}
 
 	// 命令行参数覆盖配置文件（向 slice 首元素写入，无则创建）
