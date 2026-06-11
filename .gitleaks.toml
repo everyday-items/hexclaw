@@ -1,0 +1,9 @@
+# Gitleaks allowlist: known false positives (test fixtures with fake keys).
+# Verified 2026-06-11 — none of these are real credentials.
+[allowlist]
+paths = [
+    '''api/review5_test\.go''',
+    '''voice/openai_test\.go''',
+    '''internal/adapter/slack/slack_test\.go''',
+    '''internal/adapter/wecom/wecom_test\.go''',
+]

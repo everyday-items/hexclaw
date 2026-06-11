@@ -38,16 +38,34 @@ func (s *SummarySkill) ToolDefinition() llm.ToolDefinition {
 	})
 }
 
-// Match 匹配摘要关键词
+// kbIngestMarkers are intent markers for knowledge-base ingestion. A message
+// that both starts with a summary keyword and carries one of these markers
+// (e.g. "总结这篇文章并加入知识库") must go through the LLM tool-calling path
+// so the ingestion actually happens; the local fast path would silently drop
+// the ingest half of the request.
+var kbIngestMarkers = []string{"知识库", "入库", "保存", "收藏", "加入知识", "knowledge base", "save to"}
+
+// Match matches summary keywords for the fast path, but yields to the LLM
+// tool-calling path when the message also expresses a KB-ingest intent.
 func (s *SummarySkill) Match(content string) bool {
 	lower := strings.ToLower(strings.TrimSpace(content))
 	keywords := []string{"摘要", "总结", "概括", "summary", "summarize", "tldr", "tl;dr"}
+	matched := false
 	for _, kw := range keywords {
 		if strings.HasPrefix(lower, kw) {
-			return true
+			matched = true
+			break
 		}
 	}
-	return false
+	if !matched {
+		return false
+	}
+	for _, marker := range kbIngestMarkers {
+		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	return true
 }
 
 // Execute 执行摘要

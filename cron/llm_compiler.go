@@ -6,13 +6,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/hexagon-codes/ai-core/gateway/llmcall"
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
-	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // ProviderResolver 在每次 Compile 时被调用，返当前用户配置的默认 provider + model。
@@ -131,7 +131,7 @@ func (c *LLMCompiler) CompileWithProgress(
 		Temperature: &temp,
 	}
 	startedAt := time.Now()
-	logger.Info("[cron] 开始编译", "provider_model", model, "prompt_len", len(prompt))
+	slog.Info("[cron] 开始编译", "source", "cron", "provider_model", model, "prompt_len", len(prompt))
 	// 经 ai-core gateway/llmcall：自动 retry on transient（5xx/timeout/rate limit），
 	// 上限 3 次 + 指数退避；transient 透明重试不打扰前端 progress，仅在最终失败时回包给用户。
 	resp, err := llmcall.Call(ctx, llmcall.Request{
@@ -139,15 +139,59 @@ func (c *LLMCompiler) CompileWithProgress(
 		Req:      req,
 	})
 	if err != nil {
-		logger.Warn("[cron] 编译调用失败", "model", model, "err", err.Error())
+		slog.Warn("[cron] 编译调用失败", "source", "cron", "model", model, "err", err.Error())
 		return nil, fmt.Errorf("LLM 编译失败: %w", err)
 	}
-	logger.Info("[cron] LLM 返回", "model", model, "duration_ms", time.Since(startedAt).Milliseconds(), "tokens_in", resp.Usage.PromptTokens, "tokens_out", resp.Usage.CompletionTokens)
+	slog.Info("[cron] LLM 返回", "source", "cron", "model", model, "duration_ms", time.Since(startedAt).Milliseconds(), "tokens_in", resp.Usage.PromptTokens, "tokens_out", resp.Usage.CompletionTokens)
+
+	// Token accounting sums every LLM call of this compile (initial + repair),
+	// so CompileMeta reflects the true cost (review L3).
+	tokensIn := resp.Usage.PromptTokens
+	tokensOut := resp.Usage.CompletionTokens
 
 	raw := strings.TrimSpace(resp.Content)
 	spec, parseErr := parseCompiledSpec(raw)
 	if parseErr != nil {
-		return nil, fmt.Errorf("解析编译输出失败: %w —— LLM 原文:\n%s", parseErr, raw)
+		// Self-correction, exactly one round: smaller models (e.g. glm-4-flash)
+		// systematically answer scraping prompts with a fenced Python script
+		// instead of the JSON spec. Feed the malformed output back with a
+		// reformat instruction — the model already has the script, so the
+		// repair round is cheap and usually succeeds (BUG-20260611 finding #5).
+		slog.Warn("[cron] compile output parse failed, self-correction retry", "source", "cron", "model", model, "err", parseErr.Error(), "raw_head", clipForHeal(raw, 300))
+		emit(StageCallingLLM, "输出格式异常，自动修正重试中…")
+		repairMessages := append(llm.NewMessages(sys, prompt),
+			llm.Message{Role: llm.RoleAssistant, Content: raw},
+			llm.Message{Role: llm.RoleUser, Content: "Your previous reply was not in the required format. " +
+				"Do not output markdown fences, code blocks, or any explanatory text. " +
+				"Re-emit the same task as one pure JSON object (fields: runtime / script / deps / timeout_s), " +
+				"with the complete Python script in the script field."},
+		)
+		repairResp, repairErr := llmcall.Call(ctx, llmcall.Request{
+			Provider: provider,
+			Req: llm.CompletionRequest{
+				Model:       model,
+				Messages:    repairMessages,
+				MaxTokens:   c.maxTokens,
+				Temperature: &temp,
+			},
+		})
+		if repairErr == nil {
+			tokensIn += repairResp.Usage.PromptTokens
+			tokensOut += repairResp.Usage.CompletionTokens
+			repairRaw := strings.TrimSpace(repairResp.Content)
+			if repairSpec, repairParseErr := parseCompiledSpec(repairRaw); repairParseErr == nil {
+				slog.Info("[cron] self-correction retry succeeded", "source", "cron", "model", model)
+				spec, parseErr, raw = repairSpec, nil, repairRaw
+			} else {
+				slog.Warn("[cron] self-correction retry still unparsable", "source", "cron", "model", model, "err", repairParseErr.Error(), "raw_head", clipForHeal(repairRaw, 300))
+				parseErr, raw = repairParseErr, repairRaw
+			}
+		} else {
+			slog.Warn("[cron] self-correction retry call failed", "source", "cron", "model", model, "err", repairErr.Error())
+		}
+		if parseErr != nil {
+			return nil, fmt.Errorf("解析编译输出失败（含一次自纠重试）: %w —— LLM 原文:\n%s", parseErr, raw)
+		}
 	}
 
 	if spec.TimeoutSec <= 0 {
@@ -160,14 +204,15 @@ func (c *LLMCompiler) CompileWithProgress(
 
 	emit(StageValidating, "校验脚本安全性（AST + 输出契约）…")
 	if err := validateSpec(spec); err != nil {
+		slog.Warn("[cron] 脚本校验失败", "source", "cron", "model", model, "err", err.Error(), "script_head", clipForHeal(spec.Script, 300))
 		return nil, fmt.Errorf("脚本校验失败: %w —— LLM 原文:\n%s", err, raw)
 	}
 
 	spec.Compiled = CompileMeta{
 		Model:     model,
 		At:        time.Now(),
-		TokensIn:  resp.Usage.PromptTokens,
-		TokensOut: resp.Usage.CompletionTokens,
+		TokensIn:  tokensIn,
+		TokensOut: tokensOut,
 		Hash:      hashSpec(spec),
 	}
 	return spec, nil

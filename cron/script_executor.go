@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -169,13 +170,35 @@ func parseLastJSONLine(stdout string, result *RunResult) {
 		return
 	}
 	if parsed.Status != "" {
-		result.Status = parsed.Status
+		result.Status = normalizeScriptStatus(parsed.Status)
 	}
 	if parsed.Data != nil {
 		result.Data = parsed.Data
 	}
 	if parsed.Error != "" && result.Error == "" {
 		result.Error = parsed.Error
+	}
+}
+
+// normalizeScriptStatus maps script-emitted status strings onto the canonical
+// set the scheduler understands ('success'/'error'/'failed'/'timeout').
+// Scripts occasionally emit "ok"/"succeeded"; an unknown value would slip
+// past both the heal trigger's success check and consecutiveFailures'
+// whitelist, so it normalizes to "error" with the raw value logged (review L9).
+func normalizeScriptStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "success", "ok", "succeeded":
+		return "success"
+	case "error":
+		return "error"
+	case "failed":
+		return "failed"
+	case "timeout":
+		return "timeout"
+	default:
+		slog.Warn("[cron] script emitted unknown status, treating as error",
+			"source", "cron", "status", status)
+		return "error"
 	}
 }
 

@@ -2,13 +2,13 @@
 //
 // POST /api/v1/cronjob — 单一入口，7 action 全覆盖
 //
-//   action=create   创建任务（带 idempotency_key 防重复 + 30/user 配额）
-//   action=update   更新任务（remove + create 原子替换）
-//   action=list     列出任务
-//   action=pause    暂停
-//   action=resume   恢复
-//   action=remove   删除
-//   action=run      立即触发执行（fire-and-forget）
+//	action=create   创建任务（带 idempotency_key 防重复 + 30/user 配额）
+//	action=update   更新任务（remove + create 原子替换）
+//	action=list     列出任务
+//	action=pause    暂停
+//	action=resume   恢复
+//	action=remove   删除
+//	action=run      立即触发执行（fire-and-forget）
 //
 // 设计要点：
 //   - idempotency_key：5min in-memory cache，同 (user_id, idempotency_key) 同响应
@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -219,8 +220,13 @@ func (s *Server) cronActionCreate(ctx context.Context, req *CronJobRequest) (*Cr
 	})
 	if err != nil {
 		status, code := classifyCronCreateError(err)
+		// Full-fidelity cause to the log; humanized message to the client
+		// (BUG-20260611 finding #3: never blame user parameters for model flakes).
+		slog.Warn("[cron-create] unified failed", "source", "cron", "user", req.UserID, "name", d.Name,
+			"stage", stageOfCreateError(err), "code", code, "err", err.Error())
 		return nil, status, &cronErr{code: code, msg: humanizeError(err)}
 	}
+	slog.Info("[cron-create] unified done", "source", "cron", "user", req.UserID, "job_id", job.ID, "runtime", job.Spec.Runtime)
 
 	return &CronJobResponse{
 		Action: "create",
@@ -235,10 +241,26 @@ func (s *Server) cronActionUpdate(ctx context.Context, req *CronJobRequest) (*Cr
 		return nil, http.StatusBadRequest, &cronErr{code: CodeBadRequest, msg: "job_id 必填"}
 	}
 	// 更新 = 原子替换：先删后建（共享 idempotency_key 保证幂等）
+	//
+	// Capture the original before removal: if the create side fails (compile
+	// error, agent frequency guard, quota, ...), the original job must be
+	// restored — otherwise update silently deletes the user's job (review M4).
+	var origCopy *cron.Job
+	if orig, ok := s.scheduler.GetJob(ctx, req.JobID); ok {
+		c := *orig
+		origCopy = &c
+	}
 	if err := s.scheduler.RemoveJob(ctx, req.JobID); err != nil {
 		return nil, http.StatusInternalServerError, &cronErr{code: CodeInternalError, msg: "更新前清理失败"}
 	}
-	return s.cronActionCreate(ctx, req)
+	resp, status, err := s.cronActionCreate(ctx, req)
+	if err != nil && origCopy != nil {
+		if rerr := s.scheduler.AddJob(ctx, origCopy); rerr != nil {
+			slog.Error("[cron-update] failed to restore original job after create failure",
+				"source", "cron", "job_id", req.JobID, "err", rerr.Error())
+		}
+	}
+	return resp, status, err
 }
 
 func (s *Server) cronActionList(ctx context.Context, req *CronJobRequest) (*CronJobResponse, int, error) {

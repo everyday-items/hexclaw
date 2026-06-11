@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
@@ -135,6 +136,10 @@ func (a *DingtalkAdapter) connectAndListen() error {
 	if err != nil {
 		return fmt.Errorf("WebSocket 连接失败: %w", err)
 	}
+	// Cap inbound frames to 4 MiB: DingTalk Stream delivers IM events (text
+	// plus metadata), so anything larger is malformed or hostile. Mirrors the
+	// read-limit precedent in adapter/web (20 MiB there for file uploads).
+	conn.SetReadLimit(4 << 20)
 
 	a.connMu.Lock()
 	a.conn = conn
@@ -292,8 +297,16 @@ func (a *DingtalkAdapter) pingLoop(conn *websocket.Conn, interval time.Duration,
 
 // handleWebhook 处理钉钉回调（向后兼容 HTTP Webhook）
 func (a *DingtalkAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	// BUG-20260611: cap webhook body to 1 MiB — external callers must not
+	// be able to OOM the sidecar with an unbounded payload.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		// Distinguish an oversized payload (413) from a generic read error (400).
+		if errors.As(err, new(*http.MaxBytesError)) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "读取请求体失败", http.StatusBadRequest)
 		return
 	}

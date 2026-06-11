@@ -46,7 +46,7 @@ type Document struct {
 	UpdatedAt    time.Time `json:"updated_at,omitempty"`
 	Status       string    `json:"status,omitempty"`        // processing / indexed / failed
 	ErrorMessage string    `json:"error_message,omitempty"` // 失败原因
-	SourceType   string    `json:"source_type,omitempty"`   // manual / upload / url / file
+	SourceType   string    `json:"source_type,omitempty"`   // manual / upload / url / file / agent
 }
 
 // Chunk 文档片段
@@ -299,7 +299,7 @@ func (m *Manager) Search(ctx context.Context, query string, topK int) ([]SearchH
 func (m *Manager) Query(ctx context.Context, query string, topK int) (string, error) {
 	if featureflag.Enabled(ctx, FlagRAGPipelineV1) {
 		p := &Pipeline{
-			Retriever: NewManagerRetriever(m),
+			Retriever:      NewManagerRetriever(m),
 			ContextBuilder: SimpleContextBuilder{},
 		}
 		res, err := p.RunRAG(ctx, query, topK)
@@ -559,6 +559,10 @@ func sourceTypeFromSource(source string) string {
 		return "upload"
 	case strings.HasPrefix(source, "http://"), strings.HasPrefix(source, "https://"):
 		return "url"
+	case source == "agent", strings.HasPrefix(source, "cron:"):
+		// Documents ingested by the agent (knowledge_ingest tool / cron jobs)
+		// are not files — without this branch they fell into "file".
+		return "agent"
 	default:
 		return "file"
 	}

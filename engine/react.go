@@ -66,8 +66,8 @@ type ReActEngine struct {
 	factory     *agents.Factory      // Agent 角色工厂
 	// v0.4.0 G1: 可选 hexagon.Agent 真分派（flag agent.factory.real 控制）
 	hexagonDispatcher *agents.HexagonDispatcher
-	started     bool
-	startAt     time.Time
+	started           bool
+	startAt           time.Time
 	// 由技能市场安装/卸载同步维护：仅这些名称允许 Unregister，避免误删内置 Skill
 	mpTracked map[string]struct{}
 
@@ -419,6 +419,56 @@ func (e *ReActEngine) Health(_ context.Context) error {
 	return nil
 }
 
+// isCronDispatch reports whether msg was dispatched by the cron scheduler
+// (built via NewCronDispatchMessage) rather than typed by a user.
+//
+// It gates the cron-specific spot only: cron intent guidance (the prompt IS
+// the task, not a creation request). All other shortcut guards (skill fast
+// path, semantic cache, agent routing) use the broader isSystemDispatch.
+func isCronDispatch(msg *adapter.Message) bool {
+	return msg != nil && msg.Metadata["source"] == cronDispatchSource
+}
+
+// Metadata "source" values stamped by the other internal dispatchers in
+// cmd/hexclaw (heartbeat ticker, webhook trigger, agent spawn). Together with
+// cronDispatchSource they form the system-dispatch set.
+const (
+	heartbeatDispatchSource = "heartbeat"
+	webhookDispatchSource   = "webhook"
+	spawnDispatchSource     = "spawn"
+)
+
+// isSystemDispatch reports whether msg was dispatched by any internal system
+// (cron scheduler, heartbeat ticker, webhook trigger, agent spawn) rather
+// than typed by a user. System dispatches share the cron bug class: their
+// instruction text is static, so conversational shortcuts must step aside:
+//   - semantic cache (read AND write): a recurring dispatch must re-execute
+//     every tick instead of replaying a ~ms fake cache hit, and its output
+//     must never be served to a user typing identical text
+//   - skill keyword fast path (would hijack "summarize …" instructions)
+//   - chat agent routing (a persona's local model may run with tools off)
+//
+// Cron intent guidance stays gated on isCronDispatch only — it is
+// cron-specific prompt shaping.
+func isSystemDispatch(msg *adapter.Message) bool {
+	if msg == nil {
+		return false
+	}
+	switch msg.Metadata["source"] {
+	case cronDispatchSource, heartbeatDispatchSource, webhookDispatchSource, spawnDispatchSource:
+		return true
+	}
+	return false
+}
+
+// matchSkillFastPath gates the keyword fast path around skills.Match.
+func (e *ReActEngine) matchSkillFastPath(msg *adapter.Message) (skill.Skill, bool) {
+	if isSystemDispatch(msg) {
+		return nil, false
+	}
+	return e.skills.Match(msg)
+}
+
 // Process 同步处理消息
 //
 // 完整处理流程：
@@ -433,6 +483,9 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	if err := validateIncomingMessage(msg); err != nil {
 		return nil, err
 	}
+	// Stamp the authenticated user so tool executions can trust it over
+	// LLM-supplied args (BUG-20260611 M7).
+	ctx = skill.WithAuthenticatedUser(ctx, msg.UserID)
 	if trace.L(ctx) == slog.Default() {
 		ctx = trace.WithLogger(ctx, trace.NewRequest(msg.UserID, msg.SessionID))
 	}
@@ -452,7 +505,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	}
 
 	// 2. 尝试快速路径: Skill 关键词匹配
-	if matched, ok := e.skills.Match(msg); ok {
+	if matched, ok := e.matchSkillFastPath(msg); ok {
 		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
 			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
 		}
@@ -491,26 +544,30 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		return nil, fmt.Errorf("llm 路由失败: %w", err)
 	}
 
-	// 3. 语义缓存查询
-	if cached, ok := e.cache.Get(cacheInput, selection.providerName, selection.modelName); ok {
-		trace.L(ctx).Info("语义缓存命中", "query", msg.Content[:min(20, len(msg.Content))], "session", sess.ID)
-		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
-			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
+	// 3. Semantic cache lookup. System dispatches (cron/heartbeat/webhook/
+	// spawn) must re-execute every time; the guard runs BEFORE cache.Get so
+	// bypassed lookups never mutate hit counters.
+	if !isSystemDispatch(msg) {
+		if cached, ok := e.cache.Get(cacheInput, selection.providerName, selection.modelName); ok {
+			trace.L(ctx).Info("语义缓存命中", "query", msg.Content[:min(20, len(msg.Content))], "session", sess.ID)
+			if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
+				trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
+			}
+			assistantMessageID := ""
+			if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, cached, "", messageRequestID(msg)); err != nil {
+				trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
+			} else {
+				assistantMessageID = record.ID
+			}
+			return &adapter.Reply{
+				Content: cached,
+				Metadata: withAssistantMessageID(map[string]string{
+					"source":   "cache",
+					"provider": selection.providerName,
+					"model":    selection.modelName,
+				}, assistantMessageID),
+			}, nil
 		}
-		assistantMessageID := ""
-		if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, cached, "", messageRequestID(msg)); err != nil {
-			trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
-		} else {
-			assistantMessageID = record.ID
-		}
-		return &adapter.Reply{
-			Content: cached,
-			Metadata: withAssistantMessageID(map[string]string{
-				"source":   "cache",
-				"provider": selection.providerName,
-				"model":    selection.modelName,
-			}, assistantMessageID),
-		}, nil
 	}
 
 	// 4. 主路径: 构建对话上下文（在 SaveUserMessage 之前，避免 history 重复包含当前消息）
@@ -761,7 +818,8 @@ func (e *ReActEngine) finalizeReply(
 		content = cleaned
 		reasoning = extracted
 	}
-	cacheable := true
+	// M5: system-dispatch results must never enter the semantic cache.
+	cacheable := !isSystemDispatch(msg)
 	if msg.Metadata["finish_reason"] == "thinking_timeout" || msg.Metadata["recovered_from_reasoning_only"] == "true" {
 		cacheable = false
 	}
@@ -777,6 +835,16 @@ func (e *ReActEngine) finalizeReply(
 			content = reasoningOnlyFallbackContent
 			resp.Content = content
 		}
+	}
+
+	// M6: deterministic interception of hallucinated "task created" claims
+	// on the non-stream path (the path the sync API and cron-adjacent chat use).
+	if notice, flagged := guardCronCreationClaim(ctx, msg, content, hasCronTaskAdapterCall(toolCalls), sessionID, modelName, len(toolCalls)); flagged {
+		content += notice
+		resp.Content = content
+		cacheable = false
+		ensureMessageMetadata(msg)
+		msg.Metadata["cron_claim_unverified"] = "true"
 	}
 
 	assistantMessageID := ""
@@ -930,6 +998,9 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	if err := validateIncomingMessage(msg); err != nil {
 		return nil, err
 	}
+	// Stamp the authenticated user so tool executions can trust it over
+	// LLM-supplied args (BUG-20260611 M7).
+	ctx = skill.WithAuthenticatedUser(ctx, msg.UserID)
 	if trace.L(ctx) == slog.Default() {
 		ctx = trace.WithLogger(ctx, trace.NewRequest(msg.UserID, msg.SessionID))
 	}
@@ -960,7 +1031,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	}()
 
 	// 2. 尝试快速路径: Skill 匹配 → 单 chunk 返回
-	if matched, ok := e.skills.Match(msg); ok {
+	if matched, ok := e.matchSkillFastPath(msg); ok {
 		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
 			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
 		}
@@ -1002,20 +1073,44 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		}
 		goroutineLaunched = true
 		ch := make(chan *adapter.ReplyChunk, 2)
+		// M9b: register with bgWg so engine Stop waits for the detached DB
+		// write instead of racing it (same pattern as the compactor below).
+		e.bgWg.Add(1)
 		go func() {
+			defer e.bgWg.Done()
 			defer close(ch)
 			if sessionUnlock != nil {
+				// M9c: the session lane is held for the whole generation (up
+				// to 5 min). Releasing it before the history save below would
+				// let a concurrent message in the same session interleave its
+				// saves and reorder the conversation, so the long hold is the
+				// accepted tradeoff.
 				defer sessionUnlock()
 			}
-			results, imgErr := generateImage(ctx, selection.provider, selection.modelName, msg.Content)
+			// Media generation is fire-and-forget background work: a client
+			// disconnect must not abort the expensive generation or the DB
+			// save (BUG-20260611, same shape as the other trace.Detach paths
+			// in this file).
+			bgCtx, bgCancel := context.WithTimeout(trace.Detach(ctx), 5*time.Minute)
+			defer bgCancel()
+			results, imgErr := generateImage(bgCtx, selection.provider, selection.modelName, msg.Content)
 			if imgErr != nil {
+				// M9a: if the client is gone the error chunk below is dropped,
+				// so log AND persist the failure into session history.
+				trace.L(bgCtx).Warn("image generation failed",
+					"err", imgErr, "model", selection.modelName, "session", sess.ID)
+				if _, sErr := e.sessions.SaveAssistantMessageWithMetaAndRequestID(bgCtx, sess.ID,
+					fmt.Sprintf("图片生成失败：%v", imgErr), "", messageRequestID(msg)); sErr != nil {
+					trace.L(bgCtx).Error("failed to persist image-generation failure reply",
+						"err", sErr, "session", sess.ID)
+				}
 				ch <- &adapter.ReplyChunk{Error: fmt.Errorf("图片生成失败: %w", imgErr), Done: true}
 				return
 			}
 			content := formatImageMarkdown(results)
 			assistantMessageID := ""
-			if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, content, "", messageRequestID(msg)); err != nil {
-				trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
+			if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(bgCtx, sess.ID, content, "", messageRequestID(msg)); err != nil {
+				trace.L(bgCtx).Error("保存助手回复失败", "err", err, "session", sess.ID)
 			} else {
 				assistantMessageID = record.ID
 			}
@@ -1040,20 +1135,40 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		}
 		goroutineLaunched = true
 		ch := make(chan *adapter.ReplyChunk, 2)
+		// M9b: register with bgWg so engine Stop waits for the detached DB
+		// write instead of racing it.
+		e.bgWg.Add(1)
 		go func() {
+			defer e.bgWg.Done()
 			defer close(ch)
 			if sessionUnlock != nil {
+				// M9c: lane held for the whole generation (up to 10 min) —
+				// the history save below requires it to keep same-session
+				// saves ordered; accepted tradeoff (see image path above).
 				defer sessionUnlock()
 			}
-			videoURL, coverDataURI, vidErr := generateVideo(ctx, selection.provider, selection.modelName, msg.Content)
+			// Same as image generation: the background ctx is detached from
+			// client disconnects (BUG-20260611).
+			bgCtx, bgCancel := context.WithTimeout(trace.Detach(ctx), 10*time.Minute)
+			defer bgCancel()
+			videoURL, coverDataURI, vidErr := generateVideo(bgCtx, selection.provider, selection.modelName, msg.Content)
 			if vidErr != nil {
+				// M9a: log AND persist the failure so it stays visible in
+				// session history even when the client already disconnected.
+				trace.L(bgCtx).Warn("video generation failed",
+					"err", vidErr, "model", selection.modelName, "session", sess.ID)
+				if _, sErr := e.sessions.SaveAssistantMessageWithMetaAndRequestID(bgCtx, sess.ID,
+					fmt.Sprintf("视频生成失败：%v", vidErr), "", messageRequestID(msg)); sErr != nil {
+					trace.L(bgCtx).Error("failed to persist video-generation failure reply",
+						"err", sErr, "session", sess.ID)
+				}
 				ch <- &adapter.ReplyChunk{Error: fmt.Errorf("视频生成失败: %w", vidErr), Done: true}
 				return
 			}
 			content := formatVideoMarkdown(videoURL, coverDataURI)
 			assistantMessageID := ""
-			if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, content, "", messageRequestID(msg)); err != nil {
-				trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
+			if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(bgCtx, sess.ID, content, "", messageRequestID(msg)); err != nil {
+				trace.L(bgCtx).Error("保存助手回复失败", "err", err, "session", sess.ID)
 			} else {
 				assistantMessageID = record.ID
 			}
@@ -1068,23 +1183,27 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		return ch, nil
 	}
 
-	// 3. 语义缓存命中 → 单 chunk 返回
-	if cached, ok := e.cache.Get(cacheInput, selection.providerName, selection.modelName); ok {
-		trace.L(ctx).Info("语义缓存命中", "query", msg.Content[:min(20, len(msg.Content))], "session", sess.ID)
-		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
-			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
+	// 3. Semantic cache hit → single-chunk reply. System dispatches must
+	// re-execute every time; the guard runs BEFORE cache.Get so bypassed
+	// lookups never mutate hit counters.
+	if !isSystemDispatch(msg) {
+		if cached, ok := e.cache.Get(cacheInput, selection.providerName, selection.modelName); ok {
+			trace.L(ctx).Info("语义缓存命中", "query", msg.Content[:min(20, len(msg.Content))], "session", sess.ID)
+			if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
+				trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
+			}
+			assistantMessageID := ""
+			if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, cached, "", messageRequestID(msg)); err != nil {
+				trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
+			} else {
+				assistantMessageID = record.ID
+			}
+			return singleChunk(cached, withAssistantMessageID(map[string]string{
+				"source":   "cache",
+				"provider": selection.providerName,
+				"model":    selection.modelName,
+			}, assistantMessageID)), nil
 		}
-		assistantMessageID := ""
-		if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, cached, "", messageRequestID(msg)); err != nil {
-			trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
-		} else {
-			assistantMessageID = record.ID
-		}
-		return singleChunk(cached, withAssistantMessageID(map[string]string{
-			"source":   "cache",
-			"provider": selection.providerName,
-			"model":    selection.modelName,
-		}, assistantMessageID)), nil
 	}
 
 	// 4. 构建对话上下文（在保存用户消息之前，避免 history 中重复包含当前消息）
@@ -1283,9 +1402,13 @@ func (e *ReActEngine) processStreamRuntime(
 				modelName = model
 			}
 		}
-		finalContent, metadata, usage, toolCalls := e.finalizeRuntimeStreamResult(ctx, sessionID, msg, provider, req, result, providerName, modelName, cacheInput)
+		finalContent, streamTail, metadata, usage, toolCalls := e.finalizeRuntimeStreamResult(ctx, sessionID, msg, provider, req, result, providerName, modelName, cacheInput)
 		if finalContent != "" && !sink.sentContent {
 			ch <- &adapter.ReplyChunk{Content: finalContent}
+		} else if streamTail != "" {
+			// The body was already streamed; deliver the appended guard
+			// notice as an extra chunk so the client sees it too.
+			ch <- &adapter.ReplyChunk{Content: streamTail}
 		}
 		ch <- &adapter.ReplyChunk{
 			Done:      true,
@@ -1347,11 +1470,16 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 	providerName string,
 	modelName string,
 	cacheInput string,
-) (string, map[string]string, *adapter.Usage, []adapter.ToolCall) {
+) (string, string, map[string]string, *adapter.Usage, []adapter.ToolCall) {
 	msgMeta := cloneStringMap(msg.Metadata)
 	content := result.Content
 	reasoning := result.Reasoning
-	cacheable := true
+	// M5: system-dispatch results must never enter the semantic cache.
+	cacheable := !isSystemDispatch(msg)
+	// streamTail carries content appended AFTER the body was already
+	// streamed to the client (e.g. the cron claim-guard notice), so the
+	// caller can still deliver it as an extra chunk.
+	streamTail := ""
 	if cleaned, extracted := extractThinkTags(content); extracted != "" && strings.TrimSpace(reasoning) == "" {
 		reasoning = extracted
 		content = cleaned
@@ -1367,6 +1495,15 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 		} else {
 			content = reasoningOnlyFallbackContent
 		}
+	}
+	// M6: deterministic interception of hallucinated "task created" claims —
+	// reply claims a scheduled task was created but no cron_task call this
+	// round → mark metadata + append the visible correction + log.
+	if notice, flagged := guardCronCreationClaim(ctx, msg, content, hasCronTaskCall(result.ToolCalls), sessionID, modelName, len(result.ToolCalls)); flagged {
+		msgMeta["cron_claim_unverified"] = "true"
+		cacheable = false
+		content += notice
+		streamTail = notice
 	}
 	if strings.TrimSpace(content) == "" && strings.TrimSpace(reasoning) == "" {
 		content = fmt.Sprintf("模型未返回有效内容，请检查当前模型（%s）是否正常。", modelName)
@@ -1434,7 +1571,7 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 		}()
 	}
 
-	return content, buildReplyMetadata(msgMeta, providerName, modelName, assistantMessageID), usage, runtimeToolCallsToAdapter(result.ToolCalls)
+	return content, streamTail, buildReplyMetadata(msgMeta, providerName, modelName, assistantMessageID), usage, runtimeToolCallsToAdapter(result.ToolCalls)
 }
 
 // processStreamToolLoop 多轮工具循环（后续版本启用）
@@ -1544,19 +1681,28 @@ func (e *ReActEngine) processStreamToolLoop(
 		// second provider.Stream() call that doubles LLM cost.
 		hasToolCalls := len(result.ToolCalls) > 0
 		if !hasToolCalls {
+			finalContent := result.Content
+			cacheable := !isSystemDispatch(msg)
+			// M6: hallucinated "task created" claim guard (shared helper).
+			if notice, flagged := guardCronCreationClaim(ctx, msg, finalContent, hasCronTaskAdapterCall(allToolCalls), sess.ID, selection.modelName, len(allToolCalls)); flagged {
+				finalContent += notice
+				cacheable = false
+			}
 			// Save assistant reply and build metadata (reuse finalizeReply logic inline)
 			assistantMessageID := ""
 			// H7: Detach 保留 trace/session/user_id Values，脱离请求 cancel，避免客户端断开导致保存失败
 			saveCtx, saveCancel := context.WithTimeout(trace.Detach(ctx), 10*time.Second)
-			if record, sErr := e.sessions.SaveAssistantMessageWithMetaAndRequestID(saveCtx, sess.ID, result.Content, "", messageRequestID(msg)); sErr != nil {
+			if record, sErr := e.sessions.SaveAssistantMessageWithMetaAndRequestID(saveCtx, sess.ID, finalContent, "", messageRequestID(msg)); sErr != nil {
 				trace.L(ctx).Error("保存助手回复失败", "err", sErr, "session", sess.ID)
 			} else {
 				assistantMessageID = record.ID
 			}
-			e.cache.Put(cacheInput, result.Content, selection.providerName, selection.modelName)
+			if cacheable {
+				e.cache.Put(cacheInput, finalContent, selection.providerName, selection.modelName)
+			}
 			saveCancel()
 			return singleChunkWithTools(
-				result.Content,
+				finalContent,
 				buildReplyMetadata(msg.Metadata, selection.providerName, selection.modelName, assistantMessageID),
 				allToolCalls,
 			), nil
@@ -1679,7 +1825,8 @@ func (e *ReActEngine) pipeStream(
 
 	content := fullContent.String()
 	generatedContent := false
-	cacheable := true
+	// M5: system-dispatch results must never enter the semantic cache.
+	cacheable := !isSystemDispatch(msg)
 
 	// 兜底解析：某些模型（如智谱 glm-z1）在 content 中嵌入 <think>/<thinking> 标签
 	if cleaned, extracted := extractThinkTags(content); extracted != "" && fullReasoning.Len() == 0 {
@@ -1727,6 +1874,20 @@ func (e *ReActEngine) pipeStream(
 		case <-ctx.Done():
 			ch <- &adapter.ReplyChunk{Error: ctx.Err(), Done: true}
 			return
+		}
+	}
+
+	// M6: hallucinated "task created" claim guard on the no-tools stream
+	// path (the weak-local-model scenario where hallucination is most
+	// likely). The body is already streamed, so deliver the notice as an
+	// extra chunk before the done marker.
+	if notice, flagged := guardCronCreationClaim(ctx, msg, content, false, sessionID, modelName, 0); flagged {
+		content += notice
+		msgMeta["cron_claim_unverified"] = "true"
+		cacheable = false
+		select {
+		case ch <- &adapter.ReplyChunk{Content: notice}:
+		case <-ctx.Done():
 		}
 	}
 
@@ -1882,7 +2043,8 @@ func (e *ReActEngine) pipeStreamWithTools(
 	result := llmStream.Result()
 	content := fullContent.String()
 	generatedContent := false
-	cacheable := true
+	// M5: system-dispatch results must never enter the semantic cache.
+	cacheable := !isSystemDispatch(msg)
 
 	// 兜底解析：某些模型（如智谱 glm-z1）在 content 中嵌入 <think>/<thinking> 标签
 	if cleaned, extracted := extractThinkTags(content); extracted != "" && fullReasoning.Len() == 0 {
@@ -1930,6 +2092,18 @@ func (e *ReActEngine) pipeStreamWithTools(
 		case <-ctx.Done():
 			ch <- &adapter.ReplyChunk{Error: ctx.Err(), Done: true}
 			return
+		}
+	}
+
+	// M6: hallucinated "task created" claim guard (shared helper); the body
+	// is already streamed, so push the notice as an extra chunk.
+	if notice, flagged := guardCronCreationClaim(ctx, msg, content, hasCronTaskAdapterCall(toolCalls), sessionID, modelName, len(toolCalls)); flagged {
+		content += notice
+		msgMeta["cron_claim_unverified"] = "true"
+		cacheable = false
+		select {
+		case ch <- &adapter.ReplyChunk{Content: notice}:
+		case <-ctx.Done():
 		}
 	}
 
@@ -2073,18 +2247,39 @@ func (e *ReActEngine) buildStreamMessages(ctx context.Context, roleName string, 
 	return messages
 }
 
+// lastAssistantContent 取最近一条助手消息文本，供 cron 意图的会话粘性判定使用。
+func lastAssistantContent(history []hexagon.Message) string {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == "assistant" {
+			return history[i].Content
+		}
+	}
+	return ""
+}
+
 func (e *ReActEngine) buildCompletionRequest(ctx context.Context, msg *adapter.Message, history []hexagon.Message, kbContext string) hexagon.CompletionRequest {
 	req := hexagon.CompletionRequest{
 		Messages: e.buildStreamMessages(ctx, msg.Metadata["role"], history, kbContext, msg.Content, msg.Metadata, msg.Attachments),
 	}
 	applyCompletionOverrides(&req, msg.Metadata)
-	// D2.2 Layer 3：cron-like 但前端没拦住的兜底
-	//   - msg.Metadata["cron_context"] == "true" → 前端显式标记（来自 useChatSend Layer 3 路径）
-	//   - 后端关键词扫描兜底（Layer 1/2 都没拦时的最后防线）
+	// D2.2 Layer 3: backstop for cron-like input the frontend did not catch.
+	//   - msg.Metadata["cron_context"] == "true" → explicit frontend marker
+	//     (from the useChatSend Layer 3 path)
+	//   - backend keyword scan as the last line of defense (when Layer 1/2
+	//     both missed)
+	// Cron-dispatched agent job executions get no intent guidance — a prompt
+	// containing "每天/总结" IS the task content; applying guidance would make
+	// the agent "create a task" instead of executing it. This stays cron-only
+	// on purpose: other system dispatches never carry cron creation intent.
+	if isCronDispatch(msg) {
+		return req
+	}
 	if msg.Metadata["cron_context"] == "true" {
 		applyCronIntentGuidance(&req)
-	} else if hit, _ := detectCronIntent(msg.Content); hit {
+		markCronGuidanceActive(msg)
+	} else if detectCronIntentSticky(msg.Content, lastAssistantContent(history)) {
 		applyCronIntentGuidance(&req)
+		markCronGuidanceActive(msg)
 	}
 	return req
 }
@@ -2135,7 +2330,10 @@ func (e *ReActEngine) completeDirect(
 		assistantMessageID = record.ID
 	}
 
-	e.cache.Put(cacheInput, resp.Content, providerName, modelName)
+	// M5: system-dispatch results must never enter the semantic cache.
+	if !isSystemDispatch(msg) {
+		e.cache.Put(cacheInput, resp.Content, providerName, modelName)
+	}
 
 	if resp.Usage.TotalTokens > 0 {
 		costRecord := &storage.CostRecord{
@@ -2390,7 +2588,8 @@ func (e *ReActEngine) resolveProvider(ctx context.Context, providerHint string, 
 
 	// 如果未显式指定 Provider，尝试通过 Agent 路由获取
 	// 优先规则路由；规则未命中时尝试 LLM 语义分类（如已配置）
-	if (hint == "" || hint == "auto") && e.agentRouter != nil && msg != nil {
+	// Chat agent routing never applies to system dispatches — see isSystemDispatch.
+	if (hint == "" || hint == "auto") && e.agentRouter != nil && msg != nil && !isSystemDispatch(msg) {
 		req := agentrouter.RouteRequest{
 			Platform:   string(msg.Platform),
 			InstanceID: msg.InstanceID,

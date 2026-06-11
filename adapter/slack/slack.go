@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
@@ -197,8 +198,16 @@ func (a *SlackAdapter) SendStream(ctx context.Context, chatID string, chunks <-c
 // handleEvents 处理 Slack Events API 回调
 func (a *SlackAdapter) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// 读取请求体
+	// BUG-20260611: cap webhook body to 1 MiB — external callers must not
+	// be able to OOM the sidecar with an unbounded payload.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		// Distinguish an oversized payload (413) from a generic read error (400).
+		if errors.As(err, new(*http.MaxBytesError)) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "读取请求失败", http.StatusBadRequest)
 		return
 	}

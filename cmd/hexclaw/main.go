@@ -32,8 +32,8 @@ import (
 
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/adapter"
-	"github.com/hexagon-codes/hexclaw/agents"
 	webadapter "github.com/hexagon-codes/hexclaw/adapter/web"
+	"github.com/hexagon-codes/hexclaw/agents"
 	"github.com/hexagon-codes/hexclaw/api"
 	"github.com/hexagon-codes/hexclaw/audit"
 	"github.com/hexagon-codes/hexclaw/canvas"
@@ -42,6 +42,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/desktop"
 	"github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/hexclaw/events"
+	"github.com/hexagon-codes/hexclaw/featureflag"
 	"github.com/hexagon-codes/hexclaw/gateway"
 	"github.com/hexagon-codes/hexclaw/genstore"
 	"github.com/hexagon-codes/hexclaw/heartbeat"
@@ -54,7 +55,6 @@ import (
 	"github.com/hexagon-codes/hexclaw/render"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/session"
-	"github.com/hexagon-codes/hexclaw/featureflag"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/skill/builtin"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
@@ -590,6 +590,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				knowledge.WithHybridConfig(hybridCfg),
 			)
 			eng.SetKnowledgeBase(kbMgr)
+			// Register the knowledge_ingest skill: the only channel for the Agent
+			// to persist content into the knowledge base. Without it the
+			// "collect → ingest" loop is broken (the LLM can only hallucinate success).
+			if err := skills.Register(builtin.NewKnowledgeIngestSkill(kbMgr)); err != nil {
+				logger.Warn("[knowledge] failed to register knowledge_ingest skill", "err", err.Error())
+			}
 			kbOK = true
 		}
 	}
@@ -730,8 +736,27 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				scheduler = nil
 				fmt.Printf("  ✗ Cron        Init 失败 (%v)\n", err)
 			} else {
-				scheduler.Start(ctx)
 				cronOK = true
+				// Register the cron_task skill so the Agent can create/manage
+				// built-in scheduled jobs from a conversation instead of
+				// degrading to "write a script file + manual crontab".
+				localAPIBase := fmt.Sprintf("http://127.0.0.1:%d", cfg.Server.Port)
+				if err := skills.Register(builtin.NewCronTaskSkill(scheduler, localAPIBase)); err != nil {
+					logger.Warn("[cron] cron_task skill registration failed", "err", err.Error())
+				}
+				// Agent-mode executor: cognitive jobs run one full Agent round
+				// per tick. Wired BEFORE scheduler.Start (the start itself is
+				// deferred until the desktop notifier is set, review L7).
+				scheduler.SetAgentRunner(func(runCtx context.Context, job *cron.Job) (string, error) {
+					// NewCronDispatchMessage stamps source=cron, which the engine
+					// relies on to skip the skill fast path and intent guidance.
+					reply, err := eng.Process(runCtx, engine.NewCronDispatchMessage(
+						job.UserID, job.ChatID, job.ID, job.SourcePrompt))
+					if err != nil {
+						return "", err
+					}
+					return reply.Content, nil
+				})
 			}
 		}
 	}
@@ -928,7 +953,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			Platform: adapter.PlatformAPI,
 			UserID:   "system",
 			Content:  task,
-			Metadata: map[string]string{"role": agentName},
+			// "source":"spawn" lets the engine-side system-dispatch guard
+			// recognize sub-task dispatches (sources: cron-dispatch /
+			// heartbeat / webhook / spawn).
+			Metadata: map[string]string{"role": agentName, "source": "spawn"},
 		}
 		reply, err := eng.Process(ctx, msg)
 		if err != nil {
@@ -1132,6 +1160,25 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 15. 初始化桌面集成服务（Phase 6）
 	desktopSvc := desktop.NewService(version)
 	srv.SetDesktop(desktopSvc)
+	if scheduler != nil {
+		// Push heal results and agent job deliveries to the desktop
+		// notification center, mapping the scheduler's level onto the desktop
+		// notification type (success heals are not warnings, review L6).
+		scheduler.SetNotifier(func(_ *cron.Job, level, title, body string) {
+			nt := desktop.NotifyWarning
+			switch level {
+			case cron.NotifyLevelInfo:
+				nt = desktop.NotifyInfo
+			case cron.NotifyLevelSuccess:
+				nt = desktop.NotifySuccess
+			}
+			desktopSvc.Notify(title, body, nt)
+		})
+		// Start only after the agent runner AND the notifier are wired
+		// (review L7): jobs due right at boot would otherwise run before
+		// delivery / heal notifications were possible.
+		scheduler.Start(ctx)
+	}
 
 	// 16. 文档渲染服务（POST /api/v1/render）
 	//
@@ -1441,10 +1488,10 @@ func extractLLMName(providerName string) string {
 // 本地 Ollama 在 9B-级模型上 p50 ~ 30-60s + 拖慢用户机器，不适合做 cron 编译。
 //
 // 优先级：
-//   1. 远端 provider（含 api_key，且名字含 openrouter / anthropic / openai /
-//      claude / gpt / deepseek / 智谱 等关键词）
-//   2. 任意非 Ollama 的 provider（可能用户私有 gateway 命名规律不可知）
-//   3. Ollama 兜底（仅作为最后的选项，避免完全跑不了）
+//  1. 远端 provider（含 api_key，且名字含 openrouter / anthropic / openai /
+//     claude / gpt / deepseek / 智谱 等关键词）
+//  2. 任意非 Ollama 的 provider（可能用户私有 gateway 命名规律不可知）
+//  3. Ollama 兜底（仅作为最后的选项，避免完全跑不了）
 //
 // 显式忽略 router.Default()，因为它可能被配置漂移指向不存在的 key
 // 或 fallback 到 Ollama，掩盖更快的远端 provider。
@@ -1462,11 +1509,11 @@ type cronRouterView interface {
 //
 // 选型优先级（用户决策 2026-05-29：cron 编译优先走「可用的远程快模型」，
 // 对话仍用用户选中的默认 —— 显式的子系统分流，不是偷偷兜底）：
-//   1. 默认 provider 本身就是「远程 + chat」→ 直接用默认（尊重用户显式选择）。
-//   2. 默认是本地（如 Ollama，9B 编译 cron 实测 >300s）→ 挑一个「远程 + chat」
-//      provider 跑编译（装机环境自动命中智谱 glm-5.1）。
-//   3. 没有任何远程可用 → 退回默认（本地），保留非 chat 模型守卫；模型太慢时
-//      由 llmcall/SSE 链路返回 humanize 后的友好错误（不会静默卡死）。
+//  1. 默认 provider 本身就是「远程 + chat」→ 直接用默认（尊重用户显式选择）。
+//  2. 默认是本地（如 Ollama，9B 编译 cron 实测 >300s）→ 挑一个「远程 + chat」
+//     provider 跑编译（装机环境自动命中智谱 glm-5.1）。
+//  3. 没有任何远程可用 → 退回默认（本地），保留非 chat 模型守卫；模型太慢时
+//     由 llmcall/SSE 链路返回 humanize 后的友好错误（不会静默卡死）。
 //
 // 全程不静默换成「错误类别」的模型：非 chat（图像/嵌入/语音）一律跳过并最终友好报错。
 func buildCronProviderResolver(r *llmrouter.Selector) cron.ProviderResolver {

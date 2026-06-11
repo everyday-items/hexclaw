@@ -2,8 +2,11 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/hexagon-codes/hexagon/runtime"
 	"github.com/hexagon-codes/hexclaw/cron"
@@ -96,14 +99,15 @@ func (s *Server) handleAddCronJobJSON(w http.ResponseWriter, r *http.Request) {
 // handleAddCronJobSSE 流式模式：每完成一个编译阶段就 flush 一帧。
 //
 // 事件格式（标准 W3C SSE）：
-//   event: progress
-//   data: {"stage":"calling_llm","message":"调用 LLM…"}
 //
-//   event: done
-//   data: {"job":{...},"spec_preview":{...}}
+//	event: progress
+//	data: {"stage":"calling_llm","message":"调用 LLM…"}
 //
-//   event: error
-//   data: {"error":"..."}
+//	event: done
+//	data: {"job":{...},"spec_preview":{...}}
+//
+//	event: error
+//	data: {"error":"..."}
 //
 // 客户端断流（fetch abort / EventSource.close）= 取消，r.Context() 会随之 Done。
 func (s *Server) handleAddCronJobSSE(w http.ResponseWriter, r *http.Request) {
@@ -131,6 +135,8 @@ func (s *Server) handleAddCronJobSSE(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	slog.Info("[cron-create] sse start", "source", "cron", "user", req.UserID, "name", req.Name, "schedule", req.Schedule, "prompt_len", len(req.Prompt))
+	startedAt := time.Now()
 	job, err := s.scheduler.AddJobFromPromptWithProgress(ctx, cron.AddJobRequest{
 		Name:         req.Name,
 		Schedule:     req.Schedule,
@@ -141,10 +147,19 @@ func (s *Server) handleAddCronJobSSE(w http.ResponseWriter, r *http.Request) {
 		LocalAPIBase: s.localAPIBase(),
 	}, onProgress)
 	if err != nil {
-		// D2.3 错误友好化 — SSE error event 永不漏底层 openai/anthropic 原文给前端
-		_ = sink.EmitRaw(ctx, "error", map[string]string{"error": "添加任务失败: " + humanizeError(err)})
+		// Full-fidelity cause goes to the log; the SSE event carries the
+		// humanized message plus the failed pipeline stage so the client can
+		// render "failed at <stage>" (BUG-20260611 finding #3).
+		slog.Warn("[cron-create] sse failed", "source", "cron", "user", req.UserID, "name", req.Name,
+			"stage", stageOfCreateError(err), "duration_ms", time.Since(startedAt).Milliseconds(), "err", err.Error())
+		_ = sink.EmitRaw(ctx, "error", map[string]string{
+			"error": "添加任务失败: " + humanizeError(err),
+			"stage": stageOfCreateError(err),
+		})
 		return
 	}
+	slog.Info("[cron-create] sse done", "source", "cron", "user", req.UserID, "job_id", job.ID,
+		"runtime", job.Spec.Runtime, "duration_ms", time.Since(startedAt).Milliseconds())
 	_ = sink.EmitRaw(ctx, "done", map[string]any{
 		"job":          job,
 		"spec_preview": job.Spec,
@@ -178,10 +193,35 @@ func (s *Server) parseAddCronJobRequest(w http.ResponseWriter, r *http.Request) 
 	return &req, true
 }
 
+// stageOfCreateError infers which compile-pipeline stage a create error came
+// from, so clients can render "failed at <stage>" (matching the SSE progress
+// stages) instead of guessing from flattened text. Matching is by the stable
+// Chinese error prefixes each pipeline node wraps with.
+func stageOfCreateError(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, cron.AgentIntervalGuardPrefix):
+		// Agent-mode frequency guard fires before compilation; surface it as a
+		// validation-stage rejection (review M2).
+		return "validating"
+	case strings.Contains(msg, "脚本校验失败"), strings.Contains(msg, "脚本含禁用调用"):
+		return "validating"
+	case strings.Contains(msg, "解析编译输出失败"), strings.Contains(msg, "LLM 编译失败"), strings.Contains(msg, "编译失败"):
+		return "calling_llm"
+	case strings.Contains(msg, "无效的调度表达式"), strings.Contains(msg, "保存任务失败"):
+		return "persisting"
+	default:
+		return ""
+	}
+}
+
 // classifyCronCreateError 把 AddJobFromPrompt 的错误映射到 (HTTP 状态码, APIError code)。
 func classifyCronCreateError(err error) (int, string) {
 	msg := err.Error()
 	switch {
+	case strings.Contains(msg, cron.AgentIntervalGuardPrefix):
+		// User-correctable schedule problem, not a server fault (review M2).
+		return http.StatusBadRequest, CodeCronInvalidSched
 	case strings.Contains(msg, "编译失败"):
 		return http.StatusBadRequest, CodeCronCompileFailed
 	case strings.Contains(msg, "校验失败"):
@@ -196,10 +236,14 @@ func classifyCronCreateError(err error) (int, string) {
 // localAPIBase 返回 hexclaw 自身 HTTP API 的 base URL，传给 compiler 让 LLM
 // 在生成的脚本里能引用 /api/v1/knowledge/* 等本地端点。
 //
-// 当前简化：固定 http://127.0.0.1:16060（hexclaw 默认 port）。
-// 若 port 从配置可读取，可在 Server 注入。
+// Reads the configured server port so compiled scripts target the actual
+// listener instead of a hardcoded default (review L10).
 func (s *Server) localAPIBase() string {
-	return "http://127.0.0.1:16060"
+	port := 16060
+	if s.cfg != nil && s.cfg.Server.Port > 0 {
+		port = s.cfg.Server.Port
+	}
+	return fmt.Sprintf("http://127.0.0.1:%d", port)
 }
 
 // handleDeleteCronJob 删除定时任务

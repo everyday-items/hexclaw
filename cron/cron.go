@@ -28,6 +28,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,16 +78,16 @@ type Job struct {
 	Spec         *JobSpec `json:"spec,omitempty"`
 	SourcePrompt string   `json:"source_prompt"`
 	// D4.2 多 deliver 桥接 — 通过 meta JSON 列持久化
-	Deliver      []string `json:"deliver,omitempty"`
+	Deliver []string `json:"deliver,omitempty"`
 }
 
 // JobSpec 编译后的可执行规约。一次编译，多次执行，全程零 LLM 调用。
 type JobSpec struct {
-	Runtime    string         `json:"runtime"`     // v1 固定 "python3"
-	Script     string         `json:"script"`      // 完整 Python 源码
-	Deps       []string       `json:"deps"`        // pip requirements，空则不创建 venv
-	Inputs     map[string]any `json:"inputs"`      // 注入到沙箱 env 的 JSON（HEXCLAW_INPUTS）
-	TimeoutSec int            `json:"timeout_s"`   // 单次执行硬超时，0 → 默认 300s
+	Runtime    string         `json:"runtime"`   // v1 固定 "python3"
+	Script     string         `json:"script"`    // 完整 Python 源码
+	Deps       []string       `json:"deps"`      // pip requirements，空则不创建 venv
+	Inputs     map[string]any `json:"inputs"`    // 注入到沙箱 env 的 JSON（HEXCLAW_INPUTS）
+	TimeoutSec int            `json:"timeout_s"` // 单次执行硬超时，0 → 默认 300s
 	Compiled   CompileMeta    `json:"compiled"`
 }
 
@@ -102,12 +103,12 @@ type CompileMeta struct {
 // AddJobRequest 业务路径添加任务的入参（POST /cron/jobs body）。
 // AddJobFromPrompt 会用 Compiler 编译 Prompt → Spec 后入库。
 type AddJobRequest struct {
-	Name            string   `json:"name"`
-	Schedule        string   `json:"schedule"`
-	Prompt          string   `json:"prompt"`
-	UserID          string   `json:"user_id"`
-	Platform        string   `json:"platform,omitempty"`
-	ChatID          string   `json:"chat_id,omitempty"`
+	Name     string `json:"name"`
+	Schedule string `json:"schedule"`
+	Prompt   string `json:"prompt"`
+	UserID   string `json:"user_id"`
+	Platform string `json:"platform,omitempty"`
+	ChatID   string `json:"chat_id,omitempty"`
 	// D4.2 多 deliver 桥接：chat / push / feishu / discord / wechat 任意组合
 	// 留空 → 默认 ["chat"]（仅在 chat 流回写）
 	Deliver         []string `json:"deliver,omitempty"`
@@ -124,6 +125,7 @@ type Scheduler struct {
 	db         *sql.DB
 	compiler   JobSpecCompiler
 	scriptExec *ScriptExecutor
+	agent      agentSupport
 	jobs       map[string]*Job // id -> job
 	stopCh     chan struct{}
 	stopped    bool
@@ -439,8 +441,9 @@ func (s *Scheduler) AddJobFromPrompt(ctx context.Context, req AddJobRequest) (*J
 // AddJobFromPromptWithProgress 同 AddJobFromPrompt 但每个阶段通过 onProgress 推送事件。
 //
 // 阶段顺序：
-//   analyzing  → Compiler.CompileWithProgress（内部 emit calling_llm / validating）
-//   persisting → INSERT cron_jobs + 加入内存 map
+//
+//	analyzing  → Compiler.CompileWithProgress（内部 emit calling_llm / validating）
+//	persisting → INSERT cron_jobs + 加入内存 map
 //
 // onProgress 为 nil 时静默执行。callback 同步触发 — handler 层应 flush HTTP response。
 func (s *Scheduler) AddJobFromPromptWithProgress(
@@ -462,6 +465,31 @@ func (s *Scheduler) AddJobFromPromptWithProgress(
 	}
 
 	emit(StageAnalyzing, "解析需求并选择 LLM provider…")
+
+	// Dual-mode classification: cognitive tasks are marked for agent execution
+	// (no script compilation); mechanical I/O tasks go through script compile.
+	if ClassifyTaskMode(req.Prompt) == RuntimeAgent {
+		if err := validateAgentModeSchedule(req.Schedule); err != nil {
+			return nil, err
+		}
+		emit(StagePersisting, "保存任务（AI 推理模式）…")
+		job := &Job{
+			Name:         req.Name,
+			Type:         JobTypeCron,
+			Schedule:     req.Schedule,
+			UserID:       req.UserID,
+			Platform:     req.Platform,
+			ChatID:       req.ChatID,
+			Status:       StatusActive,
+			SourcePrompt: req.Prompt,
+			Spec:         &JobSpec{Runtime: RuntimeAgent, TimeoutSec: 300},
+			Deliver:      req.Deliver,
+		}
+		if err := s.AddJob(ctx, job); err != nil {
+			return nil, err
+		}
+		return job, nil
+	}
 
 	hints := CompileHints{
 		AvailableSkills: req.AvailableSkills,
@@ -511,6 +539,9 @@ func (s *Scheduler) RemoveJob(ctx context.Context, jobID string) error {
 	s.mu.Lock()
 	delete(s.jobs, jobID)
 	s.mu.Unlock()
+	// Drop heal-quota / notification bookkeeping so the maps cannot grow
+	// unboundedly across job churn (review L5).
+	s.pruneAgentState(jobID)
 	return nil
 }
 
@@ -549,15 +580,16 @@ func (s *Scheduler) ListJobs(ctx context.Context, userID string) ([]*Job, error)
 // scanJobRow 把一条 cron_jobs 记录扫描成 *Job，集中处理 Spec JSON 反序列化与 NULL 时间。
 //
 // 期望列顺序：id, name, type, schedule, spec_json, source_prompt, user_id,
-//             platform, chat_id, status, last_run_at, next_run_at, run_count, created_at
+//
+//	platform, chat_id, status, last_run_at, next_run_at, run_count, created_at
 func scanJobRow(row interface {
 	Scan(dest ...any) error
 }) (*Job, error) {
 	job := &Job{}
 	var (
-		specJSON sql.NullString
+		specJSON  sql.NullString
 		srcPrompt sql.NullString
-		lastRun  sql.NullTime
+		lastRun   sql.NullTime
 	)
 	if err := row.Scan(
 		&job.ID, &job.Name, &job.Type, &job.Schedule,
@@ -770,21 +802,21 @@ func (s *Scheduler) executeJob(job *Job) {
 	defer s.running.Delete(job.ID)
 
 	now := time.Now()
-	dbCtx, dbCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer dbCancel()
+	// Note: the persistence ctx must be created AFTER the run finishes — a job
+	// can run for minutes, so a 10s ctx created up front would already be
+	// expired by history-write time, silently dropping the row.
+	earlyCtx := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), 10*time.Second)
+	}
 
 	// 防御：spec 为 nil（理论上 v2 不会发生，AddJob 已强制要求 Spec）
 	if job.Spec == nil {
 		logger.Error("[cron] 跳过执行 — Spec 为 nil", "id", job.ID)
-		_ = s.persistHistory(dbCtx, job.ID, "error", "", "Spec 为 nil — 请重新创建任务", 0, now, "", "", 0, nil)
+		ec, cancel := earlyCtx()
+		defer cancel()
+		_ = s.persistHistory(ec, job.ID, "error", "", "Spec 为 nil — 请重新创建任务", 0, now, "", "", 0, nil)
 		return
 	}
-	if s.scriptExec == nil {
-		logger.Error("[cron] 跳过执行 — scriptExec 未注入", "id", job.ID)
-		_ = s.persistHistory(dbCtx, job.ID, "error", "", "脚本执行器未就绪", 0, now, "", "", 0, nil)
-		return
-	}
-
 	// 执行预算：spec.TimeoutSec + 30s 给 venv / 进程清理留余量
 	budget := time.Duration(job.Spec.TimeoutSec)*time.Second + 30*time.Second
 	if budget < 60*time.Second {
@@ -793,8 +825,22 @@ func (s *Scheduler) executeJob(job *Job) {
 	runCtx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 
-	logger.Info("[cron] 执行脚本任务", "name", job.Name, "id", job.ID)
-	result, runErr := s.scriptExec.Run(runCtx, job.Spec)
+	var result *RunResult
+	var runErr error
+	if job.Spec.Runtime == RuntimeAgent {
+		slog.Info("[cron] running agent job", "source", "cron", "name", job.Name, "id", job.ID)
+		result = s.runAgentJob(runCtx, job)
+	} else {
+		if s.scriptExec == nil {
+			slog.Error("[cron] skipping run — scriptExec not injected", "source", "cron", "id", job.ID)
+			ec, cancel := earlyCtx()
+			defer cancel()
+			_ = s.persistHistory(ec, job.ID, "error", "", "脚本执行器未就绪", 0, now, "", "", 0, nil)
+			return
+		}
+		logger.Info("[cron] 执行脚本任务", "name", job.Name, "id", job.ID)
+		result, runErr = s.scriptExec.Run(runCtx, job.Spec)
+	}
 	if result == nil {
 		// Run 返 nil 一般是 venv 准备 / 工作目录创建失败，必须把 runErr 原文带出来便于排查
 		errMsg := "executor 返回 nil"
@@ -811,7 +857,10 @@ func (s *Scheduler) executeJob(job *Job) {
 		"name", job.Name, "id", job.ID,
 		"status", result.Status, "exit", result.ExitCode, "duration_ms", result.DurationMs)
 
-	// 更新任务状态
+	// Update job state (the persistence ctx is created after the run finishes,
+	// see the note at the top of this function).
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dbCancel()
 	now = time.Now()
 	s.mu.Lock()
 	if j, ok := s.jobs[job.ID]; ok {
@@ -852,6 +901,19 @@ func (s *Scheduler) executeJob(job *Job) {
 		result.Stdout, result.Stderr, result.ExitCode, result.Data,
 	); err != nil {
 		logger.Error("Cron: 写入执行历史失败", "error", err)
+	}
+
+	if result.Status == "success" {
+		// Deliver agent-mode results: script jobs self-deliver via the compiled
+		// script (POST /api/v1/notify), agent jobs rely on the scheduler routing
+		// the final content through the job's deliver targets (review H2).
+		if job.Spec.Runtime == RuntimeAgent {
+			s.deliverAgentResult(job, result)
+		}
+	} else {
+		// Self-heal bridge: consecutive script failures past the threshold →
+		// recompile with the failure context (cooldown-window quota applies).
+		s.maybeSelfHeal(dbCtx, job, result)
 	}
 }
 
@@ -933,6 +995,11 @@ func nextRunTime(schedule string, jobType JobType, from time.Time) (time.Time, e
 		dur, err := time.ParseDuration(durStr)
 		if err != nil {
 			return time.Time{}, fmt.Errorf("无效的间隔: %s", durStr)
+		}
+		// A non-positive interval would leave NextRunAt forever in the past,
+		// firing the job on every tick.
+		if dur <= 0 {
+			return time.Time{}, fmt.Errorf("间隔必须为正: %s", durStr)
 		}
 		return from.Add(dur), nil
 	}

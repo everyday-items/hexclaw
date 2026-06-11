@@ -205,3 +205,30 @@ sys.exit(1)
 		t.Errorf("ExitCode 应非零，实际 0")
 	}
 }
+
+// Review L9: scripts occasionally emit nonstandard status values. "ok"-family
+// values must normalize to "success" (otherwise the heal trigger treats a
+// passing run as a failure), and unknown values must normalize to "error"
+// (otherwise they slip past consecutiveFailures' status whitelist).
+func TestParseLastJSONLine_NormalizesStatus(t *testing.T) {
+	cases := []struct {
+		emitted string
+		want    string
+	}{
+		{"ok", "success"},
+		{"OK", "success"},
+		{"succeeded", "success"},
+		{"success", "success"},
+		{"error", "error"},
+		{"failed", "failed"},
+		{"timeout", "timeout"},
+		{"weird-status", "error"},
+	}
+	for _, c := range cases {
+		res := &RunResult{}
+		parseLastJSONLine(`{"status":"`+c.emitted+`","data":null}`, res)
+		if res.Status != c.want {
+			t.Errorf("status %q should normalize to %q, got %q", c.emitted, c.want, res.Status)
+		}
+	}
+}

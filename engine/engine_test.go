@@ -1093,6 +1093,11 @@ func newEngineWithProviders(
 	cfg.Compaction.Enabled = false // 禁用压缩
 	cfg.LLM.Default = defaultProvider
 	cfg.LLM.Providers = providerCfg
+	// Mock provider names have no entry in the cost/quality priority tables,
+	// so the default "cost-aware" strategy breaks ties via unstable sort over
+	// map iteration order — nondeterministic Route() results. Pin the
+	// strategy so Route() always returns the configured default provider.
+	cfg.LLM.Routing.Strategy = "default"
 	router := llmrouter.NewWithProviders(cfg.LLM, providers)
 
 	eng := NewReActEngine(cfg, router, store, skill.NewRegistry())
