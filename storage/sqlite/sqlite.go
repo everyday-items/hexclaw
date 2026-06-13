@@ -425,9 +425,12 @@ func (s *Store) FindSessionByScope(ctx context.Context, userID, platform, instan
 }
 
 // ListSessions 列出用户的会话（仅 active + archived，排除 deleted）
+//
+// Scheduler-generated sessions (platform=cron) are system artifacts, not
+// user-facing chats, and are excluded from listings (BUG-20260613).
 func (s *Store) ListSessions(ctx context.Context, userID string, limit, offset int) ([]*storage.Session, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+sessionCols+` FROM sessions WHERE user_id = ? AND status >= 0 ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+		`SELECT `+sessionCols+` FROM sessions WHERE user_id = ? AND status >= 0 AND platform != 'cron' ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
 		userID, limit, offset,
 	)
 	if err != nil {

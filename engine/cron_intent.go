@@ -35,12 +35,30 @@ const cronDispatchSource = "cron"
 // buildCompletionRequest (skip cron intent guidance) both rely on. Callers
 // (cmd/hexclaw AgentRunner) must use this instead of hand-building the
 // message, so the contract stays regression-locked by engine tests.
+// cronOutcomeContract instructs the agent to self-report the task outcome so
+// the scheduler can distinguish "goal accomplished" from "replied but failed"
+// (BUG-20260613: replies like "无法访问页面" were recorded as success).
+//
+// The marker is pinned to the literal ASCII token TASK_STATUS regardless of
+// reply language — a Chinese-replying model (glm-4-flash) otherwise localizes
+// it to "任务状态：失败" and the parser misses it. parseAgentOutcome also
+// accepts that localized form as a fallback.
+const cronOutcomeContract = "\n\n---\n[Scheduler contract] On the very last line of your reply, output the literal ASCII marker (do NOT translate the word TASK_STATUS, even if the rest of your reply is in another language): `TASK_STATUS: done` if the task goal was fully accomplished, or `TASK_STATUS: failed - <short reason>` if it was not (e.g. a tool was blocked, a page was unreachable, or data could not be saved). Output nothing after that line."
+
 func NewCronDispatchMessage(userID, chatID, jobID, prompt string) *adapter.Message {
+	if chatID == "" {
+		// Stable per-job chat scope: every run of a job reuses one session
+		// instead of spawning a new one per tick (BUG-20260613: each run
+		// polluted the desktop chat sidebar with a fresh conversation).
+		chatID = "cron:" + jobID
+	}
 	return &adapter.Message{
-		Platform: adapter.PlatformAPI,
+		// Dedicated platform so session listing can exclude scheduler runs
+		// from user-facing chat lists.
+		Platform: adapter.PlatformCron,
 		UserID:   userID,
 		ChatID:   chatID,
-		Content:  prompt,
+		Content:  prompt + cronOutcomeContract,
 		Metadata: map[string]string{"source": cronDispatchSource, "cron_job_id": jobID},
 	}
 }

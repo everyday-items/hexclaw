@@ -29,6 +29,7 @@ const (
 	PlatformSlack    Platform = "slack"    // Slack
 	PlatformDesktop  Platform = "desktop"  // 桌面客户端
 	PlatformAPI      Platform = "api"      // REST API 直接调用
+	PlatformCron     Platform = "cron"     // Scheduler-dispatched agent runs (not user-facing chat)
 	PlatformEmail    Platform = "email"    // 邮件
 	PlatformWhatsApp Platform = "whatsapp" // WhatsApp
 	PlatformLINE     Platform = "line"     // LINE

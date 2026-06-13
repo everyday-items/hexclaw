@@ -94,18 +94,34 @@ func TestBug20260611_CronDispatchMessageContract(t *testing.T) {
 	if msg.Metadata["cron_job_id"] != "job-9" {
 		t.Errorf("cron dispatch must carry cron_job_id, got %q", msg.Metadata["cron_job_id"])
 	}
-	if msg.Platform != adapter.PlatformAPI {
-		t.Errorf("cron dispatch platform should be API, got %q", msg.Platform)
+	if msg.Platform != adapter.PlatformCron {
+		t.Errorf("cron dispatch platform must be cron (excluded from chat listings), got %q", msg.Platform)
 	}
-	if msg.UserID != "u-1" || msg.ChatID != "c-1" || msg.Content != "summarize prompt" {
+	if msg.UserID != "u-1" || msg.ChatID != "c-1" {
 		t.Errorf("field pass-through wrong: %+v", msg)
+	}
+	if !strings.HasPrefix(msg.Content, "summarize prompt") {
+		t.Errorf("prompt must lead the content, got %q", msg.Content)
+	}
+	if !strings.Contains(msg.Content, "TASK_STATUS:") {
+		t.Errorf("content must carry the outcome contract, got %q", msg.Content)
+	}
+
+	// Empty chatID falls back to a stable per-job scope so repeated runs
+	// reuse one session instead of creating one per tick (BUG-20260613).
+	noChat := NewCronDispatchMessage("u-1", "", "job-9", "p")
+	if noChat.ChatID != "cron:job-9" {
+		t.Errorf("empty chatID must fall back to cron:<jobID>, got %q", noChat.ChatID)
 	}
 }
 
 // Before fix: SummarySkill.Match("总结…") prefix-matches → fast path returns
-//             "摘要：…" and the LLM provider is never called.
+//
+//	"摘要：…" and the LLM provider is never called.
+//
 // After fix:  source=cron skips the fast path → LLM main path, provider
-//             called exactly once.
+//
+//	called exactly once.
 func TestBug20260611_CronDispatchSkipsSkillFastPath_Process(t *testing.T) {
 	provider := mockllm.NewLLMProvider("test").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
 		return &hexagon.CompletionResponse{

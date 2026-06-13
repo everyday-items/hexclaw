@@ -121,6 +121,10 @@ type DocumentRepository interface {
 	// List 列出所有文档（不含正文）
 	List(ctx context.Context) ([]*Document, error)
 
+	// GetBySourceTitle 按 (source, title) 索引查询单个文档（不含正文），
+	// 不存在返回 (nil, nil)。用于 upsert 命中判定，避免全表 List 扫描。
+	GetBySourceTitle(ctx context.Context, source, title string) (*Document, error)
+
 	// Replace 替换文档的 Chunk（用于重建索引，原子操作）
 	Replace(ctx context.Context, doc *Document, chunks []*Chunk) error
 
@@ -197,6 +201,32 @@ func (m *Manager) AddDocument(ctx context.Context, title, content, source string
 	}
 
 	now := time.Now()
+
+	// Upsert by (source, title): a scheduled job re-ingesting the same
+	// titled document updates it in place and refreshes UpdatedAt instead of
+	// accumulating duplicates (BUG-20260613). An empty title can't be matched
+	// reliably, so it always inserts.
+	if existing := m.findBySourceTitle(ctx, source, title); existing != nil {
+		doc := &Document{
+			ID:         existing.ID,
+			Title:      title,
+			Content:    content,
+			Source:     source,
+			CreatedAt:  existing.CreatedAt,
+			UpdatedAt:  now,
+			Status:     "indexed",
+			SourceType: sourceTypeFromSource(source),
+		}
+		chunks, err := m.buildChunks(ctx, doc, now)
+		if err != nil {
+			return nil, err
+		}
+		if err := m.repo.Replace(ctx, doc, chunks); err != nil {
+			return nil, fmt.Errorf("更新文档失败: %w", err)
+		}
+		return doc, nil
+	}
+
 	doc := &Document{
 		ID:         "doc-" + idgen.ShortID(),
 		Title:      title,
@@ -214,9 +244,54 @@ func (m *Manager) AddDocument(ctx context.Context, title, content, source string
 	}
 
 	if err := m.repo.Add(ctx, doc, chunks); err != nil {
+		// Lost the read-then-insert race against the production
+		// idx_kb_documents_unique(source,title) index — a concurrent ingest of
+		// the same titled doc inserted first. Retry as an in-place update so
+		// the caller sees an idempotent upsert, not a raw constraint 500
+		// (BUG-20260613 review C1/C2).
+		if isUniqueConstraintErr(err) {
+			if existing := m.findBySourceTitle(ctx, source, title); existing != nil {
+				doc.ID = existing.ID
+				doc.CreatedAt = existing.CreatedAt
+				rechunks, cerr := m.buildChunks(ctx, doc, now)
+				if cerr != nil {
+					return nil, cerr
+				}
+				if rerr := m.repo.Replace(ctx, doc, rechunks); rerr != nil {
+					return nil, fmt.Errorf("更新文档失败: %w", rerr)
+				}
+				return doc, nil
+			}
+		}
 		return nil, fmt.Errorf("保存文档失败: %w", err)
 	}
 	return doc, nil
+}
+
+// isUniqueConstraintErr reports whether err is a SQLite UNIQUE-constraint
+// violation (the upsert's race fallback trigger).
+func isUniqueConstraintErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "UNIQUE constraint failed") || strings.Contains(s, "constraint failed: UNIQUE")
+}
+
+// findBySourceTitle returns an existing document matching both source and a
+// non-empty title, or nil. Backed by the (source, title) index via
+// GetBySourceTitle instead of a full-table List scan (review M3). The returned
+// doc omits content, which is fine — only the ID and timestamps are reused on
+// upsert.
+func (m *Manager) findBySourceTitle(ctx context.Context, source, title string) *Document {
+	if title == "" {
+		return nil
+	}
+	doc, err := m.repo.GetBySourceTitle(ctx, source, title)
+	if err != nil {
+		return nil
+	}
+	return doc
 }
 
 // ReindexDocument 重新切分并重建指定文档的索引

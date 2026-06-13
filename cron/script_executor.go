@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -25,8 +24,42 @@ import (
 type ScriptExecutor struct {
 	pythonBin  string
 	workdir    string
-	venvCache  string
 	stdoutTail int
+}
+
+// defaultScriptTimeoutSec is the fallback per-run budget for a spec whose
+// TimeoutSec is unset (0). It is the SINGLE source of truth shared by the
+// scheduler's outer execution budget (runBudget) and the executor's inner
+// deadline — they must agree, or the outer ctx can SIGKILL a script before its
+// own deadline fires. Review M4: a 0-timeout spec gave the executor a 5-minute
+// inner deadline but the scheduler only a 60-second outer budget, so any
+// default-timeout script was killed at 60s and mislabeled timeout.
+const defaultScriptTimeoutSec = 300
+
+// runCleanupHeadroom is the slack added on top of the effective timeout so the
+// outer budget outlives the inner deadline (venv teardown, process reaping).
+const runCleanupHeadroom = 30 * time.Second
+
+// effectiveTimeoutSec resolves a spec's TimeoutSec to the seconds a run is
+// actually granted: 0/negative → the default. Both the scheduler and the
+// executor route through this so the two layers can never disagree.
+func effectiveTimeoutSec(specTimeoutSec int) int {
+	if specTimeoutSec <= 0 {
+		return defaultScriptTimeoutSec
+	}
+	return specTimeoutSec
+}
+
+// runBudget is the outer execution budget the scheduler grants a run: the
+// effective inner timeout plus cleanup headroom, floored to a usable minimum.
+// Invariant (asserted in tests): runBudget(ts) >= effective inner deadline, so
+// the inner timeout is always the one that fires first.
+func runBudget(specTimeoutSec int) time.Duration {
+	b := time.Duration(effectiveTimeoutSec(specTimeoutSec))*time.Second + runCleanupHeadroom
+	if b < 60*time.Second {
+		b = 60 * time.Second
+	}
+	return b
 }
 
 // RunResult 一次脚本执行的结构化结果。
@@ -40,20 +73,22 @@ type RunResult struct {
 	DurationMs int64  `json:"duration_ms"`
 }
 
-// NewScriptExecutor 创建默认 executor（python3 + ~/.hexclaw/cron-{sandbox,venv-cache}）。
+// NewScriptExecutor 创建默认 executor（python3 + ~/.hexclaw/cron-sandbox）。
 func NewScriptExecutor() *ScriptExecutor {
 	home, _ := os.UserHomeDir()
 	return &ScriptExecutor{
 		pythonBin:  "python3",
 		workdir:    filepath.Join(home, ".hexclaw", "cron-sandbox"),
-		venvCache:  filepath.Join(home, ".hexclaw", "cron-venv-cache"),
 		stdoutTail: 64 * 1024,
 	}
 }
 
-// WithWorkdir / WithVenvCache 仅用于测试覆盖默认路径。
-func (e *ScriptExecutor) WithWorkdir(p string) *ScriptExecutor   { e.workdir = p; return e }
-func (e *ScriptExecutor) WithVenvCache(p string) *ScriptExecutor { e.venvCache = p; return e }
+// WithWorkdir 仅用于测试覆盖默认沙箱目录。
+func (e *ScriptExecutor) WithWorkdir(p string) *ScriptExecutor { e.workdir = p; return e }
+
+// WithVenvCache is a retained no-op: the stdlib-only sandbox never builds a
+// venv (review M5/F1). Kept so existing call sites compile unchanged.
+func (e *ScriptExecutor) WithVenvCache(string) *ScriptExecutor { return e }
 
 // Run 执行一份 JobSpec 并返回结构化结果。
 //
@@ -80,26 +115,22 @@ func (e *ScriptExecutor) Run(ctx context.Context, spec *JobSpec) (*RunResult, er
 		return nil, err
 	}
 
+	// Stdlib-only sandbox: the pip path is a dead end (unreliable on the
+	// sandboxed host, and the AST validator already forbids non-stdlib imports).
+	// New specs carry no deps (forced empty at the compile boundary, review M5),
+	// but a spec PERSISTED before that fix may still carry them — drop them here
+	// rather than enter the venv/pip path that can only fail (review F1).
 	pythonExec := e.pythonBin
 	if len(spec.Deps) > 0 {
-		venvPath := filepath.Join(e.venvCache, spec.Compiled.Hash)
-		if spec.Compiled.Hash == "" {
-			venvPath = filepath.Join(e.venvCache, "no-hash-"+runID)
-		}
-		if err := e.ensureVenv(ctx, venvPath, spec.Deps); err != nil {
-			return nil, fmt.Errorf("venv 准备失败: %w", err)
-		}
-		pythonExec = venvPython(venvPath)
+		slog.Warn("[cron] ignoring deps — stdlib-only sandbox, pip disabled",
+			"source", "cron", "deps", spec.Deps)
 	}
 
-	timeout := time.Duration(spec.TimeoutSec) * time.Second
-	if timeout <= 0 {
-		timeout = 5 * time.Minute
-	}
+	timeout := time.Duration(effectiveTimeoutSec(spec.TimeoutSec)) * time.Second
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	env := os.Environ()
+	env := sandboxEnv()
 	if len(spec.Inputs) > 0 {
 		if b, err := json.Marshal(spec.Inputs); err == nil {
 			env = append(env, "HEXCLAW_INPUTS="+string(b))
@@ -202,39 +233,6 @@ func normalizeScriptStatus(status string) string {
 	}
 }
 
-// ensureVenv 按 path 缓存：已存在则跳过，否则 python3 -m venv + pip install。
-func (e *ScriptExecutor) ensureVenv(ctx context.Context, venvPath string, deps []string) error {
-	if _, err := os.Stat(venvPython(venvPath)); err == nil {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(venvPath), 0755); err != nil {
-		return err
-	}
-	if out, err := exec.CommandContext(ctx, e.pythonBin, "-m", "venv", venvPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("venv create: %s", strings.TrimSpace(string(out)))
-	}
-	pip := venvPip(venvPath)
-	args := append([]string{"install", "--quiet", "--disable-pip-version-check"}, deps...)
-	if out, err := exec.CommandContext(ctx, pip, args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("pip install: %s", strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-// venvPython / venvPip 处理 Windows / POSIX 差异。
-func venvPython(venv string) string {
-	if runtime.GOOS == "windows" {
-		return filepath.Join(venv, "Scripts", "python.exe")
-	}
-	return filepath.Join(venv, "bin", "python3")
-}
-func venvPip(venv string) string {
-	if runtime.GOOS == "windows" {
-		return filepath.Join(venv, "Scripts", "pip.exe")
-	}
-	return filepath.Join(venv, "bin", "pip")
-}
-
 // tailString 把超长字符串截断为后 n 字节，前面加一行 "...[truncated]..."。
 func tailString(s string, n int) string {
 	if n <= 0 || len(s) <= n {
@@ -272,4 +270,25 @@ func (e *ScriptExecutor) cleanupOldRuns() {
 	for _, r := range runs[:len(runs)-10] {
 		_ = os.RemoveAll(r.path)
 	}
+}
+
+// sandboxEnvAllowlist are the only parent env var names propagated to a cron
+// script. Everything else (API keys, tokens, provider secrets) is withheld so
+// an LLM-generated script cannot read or exfiltrate them (BUG-20260613).
+var sandboxEnvAllowlist = map[string]bool{
+	"PATH": true, "HOME": true, "TMPDIR": true, "LANG": true,
+	"LC_ALL": true, "LC_CTYPE": true, "TZ": true, "TERM": true,
+	"SSL_CERT_FILE": true, "SSL_CERT_DIR": true, // let urllib find the CA bundle
+}
+
+// sandboxEnv returns a minimal allowlisted environment for sandboxed scripts.
+func sandboxEnv() []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		name, _, ok := strings.Cut(kv, "=")
+		if ok && (sandboxEnvAllowlist[name] || strings.HasPrefix(name, "LC_")) {
+			env = append(env, kv)
+		}
+	}
+	return env
 }

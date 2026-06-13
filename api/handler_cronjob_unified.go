@@ -216,6 +216,7 @@ func (s *Server) cronActionCreate(ctx context.Context, req *CronJobRequest) (*Cr
 		Prompt:       d.Prompt,
 		UserID:       req.UserID,
 		Deliver:      d.Deliver, // D4.2 多 deliver 桥接
+		TimeoutSec:   d.TimeoutSec,
 		LocalAPIBase: s.localAPIBase(),
 	})
 	if err != nil {

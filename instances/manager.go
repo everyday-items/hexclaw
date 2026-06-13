@@ -322,6 +322,28 @@ func (m *Manager) Stop(ctx context.Context, name string) error {
 	return m.setStatus(ctx, name, StatusStopped, "")
 }
 
+// Send delivers a Reply through a running adapter for proactive (non-inbound)
+// messaging such as scheduled-job results. target resolves by instance name
+// first, then by provider/platform (cron deliver targets are platform names
+// like "feishu"). Returns an error if no running adapter matches.
+func (m *Manager) Send(ctx context.Context, target, chatID string, reply *adapter.Reply) error {
+	m.mu.RLock()
+	adp := m.running[target]
+	if adp == nil {
+		for name, a := range m.running {
+			if md, ok := m.metadata[name]; ok && md.Provider == target {
+				adp = a
+				break
+			}
+		}
+	}
+	m.mu.RUnlock()
+	if adp == nil {
+		return fmt.Errorf("no running adapter for target %q", target)
+	}
+	return adp.Send(ctx, chatID, reply)
+}
+
 func (m *Manager) StopAll(ctx context.Context) error {
 	instances, err := m.List(ctx)
 	if err != nil {

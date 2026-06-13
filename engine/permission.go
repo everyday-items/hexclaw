@@ -201,6 +201,24 @@ func DefaultBaselinePolicy() *PermissionPolicy {
 func (h *PermissionHook) Priority() int { return 10 }
 
 // NewPermissionHook creates a permission hook.
+// systemDispatchAutoApprove is the allowlist of read/collect tools any
+// pre-authorized system dispatch may use without a human approver.
+// Capability-mutating and dangerous tools still require interactive approval.
+var systemDispatchAutoApprove = map[string]bool{
+	"browser":          true,
+	"knowledge_ingest": true,
+	"search":           true,
+	"web_search":       true,
+}
+
+// cronOnlyAutoApprove are tools auto-approved ONLY for the cron source, not for
+// webhook/spawn: cron_task manages scheduled executions, which an externally
+// triggered webhook or an LLM-decided spawn must not do autonomously
+// (BUG-20260613 review H1).
+var cronOnlyAutoApprove = map[string]bool{
+	"cron_task": true,
+}
+
 func NewPermissionHook(hub *PermissionHub, opts ...PermissionHookOption) *PermissionHook {
 	h := &PermissionHook{
 		hub: hub,
@@ -223,6 +241,16 @@ func NewPermissionHook(hub *PermissionHub, opts ...PermissionHookOption) *Permis
 }
 
 func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo) error {
+	// Schedule-management tools must never run autonomously from an
+	// externally-triggered webhook or an LLM-decided spawn (only from cron
+	// itself, or interactively). cron_task is otherwise "safe" and ungated,
+	// so this explicit guard precedes risk classification (review H1).
+	if src := systemDispatchSource(ctx); src != "" && src != "cron" && cronOnlyAutoApprove[call.Name] {
+		logger.Warn("[permission] schedule-management tool denied for non-cron system dispatch",
+			"tool_name", call.Name, "source", src)
+		return fmt.Errorf("tool %q cannot run autonomously from %s", call.Name, src)
+	}
+
 	// v0.4.0 H2: feature-flag-gated PolicyEngine 优先
 	if h.policy != nil && featureflag.Enabled(ctx, FlagToolPolicyEngine) {
 		dec := h.policy.Evaluate(call)
@@ -264,6 +292,25 @@ func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo)
 
 // requestApproval 抽出来给 policy / classifyRisk 两条路径共用。
 func (h *PermissionHook) requestApproval(ctx context.Context, call *ToolCallInfo, risk, reason string) error {
+	// System dispatches (cron/heartbeat/webhook/spawn) run without an
+	// interactive session to approve through. A scheduled task is
+	// pre-authorized at creation, so auto-approve the read/collect sensitive
+	// tools it structurally needs — but never the capability-mutating ones
+	// (create_skill/manage_mcp_server/file_edit) or dangerous ones
+	// (shell/code_exec): those still require a human, which with no session
+	// means deny. This keeps an externally-influenced webhook/spawn from
+	// silently registering an MCP server or editing files (BUG-20260613).
+	if src := systemDispatchSource(ctx); src != "" {
+		if systemDispatchAutoApprove[call.Name] || (src == "cron" && cronOnlyAutoApprove[call.Name]) {
+			logger.Info("[permission] collect tool auto-approved for pre-authorized system dispatch",
+				"tool_name", call.Name, "source", src, "risk", risk)
+			return nil
+		}
+		logger.Warn("[permission] tool denied for system dispatch — needs interactive approval",
+			"tool_name", call.Name, "source", src, "risk", risk)
+		return fmt.Errorf("tool %q cannot auto-run from %s; it requires interactive approval", call.Name, src)
+	}
+
 	sessionID, _ := ctx.Value(ctxKeySessionID).(string)
 	if sessionID == "" {
 		if risk == "dangerous" {

@@ -79,12 +79,15 @@ func TestBug20260611_CompileSelfCorrectsMalformedOutput(t *testing.T) {
 }
 
 func TestBug20260611_CompileSelfCorrectIsBounded(t *testing.T) {
-	seq := &seqProvider{responses: []string{fencedPythonOutput, fencedPythonOutput}}
+	// Unsalvageable garbage (no JSON, no fence, no script field) so the run
+	// exercises the bounded-retry-then-fail path rather than the salvage path.
+	garbage := "I cannot help with that request."
+	seq := &seqProvider{responses: []string{garbage, garbage}}
 	c := NewLLMCompilerStatic(seq, "test-model")
 
 	_, err := c.Compile(context.Background(), "抓取网页标题", CompileHints{})
 	if err == nil {
-		t.Fatal("two malformed outputs must still fail")
+		t.Fatal("two unsalvageable outputs must still fail")
 	}
 	if len(seq.reqs) != 2 {
 		t.Fatalf("self-correction must be bounded to exactly 1 extra call, got %d calls", len(seq.reqs))

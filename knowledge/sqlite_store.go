@@ -71,6 +71,11 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 		)`,
 
 		`CREATE INDEX IF NOT EXISTS idx_kb_chunks_doc ON kb_chunks(doc_id)`,
+		// Backs GetBySourceTitle's upsert-hit lookup (review M3). Non-unique on
+		// purpose: the production UNIQUE(source,title) constraint lives in
+		// storage/migrate (it dedupes first); a plain index here is safe to add
+		// to any existing store without a dedup pass.
+		`CREATE INDEX IF NOT EXISTS idx_kb_documents_source_title ON kb_documents(source, title)`,
 		// v0.4.0 E3：复合 UNIQUE 防同 doc 同位置 chunk 累积（与 storage/migrate v4 一致）
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_chunks_doc_index ON kb_chunks(doc_id, chunk_index)`,
 
@@ -258,6 +263,28 @@ func (s *SQLiteStore) List(ctx context.Context) ([]*Document, error) {
 		docs = append(docs, doc)
 	}
 	return docs, rows.Err()
+}
+
+// GetBySourceTitle 按 (source, title) 查询单个文档（不含正文）。
+// 命中 idx_kb_documents_unique(source, title) 索引，避免 List 全表扫描（review M3）。
+// 不存在返回 (nil, nil)，让调用方区分"未命中"与"查询出错"。
+func (s *SQLiteStore) GetBySourceTitle(ctx context.Context, source, title string) (*Document, error) {
+	if title == "" {
+		return nil, nil
+	}
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, title, source, chunk_count, created_at, updated_at, status, error_message, source_type
+		 FROM kb_documents WHERE source = ? AND title = ? LIMIT 1`,
+		source, title,
+	)
+	doc := &Document{}
+	if err := row.Scan(&doc.ID, &doc.Title, &doc.Source, &doc.ChunkCount, &doc.CreatedAt, &doc.UpdatedAt, &doc.Status, &doc.ErrorMessage, &doc.SourceType); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return doc, nil
 }
 
 // Get 获取单个文档详情

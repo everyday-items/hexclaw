@@ -36,6 +36,71 @@ type ctxKey string
 const ctxKeySessionUnlock ctxKey = "session_unlock"
 const ctxKeySessionID ctxKey = "session_id"
 
+// ctxKeySystemDispatchSource carries the dispatch source (e.g. "cron") for
+// non-interactive engine runs. The permission gate uses it to auto-approve
+// sensitive tools for pre-authorized scheduled tasks (BUG-20260613): a cron
+// job has no interactive session to approve a browser/file_edit call, but the
+// user already authorized it when creating the job.
+const ctxKeySystemDispatchSource ctxKey = "system_dispatch_source"
+
+// withSystemDispatch stamps the dispatch source onto ctx when msg is a system
+// dispatch (cron/heartbeat/webhook/spawn); returns ctx unchanged otherwise.
+func withSystemDispatch(ctx context.Context, source string) context.Context {
+	if source == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeySystemDispatchSource, source)
+}
+
+// systemDispatchSource returns the stamped dispatch source, or "" for
+// interactive runs.
+func systemDispatchSource(ctx context.Context) string {
+	s, _ := ctx.Value(ctxKeySystemDispatchSource).(string)
+	return s
+}
+
+// systemDispatchToolFloor are the collect/persist tools a scheduled agent job
+// structurally needs. Relevance ranking + MaxTools truncation could otherwise
+// drop them when many marketplace skills out-score the builtins, leaving a
+// cron job unable to fetch a page or write the KB (BUG-20260613 H2).
+var systemDispatchToolFloor = []string{"browser", "knowledge_ingest", "cron_task", "search", "web_search"}
+
+// effectiveMaxTools raises the MaxTools cap to at least the floor size for
+// system dispatches, so a tight operator cap (e.g. 3) cannot truncate the
+// floor tools the job structurally needs (BUG-20260613 review H2).
+func effectiveMaxTools(configured int, msg *adapter.Message) int {
+	if configured <= 0 || !isSystemDispatch(msg) {
+		return configured
+	}
+	if configured < len(systemDispatchToolFloor) {
+		return len(systemDispatchToolFloor)
+	}
+	return configured
+}
+
+// ensureSystemDispatchToolFloor moves the floor tools to the front of the list
+// for system dispatches, so the subsequent MaxTools cap cannot drop them.
+// Tools not present in the collected set are skipped (not synthesized).
+func (e *ReActEngine) ensureSystemDispatchToolFloor(tools []llm.ToolDefinition, msg *adapter.Message) []llm.ToolDefinition {
+	if !isSystemDispatch(msg) || len(tools) == 0 {
+		return tools
+	}
+	floor := make(map[string]bool, len(systemDispatchToolFloor))
+	for _, n := range systemDispatchToolFloor {
+		floor[n] = true
+	}
+	front := make([]llm.ToolDefinition, 0, len(tools))
+	rest := make([]llm.ToolDefinition, 0, len(tools))
+	for _, t := range tools {
+		if floor[t.Function.Name] {
+			front = append(front, t)
+		} else {
+			rest = append(rest, t)
+		}
+	}
+	return append(front, rest...)
+}
+
 const reasoningOnlyFallbackContent = "模型只完成了思考，没有输出最终回答，请重试一次。"
 
 var thinkingOnCompletionTimeout = 90 * time.Second
@@ -486,6 +551,9 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	// Stamp the authenticated user so tool executions can trust it over
 	// LLM-supplied args (BUG-20260611 M7).
 	ctx = skill.WithAuthenticatedUser(ctx, msg.UserID)
+	if isSystemDispatch(msg) {
+		ctx = withSystemDispatch(ctx, msg.Metadata["source"])
+	}
 	if trace.L(ctx) == slog.Default() {
 		ctx = trace.WithLogger(ctx, trace.NewRequest(msg.UserID, msg.SessionID))
 	}
@@ -496,6 +564,10 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		return nil, fmt.Errorf("会话管理失败: %w", err)
 	}
 	msg.SessionID = sess.ID
+	// Stamp the resolved session ID so the approval gates (PermissionHub
+	// routing, per-session allow/deny) work — it was previously read in three
+	// places but never written, leaving those features dead (BUG-20260613 H1).
+	ctx = context.WithValue(ctx, ctxKeySessionID, sess.ID)
 
 	// 1.5 Session 锁: 串行化同一会话的并发请求 (对齐 OpenClaw Session Lane)
 	if unlock, err := e.acquireSessionLane(ctx, sess.ID, messageRequestID(msg)); err != nil {
@@ -571,9 +643,17 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	}
 
 	// 4. 主路径: 构建对话上下文（在 SaveUserMessage 之前，避免 history 重复包含当前消息）
-	history, err := e.sessions.BuildContext(ctx, sess.ID)
-	if err != nil {
-		trace.L(ctx).Error("构建上下文失败", "err", err, "session", sess.ID)
+	// System dispatches (cron/heartbeat) are independent task executions, not
+	// conversations — loading prior-run history bloats context and biases the
+	// result ("summarize today" re-summarizing yesterday). Run them stateless
+	// (BUG-20260613 M1).
+	var history []llm.Message
+	if !isSystemDispatch(msg) {
+		var err error
+		history, err = e.sessions.BuildContext(ctx, sess.ID)
+		if err != nil {
+			trace.L(ctx).Error("构建上下文失败", "err", err, "session", sess.ID)
+		}
 	}
 
 	// 5. 保存用户消息（在 BuildContext 之后，确保 history 不含当前消息）
@@ -648,8 +728,9 @@ func (e *ReActEngine) completeWithTools(
 		tools = e.toolCollector.CollectFiltered(msg.Content, skill.Activation{
 			Mode: string(ResolveMode(msg.Metadata["agent_mode"], msg.Content)),
 		})
-		if toolsCfg.MaxTools > 0 && len(tools) > toolsCfg.MaxTools {
-			tools = tools[:toolsCfg.MaxTools]
+		tools = e.ensureSystemDispatchToolFloor(tools, msg)
+		if cap := effectiveMaxTools(toolsCfg.MaxTools, msg); cap > 0 && len(tools) > cap {
+			tools = tools[:cap]
 		}
 	}
 
@@ -741,7 +822,7 @@ func (e *ReActEngine) completeWithTools(
 	}
 	runner := hruntime.NewRunner(hruntime.Config{
 		ProviderSelector: selector,
-		ToolExecutor:     runtimeToolExecutor{executor: e.toolExecutor},
+		ToolExecutor:     newRuntimeToolExecutor(e.toolExecutor),
 		Middleware:       middleware,
 		DefaultMaxTurns:  maxTurns,
 	})
@@ -1001,6 +1082,9 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	// Stamp the authenticated user so tool executions can trust it over
 	// LLM-supplied args (BUG-20260611 M7).
 	ctx = skill.WithAuthenticatedUser(ctx, msg.UserID)
+	if isSystemDispatch(msg) {
+		ctx = withSystemDispatch(ctx, msg.Metadata["source"])
+	}
 	if trace.L(ctx) == slog.Default() {
 		ctx = trace.WithLogger(ctx, trace.NewRequest(msg.UserID, msg.SessionID))
 	}
@@ -1011,6 +1095,10 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		return nil, fmt.Errorf("会话管理失败: %w", err)
 	}
 	msg.SessionID = sess.ID
+	// Stamp the resolved session ID so the approval gates (PermissionHub
+	// routing, per-session allow/deny) work — it was previously read in three
+	// places but never written, leaving those features dead (BUG-20260613 H1).
+	ctx = context.WithValue(ctx, ctxKeySessionID, sess.ID)
 
 	// 1.5 Session 锁
 	// unlock 存入 ctx，由 pipeStream/pipeStreamWithTools goroutine 在结束时释放。
@@ -1207,9 +1295,14 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	}
 
 	// 4. 构建对话上下文（在保存用户消息之前，避免 history 中重复包含当前消息）
-	history, err := e.sessions.BuildContext(ctx, sess.ID)
-	if err != nil {
-		trace.L(ctx).Error("构建上下文失败", "err", err, "session", sess.ID)
+	// System dispatches run stateless — see the Process() path (BUG-20260613 M1).
+	var history []llm.Message
+	if !isSystemDispatch(msg) {
+		var err error
+		history, err = e.sessions.BuildContext(ctx, sess.ID)
+		if err != nil {
+			trace.L(ctx).Error("构建上下文失败", "err", err, "session", sess.ID)
+		}
 	}
 
 	// 5. 保存用户消息（在 BuildContext 之后，确保 history 不含当前消息）
@@ -1303,8 +1396,9 @@ func (e *ReActEngine) processStreamRuntime(
 			tools = e.toolCollector.CollectFiltered(msg.Content, skill.Activation{
 				Mode: string(ResolveMode(msg.Metadata["agent_mode"], msg.Content)),
 			})
-			if streamToolsCfg.MaxTools > 0 && len(tools) > streamToolsCfg.MaxTools {
-				tools = tools[:streamToolsCfg.MaxTools]
+			tools = e.ensureSystemDispatchToolFloor(tools, msg)
+			if cap := effectiveMaxTools(streamToolsCfg.MaxTools, msg); cap > 0 && len(tools) > cap {
+				tools = tools[:cap]
 			}
 		}
 		if len(tools) > 0 {
@@ -1355,7 +1449,7 @@ func (e *ReActEngine) processStreamRuntime(
 		}
 		runner := hruntime.NewRunner(hruntime.Config{
 			ProviderSelector: selector,
-			ToolExecutor:     runtimeToolExecutor{executor: e.toolExecutor},
+			ToolExecutor:     newRuntimeToolExecutor(e.toolExecutor),
 			Middleware:       middleware,
 			DefaultMaxTurns:  maxTurns,
 		})

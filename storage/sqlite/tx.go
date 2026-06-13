@@ -81,7 +81,7 @@ func (s *txStore) FindSessionByScope(ctx context.Context, userID, platform, inst
 
 func (s *txStore) ListSessions(ctx context.Context, userID string, limit, offset int) ([]*storage.Session, error) {
 	rows, err := s.tx.QueryContext(ctx,
-		`SELECT `+sessionCols+` FROM sessions WHERE user_id = ? AND status >= 0 ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+		`SELECT `+sessionCols+` FROM sessions WHERE user_id = ? AND status >= 0 AND platform != 'cron' ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
 		userID, limit, offset,
 	)
 	if err != nil {

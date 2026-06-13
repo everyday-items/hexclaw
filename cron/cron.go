@@ -111,9 +111,30 @@ type AddJobRequest struct {
 	ChatID   string `json:"chat_id,omitempty"`
 	// D4.2 多 deliver 桥接：chat / push / feishu / discord / wechat 任意组合
 	// 留空 → 默认 ["chat"]（仅在 chat 流回写）
-	Deliver         []string `json:"deliver,omitempty"`
+	Deliver []string `json:"deliver,omitempty"`
+	// TimeoutSec optionally overrides the per-run execution budget. 0 → the
+	// mode default (agent: defaultAgentTimeoutSec). Lets a multi-step agent
+	// task (browse + reason + ingest) get more than the old fixed 300s.
+	TimeoutSec      int      `json:"timeout_s,omitempty"`
 	AvailableSkills []string `json:"-"` // 服务端注入
 	LocalAPIBase    string   `json:"-"` // 服务端注入
+}
+
+// defaultAgentTimeoutSec is the per-run budget for agent-mode jobs when the
+// request does not override it. Raised from the original fixed 300s because a
+// browse→reason→ingest round routinely needs more (BUG-20260613).
+const defaultAgentTimeoutSec = 600
+
+// agentTimeoutSec resolves the agent-mode per-run budget: an explicit positive
+// override, else the default. Clamped to a sane ceiling to avoid a runaway job.
+func agentTimeoutSec(override int) int {
+	if override <= 0 {
+		return defaultAgentTimeoutSec
+	}
+	if override > 1800 {
+		return 1800
+	}
+	return override
 }
 
 // Scheduler 定时任务调度器
@@ -207,6 +228,14 @@ func (s *Scheduler) Init(ctx context.Context) error {
 	addColumnExpectDuplicate(ctx, s.db, "cron_job_runs", `ALTER TABLE cron_job_runs ADD COLUMN stderr TEXT NOT NULL DEFAULT ''`)
 	addColumnExpectDuplicate(ctx, s.db, "cron_job_runs", `ALTER TABLE cron_job_runs ADD COLUMN exit_code INTEGER NOT NULL DEFAULT 0`)
 	addColumnExpectDuplicate(ctx, s.db, "cron_job_runs", `ALTER TABLE cron_job_runs ADD COLUMN data_json TEXT NOT NULL DEFAULT ''`)
+
+	// (job_id, id) index backs the retention prune's "newest N ids per job"
+	// subquery — id is insertion-ordered, so this avoids a DATETIME sort
+	// (review H2: history was pruned per-write but lacked the supporting index).
+	if _, err := s.db.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_cron_job_runs_job_id ON cron_job_runs(job_id, id)`); err != nil {
+		return fmt.Errorf("创建 cron_job_runs 索引失败: %w", err)
+	}
 
 	// 清理 v1 遗留任务（只有 prompt 无 spec_json）—— 不自动编译，提示用户重建
 	if err := s.detectAndCleanupLegacyJobs(ctx); err != nil {
@@ -482,7 +511,7 @@ func (s *Scheduler) AddJobFromPromptWithProgress(
 			ChatID:       req.ChatID,
 			Status:       StatusActive,
 			SourcePrompt: req.Prompt,
-			Spec:         &JobSpec{Runtime: RuntimeAgent, TimeoutSec: 300},
+			Spec:         &JobSpec{Runtime: RuntimeAgent, TimeoutSec: agentTimeoutSec(req.TimeoutSec)},
 			Deliver:      req.Deliver,
 		}
 		if err := s.AddJob(ctx, job); err != nil {
@@ -752,11 +781,38 @@ func (s *Scheduler) persistHistory(ctx context.Context, jobID, status, result, e
 		}
 		dataJSON = string(b)
 	}
-	_, err := s.db.ExecContext(ctx,
+	if _, err := s.db.ExecContext(ctx,
 		`INSERT INTO cron_job_runs (job_id, status, result, error, duration_ms, run_at, stdout, stderr, exit_code, data_json)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		jobID, status, result, errMsg, durationMs, runAt, stdout, stderr, exitCode, dataJSON)
-	return err
+		jobID, status, result, errMsg, durationMs, runAt, stdout, stderr, exitCode, dataJSON); err != nil {
+		return err
+	}
+	// Retention: a long-lived job ticks forever, so without a cap cron_job_runs
+	// grows unbounded. Keep only the most recent maxHistoryRowsPerJob rows per
+	// job (review H2). Pruning on every write keeps the table bounded with no
+	// background sweeper; a prune failure is non-fatal — the row is already
+	// persisted and the next write retries the trim.
+	s.pruneHistory(ctx, jobID)
+	return nil
+}
+
+// maxHistoryRowsPerJob caps retained execution-history rows per job. The cron
+// UI shows the latest 50 (see GetJobHistory); 200 keeps comfortable headroom
+// for the self-heal window scan while bounding growth.
+const maxHistoryRowsPerJob = 200
+
+// pruneHistory deletes all but the most recent maxHistoryRowsPerJob runs of a
+// job. id is insertion-ordered (AUTOINCREMENT), so "newest" is "highest id".
+func (s *Scheduler) pruneHistory(ctx context.Context, jobID string) {
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM cron_job_runs
+		 WHERE job_id = ?
+		   AND id NOT IN (
+		       SELECT id FROM cron_job_runs WHERE job_id = ? ORDER BY id DESC LIMIT ?
+		   )`,
+		jobID, jobID, maxHistoryRowsPerJob); err != nil {
+		slog.Warn("[cron] history prune failed (non-fatal)", "source", "cron", "id", jobID, "err", err.Error())
+	}
 }
 
 // --- 内部方法 ---
@@ -817,12 +873,9 @@ func (s *Scheduler) executeJob(job *Job) {
 		_ = s.persistHistory(ec, job.ID, "error", "", "Spec 为 nil — 请重新创建任务", 0, now, "", "", 0, nil)
 		return
 	}
-	// 执行预算：spec.TimeoutSec + 30s 给 venv / 进程清理留余量
-	budget := time.Duration(job.Spec.TimeoutSec)*time.Second + 30*time.Second
-	if budget < 60*time.Second {
-		budget = 60 * time.Second
-	}
-	runCtx, cancel := context.WithTimeout(context.Background(), budget)
+	// Outer execution budget — shared timeout resolution with the executor's
+	// inner deadline so the two layers stay self-consistent (review M4).
+	runCtx, cancel := context.WithTimeout(context.Background(), runBudget(job.Spec.TimeoutSec))
 	defer cancel()
 
 	var result *RunResult
@@ -904,12 +957,14 @@ func (s *Scheduler) executeJob(job *Job) {
 	}
 
 	if result.Status == "success" {
-		// Deliver agent-mode results: script jobs self-deliver via the compiled
-		// script (POST /api/v1/notify), agent jobs rely on the scheduler routing
-		// the final content through the job's deliver targets (review H2).
-		if job.Spec.Runtime == RuntimeAgent {
-			s.deliverAgentResult(job, result)
-		}
+		// Deliver BOTH script and agent results through the job's deliver
+		// targets. Script jobs used to deliver nothing — the "self-deliver via
+		// POST /api/v1/notify" path advertised a phantom endpoint (review C2).
+		s.deliverResult(job, result)
+	} else if job.Spec.Runtime == RuntimeAgent {
+		// Agent jobs have no script to recompile — alert on persistent failure
+		// instead of healing (review H1).
+		s.maybeAlertAgentFailure(dbCtx, job, result)
 	} else {
 		// Self-heal bridge: consecutive script failures past the threshold →
 		// recompile with the failure context (cooldown-window quota applies).

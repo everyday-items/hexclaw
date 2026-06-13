@@ -94,12 +94,12 @@ func TestChaos_AgentRunnerSlowAndError(t *testing.T) {
 		NewScriptExecutor().WithWorkdir(t.TempDir()).WithVenvCache(t.TempDir()))
 	_ = s.Init(ctx)
 
-	s.SetAgentRunner(func(runCtx context.Context, _ *Job) (string, error) {
+	s.SetAgentRunner(func(runCtx context.Context, _ *Job) (AgentResult, error) {
 		select {
 		case <-runCtx.Done():
-			return "", runCtx.Err()
+			return AgentResult{}, runCtx.Err()
 		case <-time.After(50 * time.Millisecond):
-			return "", context.DeadlineExceeded
+			return AgentResult{}, context.DeadlineExceeded
 		}
 	})
 	job, err := s.AddJobFromPrompt(ctx, AddJobRequest{
@@ -138,9 +138,9 @@ func TestExecuteJob_LongRunPersistsHistory(t *testing.T) {
 		NewScriptExecutor().WithWorkdir(t.TempDir()).WithVenvCache(t.TempDir()))
 	_ = s.Init(ctx)
 
-	s.SetAgentRunner(func(context.Context, *Job) (string, error) {
+	s.SetAgentRunner(func(context.Context, *Job) (AgentResult, error) {
 		time.Sleep(11 * time.Second)
-		return "慢任务完成", nil
+		return AgentResult{Content: "慢任务完成"}, nil
 	})
 	job, err := s.AddJobFromPrompt(ctx, AddJobRequest{
 		Name: "慢晨报", Schedule: "@daily", Prompt: "每天总结要点", UserID: "u1",

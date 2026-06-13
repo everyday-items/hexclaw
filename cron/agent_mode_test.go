@@ -95,9 +95,9 @@ func TestExecuteJob_AgentRunnerPath(t *testing.T) {
 	_ = s.Init(ctx)
 
 	var gotPrompt string
-	s.SetAgentRunner(func(_ context.Context, job *Job) (string, error) {
+	s.SetAgentRunner(func(_ context.Context, job *Job) (AgentResult, error) {
 		gotPrompt = job.SourcePrompt
-		return "今日要点：A、B、C", nil
+		return AgentResult{Content: "今日要点：A、B、C"}, nil
 	})
 
 	job, err := s.AddJobFromPrompt(ctx, AddJobRequest{
@@ -290,8 +290,8 @@ func TestExecuteJob_AgentResultDelivered(t *testing.T) {
 	s := NewScheduler(db, &stubCompiler{}, NewScriptExecutor().WithWorkdir(t.TempDir()).WithVenvCache(t.TempDir()))
 	_ = s.Init(ctx)
 
-	s.SetAgentRunner(func(context.Context, *Job) (string, error) {
-		return "今日要点：A、B、C", nil
+	s.SetAgentRunner(func(context.Context, *Job) (AgentResult, error) {
+		return AgentResult{Content: "今日要点：A、B、C"}, nil
 	})
 	var got []string
 	s.SetNotifier(func(_ *Job, level, title, body string) { got = append(got, level+"|"+title+"|"+body) })
@@ -320,8 +320,8 @@ func TestExecuteJob_AgentResultNotDeliveredOnFailure(t *testing.T) {
 	s := NewScheduler(db, &stubCompiler{}, NewScriptExecutor().WithWorkdir(t.TempDir()).WithVenvCache(t.TempDir()))
 	_ = s.Init(ctx)
 
-	s.SetAgentRunner(func(context.Context, *Job) (string, error) {
-		return "", errors.New("LLM unavailable")
+	s.SetAgentRunner(func(context.Context, *Job) (AgentResult, error) {
+		return AgentResult{}, errors.New("LLM unavailable")
 	})
 	var got []string
 	s.SetNotifier(func(_ *Job, _, title, body string) { got = append(got, title+"|"+body) })

@@ -50,6 +50,7 @@ type CronJobDraft struct {
 	NoAgent         bool     `json:"no_agent,omitempty"`
 	Deliver         []string `json:"deliver,omitempty"`
 	EnabledToolsets []string `json:"enabled_toolsets,omitempty"`
+	TimeoutSec      int      `json:"timeout_s,omitempty"` // 0 → mode default (agent 600s)
 }
 
 // handleCronParse Layer 2 LLM JSON 解析端点。

@@ -176,8 +176,11 @@ func TestLLMCompiler_EndToEnd_WithFakeProvider(t *testing.T) {
 	if !strings.Contains(spec.Script, "print(json.dumps") {
 		t.Errorf("Script 缺输出契约: %q", spec.Script)
 	}
-	if len(spec.Deps) != 1 || spec.Deps[0] != "requests" {
-		t.Errorf("Deps: %v", spec.Deps)
+	// BUG-20260613 (M5): deps are forced empty at the compile boundary — the
+	// sandbox is stdlib-only, so a third-party dep like "requests" is
+	// unsatisfiable and would only drive the executor's dead pip path.
+	if len(spec.Deps) != 0 {
+		t.Errorf("Deps must be forced empty (stdlib-only sandbox), got %v", spec.Deps)
 	}
 	if spec.TimeoutSec != 90 {
 		t.Errorf("TimeoutSec: %d", spec.TimeoutSec)

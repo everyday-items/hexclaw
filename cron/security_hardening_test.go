@@ -54,11 +54,15 @@ print(json.dumps({"status":"success"}))`, "ctypes"},
 }
 
 // 合规脚本不应被误伤
+//
+// BUG-20260613: the sandbox moved to a stdlib allowlist, so 3rd-party HTTP
+// libs (requests/httpx) are now intentionally rejected — they need a venv and
+// fail the local TLS handshake. The legit network pattern is stdlib urllib.
 func TestSecurity_LegitimateScriptsPass(t *testing.T) {
 	goods := []string{
-		`import json, requests
-r = requests.get("https://example.com")
-print(json.dumps({"status":"success","data":r.status_code}))`,
+		`import json, urllib.request
+r = urllib.request.urlopen("http://example.com")
+print(json.dumps({"status":"success","data": r.read().decode()}))`,
 		`import json, urllib.request
 print(json.dumps({"status":"success"}))`,
 		`import json

@@ -103,46 +103,10 @@ print(json.dumps({"status":"success"}))
 	}
 }
 
-// ── 3.4 venv install deps + 3.5 venv 缓存命中 ──────
-
-func TestExecutor_InstallsAndUsesDeps(t *testing.T) {
-	hasPython3(t)
-	if testing.Short() {
-		t.Skip("跳过：-short 模式不跑 pip install")
-	}
-	e := newTestExecutor(t)
-	// 用 stdlib-only 包名替代真实安装慢——选择体积很小的 `wheel` 包（pip 自带依赖，安装秒级）
-	spec := &JobSpec{
-		Runtime: "python3",
-		Script: `import json
-import wheel
-print(json.dumps({"status":"success","data":wheel.__version__ != ""}))
-`,
-		Deps:       []string{"wheel"},
-		TimeoutSec: 120,
-		Compiled:   CompileMeta{Hash: "test-deps-cache-key"},
-	}
-	res, err := e.Run(context.Background(), spec)
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if res.Status != "success" {
-		t.Fatalf("Status: %s stderr=%s", res.Status, res.Stderr)
-	}
-	if res.Data != true {
-		t.Errorf("Data: %v", res.Data)
-	}
-
-	// 3.5 第二次同 Hash 应直接命中 venv，不再 pip install
-	start := time.Now()
-	res2, err := e.Run(context.Background(), spec)
-	if err != nil || res2.Status != "success" {
-		t.Fatalf("Run2: err=%v res=%+v", err, res2)
-	}
-	if time.Since(start) > 5*time.Second {
-		t.Errorf("venv 缓存未命中，第二次耗时 %s", time.Since(start))
-	}
-}
+// 3.4/3.5 (venv install deps + 缓存命中) removed: the sandbox is stdlib-only and
+// the venv/pip path was deleted (review M5/F1). The replacement contract — a
+// deps-carrying spec runs via system python with no venv — is locked by
+// TestBug20260613_ExecutorIgnoresLegacyDeps.
 
 // ── 3.6 stdout tail 截断 ───────────────────────────
 

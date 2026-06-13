@@ -747,15 +747,22 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				// Agent-mode executor: cognitive jobs run one full Agent round
 				// per tick. Wired BEFORE scheduler.Start (the start itself is
 				// deferred until the desktop notifier is set, review L7).
-				scheduler.SetAgentRunner(func(runCtx context.Context, job *cron.Job) (string, error) {
+				scheduler.SetAgentRunner(func(runCtx context.Context, job *cron.Job) (cron.AgentResult, error) {
 					// NewCronDispatchMessage stamps source=cron, which the engine
 					// relies on to skip the skill fast path and intent guidance.
 					reply, err := eng.Process(runCtx, engine.NewCronDispatchMessage(
 						job.UserID, job.ChatID, job.ID, job.SourcePrompt))
 					if err != nil {
-						return "", err
+						return cron.AgentResult{}, err
 					}
-					return reply.Content, nil
+					// Pass the invoked tool names through so the scheduler can
+					// verify a self-reported success against what the agent
+					// actually did (e.g. an ingest job must call knowledge_ingest).
+					names := make([]string, 0, len(reply.ToolCalls))
+					for _, tc := range reply.ToolCalls {
+						names = append(names, tc.Name)
+					}
+					return cron.AgentResult{Content: reply.Content, ToolNames: names}, nil
 				})
 			}
 		}
@@ -1220,6 +1227,19 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 	instanceMgr.SetHandler(messageHandler)
 	srv.SetInstanceManager(instanceMgr)
+
+	if scheduler != nil {
+		// Route cron jobs' IM deliver targets (feishu/discord/...) through the
+		// running platform adapters. Desktop-class targets still go via the
+		// notifier wired above; this seam makes IM delivery actually send rather
+		// than only log (review L2).
+		scheduler.SetDeliverer(func(job *cron.Job, target, content string) error {
+			if job.ChatID == "" {
+				return fmt.Errorf("job %s has no chat_id for IM target %q", job.ID, target)
+			}
+			return instanceMgr.Send(ctx, target, job.ChatID, &adapter.Reply{Content: content})
+		})
+	}
 
 	// Web WebSocket 适配器
 	if cfg.Platforms.Web.Enabled {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
@@ -190,17 +191,19 @@ func (c *LLMCompiler) CompileWithProgress(
 			slog.Warn("[cron] self-correction retry call failed", "source", "cron", "model", model, "err", repairErr.Error())
 		}
 		if parseErr != nil {
-			return nil, fmt.Errorf("解析编译输出失败（含一次自纠重试）: %w —— LLM 原文:\n%s", parseErr, raw)
+			// Last resort: salvage the script from the (un-JSON-able) output so
+			// a weak model that always fences/breaks JSON still compiles
+			// (BUG-20260613). Validation below still gates the salvaged script.
+			if salvaged := salvageCompiledSpec(raw); salvaged != nil {
+				slog.Info("[cron] compile output salvaged from fenced/broken JSON", "source", "cron", "model", model)
+				spec, parseErr = salvaged, nil
+			} else {
+				return nil, fmt.Errorf("解析编译输出失败（含一次自纠重试）: %w —— LLM 原文:\n%s", parseErr, raw)
+			}
 		}
 	}
 
-	if spec.TimeoutSec <= 0 {
-		spec.TimeoutSec = 300
-	}
-	if spec.Runtime == "" {
-		spec.Runtime = "python3"
-	}
-	spec.Deps = filterStdlibDeps(spec.Deps)
+	normalizeCompiledSpec(spec)
 
 	emit(StageValidating, "校验脚本安全性（AST + 输出契约）…")
 	if err := validateSpec(spec); err != nil {
@@ -241,6 +244,49 @@ func parseCompiledSpec(raw string) (*JobSpec, error) {
 	}, nil
 }
 
+// salvageCompiledSpec is the last-resort parse for when strict JSON AND the
+// self-correction round both fail: weak models (glm-4-flash) cannot escape a
+// multi-line script inside a JSON string and either emit a bare ```python
+// fence or break the JSON. The compiler only needs the SCRIPT — runtime is
+// always python3, deps must be empty (stdlib-only), timeout defaults to 120,
+// and the schedule comes from the user draft — so extract the script and apply
+// fixed metadata (BUG-20260613).
+func salvageCompiledSpec(raw string) *JobSpec {
+	if script := salvageScript(raw); script != "" {
+		return &JobSpec{Runtime: "python3", Script: script, TimeoutSec: 120}
+	}
+	return nil
+}
+
+// fencedScriptRe matches a ```python ... ``` (or bare ```) code block.
+var fencedScriptRe = regexp.MustCompile("(?s)```(?:python|py)?\\s*\\n(.*?)```")
+
+// jsonScriptFieldRe matches a "script": "<...>" value up to the field's
+// closing quote that precedes the next JSON key or the object end — tolerant
+// of unescaped newlines/quotes inside the value.
+var jsonScriptFieldRe = regexp.MustCompile(`(?s)"script"\s*:\s*"(.*?)"\s*[,}]\s*(?:"(?:runtime|deps|timeout_s|inputs)"|$|\n*})`)
+
+// salvageScript extracts a Python script from a broken compile output: a
+// fenced code block first (the local model's natural format), else an
+// unescaped JSON "script" field.
+func salvageScript(raw string) string {
+	if m := fencedScriptRe.FindStringSubmatch(raw); len(m) == 2 {
+		if s := strings.TrimSpace(m[1]); s != "" {
+			return s
+		}
+	}
+	if m := jsonScriptFieldRe.FindStringSubmatch(raw); len(m) == 2 {
+		// Best-effort unescape of the common JSON escapes the model did emit.
+		s := m[1]
+		s = strings.ReplaceAll(s, `\n`, "\n")
+		s = strings.ReplaceAll(s, `\t`, "\t")
+		s = strings.ReplaceAll(s, `\"`, `"`)
+		s = strings.ReplaceAll(s, `\\`, `\`)
+		return strings.TrimSpace(s)
+	}
+	return ""
+}
+
 // stripMarkdownFence 去掉 LLM 偶尔输出的 ```json ... ``` 围栏。
 // 容错：若没有围栏直接返回原文。
 func stripMarkdownFence(s string) string {
@@ -262,38 +308,21 @@ func stripMarkdownFence(s string) string {
 	return t
 }
 
-// pythonStdlib 是 Python 3 标准库模块名集合（不完整，覆盖 LLM 常误标的）。
-// 用于剥掉 LLM 加进 deps 里的 stdlib 名字 —— `pip install json` 会失败。
-var pythonStdlib = map[string]struct{}{
-	"json": {}, "os": {}, "sys": {}, "re": {}, "time": {}, "datetime": {},
-	"math": {}, "random": {}, "string": {}, "collections": {}, "itertools": {},
-	"functools": {}, "pathlib": {}, "urllib": {}, "html": {}, "csv": {},
-	"hashlib": {}, "base64": {}, "logging": {}, "io": {}, "typing": {},
-	"argparse": {}, "subprocess": {}, "shutil": {}, "tempfile": {}, "glob": {},
-	"unittest": {}, "asyncio": {}, "threading": {}, "queue": {}, "socket": {},
-	"struct": {}, "pickle": {}, "copy": {}, "uuid": {}, "decimal": {},
-	"fractions": {}, "statistics": {}, "warnings": {}, "traceback": {}, "inspect": {},
-	"abc": {}, "enum": {}, "operator": {}, "weakref": {}, "gc": {}, "platform": {},
-	"locale": {}, "gettext": {}, "calendar": {}, "zoneinfo": {},
-}
-
-// filterStdlibDeps 过滤掉 LLM 误填的 stdlib 模块名，保留真实 PyPI 包。
-func filterStdlibDeps(deps []string) []string {
-	out := make([]string, 0, len(deps))
-	for _, d := range deps {
-		name := strings.SplitN(strings.TrimSpace(d), "=", 2)[0]
-		name = strings.SplitN(name, ">", 2)[0]
-		name = strings.SplitN(name, "<", 2)[0]
-		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
-		}
-		if _, isStd := pythonStdlib[name]; isStd {
-			continue
-		}
-		out = append(out, d)
+// normalizeCompiledSpec applies the post-parse defaults every compiled spec
+// must satisfy before validation: a resolved timeout, the python3 runtime, and
+// — because the sandbox is stdlib-only (the AST validator enforces a stdlib
+// import whitelist) — an empty dependency list. Any third-party dep is
+// unsatisfiable and would only trigger the executor's dead pip path, which is
+// unreliable on the sandboxed host (review M5). So deps are forced empty at the
+// compile boundary rather than carried into a venv build that can only fail.
+func normalizeCompiledSpec(spec *JobSpec) {
+	if spec.TimeoutSec <= 0 {
+		spec.TimeoutSec = defaultScriptTimeoutSec
 	}
-	return out
+	if spec.Runtime == "" {
+		spec.Runtime = "python3"
+	}
+	spec.Deps = nil
 }
 
 // hashSpec 产出 venv 缓存键。仅 script + deps 影响 venv，不含 inputs。
@@ -319,7 +348,7 @@ func buildCompileSystemPrompt(hints CompileHints) string {
 {
   "runtime": "python3",
   "script": "完整 Python 源码字符串",
-  "deps": ["requests", ...],
+  "deps": [],
   "timeout_s": 120
 }
 
@@ -330,9 +359,20 @@ func buildCompileSystemPrompt(hints CompileHints) string {
      print(json.dumps({"status": "success", "data": ...}))
    错误时:
      print(json.dumps({"status": "error", "error": "<原因>"}))
-4. **禁用调用**：os.system / subprocess / __import__ / eval / exec
-5. **网络访问**：允许（用 requests / httpx）
-6. **错误处理**：try/except 包裹外部调用，失败时输出 status=error
+4. **禁用调用**：os.system / subprocess / __import__ / eval / exec / compile（内置）/ ctypes
+5. **仅用 Python 标准库**：网络一律用 urllib.request，解析用 re / json / html.parser；
+   **禁止** requests / httpx / beautifulsoup 等任何第三方依赖（沙箱无法可靠安装，
+   且本机旧版 TLS 对部分站点 https 握手会失败）。deps 必须为空数组 []。
+6. **网络规则**：用户给定的 URL 必须**逐字使用**，禁止臆造端点/路径（如把
+   top.baidu.com/board 改成 /index）。若 https 抓取握手失败（SSLEOFError），
+   自动改用 http:// 重试同一路径。
+7. **错误处理**：try/except 包裹外部调用，失败时输出 status=error 并附具体原因。
+   **严禁** try/except: pass 吞掉异常后仍 print success —— 任何被捕获的外部调用
+   异常都必须导致最后一行输出 status=error。
+8. **HTTP 写入必须校验响应**：对任何 POST（尤其知识库写入）必须读取 HTTP 状态码，
+   **非 2xx 一律 status=error** 并把状态码与响应体摘要写进 error，禁止"发了就当成功"。
+   urllib 在非 2xx 会抛 HTTPError，**不可**用 try/except: pass 静默；写入成功时
+   应确认响应里带回文档/记录标识（如 id）作为回执，缺回执视为 error。
 `)
 	if hints.LocalAPIBase != "" {
 		fmt.Fprintf(&b, `
@@ -340,8 +380,9 @@ func buildCompileSystemPrompt(hints CompileHints) string {
 - 知识库写入：POST %s/api/v1/knowledge/documents
   body: {"title":"...","content":"..."}
 - 知识库搜索：POST %s/api/v1/knowledge/search
-- 用户提示通知：POST %s/api/v1/notify
-`, hints.LocalAPIBase, hints.LocalAPIBase, hints.LocalAPIBase)
+# 结果投递无需脚本处理：脚本只要按输出契约 print 最后一行 JSON，
+# 调度器会把 data 投递到任务配置的通知渠道。
+`, hints.LocalAPIBase, hints.LocalAPIBase)
 	}
 	if len(hints.AvailableSkills) > 0 {
 		b.WriteString("\n# 用户可用的 hexclaw skills（仅供脚本内逻辑 reference，**禁止**直接 import）：\n")

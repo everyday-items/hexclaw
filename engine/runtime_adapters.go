@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"sync/atomic"
 
 	"github.com/hexagon-codes/ai-core/llm"
@@ -44,18 +45,25 @@ func (s *runtimeProviderSelector) Select(context.Context, hruntime.Request) (hru
 	}, nil
 }
 
-func (s *runtimeProviderSelector) Fallback(_ context.Context, failed hruntime.ProviderSelection, _ error) (hruntime.ProviderSelection, error) {
+func (s *runtimeProviderSelector) Fallback(ctx context.Context, failed hruntime.ProviderSelection, cause error) (hruntime.ProviderSelection, error) {
 	if s.explicitProvider || s.router == nil {
 		return hruntime.ProviderSelection{}, hruntime.ErrNoFallback
 	}
 	p, name, err := s.router.Fallback(failed.Name)
 	if err != nil {
+		trace.L(ctx).Warn("runtime tool-loop fallback exhausted",
+			"failed_provider", failed.Name, "cause", cause, "err", err)
 		return hruntime.ProviderSelection{}, err
 	}
 	model := name
 	if s.modelForProvider != nil {
 		model = s.modelForProvider(name)
 	}
+	// Provider degradation used to be invisible in logs, which made
+	// installed-app failures (e.g. silent OpenRouter→Ollama switches)
+	// hard to diagnose (BUG-20260612).
+	trace.L(ctx).Warn("runtime tool-loop provider fallback",
+		"from", failed.Name, "to", name, "model", model, "cause", cause)
 	p = s.wrap(p, name, model)
 	s.currentProvider = p
 	s.currentName = name
@@ -121,11 +129,26 @@ func (p *thinkingBoundProvider) CountTokens(messages []llm.Message) (int, error)
 	return p.provider.CountTokens(messages)
 }
 
-type runtimeToolExecutor struct {
-	executor *ToolExecutor
+// maxIdenticalToolCalls is how many times the exact same (tool, arguments)
+// call is allowed within one run before the guard short-circuits it. Weak
+// models (e.g. glm-4-flash) otherwise loop on an identical browser fetch until
+// the token budget is exhausted instead of using the result they already have
+// (BUG-20260613).
+const maxIdenticalToolCalls = 2
+
+// newRuntimeToolExecutor builds a per-run executor with a fresh repeat guard.
+func newRuntimeToolExecutor(executor *ToolExecutor) *runtimeToolExecutor {
+	return &runtimeToolExecutor{executor: executor, callCounts: make(map[string]int)}
 }
 
-func (e runtimeToolExecutor) Execute(ctx context.Context, call llm.ToolCall) (hruntime.ToolResult, error) {
+type runtimeToolExecutor struct {
+	executor *ToolExecutor
+
+	mu         sync.Mutex
+	callCounts map[string]int // (tool+args) signature → times seen this run
+}
+
+func (e *runtimeToolExecutor) Execute(ctx context.Context, call llm.ToolCall) (hruntime.ToolResult, error) {
 	var args map[string]any
 	if call.Arguments != "" {
 		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
@@ -136,6 +159,21 @@ func (e runtimeToolExecutor) Execute(ctx context.Context, call llm.ToolCall) (hr
 	if e.executor == nil {
 		return hruntime.ToolResult{Content: "Error: tool executor not available", Error: "tool executor not available"}, nil
 	}
+
+	// Loop breaker: if the model repeats the exact same call, stop executing
+	// it and nudge it to answer from the result it already has.
+	sig := call.Name + "\x00" + call.Arguments
+	e.mu.Lock()
+	e.callCounts[sig]++
+	count := e.callCounts[sig]
+	e.mu.Unlock()
+	if count > maxIdenticalToolCalls {
+		trace.L(ctx).Warn("tool-loop repeat guard tripped",
+			"tool", call.Name, "identical_calls", count)
+		msg := fmt.Sprintf("You have already called %q with these exact arguments %d times and received the same result above. Do NOT call it again. Produce your final answer now using the information you already have; if it is insufficient, explain what is missing and stop.", call.Name, count-1)
+		return hruntime.ToolResult{Content: msg}, nil
+	}
+
 	result, err := e.executor.Execute(ctx, call.Name, args)
 	if err != nil {
 		msg := fmt.Sprintf("Error executing tool %q: %s", call.Name, err.Error())

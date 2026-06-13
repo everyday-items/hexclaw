@@ -15,6 +15,7 @@ package llmrouter
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -134,9 +135,25 @@ func NewWithProviders(cfg config.LLMConfig, providers map[string]hexagon.Provide
 	return r
 }
 
+// localHostMarkers identify a base URL pointing at the local machine or a
+// nearby private deployment (Ollama etc.). Such providers don't need an API
+// key and must rank LAST in fallback (BUG-20260612), so the matcher covers
+// loopback variants and common local/container hostnames, not just localhost.
+var localHostMarkers = []string{
+	"localhost", "127.0.0.1", "::1", "0.0.0.0",
+	"host.docker.internal", "host.containers.internal",
+	"//ollama", ".local",
+}
+
 // isLocalProvider 检查 provider 是否为本地部署（如 Ollama），本地 provider 不需要 API Key
 func isLocalProvider(pc config.LLMProviderConfig) bool {
-	return strings.Contains(pc.BaseURL, "localhost") || strings.Contains(pc.BaseURL, "127.0.0.1")
+	u := strings.ToLower(pc.BaseURL)
+	for _, m := range localHostMarkers {
+		if strings.Contains(u, m) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildSelectorState(cfg config.LLMConfig) (map[string]hexagon.Provider, config.LLMConfig, string) {
@@ -369,15 +386,28 @@ func (r *Selector) Fallback(exclude ...string) (hexagon.Provider, string, error)
 		excludeSet[e] = true
 	}
 
-	// 确定性选择：按名称排序后取第一个非排除项
-	names := make([]string, 0, len(r.providers))
+	// Deterministic selection, remote providers first: local deployments
+	// (Ollama etc.) structurally cannot serve full engine prompts before
+	// ResponseHeaderTimeout, so they are last-resort only (BUG-20260612 —
+	// plain alphabetical order made the local provider win every fallback).
+	var remote, local []string
 	for name := range r.providers {
-		if !excludeSet[name] {
-			names = append(names, name)
+		if excludeSet[name] {
+			continue
+		}
+		if isLocalProvider(r.cfg.Providers[name]) {
+			local = append(local, name)
+		} else {
+			remote = append(remote, name)
 		}
 	}
-	sort.Strings(names)
+	sort.Strings(remote)
+	sort.Strings(local)
+	names := append(remote, local...)
 	if len(names) > 0 {
+		slog.Warn("[router] provider fallback selected",
+			"source", "llm", "excluded", strings.Join(exclude, ","),
+			"selected", names[0], "is_local", len(remote) == 0)
 		return r.providers[names[0]], names[0], nil
 	}
 	return nil, "", fmt.Errorf("没有可用的备用 Provider")
