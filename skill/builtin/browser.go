@@ -128,6 +128,20 @@ func (s *BrowserSkill) Execute(ctx context.Context, args map[string]any) (*skill
 
 const maxBodySize = 1 << 20 // 1MB
 
+// maxFetchTextLen 限制 fetch 返回给 LLM 的正文长度（rune 计）。整页可见文字
+// 常含大量导航/重复噪声，无界回灌会淹没（尤其是弱模型）。这是卫生上界，
+// 正常页面不触发；要结构化内容应优先用 extract。
+const maxFetchTextLen = 12000
+
+// truncateRunes 按 rune 边界截断，避免切碎 UTF-8（中文）字符。
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "\n…[内容过长已截断]"
+}
+
 func (s *BrowserSkill) doFetch(ctx context.Context, targetURL string) (*skill.Result, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
@@ -146,7 +160,7 @@ func (s *BrowserSkill) doFetch(ctx context.Context, targetURL string) (*skill.Re
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
 
-	text := stripHTML(string(body))
+	text := truncateRunes(stripHTML(string(body)), maxFetchTextLen)
 
 	return &skill.Result{
 		Content: text,
