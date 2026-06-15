@@ -55,9 +55,13 @@ func (s *mockStore) DeleteMessage(_ context.Context, id string) error {
 func (s *mockStore) ListMessages(_ context.Context, sessionID string, limit, _ int) ([]*storage.MessageRecord, error) {
 	msgs := s.messages[sessionID]
 	if limit > 0 && limit < len(msgs) {
-		return msgs[:limit], nil
+		msgs = msgs[:limit]
 	}
-	return msgs, nil
+	// Return a snapshot so callers iterating the result are unaffected by
+	// concurrent DeleteMessage/SaveMessage mutations (matching the real store).
+	out := make([]*storage.MessageRecord, len(msgs))
+	copy(out, msgs)
+	return out, nil
 }
 
 func (s *mockStore) GetMessage(_ context.Context, id string) (*storage.MessageRecord, error) {
