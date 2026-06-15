@@ -13,6 +13,7 @@ import (
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/toolkit/net/httpx"
+	"github.com/hexagon-codes/toolkit/util/retry"
 )
 
 // WeatherSkill 天气查询 Skill
@@ -97,53 +98,47 @@ func (s *WeatherSkill) Execute(ctx context.Context, args map[string]any) (*skill
 		return &skill.Result{Content: "请告诉我要查询哪个城市的天气"}, nil
 	}
 
+	apiURL := fmt.Sprintf("https://wttr.in/%s?format=j1&lang=zh", url.QueryEscape(city))
 	var body []byte
 	var lastErr string
-	for attempt := 0; attempt < 2; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return &skill.Result{Content: "天气查询已取消"}, nil
-			case <-time.After(time.Second):
-			}
-		}
-
-		apiURL := fmt.Sprintf("https://wttr.in/%s?format=j1&lang=zh", url.QueryEscape(city))
-		req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	op := func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 		if err != nil {
-			return nil, err
+			lastErr = "请求构造失败"
+			return err
 		}
 		req.Header.Set("User-Agent", "HexClaw/1.0")
 
 		resp, err := s.client.Do(req)
 		if err != nil {
 			lastErr = "网络连接失败"
-			continue
+			return err
 		}
-
-		body, err = io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB 上限
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB 上限
 		resp.Body.Close()
 		if err != nil {
 			lastErr = "数据读取失败"
-			continue
+			return err
 		}
-
 		if resp.StatusCode != http.StatusOK {
 			lastErr = "天气服务暂时不可用"
-			continue
+			return fmt.Errorf("weather: status %d", resp.StatusCode)
 		}
-
-		trimmed := strings.TrimSpace(string(body))
+		trimmed := strings.TrimSpace(string(b))
 		if len(trimmed) == 0 || trimmed[0] != '{' {
 			lastErr = "天气服务返回了非预期格式"
-			continue
+			return fmt.Errorf("weather: unexpected response format")
 		}
-
-		lastErr = ""
-		break
+		body, lastErr = b, ""
+		return nil
 	}
 
-	if lastErr != "" {
+	// toolkit reuse: replaces the hand-rolled attempt loop with the shared
+	// retry primitive — 2 attempts, 1s ctx-aware delay between them.
+	if err := retry.DoWithContext(ctx, op, retry.Attempts(2), retry.Delay(time.Second)); err != nil {
+		if ctx.Err() != nil {
+			return &skill.Result{Content: "天气查询已取消"}, nil
+		}
 		return &skill.Result{
 			Content: fmt.Sprintf("抱歉，暂时无法获取 %s 的天气信息（%s），请稍后再试", city, lastErr),
 		}, nil
