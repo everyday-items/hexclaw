@@ -1600,7 +1600,23 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 		streamTail = notice
 	}
 	if strings.TrimSpace(content) == "" && strings.TrimSpace(reasoning) == "" {
-		content = fmt.Sprintf("模型未返回有效内容，请检查当前模型（%s）是否正常。", modelName)
+		// Empty right after a tool result — common when a weaker model is handed
+		// a large/noisy tool output and fails to synthesize. Give it one nudged
+		// retry (Tools off, direct-answer) to produce an answer from the existing
+		// context. Gated on tool context so plain empty responses (e.g. system
+		// dispatch) aren't double-called.
+		recovered := ""
+		if messagesHaveToolResult(req.Messages) {
+			if r, ok := e.recoverReasoningOnly(ctx, provider, req); ok {
+				recovered = r
+			}
+		}
+		if recovered != "" {
+			content = recovered
+			msgMeta["recovered_from_empty"] = "true"
+		} else {
+			content = fmt.Sprintf("模型未返回有效内容，请检查当前模型（%s）是否正常。", modelName)
+		}
 		cacheable = false
 	}
 
@@ -2514,6 +2530,18 @@ func messageRequestID(msg *adapter.Message) string {
 		return ""
 	}
 	return msg.Metadata["request_id"]
+}
+
+// messagesHaveToolResult reports whether the conversation already contains a
+// tool-result message — i.e. a tool ran this turn and there is context worth
+// re-prompting the model to synthesize from.
+func messagesHaveToolResult(msgs []hexagon.Message) bool {
+	for _, m := range msgs {
+		if m.Role == hexagon.RoleTool {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *ReActEngine) recoverReasoningOnly(ctx context.Context, provider hexagon.Provider, req hexagon.CompletionRequest) (string, bool) {

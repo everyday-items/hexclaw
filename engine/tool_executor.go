@@ -50,16 +50,22 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 		Arguments: args,
 	}
 
-	// 1. Try Skill registry
+	// 1. Try Skill registry — direct name first, then derived slug for skills
+	//    whose original name isn't a valid LLM identifier (e.g. Chinese names).
 	if e.skills != nil {
-		if s, ok := e.skills.Get(toolName); ok {
+		s, ok := e.skills.Get(toolName)
+		if !ok {
+			s, ok = e.resolveSkillBySlug(toolName)
+		}
+		if ok {
 			call.Source = "skill"
+			skillName := s.Name()
 			// v0.4.0 G2：flag skill.pipeline.v1 ON 时 Skill 走 7 阶段 pipeline，
 			// 触发 Loading / Verification / Persistence / Improvement 钩子；
 			// flag OFF 退化到直接 Execute（与 v0.3 行为一致）。
 			if featureflag.Enabled(ctx, skill.FlagSkillPipelineV1) {
 				return e.executeWithHooks(ctx, call, func(ctx context.Context) (string, error) {
-					return e.runSkillViaPipeline(ctx, toolName, args)
+					return e.runSkillViaPipeline(ctx, skillName, args)
 				})
 			}
 			return e.executeWithHooks(ctx, call, func(ctx context.Context) (string, error) {
@@ -88,10 +94,27 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 	return "", fmt.Errorf("tool '%s' not found in skills or MCP servers", toolName)
 }
 
+// resolveSkillBySlug finds the skill whose derived LLM tool slug matches name,
+// so a non-ASCII-named skill exposed under a slug still routes on tool calls.
+func (e *ToolExecutor) resolveSkillBySlug(name string) (skill.Skill, bool) {
+	if e.skills == nil {
+		return nil, false
+	}
+	for _, s := range e.skills.All() {
+		if llmToolNameSlug(s.Name()) == name {
+			return s, true
+		}
+	}
+	return nil, false
+}
+
 // HasTool checks whether a tool exists in any source.
 func (e *ToolExecutor) HasTool(toolName string) bool {
 	if e.skills != nil {
 		if _, ok := e.skills.Get(toolName); ok {
+			return true
+		}
+		if _, ok := e.resolveSkillBySlug(toolName); ok {
 			return true
 		}
 	}

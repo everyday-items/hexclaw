@@ -1,9 +1,12 @@
 package engine
 
 import (
+	"crypto/sha1"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/mcp"
@@ -24,6 +27,29 @@ var llmToolNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
 // isValidLLMToolName 检查 name 是否符合上游 LLM 标识符规范。
 func isValidLLMToolName(name string) bool {
 	return llmToolNamePattern.MatchString(name)
+}
+
+// llmToolNameSlug 把任意技能名映射成合规的 LLM tool name。
+//
+// 合规名原样返回；否则保留 ASCII 词字符、丢弃其余，并附确定性 hash 后缀，
+// 使纯中文名（如"前女友"）也能得到稳定可路由的标识符。它是纯函数——
+// ToolCollector 用它暴露、ToolExecutor 用它反查，无需共享状态。
+func llmToolNameSlug(name string) string {
+	if isValidLLMToolName(name) {
+		return name
+	}
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			b.WriteRune(r)
+		}
+	}
+	hash := fmt.Sprintf("%x", sha1.Sum([]byte(name)))[:8]
+	if ascii := strings.Trim(b.String(), "-_"); ascii != "" {
+		return ascii + "-" + hash
+	}
+	return "skill-" + hash
 }
 
 // ToolCollector gathers tool definitions from multiple sources.
@@ -80,16 +106,9 @@ func (tc *ToolCollector) CollectFiltered(query string, act skill.Activation) []l
 			if def.Function.Name == "" {
 				continue
 			}
-			if !isValidLLMToolName(def.Function.Name) {
-				// BUG-20260523: 非法 name（含中文 / 空格 / 点号 / 冒号 / 斜杠等）
-				// 上游 Claude 会立即 400。skip + warn，trigger 词召唤路径仍然可用。
-				slog.Warn("[ToolCollector] skip skill — name 不符合 LLM 标识符正则",
-					"name", def.Function.Name,
-					"source", "skill",
-					"pattern", `^[a-zA-Z0-9_-]{1,128}$`,
-					"hint", "重命名 skill 用 ASCII / 数字 / 下划线 / 短横线；中文仍可通过 trigger 词召唤")
-				continue
-			}
+			// 非法 name（含中文 / 空格 / 点号等）上游会 400。派生合规 slug 暴露，
+			// 让中文名技能仍可被 LLM 调用；ToolExecutor 用同一 slug 函数反查路由。
+			def.Function.Name = llmToolNameSlug(def.Function.Name)
 			if seen[def.Function.Name] {
 				continue
 			}
