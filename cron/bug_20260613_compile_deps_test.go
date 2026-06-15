@@ -16,8 +16,8 @@ func TestBug20260613_NormalizeForcesEmptyDeps(t *testing.T) {
 	if len(spec.Deps) != 0 {
 		t.Errorf("deps must be forced empty (stdlib-only sandbox, pip is a dead path), got %v", spec.Deps)
 	}
-	if spec.Runtime != "python3" {
-		t.Errorf("runtime must default to python3, got %q", spec.Runtime)
+	if spec.Runtime != RuntimeStarlark {
+		t.Errorf("runtime must default to starlark (pure-Go, zero-dep), got %q", spec.Runtime)
 	}
 	if spec.TimeoutSec != defaultScriptTimeoutSec {
 		t.Errorf("zero timeout must resolve to default %d, got %d", defaultScriptTimeoutSec, spec.TimeoutSec)

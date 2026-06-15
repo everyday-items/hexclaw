@@ -194,8 +194,11 @@ func TestLLMCompiler_EndToEnd_WithFakeProvider(t *testing.T) {
 	if spec.Compiled.Hash == "" || len(spec.Compiled.Hash) != 64 {
 		t.Errorf("Compiled.Hash 应为 sha256 hex: %q", spec.Compiled.Hash)
 	}
-	if fp.last == nil || !strings.Contains(fp.last.Messages[0].Content, "127.0.0.1:16060") {
-		t.Error("system prompt 应包含 LocalAPIBase hint")
+	// F-3: LocalAPIBase no longer appears verbatim — ingest uses the in-process
+	// kb_ingest builtin, not an HTTP POST to the local API. The hint now gates
+	// whether the ingest guidance section is emitted.
+	if fp.last == nil || !strings.Contains(fp.last.Messages[0].Content, "入知识库") {
+		t.Error("system prompt 应在 LocalAPIBase 存在时包含入知识库指引")
 	}
 	if fp.last == nil || !strings.Contains(fp.last.Messages[0].Content, "web-search") {
 		t.Error("system prompt 应列出 AvailableSkills")

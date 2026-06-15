@@ -210,15 +210,30 @@ func (s *Server) cronActionCreate(ctx context.Context, req *CronJobRequest) (*Cr
 		}
 	}
 
-	job, err := s.scheduler.AddJobFromPrompt(ctx, cron.AddJobRequest{
-		Name:         d.Name,
-		Schedule:     d.Schedule,
-		Prompt:       d.Prompt,
-		UserID:       req.UserID,
-		Deliver:      d.Deliver, // D4.2 多 deliver 桥接
-		TimeoutSec:   d.TimeoutSec,
-		LocalAPIBase: s.localAPIBase(),
-	})
+	// First-class pre-authored script path (BUG-20260615): when the draft carries
+	// a script, admit it directly as a deterministic script-mode job — skip LLM
+	// compilation, which a weak model keeps failing for mechanical collectors.
+	var job *cron.Job
+	if strings.TrimSpace(d.Script) != "" {
+		job, err = s.scheduler.AddJobFromScript(ctx, cron.AddJobRequest{
+			Name:       d.Name,
+			Schedule:   d.Schedule,
+			Prompt:     d.Prompt,
+			UserID:     req.UserID,
+			Deliver:    d.Deliver,
+			TimeoutSec: d.TimeoutSec,
+		}, d.Runtime, d.Script)
+	} else {
+		job, err = s.scheduler.AddJobFromPrompt(ctx, cron.AddJobRequest{
+			Name:         d.Name,
+			Schedule:     d.Schedule,
+			Prompt:       d.Prompt,
+			UserID:       req.UserID,
+			Deliver:      d.Deliver, // D4.2 多 deliver 桥接
+			TimeoutSec:   d.TimeoutSec,
+			LocalAPIBase: s.localAPIBase(),
+		})
+	}
 	if err != nil {
 		status, code := classifyCronCreateError(err)
 		// Full-fidelity cause to the log; humanized message to the client

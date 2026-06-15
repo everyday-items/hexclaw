@@ -1,11 +1,12 @@
 package cron
 
-// BUG-20260613 (audit C3): generated scripts wrapped the knowledge-base POST in
+// BUG-20260613 (audit C3): generated scripts wrapped an HTTP write in
 // try/except: pass, swallowed a failed write, and still printed status=success —
-// so an ingest could silently store nothing while reporting done. And the prompt
-// advertised a phantom POST /api/v1/notify endpoint (C2). The hardened prompt
-// forbids swallowing, mandates non-2xx → status=error with a receipt check, and
-// no longer mentions the phantom endpoint.
+// so a request could silently fail while reporting done. The hardened prompt
+// forbids swallowing and mandates non-2xx → status=error for external http_get/
+// http_post. C2: the prompt advertised a phantom POST /api/v1/notify endpoint.
+// F-3 update: knowledge-base ingest moved to the in-process kb_ingest builtin, so
+// the prompt no longer advertises the loopback /api/v1/knowledge/documents POST.
 
 import (
 	"strings"
@@ -15,19 +16,15 @@ import (
 func TestBug20260613_CompilePromptForbidsSwallowingWriteErrors(t *testing.T) {
 	p := buildCompileSystemPrompt(CompileHints{LocalAPIBase: "http://127.0.0.1:8080"})
 
-	// Must forbid the try/except: pass + print success anti-pattern.
-	if !strings.Contains(p, "try/except: pass") {
-		t.Error("prompt must explicitly forbid the try/except: pass swallow pattern")
-	}
-	// Must mandate non-2xx → error.
+	// Must mandate non-2xx → status=error on a failed HTTP write.
 	for _, must := range []string{"非 2xx", "status=error"} {
 		if !strings.Contains(p, must) {
 			t.Errorf("prompt must mandate %q on a failed HTTP write", must)
 		}
 	}
-	// Must require a write receipt (id) check.
-	if !strings.Contains(p, "回执") {
-		t.Error("prompt must require a write-receipt check (missing receipt => error)")
+	// Must forbid treating a fire-and-forget POST as success.
+	if !strings.Contains(p, "发了就当成功") {
+		t.Error("prompt must forbid treating a fire-and-forget write as success")
 	}
 }
 
@@ -38,8 +35,12 @@ func TestBug20260613_CompilePromptDropsPhantomNotifyEndpoint(t *testing.T) {
 	if strings.Contains(p, "/api/v1/notify") {
 		t.Error("prompt must not advertise the unregistered /api/v1/notify endpoint")
 	}
-	// The real KB endpoint stays.
-	if !strings.Contains(p, "/api/v1/knowledge/documents") {
-		t.Error("prompt must still advertise the real knowledge-write endpoint")
+	// F-3: KB ingest is the in-process kb_ingest builtin; the loopback HTTP
+	// endpoint is no longer advertised (and is now SSRF-blocked).
+	if !strings.Contains(p, "kb_ingest") {
+		t.Error("prompt must advertise the in-process kb_ingest builtin")
+	}
+	if strings.Contains(p, "/api/v1/knowledge/documents") {
+		t.Error("prompt must not advertise the loopback KB endpoint (F-3: use kb_ingest)")
 	}
 }

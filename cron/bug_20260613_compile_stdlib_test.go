@@ -14,12 +14,14 @@ import (
 func TestBug20260613_CompilePromptForcesStdlibOnly(t *testing.T) {
 	p := buildCompileSystemPrompt(CompileHints{})
 
-	if strings.Contains(p, "用 requests / httpx") {
-		t.Error("prompt must not steer the model toward 3rd-party HTTP libs")
+	// Output contract is emit(), not python's print(json.dumps(...)).
+	if strings.Contains(p, "print(json.dumps") {
+		t.Error("starlark prompt must not use the python print(json.dumps) contract")
 	}
-	for _, must := range []string{"urllib.request", "禁止", "逐字使用", "http://"} {
+	// Pins scripts to injected host builtins + verbatim URLs + the emit contract.
+	for _, must := range []string{"http_get", "json_decode", "逐字使用", "emit("} {
 		if !strings.Contains(p, must) {
-			t.Errorf("hardened prompt must mention %q", must)
+			t.Errorf("hardened starlark prompt must mention %q", must)
 		}
 	}
 }

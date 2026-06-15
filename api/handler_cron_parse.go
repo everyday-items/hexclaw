@@ -47,6 +47,7 @@ type CronJobDraft struct {
 	Schedule        string   `json:"schedule"`
 	Prompt          string   `json:"prompt"`
 	Script          string   `json:"script,omitempty"`
+	Runtime         string   `json:"runtime,omitempty"` // starlark (default) | python3 — only meaningful with Script
 	NoAgent         bool     `json:"no_agent,omitempty"`
 	Deliver         []string `json:"deliver,omitempty"`
 	EnabledToolsets []string `json:"enabled_toolsets,omitempty"`

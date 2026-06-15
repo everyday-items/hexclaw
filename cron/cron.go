@@ -146,6 +146,7 @@ type Scheduler struct {
 	db         *sql.DB
 	compiler   JobSpecCompiler
 	scriptExec *ScriptExecutor
+	engines    map[string]ScriptEngine // runtime -> engine (starlark default, python3 optional)
 	agent      agentSupport
 	jobs       map[string]*Job // id -> job
 	stopCh     chan struct{}
@@ -158,12 +159,37 @@ type Scheduler struct {
 // compiler/scriptExec 可为 nil — 主要给测试使用（测试可只构造 prebuilt Job 不走编译）。
 // 业务代码（cmd/hexclaw/main.go）必须注入两者，否则 AddJobFromPrompt / executeJob 会拒收。
 func NewScheduler(db *sql.DB, compiler JobSpecCompiler, scriptExec *ScriptExecutor) *Scheduler {
+	engines := map[string]ScriptEngine{
+		RuntimeStarlark: NewStarlarkEngine(), // pure-Go default, always available
+	}
+	if scriptExec != nil {
+		engines[RuntimePython3] = scriptExec // optional: only where python3 exists
+	}
 	return &Scheduler{
 		db:         db,
 		compiler:   compiler,
 		scriptExec: scriptExec,
+		engines:    engines,
 		jobs:       make(map[string]*Job),
 	}
+}
+
+// SetKBIngest wires the in-process knowledge-base writer into the Starlark
+// engine's kb_ingest builtin, so scripts ingest without an HTTP POST to the
+// app's own API (which loopback SSRF blocking now forbids). No-op if the
+// Starlark engine is absent — though NewScheduler always installs it.
+func (s *Scheduler) SetKBIngest(fn KBIngestFunc) {
+	if eng, ok := s.engines[RuntimeStarlark].(*StarlarkEngine); ok {
+		eng.SetKBIngest(fn)
+	}
+}
+
+// engineFor resolves the script engine for a runtime, or nil for an unknown one.
+// Returning nil (rather than silently falling back to Starlark) lets executeJob
+// surface an explicit "no engine for runtime X" error instead of running, say, a
+// python script on the Starlark engine and reporting a misleading syntax error.
+func (s *Scheduler) engineFor(runtime string) ScriptEngine {
+	return s.engines[runtime]
 }
 
 // Init 初始化调度器存储表
@@ -558,6 +584,55 @@ func (s *Scheduler) AddJobFromPromptWithProgress(
 	return job, nil
 }
 
+// AddJobFromScript admits a pre-authored, deterministic script as a first-class
+// script-mode job, bypassing LLM compilation entirely. This is the reliable path
+// for mechanical fetch->parse->store jobs that a weak compile model keeps failing
+// to emit (BUG-20260615): the caller supplies a vetted stdlib script, it runs
+// through the same validateSpec chain (syntax + AST allowlist + output contract)
+// the compiler output goes through, and then executes with zero LLM at tick time.
+func (s *Scheduler) AddJobFromScript(ctx context.Context, req AddJobRequest, runtime, script string) (*Job, error) {
+	if strings.TrimSpace(req.Schedule) == "" {
+		return nil, fmt.Errorf("schedule is required")
+	}
+	if strings.TrimSpace(script) == "" {
+		return nil, fmt.Errorf("script must not be empty")
+	}
+	if runtime == "" {
+		runtime = RuntimeStarlark // pure-Go default: no runtime dependency
+	}
+	engine, ok := s.engines[runtime]
+	if !ok {
+		return nil, fmt.Errorf("unknown or unavailable runtime %q", runtime)
+	}
+	if !engine.Available() {
+		return nil, fmt.Errorf("%s runtime is not available on this host", engine.Name())
+	}
+	if err := engine.Validate(script); err != nil {
+		return nil, fmt.Errorf("script validation failed: %w", err)
+	}
+	spec := &JobSpec{
+		Runtime:    engine.Name(),
+		Script:     script,
+		TimeoutSec: req.TimeoutSec, // 0 -> executor's effective default
+	}
+	job := &Job{
+		Name:         req.Name,
+		Type:         JobTypeCron,
+		Schedule:     req.Schedule,
+		UserID:       req.UserID,
+		Platform:     req.Platform,
+		ChatID:       req.ChatID,
+		Status:       StatusActive,
+		SourcePrompt: req.Prompt,
+		Spec:         spec,
+		Deliver:      req.Deliver,
+	}
+	if err := s.AddJob(ctx, job); err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
 // RemoveJob 删除任务
 func (s *Scheduler) RemoveJob(ctx context.Context, jobID string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM cron_jobs WHERE id = ?`, jobID)
@@ -884,15 +959,26 @@ func (s *Scheduler) executeJob(job *Job) {
 		slog.Info("[cron] running agent job", "source", "cron", "name", job.Name, "id", job.ID)
 		result = s.runAgentJob(runCtx, job)
 	} else {
-		if s.scriptExec == nil {
-			slog.Error("[cron] skipping run — scriptExec not injected", "source", "cron", "id", job.ID)
+		engine := s.engineFor(job.Spec.Runtime)
+		if engine == nil {
+			slog.Error("[cron] skipping run — no engine for runtime", "source", "cron", "id", job.ID, "runtime", job.Spec.Runtime)
 			ec, cancel := earlyCtx()
 			defer cancel()
-			_ = s.persistHistory(ec, job.ID, "error", "", "脚本执行器未就绪", 0, now, "", "", 0, nil)
+			_ = s.persistHistory(ec, job.ID, "error", "", "no script engine for runtime "+job.Spec.Runtime, 0, now, "", "", 0, nil)
 			return
 		}
-		logger.Info("[cron] 执行脚本任务", "name", job.Name, "id", job.ID)
-		result, runErr = s.scriptExec.Run(runCtx, job.Spec)
+		if !engine.Available() {
+			// Explicit error instead of a silent exec failure (e.g. python3 not
+			// installed). The Starlark engine is always available, so steering new
+			// mechanical jobs to it avoids this entirely.
+			slog.Error("[cron] skipping run — runtime unavailable on this host", "source", "cron", "id", job.ID, "runtime", engine.Name())
+			ec, cancel := earlyCtx()
+			defer cancel()
+			_ = s.persistHistory(ec, job.ID, "error", "", engine.Name()+" runtime is not available on this host", 0, now, "", "", 0, nil)
+			return
+		}
+		logger.Info("[cron] 执行脚本任务", "name", job.Name, "id", job.ID, "engine", engine.Name())
+		result, runErr = engine.Execute(runCtx, job.Spec)
 	}
 	if result == nil {
 		// Run 返 nil 一般是 venv 准备 / 工作目录创建失败，必须把 runErr 原文带出来便于排查

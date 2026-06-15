@@ -764,6 +764,20 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					}
 					return cron.AgentResult{Content: reply.Content, ToolNames: names}, nil
 				})
+				// In-process knowledge ingest for Starlark cron scripts. Loopback
+				// SSRF blocking forbids a script from POSTing to the app's own KB
+				// API, so the kb_ingest builtin writes straight through the manager.
+				// Sourced from the engine because kbMgr is scoped to the
+				// knowledge-init block above.
+				if kb := eng.KnowledgeBase(); kb != nil {
+					scheduler.SetKBIngest(func(ingestCtx context.Context, title, content, source string) (string, error) {
+						doc, err := kb.AddDocument(ingestCtx, title, content, source)
+						if err != nil {
+							return "", err
+						}
+						return doc.ID, nil
+					})
+				}
 			}
 		}
 	}

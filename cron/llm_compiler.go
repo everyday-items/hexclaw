@@ -122,7 +122,7 @@ func (c *LLMCompiler) CompileWithProgress(
 		}
 	}
 
-	emit(StageCallingLLM, fmt.Sprintf("调用 LLM 生成 Python 脚本（model=%s）…", model))
+	emit(StageCallingLLM, fmt.Sprintf("调用 LLM 生成 Starlark 脚本（model=%s）…", model))
 	sys := buildCompileSystemPrompt(hints)
 	temp := 0.0
 	req := llm.CompletionRequest{
@@ -164,8 +164,8 @@ func (c *LLMCompiler) CompileWithProgress(
 			llm.Message{Role: llm.RoleAssistant, Content: raw},
 			llm.Message{Role: llm.RoleUser, Content: "Your previous reply was not in the required format. " +
 				"Do not output markdown fences, code blocks, or any explanatory text. " +
-				"Re-emit the same task as one pure JSON object (fields: runtime / script / deps / timeout_s), " +
-				"with the complete Python script in the script field."},
+				"Re-emit the same task as one pure JSON object (fields: runtime / script / timeout_s)," +
+				"with the complete Starlark script in the script field."},
 		)
 		repairResp, repairErr := llmcall.Call(ctx, llmcall.Request{
 			Provider: provider,
@@ -205,10 +205,49 @@ func (c *LLMCompiler) CompileWithProgress(
 
 	normalizeCompiledSpec(spec)
 
-	emit(StageValidating, "校验脚本安全性（AST + 输出契约）…")
-	if err := validateSpec(spec); err != nil {
-		slog.Warn("[cron] 脚本校验失败", "source", "cron", "model", model, "err", err.Error(), "script_head", clipForHeal(spec.Script, 300))
-		return nil, fmt.Errorf("脚本校验失败: %w —— LLM 原文:\n%s", err, raw)
+	emit(StageValidating, "校验脚本安全性…")
+	if verr := validateCompiledScript(spec); verr != nil {
+		// Validation self-repair (BUG-20260615 P2.5): a weak model — or one
+		// unfamiliar with Starlark, a small dialect — routinely writes a
+		// structurally-correct script with one fixable slip (bad escape \., stray
+		// continuation, wrong field). Feed the precise engine error back for ONE
+		// repair round before giving up; this recovers most slips that switching
+		// to a bigger model did not.
+		slog.Warn("[cron] script validation failed, self-correction retry", "source", "cron", "model", model, "err", verr.Error(), "script_head", clipForHeal(spec.Script, 200))
+		emit(StageCallingLLM, "脚本有小错，反馈给模型自动修正…")
+		fixMessages := append(llm.NewMessages(sys, prompt),
+			llm.Message{Role: llm.RoleAssistant, Content: raw},
+			llm.Message{Role: llm.RoleUser, Content: "The Starlark script failed validation with this exact error:\n" + verr.Error() +
+				"\n\nFix ONLY that error (for a regex escape use a raw string r\"...\" or double the backslash; " +
+				"close any unfinished expression; correct field names), then re-emit the SAME task as one pure JSON " +
+				"object (fields: runtime / script / timeout_s). No markdown fences, no explanation."},
+		)
+		fixResp, fixErr := llmcall.Call(ctx, llmcall.Request{
+			Provider: provider,
+			Req:      llm.CompletionRequest{Model: model, Messages: fixMessages, MaxTokens: c.maxTokens, Temperature: &temp},
+		})
+		if fixErr != nil {
+			return nil, fmt.Errorf("脚本校验失败: %w —— LLM 原文:\n%s", verr, raw)
+		}
+		tokensIn += fixResp.Usage.PromptTokens
+		tokensOut += fixResp.Usage.CompletionTokens
+		fixRaw := strings.TrimSpace(fixResp.Content)
+		fixSpec, fixParseErr := parseCompiledSpec(fixRaw)
+		if fixParseErr != nil {
+			if salvaged := salvageCompiledSpec(fixRaw); salvaged != nil {
+				fixSpec, fixParseErr = salvaged, nil
+			}
+		}
+		if fixParseErr != nil {
+			return nil, fmt.Errorf("脚本校验失败（自纠输出不可解析）: %w —— LLM 原文:\n%s", verr, fixRaw)
+		}
+		normalizeCompiledSpec(fixSpec)
+		if verr2 := validateCompiledScript(fixSpec); verr2 != nil {
+			slog.Warn("[cron] validation self-correction still invalid", "source", "cron", "model", model, "err", verr2.Error())
+			return nil, fmt.Errorf("脚本校验失败（含一次自纠）: %w —— LLM 原文:\n%s", verr2, fixRaw)
+		}
+		slog.Info("[cron] validation self-correction succeeded", "source", "cron", "model", model)
+		spec, raw = fixSpec, fixRaw
 	}
 
 	spec.Compiled = CompileMeta{
@@ -253,13 +292,13 @@ func parseCompiledSpec(raw string) (*JobSpec, error) {
 // fixed metadata (BUG-20260613).
 func salvageCompiledSpec(raw string) *JobSpec {
 	if script := salvageScript(raw); script != "" {
-		return &JobSpec{Runtime: "python3", Script: script, TimeoutSec: 120}
+		return &JobSpec{Runtime: RuntimeStarlark, Script: script, TimeoutSec: 60}
 	}
 	return nil
 }
 
 // fencedScriptRe matches a ```python ... ``` (or bare ```) code block.
-var fencedScriptRe = regexp.MustCompile("(?s)```(?:python|py)?\\s*\\n(.*?)```")
+var fencedScriptRe = regexp.MustCompile("(?s)```(?:starlark|star|python|py)?\\s*\\n(.*?)```")
 
 // jsonScriptFieldRe matches a "script": "<...>" value up to the field's
 // closing quote that precedes the next JSON key or the object end — tolerant
@@ -320,9 +359,20 @@ func normalizeCompiledSpec(spec *JobSpec) {
 		spec.TimeoutSec = defaultScriptTimeoutSec
 	}
 	if spec.Runtime == "" {
-		spec.Runtime = "python3"
+		spec.Runtime = RuntimeStarlark
 	}
 	spec.Deps = nil
+}
+
+// validateCompiledScript gates a compiled spec through the engine matching its
+// runtime: Starlark (pure-Go, the default) or python3 (legacy). This replaces a
+// hardcoded python validation chain so compiler output is checked by the same
+// engine that will run it.
+func validateCompiledScript(spec *JobSpec) error {
+	if spec.Runtime == RuntimePython3 {
+		return validateSpec(spec)
+	}
+	return validateStarlarkSource(spec.Script)
 }
 
 // hashSpec 产出 venv 缓存键。仅 script + deps 影响 venv，不含 inputs。
@@ -341,48 +391,68 @@ func hashSpec(spec *JobSpec) string {
 // 内容参考设计文档 §4.3。
 func buildCompileSystemPrompt(hints CompileHints) string {
 	var b strings.Builder
-	b.WriteString(`你是 hexclaw 自动化脚本编译器。把用户的中文自动化需求编译成一段**自包含、可重复执行**的 Python 3 脚本。
+	b.WriteString(`你是 hexclaw 自动化脚本编译器。把用户的中文自动化需求编译成一段**自包含、可重复执行**的 Starlark 脚本（纯 Go 沙箱执行，零依赖、无需 Python、跨平台）。
 
 # 输出契约（严格）
 仅输出**纯 JSON**（不带 markdown 围栏），格式：
 {
-  "runtime": "python3",
-  "script": "完整 Python 源码字符串",
-  "deps": [],
-  "timeout_s": 120
+  "runtime": "starlark",
+  "script": "完整 Starlark 源码字符串",
+  "timeout_s": 60
 }
 
-# 脚本编写规则
-1. **可重复执行**：每次跑结果一致（除非业务本身是抓最新数据）
-2. **自包含**：所有逻辑在脚本内，不依赖外部状态文件
-3. **输出契约**：脚本最后一行必须是
-     print(json.dumps({"status": "success", "data": ...}))
-   错误时:
-     print(json.dumps({"status": "error", "error": "<原因>"}))
-4. **禁用调用**：os.system / subprocess / __import__ / eval / exec / compile（内置）/ ctypes
-5. **仅用 Python 标准库**：网络一律用 urllib.request，解析用 re / json / html.parser；
-   **禁止** requests / httpx / beautifulsoup 等任何第三方依赖（沙箱无法可靠安装，
-   且本机旧版 TLS 对部分站点 https 握手会失败）。deps 必须为空数组 []。
-6. **网络规则**：用户给定的 URL 必须**逐字使用**，禁止臆造端点/路径（如把
-   top.baidu.com/board 改成 /index）。若 https 抓取握手失败（SSLEOFError），
-   自动改用 http:// 重试同一路径。
-7. **错误处理**：try/except 包裹外部调用，失败时输出 status=error 并附具体原因。
-   **严禁** try/except: pass 吞掉异常后仍 print success —— 任何被捕获的外部调用
-   异常都必须导致最后一行输出 status=error。
-8. **HTTP 写入必须校验响应**：对任何 POST（尤其知识库写入）必须读取 HTTP 状态码，
-   **非 2xx 一律 status=error** 并把状态码与响应体摘要写进 error，禁止"发了就当成功"。
-   urllib 在非 2xx 会抛 HTTPError，**不可**用 try/except: pass 静默；写入成功时
-   应确认响应里带回文档/记录标识（如 id）作为回执，缺回执视为 error。
+# Starlark 是受限的 Python 方言——只能用下列宿主内建函数，**禁止 import / open / eval / 任何模块名**：
+- http_get(url, headers={}) -> {"status": int, "body": str}            # GET，自动跟随 http->https 重定向
+- http_post(url, body="", headers={}) -> {"status": int, "body": str}  # POST
+- json_decode(s) -> value        # JSON 字符串 -> dict/list/数值
+- json_encode(value) -> str      # 值 -> JSON 字符串
+- re_findall(pattern, s) -> list # 正则；单捕获组返回组1，否则返回整匹配；跨行匹配用 (?s)
+- re_sub(pattern, repl, s) -> str # 正则替换（清洗文本）
+- html_unescape(s) -> str         # 解码 HTML 实体 &amp;/&lt;/&#x...
+- url_encode(s) -> str            # URL 查询参数百分号编码
+- sha256(s) -> str                # 十六进制哈希（变化检测/去重）
+- now() -> {"date":"YYYY-MM-DD","datetime":"...","year":int,"month":int,"day":int,"unix":int}
+- kb_ingest(title, content, source) -> {"id": str}  # 写入本地知识库（in-process，免鉴权）；**禁止** http_post 到 127.0.0.1/localhost（已被沙箱拦截）
+- emit(result)                   # 提交最终结果（替代 print），脚本必须调用一次
+
+可用语法：def / for / if / 列表与字典推导 / 字符串方法(strip/split/replace/join/lower) / "%d"%x 格式化 / dict.get(key, default) / in 运算符 / range(n)。
+**不存在** urllib / json / re / requests 等任何模块名——只用上面的内建。**禁止** import、open、eval、exec、无限 while。
+
+# 脚本规则
+1. **结果用 emit**：成功 emit({"status":"success","data":...})；失败 emit({"status":"error","error":"<原因>"})。
+2. **URL 逐字使用**：用户给定 URL 不得臆造/改写。http_get 已自动跟随重定向。
+3. **每次请求校验状态码**：http_get/http_post 后检查 resp["status"]，**非 2xx 一律 emit status=error** 并附状态码，禁止"发了就当成功"。
+4. **优先解析内嵌结构化数据**：优先 json_decode 页面内嵌 JSON（如 <!--s-data:...-->、window.__INITIAL_STATE__），而非易变的 CSS class。
+
+# 完整范例（采集网页榜单）
+def run():
+    url = "https://example.com/board"
+    resp = http_get(url, headers = {"User-Agent": "Mozilla/5.0"})
+    if resp["status"] < 200 or resp["status"] >= 300:
+        return {"status": "error", "error": "fetch non-2xx: %d" % resp["status"]}
+    blocks = re_findall("(?s)<!--data:(.*?)-->", resp["body"])
+    if len(blocks) == 0:
+        return {"status": "error", "error": "data block missing"}
+    data = json_decode(blocks[0])
+    titles = []
+    seen = {}
+    for item in data.get("list", []):
+        t = item.get("title", "").strip()
+        if t and t not in seen:
+            seen[t] = True
+            titles.append(t)
+    if len(titles) == 0:
+        return {"status": "error", "error": "no items extracted"}
+    content = "\n".join(["%d. %s" % (i + 1, titles[i]) for i in range(len(titles))])
+    return {"status": "success", "data": {"title": "榜单 " + now()["date"], "count": len(titles), "content": content}}
+emit(run())
 `)
 	if hints.LocalAPIBase != "" {
-		fmt.Fprintf(&b, `
-# 可用本地接口（沙箱可达，无需鉴权）
-- 知识库写入：POST %s/api/v1/knowledge/documents
-  body: {"title":"...","content":"..."}
-- 知识库搜索：POST %s/api/v1/knowledge/search
-# 结果投递无需脚本处理：脚本只要按输出契约 print 最后一行 JSON，
-# 调度器会把 data 投递到任务配置的通知渠道。
-`, hints.LocalAPIBase, hints.LocalAPIBase)
+		b.WriteString(`
+# 入知识库（in-process 内建，免鉴权）——需要入库时调用 kb_ingest，**禁止** http_post 到 127.0.0.1/localhost（已被沙箱 SSRF 拦截）：
+    res = kb_ingest(title = "标题", content = "正文", source = "cron-xxx")
+    # 成功返回 {"id": "<doc-id>"}；失败直接抛错（如知识库未启用）。入库成功后再 emit success。
+`)
 	}
 	if len(hints.AvailableSkills) > 0 {
 		b.WriteString("\n# 用户可用的 hexclaw skills（仅供脚本内逻辑 reference，**禁止**直接 import）：\n")

@@ -11,17 +11,17 @@ import (
 )
 
 func TestBug20260613_SalvageFencedScript(t *testing.T) {
-	raw := "Sure:\n```python\nimport urllib.request, re, json\nhtml = urllib.request.urlopen(\"http://x\").read().decode()\nprint(json.dumps({\"status\": \"success\", \"data\": re.findall(r\"<b>(.*?)</b>\", html)}))\n```"
+	raw := "Sure:\n```starlark\ndef run():\n    resp = http_get(\"http://x\")\n    return {\"status\": \"success\", \"data\": resp[\"status\"]}\nemit(run())\n```"
 	spec := salvageCompiledSpec(raw)
 	if spec == nil {
 		t.Fatal("fenced script must be salvaged")
 	}
-	if spec.Runtime != "python3" || !strings.Contains(spec.Script, "urllib.request") || strings.Contains(spec.Script, "```") {
-		t.Errorf("salvaged spec wrong: runtime=%q script_head=%.50q", spec.Runtime, spec.Script)
+	if spec.Runtime != RuntimeStarlark || !strings.Contains(spec.Script, "http_get") || strings.Contains(spec.Script, "```") {
+		t.Errorf("salvaged spec wrong: runtime=%q script_head=%.60q", spec.Runtime, spec.Script)
 	}
-	// Salvaged script must still pass the security validator.
-	if err := validateNoForbiddenImports(spec.Script); err != nil {
-		t.Errorf("salvaged stdlib script must pass validation: %v", err)
+	// Salvaged script must still pass the engine validator.
+	if err := NewStarlarkEngine().Validate(spec.Script); err != nil {
+		t.Errorf("salvaged starlark script must pass validation: %v", err)
 	}
 }
 

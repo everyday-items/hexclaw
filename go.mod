@@ -9,6 +9,7 @@ require (
 	github.com/hexagon-codes/toolkit v0.0.6
 	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
 	github.com/spf13/cobra v1.9.1
+	go.starlark.net v0.0.0-20260613233743-8ba36ccb83fb
 	golang.org/x/sync v0.20.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.48.2
