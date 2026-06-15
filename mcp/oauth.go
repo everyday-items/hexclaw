@@ -106,13 +106,16 @@ func (m *OAuthManager) Authorize(ctx context.Context, serverName string, cfg *OA
 	port := listener.Addr().(*net.TCPAddr).Port
 	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
 
-	state, _ := generateRandomString(16)
+	state, err := generateRandomString(16)
+	if err != nil {
+		return nil, fmt.Errorf("generate OAuth state: %w", err)
+	}
 	codeCh := make(chan string, 1)
 	errCh := make(chan error, 1)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("state") != state {
+		if !oauthStateValid(state, r.URL.Query().Get("state")) {
 			errCh <- fmt.Errorf("state mismatch")
 			http.Error(w, "State mismatch", http.StatusBadRequest)
 			return
@@ -218,7 +221,7 @@ func (m *OAuthManager) tokenRequest(ctx context.Context, tokenURL string, data u
 		return nil, fmt.Errorf("failed to read token response body: %w", readErr)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token request returned %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("token request returned %d: %s", resp.StatusCode, truncateForErr(string(body), 256))
 	}
 
 	var tokenResp struct {
@@ -276,6 +279,24 @@ func generateCodeVerifier() (string, error) {
 func codeChallenge(verifier string) string {
 	h := sha256.Sum256([]byte(verifier))
 	return base64.RawURLEncoding.EncodeToString(h[:])
+}
+
+// truncateForErr caps an upstream body included in an error message so a verbose
+// OAuth-server response cannot flood logs or surface large internal payloads.
+func truncateForErr(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…(truncated)"
+}
+
+// oauthStateValid reports whether the OAuth callback's state parameter matches
+// the one we issued. An empty expected state never validates: if state
+// generation failed and left it empty, a callback carrying no state must not be
+// able to pass the CSRF guard via "" == "".
+func oauthStateValid(expected, got string) bool {
+	return expected != "" && got == expected
 }
 
 func generateRandomString(n int) (string, error) {

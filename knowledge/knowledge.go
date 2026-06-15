@@ -178,6 +178,14 @@ func WithSplitter(s hexagon.Splitter) ManagerOption {
 // repo 和 searcher 通常由同一个 SQLiteStore 实例同时实现。
 // embedder 可为 nil，此时退化为纯关键词搜索模式。
 func NewManager(repo DocumentRepository, searcher ChunkSearcher, embedder hexagon.VectorEmbedder, opts ...ManagerOption) *Manager {
+	// Fail fast: a nil repo/searcher is a programmer error that would otherwise
+	// surface as an obscure nil-deref deep inside a request.
+	if repo == nil {
+		panic("knowledge.NewManager: repo must not be nil")
+	}
+	if searcher == nil {
+		panic("knowledge.NewManager: searcher must not be nil")
+	}
 	m := &Manager{
 		repo:     repo,
 		searcher: searcher,
@@ -206,7 +214,11 @@ func (m *Manager) AddDocument(ctx context.Context, title, content, source string
 	// titled document updates it in place and refreshes UpdatedAt instead of
 	// accumulating duplicates (BUG-20260613). An empty title can't be matched
 	// reliably, so it always inserts.
-	if existing := m.findBySourceTitle(ctx, source, title); existing != nil {
+	existing, err := m.findBySourceTitle(ctx, source, title)
+	if err != nil {
+		return nil, fmt.Errorf("查询已有文档失败: %w", err)
+	}
+	if existing != nil {
 		doc := &Document{
 			ID:         existing.ID,
 			Title:      title,
@@ -250,7 +262,9 @@ func (m *Manager) AddDocument(ctx context.Context, title, content, source string
 		// the caller sees an idempotent upsert, not a raw constraint 500
 		// (BUG-20260613 review C1/C2).
 		if isUniqueConstraintErr(err) {
-			if existing := m.findBySourceTitle(ctx, source, title); existing != nil {
+			// On the race-fallback we already hold an Add error; a lookup error
+			// here cannot improve on it, so fall through to returning the original.
+			if existing, ferr := m.findBySourceTitle(ctx, source, title); ferr == nil && existing != nil {
 				doc.ID = existing.ID
 				doc.CreatedAt = existing.CreatedAt
 				rechunks, cerr := m.buildChunks(ctx, doc, now)
@@ -283,15 +297,14 @@ func isUniqueConstraintErr(err error) bool {
 // GetBySourceTitle instead of a full-table List scan (review M3). The returned
 // doc omits content, which is fine — only the ID and timestamps are reused on
 // upsert.
-func (m *Manager) findBySourceTitle(ctx context.Context, source, title string) *Document {
+func (m *Manager) findBySourceTitle(ctx context.Context, source, title string) (*Document, error) {
 	if title == "" {
-		return nil
+		return nil, nil
 	}
-	doc, err := m.repo.GetBySourceTitle(ctx, source, title)
-	if err != nil {
-		return nil
-	}
-	return doc
+	// GetBySourceTitle returns (nil, nil) on a genuine miss and (nil, err) on a
+	// real DB failure — propagate the latter so a transient error is not
+	// mistaken for "not found" (which would wrongly insert a duplicate).
+	return m.repo.GetBySourceTitle(ctx, source, title)
 }
 
 // ReindexDocument 重新切分并重建指定文档的索引

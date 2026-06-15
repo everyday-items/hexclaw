@@ -20,6 +20,7 @@ import (
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/router"
+	"github.com/hexagon-codes/hexclaw/security"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
 	"github.com/hexagon-codes/hexclaw/voice"
 	"github.com/hexagon-codes/toolkit/util/logger"
@@ -509,9 +510,9 @@ func (s *Server) installSkillFromClawHub(w http.ResponseWriter, r *http.Request,
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name":               skillName,
 		"message":            "技能已从 ClawHub 安装并已同步到运行引擎",
-			"requires_restart":   false,
-			"runtime_registered": true,
-		})
+		"requires_restart":   false,
+		"runtime_registered": true,
+	})
 }
 
 func (s *Server) findClawHubEntry(skillName string) (meta struct {
@@ -658,6 +659,15 @@ func (s *Server) installSkillFromURL(w http.ResponseWriter, r *http.Request, raw
 	if err != nil || u.Host == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "URL 格式无效",
+		})
+		return
+	}
+
+	// SSRF guard: reject loopback/private/link-local/cloud-metadata targets
+	// before any fetch, matching the provider-model path (validateExternalProviderBaseURL).
+	if err := security.ValidateURL(rawURL); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "URL 不安全: " + err.Error(),
 		})
 		return
 	}
