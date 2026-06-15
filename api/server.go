@@ -564,6 +564,7 @@ func (s *Server) routes() http.Handler {
 	// 技能市场 API
 	if s.mp != nil {
 		mux.HandleFunc("GET /api/v1/skills", s.handleListSkills)
+		mux.HandleFunc("GET /api/v1/skills/{name}/content", s.handleSkillContent)
 		mux.HandleFunc("PUT /api/v1/skills/{name}/status", s.handleSkillStatus)
 		mux.HandleFunc("POST /api/v1/skills/install", s.handleInstallSkill)
 		mux.HandleFunc("DELETE /api/v1/skills/{name}", s.handleUninstallSkill)
