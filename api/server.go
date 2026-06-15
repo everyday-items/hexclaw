@@ -35,6 +35,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/canvas"
 	"github.com/hexagon-codes/hexclaw/config"
@@ -61,7 +62,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/voice"
 	"github.com/hexagon-codes/hexclaw/voicechat"
 	"github.com/hexagon-codes/hexclaw/webhook"
-	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/toolkit/net/sse"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -1030,8 +1031,7 @@ func (s *Server) handleChatSSE(
 	},
 	start time.Time,
 ) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		trace.L(ctx).Error("[SSE] ResponseWriter 不支持 Flush — http.Server 配置异常")
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "server does not support streaming",
@@ -1039,12 +1039,10 @@ func (s *Server) handleChatSSE(
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // 关 nginx 反向代理缓冲
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
+	// sse.NewWriter sets the text/event-stream headers; the immediate Flush
+	// commits a 200 and opens the stream before the first chunk arrives.
+	writer := sse.NewWriter(w)
+	writer.Flush()
 
 	trace.L(ctx).Info("[SSE] 开始流式响应", "session", msg.SessionID, "user", msg.UserID)
 
@@ -1055,8 +1053,7 @@ func (s *Server) handleChatSSE(
 			"error": upstreamerr.PublicMessage(err, "error"),
 			"done":  true,
 		})
-		fmt.Fprintf(w, "data: %s\n\n", errPayload)
-		flusher.Flush()
+		_ = writer.WriteData(string(errPayload))
 		return
 	}
 
@@ -1076,8 +1073,7 @@ func (s *Server) handleChatSSE(
 				"error": upstreamerr.PublicMessage(chunk.Error, "error"),
 				"done":  true,
 			})
-			fmt.Fprintf(w, "data: %s\n\n", errPayload)
-			flusher.Flush()
+			_ = writer.WriteData(string(errPayload))
 			return
 		}
 
@@ -1093,13 +1089,11 @@ func (s *Server) handleChatSSE(
 			trace.L(ctx).Error("[SSE] 序列化 chunk 失败", "err", err, "chunks_so_far", chunkCount)
 			continue
 		}
-		fmt.Fprintf(w, "data: %s\n\n", payload)
-		flusher.Flush()
+		_ = writer.WriteData(string(payload))
 	}
 
 	if !hadError {
-		fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
+		_ = writer.WriteData(sse.OpenAIDoneToken)
 	}
 
 	trace.L(ctx).Info("[SSE] 流式响应结束",
