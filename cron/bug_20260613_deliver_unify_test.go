@@ -22,10 +22,25 @@ func TestBug20260613_DeliverableContentPrefersScriptData(t *testing.T) {
 		t.Errorf("script delivery must use the data field, got %q", got)
 	}
 
-	// Structured data → compact JSON, not empty.
-	gotStruct := deliverableContent(&RunResult{Data: map[string]any{"count": 3}})
-	if !strings.Contains(gotStruct, "count") {
-		t.Errorf("structured data must render to JSON, got %q", gotStruct)
+	// Structured data with a human field → deliver that field, never raw JSON.
+	gotMsg := deliverableContent(&RunResult{Data: map[string]any{
+		"title": "百度热搜 2026-06-15", "count": 20,
+		"message": "百度热搜 2026-06-15 · 收录 20 条",
+	}})
+	if gotMsg != "百度热搜 2026-06-15 · 收录 20 条" {
+		t.Errorf("structured data must deliver its message field, got %q", gotMsg)
+	}
+
+	// Structured data with only a title (no message) → fall back to the title.
+	gotTitle := deliverableContent(&RunResult{Data: map[string]any{"title": "周报 2026-06-15", "count": 7}})
+	if gotTitle != "周报 2026-06-15" {
+		t.Errorf("structured data should fall back to title, got %q", gotTitle)
+	}
+
+	// Structured data with no human field → suppressed, never a raw-JSON dump.
+	gotBare := deliverableContent(&RunResult{Data: map[string]any{"count": 3}})
+	if strings.Contains(gotBare, "{") || strings.Contains(gotBare, "count") {
+		t.Errorf("opaque structured data must not be JSON-dumped to a notification, got %q", gotBare)
 	}
 
 	// Agent job: no Data, falls back to Stdout.

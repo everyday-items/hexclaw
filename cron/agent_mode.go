@@ -340,21 +340,37 @@ func deliverableContent(result *RunResult) string {
 			if s := strings.TrimSpace(v); s != "" {
 				return s
 			}
-		default:
-			if b, err := json.Marshal(v); err == nil {
-				return string(b)
+		case map[string]any:
+			// Structured payload: deliver the script's human-facing field if it
+			// provided one. A raw object is never JSON-dumped to a notification —
+			// the structured data stays in run history, not the user's inbox.
+			if s := readableField(v); s != "" {
+				return s
 			}
 		}
 	}
-	// No structured payload. Agent jobs put readable text in Stdout; a script
-	// that produced no data leaves only its raw output-contract JSON line, which
-	// is not worth delivering — suppress it so the scheduler skips an empty,
-	// JSON-looking notification (review F3).
+	// No deliverable payload. Agent jobs put readable text in Stdout; a script
+	// that produced only its raw output-contract JSON line has nothing worth
+	// delivering — suppress it so the scheduler skips a JSON-looking notification.
 	out := strings.TrimSpace(result.Stdout)
 	if isContractJSONLine(out) {
 		return ""
 	}
 	return out
+}
+
+// readableField returns the first human-facing string field of a structured
+// script payload, so a notification shows prose instead of a raw-JSON dump.
+// Scripts opt in by emitting one of these keys in their "data" object.
+func readableField(m map[string]any) string {
+	for _, k := range []string{"message", "summary", "title", "text"} {
+		if s, ok := m[k].(string); ok {
+			if s = strings.TrimSpace(s); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 // isContractJSONLine reports whether s is a single JSON object carrying the

@@ -44,6 +44,10 @@ def collect():
 
     kb_ingest(title = doc_title, content = content, source = "cron-baidu-hotsearch")
 
-    return {"status": "success", "data": {"title": doc_title, "count": len(titles)}}
+    return {"status": "success", "data": {
+        "title": doc_title,
+        "count": len(titles),
+        "message": "%s · 收录 %d 条" % (doc_title, len(titles)),
+    }}
 
 emit(collect())

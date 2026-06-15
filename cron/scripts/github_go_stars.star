@@ -25,6 +25,10 @@ def collect():
 
     kb_ingest(title = doc_title, content = content, source = "cron-gh-stars")
 
-    return {"status": "success", "data": {"title": doc_title, "stars": stars}}
+    return {"status": "success", "data": {
+        "title": doc_title,
+        "stars": stars,
+        "message": "%s · %d stars" % (doc_title, stars),
+    }}
 
 emit(collect())
