@@ -32,6 +32,35 @@ var blockedHosts = map[string]bool{
 	"169.254.169.254":          true, // AWS/Azure/GCP metadata endpoint
 }
 
+// ValidateLocalURL permits only loopback hosts (localhost / 127.0.0.0/8 / ::1).
+//
+// Used for provider types that are local by definition (e.g. Ollama): their
+// base URL must be loopback, never an arbitrary internal address such as a
+// cloud metadata endpoint or a LAN host — which would turn a "local" provider
+// into an SSRF vector.
+func ValidateLocalURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("URL missing host")
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// A non-literal, non-localhost host could resolve anywhere — reject it.
+		return fmt.Errorf("local provider URL must be loopback, got host %q", host)
+	}
+	if ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("local provider URL must be loopback, got %q", host)
+}
+
 // ValidateURL 校验 URL 是否安全（非内网/私有 IP）
 //
 // 用于 FetchSkill、BrowserSkill 和 MCP HTTP 请求。

@@ -106,8 +106,13 @@ var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvi
 
 func validateExternalProviderBaseURL(providerType, baseURL string) error {
 	baseURL = strings.TrimSpace(baseURL)
-	if baseURL == "" || strings.EqualFold(providerType, "ollama") {
+	if baseURL == "" {
 		return nil
+	}
+	if strings.EqualFold(providerType, "ollama") {
+		// Ollama is local: constrain its base_url to loopback instead of skipping
+		// validation, so it can't be aimed at an internal/metadata address.
+		return security.ValidateLocalURL(baseURL)
 	}
 	return security.ValidateURL(baseURL)
 }
