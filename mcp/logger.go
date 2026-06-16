@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -126,6 +127,9 @@ func (l *Logger) ReadLogs(server string, limit int) ([]ToolCallLog, error) {
 }
 
 func (l *Logger) getWriter(server string) (*logWriter, error) {
+	if l.writers == nil { // closed: drop late logs instead of writing into a nil map
+		return nil, os.ErrClosed
+	}
 	if w, ok := l.writers[server]; ok {
 		return w, nil
 	}
@@ -163,7 +167,8 @@ func (l *Logger) rotate(w *logWriter) {
 	// Reopen fresh log file
 	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		delete(l.writers, filepath.Base(w.path))
+		// Evict by the real map key (bare server name), not the file base name.
+		delete(l.writers, strings.TrimSuffix(filepath.Base(w.path), ".log"))
 		return
 	}
 	w.file = f
