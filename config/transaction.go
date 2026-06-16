@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"sync"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/hexagon-codes/hexclaw/featureflag"
 )
 
@@ -207,13 +209,25 @@ func (t *Transaction) Snapshot() *Config {
 	return cloneConfig(t.snapshot)
 }
 
-// cloneConfig 浅克隆 *Config（足够事务边界使用 —— 内部嵌套 map / slice 由 Validator
-// 决定是否需要深克隆；当前的 Config 字段都是 value type 或 immutable map）。
+// cloneConfig deep-clones *Config so a transaction snapshot is fully isolated:
+// Config has many nested maps/slices (LLM.Providers, Features, Platforms.*,
+// Metadata, ...) that a struct copy would alias, letting a mutation of the
+// snapshot corrupt the live config and defeat rollback. A YAML round-trip is a
+// complete deep copy that stays correct as new config fields are added.
 func cloneConfig(c *Config) *Config {
 	if c == nil {
 		return nil
 	}
-	out := *c
+	data, err := yaml.Marshal(c)
+	if err != nil {
+		out := *c // marshal of a plain config should not fail; degrade gracefully
+		return &out
+	}
+	var out Config
+	if err := yaml.Unmarshal(data, &out); err != nil {
+		shallow := *c
+		return &shallow
+	}
 	return &out
 }
 

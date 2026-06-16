@@ -473,6 +473,7 @@ type WhatsAppConfig struct {
 	Token       string `yaml:"token" json:"token"`
 	PhoneID     string `yaml:"phone_id" json:"phone_id"`
 	VerifyToken string `yaml:"verify_token" json:"verify_token,omitempty"`
+	AppSecret   string `yaml:"app_secret" json:"app_secret,omitempty"` // Meta App Secret，校验 webhook 签名
 }
 
 // LINEConfig LINE Messaging API 配置
