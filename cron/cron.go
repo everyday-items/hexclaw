@@ -662,7 +662,7 @@ func (s *Scheduler) ResumeJob(ctx context.Context, jobID string) error {
 // ListJobs 列出所有任务
 func (s *Scheduler) ListJobs(ctx context.Context, userID string) ([]*Job, error) {
 	query := `SELECT id, name, type, schedule, spec_json, source_prompt, user_id, platform, chat_id, status,
-	          last_run_at, next_run_at, run_count, created_at
+	          last_run_at, next_run_at, run_count, created_at, meta
 	          FROM cron_jobs WHERE user_id = ? ORDER BY next_run_at`
 	rows, err := s.db.QueryContext(ctx, query, userID)
 	if err != nil {
@@ -694,14 +694,18 @@ func scanJobRow(row interface {
 		specJSON  sql.NullString
 		srcPrompt sql.NullString
 		lastRun   sql.NullTime
+		meta      sql.NullString
 	)
 	if err := row.Scan(
 		&job.ID, &job.Name, &job.Type, &job.Schedule,
 		&specJSON, &srcPrompt,
 		&job.UserID, &job.Platform, &job.ChatID, &job.Status,
-		&lastRun, &job.NextRunAt, &job.RunCount, &job.CreatedAt,
+		&lastRun, &job.NextRunAt, &job.RunCount, &job.CreatedAt, &meta,
 	); err != nil {
 		return nil, err
+	}
+	if meta.Valid {
+		parseJobMeta(job, meta.String) // restore Deliver and other extended metadata
 	}
 	if lastRun.Valid {
 		job.LastRunAt = lastRun.Time
@@ -1062,7 +1066,7 @@ func (s *Scheduler) executeJob(job *Job) {
 func (s *Scheduler) loadJobs(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, name, type, schedule, spec_json, source_prompt, user_id, platform, chat_id, status,
-		 last_run_at, next_run_at, run_count, created_at
+		 last_run_at, next_run_at, run_count, created_at, meta
 		 FROM cron_jobs WHERE status = 'active'`)
 	if err != nil {
 		return err
@@ -1117,7 +1121,9 @@ func nextRunTime(schedule string, jobType JobType, from time.Time) (time.Time, e
 		next := time.Date(from.Year(), from.Month(), from.Day()+1, 0, 0, 0, 0, from.Location())
 		return next, nil
 	case "@hourly":
-		next := from.Truncate(time.Hour).Add(time.Hour)
+		// Local top-of-hour (time.Date avoids Truncate's UTC alignment, which
+		// fires at HH:30 in half-hour-offset zones).
+		next := time.Date(from.Year(), from.Month(), from.Day(), from.Hour()+1, 0, 0, 0, from.Location())
 		return next, nil
 	case "@weekly":
 		// 下周一本地时间 00:00
@@ -1206,7 +1212,12 @@ func parseCron5(expr string, from time.Time) (time.Time, error) {
 		dayMatch := day == -1 || candidate.Day() == day
 		monthMatch := month == -1 || int(candidate.Month()) == month
 		dowMatch := dow == -1 || int(candidate.Weekday()) == dow
-		if minMatch && hourMatch && dayMatch && monthMatch && dowMatch {
+		// POSIX: when both day-of-month and day-of-week are restricted, match on OR.
+		dayDowMatch := dayMatch && dowMatch
+		if day != -1 && dow != -1 {
+			dayDowMatch = candidate.Day() == day || int(candidate.Weekday()) == dow
+		}
+		if minMatch && hourMatch && dayDowMatch && monthMatch {
 			return candidate, nil
 		}
 		candidate = candidate.Add(time.Minute)
