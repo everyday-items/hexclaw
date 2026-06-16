@@ -330,9 +330,16 @@ func (m *Manager) Send(ctx context.Context, target, chatID string, reply *adapte
 	m.mu.RLock()
 	adp := m.running[target]
 	if adp == nil {
-		for name, a := range m.running {
+		// Deterministic pick by instance name; several instances can share a
+		// provider, and map iteration order would otherwise route to a random one.
+		names := make([]string, 0, len(m.running))
+		for name := range m.running {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
 			if md, ok := m.metadata[name]; ok && md.Provider == target {
-				adp = a
+				adp = m.running[name]
 				break
 			}
 		}
@@ -450,6 +457,12 @@ func (m *Manager) wrapHandler(inst *Instance, next adapter.MessageHandler) adapt
 		_ = m.touchEvent(ctx, inst.Name)
 		reply, err := next(ctx, msg)
 		if err != nil {
+			// The dedup marker is provisional: a transient failure must release it
+			// so the platform's redelivery of the same event_id can be retried
+			// instead of being silently dropped.
+			if msg.ID != "" {
+				_ = m.deleteEvent(ctx, inst.Name, msg.ID)
+			}
 			_ = m.setStatus(ctx, inst.Name, StatusError, err.Error())
 			return nil, err
 		}
@@ -471,6 +484,14 @@ func (m *Manager) recordEvent(ctx context.Context, instanceName, eventID string)
 		return true, nil
 	}
 	return false, err
+}
+
+func (m *Manager) deleteEvent(ctx context.Context, instanceName, eventID string) error {
+	_, err := m.db.ExecContext(ctx,
+		`DELETE FROM platform_events WHERE instance_name = ? AND event_id = ?`,
+		instanceName, eventID,
+	)
+	return err
 }
 
 func (m *Manager) touchEvent(ctx context.Context, name string) error {
@@ -635,6 +656,7 @@ func BuildAdapter(inst *Instance) (adapter.Adapter, error) {
 			Token:       cfg.Token,
 			PhoneID:     cfg.PhoneID,
 			VerifyToken: cfg.VerifyToken,
+			AppSecret:   cfg.AppSecret,
 		}), nil
 	case "matrix":
 		var cfg config.MatrixConfig
