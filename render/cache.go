@@ -163,13 +163,18 @@ func (c *Cache) Put(key string, srcPath string) (string, error) {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	_, existed := c.entries[key]
 	c.entries[key] = &cacheEntry{
 		Path:       dst,
 		Size:       stat.Size(),
 		AccessedAt: time.Now(),
 		CreatedAt:  time.Now(),
 	}
-	c.order = append(c.order, key)
+	if existed {
+		c.touchLocked(key) // move to MRU, keep order a permutation of entries
+	} else {
+		c.order = append(c.order, key)
+	}
 	c.evictIfOverLimitLocked()
 	return dst, nil
 }

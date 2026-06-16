@@ -125,6 +125,9 @@ func (r *PandocRenderer) Render(ctx context.Context, content string, format Form
 		if stat, err = os.Stat(tempPath); err != nil {
 			return nil, &RenderError{Code: CodeRenderFailed, Format: format, Detail: err.Error()}
 		}
+		if stat.Size() > MaxOutputBytes { // re-check: rezip may have grown the file
+			return nil, &RenderError{Code: CodeOutputTooLarge, Format: format}
+		}
 	}
 
 	cleanupOnError = false
