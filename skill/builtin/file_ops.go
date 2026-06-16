@@ -86,7 +86,9 @@ func (s *FileOpsSkill) safePath(relPath string) (string, error) {
 	}
 	if err == nil {
 		wsResolved, _ := filepath.EvalSymlinks(s.workspace)
-		if !strings.HasPrefix(resolved, wsResolved) {
+		// Require a separator boundary so a sibling like "/x/ws-evil" is not
+		// accepted as inside "/x/ws".
+		if resolved != wsResolved && !strings.HasPrefix(resolved, wsResolved+string(filepath.Separator)) {
 			return "", fmt.Errorf("path escapes workspace (symlink?)")
 		}
 	}

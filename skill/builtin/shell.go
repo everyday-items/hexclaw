@@ -186,6 +186,22 @@ var dangerousSubcommands = map[string][]string{
 	},
 }
 
+// findDangerousFlags 是 find 的 action primaries：可执行任意命令、删改文件，
+// 即使 find 在白名单也必须拦截。
+var findDangerousFlags = map[string]bool{
+	"-exec": true, "-execdir": true, "-ok": true, "-okdir": true,
+	"-delete": true, "-fprintf": true, "-fls": true, "-fprint": true, "-fprint0": true,
+}
+
+func checkFindFlags(segment string) string {
+	for _, tok := range strings.Fields(segment) {
+		if findDangerousFlags[tok] {
+			return fmt.Sprintf("find %s 被禁止（可执行命令或删改文件）", tok)
+		}
+	}
+	return ""
+}
+
 // checkAllowed 白名单安全检查
 //
 // 只允许白名单中的命令，拒绝所有其他命令。
@@ -214,6 +230,11 @@ func checkAllowed(command string) string {
 		}
 		if !allowedCommands[cmd] {
 			return fmt.Sprintf("命令 %q 不在白名单中", cmd)
+		}
+		if cmd == "find" {
+			if reason := checkFindFlags(seg); reason != "" {
+				return reason
+			}
 		}
 		// 检查子命令限制
 		if blocked, ok := dangerousSubcommands[cmd]; ok {
