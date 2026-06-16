@@ -17,6 +17,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
@@ -440,7 +441,7 @@ func (a *WecomAdapter) checkSignature(msgSignature, timestamp, nonce, encrypt st
 	hash := sha1.Sum([]byte(combined))
 	expected := fmt.Sprintf("%x", hash)
 
-	return expected == msgSignature
+	return hmac.Equal([]byte(expected), []byte(msgSignature))
 }
 
 // decrypt 解密消息

@@ -313,7 +313,7 @@ func (c *imapClient) Select(folder string) error {
 }
 
 func (c *imapClient) MarkSeen(id string) error {
-	return c.runSimple("STORE %s +FLAGS (\\\\Seen)", id)
+	return c.runSimple("STORE %s +FLAGS (\\Seen)", id)
 }
 
 func (c *imapClient) Logout() error {

@@ -11,6 +11,9 @@ package whatsapp
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"github.com/hexagon-codes/toolkit/util/logger"
@@ -39,6 +42,7 @@ type Config struct {
 	Token       string `yaml:"token"`        // WhatsApp Cloud API Token
 	PhoneID     string `yaml:"phone_id"`     // 电话号码 ID
 	VerifyToken string `yaml:"verify_token"` // Webhook 验证 Token
+	AppSecret   string `yaml:"app_secret"`   // Meta App Secret，用于校验 X-Hub-Signature-256
 	WebhookPort int    `yaml:"webhook_port"` // Webhook 监听端口，默认 6063
 	BaseURL     string `yaml:"base_url"`     // API 基础 URL
 }
@@ -198,8 +202,20 @@ func (a *WhatsAppAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Verify Meta's X-Hub-Signature-256 (HMAC-SHA256 over the raw body) before
+	// trusting the payload — same posture as the Slack/LINE/wecom adapters.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+	if a.config.AppSecret != "" && !a.verifySignature(r, body) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	var payload whatsappWebhook
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
@@ -245,6 +261,19 @@ func (a *WhatsAppAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 	}
+}
+
+// verifySignature 校验 Meta 的 X-Hub-Signature-256（HMAC-SHA256 over raw body）。
+func (a *WhatsAppAdapter) verifySignature(r *http.Request, body []byte) bool {
+	const prefix = "sha256="
+	sig := r.Header.Get("X-Hub-Signature-256")
+	if !strings.HasPrefix(sig, prefix) {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(a.config.AppSecret))
+	mac.Write(body)
+	expected := hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(strings.TrimPrefix(sig, prefix)), []byte(expected))
 }
 
 // getContactName 从联系人列表中获取用户名

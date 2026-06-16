@@ -18,6 +18,7 @@ package wechat
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/json"
 	"encoding/xml"
@@ -294,7 +295,7 @@ func (a *WechatAdapter) checkSignature(signature, timestamp, nonce string) bool 
 	hash := sha1.Sum([]byte(combined))
 	expected := fmt.Sprintf("%x", hash)
 
-	return expected == signature
+	return hmac.Equal([]byte(expected), []byte(signature))
 }
 
 // ============== API 调用 ==============
