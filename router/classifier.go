@@ -201,6 +201,10 @@ func (c *LLMClassifier) classify_with_cache(ctx context.Context, agents map[stri
 	for name := range agents {
 		agentNames = append(agentNames, name)
 	}
+	// Sort for a deterministic key: Go map iteration order is random, so an
+	// unsorted name list made the cache key vary across identical requests and
+	// the LLM classifier cache almost never hit (re-billing every route).
+	sort.Strings(agentNames)
 	cacheKey := fmt.Sprintf("%v:%s", agentNames, msgKey)
 
 	// 查缓存
