@@ -91,6 +91,19 @@ func New() *Dispatcher {
 	}
 }
 
+// smallestAgentName returns the lexicographically smallest registered agent
+// name (or "" when none exist). Auto-selecting a default agent uses this so the
+// choice is deterministic instead of dependent on Go's random map iteration.
+func smallestAgentName(agents map[string]*AgentConfig) string {
+	best := ""
+	for n := range agents {
+		if best == "" || n < best {
+			best = n
+		}
+	}
+	return best
+}
+
 // Register 注册 Agent
 func (r *Dispatcher) Register(cfg AgentConfig) error {
 	if cfg.Name == "" {
@@ -135,13 +148,9 @@ func (r *Dispatcher) Unregister(name string) error {
 	}
 	r.rules = filtered
 
-	// 如果删除的是默认 Agent，重新选择
+	// 如果删除的是默认 Agent，重新选择一个确定的默认值
 	if r.defaultAgent == name {
-		r.defaultAgent = ""
-		for n := range r.agents {
-			r.defaultAgent = n
-			break
-		}
+		r.defaultAgent = smallestAgentName(r.agents)
 	}
 
 	return nil
@@ -224,11 +233,8 @@ func (r *Dispatcher) LoadAll(agents []AgentConfig, defaultAgent string, rules []
 			r.defaultAgent = defaultAgent
 		}
 	}
-	if r.defaultAgent == "" && len(r.agents) > 0 {
-		for n := range r.agents {
-			r.defaultAgent = n
-			break
-		}
+	if r.defaultAgent == "" {
+		r.defaultAgent = smallestAgentName(r.agents)
 	}
 	logger.Info("Agent 路由已加载", "agents", len(r.agents), "len", len(r.rules), "default", r.defaultAgent)
 }

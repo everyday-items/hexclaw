@@ -93,15 +93,20 @@ func New(cfg config.LLMConfig) (*Selector, error) {
 // pickFallbackDefault 当配置 default 缺失时挑一个合理的 fallback。
 // 偏好远端 provider（避免桌面端 Ollama 在没安装时尝试连）。
 func pickFallbackDefault(providers map[string]hexagon.Provider) string {
-	// 第一遍：偏好远端 (非 ollama 名)
+	names := make([]string, 0, len(providers))
 	for name := range providers {
+		names = append(names, name)
+	}
+	sort.Strings(names) // deterministic: pick the smallest qualifying name, not a random one
+	// 第一遍：偏好远端 (非 ollama 名)
+	for _, name := range names {
 		if !strings.Contains(strings.ToLower(name), "ollama") {
 			return name
 		}
 	}
 	// 第二遍：只剩 ollama 兜底
-	for name := range providers {
-		return name
+	if len(names) > 0 {
+		return names[0]
 	}
 	return ""
 }
@@ -127,10 +132,7 @@ func NewWithProviders(cfg config.LLMConfig, providers map[string]hexagon.Provide
 		r.providers[name] = provider
 	}
 	if _, ok := r.providers[r.defaultP]; !ok {
-		for name := range r.providers {
-			r.defaultP = name
-			break
-		}
+		r.defaultP = pickFallbackDefault(r.providers)
 	}
 	return r
 }
@@ -143,6 +145,18 @@ var localHostMarkers = []string{
 	"localhost", "127.0.0.1", "::1", "0.0.0.0",
 	"host.docker.internal", "host.containers.internal",
 	"//ollama", ".local",
+}
+
+// isLocalProviderName reports whether a provider should rank last in fallback.
+// It honors the configured base URL and, for providers assembled without a
+// matching cfg entry (NewWithProviders), the name — keeping the local/remote
+// classification consistent with pickFallbackDefault's ollama heuristic so an
+// injected local provider can't win over a real remote one.
+func (r *Selector) isLocalProviderName(name string) bool {
+	if isLocalProvider(r.cfg.Providers[name]) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(name), "ollama")
 }
 
 // isLocalProvider 检查 provider 是否为本地部署（如 Ollama），本地 provider 不需要 API Key
@@ -367,7 +381,10 @@ func (r *Selector) selectByPriority(priorities map[string]int) string {
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].priority < candidates[j].priority
+		if candidates[i].priority != candidates[j].priority {
+			return candidates[i].priority < candidates[j].priority
+		}
+		return candidates[i].name < candidates[j].name // stable tie-break
 	})
 
 	return candidates[0].name
@@ -395,7 +412,7 @@ func (r *Selector) Fallback(exclude ...string) (hexagon.Provider, string, error)
 		if excludeSet[name] {
 			continue
 		}
-		if isLocalProvider(r.cfg.Providers[name]) {
+		if r.isLocalProviderName(name) {
 			local = append(local, name)
 		} else {
 			remote = append(remote, name)

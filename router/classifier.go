@@ -105,7 +105,12 @@ func (r *Dispatcher) RouteWithFallback(ctx context.Context, req RouteRequest, me
 	// 2. LLM 语义路由（仅在有 classifier 且 Agent >= 2 时触发）
 	r.mu.RLock()
 	classifier := r.classifier
-	agents := r.agents
+	// Snapshot under the lock: the classifier iterates this map after we release,
+	// while Register/Unregister mutate the shared map concurrently.
+	agents := make(map[string]*AgentConfig, len(r.agents))
+	for k, v := range r.agents {
+		agents[k] = v
+	}
 	defaultName := r.defaultAgent
 	r.mu.RUnlock()
 
@@ -261,18 +266,33 @@ func parseClassifyResult(raw string, agents map[string]*AgentConfig) (string, fl
 		}
 	}
 
-	// 降级：纯文本匹配
+	// Fallback over a sorted name list so overlapping agents resolve the same
+	// way on every call instead of following Go's random map iteration order.
+	names := make([]string, 0, len(agents))
 	for name := range agents {
-		if strings.EqualFold(strings.TrimSpace(raw), name) {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	// 降级：纯文本精确匹配（忽略大小写）
+	trimmed := strings.TrimSpace(raw)
+	for _, name := range names {
+		if strings.EqualFold(trimmed, name) {
 			return name, 0.8
 		}
 	}
 
-	// 模糊匹配：检查返回文本是否包含某个 agent name
-	for name := range agents {
-		if strings.Contains(strings.ToLower(raw), strings.ToLower(name)) {
-			return name, 0.6
+	// 模糊匹配：返回被包含的最长（最具体）名字，避免 "research" 抢在
+	// "research-bot" 之前；长度相同则取排序靠前者，结果稳定。
+	lowerRaw := strings.ToLower(raw)
+	best := ""
+	for _, name := range names {
+		if len(name) > len(best) && strings.Contains(lowerRaw, strings.ToLower(name)) {
+			best = name
 		}
+	}
+	if best != "" {
+		return best, 0.6
 	}
 
 	return raw, 0.3
@@ -284,7 +304,14 @@ func buildClassifierPrompt(agents map[string]*AgentConfig) string {
 	sb.WriteString("返回 JSON 格式: {\"agent\":\"agent_name\",\"confidence\":0.85}\n")
 	sb.WriteString("confidence 范围 0-1，表示你对选择的确信程度。\n\n")
 	sb.WriteString("可选 Agent 列表：\n")
-	for _, a := range agents {
+	// Sort by name so the prompt (and the classifier cache keyed on it) is stable.
+	names := make([]string, 0, len(agents))
+	for name := range agents {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		a := agents[name]
 		sb.WriteString(fmt.Sprintf("- name=%q", a.Name))
 		if a.Description != "" {
 			sb.WriteString(fmt.Sprintf("  描述: %s", a.Description))
