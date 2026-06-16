@@ -119,6 +119,14 @@ func splitIndexes(messages []llm.Message) (systemEnd, keepStart int) {
 		keepStart = systemEnd
 	}
 
+	// Don't start the retained segment on an orphan tool result: walk back so its
+	// assistant tool_call stays paired with it (the old segment is flattened into
+	// a summary, so a tool result there is harmless, but one with no preceding
+	// tool_call in the rebuilt messages makes the chat API 400).
+	for keepStart > systemEnd && messages[keepStart].Role == "tool" {
+		keepStart--
+	}
+
 	return
 }
 

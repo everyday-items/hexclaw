@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/hexagon-codes/toolkit/util/logger"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -354,9 +355,14 @@ func summarizeArgs(args map[string]any) string {
 	if len(args) == 0 {
 		return ""
 	}
-	var parts []string
-	for k, v := range args {
-		s := fmt.Sprintf("%v", v)
+	keys := make([]string, 0, len(args))
+	for k := range args {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // stable, reproducible audit/approval line regardless of map order
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		s := fmt.Sprintf("%v", args[k])
 		if len(s) > 50 {
 			s = s[:47] + "..."
 		}

@@ -1606,8 +1606,15 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 		// context. Gated on tool context so plain empty responses (e.g. system
 		// dispatch) aren't double-called.
 		recovered := ""
-		if messagesHaveToolResult(req.Messages) {
-			if r, ok := e.recoverReasoningOnly(ctx, provider, req); ok {
+		// Gate on this turn's tool activity: on the live stream path req.Messages
+		// never carries the tool result (the runtime keeps the transcript
+		// internally), so reconstruct it for the retry from result.ToolCalls.
+		retryReq := req
+		if len(result.ToolCalls) > 0 {
+			retryReq.Messages = appendToolTranscript(req.Messages, result.ToolCalls)
+		}
+		if len(result.ToolCalls) > 0 || messagesHaveToolResult(req.Messages) {
+			if r, ok := e.recoverReasoningOnly(ctx, provider, retryReq); ok {
 				recovered = r
 			}
 		}
@@ -2542,6 +2549,28 @@ func messagesHaveToolResult(msgs []hexagon.Message) bool {
 		}
 	}
 	return false
+}
+
+// appendToolTranscript reconstructs this turn's assistant tool_call + tool
+// result messages from the runtime result and appends them to msgs, so a
+// follow-up completion (the empty-after-tool retry) can see the tool outputs the
+// runtime kept in its own state rather than in the caller's request messages.
+func appendToolTranscript(msgs []hexagon.Message, calls []hruntime.ToolCallRecord) []hexagon.Message {
+	refs := make([]llm.ToolCallRef, 0, len(calls))
+	for _, c := range calls {
+		refs = append(refs, llm.ToolCallRef{ID: c.ID, Name: c.Name, Arguments: c.Arguments})
+	}
+	out := make([]hexagon.Message, 0, len(msgs)+1+len(calls))
+	out = append(out, msgs...)
+	out = append(out, llm.AssistantToolCallMessage("", refs))
+	for _, c := range calls {
+		content := c.Result.Content
+		if content == "" && c.Result.Error != "" {
+			content = "Error: " + c.Result.Error
+		}
+		out = append(out, llm.ToolResultMessage(c.ID, content))
+	}
+	return out
 }
 
 func (e *ReActEngine) recoverReasoningOnly(ctx context.Context, provider hexagon.Provider, req hexagon.CompletionRequest) (string, bool) {
