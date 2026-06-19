@@ -2,14 +2,12 @@ package gateway
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"strings"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/toolkit/crypto/sign"
 )
 
 // AuthLayer 身份认证层 (Layer 1)
@@ -118,11 +116,8 @@ func (l *AuthLayer) validateToken(token string) bool {
 			return false
 		}
 
-		// 验证 HMAC-SHA256 签名
-		mac := hmac.New(sha256.New, []byte(l.cfg.Secret))
-		mac.Write([]byte(timestamp))
-		expected := hex.EncodeToString(mac.Sum(nil))
-		return hmac.Equal([]byte(signature), []byte(expected))
+		// 验证 HMAC-SHA256 签名（复用 toolkit/crypto/sign，含常量时间比较）
+		return sign.VerifyHMACSHA256Hex([]byte(timestamp), []byte(l.cfg.Secret), signature)
 	}
 
 	// 无任何认证配置，拒绝所有请求

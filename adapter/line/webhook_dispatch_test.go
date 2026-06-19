@@ -56,10 +56,15 @@ func TestHandleWebhook_RejectsInvalidSignature(t *testing.T) {
 }
 
 func TestHandleWebhook_BadJSONReturns400(t *testing.T) {
-	// No ChannelSecret configured, so the signature gate is skipped.
-	a := New(Config{})
+	// W3-13 起签名闸门强制 fail-closed：配置密钥并对（畸形）body 签名，
+	// 穿过闸门后由 JSON 解析判定 400，而非被签名校验拦在前面。
+	const secret = "shhh"
+	a := New(Config{ChannelSecret: secret})
+	body := "{bad"
+	r := httptest.NewRequest(http.MethodPost, "/wh", strings.NewReader(body))
+	r.Header.Set("X-Line-Signature", lineSign(secret, []byte(body)))
 	w := httptest.NewRecorder()
-	a.handleWebhook(w, httptest.NewRequest(http.MethodPost, "/wh", strings.NewReader("{bad")))
+	a.handleWebhook(w, r)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("malformed body = %d, want 400", w.Code)
 	}
@@ -96,14 +101,17 @@ func TestHandleWebhook_ValidSignatureDispatchesText(t *testing.T) {
 }
 
 func TestHandleWebhook_IgnoresNonTextEvent(t *testing.T) {
-	a := New(Config{})
+	const secret = "shhh"
+	a := New(Config{ChannelSecret: secret})
 	handler, sink := lineMsgSink()
 	_ = a.Attach(handler)
 
 	body := `{"events":[{"type":"message","source":{"type":"user","userId":"U1"},` +
 		`"message":{"type":"sticker","id":"s1"}}]}`
+	r := httptest.NewRequest(http.MethodPost, "/wh", strings.NewReader(body))
+	r.Header.Set("X-Line-Signature", lineSign(secret, []byte(body)))
 	w := httptest.NewRecorder()
-	a.handleWebhook(w, httptest.NewRequest(http.MethodPost, "/wh", strings.NewReader(body)))
+	a.handleWebhook(w, r)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)

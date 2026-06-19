@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/ai-core/llm"
-	"github.com/hexagon-codes/hexclaw/security"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/toolkit/net/httpx"
+	"github.com/hexagon-codes/toolkit/net/ssrf"
 )
 
 // BrowserSkill 网页浏览技能
@@ -98,7 +98,7 @@ func (s *BrowserSkill) Execute(ctx context.Context, args map[string]any) (*skill
 		return nil, fmt.Errorf("缺少 url 参数")
 	}
 
-	// (security.ValidateURL 已在下方统一校验)
+	// (ssrf.ValidateURL 已在下方统一校验)
 
 	// 验证 URL
 	parsed, err := url.Parse(targetURL)
@@ -108,7 +108,7 @@ func (s *BrowserSkill) Execute(ctx context.Context, args map[string]any) (*skill
 
 	// SSRF 防护：使用集中校验 (security/ssrf.go) + 原有 isPrivateHost 兜底
 	if !s.allowPrivate {
-		if err := security.ValidateURL(targetURL); err != nil {
+		if err := ssrf.ValidateURL(targetURL); err != nil {
 			return nil, fmt.Errorf("禁止访问内网地址: %s", parsed.Hostname())
 		}
 		if isPrivateHost(parsed.Hostname()) {

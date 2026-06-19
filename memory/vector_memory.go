@@ -2,7 +2,6 @@ package memory
 
 import (
 	"context"
-	"crypto/rand"
 	"fmt"
 	"sort"
 	"strings"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/toolkit/util/idgen"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
@@ -366,12 +366,8 @@ func (sc *SessionContext) Clear() {
 	sc.turns = 0
 }
 
-// generateMemoryID 生成唯一记忆 ID
+// generateMemoryID 生成唯一记忆 ID（mem_ 前缀 + NanoID）
+// 复用 toolkit 的 NanoID（内部 crypto/rand，熵源失败时 panic），替代手写 rand.Read。
 func generateMemoryID() string {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		// crypto/rand 在正常系统上不会失败，panic 是合理的
-		panic(fmt.Sprintf("crypto/rand.Read failed: %v", err))
-	}
-	return fmt.Sprintf("mem_%x", b)
+	return "mem_" + idgen.NanoID()
 }

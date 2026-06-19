@@ -8,8 +8,8 @@ import (
 	"sync"
 
 	"github.com/hexagon-codes/ai-core/llm"
-	"github.com/hexagon-codes/hexclaw/sandbox"
 	"github.com/hexagon-codes/hexclaw/skill"
+	"github.com/hexagon-codes/toolkit/os/sandbox"
 )
 
 // CodeExecSkill 代码执行工具

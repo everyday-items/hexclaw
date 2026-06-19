@@ -20,7 +20,7 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
-	"github.com/hexagon-codes/hexclaw/trace"
+	"github.com/hexagon-codes/hexagon/observe/trace"
 )
 
 // ReliabilityLevel 模型对 tool_call 的支持可靠度。

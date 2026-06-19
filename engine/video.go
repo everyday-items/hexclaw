@@ -11,8 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hexagon-codes/ai-core/llm"
-	"github.com/hexagon-codes/hexagon"
+	mediavid "github.com/hexagon-codes/ai-core/media/video"
 )
 
 // videoModelPrefixes 已知的视频生成模型前缀（API 调用方的兼容回退）
@@ -43,63 +42,38 @@ func isVideoGeneration(model string, metadata map[string]string) bool {
 // videoTaskPollInterval 轮询间隔
 const videoTaskPollInterval = 10 * time.Second
 
-// generateVideo 通过 VideoProvider 接口提交任务并轮询到完成
+// generateVideo 通过 ai-core/media 的视频服务提交任务并轮询到完成。
 //
-// 返回视频 URL、封面 data URI。封面图下载失败时 coverDataURI 为空。
-func generateVideo(ctx context.Context, provider hexagon.Provider, model, prompt string) (videoURL, coverDataURI string, err error) {
-	vidProvider, ok := provider.(llm.VideoProvider)
-	if !ok {
-		return "", "", fmt.Errorf("provider %s 不支持视频生成", provider.Name())
+// media 视频服务按 model 路由 Provider，SubmitAndWait 内部以 Submit→Poll
+// （media.WaitFor 同步包装）轮询到终态。返回视频 URL、封面 data URI；
+// 封面图下载失败时 coverDataURI 为空。
+func generateVideo(ctx context.Context, svc *mediavid.Service, model, prompt string) (videoURL, coverDataURI string, err error) {
+	if svc == nil || !svc.HasProvider() {
+		return "", "", fmt.Errorf("未配置视频生成服务（model=%s）", model)
 	}
 
-	// 1. 提交任务
-	task, err := vidProvider.CreateVideoTask(ctx, llm.VideoRequest{
-		Model:  model,
-		Prompt: prompt,
-	})
+	st, err := svc.SubmitAndWait(ctx, "", mediavid.Request{Model: model, Prompt: prompt}, videoTaskPollInterval)
 	if err != nil {
-		return "", "", fmt.Errorf("提交视频任务失败: %w", err)
+		return "", "", fmt.Errorf("视频生成失败: %w", err)
+	}
+	if st.Status == "failed" || st.Error != "" {
+		errMsg := st.Error
+		if errMsg == "" {
+			errMsg = "未知错误"
+		}
+		return "", "", fmt.Errorf("视频生成失败: %s", errMsg)
+	}
+	if st.VideoURL == "" {
+		return "", "", fmt.Errorf("视频任务已完成但未返回视频地址")
 	}
 
-	// 2. 轮询直到完成或失败
-	//    先检查初始状态（任务可能立即失败），再进入定时轮询。
-	ticker := time.NewTicker(videoTaskPollInterval)
-	defer ticker.Stop()
-
-	for {
-		// 检查当前 task 状态
-		switch task.Status {
-		case llm.VideoTaskCompleted:
-			if task.VideoURL == "" {
-				return "", "", fmt.Errorf("视频任务已完成但未返回视频地址")
-			}
-			// 下载封面图为 data URI（失败不阻塞）
-			if task.CoverURL != "" {
-				if uri, dlErr := downloadAsDataURI(ctx, task.CoverURL); dlErr == nil {
-					coverDataURI = uri
-				}
-			}
-			return task.VideoURL, coverDataURI, nil
-
-		case llm.VideoTaskFailed:
-			errMsg := task.Error
-			if errMsg == "" {
-				errMsg = "未知错误"
-			}
-			return "", "", fmt.Errorf("视频生成失败: %s", errMsg)
-		}
-
-		// queued / processing → 等待下一次轮询
-		select {
-		case <-ctx.Done():
-			return "", "", ctx.Err()
-		case <-ticker.C:
-			task, err = vidProvider.QueryVideoTask(ctx, task.ID)
-			if err != nil {
-				return "", "", fmt.Errorf("查询视频任务失败: %w", err)
-			}
+	// 下载封面图为 data URI（失败不阻塞）
+	if st.CoverURL != "" {
+		if uri, dlErr := downloadAsDataURI(ctx, st.CoverURL); dlErr == nil {
+			coverDataURI = uri
 		}
 	}
+	return st.VideoURL, coverDataURI, nil
 }
 
 // formatVideoMarkdown 将视频结果格式化为 Markdown

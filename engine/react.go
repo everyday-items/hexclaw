@@ -13,11 +13,14 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/ai-core/llm/cache"
+	mediaimg "github.com/hexagon-codes/ai-core/media/image"
+	mediavid "github.com/hexagon-codes/ai-core/media/video"
 	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	hruntime "github.com/hexagon-codes/hexagon/runtime"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/agents"
-	"github.com/hexagon-codes/hexclaw/cache"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/knowledge"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
@@ -26,7 +29,6 @@ import (
 	"github.com/hexagon-codes/hexclaw/session"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/storage"
-	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
@@ -123,7 +125,7 @@ type ReActEngine struct {
 	sessions    *session.Manager
 	skills      *skill.DefaultRegistry
 	store       storage.Store
-	cache       *cache.Cache
+	cache       *cache.SemanticCache
 	kb          *knowledge.Manager   // 知识库管理器（可为 nil）
 	compactor   *session.Compactor   // 上下文压缩器
 	fileMem     *memory.FileMemory   // 文件记忆系统（可为 nil）
@@ -151,6 +153,23 @@ type ReActEngine struct {
 	// 主流式循环创建 LLMCallContext 时自动透传到 fc.Middlewares。
 	// flag model.gateway.v1 OFF 时 Chain 自动 no-op，无需在此判断。
 	defaultLLMMiddlewares []ProviderMiddleware
+
+	// 媒体生成服务（图片/视频）走 ai-core/media 子域（路线图 §12 risk#5：
+	// 媒体作为独立内聚包，不再经 LLM Provider 的能力接口）。由 cmd/hexclaw
+	// 启动时通过 SetMediaServices 注入；nil 表示未配置该能力。
+	imageSvc *mediaimg.Service
+	videoSvc *mediavid.Service
+}
+
+// SetMediaServices 注入图片/视频生成服务（ai-core/media）。
+//
+// 在 cmd/hexclaw 启动及配置热加载时调用。任一为 nil 表示该媒体能力未配置，
+// 对应的生成请求会返回明确错误。
+func (e *ReActEngine) SetMediaServices(img *mediaimg.Service, vid *mediavid.Service) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.imageSvc = img
+	e.videoSvc = vid
 }
 
 // SetDefaultLLMMiddlewares 注入默认 ProviderMiddleware 链（v0.4.0 H8）。
@@ -215,40 +234,6 @@ func (p *modelOverrideProvider) CountTokens(messages []llm.Message) (int, error)
 	return p.inner.CountTokens(messages)
 }
 
-// GenerateImage 转发图片生成请求到内层 Provider。
-// 如果内层 Provider 未实现 ImageProvider 接口，返回明确错误。
-func (p *modelOverrideProvider) GenerateImage(ctx context.Context, req llm.ImageRequest) (*llm.ImageResponse, error) {
-	imgProvider, ok := p.inner.(llm.ImageProvider)
-	if !ok {
-		return nil, fmt.Errorf("provider %s 不支持图片生成", p.inner.Name())
-	}
-	if req.Model == "" {
-		req.Model = p.model
-	}
-	return imgProvider.GenerateImage(ctx, req)
-}
-
-// CreateVideoTask 转发视频生成任务到内层 Provider。
-func (p *modelOverrideProvider) CreateVideoTask(ctx context.Context, req llm.VideoRequest) (*llm.VideoTask, error) {
-	vidProvider, ok := p.inner.(llm.VideoProvider)
-	if !ok {
-		return nil, fmt.Errorf("provider %s 不支持视频生成", p.inner.Name())
-	}
-	if req.Model == "" {
-		req.Model = p.model
-	}
-	return vidProvider.CreateVideoTask(ctx, req)
-}
-
-// QueryVideoTask 转发视频任务查询到内层 Provider。
-func (p *modelOverrideProvider) QueryVideoTask(ctx context.Context, taskID string) (*llm.VideoTask, error) {
-	vidProvider, ok := p.inner.(llm.VideoProvider)
-	if !ok {
-		return nil, fmt.Errorf("provider %s 不支持视频生成", p.inner.Name())
-	}
-	return vidProvider.QueryVideoTask(ctx, taskID)
-}
-
 type llmSelection struct {
 	provider         hexagon.Provider
 	providerName     string
@@ -256,7 +241,7 @@ type llmSelection struct {
 	explicitProvider bool
 }
 
-func llmCacheOptions(cfg config.LLMConfig) cache.Options {
+func llmCacheOptions(cfg config.LLMConfig) cache.SemanticOptions {
 	cacheTTL := 24 * time.Hour
 	if cfg.Cache.TTL != "" {
 		if d, err := time.ParseDuration(cfg.Cache.TTL); err == nil {
@@ -267,7 +252,7 @@ func llmCacheOptions(cfg config.LLMConfig) cache.Options {
 	if maxEntries == 0 {
 		maxEntries = 10000
 	}
-	return cache.Options{
+	return cache.SemanticOptions{
 		Enabled:    cfg.Cache.Enabled,
 		TTL:        cacheTTL,
 		MaxEntries: maxEntries,
@@ -290,7 +275,7 @@ func NewReActEngine(
 	store storage.Store,
 	skills *skill.DefaultRegistry,
 ) *ReActEngine {
-	llmCache := cache.New(llmCacheOptions(cfg.LLM))
+	llmCache := cache.NewSemanticCache(llmCacheOptions(cfg.LLM))
 
 	eng := &ReActEngine{
 		cfg:      cfg,
@@ -301,6 +286,12 @@ func NewReActEngine(
 		cache:    llmCache,
 		factory:  agents.NewFactory(),
 	}
+	// 安全默认：内置同会话串行化锁，不再依赖调用方记得 SetSessionLock。
+	// 漏装锁会导致同会话并发请求零串行化、交错写库丢消息（W12-Bug3）。
+	// 调用方仍可通过 SetSessionLock 覆盖（如服务端注入分布式 lease）。
+	defaultLock := session.NewSessionLock()
+	eng.sessionLock = defaultLock
+	eng.sessionLane = NewLocalSessionLane(defaultLock)
 	if cfg.Compaction.Enabled {
 		eng.compactor = session.NewCompactor(store, session.CompactionConfig{
 			MaxMessages: cfg.Compaction.MaxMessages,
@@ -406,7 +397,7 @@ func (e *ReActEngine) SetBudget(b *BudgetController) {
 }
 
 // LLMCache 返回 LLM 响应缓存实例，用于启动加载和关闭持久化。
-func (e *ReActEngine) LLMCache() *cache.Cache {
+func (e *ReActEngine) LLMCache() *cache.SemanticCache {
 	return e.cache
 }
 
@@ -580,6 +571,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	if matched, ok := e.matchSkillFastPath(msg); ok {
 		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
 			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
+			recordPersistError(msg, "user_message", err)
 		}
 		skillArgs := map[string]any{
 			"query":   msg.Content,
@@ -593,6 +585,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		assistantMessageID := ""
 		if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, result.Content, "", messageRequestID(msg)); err != nil {
 			trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
+			recordPersistError(msg, "assistant_reply", err)
 		} else {
 			assistantMessageID = record.ID
 		}
@@ -600,7 +593,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		argsJSON, _ := json.Marshal(skillArgs)
 		return &adapter.Reply{
 			Content:  result.Content,
-			Metadata: withAssistantMessageID(result.Metadata, assistantMessageID),
+			Metadata: withReplyPersistError(withAssistantMessageID(result.Metadata, assistantMessageID), msg),
 			ToolCalls: []adapter.ToolCall{{
 				ID:        "tc-" + idgen.ShortID(),
 				Name:      matched.Name(),
@@ -624,20 +617,22 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 			trace.L(ctx).Info("语义缓存命中", "query", msg.Content[:min(20, len(msg.Content))], "session", sess.ID)
 			if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
 				trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
+				recordPersistError(msg, "user_message", err)
 			}
 			assistantMessageID := ""
 			if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, cached, "", messageRequestID(msg)); err != nil {
 				trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
+				recordPersistError(msg, "assistant_reply", err)
 			} else {
 				assistantMessageID = record.ID
 			}
 			return &adapter.Reply{
 				Content: cached,
-				Metadata: withAssistantMessageID(map[string]string{
+				Metadata: withReplyPersistError(withAssistantMessageID(map[string]string{
 					"source":   "cache",
 					"provider": selection.providerName,
 					"model":    selection.modelName,
-				}, assistantMessageID),
+				}, assistantMessageID), msg),
 			}, nil
 		}
 	}
@@ -659,6 +654,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	// 5. 保存用户消息（在 BuildContext 之后，确保 history 不含当前消息）
 	if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
 		trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
+		recordPersistError(msg, "user_message", err) // 失败信号随 reply 返回，避免静默丢消息（W12-Bug2）
 	}
 
 	// 5.5 知识库检索（RAG 上下文增强）
@@ -936,6 +932,7 @@ func (e *ReActEngine) finalizeReply(
 		RequestID: messageRequestID(msg),
 	}); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
+		recordPersistError(msg, "assistant_reply", err) // 回复未落库，失败信号随 reply 返回（W12-Bug1）
 	} else {
 		assistantMessageID = record.ID
 	}
@@ -1122,6 +1119,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	if matched, ok := e.matchSkillFastPath(msg); ok {
 		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
 			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
+			recordPersistError(msg, "user_message", err)
 		}
 		skillArgs := map[string]any{
 			"query":   msg.Content,
@@ -1134,6 +1132,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		assistantMessageID := ""
 		if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, result.Content, "", messageRequestID(msg)); err != nil {
 			trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
+			recordPersistError(msg, "assistant_reply", err)
 		} else {
 			assistantMessageID = record.ID
 		}
@@ -1144,7 +1143,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 			Arguments: string(argsJSON),
 			Result:    stringx.TruncateWithSuffix(result.Content, 500, "..."),
 		}}
-		return singleChunkWithTools(result.Content, withAssistantMessageID(result.Metadata, assistantMessageID), tc), nil
+		return singleChunkWithTools(result.Content, withReplyPersistError(withAssistantMessageID(result.Metadata, assistantMessageID), msg), tc), nil
 	}
 
 	cacheInput := buildLLMCacheInput(msg)
@@ -1158,6 +1157,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		trace.L(ctx).Info("检测到图片生成请求", "model", selection.modelName, "provider", selection.providerName, "session", sess.ID)
 		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
 			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
+			recordPersistError(msg, "user_message", err)
 		}
 		goroutineLaunched = true
 		ch := make(chan *adapter.ReplyChunk, 2)
@@ -1181,7 +1181,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 			// in this file).
 			bgCtx, bgCancel := context.WithTimeout(trace.Detach(ctx), 5*time.Minute)
 			defer bgCancel()
-			results, imgErr := generateImage(bgCtx, selection.provider, selection.modelName, msg.Content)
+			results, imgErr := generateImage(bgCtx, e.imageSvc, selection.modelName, msg.Content)
 			if imgErr != nil {
 				// M9a: if the client is gone the error chunk below is dropped,
 				// so log AND persist the failure into session history.
@@ -1220,6 +1220,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		trace.L(ctx).Info("检测到视频生成请求", "model", selection.modelName, "provider", selection.providerName, "session", sess.ID)
 		if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
 			trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
+			recordPersistError(msg, "user_message", err)
 		}
 		goroutineLaunched = true
 		ch := make(chan *adapter.ReplyChunk, 2)
@@ -1239,7 +1240,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 			// client disconnects (BUG-20260611).
 			bgCtx, bgCancel := context.WithTimeout(trace.Detach(ctx), 10*time.Minute)
 			defer bgCancel()
-			videoURL, coverDataURI, vidErr := generateVideo(bgCtx, selection.provider, selection.modelName, msg.Content)
+			videoURL, coverDataURI, vidErr := generateVideo(bgCtx, e.videoSvc, selection.modelName, msg.Content)
 			if vidErr != nil {
 				// M9a: log AND persist the failure so it stays visible in
 				// session history even when the client already disconnected.
@@ -1279,18 +1280,20 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 			trace.L(ctx).Info("语义缓存命中", "query", msg.Content[:min(20, len(msg.Content))], "session", sess.ID)
 			if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
 				trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
+				recordPersistError(msg, "user_message", err)
 			}
 			assistantMessageID := ""
 			if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sess.ID, cached, "", messageRequestID(msg)); err != nil {
 				trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sess.ID)
+				recordPersistError(msg, "assistant_reply", err)
 			} else {
 				assistantMessageID = record.ID
 			}
-			return singleChunk(cached, withAssistantMessageID(map[string]string{
+			return singleChunk(cached, withReplyPersistError(withAssistantMessageID(map[string]string{
 				"source":   "cache",
 				"provider": selection.providerName,
 				"model":    selection.modelName,
-			}, assistantMessageID)), nil
+			}, assistantMessageID), msg)), nil
 		}
 	}
 
@@ -1308,6 +1311,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	// 5. 保存用户消息（在 BuildContext 之后，确保 history 不含当前消息）
 	if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
 		trace.L(ctx).Error("保存用户消息失败", "err", err, "session", sess.ID)
+		recordPersistError(msg, "user_message", err) // 失败信号随 reply 返回，避免静默丢消息（W12-Bug2）
 	}
 
 	// 5.5 知识库检索（RAG）
@@ -1639,6 +1643,7 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 		RequestID: messageRequestID(msg),
 	}); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
+		msgMeta[persistErrorMetaKey] = "assistant_reply: " + err.Error() // 失败信号随 reply 返回（W12-Bug1）
 	} else {
 		assistantMessageID = record.ID
 	}
@@ -2032,6 +2037,7 @@ func (e *ReActEngine) pipeStream(
 		RequestID:        messageRequestID(msg),
 	}); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
+		msgMeta[persistErrorMetaKey] = "assistant_reply: " + err.Error() // 失败信号随 reply 返回（W12-Bug1）
 	} else {
 		assistantMessageID = record.ID
 	}
@@ -2247,6 +2253,7 @@ func (e *ReActEngine) pipeStreamWithTools(
 		RequestID:        messageRequestID(msg),
 	}); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
+		msgMeta[persistErrorMetaKey] = "assistant_reply: " + err.Error() // 失败信号随 reply 返回（W12-Bug1）
 	} else {
 		assistantMessageID = record.ID
 	}
@@ -2443,6 +2450,7 @@ func (e *ReActEngine) completeDirect(
 	assistantMessageID := ""
 	if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(ctx, sessionID, resp.Content, "", messageRequestID(msg)); err != nil {
 		trace.L(ctx).Error("保存助手回复失败", "err", err, "session", sessionID)
+		recordPersistError(msg, "assistant_reply", err) // 失败信号随 reply 返回（W12-Bug1）
 	} else {
 		assistantMessageID = record.ID
 	}
@@ -2530,6 +2538,48 @@ func ensureMessageMetadata(msg *adapter.Message) {
 	if msg.Metadata == nil {
 		msg.Metadata = make(map[string]string)
 	}
+}
+
+// persistErrorMetaKey 标记本轮持久化失败的元数据键。
+// 该键经 buildReplyMetadata / withReplyPersistError 透传到 reply.Metadata，
+// 使调用方/前端能感知"响应/消息未真正落库"，避免假闭合（W12-Bug1/Bug2）。
+const persistErrorMetaKey = "persist_error"
+
+// recordPersistError 记录一次持久化失败：既写结构化日志，又把失败信号
+// 标记到 msg.Metadata[persist_error]，让闭环对调用方可观测。
+//
+// kind 描述失败的写入类型（如 "user_message" / "assistant_reply"），多次失败时
+// 以 ";" 追加，保留全部失败原因而非互相覆盖。这是"持久化错误不得静默吞掉"契约的
+// 落点：错误不再仅停留在日志，而是随 reply 返回（W12-Bug1）。
+func recordPersistError(msg *adapter.Message, kind string, err error) {
+	if err == nil {
+		return
+	}
+	ensureMessageMetadata(msg)
+	mark := kind + ": " + err.Error()
+	if prev := msg.Metadata[persistErrorMetaKey]; prev != "" {
+		msg.Metadata[persistErrorMetaKey] = prev + "; " + mark
+	} else {
+		msg.Metadata[persistErrorMetaKey] = mark
+	}
+}
+
+// withReplyPersistError 把 msg.Metadata 上累计的 persist_error 透传到 reply.Metadata。
+// 用于内联构造的 Reply（fast-path / 缓存命中等不经 buildReplyMetadata 的路径），
+// 保证无论走哪条返回路径，持久化失败信号都不丢失。
+func withReplyPersistError(metadata map[string]string, msg *adapter.Message) map[string]string {
+	if msg == nil || msg.Metadata == nil {
+		return metadata
+	}
+	pe := msg.Metadata[persistErrorMetaKey]
+	if pe == "" {
+		return metadata
+	}
+	if metadata == nil {
+		metadata = make(map[string]string, 1)
+	}
+	metadata[persistErrorMetaKey] = pe
+	return metadata
 }
 
 func messageRequestID(msg *adapter.Message) string {
@@ -2657,7 +2707,7 @@ func buildReplyMetadata(metadata map[string]string, providerName, modelName, ass
 	if v := metadata["routed_agent"]; v != "" {
 		replyMeta["routed_agent"] = v
 	}
-	for _, key := range []string{"request_id", "finish_reason", "recovered_from_reasoning_only"} {
+	for _, key := range []string{"request_id", "finish_reason", "recovered_from_reasoning_only", persistErrorMetaKey} {
 		if v := metadata[key]; v != "" {
 			replyMeta[key] = v
 		}

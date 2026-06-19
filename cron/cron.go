@@ -192,6 +192,18 @@ func (s *Scheduler) engineFor(runtime string) ScriptEngine {
 	return s.engines[runtime]
 }
 
+// looksLikeStarlark reports whether a script calls Starlark host builtins that the
+// python3 runtime does not define (emit / kb_ingest / http_get / ...). Used as a
+// backstop to re-route scripts mis-tagged runtime "python3" to the Starlark engine.
+func looksLikeStarlark(script string) bool {
+	for _, b := range []string{"emit(", "kb_ingest(", "http_get(", "http_post(", "json_decode(", "json_encode("} {
+		if strings.Contains(script, b) {
+			return true
+		}
+	}
+	return false
+}
+
 // Init 初始化调度器存储表
 //
 // v2 schema：cron_jobs 不再含 prompt 列。旧库由 Sprint 1.2 的 migration 处理。
@@ -929,12 +941,48 @@ func (s *Scheduler) checkAndExecute(now time.Time) {
 	}
 }
 
+// claimJob 跨副本原子领取本次到期刻度：把 last_run_at 推进到 job.NextRunAt。
+//
+// 仅第一个副本的 UPDATE 命中（RowsAffected==1）；其余副本看到 last_run_at 已 >=
+// next_run_at、RowsAffected==0，从而"一个到期刻度只跑一个副本"。与 MySQL 同语义。
+// 无 DB（纯内存调度）或 DB 中无此行（测试）时 fail-open 放行，保持既有行为。
+func (s *Scheduler) claimJob(job *Job) bool {
+	if s.db == nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE cron_jobs SET last_run_at = ? WHERE id = ? AND (last_run_at IS NULL OR last_run_at < ?)`,
+		job.NextRunAt, job.ID, job.NextRunAt)
+	if err != nil {
+		logger.Error("[cron] 原子领取失败，跳过本次执行以防双跑", "id", job.ID, "err", err)
+		return false
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		return true
+	}
+	// RowsAffected==0：另一副本已领取，或 DB 无此行（纯内存/测试）→ 区分后 fail-open。
+	var exists int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM cron_jobs WHERE id = ?`, job.ID).Scan(&exists); err != nil || exists == 0 {
+		return true
+	}
+	return false // 行存在但未领到 → 另一副本已领取本刻度
+}
+
 // executeJob 执行单个任务（v2: 走 ScriptExecutor 沙箱，零 LLM）。
 func (s *Scheduler) executeJob(job *Job) {
 	if _, loaded := s.running.LoadOrStore(job.ID, true); loaded {
-		return // 上一次执行尚未完成
+		return // 上一次执行尚未完成（进程内去重）
 	}
 	defer s.running.Delete(job.ID)
+
+	// 跨副本去重：进程内 sync.Map 只防单实例重入，多副本部署时同一到期刻度会被多个
+	// 实例同时触发。claimJob 用 DB 原子领取保证一个到期刻度只跑一个副本。
+	if !s.claimJob(job) {
+		return // 另一副本已领取本到期刻度
+	}
 
 	now := time.Now()
 	// Note: the persistence ctx must be created AFTER the run finishes — a job
@@ -963,12 +1011,22 @@ func (s *Scheduler) executeJob(job *Job) {
 		slog.Info("[cron] running agent job", "source", "cron", "name", job.Name, "id", job.ID)
 		result = s.runAgentJob(runCtx, job)
 	} else {
-		engine := s.engineFor(job.Spec.Runtime)
+		runtime := job.Spec.Runtime
+		// Backstop: a script tagged python3 but using Starlark host builtins (emit /
+		// kb_ingest / ...) was mis-routed — e.g. a weak compiler model declared python3
+		// while emitting Starlark. Run it on the engine it was actually written for
+		// instead of failing with NameError at python runtime; also self-heals already
+		// persisted jobs without a re-compile.
+		if runtime == RuntimePython3 && looksLikeStarlark(job.Spec.Script) {
+			slog.Warn("[cron] script tagged python3 but uses Starlark builtins — routing to Starlark engine", "source", "cron", "id", job.ID)
+			runtime = RuntimeStarlark
+		}
+		engine := s.engineFor(runtime)
 		if engine == nil {
-			slog.Error("[cron] skipping run — no engine for runtime", "source", "cron", "id", job.ID, "runtime", job.Spec.Runtime)
+			slog.Error("[cron] skipping run — no engine for runtime", "source", "cron", "id", job.ID, "runtime", runtime)
 			ec, cancel := earlyCtx()
 			defer cancel()
-			_ = s.persistHistory(ec, job.ID, "error", "", "no script engine for runtime "+job.Spec.Runtime, 0, now, "", "", 0, nil)
+			_ = s.persistHistory(ec, job.ID, "error", "", "no script engine for runtime "+runtime, 0, now, "", "", 0, nil)
 			return
 		}
 		if !engine.Available() {

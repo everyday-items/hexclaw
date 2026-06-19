@@ -1,10 +1,10 @@
 package mcp
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/net/sse"
 )
 
 // HTTPTransport implements the MCP 2025-03-26 Streamable HTTP transport.
@@ -260,48 +262,49 @@ func (t *HTTPTransport) collectSSEResult(body io.Reader) (json.RawMessage, error
 
 const maxTotalSSEBytes = 100 * 1024 * 1024 // 100 MB total SSE stream limit
 
+// streamSSE 解析 MCP over HTTP 的 text/event-stream 响应，逐个 SSE 事件取出其
+// data 负载，按 JSON-RPC 响应语义分发 result 或将 error 作为 Go 错误向上传播。
+//
+// SSE 行级解析（总字节上限 + 严格 data 前缀两项安全不变量）下沉到
+// toolkit 的 sse.Reader，通过 WithMaxTotalBytes / WithStrictDataPrefix 启用：
+//   - WithMaxTotalBytes：限制累计读取字节数，防御不可信上游用超长流耗尽内存的
+//     DoS 攻击；超限时 Reader 返回 sentinel 错误 sse.ErrMaxBytesExceeded，
+//     本函数以 %w 包装该 sentinel 后返回，使调用方既能 errors.Is 判定身份、
+//     又能从文案中读出本包约定的超限语义。
+//   - WithStrictDataPrefix：仅识别规范的 "data: "（含单空格）前缀，与本包既有
+//     的严格度保持一致（"data:" 无空格的行被忽略，不视为 data 字段）。
+//
+// JSON-RPC 层语义（error 传播、仅 result != nil 才回调、空/非法 data 静默忽略）
+// 不属于通用 SSE 能力，保留在本函数内：Reader 只负责把每个事件的 data 还原出来。
 func (t *HTTPTransport) streamSSE(body io.Reader, handler func(json.RawMessage)) error {
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 1MB max line for large tool results
-	var dataLines []string
-	var totalBytes int64
+	reader := sse.NewReaderWithOptions(body,
+		sse.WithMaxTotalBytes(maxTotalSSEBytes), // 100MB 总流量上限，防 DoS
+		sse.WithStrictDataPrefix(),              // 仅接受规范 "data: " 前缀
+	)
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		totalBytes += int64(len(line)) + 1 // +1 for newline
-		if totalBytes > maxTotalSSEBytes {
-			return fmt.Errorf("SSE stream exceeded maximum size of %d bytes", maxTotalSSEBytes)
-		}
-
-		if line == "" {
-			// Blank line = end of event
-			if len(dataLines) > 0 {
-				payload := strings.Join(dataLines, "\n")
-				var rpcResp jsonRPCResponse
-				if err := json.Unmarshal([]byte(payload), &rpcResp); err == nil {
-					if rpcResp.Error != nil {
-						return fmt.Errorf("RPC error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
-					}
-					if rpcResp.Result != nil {
-						handler(rpcResp.Result)
-					}
-				}
-				dataLines = nil
+	for {
+		event, err := reader.Read()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				// 正常读到流尾。Reader 在 EOF 前已把末尾未以空行收尾的事件
+				// 一并返回，无需额外 flush。
+				return nil
 			}
-			continue
+			if errors.Is(err, sse.ErrMaxBytesExceeded) {
+				// 以 %w 包装 toolkit 的 sentinel，复用其超限身份：
+				// 调用方可 errors.Is(err, sse.ErrMaxBytesExceeded) 精确判定，
+				// 无需依赖字符串子串；文案保留 "exceeded maximum size" 语义，
+				// 与本包既有错误契约（characterization 测试钉死）一致。
+				return fmt.Errorf("SSE stream exceeded maximum size of %d bytes: %w", maxTotalSSEBytes, err)
+			}
+			return err
 		}
 
-		if strings.HasPrefix(line, "data: ") {
-			dataLines = append(dataLines, line[6:])
-		}
-		// Ignore "event:", "id:", "retry:", comments
-	}
-
-	// Flush remaining buffered data (server closed without trailing blank line)
-	if len(dataLines) > 0 {
-		payload := strings.Join(dataLines, "\n")
+		// event.Data 为该 SSE 事件全部 data 行以 "\n" 拼接后的负载。
+		// 空负载（如仅有 event/id 字段的事件）交给 Unmarshal 时会失败，
+		// 与历史"仅 len(dataLines) > 0 才处理"的效果一致，被静默忽略。
 		var rpcResp jsonRPCResponse
-		if err := json.Unmarshal([]byte(payload), &rpcResp); err == nil {
+		if err := json.Unmarshal([]byte(event.Data), &rpcResp); err == nil {
 			if rpcResp.Error != nil {
 				return fmt.Errorf("RPC error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
 			}
@@ -310,6 +313,4 @@ func (t *HTTPTransport) streamSSE(body io.Reader, handler func(json.RawMessage))
 			}
 		}
 	}
-
-	return scanner.Err()
 }

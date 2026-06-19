@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/hexclaw/security"
-	"github.com/hexagon-codes/hexclaw/trace"
 )
 
 // ToolCallInfo holds metadata about a tool call for hooks

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/toolkit/net/httpx"
+	"github.com/hexagon-codes/toolkit/net/sse"
 )
 
 // OllamaStatus Ollama 运行时状态 (14.15 本地 LLM 管理)
@@ -326,16 +327,15 @@ func (s *Server) handleOllamaPull(w http.ResponseWriter, r *http.Request) {
 	}
 	defer pullResp.Body.Close()
 
-	// SSE 流式推送进度
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	// SSE 流式推送进度：复用 toolkit/net/sse.Writer（与 api/server.go 一致）。
+	// NewWriter 负责设置 text/event-stream 等响应头，WriteData 产出 "data: <line>\n\n" 并立即 Flush。
+	if _, ok := w.(http.Flusher); !ok {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming not supported"})
 		return
 	}
+	writer := sse.NewWriter(w)
 
+	// Ollama 的 /api/pull 是流式 JSON（每行一个 JSON 对象），逐行透传为 SSE data 事件。
 	scanner := bufio.NewScanner(pullResp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 256*1024)
 	for scanner.Scan() {
@@ -343,11 +343,11 @@ func (s *Server) handleOllamaPull(w http.ResponseWriter, r *http.Request) {
 		if line == "" {
 			continue
 		}
-		fmt.Fprintf(w, "data: %s\n\n", line)
-		flusher.Flush()
+		_ = writer.WriteData(line)
 	}
 	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(w, "data: {\"status\":\"error\",\"error\":%q}\n\n", err.Error())
-		flusher.Flush()
+		// 用 json.Marshal 生成错误负载，确保 error 文案被正确 JSON 转义。
+		errPayload, _ := json.Marshal(map[string]string{"status": "error", "error": err.Error()})
+		_ = writer.WriteData(string(errPayload))
 	}
 }

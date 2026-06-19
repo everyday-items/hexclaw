@@ -4,15 +4,15 @@ go 1.25.5
 
 require (
 	github.com/gorilla/websocket v1.5.3
-	github.com/hexagon-codes/ai-core v0.1.3
-	github.com/hexagon-codes/hexagon v0.4.8
-	github.com/hexagon-codes/toolkit v0.0.6
+	github.com/hexagon-codes/ai-core v0.1.4
+	github.com/hexagon-codes/hexagon v0.5.0
+	github.com/hexagon-codes/toolkit v0.1.0
 	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
 	github.com/spf13/cobra v1.9.1
 	go.starlark.net v0.0.0-20260613233743-8ba36ccb83fb
 	golang.org/x/sync v0.20.0
 	gopkg.in/yaml.v3 v3.0.1
-	modernc.org/sqlite v1.48.2
+	modernc.org/sqlite v1.52.0
 	nhooyr.io/websocket v1.8.17
 )
 
@@ -34,10 +34,10 @@ require (
 	github.com/spf13/pflag v1.0.6 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
-	golang.org/x/crypto v0.47.0 // indirect
+	golang.org/x/crypto v0.50.0 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
-	modernc.org/libc v1.70.0 // indirect
+	modernc.org/libc v1.72.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )

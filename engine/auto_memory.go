@@ -7,7 +7,7 @@ import (
 	"time"
 
 	hexagon "github.com/hexagon-codes/hexagon"
-	"github.com/hexagon-codes/hexclaw/trace"
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
@@ -169,4 +169,3 @@ func mayContainMemorableInfo(text string) bool {
 	}
 	return false
 }
-

@@ -14,8 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hexagon-codes/ai-core/llm"
-	"github.com/hexagon-codes/hexagon"
+	mediaimg "github.com/hexagon-codes/ai-core/media/image"
 	"github.com/hexagon-codes/toolkit/net/httpx"
 )
 
@@ -52,43 +51,47 @@ type imageResult struct {
 	RevisedPrompt string
 }
 
-// generateImage 通过 ImageProvider 接口生成图片并下载为 data URI
+// generateImage 通过 ai-core/media 的图片服务生成图片并内嵌为 data URI。
 //
-// 1. 类型断言检查 Provider 是否支持图片生成
-// 2. 调用 ImageProvider.GenerateImage 获取图片 URL
-// 3. 下载图片并转为 base64 data URI（不依赖外部 URL 存活）
-func generateImage(ctx context.Context, provider hexagon.Provider, model, prompt string) ([]imageResult, error) {
-	imgProvider, ok := provider.(llm.ImageProvider)
-	if !ok {
-		return nil, fmt.Errorf("provider %s 不支持图片生成", provider.Name())
+//  1. media 图片服务按 model 路由到对应 Provider（DALL-E / CogView / 兼容）
+//  2. media Provider 默认请求 b64_json，直接内嵌为 data URI（不依赖外链寿命）；
+//     若 Provider 只回 URL，则下载转 data URI，下载失败回退原始 URL。
+func generateImage(ctx context.Context, svc *mediaimg.Service, model, prompt string) ([]imageResult, error) {
+	if svc == nil || !svc.HasProvider() {
+		return nil, fmt.Errorf("未配置图片生成服务（model=%s）", model)
 	}
 
-	resp, err := imgProvider.GenerateImage(ctx, llm.ImageRequest{
-		Model:  model,
-		Prompt: prompt,
-	})
+	res, err := svc.Generate(ctx, "", mediaimg.Request{Model: model, Prompt: prompt})
 	if err != nil {
 		return nil, err
 	}
-
-	if len(resp.Data) == 0 {
+	if len(res.Images) == 0 {
 		return nil, fmt.Errorf("图片生成 API 未返回图片")
 	}
 
-	results := make([]imageResult, 0, len(resp.Data))
-	for _, img := range resp.Data {
-		if img.URL == "" {
+	results := make([]imageResult, 0, len(res.Images))
+	for _, img := range res.Images {
+		var dataURI string
+		switch {
+		case img.B64JSON != "":
+			// media 默认 response_format=b64_json，OpenAI Images 返回 PNG。
+			dataURI = "data:image/png;base64," + img.B64JSON
+		case img.URL != "":
+			if d, dlErr := downloadAsDataURI(ctx, img.URL); dlErr == nil {
+				dataURI = d
+			} else {
+				dataURI = img.URL // 下载失败回退原始 URL
+			}
+		default:
 			continue
-		}
-		dataURI, err := downloadAsDataURI(ctx, img.URL)
-		if err != nil {
-			// 下载失败时回退到原始 URL
-			dataURI = img.URL
 		}
 		results = append(results, imageResult{
 			DataURI:       dataURI,
 			RevisedPrompt: img.RevisedPrompt,
 		})
+	}
+	if len(results) == 0 {
+		return nil, fmt.Errorf("图片生成未产生有效图像")
 	}
 	return results, nil
 }

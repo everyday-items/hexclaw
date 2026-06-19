@@ -8,8 +8,10 @@ import (
 	"unicode"
 
 	"github.com/hexagon-codes/ai-core/llm"
-	"github.com/hexagon-codes/hexclaw/skill"
+	"github.com/hexagon-codes/toolkit/lang/mapx"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
+
+	"github.com/hexagon-codes/hexclaw/skill"
 )
 
 // TranslateSkill 翻译 Skill。
@@ -204,10 +206,7 @@ var zhToEnWords = map[string]string{
 var zhPhraseOrder = sortedPhraseKeys(zhToEnPhrases)
 
 func sortedPhraseKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
-	}
+	keys := mapx.Keys(m)
 	sort.Slice(keys, func(i, j int) bool {
 		return len([]rune(keys[i])) > len([]rune(keys[j]))
 	})

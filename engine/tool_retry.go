@@ -3,9 +3,10 @@ package engine
 import (
 	"context"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"time"
 
+	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"github.com/hexagon-codes/toolkit/util/retry"
 )
 
@@ -99,8 +100,8 @@ func isTransientError(err error) bool {
 	if err == nil {
 		return false
 	}
-	switch ClassifyError(err, 0, "") {
-	case FailRateLimit, FailProviderDown:
+	switch llm.ClassifyError(err, 0, "") {
+	case llm.FailRateLimit, llm.FailProviderDown:
 		return true
 	default:
 		return false

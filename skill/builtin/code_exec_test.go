@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/hexagon-codes/hexclaw/sandbox"
+	"github.com/hexagon-codes/toolkit/os/sandbox"
 )
 
 // mockSandbox implements sandbox.Sandbox for testing.

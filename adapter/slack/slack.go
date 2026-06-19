@@ -16,26 +16,30 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/hexagon-codes/hexclaw/adapter"
-	"github.com/hexagon-codes/hexclaw/config"
-	"github.com/hexagon-codes/hexclaw/trace"
+	"github.com/hexagon-codes/toolkit/crypto/sign"
+	"github.com/hexagon-codes/toolkit/util/logger"
+
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
+
+	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/config"
 )
 
-const slackAPIBase = "https://slack.com/api"
+// slackAPIBase 是 Slack Web API 的基础地址。
+// 声明为 var 而非 const，便于测试时指向 httptest mock 服务器，
+// 验证对 Slack API ok:false 响应的处理（无需真实网络）。
+var slackAPIBase = "https://slack.com/api"
 
 // SlackAdapter Slack Bot 适配器
 //
@@ -215,7 +219,7 @@ func (a *SlackAdapter) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// 验证签名
 	if a.cfg.SigningSecret != "" {
 		if !a.verifySignature(r, body) {
-			http.Error(w, "name", http.StatusUnauthorized)
+			http.Error(w, "invalid request signature", http.StatusUnauthorized)
 			return
 		}
 	}
@@ -337,9 +341,7 @@ func (a *SlackAdapter) verifySignature(r *http.Request, body []byte) bool {
 	// 拼接签名基础字符串: v0:timestamp:body
 	baseString := fmt.Sprintf("v0:%s:%s", timestamp, string(body))
 
-	mac := hmac.New(sha256.New, []byte(a.cfg.SigningSecret))
-	mac.Write([]byte(baseString))
-	expected := "v0=" + hex.EncodeToString(mac.Sum(nil))
+	expected := "v0=" + sign.HMACSHA256Hex([]byte(baseString), []byte(a.cfg.SigningSecret))
 
 	return hmac.Equal([]byte(expected), []byte(signature))
 }
@@ -418,7 +420,20 @@ func (a *SlackAdapter) postThreadMessage(ctx context.Context, channel, threadTS,
 	if err != nil {
 		return fmt.Errorf("发送 Slack 线程消息失败: %w", err)
 	}
-	_ = resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
+
+	// Slack Web API 即使业务失败也返回 HTTP 200，仅通过 body 中的 "ok":false
+	// 表达失败，因此必须解析 ok 字段，否则发送失败会被当成成功。
+	var result struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("解析 Slack 响应失败: %w", err)
+	}
+	if !result.OK {
+		return fmt.Errorf("slack API 错误: %s", result.Error)
+	}
 	return nil
 }
 
@@ -442,7 +457,20 @@ func (a *SlackAdapter) updateMessage(ctx context.Context, channel, ts, text stri
 	if err != nil {
 		return fmt.Errorf("更新 Slack 消息失败: %w", err)
 	}
-	_ = resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
+
+	// 同 postThreadMessage：chat.update 业务失败时也只在 body 标 ok=false，
+	// 不解析 ok 会把失败当成功（功能未闭环）。
+	var result struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("解析 Slack 响应失败: %w", err)
+	}
+	if !result.OK {
+		return fmt.Errorf("slack API 错误: %s", result.Error)
+	}
 	return nil
 }
 
@@ -462,10 +490,18 @@ func (a *SlackAdapter) fetchBotID() {
 	defer resp.Body.Close()
 
 	var result struct {
+		OK     bool   `json:"ok"`
+		Error  string `json:"error"`
 		UserID string `json:"user_id"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		logger.Error("解析 Slack auth.test 响应失败", "error", err)
+		return
+	}
+	// auth.test 业务失败（如 invalid_auth）时仍返回 HTTP 200，但 ok=false 且
+	// user_id 为空。不校验 ok 会把空 user_id 当成有效 botID 污染状态。
+	if !result.OK {
+		logger.Error("获取 Slack Bot ID 失败", "error", result.Error)
 		return
 	}
 	a.botID = result.UserID

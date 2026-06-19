@@ -3,11 +3,14 @@ package engine
 import (
 	"context"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/lang/mapx"
+	"github.com/hexagon-codes/toolkit/util/idgen"
+	"github.com/hexagon-codes/toolkit/util/logger"
 
 	"github.com/hexagon-codes/hexclaw/featureflag"
 )
@@ -321,7 +324,7 @@ func (h *PermissionHook) requestApproval(ctx context.Context, call *ToolCallInfo
 		return fmt.Errorf("tool %q requires approval but no session context available", call.Name)
 	}
 
-	reqID := fmt.Sprintf("perm-%s-%d", call.Name, time.Now().UnixNano())
+	reqID := fmt.Sprintf("perm-%s-%s", call.Name, idgen.NanoID())
 	req := &PermissionRequest{
 		ID:        reqID,
 		ToolName:  call.Name,
@@ -355,10 +358,7 @@ func summarizeArgs(args map[string]any) string {
 	if len(args) == 0 {
 		return ""
 	}
-	keys := make([]string, 0, len(args))
-	for k := range args {
-		keys = append(keys, k)
-	}
+	keys := mapx.Keys(args)
 	sort.Strings(keys) // stable, reproducible audit/approval line regardless of map order
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {

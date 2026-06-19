@@ -12,11 +12,11 @@ package acp
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
 // MessageType 消息类型
@@ -215,8 +215,9 @@ func (b *Bus) ListAgents() []string {
 	return names
 }
 
+// genID 生成消息唯一 ID。
+// 复用 toolkit 的 NanoID（内部 crypto/rand，熵源失败时 panic 而非静默），
+// 修复此前手写 rand.Read 忽略 error 的潜在弱随机 bug。
 func genID() string {
-	b := make([]byte, 8)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	return idgen.NanoID()
 }

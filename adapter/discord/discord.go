@@ -26,11 +26,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
-	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
+	"github.com/hexagon-codes/toolkit/util/retry"
 
 	"github.com/gorilla/websocket"
 )
@@ -38,6 +39,10 @@ import (
 const (
 	apiBase    = "https://discord.com/api/v10"
 	gatewayURL = "wss://gateway.discord.gg/?v=10&encoding=json"
+
+	// W3-3：Gateway 重连指数退避参数。
+	reconnectBaseDelay = 1 * time.Second  // 首次重连退避起步时长
+	reconnectMaxDelay  = 60 * time.Second // 退避封顶时长
 )
 
 // DiscordAdapter Discord Bot 适配器
@@ -202,26 +207,58 @@ func (a *DiscordAdapter) SendStream(ctx context.Context, chatID string, chunks <
 // ============== Gateway 连接 ==============
 
 // connectLoop 自动重连循环
+//
+// W3-3：此前固定 5s 重连无退避，Discord 网关抖动或限流时会形成稳定的高频
+// 重连风暴。改为复用 toolkit/util/retry 的指数退避：连接成功（事件循环正常
+// 运行过一段时间）后重置退避计数，连续失败时延迟按 1s→2s→4s... 增长，封顶
+// reconnectMaxDelay。
 func (a *DiscordAdapter) connectLoop() {
+	attempt := 0
 	for !a.stopped.Load() {
+		start := time.Now()
 		if err := a.connect(); err != nil {
 			logger.Error("Discord Gateway 连接失败", "error", err)
 		}
 		if a.stopped.Load() {
 			return
 		}
-		// 重连间隔（带退避）
-		time.Sleep(5 * time.Second)
+		// 连接维持超过 60s 视为一次成功会话，重置退避计数。
+		if time.Since(start) >= 60*time.Second {
+			attempt = 0
+		}
+		delay := a.reconnectDelay(attempt)
+		attempt++
+		time.Sleep(delay)
 	}
+}
+
+// reconnectDelay 计算第 attempt 次重连前的退避时长。
+//
+// W3-3：复用 toolkit/util/retry 的指数退避算法（1s 起步、2 倍增长、封顶
+// reconnectMaxDelay），attempt 从 0 开始。
+func (a *DiscordAdapter) reconnectDelay(attempt int) time.Duration {
+	cfg := retry.DefaultConfig()
+	cfg.Delay = reconnectBaseDelay
+	cfg.MaxDelay = reconnectMaxDelay
+	cfg.Multiplier = 2
+	return retry.ExponentialBackoff(attempt, cfg)
 }
 
 // connect 建立 Gateway 连接并处理事件
 func (a *DiscordAdapter) connect() error {
+	return a.connectTo(gatewayURL)
+}
+
+// connectTo 连接指定 Gateway URL 并处理事件。
+//
+// 从 connect 抽出 URL 参数，便于在测试中指向本地 WebSocket 服务器，
+// 验证 Resume/Identify 握手选择与 Hello 心跳间隔校验（W3-3 / W3-4）。
+func (a *DiscordAdapter) connectTo(url string) error {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
 	}
 
-	conn, _, err := dialer.Dial(gatewayURL, nil)
+	conn, _, err := dialer.Dial(url, nil)
 	if err != nil {
 		return fmt.Errorf("webSocket 连接失败: %w", err)
 	}
@@ -253,14 +290,29 @@ func (a *DiscordAdapter) connect() error {
 	}
 
 	// 解析心跳间隔
+	// W3-4：此前忽略 Unmarshal 返回值，解析失败会静默走零值 → 心跳间隔为 0，
+	// time.NewTicker(0) 会 panic。显式校验并把错误上抛触发重连。
 	var helloData struct {
 		HeartbeatInterval int `json:"heartbeat_interval"`
 	}
-	json.Unmarshal(hello.D, &helloData)
+	if err := json.Unmarshal(hello.D, &helloData); err != nil {
+		return fmt.Errorf("解析心跳间隔失败: %w", err)
+	}
+	if helloData.HeartbeatInterval <= 0 {
+		return fmt.Errorf("非法心跳间隔: %d", helloData.HeartbeatInterval)
+	}
 	heartbeatInterval := time.Duration(helloData.HeartbeatInterval) * time.Millisecond
 
-	// 发送 Identify
-	if err := a.sendIdentify(conn); err != nil {
+	// W3-3：握手阶段优先尝试 Resume——若已有 sessionID（上次连接成功获得），
+	// 发送 op=6 Resume 复用旧会话，避免漏掉断连期间的事件；否则全新 Identify。
+	a.mu.Lock()
+	resumeSession := a.sessionID
+	a.mu.Unlock()
+	if resumeSession != "" {
+		if err := a.sendResume(conn, resumeSession, a.seq.Load()); err != nil {
+			return fmt.Errorf("发送 Resume 失败: %w", err)
+		}
+	} else if err := a.sendIdentify(conn); err != nil {
 		return fmt.Errorf("发送 Identify 失败: %w", err)
 	}
 
@@ -303,6 +355,21 @@ func (a *DiscordAdapter) sendIdentify(conn *websocket.Conn) error {
 		},
 	}
 	return conn.WriteJSON(identify)
+}
+
+// sendResume 发送 op=6 Resume 恢复中断的会话。
+//
+// W3-3：携带 token / session_id / 最新 seq，让 Discord 重放断连期间漏掉的事件。
+func (a *DiscordAdapter) sendResume(conn *websocket.Conn, sessionID string, seq int64) error {
+	resume := map[string]any{
+		"op": 6,
+		"d": map[string]any{
+			"token":      a.cfg.Token,
+			"session_id": sessionID,
+			"seq":        seq,
+		},
+	}
+	return conn.WriteJSON(resume)
 }
 
 // heartbeat 定期发送心跳
@@ -354,7 +421,38 @@ func (a *DiscordAdapter) handleEvent(raw []byte) {
 			a.conn.Close()
 		}
 		a.mu.Unlock()
+	case 9: // Invalid Session
+		// W3-3：此前完全丢弃 op=9，导致 Resume 被拒后仍反复用失效会话重连。
+		// d 为布尔值，表示该会话是否可 Resume。不可 Resume 时清空 sessionID/seq，
+		// 强制下次连接走全新 Identify；随后关闭连接触发 connectLoop 重连。
+		a.handleInvalidSession(event.D)
+		a.mu.Lock()
+		if a.conn != nil {
+			a.conn.Close()
+		}
+		a.mu.Unlock()
 	}
+}
+
+// handleInvalidSession 处理 op=9 Invalid Session。
+//
+// W3-3：data 为 Discord 下发的布尔值，true 表示会话仍可 Resume（保留 sessionID/seq），
+// false 表示会话已失效（清空 sessionID/seq，下次重连走全新 Identify）。
+// 解析失败时按"不可 Resume"保守处理。
+func (a *DiscordAdapter) handleInvalidSession(data json.RawMessage) {
+	var resumable bool
+	if err := json.Unmarshal(data, &resumable); err != nil {
+		resumable = false
+	}
+	if resumable {
+		logger.Info("Discord 会话失效但可恢复，保留 sessionID 等待 Resume")
+		return
+	}
+	logger.Info("Discord 会话失效且不可恢复，清空会话状态走全新 Identify")
+	a.mu.Lock()
+	a.sessionID = ""
+	a.mu.Unlock()
+	a.seq.Store(0)
 }
 
 // handleDispatch 处理分发事件
@@ -364,7 +462,12 @@ func (a *DiscordAdapter) handleDispatch(eventType string, data json.RawMessage) 
 		var ready struct {
 			SessionID string `json:"session_id"`
 		}
-		json.Unmarshal(data, &ready)
+		// W3-4：此前忽略 Unmarshal 返回值，解析失败会静默清空 sessionID，
+		// 导致后续无法发送 Resume。解析失败时保留旧 sessionID 并记录日志。
+		if err := json.Unmarshal(data, &ready); err != nil {
+			logger.Error("Discord 解析 READY 事件失败", "error", err)
+			return
+		}
 		a.sessionID = ready.SessionID
 		logger.Info("Discord Bot 已就绪")
 
@@ -469,7 +572,9 @@ func (a *DiscordAdapter) createMessage(ctx context.Context, channelID, content s
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	// W3-1：Discord POST /channels/{id}/messages 成功返回 201 Created，
+	// 此前仅接受 200 会把正常成功误判为错误。按 2xx 整段判定成功。
+	if resp.StatusCode/100 != 2 {
 		respBody, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("discord API 错误 (%d): %s", resp.StatusCode, string(respBody))
 	}
@@ -506,7 +611,14 @@ func (a *DiscordAdapter) editMessage(ctx context.Context, channelID, messageID, 
 	if err != nil {
 		return fmt.Errorf("编辑 Discord 消息失败: %w", err)
 	}
-	_ = resp.Body.Close()
+	defer resp.Body.Close()
+
+	// W3-2：此前不校验响应状态码会静默吞掉 404/429/500 等失败，
+	// 导致流式编辑失败被掩盖。非 2xx 时读取错误体并返回 error。
+	if resp.StatusCode/100 != 2 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("discord 编辑消息错误 (%d): %s", resp.StatusCode, string(respBody))
+	}
 	return nil
 }
 

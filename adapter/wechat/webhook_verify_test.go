@@ -25,8 +25,9 @@ func wechatSign(token, timestamp, nonce string) string {
 
 func TestHandleVerify_ValidSignatureEchoesEchostr(t *testing.T) {
 	a := New(config.WechatConfig{Token: "tk"})
-	sig := wechatSign("tk", "100", "abc")
-	url := fmt.Sprintf("/wh?signature=%s&timestamp=100&nonce=abc&echostr=hello-echo", sig)
+	ts := nowTS() // W3-22：当下时间戳以通过重放窗口校验
+	sig := wechatSign("tk", ts, "abc")
+	url := fmt.Sprintf("/wh?signature=%s&timestamp=%s&nonce=abc&echostr=hello-echo", sig, ts)
 	w := httptest.NewRecorder()
 
 	a.handleVerify(w, httptest.NewRequest(http.MethodGet, url, nil))
@@ -66,9 +67,10 @@ func TestHandleMessage_RejectsInvalidSignature(t *testing.T) {
 
 func TestHandleMessage_BadXMLReturns400(t *testing.T) {
 	a := New(config.WechatConfig{Token: "tk"})
-	sig := wechatSign("tk", "100", "abc")
+	ts := nowTS() // W3-22：当下时间戳
+	sig := wechatSign("tk", ts, "abc")
 	r := httptest.NewRequest(http.MethodPost,
-		fmt.Sprintf("/wh?signature=%s&timestamp=100&nonce=abc", sig), strings.NewReader("<broken"))
+		fmt.Sprintf("/wh?signature=%s&timestamp=%s&nonce=abc", sig, ts), strings.NewReader("<broken"))
 	w := httptest.NewRecorder()
 
 	a.handleMessage(w, r)
@@ -80,11 +82,12 @@ func TestHandleMessage_BadXMLReturns400(t *testing.T) {
 
 func TestHandleMessage_NonTextReturnsSuccess(t *testing.T) {
 	a := New(config.WechatConfig{Token: "tk"})
-	sig := wechatSign("tk", "100", "abc")
+	ts := nowTS() // W3-22：当下时间戳
+	sig := wechatSign("tk", ts, "abc")
 	xmlBody := `<xml><ToUserName>gh</ToUserName><FromUserName>oUser</FromUserName>` +
 		`<MsgType>image</MsgType></xml>`
 	r := httptest.NewRequest(http.MethodPost,
-		fmt.Sprintf("/wh?signature=%s&timestamp=100&nonce=abc", sig), strings.NewReader(xmlBody))
+		fmt.Sprintf("/wh?signature=%s&timestamp=%s&nonce=abc", sig, ts), strings.NewReader(xmlBody))
 	w := httptest.NewRecorder()
 
 	a.handleMessage(w, r)

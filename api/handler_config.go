@@ -11,7 +11,7 @@ import (
 
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/config"
-	"github.com/hexagon-codes/hexclaw/security"
+	"github.com/hexagon-codes/toolkit/net/ssrf"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
@@ -112,9 +112,9 @@ func validateExternalProviderBaseURL(providerType, baseURL string) error {
 	if strings.EqualFold(providerType, "ollama") {
 		// Ollama is local: constrain its base_url to loopback instead of skipping
 		// validation, so it can't be aimed at an internal/metadata address.
-		return security.ValidateLocalURL(baseURL)
+		return ssrf.ValidateLocalURL(baseURL)
 	}
-	return security.ValidateURL(baseURL)
+	return ssrf.ValidateURL(baseURL)
 }
 
 // handleGetLLMConfig GET /api/v1/config/llm

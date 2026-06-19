@@ -361,6 +361,14 @@ func normalizeCompiledSpec(spec *JobSpec) {
 	if spec.Runtime == "" {
 		spec.Runtime = RuntimeStarlark
 	}
+	// A weak model may declare runtime "python3" while emitting Starlark host builtins
+	// (emit / kb_ingest / http_get / ...). Honoring it routes the script to the python3
+	// engine, which then dies at runtime (NameError: name 'emit' is not defined).
+	// Correct that specific mismatch — validation and execution then both use the engine
+	// the script was actually written for — while leaving genuine python3 output intact.
+	if spec.Runtime == RuntimePython3 && looksLikeStarlark(spec.Script) {
+		spec.Runtime = RuntimeStarlark
+	}
 	spec.Deps = nil
 }
 

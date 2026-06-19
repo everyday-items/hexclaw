@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/config"
 )
@@ -87,11 +88,13 @@ func TestDecrypt_ShortCiphertext(t *testing.T) {
 func TestHandleVerify_ValidSignatureDecryptsEchostr(t *testing.T) {
 	a := New(config.WecomConfig{Token: "tk", AESKey: wecomTestAESKey})
 	enc := wecomEncrypt(t, a.aesKey, "verify-plain", "corp-id-1")
-	sig := wecomSign("tk", "100", "abc", enc)
+	// W3-27 修复后 handleVerify 追加重放窗口校验，需使用新鲜 timestamp 才能放行。
+	ts := fmt.Sprintf("%d", time.Now().Unix())
+	sig := wecomSign("tk", ts, "abc", enc)
 
 	q := url.Values{}
 	q.Set("msg_signature", sig)
-	q.Set("timestamp", "100")
+	q.Set("timestamp", ts)
 	q.Set("nonce", "abc")
 	q.Set("echostr", enc)
 	w := httptest.NewRecorder()

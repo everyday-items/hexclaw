@@ -13,10 +13,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
 	"github.com/hexagon-codes/hexclaw/streamstate"
-	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"

@@ -12,19 +12,20 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/hexagon-codes/hexclaw/adapter"
-	"github.com/hexagon-codes/hexclaw/trace"
+	"github.com/hexagon-codes/toolkit/crypto/sign"
+	"github.com/hexagon-codes/toolkit/util/logger"
+
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/toolkit/net/httpx"
+
+	"github.com/hexagon-codes/hexclaw/adapter"
 )
 
 // WhatsAppAdapter WhatsApp Business API 适配器
@@ -270,9 +271,7 @@ func (a *WhatsAppAdapter) verifySignature(r *http.Request, body []byte) bool {
 	if !strings.HasPrefix(sig, prefix) {
 		return false
 	}
-	mac := hmac.New(sha256.New, []byte(a.config.AppSecret))
-	mac.Write(body)
-	expected := hex.EncodeToString(mac.Sum(nil))
+	expected := sign.HMACSHA256Hex(body, []byte(a.config.AppSecret))
 	return hmac.Equal([]byte(strings.TrimPrefix(sig, prefix)), []byte(expected))
 }
 

@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hexagon-codes/hexclaw/security"
+	"github.com/hexagon-codes/toolkit/net/ssrf"
 )
 
 // PreprocessConfig 预处理配置。
@@ -33,7 +33,7 @@ var imageRefPattern = regexp.MustCompile(
 
 // PreprocessMarkdown 对 markdown 中的图片引用做预处理：
 //
-//   - https?:// → 走 security.ValidateURL（私有段拦截 + DNS 解析校验 + 重定向再校验），
+//   - https?:// → 走 ssrf.ValidateURL（私有段拦截 + DNS 解析校验 + 重定向再校验），
 //     拉到内存后转 base64 data URL 注入回 markdown
 //   - data:image/... → 保留（pandoc 默认能识别）
 //   - file:// 或绝对路径 → 拒绝（防越权读盘）
@@ -119,13 +119,13 @@ func processImageRef(ctx context.Context, alt, rawURL string, client *http.Clien
 // fetchToDataURL 安全拉取 URL 并转 data URL。
 //
 // 安全清单：
-//   - security.ValidateURL（私有段 / loopback / cloud metadata / DNS rebinding）
+//   - ssrf.ValidateURL（私有段 / loopback / cloud metadata / DNS rebinding）
 //   - 仅 http/https
 //   - 跟随重定向但**对每个重定向目标重新校验**
 //   - 单图字节上限
 //   - 超时
 func fetchToDataURL(ctx context.Context, rawURL string, client *http.Client, maxBytes int64) (string, error) {
-	if err := security.ValidateURL(rawURL); err != nil {
+	if err := ssrf.ValidateURL(rawURL); err != nil {
 		return "", &RenderError{
 			Code:   CodeInvalidInput,
 			Detail: fmt.Sprintf("SSRF check failed for %s: %v", rawURL, err),
@@ -188,7 +188,7 @@ func newSafeHTTPClient(timeout time.Duration) *http.Client {
 			}
 			// 重新校验目标
 			target := req.URL.String()
-			if err := security.ValidateURL(target); err != nil {
+			if err := ssrf.ValidateURL(target); err != nil {
 				return fmt.Errorf("redirect target %s blocked: %w", target, err)
 			}
 			return nil

@@ -493,6 +493,11 @@ func (s *Store) CleanupOldSessions(ctx context.Context, olderThanDays int) (int6
 }
 
 // SaveMessage 保存消息 + 原子更新会话冗余统计字段
+//
+// WAL 模式下多个写连接并发提交时，底层可能瞬时返回 SQLITE_BUSY(5) /
+// SQLITE_BUSY_SNAPSHOT(517)（busy_timeout 不覆盖写写快照冲突）。整个写事务
+// 经 sqliteutil.RetryOnBusy 做有限退避重试：冲突方提交后重试即可成功落库，
+// 避免并发写竞争下消息被静默丢弃。事务在每次重试内独立开启/回滚，保证幂等。
 func (s *Store) SaveMessage(ctx context.Context, msg *storage.MessageRecord) error {
 	if msg.CreatedAt.IsZero() {
 		msg.CreatedAt = time.Now()
@@ -504,6 +509,18 @@ func (s *Store) SaveMessage(ctx context.Context, msg *storage.MessageRecord) err
 		msg.Meta = "{}"
 	}
 
+	if err := sqliteutil.RetryOnBusy(ctx, func() error {
+		return s.saveMessageTx(ctx, msg)
+	}); err != nil {
+		return err
+	}
+	s.invalidateSearchCache()
+	return nil
+}
+
+// saveMessageTx 在单个事务内插入消息并更新会话冗余字段。
+// 拆出独立方法以便 RetryOnBusy 在 BUSY 冲突时整体重试（每次重试独立事务）。
+func (s *Store) saveMessageTx(ctx context.Context, msg *storage.MessageRecord) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("开启事务失败: %w", err)
@@ -537,11 +554,7 @@ func (s *Store) SaveMessage(ctx context.Context, msg *storage.MessageRecord) err
 		return err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	s.invalidateSearchCache()
-	return nil
+	return tx.Commit()
 }
 
 // GetMessage 获取单条消息

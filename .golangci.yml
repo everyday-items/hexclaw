@@ -1,5 +1,41 @@
+# golangci-lint v2 配置 — hexclaw（L3 应用）
+# 参考: https://golangci-lint.run/usage/configuration/
+# 应用层以"correctness 高信号"为主，避免给既有大体量应用代码刷屏式 style 噪音；
+# 底层库（toolkit/ai-core/hexagon）lint 更严。
 version: "2"
 
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
 linters:
-  disable:
-    - errcheck
+  # 默认集（errcheck/govet/ineffassign/staticcheck/unused）之上，补高信号 correctness 检查。
+  enable:
+    - bodyclose      # HTTP response body 未关闭
+    - noctx          # 缺少 context 的网络/DB 调用
+    - unconvert      # 多余的类型转换
+    - misspell       # 拼写
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+    misspell:
+      locale: US
+  exclusions:
+    rules:
+      # 测试文件放宽 errcheck（断言/清理路径常忽略错误）
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/hexagon-codes/hexclaw

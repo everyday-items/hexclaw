@@ -18,8 +18,11 @@ package wechat
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/sha1"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -28,18 +31,27 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/adapter/whauth"
 	"github.com/hexagon-codes/hexclaw/config"
-	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
 const wechatAPIBase = "https://api.weixin.qq.com/cgi-bin"
+
+// replayWindow 微信回调时间戳防重放窗口。
+//
+// 微信请求在 query 中携带 timestamp（Unix 秒），配合 whauth.CheckReplayWindow
+// 校验其是否落在 [now-replayWindow, now+容忍] 内，超窗即视为重放攻击予以拒绝。
+// 取 5 分钟在容忍正常网络/时钟抖动的同时保持足够的重放防护强度。
+const replayWindow = 5 * time.Minute
 
 // WechatAdapter 微信公众号适配器
 //
@@ -56,6 +68,7 @@ type WechatAdapter struct {
 	mu          sync.RWMutex
 	accessToken string
 	tokenExpiry time.Time
+	aesKey      []byte // 安全模式下消息解密用的 AES Key（由 EncodingAESKey 解码而来）
 }
 
 // New 创建微信公众号适配器
@@ -63,6 +76,13 @@ func New(cfg config.WechatConfig) *WechatAdapter {
 	a := &WechatAdapter{
 		cfg:    cfg,
 		client: httpx.RawClient(httpx.WithRawTimeout(10 * time.Second)),
+	}
+	// 安全模式：解码 EncodingAESKey（43 字符 Base64，需补 "=" 后再解码为 32 字节 AES-256 Key）。
+	if cfg.AESKey != "" {
+		key, err := base64.StdEncoding.DecodeString(cfg.AESKey + "=")
+		if err == nil {
+			a.aesKey = key
+		}
 	}
 	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformWechat, a.sendReplyNow)
 	return a
@@ -173,11 +193,32 @@ func (a *WechatAdapter) handleVerify(w http.ResponseWriter, r *http.Request) {
 	nonce := r.URL.Query().Get("nonce")
 	echoStr := r.URL.Query().Get("echostr")
 
+	// W3-22：先校验时间戳重放窗口，再校验签名，超窗即拒绝。
+	if err := a.checkTimestamp(timestamp); err != nil {
+		http.Error(w, "name", http.StatusForbidden)
+		return
+	}
 	if a.checkSignature(signature, timestamp, nonce) {
 		_, _ = w.Write([]byte(echoStr))
 	} else {
 		http.Error(w, "name", http.StatusForbidden)
 	}
+}
+
+// checkTimestamp 校验微信回调携带的时间戳是否落在防重放窗口内。
+//
+// W3-22：仅校验签名而不校验时间戳时，攻击者可重放抓包到的合法请求。
+// 这里把 query 中的 timestamp（Unix 秒字符串）解析后交给
+// whauth.CheckReplayWindow 统一校验，超窗（过旧/过新）或非法时间戳一律拒绝。
+func (a *WechatAdapter) checkTimestamp(timestamp string) error {
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return fmt.Errorf("微信回调时间戳非法 %q: %w", timestamp, err)
+	}
+	if err := whauth.CheckReplayWindow(ts, replayWindow); err != nil {
+		return fmt.Errorf("微信回调时间戳超出重放窗口: %w", err)
+	}
+	return nil
 }
 
 // handleMessage 处理消息回调
@@ -186,6 +227,11 @@ func (a *WechatAdapter) handleMessage(w http.ResponseWriter, r *http.Request) {
 	signature := r.URL.Query().Get("signature")
 	timestamp := r.URL.Query().Get("timestamp")
 	nonce := r.URL.Query().Get("nonce")
+	// W3-22：先校验时间戳重放窗口，再校验签名，超窗即拒绝。
+	if err := a.checkTimestamp(timestamp); err != nil {
+		http.Error(w, "name", http.StatusForbidden)
+		return
+	}
 	if !a.checkSignature(signature, timestamp, nonce) {
 		http.Error(w, "name", http.StatusForbidden)
 		return
@@ -203,6 +249,22 @@ func (a *WechatAdapter) handleMessage(w http.ResponseWriter, r *http.Request) {
 		}
 		http.Error(w, "读取请求失败", http.StatusBadRequest)
 		return
+	}
+
+	// W3-23：安全模式下消息体经过 AES 加密，需先校验 msg_signature 再解密。
+	// 明文模式下 body 即为明文 XML，直接解析。
+	if a.secureModeEnabled() {
+		var err error
+		body, err = a.decryptCallbackBody(r, body)
+		if err != nil {
+			// 解密/签名校验失败统一按拒绝处理，区分签名(403)与解密(500)。
+			if errors.Is(err, whauth.ErrSignatureMismatch) {
+				http.Error(w, "name", http.StatusForbidden)
+			} else {
+				http.Error(w, "解密消息失败", http.StatusInternalServerError)
+			}
+			return
+		}
 	}
 
 	var msg wechatMessage
@@ -264,7 +326,10 @@ func (a *WechatAdapter) handleMessage(w http.ResponseWriter, r *http.Request) {
 			Content:      content,
 		}
 		w.Header().Set("Content-Type", "application/xml")
-		xml.NewEncoder(w).Encode(replyXML)
+		// W3-24：被动回复 XML 编码/写入失败不应被静默吞掉，记录日志便于排障。
+		if err := xml.NewEncoder(w).Encode(replyXML); err != nil {
+			logger.Error("微信被动回复 XML 编码写入失败", "error", err, "to_user", msg.FromUserName)
+		}
 
 	case <-ctx.Done():
 		// 超时，先返回空响应，后续通过客服消息推送
@@ -287,7 +352,20 @@ func (a *WechatAdapter) handleMessage(w http.ResponseWriter, r *http.Request) {
 // ============== 签名验证 ==============
 
 // checkSignature 验证微信请求签名
+//
+// 微信约定：将 Token、timestamp、nonce 三者按字典序排序拼接后做 SHA1，
+// 与请求携带的 signature 比对。本方法保留该原生算法，但在安全上做两点加固：
+//
+//   - W3-21：Token 未配置（空串）时一律拒绝（fail-closed）。否则签名只取决于
+//     timestamp+nonce，任何外部调用方都能伪造出"合法"签名绕过鉴权。
+//     这里复用 whauth.RequireSecret 统一强制密钥非空。
+//   - 比对改用 whauth.ConstantTimeEqualString 做常量时间比较，避免时序侧信道泄露。
 func (a *WechatAdapter) checkSignature(signature, timestamp, nonce string) bool {
+	// fail-closed：Token 为空直接拒绝，杜绝空密钥下的签名伪造。
+	if whauth.RequireSecret(a.Name(), a.cfg.Token) != nil {
+		return false
+	}
+
 	strs := []string{a.cfg.Token, timestamp, nonce}
 	sort.Strings(strs)
 	combined := strings.Join(strs, "")
@@ -295,7 +373,114 @@ func (a *WechatAdapter) checkSignature(signature, timestamp, nonce string) bool 
 	hash := sha1.Sum([]byte(combined))
 	expected := fmt.Sprintf("%x", hash)
 
-	return hmac.Equal([]byte(expected), []byte(signature))
+	return whauth.ConstantTimeEqualString(expected, signature)
+}
+
+// checkMsgSignature 验证安全模式下的 msg_signature。
+//
+// 微信安全模式约定：将 Token、timestamp、nonce、密文 encrypt 四者按字典序排序
+// 拼接后做 SHA1，与请求携带的 msg_signature 比对。与 checkSignature 同样的
+// 安全加固：Token 为空 fail-closed（W3-21），并用常量时间比较防时序侧信道。
+func (a *WechatAdapter) checkMsgSignature(msgSignature, timestamp, nonce, encrypt string) bool {
+	if whauth.RequireSecret(a.Name(), a.cfg.Token) != nil {
+		return false
+	}
+
+	strs := []string{a.cfg.Token, timestamp, nonce, encrypt}
+	sort.Strings(strs)
+	combined := strings.Join(strs, "")
+
+	hash := sha1.Sum([]byte(combined))
+	expected := fmt.Sprintf("%x", hash)
+
+	return whauth.ConstantTimeEqualString(expected, msgSignature)
+}
+
+// secureModeEnabled 报告是否启用了安全模式（已配置可用的 EncodingAESKey）。
+func (a *WechatAdapter) secureModeEnabled() bool {
+	return len(a.aesKey) > 0
+}
+
+// decrypt 解密微信安全模式下的消息密文（AES-256-CBC + PKCS7）。
+//
+// W3-23：实现安全模式解密。明文格式与企业微信一致：
+//
+//	16 字节随机串 + 4 字节消息长度(BigEndian) + 消息内容 + AppID
+//
+// IV 取 AES Key 的前 16 字节。返回去除随机串/长度头/AppID 尾部后的消息正文。
+func (a *WechatAdapter) decrypt(encrypted string) (string, error) {
+	if len(a.aesKey) == 0 {
+		return "", fmt.Errorf("微信 aes key 未配置")
+	}
+
+	ciphertext, err := base64.StdEncoding.DecodeString(encrypted)
+	if err != nil {
+		return "", fmt.Errorf("base64 解码失败: %w", err)
+	}
+
+	block, err := aes.NewCipher(a.aesKey)
+	if err != nil {
+		return "", fmt.Errorf("创建 AES Cipher 失败: %w", err)
+	}
+
+	if len(ciphertext) < aes.BlockSize || len(ciphertext)%aes.BlockSize != 0 {
+		return "", fmt.Errorf("密文长度非法")
+	}
+
+	iv := a.aesKey[:aes.BlockSize]
+	mode := cipher.NewCBCDecrypter(block, iv)
+	mode.CryptBlocks(ciphertext, ciphertext)
+
+	// 去除 PKCS7 填充（完整校验所有填充字节，避免被构造的非法填充蒙混）。
+	padLen := int(ciphertext[len(ciphertext)-1])
+	if padLen <= 0 || padLen > aes.BlockSize || padLen > len(ciphertext) {
+		return "", fmt.Errorf("无效的 PKCS7 填充")
+	}
+	for i := 0; i < padLen; i++ {
+		if ciphertext[len(ciphertext)-1-i] != byte(padLen) {
+			return "", fmt.Errorf("无效的 PKCS7 填充")
+		}
+	}
+	ciphertext = ciphertext[:len(ciphertext)-padLen]
+
+	// 解析格式：16 字节随机串 + 4 字节消息长度 + 消息内容 + AppID。
+	if len(ciphertext) < 20 {
+		return "", fmt.Errorf("解密后数据太短")
+	}
+	msgLen := binary.BigEndian.Uint32(ciphertext[16:20])
+	if int(msgLen) > len(ciphertext)-20 {
+		return "", fmt.Errorf("消息长度不匹配")
+	}
+
+	return string(ciphertext[20 : 20+msgLen]), nil
+}
+
+// decryptCallbackBody 校验并解密安全模式下的回调消息体。
+//
+// W3-23：安全模式消息体形如 <xml><Encrypt><![CDATA[...]]></Encrypt>...</xml>。
+// 校验链：解析 Encrypt 密文 -> 用 msg_signature 校验(checkMsgSignature) -> AES 解密。
+// 校验失败返回包装 whauth.ErrSignatureMismatch 的错误，解密失败返回原始错误，
+// 由调用方据此映射 403/500。返回解密后的明文 XML 字节供后续统一解析。
+func (a *WechatAdapter) decryptCallbackBody(r *http.Request, body []byte) ([]byte, error) {
+	var enc struct {
+		Encrypt string `xml:"Encrypt"`
+	}
+	if err := xml.Unmarshal(body, &enc); err != nil {
+		return nil, fmt.Errorf("解析加密 XML 失败: %w", err)
+	}
+
+	timestamp := r.URL.Query().Get("timestamp")
+	nonce := r.URL.Query().Get("nonce")
+	msgSignature := r.URL.Query().Get("msg_signature")
+	if !a.checkMsgSignature(msgSignature, timestamp, nonce, enc.Encrypt) {
+		return nil, fmt.Errorf("安全模式 msg_signature 校验失败: %w", whauth.ErrSignatureMismatch)
+	}
+
+	plaintext, err := a.decrypt(enc.Encrypt)
+	if err != nil {
+		return nil, fmt.Errorf("安全模式解密失败: %w", err)
+	}
+	return []byte(plaintext), nil
 }
 
 // ============== API 调用 ==============

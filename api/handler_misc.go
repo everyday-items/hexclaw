@@ -14,15 +14,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hexagon-codes/ai-core/media/voice"
 	"github.com/hexagon-codes/hexclaw/canvas"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/engine"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/router"
-	"github.com/hexagon-codes/hexclaw/security"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
-	"github.com/hexagon-codes/hexclaw/voice"
+	"github.com/hexagon-codes/toolkit/net/ssrf"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
@@ -665,7 +665,7 @@ func (s *Server) installSkillFromURL(w http.ResponseWriter, r *http.Request, raw
 
 	// SSRF guard: reject loopback/private/link-local/cloud-metadata targets
 	// before any fetch, matching the provider-model path (validateExternalProviderBaseURL).
-	if err := security.ValidateURL(rawURL); err != nil {
+	if err := ssrf.ValidateURL(rawURL); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "URL 不安全: " + err.Error(),
 		})

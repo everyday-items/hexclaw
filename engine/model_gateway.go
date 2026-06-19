@@ -20,7 +20,7 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
-	"github.com/hexagon-codes/hexclaw/events"
+	"github.com/hexagon-codes/hexagon/observe/events"
 	"github.com/hexagon-codes/hexclaw/featureflag"
 )
 
@@ -96,7 +96,7 @@ type observeProvider struct {
 	recorder CallRecorder
 }
 
-func (o *observeProvider) Name() string { return o.inner.Name() }
+func (o *observeProvider) Name() string            { return o.inner.Name() }
 func (o *observeProvider) Models() []llm.ModelInfo { return o.inner.Models() }
 func (o *observeProvider) CountTokens(msgs []llm.Message) (int, error) {
 	return o.inner.CountTokens(msgs)
@@ -194,8 +194,8 @@ type rateLimitProvider struct {
 	rl    *windowLimiter
 }
 
-func (r *rateLimitProvider) Name() string                  { return r.inner.Name() }
-func (r *rateLimitProvider) Models() []llm.ModelInfo       { return r.inner.Models() }
+func (r *rateLimitProvider) Name() string            { return r.inner.Name() }
+func (r *rateLimitProvider) Models() []llm.ModelInfo { return r.inner.Models() }
 func (r *rateLimitProvider) CountTokens(msgs []llm.Message) (int, error) {
 	return r.inner.CountTokens(msgs)
 }
@@ -232,8 +232,8 @@ type promptRewriteProvider struct {
 	fn    PromptRewriteFunc
 }
 
-func (p *promptRewriteProvider) Name() string                  { return p.inner.Name() }
-func (p *promptRewriteProvider) Models() []llm.ModelInfo       { return p.inner.Models() }
+func (p *promptRewriteProvider) Name() string            { return p.inner.Name() }
+func (p *promptRewriteProvider) Models() []llm.ModelInfo { return p.inner.Models() }
 func (p *promptRewriteProvider) CountTokens(msgs []llm.Message) (int, error) {
 	return p.inner.CountTokens(msgs)
 }

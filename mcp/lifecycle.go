@@ -16,7 +16,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/hexagon-codes/hexclaw/events"
+	"github.com/hexagon-codes/hexagon/observe/events"
 	"github.com/hexagon-codes/hexclaw/featureflag"
 )
 

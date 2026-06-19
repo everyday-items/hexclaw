@@ -11,19 +11,20 @@ package line
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/toolkit/crypto/sign"
+	"github.com/hexagon-codes/toolkit/util/logger"
+
 	"github.com/hexagon-codes/toolkit/net/httpx"
+
+	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/adapter/whauth"
 )
 
 // LineAdapter LINE Messaging API 适配器
@@ -209,19 +210,33 @@ func (a *LineAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	// W3-14：显式拒绝超大请求体，避免静默截断后用残缺数据继续解析。
+	// 多读 1 字节（上限 + 1），若实际读到的长度超过上限即判定超限，
+	// 返回明确的 413 而非把截断后损坏的 JSON 误报成 400。
+	const maxBodyBytes = 1 << 20 // 1MB
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
+	if len(body) > maxBodyBytes {
+		http.Error(w, fmt.Sprintf("请求体过大: 超过 %d 字节上限 (request body too large)", maxBodyBytes), http.StatusRequestEntityTooLarge)
+		return
+	}
 
-	// 签名验证
-	if a.config.ChannelSecret != "" {
-		signature := r.Header.Get("X-Line-Signature")
-		if !a.verifySignature(body, signature) {
-			http.Error(w, "Invalid signature", http.StatusForbidden)
-			return
-		}
+	// W3-13：签名校验强制 fail-closed。
+	// 此前 ChannelSecret 为空时静默跳过校验（fail-open），等于把签名校验关掉，
+	// 攻击者可伪造任意未签名请求。现统一用 whauth.RequireSecret 强制要求已配置
+	// 密钥，未配置即拒绝（403），而非放行；已配置则用 toolkit 一步式常量时间
+	// 校验保留 LINE 平台原算法（HMAC-SHA256 + Base64）。
+	if err := whauth.RequireSecret("line", a.config.ChannelSecret); err != nil {
+		http.Error(w, "Webhook signature verification required", http.StatusForbidden)
+		return
+	}
+	signature := r.Header.Get("X-Line-Signature")
+	if !a.verifySignature(body, signature) {
+		http.Error(w, "Invalid signature", http.StatusForbidden)
+		return
 	}
 
 	var payload lineWebhook
@@ -237,11 +252,17 @@ func (a *LineAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		// W3-12：按 source.type 取会话维度标识作为 ChatID。
+		// 群组（group）用 groupId、房间（room）用 roomId，单聊（user）回退 userId。
+		// 此前 ChatID 与 UserID 都取 userId，导致群消息丢失 groupId、ChatID
+		// 退化为发言者，无法按群会话路由/回复。
+		chatID := event.Source.chatID()
+
 		msg := &adapter.Message{
 			ID:         event.Message.ID,
 			Platform:   PlatformLINE,
 			InstanceID: a.Name(),
-			ChatID:     event.Source.UserID,
+			ChatID:     chatID,
 			UserID:     event.Source.UserID,
 			Content:    event.Message.Text,
 			Timestamp:  time.UnixMilli(event.Timestamp),
@@ -318,11 +339,12 @@ func (a *LineAdapter) Health(_ context.Context) error {
 }
 
 // verifySignature 验证 LINE Webhook 签名
+//
+// 直接复用 toolkit/crypto/sign 的一步式校验函数：内部一次性完成
+// "重新计算 HMAC-SHA256 + 用 hmac.Equal 做常量时间比较"，天然抗时序侧信道，
+// 保留 LINE 平台原算法（HMAC-SHA256 + Base64）。
 func (a *LineAdapter) verifySignature(body []byte, signature string) bool {
-	mac := hmac.New(sha256.New, []byte(a.config.ChannelSecret))
-	mac.Write(body)
-	expected := base64.StdEncoding.EncodeToString(mac.Sum(nil))
-	return hmac.Equal([]byte(expected), []byte(signature))
+	return sign.VerifyHMACSHA256Base64(body, []byte(a.config.ChannelSecret), signature)
 }
 
 // LINE Webhook 数据结构
@@ -342,6 +364,30 @@ type lineSource struct {
 	Type    string `json:"type"`
 	UserID  string `json:"userId"`
 	GroupID string `json:"groupId,omitempty"`
+	RoomID  string `json:"roomId,omitempty"`
+}
+
+// chatID 返回会话维度标识，用作统一 Message 的 ChatID。
+//
+// LINE 的 source 有三类：
+//   - group：多人群组，会话标识为 groupId。
+//   - room：多人聊天室，会话标识为 roomId。
+//   - user：一对一单聊，会话即对方 userId。
+//
+// 对 group/room，若平台未带对应 ID（异常场景）则回退到 userId，
+// 保证 ChatID 始终非空可路由。
+func (s lineSource) chatID() string {
+	switch s.Type {
+	case "group":
+		if s.GroupID != "" {
+			return s.GroupID
+		}
+	case "room":
+		if s.RoomID != "" {
+			return s.RoomID
+		}
+	}
+	return s.UserID
 }
 
 type lineMessage struct {

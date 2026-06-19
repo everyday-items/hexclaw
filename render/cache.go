@@ -11,6 +11,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/lang/mapx"
 )
 
 // Cache 磁盘 LRU 缓存。
@@ -21,12 +23,12 @@ import (
 // 命中时返回 cache file 路径，HTTP handler 走 ServeContent 流式下发，
 // 不读到 Go heap。LRU 达到上限或 TTL 过期时清理。
 type Cache struct {
-	dir            string
-	maxBytes       int64
-	ttl            time.Duration
-	engineVersion  string
-	assetsHash     string
-	defaultLocale  string
+	dir           string
+	maxBytes      int64
+	ttl           time.Duration
+	engineVersion string
+	assetsHash    string
+	defaultLocale string
 
 	mu      sync.Mutex
 	entries map[string]*cacheEntry // key = cacheKey, value = entry
@@ -90,10 +92,7 @@ func (c *Cache) Key(content string, format Format, opts RenderOptions) string {
 		"AllowRawTeX":  opts.AllowRawTeX,
 		"Locale":       opts.Locale,
 	}
-	keys := make([]string, 0, len(optMap))
-	for k := range optMap {
-		keys = append(keys, k)
-	}
+	keys := mapx.Keys(optMap)
 	sort.Strings(keys)
 	canonical := make([][2]any, 0, len(keys))
 	for _, k := range keys {

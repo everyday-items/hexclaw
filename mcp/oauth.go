@@ -16,6 +16,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	// randx 为 toolkit 的加密安全随机串生成包；本文件同时直接使用标准库
+	// crypto/rand（PKCE verifier），故以别名 randx 区分，避免与标准库 rand 冲突。
+	randx "github.com/hexagon-codes/toolkit/util/rand"
 )
 
 // OAuthConfig holds OAuth 2.0 configuration for an MCP server.
@@ -299,14 +303,19 @@ func oauthStateValid(expected, got string) bool {
 	return expected != "" && got == expected
 }
 
+// generateRandomString 生成长度为 n 的加密安全随机字符串，用于 OAuth CSRF state
+// 等不可信任场景下的一次性随机 nonce。
+//
+// 该 state 仅作为不透明随机值参与 oauthStateValid 的精确相等比较，对字符集无要求，
+// 只要求加密安全且具备足够熵。因此底层实现下沉到 toolkit 的 rand.TryToken：
+//   - 错误传播：熵源（crypto/rand）失败时返回 error 而非 panic，保留本调用点
+//     "生成失败即中止授权流程"的语义（避免 state="" 时 "" == "" 击穿 CSRF 守卫）；
+//   - 字符集：rand.TryToken 输出 [0-9A-Za-z] 的 AlphaNumeric 串（n 字符约 5.95n 比特
+//     熵），对 CSRF nonce 而言安全裕度充足，与历史 base64url 串等价可换。
+//
+// PKCE code verifier 因 RFC 7636 对字符集与长度有强约束，仍保留本地 generateCodeVerifier。
 func generateRandomString(n int) (string, error) {
-	// Generate enough bytes to ensure n characters after base64 encoding
-	byteLen := (n*3 + 3) / 4 // base64 expands 3:4
-	b := make([]byte, byteLen)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b)[:n], nil
+	return randx.TryToken(n)
 }
 
 func joinScopes(scopes []string) string {

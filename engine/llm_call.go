@@ -8,7 +8,7 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
-	"github.com/hexagon-codes/hexclaw/events"
+	"github.com/hexagon-codes/hexagon/observe/events"
 )
 
 // LLMCallContext 装载一次 failover-aware LLM 调用所需的全部依赖。
@@ -101,8 +101,8 @@ func CompleteWithFailover(
 		}
 		lastErr = err
 
-		reason := ClassifyError(err, 0, "")
-		action := HandleFailover(reason)
+		reason := llm.ClassifyError(err, 0, "")
+		action := llm.HandleFailover(reason)
 		// v0.4.0 H6：每次 failover 投递事件
 		_ = events.Emit(ctx, events.New("llm.call.failover", events.SeverityWarn).
 			WithSource("engine.llm_call").
@@ -192,8 +192,8 @@ func StreamWithFailover(
 		}
 		lastErr = err
 
-		reason := ClassifyError(err, 0, "")
-		action := HandleFailover(reason)
+		reason := llm.ClassifyError(err, 0, "")
+		action := llm.HandleFailover(reason)
 		if fc.Logger != nil {
 			fc.Logger("LLM stream failover",
 				"provider", fc.ProviderName,

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/hexagon-codes/hexclaw/imagegen"
+	imagegen "github.com/hexagon-codes/ai-core/media/image"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
 

@@ -2,8 +2,6 @@ package cron
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -17,6 +15,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hexagon-codes/toolkit/net/ip"
+	"github.com/hexagon-codes/toolkit/util/hash"
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
 )
@@ -347,8 +347,8 @@ func builtinSHA256(_ *starlark.Thread, b *starlark.Builtin, args starlark.Tuple,
 	if err := starlark.UnpackArgs(b.Name(), args, kwargs, "s", &s); err != nil {
 		return nil, err
 	}
-	sum := sha256.Sum256([]byte(s))
-	return starlark.String(hex.EncodeToString(sum[:])), nil
+	// 复用 toolkit/util/hash.SHA256：内部即 sha256.Sum256 + hex 编码，输出与原实现逐字节一致。
+	return starlark.String(hash.SHA256(s)), nil
 }
 
 // builtinNow: now() -> dict of the current local time. Collectors routinely need
@@ -494,11 +494,11 @@ func ssrfGuardedClient(timeout time.Duration) *http.Client {
 // reach: loopback, private, link-local, or unspecified. Only public addresses
 // are allowed. Loopback is blocked so a script cannot reach the app's own
 // localhost services (KB ingest goes through the in-process kb_ingest builtin);
-// private/link-local covers internal services and cloud metadata.
-func isBlockedIP(ip net.IP) bool {
-	return ip.IsLoopback() ||
-		ip.IsPrivate() ||
-		ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() ||
-		ip.IsUnspecified()
+// private/link-local covers internal services and cloud metadata。
+//
+// 判定逻辑下沉到 toolkit/net/ip.IsPrivateOrReservedIP，二者拦截集合完全一致：
+// IsLoopback || IsPrivate || IsLinkLocalUnicast || IsLinkLocalMulticast ||
+// IsUnspecified（含云元数据端点 169.254.169.254），SSRF 防御语义不变。
+func isBlockedIP(addr net.IP) bool {
+	return ip.IsPrivateOrReservedIP(addr)
 }

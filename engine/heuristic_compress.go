@@ -18,7 +18,12 @@ import (
 	"strings"
 
 	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/ai-core/tokenizer"
 )
+
+// tokenEstimator 复用 ai-core/tokenizer 的 CJK 感知估算，替代裸 len/4，
+// 与同仓 token_estimate.go 的口径保持一致。GPT-4 参数对英文即 4 字符/token。
+var tokenEstimator = tokenizer.New(tokenizer.GPT4)
 
 // HeuristicCompressOptions 控制启发式压缩参数。零值时使用合理默认。
 type HeuristicCompressOptions struct {
@@ -103,14 +108,17 @@ func HeuristicCompress(history []llm.Message, cfg HeuristicCompressOptions) []ll
 	return out
 }
 
-// EstimateMessagesTokens 粗略估算 messages 总 token 数（4 字符/token 近似）。
-// 用于 Compactor 双路径路由阈值判断。
+// EstimateMessagesTokens 估算 messages 总 token 数，用于 Compactor 双路径路由阈值判断。
+//
+// 改用 ai-core/tokenizer 的 CJK 感知估算替代裸 len/4：英文仍约 4 字符/token，
+// 中文按约 1.5 字符/token，消除与同仓 token_estimate.go 的口径不一致。
+// 逐条 content + 每个 tool_call.Arguments 累加，保持与原循环相同的统计范围。
 func EstimateMessagesTokens(history []llm.Message) int {
 	total := 0
 	for _, m := range history {
-		total += len(m.Content) / 4
+		total += tokenEstimator.Count(m.Content)
 		for _, tc := range m.ToolCalls {
-			total += len(tc.Arguments) / 4
+			total += tokenEstimator.Count(tc.Arguments)
 		}
 	}
 	return total

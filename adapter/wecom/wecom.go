@@ -29,17 +29,27 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/adapter/whauth"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
 const wecomAPIBase = "https://qyapi.weixin.qq.com/cgi-bin"
+
+// wecomReplayWindow 是 webhook 时间戳允许回看的重放窗口。
+//
+// W3-27 安全：企业微信签名把 timestamp 纳入 SHA1 计算，但源码原先从不比较
+// timestamp 与当前时间，导致任意曾经合法的请求可被无限重放。此处以 5 分钟
+// 作为向过去回看的容忍窗口（whauth.CheckReplayWindow 另对未来侧额外放宽 5 分钟
+// 时钟漂移），过旧的请求一律拒绝。
+const wecomReplayWindow = 5 * time.Minute
 
 // WecomAdapter 企业微信适配器
 //
@@ -197,6 +207,13 @@ func (a *WecomAdapter) handleVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// W3-27 安全：签名通过后还需校验时间戳重放窗口，拒绝过旧/过新的请求。
+	if err := a.checkReplayWindow(timestamp); err != nil {
+		logger.Warn("企业微信 URL 验证时间戳超出重放窗口", "error", err)
+		http.Error(w, "timestamp out of replay window", http.StatusForbidden)
+		return
+	}
+
 	// 解密 echostr
 	plaintext, err := a.decrypt(echoStr)
 	if err != nil {
@@ -244,6 +261,13 @@ func (a *WecomAdapter) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// W3-27 安全：签名通过后还需校验时间戳重放窗口，拒绝过旧/过新的请求。
+	if err := a.checkReplayWindow(timestamp); err != nil {
+		logger.Warn("企业微信回调时间戳超出重放窗口", "error", err)
+		http.Error(w, "timestamp out of replay window", http.StatusForbidden)
+		return
+	}
+
 	// 解密消息
 	plaintext, err := a.decrypt(encMsg.Encrypt)
 	if err != nil {
@@ -268,7 +292,23 @@ func (a *WecomAdapter) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 // processMessage 异步处理消息
 func (a *WecomAdapter) processMessage(msg wecomMessage) {
+	// W3-28 功能闭环：校验消息所属应用与配置的 AgentID 一致。
+	// 企业微信明文消息携带 AgentID，若与本适配器配置的 AgentID 不符，
+	// 说明该回调并非发给本应用（多应用共用回调 URL 场景下可能串号），
+	// 直接丢弃并记录，避免错误地把其它应用的消息当作自身消息处理。
+	// 仅当配置了 AgentID 时才强制校验（msg.AgentID==0 多为非应用消息，放行兼容）。
+	if a.cfg.AgentID != "" && msg.AgentID != 0 &&
+		!whauth.ConstantTimeEqualString(strconv.Itoa(msg.AgentID), a.cfg.AgentID) {
+		logger.Warn("企业微信消息 AgentID 与配置不一致，丢弃",
+			"msg_agent_id", msg.AgentID, "cfg_agent_id", a.cfg.AgentID)
+		return
+	}
+
+	// W3-28 功能闭环：仅处理文本消息，其它类型记录日志后丢弃，
+	// 避免静默吞掉非 text 消息导致排障困难。
 	if msg.MsgType != "text" {
+		logger.Info("企业微信收到暂不支持的消息类型，已忽略",
+			"msg_type", msg.MsgType, "from", msg.FromUserName)
 		return
 	}
 
@@ -432,6 +472,19 @@ func (a *WecomAdapter) Health(_ context.Context) error {
 
 // ============== 加解密 ==============
 
+// checkReplayWindow 校验 webhook 时间戳是否落在重放窗口内，防止重放攻击。
+//
+// W3-27 安全：复用共享包 whauth.CheckReplayWindow 统一策略，过旧/过新一律拒绝。
+// timestamp 为企业微信回调携带的 Unix 秒字符串；无法解析或超窗均返回 error，
+// 调用方据此 fail-closed 返回 403。
+func (a *WecomAdapter) checkReplayWindow(timestamp string) error {
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return fmt.Errorf("非法 timestamp %q: %w", timestamp, err)
+	}
+	return whauth.CheckReplayWindow(ts, wecomReplayWindow)
+}
+
 // checkSignature 验证签名
 func (a *WecomAdapter) checkSignature(msgSignature, timestamp, nonce, encrypt string) bool {
 	strs := []string{a.cfg.Token, timestamp, nonce, encrypt}
@@ -464,6 +517,15 @@ func (a *WecomAdapter) decrypt(encrypted string) (string, error) {
 		return "", fmt.Errorf("密文太短")
 	}
 
+	// W3-25 边界/安全：CBC 解密要求密文长度为块大小的整数倍，
+	// 否则 cipher.CryptBlocks 会 panic。攻击者只要知道 Token 即可构造
+	// 一个长度 >= 16 但非 16 倍数的密文，签名通过后触发 panic，
+	// 在同步请求路径上崩溃处理 goroutine（远程 DoS）。
+	// 这里在 CryptBlocks 之前显式校验整块对齐，非整块直接返回错误。
+	if len(ciphertext)%aes.BlockSize != 0 {
+		return "", fmt.Errorf("密文长度非 AES 块大小整数倍: len=%d", len(ciphertext))
+	}
+
 	iv := a.aesKey[:aes.BlockSize]
 	mode := cipher.NewCBCDecrypter(block, iv)
 	mode.CryptBlocks(ciphertext, ciphertext)
@@ -491,6 +553,19 @@ func (a *WecomAdapter) decrypt(encrypted string) (string, error) {
 	}
 
 	msg := string(ciphertext[20 : 20+msgLen])
+
+	// W3-26 安全：校验信封尾部 CorpID 防伪造来源。
+	// 企业微信信封在消息内容之后附带发送方 CorpID，官方规范要求解密后
+	// 比对该 CorpID 与自身配置是否一致，否则无法识别伪造来源的请求。
+	// 采用 fail-closed 策略：仅当配置了 CorpID 时强制校验，不一致即拒绝；
+	// 比较使用常量时间方式（whauth.ConstantTimeEqualString）避免时序侧信道。
+	if a.cfg.CorpID != "" {
+		gotCorpID := string(ciphertext[20+msgLen:])
+		if !whauth.ConstantTimeEqualString(gotCorpID, a.cfg.CorpID) {
+			return "", fmt.Errorf("信封 CorpID 与配置不一致，疑似伪造来源")
+		}
+	}
+
 	return msg, nil
 }
 

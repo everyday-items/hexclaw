@@ -16,10 +16,10 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/config"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
-	"github.com/hexagon-codes/hexclaw/sandbox"
 	"github.com/hexagon-codes/hexclaw/security"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/skill/hub"
+	"github.com/hexagon-codes/toolkit/os/sandbox"
 )
 
 // SkillDeps holds optional dependencies for skills that need external services.

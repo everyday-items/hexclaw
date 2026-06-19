@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
+	"mime"
 	"net"
 	"net/mail"
 	"net/smtp"
@@ -204,6 +205,12 @@ func (a *EmailAdapter) fetchAndProcess(ctx context.Context) {
 	}
 
 	for _, id := range ids {
+		// W3-6: 处理每封邮件前检查 stopped 标志。Stop 后在途轮询不应继续处理回复,
+		// 否则会在适配器已停止后仍调用 handler 并发送回复。
+		if a.stopped.Load() {
+			return
+		}
+
 		raw, err := client.FetchRFC822(id)
 		if err != nil {
 			logger.Error("邮件适配器: 拉取邮件失败: id", "id", id, "err", err)
@@ -387,6 +394,11 @@ func (c *imapClient) run(format string, args ...any) (*imapResponse, error) {
 			}
 			resp.literals = append(resp.literals, literal)
 			continue
+		} else if hasLiteralMarker(line) {
+			// 行尾带 {...} literal 标记但 parseLiteralSize 拒绝(负数/非数字等畸形),
+			// 属于协议层畸形数据。直接返回 error, 避免被当作普通行继续读取导致
+			// 后续数据流错位, 也防止 pollLoop 协程被恶意服务器干扰。
+			return nil, fmt.Errorf("IMAP %s 收到畸形 literal 标记: %s", cmd, strings.TrimSpace(line))
 		}
 
 		if strings.HasPrefix(line, tag+" ") {
@@ -423,7 +435,26 @@ func parseLiteralSize(line string) (int, bool) {
 	if err != nil {
 		return 0, false
 	}
+	// IMAP literal 大小语义上必须 >= 0。负数(畸形或恶意服务器)若被当作合法大小,
+	// 会导致 run() 中 make([]byte, size) 触发 panic 崩溃轮询协程, 因此一律拒绝。
+	if size < 0 {
+		return 0, false
+	}
 	return size, true
+}
+
+// hasLiteralMarker 判断行尾是否带有 IMAP literal 标记({...})的形状。
+//
+// 与 parseLiteralSize 不同, 本函数只判断"形状"是否像 literal 标记, 不校验内容合法性。
+// run() 用它区分两种 parseLiteralSize 失败的情况:
+//   - 普通响应行(根本没有 literal 标记): 正常继续处理
+//   - 畸形 literal 标记(如负数大小 {-3}、非数字 {abc}): 协议层错误, 应返回 error
+func hasLiteralMarker(line string) bool {
+	line = strings.TrimSuffix(line, "\n")
+	line = strings.TrimSuffix(line, "\r")
+	start := strings.LastIndexByte(line, '{')
+	end := strings.LastIndexByte(line, '}')
+	return start >= 0 && end == len(line)-1 && end > start
 }
 
 func parseIncomingEmail(raw []byte) (*adapter.Message, string, error) {
@@ -472,9 +503,22 @@ func sanitizeHeader(s string) string {
 	return r.Replace(s)
 }
 
+// encodeSubject 对邮件 subject 做 RFC2047 编码。
+//
+// W3-7: 出站 subject 直接以原始 UTF-8 字节写入头部时, 不兼容 RFC2047 的收件端会乱码。
+// 使用标准库 mime.QEncoding 生成 encoded-word(=?utf-8?q?...?=); 纯 ASCII 输入保持不变,
+// 编码输出为纯 ASCII 且不含裸 CR/LF, 与 sanitizeHeader 协同防止头部注入。
+func encodeSubject(subject string) string {
+	return mime.QEncoding.Encode("utf-8", subject)
+}
+
 func (a *EmailAdapter) sendEmail(to, subject, body string) error {
 	cfg := a.cfg.SMTP
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+
+	// W3-7: 出站 subject 先做 RFC2047 编码, 非 ASCII 转为 encoded-word, 避免收件端乱码。
+	// 编码输出为纯 ASCII, 再经 sanitizeHeader 兜底过滤裸 CR/LF, 防止头部注入。
+	subject = encodeSubject(subject)
 
 	// 防止邮件头部注入
 	to = sanitizeHeader(to)

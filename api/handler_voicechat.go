@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/hexagon-codes/hexclaw/voicechat"
+	"github.com/hexagon-codes/ai-core/media/voicechat"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
 

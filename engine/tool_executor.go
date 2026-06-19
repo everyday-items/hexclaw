@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hexagon-codes/hexclaw/events"
+	"github.com/hexagon-codes/hexagon/observe/events"
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/hexclaw/featureflag"
 	"github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/skill"
-	"github.com/hexagon-codes/hexclaw/trace"
 )
 
 // ToolExecutor executes tool calls with hook chain support.

@@ -13,8 +13,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/hexclaw/skill"
-	"github.com/hexagon-codes/hexclaw/trace"
 )
 
 // ImproveHook 把工具调用结果送进 skill.ImproveStore。

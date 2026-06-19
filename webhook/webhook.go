@@ -15,19 +15,19 @@ package webhook
 import (
 	"context"
 	"crypto/hmac"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/hexagon-codes/hexclaw/trace"
+	"github.com/hexagon-codes/toolkit/crypto/sign"
+	"github.com/hexagon-codes/toolkit/util/logger"
+
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -286,9 +286,7 @@ func (m *Manager) verifySignature(wh *Webhook, r *http.Request, body []byte) boo
 			return false
 		}
 		sig = strings.TrimPrefix(sig, "sha256=")
-		mac := hmac.New(sha256.New, []byte(wh.Secret))
-		mac.Write(body)
-		expected := hex.EncodeToString(mac.Sum(nil))
+		expected := sign.HMACSHA256Hex(body, []byte(wh.Secret))
 		return hmac.Equal([]byte(sig), []byte(expected))
 
 	case TypeGitLab:
@@ -306,9 +304,7 @@ func (m *Manager) verifySignature(wh *Webhook, r *http.Request, body []byte) boo
 			return false
 		}
 		sig = strings.TrimPrefix(sig, "sha256=")
-		mac := hmac.New(sha256.New, []byte(wh.Secret))
-		mac.Write(body)
-		expected := hex.EncodeToString(mac.Sum(nil))
+		expected := sign.HMACSHA256Hex(body, []byte(wh.Secret))
 		return hmac.Equal([]byte(sig), []byte(expected))
 	}
 }

@@ -531,7 +531,9 @@ func (m *Manager) hybridScore(r *SearchResult) float64 {
 		textWeight = 1.0
 	}
 	score := vectorWeight*r.VectorScore + textWeight*r.TextScore
-	if m.config.TimeDecayDays > 0 {
+	// 仅对有有效时间戳的 chunk 施加时间衰减；CreatedAt 零值（未设置）时跳过，
+	// 否则 time.Since(零值) 把分数衰减到 0、导致无时间戳的 chunk 永不召回。
+	if m.config.TimeDecayDays > 0 && !r.Chunk.CreatedAt.IsZero() {
 		age := time.Since(r.Chunk.CreatedAt).Hours() / 24
 		lambda := math.Ln2 / float64(m.config.TimeDecayDays)
 		score *= math.Exp(-lambda * age)

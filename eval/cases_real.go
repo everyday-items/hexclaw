@@ -1,7 +1,7 @@
 // cases_real.go 实现 v0.4.0 H9 真业务 EvalCase（替换 V04Suite 中部分 mock case）。
 //
 // 与 cases (mock) 的区别：本文件每个 case.Run 真调 hexclaw 内部生产代码路径
-// （engine.HeuristicCompress / engine.ClassifyError / skill.RunPipeline /
+// （engine.HeuristicCompress / llm.ClassifyError / skill.RunPipeline /
 // engine.DefaultBaselinePolicy / events.Emitter），断言真实行为是否符合契约。
 //
 // 5 条真业务 case + 7 条 mock case 配套使用：
@@ -20,9 +20,8 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/hexagon/observe/events"
 	"github.com/hexagon-codes/hexclaw/engine"
-	"github.com/hexagon-codes/hexclaw/events"
-	"github.com/hexagon-codes/hexclaw/featureflag"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
 
@@ -53,7 +52,7 @@ func caseRealHeuristicCompress() EvalCase {
 				{Role: "system", Content: "you are an assistant"},
 				{Role: "user", Content: "hello"},
 				{Role: "assistant", Content: "hi"},
-				{Role: "user", Content: "Hello"},  // 大小写重复
+				{Role: "user", Content: "Hello"},   // 大小写重复
 				{Role: "user", Content: " hello "}, // 前后空格重复
 				{Role: "assistant", ToolCalls: []llm.ToolCallRef{{ID: "1"}}},
 				{Role: "tool", Content: "r1"},
@@ -96,13 +95,13 @@ func caseRealClassifyRateLimit() EvalCase {
 		Tags:        []string{"real", "llm", "failover"},
 		Run: func(_ context.Context, _ map[string]any) (Output, error) {
 			err := errors.New("rate limit exceeded: please retry after 1s")
-			reason := engine.ClassifyError(err, 429, "")
-			action := engine.HandleFailover(reason)
+			reason := llm.ClassifyError(err, 429, "")
+			action := llm.HandleFailover(reason)
 			out := Output{
 				Content: fmt.Sprintf("reason=%s retry=%v backoff=%ds",
 					reason.String(), action.Retry, action.BackoffSeconds),
 			}
-			if reason != engine.FailRateLimit {
+			if reason != llm.FailRateLimit {
 				return out, fmt.Errorf("expected FailRateLimit; got %s", reason.String())
 			}
 			if !action.Retry {
@@ -166,9 +165,8 @@ func caseRealEventsEmitterRoundtrip() EvalCase {
 		Run: func(_ context.Context, _ map[string]any) (Output, error) {
 			sink := events.NewMemorySink()
 			emitter := events.NewEmitter(sink, "eval.real")
-			ctx := featureflag.WithContext(context.Background(),
-				featureflag.NewStatic(featureflag.Registered(), map[string]bool{events.FlagEventsTransportV1: true}))
-			ctx = events.WithEmitter(ctx, emitter)
+			// 去 feature flag 后：注入 emitter 即可投递，不再需要 flag gate。
+			ctx := events.WithEmitter(context.Background(), emitter)
 
 			ev := events.New("test.real.event", events.SeverityInfo).With("k", "v")
 			if err := events.Emit(ctx, ev); err != nil {

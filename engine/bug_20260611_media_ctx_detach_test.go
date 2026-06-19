@@ -11,6 +11,11 @@ package engine
 //
 // Contract: once a media-generation goroutine starts, cancelling the request
 // ctx must NOT cancel the generation/save ctx.
+//
+// 媒体生成自 v0.5.0 #7 改走 ai-core/media 子域：引擎不再对 LLM Provider 做
+// 能力接口断言，而是用 SetMediaServices 注入的 media image/video Service。
+// 本测试相应改为注入实现 media Provider 接口的 stub；ctx-detach 契约不变
+// （detach 逻辑在 react.go 的后台 goroutine，本次重构未触及）。
 
 import (
 	"context"
@@ -20,7 +25,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hexagon-codes/ai-core/llm"
+	mediaimg "github.com/hexagon-codes/ai-core/media/image"
+	mediavid "github.com/hexagon-codes/ai-core/media/video"
 	"github.com/hexagon-codes/hexagon"
 	mockllm "github.com/hexagon-codes/hexagon/testing/mock"
 	"github.com/hexagon-codes/hexclaw/adapter"
@@ -30,18 +36,22 @@ import (
 	sqlitestore "github.com/hexagon-codes/hexclaw/storage/sqlite"
 )
 
-// imageProviderStub implements hexagon.Provider + llm.ImageProvider. Its
-// GenerateImage blocks until released, then records whether its ctx is still
-// alive — proving whether the generation ctx was detached from the caller's.
+// 1x1 transparent PNG, base64 — stub 直接回 b64 让 generateImage 内嵌而不走网络。
+const stubPNGB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+
+// imageProviderStub implements media/image.Provider. Its Generate blocks until
+// released, then records whether its ctx is still alive — proving whether the
+// generation ctx was detached from the caller's.
 type imageProviderStub struct {
-	*mockllm.LLMProvider
-	release  chan struct{}
-	started  chan struct{}
-	ctxErr   atomic.Value // error
-	imageURL string
+	release chan struct{}
+	started chan struct{}
+	ctxErr  atomic.Value // string
 }
 
-func (s *imageProviderStub) GenerateImage(ctx context.Context, _ llm.ImageRequest) (*llm.ImageResponse, error) {
+func (s *imageProviderStub) Name() string              { return "stub-image" }
+func (s *imageProviderStub) SupportedModels() []string { return []string{"mock-model"} }
+
+func (s *imageProviderStub) Generate(ctx context.Context, _ mediaimg.Request) (*mediaimg.Result, error) {
 	close(s.started)
 	<-s.release // wait until the test cancels the request ctx
 	if err := ctx.Err(); err != nil {
@@ -49,10 +59,13 @@ func (s *imageProviderStub) GenerateImage(ctx context.Context, _ llm.ImageReques
 	} else {
 		s.ctxErr.Store("")
 	}
-	return &llm.ImageResponse{Data: []llm.ImageData{{URL: s.imageURL}}}, nil
+	return &mediaimg.Result{Images: []mediaimg.Image{{B64JSON: stubPNGB64}}}, nil
 }
 
-func TestBug20260611_ImageGenerationDetachesFromRequestCtx(t *testing.T) {
+// newMediaTestEngine builds a ReActEngine with a mock LLM provider (needed for
+// LLM selection) and the given media services injected.
+func newMediaTestEngine(t *testing.T, img *mediaimg.Service, vid *mediavid.Service) (*ReActEngine, *sqlitestore.Store) {
+	t.Helper()
 	dir := t.TempDir()
 	store, err := sqlitestore.New(filepath.Join(dir, "test.db"))
 	if err != nil {
@@ -63,25 +76,25 @@ func TestBug20260611_ImageGenerationDetachesFromRequestCtx(t *testing.T) {
 		t.Fatalf("init: %v", err)
 	}
 
-	stub := &imageProviderStub{
-		LLMProvider: mockllm.NewLLMProvider("test"),
-		release:     make(chan struct{}),
-		started:     make(chan struct{}),
-		// 1x1 transparent PNG data URL so downloadAsDataURI short-circuits.
-		imageURL: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
-	}
-
 	cfg := config.DefaultConfig()
 	cfg.Compaction.Enabled = false
 	cfg.LLM.Default = "test"
 	cfg.LLM.Providers = map[string]config.LLMProviderConfig{"test": {Model: "mock-model"}}
-	router := llmrouter.NewWithProviders(cfg.LLM, map[string]hexagon.Provider{"test": stub})
+	router := llmrouter.NewWithProviders(cfg.LLM, map[string]hexagon.Provider{"test": mockllm.NewLLMProvider("test")})
 
 	eng := NewReActEngine(cfg, router, store, skill.NewRegistry())
+	eng.SetMediaServices(img, vid)
 	if err := eng.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	t.Cleanup(func() { _ = eng.Stop(context.Background()) })
+	return eng, store
+}
+
+func TestBug20260611_ImageGenerationDetachesFromRequestCtx(t *testing.T) {
+	stub := &imageProviderStub{release: make(chan struct{}), started: make(chan struct{})}
+	imgSvc := mediaimg.NewService(map[string]mediaimg.Provider{"stub-image": stub}, "stub-image")
+	eng, _ := newMediaTestEngine(t, imgSvc, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	ch, err := eng.ProcessStream(ctx, &adapter.Message{
@@ -99,7 +112,7 @@ func TestBug20260611_ImageGenerationDetachesFromRequestCtx(t *testing.T) {
 	select {
 	case <-stub.started:
 	case <-time.After(5 * time.Second):
-		t.Fatal("GenerateImage never started")
+		t.Fatal("Generate never started")
 	}
 	cancel()
 	close(stub.release)
@@ -114,11 +127,10 @@ func TestBug20260611_ImageGenerationDetachesFromRequestCtx(t *testing.T) {
 	}
 }
 
-// videoProviderStub implements hexagon.Provider + llm.VideoProvider. Its
-// CreateVideoTask blocks until released, then records whether its ctx is
-// still alive and returns an already-completed task (no polling needed).
+// videoProviderStub implements media/video.Provider. Its Submit blocks until
+// released, then records whether its ctx is still alive; Poll returns an
+// already-completed task (no real polling needed).
 type videoProviderStub struct {
-	*mockllm.LLMProvider
 	release  chan struct{}
 	started  chan struct{}
 	ctxErr   atomic.Value // string
@@ -126,7 +138,10 @@ type videoProviderStub struct {
 	coverURL string
 }
 
-func (s *videoProviderStub) CreateVideoTask(ctx context.Context, _ llm.VideoRequest) (*llm.VideoTask, error) {
+func (s *videoProviderStub) Name() string              { return "stub-video" }
+func (s *videoProviderStub) SupportedModels() []string { return []string{"mock-model"} }
+
+func (s *videoProviderStub) Submit(ctx context.Context, _ mediavid.Request) (string, error) {
 	close(s.started)
 	<-s.release // wait until the test cancels the request ctx
 	if err := ctx.Err(); err != nil {
@@ -134,16 +149,18 @@ func (s *videoProviderStub) CreateVideoTask(ctx context.Context, _ llm.VideoRequ
 	} else {
 		s.ctxErr.Store("")
 	}
-	return &llm.VideoTask{
-		ID:       "vt-1",
-		Status:   llm.VideoTaskCompleted,
+	return "vt-1", nil
+}
+
+func (s *videoProviderStub) Poll(_ context.Context, taskID string) (mediavid.TaskStatus, error) {
+	return mediavid.TaskStatus{
+		TaskID:   taskID,
+		Provider: s.Name(),
+		Status:   "success",
+		Done:     true,
 		VideoURL: s.videoURL,
 		CoverURL: s.coverURL,
 	}, nil
-}
-
-func (s *videoProviderStub) QueryVideoTask(_ context.Context, taskID string) (*llm.VideoTask, error) {
-	return &llm.VideoTask{ID: taskID, Status: llm.VideoTaskCompleted, VideoURL: s.videoURL}, nil
 }
 
 // Mirror of the image test for the video goroutine (review M9): cancelling
@@ -151,36 +168,15 @@ func (s *videoProviderStub) QueryVideoTask(_ context.Context, taskID string) (*l
 // and the assistant reply must still land in session history (DB save
 // survives the caller-ctx cancel).
 func TestBug20260611_VideoGenerationDetachesFromRequestCtx(t *testing.T) {
-	dir := t.TempDir()
-	store, err := sqlitestore.New(filepath.Join(dir, "test.db"))
-	if err != nil {
-		t.Fatalf("store: %v", err)
-	}
-	t.Cleanup(func() { store.Close() })
-	if err := store.Init(context.Background()); err != nil {
-		t.Fatalf("init: %v", err)
-	}
-
 	stub := &videoProviderStub{
-		LLMProvider: mockllm.NewLLMProvider("test"),
-		release:     make(chan struct{}),
-		started:     make(chan struct{}),
-		videoURL:    "https://example.com/video.mp4",
+		release:  make(chan struct{}),
+		started:  make(chan struct{}),
+		videoURL: "https://example.com/video.mp4",
 		// data URL cover so downloadAsDataURI short-circuits without network.
-		coverURL: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+		coverURL: "data:image/png;base64," + stubPNGB64,
 	}
-
-	cfg := config.DefaultConfig()
-	cfg.Compaction.Enabled = false
-	cfg.LLM.Default = "test"
-	cfg.LLM.Providers = map[string]config.LLMProviderConfig{"test": {Model: "mock-model"}}
-	router := llmrouter.NewWithProviders(cfg.LLM, map[string]hexagon.Provider{"test": stub})
-
-	eng := NewReActEngine(cfg, router, store, skill.NewRegistry())
-	if err := eng.Start(context.Background()); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	t.Cleanup(func() { _ = eng.Stop(context.Background()) })
+	vidSvc := mediavid.NewService(map[string]mediavid.Provider{"stub-video": stub}, "stub-video")
+	eng, store := newMediaTestEngine(t, nil, vidSvc)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	msg := &adapter.Message{
@@ -198,7 +194,7 @@ func TestBug20260611_VideoGenerationDetachesFromRequestCtx(t *testing.T) {
 	select {
 	case <-stub.started:
 	case <-time.After(5 * time.Second):
-		t.Fatal("CreateVideoTask never started")
+		t.Fatal("Submit never started")
 	}
 	cancel()
 	close(stub.release)
@@ -234,11 +230,11 @@ func TestBug20260611_VideoGenerationDetachesFromRequestCtx(t *testing.T) {
 }
 
 // failingImageProvider always fails generation after recording the call.
-type failingImageProvider struct {
-	*mockllm.LLMProvider
-}
+type failingImageProvider struct{}
 
-func (s *failingImageProvider) GenerateImage(_ context.Context, _ llm.ImageRequest) (*llm.ImageResponse, error) {
+func (s *failingImageProvider) Name() string              { return "stub-image-fail" }
+func (s *failingImageProvider) SupportedModels() []string { return []string{"mock-model"} }
+func (s *failingImageProvider) Generate(_ context.Context, _ mediaimg.Request) (*mediaimg.Result, error) {
 	return nil, context.DeadlineExceeded
 }
 
@@ -246,29 +242,8 @@ func (s *failingImageProvider) GenerateImage(_ context.Context, _ llm.ImageReque
 // used to be a buffered error chunk that got dropped. The failure must also
 // be persisted as an assistant message so it is visible in session history.
 func TestBug20260611_MediaGenerationErrorPersistedToHistory(t *testing.T) {
-	dir := t.TempDir()
-	store, err := sqlitestore.New(filepath.Join(dir, "test.db"))
-	if err != nil {
-		t.Fatalf("store: %v", err)
-	}
-	t.Cleanup(func() { store.Close() })
-	if err := store.Init(context.Background()); err != nil {
-		t.Fatalf("init: %v", err)
-	}
-
-	stub := &failingImageProvider{LLMProvider: mockllm.NewLLMProvider("test")}
-
-	cfg := config.DefaultConfig()
-	cfg.Compaction.Enabled = false
-	cfg.LLM.Default = "test"
-	cfg.LLM.Providers = map[string]config.LLMProviderConfig{"test": {Model: "mock-model"}}
-	router := llmrouter.NewWithProviders(cfg.LLM, map[string]hexagon.Provider{"test": stub})
-
-	eng := NewReActEngine(cfg, router, store, skill.NewRegistry())
-	if err := eng.Start(context.Background()); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	t.Cleanup(func() { _ = eng.Stop(context.Background()) })
+	imgSvc := mediaimg.NewService(map[string]mediaimg.Provider{"stub-image-fail": &failingImageProvider{}}, "stub-image-fail")
+	eng, store := newMediaTestEngine(t, imgSvc, nil)
 
 	msg := &adapter.Message{
 		ID:       "msg-img-fail",

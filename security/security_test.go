@@ -46,29 +46,4 @@ func TestSkillScanner_EncodedPayloads(t *testing.T) {
 	}
 }
 
-func TestSSRF_PrivateIPs(t *testing.T) {
-	tests := []struct {
-		url  string
-		safe bool
-	}{
-		{"https://example.com/api", true},
-		{"https://google.com", true},
-		{"http://localhost:8080", false},
-		{"http://127.0.0.1:3000", false},
-		{"http://[::1]:8080", false},
-		{"http://169.254.169.254/latest/meta-data", false},
-		{"http://metadata.google.internal", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.url, func(t *testing.T) {
-			err := ValidateURL(tt.url)
-			if tt.safe && err != nil {
-				t.Errorf("expected safe URL, got error: %v", err)
-			}
-			if !tt.safe && err == nil {
-				t.Errorf("expected SSRF block for: %s", tt.url)
-			}
-		})
-	}
-}
+// 注：SSRF/ValidateURL 测试已随 ssrf.go 下沉到 toolkit/net/ssrf。

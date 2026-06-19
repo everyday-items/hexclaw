@@ -26,6 +26,7 @@ import (
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/adapter/whauth"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
 	"github.com/hexagon-codes/toolkit/net/httpx"
@@ -93,7 +94,8 @@ func (a *FeishuAdapter) Start(_ context.Context, handler adapter.MessageHandler)
 	)
 
 	go func() {
-		logger.Info("飞书适配器 [", "name", a.Name())
+		// W3-10 修复：补全残缺日志字符串（原为 "飞书适配器 ["）。
+		logger.Info("飞书适配器 WebSocket 连接启动中", "name", a.Name())
 		a.connected.Store(true)
 		a.mu.Lock()
 		a.lastError = ""
@@ -109,7 +111,8 @@ func (a *FeishuAdapter) Start(_ context.Context, handler adapter.MessageHandler)
 		}
 	}()
 
-	logger.Info("飞书适配器 [", "name", a.Name())
+	// W3-10 修复：补全残缺日志字符串（原为 "飞书适配器 ["）。
+	logger.Info("飞书适配器已启动", "name", a.Name())
 	return nil
 }
 
@@ -281,8 +284,18 @@ func (a *FeishuAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if event.Header.Token != "" && a.cfg.VerificationToken != "" {
-		if event.Header.Token != a.cfg.VerificationToken {
+	// W3-8 修复：统一走 whauth 的 fail-closed 策略，杜绝签名校验绕过。
+	//
+	// 修复前的条件 `event.Header.Token != "" && cfg.VerificationToken != ""`
+	// 把"入站 token 非空"当作校验前置：攻击者只要构造一个 Header.Token 为空的
+	// 事件即可整体跳过校验被放行（fail-open 安全缺口）。
+	//
+	// 修复后：只要配置了 VerificationToken（RequireSecret 不返回错误），
+	// 就强制校验——无论入站 token 是否为空，不匹配一律 401（fail-closed）。
+	// 未配置 VerificationToken 时（RequireSecret 返回 ErrEmptySecret）保持
+	// 向后兼容放行。token 比较使用常量时间比较，避免时序侧信道泄露。
+	if err := whauth.RequireSecret("feishu", a.cfg.VerificationToken); err == nil {
+		if !whauth.ConstantTimeEqualString(event.Header.Token, a.cfg.VerificationToken) {
 			http.Error(w, "验证失败", http.StatusUnauthorized)
 			return
 		}
@@ -439,12 +452,23 @@ func (a *FeishuAdapter) sendAndGetID(ctx context.Context, chatID, text string) (
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	respBody, _ := io.ReadAll(resp.Body)
+	// W3-9 修复：检查 HTTP 状态码，避免静默吞掉 4xx/5xx。
+	//
+	// 修复前直接 Decode 响应体并忽略 decode 错误，无论 4xx/5xx 都返回
+	// (空 messageID, nil error)。在 SendStream 首段创建路径中，调用方据
+	// `err != nil || id == ""` 判定后会 continue 重试，导致流式消息永远无法
+	// 落地。这里与 replyAndGetID / patchMessage 保持一致，非 200 直接返回错误。
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("飞书发送消息返回 %d: %s", resp.StatusCode, string(respBody))
+	}
+
 	var result struct {
 		Data struct {
 			MessageID string `json:"message_id"`
 		} `json:"data"`
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&result)
+	_ = json.Unmarshal(respBody, &result)
 	return result.Data.MessageID, nil
 }
 
@@ -771,13 +795,23 @@ func (a *FeishuAdapter) getAccessToken(ctx context.Context) (string, error) {
 	}
 	defer resp.Body.Close()
 
+	respBody, _ := io.ReadAll(resp.Body)
+	// W3-11 修复：先检查 HTTP 状态码，再解析业务 code。
+	//
+	// 修复前仅依赖响应体 code 判定成败：当网关/反代返回 4xx/5xx 且响应体
+	// 并非预期 JSON（如纯文本错误页）时，解析失败才报错；更隐蔽的是若错误页
+	// 恰好能解析出 code==0，会被误判为成功并缓存空 token。这里显式拦截非 200。
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("获取 Token 返回 %d: %s", resp.StatusCode, string(respBody))
+	}
+
 	var result struct {
 		Code              int    `json:"code"`
 		Msg               string `json:"msg"`
 		TenantAccessToken string `json:"tenant_access_token"`
 		Expire            int    `json:"expire"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(respBody, &result); err != nil {
 		return "", fmt.Errorf("解析 Token 响应失败: %w", err)
 	}
 	if result.Code != 0 {

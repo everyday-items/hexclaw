@@ -4,8 +4,6 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +13,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
 // PandocRenderer 调 pandoc subprocess 把 markdown 渲染为目标格式。
@@ -245,11 +245,8 @@ func (r *PandocRenderer) subprocessEnv() []string {
 
 // createTempFile 在 sandbox 目录创建唯一 temp file 并返回路径。
 func (r *PandocRenderer) createTempFile(format Format) (string, error) {
-	var idBytes [8]byte
-	if _, err := rand.Read(idBytes[:]); err != nil {
-		return "", err
-	}
-	id := hex.EncodeToString(idBytes[:])
+	// 复用 toolkit 的 NanoID 生成唯一文件名片段（URL/文件名安全字符集）。
+	id := idgen.NanoID()
 	name := fmt.Sprintf("render-%s.%s", id, format.Extension())
 	path := filepath.Join(r.SandboxDir, name)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_EXCL, 0o600)

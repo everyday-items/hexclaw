@@ -21,8 +21,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/hexclaw/adapter"
-	"github.com/hexagon-codes/hexclaw/trace"
 	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
@@ -77,15 +77,20 @@ func (a *MatrixAdapter) Start(ctx context.Context, handler adapter.MessageHandle
 	a.handler = handler
 	a.stopped.Store(false)
 
-	logger.Info("[Matrix] 连接到", "homeserver_u_r_l", a.config.HomeserverURL)
+	logger.Info("[Matrix] 连接到", "homeserver_url", a.config.HomeserverURL)
 
 	go a.syncLoop(ctx)
 	return nil
 }
 
-// Stop 停止适配器
+// Stop 停止适配器。
+//
+// 幂等：用 stopped 标志的 CAS 守卫 close(stopCh)，二次调用（热重载/优雅停机重入）
+// 直接返回，避免 close 已关闭 channel 触发 panic。
 func (a *MatrixAdapter) Stop(_ context.Context) error {
-	a.stopped.Store(true)
+	if !a.stopped.CompareAndSwap(false, true) {
+		return nil // 已停止，幂等返回
+	}
 	if a.queue != nil {
 		_ = a.queue.Stop(context.Background())
 	}
@@ -148,6 +153,15 @@ func (a *MatrixAdapter) SendStream(ctx context.Context, roomID string, chunks <-
 	return a.Send(ctx, roomID, &adapter.Reply{Content: sb.String()})
 }
 
+// syncMinInterval 是 syncLoop 成功路径上的最小轮询间隔。
+//
+// W3-16: Matrix /sync 是服务端长轮询，正常情况下会阻塞 SyncTimeout 秒才返回；
+// 但当服务端忽略 timeout 立即返回空响应（或网络异常导致快速返回）时，无节流的
+// for 循环会以最高速度空转，瞬间打满 CPU 并对 homeserver 形成请求风暴。
+// 在成功路径上加一个很小的最小间隔，既不影响正常长轮询的实时性，又能为这类
+// 退化场景兜底。错误路径已有 5s 退避，无需此节流。
+const syncMinInterval = 50 * time.Millisecond
+
 // syncLoop 同步轮询循环
 func (a *MatrixAdapter) syncLoop(ctx context.Context) {
 	for {
@@ -160,6 +174,16 @@ func (a *MatrixAdapter) syncLoop(ctx context.Context) {
 			if err := a.doSync(ctx); err != nil {
 				logger.Error("[Matrix] 同步错误", "error", err)
 				time.Sleep(5 * time.Second)
+				continue
+			}
+			// W3-16: 成功路径节流，防止服务端快速返回空响应时 CPU 空转。
+			// 用 select 等待，使 Stop/ctx 取消仍能即时打断、保持优雅停机响应性。
+			select {
+			case <-a.stopCh:
+				return
+			case <-ctx.Done():
+				return
+			case <-time.After(syncMinInterval):
 			}
 		}
 	}
@@ -195,7 +219,12 @@ func (a *MatrixAdapter) doSync(ctx context.Context) error {
 		return fmt.Errorf("解析同步响应失败: %w", err)
 	}
 
-	a.nextBatch = syncResp.NextBatch
+	// W3-15: 仅在响应携带有效 next_batch 时才推进游标。
+	// 空响应（如 {} 或无 next_batch）若无条件覆盖，会把已有增量游标重置为空串，
+	// 导致下次 sync 丢失游标、退回全量重新拉取整个会话历史。
+	if syncResp.NextBatch != "" {
+		a.nextBatch = syncResp.NextBatch
+	}
 
 	// 处理 room 消息
 	for roomID, room := range syncResp.Rooms.Join {
@@ -220,7 +249,9 @@ func (a *MatrixAdapter) handleEvent(ctx context.Context, roomID string, event ma
 	}
 
 	body, _ := event.Content["body"].(string)
-	if body == "" {
+	// W3-17: 纯空白/换行/制表符的 body 等价于空消息，TrimSpace 后判空，
+	// 避免空白消息浪费一次下游 LLM 调用。
+	if strings.TrimSpace(body) == "" {
 		return
 	}
 

@@ -4,10 +4,10 @@ import (
 	"context"
 	"time"
 
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/storage"
-	"github.com/hexagon-codes/hexclaw/trace"
 )
 
 // Pipeline 六层安全网关管道实现

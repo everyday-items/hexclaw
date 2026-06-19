@@ -23,8 +23,8 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	hexagon "github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/hexclaw/skill"
-	"github.com/hexagon-codes/hexclaw/trace"
 )
 
 // LLMSkillJudgeOptions LLM-as-judge 配置。

@@ -17,7 +17,6 @@ import (
 	"log"
 	"log/slog"
 
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"net/http"
 	"os"
 	"os/exec"
@@ -28,9 +27,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hexagon-codes/toolkit/util/idgen"
+	"github.com/hexagon-codes/toolkit/util/logger"
+
 	"github.com/spf13/cobra"
 
+	imagegen "github.com/hexagon-codes/ai-core/media/image"
+	videogen "github.com/hexagon-codes/ai-core/media/video"
+	"github.com/hexagon-codes/ai-core/media/voice"
+	"github.com/hexagon-codes/ai-core/media/voicechat"
 	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/hexagon/observe/events"
+	"github.com/hexagon-codes/hexagon/observe/trace"
+	genstore "github.com/hexagon-codes/toolkit/blobstore"
+
 	"github.com/hexagon-codes/hexclaw/adapter"
 	webadapter "github.com/hexagon-codes/hexclaw/adapter/web"
 	"github.com/hexagon-codes/hexclaw/agents"
@@ -41,12 +51,9 @@ import (
 	"github.com/hexagon-codes/hexclaw/cron"
 	"github.com/hexagon-codes/hexclaw/desktop"
 	"github.com/hexagon-codes/hexclaw/engine"
-	"github.com/hexagon-codes/hexclaw/events"
 	"github.com/hexagon-codes/hexclaw/featureflag"
 	"github.com/hexagon-codes/hexclaw/gateway"
-	"github.com/hexagon-codes/hexclaw/genstore"
 	"github.com/hexagon-codes/hexclaw/heartbeat"
-	"github.com/hexagon-codes/hexclaw/imagegen"
 	"github.com/hexagon-codes/hexclaw/instances"
 	"github.com/hexagon-codes/hexclaw/knowledge"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
@@ -59,10 +66,6 @@ import (
 	"github.com/hexagon-codes/hexclaw/skill/builtin"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
 	sqlitestore "github.com/hexagon-codes/hexclaw/storage/sqlite"
-	"github.com/hexagon-codes/hexclaw/trace"
-	"github.com/hexagon-codes/hexclaw/videogen"
-	"github.com/hexagon-codes/hexclaw/voice"
-	"github.com/hexagon-codes/hexclaw/voicechat"
 	"github.com/hexagon-codes/hexclaw/webhook"
 )
 
@@ -285,10 +288,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			len(registered), countEnabledFlags(flags))
 	}
 
-	// v0.4.0 H6 接入：注入 Emitter 到 root ctx —— flag events.transport.v1 OFF 时
-	// Emit 仍是 noop；flag ON 后 tool/llm/mcp 关键点埋的 Emit 会真投递到 sink。
-	// 默认用 MemorySink（进程内缓存），生产可在此切到 FileSink / HTTPSink。
-	emitter := events.NewEmitter(events.NewMemorySink(), "hexclaw")
+	// v0.4.0 H6 接入：注入 Emitter 到 root ctx，供 tool/llm/mcp 关键点埋的 Emit 使用。
+	//
+	// v0.5.0：events 下沉到框架层 hexagon/observe/events，去除 feature flag
+	// (events.transport.v1)。去 flag 后默认静默改由 Sink 选择控制 —— 这里默认用
+	// NoopSink（等价于原 flag OFF 的"默认静默"，避免长驻进程 MemorySink 无界增长）；
+	// 需要观测时在此切到 FileSink / HTTPSink / MultiSink。
+	emitter := events.NewEmitter(events.NewNoopSink(), "hexclaw")
 	ctx = events.WithEmitter(ctx, emitter)
 
 	// v0.4.0 F8 接入：注入全局 ChainPricer —— flag pricing.layered.v1 OFF 时
@@ -970,7 +976,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// OrchestrateSkill + SpawnSkill 共享 executor: 通过 engine.Process 执行子任务
 	agentExecFn := func(ctx context.Context, agentName, task string) (string, error) {
 		msg := &adapter.Message{
-			ID:       "sub-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+			ID:       "sub-" + idgen.NanoID(),
 			Platform: adapter.PlatformAPI,
 			UserID:   "system",
 			Content:  task,
@@ -1142,6 +1148,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		}
 		vg = videogen.NewService(vp, vgDefault)
 		srv.SetVideoGen(vg)
+
+		// 引擎内联媒体生成复用上面构造的 image/video Service（均已是 ai-core/media，
+		// 路线图 §12 risk#5：媒体作为独立内聚包，不再经 LLM Provider 能力接口）。
+		eng.SetMediaServices(ig, vg)
 
 		// Voice chat: OpenAI gpt-4o-audio
 		cp := map[string]voicechat.Provider{}

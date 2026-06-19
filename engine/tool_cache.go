@@ -1,11 +1,11 @@
 package engine
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"sync"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/util/hash"
 )
 
 // ToolCache caches tool execution results to avoid duplicate calls.
@@ -144,11 +144,12 @@ func (c *ToolCache) evictOldest() {
 }
 
 func cacheKey(toolName string, args map[string]any) string {
-	h := sha256.New()
-	h.Write([]byte(toolName))
+	// 复用 toolkit/util/hash.SHA256：输入与原实现的 sha256 字节序列完全一致
+	// （toolName 拼接 json(args)），取前 16 位 hex 作为缓存键，行为等价。
+	payload := toolName
 	if args != nil {
 		data, _ := json.Marshal(args)
-		h.Write(data)
+		payload += string(data)
 	}
-	return hex.EncodeToString(h.Sum(nil))[:16]
+	return hash.SHA256(payload)[:16]
 }

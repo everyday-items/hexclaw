@@ -20,6 +20,7 @@ import (
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/internal/sqliteutil"
 	"github.com/hexagon-codes/hexclaw/storage"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
@@ -117,7 +118,7 @@ func (m *Manager) SaveUserMessage(ctx context.Context, sessionID string, msg *ad
 		RequestID: requestIDFromMetadata(msg.Metadata),
 		CreatedAt: time.Now(),
 	}
-	if err := m.store.SaveMessage(ctx, record); err != nil {
+	if err := m.saveMessage(ctx, record); err != nil {
 		return err
 	}
 
@@ -205,10 +206,25 @@ func (m *Manager) SaveAssistantReply(ctx context.Context, sessionID, content str
 		RequestID: am.RequestID,
 		CreatedAt: time.Now(),
 	}
-	if err := m.store.SaveMessage(ctx, msg); err != nil {
+	if err := m.saveMessage(ctx, msg); err != nil {
 		return nil, err
 	}
 	return msg, nil
+}
+
+// saveMessage 持久化一条消息，并对 SQLite 写写冲突（SQLITE_BUSY/517）做有限退避重试。
+//
+// 并发写场景下底层存储可能瞬时返回 "database is locked (517)" 之类的可重试错误
+// （busy_timeout 不覆盖 BUSY_SNAPSHOT 写写冲突）。直接上抛会导致用户/助手消息
+// 被静默丢弃、上下文残缺。这里统一经 sqliteutil.RetryOnBusy 重试，让瞬时冲突在
+// 对方提交后自动落库；非 BUSY 错误立即原样返回，不改变错误语义。
+//
+// 重试用的写入闭包是幂等的：消息 ID 在上层已生成且固定，重复 INSERT 同一行
+// 在首次成功后不会发生（成功即返回 nil，不再重试）。
+func (m *Manager) saveMessage(ctx context.Context, record *storage.MessageRecord) error {
+	return sqliteutil.RetryOnBusy(ctx, func() error {
+		return m.store.SaveMessage(ctx, record)
+	})
 }
 
 func requestIDFromMetadata(metadata map[string]string) string {

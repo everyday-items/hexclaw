@@ -9,7 +9,7 @@ import (
 	hexagon "github.com/hexagon-codes/hexagon"
 
 	"github.com/hexagon-codes/ai-core/llm"
-	"github.com/hexagon-codes/hexclaw/trace"
+	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
@@ -238,4 +238,3 @@ func heuristicToolSummary(msgs []llm.Message) string {
 	}
 	return result.String()
 }
-

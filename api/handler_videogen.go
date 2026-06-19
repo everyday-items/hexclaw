@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/hexagon-codes/hexclaw/videogen"
+	videogen "github.com/hexagon-codes/ai-core/media/video"
 	"github.com/hexagon-codes/toolkit/util/logger"
 	"golang.org/x/sync/singleflight"
 )

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/ai-core/llm"
-	"github.com/hexagon-codes/hexclaw/events"
+	"github.com/hexagon-codes/hexagon/observe/events"
 	"github.com/hexagon-codes/hexclaw/featureflag"
 )
 
@@ -29,8 +29,8 @@ type gwTestProvider struct {
 	usage     llm.Usage
 }
 
-func (p *gwTestProvider) Name() string                          { return p.name }
-func (p *gwTestProvider) Models() []llm.ModelInfo               { return nil }
+func (p *gwTestProvider) Name() string                             { return p.name }
+func (p *gwTestProvider) Models() []llm.ModelInfo                  { return nil }
 func (p *gwTestProvider) CountTokens(_ []llm.Message) (int, error) { return 0, nil }
 func (p *gwTestProvider) Complete(_ context.Context, _ llm.CompletionRequest) (*llm.CompletionResponse, error) {
 	atomic.AddInt32(&p.completes, 1)
@@ -109,8 +109,8 @@ type recordingMW struct {
 	mu    *sync.Mutex
 }
 
-func (r *recordingMW) Name() string                  { return r.inner.Name() }
-func (r *recordingMW) Models() []llm.ModelInfo       { return r.inner.Models() }
+func (r *recordingMW) Name() string            { return r.inner.Name() }
+func (r *recordingMW) Models() []llm.ModelInfo { return r.inner.Models() }
 func (r *recordingMW) CountTokens(m []llm.Message) (int, error) {
 	return r.inner.CountTokens(m)
 }
@@ -229,8 +229,8 @@ type reqRecorder struct {
 	captured *string
 }
 
-func (r *reqRecorder) Name() string                  { return r.inner.Name() }
-func (r *reqRecorder) Models() []llm.ModelInfo       { return r.inner.Models() }
+func (r *reqRecorder) Name() string            { return r.inner.Name() }
+func (r *reqRecorder) Models() []llm.ModelInfo { return r.inner.Models() }
 func (r *reqRecorder) CountTokens(m []llm.Message) (int, error) {
 	return r.inner.CountTokens(m)
 }

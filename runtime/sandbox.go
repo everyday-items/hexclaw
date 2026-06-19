@@ -29,6 +29,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/toolkit/util/idgen"
+
 	"github.com/hexagon-codes/hexclaw/featureflag"
 )
 
@@ -84,8 +86,8 @@ var ErrSandboxDisabled = errors.New("runtime: sandbox disabled (flag runtime.san
 type ProcessSandbox struct{}
 
 // NewProcessSandbox 构造。
-func NewProcessSandbox() *ProcessSandbox             { return &ProcessSandbox{} }
-func (p *ProcessSandbox) Kind() SandboxKind          { return KindProcess }
+func NewProcessSandbox() *ProcessSandbox    { return &ProcessSandbox{} }
+func (p *ProcessSandbox) Kind() SandboxKind { return KindProcess }
 
 // Run 真实实现：用 exec.CommandContext 执行；timeout / WorkDir / Env 直接传给 cmd。
 // rlimit / cgroups (Linux) / sandbox-exec (macOS) 等系统级隔离留待生产 hardening。
@@ -183,7 +185,7 @@ func (s *CheckpointStore) Begin(ctx context.Context, paths []string) (string, er
 		return "", ErrSandboxDisabled
 	}
 	cp := &Checkpoint{
-		ID:        fmt.Sprintf("cp-%d", time.Now().UnixNano()),
+		ID:        fmt.Sprintf("cp-%s", idgen.NanoID()),
 		CreatedAt: time.Now(),
 	}
 	for _, p := range paths {
