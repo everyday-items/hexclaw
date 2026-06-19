@@ -201,13 +201,22 @@ func TestScheduler_ExecuteJobInvokesScriptExecutor(t *testing.T) {
 	s.Start(ctx)
 	defer s.Stop()
 
-	// 等待 tick 触发 + 沙箱跑完
-	time.Sleep(3 * time.Second)
-
-	history, err := s.GetJobHistory(ctx, job.ID)
-	if err != nil {
-		t.Fatalf("GetJobHistory: %v", err)
+	// 轮询等待 tick 触发 + 沙箱执行完成: 替代固定 time.Sleep, 避免 CI 负载下
+	// (python 启动 + 沙箱搭建较慢) 3s 不足导致的 flaky; 任务完成即返回, 最长等 20s。
+	var history []JobHistory
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		var err error
+		history, err = s.GetJobHistory(ctx, job.ID)
+		if err != nil {
+			t.Fatalf("GetJobHistory: %v", err)
+		}
+		if len(history) > 0 && history[0].Status == "success" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
+
 	if len(history) == 0 {
 		t.Fatal("应至少有 1 条 history")
 	}
