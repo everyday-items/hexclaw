@@ -38,6 +38,10 @@ func setupTestDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatalf("打开测试数据库失败: %v", err)
 	}
+	// :memory: SQLite 每个连接是独立内存库; database/sql 连接池下,
+	// Init 建表的连接与后续查询的连接可能不同 → "no such table: cron_job_runs"。
+	// 限定单连接, 保证全部操作命中同一内存库 (并发访问亦随之串行化)。
+	db.SetMaxOpenConns(1)
 	return db
 }
 
