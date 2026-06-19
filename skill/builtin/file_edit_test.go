@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -154,6 +155,9 @@ func TestFileEditSkill_EmptyOldString(t *testing.T) {
 
 // F.2 验证: 编辑后保留原文件权限
 func TestFileEditSkill_PreservesPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix 文件权限位 (0755) 在 Windows 上无对应语义, 本断言仅适用于类 Unix 系统")
+	}
 	ws := t.TempDir()
 	path := filepath.Join(ws, "script.sh")
 	os.WriteFile(path, []byte("#!/bin/bash\necho hello\n"), 0755)
