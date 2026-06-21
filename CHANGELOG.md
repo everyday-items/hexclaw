@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Added
+- **数据连接器（§15.1）**：新增 `connector/` 包——token（PAT / Integration Token）只读接入 GitHub / Notion，token 经 `secret.Box` 静态加密落盘（`~/.hexclaw/connectors.json`，`enc:v1:`），API 响应一律脱敏。端点 `GET/POST/DELETE /api/v1/connectors`、`POST /api/v1/connectors/test`、`GET /api/v1/connectors/{id}/resources`（真实拉取仓库 / 页面）。
+- **默认助理人设（SOUL）端点**：注册 `GET/PUT /api/v1/assistant/soul`（读写 `~/.hexclaw/SOUL.md`，空=恢复内置默认；引擎每轮读取，保存即时生效）。
+- **定时任务显式投递目标**：`AddCronJobRequest.Deliver` 透传到 `cron.AddJobRequest`，前端「从连接库下拉选投递目标」即走此字段（§5 一处存处处引）。
+
+### Changed
+- **工作流图执行器兼容前端字段**：`workflow_runtime.go` parse() 同时接受节点 `data`/`config`、边 `source/target`/`from/to`，使桌面端线性工作流保存的形状能被图执行器正确读取并链接。
+
 ## [0.4.4] - 2026-06-21
 > 接续 v0.4.3（已 tag 于 aa34a45）之后的地基功能 + 安全加固发布。本次新增静态凭据加密、
 > 注入扫描、统一权限闸 GA、Skill 工具盘、library 记忆薄版，并修复一组无人值守安全缺口。
