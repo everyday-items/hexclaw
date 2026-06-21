@@ -23,6 +23,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/adapter/wecom"
 	"github.com/hexagon-codes/hexclaw/adapter/whatsapp"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/secret"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -63,6 +64,10 @@ type Manager struct {
 	db      *sql.DB
 	handler adapter.MessageHandler
 
+	// box 负责 config_json 的静态加密/解密。可为 nil（部分测试不注入）：
+	// 此时凭据按明文直存直读，全链路退化为旧行为，不 crash。
+	box *secret.Box
+
 	mu       sync.RWMutex
 	running  map[string]adapter.Adapter
 	inbound  map[string]http.Handler
@@ -82,6 +87,45 @@ func (m *Manager) SetHandler(h adapter.MessageHandler) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.handler = h
+}
+
+// SetSecretBox 注入用于 config_json 静态加密的 Box。传 nil 表示不加密（明文直存）。
+// 设计为 setter 而非构造参数，使既有 NewManager(db) 调用点全部保持兼容。
+func (m *Manager) SetSecretBox(box *secret.Box) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.box = box
+}
+
+// encryptConfig 把明文 config JSON 封成 enc:v1: 密文用于落库。box 为 nil 时原样返回明文。
+func (m *Manager) encryptConfig(plain string) (string, error) {
+	m.mu.RLock()
+	box := m.box
+	m.mu.RUnlock()
+	if box == nil {
+		return plain, nil
+	}
+	return box.Seal([]byte(plain))
+}
+
+// decryptConfig 把库里的 config 值还原为明文 JSON。
+//   - 带 enc:v1: 前缀 → 用 box 解密（box 为 nil 时无法解密，返回错误，避免把密文当配置塞给适配器）。
+//   - 不带前缀（历史明文）→ 原样返回，下次 Upsert 时会被加密。
+func (m *Manager) decryptConfig(stored string) (string, error) {
+	if !secret.IsEncrypted(stored) {
+		return stored, nil
+	}
+	m.mu.RLock()
+	box := m.box
+	m.mu.RUnlock()
+	if box == nil {
+		return "", fmt.Errorf("config 已加密但未配置 secret.Box，无法解密")
+	}
+	plain, err := box.Open(stored)
+	if err != nil {
+		return "", err
+	}
+	return string(plain), nil
 }
 
 func (m *Manager) Init(ctx context.Context) error {
@@ -156,7 +200,11 @@ func (m *Manager) List(ctx context.Context) ([]*Instance, error) {
 			return nil, err
 		}
 		inst.Enabled = enabled == 1
-		inst.Config = json.RawMessage(configJSON)
+		plain, err := m.decryptConfig(configJSON)
+		if err != nil {
+			return nil, fmt.Errorf("解密实例 %q config 失败: %w", inst.Name, err)
+		}
+		inst.Config = json.RawMessage(plain)
 		if lastEvent.Valid {
 			inst.LastEventAt = lastEvent.Time
 		}
@@ -179,7 +227,11 @@ func (m *Manager) Get(ctx context.Context, name string) (*Instance, error) {
 		return nil, err
 	}
 	inst.Enabled = enabled == 1
-	inst.Config = json.RawMessage(configJSON)
+	plain, err := m.decryptConfig(configJSON)
+	if err != nil {
+		return nil, fmt.Errorf("解密实例 %q config 失败: %w", inst.Name, err)
+	}
+	inst.Config = json.RawMessage(plain)
 	if lastEvent.Valid {
 		inst.LastEventAt = lastEvent.Time
 	}
@@ -204,6 +256,16 @@ func (m *Manager) Upsert(ctx context.Context, inst *Instance) error {
 	}
 	inst.UpdatedAt = now
 
+	// 落库前对明文 config JSON 做静态加密（box 为 nil 时原样存明文）。
+	plainConfig := string(inst.Config)
+	if plainConfig == "" {
+		plainConfig = "{}"
+	}
+	storedConfig, err := m.encryptConfig(plainConfig)
+	if err != nil {
+		return fmt.Errorf("加密实例 %q config 失败: %w", inst.Name, err)
+	}
+
 	_, err = m.db.ExecContext(ctx,
 		`INSERT INTO platform_instances (id, provider, name, enabled, mode, status, config_json, last_error, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -213,9 +275,66 @@ func (m *Manager) Upsert(ctx context.Context, inst *Instance) error {
 		    mode=excluded.mode,
 		    config_json=excluded.config_json,
 		    updated_at=excluded.updated_at`,
-		inst.ID, inst.Provider, inst.Name, boolToInt(inst.Enabled), inst.Mode, StatusStopped, string(inst.Config), inst.LastError, inst.CreatedAt, inst.UpdatedAt,
+		inst.ID, inst.Provider, inst.Name, boolToInt(inst.Enabled), inst.Mode, StatusStopped, storedConfig, inst.LastError, inst.CreatedAt, inst.UpdatedAt,
 	)
 	return err
+}
+
+// EncryptExistingAtRest 把库里仍是明文（无 enc:v1: 前缀）的 config_json 就地重写为密文。
+// 在启动时、SetSecretBox 之后调用一次即可完成历史数据的静态加密回填。
+//
+// 设计取舍：未走 storage/migrate 的 Version 迁移，而是放在 Manager。原因是主密钥（master.key）
+// 由 secret.Box 在数据目录管理，迁移层只拿得到 *sql.DB，要在迁移里加密就得让 migrate 包反向
+// 依赖 secret 并重复一遍密钥加载逻辑；而 Manager 本就持有 Box，由它做这件数据回填最自然、耦合最低。
+// 迁移层只管 schema，数据内容的加密回填属于应用层职责。
+//
+// box 未注入时直接跳过（返回 nil），不阻断启动；绝不记录明文凭据或密钥。
+func (m *Manager) EncryptExistingAtRest(ctx context.Context) (int, error) {
+	m.mu.RLock()
+	box := m.box
+	m.mu.RUnlock()
+	if box == nil {
+		return 0, nil
+	}
+
+	rows, err := m.db.QueryContext(ctx, `SELECT name, config_json FROM platform_instances`)
+	if err != nil {
+		return 0, err
+	}
+	type pending struct{ name, plain string }
+	var todo []pending
+	for rows.Next() {
+		var name, configJSON string
+		if err := rows.Scan(&name, &configJSON); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if secret.IsEncrypted(configJSON) {
+			continue // 已加密，跳过
+		}
+		todo = append(todo, pending{name: name, plain: configJSON})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+
+	encrypted := 0
+	for _, p := range todo {
+		sealed, err := box.Seal([]byte(p.plain))
+		if err != nil {
+			return encrypted, fmt.Errorf("加密实例 %q config 失败: %w", p.name, err)
+		}
+		if _, err := m.db.ExecContext(ctx,
+			`UPDATE platform_instances SET config_json = ? WHERE name = ?`,
+			sealed, p.name,
+		); err != nil {
+			return encrypted, fmt.Errorf("回写实例 %q 密文失败: %w", p.name, err)
+		}
+		encrypted++
+	}
+	return encrypted, nil
 }
 
 func (m *Manager) Delete(ctx context.Context, name string) error {
@@ -323,20 +442,36 @@ func (m *Manager) Stop(ctx context.Context, name string) error {
 }
 
 // Send delivers a Reply through a running adapter for proactive (non-inbound)
-// messaging such as scheduled-job results. target resolves by instance name
-// first, then by provider/platform (cron deliver targets are platform names
-// like "feishu"). Returns an error if no running adapter matches.
+// messaging such as scheduled-job results. target resolves in priority order:
+//  1. instance ID ("pi-xxx") — Connection is a first-class object referenced by id;
+//  2. instance name (running map is name-keyed, so this is a direct hit);
+//  3. provider/platform fallback (cron deliver targets are platform names like "feishu").
+//
+// Deterministic ordering at each step avoids routing to a random instance when
+// several share a provider. Returns an error if no running adapter matches.
 func (m *Manager) Send(ctx context.Context, target, chatID string, reply *adapter.Reply) error {
 	m.mu.RLock()
-	adp := m.running[target]
-	if adp == nil {
-		// Deterministic pick by instance name; several instances can share a
-		// provider, and map iteration order would otherwise route to a random one.
-		names := make([]string, 0, len(m.running))
-		for name := range m.running {
-			names = append(names, name)
+	// 预排序运行中的实例名，使按 ID / provider 命中时都走确定顺序。
+	names := make([]string, 0, len(m.running))
+	for name := range m.running {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	// 1) 按 Connection ID 解析（pi-xxx）。
+	var adp adapter.Adapter
+	for _, name := range names {
+		if md, ok := m.metadata[name]; ok && md.ID == target {
+			adp = m.running[name]
+			break
 		}
-		sort.Strings(names)
+	}
+	// 2) 按实例名解析（running map 即以 name 为键）。
+	if adp == nil {
+		adp = m.running[target]
+	}
+	// 3) 按 provider/platform 回退。
+	if adp == nil {
 		for _, name := range names {
 			if md, ok := m.metadata[name]; ok && md.Provider == target {
 				adp = m.running[name]
