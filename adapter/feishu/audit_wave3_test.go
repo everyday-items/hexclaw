@@ -874,8 +874,28 @@ func TestName_Default(t *testing.T) {
 
 // captureDefaultLog 临时把全局默认 logger 重定向到内存 buffer，
 // 返回捕获到的全部日志文本和一个恢复函数。用于断言日志内容。
-func captureDefaultLog() (buf *bytes.Buffer, restore func()) {
-	buf = &bytes.Buffer{}
+// syncBuffer is a concurrency-safe log sink. Start() spawns a background
+// goroutine that logs via the global logger while the test reads String();
+// guarding both ends removes the data race on the shared buffer (BUG-F6).
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func captureDefaultLog() (buf *syncBuffer, restore func()) {
+	buf = &syncBuffer{}
 	prev := logger.Default()
 	logger.SetDefault(logger.NewWithHandler(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	return buf, func() { logger.SetDefault(prev) }

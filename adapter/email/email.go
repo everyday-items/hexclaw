@@ -149,6 +149,67 @@ func (a *EmailAdapter) ValidateConfig(ctx context.Context) error {
 	return nil
 }
 
+// ProbeSMTP 对 SMTP 凭据做一次"连接级"探测：建立连接、EHLO、按服务器能力 STARTTLS、
+// 然后 AUTH，最后 QUIT。它**不发送任何邮件**，仅用于"测试连接"场景验证 host/port/账号/口令
+// 是否可用。凭据只在本次调用内瞬态使用，绝不持久化，调用方也不应记录其内容。
+//
+// ctx 控制整体超时；465 端口默认隐式 TLS，其余端口先明文连接再按服务器 STARTTLS 能力升级。
+func ProbeSMTP(ctx context.Context, cfg SMTPConfig) error {
+	if cfg.Host == "" || cfg.Username == "" || cfg.Password == "" {
+		return fmt.Errorf("smtp host/username/password 未配置")
+	}
+	if cfg.Port == 0 {
+		cfg.Port = 587
+	}
+	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	var (
+		conn net.Conn
+		err  error
+	)
+	if cfg.Port == 465 {
+		// 隐式 TLS（SMTPS）。
+		conn, err = tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{ServerName: cfg.Host})
+	} else {
+		conn, err = dialer.DialContext(ctx, "tcp", addr)
+	}
+	if err != nil {
+		return fmt.Errorf("smtp 连接失败: %w", err)
+	}
+	// 用 ctx 的 deadline（若有）约束后续 I/O，避免恶意/缓慢服务器拖死探测。
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+
+	client, err := smtp.NewClient(conn, cfg.Host)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("创建 SMTP 客户端失败: %w", err)
+	}
+	defer func() {
+		// QUIT 关闭会话；失败不影响探测结论，但仍尽力关闭底层连接。
+		if quitErr := client.Quit(); quitErr != nil {
+			_ = conn.Close()
+		}
+	}()
+
+	// 端口 465 已是隐式 TLS；其余端口若服务器支持 STARTTLS 则升级。
+	if cfg.Port != 465 {
+		if ok, _ := client.Extension("STARTTLS"); ok {
+			if err := client.StartTLS(&tls.Config{ServerName: cfg.Host}); err != nil {
+				return fmt.Errorf("smtp STARTTLS 失败: %w", err)
+			}
+		}
+	}
+
+	auth := smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)
+	if err := client.Auth(auth); err != nil {
+		return fmt.Errorf("smtp 认证失败: %w", err)
+	}
+	return nil
+}
+
 func (a *EmailAdapter) pollLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(a.cfg.PollInterval) * time.Second)
 	defer ticker.Stop()

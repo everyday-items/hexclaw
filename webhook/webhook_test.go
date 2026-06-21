@@ -134,6 +134,55 @@ func TestManager_HandleGenericWebhook(t *testing.T) {
 }
 
 // TestManager_GitHubSignatureVerification 测试 GitHub 签名验证
+// §13.3(1)：绑定 job 的 webhook 触发时，event.JobID 必须随事件透传给 handler，
+// 且 List/load 往返保留 JobID（handler 据此走 TriggerJob 而非跑 prompt）。
+func TestManager_EventTriggerCarriesJobID(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	mgr := NewManager(db)
+	mgr.Init(ctx)
+
+	if err := mgr.Register(ctx, &Webhook{
+		Name:   "trigger",
+		Type:   TypeGeneric,
+		Prompt: "unused when job bound",
+		JobID:  "job-42",
+		UserID: "user-1",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// 往返：List 应保留 JobID（列已持久化）。
+	list, err := mgr.List(ctx, "user-1")
+	if err != nil || len(list) != 1 || list[0].JobID != "job-42" {
+		t.Fatalf("List did not preserve JobID: %+v (err=%v)", list, err)
+	}
+
+	var gotJobID atomic.Value
+	gotJobID.Store("")
+	mgr.SetHandler(func(_ context.Context, event *Event, _ string) error {
+		gotJobID.Store(event.JobID)
+		return nil
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/webhooks/{name}", mgr.Handler())
+	req := httptest.NewRequest("POST", "/api/v1/webhooks/trigger", bytes.NewReader([]byte(`{"x":1}`)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if got := gotJobID.Load().(string); got != "job-42" {
+		t.Errorf("event.JobID = %q, want job-42 (handler routes to TriggerJob)", got)
+	}
+}
+
 func TestManager_GitHubSignatureVerification(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()

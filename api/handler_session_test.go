@@ -695,13 +695,9 @@ func TestDeleteSession_Success(t *testing.T) {
 		t.Errorf("message=%q, want 会话已删除", resp["message"])
 	}
 
-	// 确认会话已被软删除（status = -1）
-	sess, err := store.GetSession(context.Background(), "sess-del")
-	if err != nil {
-		t.Fatalf("GetSession 应仍能返回软删除的会话，实际 err=%v", err)
-	}
-	if sess.Status != -1 {
-		t.Fatalf("软删除后 status=%d, want -1", sess.Status)
+	// 软删除后会话不可读：GetSession 返回 ErrNotFound，防止已删除会话被读取或 fork 复活。
+	if _, err := store.GetSession(context.Background(), "sess-del"); err != storage.ErrNotFound {
+		t.Fatalf("软删除后 GetSession 应返回 ErrNotFound，实际 err=%v", err)
 	}
 
 	// 确认不再出现在列表中（ListSessions 过滤 status >= 0）

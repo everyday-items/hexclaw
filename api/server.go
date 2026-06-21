@@ -26,7 +26,6 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"net"
 	"net/http"
 	"os"
@@ -34,6 +33,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/util/logger"
 
 	imagegen "github.com/hexagon-codes/ai-core/media/image"
 	videogen "github.com/hexagon-codes/ai-core/media/video"
@@ -51,6 +52,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/instances"
 	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
 	"github.com/hexagon-codes/hexclaw/knowledge"
+	"github.com/hexagon-codes/hexclaw/library"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
@@ -75,6 +77,8 @@ type Server struct {
 	kb                *knowledge.Manager           // 知识库管理器（可选）
 	webhookMgr        *webhook.Manager             // Webhook 管理器（可选）
 	scheduler         *cron.Scheduler              // Cron 调度器（可选）
+	promptStore       *library.PromptStore         // §11.8 Prompt 库（可选）
+	memStore          *library.MemoryStore         // §11.8 记忆薄版（可选）
 	fileMem           *memory.FileMemory           // 文件记忆（可选）
 	vectorMem         *memory.VectorMemory         // 向量语义记忆（可选）
 	mcpMgr            *hexmcp.Manager              // MCP 管理器（可选）
@@ -184,6 +188,16 @@ func (s *Server) SetWebhookManager(mgr *webhook.Manager) {
 // 设置后启用定时任务管理 API。
 func (s *Server) SetCronScheduler(scheduler *cron.Scheduler) {
 	s.scheduler = scheduler
+}
+
+// SetPromptStore 设置 Prompt 库存储（§11.8）。设置后启用 /api/v1/prompts CRUD。
+func (s *Server) SetPromptStore(ps *library.PromptStore) {
+	s.promptStore = ps
+}
+
+// SetMemoryStore 设置记忆薄版存储（§11.8）。设置后启用 /api/v1/memories CRUD。
+func (s *Server) SetMemoryStore(ms *library.MemoryStore) {
+	s.memStore = ms
 }
 
 // SetCronParser 注入 Layer 2 cron 自然语言 → JSON 解析所需的 LLM provider + model（D2.1）。
@@ -499,8 +513,25 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /api/v1/llm/capabilities/probe", s.handleProbeCapability)
 	}
 
+	// §15 连接中心「测试连接」：无状态验证一组连接凭据（email / IM），凭据不持久化、不落日志。
+	mux.HandleFunc("POST /api/v1/connections/test", s.handleConnectionsTest)
+
 	// 角色列表 API
 	mux.HandleFunc("GET /api/v1/roles", s.handleListRoles)
+
+	// §11.8 Prompt 库 API（服务端下发，运营增删不发版）
+	if s.promptStore != nil {
+		mux.HandleFunc("GET /api/v1/prompts", s.handleListPrompts)
+		mux.HandleFunc("GET /api/v1/prompts/all", s.handleListAllPrompts)
+		mux.HandleFunc("POST /api/v1/prompts", s.handleUpsertPrompt)
+		mux.HandleFunc("DELETE /api/v1/prompts/{id}", s.handleDeletePrompt)
+	}
+	// §11.8 记忆薄版 API
+	if s.memStore != nil {
+		mux.HandleFunc("GET /api/v1/memories", s.handleListUserMemories)
+		mux.HandleFunc("POST /api/v1/memories", s.handleUpsertUserMemory)
+		mux.HandleFunc("DELETE /api/v1/memories/{id}", s.handleDeleteUserMemory)
+	}
 
 	// Webhook API
 	if s.webhookMgr != nil {
@@ -599,6 +630,8 @@ func (s *Server) routes() http.Handler {
 	}
 
 	if s.instanceMgr != nil {
+		// 连接中心脱敏只读列表（一处存）：永不下发凭据。
+		mux.HandleFunc("GET /api/v1/connections", s.handleListConnections)
 		mux.HandleFunc("GET /api/v1/platforms/instances", s.handleListInstances)
 		mux.HandleFunc("GET /api/v1/platforms/instances/health", s.handleListInstanceHealth)
 		mux.HandleFunc("POST /api/v1/platforms/instances", s.handleUpsertInstance)

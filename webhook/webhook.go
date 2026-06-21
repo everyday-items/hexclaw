@@ -45,13 +45,14 @@ const (
 // Webhook 配置
 type Webhook struct {
 	ID          string      `json:"id"`
-	Name        string      `json:"name"`       // 名称（也是 URL 路径）
-	Type        WebhookType `json:"type"`       // 类型
-	Secret      string      `json:"-"`          // 签名验证 Secret（JSON 序列化时隐藏）
-	HasSecret   bool        `json:"has_secret"` // 是否配置了 Secret
-	Prompt      string      `json:"prompt"`     // Agent 处理指令
-	UserID      string      `json:"user_id"`    // 所属用户
-	Enabled     bool        `json:"enabled"`    // 是否启用
+	Name        string      `json:"name"`             // 名称（也是 URL 路径）
+	Type        WebhookType `json:"type"`             // 类型
+	Secret      string      `json:"-"`                // 签名验证 Secret（JSON 序列化时隐藏）
+	HasSecret   bool        `json:"has_secret"`       // 是否配置了 Secret
+	Prompt      string      `json:"prompt"`           // Agent 处理指令（JobID 为空时跑此 prompt）
+	JobID       string      `json:"job_id,omitempty"` // §13.3(1) 非空 → 触发指定 cron job 而非跑 prompt
+	UserID      string      `json:"user_id"`          // 所属用户
+	Enabled     bool        `json:"enabled"`          // 是否启用
 	LastEventAt time.Time   `json:"last_event_at"`
 	EventCount  int         `json:"event_count"`
 	CreatedAt   time.Time   `json:"created_at"`
@@ -62,9 +63,10 @@ type Event struct {
 	WebhookID   string         `json:"webhook_id"`
 	WebhookName string         `json:"webhook_name"`
 	Type        WebhookType    `json:"type"`
-	EventType   string         `json:"event_type"` // 事件类型（如 push, pull_request）
-	Payload     map[string]any `json:"payload"`    // 原始 payload
-	Summary     string         `json:"summary"`    // 解析后的摘要
+	EventType   string         `json:"event_type"`       // 事件类型（如 push, pull_request）
+	Payload     map[string]any `json:"payload"`          // 原始 payload
+	Summary     string         `json:"summary"`          // 解析后的摘要
+	JobID       string         `json:"job_id,omitempty"` // §13.3(1) 随 webhook 配置带下来的目标 job（非空 → 触发 job）
 	ReceivedAt  time.Time      `json:"received_at"`
 }
 
@@ -105,10 +107,16 @@ func (m *Manager) Init(ctx context.Context) error {
 		enabled INTEGER DEFAULT 1,
 		last_event_at DATETIME,
 		event_count INTEGER DEFAULT 0,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		job_id TEXT NOT NULL DEFAULT ''
 	)`)
 	if err != nil {
 		return fmt.Errorf("初始化 webhook 表失败: %w", err)
+	}
+
+	// §13.3(1) 兼容升级：旧库补 job_id 列。已存在时报 "duplicate column name"，预期忽略。
+	if _, aerr := m.db.ExecContext(ctx, `ALTER TABLE webhooks ADD COLUMN job_id TEXT NOT NULL DEFAULT ''`); aerr != nil && !strings.Contains(aerr.Error(), "duplicate column") {
+		logger.Warn("Webhook: 添加 job_id 列失败（非 duplicate）", "err", aerr.Error())
 	}
 
 	return m.loadWebhooks(ctx)
@@ -135,9 +143,9 @@ func (m *Manager) Register(ctx context.Context, wh *Webhook) error {
 	wh.Enabled = true
 
 	_, err := m.db.ExecContext(ctx,
-		`INSERT INTO webhooks (id, name, type, secret, prompt, user_id, enabled, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		wh.ID, wh.Name, wh.Type, wh.Secret, wh.Prompt, wh.UserID, 1, wh.CreatedAt,
+		`INSERT INTO webhooks (id, name, type, secret, prompt, user_id, enabled, created_at, job_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		wh.ID, wh.Name, wh.Type, wh.Secret, wh.Prompt, wh.UserID, 1, wh.CreatedAt, wh.JobID,
 	)
 	if err != nil {
 		return fmt.Errorf("注册 webhook 失败: %w", err)
@@ -167,7 +175,7 @@ func (m *Manager) Unregister(ctx context.Context, name string) error {
 // List 列出所有 Webhook
 func (m *Manager) List(ctx context.Context, userID string) ([]*Webhook, error) {
 	rows, err := m.db.QueryContext(ctx,
-		`SELECT id, name, type, secret, prompt, user_id, enabled, last_event_at, event_count, created_at
+		`SELECT id, name, type, secret, prompt, user_id, enabled, last_event_at, event_count, created_at, job_id
 		 FROM webhooks WHERE user_id = ? ORDER BY created_at DESC`, userID)
 	if err != nil {
 		return nil, err
@@ -180,7 +188,7 @@ func (m *Manager) List(ctx context.Context, userID string) ([]*Webhook, error) {
 		var lastEvent sql.NullTime
 		var enabled int
 		if err := rows.Scan(&wh.ID, &wh.Name, &wh.Type, &wh.Secret, &wh.Prompt,
-			&wh.UserID, &enabled, &lastEvent, &wh.EventCount, &wh.CreatedAt); err != nil {
+			&wh.UserID, &enabled, &lastEvent, &wh.EventCount, &wh.CreatedAt, &wh.JobID); err != nil {
 			return nil, err
 		}
 		wh.Enabled = enabled == 1
@@ -257,6 +265,9 @@ func (m *Manager) Handler() http.HandlerFunc {
 		m.mu.RUnlock()
 
 		if handler != nil {
+			// §13.3(1)：把 webhook 绑定的目标 job 随 event 带给 handler（非空 →
+			// handler 触发该 job 而非跑 prompt）。EventHandler 签名不变。
+			event.JobID = wh.JobID
 			// v0.3.12 H7：用 trace.Go 保留父 ctx 的 logger 链路（session_id / trace_id）
 			// + panic recover（防止 handler 崩了静默吞）。
 			// 父 ctx 来自 HTTP r.Context()；Detach 断开父取消但保留 Values。
@@ -394,7 +405,7 @@ func getNestedString(m map[string]any, keys ...string) string {
 // loadWebhooks 从数据库加载所有启用的 webhook
 func (m *Manager) loadWebhooks(ctx context.Context) error {
 	rows, err := m.db.QueryContext(ctx,
-		`SELECT id, name, type, secret, prompt, user_id, enabled, last_event_at, event_count, created_at
+		`SELECT id, name, type, secret, prompt, user_id, enabled, last_event_at, event_count, created_at, job_id
 		 FROM webhooks WHERE enabled = 1`)
 	if err != nil {
 		return err
@@ -406,7 +417,7 @@ func (m *Manager) loadWebhooks(ctx context.Context) error {
 		var lastEvent sql.NullTime
 		var enabled int
 		if err := rows.Scan(&wh.ID, &wh.Name, &wh.Type, &wh.Secret, &wh.Prompt,
-			&wh.UserID, &enabled, &lastEvent, &wh.EventCount, &wh.CreatedAt); err != nil {
+			&wh.UserID, &enabled, &lastEvent, &wh.EventCount, &wh.CreatedAt, &wh.JobID); err != nil {
 			return err
 		}
 		wh.Enabled = enabled == 1

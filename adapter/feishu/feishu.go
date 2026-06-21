@@ -468,7 +468,9 @@ func (a *FeishuAdapter) sendAndGetID(ctx context.Context, chatID, text string) (
 			MessageID string `json:"message_id"`
 		} `json:"data"`
 	}
-	_ = json.Unmarshal(respBody, &result)
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("解析飞书响应失败: %w", err)
+	}
 	return result.Data.MessageID, nil
 }
 
@@ -511,7 +513,9 @@ func (a *FeishuAdapter) replyAndGetID(ctx context.Context, replyToMsgID, text st
 			MessageID string `json:"message_id"`
 		} `json:"data"`
 	}
-	_ = json.Unmarshal(respBody, &result)
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("解析飞书 reply 响应失败: %w", err)
+	}
 	if result.Code != 0 {
 		return "", fmt.Errorf("飞书 reply 业务错误 code=%d: %s", result.Code, result.Msg)
 	}

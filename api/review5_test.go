@@ -38,8 +38,10 @@ func TestUpdateAgent_ZeroValueDoesNotClear(t *testing.T) {
 // 任何新增的引用类型字段，要么改成值类型，要么在下面 allow-list 里显式说明为何只读。
 func TestTriggerJob_ShallowCopy(t *testing.T) {
 	readOnlyShared := map[string]bool{
-		"Spec":    true, // *JobSpec：LLM 编译产物，运行时不变。详见 .claude/cron-script-compilation-design.md §3.1
-		"Deliver": true, // []string：D4.2 多 deliver 渠道列表 — 创建期写入，运行时只读
+		"Spec":           true, // *JobSpec：LLM 编译产物，运行时不变。详见 .claude/cron-script-compilation-design.md §3.1
+		"Deliver":        true, // []string：D4.2 多 deliver 渠道列表 — 创建期写入，运行时只读
+		"ContextFrom":    true, // []string：上游 jobID 链 — 创建期写入，运行时只读
+		"FailureDeliver": true, // []string：失败投递目标 — 创建期写入，运行时只读
 	}
 	jobType := reflect.TypeOf(cron.Job{})
 	for i := 0; i < jobType.NumField(); i++ {
