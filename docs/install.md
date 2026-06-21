@@ -40,7 +40,7 @@ go install github.com/hexagon-codes/hexclaw/cmd/hexclaw@latest
 
 ```bash
 hexclaw version
-# HexClaw v0.4.3
+# HexClaw v0.4.4
 ```
 
 ### 方式二：从源码编译
@@ -51,7 +51,7 @@ cd hexclaw
 go build -o hexclaw ./cmd/hexclaw/
 
 # 可选：带版本信息编译
-go build -ldflags "-X main.version=v0.4.3 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o hexclaw ./cmd/hexclaw/
+go build -ldflags "-X main.version=v0.4.4 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o hexclaw ./cmd/hexclaw/
 
 # 移动到 PATH
 sudo mv hexclaw /usr/local/bin/
