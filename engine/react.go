@@ -26,6 +26,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	"github.com/hexagon-codes/hexclaw/memory"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
+	"github.com/hexagon-codes/hexclaw/security"
 	"github.com/hexagon-codes/hexclaw/session"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/storage"
@@ -103,6 +104,39 @@ func (e *ReActEngine) ensureSystemDispatchToolFloor(tools []llm.ToolDefinition, 
 	return append(front, rest...)
 }
 
+// cronRecursiveToolDenylist are tools an unattended cron-dispatched agent must
+// NOT receive: self-scheduling (cron_task), self-authoring skills (create_skill),
+// and self-
+// installing skills / MCP servers (manage_skill / manage_mcp_server). Letting a
+// scheduled agent acquire or schedule new capability is a runaway-loop and
+// privilege-escalation vector. Names are the real ToolDefinition function names
+// (SkillWriter→create_skill, SkillInstaller→manage_skill), not the skill IDs.
+var cronRecursiveToolDenylist = []string{"cron_task", "create_skill", "manage_skill", "manage_mcp_server"}
+
+// stripCronRecursiveTools removes the recursion-guard denylist from a cron
+// dispatch's tool set. Because ensureSystemDispatchToolFloor only reorders
+// existing tools (never synthesizes), stripping here also keeps cron_task out of
+// the floor front — no separate floor variant needed. Case-insensitive match.
+func stripCronRecursiveTools(msg *adapter.Message, tools []llm.ToolDefinition) []llm.ToolDefinition {
+	if !isCronDispatch(msg) || len(tools) == 0 {
+		return tools
+	}
+	out := make([]llm.ToolDefinition, 0, len(tools))
+	for _, t := range tools {
+		denied := false
+		for _, d := range cronRecursiveToolDenylist {
+			if strings.EqualFold(t.Function.Name, d) {
+				denied = true
+				break
+			}
+		}
+		if !denied {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 const reasoningOnlyFallbackContent = "模型只完成了思考，没有输出最终回答，请重试一次。"
 
 var thinkingOnCompletionTimeout = 90 * time.Second
@@ -129,6 +163,7 @@ type ReActEngine struct {
 	kb          *knowledge.Manager   // 知识库管理器（可为 nil）
 	compactor   *session.Compactor   // 上下文压缩器
 	fileMem     *memory.FileMemory   // 文件记忆系统（可为 nil）
+	memProvider MemoryProvider       // §11.8 记忆薄版（standing/fact 每轮注入，可为 nil）
 	vectorMem   *memory.VectorMemory // 向量语义记忆（可为 nil）
 	factory     *agents.Factory      // Agent 角色工厂
 	// v0.4.0 G1: 可选 hexagon.Agent 真分派（flag agent.factory.real 控制）
@@ -334,6 +369,19 @@ func (e *ReActEngine) ReloadLLMConfig(_ context.Context, llmCfg config.LLMConfig
 //
 // 设置后，引擎在处理消息时会自动检索知识库，
 // 将相关内容作为上下文注入 Agent。
+// MemoryProvider 提供 §11.8 记忆薄版的每轮注入块（standing 全量 + fact 命中），
+// 由 library.MemoryStore 实现。返回 "" 表示无可注入记忆。
+type MemoryProvider interface {
+	Inject(ctx context.Context, query string) string
+}
+
+// SetMemoryProvider 注入记忆薄版提供方；nil 时不注入（行为不变）。
+func (e *ReActEngine) SetMemoryProvider(p MemoryProvider) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.memProvider = p
+}
+
 func (e *ReActEngine) SetKnowledgeBase(kb *knowledge.Manager) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -724,10 +772,21 @@ func (e *ReActEngine) completeWithTools(
 		tools = e.toolCollector.CollectFiltered(msg.Content, skill.Activation{
 			Mode: string(ResolveMode(msg.Metadata["agent_mode"], msg.Content)),
 		})
+		tools = stripCronRecursiveTools(msg, tools) // cron 递归防护：剔除自升级/自排程工具
 		tools = e.ensureSystemDispatchToolFloor(tools, msg)
 		if cap := effectiveMaxTools(toolsCfg.MaxTools, msg); cap > 0 && len(tools) > cap {
 			tools = tools[:cap]
 		}
+	}
+
+	// §11.11 注入扫描（纵深防御的一层，非主防御）：对组装进 prompt 的不可信内容
+	// （用户输入 + RAG 召回正文）做"明显恶意"快速拦截。有 skills / 注入数据时放宽
+	// "指令覆盖"族（避免误杀讲注入的合法教程文档），外泄 / 混淆族始终查。主防御仍是
+	// 架构 —— 按 source 收窄工具供给（stripCronRecursiveTools）+ 动作审批闸。
+	// 这是事件触发（webhook/cron 经 Process→completeWithTools）exec 前必经的扫描点（§12.5）。
+	if err := security.ScanAssembled(msg.Content+"\n"+kbContext, len(tools) > 0, kbContext != ""); err != nil {
+		trace.L(ctx).Warn("prompt 注入扫描拦截", "err", err.Error(), "session", sessionID, "source", msg.Metadata["source"])
+		return nil, err
 	}
 
 	// 构建初始请求
@@ -1400,10 +1459,18 @@ func (e *ReActEngine) processStreamRuntime(
 			tools = e.toolCollector.CollectFiltered(msg.Content, skill.Activation{
 				Mode: string(ResolveMode(msg.Metadata["agent_mode"], msg.Content)),
 			})
+			tools = stripCronRecursiveTools(msg, tools) // cron 递归防护：剔除自升级/自排程工具
 			tools = e.ensureSystemDispatchToolFloor(tools, msg)
 			if cap := effectiveMaxTools(streamToolsCfg.MaxTools, msg); cap > 0 && len(tools) > cap {
 				tools = tools[:cap]
 			}
+		}
+		// §11.11 注入扫描（同非流式路径，组装点纵深防御一层）。
+		if err := security.ScanAssembled(msg.Content+"\n"+kbContext, len(tools) > 0, kbContext != ""); err != nil {
+			trace.L(ctx).Warn("prompt 注入扫描拦截（流式）", "err", err.Error(), "session", sessionID, "source", msg.Metadata["source"])
+			sink.notifyStarted(err)
+			ch <- &adapter.ReplyChunk{Error: err, Done: true}
+			return
 		}
 		if len(tools) > 0 {
 			req.Tools = tools
@@ -2382,6 +2449,20 @@ func lastAssistantContent(history []hexagon.Message) string {
 }
 
 func (e *ReActEngine) buildCompletionRequest(ctx context.Context, msg *adapter.Message, history []hexagon.Message, kbContext string) hexagon.CompletionRequest {
+	// §11.8 记忆薄版：每轮把 standing 全量 + fact 命中注入上下文（与 RAG 同位，记忆在前）。
+	// 注入失败/为空不阻断主流程。
+	e.mu.RLock()
+	memProvider := e.memProvider
+	e.mu.RUnlock()
+	if memProvider != nil {
+		if mem := memProvider.Inject(ctx, msg.Content); mem != "" {
+			if kbContext == "" {
+				kbContext = mem
+			} else {
+				kbContext = mem + "\n\n" + kbContext
+			}
+		}
+	}
 	req := hexagon.CompletionRequest{
 		Messages: e.buildStreamMessages(ctx, msg.Metadata["role"], history, kbContext, msg.Content, msg.Metadata, msg.Attachments),
 	}

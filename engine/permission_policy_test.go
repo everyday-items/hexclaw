@@ -150,16 +150,14 @@ func TestPermissionHook_PolicyAllow_BypassesHub(t *testing.T) {
 	}
 }
 
-func TestPermissionHook_PolicyOff_FallsBackToClassifyRisk(t *testing.T) {
-	policy := NewPermissionPolicy(ActionAllow) // 即使 policy 默认 allow，flag OFF 时不应被使用
+func TestPermissionHook_NoPolicy_FallsBackToClassifyRisk(t *testing.T) {
+	// §11.10 后：policy 配置即生效（不再 flag-gated）。classifyRisk 黑名单只在
+	// 未注入 policy（policy==nil）时兜底 —— 此时 shell 为 dangerous + 无 session ⇒ 拒。
 	hub := NewPermissionHub(0)
-	hook := NewPermissionHook(hub, WithPolicy(policy))
-	ctx := withPolicyFlag(context.Background(), false)
-
-	// 老路径：shell 是 dangerous + 无 session ⇒ 应拒绝
-	err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "shell"})
+	hook := NewPermissionHook(hub) // 不注入 policy
+	err := hook.BeforeToolCall(context.Background(), &ToolCallInfo{Name: "shell"})
 	if err == nil {
-		t.Fatal("flag OFF 应走老 classifyRisk 路径并拒绝 shell")
+		t.Fatal("no policy ⇒ classifyRisk 兜底应拒绝 dangerous shell")
 	}
 }
 

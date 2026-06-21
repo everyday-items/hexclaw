@@ -11,8 +11,6 @@ import (
 	"github.com/hexagon-codes/toolkit/lang/mapx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"github.com/hexagon-codes/toolkit/util/logger"
-
-	"github.com/hexagon-codes/hexclaw/featureflag"
 )
 
 // PermissionRequest is sent to the frontend for user approval.
@@ -152,6 +150,23 @@ type PermissionHook struct {
 	dangerousTools map[string]bool // tools that always require approval
 	sensitiveTools map[string]bool // tools that require approval on first use
 	policy         *PermissionPolicy
+	reviewer       UnattendedReviewer
+}
+
+// UnattendedReviewer 判定一个 consequential 动作在无人值守（cron/webhook/heartbeat/
+// spawn）下是否安全到可自动放行。仅 low-risk 明确放行；medium/high/出错一律拒
+// （fail-closed）。这是 §11.10 统一安全闸的无人值守顾问 —— 单一风险闸，取代原先
+// send_message 自管的 cronConfirmer。
+type UnattendedReviewer interface {
+	AssessLowRisk(ctx context.Context, action, payload string) bool
+}
+
+// WithUnattendedReviewer 注入无人值守风险顾问：当 require_approval 命中而当前是无交互
+// 会话的系统派发时，改问顾问，仅 low 放行一次，否则 fail-closed 拒。
+func WithUnattendedReviewer(r UnattendedReviewer) PermissionHookOption {
+	return func(h *PermissionHook) {
+		h.reviewer = r
+	}
 }
 
 // PermissionHookOption configures a PermissionHook.
@@ -192,11 +207,19 @@ func DefaultBaselinePolicy() *PermissionPolicy {
 		// sensitive：首次需用户审批
 		PolicyRule{Name: "browser-sensitive", ToolPattern: "browser", Action: ActionRequireApproval, Risk: "sensitive", Reason: "浏览器自动化"},
 		PolicyRule{Name: "create-skill-sensitive", ToolPattern: "create_skill", Action: ActionRequireApproval, Risk: "sensitive", Reason: "创建新 Skill"},
+		// manage_skill 安装/卸载市场技能 = 引入新代码 = 能力注入；与 create_skill 同级。
+		// 它已在 cronRecursiveToolDenylist（cron 剥离），但 webhook/spawn 不剥离，必须靠此规则
+		// 兜住无人值守自动放行（BUG-F1，review 2026-06-21）。
+		PolicyRule{Name: "manage-skill-sensitive", ToolPattern: "manage_skill", Action: ActionRequireApproval, Risk: "sensitive", Reason: "安装/卸载 Skill（能力变更）"},
 		PolicyRule{Name: "manage-mcp-sensitive", ToolPattern: "manage_mcp_server", Action: ActionRequireApproval, Risk: "sensitive", Reason: "管理 MCP server"},
 		PolicyRule{Name: "file-edit-sensitive", ToolPattern: "file_edit", Action: ActionRequireApproval, Risk: "sensitive", Reason: "文件编辑"},
 		// patch_skill / manage_skill_pending（v0.4.0 F2）也归 sensitive
 		PolicyRule{Name: "patch-skill-sensitive", ToolPattern: "patch_skill", Action: ActionRequireApproval, Risk: "sensitive", Reason: "修改既有 Skill"},
 		PolicyRule{Name: "manage-pending-sensitive", ToolPattern: "manage_skill_pending", Action: ActionRequireApproval, Risk: "sensitive", Reason: "审批 Skill 草稿"},
+		// consequential 动作：发送到外部渠道 / 媒体生成 / 发布，执行前需用户审批。
+		PolicyRule{Name: "send-approve", ToolPattern: "send_message", Action: ActionRequireApproval, Risk: "sensitive", Reason: "发送到外部渠道"},
+		PolicyRule{Name: "media-approve", ToolPattern: "media_generate", Action: ActionRequireApproval, Risk: "sensitive", Reason: "媒体生成"},
+		PolicyRule{Name: "publish-approve", ToolPattern: "publish_*", Action: ActionRequireApproval, Risk: "dangerous", Reason: "发布到外部平台"},
 	)
 }
 
@@ -221,6 +244,21 @@ var systemDispatchAutoApprove = map[string]bool{
 // (BUG-20260613 review H1).
 var cronOnlyAutoApprove = map[string]bool{
 	"cron_task": true,
+}
+
+// unattendedHardDeny are tools that must NEVER auto-run from a system dispatch —
+// not even on a "low" verdict from the unattended risk reviewer: arbitrary code
+// execution and capability/host mutation. The reviewer is a single LLM call that
+// can be talked into "low"; letting it greenlight `shell` or `manage_skill install`
+// from an externally-triggered webhook is a privilege-escalation / RCE vector.
+// These require a real interactive approver — with no session that means deny.
+// The reviewer continues to gate only lower-risk delivery actions
+// (send_message / media_generate / publish_*). (BUG-F5, review 2026-06-21.)
+var unattendedHardDeny = map[string]bool{
+	"shell": true, "code": true, "code_exec": true, // arbitrary execution
+	"create_skill": true, "manage_skill": true, "patch_skill": true,
+	"manage_skill_pending": true, "manage_mcp_server": true, // capability mutation
+	"file_edit": true, // host filesystem mutation
 }
 
 func NewPermissionHook(hub *PermissionHub, opts ...PermissionHookOption) *PermissionHook {
@@ -255,8 +293,10 @@ func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo)
 		return fmt.Errorf("tool %q cannot run autonomously from %s", call.Name, src)
 	}
 
-	// v0.4.0 H2: feature-flag-gated PolicyEngine 优先
-	if h.policy != nil && featureflag.Enabled(ctx, FlagToolPolicyEngine) {
+	// v0.4.3 §11.10 统一安全闸：PermissionPolicy 是单一权限闸，配置即生效（不再 flag-gated）——
+	// cron/webhook 的 ctx 不携带 flags，flag-gating 会让无人值守路径漏过闸。policy==nil 时
+	// （未注入策略的调用方）才退化到 classifyRisk 黑名单兜底。
+	if h.policy != nil {
 		dec := h.policy.Evaluate(call)
 		switch dec.Action {
 		case ActionAllow:
@@ -310,9 +350,25 @@ func (h *PermissionHook) requestApproval(ctx context.Context, call *ToolCallInfo
 				"tool_name", call.Name, "source", src, "risk", risk)
 			return nil
 		}
-		logger.Warn("[permission] tool denied for system dispatch — needs interactive approval",
+		// BUG-F5：任意代码执行 + 能力/宿主变更类工具一律 fail-closed，风险顾问无权放行——
+		// 只能交互式人工审批（无会话即拒）。顾问只兜下面的送达类动作。在问顾问之前拦截。
+		if unattendedHardDeny[call.Name] {
+			logger.Warn("[permission] exec/capability tool hard-denied for system dispatch (reviewer cannot override)",
+				"tool_name", call.Name, "source", src, "risk", risk)
+			return fmt.Errorf("tool %q cannot run unattended from %s; exec/capability mutation requires interactive approval", call.Name, src)
+		}
+		// §11.10 无人值守风险顾问：无交互会话可审批时，consequential 动作（send/media/
+		// publish 等命中 require_approval 的）改问 LLM 顾问；仅判定 low 放行一次，
+		// medium/high/无顾问/出错一律 fail-closed 拒。这是统一安全闸的单一无人值守闸，
+		// 取代原 skill 层 cronConfirmer。
+		if h.reviewer != nil && h.reviewer.AssessLowRisk(ctx, call.Name, summarizeArgs(call.Arguments)) {
+			logger.Info("[permission] unattended action allowed by low-risk reviewer verdict",
+				"tool_name", call.Name, "source", src, "risk", risk)
+			return nil
+		}
+		logger.Warn("[permission] tool denied for system dispatch — needs interactive approval or low-risk verdict",
 			"tool_name", call.Name, "source", src, "risk", risk)
-		return fmt.Errorf("tool %q cannot auto-run from %s; it requires interactive approval", call.Name, src)
+		return fmt.Errorf("tool %q cannot auto-run from %s; it requires interactive approval or a low-risk verdict", call.Name, src)
 	}
 
 	sessionID, _ := ctx.Value(ctxKeySessionID).(string)

@@ -26,10 +26,13 @@ const FlagToolPolicyEngine = "tool.policy.engine"
 
 func init() {
 	featureflag.Register(featureflag.Flag{
-		Name:         FlagToolPolicyEngine,
-		Default:      true, // alpha 强制 OFF
+		Name: FlagToolPolicyEngine,
+		// v0.4.3 §11.10 统一安全闸：GA 默认 ON —— PermissionPolicy 成为单一权限闸
+		// （DefaultBaselinePolicy 与老 classifyRisk 黑名单等价 + send/media/publish 规则），
+		// 配合无人值守风险顾问，取代 skill 层 cronConfirmer。
+		Default:      true,
 		Description:  "Use declarative PermissionPolicy rules instead of hardcoded dangerous/sensitive tool lists.",
-		Stage:        featureflag.StageAlpha,
+		Stage:        featureflag.StageGA,
 		SinceVersion: "0.4.0",
 	})
 }
