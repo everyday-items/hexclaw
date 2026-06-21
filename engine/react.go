@@ -2402,7 +2402,8 @@ func (e *ReActEngine) pipeStreamWithTools(
 func (e *ReActEngine) buildStreamMessages(ctx context.Context, roleName string, history []hexagon.Message, kbContext, userQuery string, metadata map[string]string, attachments []adapter.Attachment) []hexagon.Message {
 	var messages []hexagon.Message
 
-	// System prompt 优先级: 角色名 > Agent 路由注入 > 默认
+	// System prompt 优先级: 角色名 > Agent 路由注入 > 默认助理(小蟹)人设
+	// 默认分支：存在用户自定义 SOUL.md(~/.hexclaw/SOUL.md) 则取代内置默认，否则用内置 defaultSystemPrompt。
 	sysContent := systemPrompt(metadata)
 	if roleName != "" {
 		if role, ok := e.factory.GetRole(roleName); ok {
@@ -2410,6 +2411,8 @@ func (e *ReActEngine) buildStreamMessages(ctx context.Context, roleName string, 
 		}
 	} else if metadata != nil && metadata["agent_prompt"] != "" {
 		sysContent = metadata["agent_prompt"]
+	} else if soul := config.ReadSoul(); soul != "" {
+		sysContent = decorateSystemPrompt(soul, metadata)
 	}
 	if kbContext != "" {
 		sysContent += "\n\n[参考知识]\n" + kbContext
@@ -3129,7 +3132,19 @@ const defaultSystemPrompt = `你是「小蟹」🦀，HexClaw 的 AI 助手。
 // v0.4.0 9.5：当 metadata["user_locale"] 非空且非默认 zh-CN 时，在 system prompt
 // 末尾追加"请用 X 语言回答"指令，让模型按桌面端当前语言生成。维吾尔语 (ug-CN)
 // 额外提示"如能力不足请用中文+维吾尔语解释关键术语"，避免模型硬撑导致译错。
+// DefaultSystemPrompt 返回引擎内置的默认助理(小蟹)人设(SOUL)原文，
+// 供 API 在「编辑人设」时做默认预览 / 恢复默认。
+func DefaultSystemPrompt() string {
+	return defaultSystemPrompt
+}
+
 func systemPrompt(metadata map[string]string) string {
+	return decorateSystemPrompt(defaultSystemPrompt, metadata)
+}
+
+// decorateSystemPrompt 在给定人设(SOUL)基底上追加当前模型身份与用户语言指令。
+// base 可为内置默认人设，也可为用户自定义 SOUL.md 内容。
+func decorateSystemPrompt(base string, metadata map[string]string) string {
 	model := requestedModel(metadata)
 	provider := ""
 	userLocale := ""
@@ -3138,22 +3153,25 @@ func systemPrompt(metadata map[string]string) string {
 		userLocale = strings.TrimSpace(metadata["user_locale"])
 	}
 
-	base := defaultSystemPrompt
+	out := base
 	if model != "" {
 		identity := "- 当前搭载 " + model + " 作为语言引擎"
 		if provider != "" {
 			identity = "- 当前搭载 " + provider + " 的 " + model + " 作为语言引擎"
 		}
-		base = strings.Replace(defaultSystemPrompt,
-			"- 原生支持 MCP 工具协议：文件、数据库、API 即插即用",
-			"- 原生支持 MCP 工具协议：文件、数据库、API 即插即用\n"+identity,
-			1)
+		anchor := "- 原生支持 MCP 工具协议：文件、数据库、API 即插即用"
+		if strings.Contains(out, anchor) {
+			out = strings.Replace(out, anchor, anchor+"\n"+identity, 1)
+		} else {
+			// 自定义 SOUL 无内置锚点行，则把引擎身份追加到末尾
+			out = out + "\n\n" + identity
+		}
 	}
 
 	if suffix := localeOutputDirective(userLocale); suffix != "" {
-		base = base + "\n\n" + suffix
+		out = out + "\n\n" + suffix
 	}
-	return base
+	return out
 }
 
 // localeOutputDirective 返回针对 user_locale 的输出语言指令。
