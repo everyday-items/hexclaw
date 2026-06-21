@@ -45,6 +45,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/canvas"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/connector"
 	"github.com/hexagon-codes/hexclaw/cron"
 	"github.com/hexagon-codes/hexclaw/desktop"
 	"github.com/hexagon-codes/hexclaw/engine"
@@ -87,6 +88,7 @@ type Server struct {
 	agentRouter       *router.Dispatcher           // 多 Agent 路由器（可选）
 	agentStore        router.Store                 // Agent/Rule 持久化（可选）
 	instanceMgr       *instances.Manager           // 平台实例运行时（可选）
+	connectorStore    *connector.Store             // 数据连接器(GitHub/Notion 只读，token 加密)（可选）
 	canvasSvc         *canvas.Service              // Canvas/A2UI 服务（可选）
 	voiceSvc          *voice.Service               // 语音服务（可选）
 	voiceChatSvc      *voicechat.Service           // 语音对话服务（可选）
@@ -188,6 +190,13 @@ func (s *Server) SetWebhookManager(mgr *webhook.Manager) {
 // 设置后启用定时任务管理 API。
 func (s *Server) SetCronScheduler(scheduler *cron.Scheduler) {
 	s.scheduler = scheduler
+}
+
+// SetConnectorStore 设置数据连接器存储（GitHub/Notion 只读，token 加密）。
+//
+// 设置后启用 /api/v1/connectors CRUD + test + resources。
+func (s *Server) SetConnectorStore(store *connector.Store) {
+	s.connectorStore = store
 }
 
 // SetPromptStore 设置 Prompt 库存储（§11.8）。设置后启用 /api/v1/prompts CRUD。
@@ -515,6 +524,19 @@ func (s *Server) routes() http.Handler {
 
 	// §15 连接中心「测试连接」：无状态验证一组连接凭据（email / IM），凭据不持久化、不落日志。
 	mux.HandleFunc("POST /api/v1/connections/test", s.handleConnectionsTest)
+
+	// 默认助理（小蟹）人设(SOUL)：读写 ~/.hexclaw/SOUL.md，空=恢复内置默认；引擎每轮读取，保存即时生效。
+	mux.HandleFunc("GET /api/v1/assistant/soul", s.handleGetAssistantSoul)
+	mux.HandleFunc("PUT /api/v1/assistant/soul", s.handleUpdateAssistantSoul)
+
+	// §15.1 数据连接器：token 只读接入 GitHub / Notion，token 加密落盘、响应脱敏。
+	if s.connectorStore != nil {
+		mux.HandleFunc("GET /api/v1/connectors", s.handleListConnectors)
+		mux.HandleFunc("POST /api/v1/connectors", s.handleCreateConnector)
+		mux.HandleFunc("DELETE /api/v1/connectors/{id}", s.handleDeleteConnector)
+		mux.HandleFunc("POST /api/v1/connectors/test", s.handleTestConnector)
+		mux.HandleFunc("GET /api/v1/connectors/{id}/resources", s.handleConnectorResources)
+	}
 
 	// 角色列表 API
 	mux.HandleFunc("GET /api/v1/roles", s.handleListRoles)

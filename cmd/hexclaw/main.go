@@ -48,6 +48,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/audit"
 	"github.com/hexagon-codes/hexclaw/canvas"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/connector"
 	"github.com/hexagon-codes/hexclaw/cron"
 	"github.com/hexagon-codes/hexclaw/desktop"
 	"github.com/hexagon-codes/hexclaw/engine"
@@ -1293,9 +1294,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	instanceMgr := instances.NewManager(store.DB())
 	// 静态加密：主密钥与 SQLite 同目录（~/.hexclaw/master.key, 0600）。加载失败不阻断启动，
 	// 降级为明文直存（保持可用），仅告警；绝不记录密钥或明文凭据。
-	if box, berr := secret.LoadBox(filepath.Dir(cfg.Storage.SQLite.Path)); berr != nil {
+	dataDir := filepath.Dir(cfg.Storage.SQLite.Path)
+	var secretBox *secret.Box
+	if box, berr := secret.LoadBox(dataDir); berr != nil {
 		logger.Warn("[secret] 加载主密钥失败，凭据将以明文存储", "err", berr.Error())
 	} else {
+		secretBox = box
 		instanceMgr.SetSecretBox(box)
 	}
 	if err := instanceMgr.Init(ctx); err != nil {
@@ -1312,6 +1316,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 	instanceMgr.SetHandler(messageHandler)
 	srv.SetInstanceManager(instanceMgr)
+
+	// §15.1 数据连接器：token 只读接入 GitHub / Notion（token 复用同一 secret.Box 加密落盘）。
+	srv.SetConnectorStore(connector.NewStore(dataDir, secretBox))
 
 	// 多通道送达 Skill：复用同源 live adapters（内部经 per-platform SendQueue 限速），
 	// 不自己 reach into adapters。§11.10 统一安全闸：发送审批由 engine PermissionPolicy
