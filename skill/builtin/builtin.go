@@ -153,6 +153,12 @@ func defaultWorkspace() string {
 	return ws
 }
 
+// DefaultWorkspace is the exported workspace root used as the resolveSafePath
+// boundary for file-touching skills (FileOps, knowledge_ingest_path). Exposed so
+// cmd/hexclaw can wire skills constructed outside RegisterAdvanced with the same
+// sandbox root.
+func DefaultWorkspace() string { return defaultWorkspace() }
+
 func defaultSkillDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".hexclaw", "skills")
