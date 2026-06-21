@@ -19,9 +19,34 @@
 - **ReAct Agent Engine** — Reasoning + Action loop with multi-turn tool calls, streaming output, structured interactive replies, and Agent modes such as `plan-execute`, `reflection`, and `tot`
 - **6-Layer Security Gateway** — Auth, rate limiting, cost control, injection detection, permission check, audit logging
 - **LLM Smart Router** — Multi-provider auto-switching, failover, cost optimization, and model tool-call capability probing
-- **Skill System** — Built-in search/weather/translation/summary, 7-phase pipeline, `.pending` approval flow, TrustLevel filtering, and TOCTOU checks
+- **Skill System** — Built-in search/weather/translation/summary/media-generation/messaging/document-export and more, 7-phase pipeline, `.pending` approval flow, TrustLevel filtering, and TOCTOU checks
 - **Semantic Cache** — Singleflight anti-stampede + TTL jitter anti-avalanche + empty-value anti-penetration
 - **Knowledge Base** — FTS5 + vector hybrid retrieval, 5-stage RAG pipeline, and context augmentation
+
+### Built-in Skills
+
+Ready-to-use built-in skills (no install required, invoked via LLM tool_call):
+
+| Skill | Function |
+|-------|----------|
+| `search` | Web search to find information on the internet |
+| `weather` | Look up city weather |
+| `translate` | Translate text (Chinese ↔ English) |
+| `summary` | Summarize text content |
+| `browser` | Fetch web pages, extract content, and submit forms |
+| `code` / `code_exec` | Execute code snippets (Go/Python/JavaScript) and return output |
+| `shell` | Run shell commands and return output |
+| `file_ops` / `file_edit` | Read, write, and edit files in the workspace |
+| `grep` / `glob` | Search file contents by text/regex; find files by name pattern |
+| `knowledge_ingest` | Write text content into the local knowledge base for later retrieval |
+| `knowledge_ingest_path` | Read each file under a path (directory or glob) and ingest its content into the knowledge base (sandboxed against `..`/symlink escape; capped at 200 files / 2 MiB per file) |
+| `media_generate` | Generate an image (default) or video from a text prompt, persist it, and return a stable file path reusable by export/send/ingest |
+| `export_document` | Render Markdown into a downloadable document (md/html/docx/pdf/epub/odt/rtf/txt) and return its file path |
+| `send_message` | Send a message to a configured channel (feishu/Discord/WeChat/email/Slack/...); a consequential action gated by a confirmation step, backed by an unattended risk review |
+| `cron_task` | Create/list/pause/resume/remove app-managed scheduled tasks |
+| `manage_skill` / `manage_mcp` | Search, install, or remove skills / MCP servers from HexClaw Hub |
+
+> For unattended (cron) execution of consequential actions such as delivery/publishing, an LLM risk-review gate classifies the action (low/medium/high): fixed high-risk keywords are flagged `high` outright, only `low` is allowed through, and `medium`/`high` plus any classification failure fail closed.
 
 ### Session & Data
 - **Session Management** — Create/query/delete sessions, message history, session forking
@@ -193,7 +218,7 @@ skills:
   auto_load: true
   hub:
     repo_url: https://github.com/hexagon-codes/hexclaw-hub
-    branch: main
+    branch: v0.0.2
 
 heartbeat:
   enabled: false
@@ -287,7 +312,10 @@ User → Platform Adapters (13) → Security Gateway (6 layers) → Agent Router
 ```
 hexclaw/
 ├── hexclaw.go               # Root package (version info + package docs)
-├── cmd/hexclaw/             # CLI entry (serve/init/security audit/skill)
+├── cmd/
+│   ├── hexclaw/             # CLI entry (serve/init/version/security audit/skill)
+│   └── verify-release/      # Release gate / Eval / canary dry-run verifier
+├── acp/                     # Agent Client Protocol bridge
 ├── adapter/                 # Platform adapters
 │   ├── web/                 #   Web WebSocket
 │   ├── feishu/              #   Feishu Bot
@@ -298,10 +326,11 @@ hexclaw/
 │   ├── wecom/               #   WeCom (Enterprise WeChat)
 │   ├── wechat/              #   WeChat Official Account
 │   ├── whatsapp/            #   WhatsApp
+│   ├── whauth/              #   WhatsApp signature helper
 │   ├── line/                #   LINE
 │   ├── matrix/              #   Matrix
 │   └── email/               #   Email (IMAP/SMTP)
-├── agents/                  # Agent roles (6 preset roles)
+├── agents/                  # Agent roles (6 preset roles) + dispatcher/factory/team
 ├── api/                     # REST API server
 │   ├── server.go            #   Core server + chat + route registration
 │   ├── handler_config.go    #   LLM config query/update/test/model discovery API
@@ -311,39 +340,49 @@ hexclaw/
 │   ├── handler_knowledge.go #   Knowledge base API
 │   ├── handler_webhook.go   #   Webhook API
 │   ├── handler_cron.go      #   Cron job API
-│   └── handler_misc.go      #   Memory/MCP/skill/router/canvas/voice API
+│   ├── handler_cronjob_unified.go # Unified cron entrypoint (POST /cronjob)
+│   ├── handler_voicechat.go #   Voice STT/TTS + voicechat API
+│   └── handler_misc.go      #   Memory/MCP/skill/router/canvas API
 ├── audit/                   # Security audit (7 check categories)
-├── cache/                   # LLM response semantic cache
 ├── canvas/                  # Canvas/A2UI (8 component types)
 ├── config/                  # Configuration management (YAML + env vars)
 ├── cron/                    # Cron job scheduler
 ├── desktop/                 # Desktop integration (notifications/clipboard)
 ├── engine/                  # Agent engine (ReAct loop)
-├── events/                  # Structured event protocol and sinks
 ├── eval/                    # Pre-release eval suites
 ├── featureflag/             # Feature flag registry and runtime lookup
 ├── gateway/                 # 6-layer security gateway
+│   └── llmcall/             #   LLM call gateway (middleware chain)
 ├── heartbeat/               # Heartbeat patrol
+├── instances/               # Platform instance lifecycle manager
+├── internal/                # Internal utils (sqliteutil / upstreamerr / testutil)
 ├── knowledge/               # Knowledge base (FTS5 + vector hybrid)
 ├── llmrouter/               # LLM smart router
 ├── mcp/                     # MCP client (stdio + SSE)
 ├── memory/                  # File memory (MEMORY.md + journal)
 ├── plugin/                  # Plugin Manifest / Capability extensions
 ├── release/                 # Release gates and canary state machine
+├── render/                  # Markdown/document rendering (pandoc + LRU cache)
 ├── router/                  # Multi-agent router
-├── runtime/                 # Sandbox and checkpoint rollback
+├── runtime/                 # Runtime sandbox and checkpoint rollback
+├── security/                # Injection scan / content sanitize / skill scanner
 ├── session/                 # Session management + context compaction
 ├── skill/                   # Skill system
-│   ├── builtin/             #   Built-in skills (search/weather/translate/summary)
+│   ├── builtin/             #   Built-in skills (search/weather/translate/summary/media-gen/messaging/export, ...)
+│   ├── chain/               #   Skill pipeline chain
+│   ├── hub/                 #   Online skill catalog (hexclaw-hub)
 │   ├── marketplace/         #   Markdown skill marketplace
-│   └── sandbox/             #   Sandboxed execution
+│   └── sandbox/             #   Skill sandboxed execution
 ├── storage/                 # Data storage
+│   ├── migrate/             #   Migrations
 │   └── sqlite/              #   SQLite driver
-├── voice/                   # Voice interaction (STT/TTS)
+├── streamstate/             # Streaming state registry
 ├── webhook/                 # Webhook receiver
 ├── go.mod
 └── Makefile
 ```
+
+> Base capabilities such as media generation/genstore/SSRF/cache/trace/events have been pushed down into ai-core / toolkit / hexagon; hexclaw no longer keeps local equivalents. Voice STT/TTS is handled inline by `api/` and `gateway/`, with no standalone `voice/` package.
 
 ## API Endpoints (selected endpoints; full routing is module-dependent)
 
@@ -392,15 +431,14 @@ hexclaw/
 | POST | `/api/v1/knowledge/search` | Structured search — both `result` and `results` return `[]SearchHit` with chunks, sources, and scores |
 
 ### Cron Jobs
+The unified entrypoint `POST /api/v1/cronjob` dispatches on the request body's `action` field (`create` / `update` / `remove` / `pause` / `resume` / `run` / `list` / `history`) and supports `idempotency_key` replay.
+
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/v1/cron/jobs` | Job list |
-| POST | `/api/v1/cron/jobs` | Add job |
-| DELETE | `/api/v1/cron/jobs/{id}` | Delete job |
-| POST | `/api/v1/cron/jobs/{id}/pause` | Pause job |
-| POST | `/api/v1/cron/jobs/{id}/resume` | Resume job |
-| POST | `/api/v1/cron/jobs/{id}/trigger` | Manual trigger |
-| GET | `/api/v1/cron/jobs/{id}/history` | Execution history |
+| POST | `/api/v1/cronjob` | Unified cron entrypoint (dispatches CRUD / pause-resume / manual trigger / list / history by `action`) |
+| POST | `/api/v1/cron/jobs/stream` | Create job (SSE streaming compile, pushes progress/done/error) |
+| POST | `/api/v1/cron/parse` | Parse/validate a cron expression and return the next run time |
+| GET | `/api/v1/cron/jobs/{id}/history` | Execution history (each entry includes a `result` summary) |
 
 ### Webhooks
 | Method | Path | Description |
@@ -567,7 +605,7 @@ go vet ./...
 golangci-lint run
 
 # Release gate + Eval + canary dry-run
-go run ./cmd/verify-release -repo . -version 0.4.0 -version-files package.json
+go run ./cmd/verify-release -repo . -version 0.4.4 -version-files package.json
 ```
 
 ## Tech Stack
@@ -575,9 +613,9 @@ go run ./cmd/verify-release -repo . -version 0.4.0 -version-files package.json
 | Component | Technology |
 |-----------|-----------|
 | Language | Go 1.25+ |
-| Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.4.7 |
-| AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.1.2 |
-| Utility Library | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.6 |
+| Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.5.0 |
+| AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.1.4 |
+| Utility Library | [toolkit](https://github.com/hexagon-codes/toolkit) v0.1.0 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | Configuration | YAML + environment variables |
 | Storage | SQLite (modernc.org/sqlite) |
@@ -619,14 +657,37 @@ chore: build/toolchain updates
 
 | Project | Description | Repository |
 |---------|-------------|------------|
-| **Hexagon** | Go AI Agent framework (core engine) v0.4.7 | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI core library (LLM/Tool/Memory) v0.1.2 | [ai-core](https://github.com/hexagon-codes/ai-core) |
-| **toolkit** | Go utility library v0.0.6 | [toolkit](https://github.com/hexagon-codes/toolkit) |
+| **Hexagon** | Go AI Agent framework (core engine) v0.5.0 | [hexagon](https://github.com/hexagon-codes/hexagon) |
+| **ai-core** | AI core library (LLM/Tool/Memory) v0.1.4 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **toolkit** | Go utility library v0.1.0 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI dashboard (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
 | **hexclaw-desktop** | HexClaw desktop client (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
 | **hexclaw-ui** | HexClaw web frontend (Vue 3) | [hexclaw-ui](https://github.com/hexagon-codes/hexclaw-ui) |
 
 ## Changelog
+
+### v0.4.4
+
+**New Features**
+- **At-rest credential encryption** — Platform credentials are sealed on disk with AES-256-GCM (`enc:v1:` envelope, 0600 master key); legacy plaintext rows read back transparently and are backfilled on next write
+- **Prompt-injection scan** — Defense-in-depth scanner at cron-create (strict) and exec assembly time; exfiltration/obfuscation families always strict, instruction-override relaxed only when skills/RAG data are present
+- **Unified permission gate (GA)** — Declarative `PermissionPolicy` is now the single tool-authorization gate, with an unattended LLM risk reviewer replacing the skill-layer confirmer
+- **Skill tool palette** — New `export_document` / `knowledge_ingest` / `media_generate` / `send_message` builtin skills
+- **Library memory** — Lightweight prompt/memory store injected per turn
+
+**Dependencies & Architecture**
+- **Framework upgrade** — Upgraded to hexagon v0.5.1 / ai-core v0.1.6 / toolkit v0.2.0 (go.mod toolchain line removed, Go 1.25.5); upstream bug fixes (lossless `streamx` timeout, `runtime/runner` tool-call pairing, `failover` classification). The toolkit `crypto/sign` `APISigner` wire-format BREAKING change does not affect hexclaw (only `HMACSHA256` primitives are used)
+- **Capability push-down** — Media generation/genstore/SSRF/cache/trace/events migrated into ai-core/toolkit/hexagon; gateway HMAC now uses `toolkit/crypto/sign`
+- **Failover push-down** — LLM failover logic moved into ai-core/llm; hexclaw removed its local equivalent and call sites now use `llm.*`
+- **Sandbox migration** — The Skill sandbox package moved from the top-level `sandbox/` to `skill/sandbox/`
+
+**Bug Fixes**
+- **Matrix adapter** — Idempotent Stop, eliminating the double close(closed channel) panic
+- **Knowledge time decay** — Zero-value CreatedAt is no longer decayed to zero (fixes chunks without timestamps never being recalled)
+- **Cron multi-replica** — Atomic DB claim + fencing prevents double-running jobs across replicas; fail-open preserves pure in-memory behavior
+- **Security hardening** — SSRF allows loopback only (blocks metadata and intranet addresses); shell `find -exec` allowlist tightened; file-op symlink boundary protection; WhatsApp webhook signature verification + constant-time comparison for WeChat/WeCom
+- **Unattended privilege escalation (BUG-F1/F-5)** — `manage_skill` is now gated by the baseline policy; exec + capability/host-mutation tools (`shell`/`code`/`create_skill`/`manage_skill`/`manage_mcp_server`/`file_edit`/…) hard-deny under unattended dispatch — the LLM risk reviewer can no longer greenlight them
+- **SSRF reserved ranges (BUG-F4)** — cron Starlark `http_*` now also blocks RFC6598 CGNAT `100.64.0.0/10`, `192.0.0.0/24`, `198.18.0.0/15` (incl. IPv4-mapped IPv6 forms)
 
 ### v0.4.0
 

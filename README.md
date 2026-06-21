@@ -19,9 +19,34 @@
 - **ReAct Agent 引擎** — 推理 + 行动循环，支持多轮工具调用、流式输出、结构化交互消息，以及 `plan-execute` / `reflection` / `tot` 等 Agent 模式
 - **六层安全网关** — 认证、限流、成本控制、注入检测、权限校验、审计日志
 - **LLM 智能路由** — 多 Provider 自动切换，故障降级，成本优化，模型 tool_call 能力探测
-- **Skill 系统** — 内置搜索/天气/翻译/摘要，7 阶段流水线，`.pending` 审批闭环，TrustLevel 与 TOCTOU 校验
+- **Skill 系统** — 内置搜索/天气/翻译/摘要/媒体生成/送达/文档导出等，7 阶段流水线，`.pending` 审批闭环，TrustLevel 与 TOCTOU 校验
 - **语义缓存** — Singleflight 防击穿 + TTL 抖动防雪崩 + 空值缓存防穿透
 - **知识库** — FTS5 + 向量混合检索，RAG 5 阶段 Pipeline，上下文增强
+
+### 内置技能
+
+开箱即用、无需安装的内置 Skill（通过 LLM tool_call 调用）：
+
+| 技能 | 功能 |
+|------|------|
+| `search` | 网络搜索，查找互联网上的信息 |
+| `weather` | 查询城市天气信息 |
+| `translate` | 翻译文本内容，支持中英互译 |
+| `summary` | 对文本内容进行摘要概括 |
+| `browser` | 网页获取、内容提取和表单提交 |
+| `code` / `code_exec` | 执行代码片段（Go/Python/JavaScript），返回运行结果 |
+| `shell` | 执行 Shell 命令，返回命令输出 |
+| `file_ops` / `file_edit` | 在工作区内读写、编辑文件 |
+| `grep` / `glob` | 按文本/正则搜索文件内容，按名称模式查找文件 |
+| `knowledge_ingest` | 把文本内容写入本地知识库供后续检索 |
+| `knowledge_ingest_path` | 读取路径（目录或 glob）下每个文件的内容，逐个入库（沙箱内防 `..`/软链逃逸，单次上限 200 文件 / 2 MiB·文件） |
+| `media_generate` | 从文本提示词生成图片（默认）或视频，落盘后返回稳定文件路径，可供导出/送达/入库复用 |
+| `export_document` | 把 Markdown 渲染成可下载文档（md/html/docx/pdf/epub/odt/rtf/txt）并返回文件路径 |
+| `send_message` | 把消息发送到已配置渠道（飞书/Discord/微信/邮件/Slack 等）；属敏感动作，默认经确认门，无人值守时由风险自审兜底 |
+| `cron_task` | 创建/列出/暂停/恢复/移除应用托管的定时任务 |
+| `manage_skill` / `manage_mcp` | 从 HexClaw Hub 搜索、安装、移除技能 / MCP Server |
+
+> 无人值守（cron）执行送达/发布等 consequential 动作时，会先过一道 LLM 风险自审门（low/medium/high）——固定高危关键词直接判 high，仅 low 放行，medium/high 与判级失败一律 fail-closed 拒绝。
 
 ### 会话与数据
 - **会话管理** — 创建/查询/删除会话，消息历史，会话分支 (fork)
@@ -193,7 +218,7 @@ skills:
   auto_load: true
   hub:
     repo_url: https://github.com/hexagon-codes/hexclaw-hub
-    branch: v0.0.1
+    branch: v0.0.2
 
 heartbeat:
   enabled: false
@@ -286,7 +311,10 @@ v0.4 新增能力统一通过 `features:` 段启用。未注册的 flag 永远�
 ```
 hexclaw/
 ├── hexclaw.go               # 根包（版本信息 + 包文档）
-├── cmd/hexclaw/             # CLI 入口 (serve/init/security audit/skill)
+├── cmd/
+│   ├── hexclaw/             # CLI 入口 (serve/init/version/security audit/skill)
+│   └── verify-release/      # 发版门禁/Eval/canary dry-run 校验器
+├── acp/                     # Agent Client Protocol 桥接
 ├── adapter/                 # 平台适配器
 │   ├── web/                 #   Web WebSocket
 │   ├── feishu/              #   飞书 Bot
@@ -297,10 +325,11 @@ hexclaw/
 │   ├── wecom/               #   企业微信
 │   ├── wechat/              #   微信公众号
 │   ├── whatsapp/            #   WhatsApp
+│   ├── whauth/              #   WhatsApp 验签辅助
 │   ├── line/                #   LINE
 │   ├── matrix/              #   Matrix
 │   └── email/               #   Email (IMAP/SMTP)
-├── agents/                  # Agent 角色 (6 种预置角色)
+├── agents/                  # Agent 角色 (6 种预置角色) + 分派/工厂/团队
 ├── api/                     # REST API 服务
 │   ├── server.go            #   核心服务器 + 聊天 + 路由注册
 │   ├── handler_config.go    #   LLM 配置查询/更新/测试/模型发现 API
@@ -310,39 +339,49 @@ hexclaw/
 │   ├── handler_knowledge.go #   知识库 API
 │   ├── handler_webhook.go   #   Webhook API
 │   ├── handler_cron.go      #   定时任务 API
-│   └── handler_misc.go      #   记忆/MCP/技能/路由/Canvas/语音 API
+│   ├── handler_cronjob_unified.go # 定时任务统一入口 (POST /cronjob)
+│   ├── handler_voicechat.go #   语音 STT/TTS + voicechat API
+│   └── handler_misc.go      #   记忆/MCP/技能/路由/Canvas API
 ├── audit/                   # 安全审计 (7 类检查)
-├── cache/                   # LLM 响应语义缓存
 ├── canvas/                  # Canvas/A2UI (8 种组件)
 ├── config/                  # 配置管理 (YAML + 环境变量)
 ├── cron/                    # 定时任务调度
 ├── desktop/                 # 桌面集成 (通知/剪贴板)
 ├── engine/                  # Agent 引擎（ReAct 推理循环）
-├── events/                  # 结构化事件协议与 Sink
 ├── eval/                    # 发版前评测套件
 ├── featureflag/             # Feature flag 注册与运行时查询
 ├── gateway/                 # 六层安全网关
+│   └── llmcall/             #   LLM 调用 gateway (中间件链路)
 ├── heartbeat/               # 心跳巡查
+├── instances/               # 平台实例生命周期管理
+├── internal/                # 内部工具 (sqliteutil / upstreamerr / testutil)
 ├── knowledge/               # 知识库 (FTS5 + 向量混合检索)
 ├── llmrouter/               # LLM 智能路由
 ├── mcp/                     # MCP Client (stdio + SSE)
 ├── memory/                  # 文件记忆 (MEMORY.md + 日记)
 ├── plugin/                  # 插件 Manifest / Capability 扩展
 ├── release/                 # 发版门禁与 canary 状态机
+├── render/                  # Markdown/文档渲染 (pandoc + LRU 缓存)
 ├── router/                  # 多 Agent 路由
-├── runtime/                 # 沙箱与 Checkpoint 回滚
+├── runtime/                 # Runtime 沙箱与 Checkpoint 回滚
+├── security/                # 注入扫描 / 内容净化 / 技能扫描
 ├── session/                 # 会话管理 + 上下文压缩
 ├── skill/                   # Skill 系统
-│   ├── builtin/             #   内置 Skill (搜索/天气/翻译/摘要)
+│   ├── builtin/             #   内置 Skill (搜索/天气/翻译/摘要/媒体生成/送达/文档导出 等)
+│   ├── chain/               #   Skill Pipeline 链
+│   ├── hub/                 #   在线技能目录 (hexclaw-hub)
 │   ├── marketplace/         #   Markdown 技能市场
-│   └── sandbox/             #   沙箱执行
+│   └── sandbox/             #   Skill 沙箱执行
 ├── storage/                 # 数据存储
+│   ├── migrate/             #   迁移
 │   └── sqlite/              #   SQLite 驱动
-├── voice/                   # 语音交互 (STT/TTS)
+├── streamstate/             # 流式状态注册表
 ├── webhook/                 # Webhook 接收
 ├── go.mod
 └── Makefile
 ```
+
+> 媒体生成/genstore/SSRF/缓存/trace/events 等基础能力已下沉至 ai-core / toolkit / hexagon，hexclaw 不再保留本地等价实现；语音 STT/TTS 由 `api/` 与 `gateway/` 内联处理，无独立 `voice/` 包。
 
 ## API 端点（常用接口摘录，完整路由按模块启用）
 
@@ -391,15 +430,14 @@ hexclaw/
 | POST | `/api/v1/knowledge/search` | 结构化搜索（`result` 和 `results` 均返回 `[]SearchHit` 数组，包含分片、来源、分数） |
 
 ### 定时任务
+统一入口 `POST /api/v1/cronjob` 以请求体中的 `action` 字段分发（`create` / `update` / `remove` / `pause` / `resume` / `run` / `list` / `history`），支持 `idempotency_key` 幂等重放。
+
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/v1/cron/jobs` | 任务列表 |
-| POST | `/api/v1/cron/jobs` | 添加任务 |
-| DELETE | `/api/v1/cron/jobs/{id}` | 删除任务 |
-| POST | `/api/v1/cron/jobs/{id}/pause` | 暂停任务 |
-| POST | `/api/v1/cron/jobs/{id}/resume` | 恢复任务 |
-| POST | `/api/v1/cron/jobs/{id}/trigger` | 手动触发 |
-| GET | `/api/v1/cron/jobs/{id}/history` | 执行历史 |
+| POST | `/api/v1/cronjob` | 定时任务统一入口（按 `action` 分发增删改/暂停恢复/手动触发/列表/历史） |
+| POST | `/api/v1/cron/jobs/stream` | 创建任务（SSE 流式编译，实时推送 progress/done/error） |
+| POST | `/api/v1/cron/parse` | 解析/校验 cron 表达式并返回下次触发时间 |
+| GET | `/api/v1/cron/jobs/{id}/history` | 执行历史（历史项含 `result` 输出摘要） |
 
 ### Webhook
 | 方法 | 路径 | 说明 |
@@ -566,7 +604,7 @@ go vet ./...
 golangci-lint run
 
 # 发版前门禁 + Eval + canary dry-run
-go run ./cmd/verify-release -repo . -version 0.4.0 -version-files package.json
+go run ./cmd/verify-release -repo . -version 0.4.4 -version-files package.json
 ```
 
 ## 技术栈
@@ -574,9 +612,9 @@ go run ./cmd/verify-release -repo . -version 0.4.0 -version-files package.json
 | 组件 | 技术 |
 |------|------|
 | 语言 | Go 1.25+ |
-| Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.4.7 |
-| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.1.2 |
-| 工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) v0.0.6 |
+| Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.5.0 |
+| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.1.4 |
+| 工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) v0.1.0 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | 配置 | YAML + 环境变量 |
 | 存储 | SQLite (modernc.org/sqlite) |
@@ -618,14 +656,37 @@ chore: 构建/工具链
 
 | 项目 | 说明 | 仓库 |
 |------|------|------|
-| **Hexagon** | Go AI Agent 框架 (核心引擎) v0.4.7 | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.1.2 | [ai-core](https://github.com/hexagon-codes/ai-core) |
-| **toolkit** | Go 通用工具库 v0.0.6 | [toolkit](https://github.com/hexagon-codes/toolkit) |
+| **Hexagon** | Go AI Agent 框架 (核心引擎) v0.5.0 | [hexagon](https://github.com/hexagon-codes/hexagon) |
+| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.1.4 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **toolkit** | Go 通用工具库 v0.1.0 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI 观测面板 (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
 | **hexclaw-desktop** | HexClaw 桌面客户端 (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
 | **hexclaw-ui** | HexClaw Web 前端 (Vue 3) | [hexclaw-ui](https://github.com/hexagon-codes/hexclaw-ui) |
 
 ## 更新日志
+
+### v0.4.4
+
+**新功能**
+- **凭据静态加密** — 平台凭据以 AES-256-GCM 落盘加密（`enc:v1:` 信封 + 0600 主密钥）；历史明文透明回读，下次写入自动回填密文
+- **注入扫描** — 纵深防御：cron 创建期（严格）+ exec 组装期；外泄/混淆族始终严格，指令覆盖族仅在有 skills/RAG 数据时放宽
+- **统一权限闸 GA** — 声明式 `PermissionPolicy` 成为单一工具授权闸，无人值守 LLM 风险顾问取代 skill 层确认门
+- **Skill 工具盘** — 新增 `export_document`/`knowledge_ingest`/`media_generate`/`send_message` 内置技能
+- **library 记忆薄版** — 轻量 prompt/记忆库，每轮注入
+
+**依赖与架构**
+- **框架升级** — 升级到 hexagon v0.5.1 / ai-core v0.1.6 / toolkit v0.2.0（go.mod 去除 toolchain 行，Go 1.25.5）；上游均为带回归测试的缺陷修复（`streamx` 超时无损、`runtime/runner` 工具配对、`failover` 分类）。toolkit `crypto/sign` `APISigner` wire 格式 BREAKING 不影响本仓（仅用 `HMACSHA256` 原语）
+- **能力下沉** — 媒体生成/genstore/SSRF/缓存/trace/events 迁移到 ai-core/toolkit/hexagon；gateway HMAC 改用 `toolkit/crypto/sign`
+- **failover 下沉** — LLM failover 逻辑下沉到 ai-core/llm，hexclaw 删除本地等价实现，消费点改用 `llm.*`
+- **sandbox 迁移** — Skill 沙箱包从顶层 `sandbox/` 迁移到 `skill/sandbox/`
+
+**修复**
+- **matrix 适配器** — Stop 幂等，消除二次调用 close(closed channel) panic
+- **knowledge 时间衰减** — 零值 CreatedAt 不再被衰减清零（修复无时间戳 chunk 永不召回）
+- **cron 多副本** — DB 原子领取 + fencing 防止多副本 job 双跑，fail-open 保纯内存行为
+- **安全加固** — SSRF 仅放行 loopback（封禁元数据与内网地址）；shell `find -exec` 收紧白名单；文件操作 symlink 越界防护；WhatsApp webhook 验签 + 微信/企微常量时间比较
+- **无人值守提权（BUG-F1/F-5）** — `manage_skill` 补入基线策略；任意执行 + 能力/宿主变更类工具（`shell`/`code`/`create_skill`/`manage_skill`/`manage_mcp_server`/`file_edit`/…）在无人值守派发下硬拒，LLM 风险顾问无权放行
+- **SSRF 保留段（BUG-F4）** — cron Starlark `http_*` 补封 RFC6598 CGNAT `100.64.0.0/10`、`192.0.0.0/24`、`198.18.0.0/15`（含 IPv4-mapped IPv6 形式）
 
 ### v0.4.0
 

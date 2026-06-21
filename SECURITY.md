@@ -22,7 +22,7 @@ We will acknowledge receipt within 48 hours and provide a detailed response with
 
 | Version | Supported |
 |---------|-----------|
-| v0.3.12 (latest) | ✅ Yes |
+| v0.4.3 (latest) | ✅ Yes |
 
 ## Security Features
 
@@ -35,7 +35,7 @@ HexClaw includes a 6-layer security gateway:
 5. **RBAC** - Role-based access control
 6. **Audit** - Request logging
 
-## Security Hardening (v0.3.12)
+## Security Hardening (v0.4.3)
 
 ### API Authentication
 - Token comparison uses `crypto/subtle.ConstantTimeCompare` to prevent timing attacks
@@ -51,11 +51,20 @@ HexClaw includes a 6-layer security gateway:
 - Environment variables sanitized (only `PATH`, `HOME`, `LANG`)
 - 30-second execution timeout, 64KB output limit
 
-### SSRF Protection (Browser Skill)
-- DNS resolution **before** connection with IP validation
-- Private IP ranges blocked: RFC 1918, RFC 6598, loopback, link-local
+### SSRF Protection (Browser Skill & Cron Scripts)
+- DNS resolution **before** connection with IP validation; the check runs in the dialer `Control` hook on the resolved IP, defeating DNS-rebinding and internal redirects
+- Private/reserved IP ranges blocked: RFC 1918, RFC 6598 CGNAT (`100.64.0.0/10`), RFC 6890 (`192.0.0.0/24`), RFC 2544 (`198.18.0.0/15`), loopback, link-local
 - Cloud metadata endpoints blocked: AWS (`169.254.169.254`), GCP (`metadata.google.internal`), Azure (`168.63.129.16`), Alibaba Cloud (`100.100.100.200`)
+- Applies to both the browser skill and cron Starlark `http_get`/`http_post`
 - 1MB response body limit
+
+### Tool Permission & Unattended Gate
+- A single declarative `PermissionPolicy` gates every tool call (GA). Capability-mutating tools — `manage_skill`, `create_skill`, `patch_skill`, `manage_skill_pending`, `manage_mcp_server` — and consequential actions (`send_message`, `media_generate`, `publish_*`, `shell`, `code`, `browser`, `file_edit`) **require approval**; unmatched tools default to allow.
+- **Unattended dispatches** (cron / webhook / spawn / heartbeat) have no interactive approver. Resolution order:
+  1. A read/collect allowlist (`search`, `web_search`, `knowledge_ingest`, `browser`; plus `cron_task` for cron only) auto-runs.
+  2. **Exec + capability/host-mutation tools hard-deny** — `shell`/`code`/`code_exec` and `create_skill`/`manage_skill`/`patch_skill`/`manage_skill_pending`/`manage_mcp_server`/`file_edit` can NEVER auto-run unattended; the LLM risk reviewer **cannot** override them (they require a real interactive approver).
+  3. The remaining delivery actions (`send_message`/`media_generate`/`publish_*`) are routed to a one-shot LLM risk reviewer and **allowed only on a `low` verdict — `medium`/`high`/no-reviewer/parse-error all fail-closed (deny)**.
+- Cron-dispatched agents additionally have self-escalation tools (`cron_task`, `create_skill`, `manage_skill`, `manage_mcp_server`) stripped from their tool set (recursion guard).
 
 ### Path Traversal Prevention
 - All file operations validate with `filepath.Base()` + absolute path prefix check

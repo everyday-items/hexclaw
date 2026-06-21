@@ -22,7 +22,7 @@
 
 | 版本 | 支持状态 |
 |------|---------|
-| v0.3.12（最新） | ✅ 支持 |
+| v0.4.3（最新） | ✅ 支持 |
 
 ## 安全特性
 
@@ -35,7 +35,7 @@ HexClaw 包含六层安全网关：
 5. **RBAC** — 基于角色的访问控制
 6. **审计** — 请求日志记录
 
-## 安全加固（v0.3.12）
+## 安全加固（v0.4.3）
 
 ### API 认证
 - Token 比较使用 `crypto/subtle.ConstantTimeCompare`，防止时序攻击
@@ -51,11 +51,20 @@ HexClaw 包含六层安全网关：
 - 环境变量清理（仅保留 `PATH`、`HOME`、`LANG`）
 - 30 秒执行超时，64KB 输出限制
 
-### SSRF 防护（Browser 技能）
-- 连接前进行 DNS 解析并验证 IP
-- 封锁私有 IP 段：RFC 1918、RFC 6598、回环地址、链路本地
+### SSRF 防护（Browser 技能 & Cron 脚本）
+- 连接前进行 DNS 解析并验证 IP；校验在 dialer `Control` 钩子里对**已解析待拨号的 IP**执行，可挫败 DNS-rebinding 与内网重定向
+- 封锁私有/保留 IP 段：RFC 1918、RFC 6598 CGNAT（`100.64.0.0/10`）、RFC 6890（`192.0.0.0/24`）、RFC 2544（`198.18.0.0/15`）、回环地址、链路本地
 - 封锁云元数据端点：AWS（`169.254.169.254`）、GCP（`metadata.google.internal`）、Azure（`168.63.129.16`）、阿里云（`100.100.100.200`）
+- 同时覆盖 Browser 技能与 cron Starlark `http_get`/`http_post`
 - 响应体限制 1MB
+
+### 工具权限与无人值守闸
+- 统一声明式 `PermissionPolicy` 前置闸所有工具调用（GA）。能力变更类工具——`manage_skill`、`create_skill`、`patch_skill`、`manage_skill_pending`、`manage_mcp_server`——与 consequential 动作（`send_message`、`media_generate`、`publish_*`、`shell`、`code`、`browser`、`file_edit`）**需用户审批**；未命中规则的工具默认放行。
+- **无人值守派发**（cron / webhook / spawn / heartbeat）无交互审批人，判定顺序：
+  1. 读取/采集白名单（`search`、`web_search`、`knowledge_ingest`、`browser`；`cron_task` 仅 cron）自动放行。
+  2. **任意代码执行 + 能力/宿主变更类工具硬拒**——`shell`/`code`/`code_exec` 与 `create_skill`/`manage_skill`/`patch_skill`/`manage_skill_pending`/`manage_mcp_server`/`file_edit` 永不能无人值守自动运行，LLM 风险顾问**无权**放行（必须真实交互式人工审批）。
+  3. 其余送达类动作（`send_message`/`media_generate`/`publish_*`）改问一次性 LLM 风险顾问，**仅 `low` 判定放行——`medium`/`high`/无顾问/解析失败一律 fail-closed 拒绝**。
+- cron 派发的 Agent 额外剥离自升级工具（`cron_task`、`create_skill`、`manage_skill`、`manage_mcp_server`），防递归提权。
 
 ### 路径遍历防护
 - 所有文件操作通过 `filepath.Base()` + 绝对路径前缀检查进行验证
