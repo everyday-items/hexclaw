@@ -161,7 +161,13 @@ func (e *workflowExecutor) parse() error {
 		if _, exists := e.nodes[id]; exists {
 			return fmt.Errorf("workflow node id 重复: %s", id)
 		}
+		// 节点配置兼容两种字段名：后端原生 "data" 与前端 CanvasNode 的 "config"。
 		data, _ := nodeMap["data"].(map[string]any)
+		if len(data) == 0 {
+			if cfg, ok := nodeMap["config"].(map[string]any); ok {
+				data = cfg
+			}
+		}
 		nodeType := strings.ToLower(stringValue(nodeMap["type"]))
 		if nodeType == "" {
 			nodeType = "noop"
@@ -181,8 +187,9 @@ func (e *workflowExecutor) parse() error {
 		if !ok {
 			continue
 		}
-		source := stringValue(edgeMap["source"])
-		target := stringValue(edgeMap["target"])
+		// 边端点兼容两种字段名：后端原生 "source"/"target" 与前端 CanvasEdge 的 "from"/"to"。
+		source := firstNonEmpty(stringValue(edgeMap["source"]), stringValue(edgeMap["from"]))
+		target := firstNonEmpty(stringValue(edgeMap["target"]), stringValue(edgeMap["to"]))
 		if source == "" || target == "" {
 			continue
 		}

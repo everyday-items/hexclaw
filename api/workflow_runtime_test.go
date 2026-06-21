@@ -93,6 +93,51 @@ func TestWorkflowRun_ParallelStage(t *testing.T) {
 	}
 }
 
+// TestWorkflowRun_FrontendFieldNames 验证 parse 兼容前端 CanvasNode/CanvasEdge 的字段名：
+// 节点用 "config"（而非后端原生 "data"）、边用 "from"/"to"（而非 "source"/"target"）。
+// 桌面端 WorkflowPanel 直接保存这种形状，必须能被图执行器正确读取并链接。
+func TestWorkflowRun_FrontendFieldNames(t *testing.T) {
+	s := newWorkflowTestServer()
+	s.workflowStore.workflows["wf-fe"] = &WorkflowData{
+		ID:   "wf-fe",
+		Name: "frontend-shape",
+		Nodes: []any{
+			map[string]any{"id": "n1", "type": "input", "config": map[string]any{"value": "{{input}}"}},
+			map[string]any{"id": "n2", "type": "agent", "config": map[string]any{"role": "researcher", "prompt": "分析：{{previous}}"}},
+			map[string]any{"id": "n3", "type": "output"},
+		},
+		Edges: []any{
+			map[string]any{"id": "e1", "from": "n1", "to": "n2"},
+			map[string]any{"id": "e2", "from": "n2", "to": "n3"},
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/canvas/workflows/wf-fe/run", strings.NewReader(`{"input":"市场调研"}`))
+	req.SetPathValue("id", "wf-fe")
+	w := httptest.NewRecorder()
+	s.handleRunWorkflow(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+	var run WorkflowRun
+	if err := json.Unmarshal(w.Body.Bytes(), &run); err != nil {
+		t.Fatalf("解析运行响应失败: %v", err)
+	}
+	waitForRunCompletion(t, s, run.ID)
+	got := getRunSnapshot(t, s, run.ID)
+	if got.Status != "completed" {
+		t.Fatalf("期望 completed，实际 %s: %+v", got.Status, got)
+	}
+	// config.role 被读取（前端字段兼容生效）→ 输出带 [researcher] 前缀
+	if !strings.Contains(got.Output, "[researcher]") {
+		t.Fatalf("config.role 未生效（前端字段兼容失败）: %q", got.Output)
+	}
+	// from/to 边被链接 → 3 个节点全部执行（非孤立）
+	if len(got.NodeResults) != 3 {
+		t.Fatalf("期望 3 个节点结果（from/to 边已链接），实际 %d: %+v", len(got.NodeResults), got.NodeResults)
+	}
+}
+
 func TestWorkflowRun_AgentHandoff(t *testing.T) {
 	s := newWorkflowTestServer()
 	s.workflowStore.workflows["wf-handoff"] = &WorkflowData{
