@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/net/sse"
 )
 
@@ -55,8 +56,10 @@ func WithAuth(token string) HTTPOption {
 // NewHTTPTransport creates a new Streamable HTTP transport.
 func NewHTTPTransport(endpoint string, opts ...HTTPOption) *HTTPTransport {
 	t := &HTTPTransport{
-		endpoint:   strings.TrimRight(endpoint, "/"),
-		httpClient: http.DefaultClient,
+		endpoint: strings.TrimRight(endpoint, "/"),
+		// 复用 toolkit httpx：带 ResponseHeaderTimeout（默认 120s）防服务端连上不发数据挂死，
+		// 且不设整体 Timeout 以兼容 Streamable HTTP 长流；取代裸 http.DefaultClient（无任何超时）。
+		httpClient: httpx.RawClient(),
 		headers:    make(map[string]string),
 	}
 	for _, opt := range opts {

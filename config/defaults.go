@@ -125,7 +125,7 @@ func DefaultConfig() *Config {
 			AutoLoad: true,
 			Hub: SkillsHubConfig{
 				RepoURL: "https://github.com/hexagon-codes/hexclaw-hub",
-				Branch:  "v0.0.2",
+				Branch:  "v0.0.4",
 			},
 		},
 		Heartbeat: HeartbeatConfig{

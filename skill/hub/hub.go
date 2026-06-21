@@ -25,7 +25,7 @@ import (
 type HubConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	RepoURL string `yaml:"repo_url"` // 默认: https://github.com/hexagon-codes/hexclaw-hub
-	Branch  string `yaml:"branch"`   // 默认: v0.0.2
+	Branch  string `yaml:"branch"`   // 默认: v0.0.4
 }
 
 // SkillMeta 技能/MCP Server 元数据
@@ -71,7 +71,7 @@ func New(cfg HubConfig, skillsDir string) *Hub {
 		cfg.RepoURL = "https://" + cfg.RepoURL
 	}
 	if cfg.Branch == "" {
-		cfg.Branch = "v0.0.2"
+		cfg.Branch = "v0.0.4"
 	}
 
 	return &Hub{

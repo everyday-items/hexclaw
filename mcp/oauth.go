@@ -17,10 +17,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/toolkit/net/httpx"
 	// randx 为 toolkit 的加密安全随机串生成包；本文件同时直接使用标准库
 	// crypto/rand（PKCE verifier），故以别名 randx 区分，避免与标准库 rand 冲突。
 	randx "github.com/hexagon-codes/toolkit/util/rand"
 )
+
+// oauthHTTPClient 复用 toolkit httpx：带 ResponseHeaderTimeout 防"连上但不发数据"挂死，
+// 取代裸 http.DefaultClient（无任何超时）。OAuth token 交换是短请求，30s 首字节超时足够。
+var oauthHTTPClient = httpx.RawClient(httpx.WithResponseHeaderTimeout(30 * time.Second))
 
 // OAuthConfig holds OAuth 2.0 configuration for an MCP server.
 type OAuthConfig struct {
@@ -214,7 +219,7 @@ func (m *OAuthManager) tokenRequest(ctx context.Context, tokenURL string, data u
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oauthHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("token request failed: %w", err)
 	}
