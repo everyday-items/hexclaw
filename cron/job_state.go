@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"time"
 )
 
@@ -44,7 +45,10 @@ func (s *sqlStateStore) Get(jobID, key string) (string, bool) {
 		return "", false
 	}
 	if time.Since(updated) > stateTTL {
-		_, _ = s.db.ExecContext(ctx, `DELETE FROM cron_job_state WHERE job_id = ? AND key = ?`, jobID, key)
+		// TTL 清理失败不改变"视为过期"语义，但不能静默吞错（DB errcheck 红线）：记录以便排查脏数据残留
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM cron_job_state WHERE job_id = ? AND key = ?`, jobID, key); err != nil {
+			slog.Warn("[cron] state TTL cleanup failed", "source", "cron", "job_id", jobID, "key", key, "error", err)
+		}
 		return "", false
 	}
 	return val, true

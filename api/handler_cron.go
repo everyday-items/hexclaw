@@ -26,6 +26,9 @@ type AddCronJobRequest struct {
 	Type     string `json:"type"` // cron 或 once（once 暂未接入编译）
 	Platform string `json:"platform,omitempty"`
 	ChatID   string `json:"chat_id,omitempty"`
+	// Deliver 显式投递目标（chat/push/feishu/discord/wechat 或已配置连接实例 id/name 的任意组合）。
+	// 留空 → 后端按 prompt 由 LLM 推导（默认 ["chat"]）；非空 → 直接覆盖，前端「连接库下拉」即走此字段（§5 一处存处处引）。
+	Deliver []string `json:"deliver,omitempty"`
 }
 
 // handleListCronJobs 列出定时任务
@@ -82,6 +85,7 @@ func (s *Server) handleAddCronJobJSON(w http.ResponseWriter, r *http.Request) {
 		UserID:       req.UserID,
 		Platform:     req.Platform,
 		ChatID:       req.ChatID,
+		Deliver:      req.Deliver,
 		LocalAPIBase: s.localAPIBase(),
 	})
 	if err != nil {
@@ -116,6 +120,20 @@ func (s *Server) handleAddCronJobSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// C-5 修复：SSE 创建路径与 unified create（cronActionCreate）共用同一 30/user 配额闸。
+	// 否则桌面端主路径（恒走 SSE）可无限建任务、绕过上限。在 SSE 头写出前做检查，
+	// 越限直接返 429（前端 apiSSE 对非 2xx 抛错），与 unified 行为一致。
+	used, err := s.activeCronJobCount(r.Context(), req.UserID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, CodeInternalError, "配额检查失败")
+		return
+	}
+	if used >= CronQuotaPerUser {
+		writeAPIError(w, http.StatusTooManyRequests, CodeCronQuotaExceeded,
+			"活跃定时任务已达上限（"+cronItoa(CronQuotaPerUser)+" 个）—— 请删除旧任务后重试")
+		return
+	}
+
 	// hexagon SSEEventSink：headers + flush + 线程安全锁 + Close 语义都由它管。
 	// 业务事件（progress/done/error）经 EmitRaw 走，wire 与改造前完全一致以保持
 	// 前端契约不变（参考 hexclaw-desktop src/api/tasks.ts parseSSEFrame）。
@@ -144,6 +162,7 @@ func (s *Server) handleAddCronJobSSE(w http.ResponseWriter, r *http.Request) {
 		UserID:       req.UserID,
 		Platform:     req.Platform,
 		ChatID:       req.ChatID,
+		Deliver:      req.Deliver,
 		LocalAPIBase: s.localAPIBase(),
 	}, onProgress)
 	if err != nil {

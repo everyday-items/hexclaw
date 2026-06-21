@@ -1615,35 +1615,40 @@ func nextRunTime(schedule string, jobType JobType, from time.Time) (time.Time, e
 	return parseCron5(schedule, from)
 }
 
-// parseCron5 解析标准 5 字段 cron 表达式
+// parseCron5 解析标准 5 字段 cron 表达式："分 时 日 月 周"
 //
-// 简化实现：支持数字和 * 通配符，不支持范围和步进。
-// 对于个人 Agent 的定时任务场景够用。
+// 支持完整 crontab 字段语法：通配 *、单值、列表 a,b,c、范围 a-b、
+// 步进 */n 与 a-b/n、命名月份（JAN..DEC）与命名星期（SUN..SAT）。
 func parseCron5(expr string, from time.Time) (time.Time, error) {
 	fields := strings.Fields(expr)
 	if len(fields) != 5 {
 		return time.Time{}, fmt.Errorf("cron 表达式需要 5 个字段，得到 %d 个", len(fields))
 	}
 
-	minute, err := parseCronField(fields[0], 0, 59)
+	minSet, _, err := parseCronField(fields[0], 0, 59, nil)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("分钟字段无效: %w", err)
 	}
-	hour, err := parseCronField(fields[1], 0, 23)
+	hourSet, _, err := parseCronField(fields[1], 0, 23, nil)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("小时字段无效: %w", err)
 	}
-	day, err := parseCronField(fields[2], 1, 31)
+	daySet, dayStar, err := parseCronField(fields[2], 1, 31, nil)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("日期字段无效: %w", err)
 	}
-	month, err := parseCronField(fields[3], 1, 12)
+	monthSet, _, err := parseCronField(fields[3], 1, 12, cronMonthNames)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("月份字段无效: %w", err)
 	}
-	dow, err := parseCronField(fields[4], 0, 6)
+	dowSet, dowStar, err := parseCronField(fields[4], 0, 7, cronDayNames)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("星期字段无效: %w", err)
+	}
+	// POSIX: 周日既可写 0 也可写 7，统一归到 0（time.Weekday 中 Sunday=0）
+	if dowSet[7] {
+		dowSet[0] = true
+		delete(dowSet, 7)
 	}
 
 	// 从 from 的下一分钟开始搜索
@@ -1652,15 +1657,15 @@ func parseCron5(expr string, from time.Time) (time.Time, error) {
 	// 最多搜索 366 天（覆盖所有情况）
 	maxIter := 366 * 24 * 60
 	for i := 0; i < maxIter; i++ {
-		minMatch := minute == -1 || candidate.Minute() == minute
-		hourMatch := hour == -1 || candidate.Hour() == hour
-		dayMatch := day == -1 || candidate.Day() == day
-		monthMatch := month == -1 || int(candidate.Month()) == month
-		dowMatch := dow == -1 || int(candidate.Weekday()) == dow
-		// POSIX: when both day-of-month and day-of-week are restricted, match on OR.
+		minMatch := minSet[candidate.Minute()]
+		hourMatch := hourSet[candidate.Hour()]
+		dayMatch := daySet[candidate.Day()]
+		monthMatch := monthSet[int(candidate.Month())]
+		dowMatch := dowSet[int(candidate.Weekday())]
+		// POSIX: 当 day-of-month 与 day-of-week 都受限（非 *）时取 OR；否则取 AND。
 		dayDowMatch := dayMatch && dowMatch
-		if day != -1 && dow != -1 {
-			dayDowMatch = candidate.Day() == day || int(candidate.Weekday()) == dow
+		if !dayStar && !dowStar {
+			dayDowMatch = dayMatch || dowMatch
 		}
 		if minMatch && hourMatch && dayDowMatch && monthMatch {
 			return candidate, nil
@@ -1671,18 +1676,104 @@ func parseCron5(expr string, from time.Time) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("无法计算下次执行时间: %s", expr)
 }
 
-// parseCronField 解析单个 cron 字段
-// 返回 -1 表示通配符 (*)
-func parseCronField(field string, min, max int) (int, error) {
-	if field == "*" {
-		return -1, nil
+// cronMonthNames / cronDayNames 支持命名字段（大小写不敏感）。
+var cronMonthNames = map[string]int{
+	"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+	"jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+var cronDayNames = map[string]int{
+	"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6,
+}
+
+// parseCronField 解析单个 cron 字段，返回该字段在 [min,max] 内匹配的值集合。
+// 支持标准 crontab 语法：通配 *、单值、列表 a,b,c、范围 a-b、
+// 步进 */n 与 a-b/n 与 a/n、命名（月/周，大小写不敏感）。
+// 第二个返回值 isStar 表示该字段是否为纯通配（用于 POSIX day/dow 的 OR 语义）。
+func parseCronField(field string, min, max int, names map[string]int) (map[int]bool, bool, error) {
+	field = strings.TrimSpace(field)
+	if field == "" {
+		return nil, false, fmt.Errorf("空字段")
 	}
-	v, err := strconv.Atoi(field)
+	isStar := field == "*" || strings.HasPrefix(field, "*/")
+	result := make(map[int]bool)
+	for _, part := range strings.Split(field, ",") {
+		if err := parseCronPart(part, min, max, names, result); err != nil {
+			return nil, false, err
+		}
+	}
+	if len(result) == 0 {
+		return nil, false, fmt.Errorf("无效的字段: %s", field)
+	}
+	return result, isStar, nil
+}
+
+// parseCronPart 解析逗号列表中的单个分量（含步进/范围/命名），把命中的值写入 result。
+func parseCronPart(part string, min, max int, names map[string]int, result map[int]bool) error {
+	part = strings.TrimSpace(part)
+	if part == "" {
+		return fmt.Errorf("空字段分量")
+	}
+
+	// 步进：<range>/<step>
+	step := 1
+	rangePart := part
+	if slash := strings.IndexByte(part, '/'); slash >= 0 {
+		rangePart = part[:slash]
+		s, err := strconv.Atoi(part[slash+1:])
+		if err != nil || s <= 0 {
+			return fmt.Errorf("无效的步进: %s", part)
+		}
+		step = s
+	}
+
+	// 区间端点
+	var lo, hi int
+	switch {
+	case rangePart == "*":
+		lo, hi = min, max
+	case strings.IndexByte(rangePart, '-') > 0:
+		dash := strings.IndexByte(rangePart, '-')
+		var err error
+		if lo, err = parseCronValue(rangePart[:dash], names); err != nil {
+			return err
+		}
+		if hi, err = parseCronValue(rangePart[dash+1:], names); err != nil {
+			return err
+		}
+	default:
+		v, err := parseCronValue(rangePart, names)
+		if err != nil {
+			return err
+		}
+		if step > 1 {
+			// 单值带步进（如 5/10）：从该值起到 max
+			lo, hi = v, max
+		} else {
+			lo, hi = v, v
+		}
+	}
+
+	if lo < min || hi > max || lo > hi {
+		return fmt.Errorf("值 %d-%d 超出范围 [%d, %d]", lo, hi, min, max)
+	}
+	for v := lo; v <= hi; v += step {
+		result[v] = true
+	}
+	return nil
+}
+
+// parseCronValue 解析单个数值或命名（月/周，大小写不敏感）。
+func parseCronValue(s string, names map[string]int) (int, error) {
+	s = strings.TrimSpace(s)
+	if names != nil {
+		if v, ok := names[strings.ToLower(s)]; ok {
+			return v, nil
+		}
+	}
+	v, err := strconv.Atoi(s)
 	if err != nil {
-		return 0, fmt.Errorf("无效的数字: %s", field)
-	}
-	if v < min || v > max {
-		return 0, fmt.Errorf("值 %d 超出范围 [%d, %d]", v, min, max)
+		return 0, fmt.Errorf("无效的数字: %s", s)
 	}
 	return v, nil
 }
