@@ -28,12 +28,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/security"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
@@ -79,6 +81,25 @@ type Job struct {
 	SourcePrompt string   `json:"source_prompt"`
 	// D4.2 多 deliver 桥接 — 通过 meta JSON 列持久化
 	Deliver []string `json:"deliver,omitempty"`
+
+	// 可靠性 & 安全扩展，全部走 meta JSON 列（与 Deliver 同款，免 schema migration）。
+	TZ             string   `json:"tz,omitempty"`              // IANA 时区，"" → 服务器本地
+	ContextFrom    []string `json:"context_from,omitempty"`    // 上游 jobID（线性任务链，读最近一条产物）
+	FailureDeliver []string `json:"failure_deliver,omitempty"` // 失败投递目标（空则回落现有节流告警）
+	RequireConfirm bool     `json:"require_confirm,omitempty"` // 危险动作人确认门（送达/发布/扣费）
+
+	// H1 条件升级门（Hermes wakeAgent）：Starlark 门脚本每 tick 廉价跑，仅在调用
+	// wake_agent() 时才升级到 Agent（花 token）。两字段走 meta JSON，免迁移。
+	EscalateAgent  bool   `json:"escalate_agent,omitempty"`  // 允许 wake_agent 触发 Agent 升级
+	EscalatePrompt string `json:"escalate_prompt,omitempty"` // 升级时跑的 Agent prompt（与门脚本同意图、独立）
+
+	// §13.3(2) 增量发现：开启后，产物与上次相同则跳过投递（执行仍跑以取数比对）。
+	OnlyIfChanged bool `json:"only_if_changed,omitempty"`
+
+	// H4 不静默失效：运行时观测字段（仅内存，按 API 下发；重启后由下次运行重填）。
+	// 执行失败 / 调度算不出 → LastError；投递失败 → LastDeliveryError。二者解耦，成功各自清零。
+	LastError         string `json:"last_error,omitempty"`
+	LastDeliveryError string `json:"last_delivery_error,omitempty"`
 }
 
 // JobSpec 编译后的可执行规约。一次编译，多次执行，全程零 LLM 调用。
@@ -152,7 +173,24 @@ type Scheduler struct {
 	stopCh     chan struct{}
 	stopped    bool
 	running    sync.Map // map[string]bool — 正在执行的任务 ID
+
+	// H1 升级成本护栏：jobID → 上次 wake_agent 升级时刻。坏门每 tick 唤醒时，
+	// 把 Agent 升级限制在最小间隔内（同 agent-mode 任务的 1h 下限），防刷 token。
+	lastEscalated sync.Map // map[string]time.Time
+
+	// §13.3(2) 增量发现：per-job 跨运行状态存储（state_get/set 与 only_if_changed 共用）。
+	state StateStore
+
+	// 全局并发上限 + 确定性错峰。
+	// sem 满则派发 goroutine 阻塞等待空槽（防整点惊群打满上游/资源）。
+	// nil → 不限（向后兼容，仅测试可能出现）。staggerMax>0 时按 jobID 哈希错开派发。
+	sem        chan struct{}
+	staggerMax time.Duration
 }
+
+// defaultMaxConcurrentRuns 是同时在执行的 cron 任务数上限。
+// 整点 N 个任务到期时，最多 N 个并发，其余排队，避免惊群打满上游 API / CPU / 内存。
+const defaultMaxConcurrentRuns = 8
 
 // NewScheduler 创建调度器。
 //
@@ -165,13 +203,70 @@ func NewScheduler(db *sql.DB, compiler JobSpecCompiler, scriptExec *ScriptExecut
 	if scriptExec != nil {
 		engines[RuntimePython3] = scriptExec // optional: only where python3 exists
 	}
-	return &Scheduler{
+	s := &Scheduler{
 		db:         db,
 		compiler:   compiler,
 		scriptExec: scriptExec,
 		engines:    engines,
 		jobs:       make(map[string]*Job),
+		sem:        make(chan struct{}, defaultMaxConcurrentRuns),
 	}
+	// §13.3(2)：per-job 跨运行状态存储（需 DB）。注入 Starlark 引擎供 state_get/set，
+	// scheduler 自身亦持有引用供 only_if_changed 投递门。
+	if db != nil {
+		store := newSQLStateStore(db)
+		s.state = store
+		if eng, ok := s.engines[RuntimeStarlark].(*StarlarkEngine); ok {
+			eng.SetStateStore(store)
+		}
+	}
+	return s
+}
+
+// SetMaxConcurrentRuns overrides the global concurrency cap. Must be
+// called before Start. n<=0 disables the cap (unbounded — discouraged). Replacing
+// the channel here is safe because dispatch goroutines are only spawned by Start.
+func (s *Scheduler) SetMaxConcurrentRuns(n int) {
+	if n <= 0 {
+		s.sem = nil
+		return
+	}
+	s.sem = make(chan struct{}, n)
+}
+
+// SetStaggerMax sets the maximum deterministic dispatch jitter. Each due
+// job is delayed by a stable fnv(jobID)%max so a top-of-hour burst is spread out
+// instead of firing simultaneously. 0 (default) disables staggering. Determinism
+// (no random source) keeps runs reproducible and testable.
+func (s *Scheduler) SetStaggerMax(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.staggerMax = d
+}
+
+// staggerFor returns a deterministic dispatch delay in [0, max) derived from the
+// job ID via FNV-1a — same jobID always yields the same delay, no random source.
+func staggerFor(jobID string, max time.Duration) time.Duration {
+	if max <= 0 || jobID == "" {
+		return 0
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(jobID))
+	return time.Duration(h.Sum64() % uint64(max))
+}
+
+// jobLocation resolves a job's IANA timezone. Empty or invalid
+// falls back to server-local so a bad tz never silently shifts schedules to UTC.
+func jobLocation(tz string) *time.Location {
+	if strings.TrimSpace(tz) == "" {
+		return time.Local
+	}
+	if loc, err := time.LoadLocation(tz); err == nil {
+		return loc
+	}
+	logger.Warn("[cron] 无效时区，回落服务器本地", "tz", tz)
+	return time.Local
 }
 
 // SetKBIngest wires the in-process knowledge-base writer into the Starlark
@@ -246,6 +341,18 @@ func (s *Scheduler) Init(ctx context.Context) error {
 
 	// 兼容升级：为旧表添加 result 列（已存在时返回 duplicate column，是预期）
 	addColumnExpectDuplicate(ctx, s.db, "cron_job_runs", `ALTER TABLE cron_job_runs ADD COLUMN result TEXT DEFAULT ''`)
+
+	// §13.3(2) 增量发现：per-job 跨运行状态表（state_get/set + only_if_changed 哈希）。
+	if _, err = s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS cron_job_state (
+		job_id TEXT NOT NULL,
+		key TEXT NOT NULL,
+		value TEXT NOT NULL DEFAULT '',
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (job_id, key),
+		FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
+	)`); err != nil {
+		return fmt.Errorf("初始化 cron 状态表失败: %w", err)
+	}
 
 	// v2 migration：旧库可能缺 spec_json / source_prompt 列。
 	// ALTER TABLE ADD COLUMN 在列已存在时报 "duplicate column name"，预期忽略；其他 error 必须 log。
@@ -461,8 +568,8 @@ func (s *Scheduler) AddJob(ctx context.Context, job *Job) error {
 		job.CreatedAt = time.Now()
 	}
 
-	// 计算下次执行时间
-	next, err := nextRunTime(job.Schedule, job.Type, time.Now())
+	// 计算下次执行时间（在任务时区里求 @daily/@hourly/cron 的下一刻）
+	next, err := nextRunTime(job.Schedule, job.Type, time.Now().In(jobLocation(job.TZ)))
 	if err != nil {
 		return fmt.Errorf("无效的调度表达式 %q: %w", job.Schedule, err)
 	}
@@ -523,6 +630,11 @@ func (s *Scheduler) AddJobFromPromptWithProgress(
 	}
 	if strings.TrimSpace(req.Schedule) == "" || strings.TrimSpace(req.Prompt) == "" {
 		return nil, fmt.Errorf("schedule 与 prompt 必填")
+	}
+	// 注入扫描：任务创建期严格扫（指令覆盖 / 凭证外泄 / 零宽混淆）。纵深防御一层，
+	// 主防御仍是 stripTools + 权限闸；这里只快速拦明显恶意的任务 prompt。
+	if err := security.ScanUserPrompt(req.Prompt); err != nil {
+		return nil, fmt.Errorf("任务 prompt 未通过安全扫描: %w", err)
 	}
 
 	emit := func(stage ProgressStage, msg string) {
@@ -742,6 +854,28 @@ func serializeJobMeta(job *Job) string {
 	if len(job.Deliver) > 0 {
 		m["deliver"] = job.Deliver
 	}
+	// 可靠性 & 安全字段同走 meta JSON 列，免 schema migration。
+	if job.TZ != "" {
+		m["tz"] = job.TZ
+	}
+	if len(job.ContextFrom) > 0 {
+		m["context_from"] = job.ContextFrom
+	}
+	if len(job.FailureDeliver) > 0 {
+		m["failure_deliver"] = job.FailureDeliver
+	}
+	if job.RequireConfirm {
+		m["require_confirm"] = true
+	}
+	if job.EscalateAgent {
+		m["escalate_agent"] = true
+	}
+	if job.EscalatePrompt != "" {
+		m["escalate_prompt"] = job.EscalatePrompt
+	}
+	if job.OnlyIfChanged {
+		m["only_if_changed"] = true
+	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		return "{}"
@@ -756,7 +890,14 @@ func parseJobMeta(job *Job, metaJSON string) {
 		return
 	}
 	var m struct {
-		Deliver []string `json:"deliver,omitempty"`
+		Deliver        []string `json:"deliver,omitempty"`
+		TZ             string   `json:"tz,omitempty"`
+		ContextFrom    []string `json:"context_from,omitempty"`
+		FailureDeliver []string `json:"failure_deliver,omitempty"`
+		RequireConfirm bool     `json:"require_confirm,omitempty"`
+		EscalateAgent  bool     `json:"escalate_agent,omitempty"`
+		EscalatePrompt string   `json:"escalate_prompt,omitempty"`
+		OnlyIfChanged  bool     `json:"only_if_changed,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(metaJSON), &m); err != nil {
 		return
@@ -764,6 +905,62 @@ func parseJobMeta(job *Job, metaJSON string) {
 	if len(m.Deliver) > 0 {
 		job.Deliver = m.Deliver
 	}
+	job.TZ = m.TZ
+	job.ContextFrom = m.ContextFrom
+	job.FailureDeliver = m.FailureDeliver
+	job.RequireConfirm = m.RequireConfirm
+	job.EscalateAgent = m.EscalateAgent
+	job.EscalatePrompt = m.EscalatePrompt
+	job.OnlyIfChanged = m.OnlyIfChanged
+}
+
+// latestRunOutput returns the most recent run's product for jobID (for
+// context_from injection): stdout, or data_json when stdout is empty. Empty
+// string on any miss (no DB / no rows / error) so a broken upstream never blocks
+// the consumer.
+func (s *Scheduler) latestRunOutput(jobID string) string {
+	if s.db == nil || jobID == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var stdout, dataJSON sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT stdout, data_json FROM cron_job_runs WHERE job_id = ? ORDER BY id DESC LIMIT 1`,
+		jobID).Scan(&stdout, &dataJSON)
+	if err != nil {
+		return ""
+	}
+	if stdout.Valid && strings.TrimSpace(stdout.String) != "" {
+		return stdout.String
+	}
+	if dataJSON.Valid {
+		return dataJSON.String
+	}
+	return ""
+}
+
+// withUpstreamContext returns a per-run copy of job with the upstream product
+// injected — Spec.Inputs["upstream_context"] for scripts (surfaced as
+// HEXCLAW_INPUTS) and a SourcePrompt prefix for agent jobs. It deep-copies Spec
+// and its Inputs map so the shared read-only *JobSpec is never mutated; the
+// original s.jobs[id] is untouched.
+func withUpstreamContext(job *Job, upstream string) *Job {
+	cp := *job
+	if job.Spec != nil {
+		specCopy := *job.Spec
+		inputs := make(map[string]any, len(job.Spec.Inputs)+1)
+		for k, v := range job.Spec.Inputs {
+			inputs[k] = v
+		}
+		inputs["upstream_context"] = upstream
+		specCopy.Inputs = inputs
+		cp.Spec = &specCopy
+	}
+	if cp.SourcePrompt != "" {
+		cp.SourcePrompt = "【上游任务最近产物】\n" + upstream + "\n\n" + cp.SourcePrompt
+	}
+	return &cp
 }
 
 // EffectiveDeliver 返回 job 实际应通知的渠道列表。空时回退 ["chat"]。
@@ -937,7 +1134,94 @@ func (s *Scheduler) checkAndExecute(now time.Time) {
 	s.mu.RUnlock()
 
 	for _, job := range dueJobs {
-		go s.executeJob(job)
+		// A slow job stays "due" every tick; skip spawning before we even
+		// take a goroutine/sem slot, so a long run doesn't churn goroutines or
+		// starve the semaphore. executeJob's running.LoadOrStore stays the
+		// authoritative guard (the Load→spawn race is benign — at worst one extra
+		// goroutine hits that guard and returns).
+		if _, busy := s.running.Load(job.ID); busy {
+			continue
+		}
+		// H2 misfire 宽限：停服/休眠后重启，错过本次到期超过半周期（clamp[120s,2h]）→
+		// 快进到下个未来点、跳过本次，**不补一串积压**；未超宽限则正常补跑一次。
+		// 一次性任务不参与（错过的提醒仍应迟到触发）。
+		if job.Type != JobTypeOnce && now.Sub(job.NextRunAt) > graceFor(job.Schedule, job.Type, job.TZ) {
+			s.fastForward(job, now)
+			continue
+		}
+		delay := staggerFor(job.ID, s.staggerMax)
+		go func(j *Job) {
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				select {
+				case <-timer.C:
+				case <-s.stopCh:
+					timer.Stop()
+					return
+				}
+			}
+			// global concurrency cap: block for a free slot (or bail on stop).
+			if s.sem != nil {
+				select {
+				case s.sem <- struct{}{}:
+					defer func() { <-s.sem }()
+				case <-s.stopCh:
+					return
+				}
+			}
+			s.executeJob(j)
+		}(job)
+	}
+}
+
+// graceFor 返回任务的 misfire 宽限窗 = 半周期，clamp 到 [120s, 2h]（对标 Hermes
+// _compute_grace_seconds）。周期由"下个 occurrence − 基准"推出，免解析 cron 表达式；
+// 算不出周期（坏 schedule）时返上限宽限，保守避免误快进。
+func graceFor(schedule string, jobType JobType, tz string) time.Duration {
+	loc := jobLocation(tz)
+	// 周期 = 连续两个 occurrence 的间隔（而非"距下次的剩余时间"，后者在整点附近会
+	// 退化为很小的值）。t1 = 下个 occurrence，t2 = 再下个，period = t2 - t1。
+	t1, err := nextRunTime(schedule, jobType, time.Now().In(loc))
+	if err != nil {
+		return 2 * time.Hour
+	}
+	t2, err := nextRunTime(schedule, jobType, t1)
+	if err != nil {
+		return 2 * time.Hour
+	}
+	grace := t2.Sub(t1) / 2
+	if grace < 2*time.Minute {
+		return 2 * time.Minute
+	}
+	if grace > 2*time.Hour {
+		return 2 * time.Hour
+	}
+	return grace
+}
+
+// fastForward 把超宽限的 misfire 任务推进到下个未来执行点（跳过积压、不补一串），
+// loud log + 同步更新内存与 DB 的 next_run_at；保持任务 active。
+func (s *Scheduler) fastForward(job *Job, now time.Time) {
+	next, err := nextRunTime(job.Schedule, job.Type, now.In(jobLocation(job.TZ)))
+	if err != nil {
+		slog.Error("[cron] misfire 快进失败：next 算不出，保持原 next 不补跑",
+			"source", "cron", "id", job.ID, "schedule", job.Schedule, "err", err.Error())
+		return
+	}
+	slog.Warn("[cron] misfire 超宽限：快进跳过本次，不补积压",
+		"source", "cron", "id", job.ID, "name", job.Name,
+		"missed_by", now.Sub(job.NextRunAt).String(), "new_next", next.Format(time.RFC3339))
+	s.mu.Lock()
+	if j, ok := s.jobs[job.ID]; ok {
+		j.NextRunAt = next
+	}
+	s.mu.Unlock()
+	if s.db != nil {
+		dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := s.db.ExecContext(dbCtx, `UPDATE cron_jobs SET next_run_at = ? WHERE id = ?`, next, job.ID); err != nil {
+			slog.Error("[cron] misfire 快进 DB 更新失败", "source", "cron", "id", job.ID, "err", err.Error())
+		}
 	}
 }
 
@@ -1000,10 +1284,20 @@ func (s *Scheduler) executeJob(job *Job) {
 		_ = s.persistHistory(ec, job.ID, "error", "", "Spec 为 nil — 请重新创建任务", 0, now, "", "", 0, nil)
 		return
 	}
+	// context_from 线性任务链：执行前把上游最近一次产物注入本任务（仅读最近一条，
+	// 非 DAG）。注入到 per-run 副本，绝不改共享 *JobSpec。
+	if len(job.ContextFrom) > 0 {
+		if up := s.latestRunOutput(job.ContextFrom[0]); up != "" {
+			job = withUpstreamContext(job, up)
+		}
+	}
+
 	// Outer execution budget — shared timeout resolution with the executor's
 	// inner deadline so the two layers stay self-consistent (review M4).
 	runCtx, cancel := context.WithTimeout(context.Background(), runBudget(job.Spec.TimeoutSec))
 	defer cancel()
+	// §13.3(2)：把 job ID 带进 ctx，供 Starlark state_get/state_set 内建按 job 隔离状态。
+	runCtx = withStateJobID(runCtx, job.ID)
 
 	var result *RunResult
 	var runErr error
@@ -1041,6 +1335,27 @@ func (s *Scheduler) executeJob(job *Job) {
 		}
 		logger.Info("[cron] 执行脚本任务", "name", job.Name, "id", job.ID, "engine", engine.Name())
 		result, runErr = engine.Execute(runCtx, job.Spec)
+
+		// H1 条件升级门：门脚本调 wake_agent() 且任务开启 EscalateAgent → 注入门捕获
+		// 的上下文并跑一轮 Agent（仅此刻花 token）；未 wake / EscalateAgent=false →
+		// 只取廉价 Starlark 结果，0 token。成本护栏 canEscalate 防坏门每 tick 刷 token。
+		if runErr == nil && result != nil && result.Wake && job.EscalateAgent {
+			if strings.TrimSpace(job.EscalatePrompt) == "" {
+				slog.Warn("[cron] wake_agent 触发但 EscalatePrompt 为空，跳过升级", "source", "cron", "id", job.ID)
+			} else if !s.canEscalate(job.ID) {
+				slog.Warn("[cron] wake_agent 触发但距上次升级 < 最小间隔，跳过（防坏门刷 token）", "source", "cron", "id", job.ID)
+			} else {
+				prompt := job.EscalatePrompt
+				if result.WakeContext != "" {
+					prompt = "【监控门捕获的上下文】\n" + result.WakeContext + "\n\n" + prompt
+				}
+				slog.Info("[cron] wake_agent 触发 Agent 升级", "source", "cron", "id", job.ID, "name", job.Name)
+				if esc := s.runAgentJobWithPrompt(runCtx, job, prompt); esc != nil {
+					result = esc
+				}
+				s.markEscalated(job.ID)
+			}
+		}
 	}
 	if result == nil {
 		// Run 返 nil 一般是 venv 准备 / 工作目录创建失败，必须把 runErr 原文带出来便于排查
@@ -1068,11 +1383,24 @@ func (s *Scheduler) executeJob(job *Job) {
 		j.LastRunAt = now
 		j.RunCount++
 
+		// H4：执行失败写 LastError，成功清零（投递失败单独记 LastDeliveryError）。
+		if result.Status == "success" {
+			j.LastError = ""
+		} else {
+			j.LastError = result.Error
+		}
+
 		if job.Type == JobTypeOnce {
 			j.Status = StatusDone
 		} else {
-			next, err := nextRunTime(job.Schedule, job.Type, now)
-			if err == nil {
+			next, err := nextRunTime(job.Schedule, job.Type, now.In(jobLocation(job.TZ)))
+			if err != nil {
+				// H4 不静默失效：next_run_at 算不出 → loud + 保持 active（绝不静默
+				// 转 done/paused 让任务消失）；保留原 NextRunAt，记 LastError 供 UI 可见。
+				slog.Error("[cron] next_run_at 算不出，保持 active 不静默停",
+					"source", "cron", "id", job.ID, "schedule", job.Schedule, "err", err.Error())
+				j.LastError = err.Error()
+			} else {
 				j.NextRunAt = next
 			}
 		}
@@ -1085,8 +1413,15 @@ func (s *Scheduler) executeJob(job *Job) {
 			logger.Error("Cron: 更新任务状态失败", "error", err)
 		}
 	} else {
-		next, _ := nextRunTime(job.Schedule, job.Type, now)
-		if _, err := s.db.ExecContext(dbCtx, `UPDATE cron_jobs SET last_run_at = ?, next_run_at = ?, run_count = run_count + 1 WHERE id = ?`,
+		next, nerr := nextRunTime(job.Schedule, job.Type, now.In(jobLocation(job.TZ)))
+		if nerr != nil {
+			// H4 不静默失效：算不出 next 时只推进 last_run/run_count，**不写零时间**
+			// 到 next_run_at（写零会让任务每 tick 重跑）；任务保持 active、原 next 不变。
+			if _, err := s.db.ExecContext(dbCtx, `UPDATE cron_jobs SET last_run_at = ?, run_count = run_count + 1 WHERE id = ?`,
+				now, job.ID); err != nil {
+				logger.Error("Cron: 更新任务状态失败", "error", err)
+			}
+		} else if _, err := s.db.ExecContext(dbCtx, `UPDATE cron_jobs SET last_run_at = ?, next_run_at = ?, run_count = run_count + 1 WHERE id = ?`,
 			now, next, job.ID); err != nil {
 			logger.Error("Cron: 更新任务状态失败", "error", err)
 		}
@@ -1105,19 +1440,71 @@ func (s *Scheduler) executeJob(job *Job) {
 	}
 
 	if result.Status == "success" {
-		// Deliver BOTH script and agent results through the job's deliver
-		// targets. Script jobs used to deliver nothing — the "self-deliver via
-		// POST /api/v1/notify" path advertised a phantom endpoint (review C2).
-		s.deliverResult(job, result)
-	} else if job.Spec.Runtime == RuntimeAgent {
-		// Agent jobs have no script to recompile — alert on persistent failure
-		// instead of healing (review H1).
-		s.maybeAlertAgentFailure(dbCtx, job, result)
+		// §13.3(2) only_if_changed：产物与上次相同 → 跳过投递（执行已跑、取过数）。
+		// 否则按 deliver 目标投递（脚本与 agent 结果同走）。
+		if job.OnlyIfChanged && s.outputUnchanged(job.ID, result) {
+			slog.Info("[cron] only_if_changed：产物未变，跳过投递", "source", "cron", "id", job.ID, "name", job.Name)
+		} else {
+			s.deliverResult(job, result)
+		}
 	} else {
-		// Self-heal bridge: consecutive script failures past the threshold →
-		// recompile with the failure context (cooldown-window quota applies).
-		s.maybeSelfHeal(dbCtx, job, result)
+		// failure_deliver: route a failure summary to the job's dedicated
+		// failure channels; falls back to the existing throttled alert when unset.
+		// Additive to the existing alert/self-heal paths.
+		s.maybeFailureDeliver(job, result)
+		if job.Spec.Runtime == RuntimeAgent {
+			// Agent jobs have no script to recompile — alert on persistent failure
+			// instead of healing.
+			s.maybeAlertAgentFailure(dbCtx, job, result)
+		} else {
+			// Self-heal bridge: consecutive script failures past the threshold →
+			// recompile with the failure context (cooldown-window quota applies).
+			s.maybeSelfHeal(dbCtx, job, result)
+		}
 	}
+}
+
+// maybeFailureDeliver routes a failure summary to the job's FailureDeliver
+// channels. Mirrors deliverResult's chat/push-via-notify vs IM-via-
+// deliverer routing. Fire-and-forget, best-effort; no-op when unset.
+func (s *Scheduler) maybeFailureDeliver(job *Job, result *RunResult) {
+	if job == nil || len(job.FailureDeliver) == 0 {
+		return
+	}
+	summary := failureSummary(job, result)
+	s.agent.mu.Lock()
+	deliverer := s.agent.deliverer
+	s.agent.mu.Unlock()
+
+	notified := false
+	for _, target := range job.FailureDeliver {
+		switch target {
+		case "", "chat", "notify", "push":
+			if !notified {
+				s.notify(job, NotifyLevelWarning, job.Name+" 执行失败", summary)
+				notified = true
+			}
+		default:
+			if deliverer == nil {
+				slog.Warn("[cron] failure_deliver: no deliverer wired for IM target",
+					"source", "cron", "id", job.ID, "target", target)
+				continue
+			}
+			if err := deliverer(job, target, summary); err != nil {
+				slog.Warn("[cron] failure_deliver failed",
+					"source", "cron", "id", job.ID, "target", target, "err", err.Error())
+			}
+		}
+	}
+}
+
+// failureSummary builds a short human-readable failure line for failure_deliver.
+func failureSummary(job *Job, result *RunResult) string {
+	msg := "(no error detail)"
+	if result != nil && strings.TrimSpace(result.Error) != "" {
+		msg = clipForHeal(result.Error, 300)
+	}
+	return fmt.Sprintf("⚠️ 定时任务「%s」执行失败：%s", job.Name, msg)
 }
 
 // loadJobs 从数据库加载活跃任务

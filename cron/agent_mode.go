@@ -224,6 +224,41 @@ func (s *Scheduler) runAgentJob(ctx context.Context, job *Job) *RunResult {
 	return &RunResult{Status: "success", Stdout: cleaned, DurationMs: elapsed}
 }
 
+// runAgentJobWithPrompt runs one agent round with an explicit prompt (the H1
+// escalation prompt) instead of the gate job's compiled SourcePrompt. The gate
+// Script and EscalatePrompt share intent but are distinct artifacts — the Script
+// is already compiled into the cheap Starlark gate — so escalation must drive the
+// agent with EscalatePrompt, not the gate's source.
+func (s *Scheduler) runAgentJobWithPrompt(ctx context.Context, job *Job, prompt string) *RunResult {
+	cp := *job
+	cp.SourcePrompt = prompt
+	return s.runAgentJob(ctx, &cp)
+}
+
+// escalateMinInterval floors how often a wake_agent gate may escalate to the
+// Agent, mirroring the 1h interval agent-mode jobs obey — a Starlark gate runs
+// every tick, so without this a broken gate that always wakes would burn tokens
+// every tick (P1-2 cost guard).
+const escalateMinInterval = time.Hour
+
+// canEscalate reports whether enough time has elapsed since this job last
+// escalated. First escalation always allowed.
+func (s *Scheduler) canEscalate(jobID string) bool {
+	if v, ok := s.lastEscalated.Load(jobID); ok {
+		if last, ok := v.(time.Time); ok && time.Since(last) < escalateMinInterval {
+			return false
+		}
+	}
+	return true
+}
+
+// markEscalated records the escalation time for the cost guard and surfaces it
+// in run history via a structured log (does not mutate result.Data).
+func (s *Scheduler) markEscalated(jobID string) {
+	s.lastEscalated.Store(jobID, time.Now())
+	slog.Info("[cron] escalated", "source", "cron", "id", jobID)
+}
+
 // knowledgeIngestTool is the only skill through which the Agent can persist a
 // document to the knowledge base. Keep in sync with the skill registration
 // (cmd/hexclaw/main.go) and engine.systemDispatchToolFloor.
@@ -398,10 +433,19 @@ func (s *Scheduler) deliverResult(job *Job, result *RunResult) {
 	if content == "" {
 		return
 	}
+	// H3 [SILENT]：成功结果含 [SILENT] 标记 → 抑制投递（产物已写历史）。失败永远
+	// 投递、不经本函数（executeJob 仅 success 调 deliverResult）。
+	if hasSilentMarker(content) {
+		slog.Info("[cron] [SILENT] marker — delivery suppressed, result kept in history",
+			"source", "cron", "id", job.ID, "name", job.Name)
+		s.recordDeliveryOutcome(job.ID, nil) // 抑制非失败 → 清零投递错误
+		return
+	}
 	s.agent.mu.Lock()
 	deliverer := s.agent.deliverer
 	s.agent.mu.Unlock()
 
+	var deliverErrs []string
 	notified := false
 	for _, target := range EffectiveDeliver(job) {
 		switch target {
@@ -417,11 +461,37 @@ func (s *Scheduler) deliverResult(job *Job, result *RunResult) {
 				continue
 			}
 			if err := deliverer(job, target, content); err != nil {
+				deliverErrs = append(deliverErrs, target+": "+err.Error())
 				slog.Warn("[cron] IM deliver failed, result kept in history",
 					"source", "cron", "id", job.ID, "name", job.Name, "target", target, "err", err.Error())
 			}
 		}
 	}
+	// H4：投递结果与执行解耦 —— 全成功清零 LastDeliveryError，否则记录失败目标。
+	s.recordDeliveryOutcome(job.ID, deliverErrs)
+}
+
+// recordDeliveryOutcome 把本次投递结果写回 jobs map 的规范记录（deliverResult 操作
+// 的是 per-run 副本）。errs 为空 = 全部成功 → 清零 LastDeliveryError。
+func (s *Scheduler) recordDeliveryOutcome(jobID string, errs []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.jobs[jobID]
+	if !ok {
+		return
+	}
+	if len(errs) == 0 {
+		j.LastDeliveryError = ""
+		return
+	}
+	j.LastDeliveryError = strings.Join(errs, "; ")
+}
+
+// hasSilentMarker reports whether content carries the [SILENT] delivery-suppression
+// marker (case-insensitive). The agent emits it to record a run in history without
+// pushing a notification (e.g. a monitor that found nothing noteworthy this tick).
+func hasSilentMarker(content string) bool {
+	return strings.Contains(strings.ToUpper(content), "[SILENT]")
 }
 
 // maybeAlertAgentFailure notifies the user when an agent-mode job has failed

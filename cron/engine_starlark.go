@@ -35,6 +35,7 @@ type StarlarkEngine struct {
 	maxBody    int64
 	stdoutTail int
 	kbIngest   KBIngestFunc
+	stateStore StateStore // §13.3(2) per-job 跨运行 KV，nil → state_get 返默认 / state_set 报错
 }
 
 // KBIngestFunc persists a document into the local knowledge base in-process and
@@ -61,7 +62,7 @@ func NewStarlarkEngine() *StarlarkEngine {
 	}
 }
 
-func (e *StarlarkEngine) Name() string   { return RuntimeStarlark }
+func (e *StarlarkEngine) Name() string    { return RuntimeStarlark }
 func (e *StarlarkEngine) Available() bool { return true } // pure Go, always present
 
 // SetKBIngest wires the in-process knowledge-base writer behind the kb_ingest
@@ -69,6 +70,49 @@ func (e *StarlarkEngine) Available() bool { return true } // pure Go, always pre
 // silently dropping content. Mirrors the codebase's Set* injection style
 // (SetAgentRunner / SetKnowledgeBase).
 func (e *StarlarkEngine) SetKBIngest(fn KBIngestFunc) { e.kbIngest = fn }
+
+// SetStateStore wires the per-job cross-run KV store behind state_get/state_set.
+// No-op semantics when unset: state_get returns the supplied default, state_set
+// errors loudly (a script relying on state should fail visibly, not silently
+// drop it). Mirrors the SetKBIngest injection style.
+func (e *StarlarkEngine) SetStateStore(s StateStore) { e.stateStore = s }
+
+// builtinStateGet returns state_get(key, default="") -> str. The job is scoped
+// via the run context (executeJob stamps the job ID); a missing store/job yields
+// the default so a script stays runnable in test/standalone contexts.
+func (e *StarlarkEngine) builtinStateGet(ctx context.Context) func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
+	return func(_ *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		var key, def string
+		if err := starlark.UnpackArgs(b.Name(), args, kwargs, "key", &key, "default?", &def); err != nil {
+			return nil, err
+		}
+		if e.stateStore != nil {
+			if v, ok := e.stateStore.Get(stateJobIDFrom(ctx), key); ok {
+				return starlark.String(v), nil
+			}
+		}
+		return starlark.String(def), nil
+	}
+}
+
+// builtinStateSet returns state_set(key, value) -> None. Errors (no store,
+// capacity exceeded, oversized value) propagate as a script error rather than a
+// silent drop, so "变了才 emit" logic never silently loses its memory.
+func (e *StarlarkEngine) builtinStateSet(ctx context.Context) func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
+	return func(_ *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		var key, val string
+		if err := starlark.UnpackArgs(b.Name(), args, kwargs, "key", &key, "value", &val); err != nil {
+			return nil, err
+		}
+		if e.stateStore == nil {
+			return nil, fmt.Errorf("state_set: per-job state store not available")
+		}
+		if err := e.stateStore.Set(stateJobIDFrom(ctx), key, val); err != nil {
+			return nil, fmt.Errorf("state_set: %w", err)
+		}
+		return starlark.None, nil
+	}
+}
 
 // Validate statically checks Starlark syntax and rejects module loading. No AST
 // denylist is needed: the dialect grants no escape primitives, so a parse plus a
@@ -94,8 +138,9 @@ func validateStarlarkSource(script string) error {
 			return fmt.Errorf("load() is not allowed in cron scripts")
 		}
 	}
-	if !strings.Contains(script, "emit(") {
-		return fmt.Errorf("script must call emit({...}) to return its result")
+	// emit 是常规输出契约；wake_agent 是 H1 升级门的输出契约（门任务可只 wake 不 emit）。
+	if !strings.Contains(script, "emit(") && !strings.Contains(script, "wake_agent(") {
+		return fmt.Errorf("script must call emit({...}) or wake_agent(...) to produce a result")
 	}
 	return nil
 }
@@ -142,11 +187,24 @@ func (e *StarlarkEngine) Execute(ctx context.Context, spec *JobSpec) (*RunResult
 		return starlark.None, nil
 	})
 
+	// H1 条件升级门（Hermes wakeAgent）：门脚本廉价跑，仅"有料"时调 wake_agent(context)
+	// 请求升级到 Agent（花 token）。闭包捕获请求标志与上下文，Execute 末尾落进 RunResult。
+	var wakeReq bool
+	var wakeCtx string
+	wakeAgent := starlark.NewBuiltin("wake_agent", func(_ *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		var c string
+		if err := starlark.UnpackArgs(b.Name(), args, kwargs, "context?", &c); err != nil {
+			return nil, err
+		}
+		wakeReq, wakeCtx = true, c
+		return starlark.None, nil
+	})
+
 	predeclared := starlark.StringDict{
-		"http_get":    starlark.NewBuiltin("http_get", e.builtinHTTP(runCtx, http.MethodGet)),
-		"http_post":   starlark.NewBuiltin("http_post", e.builtinHTTP(runCtx, http.MethodPost)),
-		"json_decode": starlark.NewBuiltin("json_decode", builtinJSONDecode),
-		"json_encode": starlark.NewBuiltin("json_encode", builtinJSONEncode),
+		"http_get":      starlark.NewBuiltin("http_get", e.builtinHTTP(runCtx, http.MethodGet)),
+		"http_post":     starlark.NewBuiltin("http_post", e.builtinHTTP(runCtx, http.MethodPost)),
+		"json_decode":   starlark.NewBuiltin("json_decode", builtinJSONDecode),
+		"json_encode":   starlark.NewBuiltin("json_encode", builtinJSONEncode),
 		"re_findall":    starlark.NewBuiltin("re_findall", builtinReFindall),
 		"re_sub":        starlark.NewBuiltin("re_sub", builtinReSub),
 		"html_unescape": starlark.NewBuiltin("html_unescape", builtinHTMLUnescape),
@@ -154,7 +212,10 @@ func (e *StarlarkEngine) Execute(ctx context.Context, spec *JobSpec) (*RunResult
 		"sha256":        starlark.NewBuiltin("sha256", builtinSHA256),
 		"now":           starlark.NewBuiltin("now", builtinNow),
 		"kb_ingest":     starlark.NewBuiltin("kb_ingest", e.builtinKBIngest(runCtx)),
+		"state_get":     starlark.NewBuiltin("state_get", e.builtinStateGet(runCtx)),
+		"state_set":     starlark.NewBuiltin("state_set", e.builtinStateSet(runCtx)),
 		"emit":          emit,
+		"wake_agent":    wakeAgent,
 	}
 
 	opts := &syntax.FileOptions{}
@@ -179,9 +240,16 @@ func (e *StarlarkEngine) Execute(ctx context.Context, spec *JobSpec) (*RunResult
 		return result, nil
 	}
 	applyEmitted(emitted, result)
+	result.Wake = wakeReq
+	result.WakeContext = wakeCtx
 	if result.Status == "" {
-		result.Status = "error"
-		result.Error = "script finished without calling emit({...})"
+		// H1：wake_agent 是门任务的输出契约 —— 调了 wake_agent 而未 emit 不算错。
+		if wakeReq {
+			result.Status = "success"
+		} else {
+			result.Status = "error"
+			result.Error = "script finished without calling emit({...})"
+		}
 	}
 	return result, nil
 }
@@ -500,5 +568,31 @@ func ssrfGuardedClient(timeout time.Duration) *http.Client {
 // IsLoopback || IsPrivate || IsLinkLocalUnicast || IsLinkLocalMulticast ||
 // IsUnspecified（含云元数据端点 169.254.169.254），SSRF 防御语义不变。
 func isBlockedIP(addr net.IP) bool {
-	return ip.IsPrivateOrReservedIP(addr)
+	if ip.IsPrivateOrReservedIP(addr) {
+		return true
+	}
+	// 纵深防御：toolkit 的判定基于 stdlib 谓词，漏掉若干 IANA 特殊用途段——
+	// 最关键的是 RFC6598 CGNAT 100.64.0.0/10（运营商/云内网常用）。这里补齐，
+	// 维持「只允许公网地址」的不变量（BUG-F4，review 2026-06-21）。
+	for _, n := range extraReservedCIDRs {
+		if n.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
+
+// extraReservedCIDRs 是 toolkit ip.IsPrivateOrReservedIP 漏判的 IANA 特殊用途段。
+var extraReservedCIDRs = func() []*net.IPNet {
+	out := make([]*net.IPNet, 0, 3)
+	for _, c := range []string{
+		"100.64.0.0/10", // RFC6598 CGNAT
+		"192.0.0.0/24",  // RFC6890 IETF protocol assignments
+		"198.18.0.0/15", // RFC2544 benchmarking
+	} {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}()

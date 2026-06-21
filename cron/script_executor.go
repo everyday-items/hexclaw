@@ -71,6 +71,11 @@ type RunResult struct {
 	Stderr     string `json:"stderr"`
 	ExitCode   int    `json:"exit_code"`
 	DurationMs int64  `json:"duration_ms"`
+
+	// H1 条件升级门（Starlark wake_agent）：门脚本调 wake_agent(context) 时置 Wake，
+	// WakeContext 为升级时注入下游 Agent 的上下文。仅 Starlark 引擎产出。
+	Wake        bool   `json:"wake,omitempty"`
+	WakeContext string `json:"wake_context,omitempty"`
 }
 
 // NewScriptExecutor 创建默认 executor（python3 + ~/.hexclaw/cron-sandbox）。
