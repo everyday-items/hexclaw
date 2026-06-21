@@ -25,5 +25,5 @@
 //	storage/         持久化存储
 package hexclaw
 
-// Version 当前版本号，通过 -ldflags 在构建时注入
-const Version = "0.3.11"
+// Version 当前版本号；运行时实际版本由 cmd/hexclaw 通过 -ldflags 在构建时注入。
+const Version = "0.4.4"

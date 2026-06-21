@@ -392,7 +392,7 @@ func (s *Store) CreateSession(ctx context.Context, session *storage.Session) err
 // GetSession 获取会话
 func (s *Store) GetSession(ctx context.Context, id string) (*storage.Session, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT `+sessionCols+` FROM sessions WHERE id = ?`, id,
+		`SELECT `+sessionCols+` FROM sessions WHERE id = ? AND status >= 0`, id,
 	)
 	sess, err := scanSession(row)
 	if err != nil {
@@ -857,7 +857,7 @@ func (s *Store) ForkSession(ctx context.Context, sourceSessionID, messageID, use
 			`SELECT s.title, s.platform, s.instance_id, s.chat_id,
 			        (SELECT rowid FROM messages WHERE id = ? AND session_id = s.id)
 			 FROM sessions s
-			 WHERE s.id = ?`,
+			 WHERE s.id = ? AND s.status >= 0`,
 			messageID, sourceSessionID,
 		).Scan(&sourceTitle, &sourcePlatform, &sourceInstanceID, &sourceChatID, &msgRowID)
 		if err != nil {

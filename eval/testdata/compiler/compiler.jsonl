@@ -1,0 +1,4 @@
+// compiler golden — replay 为主，钉死编译器代码回归（解析 → 归一化 → 校验 → 路由）。
+// recorded.content 是模型回放响应（编译器的 JSON 输出）；脚本用单引号避免双重转义。
+{"id":"bug2-emit-python3-to-starlark","suite":"compiler","mode":"replay","input":{"prompt":"抓取 https://example.com 列表并用 emit 输出"},"recorded":{"content":"{\"runtime\":\"python3\",\"script\":\"emit({'status': 'success', 'data': http_get('https://example.com')})\",\"timeout_s\":60}"},"expect":{"runtime":"starlark"}}
+{"id":"compiler-runtime-default-starlark","suite":"compiler","mode":"replay","input":{"prompt":"抓取页面并汇总入库"},"recorded":{"content":"{\"script\":\"emit({'status': 'success'})\"}"},"expect":{"runtime":"starlark","script_contains":"emit("}}

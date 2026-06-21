@@ -255,7 +255,14 @@ func (r *Selector) Get(name string) (hexagon.Provider, bool) {
 }
 
 // Default 获取默认 Provider
+//
+// New() 在无可用 Provider 时返回 nil *Selector（"无 LLM" 是合法状态，调用方多处以
+// `router != nil` 守卫）。读访问器对 nil 接收者按空 selector 处理，避免漏写守卫的
+// 调用点（如 cmd/hexclaw 启动期）在无 Provider 时 SIGSEGV。
 func (r *Selector) Default() hexagon.Provider {
+	if r == nil {
+		return nil
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.providers[r.defaultP]

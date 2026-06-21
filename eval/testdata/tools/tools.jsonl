@@ -1,0 +1,6 @@
+// tools golden — retrieval(确定性召回) + called(live 真实 tool-call)。
+// retrieval-knowledge-ingest-path 是 Bug1 的归位：整理目录入库应召回 path-ingest
+// 技能（逐文件读正文），而非把文件名列表当 content（设计 §11.12 / §11.4）。
+{"id":"retrieval-send-message","suite":"tools","mode":"replay","input":{"query":"把今天的工作总结发到飞书群"},"expect":{"retrieval_contains":"send_message"}}
+{"id":"retrieval-knowledge-ingest-path","suite":"tools","mode":"replay","input":{"query":"整理 /docs 目录里的所有文档并归档进知识库"},"expect":{"retrieval_contains":"knowledge_ingest_path"}}
+{"id":"called-send-feishu","suite":"tools","mode":"live","input":{"query":"把今天总结发飞书群"},"expect":{"called":"send_message"}}

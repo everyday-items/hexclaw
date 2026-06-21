@@ -350,6 +350,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_chunks_doc_index
 		Description: "v0.4.1 cron v2 脚本编译架构：删 prompt NOT NULL + 加 spec_json/source_prompt 与执行结果字段",
 		Func:        migrateCronV2,
 	},
+	{
+		Version:     6,
+		Description: "v0.4.3 §11.8 交互层：Prompt 库（一库三 type）+ 记忆薄版（standing/fact）",
+		SQL: `
+CREATE TABLE IF NOT EXISTS prompts (
+	id         TEXT PRIMARY KEY,
+	type       TEXT NOT NULL DEFAULT 'prompt',   -- prompt | command
+	title      TEXT NOT NULL,
+	body_md    TEXT NOT NULL DEFAULT '',
+	args_json  TEXT NOT NULL DEFAULT '',          -- 轻量参数声明（command 用，$ARGUMENTS 文本替换）
+	tool_scope TEXT NOT NULL DEFAULT '',
+	model      TEXT NOT NULL DEFAULT '',
+	category   TEXT NOT NULL DEFAULT '',
+	enabled    INTEGER NOT NULL DEFAULT 1,
+	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS memories (
+	id         TEXT PRIMARY KEY,
+	kind       TEXT NOT NULL DEFAULT 'fact',      -- standing（每轮全量注入）| fact（命中注入）
+	content    TEXT NOT NULL,
+	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);`,
+	},
 }
 
 // migrateCronV2 把 cron v1 schema 升级到 v2（详见 .claude/cron-script-compilation-design.md）。
@@ -360,10 +383,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_chunks_doc_index
 //   - DDL（ALTER/DROP/CREATE）在事务里行为复杂，分阶段更稳
 //
 // 流程：
-//   1. cron_jobs 不存在 → CREATE 全新 v2 schema 就行（migrate v1 应该已建表，这里兜底）
-//   2. cron_jobs 已存在但缺 spec_json 列（v1 schema）→ 表重建迁移
-//   3. cron_jobs 已含 spec_json（v2 部分迁移过的旧库）→ 检查是否还有 prompt 列；有就重建
-//   4. cron_job_runs 同理补 stdout/stderr/exit_code/data_json
+//  1. cron_jobs 不存在 → CREATE 全新 v2 schema 就行（migrate v1 应该已建表，这里兜底）
+//  2. cron_jobs 已存在但缺 spec_json 列（v1 schema）→ 表重建迁移
+//  3. cron_jobs 已含 spec_json（v2 部分迁移过的旧库）→ 检查是否还有 prompt 列；有就重建
+//  4. cron_job_runs 同理补 stdout/stderr/exit_code/data_json
 func migrateCronV2(ctx context.Context, db *sql.DB) error {
 	// — cron_jobs —
 	hasJobs, err := tableExists(ctx, db, "cron_jobs")

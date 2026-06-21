@@ -56,11 +56,13 @@ import (
 	"github.com/hexagon-codes/hexclaw/heartbeat"
 	"github.com/hexagon-codes/hexclaw/instances"
 	"github.com/hexagon-codes/hexclaw/knowledge"
+	"github.com/hexagon-codes/hexclaw/library"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/render"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
+	"github.com/hexagon-codes/hexclaw/secret"
 	"github.com/hexagon-codes/hexclaw/session"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/skill/builtin"
@@ -71,7 +73,7 @@ import (
 
 // 版本信息，通过 -ldflags 注入
 var (
-	version = "v0.4.1"
+	version = "v0.4.4"
 	commit  = "none"
 	date    = "unknown"
 )
@@ -419,12 +421,14 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	toolExecutor.AddHook(&engine.SanitizeHook{}) // Phase 9: prompt injection defense
 
 	// 6.1.1 接入权限审批 Hook (D24)
-	// v0.4.0 H2 接入：默认挂上 baseline policy；flag tool.policy.engine ON 时自动启用
-	// 声明式规则；flag OFF 时退化到 classifyRisk 老路径，行为不变。
+	// v0.4.3 §11.10 统一安全闸：PermissionPolicy 为单一权限闸（GA 默认 ON）。无人值守
+	// 风险顾问注入 —— cron/webhook 等无交互会话下，命中 require_approval 的 consequential
+	// 动作改问 LLM 判级（eng.JudgeText），仅 low 放行一次，否则 fail-closed 拒。
 	permHub := engine.NewPermissionHub(60 * time.Second)
 	permHook := engine.NewPermissionHook(permHub,
 		engine.WithCodeExecApproval(cfg.Skill.Builtin.CodeExecPolicy.CodeExecRequiresApproval()),
 		engine.WithPolicy(engine.DefaultBaselinePolicy()),
+		engine.WithUnattendedReviewer(unattendedRiskAdapter{builtin.NewLLMRiskReviewer(eng.JudgeText)}),
 	)
 	toolExecutor.AddHook(permHook)
 
@@ -602,6 +606,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			if err := skills.Register(builtin.NewKnowledgeIngestSkill(kbMgr)); err != nil {
 				logger.Warn("[knowledge] failed to register knowledge_ingest skill", "err", err.Error())
 			}
+			// batch/directory ingest: the model passes a PATH and the code reads
+			// each file's real body — never a filename listing. Sandboxed to the
+			// FileOps workspace via resolveSafePath.
+			if err := skills.Register(builtin.NewKnowledgeIngestPathSkill(kbMgr, builtin.DefaultWorkspace())); err != nil {
+				logger.Warn("[knowledge] failed to register knowledge_ingest_path skill", "err", err.Error())
+			}
 			kbOK = true
 		}
 	}
@@ -658,6 +668,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 8. 启动 HTTP 服务
 	srv := api.NewServer(cfg, eng, gw, store)
 	srv.SetVersion(version)
+
+	// §11.8 交互层：Prompt 库（服务端下发 + CRUD）+ 记忆薄版（standing/fact 每轮注入）。
+	promptStore := library.NewPromptStore(store.DB())
+	memStore := library.NewMemoryStore(store.DB())
+	srv.SetPromptStore(promptStore)
+	srv.SetMemoryStore(memStore)
+	eng.SetMemoryProvider(memStore) // 每轮组 prompt 时注入 standing 全量 + fact 命中
 
 	// 8.0.1 接入沙箱网络热更新 (Bug2 修复)
 	if skillDeps.CodeExecSkill != nil {
@@ -802,6 +819,15 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			webhookMgr = nil
 		} else {
 			webhookMgr.SetHandler(func(ctx context.Context, event *webhook.Event, prompt string) error {
+				// §13.3(1) 事件触发：webhook 绑定了 job → 触发该 cron job 而非跑 agent
+				// prompt。TriggerJob 是 fire-and-forget，executeJob 自建 runBudget ctx
+				// （非 webhook 的 5min ctx），长任务不被砍（T1-4）。
+				if event.JobID != "" {
+					if scheduler == nil {
+						return fmt.Errorf("webhook 绑定了 job %q 但调度器未就绪", event.JobID)
+					}
+					return scheduler.TriggerJob(ctx, event.JobID)
+				}
 				content := fmt.Sprintf("[Webhook: %s] %s\n\n指令: %s\n\nPayload 摘要: %s",
 					event.WebhookName, event.EventType, prompt, event.Summary)
 				_, err := eng.Process(ctx, &adapter.Message{
@@ -1088,10 +1114,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	// 14.4 生成内容存储（图像/视频持久化）
 	// 与 SQLite 同目录，便于备份；位置 ~/.hexclaw/generated/
+	// 提升到块外，使 media_generate Skill 注册可复用同一 store（落盘拿稳定路径）。
+	var genStoreSvc *genstore.Store
 	{
 		home, _ := os.UserHomeDir()
 		genStoreRoot := filepath.Join(home, ".hexclaw", "generated")
 		if gs, gErr := genstore.NewStore(genStoreRoot); gErr == nil {
+			genStoreSvc = gs
 			srv.SetGenStore(gs)
 			fmt.Printf("  ✓ GenStore    %s\n", genStoreRoot)
 		} else {
@@ -1188,6 +1217,16 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 配置热更新时重建 gen services（读最新 cfg.LLM.Providers）
 	srv.SetGenServicesReloader(func() { reloadGenServices(false) })
 
+	// 媒体生成 Skill：默认关 + 有 Provider 才注册。
+	// 直调 Generate/Submit + blobstore 落盘，返回稳定 FilePath 供 export/send/ingest 串联。
+	if cfg.Skill.Builtin.MediaGen && imagegenSvc != nil && imagegenSvc.HasProvider() {
+		if err := skills.Register(builtin.NewMediaGenerateSkill(imagegenSvc, videogenSvc, genStoreSvc)); err != nil {
+			logger.Warn("[media] failed to register media_generate skill", "err", err.Error())
+		} else {
+			fmt.Println("  ✓ Skill       media_generate (§11.1)")
+		}
+	}
+
 	// 15. 初始化桌面集成服务（Phase 6）
 	desktopSvc := desktop.NewService(version)
 	srv.SetDesktop(desktopSvc)
@@ -1220,6 +1259,15 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		logger.Info("[info] 文档渲染服务已启用",
 			"engine", "pandoc",
 			"endpoint", "/api/v1/render")
+		// 文档导出 Skill：默认关 + render service 就绪才注册。
+		// 包一层 render.Service，返回落盘路径供送达附件 / 入库 / 下载串联。
+		if cfg.Skill.Builtin.ExportDoc {
+			if rerr := skills.Register(builtin.NewExportDocumentSkill(renderSvc)); rerr != nil {
+				logger.Warn("[render] failed to register export_document skill", "err", rerr.Error())
+			} else {
+				fmt.Println("  ✓ Skill       export_document (§11.3)")
+			}
+		}
 	} else if err != nil {
 		logger.Warn("[warn] 文档渲染服务未启用", "reason", err.Error())
 	} else {
@@ -1243,14 +1291,39 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 
 	instanceMgr := instances.NewManager(store.DB())
+	// 静态加密：主密钥与 SQLite 同目录（~/.hexclaw/master.key, 0600）。加载失败不阻断启动，
+	// 降级为明文直存（保持可用），仅告警；绝不记录密钥或明文凭据。
+	if box, berr := secret.LoadBox(filepath.Dir(cfg.Storage.SQLite.Path)); berr != nil {
+		logger.Warn("[secret] 加载主密钥失败，凭据将以明文存储", "err", berr.Error())
+	} else {
+		instanceMgr.SetSecretBox(box)
+	}
 	if err := instanceMgr.Init(ctx); err != nil {
 		return fmt.Errorf("初始化平台实例运行时失败: %w", err)
 	}
 	if err := instanceMgr.SeedFromConfig(ctx, cfg); err != nil {
 		return fmt.Errorf("写入平台实例种子失败: %w", err)
 	}
+	// 历史明文 config_json 静态加密回填（box 未注入时为 no-op）。
+	if n, eerr := instanceMgr.EncryptExistingAtRest(ctx); eerr != nil {
+		logger.Warn("[secret] 历史凭据静态加密回填失败", "err", eerr.Error())
+	} else if n > 0 {
+		logger.Info("[secret] 历史凭据已静态加密", "count", n)
+	}
 	instanceMgr.SetHandler(messageHandler)
 	srv.SetInstanceManager(instanceMgr)
+
+	// 多通道送达 Skill：复用同源 live adapters（内部经 per-platform SendQueue 限速），
+	// 不自己 reach into adapters。§11.10 统一安全闸：发送审批由 engine PermissionPolicy
+	// 的 send-approve 规则 + 无人值守风险顾问统一执行，Skill 是纯发送器、不自管确认门。
+	if cfg.Skill.Builtin.SendMessage {
+		sender := &instanceMessageSender{mgr: instanceMgr, ctx: ctx}
+		if err := skills.Register(builtin.NewSendMessageSkill(sender)); err != nil {
+			logger.Warn("[send] failed to register send_message skill", "err", err.Error())
+		} else {
+			fmt.Println("  ✓ Skill       send_message (§11.2 + §11.10 unified gate)")
+		}
+	}
 
 	if scheduler != nil {
 		// Route cron jobs' IM deliver targets (feishu/discord/...) through the
@@ -1447,6 +1520,33 @@ func (b *webPermissionBridge) SendPermissionRequest(ctx context.Context, session
 		Risk:      req.Risk,
 		Reason:    req.Reason,
 	})
+}
+
+// instanceMessageSender 把 send_message Skill 的 MessageSender 接到 live
+// 平台适配器：channel = provider/instance（feishu/discord/...），target = chatID。
+// 经 instanceMgr.Send → adapter.Send，内部走 per-platform SendQueue 限速（与 cron Deliverer 同源）。
+//
+// TODO: atts（附件）暂未透传 —— adapter.Reply 当前 Content-only；导出文档作附件送达需先把
+// RenderResult 落盘路径包成 adapter.Attachment 并扩展 Reply，留到下游串联时接。
+// unattendedRiskAdapter 把 builtin.RiskReviewer（判级 low/med/high）适配成 engine
+// 的无人值守顾问：仅 low 且无错放行，其余 fail-closed。§11.10 统一安全闸的判级源。
+type unattendedRiskAdapter struct{ r builtin.RiskReviewer }
+
+func (a unattendedRiskAdapter) AssessLowRisk(ctx context.Context, action, payload string) bool {
+	lvl, err := a.r.Assess(ctx, action, payload)
+	return err == nil && lvl == builtin.RiskLow
+}
+
+type instanceMessageSender struct {
+	mgr *instances.Manager
+	ctx context.Context
+}
+
+func (s *instanceMessageSender) Send(ctx context.Context, channel, target, content string, _ []adapter.Attachment) error {
+	if ctx == nil {
+		ctx = s.ctx
+	}
+	return s.mgr.Send(ctx, channel, target, &adapter.Reply{Content: content})
 }
 
 // runInit 初始化配置

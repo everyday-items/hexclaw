@@ -628,6 +628,11 @@ type BuiltinConfig struct {
 	CodeExec       bool                 `yaml:"code_exec"` // 沙箱代码执行 (需 sandbox 初始化)
 	FileOps        bool                 `yaml:"file_ops"`  // 文件读写编辑 (受限于 workspace)
 	CodeExecPolicy CodeExecPolicyConfig `yaml:"code_exec_policy"`
+
+	// 内置 Skill 开关（默认关，需对应子系统就绪才注册）
+	MediaGen    bool `yaml:"media_gen"`    // 媒体生成 (需 imagegen Provider)
+	SendMessage bool `yaml:"send_message"` // 多通道送达 (需 live adapters)
+	ExportDoc   bool `yaml:"export_doc"`   // 文档导出 (需 render service / pandoc)
 }
 
 // CodeExecPolicyConfig 代码执行审批与沙箱策略
@@ -639,7 +644,7 @@ type BuiltinConfig struct {
 // Network 控制沙箱是否允许网络访问。默认 true 以支持抓取网页、调用 API 等场景。
 type CodeExecPolicyConfig struct {
 	RequireApproval *bool `yaml:"require_approval"` // nil 视为 true（安全默认）
-	Network         *bool `yaml:"network"`           // nil 视为 true（允许网络）
+	Network         *bool `yaml:"network"`          // nil 视为 true（允许网络）
 }
 
 // CodeExecNetworkAllowed 返回沙箱是否允许网络访问
