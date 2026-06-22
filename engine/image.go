@@ -15,6 +15,7 @@ import (
 	"time"
 
 	mediaimg "github.com/hexagon-codes/ai-core/media/image"
+	"github.com/hexagon-codes/hexclaw/httpua"
 	"github.com/hexagon-codes/toolkit/net/httpx"
 )
 
@@ -106,6 +107,7 @@ func downloadAsDataURI(ctx context.Context, url string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	httpua.Set(req) // 默认浏览器 UA，避免反爬站对 Go 默认 UA 返回 HTML（AP-016）
 
 	resp, err := client.Do(req)
 	if err != nil {

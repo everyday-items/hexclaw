@@ -614,11 +614,24 @@ func (m *Manager) recordEvent(ctx context.Context, instanceName, eventID string)
 	if err == nil {
 		return false, nil
 	}
-	// sqlite duplicate primary key
-	if strings.Contains(err.Error(), "UNIQUE") || strings.Contains(err.Error(), "constraint") {
+	// 仅「主键/唯一键冲突」=去重命中；其它约束错误必须上抛。
+	if isDuplicateKeyErr(err) {
 		return true, nil
 	}
 	return false, err
+}
+
+// isDuplicateKeyErr 仅判定唯一键/主键冲突（去重命中）。
+// 不能用裸 strings.Contains(err, "constraint")——CHECK / FOREIGN KEY / NOT NULL 约束错误
+// 文案同样含 "constraint"，会被误判为「重复事件」→ 真实平台消息被静默丢弃（bug 2026-06-22）。
+func isDuplicateKeyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "UNIQUE constraint failed") || // sqlite
+		strings.Contains(msg, "Duplicate entry") || // mysql (Error 1062)
+		strings.Contains(msg, "duplicate key value") // postgres
 }
 
 func (m *Manager) deleteEvent(ctx context.Context, instanceName, eventID string) error {

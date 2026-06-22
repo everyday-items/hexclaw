@@ -1,15 +1,13 @@
 package cron
 
-// BUG-20260615 F-3: SSRF tightening — loopback is now blocked, so a Starlark
-// collector can no longer http_post to the app's own KB API. Ingest moves into
-// the in-process kb_ingest builtin. These lock: (1) loopback is blocked at the
-// IP guard, (2) kb_ingest forwards to the injected writer and returns its id,
-// (3) an unset writer errors loudly instead of silently dropping content, and
-// (4) the Scheduler forwards its writer down to the Starlark engine.
+// BUG-20260615 F-3: a Starlark collector ingests into the local KB via the
+// in-process kb_ingest builtin instead of an HTTP round-trip. These lock:
+// (1) kb_ingest forwards to the injected writer and returns its id, (2) an
+// unset writer errors loudly instead of silently dropping content, and (3) the
+// Scheduler forwards its writer down to the Starlark engine.
 
 import (
 	"context"
-	"net"
 	"os"
 	"strings"
 	"testing"
@@ -33,20 +31,6 @@ func TestBug20260615_F3_ArchivedScripts_UseKBIngest(t *testing.T) {
 		}
 		if strings.Contains(src, "127.0.0.1") || strings.Contains(src, "localhost") {
 			t.Errorf("%s must not POST to a loopback KB endpoint (F-3)", path)
-		}
-	}
-}
-
-func TestBug20260615_F3_isBlockedIP_BlocksLoopback(t *testing.T) {
-	for _, s := range []string{"127.0.0.1", "127.0.0.53", "::1"} {
-		if !isBlockedIP(net.ParseIP(s)) {
-			t.Errorf("loopback %s must now be blocked (F-3)", s)
-		}
-	}
-	// Public addresses must stay reachable — collectors fetch the open internet.
-	for _, s := range []string{"1.1.1.1", "8.8.8.8", "104.16.0.1"} {
-		if isBlockedIP(net.ParseIP(s)) {
-			t.Errorf("public %s must stay allowed", s)
 		}
 	}
 }

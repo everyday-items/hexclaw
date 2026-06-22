@@ -73,6 +73,7 @@ type SkillMeta struct {
 	Triggers      []string `yaml:"triggers"`       // 快速路径触发关键词
 	Tags          []string `yaml:"tags"`           // 分类标签
 	Signature     string   `yaml:"signature"`      // 签名（安全验证用）
+	Icon          string   `yaml:"icon"`           // 可选：emoji（如 "📊"）或内置 lucide 名（如 "Code"），供桌面端渲染图标；缺省时前端按 category/tags/name 派生
 	When          []string `yaml:"when"`           // Phase 2: 激活条件 AND
 	NotWhen       []string `yaml:"not_when"`       // Phase 2: 排除条件
 	PreferredMode string   `yaml:"preferred_mode"` // Phase 2: 推荐 Agent 模式
@@ -449,6 +450,8 @@ func parseFrontmatter(text string) (SkillMeta, string) {
 			meta.Version = value
 		case "signature":
 			meta.Signature = value
+		case "icon":
+			meta.Icon = value
 		case "preferred_mode":
 			meta.PreferredMode = value
 		case "triggers", "tags", "when", "not_when", "tools", "requires":

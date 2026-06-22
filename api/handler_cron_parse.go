@@ -50,6 +50,7 @@ type CronJobDraft struct {
 	Runtime         string   `json:"runtime,omitempty"` // starlark (default) | python3 — only meaningful with Script
 	NoAgent         bool     `json:"no_agent,omitempty"`
 	Deliver         []string `json:"deliver,omitempty"`
+	ChatID          string   `json:"chat_id,omitempty"` // IM/连接投递目标会话/群组 ID（Deliverer 必需，否则 IM 投递失败）
 	EnabledToolsets []string `json:"enabled_toolsets,omitempty"`
 	TimeoutSec      int      `json:"timeout_s,omitempty"` // 0 → mode default (agent 600s)
 }

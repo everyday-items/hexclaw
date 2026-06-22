@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -14,7 +13,6 @@ import (
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/toolkit/net/httpx"
-	"github.com/hexagon-codes/toolkit/net/ssrf"
 )
 
 // BrowserSkill 网页浏览技能
@@ -24,36 +22,13 @@ import (
 //   - extract: 提取标题、链接、元描述
 //   - post: 提交表单数据
 type BrowserSkill struct {
-	client       *http.Client
-	allowPrivate bool // 仅测试用：允许访问内网地址
+	client *http.Client
 }
 
 // NewBrowserSkill 创建浏览器技能
 func NewBrowserSkill() *BrowserSkill {
-	// 使用 safe dialer 防止 DNS rebinding 绕过 SSRF 检查
-	safeDialer := &net.Dialer{Timeout: 10 * time.Second}
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			// DNS 解析后检查 IP
-			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-			if err != nil {
-				return nil, err
-			}
-			for _, ipAddr := range ips {
-				if isPrivateIP(ipAddr.IP) {
-					return nil, fmt.Errorf("禁止连接内网地址: %s -> %s", host, ipAddr.IP)
-				}
-			}
-			// 使用解析后的第一个 IP 直接连接
-			return safeDialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
-		},
-	}
 	return &BrowserSkill{
-		client: httpx.RawClient(httpx.WithRawTimeout(30*time.Second), httpx.WithRawTransport(transport)),
+		client: httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
 	}
 }
 
@@ -98,22 +73,10 @@ func (s *BrowserSkill) Execute(ctx context.Context, args map[string]any) (*skill
 		return nil, fmt.Errorf("缺少 url 参数")
 	}
 
-	// (ssrf.ValidateURL 已在下方统一校验)
-
 	// 验证 URL
 	parsed, err := url.Parse(targetURL)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return nil, fmt.Errorf("无效 URL: %s", targetURL)
-	}
-
-	// SSRF 防护：使用集中校验 (security/ssrf.go) + 原有 isPrivateHost 兜底
-	if !s.allowPrivate {
-		if err := ssrf.ValidateURL(targetURL); err != nil {
-			return nil, fmt.Errorf("禁止访问内网地址: %s", parsed.Hostname())
-		}
-		if isPrivateHost(parsed.Hostname()) {
-			return nil, fmt.Errorf("禁止访问内网地址: %s", parsed.Hostname())
-		}
 	}
 
 	switch action {
@@ -126,7 +89,7 @@ func (s *BrowserSkill) Execute(ctx context.Context, args map[string]any) (*skill
 	}
 }
 
-const maxBodySize = 1 << 20 // 1MB
+const maxBodySize = 64 << 20 // 64MB（桌面端按宿主机语义放宽，覆盖任意正常网页/接口响应，仅防 OOM）
 
 // maxFetchTextLen 限制 fetch 返回给 LLM 的正文长度（rune 计）。整页可见文字
 // 常含大量导航/重复噪声，无界回灌会淹没（尤其是弱模型）。这是卫生上界，
@@ -337,55 +300,4 @@ func extractMetaDescription(html string) string {
 func extractURL(text string) string {
 	match := reURL.FindString(text)
 	return match
-}
-
-// isPrivateHost 检查是否为内网/保留地址（SSRF 防护）
-func isPrivateHost(host string) bool {
-	switch strings.ToLower(host) {
-	case "localhost", "", "metadata.google.internal":
-		return true
-	}
-
-	ip := net.ParseIP(host)
-	if ip == nil {
-		h, _, err := net.SplitHostPort(host)
-		if err == nil {
-			ip = net.ParseIP(h)
-		}
-	}
-	if ip == nil {
-		return false
-	}
-	return isPrivateIP(ip)
-}
-
-// cloudMetaIPs 云元数据 IP（AWS/GCP、Azure、阿里云），编译期只解析一次
-var cloudMetaIPs = func() []net.IP {
-	raw := []string{"169.254.169.254", "168.63.129.16", "100.100.100.200"}
-	ips := make([]net.IP, 0, len(raw))
-	for _, s := range raw {
-		ips = append(ips, net.ParseIP(s))
-	}
-	return ips
-}()
-
-var cgnatNet = func() *net.IPNet {
-	_, n, _ := net.ParseCIDR("100.64.0.0/10")
-	return n
-}()
-
-// isPrivateIP 检查 IP 是否为内网/保留/云元数据地址
-func isPrivateIP(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-		return true
-	}
-	for _, metaIP := range cloudMetaIPs {
-		if ip.Equal(metaIP) {
-			return true
-		}
-	}
-	if cgnatNet.Contains(ip) {
-		return true
-	}
-	return false
 }

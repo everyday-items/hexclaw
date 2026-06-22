@@ -6,12 +6,12 @@ package cron
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/util/hash"
 )
 
 // StateStore 持久化 per-job 跨运行键值状态。
@@ -103,8 +103,8 @@ func stateJobIDFrom(ctx context.Context) string {
 const lastOutputHashKey = "__last_output_hash__"
 
 func hashString(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:])
+	// 复用 toolkit/util/hash.SHA256：内部即 sha256.Sum256 + hex 编码，输出与原实现逐字节一致。
+	return hash.SHA256(s)
 }
 
 // outputUnchanged reports whether this run's deliverable content hashes equal to

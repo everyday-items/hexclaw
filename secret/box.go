@@ -13,16 +13,15 @@
 package secret
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	tkaes "github.com/hexagon-codes/toolkit/crypto/aes"
 )
 
 // encPrefix 是密文串的版本化前缀，用于区分已加密值与历史明文值。
@@ -37,9 +36,10 @@ const masterKeyFile = "master.key"
 // ErrNotEncrypted 表示传入 Open 的串不带 enc:v1: 前缀（即历史明文），调用方应原样处理。
 var ErrNotEncrypted = errors.New("secret: 值不是 enc:v1: 密文")
 
-// Box 持有一份 AES-256-GCM 的 AEAD，负责 Seal/Open。零值不可用，须经 NewBox/LoadBox 构造。
+// Box 持有 AES-256-GCM 主密钥，负责 Seal/Open。零值不可用，须经 NewBox/LoadBox 构造。
+// 内层 GCM 加解密委托 toolkit/crypto/aes（EncryptGCM/DecryptGCM，nonce 前置，逐字节兼容历史落盘格式）。
 type Box struct {
-	aead cipher.AEAD
+	key []byte
 }
 
 // NewBox 用给定的 32 字节主密钥构造 Box。密钥长度不符立即报错，避免静默降级。
@@ -47,15 +47,10 @@ func NewBox(key []byte) (*Box, error) {
 	if len(key) != masterKeyLen {
 		return nil, fmt.Errorf("secret: 主密钥长度必须为 %d 字节，实际 %d", masterKeyLen, len(key))
 	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, fmt.Errorf("secret: 构造 AES cipher 失败: %w", err)
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("secret: 构造 GCM 失败: %w", err)
-	}
-	return &Box{aead: aead}, nil
+	// 复制一份，避免调用方后续改动底层数组影响已构造的 Box。
+	k := make([]byte, masterKeyLen)
+	copy(k, key)
+	return &Box{key: k}, nil
 }
 
 // LoadBox 从 <dir>/master.key 加载主密钥；文件不存在时用 crypto/rand 生成并以 0600 落盘。
@@ -97,23 +92,24 @@ func LoadBox(dir string) (*Box, error) {
 }
 
 // Seal 用全新随机 nonce 加密 plaintext，返回 "enc:v1:base64(nonce‖ciphertext+tag)"。
+// 内层 GCM 委托 toolkit/crypto/aes.EncryptGCM：其 blob 布局为 nonce(12B)‖ciphertext+tag，
+// 与历史落盘格式逐字节一致。
 func (b *Box) Seal(plaintext []byte) (string, error) {
-	if b == nil || b.aead == nil {
+	if b == nil || len(b.key) == 0 {
 		return "", errors.New("secret: Box 未初始化")
 	}
-	nonce := make([]byte, b.aead.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", fmt.Errorf("secret: 生成 nonce 失败: %w", err)
+	blob, err := tkaes.EncryptGCM(plaintext, b.key)
+	if err != nil {
+		return "", fmt.Errorf("secret: GCM 加密失败: %w", err)
 	}
-	// Seal 把密文+认证 tag 追加在 nonce 之后，得到自包含的 blob。
-	blob := b.aead.Seal(nonce, nonce, plaintext, nil)
 	return encPrefix + base64.StdEncoding.EncodeToString(blob), nil
 }
 
 // Open 解密 Seal 产出的串。串不带 enc:v1: 前缀时返回 ErrNotEncrypted（历史明文）。
 // 密文被篡改或密钥不匹配时返回非 nil 错误（GCM 认证失败）。
+// 内层 GCM 委托 toolkit/crypto/aes.DecryptGCM：按 nonce(12B) 前置切片后 Open，与历史落盘格式一致。
 func (b *Box) Open(s string) ([]byte, error) {
-	if b == nil || b.aead == nil {
+	if b == nil || len(b.key) == 0 {
 		return nil, errors.New("secret: Box 未初始化")
 	}
 	if !IsEncrypted(s) {
@@ -123,14 +119,9 @@ func (b *Box) Open(s string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("secret: 密文 base64 解码失败: %w", err)
 	}
-	ns := b.aead.NonceSize()
-	if len(blob) < ns {
-		return nil, errors.New("secret: 密文长度不足以容纳 nonce")
-	}
-	nonce, ciphertext := blob[:ns], blob[ns:]
-	plaintext, err := b.aead.Open(nil, nonce, ciphertext, nil)
+	plaintext, err := tkaes.DecryptGCM(blob, b.key)
 	if err != nil {
-		// 认证失败：篡改或密钥不匹配。不回显密文内容。
+		// 认证失败/长度不足：篡改或密钥不匹配。不回显密文内容。
 		return nil, fmt.Errorf("secret: 解密失败（密文被篡改或密钥不匹配）: %w", err)
 	}
 	return plaintext, nil

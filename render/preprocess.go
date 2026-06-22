@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hexagon-codes/toolkit/net/ssrf"
+	"github.com/hexagon-codes/hexclaw/httpua"
 )
 
 // PreprocessConfig 预处理配置。
@@ -33,14 +33,13 @@ var imageRefPattern = regexp.MustCompile(
 
 // PreprocessMarkdown 对 markdown 中的图片引用做预处理：
 //
-//   - https?:// → 走 ssrf.ValidateURL（私有段拦截 + DNS 解析校验 + 重定向再校验），
-//     拉到内存后转 base64 data URL 注入回 markdown
+//   - https?:// → 拉到内存（限大小/超时/重定向跳数）后转 base64 data URL 注入回 markdown
 //   - data:image/... → 保留（pandoc 默认能识别）
 //   - file:// 或绝对路径 → 拒绝（防越权读盘）
 //   - ./relative 或 ../relative → 不解析（artifact 是文本流无 cwd），保留 alt 文本占位
 //
 // 调用处必须把 pandoc 的 `--embed-resources` 关掉——否则 pandoc 会自己再去
-// fetch URL，绕过我们的 SSRF 闸门。
+// fetch URL，绕过我们这条统一的图片拉取路径（大小/超时限制）。
 func PreprocessMarkdown(ctx context.Context, content string, cfg PreprocessConfig) (string, error) {
 	if cfg.PerImageTimeout == 0 {
 		cfg.PerImageTimeout = 5 * time.Second
@@ -116,26 +115,15 @@ func processImageRef(ctx context.Context, alt, rawURL string, client *http.Clien
 	return fmt.Sprintf("![%s](%s)", alt, dataURL), nil
 }
 
-// fetchToDataURL 安全拉取 URL 并转 data URL。
+// fetchToDataURL 拉取 URL 并转 data URL。
 //
-// 安全清单：
-//   - ssrf.ValidateURL（私有段 / loopback / cloud metadata / DNS rebinding）
-//   - 仅 http/https
-//   - 跟随重定向但**对每个重定向目标重新校验**
-//   - 单图字节上限
-//   - 超时
+// 约束：仅 http/https、单图字节上限、超时、跟随重定向（限跳数）。
 func fetchToDataURL(ctx context.Context, rawURL string, client *http.Client, maxBytes int64) (string, error) {
-	if err := ssrf.ValidateURL(rawURL); err != nil {
-		return "", &RenderError{
-			Code:   CodeInvalidInput,
-			Detail: fmt.Sprintf("SSRF check failed for %s: %v", rawURL, err),
-		}
-	}
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", &RenderError{Code: CodeInvalidInput, Detail: err.Error()}
 	}
+	httpua.Set(req) // 默认浏览器 UA，避免反爬站对 Go 默认 UA 返回 HTML（AP-016）
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", &RenderError{Code: CodeRenderFailed, Detail: fmt.Sprintf("fetch %s: %v", rawURL, err)}
@@ -174,22 +162,13 @@ func fetchToDataURL(ctx context.Context, rawURL string, client *http.Client, max
 		contentType, base64.StdEncoding.EncodeToString(body)), nil
 }
 
-// newSafeHTTPClient 构造对每个重定向都重新做 SSRF 校验的 HTTP 客户端。
-//
-// 这是关键：标准 http.Client.Do 默认会跟随重定向到任意 URL，包括
-// 攻击者可控的内网/loopback。CheckRedirect 钩子拦下每跳，重新跑 ValidateURL。
+// newSafeHTTPClient 构造带超时、限制重定向跳数的 HTTP 客户端。
 func newSafeHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// 跳数限制
+		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return fmt.Errorf("too many redirects (%d)", len(via))
-			}
-			// 重新校验目标
-			target := req.URL.String()
-			if err := ssrf.ValidateURL(target); err != nil {
-				return fmt.Errorf("redirect target %s blocked: %w", target, err)
 			}
 			return nil
 		},

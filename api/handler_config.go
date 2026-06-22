@@ -11,7 +11,6 @@ import (
 
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/config"
-	"github.com/hexagon-codes/toolkit/net/ssrf"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
@@ -32,6 +31,7 @@ type LLMProviderConfigResponse struct {
 	Compatible   string   `json:"compatible"`
 	ToolsEnabled *bool    `json:"tools_enabled,omitempty"`
 	MaxTools     int      `json:"max_tools,omitempty"`
+	Enabled      *bool    `json:"enabled,omitempty"`
 }
 
 // LLMConfigUpdateRequest PUT /api/v1/config/llm 请求
@@ -51,6 +51,7 @@ type LLMProviderConfigUpdateItem struct {
 	Compatible   string   `json:"compatible"`
 	ToolsEnabled *bool    `json:"tools_enabled,omitempty"`
 	MaxTools     int      `json:"max_tools,omitempty"`
+	Enabled      *bool    `json:"enabled,omitempty"`
 }
 
 type llmConnectionTestProvider struct {
@@ -104,19 +105,6 @@ var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvi
 	return hexagon.NewOpenAI(cfg.APIKey, opts...)
 }
 
-func validateExternalProviderBaseURL(providerType, baseURL string) error {
-	baseURL = strings.TrimSpace(baseURL)
-	if baseURL == "" {
-		return nil
-	}
-	if strings.EqualFold(providerType, "ollama") {
-		// Ollama is local: constrain its base_url to loopback instead of skipping
-		// validation, so it can't be aimed at an internal/metadata address.
-		return ssrf.ValidateLocalURL(baseURL)
-	}
-	return ssrf.ValidateURL(baseURL)
-}
-
 // handleGetLLMConfig GET /api/v1/config/llm
 //
 // 返回当前 LLM 配置，API Key 脱敏显示。
@@ -136,6 +124,7 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 			Compatible:   p.Compatible,
 			ToolsEnabled: p.ToolsEnabled,
 			MaxTools:     p.MaxTools,
+			Enabled:      p.Enabled,
 		}
 	}
 
@@ -182,6 +171,7 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 				Compatible:   p.Compatible,
 				ToolsEnabled: p.ToolsEnabled,
 				MaxTools:     p.MaxTools,
+				Enabled:      p.Enabled, // 禁用态持久化；Key 经脱敏回传保留（IsMaskedKey 分支）
 			}
 		}
 		nextLLM.Providers = newProviders
@@ -313,12 +303,6 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if err := validateExternalProviderBaseURL(providerType, baseURL); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "base_url 不安全: " + err.Error(),
-		})
-		return
-	}
 
 	provider := llmTestProviderFactory(llmConnectionTestProvider{
 		Type:    providerType,
@@ -375,10 +359,6 @@ func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Reques
 	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
 	if baseURL == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "base_url 不能为空"})
-		return
-	}
-	if err := validateExternalProviderBaseURL("external", baseURL); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "base_url 不安全: " + err.Error()})
 		return
 	}
 

@@ -109,15 +109,15 @@ type Reply struct {
 // 用于流式输出场景，引擎通过 channel 逐块发送回复。
 // Done=true 表示流式输出结束，此时 Usage 和 ToolCalls 字段可被填充。
 type ReplyChunk struct {
-	Content   string            // 当前片段的文本内容（增量）
-	Reasoning string            // 推理/思考过程（增量）
-	Done      bool              // 是否为最后一个片段
-	Error     error             // 出错时的错误信息
-	Metadata  map[string]string // 附加元数据（仅在 Done=true 时填充）
-	Usage     *Usage            // Token 使用统计（仅在 Done=true 时填充）
-	ToolCalls []ToolCall        // 工具调用记录（仅在 Done=true 时填充）
+	Content   string            `json:"content"`              // 当前片段的文本内容（增量）
+	Reasoning string            `json:"reasoning,omitempty"`  // 推理/思考过程（增量）
+	Done      bool              `json:"done"`                 // 是否为最后一个片段
+	Error     error             `json:"error,omitempty"`      // 出错时的错误信息
+	Metadata  map[string]string `json:"metadata,omitempty"`   // 附加元数据（仅在 Done=true 时填充）
+	Usage     *Usage            `json:"usage,omitempty"`      // Token 使用统计（仅在 Done=true 时填充）
+	ToolCalls []ToolCall        `json:"tool_calls,omitempty"` // 工具调用记录（仅在 Done=true 时填充）
 	// Interactive 结构化交互载荷（仅在 Done=true 时填充；与 Reply.Interactive 同语义）。
-	Interactive *InteractivePayload
+	Interactive *InteractivePayload `json:"interactive,omitempty"`
 }
 
 // MessageHandler 消息处理回调（同步模式）

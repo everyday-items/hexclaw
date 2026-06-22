@@ -50,7 +50,7 @@ func evaluateDBHealth(dbPath string) (status DBHealthStatus, size int64, journal
 //   - 大小 > refuse   → 直接退出，避免"进程在跑但永远不监听"的僵死状态
 //
 // 设计原则：fail-fast 优于静默悬挂。真实用户问题"启动不起来"要比"强制 exit" 好诊断。
-func checkDBHealth(dbPath string) {
+func checkDBHealth(dbPath string, desktopMode bool) {
 	dbPath = expandHome(dbPath)
 	status, size, journalExists := evaluateDBHealth(dbPath)
 
@@ -60,10 +60,15 @@ func checkDBHealth(dbPath string) {
 
 	switch status {
 	case DBHealthRefuse:
-		fmt.Fprintf(os.Stderr, "  ✗ DB 体积 %.0f MB 超过上限 %.0f MB，拒绝启动以防卡死。\n",
+		fmt.Fprintf(os.Stderr, "  ✗ DB 体积 %.0f MB 超过上限 %.0f MB。\n",
 			float64(size)/1024/1024, float64(dbRefuseSize)/1024/1024)
 		fmt.Fprintf(os.Stderr, "    清理建议（退出 HexClaw 后执行）：\n      "+vacuumHintCmd+"\n", dbPath)
-		os.Exit(2)
+		// 桌面端=用户自有数据：拒启会让用户直接打不开 app，故只强警告、仍尝试启动；
+		// 服务端保持 fail-fast，避免"进程在跑但永不监听"的僵死。
+		if !desktopMode {
+			os.Exit(2)
+		}
+		fmt.Fprintln(os.Stderr, "    ⚠ 桌面模式：不阻止启动（启动可能较慢，强烈建议尽快清理）。")
 	case DBHealthWarn:
 		fmt.Fprintf(os.Stderr, "  ⚠ DB 体积 %.0f MB，超出推荐范围。建议执行 VACUUM（退出后）：\n      "+vacuumHintCmd+"\n",
 			float64(size)/1024/1024, dbPath)

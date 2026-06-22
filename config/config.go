@@ -277,6 +277,7 @@ type LLMProviderConfig struct {
 	Compatible   string   `yaml:"compatible"`              // 兼容协议: "openai"（用于中转/私有部署）
 	ToolsEnabled *bool    `yaml:"tools_enabled,omitempty"` // 是否启用工具注入（nil=自动判断, true=强制开启, false=强制关闭）
 	MaxTools     int      `yaml:"max_tools,omitempty"`     // 最大注入工具数（0=不限制）
+	Enabled      *bool    `yaml:"enabled,omitempty"`       // 是否启用（nil/true=启用, false=禁用但保留配置/Key，不参与路由）
 }
 
 // LLMRoutingConfig 智能路由配置

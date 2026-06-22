@@ -104,6 +104,39 @@ func (e *ReActEngine) selectLLMForMemory(ctx context.Context) (hexagon.Provider,
 	return provider, name, nil
 }
 
+// CompleteOnce 用当前路由 LLM 跑一次**无状态** completion（不写对话历史/不触发记忆副作用），
+// 供 Skill 生成等一次性场景复用。失败时接 router.Fallback 尝试备用 Provider（与 auto-memory 同策略）。
+func (e *ReActEngine) CompleteOnce(ctx context.Context, systemPrompt, userPrompt string, maxTokens int) (string, error) {
+	provider, providerName, err := e.selectLLMForMemory(ctx)
+	if err != nil {
+		return "", err
+	}
+	log := trace.L(ctx)
+	var temp float64 = 0.3
+	fc := &LLMCallContext{
+		Provider:     provider,
+		ProviderName: providerName,
+		Fallback: func(exclude ...string) (hexagon.Provider, string, error) {
+			return e.router.Fallback(exclude...)
+		},
+		Logger: func(msg string, fields ...any) { log.Warn(msg, fields...) },
+	}
+	messages := make([]hexagon.Message, 0, 2)
+	if systemPrompt != "" {
+		messages = append(messages, hexagon.Message{Role: "system", Content: systemPrompt})
+	}
+	messages = append(messages, hexagon.Message{Role: "user", Content: userPrompt})
+	resp, err := CompleteWithFailover(ctx, fc, hexagon.CompletionRequest{
+		Messages:    messages,
+		MaxTokens:   maxTokens,
+		Temperature: &temp,
+	})
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(resp.Content), nil
+}
+
 const memoryExtractionSystemPrompt = `你是一个记忆提取器。从对话中提取值得长期记住的用户信息。
 
 提取什么：

@@ -255,6 +255,19 @@ const (
 	truncationSuffix        = "\n\n…[truncated by hexclaw to protect DB size]"
 )
 
+// previewByteLimit 按字节上限截断会话预览，回退到 UTF-8 边界避免切碎 CJK 字符
+// （bug 2026-06-22：原 `preview[:200]` 在 3 字节字符中间硬切产生 `�`）。
+func previewByteLimit(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && (s[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return s[:cut]
+}
+
 // truncateLarge 按字节限制截断（UTF-8 安全：切到 valid boundary）
 func truncateLarge(s string, limit int) string {
 	if len(s) <= limit {
@@ -536,10 +549,7 @@ func (s *Store) saveMessageTx(ctx context.Context, msg *storage.MessageRecord) e
 	}
 
 	// 原子更新会话冗余字段：message_count, token 汇总, last_message_preview, updated_at
-	preview := msg.Content
-	if len(preview) > 200 {
-		preview = preview[:200]
-	}
+	preview := previewByteLimit(msg.Content, 200)
 	_, err = tx.ExecContext(ctx,
 		`UPDATE sessions SET
 			updated_at = ?,

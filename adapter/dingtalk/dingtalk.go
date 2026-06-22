@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hexagon-codes/toolkit/util/logger"
+	"github.com/hexagon-codes/toolkit/util/retry"
 	"io"
 	"net/http"
 	"strings"
@@ -105,20 +106,32 @@ func (a *DingtalkAdapter) Handler() http.Handler {
 
 // connectLoop 自动重连循环
 func (a *DingtalkAdapter) connectLoop() {
-	backoff := time.Second
-	const maxBackoff = 30 * time.Second
-
+	attempt := 1
 	for !a.stopped.Load() {
 		if err := a.connectAndListen(); err != nil {
 			if !a.stopped.Load() {
+				backoff := reconnectBackoff(attempt)
 				logger.Info("钉钉 Stream 断开", "error", err, "backoff", backoff)
 				time.Sleep(backoff)
-				backoff = min(backoff*2, maxBackoff)
+				attempt++
 			}
 		} else {
-			backoff = time.Second
+			attempt = 1
 		}
 	}
+}
+
+// reconnectBackoff 计算第 attempt 次重连前的退避时长。
+//
+// 复用 toolkit/util/retry 指数退避，退避序列与原手写实现（backoff*2 封顶 30s）
+// 逐项一致：attempt 从 1 起步 → 1s, 2s, 4s, 8s, 16s, 30s, 30s…
+// （ExponentialBackoff 的 multiplier 为 2^(attempt-1)，故 attempt=1 时为 1s。）
+func reconnectBackoff(attempt int) time.Duration {
+	cfg := retry.DefaultConfig()
+	cfg.Delay = time.Second
+	cfg.MaxDelay = 30 * time.Second
+	cfg.Multiplier = 2
+	return retry.ExponentialBackoff(attempt, cfg)
 }
 
 // connectAndListen 建立 Stream 连接并监听

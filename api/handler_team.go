@@ -171,6 +171,24 @@ func (s *Server) handleListSharedAgents(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"agents": agents, "total": len(agents)})
 }
 
+// validSharedAgentVisibility / validTeamMemberRole 与前端 union 对齐（team.ts）。
+// 校验在落库前拦截非法枚举，避免污染前端 TS union 类型。
+func validSharedAgentVisibility(v string) bool {
+	switch v {
+	case "public", "team", "private":
+		return true
+	}
+	return false
+}
+
+func validTeamMemberRole(r string) bool {
+	switch r {
+	case "admin", "member", "viewer":
+		return true
+	}
+	return false
+}
+
 func (s *Server) handleShareAgent(w http.ResponseWriter, r *http.Request) {
 	var agent SharedAgent
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&agent); err != nil {
@@ -179,6 +197,13 @@ func (s *Server) handleShareAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if agent.Name == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name 不能为空"})
+		return
+	}
+	if agent.Visibility == "" {
+		agent.Visibility = "private" // 默认私有
+	}
+	if !validSharedAgentVisibility(agent.Visibility) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "visibility 非法（须为 public/team/private）"})
 		return
 	}
 	created := s.teamStore.AddAgent(agent)
@@ -212,6 +237,13 @@ func (s *Server) handleInviteTeamMember(w http.ResponseWriter, r *http.Request) 
 	if m.Name == "" {
 		parts := splitEmail(m.Email)
 		m.Name = parts
+	}
+	if m.Role == "" {
+		m.Role = "member" // 默认成员
+	}
+	if !validTeamMemberRole(m.Role) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "role 非法（须为 admin/member/viewer）"})
+		return
 	}
 	created := s.teamStore.AddMember(m)
 	writeJSON(w, http.StatusOK, created)

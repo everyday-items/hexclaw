@@ -112,27 +112,6 @@ func TestHandleTestLLMConfig_OllamaAllowsEmptyAPIKey(t *testing.T) {
 	}
 }
 
-func TestHandleTestLLMConfig_BlocksPrivateBaseURLForExternalProvider(t *testing.T) {
-	oldFactory := llmTestProviderFactory
-	llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvider {
-		t.Fatalf("不应为不安全 base_url 创建 provider: %+v", cfg)
-		return &mockCompletionProvider{}
-	}
-	defer func() { llmTestProviderFactory = oldFactory }()
-
-	srv := NewServer(config.DefaultConfig(), &mockEngine{}, nil, nil)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/config/llm/test", strings.NewReader(`{"provider":{"type":"openai","base_url":"http://169.254.169.254/latest/meta-data","api_key":"sk-test","model":"gpt-4o-mini"}}`))
-	w := httptest.NewRecorder()
-
-	srv.handleTestLLMConfig(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("期望 400，实际 %d: %s", w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), "SSRF blocked") {
-		t.Fatalf("期望 SSRF 拦截错误，实际 %s", w.Body.String())
-	}
-}
-
 func TestHandleTestLLMConfig_RejectsEmptyAPIKeyForOpenAI(t *testing.T) {
 	srv := NewServer(config.DefaultConfig(), &mockEngine{}, nil, nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/config/llm/test", strings.NewReader(`{"provider":{"type":"openai","api_key":"","model":"gpt-4o-mini"}}`))

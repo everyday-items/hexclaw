@@ -63,6 +63,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/render"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
+	"github.com/hexagon-codes/hexclaw/security"
 	"github.com/hexagon-codes/hexclaw/secret"
 	"github.com/hexagon-codes/hexclaw/session"
 	"github.com/hexagon-codes/hexclaw/skill"
@@ -210,6 +211,16 @@ func applyDesktopOverrides(cfg *config.Config) {
 	cfg.Cron.Enabled = true
 	cfg.Canvas.Enabled = true
 	cfg.Webhook.Enabled = true
+
+	// 桌面端=单用户自有机器：网关的多租户/合规类闸门全部放开（与宿主机语义一致），
+	// 避免误杀/节流/掐预算影响功能。服务端（desktopMode=false）保持原配置不动。
+	cfg.Security.RateLimit.RequestsPerMinute = 1_000_000 // 实质不限（pipeline 会把 0 强制回 60，故设极大值）
+	cfg.Security.RateLimit.RequestsPerHour = 1_000_000
+	cfg.Security.Cost.BudgetPerUser = 0             // 0 → 不挂成本预检层
+	cfg.Security.Cost.BudgetGlobal = 0              // 0 → 不挂成本预检层
+	cfg.Security.InjectionDetection.Enabled = false // 网关注入检测层
+	cfg.Security.PIIRedaction.Enabled = false       // 不抹用户自己的手机号/邮箱
+	cfg.Security.ContentFilter.Enabled = false      // 不按 harmful/illegal 拦内容
 }
 
 func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, desktopMode bool) error {
@@ -234,6 +245,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	if desktopMode {
 		applyDesktopOverrides(cfg)
+		security.SetDesktopMode(true) // 放行引擎/cron 的内容注入扫描（见 security/desktop_mode.go）
 	}
 
 	// 命令行参数覆盖配置文件（向 slice 首元素写入，无则创建）
@@ -273,7 +285,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	fmt.Println("  ──────────────────────────────────────────────")
 
 	// 2. 初始化存储（含健康检查）
-	checkDBHealth(cfg.Storage.SQLite.Path)
+	checkDBHealth(cfg.Storage.SQLite.Path, desktopMode)
 	store, err := sqlitestore.New(cfg.Storage.SQLite.Path)
 	if err != nil {
 		return fmt.Errorf("初始化存储失败: %w", err)
@@ -477,20 +489,24 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	fmt.Printf("  ✓ Tools       %d 个工具 (Skill + MCP)\n", len(toolCollector.Collect()))
 
 	// 6.2 接入预算控制器 (G1: 三维预算 - token/duration/cost)
-	budgetDuration := 30 * time.Minute
-	if cfg.Budget.MaxDuration != "" {
-		if d, err := time.ParseDuration(cfg.Budget.MaxDuration); err == nil {
-			budgetDuration = d
+	// 桌面端=单用户自有机器，不挂预算闸（agent 长任务/大 token 不被掐）；服务端照常。
+	var budgetCtrl *engine.BudgetController
+	if !desktopMode {
+		budgetDuration := 30 * time.Minute
+		if cfg.Budget.MaxDuration != "" {
+			if d, err := time.ParseDuration(cfg.Budget.MaxDuration); err == nil {
+				budgetDuration = d
+			}
 		}
+		budgetCtrl = engine.NewBudgetController(engine.BudgetConfig{
+			MaxTokens:   cfg.Budget.MaxTokens,
+			MaxDuration: budgetDuration,
+			MaxCost:     cfg.Budget.MaxCost,
+		})
+		eng.SetBudget(budgetCtrl)
+		fmt.Printf("  ✓ Budget      max_tokens=%d, max_duration=%v, max_cost=$%.2f\n",
+			cfg.Budget.MaxTokens, budgetDuration, cfg.Budget.MaxCost)
 	}
-	budgetCtrl := engine.NewBudgetController(engine.BudgetConfig{
-		MaxTokens:   cfg.Budget.MaxTokens,
-		MaxDuration: budgetDuration,
-		MaxCost:     cfg.Budget.MaxCost,
-	})
-	eng.SetBudget(budgetCtrl)
-	fmt.Printf("  ✓ Budget      max_tokens=%d, max_duration=%v, max_cost=$%.2f\n",
-		cfg.Budget.MaxTokens, budgetDuration, cfg.Budget.MaxCost)
 
 	// 6.5 初始化知识库（向量搜索 + FTS5 混合检索）
 	//
@@ -710,8 +726,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 	// Note: "已就绪" 日志迁移到 onReady 回调，仅在 HTTP 端口真实 bind 成功后才打印。
 
-	// 挂载预算控制器 API
-	srv.SetBudgetController(budgetCtrl)
+	// 挂载预算控制器 API（桌面端无预算闸时跳过）
+	if budgetCtrl != nil {
+		srv.SetBudgetController(budgetCtrl)
+	}
 
 	// 挂载知识库 API
 	if eng.KnowledgeBase() != nil {

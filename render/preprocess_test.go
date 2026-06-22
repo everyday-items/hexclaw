@@ -93,24 +93,22 @@ func TestPreprocessMarkdown_RemoteImageInlined(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// 注意：security.ValidateURL 会拦截 127.0.0.1（loopback），所以这个测试
-	// 实际会被拒绝。这正是预期的——验证 SSRF 闸门工作。
+	// SSRF 闸门已移除：远程图片（含 loopback 测试服务器）正常拉取并内联为 data URL。
 	in := "![pic](" + srv.URL + ")"
-	_, err := PreprocessMarkdown(context.Background(), in, PreprocessConfig{})
-	if err == nil {
-		t.Errorf("loopback URL should be blocked by SSRF guard")
+	out, err := PreprocessMarkdown(context.Background(), in, PreprocessConfig{
+		PerImageTimeout: time.Second,
+		MaxImageBytes:   1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("远程图片应被正常内联: %v", err)
 	}
-	re, ok := err.(*RenderError)
-	if !ok {
-		t.Fatalf("expected *RenderError, got %T: %v", err, err)
-	}
-	if !strings.Contains(re.Detail, "SSRF") && !strings.Contains(re.Detail, "private") {
-		t.Errorf("error not from SSRF guard: %v", re)
+	if !strings.Contains(out, "data:image/png;base64,") {
+		t.Errorf("图片未内联为 data URL: %s", out)
 	}
 }
 
 func TestPreprocessMarkdown_OversizedImageRejected(t *testing.T) {
-	// 这个测试也会被 SSRF 拦截（127.0.0.1），所以验证拒绝即可
+	// 响应体超过 MaxImageBytes，应被 CodeInputTooLarge 拒绝。
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		// 写超过 cfg.MaxImageBytes 的内容
@@ -128,7 +126,7 @@ func TestPreprocessMarkdown_OversizedImageRejected(t *testing.T) {
 		MaxImageBytes:   50, // 小于响应体
 	})
 	if err == nil {
-		t.Error("expected error (loopback or too large)")
+		t.Error("expected error (image too large)")
 	}
 }
 

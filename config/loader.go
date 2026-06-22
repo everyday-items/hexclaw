@@ -142,9 +142,15 @@ func MaskAPIKey(key string) string {
 	return "****"
 }
 
-// IsMaskedKey 检查是否为脱敏后的 Key（以 **** 开头）
+// IsMaskedKey 检查是否为脱敏后的 Key。
+// 精确匹配 MaskAPIKey 的输出形态：恰好 "****"(len4) 或 "****"+末4位(len8)。
+// 不能只看 "****" 前缀——真实 Key 若恰以 **** 开头且更长，会被误判为脱敏占位值，
+// 合并配置时被当「未修改」丢弃，导致真实 Key 丢失（bug 2026-06-22）。
 func IsMaskedKey(key string) bool {
-	return strings.HasPrefix(key, "****")
+	if !strings.HasPrefix(key, "****") {
+		return false
+	}
+	return len(key) == 4 || len(key) == 8
 }
 
 // expandEnvVars 展开字符串中的 ${VAR_NAME} 为环境变量值

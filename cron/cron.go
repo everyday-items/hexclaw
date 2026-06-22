@@ -1021,7 +1021,7 @@ type JobHistory struct {
 }
 
 // GetJobHistory 获取任务执行历史（最近 50 条，从新到旧）
-func (s *Scheduler) GetJobHistory(ctx context.Context, jobID string) ([]JobHistory, error) {
+func (s *Scheduler) GetJobHistory(ctx context.Context, jobID string, limit ...int) ([]JobHistory, error) {
 	s.mu.RLock()
 	_, ok := s.jobs[jobID]
 	s.mu.RUnlock()
@@ -1029,10 +1029,15 @@ func (s *Scheduler) GetJobHistory(ctx context.Context, jobID string) ([]JobHisto
 		return nil, fmt.Errorf("任务 %q 不存在", jobID)
 	}
 
+	// limit 可选：缺省 50，传入 >0 时生效并夹到 [1,200]（bug 2026-06-22：前端 ?limit 此前被忽略）。
+	n := 50
+	if len(limit) > 0 && limit[0] > 0 {
+		n = min(limit[0], 200)
+	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, job_id, status, COALESCE(result,''), error, duration_ms, run_at,
 		        COALESCE(stdout,''), COALESCE(stderr,''), COALESCE(exit_code,0), COALESCE(data_json,'')
-		 FROM cron_job_runs WHERE job_id = ? ORDER BY run_at DESC LIMIT 50`, jobID)
+		 FROM cron_job_runs WHERE job_id = ? ORDER BY run_at DESC LIMIT ?`, jobID, n)
 	if err != nil {
 		return nil, fmt.Errorf("查询执行历史失败: %w", err)
 	}

@@ -126,6 +126,69 @@ func TestHubInstallAndUninstall(t *testing.T) {
 	}
 }
 
+func TestHubContent(t *testing.T) {
+	skillContent := "---\nname: test-skill\n---\n# Test Skill"
+	dir := t.TempDir()
+	h := New(HubConfig{RepoURL: "https://clawhub.test/repo", Branch: "main"}, dir)
+	h.client = httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(skillContent))
+	}))
+	h.catalog = &Catalog{
+		Skills: []SkillMeta{
+			{Name: "test-skill", URL: "https://clawhub.test/repo/skills/test-skill.md"},
+		},
+	}
+
+	content, err := h.Content(context.Background(), "test-skill")
+	if err != nil {
+		t.Fatalf("Content 失败: %v", err)
+	}
+	if string(content) != skillContent {
+		t.Errorf("内容不匹配:\n期望=%q\n得到=%q", skillContent, string(content))
+	}
+
+	// 预览语义：绝不落盘——skillsDir 必须为空
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("Content 不应写盘，但 skillsDir 出现 %d 个文件", len(entries))
+	}
+
+	// 未知技能应报错
+	if _, err := h.Content(context.Background(), "ghost"); err == nil {
+		t.Error("未知技能 Content 应报错")
+	}
+}
+
+// TestHubContentMatchesInstall 差分不变量：预览（Content）拿到的字节必须与安装
+// （Install 写盘）的字节逐字节一致——两者复用同一取数路径，预览所见即安装所得。
+func TestHubContentMatchesInstall(t *testing.T) {
+	skillContent := "---\nname: diff-skill\ndescription: d\n---\n# Diff\n\nbody\n"
+	dir := t.TempDir()
+	h := New(HubConfig{RepoURL: "https://clawhub.test/repo", Branch: "main"}, dir)
+	h.client = httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(skillContent))
+	}))
+	h.catalog = &Catalog{
+		Skills: []SkillMeta{
+			{Name: "diff-skill", URL: "https://clawhub.test/repo/skills/diff-skill.md"},
+		},
+	}
+
+	previewed, err := h.Content(context.Background(), "diff-skill")
+	if err != nil {
+		t.Fatalf("Content 失败: %v", err)
+	}
+	if err := h.Install(context.Background(), "diff-skill"); err != nil {
+		t.Fatalf("Install 失败: %v", err)
+	}
+	installed, err := os.ReadFile(filepath.Join(dir, "diff-skill.md"))
+	if err != nil {
+		t.Fatalf("读取安装文件失败: %v", err)
+	}
+	if string(previewed) != string(installed) {
+		t.Fatalf("预览与安装字节不一致:\n预览=%q\n安装=%q", string(previewed), string(installed))
+	}
+}
+
 func TestHubInstallNotFound(t *testing.T) {
 	h := New(HubConfig{}, t.TempDir())
 	h.catalog = &Catalog{Skills: []SkillMeta{}}

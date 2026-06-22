@@ -7,15 +7,13 @@ import (
 	"html"
 	"io"
 	"math"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
-	"syscall"
 	"time"
 
-	"github.com/hexagon-codes/toolkit/net/ip"
+	"github.com/hexagon-codes/hexclaw/httpua"
 	"github.com/hexagon-codes/toolkit/util/hash"
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
@@ -56,7 +54,7 @@ const starlarkMaxSteps = 100_000_000
 // NewStarlarkEngine builds the default pure-Go script engine.
 func NewStarlarkEngine() *StarlarkEngine {
 	return &StarlarkEngine{
-		client:     ssrfGuardedClient(30 * time.Second),
+		client:     &http.Client{Timeout: 30 * time.Second},
 		maxBody:    starlarkMaxBody,
 		stdoutTail: 64 * 1024,
 	}
@@ -281,6 +279,8 @@ func (e *StarlarkEngine) builtinHTTP(ctx context.Context, method string) func(*s
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", b.Name(), err)
 		}
+		// 默认浏览器 User-Agent，避免站点对 Go 默认 UA 返回反爬 HTML（脚本可经 headers 覆盖）。
+		httpua.Set(req)
 		if d, ok := headers.(*starlark.Dict); ok {
 			for _, item := range d.Items() {
 				k, _ := starlark.AsString(item[0])
@@ -533,66 +533,3 @@ func starlarkToGo(v starlark.Value) any {
 		return v.String()
 	}
 }
-
-// ssrfGuardedClient builds an HTTP client that refuses to connect to loopback,
-// private, link-local (incl. cloud metadata 169.254.169.254), or unspecified
-// addresses. Loopback is blocked too: a script's only localhost use was posting
-// to the app's own knowledge-base API, which now goes through the in-process
-// kb_ingest builtin instead. The check runs in the dialer Control hook on the
-// resolved IP about to be dialed, so it also defeats DNS-rebinding.
-func ssrfGuardedClient(timeout time.Duration) *http.Client {
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	dialer.Control = func(_, address string, _ syscall.RawConn) error {
-		host, _, err := net.SplitHostPort(address)
-		if err != nil {
-			return err
-		}
-		if ip := net.ParseIP(host); ip != nil && isBlockedIP(ip) {
-			return fmt.Errorf("blocked address %s (private/link-local not allowed)", ip)
-		}
-		return nil
-	}
-	return &http.Client{
-		Timeout:   timeout,
-		Transport: &http.Transport{DialContext: dialer.DialContext},
-	}
-}
-
-// isBlockedIP reports whether an IP is in a range a sandboxed script must not
-// reach: loopback, private, link-local, or unspecified. Only public addresses
-// are allowed. Loopback is blocked so a script cannot reach the app's own
-// localhost services (KB ingest goes through the in-process kb_ingest builtin);
-// private/link-local covers internal services and cloud metadata。
-//
-// 判定逻辑下沉到 toolkit/net/ip.IsPrivateOrReservedIP，二者拦截集合完全一致：
-// IsLoopback || IsPrivate || IsLinkLocalUnicast || IsLinkLocalMulticast ||
-// IsUnspecified（含云元数据端点 169.254.169.254），SSRF 防御语义不变。
-func isBlockedIP(addr net.IP) bool {
-	if ip.IsPrivateOrReservedIP(addr) {
-		return true
-	}
-	// 纵深防御：toolkit 的判定基于 stdlib 谓词，漏掉若干 IANA 特殊用途段——
-	// 最关键的是 RFC6598 CGNAT 100.64.0.0/10（运营商/云内网常用）。这里补齐，
-	// 维持「只允许公网地址」的不变量（BUG-F4，review 2026-06-21）。
-	for _, n := range extraReservedCIDRs {
-		if n.Contains(addr) {
-			return true
-		}
-	}
-	return false
-}
-
-// extraReservedCIDRs 是 toolkit ip.IsPrivateOrReservedIP 漏判的 IANA 特殊用途段。
-var extraReservedCIDRs = func() []*net.IPNet {
-	out := make([]*net.IPNet, 0, 3)
-	for _, c := range []string{
-		"100.64.0.0/10", // RFC6598 CGNAT
-		"192.0.0.0/24",  // RFC6890 IETF protocol assignments
-		"198.18.0.0/15", // RFC2544 benchmarking
-	} {
-		if _, n, err := net.ParseCIDR(c); err == nil {
-			out = append(out, n)
-		}
-	}
-	return out
-}()

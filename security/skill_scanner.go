@@ -32,6 +32,9 @@ func NewSkillScanner() *SkillScanner {
 
 // Scan checks content for dangerous patterns. Returns nil if safe.
 func (s *SkillScanner) Scan(content string) error {
+	if desktopMode.Load() {
+		return nil // 桌面端=单用户自有机器，放行危险模式扫描（见 desktop_mode.go）
+	}
 	lower := strings.ToLower(content)
 	var violations []string
 

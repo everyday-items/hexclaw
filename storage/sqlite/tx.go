@@ -126,10 +126,7 @@ func (s *txStore) SaveMessage(ctx context.Context, msg *storage.MessageRecord) e
 		return err
 	}
 
-	preview := msg.Content
-	if len(preview) > 200 {
-		preview = preview[:200]
-	}
+	preview := previewByteLimit(msg.Content, 200)
 	_, err = s.tx.ExecContext(ctx,
 		`UPDATE sessions SET
 			updated_at = ?,

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,7 +45,14 @@ func (s *Server) handleCronJobHistory(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "定时任务未启用"})
 		return
 	}
-	history, err := s.scheduler.GetJobHistory(r.Context(), r.PathValue("id"))
+	// 透传前端 ?limit（bug 2026-06-22：此前被忽略，固定返回 50 条）
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if parsed, perr := strconv.Atoi(v); perr == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	history, err := s.scheduler.GetJobHistory(r.Context(), r.PathValue("id"), limit)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return

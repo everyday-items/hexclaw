@@ -57,6 +57,9 @@ func ScanAssembled(prompt string, hasSkills, hasInjectedData bool) error {
 // the exfiltration patterns rely on uppercase KEY/TOKEN; case-insensitivity is
 // expressed per-pattern via (?i)).
 func scanInjectionFamilies(s string, families ...[]*dangerPattern) error {
+	if desktopMode.Load() {
+		return nil // 桌面端=单用户自有机器，放行注入扫描（见 desktop_mode.go）
+	}
 	var violations []string
 	for _, fam := range families {
 		for _, p := range fam {

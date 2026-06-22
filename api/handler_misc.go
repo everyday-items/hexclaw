@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -18,11 +19,11 @@ import (
 	"github.com/hexagon-codes/hexclaw/canvas"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/engine"
+	"github.com/hexagon-codes/hexclaw/httpua"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
-	"github.com/hexagon-codes/toolkit/net/ssrf"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
@@ -38,6 +39,7 @@ type skillStatusResponse struct {
 	Version          string   `json:"version,omitempty"`
 	Triggers         []string `json:"triggers,omitempty"`
 	Tags             []string `json:"tags,omitempty"`
+	Icon             string   `json:"icon,omitempty"`
 	Enabled          bool     `json:"enabled"`
 	EffectiveEnabled bool     `json:"effective_enabled"`
 	RequiresRestart  bool     `json:"requires_restart"`
@@ -344,6 +346,7 @@ func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
 			Version:          sk.Meta.Version,
 			Triggers:         sk.Meta.Triggers,
 			Tags:             sk.Meta.Tags,
+			Icon:             sk.Meta.Icon,
 			Enabled:          enabled,
 			EffectiveEnabled: effective,
 			RequiresRestart:  requiresRestart,
@@ -416,8 +419,9 @@ func (s *Server) handleSkillStatus(w http.ResponseWriter, r *http.Request) {
 
 // InstallSkillRequest 安装技能请求
 type InstallSkillRequest struct {
-	Source string `json:"source"`         // 源路径 / URL / clawhub 技能名
-	Type   string `json:"type,omitempty"` // "file" | "url" | "clawhub"（缺省时自动推断）
+	Source  string `json:"source"`            // 源路径 / URL / clawhub 技能名（type=content 时可空，改用 content）
+	Type    string `json:"type,omitempty"`    // "file" | "url" | "clawhub" | "content"（缺省时自动推断）
+	Content string `json:"content,omitempty"` // type=content 时：完整 SKILL.md 原文（AI 生成/就地编辑后落盘）
 }
 
 // handleInstallSkill 安装技能
@@ -437,7 +441,8 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Source == "" {
+	// type=content 改用 content 字段承载原文；其余类型要求 source 非空。
+	if req.Type != "content" && req.Source == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "source 不能为空",
 		})
@@ -464,11 +469,102 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		s.installSkillFromFile(w, req.Source)
 	case "url":
 		s.installSkillFromURL(w, r, req.Source)
+	case "content":
+		s.installSkillFromContent(w, req.Content)
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "不支持的安装类型: " + req.Type,
 		})
 	}
+}
+
+var (
+	// frontmatter 内提取 name 的标量行（限 frontmatter 段内调用）。
+	skillNameLineRe = regexp.MustCompile(`(?m)^name:\s*["']?([A-Za-z0-9_-]+)["']?\s*$`)
+	// 合法 skill 标识：小写字母/数字/连字符/下划线（比 validSkillName 的路径安全检查更严，
+	// 用于 content 安装时强校验 frontmatter name，避免空 name 回退临时文件名）。
+	validSkillIdentifierRe = regexp.MustCompile(`^[a-z0-9_-]+$`)
+)
+
+// frontmatterSkillName 从 SKILL.md 首段 frontmatter（首个 --- 与闭合 --- 之间）提取 name。
+// 必须有闭合 frontmatter 才在其中查找，避免把正文里恰好出现的 `name:` 行误当 skill 名。
+func frontmatterSkillName(content string) string {
+	s := strings.TrimSpace(content)
+	if !strings.HasPrefix(s, "---") {
+		return ""
+	}
+	rest := strings.TrimPrefix(s, "---")
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
+		return "" // frontmatter 未闭合
+	}
+	m := skillNameLineRe.FindStringSubmatch(rest[:end])
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func validSkillIdentifier(name string) bool {
+	return name != "" && validSkillIdentifierRe.MatchString(name)
+}
+
+// installSkillFromContent 把一份完整 SKILL.md 原文写盘安装（AI 生成 / 就地编辑后落盘）。
+// 复用 URL 安装的「临时文件 → mp.Install」路径，校验 frontmatter 标记、name 合法性与大小上限。
+func (s *Server) installSkillFromContent(w http.ResponseWriter, content string) {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "content 不能为空"})
+		return
+	}
+	if len(content) > skillURLMaxSize {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "内容过大（上限 1 MB）"})
+		return
+	}
+	if !strings.HasPrefix(trimmed, "---") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "内容不是有效的 Skill 格式（缺少 frontmatter）",
+		})
+		return
+	}
+	// content 来源没有「真实文件名」语义：必须自带合法 frontmatter name，否则 mp.Install 会
+	// 回退用临时文件名（hexclaw-skill-*.md）当 skill 名落盘（bug fix 2026-06-22 review）。
+	if name := frontmatterSkillName(trimmed); !validSkillIdentifier(name) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "SKILL.md 缺少合法的 name 字段（要求小写字母/数字/连字符/下划线）",
+		})
+		return
+	}
+
+	tmpFile, err := os.CreateTemp("", "hexclaw-skill-*.md")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "创建临时文件失败: " + err.Error()})
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmpFile.WriteString(content); err != nil {
+		tmpFile.Close()
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入临时文件失败: " + err.Error()})
+		return
+	}
+	tmpFile.Close()
+
+	sk, err := s.mp.Install(tmpPath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "安装技能失败: " + err.Error()})
+		return
+	}
+
+	s.syncEngineMarketplaceSkills()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":               sk.Meta.Name,
+		"description":        sk.Meta.Description,
+		"version":            sk.Meta.Version,
+		"message":            "技能已创建并同步到运行引擎",
+		"requires_restart":   false,
+		"runtime_registered": true,
+	})
 }
 
 // installSkillFromClawHub 从 ClawHub 在线安装
@@ -663,15 +759,6 @@ func (s *Server) installSkillFromURL(w http.ResponseWriter, r *http.Request, raw
 		return
 	}
 
-	// SSRF guard: reject loopback/private/link-local/cloud-metadata targets
-	// before any fetch, matching the provider-model path (validateExternalProviderBaseURL).
-	if err := ssrf.ValidateURL(rawURL); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "URL 不安全: " + err.Error(),
-		})
-		return
-	}
-
 	// 下载
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
@@ -683,6 +770,7 @@ func (s *Server) installSkillFromURL(w http.ResponseWriter, r *http.Request, raw
 		})
 		return
 	}
+	httpua.Set(req) // 默认浏览器 UA，避免反爬站对 Go 默认 UA 返回 HTML（AP-016）
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

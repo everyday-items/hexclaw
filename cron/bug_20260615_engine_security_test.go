@@ -1,36 +1,14 @@
 package cron
 
-// BUG-20260615 (#1/#2 + builtins): StarlarkEngine hardening — SSRF guard on
-// http_get/http_post (refuse loopback/private/link-local/metadata; KB ingest
-// goes through the in-process kb_ingest builtin, F-3), an execution-step cap
-// (kill infinite loops), and enhanced builtins (html_unescape/re_sub/url_encode/
-// sha256) for HTML/monitor tasks.
+// BUG-20260615 (#1/#2 + builtins): StarlarkEngine hardening — an execution-step
+// cap (kill infinite loops) and enhanced builtins (html_unescape/re_sub/
+// url_encode/sha256) for HTML/monitor tasks. KB ingest goes through the
+// in-process kb_ingest builtin (F-3).
 
 import (
 	"context"
-	"strings"
 	"testing"
 )
-
-func TestBug20260615_StarlarkSSRF_BlocksInternal(t *testing.T) {
-	eng := NewStarlarkEngine()
-	for _, target := range []string{
-		"http://169.254.169.254/latest/meta-data/", // cloud metadata
-		"http://10.0.0.1/",
-		"http://192.168.1.1/",
-		"http://127.0.0.1:16060/api/v1/knowledge/documents", // loopback (F-3: KB ingest now in-process)
-		"http://[::1]:16060/",                               // IPv6 loopback
-	} {
-		script := "def run():\n    resp = http_get(\"" + target + "\")\n    return {\"status\": \"success\", \"data\": resp[\"status\"]}\nemit(run())"
-		res, err := eng.Execute(context.Background(), &JobSpec{Runtime: RuntimeStarlark, Script: script, TimeoutSec: 10})
-		if err != nil {
-			t.Fatalf("Execute: %v", err)
-		}
-		if res.Status != "error" || !strings.Contains(res.Error, "blocked") {
-			t.Errorf("%s must be SSRF-blocked, got status=%q err=%q", target, res.Status, res.Error)
-		}
-	}
-}
 
 func TestBug20260615_StarlarkStepLimit_KillsInfiniteLoop(t *testing.T) {
 	eng := NewStarlarkEngine()

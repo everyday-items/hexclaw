@@ -190,35 +190,7 @@ func (h *Hub) ListByCategory(category string) []SkillMeta {
 
 // Install 从 Hub 安装技能到本地
 func (h *Hub) Install(ctx context.Context, name string) error {
-	h.mu.RLock()
-	var target *SkillMeta
-	if h.catalog != nil {
-		for _, s := range h.catalog.Skills {
-			if s.Name == name {
-				target = &s
-				break
-			}
-		}
-	}
-	h.mu.RUnlock()
-
-	if target == nil {
-		return fmt.Errorf("技能 %s 未找到", name)
-	}
-
-	downloadURL := target.URL
-	if downloadURL == "" {
-		if dir, ok := h.localRepoDir(); ok {
-			downloadURL = filepath.Join(dir, "skills", name+".md")
-		} else {
-			// 默认 URL 模式
-			repoURL := strings.TrimSuffix(h.cfg.RepoURL, ".git")
-			repoURL = strings.Replace(repoURL, "github.com", "raw.githubusercontent.com", 1)
-			downloadURL = repoURL + "/" + h.cfg.Branch + "/skills/" + name + ".md"
-		}
-	}
-
-	content, err := h.readSkillContent(ctx, downloadURL)
+	content, err := h.Content(ctx, name)
 	if err != nil {
 		return err
 	}
@@ -246,6 +218,46 @@ func (h *Hub) Install(ctx context.Context, name string) error {
 	}
 
 	return nil
+}
+
+// Content 获取 Hub 中某技能的 SKILL.md 原文（不落盘，供「安装前预览」）。
+// 复用 Install 的来源解析与 readSkillContent 下载路径（同一安全约束与 1 MB 上限），
+// 仅省去写盘——因此不引入任何新的 fetch 攻击面。
+func (h *Hub) Content(ctx context.Context, name string) ([]byte, error) {
+	target, ok := h.findSkill(name)
+	if !ok {
+		return nil, fmt.Errorf("技能 %s 未找到", name)
+	}
+	return h.readSkillContent(ctx, h.resolveDownloadURL(target, name))
+}
+
+// findSkill 在缓存目录中按精确名查技能（读锁）。
+func (h *Hub) findSkill(name string) (SkillMeta, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.catalog == nil {
+		return SkillMeta{}, false
+	}
+	for _, s := range h.catalog.Skills {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return SkillMeta{}, false
+}
+
+// resolveDownloadURL 计算技能 SKILL.md 的下载地址：
+// 优先 meta.URL；其次本地仓库 skills/<name>.md；最后回退默认 raw URL 模式。
+func (h *Hub) resolveDownloadURL(target SkillMeta, name string) string {
+	if target.URL != "" {
+		return target.URL
+	}
+	if dir, ok := h.localRepoDir(); ok {
+		return filepath.Join(dir, "skills", name+".md")
+	}
+	repoURL := strings.TrimSuffix(h.cfg.RepoURL, ".git")
+	repoURL = strings.Replace(repoURL, "github.com", "raw.githubusercontent.com", 1)
+	return repoURL + "/" + h.cfg.Branch + "/skills/" + name + ".md"
 }
 
 func (h *Hub) localRepoDir() (string, bool) {

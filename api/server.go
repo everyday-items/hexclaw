@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -620,6 +621,7 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("GET /api/v1/skills/{name}/content", s.handleSkillContent)
 		mux.HandleFunc("PUT /api/v1/skills/{name}/status", s.handleSkillStatus)
 		mux.HandleFunc("POST /api/v1/skills/install", s.handleInstallSkill)
+		mux.HandleFunc("POST /api/v1/skills/generate", s.handleGenerateSkill)
 		mux.HandleFunc("DELETE /api/v1/skills/{name}", s.handleUninstallSkill)
 	}
 
@@ -727,6 +729,8 @@ func (s *Server) routes() http.Handler {
 
 	// ClawHub 搜索（Skill 市场）
 	mux.HandleFunc("GET /api/v1/clawhub/search", s.handleClawHubSearch)
+	// ClawHub 技能「安装前预览」：不落盘返回 SKILL.md 原文
+	mux.HandleFunc("GET /api/v1/clawhub/skills/{name}/content", s.handleClawHubSkillContent)
 
 	// Team API（共享 Agent + 团队成员）
 	mux.HandleFunc("GET /api/v1/team/agents", s.handleListSharedAgents)
@@ -775,8 +779,25 @@ func (s *Server) routes() http.Handler {
 		mux.Handle("/ws", s.wsHandler)
 	}
 
-	// 管理 API 认证中间件
-	return s.apiAuthMiddleware(corsMiddleware(mux))
+	// 顶层 panic 兜底 → 认证 → CORS → 路由（bug 2026-06-22 P0-2：此前无 recover 中间件，
+	// handler panic 会中断响应且不返回结构化错误）
+	return recoverMiddleware(s.apiAuthMiddleware(corsMiddleware(mux)))
+}
+
+// recoverMiddleware 捕获下游 handler / 中间件的 panic，返回 500 JSON 并保持进程存活。
+// 流式 handler 若已写过部分响应，这里的 writeJSON 会触发一次无害的 superfluous WriteHeader。
+func recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				logger.Error("[api] panic recovered",
+					"path", r.URL.Path, "method", r.Method,
+					"panic", fmt.Sprint(rec), "stack", string(debug.Stack()))
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "内部错误"})
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Start 启动 HTTP 服务器
