@@ -4,13 +4,26 @@
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-06-23
+> 框架依赖升级 + 桌面定位下的网络/扫描放开 + 出站 UA 统一 + 一组 R4 契约修复与审计回归测试。
+
 ### Added
 - **数据连接器（§15.1）**：新增 `connector/` 包——token（PAT / Integration Token）只读接入 GitHub / Notion，token 经 `secret.Box` 静态加密落盘（`~/.hexclaw/connectors.json`，`enc:v1:`），API 响应一律脱敏。端点 `GET/POST/DELETE /api/v1/connectors`、`POST /api/v1/connectors/test`、`GET /api/v1/connectors/{id}/resources`（真实拉取仓库 / 页面）。
 - **默认助理人设（SOUL）端点**：注册 `GET/PUT /api/v1/assistant/soul`（读写 `~/.hexclaw/SOUL.md`，空=恢复内置默认；引擎每轮读取，保存即时生效）。
 - **定时任务显式投递目标**：`AddCronJobRequest.Deliver` 透传到 `cron.AddJobRequest`，前端「从连接库下拉选投递目标」即走此字段（§5 一处存处处引）。
+- **AI Skill 生成端点**：`handleGenerateSkill`（对话式生成 Skill）+ 安装路径，配套生成/安装测试。
+- **`httpua` 包**：统一出站 HTTP 默认 User-Agent（image 下载 / render 抓取 / cron starlark http）。裸 `Go-http-client` UA 易被站点反爬返回 HTML 拦截页，致下游 json/图片解码 `invalid character '<'`；`httpua.Set` 在调用方未显式设 UA 时注入真实浏览器 UA（显式 UA 优先）。
 
 ### Changed
 - **工作流图执行器兼容前端字段**：`workflow_runtime.go` parse() 同时接受节点 `data`/`config`、边 `source/target`/`from/to`，使桌面端线性工作流保存的形状能被图执行器正确读取并链接。
+- 升级框架依赖：toolkit v0.2.0 → **v0.2.1**（`net/httpx.RawClient` 遵循 `HTTP(S)_PROXY`/`NO_PROXY`）、ai-core v0.1.6 → **v0.1.7**（`llmcall` 退避委托 `toolkit/util/retry`）、hexagon v0.5.1 → **v0.5.2**（circuit/retry/sse/ssrf 复用 toolkit；`CircuitBreaker` 状态回调改异步——本仓不直接依赖该回调同步性）。
+- **adapter.ReplyChunk 补小写 json tag（R4-1）**：SSE 聊天 wire JSON 由 PascalCase（`{"Content":…}`）改为 `content`/`reasoning`/… 小写，修复桌面端读取聊天正文恒空。
+- **adapter/dingtalk 重连退避复用 `toolkit/util/retry.ExponentialBackoff`（A-1）**，退避序列保真。
+- **api/team 枚举校验（C10）**：`visibility`/`role` 非法值返 400，空值取默认（private/member）。
+
+### Security
+- **网络放开（桌面定位）**：移除 cron starlark / skill browser / api 各处应用层 SSRF 私网阻断及相关回归测试（`engine_starlark.go` 瘦身、删 4 个 SSRF 测试）。hexclaw 作为**本地单用户桌面后端**运行，出站受用户机网络策略约束，不再在应用层强制私网名单。⚠️ 若改为多租户/公网部署，需自行恢复 SSRF 防护。
+- **`security/desktop_mode` 部署模式开关**：`--desktop` 启动时置位，桌面（单用户自有机）放行内容注入扫描 / 危险模式扫描（`ScanUserPrompt`/`ScanAssembled`/`SkillScanner.Scan`）——单用户无第三方提示注入面，误杀代价 > 收益；**服务端（多租户）默认仍开启**全部扫描。
 
 ## [0.4.4] - 2026-06-21
 > 接续 v0.4.3（已 tag 于 aa34a45）之后的地基功能 + 安全加固发布。本次新增静态凭据加密、
