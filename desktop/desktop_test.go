@@ -86,6 +86,47 @@ func TestClearNotifications(t *testing.T) {
 	}
 }
 
+// TestNotifySource 验证带来源标识的通知：Source 落入队列 + 回调 + JSON 序列化。
+func TestNotifySource(t *testing.T) {
+	svc := NewService("test")
+
+	var got Notification
+	svc.SetNotifyCallback(func(n Notification) { got = n })
+
+	svc.NotifySource("定时任务", "已完成", NotifySuccess, "cron")
+
+	if got.Source != "cron" {
+		t.Errorf("回调 source 不匹配: %q", got.Source)
+	}
+	if got.Type != NotifySuccess {
+		t.Errorf("回调 type 不匹配: %q", got.Type)
+	}
+
+	list := svc.Notifications(0)
+	if len(list) != 1 || list[0].Source != "cron" {
+		t.Fatalf("队列 source 不匹配: %+v", list)
+	}
+
+	b, _ := json.Marshal(list[0])
+	if !strings.Contains(string(b), `"source":"cron"`) {
+		t.Errorf("JSON 应含 source: %s", b)
+	}
+}
+
+// TestNotify_NoSource 验证旧 Notify 路径 source 为空且 omitempty 不输出（向后兼容）。
+func TestNotify_NoSource(t *testing.T) {
+	svc := NewService("test")
+	svc.Notify("t", "b", NotifyInfo)
+
+	list := svc.Notifications(0)
+	if list[0].Source != "" {
+		t.Errorf("Notify 不应带 source: %q", list[0].Source)
+	}
+	if b, _ := json.Marshal(list[0]); strings.Contains(string(b), "source") {
+		t.Errorf("omitempty 应省略 source: %s", b)
+	}
+}
+
 // TestGetSystemInfo 测试获取系统信息
 func TestGetSystemInfo(t *testing.T) {
 	svc := NewService("v1.0.0-test")

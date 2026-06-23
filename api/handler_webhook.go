@@ -37,10 +37,11 @@ func (s *Server) handleListWebhooks(w http.ResponseWriter, r *http.Request) {
 
 // RegisterWebhookRequest 注册 Webhook 请求
 type RegisterWebhookRequest struct {
-	Name   string `json:"name"`   // Webhook 名称（也是 URL 路径）
-	Type   string `json:"type"`   // 类型: generic/github/gitlab
-	Secret string `json:"secret"` // 签名验证 Secret
-	Prompt string `json:"prompt"` // Agent 处理指令
+	Name   string `json:"name"`    // Webhook 名称（也是 URL 路径）
+	Type   string `json:"type"`    // 类型: generic/github/gitlab
+	Secret string `json:"secret"`  // 签名验证 Secret
+	Prompt string `json:"prompt"`  // Agent 处理指令（JobID 为空时跑此 prompt）
+	JobID  string `json:"job_id"`  // §13.3(1) 非空 → 事件触发指定 cron job 而非跑 prompt
 	UserID string `json:"user_id"`
 }
 
@@ -70,6 +71,7 @@ func (s *Server) handleRegisterWebhook(w http.ResponseWriter, r *http.Request) {
 		Type:   webhook.WebhookType(req.Type),
 		Secret: req.Secret,
 		Prompt: req.Prompt,
+		JobID:  req.JobID,
 		UserID: req.UserID,
 	}
 
