@@ -80,11 +80,21 @@ func compressContextIfNeeded(
 
 	oldMsgs := messages[systemEnd:keepStart]
 
-	// 尝试 LLM 摘要
-	summary, err := llmToolSummary(ctx, oldMsgs, provider)
-	if err != nil {
-		trace.L(ctx).Warn("工具循环上下文压缩: LLM 摘要失败，使用启发式", "err", err, "session", sessionID)
+	// 生成摘要。本地 provider 慢且工具摘要经 LLM 价值有限——直接走启发式：
+	// 确定性、即时、不挤占整条 chat 的时间预算（避免慢本地模型在 30s 摘要超时上白白
+	// 烧掉时间预算后整条 /api/v1/chat 仍超时）；启发式已保留 user 约束 + 工具名 + 结果。
+	var summary string
+	if provider != nil && isLocalProvider(provider.Name()) {
 		summary = heuristicToolSummary(oldMsgs)
+		trace.L(ctx).Info("工具循环上下文压缩: 本地模型直接启发式（跳过 LLM 摘要）",
+			"provider", provider.Name(), "session", sessionID)
+	} else {
+		s, err := llmToolSummary(ctx, oldMsgs, provider)
+		if err != nil {
+			trace.L(ctx).Warn("工具循环上下文压缩: LLM 摘要失败，使用启发式", "err", err, "session", sessionID)
+			s = heuristicToolSummary(oldMsgs)
+		}
+		summary = s
 	}
 
 	// 重建 messages

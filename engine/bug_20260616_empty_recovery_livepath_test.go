@@ -54,6 +54,7 @@ func TestBug20260616_EmptyAfterToolRecoversOnLivePath(t *testing.T) {
 		"test",
 		"mock-model",
 		"cache-key",
+		false,
 	)
 
 	if calls != 1 {
