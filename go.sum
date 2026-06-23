@@ -30,8 +30,8 @@ github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
 github.com/hexagon-codes/ai-core v0.1.7 h1:o/8mUN3wEcflnEi/QKdcauEhwkMHyfHCHp1Je4wc/bI=
 github.com/hexagon-codes/ai-core v0.1.7/go.mod h1:gcX+D8Dvjifih0W1bP2WtkGpzMSfhsb05l2zqvkdlbI=
-github.com/hexagon-codes/hexagon v0.5.2 h1:4tl+5zANwoLMUYQkf8iB+VwG9YO5QxAIoCD8kio0ET4=
-github.com/hexagon-codes/hexagon v0.5.2/go.mod h1:4b3WLC+O/4y1gQYZ3BP0xYzOn+K41mSIZwXJM9kodt0=
+github.com/hexagon-codes/hexagon v0.5.3 h1:Q/RK5Kgc+I0jFmhhODW0/+zHayGC771Qs8yiDBH2L4w=
+github.com/hexagon-codes/hexagon v0.5.3/go.mod h1:4b3WLC+O/4y1gQYZ3BP0xYzOn+K41mSIZwXJM9kodt0=
 github.com/hexagon-codes/toolkit v0.2.1 h1:zhUj7afbED0fsywl6VvY8m60+BVyktunRg+hSEq5Kjo=
 github.com/hexagon-codes/toolkit v0.2.1/go.mod h1:Wd/k/gGVDdPDjZgyt27Jl88naMNr7dEK7NmVE1oUNVA=
 github.com/inconshreveable/mousetrap v1.1.0 h1:wN+x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2s0bqwp9tc8=
