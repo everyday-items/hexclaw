@@ -63,8 +63,8 @@ import (
 	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/render"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
-	"github.com/hexagon-codes/hexclaw/security"
 	"github.com/hexagon-codes/hexclaw/secret"
+	"github.com/hexagon-codes/hexclaw/security"
 	"github.com/hexagon-codes/hexclaw/session"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/skill/builtin"
@@ -360,6 +360,19 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		fmt.Printf("  ✓ Skills      %d 内置\n", builtinCount)
 	}
 
+	// 4.55 静态加密保险箱（主密钥 ~/.hexclaw/master.key，load-or-create）。提前到 MCP 连接之前
+	// 创建：MCP server 的 env 凭证（DB 密码等）静态加密落盘，启动时须先解密再交给 mcpMgr 连接。
+	// 加载失败降级为明文（保持可用），仅告警；绝不记录密钥或明文凭据。box 后续复用于平台实例 / connector。
+	dataDir := filepath.Dir(cfg.Storage.SQLite.Path)
+	var secretBox *secret.Box
+	if box, berr := secret.LoadBox(dataDir); berr != nil {
+		logger.Warn("[secret] 加载主密钥失败，凭据将以明文存储", "err", berr.Error())
+	} else {
+		secretBox = box
+	}
+	// 解密持久化的 MCP env（重启后从 yaml 读到 enc:v1:…），供下方 mcpMgr 连接使用。
+	config.DecryptMCPEnv(cfg.MCP.Servers, secretBox)
+
 	// 4.6 连接 MCP Server（即使无预配 Server 也初始化 Manager，支持动态添加）
 	var mcpMgr *hexmcp.Manager
 	if cfg.MCP.Enabled {
@@ -377,6 +390,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					Transport: s.Transport,
 					Command:   s.Command,
 					Args:      s.Args,
+					Env:       s.Env,
 					Endpoint:  s.Endpoint,
 					Enabled:   enabled,
 				})
@@ -643,7 +657,6 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	// 7. 初始化文件记忆系统
 	var fileMem *memory.FileMemory
-	var memCtxLen int
 	if cfg.FileMemory.Enabled {
 		var err error
 		fileMem, err = memory.New(memory.Options{
@@ -652,14 +665,16 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			MaxMemory: cfg.FileMemory.MaxMemory,
 			DailyDays: cfg.FileMemory.DailyDays,
 		})
-		if err == nil {
-			memCtx := fileMem.LoadContext()
-			memCtxLen = len(memCtx)
+		if err != nil {
+			fmt.Printf("  ✗ Memory      初始化失败: %v\n", err)
+			fileMem = nil
 		}
 	}
-	if memCtxLen > 0 {
-		fmt.Printf("  ✓ Memory      文件记忆 (%d 字符) + 自动记忆\n", memCtxLen)
+	// bug#3a 2026-06-23：只要文件记忆系统创建成功就挂到引擎，不能用「启动时记忆是否为空」当闸门。
+	// 否则首次启动（记忆为空）时不挂载，用户当次会话新增的记忆要等到下次重启才会注入 → 问答答不上。
+	if fileMem != nil {
 		eng.SetFileMemory(fileMem)
+		fmt.Printf("  ✓ Memory      文件记忆 (%d 字符) + 自动记忆\n", len(fileMem.LoadContext()))
 	} else {
 		fmt.Println("  ✗ Memory      未启用")
 	}
@@ -721,8 +736,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	if kbOK {
 		lc.Info("knowledge", "知识库已启用 — FTS5 + 向量混合检索，RAG 增强问答")
 	}
-	if memCtxLen > 0 {
-		lc.Info("memory", fmt.Sprintf("文件记忆已加载 (%d 字符) — 跨会话长期记忆", memCtxLen))
+	if fileMem != nil {
+		lc.Info("memory", fmt.Sprintf("文件记忆已加载 (%d 字符) — 跨会话长期记忆", len(fileMem.LoadContext())))
 	}
 	// Note: "已就绪" 日志迁移到 onReady 回调，仅在 HTTP 端口真实 bind 成功后才打印。
 
@@ -933,7 +948,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 	// MCP 动态添加持久化 (P0 修复: HTTP API 添加的 MCP server 也要持久化)
 	if home, err := os.UserHomeDir(); err == nil {
-		srv.SetCfgWriter(config.NewWriter(filepath.Join(home, ".hexclaw", "hexclaw.yaml")))
+		cfgWriter := config.NewWriter(filepath.Join(home, ".hexclaw", "hexclaw.yaml"))
+		cfgWriter.SetSecretBox(secretBox) // MCP env 凭证静态加密落盘（保险箱接管 MCP 凭证）
+		srv.SetCfgWriter(cfgWriter)
 	}
 	if mp != nil {
 		srv.SetMarketplace(mp)
@@ -1261,7 +1278,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			case cron.NotifyLevelSuccess:
 				nt = desktop.NotifySuccess
 			}
-			desktopSvc.Notify(title, body, nt)
+			desktopSvc.NotifySource(title, body, nt, "cron")
 		})
 		// Start only after the agent runner AND the notifier are wired
 		// (review L7): jobs due right at boot would otherwise run before
@@ -1310,15 +1327,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 
 	instanceMgr := instances.NewManager(store.DB())
-	// 静态加密：主密钥与 SQLite 同目录（~/.hexclaw/master.key, 0600）。加载失败不阻断启动，
-	// 降级为明文直存（保持可用），仅告警；绝不记录密钥或明文凭据。
-	dataDir := filepath.Dir(cfg.Storage.SQLite.Path)
-	var secretBox *secret.Box
-	if box, berr := secret.LoadBox(dataDir); berr != nil {
-		logger.Warn("[secret] 加载主密钥失败，凭据将以明文存储", "err", berr.Error())
-	} else {
-		secretBox = box
-		instanceMgr.SetSecretBox(box)
+	// secretBox / dataDir 已在 MCP 连接前统一创建（见 4.55）。这里仅把 box 注入平台实例管理器，
+	// 让 IM config_json 与 MCP env、connector token 共用同一把主密钥静态加密。
+	if secretBox != nil {
+		instanceMgr.SetSecretBox(secretBox)
 	}
 	if err := instanceMgr.Init(ctx); err != nil {
 		return fmt.Errorf("初始化平台实例运行时失败: %w", err)
@@ -1332,7 +1344,22 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	} else if n > 0 {
 		logger.Info("[secret] 历史凭据已静态加密", "count", n)
 	}
-	instanceMgr.SetHandler(messageHandler)
+	// IM 入站回执：所有平台实例共用同一 handler，这里统一包一层，让
+	// 「我不在时 IM 来消息了」进入桌面通知中心。桌面 chat 经 wa（Web 适配器）
+	// 直连 messageHandler，不走 instanceMgr，故不会被此回执波及。
+	instanceMgr.SetHandler(func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
+		reply, err := messageHandler(ctx, msg)
+		title := string(msg.Platform) + " 新消息"
+		if msg.UserName != "" {
+			title = msg.UserName + " · " + string(msg.Platform)
+		}
+		if err != nil {
+			desktopSvc.NotifySource(title, "消息处理失败: "+err.Error(), desktop.NotifyWarning, "im")
+		} else {
+			desktopSvc.NotifySource(title, clipText(msg.Content, 120), desktop.NotifyInfo, "im")
+		}
+		return reply, err
+	})
 	srv.SetInstanceManager(instanceMgr)
 
 	// §15.1 数据连接器：token 只读接入 GitHub / Notion（token 复用同一 secret.Box 加密落盘）。
@@ -1392,6 +1419,18 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			// 接通记忆提取通知: Engine → WebAdapter → 前端
 			eng.SetOnMemorySaved(func(content string) {
 				wa.Broadcast("memory_saved", content, nil)
+			})
+
+			// 接通桌面通知中心 → 前端实时推送: 任何 desktopSvc.Notify（cron 任务
+			// 完成/失败、IM 入站回执、heal 结果等）都经此广播给桌面 WS 客户端。
+			// content=body，结构化字段走 metadata，前端按 source 映射图标与深链。
+			desktopSvc.SetNotifyCallback(func(n desktop.Notification) {
+				wa.Broadcast("desktop_notification", n.Body, map[string]string{
+					"id":     n.ID,
+					"title":  n.Title,
+					"type":   string(n.Type),
+					"source": n.Source,
+				})
 			})
 		}
 	}
@@ -1545,6 +1584,15 @@ func (b *webPermissionBridge) SendPermissionRequest(ctx context.Context, session
 		Risk:      req.Risk,
 		Reason:    req.Reason,
 	})
+}
+
+// clipText 截断字符串到至多 max 个 rune，超出补省略号；用于通知正文摘要。
+func clipText(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
 }
 
 // instanceMessageSender 把 send_message Skill 的 MessageSender 接到 live

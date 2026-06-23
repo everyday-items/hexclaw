@@ -224,14 +224,24 @@ func (s *Server) handleListMCPServers(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAddMCPServer 动态添加 MCP Server
+// mcpAddImmediateConnectTimeout 新增 MCP Server 时「即时连接」的等待窗口。
+// 暖装（npx/uvx 缓存已就绪）通常秒级连上 → 返回 connected=true；冷装首次需下载组件，
+// 超过本窗口即转后台 reconnectLoop（30s 周期）继续，不再硬失败（见 Manager.AddServerBestEffort）。
+const mcpAddImmediateConnectTimeout = 10 * time.Second
+
+// addMCPServerRequest 新增 MCP Server 请求。Env 为 stdio 子进程环境变量
+// （数据连接器走 MCP 的凭证注入：MySQL/Redis 等通过 env 配 MYSQL_HOST/PASSWORD 等）。
+type addMCPServerRequest struct {
+	Name      string            `json:"name"`
+	Command   string            `json:"command"`
+	Args      []string          `json:"args"`
+	Env       map[string]string `json:"env"`
+	Transport string            `json:"transport"`
+	Endpoint  string            `json:"endpoint"`
+}
+
 func (s *Server) handleAddMCPServer(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name      string   `json:"name"`
-		Command   string   `json:"command"`
-		Args      []string `json:"args"`
-		Transport string   `json:"transport"`
-		Endpoint  string   `json:"endpoint"`
-	}
+	var req addMCPServerRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
 		return
@@ -284,26 +294,35 @@ func (s *Server) handleAddMCPServer(w http.ResponseWriter, r *http.Request) {
 		Transport: transport,
 		Command:   req.Command,
 		Args:      req.Args,
+		Env:       req.Env,
 		Endpoint:  req.Endpoint,
 		Enabled:   true,
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	// best-effort 注册：即时连接给一个较短窗口（暖装秒连=connected；冷装 npx/uvx 下载超时则
+	// 转后台重连，不硬失败）。根治「添加数据源」首次冷装失败（详见 Manager.AddServerBestEffort）。
+	ctx, cancel := context.WithTimeout(r.Context(), mcpAddImmediateConnectTimeout)
 	defer cancel()
 
-	if err := s.mcpMgr.AddServer(ctx, cfg); err != nil {
+	connected, err := s.mcpMgr.AddServerBestEffort(ctx, cfg)
+	if err != nil {
+		// 仅不可恢复错误（name 空 / Manager 已关闭）走 400；即时连接失败属可恢复，不会到这。
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": fmt.Sprintf("MCP Server %q 连接失败: %v", req.Name, err),
+			"error": fmt.Sprintf("MCP Server %q 添加失败: %v", req.Name, err),
 		})
 		return
 	}
-	// 持久化到配置文件，重启后不丢失
+	// 持久化到配置文件：无论是否已连接都持久化——未连上者重启后仍由 reconnectLoop 自动拉起。
 	if s.cfgWriter != nil {
-		if err := s.cfgWriter.AppendMCPServer(req.Name, transport, req.Command, req.Args, req.Endpoint); err != nil {
+		if err := s.cfgWriter.AppendMCPServer(req.Name, transport, req.Command, req.Args, req.Env, req.Endpoint); err != nil {
 			logger.Error("MCP Server", "name", req.Name, "添加成功但持久化失败", err)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("MCP Server %q 已添加", req.Name)})
+	msg := fmt.Sprintf("MCP Server %q 已添加", req.Name)
+	if !connected {
+		msg = fmt.Sprintf("MCP Server %q 已添加，正在后台连接（首次需下载组件）", req.Name)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"message": msg, "connected": connected})
 }
 
 // handleRemoveMCPServer 动态移除 MCP Server
@@ -669,7 +688,7 @@ func (s *Server) installMCPFromClawHubEntry(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if s.cfgWriter != nil {
-		if err := s.cfgWriter.AppendMCPServer(name, cfg.Transport, cfg.Command, cfg.Args, cfg.Endpoint); err != nil {
+		if err := s.cfgWriter.AppendMCPServer(name, cfg.Transport, cfg.Command, cfg.Args, cfg.Env, cfg.Endpoint); err != nil {
 			logger.Error("MCP Server", "name", name, "添加成功但持久化失败", err)
 		}
 	}
@@ -1447,8 +1466,14 @@ var mcpAllowedCommands = map[string]bool{
 	"docker": true, "deno": true, "bun": true, "go": true, "cargo": true,
 }
 
-// mcpDangerousChars shell 元字符 + 控制字符，禁止出现在 command/args 中
+// mcpDangerousChars shell 元字符 + 控制字符，禁止出现在 command 中
 const mcpDangerousChars = "`$|;&><(){}!\\'\"~\n\r\x00"
+
+// mcpDangerousArgChars 用于 args 的危险字符集：同命令集但**放行 `~`**。
+// MCP 子进程经 exec(argv 数组) 启动而非 shell，args 中的 `~` 不构成 shell 注入；且 connectServer
+// 显式支持 args 里 `~` / `~/` 的家目录展开（如 SQLite `--db-path ~/data.db`、连接器本地路径）。
+// 若 args 仍禁 `~`，这类合法路径会在 handler 校验阶段被误拒，永远到不了 connectServer 的展开逻辑。
+const mcpDangerousArgChars = "`$|;&><(){}!\\'\"\n\r\x00"
 
 func validateMCPCommand(command string, args []string) error {
 	if command == "" {
@@ -1470,7 +1495,8 @@ func validateMCPCommand(command string, args []string) error {
 		return fmt.Errorf("command 包含不允许的字符")
 	}
 	for i, arg := range args {
-		if strings.ContainsAny(arg, mcpDangerousChars) {
+		// args 放行 `~`（家目录路径，connectServer 会展开），其余 shell 元字符仍禁。
+		if strings.ContainsAny(arg, mcpDangerousArgChars) {
 			return fmt.Errorf("args[%d] 包含不允许的字符", i)
 		}
 	}

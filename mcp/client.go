@@ -38,12 +38,13 @@ import (
 
 // ServerConfig MCP Server 配置
 type ServerConfig struct {
-	Name      string   `yaml:"name"`      // 名称标识
-	Transport string   `yaml:"transport"` // 传输方式: stdio / sse
-	Command   string   `yaml:"command"`   // stdio 模式的命令（如 npx, uvx）
-	Args      []string `yaml:"args"`      // stdio 模式的命令参数
-	Endpoint  string   `yaml:"endpoint"`  // sse 模式的端点 URL
-	Enabled   bool     `yaml:"enabled"`   // 是否启用，默认 true
+	Name      string            `yaml:"name"`            // 名称标识
+	Transport string            `yaml:"transport"`       // 传输方式: stdio / sse
+	Command   string            `yaml:"command"`         // stdio 模式的命令（如 npx, uvx）
+	Args      []string          `yaml:"args"`            // stdio 模式的命令参数
+	Env       map[string]string `yaml:"env,omitempty"`   // stdio 子进程环境变量（数据连接器走 MCP 的凭证注入：MYSQL_HOST/PASSWORD 等）
+	Endpoint  string            `yaml:"endpoint"`        // sse 模式的端点 URL
+	Enabled   bool              `yaml:"enabled"`         // 是否启用，默认 true
 }
 
 // ToolInfo 已发现的 MCP 工具信息
@@ -322,7 +323,7 @@ func (m *Manager) connectServer(ctx context.Context, cfg ServerConfig) (*connect
 			}
 			resolvedArgs[i] = arg
 		}
-		tools, cleanup, err := hexagon.ConnectMCPStdio(ctx, cfg.Command, resolvedArgs...)
+		tools, cleanup, err := hexagon.ConnectMCPStdioWithEnv(ctx, cfg.Command, cfg.Env, resolvedArgs...)
 		if err != nil {
 			return nil, fmt.Errorf("stdio 连接失败: %w", err)
 		}
@@ -568,6 +569,81 @@ func (m *Manager) AddServer(ctx context.Context, cfg ServerConfig) error {
 
 	logger.Info("MCP Server", "name", cfg.Name, "len", len(server.tools))
 	return nil
+}
+
+// AddServerBestEffort 注册并尽力连接 MCP Server（运行时动态添加，如「连接中心 → 添加数据源」）。
+//
+// 与 AddServer（严格：即时连接失败即不注册）不同：本方法**先尝试一次即时连接，再在同一把锁下登记
+// cfg(Enabled=true)**——成功则同时落 server，失败则只落 cfg，交后台 reconnectLoop(30s) 在 npx/uvx
+// 缓存就绪后自动拉起。这样「添加数据源」首次冷装不再硬失败（根因：旧路径连接失败即 400 且不入 configs，
+// 重连循环永不接管）。
+//
+// ★为何「连接在前、登记在后」：connectServer 期间 cfg 尚未进 m.configs，reconnectLoop 看不到它，
+// 不会对同名并发再连一次（避免双开子进程）。登记与落 server 在同一把锁内完成，登记后状态即自洽。
+//
+// 返回 (connected, err)：err 仅在不可恢复时（name 空 / Manager 已关闭）非 nil；
+// 即时连接失败属可恢复，返回 (false, nil)。
+func (m *Manager) AddServerBestEffort(ctx context.Context, cfg ServerConfig) (bool, error) {
+	if cfg.Name == "" {
+		return false, fmt.Errorf("server name 不能为空")
+	}
+	cfg.Enabled = true
+
+	select {
+	case <-m.stopCh:
+		return false, fmt.Errorf("Manager 已关闭")
+	default:
+	}
+
+	// 即时连接（此刻 cfg 未登记 → reconnectLoop 不会对同名并发连接，杜绝双开子进程）。
+	server, connErr := m.connectServer(ctx, cfg)
+
+	m.mu.Lock()
+	// double-check: Close 可能在 connectServer 期间被调用
+	select {
+	case <-m.stopCh:
+		m.mu.Unlock()
+		if server != nil {
+			if server.cleanup != nil {
+				server.cleanup()
+			}
+			if server.closer != nil {
+				server.closer.Close()
+			}
+		}
+		return false, fmt.Errorf("Manager 已关闭")
+	default:
+	}
+	// 登记 config（替换同名或追加），使 reconnectLoop 拥有它——连接失败时由后台 30s 周期重试拉起。
+	found := false
+	for i, c := range m.configs {
+		if c.Name == cfg.Name {
+			m.configs[i] = cfg
+			found = true
+			break
+		}
+	}
+	if !found {
+		m.configs = append(m.configs, cfg)
+	}
+	if connErr != nil {
+		m.mu.Unlock()
+		logger.Warn("MCP Server", "name", cfg.Name, "即时连接失败，转后台重连", connErr)
+		return false, nil
+	}
+	if old, ok := m.servers[cfg.Name]; ok {
+		if old.cleanup != nil {
+			old.cleanup()
+		}
+		if old.closer != nil {
+			old.closer.Close()
+		}
+	}
+	m.servers[cfg.Name] = server
+	m.mu.Unlock()
+
+	logger.Info("MCP Server", "name", cfg.Name, "len", len(server.tools))
+	return true, nil
 }
 
 // RemoveServer 动态移除 MCP Server

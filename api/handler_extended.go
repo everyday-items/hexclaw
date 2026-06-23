@@ -549,7 +549,9 @@ func (s *Server) handleSaveWorkflow(w http.ResponseWriter, r *http.Request) {
 	s.workflowStore.workflows[wf.ID] = &wf
 	s.workflowStore.persistToFile()
 	s.workflowStore.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"id": wf.ID, "message": "工作流已保存"})
+	// 返回完整资源（REST 约定）：前端 saveWorkflow 声明 Promise<Workflow>，调用方可直接信任返回值
+	// （修复 AP-032 契约错位：此前只回 {id,message}，前端类型撒谎、被迫二次 loadWorkflows）。
+	writeJSON(w, http.StatusOK, &wf)
 }
 
 func (s *Server) handleDeleteWorkflow(w http.ResponseWriter, r *http.Request) {

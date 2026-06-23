@@ -9,17 +9,18 @@ import (
 	"github.com/hexagon-codes/hexagon/testing/mock"
 )
 
-// stubStdioConnect temporarily replaces hexagon.ConnectMCPStdio so AddServer /
+// stubStdioConnect temporarily replaces hexagon.ConnectMCPStdioWithEnv so AddServer /
 // tryReconnect success paths run without spawning a real subprocess. It returns
 // a cleanup that restores the original and a pointer to the live call counter.
+// （connectServer 现走 ConnectMCPStdioWithEnv 以支持 env 注入，桩目标随之迁移。）
 func stubStdioConnect(t *testing.T, tools []hexagon.Tool) (cleanupCalls *int) {
 	t.Helper()
-	orig := hexagon.ConnectMCPStdio
+	orig := hexagon.ConnectMCPStdioWithEnv
 	calls := 0
-	hexagon.ConnectMCPStdio = func(ctx context.Context, command string, args ...string) ([]hexagon.Tool, func(), error) {
+	hexagon.ConnectMCPStdioWithEnv = func(ctx context.Context, command string, env map[string]string, args ...string) ([]hexagon.Tool, func(), error) {
 		return tools, func() { calls++ }, nil
 	}
-	t.Cleanup(func() { hexagon.ConnectMCPStdio = orig })
+	t.Cleanup(func() { hexagon.ConnectMCPStdioWithEnv = orig })
 	return &calls
 }
 
