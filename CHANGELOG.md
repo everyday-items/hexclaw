@@ -4,6 +4,24 @@
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-06-23
+> 连接中心 MCP 收敛（env keystone + 密钥箱静态加密）+ max-turns 优雅降级（对齐 hexagon StopReason）+ 一组用户反馈修复；框架依赖与技能市场版本升级。
+
+### Added
+- **MCP env keystone + 密钥箱（连接中心）**：新增 `config/mcp_secret`——MCP Server 的 `env` 凭据（DB 密码、API Key 等）经主密钥（`~/.hexclaw/master.key`，load-or-create）静态加密落盘（`enc:v1:`），启动时 `LoadBox` + `DecryptMCPEnv` 解密后注入 `mcpMgr` 连接；加载失败降级明文并仅告警，绝不记录密钥或明文凭据。MCP Server 连接透传 `Env` 字段。API 响应一律脱敏。
+- **MCP 参数校验 + AP-031/032/034 修复**：`api/handler_misc`/`handler_extended` 补 env 读写脱敏与参数校验，配套 env 持久化 / 校验 / mysql MCP e2e 审计回归测试。
+
+### Changed
+- 升级框架依赖：hexagon v0.5.2 → **v0.5.3**（`Result.StopReason` 提升为一等字段、移除 `ErrMaxTurns`/`KindMaxTurns`，达到轮次上限不再是错误，对齐 `stop_reason` 语义）。
+- **技能市场默认分支 v0.0.4 → v0.0.5**：`HubConfig` / `SkillsHubConfig` 默认 `Branch` 同步 hexclaw-hub v0.0.5 发布。
+- **agent 工具轮次上限默认 5 → 25**：budget 模式仍以 `hardMaxTurns=50` 兜底；上下文压缩在本地模型场景跳过，避免无谓调用。
+
+### Fixed
+- **max-turns 优雅降级**：达到轮次上限按 `result.StopReason==max_turns` 优雅返回部分结果（非错误），尾部追加「继续」提示，不再向用户抛错。
+- **文件记忆挂载闸门（bug#3a）**：只要文件记忆系统创建成功即挂到引擎，不再用「启动时记忆是否为空」当闸门——否则首次启动新增的记忆要等重启才注入，问答答不上。
+- **用户反馈修复**：记忆注入闸门、挂载 skill 人设透传、人设 prompt、mounted persona skill 一组回归取证；`api/handler_webhook` 契约对齐。
+- **桌面通知来源标识**：`desktop.Notification` 新增 `Source`（`cron`/`im`），供前端映射图标与深链；`Notify` 保持旧行为（`NotifySource` 空来源）。
+
 ## [0.4.5] - 2026-06-23
 > 框架依赖升级 + 桌面定位下的网络/扫描放开 + 出站 UA 统一 + 一组 R4 契约修复与审计回归测试。
 

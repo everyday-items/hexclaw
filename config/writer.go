@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sync"
 
+	"github.com/hexagon-codes/hexclaw/secret"
 	"gopkg.in/yaml.v3"
 )
 
@@ -17,6 +18,7 @@ import (
 type Writer struct {
 	mu   sync.Mutex
 	path string
+	box  *secret.Box // 注入后：MCP server 的 env 凭证静态加密落盘（保险箱接管 MCP 凭证）。
 }
 
 // NewWriter 创建配置写入器
@@ -24,8 +26,15 @@ func NewWriter(path string) *Writer {
 	return &Writer{path: path}
 }
 
-// AppendMCPServer 追加 MCP server 到配置文件
-func (w *Writer) AppendMCPServer(name, transport, command string, args []string, endpoint string) error {
+// SetSecretBox 注入静态加密保险箱。注入后 readConfig 解密、writeConfig 加密 MCP env 凭证；
+// 不注入（box==nil）则保持明文（向后兼容既有部署与手编 yaml）。
+func (w *Writer) SetSecretBox(box *secret.Box) {
+	w.box = box
+}
+
+// AppendMCPServer 追加 MCP server 到配置文件。env 为 stdio 进程环境变量（如 DB 凭证），
+// 必须一并持久化，否则重启后凭证丢失（连接器拿空环境鉴权失败）。
+func (w *Writer) AppendMCPServer(name, transport, command string, args []string, env map[string]string, endpoint string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -46,6 +55,7 @@ func (w *Writer) AppendMCPServer(name, transport, command string, args []string,
 		Transport: transport,
 		Command:   command,
 		Args:      args,
+		Env:       env,
 		Endpoint:  endpoint,
 		Enabled:   true,
 	})
@@ -89,14 +99,23 @@ func (w *Writer) readConfig() (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	// 必须以 DefaultConfig 为底再 overlay 文件内容（与 loader.Load 一致）。
+	// 否则用零值 Config 反序列化「精简配置」（如桌面端只写 knowledge.enabled 的文件）时，
+	// 文件未提及的段会全部退化为零值；改-写回盘后 mcp.enabled / file_memory.enabled / server.port
+	// 等被显式写成 false/0，重启后覆盖 loader 的默认值 → MCP/记忆失效、端口非法启动失败。
+	cfg := DefaultConfig()
+	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	return &cfg, nil
+	// 读改写一致性：把盘上密文 env 解回明文（无 box 时 no-op）。配合 writeConfig 的加密，
+	// 既不双重加密已有 server，也让本次新增的明文 env 在写回时统一加密。
+	DecryptMCPEnv(cfg.MCP.Servers, w.box)
+	return cfg, nil
 }
 
 func (w *Writer) writeConfig(cfg *Config) error {
+	// 写盘前把 MCP env 凭证静态加密（无 box 时 no-op，保持明文）。
+	EncryptMCPEnv(cfg.MCP.Servers, w.box)
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)

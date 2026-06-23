@@ -89,7 +89,7 @@ func (m *McpInstallerSkill) Execute(ctx context.Context, args map[string]any) (*
 		}
 		// Persist to config file so it survives restart
 		if m.cfgWriter != nil {
-			if err := m.cfgWriter.AppendMCPServer(entry.Name, "stdio", entry.Command, entry.Args, ""); err != nil {
+			if err := m.cfgWriter.AppendMCPServer(entry.Name, "stdio", entry.Command, entry.Args, nil, ""); err != nil {
 				// Non-fatal: server is running but won't persist
 				return &skill.Result{
 					Content: fmt.Sprintf("MCP server '%s' installed (running), but failed to persist config: %v. Will be lost on restart.", entry.Name, err),

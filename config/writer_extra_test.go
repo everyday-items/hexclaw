@@ -16,7 +16,7 @@ func TestWriter_AppendMCPServer(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hexclaw.yaml")
 	w := NewWriter(path)
 
-	if err := w.AppendMCPServer("fs", "stdio", "npx", []string{"-y", "server"}, ""); err != nil {
+	if err := w.AppendMCPServer("fs", "stdio", "npx", []string{"-y", "server"}, nil, ""); err != nil {
 		t.Fatalf("AppendMCPServer failed: %v", err)
 	}
 
@@ -47,10 +47,10 @@ func TestWriter_AppendMCPServer_DuplicateRejected(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hexclaw.yaml")
 	w := NewWriter(path)
 
-	if err := w.AppendMCPServer("dup", "sse", "", nil, "https://example.com"); err != nil {
+	if err := w.AppendMCPServer("dup", "sse", "", nil, nil, "https://example.com"); err != nil {
 		t.Fatalf("first append failed: %v", err)
 	}
-	err := w.AppendMCPServer("dup", "sse", "", nil, "https://example.com")
+	err := w.AppendMCPServer("dup", "sse", "", nil, nil, "https://example.com")
 	if err == nil {
 		t.Fatal("duplicate name should be rejected")
 	}
@@ -64,8 +64,8 @@ func TestWriter_RemoveMCPServer(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hexclaw.yaml")
 	w := NewWriter(path)
 
-	_ = w.AppendMCPServer("a", "stdio", "cmd", nil, "")
-	_ = w.AppendMCPServer("b", "stdio", "cmd", nil, "")
+	_ = w.AppendMCPServer("a", "stdio", "cmd", nil, nil, "")
+	_ = w.AppendMCPServer("b", "stdio", "cmd", nil, nil, "")
 
 	if err := w.RemoveMCPServer("a"); err != nil {
 		t.Fatalf("RemoveMCPServer failed: %v", err)
@@ -99,7 +99,7 @@ func TestWriter_AppendStartsFromDefaultsWhenFileMissing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.yaml")
 	w := NewWriter(path)
 
-	if err := w.AppendMCPServer("x", "stdio", "cmd", nil, ""); err != nil {
+	if err := w.AppendMCPServer("x", "stdio", "cmd", nil, nil, ""); err != nil {
 		t.Fatalf("append onto missing file should succeed via defaults: %v", err)
 	}
 	data, _ := os.ReadFile(path)

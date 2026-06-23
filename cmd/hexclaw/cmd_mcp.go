@@ -110,7 +110,7 @@ func newMCPInstallCmd() *cobra.Command {
 			cfgPath := filepath.Join(home, ".hexclaw", "hexclaw.yaml")
 			w := config.NewWriter(cfgPath)
 
-			if err := w.AppendMCPServer(meta.Name, "stdio", meta.Command, meta.Args, ""); err != nil {
+			if err := w.AppendMCPServer(meta.Name, "stdio", meta.Command, meta.Args, nil, ""); err != nil {
 				return err
 			}
 

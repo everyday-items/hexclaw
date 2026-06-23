@@ -45,6 +45,9 @@ type Notification struct {
 	Body      string           `json:"body"`
 	Type      NotificationType `json:"type"`
 	Timestamp time.Time        `json:"timestamp"`
+	// Source 标识通知来源（"cron" / "im" / "" 等），供桌面端映射图标与深链；
+	// 空值保持与旧行为一致。
+	Source string `json:"source,omitempty"`
 }
 
 // SystemInfo 系统信息
@@ -84,16 +87,23 @@ func (s *Service) SetNotifyCallback(fn func(n Notification)) {
 	s.onNotify = fn
 }
 
-// Notify 发送桌面通知
-//
-// 将通知添加到队列，同时触发回调（如果设置）。
+// Notify 发送桌面通知（来源未标注）。
 func (s *Service) Notify(title, body string, notifyType NotificationType) {
+	s.NotifySource(title, body, notifyType, "")
+}
+
+// NotifySource 发送带来源标识的桌面通知。
+//
+// 将通知添加到队列，触发回调（如果设置，用于实时推送到前端），并尝试系统通知。
+// source 供桌面端映射图标/深链（如 "cron" / "im"），不影响后端行为。
+func (s *Service) NotifySource(title, body string, notifyType NotificationType, source string) {
 	n := Notification{
 		ID:        "notif-" + idgen.ShortID(),
 		Title:     title,
 		Body:      body,
 		Type:      notifyType,
 		Timestamp: time.Now(),
+		Source:    source,
 	}
 
 	s.mu.Lock()

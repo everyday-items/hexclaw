@@ -17,10 +17,11 @@ type McpServerMeta struct {
 	DisplayName string   `json:"display_name"`
 	Description string   `json:"description"`
 	Category    string   `json:"category"`
-	Command     string   `json:"command"`
-	Args        []string `json:"args"`
-	ConfigHint  string   `json:"config_hint,omitempty"`
-	Source      string   `json:"source,omitempty"`
+	Command     string            `json:"command"`
+	Args        []string          `json:"args"`
+	Env         map[string]string `json:"env,omitempty"` // stdio 凭证注入（MySQL/Mongo 等：MYSQL_HOST / MDB_MCP_CONNECTION_STRING）
+	ConfigHint  string            `json:"config_hint,omitempty"`
+	Source      string            `json:"source,omitempty"`
 	Downloads   int      `json:"downloads"`
 	Rating      float64  `json:"rating"`
 }
@@ -56,8 +57,8 @@ func (h *McpHub) Refresh() error {
 		return fmt.Errorf("read mcp registry: %w", err)
 	}
 
-	var servers []McpServerMeta
-	if err := json.Unmarshal(data, &servers); err != nil {
+	servers, err := parseMcpRegistry(data)
+	if err != nil {
 		return fmt.Errorf("parse mcp registry: %w", err)
 	}
 
@@ -66,6 +67,25 @@ func (h *McpHub) Refresh() error {
 	h.lastSync = time.Now()
 	h.mu.Unlock()
 	return nil
+}
+
+// parseMcpRegistry 解析 mcp-registry.json。
+// 真实格式是对象 {version, updated_at, servers:[...], categories}（与 skillHub 一致），
+// 旧实现误把整个文件当作裸数组 []McpServerMeta 反序列化 → 必然失败（CLI/agentic 安装路径形同虚设）。
+// 这里按对象的 .servers 解析；并兼容极老的裸数组格式（容错回退）。
+func parseMcpRegistry(data []byte) ([]McpServerMeta, error) {
+	var reg struct {
+		Servers []McpServerMeta `json:"servers"`
+	}
+	if err := json.Unmarshal(data, &reg); err == nil && reg.Servers != nil {
+		return reg.Servers, nil
+	}
+	// 回退：极老版本可能是裸数组。
+	var bare []McpServerMeta
+	if err := json.Unmarshal(data, &bare); err != nil {
+		return nil, err
+	}
+	return bare, nil
 }
 
 // Search 搜索 MCP 服务器
