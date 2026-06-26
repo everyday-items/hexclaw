@@ -209,8 +209,10 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 				a.streams.Fail(requestID, chunk.Error)
 			}
 			errMsg := wsMessage{
-				Type:      "error",
-				Content:   chunk.Error.Error(),
+				Type: "error",
+				// 与启动失败路径(web.go streamHandler err)及 SSE/HTTP 一致：净化上游错误，
+				// 不把 provider 原始 JSON / 内部前缀灌进聊天气泡。
+				Content:   upstreamerr.PublicMessage(chunk.Error, "error"),
 				SessionID: sessionID,
 				RequestID: requestID,
 			}
@@ -347,6 +349,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if err := adapter.ValidateAttachments(incoming.Attachments); err != nil {
+			// 本地输入校验错（确定性、非敏感、对用户有用）原样展示——不走 PublicMessage（AP-070 粒度修正：Validate* 帧白名单豁免）。
 			_ = wsjson.Write(r.Context(), conn, wsMessage{Type: "error", Content: err.Error()})
 			continue
 		}

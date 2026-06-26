@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -11,6 +12,48 @@ import (
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 )
+
+// 真实事故复现(2026-06-25)：流式中途 chunk.Error 经 WS 'error' 帧下发时
+// 直接用 chunk.Error.Error()（原始串），未走 upstreamerr.PublicMessage，
+// 导致 Nvidia 免费 VL 模型的 400 整坨 JSON 灌进桌面聊天气泡。
+// 兄弟路径 web.go:390（启动失败）与 api/server.go(SSE/HTTP) 都已净化，唯独中途 chunk 漏。
+func TestWebAdapter_StreamChunkErrorIsSanitized(t *testing.T) {
+	a := New()
+	chunks := make(chan *adapter.ReplyChunk, 1)
+	a.SetStreamHandler(func(_ context.Context, _ *adapter.Message) (<-chan *adapter.ReplyChunk, error) {
+		return chunks, nil
+	})
+
+	conn, ctx, _ := dialWebAdapter(t, a)
+
+	if err := wsjson.Write(ctx, conn, wsMessage{
+		Type: "message", Content: "hi", SessionID: "s1", RequestID: "r1", UserID: "desktop-user",
+	}); err != nil {
+		t.Fatalf("send ws message failed: %v", err)
+	}
+
+	chunks <- &adapter.ReplyChunk{
+		Error: errors.New(`runtime stream 失败: llm complete: openai api error: 400 Bad Request, ` +
+			`body: {"error":{"message":"Provider returned error","code":400,` +
+			`"metadata":{"provider_name":"Nvidia"}},"user_id":"user_x"}`),
+		Done: true,
+	}
+	close(chunks)
+
+	var frame wsMessage
+	if err := wsjson.Read(ctx, conn, &frame); err != nil {
+		t.Fatalf("read error frame failed: %v", err)
+	}
+	if frame.Type != "error" {
+		t.Fatalf("frame type = %q, want error", frame.Type)
+	}
+	if strings.Contains(frame.Content, "body:") || strings.Contains(frame.Content, "runtime stream") {
+		t.Fatalf("WS 中途 chunk 错误未净化，泄露原始内容: %q", frame.Content)
+	}
+	if frame.Content != "Provider returned error (code: 400)" {
+		t.Fatalf("净化结果 = %q, 期望 %q", frame.Content, "Provider returned error (code: 400)")
+	}
+}
 
 func dialWebAdapter(t *testing.T, a *WebAdapter) (*websocket.Conn, context.Context, context.CancelFunc) {
 	t.Helper()
