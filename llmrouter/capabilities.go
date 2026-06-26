@@ -21,6 +21,7 @@ import (
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexagon/observe/trace"
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
 // ReliabilityLevel 模型对 tool_call 的支持可靠度。
@@ -230,8 +231,10 @@ func parseToolArguments(raw any) (map[string]any, error) {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	// rune-safe 截断（委托 toolkit stringx.SubString），避免 byte-slice 切断 CJK 产生乱码（BUG-20260625 F-4）。
+	head := stringx.SubString(s, 0, n)
+	if head == s {
 		return s
 	}
-	return s[:n] + "..."
+	return head + "..."
 }

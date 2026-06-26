@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/featureflag"
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
 // FlagEvalFrameworkV1 控制 H9 eval 是否启用。alpha 默认 OFF。
@@ -344,8 +345,10 @@ func SortedCaseIDs(s *Suite) []string {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	// rune-safe 截断（委托 toolkit stringx.SubString），避免 CJK 字节切断（BUG-20260625 F-4）。
+	head := stringx.SubString(s, 0, n)
+	if head == s {
 		return s
 	}
-	return s[:n] + "..."
+	return head + "..."
 }

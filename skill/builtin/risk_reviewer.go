@@ -10,6 +10,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
 // RiskJudgeFunc 是单次 LLM 分类调用（窄接口，让 skill/builtin 与 llmrouter 解耦，便于测试）。
@@ -83,8 +85,10 @@ func parseRiskLevel(reply string) RiskLevel {
 }
 
 func clipRiskPayload(s string, max int) string {
-	if len(s) <= max {
+	// rune-safe 截断（委托 toolkit stringx.SubString），避免 CJK 字节切断（BUG-20260625 F-4）。
+	head := stringx.SubString(s, 0, max)
+	if head == s {
 		return s
 	}
-	return s[:max] + "…"
+	return head + "…"
 }
