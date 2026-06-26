@@ -594,14 +594,8 @@ func (s *Server) installSkillFromClawHub(w http.ResponseWriter, r *http.Request,
 		})
 		return
 	}
-	if s.skillHub.GetCatalog() == nil {
-		if err := s.skillHub.Refresh(r.Context()); err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{
-				"error": "获取 ClawHub 技能目录失败: " + err.Error(),
-			})
-			return
-		}
-	}
+	// 离线优先：即时 seed（磁盘缓存/内嵌种子）保证目录非空；实际下载 .md 仍需网络（下方各自处理）。
+	s.skillHub.EnsureCatalog()
 	meta, ok := s.findClawHubEntry(skillName)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{
@@ -999,6 +993,11 @@ func (s *Server) validateAgentLLMConfig(cfg *router.AgentConfig) error {
 	providerKey, ok := findLLMProviderKey(llmCfg, cfg.Provider)
 	if !ok {
 		return fmt.Errorf("指定的 provider %q 不存在", cfg.Provider)
+	}
+	// 禁用的 provider（Enabled=false）不参与路由，绑定到它的 Agent 运行期必失败 →
+	// 注册时直接拒绝，给出清晰错误而非留到调用期才暴底层错误（BUG-20260625 §3-2）。
+	if p := llmCfg.Providers[providerKey]; p.Enabled != nil && !*p.Enabled {
+		return fmt.Errorf("指定的 provider %q 已禁用，请先在设置中启用", cfg.Provider)
 	}
 	cfg.Provider = providerKey
 	return nil

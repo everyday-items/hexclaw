@@ -156,11 +156,16 @@ func TestHandleListConnections(t *testing.T) {
 
 // TestConnectionCapabilities 单测 provider → capabilities 推导。
 func TestConnectionCapabilities(t *testing.T) {
-	for _, p := range []string{"email", "feishu", "dingtalk", "discord", "telegram", "wecom", "wechat"} {
+	// IM 平台已接入 instances.Manager → 可收可发。
+	for _, p := range []string{"feishu", "dingtalk", "discord", "telegram", "wecom", "wechat"} {
 		caps := connectionCapabilities(p)
 		if len(caps) != 2 || caps[0] != "receive" || caps[1] != "send" {
 			t.Fatalf("%s capabilities 应为 [receive send]，实际 %v", p, caps)
 		}
+	}
+	// email 发件未接入 instances.Manager（BuildAdapter/modeForProvider 均无 email）→ 仅 receive（BUG-20260625 §3-5）。
+	if caps := connectionCapabilities("email"); len(caps) != 1 || caps[0] != "receive" {
+		t.Fatalf("email capabilities 应为 [receive]（发件未接入），实际 %v", caps)
 	}
 	if caps := connectionCapabilities("unknown"); len(caps) != 0 {
 		t.Fatalf("未知 provider capabilities 应为空切片，实际 %v", caps)
