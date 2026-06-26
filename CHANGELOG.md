@@ -4,6 +4,25 @@
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-06-26
+> 技能/MCP 市场离线优先 + 应用自省自愈 skill（app_query/app_heal）+ 文档上传抽取预览 + 会话附件持久化；一组 CJK 截断 / 上游脱敏 / API 契约修复；框架依赖升级 hexagon v0.5.5 / ai-core v0.1.8。
+
+### Added
+- **技能/MCP 市场离线优先**：出厂嵌入快照 + 磁盘缓存 + 带 TTL/退避的后台异步刷新；`EnsureCatalog` 保证目录非阻塞可用，网络与缓存均不可用时回落嵌入种子。`McpHub` 收敛为 `Hub` 门面，目录抓取/离线/缓存统一委托 `Hub`。新增 `scripts/sync-hub-embed.sh`，发版时从锚定分支同步嵌入快照。
+- **应用自省与自愈 skill**：`app_query`（P0 只读自省——连接/MCP/cron/webhook/agent/config/logs 脱敏查询，凭据红线打码 + `<app-data>` 围栏）与 `app_heal`（P1 白名单可逆自愈——cron retry/resume/pause、workflow_run，含限频与审计）；`react` 能力上下文注入系统卡片（版本/计数），`app_heal` 强制审批闸门（独立于 tool.policy.engine 默认值）。
+- **文档上传/抽取/预览**：`POST /documents/extract`（PDF/DOC/PPTX → 纯文本，供对话上下文注入；PDF 走 poppler、.doc 走 textutil、.pptx 走 hexagon PPTXLoader）、`POST/GET /documents/preview/{token}`（原文件内存环形缓存预览）；知识库放开 .pdf/.doc/.pptx 格式。
+- **会话附件持久化**：图片 base64 单列存储（migration v7 `messages.attachments`，8MB 上限）规避 64KB metadata 截断导致重载丢图；`documents` 元数据落库（`json.RawMessage`）；`message-id` 优先用 `request_id` 作存储主键，修复删除返回 404。
+
+### Changed
+- 升级框架依赖：hexagon v0.5.3 → **v0.5.5**、ai-core v0.1.7 → **v0.1.8**（API 兼容，本仓无源码适配改动）。
+- 对齐版本常量：`hexclaw.Version` 0.4.4 → **0.4.7**（历次发版漏更，本次补齐）。
+
+### Fixed
+- **CJK 截断乱码（AP-049）**：`skill_judge`/`eval`/`llmrouter.capabilities`/`risk_reviewer`/`react` 的工具与描述截断统一改 rune-safe `stringx.SubString`，杜绝字节边界切断 CJK 产出非法 UTF-8 序列。
+- **上游错误脱敏 + 数字 error.code**：`upstreamerr` 兼容 JSON number 形式的 `error.code`（如 Nvidia 返回数字 `400`）；WS 流式分片错误统一过 `PublicMessage` 脱敏，避免上游原始 JSON 漏进聊天气泡。
+- **API 契约**：绑定到禁用 provider 的 agent 在注册校验期即拒绝（不再延后到运行时）；email 能力仅 `["receive"]`（send 未接入 instances.Manager）；Webhook 在 jobID 绑定时 `prompt` 可选、空 jobID 时仍必填。
+- **记忆闸门对称（bug#3-3）**：`memory=off` 同时阻断 `memProvider.Inject`，杜绝 standing/fact 注入泄漏。
+
 ## [0.4.6] - 2026-06-23
 > 连接中心 MCP 收敛（env keystone + 密钥箱静态加密）+ max-turns 优雅降级（对齐 hexagon StopReason）+ 一组用户反馈修复；框架依赖与技能市场版本升级。
 

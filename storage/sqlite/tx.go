@@ -119,7 +119,7 @@ func (s *txStore) SaveMessage(ctx context.Context, msg *storage.MessageRecord) e
 		msg.Meta = "{}"
 	}
 	_, err := s.tx.ExecContext(ctx,
-		`INSERT INTO messages (`+messageCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO messages (`+messageCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		messageInsertArgs(msg)...,
 	)
 	if err != nil {

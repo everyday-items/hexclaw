@@ -25,6 +25,7 @@ import (
 	hexagon "github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/hexclaw/skill"
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
 // LLMSkillJudgeOptions LLM-as-judge 配置。
@@ -157,10 +158,12 @@ func scanFirstScore(s string) (int, bool) {
 }
 
 func truncate(s string, max int) string {
-	if len(s) <= max {
+	// rune-safe 截断（委托 toolkit stringx.SubString，保留单字符省略号），避免 CJK 字节切断（BUG-20260625 F-4）。
+	head := stringx.SubString(s, 0, max)
+	if head == s {
 		return s
 	}
-	return s[:max] + "…"
+	return head + "…"
 }
 
 const defaultJudgePrompt = `你是一个 AI 工具评估员。请对以下"工具调用结果"打 0-10 分。

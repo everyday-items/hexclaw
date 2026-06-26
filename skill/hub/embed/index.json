@@ -1,0 +1,918 @@
+{
+  "version": "1.8.0",
+  "updated_at": "2026-06-21T00:00:00Z",
+  "skills": [
+    {
+      "name": "code-review-pro",
+      "display_name": "Code Review Pro",
+      "description": "自动化代码审查，支持多种语言的代码规范检查、安全漏洞扫描和性能优化建议",
+      "version": "2.1.0",
+      "author": "openclaw",
+      "category": "coding",
+      "tags": [
+        "code-review",
+        "security",
+        "lint"
+      ],
+      "downloads": 28430,
+      "rating": 4.8
+    },
+    {
+      "name": "git-commit-craft",
+      "display_name": "Git Commit Craft",
+      "description": "根据 diff 自动生成符合 Conventional Commits 规范的提交信息",
+      "version": "1.4.2",
+      "author": "devtools-hub",
+      "category": "coding",
+      "tags": [
+        "git",
+        "commit",
+        "conventional"
+      ],
+      "downloads": 19200,
+      "rating": 4.7
+    },
+    {
+      "name": "test-generator",
+      "display_name": "Test Generator",
+      "description": "根据源代码自动生成单元测试，支持 Jest / Vitest / pytest / Go test",
+      "version": "1.8.0",
+      "author": "testcraft",
+      "category": "coding",
+      "tags": [
+        "testing",
+        "unit-test",
+        "tdd"
+      ],
+      "downloads": 15670,
+      "rating": 4.6
+    },
+    {
+      "name": "code-refactor",
+      "display_name": "代码重构优化",
+      "description": "在保持行为不变的前提下消除重复、提升可读性与性能，给出分步重构方案",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "coding",
+      "tags": ["refactor", "clean-code", "quality"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "security-audit",
+      "display_name": "安全审计",
+      "description": "静态审查代码中的 SQL 注入、XSS、密钥泄露、越权等常见安全漏洞并给出修复建议",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "coding",
+      "tags": ["security", "audit", "vulnerability"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "debug-detective",
+      "display_name": "Bug 系统排查",
+      "description": "用科学方法定位根因：复现→缩小范围→假设验证→定位到具体代码行",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "coding",
+      "tags": ["debug", "troubleshooting", "root-cause"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "arxiv-reader",
+      "display_name": "arXiv Reader",
+      "description": "自动解析 arXiv 论文，提取关键信息、方法论和结论，生成结构化摘要",
+      "version": "1.2.1",
+      "author": "research-ai",
+      "category": "research",
+      "tags": [
+        "arxiv",
+        "paper",
+        "summary"
+      ],
+      "downloads": 12840,
+      "rating": 4.5
+    },
+    {
+      "name": "web-researcher",
+      "display_name": "Web Researcher",
+      "description": "深度网络调研工具，自动搜索、汇总多个来源的信息并生成调研报告",
+      "version": "2.0.3",
+      "author": "openclaw",
+      "category": "research",
+      "tags": [
+        "search",
+        "report",
+        "web"
+      ],
+      "downloads": 22100,
+      "rating": 4.7
+    },
+    {
+      "name": "fact-checker",
+      "display_name": "Fact Checker",
+      "description": "对 Agent 输出内容进行事实核查，交叉验证多个信息源",
+      "version": "1.0.5",
+      "author": "verify-ai",
+      "category": "research",
+      "tags": [
+        "fact-check",
+        "verify",
+        "accuracy"
+      ],
+      "downloads": 8930,
+      "rating": 4.4
+    },
+    {
+      "name": "blog-writer",
+      "display_name": "Blog Writer",
+      "description": "根据主题和大纲生成高质量博客文章，支持 SEO 优化和多种写作风格",
+      "version": "1.6.0",
+      "author": "content-craft",
+      "category": "writing",
+      "tags": [
+        "blog",
+        "seo",
+        "content"
+      ],
+      "downloads": 17500,
+      "rating": 4.6
+    },
+    {
+      "name": "doc-translator",
+      "display_name": "Doc Translator",
+      "description": "高质量文档翻译，保持格式和术语一致性，支持 30+ 语言",
+      "version": "2.3.1",
+      "author": "polyglot-ai",
+      "category": "writing",
+      "tags": [
+        "translation",
+        "i18n",
+        "docs"
+      ],
+      "downloads": 24600,
+      "rating": 4.8
+    },
+    {
+      "name": "copywriting-pro",
+      "display_name": "Copywriting Pro",
+      "description": "营销文案生成，支持广告、社交媒体、邮件等多种场景",
+      "version": "1.3.0",
+      "author": "marketer-ai",
+      "category": "writing",
+      "tags": [
+        "copywriting",
+        "marketing",
+        "ad"
+      ],
+      "downloads": 11200,
+      "rating": 4.3
+    },
+    {
+      "name": "csv-analyst",
+      "display_name": "CSV Analyst",
+      "description": "自动分析 CSV/Excel 数据集，生成统计摘要、可视化图表和洞察报告",
+      "version": "1.5.2",
+      "author": "data-works",
+      "category": "data",
+      "tags": [
+        "csv",
+        "analytics",
+        "visualization"
+      ],
+      "downloads": 13400,
+      "rating": 4.5
+    },
+    {
+      "name": "sql-assistant",
+      "display_name": "SQL Assistant",
+      "description": "自然语言转 SQL 查询，支持 PostgreSQL / MySQL / SQLite 方言",
+      "version": "2.0.0",
+      "author": "dbtools",
+      "category": "data",
+      "tags": [
+        "sql",
+        "database",
+        "query"
+      ],
+      "downloads": 20800,
+      "rating": 4.7
+    },
+    {
+      "name": "json-transformer",
+      "display_name": "JSON Transformer",
+      "description": "JSON 数据格式转换、清洗和验证工具，支持 JSONPath 和 Schema 校验",
+      "version": "1.1.3",
+      "author": "data-works",
+      "category": "data",
+      "tags": [
+        "json",
+        "transform",
+        "schema"
+      ],
+      "downloads": 9700,
+      "rating": 4.2
+    },
+    {
+      "name": "cron-scheduler",
+      "display_name": "Cron Scheduler",
+      "description": "智能 Cron 任务编排，根据自然语言描述生成复杂的调度计划",
+      "version": "1.2.0",
+      "author": "ops-toolkit",
+      "category": "automation",
+      "tags": [
+        "cron",
+        "scheduler",
+        "ops"
+      ],
+      "downloads": 7600,
+      "rating": 4.3
+    },
+    {
+      "name": "api-integrator",
+      "display_name": "API Integrator",
+      "description": "快速集成第三方 API，自动生成请求代码和错误处理逻辑",
+      "version": "1.7.1",
+      "author": "openclaw",
+      "category": "automation",
+      "tags": [
+        "api",
+        "integration",
+        "http"
+      ],
+      "downloads": 16300,
+      "rating": 4.6
+    },
+    {
+      "name": "file-organizer",
+      "display_name": "File Organizer",
+      "description": "智能文件分类和整理，根据内容自动重命名、分类和归档",
+      "version": "1.0.8",
+      "author": "productivity-lab",
+      "category": "automation",
+      "tags": [
+        "files",
+        "organize",
+        "rename"
+      ],
+      "downloads": 10500,
+      "rating": 4.1
+    },
+    {
+      "name": "meeting-notes",
+      "display_name": "Meeting Notes",
+      "description": "会议记录整理和摘要生成，自动提取行动项和决议",
+      "version": "1.4.0",
+      "author": "productivity-lab",
+      "category": "productivity",
+      "tags": [
+        "meeting",
+        "notes",
+        "summary"
+      ],
+      "downloads": 14200,
+      "rating": 4.5
+    },
+    {
+      "name": "email-composer",
+      "display_name": "Email Composer",
+      "description": "智能邮件撰写助手，根据上下文生成专业的商务邮件",
+      "version": "1.2.5",
+      "author": "office-ai",
+      "category": "productivity",
+      "tags": [
+        "email",
+        "business",
+        "compose"
+      ],
+      "downloads": 18700,
+      "rating": 4.6
+    },
+    {
+      "name": "daily-digest",
+      "display_name": "Daily Digest",
+      "description": "每日信息汇总，自动收集和整理来自多个渠道的更新和通知",
+      "version": "1.1.0",
+      "author": "productivity-lab",
+      "category": "productivity",
+      "tags": [
+        "digest",
+        "news",
+        "daily"
+      ],
+      "downloads": 6800,
+      "rating": 4.2
+    },
+    {
+      "name": "pptx-generator",
+      "display_name": "PPT 生成",
+      "description": "把要点/大纲一键生成可演示的 PPTX 幻灯片，含版式、配色与讲者备注",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "productivity",
+      "tags": ["pptx", "slides", "presentation", "office"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "docx-generator",
+      "display_name": "Word 文档",
+      "description": "生成/编辑带样式、目录与批注修订的 Word(DOCX) 文档",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "productivity",
+      "tags": ["docx", "word", "document", "office"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "xlsx-generator",
+      "display_name": "Excel 表格",
+      "description": "生成带公式、数据透视与图表的 Excel(XLSX) 电子表格",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "productivity",
+      "tags": ["xlsx", "excel", "spreadsheet", "office"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "legal-cog",
+      "display_name": "Legal Cog",
+      "description": "法律文书、隐私政策、NDA 与合规清单生成助手（OpenClaw 改编）",
+      "version": "1.0.0",
+      "author": "openclaw-adapted",
+      "category": "writing",
+      "tags": [
+        "legal",
+        "contracts",
+        "compliance"
+      ],
+      "downloads": 2500,
+      "rating": 4.6
+    },
+    {
+      "name": "law",
+      "display_name": "Law",
+      "description": "按用户角色切换表达深度的法律信息与研究辅助技能（OpenClaw 改编）",
+      "version": "1.0.0",
+      "author": "openclaw-adapted",
+      "category": "research",
+      "tags": [
+        "law",
+        "irac",
+        "jurisdiction"
+      ],
+      "downloads": 2100,
+      "rating": 4.5
+    },
+    {
+      "name": "lawyer",
+      "display_name": "Lawyer",
+      "description": "合同审阅、条款红旗识别与基础法务文案起草（OpenClaw 改编）",
+      "version": "1.0.0",
+      "author": "openclaw-adapted",
+      "category": "productivity",
+      "tags": [
+        "contract",
+        "legal",
+        "review"
+      ],
+      "downloads": 1700,
+      "rating": 4.6
+    },
+    {
+      "name": "docs-cog",
+      "display_name": "Docs Cog",
+      "description": "专业文档与 PDF 交付工作流，适合 proposal、report、invoice、resume、contract（OpenClaw 改编）",
+      "version": "1.0.0",
+      "author": "openclaw-adapted",
+      "category": "writing",
+      "tags": [
+        "documents",
+        "pdf",
+        "proposal"
+      ],
+      "downloads": 1900,
+      "rating": 4.7
+    },
+    {
+      "name": "tavily-search-pro",
+      "display_name": "Tavily Search Pro",
+      "description": "Tavily 五模式检索工作流：search、extract、crawl、map、research（OpenClaw 改编）",
+      "version": "1.0.0",
+      "author": "openclaw-adapted",
+      "category": "research",
+      "tags": [
+        "tavily",
+        "search",
+        "research"
+      ],
+      "downloads": 1600,
+      "rating": 4.6
+    },
+    {
+      "name": "openclaw-agent-browser",
+      "display_name": "OpenClaw Agent Browser",
+      "description": "带状态保持、截图、抓取与表单自动化规范的浏览器工作流（OpenClaw 改编）",
+      "version": "1.0.0",
+      "author": "openclaw-adapted",
+      "category": "automation",
+      "tags": [
+        "browser",
+        "automation",
+        "scraping"
+      ],
+      "downloads": 2400,
+      "rating": 4.6
+    },
+    {
+      "name": "openclaw-notion-skill",
+      "display_name": "OpenClaw Notion Skill",
+      "description": "Notion 页面与数据库的读写、查询、追加和流程同步（OpenClaw 改编）",
+      "version": "1.0.0",
+      "author": "openclaw-adapted",
+      "category": "productivity",
+      "tags": [
+        "notion",
+        "database",
+        "workspace"
+      ],
+      "downloads": 1500,
+      "rating": 4.5
+    },
+    {
+      "name": "self-improving-agent",
+      "display_name": "Self-Improving Agent",
+      "description": "记录失败与用户纠正，形成可复用的改进要点（ClawHub 热门改编）",
+      "version": "1.0.0",
+      "author": "clawhub-popular",
+      "category": "productivity",
+      "tags": [
+        "agent",
+        "learning",
+        "feedback"
+      ],
+      "downloads": 95200,
+      "rating": 4.7
+    },
+    {
+      "name": "gog",
+      "display_name": "GoG (Google Workspace)",
+      "description": "Google Workspace（Gmail/日历/Drive 等）CLI 使用指引（ClawHub 热门改编）",
+      "version": "1.0.0",
+      "author": "clawhub-popular",
+      "category": "productivity",
+      "tags": [
+        "google",
+        "cli",
+        "workspace"
+      ],
+      "downloads": 93100,
+      "rating": 4.7
+    },
+    {
+      "name": "tavily-search",
+      "display_name": "Tavily Search",
+      "description": "使用 Tavily API 做面向 AI 的网页检索摘要（ClawHub 热门改编）",
+      "version": "1.0.0",
+      "author": "clawhub-popular",
+      "category": "research",
+      "tags": [
+        "search",
+        "api",
+        "tavily"
+      ],
+      "downloads": 91800,
+      "rating": 4.6
+    },
+    {
+      "name": "find-skills",
+      "display_name": "Find Skills",
+      "description": "帮用户发现/匹配可安装的 Agent 技能（ClawHub 热门改编）",
+      "version": "1.0.0",
+      "author": "clawhub-popular",
+      "category": "productivity",
+      "tags": [
+        "discovery",
+        "skills",
+        "marketplace"
+      ],
+      "downloads": 90500,
+      "rating": 4.6
+    },
+    {
+      "name": "summarize",
+      "display_name": "Summarize",
+      "description": "总结网页、PDF、音视频等的流程与提示词模板（ClawHub 热门改编）",
+      "version": "1.0.0",
+      "author": "clawhub-popular",
+      "category": "writing",
+      "tags": [
+        "summary",
+        "url",
+        "cli"
+      ],
+      "downloads": 89200,
+      "rating": 4.6
+    },
+    {
+      "name": "github",
+      "display_name": "GitHub CLI",
+      "description": "使用 GitHub CLI `gh` 处理 issue/PR/Actions/API（ClawHub 热门改编）",
+      "version": "1.0.0",
+      "author": "clawhub-popular",
+      "category": "coding",
+      "tags": [
+        "github",
+        "cli",
+        "gh"
+      ],
+      "downloads": 88400,
+      "rating": 4.7
+    },
+    {
+      "name": "agent-browser",
+      "display_name": "Agent Browser",
+      "description": "浏览器自动化场景下的安全与步骤设计（ClawHub 热门改编）",
+      "version": "1.0.0",
+      "author": "clawhub-popular",
+      "category": "automation",
+      "tags": [
+        "browser",
+        "automation",
+        "safety"
+      ],
+      "downloads": 87100,
+      "rating": 4.5
+    },
+    {
+      "name": "clawhub-weather",
+      "display_name": "ClawHub Weather",
+      "description": "天气查询与出行提示（ClawHub 热门改编，可与内置天气能力并存）",
+      "version": "1.0.0",
+      "author": "clawhub-popular",
+      "category": "productivity",
+      "tags": [
+        "weather",
+        "outdoor"
+      ],
+      "downloads": 86200,
+      "rating": 4.5
+    },
+    {
+      "name": "polymarketodds",
+      "display_name": "Polymarket Odds",
+      "description": "预测市场（如 Polymarket）数据解读与风险说明（ClawHub 热门改编）",
+      "version": "1.0.0",
+      "author": "clawhub-popular",
+      "category": "data",
+      "tags": [
+        "prediction",
+        "markets",
+        "risk"
+      ],
+      "downloads": 84900,
+      "rating": 4.4
+    },
+    {
+      "name": "proactive-agent",
+      "display_name": "Proactive Agent",
+      "description": "主动提醒与跟进任务的边界与话术（ClawHub 热门改编）",
+      "version": "1.0.0",
+      "author": "clawhub-popular",
+      "category": "productivity",
+      "tags": [
+        "proactive",
+        "assistant"
+      ],
+      "downloads": 83600,
+      "rating": 4.5
+    },
+    {
+      "name": "sonoscli",
+      "display_name": "Sonos CLI",
+      "description": "Sonos 音响 CLI 控制与排障提示（ClawHub 热门改编）",
+      "version": "1.0.0",
+      "author": "clawhub-popular",
+      "category": "automation",
+      "tags": [
+        "audio",
+        "sonos",
+        "cli"
+      ],
+      "downloads": 82100,
+      "rating": 4.4
+    },
+    {
+      "name": "notion",
+      "display_name": "Notion",
+      "description": "Notion 页面/数据库与 API 集成思路（ClawHub 热门改编）",
+      "version": "1.0.0",
+      "author": "clawhub-popular",
+      "category": "productivity",
+      "tags": [
+        "notion",
+        "docs",
+        "api"
+      ],
+      "downloads": 80800,
+      "rating": 4.6
+    },
+    {
+      "name": "honda-crv-maintenance",
+      "display_name": "Honda CR-V Maintenance",
+      "description": "本田 CR-V 全周期保养顾问 — 保养周期、配件规格、故障排查、费用预估",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "automotive",
+      "tags": [
+        "honda",
+        "crv",
+        "maintenance",
+        "car"
+      ],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "car-maintenance-advisor",
+      "display_name": "Car Maintenance Advisor",
+      "description": "通用汽车保养顾问 — 保养周期提醒、故障码解读、维修费用评估、配件推荐",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "automotive",
+      "tags": [
+        "car",
+        "maintenance",
+        "automotive",
+        "repair",
+        "obd"
+      ],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "travel-planner",
+      "display_name": "Travel Planner",
+      "description": "智能旅行规划师 — 行程规划、机票酒店比价、签证攻略、当地美食和文化",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "productivity",
+      "tags": [
+        "travel",
+        "trip",
+        "hotel",
+        "flight",
+        "visa",
+        "food"
+      ],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "travel-packing-checklist",
+      "display_name": "Travel Packing Checklist",
+      "description": "旅行打包清单助手 — 根据目的地、天数、季节自动生成个性化打包清单",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "productivity",
+      "tags": [
+        "travel",
+        "packing",
+        "checklist"
+      ],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "video-editor-pro",
+      "display_name": "Video Editor Pro",
+      "description": "AI 视频剪辑助手 — FFmpeg 命令生成、字幕制作、转码方案、剪辑工作流",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "media",
+      "tags": [
+        "video",
+        "ffmpeg",
+        "edit",
+        "subtitle",
+        "transcode"
+      ],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "homework-tutor-primary",
+      "display_name": "Homework Tutor (Primary)",
+      "description": "小学作业辅导 — 语文阅读写作、数学计算应用题、英语启蒙，引导式教学",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "tags": [
+        "education",
+        "primary",
+        "homework",
+        "math",
+        "chinese",
+        "english"
+      ],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "homework-tutor-middle",
+      "display_name": "Homework Tutor (Middle School)",
+      "description": "初中作业辅导 — 数学代数几何、物理化学、语文阅读作文、英语语法写作",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "tags": [
+        "education",
+        "middle-school",
+        "homework",
+        "math",
+        "physics",
+        "chemistry"
+      ],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "homework-tutor-high",
+      "display_name": "Homework Tutor (High School)",
+      "description": "高中作业辅导 — 数学函数导数、物理力学电磁、化学有机无机、面向高考备考",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "tags": [
+        "education",
+        "high-school",
+        "homework",
+        "gaokao",
+        "math",
+        "physics",
+        "chemistry",
+        "biology"
+      ],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "lesson-plan",
+      "display_name": "教案设计",
+      "description": "按学段/学科/课时生成结构化教案 — 教学目标、重难点、教学过程、板书与作业设计",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "tags": ["lesson-plan", "teaching", "k12", "教案"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "quiz-generator",
+      "display_name": "组卷出题",
+      "description": "按知识点/难度/题型生成练习题与试卷，附标准答案、解析与评分标准",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "tags": ["quiz", "exam", "test", "k12", "组卷"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "essay-grader",
+      "display_name": "作文批改",
+      "description": "中英文作文批改 — 按评分标准打分、逐句点评、给出修改建议与范例升格",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "tags": ["essay", "writing", "grading", "k12", "作文"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "mistake-notebook",
+      "display_name": "错题本",
+      "description": "整理错题、定位失分根因、归纳同类题型并自动生成举一反三的变式练习",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "tags": ["mistakes", "review", "practice", "k12", "错题"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "concept-explainer",
+      "display_name": "知识点讲解",
+      "description": "把抽象知识点按学段讲清楚 — 类比、图示思路、典型例题与常见误区",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "tags": ["explain", "concept", "tutoring", "k12", "讲解"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "classical-chinese",
+      "display_name": "古诗文鉴赏",
+      "description": "文言文/古诗词 翻译、字词注释、主旨赏析、背诵助记与考点梳理",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "tags": ["classical-chinese", "poetry", "chinese", "k12", "古诗文"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "english-vocab-coach",
+      "display_name": "英语词汇教练",
+      "description": "英语单词记忆 — 词根词缀拆解、语境例句、联想记忆与拼写/用法辨析（可配 Anki）",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "tags": ["english", "vocabulary", "language", "k12", "词汇"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "study-planner",
+      "display_name": "学习计划",
+      "description": "按目标/考试节点/可用时间制定可执行的学习与复习计划，含每日清单与复盘",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "tags": ["study-plan", "schedule", "review", "k12", "学习计划"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "reading-comprehension",
+      "display_name": "阅读理解精讲",
+      "description": "现代文/英语阅读理解 — 文章解构、题型套路、答题模板与逐题讲解",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "tags": ["reading", "comprehension", "k12", "阅读理解"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "oral-english-partner",
+      "display_name": "英语口语陪练",
+      "description": "情景对话陪练 — 分级引导、实时纠音纠错、地道表达替换与跟读练习",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "tags": ["english", "speaking", "oral", "k12", "口语"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "ai-comic-drama",
+      "display_name": "AI 漫剧创作",
+      "description": "漫剧（条漫/有声漫剧）一体化创作 — 故事大纲、分镜脚本、人物设定与配音旁白脚本",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "media",
+      "tags": ["comic", "manhua", "storyboard", "ai", "漫剧"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "comic-art-prompt",
+      "display_name": "漫画 AI 绘图提示词",
+      "description": "为漫剧/插画分镜生成 AI 绘图提示词 — 画风、构图、镜头、角色一致性与负面提示",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "media",
+      "tags": ["prompt", "image", "comic", "ai-art", "绘图"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "ai-short-drama",
+      "display_name": "AI 短剧编剧",
+      "description": "竖屏短剧剧本 — 高能开篇、反转节奏、人物钩子、分集大纲与逐场台词",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "media",
+      "tags": ["short-drama", "script", "screenwriting", "ai", "短剧"],
+      "downloads": 0,
+      "rating": 0
+    },
+    {
+      "name": "short-drama-production",
+      "display_name": "AI 短剧制作流程",
+      "description": "把短剧本变成成片的 AI 工作流 — 分镜、运镜、AI 文生/图生视频提示词、配音配乐与剪辑清单",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "media",
+      "tags": ["short-drama", "production", "video", "ai", "workflow", "制作"],
+      "downloads": 0,
+      "rating": 0
+    }
+  ]
+}

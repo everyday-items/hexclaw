@@ -60,12 +60,8 @@ func (s *Server) handleClawHubSkillContent(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ClawHub 未启用"})
 		return
 	}
-	if s.skillHub.GetCatalog() == nil {
-		if err := s.skillHub.Refresh(r.Context()); err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "获取 ClawHub 技能目录失败: " + err.Error()})
-			return
-		}
-	}
+	// 离线优先：即时 seed（磁盘缓存/内嵌种子）保证目录非空；预览原文仍需网络（下方处理）。
+	s.skillHub.EnsureCatalog()
 	meta, ok := s.findClawHubEntry(name)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "技能未找到: " + name})

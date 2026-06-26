@@ -100,23 +100,28 @@ func (m *Manager) GetOrCreate(ctx context.Context, msg *adapter.Message) (*stora
 
 type messageMetadata struct {
 	Attachments []adapter.Attachment `json:"attachments,omitempty"`
+	// Documents 文档卡片（name/mime/size），前端随请求 metadata["documents"] 上送的 ChatDocumentRef[] JSON。
+	// 此前只存前端本地、重载即丢 → 文档退化为纯文本；现一并落库（BUG-20260626）。
+	Documents json.RawMessage `json:"documents,omitempty"`
 }
 
 // SaveUserMessage 保存用户消息到会话。
 func (m *Manager) SaveUserMessage(ctx context.Context, sessionID string, msg *adapter.Message) error {
-	metadata, err := encodeMessageMetadata(msg.Attachments)
+	metadata, err := encodeMessageMetadata(msg.Attachments, msg.Metadata["documents"])
 	if err != nil {
 		return fmt.Errorf("编码消息元数据失败: %w", err)
 	}
 
 	record := &storage.MessageRecord{
-		ID:        "msg-" + idgen.ShortID(),
+		ID:        userMessageID(msg.Metadata),
 		SessionID: sessionID,
 		Role:      "user",
 		Content:   msg.Content,
-		Metadata:  metadata,
-		RequestID: requestIDFromMetadata(msg.Metadata),
-		CreatedAt: time.Now(),
+		// BUG-20260626：图片附件 base64 存独立列 attachments（不受 metadata 64KB 截断）；
+		// 读取时由 scanMessage 合并回 metadata，前端继续读 metadata.attachments 渲染。
+		Attachments: metadata,
+		RequestID:   requestIDFromMetadata(msg.Metadata),
+		CreatedAt:   time.Now(),
 	}
 	if err := m.saveMessage(ctx, record); err != nil {
 		return err
@@ -232,6 +237,16 @@ func requestIDFromMetadata(metadata map[string]string) string {
 		return ""
 	}
 	return metadata["request_id"]
+}
+
+// userMessageID 选定用户消息的存储主键：优先用前端 request_id（前端唯一持有的消息句柄，
+// 编辑/重试时按它 DELETE /api/v1/messages/{id}）；缺省才回退生成。二者一致后端 delete 才命中，
+// 否则 404 → 前端报 "删除消息失败"（BUG-20260626）。
+func userMessageID(metadata map[string]string) string {
+	if rid := requestIDFromMetadata(metadata); rid != "" {
+		return rid
+	}
+	return "msg-" + idgen.ShortID()
 }
 
 // BuildContext 构建对话上下文
@@ -360,11 +375,17 @@ func generateTitleForMessage(msg *adapter.Message) string {
 	return ""
 }
 
-func encodeMessageMetadata(attachments []adapter.Attachment) (string, error) {
-	if len(attachments) == 0 {
+// encodeMessageMetadata 组装用户消息富内容 blob（图片附件 + 文档卡片）。
+// documentsJSON 来自前端随请求 metadata["documents"] 上送的 ChatDocumentRef[] JSON（可空）。
+func encodeMessageMetadata(attachments []adapter.Attachment, documentsJSON string) (string, error) {
+	mm := messageMetadata{Attachments: attachments}
+	if documentsJSON != "" && documentsJSON != "null" && json.Valid([]byte(documentsJSON)) {
+		mm.Documents = json.RawMessage(documentsJSON)
+	}
+	if len(mm.Attachments) == 0 && mm.Documents == nil {
 		return "{}", nil
 	}
-	data, err := json.Marshal(messageMetadata{Attachments: attachments})
+	data, err := json.Marshal(mm)
 	if err != nil {
 		return "", err
 	}

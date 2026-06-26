@@ -34,12 +34,16 @@ type connectionSummary struct {
 	Enabled      bool     `json:"enabled"`
 }
 
-// connectionCapabilities 由 provider 推导连接能力。email 与全部 IM 平台
-// 既能收又能发，故统一为 ["receive","send"]；未知 provider 返回空切片（非 nil，便于 JSON 出 []）。
+// connectionCapabilities 由 provider 推导连接能力。IM 平台已接入 instances.Manager（BuildAdapter +
+// modeForProvider），可收可发 → ["receive","send"]；email 收件经独立轮询，但发件未接入 instances.Manager
+// （BuildAdapter/modeForProvider 均无 email case），不能作 cron 投递目标 → 仅 ["receive"]，否则前端
+// deliverableConnections 会把 email 当投递目标致运行期 instanceMgr.Send 失败（BUG-20260625 §3-5）。
+// 未知 provider 返回空切片（非 nil，便于 JSON 出 []）。
 func connectionCapabilities(provider string) []string {
 	switch provider {
-	case "email",
-		"feishu", "dingtalk", "discord", "telegram", "wecom", "wechat":
+	case "email":
+		return []string{"receive"}
+	case "feishu", "dingtalk", "discord", "telegram", "wecom", "wechat":
 		return []string{"receive", "send"}
 	default:
 		return []string{}

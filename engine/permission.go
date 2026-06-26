@@ -218,6 +218,7 @@ func DefaultBaselinePolicy() *PermissionPolicy {
 		PolicyRule{Name: "manage-pending-sensitive", ToolPattern: "manage_skill_pending", Action: ActionRequireApproval, Risk: "sensitive", Reason: "审批 Skill 草稿"},
 		// consequential 动作：发送到外部渠道 / 媒体生成 / 发布，执行前需用户审批。
 		PolicyRule{Name: "send-approve", ToolPattern: "send_message", Action: ActionRequireApproval, Risk: "sensitive", Reason: "发送到外部渠道"},
+		PolicyRule{Name: "heal-approve", ToolPattern: "app_heal", Action: ActionRequireApproval, Risk: "sensitive", Reason: "自愈写操作（cron 重试/恢复/暂停）"},
 		PolicyRule{Name: "media-approve", ToolPattern: "media_generate", Action: ActionRequireApproval, Risk: "sensitive", Reason: "媒体生成"},
 		PolicyRule{Name: "publish-approve", ToolPattern: "publish_*", Action: ActionRequireApproval, Risk: "dangerous", Reason: "发布到外部平台"},
 	)
@@ -268,6 +269,9 @@ func NewPermissionHook(hub *PermissionHub, opts ...PermissionHookOption) *Permis
 			"shell":     true,
 			"code":      true,
 			"code_exec": true,
+			// 自愈写操作（cron 重试/恢复/暂停、workflow run）——always-approve，
+			// 放进 legacy 黑名单使其**与 tool.policy.engine flag 无关**地强制审批（修：默认 flag OFF 时网关本会失效）。
+			"app_heal": true,
 		},
 		sensitiveTools: map[string]bool{
 			"browser":           true,
