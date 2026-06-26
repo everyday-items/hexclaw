@@ -59,9 +59,8 @@ func newMCPSearchCmd() *cobra.Command {
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			h := hub.NewMcpHub("")
-			if err := h.Refresh(); err != nil {
-				return fmt.Errorf("refresh hub: %w", err)
-			}
+			// best-effort 刷新：断网 / GitHub 不可达时回退到磁盘缓存 / 内嵌出厂快照，市场不为空。
+			_ = h.Refresh()
 
 			query := ""
 			if len(args) > 0 {
@@ -97,9 +96,8 @@ func newMCPInstallCmd() *cobra.Command {
 			name := args[0]
 
 			h := hub.NewMcpHub("")
-			if err := h.Refresh(); err != nil {
-				return fmt.Errorf("refresh hub: %w", err)
-			}
+			// best-effort 刷新：断网 / GitHub 不可达时回退到磁盘缓存 / 内嵌出厂快照，市场不为空。
+			_ = h.Refresh()
 
 			meta, err := h.Get(name)
 			if err != nil {

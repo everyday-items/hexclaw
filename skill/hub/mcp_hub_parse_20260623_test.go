@@ -2,10 +2,10 @@ package hub
 
 import "testing"
 
-// McpHub.Refresh 旧实现把 mcp-registry.json（对象 {servers:[...]}）当裸数组反序列化 → 必然
-// 解析失败，CLI(`hexclaw mcp`) + agentic 安装技能的 MCP 目录形同虚设。parseMcpRegistry 修此根因：
-// 按 .servers 解析对象格式（与 skillHub 一致），并兼容极老裸数组格式。
-func TestParseMcpRegistry_ObjectFormat(t *testing.T) {
+// 旧 bug：把 mcp-registry.json（对象 {servers:[...]}）当裸数组反序列化 → 必然解析失败，
+// CLI(`hexclaw mcp`) + agentic 安装技能的 MCP 目录形同虚设。parseMcpServers 修此根因：
+// 按 .servers 解析对象格式（与 skillHub index 一致），并兼容极老裸数组格式。
+func TestParseMcpServers_ObjectFormat(t *testing.T) {
 	data := []byte(`{
 		"version": "1.3.1",
 		"updated_at": "2026-06-23",
@@ -15,7 +15,7 @@ func TestParseMcpRegistry_ObjectFormat(t *testing.T) {
 			{"name":"redis","command":"npx","args":["-y","@gongrzhe/server-redis-mcp","redis://localhost:6379"]}
 		]
 	}`)
-	servers, err := parseMcpRegistry(data)
+	servers, err := parseMcpServers(data)
 	if err != nil {
 		t.Fatalf("对象格式应解析成功: %v", err)
 	}
@@ -34,9 +34,9 @@ func TestParseMcpRegistry_ObjectFormat(t *testing.T) {
 	}
 }
 
-func TestParseMcpRegistry_BareArrayFallback(t *testing.T) {
+func TestParseMcpServers_BareArrayFallback(t *testing.T) {
 	data := []byte(`[{"name":"x","command":"npx","args":["-y","pkg"]}]`)
-	servers, err := parseMcpRegistry(data)
+	servers, err := parseMcpServers(data)
 	if err != nil {
 		t.Fatalf("裸数组回退应成功: %v", err)
 	}
