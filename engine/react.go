@@ -184,12 +184,15 @@ type ReActEngine struct {
 	mpTracked map[string]struct{}
 
 	// D1-D2: 统一工具循环基础设施
-	toolCollector *ToolCollector       // 工具收集器 (Skill + MCP)
-	toolExecutor  *ToolExecutor        // 工具执行器 (含 Hook 链)
-	sessionLock   *session.SessionLock // 会话并发锁
-	sessionLane   SessionLane          // 会话 lane 抽象：桌面 local lock / 服务端 distributed lease
-	budgetCfg     *BudgetConfig        // D17: 预算配置 (非 nil 时每次请求创建独立 BudgetController)
-	bgWg          sync.WaitGroup       // G3: 等待后台 goroutine (压缩/记忆) 完成
+	toolCollector *ToolCollector // 工具收集器 (Skill + MCP)
+	toolExecutor  *ToolExecutor  // 工具执行器 (含 Hook 链)
+
+	// P0 自感知：已配置资源(连接/cron/webhook/MCP/工作流/config)的脱敏只读访问 (可为 nil)。
+	appIntrospector AppIntrospector
+	sessionLock     *session.SessionLock // 会话并发锁
+	sessionLane     SessionLane          // 会话 lane 抽象：桌面 local lock / 服务端 distributed lease
+	budgetCfg       *BudgetConfig        // D17: 预算配置 (非 nil 时每次请求创建独立 BudgetController)
+	bgWg            sync.WaitGroup       // G3: 等待后台 goroutine (压缩/记忆) 完成
 
 	// 记忆提取通知回调 — auto_memory 提取成功后调用，用于通知前端
 	onMemorySaved func(content string)
@@ -2550,10 +2553,13 @@ func lastAssistantContent(history []hexagon.Message) string {
 func (e *ReActEngine) buildCompletionRequest(ctx context.Context, msg *adapter.Message, history []hexagon.Message, kbContext string) hexagon.CompletionRequest {
 	// §11.8 记忆薄版：每轮把 standing 全量 + fact 命中注入上下文（与 RAG 同位，记忆在前）。
 	// 注入失败/为空不阻断主流程。
+	// memory=off 门控：与 buildCapabilityContext 的 fileMem 闸对称——用户关闭记忆时这层也必须跳过，
+	// 否则 standing/fact 记忆仍泄漏进 system 上下文（BUG-20260625 §3-3 门控不对称）。
+	memoryOff := msg.Metadata != nil && msg.Metadata["memory"] == "off"
 	e.mu.RLock()
 	memProvider := e.memProvider
 	e.mu.RUnlock()
-	if memProvider != nil {
+	if memProvider != nil && !memoryOff {
 		if mem := memProvider.Inject(ctx, msg.Content); mem != "" {
 			if kbContext == "" {
 				kbContext = mem
@@ -3193,7 +3199,8 @@ func (e *ReActEngine) buildCapabilityContext(ctx context.Context, metadata map[s
 			for _, t := range tools {
 				desc := t.Function.Description
 				if len(desc) > 60 {
-					desc = desc[:60] + "..."
+					// rune-safe 截断（委托 toolkit stringx.SubString），避免 CJK 工具描述被 byte 切断成乱码（AP-049）。
+					desc = stringx.SubString(desc, 0, 60) + "..."
 				}
 				sb.WriteString("- " + t.Function.Name + "：" + desc + "\n")
 			}
@@ -3261,7 +3268,8 @@ func (e *ReActEngine) buildCapabilityContext(ctx context.Context, metadata map[s
 					desc = a.DisplayName
 				}
 				if len(desc) > 50 {
-					desc = desc[:50] + "..."
+					// rune-safe 截断（同上，避免 Agent 描述 CJK 乱码）。
+					desc = stringx.SubString(desc, 0, 50) + "..."
 				}
 				sb.WriteString("- @" + a.Name + "：" + desc + "\n")
 			}
@@ -3276,6 +3284,46 @@ func (e *ReActEngine) buildCapabilityContext(ctx context.Context, metadata map[s
 		sb.WriteString("- 定时任务：" + boolZh(cfg.Cron.Enabled) + "\n")
 		sb.WriteString("- Webhook：" + boolZh(cfg.Webhook.Enabled) + "\n")
 		sb.WriteString("- 长期记忆：" + boolZh(cfg.FileMemory.Enabled) + "\n")
+	}
+
+	// 7. 自感知系统名片：基数 + 版本（基数让模型知道"有什么、能查什么"，详情用 app_query 工具按需拉，避免每轮灌全量条目）
+	e.mu.RLock()
+	introspector := e.appIntrospector
+	e.mu.RUnlock()
+	if introspector != nil {
+		userID := ""
+		if metadata != nil {
+			userID = metadata["user_id"]
+		}
+		inv := introspector.Inventory(ctx, userID)
+		sb.WriteString("\n[本应用现状]\n")
+		if inv.Version != "" {
+			sb.WriteString("- HexClaw 版本：" + inv.Version + "\n")
+		}
+		if len(inv.Counts) > 0 {
+			order := []struct{ key, label string }{
+				{"agents", "Agent"}, {"cron", "定时任务"}, {"connections", "连接"},
+				{"webhooks", "Webhook"}, {"workflows", "工作流"}, {"mcp", "MCP/数据连接器"},
+			}
+			parts := make([]string, 0, len(order))
+			for _, o := range order {
+				if n, ok := inv.Counts[o.key]; ok {
+					parts = append(parts, fmt.Sprintf("%d 个%s", n, o.label))
+				}
+			}
+			if len(parts) > 0 {
+				sb.WriteString("- 你已配置：" + strings.Join(parts, " · ") + "\n")
+				sb.WriteString("- 需要这些资源的详情或操作时，调用 app_query 工具按需读取（如 domain=connections 列出连接），不要凭空臆测。\n")
+			}
+		}
+		// 模型工具能力提示（感知+提示，不自动切换）。**条件化**（P10 #4）：仅当用户确有需要可靠工具调用的
+		// 资源（MCP/数据连接器·连接·cron·webhook·工作流，任一 > 0）时才提示 —— 否则对纯聊天用户是噪声，
+		// 也避免无中生有地暗示"切模型"。agents 不计入（Agent 是编排者，不直接代表工具型多步任务）。
+		toolResources := inv.Counts["mcp"] + inv.Counts["connections"] + inv.Counts["cron"] +
+			inv.Counts["webhooks"] + inv.Counts["workflows"]
+		if toolResources > 0 {
+			sb.WriteString("- 提示：操作数据连接器(MySQL 等)、定时任务、自愈类多步工具任务需要工具调用可靠的模型；若当前模型频繁不触发工具，建议用户切换到 tool-capable 模型。\n")
+		}
 	}
 
 	return sb.String()

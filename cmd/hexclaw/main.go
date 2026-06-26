@@ -1377,6 +1377,32 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		}
 	}
 
+	// P0 自感知：注入 AppIntrospector（系统名片：基数 + 版本 + 工具能力提示）+ 注册 app_query 只读工具。
+	// 闭包持有各 Manager（任一 nil 优雅降级）；所有读返回**脱敏**（不含凭据，红线见 appIntrospectorImpl 注释）。
+	appIntrospector := &appIntrospectorImpl{
+		version:     version,
+		cfg:         cfg,
+		mcpMgr:      mcpMgr,
+		scheduler:   scheduler,
+		webhookMgr:  webhookMgr,
+		agentRouter: agentRouter,
+		instanceMgr: instanceMgr,
+		logs:        srv.LogCollector(),
+		srv:         srv,
+	}
+	eng.SetAppIntrospector(appIntrospector)
+	if err := skills.Register(builtin.NewAppQuerySkill(appIntrospector)); err != nil {
+		logger.Warn("[app_query] failed to register app_query skill", "err", err.Error())
+	} else {
+		fmt.Println("  ✓ Skill       app_query (P0 自感知：连接/MCP/cron/webhook/agents/config/logs 只读·脱敏·fence)")
+	}
+	// P1 自愈：白名单可逆写操作（cron retry/resume/pause），由 PermissionPolicy heal-approve 强制审批。
+	if err := skills.Register(builtin.NewAppHealSkill(scheduler, srv)); err != nil {
+		logger.Warn("[app_heal] failed to register app_heal skill", "err", err.Error())
+	} else {
+		fmt.Println("  ✓ Skill       app_heal (P1 建议+审批后自愈：cron retry/resume/pause·可逆)")
+	}
+
 	if scheduler != nil {
 		// Route cron jobs' IM deliver targets (feishu/discord/...) through the
 		// running platform adapters. Desktop-class targets still go via the

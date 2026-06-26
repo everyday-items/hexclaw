@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
@@ -621,6 +622,64 @@ func (s *Server) executeWorkflow(ctx context.Context, wf *WorkflowData, run *Wor
 	s.workflowStore.mu.Unlock()
 }
 
+// WorkflowBrief 是给 Agent 自省的工作流摘要（不含节点内部细节）。
+type WorkflowBrief struct {
+	ID    string
+	Name  string
+	Nodes int
+}
+
+// ListWorkflowsForAgent 返回工作流摘要，供 Agent 经 app_query domain=workflows 列出（P2）。
+func (s *Server) ListWorkflowsForAgent() []WorkflowBrief {
+	if s == nil || s.workflowStore == nil {
+		return nil
+	}
+	s.workflowStore.mu.RLock()
+	defer s.workflowStore.mu.RUnlock()
+	briefs := make([]WorkflowBrief, 0, len(s.workflowStore.workflows))
+	for _, wf := range s.workflowStore.workflows {
+		briefs = append(briefs, WorkflowBrief{ID: wf.ID, Name: wf.Name, Nodes: len(wf.Nodes)})
+	}
+	return briefs
+}
+
+// RunWorkflowByID 触发一个工作流执行，**复用既有 executeWorkflow 内核**（非重造）。
+// 供 Agent 经 app_heal workflow_run 调用（已过 PermissionPolicy heal-approve 审批闸）。
+// 返回 runID；工作流不存在返回 error。与 handleRunWorkflow 同一执行路径。
+//
+// 关于 userID（P10 #5）：工作流在本地单用户模型下是**全局**资源（WorkflowData 无 owner 字段，
+// 不像 cron Job 那样按用户隔离），因此这里**没有**可校验的归属边界 —— 授权边界是"工作流存在 +
+// 已过 heal-approve 人工审批"。userID 不被丢弃：写进审计轨用于取证（谁触发了哪个工作流）。
+// 若将来引入多用户，应给 WorkflowData 增加 owner 并在此按 owner 校验（参照 cron.ListJobs(userID)）。
+// 输入：当前以空 RunWorkflowRequest{} 运行（"运行已保存的工作流"语义，不带即席输入），符合自愈场景。
+func (s *Server) RunWorkflowByID(id, userID string) (string, error) {
+	if s == nil || s.workflowStore == nil {
+		return "", fmt.Errorf("工作流存储不可用")
+	}
+	s.workflowStore.mu.RLock()
+	wf, ok := s.workflowStore.workflows[id]
+	s.workflowStore.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("工作流不存在: %s", id)
+	}
+	logger.Info("[workflow] agent 触发运行", "workflow_id", id, "name", wf.Name, "user", userID)
+	run := &WorkflowRun{
+		ID:         "run-" + idgen.ShortID(),
+		WorkflowID: wf.ID,
+		Status:     "running",
+		StartedAt:  time.Now(),
+	}
+	s.workflowStore.mu.Lock()
+	s.workflowStore.addRun(run)
+	s.workflowStore.mu.Unlock()
+	wfCtx, wfCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	go func() {
+		defer wfCancel()
+		s.executeWorkflow(wfCtx, wf, run, RunWorkflowRequest{})
+	}()
+	return run.ID, nil
+}
+
 func (s *Server) handleGetWorkflowRun(w http.ResponseWriter, r *http.Request) {
 	s.workflowStore.mu.RLock()
 	run, ok := s.workflowStore.runs[r.PathValue("id")]
@@ -648,17 +707,8 @@ func (s *Server) handleClawHubSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.skillHub.GetCatalog() == nil {
-		if err := s.skillHub.Refresh(r.Context()); err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"skills": []any{},
-				"total":  0,
-				"source": "clawhub",
-				"error":  "获取目录失败: " + err.Error(),
-			})
-			return
-		}
-	}
+	// 离线优先：即时 seed（磁盘缓存/内嵌种子）保证非空，并后台刷新拉更新——永不阻塞、永不空。
+	s.skillHub.EnsureCatalog()
 
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	category := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("category")))
