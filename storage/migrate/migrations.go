@@ -373,6 +373,12 @@ CREATE TABLE IF NOT EXISTS memories (
 	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );`,
 	},
+	{
+		Version:     7,
+		Description: "BUG-20260626 图片持久化：messages.attachments 独立列（图片 base64 不再塞进 64KB 截断的 metadata，重载后图片不丢）",
+		// ALTER ADD COLUMN 幂等：列已存在时报错被 migrate.Run 捕获跳过。
+		SQL: `ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '';`,
+	},
 }
 
 // migrateCronV2 把 cron v1 schema 升级到 v2（详见 .claude/cron-script-compilation-design.md）。

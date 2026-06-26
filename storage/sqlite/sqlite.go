@@ -205,7 +205,7 @@ func (s *Store) DB() *sql.DB {
 
 const sessionCols = `id, user_id, platform, instance_id, chat_id, title, parent_session_id, branch_message_id, status, message_count, total_prompt_tokens, total_completion_tokens, last_message_preview, meta, created_at, updated_at`
 
-const messageCols = `id, session_id, parent_id, role, content, content_type, metadata, feedback, model_name, prompt_tokens, completion_tokens, finish_reason, latency_ms, request_id, meta, created_at`
+const messageCols = `id, session_id, parent_id, role, content, content_type, metadata, feedback, model_name, prompt_tokens, completion_tokens, finish_reason, latency_ms, request_id, meta, attachments, created_at`
 
 type scannable interface{ Scan(dest ...any) error }
 
@@ -230,9 +230,16 @@ func scanMessage(sc scannable) (*storage.MessageRecord, error) {
 		&m.ContentType, &m.Metadata, &m.Feedback,
 		&m.ModelName, &m.PromptTokens, &m.CompletionTokens,
 		&m.FinishReason, &m.LatencyMs, &m.RequestID, &m.Meta,
+		&m.Attachments,
 		&m.CreatedAt,
 	); err != nil {
 		return nil, err
+	}
+	// BUG-20260626：附件存独立列（避开 metadata 64KB 截断）；读取时合并回 metadata，
+	// 让前端继续读 metadata.attachments 渲染图片，无需改前端契约。仅当独立列有内容时覆盖
+	// （老消息 attachments='' → 保留其原 metadata；assistant 等无附件消息不受影响）。
+	if m.Attachments != "" && m.Attachments != "{}" {
+		m.Metadata = m.Attachments
 	}
 	return &m, nil
 }
@@ -250,10 +257,20 @@ func sessionInsertArgs(s *storage.Session) []any {
 // 单字段大小限制（见 Fix #3 背景：本地推理 reasoning 动辄 5000+ 字，
 // AI 生成 HTML 模板单条 500KB+，历史 messages 最大单条达 500,002 字节）
 const (
-	maxMessageContentBytes  = 128 * 1024 // 128 KB：单条 content
-	maxMessageMetadataBytes = 64 * 1024  // 64 KB：metadata（含 reasoning）
+	maxMessageContentBytes  = 128 * 1024      // 128 KB：单条 content
+	maxMessageMetadataBytes = 64 * 1024       // 64 KB：metadata（含 reasoning）
+	maxAttachmentBytes      = 8 * 1024 * 1024 // 8 MB：attachments 独立列（图片 base64），远高于 metadata
 	truncationSuffix        = "\n\n…[truncated by hexclaw to protect DB size]"
 )
+
+// clampAttachments 保证 attachments 列始终是 valid JSON：超限整体丢弃为 "{}"（而非 truncateLarge
+// 从中间硬截断产生损坏 JSON）。损坏 JSON 会让重载解析失败、把整条消息的附件全毁掉（BUG-20260626）。
+func clampAttachments(s string) string {
+	if len(s) > maxAttachmentBytes {
+		return "{}"
+	}
+	return s
+}
 
 // previewByteLimit 按字节上限截断会话预览，回退到 UTF-8 边界避免切碎 CJK 字符
 // （bug 2026-06-22：原 `preview[:200]` 在 3 字节字符中间硬切产生 `�`）。
@@ -294,6 +311,7 @@ func messageInsertArgs(m *storage.MessageRecord) []any {
 		m.ModelName, m.PromptTokens, m.CompletionTokens,
 		m.FinishReason, m.LatencyMs, m.RequestID,
 		truncateLarge(m.Meta, maxMessageMetadataBytes),
+		clampAttachments(m.Attachments),
 		m.CreatedAt,
 	}
 }
@@ -541,7 +559,7 @@ func (s *Store) saveMessageTx(ctx context.Context, msg *storage.MessageRecord) e
 	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO messages (`+messageCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO messages (`+messageCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		messageInsertArgs(msg)...,
 	)
 	if err != nil {
@@ -911,7 +929,7 @@ func (s *Store) ForkSession(ctx context.Context, sourceSessionID, messageID, use
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO messages (`+messageCols+`)
 			 SELECT ? || rowid, ?, parent_id, role, content, content_type, metadata, feedback,
-			        model_name, prompt_tokens, completion_tokens, finish_reason, latency_ms, request_id, meta, created_at
+			        model_name, prompt_tokens, completion_tokens, finish_reason, latency_ms, request_id, meta, attachments, created_at
 			 FROM messages
 			 WHERE session_id = ? AND rowid <= ?`,
 		forkPrefix, newSessionID, sourceSessionID, msgRowID,
