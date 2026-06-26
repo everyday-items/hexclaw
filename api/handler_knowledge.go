@@ -83,10 +83,10 @@ func (s *Server) handleUploadDocument(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	ext := strings.ToLower(filepath.Ext(header.Filename))
-	allowed := map[string]bool{".txt": true, ".md": true, ".csv": true, ".json": true, ".docx": true}
+	allowed := map[string]bool{".txt": true, ".md": true, ".csv": true, ".json": true, ".docx": true, ".pdf": true, ".doc": true, ".pptx": true}
 	if !allowed[ext] {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "不支持的文件格式，请上传 .txt / .md / .csv / .json / .docx（PDF 暂不支持）",
+			"error": "不支持的文件格式，请上传 .txt / .md / .csv / .json / .doc / .docx / .pptx / .pdf",
 		})
 		return
 	}
@@ -117,6 +117,30 @@ func (s *Server) handleUploadDocument(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{
 				"error": "解析 DOCX 失败: " + err.Error(),
+			})
+			return
+		}
+	case ".pdf":
+		content, _, err = extractPDFText(r.Context(), data)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "解析 PDF 失败: " + err.Error(),
+			})
+			return
+		}
+	case ".doc":
+		content, err = extractDOCText(r.Context(), data)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "解析 DOC 失败: " + err.Error(),
+			})
+			return
+		}
+	case ".pptx":
+		content, err = extractPPTXText(r.Context(), data)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "解析 PPTX 失败: " + err.Error(),
 			})
 			return
 		}

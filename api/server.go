@@ -263,6 +263,8 @@ func (s *Server) SetMarketplace(mp *marketplace.Marketplace) {
 		hc.Branch = s.cfg.Skills.Hub.Branch
 	}
 	s.skillHub = hub.New(hc, mp.Dir())
+	// 启用「最近一次成功拉取」磁盘缓存层（离线优先：内存→磁盘缓存→内嵌种子→后台刷新）。
+	s.skillHub.SetCacheDir(hub.DefaultCacheDir())
 }
 
 // SetAgentRouter 设置多 Agent 路由器
@@ -487,6 +489,13 @@ func (s *Server) routes() http.Handler {
 	} else {
 		mux.HandleFunc("GET /api/v1/knowledge/documents", emptyList("documents"))
 	}
+
+	// 文档解析（无状态，不依赖知识库）：把上传文档抽取为纯文本供对话注入。
+	// PDF 在桌面 WKWebView 前端解析不可靠，下沉到后端（复用 hexagon rag/loader）。
+	mux.HandleFunc("POST /api/v1/documents/extract", s.handleExtractDocument)
+	// 文档原文件预览/下载：暂存原文件并以 http://localhost 提供（前端 shell open 渲染/下载）。
+	mux.HandleFunc("POST /api/v1/documents/preview", s.handleDocumentPreviewUpload)
+	mux.HandleFunc("GET /api/v1/documents/preview/{token}", s.handleDocumentPreviewGet)
 
 	// 会话 / 搜索 / 分支 API
 	if s.store != nil {
