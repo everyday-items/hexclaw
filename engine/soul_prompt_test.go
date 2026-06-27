@@ -21,11 +21,11 @@ func TestSystemPromptDefaultBehavior(t *testing.T) {
 		t.Fatalf("自定义 SOUL 无装饰时应原样返回，got=%q", got)
 	}
 
-	// locale 指令仍按重构前逻辑追加到末尾
+	// en locale 现在走原生 EN 人设（不再是 zh 人设 + 翻译指令）+ 运行手册 + locale 指令
 	if suffix := localeOutputDirective("en"); suffix != "" {
-		want := defaultSystemPrompt + "\n\n" + suffix
+		want := soulWithManual(defaultSoulEN) + "\n\n" + suffix
 		if got := systemPrompt(map[string]string{"user_locale": "en"}); got != want {
-			t.Fatalf("locale 指令未按预期追加")
+			t.Fatalf("en locale 应下发原生 EN 人设 + 运行手册 + locale 指令")
 		}
 	}
 }

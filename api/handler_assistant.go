@@ -28,7 +28,7 @@ func (s *Server) handleGetAssistantSoul(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, assistantSoulResponse{
 		SystemPrompt:  soul,
 		IsCustom:      soul != "",
-		DefaultPrompt: engine.DefaultSystemPrompt(),
+		DefaultPrompt: engine.DefaultSoul(),
 	})
 }
 
@@ -54,6 +54,6 @@ func (s *Server) handleUpdateAssistantSoul(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, assistantSoulResponse{
 		SystemPrompt:  soul,
 		IsCustom:      soul != "",
-		DefaultPrompt: engine.DefaultSystemPrompt(),
+		DefaultPrompt: engine.DefaultSoul(),
 	})
 }
