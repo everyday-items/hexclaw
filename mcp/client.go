@@ -23,6 +23,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
@@ -478,9 +479,41 @@ func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string
 
 	result, err := found.Execute(ctx, args)
 	if err != nil {
+		// stdio MCP 子进程退出（多因数据源连不上而自退）→ 传输层抛 EOF/连接已关，对用户是天书。
+		// 翻译成可操作的友好提示；底层传输错误只进日志，不糊用户脸上（bug-20260626 #3c）。
+		if isMCPConnClosed(err) {
+			logger.Error("MCP 工具调用失败：连接已关闭/进程退出", "tool", toolName, "error", err)
+			return "", fmt.Errorf("工具 %q 执行失败: MCP 服务进程已退出，请检查数据库连接配置（主机/端口/账号/密码）后重试", toolName)
+		}
 		return "", fmt.Errorf("工具 %q 执行失败: %w", toolName, err)
 	}
 	return result.String(), nil
+}
+
+// isMCPConnClosed 判断错误是否源自 MCP stdio 子进程退出 / 传输层关闭。
+// 这类错误（EOF / client is closing / connection closed / broken pipe / 已关闭的连接）
+// 对用户毫无可操作性，应翻译成「进程退出，检查配置」的友好提示。
+func isMCPConnClosed(err error) bool {
+	// 类型化判定优先（精准）：io.EOF / 管道已关。
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	// 字符串判定只收**明确属于传输/进程关闭**的短语。
+	// ⚠️ 不匹配裸 "EOF"——工具自身的业务错误可能含 "EOF"（如 JSON "unexpected EOF"、
+	// SQL "near 'EOF'"），裸匹配会把真错误误判成「进程已退出」并吞掉（bug-20260626 #3c 回归）。
+	s := err.Error()
+	for _, marker := range []string{
+		"client is closing",
+		"connection closed",
+		"broken pipe",
+		"file already closed",
+		"use of closed",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // ServerStatus MCP Server 状态信息

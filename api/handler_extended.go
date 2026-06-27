@@ -169,7 +169,10 @@ func (s *Server) handleCallMCPTool(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.mcpMgr.CallTool(r.Context(), req.Name, req.Arguments)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]string{"error": "工具 \"" + req.Name + "\" 执行失败: " + err.Error()})
+		// CallTool 已返回完整可读的错误（含工具名 + 失败原因），此处原样透出。
+		// 不再叠加 `工具 "<name>" 执行失败:` 前缀——否则与 CallTool 内部前缀重复，
+		// 形成「工具 "x" 执行失败: 工具 "x" 执行失败: ...」的双重包裹（bug-20260626）。
+		writeJSON(w, http.StatusOK, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"result": result})
