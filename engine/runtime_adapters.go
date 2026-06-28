@@ -8,11 +8,11 @@ import (
 	"sync/atomic"
 
 	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/ai-core/template"
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexagon/observe/trace"
 	hruntime "github.com/hexagon-codes/hexagon/runtime"
 	"github.com/hexagon-codes/hexclaw/adapter"
-	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
 type runtimeProviderSelector struct {
@@ -268,8 +268,45 @@ func runtimeToolCallsToAdapter(calls []hruntime.ToolCallRecord) []adapter.ToolCa
 			ID:        c.ID,
 			Name:      c.Name,
 			Arguments: c.Arguments,
-			Result:    stringx.TruncateWithSuffix(c.Result.Content, 500, "..."),
+			// 多 Agent 工具(orchestrate/spawn)放宽展示上限以保全尾部 hexclaw-subagents 哨兵块。
+			Result: truncateToolResultForDisplay(c.Name, c.Result.Content),
+			// 透传 hexagon 框架在执行点产出的执行真相（状态/耗时），客户端免去正文嗅探。
+			Status:     string(c.Result.Status),
+			DurationMs: c.Result.DurationMs,
 		})
 	}
 	return result
+}
+
+// runtimeBlocksToAdapter 把 hexagon 产出的有序内容块流（template.Blocks）转成 wire 形态。
+// 块只承载**顺序**（text 片段 + tool_use 位置）；富数据（status/duration）仍走扁平 ToolCalls，
+// 前端按块序渲染、在 tool_use 处用 id 取完整数据。tool_result 的 toolName 由同 id 的 tool_use 回填。
+func runtimeBlocksToAdapter(blocks template.Blocks) []adapter.Block {
+	if len(blocks) == 0 {
+		return nil
+	}
+	names := make(map[string]string, len(blocks))
+	for _, b := range blocks {
+		if b.Type == template.BlockToolUse {
+			names[b.ID] = b.Name
+		}
+	}
+	out := make([]adapter.Block, 0, len(blocks))
+	for _, b := range blocks {
+		switch b.Type {
+		case template.BlockText:
+			out = append(out, adapter.Block{Type: "text", Text: b.Text})
+		case template.BlockToolUse:
+			out = append(out, adapter.Block{Type: "tool_use", ID: b.ID, Name: b.Name, Input: b.Input})
+		case template.BlockToolResult:
+			out = append(out, adapter.Block{
+				Type:      "tool_result",
+				ToolUseID: b.ToolUseID,
+				ToolName:  names[b.ToolUseID],
+				Output:    truncateToolResultForDisplay(names[b.ToolUseID], b.Output),
+				IsError:   b.IsError,
+			})
+		}
+	}
+	return out
 }

@@ -247,6 +247,41 @@ var cronOnlyAutoApprove = map[string]bool{
 	"cron_task": true,
 }
 
+// solveAutoApprove are tools auto-approved for a genuine "solve" dispatch
+// (SolveSkill's internal solver/verifier/grader). code_exec there is sandboxed
+// homework computation, tool-scoped to code_exec only. Authorization is proven by
+// the unforgeable solve grant on ctx (see withSolveGrant) — NOT by the
+// LLM-forgeable metadata source string — so it is safe to run without an
+// approver, unlike a generic spawn whose code_exec stays hard-denied.
+var solveAutoApprove = map[string]bool{
+	"code_exec": true,
+}
+
+// ── 不可伪造的 solve 内部授权令牌（设计⑤根治）──
+//
+// 旧判据「metadata source==solve && spawn_depth>0」两个字段都源自 msg.Metadata，由 LLM/外部消息
+// 可伪造（react.go 把 metadata 原样灌进 ctx）。伪造顶层消息同塞两字段即可骗过闸放行 code_exec。
+// 改用一个 **typed context value**：只有 SolveSkill 在真派 solver/verifier/grader 时用 withSolveGrant
+// 盖它；它不是 metadata，外部消息无从注入。permission 据它（而非字符串 source）放行沙箱 code_exec。
+type ctxKeySolveGrantType struct{}
+
+var ctxKeySolveGrant = ctxKeySolveGrantType{}
+
+// withSolveGrant 盖受信 solve 授权令牌。SolveSkill 派子 Agent 时盖在传给 executeFunc 的 ctx 上，
+// 经 executeFunc→eng.Process→工具执行一路透传到 permission 闸。
+func withSolveGrant(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ctxKeySolveGrant, true)
+}
+
+// solveGrantFromContext 报告 ctx 是否携带受信 solve 授权令牌。
+func solveGrantFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(ctxKeySolveGrant).(bool)
+	return v
+}
+
 // unattendedHardDeny are tools that must NEVER auto-run from a system dispatch —
 // not even on a "low" verdict from the unattended risk reviewer: arbitrary code
 // execution and capability/host mutation. The reviewer is a single LLM call that
@@ -348,6 +383,17 @@ func (h *PermissionHook) requestApproval(ctx context.Context, call *ToolCallInfo
 	// (shell/code_exec): those still require a human, which with no session
 	// means deny. This keeps an externally-influenced webhook/spawn from
 	// silently registering an MCP server or editing files (BUG-20260613).
+	// P0 solve（设计⑤根治）：内部解题验证的 sandboxed code_exec 自动放行——**仅凭不可伪造的 solve
+	// grant**（typed ctx value，外部消息注入不进来），不再认可可伪造的 metadata source+spawn_depth。
+	// solve 子 Agent 工具被 spec 限定为仅 code_exec、leaf 深度、沙箱算题、无宿主变更/外部触发，故不属
+	// unattendedHardDeny 的 RCE 面。grant 也只授权 code_exec(solveAutoApprove)，不放宽任何其它工具。
+	// 放在 systemDispatch 判定之前：grant 是最权威的授权，与 metadata 无关。
+	if solveGrantFromContext(ctx) && solveAutoApprove[call.Name] {
+		logger.Info("[permission] solve-internal code_exec auto-approved (unforgeable grant)",
+			"tool_name", call.Name)
+		return nil
+	}
+
 	if src := systemDispatchSource(ctx); src != "" {
 		if systemDispatchAutoApprove[call.Name] || (src == "cron" && cronOnlyAutoApprove[call.Name]) {
 			logger.Info("[permission] collect tool auto-approved for pre-authorized system dispatch",

@@ -197,17 +197,24 @@ func TestBuildStreamMessages(t *testing.T) {
 	if msgs[0].Role != "system" {
 		t.Errorf("第一条消息应为 system，得到 %q", msgs[0].Role)
 	}
-	if msgs[1].Content != "你好" {
-		t.Errorf("用户消息内容不匹配: %q", msgs[1].Content)
+	// 前缀缓存优化：用户问题在当轮 user 消息（含当前时间前缀），system 不含每轮易变内容。
+	if !strings.Contains(msgs[1].Content, "你好") {
+		t.Errorf("用户消息应含用户问题: %q", msgs[1].Content)
+	}
+	if strings.Contains(msgs[0].Content, "[当前时间]") {
+		t.Errorf("system 消息不应含每轮易变的当前时间（破坏前缀缓存）: %q", msgs[0].Content)
 	}
 
-	// 有知识库上下文
+	// 有知识库上下文：KB 检索结果应在当轮 user 消息（history 之后），而非 system（保前缀缓存）。
 	msgs = eng.buildStreamMessages(context.Background(), "", nil, "相关知识内容", "你好", nil, nil)
 	if len(msgs) != 2 {
 		t.Fatalf("期望 2 条消息，得到 %d", len(msgs))
 	}
-	if !strings.Contains(msgs[0].Content, "[参考知识]") {
-		t.Error("system 消息应包含知识库内容")
+	if strings.Contains(msgs[0].Content, "[参考知识]") {
+		t.Error("[参考知识] 不应在 system 消息（应移到当轮 user 消息以保前缀缓存）")
+	}
+	if !strings.Contains(msgs[1].Content, "[参考知识]") || !strings.Contains(msgs[1].Content, "相关知识内容") {
+		t.Errorf("KB 检索结果应在当轮 user 消息: %q", msgs[1].Content)
 	}
 
 	// 有历史消息
@@ -219,8 +226,9 @@ func TestBuildStreamMessages(t *testing.T) {
 	if len(msgs) != 4 {
 		t.Fatalf("期望 4 条消息（system+2history+user），得到 %d", len(msgs))
 	}
-	if msgs[3].Content != "新问题" {
-		t.Errorf("最后一条应为用户新消息: %q", msgs[3].Content)
+	// 当轮 user 消息在 history 之后，含用户问题（+ 当前时间前缀，前缀缓存优化）。
+	if msgs[3].Role != "user" || !strings.Contains(msgs[3].Content, "新问题") {
+		t.Errorf("最后一条应为含用户问题的 user 消息: %q", msgs[3].Content)
 	}
 
 	// 有角色
@@ -361,13 +369,14 @@ func TestReActEngine_ProcessUsesDirectCompletionForAttachments(t *testing.T) {
 func TestReActEngine_ProcessUsesSessionHistoryForTextFollowUp(t *testing.T) {
 	provider := mockllm.NewLLMProvider("test").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
 		last := req.Messages[len(req.Messages)-1]
-		switch last.Content {
-		case "第一句":
+		// 当轮 user 消息含「当前时间」等前缀（前缀缓存优化），故按 Contains 匹配用户问题。
+		switch {
+		case strings.Contains(last.Content, "第一句"):
 			return &hexagon.CompletionResponse{
 				Content: "reply-1",
 				Usage:   hexagon.Usage{TotalTokens: 10},
 			}, nil
-		case "继续刚才的话题":
+		case strings.Contains(last.Content, "继续刚才的话题"):
 			if len(req.Messages) < 4 {
 				t.Fatalf("follow-up 请求应包含历史消息，实际仅 %d 条", len(req.Messages))
 			}

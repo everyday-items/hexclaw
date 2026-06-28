@@ -117,16 +117,16 @@ func TestFileOps_PathTraversalBlocked(t *testing.T) {
 // ============== SpawnSkill timeout ==============
 
 func TestSpawnSkill_Timeout(t *testing.T) {
-	slowExec := func(ctx context.Context, agent, task string) (string, error) {
+	slowExec := func(ctx context.Context, spec SubAgentSpec) (SubAgentResult, error) {
 		select {
 		case <-time.After(5 * time.Second):
-			return "done", nil
+			return SubAgentResult{Output: "done"}, nil
 		case <-ctx.Done():
-			return "partial", ctx.Err()
+			return SubAgentResult{Output: "partial"}, ctx.Err()
 		}
 	}
 
-	spawn := NewSpawnSkill(slowExec)
+	spawn := NewSpawnSkill(slowExec, nil)
 	result, err := spawn.Execute(context.Background(), map[string]any{
 		"agent_name": "test",
 		"task":       "slow task",
@@ -146,13 +146,13 @@ func TestSpawnSkill_Timeout(t *testing.T) {
 
 func TestOrchestrateSkill_ParallelExecution(t *testing.T) {
 	var execCount atomic.Int32
-	mockExec := func(ctx context.Context, agent, task string) (string, error) {
+	mockExec := func(ctx context.Context, spec SubAgentSpec) (SubAgentResult, error) {
 		execCount.Add(1)
 		time.Sleep(50 * time.Millisecond) // Simulate work
-		return "result from " + agent, nil
+		return SubAgentResult{Output: "result from " + spec.Agent}, nil
 	}
 
-	orch := NewOrchestrateSkill(mockExec)
+	orch := NewOrchestrateSkill(mockExec, nil)
 	result, err := orch.Execute(context.Background(), map[string]any{
 		"subtasks": []any{
 			map[string]any{"agent": "researcher", "task": "search competitors"},
