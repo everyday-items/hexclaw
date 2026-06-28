@@ -317,9 +317,10 @@ func buildClassifierPrompt(agents map[string]*AgentConfig) string {
 			sb.WriteString(fmt.Sprintf("  描述: %s", a.Description))
 		}
 		if a.SystemPrompt != "" {
+			// rune 安全：按码点切，避免把多字节中文系统提示切裂出 U+FFFD 再喂给分类 LLM。
 			truncated := a.SystemPrompt
-			if len(truncated) > 100 {
-				truncated = truncated[:100] + "..."
+			if r := []rune(truncated); len(r) > 100 {
+				truncated = string(r[:100]) + "..."
 			}
 			sb.WriteString(fmt.Sprintf("  职责: %s", truncated))
 		}
