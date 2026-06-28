@@ -202,7 +202,7 @@ func TestVectorSearch(t *testing.T) {
 	mgr.AddDocument(ctx, "Rust 安全", "Rust 通过所有权系统保证内存安全。", "test")
 
 	queryVec, _ := embedder.Embed(ctx, []string{"Go 并发编程"})
-	results, err := store.VectorSearch(ctx, queryVec[0], 3)
+	results, err := store.VectorSearch(ctx, queryVec[0], 3, Filter{})
 	if err != nil {
 		t.Fatalf("向量搜索失败: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestTextSearch(t *testing.T) {
 	mgr.AddDocument(ctx, "数据库", "SQLite 是一个轻量级数据库。\n\nPostgreSQL 是企业级数据库。", "test")
 	mgr.AddDocument(ctx, "网络", "HTTP 协议是 Web 的基础。\n\nTCP 提供可靠传输。", "test")
 
-	results, err := store.TextSearch(ctx, "数据库 SQLite", 5)
+	results, err := store.TextSearch(ctx, "数据库 SQLite", 5, Filter{})
 	if err != nil {
 		t.Fatalf("关键词搜索失败: %v", err)
 	}

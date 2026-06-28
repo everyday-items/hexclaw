@@ -285,7 +285,10 @@ func TestBug20260611_CronDispatchKnowledgeIngestClosedLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to load document: %v", err)
 	}
-	if doc.Title != "tech news digest" || !strings.Contains(doc.Content, "chip production ramp-up") {
+	// Cron writes are snapshot-named: knowledge_ingest appends a timestamp
+	// suffix to the title so each scheduled run creates a new document instead
+	// of overwriting the previous one. The base title is preserved as a prefix.
+	if !strings.HasPrefix(doc.Title, "tech news digest ") || !strings.Contains(doc.Content, "chip production ramp-up") {
 		t.Errorf("ingested document mismatch: title=%q content=%q", doc.Title, doc.Content)
 	}
 	if doc.Source != "cron:job-test" {
@@ -297,7 +300,7 @@ func TestBug20260611_CronDispatchKnowledgeIngestClosedLoop(t *testing.T) {
 	// but KB search returns 0 results"). With a nil embedder the manager
 	// degrades to FTS text search, same as production without an embedding
 	// provider.
-	hits, err := kbStore.TextSearch(ctx, "chip production", 5)
+	hits, err := kbStore.TextSearch(ctx, "chip production", 5, knowledge.Filter{})
 	if err != nil {
 		t.Fatalf("TextSearch failed: %v", err)
 	}
@@ -318,6 +321,10 @@ type brokenKB struct{}
 
 func (brokenKB) AddDocument(context.Context, string, string, string) (*knowledge.Document, error) {
 	return nil, errInjectedKBOutage
+}
+
+func (brokenKB) IngestSnapshot(context.Context, string, string, string) (*knowledge.Document, bool, error) {
+	return nil, false, errInjectedKBOutage
 }
 
 var errInjectedKBOutage = errors.New("knowledge base offline (injected fault)")

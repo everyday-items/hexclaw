@@ -57,7 +57,7 @@ func BenchmarkVectorSearch_100docs(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		store.VectorSearch(ctx, queryVec, 5)
+		store.VectorSearch(ctx, queryVec, 5, Filter{})
 	}
 }
 
