@@ -4,13 +4,15 @@ go 1.25.5
 
 require (
 	github.com/gorilla/websocket v1.5.3
-	github.com/hexagon-codes/ai-core v0.1.8
-	github.com/hexagon-codes/hexagon v0.5.5
-	github.com/hexagon-codes/toolkit v0.2.1
+	github.com/hexagon-codes/ai-core v0.1.11
+	github.com/hexagon-codes/hexagon v0.5.7
+	github.com/hexagon-codes/toolkit v0.2.3
 	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
+	github.com/open-dingtalk/dingtalk-stream-sdk-go v0.9.1
 	github.com/spf13/cobra v1.9.1
 	go.starlark.net v0.0.0-20260613233743-8ba36ccb83fb
 	go.uber.org/goleak v1.3.0
+	golang.org/x/net v0.53.0
 	golang.org/x/sync v0.20.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.52.0
@@ -19,6 +21,7 @@ require (
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/coder/websocket v1.8.15 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
