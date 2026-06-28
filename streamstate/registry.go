@@ -29,6 +29,7 @@ type Snapshot struct {
 	Metadata  map[string]string  `json:"metadata,omitempty"`
 	Usage     *adapter.Usage     `json:"usage,omitempty"`
 	ToolCalls []adapter.ToolCall `json:"tool_calls,omitempty"`
+	Blocks    []adapter.Block    `json:"blocks,omitempty"`
 	StartedAt time.Time          `json:"started_at"`
 	UpdatedAt time.Time          `json:"updated_at"`
 }
@@ -104,6 +105,9 @@ func (r *Registry) Append(requestID string, chunk *adapter.ReplyChunk) *Snapshot
 	}
 	if len(chunk.ToolCalls) > 0 {
 		item.ToolCalls = append([]adapter.ToolCall(nil), chunk.ToolCalls...)
+	}
+	if len(chunk.Blocks) > 0 {
+		item.Blocks = append([]adapter.Block(nil), chunk.Blocks...)
 	}
 	if chunk.Done {
 		item.Done = true
@@ -205,6 +209,9 @@ func cloneSnapshot(item *Snapshot) Snapshot {
 	}
 	if len(item.ToolCalls) > 0 {
 		copy.ToolCalls = append([]adapter.ToolCall(nil), item.ToolCalls...)
+	}
+	if len(item.Blocks) > 0 {
+		copy.Blocks = append([]adapter.Block(nil), item.Blocks...)
 	}
 	return copy
 }

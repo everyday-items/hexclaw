@@ -90,6 +90,52 @@ func (w *Writer) RemoveMCPServer(name string) error {
 	return w.writeConfig(cfg)
 }
 
+// KnowledgeRetrievalSettings 是检索参数面板（PUT /api/v1/knowledge/config）可调的字段集。
+// 与 KnowledgeConfig 的对应字段一一映射；其余知识库配置（enabled / embedding / 分块等）
+// 由 UpdateKnowledgeRetrieval 原样保留，不在面板作用域内。
+type KnowledgeRetrievalSettings struct {
+	Rerank      bool
+	RerankModel string
+	QueryExpand bool
+	Contextual  bool
+	MinScore    float64
+	CandidateK  int
+}
+
+// UpdateKnowledgeRetrieval 持久化检索参数面板字段（读-改-写，保留其余配置段与字段）。
+//
+// 与 AppendMCPServer 同套读-改-写机制：以 DefaultConfig 为底 overlay 盘上文件，只覆盖
+// 检索相关字段后整体写回，避免把文件未提及的段落零值化（见 readConfig 注释）。
+func (w *Writer) UpdateKnowledgeRetrieval(s KnowledgeRetrievalSettings) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	cfg, err := w.readConfig()
+	if err != nil {
+		return err
+	}
+	cfg.Knowledge.Rerank = s.Rerank
+	cfg.Knowledge.RerankModel = s.RerankModel
+	cfg.Knowledge.QueryExpand = s.QueryExpand
+	cfg.Knowledge.Contextual = s.Contextual
+	cfg.Knowledge.MinScore = s.MinScore
+	cfg.Knowledge.CandidateK = s.CandidateK
+	return w.writeConfig(cfg)
+}
+
+// ReadKnowledge 读回当前持久化的知识库配置段（检索参数面板 GET 用，反映最近一次保存值；
+// 在 PUT 之前则反映启动时的盘上配置）。
+func (w *Writer) ReadKnowledge() (KnowledgeConfig, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	cfg, err := w.readConfig()
+	if err != nil {
+		return KnowledgeConfig{}, err
+	}
+	return cfg.Knowledge, nil
+}
+
 func (w *Writer) readConfig() (*Config, error) {
 	data, err := os.ReadFile(w.path)
 	if err != nil {

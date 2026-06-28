@@ -159,6 +159,12 @@ func (r *Selector) isLocalProviderName(name string) bool {
 	return strings.Contains(strings.ToLower(name), "ollama")
 }
 
+// IsLocalProviderName 报告指定 provider 是否本地部署（如 Ollama，base_url 指向 localhost 或名含 ollama）。
+// 供上层据本地/云端差异调整策略（如 AP-098：本地慢/reasoning 模型放宽后台抽取超时）。
+func (r *Selector) IsLocalProviderName(name string) bool {
+	return r.isLocalProviderName(name)
+}
+
 // isLocalProvider 检查 provider 是否为本地部署（如 Ollama），本地 provider 不需要 API Key
 func isLocalProvider(pc config.LLMProviderConfig) bool {
 	u := strings.ToLower(pc.BaseURL)

@@ -52,10 +52,12 @@ func (e *RenderError) HTTPStatus() int {
 }
 
 // truncateStderr 把 stderr 截到不超过 1 KB（错误模型契约）。
+// rune 安全：按码点切，绝不在多字节中文/emoji 中间切裂出 U+FFFD。
 func truncateStderr(s string) string {
 	const max = 1024
-	if len(s) <= max {
+	r := []rune(s)
+	if len(r) <= max {
 		return s
 	}
-	return s[:max] + "...[truncated]"
+	return string(r[:max]) + "...[truncated]"
 }
