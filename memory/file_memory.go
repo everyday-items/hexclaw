@@ -16,7 +16,6 @@ package memory
 
 import (
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,7 +24,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/memory/recall"
 	fileutil "github.com/hexagon-codes/toolkit/util/file"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 const (
@@ -107,11 +108,16 @@ func isEntryHeader(line string) bool {
 
 // Options 记忆配置选项
 type Options struct {
-	Enabled   bool   `yaml:"enabled"`    // 是否启用文件记忆
-	Dir       string `yaml:"dir"`        // 记忆文件目录，默认 ~/.hexclaw/memory/
-	MaxMemory int    `yaml:"max_memory"` // MEMORY.md 最大行数，默认 200
-	DailyDays int    `yaml:"daily_days"` // 加载最近几天的日记，默认 2
+	Enabled    bool   `yaml:"enabled"`     // 是否启用文件记忆
+	Dir        string `yaml:"dir"`         // 记忆文件目录，默认 ~/.hexclaw/memory/
+	MaxMemory  int    `yaml:"max_memory"`  // MEMORY.md 最大行数，默认 200
+	DailyDays  int    `yaml:"daily_days"`  // 加载最近几天的日记，默认 2
+	ArchiveMax int    `yaml:"archive_max"` // 归档文件保留最近 N 条（修缺陷B 无界增长），默认 2000；<=0 用默认
 }
+
+// defaultArchiveMax 归档保留上限（修缺陷B）：evict/反思归档只追加、原本永不裁剪 → 单调增长 +
+// Capacity/列表全量解析延迟恶化。保留最近 N 条（环形），更老的硬删。
+const defaultArchiveMax = 2000
 
 // FileMemory 文件驱动的记忆系统
 //
@@ -121,6 +127,13 @@ type FileMemory struct {
 	mu     sync.RWMutex
 	config Options
 	dir    string // 记忆目录绝对路径
+
+	// 深度整合（"做梦"）阶段（dreaming.go）：opt-in、默认关。
+	consolidator ConsolidateLLM // nil → 深度阶段降级为 no-op（仅机械反思运行）
+	dreamOpts    *DreamOptions  // nil → DefaultDreamOptions（调参）
+
+	// 低频后台相墙钟（scheduled_phase.go）：持久化 last_run，支持开机补跑。
+	clock *phaseClock
 }
 
 // New 创建文件记忆系统
@@ -151,10 +164,14 @@ func New(cfg Options) (*FileMemory, error) {
 	if cfg.DailyDays <= 0 {
 		cfg.DailyDays = 2
 	}
+	if cfg.ArchiveMax <= 0 {
+		cfg.ArchiveMax = defaultArchiveMax
+	}
 
 	fm := &FileMemory{
 		config: cfg,
 		dir:    dir,
+		clock:  newPhaseClock(dir),
 	}
 
 	logger.Info("dir", "dir", dir)
@@ -188,6 +205,28 @@ func (fm *FileMemory) GetMemory() string {
 	fm.mu.RLock()
 	defer fm.mu.RUnlock()
 	return fm.readFileFrom(fm.roleDir(""), memoryActiveFile)
+}
+
+// GetMemoryForPrompt 返回 _global 记忆、但逐行剥掉存储层内联 meta 标签（<!--m:eid/pin/vt…-->）。
+// 注入 LLM（抽取提示/上下文）一律用本方法而非裸 GetMemory：标签是存储制品，对模型是噪声且白耗 token
+// （缺陷H 后每条都带 eid 标签，问题从"部分结构化条目"放大到"全部"）。保留 时间/类型 前缀与正文。
+func (fm *FileMemory) GetMemoryForPrompt() string {
+	fm.mu.RLock()
+	defer fm.mu.RUnlock()
+	return stripInlineMetaLines(fm.readFileFrom(fm.roleDir(""), memoryActiveFile))
+}
+
+// stripInlineMetaLines 逐行剥掉行尾内联 meta 标签，保留前缀与正文。无标签则原样返回。
+func stripInlineMetaLines(raw string) string {
+	if !strings.Contains(raw, entryMetaPrefix) {
+		return raw
+	}
+	lines := strings.Split(raw, "\n")
+	for i, ln := range lines {
+		pure, _ := splitEntryMeta(ln)
+		lines[i] = pure
+	}
+	return strings.Join(lines, "\n")
 }
 
 // GetDaily 获取指定日期的日记
@@ -276,7 +315,7 @@ type SearchResult struct {
 
 // MemoryEntry 结构化记忆条目（从 MEMORY.md 行解析而来）
 type MemoryEntry struct {
-	ID         string `json:"id"`         // 行号 hash，如 "m-7"
+	ID         string `json:"id"`         // 稳定内容寻址 ID（如 "e1a2b3…"，缺陷H）；旧条目无内联 ID → 回退行号 ID（如 "m-7"）
 	Content    string `json:"content"`    // 记忆正文
 	Type       string `json:"type"`       // identity/preference/fact/instruction/context
 	Source     string `json:"source"`     // manual/chat_explicit/chat_extract/system
@@ -285,6 +324,16 @@ type MemoryEntry struct {
 	HitCount   int    `json:"hit_count"`  // 命中次数（预留）
 	Status     string `json:"status"`     // active/archived
 	ArchivedAt string `json:"archived_at,omitempty"`
+	// 地基 A：结构化元数据（内联 meta 标签持久化，G3 时序留史 + Pinned）。
+	Pinned     bool    `json:"pinned,omitempty"`
+	Subject    string  `json:"subject,omitempty"`
+	ValidFrom  string  `json:"valid_from,omitempty"`
+	ValidTo    string  `json:"valid_to,omitempty"`
+	Supersedes string  `json:"supersedes,omitempty"`
+	Confidence float32 `json:"confidence,omitempty"`
+	// lineIdx 是本条目在所属文件中的当前起始行号（解析时填入）。包内淘汰/反思/做梦的就地行操作用它定位，
+	// 不再从 ID 反解行号——缺陷H 修复后 ID 是稳定内容寻址 ID（与行号脱钩），反解会失效。未导出、不入 JSON。
+	lineIdx int
 }
 
 // MemoryCapacity 容量信息
@@ -441,9 +490,9 @@ func (fm *FileMemory) SaveEntryForRole(content, memType, source, role string) er
 		return nil
 	}
 
-	// 全局类型（identity/preference/instruction）始终写入 _global
+	// 全局类型（identity/preference/instruction/rule）始终写入 _global（跨角色、常驻保证带）
 	targetDir := fm.roleDir(role)
-	if memType == "identity" || memType == "preference" || memType == "instruction" {
+	if isGlobalMemType(memType) {
 		targetDir = fm.roleDir("")
 	}
 
@@ -460,17 +509,30 @@ func (fm *FileMemory) SaveEntryForRole(content, memType, source, role string) er
 	// 2. 容量淘汰（在写锁内直接执行，不调用 evictIfNeeded 避免死锁）
 	fm.evictIfNeededUnlocked(targetDir)
 
+	// 走结构化单写器：统一铸稳定 ID（缺陷H）+ 过 PII 守卫（缺陷J），不再绕过。
+	return fm.appendStructuredEntryUnlocked(targetDir, memType, source, content, EntryMeta{})
+}
+
+// isGlobalMemType 报告该类型是否强制写入 _global（跨角色可见、常驻保证带）。
+func isGlobalMemType(memType string) bool {
+	switch memType {
+	case "identity", "preference", "instruction", "rule":
+		return true
+	}
+	return false
+}
+
+// appendEntryUnlocked 追加一条结构化条目到目标目录的 MEMORY.md（调用方已持写锁）。
+func (fm *FileMemory) appendEntryUnlocked(targetDir, memType, source, content string) error {
 	path := filepath.Join(targetDir, memoryActiveFile)
 	if err := fileutil.MkdirAll(targetDir); err != nil {
 		return fmt.Errorf("创建记忆目录失败: %w", err)
 	}
-
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("打开记忆文件失败: %w", err)
 	}
 	defer f.Close()
-
 	timestamp := time.Now().Format("15:04")
 	entry := fmt.Sprintf("\n- [%s] [%s:%s] %s\n", timestamp, memType, source, content)
 	if _, err := f.WriteString(entry); err != nil {
@@ -498,9 +560,26 @@ func (fm *FileMemory) ParseEntriesForRole(role string) []MemoryEntry {
 		return globalEntries
 	}
 	roleEntries := fm.parseEntriesFromDir(fm.roleDir(role))
-	// role entries 的 ID 加前缀避免与 global 冲突
+	// role entries 的行号 ID 加 r- 前缀避免与 global 冲突；稳定 ID（缺陷H）本身全局唯一 → 不改写。
 	for i := range roleEntries {
-		roleEntries[i].ID = "r-" + roleEntries[i].ID[2:] // m-N → r-N
+		if looksLikeLineID(roleEntries[i].ID) {
+			roleEntries[i].ID = "r-" + roleEntries[i].ID[2:] // m-N → r-N
+		}
+	}
+	return append(globalEntries, roleEntries...)
+}
+
+// parseEntriesForRoleUnlocked 解析角色记忆（_global + role 合并，调用方已持写锁）。
+func (fm *FileMemory) parseEntriesForRoleUnlocked(role string) []MemoryEntry {
+	globalEntries := fm.parseEntriesFromDirUnlocked(fm.roleDir(""))
+	if role == "" {
+		return globalEntries
+	}
+	roleEntries := fm.parseEntriesFromDirUnlocked(fm.roleDir(role))
+	for i := range roleEntries {
+		if looksLikeLineID(roleEntries[i].ID) {
+			roleEntries[i].ID = "r-" + roleEntries[i].ID[2:]
+		}
 	}
 	return append(globalEntries, roleEntries...)
 }
@@ -631,7 +710,9 @@ func extractContentFromLine(line string) string {
 			}
 		}
 	}
-	return line
+	// 地基 A：去重比对用纯正文，剥掉行尾内联 meta 标签。
+	pure, _ := splitEntryMeta(line)
+	return pure
 }
 
 // jaccardSimilarity 基于词集的 Jaccard 相似度
@@ -662,13 +743,6 @@ func jaccardSimilarity(a, b string) float64 {
 
 // ─── 容量淘汰（加权评分） ────────────────────────────────
 
-// evictIfNeeded 当容量已满时将评分最低的条目降级到归档（带锁，供外部调用）。
-func (fm *FileMemory) evictIfNeeded(dir string) {
-	fm.mu.Lock()
-	defer fm.mu.Unlock()
-	fm.evictIfNeededUnlocked(dir)
-}
-
 // evictIfNeededUnlocked 当容量已满时将评分最低的条目降级到归档（调用方已持有写锁）。
 func (fm *FileMemory) evictIfNeededUnlocked(dir string) {
 	entries := fm.parseEntriesFromDirUnlocked(dir)
@@ -676,65 +750,35 @@ func (fm *FileMemory) evictIfNeededUnlocked(dir string) {
 		return
 	}
 
-	// 找评分最低的条目（instruction 类不淘汰）
-	lowestScore := float64(1e9)
+	// 找最该淘汰（保留价值最低）的条目。
+	lowestScore := float64(1e18)
 	lowestIdx := -1
 	now := time.Now()
 
 	for _, e := range entries {
-		if e.Type == "instruction" {
-			continue // instruction 永不淘汰
+		// 硬保护带（修复 BUG-A）：与 recall.SelectResident 同一白名单 + 用户显式置顶 → 永不淘汰。
+		// 旧逻辑只保 instruction，会把 Pinned 画像/置顶事实、rule 硬规则、identity 身份误删（做梦留史之洞）。
+		if e.Pinned || e.Type == "rule" || e.Type == "identity" || e.Type == "instruction" {
+			continue
 		}
-
-		score := entryEvictionScore(e, now)
+		// 单一真相源（修复 BUG-B）：淘汰用与召回同口径的 recall.Score（recency+importance，query 无关、
+		// 含 salience/类型先验/召回频次），不再用独立 entryEvictionScore（两套打分会漂移、删掉召回最看重的）。
+		score := recall.Score(toRecallEntry(e), 0, now, recall.DefaultWeights(), recall.DefaultLambdaPerDay)
+		// 已失效的留史条（ValidTo 过期）优先淘汰：做梦/反思留史会累积历史，空间紧张时先剪历史、保活跃事实。
+		if !entryValidAt(e, now) {
+			score = -1
+		}
 		if score < lowestScore {
 			lowestScore = score
-			lowestIdx = parseEntryLineIndex(e.ID)
+			lowestIdx = e.lineIdx
 		}
 	}
 
 	if lowestIdx < 0 {
-		return // 全是 instruction，无法淘汰
+		return // 全是受保护条目（罕见）：无法淘汰，MaxMemory 应调大
 	}
 
 	_ = fm.moveEntryLineUnlocked(dir, memoryActiveFile, memoryArchiveFile, lowestIdx)
-}
-
-// entryEvictionScore 计算条目的保留评分（越高越不该被淘汰）
-func entryEvictionScore(e MemoryEntry, now time.Time) float64 {
-	// hit_count 权重 0.3
-	hitScore := float64(e.HitCount) * 0.3
-
-	// recency 权重 0.3 (距今天数的倒数，越新越高)
-	created, err := time.Parse(time.RFC3339, e.CreatedAt)
-	recencyScore := 0.3 // 默认
-	if err == nil {
-		daysSince := now.Sub(created).Hours() / 24
-		if daysSince < 1 {
-			daysSince = 1
-		}
-		recencyScore = (1.0 / daysSince) * 0.3
-	}
-
-	// type 权重 0.2
-	typeWeights := map[string]float64{
-		"identity":   0.6,
-		"preference": 0.4,
-		"fact":       0.2,
-		"context":    0.0,
-	}
-	typeScore := typeWeights[e.Type] * 0.2
-
-	// source 权重 0.2
-	sourceWeights := map[string]float64{
-		"manual":        0.6,
-		"chat_explicit": 0.4,
-		"chat_extract":  0.2,
-		"system":        0.0,
-	}
-	sourceScore := sourceWeights[e.Source] * 0.2
-
-	return hitScore + recencyScore + typeScore + sourceScore
 }
 
 // parseEntriesFromDir 从指定目录解析活跃 MEMORY.md（带 RLock）
@@ -779,6 +823,7 @@ func (fm *FileMemory) parseEntriesFromFileUnlocked(dir, filename, status, idPref
 	for _, block := range blocks {
 		e := MemoryEntry{
 			ID:        fmt.Sprintf("%s-%d", idPrefix, block.startLine),
+			lineIdx:   block.startLine, // 真实行号（淘汰/反思/做梦就地行操作用它，与稳定 ID 解耦）
 			Type:      "fact",
 			Source:    "manual",
 			CreatedAt: defaultDate + "T00:00:00Z",
@@ -813,7 +858,21 @@ func (fm *FileMemory) parseEntriesFromFileUnlocked(dir, filename, status, idPref
 			}
 		}
 
-		e.Content = line
+		// 地基 A：分离行尾内联 meta 标签 → 填充结构化字段（旧条目无标签 → 零值）。
+		pure, emeta := splitEntryMeta(line)
+		e.Content = pure
+		if emeta.ID != "" { // 修缺陷H：有稳定 ID 则用它作条目标识（删/改/移行不漂移）；旧条目无标签 → 回退行号 ID。
+			e.ID = emeta.ID
+		}
+		e.Pinned = emeta.Pinned
+		e.Subject = emeta.Subject
+		e.ValidFrom = emeta.ValidFrom
+		e.ValidTo = emeta.ValidTo
+		e.Supersedes = emeta.Supersedes
+		e.Confidence = emeta.Confidence
+		if emeta.HitCount > 0 {
+			e.HitCount = emeta.HitCount
+		}
 		if e.Content != "" {
 			entries = append(entries, e)
 		}
@@ -821,10 +880,20 @@ func (fm *FileMemory) parseEntriesFromFileUnlocked(dir, filename, status, idPref
 	return entries
 }
 
-func (fm *FileMemory) moveEntryLine(dir, fromFile, toFile string, lineIdx int) error {
-	fm.mu.Lock()
-	defer fm.mu.Unlock()
-	return fm.moveEntryLineUnlocked(dir, fromFile, toFile, lineIdx)
+// metaLineIdx 返回块 [start,end) 内**承载内联 meta 标签的行**＝最后一个非空行。
+// parse 从块尾（splitEntryMeta 作用于整块拼接文本）读取标签，故所有就地 meta 改写都必须落在这一行；
+// 单行条目 == start（与历史行为逐字节一致），多行条目则落最后一条正文行——杜绝标签写到首行而被
+// 后续 parse 当作正文（双标签污染 / 元数据丢失）。
+func metaLineIdx(lines []string, start, end int) int {
+	if end > len(lines) {
+		end = len(lines)
+	}
+	for i := end - 1; i >= start && i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) != "" {
+			return i
+		}
+	}
+	return start
 }
 
 // findBlockByStartLine 在文件内容中找到以 startLine 开头的条目块。
@@ -896,10 +965,39 @@ func (fm *FileMemory) moveEntryLineUnlocked(dir, fromFile, toFile string, lineId
 
 	// Step 2: 更新源文件（删除该条目的所有行）
 	lines = removeLineRange(lines, blockStart, blockEnd)
-	if err := os.WriteFile(fromPath, []byte(strings.Join(lines, "\n")), 0644); err != nil {
+	if err := atomicWriteFile(fromPath, []byte(strings.Join(lines, "\n")), 0644); err != nil {
 		return fmt.Errorf("更新记忆文件失败: %w", err)
 	}
+	if toFile == memoryArchiveFile { // 修缺陷B：移入归档后裁剪到 ArchiveMax，防无界增长
+		fm.capArchiveUnlocked(dir)
+	}
 	return nil
+}
+
+// capArchiveUnlocked 把归档文件裁剪到最近 ArchiveMax 条（修缺陷B 无界增长）。调用方已持写锁。
+// 按条目首行（`- [`）切块，保留尾部 N 块（最新），更老的硬删。best-effort：失败不阻断主流程。
+func (fm *FileMemory) capArchiveUnlocked(dir string) {
+	maxN := fm.config.ArchiveMax
+	if maxN <= 0 {
+		return
+	}
+	path := filepath.Join(dir, memoryArchiveFile)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(raw), "\n")
+	var starts []int
+	for i, ln := range lines {
+		if strings.HasPrefix(strings.TrimSpace(ln), "- [") {
+			starts = append(starts, i)
+		}
+	}
+	if len(starts) <= maxN {
+		return
+	}
+	keepFrom := starts[len(starts)-maxN] // 保留最近 maxN 条的首行起
+	_ = atomicWriteFile(path, []byte(strings.Join(lines[keepFrom:], "\n")), 0644)
 }
 
 // UpdateEntry 更新指定 ID 的记忆条目内容
@@ -909,13 +1007,15 @@ func (fm *FileMemory) moveEntryLineUnlocked(dir, fromFile, toFile string, lineId
 func (fm *FileMemory) UpdateEntry(id, content string) error {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
+	return fm.updateEntryUnlocked(id, content)
+}
 
-	filename, lineIdx := parseEntryFileAndLine(id)
+// updateEntryUnlocked 更新指定 ID 条目内容（调用方已持写锁）。
+func (fm *FileMemory) updateEntryUnlocked(id, content string) error {
+	dir, filename, lineIdx := fm.resolveEntryLocationUnlocked(id)
 	if lineIdx < 0 {
 		return fmt.Errorf("记忆条目不存在: %s", id)
 	}
-
-	dir := fm.resolveEntryDir(id)
 	path := filepath.Join(dir, filename)
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -929,15 +1029,25 @@ func (fm *FileMemory) UpdateEntry(id, content string) error {
 		return fmt.Errorf("记忆条目不存在: %s", id)
 	}
 
-	// 保留首行的时间戳和元数据前缀，替换内容部分
+	// 保留首行的时间戳和类型前缀，替换正文。
+	// 修缺陷H：保留条目既有内联 meta（稳定 ID/Pinned/Subject/时序锚）——内容编辑不应让条目丢失稳定标识或常驻位。
+	// meta 是单行构造：仅当新正文也是单行时重新挂回；新正文多行则退化为无 meta 的多行条目（与既有多行约定一致）。
 	oldFirstLine := strings.TrimSpace(lines[blockStart])
-	newFirstLine := rebuildEntryLine(oldFirstLine, strings.TrimSpace(content))
+	_, meta := splitEntryMeta(stripEntryPrefix(oldFirstLine))
+	newContent := strings.TrimSpace(content)
+	if !strings.Contains(newContent, "\n") {
+		if tag := meta.serialize(); tag != "" {
+			newContent += " " + tag
+		}
+	}
+	newFirstLine := rebuildEntryLine(oldFirstLine, newContent)
 
-	// 用新内容替换整个块（新内容可能也是多行的）
-	newLines := append(lines[:blockStart], newFirstLine)
+	// 用新内容替换整个块（新内容可能也是多行的）。
+	// 全切片表达式 lines[:blockStart:blockStart] 强制 append 重新分配，避免覆写后续 lines[blockEnd:]。
+	newLines := append(lines[:blockStart:blockStart], newFirstLine)
 	newLines = append(newLines, lines[blockEnd:]...)
 
-	return os.WriteFile(path, []byte(strings.Join(newLines, "\n")), 0644)
+	return atomicWriteFile(path, []byte(strings.Join(newLines, "\n")), 0644)
 }
 
 // DeleteEntry 删除指定 ID 的记忆条目
@@ -947,12 +1057,10 @@ func (fm *FileMemory) DeleteEntry(id string) error {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 
-	filename, lineIdx := parseEntryFileAndLine(id)
+	dir, filename, lineIdx := fm.resolveEntryLocationUnlocked(id)
 	if lineIdx < 0 {
 		return fmt.Errorf("记忆条目不存在: %s", id)
 	}
-
-	dir := fm.resolveEntryDir(id)
 	path := filepath.Join(dir, filename)
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -968,32 +1076,31 @@ func (fm *FileMemory) DeleteEntry(id string) error {
 
 	lines = removeLineRange(lines, blockStart, blockEnd)
 
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
+	return atomicWriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
 }
 
 // ArchiveEntry 将活跃记忆降级到归档。
+// 解析与移动同持一把写锁：稳定 ID 现扫现定位，杜绝解析后行号漂移的 TOCTOU。
 func (fm *FileMemory) ArchiveEntry(id string) error {
-	filename, lineIdx := parseEntryFileAndLine(id)
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	dir, filename, lineIdx := fm.resolveEntryLocationUnlocked(id)
 	if filename != memoryActiveFile || lineIdx < 0 {
 		return fmt.Errorf("只能归档活跃记忆: %s", id)
 	}
-	return fm.moveEntryLine(fm.roleDir(""), memoryActiveFile, memoryArchiveFile, lineIdx)
+	return fm.moveEntryLineUnlocked(dir, memoryActiveFile, memoryArchiveFile, lineIdx)
 }
 
 // RestoreEntry 将归档记忆恢复为活跃记忆。
 func (fm *FileMemory) RestoreEntry(id string) error {
-	filename, lineIdx := parseEntryFileAndLine(id)
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	dir, filename, lineIdx := fm.resolveEntryLocationUnlocked(id)
 	if filename != memoryArchiveFile || lineIdx < 0 {
 		return fmt.Errorf("只能恢复归档记忆: %s", id)
 	}
-	fm.evictIfNeeded(fm.roleDir(""))
-	return fm.moveEntryLine(fm.roleDir(""), memoryArchiveFile, memoryActiveFile, lineIdx)
-}
-
-// parseEntryLineIndex 从 "m-7" 格式的 ID 解析出行号
-func parseEntryLineIndex(id string) int {
-	_, idx := parseEntryFileAndLine(id)
-	return idx
+	fm.evictIfNeededUnlocked(dir)
+	return fm.moveEntryLineUnlocked(dir, memoryArchiveFile, memoryActiveFile, lineIdx)
 }
 
 func parseEntryFileAndLine(id string) (string, int) {
@@ -1017,6 +1124,65 @@ func parseEntryFileAndLine(id string) (string, int) {
 		return memoryArchiveFile, n
 	}
 	return memoryActiveFile, n
+}
+
+// looksLikeLineID 报告 id 是否为旧式行号 ID（`m-`/`a-`/`r-` 前缀 + 纯数字）。
+// 稳定 ID（缺陷H 修复后，形如 `e<hex>`）不命中 → 走内容寻址扫描；二者形态正交、无歧义。
+func looksLikeLineID(id string) bool {
+	if len(id) < 3 || id[1] != '-' {
+		return false
+	}
+	if id[0] != 'm' && id[0] != 'a' && id[0] != 'r' {
+		return false
+	}
+	for i := 2; i < len(id); i++ {
+		if id[i] < '0' || id[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveEntryLocationUnlocked 把一个条目 ID 解析为其**当前**位置 (dir, filename, lineIdx)。调用方已持锁。
+//
+// 修缺陷H：稳定 ID 不绑行号——按内容寻址扫描定位当前行；行号会随删/改/移行漂移，故每次现扫现定位。
+// 旧式行号 ID（`m-N`/`a-N`/`r-N`）保持原 O(1) 行号解析，向后兼容。未找到 → lineIdx=-1。
+func (fm *FileMemory) resolveEntryLocationUnlocked(id string) (dir, filename string, lineIdx int) {
+	if looksLikeLineID(id) {
+		filename, lineIdx = parseEntryFileAndLine(id)
+		if lineIdx < 0 {
+			return "", "", -1
+		}
+		return fm.resolveEntryDir(id), filename, lineIdx
+	}
+	return fm.scanStableIDUnlocked(id)
+}
+
+// scanStableIDUnlocked 扫描全部记忆文件（_global + 各角色子目录的活跃/归档），按内联 eid 命中定位条目。
+// 调用方已持锁。记忆有界（活跃 ≤ MaxMemory、归档 ≤ ArchiveMax）→ 扫描成本可控；变更操作低频。
+func (fm *FileMemory) scanStableIDUnlocked(id string) (string, string, int) {
+	dirs := []string{fm.roleDir("")}
+	if entries, err := os.ReadDir(fm.dir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() && e.Name() != "_global" {
+				dirs = append(dirs, filepath.Join(fm.dir, e.Name()))
+			}
+		}
+	}
+	for _, dir := range dirs {
+		for _, fn := range []string{memoryActiveFile, memoryArchiveFile} {
+			raw, err := os.ReadFile(filepath.Join(dir, fn))
+			if err != nil {
+				continue
+			}
+			for _, b := range splitEntryBlocks(string(raw)) {
+				if _, m := splitEntryMeta(stripEntryPrefix(b.text)); m.ID == id {
+					return dir, fn, b.startLine
+				}
+			}
+		}
+	}
+	return "", "", -1
 }
 
 // resolveEntryDir 根据 ID 前缀确定记忆条目所在的目录。
@@ -1088,7 +1254,7 @@ func (fm *FileMemory) UpdateMemory(content string) error {
 	dir := fm.roleDir("")
 	_ = fileutil.MkdirAll(dir)
 	path := filepath.Join(dir, memoryActiveFile)
-	return os.WriteFile(path, []byte(content), 0644)
+	return atomicWriteFile(path, []byte(content), 0644)
 }
 
 // ClearAll 清空所有记忆文件

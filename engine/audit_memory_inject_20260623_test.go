@@ -63,20 +63,21 @@ func TestAudit_LongTermMemoryNotTruncated_20260623(t *testing.T) {
 
 	eng.SetFileMemory(fm)
 
-	// 构造 system prompt：长期记忆应当被注入，标记应当出现。
+	// 长期记忆召回应被注入到当轮 user 消息（前缀缓存优化后从 system 迁出），标记应当出现。
 	msgs := eng.buildStreamMessages(context.Background(), "", nil, "", "介绍下剀哥", nil, nil)
-	sys := msgs[0].Content
-	if !strings.Contains(sys, "长期记忆") {
-		t.Fatalf("system prompt 未注入任何长期记忆块")
+	turn := msgs[len(msgs)-1].Content
+	if !strings.Contains(turn, "memory-context") {
+		t.Fatalf("当轮 user 消息未注入任何长期记忆块")
 	}
-	if !strings.Contains(sys, marker) {
+	if !strings.Contains(turn, marker) {
 		t.Errorf("BUG#3b: 长期记忆被截断，排在 500 字符后的记忆 %q 丢失 —— 问答无法回答该记忆内容", marker)
 	}
 }
 
 // AUDIT bug#3a: 引擎在"挂载时记忆为空、之后才写入"的场景下也必须能注入。
 // （main.go 用 memCtxLen>0 当挂载闸门 → 首次添加的记忆要等下次重启才生效；本测试钉死引擎侧能力，
-//   配合 main.go 改为"只要 fileMem 创建成功就挂载"。）
+//
+//	配合 main.go 改为"只要 fileMem 创建成功就挂载"。）
 func TestAudit_MemoryInjectedWhenEmptyAtAttach_20260623(t *testing.T) {
 	eng := newEngineForMemoryAudit(t)
 
@@ -96,7 +97,7 @@ func TestAudit_MemoryInjectedWhenEmptyAtAttach_20260623(t *testing.T) {
 	}
 
 	msgs := eng.buildStreamMessages(context.Background(), "", nil, "", "我刚才告诉你的是什么", nil, nil)
-	if !strings.Contains(msgs[0].Content, marker) {
+	if !strings.Contains(msgs[len(msgs)-1].Content, marker) {
 		t.Errorf("BUG#3a: 挂载后新增的记忆未被注入：%q", marker)
 	}
 }
