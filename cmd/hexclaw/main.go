@@ -13,6 +13,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"log/slog"
@@ -32,6 +33,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	imagegen "github.com/hexagon-codes/ai-core/media/image"
 	videogen "github.com/hexagon-codes/ai-core/media/video"
 	"github.com/hexagon-codes/ai-core/media/voice"
@@ -39,6 +41,8 @@ import (
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexagon/observe/events"
 	"github.com/hexagon-codes/hexagon/observe/trace"
+	"github.com/hexagon-codes/hexagon/rag/reranker"
+	"github.com/hexagon-codes/hexagon/rag/splitter"
 	genstore "github.com/hexagon-codes/toolkit/blobstore"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
@@ -75,7 +79,7 @@ import (
 
 // 版本信息，通过 -ldflags 注入
 var (
-	version = "v0.4.7"
+	version = "v0.4.8"
 	commit  = "none"
 	date    = "unknown"
 )
@@ -410,6 +414,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 4.7 注册高级 Skill (需依赖注入: sandbox/hub/mcp)
 	skillDeps := builtin.SkillDeps{
 		McpMgr: mcpMgr,
+		// 用户经数据连接器授权的本地目录 → 注入 code_exec 沙箱只读放行（BUG-20260626）。
+		SandboxReadablePaths: cfg.Skill.Sandbox.Filesystem.AllowedPaths,
 	}
 	builtin.RegisterAdvanced(skills, cfg.Skill.Builtin, &skillDeps)
 	advCount := len(skills.All()) - builtinCount - mdCount
@@ -594,9 +600,16 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			}
 
 			if emb != nil {
-				sharedEmbedder = emb // 共享给 VectorMemory 和语义搜索
+				// #2 Embedding 缓存：LRU 10000 + singleflight 防击穿，
+				//    消除每次查询/重导都重打 embedding API 的成本与延迟。
+				// #5 截断闸：入 embedding API 前按 rune 截断超长文本，
+				//    防单条超长输入触发模型 token 超限错误/超量计费。
+				//    truncating 置于 cache 外层，使缓存键作用于截断后文本。
+				cached := hexagon.NewCachedEmbedder(emb) // 默认 LRU 10000
+				sharedEmbedder = knowledge.NewTruncatingEmbedder(cached, 0)
 			}
-			// 2. 构造 splitter: hexagon RecursiveSplitter
+			// 2. 构造 splitter: MarkdownSplitter（#7 保留 header_path 结构元数据；
+			//    对纯文本/无标题内容会自动按 chunkSize 退化为递归切分，无回归）
 			chunkSize := cfg.Knowledge.ChunkSize
 			if chunkSize <= 0 {
 				chunkSize = 400
@@ -605,9 +618,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			if chunkOverlap <= 0 {
 				chunkOverlap = 80
 			}
-			sp := hexagon.NewRecursiveSplitter(
-				hexagon.WithRecursiveChunkSize(chunkSize),
-				hexagon.WithRecursiveChunkOverlap(chunkOverlap),
+			sp := splitter.NewMarkdownSplitter(
+				splitter.WithMarkdownChunkSize(chunkSize),
+				splitter.WithMarkdownChunkOverlap(chunkOverlap),
+				splitter.WithHeadersToSplit([]string{"#", "##", "###", "####"}),
+				splitter.WithCodeBlockAware(true),
 			)
 
 			// 3. 混合检索配置
@@ -622,14 +637,96 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				hybridCfg.MMRLambda = cfg.Knowledge.MMRLambda
 			}
 			hybridCfg.TimeDecayDays = cfg.Knowledge.TimeDecayDays
+			// best-practice 检索开关（默认全开，可配关）
+			hybridCfg.RerankEnabled = cfg.Knowledge.Rerank
+			hybridCfg.ExpandEnabled = cfg.Knowledge.QueryExpand
+			hybridCfg.ContextualEnabled = cfg.Knowledge.Contextual
+			hybridCfg.MinScore = cfg.Knowledge.MinScore
+			if cfg.Knowledge.CandidateK > 0 {
+				hybridCfg.CandidateK = cfg.Knowledge.CandidateK
+			}
+			// #12 query/doc 嵌入非对称：显式配置优先，否则按模型智能默认
+			//（nomic 系用其官方任务前缀 search_query/search_document；bge-m3/openai 无需前缀）
+			qp, dp := cfg.Knowledge.Embedding.QueryPrefix, cfg.Knowledge.Embedding.DocPrefix
+			if qp == "" && dp == "" && strings.Contains(strings.ToLower(embModel), "nomic") {
+				qp, dp = "search_query: ", "search_document: "
+			}
+			hybridCfg.EmbedQueryPrefix = qp
+			hybridCfg.EmbedDocPrefix = dp
 
 			// 4. 创建 Manager (kbStore 同时实现 DocumentRepository + ChunkSearcher)
 			// 注意: 传 sharedEmbedder（接口类型）而非 emb（*OpenAIEmbedder），
 			// 避免 Go 接口 nil 陷阱（typed nil pointer 使接口非 nil 但 receiver 为 nil）
-			kbMgr := knowledge.NewManager(kbStore, kbStore, sharedEmbedder,
+			mgrOpts := []knowledge.ManagerOption{
 				knowledge.WithSplitter(sp),
 				knowledge.WithHybridConfig(hybridCfg),
-			)
+				// Bound each scheduled-task snapshot series so an @hourly collector
+				// cannot grow the local KB without limit (IngestSnapshot prunes the
+				// oldest past this cap).
+				knowledge.WithSnapshotRetention(cfg.Knowledge.SnapshotRetention),
+			}
+			// #6/#8 注入 LLM（复用 Agent 的 LLM router）：重排 + 查询扩展。
+			// router 为 nil 时不注入 → rerank/query-expand 自动降级关闭（安全）。
+			if router != nil {
+				mgrOpts = append(mgrOpts, knowledge.WithLLM(knowledge.RerankLLMFunc(
+					func(ctx context.Context, prompt string) (string, error) {
+						provider, _, rErr := router.Route(ctx)
+						if rErr != nil {
+							return "", rErr
+						}
+						resp, cErr := provider.Complete(ctx, hexagon.CompletionRequest{
+							Messages: []hexagon.Message{{Role: hexagon.RoleUser, Content: prompt}},
+						})
+						if cErr != nil {
+							return "", cErr
+						}
+						return resp.Content, nil
+					})))
+				// 多模态入库：注入视觉转写器（router 的视觉模型给图片生成中文描述，再走文本 RAG 入库）。
+				// router 为 nil 时不注入 → AddImageDocument 优雅报错而非吞入垃圾。
+				mgrOpts = append(mgrOpts, knowledge.WithCaptioner(knowledge.CaptionerFunc(
+					func(ctx context.Context, image []byte, mime string) (string, error) {
+						provider, _, rErr := router.Route(ctx)
+						if rErr != nil {
+							return "", rErr
+						}
+						if mime == "" {
+							mime = "image/png"
+						}
+						dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
+						resp, cErr := provider.Complete(ctx, hexagon.CompletionRequest{
+							Messages: []hexagon.Message{{
+								Role: hexagon.RoleUser,
+								MultiContent: []llm.ContentPart{
+									llm.NewTextPart("请用中文客观、简洁地描述这张图片的主要内容（包含其中可见的文字），用于知识库检索。只输出描述本身。"),
+									llm.NewImageURLPart(dataURL, "auto"),
+								},
+							}},
+						})
+						if cErr != nil {
+							return "", cErr
+						}
+						return resp.Content, nil
+					})))
+			}
+			// 专用 cross-encoder 重排：配置 rerank_model（或 SiliconFlow 自动）时，用
+			// hexagon CohereReranker 指向同 provider 的 /rerank 端点，替代慢/贵的 LLM 重排。
+			if pc, ok := cfg.LLM.Providers[embProviderName]; ok {
+				rerankModel := cfg.Knowledge.RerankModel
+				if rerankModel == "" && strings.Contains(strings.ToLower(pc.BaseURL), "siliconflow") {
+					rerankModel = "BAAI/bge-reranker-v2-m3"
+				}
+				if rerankModel != "" && pc.APIKey != "" {
+					rerankBase := strings.TrimSuffix(strings.TrimSuffix(pc.BaseURL, "/"), "/v1")
+					mgrOpts = append(mgrOpts, knowledge.WithDocReranker(
+						reranker.NewCohereReranker(pc.APIKey,
+							reranker.WithCohereBaseURL(rerankBase),
+							reranker.WithCohereModel(rerankModel),
+							reranker.WithCohereTopK(hybridCfg.CandidateK))))
+					logger.Info("[knowledge] 启用专用 cross-encoder 重排", "model", rerankModel)
+				}
+			}
+			kbMgr := knowledge.NewManager(kbStore, kbStore, sharedEmbedder, mgrOpts...)
 			eng.SetKnowledgeBase(kbMgr)
 			// Register the knowledge_ingest skill: the only channel for the Agent
 			// to persist content into the knowledge base. Without it the
@@ -642,6 +739,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			// FileOps workspace via resolveSafePath.
 			if err := skills.Register(builtin.NewKnowledgeIngestPathSkill(kbMgr, builtin.DefaultWorkspace())); err != nil {
 				logger.Warn("[knowledge] failed to register knowledge_ingest_path skill", "err", err.Error())
+			}
+			// knowledge_search: opt-in SCOPED retrieval with metadata filters
+			// (source / source_type / date). Complements the engine's automatic
+			// whole-KB RAG injection for when the model wants narrowed recall.
+			if err := skills.Register(builtin.NewKnowledgeSearchSkill(kbMgr)); err != nil {
+				logger.Warn("[knowledge] failed to register knowledge_search skill", "err", err.Error())
 			}
 			kbOK = true
 		}
@@ -675,8 +778,97 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	if fileMem != nil {
 		eng.SetFileMemory(fileMem)
 		fmt.Printf("  ✓ Memory      文件记忆 (%d 字符) + 自动记忆\n", len(fileMem.LoadContext()))
+		// 增量 G①：配了 embedding 时为长期记忆召回接入向量化器 → hybrid（0.7 向量 + 0.3 BM25）。
+		// 复用 KB 共享 embedder（已含 LRU 缓存 + 截断闸）；没配 embedding 则不接线，召回降级纯 BM25（行为不变）。
+		if sharedEmbedder != nil {
+			eng.SetMemoryEmbedder(sharedEmbedder)
+			fmt.Println("  ✓ Memory      长期记忆 hybrid 召回 (向量 + BM25)")
+		}
+		// 增量 C：manage_memory 自管工具（AI 显式管理长期记忆：记住/更新/忘掉/置顶）。
+		if err := skills.Register(builtin.NewManageMemorySkill(fileMem)); err != nil {
+			fmt.Printf("  ✗ manage_memory 注册失败: %v\n", err)
+		}
+		// 增量 B：周期反思整合（默认关、opt-in）。零 LLM 确定性维护：去重 / 时序取代留史 / 晋升降级 / 归档陈旧。
+		if cfg.FileMemory.Reflect {
+			interval := time.Duration(cfg.FileMemory.ReflectIntervalMins) * time.Minute
+			if cfg.FileMemory.Dreaming && router != nil {
+				// 多阶段 dreaming（对标 OpenClaw）：light=机械反思（每 interval），deep=LLM 聚类合成留史（每 deep）。
+				// 注入文本 LLM 整合器（复用 router）；nil router 时回退纯机械反思。
+				fileMem.WithConsolidator(llmCompleteFunc(func(ctx context.Context, prompt string) (string, error) {
+					provider, _, rErr := router.Route(ctx)
+					if rErr != nil {
+						return "", rErr
+					}
+					resp, cErr := provider.Complete(ctx, hexagon.CompletionRequest{
+						Messages: []hexagon.Message{{Role: hexagon.RoleUser, Content: prompt}},
+					})
+					if cErr != nil {
+						return "", cErr
+					}
+					return resp.Content, nil
+				}))
+				deep := time.Duration(cfg.FileMemory.DreamingIntervalMins) * time.Minute
+				stopDream := fileMem.StartDreaming(ctx, interval, deep)
+				defer stopDream()
+				// 回放相（engine 级，对标 Claude Dreaming「回放历史 session 提取模式」）：低频回放原始会话，
+				// 复用抽取补「每轮在线抽取漏掉的」事实（memory=off 的轮 / inline+弱模型漏存 / 导入的旧会话）。
+				// 单用户桌面：回放 desktop-user（= api.defaultDesktopUserID）的会话。
+				stopReplay := eng.StartSessionReplay(ctx, "desktop-user", deep, deep*2)
+				defer stopReplay()
+				fmt.Printf("  ✓ Memory      多阶段 dreaming 已启用 (light 每 %d 分 / deep+回放 每 %d 分)\n",
+					cfg.FileMemory.ReflectIntervalMins, cfg.FileMemory.DreamingIntervalMins)
+			} else {
+				stopReflect := fileMem.StartReflection(ctx, interval)
+				defer stopReflect()
+				fmt.Printf("  ✓ Memory      反思整合已启用 (每 %d 分钟)\n", cfg.FileMemory.ReflectIntervalMins)
+			}
+		}
+		// 增量 G③：周期画像蒸馏（默认关、opt-in，deep 相）。低频把零碎事实 LLM 合成稳定用户画像 → Pinned 条。
+		// 与机械反思并存不替换；prompt 强制只综合不杜撰。
+		if cfg.FileMemory.Profile {
+			syn := engine.NewProfileSynthesizer(eng)
+			interval := time.Duration(cfg.FileMemory.ProfileIntervalMins) * time.Minute
+			stopProfile := fileMem.StartProfileDistillation(ctx, interval, syn, memory.DistillProfileConfig{})
+			defer stopProfile()
+			fmt.Printf("  ✓ Memory      画像蒸馏已启用 (每 %d 分钟)\n", cfg.FileMemory.ProfileIntervalMins)
+		}
+		// 增量 G②：回复前主动会话深召回（默认开，仅 DM/交互式）。FTS-fast 零 LLM + 超时 + 熔断；
+		// 把「该想起来」的旧上下文主动浮现，而非只等模型主动调 session_search。nil 配置=默认开。
+		if cfg.FileMemory.ActiveRecall == nil || *cfg.FileMemory.ActiveRecall {
+			eng.SetActiveRecall(engine.NewActiveRecall(store))
+			fmt.Println("  ✓ Memory      主动会话召回已启用 (回复前 FTS 深召回)")
+		}
 	} else {
 		fmt.Println("  ✗ Memory      未启用")
+	}
+
+	// 修缺陷G：接线 DB 维护安全阀（StartMaintenance / CleanupOldSessions 原本实现了却从未被调用=死代码）。
+	// ① 周期 WAL checkpoint + 超阈值自动 VACUUM：纯维护、零数据丢失 → 无条件启用。
+	stopMaint := store.StartMaintenance(ctx, cfg.Storage.SQLite.Path, time.Hour)
+	defer stopMaint()
+	fmt.Println("  ✓ Storage     DB 维护已启用 (WAL checkpoint + 超阈值自动 VACUUM)")
+	// ② 会话保留清理：opt-in（session_retention_days>0 才删；个人桌面 app 默认永久保留历史）。
+	if days := cfg.Storage.SQLite.SessionRetentionDays; days > 0 {
+		cleanCtx, cancelClean := context.WithCancel(ctx)
+		defer cancelClean()
+		runCleanup := func() {
+			if n, err := store.CleanupOldSessions(cleanCtx, days); err == nil && n > 0 {
+				fmt.Printf("  ✓ Storage     已清理过期会话 %d 个 (保留 %d 天)\n", n, days)
+			}
+		}
+		runCleanup() // 启动即清一次，其后每日一次
+		go func() {
+			t := time.NewTicker(24 * time.Hour)
+			defer t.Stop()
+			for {
+				select {
+				case <-cleanCtx.Done():
+					return
+				case <-t.C:
+					runCleanup()
+				}
+			}
+		}()
 	}
 
 	// 7.5 初始化向量语义记忆 (D4: 链路④修复)
@@ -701,12 +893,18 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	srv := api.NewServer(cfg, eng, gw, store)
 	srv.SetVersion(version)
 
-	// §11.8 交互层：Prompt 库（服务端下发 + CRUD）+ 记忆薄版（standing/fact 每轮注入）。
+	// §11.8 交互层：Prompt 库（服务端下发 + CRUD）。
+	// 砍薄版（§5）：旧记忆薄版 library.MemoryStore + /api/v1/memories 已并入统一文件记忆；
+	// 升级首启时一次性迁移历史 memories 表 → FileMemory（standing→rule / fact→fact），迁移后删表（幂等）。
 	promptStore := library.NewPromptStore(store.DB())
-	memStore := library.NewMemoryStore(store.DB())
 	srv.SetPromptStore(promptStore)
-	srv.SetMemoryStore(memStore)
-	eng.SetMemoryProvider(memStore) // 每轮组 prompt 时注入 standing 全量 + fact 命中
+	if fileMem != nil {
+		if n, mErr := memory.MigrateLegacyMemories(ctx, store.DB(), fileMem); mErr != nil {
+			fmt.Printf("  ⚠ Memory      旧记忆薄版迁移失败（不阻断启动）: %v\n", mErr)
+		} else if n > 0 {
+			fmt.Printf("  ✓ Memory      旧记忆薄版已迁移 %d 条 → 统一文件记忆\n", n)
+		}
+	}
 
 	// 8.0.1 接入沙箱网络热更新 (Bug2 修复)
 	if skillDeps.CodeExecSkill != nil {
@@ -805,6 +1003,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				// per tick. Wired BEFORE scheduler.Start (the start itself is
 				// deferred until the desktop notifier is set, review L7).
 				scheduler.SetAgentRunner(func(runCtx context.Context, job *cron.Job) (cron.AgentResult, error) {
+					// The stable snapshot base title (job.Name) is stamped by the
+					// scheduler's runAgentJob before this runner is called, so any
+					// knowledge_ingest in this round writes a coherent series — that
+					// contract now lives in (and is tested by) the cron package.
 					// NewCronDispatchMessage stamps source=cron, which the engine
 					// relies on to skip the skill fast path and intent guidance.
 					reply, err := eng.Process(runCtx, engine.NewCronDispatchMessage(
@@ -828,7 +1030,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				// knowledge-init block above.
 				if kb := eng.KnowledgeBase(); kb != nil {
 					scheduler.SetKBIngest(func(ingestCtx context.Context, title, content, source string) (string, error) {
-						doc, err := kb.AddDocument(ingestCtx, title, content, source)
+						// kb_ingest is cron-exclusive, so every Starlark script
+						// write is a scheduled snapshot: append a new document
+						// (never overwrite the previous run), skip the write when
+						// content is unchanged, and keep a bounded series. `title`
+						// is the script's stable base title for the series.
+						doc, _, err := kb.IngestSnapshot(ingestCtx, title, content, source)
 						if err != nil {
 							return "", err
 						}
@@ -1035,29 +1242,62 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	if err := skills.Register(engine.NewHandoffSkill(agentRouter)); err != nil {
 		logger.Error("注册 HandoffSkill 失败", "error", err)
 	}
-	// OrchestrateSkill + SpawnSkill 共享 executor: 通过 engine.Process 执行子任务
-	agentExecFn := func(ctx context.Context, agentName, task string) (string, error) {
+	// P1/#7 能力路由自省：让主 Agent 先看清有哪些专门 Agent 再派，避免盲派不存在的角色名。
+	if err := skills.Register(engine.NewListAgentsSkill(agentRouter)); err != nil {
+		logger.Error("注册 ListAgentsSkill 失败", "error", err)
+	}
+	// 子 Agent 注册表（运行时纵深骨架：角色/工具继承/持久化/session/续接）。
+	subagentRegistry := engine.NewSubAgentRegistry(engine.DefaultSubAgentRegistryFile())
+	srv.SetSubAgentRegistry(subagentRegistry)
+
+	// orchestrate 并发自适应「LLM 后端」而非 CPU 核心：HexClaw 子 Agent 干的是 LLM 调用，
+	// 瓶颈在 provider rate-limit/成本（云端）或本机模型吞吐（本地，同机扛不住多并发推理）。
+	// 默认 provider 是本地 → 并发收到 2；云端 → 放到 8。
+	if defaultProviderIsLocal(cfg) {
+		engine.SetMaxOrchestrateConcurrency(2)
+	} else {
+		engine.SetMaxOrchestrateConcurrency(8)
+	}
+
+	// #4 reduce 合成：fan-out 后用 synthesizer 把子产出归并 + 冲突检测，替代裸拼接。同样按 LLM
+	// 后端自适应——云端模型归并质量高、值这一次额外调用 → 开；本地模型慢且归并参差 → 关（裸拼接）。
+	engine.SetOrchestrateSynthesis(!defaultProviderIsLocal(cfg))
+
+	// #5 supervisor 反馈环：云端放开迭代轮数上限（首轮 + 至多 2 轮补派）；本地模型出结构化 JSON 决策
+	// 不可靠（监工调用易空耗一次推理后 fail-parse），收到 1 = 等同关闭迭代，永远单轮。
+	if defaultProviderIsLocal(cfg) {
+		engine.SetMaxSupervisorRounds(1)
+	} else {
+		engine.SetMaxSupervisorRounds(3)
+	}
+
+	// OrchestrateSkill + SpawnSkill 共享 executor: 通过 engine.Process 执行子任务。
+	// spec 携带 role/source/spawn_depth/工具继承/run_id/session，由 ApplySpecToMessage 落到 metadata。
+	agentExecFn := func(ctx context.Context, spec engine.SubAgentSpec) (engine.SubAgentResult, error) {
 		msg := &adapter.Message{
 			ID:       "sub-" + idgen.NanoID(),
 			Platform: adapter.PlatformAPI,
 			UserID:   "system",
-			Content:  task,
-			// "source":"spawn" lets the engine-side system-dispatch guard
-			// recognize sub-task dispatches (sources: cron-dispatch /
-			// heartbeat / webhook / spawn).
-			Metadata: map[string]string{"role": agentName, "source": "spawn"},
+			Content:  spec.Task,
 		}
+		engine.ApplySpecToMessage(msg, spec)
 		reply, err := eng.Process(ctx, msg)
 		if err != nil {
-			return "", err
+			return engine.SubAgentResult{}, err
 		}
-		return reply.Content, nil
+		// msg.SessionID 经 Process 解析后即子会话 id；session-mode 回传供后续续聊。
+		return engine.SubAgentResult{Output: reply.Content, SessionID: msg.SessionID}, nil
 	}
-	if err := skills.Register(engine.NewOrchestrateSkill(agentExecFn)); err != nil {
+	if err := skills.Register(engine.NewOrchestrateSkill(agentExecFn, subagentRegistry)); err != nil {
 		logger.Error("注册 OrchestrateSkill 失败", "error", err)
 	}
-	if err := skills.Register(engine.NewSpawnSkill(agentExecFn)); err != nil {
+	if err := skills.Register(engine.NewSpawnSkill(agentExecFn, subagentRegistry)); err != nil {
 		logger.Error("注册 SpawnSkill 失败", "error", err)
+	}
+	// P0（K12 正确性）：solve = 带 code_exec 独立验证的解题工具。verifier 子 Agent 只许 code_exec、
+	// fresh-context 重算，把"算术幻觉"这一 K12 头号错因用执行 grounding 兜住。
+	if err := skills.Register(engine.NewSolveSkill(agentExecFn, subagentRegistry)); err != nil {
+		logger.Error("注册 SolveSkill 失败", "error", err)
 	}
 
 	agentCount := len(agentRouter.ListAgents())
@@ -1134,6 +1374,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					}
 				case "edge", "edge-tts":
 					multiCfg = append(multiCfg, voice.MultiTTSConfig{Provider: "edge-tts"})
+				default:
+					// 不再静默丢弃：未识别的 chain provider 显式告警（避免"配了没生效"无感知）。
+					// 付费 provider（openai-tts/azure）在 chain 中的完整接入为后续 feature；
+					// 桌面默认走免费 edge-tts，不受影响。
+					fmt.Printf("  ⚠️  Voice TTS chain: 跳过未识别的 provider %q（chain 目前支持 minimax/edge）\n", name)
 				}
 			}
 			if chained := voice.BuildMultiTTS(multiCfg); chained != nil {
@@ -1349,6 +1594,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 直连 messageHandler，不走 instanceMgr，故不会被此回执波及。
 	instanceMgr.SetHandler(func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
 		reply, err := messageHandler(ctx, msg)
+		// IM 端无结构化工具卡：把本轮工具活动追加为紧凑文本尾注，让 Telegram/企业微信/飞书等
+		// 用户也能看到「调用了什么工具、成没成、结果摘要」。桌面经 wa 直连 messageHandler、
+		// 不走此 handler，故工具卡体验不受影响（避免桌面气泡重复展示）。
+		if reply != nil && len(reply.ToolCalls) > 0 {
+			reply.Content += adapter.ToolCallDigest(reply.ToolCalls)
+		}
 		title := string(msg.Platform) + " 新消息"
 		if msg.UserName != "" {
 			title = msg.UserName + " · " + string(msg.Platform)
@@ -1374,6 +1625,16 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			logger.Warn("[send] failed to register send_message skill", "err", err.Error())
 		} else {
 			fmt.Println("  ✓ Skill       send_message (§11.2 + §11.10 unified gate)")
+		}
+	}
+
+	// 记忆检索双通道之「会话深召回」：session_search 让 Agent 按关键词翻原始历史会话（FTS 兜底），
+	// 与策展事实注入互补（方案 §6bis.B / §7.2）。
+	if store != nil {
+		if err := skills.Register(builtin.NewSessionSearchSkill(store)); err != nil {
+			logger.Warn("[memory] failed to register session_search skill", "err", err.Error())
+		} else {
+			fmt.Println("  ✓ Skill       session_search (会话深召回)")
 		}
 	}
 
@@ -1978,4 +2239,26 @@ func typstVersion() string {
 		return "typst-" + parts[1]
 	}
 	return "typst-unknown"
+}
+
+// defaultProviderIsLocal 判定默认 LLM provider 是否为本地（Ollama 类）：base_url 指向 localhost。
+// 用于 orchestrate 并发自适应——本地模型同机扛不住多并发推理，并发应收到 2。
+func defaultProviderIsLocal(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	p, ok := cfg.LLM.Providers[cfg.LLM.Default]
+	if !ok {
+		return false
+	}
+	url := strings.ToLower(p.BaseURL)
+	return strings.Contains(url, "localhost") || strings.Contains(url, "127.0.0.1") || strings.Contains(url, "11434")
+}
+
+// llmCompleteFunc 把 router 文本补全闭包适配为 memory.ConsolidateLLM（dreaming 深相整合用）。
+type llmCompleteFunc func(ctx context.Context, prompt string) (string, error)
+
+// Complete 实现 memory.ConsolidateLLM。
+func (f llmCompleteFunc) Complete(ctx context.Context, prompt string) (string, error) {
+	return f(ctx, prompt)
 }
