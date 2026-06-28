@@ -177,7 +177,10 @@ func testEmailConnection(ctx context.Context, raw json.RawMessage) (bool, string
 		Password: smtp.Password,
 		From:     smtp.From,
 	}); err != nil {
-		return false, "SMTP 认证失败: " + err.Error()
+		// ProbeSMTP 已返回分类好的、面向用户的消息（连接失败 / STARTTLS / 认证失败），
+		// 直接透出。不再统一前缀"认证失败"——否则连接层失败（如 EOF）会被误标为认证问题，
+		// 误导用户反复检查密码。
+		return false, err.Error()
 	}
 	detail := "SMTP 认证通过"
 

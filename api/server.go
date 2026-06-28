@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -80,7 +81,6 @@ type Server struct {
 	webhookMgr        *webhook.Manager             // Webhook 管理器（可选）
 	scheduler         *cron.Scheduler              // Cron 调度器（可选）
 	promptStore       *library.PromptStore         // §11.8 Prompt 库（可选）
-	memStore          *library.MemoryStore         // §11.8 记忆薄版（可选）
 	fileMem           *memory.FileMemory           // 文件记忆（可选）
 	vectorMem         *memory.VectorMemory         // 向量语义记忆（可选）
 	mcpMgr            *hexmcp.Manager              // MCP 管理器（可选）
@@ -111,6 +111,7 @@ type Server struct {
 	toolMetrics       *engine.ToolMetricsCollector // 工具指标（可选）
 	toolPerms         *engine.ToolPermissions      // 工具权限（可选）
 	checkpointMgr     *engine.CheckpointManager    // 检查点管理器（可选）
+	subagentRegistry  *engine.SubAgentRegistry     // 子 Agent 派生运行注册表（可选，观测/续接）
 	cfgTxMgr          *config.TransactionManager   // v0.4.0 F9 配置事务热加载（可选）
 	cronParseProvider hexagon.Provider             // D2.1 Layer 2 cron parse LLM provider
 	cronParseModel    string                       // D2.1 cron parse 模型名（建议 haiku/mini 类快模型）
@@ -205,11 +206,6 @@ func (s *Server) SetPromptStore(ps *library.PromptStore) {
 	s.promptStore = ps
 }
 
-// SetMemoryStore 设置记忆薄版存储（§11.8）。设置后启用 /api/v1/memories CRUD。
-func (s *Server) SetMemoryStore(ms *library.MemoryStore) {
-	s.memStore = ms
-}
-
 // SetCronParser 注入 Layer 2 cron 自然语言 → JSON 解析所需的 LLM provider + model（D2.1）。
 //
 // 该 provider 配合 ResponseFormat=json_object + Tools=nil + Metadata.cron_context=true
@@ -272,6 +268,27 @@ func (s *Server) SetMarketplace(mp *marketplace.Marketplace) {
 // 设置后启用 Agent 路由管理 API。
 func (s *Server) SetAgentRouter(r *router.Dispatcher) {
 	s.agentRouter = r
+}
+
+// SetSubAgentRegistry 注入子 Agent 派生运行注册表（观测/续接）。
+func (s *Server) SetSubAgentRegistry(reg *engine.SubAgentRegistry) {
+	s.subagentRegistry = reg
+}
+
+// handleListSubAgentRuns GET /api/v1/subagents/runs —— 列出最近的子 Agent 派生运行
+// （含角色/深度/状态/耗时/父子树），供桌面端可观测面板/审计使用（feature 3）。
+func (s *Server) handleListSubAgentRuns(w http.ResponseWriter, r *http.Request) {
+	if s.subagentRegistry == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"runs": []any{}})
+		return
+	}
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": s.subagentRegistry.List(limit)})
 }
 
 // SetAgentStore 设置 Agent/Rule 持久化层
@@ -486,6 +503,8 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("DELETE /api/v1/knowledge/documents/{id}", s.handleDeleteDocument)
 		mux.HandleFunc("POST /api/v1/knowledge/documents/{id}/reindex", s.handleReindexDocument)
 		mux.HandleFunc("POST /api/v1/knowledge/search", s.handleSearchKnowledge)
+		mux.HandleFunc("GET /api/v1/knowledge/config", s.handleGetKnowledgeConfig)
+		mux.HandleFunc("PUT /api/v1/knowledge/config", s.handlePutKnowledgeConfig)
 	} else {
 		mux.HandleFunc("GET /api/v1/knowledge/documents", emptyList("documents"))
 	}
@@ -558,12 +577,7 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /api/v1/prompts", s.handleUpsertPrompt)
 		mux.HandleFunc("DELETE /api/v1/prompts/{id}", s.handleDeletePrompt)
 	}
-	// §11.8 记忆薄版 API
-	if s.memStore != nil {
-		mux.HandleFunc("GET /api/v1/memories", s.handleListUserMemories)
-		mux.HandleFunc("POST /api/v1/memories", s.handleUpsertUserMemory)
-		mux.HandleFunc("DELETE /api/v1/memories/{id}", s.handleDeleteUserMemory)
-	}
+	// 砍薄版（§5）：/api/v1/memories（旧记忆薄版 CRUD）已移除，长期记忆统一走 /api/v1/memory（文件记忆）。
 
 	// Webhook API
 	if s.webhookMgr != nil {
@@ -593,6 +607,8 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("PUT /api/v1/memory/{id}", s.handleUpdateMemory)
 		mux.HandleFunc("POST /api/v1/memory/{id}/archive", s.handleArchiveMemoryItem)
 		mux.HandleFunc("POST /api/v1/memory/{id}/restore", s.handleRestoreMemoryItem)
+		mux.HandleFunc("POST /api/v1/memory/{id}/pin", s.handlePinMemoryItem)
+		mux.HandleFunc("POST /api/v1/memory/{id}/unpin", s.handleUnpinMemoryItem)
 		mux.HandleFunc("DELETE /api/v1/memory/{id}", s.handleDeleteMemoryItem)
 		mux.HandleFunc("DELETE /api/v1/memory", s.handleDeleteMemory)
 		mux.HandleFunc("GET /api/v1/memory/search", s.handleSearchMemory)
@@ -693,6 +709,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/canvas/workflows/{id}", s.handleDeleteWorkflow)
 	mux.HandleFunc("POST /api/v1/canvas/workflows/{id}/run", s.handleRunWorkflow)
 	mux.HandleFunc("GET /api/v1/canvas/runs/{id}", s.handleGetWorkflowRun)
+	mux.HandleFunc("POST /api/v1/canvas/runs/{id}/resume", s.handleResumeWorkflowRun)
+	mux.HandleFunc("GET /api/v1/subagents/runs", s.handleListSubAgentRuns)
 
 	// 语音 API
 	if s.voiceSvc != nil {
@@ -896,6 +914,7 @@ type ChatResponse struct {
 	Metadata  map[string]string  `json:"metadata,omitempty"`   // 元数据
 	Usage     *adapter.Usage     `json:"usage,omitempty"`      // Token 使用统计
 	ToolCalls []adapter.ToolCall `json:"tool_calls,omitempty"` // 工具调用记录
+	Blocks    []adapter.Block    `json:"blocks,omitempty"`     // 有序内容块（多步交错按序渲染）
 }
 
 // handleChat 同步聊天端点
@@ -1047,6 +1066,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		var metadata map[string]string
 		var usage *adapter.Usage
 		var toolCalls []adapter.ToolCall
+		var blocks []adapter.Block
 		for chunk := range chunks {
 			if chunk.Error != nil {
 				trace.L(ctx).Error("处理失败", "err", chunk.Error)
@@ -1060,6 +1080,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				metadata = chunk.Metadata
 				usage = chunk.Usage
 				toolCalls = chunk.ToolCalls
+				blocks = chunk.Blocks
 			}
 		}
 		trace.L(ctx).Info("流式消费完成", "content_len", content.Len())
@@ -1071,6 +1092,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			Metadata:  metadata,
 			Usage:     usage,
 			ToolCalls: toolCalls,
+			Blocks:    blocks,
 		}
 	} else {
 		var err error
@@ -1093,6 +1115,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Metadata:  reply.Metadata,
 		Usage:     reply.Usage,
 		ToolCalls: reply.ToolCalls,
+		Blocks:    reply.Blocks,
 	})
 }
 

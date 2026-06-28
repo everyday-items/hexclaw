@@ -505,11 +505,22 @@ func TestE2E_ToolError_SurfacesInClosedLoop(t *testing.T) {
 
 // TestE2E_MultiTurn_HistoryConsistency 验证多轮闭环的历史一致性：
 // 同一 session 的第二轮请求，engine 必须把第一轮的 user+assistant 注入 LLM。
+// userQueryOf 取出当轮 user 消息里的原始问题。续7 前缀缓存优化把「当前时间/KB/记忆」等
+// 易变上下文以 "<turn-context>\n\n<query>" 形式注入**当轮 user 消息**(engine buildTurnContext)，
+// 以保 Anthropic/DeepSeek 前缀缓存；该注入仅用于 LLM-call 消息，**不进持久化历史**（存原文）。
+// echo-mock 须只回吐真正的用户问题，否则把合法注入误判为「回复串台」（见 AP-112，bug-20260627）。
+func userQueryOf(content string) string {
+	if i := strings.LastIndex(content, "\n\n"); i >= 0 {
+		return content[i+2:]
+	}
+	return content
+}
+
 func TestE2E_MultiTurn_HistoryConsistency(t *testing.T) {
 	provider := mockllm.NewLLMProvider("mock").WithResponseFn(
 		func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
 			last := req.Messages[len(req.Messages)-1].Content
-			switch last {
+			switch userQueryOf(last) {
 			case "我叫小明":
 				return &hexagon.CompletionResponse{Content: "你好小明", Usage: hexagon.Usage{TotalTokens: 6}}, nil
 			case "我叫什么":
@@ -637,7 +648,7 @@ func TestE2E_ConcurrentSessions_Isolation(t *testing.T) {
 			// 回复直接回显最后一条 user 内容，便于校验归属。
 			last := req.Messages[len(req.Messages)-1].Content
 			return &hexagon.CompletionResponse{
-				Content: "回复:" + last,
+				Content: "回复:" + userQueryOf(last),
 				Usage:   hexagon.Usage{TotalTokens: 5},
 			}, nil
 		})
@@ -715,7 +726,7 @@ func TestE2E_SameSessionConcurrent_NoMessageLoss(t *testing.T) {
 	provider := mockllm.NewLLMProvider("mock").WithResponseFn(
 		func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
 			last := req.Messages[len(req.Messages)-1].Content
-			return &hexagon.CompletionResponse{Content: "ans:" + last, Usage: hexagon.Usage{TotalTokens: 5}}, nil
+			return &hexagon.CompletionResponse{Content: "ans:" + userQueryOf(last), Usage: hexagon.Usage{TotalTokens: 5}}, nil
 		})
 	h := newE2EHarness(t, provider, e2eOptions{})
 
@@ -1176,7 +1187,7 @@ func TestE2E_NewReActEngine_DefaultSessionLockSerializes(t *testing.T) {
 	provider := mockllm.NewLLMProvider("mock").WithResponseFn(
 		func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
 			last := req.Messages[len(req.Messages)-1].Content
-			return &hexagon.CompletionResponse{Content: "ans:" + last, Usage: hexagon.Usage{TotalTokens: 5}}, nil
+			return &hexagon.CompletionResponse{Content: "ans:" + userQueryOf(last), Usage: hexagon.Usage{TotalTokens: 5}}, nil
 		})
 
 	cfg := config.DefaultConfig()

@@ -523,13 +523,36 @@ type ServerStatus struct {
 	ToolCount int    `json:"tool_count"`
 }
 
-// ServerStatuses 获取所有 MCP Server 的状态
+// ServerStatuses 获取所有 MCP Server 的状态。
+//
+// ★以「已配置(Enabled)」为事实源：已安装但尚未连上的 server（冷装 npx/uvx 下载中、数据源未就绪等）
+// 也必须出现在状态里（Connected=false），交 UI 显示「未连接」灰徽章，绝不从列表消失（修复 BUG-20260626：
+// 市场装了 MySQL/readfile 再进去「都没有了」）。连接态/工具数取自 m.servers（已连接子集）。
 func (m *Manager) ServerStatuses() []ServerStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	statuses := make([]ServerStatus, 0, len(m.servers))
+	seen := make(map[string]bool, len(m.configs)+len(m.servers))
+	statuses := make([]ServerStatus, 0, len(m.configs)+len(m.servers))
+
+	for _, cfg := range m.configs {
+		if !cfg.Enabled || seen[cfg.Name] {
+			continue
+		}
+		seen[cfg.Name] = true
+		st := ServerStatus{Name: cfg.Name}
+		if server, ok := m.servers[cfg.Name]; ok {
+			st.Connected = server.connected
+			st.ToolCount = len(server.tools)
+		}
+		statuses = append(statuses, st)
+	}
+	// 防御：任何已连接但未登记 configs 的 server（理论不应出现）也并入，避免漏报。
 	for name, server := range m.servers {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
 		statuses = append(statuses, ServerStatus{
 			Name:      name,
 			Connected: server.connected,
@@ -537,6 +560,36 @@ func (m *Manager) ServerStatuses() []ServerStatus {
 		})
 	}
 	return statuses
+}
+
+// ConfiguredServerNames 返回所有「已配置(Enabled)」的 MCP Server 名——UI 服务器列表
+// （GET /api/v1/mcp/servers）的事实源。
+//
+// 与 ServerNames()（仅返回已连接的 live 子集，供内部工具路由 / 启动计数）不同：本方法把「已安装但
+// 尚未连上」的 server 也纳入，使「市场一键安装」后 server 立即出现在列表（状态显示未连接），不因冷装
+// 未即时连上而从 UI 消失（修复 BUG-20260626）。连接实况由 ServerStatuses 提供。
+func (m *Manager) ConfiguredServerNames() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	seen := make(map[string]bool, len(m.configs)+len(m.servers))
+	names := make([]string, 0, len(m.configs)+len(m.servers))
+	for _, cfg := range m.configs {
+		if !cfg.Enabled || seen[cfg.Name] {
+			continue
+		}
+		seen[cfg.Name] = true
+		names = append(names, cfg.Name)
+	}
+	// 防御：已连接但未登记 configs 的 server 也并入。
+	for name := range m.servers {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	return names
 }
 
 // AddServer 动态添加并连接 MCP Server
@@ -692,26 +745,33 @@ func (m *Manager) RemoveServer(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	server, ok := m.servers[name]
-	if !ok {
-		return fmt.Errorf("MCP Server %q 不存在", name)
-	}
-
-	server.connected = false
-	if server.cleanup != nil {
-		server.cleanup()
-	}
-	if server.closer != nil {
-		server.closer.Close()
-	}
-	delete(m.servers, name)
-
-	// 从 configs 中移除
+	// 从 configs 中移除（已配置但尚未连上的冷装 server 只在 configs 里——必须能被删除，
+	// 否则 BUG-20260626 修复后用户看得到却删不掉）。
+	inConfigs := false
 	for i, c := range m.configs {
 		if c.Name == name {
 			m.configs = append(m.configs[:i], m.configs[i+1:]...)
+			inConfigs = true
 			break
 		}
+	}
+
+	// 断开并移除已连接实例（若有）。
+	server, connected := m.servers[name]
+	if connected {
+		server.connected = false
+		if server.cleanup != nil {
+			server.cleanup()
+		}
+		if server.closer != nil {
+			server.closer.Close()
+		}
+		delete(m.servers, name)
+	}
+
+	// 既不在 configs 也不在 servers → 确实不存在。
+	if !inConfigs && !connected {
+		return fmt.Errorf("MCP Server %q 不存在", name)
 	}
 
 	logger.Info("MCP Server", "name", name)

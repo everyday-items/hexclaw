@@ -28,7 +28,10 @@ type instanceResponse struct {
 }
 
 func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
-	list, err := s.instanceMgr.List(r.Context())
+	// ListLive (not List): reconcile each started adapter's status against its
+	// live connection health so the channel badge agrees with the test button
+	// (BUG-20260627: "已连接" badge vs "Stream 未连接" test on the same channel).
+	list, err := s.instanceMgr.ListLive(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return

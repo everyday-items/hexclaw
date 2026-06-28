@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
+	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/knowledge"
 )
 
@@ -83,10 +85,11 @@ func (s *Server) handleUploadDocument(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	ext := strings.ToLower(filepath.Ext(header.Filename))
-	allowed := map[string]bool{".txt": true, ".md": true, ".csv": true, ".json": true, ".docx": true, ".pdf": true, ".doc": true, ".pptx": true}
+	allowed := map[string]bool{".txt": true, ".md": true, ".csv": true, ".json": true, ".docx": true, ".pdf": true, ".doc": true, ".pptx": true,
+		".png": true, ".jpg": true, ".jpeg": true, ".webp": true, ".gif": true}
 	if !allowed[ext] {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "不支持的文件格式，请上传 .txt / .md / .csv / .json / .doc / .docx / .pptx / .pdf",
+			"error": "不支持的文件格式，请上传 .txt / .md / .csv / .json / .doc / .docx / .pptx / .pdf / 图片(.png/.jpg/.webp/.gif)",
 		})
 		return
 	}
@@ -102,6 +105,19 @@ func (s *Server) handleUploadDocument(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": fmt.Sprintf("文件过大，最大允许 %dMB", maxUpload>>20),
 		})
+		return
+	}
+
+	// 图片：走多模态入库（视觉模型转写为中文描述 → 文本 RAG 入库，source_type=image）。
+	// 未配置 captioner 时 AddImageDocument 优雅报错（不吞垃圾）。
+	if mime := map[string]string{".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}[ext]; mime != "" {
+		title := strings.TrimSuffix(header.Filename, ext)
+		doc, ierr := s.kb.AddImageDocument(r.Context(), title, data, mime, "upload:"+header.Filename)
+		if ierr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "图片入库失败: " + ierr.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, knowledgeDocResponse(doc))
 		return
 	}
 
@@ -210,9 +226,18 @@ func extractTextFromXML(data []byte) string {
 	return strings.Join(parts, " ")
 }
 
-// handleListDocuments 列出知识库文档
+// handleListDocuments 列出知识库文档。
+//
+// 支持查询参数 ?source=&limit=&offset=（皆可选）：缺省（无 limit）时返回全部，
+// 与旧契约一致；带 limit 时返回该页 + 全集总数 + 按 source 的计数 facet，避免
+// 定时任务快照累积到数千条后把列表页拖垮。
 func (s *Server) handleListDocuments(w http.ResponseWriter, r *http.Request) {
-	docs, err := s.kb.ListDocuments(r.Context())
+	q := r.URL.Query()
+	res, err := s.kb.ListDocumentsPaged(r.Context(), knowledge.DocListQuery{
+		Source: strings.TrimSpace(q.Get("source")),
+		Limit:  atoiDefault(q.Get("limit"), 0),
+		Offset: atoiDefault(q.Get("offset"), 0),
+	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "获取文档列表失败: " + err.Error(),
@@ -220,15 +245,25 @@ func (s *Server) handleListDocuments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fix 14: 防止 nil slice 被序列化为 JSON null
-	if docs == nil {
-		docs = []*knowledge.Document{}
-	}
-
 	writeJSON(w, http.StatusOK, map[string]any{
-		"documents": docs,
-		"total":     len(docs),
+		"documents": res.Documents, // ListDocumentsPaged guarantees non-nil
+		"total":     res.Total,
+		"limit":     res.Limit,
+		"offset":    res.Offset,
+		"sources":   res.Sources,
 	})
+}
+
+// atoiDefault parses s as a non-negative int, returning def on empty/invalid
+// input (so a malformed ?limit= degrades to "no paging" rather than erroring).
+func atoiDefault(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	if n, err := strconv.Atoi(s); err == nil && n >= 0 {
+		return n
+	}
+	return def
 }
 
 // handleGetDocument 获取单个知识库文档详情（含正文）
@@ -308,6 +343,12 @@ func (s *Server) handleReindexDocument(w http.ResponseWriter, r *http.Request) {
 type SearchKnowledgeRequest struct {
 	Query string `json:"query"` // 搜索查询
 	TopK  int    `json:"top_k"` // 返回条数（默认 3）
+
+	// ── 元数据过滤（可选）：维度间 AND、维度内 OR、留空=不过滤 ──
+	Sources       []string `json:"sources,omitempty"`        // 按文档来源精确匹配
+	SourceTypes   []string `json:"source_types,omitempty"`   // manual / upload / url / file / agent
+	CreatedAfter  string   `json:"created_after,omitempty"`  // RFC3339 或 YYYY-MM-DD，文档创建时间下界
+	CreatedBefore string   `json:"created_before,omitempty"` // RFC3339 或 YYYY-MM-DD，文档创建时间上界
 }
 
 // handleSearchKnowledge 搜索知识库
@@ -320,7 +361,7 @@ func (s *Server) handleSearchKnowledge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Query == "" {
+	if strings.TrimSpace(req.Query) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "query 不能为空",
 		})
@@ -332,7 +373,24 @@ func (s *Server) handleSearchKnowledge(w http.ResponseWriter, r *http.Request) {
 		topK = 3
 	}
 
-	results, err := s.kb.Search(r.Context(), req.Query, topK)
+	createdAfter, err := knowledge.ParseFilterDate(req.CreatedAfter)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "created_after " + err.Error()})
+		return
+	}
+	createdBefore, err := knowledge.ParseFilterDate(req.CreatedBefore)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "created_before " + err.Error()})
+		return
+	}
+	filter := knowledge.Filter{
+		Sources:       req.Sources,
+		SourceTypes:   req.SourceTypes,
+		CreatedAfter:  createdAfter,
+		CreatedBefore: createdBefore,
+	}
+
+	results, err := s.kb.SearchWithFilter(r.Context(), req.Query, topK, filter)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "搜索失败: " + err.Error(),
@@ -344,6 +402,111 @@ func (s *Server) handleSearchKnowledge(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"results": results,
 		"total":   len(results),
+	})
+}
+
+// ── 检索质量参数（检索参数面板）─────────────────────────────────────────────
+//
+// GET 读当前生效配置；PUT 即时热替换 Manager 运行时参数 + 落 yaml 持久化。
+// 即时生效字段：rerank/query_expand/contextual 开关、min_score、candidate_k。
+// rerank_model 换模型走「重启 sidecar 生效」（专用重排器在启动时注入，运行时不重建）。
+
+// KnowledgeConfigPayload 检索质量参数的读写载体（GET 响应 / PUT 请求同形）。
+type KnowledgeConfigPayload struct {
+	Rerank      bool    `json:"rerank"`       // 重排总开关
+	RerankModel string  `json:"rerank_model"` // 专用 cross-encoder 重排模型（空=LLM 重排 / 自动）
+	QueryExpand bool    `json:"query_expand"` // HyDE + multi-query 查询扩展
+	Contextual  bool    `json:"contextual"`   // 入库 Contextual Retrieval
+	MinScore    float64 `json:"min_score"`    // 向量相关度地板 [0,1]，0=关
+	CandidateK  int     `json:"candidate_k"`  // 宽召回候选池大小（>0）
+}
+
+// handleGetKnowledgeConfig 读当前生效的检索质量参数。
+//
+// 运行时字段取自 Manager 的活配置（GetHybridConfig，即实际生效值）；rerank_model 取自
+// 持久化配置（最近一次保存值，反映“待重启生效”的目标模型）——cfgWriter 缺省时回落到启动配置。
+func (s *Server) handleGetKnowledgeConfig(w http.ResponseWriter, r *http.Request) {
+	if s.kb == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "知识库未启用"})
+		return
+	}
+	hc := s.kb.GetHybridConfig()
+	rerankModel := s.cfg.Knowledge.RerankModel
+	if s.cfgWriter != nil {
+		if k, err := s.cfgWriter.ReadKnowledge(); err == nil {
+			rerankModel = k.RerankModel
+		}
+	}
+	writeJSON(w, http.StatusOK, KnowledgeConfigPayload{
+		Rerank:      hc.RerankEnabled,
+		RerankModel: rerankModel,
+		QueryExpand: hc.ExpandEnabled,
+		Contextual:  hc.ContextualEnabled,
+		MinScore:    hc.MinScore,
+		CandidateK:  hc.CandidateK,
+	})
+}
+
+// handlePutKnowledgeConfig 全量替换检索质量参数：校验 → 即时热替换 Manager → 落 yaml。
+//
+// 校验失败（min_score∉[0,1] / candidate_k<=0）一律 400，且不改动运行时配置。
+// 响应回带新生效配置 + rerank_model_restart_required（rerank_model 变更需重启才生效）。
+func (s *Server) handlePutKnowledgeConfig(w http.ResponseWriter, r *http.Request) {
+	if s.kb == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "知识库未启用"})
+		return
+	}
+	var req KnowledgeConfigPayload
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
+		return
+	}
+	if req.MinScore < 0 || req.MinScore > 1 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "min_score 必须在 [0,1] 区间"})
+		return
+	}
+	if req.CandidateK <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "candidate_k 必须大于 0"})
+		return
+	}
+	req.RerankModel = strings.TrimSpace(req.RerankModel)
+
+	// 即时热替换 Manager 的运行时参数（在当前活配置基础上覆盖面板字段，保留嵌入前缀等非面板项）。
+	hc := s.kb.GetHybridConfig()
+	hc.RerankEnabled = req.Rerank
+	hc.ExpandEnabled = req.QueryExpand
+	hc.ContextualEnabled = req.Contextual
+	hc.MinScore = req.MinScore
+	hc.CandidateK = req.CandidateK
+	s.kb.SetHybridConfig(hc)
+
+	// 落 yaml 持久化；rerank_model 是否变化决定“需重启”提示。
+	restartRequired := false
+	if s.cfgWriter != nil {
+		if prev, err := s.cfgWriter.ReadKnowledge(); err == nil {
+			restartRequired = strings.TrimSpace(prev.RerankModel) != req.RerankModel
+		}
+		if err := s.cfgWriter.UpdateKnowledgeRetrieval(config.KnowledgeRetrievalSettings{
+			Rerank:      req.Rerank,
+			RerankModel: req.RerankModel,
+			QueryExpand: req.QueryExpand,
+			Contextual:  req.Contextual,
+			MinScore:    req.MinScore,
+			CandidateK:  req.CandidateK,
+		}); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存配置失败: " + err.Error()})
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"rerank":                        req.Rerank,
+		"rerank_model":                  req.RerankModel,
+		"query_expand":                  req.QueryExpand,
+		"contextual":                    req.Contextual,
+		"min_score":                     req.MinScore,
+		"candidate_k":                   req.CandidateK,
+		"rerank_model_restart_required": restartRequired,
 	})
 }
 

@@ -216,7 +216,9 @@ func (s *Server) handleListMCPServers(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"servers": []any{}, "total": 0})
 		return
 	}
-	names := s.mcpMgr.ServerNames()
+	// 用「已配置」而非「已连接」作为列表事实源：市场一键安装后冷装尚未连上的 server 也要出现在
+	// UI 列表（状态另由 /mcp/status 显示未连接），不因未即时连上而消失（修复 BUG-20260626）。
+	names := s.mcpMgr.ConfiguredServerNames()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"servers": names,
 		"total":   len(names),
@@ -672,26 +674,35 @@ func (s *Server) installMCPFromClawHubEntry(w http.ResponseWriter, r *http.Reque
 		Enabled:   true,
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	// best-effort：即时连接给较短窗口，冷装 npx/uvx 首次下载超时则转后台 reconnectLoop(30s)，不硬失败
+	// （与 handleAddMCPServer 一致，修复 BUG-20260627：hub 安装路径冷装硬失败 → 装不上/点了没反应）。
+	ctx, cancel := context.WithTimeout(r.Context(), mcpAddImmediateConnectTimeout)
 	defer cancel()
 
-	if err := s.mcpMgr.AddServer(ctx, cfg); err != nil {
+	connected, err := s.mcpMgr.AddServerBestEffort(ctx, cfg)
+	if err != nil {
+		// 仅不可恢复错误（name 空 / Manager 已关闭）走 400；即时连接失败属可恢复，不会到这。
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": fmt.Sprintf("MCP Server %q 连接失败: %v", name, err),
+			"error": fmt.Sprintf("MCP Server %q 添加失败: %v", name, err),
 		})
 		return
 	}
+	// 无论是否已连上都持久化——未连上者重启后仍由 reconnectLoop 自动拉起。
 	if s.cfgWriter != nil {
 		if err := s.cfgWriter.AppendMCPServer(name, cfg.Transport, cfg.Command, cfg.Args, cfg.Env, cfg.Endpoint); err != nil {
 			logger.Error("MCP Server", "name", name, "添加成功但持久化失败", err)
 		}
 	}
+	msg := "MCP 条目已从 ClawHub 安装并已连接"
+	if !connected {
+		msg = "MCP 条目已从 ClawHub 安装，正在后台连接（首次需下载组件）"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name":               name,
 		"type":               "mcp",
-		"message":            "MCP 条目已从 ClawHub 安装并已连接",
+		"message":            msg,
 		"requires_restart":   false,
-		"runtime_registered": true,
+		"runtime_registered": connected,
 		"config_hint":        configHint,
 	})
 }
@@ -1413,7 +1424,8 @@ func (s *Server) handleVoiceSynthesize(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
 		return
 	}
-	if req.Text == "" {
+	// 纯空白也算空：与 Service 层 TrimSpace 判定一致，避免空白文本绕到 Service 报错被包成 500。
+	if strings.TrimSpace(req.Text) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text 不能为空"})
 		return
 	}

@@ -7,11 +7,11 @@
 //
 // 5 阶段：
 //
-//	1. QueryRewriter      — 把用户原 query 改写成更适合检索的形式（同义词 / 拆分）
-//	2. Retriever          — 调 Manager.Search 返回候选 chunks
-//	3. Reranker           — 用更精细的 scorer（cross-encoder / LLM）重排
-//	4. ContextBuilder     — 把 chunks 拼成 prompt 用 context（含分隔符 / 引用 ID）
-//	5. Answerer           — 把 context 喂给 LLM 生成最终答案；可空（让调用方自己组 prompt）
+//  1. QueryRewriter      — 把用户原 query 改写成更适合检索的形式（同义词 / 拆分）
+//  2. Retriever          — 调 Manager.Search 返回候选 chunks
+//  3. Reranker           — 用更精细的 scorer（cross-encoder / LLM）重排
+//  4. ContextBuilder     — 把 chunks 拼成 prompt 用 context（含分隔符 / 引用 ID）
+//  5. Answerer           — 把 context 喂给 LLM 生成最终答案；可空（让调用方自己组 prompt）
 //
 // flag rag.pipeline.v1 控制是否启用。flag 关闭时 RunRAG 立即返回 ErrPipelineDisabled，
 // 调用方应直接用 Manager.Query / Search 老 API。
@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/featureflag"
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
 // FlagRAGPipelineV1 控制 H7 RAG pipeline 是否启用。
@@ -32,10 +33,14 @@ const FlagRAGPipelineV1 = "rag.pipeline.v1"
 
 func init() {
 	featureflag.Register(featureflag.Flag{
-		Name:         FlagRAGPipelineV1,
-		Default:      true, // alpha 强制 OFF
-		Description:  "Run knowledge retrieval through the v0.4.0 5-stage RAG pipeline (rewrite/retrieve/rerank/context/answer).",
-		Stage:        featureflag.StageAlpha,
+		Name:    FlagRAGPipelineV1,
+		Default: false,
+		// 说明（去除旧版"看似启用实则空转"的假象）：
+		// 默认检索全链路（查询扩展 → 宽召回 → RRF 融合 → 相关度地板 → LLM 重排）
+		// 已无条件落在 Manager.searchResults，与本 flag 无关、始终生效。
+		// 本 flag 仅控制可选的「可组合 Pipeline 编排门面」(Pipeline.RunRAG)，默认关闭。
+		Description:  "Opt-in composable RAG pipeline façade (Pipeline.RunRAG). The default retrieval path (query-expansion → wide recall → RRF → min-score floor → LLM rerank) always runs in Manager.searchResults regardless of this flag.",
+		Stage:        featureflag.StageBeta,
 		SinceVersion: "0.4.0",
 	})
 }
@@ -236,7 +241,7 @@ func (b SimpleContextBuilder) Build(hits []SearchHit) (string, error) {
 		fmt.Fprintf(&sb, "[%d] (doc=%s chunk=%d)\n", i+1, h.DocID, h.ChunkIndex)
 		body := h.Content
 		if b.MaxChars > 0 && len(body) > b.MaxChars {
-			body = body[:b.MaxChars] + "..."
+			body = stringx.TruncateBytes(body, b.MaxChars, "...")
 		}
 		sb.WriteString(body)
 	}

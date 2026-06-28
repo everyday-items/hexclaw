@@ -8,6 +8,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/hexagon-codes/hexagon/rag/splitter"
 	"github.com/hexagon-codes/hexclaw/internal/sqliteutil"
@@ -40,6 +41,41 @@ var (
 // NewSQLiteStore 创建 SQLite 知识库存储
 func NewSQLiteStore(db *sql.DB) *SQLiteStore {
 	return &SQLiteStore{db: db}
+}
+
+// buildFilterClause 把 Filter 的「源 / 源类型」维度编译为下推到 SQL 的 AND 片段
+// （不含前导 AND）+ 占位参数。docAlias 是 kb_documents 在 SQL 中的别名。
+// 无源/类型约束时返回 ("", nil)，调用方据此走全量快路径。
+//
+// 维度内多值用 IN(...) 实现 OR，维度间用 AND 串联。
+// 日期维度刻意不在此下推（见 Filter.matchesDate 注释——modernc 的 RFC3339 文本存储
+// 在跨时区时字符串比较不可靠），由调用方在 Go 层对真实 time.Time 比较。
+func buildFilterClause(f Filter, docAlias string) (string, []any) {
+	f = f.normalize()
+	var clauses []string
+	var args []any
+	if len(f.Sources) > 0 {
+		ph, a := inPlaceholders(f.Sources)
+		clauses = append(clauses, docAlias+".source IN ("+ph+")")
+		args = append(args, a...)
+	}
+	if len(f.SourceTypes) > 0 {
+		ph, a := inPlaceholders(f.SourceTypes)
+		clauses = append(clauses, docAlias+".source_type IN ("+ph+")")
+		args = append(args, a...)
+	}
+	return strings.Join(clauses, " AND "), args
+}
+
+// inPlaceholders 为字符串多值生成 "?,?,?" 占位串与对应参数。
+func inPlaceholders(vals []string) (string, []any) {
+	ph := make([]string, len(vals))
+	args := make([]any, len(vals))
+	for i, v := range vals {
+		ph[i] = "?"
+		args[i] = v
+	}
+	return strings.Join(ph, ","), args
 }
 
 // Init 初始化知识库表 + FTS5 索引
@@ -310,18 +346,42 @@ func (s *SQLiteStore) Get(ctx context.Context, docID string) (*Document, error) 
 // 加载 chunk 的向量，在 Go 层计算余弦相似度，
 // 返回相似度最高的 topK 个结果。
 //
-// 限制最多扫描 maxVectorScanRows 行，防止知识库过大时 OOM。
-// 对于个人知识库（通常 < 10万 chunk），这种全扫描方式
-// 性能完全够用（10万个 1536 维向量约需 ~100ms）。
-// Fix 6: 降低扫描上限到 10000 行，防止大知识库 OOM（10K × 6KB ≈ 60MB，可控）。
-// 未来可引入 ANN 索引（如 sqlite-vec）来避免全表扫描。
-const maxVectorScanRows = 10000
+// VectorSearch 做全量精确余弦扫描，不再用 LIMIT 静默截断。
+//
+// 纯 Go 驱动（modernc.org/sqlite，无 CGO）下，对个人/桌面知识库做全量精确扫描
+// 即业界最佳实践：向量数 < ~10万 时暴力精确检索 recall=1.0，反而比 ANN 更准
+// （ANN 是近似召回）。本实现逐行解码 embedding blob、算完相似度后立即丢弃，
+// 只保留 {id, sim}（内存 O(n) 仅数 MB），不存在 OOM 风险——
+// 旧 Fix 6 的 maxVectorScanRows=10000 上限会在大库时悄悄丢召回，已移除。
+//
+// 当扫描规模超过 vectorScanWarnThreshold 时打 WARN（不静默），
+// 提示后续引入 pure-Go ANN（如 HNSW）以维持延迟。
+const vectorScanWarnThreshold = 100000
 
-func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK int) ([]*SearchResult, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, doc_id, chunk_index, embedding FROM kb_chunks WHERE embedding IS NOT NULL LIMIT ?`,
-		maxVectorScanRows,
-	)
+func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK int, filter Filter) ([]*SearchResult, error) {
+	// 元数据过滤在「全量打分前」生效，确保不被 topK 截断吞掉：
+	//   - 源/源类型：下推 SQL（JOIN kb_documents + IN，纯字符串相等，跨时区无歧义）；
+	//   - 日期：取 d.created_at 在 Go 层按真实 time.Time 比较（见 Filter.matchesDate）。
+	// 无任何过滤时走原快路径（不 JOIN，零回归）。
+	clause, fargs := buildFilterClause(filter, "d")
+	needDate := filter.hasDateBound()
+	var query string
+	var args []any
+	switch {
+	case clause == "" && !needDate:
+		query = `SELECT c.id, c.doc_id, c.chunk_index, c.embedding FROM kb_chunks c WHERE c.embedding IS NOT NULL`
+	default:
+		sel := "c.id, c.doc_id, c.chunk_index, c.embedding"
+		if needDate {
+			sel += ", d.created_at"
+		}
+		query = "SELECT " + sel + " FROM kb_chunks c JOIN kb_documents d ON d.id = c.doc_id WHERE c.embedding IS NOT NULL"
+		if clause != "" {
+			query += " AND " + clause
+			args = fargs
+		}
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -335,19 +395,31 @@ func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK
 		sim        float64
 	}
 	var all []scored
+	scanned := 0
 
 	for rows.Next() {
 		// 每 1000 行检查 context，避免长时间扫描不可取消
-		if len(all)%1000 == 0 {
+		if scanned%1000 == 0 {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
 		}
+		scanned++
 
 		var s scored
 		var embBlob []byte
-		if err := rows.Scan(&s.id, &s.docID, &s.chunkIndex, &embBlob); err != nil {
+		var createdAt time.Time
+		if needDate {
+			err = rows.Scan(&s.id, &s.docID, &s.chunkIndex, &embBlob, &createdAt)
+		} else {
+			err = rows.Scan(&s.id, &s.docID, &s.chunkIndex, &embBlob)
+		}
+		if err != nil {
 			logger.Error("[knowledge] VectorSearch scan 失败", "error", err)
+			continue
+		}
+		// 日期过滤在打分/排序前生效（Go 层按真实时刻比较）。
+		if needDate && !filter.matchesDate(createdAt) {
 			continue
 		}
 
@@ -360,6 +432,10 @@ func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	if scanned > vectorScanWarnThreshold {
+		logger.Warn("[knowledge] 向量全表精确扫描规模较大，建议后续引入 ANN 索引以维持延迟",
+			"scanned", scanned, "threshold", vectorScanWarnThreshold)
 	}
 
 	// O(n log n) 排序替代 O(n²) 插入排序
@@ -400,7 +476,7 @@ func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK
 //
 // 使用 SQLite FTS5 的 BM25 排名算法进行全文搜索。
 // BM25 分数越小（负数绝对值越大）越相关，需要归一化到 0-1。
-func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int) ([]*SearchResult, error) {
+func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int, filter Filter) ([]*SearchResult, error) {
 	// 构建 FTS5 查询：将查询分词后用 OR 连接
 	keywords := splitter.SearchTokenize(query)
 	if len(keywords) == 0 {
@@ -410,17 +486,39 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int) ([
 	// FTS5 查询语法：用 OR 连接多个关键词
 	ftsQuery := strings.Join(keywords, " OR ")
 
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT f.chunk_id, f.content, bm25(kb_chunks_fts) as score
-		 FROM kb_chunks_fts f
-		 WHERE kb_chunks_fts MATCH ?
-		 ORDER BY score
-		 LIMIT ?`,
-		ftsQuery, topK,
-	)
+	// 元数据过滤生效于 LIMIT/截断之前：源/源类型下推 SQL（JOIN kb_documents + IN）；
+	// 日期取 d.created_at 在 Go 层按真实时刻比较。带日期过滤时不能用 SQL LIMIT（否则日期
+	// 匹配项可能因 bm25 排序落在 LIMIT 之外被漏召回），改为按 score 顺序扫描、Go 过滤后取 topK。
+	clause, fargs := buildFilterClause(filter, "d")
+	needDate := filter.hasDateBound()
+	needJoin := clause != "" || needDate
+
+	sel := "f.chunk_id, f.content, bm25(kb_chunks_fts) as score"
+	if needDate {
+		sel += ", d.created_at"
+	}
+	from := "kb_chunks_fts f"
+	if needJoin {
+		from = `kb_chunks_fts f
+			 JOIN kb_chunks c ON c.id = f.chunk_id
+			 JOIN kb_documents d ON d.id = c.doc_id`
+	}
+	where := "kb_chunks_fts MATCH ?"
+	args := []any{ftsQuery}
+	if clause != "" {
+		where += " AND " + clause
+		args = append(args, fargs...)
+	}
+	sqlQuery := "SELECT " + sel + " FROM " + from + " WHERE " + where + " ORDER BY score"
+	if !needDate {
+		sqlQuery += " LIMIT ?"
+		args = append(args, topK)
+	}
+
+	rows, err := s.db.QueryContext(ctx, sqlQuery, args...)
 	if err != nil {
 		// FTS5 查询失败（可能是特殊字符），降级到 LIKE 搜索
-		return s.fallbackTextSearch(ctx, keywords, topK)
+		return s.fallbackTextSearch(ctx, keywords, topK, filter)
 	}
 	defer rows.Close()
 
@@ -438,7 +536,16 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int) ([
 
 	for rows.Next() {
 		var r rawResult
-		if err := rows.Scan(&r.chunkID, &r.content, &r.score); err != nil {
+		var createdAt time.Time
+		if needDate {
+			if err := rows.Scan(&r.chunkID, &r.content, &r.score, &createdAt); err != nil {
+				return nil, err
+			}
+			// 日期过滤在 Go 层（rows 已按 score 排序，过滤后取前 topK 即最相关者）。
+			if !filter.matchesDate(createdAt) {
+				continue
+			}
+		} else if err := rows.Scan(&r.chunkID, &r.content, &r.score); err != nil {
 			return nil, err
 		}
 		// BM25 返回负数，绝对值越大越相关
@@ -450,6 +557,9 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int) ([
 			maxScore = absScore
 		}
 		raw = append(raw, rawResult{chunkID: r.chunkID, content: r.content, score: absScore})
+		if needDate && len(raw) >= topK {
+			break // 已按 score 收满 topK 个日期匹配项
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -495,27 +605,52 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int) ([
 
 	// FTS5 返回空时降级到 LIKE 搜索（解决中文 tokenizer 不匹配的问题）
 	if len(results) == 0 {
-		return s.fallbackTextSearch(ctx, keywords, topK)
+		return s.fallbackTextSearch(ctx, keywords, topK, filter)
 	}
 	return results, nil
 }
 
-// fallbackTextSearch FTS5 不可用或结果为空时的降级搜索（LIKE 匹配）
-func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string, topK int) ([]*SearchResult, error) {
+// fallbackTextSearch FTS5 不可用或结果为空时的降级搜索（LIKE 匹配）。
+// 与主路径一致地把元数据过滤下推到 LIMIT 之前（JOIN kb_documents）。
+func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string, topK int, filter Filter) ([]*SearchResult, error) {
 	var query strings.Builder
 	var args []any
 
-	// Fix 15: 不查询 embedding 列，文本降级搜索无需加载向量 BLOB
-	query.WriteString("SELECT id, doc_id, content, chunk_index, created_at FROM kb_chunks WHERE ")
+	clause, fargs := buildFilterClause(filter, "d")
+	needDate := filter.hasDateBound()
+	needJoin := clause != "" || needDate
+
+	// Fix 15: 不查询 embedding 列，文本降级搜索无需加载向量 BLOB。
+	// 统一以别名 c 引用 kb_chunks，便于在有过滤时 JOIN kb_documents。
+	// chunk.CreatedAt 取 c.created_at（片段时间，供时间衰减/展示）；日期过滤用 d.created_at
+	// （文档时间，与主路径语义一致），故 needDate 时额外多取一列。
+	if needJoin {
+		query.WriteString("SELECT c.id, c.doc_id, c.content, c.chunk_index, c.created_at")
+		if needDate {
+			query.WriteString(", d.created_at")
+		}
+		query.WriteString(" FROM kb_chunks c JOIN kb_documents d ON d.id = c.doc_id WHERE (")
+	} else {
+		query.WriteString("SELECT c.id, c.doc_id, c.content, c.chunk_index, c.created_at FROM kb_chunks c WHERE (")
+	}
 	for i, kw := range keywords {
 		if i > 0 {
 			query.WriteString(" OR ")
 		}
-		query.WriteString("content LIKE ? ESCAPE '\\'")
+		query.WriteString("c.content LIKE ? ESCAPE '\\'")
 		args = append(args, "%"+sqliteutil.EscapeLike(kw)+"%")
 	}
-	query.WriteString(" LIMIT ?")
-	args = append(args, topK)
+	query.WriteString(")")
+	if clause != "" {
+		query.WriteString(" AND ")
+		query.WriteString(clause)
+		args = append(args, fargs...)
+	}
+	// 带日期过滤时不能用 SQL LIMIT（日期在 Go 层裁，匹配项可能排在 LIMIT 之外）。
+	if !needDate {
+		query.WriteString(" LIMIT ?")
+		args = append(args, topK)
+	}
 
 	rows, err := s.db.QueryContext(ctx, query.String(), args...)
 	if err != nil {
@@ -526,8 +661,17 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 	var results []*SearchResult
 	for rows.Next() {
 		chunk := &Chunk{}
+		var docCreatedAt time.Time
 		// Fix 15: Scan 与 SELECT 对齐（已移除 embedding 列）
-		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &chunk.CreatedAt); err != nil {
+		if needDate {
+			if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &chunk.CreatedAt, &docCreatedAt); err != nil {
+				logger.Error("[knowledge] fallbackTextSearch scan 失败", "error", err)
+				continue
+			}
+			if !filter.matchesDate(docCreatedAt) {
+				continue
+			}
+		} else if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &chunk.CreatedAt); err != nil {
 			logger.Error("[knowledge] fallbackTextSearch scan 失败", "error", err)
 			continue
 		}
@@ -544,6 +688,9 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 			Chunk:     chunk,
 			TextScore: float64(matchCount) / float64(len(keywords)),
 		})
+		if needDate && len(results) >= topK {
+			break
+		}
 	}
 
 	return results, rows.Err()
@@ -564,7 +711,7 @@ func (s *SQLiteStore) getChunksByIDs(ctx context.Context, ids []string) (map[str
 	}
 
 	var query strings.Builder
-	query.WriteString(`SELECT c.id, c.doc_id, d.title, d.source, d.chunk_count, c.content, c.chunk_index, c.embedding, c.created_at
+	query.WriteString(`SELECT c.id, c.doc_id, d.title, d.source, d.source_type, d.chunk_count, c.content, c.chunk_index, c.embedding, c.created_at
 		 FROM kb_chunks c
 		 JOIN kb_documents d ON d.id = c.doc_id
 		 WHERE c.id IN (`)
@@ -580,7 +727,7 @@ func (s *SQLiteStore) getChunksByIDs(ctx context.Context, ids []string) (map[str
 	for rows.Next() {
 		chunk := &Chunk{}
 		var embBlob []byte
-		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.DocTitle, &chunk.Source, &chunk.ChunkCount, &chunk.Content, &chunk.Index, &embBlob, &chunk.CreatedAt); err != nil {
+		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.DocTitle, &chunk.Source, &chunk.SourceType, &chunk.ChunkCount, &chunk.Content, &chunk.Index, &embBlob, &chunk.CreatedAt); err != nil {
 			logger.Error("[knowledge] scan chunk", "id", chunk.ID, "error", err)
 			continue
 		}

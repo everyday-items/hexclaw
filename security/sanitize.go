@@ -30,9 +30,11 @@ func SanitizeToolOutput(output string, maxLen int) string {
 	// 3. Detect LLM delimiter injection
 	output = neutralizeDelimiters(output)
 
-	// 4. Truncate
-	if maxLen > 0 && len(output) > maxLen {
-		output = output[:maxLen] + "\n[truncated]"
+	// 4. Truncate（rune 安全：按码点切，绝不在多字节中文/emoji 中间切裂出 U+FFFD）
+	if maxLen > 0 {
+		if r := []rune(output); len(r) > maxLen {
+			output = string(r[:maxLen]) + "\n[truncated]"
+		}
 	}
 
 	return output

@@ -96,6 +96,12 @@ type Job struct {
 	// §13.3(2) 增量发现：开启后，产物与上次相同则跳过投递（执行仍跑以取数比对）。
 	OnlyIfChanged bool `json:"only_if_changed,omitempty"`
 
+	// Continuous（持续型任务 + 跨 tick 检查点）：开启后（仅 agent 模式），每个 tick 不是从头重做整个
+	// 目标，而是读上次进度档案(checkpoint，存 StateStore，重启不丢) → 只推进**一个增量** → 写回档案；
+	// 目标完成 / 连续无新进展 / 达推进次数上限即自动收工。把长目标摊到多次廉价唤醒上累积推进——桌面版
+	// 的"慢循环"（有界、带检查点、可自动终止），而非过夜死刷。
+	Continuous bool `json:"continuous,omitempty"`
+
 	// H4 不静默失效：运行时观测字段（仅内存，按 API 下发；重启后由下次运行重填）。
 	// 执行失败 / 调度算不出 → LastError；投递失败 → LastDeliveryError。二者解耦，成功各自清零。
 	LastError         string `json:"last_error,omitempty"`
@@ -136,7 +142,10 @@ type AddJobRequest struct {
 	// TimeoutSec optionally overrides the per-run execution budget. 0 → the
 	// mode default (agent: defaultAgentTimeoutSec). Lets a multi-step agent
 	// task (browse + reason + ingest) get more than the old fixed 300s.
-	TimeoutSec      int      `json:"timeout_s,omitempty"`
+	TimeoutSec int `json:"timeout_s,omitempty"`
+	// Continuous 开启「持续型任务 + 跨 tick 检查点」：长目标分多次廉价唤醒累积推进（见 continuous.go）。
+	// 持续任务每 tick 需推理"下一个增量"，故必为 agent 模式——置 true 时强制 agent 模式。
+	Continuous      bool     `json:"continuous,omitempty"`
 	AvailableSkills []string `json:"-"` // 服务端注入
 	LocalAPIBase    string   `json:"-"` // 服务端注入
 }
@@ -647,7 +656,8 @@ func (s *Scheduler) AddJobFromPromptWithProgress(
 
 	// Dual-mode classification: cognitive tasks are marked for agent execution
 	// (no script compilation); mechanical I/O tasks go through script compile.
-	if ClassifyTaskMode(req.Prompt) == RuntimeAgent {
+	// 持续型任务每 tick 都要推理"下一个增量"，必为 agent 模式 → req.Continuous 强制走 agent 分支。
+	if req.Continuous || ClassifyTaskMode(req.Prompt) == RuntimeAgent {
 		if err := validateAgentModeSchedule(req.Schedule); err != nil {
 			return nil, err
 		}
@@ -663,6 +673,7 @@ func (s *Scheduler) AddJobFromPromptWithProgress(
 			SourcePrompt: req.Prompt,
 			Spec:         &JobSpec{Runtime: RuntimeAgent, TimeoutSec: agentTimeoutSec(req.TimeoutSec)},
 			Deliver:      req.Deliver,
+			Continuous:   req.Continuous,
 		}
 		if err := s.AddJob(ctx, job); err != nil {
 			return nil, err
@@ -876,6 +887,9 @@ func serializeJobMeta(job *Job) string {
 	if job.OnlyIfChanged {
 		m["only_if_changed"] = true
 	}
+	if job.Continuous {
+		m["continuous"] = true
+	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		return "{}"
@@ -898,6 +912,7 @@ func parseJobMeta(job *Job, metaJSON string) {
 		EscalateAgent  bool     `json:"escalate_agent,omitempty"`
 		EscalatePrompt string   `json:"escalate_prompt,omitempty"`
 		OnlyIfChanged  bool     `json:"only_if_changed,omitempty"`
+		Continuous     bool     `json:"continuous,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(metaJSON), &m); err != nil {
 		return
@@ -912,6 +927,7 @@ func parseJobMeta(job *Job, metaJSON string) {
 	job.EscalateAgent = m.EscalateAgent
 	job.EscalatePrompt = m.EscalatePrompt
 	job.OnlyIfChanged = m.OnlyIfChanged
+	job.Continuous = m.Continuous
 }
 
 // latestRunOutput returns the most recent run's product for jobID (for
@@ -991,7 +1007,10 @@ func (s *Scheduler) TriggerJob(_ context.Context, jobID string) error {
 	if !ok {
 		return fmt.Errorf("任务 %q 不存在", jobID)
 	}
-	if s.scriptExec == nil {
+	// Agent-mode jobs run via the injected AgentRunner, not the script executor,
+	// so only script-mode jobs need scriptExec — don't block a webhook-triggered
+	// agent job on it (an agent-only deployment may legitimately have no exec).
+	if s.scriptExec == nil && (job.Spec == nil || job.Spec.Runtime != RuntimeAgent) {
 		return fmt.Errorf("脚本执行器未就绪")
 	}
 
@@ -1307,8 +1326,14 @@ func (s *Scheduler) executeJob(job *Job) {
 	var result *RunResult
 	var runErr error
 	if job.Spec.Runtime == RuntimeAgent {
-		slog.Info("[cron] running agent job", "source", "cron", "name", job.Name, "id", job.ID)
-		result = s.runAgentJob(runCtx, job)
+		if job.Continuous {
+			// 持续型任务：每 tick 读检查点 → 只推进一个增量 → 写回档案，目标完成/停滞/达上限自动收工。
+			slog.Info("[cron] running continuous agent job", "source", "cron", "name", job.Name, "id", job.ID)
+			result = s.runContinuousAgentJob(runCtx, job)
+		} else {
+			slog.Info("[cron] running agent job", "source", "cron", "name", job.Name, "id", job.ID)
+			result = s.runAgentJob(runCtx, job)
+		}
 	} else {
 		runtime := job.Spec.Runtime
 		// Backstop: a script tagged python3 but using Starlark host builtins (emit /

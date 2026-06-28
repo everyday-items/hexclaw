@@ -233,6 +233,7 @@ func (s *Server) cronActionCreate(ctx context.Context, req *CronJobRequest) (*Cr
 			Deliver:      d.Deliver, // D4.2 多 deliver 桥接
 			ChatID:       d.ChatID,  // IM/连接投递目标会话/群组 ID（Deliverer 必需）
 			TimeoutSec:   d.TimeoutSec,
+			Continuous:   d.Continuous, // 持续型任务（强制 agent 模式）
 			LocalAPIBase: s.localAPIBase(),
 		})
 	}

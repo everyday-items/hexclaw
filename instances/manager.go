@@ -213,6 +213,57 @@ func (m *Manager) List(ctx context.Context) ([]*Instance, error) {
 	return list, rows.Err()
 }
 
+// ListLive is List with the status of started adapters reconciled against their
+// live connection health — the single source of truth the UI badge should read.
+//
+// BUG-20260627: Start() marks an async Stream adapter (DingTalk/Feishu/Discord)
+// "running" the instant its connect loop is launched, before the WebSocket has
+// actually connected (or when it can't connect at all). The status badge read
+// List() (raw DB status) and showed "已连接", while the test button read live
+// Health() and returned "dingtalk Stream 未连接" — the same channel reporting two
+// truths. ListLive resolves the divergence: for an instance we started, the
+// adapter's live Health decides the status (running iff actually connected, else
+// error with the reason), and the correction is persisted so it self-heals (and
+// recovers to running once the Stream reconnects). Webhook adapters without a
+// HealthChecker stay "running" (attached == ready); instances we never started
+// keep their stored status.
+func (m *Manager) ListLive(ctx context.Context) ([]*Instance, error) {
+	list, err := m.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, inst := range list {
+		m.mu.RLock()
+		adp, started := m.running[inst.Name]
+		m.mu.RUnlock()
+
+		var newStatus Status
+		var lastErr string
+		switch {
+		case started:
+			newStatus = StatusRunning
+			if hc, ok := adp.(adapter.HealthChecker); ok {
+				if herr := hc.Health(ctx); herr != nil {
+					newStatus, lastErr = StatusError, herr.Error()
+				}
+			}
+		case inst.Status == StatusRunning:
+			// DB says running but there is no live runtime (crashed / not yet
+			// re-started after restart) — surface that instead of a stale badge.
+			newStatus, lastErr = StatusError, "instance runtime 未启动"
+		default:
+			continue // stopped / error with no runtime → stored status is authoritative
+		}
+
+		if inst.Status != newStatus || inst.LastError != lastErr {
+			inst.Status = newStatus
+			inst.LastError = lastErr
+			_ = m.setStatus(ctx, inst.Name, newStatus, lastErr)
+		}
+	}
+	return list, nil
+}
+
 func (m *Manager) Get(ctx context.Context, name string) (*Instance, error) {
 	row := m.db.QueryRowContext(ctx,
 		`SELECT id, provider, name, enabled, mode, status, config_json, last_event_at, last_error, created_at, updated_at

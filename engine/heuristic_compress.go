@@ -4,10 +4,10 @@
 // 长压缩走 LLM 保留语义。Compactor 按"超限程度"路由到二者之一。
 //
 // 4 条启发式规则：
-//   1. 删除老 tool_call/tool_result 配对（保留最近 N 对）
-//   2. 删除重复 user 提问（按 trim+lower 哈希去重）
-//   3. 截断超长 assistant 回复（保留头 60% + 尾 20%）
-//   4. 图像/二进制 metadata 替换为占位（保留语义，剔除 base64）
+//  1. 删除老 tool_call/tool_result 配对（保留最近 N 对）
+//  2. 删除重复 user 提问（按 trim+lower 哈希去重）
+//  3. 截断超长 assistant 回复（保留头 60% + 尾 20%）
+//  4. 图像/二进制 metadata 替换为占位（保留语义，剔除 base64）
 //
 // flag 与开关：本函数无 feature flag，由 Compactor 决定何时调；如需禁用，调用方传
 // keepRecentToolPairs=很大即可让规则 1 失效。
@@ -88,18 +88,22 @@ func HeuristicCompress(history []llm.Message, cfg HeuristicCompressOptions) []ll
 			seenUser[h] = true
 		}
 
-		// 规则 3: assistant 超长截断
-		if role == "assistant" && len(m.Content) > cfg.MaxAssistantChars {
-			head := cfg.MaxAssistantChars * 60 / 100
-			tail := cfg.MaxAssistantChars * 20 / 100
-			m.Content = m.Content[:head] + "\n...[truncated]...\n" + m.Content[len(m.Content)-tail:]
+		// 规则 3: assistant 超长截断（rune 安全头尾切：按码点而非字节，避免切裂多字节中文/emoji）
+		if role == "assistant" {
+			runes := []rune(m.Content)
+			if len(runes) > cfg.MaxAssistantChars {
+				head := cfg.MaxAssistantChars * 60 / 100
+				tail := cfg.MaxAssistantChars * 20 / 100
+				m.Content = string(runes[:head]) + "\n...[truncated]...\n" + string(runes[len(runes)-tail:])
+			}
 		}
 
 		// 规则 4: 图像 metadata 占位（图像 base64 通常出现在 message 的扩展字段；
 		// llm.Message 没有标准 attachment 字段，这里仅做长度兜底 —— 超过 100KB
-		// 的 user content 视作含 base64，截断保留前 200 字符）
+		// 的 user content 视作含 base64，截断保留前 ~200 字符）。
+		// 阈值仍按字节（payload 体积语义），截断走 rune 安全。
 		if role == "user" && len(m.Content) > 100*1024 {
-			m.Content = m.Content[:200] + "\n...[binary content elided]..."
+			m.Content = string([]rune(m.Content)[:200]) + "\n...[binary content elided]..."
 		}
 
 		out = append(out, m)

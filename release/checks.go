@@ -271,9 +271,11 @@ func BuildDefault10WithReal(repoRoot, expectedVersion string, versionFiles []str
 	return checks
 }
 
+// rune 安全：按码点切，绝不在多字节中文/emoji 中间切裂出 U+FFFD（保留 max 内容 + 后缀）。
 func truncate(s string, max int) string {
-	if len(s) <= max {
+	r := []rune(s)
+	if len(r) <= max {
 		return s
 	}
-	return s[:max] + "\n... [truncated]"
+	return string(r[:max]) + "\n... [truncated]"
 }

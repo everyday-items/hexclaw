@@ -217,6 +217,30 @@ type FileMemoryConfig struct {
 	Dir       string `yaml:"dir"`        // 记忆目录，默认 ~/.hexclaw/memory/
 	MaxMemory int    `yaml:"max_memory"` // MEMORY.md 最大行数，默认 200
 	DailyDays int    `yaml:"daily_days"` // 加载最近几天的日记，默认 2
+	// Reflect 周期反思整合（增量 B / 方案 §4.4.2）：后台机械化去重 / 时序取代留史 / 晋升降级 / 归档陈旧。
+	// **默认关、opt-in**（开启=零 LLM 的确定性维护，关闭=零行为变更）。
+	Reflect             bool `yaml:"reflect"`               // 是否启用周期反思整合
+	ReflectIntervalMins int  `yaml:"reflect_interval_mins"` // 反思间隔（分钟），默认 1440（24h）
+	// Profile 周期画像蒸馏（增量 G③ / 方案 §4.7 R5，deep 相）：低频把零碎事实 LLM 合成稳定用户画像，
+	// 落 Pinned identity 条。**默认关、opt-in**（开启=每周期一次 LLM 合成；与机械反思并存不替换）。
+	Profile             bool `yaml:"profile"`               // 是否启用周期画像蒸馏
+	ProfileIntervalMins int  `yaml:"profile_interval_mins"` // 蒸馏间隔（分钟），默认 1440（24h）
+	// Dreaming 多阶段记忆固化（对标 OpenClaw dreaming，deep 相 LLM 整合）：在机械反思之上叠加
+	// LLM 聚类合成——把相关/冗余记忆综合成一条并 supersede 留史。**默认关、opt-in**，需已配 LLM。
+	Dreaming             bool `yaml:"dreaming"`               // 是否启用多阶段 dreaming（深相 LLM 整合）
+	DreamingIntervalMins int  `yaml:"dreaming_interval_mins"` // 深相整合间隔（分钟），默认 10080（每周，低频）
+	// AutoMemory 对话自动进记忆的方式（增量 G：采纳 Claude Code 式「主模型随手判断」）：
+	//   "inline"（默认）—— 主模型回话中自行判断、顺手调 manage_memory 存：零额外 LLM 调用、内容感知、按需触发；
+	//   "extract" —— 旧法：每轮回复后后台另起一次 LLM 抽取（工具调用不可靠的弱/本地模型可回退到此）；
+	//   "off" —— 不自动进记忆（仅显式 manage_memory / 用户手改文件）。
+	AutoMemory string `yaml:"auto_memory"`
+	// RecallMinScore 召回相关性地板（修复 minScore=0 噪音）：**仅当配了 embedding 时生效**（纯 BM25 稀疏、
+	// 不设地板防漏召）。hybrid relevance(0.7 向量 + 0.3 BM25) < 此值的事实不注入。默认 0.3（保守，由 eval 调）；置 0 关。
+	RecallMinScore float64 `yaml:"recall_min_score"`
+	// ActiveRecall 回复前主动会话深召回（增量 G② / 方案 §4.4.1 §7bis R13，对齐 OpenClaw active-memory）：
+	// 按 query 翻原始历史会话、把「该想起来」的旧上下文主动浮现（FTS-fast 零 LLM、超时+熔断、与策展事实去重）。
+	// **默认开**，仅 DM/交互式生效（系统派发不跑）；置 false 关闭。
+	ActiveRecall *bool `yaml:"active_recall"`
 }
 
 // KnowledgeConfig 知识库配置
@@ -224,21 +248,32 @@ type FileMemoryConfig struct {
 // 支持向量搜索 + FTS5 关键词搜索的混合检索模式。
 // 需要配置 Embedding Provider 来生成向量。
 type KnowledgeConfig struct {
-	Enabled       bool            `yaml:"enabled"`         // 是否启用知识库
-	ChunkSize     int             `yaml:"chunk_size"`      // 分块大小（字符数），默认 400
-	ChunkOverlap  int             `yaml:"chunk_overlap"`   // 分块重叠（字符数），默认 80
-	TopK          int             `yaml:"top_k"`           // 检索返回的最大 chunk 数，默认 3
-	VectorWeight  float64         `yaml:"vector_weight"`   // 向量搜索权重，默认 0.7
-	TextWeight    float64         `yaml:"text_weight"`     // 关键词搜索权重，默认 0.3
-	MMRLambda     float64         `yaml:"mmr_lambda"`      // MMR 多样性参数（0=最多样, 1=最相关），默认 0.7
-	TimeDecayDays int             `yaml:"time_decay_days"` // 时间衰减半衰期（天），默认 30，0=不衰减
-	Embedding     EmbeddingConfig `yaml:"embedding"`       // Embedding 配置
+	Enabled       bool    `yaml:"enabled"`         // 是否启用知识库
+	ChunkSize     int     `yaml:"chunk_size"`      // 分块大小（字符数），默认 400
+	ChunkOverlap  int     `yaml:"chunk_overlap"`   // 分块重叠（字符数），默认 80
+	TopK          int     `yaml:"top_k"`           // 检索返回的最大 chunk 数，默认 3
+	VectorWeight  float64 `yaml:"vector_weight"`   // 向量搜索权重，默认 0.7
+	TextWeight    float64 `yaml:"text_weight"`     // 关键词搜索权重，默认 0.3
+	MMRLambda     float64 `yaml:"mmr_lambda"`      // MMR 多样性参数（0=最多样, 1=最相关），默认 0.7
+	TimeDecayDays int     `yaml:"time_decay_days"` // 时间衰减半衰期（天），默认 30，0=不衰减
+	Rerank        bool    `yaml:"rerank"`          // 重排总开关，默认 true
+	RerankModel   string  `yaml:"rerank_model"`    // 专用 cross-encoder 重排模型（如 BAAI/bge-reranker-v2-m3）；空=LLM 重排，SiliconFlow 自动启用
+	QueryExpand   bool    `yaml:"query_expand"`    // HyDE + multi-query 查询扩展开关（需已配 LLM），默认 true
+	Contextual    bool    `yaml:"contextual"`      // 入库 Contextual Retrieval（chunk 前置文档级上下文），默认 true
+	MinScore      float64 `yaml:"min_score"`       // 向量相关度地板 [0,1]，默认 0.55，0=关
+	CandidateK    int     `yaml:"candidate_k"`     // 宽召回候选池大小（rerank 前），默认 50
+	// SnapshotRetention 每个定时任务「快照系列」(source + 基础标题) 保留的最大文档数，
+	// 超出后台裁剪最旧的，防止 @hourly 采集器无限累积。默认 100，0=不限。
+	SnapshotRetention int             `yaml:"snapshot_retention"`
+	Embedding         EmbeddingConfig `yaml:"embedding"` // Embedding 配置
 }
 
 // EmbeddingConfig 向量嵌入配置
 type EmbeddingConfig struct {
-	Provider string `yaml:"provider"` // 使用哪个 LLM Provider 生成 embedding
-	Model    string `yaml:"model"`    // Embedding 模型名称（如 text-embedding-3-small）
+	Provider    string `yaml:"provider"`     // 使用哪个 LLM Provider 生成 embedding
+	Model       string `yaml:"model"`        // Embedding 模型名称（如 text-embedding-3-small）
+	QueryPrefix string `yaml:"query_prefix"` // 查询嵌入前缀（如 nomic 的 "search_query: "），空=按模型自动
+	DocPrefix   string `yaml:"doc_prefix"`   // 文档嵌入前缀（如 nomic 的 "search_document: "），空=按模型自动
 }
 
 // ServerConfig 服务器配置
@@ -676,6 +711,9 @@ type StorageConfig struct {
 // SQLiteConfig SQLite 配置
 type SQLiteConfig struct {
 	Path string `yaml:"path"`
+	// SessionRetentionDays 会话/消息保留天数：>0 时周期清理早于该窗口的会话（修缺陷G「CleanupOldSessions 死代码」）。
+	// 默认 0=永久保留（个人桌面 app 默认不删历史，opt-in 才生效）。
+	SessionRetentionDays int `yaml:"session_retention_days"`
 }
 
 // PostgresConfig PostgreSQL 配置

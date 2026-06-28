@@ -103,11 +103,15 @@ type messageMetadata struct {
 	// Documents 文档卡片（name/mime/size），前端随请求 metadata["documents"] 上送的 ChatDocumentRef[] JSON。
 	// 此前只存前端本地、重载即丢 → 文档退化为纯文本；现一并落库（BUG-20260626）。
 	Documents json.RawMessage `json:"documents,omitempty"`
+	// Skills 发送时挂载/召唤的技能名（前端气泡 chip）。前端随请求 metadata["skills"] 逗号分隔上送；
+	// 此前持久化漏编码 → 重载后 metadata.skills 缺失、chip 消失。现解析成**数组**一并落库
+	// （与前端内存态 userMeta.skills、getMessageSkills 的 Array.isArray 契约一致）（BUG-20260627 #4）。
+	Skills []string `json:"skills,omitempty"`
 }
 
 // SaveUserMessage 保存用户消息到会话。
 func (m *Manager) SaveUserMessage(ctx context.Context, sessionID string, msg *adapter.Message) error {
-	metadata, err := encodeMessageMetadata(msg.Attachments, msg.Metadata["documents"])
+	metadata, err := encodeMessageMetadata(msg.Attachments, msg.Metadata["documents"], msg.Metadata["skills"])
 	if err != nil {
 		return fmt.Errorf("编码消息元数据失败: %w", err)
 	}
@@ -151,6 +155,12 @@ type AssistantMeta struct {
 	Model            string
 	AgentName        string
 	RequestID        string
+	// ToolCalls 本轮工具调用记录。持久化进 meta.tool_calls，切会话/重启重载后
+	// 前端 normalizeLoadedMessage 据此重建工具卡（修「重载即蒸发」）。
+	ToolCalls []adapter.ToolCall
+	// Blocks 本轮有序内容块流（text↔tool 交错序）。持久化进 meta.blocks，重载后
+	// 前端据此按序渲染多步 ReAct（而非回退扁平 content+tool_calls 的单轮近似）。
+	Blocks []adapter.Block
 }
 
 // SaveAssistantMessageWithMeta 保存助手回复（含 reasoning 等元数据）并返回消息记录。
@@ -195,6 +205,15 @@ func (m *Manager) SaveAssistantReply(ctx context.Context, sessionID, content str
 	}
 	if am.AgentName != "" {
 		metaMap["agent_name"] = am.AgentName
+	}
+	// 工具调用持久化进 meta.tool_calls（schema 早有此约定，此前实现遗漏）——
+	// 重载后前端据此重建工具卡，不再「重载即蒸发」。
+	if len(am.ToolCalls) > 0 {
+		metaMap["tool_calls"] = am.ToolCalls
+	}
+	// 有序内容块持久化进 meta.blocks —— 重载后多步 ReAct 仍按真实交错序渲染。
+	if len(am.Blocks) > 0 {
+		metaMap["blocks"] = am.Blocks
 	}
 	meta := "{}"
 	if len(metaMap) > 0 {
@@ -377,12 +396,13 @@ func generateTitleForMessage(msg *adapter.Message) string {
 
 // encodeMessageMetadata 组装用户消息富内容 blob（图片附件 + 文档卡片）。
 // documentsJSON 来自前端随请求 metadata["documents"] 上送的 ChatDocumentRef[] JSON（可空）。
-func encodeMessageMetadata(attachments []adapter.Attachment, documentsJSON string) (string, error) {
+func encodeMessageMetadata(attachments []adapter.Attachment, documentsJSON, skillsCSV string) (string, error) {
 	mm := messageMetadata{Attachments: attachments}
 	if documentsJSON != "" && documentsJSON != "null" && json.Valid([]byte(documentsJSON)) {
 		mm.Documents = json.RawMessage(documentsJSON)
 	}
-	if len(mm.Attachments) == 0 && mm.Documents == nil {
+	mm.Skills = parseSkillsCSV(skillsCSV)
+	if len(mm.Attachments) == 0 && mm.Documents == nil && len(mm.Skills) == 0 {
 		return "{}", nil
 	}
 	data, err := json.Marshal(mm)
@@ -390,6 +410,22 @@ func encodeMessageMetadata(attachments []adapter.Attachment, documentsJSON strin
 		return "", err
 	}
 	return string(data), nil
+}
+
+// parseSkillsCSV 把前端逗号分隔的挂载技能名解析成数组：trim 去空、丢空项、保持原顺序。
+// 全空/空串返回 nil（配合 omitempty 不写 skills 键，无技能消息 metadata 保持干净）。
+func parseSkillsCSV(csv string) []string {
+	if strings.TrimSpace(csv) == "" {
+		return nil
+	}
+	parts := strings.Split(csv, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if s := strings.TrimSpace(p); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func decodeMessageAttachments(raw string) []adapter.Attachment {

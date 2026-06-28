@@ -241,6 +241,7 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 			Metadata:  chunk.Metadata,
 			Usage:     chunk.Usage,
 			ToolCalls: chunk.ToolCalls,
+			Blocks:    chunk.Blocks,
 		}
 		if msg.Metadata != nil {
 			if msg.SessionID == "" {
@@ -426,6 +427,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 				Metadata:  reply.Metadata,
 				Usage:     reply.Usage,
 				ToolCalls: reply.ToolCalls,
+				Blocks:    reply.Blocks,
 			}
 			if reply.Metadata == nil {
 				respMsg.Metadata = map[string]string{}
@@ -499,6 +501,7 @@ func snapshotToMessage(snapshot *streamstate.Snapshot) wsMessage {
 		Metadata:  snapshot.Metadata,
 		Usage:     snapshot.Usage,
 		ToolCalls: snapshot.ToolCalls,
+		Blocks:    snapshot.Blocks,
 	}
 }
 
@@ -530,6 +533,7 @@ type wsMessage struct {
 	Metadata    map[string]string    `json:"metadata,omitempty"`
 	Usage       *adapter.Usage       `json:"usage,omitempty"`
 	ToolCalls   []adapter.ToolCall   `json:"tool_calls,omitempty"`
+	Blocks      []adapter.Block      `json:"blocks,omitempty"`
 	Attachments []adapter.Attachment `json:"attachments,omitempty"`
 }
 

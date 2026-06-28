@@ -74,11 +74,11 @@ func DefaultConfig() *Config {
 				Browser:   true,
 				Code:      false, // 高风险，默认关闭
 				Shell:     false, // 高风险，默认关闭
-				CodeExec:  true, // 沙箱代码执行（Python/JS/Go），支持抓取网页、数据处理等
-				FileOps:   true, // 受限于 workspace，默认开启
+				CodeExec:  true,  // 沙箱代码执行（Python/JS/Go），支持抓取网页、数据处理等
+				FileOps:   true,  // 受限于 workspace，默认开启
 				CodeExecPolicy: CodeExecPolicyConfig{
-					RequireApproval: boolPtr(true),  // 安全默认：需要用户审批
-					Network:         boolPtr(true),  // 允许网络访问：抓取网页、调用 API
+					RequireApproval: boolPtr(true), // 安全默认：需要用户审批
+					Network:         boolPtr(true), // 允许网络访问：抓取网页、调用 API
 				},
 			},
 		},
@@ -97,16 +97,29 @@ func DefaultConfig() *Config {
 				Enabled: true,
 				Backend: "sqlite",
 			},
+			Vector: VectorMemoryConfig{
+				Enabled:  true,     // ★默认开：向量语义记忆层（仅 embedding 已配时真激活，否则 main.go 守卫不启=安全降级）
+				Backend:  "memory", // 内存向量库（桌面单机，无需外部 milvus/weaviate）
+				TopK:     5,
+				MinScore: 0.7,
+				AutoSave: true,
+			},
 		},
 		Knowledge: KnowledgeConfig{
-			Enabled:       true,
-			ChunkSize:     400,
-			ChunkOverlap:  80,
-			TopK:          3,
-			VectorWeight:  0.7,
-			TextWeight:    0.3,
-			MMRLambda:     0.7,
-			TimeDecayDays: 30,
+			Enabled:           true,
+			ChunkSize:         400,
+			ChunkOverlap:      80,
+			TopK:              3,
+			VectorWeight:      0.7,
+			TextWeight:        0.3,
+			MMRLambda:         0.7,
+			TimeDecayDays:     30,
+			Rerank:            true,
+			QueryExpand:       true,
+			Contextual:        true,
+			MinScore:          0.55,
+			CandidateK:        50,
+			SnapshotRetention: 100,
 		},
 		Compaction: CompactionConfig{
 			Enabled:     true,
@@ -114,10 +127,19 @@ func DefaultConfig() *Config {
 			KeepRecent:  10,
 		},
 		FileMemory: FileMemoryConfig{
-			Enabled:   true,
-			Dir:       "~/.hexclaw/memory/",
-			MaxMemory: 200,
-			DailyDays: 2,
+			Enabled:              true,
+			Dir:                  "~/.hexclaw/memory/",
+			MaxMemory:            200,
+			DailyDays:            2,
+			Reflect:              true,          // ★默认开：周期反思整合（轻相机械零 LLM：去重/时序取代留史/晋升降级/归档）
+			ReflectIntervalMins:  1440,          // 24h（方案 §4.4.2「cron 0 3」低频后台）
+			Profile:              true,          // ★默认开：周期画像蒸馏（对标 ChatGPT Dreaming V3 跨时综合画像）
+			ProfileIntervalMins:  1440,          // 24h（方案 §4.7 R5，deep 相低频）
+			Dreaming:             true,          // ★默认开：多阶段 dreaming（light 机械 + deep LLM 整合留史，对标 Claude/OpenClaw dreaming）
+			DreamingIntervalMins: 10080,         // 每周（深相低频，对标 OpenClaw REM dreaming）
+			AutoMemory:           "inline",      // Claude Code 式：主模型随手判断、顺手调 manage_memory（默认；零额外 LLM 调用）
+			RecallMinScore:       0.3,           // 召回相关性地板（仅 embedding 在时生效，砍低相关噪音；eval 可调）
+			ActiveRecall:         boolPtr(true), // 回复前主动会话深召回默认开（仅 DM/交互式，FTS-fast 零 LLM；§7bis R13）
 		},
 		Skills: SkillsConfig{
 			Enabled:  true,

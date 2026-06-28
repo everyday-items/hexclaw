@@ -17,7 +17,8 @@ import (
 //
 // BUG-20260523 教训：marketplace 用户 skill 名字含中文（"前女友" / "前leader"），
 // 注入到 Claude tools[].function.name 立即被 400 拒收：
-//   String should match pattern '^[a-zA-Z0-9_-]{1,128}$'
+//
+//	String should match pattern '^[a-zA-Z0-9_-]{1,128}$'
 //
 // 任何 source（builtin / marketplace / chain / MCP）的 tool name 必须过这道关。
 // 不合规的 skip + warn 日志（不影响 trigger 词召唤路径——中文 skill 仍可被
@@ -102,6 +103,13 @@ func (tc *ToolCollector) CollectFiltered(query string, act skill.Activation) []l
 			skills = tc.skills.All()
 		}
 		for _, s := range skills {
+			// persona/prompt 类技能（skill.ContentLoader，无副作用、Execute 只回吐 prompt 正文）不是
+			// 可调用工具：其激活方式是把正文注入 system prompt（挂载 → buildMountedSkillsPrompt），而非
+			// tool-call。暴露成工具只会让模型「调用」它拿回人设原文当工具结果 → 泄漏（BUG-20260627 #1：
+			// 「这次只加载了角色设定，没有生成最终回答」）。仅副作用型技能（spawn/web_search/…）进工具集。
+			if _, isContent := s.(skill.ContentLoader); isContent {
+				continue
+			}
 			def := s.ToolDefinition()
 			if def.Function.Name == "" {
 				continue

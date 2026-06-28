@@ -81,6 +81,10 @@ type workflowExecutor struct {
 
 	mu       sync.Mutex
 	nodeRuns map[string]*WorkflowNodeRun
+
+	// resumed：续接（Ph5）已完成节点的缓存输出（nodeID→output）。执行时这些节点跳过重跑，
+	// 直接复用上次结果，只重算失败/未达的节点——对齐 OpenClaw 续接语义。
+	resumed map[string]string
 }
 
 func newWorkflowExecutor(s *Server, wf *WorkflowData, req RunWorkflowRequest) *workflowExecutor {
@@ -94,6 +98,12 @@ func newWorkflowExecutor(s *Server, wf *WorkflowData, req RunWorkflowRequest) *w
 		order:    make(map[string]int),
 		nodeRuns: make(map[string]*WorkflowNodeRun),
 	}
+}
+
+// withResumed 注入续接的已完成节点输出，返回自身便于链式调用。
+func (e *workflowExecutor) withResumed(resumed map[string]string) *workflowExecutor {
+	e.resumed = resumed
+	return e
 }
 
 func (e *workflowExecutor) execute(ctx context.Context, run *WorkflowRun) *WorkflowRun {
@@ -307,6 +317,16 @@ func (e *workflowExecutor) executeNode(ctx context.Context, state hexagon.MapSta
 		return state, nil
 	}
 
+	// 续接（Ph5）：本节点上次已完成 → 跳过重跑，复用缓存输出并回灌 state，只重算失败/未达节点。
+	if cached, ok := e.resumed[node.ID]; ok {
+		e.markNodeResumed(node, cached)
+		state = putStringMapStateValue(state, stateKeyNodeOutputs, node.ID, cached)
+		if node.Type == "output" {
+			state = setStringStateValue(state, stateKeyWorkflowOutput, cached)
+		}
+		return state, nil
+	}
+
 	e.markNodeStart(node)
 	inputText := e.resolveNodeInput(state, node)
 
@@ -333,6 +353,11 @@ func (e *workflowExecutor) executeNode(ctx context.Context, state hexagon.MapSta
 	case "handoff", "agent_handoff":
 		handoffAgent, err = e.selectHandoffAgent(ctx, node, inputText)
 		output = inputText
+
+	case "parallel", "fanout":
+		// 确定性扇出：一个节点并行跑多个角色 Agent，合并输出（对齐 Claude Code Workflow
+		// parallel() / OpenClaw fan-out）。复用有界并发上限，避免角色数 = goroutine 数。
+		output, err = e.executeParallelRoles(ctx, node, inputText)
 
 	case "tool":
 		output, err = e.executeTool(ctx, node, inputText, state)
@@ -394,6 +419,91 @@ func (e *workflowExecutor) executeAgent(ctx context.Context, node *workflowNode,
 		return "", nil
 	}
 	return reply.Content, nil
+}
+
+// maxWorkflowParallel 限制单个 parallel 节点并发跑的角色 Agent 数（与 orchestrate 一致）。
+const maxWorkflowParallel = 8
+
+// parseParallelRoles 解析 parallel 节点的角色列表：支持 []any（前端结构化）或逗号/换行分隔的
+// 字符串（前端输入框），去空去重保序。
+func parseParallelRoles(raw any) []string {
+	var parts []string
+	switch v := raw.(type) {
+	case []any:
+		for _, item := range v {
+			if s := strings.TrimSpace(stringValue(item)); s != "" {
+				parts = append(parts, s)
+			}
+		}
+	case []string:
+		parts = v
+	case string:
+		for _, s := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == '\n' || r == ';' }) {
+			if t := strings.TrimSpace(s); t != "" {
+				parts = append(parts, t)
+			}
+		}
+	}
+	seen := make(map[string]bool, len(parts))
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
+}
+
+// executeParallelRoles 让 parallel 节点并行跑多个角色 Agent，按角色名合并输出。复用有界并发
+// 上限（maxWorkflowParallel），避免角色数 = goroutine 数。无角色时退化为单 agent。
+func (e *workflowExecutor) executeParallelRoles(ctx context.Context, node *workflowNode, inputText string) (string, error) {
+	roles := parseParallelRoles(node.Data["roles"])
+	if len(roles) == 0 {
+		return e.executeAgent(ctx, node, inputText, firstNonEmpty(stringValue(node.Data["role"]), stringValue(node.Data["agent"])))
+	}
+
+	type roleResult struct {
+		role   string
+		output string
+		err    error
+	}
+	results := make([]roleResult, len(roles))
+	limit := maxWorkflowParallel
+	if len(roles) < limit {
+		limit = len(roles)
+	}
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for i, role := range roles {
+		wg.Add(1)
+		go func(i int, role string) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				results[i] = roleResult{role: role, err: ctx.Err()}
+				return
+			}
+			out, err := e.executeAgent(ctx, node, inputText, role)
+			results[i] = roleResult{role: role, output: out, err: err}
+		}(i, role)
+	}
+	wg.Wait()
+
+	var sb strings.Builder
+	for _, r := range results {
+		sb.WriteString(fmt.Sprintf("=== %s ===\n", r.role))
+		if r.err != nil {
+			sb.WriteString("Error: " + r.err.Error() + "\n\n")
+		} else {
+			sb.WriteString(r.output + "\n\n")
+		}
+	}
+	return sb.String(), nil
 }
 
 func (e *workflowExecutor) executeTool(ctx context.Context, node *workflowNode, inputText string, state hexagon.MapState) (string, error) {
@@ -547,6 +657,18 @@ func (e *workflowExecutor) markNodeCompleted(node *workflowNode, output, role, h
 	run.AgentRole = role
 	run.HandoffAgent = handoffAgent
 	run.FinishedAt = time.Now()
+}
+
+// markNodeResumed 把续接复用的节点标记为已完成（直接采用上次缓存输出，不重跑）。
+func (e *workflowExecutor) markNodeResumed(node *workflowNode, output string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	run := e.ensureNodeRun(node)
+	run.Status = nodeStatusCompleted
+	run.Output = output
+	now := time.Now()
+	run.StartedAt = now
+	run.FinishedAt = now
 }
 
 func (e *workflowExecutor) markNodeSkipped(node *workflowNode, role string) {

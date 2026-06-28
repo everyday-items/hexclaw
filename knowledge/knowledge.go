@@ -20,17 +20,19 @@ package knowledge
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"math"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hexagon-codes/hexagon"
-	"github.com/hexagon-codes/hexclaw/featureflag"
+	hrag "github.com/hexagon-codes/hexagon/rag"
+	ragquery "github.com/hexagon-codes/hexagon/rag/query"
+	"github.com/hexagon-codes/hexagon/rag/reranker"
 	"github.com/hexagon-codes/toolkit/util/idgen"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // ─── Domain Model ───────────────────────────────────────
@@ -55,6 +57,7 @@ type Chunk struct {
 	DocID      string    `json:"doc_id"`
 	DocTitle   string    `json:"doc_title"`
 	Source     string    `json:"source"`
+	SourceType string    `json:"source_type,omitempty"` // 继承自所属文档（manual/upload/url/file/agent），供元数据过滤与展示
 	ChunkCount int       `json:"chunk_count"`
 	Content    string    `json:"content"`
 	Index      int       `json:"index"`
@@ -84,21 +87,129 @@ type SearchResult struct {
 	TextScore   float64 // BM25 关键词匹配分数 (0-1)
 }
 
-// HybridConfig 混合检索配置
-type HybridConfig struct {
-	VectorWeight  float64 // 向量搜索权重，默认 0.7
-	TextWeight    float64 // 关键词搜索权重，默认 0.3
-	MMRLambda     float64 // MMR 多样性参数 (0=最多样, 1=最相关)，默认 0.7
-	TimeDecayDays int     // 时间衰减半衰期（天），默认 30，0=不衰减
+// Filter 检索元数据过滤条件（SOTA 召回缺口补齐）。
+//
+// 关键约束：过滤在「打分 / topK 截断之前」下推到存储层（SQL WHERE），
+// 而不是在应用层对已截断的 topK 做后置过滤——否则匹配文档可能因排在候选池
+// 之外而被静默漏召回（filter-after-topK 经典 bug）。
+//
+// 语义：各维度之间是 AND；同一维度内的多值是 OR。任一零值字段表示该维度不过滤；
+// 全部零值（IsZero）等价于全量检索，走原有快路径（不 JOIN），零性能回归。
+type Filter struct {
+	// Sources 按 Document.Source 精确匹配（任一命中即可）。
+	Sources []string
+	// SourceTypes 按 Document.SourceType 匹配：manual / upload / url / file / agent（任一命中即可）。
+	SourceTypes []string
+	// CreatedAfter 仅保留所属文档创建时间 >= 该时刻的 chunk（零值=不限）。
+	CreatedAfter time.Time
+	// CreatedBefore 仅保留所属文档创建时间 <= 该时刻的 chunk（零值=不限）。
+	CreatedBefore time.Time
 }
 
-// DefaultHybridConfig 返回默认混合检索配置
+// IsZero 报告该 filter 是否无任何约束（等价于全量检索）。
+func (f Filter) IsZero() bool {
+	return len(nonEmptyStrings(f.Sources)) == 0 &&
+		len(nonEmptyStrings(f.SourceTypes)) == 0 &&
+		f.CreatedAfter.IsZero() && f.CreatedBefore.IsZero()
+}
+
+// normalize 返回去掉空白/空字符串多值后的副本，避免空串污染 SQL IN 子句
+// （IN (”) 会把无 source 的文档错误匹配进来）。
+func (f Filter) normalize() Filter {
+	f.Sources = nonEmptyStrings(f.Sources)
+	f.SourceTypes = nonEmptyStrings(f.SourceTypes)
+	return f
+}
+
+// hasDateBound 报告是否设置了任一日期边界。
+func (f Filter) hasDateBound() bool {
+	return !f.CreatedAfter.IsZero() || !f.CreatedBefore.IsZero()
+}
+
+// matchesDate 判断给定文档创建时间是否落在 [CreatedAfter, CreatedBefore] 闭区间内（零值边界=该侧不限）。
+//
+// 日期比较刻意放在 Go 层、按真实 time.Time 瞬时比较：底层 modernc.org/sqlite 把
+// time.Time 存成 RFC3339 文本（UTC 带 Z、其它带 ±HH:MM），SQL 里的字符串 `>=` 在
+// 跨时区时会按字面比较而非真实时刻（实测 +08:00 文档会被误判进 >= 某 UTC 边界），
+// 故不能下推到 SQL。源/类型用 SQL IN（纯字符串相等，无此问题），日期回到 Go 保证正确。
+func (f Filter) matchesDate(createdAt time.Time) bool {
+	if !f.CreatedAfter.IsZero() && createdAt.Before(f.CreatedAfter) {
+		return false
+	}
+	if !f.CreatedBefore.IsZero() && createdAt.After(f.CreatedBefore) {
+		return false
+	}
+	return true
+}
+
+// ParseFilterDate 解析过滤用日期串供 Filter.CreatedAfter/Before 使用：
+// 优先 RFC3339（带时区），否则按 "2006-01-02"（UTC 零点）。空串返回零值时间（不限）。
+// 供 HTTP API 与 agent 工具等字符串入口共用，确保日期解析口径一致。
+func ParseFilterDate(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return t.UTC(), nil
+	}
+	return time.Time{}, fmt.Errorf("无法解析日期 %q（需 RFC3339 或 YYYY-MM-DD）", s)
+}
+
+// nonEmptyStrings 去除切片中的空白项与纯空白项（trim 后为空则丢弃）。
+func nonEmptyStrings(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if t := strings.TrimSpace(s); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// HybridConfig 混合检索配置
+type HybridConfig struct {
+	VectorWeight  float64 // 向量搜索权重，默认 0.7（仅 UseRRF=false 的加权和回退路径用）
+	TextWeight    float64 // 关键词搜索权重，默认 0.3（同上）
+	MMRLambda     float64 // MMR 多样性参数 (0=最多样, 1=最相关)，默认 0.7（无 LLM 重排时的兜底排序）
+	TimeDecayDays int     // 时间衰减半衰期（天），默认 30，0=不衰减
+
+	// ── best-practice 检索参数（RRF 融合 + LLM 重排 + 查询扩展 + 相关度地板）──
+	MinScore      float64 // 向量相关度地板（作用于余弦归一分 (cos+1)/2 ∈ [0,1]），默认 0.55；0=关。空结果时放宽回退，保证不清空
+	CandidateK    int     // 宽召回候选池大小（rerank 前 over-retrieve），默认 50
+	RRFK          float64 // RRF 融合常数 k，默认 60（业界标准，Cormack et al. SIGIR 2009）
+	UseRRF        bool    // true=用 RRF 融合替代朴素加权和（量纲不可比），默认 true
+	RerankEnabled bool    // true=启用 LLM 重排（需 WithLLM 注入），默认 true
+	ExpandEnabled bool    // true=启用 HyDE + multi-query 查询扩展（需 WithLLM 注入），默认 true
+
+	ContextualEnabled bool // true=入库时给 chunk 前置文档级上下文（Anthropic Contextual Retrieval），默认 true
+
+	// query/doc 嵌入非对称（#12）：对支持任务前缀的模型（如 nomic：search_query/search_document）
+	// 给查询与文档分别前置不同指令前缀以提升检索质量。仅作用于 embedding 输入，不改存储内容/BM25。空=不加。
+	EmbedQueryPrefix string
+	EmbedDocPrefix   string
+}
+
+// DefaultHybridConfig 返回默认混合检索配置（best-practice：全开）
 func DefaultHybridConfig() HybridConfig {
 	return HybridConfig{
-		VectorWeight:  0.7,
-		TextWeight:    0.3,
-		MMRLambda:     0.7,
-		TimeDecayDays: 30,
+		VectorWeight:      0.7,
+		TextWeight:        0.3,
+		MMRLambda:         0.7,
+		TimeDecayDays:     30,
+		MinScore:          0.55,
+		CandidateK:        50,
+		RRFK:              60,
+		UseRRF:            true,
+		RerankEnabled:     true,
+		ExpandEnabled:     true,
+		ContextualEnabled: true,
 	}
 }
 
@@ -139,11 +250,13 @@ type DocumentRepository interface {
 // 负责从已索引的 Chunk 中检索相关结果。
 // 实现者可以基于向量相似度、全文搜索或两者混合。
 type ChunkSearcher interface {
-	// VectorSearch 向量语义搜索，返回余弦相似度最高的 Chunk
-	VectorSearch(ctx context.Context, queryVec []float32, topK int) ([]*SearchResult, error)
+	// VectorSearch 向量语义搜索，返回余弦相似度最高的 Chunk。
+	// filter 在打分/截断前下推到存储层（filter.IsZero() 时走全量快路径）。
+	VectorSearch(ctx context.Context, queryVec []float32, topK int, filter Filter) ([]*SearchResult, error)
 
-	// TextSearch 全文关键词搜索（FTS5 / BM25），返回匹配度最高的 Chunk
-	TextSearch(ctx context.Context, query string, topK int) ([]*SearchResult, error)
+	// TextSearch 全文关键词搜索（FTS5 / BM25），返回匹配度最高的 Chunk。
+	// filter 在 LIMIT 前下推到存储层（filter.IsZero() 时走全量快路径）。
+	TextSearch(ctx context.Context, query string, topK int, filter Filter) ([]*SearchResult, error)
 }
 
 // ─── Manager (Application Layer) ────────────────────────
@@ -153,11 +266,35 @@ type ChunkSearcher interface {
 // 协调写路径（DocumentRepository）和读路径（ChunkSearcher），
 // 加上 hexagon 的 Splitter / Embedder，完成完整的 RAG 管线。
 type Manager struct {
-	repo     DocumentRepository     // 写路径: 文档 + Chunk CRUD
-	searcher ChunkSearcher          // 读路径: 向量搜索 + 关键词搜索
-	embedder hexagon.VectorEmbedder // hexagon/ai-core 向量嵌入（可为 nil）
-	splitter hexagon.Splitter       // hexagon 文本分块器
-	config   HybridConfig
+	repo      DocumentRepository     // 写路径: 文档 + Chunk CRUD
+	searcher  ChunkSearcher          // 读路径: 向量搜索 + 关键词搜索
+	embedder  hexagon.VectorEmbedder // hexagon/ai-core 向量嵌入（可为 nil）
+	splitter  hexagon.Splitter       // hexagon 文本分块器
+	llm       RerankLLM              // 查询扩展 / contextual-ingest / LLM 兜底重排用的 LLM（可为 nil → 自动降级）
+	reranker  reranker.Reranker      // 专用文档重排器（如 cross-encoder via /rerank）；nil 时退回 LLM 重排
+	captioner Captioner              // 图像转写器（VLM caption）；nil 时 AddImageDocument 优雅报错（见 multimodal.go）
+
+	// config 混合检索配置。atomic.Pointer 使其可在运行时被 SetHybridConfig 原子热替换
+	// （检索参数面板 PUT /knowledge/config），而读路径（searchResults 等）在并发检索时
+	// 无锁取一致快照——读多写少，避免给热检索路径加锁。
+	config atomic.Pointer[HybridConfig]
+
+	// snapshotRetention 每个快照系列保留的最大文档数（IngestSnapshot 用）；0=不限。
+	snapshotRetention int
+}
+
+// RerankLLM 是重排 / 查询扩展 / contextual-ingest 所需的最小 LLM 能力面（单 prompt 补全）。
+// 与 hexagon rag/reranker、rag/query 的 LLMProvider 接口同形，可直接复用同一适配器。
+type RerankLLM interface {
+	Complete(ctx context.Context, prompt string) (string, error)
+}
+
+// RerankLLMFunc 把普通函数适配为 RerankLLM。
+type RerankLLMFunc func(ctx context.Context, prompt string) (string, error)
+
+// Complete 实现 RerankLLM。
+func (f RerankLLMFunc) Complete(ctx context.Context, prompt string) (string, error) {
+	return f(ctx, prompt)
 }
 
 // ManagerOption Manager 配置选项
@@ -165,12 +302,43 @@ type ManagerOption func(*Manager)
 
 // WithHybridConfig 设置混合检索配置
 func WithHybridConfig(cfg HybridConfig) ManagerOption {
-	return func(m *Manager) { m.config = cfg }
+	return func(m *Manager) { m.config.Store(&cfg) }
 }
+
+// cfg 取当前混合检索配置的快照（无锁原子读，并发检索安全）。
+func (m *Manager) cfg() HybridConfig { return *m.config.Load() }
+
+// GetHybridConfig 返回当前生效的混合检索配置（快照副本，供 GET /knowledge/config 读取）。
+func (m *Manager) GetHybridConfig() HybridConfig { return m.cfg() }
+
+// SetHybridConfig 在运行时原子热替换混合检索配置（PUT /knowledge/config）。
+//
+// 即时生效的读路径参数：rerank/query-expand/contextual 开关、min_score、candidate_k、
+// 融合权重、时间衰减等。注意：专用 cross-encoder 重排器（rerank_model 对应的 reranker）
+// 在 NewManager 时一次性注入，更换 rerank_model 需重建 Manager（重启 sidecar）才生效。
+func (m *Manager) SetHybridConfig(c HybridConfig) { m.config.Store(&c) }
 
 // WithSplitter 设置文本分块器（hexagon hexagon.Splitter）
 func WithSplitter(s hexagon.Splitter) ManagerOption {
 	return func(m *Manager) { m.splitter = s }
+}
+
+// WithLLM 注入重排 / 查询扩展 / contextual-ingest 所用的 LLM（通常复用 Agent 的 LLM router）。
+// 不注入时，rerank / query-expand / contextual 自动降级关闭（省成本，安全）。
+func WithLLM(llm RerankLLM) ManagerOption {
+	return func(m *Manager) { m.llm = llm }
+}
+
+// WithDocReranker 注入专用文档重排器（如 cross-encoder via /rerank 接口）。
+// 优先于 LLM-as-reranker——更快、更省、质量同级或更好。未注入则退回 LLM 重排。
+func WithDocReranker(r reranker.Reranker) ManagerOption {
+	return func(m *Manager) { m.reranker = r }
+}
+
+// WithSnapshotRetention 设置每个快照系列保留的最大文档数（IngestSnapshot 用）。
+// n<=0 表示不裁剪（保留全部）。
+func WithSnapshotRetention(n int) ManagerOption {
+	return func(m *Manager) { m.snapshotRetention = n }
 }
 
 // NewManager 创建知识库管理器
@@ -190,8 +358,9 @@ func NewManager(repo DocumentRepository, searcher ChunkSearcher, embedder hexago
 		repo:     repo,
 		searcher: searcher,
 		embedder: embedder,
-		config:   DefaultHybridConfig(),
 	}
+	def := DefaultHybridConfig()
+	m.config.Store(&def) // 默认配置；WithHybridConfig 选项会原子覆盖
 	for _, opt := range opts {
 		opt(m)
 	}
@@ -204,6 +373,14 @@ func NewManager(repo DocumentRepository, searcher ChunkSearcher, embedder hexago
 //
 // 流程：hexagon 分块 → 生成向量 → Repository 持久化
 func (m *Manager) AddDocument(ctx context.Context, title, content, source string) (*Document, error) {
+	return m.addDocumentTyped(ctx, title, content, source, sourceTypeFromSource(source))
+}
+
+// addDocumentTyped is AddDocument with an explicit source_type, so the snapshot
+// path can declare "agent" (a scheduled collection is autonomous by definition,
+// regardless of the human-meaningful source label the model attaches) while the
+// interactive path keeps the label-derived classification.
+func (m *Manager) addDocumentTyped(ctx context.Context, title, content, source, sourceType string) (*Document, error) {
 	if content == "" {
 		return nil, fmt.Errorf("文档内容不能为空")
 	}
@@ -227,7 +404,7 @@ func (m *Manager) AddDocument(ctx context.Context, title, content, source string
 			CreatedAt:  existing.CreatedAt,
 			UpdatedAt:  now,
 			Status:     "indexed",
-			SourceType: sourceTypeFromSource(source),
+			SourceType: sourceType,
 		}
 		chunks, err := m.buildChunks(ctx, doc, now)
 		if err != nil {
@@ -247,7 +424,7 @@ func (m *Manager) AddDocument(ctx context.Context, title, content, source string
 		CreatedAt:  now,
 		UpdatedAt:  now,
 		Status:     "indexed",
-		SourceType: sourceTypeFromSource(source),
+		SourceType: sourceType,
 	}
 
 	chunks, err := m.buildChunks(ctx, doc, now)
@@ -280,6 +457,137 @@ func (m *Manager) AddDocument(ctx context.Context, title, content, source string
 		return nil, fmt.Errorf("保存文档失败: %w", err)
 	}
 	return doc, nil
+}
+
+// IngestSnapshot writes one run of a scheduled-task "snapshot series" identified
+// by (source, baseTitle). It is the write path for cron/automation collectors,
+// and differs from AddDocument's upsert in three deliberate ways:
+//
+//  1. Append, never overwrite: the stored title is baseTitle + a timestamp
+//     suffix (SnapshotTitle), made unique even within the same second, so each
+//     run is a distinct document — a time series, not one mutated doc.
+//  2. Skip-if-unchanged: if the content is byte-for-byte (whitespace-normalized)
+//     identical to the latest snapshot of this series, nothing is written or
+//     re-embedded; the existing doc is returned with written=false. This is what
+//     keeps a stable collector (e.g. hourly "百度热搜" that rarely changes) from
+//     flooding the index with near-duplicates.
+//  3. Retention: after writing, snapshots beyond snapshotRetention (newest-kept)
+//     are pruned, bounding storage and keeping vector recall from being swamped.
+//
+// Returns the document (the new one, or the unchanged latest) and whether a new
+// document was actually written.
+func (m *Manager) IngestSnapshot(ctx context.Context, baseTitle, content, source string) (*Document, bool, error) {
+	if strings.TrimSpace(content) == "" {
+		return nil, false, fmt.Errorf("文档内容不能为空")
+	}
+	base := strings.TrimSpace(baseTitle)
+	if base == "" {
+		base = deriveSnapshotBaseTitle(content)
+	}
+
+	// (2) Skip-if-unchanged vs the latest snapshot of this series.
+	hash := contentHash(content)
+	if latest, err := m.latestSnapshot(ctx, source, base); err != nil {
+		return nil, false, err
+	} else if latest != nil {
+		full, err := m.repo.Get(ctx, latest.ID)
+		if err != nil {
+			return nil, false, fmt.Errorf("读取上一快照失败: %w", err)
+		}
+		if full != nil && contentHash(full.Content) == hash {
+			return full, false, nil
+		}
+	}
+
+	// (1) Append: pick a title that does not already exist, so AddDocument
+	// inserts a fresh document instead of upserting over an existing one. A
+	// same-second collision (rare; a series is serialized by the cron overlap
+	// guard) is disambiguated with a " (N)" suffix rather than overwriting.
+	title := SnapshotTitle(base)
+	for n := 2; ; n++ {
+		exists, err := m.repo.GetBySourceTitle(ctx, source, title)
+		if err != nil {
+			return nil, false, fmt.Errorf("查询快照标题失败: %w", err)
+		}
+		if exists == nil {
+			break
+		}
+		title = fmt.Sprintf("%s (%d)", SnapshotTitle(base), n)
+	}
+
+	// Scheduled snapshots are autonomous → source_type "agent" regardless of the
+	// label, so the desktop type filter buckets them as agent-collected, not as
+	// files (real-LLM E2E caught the model attaching a "用户输入"-style source).
+	doc, err := m.addDocumentTyped(ctx, title, content, source, "agent")
+	if err != nil {
+		return nil, false, err
+	}
+
+	// (3) Retention: prune oldest snapshots beyond the cap. Best-effort — a
+	// prune failure must not fail the run (the document is already stored).
+	if m.snapshotRetention > 0 {
+		if err := m.pruneSnapshotSeries(ctx, source, base, m.snapshotRetention); err != nil {
+			logger.Warn("快照系列裁剪失败", "source", source, "base", base, "err", err.Error())
+		}
+	}
+	return doc, true, nil
+}
+
+// latestSnapshot returns the newest document in the (source, baseTitle) snapshot
+// series, or nil if the series is empty. repo.List is ordered created_at DESC,
+// so the first series match is the newest.
+func (m *Manager) latestSnapshot(ctx context.Context, source, baseTitle string) (*Document, error) {
+	docs, err := m.repo.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("列出文档失败: %w", err)
+	}
+	for _, d := range docs {
+		if d.Source == source && isSnapshotTitleOf(d.Title, baseTitle) {
+			return d, nil
+		}
+	}
+	return nil, nil
+}
+
+// pruneSnapshotSeries deletes the oldest documents of the (source, baseTitle)
+// series so at most keep remain. List is created_at DESC, so everything past
+// index keep-1 is older and gets removed.
+func (m *Manager) pruneSnapshotSeries(ctx context.Context, source, baseTitle string, keep int) error {
+	docs, err := m.repo.List(ctx)
+	if err != nil {
+		return err
+	}
+	kept := 0
+	for _, d := range docs {
+		if d.Source != source || !isSnapshotTitleOf(d.Title, baseTitle) {
+			continue
+		}
+		kept++
+		if kept <= keep {
+			continue
+		}
+		if err := m.repo.Delete(ctx, d.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deriveSnapshotBaseTitle builds a fallback base title from content's first line
+// when the caller supplies none. Mirrors the agent skill's 24-rune clip so the
+// two write paths label untitled snapshots consistently.
+func deriveSnapshotBaseTitle(content string) string {
+	line := strings.TrimSpace(content)
+	if idx := strings.IndexAny(line, "\r\n"); idx >= 0 {
+		line = strings.TrimSpace(line[:idx])
+	}
+	if r := []rune(line); len(r) > 24 {
+		return string(r[:24])
+	}
+	if line == "" {
+		return "快照"
+	}
+	return line
 }
 
 // isUniqueConstraintErr reports whether err is a SQLite UNIQUE-constraint
@@ -353,11 +661,102 @@ func (m *Manager) ListDocuments(ctx context.Context) ([]*Document, error) {
 	return m.repo.List(ctx)
 }
 
+// SourceCount 是按 source 聚合的文档计数（供 UI 分组/过滤的轻量 facet）。
+type SourceCount struct {
+	Source string `json:"source"`
+	Count  int    `json:"count"`
+}
+
+// DocListQuery 文档分页/过滤查询。
+type DocListQuery struct {
+	Source string // 仅返回该 source 的文档（空=不过滤）
+	Limit  int    // 单页最大条数（<=0 表示不分页，返回全部）
+	Offset int    // 偏移（<0 视为 0）
+}
+
+// DocListResult 文档分页结果。
+type DocListResult struct {
+	Documents []*Document   `json:"documents"`
+	Total     int           `json:"total"`   // 过滤后、分页前的总数
+	Limit     int           `json:"limit"`   // 生效的 limit（回显）
+	Offset    int           `json:"offset"`  // 生效的 offset（回显）
+	Sources   []SourceCount `json:"sources"` // 全量（未过滤）按 source 的计数，供分组
+}
+
+// ListDocumentsPaged 列出文档，支持按 source 过滤 + 分页，并附带按 source 的计数
+// facet（防止 8760 条快照把列表页拖垮，并支撑「按来源折叠分组」的前端）。
+//
+// facet 基于「未过滤」的全集统计，使前端无需把全部文档拉到本地即可渲染来源分组；
+// documents/total 则反映「过滤后」的页。retention 让这里的全表扫描规模可控。
+func (m *Manager) ListDocumentsPaged(ctx context.Context, q DocListQuery) (*DocListResult, error) {
+	all, err := m.repo.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Source facet over the unfiltered set (newest-first List preserves a stable
+	// first-seen order for the facet slice).
+	counts := make(map[string]int, 8)
+	order := make([]string, 0, 8)
+	for _, d := range all {
+		if _, seen := counts[d.Source]; !seen {
+			order = append(order, d.Source)
+		}
+		counts[d.Source]++
+	}
+	sources := make([]SourceCount, 0, len(order))
+	for _, src := range order {
+		sources = append(sources, SourceCount{Source: src, Count: counts[src]})
+	}
+
+	// Filter.
+	filtered := all
+	if q.Source != "" {
+		filtered = make([]*Document, 0, len(all))
+		for _, d := range all {
+			if d.Source == q.Source {
+				filtered = append(filtered, d)
+			}
+		}
+	}
+	total := len(filtered)
+
+	// Paginate (limit<=0 → no paging, return the whole filtered set).
+	offset := q.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	page := filtered[offset:]
+	if q.Limit > 0 && len(page) > q.Limit {
+		page = page[:q.Limit]
+	}
+	if page == nil {
+		page = []*Document{}
+	}
+
+	return &DocListResult{
+		Documents: page,
+		Total:     total,
+		Limit:     q.Limit,
+		Offset:    offset,
+		Sources:   sources,
+	}, nil
+}
+
 // ─── Query Methods (读路径) ─────────────────────────────
 
-// Search 返回结构化搜索结果，供 API/UI 展示
+// Search 返回结构化搜索结果，供 API/UI 展示（无元数据过滤）。
 func (m *Manager) Search(ctx context.Context, query string, topK int) ([]SearchHit, error) {
-	selected, err := m.searchResults(ctx, query, topK)
+	return m.SearchWithFilter(ctx, query, topK, Filter{})
+}
+
+// SearchWithFilter 在元数据过滤约束下检索（按 source / source_type / 创建日期下推到存储层）。
+// 过滤在打分与 topK 截断之前生效，确保不会因截断漏召回匹配文档。
+func (m *Manager) SearchWithFilter(ctx context.Context, query string, topK int, filter Filter) ([]SearchHit, error) {
+	selected, err := m.searchResults(ctx, query, topK, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -374,82 +773,84 @@ func (m *Manager) Search(ctx context.Context, query string, topK int) ([]SearchH
 			Content:    r.Chunk.Content,
 			Score:      r.Chunk.Score,
 			CreatedAt:  r.Chunk.CreatedAt,
+			Metadata:   chunkMetadata(r.Chunk),
 		})
 	}
 	return hits, nil
 }
 
-// Query 混合检索知识库，返回格式化的 LLM 上下文
-//
-// v0.4.0 H7：当 flag rag.pipeline.v1 开启时，本方法走 5 阶段 RAGPipeline
-// （QueryRewriter → Retriever → Reranker → ContextBuilder → Answerer），
-// flag 关闭时退化到原 Search + formatSearchHits 路径，行为完全一致。
-func (m *Manager) Query(ctx context.Context, query string, topK int) (string, error) {
-	if featureflag.Enabled(ctx, FlagRAGPipelineV1) {
-		p := &Pipeline{
-			Retriever:      NewManagerRetriever(m),
-			ContextBuilder: SimpleContextBuilder{},
-		}
-		res, err := p.RunRAG(ctx, query, topK)
-		if err != nil {
-			// pipeline 层错误就回退到老路径，让用户体感无差别
-			if errors.Is(err, ErrPipelineDisabled) {
-				// 罕见：flag 在 RunRAG 入口仍 OFF（race condition），fallthrough 到老路径
-			} else {
-				return "", err
-			}
-		} else if res != nil {
-			return res.Context, nil
-		}
+// chunkMetadata 暴露 chunk 的可过滤/可展示元数据（source_type、创建时间），
+// 让上层（API/UI/agent）能按维度筛选与回显。无可用字段时返回 nil（保持 JSON 干净）。
+func chunkMetadata(c *Chunk) map[string]any {
+	md := make(map[string]any, 2)
+	if c.SourceType != "" {
+		md["source_type"] = c.SourceType
 	}
+	if !c.CreatedAt.IsZero() {
+		md["created_at"] = c.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	if len(md) == 0 {
+		return nil
+	}
+	return md
+}
 
-	hits, err := m.Search(ctx, query, topK)
+// Query 混合检索知识库，返回格式化的 LLM 上下文。
+//
+// 检索全链路（查询扩展 → 宽召回 → RRF 融合 → 相关度地板 → LLM 重排）
+// 统一落在 Manager.searchResults，无 feature-flag 门控、默认即最佳实践配置；
+// 缺 LLM 时自动降级（跳过 rerank / query-expand），缺 embedder 时退化纯关键词。
+func (m *Manager) Query(ctx context.Context, query string, topK int) (string, error) {
+	return m.QueryWithFilter(ctx, query, topK, Filter{})
+}
+
+// QueryWithFilter 同 Query，但在元数据过滤约束下检索（source / source_type / 创建日期）。
+func (m *Manager) QueryWithFilter(ctx context.Context, query string, topK int, filter Filter) (string, error) {
+	hits, err := m.SearchWithFilter(ctx, query, topK, filter)
 	if err != nil {
 		return "", err
 	}
 	return formatSearchHits(hits), nil
 }
 
-func (m *Manager) searchResults(ctx context.Context, query string, topK int) ([]*SearchResult, error) {
+func (m *Manager) searchResults(ctx context.Context, query string, topK int, filter Filter) ([]*SearchResult, error) {
 	if topK <= 0 {
 		topK = 3
 	}
-
-	candidateK := topK * 3
-	if candidateK < 10 {
-		candidateK = 10
+	cfg := m.cfg()
+	candidateK := cfg.CandidateK
+	if candidateK <= 0 {
+		candidateK = 50
+	}
+	if candidateK < topK*3 {
+		candidateK = topK * 3 // 至少留够 rerank 收窄空间
 	}
 
-	resultMap := make(map[string]*SearchResult)
+	// 1. 查询扩展（#8 HyDE + multi-query）；缺 LLM/关闭时返回 [query]
+	queries := m.expandQueries(ctx, query)
 
-	// 1. 向量搜索（读路径）
-	if m.embedder != nil {
-		queryVecs, embedErr := m.embedder.Embed(ctx, []string{query})
-		if embedErr != nil {
-			logger.Error("[knowledge] 查询向量嵌入失败", "error", embedErr)
-		} else if len(queryVecs) > 0 {
-			vectorResults, vecErr := m.searcher.VectorSearch(ctx, queryVecs[0], candidateK)
-			if vecErr != nil {
-				logger.Error("[knowledge] 向量搜索失败", "error", vecErr)
-			} else {
-				for _, r := range vectorResults {
-					resultMap[r.Chunk.ID] = r
+	// 2. 宽召回：每个 query 各取一路向量 + 一路 BM25，记录各排序列表喂给 RRF（#6 over-retrieve）
+	resultMap := make(map[string]*SearchResult)
+	var rankedLists []rankedList
+
+	for _, q := range queries {
+		if m.embedder != nil {
+			if qv, err := m.embedder.Embed(ctx, []string{cfg.EmbedQueryPrefix + q}); err != nil {
+				logger.Error("[knowledge] 查询向量嵌入失败", "error", err)
+			} else if len(qv) > 0 {
+				vres, vErr := m.searcher.VectorSearch(ctx, qv[0], candidateK, filter)
+				if vErr != nil {
+					logger.Error("[knowledge] 向量搜索失败", "error", vErr)
+				} else {
+					rankedLists = append(rankedLists, mergeRanked(resultMap, vres, true))
 				}
 			}
 		}
-	}
-
-	// 2. FTS5 关键词搜索（读路径）
-	textResults, textErr := m.searcher.TextSearch(ctx, query, candidateK)
-	if textErr != nil {
-		logger.Error("[knowledge] 关键词搜索失败", "error", textErr)
-	} else {
-		for _, r := range textResults {
-			if existing, ok := resultMap[r.Chunk.ID]; ok {
-				existing.TextScore = r.TextScore
-			} else {
-				resultMap[r.Chunk.ID] = r
-			}
+		tres, tErr := m.searcher.TextSearch(ctx, q, candidateK, filter)
+		if tErr != nil {
+			logger.Error("[knowledge] 关键词搜索失败", "error", tErr)
+		} else {
+			rankedLists = append(rankedLists, mergeRanked(resultMap, tres, false))
 		}
 	}
 
@@ -457,15 +858,223 @@ func (m *Manager) searchResults(ctx context.Context, query string, topK int) ([]
 		return nil, nil
 	}
 
-	// 3. 混合评分 + 时间衰减
+	// 3. 融合评分（#9 RRF 或加权和回退）+ 时间衰减
+	candidates := m.fuse(resultMap, rankedLists)
+
+	// 4. 相关度地板（#3）+ 放宽回退
+	candidates = m.applyMinScore(candidates)
+
+	// 5. 宽召回 → 重排 → 收窄（#6）；无 LLM/关闭时回退 MMR 多样性选取
+	return m.rerankTopK(ctx, query, candidates, topK), nil
+}
+
+// rankedList 是一路检索的有序候选（带模态：向量 / 文本），用于分数加权 RRF。
+type rankedList struct {
+	ids      []string
+	isVector bool
+}
+
+// mergeRanked 把一路搜索结果并入 resultMap（按 chunkID 去重，向量/文本分各取较大），
+// 返回该路的有序候选列表（带模态，喂给 RRF 融合）。isVector 决定合并哪类分数。
+func mergeRanked(resultMap map[string]*SearchResult, results []*SearchResult, isVector bool) rankedList {
+	ids := make([]string, 0, len(results))
+	for _, r := range results {
+		cur, ok := resultMap[r.Chunk.ID]
+		if !ok {
+			resultMap[r.Chunk.ID] = r
+			cur = r
+		} else {
+			if cur.Chunk.Content == "" && r.Chunk.Content != "" {
+				cur.Chunk.Content = r.Chunk.Content
+			}
+			if len(cur.Chunk.Embedding) == 0 && len(r.Chunk.Embedding) > 0 {
+				cur.Chunk.Embedding = r.Chunk.Embedding
+			}
+			if cur.Chunk.CreatedAt.IsZero() && !r.Chunk.CreatedAt.IsZero() {
+				cur.Chunk.CreatedAt = r.Chunk.CreatedAt
+			}
+		}
+		if isVector {
+			if r.VectorScore > cur.VectorScore {
+				cur.VectorScore = r.VectorScore
+			}
+		} else if r.TextScore > cur.TextScore {
+			cur.TextScore = r.TextScore
+		}
+		ids = append(ids, r.Chunk.ID)
+	}
+	return rankedList{ids: ids, isVector: isVector}
+}
+
+// fuse 用「分数加权 RRF」（#9/#11，默认）或朴素加权和（回退）给候选打分，并施加时间衰减。
+//
+// #11 修复：纯 rank RRF 会把「孤立弱 BM25 命中」当作与强命中同等的 rank-1 满权，导致
+// 跨语种/无词法重叠时一个虚假词法命中压过强向量命中。改为按各路归一化分(VectorScore/
+// TextScore)加权 rank 贡献：score(d) = Σ_list w_list · normScore(d,list) / (k + rank)。
+// 这样弱命中（低 normScore）的 rank 红利被同比缩小，而真正的精确命中（高 BM25 分）仍保留
+// 满权 —— 既根治虚假命中带偏，又不损失精确术语匹配能力。
+func (m *Manager) fuse(resultMap map[string]*SearchResult, rankedLists []rankedList) []*SearchResult {
+	cfg := m.cfg()
 	candidates := make([]*SearchResult, 0, len(resultMap))
-	for _, r := range resultMap {
-		r.Chunk.Score = m.hybridScore(r)
-		candidates = append(candidates, r)
+	if cfg.UseRRF && len(rankedLists) > 0 {
+		k := cfg.RRFK
+		if k <= 0 {
+			k = 60
+		}
+		vw, tw := cfg.VectorWeight, cfg.TextWeight
+		if vw <= 0 && tw <= 0 {
+			vw, tw = 0.7, 0.3
+		}
+		if m.embedder == nil {
+			vw, tw = 0, 1 // 无向量时退化纯关键词
+		}
+		fused := make(map[string]float64, len(resultMap))
+		for _, list := range rankedLists {
+			w := tw
+			if list.isVector {
+				w = vw
+			}
+			for rank, id := range list.ids {
+				r := resultMap[id]
+				s := r.TextScore
+				if list.isVector {
+					s = r.VectorScore
+				}
+				fused[id] += w * s / (k + float64(rank+1))
+			}
+		}
+		for id, r := range resultMap {
+			r.Chunk.Score = m.applyTimeDecay(fused[id], r.Chunk.CreatedAt)
+			candidates = append(candidates, r)
+		}
+	} else {
+		for _, r := range resultMap {
+			r.Chunk.Score = m.hybridScore(r)
+			candidates = append(candidates, r)
+		}
+	}
+	return candidates
+}
+
+// applyMinScore 施加相关度地板（#3）：丢弃"纯弱向量命中"（语义低于地板且无关键词支撑）；
+// 有关键词命中或纯关键词模式的候选一律保留。过滤后为空则放宽回退，保证不清空。
+func (m *Manager) applyMinScore(candidates []*SearchResult) []*SearchResult {
+	minScore := m.cfg().MinScore
+	if minScore <= 0 || m.embedder == nil {
+		return candidates
+	}
+	kept := make([]*SearchResult, 0, len(candidates))
+	for _, r := range candidates {
+		if r.VectorScore >= minScore || r.TextScore > 0 {
+			kept = append(kept, r)
+		}
+	}
+	if len(kept) == 0 {
+		return candidates // 放宽回退：避免地板把结果清空
+	}
+	return kept
+}
+
+// rerankTopK 宽召回 → 重排 → 收窄（#6）。
+// 先按融合分降序限定 rerank 输入规模；启用且有 LLM 时走 LLM 重排，否则回退 MMR 多样性。
+func (m *Manager) rerankTopK(ctx context.Context, query string, candidates []*SearchResult, topK int) []*SearchResult {
+	cfg := m.cfg()
+	sortByScore(candidates)
+	pool := candidates
+	maxRerank := cfg.CandidateK
+	if maxRerank <= 0 {
+		maxRerank = 50
+	}
+	if len(pool) > maxRerank {
+		pool = pool[:maxRerank]
 	}
 
-	// 4. MMR 去重选取
-	return m.mmrSelect(candidates, topK), nil
+	if cfg.RerankEnabled && len(pool) > 1 {
+		if rr := m.resolveReranker(topK); rr != nil {
+			if ordered, err := m.rerankWith(ctx, rr, query, pool, topK); err != nil {
+				logger.Warn("[knowledge] 重排失败，回退融合分排序", "reranker", rr.Name(), "error", err)
+			} else if len(ordered) > 0 {
+				return ordered
+			}
+		}
+	}
+	// 回退：MMR 多样性选取（无重排器时仍保留多样性，避免近重复 chunk 占满 topK）
+	return m.mmrSelect(pool, topK)
+}
+
+// resolveReranker 选重排器：专用 cross-encoder（WithDocReranker 注入）优先——更快更省更准；
+// 否则 LLM-as-reranker（复用 chat 模型）；都没有则 nil（退回 MMR）。
+func (m *Manager) resolveReranker(topK int) reranker.Reranker {
+	if m.reranker != nil {
+		return m.reranker
+	}
+	if m.llm != nil {
+		return reranker.NewLLMReranker(m.llm, reranker.WithLLMRerankerTopK(topK))
+	}
+	return nil
+}
+
+// rerankWith 用给定重排器对候选精排，按返回顺序映射回 SearchResult 并截到 topK。
+func (m *Manager) rerankWith(ctx context.Context, rr reranker.Reranker, query string, pool []*SearchResult, topK int) ([]*SearchResult, error) {
+	docs := make([]hrag.Document, 0, len(pool))
+	byID := make(map[string]*SearchResult, len(pool))
+	for _, r := range pool {
+		docs = append(docs, hrag.Document{ID: r.Chunk.ID, Content: r.Chunk.Content, Score: float32(r.Chunk.Score)})
+		byID[r.Chunk.ID] = r
+	}
+	out, err := rr.Rerank(ctx, query, docs)
+	if err != nil {
+		return nil, err
+	}
+	res := make([]*SearchResult, 0, len(out))
+	for _, d := range out {
+		if r, ok := byID[d.ID]; ok {
+			r.Chunk.Score = float64(d.Score) // 用重排分覆盖展示分
+			res = append(res, r)
+		}
+	}
+	if topK > 0 && len(res) > topK {
+		res = res[:topK]
+	}
+	return res, nil
+}
+
+// expandQueries 查询扩展（#8）：原始 query + multi-query 变体 + HyDE 假设文档。
+// 缺 LLM 或关闭时只返回 [query]。总数限 5，控制召回成本。
+func (m *Manager) expandQueries(ctx context.Context, query string) []string {
+	queries := []string{query}
+	if !m.cfg().ExpandEnabled || m.llm == nil {
+		return queries
+	}
+	seen := map[string]bool{strings.TrimSpace(query): true}
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s != "" && !seen[s] {
+			seen[s] = true
+			queries = append(queries, s)
+		}
+	}
+
+	mq := ragquery.NewMultiQueryGenerator(m.llm, ragquery.WithNumQueries(3), ragquery.WithIncludeSelf(false))
+	if variants, err := mq.Generate(ctx, query); err != nil {
+		logger.Warn("[knowledge] multi-query 生成失败", "error", err)
+	} else {
+		for _, v := range variants {
+			add(v)
+		}
+	}
+
+	hyde := ragquery.NewHyDEGenerator(m.llm)
+	if doc, err := hyde.Generate(ctx, query); err != nil {
+		logger.Warn("[knowledge] HyDE 生成失败", "error", err)
+	} else {
+		add(doc)
+	}
+
+	if len(queries) > 5 {
+		queries = queries[:5]
+	}
+	return queries
 }
 
 // ─── Internal ───────────────────────────────────────────
@@ -489,6 +1098,10 @@ func (m *Manager) buildChunks(ctx context.Context, doc *Document, ts time.Time) 
 	}
 	doc.ChunkCount = len(ragDocs)
 
+	// #7 Contextual Retrieval：给每个 chunk 前置「文档级上下文」（标题路径 + 可选 LLM 情境摘要），
+	// 使向量 embedding 与 BM25 都索引到增强后的文本（contextual embeddings + contextual BM25）。
+	m.contextualize(ctx, doc, ragDocs)
+
 	chunkTexts := make([]string, len(ragDocs))
 	for i, d := range ragDocs {
 		chunkTexts[i] = d.Content
@@ -496,7 +1109,15 @@ func (m *Manager) buildChunks(ctx context.Context, doc *Document, ts time.Time) 
 
 	var embeddings [][]float32
 	if m.embedder != nil && len(chunkTexts) > 0 {
-		embeddings, err = m.embedder.Embed(ctx, chunkTexts)
+		// #12 文档侧前缀只作用于 embedding 输入；Chunk.Content（FTS/展示）仍用原文。
+		embedTexts := chunkTexts
+		if docPrefix := m.cfg().EmbedDocPrefix; docPrefix != "" {
+			embedTexts = make([]string, len(chunkTexts))
+			for i, t := range chunkTexts {
+				embedTexts[i] = docPrefix + t
+			}
+		}
+		embeddings, err = m.embedder.Embed(ctx, embedTexts)
 		if err != nil {
 			logger.Warn("[knowledge] 生成向量嵌入失败，降级为纯文本索引", "title", doc.Title, "error", err)
 			embeddings = nil
@@ -523,19 +1144,120 @@ func (m *Manager) buildChunks(ctx context.Context, doc *Document, ts time.Time) 
 	return chunks, nil
 }
 
+// ─── Contextual Retrieval (#7) ──────────────────────────
+
+const (
+	contextualDocCharBudget   = 6000 // 喂给 LLM 的文档正文上限（rune）
+	contextualChunkCharBudget = 1200 // 喂给 LLM 的单 chunk 上限（rune）
+	maxContextualLLMChunks    = 200  // 单文档最多对前 N 个 chunk 生成 LLM 情境（控成本，超出打 WARN 不静默）
+)
+
+// contextualize 给每个 chunk 前置文档级上下文（Anthropic Contextual Retrieval）。
+//
+// ContextualEnabled 关闭时不做任何增强（原始 chunk）。开启时始终前置确定性定位
+// 「文档标题 › 标题路径（header_path，来自 MarkdownSplitter）」；当注入了 LLM 且
+// 文档多于 1 个 chunk 时，再追加一句 LLM 生成的情境摘要。增强后的文本同时用于
+// 向量 embedding 与 BM25 索引，即 contextual embeddings + contextual BM25。
+func (m *Manager) contextualize(ctx context.Context, doc *Document, ragDocs []hexagon.Document) {
+	if !m.cfg().ContextualEnabled {
+		return
+	}
+	useLLM := m.llm != nil && len(ragDocs) > 1
+	var docCtx string
+	if useLLM {
+		docCtx = clampRunes(doc.Content, contextualDocCharBudget)
+	}
+	llmBudget := maxContextualLLMChunks
+	for i := range ragDocs {
+		header := headerPathOf(ragDocs[i].Metadata)
+		var blurb string
+		if useLLM && llmBudget > 0 {
+			if b, err := m.generateChunkContext(ctx, docCtx, ragDocs[i].Content); err != nil {
+				logger.Warn("[knowledge] contextual 情境生成失败，跳过该 chunk", "error", err)
+			} else {
+				blurb = b
+				llmBudget--
+			}
+		}
+		if prefix := buildContextPrefix(doc.Title, header, blurb); prefix != "" {
+			ragDocs[i].Content = prefix + "\n\n" + ragDocs[i].Content
+		}
+	}
+	if useLLM && len(ragDocs) > maxContextualLLMChunks {
+		logger.Warn("[knowledge] 文档 chunk 数超过 contextual LLM 上限，仅前 N 个生成情境摘要",
+			"chunks", len(ragDocs), "limit", maxContextualLLMChunks, "title", doc.Title)
+	}
+}
+
+// headerPathOf 从 chunk 元数据取 MarkdownSplitter 写入的 header_path（如 "# 安装 > ## 依赖"）。
+func headerPathOf(md map[string]any) string {
+	if md == nil {
+		return ""
+	}
+	if v, ok := md["header_path"].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+// buildContextPrefix 组装「文档标题 › 标题路径」确定性定位 + 可选 LLM 情境摘要。
+func buildContextPrefix(title, headerPath, blurb string) string {
+	var loc []string
+	if t := strings.TrimSpace(title); t != "" {
+		loc = append(loc, t)
+	}
+	if headerPath != "" {
+		loc = append(loc, headerPath)
+	}
+	var parts []string
+	if len(loc) > 0 {
+		parts = append(parts, "【定位】"+strings.Join(loc, " › "))
+	}
+	if blurb != "" {
+		parts = append(parts, "【情境】"+blurb)
+	}
+	return strings.Join(parts, "  ")
+}
+
+// generateChunkContext 用 LLM 为单个 chunk 生成一句定位/主题摘要（Anthropic Contextual Retrieval）。
+func (m *Manager) generateChunkContext(ctx context.Context, docContent, chunk string) (string, error) {
+	prompt := fmt.Sprintf(`<document>
+%s
+</document>
+
+下面是该文档中的一个片段：
+<chunk>
+%s
+</chunk>
+
+请用一句不超过 50 字的话，说明这个片段在整篇文档中的位置与主题，以便检索时更好地定位。只输出这一句话，不要任何解释或前后缀。`,
+		docContent, clampRunes(chunk, contextualChunkCharBudget))
+	out, err := m.llm.Complete(ctx, prompt)
+	if err != nil {
+		return "", err
+	}
+	return clampRunes(strings.TrimSpace(out), 200), nil
+}
+
 func (m *Manager) hybridScore(r *SearchResult) float64 {
-	vectorWeight := m.config.VectorWeight
-	textWeight := m.config.TextWeight
+	cfg := m.cfg()
+	vectorWeight := cfg.VectorWeight
+	textWeight := cfg.TextWeight
 	if m.embedder == nil {
 		vectorWeight = 0
 		textWeight = 1.0
 	}
 	score := vectorWeight*r.VectorScore + textWeight*r.TextScore
-	// 仅对有有效时间戳的 chunk 施加时间衰减；CreatedAt 零值（未设置）时跳过，
-	// 否则 time.Since(零值) 把分数衰减到 0、导致无时间戳的 chunk 永不召回。
-	if m.config.TimeDecayDays > 0 && !r.Chunk.CreatedAt.IsZero() {
-		age := time.Since(r.Chunk.CreatedAt).Hours() / 24
-		lambda := math.Ln2 / float64(m.config.TimeDecayDays)
+	return m.applyTimeDecay(score, r.Chunk.CreatedAt)
+}
+
+// applyTimeDecay 对分数施加指数时间衰减（半衰期 TimeDecayDays 天）。
+// 仅对有有效时间戳的 chunk 衰减；CreatedAt 零值时跳过，
+// 否则 time.Since(零值) 会把分数衰减到 0、导致无时间戳 chunk 永不召回。
+func (m *Manager) applyTimeDecay(score float64, createdAt time.Time) float64 {
+	if days := m.cfg().TimeDecayDays; days > 0 && !createdAt.IsZero() {
+		age := time.Since(createdAt).Hours() / 24
+		lambda := math.Ln2 / float64(days)
 		score *= math.Exp(-lambda * age)
 	}
 	return score
@@ -562,7 +1284,7 @@ func (m *Manager) mmrSelect(candidates []*SearchResult, topK int) []*SearchResul
 		return candidates
 	}
 
-	lambda := m.config.MMRLambda
+	lambda := m.cfg().MMRLambda
 	selected := make([]*SearchResult, 0, topK)
 	remaining := make([]*SearchResult, len(candidates))
 	copy(remaining, candidates)
@@ -647,6 +1369,10 @@ func sourceTypeFromSource(source string) string {
 		return "manual"
 	case strings.HasPrefix(source, "upload:"):
 		return "upload"
+	case strings.HasPrefix(source, imageSourcePrefix):
+		// 多模态图像摄取（AddImageDocument）把 source 标成 "image:..."，
+		// 与 upload:/cron: 同套约定，让 source 字符串本身即编码类型。
+		return "image"
 	case strings.HasPrefix(source, "http://"), strings.HasPrefix(source, "https://"):
 		return "url"
 	case source == "agent", strings.HasPrefix(source, "cron:"):

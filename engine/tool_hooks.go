@@ -81,14 +81,16 @@ func (h *TruncateHook) AfterToolCall(_ context.Context, _ *ToolCallInfo, result 
 	if maxChars <= 0 {
 		maxChars = 8000
 	}
-	if len(result.Content) <= maxChars {
+	// 按 rune 切分，避免在多字节中文/emoji 中间切裂产生 U+FFFD（�）。
+	runes := []rune(result.Content)
+	if len(runes) <= maxChars {
 		return
 	}
 	headLen := maxChars * 60 / 100
 	tailLen := maxChars * 20 / 100
-	head := result.Content[:headLen]
-	tail := result.Content[len(result.Content)-tailLen:]
-	truncated := len(result.Content) - headLen - tailLen
+	head := string(runes[:headLen])
+	tail := string(runes[len(runes)-tailLen:])
+	truncated := len(runes) - headLen - tailLen
 	result.Content = fmt.Sprintf("%s\n\n...[truncated %d characters]...\n\n%s", head, truncated, tail)
 }
 

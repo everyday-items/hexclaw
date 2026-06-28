@@ -149,6 +149,13 @@ func (a *EmailAdapter) ValidateConfig(ctx context.Context) error {
 	return nil
 }
 
+// smtpConnectError 把连接层失败（无法建连 / TLS 握手失败 / 读 greeting 得 EOF/重置）包装成
+// 清晰、可操作的"连接失败"消息——与"认证失败"明确区分，避免用户误以为是密码问题。
+// 典型触发：境外邮箱（如 Gmail）在当前网络被重置，或所经系统代理未生效。
+func smtpConnectError(cfg SMTPConfig, err error) error {
+	return fmt.Errorf("SMTP 连接失败：无法与 %s:%d 建立可用连接（%w）。请确认服务器地址与端口正确并检查网络连通性；若访问 Gmail 等境外邮箱受网络限制，请在系统中配置代理后重试", cfg.Host, cfg.Port, err)
+}
+
 // ProbeSMTP 对 SMTP 凭据做一次"连接级"探测：建立连接、EHLO、按服务器能力 STARTTLS、
 // 然后 AUTH，最后 QUIT。它**不发送任何邮件**，仅用于"测试连接"场景验证 host/port/账号/口令
 // 是否可用。凭据只在本次调用内瞬态使用，绝不持久化，调用方也不应记录其内容。
@@ -161,21 +168,19 @@ func ProbeSMTP(ctx context.Context, cfg SMTPConfig) error {
 	if cfg.Port == 0 {
 		cfg.Port = 587
 	}
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	// 经环境代理（或直连）建立连接：465 隐式 TLS，其余端口先明文（随后按服务器能力 STARTTLS）。
+	// 走 dialTCPContext/dialTLSContext 而非裸 tls.Dial，使邮件与应用其余 HTTP 流量共用代理出口。
 	var (
 		conn net.Conn
 		err  error
 	)
 	if cfg.Port == 465 {
-		// 隐式 TLS（SMTPS）。
-		conn, err = tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{ServerName: cfg.Host})
+		conn, err = dialTLSContext(ctx, cfg.Host, cfg.Port)
 	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", addr)
+		conn, err = dialTCPContext(ctx, cfg.Host, cfg.Port)
 	}
 	if err != nil {
-		return fmt.Errorf("smtp 连接失败: %w", err)
+		return smtpConnectError(cfg, err)
 	}
 	// 用 ctx 的 deadline（若有）约束后续 I/O，避免恶意/缓慢服务器拖死探测。
 	if deadline, ok := ctx.Deadline(); ok {
@@ -185,7 +190,8 @@ func ProbeSMTP(ctx context.Context, cfg SMTPConfig) error {
 	client, err := smtp.NewClient(conn, cfg.Host)
 	if err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("创建 SMTP 客户端失败: %w", err)
+		// EOF/重置发生在读取 greeting 阶段（认证尚未发生）→ 属连接层失败，不能报"认证失败"。
+		return smtpConnectError(cfg, err)
 	}
 	defer func() {
 		// QUIT 关闭会话；失败不影响探测结论，但仍尽力关闭底层连接。
@@ -198,14 +204,14 @@ func ProbeSMTP(ctx context.Context, cfg SMTPConfig) error {
 	if cfg.Port != 465 {
 		if ok, _ := client.Extension("STARTTLS"); ok {
 			if err := client.StartTLS(&tls.Config{ServerName: cfg.Host}); err != nil {
-				return fmt.Errorf("smtp STARTTLS 失败: %w", err)
+				return fmt.Errorf("SMTP STARTTLS 失败：%w", err)
 			}
 		}
 	}
 
 	auth := smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)
 	if err := client.Auth(auth); err != nil {
-		return fmt.Errorf("smtp 认证失败: %w", err)
+		return fmt.Errorf("SMTP 认证失败：%w。请确认用户名与密码（或应用专用密码）是否正确", err)
 	}
 	return nil
 }
@@ -325,17 +331,15 @@ type imapSession interface {
 }
 
 func dialIMAP(ctx context.Context, cfg IMAPConfig) (*imapClient, error) {
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-
+	// 经环境代理（或直连）建立连接，使 IMAP 与应用其余 HTTP 流量共用代理出口。
 	var (
 		conn net.Conn
 		err  error
 	)
 	if cfg.TLS {
-		conn, err = tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{ServerName: cfg.Host})
+		conn, err = dialTLSContext(ctx, cfg.Host, cfg.Port)
 	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", addr)
+		conn, err = dialTCPContext(ctx, cfg.Host, cfg.Port)
 	}
 	if err != nil {
 		return nil, err
@@ -575,7 +579,6 @@ func encodeSubject(subject string) string {
 
 func (a *EmailAdapter) sendEmail(to, subject, body string) error {
 	cfg := a.cfg.SMTP
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 
 	// W3-7: 出站 subject 先做 RFC2047 编码, 非 ASCII 转为 encoded-word, 避免收件端乱码。
 	// 编码输出为纯 ASCII, 再经 sanitizeHeader 兜底过滤裸 CR/LF, 防止头部注入。
@@ -590,15 +593,22 @@ func (a *EmailAdapter) sendEmail(to, subject, body string) error {
 
 	auth := smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)
 
-	// TLS 连接
-	tlsConfig := &tls.Config{ServerName: cfg.Host}
-	conn, err := tls.DialWithDialer(
-		&net.Dialer{Timeout: 10 * time.Second},
-		"tcp", addr, tlsConfig,
+	// 经环境代理（或直连）建立连接：465 隐式 TLS，其余端口明文后按服务器能力 STARTTLS。
+	// 与 ProbeSMTP 同源（dialTCPContext/dialTLSContext），让发件也共用应用的代理出口。
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		conn net.Conn
+		err  error
 	)
+	if cfg.Port == 465 {
+		conn, err = dialTLSContext(ctx, cfg.Host, cfg.Port)
+	} else {
+		conn, err = dialTCPContext(ctx, cfg.Host, cfg.Port)
+	}
 	if err != nil {
-		// 回退到 STARTTLS
-		return smtp.SendMail(addr, auth, cfg.From, []string{to}, []byte(msg))
+		return fmt.Errorf("连接 SMTP 服务器失败: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -607,6 +617,14 @@ func (a *EmailAdapter) sendEmail(to, subject, body string) error {
 		return fmt.Errorf("创建 SMTP 客户端失败: %w", err)
 	}
 	defer func() { _ = client.Close() }()
+
+	if cfg.Port != 465 {
+		if ok, _ := client.Extension("STARTTLS"); ok {
+			if err := client.StartTLS(&tls.Config{ServerName: cfg.Host}); err != nil {
+				return fmt.Errorf("SMTP STARTTLS 失败: %w", err)
+			}
+		}
+	}
 
 	if err := client.Auth(auth); err != nil {
 		return fmt.Errorf("smtp 认证失败: %w", err)

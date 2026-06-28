@@ -82,11 +82,38 @@ type Usage struct {
 //
 // 记录 Agent 在处理过程中调用的工具，
 // 让前端可以结构化展示工具调用链。
+//
+// Status/DurationMs 由 hexagon 框架在工具执行点产出（见 runtime.ToolResult），
+// 经此透传给客户端——客户端据此渲染成功/失败/耗时，无需对结果正文做字符串嗅探。
+// omitempty：老路径/未填充时不出现在 wire，前端可选字段优雅降级。
 type ToolCall struct {
-	ID        string `json:"id"`               // 调用 ID
-	Name      string `json:"name"`             // 工具/技能名称
-	Arguments string `json:"arguments"`        // 调用参数（JSON 字符串）
-	Result    string `json:"result,omitempty"` // 调用结果
+	ID         string `json:"id"`                    // 调用 ID
+	Name       string `json:"name"`                  // 工具/技能名称
+	Arguments  string `json:"arguments"`             // 调用参数（JSON 字符串）
+	Result     string `json:"result,omitempty"`      // 调用结果
+	Status     string `json:"status,omitempty"`      // 执行状态：success / error（框架产出）
+	DurationMs int64  `json:"duration_ms,omitempty"` // 执行耗时（毫秒，框架测量）
+}
+
+// Block 有序内容块（wire 形态，对齐前端 ContentBlock 的 camelCase 字段）。
+//
+// 承载一个 assistant 回合的**顺序**：text 片段与 tool_use 按真实执行序交错排列，
+// 修复 Content 单串 + ToolCalls 扁平数组无法表达多步 text↔tool 交错的缺陷。
+// 富数据（status/duration/result）仍走扁平 ToolCalls；前端按 Block 顺序渲染、
+// 在每个 tool_use 处用 id 到 ToolCalls 里取完整数据。
+type Block struct {
+	Type string `json:"type"` // text | tool_use | tool_result
+	// text
+	Text string `json:"text,omitempty"`
+	// tool_use
+	ID    string `json:"id,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Input string `json:"input,omitempty"`
+	// tool_result（camelCase 对齐前端 ContentBlock）
+	ToolUseID string `json:"toolUseId,omitempty"`
+	ToolName  string `json:"toolName,omitempty"`
+	Output    string `json:"output,omitempty"`
+	IsError   bool   `json:"isError,omitempty"`
 }
 
 // Reply 同步回复
@@ -98,6 +125,7 @@ type Reply struct {
 	Metadata  map[string]string // 附加元数据（如工具调用结果、引用来源等）
 	Usage     *Usage            // Token 使用统计（可选）
 	ToolCalls []ToolCall        // 工具调用记录（可选）
+	Blocks    []Block           // 有序内容块（可选；客户端有此则按序渲染，否则回退 Content+ToolCalls）
 	// Interactive 结构化交互载荷（v0.4.0 G3）。
 	// 替代旧的 metadata["interactive_buttons"] JSON 字符串嵌入做法。
 	// 桌面端 / IM 适配器按 Type 渲染按钮 / 选项 / 审批 / 卡片。
@@ -116,6 +144,7 @@ type ReplyChunk struct {
 	Metadata  map[string]string `json:"metadata,omitempty"`   // 附加元数据（仅在 Done=true 时填充）
 	Usage     *Usage            `json:"usage,omitempty"`      // Token 使用统计（仅在 Done=true 时填充）
 	ToolCalls []ToolCall        `json:"tool_calls,omitempty"` // 工具调用记录（仅在 Done=true 时填充）
+	Blocks    []Block           `json:"blocks,omitempty"`     // 有序内容块（仅在 Done=true 时填充）
 	// Interactive 结构化交互载荷（仅在 Done=true 时填充；与 Reply.Interactive 同语义）。
 	Interactive *InteractivePayload `json:"interactive,omitempty"`
 }

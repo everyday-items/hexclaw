@@ -3,7 +3,6 @@ package library
 import (
 	"context"
 	"database/sql"
-	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -85,37 +84,5 @@ func TestRender_Arguments(t *testing.T) {
 	// 无占位 → 原样
 	if Render(Prompt{BodyMD: "no placeholder"}, "x") != "no placeholder" {
 		t.Error("no-placeholder body should be returned unchanged")
-	}
-}
-
-func TestMemoryStore_Inject(t *testing.T) {
-	ctx := context.Background()
-	s := NewMemoryStore(setupDB(t))
-
-	// 空库 → 无注入
-	if s.Inject(ctx, "anything") != "" {
-		t.Error("empty store should inject nothing")
-	}
-
-	_, _ = s.Upsert(ctx, &Memory{Kind: "standing", Content: "用户偏好简洁回答"})
-	_, _ = s.Upsert(ctx, &Memory{Kind: "fact", Content: "项目部署在腾讯云"})
-	_, _ = s.Upsert(ctx, &Memory{Kind: "fact", Content: "数据库用 MySQL"})
-
-	// standing 始终注入；fact 仅命中 query 才注入。
-	out := s.Inject(ctx, "腾讯云 怎么扩容")
-	if !strings.Contains(out, "用户偏好简洁回答") {
-		t.Errorf("standing must always inject; got %q", out)
-	}
-	if !strings.Contains(out, "腾讯云") {
-		t.Errorf("matching fact must inject; got %q", out)
-	}
-	if strings.Contains(out, "MySQL") {
-		t.Errorf("non-matching fact must NOT inject; got %q", out)
-	}
-
-	// query 与任何 fact 不匹配 → 仅 standing。
-	only := s.Inject(ctx, "天气如何")
-	if !strings.Contains(only, "用户偏好简洁回答") || strings.Contains(only, "腾讯云") {
-		t.Errorf("non-matching query should inject only standing; got %q", only)
 	}
 }

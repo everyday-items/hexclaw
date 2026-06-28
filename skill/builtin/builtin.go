@@ -30,6 +30,9 @@ type SkillDeps struct {
 	CfgWriter     *config.Writer
 	Workspace     string         // workspace dir for file ops (default ~/.hexclaw/workspace)
 	CodeExecSkill *CodeExecSkill // populated by RegisterAdvanced if code_exec enabled
+	// SandboxReadablePaths 额外授予 code_exec 沙箱只读访问的宿主路径（Workspace 之外）。
+	// 来源 = config.Skill.Sandbox.Filesystem.AllowedPaths（用户经数据连接器授权的本地目录）。
+	SandboxReadablePaths []string
 }
 
 // RegisterAll 注册所有内置 Skill
@@ -111,6 +114,8 @@ func RegisterAdvanced(registry *skill.DefaultRegistry, cfg config.BuiltinConfig,
 			Workspace: ws,
 			Timeout:   30,
 			Network:   cfg.CodeExecPolicy.CodeExecNetworkAllowed(),
+			// 用户经数据连接器授权的本地目录 → 沙箱只读放行，否则 code_exec 读不到（BUG-20260626）。
+			ReadablePaths: deps.SandboxReadablePaths,
 		}
 		sb, err := sandbox.New(sbCfg)
 		if err != nil {

@@ -5,13 +5,19 @@ import (
 	"time"
 )
 
+// mgrWithConfig 构造一个仅用于评分/选取单元测试的 Manager（repo/searcher 用空桩，embedder nil）。
+// config 字段已改为 atomic.Pointer，不能再用结构体字面量直接设，走 WithHybridConfig 选项。
+func mgrWithConfig(c HybridConfig) *Manager {
+	return NewManager(stubRepo{}, stubSearcher{}, nil, WithHybridConfig(c))
+}
+
 // TestBugTimeDecay_ZeroCreatedAtNotPenalized 回归锁定 [BUG-KB-TIMEDECAY]：
 // 开启时间衰减（TimeDecayDays>0）时，CreatedAt 为零值（未设置时间戳）的 chunk
 // 不应被当成"无限旧"而把分数衰减到 0、导致永不召回。
 //
 // 修复前：time.Since(零值) ≈ 2000+ 年 → exp(-λ·age) ≈ 0 → 分数塌成 0。
 func TestBugTimeDecay_ZeroCreatedAtNotPenalized(t *testing.T) {
-	m := &Manager{config: HybridConfig{TimeDecayDays: 30}} // embedder nil → 纯 textScore
+	m := mgrWithConfig(HybridConfig{TimeDecayDays: 30}) // embedder nil → 纯 textScore
 
 	zeroTime := &SearchResult{Chunk: &Chunk{}, TextScore: 1.0} // CreatedAt 零值
 	score := m.hybridScore(zeroTime)
@@ -24,7 +30,7 @@ func TestBugTimeDecay_ZeroCreatedAtNotPenalized(t *testing.T) {
 
 // TestTimeDecay_RecentVsOld 验证有正常时间戳时，越新分数越高（衰减方向正确）。
 func TestTimeDecay_RecentVsOld(t *testing.T) {
-	m := &Manager{config: HybridConfig{TimeDecayDays: 30}}
+	m := mgrWithConfig(HybridConfig{TimeDecayDays: 30})
 
 	recent := &SearchResult{Chunk: &Chunk{CreatedAt: time.Now()}, TextScore: 1.0}
 	old := &SearchResult{Chunk: &Chunk{CreatedAt: time.Now().Add(-60 * 24 * time.Hour)}, TextScore: 1.0}
@@ -43,7 +49,7 @@ func TestTimeDecay_RecentVsOld(t *testing.T) {
 // TestMMRSelect_NoDuplicateNoDrop 覆盖此前零测试的 MMR 贪心选择：
 // topK < 候选数时返回恰好 topK 个、互不重复、不丢不越界。
 func TestMMRSelect_NoDuplicateNoDrop(t *testing.T) {
-	m := &Manager{config: HybridConfig{MMRLambda: 0.7}}
+	m := mgrWithConfig(HybridConfig{MMRLambda: 0.7})
 
 	// 4 个带 embedding 的候选，topK=2
 	cands := []*SearchResult{
@@ -75,7 +81,7 @@ func TestMMRSelect_NoDuplicateNoDrop(t *testing.T) {
 
 // TestMMRSelect_FewerThanTopK 边界：候选数 ≤ topK 时全返回（按分排序）。
 func TestMMRSelect_FewerThanTopK(t *testing.T) {
-	m := &Manager{config: HybridConfig{MMRLambda: 0.7}}
+	m := mgrWithConfig(HybridConfig{MMRLambda: 0.7})
 	cands := []*SearchResult{
 		{Chunk: &Chunk{ID: "a", Embedding: []float32{1, 0}, Score: 0.5}},
 		{Chunk: &Chunk{ID: "b", Embedding: []float32{0, 1}, Score: 0.9}},
