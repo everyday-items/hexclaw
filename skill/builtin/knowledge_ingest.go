@@ -3,6 +3,7 @@ package builtin
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -17,8 +18,22 @@ type KnowledgeIngestor interface {
 	AddDocument(ctx context.Context, title, content, source string) (*knowledge.Document, error)
 }
 
+// SnapshotIngestor adds the scheduled-task write path: append a new snapshot
+// (never overwrite), skip if unchanged, and keep a bounded per-series history.
+// *knowledge.Manager satisfies it.
+type SnapshotIngestor interface {
+	KnowledgeIngestor
+	IngestSnapshot(ctx context.Context, baseTitle, content, source string) (*knowledge.Document, bool, error)
+}
+
 // ingestTitleMaxRunes caps the title derived from content when none is given.
 const ingestTitleMaxRunes = 24
+
+// cronDispatchSource is the system-dispatch source the engine stamps for cron
+// scheduler runs (engine.NewCronDispatchMessage / cronDispatchSource). A KB
+// write under this source is snapshot-named so repeated scheduled runs never
+// overwrite each other.
+const cronDispatchSource = "cron"
 
 // KnowledgeIngestSkill lets the Agent persist text into the local knowledge base.
 //
@@ -26,10 +41,10 @@ const ingestTitleMaxRunes = 24
 // the Agent can only claim "saved to knowledge base" in its reply while nothing
 // is actually persisted (LLM hallucinated success).
 type KnowledgeIngestSkill struct {
-	kb KnowledgeIngestor
+	kb SnapshotIngestor
 }
 
-func NewKnowledgeIngestSkill(kb KnowledgeIngestor) *KnowledgeIngestSkill {
+func NewKnowledgeIngestSkill(kb SnapshotIngestor) *KnowledgeIngestSkill {
 	return &KnowledgeIngestSkill{kb: kb}
 }
 
@@ -78,18 +93,51 @@ func (s *KnowledgeIngestSkill) Execute(ctx context.Context, args map[string]any)
 	if content == "" {
 		return nil, fmt.Errorf("content must not be empty")
 	}
-	title := firstStringArg(args, "title")
-	if title == "" {
-		title = deriveIngestTitle(content)
-	} else {
-		// Collapse whitespace/newlines: titles are single-line labels.
-		title = strings.Join(strings.Fields(title), " ")
-	}
 	source := firstStringArg(args, "source")
 	if source == "" {
 		source = "agent"
 	}
+	// Collapse whitespace/newlines: titles are single-line labels.
+	rawTitle := strings.Join(strings.Fields(firstStringArg(args, "title")), " ")
 
+	// Scheduled (cron) write → snapshot ingest: append a new document (never
+	// overwrite), skip if the content is unchanged since the last run, and keep
+	// a bounded per-series history. The series is keyed by (source, base title),
+	// so we use the job's stable base title (stamped by the cron dispatcher)
+	// rather than the title the model improvises each run — otherwise the series
+	// fragments. Fall back to the model's title, then a content-derived one.
+	if skill.SystemDispatchSource(ctx) == cronDispatchSource {
+		base := skill.SnapshotBaseTitle(ctx)
+		if base == "" {
+			base = rawTitle
+		}
+		if base == "" {
+			base = deriveIngestTitle(content)
+		}
+		doc, written, err := s.kb.IngestSnapshot(ctx, base, content, source)
+		if err != nil {
+			return nil, fmt.Errorf("failed to write to knowledge base: %w", err)
+		}
+		verb := "Saved a new snapshot to"
+		if !written {
+			verb = "Content unchanged since the last run — reused the existing snapshot in"
+		}
+		return &skill.Result{
+			Content: fmt.Sprintf("%s knowledge base: \"%s\" (document ID: %s, source: %s)", verb, doc.Title, doc.ID, source),
+			Metadata: map[string]string{
+				"doc_id":  doc.ID,
+				"source":  source,
+				"written": strconv.FormatBool(written),
+			},
+		}, nil
+	}
+
+	// Interactive / non-cron save: upsert by (source, title) so a user re-saving
+	// the same note updates it in place instead of duplicating.
+	title := rawTitle
+	if title == "" {
+		title = deriveIngestTitle(content)
+	}
 	doc, err := s.kb.AddDocument(ctx, title, content, source)
 	if err != nil {
 		return nil, fmt.Errorf("failed to write to knowledge base: %w", err)

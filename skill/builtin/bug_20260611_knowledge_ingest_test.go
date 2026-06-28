@@ -24,10 +24,12 @@ import (
 	"github.com/hexagon-codes/hexclaw/knowledge"
 )
 
-// fakeIngestor is a narrow-interface stub recording AddDocument calls.
+// fakeIngestor is a narrow-interface stub recording AddDocument and
+// IngestSnapshot calls (the two write paths the skill routes between).
 type fakeIngestor struct {
-	calls []struct{ title, content, source string }
-	err   error
+	calls     []struct{ title, content, source string } // AddDocument (interactive upsert path)
+	snapshots []struct{ title, content, source string } // IngestSnapshot (cron append path)
+	err       error
 }
 
 func (f *fakeIngestor) AddDocument(_ context.Context, title, content, source string) (*knowledge.Document, error) {
@@ -36,6 +38,14 @@ func (f *fakeIngestor) AddDocument(_ context.Context, title, content, source str
 		return nil, f.err
 	}
 	return &knowledge.Document{ID: "doc-test-1", Title: title}, nil
+}
+
+func (f *fakeIngestor) IngestSnapshot(_ context.Context, baseTitle, content, source string) (*knowledge.Document, bool, error) {
+	f.snapshots = append(f.snapshots, struct{ title, content, source string }{baseTitle, content, source})
+	if f.err != nil {
+		return nil, false, f.err
+	}
+	return &knowledge.Document{ID: "doc-snap-1", Title: baseTitle + " 2026-06-27 09:32:00"}, true, nil
 }
 
 func TestBug20260611_KnowledgeIngestSkill_Registration(t *testing.T) {
