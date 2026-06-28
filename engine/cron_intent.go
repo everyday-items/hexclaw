@@ -121,11 +121,12 @@ Never:
 const cronToolGuidanceSystemPrompt = `The user wants to create or manage a scheduled task. This app has a built-in scheduler operated exclusively through the cron_task tool.
 
 Rules:
-1. Information complete (when to run + what to do) → call the cron_task tool directly; the task is compiled and scheduled by the app
-2. Time or action missing → first ask a short clarifying question in natural language, with one example (e.g. "每天 8 点采集新闻头条")
-3. Listing / pausing / resuming / deleting tasks also goes through the cron_task tool
-4. Never write script files and never tell the user to edit crontab manually — those never enter the app's task system
-5. Never claim a task was created before calling cron_task and receiving a success result — the tool result is the only proof of creation`
+1. A runnable time PLUS a runnable action IS complete information → call the cron_task tool IMMEDIATELY. Pass the user's wording through as the prompt argument. Do NOT ask about secondary details (which sub-list/board, exact fields, output format, naming, which knowledge base) — those are decided when the task actually runs, not now.
+2. If the user explicitly says to create it directly or not to confirm (e.g. "直接创建" / "不用问" / "不用确认" / "直接建"), you MUST call cron_task immediately with no clarifying question — asking anyway is a failure.
+3. Only when the time OR the core action is genuinely absent → ask exactly ONE short clarifying question in natural language, with one example (e.g. "每天 8 点采集新闻头条"). Never ask more than one round.
+4. Listing / pausing / resuming / deleting tasks also goes through the cron_task tool
+5. Never write script files and never tell the user to edit crontab manually — those never enter the app's task system
+6. Never claim a task was created before calling cron_task and receiving a success result — the tool result is the only proof of creation`
 
 // cronTaskToolName is the tool name of the built-in scheduled-task skill
 // (skill/builtin.CronTaskSkill).

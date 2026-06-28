@@ -181,6 +181,31 @@ func TestApplyCronIntentGuidance_CronTaskMode_GuidanceMentionsTool(t *testing.T)
 	}
 }
 
+// 2026-06-27：真机 DeepSeek 在信息齐备且用户已说"不用确认"时仍反复反问澄清（bug #2）。
+// 引导词必须显式要求：①时间+动作齐备即立即建、不纠缠次要细节 ②用户说"不用确认/直接建"时
+// 必须立即调用、不得再反问。这里锁定引导词契约（模型遵从是概率事件，但契约必须在位）。
+func TestCronToolGuidance_HonorsImmediateCreate(t *testing.T) {
+	sys := cronToolGuidanceSystemPrompt
+	// 显式尊重"不用确认/直接创建"。
+	for _, kw := range []string{"不用确认", "直接创建", "不用问"} {
+		if !strings.Contains(sys, kw) {
+			t.Errorf("引导词应显式覆盖用户的无需确认措辞 %q：\n%s", kw, sys)
+		}
+	}
+	// 要求"立即调用"且明确"齐备即建"。
+	if !strings.Contains(sys, "IMMEDIATELY") {
+		t.Errorf("引导词应要求信息齐备时立即调用 cron_task：\n%s", sys)
+	}
+	// 明确不要纠缠次要细节（防过度澄清）。
+	if !strings.Contains(strings.ToLower(sys), "secondary details") {
+		t.Errorf("引导词应明确不为次要细节反问：\n%s", sys)
+	}
+	// 仍保留单轮澄清的退路（核心信息缺失时）。
+	if !strings.Contains(sys, "ONE short clarifying question") {
+		t.Errorf("引导词应仍保留单轮澄清退路：\n%s", sys)
+	}
+}
+
 // ─── session stickiness + creation-claim check (the two deterministic
 // layers of the three-layer anti-hallucination defense) ─────────────
 

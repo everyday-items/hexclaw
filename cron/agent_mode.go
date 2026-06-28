@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hexagon-codes/hexclaw/skill"
 )
 
 // RuntimeAgent marks a job as agent-executed (one full Agent round per tick
@@ -194,6 +196,15 @@ func (s *Scheduler) runAgentJob(ctx context.Context, job *Job) *RunResult {
 
 	if runner == nil {
 		return &RunResult{Status: "error", Error: "agent 执行器未注入 — 引擎未就绪"}
+	}
+
+	// Stable snapshot base title for any knowledge_ingest this run performs: a
+	// scheduled job's name keys its KB snapshot series, so repeated runs (timer,
+	// webhook trigger, or escalation — all funnel here) append under one coherent
+	// title instead of fragmenting under the title the model improvises each run.
+	// Stamped here (not in the cmd wiring) so the contract is package-testable.
+	if name := strings.TrimSpace(job.Name); name != "" {
+		ctx = skill.WithSnapshotBaseTitle(ctx, name)
 	}
 
 	start := time.Now()

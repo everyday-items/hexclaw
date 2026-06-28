@@ -3,7 +3,9 @@
 # Deterministic, zero-LLM, no python required. Fetches the repo JSON from the
 # GitHub API, reads stargazers_count, and writes a one-line digest into the local
 # knowledge base via the in-process kb_ingest builtin (loopback http_post is
-# SSRF-blocked). Builtins (http_get/json_decode/now/kb_ingest/emit) are injected
+# SSRF-blocked). kb_ingest appends a timestamp suffix to the title, so each
+# scheduled run creates a new snapshot document instead of overwriting the
+# previous run. Builtins (http_get/json_decode/now/kb_ingest/emit) are injected
 # by StarlarkEngine. GitHub's API requires a User-Agent header.
 
 UA = "hexclaw-cron/1.0 (+https://github.com/hexagon-codes/hexclaw)"
@@ -20,7 +22,9 @@ def collect():
         return {"status": "error", "error": "stargazers_count missing (API response changed)"}
 
     today = now()["date"]
-    doc_title = "golang-go-stars " + today
+    # Stable base title; kb_ingest appends the run timestamp so snapshots never
+    # collide (the date stays in the content, not the title).
+    doc_title = "golang-go-stars"
     content = "golang/go 截至 %s 的 GitHub star 数为 %d。" % (today, stars)
 
     kb_ingest(title = doc_title, content = content, source = "cron-gh-stars")
