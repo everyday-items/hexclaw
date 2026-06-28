@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -146,6 +147,33 @@ func (s *Server) handleRestoreMemoryItem(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "记忆已恢复"})
 }
 
+// ─── Memory: POST /api/v1/memory/{id}/pin · /unpin（U1：常驻置顶，逃生口）──
+
+func (s *Server) handlePinMemoryItem(w http.ResponseWriter, r *http.Request) {
+	s.setMemoryPinned(w, r, true)
+}
+
+func (s *Server) handleUnpinMemoryItem(w http.ResponseWriter, r *http.Request) {
+	s.setMemoryPinned(w, r, false)
+}
+
+func (s *Server) setMemoryPinned(w http.ResponseWriter, r *http.Request, pinned bool) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "无效的记忆 ID"})
+		return
+	}
+	if err := s.fileMem.SetPinned(id, pinned); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	msg := "记忆已置顶"
+	if !pinned {
+		msg = "已取消置顶"
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": msg})
+}
+
 // ─── MCP: POST /api/v1/mcp/tools/call ──
 
 type MCPToolCallRequest struct {
@@ -239,6 +267,9 @@ func (s *Server) handleUpdateFullConfig(w http.ResponseWriter, r *http.Request) 
 		} `json:"security"`
 		Sandbox *struct {
 			NetworkEnabled *bool `json:"network_enabled"`
+			// AllowedPaths：用户经数据连接器授权的本地目录，写进沙箱只读白名单（BUG-20260626）。
+			// 指针区分「未提供（保持原值）」与「提供空数组（清空）」。
+			AllowedPaths *[]string `json:"allowed_paths"`
 		} `json:"sandbox"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -269,10 +300,16 @@ func (s *Server) handleUpdateFullConfig(w http.ResponseWriter, r *http.Request) 
 
 	sandboxChanged := false
 	var newNetworkEnabled bool
-	if sb := body.Sandbox; sb != nil && sb.NetworkEnabled != nil {
-		nextCfg.Skill.Builtin.CodeExecPolicy.Network = sb.NetworkEnabled
-		sandboxChanged = true
-		newNetworkEnabled = *sb.NetworkEnabled
+	if sb := body.Sandbox; sb != nil {
+		if sb.NetworkEnabled != nil {
+			nextCfg.Skill.Builtin.CodeExecPolicy.Network = sb.NetworkEnabled
+			sandboxChanged = true
+			newNetworkEnabled = *sb.NetworkEnabled
+		}
+		if sb.AllowedPaths != nil {
+			// 授权目录白名单：下次沙箱构建（sidecar 启动）即放行只读。指针非 nil 时整体替换，空数组 = 清空。
+			nextCfg.Skill.Sandbox.Filesystem.AllowedPaths = *sb.AllowedPaths
+		}
 	}
 
 	// 先持久化，失败则什么都不变（runtime + 磁盘一致）
@@ -436,12 +473,13 @@ type WorkflowRun struct {
 // workflows 持久化到 ~/.hexclaw/workflows.json，重启后自动恢复。
 // runs 仅内存存储，有 LRU 淘汰（maxRuns=1000）。
 type WorkflowStore struct {
-	mu        sync.RWMutex
-	workflows map[string]*WorkflowData
-	runs      map[string]*WorkflowRun
-	runOrder  []string // 按插入顺序记录 run ID，用于 LRU 淘汰
-	maxRuns   int
-	filePath  string // JSON 持久化文件路径
+	mu           sync.RWMutex
+	workflows    map[string]*WorkflowData
+	runs         map[string]*WorkflowRun
+	runOrder     []string // 按插入顺序记录 run ID，用于 LRU 淘汰
+	maxRuns      int
+	filePath     string // workflows JSON 持久化文件路径
+	runsFilePath string // runs JSON 持久化文件路径（Ph5：续接/重放/恢复——重启后 run 历史不丢）
 }
 
 // workflowPersistFile 返回工作流持久化文件路径 (~/.hexclaw/workflows.json)
@@ -453,16 +491,76 @@ func workflowPersistFile() string {
 	return filepath.Join(home, ".hexclaw", "workflows.json")
 }
 
+// workflowRunsPersistFile 返回工作流运行历史持久化文件路径 (~/.hexclaw/workflow_runs.json)。
+// 与 workflows.json 分离：运行历史体量大、淘汰频繁，独立文件避免每次淘汰重写整个工作流定义。
+func workflowRunsPersistFile() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".hexclaw", "workflow_runs.json")
+}
+
 // NewWorkflowStore 创建工作流存储，从文件加载已有数据
 func NewWorkflowStore() *WorkflowStore {
 	ws := &WorkflowStore{
-		workflows: make(map[string]*WorkflowData),
-		runs:      make(map[string]*WorkflowRun),
-		maxRuns:   1000,
-		filePath:  workflowPersistFile(),
+		workflows:    make(map[string]*WorkflowData),
+		runs:         make(map[string]*WorkflowRun),
+		maxRuns:      1000,
+		filePath:     workflowPersistFile(),
+		runsFilePath: workflowRunsPersistFile(),
 	}
 	ws.loadFromFile()
+	ws.loadRunsFromFile()
 	return ws
+}
+
+// loadRunsFromFile 从 JSON 文件加载运行历史（Ph5 recovery：重启后 run 历史与可续接状态不丢）。
+func (ws *WorkflowStore) loadRunsFromFile() {
+	if ws.runsFilePath == "" {
+		return
+	}
+	data, err := os.ReadFile(ws.runsFilePath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			logger.Error("加载运行历史失败", "error", err)
+		}
+		return
+	}
+	var runs map[string]*WorkflowRun
+	if err := json.Unmarshal(data, &runs); err != nil {
+		logger.Error("解析运行历史失败", "error", err)
+		return
+	}
+	ws.runs = runs
+	// 重建 LRU 顺序：以 StartedAt 升序（无序 map 持久化丢顺序，按时间还原）。
+	ws.runOrder = make([]string, 0, len(runs))
+	for id := range runs {
+		ws.runOrder = append(ws.runOrder, id)
+	}
+	sort.Slice(ws.runOrder, func(i, j int) bool {
+		return runs[ws.runOrder[i]].StartedAt.Before(runs[ws.runOrder[j]].StartedAt)
+	})
+	logger.Info("从文件加载运行历史", "len", len(runs))
+}
+
+// persistRuns 将运行历史持久化到 JSON 文件。调用方必须持有 mu.Lock 或 mu.RLock。
+func (ws *WorkflowStore) persistRuns() {
+	if ws.runsFilePath == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(ws.runsFilePath), 0o750); err != nil {
+		logger.Error("创建运行历史目录失败", "error", err)
+		return
+	}
+	data, err := json.MarshalIndent(ws.runs, "", "  ")
+	if err != nil {
+		logger.Error("序列化运行历史失败", "error", err)
+		return
+	}
+	if err := os.WriteFile(ws.runsFilePath, data, 0o640); err != nil {
+		logger.Error("写运行历史失败", "error", err)
+	}
 }
 
 // loadFromFile 从 JSON 文件加载工作流数据
@@ -517,6 +615,7 @@ func (ws *WorkflowStore) addRun(run *WorkflowRun) {
 		ws.runOrder = ws.runOrder[1:]
 		delete(ws.runs, oldest)
 	}
+	ws.persistRuns() // Ph5：run 入库即落盘，重启后历史/可续接状态不丢
 }
 
 func (s *Server) handleListWorkflows(w http.ResponseWriter, r *http.Request) {
@@ -622,7 +721,70 @@ func (s *Server) executeWorkflow(ctx context.Context, wf *WorkflowData, run *Wor
 	finished := exec.execute(ctx, run)
 	s.workflowStore.mu.Lock()
 	s.workflowStore.runs[run.ID] = finished
+	s.workflowStore.persistRuns() // Ph5：终态（含各节点输出）落盘，支撑失败后续接重放
 	s.workflowStore.mu.Unlock()
+}
+
+// handleResumeWorkflowRun 续接一次失败/中断的运行（Ph5，对齐 OpenClaw 续接语义）：复用上次
+// 已完成节点的输出，只重算失败/未达的节点。POST /api/v1/canvas/runs/{id}/resume
+func (s *Server) handleResumeWorkflowRun(w http.ResponseWriter, r *http.Request) {
+	priorID := r.PathValue("id")
+
+	s.workflowStore.mu.RLock()
+	prior, ok := s.workflowStore.runs[priorID]
+	var (
+		wf         *WorkflowData
+		resumed    = map[string]string{}
+		priorInput string
+	)
+	if ok {
+		wf = s.workflowStore.workflows[prior.WorkflowID]
+		priorInput = prior.Input
+		for _, nr := range prior.NodeResults {
+			if nr.Status == nodeStatusCompleted {
+				resumed[nr.NodeID] = nr.Output
+			}
+		}
+	}
+	s.workflowStore.mu.RUnlock()
+
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "执行记录不存在"})
+		return
+	}
+	if wf == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "源工作流不存在，无法续接"})
+		return
+	}
+	if len(resumed) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "上次运行没有已完成的节点，无可续接的进度，请直接重跑"})
+		return
+	}
+
+	run := &WorkflowRun{
+		ID:         "run-" + idgen.ShortID(),
+		WorkflowID: wf.ID,
+		Status:     "running",
+		Input:      priorInput,
+		StartedAt:  time.Now(),
+	}
+	s.workflowStore.mu.Lock()
+	s.workflowStore.addRun(run)
+	s.workflowStore.mu.Unlock()
+
+	req := RunWorkflowRequest{Input: priorInput}
+	wfCtx, wfCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	go func() {
+		defer wfCancel()
+		finished := newWorkflowExecutor(s, wf, req).withResumed(resumed).execute(wfCtx, run)
+		s.workflowStore.mu.Lock()
+		s.workflowStore.runs[run.ID] = finished
+		s.workflowStore.persistRuns()
+		s.workflowStore.mu.Unlock()
+	}()
+
+	snapshot := *run
+	writeJSON(w, http.StatusOK, &snapshot)
 }
 
 // WorkflowBrief 是给 Agent 自省的工作流摘要（不含节点内部细节）。

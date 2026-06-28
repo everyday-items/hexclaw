@@ -52,7 +52,8 @@ type CronJobDraft struct {
 	Deliver         []string `json:"deliver,omitempty"`
 	ChatID          string   `json:"chat_id,omitempty"` // IM/连接投递目标会话/群组 ID（Deliverer 必需，否则 IM 投递失败）
 	EnabledToolsets []string `json:"enabled_toolsets,omitempty"`
-	TimeoutSec      int      `json:"timeout_s,omitempty"` // 0 → mode default (agent 600s)
+	TimeoutSec      int      `json:"timeout_s,omitempty"`  // 0 → mode default (agent 600s)
+	Continuous      bool     `json:"continuous,omitempty"` // 持续型任务 + 跨 tick 检查点（强制 agent 模式）
 }
 
 // handleCronParse Layer 2 LLM JSON 解析端点。

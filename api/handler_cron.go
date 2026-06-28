@@ -29,6 +29,8 @@ type AddCronJobRequest struct {
 	// Deliver 显式投递目标（chat/push/feishu/discord/wechat 或已配置连接实例 id/name 的任意组合）。
 	// 留空 → 后端按 prompt 由 LLM 推导（默认 ["chat"]）；非空 → 直接覆盖，前端「连接库下拉」即走此字段（§5 一处存处处引）。
 	Deliver []string `json:"deliver,omitempty"`
+	// Continuous 开启「持续型任务 + 跨 tick 检查点」：长目标分多次廉价唤醒累积推进（强制 agent 模式）。
+	Continuous bool `json:"continuous,omitempty"`
 }
 
 // handleListCronJobs 列出定时任务
@@ -86,6 +88,7 @@ func (s *Server) handleAddCronJobJSON(w http.ResponseWriter, r *http.Request) {
 		Platform:     req.Platform,
 		ChatID:       req.ChatID,
 		Deliver:      req.Deliver,
+		Continuous:   req.Continuous,
 		LocalAPIBase: s.localAPIBase(),
 	})
 	if err != nil {
@@ -163,6 +166,7 @@ func (s *Server) handleAddCronJobSSE(w http.ResponseWriter, r *http.Request) {
 		Platform:     req.Platform,
 		ChatID:       req.ChatID,
 		Deliver:      req.Deliver,
+		Continuous:   req.Continuous,
 		LocalAPIBase: s.localAPIBase(),
 	}, onProgress)
 	if err != nil {
