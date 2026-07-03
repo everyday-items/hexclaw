@@ -19,7 +19,7 @@
 | Item | Minimum | Recommended |
 |------|---------|-------------|
 | OS | Linux / macOS / Windows | Linux (Ubuntu 22.04+) |
-| Go | >= 1.25 | Latest stable |
+| Go | >= 1.25.7 | Latest stable |
 | Memory | 128 MB | 512 MB+ |
 | Disk | 100 MB | 1 GB+ (including knowledge base data) |
 | Network | Access to LLM API | Low-latency connection |

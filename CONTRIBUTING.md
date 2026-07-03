@@ -8,10 +8,18 @@ hexclaw 是 Hexagon 生态的 **L3 应用**（IM 适配器 / 网关 / Skill / �
 
 ## 本地开发
 ```bash
-go build ./... && go vet ./... && go test -race ./...
+GOWORK=off go test ./... -run '^$'
+go build ./... && go vet ./...
+go test -race ./...
 golangci-lint run
 ```
 跨仓联调用根目录 go.work（use 四仓）。
+
+### CI/CD 门禁说明
+
+- GitHub Actions 的 Linux 硬门禁等价于 `go test -race -count=1 -coverprofile=coverage.out ./...`。
+- 发布/CI 兼容性必须用 `GOWORK=off` 复验，避免本地 `go.work` 把未发布的 `toolkit` / `ai-core` / `hexagon` API 变化遮住。
+- 故意失败的 runner 完整性探针不得进入默认 `go test ./...` 路径；这类测试必须默认 `t.Skip`，或只在显式环境变量/手工 workflow 下启用。
 
 ## 提交规范
 - Conventional Commits；注释中文、只写功能描述，禁暴露内部开发文档/客户名/金额。

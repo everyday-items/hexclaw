@@ -5,20 +5,34 @@
 
 ## 结论
 
-当前主链路不是“不可用”，但还没有达到 100% 闭环。核心会话、API、知识库检索、记忆读写、MCP 基础调用、cron 任务创建/执行/清理、桌面真实浏览器路径多数可用；主要短板集中在 IM 适配器稳定性、模型路由一致性、多模态路由、MCP 单 server 健康、真实模型测试抗波动、release 构建可复现性。
+当前主链路不是“不可用”，但还没有达到 100% 闭环。核心会话、API、知识库检索、记忆读写、MCP 基础调用、cron 任务创建/执行/清理、桌面真实浏览器路径多数可用；主要短板集中在 IM 适配器稳定性、模型路由一致性、多模态路由、MCP 单 server 健康、真实模型测试抗波动。
 
 总体评级：黄偏红。
 
 - 绿色：基础 API 矩阵 35/35；真实模型 API 链路 23/24；桌面 live E2E 3/3；MCP Manager live 通过；cron 确定性任务 API 全闭环；Go benchmark 可跑。
-- 红色：DingTalk SDK 曾触发 `panic: send on closed channel` 并杀死 sidecar；OpenRouter alternate provider 429 导致 provider switch E2E 失败；默认 `qwen3-vl` 在知识/记忆路径持续 404；图片附件可发送但模型路由到非视觉模型后失败，E2E 没抓住；`GOWORK=off` release 构建失败。
+- 红色：DingTalk SDK 曾触发 `panic: send on closed channel` 并杀死 sidecar；OpenRouter alternate provider 429 导致 provider switch E2E 失败；默认 `qwen3-vl` 在知识/记忆路径持续 404；图片附件可发送但模型路由到非视觉模型后失败，E2E 没抓住。
 - 黄色：桌面单测有多处 warning/审计提示；MCP `time` server 持续 EOF 但 `filesystem` 可用；真实模型 P0 sandbox 测试受上游网络/超时影响未 100% 证明。
+
+### 2026-07-04 CI/CD 复验更新
+
+本轮复验基于当前工作区依赖升级：`toolkit v0.2.6`、`ai-core v0.2.0`、`hexagon v0.5.8`，三者均声明 `go=1.25.7`。
+
+- 线上 GitHub Actions 最近 10 次 run 均为 `success`；当前分支 `feat/code-exec-sandbox-autonomy` 没有关联 PR，也没有该分支 Actions run。
+- `GOWORK=off go test ./... -run '^$'` 通过，说明发版/CI 模式下全仓编译已恢复；此前 `toolkit v0.2.3` 缺字段导致的 release 构建不可复现问题已由依赖升级修复。
+- `GOWORK=off go test ./... -count=1` 通过。`engine/TestProbe_RunnerIntegrity_MustFail` 已改为 `HEXCLAW_RUNNER_PROBE=1` 手工门控，默认 CI 不再被故意失败探针阻断。
+- `.github/workflows/{ci,render,release,sandbox-code-exec}.yml` 经 `actionlint v1.7.7` 校验通过。
+- `sandbox-code-exec.yml` 是当前分支新增文件，尚未存在于 `origin/main`，GitHub 默认分支暂未注册该 workflow；合入 main 后才会出现在 Actions 列表中。
 
 ## 已执行测试
 
 | 层级 | 命令/路径 | 结果 |
 | --- | --- | --- |
-| 后端全量单测 | `go test ./... -count=1` | 通过 |
-| 后端 release 构建 | `GOWORK=off GOFLAGS=-mod=readonly go build ./...` | 失败：`skill/builtin/code_exec.go` 使用了本地 toolkit 新字段，但 `go.mod` 的 `github.com/hexagon-codes/toolkit v0.2.3` 不包含这些字段 |
+| 后端全量单测（原审计，2026-06-30） | `go test ./... -count=1` | 通过 |
+| 后端 release 构建（原审计，2026-06-30） | `GOWORK=off GOFLAGS=-mod=readonly go build ./...` | 失败：`skill/builtin/code_exec.go` 使用了本地 toolkit 新字段，但 `go.mod` 的 `github.com/hexagon-codes/toolkit v0.2.3` 不包含这些字段 |
+| CI/CD 复验（2026-07-04） | `GOWORK=off go test ./... -run '^$'` | 通过；全仓编译与依赖解析在 release 模式下可复现 |
+| CI/CD 复验（2026-07-04） | `GOWORK=off go test ./... -count=1` | 通过；runner 完整性探针默认跳过，仅在 `HEXCLAW_RUNNER_PROBE=1` 时手工触发 |
+| Workflow lint（2026-07-04） | `actionlint v1.7.7 .github/workflows/*.yml` | 通过 |
+| GitHub Actions 线上状态（2026-07-04） | `gh run list --limit 10` | 最近 10 次 run 均为 success；当前分支无 PR/run |
 | 桌面 Vitest | `pnpm vitest run --no-cache` | 4987 passed，15 todo；有 warning/审计提示 |
 | 桌面类型检查 | `pnpm vue-tsc --build` | 通过 |
 | WebKit feel | `pnpm test:webkit-feel` | 7/7 通过；sidecar 未启动时有 Vite proxy `ECONNREFUSED` 噪声 |
@@ -96,16 +110,28 @@
 - 断言 API 请求、重试次数、最终 UI 状态三者同时成立。
 - 对 DingTalk/Feishu/Line 等 IM channel 做同构 E2E 表格测试。
 
-### P0：release 构建不可复现
+### P0：默认 CI 会纳入故意失败探针（2026-07-04 已修复）
 
-证据：`GOWORK=off GOFLAGS=-mod=readonly go build ./...` 失败，`skill/builtin/code_exec.go` 引用了 `sandbox.Config` / `ExecResult` 的新字段，但 `go.mod` 锁定的 `toolkit v0.2.3` 不包含这些字段。
+历史证据：`engine/probe_runner_integrity_test.go` 中的 `TestProbe_RunnerIntegrity_MustFail` 用于证明测试 runner 真实执行；修复前代码路径恒定 `t.Fatalf`。本地复现：
 
-影响：本地 go.work 下能跑不代表发布包能构建；CI/release/新机器拉仓库会失败。
+```text
+GOWORK=off go test -race -count=1 ./engine -run TestProbe_RunnerIntegrity_MustFail -v
+--- FAIL: TestProbe_RunnerIntegrity_MustFail
+```
 
-建议：
+影响：GitHub Actions `CI / Test (Linux)` 执行 `go test -race -count=1 -coverprofile=coverage.out ./...`，修复前会将该探针纳入默认全量测试，导致 PR/main push 红灯。它不是产品功能失败，但会阻断 CI/CD。
 
-- 发布前必须跑 `GOWORK=off GOFLAGS=-mod=readonly go test/build ./...`。
-- 升级并发布 toolkit 版本，或在 go.mod 中使用正确版本；不要依赖本地 replace/工作区隐式状态。
+修复状态：
+
+- runner 完整性探针已默认 `t.Skip`，仅在显式设置 `HEXCLAW_RUNNER_PROBE=1` 时启用。
+- CI 全量命令不需要排除普通包，避免用 `-run` 或包列表掩盖真实回归。
+- `GOWORK=off go test ./... -run '^$'` 与 `GOWORK=off go test ./... -count=1` 均已通过。
+
+### P0：release 构建不可复现（2026-07-04 已修复）
+
+历史证据：`GOWORK=off GOFLAGS=-mod=readonly go build ./...` 曾失败，原因是 `skill/builtin/code_exec.go` 引用了 `sandbox.Config` / `ExecResult` 的新字段，但 `go.mod` 锁定的 `toolkit v0.2.3` 不包含这些字段。
+
+修复状态：当前依赖已升级到 `toolkit v0.2.6`、`ai-core v0.2.0`、`hexagon v0.5.8`，并统一 `go 1.25.7`。`GOWORK=off go test ./... -run '^$'` 已通过，全仓编译和模块解析不再依赖本地 `go.work` 隐式状态。
 
 ## 次级问题
 
@@ -161,7 +187,8 @@ P0：
 - 修 provider switch 健康选择与 fallback。
 - 多模态能力路由 + E2E 断言最终结果。
 - 修 DingTalk runtime test 的真实 click path。
-- 修 `GOWORK=off` release 构建。
+- 保持 runner 完整性探针默认 skip，仅在 `HEXCLAW_RUNNER_PROBE=1` 下手工触发。
+- 保持 `GOWORK=off` release 构建/编译门禁，防止再次依赖本地工作区隐式版本。
 
 P1：
 

@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Changed
+- 升级框架依赖：hexagon v0.5.7 → **v0.5.8**、ai-core v0.1.11 → **v0.2.0**、toolkit v0.2.3 → **v0.2.6**；`go.mod` 同步到 Go **1.25.7**。`GOWORK=off go test ./... -run '^$'` 已通过，发版/CI 模式下全仓编译不再依赖本地 `go.work` 的隐式下层源码。
+- 更新 CI/CD 文档口径：补充 GitHub Actions 最近 run 状态、`sandbox-code-exec.yml` 默认分支注册条件、Linux CI 等价命令，以及 runner 完整性探针不得进入默认 `go test ./...` 的规则。
+
+### Fixed
+- 修复 release 构建不可复现的依赖锁定问题：`skill/builtin/code_exec.go` 依赖的 sandbox 限额字段已由 `toolkit v0.2.6` 提供，不再需要本地 workspace 才能编译。
+- 将 runner 完整性故意失败探针改为 `HEXCLAW_RUNNER_PROBE=1` 手工门控，默认 `go test ./...` 不再被取证用例打红。
+
 ## [0.4.7] - 2026-06-26
 > 技能/MCP 市场离线优先 + 应用自省自愈 skill（app_query/app_heal）+ 文档上传抽取预览 + 会话附件持久化；一组 CJK 截断 / 上游脱敏 / API 契约修复；框架依赖升级 hexagon v0.5.5 / ai-core v0.1.8。
 

@@ -582,7 +582,7 @@ hexclaw/
 
 | 工具 | 版本要求 |
 |------|---------|
-| Go | >= 1.25 |
+| Go | >= 1.25.7 |
 | golangci-lint | 最新版（可选） |
 
 ### Make 命令
@@ -602,10 +602,13 @@ hexclaw/
 ### 手动命令
 
 ```bash
+# release/CI 模式编译校验（避免本地 go.work 掩盖未发布依赖 API）
+GOWORK=off go test ./... -run '^$'
+
 # 构建
 go build ./...
 
-# 运行测试
+# 运行测试（runner 完整性探针默认跳过；需取证时设 HEXCLAW_RUNNER_PROBE=1）
 go test ./...
 
 # 运行指定测试
@@ -623,10 +626,10 @@ go run ./cmd/verify-release -repo . -version 0.4.4 -version-files package.json
 
 | 组件 | 技术 |
 |------|------|
-| 语言 | Go 1.25+ |
-| Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.5.0 |
-| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.1.4 |
-| 工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) v0.1.0 |
+| 语言 | Go 1.25.7+ |
+| Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.5.8 |
+| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.2.0 |
+| 工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) v0.2.6 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | 配置 | YAML + 环境变量 |
 | 存储 | SQLite (modernc.org/sqlite) |
@@ -662,20 +665,26 @@ chore: 构建/工具链
 - 格式化: `make fmt`
 - 静态检查: `make vet`
 - Lint: `make lint`
-- 提交前请确保 `make test` 全部通过
+- 提交前请确保 `make test` 全部通过；runner 完整性探针这类故意失败用例必须默认跳过或放入手工 workflow
 
 ## 相关项目
 
 | 项目 | 说明 | 仓库 |
 |------|------|------|
-| **Hexagon** | Go AI Agent 框架 (核心引擎) v0.5.0 | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.1.4 | [ai-core](https://github.com/hexagon-codes/ai-core) |
-| **toolkit** | Go 通用工具库 v0.1.0 | [toolkit](https://github.com/hexagon-codes/toolkit) |
+| **Hexagon** | Go AI Agent 框架 (核心引擎) v0.5.8 | [hexagon](https://github.com/hexagon-codes/hexagon) |
+| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.2.0 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **toolkit** | Go 通用工具库 v0.2.6 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI 观测面板 (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
 | **hexclaw-desktop** | HexClaw 桌面客户端 (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
 | **hexclaw-ui** | HexClaw Web 前端 (Vue 3) | [hexclaw-ui](https://github.com/hexagon-codes/hexclaw-ui) |
 
 ## 更新日志
+
+### Unreleased
+
+**依赖与 CI/CD**
+- **框架依赖升级** — 当前 `go.mod` 对齐 hexagon v0.5.8 / ai-core v0.2.0 / toolkit v0.2.6，并统一 Go 1.25.7；`GOWORK=off go test ./... -run '^$'` 已通过，发版/CI 模式下全仓编译不再依赖本地工作区隐式版本。
+- **CI/CD 复验口径** — GitHub Actions 最近线上 run 均为 success，当前分支尚无 PR/run；新增 `sandbox-code-exec.yml` 尚未进入默认分支，合入后才会注册。runner 完整性探针已默认跳过，仅在 `HEXCLAW_RUNNER_PROBE=1` 时手工触发；`GOWORK=off go test ./... -count=1` 已通过。
 
 ### v0.4.4
 
