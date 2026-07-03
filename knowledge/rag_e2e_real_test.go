@@ -316,14 +316,18 @@ func TestRAGReal_FullPipeline(t *testing.T) {
 	nomic := realEmbedder(ollamaBase, "", envOr("HEX_E2E_OLLAMA_EMBED", "nomic-embed-text"), 768)
 	qc := e2eQueries[0] // 只跑第一条，控时
 
-	run := func(t *testing.T, llm RerankLLM) {
+	run := func(t *testing.T, embedder hexagon.VectorEmbedder, llm RerankLLM) {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 		defer cancel()
 		// 探针：chat LLM 不可用（如云端余额不足）则跳过
 		if _, err := llm.Complete(ctx, "回复:ok"); err != nil {
 			t.Skipf("chat LLM 不可用，跳过：%v", err)
 		}
-		mgr := newRealManager(t, DefaultHybridConfig(), nomic, llm) // 全开
+		// 探针：完整管线必须使用真实可用 embedding，不能在 embedding 失败后悄悄退化成纯文本检索。
+		if vv, err := embedder.Embed(ctx, []string{"探针"}); err != nil || len(vv) == 0 || len(vv[0]) == 0 {
+			t.Skipf("embedder 不可用，跳过：%v", err)
+		}
+		mgr := newRealManager(t, DefaultHybridConfig(), embedder, llm) // 全开
 		ingestCorpus(t, ctx, mgr)
 
 		hits, err := mgr.Search(ctx, qc.q, 3)
@@ -350,22 +354,38 @@ func TestRAGReal_FullPipeline(t *testing.T) {
 	// 本地 qwen 仅在 HEX_E2E_RUN_OLLAMA_CHAT=1 时跑（本机 9B 常冷启动超时，默认不跑免浪费时间）
 	if os.Getenv("HEX_E2E_RUN_OLLAMA_CHAT") == "1" {
 		t.Run("ollama_qwen", func(t *testing.T) {
-			run(t, &httpChatLLM{base: ollamaBase, model: envOr("HEX_E2E_OLLAMA_CHAT", "qwen3.5:9b"), client: httpc})
+			run(t, nomic, &httpChatLLM{base: ollamaBase, model: envOr("HEX_E2E_OLLAMA_CHAT", "qwen3.5:9b"), client: httpc})
 		})
 	}
 	if base, key, model := envProvider("SF"); key != "" {
 		t.Run("cloud_siliconflow_qwen", func(t *testing.T) {
-			run(t, &httpChatLLM{base: base, key: key, model: envOr("HEX_E2E_SF_CHAT", model), client: httpc})
+			em := envOr("HEX_E2E_SF_EMBED", "BAAI/bge-m3")
+			run(t,
+				realEmbedder(base, key, em, embedDim(em)),
+				&httpChatLLM{base: base, key: key, model: envOr("HEX_E2E_SF_CHAT", model), client: httpc},
+			)
 		})
 	}
 	if base, key, model := envProvider("GLM"); key != "" {
 		t.Run("cloud_glm_chat", func(t *testing.T) {
-			run(t, &httpChatLLM{base: base, key: key, model: model, client: httpc})
+			em := os.Getenv("HEX_E2E_GLM_EMBED")
+			if em == "" {
+				t.Skip("HEX_E2E_GLM_EMBED 未设，跳过 GLM full-pipeline；不回退到本地 embedding")
+			}
+			run(t, realEmbedder(base, key, em, embedDim(em)), &httpChatLLM{base: base, key: key, model: model, client: httpc})
 		})
 	}
 	if base, key, model := envProvider("OPENROUTER"); key != "" {
 		t.Run("cloud_openrouter_chat", func(t *testing.T) {
-			run(t, &httpChatLLM{base: base, key: key, model: model, client: httpc})
+			sfBase, sfKey, _ := envProvider("SF")
+			if sfKey == "" {
+				t.Skip("OPENROUTER full-pipeline 需要显式可用的云端 embedding（当前未设置 HEX_E2E_SF_KEY）")
+			}
+			em := envOr("HEX_E2E_SF_EMBED", "BAAI/bge-m3")
+			run(t,
+				realEmbedder(sfBase, sfKey, em, embedDim(em)),
+				&httpChatLLM{base: base, key: key, model: model, client: httpc},
+			)
 		})
 	}
 }

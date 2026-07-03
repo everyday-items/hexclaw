@@ -66,7 +66,7 @@ func (s *Server) handleAddDocument(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, knowledgeDocResponse(doc))
 }
 
-// handleUploadDocument 上传文件到知识库（支持 TXT/MD/CSV/JSON/DOCX）
+// handleUploadDocument 上传文件到知识库。
 func (s *Server) handleUploadDocument(w http.ResponseWriter, r *http.Request) {
 	const maxUpload = 200 << 20 // 200MB
 	if err := r.ParseMultipartForm(maxUpload); err != nil {
@@ -89,7 +89,7 @@ func (s *Server) handleUploadDocument(w http.ResponseWriter, r *http.Request) {
 		".png": true, ".jpg": true, ".jpeg": true, ".webp": true, ".gif": true}
 	if !allowed[ext] {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "不支持的文件格式，请上传 .txt / .md / .csv / .json / .doc / .docx / .pptx / .pdf / 图片(.png/.jpg/.webp/.gif)",
+			"error": "不支持的文件格式，请上传 .txt / .md / .csv / .json / .doc / .docx / .pptx / .pdf / 图片(.png/.jpg/.jpeg/.webp/.gif)",
 		})
 		return
 	}
@@ -122,56 +122,27 @@ func (s *Server) handleUploadDocument(w http.ResponseWriter, r *http.Request) {
 	}
 
 	title := strings.TrimSuffix(header.Filename, ext)
-	var content string
-	switch ext {
-	case ".txt", ".md", ".csv":
-		content = string(data)
-	case ".json":
-		content = string(data)
-	case ".docx":
-		content, err = extractDocxText(data)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "解析 DOCX 失败: " + err.Error(),
-			})
-			return
-		}
-	case ".pdf":
-		content, _, err = extractPDFText(r.Context(), data)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "解析 PDF 失败: " + err.Error(),
-			})
-			return
-		}
-	case ".doc":
-		content, err = extractDOCText(r.Context(), data)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "解析 DOC 失败: " + err.Error(),
-			})
-			return
-		}
-	case ".pptx":
-		content, err = extractPPTXText(r.Context(), data)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "解析 PPTX 失败: " + err.Error(),
-			})
-			return
-		}
-	default:
-		content = string(data)
-	}
-
-	if strings.TrimSpace(content) == "" {
+	extracted, err := extractDocumentForKnowledge(r.Context(), ext, data, s.kb)
+	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "文件内容为空",
+			"error": "解析文件失败: " + err.Error(),
 		})
 		return
 	}
 
-	doc, err := s.kb.AddDocument(r.Context(), title, content, "upload:"+header.Filename)
+	if strings.TrimSpace(extracted.Text) == "" {
+		msg := "文件内容为空"
+		if ext == ".pdf" || ext == ".docx" {
+			msg = "未能从文件中提取到可入库内容；扫描页或内嵌图片需要配置视觉模型 / VLM 后重试"
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":    msg,
+			"warnings": extracted.Warnings,
+		})
+		return
+	}
+
+	doc, err := s.kb.AddDocument(r.Context(), title, extracted.Text, "upload:"+header.Filename)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "添加文档失败: " + err.Error(),
@@ -179,7 +150,9 @@ func (s *Server) handleUploadDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, knowledgeDocResponse(doc))
+	resp := knowledgeDocResponse(doc)
+	resp.Warnings = extracted.Warnings
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // extractDocxText 从 DOCX 中提取纯文本（DOCX 为 ZIP，内含 word/document.xml）

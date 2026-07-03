@@ -760,7 +760,11 @@ func (m *Manager) SearchWithFilter(ctx context.Context, query string, topK int, 
 	if err != nil {
 		return nil, err
 	}
+	return hitsFromResults(selected), nil
+}
 
+// hitsFromResults 把内部检索结果映射为对外的 SearchHit。
+func hitsFromResults(selected []*SearchResult) []SearchHit {
 	hits := make([]SearchHit, 0, len(selected))
 	for _, r := range selected {
 		hits = append(hits, SearchHit{
@@ -776,7 +780,7 @@ func (m *Manager) SearchWithFilter(ctx context.Context, query string, topK int, 
 			Metadata:   chunkMetadata(r.Chunk),
 		})
 	}
-	return hits, nil
+	return hits
 }
 
 // chunkMetadata 暴露 chunk 的可过滤/可展示元数据（source_type、创建时间），
@@ -805,15 +809,29 @@ func (m *Manager) Query(ctx context.Context, query string, topK int) (string, er
 }
 
 // QueryWithFilter 同 Query，但在元数据过滤约束下检索（source / source_type / 创建日期）。
+//
+// 注入语义（BUG-20260703 B8）：本路径 fail-closed——仅语义相关度过地板（VectorScore >=
+// MinScore）的候选可进上下文，无强命中返回空串，让模型如实答"未找到"；绝不把仅
+// 通用词法重叠的弱相关文档（"公司/地址"这类分词命中）端给模型编答案。
 func (m *Manager) QueryWithFilter(ctx context.Context, query string, topK int, filter Filter) (string, error) {
-	hits, err := m.SearchWithFilter(ctx, query, topK, filter)
+	selected, err := m.searchResultsMode(ctx, query, topK, filter, true)
 	if err != nil {
 		return "", err
 	}
-	return formatSearchHits(hits), nil
+	return formatSearchHits(hitsFromResults(selected)), nil
 }
 
 func (m *Manager) searchResults(ctx context.Context, query string, topK int, filter Filter) ([]*SearchResult, error) {
+	return m.searchResultsMode(ctx, query, topK, filter, false)
+}
+
+// searchResultsMode 是检索全链路的实现。strictFloor 区分两种召回语义：
+//   - false（显式检索：桌面 KB 页 / knowledge_search 工具 / API）：宽召回——词法命中
+//     放行、地板清空时放宽回退，用户看得到相关度自行判断；
+//   - true（聊天自动注入 Query/QueryWithFilter）：fail-closed——仅 VectorScore 过地板
+//     的候选保留，清空即空，宁缺勿滥（BM25 分是结果集内 min-max 归一，最佳垃圾恒为
+//     1.0，不能当跨查询可比的相关性用）。
+func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int, filter Filter, strictFloor bool) ([]*SearchResult, error) {
 	if topK <= 0 {
 		topK = 3
 	}
@@ -832,6 +850,9 @@ func (m *Manager) searchResults(ctx context.Context, query string, topK int, fil
 	// 2. 宽召回：每个 query 各取一路向量 + 一路 BM25，记录各排序列表喂给 RRF（#6 over-retrieve）
 	resultMap := make(map[string]*SearchResult)
 	var rankedLists []rankedList
+	// vectorRouteRan：查询时向量路是否真实跑通。嵌入/向量搜索失败（如 embedding 服务
+	// 不可用）时无语义证据可要求，严格地板退回宽召回语义，避免降级态下 RAG 全盲。
+	vectorRouteRan := false
 
 	for _, q := range queries {
 		if m.embedder != nil {
@@ -843,6 +864,7 @@ func (m *Manager) searchResults(ctx context.Context, query string, topK int, fil
 					logger.Error("[knowledge] 向量搜索失败", "error", vErr)
 				} else {
 					rankedLists = append(rankedLists, mergeRanked(resultMap, vres, true))
+					vectorRouteRan = true
 				}
 			}
 		}
@@ -861,8 +883,9 @@ func (m *Manager) searchResults(ctx context.Context, query string, topK int, fil
 	// 3. 融合评分（#9 RRF 或加权和回退）+ 时间衰减
 	candidates := m.fuse(resultMap, rankedLists)
 
-	// 4. 相关度地板（#3）+ 放宽回退
-	candidates = m.applyMinScore(candidates)
+	// 4. 相关度地板（#3）：宽召回模式带放宽回退；注入模式 fail-closed（B8）。
+	// 严格语义仅在向量路真实跑通时可用（否则退回宽召回，避免降级态 RAG 全盲）。
+	candidates = m.applyMinScore(candidates, strictFloor && vectorRouteRan)
 
 	// 5. 宽召回 → 重排 → 收窄（#6）；无 LLM/关闭时回退 MMR 多样性选取
 	return m.rerankTopK(ctx, query, candidates, topK), nil
@@ -956,20 +979,31 @@ func (m *Manager) fuse(resultMap map[string]*SearchResult, rankedLists []rankedL
 	return candidates
 }
 
-// applyMinScore 施加相关度地板（#3）：丢弃"纯弱向量命中"（语义低于地板且无关键词支撑）；
-// 有关键词命中或纯关键词模式的候选一律保留。过滤后为空则放宽回退，保证不清空。
-func (m *Manager) applyMinScore(candidates []*SearchResult) []*SearchResult {
+// applyMinScore 施加相关度地板（#3）。
+//
+// 宽召回模式（strict=false，显式检索）：丢弃"纯弱向量命中"（语义低于地板且无关键词
+// 支撑），有关键词命中的候选保留；过滤后为空则放宽回退，保证不清空。
+//
+// 严格模式（strict=true，聊天自动注入）：仅 VectorScore 过地板者保留——TextScore 是
+// 结果集内 min-max 归一分（最佳垃圾恒 1.0），不构成跨查询可比的相关性证据；清空即
+// 返回空，无放宽回退（BUG-20260703 B8：宁缺勿滥，无强命中让模型如实答"未找到"）。
+//
+// 两种模式下，MinScore=0 或无 embedder（纯关键词检索）时均不施加地板。
+func (m *Manager) applyMinScore(candidates []*SearchResult, strict bool) []*SearchResult {
 	minScore := m.cfg().MinScore
 	if minScore <= 0 || m.embedder == nil {
 		return candidates
 	}
 	kept := make([]*SearchResult, 0, len(candidates))
 	for _, r := range candidates {
-		if r.VectorScore >= minScore || r.TextScore > 0 {
+		if r.VectorScore >= minScore || (!strict && r.TextScore > 0) {
 			kept = append(kept, r)
 		}
 	}
 	if len(kept) == 0 {
+		if strict {
+			return nil // fail-closed：注入路径无强相关命中即为空
+		}
 		return candidates // 放宽回退：避免地板把结果清空
 	}
 	return kept

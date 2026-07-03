@@ -49,26 +49,42 @@ func WithCaptioner(c Captioner) ManagerOption {
 	return func(m *Manager) { m.captioner = c }
 }
 
+// HasCaptioner 报告当前知识库是否已配置视觉转写能力。
+func (m *Manager) HasCaptioner() bool {
+	return m != nil && m.captioner != nil
+}
+
+// CaptionImage 使用知识库已配置的视觉模型把图像转写为可检索文本。
+//
+// 这是给文档摄取层复用的窄能力面：PDF 扫描页、DOCX 内嵌图片等都应复用同一
+// captioner，而不是绕开知识库配置另起模型调用路径。
+func (m *Manager) CaptionImage(ctx context.Context, image []byte, mime string) (string, error) {
+	if len(image) == 0 {
+		return "", fmt.Errorf("图像内容不能为空")
+	}
+	if m == nil || m.captioner == nil {
+		return "", fmt.Errorf("图片入库需要先配置具备视觉能力的模型（视觉模型 / VLM），当前未配置；请在设置中为知识库配置视觉模型后重试")
+	}
+	caption, err := m.captioner.Caption(ctx, image, mime)
+	if err != nil {
+		return "", fmt.Errorf("图像转写失败（请确认所用模型为支持图片的视觉模型）: %w", err)
+	}
+	caption = strings.TrimSpace(caption)
+	if caption == "" {
+		return "", fmt.Errorf("图像转写结果为空，已跳过摄取")
+	}
+	return caption, nil
+}
+
 // AddImageDocument 把一张图像摄取进知识库（多模态：VLM caption → 文本 RAG）。
 //
 // 流程：caption 图像 → 组装「【图像内容】\n<caption>」正文 → 复用 AddDocument 走完整
 // 写入管线，文档 SourceType 经「image:」源前缀约定标记为 "image"。title 为空时从 caption
 // 派生。未注入 Captioner、空图像、空 caption 一律返回明确错误（绝不摄取空/垃圾文档）。
 func (m *Manager) AddImageDocument(ctx context.Context, title string, image []byte, mime, source string) (*Document, error) {
-	if len(image) == 0 {
-		return nil, fmt.Errorf("图像内容不能为空")
-	}
-	if m.captioner == nil {
-		return nil, fmt.Errorf("图片入库需要先配置具备视觉能力的模型（视觉模型 / VLM），当前未配置；请在设置中为知识库配置视觉模型后重试")
-	}
-
-	caption, err := m.captioner.Caption(ctx, image, mime)
+	caption, err := m.CaptionImage(ctx, image, mime)
 	if err != nil {
-		return nil, fmt.Errorf("图像转写失败（请确认所用模型为支持图片的视觉模型）: %w", err)
-	}
-	caption = strings.TrimSpace(caption)
-	if caption == "" {
-		return nil, fmt.Errorf("图像转写结果为空，已跳过摄取")
+		return nil, err
 	}
 
 	title = strings.TrimSpace(title)
