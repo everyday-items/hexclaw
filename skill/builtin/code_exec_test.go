@@ -471,7 +471,7 @@ func TestCodeExecSkill_PreparesEnvDirsOutsideSandbox(t *testing.T) {
 		Config:      sandbox.Config{Network: true},
 	}
 	exports := codeExecEnv(run)
-	if err := ensureCodeExecEnvDirs(exports); err != nil {
+	if err := ensureCodeExecEnvDirs(run, exports); err != nil {
 		t.Fatalf("ensureCodeExecEnvDirs: %v", err)
 	}
 	for _, key := range codeExecWritableEnvKeys {
@@ -749,6 +749,53 @@ func TestCodeExecSkill_Execute_NetworkPolicyPropagatesToRunSandbox(t *testing.T)
 	}
 	if !strings.Contains(scripts[len(scripts)-1], "GOMODCACHE") {
 		t.Fatalf("online execution did not export GOMODCACHE:\n%s", scripts[len(scripts)-1])
+	}
+}
+
+func TestCodeExecSkill_Execute_OfflineGoCommandUsesHostModuleCache(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("this test inspects POSIX shell wrapper exports")
+	}
+	hostModCache := filepath.Join(t.TempDir(), "gomodcache")
+	if err := os.MkdirAll(hostModCache, 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOMODCACHE", hostModCache)
+	expectedModCache := hostModCache
+	if real, err := filepath.EvalSymlinks(hostModCache); err == nil {
+		expectedModCache = real
+	}
+
+	var script string
+	var readable []string
+	s := NewCodeExecSkill(&mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30, Network: false})
+	s.sandboxFactory = func(cfg sandbox.Config) (sandbox.Sandbox, error) {
+		readable = append([]string(nil), cfg.ReadablePaths...)
+		return &mockSandbox{execFn: func(_ context.Context, _ string, args []string) (*sandbox.ExecResult, error) {
+			if len(args) >= 2 {
+				script = args[1]
+			}
+			return &sandbox.ExecResult{Stdout: "ok", ExitCode: 0}, nil
+		}}, nil
+	}
+
+	if _, err := s.Execute(context.Background(), map[string]any{
+		"mode":         "project",
+		"project_root": t.TempDir(),
+		"command":      []any{"go", "env", "GOMODCACHE"},
+	}); err != nil {
+		t.Fatalf("offline go execute: %v", err)
+	}
+	if !strings.Contains(script, "GOMODCACHE=") || !strings.Contains(script, expectedModCache) {
+		t.Fatalf("offline go execution did not export host GOMODCACHE %q:\n%s", expectedModCache, script)
+	}
+	for _, want := range []string{"GOPROXY='off'", "GOSUMDB='off'", "GOTOOLCHAIN='local'"} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("offline go execution missing %s:\n%s", want, script)
+		}
+	}
+	if !slices.Contains(readable, expectedModCache) {
+		t.Fatalf("offline go sandbox readable paths missing host module cache %q: %v", expectedModCache, readable)
 	}
 }
 

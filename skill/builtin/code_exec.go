@@ -86,6 +86,7 @@ type codeExecRun struct {
 	CacheDir     string
 	ProjectRoot  string
 	ManifestPath string
+	GoRuntime    bool
 	Config       sandbox.Config
 }
 
@@ -460,6 +461,7 @@ func prepareCodeExecRun(cfg sandbox.Config, req codeExecRequest, broker *FileAcc
 		CacheDir:     filepath.Join(scratch, "cache"),
 		ProjectRoot:  projectRoot,
 		ManifestPath: filepath.Join(root, "manifest.json"),
+		GoRuntime:    codeExecMayNeedGoRuntime(req, projectRoot),
 		Config:       cfg,
 	}
 	for _, dir := range []string{run.Root, run.Scratch, run.ArtifactDir, run.LogDir, run.CacheDir} {
@@ -480,7 +482,7 @@ func prepareCodeExecRun(cfg sandbox.Config, req codeExecRequest, broker *FileAcc
 		}
 		run.Config.ReadablePaths = append(run.Config.ReadablePaths, projectReadablePaths(projectRoot, broker)...)
 	}
-	if codeExecNeedsGoRuntime(req) {
+	if run.GoRuntime {
 		run.Config.ReadablePaths = append(run.Config.ReadablePaths, goRuntimeReadablePaths()...)
 	}
 	run.Config.ReadablePaths = compactCleanPaths(run.Config.ReadablePaths)
@@ -656,7 +658,7 @@ func inferRunnableFile(root, language string) string {
 
 func runSandboxCommand(ctx context.Context, sb sandbox.Sandbox, run codeExecRun, command []string) (*sandbox.ExecResult, error) {
 	exports := codeExecEnv(run)
-	if err := ensureCodeExecEnvDirs(exports); err != nil {
+	if err := ensureCodeExecEnvDirs(run, exports); err != nil {
 		return nil, err
 	}
 	if runtime.GOOS == "windows" {
@@ -680,6 +682,13 @@ func codeExecEnv(run codeExecRun) map[string]string {
 	}
 	if run.Config.Network {
 		exports["GOMODCACHE"] = filepath.Join(run.CacheDir, "gomod")
+	} else if run.GoRuntime {
+		if gomod := hostGoModCachePath(); gomod != "" {
+			exports["GOMODCACHE"] = gomod
+		}
+		exports["GOPROXY"] = "off"
+		exports["GOSUMDB"] = "off"
+		exports["GOTOOLCHAIN"] = "local"
 	}
 	return exports
 }
@@ -703,9 +712,12 @@ var codeExecUnsetEnvKeys = []string{
 	"GOWORK",
 }
 
-func ensureCodeExecEnvDirs(exports map[string]string) error {
+func ensureCodeExecEnvDirs(run codeExecRun, exports map[string]string) error {
 	seen := map[string]bool{}
 	for _, key := range codeExecWritableEnvKeys {
+		if key == "GOMODCACHE" && run.GoRuntime && !run.Config.Network {
+			continue
+		}
 		dir := strings.TrimSpace(exports[key])
 		if dir == "" || seen[dir] {
 			continue
@@ -1254,6 +1266,30 @@ func codeExecNeedsGoRuntime(req codeExecRequest) bool {
 	return cmd == "go" || strings.HasPrefix(cmd, "go ") || strings.Contains(cmd, " go ")
 }
 
+func codeExecMayNeedGoRuntime(req codeExecRequest, projectRoot string) bool {
+	if codeExecNeedsGoRuntime(req) {
+		return true
+	}
+	switch req.Mode {
+	case "project":
+		return len(req.Command) == 0 && req.CommandText == "" && fileExists(filepath.Join(projectRoot, "go.mod"))
+	case "module":
+		if normalizeCodeExecLanguage(req.Language) != "" {
+			return false
+		}
+		if inferLanguageFromCode(req.Code) == "go" {
+			return true
+		}
+		for _, f := range req.Files {
+			name := filepath.Base(filepath.Clean(f.Path))
+			if name == "go.mod" || strings.HasSuffix(name, ".go") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func goRuntimeReadablePaths() []string {
 	var paths []string
 	if goroot := runtime.GOROOT(); goroot != "" {
@@ -1279,6 +1315,29 @@ func goRuntimeReadablePaths() []string {
 		)
 	}
 	return paths
+}
+
+func hostGoModCachePath() string {
+	if gomod := strings.TrimSpace(os.Getenv("GOMODCACHE")); gomod != "" {
+		return cleanExistingHostPath(gomod)
+	}
+	for _, gp := range filepath.SplitList(os.Getenv("GOPATH")) {
+		if strings.TrimSpace(gp) != "" {
+			return cleanExistingHostPath(filepath.Join(gp, "pkg", "mod"))
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		return cleanExistingHostPath(filepath.Join(home, "go", "pkg", "mod"))
+	}
+	return ""
+}
+
+func cleanExistingHostPath(path string) string {
+	clean := filepath.Clean(path)
+	if real, err := filepath.EvalSymlinks(clean); err == nil {
+		return real
+	}
+	return clean
 }
 
 func compactCleanPaths(paths []string) []string {
