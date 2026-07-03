@@ -11,7 +11,7 @@ import "strings"
 // toolDisplayNames 工具名 → 中文显示名（镜像前端 i18n chat.toolName）。
 // 未命中回退裸名。河蟹/小蟹为中文优先产品，IM 默认中文。
 var toolDisplayNames = map[string]string{
-	"code_exec":         "代码沙箱",
+	"code_exec":         "代码执行",
 	"code":              "代码运行",
 	"shell":             "终端",
 	"file_ops":          "文件管理",

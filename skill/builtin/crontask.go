@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -118,9 +120,15 @@ func (s *CronTaskSkill) Execute(ctx context.Context, args map[string]any) (*skil
 }
 
 func (s *CronTaskSkill) executeCreate(ctx context.Context, args map[string]any, userID string) (*skill.Result, error) {
-	name := cronArgString(args, "name")
-	schedule := cronArgString(args, "schedule")
-	prompt := cronArgString(args, "prompt")
+	name := cronArgFirstString(args, "name", "title", "task_name", "job_name")
+	prompt := cronArgFirstString(args, "prompt", "description", "task", "goal", "content")
+	schedule := normalizeCronTaskSchedule(cronArgFirstString(args, "schedule", "cron", "cron_expression", "time"), prompt)
+	if name == "" {
+		name = deriveCronTaskName(prompt)
+	}
+	if prompt == "" {
+		prompt = name
+	}
 	if name == "" || schedule == "" || prompt == "" {
 		return nil, fmt.Errorf("create requires name, schedule and prompt")
 	}
@@ -202,4 +210,70 @@ func formatCronTime(t time.Time) string {
 func cronArgString(args map[string]any, key string) string {
 	v, _ := args[key].(string)
 	return strings.TrimSpace(v)
+}
+
+func cronArgFirstString(args map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if v := cronArgString(args, key); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+var dailyTimeRe = regexp.MustCompile(`(?:每天|每日).{0,8}?([0-2]?\d)\s*(?::|点|时)\s*([0-5]?\d)?`)
+
+func normalizeCronTaskSchedule(schedule, prompt string) string {
+	schedule = strings.TrimSpace(schedule)
+	if schedule == "" {
+		schedule = strings.TrimSpace(prompt)
+	}
+	if schedule == "" {
+		return ""
+	}
+	if normalized := dailyTimeCron(schedule); normalized != "" {
+		return normalized
+	}
+	if strings.Contains(schedule, "每天") || strings.Contains(schedule, "每日") || strings.EqualFold(schedule, "daily") {
+		return "@daily"
+	}
+	return schedule
+}
+
+func dailyTimeCron(text string) string {
+	m := dailyTimeRe.FindStringSubmatch(text)
+	if len(m) == 0 {
+		return ""
+	}
+	hour, err := strconv.Atoi(m[1])
+	if err != nil || hour < 0 || hour > 23 {
+		return ""
+	}
+	minute := 0
+	if len(m) > 2 && strings.TrimSpace(m[2]) != "" {
+		minute, err = strconv.Atoi(m[2])
+		if err != nil || minute < 0 || minute > 59 {
+			return ""
+		}
+	}
+	prefix := m[0]
+	if (strings.Contains(prefix, "下午") || strings.Contains(prefix, "晚上")) && hour > 0 && hour < 12 {
+		hour += 12
+	}
+	return fmt.Sprintf("%d %d * * *", minute, hour)
+}
+
+func deriveCronTaskName(prompt string) string {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return ""
+	}
+	if strings.Contains(prompt, "百度热搜") {
+		return "百度热搜采集"
+	}
+	runes := []rune(prompt)
+	if len(runes) > 18 {
+		runes = runes[:18]
+	}
+	return strings.TrimSpace(string(runes))
 }

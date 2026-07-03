@@ -70,12 +70,8 @@ func (m *McpInstallerSkill) Execute(ctx context.Context, args map[string]any) (*
 		if err != nil {
 			return nil, fmt.Errorf("MCP server '%s' not found in Hub: %w", keyword, err)
 		}
-		// 安全校验: 只允许已知安全的 MCP 启动命令 + 参数验证
-		if !isSafeMCPCommand(entry.Command) {
-			return nil, fmt.Errorf("MCP server '%s' uses untrusted command %q (allowed: npx, uvx, node, python3, python, deno)", keyword, entry.Command)
-		}
-		if err := validateMCPArgs(entry.Args); err != nil {
-			return nil, fmt.Errorf("MCP server '%s' has unsafe args: %w", keyword, err)
+		if strings.TrimSpace(entry.Command) == "" {
+			return nil, fmt.Errorf("MCP server '%s' has empty command", keyword)
 		}
 		cfg := mcp.ServerConfig{
 			Name:      entry.Name,
@@ -153,34 +149,4 @@ func formatMcpSearchResults(results []hub.McpServerMeta) string {
 		sb.WriteString("\n")
 	}
 	return sb.String()
-}
-
-// isSafeMCPCommand checks if the MCP server command is in the trusted whitelist.
-// Only well-known package runners and interpreters are allowed.
-var safeMCPCommands = map[string]bool{
-	"npx": true, "uvx": true, "node": true, "deno": true,
-	"python": true, "python3": true, "bun": true, "bunx": true,
-}
-
-func isSafeMCPCommand(cmd string) bool {
-	// Extract base command name (handle paths like /usr/bin/npx)
-	parts := strings.Split(cmd, "/")
-	base := parts[len(parts)-1]
-	return safeMCPCommands[base]
-}
-
-// validateMCPArgs checks for dangerous argument patterns.
-func validateMCPArgs(args []string) error {
-	for _, arg := range args {
-		lower := strings.ToLower(arg)
-		// Block eval/exec flags
-		if arg == "-e" || arg == "--eval" || strings.HasPrefix(lower, "-e ") {
-			return fmt.Errorf("eval flag not allowed in MCP server args")
-		}
-		// Block shell injection via semicolons or pipes
-		if strings.ContainsAny(arg, ";|&`$") {
-			return fmt.Errorf("shell metacharacters not allowed in MCP server args")
-		}
-	}
-	return nil
 }

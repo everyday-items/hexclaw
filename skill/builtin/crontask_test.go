@@ -101,6 +101,53 @@ func TestCronTaskSkill_CreateRequiresFields(t *testing.T) {
 	}
 }
 
+func TestCronTaskSkill_CreateToleratesLLMArgumentDrift(t *testing.T) {
+	fake := &fakeCronScheduler{}
+	s := NewCronTaskSkill(fake, "")
+
+	_, err := s.Execute(context.Background(), map[string]any{
+		"action":      "create",
+		"title":       "百度热搜采集",
+		"description": "每天早上9点采集百度热搜榜并写入知识库",
+		"schedule":    "每天早上9点",
+	})
+	if err != nil {
+		t.Fatalf("LLM 参数轻微漂移不应导致创建失败: %v", err)
+	}
+	if fake.addReq == nil {
+		t.Fatal("未调用 AddJobFromPrompt")
+	}
+	if fake.addReq.Name != "百度热搜采集" {
+		t.Fatalf("name 未从 title 别名提取: %#v", fake.addReq)
+	}
+	if fake.addReq.Prompt != "每天早上9点采集百度热搜榜并写入知识库" {
+		t.Fatalf("prompt 未从 description 别名提取: %#v", fake.addReq)
+	}
+	if fake.addReq.Schedule != "0 9 * * *" {
+		t.Fatalf("自然语言 schedule 未规范化: %#v", fake.addReq)
+	}
+}
+
+func TestCronTaskSkill_CreateDefaultsPromptFromNameWhenModelOmitsPrompt(t *testing.T) {
+	fake := &fakeCronScheduler{}
+	s := NewCronTaskSkill(fake, "")
+
+	_, err := s.Execute(context.Background(), map[string]any{
+		"action":   "create",
+		"name":     "百度热搜采集",
+		"schedule": "0 9 * * *",
+	})
+	if err != nil {
+		t.Fatalf("name+schedule 已足够表达任务时不应因 prompt 缺失失败: %v", err)
+	}
+	if fake.addReq == nil {
+		t.Fatal("未调用 AddJobFromPrompt")
+	}
+	if fake.addReq.Prompt != "百度热搜采集" {
+		t.Fatalf("缺 prompt 时应退回 name: %#v", fake.addReq)
+	}
+}
+
 func TestCronTaskSkill_CreateErrorWrapped(t *testing.T) {
 	s := NewCronTaskSkill(&fakeCronScheduler{addErr: errors.New("compile boom")}, "")
 	_, err := s.Execute(context.Background(), map[string]any{

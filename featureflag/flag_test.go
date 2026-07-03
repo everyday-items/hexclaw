@@ -139,21 +139,33 @@ func TestContext_WithFromEnabled(t *testing.T) {
 	}
 }
 
-// ctx 未注入 fallback Disabled
-func TestContext_DisabledFallback(t *testing.T) {
-	if Enabled(context.Background(), "anything") {
-		t.Fatal("ctx 没注入应 fail-closed OFF")
+// ctx 未注入时 fail-closed，未注册 flag 仍 OFF。
+func TestContext_DefaultFallback(t *testing.T) {
+	ResetForTest()
+	defer ResetForTest()
+	Register(Flag{Name: "ga_default_on", Default: true, Stage: StageGA})
+	Register(Flag{Name: "alpha_default_true", Default: true, Stage: StageAlpha})
+
+	if Enabled(context.Background(), "ga_default_on") {
+		t.Fatal("ctx 没注入时应 fail-closed，即使 GA default=true")
 	}
-	if Enabled(nil, "x") {
-		t.Fatal("nil ctx 也应 OFF")
+	if Enabled(context.Background(), "alpha_default_true") {
+		t.Fatal("Alpha 仍应按有效默认值关闭")
+	}
+	if Enabled(nil, "missing") {
+		t.Fatal("未注册 flag 仍应 OFF")
 	}
 }
 
-// nil Flags 不破坏 ctx
+// nil Flags 不破坏 ctx，仍走 fail-closed fallback。
 func TestContext_WithNilNoop(t *testing.T) {
+	ResetForTest()
+	defer ResetForTest()
+	Register(Flag{Name: "nil_noop_default_on", Default: true, Stage: StageGA})
+
 	ctx := WithContext(context.Background(), nil)
-	if Enabled(ctx, "x") {
-		t.Fatal("nil Flags 注入应 fallback OFF")
+	if Enabled(ctx, "nil_noop_default_on") {
+		t.Fatal("nil Flags 注入应 fallback 到 fail-closed")
 	}
 }
 

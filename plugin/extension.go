@@ -1,4 +1,4 @@
-// extension.go 实现 v0.4.0 H5 Plugin / Extension System v1（feature-flag gated）。
+// extension.go 实现 v0.4.0 H5 Plugin / Extension System v1（默认启用，可由 feature flag 关闭）。
 //
 // 现状：plugin/plugin.go 提供 SkillPlugin/AdapterPlugin/HookPlugin 三种 plugin
 // 类型，但缺少：
@@ -20,15 +20,15 @@ import (
 	"github.com/hexagon-codes/hexclaw/featureflag"
 )
 
-// FlagPluginExtensionV1 控制 H5 Manifest 校验 + 沙箱是否生效。
+// FlagPluginExtensionV1 控制 H5 Manifest 校验 + 扩展上下文是否生效。
 const FlagPluginExtensionV1 = "plugin.extension.v1"
 
 func init() {
 	featureflag.Register(featureflag.Flag{
 		Name:         FlagPluginExtensionV1,
-		Default:      true, // alpha 强制 OFF
+		Default:      true,
 		Description:  "Validate plugin Manifest (version / capabilities) and apply ExtensionContext sandbox.",
-		Stage:        featureflag.StageAlpha,
+		Stage:        featureflag.StageGA,
 		SinceVersion: "0.4.0",
 	})
 }
@@ -129,11 +129,11 @@ func ValidateManifest(m Manifest, hostVersion string) error {
 // 调用方加新 capability 必须同步更新这个表，避免 plugin 静默使用未审计能力。
 func knownCapabilities() map[Capability]bool {
 	return map[Capability]bool{
-		CapReadSkills:  true,
-		CapEmitEvents:  true,
-		CapNetwork:     true,
-		CapFileRead:    true,
-		CapFileWrite:   true,
+		CapReadSkills: true,
+		CapEmitEvents: true,
+		CapNetwork:    true,
+		CapFileRead:   true,
+		CapFileWrite:  true,
 	}
 }
 

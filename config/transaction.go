@@ -1,21 +1,21 @@
 // transaction.go 实现 v0.4.0 F9+G4 配置事务热加载（feature-flag gated）。
 //
 // 设计取舍：
-//   *必须事务化*。半成品热加载（fsnotify → 直接写运行时）会引入：
-//     - 部分 service 已 reload、其它没有，配置漂移
-//     - validate 失败但写入已生效，无法回滚
-//     - 多并发写入互相覆盖
-//   F9+G4 要求 OnChange / DryRun / Rollback 完整三件套，不接受简单 fsnotify watcher。
+//
+//	*必须事务化*。半成品热加载（fsnotify → 直接写运行时）会引入：
+//	  - 部分 service 已 reload、其它没有，配置漂移
+//	  - validate 失败但写入已生效，无法回滚
+//	  - 多并发写入互相覆盖
+//	F9+G4 要求 OnChange / DryRun / Rollback 完整三件套，不接受简单 fsnotify watcher。
 //
 // 事务三段：
-//   1. Begin       — 抢占全局事务锁；只允许同时一个事务
-//   2. Stage(cfg)  — 把候选 cfg 喂给所有 Validator 做 DryRun，任一失败即 Stage 失败
-//   3. Commit      — DryRun 全过后调每个 Applier.Apply；任一失败立即按已 Apply 的逆序
-//                    调 Rollback，恢复到 Begin 时的快照
-//   4. （手动）Rollback — 调用方在 Commit 之前主动放弃，丢弃 Stage 数据
+//  1. Begin       — 抢占全局事务锁；只允许同时一个事务
+//  2. Stage(cfg)  — 把候选 cfg 喂给所有 Validator 做 DryRun，任一失败即 Stage 失败
+//  3. Commit      — DryRun 全过后调每个 Applier.Apply；任一失败立即按已 Apply 的逆序
+//     调 Rollback，恢复到 Begin 时的快照
+//  4. （手动）Rollback — 调用方在 Commit 之前主动放弃，丢弃 Stage 数据
 //
-// flag config.tx.hotload.v1：alpha 默认 OFF。flag 关闭时 Begin 直接返回 ErrTxDisabled，
-// 调用方必须用静态加载 / 重启路径，避免半成品状态。
+// flag config.tx.hotload.v1 默认 ON。关闭时 Begin 直接返回 ErrTxDisabled。
 package config
 
 import (
@@ -35,9 +35,9 @@ const FlagConfigTxHotloadV1 = "config.tx.hotload.v1"
 func init() {
 	featureflag.Register(featureflag.Flag{
 		Name:         FlagConfigTxHotloadV1,
-		Default:      true, // alpha 强制 OFF
+		Default:      true,
 		Description:  "Enable transactional config hot-reload (Begin → Stage → Validate → Apply → Commit/Rollback). Disables ad-hoc fsnotify reload.",
-		Stage:        featureflag.StageAlpha,
+		Stage:        featureflag.StageGA,
 		SinceVersion: "0.4.0",
 	})
 }

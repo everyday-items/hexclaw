@@ -7,9 +7,7 @@
 //   - OnServerConnected(ctx, name, tools)：连接成功 / 重连成功后触发
 //   - OnServerDisconnected(ctx, name, reason)：主动 Close 或检测到断连后触发
 //
-// hook 列表 + 调度只在 feature flag mcp.lifecycle.v2 开启时生效。flag 关闭时
-// AddLifecycleHook 仍然记录 hook（以便 flag 后续被打开后立即生效），但 trigger
-// 时不会调用任何 hook —— 所以引入 hook 不会改变 v0.3 默认行为。
+// hook 列表 + 调度通过 feature flag mcp.lifecycle.v2 控制，默认开启。
 package mcp
 
 import (
@@ -20,15 +18,15 @@ import (
 	"github.com/hexagon-codes/hexclaw/featureflag"
 )
 
-// FlagMCPLifecycleV2 控制 H3 lifecycle hook 是否生效。alpha 默认 OFF。
+// FlagMCPLifecycleV2 控制 H3 lifecycle hook 是否生效。
 const FlagMCPLifecycleV2 = "mcp.lifecycle.v2"
 
 func init() {
 	featureflag.Register(featureflag.Flag{
 		Name:         FlagMCPLifecycleV2,
-		Default:      true, // alpha 强制 OFF
+		Default:      true,
 		Description:  "Enable MCP server lifecycle hooks (OnServerConnected / OnServerDisconnected) and dynamic Register/Unregister APIs.",
-		Stage:        featureflag.StageAlpha,
+		Stage:        featureflag.StageGA,
 		SinceVersion: "0.4.0",
 	})
 }

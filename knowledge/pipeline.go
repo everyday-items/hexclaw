@@ -1,4 +1,4 @@
-// pipeline.go 实现 v0.4.0 H7 RAG 完整 pipeline（feature-flag gated）。
+// pipeline.go 实现 v0.4.0 H7 RAG 完整 pipeline（默认启用，可由 feature flag 关闭）。
 //
 // 现状 knowledge.Manager.Search 已经做了"hybrid + MMR"召回，但 RAG 的完整链
 // （查询改写 / 重排 / context 拼装 / 答案生成）还散在各调用方手写。H7 把这
@@ -13,7 +13,7 @@
 //  4. ContextBuilder     — 把 chunks 拼成 prompt 用 context（含分隔符 / 引用 ID）
 //  5. Answerer           — 把 context 喂给 LLM 生成最终答案；可空（让调用方自己组 prompt）
 //
-// flag rag.pipeline.v1 控制是否启用。flag 关闭时 RunRAG 立即返回 ErrPipelineDisabled，
+// flag rag.pipeline.v1 控制是否启用。默认开启；显式关闭时 RunRAG 立即返回 ErrPipelineDisabled，
 // 调用方应直接用 Manager.Query / Search 老 API。
 package knowledge
 
@@ -34,13 +34,13 @@ const FlagRAGPipelineV1 = "rag.pipeline.v1"
 func init() {
 	featureflag.Register(featureflag.Flag{
 		Name:    FlagRAGPipelineV1,
-		Default: false,
+		Default: true,
 		// 说明（去除旧版"看似启用实则空转"的假象）：
 		// 默认检索全链路（查询扩展 → 宽召回 → RRF 融合 → 相关度地板 → LLM 重排）
 		// 已无条件落在 Manager.searchResults，与本 flag 无关、始终生效。
-		// 本 flag 仅控制可选的「可组合 Pipeline 编排门面」(Pipeline.RunRAG)，默认关闭。
-		Description:  "Opt-in composable RAG pipeline façade (Pipeline.RunRAG). The default retrieval path (query-expansion → wide recall → RRF → min-score floor → LLM rerank) always runs in Manager.searchResults regardless of this flag.",
-		Stage:        featureflag.StageBeta,
+		// 本 flag 仅控制可选的「可组合 Pipeline 编排门面」(Pipeline.RunRAG)，默认开启。
+		Description:  "Composable RAG pipeline façade (Pipeline.RunRAG), enabled by default. The default retrieval path (query-expansion → wide recall → RRF → min-score floor → LLM rerank) always runs in Manager.searchResults regardless of this flag.",
+		Stage:        featureflag.StageGA,
 		SinceVersion: "0.4.0",
 	})
 }
@@ -89,7 +89,7 @@ type PipelineResult struct {
 }
 
 // ErrPipelineDisabled 在 flag OFF 时返回，调用方据此 fallback。
-var ErrPipelineDisabled = errors.New("RAG pipeline disabled (flag rag.pipeline.v1 OFF)")
+var ErrPipelineDisabled = errors.New("RAG pipeline disabled (flag rag.pipeline.v1 off)")
 
 // RunRAG 执行 5 阶段流水线。任一阶段返回 error 立即短路。
 func (p *Pipeline) RunRAG(ctx context.Context, query string, topK int) (*PipelineResult, error) {

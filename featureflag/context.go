@@ -16,7 +16,7 @@ func WithContext(ctx context.Context, f Flags) context.Context {
 	return context.WithValue(ctx, ctxKey{}, f)
 }
 
-// FromContext 从 ctx 取出 Flags；未注入时返回 Disabled（全 OFF fallback）。
+// FromContext 从 ctx 取出 Flags；未注入时 fail-closed。
 func FromContext(ctx context.Context) Flags {
 	if ctx == nil {
 		return Disabled

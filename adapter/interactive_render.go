@@ -7,7 +7,7 @@
 //   - Telegram → Inline Keyboard
 //   - 其它（不支持原生交互的平台）→ 降级为"1) 是  2) 不是"文本提示
 //
-// flag interactive.render.v1 默认 OFF。flag 关闭时 RenderTextFallback 永远生效，
+// flag interactive.render.v1 默认 ON。flag 关闭时 RenderTextFallback 永远生效，
 // 各 IM 适配器走文本 fallback；flag 开启后调用方可在适配器里 switch payload.Type
 // 调对应 RenderXxx 平台原生 API。
 //
@@ -23,15 +23,15 @@ import (
 	"github.com/hexagon-codes/hexclaw/featureflag"
 )
 
-// FlagInteractiveRenderV1 控制 F6 跨平台 renderer 是否启用原生路径。alpha 默认 OFF。
+// FlagInteractiveRenderV1 控制 F6 跨平台 renderer 是否启用原生路径。
 const FlagInteractiveRenderV1 = "interactive.render.v1"
 
 func init() {
 	featureflag.Register(featureflag.Flag{
 		Name:         FlagInteractiveRenderV1,
-		Default:      true, // alpha 强制 OFF
+		Default:      true,
 		Description:  "Render InteractivePayload to native IM components (cards / Block Kit / Embed / Inline KB). flag OFF uses text fallback.",
-		Stage:        featureflag.StageAlpha,
+		Stage:        featureflag.StageGA,
 		SinceVersion: "0.4.0",
 	})
 }
@@ -131,13 +131,25 @@ func ShouldUseNativeRenderer(flags featureflag.Flags) bool {
 }
 
 // MaybeApplyTextFallback 在 IM 适配器 Send 入口调用：当 reply 含 InteractivePayload
-// 且 flag OFF（或平台未实现原生 renderer）时，把 RenderTextFallback 结果追加到
-// reply.Content 末尾，使按钮 / 选项 / 审批 / 卡片在所有平台基础可用。
+// 且 flag OFF 时，把 RenderTextFallback 结果追加到 reply.Content 末尾，使按钮 / 选项 /
+// 审批 / 卡片在所有平台基础可用。
 //
 // 行为：
 //   - reply == nil 或 reply.Interactive == nil：no-op，返回 false
-//   - flag interactive.render.v1 ON：no-op（让适配器自行调原生 renderer），返回 false
+//   - flag interactive.render.v1 ON：no-op，返回 false
 //   - flag OFF：追加文本 fallback 到 reply.Content（保留 \n\n 分隔），返回 true
+//
+// 现状说明（查证 2026-07-02）：flag interactive.render.v1 已 GA=ON，但当前生态里
+// **没有任何适配器实现 PayloadRenderer 原生渲染**（6 个 IM 适配器只有本 fallback 一条路），
+// 且 **没有任何生产路径填充 reply.Interactive** —— 唯一的填充点是 K12 识题确认
+// （buildInteractivePayload 命中 metadata.expect_question_confirm），而该触发器目前无生产
+// 生产者接线（仅测试用；见 engine/react.go 的 TODO E6/v0.4.0）。因此 flag ON 下的 no-op
+// 此刻不会静默丢弃任何东西，不是运行时 bug。
+//
+// ⚠ 潜在陷阱：一旦有人给 reply.Interactive 接上生产生产者（如 E6 触发器），而此时上述
+// 6 个适配器仍无原生 renderer，则 payload 会被本 no-op 静默吞掉。届时必须二选一：给对应
+// 适配器落地原生 renderer，或把本 fallback 语义改为「仅在适配器已有原生 renderer 时才
+// no-op」（renderer-less 适配器继续走文本 fallback）。
 //
 // 不修改 reply.Interactive（保留以便上层观察 / persistence）。
 func MaybeApplyTextFallback(ctx context.Context, reply *Reply) bool {

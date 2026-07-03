@@ -15,12 +15,12 @@ import (
 
 // ShellSkill Shell 命令执行 Skill
 //
-// 在受限环境中执行 Shell 命令。安全措施：
-//   - 命令白名单（仅允许安全的只读/计算类命令）
+// 执行 Shell 命令。功能优先：不做命令白名单拦截，避免正常工程任务、
+// 脚本、包管理、测试命令被默认阻断；仍保留超时和输出截断。
 //   - 超时限制（默认 30 秒）
 //   - 输出大小限制（最大 64KB）
 //   - 环境变量清洗
-//   - 配置开关（默认关闭）
+//   - 配置开关（默认开启）
 type ShellSkill struct {
 	timeout time.Duration
 }
@@ -70,10 +70,9 @@ func (s *ShellSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 		return &skill.Result{Content: "请提供要执行的命令"}, nil
 	}
 
-	// 安全检查：白名单模式
 	if reason := checkAllowed(command); reason != "" {
 		return &skill.Result{
-			Content:  fmt.Sprintf("**安全拦截**: %s\n\n仅允许安全的只读命令。", reason),
+			Content:  fmt.Sprintf("**执行被配置拦截**: %s", reason),
 			Metadata: map[string]string{"status": "blocked"},
 		}, nil
 	}
@@ -144,7 +143,10 @@ func extractShellCommand(input string) string {
 	return strings.TrimSpace(input)
 }
 
-// allowedCommands 白名单：仅允许真正只读/无副作用的命令
+// allowedCommands 是旧白名单实现遗留数据，默认功能优先路径不使用。
+// 保留它是为了未来显式 strict profile 可复用。
+//
+// 旧白名单：仅允许真正只读/无副作用的命令
 //
 // 已移除所有具有写能力或数据窃取风险的命令：
 //
@@ -202,60 +204,12 @@ func checkFindFlags(segment string) string {
 	return ""
 }
 
-// checkAllowed 白名单安全检查
-//
-// 只允许白名单中的命令，拒绝所有其他命令。
-// 同时拦截管道链中的任何非白名单命令和危险模式。
+// checkAllowed 保留为配置扩展点。默认功能优先：只拒绝空命令，不对白名单、
+// 重定向、脚本语言、包管理、git 写操作等做硬拦截。
 func checkAllowed(command string) string {
-	lower := strings.TrimSpace(command)
-	if lower == "" {
+	if strings.TrimSpace(command) == "" {
 		return "命令为空"
 	}
-
-	// 拦截危险字符/模式（命令替换、eval 等）
-	if reason := checkDangerousPatterns(lower); reason != "" {
-		return reason
-	}
-
-	// 按管道和分号拆分，每段都必须通过白名单
-	segments := splitCommandSegments(lower)
-	for _, seg := range segments {
-		seg = strings.TrimSpace(seg)
-		if seg == "" {
-			continue
-		}
-		cmd := extractBaseCommand(seg)
-		if cmd == "" {
-			continue
-		}
-		if !allowedCommands[cmd] {
-			return fmt.Sprintf("命令 %q 不在白名单中", cmd)
-		}
-		if cmd == "find" {
-			if reason := checkFindFlags(seg); reason != "" {
-				return reason
-			}
-		}
-		// 检查子命令限制
-		if blocked, ok := dangerousSubcommands[cmd]; ok {
-			rest := strings.TrimSpace(seg[len(cmd):])
-			// 提取实际子命令：跳过所有 flag（以 - 开头的 token）
-			parts := strings.Fields(rest)
-			subcommand := ""
-			for _, p := range parts {
-				if !strings.HasPrefix(p, "-") {
-					subcommand = p
-					break
-				}
-			}
-			for _, sub := range blocked {
-				if subcommand == sub || strings.HasPrefix(rest, sub) {
-					return fmt.Sprintf("命令 %s %s 被禁止", cmd, sub)
-				}
-			}
-		}
-	}
-
 	return ""
 }
 

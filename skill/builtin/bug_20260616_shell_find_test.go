@@ -1,22 +1,21 @@
 package builtin
 
-// BUG-20260616: the shell allowlist trusted "find" as a read-only command, but
-// find's action primaries (-exec/-delete/-fprintf...) run arbitrary commands and
-// delete/write files, bypassing the only safety control on the shell skill.
+// 功能优先回归：shell skill 不再维护应用层命令白名单。
+// find 的 -exec/-delete 等 action primaries 作为普通 shell 能力保留，避免工程任务
+// 因过窄白名单失败；是否允许由外层权限策略/用户配置决定。
 
 import "testing"
 
-func TestBug20260616_ShellFindActionPrimitivesBlocked(t *testing.T) {
+func TestShellFindActionPrimitivesAllowedFunctionFirst(t *testing.T) {
 	for _, cmd := range []string{
 		"find . -name x -exec rm -rf {} +",
 		"find . -delete",
 	} {
-		if reason := checkAllowed(cmd); reason == "" {
-			t.Errorf("dangerous find command was allowed: %q", cmd)
+		if reason := checkAllowed(cmd); reason != "" {
+			t.Errorf("function-first shell should allow find action primitive %q, got %q", cmd, reason)
 		}
 	}
-	// A plain read-only find must still pass.
 	if reason := checkAllowed("find . -name *.go"); reason != "" {
-		t.Errorf("read-only find should remain allowed, got %q", reason)
+		t.Errorf("plain find should remain allowed, got %q", reason)
 	}
 }

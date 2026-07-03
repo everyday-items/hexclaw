@@ -1,16 +1,17 @@
-// dispatcher.go 实现 v0.4.0 G1 Agent factory 真接入 hexagon（feature-flag gated）。
+// dispatcher.go 实现 v0.4.0 G1 Agent factory 真接入 hexagon（默认启用，可由 feature flag 关闭）。
 //
 // HexClaw 的 ReActEngine 历来直接调用 hexagon.Provider.Stream/Complete，自己跑工具
 // 循环 —— 没有真用 hexagon.Agent / hexagon.Team 的高阶 Agent 抽象。本包之前的
 // agents/factory.go 已提供 Factory.CreateAgent，但只在 orchestrator 子任务里被用到。
 //
 // G1 把"真正调度到 hexagon.Agent.Invoke"封装成 Dispatcher 抽象，挂 feature flag
-// agent.factory.real：flag OFF 时 Dispatcher.Dispatch 立即返回 ErrDispatchDisabled，
+// agent.factory.real：默认 ON；显式 OFF 时 Dispatcher.Dispatch 立即返回 ErrDispatchDisabled，
 // 调用方走原 ReActEngine 路径；flag ON 时通过 factory 创建 Agent 并 Invoke 真执行。
 //
 // 这给后续 v0.4.x / v0.5 阶段把"特定角色 / 特定模式"逐步迁到 hexagon Agent 留好扩展点：
 //   - Researcher / Writer 协作链 → 用 hexagon.Team
 //   - Reflection / Self-Discovery 模式 → 用对应 hexagon.Agent 实现
+//
 // 真做这些迁移会触及 react.go 主流程（intricate），所以 v0.4.0 阶段仅落基建。
 package agents
 
@@ -24,15 +25,15 @@ import (
 	"github.com/hexagon-codes/hexclaw/featureflag"
 )
 
-// FlagAgentFactoryReal 控制 G1 dispatch 是否生效。alpha 强制 OFF。
+// FlagAgentFactoryReal 控制 G1 dispatch 是否生效。
 const FlagAgentFactoryReal = "agent.factory.real"
 
 func init() {
 	featureflag.Register(featureflag.Flag{
 		Name:         FlagAgentFactoryReal,
-		Default:      true, // alpha 强制 OFF
+		Default:      true,
 		Description:  "Allow engine to dispatch tasks to a real hexagon.Agent (Factory.CreateAgent + Invoke) instead of inline ReAct loop.",
-		Stage:        featureflag.StageAlpha,
+		Stage:        featureflag.StageGA,
 		SinceVersion: "0.4.0",
 	})
 }
@@ -90,4 +91,4 @@ func (d *HexagonDispatcher) Dispatch(ctx context.Context, role, query string) (s
 }
 
 // ErrDispatchDisabled 在 flag OFF 时返回，调用方应据此回退到 ReActEngine 路径。
-var ErrDispatchDisabled = errors.New("hexagon agent dispatch disabled (flag agent.factory.real OFF)")
+var ErrDispatchDisabled = errors.New("hexagon agent dispatch disabled (flag agent.factory.real off)")

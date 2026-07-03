@@ -71,14 +71,44 @@ func statusSort(items []FlagStatus) {
 	}
 }
 
-// ============== 不变 fallback ==============
+// ============== fallback 实现 ==============
+
+type defaultFlags struct{}
+
+func (defaultFlags) IsEnabled(name string) bool {
+	f, ok := Lookup(name)
+	if !ok {
+		return false
+	}
+	return f.effectiveDefault()
+}
+
+func (defaultFlags) Snapshot() []FlagStatus {
+	flags := Registered()
+	out := make([]FlagStatus, 0, len(flags))
+	for _, f := range flags {
+		out = append(out, FlagStatus{
+			Name:         f.Name,
+			Enabled:      f.effectiveDefault(),
+			Default:      f.effectiveDefault(),
+			UserOverride: false,
+			Description:  f.Description,
+			Stage:        f.Stage,
+			SinceVersion: f.SinceVersion,
+		})
+	}
+	statusSort(out)
+	return out
+}
+
+// Defaults 按全局注册表的有效默认值查询。仅供显式需要注册默认值的调用方使用；
+// featureflag.FromContext 在缺失 Flags 时仍 fail-closed。未注册 flag 返回 false。
+var Defaults Flags = defaultFlags{}
 
 type disabledFlags struct{}
 
-func (disabledFlags) IsEnabled(string) bool      { return false }
-func (disabledFlags) Snapshot() []FlagStatus     { return nil }
+func (disabledFlags) IsEnabled(string) bool  { return false }
+func (disabledFlags) Snapshot() []FlagStatus { return nil }
 
-// Disabled 是全 OFF 的 fallback 实现。ctx 没注入 Flags 时使用。
-//
-// 这保证 fail-closed 语义：缺失 wiring 不会让新功能"意外启用"。
+// Disabled 是显式全 OFF 实现。测试或回退路径需要强制关闭所有功能时注入它。
 var Disabled Flags = disabledFlags{}

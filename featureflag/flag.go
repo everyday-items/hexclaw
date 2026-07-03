@@ -12,7 +12,7 @@
 //     实现允许修改。
 //
 //   - **ctx 友好**：调用方通过 featureflag.Enabled(ctx, "name") 查询，避免到处传 Flags
-//     实例。Disabled fallback 在 ctx 没注入 Flags 时全 OFF（fail-closed）。
+//     实例。ctx 没注入 Flags 时 fail-closed；生产入口必须显式注入 Static。
 //
 //   - **可观测**：Snapshot 返回所有 flag 当前状态（含 user override / default / stage），
 //     桌面端 Settings 页直接渲染。
@@ -23,8 +23,8 @@
 //	func init() {
 //	    featureflag.Register(featureflag.Flag{
 //	        Name:         "agent_factory_v2",
-//	        Default:      false,
-//	        Stage:        featureflag.StageAlpha,
+//	        Default:      true,
+//	        Stage:        featureflag.StageGA,
 //	        Description:  "Agent factory 真接入 hexagon（替代 prompt overlay）",
 //	        SinceVersion: "0.4.0",
 //	    })

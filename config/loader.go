@@ -22,7 +22,7 @@ func configDir() (string, error) {
 // Load 加载配置
 //
 // 加载顺序：
-//  1. 从安全默认值开始
+//  1. 从功能优先默认值开始
 //  2. 如果指定了 configFile 则从文件加载覆盖
 //  3. 否则尝试从 ~/.hexclaw/hexclaw.yaml 加载
 //  4. 环境变量展开（${VAR_NAME} 替换为环境变量值）
@@ -318,6 +318,15 @@ security:
   rate_limit:
     requests_per_minute: 20
     requests_per_hour: 200
+  autonomy:
+    # function_first(default) / balanced / strict / full_access
+    profile: "function_first"
+    # 可选显式覆盖；值支持类别、精确工具名、glob 或 "*"。
+    # 类别：read,browser,exec_sandboxed,exec_host,files,automation,delivery,media,heal,capability,publish
+    #   exec_sandboxed=沙箱执行(code_exec)；exec_host=宿主直执行(shell/code)。
+    # system_dispatch:
+    #   webhook: ["read", "browser", "exec_sandboxed", "files", "delivery", "media", "capability"]
+    #   workflow: ["read", "browser", "exec_sandboxed", "exec_host", "files", "automation", "delivery", "media", "heal"]
 
 # Skill 配置
 skill:

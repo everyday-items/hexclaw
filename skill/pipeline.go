@@ -5,13 +5,13 @@
 // 的 lifecycle 模型，让上层（agent / event 系统）可观察每一段。
 //
 // 7 阶段：
-//   1. Discovery：按 query+activation 从 registry 召回候选
-//   2. Activation：再次确认 when/not_when 满足（兜底，registry 已过滤）
-//   3. Loading：通过 ContentLoader 加载完整 Prompt（内置 Skill 退化为 Description）
-//   4. Verification：调用 ContentVerifier（如 MarkdownSkill.VerifyContent）做 TOCTOU 校验
-//   5. Execution：Skill.Execute 真执行
-//   6. Persistence：把 trace（input/output/duration/error）持久化
-//   7. Improvement：基于结果触发评分 / 组合学习（外部 hook 注入）
+//  1. Discovery：按 query+activation 从 registry 召回候选
+//  2. Activation：再次确认 when/not_when 满足（兜底，registry 已过滤）
+//  3. Loading：通过 ContentLoader 加载完整 Prompt（内置 Skill 退化为 Description）
+//  4. Verification：调用 ContentVerifier（如 MarkdownSkill.VerifyContent）做 TOCTOU 校验
+//  5. Execution：Skill.Execute 真执行
+//  6. Persistence：把 trace（input/output/duration/error）持久化
+//  7. Improvement：基于结果触发评分 / 组合学习（外部 hook 注入）
 //
 // 不做向量召回：Discovery 仍走现有关键词打分（select.go）。向量推迟到 v0.4.x 后续。
 //
@@ -27,15 +27,15 @@ import (
 	"github.com/hexagon-codes/hexclaw/featureflag"
 )
 
-// FlagSkillPipelineV1 控制 G2 Skill Pipeline 是否启用。alpha 默认 OFF。
+// FlagSkillPipelineV1 控制 G2 Skill Pipeline 是否启用。
 const FlagSkillPipelineV1 = "skill.pipeline.v1"
 
 func init() {
 	featureflag.Register(featureflag.Flag{
 		Name:         FlagSkillPipelineV1,
-		Default:      true, // alpha 强制 OFF
+		Default:      true,
 		Description:  "Run skill execution through the v0.4.0 7-phase pipeline (Discovery → Activation → Loading → Verification → Execution → Persistence → Improvement).",
-		Stage:        featureflag.StageAlpha,
+		Stage:        featureflag.StageGA,
 		SinceVersion: "0.4.0",
 	})
 }
@@ -98,21 +98,21 @@ type ExecutionTrace struct {
 
 // PipelineOptions 控制单次 pipeline 执行的依赖注入与查询参数。
 type PipelineOptions struct {
-	Query           string                 // 用于 Discovery（关键词召回）
-	Activation      Activation             // 用于 Activation 兜底
-	TopK            int                    // Discovery Top-K，<=0 时 1
-	Args            map[string]any         // 传给 Skill.Execute
-	Observer        PhaseObserver          // 可空
-	OnPersist       PersistenceHook        // 可空
-	OnImprove       ImprovementHook        // 可空
+	Query      string          // 用于 Discovery（关键词召回）
+	Activation Activation      // 用于 Activation 兜底
+	TopK       int             // Discovery Top-K，<=0 时 1
+	Args       map[string]any  // 传给 Skill.Execute
+	Observer   PhaseObserver   // 可空
+	OnPersist  PersistenceHook // 可空
+	OnImprove  ImprovementHook // 可空
 }
 
 // PipelineResult 是 7 阶段执行的最终结果。
 type PipelineResult struct {
-	Skill        Skill
-	Result       *Result
-	Trace        ExecutionTrace
-	PhasesDone   []Phase
+	Skill      Skill
+	Result     *Result
+	Trace      ExecutionTrace
+	PhasesDone []Phase
 }
 
 // RunPipeline 在给定 registry 上执行 7 阶段流水线，命中第一个候选 Skill。
