@@ -43,11 +43,8 @@ HexClaw includes a 6-layer security gateway:
 - `isLogsAPI` uses exact prefix `/api/v1/logs` to avoid matching `/api/v1/login` etc.
 
 ### Shell Skill
-- **White-list only** command execution model
-- Dangerous commands (`rm`, `sudo`, `python3`, `perl`, `node`, etc.) permanently blocked
-- Git write subcommands (`push`, `clone`, `pull`, `commit`, etc.) blocked
-- `curl` write flags (`-o`, `-O`, `--output`) blocked
-- Dangerous patterns blocked: backticks, `$()`, `eval`, redirects (`>`, `>>`), `&&`, `||`
+- Function-first command execution model
+- No default command whitelist: scripts, package managers, git commands, redirects, and pipelines are allowed unless an explicit operator policy blocks them
 - Environment variables sanitized (only `PATH`, `HOME`, `LANG`)
 - 30-second execution timeout, 64KB output limit
 
@@ -60,11 +57,11 @@ HexClaw includes a 6-layer security gateway:
 
 ### Tool Permission & Unattended Gate
 - A single declarative `PermissionPolicy` gates every tool call (GA). Capability-mutating tools — `manage_skill`, `create_skill`, `patch_skill`, `manage_skill_pending`, `manage_mcp_server` — and consequential actions (`send_message`, `media_generate`, `publish_*`, `shell`, `code`, `browser`, `file_edit`) **require approval**; unmatched tools default to allow.
-- **Unattended dispatches** (cron / webhook / spawn / heartbeat) have no interactive approver. Resolution order:
-  1. A read/collect allowlist (`search`, `web_search`, `knowledge_ingest`, `browser`; plus `cron_task` for cron only) auto-runs.
-  2. **Exec + capability/host-mutation tools hard-deny** — `shell`/`code`/`code_exec` and `create_skill`/`manage_skill`/`patch_skill`/`manage_skill_pending`/`manage_mcp_server`/`file_edit` can NEVER auto-run unattended; the LLM risk reviewer **cannot** override them (they require a real interactive approver).
-  3. The remaining delivery actions (`send_message`/`media_generate`/`publish_*`) are routed to a one-shot LLM risk reviewer and **allowed only on a `low` verdict — `medium`/`high`/no-reviewer/parse-error all fail-closed (deny)**.
-- Cron-dispatched agents additionally have self-escalation tools (`cron_task`, `create_skill`, `manage_skill`, `manage_mcp_server`) stripped from their tool set (recursion guard).
+- **Unattended dispatches** (cron / webhook / spawn / heartbeat / workflow) have no interactive approver, so `ActionRequireApproval` is resolved through the `security.autonomy` profile + explicit switch matrix. The default profile is `function_first`; it is not an implicit approve-all mode.
+- Default `function_first` matrix: `cron=[read,browser,exec,files,automation,delivery,media]`, `webhook=[read,browser,exec,files,delivery,media]`, `heartbeat=[read,browser,exec,files,delivery]`, `workflow=[read,browser,exec,files,automation,delivery,media,heal]`, `spawn=[read,exec,files]`, `solve=[]`.
+- Category mapping: `exec=shell/code/code_exec`, `files=file_edit/file_ops`, `automation=cron_task`, `delivery=send_message`, `media=media_generate`, `heal=app_heal`, `capability=create_skill/manage_skill/patch_skill/manage_skill_pending/manage_mcp_server`, `publish=publish_*`. `capability`, `publish`, and forgeable `source=solve` are not auto-approved by default.
+- Explicit `PermissionPolicy` `ActionDeny` still blocks. Operators who need maximum functionality can explicitly set `security.autonomy.profile: full_access` or configure the exact source categories/tools they need. Note that `system_dispatch.<source>` replaces that source's profile default; it does not merge with it.
+- Cron-dispatched agents keep tool visibility; actual execution is decided by `PermissionPolicy` + the autonomy matrix instead of hard-coded tool stripping.
 
 ### Path Traversal Prevention
 - All file operations validate with `filepath.Base()` + absolute path prefix check

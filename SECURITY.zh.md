@@ -43,11 +43,8 @@ HexClaw 包含六层安全网关：
 - `isLogsAPI` 使用精确前缀 `/api/v1/logs`，避免匹配 `/api/v1/login` 等路径
 
 ### Shell 技能
-- **仅白名单**命令执行模式
-- 危险命令（`rm`、`sudo`、`python3`、`perl`、`node` 等）永久封锁
-- Git 写操作子命令（`push`、`clone`、`pull`、`commit` 等）封锁
-- `curl` 写标志（`-o`、`-O`、`--output`）封锁
-- 危险模式封锁：反引号、`$()`、`eval`、重定向（`>`、`>>`）、`&&`、`||`
+- 功能优先命令执行模式
+- 默认不启用命令白名单：脚本、包管理、git 命令、重定向与管道均可执行，除非显式运营策略阻断
 - 环境变量清理（仅保留 `PATH`、`HOME`、`LANG`）
 - 30 秒执行超时，64KB 输出限制
 
@@ -60,11 +57,11 @@ HexClaw 包含六层安全网关：
 
 ### 工具权限与无人值守闸
 - 统一声明式 `PermissionPolicy` 前置闸所有工具调用（GA）。能力变更类工具——`manage_skill`、`create_skill`、`patch_skill`、`manage_skill_pending`、`manage_mcp_server`——与 consequential 动作（`send_message`、`media_generate`、`publish_*`、`shell`、`code`、`browser`、`file_edit`）**需用户审批**；未命中规则的工具默认放行。
-- **无人值守派发**（cron / webhook / spawn / heartbeat）无交互审批人，判定顺序：
-  1. 读取/采集白名单（`search`、`web_search`、`knowledge_ingest`、`browser`；`cron_task` 仅 cron）自动放行。
-  2. **任意代码执行 + 能力/宿主变更类工具硬拒**——`shell`/`code`/`code_exec` 与 `create_skill`/`manage_skill`/`patch_skill`/`manage_skill_pending`/`manage_mcp_server`/`file_edit` 永不能无人值守自动运行，LLM 风险顾问**无权**放行（必须真实交互式人工审批）。
-  3. 其余送达类动作（`send_message`/`media_generate`/`publish_*`）改问一次性 LLM 风险顾问，**仅 `low` 判定放行——`medium`/`high`/无顾问/解析失败一律 fail-closed 拒绝**。
-- cron 派发的 Agent 额外剥离自升级工具（`cron_task`、`create_skill`、`manage_skill`、`manage_mcp_server`），防递归提权。
+- **无人值守派发**（cron / webhook / spawn / heartbeat / workflow）没有交互审批人，因此使用 `security.autonomy` 的 Profile + 显式开关矩阵处理 `ActionRequireApproval`。默认 profile 为 `function_first`，不是“一把梭全开”。
+- 默认 `function_first` 矩阵：`cron=[read,browser,exec,files,automation,delivery,media]`，`webhook=[read,browser,exec,files,delivery,media]`，`heartbeat=[read,browser,exec,files,delivery]`，`workflow=[read,browser,exec,files,automation,delivery,media,heal]`，`spawn=[read,exec,files]`，`solve=[]`。
+- 类别映射：`exec=shell/code/code_exec`，`files=file_edit/file_ops`，`automation=cron_task`，`delivery=send_message`，`media=media_generate`，`heal=app_heal`，`capability=create_skill/manage_skill/patch_skill/manage_skill_pending/manage_mcp_server`，`publish=publish_*`。默认不自动放行 `capability`、`publish` 和伪造的 `source=solve`。
+- 显式 `PermissionPolicy` `ActionDeny` 仍会阻断，保证运营配置的硬拒绝优先；需要极限功能最大化时可显式设置 `security.autonomy.profile: full_access`，或只给某个来源配置类别/工具。注意：`system_dispatch.<source>` 是替换该来源的 profile 默认值，不是增量合并。
+- cron 派发的 Agent 默认保留工具可见性；最终是否执行由 `PermissionPolicy` + autonomy 矩阵裁决，而不是硬编码剥离。
 
 ### 路径遍历防护
 - 所有文件操作通过 `filepath.Base()` + 绝对路径前缀检查进行验证

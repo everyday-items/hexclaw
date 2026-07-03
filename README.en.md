@@ -34,7 +34,7 @@ Ready-to-use built-in skills (no install required, invoked via LLM tool_call):
 | `translate` | Translate text (Chinese ↔ English) |
 | `summary` | Summarize text content |
 | `browser` | Fetch web pages, extract content, and submit forms |
-| `code` / `code_exec` | Execute code snippets (Go/Python/JavaScript) and return output |
+| `code` / `code_exec` | Execute code snippets (Go/Python/JavaScript) inside the HexClaw Sandbox and return output |
 | `shell` | Run shell commands and return output |
 | `file_ops` / `file_edit` | Read, write, and edit files in the workspace |
 | `grep` / `glob` | Search file contents by text/regex; find files by name pattern |
@@ -42,11 +42,12 @@ Ready-to-use built-in skills (no install required, invoked via LLM tool_call):
 | `knowledge_ingest_path` | Read each file under a path (directory or glob) and ingest its content into the knowledge base (sandboxed against `..`/symlink escape; capped at 200 files / 2 MiB per file) |
 | `media_generate` | Generate an image (default) or video from a text prompt, persist it, and return a stable file path reusable by export/send/ingest |
 | `export_document` | Render Markdown into a downloadable document (md/html/docx/pdf/epub/odt/rtf/txt) and return its file path |
-| `send_message` | Send a message to a configured channel (feishu/Discord/WeChat/email/Slack/...); a consequential action gated by a confirmation step, backed by an unattended risk review |
+| `send_message` | Send a message to a configured channel (feishu/Discord/WeChat/email/Slack/...); interactive sessions use confirmation, while unattended automation follows the `security.autonomy` matrix |
 | `cron_task` | Create/list/pause/resume/remove app-managed scheduled tasks |
-| `manage_skill` / `manage_mcp` | Search, install, or remove skills / MCP servers from HexClaw Hub |
+| `manage_skill` / `manage_mcp` | Search, install, or remove skills / MCP servers from HexClaw Hub; unattended dispatch does not auto-run these by default unless `capability` is explicitly enabled |
 
-> For unattended (cron) execution of consequential actions such as delivery/publishing, an LLM risk-review gate classifies the action (low/medium/high): fixed high-risk keywords are flagged `high` outright, only `low` is allowed through, and `medium`/`high` plus any classification failure fail closed.
+> Unattended automation (cron/webhook/spawn/heartbeat/workflow) uses a function-first profile plus an explicit switch matrix. The default `function_first` profile auto-approves core work such as `code_exec`, shell, file edits, browsing, knowledge ingest, and delivery. Skill/MCP management, publishing, and forgeable `solve` sources are not auto-approved by default; enable them through `security.autonomy.system_dispatch` or the explicit `full_access` profile. Explicit `PermissionPolicy` deny rules remain authoritative.
+> `system_dispatch.<source>` replaces that source's profile default; it does not merge with it. Use `profile: full_access` when you want a global explicit open mode.
 
 ### Session & Data
 - **Session Management** — Create/query/delete sessions, message history, session forking
@@ -189,6 +190,15 @@ security:
     enabled: true
   pii_redaction:
     enabled: true
+  autonomy:
+    # function_first(default) / balanced / strict / full_access
+    profile: function_first
+    # Optional explicit overrides. Values support categories, exact tool names,
+    # glob patterns, or "*". Categories:
+    # read,browser,exec,files,automation,delivery,media,heal,capability,publish
+    # system_dispatch:
+    #   webhook: [read, browser, exec, files, delivery, media, capability]
+    #   workflow: [read, browser, exec, files, automation, delivery, media, heal]
 
 platforms:
   web:
@@ -247,11 +257,14 @@ knowledge:
   top_k: 3
 
 features:
-  # v0.4 capabilities are alpha-gated and fail-closed unless explicitly enabled.
-  model.gateway.v1: false
-  skill.pipeline.v1: false
-  config.tx.hotload.v1: false
-  events.transport.v1: false
+  # Product capabilities are function-first and enabled by default; override only for rollback/rollout.
+  model.gateway.v1: true
+  skill.pipeline.v1: true
+  config.tx.hotload.v1: true
+  rag.pipeline.v1: true
+  runtime.sandbox.v1: true
+  plugin.extension.v1: true
+  agent.factory.real: true
 
 skill:
   sandbox:
@@ -671,7 +684,7 @@ chore: build/toolchain updates
 **New Features**
 - **At-rest credential encryption** — Platform credentials are sealed on disk with AES-256-GCM (`enc:v1:` envelope, 0600 master key); legacy plaintext rows read back transparently and are backfilled on next write
 - **Prompt-injection scan** — Defense-in-depth scanner at cron-create (strict) and exec assembly time; exfiltration/obfuscation families always strict, instruction-override relaxed only when skills/RAG data are present
-- **Unified permission gate (GA)** — Declarative `PermissionPolicy` is now the single tool-authorization gate, with an unattended LLM risk reviewer replacing the skill-layer confirmer
+- **Unified permission gate (GA)** — Declarative `PermissionPolicy` is now the single tool-authorization gate; unattended dispatch uses the `security.autonomy` profile + explicit matrix
 - **Skill tool palette** — New `export_document` / `knowledge_ingest` / `media_generate` / `send_message` builtin skills
 - **Library memory** — Lightweight prompt/memory store injected per turn
 
@@ -685,14 +698,14 @@ chore: build/toolchain updates
 - **Matrix adapter** — Idempotent Stop, eliminating the double close(closed channel) panic
 - **Knowledge time decay** — Zero-value CreatedAt is no longer decayed to zero (fixes chunks without timestamps never being recalled)
 - **Cron multi-replica** — Atomic DB claim + fencing prevents double-running jobs across replicas; fail-open preserves pure in-memory behavior
-- **Security hardening** — SSRF allows loopback only (blocks metadata and intranet addresses); shell `find -exec` allowlist tightened; file-op symlink boundary protection; WhatsApp webhook signature verification + constant-time comparison for WeChat/WeCom
-- **Unattended privilege escalation (BUG-F1/F-5)** — `manage_skill` is now gated by the baseline policy; exec + capability/host-mutation tools (`shell`/`code`/`create_skill`/`manage_skill`/`manage_mcp_server`/`file_edit`/…) hard-deny under unattended dispatch — the LLM risk reviewer can no longer greenlight them
+- **Security hardening** — SSRF allows loopback only (blocks metadata and intranet addresses); file-op symlink boundary protection; WhatsApp webhook signature verification + constant-time comparison for WeChat/WeCom; shell now follows the function-first execution model
+- **Function-first unattended automation matrix** — Default `function_first` auto-approves core automation such as `code_exec`, shell, file edits, browsing, knowledge ingest, and delivery. Skill/MCP management, publishing, and forgeable `solve` sources are not auto-approved by default; enable them explicitly through `security.autonomy` or `full_access`. Explicit `PermissionPolicy` deny rules still enforce operator hard limits
 - **SSRF reserved ranges (BUG-F4)** — cron Starlark `http_*` now also blocks RFC6598 CGNAT `100.64.0.0/10`, `192.0.0.0/24`, `198.18.0.0/15` (incl. IPv4-mapped IPv6 forms)
 
 ### v0.4.0
 
 **New Features**
-- **Feature flag foundation** — The `features:` config section controls v0.4 capabilities; unknown flags fail closed and alpha flags default off
+- **Feature flag foundation** — The `features:` config section controls rollout-capable features; product features default on, while unknown flags are treated as config mistakes and stay off
 - **Model capability probing** — New `/api/v1/llm/capabilities` and `/probe` endpoints cache model tool-call reliability
 - **Skill lifecycle loop** — Adds the 7-phase Pipeline, `skill_view` progressive disclosure, `.pending` approvals, TrustLevel filtering, and TOCTOU protection
 - **Interactive replies** — `Reply.Interactive` supports buttons/select/approval/card with IM text fallback

@@ -34,7 +34,7 @@
 | `translate` | 翻译文本内容，支持中英互译 |
 | `summary` | 对文本内容进行摘要概括 |
 | `browser` | 网页获取、内容提取和表单提交 |
-| `code` / `code_exec` | 执行代码片段（Go/Python/JavaScript），返回运行结果 |
+| `code` / `code_exec` | 在 HexClaw 沙箱内执行代码片段（Go/Python/JavaScript），返回运行结果 |
 | `shell` | 执行 Shell 命令，返回命令输出 |
 | `file_ops` / `file_edit` | 在工作区内读写、编辑文件 |
 | `grep` / `glob` | 按文本/正则搜索文件内容，按名称模式查找文件 |
@@ -42,11 +42,12 @@
 | `knowledge_ingest_path` | 读取路径（目录或 glob）下每个文件的内容，逐个入库（沙箱内防 `..`/软链逃逸，单次上限 200 文件 / 2 MiB·文件） |
 | `media_generate` | 从文本提示词生成图片（默认）或视频，落盘后返回稳定文件路径，可供导出/送达/入库复用 |
 | `export_document` | 把 Markdown 渲染成可下载文档（md/html/docx/pdf/epub/odt/rtf/txt）并返回文件路径 |
-| `send_message` | 把消息发送到已配置渠道（飞书/Discord/微信/邮件/Slack 等）；属敏感动作，默认经确认门，无人值守时由风险自审兜底 |
+| `send_message` | 把消息发送到已配置渠道（飞书/Discord/微信/邮件/Slack 等）；交互式会话默认经确认门，无人值守自动化由 `security.autonomy` 矩阵决定 |
 | `cron_task` | 创建/列出/暂停/恢复/移除应用托管的定时任务 |
-| `manage_skill` / `manage_mcp` | 从 HexClaw Hub 搜索、安装、移除技能 / MCP Server |
+| `manage_skill` / `manage_mcp` | 从 HexClaw Hub 搜索、安装、移除技能 / MCP Server；无人值守默认不自动执行，需显式打开 `capability` |
 
-> 无人值守（cron）执行送达/发布等 consequential 动作时，会先过一道 LLM 风险自审门（low/medium/high）——固定高危关键词直接判 high，仅 low 放行，medium/high 与判级失败一律 fail-closed 拒绝。
+> 无人值守自动化（cron/webhook/spawn/heartbeat/workflow）采用“功能优先 Profile + 显式开关矩阵”：默认 `function_first` 放行 `code_exec`、shell、文件编辑、浏览、知识入库、送达等核心任务；Skill/MCP 管理、发布、伪造 `solve` 来源等高后果能力默认不自动放行，需要在 `security.autonomy.system_dispatch` 或 `full_access` profile 中显式打开。显式 `PermissionPolicy` deny 仍是最高优先级。
+> `system_dispatch.<source>` 是替换该来源的 profile 默认值，不是增量合并；只想全局放开时直接使用 `profile: full_access`。
 
 ### 会话与数据
 - **会话管理** — 创建/查询/删除会话，消息历史，会话分支 (fork)
@@ -189,6 +190,14 @@ security:
     enabled: true
   pii_redaction:
     enabled: true
+  autonomy:
+    # function_first(default) / balanced / strict / full_access
+    profile: function_first
+    # 可选显式覆盖；值支持类别、精确工具名、glob 或 "*"。
+    # 类别：read,browser,exec,files,automation,delivery,media,heal,capability,publish
+    # system_dispatch:
+    #   webhook: [read, browser, exec, files, delivery, media, capability]
+    #   workflow: [read, browser, exec, files, automation, delivery, media, heal]
 
 platforms:
   web:
@@ -247,11 +256,14 @@ knowledge:
   top_k: 3
 
 features:
-  # v0.4 新能力默认按 alpha flag fail-closed，需要显式开启后才改变运行时路径。
-  model.gateway.v1: false
-  skill.pipeline.v1: false
-  config.tx.hotload.v1: false
-  events.transport.v1: false
+  # 产品级能力按功能优先默认开启；仅在需要回退/灰度时显式关闭。
+  model.gateway.v1: true
+  skill.pipeline.v1: true
+  config.tx.hotload.v1: true
+  rag.pipeline.v1: true
+  runtime.sandbox.v1: true
+  plugin.extension.v1: true
+  agent.factory.real: true
 
 skill:
   sandbox:
@@ -670,7 +682,7 @@ chore: 构建/工具链
 **新功能**
 - **凭据静态加密** — 平台凭据以 AES-256-GCM 落盘加密（`enc:v1:` 信封 + 0600 主密钥）；历史明文透明回读，下次写入自动回填密文
 - **注入扫描** — 纵深防御：cron 创建期（严格）+ exec 组装期；外泄/混淆族始终严格，指令覆盖族仅在有 skills/RAG 数据时放宽
-- **统一权限闸 GA** — 声明式 `PermissionPolicy` 成为单一工具授权闸，无人值守 LLM 风险顾问取代 skill 层确认门
+- **统一权限闸 GA** — 声明式 `PermissionPolicy` 成为单一工具授权闸，无人值守按 `security.autonomy` profile + 显式矩阵放行
 - **Skill 工具盘** — 新增 `export_document`/`knowledge_ingest`/`media_generate`/`send_message` 内置技能
 - **library 记忆薄版** — 轻量 prompt/记忆库，每轮注入
 
@@ -684,14 +696,14 @@ chore: 构建/工具链
 - **matrix 适配器** — Stop 幂等，消除二次调用 close(closed channel) panic
 - **knowledge 时间衰减** — 零值 CreatedAt 不再被衰减清零（修复无时间戳 chunk 永不召回）
 - **cron 多副本** — DB 原子领取 + fencing 防止多副本 job 双跑，fail-open 保纯内存行为
-- **安全加固** — SSRF 仅放行 loopback（封禁元数据与内网地址）；shell `find -exec` 收紧白名单；文件操作 symlink 越界防护；WhatsApp webhook 验签 + 微信/企微常量时间比较
-- **无人值守提权（BUG-F1/F-5）** — `manage_skill` 补入基线策略；任意执行 + 能力/宿主变更类工具（`shell`/`code`/`create_skill`/`manage_skill`/`manage_mcp_server`/`file_edit`/…）在无人值守派发下硬拒，LLM 风险顾问无权放行
+- **安全加固** — SSRF 仅放行 loopback（封禁元数据与内网地址）；文件操作 symlink 越界防护；WhatsApp webhook 验签 + 微信/企微常量时间比较；shell 改为功能优先执行模型
+- **无人值守功能优先矩阵** — 默认 `function_first` 自动放行 `code_exec`、shell、文件编辑、浏览、知识入库、送达等核心自动化；Skill/MCP 管理、发布、伪造 `solve` 来源默认不自动放行，需显式 `security.autonomy` 开关或 `full_access` profile；显式 `PermissionPolicy` deny 仍可硬限制
 - **SSRF 保留段（BUG-F4）** — cron Starlark `http_*` 补封 RFC6598 CGNAT `100.64.0.0/10`、`192.0.0.0/24`、`198.18.0.0/15`（含 IPv4-mapped IPv6 形式）
 
 ### v0.4.0
 
 **新功能**
-- **Feature flag 基建** — `features:` 配置段统一控制 v0.4 新能力，未注册 flag fail-closed，alpha 默认关闭
+- **Feature flag 基建** — `features:` 配置段统一控制可灰度能力；产品级能力默认开启，未注册 flag 仍视为配置错误并关闭
 - **模型能力探测** — 新增 `/api/v1/llm/capabilities` 与 `/probe`，缓存模型 tool_call 可靠度
 - **Skill 闭环** — 新增 7 阶段 Pipeline、`skill_view` 渐进披露、`.pending` 审批、TrustLevel 与 TOCTOU 防护
 - **交互式回复** — `Reply.Interactive` 支持 buttons/select/approval/card，并在 IM 适配器中提供文本 fallback

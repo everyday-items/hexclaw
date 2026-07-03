@@ -9,7 +9,7 @@
 
 ### Added
 - **技能/MCP 市场离线优先**：出厂嵌入快照 + 磁盘缓存 + 带 TTL/退避的后台异步刷新；`EnsureCatalog` 保证目录非阻塞可用，网络与缓存均不可用时回落嵌入种子。`McpHub` 收敛为 `Hub` 门面，目录抓取/离线/缓存统一委托 `Hub`。新增 `scripts/sync-hub-embed.sh`，发版时从锚定分支同步嵌入快照。
-- **应用自省与自愈 skill**：`app_query`（P0 只读自省——连接/MCP/cron/webhook/agent/config/logs 脱敏查询，凭据红线打码 + `<app-data>` 围栏）与 `app_heal`（P1 白名单可逆自愈——cron retry/resume/pause、workflow_run，含限频与审计）；`react` 能力上下文注入系统卡片（版本/计数），`app_heal` 强制审批闸门（独立于 tool.policy.engine 默认值）。
+- **应用自省与自愈 skill**：`app_query`（P0 只读自省——连接/MCP/cron/webhook/agent/config/logs 脱敏查询，凭据红线打码 + `<app-data>` 围栏）与 `app_heal`（P1 自愈——cron retry/resume/pause、workflow_run，含限频与审计）；`react` 能力上下文注入系统卡片（版本/计数），交互式会话仍可走确认门，无人值守自动化按功能优先执行。
 - **文档上传/抽取/预览**：`POST /documents/extract`（PDF/DOC/PPTX → 纯文本，供对话上下文注入；PDF 走 poppler、.doc 走 textutil、.pptx 走 hexagon PPTXLoader）、`POST/GET /documents/preview/{token}`（原文件内存环形缓存预览）；知识库放开 .pdf/.doc/.pptx 格式。
 - **会话附件持久化**：图片 base64 单列存储（migration v7 `messages.attachments`，8MB 上限）规避 64KB metadata 截断导致重载丢图；`documents` 元数据落库（`json.RawMessage`）；`message-id` 优先用 `request_id` 作存储主键，修复删除返回 404。
 
@@ -34,6 +34,7 @@
 - 升级框架依赖：hexagon v0.5.2 → **v0.5.3**（`Result.StopReason` 提升为一等字段、移除 `ErrMaxTurns`/`KindMaxTurns`，达到轮次上限不再是错误，对齐 `stop_reason` 语义）。
 - **技能市场默认分支 v0.0.4 → v0.0.5**：`HubConfig` / `SkillsHubConfig` 默认 `Branch` 同步 hexclaw-hub v0.0.5 发布。
 - **agent 工具轮次上限默认 5 → 25**：budget 模式仍以 `hardMaxTurns=50` 兜底；上下文压缩在本地模型场景跳过，避免无谓调用。
+- **功能优先默认值**：本地/云端模型在 `tools.enabled=auto` 下都默认开启工具；代码执行、Shell、MCP/Skill 管理、RAG Pipeline、Runtime Sandbox、Plugin Extension、真实 Agent Dispatcher 等产品级能力默认可用，显式配置可回退。
 
 ### Fixed
 - **max-turns 优雅降级**：达到轮次上限按 `result.StopReason==max_turns` 优雅返回部分结果（非错误），尾部追加「继续」提示，不再向用户抛错。
@@ -76,10 +77,10 @@
 - matrix 适配器 Stop 幂等（消除二次调用 close(closed channel) panic）。
 - knowledge 时间衰减：零值 CreatedAt 不再被衰减清零（修复无时间戳 chunk 永不召回）。
 - cron：多副本 job 双跑防护（DB 原子领取 + fencing），fail-open 保纯内存行为。
-- 安全加固：SSRF 仅放行 loopback（封禁元数据与内网地址）；shell `find -exec` 收紧白名单；文件操作 symlink 越界防护；WhatsApp webhook 验签 + 微信/企微常量时间比较。
+- 安全加固：SSRF 仅放行 loopback（封禁元数据与内网地址）；文件操作 symlink 越界防护；WhatsApp webhook 验签 + 微信/企微常量时间比较；shell 后续已调整为功能优先执行模型。
 - **安全（BUG-F1）**：`manage_skill`（安装/卸载市场技能 = 能力注入）补入默认权限策略 `DefaultBaselinePolicy`，归为 require_approval。此前它漏出策略 → 默认 allow，可被 webhook/spawn 无人值守派发免审批自动调用（交互态也无确认）。回归测试 `engine/bug_f1_manage_skill_gate_test.go` 枚举全部能力变更类工具（新增同类工具忘记加规则会自动 FAIL）。
 - **安全（BUG-F4）**：cron starlark `http_get/http_post` 的 SSRF 拦截补齐 RFC6598 CGNAT `100.64.0.0/10` 及 `192.0.0.0/24`、`198.18.0.0/15`——此前依赖的 toolkit stdlib 谓词漏判这些保留段，与 SECURITY 文档「封锁 RFC 6598」的承诺不符。回归测试 `cron/bug_f4_ssrf_reserved_test.go`、`cron/ssrf_guard_edge_test.go`（含 IPv4-mapped IPv6 / ULA / 整段 CGNAT）。
-- **安全（BUG-F5）**：无人值守派发下，任意代码执行（shell/code/code_exec）+ 能力/宿主变更（create_skill/manage_skill/patch_skill/manage_skill_pending/manage_mcp_server/file_edit）类工具改为**硬拒**——风险顾问的「low」判定不再能放行它们（顾问仅继续兜 send_message/media_generate/publish_* 送达类）。此前这些高危工具一句 LLM「low」即可从 webhook 免审批运行。回归测试 `engine/bug_f5_unattended_reviewer_override_test.go`（含 {工具 × 来源 × 顾问判定} 全量授权矩阵）。
+- **无人值守权限口径变更**：早期 BUG-F5 曾将无人值守代码执行/能力变更类工具硬拒；当前功能优先策略已改为 cron/webhook/spawn/heartbeat/workflow 自动放行 `require_approval` 工具，显式 `PermissionPolicy` deny 仍是运营硬限制。回归测试 `engine/bug_f5_unattended_reviewer_override_test.go` 覆盖 {工具 × 来源 × 顾问判定} 授权矩阵。
 - **测试（BUG-F6）**：修复 feishu `TestStart_LogMessageWellFormed` 在 `-race` 下偶发（3/10）的数据竞争——`captureDefaultLog` 改用 mutex 包裹的 `syncBuffer` 作日志 sink，消除后台 Start 协程写入与测试读取的竞争（仅测试侧，生产代码不变）。
 
 ## [基线]
