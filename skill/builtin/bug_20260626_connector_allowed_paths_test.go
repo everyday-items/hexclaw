@@ -61,14 +61,3 @@ func TestBug20260626_CodeExecReadsConnectorAuthorizedDir(t *testing.T) {
 		t.Fatalf("连接器授权目录应可被 code_exec 读到，期望 'True True' 实得 %q", got)
 	}
 }
-
-func pyStr(s string) string { return "\"" + s + "\"" }
-
-func firstOutputLine(s string) string {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' || s[i] == '\r' {
-			return s[:i]
-		}
-	}
-	return s
-}
