@@ -17,11 +17,11 @@
 
 本轮复验基于当前工作区依赖升级：`toolkit v0.2.6`、`ai-core v0.2.0`、`hexagon v0.5.8`，三者均声明 `go=1.25.7`。
 
-- `sandbox-code-exec.yml` 已进入默认分支并注册为专项 workflow，覆盖 toolkit 联调下的 Linux/macOS/Windows code_exec 路径。
+- `sandbox-code-exec.yml` 已进入默认分支并注册为专项 workflow，覆盖 toolkit 联调下的 Linux/macOS code_exec 强沙箱路径，并保留 Windows toolkit sandbox 硬门禁；Windows code_exec runtime 集成用例按当前 toolkit 工具链/设备访问能力门控。
 - `GOWORK=off go test ./... -run '^$'` 通过，说明发版/CI 模式下全仓编译已恢复；此前 `toolkit v0.2.3` 缺字段导致的 release 构建不可复现问题已由依赖升级修复。
 - `GOWORK=off go test ./... -count=1` 通过。`engine/TestProbe_RunnerIntegrity_MustFail` 已改为 `HEXCLAW_RUNNER_PROBE=1` 手工门控，默认 CI 不再被故意失败探针阻断。
 - `.github/workflows/{ci,render,release,sandbox-code-exec}.yml` 经 `actionlint v1.7.7` 校验通过。
-- 2026-07-04 的 CI 修复补充了三项边界：普通 Linux CI 在无 bubblewrap/usable unshare 时跳过真实沙箱执行型用例；Windows code_exec 用临时 `.cmd` wrapper 文件执行，避免 toolkit ADS 校验误判多行脚本参数；默认 `max_memory_bytes` 提升到 2GiB，满足 Go/Node runtime 在强沙箱中的冷启动需求。
+- 2026-07-04 的 CI 修复补充了四项边界：普通 Linux CI 在无 bubblewrap/usable unshare 时跳过真实沙箱执行型用例；Linux project 模式使用 dedicated scratch workspace，并只读进入项目根执行，避免强沙箱中未绑定的外部 `/tmp` 不可见；Windows code_exec 用临时 `.cmd` wrapper 文件执行，避免 toolkit ADS 校验误判多行脚本参数；默认 `max_memory_bytes` 提升到 2GiB，满足 Go/Node runtime 在强沙箱中的冷启动需求。
 
 ## 已执行测试
 
