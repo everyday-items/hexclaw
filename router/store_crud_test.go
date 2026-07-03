@@ -42,7 +42,7 @@ func TestStore_SaveAndLoadAgents(t *testing.T) {
 			SystemPrompt: "be helpful",
 			Skills:       []string{"search", "summarize"},
 			MaxTokens:    2048,
-			Temperature:  0.7,
+			Temperature:  func() *float64 { v := 0.7; return &v }(),
 			Metadata:     map[string]string{"team": "core"},
 		}
 		if err := store.SaveAgent(ctx, a); err != nil {
@@ -61,9 +61,12 @@ func TestStore_SaveAndLoadAgents(t *testing.T) {
 		got := agents[0]
 		if got.Name != a.Name || got.DisplayName != a.DisplayName ||
 			got.Model != a.Model || got.Provider != a.Provider ||
-			got.SystemPrompt != a.SystemPrompt || got.MaxTokens != a.MaxTokens ||
-			got.Temperature != a.Temperature {
+			got.SystemPrompt != a.SystemPrompt || got.MaxTokens != a.MaxTokens {
 			t.Fatalf("scalar fields not round-tripped: %+v", got)
+		}
+		// temperature 指针化（BUG-20260703 P2-4）：按值比较，nil/值区分往返
+		if got.Temperature == nil || a.Temperature == nil || *got.Temperature != *a.Temperature {
+			t.Fatalf("temperature not round-tripped: got=%v want=%v", got.Temperature, a.Temperature)
 		}
 		if len(got.Skills) != 2 || got.Skills[0] != "search" || got.Skills[1] != "summarize" {
 			t.Fatalf("skills JSON not round-tripped: %+v", got.Skills)

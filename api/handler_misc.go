@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -938,16 +939,38 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 
 // RegisterAgentRequest 注册/更新 Agent 请求
 type RegisterAgentRequest struct {
-	Name         string            `json:"name"`
-	DisplayName  string            `json:"display_name"`
-	Description  string            `json:"description"`
-	Model        string            `json:"model"`
-	Provider     string            `json:"provider"`
-	SystemPrompt string            `json:"system_prompt"`
-	Skills       []string          `json:"skills"`
-	MaxTokens    int               `json:"max_tokens"`
-	Temperature  float64           `json:"temperature"`
-	Metadata     map[string]string `json:"metadata"`
+	Name         string   `json:"name"`
+	DisplayName  string   `json:"display_name"`
+	Description  string   `json:"description"`
+	Model        string   `json:"model"`
+	Provider     string   `json:"provider"`
+	SystemPrompt string   `json:"system_prompt"`
+	Skills       []string `json:"skills"`
+	MaxTokens    int      `json:"max_tokens"`
+	// Temperature 指针语义（BUG-20260703 P2-4）：缺席=未设跟随模型默认，显式 0=确定性采样。
+	Temperature *float64          `json:"temperature"`
+	Metadata    map[string]string `json:"metadata"`
+}
+
+// OptionalFloat 三态 patch 字段（BUG-20260703 P2-4）：字段缺席=不改（Present=false）；
+// 显式 null=清除回「未设」；数值=设置。普通 *float64 无法区分「缺席」与「null」。
+type OptionalFloat struct {
+	Present bool
+	Value   *float64
+}
+
+func (o *OptionalFloat) UnmarshalJSON(data []byte) error {
+	o.Present = true
+	if string(bytes.TrimSpace(data)) == "null" {
+		o.Value = nil
+		return nil
+	}
+	var f float64
+	if err := json.Unmarshal(data, &f); err != nil {
+		return err
+	}
+	o.Value = &f
+	return nil
 }
 
 type UpdateAgentRequest struct {
@@ -958,8 +981,16 @@ type UpdateAgentRequest struct {
 	SystemPrompt *string            `json:"system_prompt"`
 	Skills       *[]string          `json:"skills"`
 	MaxTokens    *int               `json:"max_tokens"`
-	Temperature  *float64           `json:"temperature"`
+	Temperature  OptionalFloat      `json:"temperature"`
 	Metadata     *map[string]string `json:"metadata"`
+}
+
+// validateAgentTemperature 温度合法域 [0,2]（nil=未设不校验）。
+func validateAgentTemperature(t *float64) error {
+	if t != nil && (*t < 0 || *t > 2) {
+		return fmt.Errorf("temperature 必须在 [0,2] 区间")
+	}
+	return nil
 }
 
 func (s *Server) activeLLMConfig() config.LLMConfig {
@@ -1043,13 +1074,23 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	if err := validateAgentTemperature(cfg.Temperature); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 
 	if err := s.agentRouter.Register(cfg); err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
 	if s.agentStore != nil {
-		_ = s.agentStore.SaveAgent(r.Context(), &cfg)
+		// BUG-20260703 G1：落库失败必须暴错并回滚内存注册——否则用户收 200、
+		// 重启后 Agent 蒸发，且重试还会撞 409 冲突。
+		if err := s.agentStore.SaveAgent(r.Context(), &cfg); err != nil {
+			_ = s.agentRouter.Unregister(req.Name)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + err.Error()})
+			return
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Agent 已注册", "name": req.Name})
@@ -1091,15 +1132,30 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	if req.MaxTokens != nil {
 		cfg.MaxTokens = *req.MaxTokens
 	}
-	if req.Temperature != nil {
-		cfg.Temperature = *req.Temperature
+	if req.Temperature.Present {
+		// 三态：null=清除回「未设」（Value=nil），数值=设置（BUG-20260703 P2-4）
+		if err := validateAgentTemperature(req.Temperature.Value); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		cfg.Temperature = req.Temperature.Value
 	}
 	if req.Metadata != nil {
 		cfg.Metadata = *req.Metadata
 	}
-	if err := s.validateAgentLLMConfig(&cfg); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
+	// BUG-20260703 D3：LLM 配置校验只跟着真改动走——请求未碰（或原样回传）model/provider
+	// 时不重审存量值，否则 provider 失效后连 display_name/system_prompt 都被连坐锁死。
+	// 真改动时校验保持不放松（禁用 provider 拒绝语义见 BUG-20260625 §3-2）。
+	llmChanged := (req.Model != nil && strings.TrimSpace(*req.Model) != existing.Model) ||
+		(req.Provider != nil && strings.TrimSpace(*req.Provider) != existing.Provider)
+	if llmChanged {
+		if err := s.validateAgentLLMConfig(&cfg); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+	} else {
+		cfg.Model = existing.Model
+		cfg.Provider = existing.Provider
 	}
 	if err := s.agentRouter.UpdateAgent(cfg); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
@@ -1122,12 +1178,26 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 // handleUnregisterAgent 注销 Agent（内存 + 持久化）
 func (s *Server) handleUnregisterAgent(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	wasDefault := s.agentRouter.DefaultAgent() == name
 	if err := s.agentRouter.Unregister(name); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
 	if s.agentStore != nil {
-		_ = s.agentStore.DeleteAgent(r.Context(), name)
+		// BUG-20260703 G1：持久化删除失败必须暴错（DB 的 agent_rules FK ON DELETE
+		// CASCADE 同时清掉其规则，落库失败=重启后 Agent 连同旧规则一起还魂）。
+		if err := s.agentStore.DeleteAgent(r.Context(), name); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + err.Error()})
+			return
+		}
+		// BUG-20260703 G2：注销的是默认 Agent 时，内存重选的新默认（可能为空）必须
+		// 显式落库——不再依赖 LoadAll 兜底与 smallestAgentName 的巧合一致。
+		if wasDefault {
+			if err := s.agentStore.SetDefault(r.Context(), s.agentRouter.DefaultAgent()); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化默认 Agent 失败: " + err.Error()})
+				return
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Agent 已注销"})
 }
@@ -1146,7 +1216,11 @@ func (s *Server) handleSetDefaultAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.agentStore != nil {
-		_ = s.agentStore.SetDefault(r.Context(), req.Name)
+		// BUG-20260703 G1：默认 Agent 落库失败必须暴错，否则重启后默认悄然回退。
+		if err := s.agentStore.SetDefault(r.Context(), req.Name); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + err.Error()})
+			return
+		}
 	}
 	msg := "默认 Agent 已设置"
 	if req.Name == "" {

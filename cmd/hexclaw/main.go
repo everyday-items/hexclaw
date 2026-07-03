@@ -1231,7 +1231,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				SystemPrompt: ac.SystemPrompt,
 				Skills:       ac.Skills,
 				MaxTokens:    ac.MaxTokens,
-				Temperature:  ac.Temperature,
+				Temperature:  ac.Temperature, // 指针语义直透（nil=未设，显式 0=确定性；P2-4）
 				Metadata:     ac.Metadata,
 			})
 		}

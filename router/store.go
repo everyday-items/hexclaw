@@ -22,6 +22,8 @@ type Store interface {
 	SaveRule(ctx context.Context, rule *Rule) error
 	DeleteRule(ctx context.Context, id int) error
 	DeleteRulesByAgent(ctx context.Context, agentName string) error
+	DeleteRulesByInstance(ctx context.Context, platform, instanceID string) error
+	DeleteRulesByPlatform(ctx context.Context, platform string) error
 }
 
 // SQLiteStore 基于 SQLite 的 Agent/Rule 持久化实现
@@ -48,7 +50,7 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 			system_prompt TEXT NOT NULL DEFAULT '',
 			skills       TEXT NOT NULL DEFAULT '[]',
 			max_tokens   INTEGER NOT NULL DEFAULT 0,
-			temperature  REAL NOT NULL DEFAULT 0,
+			temperature  REAL,
 			metadata     TEXT NOT NULL DEFAULT '{}',
 			is_default   INTEGER NOT NULL DEFAULT 0,
 			created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -72,6 +74,7 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 		}
 	}
 	s.runMigrations(ctx)
+	s.migrateAgentsTemperatureNullable(ctx)
 	// 必须在 UNIQUE 索引创建之前去重
 	s.dedupeAgentRules(ctx)
 	if _, err := s.db.ExecContext(ctx,
@@ -111,6 +114,70 @@ func (s *SQLiteStore) dedupeAgentRules(ctx context.Context) {
 	}
 }
 
+// migrateAgentsTemperatureNullable 把 agents.temperature 从 NOT NULL DEFAULT 0 重建为可空
+// （BUG-20260703 P2-4）：NULL=未设跟随模型默认、显式 0=确定性采样。历史行的 0 在旧
+// `>0` 判定语义下就是「未设」→ 如实回填 NULL。SQLite 无法 ALTER 掉 NOT NULL，走官方
+// 表重建流程；重建后表名不变，agent_rules 的按名 FK 引用如故。全程钉在单一连接上
+// （PRAGMA foreign_keys 是连接级状态，连接池换连接会让它悄然失效）。幂等：列已可空
+// 直接跳过；失败只告警不阻断启动（旧列语义继续可用）。
+func (s *SQLiteStore) migrateAgentsTemperatureNullable(ctx context.Context) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		logger.Warn("temperature 迁移: 取连接失败", "error", err)
+		return
+	}
+	defer conn.Close()
+
+	var notNull int
+	err = conn.QueryRowContext(ctx,
+		`SELECT "notnull" FROM pragma_table_info('agents') WHERE name = 'temperature'`,
+	).Scan(&notNull)
+	if err != nil || notNull == 0 {
+		return // 列缺失（异常库）或已可空：无事可做
+	}
+
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		logger.Warn("temperature 迁移: 关闭 FK 检查失败", "error", err)
+		return
+	}
+	defer func() { _, _ = conn.ExecContext(ctx, `PRAGMA foreign_keys = ON`) }()
+
+	stmts := []string{
+		`BEGIN IMMEDIATE`,
+		`CREATE TABLE agents_mig_tempnull (
+			name         TEXT PRIMARY KEY,
+			display_name TEXT NOT NULL DEFAULT '',
+			description  TEXT NOT NULL DEFAULT '',
+			model        TEXT NOT NULL DEFAULT '',
+			provider     TEXT NOT NULL DEFAULT '',
+			system_prompt TEXT NOT NULL DEFAULT '',
+			skills       TEXT NOT NULL DEFAULT '[]',
+			max_tokens   INTEGER NOT NULL DEFAULT 0,
+			temperature  REAL,
+			metadata     TEXT NOT NULL DEFAULT '{}',
+			is_default   INTEGER NOT NULL DEFAULT 0,
+			created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`INSERT INTO agents_mig_tempnull
+		 SELECT name, display_name, description, model, provider, system_prompt, skills,
+		        max_tokens, CASE WHEN temperature = 0 THEN NULL ELSE temperature END,
+		        metadata, is_default, created_at, updated_at
+		 FROM agents`,
+		`DROP TABLE agents`,
+		`ALTER TABLE agents_mig_tempnull RENAME TO agents`,
+		`COMMIT`,
+	}
+	for _, stmt := range stmts {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			logger.Warn("temperature 迁移失败（保持旧列语义）", "error", err, "stmt", stmt)
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+			return
+		}
+	}
+	logger.Info("agents.temperature 已迁移为可空列（0 值与未设可区分）")
+}
+
 // LoadAgents 从 DB 加载全部 Agent
 func (s *SQLiteStore) LoadAgents(ctx context.Context) ([]AgentConfig, string, error) {
 	rows, err := s.db.QueryContext(ctx,
@@ -128,10 +195,16 @@ func (s *SQLiteStore) LoadAgents(ctx context.Context) ([]AgentConfig, string, er
 		var a AgentConfig
 		var skillsJSON, metaJSON string
 		var isDefault int
+		// temperature 可空（BUG-20260703 P2-4）：NULL=未设跟随模型默认，显式 0=确定性采样
+		var temperature sql.NullFloat64
 		if err := rows.Scan(&a.Name, &a.DisplayName, &a.Description, &a.Model,
 			&a.Provider, &a.SystemPrompt, &skillsJSON, &a.MaxTokens,
-			&a.Temperature, &metaJSON, &isDefault); err != nil {
+			&temperature, &metaJSON, &isDefault); err != nil {
 			return nil, "", err
+		}
+		if temperature.Valid {
+			v := temperature.Float64
+			a.Temperature = &v
 		}
 		if err := json.Unmarshal([]byte(skillsJSON), &a.Skills); err != nil {
 			slog.Warn("failed to parse agent skills JSON", "agent", a.Name, "error", err)
@@ -187,8 +260,13 @@ func (s *SQLiteStore) DeleteAgent(ctx context.Context, name string) error {
 	return nil
 }
 
-// SetDefault 设置默认 Agent
+// SetDefault 设置默认 Agent；name 为空 = 清除默认（与 Dispatcher.SetDefault 语义对齐，
+// BUG-20260703 G1：吞错修复后「清除默认」不得被误报为 agent 不存在）
 func (s *SQLiteStore) SetDefault(ctx context.Context, name string) error {
+	if name == "" {
+		_, err := s.db.ExecContext(ctx, `UPDATE agents SET is_default = 0 WHERE is_default = 1`)
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -281,6 +359,20 @@ func (s *SQLiteStore) DeleteRule(ctx context.Context, id int) error {
 // DeleteRulesByAgent 删除指定 Agent 的所有规则
 func (s *SQLiteStore) DeleteRulesByAgent(ctx context.Context, agentName string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM agent_rules WHERE agent_name = ?`, agentName)
+	return err
+}
+
+// DeleteRulesByInstance 删除某平台实例的所有规则（BUG-20260703 A1：删实例级联清绑定）
+func (s *SQLiteStore) DeleteRulesByInstance(ctx context.Context, platform, instanceID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM agent_rules WHERE platform = ? AND instance_id = ?`, platform, instanceID)
+	return err
+}
+
+// DeleteRulesByPlatform 删除某平台的全部规则（BUG-20260703 A1：平台最后一个实例删除后
+// 清遗留，含 platform 级（instance_id 为空串）的历史绑定——否则重建实例会静默继承旧绑定）
+func (s *SQLiteStore) DeleteRulesByPlatform(ctx context.Context, platform string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM agent_rules WHERE platform = ?`, platform)
 	return err
 }
 

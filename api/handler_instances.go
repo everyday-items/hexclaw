@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -166,9 +167,24 @@ func (s *Server) handleUpdateInstanceByID(w http.ResponseWriter, r *http.Request
 
 func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	// BUG-20260703 A1：级联清理需要实例的 platform/name，先读后删；实例本就不存在时
+	// 保持原有幂等语义（Delete 对缺行是 no-op → 200），无级联可做。
+	inst, err := s.instanceMgr.Get(r.Context(), name)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
 	if err := s.instanceMgr.Delete(r.Context(), name); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+	if inst != nil {
+		if err := s.cascadeInstanceRuleCleanup(r.Context(), inst.Provider, inst.Name); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "实例已删除，但清理其路由规则失败: " + err.Error(),
+			})
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "实例已删除", "name": name})
 }
@@ -179,7 +195,9 @@ func (s *Server) handleDeleteInstanceByID(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id 不能为空"})
 		return
 	}
-	if err := s.instanceMgr.DeleteByID(r.Context(), id); err != nil {
+	// BUG-20260703 A1：同 handleDeleteInstance——先读实例再删，删除后级联清路由规则。
+	inst, err := s.instanceMgr.GetByID(r.Context(), id)
+	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, sql.ErrNoRows) {
 			status = http.StatusNotFound
@@ -187,7 +205,53 @@ func (s *Server) handleDeleteInstanceByID(w http.ResponseWriter, r *http.Request
 		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
+	if err := s.instanceMgr.Delete(r.Context(), inst.Name); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := s.cascadeInstanceRuleCleanup(r.Context(), inst.Provider, inst.Name); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "实例已删除，但清理其路由规则失败: " + err.Error(),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "实例已删除", "id": id})
+}
+
+// cascadeInstanceRuleCleanup 删除实例后的路由规则级联（BUG-20260703 A1，绑定粒度=instance 级）：
+// 先清该实例的 instance 级规则（内存 + 持久化双端）；若该平台已无存活实例，顺带清平台
+// 全部遗留规则——含 platform 级（instance_id 为空串）的历史绑定，否则重建同平台实例会
+// 静默继承旧绑定。
+func (s *Server) cascadeInstanceRuleCleanup(ctx context.Context, platform, instanceName string) error {
+	if platform == "" {
+		return nil
+	}
+	if s.agentRouter != nil {
+		s.agentRouter.RemoveRulesByInstance(platform, instanceName)
+	}
+	if s.agentStore != nil {
+		if err := s.agentStore.DeleteRulesByInstance(ctx, platform, instanceName); err != nil {
+			return fmt.Errorf("清理实例级规则失败: %w", err)
+		}
+	}
+	list, err := s.instanceMgr.List(ctx)
+	if err != nil {
+		return fmt.Errorf("统计平台存活实例失败: %w", err)
+	}
+	for _, inst := range list {
+		if inst.Provider == platform {
+			return nil // 平台还有存活实例，platform 级规则继续生效
+		}
+	}
+	if s.agentRouter != nil {
+		s.agentRouter.RemoveRulesByPlatform(platform)
+	}
+	if s.agentStore != nil {
+		if err := s.agentStore.DeleteRulesByPlatform(ctx, platform); err != nil {
+			return fmt.Errorf("清理平台级遗留规则失败: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *Server) handleStartInstance(w http.ResponseWriter, r *http.Request) {

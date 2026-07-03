@@ -125,6 +125,9 @@ func TestHandleListRoles_ExposesRoleDetails(t *testing.T) {
 	}
 }
 
+// agentTempPtr 测试用温度指针字面量（BUG-20260703 P2-4 指针化后 float 字面量不再可直赋）。
+func agentTempPtr(v float64) *float64 { return &v }
+
 func TestHandleUpdateAgent_PreservesPersistedFields(t *testing.T) {
 	dir := t.TempDir()
 	store, err := sqlitestore.New(filepath.Join(dir, "test.db"))
@@ -150,7 +153,7 @@ func TestHandleUpdateAgent_PreservesPersistedFields(t *testing.T) {
 		Provider:     "openai",
 		SystemPrompt: "write code",
 		MaxTokens:    4096,
-		Temperature:  0.3,
+		Temperature:  agentTempPtr(0.3),
 	}
 	if err := dispatcher.Register(original); err != nil {
 		t.Fatalf("注册 Agent 失败: %v", err)
@@ -235,7 +238,7 @@ func TestHandleUpdateAgent_AllowsZeroValueOverrides(t *testing.T) {
 		SystemPrompt: "write code",
 		Skills:       []string{"shell"},
 		MaxTokens:    4096,
-		Temperature:  0.3,
+		Temperature:  agentTempPtr(0.3),
 		Metadata:     map[string]string{"team": "core"},
 	}
 	if err := dispatcher.Register(original); err != nil {
@@ -277,8 +280,9 @@ func TestHandleUpdateAgent_AllowsZeroValueOverrides(t *testing.T) {
 	if got.MaxTokens != 0 {
 		t.Fatalf("MaxTokens 未更新为 0，实际 %d", got.MaxTokens)
 	}
-	if got.Temperature != 0 {
-		t.Fatalf("Temperature 未更新为 0，实际 %f", got.Temperature)
+	// BUG-20260703 P2-4 指针语义：显式 temperature=0 = 设为确定性 0（非 nil 未设）
+	if got.Temperature == nil || *got.Temperature != 0 {
+		t.Fatalf("显式 temperature=0 应落为非 nil 的 0，实际 %v", got.Temperature)
 	}
 	if len(got.Skills) != 0 {
 		t.Fatalf("Skills 未清空，实际 %#v", got.Skills)

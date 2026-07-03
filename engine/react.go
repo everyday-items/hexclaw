@@ -3324,8 +3324,10 @@ func applyAgentConfigToMetadata(metadata map[string]string, cfg *agentrouter.Age
 	if cfg.MaxTokens > 0 {
 		metadata["agent_max_tokens"] = fmt.Sprintf("%d", cfg.MaxTokens)
 	}
-	if cfg.Temperature > 0 {
-		metadata["agent_temperature"] = fmt.Sprintf("%.2f", cfg.Temperature)
+	// BUG-20260703 P2-4：指针判定——nil=未设不下发；显式 0 也如实下发（确定性采样），
+	// 旧 `>0` 判定把 0 当未设、温度 0 永远无法表达。
+	if cfg.Temperature != nil {
+		metadata["agent_temperature"] = fmt.Sprintf("%.2f", *cfg.Temperature)
 	}
 	return hint
 }

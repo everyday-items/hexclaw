@@ -23,6 +23,7 @@ package router
 import (
 	"fmt"
 	"github.com/hexagon-codes/toolkit/util/logger"
+	"strings"
 	"sync"
 )
 
@@ -30,16 +31,18 @@ import (
 //
 // 定义一个 Agent 实例的完整配置。
 type AgentConfig struct {
-	Name         string            `json:"name" yaml:"name"`                   // Agent 名称（唯一标识）
-	DisplayName  string            `json:"display_name" yaml:"display_name"`   // 显示名称
-	Description  string            `json:"description" yaml:"description"`     // Agent 描述
-	Model        string            `json:"model" yaml:"model"`                 // 使用的 LLM 模型
-	Provider     string            `json:"provider" yaml:"provider"`           // 使用的 LLM Provider
-	SystemPrompt string            `json:"system_prompt" yaml:"system_prompt"` // 系统提示词
-	Skills       []string          `json:"skills" yaml:"skills"`               // 启用的技能列表
-	MaxTokens    int               `json:"max_tokens" yaml:"max_tokens"`       // 最大 token 数
-	Temperature  float64           `json:"temperature" yaml:"temperature"`     // 温度参数
-	Metadata     map[string]string `json:"metadata" yaml:"metadata"`           // 自定义元数据
+	Name         string   `json:"name" yaml:"name"`                   // Agent 名称（唯一标识）
+	DisplayName  string   `json:"display_name" yaml:"display_name"`   // 显示名称
+	Description  string   `json:"description" yaml:"description"`     // Agent 描述
+	Model        string   `json:"model" yaml:"model"`                 // 使用的 LLM 模型
+	Provider     string   `json:"provider" yaml:"provider"`           // 使用的 LLM Provider
+	SystemPrompt string   `json:"system_prompt" yaml:"system_prompt"` // 系统提示词
+	Skills       []string `json:"skills" yaml:"skills"`               // 启用的技能列表
+	MaxTokens    int      `json:"max_tokens" yaml:"max_tokens"`       // 最大 token 数（0=未设，跟随模型默认）
+	// Temperature 温度参数（BUG-20260703 P2-4 指针化）：nil=未设跟随模型默认，
+	// 显式 0=确定性采样——float64 零值无法表达这一区分（旧 `>0` 判定把 0 当未设）。
+	Temperature *float64          `json:"temperature,omitempty" yaml:"temperature,omitempty"`
+	Metadata    map[string]string `json:"metadata" yaml:"metadata"` // 自定义元数据
 }
 
 // Rule 路由规则
@@ -106,7 +109,8 @@ func smallestAgentName(agents map[string]*AgentConfig) string {
 
 // Register 注册 Agent
 func (r *Dispatcher) Register(cfg AgentConfig) error {
-	if cfg.Name == "" {
+	if strings.TrimSpace(cfg.Name) == "" {
+		// BUG-20260703 C1：纯空白名（"   "/tab/换行）也须拒，否则被存成空白主键。
 		return fmt.Errorf("agent 名称不能为空")
 	}
 
@@ -197,6 +201,34 @@ func (r *Dispatcher) RemoveRules(agentName string) {
 	var filtered []Rule
 	for _, rule := range r.rules {
 		if rule.AgentName != agentName {
+			filtered = append(filtered, rule)
+		}
+	}
+	r.rules = filtered
+}
+
+// RemoveRulesByInstance 删除指定平台实例的所有规则（BUG-20260703 A1：删实例级联清绑定）
+func (r *Dispatcher) RemoveRulesByInstance(platform, instanceID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var filtered []Rule
+	for _, rule := range r.rules {
+		if rule.Platform != platform || rule.InstanceID != instanceID {
+			filtered = append(filtered, rule)
+		}
+	}
+	r.rules = filtered
+}
+
+// RemoveRulesByPlatform 删除指定平台的全部规则（平台最后一个实例删除后的遗留清理）
+func (r *Dispatcher) RemoveRulesByPlatform(platform string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var filtered []Rule
+	for _, rule := range r.rules {
+		if rule.Platform != platform {
 			filtered = append(filtered, rule)
 		}
 	}
@@ -381,7 +413,8 @@ func (r *Dispatcher) ListRules() []Rule {
 
 // UpdateAgent 更新已注册 Agent 的配置
 func (r *Dispatcher) UpdateAgent(cfg AgentConfig) error {
-	if cfg.Name == "" {
+	if strings.TrimSpace(cfg.Name) == "" {
+		// BUG-20260703 C1：纯空白名（"   "/tab/换行）也须拒，否则被存成空白主键。
 		return fmt.Errorf("agent 名称不能为空")
 	}
 

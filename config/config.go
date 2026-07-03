@@ -63,16 +63,18 @@ type RouterConfig struct {
 
 // AgentStaticConfig 配置文件中的 Agent 声明
 type AgentStaticConfig struct {
-	Name         string            `yaml:"name"`
-	DisplayName  string            `yaml:"display_name"`
-	Description  string            `yaml:"description"`
-	Model        string            `yaml:"model"`
-	Provider     string            `yaml:"provider"`
-	SystemPrompt string            `yaml:"system_prompt"`
-	Skills       []string          `yaml:"skills"`
-	MaxTokens    int               `yaml:"max_tokens"`
-	Temperature  float64           `yaml:"temperature"`
-	Metadata     map[string]string `yaml:"metadata"`
+	Name         string   `yaml:"name"`
+	DisplayName  string   `yaml:"display_name"`
+	Description  string   `yaml:"description"`
+	Model        string   `yaml:"model"`
+	Provider     string   `yaml:"provider"`
+	SystemPrompt string   `yaml:"system_prompt"`
+	Skills       []string `yaml:"skills"`
+	MaxTokens    int      `yaml:"max_tokens"`
+	// Temperature 指针语义（BUG-20260703 P2-4）：yaml 缺席 = 未设跟随模型默认，
+	// 显式 0 = 确定性采样（旧 float64 零值无法区分两者）。
+	Temperature *float64          `yaml:"temperature,omitempty"`
+	Metadata    map[string]string `yaml:"metadata"`
 }
 
 // RuleStaticConfig 配置文件中的路由规则声明
