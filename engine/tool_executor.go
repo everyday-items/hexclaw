@@ -165,7 +165,7 @@ func (e *ToolExecutor) executeWithHooks(ctx context.Context, call *ToolCallInfo,
 		runAfterHook(ctx, h, call, result, v2)
 	}
 
-	// v0.4.0 H6：投递结构化事件 —— flag events.transport.v1 OFF 时 Emit 是 no-op
+	// v0.4.0 H6：投递结构化事件；是否落盘/外发由注入的 events.Sink 决定。
 	severity := events.SeverityInfo
 	if result.Error != nil {
 		severity = events.SeverityError

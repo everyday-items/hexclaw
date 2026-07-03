@@ -27,13 +27,16 @@ func TestDefaultConfig(t *testing.T) {
 	if !cfg.Security.PIIRedaction.Enabled {
 		t.Error("PIIRedaction 应默认开启")
 	}
-
-	// 高风险 Skill 默认关闭
-	if cfg.Skill.Builtin.Code {
-		t.Error("Code Skill 应默认关闭")
+	if cfg.Security.Autonomy.Profile != "function_first" {
+		t.Errorf("Autonomy profile 应默认 function_first，得到 %q", cfg.Security.Autonomy.Profile)
 	}
-	if cfg.Skill.Builtin.Shell {
-		t.Error("Shell Skill 应默认关闭")
+
+	// 功能优先：代码与 shell 能力默认开启
+	if !cfg.Skill.Builtin.Code {
+		t.Error("Code Skill 应默认开启")
+	}
+	if !cfg.Skill.Builtin.Shell {
+		t.Error("Shell Skill 应默认开启")
 	}
 
 	// Web UI 默认开启
@@ -101,8 +104,8 @@ func TestDefaultConfig(t *testing.T) {
 	}
 
 	// Heartbeat 默认值
-	if cfg.Heartbeat.Enabled {
-		t.Error("Heartbeat 应默认关闭")
+	if !cfg.Heartbeat.Enabled {
+		t.Error("Heartbeat 应默认开启")
 	}
 	if cfg.Heartbeat.IntervalMins != 15 {
 		t.Errorf("期望 IntervalMins=15，得到 %d", cfg.Heartbeat.IntervalMins)

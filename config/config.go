@@ -4,9 +4,9 @@
 //   - 命令行参数 (--feishu-app-id)
 //   - 环境变量 (DEEPSEEK_API_KEY)
 //   - 配置文件 (hexclaw.yaml)
-//   - 安全默认值
+//   - 功能优先默认值
 //
-// 所有配置项都有安全的默认值，零配置即可运行（只需设置至少一个 LLM API Key）。
+// 所有配置项都有功能优先的默认值，零配置即可运行（只需设置至少一个 LLM API Key）。
 package config
 
 import (
@@ -538,8 +538,36 @@ type SecurityConfig struct {
 	ContentFilter      ContentFilterConfig   `yaml:"content_filter"`
 	Cost               CostConfig            `yaml:"cost"`
 	RateLimit          RateLimitConfig       `yaml:"rate_limit"`
+	Autonomy           AutonomyConfig        `yaml:"autonomy"`
 	RBAC               RBACConfig            `yaml:"rbac"`
 	ToolPermissions    ToolPermissionsConfig `yaml:"tool_permissions"`
+}
+
+// AutonomyConfig controls non-interactive automation permissions.
+//
+// Profile sets the baseline matrix. SystemDispatch entries optionally override
+// a specific source with category names, exact tool names, glob patterns, or "*".
+// Supported profiles: function_first (default), balanced, strict, full_access.
+type AutonomyConfig struct {
+	Profile        string                       `yaml:"profile"`
+	SystemDispatch SystemDispatchAutonomyConfig `yaml:"system_dispatch,omitempty"`
+}
+
+// SystemDispatchAutonomyConfig is the explicit switch matrix for unattended
+// sources. A nil pointer means "use the selected profile default"; a pointer to
+// an empty slice means "auto-approve nothing for this source".
+//
+// Fields are *[]string (not []string) so the nil/empty distinction survives a
+// Save→Load round trip: yaml.v3 marshals a nil []string as "[]", which on
+// reload becomes a non-nil empty override and silently wipes the profile
+// matrix (every profile then behaves as strict regardless of its label).
+type SystemDispatchAutonomyConfig struct {
+	Cron      *[]string `yaml:"cron,omitempty"`
+	Webhook   *[]string `yaml:"webhook,omitempty"`
+	Heartbeat *[]string `yaml:"heartbeat,omitempty"`
+	Workflow  *[]string `yaml:"workflow,omitempty"`
+	Spawn     *[]string `yaml:"spawn,omitempty"`
+	Solve     *[]string `yaml:"solve,omitempty"`
 }
 
 // ToolPermissionsConfig per-tool allow/deny 权限 (Phase 9 D40)
@@ -676,11 +704,11 @@ type BuiltinConfig struct {
 //
 // RequireApproval 为 true 时，code_exec 工具被分类为 "dangerous"，
 // 每次执行前需要用户确认。设为 false 表示信任沙箱隔离，跳过审批。
-// 默认值为 true（安全优先）。
+// 默认值为 false（功能优先）。
 //
 // Network 控制沙箱是否允许网络访问。默认 true 以支持抓取网页、调用 API 等场景。
 type CodeExecPolicyConfig struct {
-	RequireApproval *bool `yaml:"require_approval"` // nil 视为 true（安全默认）
+	RequireApproval *bool `yaml:"require_approval"` // nil 视为 false（功能优先）
 	Network         *bool `yaml:"network"`          // nil 视为 true（允许网络）
 }
 
@@ -693,10 +721,10 @@ func (c CodeExecPolicyConfig) CodeExecNetworkAllowed() bool {
 }
 
 // CodeExecRequiresApproval 返回 code_exec 是否需要用户审批
-// nil（未设置）视为 true，安全优先。
+// nil（未设置）视为 false，功能优先。
 func (c CodeExecPolicyConfig) CodeExecRequiresApproval() bool {
 	if c.RequireApproval == nil {
-		return true
+		return false
 	}
 	return *c.RequireApproval
 }

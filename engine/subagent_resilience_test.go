@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -76,6 +77,52 @@ func TestRunSubAgentWithRetry_ExhaustsRetries(t *testing.T) {
 	}
 	if c := atomic.LoadInt32(&calls); c != 3 {
 		t.Errorf("应调用 3 次(1+2)，得 %d", c)
+	}
+}
+
+func TestRunSubAgentWithRetry_RetriesEmptyOutput(t *testing.T) {
+	old := subAgentRetryBackoff
+	subAgentRetryBackoff = []time.Duration{time.Millisecond, time.Millisecond}
+	defer func() { subAgentRetryBackoff = old }()
+
+	var calls int32
+	exec := func(ctx context.Context, spec SubAgentSpec) (SubAgentResult, error) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return SubAgentResult{Output: "   "}, nil
+		}
+		return SubAgentResult{Output: "ok after retry"}, nil
+	}
+
+	res, err := runSubAgentWithRetry(context.Background(), exec, SubAgentSpec{Agent: "x"}, time.Second)
+	if err != nil {
+		t.Fatalf("empty output should be retried and recover, got err=%v", err)
+	}
+	if res.Output != "ok after retry" {
+		t.Fatalf("unexpected output after empty retry: %q", res.Output)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("calls = %d, want 2", got)
+	}
+}
+
+func TestRunSubAgentWithRetry_EmptyOutputExhaustionIsError(t *testing.T) {
+	old := subAgentRetryBackoff
+	subAgentRetryBackoff = []time.Duration{time.Millisecond}
+	defer func() { subAgentRetryBackoff = old }()
+
+	exec := func(ctx context.Context, spec SubAgentSpec) (SubAgentResult, error) {
+		return SubAgentResult{Output: "\n\t"}, nil
+	}
+
+	res, err := runSubAgentWithRetry(context.Background(), exec, SubAgentSpec{Agent: "x"}, time.Second)
+	if err == nil {
+		t.Fatal("empty output after retries should be an error")
+	}
+	if !strings.Contains(err.Error(), "empty output") {
+		t.Fatalf("error should explain empty output, got %v", err)
+	}
+	if strings.TrimSpace(res.Output) != "" {
+		t.Fatalf("result should remain empty, got %q", res.Output)
 	}
 }
 

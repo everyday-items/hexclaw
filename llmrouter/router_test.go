@@ -3,6 +3,7 @@ package llmrouter
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/config"
@@ -70,6 +71,31 @@ func TestRouter_Route(t *testing.T) {
 	}
 }
 
+func TestRouter_RouteModelReturnsConfiguredModel(t *testing.T) {
+	cfg := config.LLMConfig{
+		Default: "硅基流动",
+		Providers: map[string]config.LLMProviderConfig{
+			"硅基流动": {APIKey: "sk-test", Model: "Qwen/Qwen3.6-35B-A3B"},
+		},
+	}
+
+	r, err := New(cfg)
+	if err != nil {
+		t.Fatalf("创建路由器失败: %v", err)
+	}
+
+	p, model, err := r.RouteModel(context.Background())
+	if err != nil {
+		t.Fatalf("路由模型失败: %v", err)
+	}
+	if p == nil {
+		t.Fatal("Provider 不应为 nil")
+	}
+	if model != "Qwen/Qwen3.6-35B-A3B" {
+		t.Fatalf("RouteModel model = %q，期望真实模型名；不能返回 provider 名", model)
+	}
+}
+
 func TestRouter_Fallback(t *testing.T) {
 	cfg := config.LLMConfig{
 		Default: "primary",
@@ -108,7 +134,9 @@ func TestRouter_Fallback(t *testing.T) {
 // 由于真实 Provider 需要 API Key，测试路由选择逻辑时使用 nil Provider 占位。
 func newTestSelectorDirect(providers []string, defaultP string, routing config.LLMRoutingConfig) *Selector {
 	s := &Selector{
-		providers: make(map[string]hexagon.Provider),
+		providers:      make(map[string]hexagon.Provider),
+		unhealthyUntil: make(map[string]time.Time),
+		now:            time.Now,
 		cfg: config.LLMConfig{
 			Default: defaultP,
 			Routing: routing,
@@ -119,6 +147,68 @@ func newTestSelectorDirect(providers []string, defaultP string, routing config.L
 		s.providers[name] = nil
 	}
 	return s
+}
+
+func TestRoute_DefaultSkipsUnhealthyDefault(t *testing.T) {
+	s := newTestSelectorDirect(
+		[]string{"openai", "deepseek"},
+		"openai",
+		config.LLMRoutingConfig{Enabled: false},
+	)
+	s.MarkProviderUnhealthy("openai", "rate_limit", time.Hour)
+
+	_, name, err := s.Route(context.Background())
+	if err != nil {
+		t.Fatalf("Route 返回错误: %v", err)
+	}
+	if name != "deepseek" {
+		t.Fatalf("默认 provider unhealthy 后应切到 deepseek，实际 %s", name)
+	}
+}
+
+func TestFallback_SkipsUnhealthyCandidate(t *testing.T) {
+	s := newTestSelectorDirect(
+		[]string{"openai", "deepseek", "qwen"},
+		"openai",
+		config.LLMRoutingConfig{},
+	)
+	s.MarkProviderUnhealthy("deepseek", "model_not_found", time.Hour)
+
+	_, name, err := s.Fallback("openai")
+	if err != nil {
+		t.Fatalf("Fallback 返回错误: %v", err)
+	}
+	if name != "qwen" {
+		t.Fatalf("Fallback 应跳过 unhealthy deepseek 并返回 qwen，实际 %s", name)
+	}
+}
+
+func TestProviderCooldownExpires(t *testing.T) {
+	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	s := newTestSelectorDirect(
+		[]string{"openai", "deepseek", "qwen"},
+		"openai",
+		config.LLMRoutingConfig{},
+	)
+	s.now = func() time.Time { return now }
+	s.MarkProviderUnhealthy("deepseek", "rate_limit", time.Second)
+
+	_, name, err := s.Fallback("openai")
+	if err != nil {
+		t.Fatalf("Fallback 返回错误: %v", err)
+	}
+	if name != "qwen" {
+		t.Fatalf("cooldown 内应跳过 deepseek，实际 %s", name)
+	}
+
+	now = now.Add(2 * time.Second)
+	_, name, err = s.Fallback("openai")
+	if err != nil {
+		t.Fatalf("Fallback 返回错误: %v", err)
+	}
+	if name != "deepseek" {
+		t.Fatalf("cooldown 过期后应恢复 deepseek，实际 %s", name)
+	}
 }
 
 // TestRoute_DefaultStrategy 测试默认策略（路由未启用）返回默认 Provider

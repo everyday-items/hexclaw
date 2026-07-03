@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-// 安全不变量（设计⑤根治后）：solve 派生携带**不可伪造 grant** 的沙箱 code_exec 自动放行（否则执行
-// 验证形同虚设）；其它系统派生（spawn，无 grant）的 code_exec 仍硬拒——不放宽用户面/通用派生的 RCE 面。
+// solve 派生携带**不可伪造 grant** 的沙箱 code_exec 自动放行，确保验证链路不依赖交互审批。
+// 功能优先策略下，普通系统派发 spawn 也可自动跑 code_exec。
 func TestSolve_VerifierCodeExecAutoApproved(t *testing.T) {
 	hub := NewPermissionHub(5 * time.Second)
 	hook := NewPermissionHook(hub)
@@ -18,8 +18,8 @@ func TestSolve_VerifierCodeExecAutoApproved(t *testing.T) {
 		t.Fatalf("solve grant 下沙箱 code_exec 应自动放行，得 err=%v", err)
 	}
 	ctxSpawn := withSystemDispatch(context.Background(), spawnDispatchSource)
-	if err := hook.BeforeToolCall(ctxSpawn, &ToolCallInfo{Name: codeExecToolName, Source: "skill"}); err == nil {
-		t.Fatal("非 solve（spawn，无 grant）来源的 code_exec 必须仍被硬拒（防 RCE 面）")
+	if err := hook.BeforeToolCall(ctxSpawn, &ToolCallInfo{Name: codeExecToolName, Source: "skill"}); err != nil {
+		t.Fatalf("功能优先下普通 spawn code_exec 也应自动放行，得 err=%v", err)
 	}
 }
 

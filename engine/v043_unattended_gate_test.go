@@ -1,7 +1,7 @@
 package engine
 
-// §11.10 统一安全闸：无人值守（系统派发、无交互会话）下，命中 require_approval 的
-// consequential 动作改问 LLM 风险顾问，仅 low 放行，medium/high/无顾问一律 fail-closed。
+// 功能优先不等于全默认打开：无人值守系统派发没有交互审批人，命中
+// require_approval 的工具先查 profile + 显式开关矩阵；矩阵允许才自动放行。
 
 import (
 	"context"
@@ -19,40 +19,51 @@ func sendPolicy() *PermissionPolicy {
 	)
 }
 
-func TestUnattendedGate_LowAllowed(t *testing.T) {
-	hook := NewPermissionHook(NewPermissionHub(time.Second),
-		WithPolicy(sendPolicy()), WithUnattendedReviewer(fakeUnattended{low: true}))
-	ctx := withSystemDispatch(context.Background(), "cron")
-	if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "send_message", Source: "skill"}); err != nil {
-		t.Fatalf("low-risk unattended send must be allowed: %v", err)
-	}
-}
-
-func TestUnattendedGate_HighDenied(t *testing.T) {
+func TestUnattendedGate_MatrixAllowedIgnoresReviewer(t *testing.T) {
 	hook := NewPermissionHook(NewPermissionHub(time.Second),
 		WithPolicy(sendPolicy()), WithUnattendedReviewer(fakeUnattended{low: false}))
 	ctx := withSystemDispatch(context.Background(), "cron")
-	if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "send_message", Source: "skill"}); err == nil {
-		t.Fatal("non-low unattended send must be denied (fail-closed)")
+	if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "send_message", Source: "skill"}); err != nil {
+		t.Fatalf("cron delivery is in function_first matrix and must be allowed: %v", err)
 	}
 }
 
-func TestUnattendedGate_NoReviewer_FailsClosed(t *testing.T) {
+func TestUnattendedGate_MatrixDeniedDoesNotUseReviewerOverride(t *testing.T) {
+	hook := NewPermissionHook(NewPermissionHub(time.Second),
+		WithPolicy(DefaultBaselinePolicy()), WithUnattendedReviewer(fakeUnattended{low: true}))
+	ctx := withSystemDispatch(context.Background(), "webhook")
+	if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "manage_skill", Source: "skill"}); err == nil {
+		t.Fatal("webhook capability mutation must require an explicit autonomy switch")
+	}
+}
+
+func TestUnattendedGate_NoReviewerAllowedByMatrix(t *testing.T) {
 	hook := NewPermissionHook(NewPermissionHub(time.Second), WithPolicy(sendPolicy()))
 	ctx := withSystemDispatch(context.Background(), "cron")
-	if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "send_message", Source: "skill"}); err == nil {
-		t.Fatal("no reviewer must fail-closed (deny)")
+	if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "send_message", Source: "skill"}); err != nil {
+		t.Fatalf("matrix-allowed unattended send must not require reviewer: %v", err)
 	}
 }
 
-// 良性读取类工具（在 systemDispatchAutoApprove 白名单）无需顾问即放行。
-func TestUnattendedGate_AllowlistedReadTool(t *testing.T) {
+func TestUnattendedGate_FunctionFirstToolsAutoApprove(t *testing.T) {
 	hook := NewPermissionHook(NewPermissionHub(time.Second),
 		WithPolicy(NewPermissionPolicy(ActionAllow,
-			PolicyRule{Name: "search-approve", ToolPattern: "web_search", Action: ActionRequireApproval, Risk: "sensitive"})),
+			PolicyRule{Name: "all-approve", ToolPattern: "*", Action: ActionRequireApproval, Risk: "sensitive"})),
 	)
-	ctx := withSystemDispatch(context.Background(), "cron")
-	if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "web_search", Source: "skill"}); err != nil {
-		t.Fatalf("allowlisted read tool should auto-approve for system dispatch: %v", err)
+	for _, tool := range []string{"web_search", "code_exec", "shell", "file_edit", "send_message", "media_generate", "app_heal"} {
+		ctx := withSystemDispatch(context.Background(), "workflow")
+		if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: tool, Source: "skill"}); err != nil {
+			t.Fatalf("function_first workflow dispatch should auto-approve %s: %v", tool, err)
+		}
+	}
+}
+
+func TestUnattendedGate_FullAccessProfileExplicitlyAllowsCapability(t *testing.T) {
+	hook := NewPermissionHook(NewPermissionHub(time.Second),
+		WithPolicy(DefaultBaselinePolicy()),
+		WithSystemDispatchPolicy(FullAccessSystemDispatchPolicy()))
+	ctx := withSystemDispatch(context.Background(), "webhook")
+	if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "manage_skill", Source: "skill"}); err != nil {
+		t.Fatalf("full_access profile should explicitly allow manage_skill: %v", err)
 	}
 }

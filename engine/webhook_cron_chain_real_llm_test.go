@@ -134,7 +134,9 @@ func TestRealLLM_WebhookCronChain(t *testing.T) {
 	if err := wmgr.Init(ctx); err != nil {
 		t.Fatalf("webhook init: %v", err)
 	}
-	if err := wmgr.Register(ctx, &webhook.Webhook{Name: "collect-hook", Type: webhook.TypeGeneric, JobID: job.ID, UserID: "u1"}); err != nil {
+	if err := wmgr.Register(ctx, &webhook.Webhook{Name: "collect-hook", Type: webhook.TypeGeneric, JobID: job.ID, UserID: "u1",
+		Enabled: true, // 派发链路测试：显式启用（默认未启用，未启用端点回 423 不派发）
+	}); err != nil {
 		t.Fatalf("register webhook: %v", err)
 	}
 	wmgr.SetHandler(func(hctx context.Context, event *webhook.Event, _ string) error {

@@ -241,6 +241,10 @@ func (o *SolveSkill) verify(ctx context.Context, problem, candidate string) (ver
 	// 时才下调 AGREE——带单位/等价文字形式解析不了 → 不武断（信模型对「42支==42」这类等价的判断）。
 	if computed != "" {
 		switch {
+		case verdict == verdictUnverifiable && answersEqual(computed, candidate):
+			verdict = verdictAgree
+		case verdict == verdictUnverifiable && answersDefinitelyDiffer(computed, candidate):
+			verdict = verdictDisagree
 		case verdict == verdictDisagree && answersEqual(computed, candidate):
 			verdict = verdictAgree
 		case verdict == verdictAgree && answersDefinitelyDiffer(computed, candidate):

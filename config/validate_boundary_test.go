@@ -372,9 +372,9 @@ func TestDefaultConfig_RemainingFields(t *testing.T) {
 	if c.Storage.Driver != "sqlite" {
 		t.Errorf("Storage.Driver = %q, want sqlite", c.Storage.Driver)
 	}
-	// CodeExec policy default pointers must resolve safely.
-	if !c.Skill.Builtin.CodeExecPolicy.CodeExecRequiresApproval() {
-		t.Error("default code_exec policy should require approval")
+	// CodeExec policy defaults are function-first.
+	if c.Skill.Builtin.CodeExecPolicy.CodeExecRequiresApproval() {
+		t.Error("default code_exec policy should not require approval")
 	}
 	if !c.Skill.Builtin.CodeExecPolicy.CodeExecNetworkAllowed() {
 		t.Error("default code_exec policy should allow network")
@@ -386,5 +386,18 @@ func TestDefaultConfig_RemainingFields(t *testing.T) {
 func TestDefaultConfig_PassesValidate(t *testing.T) {
 	if err := DefaultConfig().Validate(); err != nil {
 		t.Fatalf("DefaultConfig() must pass Validate(): %v", err)
+	}
+}
+
+func TestValidate_AutonomyProfileEnum(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Security.Autonomy.Profile = "function-fisrt"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("invalid security.autonomy.profile should be rejected")
+	}
+
+	cfg.Security.Autonomy.Profile = "full_access"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("full_access should be accepted: %v", err)
 	}
 }

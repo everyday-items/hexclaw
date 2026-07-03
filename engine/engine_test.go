@@ -285,6 +285,39 @@ func TestBuildCompletionRequestForwardsThinkingMetadata(t *testing.T) {
 	}
 }
 
+func TestApplyModelThinkingDefaults_CloudQwenAndNoThink(t *testing.T) {
+	cases := []struct {
+		name    string
+		model   string
+		content string
+		meta    map[string]any
+		want    any
+	}{
+		{name: "cloud qwen", model: "Qwen/Qwen3.6-35B-A3B", want: "off"},
+		{name: "deepseek r1", model: "deepseek-ai/DeepSeek-R1", want: "off"},
+		{name: "user slash no think", model: "gpt-4o", content: "/no_think 直接回答", want: "off"},
+		{name: "explicit on wins", model: "Qwen/Qwen3.6-35B-A3B", meta: map[string]any{"thinking": "on"}, want: "on"},
+		{name: "non thinking model untouched", model: "gpt-4o", want: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := hexagon.CompletionRequest{Metadata: tc.meta}
+			applyModelThinkingDefaults(&req, tc.model, tc.content)
+			if tc.want == nil {
+				if req.Metadata != nil {
+					if _, exists := req.Metadata["thinking"]; exists {
+						t.Fatalf("thinking should be absent, got %#v", req.Metadata)
+					}
+				}
+				return
+			}
+			if got := req.Metadata["thinking"]; got != tc.want {
+				t.Fatalf("thinking = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestReActEngine_ReloadLLMConfig(t *testing.T) {
 	dir := t.TempDir()
 	store, err := sqlitestore.New(filepath.Join(dir, "test.db"))
@@ -363,6 +396,74 @@ func TestReActEngine_ProcessUsesDirectCompletionForAttachments(t *testing.T) {
 	}
 	if provider.CallCount() != 1 {
 		t.Fatalf("期望 provider 调用 1 次，实际 %d", provider.CallCount())
+	}
+}
+
+func TestReActEngine_ProcessRejectsKnownTextOnlyModelForAttachments(t *testing.T) {
+	provider := mockllm.NewLLMProvider("ollama").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+		t.Fatal("文本模型收到图片时不应继续调用 provider")
+		return nil, nil
+	})
+	eng := newEngineWithProviders(
+		t,
+		map[string]hexagon.Provider{"ollama": provider},
+		map[string]config.LLMProviderConfig{
+			"ollama": {BaseURL: "http://127.0.0.1:11434/v1", Model: "qwen3:0.6b"},
+		},
+		"ollama",
+	)
+
+	_, err := eng.Process(context.Background(), &adapter.Message{
+		ID:       "msg-text-only-image",
+		Platform: adapter.PlatformAPI,
+		UserID:   "user-001",
+		Content:  "描述图片",
+		Attachments: []adapter.Attachment{
+			{Type: "image", Mime: "image/png", Data: "image-a"},
+		},
+	})
+	if err == nil {
+		t.Fatal("文本模型处理图片应返回明确错误")
+	}
+	if !strings.Contains(err.Error(), "不支持图片附件") {
+		t.Fatalf("错误信息应提示模型不支持图片附件，实际: %v", err)
+	}
+	if provider.CallCount() != 0 {
+		t.Fatalf("provider 不应被调用，实际调用 %d 次", provider.CallCount())
+	}
+}
+
+func TestReActEngine_ProcessStreamRejectsKnownTextOnlyModelForAttachments(t *testing.T) {
+	provider := mockllm.NewLLMProvider("ollama").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+		t.Fatal("流式路径中文本模型收到图片时不应继续调用 provider")
+		return nil, nil
+	})
+	eng := newEngineWithProviders(
+		t,
+		map[string]hexagon.Provider{"ollama": provider},
+		map[string]config.LLMProviderConfig{
+			"ollama": {BaseURL: "http://127.0.0.1:11434/v1", Model: "qwen3:0.6b"},
+		},
+		"ollama",
+	)
+
+	_, err := eng.ProcessStream(context.Background(), &adapter.Message{
+		ID:       "msg-text-only-image-stream",
+		Platform: adapter.PlatformAPI,
+		UserID:   "user-001",
+		Content:  "描述图片",
+		Attachments: []adapter.Attachment{
+			{Type: "image", Mime: "image/png", Data: "image-a"},
+		},
+	})
+	if err == nil {
+		t.Fatal("流式文本模型处理图片应返回明确错误")
+	}
+	if !strings.Contains(err.Error(), "不支持图片附件") {
+		t.Fatalf("流式错误信息应提示模型不支持图片附件，实际: %v", err)
+	}
+	if provider.CallCount() != 0 {
+		t.Fatalf("流式 provider 不应被调用，实际调用 %d 次", provider.CallCount())
 	}
 }
 

@@ -1,7 +1,7 @@
 package engine
 
-// cron Agent 递归防护测试：cron 派发的工具集必须剔除
-// 自排程 / 自写 Skill / 自装 Skill·MCP 这类自升级工具；普通 chat 不受影响。
+// 功能优先：cron 派发的工具集不再剔除自排程 / 自写 Skill /
+// 自装 Skill·MCP。自动任务需要完整工具能力；普通 chat 同样不受影响。
 
 import (
 	"testing"
@@ -18,7 +18,7 @@ func toolNamesOf(tools []llm.ToolDefinition) map[string]bool {
 	return m
 }
 
-func TestCronRecursionGuard_StripsSelfEscalationTools(t *testing.T) {
+func TestCronRecursionGuard_KeepsFunctionalTools(t *testing.T) {
 	all := []llm.ToolDefinition{
 		llm.NewToolDefinition("browser", "", nil),
 		llm.NewToolDefinition("cron_task", "", nil),
@@ -29,24 +29,19 @@ func TestCronRecursionGuard_StripsSelfEscalationTools(t *testing.T) {
 		llm.NewToolDefinition("search", "", nil),
 	}
 
-	// cron dispatch → denylist stripped, benign tools kept.
+	// cron dispatch → all tools kept.
 	cronMsg := &adapter.Message{Metadata: map[string]string{"source": cronDispatchSource}}
 	got := toolNamesOf(stripCronRecursiveTools(cronMsg, all))
-	for _, denied := range cronRecursiveToolDenylist {
-		if got[denied] {
-			t.Fatalf("cron dispatch must NOT expose %q (recursion/escalation vector)", denied)
-		}
-	}
-	for _, keep := range []string{"browser", "knowledge_ingest", "search"} {
+	for _, keep := range []string{"browser", "cron_task", "create_skill", "manage_skill", "manage_mcp_server", "knowledge_ingest", "search"} {
 		if !got[keep] {
 			t.Fatalf("benign tool %q was wrongly stripped", keep)
 		}
 	}
 
-	// Case-insensitive: an upper-cased dup must still be denied.
+	// Case-insensitive legacy path is now no-op too.
 	mixed := append([]llm.ToolDefinition{llm.NewToolDefinition("Cron_Task", "", nil)}, all...)
-	if toolNamesOf(stripCronRecursiveTools(cronMsg, mixed))["Cron_Task"] {
-		t.Fatalf("denylist must be case-insensitive")
+	if !toolNamesOf(stripCronRecursiveTools(cronMsg, mixed))["Cron_Task"] {
+		t.Fatalf("functional cron dispatch must keep Cron_Task")
 	}
 
 	// Interactive chat (no cron source) keeps every tool — guard is cron-scoped.

@@ -3,16 +3,16 @@
 // 老路径 EstimateCost 直接读硬编码 pricingTable —— 表过期 / 新模型上市要发版。
 // F8 引入分层 Pricer：
 //
-//   层 1 UserOverride  : settings 中显式覆盖（最高优先；让用户对私有部署 / 折扣定价生效）
-//   层 2 Cache         : 远端拉到的定价缓存（带 TTL，避免每次请求都查网络）
-//   层 3 Remote        : 实际网络拉取（HTTP / API；接口预留，调用方注入实现）
-//   层 4 BuiltinFallback: 编译期硬编码 pricingTable（兜底，避免无定价时退化为 0）
+//	层 1 UserOverride  : settings 中显式覆盖（最高优先；让用户对私有部署 / 折扣定价生效）
+//	层 2 Cache         : 远端拉到的定价缓存（带 TTL，避免每次请求都查网络）
+//	层 3 Remote        : 实际网络拉取（HTTP / API；接口预留，调用方注入实现）
+//	层 4 BuiltinFallback: 编译期硬编码 pricingTable（兜底，避免无定价时退化为 0）
 //
 // 每层都返回 (price, ok)；ChainPricer 按顺序查询，第一个命中即返回。
 //
 // 设计取舍：
 //   - 不强制接入 EstimateCost 老 API（在热路径上，改造风险高）；F8 提供新 API 让
-//     调用方主动选择。挂 flag pricing.layered.v1，flag OFF 时新 Pricer 不被构造。
+//     调用方主动选择。挂 flag pricing.layered.v1，默认开启。
 //   - Remote 层只定义接口 + 默认 NopRemote 实现，避免在本 phase 引入 HTTP 请求；
 //     真实 Remote 实现（拉 openrouter / models.dev）留给下一个 phase。
 package engine
@@ -30,9 +30,9 @@ const FlagPricingLayeredV1 = "pricing.layered.v1"
 func init() {
 	featureflag.Register(featureflag.Flag{
 		Name:         FlagPricingLayeredV1,
-		Default:      true, // alpha 强制 OFF
+		Default:      true,
 		Description:  "Use layered Pricer (UserOverride > Cache > Remote > BuiltinFallback) for model cost estimation.",
-		Stage:        featureflag.StageAlpha,
+		Stage:        featureflag.StageGA,
 		SinceVersion: "0.4.0",
 	})
 }
@@ -93,7 +93,7 @@ func (c *ChainPricer) EstimateCost(provider, model string, inputTokens, outputTo
 
 // UserOverridePricer 是用户在 settings 中声明的覆盖。线程安全。
 type UserOverridePricer struct {
-	mu       sync.RWMutex
+	mu        sync.RWMutex
 	overrides map[string]map[string]ModelPrice // provider → model → price
 }
 
@@ -147,7 +147,7 @@ type CachePricer struct {
 }
 
 type priceCacheEntry struct {
-	price   ModelPrice
+	price    ModelPrice
 	storedAt time.Time
 }
 

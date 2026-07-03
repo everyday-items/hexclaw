@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hexagon-codes/ai-core/llm/anthropic"
 	"github.com/hexagon-codes/hexagon"
@@ -55,11 +56,15 @@ var latencyPriority = map[string]int{
 // 管理多个 LLM Provider，根据策略选择最优 Provider 处理请求。
 // 线程安全，可并发调用。
 type Selector struct {
-	mu        sync.RWMutex
-	providers map[string]hexagon.Provider // 已初始化的 Provider
-	cfg       config.LLMConfig            // 当前活跃的 LLM 配置（仅包含已加载 Provider）
-	defaultP  string                      // 默认 Provider 名称
+	mu             sync.RWMutex
+	providers      map[string]hexagon.Provider // 已初始化的 Provider
+	cfg            config.LLMConfig            // 当前活跃的 LLM 配置（仅包含已加载 Provider）
+	defaultP       string                      // 默认 Provider 名称
+	unhealthyUntil map[string]time.Time        // 运行时短期熔断，避免刚失败的 provider 立即被再次选中
+	now            func() time.Time
 }
+
+const defaultProviderCooldown = 2 * time.Minute
 
 // New 创建 LLM 路由器
 //
@@ -84,9 +89,11 @@ func New(cfg config.LLMConfig) (*Selector, error) {
 		defaultP = picked
 	}
 	return &Selector{
-		providers: providers,
-		cfg:       activeCfg,
-		defaultP:  defaultP,
+		providers:      providers,
+		cfg:            activeCfg,
+		defaultP:       defaultP,
+		unhealthyUntil: make(map[string]time.Time),
+		now:            time.Now,
 	}, nil
 }
 
@@ -124,9 +131,11 @@ func providerNames(m map[string]hexagon.Provider) []string {
 // 主要用于测试和自定义 Provider 装配，避免依赖真实网络 Provider。
 func NewWithProviders(cfg config.LLMConfig, providers map[string]hexagon.Provider) *Selector {
 	r := &Selector{
-		providers: make(map[string]hexagon.Provider, len(providers)),
-		cfg:       cloneLLMConfig(cfg),
-		defaultP:  cfg.Default,
+		providers:      make(map[string]hexagon.Provider, len(providers)),
+		cfg:            cloneLLMConfig(cfg),
+		defaultP:       cfg.Default,
+		unhealthyUntil: make(map[string]time.Time),
+		now:            time.Now,
 	}
 	for name, provider := range providers {
 		r.providers[name] = provider
@@ -153,7 +162,13 @@ var localHostMarkers = []string{
 // classification consistent with pickFallbackDefault's ollama heuristic so an
 // injected local provider can't win over a real remote one.
 func (r *Selector) isLocalProviderName(name string) bool {
-	if isLocalProvider(r.cfg.Providers[name]) {
+	// canonical 解析：与其它按名访问器一致，容忍 Title Case 名（AP-144 举一反三）——
+	// 否则本地 provider 用大写名查会漏 base_url 判定、误分类为云端（影响 AP-098）。
+	key := name
+	if canon, ok := r.canonicalNameLocked(name); ok {
+		key = canon
+	}
+	if isLocalProvider(r.cfg.Providers[key]) {
 		return true
 	}
 	return strings.Contains(strings.ToLower(name), "ollama")
@@ -256,11 +271,41 @@ func (r *Selector) createProvider(name string, pc config.LLMProviderConfig) hexa
 	return hexagon.NewOpenAI(pc.APIKey, opts...)
 }
 
+// canonicalNameLocked 把外部传入的 provider 名解析为注册时的配置 key。
+// 先精确匹配，miss 后大小写不敏感兜底（BUG-20260703/AP-144：前端展示层与
+// 持久化的 Agent 配置可能存 Title Case 名，运行期按名查表不能因大小写错位
+// 报「provider 不存在」或让模型偏好/健康标记静默失效）。
+// 调用方必须已持有 r.mu。
+func (r *Selector) canonicalNameLocked(name string) (string, bool) {
+	if _, ok := r.providers[name]; ok {
+		return name, true
+	}
+	if _, ok := r.cfg.Providers[name]; ok {
+		return name, true
+	}
+	trimmed := strings.TrimSpace(name)
+	for key := range r.providers {
+		if strings.EqualFold(strings.TrimSpace(key), trimmed) {
+			return key, true
+		}
+	}
+	for key := range r.cfg.Providers {
+		if strings.EqualFold(strings.TrimSpace(key), trimmed) {
+			return key, true
+		}
+	}
+	return name, false
+}
+
 // Get 获取指定名称的 Provider
 func (r *Selector) Get(name string) (hexagon.Provider, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	p, ok := r.providers[name]
+	key, ok := r.canonicalNameLocked(name)
+	if !ok {
+		return nil, false
+	}
+	p, ok := r.providers[key]
 	return p, ok
 }
 
@@ -307,6 +352,15 @@ func (r *Selector) Route(_ context.Context) (hexagon.Provider, string, error) {
 		if !ok {
 			return nil, "", fmt.Errorf("默认 Provider %s 不可用", r.defaultP)
 		}
+		if !r.isProviderHealthyLocked(r.defaultP) {
+			fallback := r.fallbackNameLocked([]string{r.defaultP})
+			if fallback == "" {
+				return nil, "", fmt.Errorf("默认 Provider %s 暂不可用且无可用备用 Provider", r.defaultP)
+			}
+			slog.Warn("[router] default provider unhealthy, route fallback selected",
+				"source", "llm", "default", r.defaultP, "selected", fallback)
+			return r.providers[fallback], fallback, nil
+		}
 		return p, r.defaultP, nil
 	}
 
@@ -326,6 +380,13 @@ func (r *Selector) Route(_ context.Context) (hexagon.Provider, string, error) {
 		if !ok {
 			return nil, "", fmt.Errorf("默认 Provider %s 不可用", r.defaultP)
 		}
+		if !r.isProviderHealthyLocked(r.defaultP) {
+			fallback := r.fallbackNameLocked([]string{r.defaultP})
+			if fallback == "" {
+				return nil, "", fmt.Errorf("默认 Provider %s 暂不可用且无可用备用 Provider", r.defaultP)
+			}
+			return r.providers[fallback], fallback, nil
+		}
 		return p, r.defaultP, nil
 	}
 
@@ -337,6 +398,22 @@ func (r *Selector) Route(_ context.Context) (hexagon.Provider, string, error) {
 	return r.providers[best], best, nil
 }
 
+// RouteModel 根据当前路由策略选择 Provider，并返回该 Provider 当前配置的模型名。
+//
+// Route 的第二返回值是 provider 名称，不是模型名；需要传给 llm.CompletionRequest.Model
+// 的调用点应使用本方法，避免把用户可见 provider 名（如“硅基流动”）误当模型名。
+func (r *Selector) RouteModel(ctx context.Context) (hexagon.Provider, string, error) {
+	p, providerName, err := r.Route(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	model := strings.TrimSpace(r.ProviderModel(providerName))
+	if model == "" {
+		return nil, "", fmt.Errorf("provider %s 未配置 model", providerName)
+	}
+	return p, model, nil
+}
+
 // Reload 使用新配置重建 Provider 集合并立即生效。
 func (r *Selector) Reload(cfg config.LLMConfig) error {
 	providers, activeCfg, defaultP := buildSelectorState(cfg)
@@ -346,6 +423,10 @@ func (r *Selector) Reload(cfg config.LLMConfig) error {
 	r.providers = providers
 	r.cfg = activeCfg
 	r.defaultP = defaultP
+	r.unhealthyUntil = make(map[string]time.Time)
+	if r.now == nil {
+		r.now = time.Now
+	}
 	return nil
 }
 
@@ -360,7 +441,11 @@ func (r *Selector) ActiveConfig() config.LLMConfig {
 func (r *Selector) ProviderModel(name string) string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if provider, ok := r.cfg.Providers[name]; ok {
+	key, ok := r.canonicalNameLocked(name)
+	if !ok {
+		return ""
+	}
+	if provider, ok := r.cfg.Providers[key]; ok {
 		return provider.Model
 	}
 	return ""
@@ -370,7 +455,11 @@ func (r *Selector) ProviderModel(name string) string {
 func (r *Selector) ProviderConfig(name string) (config.LLMProviderConfig, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	pc, ok := r.cfg.Providers[name]
+	key, ok := r.canonicalNameLocked(name)
+	if !ok {
+		return config.LLMProviderConfig{}, false
+	}
+	pc, ok := r.cfg.Providers[key]
 	return pc, ok
 }
 
@@ -386,6 +475,9 @@ func (r *Selector) selectByPriority(priorities map[string]int) string {
 
 	var candidates []ranked
 	for name := range r.providers {
+		if !r.isProviderHealthyLocked(name) {
+			continue
+		}
 		p, ok := priorities[name]
 		if !ok {
 			p = 999 // 未知 Provider 排到最后
@@ -415,6 +507,17 @@ func (r *Selector) Fallback(exclude ...string) (hexagon.Provider, string, error)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	name := r.fallbackNameLocked(exclude)
+	if name != "" {
+		slog.Warn("[router] provider fallback selected",
+			"source", "llm", "excluded", strings.Join(exclude, ","),
+			"selected", name, "is_local", r.isLocalProviderName(name))
+		return r.providers[name], name, nil
+	}
+	return nil, "", fmt.Errorf("没有可用的备用 Provider")
+}
+
+func (r *Selector) fallbackNameLocked(exclude []string) string {
 	excludeSet := make(map[string]bool, len(exclude))
 	for _, e := range exclude {
 		excludeSet[e] = true
@@ -426,7 +529,7 @@ func (r *Selector) Fallback(exclude ...string) (hexagon.Provider, string, error)
 	// plain alphabetical order made the local provider win every fallback).
 	var remote, local []string
 	for name := range r.providers {
-		if excludeSet[name] {
+		if excludeSet[name] || !r.isProviderHealthyLocked(name) {
 			continue
 		}
 		if r.isLocalProviderName(name) {
@@ -439,12 +542,9 @@ func (r *Selector) Fallback(exclude ...string) (hexagon.Provider, string, error)
 	sort.Strings(local)
 	names := append(remote, local...)
 	if len(names) > 0 {
-		slog.Warn("[router] provider fallback selected",
-			"source", "llm", "excluded", strings.Join(exclude, ","),
-			"selected", names[0], "is_local", len(remote) == 0)
-		return r.providers[names[0]], names[0], nil
+		return names[0]
 	}
-	return nil, "", fmt.Errorf("没有可用的备用 Provider")
+	return ""
 }
 
 // Providers 返回所有已加载的 Provider 名称
@@ -456,4 +556,51 @@ func (r *Selector) Providers() []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+// MarkProviderUnhealthy 将 provider 临时标记为不可路由，用于 429/服务不可用/模型下线等
+// 短期故障后的下一轮 Route/Fallback 避让。ttl<=0 时使用保守默认值。
+func (r *Selector) MarkProviderUnhealthy(name, reason string, ttl time.Duration) {
+	if r == nil || strings.TrimSpace(name) == "" {
+		return
+	}
+	if ttl <= 0 {
+		ttl = defaultProviderCooldown
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.unhealthyUntil == nil {
+		r.unhealthyUntil = make(map[string]time.Time)
+	}
+	if r.now == nil {
+		r.now = time.Now
+	}
+	// 健康表以注册 key 为准：engine 侧回传的 ProviderName 可能是 Title Case
+	// 展示名，不归一会让熔断标记永远打不到路由表上（BUG-20260703）。
+	if key, ok := r.canonicalNameLocked(name); ok {
+		name = key
+	}
+	until := r.now().Add(ttl)
+	if cur, ok := r.unhealthyUntil[name]; !ok || until.After(cur) {
+		r.unhealthyUntil[name] = until
+	}
+	slog.Warn("[router] provider marked unhealthy", "source", "llm", "provider", name, "reason", reason, "until", until.Format(time.RFC3339))
+}
+
+func (r *Selector) isProviderHealthyLocked(name string) bool {
+	if r == nil || len(r.unhealthyUntil) == 0 {
+		return true
+	}
+	until, ok := r.unhealthyUntil[name]
+	if !ok {
+		return true
+	}
+	now := time.Now
+	if r.now != nil {
+		now = r.now
+	}
+	if now().Before(until) {
+		return false
+	}
+	return true
 }

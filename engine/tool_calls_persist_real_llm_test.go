@@ -69,7 +69,7 @@ func TestRealLLM_ToolCallsPersistAcrossReload(t *testing.T) {
 
 	// 注册 cron_task 工具（既有真测证明真模型会可靠调它）→ 产生一次真实 tool_call。
 	compiler := cron.NewLLMCompiler(func() (hexagon.Provider, string, error) {
-		return router.Route(context.Background())
+		return router.RouteModel(context.Background())
 	})
 	sched := cron.NewScheduler(store.DB(), compiler, nil)
 	if err := sched.Init(ctx); err != nil {

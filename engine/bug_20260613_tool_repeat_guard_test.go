@@ -7,10 +7,13 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/ai-core/llm"
+	hruntime "github.com/hexagon-codes/hexagon/runtime"
 )
 
 func TestBug20260613_ToolRepeatGuardShortCircuits(t *testing.T) {
@@ -52,5 +55,66 @@ func TestBug20260613_ToolRepeatGuardDistinctArgsNotBlocked(t *testing.T) {
 		if strings.Contains(res.Content, "already called") {
 			t.Errorf("distinct args must not trip the guard (call %d, args %s)", i+1, url)
 		}
+	}
+}
+
+func TestToolRepeatGuard_UnsafeMutatingToolShortCircuitsAfterOne(t *testing.T) {
+	rte := newRuntimeToolExecutor(&ToolExecutor{})
+	call := llm.ToolCall{Name: "cron_task", Arguments: `{"action":"create","prompt":"每天早上9点采集百度热搜榜","schedule":"每天早上9点"}`}
+
+	first, _ := rte.Execute(context.Background(), call)
+	if strings.Contains(first.Content, "already called") {
+		t.Fatalf("first mutating tool call must be allowed, got %q", first.Content)
+	}
+	second, _ := rte.Execute(context.Background(), call)
+	if !strings.Contains(second.Content, "already called") {
+		t.Fatalf("second identical mutating tool call must be blocked, got %q", second.Content)
+	}
+}
+
+type repeatToolProvider struct {
+	calls int
+}
+
+func (p *repeatToolProvider) Name() string { return "repeat-tool" }
+func (p *repeatToolProvider) Complete(context.Context, llm.CompletionRequest) (*llm.CompletionResponse, error) {
+	p.calls++
+	return &llm.CompletionResponse{
+		ToolCalls: []llm.ToolCall{{
+			ID:        fmt.Sprintf("call-%d", p.calls),
+			Name:      "cron_task",
+			Arguments: `{"action":"create","prompt":"每天早上9点采集百度热搜榜","schedule":"每天早上9点"}`,
+		}},
+	}, nil
+}
+func (p *repeatToolProvider) Stream(context.Context, llm.CompletionRequest) (*llm.Stream, error) {
+	return nil, errors.New("unused")
+}
+
+func TestToolRepeatGuard_RuntimeStopsAfterRepeatedMutatingTool(t *testing.T) {
+	provider := &repeatToolProvider{}
+	runner := hruntime.NewRunner(hruntime.Config{
+		ProviderSelector: hruntime.StaticProviderSelector{Provider: provider, Name: "repeat", Model: "m"},
+		ToolExecutor:     newRuntimeToolExecutor(&ToolExecutor{}),
+		Middleware:       []hruntime.Middleware{runtimeRepeatGuardStopMiddleware{}},
+		DefaultMaxTurns:  25,
+	})
+
+	result, err := runner.Run(context.Background(), hruntime.Request{
+		ID:       "repeat-mutating-tool",
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: "create task"}},
+		Tools:    []llm.ToolDefinition{{Type: "function", Function: llm.ToolFunctionDef{Name: "cron_task"}}},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if provider.calls > 2 {
+		t.Fatalf("repeat guard must stop the runtime after the blocked repeat, provider calls=%d", provider.calls)
+	}
+	if result.StopReason != hruntime.StopReasonEndTurn {
+		t.Fatalf("StopReason=%q, want end_turn", result.StopReason)
+	}
+	if !strings.Contains(result.Content, "already called") {
+		t.Fatalf("final content should explain the repeat guard, got %q", result.Content)
 	}
 }

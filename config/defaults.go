@@ -2,7 +2,7 @@ package config
 
 // DefaultConfig 返回安全的默认配置
 //
-// 所有安全选项默认开启，高风险 Skill 默认关闭。
+// 默认配置采用功能优先：主要内置能力默认开启，安全/审批能力作为可配置治理层保留。
 // 用户只需设置 LLM API Key 即可运行。
 func DefaultConfig() *Config {
 	return &Config{
@@ -56,6 +56,9 @@ func DefaultConfig() *Config {
 				RequestsPerMinute: 20,
 				RequestsPerHour:   200,
 			},
+			Autonomy: AutonomyConfig{
+				Profile: "function_first",
+			},
 		},
 		Skill: SkillConfig{
 			Sandbox: SandboxConfig{
@@ -72,13 +75,13 @@ func DefaultConfig() *Config {
 				Translate: true,
 				Summary:   true,
 				Browser:   true,
-				Code:      false, // 高风险，默认关闭
-				Shell:     false, // 高风险，默认关闭
-				CodeExec:  true,  // 沙箱代码执行（Python/JS/Go），支持抓取网页、数据处理等
-				FileOps:   true,  // 受限于 workspace，默认开启
+				Code:      true, // 功能优先：默认开启代码能力
+				Shell:     true, // 功能优先：默认开启 shell 能力
+				CodeExec:  true, // 沙箱代码执行（Python/JS/Go），支持抓取网页、数据处理等
+				FileOps:   true, // 受限于 workspace，默认开启
 				CodeExecPolicy: CodeExecPolicyConfig{
-					RequireApproval: boolPtr(true), // 安全默认：需要用户审批
-					Network:         boolPtr(true), // 允许网络访问：抓取网页、调用 API
+					RequireApproval: boolPtr(false), // 功能优先：默认无需审批
+					Network:         boolPtr(true),  // 允许网络访问：抓取网页、调用 API
 				},
 			},
 		},
@@ -151,7 +154,7 @@ func DefaultConfig() *Config {
 			},
 		},
 		Heartbeat: HeartbeatConfig{
-			Enabled:      false,
+			Enabled:      true,
 			IntervalMins: 15,
 		},
 		Router: RouterConfig{

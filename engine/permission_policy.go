@@ -1,4 +1,4 @@
-// permission_policy.go 实现 v0.4.0 H2 Permission Policy Engine（feature-flag gated）。
+// permission_policy.go 实现 v0.4.0 H2 Permission Policy Engine（默认启用，可由 feature flag 关闭）。
 //
 // 老路径（PermissionHook.classifyRisk）只支持"硬编码工具名 → 风险等级"的二元分类，
 // 表达力有限：无法基于参数、来源、会话元数据做精细决策；无法被用户在 settings 中
@@ -10,8 +10,8 @@
 //   - 多条规则按声明顺序，第一条命中即 short-circuit
 //   - 未命中任何规则 → defaultAction（建议默认 allow，保留老 classifyRisk 黑名单兜底）
 //
-// feature flag `tool.policy.engine` 默认 OFF（alpha），flag 开启时 PermissionHook
-// 优先调 PolicyEngine 评估；OFF 时退化为老 classifyRisk 路径，行为与 v0.3 完全一致。
+// feature flag `tool.policy.engine` 默认 ON。PermissionHook 优先调 PolicyEngine
+// 评估；显式 OFF 时退化为老 classifyRisk 路径，用于回退。
 package engine
 
 import (

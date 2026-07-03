@@ -96,6 +96,96 @@ func TestCompleteWithFailover_RateLimitRetriesSameProvider(t *testing.T) {
 	}
 }
 
+func TestCompleteWithFailover_RateLimitSwitchesAfterRetriesExhausted(t *testing.T) {
+	p1 := &scriptedProvider{
+		name: "p1",
+		completeSeq: []error{
+			errors.New("429 too many requests"),
+			errors.New("429 too many requests"),
+			errors.New("429 too many requests"),
+			errors.New("429 too many requests"),
+		},
+	}
+	p2 := &scriptedProvider{name: "p2"}
+	var fallbackCalls atomic.Int32
+	var unhealthyMarks atomic.Int32
+	fc := &LLMCallContext{
+		Provider:     p1,
+		ProviderName: "p1",
+		Fallback: func(exclude ...string) (llm.Provider, string, error) {
+			fallbackCalls.Add(1)
+			return p2, "p2", nil
+		},
+		MarkProviderUnhealthy: func(name, reason string) {
+			if name == "p1" && reason == llm.FailRateLimit.String() {
+				unhealthyMarks.Add(1)
+			}
+		},
+		Backoff: func(context.Context, time.Duration) error { return nil },
+	}
+
+	resp, err := CompleteWithFailover(context.Background(), fc, llm.CompletionRequest{})
+	if err != nil {
+		t.Fatalf("expected success after switching provider, got: %v", err)
+	}
+	if resp.Content != "ok-from-p2" {
+		t.Fatalf("expected p2 response, got %q", resp.Content)
+	}
+	if got := p1.calls.Load(); got != 4 {
+		t.Fatalf("expected p1 called 4 times before switch, got %d", got)
+	}
+	if got := p2.calls.Load(); got != 1 {
+		t.Fatalf("expected p2 called once, got %d", got)
+	}
+	if got := fallbackCalls.Load(); got != 1 {
+		t.Fatalf("expected one fallback call, got %d", got)
+	}
+	if got := unhealthyMarks.Load(); got != 1 {
+		t.Fatalf("expected one unhealthy mark, got %d", got)
+	}
+	if fc.ProviderName != "p2" {
+		t.Fatalf("expected final provider p2, got %q", fc.ProviderName)
+	}
+}
+
+func TestCompleteWithFailover_ModelNotFoundSwitchesWhenFallbackAvailable(t *testing.T) {
+	p1 := &scriptedProvider{
+		name:        "p1",
+		completeSeq: []error{errors.New("404 model not found")},
+	}
+	p2 := &scriptedProvider{name: "p2"}
+	var unhealthyMarks atomic.Int32
+	fc := &LLMCallContext{
+		Provider:     p1,
+		ProviderName: "p1",
+		Fallback: func(exclude ...string) (llm.Provider, string, error) {
+			return p2, "p2", nil
+		},
+		MarkProviderUnhealthy: func(name, reason string) {
+			if name == "p1" && reason == llm.FailModelNotFound.String() {
+				unhealthyMarks.Add(1)
+			}
+		},
+	}
+
+	resp, err := CompleteWithFailover(context.Background(), fc, llm.CompletionRequest{})
+	if err != nil {
+		t.Fatalf("expected model-not-found to switch provider, got: %v", err)
+	}
+	if resp.Content != "ok-from-p2" {
+		t.Fatalf("expected p2 response, got %q", resp.Content)
+	}
+	if got := p1.calls.Load(); got != 1 {
+		t.Fatalf("expected p1 fail-fast before switch, got %d calls", got)
+	}
+	if got := p2.calls.Load(); got != 1 {
+		t.Fatalf("expected p2 called once, got %d", got)
+	}
+	if got := unhealthyMarks.Load(); got != 1 {
+		t.Fatalf("expected one unhealthy mark, got %d", got)
+	}
+}
+
 func TestCompleteWithFailover_ProviderDownSwitches(t *testing.T) {
 	p1 := &scriptedProvider{
 		name:        "p1",

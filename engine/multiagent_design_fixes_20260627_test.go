@@ -77,16 +77,15 @@ func TestOrchestrate_Supervisor_DedupsRedispatch(t *testing.T) {
 	}
 }
 
-// ⑤ 根治（本会话强化，取代上一版「source+spawn_depth」弱判据）：solve 源 code_exec 自动放行须凭
-// **不可伪造的 grant**（typed ctx value）。伪造 metadata（连 source=solve + spawn_depth 一并伪造）
-// 而无 grant 一律不放行——堵死「同塞两个可伪造字段即骗过闸」的越权面。
-func TestPermission_ForgedSolveSourceTopLevelDenied(t *testing.T) {
+// ⑤ grant 仍是 solve 内部授权的权威来源；source=solve 来自 metadata，不能单独作为
+// code_exec 授权依据。
+func TestPermission_ForgedSolveSourceTopLevelDeniedWithoutGrant(t *testing.T) {
 	hub := NewPermissionHub(5 * time.Second)
 	hook := NewPermissionHook(hub)
-	// 最坏伪造：metadata source=solve 且连深度也伪造成 maxSpawnDepth，但无 grant → code_exec 不放行。
+	// 伪造 source=solve 但没有 grant → 拒绝。
 	ctxForged := withSpawnDepth(withSystemDispatch(context.Background(), solveDispatchSource), maxSpawnDepth)
 	if err := hook.BeforeToolCall(ctxForged, &ToolCallInfo{Name: codeExecToolName, Source: "skill"}); err == nil {
-		t.Error("回归(设计⑤根治): 伪造 metadata(source=solve + spawn_depth)而无 grant 不应放行 code_exec")
+		t.Error("伪造 source=solve 不应放行 code_exec；必须携带 solve grant")
 	}
 	// 真 solve 派生：携带不可伪造 grant → 放行沙箱 code_exec。
 	ctxReal := withSolveGrant(context.Background())

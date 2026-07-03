@@ -305,6 +305,38 @@ func TestBuildAdapterMessagePreservesRequestIDAndExplicitModelRouting(t *testing
 	}
 }
 
+// GO-3（BUG-20260703）：WS 入站是信任边界——伪造的系统派发保留键必须被剥除，
+// 否则外部客户端可 source=cron + cron_job_id 盗用他人任务的授权（提权）。
+func TestBuildAdapterMessageStripsForgedDispatchKeys(t *testing.T) {
+	incoming := wsMessage{
+		Type:    "message",
+		Content: "帮我查天气",
+		UserID:  "desktop-user",
+		Metadata: map[string]string{
+			"source":       "cron",
+			"cron_job_id":  "victim-job",
+			"spawn_depth":  "0",
+			"tool_allow":   "shell,code",
+			"thinking":     "on", // 合法键保留
+			"pinned_agent": "translator",
+		},
+	}
+
+	msg := buildAdapterMessage("chat-1", incoming)
+
+	for _, k := range []string{"source", "cron_job_id", "spawn_depth", "tool_allow"} {
+		if _, ok := msg.Metadata[k]; ok {
+			t.Errorf("[GO-3] 伪造派发键 %q 未从 WS 入站 metadata 剥除", k)
+		}
+	}
+	if msg.Metadata["thinking"] != "on" {
+		t.Errorf("合法键 thinking 被误删，实际 %q", msg.Metadata["thinking"])
+	}
+	if msg.Metadata["pinned_agent"] != "translator" {
+		t.Errorf("合法键 pinned_agent 被误删，实际 %q", msg.Metadata["pinned_agent"])
+	}
+}
+
 // TestConnManagement 测试连接管理基本操作
 func TestConnManagement(t *testing.T) {
 	a := New()

@@ -7,6 +7,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -139,15 +140,30 @@ type PermissionRequestData struct {
 
 // SendPermissionRequest sends a tool approval request to the frontend via WebSocket.
 func (a *WebAdapter) SendPermissionRequest(ctx context.Context, sessionID string, data *PermissionRequestData) error {
+	if data == nil {
+		return errors.New("permission request data is nil")
+	}
+	msg := permissionRequestMessage(sessionID, data)
 	chatID, ok := a.sessionConns.Load(sessionID)
 	if !ok {
-		return fmt.Errorf("no WebSocket connection for session %s", sessionID)
+		return a.broadcastPermissionRequest(ctx, msg, "", fmt.Errorf("no WebSocket connection for session %s", sessionID))
 	}
-	conn, ok := a.getConn(chatID.(string))
+	chatIDStr, ok := chatID.(string)
+	if !ok || chatIDStr == "" {
+		return a.broadcastPermissionRequest(ctx, msg, "", fmt.Errorf("invalid WebSocket connection binding for session %s", sessionID))
+	}
+	conn, ok := a.getConn(chatIDStr)
 	if !ok {
-		return fmt.Errorf("WebSocket connection %s disconnected", chatID)
+		return a.broadcastPermissionRequest(ctx, msg, chatIDStr, fmt.Errorf("WebSocket connection %s disconnected", chatIDStr))
 	}
-	msg := wsMessage{
+	if err := wsjson.Write(ctx, conn, msg); err != nil {
+		return a.broadcastPermissionRequest(ctx, msg, chatIDStr, err)
+	}
+	return nil
+}
+
+func permissionRequestMessage(sessionID string, data *PermissionRequestData) wsMessage {
+	return wsMessage{
 		Type:      "tool_approval_request",
 		SessionID: sessionID,
 		RequestID: data.ID,
@@ -158,7 +174,42 @@ func (a *WebAdapter) SendPermissionRequest(ctx context.Context, sessionID string
 			"risk":       data.Risk,
 		},
 	}
-	return wsjson.Write(ctx, conn, msg)
+}
+
+func (a *WebAdapter) broadcastPermissionRequest(ctx context.Context, msg wsMessage, excludeChatID string, routeErr error) error {
+	sent := 0
+	var firstErr error
+	a.conns.Range(func(key, value any) bool {
+		chatID, _ := key.(string)
+		if chatID == excludeChatID {
+			return true
+		}
+		conn, ok := value.(*websocket.Conn)
+		if !ok {
+			return true
+		}
+		if err := wsjson.Write(ctx, conn, msg); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return true
+		}
+		sent++
+		return true
+	})
+	if sent > 0 {
+		if routeErr != nil {
+			slog.Warn("审批请求使用 WebSocket 广播兜底", "session_id", msg.SessionID, "request_id", msg.RequestID, "err", routeErr)
+		}
+		return nil
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	if routeErr != nil {
+		return routeErr
+	}
+	return fmt.Errorf("no active WebSocket connections for session %s", msg.SessionID)
 }
 
 // Broadcast 向所有活跃 WebSocket 连接广播消息。
@@ -552,6 +603,9 @@ func buildAdapterMessage(chatID string, incoming wsMessage) *adapter.Message {
 	for k, v := range incoming.Metadata {
 		metadata[k] = v
 	}
+	// GO-3：WebSocket 入站是信任边界——剥除只能由受信内部派发器盖章的保留键，
+	// 否则客户端可伪造 source=cron + cron_job_id 盗用他人任务的授权（提权）。
+	adapter.StripReservedDispatchMetadata(metadata)
 	if incoming.RequestID != "" {
 		metadata["request_id"] = incoming.RequestID
 	}

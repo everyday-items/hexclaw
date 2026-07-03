@@ -33,6 +33,13 @@ type LLMCallContext struct {
 	// Logger 用于打 failover 转移日志。nil 时静默。
 	Logger func(msg string, fields ...any)
 
+	// MarkProviderUnhealthy 在当前 Provider 出现短期故障并准备切换时被调用。
+	// Router 可据此把该 Provider 临时移出 Route/Fallback 候选，避免下一轮请求又选回失败点。
+	MarkProviderUnhealthy func(name, reason string)
+
+	// Backoff 用于测试中跳过真实 sleep；nil 时使用 time.After。
+	Backoff func(context.Context, time.Duration) error
+
 	// Middlewares v0.4.0 H8：把 Provider 包装一层 ProviderMiddleware（rate limit /
 	// observe / prompt rewrite 等）；flag model.gateway.v1 OFF 时被忽略。
 	// 列表会以洋葱模型应用：第一个最外层、最后一个最里层。
@@ -46,6 +53,21 @@ func (fc *LLMCallContext) applyGateway(ctx context.Context) hexagon.Provider {
 		return fc.Provider
 	}
 	return Chain(ctx, fc.Provider, fc.Middlewares...)
+}
+
+func (fc *LLMCallContext) sleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	if fc.Backoff != nil {
+		return fc.Backoff(ctx, d)
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
 }
 
 // maxFailoverIterations 是兜底硬上限，防止 Compress / Fallback 配合错误把循环推进死。
@@ -119,6 +141,20 @@ func CompleteWithFailover(
 		}
 
 		if !action.Retry {
+			if reason == llm.FailModelNotFound && fc.Fallback != nil {
+				if fc.MarkProviderUnhealthy != nil {
+					fc.MarkProviderUnhealthy(fc.ProviderName, reason.String())
+				}
+				next, name, fbErr := fc.Fallback(tried...)
+				if fbErr == nil {
+					fc.Provider = next
+					fc.ProviderName = name
+					tried = append(tried, name)
+					sameProviderRetries = 0
+					continue
+				}
+				return nil, fmt.Errorf("%s (fallback exhausted: %v): %w", action.UserFacing, fbErr, err)
+			}
 			return nil, fmt.Errorf("%s: %w", action.UserFacing, err)
 		}
 
@@ -146,14 +182,23 @@ func CompleteWithFailover(
 			// 同 Provider 退避重试（rate-limit / unknown）
 			sameProviderRetries++
 			if sameProviderRetries > action.MaxRetries {
+				if fc.Fallback != nil && shouldSwitchProviderAfterRetryExhausted(reason) {
+					if fc.MarkProviderUnhealthy != nil {
+						fc.MarkProviderUnhealthy(fc.ProviderName, reason.String())
+					}
+					next, name, fbErr := fc.Fallback(tried...)
+					if fbErr == nil {
+						fc.Provider = next
+						fc.ProviderName = name
+						tried = append(tried, name)
+						sameProviderRetries = 0
+						continue
+					}
+				}
 				return nil, fmt.Errorf("%s (retries exhausted): %w", action.UserFacing, err)
 			}
-			if action.BackoffSeconds > 0 {
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(time.Duration(action.BackoffSeconds) * time.Second):
-				}
+			if err := fc.sleep(ctx, time.Duration(action.BackoffSeconds)*time.Second); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -204,6 +249,20 @@ func StreamWithFailover(
 		}
 
 		if !action.Retry {
+			if reason == llm.FailModelNotFound && fc.Fallback != nil {
+				if fc.MarkProviderUnhealthy != nil {
+					fc.MarkProviderUnhealthy(fc.ProviderName, reason.String())
+				}
+				next, name, fbErr := fc.Fallback(tried...)
+				if fbErr == nil {
+					fc.Provider = next
+					fc.ProviderName = name
+					tried = append(tried, name)
+					sameProviderRetries = 0
+					continue
+				}
+				return nil, fmt.Errorf("%s (fallback exhausted: %v): %w", action.UserFacing, fbErr, err)
+			}
 			return nil, fmt.Errorf("%s: %w", action.UserFacing, err)
 		}
 
@@ -230,17 +289,35 @@ func StreamWithFailover(
 		default:
 			sameProviderRetries++
 			if sameProviderRetries > action.MaxRetries {
+				if fc.Fallback != nil && shouldSwitchProviderAfterRetryExhausted(reason) {
+					if fc.MarkProviderUnhealthy != nil {
+						fc.MarkProviderUnhealthy(fc.ProviderName, reason.String())
+					}
+					next, name, fbErr := fc.Fallback(tried...)
+					if fbErr == nil {
+						fc.Provider = next
+						fc.ProviderName = name
+						tried = append(tried, name)
+						sameProviderRetries = 0
+						continue
+					}
+				}
 				return nil, fmt.Errorf("%s (retries exhausted): %w", action.UserFacing, err)
 			}
-			if action.BackoffSeconds > 0 {
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(time.Duration(action.BackoffSeconds) * time.Second):
-				}
+			if err := fc.sleep(ctx, time.Duration(action.BackoffSeconds)*time.Second); err != nil {
+				return nil, err
 			}
 		}
 	}
 
 	return nil, fmt.Errorf("failover exhausted iterations: %w", lastErr)
+}
+
+func shouldSwitchProviderAfterRetryExhausted(reason llm.FailoverReason) bool {
+	switch reason {
+	case llm.FailRateLimit, llm.FailProviderDown, llm.FailUnknown:
+		return true
+	default:
+		return false
+	}
 }

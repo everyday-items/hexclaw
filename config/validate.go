@@ -53,6 +53,14 @@ func (c *Config) Validate() error {
 			Suggest: "用 127.0.0.1 / localhost / 0.0.0.0",
 		})
 	}
+	if !isValidAutonomyProfile(c.Security.Autonomy.Profile) {
+		errs = append(errs, &ValidationError{
+			Field:   "security.autonomy.profile",
+			Value:   c.Security.Autonomy.Profile,
+			Rule:    "function_first / balanced / strict / full_access",
+			Suggest: "功能优先默认用 function_first；需要显式全开放用 full_access",
+		})
+	}
 
 	// 2. Budget：时间格式要可解析
 	if c.Budget.MaxDuration != "" {
@@ -154,6 +162,15 @@ func isValidTTSProvider(provider string, llmProviders map[string]LLMProviderConf
 	}
 	_, ok := llmProviders[prefix]
 	return ok
+}
+
+func isValidAutonomyProfile(profile string) bool {
+	switch strings.ToLower(strings.TrimSpace(profile)) {
+	case "", "function_first", "function-first", "functional_first", "functional-first", "balanced", "balance", "strict", "full_access", "full-access", "full", "all":
+		return true
+	default:
+		return false
+	}
 }
 
 // isPlausibleVoiceID 粗略校验 Voice ID 是否合法。

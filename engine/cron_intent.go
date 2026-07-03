@@ -170,6 +170,7 @@ func applyCronIntentGuidance(req *llm.CompletionRequest) {
 		// (filesystem/mcp/search). This both stops the LLM from implementing
 		// the schedule with the wrong tool and keeps the tool_use_id chain safe.
 		req.Tools = cronTool
+		delete(req.Metadata, "cron_context")
 		guidance = cronToolGuidanceSystemPrompt
 		logCronGuidanceApplied("tool", toolsIn, 1)
 	} else {

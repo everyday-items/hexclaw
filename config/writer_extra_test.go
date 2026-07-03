@@ -161,12 +161,12 @@ func TestAtomicWriteFile_OverwritesExisting(t *testing.T) {
 	}
 }
 
-// TestCodeExecPolicy_NilDefaultsAreSafe verifies the nil-pointer policy accessors
-// default to the secure/permissive values documented on the type.
-func TestCodeExecPolicy_NilDefaultsAreSafe(t *testing.T) {
+// TestCodeExecPolicy_NilDefaultsAreFunctional verifies the nil-pointer policy
+// accessors default to function-first values documented on the type.
+func TestCodeExecPolicy_NilDefaultsAreFunctional(t *testing.T) {
 	var p CodeExecPolicyConfig // both pointers nil
-	if !p.CodeExecRequiresApproval() {
-		t.Error("nil RequireApproval should default to true (safe)")
+	if p.CodeExecRequiresApproval() {
+		t.Error("nil RequireApproval should default to false (function-first)")
 	}
 	if !p.CodeExecNetworkAllowed() {
 		t.Error("nil Network should default to true (network allowed)")

@@ -7,7 +7,11 @@ import (
 	"testing"
 
 	"github.com/hexagon-codes/ai-core/llm"
+	aitool "github.com/hexagon-codes/ai-core/tool"
+	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/hexagon/testing/mock"
 	"github.com/hexagon-codes/hexclaw/featureflag"
+	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
 
@@ -83,6 +87,37 @@ func TestToolExecutor_ExecuteSkill(t *testing.T) {
 	}
 	if !recorder.afterCalled {
 		t.Error("afterHook was not called")
+	}
+}
+
+func TestToolExecutor_BuiltinFileToolOverridesSameNameMCP(t *testing.T) {
+	reg := skill.NewRegistry()
+	reg.Register(&testSkill{name: "list_directory", result: "from builtin file broker"})
+
+	orig := hexagon.ConnectMCPStdioWithEnv
+	hexagon.ConnectMCPStdioWithEnv = func(ctx context.Context, command string, env map[string]string, args ...string) ([]hexagon.Tool, func(), error) {
+		return []hexagon.Tool{mock.NewTool("list_directory", mock.WithToolExecuteFn(func(context.Context, map[string]any) (aitool.Result, error) {
+			return aitool.NewResult("from external mcp filesystem"), nil
+		}))}, func() {}, nil
+	}
+	t.Cleanup(func() { hexagon.ConnectMCPStdioWithEnv = orig })
+
+	mgr := hexmcp.NewManager()
+	if err := mgr.AddServer(context.Background(), hexmcp.ServerConfig{
+		Name:      "filesystem",
+		Transport: "stdio",
+		Command:   "stub",
+		Enabled:   true,
+	}); err != nil {
+		t.Fatalf("add mcp server: %v", err)
+	}
+
+	got, err := NewToolExecutor(reg, mgr).Execute(context.Background(), "list_directory", nil)
+	if err != nil {
+		t.Fatalf("execute list_directory: %v", err)
+	}
+	if got != "from builtin file broker" {
+		t.Fatalf("same-name file tool must be handled by builtin skill before MCP, got %q", got)
 	}
 }
 

@@ -11,8 +11,9 @@ package engine
 // are not cron, and nothing else gated it.
 //
 // These tests enumerate ALL capability-mutation tools (granularity matches the
-// bug: adding a new capability-mutation tool without a baseline rule must FAIL),
-// and lock the unattended-deny behavior.
+// bug: adding a new capability-mutation tool without a baseline rule must FAIL).
+// Under the function-first automation profile, unattended system dispatches
+// still deny capability mutation unless an explicit autonomy switch enables it.
 
 import (
 	"context"
@@ -43,10 +44,7 @@ func TestBUGF1_CapabilityMutationToolsGatedByBaselinePolicy(t *testing.T) {
 	}
 }
 
-func TestBUGF1_ManageSkillDeniedForUnattendedWebhookDispatch(t *testing.T) {
-	// No reviewer + not in the read-collect auto-approve allowlist → an unattended
-	// webhook dispatch must be DENIED (fail-closed). Before the fix this returned
-	// nil (allowed) because the policy treated manage_skill as ActionAllow.
+func TestBUGF1_ManageSkillDeniedForUnattendedWebhookDispatchByDefault(t *testing.T) {
 	hook := NewPermissionHook(NewPermissionHub(time.Second), WithPolicy(DefaultBaselinePolicy()))
 	ctx := withSystemDispatch(context.Background(), "webhook")
 	err := hook.BeforeToolCall(ctx, &ToolCallInfo{
@@ -55,6 +53,21 @@ func TestBUGF1_ManageSkillDeniedForUnattendedWebhookDispatch(t *testing.T) {
 		Arguments: map[string]any{"action": "install", "keyword": "evil"},
 	})
 	if err == nil {
-		t.Fatal("BUG-F1: manage_skill must NOT auto-run from a webhook dispatch (privilege escalation / capability injection)")
+		t.Fatal("function_first webhook dispatch must deny manage_skill unless explicitly enabled")
+	}
+}
+
+func TestBUGF1_ManageSkillAllowedWhenFullAccessProfileExplicit(t *testing.T) {
+	hook := NewPermissionHook(NewPermissionHub(time.Second),
+		WithPolicy(DefaultBaselinePolicy()),
+		WithSystemDispatchPolicy(FullAccessSystemDispatchPolicy()))
+	ctx := withSystemDispatch(context.Background(), "webhook")
+	err := hook.BeforeToolCall(ctx, &ToolCallInfo{
+		Name:      "manage_skill",
+		Source:    "skill",
+		Arguments: map[string]any{"action": "install", "keyword": "trusted"},
+	})
+	if err != nil {
+		t.Fatalf("full_access profile should allow manage_skill automation: %v", err)
 	}
 }

@@ -66,8 +66,9 @@ func TestOrchestrate_RealModel(t *testing.T) {
 				{"role": "system", "content": "You are the " + spec.Agent + " agent. Answer concisely."},
 				{"role": "user", "content": "/no_think " + spec.Task},
 			},
-			"max_tokens":  150,
-			"temperature": 0.2,
+			"max_tokens":      150,
+			"temperature":     0.2,
+			"enable_thinking": false,
 		})
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")

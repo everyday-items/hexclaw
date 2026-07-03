@@ -50,6 +50,29 @@ func SystemDispatchSource(ctx context.Context) string {
 	return s
 }
 
+// systemDispatchTaskKey carries the stable task reference of a system dispatch
+// ("cron:<jobID>" / "webhook:<id>" / "workflow:<id>"). The engine stamps it at
+// Process/ProcessStream entry alongside the dispatch source. The permission
+// gate reads it to evaluate task-scoped grants and to attribute persisted
+// permission decisions to the task that triggered the run.
+type systemDispatchTaskKey struct{}
+
+// WithSystemDispatchTask returns a context carrying the task reference of the
+// current system dispatch. An empty ref returns ctx unchanged.
+func WithSystemDispatchTask(ctx context.Context, taskRef string) context.Context {
+	if taskRef == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, systemDispatchTaskKey{}, taskRef)
+}
+
+// SystemDispatchTaskRef returns the stamped task reference, or "" when the
+// dispatch carries no task identity (heartbeat, interactive runs, tests).
+func SystemDispatchTaskRef(ctx context.Context) string {
+	s, _ := ctx.Value(systemDispatchTaskKey{}).(string)
+	return s
+}
+
 // snapshotBaseTitleKey carries a stable base title for scheduled knowledge-base
 // writes. The cron dispatcher stamps the job's name so every run of a job
 // ingests under one coherent snapshot series, even when the model varies the

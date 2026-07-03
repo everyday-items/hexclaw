@@ -72,7 +72,7 @@ func TestRealLLM_ConversationCreatesTask(t *testing.T) {
 
 	// Scheduler with a REAL LLM compiler (AddJobFromPrompt compiles the spec).
 	compiler := cron.NewLLMCompiler(func() (hexagon.Provider, string, error) {
-		return router.Route(context.Background())
+		return router.RouteModel(context.Background())
 	})
 	sched := cron.NewScheduler(store.DB(), compiler, nil)
 	if err := sched.Init(ctx); err != nil {
@@ -106,7 +106,7 @@ func TestRealLLM_ConversationCreatesTask(t *testing.T) {
 			called = true
 		}
 	}
-	t.Logf("reply tool_calls=%v content=%q", convReplyToolNames(reply), truncate(reply.Content, 100))
+	t.Logf("reply tool_calls=%v args=%v content=%q", convReplyToolNames(reply), convReplyToolArgs(reply), truncate(reply.Content, 100))
 
 	jobs, lerr := sched.ListJobs(ctx, "user-001")
 	if lerr != nil {
@@ -139,6 +139,14 @@ func convReplyToolNames(r *adapter.Reply) []string {
 	out := make([]string, 0, len(r.ToolCalls))
 	for _, tc := range r.ToolCalls {
 		out = append(out, tc.Name)
+	}
+	return out
+}
+
+func convReplyToolArgs(r *adapter.Reply) []string {
+	out := make([]string, 0, len(r.ToolCalls))
+	for _, tc := range r.ToolCalls {
+		out = append(out, truncate(tc.Arguments, 180))
 	}
 	return out
 }

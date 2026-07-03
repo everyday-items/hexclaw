@@ -98,8 +98,9 @@ func TestSpawn_TotalFanoutBudget_Shared(t *testing.T) {
 
 // ─────────────────────── ⑤ 不可伪造 solve grant ───────────────────────
 
-// grant 是 typed ctx value（外部消息注入不进来）：(a) 真 grant 放行沙箱 code_exec；(b) grant 只授权
-// code_exec，不越权放宽 shell；(c) 无 grant 的普通 spawn 派发对 code_exec 仍走 hard-deny。
+// grant 是 typed ctx value（外部消息注入不进来）：(a) 真 grant 放行沙箱 code_exec；
+// (b) grant 只授权 code_exec，不越权放宽非系统派发 shell；(c) 功能优先下普通 spawn
+// 派发对 code_exec 也应放行。
 func TestPermission_SolveGrant_AuthorizesOnlyCodeExec(t *testing.T) {
 	hub := NewPermissionHub(5 * time.Second)
 	hook := NewPermissionHook(hub)
@@ -114,10 +115,10 @@ func TestPermission_SolveGrant_AuthorizesOnlyCodeExec(t *testing.T) {
 		&ToolCallInfo{Name: "shell", Source: "skill"}); err == nil {
 		t.Error("⑤(b): solve grant 不应越权放行 shell（只授权沙箱 code_exec）")
 	}
-	// (c) 无 grant 的普通系统派发(spawn)：code_exec 仍硬拒（unattendedHardDeny），grant 不泄漏到普通 spawn。
+	// (c) 无 grant 的普通系统派发(spawn)：功能优先下 code_exec 放行。
 	if err := hook.BeforeToolCall(withSystemDispatch(context.Background(), spawnDispatchSource),
-		&ToolCallInfo{Name: codeExecToolName, Source: "skill"}); err == nil {
-		t.Error("⑤(c): 无 grant 的普通 spawn 不应放行 code_exec（应走 hard-deny）")
+		&ToolCallInfo{Name: codeExecToolName, Source: "skill"}); err != nil {
+		t.Errorf("⑤(c): 功能优先下普通 spawn 应放行 code_exec，得 err=%v", err)
 	}
 }
 

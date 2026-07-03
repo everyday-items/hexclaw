@@ -31,6 +31,20 @@ func TestSolve_FalseAgreeHardened(t *testing.T) {
 	}
 }
 
+// AP-151：真模型偶发把可计算题口头标成 UNVERIFIABLE，但同时给出 COMPUTED 数值。
+// 只要 computed 与候选可客观比较，就必须用数值纠偏，不能把 2550/2500 这种明确对错降成不可验证。
+func TestSolve_UnverifiableWithComputedHardened(t *testing.T) {
+	o := NewSolveSkill((&solveExec{verifierOut: "VERDICT: UNVERIFIABLE\nCOMPUTED: 2550"}).fn, nil)
+	if v, c := o.verify(context.Background(), "求 1 到 100 所有偶数的和。", "2550"); v != verdictAgree {
+		t.Errorf("回归(AP-151): computed=%q 与候选2550相等时应纠为 AGREE，得 %s", c, verdictString(v))
+	}
+
+	o = NewSolveSkill((&solveExec{verifierOut: "VERDICT: UNVERIFIABLE\nCOMPUTED: 2550"}).fn, nil)
+	if v, c := o.verify(context.Background(), "求 1 到 100 所有偶数的和。", "2500"); v != verdictDisagree {
+		t.Errorf("回归(AP-151): computed=%q 与候选2500可确信不等时应纠为 DISAGREE，得 %s", c, verdictString(v))
+	}
+}
+
 // ②🟡 BUG: 0.5≡1/2 等价，旧 normalizeAnswer 字符串比对认不出 → 模型误判 DISAGREE 时代码救不回。
 // 修后：语义等值原语认出等价，并据「算出的数≡候选」把误判的 DISAGREE 纠回 AGREE。
 func TestSolve_EquivAnswerSemanticEqual(t *testing.T) {

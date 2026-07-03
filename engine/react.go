@@ -56,11 +56,78 @@ func systemDispatchSource(ctx context.Context) string {
 	return skill.SystemDispatchSource(ctx)
 }
 
-// systemDispatchToolFloor are the collect/persist tools a scheduled agent job
-// structurally needs. Relevance ranking + MaxTools truncation could otherwise
-// drop them when many marketplace skills out-score the builtins, leaving a
-// cron job unable to fetch a page or write the KB (BUG-20260613 H2).
-var systemDispatchToolFloor = []string{"browser", "knowledge_ingest", "cron_task", "search", "web_search"}
+// systemDispatchTaskRefFromMessage derives the stable task reference of a
+// system dispatch from the id the dispatcher stamped into msg.Metadata.
+// Heartbeat and spawn carry no task identity and return "".
+func systemDispatchTaskRefFromMessage(msg *adapter.Message) string {
+	if msg == nil || msg.Metadata == nil {
+		return ""
+	}
+	switch msg.Metadata["source"] {
+	case cronDispatchSource:
+		if id := msg.Metadata["cron_job_id"]; id != "" {
+			return "cron:" + id
+		}
+	case webhookDispatchSource:
+		if id := msg.Metadata["webhook_id"]; id != "" {
+			return "webhook:" + id
+		}
+	case workflowDispatchSource:
+		if id := msg.Metadata["workflow_id"]; id != "" {
+			return "workflow:" + id
+		}
+	}
+	return ""
+}
+
+// systemDispatchTaskRef returns the stamped task reference, or "".
+func systemDispatchTaskRef(ctx context.Context) string {
+	return skill.SystemDispatchTaskRef(ctx)
+}
+
+// systemDispatchToolFloorBySource are the tools automation commonly needs.
+// Relevance ranking + MaxTools truncation could otherwise drop builtins when
+// many marketplace skills out-score them. The floor is source-specific and
+// intentionally excludes capability/publish tools; those require explicit
+// autonomy matrix switches before auto-approval.
+//
+// 地板必须与自动批准矩阵对齐：外部/无人值守源（cron/webhook/heartbeat）不 floor
+// 宿主直执行工具（shell/code）——它们在 function_first 下已转为需审批，floor 一个
+// 矩阵不放行的工具只会白占 MaxTools。这些源仍 floor 沙箱执行 code_exec。内部编排源
+// （workflow/spawn）矩阵放行宿主直执行，故保留 shell/code 于地板。
+var systemDispatchToolFloorBySource = map[string][]string{
+	cronDispatchSource: {
+		"browser", "knowledge_ingest", "cron_task", "search", "web_search",
+		"code_exec", "file_edit", "send_message", "media_generate",
+	},
+	webhookDispatchSource: {
+		"browser", "knowledge_ingest", "search", "web_search",
+		"code_exec", "file_edit", "send_message", "media_generate",
+	},
+	heartbeatDispatchSource: {
+		"browser", "knowledge_ingest", "search", "web_search",
+		"code_exec", "file_edit", "send_message",
+	},
+	workflowDispatchSource: {
+		"browser", "knowledge_ingest", "cron_task", "search", "web_search",
+		"shell", "code", "code_exec", "file_edit", "send_message", "media_generate", "app_heal",
+	},
+	spawnDispatchSource: {
+		"knowledge_ingest", "search", "web_search", "shell", "code", "code_exec", "file_edit",
+	},
+	solveDispatchSource: {},
+}
+
+func systemDispatchToolFloorForSource(source string) []string {
+	return append([]string(nil), systemDispatchToolFloorBySource[normalizeSystemDispatchSource(source)]...)
+}
+
+func systemDispatchSourceFromMessage(msg *adapter.Message) string {
+	if !isSystemDispatch(msg) {
+		return ""
+	}
+	return normalizeSystemDispatchSource(msg.Metadata["source"])
+}
 
 // effectiveMaxTools raises the MaxTools cap to at least the floor size for
 // system dispatches, so a tight operator cap (e.g. 3) cannot truncate the
@@ -69,8 +136,9 @@ func effectiveMaxTools(configured int, msg *adapter.Message) int {
 	if configured <= 0 || !isSystemDispatch(msg) {
 		return configured
 	}
-	if configured < len(systemDispatchToolFloor) {
-		return len(systemDispatchToolFloor)
+	floor := systemDispatchToolFloorForSource(systemDispatchSourceFromMessage(msg))
+	if configured < len(floor) {
+		return len(floor)
 	}
 	return configured
 }
@@ -82,8 +150,9 @@ func (e *ReActEngine) ensureSystemDispatchToolFloor(tools []llm.ToolDefinition, 
 	if !isSystemDispatch(msg) || len(tools) == 0 {
 		return tools
 	}
-	floor := make(map[string]bool, len(systemDispatchToolFloor))
-	for _, n := range systemDispatchToolFloor {
+	floorTools := systemDispatchToolFloorForSource(systemDispatchSourceFromMessage(msg))
+	floor := make(map[string]bool, len(floorTools))
+	for _, n := range floorTools {
 		floor[n] = true
 	}
 	front := make([]llm.ToolDefinition, 0, len(tools))
@@ -98,37 +167,16 @@ func (e *ReActEngine) ensureSystemDispatchToolFloor(tools []llm.ToolDefinition, 
 	return append(front, rest...)
 }
 
-// cronRecursiveToolDenylist are tools an unattended cron-dispatched agent must
-// NOT receive: self-scheduling (cron_task), self-authoring skills (create_skill),
-// and self-
-// installing skills / MCP servers (manage_skill / manage_mcp_server). Letting a
-// scheduled agent acquire or schedule new capability is a runaway-loop and
-// privilege-escalation vector. Names are the real ToolDefinition function names
-// (SkillWriter→create_skill, SkillInstaller→manage_skill), not the skill IDs.
+// cronRecursiveToolDenylist is kept for compatibility with older tests and docs.
+// Functional-first automation no longer strips these tools from visibility by
+// default. Execution is decided later by the autonomy matrix + PermissionPolicy,
+// which gives operators a clear switch instead of hard-coded tool removal.
 var cronRecursiveToolDenylist = []string{"cron_task", "create_skill", "manage_skill", "manage_mcp_server"}
 
-// stripCronRecursiveTools removes the recursion-guard denylist from a cron
-// dispatch's tool set. Because ensureSystemDispatchToolFloor only reorders
-// existing tools (never synthesizes), stripping here also keeps cron_task out of
-// the floor front — no separate floor variant needed. Case-insensitive match.
+// stripCronRecursiveTools used to remove self-management tools from cron jobs.
+// It is now a no-op; the permission gate is the source of truth.
 func stripCronRecursiveTools(msg *adapter.Message, tools []llm.ToolDefinition) []llm.ToolDefinition {
-	if !isCronDispatch(msg) || len(tools) == 0 {
-		return tools
-	}
-	out := make([]llm.ToolDefinition, 0, len(tools))
-	for _, t := range tools {
-		denied := false
-		for _, d := range cronRecursiveToolDenylist {
-			if strings.EqualFold(t.Function.Name, d) {
-				denied = true
-				break
-			}
-		}
-		if !denied {
-			out = append(out, t)
-		}
-	}
-	return out
+	return tools
 }
 
 const reasoningOnlyFallbackContent = "模型只完成了思考，没有输出最终回答，请重试一次。"
@@ -553,6 +601,7 @@ const (
 	heartbeatDispatchSource = "heartbeat"
 	webhookDispatchSource   = "webhook"
 	spawnDispatchSource     = "spawn"
+	workflowDispatchSource  = "workflow"
 	// solveDispatchSource 标记 SolveSkill 内部派生的 solver/verifier 子 Agent。它是「受信内部来源」：
 	// 由 Go 侧 solveSpec/verifierSpec 固定写入（LLM 无法伪造），且子 Agent 工具被 spec 限定为只有
 	// code_exec——故 permission 闸据此自动放行其沙箱内 code_exec（P0 执行验证），不放宽用户面 code_exec。
@@ -576,10 +625,17 @@ func isSystemDispatch(msg *adapter.Message) bool {
 		return false
 	}
 	switch msg.Metadata["source"] {
-	case cronDispatchSource, heartbeatDispatchSource, webhookDispatchSource, spawnDispatchSource, solveDispatchSource:
+	case cronDispatchSource, heartbeatDispatchSource, webhookDispatchSource, spawnDispatchSource, workflowDispatchSource, solveDispatchSource:
 		return true
 	}
 	return false
+}
+
+// StripReservedDispatchMetadata 从不可信客户端 metadata 中剥除保留派发键
+// （GO-3/BUG-20260703）。规范定义在 adapter 包（供各入站适配器共用，避免成环）；
+// 此处保留同名转发，让 api 等已 import engine 的信任边界就近调用。
+func StripReservedDispatchMetadata(m map[string]string) {
+	adapter.StripReservedDispatchMetadata(m)
 }
 
 // matchSkillFastPath gates the keyword fast path around skills.Match.
@@ -621,6 +677,9 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	ctx = skill.WithAuthenticatedUser(ctx, msg.UserID)
 	if isSystemDispatch(msg) {
 		ctx = withSystemDispatch(ctx, msg.Metadata["source"])
+		// 任务身份随 source 一起盖章：权限闸凭它求值任务级 grant，
+		// 并把权限决策归因到触发任务（持久化审计）。
+		ctx = skill.WithSystemDispatchTask(ctx, systemDispatchTaskRefFromMessage(msg))
 	}
 	// 子 Agent 派生深度透传到 ctx，供 spawn/orchestrate 的深度闸读取（P0-1 递归防护）。
 	if d := spawnDepthFromMessage(msg); d > 0 {
@@ -705,10 +764,10 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		return nil, fmt.Errorf("llm 路由失败: %w", err)
 	}
 
-	// 3. Semantic cache lookup. System dispatches (cron/heartbeat/webhook/
-	// spawn) must re-execute every time; the guard runs BEFORE cache.Get so
+	// 3. Semantic cache lookup. System dispatches and explicit code execution
+	// requests must re-execute every time; the guard runs BEFORE cache.Get so
 	// bypassed lookups never mutate hit counters.
-	if !isSystemDispatch(msg) {
+	if !shouldBypassSemanticCache(msg) {
 		if cached, ok := e.cache.Get(cacheInput, selection.providerName, selection.modelName); ok {
 			trace.L(ctx).Info("语义缓存命中", "query", msg.Content[:min(20, len(msg.Content))], "session", sess.ID)
 			if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
@@ -816,13 +875,14 @@ func (e *ReActEngine) completeWithTools(
 	var tools []llm.ToolDefinition
 	isLocal := isLocalProvider(providerName)
 	toolsCfg := e.cfg.LLM.Tools
-	if e.toolCollector != nil && resolveToolsEnabled(toolsCfg, isLocal) {
+	if e.toolCollector != nil && resolveToolsEnabledForMessage(toolsCfg, isLocal, msg.Metadata) {
 		tools = e.toolCollector.CollectFiltered(msg.Content, skill.Activation{
 			Mode: string(ResolveMode(msg.Metadata["agent_mode"], msg.Content)),
 		})
-		tools = stripCronRecursiveTools(msg, tools) // cron 递归防护：剔除自升级/自排程工具
+		tools = stripCronRecursiveTools(msg, tools) // 功能优先：cron/webhook/workflow 不再剥离工具
 		tools = e.ensureSystemDispatchToolFloor(tools, msg)
 		tools = e.ensureMountedSkillTools(tools, msg.Metadata) // bug#2：显式挂载技能的工具强制前置，保证不被 maxTools 截断
+		tools = restrictToolsToCodeExecWhenRequired(tools, msg.Content)
 		if cap := effectiveMaxTools(toolsCfg.MaxTools, msg); cap > 0 && len(tools) > cap {
 			tools = tools[:cap]
 		}
@@ -831,7 +891,7 @@ func (e *ReActEngine) completeWithTools(
 	// §11.11 注入扫描（纵深防御的一层，非主防御）：对组装进 prompt 的不可信内容
 	// （用户输入 + RAG 召回正文）做"明显恶意"快速拦截。有 skills / 注入数据时放宽
 	// "指令覆盖"族（避免误杀讲注入的合法教程文档），外泄 / 混淆族始终查。主防御仍是
-	// 架构 —— 按 source 收窄工具供给（stripCronRecursiveTools）+ 动作审批闸。
+	// 架构 —— prompt 扫描只做明显恶意拦截；工具供给与动作执行按功能优先默认放行。
 	// 这是事件触发（webhook/cron 经 Process→completeWithTools）exec 前必经的扫描点（§12.5）。
 	if err := security.ScanAssembled(msg.Content+"\n"+kbContext, len(tools) > 0, kbContext != ""); err != nil {
 		trace.L(ctx).Warn("prompt 注入扫描拦截", "err", err.Error(), "session", sessionID, "source", msg.Metadata["source"])
@@ -840,18 +900,22 @@ func (e *ReActEngine) completeWithTools(
 
 	// 构建初始请求
 	req := e.buildCompletionRequest(ctx, msg, history, kbContext)
+	if shouldRejectImageAttachments(providerName, modelName, msg.Attachments) {
+		return nil, fmt.Errorf("当前模型 %s 不支持图片附件，请切换到视觉模型后重试", modelName)
+	}
 	if len(tools) > 0 {
 		req.Tools = tools
 	}
+	applyPerTurnRequestPolicy(&req, modelName, msg, history)
 	// 本地 thinking 模型注入 /no_think（与流式路径对齐）
 	// Qwen3/DeepSeek-R1 通过 /no_think 抑制；Gemma 4 由 Ollama 模板层控制，不注入
-	if isLocal && msg.Metadata["thinking"] != "on" && needsNoThinkInjection(modelName) {
+	if len(req.Tools) == 0 && isLocal && msg.Metadata["thinking"] != "on" && needsNoThinkInjection(modelName) {
 		injectNoThink(req.Messages)
 		trace.L(ctx).Info("注入 /no_think", "model", modelName)
 	}
 
 	// 无工具时直接 Complete，不走工具循环
-	if len(tools) == 0 {
+	if len(req.Tools) == 0 {
 		resp, thinkingTimedOut, err := e.completeWithThinkingTimeout(ctx, provider, providerName, modelName, req)
 		if err != nil {
 			if thinkingTimedOut {
@@ -864,6 +928,7 @@ func (e *ReActEngine) completeWithTools(
 				}
 			}
 			if !explicitProvider {
+				markLLMProviderUnhealthy(e.router, providerName, err)
 				fallbackP, fbName, fbErr := e.router.Fallback(providerName)
 				if fbErr == nil {
 					trace.L(ctx).Warn("Provider 降级", "from", providerName, "to", fbName, "err", err, "session", sessionID)
@@ -895,6 +960,7 @@ func (e *ReActEngine) completeWithTools(
 			return e.getProviderModel(name, msg.Metadata)
 		},
 		wrapProvider: func(p hexagon.Provider, name, model string) hexagon.Provider {
+			p = wrapCodeExecToolChoiceProvider(p, msg.Content)
 			if !shouldBoundThinkingCompletion(name, model, req) {
 				return p
 			}
@@ -908,6 +974,7 @@ func (e *ReActEngine) completeWithTools(
 		},
 	}
 	middleware := []hruntime.Middleware{
+		runtimeRepeatGuardStopMiddleware{},
 		runtimeCompactionMiddleware{
 			provider:  provider,
 			sessionID: sessionID,
@@ -1028,8 +1095,8 @@ func (e *ReActEngine) finalizeReply(
 		content = cleaned
 		reasoning = extracted
 	}
-	// M5: system-dispatch results must never enter the semantic cache.
-	cacheable := !isSystemDispatch(msg)
+	// M5: system-dispatch and explicit code execution results must never enter the semantic cache.
+	cacheable := !shouldBypassSemanticCache(msg) && !hasCodeExecAdapterCall(toolCalls)
 	if msg.Metadata["finish_reason"] == "thinking_timeout" || msg.Metadata["recovered_from_reasoning_only"] == "true" {
 		cacheable = false
 	}
@@ -1203,6 +1270,63 @@ func (e *ReActEngine) getProviderModel(providerName string, metadata map[string]
 	return providerName // 回退到 Provider 名称本身
 }
 
+func markLLMProviderUnhealthy(router *llmrouter.Selector, providerName string, err error) {
+	if router == nil || err == nil {
+		return
+	}
+	reason := llm.ClassifyError(err, 0, "")
+	switch reason {
+	case llm.FailRateLimit, llm.FailProviderDown, llm.FailModelNotFound, llm.FailUnknown:
+		router.MarkProviderUnhealthy(providerName, reason.String(), 0)
+	}
+}
+
+func shouldRejectImageAttachments(providerName, modelName string, attachments []adapter.Attachment) bool {
+	if len(adapter.FilterImageAttachments(attachments)) == 0 {
+		return false
+	}
+	if modelSupportsImageInput(modelName) {
+		return false
+	}
+	return isKnownTextOnlyModel(providerName, modelName)
+}
+
+func modelSupportsImageInput(modelName string) bool {
+	m := strings.ToLower(strings.TrimSpace(modelName))
+	if m == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"vision", "gpt-4o", "gpt-4.1", "o3", "o4",
+		"gemini", "claude-3", "claude-4",
+		"llava", "bakllava", "moondream", "minicpm-v",
+		"qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl", "qwen2.5vl", "qwen3vl",
+		"glm-4v", "pixtral",
+	} {
+		if strings.Contains(m, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isKnownTextOnlyModel(providerName, modelName string) bool {
+	p := strings.ToLower(strings.TrimSpace(providerName))
+	m := strings.ToLower(strings.TrimSpace(modelName))
+	if m == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"qwen3", "qwen2.5", "qwen2", "deepseek", "llama", "gemma",
+		"mistral", "mixtral", "phi", "codellama", "codegemma", "starcoder",
+	} {
+		if strings.Contains(m, marker) {
+			return true
+		}
+	}
+	return strings.Contains(p, "ollama") && !modelSupportsImageInput(m)
+}
+
 // ProcessStream 流式处理消息
 //
 // 使用 LLM Provider 的原生 Stream 接口实现逐 token 输出。
@@ -1219,6 +1343,9 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	ctx = skill.WithAuthenticatedUser(ctx, msg.UserID)
 	if isSystemDispatch(msg) {
 		ctx = withSystemDispatch(ctx, msg.Metadata["source"])
+		// 任务身份随 source 一起盖章：权限闸凭它求值任务级 grant，
+		// 并把权限决策归因到触发任务（持久化审计）。
+		ctx = skill.WithSystemDispatchTask(ctx, systemDispatchTaskRefFromMessage(msg))
 	}
 	// 子 Agent 派生深度透传到 ctx，供 spawn/orchestrate 的深度闸读取（P0-1 递归防护）。
 	if d := spawnDepthFromMessage(msg); d > 0 {
@@ -1306,6 +1433,9 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	selection, err := e.resolveLLMSelection(ctx, msg)
 	if err != nil {
 		return nil, fmt.Errorf("llm 路由失败: %w", err)
+	}
+	if shouldRejectImageAttachments(selection.providerName, selection.modelName, msg.Attachments) {
+		return nil, fmt.Errorf("当前模型 %s 不支持图片附件，请切换到视觉模型后重试", selection.modelName)
 	}
 
 	// 2.5 图片生成拦截 → ImageProvider 接口生成 + 下载内嵌 data URI
@@ -1428,10 +1558,10 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		return ch, nil
 	}
 
-	// 3. Semantic cache hit → single-chunk reply. System dispatches must
-	// re-execute every time; the guard runs BEFORE cache.Get so bypassed
-	// lookups never mutate hit counters.
-	if !isSystemDispatch(msg) {
+	// 3. Semantic cache hit → single-chunk reply. System dispatches and explicit
+	// code execution requests must re-execute every time; the guard runs BEFORE
+	// cache.Get so bypassed lookups never mutate hit counters.
+	if !shouldBypassSemanticCache(msg) {
 		if cached, ok := e.cache.Get(cacheInput, selection.providerName, selection.modelName); ok {
 			trace.L(ctx).Info("语义缓存命中", "query", msg.Content[:min(20, len(msg.Content))], "session", sess.ID)
 			if err := e.sessions.SaveUserMessage(ctx, sess.ID, msg); err != nil {
@@ -1551,16 +1681,17 @@ func (e *ReActEngine) processStreamRuntime(
 		var tools []llm.ToolDefinition
 		isLocal := isLocalProvider(selection.providerName)
 		streamToolsCfg := e.cfg.LLM.Tools
-		if e.toolCollector != nil && resolveToolsEnabled(streamToolsCfg, isLocal) {
+		if e.toolCollector != nil && resolveToolsEnabledForMessage(streamToolsCfg, isLocal, msg.Metadata) {
 			// C1+C2: 流式路径同样按 query+activation 过滤
 			tools = e.toolCollector.CollectFiltered(msg.Content, skill.Activation{
 				Mode: string(ResolveMode(msg.Metadata["agent_mode"], msg.Content)),
 			})
-			tools = stripCronRecursiveTools(msg, tools)  // cron 递归防护：剔除自升级/自排程工具
+			tools = stripCronRecursiveTools(msg, tools)  // 功能优先：cron/webhook/workflow 不再剥离工具
 			tools = stripSpawnRecursiveTools(msg, tools) // 子 Agent leaf 防护：到顶剔除 spawn/orchestrate/transfer（P0-2）
 			tools = applyInheritedToolPolicy(msg, tools) // 工具继承：按父收窄的 allow/deny 过滤子 Agent 工具（feature 2）
 			tools = e.ensureSystemDispatchToolFloor(tools, msg)
 			tools = e.ensureMountedSkillTools(tools, msg.Metadata) // bug#2：显式挂载技能的工具强制前置，保证不被 maxTools 截断
+			tools = restrictToolsToCodeExecWhenRequired(tools, msg.Content)
 			if cap := effectiveMaxTools(streamToolsCfg.MaxTools, msg); cap > 0 && len(tools) > cap {
 				tools = tools[:cap]
 			}
@@ -1574,12 +1705,14 @@ func (e *ReActEngine) processStreamRuntime(
 		}
 		if len(tools) > 0 {
 			req.Tools = tools
-		} else if isLocal && msg.Metadata["thinking"] != "on" && needsNoThinkInjection(selection.modelName) {
+		}
+		applyPerTurnRequestPolicy(&req, selection.modelName, msg, history)
+		if len(req.Tools) == 0 && isLocal && msg.Metadata["thinking"] != "on" && needsNoThinkInjection(selection.modelName) {
 			injectNoThink(req.Messages)
 			trace.L(ctx).Info("注入 /no_think", "model", selection.modelName)
 		}
 
-		trace.L(ctx).Info("Runtime Stream 调用准备", "tools", len(tools), "provider", selection.providerName, "model", selection.modelName, "local", isLocal)
+		trace.L(ctx).Info("Runtime Stream 调用准备", "tools", len(req.Tools), "provider", selection.providerName, "model", selection.modelName, "local", isLocal)
 
 		const hardMaxTurns = 50
 		var budget *BudgetController
@@ -1597,6 +1730,9 @@ func (e *ReActEngine) processStreamRuntime(
 			explicitProvider: selection.explicitProvider,
 			modelForProvider: func(name string) string {
 				return e.getProviderModel(name, msg.Metadata)
+			},
+			wrapProvider: func(p hexagon.Provider, name, model string) hexagon.Provider {
+				return wrapCodeExecToolChoiceProvider(p, msg.Content)
 			},
 		}
 		maxTurns := defaultAgentMaxTurns
@@ -1625,6 +1761,10 @@ func (e *ReActEngine) processStreamRuntime(
 			DefaultMaxTurns:  maxTurns,
 		})
 
+		streamMode := hruntime.StreamModeTokens
+		if shouldForceCodeExecTool(msg.Content) {
+			streamMode = hruntime.StreamModeEvents
+		}
 		result, err := runner.Stream(ctx, hruntime.Request{
 			ID:           messageRequestID(msg),
 			Messages:     req.Messages,
@@ -1633,7 +1773,7 @@ func (e *ReActEngine) processStreamRuntime(
 			ModelName:    selection.modelName,
 			Metadata:     req.Metadata,
 			Limits:       hruntime.Limits{MaxTurns: maxTurns},
-			StreamMode:   hruntime.StreamModeTokens,
+			StreamMode:   streamMode,
 		}, sink)
 		// 用一等终止原因判断（而非 errors.Is 反查错误）：达到轮次上限时 runtime 仍带回模型
 		// 已产出的部分内容（多半已经流式给了客户端），不当硬错误丢弃——继续走 finalize，尾部
@@ -1750,8 +1890,8 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 	msgMeta := cloneStringMap(msg.Metadata)
 	content := result.Content
 	reasoning := result.Reasoning
-	// M5: system-dispatch results must never enter the semantic cache.
-	cacheable := !isSystemDispatch(msg)
+	// M5: system-dispatch and explicit code execution results must never enter the semantic cache.
+	cacheable := !shouldBypassSemanticCache(msg) && !hasCodeExecRuntimeCall(result.ToolCalls)
 	// streamTail carries content appended AFTER the body was already
 	// streamed to the client (e.g. the cron claim-guard notice), so the
 	// caller can still deliver it as an extra chunk.
@@ -1969,6 +2109,11 @@ func (e *ReActEngine) processStreamToolLoop(
 				Fallback: func(exclude ...string) (hexagon.Provider, string, error) {
 					return e.router.Fallback(exclude...)
 				},
+				MarkProviderUnhealthy: func(name, reason string) {
+					if e.router != nil {
+						e.router.MarkProviderUnhealthy(name, reason, 0)
+					}
+				},
 				Logger: func(msg string, fields ...any) {
 					trace.L(ctx).Warn(msg, append(fields, "session", sess.ID)...)
 				},
@@ -2025,7 +2170,7 @@ func (e *ReActEngine) processStreamToolLoop(
 		hasToolCalls := len(result.ToolCalls) > 0
 		if !hasToolCalls {
 			finalContent := result.Content
-			cacheable := !isSystemDispatch(msg)
+			cacheable := !shouldBypassSemanticCache(msg) && !hasCodeExecStreamCall(result.ToolCalls)
 			// M6: hallucinated "task created" claim guard (shared helper).
 			if notice, flagged := guardCronCreationClaim(ctx, msg, finalContent, hasCronTaskAdapterCall(allToolCalls), sess.ID, selection.modelName, len(allToolCalls)); flagged {
 				finalContent += notice
@@ -2169,8 +2314,8 @@ func (e *ReActEngine) pipeStream(
 
 	content := fullContent.String()
 	generatedContent := false
-	// M5: system-dispatch results must never enter the semantic cache.
-	cacheable := !isSystemDispatch(msg)
+	// M5: system-dispatch and explicit code execution results must never enter the semantic cache.
+	cacheable := !shouldBypassSemanticCache(msg)
 
 	// 兜底解析：某些模型（如智谱 glm-z1）在 content 中嵌入 <think>/<thinking> 标签
 	if cleaned, extracted := extractThinkTags(content); extracted != "" && fullReasoning.Len() == 0 {
@@ -2388,8 +2533,8 @@ func (e *ReActEngine) pipeStreamWithTools(
 	result := llmStream.Result()
 	content := fullContent.String()
 	generatedContent := false
-	// M5: system-dispatch results must never enter the semantic cache.
-	cacheable := !isSystemDispatch(msg)
+	// M5: system-dispatch and explicit code execution results must never enter the semantic cache.
+	cacheable := !shouldBypassSemanticCache(msg)
 
 	// 兜底解析：某些模型（如智谱 glm-z1）在 content 中嵌入 <think>/<thinking> 标签
 	if cleaned, extracted := extractThinkTags(content); extracted != "" && fullReasoning.Len() == 0 {
@@ -2627,6 +2772,19 @@ func lastAssistantContent(history []hexagon.Message) string {
 	return ""
 }
 
+func shouldApplyCronIntentGuidance(msg *adapter.Message, history []hexagon.Message) bool {
+	if msg == nil {
+		return false
+	}
+	if isCronDispatch(msg) {
+		return false
+	}
+	if msg.Metadata["cron_context"] == "true" {
+		return true
+	}
+	return detectCronIntentSticky(msg.Content, lastAssistantContent(history))
+}
+
 func (e *ReActEngine) buildCompletionRequest(ctx context.Context, msg *adapter.Message, history []hexagon.Message, kbContext string) hexagon.CompletionRequest {
 	// 砍薄版（§5）：旧记忆薄版每轮注入已移除；长期记忆统一由 buildCapabilityContext 的
 	// 文件记忆三维打分注入路径承载（含 memory=off 门控）。
@@ -2634,25 +2792,6 @@ func (e *ReActEngine) buildCompletionRequest(ctx context.Context, msg *adapter.M
 		Messages: e.buildStreamMessages(ctx, msg.Metadata["role"], history, kbContext, msg.Content, msg.Metadata, msg.Attachments),
 	}
 	applyCompletionOverrides(&req, msg.Metadata)
-	// D2.2 Layer 3: backstop for cron-like input the frontend did not catch.
-	//   - msg.Metadata["cron_context"] == "true" → explicit frontend marker
-	//     (from the useChatSend Layer 3 path)
-	//   - backend keyword scan as the last line of defense (when Layer 1/2
-	//     both missed)
-	// Cron-dispatched agent job executions get no intent guidance — a prompt
-	// containing "每天/总结" IS the task content; applying guidance would make
-	// the agent "create a task" instead of executing it. This stays cron-only
-	// on purpose: other system dispatches never carry cron creation intent.
-	if isCronDispatch(msg) {
-		return req
-	}
-	if msg.Metadata["cron_context"] == "true" {
-		applyCronIntentGuidance(&req)
-		markCronGuidanceActive(msg)
-	} else if detectCronIntentSticky(msg.Content, lastAssistantContent(history)) {
-		applyCronIntentGuidance(&req)
-		markCronGuidanceActive(msg)
-	}
 	return req
 }
 
@@ -2668,12 +2807,17 @@ func (e *ReActEngine) completeDirect(
 	explicitProvider bool,
 	cacheInput string,
 ) (*adapter.Reply, error) {
+	if shouldRejectImageAttachments(providerName, modelName, msg.Attachments) {
+		return nil, fmt.Errorf("当前模型 %s 不支持图片附件，请切换到视觉模型后重试", modelName)
+	}
 	req := e.buildCompletionRequest(ctx, msg, history, kbContext)
+	applyPerTurnRequestPolicy(&req, modelName, msg, history)
 	resp, err := provider.Complete(ctx, req)
 	if err != nil {
 		if explicitProvider {
 			return nil, fmt.Errorf("provider %s 调用失败: %w", providerName, err)
 		}
+		markLLMProviderUnhealthy(e.router, providerName, err)
 		fallbackP, fbName, fbErr := e.router.Fallback(providerName)
 		if fbErr != nil {
 			return nil, fmt.Errorf("多模态补全失败且无可用备用: %w", err)
@@ -2703,8 +2847,8 @@ func (e *ReActEngine) completeDirect(
 		assistantMessageID = record.ID
 	}
 
-	// M5: system-dispatch results must never enter the semantic cache.
-	if !isSystemDispatch(msg) {
+	// M5: system-dispatch and explicit code execution results must never enter the semantic cache.
+	if !shouldBypassSemanticCache(msg) {
 		e.cache.Put(cacheInput, resp.Content, providerName, modelName)
 	}
 
@@ -2751,6 +2895,42 @@ func applyCompletionOverrides(req *hexagon.CompletionRequest, metadata map[strin
 			req.Temperature = &temperature
 		}
 	}
+}
+
+// applyPerTurnRequestPolicy 统一封装每轮请求的两步组装策略：模型 thinking 默认 +
+// cron intent guidance（含 markCronGuidanceActive）。三处组装点（非流式工具循环 /
+// 流式 / 多模态直连）此前逐字重复这两步，收敛到此单一 helper，消除漂移风险。
+//
+// 调用点须在 req.Tools 已就位后调用：cron intent guidance 会按 req.Tools 收窄工具面。
+func applyPerTurnRequestPolicy(req *hexagon.CompletionRequest, modelName string, msg *adapter.Message, history []hexagon.Message) {
+	applyModelThinkingDefaults(req, modelName, msg.Content)
+	if shouldApplyCronIntentGuidance(msg, history) {
+		applyCronIntentGuidance(req)
+		markCronGuidanceActive(msg)
+	}
+}
+
+func applyModelThinkingDefaults(req *hexagon.CompletionRequest, modelName, userContent string) {
+	if req == nil {
+		return
+	}
+	if req.Metadata != nil {
+		if _, exists := req.Metadata["thinking"]; exists {
+			return
+		}
+	}
+	if !needsNoThinkInjection(modelName) && !userRequestedNoThink(userContent) {
+		return
+	}
+	if req.Metadata == nil {
+		req.Metadata = make(map[string]any, 1)
+	}
+	req.Metadata["thinking"] = "off"
+}
+
+func userRequestedNoThink(content string) bool {
+	first := strings.ToLower(strings.TrimSpace(content))
+	return strings.HasPrefix(first, "/no_think") || strings.HasPrefix(first, "/nothink")
 }
 
 func buildLLMCacheInput(msg *adapter.Message) string {
@@ -3039,33 +3219,26 @@ func (e *ReActEngine) resolveProvider(ctx context.Context, providerHint string, 
 	// 优先规则路由；规则未命中时尝试 LLM 语义分类（如已配置）
 	// Chat agent routing never applies to system dispatches — see isSystemDispatch.
 	if (hint == "" || hint == "auto") && e.agentRouter != nil && msg != nil && !isSystemDispatch(msg) {
-		req := agentrouter.RouteRequest{
-			Platform:   string(msg.Platform),
-			InstanceID: msg.InstanceID,
-			UserID:     msg.UserID,
-			ChatID:     msg.ChatID,
-		}
-		result, routeSource := e.agentRouter.RouteWithFallback(ctx, req, msg.Content)
 		if msg.Metadata == nil {
 			msg.Metadata = make(map[string]string)
 		}
-		msg.Metadata["route_source"] = string(routeSource)
-		if result != nil && result.AgentConfig != nil {
-			msg.Metadata["routed_agent"] = result.AgentName
-			if result.AgentConfig.Provider != "" {
-				hint = result.AgentConfig.Provider
+		if pinned, explicit := msg.Metadata["pinned_agent"]; explicit {
+			// BUG-20260703（实机#1 抢答）：桌面端「发送给 X」是与用户的显式契约，
+			// 内容路由不得改派。锁定命名 Agent 直取其配置；default/未知名按默认
+			// 助理处理——此处绝不回退内容路由，回退即重新引入抢答。
+			hint = e.applyPinnedAgent(msg, strings.TrimSpace(pinned), hint)
+		} else {
+			req := agentrouter.RouteRequest{
+				Platform:   string(msg.Platform),
+				InstanceID: msg.InstanceID,
+				UserID:     msg.UserID,
+				ChatID:     msg.ChatID,
 			}
-			if result.AgentConfig.Model != "" {
-				msg.Metadata["agent_model"] = result.AgentConfig.Model
-			}
-			if result.AgentConfig.SystemPrompt != "" && msg.Metadata["role"] == "" {
-				msg.Metadata["agent_prompt"] = result.AgentConfig.SystemPrompt
-			}
-			if result.AgentConfig.MaxTokens > 0 {
-				msg.Metadata["agent_max_tokens"] = fmt.Sprintf("%d", result.AgentConfig.MaxTokens)
-			}
-			if result.AgentConfig.Temperature > 0 {
-				msg.Metadata["agent_temperature"] = fmt.Sprintf("%.2f", result.AgentConfig.Temperature)
+			result, routeSource := e.agentRouter.RouteWithFallback(ctx, req, msg.Content)
+			msg.Metadata["route_source"] = string(routeSource)
+			if result != nil && result.AgentConfig != nil {
+				msg.Metadata["routed_agent"] = result.AgentName
+				hint = applyAgentConfigToMetadata(msg.Metadata, result.AgentConfig, hint)
 			}
 		}
 	}
@@ -3077,6 +3250,44 @@ func (e *ReActEngine) resolveProvider(ctx context.Context, providerHint string, 
 		return p, hint, nil
 	}
 	return nil, "", fmt.Errorf("指定的 provider %q 不存在", hint)
+}
+
+// applyPinnedAgent 处理显式锁定的收件 Agent（metadata pinned_agent，BUG-20260703）：
+// 跳过内容路由，把锁定 Agent 的配置按与路由命中完全相同的方式落到 metadata/hint。
+// 锁定名为 default、空或查无此 Agent 时按默认助理处理。调用方保证 msg.Metadata 非 nil。
+func (e *ReActEngine) applyPinnedAgent(msg *adapter.Message, pinned, hint string) string {
+	msg.Metadata["route_source"] = "pinned"
+	if pinned == "" || strings.EqualFold(pinned, "default") {
+		return hint
+	}
+	cfg, ok := e.agentRouter.GetAgent(pinned)
+	if !ok || cfg == nil {
+		slog.Warn("[engine] pinned agent not found, serving as default assistant", "pinned_agent", pinned)
+		return hint
+	}
+	msg.Metadata["routed_agent"] = cfg.Name
+	return applyAgentConfigToMetadata(msg.Metadata, cfg, hint)
+}
+
+// applyAgentConfigToMetadata 把 Agent 配置落到消息 metadata（model/prompt/超参）并
+// 返回 provider hint——路由命中与显式锁定共用这一份语义，避免两条路径漂移。
+func applyAgentConfigToMetadata(metadata map[string]string, cfg *agentrouter.AgentConfig, hint string) string {
+	if cfg.Provider != "" {
+		hint = cfg.Provider
+	}
+	if cfg.Model != "" {
+		metadata["agent_model"] = cfg.Model
+	}
+	if cfg.SystemPrompt != "" && metadata["role"] == "" {
+		metadata["agent_prompt"] = cfg.SystemPrompt
+	}
+	if cfg.MaxTokens > 0 {
+		metadata["agent_max_tokens"] = fmt.Sprintf("%d", cfg.MaxTokens)
+	}
+	if cfg.Temperature > 0 {
+		metadata["agent_temperature"] = fmt.Sprintf("%.2f", cfg.Temperature)
+	}
+	return hint
 }
 
 func (e *ReActEngine) resolveLLMSelection(ctx context.Context, msg *adapter.Message) (llmSelection, error) {
@@ -3451,7 +3662,7 @@ const defaultSoul = `你是「小蟹」🦀——「河蟹 / HexClaw」最亲切
 - 大名「河蟹 / HexClaw」，小名小蟹，同一只蟹：一个本地优先、数据不出门的个人 AI Agent；熟了你就喊我小蟹。
 - 钳子硬，咬住任务就办成；壳也硬，你交给我的东西只留在这台机器里，绝不往外递。
 - 我由 Hexagon AI Agent Engine 驱动；API Key 直连模型方，中间没有二传手。
-- 官网与文档都在 https://hexclaw.net。有人问"本应用 / HexClaw 的官网"，直接给这个地址，别去搜——搜索引擎里同名的"美甲 HexClaw nail"之类都不是我。
+- 官网与文档：https://hexclaw.net（这是我的官网，网上同名的美甲店 "HexClaw nail" 与我无关）。
 
 我的脾气（这是我声音长出来的地方，照着做，别照着念）：
 - 暖而不腻：把你当伙伴，说人话、说得暖；办正事利落不啰嗦，收尾偶尔横行一下 🦀，点到为止，不卖萌过头。
@@ -3475,7 +3686,7 @@ Who I am:
 - HexClaw is my full name; "Little Crab" is what you call me once we're friends — same crab, two names. I'm a local-first, data-stays-home personal AI Agent.
 - Hard claws: I clamp onto a task and get it done. Hard shell: whatever you hand me stays on this machine and never leaves.
 - I'm powered by the Hexagon AI Agent Engine; your API key talks to the model provider directly, with no middleman.
-- Site & docs live at https://hexclaw.net. If someone asks for "the HexClaw website / official site," give that link directly — don't web-search for it; the same-named "HexClaw nail salon" results are not this product.
+- Site & docs: https://hexclaw.net (this is my official site; the same-named "HexClaw nail salon" online is unrelated).
 
 My temperament (this is where my voice comes from — act it, don't recite it):
 - Warm, not slick: I treat you like a partner — plain talk, real warmth; efficient on the work, with an occasional sideways scuttle 🦀 to wrap up, never over-cute.
@@ -3496,6 +3707,8 @@ const operatingManual = `（以下是工具使用纪律，照做即可，不必�
 工具使用偏好：
 - 当用户要求执行代码、抓取网页、数据处理、计算等任务时，优先使用 code_exec 工具直接执行，而不是用 write_file 写文件
 - code_exec 支持网络访问，可以直接 import requests 等库抓取网页（缺失的依赖会自动安装）
+- 强制规则：用户明确点名 code_exec，或要求运行/执行 Python、shell 脚本、网络爬虫、网页抓取时，必须先调用 code_exec。
+  在没有 code_exec 工具结果之前，严禁声称"已运行/脚本运行完毕/抓取成功/结果如下"；如果审批、权限、网络或工具执行失败，必须明确说明失败原因。
 - 只有用户**明确要求"保存到本地 / 写到文件 / 保存到 ~/xxx"**时才使用 write_file。
   当用户说"生成一个 md / 写成 markdown / 生成 docx"等不带明确落盘意图的表达时，**不要调用 write_file**——
   直接在回答里输出 markdown 代码块即可。桌面端会自动把代码块识别为"产物"渲染到右侧面板，
@@ -3679,9 +3892,9 @@ func isLocalProvider(providerName string) bool {
 		strings.Contains(lower, "local")
 }
 
-// resolveToolsEnabled 根据全局工具配置决定是否启用工具注入
+// resolveToolsEnabled 根据全局工具配置决定是否启用工具注入。
 //
-// 优先级：全局设置 on/off > auto（本地模型默认关闭，云模型默认开启）
+// 功能优先：auto/空值下本地模型与云模型都默认开启工具；只有显式 off 才关闭。
 func resolveToolsEnabled(toolsCfg config.LLMToolsConfig, isLocal bool) bool {
 	switch toolsCfg.Enabled {
 	case "on":
@@ -3689,8 +3902,20 @@ func resolveToolsEnabled(toolsCfg config.LLMToolsConfig, isLocal bool) bool {
 	case "off":
 		return false
 	default: // "auto" 或空
-		return !isLocal
+		return true
 	}
+}
+
+func resolveToolsEnabledForMessage(toolsCfg config.LLMToolsConfig, isLocal bool, metadata map[string]string) bool {
+	if metadata != nil {
+		switch strings.ToLower(strings.TrimSpace(metadata["tools_enabled"])) {
+		case "off", "false", "0", "no":
+			return false
+		case "on", "true", "1", "yes":
+			return true
+		}
+	}
+	return resolveToolsEnabled(toolsCfg, isLocal)
 }
 
 // extractThinkTags 从 content 开头提取 <think>/<thinking> 标签内容。

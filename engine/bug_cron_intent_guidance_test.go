@@ -15,11 +15,16 @@
 package engine
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/hexagon"
 	hruntime "github.com/hexagon-codes/hexagon/runtime"
+	mockllm "github.com/hexagon-codes/hexagon/testing/mock"
+	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/skill"
 )
 
 func TestDetectCronIntent_PositiveKeywords(t *testing.T) {
@@ -206,6 +211,49 @@ func TestCronToolGuidance_HonorsImmediateCreate(t *testing.T) {
 	}
 }
 
+func TestCronIntentGuidanceRunsAfterToolCollection(t *testing.T) {
+	var captured hexagon.CompletionRequest
+	provider := mockllm.NewLLMProvider("test").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+		captured = req
+		return &hexagon.CompletionResponse{
+			Content: "ok",
+			Usage:   hexagon.Usage{TotalTokens: 1},
+		}, nil
+	})
+
+	eng := newEngineWithProvider(t, provider)
+	eng.cfg.LLM.Tools.Enabled = "on"
+	reg := skill.NewRegistry()
+	if err := reg.Register(&cronProbeSkill{}); err != nil {
+		t.Fatalf("register cron probe: %v", err)
+	}
+	if err := reg.Register(&echoSkill{}); err != nil {
+		t.Fatalf("register echo: %v", err)
+	}
+	eng.SetToolCollector(NewToolCollector(reg, nil, 40))
+	eng.SetToolExecutor(NewToolExecutor(reg, nil))
+
+	_, err := eng.Process(context.Background(), &adapter.Message{
+		ID:       "msg-cron-tool-guidance-order",
+		Platform: adapter.PlatformAPI,
+		UserID:   "user-001",
+		Content:  "帮我创建一个定时任务：每天早上9点采集百度热搜榜并写入知识库。直接用 cron_task 工具创建，不用问我确认。",
+		Metadata: map[string]string{},
+	})
+	if err != nil {
+		t.Fatalf("Process failed: %v", err)
+	}
+	if len(captured.Tools) != 1 || captured.Tools[0].Function.Name != "cron_task" {
+		t.Fatalf("cron intent should keep exactly cron_task after collection, got %#v", captured.Tools)
+	}
+	if _, ok := captured.Metadata["cron_context"]; ok {
+		t.Fatalf("cron_task mode must not carry cron_context because runtime disables tools, metadata=%#v", captured.Metadata)
+	}
+	if len(captured.Messages) == 0 || captured.Messages[0].Role != "system" || !strings.Contains(captured.Messages[0].Content, "cron_task") {
+		t.Fatalf("cron_task guidance system prompt not injected: %#v", captured.Messages)
+	}
+}
+
 // ─── session stickiness + creation-claim check (the two deterministic
 // layers of the three-layer anti-hallucination defense) ─────────────
 
@@ -216,6 +264,18 @@ func TestDetectCronIntentSticky_AffirmationFollowsCronQuestion(t *testing.T) {
 			t.Errorf("简短确认 %q 应沿用上一条助手消息的 cron 语境", cur)
 		}
 	}
+}
+
+type cronProbeSkill struct{}
+
+func (s *cronProbeSkill) Name() string        { return "cron_task" }
+func (s *cronProbeSkill) Description() string { return "管理内置定时任务" }
+func (s *cronProbeSkill) Match(string) bool   { return false }
+func (s *cronProbeSkill) Execute(context.Context, map[string]any) (*skill.Result, error) {
+	return &skill.Result{Content: "ok"}, nil
+}
+func (s *cronProbeSkill) ToolDefinition() llm.ToolDefinition {
+	return cronTaskToolDef()
 }
 
 func TestDetectCronIntentSticky_LongMessageDoesNotInherit(t *testing.T) {

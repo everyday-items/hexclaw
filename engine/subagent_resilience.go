@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"regexp"
 	"strings"
 	"time"
@@ -35,10 +36,15 @@ var transientStatusCodeRe = regexp.MustCompile(`\b(429|500|502|503|504)\b`)
 // statusContextMarkers：裸状态码仅在伴随这些「请求/上游」语境时才算瞬时——否则"computed 500 items"会误判（设计⑥）。
 var statusContextMarkers = []string{"status", "code", "http", "api", "response", "gateway", "server", "请求", "上游", "服务"}
 
+var errSubAgentEmptyOutput = errors.New("subagent empty output")
+
 // isTransientErr 判定错误是否瞬时可重试。ctx 取消（用户主动停）不算瞬时——不重试。
 func isTransientErr(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, errSubAgentEmptyOutput) {
+		return true
 	}
 	if err == context.Canceled {
 		return false
@@ -76,6 +82,9 @@ func runSubAgentWithRetry(ctx context.Context, execFn SubAgentExecFunc, spec Sub
 		tryCtx, cancel := context.WithTimeout(ctx, perTry)
 		res, err := execFn(tryCtx, spec)
 		cancel()
+		if err == nil && strings.TrimSpace(res.Output) == "" {
+			err = errSubAgentEmptyOutput
+		}
 		if err == nil {
 			return res, nil
 		}

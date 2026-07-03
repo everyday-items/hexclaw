@@ -11,8 +11,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/skill"
 )
 
-// withV2Flag 在测试 ctx 中显式注入一个开启 tool.lifecycle.v2 的 Flags。
-// 即使 flag 是 alpha 默认 OFF，user override 也能把它打开。
+// withV2Flag 在测试 ctx 中显式注入 tool.lifecycle.v2 的 Flags，用于覆盖默认值。
 func withV2Flag(ctx context.Context, on bool) context.Context {
 	flags := featureflag.NewStatic(featureflag.Registered(), map[string]bool{
 		FlagToolLifecycleV2: on,
@@ -59,7 +58,7 @@ func (h *witnessAfterHook) AfterToolCall(_ context.Context, _ *ToolCallInfo, _ *
 // durationCaptureHook 捕获 result.Duration 用于断言。
 type durationCaptureHook struct {
 	gotStartedAtSet bool
-	gotDuration    bool
+	gotDuration     bool
 }
 
 func (h *durationCaptureHook) AfterToolCall(_ context.Context, _ *ToolCallInfo, r *ToolCallResult) {
@@ -92,9 +91,9 @@ type lifecycleSkill struct {
 	initCalled, shutdownCalled bool
 }
 
-func (s *lifecycleSkill) Name() string                       { return "lifecycle-test" }
-func (s *lifecycleSkill) Init(_ context.Context) error       { s.initCalled = true; return nil }
-func (s *lifecycleSkill) Shutdown(_ context.Context) error   { s.shutdownCalled = true; return nil }
+func (s *lifecycleSkill) Name() string                     { return "lifecycle-test" }
+func (s *lifecycleSkill) Init(_ context.Context) error     { s.initCalled = true; return nil }
+func (s *lifecycleSkill) Shutdown(_ context.Context) error { s.shutdownCalled = true; return nil }
 
 func TestToolExecutor_PrioritySortApplied_WhenFlagOn(t *testing.T) {
 	reg := skill.NewRegistry()

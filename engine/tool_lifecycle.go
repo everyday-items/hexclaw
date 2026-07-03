@@ -1,6 +1,6 @@
 // tool_lifecycle.go 实现 v0.4.0 H1 Tool Lifecycle + Hook Runtime（feature-flag gated）。
 //
-// 当 feature flag `tool.lifecycle.v2` 关闭（默认）时，ToolExecutor 行为与 v0.3 完全一致：
+// 当 feature flag `tool.lifecycle.v2` 关闭时，ToolExecutor 行为与 v0.3 完全一致：
 //   - Hook 按注册顺序串联
 //   - After hook panic 直接传播到调用方
 //   - ToolCallResult.Duration / StartedAt 不被填充
@@ -11,8 +11,7 @@
 //   - After hook panic 隔离：单 hook panic 不影响其余 after hook 与最终结果返回
 //   - ToolCallResult.StartedAt / Duration 自动填充供 Audit hook 观测
 //
-// flag 设计为 alpha：StageAlpha + Default=true（自动 fallback 到 false）—— 内部测试通过后
-// 改 StageBeta + 显式 Default=true，再 GA。
+// flag 默认开启，保证生命周期、观测和 panic 隔离能力可用。
 package engine
 
 import (
@@ -28,9 +27,9 @@ const FlagToolLifecycleV2 = "tool.lifecycle.v2"
 func init() {
 	featureflag.Register(featureflag.Flag{
 		Name:         FlagToolLifecycleV2,
-		Default:      true, // alpha 阶段会被强制 OFF
+		Default:      true,
 		Description:  "Enable Tool Lifecycle + Hook Runtime v2 (priority sort, panic isolation, duration metrics, Init/Shutdown).",
-		Stage:        featureflag.StageAlpha,
+		Stage:        featureflag.StageGA,
 		SinceVersion: "0.4.0",
 	})
 }

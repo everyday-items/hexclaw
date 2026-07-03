@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hexagon-codes/toolkit/lang/mapx"
@@ -146,23 +147,66 @@ func (h *PermissionHub) HandleResponse(resp PermissionResponse) {
 // ActionAllow 直接放行。flag 关闭或 policy=nil 时退化为 classifyRisk 黑名单路径，
 // 行为与 v0.3 完全一致。
 type PermissionHook struct {
-	hub            *PermissionHub
-	dangerousTools map[string]bool // tools that always require approval
-	sensitiveTools map[string]bool // tools that require approval on first use
-	policy         *PermissionPolicy
-	reviewer       UnattendedReviewer
+	hub                  *PermissionHub
+	dangerousTools       map[string]bool // tools that always require approval
+	sensitiveTools       map[string]bool // tools that require approval on first use
+	policy               *PermissionPolicy
+	reviewer             UnattendedReviewer
+	systemDispatchPolicy atomic.Pointer[SystemDispatchPolicy]
+	taskGrants           TaskGrantChecker
+	recorder             PermissionDecisionRecorder
+}
+
+// PermissionDecision is one auditable outcome of the unattended permission
+// gate. It is emitted for system-dispatch runs only (cron/webhook/heartbeat/
+// workflow/spawn/solve) — interactive sessions have their own approval UX.
+type PermissionDecision struct {
+	Source     string // dispatch source (cron/webhook/…)
+	TaskRef    string // "cron:<id>" / "webhook:<id>" / "workflow:<id>", "" when unknown
+	Tool       string // tool name that hit the gate
+	Capability string // matrix category of the tool, "" for uncategorized (e.g. MCP)
+	Profile    string // active autonomy profile at decision time
+	Decision   string // "allow" | "pending" | "deny"
+	Via        string // "matrix" | "task_grant" | "solve_grant" | "policy"
+	Reason     string
+}
+
+// PermissionDecisionRecorder persists permission decisions. Implementations
+// must never block the tool path on failure (log and continue).
+type PermissionDecisionRecorder interface {
+	RecordPermissionDecision(ctx context.Context, d PermissionDecision)
+}
+
+// TaskGrantChecker answers whether a persisted task-scoped grant authorizes a
+// tool for the given dispatch source and task reference. It sits between the
+// unforgeable solve grant and the profile matrix in the evaluation order.
+type TaskGrantChecker interface {
+	GrantAllows(source, taskRef, toolName string) bool
+}
+
+// WithTaskGrants injects the task-scoped grant store.
+func WithTaskGrants(c TaskGrantChecker) PermissionHookOption {
+	return func(h *PermissionHook) {
+		h.taskGrants = c
+	}
+}
+
+// WithPermissionDecisionRecorder injects the persistent decision audit sink.
+func WithPermissionDecisionRecorder(r PermissionDecisionRecorder) PermissionHookOption {
+	return func(h *PermissionHook) {
+		h.recorder = r
+	}
 }
 
 // UnattendedReviewer 判定一个 consequential 动作在无人值守（cron/webhook/heartbeat/
-// spawn）下是否安全到可自动放行。仅 low-risk 明确放行；medium/high/出错一律拒
-// （fail-closed）。这是 §11.10 统一安全闸的无人值守顾问 —— 单一风险闸，取代原先
-// send_message 自管的 cronConfirmer。
+// spawn/workflow）下是否安全到可自动放行。当前默认策略不再依赖它做隐式全开；
+// 自动放行由 SystemDispatchPolicy 的 profile + source/tool 矩阵决定。
 type UnattendedReviewer interface {
 	AssessLowRisk(ctx context.Context, action, payload string) bool
 }
 
-// WithUnattendedReviewer 注入无人值守风险顾问：当 require_approval 命中而当前是无交互
-// 会话的系统派发时，改问顾问，仅 low 放行一次，否则 fail-closed 拒。
+// WithUnattendedReviewer 注入无人值守风险顾问。保留给调用方扩展更严格策略；
+// 默认权限闸以显式矩阵为准，不用 reviewer 覆盖矩阵结果。
 func WithUnattendedReviewer(r UnattendedReviewer) PermissionHookOption {
 	return func(h *PermissionHook) {
 		h.reviewer = r
@@ -182,12 +226,38 @@ func WithCodeExecApproval(require bool) PermissionHookOption {
 	}
 }
 
-// WithPolicy 注入 v0.4.0 H2 PermissionPolicy；仅在 feature flag tool.policy.engine
-// 开启时生效，flag 关闭仍走 classifyRisk 老路径。
+// WithPolicy 注入 PermissionPolicy；注入后即作为统一权限闸生效。
+// 未注入时才走 classifyRisk legacy 路径。
 func WithPolicy(p *PermissionPolicy) PermissionHookOption {
 	return func(h *PermissionHook) {
 		h.policy = p
 	}
+}
+
+// WithSystemDispatchPolicy injects the unattended auto-approval matrix.
+func WithSystemDispatchPolicy(p *SystemDispatchPolicy) PermissionHookOption {
+	return func(h *PermissionHook) {
+		if p != nil {
+			h.systemDispatchPolicy.Store(p)
+		}
+	}
+}
+
+// SetSystemDispatchPolicy hot-swaps the unattended auto-approval matrix at
+// runtime (profile changes from the settings UI take effect without a
+// restart). Safe for concurrent use with in-flight tool calls.
+func (h *PermissionHook) SetSystemDispatchPolicy(p *SystemDispatchPolicy) {
+	if p != nil {
+		h.systemDispatchPolicy.Store(p)
+	}
+}
+
+// DispatchPolicy returns the currently effective unattended matrix.
+func (h *PermissionHook) DispatchPolicy() *SystemDispatchPolicy {
+	if p := h.systemDispatchPolicy.Load(); p != nil {
+		return p
+	}
+	return DefaultSystemDispatchPolicy()
 }
 
 // DefaultBaselinePolicy 返回与老 classifyRisk 黑名单等价的 PermissionPolicy。
@@ -196,8 +266,7 @@ func WithPolicy(p *PermissionPolicy) PermissionHookOption {
 //
 //	hook := engine.NewPermissionHook(hub, engine.WithPolicy(engine.DefaultBaselinePolicy()))
 //
-// flag tool.policy.engine 开启时此 policy 生效；关闭时被忽略，老 classifyRisk 黑名单
-// 继续工作。这样一行代码同时启用了 H2 + 默认安全模型。
+// 注入后此 policy 生效；未注入 policy 时老 classifyRisk 黑名单继续工作。
 func DefaultBaselinePolicy() *PermissionPolicy {
 	return NewPermissionPolicy(ActionAllow,
 		// dangerous：必须用户审批
@@ -208,8 +277,8 @@ func DefaultBaselinePolicy() *PermissionPolicy {
 		PolicyRule{Name: "browser-sensitive", ToolPattern: "browser", Action: ActionRequireApproval, Risk: "sensitive", Reason: "浏览器自动化"},
 		PolicyRule{Name: "create-skill-sensitive", ToolPattern: "create_skill", Action: ActionRequireApproval, Risk: "sensitive", Reason: "创建新 Skill"},
 		// manage_skill 安装/卸载市场技能 = 引入新代码 = 能力注入；与 create_skill 同级。
-		// 它已在 cronRecursiveToolDenylist（cron 剥离），但 webhook/spawn 不剥离，必须靠此规则
-		// 兜住无人值守自动放行（BUG-F1，review 2026-06-21）。
+		// 它已在 cronRecursiveToolDenylist（历史 cron 剥离清单）中，证明它是能力注入向量。
+		// webhook/spawn 不应绕过审批；无人值守是否自动放行由 autonomy 矩阵显式决定。
 		PolicyRule{Name: "manage-skill-sensitive", ToolPattern: "manage_skill", Action: ActionRequireApproval, Risk: "sensitive", Reason: "安装/卸载 Skill（能力变更）"},
 		PolicyRule{Name: "manage-mcp-sensitive", ToolPattern: "manage_mcp_server", Action: ActionRequireApproval, Risk: "sensitive", Reason: "管理 MCP server"},
 		PolicyRule{Name: "file-edit-sensitive", ToolPattern: "file_edit", Action: ActionRequireApproval, Risk: "sensitive", Reason: "文件编辑"},
@@ -229,30 +298,12 @@ func DefaultBaselinePolicy() *PermissionPolicy {
 func (h *PermissionHook) Priority() int { return 10 }
 
 // NewPermissionHook creates a permission hook.
-// systemDispatchAutoApprove is the allowlist of read/collect tools any
-// pre-authorized system dispatch may use without a human approver.
-// Capability-mutating and dangerous tools still require interactive approval.
-var systemDispatchAutoApprove = map[string]bool{
-	"browser":          true,
-	"knowledge_ingest": true,
-	"search":           true,
-	"web_search":       true,
-}
-
-// cronOnlyAutoApprove are tools auto-approved ONLY for the cron source, not for
-// webhook/spawn: cron_task manages scheduled executions, which an externally
-// triggered webhook or an LLM-decided spawn must not do autonomously
-// (BUG-20260613 review H1).
-var cronOnlyAutoApprove = map[string]bool{
-	"cron_task": true,
-}
-
 // solveAutoApprove are tools auto-approved for a genuine "solve" dispatch
 // (SolveSkill's internal solver/verifier/grader). code_exec there is sandboxed
 // homework computation, tool-scoped to code_exec only. Authorization is proven by
 // the unforgeable solve grant on ctx (see withSolveGrant) — NOT by the
-// LLM-forgeable metadata source string — so it is safe to run without an
-// approver, unlike a generic spawn whose code_exec stays hard-denied.
+// LLM-forgeable metadata source string. It remains useful for non-system solve
+// execution paths and does not broaden shell or other tools.
 var solveAutoApprove = map[string]bool{
 	"code_exec": true,
 }
@@ -282,21 +333,6 @@ func solveGrantFromContext(ctx context.Context) bool {
 	return v
 }
 
-// unattendedHardDeny are tools that must NEVER auto-run from a system dispatch —
-// not even on a "low" verdict from the unattended risk reviewer: arbitrary code
-// execution and capability/host mutation. The reviewer is a single LLM call that
-// can be talked into "low"; letting it greenlight `shell` or `manage_skill install`
-// from an externally-triggered webhook is a privilege-escalation / RCE vector.
-// These require a real interactive approver — with no session that means deny.
-// The reviewer continues to gate only lower-risk delivery actions
-// (send_message / media_generate / publish_*). (BUG-F5, review 2026-06-21.)
-var unattendedHardDeny = map[string]bool{
-	"shell": true, "code": true, "code_exec": true, // arbitrary execution
-	"create_skill": true, "manage_skill": true, "patch_skill": true,
-	"manage_skill_pending": true, "manage_mcp_server": true, // capability mutation
-	"file_edit": true, // host filesystem mutation
-}
-
 func NewPermissionHook(hub *PermissionHub, opts ...PermissionHookOption) *PermissionHook {
 	h := &PermissionHook{
 		hub: hub,
@@ -315,23 +351,36 @@ func NewPermissionHook(hub *PermissionHub, opts ...PermissionHookOption) *Permis
 			"file_edit":         true,
 		},
 	}
+	h.systemDispatchPolicy.Store(DefaultSystemDispatchPolicy())
 	for _, opt := range opts {
 		opt(h)
 	}
 	return h
 }
 
-func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo) error {
-	// Schedule-management tools must never run autonomously from an
-	// externally-triggered webhook or an LLM-decided spawn (only from cron
-	// itself, or interactively). cron_task is otherwise "safe" and ungated,
-	// so this explicit guard precedes risk classification (review H1).
-	if src := systemDispatchSource(ctx); src != "" && src != "cron" && cronOnlyAutoApprove[call.Name] {
-		logger.Warn("[permission] schedule-management tool denied for non-cron system dispatch",
-			"tool_name", call.Name, "source", src)
-		return fmt.Errorf("tool %q cannot run autonomously from %s", call.Name, src)
+// recordDecision persists one gate outcome for system-dispatch runs. No-op
+// without a recorder; the recorder itself must swallow storage errors.
+func (h *PermissionHook) recordDecision(ctx context.Context, tool, decision, via, reason string) {
+	if h.recorder == nil {
+		return
 	}
+	src := systemDispatchSource(ctx)
+	if src == "" {
+		return // interactive sessions are out of the unattended audit scope
+	}
+	h.recorder.RecordPermissionDecision(ctx, PermissionDecision{
+		Source:     src,
+		TaskRef:    systemDispatchTaskRef(ctx),
+		Tool:       tool,
+		Capability: SystemDispatchToolCategory(tool),
+		Profile:    h.DispatchPolicy().Profile(),
+		Decision:   decision,
+		Via:        via,
+		Reason:     reason,
+	})
+}
 
+func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo) error {
 	// v0.4.3 §11.10 统一安全闸：PermissionPolicy 是单一权限闸，配置即生效（不再 flag-gated）——
 	// cron/webhook 的 ctx 不携带 flags，flag-gating 会让无人值守路径漏过闸。policy==nil 时
 	// （未注入策略的调用方）才退化到 classifyRisk 黑名单兜底。
@@ -339,7 +388,7 @@ func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo)
 		dec := h.policy.Evaluate(call)
 		switch dec.Action {
 		case ActionAllow:
-			return nil
+			return h.gateUnattendedConnectorTool(ctx, call)
 		case ActionDeny:
 			logger.Info("[permission] policy deny",
 				"tool", call.Name, "rule", dec.MatchedRule, "reason", dec.Reason)
@@ -347,6 +396,7 @@ func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo)
 			if reason == "" {
 				reason = "policy denies execution"
 			}
+			h.recordDecision(ctx, call.Name, "deny", "policy", "显式 deny 规则 "+dec.MatchedRule)
 			return fmt.Errorf("tool %q blocked by policy %q: %s", call.Name, dec.MatchedRule, reason)
 		case ActionRequireApproval:
 			risk := dec.Risk
@@ -367,58 +417,89 @@ func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo)
 	// Legacy path: hardcoded dangerous/sensitive lists
 	risk := h.classifyRisk(call.Name)
 	if risk == "safe" {
-		return nil
+		return h.gateUnattendedConnectorTool(ctx, call)
 	}
 	return h.requestApproval(ctx, call, risk,
 		fmt.Sprintf("Agent wants to execute %s(%s)", call.Name, summarizeArgs(call.Arguments)))
 }
 
+// gateUnattendedConnectorTool 收口无人值守下的连接器（MCP）工具。
+//
+// 基线 policy 对未命中规则的工具默认放行——交互会话保持该手感不变；但外部/
+// 无人值守触发（cron/webhook/…）下的 MCP 连接器工具是「外部写入」风险面
+// （GitHub/Jira/DB 等第三方系统），矩阵没有它们的内置类别，必须由任务级
+// grant 或显式矩阵条目（含全功能 profile 的 "*"）授权，否则转待审批。
+// skill/builtin 工具不经此闸（它们有类别与 policy 规则治理）。
+func (h *PermissionHook) gateUnattendedConnectorTool(ctx context.Context, call *ToolCallInfo) error {
+	src := systemDispatchSource(ctx)
+	if src == "" {
+		// 交互会话（无派发源）保持自动放行手感，不引入审批摩擦。
+		return nil
+	}
+	// 无人值守下需矩阵/grant 授权的两类工具：
+	//   - 连接器（MCP）工具：外部写入风险面，矩阵无内置类别。
+	//   - 自排程自动化 builtin（cron_task，automation 类别）：GO-9——cron_task 是
+	//     builtin(Source≠mcp)、DefaultBaselinePolicy 无其规则 → 走 ActionAllow 分支
+	//     直达本闸，若仍按「非 mcp 早退」放行，则 SystemDispatchPolicy 矩阵对 cron_task
+	//     形同虚设，cron agent 可自建 cron job 成自我复制回路。故 automation 类别
+	//     builtin 在此一并按矩阵/grant 求值（read/files/media 等其它类别不受影响）。
+	if call.Source != "mcp" && SystemDispatchToolCategory(call.Name) != "automation" {
+		return nil
+	}
+	if taskRef := systemDispatchTaskRef(ctx); taskRef != "" && h.taskGrants != nil && h.taskGrants.GrantAllows(src, taskRef, call.Name) {
+		logger.Info("[permission] connector tool auto-approved by task-scoped grant",
+			"tool_name", call.Name, "source", src, "task_ref", taskRef)
+		h.recordDecision(ctx, call.Name, "allow", "task_grant", "任务级授权命中（连接器工具）")
+		return nil
+	}
+	policy := h.DispatchPolicy()
+	if policy.Allows(src, call.Name) {
+		h.recordDecision(ctx, call.Name, "allow", "matrix", "矩阵显式条目放行（连接器工具）")
+		return nil
+	}
+	logger.Warn("[permission] unattended connector tool requires explicit authorization",
+		"tool_name", call.Name, "source", src, "profile", policy.Profile())
+	h.recordDecision(ctx, call.Name, "pending", "matrix", "连接器工具在无人值守下需显式授权")
+	return fmt.Errorf("connector tool %q requires explicit authorization for unattended %s dispatch: grant it to this task or add an explicit autonomy matrix entry", call.Name, src)
+}
+
 // requestApproval 抽出来给 policy / classifyRisk 两条路径共用。
 func (h *PermissionHook) requestApproval(ctx context.Context, call *ToolCallInfo, risk, reason string) error {
-	// System dispatches (cron/heartbeat/webhook/spawn) run without an
-	// interactive session to approve through. A scheduled task is
-	// pre-authorized at creation, so auto-approve the read/collect sensitive
-	// tools it structurally needs — but never the capability-mutating ones
-	// (create_skill/manage_mcp_server/file_edit) or dangerous ones
-	// (shell/code_exec): those still require a human, which with no session
-	// means deny. This keeps an externally-influenced webhook/spawn from
-	// silently registering an MCP server or editing files (BUG-20260613).
 	// P0 solve（设计⑤根治）：内部解题验证的 sandboxed code_exec 自动放行——**仅凭不可伪造的 solve
 	// grant**（typed ctx value，外部消息注入不进来），不再认可可伪造的 metadata source+spawn_depth。
-	// solve 子 Agent 工具被 spec 限定为仅 code_exec、leaf 深度、沙箱算题、无宿主变更/外部触发，故不属
-	// unattendedHardDeny 的 RCE 面。grant 也只授权 code_exec(solveAutoApprove)，不放宽任何其它工具。
-	// 放在 systemDispatch 判定之前：grant 是最权威的授权，与 metadata 无关。
+	// grant 也只授权 code_exec(solveAutoApprove)，不放宽任何其它工具。放在 systemDispatch 判定之前：
+	// grant 是最权威的授权，与 metadata 无关。
 	if solveGrantFromContext(ctx) && solveAutoApprove[call.Name] {
 		logger.Info("[permission] solve-internal code_exec auto-approved (unforgeable grant)",
 			"tool_name", call.Name)
+		h.recordDecision(ctx, call.Name, "allow", "solve_grant", "solve 内部沙箱执行（不可伪造 grant）")
 		return nil
 	}
 
 	if src := systemDispatchSource(ctx); src != "" {
-		if systemDispatchAutoApprove[call.Name] || (src == "cron" && cronOnlyAutoApprove[call.Name]) {
-			logger.Info("[permission] collect tool auto-approved for pre-authorized system dispatch",
-				"tool_name", call.Name, "source", src, "risk", risk)
+		// 任务级 grant 优先于 Profile 矩阵：范围最小的显式授权（用户在创建流/
+		// 阻断处理里点出来的）应当赢过全局默认，且不放宽其他任务。
+		if taskRef := systemDispatchTaskRef(ctx); taskRef != "" && h.taskGrants != nil {
+			if h.taskGrants.GrantAllows(src, taskRef, call.Name) {
+				logger.Info("[permission] tool auto-approved by task-scoped grant",
+					"tool_name", call.Name, "source", src, "task_ref", taskRef)
+				h.recordDecision(ctx, call.Name, "allow", "task_grant", "任务级授权命中")
+				return nil
+			}
+		}
+
+		policy := h.DispatchPolicy()
+		if policy.Allows(src, call.Name) {
+			logger.Info("[permission] tool auto-approved by system dispatch matrix",
+				"tool_name", call.Name, "source", src, "risk", risk, "profile", policy.Profile())
+			h.recordDecision(ctx, call.Name, "allow", "matrix", "命中 Profile 矩阵自动放行")
 			return nil
 		}
-		// BUG-F5：任意代码执行 + 能力/宿主变更类工具一律 fail-closed，风险顾问无权放行——
-		// 只能交互式人工审批（无会话即拒）。顾问只兜下面的送达类动作。在问顾问之前拦截。
-		if unattendedHardDeny[call.Name] {
-			logger.Warn("[permission] exec/capability tool hard-denied for system dispatch (reviewer cannot override)",
-				"tool_name", call.Name, "source", src, "risk", risk)
-			return fmt.Errorf("tool %q cannot run unattended from %s; exec/capability mutation requires interactive approval", call.Name, src)
-		}
-		// §11.10 无人值守风险顾问：无交互会话可审批时，consequential 动作（send/media/
-		// publish 等命中 require_approval 的）改问 LLM 顾问；仅判定 low 放行一次，
-		// medium/high/无顾问/出错一律 fail-closed 拒。这是统一安全闸的单一无人值守闸，
-		// 取代原 skill 层 cronConfirmer。
-		if h.reviewer != nil && h.reviewer.AssessLowRisk(ctx, call.Name, summarizeArgs(call.Arguments)) {
-			logger.Info("[permission] unattended action allowed by low-risk reviewer verdict",
-				"tool_name", call.Name, "source", src, "risk", risk)
-			return nil
-		}
-		logger.Warn("[permission] tool denied for system dispatch — needs interactive approval or low-risk verdict",
-			"tool_name", call.Name, "source", src, "risk", risk)
-		return fmt.Errorf("tool %q cannot auto-run from %s; it requires interactive approval or a low-risk verdict", call.Name, src)
+		logger.Warn("[permission] system dispatch requires explicit autonomy switch",
+			"tool_name", call.Name, "source", src, "risk", risk, "profile", policy.Profile())
+		h.recordDecision(ctx, call.Name, "pending", "matrix", "Profile 矩阵未放行，转待审批")
+		return fmt.Errorf("tool %q requires approval but %s dispatch profile %q does not auto-approve it; configure security.autonomy.system_dispatch.%s to include a matching category/tool",
+			call.Name, src, policy.Profile(), src)
 	}
 
 	sessionID, _ := ctx.Value(ctxKeySessionID).(string)

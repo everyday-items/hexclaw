@@ -136,6 +136,24 @@ func (p *thinkingBoundProvider) CountTokens(messages []llm.Message) (int, error)
 // (BUG-20260613).
 const maxIdenticalToolCalls = 2
 
+const repeatToolCallBlockedError = "repeat_tool_call_blocked"
+
+func maxIdenticalToolCallsFor(toolName string) int {
+	if runtimeToolSideEffect(toolName) == hruntime.SideEffectUnsafe {
+		return 1
+	}
+	return maxIdenticalToolCalls
+}
+
+func runtimeToolSideEffect(toolName string) hruntime.ToolSideEffect {
+	switch toolName {
+	case "app_query", "browser", "knowledge_search", "list_agents", "search", "session_search", "weather", "web_search":
+		return hruntime.SideEffectReadOnly
+	default:
+		return hruntime.SideEffectUnsafe
+	}
+}
+
 // newRuntimeToolExecutor builds a per-run executor with a fresh repeat guard.
 func newRuntimeToolExecutor(executor *ToolExecutor) *runtimeToolExecutor {
 	return &runtimeToolExecutor{executor: executor, callCounts: make(map[string]int)}
@@ -167,11 +185,11 @@ func (e *runtimeToolExecutor) Execute(ctx context.Context, call llm.ToolCall) (h
 	e.callCounts[sig]++
 	count := e.callCounts[sig]
 	e.mu.Unlock()
-	if count > maxIdenticalToolCalls {
+	if count > maxIdenticalToolCallsFor(call.Name) {
 		trace.L(ctx).Warn("tool-loop repeat guard tripped",
 			"tool", call.Name, "identical_calls", count)
 		msg := fmt.Sprintf("You have already called %q with these exact arguments %d times and received the same result above. Do NOT call it again. Produce your final answer now using the information you already have; if it is insufficient, explain what is missing and stop.", call.Name, count-1)
-		return hruntime.ToolResult{Content: msg}, nil
+		return hruntime.ToolResult{Content: msg, Raw: repeatToolCallBlockedError, Status: hruntime.ToolStatusError}, nil
 	}
 
 	result, err := e.executor.Execute(ctx, call.Name, args)
@@ -180,6 +198,36 @@ func (e *runtimeToolExecutor) Execute(ctx context.Context, call llm.ToolCall) (h
 		return hruntime.ToolResult{Content: msg, Raw: result, Error: err.Error()}, nil
 	}
 	return hruntime.ToolResult{Content: result, Raw: result}, nil
+}
+
+func (e *runtimeToolExecutor) SideEffectOf(call llm.ToolCall) hruntime.ToolSideEffect {
+	return runtimeToolSideEffect(call.Name)
+}
+
+type runtimeRepeatGuardStopMiddleware struct{}
+
+func (runtimeRepeatGuardStopMiddleware) BeforeLLM(context.Context, *hruntime.State) error {
+	return nil
+}
+
+func (runtimeRepeatGuardStopMiddleware) AfterLLM(context.Context, *hruntime.State, *llm.CompletionResponse) error {
+	return nil
+}
+
+func (runtimeRepeatGuardStopMiddleware) BeforeTool(context.Context, *hruntime.State, llm.ToolCall) error {
+	return nil
+}
+
+func (runtimeRepeatGuardStopMiddleware) AfterTool(_ context.Context, state *hruntime.State, _ llm.ToolCall, result hruntime.ToolResult) error {
+	if state != nil && result.Raw == repeatToolCallBlockedError {
+		state.Final = true
+		state.FinalText = result.Content
+	}
+	return nil
+}
+
+func (runtimeRepeatGuardStopMiddleware) Finalize(context.Context, *hruntime.State) error {
+	return nil
 }
 
 type runtimeBudgetMiddleware struct {

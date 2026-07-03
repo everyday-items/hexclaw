@@ -8,8 +8,7 @@
 // H8 引入 ProviderMiddleware：把 hexagon.Provider 包成 wrapper，按"洋葱"模型
 // 串联多个 middleware。所有 cross-cutting 关注点变成可插拔组件。
 //
-// flag model.gateway.v1：alpha 默认 OFF。flag 关闭时 Chain 直接返回未包装的
-// inner provider —— 调用路径与 v0.3 完全一致；flag 开启时 middleware 链路才生效。
+// flag model.gateway.v1 默认 ON；关闭时 Chain 直接返回未包装的 inner provider。
 package engine
 
 import (
@@ -30,9 +29,9 @@ const FlagModelGatewayV1 = "model.gateway.v1"
 func init() {
 	featureflag.Register(featureflag.Flag{
 		Name:         FlagModelGatewayV1,
-		Default:      true, // alpha 强制 OFF
+		Default:      true,
 		Description:  "Wrap hexagon.Provider with middleware chain (rate limit / prompt rewrite / observability).",
-		Stage:        featureflag.StageAlpha,
+		Stage:        featureflag.StageGA,
 		SinceVersion: "0.4.0",
 	})
 }
