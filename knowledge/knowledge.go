@@ -24,6 +24,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -281,6 +282,20 @@ type Manager struct {
 
 	// snapshotRetention 每个快照系列保留的最大文档数（IngestSnapshot 用）；0=不限。
 	snapshotRetention int
+
+	// auxBreaker RAG 辅助 LLM（查询扩展 / LLM 重排）的预算熔断状态（BUG-20260704）；
+	// 跨检索共享，慢 provider 连续超预算即开闸冷却，期间纯确定性检索。零值可用。
+	auxBreaker auxLLMBreaker
+}
+
+// retrievalLLM 返回带预算+熔断的辅助 LLM，用于聊天关键路径上的查询扩展 / LLM 重排
+// （BUG-20260704）；m.llm 为 nil 时返回 nil（调用方自动降级）。与原始 m.llm 区分：
+// 后者仍供离线 contextual-ingest 用（非关键路径，可容忍慢），不加预算。
+func (m *Manager) retrievalLLM() RerankLLM {
+	if m.llm == nil {
+		return nil
+	}
+	return &budgetedRerankLLM{inner: m.llm, breaker: &m.auxBreaker}
 }
 
 // RerankLLM 是重排 / 查询扩展 / contextual-ingest 所需的最小 LLM 能力面（单 prompt 补全）。
@@ -856,7 +871,12 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 
 	for _, q := range queries {
 		if m.embedder != nil {
-			if qv, err := m.embedder.Embed(ctx, []string{cfg.EmbedQueryPrefix + q}); err != nil {
+			// 查询向量化预算（BUG-20260703 同构防护，对齐 engine 记忆召回）：检索是增强，
+			// 不继承整请求 ctx 的漫长余量——慢 embedding 端点超预算即掐断，本轮走纯 BM25。
+			ectx, ecancel := context.WithTimeout(ctx, queryEmbedTimeout)
+			qv, err := m.embedder.Embed(ectx, []string{cfg.EmbedQueryPrefix + q})
+			ecancel()
+			if err != nil {
 				logger.Error("[knowledge] 查询向量嵌入失败", "error", err)
 			} else if len(qv) > 0 {
 				vres, vErr := m.searcher.VectorSearch(ctx, qv[0], candidateK, filter)
@@ -1043,7 +1063,8 @@ func (m *Manager) resolveReranker(topK int) reranker.Reranker {
 		return m.reranker
 	}
 	if m.llm != nil {
-		return reranker.NewLLMReranker(m.llm, reranker.WithLLMRerankerTopK(topK))
+		// BUG-20260704：LLM 重排走带预算+熔断的 retrievalLLM，慢 provider 不阻塞聊天关键路径。
+		return reranker.NewLLMReranker(m.retrievalLLM(), reranker.WithLLMRerankerTopK(topK))
 	}
 	return nil
 }
@@ -1089,20 +1110,43 @@ func (m *Manager) expandQueries(ctx context.Context, query string) []string {
 		}
 	}
 
-	mq := ragquery.NewMultiQueryGenerator(m.llm, ragquery.WithNumQueries(3), ragquery.WithIncludeSelf(false))
-	if variants, err := mq.Generate(ctx, query); err != nil {
-		logger.Warn("[knowledge] multi-query 生成失败", "error", err)
+	// BUG-20260704：查询扩展的 multi-query / HyDE 走带预算+熔断的 retrievalLLM，慢
+	// provider 超预算即掐断，本函数降级返回原查询（[query]），不阻塞聊天关键路径。
+	auxLLM := m.retrievalLLM()
+
+	// 优化（BUG-20260704 续）：multi-query 与 HyDE 是相互独立的查询变换，并行跑——
+	// 健康路径省一半墙钟（原串行 2×LLM），慢 provider 下两路预算超时并发发生（而非串行叠加），
+	// 更快触发熔断（阈值 2）让后续 rerank 直接跳过。结果按固定顺序 add，输出确定。
+	var (
+		wg         sync.WaitGroup
+		mqVariants []string
+		mqErr      error
+		hydeDoc    string
+		hydeErr    error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		mqVariants, mqErr = ragquery.NewMultiQueryGenerator(
+			auxLLM, ragquery.WithNumQueries(3), ragquery.WithIncludeSelf(false)).Generate(ctx, query)
+	}()
+	go func() {
+		defer wg.Done()
+		hydeDoc, hydeErr = ragquery.NewHyDEGenerator(auxLLM).Generate(ctx, query)
+	}()
+	wg.Wait()
+
+	if mqErr != nil {
+		logger.Warn("[knowledge] multi-query 生成失败", "error", mqErr)
 	} else {
-		for _, v := range variants {
+		for _, v := range mqVariants {
 			add(v)
 		}
 	}
-
-	hyde := ragquery.NewHyDEGenerator(m.llm)
-	if doc, err := hyde.Generate(ctx, query); err != nil {
-		logger.Warn("[knowledge] HyDE 生成失败", "error", err)
+	if hydeErr != nil {
+		logger.Warn("[knowledge] HyDE 生成失败", "error", hydeErr)
 	} else {
-		add(doc)
+		add(hydeDoc)
 	}
 
 	if len(queries) > 5 {
@@ -1184,6 +1228,10 @@ const (
 	contextualDocCharBudget   = 6000 // 喂给 LLM 的文档正文上限（rune）
 	contextualChunkCharBudget = 1200 // 喂给 LLM 的单 chunk 上限（rune）
 	maxContextualLLMChunks    = 200  // 单文档最多对前 N 个 chunk 生成 LLM 情境（控成本，超出打 WARN 不静默）
+	// queryEmbedTimeout 检索路径单次查询向量化预算（BUG-20260703 同构防护）。
+	// 仅约束 Search 的 query embed（单条短文本，正常远 <1s）；文档导入的批量
+	// embedding 走 UpsertDocument 等独立路径，不受此预算限制。
+	queryEmbedTimeout = 4 * time.Second
 )
 
 // contextualize 给每个 chunk 前置文档级上下文（Anthropic Contextual Retrieval）。

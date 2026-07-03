@@ -98,7 +98,7 @@ func TestAuditF_NoRelevanceFloorWithRealEmbedding(t *testing.T) {
 	query := "k8s 部署怎么做滚动发布"
 
 	// 先看真实向量相关度：无关事实 cosine 应明显低。
-	cands, err := memEntrySource{entries: toRecallEntries(fm.ParseEntriesForRole("")), embedder: emb}.
+	cands, err := (&memEntrySource{entries: toRecallEntries(fm.ParseEntriesForRole("")), embedder: emb}).
 		Candidates(context.Background(), "", "", query, 10)
 	if err != nil {
 		t.Skipf("embed: %v", err)

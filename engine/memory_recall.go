@@ -2,12 +2,27 @@ package engine
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/memory/recall"
+)
+
+// BUG-20260703 会话 pre-LLM 阻塞防护（对齐同包 ActiveRecall 的超时+熔断模式）：
+// 记忆召回是增强，绝不值得让会话陪慢 embedding 端点等 —— 真机曾出现 26 字回复 95s：
+// Embed 继承整请求 ctx（web 适配器 10min）+ 底层仅 ResponseHeaderTimeout=120s，
+// 端点排队时把「收到消息 → 调 LLM」拖出上百秒且全程零日志。
+const (
+	// memoryEmbedTimeout 单次召回向量化预算。缓存命中零网络；未命中正常 <1s，
+	// 超预算即掐断软降级 BM25（宁可本轮少语义分，不可拖会话）。
+	memoryEmbedTimeout = 2500 * time.Millisecond
+	// memEmbedBreakerThreshold 连续失败/超时次数阈值，达到即开闸。
+	memEmbedBreakerThreshold = 3
+	// memEmbedBreakerCooldown 开闸冷却期：期间跳过向量路径（纯 BM25），到期放行探测。
+	memEmbedBreakerCooldown = 60 * time.Second
 )
 
 // MemoryEmbedder 是长期记忆召回所需的最小向量化能力（hexagon.VectorEmbedder 的子集：
@@ -112,20 +127,32 @@ func (e *ReActEngine) rankFacts(ctx context.Context, facts []recall.Entry, query
 		})
 		return sorted
 	}
+	// 熔断开闸期间跳过向量路径（BUG-20260703③）：端点持续慢/坏时不再逐条消息付代价。
+	emb := e.memEmbedderIfHealthy()
+	src := &memEntrySource{entries: facts, embedder: emb}
+	minScore := 0.0
+	if emb != nil {
+		minScore = e.recallMinScore() // 地板仅在向量真实可用时有语义意义（同 no-embedder 分支）
+	}
 	r := &recall.CuratedRetriever{
-		Source:   memEntrySource{entries: facts, embedder: e.memEmbedder},
+		Source:   src,
 		Expander: recall.SynonymExpander{Synonyms: recall.DefaultSynonyms()}, // 重点二 query 改写：救漏召
 		Reranker: recall.LexicalReranker{},                                   // 重点二 rerank：短语/覆盖精排
-		MinScore: e.recallMinScore(),                                         // 相关性地板：仅 embedding 在时设地板砍噪音，纯 BM25=0 防漏召
+		MinScore: minScore,
 		TopK:     len(facts),
 		Now:      func() time.Time { return now },
 	}
 	results, err := r.Retrieve(ctx, "", "", query)
 	// 相关性地板绝不砍到空（修 S2 真机回归：「花生酱」query 因地板把唯一相关「花生过敏」也砍掉致空召回）。
 	// best practice：地板只用来在「有更相关备选时」滤噪音；若砍到空 → 退回不设地板，宁注入次相关也不漏召到空。
+	// fallback 复用 src 的 embed memo（BUG-20260703②）：同一轮同 query 同批文本绝不二次 Embed。
 	if r.MinScore > 0 && (err != nil || len(results) == 0) {
 		r.MinScore = 0
 		results, err = r.Retrieve(ctx, "", "", query)
+	}
+	// 熔断记账（BUG-20260703③）：本轮真实尝试过向量化才计成败。
+	if src.embedAttempted {
+		e.recordMemEmbedOutcome(src.embedErr == nil)
 	}
 	if err != nil || len(results) == 0 {
 		return facts // 失败兜底：原样返回（注入是增强，绝不阻断）
@@ -137,6 +164,31 @@ func (e *ReActEngine) rankFacts(ctx context.Context, facts []recall.Entry, query
 	return out
 }
 
+// memEmbedderIfHealthy 返回可用的记忆向量化器；熔断开闸期间返回 nil（纯 BM25 降级）。
+func (e *ReActEngine) memEmbedderIfHealthy() MemoryEmbedder {
+	if e.memEmbedder == nil {
+		return nil
+	}
+	if until := e.memEmbedOpenUntil.Load(); until > 0 && time.Now().UnixNano() < until {
+		return nil
+	}
+	return e.memEmbedder
+}
+
+// recordMemEmbedOutcome 熔断记账：连续失败达阈值 → 开闸冷却；任一成功 → 复位。
+func (e *ReActEngine) recordMemEmbedOutcome(ok bool) {
+	if ok {
+		e.memEmbedFailStreak.Store(0)
+		e.memEmbedOpenUntil.Store(0)
+		return
+	}
+	if streak := e.memEmbedFailStreak.Add(1); streak >= memEmbedBreakerThreshold {
+		e.memEmbedOpenUntil.Store(time.Now().Add(memEmbedBreakerCooldown).UnixNano())
+		slog.Warn("[engine] 记忆向量化连续失败，熔断开闸（冷却期内纯 BM25 召回）",
+			"streak", streak, "cooldown", memEmbedBreakerCooldown.String())
+	}
+}
+
 // recallMinScore 返回召回相关性地板（修复 minScore=0 噪音）。
 // **仅当配了 embedder 时设地板**（hybrid relevance 才有语义意义）；纯 BM25 稀疏 → 返 0 防漏召。
 func (e *ReActEngine) recallMinScore() float64 {
@@ -146,30 +198,52 @@ func (e *ReActEngine) recallMinScore() float64 {
 	if e.cfg == nil {
 		return 0.3 // 测试/无 cfg：用默认地板
 	}
-	return e.cfg.FileMemory.RecallMinScore // DefaultConfig 设 0.3；用户可调/置 0 关
+	// 经 RLock 快照读（BUG-20260703 P2-2：与 ReloadFileMemoryConfig 的热更新写互斥）
+	return e.ActiveFileMemoryConfig().RecallMinScore // DefaultConfig 设 0.3；用户可调/置 0 关
 }
 
 // memEntrySource 是基于内存条目切片的 recall.CandidateSource。
 // 配了 embedder 时附带向量分（激活 hybrid），否则降级纯 BM25（复用 LexicalSim）。
+// embed memo（BUG-20260703②）：一轮 rankFacts 内 Retrieve 可能被调两次（地板 fallback），
+// 同 query 同批文本的向量化结果/结论必须复用，绝不二次打端点。
 type memEntrySource struct {
 	entries  []recall.Entry
 	embedder MemoryEmbedder // 可为 nil → 纯 BM25 降级
+
+	embedAttempted bool  // 本轮已真实尝试过向量化（含失败）
+	embedErr       error // 尝试结果（nil=成功）；供调用方做熔断记账
+	memoQVec       []float32
+	memoContent    [][]float32
 }
 
-func (s memEntrySource) Candidates(ctx context.Context, _, _, query string, _ int) ([]recall.Candidate, error) {
+func (s *memEntrySource) Candidates(ctx context.Context, _, _, query string, _ int) ([]recall.Candidate, error) {
 	// 向量路径（可选）：一次性 batch embed [query, ...contents]，逐条 cosine 填 VectorScore。
 	// CachedEmbedder 按文本缓存：条目正文稳定→命中缓存，每轮仅新 query 真打一次 API。
 	// 任一步失败 → 不填向量分，relevance() 自动软降级纯 BM25（注入是增强，绝不阻断）。
-	var qVec []float32
-	var contentVecs [][]float32
-	if s.embedder != nil && strings.TrimSpace(query) != "" && len(s.entries) > 0 {
+	if s.embedder != nil && !s.embedAttempted && strings.TrimSpace(query) != "" && len(s.entries) > 0 {
+		s.embedAttempted = true
 		texts := make([]string, 0, len(s.entries)+1)
 		texts = append(texts, query)
 		for _, e := range s.entries {
 			texts = append(texts, e.Content)
 		}
-		if vecs, err := s.embedder.Embed(ctx, texts); err == nil && len(vecs) == len(texts) {
-			qVec, contentVecs = vecs[0], vecs[1:]
+		// 预算闸（BUG-20260703①）：不继承整请求 ctx 的漫长余量——超预算掐断软降级，
+		// 并显式留痕（此前失败被静默吞掉，真机 110s 阻塞全程零日志无从定位）。
+		ectx, cancel := context.WithTimeout(ctx, memoryEmbedTimeout)
+		start := time.Now()
+		vecs, err := s.embedder.Embed(ectx, texts)
+		cancel()
+		switch {
+		case err != nil:
+			s.embedErr = err
+			slog.Warn("[engine] 记忆召回向量化失败，软降级 BM25",
+				"error", err, "elapsed", time.Since(start).String(), "texts", len(texts))
+		case len(vecs) != len(texts):
+			s.embedErr = context.Canceled // 形状不符视为失败（不重试）
+			slog.Warn("[engine] 记忆召回向量化返回形状不符，软降级 BM25",
+				"want", len(texts), "got", len(vecs))
+		default:
+			s.memoQVec, s.memoContent = vecs[0], vecs[1:]
 		}
 	}
 
@@ -179,8 +253,8 @@ func (s memEntrySource) Candidates(ctx context.Context, _, _, query string, _ in
 			Entry:     e,
 			BM25Score: recall.LexicalSim(query, e.Content),
 		}
-		if len(qVec) > 0 && contentVecs != nil {
-			c.VectorScore = recall.Cosine(qVec, contentVecs[i])
+		if len(s.memoQVec) > 0 && s.memoContent != nil {
+			c.VectorScore = recall.Cosine(s.memoQVec, s.memoContent[i])
 			c.HasVector = true
 		}
 		out = append(out, c)

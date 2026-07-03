@@ -21,6 +21,17 @@ import (
 // ProfileSubject 是用户画像 Pinned 条的保留主语（蒸馏覆盖同一主语条 → 单一真相、可时序更新）。
 const ProfileSubject = "用户画像"
 
+// PersonSubjectPrefix 标记「主语归属为某个第三方具名人物」的事实（如用户让 Agent 记住
+// 的他人简介、对话谈及的第三方）。提取器识别到第三方人物时用 `[人物:名] 正文` 打标，
+// 落库为 Subject=「人物:名」。画像蒸馏据此隔离：**这些事实描述的是别人、不是当前使用者**，
+// 绝不作为使用者画像素材（BUG-20260704：被谈论的第三方人物被蒸馏成软件使用者的画像）。
+const PersonSubjectPrefix = "人物:"
+
+// isPersonSubject 判定一条记忆的主语是否归属第三方具名人物（画像蒸馏须隔离）。
+func isPersonSubject(subject string) bool {
+	return strings.HasPrefix(strings.TrimSpace(subject), PersonSubjectPrefix)
+}
+
 // profileMaxRunes 画像正文 rune 上限（防 LLM 跑飞；画像应是稳定摘要而非长文）。
 const profileMaxRunes = 600
 
@@ -102,6 +113,11 @@ func (fm *FileMemory) collectProfileInputs(role string, now time.Time) (facts []
 			continue // 画像不喂回自身（防自我放大）
 		}
 		if e.Status == "archived" || !entryValidAt(e, now) {
+			continue
+		}
+		// 第三方具名人物事实（用户让 Agent 记住的他人简介、人设等）描述的是**别人**，
+		// 不是当前使用者 —— 隔离出画像输入，否则会把被谈论的人蒸馏成软件使用者（BUG-20260704）。
+		if isPersonSubject(e.Subject) {
 			continue
 		}
 		switch e.Type {

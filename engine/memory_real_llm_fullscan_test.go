@@ -320,7 +320,7 @@ func TestMemoryRealLLM_FullScan(t *testing.T) {
 			{ID: "v1", Type: recall.TypeFact, Content: "用户每年夏天都去马尔代夫海岛潜水度假"}, // 语义相关，字面零重叠
 			{ID: "v2", Type: recall.TypeFact, Content: "用户在北京中关村的写字楼做行政工作"},  // 语义无关
 		}
-		cands, err := memEntrySource{entries: ents, embedder: realEmb}.Candidates(ctx, "", "", query, 10)
+		cands, err := (&memEntrySource{entries: ents, embedder: realEmb}).Candidates(ctx, "", "", query, 10)
 		if err != nil {
 			t.Skipf("embedding 调用失败（网络/额度）: %v", err)
 		}

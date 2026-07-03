@@ -55,7 +55,8 @@ func (e *ReActEngine) autoMemoryMode() string {
 	if e.cfg == nil {
 		return autoMemoryInline
 	}
-	switch m := strings.ToLower(strings.TrimSpace(e.cfg.FileMemory.AutoMemory)); m {
+	// 经 RLock 快照读（BUG-20260703 P2-2：与 ReloadFileMemoryConfig 的热更新写互斥）
+	switch m := strings.ToLower(strings.TrimSpace(e.ActiveFileMemoryConfig().AutoMemory)); m {
 	case autoMemoryExtract, autoMemoryOff:
 		return m
 	default:
@@ -220,7 +221,7 @@ func (e *ReActEngine) CompleteOnce(ctx context.Context, systemPrompt, userPrompt
 	return strings.TrimSpace(resp.Content), nil
 }
 
-const memoryExtractionSystemPrompt = `你是一个记忆提取器。从对话中提取值得长期记住的用户信息。
+const memoryExtractionSystemPrompt = `你是一个记忆提取器。从对话中提取值得长期记住的**当前使用者本人**的信息。
 
 提取什么：
 - 用户身份：姓名、职业、角色、公司
@@ -233,10 +234,17 @@ const memoryExtractionSystemPrompt = `你是一个记忆提取器。从对话中
 - 密码、密钥、身份证号等敏感信息
 - 已有记忆中已经包含的内容（避免重复）
 
+**主语归属（重要）**：只把信息归属给"用户"（当前使用者本人）时，才写成"用户是…/用户偏好…"。
+对话里谈到的**其他人**（第三方具名人物、同事、朋友、被当作资料/彩蛋让你记住的某个人）**绝不能**
+写成"用户是…"——那会把别人的身份、头衔、特质错安到使用者头上。确需记住某个第三方人物的资料时，
+用 ` + "`[人物:名字] 正文`" + ` 前缀把主语标成那个人（如 [人物:张三] 张三是隔壁团队负责人），
+让它明确归属第三方、不污染使用者画像。分不清是谁、或明显在描述别人时，宁可不提取。
+
 格式要求：
 - 每条记忆一行，简短精准
 - **会随时间改变的属性型事实**（居住地、时区、职业、公司、婚况、当前项目等）务必以 [属性名] 前缀标注，
   便于后续矛盾消解（同属性出现新值时取代旧值）。例：[居住地] 用户住在上海、[时区] 用户在 UTC+8
+- **第三方具名人物**的事实用 [人物:名字] 前缀标注主语（见上）
 - 不变事实或一次性偏好无需前缀
 - 如果没有新的值得记忆的信息，只回复 NONE
 - 不要解释，不要前缀编号
@@ -245,7 +253,8 @@ const memoryExtractionSystemPrompt = `你是一个记忆提取器。从对话中
 [职业] 用户是 Go 后端开发者
 用户的项目使用 Vue 3 + TypeScript 前端
 [居住地] 用户住在杭州
-用户偏好简洁的代码风格`
+用户偏好简洁的代码风格
+[人物:李四] 李四是用户团队的设计师`
 
 func buildMemoryExtractionPrompt(userText, assistantText, existingMemory string) string {
 	userText = stringx.TruncateWithSuffix(userText, 500, "...")
