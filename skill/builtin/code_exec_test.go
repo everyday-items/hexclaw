@@ -37,9 +37,65 @@ func (m *mockSandbox) Exec(ctx context.Context, cmd string, args []string) (*san
 
 func newTestCodeExecSkill(t *testing.T) *CodeExecSkill {
 	t.Helper()
+	if codeExecTestNeedsRealSandbox(t.Name()) {
+		requireCodeExecSandbox(t)
+	}
 	sb := &mockSandbox{}
 	cfg := sandbox.Config{Workspace: t.TempDir(), Timeout: 30, Network: true}
 	return NewCodeExecSkill(sb, cfg)
+}
+
+var (
+	codeExecSandboxProbeOnce sync.Once
+	codeExecSandboxProbeErr  error
+)
+
+func codeExecTestNeedsRealSandbox(name string) bool {
+	return strings.Contains(name, "_Execute_") ||
+		strings.Contains(name, "StillExecutes") ||
+		strings.Contains(name, "SandboxDeniesSecretRead")
+}
+
+func requireCodeExecSandbox(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" || os.Getenv("HEXCLAW_P0_SANDBOX_PROOF") == "1" {
+		return
+	}
+	codeExecSandboxProbeOnce.Do(func() {
+		ws, err := os.MkdirTemp("", "hexclaw-code-exec-sandbox-probe-*")
+		if err != nil {
+			codeExecSandboxProbeErr = err
+			return
+		}
+		defer func() {
+			if err := os.RemoveAll(ws); err != nil && codeExecSandboxProbeErr == nil {
+				codeExecSandboxProbeErr = err
+			}
+		}()
+		cfg := ensureCodeExecConfigDefaults(sandbox.Config{Workspace: ws, Timeout: 5})
+		sb, err := sandbox.New(cfg)
+		if err != nil {
+			codeExecSandboxProbeErr = err
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		res, err := sb.Exec(ctx, "sh", []string{"-c", "true"})
+		if err != nil {
+			codeExecSandboxProbeErr = err
+			return
+		}
+		if res == nil {
+			codeExecSandboxProbeErr = fmt.Errorf("probe returned nil result")
+			return
+		}
+		if res.ExitCode != 0 {
+			codeExecSandboxProbeErr = fmt.Errorf("probe exit code %d", res.ExitCode)
+		}
+	})
+	if codeExecSandboxProbeErr != nil {
+		t.Skipf("linux sandbox backend unavailable: %v", codeExecSandboxProbeErr)
+	}
 }
 
 func TestCodeExecSkill_Meta(t *testing.T) {
@@ -388,7 +444,7 @@ func TestCodeExecSkill_Execute_SnippetInfersPythonFromModelCode(t *testing.T) {
 	s := newTestCodeExecSkill(t)
 	result, err := s.Execute(context.Background(), map[string]any{
 		"mode": "snippet",
-		"code": "from pathlib import Path\nPath('artifacts/inferred_python.txt').write_text('ok')\nprint('PY_INFERRED_SNIPPET_OK')",
+		"code": "import os\nfrom pathlib import Path\nartifact_dir = Path(os.environ['HEXCLAW_ARTIFACT_DIR'])\nartifact_dir.mkdir(parents=True, exist_ok=True)\n(artifact_dir / 'inferred_python.txt').write_text('ok')\nprint('PY_INFERRED_SNIPPET_OK')",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -550,6 +606,7 @@ func TestCodeExecSkill_Execute_PythonCrawlerNetworkPolicy(t *testing.T) {
 }
 
 func TestCodeExecSkill_Execute_ProjectGoCommand(t *testing.T) {
+	requireCodeExecSandbox(t)
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -578,6 +635,7 @@ func TestCodeExecSkill_Execute_ProjectGoCommand(t *testing.T) {
 }
 
 func TestCodeExecSkill_Execute_OutputTruncation(t *testing.T) {
+	requireCodeExecSandbox(t)
 	sb := &mockSandbox{}
 	// 直接字段赋值：sandbox.Config 的限额字段由 go.work 链接的 toolkit 保证存在，
 	// 不再走反射设置（旧版曾用反射 + 版本 skip 兜底）。
@@ -612,6 +670,7 @@ func TestCodeExecSkill_Execute_RuntimeMissing(t *testing.T) {
 }
 
 func TestCodeExecSkill_Execute_Timeout(t *testing.T) {
+	requireCodeExecSandbox(t)
 	sb := &mockSandbox{}
 	cfg := sandbox.Config{Workspace: t.TempDir(), Timeout: 1, MaxOutputBytes: 1024, MaxStderrBytes: 1024}
 	s := NewCodeExecSkill(sb, cfg)
@@ -822,6 +881,11 @@ func TestCodeExecSkill_ConcurrentSafety(t *testing.T) {
 	sb := &mockSandbox{}
 	cfg := sandbox.Config{Workspace: ws, Timeout: 30, Network: true}
 	s := NewCodeExecSkill(sb, cfg)
+	s.sandboxFactory = func(sandbox.Config) (sandbox.Sandbox, error) {
+		return &mockSandbox{execFn: func(context.Context, string, []string) (*sandbox.ExecResult, error) {
+			return &sandbox.ExecResult{Stdout: "1\n", ExitCode: 0}, nil
+		}}, nil
+	}
 
 	var wg sync.WaitGroup
 	errs := make(chan error, 20)

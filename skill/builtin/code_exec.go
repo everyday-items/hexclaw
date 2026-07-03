@@ -653,7 +653,7 @@ func runSandboxCommand(ctx context.Context, sb sandbox.Sandbox, run codeExecRun,
 		return nil, err
 	}
 	if runtime.GOOS == "windows" {
-		return runWindowsSandboxCommand(ctx, sb, command, exports)
+		return runWindowsSandboxCommand(ctx, sb, run, command, exports)
 	}
 	return runPosixSandboxCommand(ctx, sb, command, exports)
 }
@@ -735,7 +735,7 @@ func runPosixSandboxCommand(ctx context.Context, sb sandbox.Sandbox, command []s
 	return sb.Exec(ctx, "sh", []string{"-c", script.String()})
 }
 
-func runWindowsSandboxCommand(ctx context.Context, sb sandbox.Sandbox, command []string, exports map[string]string) (*sandbox.ExecResult, error) {
+func runWindowsSandboxCommand(ctx context.Context, sb sandbox.Sandbox, run codeExecRun, command []string, exports map[string]string) (*sandbox.ExecResult, error) {
 	var script strings.Builder
 	for _, k := range codeExecUnsetEnvKeys {
 		script.WriteString("set \"")
@@ -755,7 +755,18 @@ func runWindowsSandboxCommand(ctx context.Context, sb sandbox.Sandbox, command [
 		script.WriteString("\"\r\n")
 	}
 	script.WriteString(windowsCmdJoin(command))
-	return sb.Exec(ctx, "cmd", []string{"/d", "/s", "/c", script.String()})
+
+	wrapperName := "_hexclaw_run_" + run.ID + ".cmd"
+	wrapperPath := filepath.Join(run.Workspace, wrapperName)
+	if err := os.WriteFile(wrapperPath, []byte(script.String()), 0600); err != nil {
+		return nil, fmt.Errorf("write windows command wrapper: %w", err)
+	}
+	defer func() {
+		if err := os.Remove(wrapperPath); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "code_exec: remove windows command wrapper %q: %v\n", wrapperPath, err)
+		}
+	}()
+	return sb.Exec(ctx, "cmd", []string{"/d", "/s", "/c", wrapperName})
 }
 
 func buildCodeExecReport(req codeExecRequest, run codeExecRun, command []string, result *sandbox.ExecResult, execErr error, missingDeps []string) codeExecReport {
@@ -1423,7 +1434,7 @@ func ensureCodeExecConfigDefaults(cfg sandbox.Config) sandbox.Config {
 		cfg.MaxArtifactBytes = 50 * 1024 * 1024
 	}
 	if cfg.MaxMemoryBytes <= 0 {
-		cfg.MaxMemoryBytes = 256 * 1024 * 1024
+		cfg.MaxMemoryBytes = 2 * 1024 * 1024 * 1024
 	}
 	if cfg.MaxProcesses <= 0 {
 		cfg.MaxProcesses = 64
