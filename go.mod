@@ -1,6 +1,6 @@
 module github.com/hexagon-codes/hexclaw
 
-go 1.25.5
+go 1.25.7
 
 require (
 	github.com/alibabacloud-go/darabonba-openapi/v2 v2.0.12
@@ -8,9 +8,9 @@ require (
 	github.com/alibabacloud-go/tea v1.2.2
 	github.com/alibabacloud-go/tea-utils/v2 v2.0.8
 	github.com/gorilla/websocket v1.5.3
-	github.com/hexagon-codes/ai-core v0.1.11
-	github.com/hexagon-codes/hexagon v0.5.7
-	github.com/hexagon-codes/toolkit v0.2.3
+	github.com/hexagon-codes/ai-core v0.2.0
+	github.com/hexagon-codes/hexagon v0.5.8
+	github.com/hexagon-codes/toolkit v0.2.6
 	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
 	github.com/line/line-bot-sdk-go/v8 v8.20.1
 	github.com/open-dingtalk/dingtalk-stream-sdk-go v0.9.1

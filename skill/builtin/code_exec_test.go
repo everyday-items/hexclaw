@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -427,6 +428,17 @@ func TestCodeExecSkill_PreparesEnvDirsOutsideSandbox(t *testing.T) {
 	}
 }
 
+func TestCodeExecSkill_GoRuntimeReadablePathsIncludeSumDB(t *testing.T) {
+	gopath := filepath.Join(t.TempDir(), "gopath")
+	t.Setenv("GOPATH", gopath)
+
+	paths := goRuntimeReadablePaths()
+	want := filepath.Join(gopath, "pkg", "sumdb")
+	if !slices.Contains(paths, want) {
+		t.Fatalf("go runtime readable paths missing sumdb cache %q: %v", want, paths)
+	}
+}
+
 func TestCodeExecSkill_PosixWrapperDoesNotMkdirInsideSandbox(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell wrapper only")
@@ -544,8 +556,11 @@ func TestCodeExecSkill_Execute_ProjectGoCommand(t *testing.T) {
 	}
 	root := nearestProjectRoot(wd)
 	s := NewCodeExecSkill(&mockSandbox{}, sandbox.Config{
-		Workspace:     t.TempDir(),
-		Timeout:       60,
+		Workspace: t.TempDir(),
+		// 沙箱 per-run 冷 GOCACHE：嵌套 go test 每次全量编译整条 go.work 链，空载 ~18s、
+		// 并行全量回归下实测 60s 会被挤爆（2026-07-03 负载 flaky 取证）。180s 留足余量，
+		// 本测试意图是「project 模式能跑 go 命令」而非性能门。
+		Timeout:       180,
 		Network:       false,
 		ReadablePaths: []string{filepath.Dir(root)},
 	})

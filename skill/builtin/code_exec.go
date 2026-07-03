@@ -1227,12 +1227,16 @@ func goRuntimeReadablePaths() []string {
 	}
 	for _, gp := range filepath.SplitList(os.Getenv("GOPATH")) {
 		if strings.TrimSpace(gp) != "" {
-			paths = append(paths, filepath.Join(gp, "pkg", "mod"))
+			paths = append(paths,
+				filepath.Join(gp, "pkg", "mod"),
+				filepath.Join(gp, "pkg", "sumdb"),
+			)
 		}
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		paths = append(paths,
 			filepath.Join(home, "go", "pkg", "mod"),
+			filepath.Join(home, "go", "pkg", "sumdb"),
 			filepath.Join(home, ".cache", "go-build"),
 			filepath.Join(home, "Library", "Caches", "go-build"),
 		)
