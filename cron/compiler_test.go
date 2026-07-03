@@ -63,15 +63,15 @@ func TestParseCompiledSpec_ExtractsRuntimeAndScript(t *testing.T) {
 	}{
 		{
 			name: "纯 JSON",
-			raw: `{"runtime":"python3","script":"print('hi')\n","deps":[],"timeout_s":60}`,
+			raw:  `{"runtime":"python3","script":"print('hi')\n","deps":[],"timeout_s":60}`,
 		},
 		{
 			name: "markdown 围栏",
-			raw: "```json\n{\"runtime\":\"python3\",\"script\":\"print('hi')\\n\",\"deps\":[\"requests\"],\"timeout_s\":120}\n```",
+			raw:  "```json\n{\"runtime\":\"python3\",\"script\":\"print('hi')\\n\",\"deps\":[\"requests\"],\"timeout_s\":120}\n```",
 		},
 		{
 			name: "首行无 json 标识",
-			raw: "```\n{\"runtime\":\"python3\",\"script\":\"print('hi')\\n\"}\n```",
+			raw:  "```\n{\"runtime\":\"python3\",\"script\":\"print('hi')\\n\"}\n```",
 		},
 	}
 	for _, tc := range cases {
@@ -202,6 +202,33 @@ func TestLLMCompiler_EndToEnd_WithFakeProvider(t *testing.T) {
 	}
 	if fp.last == nil || !strings.Contains(fp.last.Messages[0].Content, "web-search") {
 		t.Error("system prompt 应列出 AvailableSkills")
+	}
+}
+
+func TestLLMCompiler_DisablesThinkingForStructuredCompile(t *testing.T) {
+	fp := &fakeProvider{
+		resp: &llm.CompletionResponse{
+			Content: `{"runtime":"python3","script":"` + escapeJSON(validScript) + `","timeout_s":60}`,
+		},
+	}
+	c := NewLLMCompilerStatic(fp, "Qwen/Qwen3.6-35B-A3B")
+	if _, err := c.Compile(context.Background(), "每天采集百度热搜", CompileHints{}); err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if fp.last == nil {
+		t.Fatal("provider 未收到请求")
+	}
+	if got := fp.last.Metadata["thinking"]; got != "off" {
+		t.Fatalf("compile request thinking metadata = %#v, want off", got)
+	}
+	if got := fp.last.Metadata["enable_thinking"]; got != false {
+		t.Fatalf("compile request enable_thinking metadata = %#v, want false", got)
+	}
+	if fp.last.ResponseFormat == nil || fp.last.ResponseFormat.Type != "json_object" {
+		t.Fatalf("compile request response_format = %#v, want json_object", fp.last.ResponseFormat)
+	}
+	if len(fp.last.Messages) == 0 || !strings.Contains(fp.last.Messages[0].Content, "/no_think") {
+		t.Fatalf("compile system prompt must include /no_think, got %#v", fp.last.Messages)
 	}
 }
 

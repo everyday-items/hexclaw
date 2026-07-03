@@ -57,6 +57,35 @@ func TestBug20260615_CompilePrompt_IsStarlark(t *testing.T) {
 	}
 }
 
+func TestBug20260702_CompilePromptForbidsPythonOnlyStarlark(t *testing.T) {
+	p := buildCompileSystemPrompt(CompileHints{})
+	for _, must := range []string{"try/except", "set()", "enumerate()", "isinstance()", "range(len(items))", "seen = {}"} {
+		if !strings.Contains(p, must) {
+			t.Errorf("compile prompt must forbid/replace Python-only Starlark pattern %q", must)
+		}
+	}
+}
+
+func TestBug20260702_ValidateRejectsPythonOnlyStarlark(t *testing.T) {
+	cases := []string{
+		"def run():\n    try:\n        x = 1\n    except Exception:\n        x = 2\n    return {\"status\":\"success\"}\nemit(run())",
+		"def run():\n    seen = set()\n    return {\"status\":\"success\"}\nemit(run())",
+		"def run():\n    for i, item in enumerate([1]):\n        pass\n    return {\"status\":\"success\"}\nemit(run())",
+		"def run():\n    if isinstance({}, dict):\n        pass\n    return {\"status\":\"success\"}\nemit(run())",
+	}
+	for _, script := range cases {
+		if err := validateStarlarkSource(script); err == nil || !strings.Contains(err.Error(), "Python-only") {
+			t.Fatalf("expected Python-only Starlark validation error, got %v for script:\n%s", err, script)
+		}
+	}
+	if err := validateStarlarkSource("state_set(\"k\", \"v\")\nemit({\"status\":\"success\"})"); err != nil {
+		t.Fatalf("state_set must not be mistaken for set(): %v", err)
+	}
+	if err := validateStarlarkSource("# CSS class and try in comments are fine\nemit({\"status\":\"success\",\"data\":\"class try set()\"})"); err != nil {
+		t.Fatalf("comments/strings must not trigger Python-only validation: %v", err)
+	}
+}
+
 func TestBug20260615_CompileStarlark_DefaultsRuntimeWhenOmitted(t *testing.T) {
 	fp := &fakeProvider{
 		resp: &llm.CompletionResponse{

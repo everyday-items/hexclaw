@@ -36,15 +36,21 @@ func TestBug20260615_CompileValidationSelfRepair_Recovers(t *testing.T) {
 	if verr := NewStarlarkEngine().Validate(spec.Script); verr != nil {
 		t.Errorf("repaired script must pass validation: %v", verr)
 	}
-	if len(seq.reqs) < 2 {
-		t.Errorf("expected a repair round (>=2 LLM calls), got %d", len(seq.reqs))
+	// BUG-20260703：坏转义(\.) 现由 deterministic 预修复在首次校验失败时直接修好，
+	// 不再花一轮 LLM——只需 1 次 LLM 调用（初始编译）。
+	if len(seq.reqs) != 1 {
+		t.Errorf("bad escape should be repaired deterministically without an LLM round (want 1 call), got %d", len(seq.reqs))
 	}
 }
 
 func TestBug20260615_CompileValidationSelfRepair_GivesUpAfterOneRound(t *testing.T) {
-	// Both replies carry the same bad escape — repair must not loop forever; it
-	// surfaces the validation error after exactly one repair round.
-	bad := `{"runtime":"starlark","script":"` + escapeJSON(badEscapeStarlark) + `"}`
+	// Both replies carry a Python-only builtin that deterministic repair does NOT
+	// handle (set()) — repair must not loop forever; it surfaces the validation
+	// error after exactly one repair round.
+	// (try/except is no longer a give-up example: BUG-20260703 repairs it
+	// deterministically, see TestBug20260703_RepairPythonTryExceptAndIsNone.)
+	badScript := "def run():\n    x = set([1, 2])\n    return {\"status\":\"success\"}\nemit(run())\n"
+	bad := `{"runtime":"starlark","script":"` + escapeJSON(badScript) + `"}`
 	seq := &seqProvider{responses: []string{bad, bad}}
 	c := NewLLMCompilerStatic(seq, "glm-4-flash")
 	_, err := c.Compile(context.Background(), "x", CompileHints{})
@@ -53,5 +59,38 @@ func TestBug20260615_CompileValidationSelfRepair_GivesUpAfterOneRound(t *testing
 	}
 	if len(seq.reqs) > 2 {
 		t.Errorf("repair must run at most one round (<=2 calls), got %d", len(seq.reqs))
+	}
+}
+
+func TestBug20260702_CompileValidationSelfRepair_FixesRegexEscapesAfterLLMRepair(t *testing.T) {
+	// 1st reply uses set() (not deterministically fixable) → forces one LLM round;
+	// the LLM's 2nd reply carries bad regex escapes that the post-LLM deterministic
+	// repair doubles. (try/except would now be pre-repaired, skipping the round —
+	// BUG-20260703 — so use set() to still exercise the after-LLM-repair path.)
+	badPythonOnly := "def run():\n    x = set([1, 2])\n    return {\"status\":\"success\"}\nemit(run())\n"
+	badRegexEscape := `def run():
+    data = re_findall("window\.INITIAL_STATE\s*=\s*\{(.*?)\}", "window.INITIAL_STATE = {x}")
+    return {"status":"success","data": data}
+run()`
+	seq := &seqProvider{responses: []string{
+		`{"runtime":"starlark","script":"` + escapeJSON(badPythonOnly) + `"}`,
+		`{"runtime":"starlark","script":"` + escapeJSON(badRegexEscape) + `"}`,
+	}}
+	c := NewLLMCompilerStatic(seq, "nemotron")
+	spec, err := c.Compile(context.Background(), "采集百度热搜", CompileHints{})
+	if err != nil {
+		t.Fatalf("regex escape deterministic repair should recover after LLM repair: %v", err)
+	}
+	if err := validateStarlarkSource(spec.Script); err != nil {
+		t.Fatalf("repaired script must validate: %v\n%s", err, spec.Script)
+	}
+	if !strings.Contains(spec.Script, `window\\.INITIAL_STATE`) || !strings.Contains(spec.Script, `\\s*`) {
+		t.Fatalf("regex escapes were not doubled safely: %s", spec.Script)
+	}
+	if !strings.Contains(spec.Script, "emit(run())") {
+		t.Fatalf("bare run() was not wrapped in emit(run()): %s", spec.Script)
+	}
+	if len(seq.reqs) != 2 {
+		t.Fatalf("expected exactly one LLM repair round, got %d", len(seq.reqs))
 	}
 }

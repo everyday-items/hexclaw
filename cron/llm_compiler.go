@@ -16,7 +16,9 @@ import (
 	"github.com/hexagon-codes/hexagon"
 )
 
-// ProviderResolver 在每次 Compile 时被调用，返当前用户配置的默认 provider + model。
+// ProviderResolver 在每次 Compile 时被调用，返回 provider + model。
+// 注意：llmrouter.Selector.Route 的第二返回值是 provider 名；调用方需要使用
+// RouteModel 或等价逻辑解析出真实 model。
 //
 // 设计动机（2026-05-27 用户反馈）：cron compiler 不能在启动时固化模型 —
 // 用户在 UI 切换 chat 模型后，cron 编译应跟随当前默认（router.Default()），
@@ -94,6 +96,28 @@ func (c *LLMCompiler) CompileWithProgress(
 		return nil, fmt.Errorf("prompt 不能为空")
 	}
 
+	emit := func(stage ProgressStage, msg string) {
+		if onProgress != nil {
+			onProgress(CompileProgress{Stage: stage, Message: msg})
+		}
+	}
+
+	if spec := deterministicCompiledSpec(prompt); spec != nil {
+		emit(StageValidating, "使用内置 Starlark 模板并校验脚本安全性…")
+		normalizeCompiledSpec(spec)
+		if err := validateCompiledScript(spec); err != nil {
+			return nil, fmt.Errorf("内置模板校验失败: %w", err)
+		}
+		spec.Compiled = CompileMeta{
+			Model:     "builtin-template",
+			At:        time.Now(),
+			Hash:      hashSpec(spec),
+			TokensIn:  0,
+			TokensOut: 0,
+		}
+		return spec, nil
+	}
+
 	// 每次 Compile 时动态解析当前默认 provider+model（2026-05-27 用户反馈）
 	// resolver != nil 走生产路径；nil 时回退到静态字段（测试 / stub compiler 走这里）。
 	var (
@@ -116,20 +140,16 @@ func (c *LLMCompiler) CompileWithProgress(
 		provider, model = c.provider, c.model
 	}
 
-	emit := func(stage ProgressStage, msg string) {
-		if onProgress != nil {
-			onProgress(CompileProgress{Stage: stage, Message: msg})
-		}
-	}
-
 	emit(StageCallingLLM, fmt.Sprintf("调用 LLM 生成 Starlark 脚本（model=%s）…", model))
-	sys := buildCompileSystemPrompt(hints)
+	sys := withCompileNoThinkDirective(buildCompileSystemPrompt(hints))
 	temp := 0.0
 	req := llm.CompletionRequest{
-		Model:       model,
-		Messages:    llm.NewMessages(sys, prompt),
-		MaxTokens:   c.maxTokens,
-		Temperature: &temp,
+		Model:          model,
+		Messages:       llm.NewMessages(sys, prompt),
+		MaxTokens:      c.maxTokens,
+		Temperature:    &temp,
+		Metadata:       compileLLMMetadata(),
+		ResponseFormat: &llm.ResponseFormat{Type: "json_object"},
 	}
 	startedAt := time.Now()
 	slog.Info("[cron] 开始编译", "source", "cron", "provider_model", model, "prompt_len", len(prompt))
@@ -170,10 +190,12 @@ func (c *LLMCompiler) CompileWithProgress(
 		repairResp, repairErr := llmcall.Call(ctx, llmcall.Request{
 			Provider: provider,
 			Req: llm.CompletionRequest{
-				Model:       model,
-				Messages:    repairMessages,
-				MaxTokens:   c.maxTokens,
-				Temperature: &temp,
+				Model:          model,
+				Messages:       repairMessages,
+				MaxTokens:      c.maxTokens,
+				Temperature:    &temp,
+				Metadata:       compileLLMMetadata(),
+				ResponseFormat: &llm.ResponseFormat{Type: "json_object"},
 			},
 		})
 		if repairErr == nil {
@@ -207,6 +229,19 @@ func (c *LLMCompiler) CompileWithProgress(
 
 	emit(StageValidating, "校验脚本安全性…")
 	if verr := validateCompiledScript(spec); verr != nil {
+		// BUG-20260703：先跑 deterministic 修复（try/except 剥离、is None 归一、正则转义、
+		// 补 emit）——采集类脚本的校验失败绝大多数就是这几个 Python-ism，机械翻译即通过，
+		// 无需再花一轮 LLM（更快更稳、不受弱模型固执影响）。
+		if repaired, ok := repairCommonStarlarkValidationSlips(spec.Script); ok {
+			candidate := *spec
+			candidate.Script = repaired
+			if validateCompiledScript(&candidate) == nil {
+				slog.Info("[cron] validation slips repaired deterministically, skipping LLM round", "source", "cron", "model", model)
+				spec = &candidate
+				spec.Compiled = CompileMeta{Model: model, At: time.Now(), TokensIn: tokensIn, TokensOut: tokensOut, Hash: hashSpec(spec)}
+				return spec, nil
+			}
+		}
 		// Validation self-repair (BUG-20260615 P2.5): a weak model — or one
 		// unfamiliar with Starlark, a small dialect — routinely writes a
 		// structurally-correct script with one fixable slip (bad escape \., stray
@@ -218,13 +253,22 @@ func (c *LLMCompiler) CompileWithProgress(
 		fixMessages := append(llm.NewMessages(sys, prompt),
 			llm.Message{Role: llm.RoleAssistant, Content: raw},
 			llm.Message{Role: llm.RoleUser, Content: "The Starlark script failed validation with this exact error:\n" + verr.Error() +
-				"\n\nFix ONLY that error (for a regex escape use a raw string r\"...\" or double the backslash; " +
+				"\n\nConvert the script to REAL Starlark, not Python. Starlark has NO try/except/finally/raise, NO set(), NO enumerate(), NO isinstance(). " +
+				"Use seen = {} as a set, for i in range(len(items)) for indexed loops, and simple key/get checks instead of isinstance. " +
+				"Fix ONLY the validation error (for a regex escape use a raw string r\"...\" or double the backslash; " +
 				"close any unfinished expression; correct field names), then re-emit the SAME task as one pure JSON " +
 				"object (fields: runtime / script / timeout_s). No markdown fences, no explanation."},
 		)
 		fixResp, fixErr := llmcall.Call(ctx, llmcall.Request{
 			Provider: provider,
-			Req:      llm.CompletionRequest{Model: model, Messages: fixMessages, MaxTokens: c.maxTokens, Temperature: &temp},
+			Req: llm.CompletionRequest{
+				Model:          model,
+				Messages:       fixMessages,
+				MaxTokens:      c.maxTokens,
+				Temperature:    &temp,
+				Metadata:       compileLLMMetadata(),
+				ResponseFormat: &llm.ResponseFormat{Type: "json_object"},
+			},
 		})
 		if fixErr != nil {
 			return nil, fmt.Errorf("脚本校验失败: %w —— LLM 原文:\n%s", verr, raw)
@@ -242,6 +286,14 @@ func (c *LLMCompiler) CompileWithProgress(
 			return nil, fmt.Errorf("脚本校验失败（自纠输出不可解析）: %w —— LLM 原文:\n%s", verr, fixRaw)
 		}
 		normalizeCompiledSpec(fixSpec)
+		if repaired, ok := repairCommonStarlarkValidationSlips(fixSpec.Script); ok {
+			candidate := *fixSpec
+			candidate.Script = repaired
+			if repairErr := validateCompiledScript(&candidate); repairErr == nil {
+				slog.Info("[cron] validation self-correction common slips repaired", "source", "cron", "model", model)
+				fixSpec = &candidate
+			}
+		}
 		if verr2 := validateCompiledScript(fixSpec); verr2 != nil {
 			slog.Warn("[cron] validation self-correction still invalid", "source", "cron", "model", model, "err", verr2.Error())
 			return nil, fmt.Errorf("脚本校验失败（含一次自纠）: %w —— LLM 原文:\n%s", verr2, fixRaw)
@@ -258,6 +310,21 @@ func (c *LLMCompiler) CompileWithProgress(
 		Hash:      hashSpec(spec),
 	}
 	return spec, nil
+}
+
+func compileLLMMetadata() map[string]any {
+	return map[string]any{
+		"thinking":        "off",
+		"enable_thinking": false,
+	}
+}
+
+func withCompileNoThinkDirective(systemPrompt string) string {
+	const directive = "/no_think\nDo not spend tokens on hidden reasoning. Output only the required JSON object."
+	if strings.Contains(systemPrompt, "/no_think") {
+		return systemPrompt
+	}
+	return strings.TrimSpace(systemPrompt) + "\n\n" + directive
 }
 
 // parseCompiledSpec 把 LLM 输出解析成 JobSpec。
@@ -324,6 +391,237 @@ func salvageScript(raw string) string {
 		return strings.TrimSpace(s)
 	}
 	return ""
+}
+
+var regexStringLiteralRe = regexp.MustCompile(`re_(?:findall|sub)\(\s*"((?:\\.|[^"\\])*)"`)
+var topLevelNoArgFuncRe = regexp.MustCompile(`(?m)^def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\):`)
+
+func repairCommonStarlarkValidationSlips(script string) (string, bool) {
+	out, changed := repairInvalidRegexEscapes(script)
+	// BUG-20260703：弱模型对采集类脚本反复写 Python-only 的 try/except 防御式解析 +
+	// `is None` 判空——Starlark 两者都没有。系统提示已明令禁止仍照写，一次 LLM 自纠也
+	// 常不改。deterministic 翻译这两个最高频 Python-ism，让自愈确定性收敛不依赖模型。
+	if repaired, ok := stripPythonTryExcept(out); ok {
+		out = repaired
+		changed = true
+	}
+	if repaired, ok := normalizeStarlarkIsNone(out); ok {
+		out = repaired
+		changed = true
+	}
+	if repaired, ok := repairMissingEmitCall(out); ok {
+		out = repaired
+		changed = true
+	}
+	return out, changed
+}
+
+// starlarkIsNoneRe 匹配 Python 的 `X is None` / `X is not None` 判空。Starlark 无 `is`
+// 运算符；对 None 而言 `== None`/`!= None` 语义完全等价，故直接替换、零风险。词边界
+// 保证不误伤 `history`、字符串 `"is None-ish"` 里的子串（前后须为非标识符字符）。
+var starlarkIsNoneRe = regexp.MustCompile(`\bis\s+not\s+None\b|\bis\s+None\b`)
+
+func normalizeStarlarkIsNone(script string) (string, bool) {
+	if !starlarkIsNoneRe.MatchString(script) {
+		return script, false
+	}
+	out := starlarkIsNoneRe.ReplaceAllStringFunc(script, func(m string) string {
+		if strings.Contains(m, "not") {
+			return "!= None"
+		}
+		return "== None"
+	})
+	return out, out != script
+}
+
+var (
+	tryHeaderRe     = regexp.MustCompile(`^(\s*)try\s*:\s*(#.*)?$`)
+	handlerHeaderRe = regexp.MustCompile(`^\s*(except|finally|else)\b.*:\s*(#.*)?$`)
+)
+
+// stripPythonTryExcept 把 Python try/except/finally 块改写成合法 Starlark：保留 try
+// 主体（去缩进一级）、丢弃 except/finally/else 处理子句。Starlark 无异常模型，忠实
+// 行为是「跑主体，无法恢复的错误直接失败」（正对齐系统提示「先检查 status/len/key，
+// 不要捕获异常」），故保留 happy-path、丢处理子句是这个最常见 Python-ism 的确定性译法。
+// 逐块处理，嵌套块经多轮循环收敛。
+func stripPythonTryExcept(script string) (string, bool) {
+	lines := strings.Split(script, "\n")
+	changed := false
+	for {
+		idx := -1
+		indent := ""
+		for i, ln := range lines {
+			if m := tryHeaderRe.FindStringSubmatch(ln); m != nil {
+				idx = i
+				indent = m[1]
+				break
+			}
+		}
+		if idx < 0 {
+			break
+		}
+		base := len(indent)
+		// try 主体：后续比 try 更深缩进的行（空行一并纳入）。
+		bodyStart := idx + 1
+		j := bodyStart
+		for j < len(lines) {
+			if strings.TrimSpace(lines[j]) == "" || leadingSpaces(lines[j]) > base {
+				j++
+				continue
+			}
+			break
+		}
+		bodyEnd := j
+		// 丢弃 except/finally/else 处理子句（与 try 同缩进）及其子体。
+		k := bodyEnd
+		for k < len(lines) {
+			ln := lines[k]
+			if strings.TrimSpace(ln) == "" {
+				break
+			}
+			if leadingSpaces(ln) == base && handlerHeaderRe.MatchString(ln) {
+				k++
+				for k < len(lines) {
+					if strings.TrimSpace(lines[k]) == "" || leadingSpaces(lines[k]) > base {
+						k++
+						continue
+					}
+					break
+				}
+				continue
+			}
+			break
+		}
+		handlerEnd := k
+		body := lines[bodyStart:bodyEnd]
+		delta := tryBodyDeIndent(body, base)
+		deindented := make([]string, 0, len(body))
+		for _, bl := range body {
+			deindented = append(deindented, deIndentLine(bl, delta))
+		}
+		next := make([]string, 0, len(lines))
+		next = append(next, lines[:idx]...)
+		next = append(next, deindented...)
+		next = append(next, lines[handlerEnd:]...)
+		lines = next
+		changed = true
+	}
+	if !changed {
+		return script, false
+	}
+	return strings.Join(lines, "\n"), true
+}
+
+func leadingSpaces(s string) int {
+	n := 0
+	for n < len(s) && s[n] == ' ' {
+		n++
+	}
+	return n
+}
+
+// tryBodyDeIndent 求 try 主体统一去缩进量 = 主体最小缩进 − try 缩进。
+func tryBodyDeIndent(body []string, base int) int {
+	lo := -1
+	for _, bl := range body {
+		if strings.TrimSpace(bl) == "" {
+			continue
+		}
+		if n := leadingSpaces(bl); lo < 0 || n < lo {
+			lo = n
+		}
+	}
+	if lo < 0 || lo <= base {
+		return 0
+	}
+	return lo - base
+}
+
+func deIndentLine(s string, delta int) string {
+	if delta <= 0 || strings.TrimSpace(s) == "" {
+		return s
+	}
+	return s[min(leadingSpaces(s), delta):]
+}
+
+func repairInvalidRegexEscapes(script string) (string, bool) {
+	matches := regexStringLiteralRe.FindAllStringSubmatchIndex(script, -1)
+	if len(matches) == 0 {
+		return script, false
+	}
+	var b strings.Builder
+	last := 0
+	changed := false
+	for _, m := range matches {
+		if len(m) < 4 || m[2] < 0 || m[3] < 0 {
+			continue
+		}
+		lit := script[m[2]:m[3]]
+		fixed, ok := escapeInvalidStarlarkStringEscapes(lit)
+		if !ok {
+			continue
+		}
+		b.WriteString(script[last:m[2]])
+		b.WriteString(fixed)
+		last = m[3]
+		changed = true
+	}
+	if !changed {
+		return script, false
+	}
+	b.WriteString(script[last:])
+	return b.String(), true
+}
+
+func repairMissingEmitCall(script string) (string, bool) {
+	if strings.Contains(script, "emit(") {
+		return script, false
+	}
+	match := topLevelNoArgFuncRe.FindStringSubmatch(script)
+	if len(match) != 2 {
+		return script, false
+	}
+	fn := match[1]
+	trimmed := strings.TrimRight(script, " \t\r\n")
+	suffix := fn + "()"
+	if !strings.HasSuffix(trimmed, suffix) {
+		return script, false
+	}
+	idx := strings.LastIndex(script, suffix)
+	if idx < 0 {
+		return script, false
+	}
+	return script[:idx] + "emit(" + suffix + ")" + script[idx+len(suffix):], true
+}
+
+func escapeInvalidStarlarkStringEscapes(lit string) (string, bool) {
+	var b strings.Builder
+	changed := false
+	for i := 0; i < len(lit); i++ {
+		if lit[i] != '\\' {
+			b.WriteByte(lit[i])
+			continue
+		}
+		if i+1 >= len(lit) {
+			b.WriteString(`\\`)
+			changed = true
+			continue
+		}
+		next := lit[i+1]
+		if strings.ContainsRune(`"'\\abfnrtvxuU`, rune(next)) {
+			b.WriteByte(lit[i])
+			b.WriteByte(next)
+		} else {
+			b.WriteString(`\\`)
+			b.WriteByte(next)
+			changed = true
+		}
+		i++
+	}
+	if !changed {
+		return lit, false
+	}
+	return b.String(), true
 }
 
 // stripMarkdownFence 去掉 LLM 偶尔输出的 ```json ... ``` 围栏。
@@ -409,7 +707,7 @@ func buildCompileSystemPrompt(hints CompileHints) string {
   "timeout_s": 60
 }
 
-# Starlark 是受限的 Python 方言——只能用下列宿主内建函数，**禁止 import / open / eval / 任何模块名**：
+# Starlark 是受限的 Python 方言，不是 Python 解释器——只能用下列宿主内建函数，**禁止 import / open / eval / 任何模块名**：
 - http_get(url, headers={}) -> {"status": int, "body": str}            # GET，自动跟随 http->https 重定向
 - http_post(url, body="", headers={}) -> {"status": int, "body": str}  # POST
 - json_decode(s) -> value        # JSON 字符串 -> dict/list/数值
@@ -423,8 +721,17 @@ func buildCompileSystemPrompt(hints CompileHints) string {
 - kb_ingest(title, content, source) -> {"id": str}  # 写入本地知识库（in-process，免鉴权）；**禁止** http_post 到 127.0.0.1/localhost（已被沙箱拦截）
 - emit(result)                   # 提交最终结果（替代 print），脚本必须调用一次
 
-可用语法：def / for / if / 列表与字典推导 / 字符串方法(strip/split/replace/join/lower) / "%d"%x 格式化 / dict.get(key, default) / in 运算符 / range(n)。
+可用语法：def / for / if / append / 字符串方法(strip/split/replace/join/lower) / "%d"%x 格式化 / dict.get(key, default) / in 运算符 / range(n)。
 **不存在** urllib / json / re / requests 等任何模块名——只用上面的内建。**禁止** import、open、eval、exec、无限 while。
+**严禁 Python-only 写法**：try/except/finally/raise、with、class、lambda、set()、enumerate()、isinstance()。错误处理不要捕获异常；先检查 status/len/key，无法恢复的内建错误应直接失败。
+**判空用 == None / != None，禁止 is / is not**（Starlark 无 is 运算符）：写 if data == None: 、 if x != None: 。
+索引循环必须写成：
+    for i in range(len(items)):
+        item = items[i]
+去重集合必须写成字典：
+    seen = {}
+    if key not in seen:
+        seen[key] = True
 
 # 脚本规则
 1. **结果用 emit**：成功 emit({"status":"success","data":...})；失败 emit({"status":"error","error":"<原因>"})。
@@ -451,13 +758,16 @@ def run():
             titles.append(t)
     if len(titles) == 0:
         return {"status": "error", "error": "no items extracted"}
-    content = "\n".join(["%d. %s" % (i + 1, titles[i]) for i in range(len(titles))])
+    lines = []
+    for i in range(len(titles)):
+        lines.append("%d. %s" % (i + 1, titles[i]))
+    content = "\n".join(lines)
     return {"status": "success", "data": {"title": "榜单 " + now()["date"], "count": len(titles), "content": content}}
 emit(run())
 `)
 	if hints.LocalAPIBase != "" {
 		b.WriteString(`
-# 入知识库（in-process 内建，免鉴权）——需要入库时调用 kb_ingest，**禁止** http_post 到 127.0.0.1/localhost（已被沙箱 SSRF 拦截）：
+# 入知识库（in-process 内建，免鉴权）——需要入库时调用 kb_ingest，**不要** http_post 到 127.0.0.1/localhost 的本地 API（kb_ingest 免鉴权、in-process、无需本地服务在跑，是更干净的入库路径）：
     res = kb_ingest(title = "标题", content = "正文", source = "cron-xxx")
     # 成功返回 {"id": "<doc-id>"}；失败直接抛错（如知识库未启用）。入库成功后再 emit success。
 `)

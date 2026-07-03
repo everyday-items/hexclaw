@@ -15,7 +15,9 @@ import (
 
 // TestBug20260615_F3_ArchivedScripts_UseKBIngest locks the migrated collectors:
 // every archived .star must pass the real engine validator, ingest via kb_ingest,
-// and never http_post to a loopback KB endpoint (now SSRF-blocked).
+// and never http_post to a loopback KB endpoint. Note: loopback is not blocked
+// (Starlark http has no SSRF guard by design); kb_ingest is preferred because it
+// is in-process and auth-free, not because a POST would be refused.
 func TestBug20260615_F3_ArchivedScripts_UseKBIngest(t *testing.T) {
 	for _, path := range []string{"scripts/baidu_hotsearch.star", "scripts/github_go_stars.star"} {
 		b, err := os.ReadFile(path)

@@ -39,7 +39,10 @@ type StarlarkEngine struct {
 // KBIngestFunc persists a document into the local knowledge base in-process and
 // returns the new document ID. StarlarkEngine exposes it to scripts as the
 // kb_ingest builtin so a collector can store its results without an HTTP POST to
-// the app's own API — a round-trip that loopback SSRF blocking now forbids.
+// the app's own API. That round-trip is discouraged because it would need auth
+// and a running local server — not because it is blocked: the Starlark http
+// builtins intentionally have no SSRF/loopback guard (see builtinHTTP), so a
+// collector could reach loopback, but kb_ingest is the cleaner in-process path.
 type KBIngestFunc func(ctx context.Context, title, content, source string) (string, error)
 
 // starlarkMaxBody caps a single http_get/http_post response body so a runaway
@@ -126,6 +129,9 @@ func validateStarlarkSource(script string) error {
 	if strings.TrimSpace(script) == "" {
 		return fmt.Errorf("script is empty")
 	}
+	if err := validateNoPythonOnlyStarlark(script); err != nil {
+		return err
+	}
 	opts := &syntax.FileOptions{}
 	f, err := opts.Parse("job.star", script, 0)
 	if err != nil {
@@ -141,6 +147,69 @@ func validateStarlarkSource(script string) error {
 		return fmt.Errorf("script must call emit({...}) or wake_agent(...) to produce a result")
 	}
 	return nil
+}
+
+var pythonOnlyStarlarkRe = regexp.MustCompile(`\b(try|except|finally|raise|with|class|lambda)\b|(^|[^A-Za-z0-9_])(set|enumerate|isinstance)\s*\(`)
+
+func validateNoPythonOnlyStarlark(script string) error {
+	m := pythonOnlyStarlarkRe.FindStringSubmatch(maskStarlarkCommentsAndStrings(script))
+	if len(m) == 0 {
+		return nil
+	}
+	token := strings.TrimSpace(m[1])
+	if token == "" && len(m) > 3 {
+		token = strings.TrimSpace(m[3])
+	}
+	return fmt.Errorf("starlark dialect error: Python-only syntax/builtin %q is not supported; use simple Starlark loops, seen = {} as a set, range(len(items)) for indexed loops, and no try/except", token)
+}
+
+func maskStarlarkCommentsAndStrings(script string) string {
+	var b strings.Builder
+	b.Grow(len(script))
+	inString := false
+	var quote byte
+	escaped := false
+	for i := 0; i < len(script); i++ {
+		c := script[i]
+		if inString {
+			if c == '\n' {
+				b.WriteByte('\n')
+			} else {
+				b.WriteByte(' ')
+			}
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == quote {
+				inString = false
+			}
+			continue
+		}
+		if c == '#' {
+			for i < len(script) && script[i] != '\n' {
+				b.WriteByte(' ')
+				i++
+			}
+			if i < len(script) {
+				b.WriteByte('\n')
+			}
+			continue
+		}
+		if c == '"' || c == '\'' {
+			inString = true
+			quote = c
+			escaped = false
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
 }
 
 // Execute runs the script under the spec's timeout and captures the value passed
@@ -255,6 +324,11 @@ func (e *StarlarkEngine) Execute(ctx context.Context, spec *JobSpec) (*RunResult
 // builtinHTTP returns an http_get/http_post builtin bound to the run context.
 // Signature: http_get(url, headers={}) / http_post(url, body="", headers={})
 // -> {"status": int, "body": str}.
+//
+// 网络策略：Starlark 出网**不设 SSRF/loopback 门**（桌面端按宿主机语义放开网络，
+// 因 fake-ip 透明代理会把公网域名映射进保留段，SSRF 守卫会误杀合法公网抓取；见
+// TestNetworkUnrestricted_StarlarkReachesLoopback 锁定该行为）。可达范围由 cron 权限
+// 矩阵约束，而非在此拦截私网 IP。故 http_post 到 127.0.0.1/localhost 并不会被拒。
 func (e *StarlarkEngine) builtinHTTP(ctx context.Context, method string) func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
 	return func(_ *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 		var url, body string
