@@ -32,6 +32,7 @@ func finalizeEmpty(t *testing.T, provider hexagon.Provider, reqMessages []hexago
 		"mock-model",
 		"cache-key",
 		false,
+		0,
 	)
 	return content, meta
 }

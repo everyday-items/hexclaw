@@ -34,6 +34,7 @@ func TestAudit_MaxTurnsGraceful_StreamFinalizeAppendsNotice_20260623(t *testing.
 		"mock-model",
 		"cache-key",
 		true, // maxTurnsHit
+		0,    // thinkingDuration
 	)
 
 	if !strings.Contains(content, partial) {

@@ -1816,7 +1816,7 @@ func (e *ReActEngine) processStreamRuntime(
 				modelName = model
 			}
 		}
-		finalContent, streamTail, metadata, usage, toolCalls := e.finalizeRuntimeStreamResult(ctx, sessionID, msg, provider, req, result, providerName, modelName, cacheInput, maxTurnsHit)
+		finalContent, streamTail, metadata, usage, toolCalls := e.finalizeRuntimeStreamResult(ctx, sessionID, msg, provider, req, result, providerName, modelName, cacheInput, maxTurnsHit, sink.thinkingDuration())
 		if finalContent != "" && !sink.sentContent {
 			ch <- &adapter.ReplyChunk{Content: finalContent}
 		} else if streamTail != "" {
@@ -1845,6 +1845,11 @@ type replyChunkRuntimeSink struct {
 	sentContent bool
 	started     chan<- error
 	startOnce   sync.Once
+	// reasoning 计时（BUG-20260703 B3）：runtime 流式路径的思考时长在此采样，
+	// finalize 时经 thinkingDuration() 透出+落库。与 legacy 流式路径同语义：
+	// 首个 reasoning 增量起表，其后首个 content 增量停表。
+	reasoningStart time.Time
+	reasoningEnd   time.Time
 }
 
 func (s *replyChunkRuntimeSink) Emit(ctx context.Context, event hruntime.Event) error {
@@ -1854,8 +1859,14 @@ func (s *replyChunkRuntimeSink) Emit(ctx context.Context, event hruntime.Event) 
 	if event.Chunk.Content == "" && event.Chunk.Reasoning == "" {
 		return nil
 	}
+	if event.Chunk.Reasoning != "" && s.reasoningStart.IsZero() {
+		s.reasoningStart = time.Now()
+	}
 	if event.Chunk.Content != "" {
 		s.sentContent = true
+		if !s.reasoningStart.IsZero() && s.reasoningEnd.IsZero() {
+			s.reasoningEnd = time.Now()
+		}
 	}
 	s.notifyStarted(nil)
 	select {
@@ -1864,6 +1875,22 @@ func (s *replyChunkRuntimeSink) Emit(ctx context.Context, event hruntime.Event) 
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// thinkingDuration 返回本次流式的思考时长（整秒）。无 reasoning 增量时为 0；
+// 纯 reasoning 无 content 时以当前时刻停表（与 legacy 路径一致）。
+func (s *replyChunkRuntimeSink) thinkingDuration() int {
+	if s.reasoningStart.IsZero() {
+		return 0
+	}
+	end := s.reasoningEnd
+	if end.IsZero() {
+		end = time.Now()
+	}
+	if end.Before(s.reasoningStart) {
+		return 0
+	}
+	return int(end.Sub(s.reasoningStart).Seconds())
 }
 
 func (s *replyChunkRuntimeSink) notifyStarted(err error) {
@@ -1886,8 +1913,12 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 	modelName string,
 	cacheInput string,
 	maxTurnsHit bool,
+	thinkingDuration int,
 ) (string, string, map[string]string, *adapter.Usage, []adapter.ToolCall) {
 	msgMeta := cloneStringMap(msg.Metadata)
+	if sessionID != "" {
+		msgMeta["session_id"] = sessionID
+	}
 	content := result.Content
 	reasoning := result.Reasoning
 	// M5: system-dispatch and explicit code execution results must never enter the semantic cache.
@@ -1961,13 +1992,22 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 	saveCtx, saveCancel := context.WithTimeout(trace.Detach(ctx), 10*time.Second)
 	defer saveCancel()
 
+	// 思考时长（BUG-20260703 B3）：随 wire metadata 透出（live 一致性）并落库（重载不丢）。
+	// 仅在确有 reasoning 时写入，与 legacy 流式路径同门槛。
+	if thinkingDuration > 0 && strings.TrimSpace(reasoning) != "" {
+		msgMeta["thinking_duration"] = strconv.Itoa(thinkingDuration)
+	} else {
+		thinkingDuration = 0
+	}
+
 	assistantMessageID := ""
 	if record, err := e.sessions.SaveAssistantReply(saveCtx, sessionID, content, session.AssistantMeta{
-		Reasoning: reasoning,
-		Provider:  providerName,
-		Model:     modelName,
-		AgentName: msgMeta["role"],
-		RequestID: messageRequestID(msg),
+		Reasoning:        reasoning,
+		ThinkingDuration: thinkingDuration,
+		Provider:         providerName,
+		Model:            modelName,
+		AgentName:        msgMeta["role"],
+		RequestID:        messageRequestID(msg),
 		// 经同一转换器落库：持久化的 tool_calls 与 live wire 形状一致（含 status/duration），重载后工具卡不蒸发。
 		ToolCalls: runtimeToolCallsToAdapter(result.ToolCalls),
 		// 有序内容块同步落库：重载后多步 ReAct 仍按真实交错序渲染（与 live wire 同形状）。
@@ -3135,7 +3175,7 @@ func buildReplyMetadata(metadata map[string]string, providerName, modelName, ass
 	if v := metadata["routed_agent"]; v != "" {
 		replyMeta["routed_agent"] = v
 	}
-	for _, key := range []string{"request_id", "finish_reason", "recovered_from_reasoning_only", persistErrorMetaKey} {
+	for _, key := range []string{"request_id", "session_id", "finish_reason", "recovered_from_reasoning_only", "thinking_duration", persistErrorMetaKey} {
 		if v := metadata[key]; v != "" {
 			replyMeta[key] = v
 		}
