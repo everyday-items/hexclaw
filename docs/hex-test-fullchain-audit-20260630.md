@@ -17,11 +17,11 @@
 
 本轮复验基于当前工作区依赖升级：`toolkit v0.2.6`、`ai-core v0.2.0`、`hexagon v0.5.8`，三者均声明 `go=1.25.7`。
 
-- 线上 GitHub Actions 最近 10 次 run 均为 `success`；当前分支 `feat/code-exec-sandbox-autonomy` 没有关联 PR，也没有该分支 Actions run。
+- `sandbox-code-exec.yml` 已进入默认分支并注册为专项 workflow，覆盖 toolkit 联调下的 Linux/macOS/Windows code_exec 路径。
 - `GOWORK=off go test ./... -run '^$'` 通过，说明发版/CI 模式下全仓编译已恢复；此前 `toolkit v0.2.3` 缺字段导致的 release 构建不可复现问题已由依赖升级修复。
 - `GOWORK=off go test ./... -count=1` 通过。`engine/TestProbe_RunnerIntegrity_MustFail` 已改为 `HEXCLAW_RUNNER_PROBE=1` 手工门控，默认 CI 不再被故意失败探针阻断。
 - `.github/workflows/{ci,render,release,sandbox-code-exec}.yml` 经 `actionlint v1.7.7` 校验通过。
-- `sandbox-code-exec.yml` 是当前分支新增文件，尚未存在于 `origin/main`，GitHub 默认分支暂未注册该 workflow；合入 main 后才会出现在 Actions 列表中。
+- 2026-07-04 的 CI 修复补充了三项边界：普通 Linux CI 在无 bubblewrap/usable unshare 时跳过真实沙箱执行型用例；Windows code_exec 用临时 `.cmd` wrapper 文件执行，避免 toolkit ADS 校验误判多行脚本参数；默认 `max_memory_bytes` 提升到 2GiB，满足 Go/Node runtime 在强沙箱中的冷启动需求。
 
 ## 已执行测试
 
@@ -32,7 +32,9 @@
 | CI/CD 复验（2026-07-04） | `GOWORK=off go test ./... -run '^$'` | 通过；全仓编译与依赖解析在 release 模式下可复现 |
 | CI/CD 复验（2026-07-04） | `GOWORK=off go test ./... -count=1` | 通过；runner 完整性探针默认跳过，仅在 `HEXCLAW_RUNNER_PROBE=1` 时手工触发 |
 | Workflow lint（2026-07-04） | `actionlint v1.7.7 .github/workflows/*.yml` | 通过 |
-| GitHub Actions 线上状态（2026-07-04） | `gh run list --limit 10` | 最近 10 次 run 均为 success；当前分支无 PR/run |
+| code_exec 强沙箱复验（2026-07-04） | `HEXCLAW_P0_SANDBOX_PROOF=1 go test -v -count=1 -timeout 360s ./skill/builtin -run 'TestCodeExecSkill_\|TestDetectMissingPackages\|TestBuildInstallCommand\|TestSandboxP0_StaticGapMatrix'` | 通过；覆盖 P0 code_exec 执行、产物、限额、超时、运行时诊断矩阵 |
+| Windows 编译复验（2026-07-04） | `GOOS=windows GOARCH=amd64 go test -c -o /tmp/hexclaw-builtin-windows.test.exe ./skill/builtin` | 通过；覆盖 Windows wrapper 签名与 toolkit sandbox API 兼容性 |
+| 后端 race 全量复验（2026-07-04） | `go test -race -count=1 -coverprofile=/tmp/hexclaw-coverage.out ./...` | 通过 |
 | 桌面 Vitest | `pnpm vitest run --no-cache` | 4987 passed，15 todo；有 warning/审计提示 |
 | 桌面类型检查 | `pnpm vue-tsc --build` | 通过 |
 | WebKit feel | `pnpm test:webkit-feel` | 7/7 通过；sidecar 未启动时有 Vite proxy `ECONNREFUSED` 噪声 |
