@@ -11,6 +11,7 @@ import (
 
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/engine"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 )
 
@@ -392,6 +393,9 @@ func (e *workflowExecutor) executeAgent(ctx context.Context, node *workflowNode,
 	for k, v := range e.req.Metadata {
 		metadata[k] = v
 	}
+	// GO-3：工作流触发请求的 metadata 同为客户端可控——先剥保留派发键，再由本执行器
+	// 盖章受信的 source=workflow / workflow_id，避免客户端伪造 cron_job_id 盗 grant。
+	engine.StripReservedDispatchMetadata(metadata)
 	if role != "" {
 		metadata["role"] = role
 	}
@@ -403,6 +407,7 @@ func (e *workflowExecutor) executeAgent(ctx context.Context, node *workflowNode,
 	}
 	metadata["workflow_id"] = e.wf.ID
 	metadata["workflow_node_id"] = node.ID
+	metadata["source"] = "workflow"
 
 	reply, err := e.server.engine.Process(ctx, (&agentrouterMessageAdapter{
 		UserID:     firstNonEmpty(e.req.UserID, "workflow-"+e.wf.ID),
@@ -507,13 +512,19 @@ func (e *workflowExecutor) executeParallelRoles(ctx context.Context, node *workf
 }
 
 func (e *workflowExecutor) executeTool(ctx context.Context, node *workflowNode, inputText string, state hexagon.MapState) (string, error) {
-	if e.server.mcpMgr == nil {
-		return "", fmt.Errorf("mcp manager 未初始化")
-	}
-
 	toolName := firstNonEmpty(stringValue(node.Data["tool"]), stringValue(node.Data["name"]))
 	if toolName == "" {
 		return "", fmt.Errorf("tool 节点缺少 tool 名称")
+	}
+
+	// 无人值守连接器授权闸（fail-closed，先于一切副作用）：tool 节点直连 mcpMgr
+	// 绕过 PermissionHook，在此补齐与 engine 连接器闸一致的判定，未授权即拦。
+	if err := e.server.authorizeWorkflowConnectorTool(e.wf.ID, toolName); err != nil {
+		return "", err
+	}
+
+	if e.server.mcpMgr == nil {
+		return "", fmt.Errorf("mcp manager 未初始化")
 	}
 
 	args, _ := node.Data["args"].(map[string]any)

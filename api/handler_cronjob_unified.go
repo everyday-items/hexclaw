@@ -223,6 +223,7 @@ func (s *Server) cronActionCreate(ctx context.Context, req *CronJobRequest) (*Cr
 			Deliver:    d.Deliver,
 			ChatID:     d.ChatID, // IM/连接投递目标会话/群组 ID（Deliverer 必需）
 			TimeoutSec: d.TimeoutSec,
+			Paused:     d.Paused, // 审批未决 → 初始暂停，授权后 resume
 		}, d.Runtime, d.Script)
 	} else {
 		job, err = s.scheduler.AddJobFromPrompt(ctx, cron.AddJobRequest{
@@ -234,6 +235,7 @@ func (s *Server) cronActionCreate(ctx context.Context, req *CronJobRequest) (*Cr
 			ChatID:       d.ChatID,  // IM/连接投递目标会话/群组 ID（Deliverer 必需）
 			TimeoutSec:   d.TimeoutSec,
 			Continuous:   d.Continuous, // 持续型任务（强制 agent 模式）
+			Paused:       d.Paused,     // 审批未决 → 初始暂停，授权后 resume
 			LocalAPIBase: s.localAPIBase(),
 		})
 	}
@@ -333,6 +335,8 @@ func (s *Server) cronActionRemove(ctx context.Context, req *CronJobRequest) (*Cr
 	if err := s.scheduler.RemoveJob(ctx, req.JobID); err != nil {
 		return nil, http.StatusInternalServerError, &cronErr{code: CodeInternalError, msg: humanizeError(err)}
 	}
+	// 授权生命周期跟随任务：删除即回收其全部任务级授权。
+	s.revokeTaskGrants(ctx, "cron:"+req.JobID)
 	return &CronJobResponse{Action: "remove", OK: true}, http.StatusOK, nil
 }
 

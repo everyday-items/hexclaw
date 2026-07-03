@@ -50,6 +50,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/agents"
 	"github.com/hexagon-codes/hexclaw/api"
 	"github.com/hexagon-codes/hexclaw/audit"
+	"github.com/hexagon-codes/hexclaw/autonomy"
 	"github.com/hexagon-codes/hexclaw/canvas"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/connector"
@@ -297,9 +298,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	defer store.Close()
 
 	// v0.4.0 方案 A：构造 Feature Flag Static 实例并注入 root ctx。
-	// 所有 P1 重构项（Agent factory v2 / Skill 7 阶段 / MCP v2 等）必须挂 flag，
-	// 默认 OFF；用户在 hexclaw.yaml 的 features: 段或 Settings 显式开启。
-	// 业务路径用 featureflag.Enabled(ctx, "name") 查询，fail-closed。
+	// 产品级能力按功能优先默认开启；features: 段仅用于显式关闭或灰度覆盖。
+	// 业务路径用 featureflag.Enabled(ctx, "name") 查询，未注册 flag 仍按配置错误处理为 OFF。
 	flags := featureflag.NewStatic(featureflag.Registered(), cfg.Features)
 	ctx := featureflag.WithContext(context.Background(), flags)
 	if registered := featureflag.Registered(); len(registered) > 0 {
@@ -455,14 +455,42 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	// 6.1.1 接入权限审批 Hook (D24)
 	// v0.4.3 §11.10 统一安全闸：PermissionPolicy 为单一权限闸（GA 默认 ON）。无人值守
-	// 风险顾问注入 —— cron/webhook 等无交互会话下，命中 require_approval 的 consequential
-	// 动作改问 LLM 判级（eng.JudgeText），仅 low 放行一次，否则 fail-closed 拒。
+	// 来源没有交互审批人，因此按 security.autonomy profile + 显式矩阵决定是否自动放行；
+	// ActionDeny 仍优先，矩阵未命中则 fail-closed。
 	permHub := engine.NewPermissionHub(60 * time.Second)
-	permHook := engine.NewPermissionHook(permHub,
+
+	// 6.1.0 自动化权限治理数据面：权限决策审计日志 + 任务级授权。
+	// 初始化失败只降级（闸照常工作，少审计/grant），不阻断启动。
+	var autonomyDecisions *autonomy.DecisionStore
+	var autonomyGrants *autonomy.GrantStore
+	if ds := autonomy.NewDecisionStore(store.DB()); ds != nil {
+		if err := ds.Init(ctx); err != nil {
+			fmt.Printf("  ⚠ Autonomy    决策审计初始化失败（降级为仅日志）: %v\n", err)
+		} else {
+			autonomyDecisions = ds
+		}
+	}
+	if gs := autonomy.NewGrantStore(store.DB()); gs != nil {
+		if err := gs.Init(ctx); err != nil {
+			fmt.Printf("  ⚠ Autonomy    任务级授权初始化失败（降级为矩阵-only）: %v\n", err)
+		} else {
+			autonomyGrants = gs
+		}
+	}
+
+	permOpts := []engine.PermissionHookOption{
 		engine.WithCodeExecApproval(cfg.Skill.Builtin.CodeExecPolicy.CodeExecRequiresApproval()),
 		engine.WithPolicy(engine.DefaultBaselinePolicy()),
+		engine.WithSystemDispatchPolicy(engine.NewSystemDispatchPolicyFromConfig(cfg.Security.Autonomy)),
 		engine.WithUnattendedReviewer(unattendedRiskAdapter{builtin.NewLLMRiskReviewer(eng.JudgeText)}),
-	)
+	}
+	if autonomyGrants != nil {
+		permOpts = append(permOpts, engine.WithTaskGrants(autonomyGrants))
+	}
+	if autonomyDecisions != nil {
+		permOpts = append(permOpts, engine.WithPermissionDecisionRecorder(autonomy.NewRecorder(autonomyDecisions)))
+	}
+	permHook := engine.NewPermissionHook(permHub, permOpts...)
 	toolExecutor.AddHook(permHook)
 
 	// 6.1.2 接入 per-tool 权限控制 (Phase 9 D40)
@@ -892,6 +920,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 8. 启动 HTTP 服务
 	srv := api.NewServer(cfg, eng, gw, store)
 	srv.SetVersion(version)
+	// 自动化权限治理 API（Profile 热更 / 预检 / 决策日志 / 任务级授权）
+	srv.SetAutonomy(permHook, autonomyDecisions, autonomyGrants, configFile)
 
 	// §11.8 交互层：Prompt 库（服务端下发 + CRUD）。
 	// 砍薄版（§5）：旧记忆薄版 library.MemoryStore + /api/v1/memories 已并入统一文件记忆；
@@ -909,6 +939,19 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 8.0.1 接入沙箱网络热更新 (Bug2 修复)
 	if skillDeps.CodeExecSkill != nil {
 		srv.SetSandboxCallbacks(skillDeps.CodeExecSkill.UpdateNetwork, skillDeps.CodeExecSkill.NetworkEnabled)
+	}
+	if skillDeps.CodeExecSkill != nil || skillDeps.FileAccess != nil {
+		srv.SetSandboxAllowedPathsCallback(func(paths []string) error {
+			if skillDeps.CodeExecSkill != nil {
+				if err := skillDeps.CodeExecSkill.UpdateReadablePaths(paths); err != nil {
+					return err
+				}
+			}
+			if skillDeps.FileAccess != nil {
+				skillDeps.FileAccess.UpdateAllowedPaths(paths)
+			}
+			return nil
+		})
 	}
 	lc := srv.LogCollector()
 
@@ -1075,7 +1118,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					Platform: adapter.PlatformAPI,
 					UserID:   "webhook-system",
 					Content:  content,
-					Metadata: map[string]string{"source": "webhook", "webhook": event.WebhookName},
+					// webhook_id 供 engine 盖任务身份（task_ref=webhook:<id>）：
+					// 任务级 grant 求值与权限决策审计归因都依赖它。
+					Metadata: map[string]string{"source": "webhook", "webhook": event.WebhookName, "webhook_id": event.WebhookID},
 				})
 				return err
 			})
@@ -1572,6 +1617,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 
 	instanceMgr := instances.NewManager(store.DB())
+	if disabled := parseDisabledIMProviders(os.Getenv("HEXCLAW_DISABLE_IM")); len(disabled) > 0 {
+		instanceMgr.SetDisabledProviders(disabled...)
+		logger.Warn("[instances] IM provider startup disabled by HEXCLAW_DISABLE_IM", "providers", strings.Join(disabled, ","))
+	}
 	// secretBox / dataDir 已在 MCP 连接前统一创建（见 4.55）。这里仅把 box 注入平台实例管理器，
 	// 让 IM config_json 与 MCP env、connector token 共用同一把主密钥静态加密。
 	if secretBox != nil {
@@ -2261,4 +2310,29 @@ type llmCompleteFunc func(ctx context.Context, prompt string) (string, error)
 // Complete 实现 memory.ConsolidateLLM。
 func (f llmCompleteFunc) Complete(ctx context.Context, prompt string) (string, error) {
 	return f(ctx, prompt)
+}
+
+func parseDisabledIMProviders(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	all := []string{"dingtalk", "feishu", "discord", "telegram", "slack", "wechat", "wecom", "line", "whatsapp", "matrix", "email"}
+	if strings.EqualFold(raw, "all") || strings.EqualFold(raw, "true") || raw == "1" {
+		return all
+	}
+	seen := make(map[string]bool)
+	out := make([]string, 0)
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
+	}) {
+		p := strings.ToLower(strings.TrimSpace(part))
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
 }

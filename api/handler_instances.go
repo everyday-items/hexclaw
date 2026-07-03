@@ -1,18 +1,29 @@
 package api
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/instances"
 )
 
 type UpsertInstanceRequest struct {
+	ID       string          `json:"id"`
 	Provider string          `json:"provider"`
 	Name     string          `json:"name"`
 	Enabled  bool            `json:"enabled"`
 	Config   json.RawMessage `json:"config"`
+}
+
+type sendTestRequest struct {
+	Target  string `json:"target"`
+	Content string `json:"content"`
 }
 
 type instanceResponse struct {
@@ -25,6 +36,20 @@ type instanceResponse struct {
 	Config    json.RawMessage  `json:"config,omitempty"`
 	UpdatedAt string           `json:"updated_at,omitempty"`
 	Message   string           `json:"message,omitempty"`
+}
+
+func instanceToResponse(inst *instances.Instance, message string) instanceResponse {
+	return instanceResponse{
+		ID:        inst.ID,
+		Provider:  inst.Provider,
+		Name:      inst.Name,
+		Enabled:   inst.Enabled,
+		Status:    inst.Status,
+		LastError: inst.LastError,
+		Config:    inst.Config,
+		UpdatedAt: inst.UpdatedAt.Format(http.TimeFormat),
+		Message:   message,
+	}
 }
 
 func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
@@ -75,17 +100,68 @@ func (s *Server) handleUpsertInstance(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, instanceResponse{
-		ID:        savedInst.ID,
-		Provider:  savedInst.Provider,
-		Name:      savedInst.Name,
-		Enabled:   savedInst.Enabled,
-		Status:    savedInst.Status,
-		LastError: savedInst.LastError,
-		Config:    savedInst.Config,
-		UpdatedAt: savedInst.UpdatedAt.Format(http.TimeFormat),
-		Message:   "实例已保存",
-	})
+	writeJSON(w, http.StatusOK, instanceToResponse(savedInst, "实例已保存"))
+}
+
+func (s *Server) handleUpdateInstanceByID(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if strings.TrimSpace(id) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id 不能为空"})
+		return
+	}
+	current, err := s.instanceMgr.GetByID(r.Context(), id)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+
+	var req UpsertInstanceRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.Provider) == "" {
+		req.Provider = current.Provider
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		req.Name = current.Name
+	}
+	if len(req.Config) == 0 {
+		req.Config = current.Config
+	}
+
+	_ = s.instanceMgr.Stop(r.Context(), current.Name)
+	next := &instances.Instance{
+		ID:       current.ID,
+		Provider: req.Provider,
+		Name:     strings.TrimSpace(req.Name),
+		Enabled:  req.Enabled,
+		Config:   req.Config,
+	}
+	if err := s.instanceMgr.UpdateByID(r.Context(), id, next); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	if req.Enabled {
+		if err := s.instanceMgr.Start(r.Context(), next.Name); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	savedInst, err := s.instanceMgr.GetByID(r.Context(), id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, instanceToResponse(savedInst, "实例已保存"))
 }
 
 func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
@@ -95,6 +171,23 @@ func (s *Server) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "实例已删除", "name": name})
+}
+
+func (s *Server) handleDeleteInstanceByID(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if strings.TrimSpace(id) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id 不能为空"})
+		return
+	}
+	if err := s.instanceMgr.DeleteByID(r.Context(), id); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "实例已删除", "id": id})
 }
 
 func (s *Server) handleStartInstance(w http.ResponseWriter, r *http.Request) {
@@ -159,6 +252,79 @@ func (s *Server) handleTestInstance(w http.ResponseWriter, r *http.Request) {
 		"provider":   report.Provider,
 		"status":     report.Status,
 		"last_error": report.LastError,
+	})
+}
+
+func (s *Server) handleTestInstanceByID(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	inst, err := s.instanceMgr.GetByID(r.Context(), id)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	r.SetPathValue("name", inst.Name)
+	s.handleTestInstance(w, r)
+}
+
+func (s *Server) handleSendTestInstanceByID(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	inst, err := s.instanceMgr.GetByID(r.Context(), id)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]any{"success": false, "error": err.Error()})
+		return
+	}
+	if !inst.Enabled {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"message": "实例未启用，不能发送测试消息",
+		})
+		return
+	}
+
+	var req sendTestRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
+		return
+	}
+	req.Target = strings.TrimSpace(req.Target)
+	req.Content = strings.TrimSpace(req.Content)
+	if req.Target == "" || req.Content == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"message": "target 和 content 不能为空",
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	if err := s.instanceMgr.Start(ctx, inst.Name); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"success": false,
+			"message": "实例启动失败: " + err.Error(),
+		})
+		return
+	}
+	if err := s.instanceMgr.Send(ctx, inst.ID, req.Target, &adapter.Reply{Content: req.Content}); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": false,
+			"message": "测试消息发送失败: " + err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"message": "测试消息已发送",
+		"id":      inst.ID,
+		"name":    inst.Name,
 	})
 }
 

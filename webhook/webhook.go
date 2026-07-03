@@ -17,6 +17,7 @@ import (
 	"crypto/hmac"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,6 +33,10 @@ import (
 )
 
 const maxPayloadSize = 1 << 20 // 1MB
+
+// ErrWebhookNotFound 表示按 name 找不到 Webhook。调用方（API handler）据此
+// 返回 404 而非 500（FS-10/BUG-20260703：资源不存在 ≠ 服务端故障）。
+var ErrWebhookNotFound = errors.New("webhook 不存在")
 
 // WebhookType 预置 Webhook 类型
 type WebhookType string
@@ -129,7 +134,11 @@ func (m *Manager) SetHandler(handler EventHandler) {
 	m.mu.Unlock()
 }
 
-// Register 注册新 Webhook
+// Register 注册新 Webhook。
+//
+// 尊重调用方给定的 wh.Enabled——产品语义为「创建即得端点、默认未启用」：
+// 未启用端点照常验签并记录事件，但不派发 Agent（返回 423），先把 URL/Secret
+// 配到对端、跑通测试事件，完成授权后再显式启用。
 func (m *Manager) Register(ctx context.Context, wh *Webhook) error {
 	if wh.ID == "" {
 		wh.ID = "wh-" + idgen.ShortID()
@@ -140,12 +149,15 @@ func (m *Manager) Register(ctx context.Context, wh *Webhook) error {
 	if wh.CreatedAt.IsZero() {
 		wh.CreatedAt = time.Now()
 	}
-	wh.Enabled = true
 
+	enabled := 0
+	if wh.Enabled {
+		enabled = 1
+	}
 	_, err := m.db.ExecContext(ctx,
 		`INSERT INTO webhooks (id, name, type, secret, prompt, user_id, enabled, created_at, job_id)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		wh.ID, wh.Name, wh.Type, wh.Secret, wh.Prompt, wh.UserID, 1, wh.CreatedAt, wh.JobID,
+		wh.ID, wh.Name, wh.Type, wh.Secret, wh.Prompt, wh.UserID, enabled, wh.CreatedAt, wh.JobID,
 	)
 	if err != nil {
 		return fmt.Errorf("注册 webhook 失败: %w", err)
@@ -155,8 +167,43 @@ func (m *Manager) Register(ctx context.Context, wh *Webhook) error {
 	m.webhooks[wh.Name] = wh
 	m.mu.Unlock()
 
-	logger.Info("Webhook 已注册", "name", wh.Name, "type", wh.Type)
+	logger.Info("Webhook 已注册", "name", wh.Name, "type", wh.Type, "enabled", wh.Enabled)
 	return nil
+}
+
+// SetEnabled 启用/停用 Webhook（授权完成后启用；停用即回到「验签后 423、零写入」态）。
+//
+// 单用户桌面契约（GO-5 评审定论）：name 是全局唯一主键，SetEnabled/Get/Unregister
+// 不带 user_id 维度——多用户隔离在本产品定位下 out-of-scope；user_id 仅作 List
+// 展示过滤的记账字段。管理面全部走 API 鉴权门，外部对端只能打触发端点。
+func (m *Manager) SetEnabled(ctx context.Context, name string, enabled bool) error {
+	val := 0
+	if enabled {
+		val = 1
+	}
+	res, err := m.db.ExecContext(ctx, `UPDATE webhooks SET enabled = ? WHERE name = ?`, val, name)
+	if err != nil {
+		return fmt.Errorf("更新 webhook 启用状态失败: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: %q", ErrWebhookNotFound, name)
+	}
+
+	m.mu.Lock()
+	if wh, ok := m.webhooks[name]; ok {
+		wh.Enabled = enabled
+	}
+	m.mu.Unlock()
+	logger.Info("Webhook 启用状态已更新", "name", name, "enabled", enabled)
+	return nil
+}
+
+// Get 按名称取 Webhook（含未启用的）。
+func (m *Manager) Get(name string) (*Webhook, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	wh, ok := m.webhooks[name]
+	return wh, ok
 }
 
 // Unregister 注销 Webhook
@@ -212,12 +259,13 @@ func (m *Manager) Handler() http.HandlerFunc {
 			return
 		}
 
-		// 查找 webhook
+		// 查找 webhook（含未启用的：未启用端点仍要验签/记录/回 423，
+		// 让用户在启用前就能把 URL 配到对端并跑通测试事件）
 		m.mu.RLock()
 		wh, ok := m.webhooks[name]
 		m.mu.RUnlock()
 
-		if !ok || !wh.Enabled {
+		if !ok {
 			http.Error(w, "webhook not found", http.StatusNotFound)
 			return
 		}
@@ -244,6 +292,31 @@ func (m *Manager) Handler() http.HandlerFunc {
 		if err != nil {
 			logger.Error("Webhook", "name", name, "error", err)
 			http.Error(w, "parse event failed", http.StatusBadRequest)
+			return
+		}
+
+		// 测试事件（显式测试标记，或 GitHub 创建 webhook 时的 ping）：
+		// 验签 + 回显解析结果，不派发 Agent、不计入事件统计。
+		if isTestEvent(wh, r, event) {
+			writeWebhookJSON(w, http.StatusOK, map[string]any{
+				"status":     "test",
+				"signature":  signatureStatus(wh),
+				"event_type": event.EventType,
+				"summary":    event.Summary,
+				"dispatched": false,
+			})
+			return
+		}
+
+		// 未启用：验签后直接 423，统计零写入（GO-4/BUG-20260703）——无 Secret 端点
+		// 不验签，若先写 event_count/last_event_at，任意未授权对端可无限刷写 DB。
+		if !wh.Enabled {
+			logger.Info("Webhook 未启用，事件已忽略不派发", "name", name, "event_type", event.EventType)
+			writeWebhookJSON(w, http.StatusLocked, map[string]any{
+				"status":     "disabled",
+				"detail":     "webhook exists but automation is disabled; event ignored, agent not dispatched",
+				"dispatched": false,
+			})
 			return
 		}
 
@@ -286,6 +359,31 @@ func (m *Manager) Handler() http.HandlerFunc {
 }
 
 // --- 内部方法 ---
+
+// isTestEvent 判断这次请求是否为测试事件：显式测试标记（?test=1 或
+// X-HexClaw-Webhook-Test 头，供用户手动 curl 验签），或 GitHub 在对端配置
+// webhook 时自动发送的 ping 事件。测试事件只回显验签/解析结果，不派发。
+func isTestEvent(wh *Webhook, r *http.Request, event *Event) bool {
+	if r.URL.Query().Get("test") == "1" || r.Header.Get("X-HexClaw-Webhook-Test") != "" {
+		return true
+	}
+	return wh.Type == TypeGitHub && event.EventType == "ping"
+}
+
+// signatureStatus 报告本次请求验签状态：配置了 Secret 的到这里必已通过。
+func signatureStatus(wh *Webhook) string {
+	if wh.Secret == "" {
+		return "skipped"
+	}
+	return "ok"
+}
+
+// writeWebhookJSON 输出 JSON 响应（端点侧的轻量 helper）。
+func writeWebhookJSON(w http.ResponseWriter, status int, data map[string]any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(data)
+}
 
 // verifySignature 验证 Webhook 签名
 func (m *Manager) verifySignature(wh *Webhook, r *http.Request, body []byte) bool {
@@ -402,11 +500,12 @@ func getNestedString(m map[string]any, keys ...string) string {
 	return ""
 }
 
-// loadWebhooks 从数据库加载所有启用的 webhook
+// loadWebhooks 从数据库加载全部 webhook（含未启用——未启用端点也要
+// 可寻址：验签测试与 423 记录都发生在启用前）。
 func (m *Manager) loadWebhooks(ctx context.Context) error {
 	rows, err := m.db.QueryContext(ctx,
 		`SELECT id, name, type, secret, prompt, user_id, enabled, last_event_at, event_count, created_at, job_id
-		 FROM webhooks WHERE enabled = 1`)
+		 FROM webhooks`)
 	if err != nil {
 		return err
 	}

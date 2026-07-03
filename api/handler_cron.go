@@ -31,6 +31,8 @@ type AddCronJobRequest struct {
 	Deliver []string `json:"deliver,omitempty"`
 	// Continuous 开启「持续型任务 + 跨 tick 检查点」：长目标分多次廉价唤醒累积推进（强制 agent 模式）。
 	Continuous bool `json:"continuous,omitempty"`
+	// Paused 以初始暂停态创建：审批未决时先冻结任务意图，授权后 resume。
+	Paused bool `json:"paused,omitempty"`
 }
 
 // handleListCronJobs 列出定时任务
@@ -89,6 +91,7 @@ func (s *Server) handleAddCronJobJSON(w http.ResponseWriter, r *http.Request) {
 		ChatID:       req.ChatID,
 		Deliver:      req.Deliver,
 		Continuous:   req.Continuous,
+		Paused:       req.Paused, // FS-8：与 SSE 路径一致，审批未决 → 初始暂停，否则创建即跑绕过审批
 		LocalAPIBase: s.localAPIBase(),
 	})
 	if err != nil {
@@ -167,6 +170,7 @@ func (s *Server) handleAddCronJobSSE(w http.ResponseWriter, r *http.Request) {
 		ChatID:       req.ChatID,
 		Deliver:      req.Deliver,
 		Continuous:   req.Continuous,
+		Paused:       req.Paused, // 审批未决 → 初始暂停，授权后 resume
 		LocalAPIBase: s.localAPIBase(),
 	}, onProgress)
 	if err != nil {

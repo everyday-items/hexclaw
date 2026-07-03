@@ -225,7 +225,7 @@ func (s *Server) handleMCPStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetFullConfig(w http.ResponseWriter, r *http.Request) {
 	providers := make(map[string]any, len(s.cfg.LLM.Providers))
 	for name, p := range s.cfg.LLM.Providers {
-		providers[name] = map[string]any{"model": p.Model, "base_url": p.BaseURL, "has_key": p.APIKey != ""}
+		providers[name] = fullConfigProviderStatus(name, p)
 	}
 	// sandbox 网络状态：优先读运行时真值，回退到配置
 	sandboxNetworkEnabled := s.cfg.Skill.Builtin.CodeExecPolicy.CodeExecNetworkAllowed()
@@ -251,8 +251,59 @@ func (s *Server) handleGetFullConfig(w http.ResponseWriter, r *http.Request) {
 		},
 		"sandbox": map[string]any{
 			"network_enabled": sandboxNetworkEnabled,
+			"allowed_paths":   s.cfg.Skill.Sandbox.Filesystem.AllowedPaths,
 		},
 	})
+}
+
+func fullConfigProviderStatus(name string, p config.LLMProviderConfig) map[string]any {
+	enabled := p.Enabled == nil || *p.Enabled
+	hasKey := strings.TrimSpace(p.APIKey) != ""
+	local := isLocalLLMProvider(name, p.BaseURL)
+	switchable := enabled && (hasKey || local)
+	reason := ""
+	if !enabled {
+		switchable = false
+		reason = "disabled"
+	} else if !hasKey && !local {
+		switchable = false
+		reason = "missing_api_key"
+	}
+	if isOpenRouterFreeModel(p.BaseURL, p.Model) {
+		switchable = false
+		if reason == "" {
+			reason = "openrouter_free_model_rate_limited"
+		}
+	}
+
+	return map[string]any{
+		"model":                  p.Model,
+		"base_url":               p.BaseURL,
+		"has_key":                hasKey,
+		"enabled":                enabled,
+		"local":                  local,
+		"switchable":             switchable,
+		"switch_disabled_reason": reason,
+	}
+}
+
+func isLocalLLMProvider(name, baseURL string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if strings.Contains(n, "ollama") {
+		return true
+	}
+	u := strings.ToLower(strings.TrimSpace(baseURL))
+	for _, marker := range []string{"localhost", "127.0.0.1", "::1", "0.0.0.0", "host.docker.internal", "host.containers.internal", ".local"} {
+		if strings.Contains(u, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isOpenRouterFreeModel(baseURL, model string) bool {
+	return strings.Contains(strings.ToLower(baseURL), "openrouter.ai") &&
+		strings.Contains(strings.ToLower(model), ":free")
 }
 
 func (s *Server) handleUpdateFullConfig(w http.ResponseWriter, r *http.Request) {
@@ -277,7 +328,11 @@ func (s *Server) handleUpdateFullConfig(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 先在副本上构建新配置，持久化成功后再应用到 runtime
+	// 先在副本上构建新配置，持久化成功后再应用到 runtime。
+	// cfgMu 串行 read-copy-save-apply（GO-7）：与其它配置写 handler 的浅拷贝读/
+	// 字段写同址竞争 + lost-update。
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
 	nextCfg := *s.cfg
 
 	if sec := body.Security; sec != nil {
@@ -300,6 +355,8 @@ func (s *Server) handleUpdateFullConfig(w http.ResponseWriter, r *http.Request) 
 
 	sandboxChanged := false
 	var newNetworkEnabled bool
+	allowedPathsChanged := false
+	var newAllowedPaths []string
 	if sb := body.Sandbox; sb != nil {
 		if sb.NetworkEnabled != nil {
 			nextCfg.Skill.Builtin.CodeExecPolicy.Network = sb.NetworkEnabled
@@ -309,6 +366,8 @@ func (s *Server) handleUpdateFullConfig(w http.ResponseWriter, r *http.Request) 
 		if sb.AllowedPaths != nil {
 			// 授权目录白名单：下次沙箱构建（sidecar 启动）即放行只读。指针非 nil 时整体替换，空数组 = 清空。
 			nextCfg.Skill.Sandbox.Filesystem.AllowedPaths = *sb.AllowedPaths
+			allowedPathsChanged = true
+			newAllowedPaths = append([]string(nil), (*sb.AllowedPaths)...)
 		}
 	}
 
@@ -317,6 +376,23 @@ func (s *Server) handleUpdateFullConfig(w http.ResponseWriter, r *http.Request) 
 		logger.Error("配置持久化失败", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "配置保存失败: " + err.Error()})
 		return
+	}
+
+	if allowedPathsChanged && s.onSandboxAllowedPathsUpdate != nil {
+		if err := s.onSandboxAllowedPathsUpdate(newAllowedPaths); err != nil {
+			logger.Error("沙箱文件授权路径热更新失败", "error", err)
+			if rollbackErr := config.Save(s.cfg, ""); rollbackErr != nil {
+				logger.Error("沙箱文件授权路径热更新失败，且配置回滚失败", "error", rollbackErr)
+				writeJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "沙箱文件授权路径热更新失败，且配置回滚失败: " + rollbackErr.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "沙箱文件授权路径热更新失败，配置已回滚: " + err.Error(),
+			})
+			return
+		}
 	}
 
 	// 沙箱网络热更新；失败时回滚刚刚持久化的新配置，保持 runtime/内存/磁盘一致
@@ -668,6 +744,8 @@ func (s *Server) handleDeleteWorkflow(w http.ResponseWriter, r *http.Request) {
 	delete(s.workflowStore.workflows, id)
 	s.workflowStore.persistToFile()
 	s.workflowStore.mu.Unlock()
+	// 授权生命周期跟随任务：删除即回收其全部任务级授权。
+	s.revokeTaskGrants(r.Context(), "workflow:"+id)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "工作流已删除"})
 }
 

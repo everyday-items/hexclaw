@@ -145,9 +145,21 @@ type AddJobRequest struct {
 	TimeoutSec int `json:"timeout_s,omitempty"`
 	// Continuous 开启「持续型任务 + 跨 tick 检查点」：长目标分多次廉价唤醒累积推进（见 continuous.go）。
 	// 持续任务每 tick 需推理"下一个增量"，故必为 agent 模式——置 true 时强制 agent 模式。
-	Continuous      bool     `json:"continuous,omitempty"`
+	Continuous bool `json:"continuous,omitempty"`
+	// Paused 以初始暂停态创建：任务入库但不入调度，直到显式 resume。
+	// 用于创建流权限预检命中「需审批」而用户尚未授权完成的场景——任务意图
+	// 先冻结，授权后启用，避免「创建即跑」把未授权动作跑进拦截。
+	Paused          bool     `json:"paused,omitempty"`
 	AvailableSkills []string `json:"-"` // 服务端注入
 	LocalAPIBase    string   `json:"-"` // 服务端注入
+}
+
+// initialJobStatus 由 Paused 求初始状态。
+func initialJobStatus(paused bool) JobStatus {
+	if paused {
+		return StatusPaused
+	}
+	return StatusActive
 }
 
 // defaultAgentTimeoutSec is the per-run budget for agent-mode jobs when the
@@ -280,8 +292,10 @@ func jobLocation(tz string) *time.Location {
 
 // SetKBIngest wires the in-process knowledge-base writer into the Starlark
 // engine's kb_ingest builtin, so scripts ingest without an HTTP POST to the
-// app's own API (which loopback SSRF blocking now forbids). No-op if the
-// Starlark engine is absent — though NewScheduler always installs it.
+// app's own API. The loopback round-trip is avoided because it would need auth
+// and a running local server — not because it is blocked (Starlark http has no
+// SSRF/loopback guard by design). No-op if the Starlark engine is absent —
+// though NewScheduler always installs it.
 func (s *Scheduler) SetKBIngest(fn KBIngestFunc) {
 	if eng, ok := s.engines[RuntimeStarlark].(*StarlarkEngine); ok {
 		eng.SetKBIngest(fn)
@@ -669,7 +683,7 @@ func (s *Scheduler) AddJobFromPromptWithProgress(
 			UserID:       req.UserID,
 			Platform:     req.Platform,
 			ChatID:       req.ChatID,
-			Status:       StatusActive,
+			Status:       initialJobStatus(req.Paused),
 			SourcePrompt: req.Prompt,
 			Spec:         &JobSpec{Runtime: RuntimeAgent, TimeoutSec: agentTimeoutSec(req.TimeoutSec)},
 			Deliver:      req.Deliver,
@@ -708,7 +722,7 @@ func (s *Scheduler) AddJobFromPromptWithProgress(
 		UserID:       req.UserID,
 		Platform:     req.Platform,
 		ChatID:       req.ChatID,
-		Status:       StatusActive,
+		Status:       initialJobStatus(req.Paused),
 		SourcePrompt: req.Prompt,
 		Spec:         spec,
 		Deliver:      req.Deliver, // D4.2 多 deliver 桥接 — 持久化到 meta JSON 列
@@ -757,7 +771,7 @@ func (s *Scheduler) AddJobFromScript(ctx context.Context, req AddJobRequest, run
 		UserID:       req.UserID,
 		Platform:     req.Platform,
 		ChatID:       req.ChatID,
-		Status:       StatusActive,
+		Status:       initialJobStatus(req.Paused),
 		SourcePrompt: req.Prompt,
 		Spec:         spec,
 		Deliver:      req.Deliver,
@@ -1006,6 +1020,12 @@ func (s *Scheduler) TriggerJob(_ context.Context, jobID string) error {
 
 	if !ok {
 		return fmt.Errorf("任务 %q 不存在", jobID)
+	}
+	// 暂停态任务不接受手动 run / webhook TriggerJob —— 尊重「审批未决先冻结任务
+	// 意图，暂停期间根本不 dispatch」的设计（GO-6）。仅 checkAndExecute 的调度尊重
+	// StatusActive 是不够的：run/webhook 会绕过冻结，平白产生一次失败运行+pending 审计。
+	if job.Status == StatusPaused {
+		return fmt.Errorf("任务 %q 已暂停，恢复（resume）后才能触发", jobID)
 	}
 	// Agent-mode jobs run via the injected AgentRunner, not the script executor,
 	// so only script-mode jobs need scriptExec — don't block a webhook-triggered

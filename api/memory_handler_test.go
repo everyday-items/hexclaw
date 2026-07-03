@@ -125,9 +125,9 @@ func TestGetMemory_Empty(t *testing.T) {
 	}
 
 	var resp struct {
-		Entries  []memory.MemoryEntry `json:"entries"`
-		Total    int                  `json:"total"`
-		HasMore  bool                 `json:"has_more"`
+		Entries  []memory.MemoryEntry  `json:"entries"`
+		Total    int                   `json:"total"`
+		HasMore  bool                  `json:"has_more"`
 		Capacity memory.MemoryCapacity `json:"capacity"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
@@ -162,9 +162,9 @@ func TestGetMemory_WithEntries(t *testing.T) {
 	}
 
 	var resp struct {
-		Entries  []memory.MemoryEntry `json:"entries"`
-		Total    int                  `json:"total"`
-		Summary  string               `json:"summary"`
+		Entries  []memory.MemoryEntry  `json:"entries"`
+		Total    int                   `json:"total"`
+		Summary  string                `json:"summary"`
 		Capacity memory.MemoryCapacity `json:"capacity"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
@@ -222,6 +222,37 @@ func TestSaveMemory_Success(t *testing.T) {
 	}
 	if entries[0].Content != "用户偏好深色主题" {
 		t.Errorf("persisted content=%q", entries[0].Content)
+	}
+}
+
+func TestSaveMemory_ManualAPIDoesNotDropDistinctShortEntries(t *testing.T) {
+	srv, fm := newTestMemoryServer(t, 10)
+	if err := fm.SaveStructuredEntry("manual e2e probe", "fact", "manual", "", memory.EntryMeta{}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	body := `{"content":"e2e memory readback marker"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.handleSaveMemory(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, body=%s", w.Code, w.Body.String())
+	}
+	var resp memory.MemoryEntry
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Content != "e2e memory readback marker" {
+		t.Fatalf("POST response content=%q, want new marker", resp.Content)
+	}
+
+	entries := fm.ParseEntries()
+	if len(entries) != 2 {
+		t.Fatalf("entries len=%d, want 2: %+v", len(entries), entries)
+	}
+	if entries[1].Content != "e2e memory readback marker" {
+		t.Fatalf("persisted second content=%q", entries[1].Content)
 	}
 }
 

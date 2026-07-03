@@ -39,13 +39,13 @@ import (
 
 // ServerConfig MCP Server 配置
 type ServerConfig struct {
-	Name      string            `yaml:"name"`            // 名称标识
-	Transport string            `yaml:"transport"`       // 传输方式: stdio / sse
-	Command   string            `yaml:"command"`         // stdio 模式的命令（如 npx, uvx）
-	Args      []string          `yaml:"args"`            // stdio 模式的命令参数
-	Env       map[string]string `yaml:"env,omitempty"`   // stdio 子进程环境变量（数据连接器走 MCP 的凭证注入：MYSQL_HOST/PASSWORD 等）
-	Endpoint  string            `yaml:"endpoint"`        // sse 模式的端点 URL
-	Enabled   bool              `yaml:"enabled"`         // 是否启用，默认 true
+	Name      string            `yaml:"name"`          // 名称标识
+	Transport string            `yaml:"transport"`     // 传输方式: stdio / sse
+	Command   string            `yaml:"command"`       // stdio 模式的命令（如 npx, uvx）
+	Args      []string          `yaml:"args"`          // stdio 模式的命令参数
+	Env       map[string]string `yaml:"env,omitempty"` // stdio 子进程环境变量（数据连接器走 MCP 的凭证注入：MYSQL_HOST/PASSWORD 等）
+	Endpoint  string            `yaml:"endpoint"`      // sse 模式的端点 URL
+	Enabled   bool              `yaml:"enabled"`       // 是否启用，默认 true
 }
 
 // ToolInfo 已发现的 MCP 工具信息
@@ -519,8 +519,29 @@ func isMCPConnClosed(err error) bool {
 // ServerStatus MCP Server 状态信息
 type ServerStatus struct {
 	Name      string `json:"name"`
+	Kind      string `json:"kind,omitempty"`
 	Connected bool   `json:"connected"`
 	ToolCount int    `json:"tool_count"`
+}
+
+func classifyServerKind(cfg ServerConfig) string {
+	haystack := strings.ToLower(strings.Join(append([]string{cfg.Name, cfg.Command, cfg.Endpoint}, cfg.Args...), " "))
+	switch {
+	case strings.Contains(haystack, "mysql"):
+		return "mysql"
+	case strings.Contains(haystack, "postgres") || strings.Contains(haystack, "pgsql"):
+		return "postgres"
+	case strings.Contains(haystack, "sqlite"):
+		return "sqlite"
+	case strings.Contains(haystack, "redis"):
+		return "redis"
+	case strings.Contains(haystack, "filesystem") || strings.Contains(haystack, "readfile"):
+		return "filesystem"
+	case strings.Contains(haystack, "github"):
+		return "github"
+	default:
+		return "mcp"
+	}
 }
 
 // ServerStatuses 获取所有 MCP Server 的状态。
@@ -540,7 +561,7 @@ func (m *Manager) ServerStatuses() []ServerStatus {
 			continue
 		}
 		seen[cfg.Name] = true
-		st := ServerStatus{Name: cfg.Name}
+		st := ServerStatus{Name: cfg.Name, Kind: classifyServerKind(cfg)}
 		if server, ok := m.servers[cfg.Name]; ok {
 			st.Connected = server.connected
 			st.ToolCount = len(server.tools)
@@ -555,6 +576,7 @@ func (m *Manager) ServerStatuses() []ServerStatus {
 		seen[name] = true
 		statuses = append(statuses, ServerStatus{
 			Name:      name,
+			Kind:      "mcp",
 			Connected: server.connected,
 			ToolCount: len(server.tools),
 		})

@@ -7,7 +7,7 @@ package api
 //
 // 与已有的 POST /api/v1/im/channels/{provider}/test 的区别：
 //   - 统一契约 {type, config} → {ok, detail}，type 含 email 与各 IM 平台；
-//   - email 走真正的 SMTP AUTH + 可选 IMAP 登录探测（BuildAdapter 不覆盖 email）；
+//   - email 走真正的 SMTP AUTH + 可选 IMAP 登录探测；
 //   - IM 平台复用 instances.BuildAdapter + adapter.ConfigValidator 这一既有、经过验证的探测口子，
 //     不重复造轮子，也不向外部 API 发垃圾请求。
 
@@ -35,15 +35,13 @@ type connectionSummary struct {
 }
 
 // connectionCapabilities 由 provider 推导连接能力。IM 平台已接入 instances.Manager（BuildAdapter +
-// modeForProvider），可收可发 → ["receive","send"]；email 收件经独立轮询，但发件未接入 instances.Manager
-// （BuildAdapter/modeForProvider 均无 email case），不能作 cron 投递目标 → 仅 ["receive"]，否则前端
-// deliverableConnections 会把 email 当投递目标致运行期 instanceMgr.Send 失败（BUG-20260625 §3-5）。
+// modeForProvider），可收可发 → ["receive","send"]。email 也接入 instances.Manager（IMAP 轮询 +
+// SMTP Send），因此和 IM 一样是可投递连接。
 // 未知 provider 返回空切片（非 nil，便于 JSON 出 []）。
 func connectionCapabilities(provider string) []string {
 	switch provider {
-	case "email":
-		return []string{"receive"}
-	case "feishu", "dingtalk", "discord", "telegram", "wecom", "wechat":
+	case "feishu", "dingtalk", "discord", "telegram", "wecom", "wechat",
+		"slack", "line", "whatsapp", "matrix", "email":
 		return []string{"receive", "send"}
 	default:
 		return []string{}
@@ -121,7 +119,7 @@ func (s *Server) handleConnectionsTest(w http.ResponseWriter, r *http.Request) {
 	case "email":
 		ok, detail := testEmailConnection(ctx, req.Config)
 		writeJSON(w, http.StatusOK, connectionTestResponse{OK: ok, Detail: detail})
-	case "feishu", "dingtalk", "discord", "telegram", "wecom", "wechat":
+	case "feishu", "dingtalk", "discord", "telegram", "wecom", "wechat", "slack", "line", "whatsapp", "matrix":
 		ok, detail := testIMConnection(ctx, connType, req.Config)
 		writeJSON(w, http.StatusOK, connectionTestResponse{OK: ok, Detail: detail})
 	default:

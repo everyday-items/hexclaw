@@ -14,6 +14,61 @@ import (
 
 func boolPtr(b bool) *bool { return &b }
 
+func TestHandleGetFullConfig_ProviderSwitchableStatus(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
+		"openrouter": {
+			APIKey:  "sk-openrouter",
+			BaseURL: "https://openrouter.ai/api/v1",
+			Model:   "deepseek/deepseek-chat-v3-0324:free",
+		},
+		"ollama": {
+			BaseURL: "http://127.0.0.1:11434/v1",
+			Model:   "qwen3:0.6b",
+		},
+		"disabled": {
+			APIKey:  "sk-disabled",
+			BaseURL: "https://api.example.com/v1",
+			Model:   "x",
+			Enabled: boolPtr(false),
+		},
+	}
+	s := &Server{cfg: cfg, logCollector: NewLogCollector(10)}
+
+	w := httptest.NewRecorder()
+	s.handleGetFullConfig(w, httptest.NewRequest(http.MethodGet, "/api/v1/config", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", w.Code, w.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	llmSection := body["llm"].(map[string]any)
+	providers := llmSection["providers"].(map[string]any)
+	openrouter := providers["openrouter"].(map[string]any)
+	if openrouter["switchable"] != false {
+		t.Fatalf("OpenRouter free model should not be switchable: %+v", openrouter)
+	}
+	if openrouter["switch_disabled_reason"] != "openrouter_free_model_rate_limited" {
+		t.Fatalf("unexpected openrouter reason: %+v", openrouter)
+	}
+	if strings.Contains(w.Body.String(), "sk-openrouter") {
+		t.Fatalf("full config leaked API key: %s", w.Body.String())
+	}
+
+	ollama := providers["ollama"].(map[string]any)
+	if ollama["switchable"] != true || ollama["local"] != true {
+		t.Fatalf("Ollama local provider should be switchable without API key: %+v", ollama)
+	}
+
+	disabled := providers["disabled"].(map[string]any)
+	if disabled["switchable"] != false || disabled["enabled"] != false {
+		t.Fatalf("disabled provider should not be switchable: %+v", disabled)
+	}
+}
+
 func TestHandleUpdateFullConfig_SaveFailureReturnsError(t *testing.T) {
 	homeFile := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(homeFile, []byte("x"), 0600); err != nil {

@@ -2,10 +2,9 @@ package api
 
 import "testing"
 
-// 校验 validateMCPCommand 的 args 危险字符策略：
-// MCP 子进程经 exec(argv) 启动（非 shell），args 里的 `~` 不构成注入，且 connectServer 会展开
-// `~`/`~/`（SQLite --db-path ~/data.db、连接器本地路径）。旧实现 args 也禁 `~` → 这类合法路径
-// 在 handler 校验阶段被误拒，永远到不了展开逻辑。本测试钉死：args 放行 `~`，但其余 shell 元字符仍禁。
+// 校验 validateMCPCommand 的功能优先策略：
+// MCP 子进程经 exec(argv) 启动（非 shell），args 里的 shell 元字符、JSON、连接串、`~`
+// 都应放行，避免合法 MCP server 配置在 handler 校验阶段被误拒。
 func TestValidateMCPCommand_ArgsAllowTildePath(t *testing.T) {
 	// SQLite（增量3 连接中心 + registry 一键装都会产出 ~ 路径）必须通过。
 	if err := validateMCPCommand("uvx", []string{"mcp-server-sqlite", "--db-path", "~/data.db"}); err != nil {
@@ -23,19 +22,27 @@ func TestValidateMCPCommand_ArgsAllowTildePath(t *testing.T) {
 	}
 }
 
-// 真正的 shell 元字符在 args 中仍必须被拒（放行 `~` 不等于放开注入面）。
-func TestValidateMCPCommand_ArgsStillRejectShellMeta(t *testing.T) {
-	for _, bad := range []string{"a;rm -rf", "x|y", "$(whoami)", "a&b", "`id`", "a>b", "a<b", "a'b", "a\"b"} {
-		if err := validateMCPCommand("npx", []string{"-y", bad}); err == nil {
-			t.Errorf("args 含 shell 元字符 %q 必须被拒", bad)
+func TestValidateMCPCommand_ArgsAllowShellMetaBecauseExecArgv(t *testing.T) {
+	for _, arg := range []string{"a;rm -rf", "x|y", "$(whoami)", "a&b", "`id`", "a>b", "a<b", "a'b", "a\"b", `{"k":"v"}`} {
+		if err := validateMCPCommand("custom-mcp", []string{"-y", arg}); err != nil {
+			t.Errorf("exec argv arg %q should be allowed, got %v", arg, err)
 		}
 	}
-	// command 仍严格禁 `~`（可执行名不该带 `~`）。
-	if err := validateMCPCommand("~npx", nil); err == nil {
-		t.Error("command 含 `~` 必须被拒")
+	if err := validateMCPCommand("~npx", nil); err != nil {
+		t.Errorf("function-first command with ~ should be allowed: %v", err)
 	}
-	// 命令白名单仍生效。
-	if err := validateMCPCommand("rm", []string{"-rf", "/"}); err == nil {
-		t.Error("非白名单命令必须被拒")
+	if err := validateMCPCommand("rm", []string{"-rf", "/"}); err != nil {
+		t.Errorf("function-first custom command should be allowed: %v", err)
+	}
+	for _, bad := range []struct {
+		command string
+		args    []string
+	}{
+		{"bad\ncmd", nil},
+		{"ok", []string{"bad\x00arg"}},
+	} {
+		if err := validateMCPCommand(bad.command, bad.args); err == nil {
+			t.Errorf("control chars must still be rejected: command=%q args=%v", bad.command, bad.args)
+		}
 	}
 }

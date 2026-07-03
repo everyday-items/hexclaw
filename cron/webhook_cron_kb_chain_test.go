@@ -88,6 +88,7 @@ func TestWebhookCronKBSnapshotChain_E2E(t *testing.T) {
 	}
 	if err := wmgr.Register(ctx, &webhook.Webhook{
 		Name: "deploy-hook", Type: webhook.TypeGeneric, JobID: job.ID, UserID: "u1",
+		Enabled: true, // 派发链路测试：显式启用（默认未启用）
 	}); err != nil {
 		t.Fatalf("register webhook: %v", err)
 	}
@@ -186,6 +187,7 @@ func TestWebhookNoJob_TakesPromptPath(t *testing.T) {
 	}
 	if err := wmgr.Register(ctx, &webhook.Webhook{
 		Name: "notify-hook", Type: webhook.TypeGeneric, Prompt: "处理事件", UserID: "u1", // no JobID
+		Enabled: true, // 派发链路测试：显式启用（默认未启用）
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}

@@ -45,6 +45,7 @@ import (
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/autonomy"
 	"github.com/hexagon-codes/hexclaw/canvas"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/connector"
@@ -73,7 +74,11 @@ import (
 
 // Server HTTP API 服务器
 type Server struct {
-	cfg               *config.Config
+	cfg *config.Config
+	// cfgMu 串行化 s.cfg 的 read-copy-save-apply 写路径（GO-7/BUG-20260703）：
+	// 各配置写 handler 都做「整结构浅拷贝→落盘→回写」，无锁时既有同址读写
+	// 竞争（拷贝读 vs 字段写），也有 lost-update（旧副本落盘抹掉他人变更）。
+	cfgMu             sync.Mutex
 	engine            engine.Engine
 	gateway           gateway.Gateway
 	store             storage.Store                // 数据存储层
@@ -116,14 +121,20 @@ type Server struct {
 	cronParseProvider hexagon.Provider             // D2.1 Layer 2 cron parse LLM provider
 	cronParseModel    string                       // D2.1 cron parse 模型名（建议 haiku/mini 类快模型）
 	version           string                       // 版本号
+	// 自动化权限治理（可选，main.go 经 SetAutonomy 注入）
+	autonomyHook      *engine.PermissionHook  // 权限闸引用：Profile 热更新 + 当前策略
+	autonomyDecisions *autonomy.DecisionStore // 权限决策审计日志（持久化）
+	autonomyGrants    *autonomy.GrantStore    // 任务级授权存储
+	autonomyCfgPath   string                  // Profile 持久化目标配置文件（空 = 默认）
 	// 沙箱网络热更新回调（由 main.go 注入）
-	onSandboxNetworkUpdate func(enabled bool) error
-	sandboxNetworkEnabled  func() bool
-	server                 *http.Server
-	statsMu                sync.Mutex
-	statsCache             statsResponse
-	statsJSON              []byte
-	statsCacheAt           time.Time
+	onSandboxNetworkUpdate      func(enabled bool) error
+	onSandboxAllowedPathsUpdate func(paths []string) error
+	sandboxNetworkEnabled       func() bool
+	server                      *http.Server
+	statsMu                     sync.Mutex
+	statsCache                  statsResponse
+	statsJSON                   []byte
+	statsCacheAt                time.Time
 }
 
 // NewServer 创建 API 服务器
@@ -420,6 +431,10 @@ func (s *Server) SetSandboxCallbacks(updater func(bool) error, getter func() boo
 	s.sandboxNetworkEnabled = getter
 }
 
+func (s *Server) SetSandboxAllowedPathsCallback(updater func([]string) error) {
+	s.onSandboxAllowedPathsUpdate = updater
+}
+
 // LogCollector 返回日志收集器，供外部模块写入日志
 func (s *Server) LogCollector() *LogCollector {
 	return s.logCollector
@@ -584,8 +599,19 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /api/v1/webhooks/{name}", s.webhookMgr.Handler())
 		mux.HandleFunc("GET /api/v1/webhooks", s.handleListWebhooks)
 		mux.HandleFunc("POST /api/v1/webhooks", s.handleRegisterWebhook)
+		mux.HandleFunc("PATCH /api/v1/webhooks/{name}", s.handleUpdateWebhook)
 		mux.HandleFunc("DELETE /api/v1/webhooks/{name}", s.handleDeleteWebhook)
 	}
+
+	// 自动化权限治理 API（Profile / 预检 / 总览 / 决策日志 / 任务级授权）
+	mux.HandleFunc("GET /api/v1/autonomy/profile", s.handleGetAutonomyProfile)
+	mux.HandleFunc("PUT /api/v1/autonomy/profile", s.handleUpdateAutonomyProfile)
+	mux.HandleFunc("POST /api/v1/autonomy/preflight", s.handleAutonomyPreflight)
+	mux.HandleFunc("GET /api/v1/autonomy/summary", s.handleAutonomySummary)
+	mux.HandleFunc("GET /api/v1/autonomy/decisions", s.handleListAutonomyDecisions)
+	mux.HandleFunc("GET /api/v1/autonomy/grants", s.handleListAutonomyGrants)
+	mux.HandleFunc("POST /api/v1/autonomy/grants", s.handleCreateAutonomyGrant)
+	mux.HandleFunc("DELETE /api/v1/autonomy/grants/{id}", s.handleRevokeAutonomyGrant)
 
 	// Cron API（v0.4.x：统一为单 endpoint 7-action 入口，决策 B 完全替换）
 	if s.scheduler != nil {
@@ -684,6 +710,10 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("GET /api/v1/platforms/instances", s.handleListInstances)
 		mux.HandleFunc("GET /api/v1/platforms/instances/health", s.handleListInstanceHealth)
 		mux.HandleFunc("POST /api/v1/platforms/instances", s.handleUpsertInstance)
+		mux.HandleFunc("PUT /api/v1/platforms/instances/by-id/{id}", s.handleUpdateInstanceByID)
+		mux.HandleFunc("DELETE /api/v1/platforms/instances/by-id/{id}", s.handleDeleteInstanceByID)
+		mux.HandleFunc("POST /api/v1/platforms/instances/by-id/{id}/test", s.handleTestInstanceByID)
+		mux.HandleFunc("POST /api/v1/platforms/instances/by-id/{id}/send-test", s.handleSendTestInstanceByID)
 		mux.HandleFunc("PUT /api/v1/platforms/instances/{name}", s.handleUpsertInstance)
 		mux.HandleFunc("DELETE /api/v1/platforms/instances/{name}", s.handleDeleteInstance)
 		mux.HandleFunc("GET /api/v1/platforms/instances/{name}/health", s.handleGetInstanceHealth)
@@ -987,6 +1017,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	for k, v := range req.Metadata {
 		msg.Metadata[k] = v
 	}
+	// GO-3：外部聊天入口是信任边界——剥除只能由受信内部派发器盖章的保留键，
+	// 否则客户端可伪造 source=cron + cron_job_id 盗用他人任务的授权（提权）。
+	engine.StripReservedDispatchMetadata(msg.Metadata)
 	if req.RequestID != "" {
 		msg.Metadata["request_id"] = req.RequestID
 	}
@@ -1305,7 +1338,10 @@ func (s *Server) apiAuthMiddleware(next http.Handler) http.Handler {
 		// 2. 日志 API（GET /api/v1/logs*）需认证（可能含敏感信息）
 		// 3. 所有 localhost 请求始终放行，兼容桌面客户端 sidecar / 本机管理
 		path := r.URL.Path
-		isWriteOp := r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete
+		// PATCH 也是写操作（如 PATCH /webhooks/{name} 启停 webhook = 开关自动化派发闸门）。
+		// 漏了 PATCH 会让它绕过 Bearer 校验（非回环 + 配了 APIToken 时可无凭证操作）。
+		isWriteOp := r.Method == http.MethodPost || r.Method == http.MethodPut ||
+			r.Method == http.MethodPatch || r.Method == http.MethodDelete
 		isWebhookReceiver := (r.Method == http.MethodPost && strings.HasPrefix(path, "/api/v1/webhooks/") && path != "/api/v1/webhooks") ||
 			((r.Method == http.MethodGet || r.Method == http.MethodPost) &&
 				strings.HasPrefix(path, "/api/v1/platforms/hooks/"))

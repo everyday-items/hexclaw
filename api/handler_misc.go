@@ -140,7 +140,7 @@ func (s *Server) handleSaveMemory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.fileMem.SaveEntry(req.Content, req.Type, req.Source); err != nil {
+	if err := s.fileMem.SaveStructuredEntry(req.Content, req.Type, req.Source, "", memory.EntryMeta{}); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "保存记忆失败: " + err.Error(),
 		})
@@ -1469,46 +1469,23 @@ func (s *Server) syncEngineMarketplaceSkills() {
 	}
 }
 
-// ─── MCP 安全校验 ────────────────────────────────────
+// ─── MCP 功能优先校验 ────────────────────────────────────
 
-// mcpAllowedCommands stdio 模式允许的命令白名单
-var mcpAllowedCommands = map[string]bool{
-	"npx": true, "node": true, "uvx": true, "uv": true, "python": true, "python3": true,
-	"docker": true, "deno": true, "bun": true, "go": true, "cargo": true,
-}
-
-// mcpDangerousChars shell 元字符 + 控制字符，禁止出现在 command 中
-const mcpDangerousChars = "`$|;&><(){}!\\'\"~\n\r\x00"
-
-// mcpDangerousArgChars 用于 args 的危险字符集：同命令集但**放行 `~`**。
-// MCP 子进程经 exec(argv 数组) 启动而非 shell，args 中的 `~` 不构成 shell 注入；且 connectServer
-// 显式支持 args 里 `~` / `~/` 的家目录展开（如 SQLite `--db-path ~/data.db`、连接器本地路径）。
-// 若 args 仍禁 `~`，这类合法路径会在 handler 校验阶段被误拒，永远到不了 connectServer 的展开逻辑。
-const mcpDangerousArgChars = "`$|;&><(){}!\\'\"\n\r\x00"
+// MCP stdio 子进程通过 exec(argv) 启动，不经过 shell。默认不做命令白名单或
+// shell 元字符拦截，避免挡住自定义 MCP server、JSON 参数、连接串、路径等合法配置；
+// 仅拒绝空命令和控制字符。
+const mcpControlChars = "\n\r\x00"
 
 func validateMCPCommand(command string, args []string) error {
 	if command == "" {
 		return fmt.Errorf("command 不能为空")
 	}
-	// 解析 symlink 防止伪装绕过白名单
-	resolved := command
-	if filepath.IsAbs(command) {
-		if real, err := filepath.EvalSymlinks(command); err == nil {
-			resolved = real
-		}
-	}
-	base := filepath.Base(resolved)
-	if !mcpAllowedCommands[base] {
-		return fmt.Errorf("不允许的命令 %q，仅支持: npx, node, uvx, uv, python, python3, docker, deno, bun, go, cargo", base)
-	}
-	// 禁止 shell 元字符
-	if strings.ContainsAny(command, mcpDangerousChars) {
-		return fmt.Errorf("command 包含不允许的字符")
+	if strings.ContainsAny(command, mcpControlChars) {
+		return fmt.Errorf("command 包含控制字符")
 	}
 	for i, arg := range args {
-		// args 放行 `~`（家目录路径，connectServer 会展开），其余 shell 元字符仍禁。
-		if strings.ContainsAny(arg, mcpDangerousArgChars) {
-			return fmt.Errorf("args[%d] 包含不允许的字符", i)
+		if strings.ContainsAny(arg, mcpControlChars) {
+			return fmt.Errorf("args[%d] 包含控制字符", i)
 		}
 	}
 	return nil

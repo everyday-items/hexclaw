@@ -54,6 +54,7 @@ type CronJobDraft struct {
 	EnabledToolsets []string `json:"enabled_toolsets,omitempty"`
 	TimeoutSec      int      `json:"timeout_s,omitempty"`  // 0 → mode default (agent 600s)
 	Continuous      bool     `json:"continuous,omitempty"` // 持续型任务 + 跨 tick 检查点（强制 agent 模式）
+	Paused          bool     `json:"paused,omitempty"`     // 初始暂停态：审批未决时先冻结任务意图，授权后 resume
 }
 
 // handleCronParse Layer 2 LLM JSON 解析端点。

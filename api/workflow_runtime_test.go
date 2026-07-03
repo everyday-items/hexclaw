@@ -136,6 +136,16 @@ func TestWorkflowRun_FrontendFieldNames(t *testing.T) {
 	if len(got.NodeResults) != 3 {
 		t.Fatalf("期望 3 个节点结果（from/to 边已链接），实际 %d: %+v", len(got.NodeResults), got.NodeResults)
 	}
+	eng := s.engine.(*workflowTestEngine)
+	eng.mu.Lock()
+	lastMsg := eng.lastMsg
+	eng.mu.Unlock()
+	if lastMsg == nil {
+		t.Fatal("workflow engine 未收到消息")
+	}
+	if lastMsg.Metadata["source"] != "workflow" {
+		t.Fatalf("workflow agent message must stamp source=workflow, got metadata=%v", lastMsg.Metadata)
+	}
 }
 
 func TestWorkflowRun_AgentHandoff(t *testing.T) {

@@ -112,17 +112,15 @@ func (a *appIntrospectorImpl) Inventory(ctx context.Context, userID string) engi
 			counts["connections"] = len(insts)
 		}
 	}
+	if a.mcpMgr != nil {
+		statuses := a.mcpMgr.ServerStatuses()
+		counts["mcp"] = len(statuses)
+		counts["connections"] += len(statuses)
+	}
 	if a.webhookMgr != nil {
 		if whs, err := a.webhookMgr.List(ctx, userID); err == nil {
 			counts["webhooks"] = len(whs)
 		}
-	}
-	if a.mcpMgr != nil {
-		servers := map[string]struct{}{}
-		for _, t := range a.mcpMgr.ListToolInfos() {
-			servers[t.ServerName] = struct{}{}
-		}
-		counts["mcp"] = len(servers)
 	}
 	if a.srv != nil {
 		counts["workflows"] = len(a.srv.ListWorkflowsForAgent())
@@ -191,26 +189,46 @@ func (a *appIntrospectorImpl) queryDomain(ctx context.Context, domain, action, i
 }
 
 func (a *appIntrospectorImpl) queryConnections(ctx context.Context, id string) (string, error) {
-	if a.instanceMgr == nil {
+	if a.instanceMgr == nil && a.mcpMgr == nil {
 		return "连接功能未启用。", nil
 	}
-	insts, err := a.instanceMgr.List(ctx)
-	if err != nil {
-		return "", err
-	}
-	if len(insts) == 0 {
-		return "当前没有已配置的连接。", nil
-	}
 	var lines []string
-	for _, in := range insts {
-		if !matchID(id, in.ID, in.Name) {
-			continue
+	if a.instanceMgr != nil {
+		insts, err := a.instanceMgr.List(ctx)
+		if err != nil {
+			return "", err
 		}
-		// 仅暴露 id/provider/name/状态/启用 —— 绝不含 in.Config（凭据）。
-		lines = append(lines, fmt.Sprintf("- %s | provider=%s | %s | 状态=%s | %s\n",
-			in.ID, in.Provider, in.Name, in.Status, enabledZh(in.Enabled)))
+		for _, in := range insts {
+			if !matchID(id, in.ID, in.Name) {
+				continue
+			}
+			// 仅暴露 id/provider/name/状态/启用 —— 绝不含 in.Config（凭据）。
+			lines = append(lines, fmt.Sprintf("- %s | provider=%s | %s | 状态=%s | %s\n",
+				in.ID, in.Provider, in.Name, in.Status, enabledZh(in.Enabled)))
+		}
+	}
+	if a.mcpMgr != nil {
+		for _, st := range a.mcpMgr.ServerStatuses() {
+			if !matchID(id, st.Name) {
+				continue
+			}
+			kind := st.Kind
+			if kind == "" {
+				kind = "mcp"
+			}
+			state := "disconnected"
+			if st.Connected {
+				state = "connected"
+			}
+			// MCP server 覆盖数据连接器（MySQL/Postgres 等）。只暴露脱敏状态，不输出 command/args/env。
+			lines = append(lines, fmt.Sprintf("- %s | provider=%s | 数据连接器/MCP | 状态=%s | 工具数=%d | 已配置\n",
+				st.Name, kind, state, st.ToolCount))
+		}
 	}
 	if len(lines) == 0 {
+		if id == "" {
+			return "当前没有已配置的连接。", nil
+		}
 		return notFoundByID("连接", id), nil
 	}
 	var sb strings.Builder
@@ -225,30 +243,50 @@ func (a *appIntrospectorImpl) queryMCP(id string) (string, error) {
 	if a.mcpMgr == nil {
 		return "MCP 未启用。", nil
 	}
+	statuses := a.mcpMgr.ServerStatuses()
 	tools := a.mcpMgr.ListToolInfos()
-	if len(tools) == 0 {
-		return "当前没有已连接的 MCP server（含数据连接器如 MySQL/Postgres）。", nil
+	if len(statuses) == 0 {
+		return "当前没有已配置的 MCP server（含数据连接器如 MySQL/Postgres）。", nil
 	}
 	byServer := map[string][]string{}
-	order := []string{}
 	shownTools := 0
 	for _, t := range tools {
 		if !matchID(id, t.ServerName) { // get：按 server 名过滤
 			continue
 		}
-		if _, ok := byServer[t.ServerName]; !ok {
-			order = append(order, t.ServerName)
-		}
 		byServer[t.ServerName] = append(byServer[t.ServerName], t.Name)
 		shownTools++
 	}
-	if len(order) == 0 {
+	var shown []hexmcp.ServerStatus
+	connected := 0
+	for _, st := range statuses {
+		if !matchID(id, st.Name) {
+			continue
+		}
+		if st.Connected {
+			connected++
+		}
+		shown = append(shown, st)
+	}
+	if len(shown) == 0 {
 		return notFoundByID("MCP server", id), nil
 	}
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "共 %d 个 MCP server（数据连接器即 MCP server），%d 个工具：\n", len(order), shownTools)
-	for _, srv := range order {
-		fmt.Fprintf(&sb, "- %s → 工具: %s\n", srv, strings.Join(byServer[srv], ", "))
+	fmt.Fprintf(&sb, "共 %d 个 MCP server（数据连接器即 MCP server），%d 个已连接，%d 个工具：\n", len(shown), connected, shownTools)
+	for _, st := range shown {
+		kind := st.Kind
+		if kind == "" {
+			kind = "mcp"
+		}
+		state := "disconnected"
+		if st.Connected {
+			state = "connected"
+		}
+		toolList := "无/未发现"
+		if names := byServer[st.Name]; len(names) > 0 {
+			toolList = strings.Join(names, ", ")
+		}
+		fmt.Fprintf(&sb, "- %s | kind=%s | 状态=%s | 工具数=%d | 工具: %s\n", st.Name, kind, state, st.ToolCount, toolList)
 	}
 	return sb.String(), nil
 }

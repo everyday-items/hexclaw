@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/instances"
+	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	sqlitestore "github.com/hexagon-codes/hexclaw/storage/sqlite"
 	"github.com/hexagon-codes/hexclaw/webhook"
 )
@@ -42,6 +45,15 @@ func newTestWebhookMgr(t *testing.T) *webhook.Manager {
 	return mgr
 }
 
+func stubMCPStdioError(t *testing.T, err error) {
+	t.Helper()
+	orig := hexagon.ConnectMCPStdioWithEnv
+	hexagon.ConnectMCPStdioWithEnv = func(context.Context, string, map[string]string, ...string) ([]hexagon.Tool, func(), error) {
+		return nil, nil, err
+	}
+	t.Cleanup(func() { hexagon.ConnectMCPStdioWithEnv = orig })
+}
+
 // 🔴 P0 安全不变量（最高优先）：app_query 读连接**绝不**泄露凭据（Instance.Config 含 token/密码）。
 // 若有人日后改 queryConnections 去 dump Config，本测试必须 FAIL。
 func TestAppIntrospect_Connections_RedactsCredentials_P0(t *testing.T) {
@@ -68,6 +80,57 @@ func TestAppIntrospect_Connections_RedactsCredentials_P0(t *testing.T) {
 	// 绝不泄露凭据
 	if strings.Contains(out, secret) || strings.Contains(out, secret2) {
 		t.Fatalf("🔴 泄露凭据！app_query 连接输出含 secret: %q", out)
+	}
+}
+
+// BUG-20260630：app_query 只能看到平台实例（钉钉/飞书等），看不到「连接器」里已配置但尚未连上的
+// MySQL/Postgres 等数据连接器。数据连接器运行时事实源是 MCP manager 的已配置 server 状态，而不是
+// 已连接工具列表；冷装/连接失败时也必须能被模型看到，否则会误答“没有 MySQL 连接”。
+func TestAppIntrospect_Connections_IncludesConfiguredMCPDataConnectors(t *testing.T) {
+	ctx := context.Background()
+	stubMCPStdioError(t, errors.New("mysql not running"))
+	mcpMgr := hexmcp.NewManager()
+	t.Cleanup(mcpMgr.Close)
+	const secret = "mysql-password-must-not-leak"
+	connected, err := mcpMgr.AddServerBestEffort(ctx, hexmcp.ServerConfig{
+		Name:      "测试会话数据库",
+		Transport: "stdio",
+		Command:   "npx",
+		Args:      []string{"-y", "@benborla29/mcp-server-mysql"},
+		Env:       map[string]string{"MYSQL_PASSWORD": secret},
+	})
+	if err != nil {
+		t.Fatalf("AddServerBestEffort: %v", err)
+	}
+	if connected {
+		t.Fatal("stub 连接失败时 connected 应为 false")
+	}
+	a := &appIntrospectorImpl{mcpMgr: mcpMgr}
+
+	out, err := a.Query(ctx, "connections", "list", "", "u1")
+	if err != nil {
+		t.Fatalf("query connections: %v", err)
+	}
+	for _, want := range []string{"测试会话数据库", "provider=mysql", "数据连接器/MCP", "状态=disconnected"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("connections 应包含已配置 MySQL 数据连接器 %q, got: %q", want, out)
+		}
+	}
+	if strings.Contains(out, secret) || strings.Contains(out, "@benborla29/mcp-server-mysql") {
+		t.Fatalf("connections 输出不得泄露 env/command/args: %q", out)
+	}
+
+	out, err = a.Query(ctx, "mcp", "list", "", "u1")
+	if err != nil {
+		t.Fatalf("query mcp: %v", err)
+	}
+	for _, want := range []string{"测试会话数据库", "kind=mysql", "状态=disconnected", "工具数=0"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("mcp 应包含已配置未连接 server %q, got: %q", want, out)
+		}
+	}
+	if strings.Contains(out, secret) || strings.Contains(out, "@benborla29/mcp-server-mysql") {
+		t.Fatalf("mcp 输出不得泄露 env/command/args: %q", out)
 	}
 }
 

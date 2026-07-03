@@ -14,6 +14,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/adapter/dingtalk"
 	"github.com/hexagon-codes/hexclaw/adapter/discord"
+	"github.com/hexagon-codes/hexclaw/adapter/email"
 	"github.com/hexagon-codes/hexclaw/adapter/feishu"
 	"github.com/hexagon-codes/hexclaw/adapter/line"
 	"github.com/hexagon-codes/hexclaw/adapter/matrix"
@@ -61,8 +62,10 @@ type HealthReport struct {
 }
 
 type Manager struct {
-	db      *sql.DB
-	handler adapter.MessageHandler
+	db                *sql.DB
+	handler           adapter.MessageHandler
+	buildAdapter      func(*Instance) (adapter.Adapter, error)
+	disabledProviders map[string]bool
 
 	// box 负责 config_json 的静态加密/解密。可为 nil（部分测试不注入）：
 	// 此时凭据按明文直存直读，全链路退化为旧行为，不 crash。
@@ -76,10 +79,12 @@ type Manager struct {
 
 func NewManager(db *sql.DB) *Manager {
 	return &Manager{
-		db:       db,
-		running:  make(map[string]adapter.Adapter),
-		inbound:  make(map[string]http.Handler),
-		metadata: make(map[string]*Instance),
+		db:                db,
+		buildAdapter:      BuildAdapter,
+		running:           make(map[string]adapter.Adapter),
+		inbound:           make(map[string]http.Handler),
+		metadata:          make(map[string]*Instance),
+		disabledProviders: make(map[string]bool),
 	}
 }
 
@@ -87,6 +92,21 @@ func (m *Manager) SetHandler(h adapter.MessageHandler) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.handler = h
+}
+
+// SetDisabledProviders prevents selected platform adapters from starting.
+// It is intentionally provider-scoped so desktop/tests can disable flaky IM
+// transports without deleting user configuration.
+func (m *Manager) SetDisabledProviders(providers ...string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.disabledProviders = make(map[string]bool, len(providers))
+	for _, p := range providers {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p != "" {
+			m.disabledProviders[p] = true
+		}
+	}
 }
 
 // SetSecretBox 注入用于 config_json 静态加密的 Box。传 nil 表示不加密（明文直存）。
@@ -183,8 +203,7 @@ func (m *Manager) SeedFromConfig(ctx context.Context, cfg *config.Config) error 
 
 func (m *Manager) List(ctx context.Context) ([]*Instance, error) {
 	rows, err := m.db.QueryContext(ctx,
-		`SELECT id, provider, name, enabled, mode, status, config_json, last_event_at, last_error, created_at, updated_at
-		 FROM platform_instances ORDER BY provider, name`)
+		`SELECT `+instanceColumns+` FROM platform_instances ORDER BY provider, name`)
 	if err != nil {
 		return nil, err
 	}
@@ -192,21 +211,9 @@ func (m *Manager) List(ctx context.Context) ([]*Instance, error) {
 
 	var list []*Instance
 	for rows.Next() {
-		inst := &Instance{}
-		var enabled int
-		var configJSON string
-		var lastEvent sql.NullTime
-		if err := rows.Scan(&inst.ID, &inst.Provider, &inst.Name, &enabled, &inst.Mode, &inst.Status, &configJSON, &lastEvent, &inst.LastError, &inst.CreatedAt, &inst.UpdatedAt); err != nil {
-			return nil, err
-		}
-		inst.Enabled = enabled == 1
-		plain, err := m.decryptConfig(configJSON)
+		inst, err := m.scanInstance(rows)
 		if err != nil {
-			return nil, fmt.Errorf("解密实例 %q config 失败: %w", inst.Name, err)
-		}
-		inst.Config = json.RawMessage(plain)
-		if lastEvent.Valid {
-			inst.LastEventAt = lastEvent.Time
+			return nil, err
 		}
 		list = append(list, inst)
 	}
@@ -264,12 +271,17 @@ func (m *Manager) ListLive(ctx context.Context) ([]*Instance, error) {
 	return list, nil
 }
 
-func (m *Manager) Get(ctx context.Context, name string) (*Instance, error) {
-	row := m.db.QueryRowContext(ctx,
-		`SELECT id, provider, name, enabled, mode, status, config_json, last_event_at, last_error, created_at, updated_at
-		 FROM platform_instances WHERE name = ?`,
-		name,
-	)
+// rowScanner 抽象 *sql.Row 与 *sql.Rows 的共同扫描能力，供 scanInstance 统一消费。
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// instanceColumns 是 platform_instances 的固定读取列序（Get/GetByID/List 共享）。
+const instanceColumns = `id, provider, name, enabled, mode, status, config_json, last_event_at, last_error, created_at, updated_at`
+
+// scanInstance 把一行 platform_instances 结果扫描为 *Instance 并解密 config，
+// 消除 Get/GetByID/List 三处逐字重复的扫描 + 解密逻辑。
+func (m *Manager) scanInstance(row rowScanner) (*Instance, error) {
 	inst := &Instance{}
 	var enabled int
 	var configJSON string
@@ -289,14 +301,51 @@ func (m *Manager) Get(ctx context.Context, name string) (*Instance, error) {
 	return inst, nil
 }
 
+// getBy 按唯一列读取单条实例。column 只来自 Get/GetByID 的编译期常量（"name"/"id"），
+// 非外部输入，拼接安全。by-name 与 by-id 仅差查找键，共享同一读取内核。
+func (m *Manager) getBy(ctx context.Context, column, value string) (*Instance, error) {
+	row := m.db.QueryRowContext(ctx,
+		`SELECT `+instanceColumns+` FROM platform_instances WHERE `+column+` = ?`,
+		value,
+	)
+	return m.scanInstance(row)
+}
+
+func (m *Manager) Get(ctx context.Context, name string) (*Instance, error) {
+	return m.getBy(ctx, "name", name)
+}
+
+func (m *Manager) GetByID(ctx context.Context, id string) (*Instance, error) {
+	return m.getBy(ctx, "id", id)
+}
+
+// prepareInstanceWrite 校验实例写入字段并返回归一化的 mode 与加密后的 config JSON。
+// by-name(Upsert) 与 by-id(UpdateByID) 两条写入路径共享此内核：相同的必填校验、
+// provider→mode 解析、明文 config 静态加密（box 为 nil 时原样存明文）。
+func (m *Manager) prepareInstanceWrite(inst *Instance) (mode, storedConfig string, err error) {
+	if inst.Name == "" || inst.Provider == "" {
+		return "", "", fmt.Errorf("provider 和 name 不能为空")
+	}
+	mode, err = modeForProvider(inst.Provider)
+	if err != nil {
+		return "", "", err
+	}
+	plainConfig := string(inst.Config)
+	if plainConfig == "" {
+		plainConfig = "{}"
+	}
+	storedConfig, err = m.encryptConfig(plainConfig)
+	if err != nil {
+		return "", "", fmt.Errorf("加密实例 %q config 失败: %w", inst.Name, err)
+	}
+	return mode, storedConfig, nil
+}
+
 func (m *Manager) Upsert(ctx context.Context, inst *Instance) error {
 	if inst.ID == "" {
 		inst.ID = "pi-" + idgen.ShortID()
 	}
-	if inst.Name == "" || inst.Provider == "" {
-		return fmt.Errorf("provider 和 name 不能为空")
-	}
-	mode, err := modeForProvider(inst.Provider)
+	mode, storedConfig, err := m.prepareInstanceWrite(inst)
 	if err != nil {
 		return err
 	}
@@ -306,16 +355,6 @@ func (m *Manager) Upsert(ctx context.Context, inst *Instance) error {
 		inst.CreatedAt = now
 	}
 	inst.UpdatedAt = now
-
-	// 落库前对明文 config JSON 做静态加密（box 为 nil 时原样存明文）。
-	plainConfig := string(inst.Config)
-	if plainConfig == "" {
-		plainConfig = "{}"
-	}
-	storedConfig, err := m.encryptConfig(plainConfig)
-	if err != nil {
-		return fmt.Errorf("加密实例 %q config 失败: %w", inst.Name, err)
-	}
 
 	_, err = m.db.ExecContext(ctx,
 		`INSERT INTO platform_instances (id, provider, name, enabled, mode, status, config_json, last_error, created_at, updated_at)
@@ -329,6 +368,34 @@ func (m *Manager) Upsert(ctx context.Context, inst *Instance) error {
 		inst.ID, inst.Provider, inst.Name, boolToInt(inst.Enabled), inst.Mode, StatusStopped, storedConfig, inst.LastError, inst.CreatedAt, inst.UpdatedAt,
 	)
 	return err
+}
+
+func (m *Manager) UpdateByID(ctx context.Context, id string, inst *Instance) error {
+	if id == "" {
+		return fmt.Errorf("id 不能为空")
+	}
+	mode, storedConfig, err := m.prepareInstanceWrite(inst)
+	if err != nil {
+		return err
+	}
+
+	res, err := m.db.ExecContext(ctx,
+		`UPDATE platform_instances
+		 SET provider = ?, name = ?, enabled = ?, mode = ?, status = ?, config_json = ?, last_error = ?, updated_at = ?
+		 WHERE id = ?`,
+		inst.Provider, inst.Name, boolToInt(inst.Enabled), mode, StatusStopped, storedConfig, inst.LastError, time.Now(), id,
+	)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // EncryptExistingAtRest 把库里仍是明文（无 enc:v1: 前缀）的 config_json 就地重写为密文。
@@ -410,6 +477,14 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 	return nil
 }
 
+func (m *Manager) DeleteByID(ctx context.Context, id string) error {
+	inst, err := m.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	return m.Delete(ctx, inst.Name)
+}
+
 func (m *Manager) StartEnabled(ctx context.Context) error {
 	instances, err := m.List(ctx)
 	if err != nil {
@@ -435,15 +510,25 @@ func (m *Manager) Start(ctx context.Context, name string) error {
 	_, alreadyRunning := m.running[name]
 	_, alreadyInbound := m.inbound[name]
 	handler := m.handler
+	buildAdapter := m.buildAdapter
+	disabled := m.disabledProviders[strings.ToLower(inst.Provider)]
 	m.mu.RUnlock()
 	if alreadyRunning || alreadyInbound {
 		return nil
 	}
+	if disabled {
+		err := fmt.Errorf("provider %s 已被启动策略禁用", inst.Provider)
+		_ = m.setStatus(ctx, name, StatusError, err.Error())
+		return err
+	}
 	if handler == nil {
 		return fmt.Errorf("instance message handler 未设置")
 	}
+	if buildAdapter == nil {
+		buildAdapter = BuildAdapter
+	}
 
-	adp, err := BuildAdapter(inst)
+	adp, err := buildAdapter(inst)
 	if err != nil {
 		_ = m.setStatus(ctx, name, StatusError, err.Error())
 		return err
@@ -463,7 +548,7 @@ func (m *Manager) Start(ctx context.Context, name string) error {
 		return m.setStatus(ctx, name, StatusRunning, "")
 	}
 
-	if err := adp.Start(ctx, wrapped); err != nil {
+	if err := safeStartAdapter(ctx, adp, wrapped); err != nil {
 		_ = m.setStatus(ctx, name, StatusError, err.Error())
 		return err
 	}
@@ -473,6 +558,15 @@ func (m *Manager) Start(ctx context.Context, name string) error {
 	m.metadata[name] = inst
 	m.mu.Unlock()
 	return m.setStatus(ctx, name, StatusRunning, "")
+}
+
+func safeStartAdapter(ctx context.Context, adp adapter.Adapter, handler adapter.MessageHandler) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("adapter %s start panic: %v", adp.Name(), r)
+		}
+	}()
+	return adp.Start(ctx, handler)
 }
 
 func (m *Manager) Stop(ctx context.Context, name string) error {
@@ -868,16 +962,62 @@ func BuildAdapter(inst *Instance) (adapter.Adapter, error) {
 			AccessToken:   cfg.AccessToken,
 			UserID:        cfg.UserID,
 		}), nil
+	case "email":
+		cfg, err := emailConfigFromRaw(inst.Config)
+		if err != nil {
+			return nil, err
+		}
+		return email.New(cfg), nil
 	default:
 		return nil, fmt.Errorf("unsupported provider %q", inst.Provider)
 	}
+}
+
+func emailConfigFromRaw(raw json.RawMessage) (email.EmailConfig, error) {
+	var cfg email.EmailConfig
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return cfg, err
+		}
+	}
+	if cfg.SMTP.Host != "" || cfg.IMAP.Host != "" {
+		return cfg, nil
+	}
+
+	var flat struct {
+		Email        string `json:"email"`
+		Password     string `json:"password"`
+		From         string `json:"from"`
+		SMTPHost     string `json:"smtp_host"`
+		SMTPPort     string `json:"smtp_port"`
+		IMAPHost     string `json:"imap_host"`
+		IMAPPort     string `json:"imap_port"`
+		PollInterval int    `json:"poll_interval"`
+		MaxFetch     int    `json:"max_fetch"`
+	}
+	if err := json.Unmarshal(raw, &flat); err != nil {
+		return cfg, err
+	}
+	cfg.SMTP.Host = strings.TrimSpace(flat.SMTPHost)
+	cfg.SMTP.Port = atoiDefault(flat.SMTPPort, 0)
+	cfg.SMTP.Username = strings.TrimSpace(flat.Email)
+	cfg.SMTP.Password = flat.Password
+	cfg.SMTP.From = firstNonEmpty(flat.From, flat.Email)
+	cfg.IMAP.Host = strings.TrimSpace(flat.IMAPHost)
+	cfg.IMAP.Port = atoiDefault(flat.IMAPPort, 0)
+	cfg.IMAP.Username = strings.TrimSpace(flat.Email)
+	cfg.IMAP.Password = flat.Password
+	cfg.IMAP.TLS = true
+	cfg.PollInterval = flat.PollInterval
+	cfg.MaxFetch = flat.MaxFetch
+	return cfg, nil
 }
 
 func modeForProvider(provider string) (string, error) {
 	switch provider {
 	case "wecom", "wechat", "slack", "line", "whatsapp":
 		return "webhook", nil
-	case "feishu", "dingtalk", "telegram", "discord", "matrix":
+	case "feishu", "dingtalk", "telegram", "discord", "matrix", "email":
 		return "runtime", nil
 	default:
 		return "", fmt.Errorf("unsupported provider %q", provider)
@@ -896,4 +1036,25 @@ func boolToInt(v bool) int {
 		return 1
 	}
 	return 0
+}
+
+func atoiDefault(s string, fallback int) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return fallback
+	}
+	var n int
+	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
+		return fallback
+	}
+	return n
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }

@@ -157,15 +157,11 @@ func TestHandleListConnections(t *testing.T) {
 // TestConnectionCapabilities 单测 provider → capabilities 推导。
 func TestConnectionCapabilities(t *testing.T) {
 	// IM 平台已接入 instances.Manager → 可收可发。
-	for _, p := range []string{"feishu", "dingtalk", "discord", "telegram", "wecom", "wechat"} {
+	for _, p := range []string{"feishu", "dingtalk", "discord", "telegram", "wecom", "wechat", "slack", "line", "whatsapp", "matrix", "email"} {
 		caps := connectionCapabilities(p)
 		if len(caps) != 2 || caps[0] != "receive" || caps[1] != "send" {
 			t.Fatalf("%s capabilities 应为 [receive send]，实际 %v", p, caps)
 		}
-	}
-	// email 发件未接入 instances.Manager（BuildAdapter/modeForProvider 均无 email）→ 仅 receive（BUG-20260625 §3-5）。
-	if caps := connectionCapabilities("email"); len(caps) != 1 || caps[0] != "receive" {
-		t.Fatalf("email capabilities 应为 [receive]（发件未接入），实际 %v", caps)
 	}
 	if caps := connectionCapabilities("unknown"); len(caps) != 0 {
 		t.Fatalf("未知 provider capabilities 应为空切片，实际 %v", caps)
@@ -211,6 +207,10 @@ func TestHandleConnectionsTest_IMFieldValidation(t *testing.T) {
 		{"discord 空 token", `{"type":"discord","config":{"token":""}}`},
 		{"wecom 空凭据", `{"type":"wecom","config":{"corp_id":"","secret":""}}`},
 		{"wechat 空凭据", `{"type":"wechat","config":{"app_id":"","app_secret":""}}`},
+		{"slack 空凭据", `{"type":"slack","config":{"token":"","signing_secret":""}}`},
+		{"line 空凭据", `{"type":"line","config":{"channel_secret":"","channel_token":""}}`},
+		{"whatsapp 空凭据", `{"type":"whatsapp","config":{"token":"","phone_id":""}}`},
+		{"matrix 空凭据", `{"type":"matrix","config":{"homeserver_url":"","access_token":"","user_id":""}}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -222,14 +222,6 @@ func TestHandleConnectionsTest_IMFieldValidation(t *testing.T) {
 				t.Fatal("失败时 detail 不应为空")
 			}
 		})
-	}
-}
-
-// TestHandleConnectionsTest_DingtalkFieldsPresent 验证字段齐备时钉钉（仅字段校验）返回成功。
-func TestHandleConnectionsTest_DingtalkFieldsPresent(t *testing.T) {
-	resp := postConnectionsTest(t, `{"type":"dingtalk","config":{"app_key":"k","app_secret":"s","robot_code":"r"}}`)
-	if !resp.OK {
-		t.Fatalf("字段齐备时钉钉应通过字段校验，得到 ok=false detail=%q", resp.Detail)
 	}
 }
 

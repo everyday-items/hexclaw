@@ -96,10 +96,11 @@ func TestManager_HandleGenericWebhook(t *testing.T) {
 	mgr.Init(ctx)
 
 	mgr.Register(ctx, &Webhook{
-		Name:   "test",
-		Type:   TypeGeneric,
-		Prompt: "处理事件",
-		UserID: "user-1",
+		Name:    "test",
+		Type:    TypeGeneric,
+		Prompt:  "处理事件",
+		UserID:  "user-1",
+		Enabled: true, // 派发路径测试：显式启用（默认未启用）
 	})
 
 	var handled atomic.Int32
@@ -145,11 +146,12 @@ func TestManager_EventTriggerCarriesJobID(t *testing.T) {
 	mgr.Init(ctx)
 
 	if err := mgr.Register(ctx, &Webhook{
-		Name:   "trigger",
-		Type:   TypeGeneric,
-		Prompt: "unused when job bound",
-		JobID:  "job-42",
-		UserID: "user-1",
+		Name:    "trigger",
+		Type:    TypeGeneric,
+		Prompt:  "unused when job bound",
+		JobID:   "job-42",
+		UserID:  "user-1",
+		Enabled: true, // 派发路径测试：显式启用（默认未启用）
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -193,11 +195,12 @@ func TestManager_GitHubSignatureVerification(t *testing.T) {
 
 	secret := "my-github-secret"
 	mgr.Register(ctx, &Webhook{
-		Name:   "github",
-		Type:   TypeGitHub,
-		Secret: secret,
-		Prompt: "分析 PR",
-		UserID: "user-1",
+		Name:    "github",
+		Type:    TypeGitHub,
+		Secret:  secret,
+		Prompt:  "分析 PR",
+		UserID:  "user-1",
+		Enabled: true, // 派发路径测试：显式启用（默认未启用）
 	})
 	mgr.SetHandler(func(_ context.Context, _ *Event, _ string) error { return nil })
 

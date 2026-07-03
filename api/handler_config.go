@@ -149,6 +149,11 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// cfgMu 串行 read-copy-save-apply（GO-7）：与其它配置写 handler 的浅拷贝读/
+	// 字段写同址竞争 + lost-update。
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+
 	oldLLM := s.cfg.LLM
 	nextLLM := oldLLM
 
