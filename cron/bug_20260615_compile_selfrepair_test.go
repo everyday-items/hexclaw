@@ -77,7 +77,9 @@ run()`
 		`{"runtime":"starlark","script":"` + escapeJSON(badRegexEscape) + `"}`,
 	}}
 	c := NewLLMCompilerStatic(seq, "nemotron")
-	spec, err := c.Compile(context.Background(), "采集百度热搜", CompileHints{})
+	// 百度热搜采集类 prompt 自 BUG-20260704 起命中确定性模板不走 LLM，
+	// 本测试对象是正则转义的确定性修复链，换用非模板数据源。
+	spec, err := c.Compile(context.Background(), "采集微博热搜", CompileHints{})
 	if err != nil {
 		t.Fatalf("regex escape deterministic repair should recover after LLM repair: %v", err)
 	}

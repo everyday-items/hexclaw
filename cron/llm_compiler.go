@@ -738,6 +738,7 @@ func buildCompileSystemPrompt(hints CompileHints) string {
 2. **URL 逐字使用**：用户给定 URL 不得臆造/改写。http_get 已自动跟随重定向。
 3. **每次请求校验状态码**：http_get/http_post 后检查 resp["status"]，**非 2xx 一律 emit status=error** 并附状态码，禁止"发了就当成功"。
 4. **优先解析内嵌结构化数据**：优先 json_decode 页面内嵌 JSON（如 <!--s-data:...-->、window.__INITIAL_STATE__），而非易变的 CSS class。
+5. **提取失败必须自描述**：当解码出的结构里找不到目标条目时，error 里必须附带实际的结构线索——已解码 dict 的顶层 keys（keys = []，for k in data: keys.append(k)，再 ",".join(keys)）；正文层面失败（找不到内嵌 JSON 块）则附 body 前 200 字符。**禁止**只输出 "no items found" 这类无线索错误：任务失败后的自动修复（自愈重编译）完全依赖这些线索定位真实数据路径，无线索 = 永远修不好。
 
 # 完整范例（采集网页榜单）
 def run():
@@ -747,7 +748,7 @@ def run():
         return {"status": "error", "error": "fetch non-2xx: %d" % resp["status"]}
     blocks = re_findall("(?s)<!--data:(.*?)-->", resp["body"])
     if len(blocks) == 0:
-        return {"status": "error", "error": "data block missing"}
+        return {"status": "error", "error": "data block missing; body head: " + resp["body"][:200]}
     data = json_decode(blocks[0])
     titles = []
     seen = {}
@@ -757,7 +758,10 @@ def run():
             seen[t] = True
             titles.append(t)
     if len(titles) == 0:
-        return {"status": "error", "error": "no items extracted"}
+        keys = []
+        for k in data:
+            keys.append(k)
+        return {"status": "error", "error": "no items extracted; top-level keys: " + ",".join(keys)}
     lines = []
     for i in range(len(titles)):
         lines.append("%d. %s" % (i + 1, titles[i]))

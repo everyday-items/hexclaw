@@ -32,6 +32,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
 	sign_ "github.com/hexagon-codes/toolkit/crypto/sign"
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
@@ -63,7 +64,15 @@ func New(cfg config.DingtalkConfig) *DingtalkAdapter {
 
 type dingtalkOpenAPI interface {
 	GetAccessToken(ctx context.Context, appKey, appSecret string) (string, time.Duration, error)
-	SendOTO(ctx context.Context, accessToken, robotCode, userID, text string) error
+	SendOTO(ctx context.Context, accessToken, robotCode, userID string, msg dingtalkOutboundMessage) error
+}
+
+// dingtalkOutboundMessage 是钉钉出站消息的传输形态：MsgKey 选择消息类型
+// （sampleText / sampleMarkdown），MsgParam 为对应 JSON 载荷。消息类型策略在
+// 适配器层决定，接口只负责传输（可测缝，BUG-20260703 B7）。
+type dingtalkOutboundMessage struct {
+	MsgKey   string
+	MsgParam string
 }
 
 const dingtalkThinkingFeedback = "⌨️ 已收到，正在思考…"
@@ -138,13 +147,13 @@ func (c *officialDingtalkOpenAPI) GetAccessToken(_ context.Context, appKey, appS
 	return *resp.Body.AccessToken, expire, nil
 }
 
-func (c *officialDingtalkOpenAPI) SendOTO(_ context.Context, accessToken, robotCode, userID, text string) error {
+func (c *officialDingtalkOpenAPI) SendOTO(_ context.Context, accessToken, robotCode, userID string, msg dingtalkOutboundMessage) error {
 	resp, err := c.robot.BatchSendOTOWithOptions(
 		(&dtrobot.BatchSendOTORequest{}).
 			SetRobotCode(robotCode).
 			SetUserIds([]*string{tea.String(userID)}).
-			SetMsgKey("sampleText").
-			SetMsgParam(marshalTextContent(text)),
+			SetMsgKey(msg.MsgKey).
+			SetMsgParam(msg.MsgParam),
 		(&dtrobot.BatchSendOTOHeaders{}).SetXAcsDingtalkAccessToken(accessToken),
 		c.runtime,
 	)
@@ -368,10 +377,35 @@ func (a *DingtalkAdapter) sendReplyNow(ctx context.Context, chatID string, reply
 	if err != nil {
 		return fmt.Errorf("初始化钉钉官方 SDK 失败: %w", err)
 	}
-	if err := api.SendOTO(ctx, token, a.cfg.RobotCode, chatID, reply.Content); err != nil {
+	if err := api.SendOTO(ctx, token, a.cfg.RobotCode, chatID, dingtalkMarkdownMessage(reply.Content)); err != nil {
 		return fmt.Errorf("发送消息失败: %w", err)
 	}
 	return nil
+}
+
+// dingtalkMarkdownMessage 构造 sampleMarkdown 出站消息（BUG-20260703 B7）。
+//
+// 钉钉 text 消息不渲染 markdown，LLM 产出的 ### 标题/加粗会裸露给用户；
+// sampleMarkdown 原生渲染标题/加粗/链接/列表子集（纯文本内容按 markdown 发送
+// 显示不变）。载荷为 {"title","text"}，title 必填（用作推送通知摘要），从正文
+// 首个非空行派生并剥掉 markdown 标记。
+func dingtalkMarkdownMessage(content string) dingtalkOutboundMessage {
+	return dingtalkOutboundMessage{
+		MsgKey:   "sampleMarkdown",
+		MsgParam: marshalMarkdownContent(dingtalkMessageTitle(content), content),
+	}
+}
+
+// dingtalkMessageTitle 从正文派生 sampleMarkdown 必填的 title：取首个非空行，
+// 剥掉行首 markdown 标记（# > - * 及空白），按 rune 截断防超长。
+func dingtalkMessageTitle(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(line), "#>-*+ \t"))
+		if line != "" {
+			return stringx.Truncate(line, 30)
+		}
+	}
+	return "小蟹回复"
 }
 
 // SendStream 流式发送（拼接后一次性发送）
@@ -553,7 +587,9 @@ type dtEvent struct {
 	MsgType string `json:"msgtype"`
 }
 
-func marshalTextContent(text string) string {
-	b, _ := json.Marshal(map[string]string{"content": text})
+// marshalMarkdownContent 生成 sampleMarkdown 的 {"title","text"} 载荷
+// （与 sampleText 的 {"content"} 结构不同，两者不可混用）。
+func marshalMarkdownContent(title, text string) string {
+	b, _ := json.Marshal(map[string]string{"title": title, "text": text})
 	return string(b)
 }

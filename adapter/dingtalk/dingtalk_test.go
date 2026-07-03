@@ -44,7 +44,11 @@ type fakeDingtalkSendCall struct {
 	AccessToken string
 	RobotCode   string
 	UserID      string
-	Text        string
+	// Text 是从 MsgParam 载荷解出的正文（sampleText 的 content / sampleMarkdown 的 text），
+	// 便于既有断言与消息类型无关地校验内容。
+	Text     string
+	MsgKey   string
+	MsgParam string
 }
 
 func newFakeDingtalkOpenAPI(token string) *fakeDingtalkOpenAPI {
@@ -61,14 +65,25 @@ func (f *fakeDingtalkOpenAPI) GetAccessToken(_ context.Context, _, _ string) (st
 	return f.token, f.ttl, nil
 }
 
-func (f *fakeDingtalkOpenAPI) SendOTO(_ context.Context, accessToken, robotCode, userID, text string) error {
+func (f *fakeDingtalkOpenAPI) SendOTO(_ context.Context, accessToken, robotCode, userID string, msg dingtalkOutboundMessage) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	var param struct {
+		Content string `json:"content"`
+		Text    string `json:"text"`
+	}
+	_ = json.Unmarshal([]byte(msg.MsgParam), &param)
+	body := param.Content
+	if body == "" {
+		body = param.Text
+	}
 	f.sendCalls = append(f.sendCalls, fakeDingtalkSendCall{
 		AccessToken: accessToken,
 		RobotCode:   robotCode,
 		UserID:      userID,
-		Text:        text,
+		Text:        body,
+		MsgKey:      msg.MsgKey,
+		MsgParam:    msg.MsgParam,
 	})
 	if len(f.sendErrs) > 0 {
 		err := f.sendErrs[0]
@@ -493,8 +508,9 @@ func TestGetAccessTokenExpired(t *testing.T) {
 	}
 }
 
-// TestMarshalTextContent 测试安全 JSON 序列化
-func TestMarshalTextContent(t *testing.T) {
+// TestMarshalMarkdownContent 测试出站 markdown 载荷的安全 JSON 序列化
+// （BUG-20260703 B7 后出站统一 sampleMarkdown，{"title","text"} 载荷）。
+func TestMarshalMarkdownContent(t *testing.T) {
 	tests := []struct {
 		input string
 	}{
@@ -508,13 +524,16 @@ func TestMarshalTextContent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			result := marshalTextContent(tt.input)
+			result := marshalMarkdownContent("标题", tt.input)
 			var parsed map[string]string
 			if err := json.Unmarshal([]byte(result), &parsed); err != nil {
-				t.Errorf("marshalTextContent(%q) 产生非法 JSON: %s", tt.input, result)
+				t.Errorf("marshalMarkdownContent(%q) 产生非法 JSON: %s", tt.input, result)
 			}
-			if parsed["content"] != tt.input {
-				t.Errorf("marshalTextContent(%q) 反序列化后不匹配: %q", tt.input, parsed["content"])
+			if parsed["text"] != tt.input {
+				t.Errorf("marshalMarkdownContent(%q) 反序列化后不匹配: %q", tt.input, parsed["text"])
+			}
+			if parsed["title"] != "标题" {
+				t.Errorf("title 不匹配: %q", parsed["title"])
 			}
 		})
 	}

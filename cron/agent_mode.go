@@ -530,6 +530,25 @@ func (s *Scheduler) maybeAlertAgentFailure(_ context.Context, job *Job, lastResu
 			job.Name, selfHealThreshold, clipForHeal(lastResult.Error, 120)))
 }
 
+// buildHealPrompt assembles the self-heal recompile prompt. It must carry the
+// FAILING script alongside the error text: with only the error, the compiler
+// regenerates another blind guess over the same data source and the heal never
+// converges (BUG-20260704 — a heal "succeeded" and the healed script failed
+// with the identical "no items found in data structure"). Seeing the exact
+// parse paths that already failed lets the LLM pick a different extraction
+// strategy, ideally driven by the structural evidence the error carries.
+func buildHealPrompt(job *Job, failCtx string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n\n[自愈上下文] 该任务此前编译的脚本已连续失败 %d 次，最近错误：\n%s\n",
+		job.SourcePrompt, selfHealThreshold, failCtx)
+	if job.Spec != nil && strings.TrimSpace(job.Spec.Script) != "" {
+		fmt.Fprintf(&b, "\n[已失败的脚本] 以下脚本的解析路径已被证明与数据源实际返回结构不符，禁止原样复用其字段路径；请优先依据错误信息中的结构线索（如 keys 列表）定位真实数据路径，改用不同的提取策略：\n%s\n",
+			clipForHeal(job.Spec.Script, 4000))
+	}
+	b.WriteString("\n请根据错误原因生成修正后的脚本。")
+	return b.String()
+}
+
 // maybeSelfHeal is the self-heal bridge: after a script job fails
 // selfHealThreshold times in a row (counting only runs newer than the last
 // successful heal), recompile the script once with the failure context.
@@ -569,10 +588,7 @@ func (s *Scheduler) maybeSelfHeal(ctx context.Context, job *Job, lastResult *Run
 	if lastResult.Stderr != "" {
 		failCtx += "\nstderr: " + clipForHeal(lastResult.Stderr, 500)
 	}
-	enriched := fmt.Sprintf(
-		"%s\n\n[自愈上下文] 该任务此前编译的脚本已连续失败 %d 次，最近错误：\n%s\n请根据错误原因生成修正后的脚本。",
-		job.SourcePrompt, selfHealThreshold, failCtx,
-	)
+	enriched := buildHealPrompt(job, failCtx)
 
 	slog.Info("[cron-heal] triggering self-heal recompile", "source", "cron", "id", job.ID, "name", job.Name)
 	compileCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)

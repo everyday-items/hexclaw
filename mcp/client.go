@@ -460,10 +460,12 @@ func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string
 	// Copy the tool reference under lock, then release before executing
 	m.mu.RLock()
 	var found hexagon.Tool
-	for _, server := range m.servers {
+	var owner string // 属主 server 名——进程死亡时用于翻转其连接状态
+	for name, server := range m.servers {
 		for _, t := range server.tools {
 			if t.Name() == toolName {
 				found = t
+				owner = name
 				break
 			}
 		}
@@ -482,12 +484,33 @@ func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string
 		// stdio MCP 子进程退出（多因数据源连不上而自退）→ 传输层抛 EOF/连接已关，对用户是天书。
 		// 翻译成可操作的友好提示；底层传输错误只进日志，不糊用户脸上（bug-20260626 #3c）。
 		if isMCPConnClosed(err) {
-			logger.Error("MCP 工具调用失败：连接已关闭/进程退出", "tool", toolName, "error", err)
+			logger.Error("MCP 工具调用失败：连接已关闭/进程退出", "tool", toolName, "server", owner, "error", err)
+			// BUG-20260704：识别到进程退出必须同步翻转属主 server 的连接状态——
+			// 否则 ServerStatuses 谎报「已连接」（UI 徽章事实源），且 tryReconnect 因
+			// connected 仍为 true 永远跳过该 server，不自愈。翻转后下个 30s tick 自动重拉。
+			m.markServerDisconnected(ctx, owner, "stdio process exited (detected on tool call)")
 			return "", fmt.Errorf("工具 %q 执行失败: MCP 服务进程已退出，请检查数据库连接配置（主机/端口/账号/密码）后重试", toolName)
 		}
 		return "", fmt.Errorf("工具 %q 执行失败: %w", toolName, err)
 	}
 	return result.String(), nil
+}
+
+// markServerDisconnected 把指定 server 标记为断连（幂等）：状态即刻对 ServerStatuses
+// 可见，tryReconnect 下个 tick 会尝试重连。仅在状态真实翻转时触发 lifecycle hook。
+func (m *Manager) markServerDisconnected(ctx context.Context, name, reason string) {
+	if name == "" {
+		return
+	}
+	m.mu.Lock()
+	server, ok := m.servers[name]
+	if !ok || !server.connected {
+		m.mu.Unlock()
+		return
+	}
+	server.connected = false
+	m.mu.Unlock()
+	m.hooks.fireDisconnected(ctx, name, reason)
 }
 
 // isMCPConnClosed 判断错误是否源自 MCP stdio 子进程退出 / 传输层关闭。

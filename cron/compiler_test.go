@@ -212,7 +212,9 @@ func TestLLMCompiler_DisablesThinkingForStructuredCompile(t *testing.T) {
 		},
 	}
 	c := NewLLMCompilerStatic(fp, "Qwen/Qwen3.6-35B-A3B")
-	if _, err := c.Compile(context.Background(), "每天采集百度热搜", CompileHints{}); err != nil {
+	// 百度热搜采集类 prompt 自 BUG-20260704 起命中确定性模板不走 LLM，
+	// 本测试对象是 LLM 请求的 thinking 元数据，换用非模板数据源。
+	if _, err := c.Compile(context.Background(), "每天采集微博热搜", CompileHints{}); err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
 	if fp.last == nil {
