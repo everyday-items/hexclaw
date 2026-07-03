@@ -9,8 +9,7 @@
 // 下执行。Checkpoint：每次文件写入 / Skill patch / 配置修改前生成 fs 快照（基于
 // path + mtime + sha256 的轻量记录），失败时按 checkpoint 回滚 untracked 变更。
 //
-// flag runtime.sandbox.v1 默认 OFF：未启用时所有方法返回 ErrSandboxDisabled，
-// 调用方走原"无沙箱直接执行"路径。
+// flag runtime.sandbox.v1 默认 ON：功能优先启用 sandbox/checkpoint 能力。
 package runtime
 
 import (
@@ -34,15 +33,15 @@ import (
 	"github.com/hexagon-codes/hexclaw/featureflag"
 )
 
-// FlagRuntimeSandboxV1 控制 H4 sandbox+checkpoint 是否启用。alpha 默认 OFF。
+// FlagRuntimeSandboxV1 控制 H4 sandbox+checkpoint 是否启用。
 const FlagRuntimeSandboxV1 = "runtime.sandbox.v1"
 
 func init() {
 	featureflag.Register(featureflag.Flag{
 		Name:         FlagRuntimeSandboxV1,
-		Default:      true, // alpha 强制 OFF
+		Default:      true,
 		Description:  "Enable H4 Sandbox provider (process/docker/remote) + Checkpoint snapshot/rollback for high-risk operations.",
-		Stage:        featureflag.StageAlpha,
+		Stage:        featureflag.StageGA,
 		SinceVersion: "0.4.0",
 	})
 }

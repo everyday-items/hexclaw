@@ -1,0 +1,161 @@
+name: Sandbox CodeExec
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/sandbox-code-exec.yml"
+      - "go.mod"
+      - "go.sum"
+      - "skill/builtin/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/sandbox-code-exec.yml"
+      - "go.mod"
+      - "go.sum"
+      - "skill/builtin/**"
+  workflow_dispatch:
+    inputs:
+      toolkit_ref:
+        description: "hexagon-codes/toolkit ref to test with"
+        required: false
+        default: "main"
+      run_live_network:
+        description: "Run live network code_exec crawler checks on Linux/macOS"
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sandbox-code-exec-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.toolkit_ref || 'main' }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.25"
+  GOPRIVATE: github.com/hexagon-codes/*
+  TOOLKIT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.toolkit_ref || 'main' }}
+  RUN_LIVE_NETWORK: ${{ github.event_name != 'workflow_dispatch' || inputs.run_live_network == 'true' }}
+
+jobs:
+  workflow-lint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout hexclaw
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Run actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/sandbox-code-exec.yml
+
+  sandbox-code-exec:
+    name: ${{ matrix.name }}
+    needs: workflow-lint
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux sandbox/code_exec
+            os: ubuntu-22.04
+            live_network: "1"
+          - name: macOS sandbox/code_exec
+            os: macos-latest
+            live_network: "1"
+          - name: Windows sandbox/code_exec
+            os: windows-latest
+            live_network: "0"
+
+    steps:
+      - name: Checkout hexclaw
+        uses: actions/checkout@v4
+        with:
+          path: hexclaw
+
+      - name: Checkout toolkit
+        uses: actions/checkout@v4
+        with:
+          repository: hexagon-codes/toolkit
+          ref: ${{ env.TOOLKIT_REF }}
+          path: toolkit
+          token: ${{ secrets.PRIVATE_REPO_TOKEN || github.token }}
+
+      - name: Configure private modules
+        shell: pwsh
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          if ($env:PRIVATE_REPO_TOKEN) {
+            git config --global url."https://$env:PRIVATE_REPO_TOKEN@github.com/".insteadOf "https://github.com/"
+          }
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            hexclaw/go.sum
+            toolkit/go.sum
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Linux sandbox dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap util-linux python3 python3-pip nodejs npm
+
+      - name: Probe Linux sandbox backend
+        if: runner.os == 'Linux'
+        run: |
+          bwrap --version
+          unshare --version
+
+      - name: Create Go workspace
+        run: go work init ./hexclaw ./toolkit
+
+      - name: Verify toolchain
+        run: |
+          go version
+          python --version
+          node --version
+          go env GOPATH GOMODCACHE GOCACHE
+
+      - name: Test toolkit sandbox
+        working-directory: toolkit
+        run: go test -v -count=1 -timeout 240s ./os/sandbox
+
+      - name: Test hexclaw code_exec
+        working-directory: hexclaw
+        env:
+          HEXCLAW_P0_SANDBOX_PROOF: "1"
+        run: go test -v -count=1 -timeout 360s ./skill/builtin -run 'TestCodeExecSkill_|TestDetectMissingPackages|TestBuildInstallCommand|TestSandboxP0_StaticGapMatrix'
+
+      - name: Test macOS connector readable paths
+        if: runner.os == 'macOS'
+        working-directory: hexclaw
+        run: go test -v -count=1 -timeout 180s ./skill/builtin -run 'TestBug20260626_CodeExecReadsConnectorAuthorizedDir'
+
+      - name: Test live code_exec crawler network policy
+        if: matrix.live_network == '1' && env.RUN_LIVE_NETWORK == 'true'
+        working-directory: hexclaw
+        env:
+          HEXCLAW_CODE_EXEC_LIVE_NETWORK: "1"
+        run: go test -v -count=1 -timeout 180s ./skill/builtin -run 'TestCodeExecSkill_Execute_PythonCrawlerNetworkPolicy'

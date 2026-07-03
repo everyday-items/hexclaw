@@ -56,7 +56,7 @@ func TestBug20260626_CodeExecReadsConnectorAuthorizedDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("code_exec 执行失败: %v", err)
 	}
-	got := trimSpace(res.Content)
+	got := firstOutputLine(res.Content)
 	if got != "True True" {
 		t.Fatalf("连接器授权目录应可被 code_exec 读到，期望 'True True' 实得 %q", got)
 	}
@@ -64,15 +64,11 @@ func TestBug20260626_CodeExecReadsConnectorAuthorizedDir(t *testing.T) {
 
 func pyStr(s string) string { return "\"" + s + "\"" }
 
-func trimSpace(s string) string {
-	// 去掉尾部换行/空白，避免 print 末尾 \n 干扰断言
-	for len(s) > 0 {
-		c := s[len(s)-1]
-		if c == '\n' || c == '\r' || c == ' ' || c == '\t' {
-			s = s[:len(s)-1]
-			continue
+func firstOutputLine(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' || s[i] == '\r' {
+			return s[:i]
 		}
-		break
 	}
 	return s
 }

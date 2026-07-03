@@ -30,6 +30,7 @@ type SkillDeps struct {
 	CfgWriter     *config.Writer
 	Workspace     string         // workspace dir for file ops (default ~/.hexclaw/workspace)
 	CodeExecSkill *CodeExecSkill // populated by RegisterAdvanced if code_exec enabled
+	FileAccess    *FileAccessBroker
 	// SandboxReadablePaths 额外授予 code_exec 沙箱只读访问的宿主路径（Workspace 之外）。
 	// 来源 = config.Skill.Sandbox.Filesystem.AllowedPaths（用户经数据连接器授权的本地目录）。
 	SandboxReadablePaths []string
@@ -105,6 +106,20 @@ func RegisterAll(registry *skill.DefaultRegistry, cfg config.BuiltinConfig) {
 // RegisterAdvanced registers skills that require external dependencies.
 // Called from main.go after all services are initialized.
 func RegisterAdvanced(registry *skill.DefaultRegistry, cfg config.BuiltinConfig, deps *SkillDeps) {
+	if cfg.FileOps {
+		broker := NewFileAccessBroker(deps.SandboxReadablePaths)
+		if err := registry.Register(NewListDirectorySkill(broker)); err != nil {
+			logger.Error("注册 ListDirectorySkill 失败", "error", err)
+		}
+		if err := registry.Register(NewReadFileSkill(broker)); err != nil {
+			logger.Error("注册 ReadFileSkill 失败", "error", err)
+		}
+		if err := registry.Register(NewListAllowedDirectoriesSkill(broker)); err != nil {
+			logger.Error("注册 ListAllowedDirectoriesSkill 失败", "error", err)
+		}
+		deps.FileAccess = broker
+	}
+
 	if cfg.CodeExec {
 		ws := deps.Workspace
 		if ws == "" {
@@ -114,6 +129,11 @@ func RegisterAdvanced(registry *skill.DefaultRegistry, cfg config.BuiltinConfig,
 			Workspace: ws,
 			Timeout:   30,
 			Network:   cfg.CodeExecPolicy.CodeExecNetworkAllowed(),
+			// 允许外网但禁止本机回环：无人值守 agent 的 code_exec 需要抓网页/调 API，
+			// 但绝不该经 loopback 打本机管理端口（API server 自提权 / Ollama / 其它
+			// sidecar）——那是 SSRF 与权限自提升面（GO-1/GO-2）。darwin 经 seatbelt
+			// 强制；linux 目前 Network=true 不隔离 net namespace，回环仍可达（能力缺口）。
+			DenyLoopback: true,
 			// 用户经数据连接器授权的本地目录 → 沙箱只读放行，否则 code_exec 读不到（BUG-20260626）。
 			ReadablePaths: deps.SandboxReadablePaths,
 		}
@@ -122,6 +142,15 @@ func RegisterAdvanced(registry *skill.DefaultRegistry, cfg config.BuiltinConfig,
 			logger.Error("沙箱初始化失败，CodeExecSkill 不可用", "error", err)
 		} else {
 			codeExec := NewCodeExecSkill(sb, sbCfg)
+			// 集中文件访问裁决：mode=file/project 触达宿主机的路径须过 allow-list（fail-closed）。
+			// 复用 FileOps 已建的 broker；未建（FileOps 关闭）则按用户授权目录新建一个，
+			// 授权集为空时 code_exec 仅能在沙箱 workspace 内运行外部路径全部被拒。
+			broker := deps.FileAccess
+			if broker == nil {
+				broker = NewFileAccessBroker(deps.SandboxReadablePaths)
+				deps.FileAccess = broker
+			}
+			codeExec.SetFileAccess(broker)
 			if err := registry.Register(codeExec); err != nil {
 				logger.Error("注册 CodeExecSkill 失败", "error", err)
 			}
