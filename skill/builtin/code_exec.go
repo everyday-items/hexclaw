@@ -440,8 +440,13 @@ func prepareCodeExecRun(cfg sandbox.Config, req codeExecRequest, broker *FileAcc
 		if err != nil {
 			return codeExecRun{}, err
 		}
-		workspace = projectRoot
-		scratch = filepath.Join(codeExecScratchBase(), "hexclaw-sandbox-runs", runID)
+		if runtime.GOOS == "darwin" {
+			workspace = projectRoot
+			scratch = filepath.Join(codeExecScratchBase(), "hexclaw-sandbox-runs", runID)
+		} else {
+			scratch = filepath.Join(codeExecScratchBase(), "hexclaw-sandbox-runs", runID)
+			workspace = scratch
+		}
 	}
 
 	run := codeExecRun{
@@ -469,8 +474,10 @@ func prepareCodeExecRun(cfg sandbox.Config, req codeExecRequest, broker *FileAcc
 	}
 	run.Config = ensureCodeExecConfigDefaults(run.Config)
 	run.Config.ReadablePaths = append([]string(nil), cfg.ReadablePaths...)
-	run.Config.ReadablePaths = append(run.Config.ReadablePaths, base)
 	if req.Mode == "project" {
+		if filepath.Clean(run.Workspace) != filepath.Clean(projectRoot) {
+			run.Config.ReadablePaths = append(run.Config.ReadablePaths, projectRoot)
+		}
 		run.Config.ReadablePaths = append(run.Config.ReadablePaths, projectReadablePaths(projectRoot, broker)...)
 	}
 	if codeExecNeedsGoRuntime(req) {
@@ -655,7 +662,7 @@ func runSandboxCommand(ctx context.Context, sb sandbox.Sandbox, run codeExecRun,
 	if runtime.GOOS == "windows" {
 		return runWindowsSandboxCommand(ctx, sb, run, command, exports)
 	}
-	return runPosixSandboxCommand(ctx, sb, command, exports)
+	return runPosixSandboxCommandInDir(ctx, sb, run.ProjectRoot, command, exports)
 }
 
 func codeExecEnv(run codeExecRun) map[string]string {
@@ -712,6 +719,10 @@ func ensureCodeExecEnvDirs(exports map[string]string) error {
 }
 
 func runPosixSandboxCommand(ctx context.Context, sb sandbox.Sandbox, command []string, exports map[string]string) (*sandbox.ExecResult, error) {
+	return runPosixSandboxCommandInDir(ctx, sb, "", command, exports)
+}
+
+func runPosixSandboxCommandInDir(ctx context.Context, sb sandbox.Sandbox, projectRoot string, command []string, exports map[string]string) (*sandbox.ExecResult, error) {
 	var script strings.Builder
 	for _, k := range codeExecUnsetEnvKeys {
 		script.WriteString("unset ")
@@ -730,6 +741,11 @@ func runPosixSandboxCommand(ctx context.Context, sb sandbox.Sandbox, command []s
 		script.WriteString(shellQuote(exports[k]))
 		script.WriteString("\n")
 	}
+	if projectRoot != "" {
+		script.WriteString("cd ")
+		script.WriteString(shellQuote(projectRoot))
+		script.WriteString("\n")
+	}
 	script.WriteString("exec ")
 	script.WriteString(shellJoin(command))
 	return sb.Exec(ctx, "sh", []string{"-c", script.String()})
@@ -737,6 +753,7 @@ func runPosixSandboxCommand(ctx context.Context, sb sandbox.Sandbox, command []s
 
 func runWindowsSandboxCommand(ctx context.Context, sb sandbox.Sandbox, run codeExecRun, command []string, exports map[string]string) (*sandbox.ExecResult, error) {
 	var script strings.Builder
+	script.WriteString("@echo off\r\n")
 	for _, k := range codeExecUnsetEnvKeys {
 		script.WriteString("set \"")
 		script.WriteString(k)
@@ -753,6 +770,11 @@ func runWindowsSandboxCommand(ctx context.Context, sb sandbox.Sandbox, run codeE
 		script.WriteString("=")
 		script.WriteString(strings.ReplaceAll(exports[k], `"`, `\"`))
 		script.WriteString("\"\r\n")
+	}
+	if run.ProjectRoot != "" {
+		script.WriteString("cd /d ")
+		script.WriteString(windowsCmdQuote(run.ProjectRoot))
+		script.WriteString("\r\n")
 	}
 	script.WriteString(windowsCmdJoin(command))
 
@@ -772,6 +794,10 @@ func runWindowsSandboxCommand(ctx context.Context, sb sandbox.Sandbox, run codeE
 func buildCodeExecReport(req codeExecRequest, run codeExecRun, command []string, result *sandbox.ExecResult, execErr error, missingDeps []string) codeExecReport {
 	// 直接字段读写 sandbox.Config：编译器守契约，字段改名/删除会编译错，
 	// 不再走反射在发版构建下静默返回 0 导致限额在报告里蒸发。
+	cwd := run.Workspace
+	if run.ProjectRoot != "" {
+		cwd = run.ProjectRoot
+	}
 	report := codeExecReport{
 		RunID:             run.ID,
 		Mode:              req.Mode,
@@ -790,7 +816,7 @@ func buildCodeExecReport(req codeExecRequest, run codeExecRun, command []string,
 		Paths: map[string]string{
 			"run_root":     run.Root,
 			"workspace":    run.Scratch,
-			"cwd":          run.Workspace,
+			"cwd":          cwd,
 			"artifacts":    run.ArtifactDir,
 			"manifest":     run.ManifestPath,
 			"project_root": run.ProjectRoot,

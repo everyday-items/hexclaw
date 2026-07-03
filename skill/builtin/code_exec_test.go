@@ -58,6 +58,9 @@ func codeExecTestNeedsRealSandbox(name string) bool {
 
 func requireCodeExecSandbox(t *testing.T) {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("windows code_exec runtime integration depends on toolkit sandbox toolchain/device access")
+	}
 	if runtime.GOOS != "linux" || os.Getenv("HEXCLAW_P0_SANDBOX_PROOF") == "1" {
 		return
 	}
@@ -381,14 +384,16 @@ func TestCodeExecSkill_Execute_PythonShellCommandTask(t *testing.T) {
 	project := t.TempDir()
 	s := newTestCodeExecSkill(t)
 	code := strings.Join([]string{
+		"import os",
 		"from pathlib import Path",
 		"records = [('A', 3, 19), ('B', 2, 41), ('A', 5, 19), ('C', 7, 11)]",
 		"revenue = {}",
 		"for sku, qty, price in records:",
 		"    revenue[sku] = revenue.get(sku, 0) + qty * price",
 		"best = max(revenue, key=revenue.get)",
-		"Path('artifacts').mkdir(exist_ok=True)",
-		"Path('artifacts/python_shell_summary.txt').write_text(str(revenue))",
+		"artifact_dir = Path(os.environ['HEXCLAW_ARTIFACT_DIR'])",
+		"artifact_dir.mkdir(parents=True, exist_ok=True)",
+		"(artifact_dir / 'python_shell_summary.txt').write_text(str(revenue))",
 		"print(f'PY_SHELL_TASK_OK total={sum(revenue.values())} best={best}')",
 	}, "\n")
 	result, err := s.Execute(context.Background(), map[string]any{
