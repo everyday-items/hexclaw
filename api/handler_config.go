@@ -11,6 +11,7 @@ import (
 
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
@@ -491,4 +492,150 @@ func anyPriceToString(v any) string {
 	default:
 		return ""
 	}
+}
+
+// --- 记忆配置 API（BUG-20260703 P2-2：记忆设置桌面暴露面）---
+
+// fileMemoryConfigRuntime 引擎侧文件记忆配置热更接口（镜像 llmConfigRuntime 模式）。
+type fileMemoryConfigRuntime interface {
+	ActiveFileMemoryConfig() config.FileMemoryConfig
+	ReloadFileMemoryConfig(config.FileMemoryConfig)
+}
+
+// activeRecallRuntime 引擎侧主动会话召回接线接口（nil = 摘除）。
+type activeRecallRuntime interface {
+	SetActiveRecall(*engine.ActiveRecall)
+}
+
+// MemoryConfigResponse GET /api/v1/config/memory 响应
+type MemoryConfigResponse struct {
+	Enabled             bool    `json:"enabled"`               // 文件记忆总开关（只读展示；关闭需改配置文件并重启）
+	AutoMemory          string  `json:"auto_memory"`           // inline / extract / off（规范化后，热生效）
+	RecallMinScore      float64 `json:"recall_min_score"`      // 召回相关性地板 [0,1]，仅配 embedding 时生效（热生效）
+	ActiveRecall        bool    `json:"active_recall"`         // 回复前主动会话召回（生效值：未配 = 默认开；热生效）
+	Profile             bool    `json:"profile"`               // 周期画像蒸馏开关（重启后生效）
+	ProfileIntervalMins int     `json:"profile_interval_mins"` // 蒸馏间隔（只读展示）
+}
+
+// MemoryConfigUpdateRequest PUT /api/v1/config/memory 请求（字段级 patch 语义）
+type MemoryConfigUpdateRequest struct {
+	AutoMemory     *string  `json:"auto_memory"`
+	RecallMinScore *float64 `json:"recall_min_score"`
+	ActiveRecall   *bool    `json:"active_recall"`
+	Profile        *bool    `json:"profile"`
+}
+
+// normalizeAutoMemoryMode 与 engine.autoMemoryMode 的容错语义对齐：空/未知 → inline。
+func normalizeAutoMemoryMode(m string) string {
+	switch strings.ToLower(strings.TrimSpace(m)) {
+	case "extract":
+		return "extract"
+	case "off":
+		return "off"
+	default:
+		return "inline"
+	}
+}
+
+func memoryConfigResponse(fm config.FileMemoryConfig) MemoryConfigResponse {
+	return MemoryConfigResponse{
+		Enabled:             fm.Enabled,
+		AutoMemory:          normalizeAutoMemoryMode(fm.AutoMemory),
+		RecallMinScore:      fm.RecallMinScore,
+		ActiveRecall:        fm.ActiveRecall == nil || *fm.ActiveRecall,
+		Profile:             fm.Profile,
+		ProfileIntervalMins: fm.ProfileIntervalMins,
+	}
+}
+
+// handleGetMemoryConfig GET /api/v1/config/memory
+func (s *Server) handleGetMemoryConfig(w http.ResponseWriter, r *http.Request) {
+	fm := s.cfg.FileMemory
+	if runtime, ok := s.engine.(fileMemoryConfigRuntime); ok {
+		fm = runtime.ActiveFileMemoryConfig()
+	}
+	writeJSON(w, http.StatusOK, memoryConfigResponse(fm))
+}
+
+// handleUpdateMemoryConfig PUT /api/v1/config/memory
+//
+// 更新记忆行为配置并持久化到 ~/.hexclaw/hexclaw.yaml。auto_memory/recall_min_score/
+// active_recall 热生效（引擎调用时读取 + SetActiveRecall 接线）；profile 的后台蒸馏
+// goroutine 在 boot 期接线 → 落盘后重启生效，响应以 restart_required 如实告知。
+func (s *Server) handleUpdateMemoryConfig(w http.ResponseWriter, r *http.Request) {
+	var req MemoryConfigUpdateRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误: " + err.Error()})
+		return
+	}
+
+	if req.AutoMemory != nil {
+		switch strings.ToLower(strings.TrimSpace(*req.AutoMemory)) {
+		case "inline", "extract", "off":
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "auto_memory 无效：" + *req.AutoMemory + "（可选 inline / extract / off）",
+			})
+			return
+		}
+	}
+	if req.RecallMinScore != nil && (*req.RecallMinScore < 0 || *req.RecallMinScore > 1) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "recall_min_score 必须在 [0,1] 区间"})
+		return
+	}
+
+	// cfgMu 串行 read-copy-save-apply（GO-7 纪律，与 LLM 配置写 handler 一致）。
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+
+	nextFM := s.cfg.FileMemory
+	if runtime, ok := s.engine.(fileMemoryConfigRuntime); ok {
+		nextFM = runtime.ActiveFileMemoryConfig()
+	}
+	restartRequired := []string{}
+	if req.AutoMemory != nil {
+		nextFM.AutoMemory = strings.ToLower(strings.TrimSpace(*req.AutoMemory))
+	}
+	if req.RecallMinScore != nil {
+		nextFM.RecallMinScore = *req.RecallMinScore
+	}
+	if req.ActiveRecall != nil {
+		v := *req.ActiveRecall
+		nextFM.ActiveRecall = &v
+	}
+	if req.Profile != nil && *req.Profile != nextFM.Profile {
+		nextFM.Profile = *req.Profile
+		restartRequired = append(restartRequired, "profile")
+	}
+
+	nextCfg := *s.cfg
+	nextCfg.FileMemory = nextFM
+	if err := config.Save(&nextCfg, ""); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存配置失败: " + err.Error()})
+		return
+	}
+
+	// 热应用：引擎与 Server 共享同一 *config.Config，经引擎锁写入即全局生效；
+	// 无引擎热更接口（测试替身等）时兜底直写 Server 侧。
+	if runtime, ok := s.engine.(fileMemoryConfigRuntime); ok {
+		runtime.ReloadFileMemoryConfig(nextFM)
+	} else {
+		s.cfg.FileMemory = nextFM
+	}
+	if req.ActiveRecall != nil {
+		if runtime, ok := s.engine.(activeRecallRuntime); ok {
+			if *req.ActiveRecall && s.store != nil {
+				runtime.SetActiveRecall(engine.NewActiveRecall(s.store))
+			} else if !*req.ActiveRecall {
+				runtime.SetActiveRecall(nil)
+			}
+		}
+	}
+
+	logger.Info("记忆配置已更新并持久化", "restart_required", restartRequired)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":           "ok",
+		"config":           memoryConfigResponse(nextFM),
+		"restart_required": restartRequired,
+	})
 }

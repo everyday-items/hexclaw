@@ -559,6 +559,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("PUT /api/v1/config/llm", s.handleUpdateLLMConfig)
 	mux.HandleFunc("POST /api/v1/config/llm/test", s.handleTestLLMConfig)
 	mux.HandleFunc("POST /api/v1/config/llm/models", s.handleFetchProviderModels)
+	// 记忆行为配置（BUG-20260703 P2-2：auto_memory / 召回地板 / 主动召回 / 画像蒸馏）
+	mux.HandleFunc("GET /api/v1/config/memory", s.handleGetMemoryConfig)
+	mux.HandleFunc("PUT /api/v1/config/memory", s.handleUpdateMemoryConfig)
 
 	// A7 模型 tool_call 能力探测
 	if s.capabilities != nil {

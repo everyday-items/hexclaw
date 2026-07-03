@@ -8,10 +8,15 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/hexagon-codes/hexclaw/storage"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
+
+// maxSessionTitleRunes 会话标题上限（rune 计数，CJK 一字一计）。
+// 自动标题与用户改名共用该边界（BUG-20260703 P2b）。
+const maxSessionTitleRunes = 200
 
 // --- 会话管理 API ---
 
@@ -355,7 +360,21 @@ func (s *Server) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess.Title = req.Title
+	// BUG-20260703 P2b：标题不再原样入库——空/纯空白会把会话弄成不可辨识，
+	// 超长（粘贴整段文章）拖累列表渲染与索引。上限按 rune 计数（CJK 一字一计）。
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "标题不能为空"})
+		return
+	}
+	if utf8.RuneCountInString(title) > maxSessionTitleRunes {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("标题过长（最多 %d 字符）", maxSessionTitleRunes),
+		})
+		return
+	}
+
+	sess.Title = title
 	if err := s.store.UpdateSession(r.Context(), sess); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "更新会话失败: " + err.Error(),

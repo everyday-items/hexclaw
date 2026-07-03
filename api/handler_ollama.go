@@ -34,6 +34,47 @@ type OllamaModel struct {
 	Family   string `json:"family,omitempty"`
 	Params   string `json:"parameter_size,omitempty"`
 	Quant    string `json:"quantization_level,omitempty"`
+	// Capabilities 模型真实能力（BUG-20260704）：直接透出 Ollama /api/tags 上报的
+	// capabilities（如 completion / vision / tools / thinking），由前端映射为模态徽章。
+	// 此前前端只按模型名查静态表猜能力 → qwen3.5:9b 等视觉模型被误判为纯文本。
+	Capabilities []string `json:"capabilities,omitempty"`
+}
+
+// ollamaTagsResponse 是 Ollama GET /api/tags 的响应结构（含 capabilities，新版 Ollama 已上报）。
+type ollamaTagsResponse struct {
+	Models []struct {
+		Name         string   `json:"name"`
+		Size         int64    `json:"size"`
+		ModifiedAt   string   `json:"modified_at"`
+		Capabilities []string `json:"capabilities"`
+		Details      struct {
+			Family            string `json:"family"`
+			ParameterSize     string `json:"parameter_size"`
+			QuantizationLevel string `json:"quantization_level"`
+		} `json:"details"`
+	} `json:"models"`
+}
+
+// parseOllamaTags 把 /api/tags 响应体解析为 OllamaModel 列表（含真实 capabilities）。
+// 抽成纯函数便于单测；解析失败返回 nil（调用方保持列表为空，不 panic）。
+func parseOllamaTags(body []byte) []OllamaModel {
+	var result ollamaTagsResponse
+	if json.Unmarshal(body, &result) != nil {
+		return nil
+	}
+	models := make([]OllamaModel, 0, len(result.Models))
+	for _, m := range result.Models {
+		models = append(models, OllamaModel{
+			Name:         m.Name,
+			Size:         m.Size,
+			Modified:     m.ModifiedAt,
+			Family:       m.Details.Family,
+			Params:       m.Details.ParameterSize,
+			Quant:        m.Details.QuantizationLevel,
+			Capabilities: m.Capabilities,
+		})
+	}
+	return models
 }
 
 // handleOllamaStatus 探测本地 Ollama 服务状态 + 模型列表 + 版本 + 关联状态
@@ -65,34 +106,11 @@ func (s *Server) handleOllamaStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. 获取已下载模型列表 (GET /api/tags)
+	// 2. 获取已下载模型列表 (GET /api/tags)——含真实 capabilities（BUG-20260704）
 	if tResp, err := client.Get("http://localhost:11434/api/tags"); err == nil {
 		defer tResp.Body.Close()
 		body, _ := io.ReadAll(io.LimitReader(tResp.Body, 1<<20))
-		var result struct {
-			Models []struct {
-				Name       string `json:"name"`
-				Size       int64  `json:"size"`
-				ModifiedAt string `json:"modified_at"`
-				Details    struct {
-					Family            string `json:"family"`
-					ParameterSize     string `json:"parameter_size"`
-					QuantizationLevel string `json:"quantization_level"`
-				} `json:"details"`
-			} `json:"models"`
-		}
-		if json.Unmarshal(body, &result) == nil {
-			for _, m := range result.Models {
-				status.Models = append(status.Models, OllamaModel{
-					Name:     m.Name,
-					Size:     m.Size,
-					Modified: m.ModifiedAt,
-					Family:   m.Details.Family,
-					Params:   m.Details.ParameterSize,
-					Quant:    m.Details.QuantizationLevel,
-				})
-			}
-		}
+		status.Models = parseOllamaTags(body)
 		status.ModelCount = len(status.Models)
 	}
 
