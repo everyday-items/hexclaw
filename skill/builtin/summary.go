@@ -45,8 +45,17 @@ func (s *SummarySkill) ToolDefinition() llm.ToolDefinition {
 // the ingest half of the request.
 var kbIngestMarkers = []string{"知识库", "入库", "保存", "收藏", "加入知识", "knowledge base", "save to"}
 
+// summaryEchoRuneLimit 是抽取式摘要的「回声阈值」：不超过该长度的输入，
+// summarizeText 只会原样回吐（"摘要：<输入>"），毫无摘要价值。
+const summaryEchoRuneLimit = 80
+
 // Match matches summary keywords for the fast path, but yields to the LLM
-// tool-calling path when the message also expresses a KB-ingest intent.
+// tool-calling path when the message also expresses a KB-ingest intent, or
+// when it carries no substantial summarizable body (BUG-20260703 B4)。
+//
+// B4：剥掉触发词后的正文不超过回声阈值的请求（对话式指令/代词指代上文，如
+// "总结下乐知这家公司"），本地抽取式算法只能吐回声垃圾——必须让路 LLM 主路径
+// 带会话上下文作答。只有携带真正可摘要正文的消息保留快路径。
 func (s *SummarySkill) Match(content string) bool {
 	lower := strings.ToLower(strings.TrimSpace(content))
 	keywords := []string{"摘要", "总结", "概括", "summary", "summarize", "tldr", "tl;dr"}
@@ -65,7 +74,7 @@ func (s *SummarySkill) Match(content string) bool {
 			return false
 		}
 	}
-	return true
+	return utf8.RuneCountInString(extractSummaryText(content)) > summaryEchoRuneLimit
 }
 
 // Execute 执行摘要
@@ -97,7 +106,7 @@ func summarizeText(text string) string {
 	if cleaned == "" {
 		return "摘要："
 	}
-	if utf8.RuneCountInString(cleaned) <= 80 {
+	if utf8.RuneCountInString(cleaned) <= summaryEchoRuneLimit {
 		return "摘要：" + cleaned
 	}
 

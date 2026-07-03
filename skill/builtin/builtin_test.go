@@ -651,13 +651,17 @@ func TestSummarySkillMeta(t *testing.T) {
 func TestSummarySkillMatch(t *testing.T) {
 	s := NewSummarySkill()
 
+	// BUG-20260703 B4：快路径要求真正可摘要的正文（超过回声阈值 80 rune），
+	// 短尾巴/代词指代上文的对话式请求让路 LLM。
+	longBody := "今天发布了新版本，修复了若干问题，性能提升明显，安装包体积下降，启动速度加快，内存占用降低，用户反馈整体正面，崩溃率明显下降，后续将继续优化细节体验，欢迎大家升级试用并积极反馈问题。"
 	tests := []struct {
 		input string
 		want  bool
 	}{
-		{"摘要一下 今天下雨，记得带伞", true},
-		{"summary this", true},
-		{"总结一下 这篇文章", true},
+		{"摘要一下 " + longBody, true},
+		{"摘要一下 今天下雨，记得带伞", false},
+		{"summary this", false},
+		{"总结一下 这篇文章", false},
 		{"hello", false},
 		{"", false},
 	}

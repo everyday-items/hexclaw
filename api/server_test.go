@@ -191,7 +191,7 @@ func TestServer_ChatForwardsMetadataAndRequestID(t *testing.T) {
 	}
 	srv := NewServer(cfg, eng, nil, nil)
 
-	body := `{"message":"你好","user_id":"test-user","request_id":"req-chat-001","metadata":{"thinking":"off","memory":"off","provider":"ignored"},"provider":"ollama","model":"qwen3.5:9b"}`
+	body := `{"message":"你好","user_id":"test-user","request_id":"req-chat-001","metadata":{"thinking":"off","memory":"off","provider":"ignored","skills":"stocks"},"provider":"ollama","model":"qwen3.5:9b"}`
 	req := httptest.NewRequest("POST", "/api/v1/chat", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -209,6 +209,9 @@ func TestServer_ChatForwardsMetadataAndRequestID(t *testing.T) {
 	}
 	if got := eng.lastMsg.Metadata["memory"]; got != "off" {
 		t.Fatalf("memory metadata 未透传，实际 %q", got)
+	}
+	if got := eng.lastMsg.Metadata["skills"]; got != "stocks" {
+		t.Fatalf("skills metadata 未透传，实际 %q", got)
 	}
 	if got := eng.lastMsg.Metadata["request_id"]; got != "req-chat-001" {
 		t.Fatalf("request_id 未透传到 metadata，实际 %q", got)

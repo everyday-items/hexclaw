@@ -10,12 +10,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/ai-core/llm/cache"
 	mediaimg "github.com/hexagon-codes/ai-core/media/image"
 	mediavid "github.com/hexagon-codes/ai-core/media/video"
+	"github.com/hexagon-codes/ai-core/template"
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexagon/observe/trace"
 	hruntime "github.com/hexagon-codes/hexagon/runtime"
@@ -218,7 +220,10 @@ type ReActEngine struct {
 	vectorMem    *memory.VectorMemory // 向量语义记忆（可为 nil）
 	memEmbedder  MemoryEmbedder       // 长期记忆召回的向量化器（可为 nil → 纯 BM25 降级）
 	activeRecall *ActiveRecall        // G②：回复前主动会话深召回（可为 nil → 不跑）
-	factory      *agents.Factory      // Agent 角色工厂
+	// 记忆向量化熔断（BUG-20260703③，lock-free）：连续失败达阈值开闸，冷却期内纯 BM25。
+	memEmbedFailStreak atomic.Int32
+	memEmbedOpenUntil  atomic.Int64    // UnixNano；0=闸门关闭
+	factory            *agents.Factory // Agent 角色工厂
 	// v0.4.0 G1: 可选 hexagon.Agent 真分派（flag agent.factory.real 控制）
 	hexagonDispatcher *agents.HexagonDispatcher
 	started           bool
@@ -419,6 +424,29 @@ func (e *ReActEngine) ReloadLLMConfig(_ context.Context, llmCfg config.LLMConfig
 	e.cache.Reconfigure(llmCacheOptions(llmCfg))
 	e.cfg.LLM = cloneLLMConfig(llmCfg)
 	return nil
+}
+
+// ActiveFileMemoryConfig 返回当前生效的文件记忆行为配置快照（BUG-20260703 P2-2）。
+func (e *ReActEngine) ActiveFileMemoryConfig() config.FileMemoryConfig {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.cfg == nil {
+		return config.FileMemoryConfig{}
+	}
+	return e.cfg.FileMemory
+}
+
+// ReloadFileMemoryConfig 原地热更新文件记忆行为旋钮（BUG-20260703 P2-2）。
+// auto_memory / recall_min_score 为调用时读取，写入即生效；active_recall 的
+// 接线/摘除由调用方经 SetActiveRecall 完成；profile/dreaming 后台 goroutine
+// 在 boot 期接线，此处只落配置、重启后生效。
+func (e *ReActEngine) ReloadFileMemoryConfig(fmCfg config.FileMemoryConfig) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.cfg == nil {
+		return
+	}
+	e.cfg.FileMemory = fmCfg
 }
 
 // SetKnowledgeBase 设置知识库管理器
@@ -641,6 +669,13 @@ func StripReservedDispatchMetadata(m map[string]string) {
 // matchSkillFastPath gates the keyword fast path around skills.Match.
 func (e *ReActEngine) matchSkillFastPath(msg *adapter.Message) (skill.Skill, bool) {
 	if isSystemDispatch(msg) {
+		return nil, false
+	}
+	// BUG-20260703 G1：用户显式挂载了 skill（metadata["skills"] 非空）即表达「本轮由挂载
+	// 的 skill 塑造回复」——关键词 fast-path 必须让路 LLM 主路径，否则正文命中的 builtin
+	// 会短路旁路，挂载的 persona 正文永不注入（buildMountedSkillsPrompt 到不了）、当轮失效。
+	// 与 bug#2「挂载即生效」、bug#7/B4「fast-path 不劫持对话」同一纪律。
+	if len(mountedSkillNames(msg.Metadata)) > 0 {
 		return nil, false
 	}
 	matched, ok := e.skills.Match(msg)
@@ -900,7 +935,7 @@ func (e *ReActEngine) completeWithTools(
 
 	// 构建初始请求
 	req := e.buildCompletionRequest(ctx, msg, history, kbContext)
-	if shouldRejectImageAttachments(providerName, modelName, msg.Attachments) {
+	if shouldRejectImageAttachmentsForProvider(provider, providerName, modelName, msg.Attachments) {
 		return nil, fmt.Errorf("当前模型 %s 不支持图片附件，请切换到视觉模型后重试", modelName)
 	}
 	if len(tools) > 0 {
@@ -1032,6 +1067,8 @@ func (e *ReActEngine) completeWithTools(
 		resp.Content += maxTurnsReachedNotice
 		ensureMessageMetadata(msg)
 		msg.Metadata["finish_reason"] = "max_turns"
+		// BUG-20260703 B5b：提示同步进块流（blocks 是完整渲染真相，不与 content 分叉）。
+		result.Blocks = append(result.Blocks, template.TextBlock(maxTurnsReachedNotice))
 	}
 	if result.Metadata != nil {
 		if v, ok := result.Metadata["provider"].(string); ok && v != "" {
@@ -1067,12 +1104,9 @@ func (e *ReActEngine) completeWithTools(
 		ensureMessageMetadata(msg)
 		msg.Metadata["recovered_from_reasoning_only"] = "true"
 	}
-	reply, ferr := e.finalizeReply(ctx, sessionID, msg, provider, req, resp, providerName, modelName, cacheInput, runtimeToolCallsToAdapter(result.ToolCalls), runtimeBlocksToAdapter(result.Blocks))
-	if reply != nil {
-		// 附加有序内容块（多步 text↔tool 交错按序渲染；不改 finalizeReply 签名）。
-		reply.Blocks = runtimeBlocksToAdapter(result.Blocks)
-	}
-	return reply, ferr
+	// 有序内容块经 finalizeReply 透传进 reply（它可能追加守卫提示 text 块，B5b），
+	// 此处不再二次覆盖——否则追加的块会被打回。
+	return e.finalizeReply(ctx, sessionID, msg, provider, req, resp, providerName, modelName, cacheInput, runtimeToolCallsToAdapter(result.ToolCalls), runtimeBlocksToAdapter(result.Blocks))
 }
 
 // finalizeReply 完成回复的保存、缓存、成本记录等后处理
@@ -1122,6 +1156,8 @@ func (e *ReActEngine) finalizeReply(
 		cacheable = false
 		ensureMessageMetadata(msg)
 		msg.Metadata["cron_claim_unverified"] = "true"
+		// BUG-20260703 B5b：提示同步进块流（落库与 reply 都取本地 blocks）。
+		blocks = append(blocks, adapter.Block{Type: "text", Text: notice})
 	}
 
 	assistantMessageID := ""
@@ -1197,6 +1233,8 @@ func (e *ReActEngine) finalizeReply(
 		Interactive: buildInteractivePayload(msg.Metadata),
 		Usage:       buildUsage(resp.Usage, providerName, modelName),
 		ToolCalls:   toolCalls,
+		// 有序内容块由本函数携带（含 B5b 追加的守卫提示 text 块），调用方不再覆盖。
+		Blocks: blocks,
 	}, nil
 }
 
@@ -1282,13 +1320,42 @@ func markLLMProviderUnhealthy(router *llmrouter.Selector, providerName string, e
 }
 
 func shouldRejectImageAttachments(providerName, modelName string, attachments []adapter.Attachment) bool {
+	return shouldRejectImageAttachmentsForProvider(nil, providerName, modelName, attachments)
+}
+
+func shouldRejectImageAttachmentsForProvider(provider hexagon.Provider, providerName, modelName string, attachments []adapter.Attachment) bool {
 	if len(adapter.FilterImageAttachments(attachments)) == 0 {
+		return false
+	}
+	if providerModelSupportsImageInput(provider, modelName) {
 		return false
 	}
 	if modelSupportsImageInput(modelName) {
 		return false
 	}
 	return isKnownTextOnlyModel(providerName, modelName)
+}
+
+func providerModelSupportsImageInput(provider hexagon.Provider, modelName string) bool {
+	if provider == nil {
+		return false
+	}
+	target := strings.TrimSpace(modelName)
+	if target == "" {
+		return false
+	}
+	for _, model := range provider.Models() {
+		if sameModelID(model, target) {
+			return model.HasFeature(llm.FeatureVision)
+		}
+	}
+	return false
+}
+
+func sameModelID(model llm.ModelInfo, target string) bool {
+	target = strings.TrimSpace(target)
+	return strings.EqualFold(strings.TrimSpace(model.ID), target) ||
+		strings.EqualFold(strings.TrimSpace(model.Name), target)
 }
 
 func modelSupportsImageInput(modelName string) bool {
@@ -1434,7 +1501,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	if err != nil {
 		return nil, fmt.Errorf("llm 路由失败: %w", err)
 	}
-	if shouldRejectImageAttachments(selection.providerName, selection.modelName, msg.Attachments) {
+	if shouldRejectImageAttachmentsForProvider(selection.provider, selection.providerName, selection.modelName, msg.Attachments) {
 		return nil, fmt.Errorf("当前模型 %s 不支持图片附件，请切换到视觉模型后重试", selection.modelName)
 	}
 
@@ -1951,6 +2018,10 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 		cacheable = false
 		content += notice
 		streamTail = notice
+		// BUG-20260703 B5b：追加进 content 的提示必须同步进块流——done chunk 与落库
+		// 的 blocks 都取 result.Blocks，blocks 里已有 text 块时客户端 blocks 优先渲染，
+		// 只进 content 的提示会在 finalize 一刻蒸发、重载后也没有。
+		result.Blocks = append(result.Blocks, template.TextBlock(notice))
 	}
 	if strings.TrimSpace(content) == "" && strings.TrimSpace(reasoning) == "" {
 		// Empty right after a tool result — common when a weaker model is handed
@@ -1987,6 +2058,8 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 		cacheable = false
 		content += maxTurnsReachedNotice
 		streamTail += maxTurnsReachedNotice
+		// BUG-20260703 B5b：同步进块流（见上方 cron 幻称守卫处的说明）。
+		result.Blocks = append(result.Blocks, template.TextBlock(maxTurnsReachedNotice))
 	}
 
 	saveCtx, saveCancel := context.WithTimeout(trace.Detach(ctx), 10*time.Second)
@@ -2847,7 +2920,7 @@ func (e *ReActEngine) completeDirect(
 	explicitProvider bool,
 	cacheInput string,
 ) (*adapter.Reply, error) {
-	if shouldRejectImageAttachments(providerName, modelName, msg.Attachments) {
+	if shouldRejectImageAttachmentsForProvider(provider, providerName, modelName, msg.Attachments) {
 		return nil, fmt.Errorf("当前模型 %s 不支持图片附件，请切换到视觉模型后重试", modelName)
 	}
 	req := e.buildCompletionRequest(ctx, msg, history, kbContext)

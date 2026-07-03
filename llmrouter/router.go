@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/ai-core/llm/anthropic"
+	"github.com/hexagon-codes/ai-core/llm/ollama"
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/toolkit/util/logger"
@@ -248,6 +249,17 @@ func cloneLLMConfig(cfg config.LLMConfig) config.LLMConfig {
 // 这意味着：DeepSeek、Qwen 等声明 OpenAI 兼容的 Provider，
 // 以及任何 API 中转/私有部署，都可以通过此方式接入。
 func (r *Selector) createProvider(name string, pc config.LLMProviderConfig) hexagon.Provider {
+	if isOllamaProviderConfig(name, pc) {
+		var opts []ollama.Option
+		if baseURL := normalizeOllamaBaseURL(pc.BaseURL); baseURL != "" {
+			opts = append(opts, ollama.WithBaseURL(baseURL))
+		}
+		if pc.Model != "" {
+			opts = append(opts, ollama.WithModel(pc.Model))
+		}
+		return ollama.New(opts...)
+	}
+
 	// Anthropic 使用原生 SDK（非 OpenAI 兼容协议）
 	if name == "anthropic" {
 		var aopts []anthropic.Option
@@ -269,6 +281,24 @@ func (r *Selector) createProvider(name string, pc config.LLMProviderConfig) hexa
 		opts = append(opts, hexagon.OpenAIWithModel(pc.Model))
 	}
 	return hexagon.NewOpenAI(pc.APIKey, opts...)
+}
+
+func isOllamaProviderConfig(name string, pc config.LLMProviderConfig) bool {
+	lowerName := strings.ToLower(strings.TrimSpace(name))
+	lowerBase := strings.ToLower(strings.TrimSpace(pc.BaseURL))
+	return strings.Contains(lowerName, "ollama") ||
+		strings.Contains(lowerBase, "localhost:11434") ||
+		strings.Contains(lowerBase, "127.0.0.1:11434") ||
+		strings.Contains(lowerBase, "[::1]:11434") ||
+		strings.Contains(lowerBase, "//ollama:")
+}
+
+func normalizeOllamaBaseURL(baseURL string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if strings.HasSuffix(strings.ToLower(trimmed), "/v1") {
+		return strings.TrimRight(trimmed[:len(trimmed)-len("/v1")], "/")
+	}
+	return trimmed
 }
 
 // canonicalNameLocked 把外部传入的 provider 名解析为注册时的配置 key。

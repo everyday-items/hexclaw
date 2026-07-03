@@ -497,7 +497,8 @@ func TestBug20260611_UserMessageFastPathUnchanged(t *testing.T) {
 		ID:       "msg-bug-20260611-user",
 		Platform: adapter.PlatformAPI,
 		UserID:   "user-001",
-		Content:  "总结一下：今天发布了新版本，修复了若干问题，性能提升明显。",
+		// BUG-20260703 B4 后快路径要求真正可摘要的正文（超过回声阈值），故此处用长文。
+		Content: "总结一下：今天发布了新版本，修复了若干问题，性能提升明显，安装包体积下降，启动速度加快，内存占用降低，用户反馈整体正面，崩溃率明显下降，后续将继续优化细节体验，欢迎大家升级试用并反馈问题。",
 	})
 	if err != nil {
 		t.Fatalf("Process failed: %v", err)
