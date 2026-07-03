@@ -1,11 +1,10 @@
 // Package feishu 提供飞书（Lark）Bot 适配器
 //
 // 使用飞书官方 Go SDK（larkws）建立 WebSocket 长连接接收事件，无需公网地址。
-// 回复通过飞书 OpenAPI 发送。
+// 收发消息、Reaction 与凭证校验统一走飞书官方 Go SDK。
 package feishu
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/hexagon-codes/toolkit/util/logger"
 
+	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
@@ -33,11 +33,6 @@ import (
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
-const (
-	baseURL            = "https://open.feishu.cn/open-apis"
-	tokenRefreshBuffer = 5 * time.Minute
-)
-
 // FeishuAdapter 飞书 Bot 适配器
 type FeishuAdapter struct {
 	cfg     config.FeishuConfig
@@ -45,10 +40,10 @@ type FeishuAdapter struct {
 	client  *http.Client
 	queue   *adapter.SendQueue
 
-	mu          sync.RWMutex
-	accessToken string
-	tokenExpiry time.Time
-	lastError   string
+	mu        sync.RWMutex
+	lastError string
+	sdkClient *lark.Client
+	sdkHTTP   *http.Client
 
 	wsClient  *larkws.Client
 	connected atomic.Bool
@@ -63,6 +58,34 @@ func New(cfg config.FeishuConfig) *FeishuAdapter {
 	}
 	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformFeishu, a.sendReplyNow)
 	return a
+}
+
+func (a *FeishuAdapter) openAPIClient() *lark.Client {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.sdkClient != nil && a.sdkHTTP == a.client {
+		return a.sdkClient
+	}
+	opts := []lark.ClientOptionFunc{
+		lark.WithReqTimeout(10 * time.Second),
+		lark.WithLogLevel(larkcore.LogLevelError),
+	}
+	if a.client != nil {
+		opts = append(opts, lark.WithHttpClient(a.client))
+	}
+	a.sdkClient = lark.NewClient(a.cfg.AppID, a.cfg.AppSecret, opts...)
+	a.sdkHTTP = a.client
+	return a.sdkClient
+}
+
+func feishuAPIError(op string, resp *larkcore.ApiResp, code int, msg string) error {
+	if resp != nil && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s 返回 %d: %s", op, resp.StatusCode, string(resp.RawBody))
+	}
+	if code != 0 {
+		return fmt.Errorf("%s 业务错误 code=%d: %s", op, code, msg)
+	}
+	return nil
 }
 
 func (a *FeishuAdapter) Name() string {
@@ -229,9 +252,15 @@ func (a *FeishuAdapter) handleSDKMessage(event *larkim.P2MessageReceiveV1) {
 		logger.Error("飞书: 处理消息失败", "error", err)
 		recallThinking()
 		errContent := "⚠️ 处理消息时出现错误：" + upstreamerr.PublicMessage(err, "未知错误") + "\n请检查 LLM Provider 配置后重试。"
-		sendCtx, sendCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer sendCancel()
-		_ = a.Send(sendCtx, msg.ChatID, &adapter.Reply{Content: errContent})
+		if messageID != "" {
+			if _, rErr := a.replyAndGetID(ctx, messageID, errContent); rErr != nil {
+				logger.Error("[feishu] 发送错误回复失败", "error", rErr)
+			}
+			return
+		}
+		if sendErr := a.Send(ctx, msg.ChatID, &adapter.Reply{Content: errContent}); sendErr != nil {
+			logger.Error("[feishu] 发送错误消息失败", "error", sendErr)
+		}
 		return
 	}
 
@@ -243,8 +272,7 @@ func (a *FeishuAdapter) handleSDKMessage(event *larkim.P2MessageReceiveV1) {
 	// 发送实际回复（emoji 已回收，发新消息）
 	if messageID != "" {
 		if _, rErr := a.replyAndGetID(ctx, messageID, reply.Content); rErr != nil {
-			logger.Error("[feishu] 回复消息失败，降级为直接发送", "error", rErr)
-			_ = a.Send(ctx, msg.ChatID, reply)
+			logger.Error("[feishu] 回复消息失败", "error", rErr)
 		}
 	} else {
 		if err := a.Send(ctx, msg.ChatID, reply); err != nil {
@@ -327,38 +355,34 @@ func (a *FeishuAdapter) sendReplyNow(ctx context.Context, chatID string, reply *
 	if reply == nil {
 		return nil
 	}
-	token, err := a.getAccessToken(ctx)
-	if err != nil {
-		return fmt.Errorf("获取 Access Token 失败: %w", err)
-	}
-
-	body := map[string]any{
-		"receive_id": chatID,
-		"msg_type":   "text",
-		"content":    marshalTextContent(reply.Content),
-	}
-	bodyJSON, _ := json.Marshal(body)
-
-	url := baseURL + "/im/v1/messages?receive_id_type=chat_id"
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyJSON))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := a.client.Do(req)
+	_, err := a.createTextMessage(ctx, chatID, reply.Content)
 	if err != nil {
 		return fmt.Errorf("发送消息失败: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("飞书 API 返回 %d: %s", resp.StatusCode, string(respBody))
-	}
-
 	return nil
+}
+
+func (a *FeishuAdapter) createTextMessage(ctx context.Context, chatID, text string) (string, error) {
+	resp, err := a.openAPIClient().Im.V1.Message.Create(ctx,
+		larkim.NewCreateMessageReqBuilder().
+			ReceiveIdType("chat_id").
+			Body(larkim.NewCreateMessageReqBodyBuilder().
+				ReceiveId(chatID).
+				MsgType(larkim.MsgTypeText).
+				Content(marshalTextContent(text)).
+				Build()).
+			Build(),
+	)
+	if err != nil {
+		return "", err
+	}
+	if err := feishuAPIError("飞书发送消息", resp.ApiResp, resp.Code, resp.Msg); err != nil {
+		return "", err
+	}
+	if resp.Data == nil || resp.Data.MessageId == nil {
+		return "", nil
+	}
+	return *resp.Data.MessageId, nil
 }
 
 // SendStream 发送流式回复
@@ -426,134 +450,47 @@ func (a *FeishuAdapter) SendStream(ctx context.Context, chatID string, chunks <-
 
 // sendAndGetID 发送消息并返回 message_id
 func (a *FeishuAdapter) sendAndGetID(ctx context.Context, chatID, text string) (string, error) {
-	token, err := a.getAccessToken(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	body := map[string]any{
-		"receive_id": chatID,
-		"msg_type":   "text",
-		"content":    marshalTextContent(text),
-	}
-	bodyJSON, _ := json.Marshal(body)
-
-	url := baseURL + "/im/v1/messages?receive_id_type=chat_id"
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyJSON))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	// W3-9 修复：检查 HTTP 状态码，避免静默吞掉 4xx/5xx。
-	//
-	// 修复前直接 Decode 响应体并忽略 decode 错误，无论 4xx/5xx 都返回
-	// (空 messageID, nil error)。在 SendStream 首段创建路径中，调用方据
-	// `err != nil || id == ""` 判定后会 continue 重试，导致流式消息永远无法
-	// 落地。这里与 replyAndGetID / patchMessage 保持一致，非 200 直接返回错误。
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("飞书发送消息返回 %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var result struct {
-		Data struct {
-			MessageID string `json:"message_id"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", fmt.Errorf("解析飞书响应失败: %w", err)
-	}
-	return result.Data.MessageID, nil
+	return a.createTextMessage(ctx, chatID, text)
 }
 
 // replyAndGetID 以回复形式回复指定消息，返回新消息的 message_id
 func (a *FeishuAdapter) replyAndGetID(ctx context.Context, replyToMsgID, text string) (string, error) {
-	token, err := a.getAccessToken(ctx)
+	resp, err := a.openAPIClient().Im.V1.Message.Reply(ctx,
+		larkim.NewReplyMessageReqBuilder().
+			MessageId(replyToMsgID).
+			Body(larkim.NewReplyMessageReqBodyBuilder().
+				MsgType(larkim.MsgTypeText).
+				Content(marshalTextContent(text)).
+				Build()).
+			Build(),
+	)
 	if err != nil {
 		return "", err
 	}
-
-	body := map[string]any{
-		"msg_type": "text",
-		"content":  marshalTextContent(text),
-	}
-	bodyJSON, _ := json.Marshal(body)
-
-	url := baseURL + "/im/v1/messages/" + replyToMsgID + "/reply"
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyJSON))
-	if err != nil {
+	if err := feishuAPIError("飞书 reply", resp.ApiResp, resp.Code, resp.Msg); err != nil {
 		return "", err
 	}
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return "", err
+	if resp.Data == nil || resp.Data.MessageId == nil {
+		return "", nil
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("飞书 reply 返回 %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var result struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-		Data struct {
-			MessageID string `json:"message_id"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", fmt.Errorf("解析飞书 reply 响应失败: %w", err)
-	}
-	if result.Code != 0 {
-		return "", fmt.Errorf("飞书 reply 业务错误 code=%d: %s", result.Code, result.Msg)
-	}
-	return result.Data.MessageID, nil
+	return *resp.Data.MessageId, nil
 }
 
-// patchMessage 编辑已发送的消息
+// patchMessage 编辑已发送的文本消息。函数名保留给既有调用点，实际走飞书官方 SDK 的 Message.Update。
 func (a *FeishuAdapter) patchMessage(ctx context.Context, messageID, text string) error {
-	token, err := a.getAccessToken(ctx)
+	resp, err := a.openAPIClient().Im.V1.Message.Update(ctx,
+		larkim.NewUpdateMessageReqBuilder().
+			MessageId(messageID).
+			Body(larkim.NewUpdateMessageReqBodyBuilder().
+				MsgType(larkim.MsgTypeText).
+				Content(marshalTextContent(text)).
+				Build()).
+			Build(),
+	)
 	if err != nil {
 		return err
 	}
-
-	body := map[string]any{
-		"msg_type": "text",
-		"content":  marshalTextContent(text),
-	}
-	bodyJSON, _ := json.Marshal(body)
-
-	url := baseURL + "/im/v1/messages/" + messageID
-	req, err := http.NewRequestWithContext(ctx, "PATCH", url, bytes.NewReader(bodyJSON))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("飞书 PATCH 消息返回 %d: %s", resp.StatusCode, string(respBody))
-	}
-	return nil
+	return feishuAPIError("飞书 UPDATE 消息", resp.ApiResp, resp.Code, resp.Msg)
 }
 
 // thinkingEmojiTypes 飞书 Reaction API 表示 AI 正在处理的表情
@@ -570,71 +507,38 @@ func randomThinkingEmojiType() string {
 
 // addReaction 给消息添加表情回应，返回 reaction_id 用于后续回收
 func (a *FeishuAdapter) addReaction(ctx context.Context, messageID, emojiType string) (string, error) {
-	token, err := a.getAccessToken(ctx)
+	resp, err := a.openAPIClient().Im.V1.MessageReaction.Create(ctx,
+		larkim.NewCreateMessageReactionReqBuilder().
+			MessageId(messageID).
+			Body(larkim.NewCreateMessageReactionReqBodyBuilder().
+				ReactionType(larkim.NewEmojiBuilder().EmojiType(emojiType).Build()).
+				Build()).
+			Build(),
+	)
 	if err != nil {
 		return "", err
 	}
-
-	body := map[string]any{
-		"reaction_type": map[string]string{"emoji_type": emojiType},
-	}
-	bodyJSON, _ := json.Marshal(body)
-
-	url := baseURL + "/im/v1/messages/" + messageID + "/reactions"
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyJSON))
-	if err != nil {
+	if err := feishuAPIError("飞书添加 Reaction", resp.ApiResp, resp.Code, resp.Msg); err != nil {
 		return "", err
 	}
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return "", err
+	if resp.Data == nil || resp.Data.ReactionId == nil {
+		return "", nil
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("飞书添加 Reaction 返回 %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var result struct {
-		Data struct {
-			ReactionID string `json:"reaction_id"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", err
-	}
-	return result.Data.ReactionID, nil
+	return *resp.Data.ReactionId, nil
 }
 
 // removeReaction 移除消息上的表情回应
 func (a *FeishuAdapter) removeReaction(ctx context.Context, messageID, reactionID string) error {
-	token, err := a.getAccessToken(ctx)
+	resp, err := a.openAPIClient().Im.V1.MessageReaction.Delete(ctx,
+		larkim.NewDeleteMessageReactionReqBuilder().
+			MessageId(messageID).
+			ReactionId(reactionID).
+			Build(),
+	)
 	if err != nil {
 		return err
 	}
-
-	url := baseURL + "/im/v1/messages/" + messageID + "/reactions/" + reactionID
-	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("飞书移除 Reaction 返回 %d: %s", resp.StatusCode, string(respBody))
-	}
-	return nil
+	return feishuAPIError("飞书移除 Reaction", resp.ApiResp, resp.Code, resp.Msg)
 }
 
 // handleMessage 处理消息事件（webhook 兼容路径）
@@ -707,9 +611,15 @@ func (a *FeishuAdapter) handleMessage(event feishuEvent) {
 		logger.Error("飞书: 处理消息失败", "error", err)
 		recallThinking()
 		errContent := "⚠️ 处理消息时出现错误：" + upstreamerr.PublicMessage(err, "未知错误") + "\n请检查 LLM Provider 配置后重试。"
-		sendCtx, sendCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer sendCancel()
-		_ = a.Send(sendCtx, msg.ChatID, &adapter.Reply{Content: errContent})
+		if origMsgID != "" {
+			if _, rErr := a.replyAndGetID(ctx, origMsgID, errContent); rErr != nil {
+				logger.Error("[feishu] 发送错误回复失败", "error", rErr)
+			}
+			return
+		}
+		if sendErr := a.Send(ctx, msg.ChatID, &adapter.Reply{Content: errContent}); sendErr != nil {
+			logger.Error("[feishu] 发送错误消息失败", "error", sendErr)
+		}
 		return
 	}
 
@@ -720,8 +630,7 @@ func (a *FeishuAdapter) handleMessage(event feishuEvent) {
 	}
 	if origMsgID != "" {
 		if _, rErr := a.replyAndGetID(ctx, origMsgID, reply.Content); rErr != nil {
-			logger.Error("[feishu] 回复消息失败，降级为直接发送", "error", rErr)
-			_ = a.Send(ctx, msg.ChatID, reply)
+			logger.Error("[feishu] 回复消息失败", "error", rErr)
 		}
 	} else {
 		if err := a.Send(ctx, msg.ChatID, reply); err != nil {
@@ -735,8 +644,14 @@ func (a *FeishuAdapter) ValidateConfig(ctx context.Context) error {
 	if a.cfg.AppID == "" || a.cfg.AppSecret == "" {
 		return fmt.Errorf("feishu app_id/app_secret 未配置")
 	}
-	_, err := a.getAccessToken(ctx)
-	return err
+	resp, err := a.openAPIClient().GetTenantAccessTokenBySelfBuiltApp(ctx, &larkcore.SelfBuiltTenantAccessTokenReq{
+		AppID:     a.cfg.AppID,
+		AppSecret: a.cfg.AppSecret,
+	})
+	if err != nil {
+		return err
+	}
+	return feishuAPIError("飞书凭证验证", resp.ApiResp, resp.Code, resp.Msg)
 }
 
 // Health 返回适配器运行时健康状态
@@ -760,73 +675,6 @@ func (a *FeishuAdapter) Health(_ context.Context) error {
 		return fmt.Errorf("feishu WebSocket 未连接，请检查飞书开放平台是否已启用机器人和长连接事件订阅")
 	}
 	return nil
-}
-
-// ============== Token 管理 ==============
-
-// getAccessToken 获取飞书 Tenant Access Token（带缓存）
-func (a *FeishuAdapter) getAccessToken(ctx context.Context) (string, error) {
-	a.mu.RLock()
-	if a.accessToken != "" && time.Now().Before(a.tokenExpiry.Add(-tokenRefreshBuffer)) {
-		token := a.accessToken
-		a.mu.RUnlock()
-		return token, nil
-	}
-	a.mu.RUnlock()
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.accessToken != "" && time.Now().Before(a.tokenExpiry.Add(-tokenRefreshBuffer)) {
-		return a.accessToken, nil
-	}
-
-	body, _ := json.Marshal(map[string]string{
-		"app_id":     a.cfg.AppID,
-		"app_secret": a.cfg.AppSecret,
-	})
-
-	url := baseURL + "/auth/v3/tenant_access_token/internal"
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("获取 Token 请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	// W3-11 修复：先检查 HTTP 状态码，再解析业务 code。
-	//
-	// 修复前仅依赖响应体 code 判定成败：当网关/反代返回 4xx/5xx 且响应体
-	// 并非预期 JSON（如纯文本错误页）时，解析失败才报错；更隐蔽的是若错误页
-	// 恰好能解析出 code==0，会被误判为成功并缓存空 token。这里显式拦截非 200。
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("获取 Token 返回 %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var result struct {
-		Code              int    `json:"code"`
-		Msg               string `json:"msg"`
-		TenantAccessToken string `json:"tenant_access_token"`
-		Expire            int    `json:"expire"`
-	}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", fmt.Errorf("解析 Token 响应失败: %w", err)
-	}
-	if result.Code != 0 {
-		return "", fmt.Errorf("获取 Token 失败: code=%d, msg=%s", result.Code, result.Msg)
-	}
-
-	a.accessToken = result.TenantAccessToken
-	a.tokenExpiry = time.Now().Add(time.Duration(result.Expire) * time.Second)
-	logger.Info("飞书 Access Token 已刷新, 有效期", "expire", result.Expire)
-
-	return a.accessToken, nil
 }
 
 // ============== 数据模型 ==============

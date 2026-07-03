@@ -126,12 +126,12 @@ func TestReplyAndGetID_修复后_思考消息作为回复发送(t *testing.T) {
 func TestPatchMessage_修复前_静默吞掉API错误(t *testing.T) {
 	// 修复前: patchMessage 不检查 HTTP 状态码
 	// 即使飞书 API 返回 403/400，patchMessage 也返回 nil
-	// 导致 handleSDKMessage 认为消息已更新，不发送降级回复
-	// 结果：用户永远看到"思考中..."，看不到最终回复
+	// 导致 handleSDKMessage 认为消息已更新，无法准确记录回复失败
+	// 结果：用户可能看不到最终回复，日志也无法暴露真实失败原因
 
 	// 这个测试文档化了修复前的 bug 行为
 	t.Log("修复前行为: patchMessage 不检查 resp.StatusCode，API 返回 400/403/500 时仍返回 nil")
-	t.Log("后果: handleSDKMessage 认为 patch 成功，不走降级路径，用户永远看到'思考中...'")
+	t.Log("后果: handleSDKMessage 认为 patch 成功，用户可能看不到最终回复")
 }
 
 // TestPatchMessage_修复后_API错误正确返回 验证修复后的行为
@@ -176,15 +176,15 @@ func TestPatchMessage_修复后_API错误正确返回(t *testing.T) {
 			}
 			if tt.wantErr && err != nil {
 				// 验证错误信息包含有用信息
-				if !strings.Contains(err.Error(), "飞书 PATCH") {
-					t.Fatalf("错误信息应包含'飞书 PATCH'，实际: %s", err.Error())
+				if !strings.Contains(err.Error(), "飞书 UPDATE") {
+					t.Fatalf("错误信息应包含'飞书 UPDATE'，实际: %s", err.Error())
 				}
 			}
 		})
 	}
 }
 
-// TestPatchMessage_修复后_请求体包含msg_type 验证 PATCH 请求格式
+// TestPatchMessage_修复后_请求体包含msg_type 验证文本消息更新请求格式
 func TestPatchMessage_修复后_请求体包含msg_type(t *testing.T) {
 	var capturedBody map[string]any
 
@@ -197,7 +197,7 @@ func TestPatchMessage_修复后_请求体包含msg_type(t *testing.T) {
 		}
 		body, _ := io.ReadAll(r.Body)
 		json.Unmarshal(body, &capturedBody)
-		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{"code": 0})
 	}))
 	defer ts.Close()
 
@@ -211,14 +211,13 @@ func TestPatchMessage_修复后_请求体包含msg_type(t *testing.T) {
 }
 
 // ============================================================
-// 修复 3: 降级逻辑 — patchMessage 失败后发新消息
+// 修复 3: patchMessage 错误必须透出
 // ============================================================
 
-// TestHandleMessage_PatchFail_FallbackToSend 模拟 patch 失败后降级为新消息
-func TestHandleMessage_PatchFail_FallbackToSend(t *testing.T) {
-	// 这个测试验证：当 patchMessage 返回错误时，handleSDKMessage 会降级发送新消息
-	// 修复前: patchMessage 永远返回 nil → 降级逻辑永远不会触发
-	// 修复后: patchMessage 正确返回错误 → 降级逻辑触发 → 用户收到回复
+// TestPatchMessage_UpdateFailureReturnsError 模拟官方 SDK 更新消息失败时返回错误。
+func TestPatchMessage_UpdateFailureReturnsError(t *testing.T) {
+	// 单一路径原则：不在适配器里自写备用发送链路。patchMessage 必须把官方 SDK
+	// 返回的错误透出，由上层记录并进入统一失败处理。
 
 	var apiCalls []string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -229,27 +228,13 @@ func TestHandleMessage_PatchFail_FallbackToSend(t *testing.T) {
 			})
 			return
 		}
-		// reply 端点 — 发送思考消息成功
-		if r.Method == "POST" && strings.Contains(r.URL.Path, "/reply") {
-			json.NewEncoder(w).Encode(map[string]any{
-				"data": map[string]string{"message_id": "om_thinking_001"},
-			})
-			return
-		}
-		// PATCH 端点 — 模拟失败
-		if r.Method == "PATCH" {
+		// 文本消息更新端点 — 模拟失败
+		if r.Method == "PUT" {
 			w.WriteHeader(403)
 			w.Write([]byte(`{"code":403,"msg":"no permission to update"}`))
 			return
 		}
-		// 降级的 POST 新消息 — 应该被触发
-		if r.Method == "POST" && strings.Contains(r.URL.Path, "receive_id_type") {
-			json.NewEncoder(w).Encode(map[string]any{
-				"data": map[string]string{"message_id": "om_fallback_001"},
-			})
-			return
-		}
-		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]any{"code": 0})
 	}))
 	defer ts.Close()
 
@@ -262,15 +247,21 @@ func TestHandleMessage_PatchFail_FallbackToSend(t *testing.T) {
 	}
 	t.Logf("patchMessage 正确返回错误: %v", err)
 
-	// 验证降级路径：先 reply → PATCH 失败 → fallback Send
-	hasPatch := false
+	hasUpdate := false
+	hasCreate := false
 	for _, call := range apiCalls {
-		if strings.HasPrefix(call, "PATCH") {
-			hasPatch = true
+		if strings.HasPrefix(call, "PUT") {
+			hasUpdate = true
+		}
+		if strings.HasPrefix(call, "POST") && strings.Contains(call, "/im/v1/messages") && !strings.Contains(call, "/reply") {
+			hasCreate = true
 		}
 	}
-	if !hasPatch {
-		t.Fatal("应有 PATCH 请求")
+	if !hasUpdate {
+		t.Fatal("应有 PUT 更新请求")
+	}
+	if hasCreate {
+		t.Fatal("patchMessage 失败不应触发备用新消息发送")
 	}
 }
 
@@ -288,9 +279,9 @@ func TestHexclawYaml_FilesystemMCP_路径格式(t *testing.T) {
 		{"macOS home", "/Users/hexagon", true},
 		{"Linux home", "/home/hexagon", true},
 		{"Windows home", `C:\Users\hexagon`, true},
-		{"旧的 /tmp", "/tmp", true},           // 格式合法但权限太窄
-		{"空路径", "", false},                    // 不应使用空路径
-		{"相对路径", "relative/path", false},      // 不应使用相对路径
+		{"旧的 /tmp", "/tmp", true},        // 格式合法但权限太窄
+		{"空路径", "", false},               // 不应使用空路径
+		{"相对路径", "relative/path", false}, // 不应使用相对路径
 	}
 
 	for _, tt := range tests {
@@ -311,12 +302,12 @@ func TestHexclawYaml_FilesystemMCP_路径格式(t *testing.T) {
 // ============================================================
 
 func newTestAdapterWithBase(baseURL string) *FeishuAdapter {
-	// 临时覆盖 baseURL（通过替换 client 请求前缀）
+	// 将官方 SDK 发起的 HTTP 请求重定向到测试服务器。
 	a := New(config.FeishuConfig{
 		AppID:     "test-app",
 		AppSecret: "test-secret",
 	})
-	// 使用闭包覆盖所有 API 请求的 baseURL
+	// 通过自定义 http.Client 覆盖 SDK 请求的目标 host。
 	origClient := a.client
 	a.client = &http.Client{
 		Transport: &rewriteTransport{
@@ -336,8 +327,17 @@ type rewriteTransport struct {
 func (t *rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req.URL.Scheme = "http"
 	req.URL.Host = strings.TrimPrefix(t.base, "http://")
+	var (
+		resp *http.Response
+		err  error
+	)
 	if t.transport != nil {
-		return t.transport.RoundTrip(req)
+		resp, err = t.transport.RoundTrip(req)
+	} else {
+		resp, err = http.DefaultTransport.RoundTrip(req)
 	}
-	return http.DefaultTransport.RoundTrip(req)
+	if resp != nil {
+		resp.Header.Set("Content-Type", "application/json; charset=utf-8")
+	}
+	return resp, err
 }

@@ -11,17 +11,18 @@ package line
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/hexagon-codes/toolkit/crypto/sign"
 	"github.com/hexagon-codes/toolkit/util/logger"
 
 	"github.com/hexagon-codes/toolkit/net/httpx"
+	"github.com/line/line-bot-sdk-go/v8/linebot/messaging_api"
+	linewebhook "github.com/line/line-bot-sdk-go/v8/linebot/webhook"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/adapter/whauth"
@@ -42,6 +43,7 @@ type Config struct {
 	ChannelSecret string `yaml:"channel_secret"` // Channel Secret（用于签名验证）
 	ChannelToken  string `yaml:"channel_token"`  // Channel Access Token
 	WebhookPort   int    `yaml:"webhook_port"`   // Webhook 端口，默认 6064
+	APIEndpoint   string `yaml:"api_endpoint"`   // 测试注入；生产默认 https://api.line.me
 }
 
 // PlatformLINE LINE 平台常量
@@ -128,40 +130,37 @@ func (a *LineAdapter) sendReplyNow(ctx context.Context, chatID string, reply *ad
 	if reply == nil {
 		return nil
 	}
-	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给家长（同时覆盖 reply/push 两条路径）
+	api, err := a.messagingAPI(ctx)
+	if err != nil {
+		return fmt.Errorf("创建 LINE SDK 客户端失败: %w", err)
+	}
+
+	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给家长（同时覆盖 reply/push 两条路径）。
 	clean := adapter.StripThinking(reply.Content)
+	messages := []messaging_api.MessageInterface{
+		&messaging_api.TextMessage{Text: clean},
+	}
 	if replyToken := reply.Metadata["reply_token"]; replyToken != "" {
-		return a.replyMessage(ctx, replyToken, clean)
+		_, err := api.ReplyMessage(&messaging_api.ReplyMessageRequest{
+			ReplyToken: replyToken,
+			Messages:   messages,
+		})
+		if err != nil {
+			return fmt.Errorf("line reply API 发送失败: %w", err)
+		}
+		return nil
 	}
-	payload := map[string]any{
-		"to": chatID,
-		"messages": []map[string]string{
-			{"type": "text", "text": clean},
-		},
-	}
-
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.line.me/v2/bot/message/push", bytes.NewReader(body))
+	_, err = api.PushMessage(&messaging_api.PushMessageRequest{
+		To:       chatID,
+		Messages: messages,
+	}, "")
 	if err != nil {
-		return fmt.Errorf("创建请求失败: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+a.config.ChannelToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("发送消息失败: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("line API 返回 %d: %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("line push API 发送失败: %w", err)
 	}
 	return nil
 }
 
-// SendStream 流式发送（LINE 不支持流式，降级为完整发送）
+// SendStream 流式发送（LINE 不支持流式编辑，聚合后完整发送）
 func (a *LineAdapter) SendStream(ctx context.Context, chatID string, chunks <-chan *adapter.ReplyChunk) error {
 	var sb strings.Builder
 	for chunk := range chunks {
@@ -171,36 +170,6 @@ func (a *LineAdapter) SendStream(ctx context.Context, chatID string, chunks <-ch
 		sb.WriteString(chunk.Content)
 	}
 	return a.Send(ctx, chatID, &adapter.Reply{Content: sb.String()})
-}
-
-// replyMessage 使用 Reply API 回复（需要 replyToken）
-func (a *LineAdapter) replyMessage(ctx context.Context, replyToken, text string) error {
-	payload := map[string]any{
-		"replyToken": replyToken,
-		"messages": []map[string]string{
-			{"type": "text", "text": text},
-		},
-	}
-
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.line.me/v2/bot/message/reply", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("创建请求失败: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+a.config.ChannelToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("发送回复失败: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("line reply API 返回 %d: %s", resp.StatusCode, string(respBody))
-	}
-	return nil
 }
 
 // handleWebhook 处理 LINE Webhook 事件
@@ -224,23 +193,18 @@ func (a *LineAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// W3-13：签名校验强制 fail-closed。
-	// 此前 ChannelSecret 为空时静默跳过校验（fail-open），等于把签名校验关掉，
-	// 攻击者可伪造任意未签名请求。现统一用 whauth.RequireSecret 强制要求已配置
-	// 密钥，未配置即拒绝（403），而非放行；已配置则用 toolkit 一步式常量时间
-	// 校验保留 LINE 平台原算法（HMAC-SHA256 + Base64）。
 	if err := whauth.RequireSecret("line", a.config.ChannelSecret); err != nil {
 		http.Error(w, "Webhook signature verification required", http.StatusForbidden)
 		return
 	}
-	signature := r.Header.Get("X-Line-Signature")
-	if !a.verifySignature(body, signature) {
+	parseReq := r.Clone(r.Context())
+	parseReq.Body = io.NopCloser(bytes.NewReader(body))
+	payload, err := linewebhook.ParseRequest(a.config.ChannelSecret, parseReq)
+	if errors.Is(err, linewebhook.ErrInvalidSignature) {
 		http.Error(w, "Invalid signature", http.StatusForbidden)
 		return
 	}
-
-	var payload lineWebhook
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if err != nil {
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
@@ -248,29 +212,12 @@ func (a *LineAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	for _, event := range payload.Events {
-		if event.Type != "message" || event.Message.Type != "text" {
+		msg, ok := messageFromWebhookEvent(event)
+		if !ok {
 			continue
 		}
-
-		// W3-12：按 source.type 取会话维度标识作为 ChatID。
-		// 群组（group）用 groupId、房间（room）用 roomId，单聊（user）回退 userId。
-		// 此前 ChatID 与 UserID 都取 userId，导致群消息丢失 groupId、ChatID
-		// 退化为发言者，无法按群会话路由/回复。
-		chatID := event.Source.chatID()
-
-		msg := &adapter.Message{
-			ID:         event.Message.ID,
-			Platform:   PlatformLINE,
-			InstanceID: a.Name(),
-			ChatID:     chatID,
-			UserID:     event.Source.UserID,
-			Content:    event.Message.Text,
-			Timestamp:  time.UnixMilli(event.Timestamp),
-			Metadata: map[string]string{
-				"reply_token": event.ReplyToken,
-				"source_type": event.Source.Type,
-			},
-		}
+		msg.Platform = PlatformLINE
+		msg.InstanceID = a.Name()
 
 		go func(m *adapter.Message) {
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -308,23 +255,12 @@ func (a *LineAdapter) ValidateConfig(ctx context.Context) error {
 	if a.config.ChannelToken == "" {
 		return fmt.Errorf("line channel_token 未配置")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.line.me/v2/bot/info", nil)
+	api, err := a.messagingAPI(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("创建 LINE SDK 客户端失败: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+a.config.ChannelToken)
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("line bot info 请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("line token 验证失败 (%d): %s", resp.StatusCode, string(respBody))
-	}
-	return nil
+	_, err = api.GetBotInfo()
+	return err
 }
 
 // Health 返回适配器健康状态。
@@ -338,60 +274,71 @@ func (a *LineAdapter) Health(_ context.Context) error {
 	return nil
 }
 
-// verifySignature 验证 LINE Webhook 签名
-//
-// 直接复用 toolkit/crypto/sign 的一步式校验函数：内部一次性完成
-// "重新计算 HMAC-SHA256 + 用 hmac.Equal 做常量时间比较"，天然抗时序侧信道，
-// 保留 LINE 平台原算法（HMAC-SHA256 + Base64）。
-func (a *LineAdapter) verifySignature(body []byte, signature string) bool {
-	return sign.VerifyHMACSHA256Base64(body, []byte(a.config.ChannelSecret), signature)
+func (a *LineAdapter) messagingAPI(ctx context.Context) (*messaging_api.MessagingApiAPI, error) {
+	opts := []messaging_api.MessagingApiAPIOption{
+		messaging_api.WithHTTPClient(a.client),
+	}
+	if a.config.APIEndpoint != "" {
+		opts = append(opts, messaging_api.WithEndpoint(a.config.APIEndpoint))
+	}
+	api, err := messaging_api.NewMessagingApiAPI(a.config.ChannelToken, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if ctx != nil {
+		api.WithContext(ctx)
+	}
+	return api, nil
 }
 
-// LINE Webhook 数据结构
-type lineWebhook struct {
-	Events []lineEvent `json:"events"`
+func messageFromWebhookEvent(event linewebhook.EventInterface) (*adapter.Message, bool) {
+	messageEvent, ok := event.(linewebhook.MessageEvent)
+	if !ok {
+		return nil, false
+	}
+	textMessage, ok := messageEvent.Message.(linewebhook.TextMessageContent)
+	if !ok {
+		return nil, false
+	}
+	chatID, userID, sourceType := sourceIDs(messageEvent.Source)
+	return &adapter.Message{
+		ID:        textMessage.Id,
+		ChatID:    chatID,
+		UserID:    userID,
+		Content:   textMessage.Text,
+		Timestamp: time.UnixMilli(messageEvent.Timestamp),
+		Metadata: map[string]string{
+			"reply_token": messageEvent.ReplyToken,
+			"source_type": sourceType,
+		},
+	}, true
 }
 
-type lineEvent struct {
-	Type       string      `json:"type"`
-	ReplyToken string      `json:"replyToken"`
-	Timestamp  int64       `json:"timestamp"`
-	Source     lineSource  `json:"source"`
-	Message    lineMessage `json:"message"`
-}
-
-type lineSource struct {
-	Type    string `json:"type"`
-	UserID  string `json:"userId"`
-	GroupID string `json:"groupId,omitempty"`
-	RoomID  string `json:"roomId,omitempty"`
-}
-
-// chatID 返回会话维度标识，用作统一 Message 的 ChatID。
-//
-// LINE 的 source 有三类：
-//   - group：多人群组，会话标识为 groupId。
-//   - room：多人聊天室，会话标识为 roomId。
-//   - user：一对一单聊，会话即对方 userId。
-//
-// 对 group/room，若平台未带对应 ID（异常场景）则回退到 userId，
-// 保证 ChatID 始终非空可路由。
-func (s lineSource) chatID() string {
-	switch s.Type {
-	case "group":
-		if s.GroupID != "" {
-			return s.GroupID
+func sourceIDs(source linewebhook.SourceInterface) (chatID, userID, sourceType string) {
+	switch s := source.(type) {
+	case linewebhook.GroupSource:
+		if s.GroupId != "" {
+			chatID = s.GroupId
 		}
-	case "room":
-		if s.RoomID != "" {
-			return s.RoomID
+		userID = s.UserId
+		sourceType = "group"
+	case linewebhook.RoomSource:
+		if s.RoomId != "" {
+			chatID = s.RoomId
+		}
+		userID = s.UserId
+		sourceType = "room"
+	case linewebhook.UserSource:
+		chatID = s.UserId
+		userID = s.UserId
+		sourceType = "user"
+	default:
+		if source != nil {
+			sourceType = source.GetType()
 		}
 	}
-	return s.UserID
-}
-
-type lineMessage struct {
-	ID   string `json:"id"`
-	Type string `json:"type"`
-	Text string `json:"text"`
+	if chatID == "" {
+		chatID = userID
+	}
+	return chatID, userID, sourceType
 }

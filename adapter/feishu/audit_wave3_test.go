@@ -8,7 +8,7 @@ package feishu
 //   - 入站 payload 解析（各种消息类型 / 空字段 / 超长 / Unicode / 非法 JSON）
 //   - 出站消息转换（marshalTextContent / sendReplyNow / sendAndGetID / replyAndGetID / patchMessage）
 //   - HTTP 状态码处理一致性（sendAndGetID 是否吞掉 4xx/5xx）
-//   - Token 缓存并发竞态、Health / ValidateConfig 状态机
+//   - Health / ValidateConfig 状态机
 //
 // 约束：只使用本包公开 / 包内可见的真实函数，不 mock 掉被测逻辑本身。
 // HTTP 通过 httptest + rewriteTransport（复用 feishu_fix_test.go 中的辅助）拦截真实请求。
@@ -334,7 +334,7 @@ func TestSendAndGetID_SwallowsHTTPError(t *testing.T) {
 	}{
 		{"403权限不足", http.StatusForbidden, `{"code":99991663,"msg":"no permission"}`},
 		{"400参数错误", http.StatusBadRequest, `{"code":400,"msg":"bad request"}`},
-		{"500服务端错误", http.StatusInternalServerError, `internal error`},
+		{"500服务端错误", http.StatusInternalServerError, `{"code":500,"msg":"internal error"}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -483,7 +483,10 @@ func TestSend_GoesThroughQueue(t *testing.T) {
 		var m map[string]any
 		_ = json.Unmarshal(body, &m)
 		captured.Store(m)
-		w.WriteHeader(200)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code": 0,
+			"data": map[string]string{"message_id": "om_queue"},
+		})
 	}))
 	defer ts.Close()
 
@@ -565,7 +568,7 @@ func TestSendStream_NormalFlow(t *testing.T) {
 			})
 			return
 		}
-		if r.Method == http.MethodPatch {
+		if r.Method == http.MethodPut {
 			body, _ := io.ReadAll(r.Body)
 			var m map[string]any
 			_ = json.Unmarshal(body, &m)
@@ -574,7 +577,7 @@ func TestSendStream_NormalFlow(t *testing.T) {
 				_ = json.Unmarshal([]byte(c), &inner)
 				lastPatch.Store(inner["text"])
 			}
-			w.WriteHeader(200)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0})
 			return
 		}
 		// POST create
@@ -603,113 +606,7 @@ func TestSendStream_NormalFlow(t *testing.T) {
 }
 
 // ============================================================
-// 7. Token 缓存 —— 并发竞态 + 缓存命中
-// ============================================================
-
-// TestGetAccessToken_ConcurrentSingleFetch 高并发首次获取 token 时，
-// 受 mu.Lock + double-check 保护，理想情况下只触发一次真实 HTTP 请求。
-//
-// 用 -race 跑可同时检测数据竞争。
-func TestGetAccessToken_ConcurrentSingleFetch(t *testing.T) {
-	var authHits int32
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/auth/") {
-			atomic.AddInt32(&authHits, 1)
-			// 轻微延迟放大竞态窗口
-			time.Sleep(20 * time.Millisecond)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"code": 0, "tenant_access_token": "tok-concurrent", "expire": 7200,
-			})
-			return
-		}
-		w.WriteHeader(200)
-	}))
-	defer ts.Close()
-	a := newTestAdapterWithBase(ts.URL)
-
-	const n = 32
-	var wg sync.WaitGroup
-	errs := make(chan error, n)
-	tokens := make(chan string, n)
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			tok, err := a.getAccessToken(context.Background())
-			if err != nil {
-				errs <- err
-				return
-			}
-			tokens <- tok
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	close(tokens)
-
-	for err := range errs {
-		t.Fatalf("并发 getAccessToken 出错: %v", err)
-	}
-	for tok := range tokens {
-		if tok != "tok-concurrent" {
-			t.Errorf("token = %q, want tok-concurrent", tok)
-		}
-	}
-	hits := atomic.LoadInt32(&authHits)
-	if hits != 1 {
-		// double-check 锁应保证只打一次；>1 说明缓存/锁有问题（记为疑似问题，不直接 Fatal 避免偶发误报）
-		t.Logf("[关注] 并发首取触发了 %d 次 auth 请求，期望 1 次（double-check 锁应去重）", hits)
-		if hits > 2 {
-			t.Errorf("auth 请求次数 = %d，明显超出 double-check 预期", hits)
-		}
-	}
-}
-
-// TestGetAccessToken_BusinessErrorCode 业务 code != 0 时应返回错误。
-func TestGetAccessToken_BusinessErrorCode(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 注意：飞书在凭证错误时通常 HTTP 200 + code!=0
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"code": 10003, "msg": "app_secret invalid",
-		})
-	}))
-	defer ts.Close()
-	a := newTestAdapterWithBase(ts.URL)
-
-	_, err := a.getAccessToken(context.Background())
-	if err == nil {
-		t.Fatal("业务 code=10003 应返回错误")
-	}
-	if !strings.Contains(err.Error(), "10003") {
-		t.Errorf("错误应含 code=10003: %v", err)
-	}
-}
-
-// TestGetAccessToken_CacheHitSkipsHTTP 第二次取应命中缓存，不再打 auth。
-func TestGetAccessToken_CacheHitSkipsHTTP(t *testing.T) {
-	var authHits int32
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&authHits, 1)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"code": 0, "tenant_access_token": "tok-cached", "expire": 7200,
-		})
-	}))
-	defer ts.Close()
-	a := newTestAdapterWithBase(ts.URL)
-
-	for i := 0; i < 5; i++ {
-		tok, err := a.getAccessToken(context.Background())
-		if err != nil || tok != "tok-cached" {
-			t.Fatalf("第 %d 次取 token 失败: tok=%q err=%v", i, tok, err)
-		}
-	}
-	if h := atomic.LoadInt32(&authHits); h != 1 {
-		t.Errorf("5 次取 token 触发了 %d 次 auth 请求，期望 1 次（缓存命中）", h)
-	}
-}
-
-// ============================================================
-// 8. Health / ValidateConfig 状态机
+// 7. Health / ValidateConfig 状态机
 // ============================================================
 
 // TestHealth_StateMachine 覆盖 Health 的各状态分支。
@@ -807,7 +704,7 @@ func TestValidateConfig_Success(t *testing.T) {
 }
 
 // ============================================================
-// 9. 生命周期 —— Start 缺凭证 + Stop 幂等
+// 8. 生命周期 —— Start 缺凭证 + Stop 幂等
 // ============================================================
 
 // TestStart_MissingCreds Start 缺凭证应立即返回错误。
@@ -840,7 +737,7 @@ func TestStop_Idempotent(t *testing.T) {
 }
 
 // ============================================================
-// 10. handleSDKMessage —— nil 防御
+// 9. handleSDKMessage —— nil 防御
 // ============================================================
 
 // TestHandleSDKMessage_NilGuards 各级 nil 都应安全短路（不 panic）。
@@ -925,44 +822,5 @@ func TestStart_LogMessageWellFormed(t *testing.T) {
 	}
 	if !strings.Contains(out, "飞书适配器") {
 		t.Errorf("Start 日志应包含完整的 \"飞书适配器\" 相关启动信息，实际输出: %q", out)
-	}
-}
-
-// TestGetAccessToken_HTTPErrorStatus 回归: W3-11 —— getAccessToken 必须检查 HTTP 状态码。
-//
-// 修复前 getAccessToken 仅依赖响应体中的业务 code 判定成败，HTTP 返回
-// 4xx/5xx 但响应体非预期 JSON（如网关返回纯文本错误页）时，
-// 解析得到 code==0、token 为空，被误判为成功并缓存空 token。
-// 修复后非 200 状态码必须直接返回带状态码的错误。
-func TestGetAccessToken_HTTPErrorStatus(t *testing.T) {
-	tests := []struct {
-		name       string
-		statusCode int
-		body       string
-	}{
-		{"500纯文本错误页", http.StatusInternalServerError, `<html>502 Bad Gateway</html>`},
-		{"401网关鉴权失败", http.StatusUnauthorized, `unauthorized`},
-		{"403被拦截", http.StatusForbidden, `forbidden`},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(tt.statusCode)
-				_, _ = w.Write([]byte(tt.body))
-			}))
-			defer ts.Close()
-
-			a := newTestAdapterWithBase(ts.URL)
-			tok, err := a.getAccessToken(context.Background())
-			if err == nil {
-				t.Fatalf("getAccessToken 在 HTTP %d 时应返回错误，却返回了 nil（仅依赖 body code）", tt.statusCode)
-			}
-			if !strings.Contains(err.Error(), fmt.Sprintf("%d", tt.statusCode)) {
-				t.Errorf("错误信息应包含状态码 %d，实际: %v", tt.statusCode, err)
-			}
-			if tok != "" {
-				t.Errorf("非 200 不应返回 token，实际 = %q", tok)
-			}
-		})
 	}
 }

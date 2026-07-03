@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
+	linewebhook "github.com/line/line-bot-sdk-go/v8/linebot/webhook"
 )
 
 // audit_wave3_test.go 针对 LINE 适配器的平台特定逻辑做全场景审计测试：
@@ -26,7 +27,7 @@ import (
 // 约束：只测本包公开/包内可见函数，不 mock 被测逻辑本身；网络请求通过
 // httptest.Server 或可达性失败路径来覆盖，避免真实访问 api.line.me。
 
-// helper：用与源码同算法独立计算签名，避免直接调用被测 verifySignature 自证。
+// helper：按 LINE 官方 webhook 签名算法生成测试签名；生产校验由官方 SDK 执行。
 func sigOf(secret string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
@@ -61,7 +62,7 @@ func collectingHandler(buf int) (adapter.MessageHandler, <-chan *adapter.Message
 // 1. 签名校验：正常 / 边界 / 安全
 // --------------------------------------------------------------------------
 
-func TestVerifySignature_Table(t *testing.T) {
+func TestOfficialSDKValidateSignature_Table(t *testing.T) {
 	secret := "channel-secret-abc"
 	body := []byte(`{"events":[{"type":"message"}]}`)
 	valid := sigOf(secret, body)
@@ -84,9 +85,8 @@ func TestVerifySignature_Table(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			a := New(Config{ChannelSecret: tt.secret})
-			if got := a.verifySignature(tt.body, tt.sig); got != tt.want {
-				t.Errorf("verifySignature() = %v, want %v", got, tt.want)
+			if got := linewebhook.ValidateSignature(tt.secret, tt.sig, tt.body); got != tt.want {
+				t.Errorf("linewebhook.ValidateSignature() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -136,18 +136,19 @@ func TestHandleWebhook_ConfiguredSecretRejectsMissingHeader(t *testing.T) {
 // 各种事件类型只有 message+text 会被分发，其余忽略。
 func TestHandleWebhook_EventTypeFiltering(t *testing.T) {
 	tests := []struct {
-		name        string
-		eventJSON   string
+		name         string
+		eventJSON    string
+		wantStatus   int
 		wantDispatch bool
 	}{
-		{"text 消息", `{"type":"message","source":{"type":"user","userId":"U"},"message":{"type":"text","id":"1","text":"hi"}}`, true},
-		{"sticker 消息", `{"type":"message","source":{"type":"user","userId":"U"},"message":{"type":"sticker","id":"1"}}`, false},
-		{"image 消息", `{"type":"message","source":{"type":"user","userId":"U"},"message":{"type":"image","id":"1"}}`, false},
-		{"follow 事件", `{"type":"follow","source":{"type":"user","userId":"U"}}`, false},
-		{"join 事件", `{"type":"join","source":{"type":"group","groupId":"G"}}`, false},
-		{"postback 事件", `{"type":"postback","source":{"type":"user","userId":"U"}}`, false},
-		{"空 type", `{"source":{"type":"user","userId":"U"},"message":{"type":"text","id":"1","text":"x"}}`, false},
-		{"text 但内容为空", `{"type":"message","source":{"type":"user","userId":"U"},"message":{"type":"text","id":"1","text":""}}`, true},
+		{"text 消息", `{"type":"message","source":{"type":"user","userId":"U"},"message":{"type":"text","id":"1","text":"hi"}}`, http.StatusOK, true},
+		{"sticker 消息", `{"type":"message","source":{"type":"user","userId":"U"},"message":{"type":"sticker","id":"1"}}`, http.StatusOK, false},
+		{"image 消息", `{"type":"message","source":{"type":"user","userId":"U"},"message":{"type":"image","id":"1"}}`, http.StatusOK, false},
+		{"follow 事件", `{"type":"follow","source":{"type":"user","userId":"U"}}`, http.StatusOK, false},
+		{"join 事件", `{"type":"join","source":{"type":"group","groupId":"G"}}`, http.StatusOK, false},
+		{"postback 事件", `{"type":"postback","source":{"type":"user","userId":"U"}}`, http.StatusOK, false},
+		{"空 type", `{"source":{"type":"user","userId":"U"},"message":{"type":"text","id":"1","text":"x"}}`, http.StatusBadRequest, false},
+		{"text 但内容为空", `{"type":"message","source":{"type":"user","userId":"U"},"message":{"type":"text","id":"1","text":""}}`, http.StatusOK, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -157,8 +158,11 @@ func TestHandleWebhook_EventTypeFiltering(t *testing.T) {
 			body := `{"events":[` + tt.eventJSON + `]}`
 			w := httptest.NewRecorder()
 			a.handleWebhook(w, signedReq(body))
-			if w.Code != http.StatusOK {
-				t.Fatalf("status = %d, want 200", w.Code)
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", w.Code, tt.wantStatus)
+			}
+			if tt.wantStatus != http.StatusOK {
+				return
 			}
 			select {
 			case <-sink:
@@ -296,6 +300,7 @@ func TestHandleWebhook_VeryLongText(t *testing.T) {
 // 不得静默截断后继续解析。此前用裸 LimitReader 截断，超限请求被静默截断：
 //   - 截断后 JSON 损坏 → 误报 400（掩盖了"请求过大"的真实原因）；
 //   - 若截断点恰好落在合法 JSON 边界，则会用残缺数据继续处理。
+//
 // 本测试构造一个超 1MB 的请求，断言显式 413 而非静默处理。
 func TestHandleWebhook_BodyOverLimitRejected(t *testing.T) {
 	a := New(Config{})
@@ -368,11 +373,11 @@ func TestHandleWebhook_MalformedJSONTable(t *testing.T) {
 		{"截断对象", `{"events":[`, http.StatusBadRequest},
 		{"纯文本", `not json at all`, http.StatusBadRequest},
 		{"空 body", ``, http.StatusBadRequest},
-		{"JSON null", `null`, http.StatusOK},          // 解析成功，payload.Events 为 nil
-		{"JSON 数组", `[]`, http.StatusBadRequest},      // 顶层应为对象
+		{"JSON null", `null`, http.StatusOK},     // 解析成功，payload.Events 为 nil
+		{"JSON 数组", `[]`, http.StatusBadRequest}, // 顶层应为对象
 		{"events 为对象", `{"events":{}}`, http.StatusBadRequest},
 		{"events 为字符串", `{"events":"x"}`, http.StatusBadRequest},
-		{"events 缺失", `{"foo":1}`, http.StatusOK},      // 合法对象，Events 为 nil
+		{"events 缺失", `{"foo":1}`, http.StatusOK}, // 合法对象，Events 为 nil
 		{"type 字段数字类型不匹配", `{"events":[{"type":123}]}`, http.StatusBadRequest},
 	}
 	for _, tt := range tests {
@@ -395,7 +400,7 @@ func TestHandleWebhook_TimestampBoundaries(t *testing.T) {
 	}{
 		{"零时间戳", 0},
 		{"负时间戳", -1000},
-		{"未来极大时间戳", 1<<62},
+		{"未来极大时间戳", 1 << 62},
 		{"正常时间戳", 1700000000000},
 	}
 	for _, tt := range tests {
@@ -511,7 +516,9 @@ func TestSendReplyNow_StripsThinkingAndRoutesPush(t *testing.T) {
 		captured.path = r.URL.Path
 		captured.body = b
 		captured.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"sentMessages":[]}`))
 	}))
 	defer ts.Close()
 
@@ -553,7 +560,9 @@ func TestSendReplyNow_RoutesReplyWhenTokenPresent(t *testing.T) {
 		mu.Lock()
 		gotPath = r.URL.Path
 		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"sentMessages":[]}`))
 	}))
 	defer ts.Close()
 
@@ -600,10 +609,10 @@ func TestSendReplyNow_NonOKStatusReturnsError(t *testing.T) {
 
 func TestHealth_Table(t *testing.T) {
 	tests := []struct {
-		name       string
-		cfg        Config
-		attach     bool
-		wantErr    bool
+		name    string
+		cfg     Config
+		attach  bool
+		wantErr bool
 	}{
 		{"全配置+已attach", Config{ChannelSecret: "s", ChannelToken: "t"}, true, false},
 		{"未attach", Config{ChannelSecret: "s", ChannelToken: "t"}, false, true},
@@ -661,7 +670,13 @@ func TestValidateConfig_RemoteResponse(t *testing.T) {
 				if r.Header.Get("Authorization") != "Bearer t" {
 					t.Errorf("Authorization 头 = %q", r.Header.Get("Authorization"))
 				}
+				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(tt.status)
+				if tt.status == http.StatusOK {
+					_, _ = w.Write([]byte(`{"userId":"U0123456789abcdef0123456789abcdef","basicId":"@hexclaw","displayName":"HexClaw","chatMode":"bot","markAsReadMode":"auto"}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"message":"line test failure"}`))
 			}))
 			defer ts.Close()
 

@@ -4,7 +4,11 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"os"
+	"strings"
 	"testing"
+
+	linewebhook "github.com/line/line-bot-sdk-go/v8/linebot/webhook"
 )
 
 func TestLineAdapter_NameAndPlatform(t *testing.T) {
@@ -24,22 +28,47 @@ func TestLineAdapter_DefaultConfig(t *testing.T) {
 	}
 }
 
-func TestLineAdapter_VerifySignature(t *testing.T) {
+func TestLineOfficialSDK_ValidateSignature(t *testing.T) {
 	secret := "test-channel-secret"
-	a := New(Config{ChannelSecret: secret})
-
 	body := []byte(`{"events":[]}`)
 
-	// 计算正确签名
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
 	validSig := base64.StdEncoding.EncodeToString(mac.Sum(nil))
 
-	if !a.verifySignature(body, validSig) {
+	if !linewebhook.ValidateSignature(secret, validSig, body) {
 		t.Error("有效签名应验证通过")
 	}
 
-	if a.verifySignature(body, "invalid-signature") {
+	if linewebhook.ValidateSignature(secret, "invalid-signature", body) {
 		t.Error("无效签名应验证失败")
+	}
+}
+
+func TestLineAdapter_UsesOfficialLineSDK(t *testing.T) {
+	src, err := os.ReadFile("line.go")
+	if err != nil {
+		t.Fatalf("读取 line.go 失败: %v", err)
+	}
+	raw := string(src)
+	for _, must := range []string{
+		"github.com/line/line-bot-sdk-go/v8/linebot/messaging_api",
+		"github.com/line/line-bot-sdk-go/v8/linebot/webhook",
+		"linewebhook.ParseRequest",
+		"messaging_api.NewMessagingApiAPI",
+	} {
+		if !strings.Contains(raw, must) {
+			t.Fatalf("LINE adapter 必须优先使用官方 SDK，缺少 %q", must)
+		}
+	}
+	for _, banned := range []string{
+		"https://api.line.me/v2/bot/message/push",
+		"https://api.line.me/v2/bot/message/reply",
+		"VerifyHMACSHA256Base64",
+		"func (a *LineAdapter) verifySignature",
+	} {
+		if strings.Contains(raw, banned) {
+			t.Fatalf("LINE adapter 仍含手写 API/签名路径 %q，应统一走官方 SDK", banned)
+		}
 	}
 }

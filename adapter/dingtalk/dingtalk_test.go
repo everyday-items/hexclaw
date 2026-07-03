@@ -7,26 +7,17 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
-	"io"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
-	"github.com/hexagon-codes/hexclaw/internal/testutil/httpmock"
 )
-
-type mockTransport struct {
-	handler httpmock.RoundTripFunc
-}
-
-func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	return m.handler.RoundTrip(req)
-}
 
 // newTestAdapter 创建测试用钉钉适配器
 func newTestAdapter() *DingtalkAdapter {
@@ -36,6 +27,69 @@ func newTestAdapter() *DingtalkAdapter {
 		AppSecret: "test-app-secret",
 		RobotCode: "test-robot-code",
 	})
+}
+
+type fakeDingtalkOpenAPI struct {
+	mu         sync.Mutex
+	token      string
+	ttl        time.Duration
+	tokenErr   error
+	sendErr    error
+	sendErrs   []error
+	tokenCalls int
+	sendCalls  []fakeDingtalkSendCall
+}
+
+type fakeDingtalkSendCall struct {
+	AccessToken string
+	RobotCode   string
+	UserID      string
+	Text        string
+}
+
+func newFakeDingtalkOpenAPI(token string) *fakeDingtalkOpenAPI {
+	return &fakeDingtalkOpenAPI{token: token, ttl: 2 * time.Hour}
+}
+
+func (f *fakeDingtalkOpenAPI) GetAccessToken(_ context.Context, _, _ string) (string, time.Duration, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tokenCalls++
+	if f.tokenErr != nil {
+		return "", 0, f.tokenErr
+	}
+	return f.token, f.ttl, nil
+}
+
+func (f *fakeDingtalkOpenAPI) SendOTO(_ context.Context, accessToken, robotCode, userID, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sendCalls = append(f.sendCalls, fakeDingtalkSendCall{
+		AccessToken: accessToken,
+		RobotCode:   robotCode,
+		UserID:      userID,
+		Text:        text,
+	})
+	if len(f.sendErrs) > 0 {
+		err := f.sendErrs[0]
+		f.sendErrs = f.sendErrs[1:]
+		return err
+	}
+	return f.sendErr
+}
+
+func (f *fakeDingtalkOpenAPI) TokenCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tokenCalls
+}
+
+func (f *fakeDingtalkOpenAPI) SendCalls() []fakeDingtalkSendCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]fakeDingtalkSendCall, len(f.sendCalls))
+	copy(out, f.sendCalls)
+	return out
 }
 
 // TestNew 测试创建适配器
@@ -57,8 +111,8 @@ func TestNew(t *testing.T) {
 	if a.cfg.AppSecret != "secret" {
 		t.Errorf("AppSecret = %q, 期望 %q", a.cfg.AppSecret, "secret")
 	}
-	if a.client == nil {
-		t.Error("client 不应为 nil")
+	if a.openAPI != nil {
+		t.Error("official SDK client 应惰性初始化")
 	}
 }
 
@@ -173,17 +227,7 @@ func TestHandleWebhookNoSignatureCheck(t *testing.T) {
 		RobotCode: "robot",
 	})
 	a.handler = func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
-		return &adapter.Reply{Content: "ok"}, nil
-	}
-	// 使用 mock transport 避免真实 HTTP 调用（handleMessage 中的 Send 会发请求）
-	a.client = &http.Client{
-		Transport: httpmock.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{"accessToken":"test","expireIn":7200}`)),
-				Header:     make(http.Header),
-			}, nil
-		}),
+		return nil, nil
 	}
 
 	body := `{"text":{"content":"hello"},"senderStaffId":"user1","senderNick":"Test"}`
@@ -220,18 +264,7 @@ func TestHandleWebhookValidMessage(t *testing.T) {
 	handlerCalled := make(chan bool, 1)
 	a.handler = func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
 		handlerCalled <- true
-		return &adapter.Reply{Content: "ok"}, nil
-	}
-	a.client = &http.Client{
-		Transport: &mockTransport{
-			handler: func(req *http.Request) (*http.Response, error) {
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(`{"accessToken":"test","expireIn":7200}`)),
-					Header:     make(http.Header),
-				}, nil
-			},
-		},
+		return nil, nil
 	}
 
 	event := dtEvent{
@@ -268,25 +301,8 @@ func TestHandleMessage(t *testing.T) {
 		capturedMsg = msg
 		return &adapter.Reply{Content: "回复: " + msg.Content}, nil
 	}
-	a.client = &http.Client{
-		Transport: &mockTransport{
-			handler: func(req *http.Request) (*http.Response, error) {
-				// getAccessToken 和 Send 都走这里
-				if strings.Contains(req.URL.Path, "accessToken") {
-					return &http.Response{
-						StatusCode: http.StatusOK,
-						Body:       io.NopCloser(strings.NewReader(`{"accessToken":"test-token","expireIn":7200}`)),
-						Header:     make(http.Header),
-					}, nil
-				}
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(`{}`)),
-					Header:     make(http.Header),
-				}, nil
-			},
-		},
-	}
+	fakeAPI := newFakeDingtalkOpenAPI("test-token")
+	a.openAPI = fakeAPI
 
 	event := dtEvent{
 		ConversationId:   "conv-1",
@@ -313,6 +329,67 @@ func TestHandleMessage(t *testing.T) {
 	if capturedMsg.UserName != "TestUser" {
 		t.Errorf("UserName = %q, 期望 %q", capturedMsg.UserName, "TestUser")
 	}
+	calls := fakeAPI.SendCalls()
+	if len(calls) != 2 {
+		t.Fatalf("应通过官方 SDK 先发送思考反馈再发送回复，实际 %d 次", len(calls))
+	}
+	if calls[0].UserID != "user123" || calls[0].Text != dingtalkThinkingFeedback {
+		t.Errorf("思考反馈 send call = %+v, 期望 user123/%q", calls[0], dingtalkThinkingFeedback)
+	}
+	if calls[1].Text != "回复: 你好世界" {
+		t.Errorf("回复发送内容 = %q, 期望 %q", calls[1].Text, "回复: 你好世界")
+	}
+}
+
+func TestHandleMessageThinkingFeedbackFailureDoesNotBlockReply(t *testing.T) {
+	a := newTestAdapter()
+	a.handler = func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
+		return &adapter.Reply{Content: "最终回复"}, nil
+	}
+	fakeAPI := newFakeDingtalkOpenAPI("test-token")
+	fakeAPI.sendErrs = []error{errors.New("feedback failed"), nil}
+	a.openAPI = fakeAPI
+
+	event := dtEvent{SenderStaffId: "user123", SenderNick: "TestUser"}
+	event.Text.Content = "hello"
+
+	a.handleMessage(event)
+
+	calls := fakeAPI.SendCalls()
+	if len(calls) != 2 {
+		t.Fatalf("反馈失败也应继续发送最终回复，实际发送 %d 次", len(calls))
+	}
+	if calls[0].Text != dingtalkThinkingFeedback {
+		t.Errorf("第一次应发送思考反馈，实际 %q", calls[0].Text)
+	}
+	if calls[1].Text != "最终回复" {
+		t.Errorf("最终回复 = %q, 期望 %q", calls[1].Text, "最终回复")
+	}
+}
+
+func TestHandleMessageErrorSendsThinkingFeedbackThenErrorReply(t *testing.T) {
+	a := newTestAdapter()
+	a.handler = func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
+		return nil, errors.New("llm failed")
+	}
+	fakeAPI := newFakeDingtalkOpenAPI("test-token")
+	a.openAPI = fakeAPI
+
+	event := dtEvent{SenderStaffId: "user123", SenderNick: "TestUser"}
+	event.Text.Content = "hello"
+
+	a.handleMessage(event)
+
+	calls := fakeAPI.SendCalls()
+	if len(calls) != 2 {
+		t.Fatalf("handler 失败时应发送思考反馈和错误回复，实际发送 %d 次", len(calls))
+	}
+	if calls[0].Text != dingtalkThinkingFeedback {
+		t.Errorf("第一次应发送思考反馈，实际 %q", calls[0].Text)
+	}
+	if calls[1].Text != "处理消息时出现错误，请稍后重试。" {
+		t.Errorf("错误回复 = %q", calls[1].Text)
+	}
 }
 
 // TestHandleMessageNilHandler 测试 handler 为 nil 时不 panic
@@ -331,6 +408,8 @@ func TestHandleMessageNilHandler(t *testing.T) {
 func TestHandleMessageEmptyContent(t *testing.T) {
 	handlerCalled := false
 	a := newTestAdapter()
+	fakeAPI := newFakeDingtalkOpenAPI("test-token")
+	a.openAPI = fakeAPI
 	a.handler = func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
 		handlerCalled = true
 		return &adapter.Reply{Content: "ok"}, nil
@@ -344,27 +423,16 @@ func TestHandleMessageEmptyContent(t *testing.T) {
 	if handlerCalled {
 		t.Error("空内容不应调用 handler")
 	}
+	if calls := fakeAPI.SendCalls(); len(calls) != 0 {
+		t.Fatalf("空内容不应发送思考反馈，实际发送 %d 次", len(calls))
+	}
 }
 
 // TestGetAccessToken 测试获取和缓存 Access Token
 func TestGetAccessToken(t *testing.T) {
-	callCount := 0
-
 	a := newTestAdapter()
-	a.client = &http.Client{
-		Transport: &mockTransport{
-			handler: func(req *http.Request) (*http.Response, error) {
-				callCount++
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body: io.NopCloser(strings.NewReader(
-						fmt.Sprintf(`{"accessToken":"token-%d","expireIn":7200}`, callCount),
-					)),
-					Header: make(http.Header),
-				}, nil
-			},
-		},
-	}
+	fakeAPI := newFakeDingtalkOpenAPI("token-1")
+	a.openAPI = fakeAPI
 
 	ctx := context.Background()
 
@@ -385,30 +453,16 @@ func TestGetAccessToken(t *testing.T) {
 	if token2 != "token-1" {
 		t.Errorf("token = %q, 期望缓存值 %q", token2, "token-1")
 	}
-	if callCount != 1 {
-		t.Errorf("API 调用次数 = %d, 期望 1（应使用缓存）", callCount)
+	if fakeAPI.TokenCalls() != 1 {
+		t.Errorf("官方 SDK token 调用次数 = %d, 期望 1（应使用缓存）", fakeAPI.TokenCalls())
 	}
 }
 
 // TestGetAccessTokenExpired 测试过期 token 会重新获取
 func TestGetAccessTokenExpired(t *testing.T) {
-	callCount := 0
-
 	a := newTestAdapter()
-	a.client = &http.Client{
-		Transport: &mockTransport{
-			handler: func(req *http.Request) (*http.Response, error) {
-				callCount++
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body: io.NopCloser(strings.NewReader(
-						fmt.Sprintf(`{"accessToken":"token-%d","expireIn":7200}`, callCount),
-					)),
-					Header: make(http.Header),
-				}, nil
-			},
-		},
-	}
+	fakeAPI := newFakeDingtalkOpenAPI("token-1")
+	a.openAPI = fakeAPI
 
 	ctx := context.Background()
 
@@ -422,6 +476,9 @@ func TestGetAccessTokenExpired(t *testing.T) {
 	a.mu.Lock()
 	a.tokenExpiry = time.Now().Add(-1 * time.Hour)
 	a.mu.Unlock()
+	fakeAPI.mu.Lock()
+	fakeAPI.token = "token-2"
+	fakeAPI.mu.Unlock()
 
 	// 应重新获取
 	token2, err := a.getAccessToken(ctx)
@@ -431,8 +488,8 @@ func TestGetAccessTokenExpired(t *testing.T) {
 	if token2 != "token-2" {
 		t.Errorf("token = %q, 期望 %q（应重新获取）", token2, "token-2")
 	}
-	if callCount != 2 {
-		t.Errorf("API 调用次数 = %d, 期望 2", callCount)
+	if fakeAPI.TokenCalls() != 2 {
+		t.Errorf("官方 SDK token 调用次数 = %d, 期望 2", fakeAPI.TokenCalls())
 	}
 }
 
@@ -465,70 +522,35 @@ func TestMarshalTextContent(t *testing.T) {
 
 // TestSend 测试发送消息
 func TestSend(t *testing.T) {
-	var capturedBody map[string]any
-	var capturedToken string
-
 	a := newTestAdapter()
-	a.client = &http.Client{
-		Transport: &mockTransport{
-			handler: func(req *http.Request) (*http.Response, error) {
-				if strings.Contains(req.URL.Path, "accessToken") {
-					return &http.Response{
-						StatusCode: http.StatusOK,
-						Body:       io.NopCloser(strings.NewReader(`{"accessToken":"my-token","expireIn":7200}`)),
-						Header:     make(http.Header),
-					}, nil
-				}
-				capturedToken = req.Header.Get("x-acs-dingtalk-access-token")
-				body, _ := io.ReadAll(req.Body)
-				_ = json.Unmarshal(body, &capturedBody)
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(`{}`)),
-					Header:     make(http.Header),
-				}, nil
-			},
-		},
-	}
+	fakeAPI := newFakeDingtalkOpenAPI("my-token")
+	a.openAPI = fakeAPI
 
 	err := a.Send(context.Background(), "user1", &adapter.Reply{Content: "hello"})
 	if err != nil {
 		t.Fatalf("Send 失败: %v", err)
 	}
 
-	if capturedToken != "my-token" {
-		t.Errorf("token = %q, 期望 %q", capturedToken, "my-token")
+	calls := fakeAPI.SendCalls()
+	if len(calls) != 1 {
+		t.Fatalf("官方 SDK send 调用次数 = %d, 期望 1", len(calls))
 	}
-	if capturedBody["robotCode"] != "test-robot-code" {
-		t.Errorf("robotCode = %v, 期望 %q", capturedBody["robotCode"], "test-robot-code")
+	if calls[0].AccessToken != "my-token" {
+		t.Errorf("token = %q, 期望 %q", calls[0].AccessToken, "my-token")
+	}
+	if calls[0].RobotCode != "test-robot-code" {
+		t.Errorf("robotCode = %v, 期望 %q", calls[0].RobotCode, "test-robot-code")
+	}
+	if calls[0].UserID != "user1" || calls[0].Text != "hello" {
+		t.Errorf("send call = %+v, 期望 user1/hello", calls[0])
 	}
 }
 
 // TestSendStream 测试流式发送（拼接后发送）
 func TestSendStream(t *testing.T) {
-	var capturedBody map[string]any
-
 	a := newTestAdapter()
-	a.client = &http.Client{
-		Transport: &mockTransport{
-			handler: func(req *http.Request) (*http.Response, error) {
-				if strings.Contains(req.URL.Path, "accessToken") {
-					return &http.Response{
-						StatusCode: http.StatusOK,
-						Body:       io.NopCloser(strings.NewReader(`{"accessToken":"tok","expireIn":7200}`)),
-						Header:     make(http.Header),
-					}, nil
-				}
-				body, _ := io.ReadAll(req.Body)
-				_ = json.Unmarshal(body, &capturedBody)
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(`{}`)),
-					Header:     make(http.Header),
-				}, nil
-			},
-		},
-	}
+	fakeAPI := newFakeDingtalkOpenAPI("tok")
+	a.openAPI = fakeAPI
 
 	chunks := make(chan *adapter.ReplyChunk, 3)
 	chunks <- &adapter.ReplyChunk{Content: "Hello "}
@@ -541,11 +563,12 @@ func TestSendStream(t *testing.T) {
 		t.Fatalf("SendStream 失败: %v", err)
 	}
 
-	// 验证发送的 msgParam 包含拼接后的内容
-	if msgParam, ok := capturedBody["msgParam"].(string); ok {
-		if !strings.Contains(msgParam, "Hello World!") {
-			t.Errorf("msgParam = %q, 期望包含 %q", msgParam, "Hello World!")
-		}
+	calls := fakeAPI.SendCalls()
+	if len(calls) != 1 {
+		t.Fatalf("官方 SDK send 调用次数 = %d, 期望 1", len(calls))
+	}
+	if calls[0].Text != "Hello World!" {
+		t.Errorf("发送内容 = %q, 期望 %q", calls[0].Text, "Hello World!")
 	}
 }
 

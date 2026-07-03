@@ -2,8 +2,9 @@ package dingtalk
 
 import (
 	"context"
-	"io"
-	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -25,14 +26,7 @@ func TestOnChatBotMessage_MapsToAdapterMessage(t *testing.T) {
 		captured <- msg
 		return &adapter.Reply{Content: "ok"}, nil
 	}
-	// handleMessage 在回复阶段会调 Send（getAccessToken + batchSend），用 mock transport 拦截。
-	a.client = &http.Client{Transport: &mockTransport{handler: func(req *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(strings.NewReader(`{"accessToken":"tok","expireIn":7200}`)),
-			Header:     make(http.Header),
-		}, nil
-	}}}
+	a.openAPI = newFakeDingtalkOpenAPI("tok")
 
 	data := &dtchatbot.BotCallbackDataModel{
 		ConversationId:   "conv-1",
@@ -114,6 +108,26 @@ func TestOnChatBotMessage_NilData(t *testing.T) {
 	}
 	if ack == nil {
 		t.Fatal("应返回非 nil ack")
+	}
+}
+
+func TestDingtalkStreamSDKUsesHexagonFork(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	root := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	src, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	if err != nil {
+		t.Fatalf("读取 go.mod 失败: %v", err)
+	}
+	text := string(src)
+	const forkReplace = "replace github.com/open-dingtalk/dingtalk-stream-sdk-go => github.com/hexagon-codes/dingtalk-stream-sdk-go"
+	if !strings.Contains(text, forkReplace) {
+		t.Fatalf("钉钉 Stream SDK 必须指向 Hexagon fork，go.mod 缺少 %q", forkReplace)
+	}
+	if strings.Contains(text, "=> ./third_party/dingtalk-stream-sdk-go") {
+		t.Fatal("钉钉 Stream SDK 不应再指向本地 third_party 副本")
 	}
 }
 
