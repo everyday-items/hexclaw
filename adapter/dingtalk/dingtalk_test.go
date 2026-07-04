@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,14 +31,16 @@ func newTestAdapter() *DingtalkAdapter {
 }
 
 type fakeDingtalkOpenAPI struct {
-	mu         sync.Mutex
-	token      string
-	ttl        time.Duration
-	tokenErr   error
-	sendErr    error
-	sendErrs   []error
-	tokenCalls int
-	sendCalls  []fakeDingtalkSendCall
+	mu          sync.Mutex
+	token       string
+	ttl         time.Duration
+	tokenErr    error
+	sendErr     error
+	sendErrs    []error
+	recallErr   error
+	tokenCalls  int
+	sendCalls   []fakeDingtalkSendCall
+	recallCalls [][]string
 }
 
 type fakeDingtalkSendCall struct {
@@ -65,7 +68,7 @@ func (f *fakeDingtalkOpenAPI) GetAccessToken(_ context.Context, _, _ string) (st
 	return f.token, f.ttl, nil
 }
 
-func (f *fakeDingtalkOpenAPI) SendOTO(_ context.Context, accessToken, robotCode, userID string, msg dingtalkOutboundMessage) error {
+func (f *fakeDingtalkOpenAPI) SendOTO(_ context.Context, accessToken, robotCode, userID string, msg dingtalkOutboundMessage) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var param struct {
@@ -77,6 +80,8 @@ func (f *fakeDingtalkOpenAPI) SendOTO(_ context.Context, accessToken, robotCode,
 	if body == "" {
 		body = param.Text
 	}
+	// 每次发送返回确定性 processQueryKey = 该发送在序列中的下标（pqk-0 为首条）。
+	key := fmt.Sprintf("pqk-%d", len(f.sendCalls))
 	f.sendCalls = append(f.sendCalls, fakeDingtalkSendCall{
 		AccessToken: accessToken,
 		RobotCode:   robotCode,
@@ -88,9 +93,32 @@ func (f *fakeDingtalkOpenAPI) SendOTO(_ context.Context, accessToken, robotCode,
 	if len(f.sendErrs) > 0 {
 		err := f.sendErrs[0]
 		f.sendErrs = f.sendErrs[1:]
-		return err
+		if err != nil {
+			return "", err
+		}
+		return key, nil
 	}
-	return f.sendErr
+	if f.sendErr != nil {
+		return "", f.sendErr
+	}
+	return key, nil
+}
+
+func (f *fakeDingtalkOpenAPI) RecallOTO(_ context.Context, _, _ string, processQueryKeys []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	keys := make([]string, len(processQueryKeys))
+	copy(keys, processQueryKeys)
+	f.recallCalls = append(f.recallCalls, keys)
+	return f.recallErr
+}
+
+func (f *fakeDingtalkOpenAPI) RecallCalls() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([][]string, len(f.recallCalls))
+	copy(out, f.recallCalls)
+	return out
 }
 
 func (f *fakeDingtalkOpenAPI) TokenCalls() int {
@@ -346,43 +374,55 @@ func TestHandleMessage(t *testing.T) {
 	}
 	calls := fakeAPI.SendCalls()
 	if len(calls) != 2 {
-		t.Fatalf("应通过官方 SDK 先发送思考反馈再发送回复，实际 %d 次", len(calls))
+		t.Fatalf("应先发送思考占位再发送回复，实际 %d 次", len(calls))
 	}
 	if calls[0].UserID != "user123" || calls[0].Text != dingtalkThinkingFeedback {
-		t.Errorf("思考反馈 send call = %+v, 期望 user123/%q", calls[0], dingtalkThinkingFeedback)
+		t.Errorf("思考占位 send call = %+v, 期望 user123/%q", calls[0], dingtalkThinkingFeedback)
 	}
 	if calls[1].Text != "回复: 你好世界" {
 		t.Errorf("回复发送内容 = %q, 期望 %q", calls[1].Text, "回复: 你好世界")
 	}
+	// 答案就位后撤回占位：占位是首条发送(pqk-0)
+	recalls := fakeAPI.RecallCalls()
+	if len(recalls) != 1 || len(recalls[0]) != 1 || recalls[0][0] != "pqk-0" {
+		t.Errorf("应撤回思考占位 pqk-0，实际 recall = %+v", recalls)
+	}
 }
 
-func TestHandleMessageThinkingFeedbackFailureDoesNotBlockReply(t *testing.T) {
+// TestHandleMessageThinkingFeedbackRecalledAfterReply_BUG20260704 锁定：钉钉发送前仍先发
+// 「已收到，正在思考…」占位给用户即时反馈；最终答案送达后撤回该占位，使其不残留在会话里。
+func TestHandleMessageThinkingFeedbackRecalledAfterReply_BUG20260704(t *testing.T) {
 	a := newTestAdapter()
 	a.handler = func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
-		return &adapter.Reply{Content: "最终回复"}, nil
+		return &adapter.Reply{Content: "最终答案"}, nil
 	}
 	fakeAPI := newFakeDingtalkOpenAPI("test-token")
-	fakeAPI.sendErrs = []error{errors.New("feedback failed"), nil}
 	a.openAPI = fakeAPI
 
 	event := dtEvent{SenderStaffId: "user123", SenderNick: "TestUser"}
-	event.Text.Content = "hello"
+	event.Text.Content = "你好世界"
 
 	a.handleMessage(event)
 
+	// 发送顺序：先占位(pqk-0)，后最终答案(pqk-1)
 	calls := fakeAPI.SendCalls()
 	if len(calls) != 2 {
-		t.Fatalf("反馈失败也应继续发送最终回复，实际发送 %d 次", len(calls))
+		t.Fatalf("应先发占位再发答案，实际发送 %d 次：%+v", len(calls), calls)
 	}
 	if calls[0].Text != dingtalkThinkingFeedback {
-		t.Errorf("第一次应发送思考反馈，实际 %q", calls[0].Text)
+		t.Errorf("第一条应为思考占位，实际 %q", calls[0].Text)
 	}
-	if calls[1].Text != "最终回复" {
-		t.Errorf("最终回复 = %q, 期望 %q", calls[1].Text, "最终回复")
+	if calls[1].Text != "最终答案" {
+		t.Errorf("第二条应为最终答案，实际 %q", calls[1].Text)
+	}
+	// 答案送达后撤回占位（且撤回的是占位那条 pqk-0，绝不能误撤答案 pqk-1）
+	recalls := fakeAPI.RecallCalls()
+	if len(recalls) != 1 || len(recalls[0]) != 1 || recalls[0][0] != "pqk-0" {
+		t.Fatalf("应撤回思考占位 pqk-0（不撤答案），实际 recall = %+v", recalls)
 	}
 }
 
-func TestHandleMessageErrorSendsThinkingFeedbackThenErrorReply(t *testing.T) {
+func TestHandleMessageErrorSendsFeedbackThenErrorReplyAndRecalls(t *testing.T) {
 	a := newTestAdapter()
 	a.handler = func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
 		return nil, errors.New("llm failed")
@@ -397,13 +437,18 @@ func TestHandleMessageErrorSendsThinkingFeedbackThenErrorReply(t *testing.T) {
 
 	calls := fakeAPI.SendCalls()
 	if len(calls) != 2 {
-		t.Fatalf("handler 失败时应发送思考反馈和错误回复，实际发送 %d 次", len(calls))
+		t.Fatalf("handler 失败时应先发占位再发错误回复，实际发送 %d 次", len(calls))
 	}
 	if calls[0].Text != dingtalkThinkingFeedback {
-		t.Errorf("第一次应发送思考反馈，实际 %q", calls[0].Text)
+		t.Errorf("第一条应为思考占位，实际 %q", calls[0].Text)
 	}
 	if calls[1].Text != "处理消息时出现错误，请稍后重试。" {
 		t.Errorf("错误回复 = %q", calls[1].Text)
+	}
+	// 错误路径也要撤回占位，避免残留
+	recalls := fakeAPI.RecallCalls()
+	if len(recalls) != 1 || len(recalls[0]) != 1 || recalls[0][0] != "pqk-0" {
+		t.Errorf("错误路径也应撤回思考占位 pqk-0，实际 recall = %+v", recalls)
 	}
 }
 
