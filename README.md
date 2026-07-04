@@ -628,7 +628,7 @@ go run ./cmd/verify-release -repo . -version 0.4.4 -version-files package.json
 |------|------|
 | 语言 | Go 1.25.7+ |
 | Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.5.8 |
-| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.2.0 |
+| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.2.1 |
 | 工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) v0.2.6 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | 配置 | YAML + 环境变量 |
@@ -672,7 +672,7 @@ chore: 构建/工具链
 | 项目 | 说明 | 仓库 |
 |------|------|------|
 | **Hexagon** | Go AI Agent 框架 (核心引擎) v0.5.8 | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.2.0 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.2.1 | [ai-core](https://github.com/hexagon-codes/ai-core) |
 | **toolkit** | Go 通用工具库 v0.2.6 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI 观测面板 (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
 | **hexclaw-desktop** | HexClaw 桌面客户端 (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
@@ -683,7 +683,7 @@ chore: 构建/工具链
 ### Unreleased
 
 **依赖与 CI/CD**
-- **框架依赖升级** — 当前 `go.mod` 对齐 hexagon v0.5.8 / ai-core v0.2.0 / toolkit v0.2.6，并统一 Go 1.25.7；`GOWORK=off go test ./... -run '^$'` 已通过，发版/CI 模式下全仓编译不再依赖本地工作区隐式版本。
+- **框架依赖升级** — 当前 `go.mod` 对齐 hexagon v0.5.8 / ai-core v0.2.1 / toolkit v0.2.6，并统一 Go 1.25.7；`GOWORK=off go test ./... -run '^$'` 已通过，发版/CI 模式下全仓编译不再依赖本地工作区隐式版本。
 - **CI/CD 复验口径** — `sandbox-code-exec.yml` 已作为默认分支专项 workflow，覆盖 toolkit 联调下的 Linux/macOS code_exec 强沙箱路径，并保留 Windows toolkit sandbox 硬门禁；Windows code_exec runtime 集成用例按当前 toolkit 工具链/设备访问能力门控。普通 Linux CI 对真实沙箱执行型用例按后端能力门控，专项 workflow 通过 `HEXCLAW_P0_SANDBOX_PROOF=1` 强制验证。runner 完整性探针已默认跳过，仅在 `HEXCLAW_RUNNER_PROBE=1` 时手工触发；`go test -race -count=1 -coverprofile=/tmp/hexclaw-coverage.out ./...` 已通过。
 - **code_exec 沙箱兼容性** — Windows 执行包装改为临时 `.cmd` 文件，避免带 `C:\...` 的多行脚本文本触发 toolkit ADS 防逃逸校验；默认 `max_memory_bytes` 提升到 2GiB，满足 Go/Node runtime 在强沙箱中的冷启动需求。
 

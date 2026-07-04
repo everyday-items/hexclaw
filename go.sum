@@ -112,8 +112,8 @@ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aN
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs4luLUK2k=
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
-github.com/hexagon-codes/ai-core v0.2.0 h1:bHBvkLGcQFA8wGvDJmIAA+hep2dqSRkdIEU9mz1a7Ac=
-github.com/hexagon-codes/ai-core v0.2.0/go.mod h1:GSHC9DE1L7M+k6GHeHEKXvin71LABLwJV1CEu8JImnk=
+github.com/hexagon-codes/ai-core v0.2.1 h1:jXWDix4/rY3eubSNuj5iZ57N0ebkL3trZcfrw5HWtMc=
+github.com/hexagon-codes/ai-core v0.2.1/go.mod h1:GSHC9DE1L7M+k6GHeHEKXvin71LABLwJV1CEu8JImnk=
 github.com/hexagon-codes/dingtalk-stream-sdk-go v0.9.1-hexclaw.1 h1:n0d/y633PCHQHUFwglSR8BmapVNTrqaXBKOerjs0AqY=
 github.com/hexagon-codes/dingtalk-stream-sdk-go v0.9.1-hexclaw.1/go.mod h1:ln3IqPYYocZbYvl9TAOrG/cxGR9xcn4pnZRLdCTEGEU=
 github.com/hexagon-codes/hexagon v0.5.8 h1:sRXcNDyVpQWC8zPIiXZaoLEDRzQDi2JPDxyzv8axDzw=
@@ -153,8 +153,6 @@ github.com/ncruces/go-strftime v1.0.0 h1:HMFp8mLCTPp341M/ZnA4qaf7ZlsbTc+miZjCLOF
 github.com/ncruces/go-strftime v1.0.0/go.mod h1:Fwc5htZGVVkseilnfgOVb9mKy6w1naJmn9CehxcKcls=
 github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e h1:fD57ERR4JtEqsWbfPhv4DMiApHyliiK5xCTNVSPiaAs=
 github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e/go.mod h1:zD1mROLANZcx1PVRCS0qkT7pwLkGfwJo4zjcN/Tysno=
-github.com/open-dingtalk/dingtalk-stream-sdk-go v0.9.1 h1:Lb/Uzkiw2Ugt2Xf03J5wmv81PdkYOiWbI8CNBi1boC8=
-github.com/open-dingtalk/dingtalk-stream-sdk-go v0.9.1/go.mod h1:ln3IqPYYocZbYvl9TAOrG/cxGR9xcn4pnZRLdCTEGEU=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4/go.mod h1:xMI15A0UPsDsEKsMN9yxemIoYk6Tm2C1GtYGdfGttqA=
