@@ -834,71 +834,10 @@ func TestReActEngine_ProcessStreamRecoversReasoningOnlyResponse(t *testing.T) {
 	}
 }
 
-func TestReActEngine_ProcessStreamRecoversThinkingTimeout(t *testing.T) {
-	var calls int32
-	provider := mockllm.NewLLMProvider("ollama").WithResponseFn(func(req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
-		call := atomic.AddInt32(&calls, 1)
-		if call == 1 {
-			if got := req.Metadata["thinking"]; got != "on" {
-				t.Fatalf("首个流式降级请求应保留 thinking:on，实际 %#v", req.Metadata)
-			}
-			return nil, context.DeadlineExceeded
-		}
-		if got := req.Metadata["thinking"]; got != "off" {
-			t.Fatalf("stream timeout 恢复请求应关闭 thinking，实际 %#v", req.Metadata)
-		}
-		return &hexagon.CompletionResponse{
-			Content: "流式直接回答",
-			Usage:   hexagon.Usage{TotalTokens: 8},
-		}, nil
-	})
-
-	eng := newEngineWithProviders(t, map[string]hexagon.Provider{
-		"ollama": provider,
-	}, map[string]config.LLMProviderConfig{
-		"ollama": {Model: "qwen3.5:9b"},
-	}, "ollama")
-
-	ch, err := eng.ProcessStream(context.Background(), &adapter.Message{
-		ID:       "msg-stream-thinking-timeout",
-		Platform: adapter.PlatformAPI,
-		UserID:   "user-001",
-		Content:  "你想吃点什么？",
-		Metadata: map[string]string{"thinking": "on"},
-	})
-	if err != nil {
-		t.Fatalf("ProcessStream 失败: %v", err)
-	}
-
-	var content strings.Builder
-	var done *adapter.ReplyChunk
-	for chunk := range ch {
-		if chunk.Error != nil {
-			t.Fatalf("chunk error: %v", chunk.Error)
-		}
-		content.WriteString(chunk.Content)
-		if chunk.Done {
-			copied := *chunk
-			done = &copied
-		}
-	}
-
-	if content.String() != "流式直接回答" {
-		t.Fatalf("thinking timeout 流式回复应恢复为直接回答，实际 %q", content.String())
-	}
-	if done == nil {
-		t.Fatal("未收到 done chunk")
-	}
-	if done.Metadata["finish_reason"] != "thinking_timeout" {
-		t.Fatalf("timeout 标记未返回，metadata=%#v", done.Metadata)
-	}
-	if done.Metadata["recovered_from_reasoning_only"] != "true" {
-		t.Fatalf("恢复标记未返回，metadata=%#v", done.Metadata)
-	}
-	if provider.CallCount() != 2 {
-		t.Fatalf("应执行一次 stream timeout 恢复重试，实际调用 %d 次", provider.CallCount())
-	}
-}
+// 注：原 TestReActEngine_ProcessStreamRecoversThinkingTimeout 断言的是「thinking:on 流式→
+// 有界非流式补全→90s 硬切→降级 thinking:off 恢复」这套已被 BUG-20260704 移除的行为
+// （它丢原生推理、造成截断）。新契约由 bug_20260704_ollama_native_thinking_test.go 的三个用例
+// 钉死：默认 think:off、开则 think:on 透传、开则推理**流式**透出（stream 而非有界 complete）。
 
 func TestReActEngine_ProcessStreamEstimatesUsageWhenProviderOmitsUsage(t *testing.T) {
 	eng := newEngineWithProvider(t, &usageLessStreamProvider{})

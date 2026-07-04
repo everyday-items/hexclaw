@@ -1282,16 +1282,6 @@ func shouldBoundThinkingCompletion(providerName, modelName string, req hexagon.C
 	return strings.EqualFold(strings.TrimSpace(fmt.Sprint(req.Metadata["thinking"])), "on")
 }
 
-func shouldBoundThinkingMessage(providerName, modelName string, metadata map[string]string) bool {
-	if metadata == nil {
-		return false
-	}
-	if !isLocalProvider(providerName) || !isLocalThinkingModel(modelName) {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(metadata["thinking"]), "on")
-}
-
 // getProviderModel 安全获取 Provider 的模型名称
 func (e *ReActEngine) getProviderModel(providerName string, metadata map[string]string) string {
 	if model := requestedModel(metadata); model != "" {
@@ -1683,44 +1673,13 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		}
 	}
 
-	if shouldBoundThinkingMessage(selection.providerName, selection.modelName, msg.Metadata) {
-		trace.L(ctx).Info("thinking:on 流式请求切换为有界补全", "provider", selection.providerName, "model", selection.modelName, "session", sess.ID)
-		goroutineLaunched = true
-		ch := make(chan *adapter.ReplyChunk, 2)
-		go func() {
-			defer close(ch)
-			if sessionUnlock != nil {
-				defer sessionUnlock()
-			}
-			reply, err := e.completeWithTools(
-				ctx,
-				sess.ID,
-				msg,
-				history,
-				kbContext,
-				selection.provider,
-				selection.providerName,
-				selection.modelName,
-				selection.explicitProvider,
-				cacheInput,
-			)
-			if err != nil {
-				ch <- &adapter.ReplyChunk{Error: err, Done: true}
-				return
-			}
-			if reply.Content != "" {
-				ch <- &adapter.ReplyChunk{Content: reply.Content}
-			}
-			ch <- &adapter.ReplyChunk{
-				Done:      true,
-				Metadata:  reply.Metadata,
-				Usage:     reply.Usage,
-				ToolCalls: reply.ToolCalls,
-			}
-		}()
-		return ch, nil
-	}
-
+	// BUG-20260704：深度思考开启的本地 thinking 模型（qwen3.5:9b 等）**照常走原生流式**。
+	// 旧实现把 thinking:on 的本地流式请求切到有界非流式 completeWithTools——而非流式 Complete
+	// 会丢掉 Ollama 的 message.thinking（adapter.parseResponse 不拷贝、CompletionResponse 无
+	// Reasoning 字段），90s 硬切还会截断并降级 thinking:off，导致「开了深度思考却看不到推理、
+	// 还慢」。ai-core 原生 ollama adapter 的 Stream 会把 thinking 作为 reasoning 增量分离透出，
+	// 与云端 thinking 模型（DeepSeek 等）同构：推理边想边显示、不阻塞、用户可随时停止，
+	// 无需有界补全那套（那套本就是原生推理未透出年代的过渡挡板，现已多余且有害）。
 	goroutineLaunched = true
 	return e.processStreamRuntime(ctx, sess.ID, msg, history, kbContext, &selection, cacheInput, sessionUnlock)
 }
