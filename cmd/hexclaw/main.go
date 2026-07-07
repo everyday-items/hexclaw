@@ -696,20 +696,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			// #6/#8 注入 LLM（复用 Agent 的 LLM router）：重排 + 查询扩展。
 			// router 为 nil 时不注入 → rerank/query-expand 自动降级关闭（安全）。
 			if router != nil {
-				mgrOpts = append(mgrOpts, knowledge.WithLLM(knowledge.RerankLLMFunc(
-					func(ctx context.Context, prompt string) (string, error) {
-						provider, _, rErr := router.Route(ctx)
-						if rErr != nil {
-							return "", rErr
-						}
-						resp, cErr := provider.Complete(ctx, hexagon.CompletionRequest{
-							Messages: []hexagon.Message{{Role: hexagon.RoleUser, Content: prompt}},
-						})
-						if cErr != nil {
-							return "", cErr
-						}
-						return resp.Content, nil
-					})))
+				// BUG-20260704：辅助 LLM 路由到本地单槽 provider 时跳过，避让前台主聊天（见 retrieval_llm.go）。
+				mgrOpts = append(mgrOpts, knowledge.WithLLM(newRetrievalRerankLLM(router)))
 				// 多模态入库：注入视觉转写器（router 的视觉模型给图片生成中文描述，再走文本 RAG 入库）。
 				// router 为 nil 时不注入 → AddImageDocument 优雅报错而非吞入垃圾。
 				mgrOpts = append(mgrOpts, knowledge.WithCaptioner(knowledge.CaptionerFunc(
