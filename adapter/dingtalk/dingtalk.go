@@ -62,9 +62,16 @@ func New(cfg config.DingtalkConfig) *DingtalkAdapter {
 	return a
 }
 
+// dingtalkThinkingFeedback 是「收到消息、正在处理」的占位提示。发送前先发它给用户即时反馈，
+// 最终答案输出后再撤回（recall），使占位不残留（BUG-20260704：不删除占位、改为答案就位后撤回）。
+const dingtalkThinkingFeedback = "⌨️ 已收到，正在思考…"
+
 type dingtalkOpenAPI interface {
 	GetAccessToken(ctx context.Context, appKey, appSecret string) (string, time.Duration, error)
-	SendOTO(ctx context.Context, accessToken, robotCode, userID string, msg dingtalkOutboundMessage) error
+	// SendOTO 发送单聊消息，返回 processQueryKey（钉钉消息标识，供后续撤回）。
+	SendOTO(ctx context.Context, accessToken, robotCode, userID string, msg dingtalkOutboundMessage) (processQueryKey string, err error)
+	// RecallOTO 按 processQueryKey 批量撤回此前主动发送的单聊消息。
+	RecallOTO(ctx context.Context, accessToken, robotCode string, processQueryKeys []string) error
 }
 
 // dingtalkOutboundMessage 是钉钉出站消息的传输形态：MsgKey 选择消息类型
@@ -74,8 +81,6 @@ type dingtalkOutboundMessage struct {
 	MsgKey   string
 	MsgParam string
 }
-
-const dingtalkThinkingFeedback = "⌨️ 已收到，正在思考…"
 
 type officialDingtalkOpenAPI struct {
 	oauth   *dtoauth.Client
@@ -147,7 +152,7 @@ func (c *officialDingtalkOpenAPI) GetAccessToken(_ context.Context, appKey, appS
 	return *resp.Body.AccessToken, expire, nil
 }
 
-func (c *officialDingtalkOpenAPI) SendOTO(_ context.Context, accessToken, robotCode, userID string, msg dingtalkOutboundMessage) error {
+func (c *officialDingtalkOpenAPI) SendOTO(_ context.Context, accessToken, robotCode, userID string, msg dingtalkOutboundMessage) (string, error) {
 	resp, err := c.robot.BatchSendOTOWithOptions(
 		(&dtrobot.BatchSendOTORequest{}).
 			SetRobotCode(robotCode).
@@ -158,21 +163,51 @@ func (c *officialDingtalkOpenAPI) SendOTO(_ context.Context, accessToken, robotC
 		c.runtime,
 	)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if resp != nil && resp.StatusCode != nil && *resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("钉钉机器人发送返回 %d", *resp.StatusCode)
+		return "", fmt.Errorf("钉钉机器人发送返回 %d", *resp.StatusCode)
 	}
 	if resp != nil && resp.Body != nil {
 		if len(resp.Body.InvalidStaffIdList) > 0 {
-			return fmt.Errorf("钉钉机器人发送失败，无效用户: %s", joinStringPtrs(resp.Body.InvalidStaffIdList))
+			return "", fmt.Errorf("钉钉机器人发送失败，无效用户: %s", joinStringPtrs(resp.Body.InvalidStaffIdList))
 		}
 		if len(resp.Body.FilteredStaffIdList) > 0 {
-			return fmt.Errorf("钉钉机器人发送被过滤: %s", joinStringPtrs(resp.Body.FilteredStaffIdList))
+			return "", fmt.Errorf("钉钉机器人发送被过滤: %s", joinStringPtrs(resp.Body.FilteredStaffIdList))
 		}
 		if len(resp.Body.FlowControlledStaffIdList) > 0 {
-			return fmt.Errorf("钉钉机器人发送被限流: %s", joinStringPtrs(resp.Body.FlowControlledStaffIdList))
+			return "", fmt.Errorf("钉钉机器人发送被限流: %s", joinStringPtrs(resp.Body.FlowControlledStaffIdList))
 		}
+		if resp.Body.ProcessQueryKey != nil {
+			return *resp.Body.ProcessQueryKey, nil
+		}
+	}
+	return "", nil
+}
+
+// RecallOTO 按 processQueryKey 撤回此前发送的单聊消息（用于答案就位后撤回「正在思考」占位）。
+func (c *officialDingtalkOpenAPI) RecallOTO(_ context.Context, accessToken, robotCode string, processQueryKeys []string) error {
+	keys := make([]*string, 0, len(processQueryKeys))
+	for _, k := range processQueryKeys {
+		if k != "" {
+			keys = append(keys, tea.String(k))
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	resp, err := c.robot.BatchRecallOTOWithOptions(
+		(&dtrobot.BatchRecallOTORequest{}).
+			SetRobotCode(robotCode).
+			SetProcessQueryKeys(keys),
+		(&dtrobot.BatchRecallOTOHeaders{}).SetXAcsDingtalkAccessToken(accessToken),
+		c.runtime,
+	)
+	if err != nil {
+		return err
+	}
+	if resp != nil && resp.StatusCode != nil && *resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("钉钉机器人撤回返回 %d", *resp.StatusCode)
 	}
 	return nil
 }
@@ -377,22 +412,80 @@ func (a *DingtalkAdapter) sendReplyNow(ctx context.Context, chatID string, reply
 	if err != nil {
 		return fmt.Errorf("初始化钉钉官方 SDK 失败: %w", err)
 	}
-	if err := api.SendOTO(ctx, token, a.cfg.RobotCode, chatID, dingtalkMarkdownMessage(reply.Content)); err != nil {
+	if _, err := api.SendOTO(ctx, token, a.cfg.RobotCode, chatID, dingtalkMarkdownMessage(reply.Content)); err != nil {
 		return fmt.Errorf("发送消息失败: %w", err)
 	}
 	return nil
 }
 
+// sendThinkingFeedback 发送「正在思考」占位并返回其 processQueryKey（供答案就位后撤回）。
+// 直连 SendOTO（不过发送队列）以拿到消息标识；任何失败都返回空 key，调用方据此跳过撤回、不阻断主流程。
+func (a *DingtalkAdapter) sendThinkingFeedback(ctx context.Context, chatID string) string {
+	if strings.TrimSpace(chatID) == "" {
+		return ""
+	}
+	if a.cfg.AppKey == "" || a.cfg.AppSecret == "" || a.cfg.RobotCode == "" {
+		return ""
+	}
+	token, err := a.getAccessToken(ctx)
+	if err != nil {
+		logger.Error("[dingtalk] 思考占位取 Access Token 失败", "error", err)
+		return ""
+	}
+	api, err := a.apiClient()
+	if err != nil {
+		logger.Error("[dingtalk] 思考占位初始化 SDK 失败", "error", err)
+		return ""
+	}
+	key, err := api.SendOTO(ctx, token, a.cfg.RobotCode, chatID, dingtalkMarkdownMessage(dingtalkThinkingFeedback))
+	if err != nil {
+		logger.Error("[dingtalk] 发送思考占位失败", "error", err)
+		return ""
+	}
+	return key
+}
+
+// recallThinkingFeedback 撤回先前发送的「正在思考」占位（processQueryKey 为空则跳过）。
+// 撤回失败仅记录不阻断：占位残留是可接受降级，最终答案已送达。
+func (a *DingtalkAdapter) recallThinkingFeedback(ctx context.Context, processQueryKey string) {
+	if strings.TrimSpace(processQueryKey) == "" {
+		return
+	}
+	token, err := a.getAccessToken(ctx)
+	if err != nil {
+		logger.Error("[dingtalk] 撤回思考占位取 Access Token 失败", "error", err)
+		return
+	}
+	api, err := a.apiClient()
+	if err != nil {
+		logger.Error("[dingtalk] 撤回思考占位初始化 SDK 失败", "error", err)
+		return
+	}
+	if err := api.RecallOTO(ctx, token, a.cfg.RobotCode, []string{processQueryKey}); err != nil {
+		logger.Error("[dingtalk] 撤回思考占位失败", "error", err)
+	}
+}
+
+// dingtalkEmptyReplyFallback 是「正文为空」时的兜底文案（BUG-20260704）。
+// 钉钉 sampleMarkdown 的 text 必填，空 text 会被硬拒 400 miss.param.markdownTotext。
+// 空正文来源：推理型模型只产出 <think> 被 StripThinking 剥空、纯工具调用轮无正文、审核截断等。
+const dingtalkEmptyReplyFallback = "⚠️ 本次没有生成有效内容，请重试。"
+
 // dingtalkMarkdownMessage 构造 sampleMarkdown 出站消息（BUG-20260703 B7）。
 //
 // 钉钉 text 消息不渲染 markdown，LLM 产出的 ### 标题/加粗会裸露给用户；
 // sampleMarkdown 原生渲染标题/加粗/链接/列表子集（纯文本内容按 markdown 发送
-// 显示不变）。载荷为 {"title","text"}，title 必填（用作推送通知摘要），从正文
-// 首个非空行派生并剥掉 markdown 标记。
+// 显示不变）。载荷为 {"title","text"}，title/text 均必填（钉钉硬约束）——title 从正文
+// 首个非空行派生（有兜底），text 同理：正文为空/纯空白时用兜底文案，绝不产出空 text
+// （BUG-20260704，与 title 兜底对称，使非法载荷在构造点即不可表达）。
 func dingtalkMarkdownMessage(content string) dingtalkOutboundMessage {
+	text := content
+	if strings.TrimSpace(text) == "" {
+		text = dingtalkEmptyReplyFallback
+	}
 	return dingtalkOutboundMessage{
 		MsgKey:   "sampleMarkdown",
-		MsgParam: marshalMarkdownContent(dingtalkMessageTitle(content), content),
+		MsgParam: marshalMarkdownContent(dingtalkMessageTitle(content), text),
 	}
 }
 
@@ -450,7 +543,8 @@ func (a *DingtalkAdapter) handleMessage(event dtEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	a.sendThinkingFeedback(ctx, msg.ChatID)
+	// 发送前先发「正在思考」占位给用户即时反馈；拿到其标识，答案就位后撤回（BUG-20260704）。
+	thinkingKey := a.sendThinkingFeedback(ctx, msg.ChatID)
 
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
@@ -458,9 +552,13 @@ func (a *DingtalkAdapter) handleMessage(event dtEvent) {
 		errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer errCancel()
 		_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{Content: "处理消息时出现错误，请稍后重试。"})
+		a.recallThinkingFeedback(errCtx, thinkingKey)
 		return
 	}
 	if reply == nil {
+		rcCtx, rcCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer rcCancel()
+		a.recallThinkingFeedback(rcCtx, thinkingKey)
 		return
 	}
 
@@ -469,24 +567,8 @@ func (a *DingtalkAdapter) handleMessage(event dtEvent) {
 	if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
 		logger.Error("钉钉: 发送回复失败", "error", err)
 	}
-}
-
-func (a *DingtalkAdapter) sendThinkingFeedback(parent context.Context, chatID string) {
-	if strings.TrimSpace(chatID) == "" {
-		return
-	}
-	if a.cfg.AppKey == "" || a.cfg.AppSecret == "" || a.cfg.RobotCode == "" {
-		return
-	}
-	if parent == nil {
-		parent = context.Background()
-	}
-	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-	defer cancel()
-
-	if err := a.Send(ctx, chatID, &adapter.Reply{Content: dingtalkThinkingFeedback}); err != nil {
-		logger.Error("[dingtalk] 发送思考反馈失败", "error", err)
-	}
+	// 答案已送达 → 撤回占位，使其不残留。
+	a.recallThinkingFeedback(sendCtx, thinkingKey)
 }
 
 // ============== Token 管理 ==============
