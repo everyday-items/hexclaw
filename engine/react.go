@@ -916,7 +916,8 @@ func (e *ReActEngine) completeWithTools(
 		})
 		tools = stripCronRecursiveTools(msg, tools) // 功能优先：cron/webhook/workflow 不再剥离工具
 		tools = e.ensureSystemDispatchToolFloor(tools, msg)
-		tools = e.ensureMountedSkillTools(tools, msg.Metadata) // bug#2：显式挂载技能的工具强制前置，保证不被 maxTools 截断
+		tools = e.ensureMountedSkillTools(tools, msg.Metadata)                // bug#2：显式挂载技能的工具强制前置，保证不被 maxTools 截断
+		tools = e.filterInternalRetrievalToolsForPersona(tools, msg.Metadata) // BUG-20260704：挂载 persona 时剥离内部检索工具，防模型主动拉回旧内容压过人设
 		tools = restrictToolsToCodeExecWhenRequired(tools, msg.Content)
 		if cap := effectiveMaxTools(toolsCfg.MaxTools, msg); cap > 0 && len(tools) > cap {
 			tools = tools[:cap]
@@ -1716,7 +1717,8 @@ func (e *ReActEngine) processStreamRuntime(
 			tools = stripSpawnRecursiveTools(msg, tools) // 子 Agent leaf 防护：到顶剔除 spawn/orchestrate/transfer（P0-2）
 			tools = applyInheritedToolPolicy(msg, tools) // 工具继承：按父收窄的 allow/deny 过滤子 Agent 工具（feature 2）
 			tools = e.ensureSystemDispatchToolFloor(tools, msg)
-			tools = e.ensureMountedSkillTools(tools, msg.Metadata) // bug#2：显式挂载技能的工具强制前置，保证不被 maxTools 截断
+			tools = e.ensureMountedSkillTools(tools, msg.Metadata)                // bug#2：显式挂载技能的工具强制前置，保证不被 maxTools 截断
+			tools = e.filterInternalRetrievalToolsForPersona(tools, msg.Metadata) // BUG-20260704：挂载 persona 时剥离内部检索工具，防模型主动拉回旧内容压过人设
 			tools = restrictToolsToCodeExecWhenRequired(tools, msg.Content)
 			if cap := effectiveMaxTools(streamToolsCfg.MaxTools, msg); cap > 0 && len(tools) > cap {
 				tools = tools[:cap]
@@ -3429,6 +3431,31 @@ type skillContentLoader interface {
 	LoadContent() (string, error)
 }
 
+// hasMountedPersonaSkill 报告用户是否显式挂载了至少一个 persona（正文注入型）技能。
+// BUG-20260704：persona 技能塑造整段回复口吻，跨会话记忆/召回的无关旧上下文会压过人设——
+// 故挂载 persona 时抑制记忆召回，让人设独占本轮（与 matchSkillFastPath 的 G1 让路同一纪律）。
+// 纯工具类挂载技能不触发抑制（工具不与记忆冲突）。
+func (e *ReActEngine) hasMountedPersonaSkill(metadata map[string]string) bool {
+	names := mountedSkillNames(metadata)
+	if len(names) == 0 {
+		return false
+	}
+	e.mu.RLock()
+	skills := e.skills
+	e.mu.RUnlock()
+	if skills == nil {
+		return false
+	}
+	for _, name := range names {
+		if s, ok := skills.Get(name); ok {
+			if _, isPersona := s.(skillContentLoader); isPersona {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // buildMountedSkillsPrompt 把用户显式挂载的 persona 类技能正文注入 system prompt，
 // 使其当轮即生效（不依赖模型主动调用工具）。bug#2 2026-06-23。
 func (e *ReActEngine) buildMountedSkillsPrompt(names []string) string {
@@ -3521,6 +3548,40 @@ func (e *ReActEngine) ensureMountedSkillTools(tools []llm.ToolDefinition, metada
 	return append(front, rest...)
 }
 
+// internalRetrievalToolNames 是「读取内部跨会话/KB 上下文」的工具名集——恰好是 buildTurnContext
+// 里 KB [参考知识] + activeRecall 两路**自动注入**的「模型主动调用」对应物。
+var internalRetrievalToolNames = map[string]bool{
+	"knowledge_search": true, // ⇔ 自动 [参考知识] KB 注入
+	"session_search":   true, // ⇔ 自动跨会话主动召回
+}
+
+// filterInternalRetrievalToolsForPersona 在用户显式挂载 persona 技能时，从工具集移除内部检索工具
+// （knowledge_search / session_search）。BUG-20260704 残留漏点：buildTurnContext 已抑制这两路的
+// **自动注入**，但模型仍可**主动调用**同名工具把无关的跨会话/KB 旧内容当工具结果拉回，绕过抑制、
+// 压过人设（「debug 帮手」型人设尤其会诱导模型主动检索）。此处剥离与自动注入抑制对称，让人设独占本轮。
+//
+// 边界：① 仅剥离「自动召回进来的」——用户**显式挂载**的检索工具保留（bug#2 显式挂载=必给契约胜出，
+// 表示用户明确要它）；② web_search / weather / browser 等**外部**信息工具不受影响（persona 仍可合法
+// 上网检索，只是不能拉内部陈旧上下文覆盖人设）；③ 纯工具挂载不触发（hasMountedPersonaSkill 为假）。
+func (e *ReActEngine) filterInternalRetrievalToolsForPersona(tools []llm.ToolDefinition, metadata map[string]string) []llm.ToolDefinition {
+	if len(tools) == 0 || !e.hasMountedPersonaSkill(metadata) {
+		return tools
+	}
+	mounted := make(map[string]bool)
+	for _, n := range mountedSkillNames(metadata) {
+		mounted[llmToolNameSlug(n)] = true // 与工具名 slug 规则对齐
+	}
+	out := make([]llm.ToolDefinition, 0, len(tools))
+	for _, t := range tools {
+		name := t.Function.Name
+		if internalRetrievalToolNames[name] && !mounted[name] {
+			continue // persona 挂载 + 非显式挂载的内部检索工具 → 剥离
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
 // buildTurnContext 构建「每轮易变」的上下文（当前时间 + KB 检索结果 + 长期记忆召回），
 // 拼到当轮 user 消息（history 之后），而非 system prompt —— 让 system+history 成为稳定
 // 可缓存前缀，避免每轮检索/记忆/时间的变化击穿 Anthropic/DeepSeek 等的前缀缓存（省 token + 降延迟）。
@@ -3532,13 +3593,20 @@ func (e *ReActEngine) buildTurnContext(ctx context.Context, metadata map[string]
 	// 当前时间（每分钟变 → 必须留在当轮，不能进可缓存前缀）
 	sb.WriteString("[当前时间] " + time.Now().Format("2006-01-02 15:04 (Monday)") + "\n")
 
-	// KB 检索结果（查询相关）
-	if kbContext != "" {
+	// BUG-20260704：用户显式挂载了 persona 技能即表达「本轮由该人设塑造回复」（G1 原则，见
+	// matchSkillFastPath）——所有查询相关的背景注入（KB 检索 / 跨会话长期记忆 / 主动召回）都会把
+	// 无关旧上下文当「参考知识/历史片段」塞进来，直接淹没并压过人设（实测挂「前女友」问「想我了吗」
+	// 或挂「前leader」提「加班/bug」，模型反而去做代码审查；memory=off 亦无法挡 KB 那路）。
+	// 故挂载 persona 时一并抑制 KB + 记忆 + 主动召回，让人设独占本轮；纯工具挂载不受影响。
+	personaMounted := e.hasMountedPersonaSkill(metadata)
+
+	// KB 检索结果（查询相关）；挂载 persona 时让路
+	if kbContext != "" && !personaMounted {
 		sb.WriteString("\n[参考知识]\n" + kbContext + "\n")
 	}
 
 	// 长期记忆召回（查询相关，三维打分），尊重 memory=off 门控；按角色隔离。
-	memoryOff := metadata != nil && metadata["memory"] == "off"
+	memoryOff := (metadata != nil && metadata["memory"] == "off") || personaMounted
 	var injectedMem string // 本轮已注入的策展记忆，供 G② 主动召回去重（坑F）
 	if e.fileMem != nil && !memoryOff {
 		role := ""
