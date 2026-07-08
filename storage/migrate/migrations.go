@@ -379,6 +379,36 @@ CREATE TABLE IF NOT EXISTS memories (
 		// ALTER ADD COLUMN 幂等：列已存在时报错被 migrate.Run 捕获跳过。
 		SQL: `ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '';`,
 	},
+	{
+		Version:     8,
+		Description: "v0.5.0 M1-6 记录本原语：agent_records 通用记录表（领域中性；场景包通过 RecordSchemaRegistry 声明记录集，平台不认识 K12）",
+		// 设计见 架构设计和执行计划-v0.5.0.md §5.2.3 / §6.4-6.5。
+		// 通用基建列 typed；领域字段(knowledgePoint/errorCause 等)进 fields_json，平台不 typed。
+		// 隔离键 = agent_name(REFERENCES agents(name)=不可变 PK)，display_name 才是可变显示名。
+		SQL: `
+CREATE TABLE IF NOT EXISTS agent_records (
+    record_id         TEXT     PRIMARY KEY,
+    agent_name        TEXT     NOT NULL REFERENCES agents(name) ON DELETE CASCADE,
+    collection        TEXT     NOT NULL,
+    schema_version    INTEGER  NOT NULL DEFAULT 1,
+    status            TEXT     NOT NULL,
+    fields_json       TEXT     NOT NULL DEFAULT '{}',
+    dedupe_key        TEXT     NOT NULL,
+    tags_json         TEXT     NOT NULL DEFAULT '[]',
+    due_at            INTEGER,
+    source_session_id TEXT     NOT NULL DEFAULT '',
+    version           INTEGER  NOT NULL DEFAULT 0,
+    created_at        INTEGER  NOT NULL,
+    updated_at        INTEGER  NOT NULL
+);
+-- 多孩隔离 + 记录集 + 状态：复习列表/派生指标的主查询路径
+CREATE INDEX IF NOT EXISTS idx_agent_records_scope ON agent_records(agent_name, collection, status);
+-- 复习队列：按到期排序（仅索引有 due 的行，避免全表）
+CREATE INDEX IF NOT EXISTS idx_agent_records_due ON agent_records(agent_name, collection, due_at) WHERE due_at IS NOT NULL;
+-- 幂等写：同实例+记录集内 dedupe_key 唯一（防同题重复入库膨胀）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_records_dedupe ON agent_records(agent_name, collection, dedupe_key);
+`,
+	},
 }
 
 // migrateCronV2 把 cron v1 schema 升级到 v2（详见 .claude/cron-script-compilation-design.md）。
