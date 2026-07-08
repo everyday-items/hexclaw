@@ -61,10 +61,13 @@ func (p *MyPlugin) Manifest() hcplugin.Manifest {
             hcplugin.CapReadSkills,
             hcplugin.CapEmitEvents,
         },
+        Dependencies: []string{},
         Description: "Example plugin",
     }
 }
 ```
+
+Set `MinHostVersion` to the real minimum your plugin needs. If it only depends on the v1 manifest/capability protocol, `0.4.0` is still valid; if it calls Host APIs added after v0.5, raise it to that minimum version. `Dependencies` uses other plugins' `Manifest.Name`; the Host must load them successfully first.
 
 Defined capabilities:
 - `skills.read`: read the host Skill registry
@@ -75,6 +78,7 @@ Defined capabilities:
 
 Capabilities that are not declared are left nil in `ExtensionContext`; plugins
 should degrade gracefully when a field is nil.
+Note: `plugin.NewManager()` stays in compatibility mode by default. `Register` enforces Manifest validation only after the app calls `SetHostContext(hostVersion, flags)` and `plugin.extension.v1=true`.
 
 ## Quick Start
 
@@ -166,6 +170,7 @@ Register at application startup:
 
 ```go
 mgr := hcplugin.NewManager()
+mgr.SetHostContext("0.5.0", flags)
 
 // Register plugins
 mgr.Register(myplugin.New())

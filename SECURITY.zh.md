@@ -22,7 +22,9 @@
 
 | 版本 | 支持状态 |
 |------|---------|
-| v0.4.4（最新） | ✅ 支持 |
+| main / v0.5.0-dev | 活跃开发 |
+| v0.4.9 | ✅ 支持 |
+| <= v0.4.3 | 不支持 |
 
 ## 安全特性
 
@@ -35,28 +37,27 @@ HexClaw 包含六层安全网关：
 5. **RBAC** — 基于角色的访问控制
 6. **审计** — 请求日志记录
 
-## 安全加固（v0.4.4）
+## 安全加固（当前代码）
 
 ### API 认证
 - Token 比较使用 `crypto/subtle.ConstantTimeCompare`，防止时序攻击
 - 日志 API（`/api/v1/logs*`）无论来源 IP 均要求认证
 - `isLogsAPI` 使用精确前缀 `/api/v1/logs`，避免匹配 `/api/v1/login` 等路径
+- `/api/k12/*` 等场景包挂载路由从挂载注册表派生鉴权前缀，非 loopback 读写均需认证，避免未来新场景绕过 `/api/v1` 守卫。
 
-### Shell 技能
-- 功能优先命令执行模式
-- 默认不启用命令白名单：脚本、包管理、git 命令、重定向与管道均可执行，除非显式运营策略阻断
-- 环境变量清理（仅保留 `PATH`、`HOME`、`LANG`）
-- 30 秒执行超时，64KB 输出限制
+### 代码执行
+- `code_exec` 是推荐执行原语，支持 snippet/file/module/project，通过 toolkit sandbox 执行，并返回有界输出、运行元数据、资源限制、诊断和产物清单。
+- 文件访问由 FileAccessBroker 统一裁决。`mode=file` 入口、`mode=project` 根目录和额外只读路径必须显式授权，否则拒绝触达宿主路径。
+- `code_exec` 默认禁止 loopback 网络访问，避免无人值守 Agent 通过本机管理端点自提权。
+- `code` 和 `shell` 仍作为兼容工具保留但已弃用；新自动化应迁移到 `code_exec`，运营方仍可用 `PermissionPolicy` 对任意执行工具 deny 或 require approval。
 
-### SSRF 防护（Browser 技能 & Cron 脚本）
-- 连接前进行 DNS 解析并验证 IP；校验在 dialer `Control` 钩子里对**已解析待拨号的 IP**执行，可挫败 DNS-rebinding 与内网重定向
-- 封锁私有/保留 IP 段：RFC 1918、RFC 6598 CGNAT（`100.64.0.0/10`）、RFC 6890（`192.0.0.0/24`）、RFC 2544（`198.18.0.0/15`）、回环地址、链路本地
-- 封锁云元数据端点：AWS（`169.254.169.254`）、GCP（`metadata.google.internal`）、Azure（`168.63.129.16`）、阿里云（`100.100.100.200`）
-- 同时覆盖 Browser 技能与 cron Starlark `http_get`/`http_post`
-- 响应体限制 1MB
+### 出站 HTTP 边界
+- Browser/search/weather/Skill Hub 使用带超时和响应体限制的原始 HTTP 客户端；当前代码不应被描述为具备通用私网/元数据 SSRF 封锁。
+- Cron Starlark `http_get`/`http_post` 在桌面/单用户语义下故意不设置 SSRF 或 loopback 守卫，脚本可以访问 loopback；需要写知识库时优先用 in-process 的 `kb_ingest`，不要回打本地知识库 HTTP API。
+- 对不可信无人值守任务，应依赖 `PermissionPolicy`、`security.autonomy`、非 loopback API 鉴权以及 `code_exec` 的 loopback 禁止，而不是假设所有出站 HTTP 都有 SSRF 过滤。
 
 ### 工具权限与无人值守闸
-- 统一声明式 `PermissionPolicy` 前置闸所有工具调用（GA）。能力变更类工具——`manage_skill`、`create_skill`、`patch_skill`、`manage_skill_pending`、`manage_mcp_server`——与 consequential 动作（`send_message`、`media_generate`、`publish_*`、`shell`、`code`、`browser`、`file_edit`）**需用户审批**；未命中规则的工具默认放行。
+- 统一声明式 `PermissionPolicy` 前置闸所有工具调用（GA）。能力变更类工具——`manage_skill`、`create_skill`、`patch_skill`、`manage_skill_pending`、`manage_mcp_server`——与 consequential 动作（`send_message`、`media_generate`、`publish_*`、`shell`、`code`、`code_exec`、`browser`、`file_edit`）在策略要求时**需用户审批**；未命中规则的工具默认放行。
 - **无人值守派发**（cron / webhook / spawn / heartbeat / workflow）没有交互审批人，因此使用 `security.autonomy` 的 Profile + 显式开关矩阵处理 `ActionRequireApproval`。默认 profile 为 `function_first`，不是“一把梭全开”。
 - 默认 `function_first` 矩阵：`cron=[read,browser,exec,files,automation,delivery,media]`，`webhook=[read,browser,exec,files,delivery,media]`，`heartbeat=[read,browser,exec,files,delivery]`，`workflow=[read,browser,exec,files,automation,delivery,media,heal]`，`spawn=[read,exec,files]`，`solve=[]`。
 - 类别映射：`exec=shell/code/code_exec`，`files=file_edit/file_ops`，`automation=cron_task`，`delivery=send_message`，`media=media_generate`，`heal=app_heal`，`capability=create_skill/manage_skill/patch_skill/manage_skill_pending/manage_mcp_server`，`publish=publish_*`。默认不自动放行 `capability`、`publish` 和伪造的 `source=solve`。
@@ -68,6 +69,7 @@ HexClaw 包含六层安全网关：
 - 记忆系统：`DeleteFile()` 使用 `filepath.Clean()` + 前缀匹配双重验证
 - 记忆条目 ID 在处理层验证（拒绝 `..`、`/`、`\`）
 - Skill Hub/Marketplace：安装路径经过技能目录边界验证
+- `code_exec` 宿主文件入口和项目根目录进入沙箱前先经 FileAccessBroker 授权。
 
 ### 缓存安全
 - **Singleflight** 防止缓存击穿（同一 Key 并发 Miss）
@@ -89,8 +91,13 @@ HexClaw 包含六层安全网关：
 - 日志流 WebSocket 要求 Bearer Token 认证
 
 ### MCP
-- `sync.Once` 保护 `Close()` 防止重复关闭 panic
-- 后台重连循环配合正确的停止通道
+- 运行时 MCP 管理支持 stdio、SSE、streamable 传输。
+- `sync.Once` 保护 `Close()` 防止重复关闭 panic，后台重连循环配合正确的停止通道。
+- Server 定义和密钥复用平台集成的配置/凭据加密路径持久化。
+
+### 桌面模式
+- `hexclaw serve --desktop` 是单用户本地 sidecar 模式，会为了桌面、cron、本地 UI 集成放行 loopback 无 Bearer Token 请求。
+- 暴露到非 loopback 的服务部署应配置 `server.api_token`，保持日志和场景包路由鉴权，并把 desktop mode 视为本地专用模式。
 
 ### 工作流执行
 - 异步工作流执行使用 10 分钟超时上下文

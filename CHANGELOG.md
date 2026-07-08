@@ -4,9 +4,17 @@
 
 ## [Unreleased]
 
+### Added
+- **场景包扩展框架**：新增 `scenario` 六缝注册表（记录集 / 约束 / 视图槽 / Agent mode / 按钮 / eval suite），平台层不再硬编码具体业务包。
+- **通用记录本**：新增 `records.agent_records`，以 Agent 为隔离键，支持 schema 校验、去重键、到期复习队列、状态机和乐观锁。
+- **K12 家长辅导场景包**：内置 `/api/k12/*`、`k12_grade`/`k12_review`、错题本、积累本、年级约束、备课卡、默认 cron 投递和 K12 专项评测 workflow。
+- **无人值守治理 API**：新增 autonomy profile、preflight、summary、decision audit、task grant 端点，并补齐 purpose/data-class 出网策略。
+
 ### Changed
-- 升级框架依赖：hexagon v0.5.7 → **v0.5.8**、ai-core v0.1.11 → **v0.2.0**、toolkit v0.2.3 → **v0.2.6**；`go.mod` 同步到 Go **1.25.7**。`GOWORK=off go test ./... -run '^$'` 已通过，发版/CI 模式下全仓编译不再依赖本地 `go.work` 的隐式下层源码。
-- 更新 CI/CD 文档口径：补充 GitHub Actions 最近 run 状态、`sandbox-code-exec.yml` 默认分支注册条件、Linux CI 等价命令，以及 runner 完整性探针不得进入默认 `go test ./...` 的规则。
+- 升级框架依赖：hexagon v0.5.7 → **v0.5.8**、ai-core v0.1.11 → **v0.2.1**、toolkit v0.2.3 → **v0.2.6**；`go.mod` 同步到 Go **1.25.7**。`GOWORK=off go test ./... -run '^$'` 已通过，发版/CI 模式下全仓编译不再依赖本地 `go.work` 的隐式下层源码。
+- **执行原语收敛**：`code_exec` 成为推荐执行入口，支持 snippet/file/module/project 与 artifact metadata；`code`/`shell` 保留兼容但标记弃用，顶层 `runtime/` 包删除，沙箱能力收敛到 toolkit + `skill/sandbox`。
+- **默认 Hub 标签**：技能市场默认目录对齐 `hexagon-codes/hexclaw-hub` `v0.0.6`。
+- 更新 CI/CD 文档口径：补充 `sandbox-code-exec.yml` 专项门禁、Linux CI 等价命令，以及 runner 完整性探针不得进入默认 `go test ./...` 的规则。
 
 ### Fixed
 - 修复 release 构建不可复现的依赖锁定问题：`skill/builtin/code_exec.go` 依赖的 sandbox 限额字段已由 `toolkit v0.2.6` 提供，不再需要本地 workspace 才能编译。

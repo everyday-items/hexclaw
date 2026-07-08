@@ -40,7 +40,7 @@ go install github.com/hexagon-codes/hexclaw/cmd/hexclaw@latest
 
 ```bash
 hexclaw version
-# HexClaw v0.4.4
+# HexClaw <当前构建版本>
 ```
 
 ### 方式二：从源码编译
@@ -50,8 +50,9 @@ git clone https://github.com/hexagon-codes/hexclaw.git
 cd hexclaw
 go build -o hexclaw ./cmd/hexclaw/
 
-# 可选：带版本信息编译
-go build -ldflags "-X main.version=v0.4.4 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o hexclaw ./cmd/hexclaw/
+# 可选：带版本信息编译（推荐 release/自测构建都注入 git describe）
+VERSION=$(git describe --tags --always --dirty)
+go build -ldflags "-X main.version=${VERSION} -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o hexclaw ./cmd/hexclaw/
 
 # 移动到 PATH
 sudo mv hexclaw /usr/local/bin/
@@ -104,22 +105,25 @@ hexclaw init
 ~/.hexclaw/
 ├── hexclaw.yaml     # 主配置文件
 ├── data.db          # SQLite 数据库（自动创建）
+├── master.key       # 静态凭据加密主密钥（自动创建，权限 0600）
+├── logs/            # 本地日志 / 运行诊断（按部署方式可选）
+├── workspace/       # code_exec / 文件工具的默认工作目录
 ├── memory/          # 文件记忆目录
 │   ├── MEMORY.md    # 长期记忆
 │   └── YYYY-MM-DD.md  # 每日日记（以当天日期命名）
-└── skills/          # 技能安装目录
+└── skills/          # 技能安装目录（含 .drafts 草稿目录）
 ```
 
 ### 技能市场（hexclaw-hub）
 
-桌面端「技能市场」从在线目录拉取 `index.json` 与 `skills/*.md`。默认仓库为 **`hexagon-codes/hexclaw-hub`** 的 **`v0.0.2`** 标签。自建镜像时可覆盖：
+桌面端「技能市场」从在线目录拉取 `index.json` 与 `skills/*.md`。默认仓库为 **`hexagon-codes/hexclaw-hub`** 的 **`v0.0.6`** 标签。自建镜像时可覆盖：
 
 ```yaml
 skills:
   enabled: true
   hub:
     repo_url: https://github.com/hexagon-codes/hexclaw-hub
-    branch: v0.0.2
+    branch: v0.0.6
 ```
 
 安装或卸载 Markdown 技能后，引擎会**自动同步**运行时技能注册表，一般**无需重启** sidecar。
@@ -164,7 +168,7 @@ llm:
 
 ### 最小配置
 
-只需一个 LLM API Key 即可启动：
+服务本身可在没有云端 LLM Key 时启动，但聊天、识题、批改、RAG 增强等 LLM 依赖功能会返回 Provider 配置错误。建议至少配置一个 Provider：
 
 ```bash
 export DEEPSEEK_API_KEY="sk-xxx"
@@ -186,6 +190,7 @@ hexclaw serve
 ```bash
 hexclaw serve
 hexclaw serve --config /path/to/hexclaw.yaml
+hexclaw serve --desktop  # 桌面单用户模式：本地匿名访问，启用桌面通知/cron/canvas/webhook 集成
 ```
 
 ### 2. systemd 服务（Linux 生产部署推荐）
@@ -569,6 +574,14 @@ curl http://127.0.0.1:16060/api/v1/platforms/instances
 curl -X POST http://127.0.0.1:16060/api/v1/im/channels/telegram/test \
   -H "Content-Type: application/json" \
   -d '{"token":"123:abc"}'
+
+# 7. 检查 autonomy 权限治理和媒体 Provider 状态
+curl http://127.0.0.1:16060/api/v1/autonomy/summary
+curl http://127.0.0.1:16060/api/v1/images/status
+curl http://127.0.0.1:16060/api/v1/videos/status
+
+# 8. 检查内置 K12 场景包挂载
+curl http://127.0.0.1:16060/api/k12/view-descriptor
 ```
 
 重点返回语义：
@@ -580,6 +593,8 @@ curl -X POST http://127.0.0.1:16060/api/v1/im/channels/telegram/test \
 - `/api/v1/knowledge/search` 返回结构化 chunk 结果（`result` 和 `results` 字段均为 `[]SearchHit` 数组），不再只是拼接后的上下文字符串
 - `/api/v1/knowledge/documents` 返回 `status/error_message/updated_at/source_type`
 - `/api/v1/knowledge/documents/{id}` 返回单个文档的完整内容
+- 图片/视频生成优先返回 `file_path`，通过 `/api/v1/files/generated/{path}` 访问产物
+- `/api/k12/*` 是场景包挂载路由；非 loopback 读写请求同样需要 Bearer Token
 - `/api/v1/logs` 支持 `domain` 过滤，便于按功能域诊断问题
 
 ### 日志
@@ -665,13 +680,13 @@ docker compose up -d
 
 **"没有可用的 LLM Provider"**
 
-至少需要设置一个 LLM API Key：
+服务可以启动，但聊天、K12 识题/批改、备课热身题、语音/媒体等依赖 Provider 的功能需要至少一个可用 LLM 或本地兼容 Provider：
 
 ```bash
 export DEEPSEEK_API_KEY="sk-xxx"
 ```
 
-本地 Ollama 的空 `api_key` 目前只适用于 `POST /api/v1/config/llm/test` 连通性测试；主服务启动仍需要至少一个带 API Key 的 Provider。
+本地 Ollama 的连通性测试允许空 `api_key`；实际聊天前仍需在配置里启用可用的本地或云端 Provider。
 
 **"初始化存储失败"**
 

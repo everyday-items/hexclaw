@@ -40,7 +40,7 @@ Verify installation:
 
 ```bash
 hexclaw version
-# HexClaw v0.4.4
+# HexClaw <current build version>
 ```
 
 ### Method 2: Build from source
@@ -50,8 +50,9 @@ git clone https://github.com/hexagon-codes/hexclaw.git
 cd hexclaw
 go build -o hexclaw ./cmd/hexclaw/
 
-# Optional: build with version info
-go build -ldflags "-X main.version=v0.4.4 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o hexclaw ./cmd/hexclaw/
+# Optional: build with version info (recommended for release/self-test builds)
+VERSION=$(git describe --tags --always --dirty)
+go build -ldflags "-X main.version=${VERSION} -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o hexclaw ./cmd/hexclaw/
 
 # Move to PATH
 sudo mv hexclaw /usr/local/bin/
@@ -104,22 +105,25 @@ The default config directory is `~/.hexclaw/`, containing:
 ~/.hexclaw/
 ├── hexclaw.yaml     # Main config file
 ├── data.db          # SQLite database (auto-created)
+├── master.key       # At-rest credential encryption master key (auto-created, 0600)
+├── logs/            # Local logs / runtime diagnostics (deployment-dependent)
+├── workspace/       # Default workspace for code_exec and file tools
 ├── memory/          # File memory directory
 │   ├── MEMORY.md    # Long-term memory
 │   └── YYYY-MM-DD.md  # Daily journal (named by date)
-└── skills/          # Skill installation directory
+└── skills/          # Skill installation directory (includes .drafts)
 ```
 
 ### Skill marketplace (hexclaw-hub)
 
-The desktop **Skill Marketplace** fetches `index.json` and `skills/*.md` from a GitHub repo. The default is **`hexagon-codes/hexclaw-hub`** on tag **`v0.0.2`**. Override for a mirror:
+The desktop **Skill Marketplace** fetches `index.json` and `skills/*.md` from a GitHub repo. The default is **`hexagon-codes/hexclaw-hub`** on tag **`v0.0.6`**. Override for a mirror:
 
 ```yaml
 skills:
   enabled: true
   hub:
     repo_url: https://github.com/hexagon-codes/hexclaw-hub
-    branch: v0.0.2
+    branch: v0.0.6
 ```
 
 After installing or uninstalling a Markdown skill, the engine **syncs** the runtime skill registry; you usually **do not need** to restart the sidecar.
@@ -164,7 +168,7 @@ From highest to lowest:
 
 ### Minimal Configuration
 
-Only one LLM API key is needed to start:
+The service can start without a cloud LLM key, but chat, homework recognition/grading, RAG-augmented answers, and other LLM-dependent features will return provider configuration errors. Configure at least one provider for normal use:
 
 ```bash
 export DEEPSEEK_API_KEY="sk-xxx"
@@ -186,6 +190,7 @@ See the complete config file in [README.en.md](../README.en.md#configuration).
 ```bash
 hexclaw serve
 hexclaw serve --config /path/to/hexclaw.yaml
+hexclaw serve --desktop  # Single-user desktop mode: local anonymous access plus desktop notification/cron/canvas/webhook integration
 ```
 
 ### 2. systemd Service (recommended for Linux production)
@@ -569,6 +574,14 @@ curl http://127.0.0.1:16060/api/v1/platforms/instances
 curl -X POST http://127.0.0.1:16060/api/v1/im/channels/telegram/test \
   -H "Content-Type: application/json" \
   -d '{"token":"123:abc"}'
+
+# 7. Check autonomy governance and media provider status
+curl http://127.0.0.1:16060/api/v1/autonomy/summary
+curl http://127.0.0.1:16060/api/v1/images/status
+curl http://127.0.0.1:16060/api/v1/videos/status
+
+# 8. Check the built-in K12 scenario-pack mount
+curl http://127.0.0.1:16060/api/k12/view-descriptor
 ```
 
 Key response semantics:
@@ -580,6 +593,8 @@ Key response semantics:
 - `/api/v1/knowledge/search` returns structured chunk results (both `result` and `results` are now `[]SearchHit` arrays) instead of one concatenated context string
 - `/api/v1/knowledge/documents` returns `status/error_message/updated_at/source_type`
 - `/api/v1/knowledge/documents/{id}` returns a single document with full content
+- Image/video generation prefers returning `file_path`; resolve artifacts through `/api/v1/files/generated/{path}`
+- `/api/k12/*` is a scenario-pack mount; non-loopback read/write requests still require a Bearer token
 - `/api/v1/logs` supports `domain` filtering for functional diagnostics
 
 ### Logs
@@ -665,13 +680,13 @@ Config files are backward-compatible — upgrades typically require no config ch
 
 **"No LLM provider available"**
 
-At least one LLM API key must be set:
+The service can start, but chat, K12 recognition/grading, prep-card warmups, voice/media, and other provider-dependent features require at least one usable local or cloud provider:
 
 ```bash
 export DEEPSEEK_API_KEY="sk-xxx"
 ```
 
-An empty `api_key` for local Ollama currently applies only to `POST /api/v1/config/llm/test`; the main service still needs at least one provider configured with an API key.
+Local Ollama connectivity checks allow an empty `api_key`; actual chat still requires a configured local or cloud provider.
 
 **"Failed to initialize storage"**
 

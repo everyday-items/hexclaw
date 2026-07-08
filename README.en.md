@@ -22,6 +22,8 @@
 - **Skill System** — Built-in search/weather/translation/summary/media-generation/messaging/document-export and more, 7-phase pipeline, `.pending` approval flow, TrustLevel filtering, and TOCTOU checks
 - **Semantic Cache** — Singleflight anti-stampede + TTL jitter anti-avalanche + empty-value anti-penetration
 - **Knowledge Base** — FTS5 + vector hybrid retrieval, 5-stage RAG pipeline, and context augmentation
+- **Scenario Packs** — Six extension seams in `scenario` (record collections, constraints, view slots, Agent modes, buttons, eval suites) so the platform does not hard-code business scenarios
+- **Generic Records** — `records.agent_records` isolates by Agent and supports state transitions, dedupe keys, due queues, optimistic locking, and scenario-level field validation
 
 ### Built-in Skills
 
@@ -34,19 +36,25 @@ Ready-to-use built-in skills (no install required, invoked via LLM tool_call):
 | `translate` | Translate text (Chinese ↔ English) |
 | `summary` | Summarize text content |
 | `browser` | Fetch web pages, extract content, and submit forms |
-| `code` / `code_exec` | Execute code snippets (Go/Python/JavaScript) inside the HexClaw Sandbox and return output |
-| `shell` | Run shell commands and return output |
+| `code_exec` | Recommended execution primitive: run snippet/file/module/project commands (Go/Python/JavaScript/project commands) inside the HexClaw sandbox and return `run_id`, limits, diagnostics, and artifacts |
+| `code` / `shell` | Deprecated compatibility host-execution tools; new work should move to `code_exec` |
 | `file_ops` / `file_edit` | Read, write, and edit files in the workspace |
+| `list_directory` / `read_file` / `list_allowed_directories` | Read user-authorized directories through FileAccessBroker, sharing file boundaries with `code_exec` and connectors |
 | `grep` / `glob` | Search file contents by text/regex; find files by name pattern |
 | `knowledge_ingest` | Write text content into the local knowledge base for later retrieval |
 | `knowledge_ingest_path` | Read each file under a path (directory or glob) and ingest its content into the knowledge base (sandboxed against `..`/symlink escape; capped at 200 files / 2 MiB per file) |
+| `knowledge_search` | Search the local knowledge base and return structured chunks, sources, and scores |
+| `manage_memory` / `session_search` | Manage file memory and search historical sessions |
 | `media_generate` | Generate an image (default) or video from a text prompt, persist it, and return a stable file path reusable by export/send/ingest |
 | `export_document` | Render Markdown into a downloadable document (md/html/docx/pdf/epub/odt/rtf/txt) and return its file path |
 | `send_message` | Send a message to a configured channel (feishu/Discord/WeChat/email/Slack/...); interactive sessions use confirmation, while unattended automation follows the `security.autonomy` matrix |
 | `cron_task` | Create/list/pause/resume/remove app-managed scheduled tasks |
 | `manage_skill` / `manage_mcp` | Search, install, or remove skills / MCP servers from HexClaw Hub; unattended dispatch does not auto-run these by default unless `capability` is explicitly enabled |
+| `app_query` / `app_heal` | Query redacted app state or run controlled self-healing for cron/workflow |
+| `transfer_to_agent` / `list_agents` / `orchestrate` / `spawn_agent` / `solve` | Multi-agent transfer, orchestration, spawned runs, and independently verified solving through `code_exec` |
+| `k12_grade` / `k12_review` | K12 scenario-pack skills for grading into the mistake notebook and generating review variations when the K12 pack is enabled |
 
-> Unattended automation (cron/webhook/spawn/heartbeat/workflow) uses a function-first profile plus an explicit switch matrix. The default `function_first` profile auto-approves core work such as `code_exec`, shell, file edits, browsing, knowledge ingest, and delivery. Skill/MCP management, publishing, and forgeable `solve` sources are not auto-approved by default; enable them through `security.autonomy.system_dispatch` or the explicit `full_access` profile. Explicit `PermissionPolicy` deny rules remain authoritative.
+> Unattended automation (cron/webhook/spawn/heartbeat/workflow) uses a function-first profile plus an explicit switch matrix. The default `function_first` profile auto-approves core work such as exec-class tools (recommended `code_exec`, compatible `code`/`shell`), file edits, browsing, knowledge ingest, and delivery. Skill/MCP management, publishing, and forgeable `solve` sources are not auto-approved by default; enable them through `security.autonomy.system_dispatch` or the explicit `full_access` profile. Explicit `PermissionPolicy` deny rules remain authoritative.
 > `system_dispatch.<source>` replaces that source's profile default; it does not merge with it. Use `profile: full_access` when you want a global explicit open mode.
 
 ### Session & Data
@@ -62,9 +70,10 @@ Ready-to-use built-in skills (no install required, invoked via LLM tool_call):
 - **Workflow Engine** — Visual orchestration of multi-step Agent workflows (Canvas Workflow)
 
 ### Ecosystem & Extensions
-- **Native MCP Support** — Compatible with 3200+ MCP Servers (stdio + SSE transport)
+- **Native MCP Support** — Compatible with 3200+ MCP Servers (stdio + SSE + streamable transports)
 - **Markdown Skill Marketplace** — Compatible with OpenClaw skill format, lazy-loaded on demand
 - **Multi-Agent Routing** — Host multiple agents in one instance, route by platform/user/group
+- **K12 Parent-Tutoring Scenario Pack** — Built-in mistake notebook, review queue, prep cards, grade constraints, homework recognition/grading, and default cron delivery
 - **Canvas / A2UI** — Agent-generated interactive UIs (charts, forms, kanban, and 8+ component types)
 - **Security Audit CLI** — `hexclaw security audit` one-click security check + remediation suggestions
 - **Voice Interaction** — STT/TTS transcription and synthesis with chained MiniMax / Edge / OpenAI / Azure TTS fallback
@@ -228,10 +237,10 @@ skills:
   auto_load: true
   hub:
     repo_url: https://github.com/hexagon-codes/hexclaw-hub
-    branch: v0.0.2
+    branch: v0.0.6
 
 heartbeat:
-  enabled: false
+  enabled: true
   interval_mins: 15
   quiet_start: "22:00"
   quiet_end: "08:00"
@@ -260,11 +269,15 @@ features:
   # Product capabilities are function-first and enabled by default; override only for rollback/rollout.
   model.gateway.v1: true
   skill.pipeline.v1: true
+  tool.lifecycle.v2: true
+  tool.policy.engine: true
   config.tx.hotload.v1: true
   rag.pipeline.v1: true
-  runtime.sandbox.v1: true
   plugin.extension.v1: true
   agent.factory.real: true
+  pricing.layered.v1: true
+  mcp.lifecycle.v2: true
+  eval.framework.v1: false
 
 skill:
   sandbox:
@@ -288,11 +301,16 @@ registered default is true.
 Common flags:
 - `agent.factory.real`: allow `dispatch_role` to invoke a real `hexagon.Agent`
 - `skill.pipeline.v1`: enable the 7-phase Skill execution pipeline
+- `tool.lifecycle.v2`: enable tool lifecycle hooks, hook priority, panic isolation, and latency metrics
+- `tool.policy.engine`: enable declarative `PermissionPolicy`
 - `interactive.render.v1`: use native platform renderers for interactive replies; disabled uses text fallback
 - `config.tx.hotload.v1`: update LLM config through transactional hot reload
 - `model.gateway.v1`: enable the Provider middleware chain
-- `events.transport.v1`: enable structured event sink delivery
 - `rag.pipeline.v1`: enable the 5-stage knowledge RAG pipeline
+- `pricing.layered.v1`: enable layered pricing lookup with user override / cache / remote / built-in fallback
+- `mcp.lifecycle.v2`: enable MCP server lifecycle hooks
+- `plugin.extension.v1`: enable plugin manifest and capability validation
+- `eval.framework.v1`: alpha eval framework, default off; release tooling enables it explicitly
 - `voice.tts.chain.v1`: enable chained TTS provider fallback
 
 ## Architecture
@@ -357,27 +375,36 @@ hexclaw/
 │   ├── handler_voicechat.go #   Voice STT/TTS + voicechat API
 │   └── handler_misc.go      #   Memory/MCP/skill/router/canvas API
 ├── audit/                   # Security audit (7 check categories)
+├── autonomy/                # Unattended permission governance (decision audit / task grants / preflight)
 ├── canvas/                  # Canvas/A2UI (8 component types)
 ├── config/                  # Configuration management (YAML + env vars)
+├── connector/               # Data connectors (GitHub/Notion/... read-only resources)
 ├── cron/                    # Cron job scheduler
 ├── desktop/                 # Desktop integration (notifications/clipboard)
+├── egress/                  # Purpose x data-class privacy egress policy
 ├── engine/                  # Agent engine (ReAct loop)
 ├── eval/                    # Pre-release eval suites
 ├── featureflag/             # Feature flag registry and runtime lookup
 ├── gateway/                 # 6-layer security gateway
 │   └── llmcall/             #   LLM call gateway (middleware chain)
 ├── heartbeat/               # Heartbeat patrol
+├── httpua/                  # Unified outbound HTTP User-Agent injection
 ├── instances/               # Platform instance lifecycle manager
 ├── internal/                # Internal utils (sqliteutil / upstreamerr / testutil)
 ├── knowledge/               # Knowledge base (FTS5 + vector hybrid)
+├── library/                 # Prompt library / managed entries
 ├── llmrouter/               # LLM smart router
-├── mcp/                     # MCP client (stdio + SSE)
+├── mcp/                     # MCP client (stdio + SSE + streamable)
 ├── memory/                  # File memory (MEMORY.md + journal)
 ├── plugin/                  # Plugin Manifest / Capability extensions
+├── records/                 # Generic agent_records primitive
 ├── release/                 # Release gates and canary state machine
 ├── render/                  # Markdown/document rendering (pandoc + LRU cache)
 ├── router/                  # Multi-agent router
-├── runtime/                 # Runtime sandbox and checkpoint rollback
+├── scenario/                # Scenario-pack six-seam registry
+├── scenarios/
+│   └── k12/                 # K12 parent-tutoring scenario pack
+├── secret/                  # Static credential master key and envelopes
 ├── security/                # Injection scan / content sanitize / skill scanner
 ├── session/                 # Session management + context compaction
 ├── skill/                   # Skill system
@@ -395,7 +422,7 @@ hexclaw/
 └── Makefile
 ```
 
-> Base capabilities such as media generation/genstore/SSRF/cache/trace/events have been pushed down into ai-core / toolkit / hexagon; hexclaw no longer keeps local equivalents. Voice STT/TTS is handled inline by `api/` and `gateway/`, with no standalone `voice/` package.
+> Base capabilities such as media generation/genstore/cache/trace/events and low-level HTTP utilities have been pushed down into ai-core / toolkit / hexagon; hexclaw no longer keeps local equivalents. Voice STT/TTS is handled inline by `api/` and `gateway/`, with no standalone `voice/` package.
 
 ## API Endpoints (selected endpoints; full routing is module-dependent)
 
@@ -412,13 +439,23 @@ hexclaw/
 ### Session Management
 | Method | Path | Description |
 |--------|------|-------------|
+| POST | `/api/v1/sessions` | Create session |
 | GET | `/api/v1/sessions` | Session list |
 | GET | `/api/v1/sessions/{id}` | Session details |
+| PATCH | `/api/v1/sessions/{id}` | Update session metadata |
+| POST | `/api/v1/sessions/{id}/suggest-title` | Generate a session title |
 | DELETE | `/api/v1/sessions/{id}` | Delete session |
 | GET | `/api/v1/sessions/{id}/messages` | Message history |
+| POST | `/api/v1/sessions/{id}/messages` | Append one message |
+| POST | `/api/v1/sessions/{id}/messages/batch` | Batch append messages |
 | GET | `/api/v1/sessions/{id}/branches` | Session branch list |
 | POST | `/api/v1/sessions/{id}/fork` | Fork conversation |
 | GET | `/api/v1/messages/search` | Full-text message search |
+| DELETE | `/api/v1/messages/{id}` | Delete one message |
+| PUT | `/api/v1/messages/{id}/feedback` | Save message feedback |
+| GET | `/api/v1/streams/active` | Active streaming requests |
+| GET | `/api/v1/streams/{request_id}` | Streaming request snapshot / resume |
+| GET | `/api/v1/sessions/{id}/checkpoints` | Session checkpoints when checkpointing is enabled |
 
 ### Configuration
 | Method | Path | Description |
@@ -429,8 +466,27 @@ hexclaw/
 | PUT | `/api/v1/config/llm` | Update LLM config |
 | POST | `/api/v1/config/llm/test` | Test one provider config without persisting it; local Ollama may omit the key |
 | POST | `/api/v1/config/llm/models` | Dynamically fetch available models from a provider (proxies to provider `/models` API) |
+| GET | `/api/v1/config/memory` | Get memory behavior config (auto memory, active recall, profile distillation) |
+| PUT | `/api/v1/config/memory` | Field-level update of memory behavior config |
 | GET | `/api/v1/llm/capabilities` | List cached model tool-call capability probe results |
 | POST | `/api/v1/llm/capabilities/probe` | Probe the tool-call reliability for a given `provider` + `model` |
+
+### Assistant / Prompt Library / Connectors
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/assistant/soul` | Get assistant soul/personality text |
+| PUT | `/api/v1/assistant/soul` | Update assistant soul/personality text |
+| GET | `/api/v1/connections` | List configurable connection types and status |
+| POST | `/api/v1/connections/test` | Statelessly test platform/provider credentials |
+| GET | `/api/v1/connectors` | Redacted connector list when connector store is enabled |
+| POST | `/api/v1/connectors` | Create and encrypt a connector |
+| DELETE | `/api/v1/connectors/{id}` | Delete connector |
+| POST | `/api/v1/connectors/test` | Statelessly test connector credentials |
+| GET | `/api/v1/connectors/{id}/resources` | Fetch connector read-only resources |
+| GET | `/api/v1/prompts` | List enabled prompt library entries |
+| GET | `/api/v1/prompts/all` | List all prompt library entries |
+| POST | `/api/v1/prompts` | Create or update a prompt entry |
+| DELETE | `/api/v1/prompts/{id}` | Delete prompt entry |
 
 ### Knowledge Base
 | Method | Path | Description |
@@ -442,6 +498,16 @@ hexclaw/
 | DELETE | `/api/v1/knowledge/documents/{id}` | Delete document |
 | POST | `/api/v1/knowledge/documents/{id}/reindex` | Reindex/retry one document |
 | POST | `/api/v1/knowledge/search` | Structured search — both `result` and `results` return `[]SearchHit` with chunks, sources, and scores |
+| GET | `/api/v1/knowledge/config` | Get knowledge retrieval config |
+| PUT | `/api/v1/knowledge/config` | Update knowledge retrieval config |
+
+### Document Extraction / Rendering
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/v1/documents/extract` | Upload PDF/DOC/PPTX etc. and extract plain text |
+| POST | `/api/v1/documents/preview` | Stage the original file and return a preview token |
+| GET | `/api/v1/documents/preview/{token}` | Preview/download staged original file |
+| POST | `/api/v1/render` | Render Markdown to md/html/docx/pdf/epub/odt/rtf/txt when render service is enabled |
 
 ### Cron Jobs
 The unified entrypoint `POST /api/v1/cronjob` dispatches on the request body's `action` field (`create` / `update` / `remove` / `pause` / `resume` / `run` / `list` / `history`) and supports `idempotency_key` replay.
@@ -459,7 +525,20 @@ The unified entrypoint `POST /api/v1/cronjob` dispatches on the request body's `
 | POST | `/api/v1/webhooks/{name}` | Receive webhook event |
 | GET | `/api/v1/webhooks` | List webhooks |
 | POST | `/api/v1/webhooks` | Register webhook |
+| PATCH | `/api/v1/webhooks/{name}` | Update webhook enabled state |
 | DELETE | `/api/v1/webhooks/{name}` | Delete webhook |
+
+### Autonomy Governance
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/autonomy/profile` | Get unattended permission profile |
+| PUT | `/api/v1/autonomy/profile` | Update unattended permission profile |
+| POST | `/api/v1/autonomy/preflight` | Preflight an automation task before creation |
+| GET | `/api/v1/autonomy/summary` | Governance summary and blocked-action counts |
+| GET | `/api/v1/autonomy/decisions` | Permission decision audit log |
+| GET | `/api/v1/autonomy/grants` | Task grant list |
+| POST | `/api/v1/autonomy/grants` | Create a task grant |
+| DELETE | `/api/v1/autonomy/grants/{id}` | Revoke a task grant |
 
 ### Memory
 | Method | Path | Description |
@@ -467,6 +546,11 @@ The unified entrypoint `POST /api/v1/cronjob` dispatches on the request body's `
 | GET | `/api/v1/memory` | Get memory |
 | POST | `/api/v1/memory` | Create memory |
 | PUT | `/api/v1/memory` | Update memory (allows clearing) |
+| PUT | `/api/v1/memory/{id}` | Update one memory item |
+| POST | `/api/v1/memory/{id}/archive` | Archive one memory item |
+| POST | `/api/v1/memory/{id}/restore` | Restore one memory item |
+| POST | `/api/v1/memory/{id}/pin` | Pin one memory item |
+| POST | `/api/v1/memory/{id}/unpin` | Unpin one memory item |
 | DELETE | `/api/v1/memory` | Clear all memory |
 | DELETE | `/api/v1/memory/{id}` | Delete specific memory |
 | GET | `/api/v1/memory/search` | Search memory |
@@ -476,6 +560,8 @@ The unified entrypoint `POST /api/v1/cronjob` dispatches on the request body's `
 |--------|------|-------------|
 | GET | `/api/v1/mcp/tools` | Tool list |
 | GET | `/api/v1/mcp/servers` | Server list |
+| POST | `/api/v1/mcp/servers` | Add and persist an MCP server at runtime |
+| DELETE | `/api/v1/mcp/servers/{name}` | Remove MCP server |
 | GET | `/api/v1/mcp/status` | Connection status snapshot |
 | POST | `/api/v1/mcp/tools/call` | Call tool |
 
@@ -483,12 +569,15 @@ The unified entrypoint `POST /api/v1/cronjob` dispatches on the request body's `
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/skills` | Installed skills |
+| GET | `/api/v1/skills/{name}/content` | Read installed skill content |
 | PUT | `/api/v1/skills/{name}/status` | Enable/disable a skill with runtime status fields |
 | POST | `/api/v1/skills/install` | Install skill from `clawhub://name` or a local relative path |
+| POST | `/api/v1/skills/generate` | Generate a Skill draft conversationally and install it |
 | DELETE | `/api/v1/skills/{name}` | Uninstall skill |
 | GET | `/api/v1/clawhub/search` | ClawHub skill search with `q` / `category` filters |
+| GET | `/api/v1/clawhub/skills/{name}/content` | Preview ClawHub skill content before installing |
 
-Default skill catalog repo: `https://github.com/hexagon-codes/hexclaw-hub` (`index.json` + `skills/*.md`).
+Default skill catalog repo: `https://github.com/hexagon-codes/hexclaw-hub` tag `v0.0.6` (`index.json` + `skills/*.md`).
 Installing or uninstalling Markdown skills automatically syncs the runtime skill registry; a sidecar restart is usually unnecessary.
 
 ### Agent Routing
@@ -510,6 +599,10 @@ Installing or uninstalling Markdown skills automatically syncs the runtime skill
 | GET | `/api/v1/platforms/instances` | Platform instance list |
 | GET | `/api/v1/platforms/instances/health` | Health of all instances |
 | POST | `/api/v1/platforms/instances` | Create instance |
+| PUT | `/api/v1/platforms/instances/by-id/{id}` | Update instance by stable ID |
+| DELETE | `/api/v1/platforms/instances/by-id/{id}` | Delete instance by stable ID |
+| POST | `/api/v1/platforms/instances/by-id/{id}/test` | Test instance config by stable ID |
+| POST | `/api/v1/platforms/instances/by-id/{id}/send-test` | Send test message by stable ID |
 | PUT | `/api/v1/platforms/instances/{name}` | Update instance |
 | DELETE | `/api/v1/platforms/instances/{name}` | Delete instance |
 | GET | `/api/v1/platforms/instances/{name}/health` | Health of one instance |
@@ -517,6 +610,9 @@ Installing or uninstalling Markdown skills automatically syncs the runtime skill
 | POST | `/api/v1/platforms/instances/{name}/start` | Start instance |
 | POST | `/api/v1/platforms/instances/{name}/stop` | Stop instance |
 | POST | `/api/v1/im/channels/{provider}/test` | Test IM channel config |
+| GET | `/api/v1/channels/wecom/guide` | Get WeCom setup guide |
+| GET | `/api/v1/platforms/hooks/{provider}/{name}` | Platform GET callback / verification hook |
+| POST | `/api/v1/platforms/hooks/{provider}/{name}` | Platform callback event entrypoint |
 
 ### Canvas / Workflow
 | Method | Path | Description |
@@ -529,6 +625,20 @@ Installing or uninstalling Markdown skills automatically syncs the runtime skill
 | DELETE | `/api/v1/canvas/workflows/{id}` | Delete workflow |
 | POST | `/api/v1/canvas/workflows/{id}/run` | Run workflow async |
 | GET | `/api/v1/canvas/runs/{id}` | Query run result |
+| POST | `/api/v1/canvas/runs/{id}/resume` | Resume workflow from failed/interrupted nodes |
+| GET | `/api/v1/subagents/runs` | Query sub-agent run records |
+
+### Media Generation / Generated Files
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/images/status` | Image generation provider status |
+| POST | `/api/v1/images/generate` | Generate image |
+| GET | `/api/v1/videos/status` | Video generation provider status |
+| POST | `/api/v1/videos/generate` | Submit async video generation task |
+| GET | `/api/v1/videos/tasks/{id}` | Poll video generation task |
+| GET | `/api/v1/voicechat/status` | Voicechat provider status |
+| POST | `/api/v1/voicechat/chat` | Voicechat |
+| GET | `/api/v1/files/generated/{path...}` | Access generated image/video/document artifacts |
 
 ### Voice
 | Method | Path | Description |
@@ -546,6 +656,20 @@ Installing or uninstalling Markdown skills automatically syncs the runtime skill
 | DELETE | `/api/v1/desktop/notifications` | Clear notifications |
 | GET | `/api/v1/desktop/clipboard` | Read clipboard |
 | POST | `/api/v1/desktop/clipboard` | Write clipboard |
+
+### Ollama Local Models
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/ollama/status` | Probe local Ollama service and models |
+| POST | `/api/v1/ollama/pull` | Pull model |
+| GET | `/api/v1/ollama/running` | List running models |
+| POST | `/api/v1/ollama/load` | Load model |
+| POST | `/api/v1/ollama/unload` | Unload model |
+| DELETE | `/api/v1/ollama/models/{name}` | Delete model |
+| POST | `/api/v1/ollama/restart` | Restart Ollama service |
+
+### Scenario Packs
+Scenario packs are mounted through `srv.Mount` under `/api/<scenario>` and inherit remote-access authentication. The built-in K12 parent-tutoring pack is mounted at `/api/k12/*`; see [scenarios/k12/API.md](scenarios/k12/API.md) for its contract.
 
 ### Team Collaboration
 | Method | Path | Description |
@@ -574,6 +698,8 @@ Installing or uninstalling Markdown skills automatically syncs the runtime skill
 - `GET /api/v1/knowledge/documents/{id}` returns a single document with its full content.
 - `GET /api/v1/knowledge/documents` includes `status`, `error_message`, `updated_at`, and `source_type`; `POST /api/v1/knowledge/upload` returns `status`, `source`, `chunk_count`, and `warnings`.
 - `POST /api/v1/agents/rules/test` returns matched rules and scores so the UI can explain why a request was routed to a given agent.
+- Frontends should prefer platform instance `by-id` routes for update/delete/test actions to avoid mistakes after display-name changes; `GET/POST /api/v1/platforms/hooks/{provider}/{name}` is reused by platform adapters as the callback entrypoint.
+- Image/video generation prefers returning `file_path`; frontends should resolve it through `/api/v1/files/generated/{path}` instead of storing large base64 payloads in SQLite.
 - Log entries returned by `GET /api/v1/logs` include a stable `domain` field for filtering by functional area such as `chat`, `knowledge`, `integration`, `automation`, or `engine`.
 - `POST /api/v1/config/llm/models` proxies to a provider's `/models` endpoint and returns a normalized model list (`{ models: [{ id, name }] }`); auto-adapts between OpenAI standard format and alternative formats.
 - `GET /api/v1/llm/capabilities` returns `{ provider_name, model_name, tool_call, tool_call_text, last_probe, probe_error }`; `POST /api/v1/llm/capabilities/probe?provider=X&model=Y` probes immediately and writes the SQLite cache.
@@ -621,7 +747,7 @@ go vet ./...
 golangci-lint run
 
 # Release gate + Eval + canary dry-run
-go run ./cmd/verify-release -repo . -version 0.4.4 -version-files package.json
+go run ./cmd/verify-release -repo . -version 0.5.0 -version-files hexclaw.go
 ```
 
 ## Tech Stack
@@ -630,7 +756,7 @@ go run ./cmd/verify-release -repo . -version 0.4.4 -version-files package.json
 |-----------|-----------|
 | Language | Go 1.25.7+ |
 | Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.5.8 |
-| AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.2.0 |
+| AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.2.1 |
 | Utility Library | [toolkit](https://github.com/hexagon-codes/toolkit) v0.2.6 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | Configuration | YAML + environment variables |
@@ -674,7 +800,7 @@ chore: build/toolchain updates
 | Project | Description | Repository |
 |---------|-------------|------------|
 | **Hexagon** | Go AI Agent framework (core engine) v0.5.8 | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI core library (LLM/Tool/Memory) v0.2.0 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **ai-core** | AI core library (LLM/Tool/Memory) v0.2.1 | [ai-core](https://github.com/hexagon-codes/ai-core) |
 | **toolkit** | Go utility library v0.2.6 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI dashboard (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
 | **hexclaw-desktop** | HexClaw desktop client (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
@@ -684,9 +810,19 @@ chore: build/toolchain updates
 
 ### Unreleased
 
+**Scenario Packs & Records**
+- **Scenario extension seams** — Added the `scenario` registry for record collections, constraints, view slots, Agent modes, buttons, and eval suites without hard-coding business packages in the platform layer.
+- **Generic records** — Added `records.agent_records` with Agent isolation, schema validation, dedupe keys, due review queues, state transitions, and optimistic locking.
+- **K12 parent-tutoring pack** — Added `/api/k12/*`, `k12_grade`/`k12_review`, mistake and accumulation notebooks, grade constraints, prep cards, default cron delivery, and a K12-specific eval workflow.
+
+**Execution & Governance**
+- **Execution primitive convergence** — `code_exec` is now the recommended execution entrypoint with snippet/file/module/project support and artifact metadata. `code`/`shell` remain for compatibility but are deprecated, the top-level `runtime/` package was removed, and sandbox capability now converges on toolkit + `skill/sandbox`.
+- **Unattended governance API** — Added autonomy profile, preflight, summary, decision-audit, and task-grant endpoints, plus purpose/data-class egress policy.
+
 **Dependencies & CI/CD**
-- **Framework dependency upgrade** — `go.mod` now targets hexagon v0.5.8 / ai-core v0.2.0 / toolkit v0.2.6 and Go 1.25.7. `GOWORK=off go test ./... -run '^$'` passes, so release/CI-mode compilation no longer depends on local workspace-only dependency APIs.
-- **CI/CD verification notes** — Recent GitHub Actions runs are green, and this branch currently has no PR/run. The new `sandbox-code-exec.yml` workflow is not registered until it lands on the default branch. The runner-integrity probe is skipped by default and only runs when `HEXCLAW_RUNNER_PROBE=1`; `GOWORK=off go test ./... -count=1` passes.
+- **Framework dependency upgrade** — `go.mod` now targets hexagon v0.5.8 / ai-core v0.2.1 / toolkit v0.2.6 and Go 1.25.7. `GOWORK=off go test ./... -run '^$'` passes, so release/CI-mode compilation no longer depends on local workspace-only dependency APIs.
+- **Default Hub tag** — Skill Marketplace now defaults to `hexagon-codes/hexclaw-hub` tag `v0.0.6`.
+- **CI/CD verification notes** — `sandbox-code-exec.yml` is the dedicated workflow for Linux/macOS `code_exec` strong-sandbox paths against toolkit, while Windows keeps the toolkit sandbox gate. Windows `code_exec` runtime integration tests are gated by the current toolkit/device capabilities. Normal Linux CI gates real sandbox execution by backend capability; the dedicated workflow forces proof with `HEXCLAW_P0_SANDBOX_PROOF=1`. The runner-integrity probe is skipped by default and only runs when `HEXCLAW_RUNNER_PROBE=1`.
 
 ### v0.4.4
 

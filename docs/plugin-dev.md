@@ -60,10 +60,13 @@ func (p *MyPlugin) Manifest() hcplugin.Manifest {
             hcplugin.CapReadSkills,
             hcplugin.CapEmitEvents,
         },
+        Dependencies: []string{},
         Description: "示例插件",
     }
 }
 ```
+
+`MinHostVersion` 应按插件实际依赖填写：只依赖 v1 manifest/capability 协议时可保持 `0.4.0`；如果调用 v0.5 之后才新增的 Host API，应提升到对应最低版本。`Dependencies` 使用其他插件的 `Manifest.Name`，Host 需要先成功加载这些依赖。
 
 已定义能力：
 - `skills.read`：读取 Host 的 Skill registry
@@ -73,6 +76,7 @@ func (p *MyPlugin) Manifest() hcplugin.Manifest {
 - `fs.write`：写入 `.pending` 风格的待审核文件
 
 不声明的能力不会出现在 `ExtensionContext` 中；插件需要对 nil 字段做降级处理。
+注意：`plugin.NewManager()` 本身保持兼容模式；只有在应用启动时调用 `SetHostContext(hostVersion, flags)` 且 `plugin.extension.v1=true` 时，`Register` 才会强制校验 Manifest。
 
 ## 快速开始
 
@@ -164,6 +168,7 @@ func (p *MatrixPlugin) Adapter() adapter.Adapter {
 
 ```go
 mgr := hcplugin.NewManager()
+mgr.SetHostContext("0.5.0", flags)
 
 // 注册插件
 mgr.Register(myplugin.New())

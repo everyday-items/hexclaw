@@ -22,6 +22,8 @@
 - **Skill 系统** — 内置搜索/天气/翻译/摘要/媒体生成/送达/文档导出等，7 阶段流水线，`.pending` 审批闭环，TrustLevel 与 TOCTOU 校验
 - **语义缓存** — Singleflight 防击穿 + TTL 抖动防雪崩 + 空值缓存防穿透
 - **知识库** — FTS5 + 向量混合检索，RAG 5 阶段 Pipeline，上下文增强
+- **场景包扩展** — `scenario` 六缝注入（记录集、约束、视图槽、Agent mode、按钮、eval），平台不硬编码具体业务
+- **通用记录本** — `records.agent_records` 以 Agent 为隔离键，支持状态机、去重键、到期队列、乐观锁和场景包字段校验
 
 ### 内置技能
 
@@ -34,19 +36,25 @@
 | `translate` | 翻译文本内容，支持中英互译 |
 | `summary` | 对文本内容进行摘要概括 |
 | `browser` | 网页获取、内容提取和表单提交 |
-| `code` / `code_exec` | 在 HexClaw 沙箱内执行代码片段（Go/Python/JavaScript），返回运行结果 |
-| `shell` | 执行 Shell 命令，返回命令输出 |
+| `code_exec` | 推荐执行原语：在 HexClaw 沙箱内执行 snippet/file/module/project（Go/Python/JavaScript/项目命令），返回 `run_id`、限额、诊断和产物清单 |
+| `code` / `shell` | 兼容保留的裸宿主执行工具，已弃用；新任务应迁移到 `code_exec` |
 | `file_ops` / `file_edit` | 在工作区内读写、编辑文件 |
+| `list_directory` / `read_file` / `list_allowed_directories` | 通过 FileAccessBroker 读取用户授权目录，供 `code_exec` 与连接器共享文件访问边界 |
 | `grep` / `glob` | 按文本/正则搜索文件内容，按名称模式查找文件 |
 | `knowledge_ingest` | 把文本内容写入本地知识库供后续检索 |
 | `knowledge_ingest_path` | 读取路径（目录或 glob）下每个文件的内容，逐个入库（沙箱内防 `..`/软链逃逸，单次上限 200 文件 / 2 MiB·文件） |
+| `knowledge_search` | 搜索本地知识库，返回结构化分片、来源和分数 |
+| `manage_memory` / `session_search` | 管理文件记忆、检索历史会话 |
 | `media_generate` | 从文本提示词生成图片（默认）或视频，落盘后返回稳定文件路径，可供导出/送达/入库复用 |
 | `export_document` | 把 Markdown 渲染成可下载文档（md/html/docx/pdf/epub/odt/rtf/txt）并返回文件路径 |
 | `send_message` | 把消息发送到已配置渠道（飞书/Discord/微信/邮件/Slack 等）；交互式会话默认经确认门，无人值守自动化由 `security.autonomy` 矩阵决定 |
 | `cron_task` | 创建/列出/暂停/恢复/移除应用托管的定时任务 |
 | `manage_skill` / `manage_mcp` | 从 HexClaw Hub 搜索、安装、移除技能 / MCP Server；无人值守默认不自动执行，需显式打开 `capability` |
+| `app_query` / `app_heal` | 脱敏查询应用状态，或对 cron/workflow 做受控自愈 |
+| `transfer_to_agent` / `list_agents` / `orchestrate` / `spawn_agent` / `solve` | 多 Agent 分派、编排、派生运行和带独立 `code_exec` 验算的解题工具 |
+| `k12_grade` / `k12_review` | K12 场景包技能：批改入错题本、生成复习变式题（启用 K12 场景包时注册） |
 
-> 无人值守自动化（cron/webhook/spawn/heartbeat/workflow）采用“功能优先 Profile + 显式开关矩阵”：默认 `function_first` 放行 `code_exec`、shell、文件编辑、浏览、知识入库、送达等核心任务；Skill/MCP 管理、发布、伪造 `solve` 来源等高后果能力默认不自动放行，需要在 `security.autonomy.system_dispatch` 或 `full_access` profile 中显式打开。显式 `PermissionPolicy` deny 仍是最高优先级。
+> 无人值守自动化（cron/webhook/spawn/heartbeat/workflow）采用“功能优先 Profile + 显式开关矩阵”：默认 `function_first` 放行 exec 类（推荐 `code_exec`，兼容 `code`/`shell`）、文件编辑、浏览、知识入库、送达等核心任务；Skill/MCP 管理、发布、伪造 `solve` 来源等高后果能力默认不自动放行，需要在 `security.autonomy.system_dispatch` 或 `full_access` profile 中显式打开。显式 `PermissionPolicy` deny 仍是最高优先级。
 > `system_dispatch.<source>` 是替换该来源的 profile 默认值，不是增量合并；只想全局放开时直接使用 `profile: full_access`。
 
 ### 会话与数据
@@ -62,9 +70,10 @@
 - **工作流引擎** — 可视化编排多步骤 Agent 工作流（Canvas Workflow）
 
 ### 生态扩展
-- **MCP 原生支持** — 兼容 3200+ MCP Server（stdio + SSE 传输）
+- **MCP 原生支持** — 兼容 3200+ MCP Server（stdio + SSE + streamable 传输）
 - **Markdown 技能市场** — 兼容 OpenClaw 技能格式，按需延迟加载
 - **多 Agent 路由** — 一个实例托管多个 Agent，按平台/用户/群组路由
+- **K12 家长辅导场景包** — 出厂内置错题本、复习队列、备课卡、年级约束、作业识题/批改和默认 cron 投递
 - **Canvas / A2UI** — Agent 生成交互式 UI（图表、表单、看板等 8 种组件）
 - **安全审计 CLI** — `hexclaw security audit` 一键安全检查 + 修复建议
 - **语音交互** — STT/TTS 转写与合成，支持 MiniMax / Edge / OpenAI / Azure TTS 串联 fallback
@@ -227,10 +236,10 @@ skills:
   auto_load: true
   hub:
     repo_url: https://github.com/hexagon-codes/hexclaw-hub
-    branch: v0.0.2
+    branch: v0.0.6
 
 heartbeat:
-  enabled: false
+  enabled: true
   interval_mins: 15
   quiet_start: "22:00"
   quiet_end: "08:00"
@@ -259,11 +268,15 @@ features:
   # 产品级能力按功能优先默认开启；仅在需要回退/灰度时显式关闭。
   model.gateway.v1: true
   skill.pipeline.v1: true
+  tool.lifecycle.v2: true
+  tool.policy.engine: true
   config.tx.hotload.v1: true
   rag.pipeline.v1: true
-  runtime.sandbox.v1: true
   plugin.extension.v1: true
   agent.factory.real: true
+  pricing.layered.v1: true
+  mcp.lifecycle.v2: true
+  eval.framework.v1: false
 
 skill:
   sandbox:
@@ -286,11 +299,16 @@ v0.4 新增能力统一通过 `features:` 段启用。未注册的 flag 永远�
 常见 flag：
 - `agent.factory.real`：允许按 `dispatch_role` 分派到真实 `hexagon.Agent`
 - `skill.pipeline.v1`：启用 Skill 7 阶段执行流水线
+- `tool.lifecycle.v2`：启用工具生命周期、Hook 优先级、panic 隔离和耗时指标
+- `tool.policy.engine`：启用声明式 PermissionPolicy 权限策略
 - `interactive.render.v1`：交互消息走平台原生 renderer；关闭时使用文本 fallback
 - `config.tx.hotload.v1`：LLM 配置保存走事务热加载
 - `model.gateway.v1`：启用 Provider middleware 链路
-- `events.transport.v1`：启用结构化事件 Sink 投递
 - `rag.pipeline.v1`：启用知识库 5 阶段 RAG Pipeline
+- `pricing.layered.v1`：启用用户覆盖 / 缓存 / 远端 / 内置兜底的分层定价查询
+- `mcp.lifecycle.v2`：启用 MCP Server 上下线生命周期 Hook
+- `plugin.extension.v1`：启用插件 Manifest 与 capability 校验
+- `eval.framework.v1`：评测框架，alpha 阶段默认关闭，发版工具会显式打开
 - `voice.tts.chain.v1`：启用多 TTS Provider 串联 fallback
 
 ## 架构
@@ -355,27 +373,36 @@ hexclaw/
 │   ├── handler_voicechat.go #   语音 STT/TTS + voicechat API
 │   └── handler_misc.go      #   记忆/MCP/技能/路由/Canvas API
 ├── audit/                   # 安全审计 (7 类检查)
+├── autonomy/                # 无人值守权限治理（决策审计 / 任务级授权 / 预检）
 ├── canvas/                  # Canvas/A2UI (8 种组件)
 ├── config/                  # 配置管理 (YAML + 环境变量)
+├── connector/               # 数据连接器（GitHub/Notion 等只读资源）
 ├── cron/                    # 定时任务调度
 ├── desktop/                 # 桌面集成 (通知/剪贴板)
+├── egress/                  # 分级隐私出网策略（用途 × 数据敏感类）
 ├── engine/                  # Agent 引擎（ReAct 推理循环）
 ├── eval/                    # 发版前评测套件
 ├── featureflag/             # Feature flag 注册与运行时查询
 ├── gateway/                 # 六层安全网关
 │   └── llmcall/             #   LLM 调用 gateway (中间件链路)
 ├── heartbeat/               # 心跳巡查
+├── httpua/                  # 出站 HTTP User-Agent 统一注入
 ├── instances/               # 平台实例生命周期管理
 ├── internal/                # 内部工具 (sqliteutil / upstreamerr / testutil)
 ├── knowledge/               # 知识库 (FTS5 + 向量混合检索)
+├── library/                 # Prompt 库 / 运营下发条目
 ├── llmrouter/               # LLM 智能路由
-├── mcp/                     # MCP Client (stdio + SSE)
+├── mcp/                     # MCP Client (stdio + SSE + streamable)
 ├── memory/                  # 文件记忆 (MEMORY.md + 日记)
 ├── plugin/                  # 插件 Manifest / Capability 扩展
+├── records/                 # 通用记录本原语 agent_records
 ├── release/                 # 发版门禁与 canary 状态机
 ├── render/                  # Markdown/文档渲染 (pandoc + LRU 缓存)
 ├── router/                  # 多 Agent 路由
-├── runtime/                 # Runtime 沙箱与 Checkpoint 回滚
+├── scenario/                # 场景包六缝注册表
+├── scenarios/
+│   └── k12/                 # K12 家长辅导场景包
+├── secret/                  # 静态凭据加密主密钥与信封
 ├── security/                # 注入扫描 / 内容净化 / 技能扫描
 ├── session/                 # 会话管理 + 上下文压缩
 ├── skill/                   # Skill 系统
@@ -393,7 +420,7 @@ hexclaw/
 └── Makefile
 ```
 
-> 媒体生成/genstore/SSRF/缓存/trace/events 等基础能力已下沉至 ai-core / toolkit / hexagon，hexclaw 不再保留本地等价实现；语音 STT/TTS 由 `api/` 与 `gateway/` 内联处理，无独立 `voice/` 包。
+> 媒体生成/genstore/缓存/trace/events 与底层 HTTP 工具等基础能力已下沉至 ai-core / toolkit / hexagon，hexclaw 不再保留本地等价实现；语音 STT/TTS 由 `api/` 与 `gateway/` 内联处理，无独立 `voice/` 包。
 
 ## API 端点（常用接口摘录，完整路由按模块启用）
 
@@ -410,13 +437,23 @@ hexclaw/
 ### 会话管理
 | 方法 | 路径 | 说明 |
 |------|------|------|
+| POST | `/api/v1/sessions` | 创建会话 |
 | GET | `/api/v1/sessions` | 会话列表 |
 | GET | `/api/v1/sessions/{id}` | 会话详情 |
+| PATCH | `/api/v1/sessions/{id}` | 更新会话元信息 |
+| POST | `/api/v1/sessions/{id}/suggest-title` | 自动生成会话标题 |
 | DELETE | `/api/v1/sessions/{id}` | 删除会话 |
 | GET | `/api/v1/sessions/{id}/messages` | 消息历史 |
+| POST | `/api/v1/sessions/{id}/messages` | 追加单条消息 |
+| POST | `/api/v1/sessions/{id}/messages/batch` | 批量追加消息 |
 | GET | `/api/v1/sessions/{id}/branches` | 会话分支列表 |
 | POST | `/api/v1/sessions/{id}/fork` | 分支对话 |
 | GET | `/api/v1/messages/search` | 全文搜索消息 |
+| DELETE | `/api/v1/messages/{id}` | 删除单条消息 |
+| PUT | `/api/v1/messages/{id}/feedback` | 写入消息反馈 |
+| GET | `/api/v1/streams/active` | 当前活跃流式请求 |
+| GET | `/api/v1/streams/{request_id}` | 流式请求快照/恢复 |
+| GET | `/api/v1/sessions/{id}/checkpoints` | 会话检查点列表（启用 checkpoint 时） |
 
 ### 配置
 | 方法 | 路径 | 说明 |
@@ -427,8 +464,27 @@ hexclaw/
 | PUT | `/api/v1/config/llm` | 更新 LLM 配置 |
 | POST | `/api/v1/config/llm/test` | 测试单个 Provider 连通性（不落盘；本地 Ollama 可无 Key） |
 | POST | `/api/v1/config/llm/models` | 动态获取 Provider 可用模型列表（代理到 Provider `/models` API） |
+| GET | `/api/v1/config/memory` | 获取自动记忆、主动召回、画像蒸馏等记忆行为配置 |
+| PUT | `/api/v1/config/memory` | 字段级更新记忆行为配置 |
 | GET | `/api/v1/llm/capabilities` | 列出已缓存的模型 tool_call 能力探测结果 |
 | POST | `/api/v1/llm/capabilities/probe` | 立即探测指定 `provider` + `model` 的 tool_call 可靠度 |
+
+### 助手 / Prompt 库 / 连接器
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/assistant/soul` | 获取助手人格 / soul 文本 |
+| PUT | `/api/v1/assistant/soul` | 更新助手人格 / soul 文本 |
+| GET | `/api/v1/connections` | 列出可配置连接类型与状态 |
+| POST | `/api/v1/connections/test` | 无状态测试平台/Provider 凭据 |
+| GET | `/api/v1/connectors` | 连接器脱敏列表（启用 connector store 时） |
+| POST | `/api/v1/connectors` | 创建并加密保存连接器 |
+| DELETE | `/api/v1/connectors/{id}` | 删除连接器 |
+| POST | `/api/v1/connectors/test` | 无状态测试连接器凭据 |
+| GET | `/api/v1/connectors/{id}/resources` | 读取连接器只读资源列表 |
+| GET | `/api/v1/prompts` | 列出启用 Prompt 库条目 |
+| GET | `/api/v1/prompts/all` | 列出全部 Prompt 库条目 |
+| POST | `/api/v1/prompts` | 创建或更新 Prompt 条目 |
+| DELETE | `/api/v1/prompts/{id}` | 删除 Prompt 条目 |
 
 ### 知识库
 | 方法 | 路径 | 说明 |
@@ -440,6 +496,16 @@ hexclaw/
 | DELETE | `/api/v1/knowledge/documents/{id}` | 删除文档 |
 | POST | `/api/v1/knowledge/documents/{id}/reindex` | 重建/重试单个文档索引 |
 | POST | `/api/v1/knowledge/search` | 结构化搜索（`result` 和 `results` 均返回 `[]SearchHit` 数组，包含分片、来源、分数） |
+| GET | `/api/v1/knowledge/config` | 获取知识库检索配置 |
+| PUT | `/api/v1/knowledge/config` | 更新知识库检索配置 |
+
+### 文档解析 / 渲染
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/v1/documents/extract` | 上传 PDF/DOC/PPTX 等并抽取纯文本 |
+| POST | `/api/v1/documents/preview` | 暂存原文件并返回预览 token |
+| GET | `/api/v1/documents/preview/{token}` | 预览/下载暂存原文件 |
+| POST | `/api/v1/render` | Markdown 渲染为 md/html/docx/pdf/epub/odt/rtf/txt（启用 render 服务时） |
 
 ### 定时任务
 统一入口 `POST /api/v1/cronjob` 以请求体中的 `action` 字段分发（`create` / `update` / `remove` / `pause` / `resume` / `run` / `list` / `history`），支持 `idempotency_key` 幂等重放。
@@ -457,7 +523,20 @@ hexclaw/
 | POST | `/api/v1/webhooks/{name}` | 接收 Webhook 事件 |
 | GET | `/api/v1/webhooks` | 列表 |
 | POST | `/api/v1/webhooks` | 注册 |
+| PATCH | `/api/v1/webhooks/{name}` | 更新 Webhook 启用状态 |
 | DELETE | `/api/v1/webhooks/{name}` | 删除 |
+
+### 自动化权限治理
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/autonomy/profile` | 获取无人值守权限 Profile |
+| PUT | `/api/v1/autonomy/profile` | 更新无人值守权限 Profile |
+| POST | `/api/v1/autonomy/preflight` | 对创建中的自动化任务做权限预检 |
+| GET | `/api/v1/autonomy/summary` | 权限治理总览与阻断摘要 |
+| GET | `/api/v1/autonomy/decisions` | 权限决策审计日志 |
+| GET | `/api/v1/autonomy/grants` | 任务级授权列表 |
+| POST | `/api/v1/autonomy/grants` | 创建任务级授权 |
+| DELETE | `/api/v1/autonomy/grants/{id}` | 撤销任务级授权 |
 
 ### 记忆
 | 方法 | 路径 | 说明 |
@@ -465,6 +544,11 @@ hexclaw/
 | GET | `/api/v1/memory` | 获取记忆 |
 | POST | `/api/v1/memory` | 创建记忆 |
 | PUT | `/api/v1/memory` | 更新记忆（允许清空） |
+| PUT | `/api/v1/memory/{id}` | 更新单条记忆 |
+| POST | `/api/v1/memory/{id}/archive` | 归档单条记忆 |
+| POST | `/api/v1/memory/{id}/restore` | 恢复单条记忆 |
+| POST | `/api/v1/memory/{id}/pin` | 置顶单条记忆 |
+| POST | `/api/v1/memory/{id}/unpin` | 取消置顶单条记忆 |
 | DELETE | `/api/v1/memory` | 清空全部记忆 |
 | DELETE | `/api/v1/memory/{id}` | 删除指定记忆 |
 | GET | `/api/v1/memory/search` | 搜索记忆 |
@@ -474,6 +558,8 @@ hexclaw/
 |------|------|------|
 | GET | `/api/v1/mcp/tools` | 工具列表 |
 | GET | `/api/v1/mcp/servers` | Server 列表 |
+| POST | `/api/v1/mcp/servers` | 运行时添加并持久化 MCP Server |
+| DELETE | `/api/v1/mcp/servers/{name}` | 移除 MCP Server |
 | GET | `/api/v1/mcp/status` | 连接状态快照 |
 | POST | `/api/v1/mcp/tools/call` | 调用工具 |
 
@@ -481,12 +567,15 @@ hexclaw/
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/v1/skills` | 已安装技能 |
+| GET | `/api/v1/skills/{name}/content` | 查看已安装技能内容 |
 | PUT | `/api/v1/skills/{name}/status` | 启用/禁用技能（返回运行态字段） |
 | POST | `/api/v1/skills/install` | 安装技能（`clawhub://name` 或本地相对路径） |
+| POST | `/api/v1/skills/generate` | 对话式生成 Skill 草稿并安装 |
 | DELETE | `/api/v1/skills/{name}` | 卸载技能 |
 | GET | `/api/v1/clawhub/search` | ClawHub 技能搜索（支持 `q` / `category`） |
+| GET | `/api/v1/clawhub/skills/{name}/content` | 安装前预览 ClawHub 技能内容 |
 
-默认技能目录仓库：`https://github.com/hexagon-codes/hexclaw-hub` 的 `v0.0.2` 标签（`index.json` + `skills/*.md`）。
+默认技能目录仓库：`https://github.com/hexagon-codes/hexclaw-hub` 的 `v0.0.6` 标签（`index.json` + `skills/*.md`）。
 安装或卸载 Markdown 技能后，会自动同步运行时技能注册表；通常无需重启 sidecar。
 
 ### Agent 路由
@@ -508,6 +597,10 @@ hexclaw/
 | GET | `/api/v1/platforms/instances` | 平台实例列表 |
 | GET | `/api/v1/platforms/instances/health` | 全部实例健康状态 |
 | POST | `/api/v1/platforms/instances` | 创建实例 |
+| PUT | `/api/v1/platforms/instances/by-id/{id}` | 按稳定 ID 更新实例 |
+| DELETE | `/api/v1/platforms/instances/by-id/{id}` | 按稳定 ID 删除实例 |
+| POST | `/api/v1/platforms/instances/by-id/{id}/test` | 按稳定 ID 测试实例配置 |
+| POST | `/api/v1/platforms/instances/by-id/{id}/send-test` | 按稳定 ID 发送测试消息 |
 | PUT | `/api/v1/platforms/instances/{name}` | 更新实例 |
 | DELETE | `/api/v1/platforms/instances/{name}` | 删除实例 |
 | GET | `/api/v1/platforms/instances/{name}/health` | 单实例健康状态 |
@@ -515,6 +608,9 @@ hexclaw/
 | POST | `/api/v1/platforms/instances/{name}/start` | 启动实例 |
 | POST | `/api/v1/platforms/instances/{name}/stop` | 停止实例 |
 | POST | `/api/v1/im/channels/{provider}/test` | 测试 IM 通道配置 |
+| GET | `/api/v1/channels/wecom/guide` | 获取企业微信配置指引 |
+| GET | `/api/v1/platforms/hooks/{provider}/{name}` | 平台回调验证 / GET hook |
+| POST | `/api/v1/platforms/hooks/{provider}/{name}` | 平台回调事件入口 |
 
 ### Canvas / 工作流
 | 方法 | 路径 | 说明 |
@@ -527,6 +623,20 @@ hexclaw/
 | DELETE | `/api/v1/canvas/workflows/{id}` | 删除工作流 |
 | POST | `/api/v1/canvas/workflows/{id}/run` | 异步执行工作流 |
 | GET | `/api/v1/canvas/runs/{id}` | 查询执行结果 |
+| POST | `/api/v1/canvas/runs/{id}/resume` | 从失败/中断节点续跑工作流 |
+| GET | `/api/v1/subagents/runs` | 查询子 Agent 运行记录 |
+
+### 媒体生成 / 产物文件
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/images/status` | 图片生成 Provider 状态 |
+| POST | `/api/v1/images/generate` | 生成图片 |
+| GET | `/api/v1/videos/status` | 视频生成 Provider 状态 |
+| POST | `/api/v1/videos/generate` | 提交异步视频生成任务 |
+| GET | `/api/v1/videos/tasks/{id}` | 轮询视频生成任务 |
+| GET | `/api/v1/voicechat/status` | 语音对话 Provider 状态 |
+| POST | `/api/v1/voicechat/chat` | 语音对话 |
+| GET | `/api/v1/files/generated/{path...}` | 访问图片/视频/文档等生成产物 |
 
 ### 语音
 | 方法 | 路径 | 说明 |
@@ -544,6 +654,20 @@ hexclaw/
 | DELETE | `/api/v1/desktop/notifications` | 清空通知 |
 | GET | `/api/v1/desktop/clipboard` | 读取剪贴板 |
 | POST | `/api/v1/desktop/clipboard` | 写入剪贴板 |
+
+### Ollama 本地模型
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/ollama/status` | 探测本地 Ollama 服务与模型 |
+| POST | `/api/v1/ollama/pull` | 拉取模型 |
+| GET | `/api/v1/ollama/running` | 列出运行中模型 |
+| POST | `/api/v1/ollama/load` | 加载模型 |
+| POST | `/api/v1/ollama/unload` | 卸载模型 |
+| DELETE | `/api/v1/ollama/models/{name}` | 删除模型 |
+| POST | `/api/v1/ollama/restart` | 重启 Ollama 服务 |
+
+### 场景包
+场景包通过 `srv.Mount` 挂载在 `/api/<scenario>` 前缀下，并继承远程访问鉴权。当前内置 K12 家长辅导场景包挂在 `/api/k12/*`，端点契约见 [scenarios/k12/API.md](scenarios/k12/API.md)。
 
 ### 团队协作
 | 方法 | 路径 | 说明 |
@@ -572,6 +696,8 @@ hexclaw/
 - `GET /api/v1/knowledge/documents/{id}` 返回单个文档的完整信息，包含全部内容。
 - `GET /api/v1/knowledge/documents` 返回 `status`、`error_message`、`updated_at`、`source_type`；`POST /api/v1/knowledge/upload` 返回 `status`、`source`、`chunk_count`、`warnings`。
 - `POST /api/v1/agents/rules/test` 会返回命中规则与分数，便于解释“为什么路由到这个 Agent”。
+- 平台实例推荐在前端用 `by-id` 路由做更新/删除/测试，避免显示名重命名后误操作；`GET/POST /api/v1/platforms/hooks/{provider}/{name}` 由平台适配器复用为回调入口。
+- 图片/视频生成优先返回 `file_path`，前端拼接 `/api/v1/files/generated/{path}` 访问，避免把大 base64 写入 SQLite。
 - `GET /api/v1/logs` 的日志项包含稳定 `domain` 字段，可按 `chat / knowledge / integration / automation / engine` 等功能域过滤。
 - `POST /api/v1/config/llm/models` 向 Provider 的 `/models` 端点发起代理请求，返回标准化的模型列表（`{ models: [{ id, name }] }`）；支持 OpenAI 标准格式和替代格式的自动适配。
 - `GET /api/v1/llm/capabilities` 返回 `{ provider_name, model_name, tool_call, tool_call_text, last_probe, probe_error }`；`POST /api/v1/llm/capabilities/probe?provider=X&model=Y` 会实时重测并写入 SQLite 缓存。
@@ -619,7 +745,7 @@ go vet ./...
 golangci-lint run
 
 # 发版前门禁 + Eval + canary dry-run
-go run ./cmd/verify-release -repo . -version 0.4.4 -version-files package.json
+go run ./cmd/verify-release -repo . -version 0.5.0 -version-files hexclaw.go
 ```
 
 ## 技术栈
@@ -682,9 +808,19 @@ chore: 构建/工具链
 
 ### Unreleased
 
+**场景包与记录系统**
+- **场景包六缝扩展** — 新增 `scenario` 注册表，统一注入记录集、约束、视图槽、Agent mode、按钮和 eval suite，平台层不硬编码业务包。
+- **通用记录本** — 新增 `records.agent_records`，以 Agent 为隔离键，支持 schema 校验、去重键、到期复习队列、状态机和乐观锁。
+- **K12 家长辅导包** — 内置 `/api/k12/*`、`k12_grade`/`k12_review`、错题本、积累本、年级约束、备课卡、默认 cron 投递和 K12 专项评测 workflow。
+
+**执行与治理**
+- **执行原语收敛** — `code_exec` 成为推荐执行入口，支持 snippet/file/module/project 与 artifact metadata；`code`/`shell` 保留兼容但标记弃用，顶层 `runtime/` 包删除，沙箱能力收敛到 toolkit + `skill/sandbox`。
+- **无人值守治理 API** — 新增 autonomy profile、preflight、summary、decision audit、task grant 端点，并补齐 purpose/data-class 出网策略。
+
 **依赖与 CI/CD**
 - **框架依赖升级** — 当前 `go.mod` 对齐 hexagon v0.5.8 / ai-core v0.2.1 / toolkit v0.2.6，并统一 Go 1.25.7；`GOWORK=off go test ./... -run '^$'` 已通过，发版/CI 模式下全仓编译不再依赖本地工作区隐式版本。
-- **CI/CD 复验口径** — `sandbox-code-exec.yml` 已作为默认分支专项 workflow，覆盖 toolkit 联调下的 Linux/macOS code_exec 强沙箱路径，并保留 Windows toolkit sandbox 硬门禁；Windows code_exec runtime 集成用例按当前 toolkit 工具链/设备访问能力门控。普通 Linux CI 对真实沙箱执行型用例按后端能力门控，专项 workflow 通过 `HEXCLAW_P0_SANDBOX_PROOF=1` 强制验证。runner 完整性探针已默认跳过，仅在 `HEXCLAW_RUNNER_PROBE=1` 时手工触发；`go test -race -count=1 -coverprofile=/tmp/hexclaw-coverage.out ./...` 已通过。
+- **默认 Hub 标签** — 技能市场默认目录对齐 `hexagon-codes/hexclaw-hub` `v0.0.6`。
+- **CI/CD 复验口径** — `sandbox-code-exec.yml` 作为专项 workflow 覆盖 toolkit 联调下的 Linux/macOS code_exec 强沙箱路径，并保留 Windows toolkit sandbox 硬门禁；Windows code_exec runtime 集成用例按当前 toolkit 工具链/设备访问能力门控。普通 Linux CI 对真实沙箱执行型用例按后端能力门控，专项 workflow 通过 `HEXCLAW_P0_SANDBOX_PROOF=1` 强制验证。runner 完整性探针默认跳过，仅在 `HEXCLAW_RUNNER_PROBE=1` 时手工触发。
 - **code_exec 沙箱兼容性** — Windows 执行包装改为临时 `.cmd` 文件，避免带 `C:\...` 的多行脚本文本触发 toolkit ADS 防逃逸校验；默认 `max_memory_bytes` 提升到 2GiB，满足 Go/Node runtime 在强沙箱中的冷启动需求。
 
 ### v0.4.4
