@@ -56,6 +56,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/connector"
 	"github.com/hexagon-codes/hexclaw/cron"
 	"github.com/hexagon-codes/hexclaw/desktop"
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/hexclaw/featureflag"
 	"github.com/hexagon-codes/hexclaw/gateway"
@@ -68,6 +69,12 @@ import (
 	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/render"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
+	k12 "github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12apihttp "github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
+	k12assembly "github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
+	k12engineadapter "github.com/hexagon-codes/hexclaw/scenarios/k12/engineadapter"
+	k12skilladapter "github.com/hexagon-codes/hexclaw/scenarios/k12/skilladapter"
+	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/secret"
 	"github.com/hexagon-codes/hexclaw/security"
 	"github.com/hexagon-codes/hexclaw/session"
@@ -346,6 +353,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	mdCount := 0
 	if cfg.Skills.Enabled {
 		mp = marketplace.NewMarketplace(cfg.Skills.Dir)
+		// 场景包出厂 seed（batteries-included·零下载）：K12 pack go:embed 的 skill 首启幂等注入
+		// ~/.hexclaw/skills/（已存在不覆盖），须在 Init 前调用，本次启动即被扫描注册。
+		if n, serr := mp.SeedFromFS(k12.BundledSkillsFS(), "skills"); serr != nil {
+			logger.Warn("K12 场景包 skill 首启 seed 失败", "error", serr)
+		} else if n > 0 {
+			logger.Info("K12 场景包 skill 已出厂 seed", "count", n, "dir", cfg.Skills.Dir)
+		}
 		if err := mp.Init(); err != nil {
 			// 静默，后面统一报告
 		} else {
@@ -1329,8 +1343,130 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 	// P0（K12 正确性）：solve = 带 code_exec 独立验证的解题工具。verifier 子 Agent 只许 code_exec、
 	// fresh-context 重算，把"算术幻觉"这一 K12 头号错因用执行 grounding 兜住。
-	if err := skills.Register(engine.NewSolveSkill(agentExecFn, subagentRegistry)); err != nil {
+	solveSkill := engine.NewSolveSkill(agentExecFn, subagentRegistry)
+	if err := skills.Register(solveSkill); err != nil {
 		logger.Error("注册 SolveSkill 失败", "error", err)
+	}
+
+	// 文档渲染服务（提前构建到函数作用域，K12 导出与平台 export skill 复用同一实例，避免 sandbox/cache 冲突）。
+	var renderSvc *render.Service
+	if rs, rErr := buildRenderService(); rErr == nil {
+		renderSvc = rs
+	} else {
+		logger.Warn("[warn] 文档渲染服务未启用", "error", rErr)
+	}
+
+	// K12 场景包装配（v0.5.0）：六缝注册 + records 存储 + 真 adapter（solve/识题/学情/教材/档案/渲染）+ 用例，挂 /api/k12/。
+	// AP-1：K12 只经 scenarios/k12 通过 registry 注入；平台 engine/api 不认识 K12。
+	{
+		// 识题视觉闭包：作业图片 → 云端 vision 文本（mirror knowledge captioner），出网前过 EgressPolicy。
+		k12Egress := &egress.Policy{}
+		visionFn := func(ctx context.Context, image []byte, prompt string) (string, error) {
+			// 分级隐私红线：敏感媒体（作业图片）仅在 vision_ocr 用途放行出网。
+			if gErr := k12Egress.Guard(egress.Request{Purpose: egress.PurposeVisionOCR, DataClass: egress.ClassSensitiveMedia}); gErr != nil {
+				return "", gErr
+			}
+			if router == nil {
+				return "", fmt.Errorf("未配置视觉模型")
+			}
+			provider, _, rErr := router.Route(ctx)
+			if rErr != nil {
+				return "", rErr
+			}
+			dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(image)
+			resp, cErr := provider.Complete(ctx, hexagon.CompletionRequest{
+				Messages: []hexagon.Message{{
+					Role: hexagon.RoleUser,
+					MultiContent: []llm.ContentPart{
+						llm.NewTextPart(prompt),
+						llm.NewImageURLPart(dataURL, "auto"),
+					},
+				}},
+			})
+			if cErr != nil {
+				return "", cErr
+			}
+			return resp.Content, nil
+		}
+
+		k12Opts := []k12assembly.Option{
+			k12assembly.WithRecognizer(k12engineadapter.NewRecognizerAdapter(visionFn)),
+		}
+		if fileMem != nil {
+			k12Opts = append(k12Opts, k12assembly.WithInsights(k12engineadapter.NewInsightsAdapter(fileMem)))
+		}
+		if kb := eng.KnowledgeBase(); kb != nil {
+			k12Opts = append(k12Opts, k12assembly.WithGrounding(k12engineadapter.NewGroundingAdapter(kb)))
+		}
+		// 建档/改档：接 agent 路由 + 持久化（读改写 agents.metadata）。
+		k12Opts = append(k12Opts, k12assembly.WithProfiles(k12engineadapter.NewProfileAdapter(agentRouter, agentStore)))
+		// 导出 PDF/Word：接 render 服务（nil 时 /export 优雅降级 markdown）。
+		if renderSvc != nil {
+			k12Opts = append(k12Opts, k12assembly.WithRenderer(k12engineadapter.NewRenderAdapter(renderSvc)))
+		}
+
+		if k12rt, k12err := k12assembly.Wire(store.DB(), solveSkill, k12Opts...); k12err != nil {
+			logger.Error("装配 K12 场景包失败", "error", k12err)
+		} else {
+			// IM 入站错题入库副作用：把 K12 批改闭环包成通用 skill 注入工具面。
+			// engine 只见通用工具（守 AP-1）；辅导 Agent 在群里被路由命中时，LLM 调
+			// k12_grade 即跑完整批改+错题入库+学情，实例 scope 从 ctx 的已路由 Agent 取。
+			// 辅导 Agent 模板须在 Skills 声明 "k12_grade"（建档时挂载）。
+			if err := skills.Register(k12skilladapter.NewGradeSkill(k12rt.Deps)); err != nil {
+				logger.Warn("注册 k12_grade skill 失败", "error", err)
+			}
+			// 复习飞轮「读」侧：与 k12_grade（写）对称。LLM 在对话/群里被家长要求"复习
+			// 错题"时调 k12_review，取到期错题队列 + 陪练方案（守答案遮罩）。此前 review
+			// 用例只经 HTTP + cron 暴露，自由对话读不到错题本——本工具补上这个触达缺口。
+			// 辅导 Agent 模板须在 Skills 声明 "k12_review"（建档时挂载）。
+			if err := skills.Register(k12skilladapter.NewReviewSkill(k12rt.Deps)); err != nil {
+				logger.Warn("注册 k12_review skill 失败", "error", err)
+			}
+			// 自动化沉淀「调度」缝：注入平台 cron.Scheduler 包成 CronRegistrar，
+			// POST /api/k12/cron/provision 即可为实例注册默认任务（周卷/日提醒/月报/学期确认）。
+			var k12Cron k12apihttp.CronRegistrar
+			if scheduler != nil {
+				k12Cron = k12CronRegistrar{sched: scheduler}
+			}
+			// IM 入站路由「绑定」缝：POST /api/k12/bind-im 把家庭群绑到辅导实例。
+			k12Binder := k12IMBinder{router: agentRouter, store: agentStore}
+			k12Base := fmt.Sprintf("http://127.0.0.1:%d", cfg.Server.Port)
+			srv.Mount("/api/k12", k12apihttp.NewHandler(k12apihttp.Runtime{
+				Views:   k12rt.Registry.Views,
+				Records: k12rt.Records,
+				Deps:    k12rt.Deps,
+				Cron:    k12Cron,
+				Binder:  k12Binder,
+				BaseURL: k12Base,
+			}))
+			// 清债 P5：engine 的 agent-mode 路由消费场景包 mode 特性（K12 领域词不再 engine 硬编码）。
+			modes := k12rt.Registry.Modes
+			engine.SetModeKeywordMatcher(func(mode engine.AgentMode, text string) bool {
+				return modes.MatchesMode(string(mode), text)
+			})
+			// 清债 P5：engine 的交互按钮消费场景包 ButtonProvider（识题确认按钮内容不再 engine 硬编码）。
+			buttons := k12rt.Registry.Buttons
+			engine.SetInteractiveButtonProvider(func(md map[string]string) *adapter.InteractivePayload {
+				b, ok := buttons.Match(func(key string) bool { return engine.ShouldEnrichTrigger(md, key) })
+				if !ok {
+					return nil
+				}
+				payload := &adapter.InteractivePayload{Type: adapter.InteractiveTypeButtons, Prompt: b.Prompt}
+				for i, label := range b.Labels {
+					action := ""
+					if i < len(b.Actions) {
+						action = b.Actions[i]
+					}
+					variant := adapter.ButtonSecondary
+					if i == 0 {
+						variant = adapter.ButtonPrimary
+					}
+					payload.Buttons = append(payload.Buttons, adapter.InteractiveButton{Label: label, Action: action, Variant: variant})
+				}
+				return payload
+			})
+			logger.Info("K12 场景包已装配", "mount", "/api/k12", "识题", true, "学情", fileMem != nil, "教材grounding", eng.KnowledgeBase() != nil)
+		}
 	}
 
 	agentCount := len(agentRouter.ListAgents())
@@ -1568,7 +1704,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	//
 	// markdown → docx/pdf/epub/odt/rtf/txt/html/md 通过 pandoc 渲染。
 	// 详见 .claude/doc-generation-architecture.md
-	if renderSvc, err := buildRenderService(); err == nil && renderSvc != nil {
+	// 复用前面提前构建的 renderSvc（K12 导出与本处 export skill / /api/v1/render 共用一实例）。
+	if renderSvc != nil {
 		srv.SetRenderService(renderSvc)
 		logger.Info("[info] 文档渲染服务已启用",
 			"engine", "pandoc",
@@ -1582,8 +1719,6 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				fmt.Println("  ✓ Skill       export_document (§11.3)")
 			}
 		}
-	} else if err != nil {
-		logger.Warn("[warn] 文档渲染服务未启用", "reason", err.Error())
 	} else {
 		logger.Info("[info] 文档渲染服务未启用",
 			"reason", "系统未安装 pandoc，POST /api/v1/render 端点不挂载")
@@ -1932,6 +2067,52 @@ type unattendedRiskAdapter struct{ r builtin.RiskReviewer }
 func (a unattendedRiskAdapter) AssessLowRisk(ctx context.Context, action, payload string) bool {
 	lvl, err := a.r.Assess(ctx, action, payload)
 	return err == nil && lvl == builtin.RiskLow
+}
+
+// k12IMBinder 把平台 router.Dispatcher + store 包成 K12 的 IMBinder 缝（AP-1：K12 不 import router）。
+// 绑定 = 内存路由规则（即时生效）+ 持久化（重启存活），chat 级绑定（PRD §3.1.7 各绑各的群）。
+type k12IMBinder struct {
+	router *agentrouter.Dispatcher
+	store  *agentrouter.SQLiteStore
+}
+
+func (b k12IMBinder) Bind(ctx context.Context, platform, instanceID, chatID, agentName string) error {
+	rule := agentrouter.Rule{
+		Platform:   platform,
+		InstanceID: instanceID,
+		ChatID:     chatID,
+		AgentName:  agentName,
+		Priority:   50, // 群级显式绑定，优先于平台默认
+	}
+	if err := b.router.AddRule(rule); err != nil {
+		return err
+	}
+	if b.store != nil {
+		if err := b.store.SaveRule(ctx, &rule); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// k12CronRegistrar 把平台 cron.Scheduler 包成 K12 的 CronRegistrar 缝（AP-1：K12 不 import cron）。
+// 用 AddJobFromScript 直接喂 K12 产的确定性 Starlark 脚本，跳过 LLM 编译。
+type k12CronRegistrar struct{ sched *cron.Scheduler }
+
+func (r k12CronRegistrar) Register(ctx context.Context, kind string, spec k12usecase.CronSpec, platform, chatID, userID string) (string, error) {
+	req := cron.AddJobRequest{
+		Name:     spec.Name,
+		Schedule: spec.Schedule,
+		UserID:   userID,
+		Platform: platform,
+		ChatID:   chatID,
+		Deliver:  spec.Deliver,
+	}
+	job, err := r.sched.AddJobFromScript(ctx, req, spec.Runtime, spec.Script)
+	if err != nil {
+		return "", err
+	}
+	return job.ID, nil
 }
 
 type instanceMessageSender struct {

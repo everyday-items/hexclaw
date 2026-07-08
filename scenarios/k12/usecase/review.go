@@ -1,0 +1,226 @@
+package usecase
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
+
+	"github.com/hexagon-codes/hexclaw/records"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+)
+
+// reviewIntervalLadder 艾宾浩斯式间隔阶梯（秒）：卡片每成功重做一次，下次复习推得更远
+// （越记得牢间隔越长，抗遗忘曲线）。索引 = ReviewStage 轮次；超出末档按 30 天封顶。
+//
+//	rung 0 = 1 天（入库首排，与 pipeline.FirstReviewInterval 对齐）
+//	rung 1 = 3 天（首次重做做对）· rung 2 = 7 天 · rung 3 = 15 天 · rung 4+ = 30 天封顶
+var reviewIntervalLadder = []int64{1 * 86400, 3 * 86400, 7 * 86400, 15 * 86400, 30 * 86400}
+
+// reviewIntervalForStage 取某复习轮次的到期间隔（秒），末档封顶、下界 0。
+func reviewIntervalForStage(stage int) int64 {
+	if stage < 0 {
+		stage = 0
+	}
+	if stage >= len(reviewIntervalLadder) {
+		stage = len(reviewIntervalLadder) - 1
+	}
+	return reviewIntervalLadder[stage]
+}
+
+// ReviewItem 复习队列项（跨 collection）：错题本用 Fields，积累本纠错型用 Accum。
+type ReviewItem struct {
+	Record *records.AgentRecord
+	Fields k12.MistakeFields // Collection=错题本 时有效
+	Accum  k12.AccumFields   // Collection=积累本 时有效
+}
+
+// IsAccum 该项是否来自积累本（语英纠错型）。
+func (it ReviewItem) IsAccum() bool {
+	return it.Record != nil && it.Record.Collection == k12.CollectionAccumulation
+}
+
+// Subject 学科（家长侧跨科混排展示）：积累本取 subject；错题本主路径=数学（物化 M4-2 后带 subject）。
+func (it ReviewItem) Subject() string {
+	if it.IsAccum() {
+		return it.Accum.Subject
+	}
+	return "数学"
+}
+
+// Title 题面/内容。
+func (it ReviewItem) Title() string {
+	if it.IsAccum() {
+		return it.Accum.Content
+	}
+	return it.Fields.Question
+}
+
+// Point 知识点/类型（错题本=知识点；积累本=entry_type 如"默写错/错词"）。
+func (it ReviewItem) Point() string {
+	if it.IsAccum() {
+		return it.Accum.EntryType
+	}
+	return it.Fields.KnowledgePoint
+}
+
+// dueOf 取到期（无到期排末尾）。
+func dueOf(it ReviewItem) int64 {
+	if it.Record != nil && it.Record.DueAt != nil {
+		return *it.Record.DueAt
+	}
+	return 1 << 62
+}
+
+// ReviewQueue 返回某实例**到期该练**的复习项——**跨 collection 混排**（错题本 + 积累本纠错型），
+// 按到期升序。这是家长侧"本周该练"的统一队列（PRD §3.5.4：语英客观错误同进复习引擎）。
+func (d Deps) ReviewQueue(ctx context.Context, agentName string) ([]ReviewItem, error) {
+	now := d.now()
+	mrecs, err := d.Records.ListDue(ctx, agentName, k12.CollectionMistakes, now)
+	if err != nil {
+		return nil, fmt.Errorf("usecase: 取错题复习队列: %w", err)
+	}
+	arecs, err := d.Records.ListDue(ctx, agentName, k12.CollectionAccumulation, now)
+	if err != nil {
+		return nil, fmt.Errorf("usecase: 取积累复习队列: %w", err)
+	}
+	items := toItems(mrecs) // 错题本（数理化）
+	for _, r := range arecs {
+		f, _ := k12.ParseAccumFields(r.Fields)
+		if !k12.AccumIsCorrective(f.EntryType) {
+			continue // 只纳入语英纠错型（积累/留档型不进复习队列，双保险：它们本就无 due）
+		}
+		items = append(items, ReviewItem{Record: r, Accum: f})
+	}
+	sort.SliceStable(items, func(i, j int) bool { return dueOf(items[i]) < dueOf(items[j]) })
+	return items, nil
+}
+
+// MarkMastered 家长「他会了」/复测掌握：状态 → 已掌握，清到期（移出复习队列）。**按 collection 分派**
+// 掌握态（错题本 mastered / 积累本 已掌握）——否则会撞记录集状态机校验。
+func (d Deps) MarkMastered(ctx context.Context, recordID string, expectedVersion int) error {
+	rec, err := d.Records.Get(ctx, recordID)
+	if err != nil {
+		return fmt.Errorf("usecase: 取记录: %w", err)
+	}
+	mastered := k12.StatusMastered
+	if rec.Collection == k12.CollectionAccumulation {
+		mastered = k12.AccumStatusMastered
+	}
+	return d.Records.UpdateStatus(ctx, recordID, mastered, nil, expectedVersion)
+}
+
+// MasteryGapInterval 掌握判定的最小间隔（秒）：第二次做对距上次 ≥ 此值 → mastered（PRD §5.3.1）。
+const MasteryGapInterval int64 = 3 * 86400 // 3 天
+
+// MarkRetried 重做做对：状态 → retried，复习轮次 +1，按艾宾浩斯阶梯重排下次到期
+// （轮次越高间隔越长）。轮次写回卡片 fields（乐观锁校验 expectedVersion）。
+//
+// T2.2（PRD §5.3.1）：若已是 retried（做对过一次）且距上次做对 ≥3 天 → 升 mastered、清到期
+// （连对两次且隔天才算掌握，抗隔天遗忘）；否则停留/进入 retried 并记录本次做对时间。
+func (d Deps) MarkRetried(ctx context.Context, recordID string, expectedVersion int) error {
+	rec, err := d.Records.Get(ctx, recordID)
+	if err != nil {
+		return fmt.Errorf("usecase: 取错题记录: %w", err)
+	}
+	if rec.Collection == k12.CollectionAccumulation {
+		return d.markRetriedAccum(ctx, rec, expectedVersion) // 语英纠错型：同艾宾浩斯阶梯，用积累本状态
+	}
+	f, _ := k12.ParseMistakeFields(rec.Fields)
+	now := d.now()
+
+	if rec.Status == k12.StatusRetried && f.LastRetriedAt > 0 && now-f.LastRetriedAt >= MasteryGapInterval {
+		f.LastRetriedAt = now
+		raw, err := json.Marshal(f)
+		if err != nil {
+			return fmt.Errorf("usecase: marshal 错题字段: %w", err)
+		}
+		// 掌握：清到期（移出复习队列）。
+		return d.Records.UpdateStatusFields(ctx, recordID, k12.StatusMastered, nil, string(raw), expectedVersion)
+	}
+
+	f.ReviewStage++ // 完成一次成功重做 → 进阶到下一档间隔
+	f.LastRetriedAt = now
+	due := now + reviewIntervalForStage(f.ReviewStage)
+	raw, err := json.Marshal(f)
+	if err != nil {
+		return fmt.Errorf("usecase: marshal 错题字段: %w", err)
+	}
+	return d.Records.UpdateStatusFields(ctx, recordID, k12.StatusRetried, &due, string(raw), expectedVersion)
+}
+
+// markRetriedAccum 语英纠错型「重做做对」：同错题本艾宾浩斯口径，但走积累本状态（待复习/已掌握）。
+// 连对两次且隔天 ≥MasteryGapInterval → 已掌握清到期；否则轮次 +1 按阶梯重排到期。
+func (d Deps) markRetriedAccum(ctx context.Context, rec *records.AgentRecord, expectedVersion int) error {
+	f, _ := k12.ParseAccumFields(rec.Fields)
+	now := d.now()
+	if rec.Status == k12.AccumStatusReviewing && f.LastRetriedAt > 0 && now-f.LastRetriedAt >= MasteryGapInterval {
+		f.LastRetriedAt = now
+		raw, err := json.Marshal(f)
+		if err != nil {
+			return fmt.Errorf("usecase: marshal 积累字段: %w", err)
+		}
+		return d.Records.UpdateStatusFields(ctx, rec.RecordID, k12.AccumStatusMastered, nil, string(raw), expectedVersion)
+	}
+	f.ReviewStage++
+	f.LastRetriedAt = now
+	due := now + reviewIntervalForStage(f.ReviewStage)
+	raw, err := json.Marshal(f)
+	if err != nil {
+		return fmt.Errorf("usecase: marshal 积累字段: %w", err)
+	}
+	return d.Records.UpdateStatusFields(ctx, rec.RecordID, k12.AccumStatusReviewing, &due, string(raw), expectedVersion)
+}
+
+// GenerateRetry 「再练一道」：基于某错题出一道相似题，**必过 solve 验算链**（不合格由 Solver 侧弃用重出）。
+// 返回相似题解 + 证据对象；只读，不改错题状态。
+func (d Deps) GenerateRetry(ctx context.Context, item ReviewItem, grade string) (SolveResult, error) {
+	if d.Solver == nil {
+		return SolveResult{}, fmt.Errorf("usecase: 未配置 Solver")
+	}
+	prompt := fmt.Sprintf("参照这道错题出一道同知识点(%s)的相似题并解答：%s", item.Fields.KnowledgePoint, item.Fields.Question)
+	sr, err := d.Solver.Solve(ctx, prompt, grade, d.constraintFor(ctx, grade))
+	if err != nil {
+		// BUG-2：下游解题执行失败标记为 ErrSolveFailed，HTTP 层据此回 502（非 400）。
+		return SolveResult{}, fmt.Errorf("%w: %v", ErrSolveFailed, err)
+	}
+	return sr, nil
+}
+
+// GenerateRetryByRecord 按错题 record_id「再练一道」（HTTP/前端入口）。grade 空时从档案取。
+func (d Deps) GenerateRetryByRecord(ctx context.Context, agentName, recordID, grade string) (SolveResult, error) {
+	if recordID == "" {
+		return SolveResult{}, fmt.Errorf("usecase: recordID 不可空")
+	}
+	rec, err := d.Records.Get(ctx, recordID)
+	if err != nil {
+		return SolveResult{}, fmt.Errorf("usecase: 取错题: %w", err)
+	}
+	if rec == nil || rec.AgentName != agentName {
+		return SolveResult{}, fmt.Errorf("usecase: 错题不属于该实例")
+	}
+	// 语英纠错型：**原词重现 + 确定性字符比对**，不走 solve 验算链（PRD §3.5.4：语英字词再练机制适配）。
+	if rec.Collection == k12.CollectionAccumulation {
+		af, _ := k12.ParseAccumFields(rec.Fields)
+		return SolveResult{
+			Solution: fmt.Sprintf("再默一遍（%s·%s）：%s\n判定：一字不差即正确（确定性字符比对，非验算链）。", af.Subject, af.EntryType, af.Content),
+			Evidence: SolveEvidence{Verdict: VerdictVerbatim, EvidenceType: EvidenceVerbatim},
+		}, nil
+	}
+	if grade == "" && d.Profiles != nil {
+		if p, perr := d.GetProfile(ctx, agentName); perr == nil {
+			grade = p.GradeTerm
+		}
+	}
+	f, _ := k12.ParseMistakeFields(rec.Fields)
+	return d.GenerateRetry(ctx, ReviewItem{Record: rec, Fields: f}, grade)
+}
+
+func toItems(recs []*records.AgentRecord) []ReviewItem {
+	out := make([]ReviewItem, 0, len(recs))
+	for _, r := range recs {
+		f, _ := k12.ParseMistakeFields(r.Fields)
+		out = append(out, ReviewItem{Record: r, Fields: f})
+	}
+	return out
+}
