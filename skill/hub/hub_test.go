@@ -205,10 +205,10 @@ func TestNewDefaultsToTaggedHubCatalog(t *testing.T) {
 	if h.cfg.RepoURL != "https://github.com/hexagon-codes/hexclaw-hub" {
 		t.Fatalf("RepoURL 默认值不匹配: %s", h.cfg.RepoURL)
 	}
-	if h.cfg.Branch != "v0.0.5" {
+	if h.cfg.Branch != "v0.0.6" {
 		t.Fatalf("Branch 默认值不匹配: %s", h.cfg.Branch)
 	}
-	if got := h.catalogURL(); got != "https://raw.githubusercontent.com/hexagon-codes/hexclaw-hub/v0.0.5/index.json" {
+	if got := h.catalogURL(); got != "https://raw.githubusercontent.com/hexagon-codes/hexclaw-hub/v0.0.6/index.json" {
 		t.Fatalf("catalogURL 默认值不匹配: %s", got)
 	}
 }

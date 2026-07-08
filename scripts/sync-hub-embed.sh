@@ -22,4 +22,27 @@ fi
 cp "$HUB_DIR/index.json" "$DEST/index.json"
 cp "$HUB_DIR/mcp-registry.json" "$DEST/mcp-registry.json"
 echo "已同步内嵌市场快照 ← $HUB_DIR"
-echo "记得提交 skill/hub/embed/*.json，并确认 DefaultHubBranch 与该分支一致。"
+
+# ── K12 场景包出厂 seed skill（产品决策：batteries-included 零下载）──
+# 从 index.json 按 tag=k12 自动选（无硬编码清单），拷 skill 正文到 scenarios/k12/skills/，
+# 由 scenarios/k12/skills_bundle.go 的 go:embed 打进二进制、首启幂等 seed 到 ~/.hexclaw/skills/。
+K12_SEED_DEST="$REPO_ROOT/scenarios/k12/skills"
+mkdir -p "$K12_SEED_DEST"
+python3 - "$HUB_DIR" "$K12_SEED_DEST" <<'PY'
+import json, os, shutil, sys
+hub, dest = sys.argv[1], sys.argv[2]
+idx = json.load(open(os.path.join(hub, "index.json"), encoding="utf-8"))
+# 清旧 seed（防已下架 skill 残留），再按 k12 tag 重铺
+for f in os.listdir(dest):
+    if f.endswith(".md"):
+        os.remove(os.path.join(dest, f))
+n = 0
+for s in idx.get("skills", []):
+    if "k12" in (s.get("tags") or []):
+        src = os.path.join(hub, s["file"])
+        if os.path.isfile(src):
+            shutil.copy(src, os.path.join(dest, os.path.basename(s["file"])))
+            n += 1
+print(f"已 seed {n} 个 K12 skill → scenarios/k12/skills/")
+PY
+echo "记得提交 skill/hub/embed/*.json + scenarios/k12/skills/*.md，并确认 DefaultHubBranch 与该分支一致。"

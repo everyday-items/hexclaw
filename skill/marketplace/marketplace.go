@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -75,6 +77,40 @@ func (m *Marketplace) Init() error {
 
 	logger.Info("count", "count", len(skills), "dir", m.skillDir)
 	return nil
+}
+
+// SeedFromFS 场景包出厂 skill 的**首启幂等 seed**：把 fsys 下 subdir/*.md 写入 skillDir，
+// **已存在的文件不覆盖**（保留用户/更高版本的本地修改，避免每次启动回滚）。返回新写入数量。
+//
+// batteries-included 的落地：场景包 skill 随二进制 go:embed 出厂，首次运行注入 ~/.hexclaw/skills/，
+// 零下载、离线可用（产品决策：本地部署·零云端依赖）。须在 Init() 之前调用，本次启动才会被扫描注册。
+func (m *Marketplace) SeedFromFS(fsys fs.FS, subdir string) (int, error) {
+	if err := fileutil.MkdirAll(m.skillDir); err != nil {
+		return 0, fmt.Errorf("创建技能目录失败: %w", err)
+	}
+	entries, err := fs.ReadDir(fsys, subdir)
+	if err != nil {
+		return 0, fmt.Errorf("读取内嵌 seed 目录失败: %w", err)
+	}
+	seeded := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		dest := filepath.Join(m.skillDir, e.Name())
+		if _, statErr := os.Stat(dest); statErr == nil {
+			continue // 已存在 → 不覆盖（幂等）
+		}
+		data, rerr := fs.ReadFile(fsys, path.Join(subdir, e.Name()))
+		if rerr != nil {
+			return seeded, fmt.Errorf("读取内嵌 skill %q 失败: %w", e.Name(), rerr)
+		}
+		if werr := os.WriteFile(dest, data, 0644); werr != nil {
+			return seeded, fmt.Errorf("写入 seed skill %q 失败: %w", e.Name(), werr)
+		}
+		seeded++
+	}
+	return seeded, nil
 }
 
 // List 列出所有已安装技能
