@@ -808,7 +808,7 @@ func (f *fakeSession) Login(u, p string) error {
 	f.mu.Unlock()
 	return f.loginErr
 }
-func (f *fakeSession) Select(folder string) error          { return nil }
+func (f *fakeSession) Select(folder string) error             { return nil }
 func (f *fakeSession) SearchUnseen(max int) ([]string, error) { return f.ids, nil }
 func (f *fakeSession) FetchRFC822(id string) ([]byte, error) {
 	if f.fetchErrFor[id] {
@@ -816,8 +816,13 @@ func (f *fakeSession) FetchRFC822(id string) ([]byte, error) {
 	}
 	return []byte(f.raw), nil
 }
-func (f *fakeSession) MarkSeen(id string) error { f.mu.Lock(); f.markedSeen = true; f.mu.Unlock(); return nil }
-func (f *fakeSession) Logout() error            { f.mu.Lock(); f.loggedOut = true; f.mu.Unlock(); return nil }
+func (f *fakeSession) MarkSeen(id string) error {
+	f.mu.Lock()
+	f.markedSeen = true
+	f.mu.Unlock()
+	return nil
+}
+func (f *fakeSession) Logout() error { f.mu.Lock(); f.loggedOut = true; f.mu.Unlock(); return nil }
 
 // LoginCallCount 并发安全地返回 Login 被调用次数, 供启动了后台 pollLoop 的测试读取。
 func (f *fakeSession) LoginCallCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.loginCalls }

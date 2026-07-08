@@ -144,8 +144,8 @@ func TestExtractThinkTags_Idempotent(t *testing.T) {
 
 func TestExtractThinkTags_NoInfoLoss(t *testing.T) {
 	inputs := []struct {
-		raw           string
-		wantContains  string
+		raw          string
+		wantContains string
 	}{
 		{"<think>ABC</think>DEF", "ABCDEF"},
 		{"<thinking>X</thinking>Y", "XY"},
@@ -501,4 +501,3 @@ func TestNeedsNoThinkInjection(t *testing.T) {
 		}
 	}
 }
-

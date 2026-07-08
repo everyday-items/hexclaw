@@ -92,8 +92,8 @@ func TestParseJudgeOutput(t *testing.T) {
 		{"7\n答案部分正确", 7, true},
 		{"7", 7, false},
 		{"评分：8\n准确实用", 8, true}, // fallback 全文搜
-		{"", 10, false},          // 空 → 10
-		{"abc", 10, false},       // 无数字 → 10
+		{"", 10, false},         // 空 → 10
+		{"abc", 10, false},      // 无数字 → 10
 	}
 	for _, c := range cases {
 		score, reason := parseJudgeOutput(c.in)

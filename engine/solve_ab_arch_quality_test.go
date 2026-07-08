@@ -128,7 +128,7 @@ func runABComparison(t *testing.T, modelLabel string, exec SubAgentExecFunc, pro
 		if withCode {
 			allow = []string{codeExecToolName}
 		}
-		spec := SubAgentSpec{RunID: "ab-single", Agent: solverAgentName, Task: buildSolverPrompt(q, "", ""),
+		spec := SubAgentSpec{RunID: "ab-single", Agent: solverAgentName, Task: buildSolverPrompt(q, "", "", "", ""),
 			ToolAllow: allow, Mode: "run", Depth: maxSpawnDepth, Source: solveDispatchSource}
 		res, err := exec(ctx, spec)
 		if err != nil {

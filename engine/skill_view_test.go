@@ -17,9 +17,9 @@ type metaSkill struct {
 	meta skill.SkillMetaInfo
 }
 
-func (s *metaSkill) Name() string                                                { return s.name }
-func (s *metaSkill) Description() string                                         { return s.desc }
-func (s *metaSkill) Match(string) bool                                           { return false }
+func (s *metaSkill) Name() string        { return s.name }
+func (s *metaSkill) Description() string { return s.desc }
+func (s *metaSkill) Match(string) bool   { return false }
 func (s *metaSkill) Execute(context.Context, map[string]any) (*skill.Result, error) {
 	return nil, errors.New("metaSkill.Execute should not be called by skill_view")
 }

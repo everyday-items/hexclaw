@@ -15,16 +15,19 @@ import (
 // bug-20260626：MCP 工具测试报错被「双重包裹」。
 //
 // 复现（用户截图）：测试 mysql_query 工具失败时显示
-//   工具 "mysql_query" 执行失败：工具 "mysql_query" 执行失败：调用 MCP 工具 mysql_query 失败：...
-//                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^ 同一前缀出现两次
+//
+//	工具 "mysql_query" 执行失败：工具 "mysql_query" 执行失败：调用 MCP 工具 mysql_query 失败：...
+//	                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^ 同一前缀出现两次
 //
 // 根因：两层各自加了同样的 `工具 "<name>" 执行失败:` 前缀——
-//   1. mcp/client.go  Manager.CallTool   → fmt.Errorf("工具 %q 执行失败: %w", ...)
-//   2. api/handler_extended.go handleCallMCPTool → "工具 \"" + name + "\" 执行失败: " + err.Error()
+//  1. mcp/client.go  Manager.CallTool   → fmt.Errorf("工具 %q 执行失败: %w", ...)
+//  2. api/handler_extended.go handleCallMCPTool → "工具 \"" + name + "\" 执行失败: " + err.Error()
+//
 // CallTool 返回的 error 已经是完整可读的消息，handler 不应再套一层同样的框。
 //
 // 不变量：handler 必须原样透出 CallTool 的错误，不得叠加自己的 `工具 "<name>" 执行失败:` 前缀
-//   → 工具名前缀在最终消息里只能出现一次；且「未找到」不得被误标成「执行失败」。
+//
+//	→ 工具名前缀在最终消息里只能出现一次；且「未找到」不得被误标成「执行失败」。
 func TestHandleCallMCPTool_NoDoubleWrap(t *testing.T) {
 	cfg := config.DefaultConfig()
 	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}

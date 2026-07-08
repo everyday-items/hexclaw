@@ -30,7 +30,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/cron"
 )
 
-// CronQuotaPerUser 每用户活跃 cron 任务上限（决策点 2：B 30/user，K12 教辅放宽）。
+// CronQuotaPerUser 每用户活跃 cron 任务上限（决策点 2：B 30/user，按需放宽）。
 const CronQuotaPerUser = 30
 
 // CronJobRequest 统一入口请求体。
@@ -64,7 +64,7 @@ type quotaInfo struct {
 	Limit int `json:"limit"`
 }
 
-// idempCache 5min TTL idempotency cache（防 K12 家长 spam 重复提交）。
+// idempCache 5min TTL idempotency cache（防用户 spam 重复提交）。
 type idempCache struct {
 	mu      sync.Mutex
 	entries map[string]idempEntry

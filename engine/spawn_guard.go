@@ -90,7 +90,7 @@ func SetMaxChildrenPerAgent(n int) {
 // 深度闸(maxSpawnDepth) + 并发闸(maxOrchestrateConcurrency) + 单次数量闸(maxChildrenPerAgent)
 // 各自只钳住「一层 / 一瞬间 / 一次拆分」。但 orchestrate 会 **跨深度 × 跨监工轮** 组合扇出：
 // depth0 派 8 → 每个 depth1 再 orchestrate 8 = 72 子；× 监工多轮 ≈ 数百次 LLM 调用 / 单次工具调用。
-// K12 pivot 删了成本闸后，唯一剩的 orchestrateMaxWall=5min 只兜「时间」不兜「数量」——云端快模型
+// 删了成本闸后，唯一剩的 orchestrateMaxWall=5min 只兜「时间」不兜「数量」——云端快模型
 // 5 分钟能打数百次。本闸是纯计数 backstop（不记账成本，符合「成本低优先」），跨整棵派生树累加，
 // 给组合爆炸封一个硬顶。计数器挂在 orchestrate/spawn 根 ctx 上，经 executeFunc→Process 透传给
 // 所有后代（同一指针），任意深度 / 任意轮的新派发都从同一预算扣减，超限即拒。

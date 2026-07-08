@@ -135,7 +135,7 @@ func TestSolve_StampsGrantThroughExecutor(t *testing.T) {
 		return SubAgentResult{Output: "答案：42"}, nil
 	}
 	o := NewSolveSkill(exec, nil)
-	if _, err := o.runSolveAgent(context.Background(), verifierSpec("1+1=?", "2")); err != nil {
+	if _, err := o.runSolveAgent(context.Background(), verifierSpec("1+1=?", "2", "")); err != nil {
 		t.Fatalf("runSolveAgent 报错：%v", err)
 	}
 	if !sawGrant.Load() {

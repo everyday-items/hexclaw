@@ -16,17 +16,17 @@ import (
 func TestSolve_FalseAgreeHardened(t *testing.T) {
 	se := &solveExec{verifierOut: "VERDICT: AGREE\nCOMPUTED: 42"}
 	o := NewSolveSkill(se.fn, nil)
-	if v, c := o.verify(context.Background(), "6×7 等于多少", "48"); v == verdictAgree {
+	if v, c, _ := o.verify(context.Background(), "6×7 等于多少", "48", ""); v == verdictAgree {
 		t.Errorf("回归(BUG①): computed=%q 与候选48可确信不等，verify 却返回 AGREE —— false-AGREE 未硬化，错答案被当『已验证』", c)
 	}
 	// 不误伤①：computed≡候选 → AGREE 维持。
 	se2 := &solveExec{verifierOut: "VERDICT: AGREE\nCOMPUTED: 42"}
-	if v2, _ := NewSolveSkill(se2.fn, nil).verify(context.Background(), "6×7", "42"); v2 != verdictAgree {
+	if v2, _, _ := NewSolveSkill(se2.fn, nil).verify(context.Background(), "6×7", "42", ""); v2 != verdictAgree {
 		t.Errorf("回归(BUG①): computed≡候选(42)应维持 AGREE，得 %s", verdictString(v2))
 	}
 	// 不误伤②：候选『42支』解析不出数（等价文字形式）→ 不武断下调，AGREE 维持。
 	se3 := &solveExec{verifierOut: "VERDICT: AGREE\nCOMPUTED: 42"}
-	if v3, _ := NewSolveSkill(se3.fn, nil).verify(context.Background(), "几支铅笔", "42支"); v3 != verdictAgree {
+	if v3, _, _ := NewSolveSkill(se3.fn, nil).verify(context.Background(), "几支铅笔", "42支", ""); v3 != verdictAgree {
 		t.Errorf("回归(BUG①): 『42支』≡computed 42 属等价文字形式，不应被误降，得 %s", verdictString(v3))
 	}
 }
@@ -35,12 +35,12 @@ func TestSolve_FalseAgreeHardened(t *testing.T) {
 // 只要 computed 与候选可客观比较，就必须用数值纠偏，不能把 2550/2500 这种明确对错降成不可验证。
 func TestSolve_UnverifiableWithComputedHardened(t *testing.T) {
 	o := NewSolveSkill((&solveExec{verifierOut: "VERDICT: UNVERIFIABLE\nCOMPUTED: 2550"}).fn, nil)
-	if v, c := o.verify(context.Background(), "求 1 到 100 所有偶数的和。", "2550"); v != verdictAgree {
+	if v, c, _ := o.verify(context.Background(), "求 1 到 100 所有偶数的和。", "2550", ""); v != verdictAgree {
 		t.Errorf("回归(AP-151): computed=%q 与候选2550相等时应纠为 AGREE，得 %s", c, verdictString(v))
 	}
 
 	o = NewSolveSkill((&solveExec{verifierOut: "VERDICT: UNVERIFIABLE\nCOMPUTED: 2550"}).fn, nil)
-	if v, c := o.verify(context.Background(), "求 1 到 100 所有偶数的和。", "2500"); v != verdictDisagree {
+	if v, c, _ := o.verify(context.Background(), "求 1 到 100 所有偶数的和。", "2500", ""); v != verdictDisagree {
 		t.Errorf("回归(AP-151): computed=%q 与候选2500可确信不等时应纠为 DISAGREE，得 %s", c, verdictString(v))
 	}
 }
@@ -57,7 +57,7 @@ func TestSolve_EquivAnswerSemanticEqual(t *testing.T) {
 	}
 	se := &solveExec{verifierOut: "VERDICT: DISAGREE\nCOMPUTED: 0.5"}
 	o := NewSolveSkill(se.fn, nil)
-	if v, _ := o.verify(context.Background(), "1 除以 2", "1/2"); v == verdictDisagree {
+	if v, _, _ := o.verify(context.Background(), "1 除以 2", "1/2", ""); v == verdictDisagree {
 		t.Errorf("回归(BUG②): 0.5≡1/2，模型误判 DISAGREE 应被代码纠回（仍得 disagree）")
 	}
 }
@@ -77,7 +77,7 @@ func TestSolve_MethodDiversityMultiPartGrouped(t *testing.T) {
 // ④🟡 BUG: verifier prompt 只比对「最终答案」，无逐步过程校验 → 「答案对、推理错」抓不出。
 // 修后：prompt 含过程级（逐步/每一步/过程是否…）校验语义。
 func TestSolve_VerifierProcessLevelCheck(t *testing.T) {
-	p := buildVerifierPrompt("任意题", "任意候选")
+	p := buildVerifierPrompt("任意题", "任意候选", "")
 	hasStepCheck := false
 	for _, kw := range []string{"逐步", "每一步", "每步", "step", "过程是否", "推理是否正确"} {
 		if strings.Contains(p, kw) {

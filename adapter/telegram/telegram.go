@@ -141,7 +141,7 @@ func (a *TelegramAdapter) SendStream(ctx context.Context, chatID string, chunks 
 		}
 	}
 
-	// v0.4.0 E2：最终发送前 strip thinking 防泄漏给家长
+	// v0.4.0 E2：最终发送前 strip thinking 防泄漏给终端用户
 	finalContent := adapter.StripThinking(sb.String())
 	if finalContent == "" {
 		return nil

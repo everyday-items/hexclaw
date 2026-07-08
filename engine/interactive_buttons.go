@@ -15,8 +15,8 @@
 //   buildReplyMetadata 仍会写 metadata["interactive_payload"] JSON 字符串，标 deprecated。
 //   v0.5.x 一个版本后移除，强制升级到 reply.Interactive。
 //
-// 触发模型（K12 识题确认）：incoming metadata.expect_question_confirm=true → enrich 默认按钮。
-// 后续触发器扩展：expect_subquestion_select / expect_answer_reveal / 等（见 E6 完整实现）。
+// 触发模型（清债 P5）：具体按钮内容由**场景包**通过 ButtonProvider 声明（如 K12 的识题确认）；
+// engine 只做通用机制——按 metadata 触发键 enrich 结构化按钮。engine 不再硬编码任何领域按钮内容。
 
 package engine
 
@@ -27,25 +27,29 @@ import (
 	"github.com/hexagon-codes/hexclaw/adapter"
 )
 
-// BuildQuestionConfirmPayload K12 识题确认场景默认按钮。
+// interactiveButtonProvider 场景包注入的交互按钮提供者（清债 P5）。
 //
-// 用法：当用户上传题目图片但 OCR/识题后需要让家长确认是否识对，前端可在请求
-// metadata 标记 expect_question_confirm=true，engine 在回复时自动附带按钮。
-func BuildQuestionConfirmPayload() *adapter.InteractivePayload {
-	return &adapter.InteractivePayload{
-		Type:   adapter.InteractiveTypeButtons,
-		Prompt: "是这道题吗？",
-		Buttons: []adapter.InteractiveButton{
-			{Label: "是", Action: "confirm-question", Variant: adapter.ButtonPrimary},
-			{Label: "不是", Action: "reject-question", Variant: adapter.ButtonSecondary},
-		},
-	}
+// 给定 incoming metadata（含触发键），返回要 enrich 的结构化按钮载荷；无匹配返回 nil。
+// nil（无场景包）时 engine 不产任何领域按钮（AP-1：删掉场景包后平台无 K12 按钮）。
+var interactiveButtonProvider func(metadata map[string]string) *adapter.InteractivePayload
+
+// SetInteractiveButtonProvider 由 composition root 注入（适配场景包的 ButtonRegistry）。
+func SetInteractiveButtonProvider(f func(metadata map[string]string) *adapter.InteractivePayload) {
+	interactiveButtonProvider = f
 }
 
-// shouldEnrichQuestionConfirm 检查 incoming 消息 metadata 是否触发"识题确认"。
-// trigger key=expect_question_confirm，值非空且不为 "false"/"0"/"off" 即触发。
-func shouldEnrichQuestionConfirm(metadata map[string]string) bool {
-	v := strings.TrimSpace(strings.ToLower(metadata["expect_question_confirm"]))
+// enrichInteractiveButtons 查询场景包是否为本次 metadata 提供交互按钮。
+func enrichInteractiveButtons(metadata map[string]string) *adapter.InteractivePayload {
+	if interactiveButtonProvider == nil {
+		return nil
+	}
+	return interactiveButtonProvider(metadata)
+}
+
+// ShouldEnrichTrigger 通用触发判定：metadata[key] 非空且不为 "false"/"0"/"off"/"no"。
+// 供场景包的 ButtonProvider 复用（通用 metadata flag 解析，领域无关）。
+func ShouldEnrichTrigger(metadata map[string]string, key string) bool {
+	v := strings.TrimSpace(strings.ToLower(metadata[key]))
 	if v == "" {
 		return false
 	}
@@ -112,19 +116,6 @@ func EncodeInteractiveButtons(block InteractiveButtonsBlock) string {
 // Deprecated: use WithInteractivePayload.
 func WithInteractiveButtons(metadata map[string]string, block InteractiveButtonsBlock) map[string]string {
 	return WithInteractivePayload(metadata, block.toPayload())
-}
-
-// BuildQuestionConfirmButtons Deprecated: 改用 BuildQuestionConfirmPayload。
-//
-// Deprecated: use BuildQuestionConfirmPayload.
-func BuildQuestionConfirmButtons() InteractiveButtonsBlock {
-	return InteractiveButtonsBlock{
-		Prompt: "是这道题吗？",
-		Buttons: []adapter.InteractiveButton{
-			{Label: "是", Action: "confirm-question", Variant: adapter.ButtonPrimary},
-			{Label: "不是", Action: "reject-question", Variant: adapter.ButtonSecondary},
-		},
-	}
 }
 
 // WithInteractivePayload 把结构化 payload 装入 metadata 兼容字段（拷贝语义，不修改入参）。

@@ -5,11 +5,11 @@
 //   - **类型安全**：替代之前的 `metadata["interactive_buttons"] = JSON.stringify(...)` 字符串嵌入做法。
 //     reply.Interactive 是结构化字段，跨适配器（飞书 / Slack / Discord / Telegram / Web）渲染时不再 JSON.parse。
 //
-//   - **4 种交互形态**：buttons / select / approval / card。覆盖 v0.5.x K12 全部交互场景：
-//     - buttons：识题确认 / 二选一 / 简单导航
-//     - select：分题（一页多题选哪道讲）/ 学科切换 / 难度选择
-//     - approval：危险操作审批（删除错题 / 清空 Memory / 调用付费 API）
-//     - card：富信息展示（错题详情卡 / 学情周报卡 / 模型成本卡）+ 内嵌按钮
+//   - **4 种交互形态**：buttons / select / approval / card。覆盖 v0.5.x 全部交互场景：
+//     - buttons：确认 / 二选一 / 简单导航
+//     - select：多选一 / 切换 / 难度选择
+//     - approval：危险操作审批（删除记录 / 清空 Memory / 调用付费 API）
+//     - card：富信息展示（详情卡 / 周报卡 / 模型成本卡）+ 内嵌按钮
 //
 //   - **跨适配器可渲染**：所有平台都能把抽象 payload 翻译成原生格式（飞书卡片 / Slack Block Kit /
 //     Discord Components / Telegram Inline Keyboard / Web Vue 组件）。Adapter 实现 PayloadRenderer 即可。
@@ -40,22 +40,22 @@ const (
 //   - Type=approval  → Approval 必填
 //   - Type=card      → Card 必填
 type InteractivePayload struct {
-	Type    InteractiveType `json:"type"`
-	Prompt  string          `json:"prompt,omitempty"` // 通用提示文案（4 种 type 都可用）
-	Buttons []InteractiveButton `json:"buttons,omitempty"`
-	Options []InteractiveOption `json:"options,omitempty"`
+	Type     InteractiveType      `json:"type"`
+	Prompt   string               `json:"prompt,omitempty"` // 通用提示文案（4 种 type 都可用）
+	Buttons  []InteractiveButton  `json:"buttons,omitempty"`
+	Options  []InteractiveOption  `json:"options,omitempty"`
 	Approval *InteractiveApproval `json:"approval,omitempty"`
-	Card    *InteractiveCard `json:"card,omitempty"`
+	Card     *InteractiveCard     `json:"card,omitempty"`
 	// Resolved 用户已交互后的结果（前端点击 / 后端读取）
 	Resolved *InteractiveResolved `json:"resolved,omitempty"`
 }
 
 // InteractiveButton 单个按钮。
 type InteractiveButton struct {
-	Label   string         `json:"label"`
-	Action  string         `json:"action"`            // 用户点击后回传给后端的 action 标识
-	Variant ButtonVariant  `json:"variant,omitempty"` // primary / secondary / danger
-	Payload string         `json:"payload,omitempty"` // 可选 payload，原样回传
+	Label   string        `json:"label"`
+	Action  string        `json:"action"`            // 用户点击后回传给后端的 action 标识
+	Variant ButtonVariant `json:"variant,omitempty"` // primary / secondary / danger
+	Payload string        `json:"payload,omitempty"` // 可选 payload，原样回传
 }
 
 // ButtonVariant 按钮视觉强度。
@@ -76,8 +76,8 @@ type InteractiveOption struct {
 
 // InteractiveApproval approve / reject 审批载荷。
 type InteractiveApproval struct {
-	Subject     string `json:"subject"`               // 审批对象（如"删除 12 道错题"）
-	Summary     string `json:"summary,omitempty"`     // 详情摘要
+	Subject      string `json:"subject"`                 // 审批对象（如"删除 12 条记录"）
+	Summary      string `json:"summary,omitempty"`       // 详情摘要
 	ApproveLabel string `json:"approve_label,omitempty"` // 默认"批准"
 	RejectLabel  string `json:"reject_label,omitempty"`  // 默认"拒绝"
 	// 审批结果回传 action 名（默认 "approve" / "reject"）
@@ -87,11 +87,11 @@ type InteractiveApproval struct {
 
 // InteractiveCard 富信息卡片（标题 + 字段列表 + 可选按钮）。
 type InteractiveCard struct {
-	Title   string             `json:"title"`
-	Fields  []CardField        `json:"fields,omitempty"`
+	Title   string              `json:"title"`
+	Fields  []CardField         `json:"fields,omitempty"`
 	Buttons []InteractiveButton `json:"buttons,omitempty"`
-	Image   string             `json:"image,omitempty"`   // 可选封面图 URL / data:
-	Footer  string             `json:"footer,omitempty"`
+	Image   string              `json:"image,omitempty"` // 可选封面图 URL / data:
+	Footer  string              `json:"footer,omitempty"`
 }
 
 // CardField 卡片中的一行键值对。

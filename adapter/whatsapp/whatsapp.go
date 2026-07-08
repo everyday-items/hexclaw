@@ -135,7 +135,7 @@ func (a *WhatsAppAdapter) sendReplyNow(ctx context.Context, chatID string, reply
 	if reply == nil {
 		return nil
 	}
-	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给家长
+	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给终端用户
 	payload := map[string]any{
 		"messaging_product": "whatsapp",
 		"to":                chatID,

@@ -114,7 +114,7 @@ func (a *MatrixAdapter) sendReplyNow(ctx context.Context, roomID string, reply *
 	url := fmt.Sprintf("%s/_matrix/client/v3/rooms/%s/send/m.room.message/%s",
 		a.config.HomeserverURL, roomID, txnID)
 
-	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给家长
+	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给终端用户
 	payload := map[string]string{
 		"msgtype": "m.text",
 		"body":    adapter.StripThinking(reply.Content),

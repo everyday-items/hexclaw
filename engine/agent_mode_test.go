@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/ai-core/llm"
@@ -15,9 +16,9 @@ type metaSkillStub struct {
 	meta skill.SkillMetaInfo
 }
 
-func (s *metaSkillStub) Name() string                                              { return s.name }
-func (s *metaSkillStub) Description() string                                       { return s.desc }
-func (s *metaSkillStub) Match(string) bool                                         { return false }
+func (s *metaSkillStub) Name() string        { return s.name }
+func (s *metaSkillStub) Description() string { return s.desc }
+func (s *metaSkillStub) Match(string) bool   { return false }
 func (s *metaSkillStub) Execute(context.Context, map[string]any) (*skill.Result, error) {
 	return nil, nil
 }
@@ -49,6 +50,22 @@ func TestDecodeMode(t *testing.T) {
 }
 
 func TestAutoRoute(t *testing.T) {
+	// 清债 P5：K12 领域词（复习/备考/我孩子/以前错过/之前那道/错题本）不再 engine 硬编码，
+	// 由场景包经 matcher 注入。此处模拟 K12 pack 注入，验证 engine 在原路由位置正确消费。
+	SetModeKeywordMatcher(func(mode AgentMode, text string) bool {
+		kw := map[AgentMode][]string{
+			ModePlanExecute:  {"复习", "备考"},
+			ModeMemAugmented: {"我孩子", "以前错过", "之前那道", "错题本"},
+		}
+		for _, k := range kw[mode] {
+			if strings.Contains(text, k) {
+				return true
+			}
+		}
+		return false
+	})
+	defer SetModeKeywordMatcher(nil)
+
 	cases := []struct {
 		text string
 		want AgentMode

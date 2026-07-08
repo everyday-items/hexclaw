@@ -30,8 +30,8 @@ type Activation struct {
 
 // TrustLevel 表示 Skill 的可信级别。值越大越可信。
 //
-// v0.4.0 F10 K12 安全底线：
-//   - LLM 暴露给学生使用前可按 SelectByMinTrust 过滤掉 Untrusted Skill
+// v0.4.0 F10 安全底线：
+//   - LLM 暴露给终端用户前可按 SelectByMinTrust 过滤掉 Untrusted Skill
 //   - patch_skill / create_skill 写到 .pending 后审核者可用 Trust 决定是否批准
 //
 // Trust 不由 LLM 自填，而由 loader 推导：
@@ -104,13 +104,13 @@ type MetaProvider interface {
 // 单独抽出此 struct 是因为 skill/marketplace 依赖 skill 包，反向引用会循环。
 // MarkdownSkill 在 marketplace 包中实现 SkillMeta() 返回此结构即可。
 type SkillMetaInfo struct {
-	Name           string
-	Description    string
-	Triggers       []string
-	Tags           []string
-	When           []string // 形如 "subject=math"、"mode=tot"、"grade=小学"，AND 关系
-	NotWhen        []string // AND 关系，匹配任一即排除
-	PreferredMode  string   // 例如 "tot"、"plan-execute"，由 chat 引擎读取后路由
+	Name          string
+	Description   string
+	Triggers      []string
+	Tags          []string
+	When          []string // 形如 "subject=math"、"mode=tot"、"grade=小学"，AND 关系
+	NotWhen       []string // AND 关系，匹配任一即排除
+	PreferredMode string   // 例如 "tot"、"plan-execute"，由 chat 引擎读取后路由
 
 	// v0.4.0 F5: 工具集依赖。Tools 是硬依赖（缺失则 Skill 跳过）；Requires 是
 	// 抽象能力标签（用于上层环境画像匹配，不强制为可执行工具名）。
@@ -327,7 +327,7 @@ func MissingDependencies(s Skill, available map[string]bool) []string {
 
 // SelectByMinTrust 在 SelectByContext 基础上过滤掉信任级别低于 minTrust 的 Skill。
 //
-// 用法：K12 场景下 Agent 暴露给学生时传 minTrust=TrustSigned，可同时收紧 Top-K
+// 用法：Agent 暴露给终端用户时传 minTrust=TrustSigned，可同时收紧 Top-K
 // 召回 + 信任过滤。query="" + 零 Activation 时退化为"按信任级别拉全表"。
 func (r *DefaultRegistry) SelectByMinTrust(query string, act Activation, minTrust TrustLevel, k int) []Skill {
 	r.mu.RLock()

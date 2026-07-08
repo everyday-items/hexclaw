@@ -5,7 +5,7 @@
 //   - SQL / file path
 //
 // 来源动机：v0.4.x cron 链路曾把 Anthropic 400 错误（含 tool_use_id 字符串）
-// 直接抖给用户，对 K12 家长完全是黑话。统一在 API edge 层兜底翻译。
+// 直接抖给用户，对非技术用户完全是黑话。统一在 API edge 层兜底翻译。
 package api
 
 import (
@@ -15,7 +15,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/cron"
 )
 
-// humanizeError 把任意 error 翻译成对 K12 家长友好的消息。
+// humanizeError 把任意 error 翻译成对非技术用户友好的消息。
 //
 // 设计原则：
 //   - 不返 nil（即使 err==nil 也返空字符串，调用方判断）

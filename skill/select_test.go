@@ -14,13 +14,13 @@ type fakeSkill struct {
 	meta SkillMetaInfo
 }
 
-func (s *fakeSkill) Name() string                                          { return s.name }
-func (s *fakeSkill) Description() string                                   { return s.desc }
-func (s *fakeSkill) Match(string) bool                                     { return false }
+func (s *fakeSkill) Name() string                                             { return s.name }
+func (s *fakeSkill) Description() string                                      { return s.desc }
+func (s *fakeSkill) Match(string) bool                                        { return false }
 func (s *fakeSkill) Execute(context.Context, map[string]any) (*Result, error) { return nil, nil }
 func (s *fakeSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.ToolDefinition{
-		Type: "function",
+		Type:     "function",
 		Function: llm.ToolFunctionDef{Name: s.name, Description: s.desc},
 	}
 }
@@ -45,9 +45,9 @@ func newFake(name, desc string, triggers, tags, when, notWhen []string, prefMode
 // builtinSkill 模拟内置 Skill —— 不实现 MetaProvider，验证 MissingDependencies 兜底逻辑。
 type builtinSkill struct{ name string }
 
-func (s *builtinSkill) Name() string                                          { return s.name }
-func (s *builtinSkill) Description() string                                   { return "builtin" }
-func (s *builtinSkill) Match(string) bool                                     { return false }
+func (s *builtinSkill) Name() string                                             { return s.name }
+func (s *builtinSkill) Description() string                                      { return "builtin" }
+func (s *builtinSkill) Match(string) bool                                        { return false }
 func (s *builtinSkill) Execute(context.Context, map[string]any) (*Result, error) { return nil, nil }
 func (s *builtinSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.ToolDefinition{Type: "function", Function: llm.ToolFunctionDef{Name: s.name}}

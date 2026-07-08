@@ -55,13 +55,13 @@ func TestCustomSoul_StillGetsOperatingManual(t *testing.T) {
 func TestDefaultSystemPrompt_RetainsOperatingManual(t *testing.T) {
 	full := DefaultSystemPrompt()
 	for _, must := range []string{
-		"hexclaw.net",            // 官网锚点
-		"严禁",                    // 别谎报存盘红线
-		"write_file",             // 工具偏好
-		"code_exec",              // 代码执行偏好
+		"hexclaw.net",  // 官网锚点
+		"严禁",           // 别谎报存盘红线
+		"write_file",   // 工具偏好
+		"code_exec",    // 代码执行偏好
 		"明确点名要某种可下载格式", // PDF/Word 导出指引
-		"Download",               // 导出入口
-		"file_edit",              // 精确改文件
+		"Download",     // 导出入口
+		"file_edit",    // 精确改文件
 	} {
 		if !strings.Contains(full, must) {
 			t.Errorf("默认 system prompt 拆分后丢了工具纪律关键项: %q", must)
@@ -94,11 +94,11 @@ func TestEnLocale_GetsNativeEnglishPersona(t *testing.T) {
 	got := systemPrompt(map[string]string{"user_locale": "en"})
 
 	for _, must := range []string{
-		"Little Crab",      // EN 角色名
-		"Hard claws",       // EN 声音：钳
-		"local-first",      // EN 定位
-		"Creed:",           // EN 信条
-		"hexclaw.net",      // 官网锚点
+		"Little Crab", // EN 角色名
+		"Hard claws",  // EN 声音：钳
+		"local-first", // EN 定位
+		"Creed:",      // EN 信条
+		"hexclaw.net", // 官网锚点
 	} {
 		if !strings.Contains(got, must) {
 			t.Errorf("en 人设缺原生英文要素: %q", must)

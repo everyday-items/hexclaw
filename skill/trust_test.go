@@ -14,9 +14,9 @@ type trustingSkill struct {
 	trust TrustLevel
 }
 
-func (s *trustingSkill) Name() string                                          { return s.name }
-func (s *trustingSkill) Description() string                                   { return s.desc }
-func (s *trustingSkill) Match(string) bool                                     { return false }
+func (s *trustingSkill) Name() string                                             { return s.name }
+func (s *trustingSkill) Description() string                                      { return s.desc }
+func (s *trustingSkill) Match(string) bool                                        { return false }
 func (s *trustingSkill) Execute(context.Context, map[string]any) (*Result, error) { return nil, nil }
 func (s *trustingSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.ToolDefinition{Type: "function", Function: llm.ToolFunctionDef{Name: s.name}}

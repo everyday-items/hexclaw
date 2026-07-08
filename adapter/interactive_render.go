@@ -141,7 +141,7 @@ func ShouldUseNativeRenderer(flags featureflag.Flags) bool {
 //
 // 现状说明（查证 2026-07-02）：flag interactive.render.v1 已 GA=ON，但当前生态里
 // **没有任何适配器实现 PayloadRenderer 原生渲染**（6 个 IM 适配器只有本 fallback 一条路），
-// 且 **没有任何生产路径填充 reply.Interactive** —— 唯一的填充点是 K12 识题确认
+// 且 **没有任何生产路径填充 reply.Interactive** —— 唯一的填充点是场景包交互按钮
 // （buildInteractivePayload 命中 metadata.expect_question_confirm），而该触发器目前无生产
 // 生产者接线（仅测试用；见 engine/react.go 的 TODO E6/v0.4.0）。因此 flag ON 下的 no-op
 // 此刻不会静默丢弃任何东西，不是运行时 bug。

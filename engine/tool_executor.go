@@ -73,6 +73,8 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 				if err != nil {
 					return "", err
 				}
+				// BUG-1：skill 结构化 reply-safe 元数据（如 record chip）经 ctx sink 带到 reply。
+				stampToolReplyMeta(ctx, result.Metadata)
 				return result.Content, nil
 			})
 		}
@@ -229,6 +231,8 @@ func (e *ToolExecutor) runSkillViaPipeline(ctx context.Context, toolName string,
 	if res.Skill != nil && res.Skill.Name() != toolName {
 		return "", fmt.Errorf("runSkillViaPipeline: pipeline routed %q → %q (refusing to execute mismatched skill)", toolName, res.Skill.Name())
 	}
+	// BUG-1：pipeline 路径同样透传结构化 reply-safe 元数据（record chip 等）。
+	stampToolReplyMeta(ctx, res.Result.Metadata)
 	return res.Result.Content, nil
 }
 

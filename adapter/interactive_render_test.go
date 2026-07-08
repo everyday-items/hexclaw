@@ -43,8 +43,8 @@ func TestRenderTextFallback_Card(t *testing.T) {
 	out := RenderTextFallback(&InteractivePayload{
 		Type: "card",
 		Card: &InteractiveCard{
-			Title:  "今日概况",
-			Fields: []CardField{{Label: "做题", Value: "12"}},
+			Title:   "今日概况",
+			Fields:  []CardField{{Label: "做题", Value: "12"}},
 			Buttons: []InteractiveButton{{Label: "查看", Action: "view"}},
 		},
 	})

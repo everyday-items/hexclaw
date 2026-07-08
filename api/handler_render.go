@@ -13,10 +13,10 @@ import (
 //
 // 参考 .claude/doc-generation-architecture.md §3.2。
 type renderRequest struct {
-	Content string                `json:"content"` // markdown 文本（外部资源已预下载内联）
-	Format  render.Format         `json:"format"`
-	Title   string                `json:"title,omitempty"`   // 可选：用于 Content-Disposition filename
-	Options render.RenderOptions  `json:"options,omitempty"` // 可选：locale 等
+	Content string               `json:"content"` // markdown 文本（外部资源已预下载内联）
+	Format  render.Format        `json:"format"`
+	Title   string               `json:"title,omitempty"`   // 可选：用于 Content-Disposition filename
+	Options render.RenderOptions `json:"options,omitempty"` // 可选：locale 等
 }
 
 // handleRender 处理 POST /api/v1/render

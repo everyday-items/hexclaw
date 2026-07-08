@@ -49,8 +49,8 @@ func TestInteractivePayload_IsValid(t *testing.T) {
 
 func TestInteractivePayload_ResolvedFlow(t *testing.T) {
 	p := &InteractivePayload{
-		Type:    InteractiveTypeButtons,
-		Prompt:  "是这道题吗？",
+		Type:   InteractiveTypeButtons,
+		Prompt: "是这道题吗？",
 		Buttons: []InteractiveButton{
 			{Label: "是", Action: "confirm", Variant: ButtonPrimary},
 			{Label: "不是", Action: "reject"},

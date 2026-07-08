@@ -135,7 +135,7 @@ func (a *LineAdapter) sendReplyNow(ctx context.Context, chatID string, reply *ad
 		return fmt.Errorf("创建 LINE SDK 客户端失败: %w", err)
 	}
 
-	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给家长（同时覆盖 reply/push 两条路径）。
+	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给终端用户（同时覆盖 reply/push 两条路径）。
 	clean := adapter.StripThinking(reply.Content)
 	messages := []messaging_api.MessageInterface{
 		&messaging_api.TextMessage{Text: clean},

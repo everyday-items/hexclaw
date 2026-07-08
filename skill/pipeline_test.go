@@ -31,19 +31,19 @@ func (o *recordingObserver) OnPhaseExit(_ context.Context, p Phase, _ Skill, err
 
 // pipelineSkill 实现完整接口（execute 可指定结果 / 错误，并可注入 LoadContent / VerifyContent 失败）。
 type pipelineSkill struct {
-	name        string
-	desc        string
-	execResult  string
-	execErr     error
-	loadErr     error
-	verifyErr   error
-	loadCalled  bool
+	name         string
+	desc         string
+	execResult   string
+	execErr      error
+	loadErr      error
+	verifyErr    error
+	loadCalled   bool
 	verifyCalled bool
 }
 
-func (s *pipelineSkill) Name() string                                          { return s.name }
-func (s *pipelineSkill) Description() string                                   { return s.desc }
-func (s *pipelineSkill) Match(string) bool                                     { return false }
+func (s *pipelineSkill) Name() string        { return s.name }
+func (s *pipelineSkill) Description() string { return s.desc }
+func (s *pipelineSkill) Match(string) bool   { return false }
 func (s *pipelineSkill) Execute(_ context.Context, _ map[string]any) (*Result, error) {
 	if s.execErr != nil {
 		return nil, s.execErr

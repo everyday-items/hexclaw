@@ -1,17 +1,19 @@
 // BUG-20260523 ToolCollector skill name 校验回归测试
 //
 // 症状：用户的 marketplace skill "前女友" / "前leader" 名字含中文，
-//      被 ToolCollector 注入到 Claude tools[].function.name 后，
-//      上游 400 Bad Request：
-//        ***.***.***.name: String should match pattern '^[a-zA-Z0-9_-]{1,128}$'
+//
+//	被 ToolCollector 注入到 Claude tools[].function.name 后，
+//	上游 400 Bad Request：
+//	  ***.***.***.name: String should match pattern '^[a-zA-Z0-9_-]{1,128}$'
 //
 // 根因：CollectFiltered 直接吐 ToolDefinition 没校验 name 是否符合
-//      OpenAI / Anthropic 兼容协议的标识符正则。任何 source（builtin /
-//      marketplace / chain / MCP）引入非法 name 都会被上游拒收。
+//
+//	OpenAI / Anthropic 兼容协议的标识符正则。任何 source（builtin /
+//	marketplace / chain / MCP）引入非法 name 都会被上游拒收。
 //
 // 修法：CollectFiltered 出口处用 isValidLLMToolName(...) 守门：
-//      - 合法：直通
-//      - 非法：skip + warn 日志（不破坏 trigger 词召唤路径）
+//   - 合法：直通
+//   - 非法：skip + warn 日志（不破坏 trigger 词召唤路径）
 //
 // 本测试以**契约**为粒度断言所有输出 tool name 都符合正则。任何未来 source
 // 引入非法 name 立即 FAIL。
@@ -32,10 +34,10 @@ var claudeToolNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
 // LLM tools 列表里，否则上游 Claude 立即 400。
 func TestBUG20260523_ChineseSkillNameMustNotEnterToolList(t *testing.T) {
 	reg := skill.NewRegistry()
-	reg.Register(&testSkill{name: "search", result: "ok"})        // 合法
-	reg.Register(&testSkill{name: "weather", result: "ok"})       // 合法
-	reg.Register(&testSkill{name: "前女友", result: "blocked"})      // 中文非法
-	reg.Register(&testSkill{name: "前leader", result: "blocked"})  // 中文混合非法
+	reg.Register(&testSkill{name: "search", result: "ok"})       // 合法
+	reg.Register(&testSkill{name: "weather", result: "ok"})      // 合法
+	reg.Register(&testSkill{name: "前女友", result: "blocked"})     // 中文非法
+	reg.Register(&testSkill{name: "前leader", result: "blocked"}) // 中文混合非法
 
 	tc := NewToolCollector(reg, nil, 40)
 	tools := tc.Collect()
@@ -55,14 +57,14 @@ func TestBUG20260523_AllToolNamesMustBeUpstreamSafe(t *testing.T) {
 	reg := skill.NewRegistry()
 	// 各种非法形态都得被过滤
 	badNames := []string{
-		"前女友",                  // 全中文
-		"前leader",              // 中混 ASCII
-		"my tool",              // 空格
-		"my.tool",              // 点号
-		"my:tool",              // 冒号
-		"my/tool",              // 斜杠
-		"my\ttool",             // tab
-		"emoji😀",              // emoji
+		"前女友",      // 全中文
+		"前leader",  // 中混 ASCII
+		"my tool",  // 空格
+		"my.tool",  // 点号
+		"my:tool",  // 冒号
+		"my/tool",  // 斜杠
+		"my\ttool", // tab
+		"emoji😀",   // emoji
 	}
 	for _, n := range badNames {
 		reg.Register(&testSkill{name: n})

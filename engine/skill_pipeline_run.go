@@ -1,7 +1,7 @@
 // skill_pipeline_run.go 实现 v0.4.0 G2 接入：在 ReActEngine 提供
 // "走 Skill 7 阶段 pipeline 执行单个 Skill" 的便捷入口（feature-flag gated）。
 //
-// 调用方在确认要走完整 7 阶段（如 K12 教辅场景需要 Persistence + Improvement
+// 调用方在确认要走完整 7 阶段（如某些场景需要 Persistence + Improvement
 // 闭环）时，使用本方法替代直接调 skill.Skill.Execute。flag skill.pipeline.v1
 // 关闭时退化到直接 Execute，行为与 v0.3 一致。
 package engine

@@ -19,9 +19,9 @@ type fakePersonaSkill struct {
 	body string
 }
 
-func (f *fakePersonaSkill) Name() string         { return f.name }
-func (f *fakePersonaSkill) Description() string   { return "切换为人格：" + f.name }
-func (f *fakePersonaSkill) Match(string) bool     { return false }
+func (f *fakePersonaSkill) Name() string                 { return f.name }
+func (f *fakePersonaSkill) Description() string          { return "切换为人格：" + f.name }
+func (f *fakePersonaSkill) Match(string) bool            { return false }
 func (f *fakePersonaSkill) LoadContent() (string, error) { return f.body, nil }
 func (f *fakePersonaSkill) Execute(context.Context, map[string]any) (*skill.Result, error) {
 	return &skill.Result{Content: f.body}, nil
@@ -71,7 +71,7 @@ func TestAudit_MountedPersonaSkillInjected_20260623(t *testing.T) {
 // fakeToolSkill 模拟纯工具技能（不实现 LoadContent）：靠工具供给生效，不注入正文。
 type fakeToolSkill struct{ name string }
 
-func (f *fakeToolSkill) Name() string       { return f.name }
+func (f *fakeToolSkill) Name() string        { return f.name }
 func (f *fakeToolSkill) Description() string { return "工具技能 " + f.name }
 func (f *fakeToolSkill) Match(string) bool   { return false }
 func (f *fakeToolSkill) Execute(context.Context, map[string]any) (*skill.Result, error) {

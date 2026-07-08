@@ -14,15 +14,18 @@ type bugH7CtxKey struct{}
 // TestBugH7_MatrixHandleEvent_PreservesCtxValues 是 BUG-H7 的 regression test。
 //
 // BUG：在未修版本中，handleEvent 未接收 ctx，goroutine 里直接用 context.Background()
-//     调用 handler —— parent 请求的 logger/session/user_id 全部丢失，
-//     出 bug 时异步路径的日志无法与源头请求关联。
+//
+//	调用 handler —— parent 请求的 logger/session/user_id 全部丢失，
+//	出 bug 时异步路径的日志无法与源头请求关联。
 //
 // 契约：handleEvent 必须接收 parent ctx；goroutine 里调用 handler 时
-//      传入的 ctx 必须保留 parent ctx 的 Values。
+//
+//	传入的 ctx 必须保留 parent ctx 的 Values。
 //
 // RED（未修版本）：handleEvent 签名不带 ctx → 本测试编译失败 [build failed]
 // GREEN（修复版本）：handleEvent(ctx, roomID, event) + trace.Detach(ctx)
-//                  → handler 收到的 ctx 保留 bugH7CtxKey 的 Value
+//
+//	→ handler 收到的 ctx 保留 bugH7CtxKey 的 Value
 func TestBugH7_MatrixHandleEvent_PreservesCtxValues(t *testing.T) {
 	var capturedCtx context.Context
 	done := make(chan struct{})

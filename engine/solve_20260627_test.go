@@ -321,14 +321,14 @@ func TestSolve_Grader_ValidateRetryOnBadFormat(t *testing.T) {
 func TestSolve_VerifierInconsistencyHardened(t *testing.T) {
 	se := &solveExec{verifierOut: "我算了一下。\nVERDICT: DISAGREE\nCOMPUTED: 2550"}
 	o := NewSolveSkill(se.fn, nil)
-	v, _ := o.verify(context.Background(), "求 1 到 100 偶数和", "2550")
+	v, _, _ := o.verify(context.Background(), "求 1 到 100 偶数和", "2550", "")
 	if v != verdictAgree {
 		t.Fatalf("computed==候选却判 DISAGREE 应纠正为 AGREE，得 %s", verdictString(v))
 	}
 	// 反向不误伤：computed 与候选不同时，DISAGREE 维持。
 	se2 := &solveExec{verifierOut: "VERDICT: DISAGREE\nCOMPUTED: 2550"}
 	o2 := NewSolveSkill(se2.fn, nil)
-	if v2, _ := o2.verify(context.Background(), "x", "2500"); v2 != verdictDisagree {
+	if v2, _, _ := o2.verify(context.Background(), "x", "2500", ""); v2 != verdictDisagree {
 		t.Fatalf("computed!=候选应维持 DISAGREE，得 %s", verdictString(v2))
 	}
 }

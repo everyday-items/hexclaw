@@ -52,8 +52,9 @@ func newSSETestServer(t *testing.T) (*Server, *cron.Scheduler) {
 }
 
 // TestHandleAddCronJobSSE_EmitsAllStages 验证 SSE 完整流：
-//   progress(analyzing) → progress(calling_llm) → progress(validating)
-//   → progress(persisting) → done
+//
+//	progress(analyzing) → progress(calling_llm) → progress(validating)
+//	→ progress(persisting) → done
 func TestHandleAddCronJobSSE_EmitsAllStages(t *testing.T) {
 	srv, _ := newSSETestServer(t)
 

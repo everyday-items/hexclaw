@@ -510,7 +510,7 @@ func (a *DingtalkAdapter) SendStream(ctx context.Context, chatID string, chunks 
 		}
 		sb.WriteString(chunk.Content)
 	}
-	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给家长
+	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给终端用户
 	return a.Send(ctx, chatID, &adapter.Reply{Content: adapter.StripThinking(sb.String())})
 }
 

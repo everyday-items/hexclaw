@@ -2,14 +2,15 @@
 // 方法 3 (Race Detection) + 方法 5 (Differential)。
 //
 // 不变量集合（必须永远成立）：
-//   I1: humanizeError 输出绝不含 tool_use_id / tool_call_id / toolu_ 任何形式
-//   I2: humanizeError 输出长度 ≤ 220 字符
-//   I3: humanizeError 输出永远非空（不返回空字符串误导调用方）
-//   I4: humanizeError 永远不抛 panic（防御性）
-//   I5: idempCache 同 user 不同 key 不会串
-//   I6: idempCache 同 key 重复 put 后 get 返最后一次值（不丢失）
-//   I7: cronItoa(n) 永远 round-trip：fmt.Sprintf("%d",n) == cronItoa(n)
-//   I8: stripJSONFence 幂等：stripJSONFence(stripJSONFence(x)) == stripJSONFence(x)
+//
+//	I1: humanizeError 输出绝不含 tool_use_id / tool_call_id / toolu_ 任何形式
+//	I2: humanizeError 输出长度 ≤ 220 字符
+//	I3: humanizeError 输出永远非空（不返回空字符串误导调用方）
+//	I4: humanizeError 永远不抛 panic（防御性）
+//	I5: idempCache 同 user 不同 key 不会串
+//	I6: idempCache 同 key 重复 put 后 get 返最后一次值（不丢失）
+//	I7: cronItoa(n) 永远 round-trip：fmt.Sprintf("%d",n) == cronItoa(n)
+//	I8: stripJSONFence 幂等：stripJSONFence(stripJSONFence(x)) == stripJSONFence(x)
 //
 // 用伪 fuzz（确定性种子 + 大样本）替代 go fuzz（保持快速 + 可重现）。
 package api

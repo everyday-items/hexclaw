@@ -107,6 +107,7 @@ type Server struct {
 	desktopSvc        *desktop.Service             // 桌面集成服务（可选）
 	cfgWriter         *config.Writer               // 配置文件写入器（MCP 持久化用）
 	wsHandler         http.Handler                 // WebSocket Handler（可选）
+	extraMounts       []mountedHandler             // 场景包子路由（前缀 → handler，AP-1：平台不认识场景内容）
 	streamStates      streamstate.Provider         // 流式 in-flight 状态（可选）
 	logCollector      *LogCollector                // 日志收集器
 	workflowStore     *WorkflowStore               // 工作流存储
@@ -495,6 +496,23 @@ func (s *Server) SetCheckpointManager(cm *engine.CheckpointManager) {
 	s.checkpointMgr = cm
 }
 
+// mountedHandler 一个挂在前缀下的子路由（场景包提供）。
+type mountedHandler struct {
+	prefix string
+	h      http.Handler
+}
+
+// Mount 把一个子路由 handler 挂到路径前缀下（如 "/api/k12"）。
+//
+// AP-1：平台 api 层不认识任何场景内容，只做通用挂载；子路由由场景包（scenarios/k12/apihttp）
+// 自己提供。须在 routes() 被调用（服务启动）前调用。
+func (s *Server) Mount(prefix string, h http.Handler) {
+	if prefix == "" || h == nil {
+		return
+	}
+	s.extraMounts = append(s.extraMounts, mountedHandler{prefix: prefix, h: h})
+}
+
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 
@@ -832,6 +850,11 @@ func (s *Server) routes() http.Handler {
 	// 桌面集成 API
 	if s.desktopSvc != nil {
 		s.desktopSvc.RegisterRoutes(mux)
+	}
+
+	// 场景包子路由（AP-1 通用挂载；如 K12 挂在 /api/k12/）。
+	for _, m := range s.extraMounts {
+		mux.Handle(m.prefix+"/", http.StripPrefix(m.prefix, m.h))
 	}
 
 	// WebSocket（Web UI）
@@ -1334,6 +1357,17 @@ func isLoopbackRequest(r *http.Request) bool {
 // 如果配置了 APIToken，需要 Authorization: Bearer <token>。
 // 为兼容本地桌面客户端和本机管理操作，localhost 请求始终允许访问。
 // 非 localhost 请求在未配置 Token 时会被拒绝。
+// isMountedScenarioPath 判断 path 是否落在某个已挂载的场景子路由前缀下（BUG-4）。
+// 与 routes() 的挂载注册（mux.Handle(prefix+"/", ...)）同源：命中即须走场景鉴权守卫。
+func (s *Server) isMountedScenarioPath(path string) bool {
+	for _, m := range s.extraMounts {
+		if strings.HasPrefix(path, m.prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) apiAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 认证规则：
@@ -1350,7 +1384,17 @@ func (s *Server) apiAuthMiddleware(next http.Handler) http.Handler {
 				strings.HasPrefix(path, "/api/v1/platforms/hooks/"))
 		isLogsAPI := path == "/api/v1/logs" || strings.HasPrefix(path, "/api/v1/logs/")
 		isDesktopAPI := strings.HasPrefix(path, "/api/v1/desktop/")
-		needsAuth := isDesktopAPI || isLogsAPI || (isWriteOp && strings.HasPrefix(path, "/api/v1/") && path != "/api/v1/chat" && !isWebhookReceiver)
+		// 场景包挂载路径（/api/k12/ 等）**读写都需鉴权**——否则落在 /api/v1 前缀守卫之外，
+		// 非回环部署下 grade/restore/provision/bind-im（写）与 backup/export/profile/mistakes（读，
+		// 含孩子 PII 与全量 .hexbak 导出）会无凭证可达。读端点尤其敏感（整份错题/档案导出）。
+		// loopback 仍在下方放行（桌面 sidecar + cron 自身 http_get 到本机端点不受影响）。
+		//
+		// BUG-4：守护前缀集从挂载注册表 extraMounts 派生，而非硬编码 `/api/k12/`——否则未来
+		// 新场景包挂到 `/api/<其他>/` 会重现 AP-184 绕过鉴权。任何 Mount 进来的场景子路由
+		// （注册为 prefix+"/"）自动纳入守卫。
+		isScenarioAPI := s.isMountedScenarioPath(path)
+		needsAuth := isDesktopAPI || isLogsAPI || isScenarioAPI ||
+			(isWriteOp && strings.HasPrefix(path, "/api/v1/") && path != "/api/v1/chat" && !isWebhookReceiver)
 
 		if !needsAuth {
 			next.ServeHTTP(w, r)

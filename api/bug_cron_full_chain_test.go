@@ -1,10 +1,10 @@
 // bug_cron_full_chain_test 守卫 v0.4.x 4 层 cron 路由 + tool_use_id 链路 0 复现（D5.1 E2E）。
 //
 // 这是端到端 chain test，覆盖：
-//   1. 后端 unified endpoint create→list→pause→resume→run→remove 全链路
-//   2. cron parse endpoint → needs_clarification fallback
-//   3. handleCronjobUnified idempotency replay 行为
-//   4. 配额触发 → 429 + CRON_QUOTA_EXCEEDED
+//  1. 后端 unified endpoint create→list→pause→resume→run→remove 全链路
+//  2. cron parse endpoint → needs_clarification fallback
+//  3. handleCronjobUnified idempotency replay 行为
+//  4. 配额触发 → 429 + CRON_QUOTA_EXCEEDED
 //
 // 与单一函数 unit test 互补：unit 关心单点，本套关心多次调用 + 状态机正确性。
 package api

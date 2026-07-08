@@ -1,7 +1,7 @@
 // thinking.go 把 thinking/reasoning 标签剥离从 engine 包下移到 adapter 包。
 //
 // v0.4.0 E2 收口：所有 IM 适配器 SendStream 出口必须在最终发送前调用 StripThinking，
-// 防止 `<think>...</think>` 直接泄漏给家长（K12 场景敏感）。
+// 防止 `<think>...</think>` 直接泄漏给终端用户（部分场景敏感）。
 //
 // 架构原因：engine 已依赖 adapter，因此 thinking 剥离的纯字符串处理放到 adapter 更底层，
 // 让所有 IM 适配器同包内直接调用，不产生循环依赖。engine.StripAllThinking 保留为 wrapper

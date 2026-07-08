@@ -8,9 +8,9 @@ func TestFrontmatterSkillName(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"---\nname: my-skill\n---\n# x", "my-skill"},
 		{"---\nname: \"quoted_name\"\n---\n", "quoted_name"},
-		{"---\ndescription: d\n---\n", ""},          // 无 name
-		{"---\nname: My Skill\n---\n", ""},          // 含空格，非标量标识 → 不匹配
-		{"# body\nname: not-frontmatter", ""},       // name 在正文不算（无 frontmatter 段）
+		{"---\ndescription: d\n---\n", ""},    // 无 name
+		{"---\nname: My Skill\n---\n", ""},    // 含空格，非标量标识 → 不匹配
+		{"# body\nname: not-frontmatter", ""}, // name 在正文不算（无 frontmatter 段）
 	}
 	for _, c := range cases {
 		if got := frontmatterSkillName(c.in); got != c.want {

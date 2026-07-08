@@ -14,7 +14,7 @@ import (
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
-// SolveSkill 是 K12 作业辅导的「带独立验证的解题」工具（评审 P0，对标 OpenClaw/Hermes/ITS 三方
+// SolveSkill 是 作业辅导的「带独立验证的解题」工具（评审 P0，对标 OpenClaw/Hermes/ITS 三方
 // 调研一致结论：正确性的第一杠杆是工具增强验证）。
 //
 // 流程：Solver 解题（self_consistency 多采样多数表决，或 method_diversity 跑 2 个不同方法）→
@@ -24,7 +24,7 @@ import (
 //   - 解法一致但核验不一致      → ⚠️ 诚实并列两答 + 请复核（绝不自信采信）
 //   - 不可验证(非计算题)        → 输出解题 + 提示人工复核
 //
-// 为何不是裸 LLM 二次意见：数学/物理的算术幻觉是 K12 头号错因，靠模型"再想一遍"治不了；让另一个
+// 为何不是裸 LLM 二次意见：数学/物理的算术幻觉是作业辅导头号错因，靠模型"再想一遍"治不了；让另一个
 // Agent **执行代码**算出 ground truth 才能根治。method_diversity 跨「方法」而非跨「温度」，能抓到
 // 自洽采样抓不到的系统性方法错误。
 type SolveSkill struct {
@@ -45,12 +45,14 @@ func (o *SolveSkill) Match(_ string) bool { return false }
 
 func (o *SolveSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition("solve",
-		"Solve a K12 homework/exam problem with a step-by-step teaching explanation whose final answer is INDEPENDENTLY VERIFIED by a separate agent that runs code (code_exec) to recompute it. Use for math/physics/chemistry word problems or any problem where correctness matters (don't bother for trivial single-step arithmetic a student can check by hand — just answer those directly). Effort auto-scales to difficulty; returns the worked solution plus a verification verdict, and on disagreement honestly surfaces both answers instead of guessing.",
+		"Solve a homework/exam problem with a step-by-step teaching explanation whose final answer is INDEPENDENTLY VERIFIED by a separate agent that runs code (code_exec) to recompute it. Use for math/physics/chemistry word problems or any problem where correctness matters (don't bother for trivial single-step arithmetic a student can check by hand — just answer those directly). Effort auto-scales to difficulty; returns the worked solution plus a verification verdict, and on disagreement honestly surfaces both answers instead of guessing.",
 		&llm.Schema{
 			Type: "object",
 			Properties: map[string]*llm.Schema{
 				"problem":          {Type: "string", Description: "The full problem statement to solve."},
 				"subject":          {Type: "string", Description: "Optional subject (math/physics/chemistry/english/chinese) to tune the teaching style."},
+				"grade":            {Type: "string", Description: "Optional learner grade/level label (opaque). When set, the solution must stay within what a learner at this level has been taught."},
+				"constraint":       {Type: "string", Description: "Optional opaque constraint hint injected verbatim into the solver (e.g. an allowed-methods whitelist). When present, using a method outside it is out-of-scope and the verifier flags it."},
 				"self_consistency": {Type: "integer", Description: "Optional number of independent same-method solver samples to majority-vote (default 1; >1 boosts accuracy on hard problems)."},
 				"method_diversity": {Type: "boolean", Description: "Optional. When true, solve with TWO deliberately different methods and cross-check them (catches systematic method errors; the code verifier breaks ties). Great for problems with multiple solution paths."},
 				"student_answer":   {Type: "string", Description: "Optional. The student's submitted answer (or worked steps). When present, GRADES it: solves to get the correct answer, then identifies whether the student is right and, if wrong, WHICH step erred + the misconception + a guiding hint (without just handing over the full answer)."},
@@ -77,6 +79,7 @@ const (
 	verdictUnverifiable verifyVerdict = iota // 非计算题 / 无法判定 / verifier 不可用
 	verdictAgree
 	verdictDisagree
+	verdictOutOfScope // 解法用了 constraint 白名单之外的方法（超纲），需学段内重解
 )
 
 // solverSolution 是一份解题产出。
@@ -97,6 +100,8 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 		return nil, fmt.Errorf("problem is required")
 	}
 	subject, _ := args["subject"].(string)
+	grade, _ := args["grade"].(string)
+	constraint, _ := args["constraint"].(string)
 	methodDiversity, _ := args["method_diversity"].(bool)
 	samples := clampSamples(intArg(args["self_consistency"], 1))
 	studentAnswer, _ := args["student_answer"].(string)
@@ -125,7 +130,7 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 
 	// 1) Solver 阶段：method_diversity → 2 个不同方法；否则 self_consistency 同法多采样。
 	var sols []solverSolution
-	for _, sp := range o.solverSpecs(problem, subject, methodDiversity, samples) {
+	for _, sp := range o.solverSpecs(problem, subject, grade, constraint, methodDiversity, samples) {
 		if childCtx.Err() != nil {
 			break
 		}
@@ -151,7 +156,23 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 	}
 
 	// 2) Verifier 阶段：code_exec 独立重算（fresh-context、只许 code_exec）。
-	verdict, computed := o.verify(childCtx, problem, primary.answer)
+	verdict, computed, numericGrounded := o.verify(childCtx, problem, primary.answer, constraint)
+
+	// 2.5) 学段内重解：verifier 判解法超纲（out_of_scope）→ 强化约束重解一次，只用学过的方法。
+	// 仅在有约束、非批改、还有墙钟时尝试一次，避免无界重试。
+	if verdict == verdictOutOfScope && !gradingMode && strings.TrimSpace(constraint) != "" && childCtx.Err() == nil {
+		reSpec := solverSpec(problem, subject, "只用「"+constraint+"」范围内、学生已学过的最朴素方法，禁止任何超纲技巧", grade, constraint)
+		if out, _ := o.runSolveAgent(childCtx, reSpec); strings.TrimSpace(out) != "" {
+			// **纠正性替换**（非又一次投票样本）：重解的学段内解法直接取代原超纲解作为 primary。
+			// 若走 append+groupByAnswer，超纲解与重解答案值通常相同 → 归同一组、原解先入仍居首，
+			// 学生仍会看到超纲方法（feature 落空，BUG-20260708）。故这里直接换掉 groups。
+			resolved := solverSolution{output: out, answer: extractFinalAnswer(out)}
+			primary = answerGroup{answer: resolved.answer, sols: []solverSolution{resolved}}
+			groups = []answerGroup{primary}
+			// 重解后重新校验（此次不再判超纲，只看对不对）。
+			verdict, computed, numericGrounded = o.verify(childCtx, problem, primary.answer, "")
+		}
+	}
 
 	o.registry.Finish(solveRunID, subAgentStatusOK,
 		fmt.Sprintf("verdict=%d answer=%q groups=%d", verdict, primary.answer, len(groups)), "", "")
@@ -169,8 +190,19 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 			{Agent: graderAgentName, Status: subAgentStatusOK},
 		}
 		return &skill.Result{
-			Content:  formatGrading(studentAnswer, groundTruth, assess) + encodeSubAgentReports(reports),
-			Metadata: map[string]string{"solve_run_id": solveRunID, "solve_mode": "grading"},
+			Content: formatGrading(studentAnswer, groundTruth, assess) + encodeSubAgentReports(reports),
+			// 结构化批改结果同步进 Metadata，供上层 adapter 免解析文本消费（场景用例层）。
+			Metadata: map[string]string{
+				"solve_run_id":        solveRunID,
+				"solve_mode":          "grading",
+				"solve_verdict":       verdictString(verdict),
+				"solve_evidence":      evidenceKind(numericGrounded),
+				"grade_correct":       strconv.FormatBool(assess.correct),
+				"grade_wrong_step":    assess.wrongStep,
+				"grade_misconception": assess.misconception,
+				"grade_guidance":      assess.guidance,
+				"grade_ground_truth":  groundTruth,
+			},
 		}, nil
 	}
 
@@ -181,23 +213,36 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 		newVerifierReport(verdict),
 	}
 	return &skill.Result{
-		Content:  content + encodeSubAgentReports(reports),
-		Metadata: map[string]string{"solve_run_id": solveRunID, "solve_verdict": verdictString(verdict)},
+		Content: content + encodeSubAgentReports(reports),
+		Metadata: map[string]string{
+			"solve_run_id":   solveRunID,
+			"solve_verdict":  verdictString(verdict),
+			"solve_evidence": evidenceKind(numericGrounded),
+		},
 	}, nil
 }
 
+// evidenceKind 把「是否有 code_exec 数值 ground truth」映射成 adapter 认得的证据类型串。
+// numeric_exec = verifier 真跑代码算出并客观相等（强）；model = 仅模型口头判定（弱）。
+func evidenceKind(numericGrounded bool) string {
+	if numericGrounded {
+		return "numeric_exec"
+	}
+	return "model"
+}
+
 // solverSpecs 按模式产出本次要跑的 solver spec 列表。
-func (o *SolveSkill) solverSpecs(problem, subject string, methodDiversity bool, samples int) []SubAgentSpec {
+func (o *SolveSkill) solverSpecs(problem, subject, grade, constraint string, methodDiversity bool, samples int) []SubAgentSpec {
 	if methodDiversity {
 		specs := make([]SubAgentSpec, 0, len(solverMethods))
 		for _, m := range solverMethods {
-			specs = append(specs, solverSpec(problem, subject, m))
+			specs = append(specs, solverSpec(problem, subject, m, grade, constraint))
 		}
 		return specs
 	}
 	specs := make([]SubAgentSpec, 0, samples)
 	for i := 0; i < samples; i++ {
-		specs = append(specs, solverSpec(problem, subject, ""))
+		specs = append(specs, solverSpec(problem, subject, "", grade, constraint))
 	}
 	return specs
 }
@@ -224,19 +269,19 @@ func (o *SolveSkill) runSolveAgent(ctx context.Context, spec SubAgentSpec) (stri
 }
 
 // verify 用 code_exec 独立重算。verifier 不可用/出错/不可解析 → unverifiable（不阻断）。
-func (o *SolveSkill) verify(ctx context.Context, problem, candidate string) (verifyVerdict, string) {
+func (o *SolveSkill) verify(ctx context.Context, problem, candidate, constraint string) (v verifyVerdict, computed string, numericGrounded bool) {
 	if o.executeFunc == nil || ctx.Err() != nil {
-		return verdictUnverifiable, ""
+		return verdictUnverifiable, "", false
 	}
-	out := o.runValidated(ctx, verifierSpec(problem, candidate), verdictParseable)
+	out := o.runValidated(ctx, verifierSpec(problem, candidate, constraint), verdictParseable)
 	if strings.TrimSpace(out) == "" {
-		return verdictUnverifiable, ""
+		return verdictUnverifiable, "", false
 	}
 	verdict, computed := parseVerdict(out)
 	// 交叉校验硬化：verifier 真算出一个数（computed）时，以「算出的数 vs 候选」的客观比对为准，
 	// 纠正模型口头判定词与自己算出的数自相矛盾的两种危险情形——
 	//   • BUG-D（真模型实测 Qwen2.5-72B 算对 computed=2550 却说 DISAGREE）：computed≡候选却判 DISAGREE → 纠为 AGREE。
-	//   • ① false-AGREE（K12 最坏失效）：computed 与候选**可确信不等**却判 AGREE → 降为 DISAGREE，错答案绝不当「已验证」。
+	//   • ① false-AGREE（最坏失效）：computed 与候选**可确信不等**却判 AGREE → 降为 DISAGREE，错答案绝不当「已验证」。
 	// 用数值/分数/集合容差等值，不靠脆字符串比对：既认出 0.5≡1/2、'12和8'≡'8和12'，又只在「能解析且确不等」
 	// 时才下调 AGREE——带单位/等价文字形式解析不了 → 不武断（信模型对「42支==42」这类等价的判断）。
 	if computed != "" {
@@ -251,7 +296,11 @@ func (o *SolveSkill) verify(ctx context.Context, problem, candidate string) (ver
 			verdict = verdictDisagree
 		}
 	}
-	return verdict, computed
+	// 强证据（numericGrounded）= verifier 真算出了 computed 且它与候选客观相等——
+	// 此时 agree 有 code_exec ground truth 撑腰（强徽章）；否则 agree 只是模型口头判定（弱徽章）。
+	// out_of_scope 是解法合规性判定，与数值验算正交，不算强数值证据。
+	numericGrounded = verdict == verdictAgree && computed != "" && answersEqual(computed, candidate)
+	return verdict, computed, numericGrounded
 }
 
 // strictFormatReminder 在校验重试时附加，逼模型只吐固定格式。
@@ -280,7 +329,8 @@ func (o *SolveSkill) runValidated(ctx context.Context, spec SubAgentSpec, ok fun
 // verdictParseable 报告 verifier 输出是否含可识别判定。
 func verdictParseable(out string) bool {
 	up := strings.ToUpper(out)
-	return strings.Contains(up, "AGREE") || strings.Contains(up, "DISAGREE") || strings.Contains(up, "UNVERIFIABLE")
+	return strings.Contains(up, "AGREE") || strings.Contains(up, "DISAGREE") ||
+		strings.Contains(up, "UNVERIFIABLE") || strings.Contains(up, "OUT_OF_SCOPE") || strings.Contains(up, "OUT OF SCOPE")
 }
 
 // gradingParseable 报告 grader 输出是否含 CORRECT 行。
@@ -320,7 +370,7 @@ func graderSpec(problem, solution, groundTruth, studentAnswer string) SubAgentSp
 }
 
 func buildGraderPrompt(problem, solution, groundTruth, studentAnswer string) string {
-	return fmt.Sprintf(`你是一位 K12 老师在批改作业。请判断学生是否答对；若答错，找出他**第一个**出错的步骤、背后的误区，并给一句**引导性**提示——不要把完整正确步骤全抄给他，留点余地让他自己改对。可用 code_exec 核对学生的算术。
+	return fmt.Sprintf(`你是一位老师在批改作业。请判断学生是否答对；若答错，找出他**第一个**出错的步骤、背后的误区，并给一句**引导性**提示——不要把完整正确步骤全抄给他，留点余地让他自己改对。可用 code_exec 核对学生的算术。
 
 题目：%s
 参考解法：%s
@@ -393,11 +443,11 @@ var solverMethods = []string{
 
 // solverSpec 构造解题子 Agent：允许 code_exec（Program-of-Thought 可靠算术），leaf 深度防递归，
 // 受信来源放行沙箱 code_exec。method 为附加的解法指令（method_diversity 用）。
-func solverSpec(problem, subject, method string) SubAgentSpec {
+func solverSpec(problem, subject, method, grade, constraint string) SubAgentSpec {
 	return SubAgentSpec{
 		RunID:     "solver-" + idgen.NanoID(),
 		Agent:     solverAgentName,
-		Task:      buildSolverPrompt(problem, subject, method),
+		Task:      buildSolverPrompt(problem, subject, method, grade, constraint),
 		ToolAllow: []string{codeExecToolName},
 		Mode:      "run",
 		Depth:     maxSpawnDepth,
@@ -406,11 +456,11 @@ func solverSpec(problem, subject, method string) SubAgentSpec {
 }
 
 // verifierSpec 构造验证子 Agent：**只许 code_exec**、fresh-context、leaf 深度——强独立重算。
-func verifierSpec(problem, candidate string) SubAgentSpec {
+func verifierSpec(problem, candidate, constraint string) SubAgentSpec {
 	return SubAgentSpec{
 		RunID:     "verifier-" + idgen.NanoID(),
 		Agent:     verifierAgentName,
-		Task:      buildVerifierPrompt(problem, candidate),
+		Task:      buildVerifierPrompt(problem, candidate, constraint),
 		ToolAllow: []string{codeExecToolName},
 		Mode:      "run",
 		Depth:     maxSpawnDepth,
@@ -418,7 +468,7 @@ func verifierSpec(problem, candidate string) SubAgentSpec {
 	}
 }
 
-func buildSolverPrompt(problem, subject, method string) string {
+func buildSolverPrompt(problem, subject, method, grade, constraint string) string {
 	subjectLine := ""
 	if strings.TrimSpace(subject) != "" {
 		subjectLine = "学科：" + subject + "\n"
@@ -427,15 +477,33 @@ func buildSolverPrompt(problem, subject, method string) string {
 	if strings.TrimSpace(method) != "" {
 		methodLine = "\n方法要求：" + method + "\n"
 	}
-	return fmt.Sprintf(`你是一位耐心的 K12 老师。请一步步解答下面这道题，面向学生讲清「为什么」，不要只给答案。
-%s题目：%s
+	// 年级/约束注入（领域中性）：调用方给什么就注入什么，solve 不认识"课标"。
+	gradeLine := ""
+	if strings.TrimSpace(grade) != "" {
+		gradeLine = fmt.Sprintf("\n学习阶段：%s。解法只能使用这个阶段的学生已经学过的方法，不得使用更高阶段才学的知识。\n", grade)
+	}
+	constraintLine := ""
+	if strings.TrimSpace(constraint) != "" {
+		constraintLine = fmt.Sprintf("允许使用的范围（超出即为超纲，禁止使用）：%s\n", constraint)
+	}
+	return fmt.Sprintf(`你是一位耐心的老师。请一步步解答下面这道题，面向学生讲清「为什么」，不要只给答案。
+%s%s%s题目：%s
 %s
 要求：
 1. 分步推导，关键步骤说明依据；涉及计算时可调用 code_exec 写代码精确计算（别口算硬凑）。
-2. 最后单独用一行给出最终答案，格式严格为：答案：<最终答案>`, subjectLine, problem, methodLine)
+2. 解法务必控制在上面「学习阶段/允许范围」之内——宁可用更朴素但学过的方法，也不要为了简便用超纲方法。
+3. 最后单独用一行给出最终答案，格式严格为：答案：<最终答案>`, subjectLine, gradeLine, constraintLine, problem, methodLine)
 }
 
-func buildVerifierPrompt(problem, candidate string) string {
+func buildVerifierPrompt(problem, candidate, constraint string) string {
+	scopeStep := ""
+	scopeVerdict := ""
+	scopeRule := ""
+	if strings.TrimSpace(constraint) != "" {
+		scopeStep = fmt.Sprintf("\n3. 再检查解法是否**超纲**：本题只允许使用「%s」范围内的方法；若待校验解法用了这个范围之外、学生尚未学过的方法（哪怕答案对），也要判为 OUT_OF_SCOPE。", constraint)
+		scopeVerdict = " 或 OUT_OF_SCOPE"
+		scopeRule = "；解法用了允许范围外的超纲方法 → OUT_OF_SCOPE"
+	}
 	return fmt.Sprintf(`你是一名独立校验员。下面有一道题和一个「待校验答案」。请**完全独立地**用 code_exec 写代码重新计算正确答案，不要相信待校验答案、也没有别人的解题过程可参考。
 
 题目：%s
@@ -444,14 +512,14 @@ func buildVerifierPrompt(problem, candidate string) string {
 步骤：
 1. 自己**逐步**审题、列式，用 code_exec（language=python）把**每一步**都算出来（别跳步、别口算），得到你独立的最终答案。
 2. 再逐步核对：你的**推理过程是否正确**、每一步是否站得住，最后比对你的答案与待校验答案是否一致。
-   ——「答案凑对但过程/推理错」也要当作不一致，不要只看最终那个数。
+   ——「答案凑对但过程/推理错」也要当作不一致，不要只看最终那个数。%s
 
 最后严格按以下格式输出（三行）：
-VERDICT: AGREE 或 DISAGREE 或 UNVERIFIABLE
+VERDICT: AGREE 或 DISAGREE 或 UNVERIFIABLE%s
 COMPUTED: <你独立算出的答案；若本题无法用代码计算则写 N/A>
 说明：<一句话>
 
-判定规则：你的结果与待校验答案在数值/含义上一致、且过程经得起逐步检查 → AGREE；数值不一致或推理过程明显错误 → DISAGREE；本题非计算题、无法用代码客观判定 → UNVERIFIABLE。`, problem, candidate)
+判定规则：你的结果与待校验答案在数值/含义上一致、且过程经得起逐步检查 → AGREE；数值不一致或推理过程明显错误 → DISAGREE；本题非计算题、无法用代码客观判定 → UNVERIFIABLE%s。`, problem, candidate, scopeStep, scopeVerdict, scopeRule)
 }
 
 // answerMarker 抓「答案：x」/「ANSWER: x」（取最后一处，大小写不敏感，中英冒号皆可）。
@@ -485,7 +553,7 @@ func normalizeAnswer(s string) string {
 // 这一原语：相等判断用 answersEqual（能确信相等才为真），不等判断用 answersDefinitelyDiffer
 // （仅两边都能解析成数/数集且确不等才为真，带单位/等价文字形式解析不了 → 不武断，信模型的等价判断）。
 
-// answerTol 数值等值容差（相对或绝对取其一满足即等）；既认 exact 分数≡小数，又能抓出 K12 量级的真实算错（42 vs 48）。
+// answerTol 数值等值容差（相对或绝对取其一满足即等）；既认 exact 分数≡小数，又能抓出作业量级的真实算错（42 vs 48）。
 const answerTol = 1e-6
 
 // answerSetSep 拆分多元答案（"12和8"/"3, 5"/"a、b"）。注意不含 '/'——'/' 留给分数解析。
@@ -611,9 +679,12 @@ func groupByAnswer(sols []solverSolution) []answerGroup {
 
 var computedMarker = regexp.MustCompile(`(?im)COMPUTED\s*[:：]\s*(.+?)\s*$`)
 
+// verdictLineRe 抓「VERDICT: <token>」判定行。只在此行内识别关键词，避免说明文字里的
+// 「not out of scope」「不是不一致」等否定表述被全文 substring 误伤（BUG-20260708）。
+var verdictLineRe = regexp.MustCompile(`(?im)^\s*VERDICT\s*[:：]\s*(.+?)\s*$`)
+
 // parseVerdict 解析 verifier 输出的判定 + 独立算出的答案。不可解析 → unverifiable（不阻断）。
 func parseVerdict(out string) (verifyVerdict, string) {
-	up := strings.ToUpper(out)
 	computed := ""
 	if m := computedMarker.FindStringSubmatch(out); len(m) > 1 {
 		computed = normalizeAnswer(m[1])
@@ -621,6 +692,24 @@ func parseVerdict(out string) (verifyVerdict, string) {
 	if strings.EqualFold(computed, "N/A") {
 		computed = ""
 	}
+	// 优先在 VERDICT: 行内判定（有该行时只看它，防说明文字否定式误伤）。
+	if m := verdictLineRe.FindStringSubmatch(out); len(m) > 1 {
+		line := strings.ToUpper(m[1])
+		switch {
+		// OUT_OF_SCOPE 先判：常与 AGREE/DISAGREE 同现（答案对但方法超纲），须优先识别。
+		case strings.Contains(line, "OUT_OF_SCOPE") || strings.Contains(line, "OUT OF SCOPE"):
+			return verdictOutOfScope, computed
+		case strings.Contains(line, "DISAGREE"):
+			return verdictDisagree, computed
+		case strings.Contains(line, "UNVERIFIABLE"):
+			return verdictUnverifiable, computed
+		case strings.Contains(line, "AGREE"):
+			return verdictAgree, computed
+		}
+	}
+	// 无 VERDICT 行或行内未识别 → 回退全文宽容匹配。out_of_scope 不进回退（否定式不可靠），
+	// 只认 AGREE/DISAGREE/UNVERIFIABLE 三态（与本次改动前行为一致）。
+	up := strings.ToUpper(out)
 	switch {
 	case strings.Contains(up, "DISAGREE"):
 		return verdictDisagree, computed
@@ -738,6 +827,8 @@ func verdictString(v verifyVerdict) string {
 		return "agree"
 	case verdictDisagree:
 		return "disagree"
+	case verdictOutOfScope:
+		return "out_of_scope"
 	default:
 		return "unverifiable"
 	}

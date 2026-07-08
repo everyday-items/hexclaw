@@ -1033,6 +1033,9 @@ func (e *ReActEngine) completeWithTools(
 		Middleware:       middleware,
 		DefaultMaxTurns:  maxTurns,
 	})
+	// BUG-1：安装工具→回复元数据 sink，工具循环期间 skill 产出的 reply-safe 元数据
+	// （record chip 等）在此收集，跑完后落到 msg.Metadata 供 buildReplyMetadata 转发。
+	ctx = withToolReplyMetaSink(ctx)
 	result, err := runner.Run(ctx, hruntime.Request{
 		ID:           messageRequestID(msg),
 		Messages:     req.Messages,
@@ -1105,6 +1108,9 @@ func (e *ReActEngine) completeWithTools(
 		ensureMessageMetadata(msg)
 		msg.Metadata["recovered_from_reasoning_only"] = "true"
 	}
+	// BUG-1：把工具循环收集的 reply-safe 元数据落到 msg.Metadata，finalizeReply
+	// 经 buildReplyMetadata(msg.Metadata) 转发进最终回复（record chip 等）。
+	applyToolReplyMeta(ctx, msg)
 	// 有序内容块经 finalizeReply 透传进 reply（它可能追加守卫提示 text 块，B5b），
 	// 此处不再二次覆盖——否则追加的块会被打回。
 	return e.finalizeReply(ctx, sessionID, msg, provider, req, resp, providerName, modelName, cacheInput, runtimeToolCallsToAdapter(result.ToolCalls), runtimeBlocksToAdapter(result.Blocks))
@@ -1793,7 +1799,9 @@ func (e *ReActEngine) processStreamRuntime(
 		if shouldForceCodeExecTool(msg.Content) {
 			streamMode = hruntime.StreamModeEvents
 		}
-		result, err := runner.Stream(ctx, hruntime.Request{
+		// BUG-1：装工具→回复元数据 sink（新局部 ctx，避免重赋 goroutine 捕获的 ctx 引发竞态）。
+		streamCtx := withToolReplyMetaSink(ctx)
+		result, err := runner.Stream(streamCtx, hruntime.Request{
 			ID:           messageRequestID(msg),
 			Messages:     req.Messages,
 			Tools:        req.Tools,
@@ -1844,6 +1852,9 @@ func (e *ReActEngine) processStreamRuntime(
 				modelName = model
 			}
 		}
+		// BUG-1：把工具循环收集的 reply-safe 元数据落到 msg.Metadata，finalizeRuntimeStreamResult
+		// 克隆 msg.Metadata 作 msgMeta 并经 buildReplyMetadata 转发（record chip 等）。
+		applyToolReplyMeta(streamCtx, msg)
 		finalContent, streamTail, metadata, usage, toolCalls := e.finalizeRuntimeStreamResult(ctx, sessionID, msg, provider, req, result, providerName, modelName, cacheInput, maxTurnsHit, sink.thinkingDuration())
 		if finalContent != "" && !sink.sentContent {
 			ch <- &adapter.ReplyChunk{Content: finalContent}
@@ -2144,6 +2155,13 @@ func (e *ReActEngine) processStreamToolLoop(
 	// Previously, error returns before launching a goroutine would permanently deadlock the session.
 	if unlock, ok := ctx.Value(ctxKeySessionUnlock).(func()); ok && unlock != nil {
 		defer unlock()
+	}
+
+	// Scope-stamp: carry the routed agent name into ctx so tool-use skills can
+	// scope their side effects to this instance (e.g. a scenario pack persisting
+	// records for the current agent). Additive — no existing skill reads it.
+	if msg != nil && msg.Metadata != nil {
+		ctx = skill.WithRoutedAgent(ctx, msg.Metadata["routed_agent"])
 	}
 
 	const maxStreamToolTurns = 25
@@ -2784,6 +2802,14 @@ func (e *ReActEngine) buildStreamMessages(ctx context.Context, roleName string, 
 		if role, ok := e.factory.GetRole(roleName); ok {
 			sysContent = role.ToSystemPrompt()
 			fromAgent = true
+		} else if e.agentRouter != nil {
+			// roleName 命名的是**注册 agent**（非内置工厂角色，如 k12-tutor-xxx）→ 用其 system_prompt 人设。
+			// D4·BUG-20260708：桌面「进入辅导」pin role=<注册 agent 名>（api/server.go:1055 落 metadata["role"]），
+			// 但 GetRole 只查 factory.roles 内置角色 → 注册 agent 查不到 → 人设从不生效、tutor 回落默认小蟹。
+			if cfg, ok := e.agentRouter.GetAgent(roleName); ok && cfg != nil && cfg.SystemPrompt != "" {
+				sysContent = cfg.SystemPrompt
+				fromAgent = true
+			}
 		}
 	} else if metadata != nil && metadata["agent_prompt"] != "" {
 		sysContent = metadata["agent_prompt"]
@@ -3188,11 +3214,8 @@ func buildUsage(usage hexagon.Usage, providerName, modelName string) *adapter.Us
 // 这是 G3 协议骨架：未来扩展 select / approval / card 时只需在此添加分支。返回 nil
 // 表示无交互载荷。Reply 构造点可直接 `Interactive: buildInteractivePayload(msg.Metadata)`。
 func buildInteractivePayload(metadata map[string]string) *adapter.InteractivePayload {
-	if shouldEnrichQuestionConfirm(metadata) {
-		return BuildQuestionConfirmPayload()
-	}
-	// TODO(E6/v0.4.0): expect_subquestion_select / expect_answer_reveal / expect_action_approval 触发器
-	return nil
+	// 清债 P5：具体交互按钮由场景包提供（如 K12 识题确认），engine 不硬编码领域内容。
+	return enrichInteractiveButtons(metadata)
 }
 
 func buildReplyMetadata(metadata map[string]string, providerName, modelName, assistantMessageID string) map[string]string {
@@ -3209,14 +3232,14 @@ func buildReplyMetadata(metadata map[string]string, providerName, modelName, ass
 	if v := metadata["routed_agent"]; v != "" {
 		replyMeta["routed_agent"] = v
 	}
-	for _, key := range []string{"request_id", "session_id", "finish_reason", "recovered_from_reasoning_only", "thinking_duration", persistErrorMetaKey} {
+	for _, key := range []string{"request_id", "session_id", "finish_reason", "recovered_from_reasoning_only", "thinking_duration", "record", persistErrorMetaKey} {
 		if v := metadata[key]; v != "" {
 			replyMeta[key] = v
 		}
 	}
-	// v0.4.x D2 交互按钮：incoming 含 expect_question_confirm 触发时，注入识题确认按钮组。
-	if shouldEnrichQuestionConfirm(metadata) {
-		replyMeta = WithInteractiveButtons(replyMeta, BuildQuestionConfirmButtons())
+	// 交互按钮（清债 P5）：场景包提供触发按钮时注入 metadata 兼容字段。
+	if p := enrichInteractiveButtons(metadata); p != nil {
+		replyMeta = WithInteractivePayload(replyMeta, p)
 	}
 	return withAssistantMessageID(replyMeta, assistantMessageID)
 }

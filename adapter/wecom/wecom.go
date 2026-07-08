@@ -175,7 +175,7 @@ func (a *WecomAdapter) sendReplyNow(ctx context.Context, chatID string, reply *a
 	if reply == nil {
 		return nil
 	}
-	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给家长
+	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给终端用户
 	return a.sendTextMessage(ctx, chatID, adapter.StripThinking(reply.Content))
 }
 

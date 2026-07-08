@@ -1,4 +1,4 @@
-// agent_mode.go 提供 K12 场景下的 Agent 策略模式。
+// agent_mode.go 提供通用的 Agent 策略模式（领域无关；场景包按需注入领域特性词）。
 //
 // 设计选择：HexClaw.ReActEngine 已是完整自研工具循环引擎（tool cache / budget /
 // compactor / streaming / reasoning / multi-provider），不接入 hexagon Agent（那会
@@ -9,13 +9,13 @@
 //   - reflection     — 答案产出后自我审查（判题 / 作文批改）
 //   - tot            — Tree-of-Thought：列多条路径再择优（数学多解 / 开放题）
 //   - self-reflect   — 强自查：每个关键步骤后立即审视（语文阅读 / 论证）
-//   - mem-augmented  — 检索家庭/错题档案优先，再作答（个性化辅导）
+//   - mem-augmented  — 检索个性化档案优先，再作答（个性化助手）
 //   - debate         — 双视角对辩后裁决（争议性判题 / 作文打分）
 //   - auto           — 按消息启发式路由到上面具体模式
 //
 // 设计取舍：lightweight prompt-overlay 而非 hexagon agent factory。这样能在保留
-// ReActEngine 全部能力（tool / streaming / budget / reasoning）的同时实现 K12
-// 场景需要的 7 种策略。重型模式（多分支并行 / 多 agent 实例）需 v0.5.x 后扩展。
+// ReActEngine 全部能力（tool / streaming / budget / reasoning）的同时提供
+// 7 种通用策略。重型模式（多分支并行 / 多 agent 实例）需 v0.5.x 后扩展。
 package engine
 
 import (
@@ -89,11 +89,11 @@ func modePromptPrefix(m AgentMode) string {
 若反思发现初步思考无问题，反思段也要明确写"反思通过"。
 `
 	case ModeMemAugmented:
-		return `你在为一名熟悉的学生作答。请先做以下检索：
-1. 用"档案回忆："起头，回顾该学生的薄弱点 / 历史错题 / 学习偏好（基于已注入的 memory 与 RAG 上下文；无信息则写"暂无档案"）。
-2. 用"切入点："起头，说明本次作答如何结合档案（个性化讲解 / 避开混淆点）。
+		return `你在为一名熟悉的用户作答。请先做以下检索：
+1. 用"档案回忆："起头，回顾该用户的薄弱点 / 历史记录 / 偏好（基于已注入的 memory 与 RAG 上下文；无信息则写"暂无档案"）。
+2. 用"切入点："起头，说明本次作答如何结合档案（个性化应答 / 避开混淆点）。
 3. 用"答案："起头给出最终回答。
-注意：档案信息只用于个性化讲解，不要把档案原文复述给学生。
+注意：档案信息只用于个性化应答，不要把档案原文复述给用户。
 `
 	case ModeDebate:
 		return `你需要用双视角辩论方式作答这道争议题：
@@ -107,9 +107,24 @@ func modePromptPrefix(m AgentMode) string {
 	}
 }
 
+// modeKeywordMatcher 场景包注入的"某 mode 的领域特性词"匹配器（清债 P5）。
+//
+// engine 不再硬编码 K12 领域词（错题/复习/备考/我孩子…），改由场景包（scenarios/k12）通过
+// ModeFeatureRegistry 提供，engine 在**原路由位置**消费（保持 AutoRoute 优先级不变）。
+// nil 时无场景包特性，仅走内置通用关键词（AP-1：删掉场景包后平台仍是干净通用路由）。
+var modeKeywordMatcher func(mode AgentMode, text string) bool
+
+// SetModeKeywordMatcher 由 composition root 注入（适配场景包的 ModeFeatureRegistry.MatchesMode）。
+func SetModeKeywordMatcher(m func(mode AgentMode, text string) bool) { modeKeywordMatcher = m }
+
+// packMatches 查询场景包是否为 mode 提供了命中 s 的特性词。
+func packMatches(mode AgentMode, s string) bool {
+	return modeKeywordMatcher != nil && modeKeywordMatcher(mode, s)
+}
+
 // AutoRoute 对用户消息做启发式分类，返回推荐的 AgentMode。
 //
-// K12 场景分类规则（优先级从上到下）：
+// 分类规则（优先级从上到下；领域特性词由场景包补充）：
 //  1. 双答案争议 / 打分类 → ModeDebate（双视角辩论）
 //  2. 多解探索（"几种方法"/"还有别的解法"） → ModeToT
 //  3. 个性化档案（"我之前"/"我孩子"/"以前错过") → ModeMemAugmented
@@ -154,13 +169,14 @@ func containsMathFeatures(s string) bool {
 }
 
 func containsPlanFeatures(s string) bool {
-	keywords := []string{"计划", "安排", "一周", "一个月", "复习", "备考", "时间表", "plan", "schedule"}
+	// 通用规划词（engine 内置，领域无关）。K12 的"复习/备考"由场景包提供（清债 P5）。
+	keywords := []string{"计划", "安排", "一周", "一个月", "时间表", "plan", "schedule"}
 	for _, k := range keywords {
 		if strings.Contains(s, k) {
 			return true
 		}
 	}
-	return false
+	return packMatches(ModePlanExecute, s)
 }
 
 func containsJudgeFeatures(s string) bool {
@@ -197,13 +213,14 @@ func containsToTFeatures(s string) bool {
 
 // containsMemoryFeatures 个性化档案类
 func containsMemoryFeatures(s string) bool {
-	keywords := []string{"我之前", "我孩子", "以前错过", "上次", "我家", "之前那道", "错题本"}
+	// 通用个性化词（engine 内置）。K12 的"我孩子/错题本/以前错过/之前那道"由场景包提供（清债 P5）。
+	keywords := []string{"我之前", "上次", "我家"}
 	for _, k := range keywords {
 		if strings.Contains(s, k) {
 			return true
 		}
 	}
-	return false
+	return packMatches(ModeMemAugmented, s)
 }
 
 // ResolveMode 将 meta 里的 agent_mode 解析为最终具体模式。

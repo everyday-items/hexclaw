@@ -10,7 +10,8 @@ import (
 // TestSendQueue_CancelledContextRejectsSend 证明:
 // 当 context 已取消时，SendQueue.Send 立即返回 ctx.Err()，消息永远不会发出。
 // 这正是修复前所有 IM 适配器的 bug 路径:
-//   handler 耗尽 2min timeout → ctx deadline exceeded → Send(ctx, ...) 静默失败
+//
+//	handler 耗尽 2min timeout → ctx deadline exceeded → Send(ctx, ...) 静默失败
 func TestSendQueue_CancelledContextRejectsSend(t *testing.T) {
 	var sendCalled atomic.Bool
 

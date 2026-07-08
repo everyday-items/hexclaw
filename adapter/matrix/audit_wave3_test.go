@@ -340,10 +340,10 @@ func captureHandler() (adapter.MessageHandler, <-chan *adapter.Message) {
 
 func TestHandleEvent_Filtering(t *testing.T) {
 	tests := []struct {
-		name      string
-		event     matrixEvent
-		wantPass  bool // 是否应进入 handler
-		checkMsg  func(t *testing.T, m *adapter.Message)
+		name     string
+		event    matrixEvent
+		wantPass bool // 是否应进入 handler
+		checkMsg func(t *testing.T, m *adapter.Message)
 	}{
 		{
 			name: "正常文本消息透传",

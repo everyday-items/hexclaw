@@ -40,14 +40,14 @@ func TestSolve_RealModel_Eval(t *testing.T) {
 	t.Logf("=== 真模型 eval：%s @ %s ===", model, base)
 
 	// ★① verifier 真能抓出错答案吗（P0 命脉）：候选 48 错，code 算 6*7=42 → 应 DISAGREE。
-	v1, c1 := o.verify(ctx, "6 × 7 等于多少？", "48")
+	v1, c1, _ := o.verify(ctx, "6 × 7 等于多少？", "48", "")
 	t.Logf("[①verify 候选48(错)] verdict=%s computed=%q  期望 DISAGREE", verdictString(v1), c1)
 	if v1 != verdictDisagree {
 		t.Errorf("★代码验证未抓出错答案 48（应 DISAGREE，得 %s）", verdictString(v1))
 	}
 
 	// ② 正确候选确认：候选 42 → 应 AGREE。
-	v2, c2 := o.verify(ctx, "6 × 7 等于多少？", "42")
+	v2, c2, _ := o.verify(ctx, "6 × 7 等于多少？", "42", "")
 	t.Logf("[②verify 候选42(对)] verdict=%s computed=%q  期望 AGREE", verdictString(v2), c2)
 	if v2 != verdictAgree {
 		t.Errorf("正确答案 42 未被确认（应 AGREE，得 %s）", verdictString(v2))
@@ -69,7 +69,7 @@ func TestSolve_RealModel_Eval(t *testing.T) {
 	t.Logf("[⑤method_diversity 两法] 答案应=12与8 →\n%s\n", truncForLog(r5.Content, 500))
 
 	// ⑥ 不可验证不误判：作文赏析。
-	v6, _ := o.verify(ctx, "赏析《静夜思》的意境与思乡之情。", "（一段文学赏析）")
+	v6, _, _ := o.verify(ctx, "赏析《静夜思》的意境与思乡之情。", "（一段文学赏析）", "")
 	t.Logf("[⑥verify 作文题] verdict=%s  期望 UNVERIFIABLE", verdictString(v6))
 }
 
@@ -89,7 +89,7 @@ func TestSolve_RealModel_BugHunt(t *testing.T) {
 	defer cancel()
 
 	// BUG-A：候选带单位「42 支」不应被误判 DISAGREE（含义一致）。
-	va, ca := o.verify(ctx, "小明有 6 盒铅笔，每盒 7 支，一共多少支？", "42 支")
+	va, ca, _ := o.verify(ctx, "小明有 6 盒铅笔，每盒 7 支，一共多少支？", "42 支", "")
 	t.Logf("[A 单位42支] verdict=%s computed=%q", verdictString(va), ca)
 	if va == verdictDisagree {
 		t.Errorf("BUG-A: 含单位的正确答案被误判 DISAGREE")
@@ -103,21 +103,21 @@ func TestSolve_RealModel_BugHunt(t *testing.T) {
 	}
 
 	// BUG-C：等价分数/小数——候选「1/2」vs code 0.5 不应 DISAGREE。
-	vc, cc := o.verify(ctx, "1 除以 2 等于多少？", "1/2")
+	vc, cc, _ := o.verify(ctx, "1 除以 2 等于多少？", "1/2", "")
 	t.Logf("[C 1/2 vs 0.5] verdict=%s computed=%q", verdictString(vc), cc)
 	if vc == verdictDisagree {
 		t.Errorf("BUG-C: 等价分数/小数被误判 DISAGREE")
 	}
 
 	// BUG-D：非 trivial 真实计算——正确候选 2550 应 AGREE。
-	vd, cd := o.verify(ctx, "求 1 到 100 所有偶数的和。", "2550")
+	vd, cd, _ := o.verify(ctx, "求 1 到 100 所有偶数的和。", "2550", "")
 	t.Logf("[D 偶数和2550(对)] verdict=%s computed=%q 期望AGREE", verdictString(vd), cd)
 	if vd != verdictAgree {
 		t.Errorf("BUG-D: 正确的非 trivial 计算未确认(verdict=%s)", verdictString(vd))
 	}
 
 	// BUG-E：再验命脉——错候选 2500 必须抓出。
-	ve, ce := o.verify(ctx, "求 1 到 100 所有偶数的和。", "2500")
+	ve, ce, _ := o.verify(ctx, "求 1 到 100 所有偶数的和。", "2500", "")
 	t.Logf("[E 偶数和2500(错)] verdict=%s computed=%q 期望DISAGREE", verdictString(ve), ce)
 	if ve != verdictDisagree {
 		t.Errorf("BUG-E: 错答案 2500 未抓出")

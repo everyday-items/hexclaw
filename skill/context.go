@@ -25,6 +25,31 @@ func AuthenticatedUserID(ctx context.Context) string {
 	return id
 }
 
+// routedAgentCtxKey carries the name of the agent (agents.name) the current
+// message was routed to. The engine stamps it during tool execution so a skill
+// can scope its side effects to that instance — trusting the routed identity
+// over an LLM-supplied argument (same rationale as authUserCtxKey). A scenario
+// pack (e.g. K12) reads it to persist records under the right agent; nothing in
+// the engine reads it, so stamping is behavior-neutral for existing skills.
+type routedAgentCtxKey struct{}
+
+// WithRoutedAgent returns a context carrying the routed agent name. An empty
+// name returns ctx unchanged (message not routed to a named agent).
+func WithRoutedAgent(ctx context.Context, name string) context.Context {
+	if name == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, routedAgentCtxKey{}, name)
+}
+
+// RoutedAgentName returns the routed agent name stamped by the engine, or ""
+// when the message was not routed to a named agent (default assistant, direct
+// skill invocation in tests).
+func RoutedAgentName(ctx context.Context) string {
+	s, _ := ctx.Value(routedAgentCtxKey{}).(string)
+	return s
+}
+
 // systemDispatchSourceKey carries the dispatch source (e.g. "cron") for
 // non-interactive engine runs. The engine stamps it at Process entry for
 // system dispatches (cron/heartbeat/webhook/spawn). Permission gating reads it

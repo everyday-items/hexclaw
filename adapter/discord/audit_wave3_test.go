@@ -280,7 +280,7 @@ func TestCreateMessage_StatusCodeHandling(t *testing.T) {
 
 func TestCreateMessage_RequestShape(t *testing.T) {
 	a := newTestAdapter()
-	caps := stubClient(a, func(c *capturedReq) (int, string) { return 200, `{"id":"x"}`} )
+	caps := stubClient(a, func(c *capturedReq) (int, string) { return 200, `{"id":"x"}` })
 	_, err := a.createMessage(context.Background(), "CH-9", "payload")
 	if err != nil {
 		t.Fatalf("createMessage err: %v", err)

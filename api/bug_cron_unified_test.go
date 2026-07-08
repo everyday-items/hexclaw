@@ -48,7 +48,7 @@ func TestHumanizeError_ToolUseIDNeverLeaks(t *testing.T) {
 // TestHumanizeError_KnownPatternsMapped 验证已知错误模式正确翻译。
 func TestHumanizeError_KnownPatternsMapped(t *testing.T) {
 	cases := []struct {
-		in       string
+		in        string
 		expectSub string
 	}{
 		{"context deadline exceeded", "超时"},
@@ -241,10 +241,10 @@ func TestBugCogview_NonChatModel_FriendlyHint(t *testing.T) {
 // TestStripJSONFence 守卫围栏剥离（LLM 偶尔包 ```json …```）。
 func TestStripJSONFence(t *testing.T) {
 	cases := map[string]string{
-		"{}":                          "{}",
-		"```json\n{\"a\":1}\n```":     `{"a":1}`,
-		"```\n{\"a\":1}\n```":         `{"a":1}`,
-		"  {\"a\":1}\n":               `{"a":1}`,
+		"{}":                      "{}",
+		"```json\n{\"a\":1}\n```": `{"a":1}`,
+		"```\n{\"a\":1}\n```":     `{"a":1}`,
+		"  {\"a\":1}\n":           `{"a":1}`,
 	}
 	for in, want := range cases {
 		if got := stripJSONFence(in); strings.TrimSpace(got) != strings.TrimSpace(want) {

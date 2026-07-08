@@ -51,7 +51,7 @@ type mockSlackWebAPI struct {
 	outbounds []slackOutbound
 	gotCh     chan slackOutbound // 每收到一次出站就投递一个，供异步闭环收敛
 
-	okFalse bool   // true → 返回业务失败
+	okFalse bool // true → 返回业务失败
 	errCode string
 }
 
