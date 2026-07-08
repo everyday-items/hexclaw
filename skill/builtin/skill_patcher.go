@@ -7,7 +7,7 @@
 //     连续匹配；用于容忍尾随空白、缩进微差等 LLM 输出常见漂移
 //  3. 任一匹配即把对应区段替换为 new_text；都失败则报错
 //
-// 不引入完整 unified diff / 三向合并：F2 的目标是"K12 安全底线"，越简单越好审计；
+// 不引入完整 unified diff / 三向合并：F2 的目标是"安全底线"，越简单越好审计；
 // 复杂多 hunk 编辑请走 create_skill 重写整个 SKILL.md.pending 路径。
 package builtin
 

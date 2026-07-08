@@ -679,6 +679,10 @@ func codeExecEnv(run codeExecRun) map[string]string {
 		"PIP_CACHE_DIR":        filepath.Join(run.CacheDir, "pip"),
 		"PYTHONPYCACHEPREFIX":  filepath.Join(run.CacheDir, "pycache"),
 		"npm_config_cache":     filepath.Join(run.CacheDir, "npm"),
+		// GOWORK=off 显式关 Go workspace 模式：沙箱内 go 命令绝不加载宿主 go.work（hermeticity）。
+		// 仅 `unset GOWORK` 不够——go 会沿目录树自动发现 go.work 进 workspace 模式、进而想写宿主
+		// go.work.sum（沙箱只读拒绝→失败）。=off 才真正隔离（对非 go 运行无害）。
+		"GOWORK": "off",
 	}
 	if run.Config.Network {
 		exports["GOMODCACHE"] = filepath.Join(run.CacheDir, "gomod")
@@ -705,12 +709,10 @@ var codeExecWritableEnvKeys = []string{
 	"GOMODCACHE",
 }
 
-var codeExecUnsetEnvKeys = []string{
-	// Host workspaces must not leak into isolated code_exec runs. Leaving
-	// GOWORK set makes a temp Go module try to load the developer's repo
-	// workspace, which either fails the sandbox boundary or breaks hermeticity.
-	"GOWORK",
-}
+// codeExecUnsetEnvKeys 需从沙箱环境剥除的宿主变量。GOWORK 不在此列——它改为显式
+// `export GOWORK=off`（见 exports base），因为 `unset GOWORK` 后 go 仍会自动发现宿主 go.work、
+// 破坏 hermeticity 并触发对宿主 go.work.sum 的越界写（沙箱拒→失败）。
+var codeExecUnsetEnvKeys = []string{}
 
 func ensureCodeExecEnvDirs(run codeExecRun, exports map[string]string) error {
 	seen := map[string]bool{}

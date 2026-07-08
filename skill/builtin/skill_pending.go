@@ -9,7 +9,7 @@
 //   - approve 用 os.Rename 原子替换，避免半写入状态
 //   - 永远不写 production 路径（只 rename / unlink）
 //
-// 该工具同样作为 LLM tool 暴露，但预期由用户/家长在前端确认后才让 LLM 触发；
+// 该工具同样作为 LLM tool 暴露，但预期由用户在前端确认后才让 LLM 触发；
 // 真实部署可在前端把这个工具放进"需要 approval"白名单。
 package builtin
 

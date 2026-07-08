@@ -690,9 +690,9 @@ type BuiltinConfig struct {
 	Translate      bool                 `yaml:"translate"`
 	Summary        bool                 `yaml:"summary"`
 	Browser        bool                 `yaml:"browser"`
-	Code           bool                 `yaml:"code"`
-	Shell          bool                 `yaml:"shell"`
-	CodeExec       bool                 `yaml:"code_exec"` // 沙箱代码执行 (需 sandbox 初始化)
+	Code           bool                 `yaml:"code"`      // DEPRECATED(T4.1)：裸 exec 无沙箱，迁移到 code_exec(snippet/file/module)；遥测窗口后移除
+	Shell          bool                 `yaml:"shell"`     // DEPRECATED(T4.1)：裸 sh -c 无沙箱，迁移到 code_exec(mode=project)；遥测窗口后移除
+	CodeExec       bool                 `yaml:"code_exec"` // 沙箱代码执行 (需 sandbox 初始化)；唯一推荐的执行原语
 	FileOps        bool                 `yaml:"file_ops"`  // 文件读写编辑 (受限于 workspace)
 	CodeExecPolicy CodeExecPolicyConfig `yaml:"code_exec_policy"`
 

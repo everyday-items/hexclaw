@@ -17,10 +17,10 @@ var validSkillName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
 
 // SkillWriterSkill allows the LLM to create new Skills as SKILL.md files.
 //
-// v0.4.0 F2 K12 安全底线（强制 .pending 流）：
+// v0.4.0 F2 安全底线（强制 .pending 流）：
 //   - LLM 永远不直接覆盖 production 的 SKILL.md
 //   - 所有写入落到 SKILL.md.pending；marketplace loader 不会扫描 .pending
-//   - 用户/家长通过 manage_skill_pending(approve|reject) 审核闭环
+//   - 用户通过 manage_skill_pending(approve|reject) 审核闭环
 //
 // Security:
 //   - Name validation (no path traversal)

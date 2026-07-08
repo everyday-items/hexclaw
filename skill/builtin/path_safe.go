@@ -56,4 +56,3 @@ func resolveSafePath(workspace, inputPath string) (string, error) {
 
 	return resolved, nil
 }
-

@@ -71,14 +71,22 @@ func RegisterAll(registry *skill.DefaultRegistry, cfg config.BuiltinConfig) {
 	}
 
 	if cfg.Code {
-		logger.Warn("[SECURITY WARNING] Code Skill 已启用：将在宿主机上直接执行任意代码（go run / python3 / node），" +
-			"不提供内核级沙箱隔离。请确认当前进程运行于容器化或已隔离的沙箱环境，否则请在配置中关闭 builtin.code。")
+		// DEPRECATED（T4.1 架构评审）：code skill 裸 exec 在宿主机直跑代码，无内核级沙箱。已被
+		// **code_exec**（mode=snippet/file/module，走 toolkit/os/sandbox + FileAccessBroker 受控访问）
+		// 完全取代。请迁移到 builtin.code_exec；本 skill 计划在遥测确认无残留依赖后（约两个 minor 版本）移除。
+		logger.Warn("[DEPRECATED · SECURITY] builtin.code 已弃用：裸 exec 在宿主机直跑代码、无沙箱隔离；" +
+			"请迁移到 builtin.code_exec（沙箱化 + 受控文件访问）。本 skill 将在后续版本移除。")
 		if err := registry.Register(NewCodeSkill()); err != nil {
 			logger.Error("注册代码执行 Skill 失败", "error", err)
 		}
 	}
 
 	if cfg.Shell {
+		// DEPRECATED（T4.1 架构评审）：shell skill 裸 `sh -c` 在宿主机执行任意命令、无沙箱。已被
+		// **code_exec mode=project**（带 command，走沙箱 + broker 授权目录，受控宿主访问）取代。
+		// 请迁移到 builtin.code_exec；计划遥测窗口后移除。
+		logger.Warn("[DEPRECATED · SECURITY] builtin.shell 已弃用：裸 sh -c 在宿主机执行任意命令、无沙箱隔离；" +
+			"请迁移到 builtin.code_exec（mode=project）。本 skill 将在后续版本移除。")
 		if err := registry.Register(NewShellSkill()); err != nil {
 			logger.Error("注册 Shell Skill 失败", "error", err)
 		}

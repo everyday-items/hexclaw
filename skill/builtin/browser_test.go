@@ -14,7 +14,7 @@ func TestBrowserSkillFetch(t *testing.T) {
 		client: httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html")
 			_, _ = w.Write([]byte(`<html><head><title>Test Page</title></head><body><p>Hello World</p></body></html>`))
-		})),	}
+		}))}
 	result, err := s.Execute(context.Background(), map[string]any{
 		"action": "fetch",
 		"url":    "https://example.com/test",
@@ -46,7 +46,7 @@ func TestBrowserSkillExtract(t *testing.T) {
 	s := &BrowserSkill{
 		client: httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(html))
-		})),	}
+		}))}
 
 	// 提取标题
 	result, err := s.Execute(context.Background(), map[string]any{

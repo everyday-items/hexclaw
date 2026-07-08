@@ -77,4 +77,3 @@ func TestResolveSafePath_TraversalBlocked(t *testing.T) {
 		}
 	}
 }
-
