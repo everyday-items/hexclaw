@@ -3984,7 +3984,9 @@ func decorateSystemPrompt(base string, metadata map[string]string) string {
 }
 
 // localeOutputDirective 返回针对 user_locale 的输出语言指令。
-// 默认 / zh-CN / 空值返回 ""（不追加，沿用 system prompt 默认中文风格）。
+// BUG-20260709：zh-CN/zh 也返回**显式**中文指令（与 en/ug 对称）——旧版返回空串靠 SOUL
+// 隐式约定，真机取证（钉钉真图解题轮）英语倾向的推理模型（nemotron omni 等）会直接英文作答。
+// 空值（未设置）仍不追加，保持向后兼容。
 //
 // **安全**：locale 来自前端 localStorage（攻击者可写），未知 locale 必须直接回落
 // 到空串（不再把原始字符串拼接到 system prompt），防止 prompt injection
@@ -3992,8 +3994,10 @@ func decorateSystemPrompt(base string, metadata map[string]string) string {
 // 仅返回**白名单内**的固定字符串。
 func localeOutputDirective(locale string) string {
 	switch locale {
-	case "", "zh-CN", "zh":
+	case "":
 		return ""
+	case "zh-CN", "zh":
+		return "用户语言设置为中文（zh-CN）。请默认使用中文回答（含最终答案与解释），除非用户明确要求换语言；不要输出英文思考过程。"
 	case "en":
 		return "User locale: en. Please respond in English by default unless the user explicitly switches language."
 	case "ug-CN", "ug":

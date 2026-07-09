@@ -15,8 +15,9 @@ func TestLocaleOutputDirective_KnownLocales(t *testing.T) {
 		wantContain  string
 	}{
 		{"", false, ""},
-		{"zh-CN", false, ""},
-		{"zh", false, ""},
+		// BUG-20260709：zh 系与 en/ug 对称改为显式中文指令（旧契约空串→英语倾向模型漏英文，真机复现）
+		{"zh-CN", true, "中文"},
+		{"zh", true, "中文"},
 		{"en", true, "English"},
 		{"ug-CN", true, "ug-CN"},
 		{"ug", true, "ug-CN"},
