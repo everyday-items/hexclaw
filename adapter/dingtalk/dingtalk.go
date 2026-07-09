@@ -11,6 +11,7 @@ package dingtalk
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -72,6 +73,9 @@ type dingtalkOpenAPI interface {
 	SendOTO(ctx context.Context, accessToken, robotCode, userID string, msg dingtalkOutboundMessage) (processQueryKey string, err error)
 	// RecallOTO 按 processQueryKey 批量撤回此前主动发送的单聊消息。
 	RecallOTO(ctx context.Context, accessToken, robotCode string, processQueryKeys []string) error
+	// DownloadMessageFile 用消息 downloadCode 换取媒体文件的临时下载 URL
+	//（BUG-20260709：picture 消息进多模态管道的前置步骤）。
+	DownloadMessageFile(ctx context.Context, accessToken, robotCode, downloadCode string) (downloadURL string, err error)
 }
 
 // dingtalkOutboundMessage 是钉钉出站消息的传输形态：MsgKey 选择消息类型
@@ -212,6 +216,25 @@ func (c *officialDingtalkOpenAPI) RecallOTO(_ context.Context, accessToken, robo
 	return nil
 }
 
+// DownloadMessageFile 用 downloadCode 换媒体文件临时下载 URL
+//（官方 robot/messageFiles/download API·BUG-20260709 picture 消息进管道的前置步骤）。
+func (c *officialDingtalkOpenAPI) DownloadMessageFile(_ context.Context, accessToken, robotCode, downloadCode string) (string, error) {
+	resp, err := c.robot.RobotMessageFileDownloadWithOptions(
+		(&dtrobot.RobotMessageFileDownloadRequest{}).
+			SetRobotCode(robotCode).
+			SetDownloadCode(downloadCode),
+		(&dtrobot.RobotMessageFileDownloadHeaders{}).SetXAcsDingtalkAccessToken(accessToken),
+		c.runtime,
+	)
+	if err != nil {
+		return "", err
+	}
+	if resp == nil || resp.Body == nil || resp.Body.DownloadUrl == nil || *resp.Body.DownloadUrl == "" {
+		return "", fmt.Errorf("钉钉未返回下载 URL")
+	}
+	return *resp.Body.DownloadUrl, nil
+}
+
 func joinStringPtrs(values []*string) string {
 	out := make([]string, 0, len(values))
 	for _, v := range values {
@@ -341,8 +364,16 @@ func (a *DingtalkAdapter) onChatBotMessage(_ context.Context, data *dtchatbot.Bo
 		SenderNick:       data.SenderNick,
 	}
 	event.Text.Content = data.Text.Content
+	event.MsgType = data.Msgtype
+	// picture 等富媒体的 downloadCode 在 Content（SDK 为 interface{}，按 map 取）
+	// ——BUG-20260709：此前只拷贝 Text.Content，图片消息被静默丢弃、用户零回复。
+	if m, ok := data.Content.(map[string]interface{}); ok {
+		if code, ok := m["downloadCode"].(string); ok {
+			event.Content.DownloadCode = code
+		}
+	}
 
-	if strings.TrimSpace(event.Text.Content) != "" {
+	if strings.TrimSpace(event.Text.Content) != "" || event.Content.DownloadCode != "" {
 		go a.handleMessage(event)
 	}
 	return []byte(""), nil
@@ -378,7 +409,8 @@ func (a *DingtalkAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if event.Text.Content != "" {
+	// BUG-20260709：picture 消息正文为空但带 downloadCode，同样要进管道
+	if event.Text.Content != "" || event.Content.DownloadCode != "" {
 		go a.handleMessage(event)
 	}
 
@@ -521,27 +553,44 @@ func (a *DingtalkAdapter) handleMessage(event dtEvent) {
 	}
 
 	content := strings.TrimSpace(event.Text.Content)
-	if content == "" {
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	// picture 消息（BUG-20260709）：downloadCode → 临时下载 URL → 图片字节 → image 附件，
+	// 与桌面/web 同走 BuildMultimodalUserMessage 多模态管道（无 vision 模型时引擎有友好拒绝）。
+	// 下载失败给用户明确提示，绝不静默丢弃。
+	var attachments []adapter.Attachment
+	if event.Content.DownloadCode != "" {
+		att, err := a.downloadPictureAttachment(ctx, event.Content.DownloadCode)
+		if err != nil {
+			logger.Error("钉钉: 下载图片消息失败", "error", err)
+			errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer errCancel()
+			_ = a.Send(errCtx, event.SenderStaffId, &adapter.Reply{Content: "⚠️ 图片获取失败，请重新发送一次。"})
+			return
+		}
+		attachments = append(attachments, att)
+	}
+	if !adapter.HasMessageInput(content, attachments) {
 		return
 	}
 
 	msg := &adapter.Message{
-		ID:         "dt-" + idgen.ShortID(),
-		Platform:   adapter.PlatformDingtalk,
-		InstanceID: a.Name(),
-		ChatID:     event.SenderStaffId,
-		UserID:     event.SenderStaffId,
-		UserName:   event.SenderNick,
-		Content:    content,
-		Timestamp:  time.Now(),
+		ID:          "dt-" + idgen.ShortID(),
+		Platform:    adapter.PlatformDingtalk,
+		InstanceID:  a.Name(),
+		ChatID:      event.SenderStaffId,
+		UserID:      event.SenderStaffId,
+		UserName:    event.SenderNick,
+		Content:     content,
+		Attachments: attachments,
+		Timestamp:   time.Now(),
 		Metadata: map[string]string{
 			"conversation_id":   event.ConversationId,
 			"conversation_type": event.ConversationType,
 		},
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
 
 	// 发送前先发「正在思考」占位给用户即时反馈；拿到其标识，答案就位后撤回（BUG-20260704）。
 	thinkingKey := a.sendThinkingFeedback(ctx, msg.ChatID)
@@ -569,6 +618,52 @@ func (a *DingtalkAdapter) handleMessage(event dtEvent) {
 	}
 	// 答案已送达 → 撤回占位，使其不残留。
 	a.recallThinkingFeedback(sendCtx, thinkingKey)
+}
+
+// downloadPictureAttachment 把 picture 消息的 downloadCode 兑换成 image 附件（BUG-20260709）：
+// openAPI 换临时下载 URL → GET 图片字节（上限 10MiB 防 OOM）→ base64 + MIME 嗅探。
+func (a *DingtalkAdapter) downloadPictureAttachment(ctx context.Context, downloadCode string) (adapter.Attachment, error) {
+	token, err := a.getAccessToken(ctx)
+	if err != nil {
+		return adapter.Attachment{}, fmt.Errorf("获取 Access Token 失败: %w", err)
+	}
+	api, err := a.apiClient()
+	if err != nil {
+		return adapter.Attachment{}, fmt.Errorf("初始化钉钉官方 SDK 失败: %w", err)
+	}
+	url, err := api.DownloadMessageFile(ctx, token, a.cfg.RobotCode, downloadCode)
+	if err != nil {
+		return adapter.Attachment{}, fmt.Errorf("换取下载 URL 失败: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return adapter.Attachment{}, fmt.Errorf("构造下载请求失败: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return adapter.Attachment{}, fmt.Errorf("下载图片失败: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return adapter.Attachment{}, fmt.Errorf("下载图片失败: HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	if err != nil {
+		return adapter.Attachment{}, fmt.Errorf("读取图片字节失败: %w", err)
+	}
+	if len(data) == 0 {
+		return adapter.Attachment{}, fmt.Errorf("图片内容为空")
+	}
+	mime := resp.Header.Get("Content-Type")
+	if mime == "" || !strings.HasPrefix(mime, "image/") {
+		mime = http.DetectContentType(data)
+	}
+	return adapter.Attachment{
+		Type: "image",
+		Mime: mime,
+		Name: "dingtalk-picture",
+		Data: base64.StdEncoding.EncodeToString(data),
+	}, nil
 }
 
 // ============== Token 管理 ==============
@@ -667,6 +762,11 @@ type dtEvent struct {
 		Content string `json:"content"`
 	} `json:"text"`
 	MsgType string `json:"msgtype"`
+	// Content 承载富媒体载荷（BUG-20260709：picture 消息的 downloadCode 在此，
+	// 此前未解析 → 图片消息正文为空被静默丢弃、用户零回复）。
+	Content struct {
+		DownloadCode string `json:"downloadCode"`
+	} `json:"content"`
 }
 
 // marshalMarkdownContent 生成 sampleMarkdown 的 {"title","text"} 载荷

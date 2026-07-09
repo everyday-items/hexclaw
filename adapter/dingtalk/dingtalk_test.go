@@ -113,6 +113,11 @@ func (f *fakeDingtalkOpenAPI) RecallOTO(_ context.Context, _, _ string, processQ
 	return f.recallErr
 }
 
+// DownloadMessageFile 基础 fake 不预置下载 URL（picture 用例见 fakePictureOpenAPI·BUG-20260709）。
+func (f *fakeDingtalkOpenAPI) DownloadMessageFile(_ context.Context, _, _, _ string) (string, error) {
+	return "", fmt.Errorf("fakeDingtalkOpenAPI 未配置下载 URL")
+}
+
 func (f *fakeDingtalkOpenAPI) RecallCalls() [][]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
