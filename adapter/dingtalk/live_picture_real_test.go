@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -141,6 +142,7 @@ func TestLivePicture_RealImageSolve_SendToDingtalk(t *testing.T) {
 	adp.openAPI = &livePictureOpenAPI{dingtalkOpenAPI: realAPI, mediaURL: mediaSrv.URL}
 
 	// 真实多模态 handler：图片附件 → MultiContent(image_url data URI) → 真调 vision 模型解题。
+	var answered atomic.Bool
 	adp.handler = func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
 		if len(msg.Attachments) != 1 {
 			t.Fatalf("handler 应收到 1 个图片附件，实际 %d", len(msg.Attachments))
@@ -151,14 +153,28 @@ func TestLivePicture_RealImageSolve_SendToDingtalk(t *testing.T) {
 		if rerr != nil {
 			return nil, rerr
 		}
-		t.Logf("   → 路由到真实模型 model=%s", model)
+		// v4：优先非推理型视觉模型——nemotron omni(reasoning) 遇到难题会把大段英文推理
+		// 写进 content（v3 真机取证：思维题触发长篇 GCD/LCM 英文纠结原样送达用户），
+		// 提示词不可控；推理模型出站剥离为 P2。免费池常 429 → 候选顺序尝试；
+		// DINGTALK_LIVE_VISION_MODEL 可插队首选。
+		candidates := []string{"google/gemma-4-26b-a4b-it:free", "google/gemma-4-31b-it:free", model}
+		if vm := os.Getenv("DINGTALK_LIVE_VISION_MODEL"); vm != "" {
+			candidates = append([]string{vm}, candidates...)
+		}
+		_ = model
 		temp := 0.4
-		resp, cerr := p.Complete(ctx, llm.CompletionRequest{
-			Model: model,
+		var resp *llm.CompletionResponse
+		var cerr error
+		for _, cand := range candidates {
+			t.Logf("   → 尝试真实模型 model=%s", cand)
+			resp, cerr = p.Complete(ctx, llm.CompletionRequest{
+				Model: cand,
 			Messages: []llm.Message{
-				// BUG-20260709 用户反馈：首轮真机答案混入英文推理过程。与产品修复对齐
-				//（engine zh locale 指令 cbd223b）：显式要求只输出最终中文答案、禁止思考过程。
-				{Role: "system", Content: "你是小明的五年级辅导助手。家长发来孩子的作业照片，请识别第一大题「直接写得数」里的前 3 道口算题，逐题给出算式和答案。硬性要求：只输出最终答案，全程使用中文，绝对不要输出思考过程、推理步骤或任何英文。"},
+				// 用户反馈迭代：v1 混英文推理 → v2 收太死只答 3 题无文字说明 →
+				// v3（本版）：整页逐题作答 + 题目原文 + 简要过程，仍禁思考过程/英文。
+				// v5：结构化分隔标记——推理模型的内部思考压不住就让它随便想，
+				// 但最终解答必须跟在标记之后，发送前只截取标记后内容（工程化剥离）。
+				{Role: "system", Content: "你是小明的五年级辅导助手。家长发来孩子的整页作业照片，请识别并解答**整页所有题目**。输出格式硬性要求：最后必须输出一行只含「===最终解答===」的分隔行，紧接着给出完整解答——按大题分节（如「一、直接写得数」），每小题一行：题目原文 + 「= 答案」；计算/简算与解方程给一行简要过程；应用题、思维题写清算式与最终答案。分隔行之后的解答**只能用中文**，不得出现英文或思考过程。"},
 				{
 					Role: "user",
 					MultiContent: []llm.ContentPart{
@@ -167,20 +183,47 @@ func TestLivePicture_RealImageSolve_SendToDingtalk(t *testing.T) {
 					},
 				},
 			},
-			MaxTokens: 1200,
+			MaxTokens: 4000, // 整页 ~25 小题逐题作答，1200 不够截断
 			Temperature: &temp,
 		})
+			if cerr == nil {
+				break
+			}
+			t.Logf("   ✗ 模型 %s 调用失败（试下一候选）：%v", cand, cerr)
+		}
 		if cerr != nil {
+			t.Log("   ✗ 全部候选模型失败")
 			return nil, cerr
 		}
 		answer := strings.TrimSpace(adapter.StripThinking(resp.Content))
 		if answer == "" {
 			answer = strings.TrimSpace(resp.Content)
 		}
+		// v5 工程化剥离：只取「===最终解答===」标记之后的内容（推理模型的英文思考在标记前）。
+		const marker = "===最终解答==="
+		if idx := strings.LastIndex(answer, marker); idx >= 0 {
+			answer = strings.TrimSpace(answer[idx+len(marker):])
+		}
 		if answer == "" {
+			t.Log("   ✗ 模型返回空正文/标记后无内容")
+			return nil, context.DeadlineExceeded
+		}
+		// 英文占比守卫：解答段仍以英文为主 → 判失败不发垃圾给用户
+		letters, han := 0, 0
+		for _, r := range answer {
+			switch {
+			case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z':
+				letters++
+			case r >= 0x4E00 && r <= 0x9FFF:
+				han++
+			}
+		}
+		if letters > han {
+			t.Logf("   ✗ 解答段英文占比过高（en=%d han=%d），拒发。前 300 字：%s", letters, han, string([]rune(answer))[:min(300, len([]rune(answer)))])
 			return nil, context.DeadlineExceeded
 		}
 		t.Logf("   → 真实解题答案(%d 字)：\n%s", len([]rune(answer)), answer)
+		answered.Store(true)
 		return &adapter.Reply{Content: "📷 已识别你发来的作业照片：\n\n" + answer}, nil
 	}
 
@@ -190,5 +233,8 @@ func TestLivePicture_RealImageSolve_SendToDingtalk(t *testing.T) {
 	event.MsgType = "picture"
 	event.Content.DownloadCode = "live-real-image-code"
 	adp.handleMessage(event) // 生产路径：占位→下载真图→vision 解题→真实发送→撤占位
+	if !answered.Load() {
+		t.Fatal("解题未成功（模型失败/空正文），用户收到的是错误提示而非答案——见上方 ✗ 日志")
+	}
 	t.Logf("✅ 真图解题结果已真实发送到钉钉 userId=%s——请在钉钉里确认收到解题消息", userID)
 }
