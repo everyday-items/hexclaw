@@ -919,6 +919,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 	defer eng.Stop(context.Background())
 
+	// 本地模型后台预热（BUG-20260710）：默认路由是 ollama/local 时，把巨型 system prompt
+	// +工具模板先行 prefill 进 KV 缓存（纯 CPU 机型冷路径实测 344s），用户首条消息走热路径。
+	// 不阻塞启动、失败仅告警；云端默认路由自动跳过。
+	eng.StartLocalWarmup(ctx)
+
 	// 8. 启动 HTTP 服务
 	srv := api.NewServer(cfg, eng, gw, store)
 	srv.SetVersion(version)
