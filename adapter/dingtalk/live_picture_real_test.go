@@ -156,7 +156,9 @@ func TestLivePicture_RealImageSolve_SendToDingtalk(t *testing.T) {
 		resp, cerr := p.Complete(ctx, llm.CompletionRequest{
 			Model: model,
 			Messages: []llm.Message{
-				{Role: "system", Content: "你是小明的五年级辅导助手。家长发来孩子的作业照片，请识别第一大题「直接写得数」里的前 3 道口算题，逐题给出算式和答案，中文、简洁、分行。"},
+				// BUG-20260709 用户反馈：首轮真机答案混入英文推理过程。与产品修复对齐
+				//（engine zh locale 指令 cbd223b）：显式要求只输出最终中文答案、禁止思考过程。
+				{Role: "system", Content: "你是小明的五年级辅导助手。家长发来孩子的作业照片，请识别第一大题「直接写得数」里的前 3 道口算题，逐题给出算式和答案。硬性要求：只输出最终答案，全程使用中文，绝对不要输出思考过程、推理步骤或任何英文。"},
 				{
 					Role: "user",
 					MultiContent: []llm.ContentPart{
