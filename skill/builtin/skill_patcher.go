@@ -77,13 +77,16 @@ func (s *SkillPatcherSkill) Execute(_ context.Context, args map[string]any) (*sk
 	if err != nil {
 		return nil, fmt.Errorf("skill %q not found: %w", name, err)
 	}
-	resolvedBase, _ := filepath.EvalSymlinks(s.skillDir)
-	if !strings.HasPrefix(resolvedDir, resolvedBase) {
+	resolvedBase, err := filepath.EvalSymlinks(s.skillDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve skill base directory: %w", err)
+	}
+	if resolvedDir != resolvedBase && !strings.HasPrefix(resolvedDir, resolvedBase+string(os.PathSeparator)) {
 		return nil, fmt.Errorf("skill directory escapes base path (symlink attack?)")
 	}
 
 	livePath := filepath.Join(resolvedDir, "SKILL.md")
-	original, err := os.ReadFile(livePath)
+	original, _, err := readRegularFileNoFollow(livePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read existing SKILL.md: %w", err)
 	}
@@ -100,7 +103,7 @@ func (s *SkillPatcherSkill) Execute(_ context.Context, args map[string]any) (*sk
 	}
 
 	pendingPath := filepath.Join(resolvedDir, "SKILL.md"+PendingSuffix)
-	if err := os.WriteFile(pendingPath, []byte(patched), 0644); err != nil {
+	if err := writeRegularFileAtomicNoFollow(pendingPath, []byte(patched), 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write pending file: %w", err)
 	}
 

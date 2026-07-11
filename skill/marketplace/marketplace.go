@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hexagon-codes/toolkit/util/logger"
 
@@ -22,6 +23,12 @@ import (
 
 // ErrSkillNotInstalled is returned when operating on a skill that is not installed.
 var ErrSkillNotInstalled = errors.New("skill not installed")
+
+const (
+	seedTempPrefix = ".hexclaw-seed-"
+	seedTempSuffix = ".tmp"
+	seedTempMaxAge = 24 * time.Hour
+)
 
 // Marketplace 技能市场管理器
 //
@@ -88,6 +95,9 @@ func (m *Marketplace) SeedFromFS(fsys fs.FS, subdir string) (int, error) {
 	if err := fileutil.MkdirAll(m.skillDir); err != nil {
 		return 0, fmt.Errorf("创建技能目录失败: %w", err)
 	}
+	if err := cleanupStaleSeedTemps(m.skillDir, time.Now()); err != nil {
+		return 0, fmt.Errorf("清理 seed 临时文件失败: %w", err)
+	}
 	entries, err := fs.ReadDir(fsys, subdir)
 	if err != nil {
 		return 0, fmt.Errorf("读取内嵌 seed 目录失败: %w", err)
@@ -97,20 +107,78 @@ func (m *Marketplace) SeedFromFS(fsys fs.FS, subdir string) (int, error) {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
 		}
-		dest := filepath.Join(m.skillDir, e.Name())
-		if _, statErr := os.Stat(dest); statErr == nil {
-			continue // 已存在 → 不覆盖（幂等）
-		}
 		data, rerr := fs.ReadFile(fsys, path.Join(subdir, e.Name()))
 		if rerr != nil {
 			return seeded, fmt.Errorf("读取内嵌 skill %q 失败: %w", e.Name(), rerr)
 		}
-		if werr := os.WriteFile(dest, data, 0644); werr != nil {
+		dest := filepath.Join(m.skillDir, e.Name())
+		published, werr := publishSeedNoReplace(dest, data)
+		if werr != nil {
 			return seeded, fmt.Errorf("写入 seed skill %q 失败: %w", e.Name(), werr)
 		}
-		seeded++
+		if published {
+			seeded++
+		}
 	}
 	return seeded, nil
+}
+
+func publishSeedNoReplace(dest string, data []byte) (bool, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(dest), seedTempPrefix+filepath.Base(dest)+"-*"+seedTempSuffix)
+	if err != nil {
+		return false, err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
+	if err := tmp.Chmod(0o644); err != nil {
+		return false, err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return false, err
+	}
+	if err := tmp.Sync(); err != nil {
+		return false, err
+	}
+	if err := tmp.Close(); err != nil {
+		return false, err
+	}
+	if err := os.Link(tmpPath, dest); err != nil {
+		if os.IsExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func cleanupStaleSeedTemps(dir string, now time.Time) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, seedTempPrefix) || !strings.HasSuffix(name, seedTempSuffix) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if now.Sub(info.ModTime()) < seedTempMaxAge {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 // List 列出所有已安装技能

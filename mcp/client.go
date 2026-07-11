@@ -25,7 +25,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"io"
 	"os"
 	"path/filepath"
@@ -35,6 +34,7 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // ServerConfig MCP Server 配置
@@ -63,6 +63,7 @@ type connectedServer struct {
 	cleanup   func()         // stdio 模式的清理函数
 	closer    io.Closer      // sse 模式的关闭接口
 	connected bool           // 连接状态
+	closeOnce sync.Once      // transport cleanup/Close 只执行一次
 }
 
 // Manager MCP 连接管理器
@@ -79,6 +80,7 @@ type Manager struct {
 	configs   []ServerConfig // 保存配置用于重连
 	stopCh    chan struct{}
 	closeOnce sync.Once
+	revisions map[string]uint64 // per-name lifecycle generation; guarded by mu
 
 	hooks hooksRegistry // v0.4.0 H3 LifecycleHook 列表
 }
@@ -86,9 +88,24 @@ type Manager struct {
 // NewManager 创建 MCP 管理器
 func NewManager() *Manager {
 	return &Manager{
-		servers: make(map[string]*connectedServer),
-		stopCh:  make(chan struct{}),
+		servers:   make(map[string]*connectedServer),
+		stopCh:    make(chan struct{}),
+		revisions: make(map[string]uint64),
 	}
+}
+
+func (m *Manager) closedLocked() bool {
+	select {
+	case <-m.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) bumpRevisionLocked(name string) uint64 {
+	m.revisions[name]++
+	return m.revisions[name]
 }
 
 // AddLifecycleHook 注册一个 LifecycleHook。flag mcp.lifecycle.v2 关闭时 hook
@@ -104,12 +121,25 @@ func (m *Manager) AddLifecycleHook(h LifecycleHook) {
 // 遍历配置列表，逐个连接。单个 Server 连接失败不影响其他 Server。
 // 返回总共发现的工具数量。
 func (m *Manager) Connect(ctx context.Context, configs []ServerConfig) (int, error) {
+	m.mu.Lock()
+	if m.closedLocked() {
+		m.mu.Unlock()
+		return 0, fmt.Errorf("MCP Manager 已关闭")
+	}
+	m.mu.Unlock()
 	totalTools := 0
 
 	for _, cfg := range configs {
 		if !cfg.Enabled {
 			continue
 		}
+		m.mu.Lock()
+		if m.closedLocked() {
+			m.mu.Unlock()
+			return totalTools, fmt.Errorf("MCP Manager 已关闭")
+		}
+		revision := m.bumpRevisionLocked(cfg.Name)
+		m.mu.Unlock()
 
 		server, err := m.connectServer(ctx, cfg)
 		if err != nil {
@@ -118,8 +148,18 @@ func (m *Manager) Connect(ctx context.Context, configs []ServerConfig) (int, err
 		}
 
 		m.mu.Lock()
+		if m.closedLocked() || m.revisions[cfg.Name] != revision {
+			m.mu.Unlock()
+			closeServer(server)
+			return totalTools, fmt.Errorf("MCP Manager 在连接 %q 期间关闭或配置已变更", cfg.Name)
+		}
+		old := m.servers[cfg.Name]
+		if old != nil {
+			old.connected = false
+		}
 		m.servers[cfg.Name] = server
 		m.mu.Unlock()
+		closeServer(old)
 
 		totalTools += len(server.tools)
 		logger.Info("MCP Server", "name", cfg.Name, "len", len(server.tools))
@@ -129,6 +169,10 @@ func (m *Manager) Connect(ctx context.Context, configs []ServerConfig) (int, err
 
 	// 保存配置用于重连
 	m.mu.Lock()
+	if m.closedLocked() {
+		m.mu.Unlock()
+		return totalTools, fmt.Errorf("MCP Manager 已关闭")
+	}
 	m.configs = configs
 	m.mu.Unlock()
 
@@ -148,13 +192,19 @@ func (m *Manager) RegisterServer(ctx context.Context, cfg ServerConfig) error {
 	if cfg.Name == "" {
 		return fmt.Errorf("RegisterServer: empty name")
 	}
+	m.mu.Lock()
+	if m.closedLocked() {
+		m.mu.Unlock()
+		return fmt.Errorf("RegisterServer: manager closed")
+	}
+	revision := m.bumpRevisionLocked(cfg.Name)
 	if !cfg.Enabled {
 		// 不抛错，但也不连接 —— 调用方意图明确：先注册到 configs，后续手动 enable
-		m.mu.Lock()
 		m.configs = appendOrReplaceConfig(m.configs, cfg)
 		m.mu.Unlock()
 		return nil
 	}
+	m.mu.Unlock()
 
 	server, err := m.connectServer(ctx, cfg)
 	if err != nil {
@@ -162,16 +212,24 @@ func (m *Manager) RegisterServer(ctx context.Context, cfg ServerConfig) error {
 	}
 
 	m.mu.Lock()
-	// 替换旧连接
-	if old, ok := m.servers[cfg.Name]; ok {
-		closeServer(old)
-		delete(m.servers, cfg.Name)
+	if m.closedLocked() || m.revisions[cfg.Name] != revision {
+		m.mu.Unlock()
+		closeServer(server)
+		return fmt.Errorf("RegisterServer %q superseded or manager closed", cfg.Name)
+	}
+	old := m.servers[cfg.Name]
+	if old != nil {
+		old.connected = false
 	}
 	m.servers[cfg.Name] = server
 	m.configs = appendOrReplaceConfig(m.configs, cfg)
 	m.mu.Unlock()
+	closeServer(old)
 
 	logger.Info("MCP Server registered", "name", cfg.Name, "tools", len(server.tools))
+	if old != nil {
+		m.hooks.fireDisconnected(ctx, cfg.Name, "server replaced")
+	}
 	m.hooks.fireConnected(ctx, cfg.Name, len(server.tools))
 	return nil
 }
@@ -181,15 +239,21 @@ func (m *Manager) RegisterServer(ctx context.Context, cfg ServerConfig) error {
 // 触发 OnServerDisconnected lifecycle hook（如果 flag 开启）。
 func (m *Manager) UnregisterServer(ctx context.Context, name string) bool {
 	m.mu.Lock()
+	if m.closedLocked() {
+		m.mu.Unlock()
+		return false
+	}
 	server, ok := m.servers[name]
 	if !ok {
 		m.mu.Unlock()
 		return false
 	}
-	closeServer(server)
+	server.connected = false
 	delete(m.servers, name)
 	m.configs = removeConfig(m.configs, name)
+	m.bumpRevisionLocked(name)
 	m.mu.Unlock()
+	closeServer(server)
 
 	logger.Info("MCP Server unregistered", "name", name)
 	m.hooks.fireDisconnected(ctx, name, "manual unregister")
@@ -201,13 +265,14 @@ func closeServer(s *connectedServer) {
 	if s == nil {
 		return
 	}
-	if s.cleanup != nil {
-		s.cleanup()
-	}
-	if s.closer != nil {
-		_ = s.closer.Close()
-	}
-	s.connected = false
+	s.closeOnce.Do(func() {
+		if s.cleanup != nil {
+			s.cleanup()
+		}
+		if s.closer != nil {
+			_ = s.closer.Close()
+		}
+	})
 }
 
 // appendOrReplaceConfig 替换同名 config 或追加。
@@ -263,9 +328,11 @@ func (m *Manager) tryReconnect() {
 		m.mu.RLock()
 		server, exists := m.servers[cfg.Name]
 		needReconnect := !exists || !server.connected
+		revision := m.revisions[cfg.Name]
+		closed := m.closedLocked()
 		m.mu.RUnlock()
 
-		if !needReconnect {
+		if closed || !needReconnect {
 			continue
 		}
 
@@ -279,19 +346,34 @@ func (m *Manager) tryReconnect() {
 		}
 
 		m.mu.Lock()
-		// 清理旧连接
-		if old, ok := m.servers[cfg.Name]; ok {
-			if old.cleanup != nil {
-				old.cleanup()
-			}
-			if old.closer != nil {
-				old.closer.Close()
+		current, exists := m.servers[cfg.Name]
+		stillNeedsReconnect := !exists || !current.connected
+		configured := false
+		for i := range m.configs {
+			if m.configs[i].Name == cfg.Name && m.configs[i].Enabled {
+				configured = true
+				break
 			}
 		}
+		if m.closedLocked() || m.revisions[cfg.Name] != revision || !configured || !stillNeedsReconnect {
+			m.mu.Unlock()
+			closeServer(newServer)
+			continue
+		}
+		old := current
+		if old != nil {
+			old.connected = false
+		}
 		m.servers[cfg.Name] = newServer
+		m.bumpRevisionLocked(cfg.Name)
 		m.mu.Unlock()
+		closeServer(old)
 
 		logger.Info("MCP Server", "name", cfg.Name, "len", len(newServer.tools))
+		if old != nil {
+			m.hooks.fireDisconnected(ctx, cfg.Name, "automatic reconnect")
+		}
+		m.hooks.fireConnected(ctx, cfg.Name, len(newServer.tools))
 	}
 }
 
@@ -457,15 +539,26 @@ func (m *Manager) ServerNames() []string {
 //
 // 在所有已连接 Server 中查找指定名称的工具并执行。
 func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string]any) (string, error) {
+	result, _, err := m.CallToolWithOwner(ctx, toolName, args)
+	return result, err
+}
+
+// CallToolWithOwner executes a tool and returns the exact server selected by
+// the same lookup. Callers must not perform a separate owner lookup: map order
+// and concurrent lifecycle changes could otherwise pair the result with a
+// different server.
+func (m *Manager) CallToolWithOwner(ctx context.Context, toolName string, args map[string]any) (string, string, error) {
 	// Copy the tool reference under lock, then release before executing
 	m.mu.RLock()
 	var found hexagon.Tool
-	var owner string // 属主 server 名——进程死亡时用于翻转其连接状态
+	var owner string                 // 属主 server 名——进程死亡时用于翻转其连接状态
+	var ownerServer *connectedServer // 选中时的连接世代；重启替换后旧调用不得污染新连接
 	for name, server := range m.servers {
 		for _, t := range server.tools {
 			if t.Name() == toolName {
 				found = t
 				owner = name
+				ownerServer = server
 				break
 			}
 		}
@@ -476,7 +569,7 @@ func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string
 	m.mu.RUnlock()
 
 	if found == nil {
-		return "", fmt.Errorf("工具 %q 未找到", toolName)
+		return "", "", fmt.Errorf("工具 %q 未找到", toolName)
 	}
 
 	result, err := found.Execute(ctx, args)
@@ -488,23 +581,27 @@ func (m *Manager) CallTool(ctx context.Context, toolName string, args map[string
 			// BUG-20260704：识别到进程退出必须同步翻转属主 server 的连接状态——
 			// 否则 ServerStatuses 谎报「已连接」（UI 徽章事实源），且 tryReconnect 因
 			// connected 仍为 true 永远跳过该 server，不自愈。翻转后下个 30s tick 自动重拉。
-			m.markServerDisconnected(ctx, owner, "stdio process exited (detected on tool call)")
-			return "", fmt.Errorf("工具 %q 执行失败: MCP 服务进程已退出，请检查数据库连接配置（主机/端口/账号/密码）后重试", toolName)
+			m.markServerDisconnected(ctx, owner, ownerServer, "stdio process exited (detected on tool call)")
+			return "", owner, fmt.Errorf("工具 %q 执行失败: MCP 服务进程已退出，请检查数据库连接配置（主机/端口/账号/密码）后重试", toolName)
 		}
-		return "", fmt.Errorf("工具 %q 执行失败: %w", toolName, err)
+		return "", owner, fmt.Errorf("工具 %q 执行失败: %w", toolName, err)
 	}
-	return result.String(), nil
+	return result.String(), owner, nil
 }
 
 // markServerDisconnected 把指定 server 标记为断连（幂等）：状态即刻对 ServerStatuses
 // 可见，tryReconnect 下个 tick 会尝试重连。仅在状态真实翻转时触发 lifecycle hook。
-func (m *Manager) markServerDisconnected(ctx context.Context, name, reason string) {
+func (m *Manager) markServerDisconnected(ctx context.Context, name string, expected *connectedServer, reason string) {
 	if name == "" {
 		return
 	}
 	m.mu.Lock()
 	server, ok := m.servers[name]
-	if !ok || !server.connected {
+	// A tool executes outside Manager.mu. Restart/replace may publish a fresh
+	// connectedServer under the same name while an old call is still in flight;
+	// only the exact connection generation that produced the error may be
+	// marked disconnected.
+	if !ok || server != expected || !server.connected {
 		m.mu.Unlock()
 		return
 	}
@@ -637,6 +734,49 @@ func (m *Manager) ConfiguredServerNames() []string {
 	return names
 }
 
+// FilesystemRoots returns the current configured absolute roots for one named
+// filesystem MCP server. It reads configs on every call so runtime replacement
+// is visible to path-resolution hooks without a stale boot snapshot.
+func (m *Manager) FilesystemRoots(name string) []string {
+	m.mu.RLock()
+	var cfg *ServerConfig
+	for i := range m.configs {
+		if m.configs[i].Name == name && m.configs[i].Enabled {
+			copyCfg := m.configs[i]
+			copyCfg.Args = append([]string(nil), copyCfg.Args...)
+			cfg = &copyCfg
+			break
+		}
+	}
+	m.mu.RUnlock()
+	if cfg == nil {
+		return nil
+	}
+	isFilesystem := false
+	for _, arg := range cfg.Args {
+		if strings.Contains(arg, "server-filesystem") {
+			isFilesystem = true
+			break
+		}
+	}
+	if !isFilesystem {
+		return nil
+	}
+	home, _ := os.UserHomeDir()
+	var roots []string
+	for _, arg := range cfg.Args {
+		if arg == "~" && home != "" {
+			arg = home
+		} else if strings.HasPrefix(arg, "~/") && home != "" {
+			arg = filepath.Join(home, arg[2:])
+		}
+		if filepath.IsAbs(arg) {
+			roots = append(roots, filepath.Clean(arg))
+		}
+	}
+	return roots
+}
+
 // AddServer 动态添加并连接 MCP Server
 //
 // 在运行时添加新的 MCP Server（无需重启）。
@@ -645,15 +785,14 @@ func (m *Manager) AddServer(ctx context.Context, cfg ServerConfig) error {
 	if cfg.Name == "" {
 		return fmt.Errorf("server name 不能为空")
 	}
-	if !cfg.Enabled {
-		cfg.Enabled = true
-	}
-
-	select {
-	case <-m.stopCh:
+	cfg.Enabled = true
+	m.mu.Lock()
+	if m.closedLocked() {
+		m.mu.Unlock()
 		return fmt.Errorf("Manager 已关闭")
-	default:
 	}
+	revision := m.bumpRevisionLocked(cfg.Name)
+	m.mu.Unlock()
 
 	server, err := m.connectServer(ctx, cfg)
 	if err != nil {
@@ -661,42 +800,19 @@ func (m *Manager) AddServer(ctx context.Context, cfg ServerConfig) error {
 	}
 
 	m.mu.Lock()
-	// double-check: Close 可能在 connectServer 期间被调用
-	select {
-	case <-m.stopCh:
+	if m.closedLocked() || m.revisions[cfg.Name] != revision {
 		m.mu.Unlock()
-		if server.cleanup != nil {
-			server.cleanup()
-		}
-		if server.closer != nil {
-			server.closer.Close()
-		}
-		return fmt.Errorf("Manager 已关闭")
-	default:
+		closeServer(server)
+		return fmt.Errorf("Manager 已关闭或添加操作已被更新操作取代")
 	}
-	if old, ok := m.servers[cfg.Name]; ok {
-		if old.cleanup != nil {
-			old.cleanup()
-		}
-		if old.closer != nil {
-			old.closer.Close()
-		}
+	old := m.servers[cfg.Name]
+	if old != nil {
+		old.connected = false
 	}
 	m.servers[cfg.Name] = server
-
-	// 同步更新 configs 以支持重连
-	found := false
-	for i, c := range m.configs {
-		if c.Name == cfg.Name {
-			m.configs[i] = cfg
-			found = true
-			break
-		}
-	}
-	if !found {
-		m.configs = append(m.configs, cfg)
-	}
+	m.configs = appendOrReplaceConfig(m.configs, cfg)
 	m.mu.Unlock()
+	closeServer(old)
 
 	logger.Info("MCP Server", "name", cfg.Name, "len", len(server.tools))
 	return nil
@@ -720,58 +836,37 @@ func (m *Manager) AddServerBestEffort(ctx context.Context, cfg ServerConfig) (bo
 	}
 	cfg.Enabled = true
 
-	select {
-	case <-m.stopCh:
+	m.mu.Lock()
+	if m.closedLocked() {
+		m.mu.Unlock()
 		return false, fmt.Errorf("Manager 已关闭")
-	default:
 	}
+	revision := m.bumpRevisionLocked(cfg.Name)
+	m.mu.Unlock()
 
 	// 即时连接（此刻 cfg 未登记 → reconnectLoop 不会对同名并发连接，杜绝双开子进程）。
 	server, connErr := m.connectServer(ctx, cfg)
 
 	m.mu.Lock()
-	// double-check: Close 可能在 connectServer 期间被调用
-	select {
-	case <-m.stopCh:
+	if m.closedLocked() || m.revisions[cfg.Name] != revision {
 		m.mu.Unlock()
-		if server != nil {
-			if server.cleanup != nil {
-				server.cleanup()
-			}
-			if server.closer != nil {
-				server.closer.Close()
-			}
-		}
-		return false, fmt.Errorf("Manager 已关闭")
-	default:
+		closeServer(server)
+		return false, fmt.Errorf("Manager 已关闭或添加操作已被更新操作取代")
 	}
 	// 登记 config（替换同名或追加），使 reconnectLoop 拥有它——连接失败时由后台 30s 周期重试拉起。
-	found := false
-	for i, c := range m.configs {
-		if c.Name == cfg.Name {
-			m.configs[i] = cfg
-			found = true
-			break
-		}
-	}
-	if !found {
-		m.configs = append(m.configs, cfg)
-	}
+	m.configs = appendOrReplaceConfig(m.configs, cfg)
 	if connErr != nil {
 		m.mu.Unlock()
 		logger.Warn("MCP Server", "name", cfg.Name, "即时连接失败，转后台重连", connErr)
 		return false, nil
 	}
-	if old, ok := m.servers[cfg.Name]; ok {
-		if old.cleanup != nil {
-			old.cleanup()
-		}
-		if old.closer != nil {
-			old.closer.Close()
-		}
+	old := m.servers[cfg.Name]
+	if old != nil {
+		old.connected = false
 	}
 	m.servers[cfg.Name] = server
 	m.mu.Unlock()
+	closeServer(old)
 
 	logger.Info("MCP Server", "name", cfg.Name, "len", len(server.tools))
 	return true, nil
@@ -781,14 +876,11 @@ func (m *Manager) AddServerBestEffort(ctx context.Context, cfg ServerConfig) (bo
 //
 // 断开指定 Server 的连接并从管理器中移除。
 func (m *Manager) RemoveServer(name string) error {
-	select {
-	case <-m.stopCh:
-		return fmt.Errorf("Manager 已关闭")
-	default:
-	}
-
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	if m.closedLocked() {
+		m.mu.Unlock()
+		return fmt.Errorf("Manager 已关闭")
+	}
 
 	// 从 configs 中移除（已配置但尚未连上的冷装 server 只在 configs 里——必须能被删除，
 	// 否则 BUG-20260626 修复后用户看得到却删不掉）。
@@ -805,20 +897,18 @@ func (m *Manager) RemoveServer(name string) error {
 	server, connected := m.servers[name]
 	if connected {
 		server.connected = false
-		if server.cleanup != nil {
-			server.cleanup()
-		}
-		if server.closer != nil {
-			server.closer.Close()
-		}
 		delete(m.servers, name)
 	}
 
 	// 既不在 configs 也不在 servers → 确实不存在。
 	if !inConfigs && !connected {
+		m.mu.Unlock()
 		return fmt.Errorf("MCP Server %q 不存在", name)
 	}
+	m.bumpRevisionLocked(name)
+	m.mu.Unlock()
 
+	closeServer(server)
 	logger.Info("MCP Server", "name", name)
 	return nil
 }
@@ -832,21 +922,18 @@ func (m *Manager) Close() {
 		close(m.stopCh)
 
 		m.mu.Lock()
-		defer m.mu.Unlock()
-
+		servers := make(map[string]*connectedServer, len(m.servers))
 		for name, server := range m.servers {
 			server.connected = false
-			if server.cleanup != nil {
-				server.cleanup()
-			}
-			if server.closer != nil {
-				if err := server.closer.Close(); err != nil {
-					logger.Error("MCP Server", "name", name, "error", err)
-				}
-			}
+			servers[name] = server
+			m.bumpRevisionLocked(name)
+		}
+		m.servers = make(map[string]*connectedServer)
+		m.mu.Unlock()
+
+		for name, server := range servers {
+			closeServer(server)
 			logger.Info("MCP Server", "name", name)
 		}
-
-		m.servers = make(map[string]*connectedServer)
 	})
 }

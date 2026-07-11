@@ -209,6 +209,43 @@ func TestCallTool_NotFound(t *testing.T) {
 	}
 }
 
+func TestCallToolWithOwner_ReturnsResolvedServer(t *testing.T) {
+	m := NewManager()
+	m.mu.Lock()
+	m.servers["filesystem-b"] = &connectedServer{
+		name: "filesystem-b", connected: true, tools: []hexagon.Tool{fakeTool("write_file")},
+	}
+	m.mu.Unlock()
+	_, owner, err := m.CallToolWithOwner(context.Background(), "write_file", map[string]any{"path": "a.md"})
+	if err != nil {
+		t.Fatalf("CallToolWithOwner: %v", err)
+	}
+	if owner != "filesystem-b" {
+		t.Fatalf("owner=%q want filesystem-b", owner)
+	}
+}
+
+func TestFilesystemRoots_ReadsCurrentNamedServerConfig(t *testing.T) {
+	m := NewManager()
+	m.mu.Lock()
+	m.configs = []ServerConfig{
+		{Name: "filesystem-a", Enabled: true, Args: []string{"-y", "@modelcontextprotocol/server-filesystem", "/root-a"}},
+		{Name: "filesystem-b", Enabled: true, Args: []string{"-y", "@modelcontextprotocol/server-filesystem", "/root-b", "relative"}},
+	}
+	m.mu.Unlock()
+	got := m.FilesystemRoots("filesystem-b")
+	if len(got) != 1 || got[0] != "/root-b" {
+		t.Fatalf("FilesystemRoots(filesystem-b)=%v want [/root-b]", got)
+	}
+	m.mu.Lock()
+	m.configs[1].Args[2] = "/root-b-updated"
+	m.mu.Unlock()
+	got = m.FilesystemRoots("filesystem-b")
+	if len(got) != 1 || got[0] != "/root-b-updated" {
+		t.Fatalf("FilesystemRoots must read runtime config, got %v", got)
+	}
+}
+
 // TestTryReconnect_Reconnects drives tryReconnect for a config whose server is
 // marked disconnected, asserting a fresh connection replaces it.
 func TestTryReconnect_Reconnects(t *testing.T) {

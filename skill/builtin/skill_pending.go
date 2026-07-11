@@ -148,13 +148,10 @@ func (s *SkillPendingSkill) approve(name string) (*skill.Result, error) {
 	pending := filepath.Join(dir, "SKILL.md"+PendingSuffix)
 	live := filepath.Join(dir, "SKILL.md")
 
-	if _, err := os.Stat(pending); err != nil {
-		return nil, fmt.Errorf("no pending draft for skill %q: %w", name, err)
-	}
-
-	// Atomic rename — replaces existing SKILL.md if present.
-	if err := os.Rename(pending, live); err != nil {
-		return nil, fmt.Errorf("approve rename failed: %w", err)
+	// Claim the pending directory entry, validate it without following links,
+	// then atomically rename the validated regular file into the live slot.
+	if err := promoteRegularFileNoFollow(pending, live); err != nil {
+		return nil, fmt.Errorf("no safe pending draft for skill %q: %w", name, err)
 	}
 	return &skill.Result{
 		Content: fmt.Sprintf("Approved: %s pending draft promoted to %s. Restart or hot-reload registry to activate.", name, live),
@@ -204,8 +201,11 @@ func (s *SkillPendingSkill) resolveDir(name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("skill %q not found: %w", name, err)
 	}
-	resolvedBase, _ := filepath.EvalSymlinks(s.skillDir)
-	if !strings.HasPrefix(resolvedDir, resolvedBase) {
+	resolvedBase, err := filepath.EvalSymlinks(s.skillDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve skill base: %w", err)
+	}
+	if resolvedDir != resolvedBase && !strings.HasPrefix(resolvedDir, resolvedBase+string(os.PathSeparator)) {
 		return "", fmt.Errorf("skill directory escapes base path (symlink attack?)")
 	}
 	return resolvedDir, nil

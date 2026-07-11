@@ -97,12 +97,15 @@ func (s *SkillWriterSkill) Execute(_ context.Context, args map[string]any) (*ski
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve skill directory: %w", err)
 	}
-	resolvedBase, _ := filepath.EvalSymlinks(s.skillDir)
-	if !strings.HasPrefix(resolvedDir, resolvedBase) {
+	resolvedBase, err := filepath.EvalSymlinks(s.skillDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve skill base directory: %w", err)
+	}
+	if resolvedDir != resolvedBase && !strings.HasPrefix(resolvedDir, resolvedBase+string(os.PathSeparator)) {
 		return nil, fmt.Errorf("skill directory escapes base path (symlink attack?)")
 	}
 	pendingPath := filepath.Join(resolvedDir, "SKILL.md"+PendingSuffix)
-	if err := os.WriteFile(pendingPath, []byte(content), 0644); err != nil {
+	if err := writeRegularFileAtomicNoFollow(pendingPath, []byte(content), 0o644); err != nil {
 		return nil, fmt.Errorf("failed to write skill pending file: %w", err)
 	}
 
