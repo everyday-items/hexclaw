@@ -54,6 +54,15 @@ func (f *failingAgentStore) DeleteAgent(ctx context.Context, name string) error 
 	}
 	return nil
 }
+func (f *failingAgentStore) DeleteAgentAndSetDefault(ctx context.Context, name, nextDefault string, wasDefault bool) error {
+	if err := f.DeleteAgent(ctx, name); err != nil {
+		return err
+	}
+	if wasDefault {
+		return f.SetDefault(ctx, nextDefault)
+	}
+	return nil
+}
 func (f *failingAgentStore) SetDefault(ctx context.Context, name string) error {
 	if f.failSetDefault {
 		return errAgentStoreDown

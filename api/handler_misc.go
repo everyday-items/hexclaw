@@ -351,6 +351,31 @@ func (s *Server) handleRemoveMCPServer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("MCP Server %q 已移除", name)})
 }
 
+// handleRestartMCPServer 重启单个 MCP Server（M3-20260710，原型 app.html:1927 服务器行「重启」）。
+// 语义见 mcp.Manager.RestartServer：新连接成功才替换，失败保留原状（404=未配置/已禁用，502=连接失败）。
+func (s *Server) handleRestartMCPServer(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "server name 不能为空"})
+		return
+	}
+	if s.mcpMgr == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "MCP 未启用"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	if err := s.mcpMgr.RestartServer(ctx, name); err != nil {
+		status := http.StatusBadGateway
+		if strings.Contains(err.Error(), "not configured") || strings.Contains(err.Error(), "disabled") {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("MCP Server %q 已重启", name)})
+}
+
 // --- 技能市场 API ---
 
 // handleListSkills 列出所有已安装的 Markdown 技能
@@ -1079,18 +1104,21 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.agentRouter.Register(cfg); err != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
-		return
-	}
-	if s.agentStore != nil {
-		// BUG-20260703 G1：落库失败必须暴错并回滚内存注册——否则用户收 200、
-		// 重启后 Agent 蒸发，且重试还会撞 409 冲突。
-		if err := s.agentStore.SaveAgent(r.Context(), &cfg); err != nil {
-			_ = s.agentRouter.Unregister(req.Name)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + err.Error()})
-			return
+	var persistErr error
+	err := s.agentRouter.RegisterPersisted(cfg, func(candidate *router.AgentConfig) error {
+		if s.agentStore == nil {
+			return nil
 		}
+		persistErr = s.agentStore.SaveAgent(r.Context(), candidate)
+		return persistErr
+	})
+	if err != nil {
+		if persistErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + persistErr.Error()})
+		} else {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		}
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Agent 已注册", "name": req.Name})
@@ -1157,20 +1185,51 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		cfg.Model = existing.Model
 		cfg.Provider = existing.Provider
 	}
-	if err := s.agentRouter.UpdateAgent(cfg); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+	var persistErr error
+	err := s.agentRouter.UpdateAgentPersisted(name, func(current router.AgentConfig) (router.AgentConfig, error) {
+		// Reapply only request-present fields to the value read under the
+		// dispatcher lock. This prevents a concurrent K12 profile restore from
+		// being overwritten by the stale pre-validation snapshot above.
+		if req.DisplayName != nil {
+			current.DisplayName = cfg.DisplayName
+		}
+		if req.Description != nil {
+			current.Description = cfg.Description
+		}
+		if req.SystemPrompt != nil {
+			current.SystemPrompt = cfg.SystemPrompt
+		}
+		if req.Skills != nil {
+			current.Skills = cfg.Skills
+		}
+		if req.MaxTokens != nil {
+			current.MaxTokens = cfg.MaxTokens
+		}
+		if req.Temperature.Present {
+			current.Temperature = cfg.Temperature
+		}
+		if req.Metadata != nil {
+			current.Metadata = cfg.Metadata
+		}
+		if llmChanged {
+			current.Model = cfg.Model
+			current.Provider = cfg.Provider
+		}
+		return current, nil
+	}, func(updated *router.AgentConfig) error {
+		if s.agentStore == nil {
+			return nil
+		}
+		persistErr = s.agentStore.SaveAgent(r.Context(), updated)
+		return persistErr
+	})
+	if err != nil {
+		if persistErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + persistErr.Error()})
+		} else {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
 		return
-	}
-	if s.agentStore != nil {
-		updated, ok := s.agentRouter.GetAgent(name)
-		if !ok {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "更新后读取 Agent 失败"})
-			return
-		}
-		if err := s.agentStore.SaveAgent(r.Context(), updated); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + err.Error()})
-			return
-		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Agent 已更新", "name": name})
 }
@@ -1178,26 +1237,32 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 // handleUnregisterAgent 注销 Agent（内存 + 持久化）
 func (s *Server) handleUnregisterAgent(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	wasDefault := s.agentRouter.DefaultAgent() == name
-	if err := s.agentRouter.Unregister(name); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
-		return
-	}
-	if s.agentStore != nil {
-		// BUG-20260703 G1：持久化删除失败必须暴错（DB 的 agent_rules FK ON DELETE
-		// CASCADE 同时清掉其规则，落库失败=重启后 Agent 连同旧规则一起还魂）。
-		if err := s.agentStore.DeleteAgent(r.Context(), name); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + err.Error()})
-			return
+	var persistErr error
+	err := s.agentRouter.UnregisterPersisted(name, func(name, nextDefault string, wasDefault bool) error {
+		if s.agentStore == nil {
+			return nil
 		}
-		// BUG-20260703 G2：注销的是默认 Agent 时，内存重选的新默认（可能为空）必须
-		// 显式落库——不再依赖 LoadAll 兜底与 smallestAgentName 的巧合一致。
+		if atomicStore, ok := s.agentStore.(router.AtomicAgentUnregisterStore); ok {
+			persistErr = atomicStore.DeleteAgentAndSetDefault(r.Context(), name, nextDefault, wasDefault)
+			return persistErr
+		}
+		// A non-default deletion is one durable mutation and remains atomic through
+		// Store.DeleteAgent. Deleting the default requires reassignment in the same
+		// transaction; fail closed if this Store cannot provide that boundary.
 		if wasDefault {
-			if err := s.agentStore.SetDefault(r.Context(), s.agentRouter.DefaultAgent()); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化默认 Agent 失败: " + err.Error()})
-				return
-			}
+			persistErr = fmt.Errorf("agent store 不支持默认 Agent 原子注销")
+			return persistErr
 		}
+		persistErr = s.agentStore.DeleteAgent(r.Context(), name)
+		return persistErr
+	})
+	if err != nil {
+		if persistErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + persistErr.Error()})
+		} else {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Agent 已注销"})
 }
@@ -1211,16 +1276,21 @@ func (s *Server) handleSetDefaultAgent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误"})
 		return
 	}
-	if err := s.agentRouter.SetDefault(req.Name); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
-		return
-	}
-	if s.agentStore != nil {
-		// BUG-20260703 G1：默认 Agent 落库失败必须暴错，否则重启后默认悄然回退。
-		if err := s.agentStore.SetDefault(r.Context(), req.Name); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + err.Error()})
-			return
+	var persistErr error
+	err := s.agentRouter.SetDefaultPersisted(req.Name, func(name string) error {
+		if s.agentStore == nil {
+			return nil
 		}
+		persistErr = s.agentStore.SetDefault(r.Context(), name)
+		return persistErr
+	})
+	if err != nil {
+		if persistErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + persistErr.Error()})
+		} else {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
+		return
 	}
 	msg := "默认 Agent 已设置"
 	if req.Name == "" {
@@ -1341,12 +1411,21 @@ func (s *Server) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "无效的规则 ID"})
 		return
 	}
-	if err := s.agentRouter.RemoveRule(id); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+	var persistErr error
+	err := s.agentRouter.RemoveRulePersisted(id, func(id int) error {
+		if s.agentStore == nil {
+			return nil
+		}
+		persistErr = s.agentStore.DeleteRule(r.Context(), id)
+		return persistErr
+	})
+	if err != nil {
+		if persistErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "规则持久化删除失败: " + persistErr.Error()})
+		} else {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
 		return
-	}
-	if s.agentStore != nil {
-		_ = s.agentStore.DeleteRule(r.Context(), id)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "规则已删除"})
 }

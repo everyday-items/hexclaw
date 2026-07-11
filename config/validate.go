@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -127,6 +128,18 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// 6. LLM provider keep_alive 格式（仅 Ollama 本地生效；非法值此前直达 Ollama 才 400）
+	for name, p := range c.LLM.Providers {
+		if !IsValidKeepAlive(p.KeepAlive) {
+			errs = append(errs, &ValidationError{
+				Field:   fmt.Sprintf("llm.providers.%s.keep_alive", name),
+				Value:   p.KeepAlive,
+				Rule:    "Go duration（如 30m/2h/1h30m）、纯整数秒（如 3600）、0（立即卸载）或 -1（永久驻留）",
+				Suggest: "示例：\"30m\"、\"-1\"、\"0\"、\"3600\"；留空则用默认 30m",
+			})
+		}
+	}
+
 	if len(errs) > 0 {
 		return errs
 	}
@@ -162,6 +175,31 @@ func isValidTTSProvider(provider string, llmProviders map[string]LLMProviderConf
 	}
 	_, ok := llmProviders[prefix]
 	return ok
+}
+
+// IsValidKeepAlive 校验 Ollama keep_alive 取值格式（PUT /config/llm 边界 + 启动校验共用）。
+//
+// Ollama 接受的合法形态：
+//   - 空串 → 沿用 ai-core 请求级默认（30m），不下发
+//   - Go duration 字符串（如 "30m"/"2h"/"1h30m"/"90s"/"-1m"）
+//   - 纯整数秒（如 "3600"），含 0（立即卸载）与负数如 "-1"（永久驻留）
+//
+// 非法（家长手误）：如 "banana"/"30 m"/"3600x"/"12.5" —— 既非整数也非可解析 duration。
+// 此前全链零校验：非法值原样存盘、原样经 llmrouter 下发，直到 Ollama 首次聊天才 400。
+func IsValidKeepAlive(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return true
+	}
+	// 纯整数秒（含 0 / 负数），Ollama 语义：0 立即卸载、负数永久驻留。
+	if _, err := strconv.Atoi(s); err == nil {
+		return true
+	}
+	// Go duration（含带单位的负值如 "-1m"）。
+	if _, err := time.ParseDuration(s); err == nil {
+		return true
+	}
+	return false
 }
 
 func isValidAutonomyProfile(profile string) bool {

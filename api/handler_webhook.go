@@ -98,6 +98,12 @@ func (s *Server) handleRegisterWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.webhookMgr.Register(r.Context(), wh); err != nil {
+		if errors.Is(err, webhook.ErrWebhookExists) {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "同名 Webhook 已存在: " + wh.Name,
+			})
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "注册 Webhook 失败: " + err.Error(),
 		})

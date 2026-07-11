@@ -2,7 +2,8 @@ package config
 
 // DefaultConfig 返回安全的默认配置
 //
-// 默认配置采用功能优先：主要内置能力默认开启，安全/审批能力作为可配置治理层保留。
+// 默认配置开启主要内置能力，但默认关闭会直接在宿主机执行的 legacy code/shell；
+// 执行能力由 code_exec 沙箱提供，旧配置显式开启 legacy 开关时仍保持兼容。
 // 用户只需设置 LLM API Key 即可运行。
 func DefaultConfig() *Config {
 	return &Config{
@@ -75,10 +76,10 @@ func DefaultConfig() *Config {
 				Translate: true,
 				Summary:   true,
 				Browser:   true,
-				Code:      true, // 功能优先：默认开启代码能力
-				Shell:     true, // 功能优先：默认开启 shell 能力
-				CodeExec:  true, // 沙箱代码执行（Python/JS/Go），支持抓取网页、数据处理等
-				FileOps:   true, // 受限于 workspace，默认开启
+				Code:      false, // 裸宿主执行默认关闭；旧配置显式 true 仍兼容
+				Shell:     false, // 裸宿主执行默认关闭；旧配置显式 true 仍兼容
+				CodeExec:  true,  // 沙箱代码执行（Python/JS/Go），支持抓取网页、数据处理等
+				FileOps:   true,  // 受限于 workspace，默认开启
 				CodeExecPolicy: CodeExecPolicyConfig{
 					RequireApproval: boolPtr(false), // 功能优先：默认无需审批
 					Network:         boolPtr(true),  // 允许网络访问：抓取网页、调用 API

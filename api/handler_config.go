@@ -11,7 +11,9 @@ import (
 
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/engine"
+	"github.com/hexagon-codes/hexclaw/llmrouter"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
@@ -33,6 +35,7 @@ type LLMProviderConfigResponse struct {
 	ToolsEnabled *bool    `json:"tools_enabled,omitempty"`
 	MaxTools     int      `json:"max_tools,omitempty"`
 	Enabled      *bool    `json:"enabled,omitempty"`
+	KeepAlive    string   `json:"keep_alive,omitempty"`
 }
 
 // LLMConfigUpdateRequest PUT /api/v1/config/llm 请求
@@ -53,6 +56,7 @@ type LLMProviderConfigUpdateItem struct {
 	ToolsEnabled *bool    `json:"tools_enabled,omitempty"`
 	MaxTools     int      `json:"max_tools,omitempty"`
 	Enabled      *bool    `json:"enabled,omitempty"`
+	KeepAlive    string   `json:"keep_alive,omitempty"`
 }
 
 type llmConnectionTestProvider struct {
@@ -96,14 +100,13 @@ func effectiveLLMConfig(base config.LLMConfig, runtime llmConfigRuntime) config.
 }
 
 var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvider {
-	opts := []hexagon.OpenAIOption{}
-	if cfg.BaseURL != "" {
-		opts = append(opts, hexagon.OpenAIWithBaseURL(cfg.BaseURL))
-	}
-	if cfg.Model != "" {
-		opts = append(opts, hexagon.OpenAIWithModel(cfg.Model))
-	}
-	return hexagon.NewOpenAI(cfg.APIKey, opts...)
+	// 复用真实路由的类型感知工厂（ollama/anthropic 原生 / 其余 OpenAI 兼容），
+	// 消除「测试连接一律当 OpenAI 打」的协议漂移（契约#2）。
+	return llmrouter.NewProviderFromConfig(cfg.Type, config.LLMProviderConfig{
+		BaseURL: cfg.BaseURL,
+		APIKey:  cfg.APIKey,
+		Model:   cfg.Model,
+	})
 }
 
 // handleGetLLMConfig GET /api/v1/config/llm
@@ -126,6 +129,7 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 			ToolsEnabled: p.ToolsEnabled,
 			MaxTools:     p.MaxTools,
 			Enabled:      p.Enabled,
+			KeepAlive:    p.KeepAlive,
 		}
 	}
 
@@ -148,6 +152,17 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 			"error": "请求格式错误: " + err.Error(),
 		})
 		return
+	}
+
+	// keep_alive 边界校验（C4）：非法值此前原样存盘 + 原样经 llmrouter 下发，直到 Ollama
+	// 首次聊天才 400。非事务路径（flag OFF）完全跳过 Config.Validate，故在此显式兜底。
+	for name, p := range req.Providers {
+		if !config.IsValidKeepAlive(p.KeepAlive) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("provider %q 的 keep_alive=%q 非法：应为 Go duration（如 30m/2h）、纯整数秒（如 3600）、0 或 -1", name, p.KeepAlive),
+			})
+			return
+		}
 	}
 
 	// cfgMu 串行 read-copy-save-apply（GO-7）：与其它配置写 handler 的浅拷贝读/
@@ -178,6 +193,7 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 				ToolsEnabled: p.ToolsEnabled,
 				MaxTools:     p.MaxTools,
 				Enabled:      p.Enabled, // 禁用态持久化；Key 经脱敏回传保留（IsMaskedKey 分支）
+				KeepAlive:    p.KeepAlive,
 			}
 		}
 		nextLLM.Providers = newProviders
@@ -318,6 +334,7 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 	})
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
+	ctx = egress.WithRequest(ctx, egress.PurposeProviderProbe, "", egress.ClassGeneral)
 
 	start := time.Now()
 	_, err := provider.Complete(ctx, hexagon.CompletionRequest{

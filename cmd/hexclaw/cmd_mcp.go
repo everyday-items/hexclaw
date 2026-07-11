@@ -10,6 +10,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/skill/hub"
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
 func newMCPCmd() *cobra.Command {
@@ -76,15 +77,19 @@ func newMCPSearchCmd() *cobra.Command {
 			tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(tw, "NAME\tDESCRIPTION\tCATEGORY")
 			for _, s := range results {
-				desc := s.Description
-				if len(desc) > 50 {
-					desc = desc[:47] + "..."
-				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\n", s.Name, desc, s.Category)
+				fmt.Fprintf(tw, "%s\t%s\t%s\n", s.Name, truncateDesc(s.Description), s.Category)
 			}
 			return tw.Flush()
 		},
 	}
+}
+
+// truncateDesc 截断 MCP 描述用于表格展示（rune-safe，避免 CJK 字节切断乱码 AP-141）。
+func truncateDesc(s string) string {
+	if len(s) > 50 {
+		return stringx.TruncateBytes(s, 47, "...")
+	}
+	return s
 }
 
 func newMCPInstallCmd() *cobra.Command {

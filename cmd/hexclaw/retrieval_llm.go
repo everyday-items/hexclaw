@@ -27,6 +27,7 @@ var errRetrievalAuxSkippedLocal = errors.New("knowledge: 辅助 LLM 跳过——
 // 无自争用，照常启用。与 rag_aux_llm.go 的预算+熔断是同一「增强绝不阻塞主路径」纪律的互补一环。
 func newRetrievalRerankLLM(router retrievalRouter) knowledge.RerankLLMFunc {
 	return func(ctx context.Context, prompt string) (string, error) {
+		ctx = ragEnrichEgressContext(ctx)
 		provider, name, rErr := router.Route(ctx)
 		if rErr != nil {
 			return "", rErr

@@ -31,12 +31,15 @@ func TestDefaultConfig(t *testing.T) {
 		t.Errorf("Autonomy profile 应默认 function_first，得到 %q", cfg.Security.Autonomy.Profile)
 	}
 
-	// 功能优先：代码与 shell 能力默认开启
-	if !cfg.Skill.Builtin.Code {
-		t.Error("Code Skill 应默认开启")
+	// 裸宿主执行默认关闭；仅沙箱 code_exec 默认开启。
+	if cfg.Skill.Builtin.Code {
+		t.Error("Code Skill 应默认关闭")
 	}
-	if !cfg.Skill.Builtin.Shell {
-		t.Error("Shell Skill 应默认开启")
+	if cfg.Skill.Builtin.Shell {
+		t.Error("Shell Skill 应默认关闭")
+	}
+	if !cfg.Skill.Builtin.CodeExec {
+		t.Error("CodeExec Skill 应默认开启")
 	}
 
 	// Web UI 默认开启
@@ -109,6 +112,22 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if cfg.Heartbeat.IntervalMins != 15 {
 		t.Errorf("期望 IntervalMins=15，得到 %d", cfg.Heartbeat.IntervalMins)
+	}
+}
+
+func TestLoad_LegacyExplicitHostExecutionFlagsRemainCompatible(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hexclaw.yaml")
+	if err := os.WriteFile(path, []byte("skill:\n  builtin:\n    code: true\n    shell: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load explicit legacy flags: %v", err)
+	}
+	if !cfg.Skill.Builtin.Code || !cfg.Skill.Builtin.Shell {
+		t.Fatalf("explicit legacy flags lost: code=%v shell=%v", cfg.Skill.Builtin.Code, cfg.Skill.Builtin.Shell)
 	}
 }
 

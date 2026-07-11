@@ -26,6 +26,11 @@ const (
 	stateKeyNodeOutputs    = "__workflow_node_outputs"
 	stateKeyNodeHandoffs   = "__workflow_node_handoffs"
 	stateKeyWorkflowOutput = "__workflow_output"
+	// C6 condition 分支：deadNodes 记录被 condition 分支停用/跳过的节点；deactivatedEdges
+	// 记录被 condition 判定为未选中的出边（"source|target"）。节点在拓扑序被求值时，若其
+	// 所有入边都不 live（源节点已 dead 或该入边被停用）则整枝跳过——实现按条件的分支路由。
+	stateKeyDeadNodes        = "__workflow_dead_nodes"
+	stateKeyDeactivatedEdges = "__workflow_deactivated_edges"
 )
 
 type RunWorkflowRequest struct {
@@ -128,10 +133,12 @@ func (e *workflowExecutor) execute(ctx context.Context, run *WorkflowRun) *Workf
 	}
 
 	state := hexagon.MapState{
-		stateKeyInput:          e.req.Input,
-		stateKeyNodeOutputs:    map[string]string{},
-		stateKeyNodeHandoffs:   map[string]string{},
-		stateKeyWorkflowOutput: "",
+		stateKeyInput:            e.req.Input,
+		stateKeyNodeOutputs:      map[string]string{},
+		stateKeyNodeHandoffs:     map[string]string{},
+		stateKeyWorkflowOutput:   "",
+		stateKeyDeadNodes:        map[string]string{},
+		stateKeyDeactivatedEdges: map[string]string{},
 	}
 
 	result, err := g.Run(ctx, state)
@@ -328,6 +335,13 @@ func (e *workflowExecutor) executeNode(ctx context.Context, state hexagon.MapSta
 		return state, nil
 	}
 
+	// C6：若本节点所有入边都因上游 condition 分支未选中而失效，则整枝跳过（不执行、不产出）。
+	// 根节点（无入边）与至少有一条 live 入边的节点正常执行。
+	if e.nodeDeactivatedByBranch(state, node) {
+		e.markNodeSkipped(node, "")
+		return e.markNodeDead(state, node.ID), nil
+	}
+
 	e.markNodeStart(node)
 	inputText := e.resolveNodeInput(state, node)
 
@@ -347,7 +361,7 @@ func (e *workflowExecutor) executeNode(ctx context.Context, state hexagon.MapSta
 		agentRole = firstNonEmpty(stringValue(node.Data["role"]), stringValue(node.Data["agent"]), selected)
 		if selected != "" && agentRole != "" && agentRole != selected {
 			e.markNodeSkipped(node, agentRole)
-			return state, nil
+			return e.markNodeDead(state, node.ID), nil
 		}
 		output, err = e.executeAgent(ctx, node, inputText, agentRole)
 
@@ -366,6 +380,11 @@ func (e *workflowExecutor) executeNode(ctx context.Context, state hexagon.MapSta
 	case "output":
 		output = inputText
 		state = setStringStateValue(state, stateKeyWorkflowOutput, output)
+
+	case "condition":
+		// C6：求值条件表达式，选择激活分支，停用未选中的出边（其下游整枝跳过）。
+		// output 透传 inputText 给激活分支；条件配置非法时显式失败而非静默直通。
+		state, output, err = e.executeCondition(state, node, inputText)
 
 	default:
 		output = inputText
@@ -749,6 +768,9 @@ func mergeWorkflowStates(original hexagon.MapState, outputs []hexagon.MapState) 
 	merged := original.Clone().(hexagon.MapState)
 	combinedOutputs := stringMapStateValue(merged, stateKeyNodeOutputs)
 	combinedHandoffs := stringMapStateValue(merged, stateKeyNodeHandoffs)
+	// C6：并行分支各自可能停用不同出边/标记不同死节点，合并时取并集。
+	combinedDead := stringMapStateValue(merged, stateKeyDeadNodes)
+	combinedDeadEdges := stringMapStateValue(merged, stateKeyDeactivatedEdges)
 	var workflowOutputs []string
 
 	for _, out := range outputs {
@@ -758,6 +780,12 @@ func mergeWorkflowStates(original hexagon.MapState, outputs []hexagon.MapState) 
 		for k, v := range stringMapStateValue(out, stateKeyNodeHandoffs) {
 			combinedHandoffs[k] = v
 		}
+		for k, v := range stringMapStateValue(out, stateKeyDeadNodes) {
+			combinedDead[k] = v
+		}
+		for k, v := range stringMapStateValue(out, stateKeyDeactivatedEdges) {
+			combinedDeadEdges[k] = v
+		}
 		if v := stringStateValue(out, stateKeyWorkflowOutput); v != "" {
 			workflowOutputs = append(workflowOutputs, v)
 		}
@@ -765,6 +793,8 @@ func mergeWorkflowStates(original hexagon.MapState, outputs []hexagon.MapState) 
 
 	merged.Set(stateKeyNodeOutputs, combinedOutputs)
 	merged.Set(stateKeyNodeHandoffs, combinedHandoffs)
+	merged.Set(stateKeyDeadNodes, combinedDead)
+	merged.Set(stateKeyDeactivatedEdges, combinedDeadEdges)
 	if len(workflowOutputs) > 0 {
 		merged.Set(stateKeyWorkflowOutput, strings.Join(workflowOutputs, "\n\n"))
 	}
@@ -776,12 +806,24 @@ func stringMapStateValue(state hexagon.MapState, key string) map[string]string {
 		return map[string]string{}
 	}
 	raw, _ := state.Get(key)
-	src, _ := raw.(map[string]string)
-	dst := make(map[string]string, len(src))
-	for k, v := range src {
-		dst[k] = v
+	// graph 的 deepCopy 在跨 stage/并行 clone 时把 map[string]string JSON 往返成
+	// map[string]any，故两种类型都要容忍（否则跨 stage 后读取恒空——C6 分支状态丢失根因）。
+	switch src := raw.(type) {
+	case map[string]string:
+		dst := make(map[string]string, len(src))
+		for k, v := range src {
+			dst[k] = v
+		}
+		return dst
+	case map[string]any:
+		dst := make(map[string]string, len(src))
+		for k, v := range src {
+			dst[k] = stringValue(v)
+		}
+		return dst
+	default:
+		return map[string]string{}
 	}
-	return dst
 }
 
 func putStringMapStateValue(state hexagon.MapState, key, entryKey, entryValue string) hexagon.MapState {

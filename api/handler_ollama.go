@@ -204,18 +204,76 @@ func (s *Server) handleOllamaUnload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "unloaded"})
 }
 
+// defaultWarmupKeepAlive 预热请求默认驻留时长——与 ai-core 请求级默认（defaultKeepAlive="30m"）
+// 一致：预热 5m 而真实对话 30m 会让预热模型在 5~30min 空窗期提前卸载，首条消息仍走冷路径。
+const defaultWarmupKeepAlive = "30m"
+
+// warmupNumCtxTiers 镜像 ai-core llm/ollama 的 numCtxTiers（该表未导出）。真实对话经
+// ai-core 自动分档：标准桌面聊天（SOUL + 操作手册 + 工具 schema ≈8k token）稳态落在 8192
+// 档（真机取证 ctx 4096→8192）。
+var warmupNumCtxTiers = []int{4096, 8192, 16384, 32768}
+
+// defaultWarmupNumCtx 预热请求默认 num_ctx：与真实对话稳态一致。AP-206 核心不变量——
+// 预热请求的 runner-affecting 参数（num_ctx）必须与真实对话一致，否则首条消息触发 runner
+// 重载、预热白做。
+const defaultWarmupNumCtx = 8192
+
+// resolveWarmupNumCtx 请求显式 num_ctx 优先（>0 原样生效，供前端下发与真实对话一致的档位），
+// 否则回落到稳态默认档 8192（ai-core 分档表中的档位之一）。
+func resolveWarmupNumCtx(reqNumCtx int) int {
+	if reqNumCtx > 0 {
+		return reqNumCtx
+	}
+	return defaultWarmupNumCtx
+}
+
+// resolveOllamaKeepAlive 取 Ollama provider 配置的 keep_alive（与真实对话下发值一致），
+// 未配置时回落到与 ai-core 请求级默认一致的 30m。
+func (s *Server) resolveOllamaKeepAlive() string {
+	if s.cfg != nil {
+		for name, p := range s.cfg.LLM.Providers {
+			lower := strings.ToLower(name)
+			if lower == "ollama" || strings.Contains(strings.ToLower(p.BaseURL), "localhost:11434") {
+				if ka := strings.TrimSpace(p.KeepAlive); ka != "" {
+					return ka
+				}
+			}
+		}
+	}
+	return defaultWarmupKeepAlive
+}
+
+// buildOllamaLoadBody 构造 /api/generate 预热请求体。
+//
+// AP-206 核心不变量：预热请求的 runner-affecting 参数（num_ctx）必须与真实对话一致，
+// 否则真实对话经 ai-core 带分档 num_ctx（如 8192）时 Ollama 重载 runner，预热白做。
+func buildOllamaLoadBody(model string, numCtx int, keepAlive string) []byte {
+	payload := map[string]any{
+		"model":      model,
+		"prompt":     "",
+		"keep_alive": keepAlive,
+	}
+	if numCtx > 0 {
+		payload["options"] = map[string]any{"num_ctx": numCtx}
+	}
+	b, _ := json.Marshal(payload)
+	return b
+}
+
 // handleOllamaLoad 预热模型到内存
 //
-// POST /api/v1/ollama/load  Body: {"model": "qwen3:8b"}
+// POST /api/v1/ollama/load  Body: {"model": "qwen3:8b", "num_ctx": 8192}
+// num_ctx 可选：前端可下发与真实对话一致的档位；缺省时回落稳态默认档。
 func (s *Server) handleOllamaLoad(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Model string `json:"model"`
+		Model  string `json:"model"`
+		NumCtx int    `json:"num_ctx,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Model == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "model is required"})
 		return
 	}
-	loadBody, _ := json.Marshal(map[string]any{"model": req.Model, "prompt": "", "keep_alive": "5m"})
+	loadBody := buildOllamaLoadBody(req.Model, resolveWarmupNumCtx(req.NumCtx), s.resolveOllamaKeepAlive())
 	client := httpx.RawClient(httpx.WithRawTimeout(30 * time.Second))
 	resp, err := client.Post("http://localhost:11434/api/generate", "application/json", bytes.NewReader(loadBody))
 	if err != nil {

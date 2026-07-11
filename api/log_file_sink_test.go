@@ -110,8 +110,7 @@ func TestLogFileSink_ConcurrentWrites(t *testing.T) {
 
 	// Should not panic or lose the file handle
 	if sink.file == nil {
-		// It's ok if file is nil only if it was rotated and reopened
-		// The key test is that we didn't panic
+		t.Error("concurrent writes lost the file handle")
 	}
 }
 

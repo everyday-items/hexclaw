@@ -224,6 +224,68 @@ func TestServer_ChatForwardsMetadataAndRequestID(t *testing.T) {
 	}
 }
 
+func TestServer_ChatForwardsValidatedSamplingOverrides(t *testing.T) {
+	cfg := config.DefaultConfig()
+	eng := &mockEngine{reply: &adapter.Reply{Content: "收到"}}
+	srv := NewServer(cfg, eng, nil, nil)
+
+	// 显式字段必须覆盖同名内部 metadata；temperature=0 不能被当成未设置吞掉。
+	body := `{"message":"你好","temperature":0,"max_tokens":128,"metadata":{"request_temperature":"1.9","request_max_tokens":"999","agent_temperature":"1.8","agent_max_tokens":"888"}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d, body: %s", w.Code, w.Body.String())
+	}
+	if eng.lastMsg == nil {
+		t.Fatal("引擎未收到消息")
+	}
+	if got := eng.lastMsg.Metadata["request_temperature"]; got != "0" {
+		t.Fatalf("temperature 未端到端透传，实际 %q", got)
+	}
+	if got := eng.lastMsg.Metadata["request_max_tokens"]; got != "128" {
+		t.Fatalf("max_tokens 未端到端透传，实际 %q", got)
+	}
+	if _, ok := eng.lastMsg.Metadata["agent_temperature"]; ok {
+		t.Fatal("外部 metadata 不得伪造可信 Agent temperature")
+	}
+	if _, ok := eng.lastMsg.Metadata["agent_max_tokens"]; ok {
+		t.Fatal("外部 metadata 不得伪造可信 Agent max_tokens")
+	}
+}
+
+func TestServer_ChatRejectsInvalidSamplingOverrides(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "temperature below range", body: `{"message":"你好","temperature":-0.1}`},
+		{name: "temperature above range", body: `{"message":"你好","temperature":2.1}`},
+		{name: "max tokens zero", body: `{"message":"你好","max_tokens":0}`},
+		{name: "max tokens negative", body: `{"message":"你好","max_tokens":-1}`},
+		{name: "max tokens excessive", body: `{"message":"你好","max_tokens":1000001}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := &mockEngine{reply: &adapter.Reply{Content: "不应调用"}}
+			srv := NewServer(config.DefaultConfig(), eng, nil, nil)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", strings.NewReader(tc.body))
+			w := httptest.NewRecorder()
+
+			srv.handleChat(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("期望 400，实际 %d, body: %s", w.Code, w.Body.String())
+			}
+			if eng.calls != 0 {
+				t.Fatalf("非法采样参数仍调用引擎 %d 次", eng.calls)
+			}
+		})
+	}
+}
+
 func TestServer_ChatReturnsUnderlyingErrorMessage(t *testing.T) {
 	cfg := config.DefaultConfig()
 	eng := &mockEngine{err: context.DeadlineExceeded}

@@ -316,6 +316,9 @@ type LLMProviderConfig struct {
 	ToolsEnabled *bool    `yaml:"tools_enabled,omitempty"` // 是否启用工具注入（nil=自动判断, true=强制开启, false=强制关闭）
 	MaxTools     int      `yaml:"max_tools,omitempty"`     // 最大注入工具数（0=不限制）
 	Enabled      *bool    `yaml:"enabled,omitempty"`       // 是否启用（nil/true=启用, false=禁用但保留配置/Key，不参与路由）
+	// KeepAlive 本地模型驻留时长(仅 Ollama 生效,如 "5m"/"30m";空=ai-core 默认 30m)。
+	// BUG-20260710:16GB 机器 9B 模型驻留≈7GB,可调短换内存。
+	KeepAlive string `yaml:"keep_alive,omitempty" json:"keep_alive,omitempty"`
 }
 
 // LLMRoutingConfig 智能路由配置
@@ -335,18 +338,24 @@ type LLMCacheConfig struct {
 // PlatformsConfig 平台适配配置
 //
 // 除 Web 外，所有平台均支持多实例（slice），同一平台可配置多个 Bot。
+//
+// ⚠️ 运行时真相源是「连接中心」(platform_instances DB，含加密凭据)——此处 yaml im.*
+// 仅作**首次 seed**（instances.SeedFromConfig 在 DB 已有任意实例时直接 return，不回写、
+// 不清库）。故各平台 slice 均 omitempty：空平台不序列化，避免 config Save 后 yaml 出现
+// `dingtalk: []` 之类误导信号（用户已在连接中心配了钉钉，yaml 却显示空数组=以为没配）。
+// 见 BUG-20260711 + config/bug_20260711_im_seed_omitempty_test.go。
 type PlatformsConfig struct {
-	Feishu   []FeishuConfig   `yaml:"feishu"`
-	Dingtalk []DingtalkConfig `yaml:"dingtalk"`
-	Wecom    []WecomConfig    `yaml:"wecom"`
-	Slack    []SlackConfig    `yaml:"slack"`
-	Discord  []DiscordConfig  `yaml:"discord"`
-	Telegram []TelegramConfig `yaml:"telegram"`
-	Wechat   []WechatConfig   `yaml:"wechat"`
+	Feishu   []FeishuConfig   `yaml:"feishu,omitempty"`
+	Dingtalk []DingtalkConfig `yaml:"dingtalk,omitempty"`
+	Wecom    []WecomConfig    `yaml:"wecom,omitempty"`
+	Slack    []SlackConfig    `yaml:"slack,omitempty"`
+	Discord  []DiscordConfig  `yaml:"discord,omitempty"`
+	Telegram []TelegramConfig `yaml:"telegram,omitempty"`
+	Wechat   []WechatConfig   `yaml:"wechat,omitempty"`
 	Web      WebConfig        `yaml:"web"`
-	WhatsApp []WhatsAppConfig `yaml:"whatsapp"`
-	LINE     []LINEConfig     `yaml:"line"`
-	Matrix   []MatrixConfig   `yaml:"matrix"`
+	WhatsApp []WhatsAppConfig `yaml:"whatsapp,omitempty"`
+	LINE     []LINEConfig     `yaml:"line,omitempty"`
+	Matrix   []MatrixConfig   `yaml:"matrix,omitempty"`
 }
 
 // UnmarshalYAML 实现向后兼容的 YAML 解析

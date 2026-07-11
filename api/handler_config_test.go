@@ -133,7 +133,7 @@ func TestHandleGetLLMConfig_UsesRuntimeActiveConfig(t *testing.T) {
 	runtimeCfg := config.LLMConfig{
 		Default: "智谱",
 		Providers: map[string]config.LLMProviderConfig{
-			"智谱": {APIKey: "sk-zhipu", BaseURL: "https://open.bigmodel.cn/api/paas/v4", Model: "glm-5"},
+			"智谱": {APIKey: "sk-zhipu", BaseURL: "https://open.bigmodel.cn/api/paas/v4", Model: "glm-5", KeepAlive: "15m"},
 		},
 	}
 
@@ -160,6 +160,17 @@ func TestHandleGetLLMConfig_UsesRuntimeActiveConfig(t *testing.T) {
 	if _, ok := resp.Providers["openai"]; ok {
 		t.Fatalf("不应回退到磁盘配置，实际 %+v", resp.Providers)
 	}
+	var wire struct {
+		Providers map[string]struct {
+			KeepAlive string `json:"keep_alive"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &wire); err != nil {
+		t.Fatalf("解析 wire 响应失败: %v", err)
+	}
+	if wire.Providers["智谱"].KeepAlive != "15m" {
+		t.Fatalf("GET 丢失 keep_alive，实际响应 %s", w.Body.String())
+	}
 }
 
 func TestHandleUpdateLLMConfig_HotReloadsAndPersists(t *testing.T) {
@@ -177,7 +188,7 @@ func TestHandleUpdateLLMConfig_HotReloadsAndPersists(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/config/llm", strings.NewReader(`{
 		"default":"智谱",
 		"providers":{
-			"智谱":{"api_key":"sk-zhipu","base_url":"https://open.bigmodel.cn/api/paas/v4","model":"glm-5","compatible":"openai"}
+			"智谱":{"api_key":"sk-zhipu","base_url":"https://open.bigmodel.cn/api/paas/v4","model":"glm-5","compatible":"openai","keep_alive":"5m"}
 		}
 	}`))
 	w := httptest.NewRecorder()
@@ -192,6 +203,9 @@ func TestHandleUpdateLLMConfig_HotReloadsAndPersists(t *testing.T) {
 	if eng.activeLLM.Default != "智谱" {
 		t.Fatalf("引擎未热更新到新默认 provider，实际 %q", eng.activeLLM.Default)
 	}
+	if eng.activeLLM.Providers["智谱"].KeepAlive != "5m" {
+		t.Fatalf("引擎热更新丢失 keep_alive，实际 %+v", eng.activeLLM.Providers["智谱"])
+	}
 	if srv.cfg.LLM.Default != "智谱" {
 		t.Fatalf("服务端内存配置未更新，实际 %q", srv.cfg.LLM.Default)
 	}
@@ -202,7 +216,7 @@ func TestHandleUpdateLLMConfig_HotReloadsAndPersists(t *testing.T) {
 		t.Fatalf("读取持久化配置失败: %v", err)
 	}
 	content := string(data)
-	if !strings.Contains(content, "glm-5") || !strings.Contains(content, "智谱") {
+	if !strings.Contains(content, "glm-5") || !strings.Contains(content, "智谱") || !strings.Contains(content, "keep_alive: 5m") {
 		t.Fatalf("配置文件未写入新 provider: %s", content)
 	}
 }

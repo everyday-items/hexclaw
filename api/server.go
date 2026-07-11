@@ -674,6 +674,7 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("GET /api/v1/mcp/servers", s.handleListMCPServers)
 		mux.HandleFunc("POST /api/v1/mcp/servers", s.handleAddMCPServer)
 		mux.HandleFunc("DELETE /api/v1/mcp/servers/{name}", s.handleRemoveMCPServer)
+		mux.HandleFunc("POST /api/v1/mcp/servers/{name}/restart", s.handleRestartMCPServer) // M3-20260710
 		mux.HandleFunc("POST /api/v1/mcp/tools/call", s.handleCallMCPTool)
 		mux.HandleFunc("GET /api/v1/mcp/status", s.handleMCPStatus)
 	} else {
@@ -961,6 +962,8 @@ type ChatRequest struct {
 	Attachments []adapter.Attachment `json:"attachments,omitempty"` // 图片附件列表（可选）
 	Metadata    map[string]string    `json:"metadata,omitempty"`    // 请求级元数据（如 thinking/memory）
 	RequestID   string               `json:"request_id,omitempty"`  // 客户端请求 ID（用于幂等/流式恢复关联）
+	Temperature *float64             `json:"temperature,omitempty"` // 本次请求温度；nil=跟随 Agent/模型默认，0=确定性
+	MaxTokens   *int                 `json:"max_tokens,omitempty"`  // 本次请求最大输出 token；nil=跟随 Agent/模型默认
 }
 
 // ChatResponse 聊天回复
@@ -971,6 +974,9 @@ type ChatResponse struct {
 	Usage     *adapter.Usage     `json:"usage,omitempty"`      // Token 使用统计
 	ToolCalls []adapter.ToolCall `json:"tool_calls,omitempty"` // 工具调用记录
 	Blocks    []adapter.Block    `json:"blocks,omitempty"`     // 有序内容块（多步交错按序渲染）
+	// U9：结构化 RAG/记忆命中（非空时前端渲染「知识库命中」「记忆命中」标签+详情）。
+	KnowledgeHits []adapter.KnowledgeHit `json:"knowledge_hits,omitempty"`
+	MemoryHits    []adapter.MemoryHit    `json:"memory_hits,omitempty"`
 }
 
 // handleChat 同步聊天端点
@@ -1046,6 +1052,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// GO-3：外部聊天入口是信任边界——剥除只能由受信内部派发器盖章的保留键，
 	// 否则客户端可伪造 source=cron + cron_job_id 盗用他人任务的授权（提权）。
 	engine.StripReservedDispatchMetadata(msg.Metadata)
+	if err := adapter.ApplyRequestSamplingOverrides(msg.Metadata, req.Temperature, req.MaxTokens); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	if req.RequestID != "" {
 		msg.Metadata["request_id"] = req.RequestID
 	}
@@ -1126,6 +1136,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		var usage *adapter.Usage
 		var toolCalls []adapter.ToolCall
 		var blocks []adapter.Block
+		var knowledgeHits []adapter.KnowledgeHit
+		var memoryHits []adapter.MemoryHit
 		for chunk := range chunks {
 			if chunk.Error != nil {
 				trace.L(ctx).Error("处理失败", "err", chunk.Error)
@@ -1140,6 +1152,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				usage = chunk.Usage
 				toolCalls = chunk.ToolCalls
 				blocks = chunk.Blocks
+				knowledgeHits = chunk.KnowledgeHits // U9：命中结构化透出
+				memoryHits = chunk.MemoryHits
 			}
 		}
 		trace.L(ctx).Info("流式消费完成", "content_len", content.Len())
@@ -1147,11 +1161,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// 覆盖 <think>/<thinking>/<reasoning> 三种标签、任意位置（含中间嵌入）、多段、未闭合残段
 		finalContent := engine.StripAllThinking(content.String())
 		reply = &adapter.Reply{
-			Content:   finalContent,
-			Metadata:  metadata,
-			Usage:     usage,
-			ToolCalls: toolCalls,
-			Blocks:    blocks,
+			Content:       finalContent,
+			Metadata:      metadata,
+			Usage:         usage,
+			ToolCalls:     toolCalls,
+			Blocks:        blocks,
+			KnowledgeHits: knowledgeHits,
+			MemoryHits:    memoryHits,
 		}
 	} else {
 		var err error
@@ -1169,12 +1185,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	// 返回响应
 	writeJSON(w, http.StatusOK, ChatResponse{
-		Reply:     reply.Content,
-		SessionID: msg.SessionID,
-		Metadata:  reply.Metadata,
-		Usage:     reply.Usage,
-		ToolCalls: reply.ToolCalls,
-		Blocks:    reply.Blocks,
+		Reply:         reply.Content,
+		SessionID:     msg.SessionID,
+		Metadata:      reply.Metadata,
+		Usage:         reply.Usage,
+		ToolCalls:     reply.ToolCalls,
+		Blocks:        reply.Blocks,
+		KnowledgeHits: reply.KnowledgeHits,
+		MemoryHits:    reply.MemoryHits,
 	})
 }
 

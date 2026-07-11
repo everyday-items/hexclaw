@@ -8,6 +8,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/mcp"
 )
 
 // --- MCP API Tests ---
@@ -173,4 +174,32 @@ func TestHandleAddMCPServer_TransportAutoDetect(t *testing.T) {
 	}()
 	srv.handleAddMCPServer(w, req)
 	// If we get here without panic, auto-detect worked through validation
+}
+
+// M3-20260710：restart 端点契约——name 空 400 / mcp 未启用 503 / 未配置 404。
+func TestHandleRestartMCPServer_Contract(t *testing.T) {
+	srv := &Server{}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/mcp/servers//restart", nil)
+	srv.handleRestartMCPServer(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("空 name 期望 400，实际 %d", w.Code)
+	}
+
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/mcp/servers/x/restart", nil)
+	req.SetPathValue("name", "x")
+	srv.handleRestartMCPServer(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("mcp 未启用期望 503，实际 %d", w.Code)
+	}
+
+	srv2 := &Server{mcpMgr: mcp.NewManager()}
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/mcp/servers/ghost/restart", nil)
+	req.SetPathValue("name", "ghost")
+	srv2.handleRestartMCPServer(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("未配置期望 404，实际 %d", w.Code)
+	}
 }
