@@ -23,6 +23,8 @@ jobs:
   eval-gate:
     name: K12 Eval Gate
     runs-on: ubuntu-latest
+    env:
+      HAS_REAL_LLM_EVAL_KEY: ${{ secrets.HEXCLAW_LLM_EVAL_KEY != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -44,7 +46,7 @@ jobs:
 
       # 真模型批改准确率 ≥90% 门：仅当配置了 LLM eval secret 才激活（否则内部自动 skip）。
       - name: K12 real-model accuracy gate (opt-in)
-        if: ${{ secrets.HEXCLAW_LLM_EVAL_KEY != '' }}
+        if: ${{ env.HAS_REAL_LLM_EVAL_KEY == 'true' }}
         run: go test -count=1 -timeout 900s -run TestK12EvalGate_RealModel -v ./scenarios/k12/usecase/
         env:
           GOPRIVATE: github.com/hexagon-codes/*
