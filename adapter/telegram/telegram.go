@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,14 +26,26 @@ import (
 
 const baseURL = "https://api.telegram.org/bot"
 
+const maxTelegramErrorBodyBytes = 64 << 10
+
 // TelegramAdapter Telegram Bot 适配器
 type TelegramAdapter struct {
-	cfg     config.TelegramConfig
-	handler adapter.MessageHandler
-	client  *http.Client
-	queue   *adapter.SendQueue
-	offset  atomic.Int64 // 长轮询偏移量
-	stopped atomic.Bool
+	cfg           config.TelegramConfig
+	handler       adapter.MessageHandler
+	client        *http.Client
+	queue         *adapter.SendQueue
+	offset        atomic.Int64 // 长轮询偏移量
+	stopped       atomic.Bool
+	stopCh        chan struct{}
+	stopOnce      sync.Once
+	pollCtx       context.Context
+	pollCancel    context.CancelFunc
+	loopWG        sync.WaitGroup
+	handlerWG     sync.WaitGroup
+	loopWaiter    adapter.LifecycleWaiter
+	handlerWaiter adapter.LifecycleWaiter
+	handlerCtx    context.Context
+	handlerCancel context.CancelFunc
 	// v0.4.0 E5：Start 收到的 ctx，仅作 logger/trace 链路源头使用；
 	// 实际异步 handler 处理用 trace.Detach(baseCtx) 派生新 ctx，避免被父 cancel 杀死。
 	baseCtx context.Context
@@ -40,9 +53,13 @@ type TelegramAdapter struct {
 
 // New 创建 Telegram 适配器
 func New(cfg config.TelegramConfig) *TelegramAdapter {
+	handlerCtx, handlerCancel := context.WithCancel(context.Background())
 	a := &TelegramAdapter{
-		cfg:    cfg,
-		client: httpx.RawClient(httpx.WithRawTimeout(40 * time.Second)),
+		cfg:           cfg,
+		client:        httpx.RawClient(httpx.WithRawTimeout(40 * time.Second)),
+		stopCh:        make(chan struct{}),
+		handlerCtx:    handlerCtx,
+		handlerCancel: handlerCancel,
 	}
 	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformTelegram, a.sendMessageNow)
 	return a
@@ -59,23 +76,60 @@ func (a *TelegramAdapter) Platform() adapter.Platform { return adapter.PlatformT
 // Start 启动长轮询
 func (a *TelegramAdapter) Start(ctx context.Context, handler adapter.MessageHandler) error {
 	a.handler = handler
-	a.stopped.Store(false)
+	if a.stopped.Swap(false) {
+		a.stopCh = make(chan struct{})
+		a.stopOnce = sync.Once{}
+	}
 	// v0.4.0 E5：保留 Start ctx，handleMessage 用 Detach 派生异步处理 ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	a.baseCtx = ctx
+	a.pollCtx, a.pollCancel = context.WithCancel(ctx)
+	if a.handlerCtx == nil || a.handlerCtx.Err() != nil {
+		a.handlerCtx, a.handlerCancel = context.WithCancel(context.Background())
+	}
+	a.loopWaiter.Reset()
+	a.handlerWaiter.Reset()
 
-	go a.pollLoop()
+	a.loopWG.Add(1)
+	go func() {
+		defer a.loopWG.Done()
+		a.pollLoop()
+	}()
 	logger.Info("Telegram 适配器已启动（长轮询模式）")
 	return nil
 }
 
 // Stop 停止长轮询
-func (a *TelegramAdapter) Stop(_ context.Context) error {
+func (a *TelegramAdapter) Stop(ctx context.Context) error {
 	a.stopped.Store(true)
-	if a.queue != nil {
-		_ = a.queue.Stop(context.Background())
+	if a.pollCancel != nil {
+		a.pollCancel()
+	}
+	if a.handlerCancel != nil {
+		a.handlerCancel()
+	}
+	a.stopOnce.Do(func() { close(a.stopCh) })
+	stopQueue := func() error {
+		if a.queue != nil {
+			return a.queue.Stop(ctx)
+		}
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := a.loopWaiter.Wait(ctx, &a.loopWG); err != nil {
+		_ = stopQueue()
+		return err
+	}
+	if err := a.handlerWaiter.Wait(ctx, &a.handlerWG); err != nil {
+		_ = stopQueue()
+		return err
+	}
+	if err := stopQueue(); err != nil {
+		return err
 	}
 	logger.Info("Telegram 适配器已停止")
 	return nil
@@ -213,7 +267,11 @@ func (a *TelegramAdapter) pollLoop() {
 		if err != nil {
 			if !a.stopped.Load() {
 				logger.Error("Telegram: 获取更新失败", "error", err)
-				time.Sleep(3 * time.Second)
+				select {
+				case <-a.stopCh:
+					return
+				case <-time.After(3 * time.Second):
+				}
 			}
 			continue
 		}
@@ -221,7 +279,11 @@ func (a *TelegramAdapter) pollLoop() {
 		for _, update := range updates {
 			a.offset.Store(int64(update.UpdateID) + 1)
 			if update.Message != nil && update.Message.Text != "" {
-				go a.handleMessage(update.Message)
+				a.handlerWG.Add(1)
+				go func(message *tgMessage) {
+					defer a.handlerWG.Done()
+					a.handleMessage(message)
+				}(update.Message)
 			}
 		}
 	}
@@ -231,7 +293,15 @@ func (a *TelegramAdapter) pollLoop() {
 func (a *TelegramAdapter) getUpdates() ([]tgUpdate, error) {
 	url := fmt.Sprintf("%s%s/getUpdates?offset=%d&timeout=30", baseURL, a.cfg.Token, a.offset.Load())
 
-	resp, err := a.client.Get(url)
+	ctx := a.pollCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := a.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -282,11 +352,13 @@ func (a *TelegramAdapter) handleMessage(tgMsg *tgMessage) {
 
 	ctx, cancel := context.WithTimeout(trace.Detach(base), 2*time.Minute)
 	defer cancel()
+	stopCancel := context.AfterFunc(a.handlerCtx, cancel)
+	defer stopCancel()
 
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
 		logger.Error("Telegram: 处理消息失败", "error", err)
-		errCtx, errCancel := context.WithTimeout(trace.Detach(base), 10*time.Second)
+		errCtx, errCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer errCancel()
 		_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{Content: "处理消息时出现错误，请稍后重试。"})
 		return
@@ -294,7 +366,7 @@ func (a *TelegramAdapter) handleMessage(tgMsg *tgMessage) {
 	if reply == nil {
 		return
 	}
-	sendCtx, sendCancel := context.WithTimeout(trace.Detach(base), 30*time.Second)
+	sendCtx, sendCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer sendCancel()
 	if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
 		logger.Error("Telegram: 发送回复失败", "error", err)
@@ -372,7 +444,7 @@ func (a *TelegramAdapter) sendMessageNow(ctx context.Context, chatID string, rep
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxTelegramErrorBodyBytes))
 		return fmt.Errorf("telegram API 返回 %d: %s", resp.StatusCode, string(respBody))
 	}
 	return nil

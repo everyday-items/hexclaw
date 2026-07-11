@@ -17,6 +17,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hexagon-codes/toolkit/crypto/sign"
@@ -28,13 +29,21 @@ import (
 	"github.com/hexagon-codes/hexclaw/adapter"
 )
 
+const maxWhatsAppErrorBodyBytes = 64 << 10
+
 // WhatsAppAdapter WhatsApp Business API 适配器
 type WhatsAppAdapter struct {
-	config  Config
-	handler adapter.MessageHandler
-	server  *http.Server
-	client  *http.Client
-	queue   *adapter.SendQueue
+	config       Config
+	handler      adapter.MessageHandler
+	server       *http.Server
+	client       *http.Client
+	queue        *adapter.SendQueue
+	workerMu     sync.Mutex
+	workers      sync.WaitGroup
+	workerWaiter adapter.LifecycleWaiter
+	stopping     bool
+	workerCtx    context.Context
+	workerCancel context.CancelFunc
 }
 
 // Config WhatsApp 适配器配置
@@ -56,9 +65,12 @@ func New(cfg Config) *WhatsAppAdapter {
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://graph.facebook.com/v18.0"
 	}
+	workerCtx, workerCancel := context.WithCancel(context.Background())
 	a := &WhatsAppAdapter{
-		config: cfg,
-		client: httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
+		config:       cfg,
+		client:       httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
+		workerCtx:    workerCtx,
+		workerCancel: workerCancel,
 	}
 	a.queue = adapter.NewPlatformSendQueue(PlatformWhatsApp, a.sendReplyNow)
 	return a
@@ -80,6 +92,16 @@ func (a *WhatsAppAdapter) Start(ctx context.Context, handler adapter.MessageHand
 	if err := a.Attach(handler); err != nil {
 		return err
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.workerMu.Lock()
+	a.stopping = false
+	if a.workerCancel != nil {
+		a.workerCancel()
+	}
+	a.workerCtx, a.workerCancel = context.WithCancel(ctx)
+	a.workerMu.Unlock()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/webhook/whatsapp", a.handleWebhook)
@@ -103,19 +125,80 @@ func (a *WhatsAppAdapter) Start(ctx context.Context, handler adapter.MessageHand
 
 // Attach 注册消息处理器，但不启动独立 HTTP 服务器。
 func (a *WhatsAppAdapter) Attach(handler adapter.MessageHandler) error {
+	if err := a.validateWebhookCredentials(); err != nil {
+		return err
+	}
+	if handler == nil {
+		return fmt.Errorf("whatsapp message handler 未配置")
+	}
+	a.workerMu.Lock()
+	defer a.workerMu.Unlock()
+	a.workerWaiter.Reset()
 	a.handler = handler
+	a.stopping = false
+	if a.workerCtx == nil || a.workerCtx.Err() != nil {
+		a.workerCtx, a.workerCancel = context.WithCancel(context.Background())
+	}
+	return nil
+}
+
+func (a *WhatsAppAdapter) validateWebhookCredentials() error {
+	if strings.TrimSpace(a.config.AppSecret) == "" {
+		return fmt.Errorf("whatsapp app_secret 未配置")
+	}
+	if strings.TrimSpace(a.config.VerifyToken) == "" {
+		return fmt.Errorf("whatsapp verify_token 未配置")
+	}
 	return nil
 }
 
 // Stop 停止适配器
 func (a *WhatsAppAdapter) Stop(ctx context.Context) error {
-	if a.queue != nil {
-		_ = a.queue.Stop(context.Background())
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	a.workerMu.Lock()
+	a.stopping = true
+	if a.workerCancel != nil {
+		a.workerCancel()
+	}
+	a.workerMu.Unlock()
+	var shutdownErr error
 	if a.server != nil {
-		return a.server.Shutdown(ctx)
+		shutdownErr = a.server.Shutdown(ctx)
 	}
-	return nil
+	workerErr := a.workerWaiter.Wait(ctx, &a.workers)
+	var queueErr error
+	if a.queue != nil {
+		queueErr = a.queue.Stop(ctx)
+	}
+	if shutdownErr != nil {
+		return shutdownErr
+	}
+	if workerErr != nil {
+		return workerErr
+	}
+	return queueErr
+}
+
+func (a *WhatsAppAdapter) runWorkers(fns []func(context.Context)) bool {
+	if len(fns) == 0 {
+		return true
+	}
+	a.workerMu.Lock()
+	defer a.workerMu.Unlock()
+	if a.stopping {
+		return false
+	}
+	workerCtx := a.workerCtx
+	a.workers.Add(len(fns))
+	for _, fn := range fns {
+		go func(run func(context.Context)) {
+			defer a.workers.Done()
+			run(workerCtx)
+		}(fn)
+	}
+	return true
 }
 
 // Handler 返回统一 ingress 使用的处理器。
@@ -162,7 +245,7 @@ func (a *WhatsAppAdapter) sendReplyNow(ctx context.Context, chatID string, reply
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxWhatsAppErrorBodyBytes))
 		return fmt.Errorf("whatsApp API 返回 %d: %s", resp.StatusCode, string(respBody))
 	}
 	return nil
@@ -188,7 +271,8 @@ func (a *WhatsAppAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 		token := r.URL.Query().Get("hub.verify_token")
 		challenge := r.URL.Query().Get("hub.challenge")
 
-		if mode == "subscribe" && token == a.config.VerifyToken {
+		if mode == "subscribe" && a.config.VerifyToken != "" &&
+			hmac.Equal([]byte(token), []byte(a.config.VerifyToken)) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = fmt.Fprint(w, challenge)
 			return
@@ -210,7 +294,7 @@ func (a *WhatsAppAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
-	if a.config.AppSecret != "" && !a.verifySignature(r, body) {
+	if a.config.AppSecret == "" || !a.verifySignature(r, body) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -221,10 +305,9 @@ func (a *WhatsAppAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 立即返回 200，避免 WhatsApp 重试
-	w.WriteHeader(http.StatusOK)
-
-	// 异步处理消息
+	// Build the complete batch before admission so Stop cannot interleave after
+	// a partial admission and turn a retry into duplicate processing.
+	var workers []func(context.Context)
 	for _, entry := range payload.Entry {
 		for _, change := range entry.Changes {
 			for _, message := range change.Value.Messages {
@@ -241,27 +324,37 @@ func (a *WhatsAppAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 					Content:    message.Text.Body,
 					Timestamp:  time.Now(),
 				}
-				go func(m *adapter.Message) {
+				baseCtx := trace.Detach(r.Context())
+				workers = append(workers, func(workerCtx context.Context) {
 					if a.handler == nil {
 						return
 					}
 					// H7: Detach(r.Context()) 保留 logger，脱离 webhook 响应返回后的 cancel
-					bgCtx, cancel := context.WithTimeout(trace.Detach(r.Context()), 2*time.Minute)
+					bgCtx, cancel := context.WithTimeout(baseCtx, 2*time.Minute)
 					defer cancel()
-					reply, err := a.handler(bgCtx, m)
+					stopCancel := context.AfterFunc(workerCtx, cancel)
+					defer stopCancel()
+					reply, err := a.handler(bgCtx, msg)
 					if err != nil {
 						logger.Error("[WhatsApp] 处理消息错误", "error", err)
 						return
 					}
 					if reply != nil {
-						if err := a.Send(bgCtx, m.ChatID, reply); err != nil {
+						if err := a.Send(bgCtx, msg.ChatID, reply); err != nil {
 							logger.Error("[WhatsApp] 发送回复错误", "error", err)
 						}
 					}
-				}(msg)
+				})
 			}
 		}
 	}
+	if !a.runWorkers(workers) {
+		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Ack only after every message worker has been admitted; otherwise Meta must retry.
+	w.WriteHeader(http.StatusOK)
 }
 
 // verifySignature 校验 Meta 的 X-Hub-Signature-256（HMAC-SHA256 over raw body）。
@@ -293,6 +386,9 @@ func (a *WhatsAppAdapter) ValidateConfig(ctx context.Context) error {
 	if a.config.PhoneID == "" {
 		return fmt.Errorf("whatsapp phone_id 未配置")
 	}
+	if err := a.validateWebhookCredentials(); err != nil {
+		return err
+	}
 	url := fmt.Sprintf("%s/%s", a.config.BaseURL, a.config.PhoneID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -307,7 +403,7 @@ func (a *WhatsAppAdapter) ValidateConfig(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxWhatsAppErrorBodyBytes))
 		return fmt.Errorf("whatsapp 凭证验证失败 (%d): %s", resp.StatusCode, string(respBody))
 	}
 	return nil
@@ -321,7 +417,7 @@ func (a *WhatsAppAdapter) Health(_ context.Context) error {
 	if a.config.Token == "" || a.config.PhoneID == "" {
 		return fmt.Errorf("whatsapp token/phone_id 未配置")
 	}
-	return nil
+	return a.validateWebhookCredentials()
 }
 
 // WhatsApp Webhook 数据结构

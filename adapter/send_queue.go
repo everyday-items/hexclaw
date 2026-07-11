@@ -21,6 +21,15 @@ type SendQueue struct {
 	minInterval time.Duration
 	tasks       chan *sendTask
 	stopCh      chan struct{}
+	// admissionMu linearizes the stopped check with registration in admitted.
+	// Stop closes the gate while holding this mutex, then waits until every Send
+	// that crossed it has returned before draining the channel.
+	admissionMu sync.Mutex
+	admitted    sync.WaitGroup
+	workerCtx   context.Context
+	workerStop  context.CancelFunc
+	doneCh      chan struct{}
+	cleanupDone chan struct{}
 	wg          sync.WaitGroup
 	stopOnce    sync.Once
 	stopped     atomic.Bool
@@ -34,11 +43,16 @@ func NewSendQueue(ratePerSecond, queueSize int, send func(context.Context, strin
 	if queueSize <= 0 {
 		queueSize = 128
 	}
+	workerCtx, workerStop := context.WithCancel(context.Background())
 	q := &SendQueue{
 		send:        send,
 		minInterval: time.Second / time.Duration(ratePerSecond),
 		tasks:       make(chan *sendTask, queueSize),
 		stopCh:      make(chan struct{}),
+		workerCtx:   workerCtx,
+		workerStop:  workerStop,
+		doneCh:      make(chan struct{}),
+		cleanupDone: make(chan struct{}),
 	}
 	q.wg.Add(1)
 	go q.run()
@@ -62,12 +76,18 @@ func (q *SendQueue) Send(ctx context.Context, chatID string, reply *Reply) error
 	if q == nil {
 		return fmt.Errorf("send queue 未初始化")
 	}
-	if q.stopped.Load() {
-		return fmt.Errorf("send queue 已停止")
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	q.admissionMu.Lock()
+	if q.stopped.Load() {
+		q.admissionMu.Unlock()
+		return fmt.Errorf("send queue 已停止")
+	}
+	q.admitted.Add(1)
+	q.admissionMu.Unlock()
+	defer q.admitted.Done()
+
 	task := &sendTask{
 		ctx:    ctx,
 		chatID: chatID,
@@ -93,16 +113,40 @@ func (q *SendQueue) Send(ctx context.Context, chatID string, reply *Reply) error
 }
 
 // Stop stops the queue worker and rejects future sends.
-func (q *SendQueue) Stop(context.Context) error {
+func (q *SendQueue) Stop(ctx context.Context) error {
 	if q == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	q.stopOnce.Do(func() {
+		q.admissionMu.Lock()
 		q.stopped.Store(true)
+		q.workerStop()
 		close(q.stopCh)
+		q.admissionMu.Unlock()
+		go q.finishStop()
 	})
-	q.wg.Wait()
+	select {
+	case <-q.cleanupDone:
+	case <-ctx.Done():
+		select {
+		case <-q.cleanupDone:
+		default:
+			return ctx.Err()
+		}
+	}
+	return nil
+}
 
+// finishStop performs the non-cancellable half of shutdown. A Stop caller may
+// time out while an adapter sender ignores cancellation; the cleanup keeps
+// running, and a later Stop converges on cleanupDone without leaking queued
+// task references.
+func (q *SendQueue) finishStop() {
+	q.admitted.Wait()
+	<-q.doneCh
 	// 排空残留任务，释放 ctx/reply 引用并通知调用方
 	for {
 		select {
@@ -111,16 +155,23 @@ func (q *SendQueue) Stop(context.Context) error {
 				task.done <- fmt.Errorf("send queue 已停止")
 			}
 		default:
-			return nil
+			close(q.cleanupDone)
+			return
 		}
 	}
 }
 
 func (q *SendQueue) run() {
 	defer q.wg.Done()
+	defer close(q.doneCh)
 
 	var lastSend time.Time
 	for {
+		select {
+		case <-q.stopCh:
+			return
+		default:
+		}
 		var task *sendTask
 		select {
 		case <-q.stopCh:
@@ -128,6 +179,14 @@ func (q *SendQueue) run() {
 		case task = <-q.tasks:
 		}
 		if task == nil {
+			continue
+		}
+		if q.workerCtx.Err() != nil {
+			task.done <- fmt.Errorf("send queue 已停止")
+			return
+		}
+		if err := task.ctx.Err(); err != nil {
+			task.done <- err
 			continue
 		}
 
@@ -154,7 +213,26 @@ func (q *SendQueue) run() {
 			continue
 		}
 
-		err := q.send(task.ctx, task.chatID, task.reply)
+		sendCtx, cancelSend := context.WithCancel(task.ctx)
+		stopCancel := context.AfterFunc(q.workerCtx, cancelSend)
+		// context.AfterFunc runs asynchronously. Re-check synchronously after it
+		// is installed so a task selected concurrently with Stop cannot call the
+		// adapter sender merely because the cancellation callback has not run yet.
+		if q.workerCtx.Err() != nil {
+			stopCancel()
+			cancelSend()
+			task.done <- fmt.Errorf("send queue 已停止")
+			return
+		}
+		if err := task.ctx.Err(); err != nil {
+			stopCancel()
+			cancelSend()
+			task.done <- err
+			continue
+		}
+		err := q.send(sendCtx, task.chatID, task.reply)
+		stopCancel()
+		cancelSend()
 		lastSend = time.Now()
 		task.done <- err
 	}

@@ -116,6 +116,25 @@ type Block struct {
 	IsError   bool   `json:"isError,omitempty"`
 }
 
+// KnowledgeHit 知识库检索命中（结构化，随回复回传给前端渲染「知识库命中」标签+详情）。
+//
+// U9：Reply/ReplyChunk 的 Metadata 是 map[string]string，结构上无法承载对象数组，
+// 故命中以独立结构化字段回传（而非塞进字符串 map）。字段名对齐前端 ChatView 的
+// getHitTitle（doc_title/source）与 getHitSubtitle（content）消费路径。
+type KnowledgeHit struct {
+	DocTitle string  `json:"doc_title,omitempty"` // 文档标题
+	Source   string  `json:"source,omitempty"`    // 来源
+	Content  string  `json:"content,omitempty"`   // 命中片段正文
+	Score    float64 `json:"score,omitempty"`     // 相关度分数
+}
+
+// MemoryHit 长期记忆召回命中（结构化，驱动前端「记忆命中」标签+详情）。
+// 字段名对齐前端 ChatView 记忆命中渲染（content/source）。
+type MemoryHit struct {
+	Content string `json:"content,omitempty"` // 记忆内容
+	Source  string `json:"source,omitempty"`  // 记忆来源（角色/文件等）
+}
+
 // Reply 同步回复
 //
 // 引擎处理完消息后返回的完整回复。
@@ -130,6 +149,9 @@ type Reply struct {
 	// 替代旧的 metadata["interactive_buttons"] JSON 字符串嵌入做法。
 	// 桌面端 / IM 适配器按 Type 渲染按钮 / 选项 / 审批 / 卡片。
 	Interactive *InteractivePayload
+	// U9：本轮 RAG/记忆检索命中（结构化，非空时前端渲染命中标签+详情）。
+	KnowledgeHits []KnowledgeHit `json:"knowledge_hits,omitempty"`
+	MemoryHits    []MemoryHit    `json:"memory_hits,omitempty"`
 }
 
 // ReplyChunk 流式回复片段
@@ -147,6 +169,9 @@ type ReplyChunk struct {
 	Blocks    []Block           `json:"blocks,omitempty"`     // 有序内容块（仅在 Done=true 时填充）
 	// Interactive 结构化交互载荷（仅在 Done=true 时填充；与 Reply.Interactive 同语义）。
 	Interactive *InteractivePayload `json:"interactive,omitempty"`
+	// U9：本轮 RAG/记忆检索命中（仅在 Done=true 时填充；非空时前端渲染命中标签+详情）。
+	KnowledgeHits []KnowledgeHit `json:"knowledge_hits,omitempty"`
+	MemoryHits    []MemoryHit    `json:"memory_hits,omitempty"`
 }
 
 // MessageHandler 消息处理回调（同步模式）

@@ -92,3 +92,29 @@ func TestSendReplyNow_NilReplyIsNoOp(t *testing.T) {
 		t.Error("nil reply must not issue an HTTP request")
 	}
 }
+
+func TestWhatsAppErrorBodiesAreBounded(t *testing.T) {
+	const maxErrorText = 64<<10 + 1024
+	huge := strings.Repeat("x", 256<<10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(huge))
+	}))
+	defer srv.Close()
+
+	a := New(Config{BaseURL: srv.URL, PhoneID: "PHONE1", Token: "tok", AppSecret: "secret"})
+	for name, call := range map[string]func() error{
+		"send":     func() error { return a.sendReplyNow(context.Background(), "chat", &adapter.Reply{Content: "hi"}) },
+		"validate": func() error { return a.ValidateConfig(context.Background()) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := call()
+			if err == nil {
+				t.Fatal("non-OK response returned nil error")
+			}
+			if len(err.Error()) > maxErrorText {
+				t.Fatalf("error text length = %d, want <= %d", len(err.Error()), maxErrorText)
+			}
+		})
+	}
+}

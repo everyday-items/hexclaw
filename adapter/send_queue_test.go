@@ -2,10 +2,48 @@ package adapter
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// errGateContext pauses Send exactly at its pre-admission ctx.Err check. It
+// lets the test put Stop between the old stopped.Load and enqueue select
+// without production-only timing hooks.
+type errGateContext struct {
+	entered chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (c *errGateContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *errGateContext) Done() <-chan struct{}       { return nil }
+func (c *errGateContext) Value(any) any               { return nil }
+func (c *errGateContext) Err() error {
+	c.once.Do(func() { close(c.entered) })
+	<-c.release
+	return nil
+}
+
+// doneGateContext pauses the worker while context.WithCancel wires the task
+// parent. Stop can then cancel the queue before the worker reaches q.send.
+type doneGateContext struct {
+	entered chan struct{}
+	release <-chan struct{}
+	never   chan struct{}
+	once    sync.Once
+}
+
+func (c *doneGateContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *doneGateContext) Value(any) any               { return nil }
+func (c *doneGateContext) Err() error                  { return nil }
+func (c *doneGateContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.entered) })
+	<-c.release
+	return c.never
+}
 
 // TestSendQueue_CancelledContextRejectsSend 证明:
 // 当 context 已取消时，SendQueue.Send 立即返回 ctx.Err()，消息永远不会发出。
@@ -116,5 +154,163 @@ func TestSendQueue_SimulateAdapterBugAndFix(t *testing.T) {
 	}
 	if sendCount.Load() != 1 {
 		t.Fatalf("[FIX 路径] 底层 send 应被执行 1 次，实际: %d", sendCount.Load())
+	}
+}
+
+func TestSendQueue_StopCancelsActiveSend(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+
+	q := NewSendQueue(5, 8, func(ctx context.Context, _ string, _ *Reply) error {
+		close(started)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-release:
+			return errors.New("test send released")
+		}
+	})
+	sendDone := make(chan error, 1)
+	go func() {
+		sendDone <- q.Send(context.Background(), "chat-1", &Reply{Content: "hello"})
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("send did not start")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- q.Stop(ctx) }()
+
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop returned error after canceling active send: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		releaseOnce.Do(func() { close(release) })
+		<-stopDone
+		t.Fatal("Stop did not cancel the active send")
+	}
+	if err := <-sendDone; err == nil {
+		t.Fatal("active Send returned nil while the queue was stopping")
+	}
+}
+
+func TestSendQueue_StopHonorsDeadlineWhenSenderIgnoresContext(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+
+	q := NewSendQueue(5, 8, func(context.Context, string, *Reply) error {
+		close(started)
+		<-release
+		return nil
+	})
+	go func() { _ = q.Send(context.Background(), "chat-1", &Reply{Content: "hello"}) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("send did not start")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- q.Stop(ctx) }()
+	select {
+	case err := <-stopDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Stop error = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		releaseOnce.Do(func() { close(release) })
+		<-stopDone
+		t.Fatal("Stop ignored its context deadline")
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := q.Stop(context.Background()); err != nil {
+		t.Fatalf("second Stop did not converge after sender exit: %v", err)
+	}
+}
+
+func TestSendQueue_StopLinearizesWithBlockedAdmissions(t *testing.T) {
+	const senders = 128
+	release := make(chan struct{})
+	q := NewSendQueue(1000, senders, func(context.Context, string, *Reply) error {
+		return errors.New("send must not run after stop")
+	})
+
+	var wg sync.WaitGroup
+	results := make(chan error, senders)
+	entered := make([]chan struct{}, senders)
+	for i := range senders {
+		entered[i] = make(chan struct{})
+		ctx := &errGateContext{entered: entered[i], release: release}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- q.Send(ctx, "chat", &Reply{Content: "queued"})
+		}()
+	}
+	for _, ch := range entered {
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatal("Send did not reach its admission boundary")
+		}
+	}
+
+	if err := q.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	close(release)
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err == nil {
+			t.Fatal("a Send admitted after Stop returned nil")
+		}
+	}
+	if got := len(q.tasks); got != 0 {
+		t.Fatalf("%d tasks were enqueued after Stop had already drained the queue", got)
+	}
+}
+
+func TestSendQueue_WorkerNeverCallsSenderAfterStop(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var called atomic.Bool
+	q := NewSendQueue(1000, 1, func(context.Context, string, *Reply) error {
+		called.Store(true)
+		return nil
+	})
+	gate := &doneGateContext{entered: entered, release: release, never: make(chan struct{})}
+	q.tasks <- &sendTask{
+		ctx: gate, chatID: "chat", reply: &Reply{Content: "must be rejected"}, done: make(chan error, 1),
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not reach the controlled pre-send boundary")
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := q.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop while worker is paused = %v, want deadline exceeded", err)
+	}
+	close(release)
+	if err := q.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop did not converge after releasing worker: %v", err)
+	}
+	if called.Load() {
+		t.Fatal("worker called the sender after queue Stop")
 	}
 }

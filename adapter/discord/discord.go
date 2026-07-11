@@ -40,6 +40,8 @@ const (
 	apiBase    = "https://discord.com/api/v10"
 	gatewayURL = "wss://gateway.discord.gg/?v=10&encoding=json"
 
+	maxDiscordErrorBodyBytes = 64 << 10
+
 	// W3-3：Gateway 重连指数退避参数。
 	reconnectBaseDelay = 1 * time.Second  // 首次重连退避起步时长
 	reconnectMaxDelay  = 60 * time.Second // 退避封顶时长
@@ -59,21 +61,33 @@ type DiscordAdapter struct {
 	// 实际异步处理用 trace.Detach(baseCtx) 派生新 ctx，避免被父 cancel 杀死。
 	baseCtx context.Context
 
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	loopWG          sync.WaitGroup
+	loopWaiter      adapter.LifecycleWaiter
+	workerMu        sync.Mutex
+	handlerWG       sync.WaitGroup
+	handlerWaiter   adapter.LifecycleWaiter
+	workerCtx       context.Context
+	workerCancel    context.CancelFunc
+	stopping        bool
+
 	conn          *websocket.Conn // WebSocket 连接
 	mu            sync.Mutex      // 保护 conn
 	sessionID     string          // Gateway 会话 ID（用于恢复连接）
 	seq           atomic.Int64    // 最新序列号
 	stopped       atomic.Bool     // 是否已停止
-	heartbeatCh   chan struct{}   // 心跳停止信号
 	heartbeatStop chan struct{}   // 当前连接的心跳停止信号
 }
 
 // New 创建 Discord 适配器
 func New(cfg config.DiscordConfig) *DiscordAdapter {
+	workerCtx, workerCancel := context.WithCancel(context.Background())
 	a := &DiscordAdapter{
-		cfg:         cfg,
-		client:      httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
-		heartbeatCh: make(chan struct{}),
+		cfg:          cfg,
+		client:       httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
+		workerCtx:    workerCtx,
+		workerCancel: workerCancel,
 	}
 	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformDiscord, a.sendReplyNow)
 	return a
@@ -92,6 +106,12 @@ func (a *DiscordAdapter) Platform() adapter.Platform { return adapter.PlatformDi
 // 连接 Gateway WebSocket，开始接收消息。
 // 自动维持心跳和处理重连。
 func (a *DiscordAdapter) Start(ctx context.Context, handler adapter.MessageHandler) error {
+	if a.cfg.Token == "" {
+		return fmt.Errorf("discord bot token 不能为空")
+	}
+	if handler == nil {
+		return fmt.Errorf("discord message handler 不能为空")
+	}
 	a.handler = handler
 	a.stopped.Store(false)
 	// v0.4.0 E5：保留 Start ctx，handleMessageCreate 用 Detach 派生异步处理 ctx
@@ -99,38 +119,71 @@ func (a *DiscordAdapter) Start(ctx context.Context, handler adapter.MessageHandl
 		ctx = context.Background()
 	}
 	a.baseCtx = ctx
+	a.loopWaiter.Reset()
+	a.handlerWaiter.Reset()
 
-	if a.cfg.Token == "" {
-		return fmt.Errorf("discord bot token 不能为空")
+	a.workerMu.Lock()
+	a.stopping = false
+	if a.workerCtx == nil || a.workerCtx.Err() != nil {
+		a.workerCtx, a.workerCancel = context.WithCancel(context.Background())
 	}
+	a.lifecycleCtx, a.lifecycleCancel = context.WithCancel(ctx)
+	loopCtx := a.lifecycleCtx
+	a.loopWG.Add(1)
+	a.workerMu.Unlock()
 
-	go a.connectLoop()
+	go func() {
+		defer a.loopWG.Done()
+		a.connectLoop(loopCtx)
+	}()
 	logger.Info("Discord 适配器已启动")
 	return nil
 }
 
 // Stop 停止适配器
-func (a *DiscordAdapter) Stop(_ context.Context) error {
+func (a *DiscordAdapter) Stop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	a.stopped.Store(true)
 
-	// 关闭心跳
-	select {
-	case a.heartbeatCh <- struct{}{}:
-	default:
+	a.workerMu.Lock()
+	a.stopping = true
+	if a.lifecycleCancel != nil {
+		a.lifecycleCancel()
 	}
+	if a.workerCancel != nil {
+		a.workerCancel()
+	}
+	a.workerMu.Unlock()
 
-	// 关闭 WebSocket 连接
 	a.mu.Lock()
+	if a.heartbeatStop != nil {
+		close(a.heartbeatStop)
+		a.heartbeatStop = nil
+	}
 	if a.conn != nil {
-		a.conn.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		a.conn.Close()
+		_ = a.conn.Close()
 		a.conn = nil
 	}
 	a.mu.Unlock()
 
-	if a.queue != nil {
-		_ = a.queue.Stop(context.Background())
+	stopQueue := func() error {
+		if a.queue != nil {
+			return a.queue.Stop(ctx)
+		}
+		return nil
+	}
+	if err := a.loopWaiter.Wait(ctx, &a.loopWG); err != nil {
+		_ = stopQueue()
+		return err
+	}
+	if err := a.handlerWaiter.Wait(ctx, &a.handlerWG); err != nil {
+		_ = stopQueue()
+		return err
+	}
+	if err := stopQueue(); err != nil {
+		return err
 	}
 
 	logger.Info("Discord 适配器已停止")
@@ -212,14 +265,14 @@ func (a *DiscordAdapter) SendStream(ctx context.Context, chatID string, chunks <
 // 重连风暴。改为复用 toolkit/util/retry 的指数退避：连接成功（事件循环正常
 // 运行过一段时间）后重置退避计数，连续失败时延迟按 1s→2s→4s... 增长，封顶
 // reconnectMaxDelay。
-func (a *DiscordAdapter) connectLoop() {
+func (a *DiscordAdapter) connectLoop(ctx context.Context) {
 	attempt := 0
-	for !a.stopped.Load() {
+	for !a.stopped.Load() && ctx.Err() == nil {
 		start := time.Now()
-		if err := a.connect(); err != nil {
+		if err := a.connect(ctx); err != nil && ctx.Err() == nil {
 			logger.Error("Discord Gateway 连接失败", "error", err)
 		}
-		if a.stopped.Load() {
+		if a.stopped.Load() || ctx.Err() != nil {
 			return
 		}
 		// 连接维持超过 60s 视为一次成功会话，重置退避计数。
@@ -228,7 +281,13 @@ func (a *DiscordAdapter) connectLoop() {
 		}
 		delay := a.reconnectDelay(attempt)
 		attempt++
-		time.Sleep(delay)
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		}
 	}
 }
 
@@ -245,8 +304,8 @@ func (a *DiscordAdapter) reconnectDelay(attempt int) time.Duration {
 }
 
 // connect 建立 Gateway 连接并处理事件
-func (a *DiscordAdapter) connect() error {
-	return a.connectTo(gatewayURL)
+func (a *DiscordAdapter) connect(ctx context.Context) error {
+	return a.connectToContext(ctx, gatewayURL)
 }
 
 // connectTo 连接指定 Gateway URL 并处理事件。
@@ -254,14 +313,20 @@ func (a *DiscordAdapter) connect() error {
 // 从 connect 抽出 URL 参数，便于在测试中指向本地 WebSocket 服务器，
 // 验证 Resume/Identify 握手选择与 Hello 心跳间隔校验（W3-3 / W3-4）。
 func (a *DiscordAdapter) connectTo(url string) error {
+	return a.connectToContext(context.Background(), url)
+}
+
+func (a *DiscordAdapter) connectToContext(ctx context.Context, url string) error {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
 	}
 
-	conn, _, err := dialer.Dial(url, nil)
+	conn, _, err := dialer.DialContext(ctx, url, nil)
 	if err != nil {
 		return fmt.Errorf("webSocket 连接失败: %w", err)
 	}
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
 
 	a.mu.Lock()
 	a.conn = conn
@@ -324,7 +389,21 @@ func (a *DiscordAdapter) connectTo(url string) error {
 	a.heartbeatStop = make(chan struct{})
 	stopCh := a.heartbeatStop
 	a.mu.Unlock()
-	go a.heartbeat(conn, heartbeatInterval, stopCh)
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		a.heartbeat(conn, heartbeatInterval, stopCh)
+	}()
+	defer func() {
+		_ = conn.Close()
+		a.mu.Lock()
+		if a.heartbeatStop == stopCh {
+			close(stopCh)
+			a.heartbeatStop = nil
+		}
+		a.mu.Unlock()
+		<-heartbeatDone
+	}()
 
 	// 读取事件循环
 	for !a.stopped.Load() {
@@ -389,8 +468,6 @@ func (a *DiscordAdapter) heartbeat(conn *websocket.Conn, interval time.Duration,
 				logger.Error("Discord 心跳发送失败", "error", err)
 				return
 			}
-		case <-a.heartbeatCh:
-			return
 		case <-stopCh:
 			return
 		}
@@ -507,16 +584,21 @@ func (a *DiscordAdapter) handleMessageCreate(data json.RawMessage) {
 
 	// 异步处理消息
 	// v0.4.0 E5：Detach(baseCtx) 保留 logger/Values，但脱离 Start ctx cancel
-	go func() {
+	a.runHandler(func(workerCtx context.Context) {
 		base := a.baseCtx
 		if base == nil {
 			base = context.Background()
 		}
 		ctx, cancel := context.WithTimeout(trace.Detach(base), 120*time.Second)
 		defer cancel()
+		stopCancel := context.AfterFunc(workerCtx, cancel)
+		defer stopCancel()
 
 		reply, err := a.handler(ctx, unified)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			logger.Error("Discord 消息处理失败", "error", err)
 			errCtx, errCancel := context.WithTimeout(trace.Detach(base), 10*time.Second)
 			defer errCancel()
@@ -524,11 +606,29 @@ func (a *DiscordAdapter) handleMessageCreate(data json.RawMessage) {
 			return
 		}
 		if reply != nil {
-			sendCtx, sendCancel := context.WithTimeout(trace.Detach(base), 30*time.Second)
+			sendCtx, sendCancel := context.WithTimeout(ctx, 30*time.Second)
 			defer sendCancel()
 			_ = a.Send(sendCtx, msg.ChannelID, reply)
 		}
+	})
+}
+
+func (a *DiscordAdapter) runHandler(fn func(context.Context)) bool {
+	a.workerMu.Lock()
+	defer a.workerMu.Unlock()
+	if a.stopping {
+		return false
+	}
+	workerCtx := a.workerCtx
+	if workerCtx == nil {
+		workerCtx = context.Background()
+	}
+	a.handlerWG.Add(1)
+	go func() {
+		defer a.handlerWG.Done()
+		fn(workerCtx)
 	}()
+	return true
 }
 
 // ============== REST API ==============
@@ -575,7 +675,7 @@ func (a *DiscordAdapter) createMessage(ctx context.Context, channelID, content s
 	// W3-1：Discord POST /channels/{id}/messages 成功返回 201 Created，
 	// 此前仅接受 200 会把正常成功误判为错误。按 2xx 整段判定成功。
 	if resp.StatusCode/100 != 2 {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxDiscordErrorBodyBytes))
 		return "", fmt.Errorf("discord API 错误 (%d): %s", resp.StatusCode, string(respBody))
 	}
 
@@ -616,7 +716,7 @@ func (a *DiscordAdapter) editMessage(ctx context.Context, channelID, messageID, 
 	// W3-2：此前不校验响应状态码会静默吞掉 404/429/500 等失败，
 	// 导致流式编辑失败被掩盖。非 2xx 时读取错误体并返回 error。
 	if resp.StatusCode/100 != 2 {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxDiscordErrorBodyBytes))
 		return fmt.Errorf("discord 编辑消息错误 (%d): %s", resp.StatusCode, string(respBody))
 	}
 	return nil
@@ -640,7 +740,7 @@ func (a *DiscordAdapter) ValidateConfig(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxDiscordErrorBodyBytes))
 		return fmt.Errorf("discord token 验证失败 (%d): %s", resp.StatusCode, string(respBody))
 	}
 	return nil

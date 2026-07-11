@@ -18,6 +18,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,13 +30,21 @@ import (
 
 // MatrixAdapter Matrix 协议适配器
 type MatrixAdapter struct {
-	config    Config
-	handler   adapter.MessageHandler
-	client    *http.Client
-	queue     *adapter.SendQueue
-	stopCh    chan struct{}
-	nextBatch string // sync 的 since token
-	stopped   atomic.Bool
+	config        Config
+	handler       adapter.MessageHandler
+	client        *http.Client
+	queue         *adapter.SendQueue
+	stopCh        chan struct{}
+	nextBatch     string // sync 的 since token
+	stopped       atomic.Bool
+	loopWG        sync.WaitGroup
+	handlerWG     sync.WaitGroup
+	loopWaiter    adapter.LifecycleWaiter
+	handlerWaiter adapter.LifecycleWaiter
+	pollCtx       context.Context
+	pollCancel    context.CancelFunc
+	workerCtx     context.Context
+	workerCancel  context.CancelFunc
 }
 
 // Config Matrix 适配器配置
@@ -55,10 +64,13 @@ func New(cfg Config) *MatrixAdapter {
 	if cfg.SyncTimeout == 0 {
 		cfg.SyncTimeout = 30
 	}
+	workerCtx, workerCancel := context.WithCancel(context.Background())
 	a := &MatrixAdapter{
-		config: cfg,
-		client: httpx.RawClient(httpx.WithRawTimeout(time.Duration(cfg.SyncTimeout+10) * time.Second)),
-		stopCh: make(chan struct{}),
+		config:       cfg,
+		client:       httpx.RawClient(httpx.WithRawTimeout(time.Duration(cfg.SyncTimeout+10) * time.Second)),
+		stopCh:       make(chan struct{}),
+		workerCtx:    workerCtx,
+		workerCancel: workerCancel,
 	}
 	a.queue = adapter.NewPlatformSendQueue(PlatformMatrix, a.sendReplyNow)
 	return a
@@ -76,10 +88,20 @@ func (a *MatrixAdapter) Platform() adapter.Platform { return PlatformMatrix }
 func (a *MatrixAdapter) Start(ctx context.Context, handler adapter.MessageHandler) error {
 	a.handler = handler
 	a.stopped.Store(false)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.pollCtx, a.pollCancel = context.WithCancel(ctx)
+	a.loopWaiter.Reset()
+	a.handlerWaiter.Reset()
 
 	logger.Info("[Matrix] 连接到", "homeserver_url", a.config.HomeserverURL)
 
-	go a.syncLoop(ctx)
+	a.loopWG.Add(1)
+	go func() {
+		defer a.loopWG.Done()
+		a.syncLoop(a.pollCtx)
+	}()
 	return nil
 }
 
@@ -87,15 +109,34 @@ func (a *MatrixAdapter) Start(ctx context.Context, handler adapter.MessageHandle
 //
 // 幂等：用 stopped 标志的 CAS 守卫 close(stopCh)，二次调用（热重载/优雅停机重入）
 // 直接返回，避免 close 已关闭 channel 触发 panic。
-func (a *MatrixAdapter) Stop(_ context.Context) error {
-	if !a.stopped.CompareAndSwap(false, true) {
-		return nil // 已停止，幂等返回
+func (a *MatrixAdapter) Stop(ctx context.Context) error {
+	if a.stopped.CompareAndSwap(false, true) {
+		close(a.stopCh)
 	}
-	if a.queue != nil {
-		_ = a.queue.Stop(context.Background())
+	if a.pollCancel != nil {
+		a.pollCancel()
 	}
-	close(a.stopCh)
-	return nil
+	if a.workerCancel != nil {
+		a.workerCancel()
+	}
+	stopQueue := func() error {
+		if a.queue != nil {
+			return a.queue.Stop(ctx)
+		}
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := a.loopWaiter.Wait(ctx, &a.loopWG); err != nil {
+		_ = stopQueue()
+		return err
+	}
+	if err := a.handlerWaiter.Wait(ctx, &a.handlerWG); err != nil {
+		_ = stopQueue()
+		return err
+	}
+	return stopQueue()
 }
 
 // Send 发送消息到 Room
@@ -135,7 +176,7 @@ func (a *MatrixAdapter) sendReplyNow(ctx context.Context, roomID string, reply *
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxMatrixErrorBodyBytes))
 		return fmt.Errorf("matrix API 返回 %d: %s", resp.StatusCode, string(respBody))
 	}
 	return nil
@@ -162,6 +203,8 @@ func (a *MatrixAdapter) SendStream(ctx context.Context, roomID string, chunks <-
 // 退化场景兜底。错误路径已有 5s 退避，无需此节流。
 const syncMinInterval = 50 * time.Millisecond
 
+const maxMatrixErrorBodyBytes = 64 << 10
+
 // syncLoop 同步轮询循环
 func (a *MatrixAdapter) syncLoop(ctx context.Context) {
 	for {
@@ -173,8 +216,14 @@ func (a *MatrixAdapter) syncLoop(ctx context.Context) {
 		default:
 			if err := a.doSync(ctx); err != nil {
 				logger.Error("[Matrix] 同步错误", "error", err)
-				time.Sleep(5 * time.Second)
-				continue
+				select {
+				case <-a.stopCh:
+					return
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+					continue
+				}
 			}
 			// W3-16: 成功路径节流，防止服务端快速返回空响应时 CPU 空转。
 			// 用 select 等待，使 Stop/ctx 取消仍能即时打断、保持优雅停机响应性。
@@ -210,7 +259,7 @@ func (a *MatrixAdapter) doSync(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxMatrixErrorBodyBytes))
 		return fmt.Errorf("同步 API 返回 %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -265,13 +314,17 @@ func (a *MatrixAdapter) handleEvent(ctx context.Context, roomID string, event ma
 		Timestamp:  time.UnixMilli(event.OriginServerTS),
 	}
 
+	a.handlerWG.Add(1)
 	go func(m *adapter.Message) {
+		defer a.handlerWG.Done()
 		if a.handler == nil {
 			return
 		}
 		// H7: Detach(syncCtx) 保留 logger，脱离 sync loop cancel 避免消息处理半途被杀
 		bgCtx, cancel := context.WithTimeout(trace.Detach(ctx), 2*time.Minute)
 		defer cancel()
+		stopCancel := context.AfterFunc(a.workerCtx, cancel)
+		defer stopCancel()
 		reply, err := a.handler(bgCtx, m)
 		if err != nil {
 			logger.Error("[Matrix] 处理消息错误", "error", err)
@@ -310,7 +363,7 @@ func (a *MatrixAdapter) ValidateConfig(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxMatrixErrorBodyBytes))
 		return fmt.Errorf("matrix 凭证验证失败 (%d): %s", resp.StatusCode, string(respBody))
 	}
 	return nil

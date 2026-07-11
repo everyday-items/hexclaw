@@ -104,13 +104,19 @@ func (a *LineAdapter) Start(ctx context.Context, handler adapter.MessageHandler)
 
 // Stop 停止适配器
 func (a *LineAdapter) Stop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var queueErr error
 	if a.queue != nil {
-		_ = a.queue.Stop(context.Background())
+		queueErr = a.queue.Stop(ctx)
 	}
 	if a.server != nil {
-		return a.server.Shutdown(ctx)
+		if err := a.server.Shutdown(ctx); err != nil {
+			return err
+		}
 	}
-	return nil
+	return queueErr
 }
 
 // Handler 返回统一 ingress 使用的处理器。

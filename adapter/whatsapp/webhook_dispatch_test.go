@@ -2,6 +2,9 @@ package whatsapp
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +13,16 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 )
+
+const waTestAppSecret = "test-app-secret"
+
+func signedWARequest(method, target, body string) *http.Request {
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	mac := hmac.New(sha256.New, []byte(waTestAppSecret))
+	_, _ = mac.Write([]byte(body))
+	req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	return req
+}
 
 // Exercises the WhatsApp webhook handler: the GET verify-token handshake (the
 // platform's only inbound auth gate), method/parse guards, and the POST text
@@ -66,16 +79,16 @@ func TestHandleWebhook_MethodNotAllowed(t *testing.T) {
 }
 
 func TestHandleWebhook_BadJSONReturns400(t *testing.T) {
-	a := New(Config{})
+	a := New(Config{AppSecret: waTestAppSecret, VerifyToken: "verify"})
 	w := httptest.NewRecorder()
-	a.handleWebhook(w, httptest.NewRequest(http.MethodPost, "/wh", strings.NewReader("{not json")))
+	a.handleWebhook(w, signedWARequest(http.MethodPost, "/wh", "{not json"))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("malformed POST = %d, want 400", w.Code)
 	}
 }
 
 func TestHandleWebhook_DispatchesTextMessageWithContactName(t *testing.T) {
-	a := New(Config{})
+	a := New(Config{AppSecret: waTestAppSecret, VerifyToken: "verify"})
 	handler, sink := waMsgSink(t)
 	_ = a.Attach(handler)
 
@@ -84,7 +97,7 @@ func TestHandleWebhook_DispatchesTextMessageWithContactName(t *testing.T) {
 		"messages":[{"id":"wamid.1","from":"15551234567","type":"text","text":{"body":"hello there"}}]
 	}}]}]}`
 	w := httptest.NewRecorder()
-	a.handleWebhook(w, httptest.NewRequest(http.MethodPost, "/wh", strings.NewReader(body)))
+	a.handleWebhook(w, signedWARequest(http.MethodPost, "/wh", body))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("valid POST = %d, want 200", w.Code)
@@ -103,7 +116,7 @@ func TestHandleWebhook_DispatchesTextMessageWithContactName(t *testing.T) {
 }
 
 func TestHandleWebhook_IgnoresNonTextMessage(t *testing.T) {
-	a := New(Config{})
+	a := New(Config{AppSecret: waTestAppSecret, VerifyToken: "verify"})
 	handler, sink := waMsgSink(t)
 	_ = a.Attach(handler)
 
@@ -111,7 +124,7 @@ func TestHandleWebhook_IgnoresNonTextMessage(t *testing.T) {
 		"messages":[{"id":"wamid.2","from":"15550000000","type":"image"}]
 	}}]}]}`
 	w := httptest.NewRecorder()
-	a.handleWebhook(w, httptest.NewRequest(http.MethodPost, "/wh", strings.NewReader(body)))
+	a.handleWebhook(w, signedWARequest(http.MethodPost, "/wh", body))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)

@@ -169,23 +169,23 @@ func TestLivePicture_RealImageSolve_SendToDingtalk(t *testing.T) {
 			t.Logf("   → 尝试真实模型 model=%s", cand)
 			resp, cerr = p.Complete(ctx, llm.CompletionRequest{
 				Model: cand,
-			Messages: []llm.Message{
-				// 用户反馈迭代：v1 混英文推理 → v2 收太死只答 3 题无文字说明 →
-				// v3（本版）：整页逐题作答 + 题目原文 + 简要过程，仍禁思考过程/英文。
-				// v5：结构化分隔标记——推理模型的内部思考压不住就让它随便想，
-				// 但最终解答必须跟在标记之后，发送前只截取标记后内容（工程化剥离）。
-				{Role: "system", Content: "你是小明的五年级辅导助手。家长发来孩子的整页作业照片，请识别并解答**整页所有题目**。输出格式硬性要求：最后必须输出一行只含「===最终解答===」的分隔行，紧接着给出完整解答——按大题分节（如「一、直接写得数」），每小题一行：题目原文 + 「= 答案」；计算/简算与解方程给一行简要过程；应用题、思维题写清算式与最终答案。分隔行之后的解答**只能用中文**，不得出现英文或思考过程。"},
-				{
-					Role: "user",
-					MultiContent: []llm.ContentPart{
-						llm.NewTextPart("这是孩子的作业照片，请按要求识别并解答。"),
-						llm.NewImageURLPart("data:"+att.Mime+";base64,"+att.Data, "auto"),
+				Messages: []llm.Message{
+					// 用户反馈迭代：v1 混英文推理 → v2 收太死只答 3 题无文字说明 →
+					// v3（本版）：整页逐题作答 + 题目原文 + 简要过程，仍禁思考过程/英文。
+					// v5：结构化分隔标记——推理模型的内部思考压不住就让它随便想，
+					// 但最终解答必须跟在标记之后，发送前只截取标记后内容（工程化剥离）。
+					{Role: "system", Content: "你是小明的五年级辅导助手。家长发来孩子的整页作业照片，请识别并解答**整页所有题目**。输出格式硬性要求：最后必须输出一行只含「===最终解答===」的分隔行，紧接着给出完整解答——按大题分节（如「一、直接写得数」），每小题一行：题目原文 + 「= 答案」；计算/简算与解方程给一行简要过程；应用题、思维题写清算式与最终答案。分隔行之后的解答**只能用中文**，不得出现英文或思考过程。"},
+					{
+						Role: "user",
+						MultiContent: []llm.ContentPart{
+							llm.NewTextPart("这是孩子的作业照片，请按要求识别并解答。"),
+							llm.NewImageURLPart("data:"+att.Mime+";base64,"+att.Data, "auto"),
+						},
 					},
 				},
-			},
-			MaxTokens: 4000, // 整页 ~25 小题逐题作答，1200 不够截断
-			Temperature: &temp,
-		})
+				MaxTokens:   4000, // 整页 ~25 小题逐题作答，1200 不够截断
+				Temperature: &temp,
+			})
 			if cerr == nil {
 				break
 			}

@@ -286,7 +286,10 @@ func TestBuildAdapterMessagePreservesRequestIDAndExplicitModelRouting(t *testing
 		},
 	}
 
-	msg := buildAdapterMessage("chat-1", incoming)
+	msg, err := buildAdapterMessage("chat-1", incoming)
+	if err != nil {
+		t.Fatalf("buildAdapterMessage: %v", err)
+	}
 
 	if msg.ID == "" {
 		t.Fatal("消息 ID 不能为空")
@@ -322,7 +325,10 @@ func TestBuildAdapterMessageStripsForgedDispatchKeys(t *testing.T) {
 		},
 	}
 
-	msg := buildAdapterMessage("chat-1", incoming)
+	msg, err := buildAdapterMessage("chat-1", incoming)
+	if err != nil {
+		t.Fatalf("buildAdapterMessage: %v", err)
+	}
 
 	for _, k := range []string{"source", "cron_job_id", "spawn_depth", "tool_allow"} {
 		if _, ok := msg.Metadata[k]; ok {
@@ -334,6 +340,65 @@ func TestBuildAdapterMessageStripsForgedDispatchKeys(t *testing.T) {
 	}
 	if msg.Metadata["pinned_agent"] != "translator" {
 		t.Errorf("合法键 pinned_agent 被误删，实际 %q", msg.Metadata["pinned_agent"])
+	}
+}
+
+func TestBuildAdapterMessagePreservesValidatedSamplingOverrides(t *testing.T) {
+	temperature, maxTokens := 0.0, 1024
+	incoming := wsMessage{
+		Type:        "message",
+		Content:     "你好",
+		Temperature: &temperature,
+		MaxTokens:   &maxTokens,
+		Metadata: map[string]string{
+			"request_temperature": "1.9",
+			"request_max_tokens":  "999",
+			"agent_temperature":   "1.8",
+			"agent_max_tokens":    "888",
+		},
+	}
+
+	msg, err := buildAdapterMessage("chat-1", incoming)
+	if err != nil {
+		t.Fatalf("buildAdapterMessage: %v", err)
+	}
+	if got := msg.Metadata["request_temperature"]; got != "0" {
+		t.Fatalf("temperature 未透传，实际 %q", got)
+	}
+	if got := msg.Metadata["request_max_tokens"]; got != "1024" {
+		t.Fatalf("max_tokens 未透传，实际 %q", got)
+	}
+	if _, ok := msg.Metadata["agent_temperature"]; ok {
+		t.Fatal("WebSocket metadata 不得伪造可信 Agent temperature")
+	}
+	if _, ok := msg.Metadata["agent_max_tokens"]; ok {
+		t.Fatal("WebSocket metadata 不得伪造可信 Agent max_tokens")
+	}
+}
+
+func TestBuildAdapterMessageRejectsInvalidSamplingOverrides(t *testing.T) {
+	temperature, maxTokens := 2.1, 0
+	if _, err := buildAdapterMessage("chat-1", wsMessage{
+		Type:        "message",
+		Content:     "你好",
+		Temperature: &temperature,
+	}); err == nil {
+		t.Fatal("越界 temperature 应被拒绝")
+	}
+	if _, err := buildAdapterMessage("chat-1", wsMessage{
+		Type:      "message",
+		Content:   "你好",
+		MaxTokens: &maxTokens,
+	}); err == nil {
+		t.Fatal("max_tokens=0 应被拒绝")
+	}
+	excessive := 1_000_001
+	if _, err := buildAdapterMessage("chat-1", wsMessage{
+		Type:      "message",
+		Content:   "你好",
+		MaxTokens: &excessive,
+	}); err == nil {
+		t.Fatal("超大 max_tokens 应被拒绝")
 	}
 }
 

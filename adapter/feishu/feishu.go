@@ -140,11 +140,13 @@ func (a *FeishuAdapter) Start(_ context.Context, handler adapter.MessageHandler)
 }
 
 // Stop 停止飞书适配器
-func (a *FeishuAdapter) Stop(_ context.Context) error {
+func (a *FeishuAdapter) Stop(ctx context.Context) error {
 	a.stopped.Store(true)
 	a.connected.Store(false)
 	if a.queue != nil {
-		_ = a.queue.Stop(context.Background())
+		if err := a.queue.Stop(ctx); err != nil {
+			return err
+		}
 	}
 	logger.Info("飞书适配器停止中...")
 	return nil

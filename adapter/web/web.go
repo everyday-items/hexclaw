@@ -238,7 +238,7 @@ func (a *WebAdapter) Send(ctx context.Context, chatID string, reply *adapter.Rep
 	if !ok {
 		return nil
 	}
-	msg := wsMessage{Type: "reply", Content: reply.Content, Metadata: reply.Metadata}
+	msg := wsMessage{Type: "reply", Content: reply.Content, Metadata: reply.Metadata, KnowledgeHits: reply.KnowledgeHits, MemoryHits: reply.MemoryHits} // U9
 	if reply.Metadata != nil {
 		msg.SessionID = reply.Metadata["session_id"]
 		msg.RequestID = reply.Metadata["request_id"]
@@ -283,16 +283,18 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 		}
 
 		msg := wsMessage{
-			Type:      "chunk",
-			Content:   chunk.Content,
-			Reasoning: chunk.Reasoning,
-			Done:      chunk.Done,
-			SessionID: sessionID,
-			RequestID: requestID,
-			Metadata:  chunk.Metadata,
-			Usage:     chunk.Usage,
-			ToolCalls: chunk.ToolCalls,
-			Blocks:    chunk.Blocks,
+			Type:          "chunk",
+			Content:       chunk.Content,
+			Reasoning:     chunk.Reasoning,
+			Done:          chunk.Done,
+			SessionID:     sessionID,
+			RequestID:     requestID,
+			Metadata:      chunk.Metadata,
+			Usage:         chunk.Usage,
+			ToolCalls:     chunk.ToolCalls,
+			Blocks:        chunk.Blocks,
+			KnowledgeHits: chunk.KnowledgeHits, // U9
+			MemoryHits:    chunk.MemoryHits,
 		}
 		if msg.Metadata != nil {
 			if msg.SessionID == "" {
@@ -389,7 +391,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			continue
 		case "tool_approval_response":
 			if a.onApprovalResponse != nil {
-				reqID, _ := incoming.Metadata["request_id"]
+				reqID := incoming.Metadata["request_id"]
 				approved := incoming.Content == "approved"
 				remember := incoming.Content == "approved_remember"
 				a.onApprovalResponse(reqID, approved || remember, remember)
@@ -409,7 +411,11 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			incoming.RequestID = "req-" + idgen.ShortID()
 		}
 
-		msg := buildAdapterMessage(chatID, incoming)
+		msg, err := buildAdapterMessage(chatID, incoming)
+		if err != nil {
+			_ = wsjson.Write(r.Context(), conn, wsMessage{Type: "error", Content: err.Error()})
+			continue
+		}
 		msg.InstanceID = a.Name()
 		if incoming.SessionID != "" {
 			a.sessionConns.Store(incoming.SessionID, chatID)
@@ -471,14 +477,16 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			respMsg := wsMessage{
-				Type:      "reply",
-				Content:   reply.Content,
-				SessionID: msg.SessionID,
-				RequestID: incoming.RequestID,
-				Metadata:  reply.Metadata,
-				Usage:     reply.Usage,
-				ToolCalls: reply.ToolCalls,
-				Blocks:    reply.Blocks,
+				Type:          "reply",
+				Content:       reply.Content,
+				SessionID:     msg.SessionID,
+				RequestID:     incoming.RequestID,
+				Metadata:      reply.Metadata,
+				Usage:         reply.Usage,
+				ToolCalls:     reply.ToolCalls,
+				Blocks:        reply.Blocks,
+				KnowledgeHits: reply.KnowledgeHits, // U9
+				MemoryHits:    reply.MemoryHits,
 			}
 			if reply.Metadata == nil {
 				respMsg.Metadata = map[string]string{}
@@ -580,12 +588,17 @@ type wsMessage struct {
 	Provider    string               `json:"provider,omitempty"`
 	Model       string               `json:"model,omitempty"`
 	Role        string               `json:"role,omitempty"`
+	Temperature *float64             `json:"temperature,omitempty"`
+	MaxTokens   *int                 `json:"max_tokens,omitempty"`
 	Done        bool                 `json:"done,omitempty"`
 	Metadata    map[string]string    `json:"metadata,omitempty"`
 	Usage       *adapter.Usage       `json:"usage,omitempty"`
 	ToolCalls   []adapter.ToolCall   `json:"tool_calls,omitempty"`
 	Blocks      []adapter.Block      `json:"blocks,omitempty"`
 	Attachments []adapter.Attachment `json:"attachments,omitempty"`
+	// U9：结构化 RAG/记忆命中（随 done chunk / reply 回传前端渲染命中标签+详情）。
+	KnowledgeHits []adapter.KnowledgeHit `json:"knowledge_hits,omitempty"`
+	MemoryHits    []adapter.MemoryHit    `json:"memory_hits,omitempty"`
 }
 
 // MarshalJSON 自定义序列化（省略空字段）。
@@ -594,7 +607,7 @@ func (m wsMessage) MarshalJSON() ([]byte, error) {
 	return json.Marshal((Alias)(m))
 }
 
-func buildAdapterMessage(chatID string, incoming wsMessage) *adapter.Message {
+func buildAdapterMessage(chatID string, incoming wsMessage) (*adapter.Message, error) {
 	userID := incoming.UserID
 	if userID == "" {
 		userID = "web-user"
@@ -606,6 +619,9 @@ func buildAdapterMessage(chatID string, incoming wsMessage) *adapter.Message {
 	// GO-3：WebSocket 入站是信任边界——剥除只能由受信内部派发器盖章的保留键，
 	// 否则客户端可伪造 source=cron + cron_job_id 盗用他人任务的授权（提权）。
 	adapter.StripReservedDispatchMetadata(metadata)
+	if err := adapter.ApplyRequestSamplingOverrides(metadata, incoming.Temperature, incoming.MaxTokens); err != nil {
+		return nil, err
+	}
 	if incoming.RequestID != "" {
 		metadata["request_id"] = incoming.RequestID
 	}
@@ -630,5 +646,5 @@ func buildAdapterMessage(chatID string, incoming wsMessage) *adapter.Message {
 		Attachments: incoming.Attachments,
 		Timestamp:   time.Now(),
 		Metadata:    metadata,
-	}
+	}, nil
 }

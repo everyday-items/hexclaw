@@ -21,6 +21,11 @@ var ReservedDispatchMetadataKeys = []string{
 	"dispatch_role",
 	"cron_claim_unverified",
 	"cron_context",
+	// 路由身份：只应由引擎内部路由（react.go 路由块 / applyPinnedAgent）在 Strip 之后
+	// 写入。客户端提供即伪造——带 provider hint 令路由块跳过时，伪造的 routed_agent 会
+	// 被 skill.WithRoutedAgent 采纳，绕过 agent 存在性校验跨孩子写记录（R1 High）。
+	"routed_agent",
+	"route_source",
 }
 
 // StripReservedDispatchMetadata 从不可信客户端 metadata 中剥除保留派发键。

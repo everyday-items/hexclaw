@@ -52,13 +52,22 @@ type DingtalkAdapter struct {
 
 	streamClient *dtclient.StreamClient
 	streamCancel context.CancelFunc
+	streamWG     sync.WaitGroup
+	streamWaiter adapter.LifecycleWaiter
+	workerMu     sync.Mutex
+	workers      sync.WaitGroup
+	workerWaiter adapter.LifecycleWaiter
+	workerCtx    context.Context
+	workerCancel context.CancelFunc
+	stopping     bool
 	connected    atomic.Bool
 	stopped      atomic.Bool
 }
 
 // New 创建钉钉适配器
 func New(cfg config.DingtalkConfig) *DingtalkAdapter {
-	a := &DingtalkAdapter{cfg: cfg}
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	a := &DingtalkAdapter{cfg: cfg, workerCtx: workerCtx, workerCancel: workerCancel}
 	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformDingtalk, a.sendReplyNow)
 	return a
 }
@@ -66,6 +75,17 @@ func New(cfg config.DingtalkConfig) *DingtalkAdapter {
 // dingtalkThinkingFeedback 是「收到消息、正在处理」的占位提示。发送前先发它给用户即时反馈，
 // 最终答案输出后再撤回（recall），使占位不残留（BUG-20260704：不删除占位、改为答案就位后撤回）。
 const dingtalkThinkingFeedback = "⌨️ 已收到，正在思考…"
+
+// dtMsgTypePicture 是钉钉图片消息的 msgtype——唯一允许经 downloadCode 进图片
+// 多模态管道的富媒体类型（BUG-20260710：audio/video/file 同以 downloadCode 承载，
+// 硬贴 image 附件会让 provider 400）。
+const dtMsgTypePicture = "picture"
+
+// dingtalkUnsupportedMediaFeedback 是非图片富媒体（语音/视频/文件）的降级提示（BUG-20260710）。
+const dingtalkUnsupportedMediaFeedback = "⚠️ 暂不支持语音/视频/文件消息，请发送文字或图片。"
+
+// dtMaxPictureBytes 是图片下载上限（防 OOM）；超限报错而非静默截断（BUG-20260710·审查 M-9）。
+const dtMaxPictureBytes = 10 << 20
 
 type dingtalkOpenAPI interface {
 	GetAccessToken(ctx context.Context, appKey, appSecret string) (string, time.Duration, error)
@@ -217,7 +237,7 @@ func (c *officialDingtalkOpenAPI) RecallOTO(_ context.Context, accessToken, robo
 }
 
 // DownloadMessageFile 用 downloadCode 换媒体文件临时下载 URL
-//（官方 robot/messageFiles/download API·BUG-20260709 picture 消息进管道的前置步骤）。
+// （官方 robot/messageFiles/download API·BUG-20260709 picture 消息进管道的前置步骤）。
 func (c *officialDingtalkOpenAPI) DownloadMessageFile(_ context.Context, accessToken, robotCode, downloadCode string) (string, error) {
 	resp, err := c.robot.RobotMessageFileDownloadWithOptions(
 		(&dtrobot.RobotMessageFileDownloadRequest{}).
@@ -254,20 +274,32 @@ func (a *DingtalkAdapter) Name() string {
 func (a *DingtalkAdapter) Platform() adapter.Platform { return adapter.PlatformDingtalk }
 
 // Start 启动钉钉 Stream 长连接（使用官方 dingtalk-stream-sdk-go）
-func (a *DingtalkAdapter) Start(_ context.Context, handler adapter.MessageHandler) error {
+func (a *DingtalkAdapter) Start(ctx context.Context, handler adapter.MessageHandler) error {
 	a.handler = handler
 	a.stopped.Store(false)
 
 	if a.cfg.AppKey == "" || a.cfg.AppSecret == "" {
 		return fmt.Errorf("dingtalk app_key/app_secret 未配置")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.streamWaiter.Reset()
+	a.workerWaiter.Reset()
+	a.workerMu.Lock()
+	a.stopping = false
+	if a.workerCancel != nil {
+		a.workerCancel()
+	}
+	a.workerCtx, a.workerCancel = context.WithCancel(ctx)
+	a.workerMu.Unlock()
 
 	cli := dtclient.NewStreamClient(
 		dtclient.WithAppCredential(dtclient.NewAppCredentialConfig(a.cfg.AppKey, a.cfg.AppSecret)),
 	)
 	cli.RegisterChatBotCallbackRouter(a.onChatBotMessage)
 	a.streamClient = cli
-	streamCtx, cancel := context.WithCancel(context.Background())
+	streamCtx, cancel := context.WithCancel(ctx)
 	a.mu.Lock()
 	if a.streamCancel != nil {
 		a.streamCancel()
@@ -278,7 +310,9 @@ func (a *DingtalkAdapter) Start(_ context.Context, handler adapter.MessageHandle
 	// 官方 SDK 的 Start 在首次建连成功后即返回（内部起 processLoop + 自动重连），失败才返回 error。
 	// 放到 goroutine 中执行：与飞书一致保持 Start 非阻塞，并把建连结果记入 connected/lastError 供
 	// Health 透出（首次建连失败是用户「点击测试报 Stream 未连接」最常见的场景）。
+	a.streamWG.Add(1)
 	go func() {
+		defer a.streamWG.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				a.connected.Store(false)
@@ -314,12 +348,18 @@ func (a *DingtalkAdapter) Start(_ context.Context, handler adapter.MessageHandle
 }
 
 // Stop 停止钉钉适配器
-func (a *DingtalkAdapter) Stop(_ context.Context) error {
+func (a *DingtalkAdapter) Stop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	a.stopped.Store(true)
 	a.connected.Store(false)
-	if a.queue != nil {
-		_ = a.queue.Stop(context.Background())
+	a.workerMu.Lock()
+	a.stopping = true
+	if a.workerCancel != nil {
+		a.workerCancel()
 	}
+	a.workerMu.Unlock()
 	a.mu.Lock()
 	cancel := a.streamCancel
 	a.streamCancel = nil
@@ -336,8 +376,38 @@ func (a *DingtalkAdapter) Stop(_ context.Context) error {
 		a.streamClient.Close()
 	}
 
+	var stopErr error
+	if err := a.streamWaiter.Wait(ctx, &a.streamWG); err != nil {
+		stopErr = err
+	}
+	if err := a.workerWaiter.Wait(ctx, &a.workers); err != nil && stopErr == nil {
+		stopErr = err
+	}
+	if a.queue != nil {
+		if err := a.queue.Stop(ctx); err != nil && stopErr == nil {
+			stopErr = err
+		}
+	}
 	logger.Info("钉钉适配器停止中...", "name", a.Name())
-	return nil
+	return stopErr
+}
+
+func (a *DingtalkAdapter) runWorker(fn func(context.Context)) bool {
+	a.workerMu.Lock()
+	defer a.workerMu.Unlock()
+	if a.stopping {
+		return false
+	}
+	workerCtx := a.workerCtx
+	if workerCtx == nil {
+		workerCtx = context.Background()
+	}
+	a.workers.Add(1)
+	go func() {
+		defer a.workers.Done()
+		fn(workerCtx)
+	}()
+	return true
 }
 
 // Handler 返回 HTTP Handler（保留向后兼容，Stream 模式下不使用）
@@ -374,7 +444,9 @@ func (a *DingtalkAdapter) onChatBotMessage(_ context.Context, data *dtchatbot.Bo
 	}
 
 	if strings.TrimSpace(event.Text.Content) != "" || event.Content.DownloadCode != "" {
-		go a.handleMessage(event)
+		if !a.runWorker(func(ctx context.Context) { a.handleMessageContext(ctx, event) }) {
+			return nil, fmt.Errorf("dingtalk adapter stopping")
+		}
 	}
 	return []byte(""), nil
 }
@@ -411,7 +483,10 @@ func (a *DingtalkAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 
 	// BUG-20260709：picture 消息正文为空但带 downloadCode，同样要进管道
 	if event.Text.Content != "" || event.Content.DownloadCode != "" {
-		go a.handleMessage(event)
+		if !a.runWorker(func(ctx context.Context) { a.handleMessageContext(ctx, event) }) {
+			http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -548,13 +623,20 @@ func (a *DingtalkAdapter) SendStream(ctx context.Context, chatID string, chunks 
 
 // handleMessage 处理消息
 func (a *DingtalkAdapter) handleMessage(event dtEvent) {
+	a.handleMessageContext(context.Background(), event)
+}
+
+func (a *DingtalkAdapter) handleMessageContext(baseCtx context.Context, event dtEvent) {
 	if a.handler == nil {
 		return
+	}
+	if baseCtx == nil {
+		baseCtx = context.Background()
 	}
 
 	content := strings.TrimSpace(event.Text.Content)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(baseCtx, 2*time.Minute)
 	defer cancel()
 
 	// picture 消息（BUG-20260709）：downloadCode → 临时下载 URL → 图片字节 → image 附件，
@@ -562,10 +644,20 @@ func (a *DingtalkAdapter) handleMessage(event dtEvent) {
 	// 下载失败给用户明确提示，绝不静默丢弃。
 	var attachments []adapter.Attachment
 	if event.Content.DownloadCode != "" {
+		// BUG-20260710：钉钉的语音/视频/文件回调同样以 content.downloadCode 承载。
+		// 只有 msgtype=picture 才能走图片下载进多模态管道；其余类型硬贴 image 附件
+		// 会让 provider 400、用户收到不可归因报错——此处给出明确"暂不支持"提示后返回。
+		if event.MsgType != dtMsgTypePicture {
+			logger.Warn("钉钉: 收到暂不支持的富媒体消息", "msgtype", event.MsgType)
+			ntCtx, ntCancel := context.WithTimeout(ctx, 10*time.Second)
+			defer ntCancel()
+			_ = a.Send(ntCtx, event.SenderStaffId, &adapter.Reply{Content: dingtalkUnsupportedMediaFeedback})
+			return
+		}
 		att, err := a.downloadPictureAttachment(ctx, event.Content.DownloadCode)
 		if err != nil {
 			logger.Error("钉钉: 下载图片消息失败", "error", err)
-			errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			errCtx, errCancel := context.WithTimeout(ctx, 10*time.Second)
 			defer errCancel()
 			_ = a.Send(errCtx, event.SenderStaffId, &adapter.Reply{Content: "⚠️ 图片获取失败，请重新发送一次。"})
 			return
@@ -597,21 +689,24 @@ func (a *DingtalkAdapter) handleMessage(event dtEvent) {
 
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		logger.Error("钉钉: 处理消息失败", "error", err)
-		errCtx, errCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		errCtx, errCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer errCancel()
 		_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{Content: "处理消息时出现错误，请稍后重试。"})
 		a.recallThinkingFeedback(errCtx, thinkingKey)
 		return
 	}
 	if reply == nil {
-		rcCtx, rcCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		rcCtx, rcCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer rcCancel()
 		a.recallThinkingFeedback(rcCtx, thinkingKey)
 		return
 	}
 
-	sendCtx, sendCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	sendCtx, sendCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer sendCancel()
 	if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
 		logger.Error("钉钉: 发送回复失败", "error", err)
@@ -621,7 +716,8 @@ func (a *DingtalkAdapter) handleMessage(event dtEvent) {
 }
 
 // downloadPictureAttachment 把 picture 消息的 downloadCode 兑换成 image 附件（BUG-20260709）：
-// openAPI 换临时下载 URL → GET 图片字节（上限 10MiB 防 OOM）→ base64 + MIME 嗅探。
+// openAPI 换临时下载 URL → GET 图片字节（上限 dtMaxPictureBytes 防 OOM，超限报错不截断）
+// → base64 + MIME 嗅探。
 func (a *DingtalkAdapter) downloadPictureAttachment(ctx context.Context, downloadCode string) (adapter.Attachment, error) {
 	token, err := a.getAccessToken(ctx)
 	if err != nil {
@@ -647,16 +743,21 @@ func (a *DingtalkAdapter) downloadPictureAttachment(ctx context.Context, downloa
 	if resp.StatusCode != http.StatusOK {
 		return adapter.Attachment{}, fmt.Errorf("下载图片失败: HTTP %d", resp.StatusCode)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	// BUG-20260710（审查 M-9）：多读 1 字节探测超限——此前 LimitReader 恰好超限时
+	// 静默截断产生坏 base64；现在超限返回明确错误，走"图片获取失败"用户反馈路径。
+	data, err := io.ReadAll(io.LimitReader(resp.Body, dtMaxPictureBytes+1))
 	if err != nil {
 		return adapter.Attachment{}, fmt.Errorf("读取图片字节失败: %w", err)
+	}
+	if len(data) > dtMaxPictureBytes {
+		return adapter.Attachment{}, fmt.Errorf("图片超过 %d MiB 上限，拒绝截断收取", dtMaxPictureBytes>>20)
 	}
 	if len(data) == 0 {
 		return adapter.Attachment{}, fmt.Errorf("图片内容为空")
 	}
-	mime := resp.Header.Get("Content-Type")
-	if mime == "" || !strings.HasPrefix(mime, "image/") {
-		mime = http.DetectContentType(data)
+	mime := http.DetectContentType(data)
+	if !strings.HasPrefix(strings.ToLower(mime), "image/") {
+		return adapter.Attachment{}, fmt.Errorf("下载内容 MIME %q 不是图片", mime)
 	}
 	return adapter.Attachment{
 		Type: "image",
