@@ -14,6 +14,7 @@ import (
 	"github.com/hexagon-codes/ai-core/gateway/llmcall"
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/hexclaw/egress"
 )
 
 // ProviderResolver 在每次 Compile 时被调用，返回 provider + model。
@@ -117,6 +118,7 @@ func (c *LLMCompiler) CompileWithProgress(
 		}
 		return spec, nil
 	}
+	ctx = egress.WithRequest(ctx, egress.PurposeAutomationBuild, "", egress.ClassGeneral)
 
 	// 每次 Compile 时动态解析当前默认 provider+model（2026-05-27 用户反馈）
 	// resolver != nil 走生产路径；nil 时回退到静态字段（测试 / stub compiler 走这里）。

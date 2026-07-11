@@ -2,8 +2,8 @@ package render
 
 import (
 	"context"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -86,16 +86,12 @@ func TestPreprocessMarkdown_RelativePathStripped(t *testing.T) {
 }
 
 func TestPreprocessMarkdown_RemoteImageInlined(t *testing.T) {
-	// 启动本地测试服务器
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "image/png")
-		w.Write([]byte("fake-png-bytes"))
-	}))
-	defer srv.Close()
-
-	// SSRF 闸门已移除：远程图片（含 loopback 测试服务器）正常拉取并内联为 data URL。
-	in := "![pic](" + srv.URL + ")"
+	client := &http.Client{Transport: redirectRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return imageResponse(req), nil
+	})}
+	in := "![pic](http://93.184.216.34/image.png)"
 	out, err := PreprocessMarkdown(context.Background(), in, PreprocessConfig{
+		HTTPClient:      client,
 		PerImageTimeout: time.Second,
 		MaxImageBytes:   1 << 20,
 	})
@@ -109,24 +105,30 @@ func TestPreprocessMarkdown_RemoteImageInlined(t *testing.T) {
 
 func TestPreprocessMarkdown_OversizedImageRejected(t *testing.T) {
 	// 响应体超过 MaxImageBytes，应被 CodeInputTooLarge 拒绝。
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "image/png")
+	client := &http.Client{Transport: redirectRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		// 写超过 cfg.MaxImageBytes 的内容
 		big := make([]byte, 100)
 		for i := range big {
 			big[i] = 'X'
 		}
-		w.Write(big)
-	}))
-	defer srv.Close()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"image/png"}},
+			Body:       io.NopCloser(strings.NewReader(string(big))),
+			Request:    req,
+		}, nil
+	})}
 
-	in := "![](" + srv.URL + ")"
+	in := "![](http://93.184.216.34/image.png)"
 	_, err := PreprocessMarkdown(context.Background(), in, PreprocessConfig{
+		HTTPClient:      client,
 		PerImageTimeout: time.Second,
 		MaxImageBytes:   50, // 小于响应体
 	})
 	if err == nil {
 		t.Error("expected error (image too large)")
+	} else if renderErr, ok := err.(*RenderError); !ok || renderErr.Code != CodeInputTooLarge {
+		t.Fatalf("oversized image error = %T %v, want %s", err, err, CodeInputTooLarge)
 	}
 }
 
@@ -153,11 +155,11 @@ func TestPreprocessMarkdown_NoImagesUnchanged(t *testing.T) {
 
 func TestImageRefPattern(t *testing.T) {
 	cases := map[string]string{
-		`![alt](url)`:                     "url",
-		`![alt with spaces](url)`:         "url",
-		`![](url)`:                        "url",
+		`![alt](url)`:                       "url",
+		`![alt with spaces](url)`:           "url",
+		`![](url)`:                          "url",
 		`![alt](https://example.com/p.png)`: "https://example.com/p.png",
-		`![alt](url "title")`:             "url",
+		`![alt](url "title")`:               "url",
 	}
 	for in, want := range cases {
 		groups := imageRefPattern.FindStringSubmatch(in)

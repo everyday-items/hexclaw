@@ -37,8 +37,8 @@ func newFKStore(t *testing.T) *Store {
 func TestT1_2_ImportRecordsAtomic_RollbackOnMidBatchFailure(t *testing.T) {
 	s := newFKStore(t)
 	ctx := context.Background()
-	good := &AgentRecord{RecordID: "g1", AgentName: "mingming", Collection: "ladder", Status: "new", SourceSession: "s"}
-	bad := &AgentRecord{RecordID: "b1", AgentName: "ghost", Collection: "ladder", Status: "new"} // FK 违约
+	good := &AgentRecord{RecordID: "g1", AgentName: "mingming", Collection: "ladder", SchemaVersion: 1, Status: "new", SourceSession: "s"}
+	bad := &AgentRecord{RecordID: "b1", AgentName: "ghost", Collection: "ladder", SchemaVersion: 1, Status: "new"} // FK 违约
 
 	err := s.ImportRecords(ctx, []*AgentRecord{good, bad})
 	if err == nil {
@@ -54,8 +54,8 @@ func TestT1_2_ImportRecordsAtomic_AllOrNothingSuccess(t *testing.T) {
 	s := newFKStore(t)
 	ctx := context.Background()
 	recs := []*AgentRecord{
-		{RecordID: "a1", AgentName: "mingming", Collection: "ladder", Status: "new", DedupeKey: "k1", SourceSession: "s1"},
-		{RecordID: "a2", AgentName: "mingming", Collection: "ladder", Status: "retried", DedupeKey: "k2", SourceSession: "s2"},
+		{RecordID: "a1", AgentName: "mingming", Collection: "ladder", SchemaVersion: 1, Status: "new", DedupeKey: "k1", SourceSession: "s1"},
+		{RecordID: "a2", AgentName: "mingming", Collection: "ladder", SchemaVersion: 1, Status: "retried", DedupeKey: "k2", SourceSession: "s2"},
 	}
 	if err := s.ImportRecords(ctx, recs); err != nil {
 		t.Fatalf("全合法批量导入应成功: %v", err)

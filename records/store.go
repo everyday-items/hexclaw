@@ -39,7 +39,7 @@ func (s *Store) Put(ctx context.Context, r *AgentRecord) (created bool, err erro
 	}
 	if schema.ValidateFields != nil {
 		if err := schema.ValidateFields(r.Fields); err != nil {
-			return false, fmt.Errorf("records: 记录集 %q 字段校验失败: %w", r.Collection, err)
+			return false, fmt.Errorf("%w: 记录集 %q: %v", ErrInvalidFields, r.Collection, err)
 		}
 	}
 
@@ -82,9 +82,10 @@ ON CONFLICT(agent_name, collection, dedupe_key) DO NOTHING`,
 	var existingID string
 	if qErr := s.db.QueryRowContext(ctx,
 		`SELECT record_id FROM agent_records WHERE agent_name = ? AND collection = ? AND dedupe_key = ?`,
-		r.AgentName, r.Collection, r.DedupeKey).Scan(&existingID); qErr == nil {
-		r.RecordID = existingID
+		r.AgentName, r.Collection, r.DedupeKey).Scan(&existingID); qErr != nil {
+		return false, fmt.Errorf("records: 去重命中后回查记录失败: %w", qErr)
 	}
+	r.RecordID = existingID
 	return false, nil
 }
 
@@ -142,6 +143,19 @@ func (s *Store) ListDue(ctx context.Context, agentName, collection string, befor
 // expectedVersion 与库中不符 → ErrVersionConflict（防 IM + 桌面并发写丢更新）。
 // newStatus 必须 ∈ 记录集状态机。可同时更新 due_at（nil = 清空到期，移出到期队列）。
 func (s *Store) UpdateStatus(ctx context.Context, recordID, newStatus string, dueAt *int64, expectedVersion int) error {
+	return s.updateStatusScoped(ctx, "", recordID, newStatus, dueAt, expectedVersion)
+}
+
+// UpdateStatusScoped 与 UpdateStatus 相同，但把 agentName 同时放进 CAS WHERE，
+// 避免仅凭 record_id 跨实例推进记录状态。scope 不匹配按不存在返回。
+func (s *Store) UpdateStatusScoped(ctx context.Context, agentName, recordID, newStatus string, dueAt *int64, expectedVersion int) error {
+	if agentName == "" {
+		return ErrNotFound
+	}
+	return s.updateStatusScoped(ctx, agentName, recordID, newStatus, dueAt, expectedVersion)
+}
+
+func (s *Store) updateStatusScoped(ctx context.Context, agentName, recordID, newStatus string, dueAt *int64, expectedVersion int) error {
 	cur, err := s.Get(ctx, recordID)
 	if err != nil {
 		return err
@@ -156,17 +170,31 @@ func (s *Store) UpdateStatus(ctx context.Context, recordID, newStatus string, du
 	if !schema.canTransition(cur.Status, newStatus) {
 		return fmt.Errorf("%w: 记录集 %q 不允许 %q→%q", ErrIllegalTransition, cur.Collection, cur.Status, newStatus)
 	}
+	if agentName != "" && cur.AgentName != agentName {
+		return ErrNotFound
+	}
 
-	res, err := s.db.ExecContext(ctx, `
+	query := `
 UPDATE agent_records
    SET status = ?, due_at = ?, version = version + 1, updated_at = ?
- WHERE record_id = ? AND version = ?`,
-		newStatus, dueAt, nowUnix(), recordID, expectedVersion)
+ WHERE record_id = ? AND version = ?`
+	args := []any{newStatus, dueAt, nowUnix(), recordID, expectedVersion}
+	if agentName != "" {
+		query += ` AND agent_name = ?`
+		args = append(args, agentName)
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("records: 更新失败: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
+		if agentName != "" {
+			var exists int
+			if qErr := s.db.QueryRowContext(ctx, `SELECT 1 FROM agent_records WHERE record_id = ? AND agent_name = ?`, recordID, agentName).Scan(&exists); qErr == sql.ErrNoRows {
+				return ErrNotFound
+			}
+		}
 		return ErrVersionConflict
 	}
 	return nil
@@ -192,7 +220,7 @@ func (s *Store) UpdateStatusFields(ctx context.Context, recordID, newStatus stri
 	}
 	if schema.ValidateFields != nil {
 		if err := schema.ValidateFields(fieldsJSON); err != nil {
-			return fmt.Errorf("records: 记录集 %q 字段校验失败: %w", cur.Collection, err)
+			return fmt.Errorf("%w: 记录集 %q: %v", ErrInvalidFields, cur.Collection, err)
 		}
 	}
 
@@ -226,7 +254,8 @@ ON CONFLICT(record_id) DO UPDATE SET
     agent_name=excluded.agent_name, collection=excluded.collection, schema_version=excluded.schema_version,
     status=excluded.status, fields_json=excluded.fields_json, dedupe_key=excluded.dedupe_key,
     tags_json=excluded.tags_json, due_at=excluded.due_at, source_session_id=excluded.source_session_id,
-    version=excluded.version, created_at=excluded.created_at, updated_at=excluded.updated_at`
+    version=excluded.version, created_at=excluded.created_at, updated_at=excluded.updated_at
+WHERE agent_records.agent_name = excluded.agent_name`
 
 // execer 抽象 *sql.DB 与 *sql.Tx，让导入 SQL 在直连或事务内共用。
 type execer interface {
@@ -234,16 +263,54 @@ type execer interface {
 }
 
 func importRecordVia(ctx context.Context, e execer, r *AgentRecord) error {
-	_, err := e.ExecContext(ctx, importRecordSQL,
+	res, err := e.ExecContext(ctx, importRecordSQL,
 		r.RecordID, r.AgentName, r.Collection, r.SchemaVersion, r.Status, r.Fields,
 		r.DedupeKey, r.Tags, r.DueAt, r.SourceSession, r.Version, r.CreatedAt, r.UpdatedAt)
-	return err
+	if err != nil {
+		return err
+	}
+	if n, rowsErr := res.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if n == 0 {
+		return fmt.Errorf("records: record_id %q 已属于其他实例", r.RecordID)
+	}
+	return nil
+}
+
+func (s *Store) validateImportRecord(r *AgentRecord, expectedAgent string) error {
+	if r == nil {
+		return fmt.Errorf("%w: 导入记录不可为 nil", ErrInvalidRecord)
+	}
+	if r.RecordID == "" || r.AgentName == "" || r.Collection == "" {
+		return fmt.Errorf("%w: 导入记录缺少 record_id / agent_name / collection", ErrInvalidRecord)
+	}
+	if expectedAgent != "" && r.AgentName != expectedAgent {
+		return fmt.Errorf("%w: 导入记录 %q 不属于实例 %q", ErrInvalidRecord, r.RecordID, expectedAgent)
+	}
+	schema, err := s.registry.Get(r.Collection)
+	if err != nil {
+		return err
+	}
+	if r.SchemaVersion <= 0 || r.SchemaVersion > schema.Version {
+		return fmt.Errorf("%w: 记录 %q schema v%d 超出 %q 支持的 v%d", ErrInvalidRecord, r.RecordID, r.SchemaVersion, r.Collection, schema.Version)
+	}
+	if !schema.hasStatus(r.Status) {
+		return fmt.Errorf("%w: %q 不在记录集 %q 的状态机内", ErrInvalidStatus, r.Status, r.Collection)
+	}
+	if schema.ValidateFields != nil {
+		if err := schema.ValidateFields(r.Fields); err != nil {
+			return fmt.Errorf("%w: 记录集 %q: %v", ErrInvalidFields, r.Collection, err)
+		}
+	}
+	return nil
 }
 
 // ImportRecord 原样导入一条记录（恢复用，保留 record_id/status/时间戳等全部字段）。
-//
-// 与 Put 不同：不走 dedupe/schema 校验，逐字段还原；record_id 冲突则整条覆盖（幂等恢复）。
+// 导入前校验注册 schema/status/fields；record_id 只允许覆盖同 agent 记录。
 func (s *Store) ImportRecord(ctx context.Context, r *AgentRecord) error {
+	if err := s.validateImportRecord(r, ""); err != nil {
+		return err
+	}
 	if err := importRecordVia(ctx, s.db, r); err != nil {
 		return fmt.Errorf("records: 导入失败: %w", err)
 	}
@@ -255,6 +322,11 @@ func (s *Store) ImportRecord(ctx context.Context, r *AgentRecord) error {
 func (s *Store) ImportRecords(ctx context.Context, recs []*AgentRecord) error {
 	if len(recs) == 0 {
 		return nil
+	}
+	for _, r := range recs {
+		if err := s.validateImportRecord(r, ""); err != nil {
+			return err
+		}
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -268,6 +340,107 @@ func (s *Store) ImportRecords(ctx context.Context, recs []*AgentRecord) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("records: 提交导入事务: %w", err)
+	}
+	return nil
+}
+
+// ImportAgentRecordsTx atomically merges one archive batch into an existing
+// agent through a caller-owned transaction. Records absent from the archive are
+// preserved; equal record_id values are idempotently replaced by the imported
+// value. The full batch is validated against agentName before the first write.
+func (s *Store) ImportAgentRecordsTx(ctx context.Context, tx *sql.Tx, agentName string, recs []*AgentRecord) error {
+	if tx == nil {
+		return fmt.Errorf("records: nil merge transaction")
+	}
+	if err := s.ValidateAgentRecords(agentName, recs); err != nil {
+		return err
+	}
+	for _, r := range recs {
+		if err := importRecordVia(ctx, tx, r); err != nil {
+			return fmt.Errorf("records: 合并记录 %q: %w", r.RecordID, err)
+		}
+	}
+	return nil
+}
+
+// ImportAgentRecords merges a complete agent-scoped archive batch in one
+// transaction. It implements the restore contract: add missing records, replace
+// duplicate record IDs with the imported value, and retain unrelated current
+// records.
+func (s *Store) ImportAgentRecords(ctx context.Context, agentName string, recs []*AgentRecord) error {
+	if err := s.ValidateAgentRecords(agentName, recs); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("records: 开启合并事务: %w", err)
+	}
+	defer tx.Rollback()
+	if err := s.ImportAgentRecordsTx(ctx, tx, agentName, recs); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("records: 提交合并事务: %w", err)
+	}
+	return nil
+}
+
+// ValidateAgentRecords validates a complete agent-scoped restore batch without
+// mutating storage. Atomic cross-subsystem restore adapters use this as their
+// preflight before acquiring other subsystem locks and opening a shared tx.
+func (s *Store) ValidateAgentRecords(agentName string, recs []*AgentRecord) error {
+	if agentName == "" {
+		return fmt.Errorf("%w: agentName 不可空", ErrInvalidRecord)
+	}
+	for _, r := range recs {
+		if err := s.validateImportRecord(r, agentName); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func replaceAgentRecordsVia(ctx context.Context, e execer, agentName string, recs []*AgentRecord) error {
+	if _, err := e.ExecContext(ctx, `DELETE FROM agent_records WHERE agent_name = ?`, agentName); err != nil {
+		return fmt.Errorf("records: 清理实例旧记录: %w", err)
+	}
+	for _, r := range recs {
+		if err := importRecordVia(ctx, e, r); err != nil {
+			return fmt.Errorf("records: 替换记录 %q: %w", r.RecordID, err)
+		}
+	}
+	return nil
+}
+
+// ReplaceAgentRecordsTx replaces one agent's records through a caller-owned
+// transaction. This lets a composition adapter commit records together with
+// another SQLite-backed aggregate (for example agents.metadata).
+func (s *Store) ReplaceAgentRecordsTx(ctx context.Context, tx *sql.Tx, agentName string, recs []*AgentRecord) error {
+	if tx == nil {
+		return fmt.Errorf("records: nil replace transaction")
+	}
+	if err := s.ValidateAgentRecords(agentName, recs); err != nil {
+		return err
+	}
+	return replaceAgentRecordsVia(ctx, tx, agentName, recs)
+}
+
+// ReplaceAgentRecords 在单事务内用归档记录替换指定实例的全部记录。
+// 整批先校验 agent/schema/status/fields，任一不合法时不会删除现有数据。
+func (s *Store) ReplaceAgentRecords(ctx context.Context, agentName string, recs []*AgentRecord) error {
+	if err := s.ValidateAgentRecords(agentName, recs); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("records: 开启替换事务: %w", err)
+	}
+	defer tx.Rollback()
+	if err := replaceAgentRecordsVia(ctx, tx, agentName, recs); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("records: 提交替换事务: %w", err)
 	}
 	return nil
 }

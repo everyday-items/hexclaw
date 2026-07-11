@@ -78,9 +78,9 @@ func (e *StarlarkEngine) SetKBIngest(fn KBIngestFunc) { e.kbIngest = fn }
 // drop it). Mirrors the SetKBIngest injection style.
 func (e *StarlarkEngine) SetStateStore(s StateStore) { e.stateStore = s }
 
-// builtinStateGet returns state_get(key, default="") -> str. The job is scoped
-// via the run context (executeJob stamps the job ID); a missing store/job yields
-// the default so a script stays runnable in test/standalone contexts.
+// builtinStateGet returns state_get(key, default="") -> str. The job lifecycle
+// is scoped via the run context (ID + generation); a missing store/job yields the
+// default so a script stays runnable in test/standalone contexts.
 func (e *StarlarkEngine) builtinStateGet(ctx context.Context) func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
 	return func(_ *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 		var key, def string
@@ -88,7 +88,7 @@ func (e *StarlarkEngine) builtinStateGet(ctx context.Context) func(*starlark.Thr
 			return nil, err
 		}
 		if e.stateStore != nil {
-			if v, ok := e.stateStore.Get(stateJobIDFrom(ctx), key); ok {
+			if v, ok := e.stateStore.Get(stateJobIDFrom(ctx), stateKeyFromContext(ctx, key)); ok {
 				return starlark.String(v), nil
 			}
 		}
@@ -108,7 +108,7 @@ func (e *StarlarkEngine) builtinStateSet(ctx context.Context) func(*starlark.Thr
 		if e.stateStore == nil {
 			return nil, fmt.Errorf("state_set: per-job state store not available")
 		}
-		if err := e.stateStore.Set(stateJobIDFrom(ctx), key, val); err != nil {
+		if err := e.stateStore.Set(stateJobIDFrom(ctx), stateKeyFromContext(ctx, key), val); err != nil {
 			return nil, fmt.Errorf("state_set: %w", err)
 		}
 		return starlark.None, nil

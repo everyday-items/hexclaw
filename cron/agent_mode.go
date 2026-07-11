@@ -440,6 +440,11 @@ func isContractJSONLine(s string) bool {
 // the injected Deliverer, falling back to history-only when none is wired
 // (review L2).
 func (s *Scheduler) deliverResult(job *Job, result *RunResult) {
+	if !s.jobGenerationCurrentFresh(job) {
+		slog.Info("[cron] stale generation delivery suppressed",
+			"source", "cron", "id", job.ID, "generation", job.Generation)
+		return
+	}
 	content := deliverableContent(result)
 	if content == "" {
 		return
@@ -449,7 +454,7 @@ func (s *Scheduler) deliverResult(job *Job, result *RunResult) {
 	if hasSilentMarker(content) {
 		slog.Info("[cron] [SILENT] marker — delivery suppressed, result kept in history",
 			"source", "cron", "id", job.ID, "name", job.Name)
-		s.recordDeliveryOutcome(job.ID, nil) // 抑制非失败 → 清零投递错误
+		s.recordDeliveryOutcomeForGeneration(job, nil) // 抑制非失败 → 清零投递错误
 		return
 	}
 	s.agent.mu.Lock()
@@ -459,6 +464,9 @@ func (s *Scheduler) deliverResult(job *Job, result *RunResult) {
 	var deliverErrs []string
 	notified := false
 	for _, target := range EffectiveDeliver(job) {
+		if !s.jobGenerationCurrentFresh(job) {
+			return
+		}
 		switch target {
 		case "", "chat", "notify", "push":
 			if !notified {
@@ -479,11 +487,38 @@ func (s *Scheduler) deliverResult(job *Job, result *RunResult) {
 		}
 	}
 	// H4：投递结果与执行解耦 —— 全成功清零 LastDeliveryError，否则记录失败目标。
-	s.recordDeliveryOutcome(job.ID, deliverErrs)
+	s.recordDeliveryOutcomeForGeneration(job, deliverErrs)
+}
+
+// recordDeliveryOutcomeForGeneration writes delivery bookkeeping only to the
+// definition that initiated the delivery. Stable-key upsert intentionally
+// reuses the ID, so an ID-only write can clear or overwrite replacement state.
+func (s *Scheduler) recordDeliveryOutcomeForGeneration(job *Job, errs []string) {
+	if job == nil {
+		return
+	}
+	if !s.jobGenerationCurrentFresh(job) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.currentJobGenerationLocked(job) {
+		return
+	}
+	j, ok := s.jobs[job.ID]
+	if !ok {
+		return
+	}
+	if len(errs) == 0 {
+		j.LastDeliveryError = ""
+		return
+	}
+	j.LastDeliveryError = strings.Join(errs, "; ")
 }
 
 // recordDeliveryOutcome 把本次投递结果写回 jobs map 的规范记录（deliverResult 操作
-// 的是 per-run 副本）。errs 为空 = 全部成功 → 清零 LastDeliveryError。
+// 的是 per-run 副本）。仅供显式 ID 管理/兼容调用；执行路径必须用
+// recordDeliveryOutcomeForGeneration。errs 为空 = 全部成功 → 清零。
 func (s *Scheduler) recordDeliveryOutcome(jobID string, errs []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -519,10 +554,18 @@ func (s *Scheduler) maybeAlertAgentFailure(_ context.Context, job *Job, lastResu
 	// query must not be annihilated alongside it (same reasoning as maybeSelfHeal).
 	alertCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if !s.jobGenerationCurrentFresh(job) {
+		return
+	}
 	if !s.consecutiveFailures(alertCtx, job.ID, selfHealThreshold) {
 		return
 	}
 	if !s.shouldNotifyHealFailure(job.ID) {
+		return
+	}
+	// consecutiveFailures may consume alertCtx; notification is a separate
+	// boundary and needs an independent generation check.
+	if !s.jobGenerationCurrentFresh(job) {
 		return
 	}
 	s.notify(job, NotifyLevelWarning, "定时任务持续失败",
@@ -553,7 +596,7 @@ func buildHealPrompt(job *Job, failCtx string) string {
 // selfHealThreshold times in a row (counting only runs newer than the last
 // successful heal), recompile the script once with the failure context.
 // Attempts beyond the cooldown-window quota are skipped and logged.
-func (s *Scheduler) maybeSelfHeal(ctx context.Context, job *Job, lastResult *RunResult) {
+func (s *Scheduler) maybeSelfHeal(_ context.Context, job *Job, lastResult *RunResult) {
 	if job.Spec == nil || job.Spec.Runtime == RuntimeAgent || s.compiler == nil {
 		return
 	}
@@ -561,9 +604,8 @@ func (s *Scheduler) maybeSelfHeal(ctx context.Context, job *Job, lastResult *Run
 	// ctx (10s dbCtx), which an LLM recompile always outlives — and a failure
 	// record written with the already-expired ctx would vanish too, leaving
 	// zero trace (BUG-20260611 finding #6, double annihilation).
-	healCtx, healCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, healCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer healCancel()
-	ctx = healCtx
 
 	if !s.consecutiveFailures(ctx, job.ID, selfHealThreshold) {
 		return
@@ -597,7 +639,10 @@ func (s *Scheduler) maybeSelfHeal(ctx context.Context, job *Job, lastResult *Run
 	now := time.Now()
 	if err != nil {
 		slog.Warn("[cron-heal] self-heal recompile failed", "source", "cron", "id", job.ID, "err", err.Error())
-		_ = s.persistHistory(ctx, job.ID, "heal_failed", "", "自愈重编译失败: "+err.Error(), 0, now, "", "", 0, nil)
+		persisted, _ := s.persistHistoryForGeneration(ctx, job, "heal_failed", "", "自愈重编译失败: "+err.Error(), 0, now, "", "", 0, nil)
+		if !persisted {
+			return
+		}
 		// Same anti-bombing budget as the quota-exhausted path: one
 		// failure-class notification per cooldown window.
 		if s.shouldNotifyHealFailure(job.ID) {
@@ -612,16 +657,48 @@ func (s *Scheduler) maybeSelfHeal(ctx context.Context, job *Job, lastResult *Run
 		slog.Warn("[cron-heal] spec marshal failed", "source", "cron", "id", job.ID, "err", err.Error())
 		return
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE cron_jobs SET spec_json = ? WHERE id = ?`, string(specJSON), job.ID); err != nil {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE cron_jobs SET spec_json = ? WHERE id = ? AND meta = ?`,
+		string(specJSON), job.ID, serializeJobMeta(job))
+	if err != nil {
 		slog.Warn("[cron-heal] spec persist failed", "source", "cron", "id", job.ID, "err", err.Error())
 		return
 	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		// Legacy unit/in-memory callers historically heal jobs with no cron_jobs
+		// row. Preserve that no-row behavior only for generation-less jobs; a
+		// persisted generation or an existing mismatched row is superseded.
+		var exists int
+		queryErr := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM cron_jobs WHERE id = ?`, job.ID).Scan(&exists)
+		if job.Generation != "" || queryErr != nil || exists != 0 {
+			slog.Info("[cron-heal] stale generation heal ignored",
+				"source", "cron", "id", job.ID, "generation", job.Generation)
+			return
+		}
+	}
 	s.mu.Lock()
-	if j, ok := s.jobs[job.ID]; ok {
-		j.Spec = spec
+	if !s.currentJobGenerationLocked(job) {
+		s.mu.Unlock()
+		return
+	}
+	if current, ok := s.jobs[job.ID]; ok {
+		current.Spec = spec
 	}
 	s.mu.Unlock()
-	_ = s.persistHistory(ctx, job.ID, "healed", "脚本已根据失败上下文自动重编译，下次执行使用新脚本", "", 0, now, "", "", 0, nil)
+
+	// Re-check before each externally visible side effect. Do not hold the
+	// scheduler mutex while invoking notifier callbacks: callbacks are external
+	// code and may legitimately call back into scheduler read APIs.
+	if !s.currentJobGeneration(job) {
+		return
+	}
+	persisted, _ := s.persistHistoryForGeneration(ctx, job, "healed", "脚本已根据失败上下文自动重编译，下次执行使用新脚本", "", 0, now, "", "", 0, nil)
+	if !persisted {
+		return
+	}
+	if !s.currentJobGeneration(job) {
+		return
+	}
 	s.notify(job, NotifyLevelSuccess, "定时任务已自动修复",
 		fmt.Sprintf("「%s」连续失败后已自动重编译，下次执行使用修复后的脚本。", job.Name))
 	slog.Info("[cron-heal] self-heal complete, script updated", "source", "cron", "id", job.ID, "name", job.Name)

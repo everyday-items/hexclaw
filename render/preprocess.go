@@ -3,8 +3,10 @@ package render
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/httpua"
+	"github.com/hexagon-codes/toolkit/net/ssrf"
 )
 
 // PreprocessConfig 预处理配置。
@@ -119,13 +122,26 @@ func processImageRef(ctx context.Context, alt, rawURL string, client *http.Clien
 //
 // 约束：仅 http/https、单图字节上限、超时、跟随重定向（限跳数）。
 func fetchToDataURL(ctx context.Context, rawURL string, client *http.Client, maxBytes int64) (string, error) {
+	// SSRF 前置闸门：在发起任何连接前校验目标 URL，拒绝私网/回环/云元数据端点
+	// （169.254.169.254 等），并抵御 DNS rebinding（RU-13）。此前注释谎称"经 SSRF
+	// 闸门"但实际未接入，用户 markdown 里的图片 URL 可直连内网/元数据窃取凭据。
+	if err := ssrf.ValidateURL(rawURL); err != nil {
+		return "", &RenderError{Code: CodeInvalidInput, Detail: fmt.Sprintf("SSRF check failed for %s: %v", rawURL, err)}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", &RenderError{Code: CodeInvalidInput, Detail: err.Error()}
 	}
 	httpua.Set(req) // 默认浏览器 UA，避免反爬站对 Go 默认 UA 返回 HTML（AP-016）
-	resp, err := client.Do(req)
+	safeClient, err := clientWithSafeRedirects(client)
 	if err != nil {
+		return "", &RenderError{Code: CodeRenderFailed, Detail: err.Error()}
+	}
+	resp, err := safeClient.Do(req)
+	if err != nil {
+		if errors.Is(err, errRenderSSRFBlocked) {
+			return "", &RenderError{Code: CodeInvalidInput, Detail: fmt.Sprintf("fetch %s: %v", rawURL, err)}
+		}
 		return "", &RenderError{Code: CodeRenderFailed, Detail: fmt.Sprintf("fetch %s: %v", rawURL, err)}
 	}
 	defer resp.Body.Close()
@@ -160,6 +176,144 @@ func fetchToDataURL(ctx context.Context, rawURL string, client *http.Client, max
 
 	return fmt.Sprintf("data:%s;base64,%s",
 		contentType, base64.StdEncoding.EncodeToString(body)), nil
+}
+
+var errRenderSSRFBlocked = errors.New("render: SSRF blocked at connection boundary")
+
+// renderSSRFGuardedTransport is intentionally package-private. It exists only
+// for in-package transports that never open a socket (deterministic test
+// fixtures). An arbitrary caller-provided RoundTripper cannot be made safe
+// against DNS rebinding after the fact, so all other custom transports fail
+// closed below.
+type renderSSRFGuardedTransport interface {
+	http.RoundTripper
+	renderSSRFGuarded()
+}
+
+// clientWithSafeRedirects returns a per-request copy so redirect and transport
+// hardening do not mutate a caller-owned client that may be shared by concurrent
+// renders. Every real TCP connection is pinned to an address resolved and
+// checked at dial time; the actual peer is checked again after connect.
+func clientWithSafeRedirects(client *http.Client) (*http.Client, error) {
+	if client == nil {
+		client = &http.Client{}
+	}
+	cloned := *client
+	transport, err := renderSSRFSafeTransport(client.Transport)
+	if err != nil {
+		return nil, err
+	}
+	cloned.Transport = transport
+	callerCheckRedirect := client.CheckRedirect
+	cloned.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		target := ""
+		if req != nil && req.URL != nil {
+			target = req.URL.String()
+		}
+		if err := ssrf.ValidateURL(target); err != nil {
+			return fmt.Errorf("SSRF check failed for redirect %s: %w", target, err)
+		}
+		if len(via) >= 5 {
+			return fmt.Errorf("too many redirects (%d)", len(via))
+		}
+		if callerCheckRedirect != nil {
+			return callerCheckRedirect(req, via)
+		}
+		return nil
+	}
+	return &cloned, nil
+}
+
+func renderSSRFSafeTransport(base http.RoundTripper) (http.RoundTripper, error) {
+	if guarded, ok := base.(renderSSRFGuardedTransport); ok {
+		return guarded, nil
+	}
+
+	var transport *http.Transport
+	switch typed := base.(type) {
+	case nil:
+		defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			return nil, fmt.Errorf("%w: default HTTP transport is not cloneable", errRenderSSRFBlocked)
+		}
+		transport = defaultTransport.Clone()
+	case *http.Transport:
+		transport = typed.Clone()
+	default:
+		return nil, fmt.Errorf("%w: custom HTTP transport has no connect-time guard", errRenderSSRFBlocked)
+	}
+
+	// A forward proxy resolves and connects to the target outside this process,
+	// beyond the dial-time address check. Remote image rendering therefore uses
+	// a direct connection. Custom TLS dialers are cleared for the same reason:
+	// HTTPS must pass through the guarded DialContext below.
+	transport.Proxy = nil
+	//lint:ignore SA1019 The legacy field must also be cleared; otherwise a caller
+	// can bypass the guarded DialContext on Go versions that still honor it.
+	transport.DialTLS = nil
+	transport.DialTLSContext = nil
+
+	originalDial := transport.DialContext
+	if originalDial == nil {
+		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+		originalDial = dialer.DialContext
+	}
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid dial address %q: %v", errRenderSSRFBlocked, addr, err)
+		}
+
+		lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		resolved, err := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
+		if err != nil {
+			return nil, fmt.Errorf("%w: resolve %q: %v", errRenderSSRFBlocked, host, err)
+		}
+		if len(resolved) == 0 {
+			return nil, fmt.Errorf("%w: no addresses for %q", errRenderSSRFBlocked, host)
+		}
+		// Reject the whole answer set if any address is unsafe. Picking a public
+		// member while ignoring a private member would leave rebinding/round-robin
+		// behavior dependent on resolver ordering.
+		for _, candidate := range resolved {
+			if !renderPublicIP(candidate.IP) {
+				return nil, fmt.Errorf("%w: %q resolved to private/reserved IP %s", errRenderSSRFBlocked, host, candidate.IP)
+			}
+		}
+
+		var lastErr error
+		for _, candidate := range resolved {
+			// Dial the checked literal address, never the hostname, so the actual
+			// dial cannot trigger a second DNS resolution.
+			pinnedAddr := net.JoinHostPort(candidate.IP.String(), port)
+			conn, dialErr := originalDial(ctx, network, pinnedAddr)
+			if dialErr != nil {
+				lastErr = dialErr
+				continue
+			}
+			if err := validateRenderPeer(conn.RemoteAddr()); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			return conn, nil
+		}
+		return nil, lastErr
+	}
+	return transport, nil
+}
+
+func renderPublicIP(ip net.IP) bool {
+	return ip != nil && ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() &&
+		!ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsUnspecified()
+}
+
+func validateRenderPeer(addr net.Addr) error {
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok || !renderPublicIP(tcpAddr.IP) {
+		return fmt.Errorf("%w: connected peer %v is private, reserved, or unverifiable", errRenderSSRFBlocked, addr)
+	}
+	return nil
 }
 
 // newSafeHTTPClient 构造带超时、限制重定向跳数的 HTTP 客户端。

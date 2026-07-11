@@ -38,6 +38,9 @@ const maxPayloadSize = 1 << 20 // 1MB
 // 返回 404 而非 500（FS-10/BUG-20260703：资源不存在 ≠ 服务端故障）。
 var ErrWebhookNotFound = errors.New("webhook 不存在")
 
+// ErrWebhookExists 表示同名 webhook 已存在（handler 应转 409 Conflict，不外泄底层约束串）。
+var ErrWebhookExists = errors.New("webhook 名称已存在")
+
 // WebhookType 预置 Webhook 类型
 type WebhookType string
 
@@ -160,6 +163,10 @@ func (m *Manager) Register(ctx context.Context, wh *Webhook) error {
 		wh.ID, wh.Name, wh.Type, wh.Secret, wh.Prompt, wh.UserID, enabled, wh.CreatedAt, wh.JobID,
 	)
 	if err != nil {
+		// 名称唯一约束冲突转为可分类的 sentinel，供 handler 返回 409 且不外泄底层约束串。
+		if strings.Contains(err.Error(), "UNIQUE constraint") {
+			return fmt.Errorf("%w: %s", ErrWebhookExists, wh.Name)
+		}
 		return fmt.Errorf("注册 webhook 失败: %w", err)
 	}
 

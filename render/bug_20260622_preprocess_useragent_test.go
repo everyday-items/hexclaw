@@ -2,8 +2,8 @@ package render
 
 import (
 	"context"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -13,19 +13,23 @@ import (
 // UA 分流服务器精确复现：非浏览器 UA → text/html；浏览器 UA → image/png。
 // 修复前 fetchToDataURL 拿到 HTML → data:text/html（RED）；修复后默认浏览器 UA → image/png（GREEN）。
 func TestBug20260622_PreprocessFetch_SetsDefaultUserAgent(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ua := r.Header.Get("User-Agent")
+	client := &http.Client{Transport: redirectRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		contentType := "image/png"
+		body := "\x89PNG\r\n\x1a\nfake-png-bytes"
+		ua := req.Header.Get("User-Agent")
 		if ua == "" || strings.Contains(ua, "Go-http-client") {
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = w.Write([]byte("<!DOCTYPE html><html><body>anti-bot</body></html>"))
-			return
+			contentType = "text/html"
+			body = "<!DOCTYPE html><html><body>anti-bot</body></html>"
 		}
-		w.Header().Set("Content-Type", "image/png")
-		_, _ = w.Write([]byte("\x89PNG\r\n\x1a\nfake-png-bytes"))
-	}))
-	defer srv.Close()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{contentType}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	})}
 
-	got, err := fetchToDataURL(context.Background(), srv.URL, &http.Client{}, 1<<20)
+	got, err := fetchToDataURL(context.Background(), "http://93.184.216.34/image.png", client, 1<<20)
 	if err != nil {
 		t.Fatalf("fetchToDataURL: %v", err)
 	}

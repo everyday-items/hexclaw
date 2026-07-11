@@ -105,11 +105,12 @@ func (r *Dispatcher) RouteWithFallback(ctx context.Context, req RouteRequest, me
 	// 2. LLM 语义路由（仅在有 classifier 且 Agent >= 2 时触发）
 	r.mu.RLock()
 	classifier := r.classifier
-	// Snapshot under the lock: the classifier iterates this map after we release,
-	// while Register/Unregister mutate the shared map concurrently.
+	// Take a detached snapshot under the lock: the classifier iterates this map
+	// after we release, while Register/Unregister mutate dispatcher state.
 	agents := make(map[string]*AgentConfig, len(r.agents))
 	for k, v := range r.agents {
-		agents[k] = v
+		cloned := cloneAgentConfig(*v)
+		agents[k] = &cloned
 	}
 	defaultName := r.defaultAgent
 	r.mu.RUnlock()
@@ -119,12 +120,16 @@ func (r *Dispatcher) RouteWithFallback(ctx context.Context, req RouteRequest, me
 		if agentName != "" && confidence >= classifier.confidenceThreshold {
 			r.mu.RLock()
 			cfg, ok := r.agents[agentName]
+			var cloned AgentConfig
+			if ok {
+				cloned = cloneAgentConfig(*cfg)
+			}
 			r.mu.RUnlock()
 			if ok {
 				logger.Info("LLM 路由", "agent", agentName, "confidence", confidence)
 				return &RoutingResult{
 					AgentName:   agentName,
-					AgentConfig: cfg,
+					AgentConfig: &cloned,
 				}, RouteSourceLLM
 			}
 		}
@@ -138,11 +143,15 @@ func (r *Dispatcher) RouteWithFallback(ctx context.Context, req RouteRequest, me
 	if defaultName != "" {
 		r.mu.RLock()
 		cfg := r.agents[defaultName]
+		var cloned AgentConfig
+		if cfg != nil {
+			cloned = cloneAgentConfig(*cfg)
+		}
 		r.mu.RUnlock()
 		if cfg != nil {
 			return &RoutingResult{
 				AgentName:   defaultName,
-				AgentConfig: cfg,
+				AgentConfig: &cloned,
 			}, RouteSourceDefault
 		}
 	}

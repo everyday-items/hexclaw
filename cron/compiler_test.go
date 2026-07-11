@@ -7,6 +7,7 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/ai-core/streamx"
+	"github.com/hexagon-codes/hexclaw/egress"
 )
 
 // fakeProvider 实现 hexagon.Provider（llm.Provider 接口），仅返回预设 Content / err。
@@ -14,11 +15,13 @@ type fakeProvider struct {
 	resp *llm.CompletionResponse
 	err  error
 	last *llm.CompletionRequest
+	ctx  context.Context
 }
 
 func (f *fakeProvider) Name() string { return "fake" }
 
-func (f *fakeProvider) Complete(_ context.Context, req llm.CompletionRequest) (*llm.CompletionResponse, error) {
+func (f *fakeProvider) Complete(ctx context.Context, req llm.CompletionRequest) (*llm.CompletionResponse, error) {
+	f.ctx = ctx
 	f.last = &req
 	if f.err != nil {
 		return nil, f.err
@@ -202,6 +205,19 @@ func TestLLMCompiler_EndToEnd_WithFakeProvider(t *testing.T) {
 	}
 	if fp.last == nil || !strings.Contains(fp.last.Messages[0].Content, "web-search") {
 		t.Error("system prompt 应列出 AvailableSkills")
+	}
+}
+
+func TestLLMCompiler_StampsAutomationEgressEnvelope(t *testing.T) {
+	fp := &fakeProvider{resp: &llm.CompletionResponse{
+		Content: `{"runtime":"python3","script":"` + escapeJSON(validScript) + `","timeout_s":30}`,
+	}}
+	if _, err := NewLLMCompilerStatic(fp, "test").Compile(context.Background(), "do x", CompileHints{}); err != nil {
+		t.Fatal(err)
+	}
+	requests, ok := egress.RequestsFromContext(fp.ctx)
+	if !ok || len(requests) != 1 || requests[0].Purpose != egress.PurposeAutomationBuild || requests[0].DataClass != egress.ClassGeneral {
+		t.Fatalf("compiler egress envelope=%+v ok=%v", requests, ok)
 	}
 }
 

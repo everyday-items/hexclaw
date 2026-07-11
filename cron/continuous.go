@@ -42,29 +42,60 @@ type continuousCheckpoint struct {
 	NoProgress int      `json:"no_progress"` // 连续无新进展计数
 }
 
-// loadContinuousCheckpoint 从 StateStore 读检查点（无 / 解析失败 → 全零的新档案，等于从头开始）。
+// checkpointJobSnapshot resolves the currently installed generation for test/UI
+// helpers that only have a public job ID. The execution path always passes its
+// captured *Job directly so an old in-flight run never resolves to a replacement.
+func (s *Scheduler) checkpointJobSnapshot(jobID string) *Job {
+	job := &Job{ID: jobID}
+	s.mu.RLock()
+	if current := s.jobs[jobID]; current != nil {
+		*job = *current
+	}
+	s.mu.RUnlock()
+	return job
+}
+
+// loadContinuousCheckpoint keeps the historical ID-only helper while resolving
+// that ID to the current generation. Production execution uses
+// loadContinuousCheckpointForJob with its immutable run snapshot.
 func (s *Scheduler) loadContinuousCheckpoint(jobID string) continuousCheckpoint {
+	return s.loadContinuousCheckpointForJob(s.checkpointJobSnapshot(jobID))
+}
+
+// loadContinuousCheckpointForJob reads only the checkpoint owned by job's
+// generation (no value / malformed value → a fresh zero checkpoint).
+func (s *Scheduler) loadContinuousCheckpointForJob(job *Job) continuousCheckpoint {
 	var cp continuousCheckpoint
-	if s.state == nil {
+	if s.state == nil || job == nil || job.ID == "" {
 		return cp
 	}
-	if raw, ok := s.state.Get(jobID, continuousStateKey); ok {
+	if raw, ok := s.state.Get(job.ID, stateKeyForGeneration(continuousStateKey, job)); ok {
 		_ = json.Unmarshal([]byte(raw), &cp) // 脏数据当作从头开始，不致命
 	}
 	return cp
 }
 
-// saveContinuousCheckpoint 把检查点落盘（落盘失败 loud 记录，不致命——下个 tick 会基于内存态重试）。
+// saveContinuousCheckpoint keeps the historical ID-only helper and writes the
+// currently installed generation. Production execution must use the *Job form.
 func (s *Scheduler) saveContinuousCheckpoint(jobID string, cp continuousCheckpoint) {
-	if s.state == nil {
+	s.saveContinuousCheckpointForJob(s.checkpointJobSnapshot(jobID), cp)
+}
+
+// saveContinuousCheckpointForJob writes only job's generation checkpoint. An
+// old run may finish after stable-key replacement, but its late write lands in
+// the old generation key and cannot complete or fast-forward the replacement.
+func (s *Scheduler) saveContinuousCheckpointForJob(job *Job, cp continuousCheckpoint) {
+	if s.state == nil || job == nil || job.ID == "" {
 		return
 	}
 	b, err := json.Marshal(cp)
 	if err != nil {
 		return
 	}
-	if err := s.state.Set(jobID, continuousStateKey, string(b)); err != nil {
-		slog.Warn("[cron] 持续任务 checkpoint 落盘失败", "source", "cron", "id", jobID, "error", err)
+	key := stateKeyForGeneration(continuousStateKey, job)
+	if err := s.state.Set(job.ID, key, string(b)); err != nil {
+		slog.Warn("[cron] 持续任务 checkpoint 落盘失败", "source", "cron", "id", job.ID,
+			"generation", job.Generation, "error", err)
 	}
 }
 
@@ -140,11 +171,11 @@ func isNoProgressSignal(progress string) bool {
 // runContinuousAgentJob 跑持续任务的一个 tick：读档案 → 渐进式 prompt 跑一轮 → 解析进度 → 写回档案 →
 // 检查三道终止闸。失败 tick 不推进档案（交既有失败/告警路径处理），成功 tick 才累积进度。
 func (s *Scheduler) runContinuousAgentJob(ctx context.Context, job *Job) *RunResult {
-	cp := s.loadContinuousCheckpoint(job.ID)
+	cp := s.loadContinuousCheckpointForJob(job)
 
 	// 已完成：不再烧 LLM——确保状态收为 done（防被手动恢复后空转），静默记一条历史。
 	if cp.Completed {
-		s.markContinuousFinished(job.ID, StatusDone)
+		s.markContinuousFinished(job, StatusDone)
 		return &RunResult{Status: "success", Stdout: "[SILENT] 持续任务已完成，无需再推进。"}
 	}
 
@@ -173,37 +204,57 @@ func (s *Scheduler) runContinuousAgentJob(ctx context.Context, job *Job) *RunRes
 	if complete {
 		cp.Completed = true
 	}
-	s.saveContinuousCheckpoint(job.ID, cp)
+	s.saveContinuousCheckpointForJob(job, cp)
 
 	// 三道终止闸：完成信号 / 无进展停滞 / 总量 backstop——任一触发即自动收工（停止后续 tick）。
 	switch {
 	case cp.Completed:
-		s.markContinuousFinished(job.ID, StatusDone)
-		s.notify(job, NotifyLevelSuccess, "持续任务已完成",
-			fmt.Sprintf("「%s」经 %d 次推进已完成目标。", job.Name, cp.Tick))
+		if s.markContinuousFinished(job, StatusDone) {
+			s.notify(job, NotifyLevelSuccess, "持续任务已完成",
+				fmt.Sprintf("「%s」经 %d 次推进已完成目标。", job.Name, cp.Tick))
+		}
 	case cp.NoProgress >= maxNoProgressStreak:
-		s.markContinuousFinished(job.ID, StatusPaused)
-		s.notify(job, NotifyLevelWarning, "持续任务已暂停",
-			fmt.Sprintf("「%s」连续 %d 次无新进展，已暂停（可在自动化页面调整目标后恢复）。", job.Name, cp.NoProgress))
+		if s.markContinuousFinished(job, StatusPaused) {
+			s.notify(job, NotifyLevelWarning, "持续任务已暂停",
+				fmt.Sprintf("「%s」连续 %d 次无新进展，已暂停（可在自动化页面调整目标后恢复）。", job.Name, cp.NoProgress))
+		}
 	case cp.Tick >= maxContinuousTicks:
-		s.markContinuousFinished(job.ID, StatusPaused)
-		s.notify(job, NotifyLevelWarning, "持续任务达推进上限",
-			fmt.Sprintf("「%s」已推进 %d 次达上限，已暂停（防无限推进）。", job.Name, cp.Tick))
+		if s.markContinuousFinished(job, StatusPaused) {
+			s.notify(job, NotifyLevelWarning, "持续任务达推进上限",
+				fmt.Sprintf("「%s」已推进 %d 次达上限，已暂停（防无限推进）。", job.Name, cp.Tick))
+		}
 	}
 	return result
 }
 
 // markContinuousFinished 把持续任务收工：同步内存 + DB 状态（done/paused），使调度循环的
 // `Status == StatusActive` 闸不再触发它（停止后续 tick）。
-func (s *Scheduler) markContinuousFinished(jobID string, status JobStatus) {
-	s.mu.Lock()
-	if j, ok := s.jobs[jobID]; ok {
-		j.Status = status
+func (s *Scheduler) markContinuousFinished(job *Job, status JobStatus) bool {
+	if job == nil {
+		return false
 	}
-	s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := s.updateJobStatus(ctx, jobID, status); err != nil {
-		slog.Warn("[cron] 持续任务收工状态落盘失败", "source", "cron", "id", jobID, "status", string(status), "error", err)
+	if s.db != nil {
+		res, err := s.db.ExecContext(ctx,
+			`UPDATE cron_jobs SET status = ? WHERE id = ? AND meta = ?`,
+			status, job.ID, serializeJobMeta(job))
+		if err != nil {
+			slog.Warn("[cron] 持续任务收工状态落盘失败", "source", "cron", "id", job.ID, "status", string(status), "error", err)
+			return false
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			slog.Info("[cron] 已忽略旧世代持续任务收工", "source", "cron", "id", job.ID, "generation", job.Generation)
+			return false
+		}
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.currentJobGenerationLocked(job) {
+		return false
+	}
+	if j, ok := s.jobs[job.ID]; ok {
+		j.Status = status
+	}
+	return true
 }

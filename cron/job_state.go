@@ -84,23 +84,58 @@ func (s *sqlStateStore) Set(jobID, key, val string) error {
 	return err
 }
 
-// stateJobIDKey 通过 ctx 把当前 job ID 传给 state 内建（StarlarkEngine.Execute 只收
-// spec，不收 job；用 ctx 携带是最干净的 per-run scope，且不污染共享的引擎或 spec）。
+// stateJobIDKey 通过 ctx 把当前 job lifecycle scope 传给 state 内建
+// （StarlarkEngine.Execute 只收 spec，不收 job；用 ctx 携带不会污染共享引擎/spec）。
 type stateJobIDKeyT struct{}
 
 var stateJobIDKey stateJobIDKeyT
 
+type stateJobScope struct {
+	jobID      string
+	generation string
+}
+
+// withStateJobID preserves the legacy/standalone generation-less scope used by
+// direct engine callers and old tests. Admitted scheduler jobs use withStateJob.
 func withStateJobID(ctx context.Context, jobID string) context.Context {
-	return context.WithValue(ctx, stateJobIDKey, jobID)
+	return context.WithValue(ctx, stateJobIDKey, stateJobScope{jobID: jobID})
+}
+
+func withStateJob(ctx context.Context, job *Job) context.Context {
+	if job == nil {
+		return context.WithValue(ctx, stateJobIDKey, stateJobScope{})
+	}
+	return context.WithValue(ctx, stateJobIDKey, stateJobScope{
+		jobID: job.ID, generation: job.Generation,
+	})
+}
+
+func stateJobScopeFrom(ctx context.Context) stateJobScope {
+	scope, _ := ctx.Value(stateJobIDKey).(stateJobScope)
+	return scope
 }
 
 func stateJobIDFrom(ctx context.Context) string {
-	v, _ := ctx.Value(stateJobIDKey).(string)
-	return v
+	return stateJobScopeFrom(ctx).jobID
+}
+
+func stateKeyFromContext(ctx context.Context, key string) string {
+	scope := stateJobScopeFrom(ctx)
+	return stateKeyForGeneration(key, &Job{Generation: scope.generation})
 }
 
 // lastOutputHashKey 是 only_if_changed 投递门存放上次产物哈希的保留 key。
 const lastOutputHashKey = "__last_output_hash__"
+
+// stateKeyForGeneration keeps state that belongs to a concrete job definition
+// isolated across stable-key replacements. Upsert deliberately reuses the
+// public job ID, so jobID alone is not a lifecycle identity.
+func stateKeyForGeneration(base string, job *Job) string {
+	if job == nil || job.Generation == "" {
+		return base
+	}
+	return base + ":" + job.Generation
+}
 
 func hashString(s string) string {
 	// 复用 toolkit/util/hash.SHA256：内部即 sha256.Sum256 + hex 编码，输出与原实现逐字节一致。
@@ -112,15 +147,29 @@ func hashString(s string) string {
 // call, so the first run (or any change) returns false and delivers. No store →
 // false (never suppress without a way to compare — conservative: deliver).
 func (s *Scheduler) outputUnchanged(jobID string, result *RunResult) bool {
+	return s.outputUnchangedWithKey(jobID, lastOutputHashKey, result)
+}
+
+// outputUnchangedForGeneration isolates delivery-dedup state across stable-key
+// replacements. Reusing the public job ID must not let an old run seed or
+// suppress the replacement's first output.
+func (s *Scheduler) outputUnchangedForGeneration(job *Job, result *RunResult) bool {
+	if job == nil {
+		return false
+	}
+	return s.outputUnchangedWithKey(job.ID, stateKeyForGeneration(lastOutputHashKey, job), result)
+}
+
+func (s *Scheduler) outputUnchangedWithKey(jobID, key string, result *RunResult) bool {
 	if s.state == nil {
 		return false
 	}
 	h := hashString(deliverableContent(result))
-	prev, ok := s.state.Get(jobID, lastOutputHashKey)
+	prev, ok := s.state.Get(jobID, key)
 	if ok && prev == h {
 		return true
 	}
-	if err := s.state.Set(jobID, lastOutputHashKey, h); err != nil {
+	if err := s.state.Set(jobID, key, h); err != nil {
 		// 记不住哈希 → 下次仍会投递（保守，不会误抑制）。
 		return false
 	}

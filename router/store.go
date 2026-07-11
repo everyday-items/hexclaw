@@ -26,6 +26,16 @@ type Store interface {
 	DeleteRulesByPlatform(ctx context.Context, platform string) error
 }
 
+// AtomicAgentUnregisterStore is the durable counterpart of
+// Dispatcher.UnregisterPersisted. Implementations atomically delete the Agent
+// (and its rules) and, when wasDefault is true, publish nextDefault. API callers
+// must fail closed for default-Agent deletion when a Store does not implement
+// this interface; composing DeleteAgent and SetDefault cannot be rolled back
+// reliably across two independent calls.
+type AtomicAgentUnregisterStore interface {
+	DeleteAgentAndSetDefault(ctx context.Context, name, nextDefault string, wasDefault bool) error
+}
+
 // SQLiteStore 基于 SQLite 的 Agent/Rule 持久化实现
 type SQLiteStore struct {
 	db *sql.DB
@@ -220,8 +230,11 @@ func (s *SQLiteStore) LoadAgents(ctx context.Context) ([]AgentConfig, string, er
 	return agents, defaultName, rows.Err()
 }
 
-// SaveAgent 插入或更新 Agent（upsert）
-func (s *SQLiteStore) SaveAgent(ctx context.Context, a *AgentConfig) error {
+type agentExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func saveAgentVia(ctx context.Context, e agentExecer, a *AgentConfig) error {
 	skillsJSON, _ := json.Marshal(a.Skills)
 	if a.Skills == nil {
 		skillsJSON = []byte("[]")
@@ -231,7 +244,7 @@ func (s *SQLiteStore) SaveAgent(ctx context.Context, a *AgentConfig) error {
 		metaJSON = []byte("{}")
 	}
 	now := time.Now()
-	_, err := s.db.ExecContext(ctx,
+	_, err := e.ExecContext(ctx,
 		`INSERT INTO agents (name, display_name, description, model, provider, system_prompt,
 		                     skills, max_tokens, temperature, metadata, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -247,6 +260,21 @@ func (s *SQLiteStore) SaveAgent(ctx context.Context, a *AgentConfig) error {
 	return err
 }
 
+// SaveAgent 插入或更新 Agent（upsert）。
+func (s *SQLiteStore) SaveAgent(ctx context.Context, a *AgentConfig) error {
+	return saveAgentVia(ctx, s.db, a)
+}
+
+// SaveAgentTx writes an Agent through a caller-owned SQLite transaction. It is
+// intentionally separate from Store so only composition adapters that know the
+// concrete shared database can coordinate agents with another aggregate.
+func (s *SQLiteStore) SaveAgentTx(ctx context.Context, tx *sql.Tx, a *AgentConfig) error {
+	if tx == nil {
+		return fmt.Errorf("router: nil agent transaction")
+	}
+	return saveAgentVia(ctx, tx, a)
+}
+
 // DeleteAgent 删除 Agent（级联删除规则）
 func (s *SQLiteStore) DeleteAgent(ctx context.Context, name string) error {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM agents WHERE name = ?`, name)
@@ -258,6 +286,47 @@ func (s *SQLiteStore) DeleteAgent(ctx context.Context, name string) error {
 		return fmt.Errorf("agent %q 不存在", name)
 	}
 	return nil
+}
+
+// DeleteAgentAndSetDefault performs default-Agent reassignment in the same
+// transaction as deletion. If reassignment fails, SQLite rolls back the Agent
+// row and its ON DELETE CASCADE rule deletions together.
+func (s *SQLiteStore) DeleteAgentAndSetDefault(
+	ctx context.Context,
+	name, nextDefault string,
+	wasDefault bool,
+) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE name = ?`, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("agent %q 不存在", name)
+	}
+
+	if wasDefault {
+		if _, err := tx.ExecContext(ctx, `UPDATE agents SET is_default = 0 WHERE is_default = 1`); err != nil {
+			return err
+		}
+		if nextDefault != "" {
+			res, err := tx.ExecContext(ctx, `UPDATE agents SET is_default = 1 WHERE name = ?`, nextDefault)
+			if err != nil {
+				return err
+			}
+			n, _ := res.RowsAffected()
+			if n == 0 {
+				return fmt.Errorf("agent %q 不存在", nextDefault)
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 // SetDefault 设置默认 Agent；name 为空 = 清除默认（与 Dispatcher.SetDefault 语义对齐，
@@ -341,6 +410,37 @@ func (s *SQLiteStore) SaveRule(ctx context.Context, rule *Rule) error {
 		 WHERE platform=? AND instance_id=? AND user_id=? AND chat_id=? AND agent_name=?`,
 		rule.Platform, rule.InstanceID, rule.UserID, rule.ChatID, rule.AgentName,
 	).Scan(&rule.ID)
+}
+
+// ReplaceRuleScope atomically replaces all persisted rules for one routing
+// scope. The delete and insert share a transaction so an insert failure leaves
+// the previous binding intact.
+func (s *SQLiteStore) ReplaceRuleScope(ctx context.Context, rule *Rule) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM agent_rules
+		 WHERE platform=? AND instance_id=? AND user_id=? AND chat_id=?`,
+		rule.Platform, rule.InstanceID, rule.UserID, rule.ChatID,
+	); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO agent_rules (platform, instance_id, user_id, chat_id, agent_name, priority)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		rule.Platform, rule.InstanceID, rule.UserID, rule.ChatID, rule.AgentName, rule.Priority,
+	)
+	if err != nil {
+		return err
+	}
+	if id, idErr := res.LastInsertId(); idErr == nil {
+		rule.ID = int(id)
+	}
+	return tx.Commit()
 }
 
 // DeleteRule 删除单条规则

@@ -28,6 +28,12 @@ var ErrUnknownCollection = errors.New("unknown record collection")
 // ErrInvalidStatus 状态不在记录集状态机声明内。
 var ErrInvalidStatus = errors.New("invalid status for collection")
 
+// ErrInvalidFields 记录领域字段不符合注册 schema。
+var ErrInvalidFields = errors.New("invalid fields for collection")
+
+// ErrInvalidRecord 记录导入信封缺字段、跨 scope 或 schema 版本非法。
+var ErrInvalidRecord = errors.New("invalid record envelope")
+
 // ErrIllegalTransition 状态转移不在记录集声明的转移偏序内（如倒退 / 离开终态）。
 var ErrIllegalTransition = errors.New("illegal status transition for collection")
 
