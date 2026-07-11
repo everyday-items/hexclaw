@@ -112,12 +112,12 @@ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aN
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs4luLUK2k=
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
-github.com/hexagon-codes/ai-core v0.2.1 h1:jXWDix4/rY3eubSNuj5iZ57N0ebkL3trZcfrw5HWtMc=
-github.com/hexagon-codes/ai-core v0.2.1/go.mod h1:GSHC9DE1L7M+k6GHeHEKXvin71LABLwJV1CEu8JImnk=
+github.com/hexagon-codes/ai-core v0.2.4 h1:seS2zBt0s8Bxdzx/HrSZ7P+DZtUelBrTXcEteLtsEYU=
+github.com/hexagon-codes/ai-core v0.2.4/go.mod h1:GSHC9DE1L7M+k6GHeHEKXvin71LABLwJV1CEu8JImnk=
 github.com/hexagon-codes/dingtalk-stream-sdk-go v0.9.1-hexclaw.1 h1:n0d/y633PCHQHUFwglSR8BmapVNTrqaXBKOerjs0AqY=
 github.com/hexagon-codes/dingtalk-stream-sdk-go v0.9.1-hexclaw.1/go.mod h1:ln3IqPYYocZbYvl9TAOrG/cxGR9xcn4pnZRLdCTEGEU=
-github.com/hexagon-codes/hexagon v0.5.8 h1:sRXcNDyVpQWC8zPIiXZaoLEDRzQDi2JPDxyzv8axDzw=
-github.com/hexagon-codes/hexagon v0.5.8/go.mod h1:sM84wsUZSlEqmZd2WRnrPK6PCWksPPhkXqJUd7qKFN4=
+github.com/hexagon-codes/hexagon v0.5.9 h1:XF0ZoIAN6ekGJvjOyeWlAYZt9SOZjNBCyl5ir2boyMA=
+github.com/hexagon-codes/hexagon v0.5.9/go.mod h1:qqOfkET5JIsp32CmJws+So93dJHGMk7aBVRmReUioQ0=
 github.com/hexagon-codes/toolkit v0.2.6 h1:Lq7nwtMWDWptIjzn0vTBOanO0vZ3tdsykQNzKEIkGtg=
 github.com/hexagon-codes/toolkit v0.2.6/go.mod h1:qQmc+lAOnRBPo2JBXmje15yzmVUjQ0SMk2JpyiSe7Rg=
 github.com/inconshreveable/mousetrap v1.1.0 h1:wN+x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2s0bqwp9tc8=

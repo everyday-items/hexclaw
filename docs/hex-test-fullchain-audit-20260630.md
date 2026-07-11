@@ -15,7 +15,7 @@
 
 ### 2026-07-04 CI/CD 复验更新
 
-本轮复验基于当前工作区依赖升级：`toolkit v0.2.6`、`ai-core v0.2.1`、`hexagon v0.5.8`，三者均声明 `go=1.25.7`。
+本轮复验基于当前工作区依赖升级：`toolkit v0.2.6`、`ai-core v0.2.4`、`hexagon v0.5.9`，三者均声明 `go=1.25.7`。
 
 - `sandbox-code-exec.yml` 已进入默认分支并注册为专项 workflow，覆盖 toolkit 联调下的 Linux/macOS code_exec 强沙箱路径，并保留 Windows toolkit sandbox 硬门禁；Windows code_exec runtime 集成用例按当前 toolkit 工具链/设备访问能力门控。
 - `GOWORK=off go test ./... -run '^$'` 通过，说明发版/CI 模式下全仓编译已恢复；此前 `toolkit v0.2.3` 缺字段导致的 release 构建不可复现问题已由依赖升级修复。
@@ -133,7 +133,7 @@ GOWORK=off go test -race -count=1 ./engine -run TestProbe_RunnerIntegrity_MustFa
 
 历史证据：`GOWORK=off GOFLAGS=-mod=readonly go build ./...` 曾失败，原因是 `skill/builtin/code_exec.go` 引用了 `sandbox.Config` / `ExecResult` 的新字段，但 `go.mod` 锁定的 `toolkit v0.2.3` 不包含这些字段。
 
-修复状态：当前依赖已升级到 `toolkit v0.2.6`、`ai-core v0.2.1`、`hexagon v0.5.8`，并统一 `go 1.25.7`。`GOWORK=off go test ./... -run '^$'` 已通过，全仓编译和模块解析不再依赖本地 `go.work` 隐式状态。
+修复状态：当前依赖已升级到 `toolkit v0.2.6`、`ai-core v0.2.4`、`hexagon v0.5.9`，并统一 `go 1.25.7`。`GOWORK=off go test ./... -run '^$'` 已通过，全仓编译和模块解析不再依赖本地 `go.work` 隐式状态。
 
 ## 次级问题
 

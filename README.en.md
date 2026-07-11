@@ -755,8 +755,8 @@ go run ./cmd/verify-release -repo . -version 0.5.0 -version-files hexclaw.go
 | Component | Technology |
 |-----------|-----------|
 | Language | Go 1.25.7+ |
-| Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.5.8 |
-| AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.2.1 |
+| Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.5.9 |
+| AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.2.4 |
 | Utility Library | [toolkit](https://github.com/hexagon-codes/toolkit) v0.2.6 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | Configuration | YAML + environment variables |
@@ -800,7 +800,7 @@ chore: build/toolchain updates
 | Project | Description | Repository |
 |---------|-------------|------------|
 | **Hexagon** | Go AI Agent framework (core engine) v0.5.8 | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI core library (LLM/Tool/Memory) v0.2.1 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **ai-core** | AI core library (LLM/Tool/Memory) v0.2.4 | [ai-core](https://github.com/hexagon-codes/ai-core) |
 | **toolkit** | Go utility library v0.2.6 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI dashboard (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
 | **hexclaw-desktop** | HexClaw desktop client (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
@@ -820,7 +820,7 @@ chore: build/toolchain updates
 - **Unattended governance API** — Added autonomy profile, preflight, summary, decision-audit, and task-grant endpoints, plus purpose/data-class egress policy.
 
 **Dependencies & CI/CD**
-- **Framework dependency upgrade** — `go.mod` now targets hexagon v0.5.8 / ai-core v0.2.1 / toolkit v0.2.6 and Go 1.25.7. `GOWORK=off go test ./... -run '^$'` passes, so release/CI-mode compilation no longer depends on local workspace-only dependency APIs.
+- **Framework dependency upgrade** — `go.mod` now targets hexagon v0.5.9 / ai-core v0.2.4 / toolkit v0.2.6 and Go 1.25.7. `GOWORK=off go test ./... -run '^$'` passes, so release/CI-mode compilation no longer depends on local workspace-only dependency APIs.
 - **Default Hub tag** — Skill Marketplace now defaults to `hexagon-codes/hexclaw-hub` tag `v0.0.6`.
 - **CI/CD verification notes** — `sandbox-code-exec.yml` is the dedicated workflow for Linux/macOS `code_exec` strong-sandbox paths against toolkit, while Windows keeps the toolkit sandbox gate. Windows `code_exec` runtime integration tests are gated by the current toolkit/device capabilities. Normal Linux CI gates real sandbox execution by backend capability; the dedicated workflow forces proof with `HEXCLAW_P0_SANDBOX_PROOF=1`. The runner-integrity probe is skipped by default and only runs when `HEXCLAW_RUNNER_PROBE=1`.
 

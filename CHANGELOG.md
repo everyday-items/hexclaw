@@ -11,7 +11,7 @@
 - **无人值守治理 API**：新增 autonomy profile、preflight、summary、decision audit、task grant 端点，并补齐 purpose/data-class 出网策略。
 
 ### Changed
-- 升级框架依赖：hexagon v0.5.7 → **v0.5.8**、ai-core v0.1.11 → **v0.2.1**、toolkit v0.2.3 → **v0.2.6**；`go.mod` 同步到 Go **1.25.7**。`GOWORK=off go test ./... -run '^$'` 已通过，发版/CI 模式下全仓编译不再依赖本地 `go.work` 的隐式下层源码。
+- 升级框架依赖至 hexagon **v0.5.9**、ai-core **v0.2.4**、toolkit **v0.2.6**；`go.mod` 同步到 Go **1.25.7**。`GOWORK=off go test ./... -run '^$'` 已通过，发版/CI 模式下全仓编译不再依赖本地 `go.work` 的隐式下层源码。
 - **执行原语收敛**：`code_exec` 成为推荐执行入口，支持 snippet/file/module/project 与 artifact metadata；`code`/`shell` 保留兼容但标记弃用，顶层 `runtime/` 包删除，沙箱能力收敛到 toolkit + `skill/sandbox`。
 - **默认 Hub 标签**：技能市场默认目录对齐 `hexagon-codes/hexclaw-hub` `v0.0.6`。
 - 更新 CI/CD 文档口径：补充 `sandbox-code-exec.yml` 专项门禁、Linux CI 等价命令，以及 runner 完整性探针不得进入默认 `go test ./...` 的规则。
