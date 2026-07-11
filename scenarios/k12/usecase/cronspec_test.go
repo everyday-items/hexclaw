@@ -19,8 +19,16 @@ func TestDefaultCronSpecs_Shape(t *testing.T) {
 		"学期确认（9/1）":    "0 9 1 9 *",
 	}
 	for _, s := range specs {
-		if want, ok := wantSchedules[s.Name]; !ok || want != s.Schedule {
-			t.Errorf("任务 %q schedule=%q, 期望 %q", s.Name, s.Schedule, want)
+		var want string
+		matched := false
+		for name, schedule := range wantSchedules {
+			if strings.HasPrefix(s.Name, name+"·") {
+				want, matched = schedule, true
+				break
+			}
+		}
+		if !matched || want != s.Schedule {
+			t.Errorf("任务 %q schedule=%q, 期望匹配默认任务名及其 agent 作用域", s.Name, s.Schedule)
 		}
 		if len(s.Deliver) != 1 || s.Deliver[0] != "dingtalk" {
 			t.Errorf("任务 %q deliver 应为 [dingtalk], got %v", s.Name, s.Deliver)
@@ -54,6 +62,26 @@ func TestDefaultCronSpecs_EndpointsDistinct(t *testing.T) {
 	for _, p := range []string{"mistake-sheet", "daily-reminder", "monthly-report", "semester-check"} {
 		if !paths[p] {
 			t.Errorf("端点 %q 未被任何默认任务覆盖", p)
+		}
+	}
+}
+
+func TestDefaultCronSpecs_HasStableAgentKindKey(t *testing.T) {
+	specs := DefaultCronSpecs("http://h", "child-a", nil)
+	want := []string{
+		"child-a/weekly-sheet",
+		"child-a/daily-reminder",
+		"child-a/monthly-report",
+		"child-a/year-archive",
+		"child-a/semester-spring",
+		"child-a/semester-fall",
+	}
+	if len(specs) != len(want) {
+		t.Fatalf("spec count=%d want=%d", len(specs), len(want))
+	}
+	for i := range specs {
+		if specs[i].Key != want[i] {
+			t.Errorf("spec[%d].Key=%q want=%q", i, specs[i].Key, want[i])
 		}
 	}
 }

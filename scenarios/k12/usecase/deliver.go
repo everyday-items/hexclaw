@@ -155,6 +155,12 @@ func (d Deps) ArchiveStaleMistakes(ctx context.Context, agentName string) (int, 
 		if r.Status == k12.StatusArchived || r.UpdatedAt > cutoff {
 			continue
 		}
+		// BUG-20260710：顶档（rung 4）间隔 = 30 天 == StaleArchiveInterval，卡片在 due 时刻
+		// UpdatedAt 恰满足静默条件，会先于进复习队列被归档。有未过期/刚到期排期 due 的卡片
+		// 是「按阶梯正常待练」而非静默——只有 due 也已过期 30 天以上（或无 due）才算无状态变化。
+		if r.DueAt != nil && *r.DueAt >= cutoff {
+			continue
+		}
 		if err := d.Records.UpdateStatus(ctx, r.RecordID, k12.StatusArchived, nil, r.Version); err == nil {
 			n++
 		}

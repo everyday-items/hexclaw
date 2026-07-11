@@ -12,9 +12,11 @@ import (
 type fakeExec struct {
 	solveResult *skill.Result
 	gradeResult *skill.Result
+	lastArgs    map[string]any
 }
 
-func (f fakeExec) Execute(_ context.Context, args map[string]any) (*skill.Result, error) {
+func (f *fakeExec) Execute(_ context.Context, args map[string]any) (*skill.Result, error) {
+	f.lastArgs = args
 	if _, grading := args["student_answer"]; grading {
 		return f.gradeResult, nil
 	}
@@ -22,7 +24,7 @@ func (f fakeExec) Execute(_ context.Context, args map[string]any) (*skill.Result
 }
 
 func TestSolveAdapter_Solve_AgreeStrong(t *testing.T) {
-	a := NewSolveAdapter(fakeExec{
+	a := NewSolveAdapter(&fakeExec{
 		solveResult: &skill.Result{
 			Content:  "解题：3.8×3=11.4\n\n```hexclaw-subagents\n[{\"Agent\":\"solver\"}]\n```",
 			Metadata: map[string]string{"solve_verdict": "agree", "solve_evidence": "numeric_exec"},
@@ -44,7 +46,7 @@ func TestSolveAdapter_Solve_AgreeStrong(t *testing.T) {
 }
 
 func TestSolveAdapter_Solve_SkippedIsWeak(t *testing.T) {
-	a := NewSolveAdapter(fakeExec{
+	a := NewSolveAdapter(&fakeExec{
 		solveResult: &skill.Result{Content: "1+1=2", Metadata: map[string]string{"solve_verdict": "skipped"}},
 	})
 	sr, _ := a.Solve(context.Background(), "1+1=?", "五年级上", "")
@@ -57,7 +59,7 @@ func TestSolveAdapter_Solve_SkippedIsWeak(t *testing.T) {
 }
 
 func TestSolveAdapter_Grade(t *testing.T) {
-	a := NewSolveAdapter(fakeExec{
+	a := NewSolveAdapter(&fakeExec{
 		gradeResult: &skill.Result{
 			Content: "批改...",
 			Metadata: map[string]string{
@@ -79,11 +81,49 @@ func TestSolveAdapter_Grade(t *testing.T) {
 }
 
 func TestSolveAdapter_Grade_Correct(t *testing.T) {
-	a := NewSolveAdapter(fakeExec{
+	a := NewSolveAdapter(&fakeExec{
 		gradeResult: &skill.Result{Metadata: map[string]string{"grade_correct": "true"}},
 	})
 	out, _ := a.Grade(context.Background(), "1+1=?", "2", "")
 	if !out.Correct {
 		t.Error("应判对")
+	}
+}
+
+func TestSolveAdapter_GradeRejectsMissingOrInvalidCorrectMetadata(t *testing.T) {
+	tests := []struct {
+		name string
+		meta map[string]string
+	}{
+		{name: "missing", meta: map[string]string{}},
+		{name: "invalid", meta: map[string]string{"grade_correct": "not-a-bool"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := NewSolveAdapter(&fakeExec{gradeResult: &skill.Result{Metadata: tt.meta}})
+			if _, err := a.Grade(context.Background(), "1+1=?", "2", ""); err == nil {
+				t.Fatal("missing/invalid grade_correct must fail closed")
+			}
+		})
+	}
+}
+
+func TestSolveAdapter_SubjectPassThrough(t *testing.T) {
+	exec := &fakeExec{
+		solveResult: &skill.Result{Metadata: map[string]string{"solve_verdict": "agree"}},
+		gradeResult: &skill.Result{Metadata: map[string]string{"grade_correct": "true"}},
+	}
+	a := NewSolveAdapter(exec)
+	if _, err := a.SolveSubject(context.Background(), "英语", "fill the blank", "初一上", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := exec.lastArgs["subject"]; got != "英语" {
+		t.Fatalf("solve subject=%v want 英语", got)
+	}
+	if _, err := a.GradeSubject(context.Background(), "英语", "fill the blank", "goes", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := exec.lastArgs["subject"]; got != "英语" {
+		t.Fatalf("grade subject=%v want 英语", got)
 	}
 }

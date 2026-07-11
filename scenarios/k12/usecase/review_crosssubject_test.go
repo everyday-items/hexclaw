@@ -2,9 +2,11 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
@@ -22,6 +24,24 @@ func seedAccumDue(t *testing.T, d Deps, subject, entryType, content string, due 
 		t.Fatalf("seed accum: %v", err)
 	}
 	return rec.RecordID
+}
+
+func TestAccumulationTerminalStatesCannotReenterReview(t *testing.T) {
+	d, _ := newPipeline(t, fakeSolver{}, fakeGrader{}, nil)
+	ctx := context.Background()
+	id := seedAccumDue(t, d, "英语", "错词", "believe", 400)
+	cur, _ := d.Records.Get(ctx, id)
+	if err := d.MarkMastered(ctx, "mingming", id, cur.Version); err != nil {
+		t.Fatal(err)
+	}
+	mastered, _ := d.Records.Get(ctx, id)
+	if err := d.MarkRetried(ctx, id, mastered.Version); !errors.Is(err, records.ErrIllegalTransition) {
+		t.Fatalf("mastered -> reviewing err=%v want illegal transition", err)
+	}
+	after, _ := d.Records.Get(ctx, id)
+	if after.Status != k12.AccumStatusMastered || after.Version != mastered.Version {
+		t.Fatalf("terminal record changed: before=%+v after=%+v", mastered, after)
+	}
 }
 
 // TestReviewQueue_CrossSubject 口径核心：本周该练队列**跨科混排**（错题本 + 语英纠错型），
@@ -101,7 +121,7 @@ func TestAccum_MarkRetriedAndMastered(t *testing.T) {
 	}
 
 	cur2, _ := d.Records.Get(ctx, id)
-	if err := d.MarkMastered(ctx, id, cur2.Version); err != nil {
+	if err := d.MarkMastered(ctx, "mingming", id, cur2.Version); err != nil {
 		t.Fatal(err)
 	}
 	got2, _ := d.Records.Get(ctx, id)

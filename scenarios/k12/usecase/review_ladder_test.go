@@ -75,7 +75,7 @@ func TestMarkMastered_ClearsDue(t *testing.T) {
 	id := seedMistake(t, d, "a", "小数乘法", "计算失误", 500)
 
 	cur, _ := d.Records.Get(ctx, id)
-	if err := d.MarkMastered(ctx, id, cur.Version); err != nil {
+	if err := d.MarkMastered(ctx, "mingming", id, cur.Version); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := d.Records.Get(ctx, id)

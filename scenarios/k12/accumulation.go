@@ -44,10 +44,15 @@ type AccumFields struct {
 // AccumulationSchema 返回积累本记录集 schema。去重键 = 学科+类型+内容摘要。
 func AccumulationSchema() *records.RecordSchema {
 	return &records.RecordSchema{
-		Collection:     CollectionAccumulation,
-		Version:        1,
-		InitialStatus:  AccumStatusKept, // 默认积累型；复习型由 NewAccumRecord 显式置 待复习
-		Statuses:       []string{AccumStatusReviewing, AccumStatusMastered, AccumStatusKept},
+		Collection:    CollectionAccumulation,
+		Version:       1,
+		InitialStatus: AccumStatusKept, // 默认积累型；复习型由 NewAccumRecord 显式置 待复习
+		Statuses:      []string{AccumStatusReviewing, AccumStatusMastered, AccumStatusKept},
+		Transitions: map[string][]string{
+			AccumStatusReviewing: {AccumStatusMastered},
+			AccumStatusMastered:  {},
+			AccumStatusKept:      {},
+		},
 		DedupeKey:      accumDedupeKey,
 		ValidateFields: validateAccumFields,
 	}

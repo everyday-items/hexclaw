@@ -45,6 +45,9 @@ func (it ReviewItem) Subject() string {
 	if it.IsAccum() {
 		return it.Accum.Subject
 	}
+	if it.Fields.Subject != "" {
+		return it.Fields.Subject
+	}
 	return "数学"
 }
 
@@ -98,16 +101,22 @@ func (d Deps) ReviewQueue(ctx context.Context, agentName string) ([]ReviewItem, 
 
 // MarkMastered 家长「他会了」/复测掌握：状态 → 已掌握，清到期（移出复习队列）。**按 collection 分派**
 // 掌握态（错题本 mastered / 积累本 已掌握）——否则会撞记录集状态机校验。
-func (d Deps) MarkMastered(ctx context.Context, recordID string, expectedVersion int) error {
+func (d Deps) MarkMastered(ctx context.Context, agentName, recordID string, expectedVersion int) error {
+	if agentName == "" || recordID == "" {
+		return fmt.Errorf("%w: agentName / recordID 不可空", ErrInvalidInput)
+	}
 	rec, err := d.Records.Get(ctx, recordID)
 	if err != nil {
 		return fmt.Errorf("usecase: 取记录: %w", err)
+	}
+	if rec.AgentName != agentName {
+		return fmt.Errorf("usecase: 取记录: %w", records.ErrNotFound)
 	}
 	mastered := k12.StatusMastered
 	if rec.Collection == k12.CollectionAccumulation {
 		mastered = k12.AccumStatusMastered
 	}
-	return d.Records.UpdateStatus(ctx, recordID, mastered, nil, expectedVersion)
+	return d.Records.UpdateStatusScoped(ctx, agentName, recordID, mastered, nil, expectedVersion)
 }
 
 // MasteryGapInterval 掌握判定的最小间隔（秒）：第二次做对距上次 ≥ 此值 → mastered（PRD §5.3.1）。
@@ -175,11 +184,14 @@ func (d Deps) markRetriedAccum(ctx context.Context, rec *records.AgentRecord, ex
 // GenerateRetry 「再练一道」：基于某错题出一道相似题，**必过 solve 验算链**（不合格由 Solver 侧弃用重出）。
 // 返回相似题解 + 证据对象；只读，不改错题状态。
 func (d Deps) GenerateRetry(ctx context.Context, item ReviewItem, grade string) (SolveResult, error) {
+	if err := validateGradeInput(grade); err != nil {
+		return SolveResult{}, err
+	}
 	if d.Solver == nil {
 		return SolveResult{}, fmt.Errorf("usecase: 未配置 Solver")
 	}
 	prompt := fmt.Sprintf("参照这道错题出一道同知识点(%s)的相似题并解答：%s", item.Fields.KnowledgePoint, item.Fields.Question)
-	sr, err := d.Solver.Solve(ctx, prompt, grade, d.constraintFor(ctx, grade))
+	sr, err := d.solveProblem(ctx, item.Subject(), prompt, grade)
 	if err != nil {
 		// BUG-2：下游解题执行失败标记为 ErrSolveFailed，HTTP 层据此回 502（非 400）。
 		return SolveResult{}, fmt.Errorf("%w: %v", ErrSolveFailed, err)
@@ -197,7 +209,7 @@ func (d Deps) GenerateRetryByRecord(ctx context.Context, agentName, recordID, gr
 		return SolveResult{}, fmt.Errorf("usecase: 取错题: %w", err)
 	}
 	if rec == nil || rec.AgentName != agentName {
-		return SolveResult{}, fmt.Errorf("usecase: 错题不属于该实例")
+		return SolveResult{}, fmt.Errorf("usecase: 错题不属于该实例: %w", records.ErrNotFound)
 	}
 	// 语英纠错型：**原词重现 + 确定性字符比对**，不走 solve 验算链（PRD §3.5.4：语英字词再练机制适配）。
 	if rec.Collection == k12.CollectionAccumulation {
@@ -206,6 +218,9 @@ func (d Deps) GenerateRetryByRecord(ctx context.Context, agentName, recordID, gr
 			Solution: fmt.Sprintf("再默一遍（%s·%s）：%s\n判定：一字不差即正确（确定性字符比对，非验算链）。", af.Subject, af.EntryType, af.Content),
 			Evidence: SolveEvidence{Verdict: VerdictVerbatim, EvidenceType: EvidenceVerbatim},
 		}, nil
+	}
+	if rec.Collection != k12.CollectionMistakes {
+		return SolveResult{}, fmt.Errorf("usecase: 记录不属于 K12 复习集: %w", records.ErrNotFound)
 	}
 	if grade == "" && d.Profiles != nil {
 		if p, perr := d.GetProfile(ctx, agentName); perr == nil {

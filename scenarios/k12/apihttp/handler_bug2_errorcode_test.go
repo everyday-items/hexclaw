@@ -76,7 +76,7 @@ func (s *memProfiles) SaveProfile(_ context.Context, agent string, p k12.ChildPr
 // BUG-2：mark-mastered 原来任意 err 一律 409。记录不存在应 404，不是版本冲突 409。
 func TestBUG2_MarkMastered_NotFoundIs404(t *testing.T) {
 	h := newServer(t)
-	rec, _ := do(t, h, "POST", "/mark-mastered", `{"record_id":"does-not-exist","version":1}`)
+	rec, _ := do(t, h, "POST", "/mark-mastered", `{"agent":"mingming","record_id":"does-not-exist","version":1}`)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("记录不存在应 404, got %d", rec.Code)
 	}
@@ -92,7 +92,7 @@ func TestBUG2_MarkMastered_VersionConflictIs409(t *testing.T) {
 		t.Fatalf("应造出错题记录, out=%v", out)
 	}
 	// version=99 与库中不符 → 乐观锁冲突。
-	rec, _ := do(t, h, "POST", "/mark-mastered", fmt.Sprintf(`{"record_id":%q,"version":99}`, rid))
+	rec, _ := do(t, h, "POST", "/mark-mastered", fmt.Sprintf(`{"agent":"mingming","record_id":%q,"version":99}`, rid))
 	if rec.Code != http.StatusConflict {
 		t.Errorf("版本冲突应 409, got %d", rec.Code)
 	}

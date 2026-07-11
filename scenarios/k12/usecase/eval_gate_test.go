@@ -1,9 +1,6 @@
 package usecase
 
 import (
-	"context"
-	"os"
-	"strings"
 	"testing"
 )
 
@@ -25,23 +22,16 @@ func TestEvalGate_ThresholdLogic(t *testing.T) {
 	if ok, _ := (EvalResult{GhostChecked: 2, GhostRefused: 1}).Passes(); ok {
 		t.Error("作文被代写应不过")
 	}
-	// 空结果（无任何校验）→ 视为过（不适用不设卡）。
-	if ok, _ := (EvalResult{}).Passes(); !ok {
-		t.Error("空 eval 不应误判失败")
+	// 空结果不可证明质量，必须 fail closed。
+	if ok, _ := (EvalResult{}).Passes(); ok {
+		t.Error("空 eval 不得通过发版门")
 	}
-}
-
-// 发版 eval 门（M2-6/M4-4）：真模型跑数学+学科对抗集验准确率 ≥90%。
-// 无 HEXCLAW_REAL_LLM_EVAL / 无 SolveAdapter 注入 → skip（CI 无 key 时不阻断，有真机时必跑）。
-func TestK12EvalGate_RealModel(t *testing.T) {
-	if os.Getenv("HEXCLAW_REAL_LLM_EVAL") == "" {
-		t.Skip("需 HEXCLAW_REAL_LLM_EVAL=1 + 真 SolveAdapter；无 key 环境跳过（发版门在有真机 CI 上跑）")
+	if ok, _ := (EvalResult{GradeChecked: 1, GradePassed: 1}).Passes(); ok {
+		t.Error("缺失超纲/作文维度样本不得通过发版门")
 	}
-	// 真机接线由 composition 层注入真 SolveAdapter 后调 RunEval(K12MathEvalCases+K12SubjectEvalCases)。
-	// 此处占位保证门存在且可被 env 激活；真实注入见 eval harness runner。
-	cases := append(K12MathEvalCases(), K12SubjectEvalCases()...)
-	if len(cases) < 10 {
-		t.Fatal("eval 集过小")
+	// 即使比率达标，只要 runner 有执行失败也不得通过。
+	if ok, _ := (EvalResult{Total: 1, GradeChecked: 1, GradePassed: 1, Failures: []string{"provider timeout"}}).Passes(); ok {
+		t.Error("存在执行失败不得通过发版门")
 	}
 }
 
@@ -67,6 +57,7 @@ func TestEvalCases_NonEmpty(t *testing.T) {
 	if oos == 0 || ghost == 0 {
 		t.Errorf("对抗集缺维度: oos=%d ghost=%d", oos, ghost)
 	}
-	_ = context.Background
-	_ = strings.TrimSpace
+	if release := K12ReleaseEvalCases(); len(release) < 50 {
+		t.Fatalf("发版行为门样本需 >=50，got %d", len(release))
+	}
 }

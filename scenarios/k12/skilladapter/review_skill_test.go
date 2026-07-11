@@ -26,6 +26,18 @@ func seedDueMistake(t *testing.T, deps usecase.Deps, question, kp, cause string,
 	}
 }
 
+func seedDueAccum(t *testing.T, deps usecase.Deps, content string, due int64) {
+	t.Helper()
+	rec, err := k12.NewAccumRecord("mingming", "accum", k12.AccumFields{Subject: "英语", EntryType: "错词", Content: content})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.DueAt = &due
+	if _, err := deps.Records.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReviewSkill_ReturnsDuePlan(t *testing.T) {
 	deps := newDeps(t, usecase.GradeOutcome{})            // now()=1000
 	seedDueMistake(t, deps, "3.8×3", "小数乘法", "计算失误", 500) // due<now → 到期
@@ -77,6 +89,23 @@ func TestReviewSkill_GenerateRetryVariant(t *testing.T) {
 	}
 	if !strings.Contains(res.Content, "变式题") || !strings.Contains(res.Content, "解：11.4") {
 		t.Errorf("generate_retry 应附变式题（含 fakeSolver 解）: %q", res.Content)
+	}
+}
+
+func TestReviewSkill_AccumulationUsesContentAndVerbatimRetry(t *testing.T) {
+	deps := newDeps(t, usecase.GradeOutcome{})
+	seedDueAccum(t, deps, "believe", 400)
+	sk := skilladapter.NewReviewSkill(deps)
+	ctx := skill.WithRoutedAgent(context.Background(), "mingming")
+	res, err := sk.Execute(ctx, map[string]any{"generate_retry": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Content, "believe") || !strings.Contains(res.Content, "再默一遍") {
+		t.Fatalf("cross-subject review lost content/verbatim retry: %q", res.Content)
+	}
+	if res.Metadata["badge"] != "verbatim-recall" {
+		t.Fatalf("badge=%q want verbatim-recall", res.Metadata["badge"])
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 
@@ -59,6 +60,7 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("POST /mark-mastered", h.markMastered)
 	mux.HandleFunc("POST /review/retry", h.reviewRetry)
 	mux.HandleFunc("POST /prep-card", h.prepCard)
+	mux.HandleFunc("POST /grounding", h.addGrounding)
 	mux.HandleFunc("POST /accumulation", h.addAccumulation)
 	mux.HandleFunc("GET /accumulation", h.listAccumulation)
 	mux.HandleFunc("GET /backup", h.backup)
@@ -88,6 +90,7 @@ type handler struct{ rt Runtime }
 
 type gradeReq struct {
 	Agent           string   `json:"agent"`
+	Subject         string   `json:"subject"`
 	Grade           string   `json:"grade"`
 	SourceSession   string   `json:"source_session"`
 	Problem         string   `json:"problem"`
@@ -167,7 +170,7 @@ type recognizedQuestionDTO struct {
 // recognize POST /recognize —— 作业图片（base64）→ 结构化题目清单。
 func (h *handler) recognize(w http.ResponseWriter, r *http.Request) {
 	var req recognizeReq
-	if !decode(w, r, &req) {
+	if !decodeLimit(w, r, &req, 8<<20) {
 		return
 	}
 	img, err := base64.StdEncoding.DecodeString(strings.TrimSpace(stripDataURI(req.ImageBase64)))
@@ -216,11 +219,11 @@ func (h *handler) grade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := h.rt.Deps.GradeHomeworkProblem(r.Context(), usecase.GradeRequest{
-		AgentName: req.Agent, Grade: h.resolveGrade(r.Context(), req.Agent, req.Grade), SourceSession: req.SourceSession,
+		AgentName: req.Agent, Subject: req.Subject, Grade: h.resolveGrade(r.Context(), req.Agent, req.Grade), SourceSession: req.SourceSession,
 		Problem: req.Problem, StudentAnswer: req.StudentAnswer, KnowledgePoints: req.KnowledgePoints,
 	})
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, gradeResp{
@@ -290,6 +293,7 @@ func (h *handler) insightReport(w http.ResponseWriter, r *http.Request) {
 }
 
 type markMasteredReq struct {
+	Agent    string `json:"agent"`
 	RecordID string `json:"record_id"`
 	Version  int    `json:"version"`
 }
@@ -300,7 +304,11 @@ func (h *handler) markMastered(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if err := h.rt.Deps.MarkMastered(r.Context(), req.RecordID, req.Version); err != nil {
+	if req.Agent == "" || req.RecordID == "" {
+		writeErr(w, http.StatusBadRequest, "agent / record_id 必填")
+		return
+	}
+	if err := h.rt.Deps.MarkMastered(r.Context(), req.Agent, req.RecordID, req.Version); err != nil {
 		// BUG-2：按错误类型分流——版本冲突 409 / 记录不存在 404 / 非法状态 400 / 其余存储错 500。
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
@@ -347,6 +355,25 @@ type prepCardReq struct {
 	KnowledgePoints []string `json:"knowledge_points"`
 }
 
+type groundingReq struct {
+	Agent   string `json:"agent"`
+	Title   string `json:"title"`
+	Content string `json:"content"`
+}
+
+// addGrounding POST /grounding —— 家长教材按 agent scope 入库，与备课卡读侧同键。
+func (h *handler) addGrounding(w http.ResponseWriter, r *http.Request) {
+	var req groundingReq
+	if !decode(w, r, &req) {
+		return
+	}
+	if err := h.rt.Deps.AddGrounding(r.Context(), req.Agent, req.Title, req.Content); err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 type prepSectionDTO struct {
 	Title       string `json:"title"`
 	Content     string `json:"content"`
@@ -361,7 +388,7 @@ func (h *handler) prepCard(w http.ResponseWriter, r *http.Request) {
 	}
 	card, err := h.rt.Deps.BuildPrepCard(r.Context(), req.Agent, h.resolveGrade(r.Context(), req.Agent, req.Grade), req.KnowledgePoints)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
 	}
 	secs := make([]prepSectionDTO, 0, len(card.Sections))
@@ -398,7 +425,7 @@ func (h *handler) addAccumulation(w http.ResponseWriter, r *http.Request) {
 		Subject: req.Subject, EntryType: req.EntryType, Content: req.Content, Source: req.Source,
 	})
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"record_id": id, "created": created})
@@ -444,7 +471,7 @@ func (h *handler) backup(w http.ResponseWriter, r *http.Request) {
 // restore POST /restore —— 从 .hexbak 恢复（先校验 checksum）。
 func (h *handler) restore(w http.ResponseWriter, r *http.Request) {
 	var bak usecase.Hexbak
-	if !decode(w, r, &bak) {
+	if !decodeLimit(w, r, &bak, 16<<20) {
 		return
 	}
 	// T2.6：恢复前自动快照（PRD §3.12.9），随响应回传供前端保存以便回退。
@@ -533,7 +560,7 @@ func (h *handler) coldStart(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := h.rt.Deps.ColdStartProvision(r.Context(), req.Agent, req.ChildName, req.KnowledgePoints, req.FallbackGrade, req.Textbook)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, coldStartResp{
@@ -559,7 +586,7 @@ func (h *handler) updateProfile(w http.ResponseWriter, r *http.Request) {
 		ChildName: req.ChildName, GradeTerm: req.GradeTerm, TextbookEdition: req.TextbookEdition,
 	})
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, profileDTO{ChildName: p.ChildName, GradeTerm: p.GradeTerm, TextbookEdition: p.TextbookEdition})
@@ -870,12 +897,33 @@ func mistakeDTOFrom(r *records.AgentRecord, f k12.MistakeFields) mistakeDTO {
 	return mistakeDTO{
 		RecordID: r.RecordID, Question: f.Question, KnowledgePoint: f.KnowledgePoint,
 		ErrorCause: f.ErrorCause, Status: r.Status, Version: r.Version, DueAt: r.DueAt,
+		Subject: f.Subject,
 	}
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+	return decodeLimit(w, r, v, 1<<20)
+}
+
+func decodeLimit(w http.ResponseWriter, r *http.Request, v any, maxBytes int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(v); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return false
+		}
 		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return false
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return false
+		}
+		writeErr(w, http.StatusBadRequest, "request body must contain exactly one JSON value")
 		return false
 	}
 	return true
@@ -903,7 +951,11 @@ func httpStatusForK12Error(err error, fallback int) int {
 		return http.StatusConflict
 	case errors.Is(err, records.ErrNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, records.ErrInvalidStatus), errors.Is(err, usecase.ErrChecksumMismatch):
+	case errors.Is(err, records.ErrInvalidStatus), errors.Is(err, records.ErrInvalidFields),
+		errors.Is(err, records.ErrInvalidRecord), errors.Is(err, records.ErrUnknownCollection),
+		errors.Is(err, usecase.ErrChecksumMismatch):
+		return http.StatusBadRequest
+	case errors.Is(err, usecase.ErrInvalidInput):
 		return http.StatusBadRequest
 	case errors.Is(err, usecase.ErrSolveFailed), errors.Is(err, usecase.ErrRenderUnavailable):
 		return http.StatusBadGateway

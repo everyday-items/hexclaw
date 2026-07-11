@@ -50,7 +50,7 @@ type ColdStartResult struct {
 // 或把本方法当"确认后落库"入口。连续无法确认 → 传空 grade 走"不注入约束"降级（§3.1.8）。
 func (d Deps) ColdStartProvision(ctx context.Context, agentName, childName string, kps []string, fallbackGrade, textbook string) (ColdStartResult, error) {
 	if agentName == "" {
-		return ColdStartResult{}, fmt.Errorf("usecase: agentName 不可空")
+		return ColdStartResult{}, fmt.Errorf("%w: agentName 不可空", ErrInvalidInput)
 	}
 	if d.Profiles == nil {
 		return ColdStartResult{}, fmt.Errorf("usecase: 未配置档案存储")
@@ -65,7 +65,7 @@ func (d Deps) ColdStartProvision(ctx context.Context, agentName, childName strin
 		grade = fallbackGrade // 推断不出：用传入 grade（可空 → 降级不注入约束）
 	}
 	if grade != "" && !k12.ValidGradeTerm(grade) {
-		return ColdStartResult{}, fmt.Errorf("usecase: 非法年级 %q", grade)
+		return ColdStartResult{}, fmt.Errorf("%w: 非法年级 %q", ErrInvalidInput, grade)
 	}
 	if textbook == "" {
 		textbook = "人教版" // §3.1.8 覆盖外教材默认人教版

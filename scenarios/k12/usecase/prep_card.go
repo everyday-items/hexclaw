@@ -39,7 +39,10 @@ const consecutiveFailThreshold = 2
 // 全程只读档案/错题/学情，不写入（§3.14.9）。solve 验算链只验解题、不验讲解——①段靠来源标注兜信任。
 func (d Deps) BuildPrepCard(ctx context.Context, agentName, grade string, knowledgePoints []string) (PrepCard, error) {
 	if agentName == "" || len(knowledgePoints) == 0 {
-		return PrepCard{}, fmt.Errorf("usecase: 备课卡需 agentName + 至少一个知识点")
+		return PrepCard{}, fmt.Errorf("%w: 备课卡需 agentName + 至少一个知识点", ErrInvalidInput)
+	}
+	if err := validateGradeInput(grade); err != nil {
+		return PrepCard{}, err
 	}
 	card := PrepCard{KnowledgePoints: knowledgePoints}
 
@@ -71,19 +74,19 @@ func (d Deps) BuildPrepCard(ctx context.Context, agentName, grade string, knowle
 func (d Deps) sectionReview(ctx context.Context, agentName, grade string, kps []string) PrepSection {
 	var b strings.Builder
 	label := SrcTextbook
-	grounded := false
+	grounded := 0
 	for _, kp := range kps {
 		if d.Grounding != nil {
 			if text, found, err := d.Grounding.Ground(ctx, agentName, kp, grade); err == nil && found {
 				fmt.Fprintf(&b, "【%s】%s\n", kp, text)
-				grounded = true
+				grounded++
 				continue
 			}
 		}
 		fmt.Fprintf(&b, "【%s】（依据年级常识归纳，请自行核对）\n", kp)
 	}
-	if !grounded {
-		label = SrcAIUnverified // 全无教材命中 → 整体标未校验
+	if grounded != len(kps) {
+		label = SrcAIUnverified // 任一知识点未命中，整段不得宣称全部依据课本
 	}
 	return PrepSection{Title: "① 知识点 3 分钟回顾", Content: strings.TrimSpace(b.String()), SourceLabel: label}
 }
@@ -109,12 +112,12 @@ func sectionStumbles(history []ReviewItem) PrepSection {
 
 func (d Deps) sectionWarmup(ctx context.Context, grade, kp string) PrepSection {
 	if d.Solver == nil {
-		return PrepSection{Title: "④ 热身题", Content: "（未配置出题）", SourceLabel: SrcVerified}
+		return PrepSection{Title: "④ 热身题", Content: "（未配置出题）", SourceLabel: SrcAIUnverified}
 	}
 	sr, err := d.Solver.Solve(ctx, fmt.Sprintf("出一道低于作业难度半档的「%s」热身题并解答", kp), grade, d.constraintFor(ctx, grade))
 	if err != nil || !sr.Evidence.StrongTrust() {
 		// 出题未过验算链 → 不放热身题（诚实兜底）
-		return PrepSection{Title: "④ 热身题", Content: "（本次未生成可靠热身题）", SourceLabel: SrcVerified}
+		return PrepSection{Title: "④ 热身题", Content: "（本次未生成可靠热身题）", SourceLabel: SrcAIUnverified}
 	}
 	return PrepSection{Title: "④ 热身题（已过验算链）", Content: sr.Solution, SourceLabel: SrcVerified}
 }

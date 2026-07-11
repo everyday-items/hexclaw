@@ -101,9 +101,15 @@ func TestGradeAndMistakes(t *testing.T) {
 func TestOutOfScope(t *testing.T) {
 	h := newServer(t)
 	body := `{"agent":"mingming","grade":"五年级上","problem":"解方程组","knowledge_points":["解方程组"]}`
-	_, out := do(t, h, "POST", "/grade", body)
+	rec, out := do(t, h, "POST", "/grade", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("grade 状态 %d: %v", rec.Code, out)
+	}
 	if out["out_of_scope"] != true {
 		t.Errorf("超纲契约不符: %v", out)
+	}
+	if out["verdict"] != "out_of_scope" || out["evidence_type"] != "none" || out["badge"] != "out-of-scope" {
+		t.Errorf("超纲证据/徽章契约不一致: %v", out)
 	}
 }
 

@@ -42,5 +42,33 @@ func ApplyProfileToMeta(meta map[string]string, p ChildProfile) map[string]strin
 	return clone
 }
 
+// ReplaceProfileInMeta exact-replaces the K12 profile namespace while preserving
+// unrelated agent metadata. A nil profile means the archived state had no K12
+// profile and therefore clears all three K12 keys.
+func ReplaceProfileInMeta(meta map[string]string, p *ChildProfile) map[string]string {
+	clone := make(map[string]string, len(meta)+3)
+	for k, v := range meta {
+		switch k {
+		case MetaKeyChildName, MetaKeyGradeTerm, MetaKeyTextbook:
+			continue
+		default:
+			clone[k] = v
+		}
+	}
+	if p == nil {
+		return clone
+	}
+	if p.ChildName != "" {
+		clone[MetaKeyChildName] = p.ChildName
+	}
+	if p.GradeTerm != "" {
+		clone[MetaKeyGradeTerm] = p.GradeTerm
+	}
+	if p.TextbookEdition != "" {
+		clone[MetaKeyTextbook] = p.TextbookEdition
+	}
+	return clone
+}
+
 // ValidGradeTerm 校验年级学期是否 18 档之一。
 func ValidGradeTerm(g string) bool { return GradeRank(g) >= 0 }

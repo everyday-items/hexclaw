@@ -6,6 +6,7 @@ package engineadapter
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -38,7 +39,15 @@ var (
 // Solve 实现 usecase.Solver：调 solve skill 解题验算（透传 grade + constraint 约束年级边界），
 // 把 Metadata 里的 verdict + evidence 映射成证据对象。
 func (a *SolveAdapter) Solve(ctx context.Context, problem, grade, constraint string) (usecase.SolveResult, error) {
+	return a.SolveSubject(ctx, "", problem, grade, constraint)
+}
+
+// SolveSubject 与 Solve 相同，并把显式学科传给 solve skill，避免非数学 eval/批改落入默认数学路由。
+func (a *SolveAdapter) SolveSubject(ctx context.Context, subject, problem, grade, constraint string) (usecase.SolveResult, error) {
 	args := map[string]any{"problem": problem}
+	if subject != "" {
+		args["subject"] = subject
+	}
 	if grade != "" {
 		args["grade"] = grade
 	}
@@ -49,6 +58,9 @@ func (a *SolveAdapter) Solve(ctx context.Context, problem, grade, constraint str
 	if err != nil {
 		return usecase.SolveResult{}, err
 	}
+	if res == nil {
+		return usecase.SolveResult{}, fmt.Errorf("solve adapter: empty solve result")
+	}
 	return usecase.SolveResult{
 		Solution: stripReports(res.Content),
 		Evidence: evidenceFromMeta(res.Metadata),
@@ -58,12 +70,31 @@ func (a *SolveAdapter) Solve(ctx context.Context, problem, grade, constraint str
 // Grade 实现 usecase.Grader：solve skill 的 grading 模式内部会重新解题得 ground truth，
 // 结构化批改结果从 Metadata 读（solve.go 已同步输出，免解析 Content 文本）。
 func (a *SolveAdapter) Grade(ctx context.Context, problem, studentAnswer, _ string) (usecase.GradeOutcome, error) {
-	res, err := a.exec.Execute(ctx, map[string]any{"problem": problem, "student_answer": studentAnswer})
+	return a.GradeSubject(ctx, "", problem, studentAnswer, "")
+}
+
+// GradeSubject 与 Grade 相同，并把显式学科传给 grading 模式。
+func (a *SolveAdapter) GradeSubject(ctx context.Context, subject, problem, studentAnswer, _ string) (usecase.GradeOutcome, error) {
+	args := map[string]any{"problem": problem, "student_answer": studentAnswer}
+	if subject != "" {
+		args["subject"] = subject
+	}
+	res, err := a.exec.Execute(ctx, args)
 	if err != nil {
 		return usecase.GradeOutcome{}, err
 	}
+	if res == nil {
+		return usecase.GradeOutcome{}, fmt.Errorf("solve adapter: empty grading result")
+	}
 	m := res.Metadata
-	correct, _ := strconv.ParseBool(m["grade_correct"])
+	raw, ok := m["grade_correct"]
+	if !ok {
+		return usecase.GradeOutcome{}, fmt.Errorf("solve adapter: grading metadata missing grade_correct")
+	}
+	correct, err := strconv.ParseBool(raw)
+	if err != nil {
+		return usecase.GradeOutcome{}, fmt.Errorf("solve adapter: invalid grade_correct %q: %w", raw, err)
+	}
 	return usecase.GradeOutcome{
 		Correct:    correct,
 		WrongStep:  m["grade_wrong_step"],

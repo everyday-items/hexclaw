@@ -45,6 +45,7 @@ func (s *GradeSkill) ToolDefinition() llm.ToolDefinition {
 			Properties: map[string]*llm.Schema{
 				"problem":          {Type: "string", Description: "The problem statement."},
 				"student_answer":   {Type: "string", Description: "The child's submitted answer or worked steps."},
+				"subject":          {Type: "string", Description: "Optional explicit subject: 数学/语文/英语/物理/化学."},
 				"grade":            {Type: "string", Description: "Optional. Effective grade term (e.g. 五年级上); left empty resolves from the child's profile."},
 				"knowledge_points": {Type: "array", Items: &llm.Schema{Type: "string"}, Description: "Optional knowledge points from recognition."},
 				"source_session":   {Type: "string", Description: "Optional source session/chat id for mistake dedup."},
@@ -56,11 +57,10 @@ func (s *GradeSkill) ToolDefinition() llm.ToolDefinition {
 // Execute 跑完整 K12 批改闭环。实例 scope 取自 ctx（engine stamp 的已路由 Agent），
 // 不信 LLM 的 agent 参数（同 authUserCtxKey 纪律）。
 func (s *GradeSkill) Execute(ctx context.Context, args map[string]any) (*skill.Result, error) {
+	// BUG-20260710-H1：实例 scope 只认 ctx（engine stamp 的已路由 Agent），绝不回退
+	// 采信 LLM 传的 agent 参数——否则幻觉参数可把批改记录/错题写进任意孩子的命名
+	// 空间，击穿多孩隔离（同 authUserCtxKey 纪律）。测试用 skill.WithRoutedAgent 构造 ctx。
 	agent := skill.RoutedAgentName(ctx)
-	if agent == "" {
-		// 非路由上下文（如直接调用/测试）允许 args 兜底；生产 IM 入站恒有 ctx。
-		agent = argStr(args, "agent")
-	}
 	if agent == "" {
 		return nil, fmt.Errorf("k12_grade: 无法确定辅导实例（ctx 无已路由 Agent）")
 	}
@@ -80,6 +80,7 @@ func (s *GradeSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 	knowledgePoints := argStrSlice(args, "knowledge_points")
 	res, err := s.deps.GradeHomeworkProblem(ctx, usecase.GradeRequest{
 		AgentName:       agent,
+		Subject:         argStr(args, "subject"),
 		Grade:           grade,
 		SourceSession:   argStr(args, "source_session"),
 		Problem:         problem,

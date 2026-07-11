@@ -38,7 +38,7 @@ func TestE2E_ParentSession(t *testing.T) {
 
 	// 3) 孩子会了 → 家长点「他会了」（乐观锁带 version）
 	rec, out := do(t, h, "POST", "/mark-mastered",
-		`{"record_id":"`+recordID+`","version":`+itoa(version)+`}`)
+		`{"agent":"mingming","record_id":"`+recordID+`","version":`+itoa(version)+`}`)
 	if rec.Code != 200 || out["ok"] != true {
 		t.Fatalf("mark-mastered 应成功: code=%d %v", rec.Code, out)
 	}
@@ -52,7 +52,7 @@ func TestE2E_ParentSession(t *testing.T) {
 
 	// 5) 陈旧 version 再点 → 乐观锁冲突 409（防并发重复推进）
 	rec, _ = do(t, h, "POST", "/mark-mastered",
-		`{"record_id":"`+recordID+`","version":`+itoa(version)+`}`)
+		`{"agent":"mingming","record_id":"`+recordID+`","version":`+itoa(version)+`}`)
 	if rec.Code != 409 {
 		t.Errorf("陈旧 version 应 409 冲突, got %d", rec.Code)
 	}

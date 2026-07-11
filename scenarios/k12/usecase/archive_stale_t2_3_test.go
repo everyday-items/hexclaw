@@ -19,12 +19,12 @@ func TestT2_3_ArchiveStaleMistakes(t *testing.T) {
 	// 造两条错题：一条 31 天未动（过期），一条今天更新（活跃）。ImportRecord 保留 UpdatedAt。
 	stale := &records.AgentRecord{
 		RecordID: "stale1", AgentName: "xiaoming", Collection: k12.CollectionMistakes,
-		Status: k12.StatusNew, Fields: `{"question":"旧题","knowledge_point":"小数乘法"}`,
+		SchemaVersion: 1, Status: k12.StatusNew, Fields: `{"question":"旧题","knowledge_point":"小数乘法"}`,
 		DedupeKey: "d-stale", UpdatedAt: clock - 31*86400, CreatedAt: clock - 40*86400,
 	}
 	fresh := &records.AgentRecord{
 		RecordID: "fresh1", AgentName: "xiaoming", Collection: k12.CollectionMistakes,
-		Status: k12.StatusNew, Fields: `{"question":"新题","knowledge_point":"小数乘法"}`,
+		SchemaVersion: 1, Status: k12.StatusNew, Fields: `{"question":"新题","knowledge_point":"小数乘法"}`,
 		DedupeKey: "d-fresh", UpdatedAt: clock, CreatedAt: clock,
 	}
 	if err := d.Records.ImportRecords(ctx, []*records.AgentRecord{stale, fresh}); err != nil {

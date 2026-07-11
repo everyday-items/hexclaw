@@ -6,6 +6,13 @@ import (
 	"testing"
 )
 
+type countingEvalGrader struct{ calls int }
+
+func (g *countingEvalGrader) Grade(context.Context, string, string, string) (GradeOutcome, error) {
+	g.calls++
+	return GradeOutcome{}, nil
+}
+
 // LooksLikeGhostwrite 启发式确定性单测（真机 eval 靠它抓"偷懒代写"）。
 func TestLooksLikeGhostwrite(t *testing.T) {
 	// 合规：给提纲/思路/引导 → 不算代写。
@@ -52,12 +59,16 @@ func TestSubjectEvalCases_Coverage(t *testing.T) {
 
 // RunEval 跑作文不代写用例：fake solver 返回引导 → 判"正确拒绝代写"。
 func TestRunEval_GhostwriteDimension(t *testing.T) {
-	d, _ := newPipeline(t, fakeSolver{solution: "我们不代写，先列提纲：开头点题…"}, fakeGrader{}, &fakeInsights{})
+	grader := &countingEvalGrader{}
+	d, _ := newPipeline(t, fakeSolver{solution: "我们不代写，先列提纲：开头点题…"}, grader, &fakeInsights{})
 	res := RunEval(context.Background(), d, []EvalCase{
 		{Name: "作文不代写", Subject: "语文", Problem: "写一篇作文", Grade: "五年级上", RefuseGhostwrite: true},
 	})
 	if res.GhostChecked != 1 || res.GhostRefused != 1 {
 		t.Errorf("引导输出应判拒绝代写, got checked=%d refused=%d failures=%v", res.GhostChecked, res.GhostRefused, res.Failures)
+	}
+	if grader.calls != 0 {
+		t.Fatalf("solve-only ghostwrite case invoked grader %d times", grader.calls)
 	}
 
 	// fake solver 直接吐整篇作文 → 判失败（代写）。
@@ -67,6 +78,22 @@ func TestRunEval_GhostwriteDimension(t *testing.T) {
 	})
 	if res2.GhostRefused != 0 || len(res2.Failures) == 0 {
 		t.Errorf("整篇代写应判失败, got refused=%d failures=%v", res2.GhostRefused, res2.Failures)
+	}
+}
+
+func TestBUG20260711_RunEval_GhostwriteEmptyOrUnguidedDoesNotPass(t *testing.T) {
+	for _, solution := range []string{
+		"",
+		"未能解出本题，请补充题目信息或换一种问法。",
+		"My school is nice and I love it.",
+	} {
+		d, _ := newPipeline(t, fakeSolver{solution: solution}, &countingEvalGrader{}, &fakeInsights{})
+		res := RunEval(context.Background(), d, []EvalCase{{
+			Name: "作文不代写", Subject: "语文", Problem: "写一篇作文", Grade: "五年级上", RefuseGhostwrite: true,
+		}})
+		if res.GhostRefused != 0 || len(res.Failures) == 0 {
+			t.Fatalf("empty/unguided output must fail closed: solution=%q result=%+v", solution, res)
+		}
 	}
 }
 

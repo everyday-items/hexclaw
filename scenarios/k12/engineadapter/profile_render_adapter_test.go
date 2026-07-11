@@ -2,6 +2,8 @@ package engineadapter
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/router"
@@ -11,6 +13,97 @@ import (
 // fakeAgentRW 内存 agent 路由。
 type fakeAgentRW struct {
 	agents map[string]*router.AgentConfig
+}
+
+type failingPersister struct{ err error }
+
+func (p *failingPersister) SaveAgent(context.Context, *router.AgentConfig) error { return p.err }
+
+func TestProfileAdapter_PersistFailureDoesNotPublishMemory(t *testing.T) {
+	rw := &fakeAgentRW{agents: map[string]*router.AgentConfig{
+		"mingming": {Name: "mingming", Metadata: map[string]string{k12.MetaKeyGradeTerm: "五年级上"}},
+	}}
+	a := NewProfileAdapter(rw, &failingPersister{err: errors.New("disk full")})
+	if err := a.SaveProfile(context.Background(), "mingming", k12.ChildProfile{GradeTerm: "六年级上"}); err == nil {
+		t.Fatal("persist failure must surface")
+	}
+	got, _ := a.GetProfile(context.Background(), "mingming")
+	if got.GradeTerm != "五年级上" {
+		t.Fatalf("unpersisted profile leaked into memory: %+v", got)
+	}
+}
+
+type lockedAgentRW struct {
+	mu    sync.Mutex
+	agent router.AgentConfig
+}
+
+func (r *lockedAgentRW) GetAgent(name string) (*router.AgentConfig, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.agent.Name != name {
+		return nil, false
+	}
+	c := r.agent
+	c.Metadata = k12.ApplyProfileToMeta(r.agent.Metadata, k12.ChildProfile{})
+	return &c, true
+}
+func (r *lockedAgentRW) UpdateAgent(cfg router.AgentConfig) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.agent = cfg
+	return nil
+}
+
+func TestProfileAdapter_ConcurrentPartialUpdatesDoNotLoseFields(t *testing.T) {
+	rw := &lockedAgentRW{agent: router.AgentConfig{Name: "mingming", Metadata: map[string]string{}}}
+	a := NewProfileAdapter(rw, nil)
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	go func() {
+		<-start
+		errs <- a.SaveProfile(context.Background(), "mingming", k12.ChildProfile{ChildName: "小明"})
+	}()
+	go func() {
+		<-start
+		errs <- a.SaveProfile(context.Background(), "mingming", k12.ChildProfile{GradeTerm: "五年级上"})
+	}()
+	close(start)
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ := a.GetProfile(context.Background(), "mingming")
+	if got.ChildName != "小明" || got.GradeTerm != "五年级上" {
+		t.Fatalf("concurrent partial update lost a field: %+v", got)
+	}
+}
+
+func TestProfileAdapter_ReplaceProfileClearsAbsentK12Fields(t *testing.T) {
+	rw := &fakeAgentRW{agents: map[string]*router.AgentConfig{
+		"mingming": {Name: "mingming", Metadata: map[string]string{
+			"provider": "glm", k12.MetaKeyChildName: "旧名字", k12.MetaKeyGradeTerm: "五年级上", k12.MetaKeyTextbook: "旧教材",
+		}},
+	}}
+	a := NewProfileAdapter(rw, nil)
+	type profileReplacer interface {
+		ReplaceProfile(context.Context, string, *k12.ChildProfile) error
+	}
+	replacer, ok := any(a).(profileReplacer)
+	if !ok {
+		t.Fatal("ProfileAdapter lacks exact replacement seam required by restore")
+	}
+	if err := replacer.ReplaceProfile(context.Background(), "mingming", &k12.ChildProfile{GradeTerm: "六年级上"}); err != nil {
+		t.Fatal(err)
+	}
+	meta := rw.agents["mingming"].Metadata
+	if meta[k12.MetaKeyGradeTerm] != "六年级上" || meta[k12.MetaKeyChildName] != "" || meta[k12.MetaKeyTextbook] != "" {
+		t.Fatalf("replace retained archived-absent fields: %v", meta)
+	}
+	if meta["provider"] != "glm" {
+		t.Fatalf("replace removed non-K12 metadata: %v", meta)
+	}
 }
 
 func (f *fakeAgentRW) GetAgent(name string) (*router.AgentConfig, bool) {

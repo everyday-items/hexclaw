@@ -55,11 +55,10 @@ func (s *ReviewSkill) ToolDefinition() llm.ToolDefinition {
 
 // Execute 取到期复习队列 → 陪练方案。实例 scope 取自 ctx（engine stamp 的已路由 Agent）。
 func (s *ReviewSkill) Execute(ctx context.Context, args map[string]any) (*skill.Result, error) {
+	// BUG-20260710-H1：实例 scope 只认 ctx（engine stamp 的已路由 Agent），绝不回退
+	// 采信 LLM 传的 agent 参数——否则幻觉参数可把记录写进任意孩子的命名空间，
+	// 击穿多孩隔离（同 authUserCtxKey 纪律）。测试用 skill.WithRoutedAgent 构造 ctx。
 	agent := skill.RoutedAgentName(ctx)
-	if agent == "" {
-		// 非路由上下文（直接调用/测试）允许 args 兜底；生产 IM 入站恒有 ctx。
-		agent = argStr(args, "agent")
-	}
 	if agent == "" {
 		return nil, fmt.Errorf("k12_review: 无法确定辅导实例（ctx 无已路由 Agent）")
 	}
@@ -87,7 +86,7 @@ func (s *ReviewSkill) Execute(ctx context.Context, args map[string]any) (*skill.
 				grade = p.GradeTerm
 			}
 		}
-		if r, gerr := s.deps.GenerateRetry(ctx, items[0], grade); gerr == nil {
+		if r, gerr := s.deps.GenerateRetryByRecord(ctx, agent, items[0].Record.RecordID, grade); gerr == nil {
 			retry = &r
 		}
 	}
@@ -101,7 +100,7 @@ func (s *ReviewSkill) Execute(ctx context.Context, args map[string]any) (*skill.
 // renderReviewContent 面向家长/LLM 的陪练方案文本。守答案遮罩：给引导话术，不直接报答案。
 func renderReviewContent(items []usecase.ReviewItem, retry *usecase.SolveResult) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "今天有 %d 道错题该陪孩子复习了", len(items))
+	fmt.Fprintf(&b, "今天有 %d 个复习项该陪孩子练了", len(items))
 	if weakest := weakestKP(items); weakest != "" {
 		fmt.Fprintf(&b, "，最薄弱的是「%s」", weakest)
 	}
@@ -112,12 +111,12 @@ func renderReviewContent(items []usecase.ReviewItem, retry *usecase.SolveResult)
 		n = reviewListMax
 	}
 	for i := 0; i < n; i++ {
-		f := items[i].Fields
-		fmt.Fprintf(&b, "%d. %s", i+1, f.Question)
-		if f.KnowledgePoint != "" {
-			fmt.Fprintf(&b, "（知识点：%s", f.KnowledgePoint)
-			if f.ErrorCause != "" {
-				fmt.Fprintf(&b, "，上次错因：%s", f.ErrorCause)
+		it := items[i]
+		fmt.Fprintf(&b, "%d. %s", i+1, it.Title())
+		if point := it.Point(); point != "" {
+			fmt.Fprintf(&b, "（%s：%s", it.Subject(), point)
+			if it.Fields.ErrorCause != "" {
+				fmt.Fprintf(&b, "，上次错因：%s", it.Fields.ErrorCause)
 			}
 			b.WriteString("）")
 		}
@@ -153,7 +152,7 @@ func weakestKP(items []usecase.ReviewItem) string {
 	count := map[string]int{}
 	best, bestN := "", 0
 	for _, it := range items {
-		kp := it.Fields.KnowledgePoint
+		kp := it.Point()
 		if kp == "" {
 			continue
 		}

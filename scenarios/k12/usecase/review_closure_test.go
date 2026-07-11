@@ -62,7 +62,7 @@ func TestReviewFlywheel_Invariants_Property(t *testing.T) {
 		// 随机以 mastered 收尾 → 断言清 due（移出复习队列）
 		if rng.Intn(2) == 0 {
 			cur, _ := d.Records.Get(ctx, id)
-			if err := d.MarkMastered(ctx, id, cur.Version); err != nil {
+			if err := d.MarkMastered(ctx, "mingming", id, cur.Version); err != nil {
 				t.Fatal(err)
 			}
 			got, _ := d.Records.Get(ctx, id)

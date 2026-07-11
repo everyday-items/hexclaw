@@ -16,6 +16,7 @@ import (
 
 // CronSpec 一个默认自动化任务的声明式描述符。
 type CronSpec struct {
+	Key      string   // 稳定幂等键：agentName/kind（不依赖可变展示名）
 	Name     string   // 任务名（对家长可见）
 	Schedule string   // 标准 5 段 cron 表达式
 	Runtime  string   // 执行运行时；空 → 平台默认 starlark
@@ -69,7 +70,11 @@ func DefaultCronSpecs(baseURL, agentName string, deliver []string) []CronSpec {
 
 	mk := func(kind K12CronKind, name, schedule, path string) CronSpec {
 		return CronSpec{
-			Name:     name,
+			Key: string(agentName) + "/" + string(kind),
+			// BUG-20260710-H3：Name 带 agent 作用域——它是 Register 幂等键
+			// （agent+kind）的载体：同名覆盖/跳过、多孩互不挤占；对家长也可分辨
+			// 是哪个孩子的任务。
+			Name:     name + "·" + agentName,
 			Schedule: schedule,
 			Runtime:  "", // 平台默认 starlark
 			Script:   deliverScript(ep(path)),

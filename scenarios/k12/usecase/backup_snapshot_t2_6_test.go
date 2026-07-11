@@ -17,6 +17,18 @@ import (
 
 type memProfileStore struct{ m map[string]k12.ChildProfile }
 
+type memArchiveRestorer struct {
+	records  *records.Store
+	profiles *memProfileStore
+}
+
+func (r *memArchiveRestorer) RestoreArchive(ctx context.Context, agent string, recs []*records.AgentRecord, profile *k12.ChildProfile) error {
+	if err := r.records.ImportAgentRecords(ctx, agent, recs); err != nil {
+		return err
+	}
+	return r.profiles.ReplaceProfile(ctx, agent, profile)
+}
+
 func (s *memProfileStore) GetProfile(_ context.Context, a string) (k12.ChildProfile, error) {
 	p, ok := s.m[a]
 	if !ok {
@@ -26,6 +38,14 @@ func (s *memProfileStore) GetProfile(_ context.Context, a string) (k12.ChildProf
 }
 func (s *memProfileStore) SaveProfile(_ context.Context, a string, p k12.ChildProfile) error {
 	s.m[a] = p
+	return nil
+}
+func (s *memProfileStore) ReplaceProfile(_ context.Context, a string, p *k12.ChildProfile) error {
+	if p == nil {
+		delete(s.m, a)
+		return nil
+	}
+	s.m[a] = *p
 	return nil
 }
 
@@ -46,10 +66,13 @@ func newBackupDeps(t *testing.T) (usecase.Deps, *memProfileStore) {
 		t.Fatal(err)
 	}
 	ps := &memProfileStore{m: map[string]k12.ChildProfile{}}
-	return usecase.Deps{
-		Solver: toggleSolver{}, Grader: &toggleGrader{}, Records: records.NewStore(db, reg.Records),
+	recordStore := records.NewStore(db, reg.Records)
+	deps := usecase.Deps{
+		Solver: toggleSolver{}, Grader: &toggleGrader{}, Records: recordStore,
 		Profiles: ps, Constraint: cur, Now: func() int64 { return 1000 },
-	}, ps
+	}
+	deps.ArchiveRestorer = &memArchiveRestorer{records: recordStore, profiles: ps}
+	return deps, ps
 }
 
 // T2.6a（PRD §3.12.4-1）：全量导出应含孩子档案（不止 records）。
@@ -83,7 +106,7 @@ func TestT2_6_RestoreWithSnapshotCapturesPreState(t *testing.T) {
 	// 造既有记录（恢复前状态）。
 	pre := &records.AgentRecord{
 		RecordID: "old1", AgentName: "xiaoming", Collection: k12.CollectionMistakes,
-		Status: k12.StatusNew, Fields: `{"question":"旧题","knowledge_point":"小数乘法"}`, DedupeKey: "d-old",
+		SchemaVersion: 1, Status: k12.StatusNew, Fields: `{"question":"旧题","knowledge_point":"小数乘法"}`, DedupeKey: "d-old",
 	}
 	if err := d.Records.ImportRecords(ctx, []*records.AgentRecord{pre}); err != nil {
 		t.Fatal(err)

@@ -35,10 +35,11 @@ const (
 // MistakeFields 错题的领域字段（PRD §5.2.3 错题本 fields 约定）。
 // 它被 marshal 进 AgentRecord.Fields（JSON），平台不 typed 这些字段。
 type MistakeFields struct {
-	Question       string `json:"question"`        // 题干
-	KnowledgePoint string `json:"knowledge_point"` // 命中课标词表；命不中记「其他」
-	ErrorCause     string `json:"error_cause"`     // 五类错因
-	WrongProcess   string `json:"wrong_process"`   // ≤100 字错步摘要，可空
+	Subject        string `json:"subject,omitempty"` // 数学/物理/化学；老记录空值按数学兼容
+	Question       string `json:"question"`          // 题干
+	KnowledgePoint string `json:"knowledge_point"`   // 命中课标词表；命不中记「其他」
+	ErrorCause     string `json:"error_cause"`       // 五类错因
+	WrongProcess   string `json:"wrong_process"`     // ≤100 字错步摘要，可空
 	// ReviewStage 间隔重排轮次（艾宾浩斯式）：0=首次入库；每成功重做一次 +1，决定下次复习间隔
 	// （越记得牢，下次复习推得越远）。老记录缺此字段 = 0，前向兼容。
 	ReviewStage int `json:"review_stage"`

@@ -12,6 +12,9 @@ var ErrRenderUnavailable = errors.New("render service unavailable")
 // 与「用例校验错误」区分：HTTP 层据此回 502（下游故障），而非 400（客户端请求错）。
 var ErrSolveFailed = errors.New("solve service failed")
 
+// ErrInvalidInput 标识客户端可修正的 K12 用例输入错误。
+var ErrInvalidInput = errors.New("invalid k12 input")
+
 // Renderer 文档渲染 port（adapter = 平台 render 服务）。format=pdf/docx/...
 type Renderer interface {
 	Render(ctx context.Context, markdown, format string) (data []byte, contentType string, err error)
@@ -44,6 +47,12 @@ type Solver interface {
 	Solve(ctx context.Context, problem, grade, constraint string) (SolveResult, error)
 }
 
+// SubjectSolver 是支持显式学科路由的 Solver 扩展。用例在请求带 Subject 时优先调用，
+// 老 Solver 仍可只实现 Solver，保持场景扩展向后兼容。
+type SubjectSolver interface {
+	SolveSubject(ctx context.Context, subject, problem, grade, constraint string) (SolveResult, error)
+}
+
 // GradeOutcome 批改结果（第一个错步 + 错因 + 命中知识点）。
 type GradeOutcome struct {
 	Correct        bool
@@ -57,6 +66,11 @@ type Grader interface {
 	Grade(ctx context.Context, problem, studentAnswer, solution string) (GradeOutcome, error)
 }
 
+// SubjectGrader 是支持显式学科路由的 Grader 扩展。
+type SubjectGrader interface {
+	GradeSubject(ctx context.Context, subject, problem, studentAnswer, solution string) (GradeOutcome, error)
+}
+
 // Insights 学情信号写入 port（adapter = memory 反思管线）。
 // 错题**不入记忆**（AP-3）；这里只写"薄弱点画像"信号。
 type Insights interface {
@@ -67,4 +81,9 @@ type Insights interface {
 // found=true 来自家长上传教材（可信）；false 时调用方降级为 LLM 生成并标未校验。
 type Grounding interface {
 	Ground(ctx context.Context, agentName, knowledgePoint, grade string) (text string, found bool, err error)
+}
+
+// GroundingWriter 是教材 grounding 的写缝；与 Grounding 使用同一 agent scope。
+type GroundingWriter interface {
+	AddGrounding(ctx context.Context, agentName, title, content string) error
 }

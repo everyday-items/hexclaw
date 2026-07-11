@@ -13,6 +13,15 @@ func (f fakeGrounding) Ground(context.Context, string, string, string) (string, 
 	return "课本讲法：小数点对齐相乘", f.found, nil
 }
 
+type selectiveGrounding struct{}
+
+func (selectiveGrounding) Ground(_ context.Context, _ string, kp, _ string) (string, bool, error) {
+	if kp == "小数乘法" {
+		return "教材讲法", true, nil
+	}
+	return "", false, nil
+}
+
 // seedMistake 直接入库一条错题（绕过批改，供复习/备课测试造数据）。
 func seedMistake(t *testing.T, d Deps, session, kp, cause string, due int64) string {
 	t.Helper()
@@ -50,7 +59,7 @@ func TestReviewQueue_And_Mastery(t *testing.T) {
 	}
 
 	// 「他会了」→ mastered，移出队列
-	if err := d.MarkMastered(ctx, id1, 0); err != nil {
+	if err := d.MarkMastered(ctx, "mingming", id1, 0); err != nil {
 		t.Fatalf("MarkMastered: %v", err)
 	}
 	q, _ = d.ReviewQueue(ctx, "mingming")
@@ -118,7 +127,19 @@ func TestBuildPrepCard_NoTextbook_Degrades(t *testing.T) {
 		t.Errorf("无历史②段文案不符: %q", card.Sections[1].Content)
 	}
 	// 热身题未过验算 → 不放
-	if card.Sections[3].Content == "" || card.Sections[3].SourceLabel != SrcVerified {
+	if card.Sections[3].Content == "" || card.Sections[3].SourceLabel != SrcAIUnverified {
 		t.Errorf("④段应诚实兜底, got %+v", card.Sections[3])
+	}
+}
+
+func TestBuildPrepCard_MixedGroundingDoesNotClaimWholeSectionIsTextbook(t *testing.T) {
+	d, _ := newPipeline(t, fakeSolver{ev: SolveEvidence{EvidenceType: EvidenceNone}}, fakeGrader{}, nil)
+	d.Grounding = selectiveGrounding{}
+	card, err := d.BuildPrepCard(context.Background(), "mingming", "五年级上", []string{"小数乘法", "简易方程"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if card.Sections[0].SourceLabel != SrcAIUnverified {
+		t.Fatalf("mixed section label=%q want %q", card.Sections[0].SourceLabel, SrcAIUnverified)
 	}
 }

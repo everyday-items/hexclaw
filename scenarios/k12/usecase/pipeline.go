@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/records"
@@ -15,15 +16,16 @@ const FirstReviewInterval int64 = 86400 // 1 天
 
 // Deps 用例依赖（端口注入 + 通用能力）。
 type Deps struct {
-	Solver     Solver
-	Grader     Grader
-	Recognizer Recognizer
-	Insights   Insights
-	Grounding  Grounding
-	Profiles   ProfileStore
-	Renderer   Renderer
-	Records    *records.Store
-	Constraint scenario.ConstraintProvider
+	Solver          Solver
+	Grader          Grader
+	Recognizer      Recognizer
+	Insights        Insights
+	Grounding       Grounding
+	Profiles        ProfileStore
+	ArchiveRestorer ArchiveRestorer
+	Renderer        Renderer
+	Records         *records.Store
+	Constraint      scenario.ConstraintProvider
 	// Now 取当前 unix 秒（测试可注入固定时钟）。nil 时用系统时钟。
 	Now func() int64
 }
@@ -40,6 +42,7 @@ func (d Deps) RecognizeHomework(ctx context.Context, image []byte) ([]Recognized
 // GradeRequest 一道题的批改请求（识题后的结构化输入）。
 type GradeRequest struct {
 	AgentName       string
+	Subject         string // 数学/语文/英语/物理/化学；空时由 solver 默认路由
 	Grade           string // 生效年级
 	SourceSession   string
 	Problem         string
@@ -66,29 +69,49 @@ type GradeResult struct {
 // 这是 K12 的核心业务闭环；engine 只提供 Solver/Grader 能力，编排在此。
 func (d Deps) GradeHomeworkProblem(ctx context.Context, req GradeRequest) (GradeResult, error) {
 	if req.AgentName == "" || req.Problem == "" {
-		return GradeResult{}, fmt.Errorf("usecase: AgentName / Problem 不可空")
+		return GradeResult{}, fmt.Errorf("%w: AgentName / Problem 不可空", ErrInvalidInput)
 	}
+	if err := validateGradeInput(req.Grade); err != nil {
+		return GradeResult{}, err
+	}
+	subject, err := normalizeSubject(req.Subject)
+	if err != nil {
+		return GradeResult{}, err
+	}
+	req.Subject = subject
 
 	// 1. 年级校验（倒查超纲）：任一知识点首学年级晚于生效年级 = 错发，反问不批改。
-	if d.Constraint != nil {
+	if d.Constraint != nil && isMathSubject(req.Subject) {
 		for _, kp := range req.KnowledgePoints {
 			if fg, ok := d.Constraint.FirstGrade(ctx, kp); ok && k12.IsBeyond(req.Grade, fg) {
-				return GradeResult{OutOfScope: true, OutOfScopeKP: kp}, nil
+				return GradeResult{
+					OutOfScope:   true,
+					OutOfScopeKP: kp,
+					Evidence: SolveEvidence{
+						Verdict:      VerdictOutOfScope,
+						EvidenceType: EvidenceNone,
+					},
+				}, nil
 			}
 		}
 	}
 
 	// 2. 解题验算（受年级约束）→ 解 + 证据对象。
-	sr, err := d.Solver.Solve(ctx, req.Problem, req.Grade, d.constraintFor(ctx, req.Grade))
+	sr, err := d.solveProblem(ctx, req.Subject, req.Problem, req.Grade)
 	if err != nil {
-		return GradeResult{}, fmt.Errorf("usecase: 解题失败: %w", err)
+		return GradeResult{}, fmt.Errorf("%w: 解题: %w", ErrSolveFailed, err)
 	}
 	res := GradeResult{Solution: sr.Solution, Evidence: sr.Evidence}
 
 	// 3. 批改学生答案。
-	outcome, err := d.Grader.Grade(ctx, req.Problem, req.StudentAnswer, sr.Solution)
+	var outcome GradeOutcome
+	if grader, ok := d.Grader.(SubjectGrader); ok && req.Subject != "" {
+		outcome, err = grader.GradeSubject(ctx, req.Subject, req.Problem, req.StudentAnswer, sr.Solution)
+	} else {
+		outcome, err = d.Grader.Grade(ctx, req.Problem, req.StudentAnswer, sr.Solution)
+	}
 	if err != nil {
-		return GradeResult{}, fmt.Errorf("usecase: 批改失败: %w", err)
+		return GradeResult{}, fmt.Errorf("%w: 批改: %w", ErrSolveFailed, err)
 	}
 	res.Outcome = outcome
 
@@ -102,10 +125,12 @@ func (d Deps) GradeHomeworkProblem(ctx context.Context, req GradeRequest) (Grade
 	// 5. 判错 → 无感入库错题（幂等去重）+ 首次复习到期 + 学情薄弱信号。
 	// 知识点由识题/课标决定（grader 不产 KP）：优先识题结果，回退 grader 若有。
 	knowledgePoint := outcome.KnowledgePoint
-	if knowledgePoint == "" && len(req.KnowledgePoints) > 0 {
+	if len(req.KnowledgePoints) > 0 {
 		knowledgePoint = req.KnowledgePoints[0]
 	}
+	res.Outcome.KnowledgePoint = knowledgePoint
 	rec, err := k12.NewMistakeRecord(req.AgentName, req.SourceSession, k12.MistakeFields{
+		Subject:        req.Subject,
 		Question:       req.Problem,
 		KnowledgePoint: knowledgePoint,
 		ErrorCause:     outcome.ErrorCause,
@@ -132,6 +157,41 @@ func (d Deps) GradeHomeworkProblem(ctx context.Context, req GradeRequest) (Grade
 		}
 	}
 	return res, nil
+}
+
+func isMathSubject(subject string) bool { return subject == "" || subject == "数学" }
+
+func (d Deps) solveProblem(ctx context.Context, subject, problem, grade string) (SolveResult, error) {
+	var err error
+	subject, err = normalizeSubject(subject)
+	if err != nil {
+		return SolveResult{}, err
+	}
+	constraint := ""
+	if isMathSubject(subject) {
+		constraint = d.constraintFor(ctx, grade)
+	}
+	if solver, ok := d.Solver.(SubjectSolver); ok && subject != "" {
+		return solver.SolveSubject(ctx, subject, problem, grade, constraint)
+	}
+	return d.Solver.Solve(ctx, problem, grade, constraint)
+}
+
+func normalizeSubject(subject string) (string, error) {
+	subject = strings.TrimSpace(subject)
+	switch subject {
+	case "", "数学", "语文", "英语", "物理", "化学":
+		return subject, nil
+	default:
+		return "", fmt.Errorf("%w: 非法学科 %q", ErrInvalidInput, subject)
+	}
+}
+
+func validateGradeInput(grade string) error {
+	if grade != "" && !k12.ValidGradeTerm(grade) {
+		return fmt.Errorf("%w: 非法年级学期 %q", ErrInvalidInput, grade)
+	}
+	return nil
 }
 
 // advanceMistakeOnCorrect 答对同题时推进既有错题：new/explained/retried → retried

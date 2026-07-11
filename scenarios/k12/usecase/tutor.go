@@ -137,6 +137,9 @@ type TutorTurnResult struct {
 // TutorTurn 计算本轮编排；阶段三且给了题目时，调 Solver 验算链取可信完整解
 // （渐进提示不给未验证答案；阶段一二只出指令，由上游 LLM 生成话术）。
 func (d Deps) TutorTurn(ctx context.Context, req TutorTurnRequest, problem, grade string) (TutorTurnResult, error) {
+	if err := validateGradeInput(grade); err != nil {
+		return TutorTurnResult{}, err
+	}
 	dir := PlanTutorTurn(req)
 	res := TutorTurnResult{Directive: dir}
 	// 仅在进入完整讲解且未被情绪守门暂停、且有题目时，取验算过的解。

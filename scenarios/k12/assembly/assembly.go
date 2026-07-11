@@ -48,6 +48,19 @@ func WithProfiles(p usecase.ProfileStore) Option {
 	return func(d *usecase.Deps) { d.Profiles = p }
 }
 
+// ArchiveRestorerFactory receives the records store assembled by Wire, allowing
+// the composition root to build a cross-store adapter around that exact store.
+type ArchiveRestorerFactory func(*records.Store) usecase.ArchiveRestorer
+
+// WithArchiveRestorer injects the crash-durable records/profile restore seam.
+func WithArchiveRestorer(build ArchiveRestorerFactory) Option {
+	return func(d *usecase.Deps) {
+		if build != nil {
+			d.ArchiveRestorer = build(d.Records)
+		}
+	}
+}
+
 // WithRenderer 注入文档渲染 adapter（PDF/Word）。
 func WithRenderer(r usecase.Renderer) Option {
 	return func(d *usecase.Deps) { d.Renderer = r }
