@@ -9,6 +9,7 @@ import (
 
 	hexagon "github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexagon/observe/trace"
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
@@ -111,6 +112,7 @@ func (e *ReActEngine) autoExtractMemoryForRole(parentCtx context.Context, userTe
 	go func() {
 		defer e.bgWg.Done()
 		base := trace.Detach(parentCtx)
+		base = egress.WithRequest(base, egress.PurposeGeneralChat, "auto-memory", egress.ClassGeneral, egress.ClassMemory)
 
 		// 先选模型（路由本身不调 LLM，很快），再据 provider 本地性自适应抽取超时（修 AP-098）。
 		provider, providerName, err := e.selectLLMForMemory(base)
@@ -191,6 +193,9 @@ func (e *ReActEngine) selectLLMForMemory(ctx context.Context) (hexagon.Provider,
 // CompleteOnce 用当前路由 LLM 跑一次**无状态** completion（不写对话历史/不触发记忆副作用），
 // 供 Skill 生成等一次性场景复用。失败时接 router.Fallback 尝试备用 Provider（与 auto-memory 同策略）。
 func (e *ReActEngine) CompleteOnce(ctx context.Context, systemPrompt, userPrompt string, maxTokens int) (string, error) {
+	if _, ok := egress.RequestsFromContext(ctx); !ok {
+		ctx = egress.WithRequest(ctx, egress.PurposeGeneralChat, "complete-once", egress.ClassGeneral)
+	}
 	provider, providerName, err := e.selectLLMForMemory(ctx)
 	if err != nil {
 		return "", err

@@ -178,6 +178,21 @@ func TestLiveStateRequestsBypassSemanticCache(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "stateful k12 review queue",
+			msg:  &adapter.Message{Content: "复习错题"},
+			want: true,
+		},
+		{
+			name: "stateful k12 grading",
+			msg:  &adapter.Message{Content: "请批改这份作业"},
+			want: true,
+		},
+		{
+			name: "stateful record transition",
+			msg:  &adapter.Message{Content: "这道题已经掌握了，标记一下"},
+			want: true,
+		},
+		{
 			name: "plain stable chat",
 			msg:  &adapter.Message{Content: "1+1等于几"},
 			want: false,
@@ -187,6 +202,28 @@ func TestLiveStateRequestsBypassSemanticCache(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := shouldBypassSemanticCache(tt.msg); got != tt.want {
 				t.Fatalf("shouldBypassSemanticCache() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSemanticCacheToolPurity(t *testing.T) {
+	tests := []struct {
+		name  string
+		tools []string
+		want  bool
+	}{
+		{name: "no tools", want: true},
+		{name: "read only tools", tools: []string{"search", "knowledge_search", "weather"}, want: true},
+		{name: "k12 review mutates records", tools: []string{"k12_review"}, want: false},
+		{name: "k12 grade mutates records", tools: []string{"k12_grade"}, want: false},
+		{name: "unknown defaults unsafe", tools: []string{"third_party_action"}, want: false},
+		{name: "mixed purity", tools: []string{"search", "write_file"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := semanticCacheToolNamesCacheable(tt.tools); got != tt.want {
+				t.Fatalf("semanticCacheToolNamesCacheable(%v) = %v, want %v", tt.tools, got, tt.want)
 			}
 		})
 	}

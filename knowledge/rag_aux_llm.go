@@ -80,7 +80,7 @@ func (b *budgetedRerankLLM) Complete(ctx context.Context, prompt string) (string
 	defer cancel()
 
 	start := time.Now()
-	out, err := b.inner.Complete(cctx, prompt)
+	out, err := b.inner.Complete(ragEnrichContext(cctx), prompt)
 	if err != nil {
 		b.breaker.record(false, time.Now())
 		logger.Warn("[knowledge] 辅助 LLM 超预算/失败，降级确定性检索",

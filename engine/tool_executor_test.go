@@ -55,6 +55,7 @@ type recordingHook struct {
 	beforeCalled bool
 	afterCalled  bool
 	afterContent string
+	serverName   string
 }
 
 func (h *recordingHook) BeforeToolCall(_ context.Context, _ *ToolCallInfo) error {
@@ -62,9 +63,33 @@ func (h *recordingHook) BeforeToolCall(_ context.Context, _ *ToolCallInfo) error
 	return nil
 }
 
-func (h *recordingHook) AfterToolCall(_ context.Context, _ *ToolCallInfo, result *ToolCallResult) {
+func (h *recordingHook) AfterToolCall(_ context.Context, call *ToolCallInfo, result *ToolCallResult) {
 	h.afterCalled = true
 	h.afterContent = result.Content
+	h.serverName = call.ServerName
+}
+
+func TestToolExecutor_MCPAfterHookReceivesResolvedServerOwner(t *testing.T) {
+	orig := hexagon.ConnectMCPStdioWithEnv
+	hexagon.ConnectMCPStdioWithEnv = func(context.Context, string, map[string]string, ...string) ([]hexagon.Tool, func(), error) {
+		return []hexagon.Tool{mock.NewTool("write_file")}, func() {}, nil
+	}
+	t.Cleanup(func() { hexagon.ConnectMCPStdioWithEnv = orig })
+	mgr := hexmcp.NewManager()
+	if err := mgr.AddServer(context.Background(), hexmcp.ServerConfig{
+		Name: "filesystem-b", Transport: "stdio", Command: "stub", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	executor := NewToolExecutor(skill.NewRegistry(), mgr)
+	recorder := &recordingHook{}
+	executor.AddHook(recorder)
+	if _, err := executor.Execute(context.Background(), "write_file", map[string]any{"path": "a.md"}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if recorder.serverName != "filesystem-b" {
+		t.Fatalf("After hook server owner=%q want filesystem-b", recorder.serverName)
+	}
 }
 
 func TestToolExecutor_ExecuteSkill(t *testing.T) {

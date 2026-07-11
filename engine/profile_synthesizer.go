@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/memory"
 )
 
@@ -54,5 +55,6 @@ func (s *llmProfileSynthesizer) Synthesize(ctx context.Context, facts []string, 
 		b.WriteByte('\n')
 	}
 	b.WriteString("\n请输出更新后的用户画像：")
+	ctx = egress.WithRequest(ctx, egress.PurposeGeneralChat, "profile-synthesis", egress.ClassGeneral, egress.ClassMemory, egress.ClassSensitiveProfile)
 	return s.eng.CompleteOnce(ctx, profileSynthSystemPrompt, b.String(), profileSynthMaxTokens)
 }

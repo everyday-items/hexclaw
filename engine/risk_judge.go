@@ -11,6 +11,7 @@ import (
 	"fmt"
 
 	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/hexclaw/egress"
 )
 
 // JudgeText runs a single cheap, non-streaming completion against the default
@@ -25,6 +26,11 @@ func (e *ReActEngine) JudgeText(ctx context.Context, prompt string) (string, err
 	provider := e.router.Default()
 	if provider == nil {
 		return "", fmt.Errorf("no default LLM provider configured")
+	}
+	if _, ok := egress.RequestsFromContext(ctx); ok {
+		egress.AddDataClasses(ctx, egress.ClassGeneral)
+	} else {
+		ctx = egress.WithRequest(ctx, egress.PurposeGeneralChat, "risk-judge", egress.ClassGeneral)
 	}
 	resp, err := provider.Complete(ctx, llm.CompletionRequest{
 		Model:     e.router.ProviderModel(e.router.DefaultName()),

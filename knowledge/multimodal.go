@@ -65,7 +65,7 @@ func (m *Manager) CaptionImage(ctx context.Context, image []byte, mime string) (
 	if m == nil || m.captioner == nil {
 		return "", fmt.Errorf("图片入库需要先配置具备视觉能力的模型（视觉模型 / VLM），当前未配置；请在设置中为知识库配置视觉模型后重试")
 	}
-	caption, err := m.captioner.Caption(ctx, image, mime)
+	caption, err := m.captioner.Caption(ragEnrichContext(ctx), image, mime)
 	if err != nil {
 		return "", fmt.Errorf("图像转写失败（请确认所用模型为支持图片的视觉模型）: %w", err)
 	}

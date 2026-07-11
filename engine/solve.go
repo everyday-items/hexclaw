@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
@@ -72,6 +73,55 @@ const (
 // maxSelfConsistency 限制自洽采样的解题次数上限（兜住延迟/成本）。
 var maxSelfConsistency = 5
 
+type solveEgressClassesKey struct{}
+
+func solveEgressClasses(ctx context.Context, args map[string]any) []egress.DataClass {
+	classes := make([]egress.DataClass, 0, 3)
+	seen := make(map[egress.DataClass]struct{}, 3)
+	add := func(class egress.DataClass) {
+		if _, ok := seen[class]; ok {
+			return
+		}
+		seen[class] = struct{}{}
+		classes = append(classes, class)
+	}
+	add(egress.ClassGeneral)
+	if requests, ok := egress.RequestsFromContext(ctx); ok {
+		for _, request := range requests {
+			// Purpose describes why data is leaving; DataClass describes what the
+			// data is. Solve changes the former, but its problem/constraints can be
+			// derived from any parent envelope (chat memory, RAG documents, media),
+			// so provenance must be inherited conservatively across purpose changes.
+			add(request.DataClass)
+		}
+	}
+	if anyNonEmptySolveArg(args, "grade", "constraint", "profile", "learner_profile", "student_answer") {
+		add(egress.ClassSensitiveProfile)
+	}
+	if anyNonEmptySolveArg(args, "image", "image_url", "media", "attachments") {
+		add(egress.ClassSensitiveMedia)
+	}
+	return classes
+}
+
+func anyNonEmptySolveArg(args map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		value, ok := args[key]
+		if !ok || value == nil {
+			continue
+		}
+		switch v := value.(type) {
+		case string:
+			if strings.TrimSpace(v) != "" {
+				return true
+			}
+		default:
+			return true
+		}
+	}
+	return false
+}
+
 // verifyVerdict 是 verifier 的判定。
 type verifyVerdict int
 
@@ -127,6 +177,7 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 		Depth: spawnDepthFromContext(ctx), Mode: "run", Status: subAgentStatusRunning,
 	})
 	childCtx := withCurrentRunID(runCtx, solveRunID)
+	childCtx = context.WithValue(childCtx, solveEgressClassesKey{}, solveEgressClasses(ctx, args))
 
 	// 1) Solver 阶段：method_diversity → 2 个不同方法；否则 self_consistency 同法多采样。
 	var sols []solverSolution
@@ -156,7 +207,7 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 	}
 
 	// 2) Verifier 阶段：code_exec 独立重算（fresh-context、只许 code_exec）。
-	verdict, computed, numericGrounded := o.verify(childCtx, problem, primary.answer, constraint)
+	verdict, computed, numericGrounded := o.verifySolution(childCtx, problem, primary.sols[0].output, primary.answer, constraint)
 
 	// 2.5) 学段内重解：verifier 判解法超纲（out_of_scope）→ 强化约束重解一次，只用学过的方法。
 	// 仅在有约束、非批改、还有墙钟时尝试一次，避免无界重试。
@@ -169,8 +220,8 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 			resolved := solverSolution{output: out, answer: extractFinalAnswer(out)}
 			primary = answerGroup{answer: resolved.answer, sols: []solverSolution{resolved}}
 			groups = []answerGroup{primary}
-			// 重解后重新校验（此次不再判超纲，只看对不对）。
-			verdict, computed, numericGrounded = o.verify(childCtx, problem, primary.answer, "")
+			// 重解后仍按原约束复验完整过程；答案正确但方法再次超纲不能放行。
+			verdict, computed, numericGrounded = o.verifySolution(childCtx, problem, resolved.output, primary.answer, constraint)
 		}
 	}
 
@@ -259,6 +310,11 @@ func (o *SolveSkill) runSolveAgent(ctx context.Context, spec SubAgentSpec) (stri
 	if spec.Source == solveDispatchSource {
 		execCtx = withSolveGrant(ctx)
 	}
+	classes, _ := execCtx.Value(solveEgressClassesKey{}).([]egress.DataClass)
+	if len(classes) == 0 {
+		classes = []egress.DataClass{egress.ClassGeneral}
+	}
+	execCtx = egress.WithRequest(execCtx, egress.PurposeSolveVerify, spec.RunID, classes...)
 	res, err := runSubAgentWithRetry(execCtx, o.executeFunc, spec, defaultSubAgentTimeout)
 	status, errStr := subAgentStatusOK, ""
 	if err != nil {
@@ -270,10 +326,16 @@ func (o *SolveSkill) runSolveAgent(ctx context.Context, spec SubAgentSpec) (stri
 
 // verify 用 code_exec 独立重算。verifier 不可用/出错/不可解析 → unverifiable（不阻断）。
 func (o *SolveSkill) verify(ctx context.Context, problem, candidate, constraint string) (v verifyVerdict, computed string, numericGrounded bool) {
+	return o.verifySolution(ctx, problem, "", candidate, constraint)
+}
+
+// verifySolution independently recomputes the answer, then audits the supplied
+// worked solution. A final answer alone cannot reveal an invalid or out-of-scope derivation.
+func (o *SolveSkill) verifySolution(ctx context.Context, problem, solution, candidate, constraint string) (v verifyVerdict, computed string, numericGrounded bool) {
 	if o.executeFunc == nil || ctx.Err() != nil {
 		return verdictUnverifiable, "", false
 	}
-	out := o.runValidated(ctx, verifierSpec(problem, candidate, constraint), verdictParseable)
+	out := o.runValidated(ctx, verifierSpecWithSolution(problem, solution, candidate, constraint), verdictParseable)
 	if strings.TrimSpace(out) == "" {
 		return verdictUnverifiable, "", false
 	}
@@ -457,10 +519,14 @@ func solverSpec(problem, subject, method, grade, constraint string) SubAgentSpec
 
 // verifierSpec 构造验证子 Agent：**只许 code_exec**、fresh-context、leaf 深度——强独立重算。
 func verifierSpec(problem, candidate, constraint string) SubAgentSpec {
+	return verifierSpecWithSolution(problem, "", candidate, constraint)
+}
+
+func verifierSpecWithSolution(problem, solution, candidate, constraint string) SubAgentSpec {
 	return SubAgentSpec{
 		RunID:     "verifier-" + idgen.NanoID(),
 		Agent:     verifierAgentName,
-		Task:      buildVerifierPrompt(problem, candidate, constraint),
+		Task:      buildVerifierPromptWithSolution(problem, solution, candidate, constraint),
 		ToolAllow: []string{codeExecToolName},
 		Mode:      "run",
 		Depth:     maxSpawnDepth,
@@ -496,22 +562,31 @@ func buildSolverPrompt(problem, subject, method, grade, constraint string) strin
 }
 
 func buildVerifierPrompt(problem, candidate, constraint string) string {
+	return buildVerifierPromptWithSolution(problem, "", candidate, constraint)
+}
+
+func buildVerifierPromptWithSolution(problem, solution, candidate, constraint string) string {
+	solutionBlock := "待校验完整解法：未提供（只能核验最终答案）"
+	if strings.TrimSpace(solution) != "" {
+		solutionBlock = "待校验完整解法（必须逐步审计）：\n" + solution
+	}
 	scopeStep := ""
 	scopeVerdict := ""
 	scopeRule := ""
 	if strings.TrimSpace(constraint) != "" {
-		scopeStep = fmt.Sprintf("\n3. 再检查解法是否**超纲**：本题只允许使用「%s」范围内的方法；若待校验解法用了这个范围之外、学生尚未学过的方法（哪怕答案对），也要判为 OUT_OF_SCOPE。", constraint)
+		scopeStep = fmt.Sprintf("\n3. 再检查解法是否**超纲**：本题只允许使用「%s」范围内的方法；若待校验完整解法用了这个范围之外、学生尚未学过的方法（哪怕答案对），也要判为 OUT_OF_SCOPE。", constraint)
 		scopeVerdict = " 或 OUT_OF_SCOPE"
 		scopeRule = "；解法用了允许范围外的超纲方法 → OUT_OF_SCOPE"
 	}
-	return fmt.Sprintf(`你是一名独立校验员。下面有一道题和一个「待校验答案」。请**完全独立地**用 code_exec 写代码重新计算正确答案，不要相信待校验答案、也没有别人的解题过程可参考。
+	return fmt.Sprintf(`你是一名独立校验员。下面有一道题、一份「待校验完整解法」和最终答案。请先**完全独立地**用 code_exec 写代码重新计算正确答案，不要先相信待校验内容；独立计算后，再逐步审计提供的完整解法。
 
 题目：%s
+%s
 待校验答案：%s
 
 步骤：
 1. 自己**逐步**审题、列式，用 code_exec（language=python）把**每一步**都算出来（别跳步、别口算），得到你独立的最终答案。
-2. 再逐步核对：你的**推理过程是否正确**、每一步是否站得住，最后比对你的答案与待校验答案是否一致。
+2. 再逐步核对：待校验完整解法的**推理过程是否正确**、每一步是否站得住，最后比对你的答案与待校验答案是否一致。
    ——「答案凑对但过程/推理错」也要当作不一致，不要只看最终那个数。%s
 
 最后严格按以下格式输出（三行）：
@@ -519,7 +594,7 @@ VERDICT: AGREE 或 DISAGREE 或 UNVERIFIABLE%s
 COMPUTED: <你独立算出的答案；若本题无法用代码计算则写 N/A>
 说明：<一句话>
 
-判定规则：你的结果与待校验答案在数值/含义上一致、且过程经得起逐步检查 → AGREE；数值不一致或推理过程明显错误 → DISAGREE；本题非计算题、无法用代码客观判定 → UNVERIFIABLE%s。`, problem, candidate, scopeStep, scopeVerdict, scopeRule)
+判定规则：你的结果与待校验答案在数值/含义上一致、且提供的完整解法经得起逐步检查 → AGREE；数值不一致或提供的推理过程明显错误 → DISAGREE；本题非计算题、无法用代码客观判定 → UNVERIFIABLE%s。`, problem, solutionBlock, candidate, scopeStep, scopeVerdict, scopeRule)
 }
 
 // answerMarker 抓「答案：x」/「ANSWER: x」（取最后一处，大小写不敏感，中英冒号皆可）。

@@ -106,7 +106,7 @@ func (p *Pipeline) RunRAG(ctx context.Context, query string, topK int) (*Pipelin
 	if rewriter == nil {
 		rewriter = IdentityQueryRewriter{}
 	}
-	queries, err := rewriter.Rewrite(ctx, query)
+	queries, err := rewriter.Rewrite(ragEnrichContext(ctx), query)
 	if err != nil {
 		return res, fmt.Errorf("rag: rewrite: %w", err)
 	}
@@ -127,7 +127,7 @@ func (p *Pipeline) RunRAG(ctx context.Context, query string, topK int) (*Pipelin
 	if reranker == nil {
 		reranker = ScoreReranker{}
 	}
-	hits, err = reranker.Rerank(ctx, query, hits, topK)
+	hits, err = reranker.Rerank(ragEnrichContext(ctx), query, hits, topK)
 	if err != nil {
 		return res, fmt.Errorf("rag: rerank: %w", err)
 	}
@@ -144,7 +144,7 @@ func (p *Pipeline) RunRAG(ctx context.Context, query string, topK int) (*Pipelin
 	res.Context = ctxStr
 
 	if p.Answerer != nil {
-		answer, err := p.Answerer.Answer(ctx, query, ctxStr)
+		answer, err := p.Answerer.Answer(ragEnrichContext(ctx), query, ctxStr)
 		if err != nil {
 			return res, fmt.Errorf("rag: answer: %w", err)
 		}

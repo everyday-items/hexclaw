@@ -7,11 +7,13 @@ package engine
 // 契约：聊天请求 metadata 带 pinned_agent 即为显式锁定，内容路由必须跳过：
 //   - pinned_agent=default        → 默认助理（不注入 agent_prompt、不改 provider）
 //   - pinned_agent=<Agent 名>     → 直取该 Agent 配置（等效于路由命中它）
-//   - pinned_agent=<不存在的名字> → 按默认助理处理（绝不回退内容路由）
+//   - pinned_agent=<不存在的名字> → fail-loud 报错（BUG-20260710 契约变更：绝不回退
+//     内容路由，也不再静默冒充默认助理——那是身份欺骗式降级）
 //   - 不带 pinned_agent           → 内容路由保持现状（IM/旧链路不受影响）
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexagon"
@@ -118,23 +120,28 @@ func TestBug20260703_PinnedNamedAgentUsesItsConfig(t *testing.T) {
 	}
 }
 
-// UT-PIN-003: 锁定不存在的 Agent 名（陈旧配置）→ 按默认助理处理，绝不回退内容路由。
-func TestBug20260703_PinnedUnknownAgentFallsBackToDefault(t *testing.T) {
+// UT-PIN-003: 锁定不存在的 Agent 名（陈旧配置）→ fail-loud 明确报错。
+//
+// 契约变更（BUG-20260710 ghost-agent）：旧契约是"按默认助理处理"——但那正是
+// "前端渲染皮肤、后端换人格"的身份欺骗式降级（M-1：只带 pinned_agent 不带 role
+// 的调用方完整复现原 bug）。新契约与 bug_20260710_ghost_agent_role_test 对齐：
+// 查无此人 → 明确报错，不调用任何 LLM。原保护点保留：绝不回退内容路由（抢答）。
+func TestBug20260703_PinnedUnknownAgentFailsLoud(t *testing.T) {
 	eng, defaultLLM, translatorLLM := newPinnedAgentEngine(t)
 
 	msg := pinnedChatMessage("pin-ghost", "ghost-agent")
-	reply, err := eng.Process(context.Background(), msg)
-	if err != nil {
-		t.Fatalf("Process failed: %v", err)
+	_, err := eng.Process(context.Background(), msg)
+	if err == nil {
+		t.Fatal("[BUG-20260710] 未知锁定名必须 fail-loud，got err=nil（静默冒充默认助理=身份欺骗式降级）")
+	}
+	if !strings.Contains(err.Error(), "不存在") {
+		t.Errorf("错误应含「不存在」语义，实际 %v", err)
 	}
 	if translatorLLM.CallCount() != 0 {
 		t.Errorf("[BUG-20260703] 未知锁定名回退到了内容路由（translator 调用 %d 次）——回退即重新引入抢答", translatorLLM.CallCount())
 	}
-	if defaultLLM.CallCount() != 1 {
-		t.Errorf("默认 provider 应调用 1 次，实际 %d", defaultLLM.CallCount())
-	}
-	if reply.Content != "default-reply" {
-		t.Errorf("回复应来自默认助理，实际 %q", reply.Content)
+	if defaultLLM.CallCount() != 0 {
+		t.Errorf("fail-loud 不应调用任何 LLM，默认 provider 实际调用 %d 次", defaultLLM.CallCount())
 	}
 }
 

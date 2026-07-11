@@ -33,6 +33,7 @@ func NewTruncatingEmbedder(inner hexagon.VectorEmbedder, maxRunes int) *Truncati
 
 // Embed 实现 vector.Embedder：逐条按 rune 截断后委托底层。
 func (e *TruncatingEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	ctx = sharedEmbedderContext(ctx)
 	if len(texts) == 0 {
 		return e.inner.Embed(ctx, texts)
 	}
@@ -45,7 +46,7 @@ func (e *TruncatingEmbedder) Embed(ctx context.Context, texts []string) ([][]flo
 
 // EmbedOne 实现 vector.Embedder。
 func (e *TruncatingEmbedder) EmbedOne(ctx context.Context, text string) ([]float32, error) {
-	return e.inner.EmbedOne(ctx, clampRunes(text, e.maxRunes))
+	return e.inner.EmbedOne(sharedEmbedderContext(ctx), clampRunes(text, e.maxRunes))
 }
 
 // Dimension 实现 vector.Embedder：透传底层维度。

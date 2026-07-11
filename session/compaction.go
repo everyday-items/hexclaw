@@ -9,6 +9,7 @@ import (
 
 	"github.com/hexagon-codes/hexagon"
 
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/storage"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
@@ -192,6 +193,7 @@ func (c *Compactor) generateSummary(ctx context.Context, msgs []*storage.Message
 	}
 
 	// 调用 LLM
+	ctx = egress.WithRequest(ctx, egress.PurposeGeneralChat, "", egress.ClassGeneral, egress.ClassMemory)
 	resp, err := provider.Complete(ctx, hexagon.CompletionRequest{
 		Messages: []hexagon.Message{
 			{Role: "user", Content: prompt},

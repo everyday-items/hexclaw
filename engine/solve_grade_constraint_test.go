@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -40,6 +41,49 @@ func TestVerifier_OutOfScope(t *testing.T) {
 	}
 	if verdictString(verdictOutOfScope) != "out_of_scope" {
 		t.Errorf("verdictString 应输出 out_of_scope, got %s", verdictString(verdictOutOfScope))
+	}
+}
+
+func TestSolve_VerifierSeesWorkedStepsAndReverifyKeepsConstraint(t *testing.T) {
+	se := &solveExec{
+		solverOuts: []string{
+			"超纲解法标记：使用微积分。\n答案：42",
+			"学段内解法标记：只用乘法竖式。\n答案：42",
+		},
+		verifierOuts: []string{
+			"VERDICT: OUT_OF_SCOPE\nCOMPUTED: 42\n说明：方法超纲",
+			"VERDICT: AGREE\nCOMPUTED: 42\n说明：正确且未超纲",
+		},
+	}
+	o := NewSolveSkill(se.fn, nil)
+	_, err := o.Execute(context.Background(), map[string]any{
+		"problem":          "小明买了六盒彩笔，每盒七支，共有多少支？",
+		"constraint":       "只允许整数乘法和乘法竖式",
+		"self_consistency": float64(1),
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	var verifierTasks []string
+	for _, spec := range se.specs {
+		if spec.Agent == verifierAgentName {
+			verifierTasks = append(verifierTasks, spec.Task)
+		}
+	}
+	if len(verifierTasks) != 2 {
+		t.Fatalf("want initial verification + constrained re-verification, got %d", len(verifierTasks))
+	}
+	if !strings.Contains(verifierTasks[0], "超纲解法标记") {
+		t.Fatalf("initial verifier must receive the full worked solution, task=%q", verifierTasks[0])
+	}
+	if !strings.Contains(verifierTasks[1], "学段内解法标记") {
+		t.Fatalf("re-verifier must receive the replacement worked solution, task=%q", verifierTasks[1])
+	}
+	for i, task := range verifierTasks {
+		if !strings.Contains(task, "只允许整数乘法和乘法竖式") || !strings.Contains(task, "OUT_OF_SCOPE") {
+			t.Fatalf("verifier[%d] lost the scope constraint, task=%q", i, task)
+		}
 	}
 }
 

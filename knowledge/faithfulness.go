@@ -53,7 +53,7 @@ func EvalFaithfulness(ctx context.Context, judge RerankLLM, c FaithfulnessCase) 
 	if judge == nil {
 		return FaithfulnessScore{}, fmt.Errorf("faithfulness: judge 为空")
 	}
-	out, err := judge.Complete(ctx, buildFaithfulnessPrompt(c))
+	out, err := judge.Complete(ragEnrichContext(ctx), buildFaithfulnessPrompt(c))
 	if err != nil {
 		return FaithfulnessScore{}, fmt.Errorf("faithfulness[%s] judge: %w", c.Name, err)
 	}

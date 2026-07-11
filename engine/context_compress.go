@@ -10,6 +10,7 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon/observe/trace"
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
@@ -171,6 +172,7 @@ func llmToolSummary(ctx context.Context, msgs []llm.Message, provider hexagon.Pr
 
 	summaryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	egress.AddDataClasses(summaryCtx, egress.ClassMemory, egress.ClassRecord)
 
 	var temp float64 = 0
 	// v0.4.0 E4：用 CompleteWithFailover 做 ClassifyError-aware 重试（同 Provider，

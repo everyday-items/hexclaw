@@ -125,7 +125,7 @@ func TestRouter_Fallback(t *testing.T) {
 	// 如果只有一个 Provider，排除后无可用备用
 	_, _, err = r.Fallback("fallback")
 	if err != nil {
-		// primary 还在，所以不会报错
+		t.Fatalf("primary 仍可用时不应报错: %v", err)
 	}
 }
 

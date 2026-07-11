@@ -1002,8 +1002,14 @@ func TestReActEngine_ProcessStreamHonorsExplicitProviderModelAndDisablesFallback
 	if err == nil {
 		t.Fatal("期望流式显式 provider 失败时直接返回错误")
 	}
-	if !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
-		t.Fatalf("流式错误未透传底层原因: %v", err)
+	// BUG-20260711：显式 provider 失败仍同步 surfaces 错误（不静默成功、不跨 provider
+	// fallback），但错误经 friendlyLLMError 翻译为对用户友好、可操作的中文——原始
+	// context deadline / 500 / 堆栈只进日志，不再泄漏给终端用户。
+	if !strings.Contains(err.Error(), "超时") {
+		t.Fatalf("流式错误应为人性化超时提示，实际: %v", err)
+	}
+	if strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("人性化后不应再泄漏原始 context deadline 技术错误: %v", err)
 	}
 	if fallback.CallCount() != 0 {
 		t.Fatalf("流式显式 provider 失败时不应跨 provider fallback，实际调用 %d 次", fallback.CallCount())

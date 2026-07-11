@@ -21,6 +21,7 @@ package engine
 import (
 	"regexp"
 	"strings"
+	"sync/atomic"
 
 	"github.com/hexagon-codes/hexclaw/skill"
 )
@@ -112,14 +113,26 @@ func modePromptPrefix(m AgentMode) string {
 // engine 不再硬编码 K12 领域词（错题/复习/备考/我孩子…），改由场景包（scenarios/k12）通过
 // ModeFeatureRegistry 提供，engine 在**原路由位置**消费（保持 AutoRoute 优先级不变）。
 // nil 时无场景包特性，仅走内置通用关键词（AP-1：删掉场景包后平台仍是干净通用路由）。
-var modeKeywordMatcher func(mode AgentMode, text string) bool
+//
+// BUG-20260710-H2：原子存取——注入发生在 composition root 装配期，而本地预热
+// goroutine（StartLocalWarmup→ResolveMode→packMatches）可能并发读；裸包级变量
+// 构成 data race（go test -race 可检出）。
+var modeKeywordMatcher atomic.Pointer[func(mode AgentMode, text string) bool]
 
 // SetModeKeywordMatcher 由 composition root 注入（适配场景包的 ModeFeatureRegistry.MatchesMode）。
-func SetModeKeywordMatcher(m func(mode AgentMode, text string) bool) { modeKeywordMatcher = m }
+// 传 nil 清除注入（测试还原用）。
+func SetModeKeywordMatcher(m func(mode AgentMode, text string) bool) {
+	if m == nil {
+		modeKeywordMatcher.Store(nil)
+		return
+	}
+	modeKeywordMatcher.Store(&m)
+}
 
 // packMatches 查询场景包是否为 mode 提供了命中 s 的特性词。
 func packMatches(mode AgentMode, s string) bool {
-	return modeKeywordMatcher != nil && modeKeywordMatcher(mode, s)
+	m := modeKeywordMatcher.Load()
+	return m != nil && (*m)(mode, s)
 }
 
 // AutoRoute 对用户消息做启发式分类，返回推荐的 AgentMode。

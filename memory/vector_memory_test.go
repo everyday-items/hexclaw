@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/hexagon-codes/ai-core/store/vector"
+	"github.com/hexagon-codes/hexclaw/egress"
 )
 
 func TestVectorMemory_SaveAndSearch(t *testing.T) {
@@ -84,6 +85,36 @@ func TestVectorMemory_SaveEmpty(t *testing.T) {
 	count, _ := vm.Count(context.Background())
 	if count != 0 {
 		t.Error("空内容不应保存任何记录")
+	}
+}
+
+func TestBUG20260710_VectorMemoryEmbeddingIsClassifiedPrivate(t *testing.T) {
+	store := vector.NewMemoryStore(3)
+	defer store.Close()
+	var seen [][]egress.Request
+	embedder := vector.NewEmbedderFunc(3, func(ctx context.Context, texts []string) ([][]float32, error) {
+		requests, _ := egress.RequestsFromContext(ctx)
+		seen = append(seen, requests)
+		result := make([][]float32, len(texts))
+		for i := range result {
+			result[i] = []float32{1, 0, 0}
+		}
+		return result, nil
+	})
+	vm := NewVectorMemory(store, embedder, VectorMemoryConfig{MinScore: 0.1})
+	if err := vm.Save(context.Background(), "private memory", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vm.Search(context.Background(), "private", 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("embedding calls=%d", len(seen))
+	}
+	for i, requests := range seen {
+		if len(requests) != 1 || requests[0].Purpose != egress.PurposeRAGEmbed || requests[0].DataClass != egress.ClassMemory {
+			t.Fatalf("call %d envelope=%+v", i, requests)
+		}
 	}
 }
 

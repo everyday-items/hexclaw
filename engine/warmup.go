@@ -10,19 +10,65 @@ package engine
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/hexagon-codes/ai-core/llm"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
+
+const defaultLocalWarmupTimeout = 10 * time.Minute
+
+// WarmupHandle controls one background warmup and exposes deterministic
+// shutdown semantics to the engine and callers.
+type WarmupHandle struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	mu  sync.Mutex
+	err error
+}
+
+func (h *WarmupHandle) Cancel() {
+	if h != nil && h.cancel != nil {
+		h.cancel()
+	}
+}
+
+func (h *WarmupHandle) Wait(ctx context.Context) error {
+	if h == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-h.done:
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (h *WarmupHandle) finish(err error) {
+	h.mu.Lock()
+	h.err = err
+	h.mu.Unlock()
+	close(h.done)
+}
 
 // WarmupLocalDefaultModel 若默认路由是本地模型（ollama/local），发送一次与真实聊天
 // 同构（system prompt + 基础工具集）的 1-token 请求，把大前缀 prefill 进 KV 缓存。
 // 返回 warmed=false 表示默认路由非本地、按设计跳过（云端无预热需求）。
 func (e *ReActEngine) WarmupLocalDefaultModel(ctx context.Context) (warmed bool, err error) {
+	ctx = egress.WithRequest(ctx, egress.PurposeGeneralChat, "warmup", egress.ClassGeneral)
 	// 与日常提问同构的普通中文短句：工具渐进召回（CollectFiltered 按 query）对无关键词
 	// 文本返回基础工具集——与多数真实首问相同，前缀才能命中。
 	msg := &adapter.Message{
@@ -92,11 +138,50 @@ func (e *ReActEngine) WarmupLocalDefaultModel(ctx context.Context) (warmed bool,
 	return true, nil
 }
 
-// StartLocalWarmup 后台预热入口（serve 启动尾调用）：不阻塞启动，失败仅告警——
-// 预热是纯性能优化，任何失败都不影响功能路径。
-func (e *ReActEngine) StartLocalWarmup(ctx context.Context) {
+// StartLocalWarmup 后台预热入口（serve 启动尾调用）：不阻塞启动，失败仅告警。
+// 可选 timeout 主要用于测试/受限环境；省略时使用十分钟上限（覆盖纯 CPU 大前缀实测耗时）。
+func (e *ReActEngine) StartLocalWarmup(ctx context.Context, timeout ...time.Duration) *WarmupHandle {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	limit := defaultLocalWarmupTimeout
+	if len(timeout) > 0 && timeout[0] > 0 {
+		limit = timeout[0]
+	}
+	runCtx, cancel := context.WithTimeout(ctx, limit)
+	handle := &WarmupHandle{cancel: cancel, done: make(chan struct{})}
+
+	e.mu.Lock()
+	previous := e.warmup
+	e.warmup = handle
+	e.mu.Unlock()
+	if previous != nil {
+		previous.Cancel()
+	}
+
+	e.bgWg.Add(1)
 	go func() {
-		warmed, err := e.WarmupLocalDefaultModel(ctx)
+		defer e.bgWg.Done()
+		defer cancel()
+		var runErr error
+		// BUG-20260710-H2：纯性能优化路径的 panic 不允许带崩进程（同 tool_executor recover 范式）。
+		defer func() {
+			if r := recover(); r != nil {
+				runErr = fmt.Errorf("warmup panic: %v", r)
+				logger.Warn("[warmup] 预热 goroutine panic（已吞，不影响功能）", "panic", r)
+			}
+			if runErr == nil && runCtx.Err() != nil {
+				runErr = runCtx.Err()
+			}
+			handle.finish(runErr)
+			e.mu.Lock()
+			if e.warmup == handle {
+				e.warmup = nil
+			}
+			e.mu.Unlock()
+		}()
+		warmed, err := e.WarmupLocalDefaultModel(runCtx)
+		runErr = err
 		switch {
 		case err != nil:
 			logger.Warn("[warmup] 本地模型预热失败（不影响功能，首条消息将走冷路径）", "error", err)
@@ -104,4 +189,5 @@ func (e *ReActEngine) StartLocalWarmup(ctx context.Context) {
 			logger.Info("[warmup] 默认路由非本地模型，跳过预热")
 		}
 	}()
+	return handle
 }

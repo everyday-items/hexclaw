@@ -89,7 +89,9 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 	if e.mcpMgr != nil {
 		call.Source = "mcp"
 		return e.executeWithHooks(ctx, call, func(ctx context.Context) (string, error) {
-			return e.mcpMgr.CallTool(ctx, toolName, args)
+			result, owner, err := e.mcpMgr.CallToolWithOwner(ctx, toolName, args)
+			call.ServerName = owner
+			return result, err
 		})
 	}
 
@@ -166,6 +168,7 @@ func (e *ToolExecutor) executeWithHooks(ctx context.Context, call *ToolCallInfo,
 	for _, h := range afterHooks {
 		runAfterHook(ctx, h, call, result, v2)
 	}
+	labelToolResultEgress(ctx, call.Name)
 
 	// v0.4.0 H6：投递结构化事件；是否落盘/外发由注入的 events.Sink 决定。
 	severity := events.SeverityInfo

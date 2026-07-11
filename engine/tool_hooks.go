@@ -14,6 +14,9 @@ type ToolCallInfo struct {
 	Name      string
 	Arguments map[string]any
 	Source    string // "skill" | "mcp" | "chain"
+	// ServerName identifies the resolved MCP server owner. It is populated
+	// before After hooks so server-relative results can be interpreted safely.
+	ServerName string
 }
 
 // ToolCallResult holds the result of a tool call for hooks.

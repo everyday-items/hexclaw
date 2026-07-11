@@ -836,6 +836,20 @@ func (m *Manager) QueryWithFilter(ctx context.Context, query string, topK int, f
 	return formatSearchHits(hitsFromResults(selected)), nil
 }
 
+// QueryHits 同 Query（fail-closed 严格地板），但同时返回格式化上下文与结构化命中列表。
+//
+// U9：引擎自动 RAG 注入点需要「注入了什么」的结构化命中回传前端渲染命中标签+详情。
+// 命中集与 Query 注入的上下文**同源同判据**（同一次 searchResultsMode strict 检索），
+// 保证「标签显示的命中数」== 「真正端给模型的命中数」，不产生二次检索的漂移。
+func (m *Manager) QueryHits(ctx context.Context, query string, topK int) (string, []SearchHit, error) {
+	selected, err := m.searchResultsMode(ctx, query, topK, Filter{}, true)
+	if err != nil {
+		return "", nil, err
+	}
+	hits := hitsFromResults(selected)
+	return formatSearchHits(hits), hits, nil
+}
+
 func (m *Manager) searchResults(ctx context.Context, query string, topK int, filter Filter) ([]*SearchResult, error) {
 	return m.searchResultsMode(ctx, query, topK, filter, false)
 }
@@ -873,7 +887,7 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 		if m.embedder != nil {
 			// 查询向量化预算（BUG-20260703 同构防护，对齐 engine 记忆召回）：检索是增强，
 			// 不继承整请求 ctx 的漫长余量——慢 embedding 端点超预算即掐断，本轮走纯 BM25。
-			ectx, ecancel := context.WithTimeout(ctx, queryEmbedTimeout)
+			ectx, ecancel := context.WithTimeout(ragEmbedContext(ctx), queryEmbedTimeout)
 			qv, err := m.embedder.Embed(ectx, []string{cfg.EmbedQueryPrefix + q})
 			ecancel()
 			if err != nil {
@@ -1077,7 +1091,7 @@ func (m *Manager) rerankWith(ctx context.Context, rr reranker.Reranker, query st
 		docs = append(docs, hrag.Document{ID: r.Chunk.ID, Content: r.Chunk.Content, Score: float32(r.Chunk.Score)})
 		byID[r.Chunk.ID] = r
 	}
-	out, err := rr.Rerank(ctx, query, docs)
+	out, err := rr.Rerank(ragEnrichContext(ctx), query, docs)
 	if err != nil {
 		return nil, err
 	}
@@ -1195,7 +1209,7 @@ func (m *Manager) buildChunks(ctx context.Context, doc *Document, ts time.Time) 
 				embedTexts[i] = docPrefix + t
 			}
 		}
-		embeddings, err = m.embedder.Embed(ctx, embedTexts)
+		embeddings, err = m.embedder.Embed(ragEmbedContext(ctx), embedTexts)
 		if err != nil {
 			logger.Warn("[knowledge] 生成向量嵌入失败，降级为纯文本索引", "title", doc.Title, "error", err)
 			embeddings = nil
@@ -1314,7 +1328,7 @@ func (m *Manager) generateChunkContext(ctx context.Context, docContent, chunk st
 
 请用一句不超过 50 字的话，说明这个片段在整篇文档中的位置与主题，以便检索时更好地定位。只输出这一句话，不要任何解释或前后缀。`,
 		docContent, clampRunes(chunk, contextualChunkCharBudget))
-	out, err := m.llm.Complete(ctx, prompt)
+	out, err := m.llm.Complete(ragEnrichContext(ctx), prompt)
 	if err != nil {
 		return "", err
 	}

@@ -16,15 +16,19 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/ai-core/llm/anthropic"
 	"github.com/hexagon-codes/ai-core/llm/ollama"
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
@@ -63,6 +67,7 @@ type Selector struct {
 	defaultP       string                      // 默认 Provider 名称
 	unhealthyUntil map[string]time.Time        // 运行时短期熔断，避免刚失败的 provider 立即被再次选中
 	now            func() time.Time
+	egressPolicy   *egress.Policy // nil only for explicitly unguarded/test selectors
 }
 
 const defaultProviderCooldown = 2 * time.Minute
@@ -147,14 +152,53 @@ func NewWithProviders(cfg config.LLMConfig, providers map[string]hexagon.Provide
 	return r
 }
 
-// localHostMarkers identify a base URL pointing at the local machine or a
-// nearby private deployment (Ollama etc.). Such providers don't need an API
-// key and must rank LAST in fallback (BUG-20260612), so the matcher covers
-// loopback variants and common local/container hostnames, not just localhost.
-var localHostMarkers = []string{
-	"localhost", "127.0.0.1", "::1", "0.0.0.0",
-	"host.docker.internal", "host.containers.internal",
-	"//ollama", ".local",
+// SetEgressPolicy installs the mandatory cloud-provider boundary. Local
+// providers remain in-process/LAN calls and bypass it; every remote Complete or
+// Stream returned by this selector requires an explicit egress context
+// envelope. The policy is retained across Reload.
+func (r *Selector) SetEgressPolicy(policy *egress.Policy) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.egressPolicy = policy
+	r.mu.Unlock()
+}
+
+type cloudEgressProvider struct {
+	next   hexagon.Provider
+	policy *egress.Policy
+}
+
+func (p *cloudEgressProvider) Name() string { return p.next.Name() }
+
+func (p *cloudEgressProvider) Complete(ctx context.Context, req llm.CompletionRequest) (*llm.CompletionResponse, error) {
+	if err := p.policy.GuardContext(ctx); err != nil {
+		return nil, fmt.Errorf("cloud provider %s egress: %w", p.next.Name(), err)
+	}
+	return p.next.Complete(ctx, req)
+}
+
+func (p *cloudEgressProvider) Stream(ctx context.Context, req llm.CompletionRequest) (*llm.Stream, error) {
+	if err := p.policy.GuardContext(ctx); err != nil {
+		return nil, fmt.Errorf("cloud provider %s egress: %w", p.next.Name(), err)
+	}
+	return p.next.Stream(ctx, req)
+}
+
+func (p *cloudEgressProvider) Models() []llm.ModelInfo { return p.next.Models() }
+func (p *cloudEgressProvider) CountTokens(messages []llm.Message) (int, error) {
+	return p.next.CountTokens(messages)
+}
+
+// providerLocked returns the raw local provider or a cloud-guarded facade.
+// Caller must hold at least r.mu.RLock.
+func (r *Selector) providerLocked(name string) hexagon.Provider {
+	p := r.providers[name]
+	if p == nil || r.egressPolicy == nil || r.isLocalProviderName(name) {
+		return p
+	}
+	return &cloudEgressProvider{next: p, policy: r.egressPolicy}
 }
 
 // isLocalProviderName reports whether a provider should rank last in fallback.
@@ -169,8 +213,10 @@ func (r *Selector) isLocalProviderName(name string) bool {
 	if canon, ok := r.canonicalNameLocked(name); ok {
 		key = canon
 	}
-	if isLocalProvider(r.cfg.Providers[key]) {
-		return true
+	if pc, configured := r.cfg.Providers[key]; configured && strings.TrimSpace(pc.BaseURL) != "" {
+		// An explicit endpoint is authoritative. In particular, a public hosted
+		// service named "ollama" must still cross the cloud egress boundary.
+		return isLocalProvider(pc)
 	}
 	return strings.Contains(strings.ToLower(name), "ollama")
 }
@@ -178,18 +224,43 @@ func (r *Selector) isLocalProviderName(name string) bool {
 // IsLocalProviderName 报告指定 provider 是否本地部署（如 Ollama，base_url 指向 localhost 或名含 ollama）。
 // 供上层据本地/云端差异调整策略（如 AP-098：本地慢/reasoning 模型放宽后台抽取超时）。
 func (r *Selector) IsLocalProviderName(name string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.isLocalProviderName(name)
 }
 
 // isLocalProvider 检查 provider 是否为本地部署（如 Ollama），本地 provider 不需要 API Key
 func isLocalProvider(pc config.LLMProviderConfig) bool {
-	u := strings.ToLower(pc.BaseURL)
-	for _, m := range localHostMarkers {
-		if strings.Contains(u, m) {
-			return true
-		}
+	return IsLocalProviderBaseURL(pc.BaseURL)
+}
+
+// IsLocalProviderBaseURL classifies only the parsed endpoint host. Local-looking
+// text in a public hostname, path, query, or userinfo must not bypass egress.
+func IsLocalProviderBaseURL(baseURL string) bool {
+	raw := strings.TrimSpace(baseURL)
+	if raw == "" {
+		return false
 	}
-	return false
+	if !strings.Contains(raw, "://") {
+		raw = "//" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if zone := strings.LastIndexByte(host, '%'); zone >= 0 {
+		host = host[:zone]
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsUnspecified()
+	}
+	return host == "localhost" || host == "ollama" ||
+		host == "host.docker.internal" || host == "host.containers.internal" ||
+		strings.HasSuffix(host, ".local")
 }
 
 func buildSelectorState(cfg config.LLMConfig) (map[string]hexagon.Provider, config.LLMConfig, string) {
@@ -249,6 +320,13 @@ func cloneLLMConfig(cfg config.LLMConfig) config.LLMConfig {
 // 这意味着：DeepSeek、Qwen 等声明 OpenAI 兼容的 Provider，
 // 以及任何 API 中转/私有部署，都可以通过此方式接入。
 func (r *Selector) createProvider(name string, pc config.LLMProviderConfig) hexagon.Provider {
+	return NewProviderFromConfig(name, pc)
+}
+
+// NewProviderFromConfig 按 provider 名/配置选择正确协议创建 Provider（ollama 原生 /
+// anthropic 原生 SDK / 其余 OpenAI 兼容）。测试连接与真实路由共用此单一工厂，避免
+// 「测试连接一律当 OpenAI 打」的协议漂移（契约#2）。
+func NewProviderFromConfig(name string, pc config.LLMProviderConfig) hexagon.Provider {
 	if isOllamaProviderConfig(name, pc) {
 		var opts []ollama.Option
 		if baseURL := normalizeOllamaBaseURL(pc.BaseURL); baseURL != "" {
@@ -256,6 +334,9 @@ func (r *Selector) createProvider(name string, pc config.LLMProviderConfig) hexa
 		}
 		if pc.Model != "" {
 			opts = append(opts, ollama.WithModel(pc.Model))
+		}
+		if pc.KeepAlive != "" {
+			opts = append(opts, ollama.WithKeepAlive(pc.KeepAlive))
 		}
 		return ollama.New(opts...)
 	}
@@ -335,8 +416,8 @@ func (r *Selector) Get(name string) (hexagon.Provider, bool) {
 	if !ok {
 		return nil, false
 	}
-	p, ok := r.providers[key]
-	return p, ok
+	_, ok = r.providers[key]
+	return r.providerLocked(key), ok
 }
 
 // Default 获取默认 Provider
@@ -350,7 +431,7 @@ func (r *Selector) Default() hexagon.Provider {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.providers[r.defaultP]
+	return r.providerLocked(r.defaultP)
 }
 
 // DefaultName 返回默认 Provider 名称
@@ -378,7 +459,7 @@ func (r *Selector) Route(_ context.Context) (hexagon.Provider, string, error) {
 	// 如果路由未启用或策略为空/default，直接返回默认 Provider
 	strategy := r.cfg.Routing.Strategy
 	if !r.cfg.Routing.Enabled || strategy == "" || strategy == "default" {
-		p, ok := r.providers[r.defaultP]
+		_, ok := r.providers[r.defaultP]
 		if !ok {
 			return nil, "", fmt.Errorf("默认 Provider %s 不可用", r.defaultP)
 		}
@@ -389,9 +470,9 @@ func (r *Selector) Route(_ context.Context) (hexagon.Provider, string, error) {
 			}
 			slog.Warn("[router] default provider unhealthy, route fallback selected",
 				"source", "llm", "default", r.defaultP, "selected", fallback)
-			return r.providers[fallback], fallback, nil
+			return r.providerLocked(fallback), fallback, nil
 		}
-		return p, r.defaultP, nil
+		return r.providerLocked(r.defaultP), r.defaultP, nil
 	}
 
 	// 根据策略选择优先级映射
@@ -406,7 +487,7 @@ func (r *Selector) Route(_ context.Context) (hexagon.Provider, string, error) {
 	default:
 		// 未知策略，回退到默认 Provider
 		logger.Info("未知路由策略", "strategy", strategy)
-		p, ok := r.providers[r.defaultP]
+		_, ok := r.providers[r.defaultP]
 		if !ok {
 			return nil, "", fmt.Errorf("默认 Provider %s 不可用", r.defaultP)
 		}
@@ -415,9 +496,9 @@ func (r *Selector) Route(_ context.Context) (hexagon.Provider, string, error) {
 			if fallback == "" {
 				return nil, "", fmt.Errorf("默认 Provider %s 暂不可用且无可用备用 Provider", r.defaultP)
 			}
-			return r.providers[fallback], fallback, nil
+			return r.providerLocked(fallback), fallback, nil
 		}
-		return p, r.defaultP, nil
+		return r.providerLocked(r.defaultP), r.defaultP, nil
 	}
 
 	// 按优先级排序可用的 Provider
@@ -425,7 +506,7 @@ func (r *Selector) Route(_ context.Context) (hexagon.Provider, string, error) {
 	if best == "" {
 		return nil, "", fmt.Errorf("没有可用的 Provider (策略: %s)", strategy)
 	}
-	return r.providers[best], best, nil
+	return r.providerLocked(best), best, nil
 }
 
 // RouteModel 根据当前路由策略选择 Provider，并返回该 Provider 当前配置的模型名。
@@ -542,7 +623,7 @@ func (r *Selector) Fallback(exclude ...string) (hexagon.Provider, string, error)
 		slog.Warn("[router] provider fallback selected",
 			"source", "llm", "excluded", strings.Join(exclude, ","),
 			"selected", name, "is_local", r.isLocalProviderName(name))
-		return r.providers[name], name, nil
+		return r.providerLocked(name), name, nil
 	}
 	return nil, "", fmt.Errorf("没有可用的备用 Provider")
 }

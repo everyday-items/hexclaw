@@ -15,6 +15,7 @@ import (
 
 	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/hexclaw/skill"
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
 // ImproveHook 把工具调用结果送进 skill.ImproveStore。
@@ -106,10 +107,8 @@ func argString(args map[string]any) string {
 func formatVal(v any) string {
 	switch x := v.(type) {
 	case string:
-		if len(x) > 80 {
-			return x[:80] + "…"
-		}
-		return x
+		// rune-safe 截断，避免 CJK 字节切断产生乱码（AP-141）。
+		return stringx.TruncateBytes(x, 80, "…")
 	case nil:
 		return ""
 	default:

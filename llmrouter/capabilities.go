@@ -21,6 +21,7 @@ import (
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexagon/observe/trace"
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
 
@@ -140,6 +141,7 @@ func probeProvider(ctx context.Context, p hexagon.Provider, providerName, model 
 	// 设置 30s 超时，防止坏模型卡死探测（有的 Ollama 小模型会陷入无限 reasoning）
 	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	probeCtx = egress.WithRequest(probeCtx, egress.PurposeProviderProbe, "", egress.ClassGeneral)
 
 	tool := llm.NewToolDefinition(
 		"echo",

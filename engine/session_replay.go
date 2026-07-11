@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexagon/observe/trace"
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/memory"
 )
 
@@ -26,6 +27,7 @@ func (e *ReActEngine) extractAndIngestConversation(ctx context.Context, userText
 		return 0
 	}
 	existing := e.fileMem.GetMemoryForPrompt() // 剥存储层内联 meta 标签，不把 eid/pin 噪声注入抽取提示
+	ctx = egress.WithRequest(ctx, egress.PurposeGeneralChat, "session-replay", egress.ClassGeneral, egress.ClassMemory)
 	out, err := e.CompleteOnce(ctx, memoryExtractionSystemPrompt,
 		buildMemoryExtractionPrompt(userText, assistantText, existing), memoryExtractMaxTokens)
 	if err != nil || strings.TrimSpace(out) == "" {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/toolkit/lang/mapx"
+	"github.com/hexagon-codes/toolkit/lang/stringx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
@@ -551,7 +552,8 @@ func summarizeArgs(args map[string]any) string {
 	for _, k := range keys {
 		s := fmt.Sprintf("%v", args[k])
 		if len(s) > 50 {
-			s = s[:47] + "..."
+			// rune-safe 截断，避免 CJK 字节切断产生乱码（AP-141，审批/审计行用户可见）。
+			s = stringx.TruncateBytes(s, 47, "...")
 		}
 		parts = append(parts, fmt.Sprintf("%s=%s", k, s))
 	}

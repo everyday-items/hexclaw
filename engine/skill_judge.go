@@ -21,9 +21,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hexagon-codes/ai-core/llm"
 	hexagon "github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon/observe/trace"
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
@@ -78,11 +78,12 @@ func NewLLMSkillJudge(provider hexagon.Provider, model string, opts LLMSkillJudg
 
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
+		ctx = egress.WithRequest(ctx, egress.PurposeGeneralChat, "skill-judge", egress.ClassGeneral, egress.ClassRecord)
 
 		temp := 0.1
 		req := hexagon.CompletionRequest{
 			Model:       model,
-			Messages:    []llm.Message{{Role: "user", Content: prompt}},
+			Messages:    []hexagon.Message{{Role: "user", Content: prompt}},
 			Temperature: &temp,
 		}
 		resp, err := provider.Complete(ctx, req)

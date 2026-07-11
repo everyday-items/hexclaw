@@ -161,6 +161,14 @@ type AssistantMeta struct {
 	// Blocks 本轮有序内容块流（text↔tool 交错序）。持久化进 meta.blocks，重载后
 	// 前端据此按序渲染多步 ReAct（而非回退扁平 content+tool_calls 的单轮近似）。
 	Blocks []adapter.Block
+	// ReplyMetadata carries structured UI metadata that must survive reload.
+	// SaveAssistantReply applies its own allowlist; callers may pass the live
+	// reply map without persisting routing, credentials, or internal flags.
+	ReplyMetadata map[string]string
+}
+
+var replySafeAssistantMetadataKeys = map[string]struct{}{
+	"record": {},
 }
 
 // SaveAssistantMessageWithMeta 保存助手回复（含 reasoning 等元数据）并返回消息记录。
@@ -214,6 +222,11 @@ func (m *Manager) SaveAssistantReply(ctx context.Context, sessionID, content str
 	// 有序内容块持久化进 meta.blocks —— 重载后多步 ReAct 仍按真实交错序渲染。
 	if len(am.Blocks) > 0 {
 		metaMap["blocks"] = am.Blocks
+	}
+	for key, value := range am.ReplyMetadata {
+		if _, ok := replySafeAssistantMetadataKeys[key]; ok && value != "" {
+			metaMap[key] = value
+		}
 	}
 	meta := "{}"
 	if len(metaMap) > 0 {

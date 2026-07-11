@@ -79,6 +79,7 @@ func (e *ReActEngine) buildLongTermMemoryBlock(ctx context.Context, role, query 
 	var b strings.Builder
 	used := 0
 	var recalledFactIDs []string // 缺陷F：被真正注入的检索层事实 = 一次召回
+	var injected []recall.Entry  // U9：真正进入注入块的记忆条目 → 结构化命中回传前端
 	write := func(entries []recall.Entry, trackRecall bool) {
 		for _, en := range entries {
 			line := "- " + strings.TrimSpace(en.Content)
@@ -88,6 +89,7 @@ func (e *ReActEngine) buildLongTermMemoryBlock(ctx context.Context, role, query 
 			}
 			b.WriteString(line + "\n")
 			used += cost
+			injected = append(injected, en)
 			if trackRecall && en.ID != "" {
 				recalledFactIDs = append(recalledFactIDs, en.ID)
 			}
@@ -95,6 +97,10 @@ func (e *ReActEngine) buildLongTermMemoryBlock(ctx context.Context, role, query 
 	}
 	write(resident, false) // 常驻恒注入，不计入「按相关性被召回」的频次信号
 	write(ranked, true)
+
+	// U9：把真正注入本轮的记忆条目记入命中 sink（与「标签显示的记忆命中」同源），
+	// 供 finalize/Reply 回传前端渲染「记忆命中」标签+详情。
+	recordMemoryHits(ctx, role, injected)
 
 	// 缺陷F：query 驱动的真召回里被注入的事实 → 自增 HitCount，复活行为 importance/晋升/做梦保护反馈环。
 	// 空 query（每轮 dump）不计：那不是「因相关被召回」，避免频次被无意义灌水。best-effort、不阻断。

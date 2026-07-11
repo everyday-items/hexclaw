@@ -92,7 +92,39 @@ func shouldBypassSemanticCache(msg *adapter.Message) bool {
 	if msg == nil {
 		return false
 	}
+	if msg.Metadata != nil && (msg.Metadata[adapter.MetadataRequestTemperature] != "" || msg.Metadata[adapter.MetadataRequestMaxTokens] != "") {
+		return true
+	}
 	return shouldForceCodeExecTool(msg.Content) || shouldBypassLiveStateCache(msg.Content)
+}
+
+// semanticCacheToolNamesCacheable applies a conservative purity rule: only
+// tools explicitly classified read-only may contribute to a cached response.
+// Unknown and mutating tools default unsafe so a newly added stateful tool can
+// never be silently skipped by a semantic-cache hit.
+func semanticCacheToolNamesCacheable(names []string) bool {
+	for _, name := range names {
+		if runtimeToolSideEffect(name) != hruntime.SideEffectReadOnly {
+			return false
+		}
+	}
+	return true
+}
+
+func semanticCacheAdapterCallsCacheable(calls []adapter.ToolCall) bool {
+	names := make([]string, 0, len(calls))
+	for _, call := range calls {
+		names = append(names, call.Name)
+	}
+	return semanticCacheToolNamesCacheable(names)
+}
+
+func semanticCacheRuntimeCallsCacheable(calls []hruntime.ToolCallRecord) bool {
+	names := make([]string, 0, len(calls))
+	for _, call := range calls {
+		names = append(names, call.Name)
+	}
+	return semanticCacheToolNamesCacheable(names)
 }
 
 func hasCodeExecAdapterCall(calls []adapter.ToolCall) bool {
@@ -301,6 +333,16 @@ func shouldBypassLiveStateCache(content string) bool {
 	s := strings.ToLower(strings.TrimSpace(content))
 	if s == "" {
 		return false
+	}
+	// Stateful/domain actions must observe current records and execute their
+	// transition on every turn. Serving these intents from the 24h semantic
+	// response cache skips the tool loop entirely.
+	if containsAny(s,
+		"复习错题", "错题复习", "批改作业", "批改这", "加入错题", "记入错题",
+		"标记已掌握", "标记掌握", "已经掌握", "继续复习", "再来一道",
+		"review mistakes", "grade homework", "mark mastered",
+	) {
+		return true
 	}
 	fileInventoryIntent := containsAny(s,
 		"有哪些文件", "哪些文件", "列出文件", "列一下文件", "文件列表",

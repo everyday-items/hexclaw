@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
@@ -67,7 +68,7 @@ func (vm *VectorMemory) Save(ctx context.Context, content string, metadata map[s
 	}
 
 	// 在锁外执行 HTTP 调用（embedding 可能耗时数秒）
-	embedding, err := vm.embedder.EmbedOne(ctx, content)
+	embedding, err := vm.embedder.EmbedOne(vectorMemoryEgressContext(ctx), content)
 	if err != nil {
 		return fmt.Errorf("生成向量失败: %w", err)
 	}
@@ -109,7 +110,7 @@ func (vm *VectorMemory) Search(ctx context.Context, query string, topK int) ([]V
 	}
 
 	// 在锁外执行 HTTP 调用（embedding 可能耗时数秒）
-	queryEmbedding, err := vm.embedder.EmbedOne(ctx, query)
+	queryEmbedding, err := vm.embedder.EmbedOne(vectorMemoryEgressContext(ctx), query)
 	if err != nil {
 		return nil, fmt.Errorf("生成查询向量失败: %w", err)
 	}
@@ -135,6 +136,14 @@ func (vm *VectorMemory) Search(ctx context.Context, query string, topK int) ([]V
 	}
 
 	return results, nil
+}
+
+func vectorMemoryEgressContext(ctx context.Context) context.Context {
+	if requests, ok := egress.RequestsFromContext(ctx); ok && len(requests) == 1 &&
+		requests[0].Purpose == egress.PurposeRAGEmbed && requests[0].DataClass == egress.ClassMemory {
+		return ctx
+	}
+	return egress.WithRequest(ctx, egress.PurposeRAGEmbed, "", egress.ClassMemory)
 }
 
 // Delete 删除记忆

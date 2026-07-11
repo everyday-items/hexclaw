@@ -14,10 +14,13 @@ import "fmt"
 type Purpose string
 
 const (
-	PurposeVisionOCR   Purpose = "vision_ocr"   // 图像/OCR 识别
-	PurposeSolveVerify Purpose = "solve_verify" // 受验证的推理（需程序/工具验证的推理）
-	PurposeGeneralChat Purpose = "general_chat" // 通用对话
-	PurposeRAGEmbed    Purpose = "rag_embed"    // 文档向量化
+	PurposeVisionOCR       Purpose = "vision_ocr"         // 图像/OCR 识别
+	PurposeSolveVerify     Purpose = "solve_verify"       // 受验证的推理（需程序/工具验证的推理）
+	PurposeGeneralChat     Purpose = "general_chat"       // 通用对话
+	PurposeRAGEmbed        Purpose = "rag_embed"          // 文档向量化
+	PurposeRAGEnrich       Purpose = "rag_enrich"         // 查询扩展/重排/文档描述等检索增强
+	PurposeProviderProbe   Purpose = "provider_probe"     // 静态连通性/能力探测（不含用户数据）
+	PurposeAutomationBuild Purpose = "automation_compile" // 用户自动化描述编译为确定性脚本
 )
 
 // DataClass 数据敏感类别（通用分级；业务概念到此的映射在调用点）。
@@ -48,8 +51,28 @@ type Decision struct {
 // sensitiveClasses 默认不得出本机的数据类。
 var sensitiveClasses = map[DataClass]bool{
 	ClassSensitiveProfile: true,
+	ClassSensitiveMedia:   true,
 	ClassRecord:           true,
 	ClassMemory:           true,
+}
+
+var knownPurposes = map[Purpose]bool{
+	PurposeVisionOCR:       true,
+	PurposeSolveVerify:     true,
+	PurposeGeneralChat:     true,
+	PurposeRAGEmbed:        true,
+	PurposeRAGEnrich:       true,
+	PurposeProviderProbe:   true,
+	PurposeAutomationBuild: true,
+}
+
+var knownDataClasses = map[DataClass]bool{
+	ClassSensitiveProfile: true,
+	ClassSensitiveMedia:   true,
+	ClassRecord:           true,
+	ClassMemory:           true,
+	ClassDocument:         true,
+	ClassGeneral:          true,
 }
 
 // purposeAllowsSensitive 白名单：允许携带敏感数据出网的用途 → 该用途允许的敏感类。
@@ -69,9 +92,9 @@ type Policy struct {
 // Evaluate 判定一次出网请求是否允许上云。
 //
 // 规则：
-//   - 非敏感类（document/general/homework_image）：允许（document/general 上云无隐私风险）；
-//   - 敏感类（child_profile/record/memory）：仅当用途在白名单且该用途显式允许此类时放行，
-//     否则拦截——这条就是"只有白名单用途出本机"的代码化。
+//   - 未知/空用途或数据类一律拦截；
+//   - 已知非敏感类（document/general）允许；
+//   - 敏感类仅当用途白名单显式允许该类时放行。
 func (p *Policy) Evaluate(req Request) Decision {
 	d := p.decide(req)
 	if p.OnAudit != nil {
@@ -81,6 +104,12 @@ func (p *Policy) Evaluate(req Request) Decision {
 }
 
 func (p *Policy) decide(req Request) Decision {
+	if !knownPurposes[req.Purpose] {
+		return Decision{AllowCloud: false, Reason: fmt.Sprintf("未知出网用途 %q", req.Purpose)}
+	}
+	if !knownDataClasses[req.DataClass] {
+		return Decision{AllowCloud: false, Reason: fmt.Sprintf("未知数据类 %q", req.DataClass)}
+	}
 	if !sensitiveClasses[req.DataClass] {
 		return Decision{AllowCloud: true, Reason: "非敏感数据类"}
 	}

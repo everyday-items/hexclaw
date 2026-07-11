@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/storage"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
@@ -34,6 +35,7 @@ func SuggestTitle(ctx context.Context, provider hexagon.Provider, messages []*st
 	}
 
 	temp := 0.2
+	ctx = egress.WithRequest(ctx, egress.PurposeGeneralChat, "", egress.ClassGeneral, egress.ClassMemory)
 	resp, err := provider.Complete(ctx, hexagon.CompletionRequest{
 		Messages: []hexagon.Message{
 			{Role: "system", Content: titleSuggestionPrompt},
