@@ -1154,7 +1154,7 @@ func (e *ReActEngine) completeWithTools(
 	e.applyLocalNumCtxCap(&req, isLocal) // 本地 Ollama：按配置钳 num_ctx，防 KV 撑爆内存（BUG-20260712）
 	// 本地 thinking 模型注入 /no_think（与流式路径对齐）
 	// Qwen3/DeepSeek-R1 通过 /no_think 抑制；Gemma 4 由 Ollama 模板层控制，不注入
-	if len(req.Tools) == 0 && isLocal && msg.Metadata["thinking"] != "on" && needsNoThinkInjection(modelName) {
+	if shouldInjectNoThink(isLocal, len(req.Tools) > 0, msg.Metadata["thinking"], modelName) {
 		injectNoThink(req.Messages)
 		trace.L(ctx).Info("注入 /no_think", "model", modelName)
 	}
@@ -2066,7 +2066,7 @@ func (e *ReActEngine) processStreamRuntime(
 		}
 		applyPerTurnRequestPolicy(&req, selection.modelName, msg, history)
 		e.applyLocalNumCtxCap(&req, isLocal) // 本地 Ollama：按配置钳 num_ctx，防 KV 撑爆内存（BUG-20260712）
-		if len(req.Tools) == 0 && isLocal && msg.Metadata["thinking"] != "on" && needsNoThinkInjection(selection.modelName) {
+		if shouldInjectNoThink(isLocal, len(req.Tools) > 0, msg.Metadata["thinking"], selection.modelName) {
 			injectNoThink(req.Messages)
 			trace.L(ctx).Info("注入 /no_think", "model", selection.modelName)
 		}
@@ -3870,7 +3870,10 @@ func (e *ReActEngine) resolveProvider(ctx context.Context, providerHint string, 
 	if p, ok := router.Get(hint); ok {
 		return p, hint, nil
 	}
-	return nil, "", fmt.Errorf("指定的 provider %q 不存在", hint)
+	// provider 韧性（治本）：绑定的 provider 找不到时给**可操作**错误（点名 provider + 怎么恢复），
+	// 而非笼统「provider 不存在」。绝不静默回退到默认/云端 provider——本地会话被悄悄转发云端会
+	// 击穿隐私出口边界（egress）。本地模型缺失多因 Ollama 未启动，提示里点明（BUG-20260712）。
+	return nil, "", fmt.Errorf("智能体绑定的模型提供方 %q 当前不可用（未注册或已被移除）；请在「设置 → 模型」恢复该 provider，或在「智能体」里改绑到可用模型（本地模型请确认 Ollama 已启动）", hint)
 }
 
 // applyPinnedAgent 处理显式锁定的收件 Agent（metadata pinned_agent，BUG-20260703）：
@@ -4632,6 +4635,18 @@ func needsNoThinkInjection(model string) bool {
 	return strings.Contains(m, "qwen3") ||
 		strings.Contains(m, "deepseek-r1") ||
 		strings.Contains(m, "qwq")
+}
+
+// shouldInjectNoThink 判定是否为**本地** thinking 模型注入 /no_think 抑制冗长推理。
+//
+// hasTools 传入但**不参与判定**（BUG-20260712）：旧逻辑以 `len(req.Tools)==0`（即 !hasTools）为
+// 前置，而桌面会话恒挂 20+ 工具 → 本地 qwen3/deepseek-r1 永远拿不到 /no_think → 思考模式在
+// CPU 上生成海量推理，9B 真机单条 120s+（"用一句话说你好"都超时）。/no_think 只抑制 <think>
+// 冗长推理块、**不阻止工具调用**，故有无工具都应注入；仅当用户显式开「深度思考」(thinking==on)
+// 才尊重保留思考。云端 thinking 模型不受此困扰（不慢），且非本地不注入。
+func shouldInjectNoThink(isLocal, hasTools bool, thinkingMeta, model string) bool {
+	_ = hasTools // 保留在签名以标注「工具存在不再阻断注入」，不参与判定
+	return isLocal && thinkingMeta != "on" && needsNoThinkInjection(model)
 }
 
 // injectNoThink 在 system prompt 末尾追加 /no_think 指令

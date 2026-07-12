@@ -263,6 +263,34 @@ func IsLocalProviderBaseURL(baseURL string) bool {
 		strings.HasSuffix(host, ".local")
 }
 
+const (
+	localOllamaProviderName = "Ollama (本地)"
+	localOllamaBaseURL      = "http://localhost:11434/v1"
+	localOllamaDefaultModel = "qwen3.5:9b"
+	// 自动注册的本地 provider 也 cap num_ctx，防内存受限机（16GB）auto 分档飙高 KV 撑爆（BUG-20260712）。
+	localOllamaDefaultNumCtx = 4096
+)
+
+// localOllamaReachable 探测本地 Ollama 守护进程是否在运行（可被测试替换）。
+var localOllamaReachable = func() bool {
+	conn, err := net.DialTimeout("tcp", "localhost:11434", 300*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// hasLocalProvider 判断配置里是否已有任一本地 provider（指向回环端点）。
+func hasLocalProvider(providers map[string]config.LLMProviderConfig) bool {
+	for _, pc := range providers {
+		if isLocalProvider(pc) {
+			return true
+		}
+	}
+	return false
+}
+
 func buildSelectorState(cfg config.LLMConfig) (map[string]hexagon.Provider, config.LLMConfig, string) {
 	providers := make(map[string]hexagon.Provider)
 	activeCfg := cloneLLMConfig(cfg)
@@ -281,6 +309,23 @@ func buildSelectorState(cfg config.LLMConfig) (map[string]hexagon.Provider, conf
 		logger.Info("[router] 加载 provider", "provider", name, "base_url", pc.BaseURL, "local", isLocalProvider(pc))
 		providerNames = append(providerNames, name)
 		activeCfg.Providers[name] = pc
+	}
+
+	// provider 韧性（治本）：本地 Ollama 在运行、但配置里没有任何本地 provider 时（配置漂移/被
+	// 测试或误操作抹掉），自动注册默认「Ollama (本地)」。让本地模型「配置漂移也不丢」，绑定本地
+	// 模型的 agent 不再因缺 provider 硬崩（BUG-20260712）。已有本地 provider 则尊重配置不覆盖。
+	// 仅**补充**已有配置（len>0）：空配置=「未配置 LLM」语义不变（不凭空造 LLM，保 nil-router 契约）。
+	if len(providerNames) > 0 && !hasLocalProvider(activeCfg.Providers) && localOllamaReachable() {
+		enabled := true
+		activeCfg.Providers[localOllamaProviderName] = config.LLMProviderConfig{
+			BaseURL: localOllamaBaseURL,
+			Model:   localOllamaDefaultModel,
+			NumCtx:  localOllamaDefaultNumCtx,
+			Enabled: &enabled,
+		}
+		providerNames = append(providerNames, localOllamaProviderName)
+		logger.Info("[router] 本地 Ollama 在运行且配置无本地 provider，自动注册",
+			"provider", localOllamaProviderName, "base_url", localOllamaBaseURL)
 	}
 	sort.Strings(providerNames)
 

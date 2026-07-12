@@ -22,6 +22,12 @@ func TestNew_NoProviders(t *testing.T) {
 }
 
 func TestNew_SkipEmptyAPIKey(t *testing.T) {
+	// 本用例验证「空 Key provider 被跳过」的配置解析逻辑，与本地 Ollama 探测正交——
+	// 关掉自动注册探测使断言确定（否则跑测机器上 ollama 在跑会多注册一个本地 provider）。
+	prevProbe := localOllamaReachable
+	localOllamaReachable = func() bool { return false }
+	defer func() { localOllamaReachable = prevProbe }()
+
 	cfg := config.LLMConfig{
 		Default: "openai",
 		Providers: map[string]config.LLMProviderConfig{

@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/hexagon-codes/toolkit/util/logger"
 	"gopkg.in/yaml.v3"
 )
 
@@ -45,6 +46,7 @@ func Load(configFile string) (*Config, error) {
 			// 配置文件不存在，使用默认配置 + 环境变量
 			applyEnvProviders(cfg)
 			expandTildePaths(cfg)
+			applyReasoningDefault(cfg)
 			return cfg, nil
 		}
 		return nil, fmt.Errorf("读取配置文件失败: %w", err)
@@ -63,6 +65,9 @@ func Load(configFile string) (*Config, error) {
 
 	// 展开路径中的 ~
 	expandTildePaths(cfg)
+
+	// reasoning 兜底：未显式配强文本模型时指向云端强 provider（BUG-20260712 治本 #5）。
+	applyReasoningDefault(cfg)
 
 	// 启动时校验（H6：精确到字段，家长可看懂错误；fail-fast 优于静默运行异常配置）
 	if err := cfg.Validate(); err != nil {
@@ -210,6 +215,15 @@ func applyEnvProviders(cfg *Config) {
 		}
 		sort.Strings(names)
 		cfg.LLM.Default = names[0]
+	}
+}
+
+// applyReasoningDefault 未显式配 reasoning_provider 时挑云端强文本 provider 兜底，并 warn。
+// 让解题/批改/热身题不落到视觉/本地弱模型（BUG-20260712 治本 #5）。
+func applyReasoningDefault(cfg *Config) {
+	if chosen, applied := cfg.ApplyReasoningDefault(); applied {
+		logger.Warn("[llm] 未配 reasoning_provider，已自动指向云端强文本 provider 兜底（解题/批改/热身走它，可在配置显式覆盖）",
+			"reasoning_provider", chosen)
 	}
 }
 

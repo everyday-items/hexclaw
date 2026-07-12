@@ -11,6 +11,8 @@ package config
 
 import (
 	"encoding/json"
+	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -308,6 +310,64 @@ type LLMConfig struct {
 	// 源的 solver/verifier 子 Agent 走它；空=沿用默认路由（不改变现状，无回归）。
 	ReasoningProvider string `yaml:"reasoning_provider,omitempty" json:"reasoning_provider,omitempty"`
 	ReasoningModel    string `yaml:"reasoning_model,omitempty" json:"reasoning_model,omitempty"`
+}
+
+// strongTextProviderTokens 已知擅长多步文本推理的云端 provider 名 token（reasoning 兜底优先序）。
+// 视觉/本地默认模型（如 glm-4v-flash、本地 9B）不擅长多步数学推理，会把解题/批改/热身题落到弱模型。
+var strongTextProviderTokens = []string{"deepseek", "anthropic", "claude", "openai", "gpt", "zhipu", "glm", "ark", "qwen", "moonshot", "kimi", "gemini"}
+
+// ApplyReasoningDefault 未显式配 reasoning_provider 时，挑一个云端强文本 provider 兜底
+// （BUG-20260712 治本 #5）。返回 chosen=选中的 provider 名、applied=是否发生兜底。
+// 已显式配置、或无合格云端 provider 时 applied=false（不改现状，无回归）。
+// 纯函数式（不打日志），供 loader 调用后统一 warn，便于单测直接断言。
+func (c *Config) ApplyReasoningDefault() (chosen string, applied bool) {
+	if c == nil || strings.TrimSpace(c.LLM.ReasoningProvider) != "" {
+		return "", false
+	}
+	names := make([]string, 0, len(c.LLM.Providers))
+	for name := range c.LLM.Providers {
+		names = append(names, name)
+	}
+	sort.Strings(names) // 确定性：同优先级 token 下按名排序取第一个
+	for _, token := range strongTextProviderTokens {
+		for _, name := range names {
+			if !strings.Contains(strings.ToLower(name), token) {
+				continue
+			}
+			if !providerUsableCloud(c.LLM.Providers[name]) {
+				continue
+			}
+			c.LLM.ReasoningProvider = name
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// providerUsableCloud 判定 provider 可作云端强文本兜底：启用 + 非本地部署 + 有 key 或自定义端点。
+func providerUsableCloud(pc LLMProviderConfig) bool {
+	if pc.Enabled != nil && !*pc.Enabled {
+		return false
+	}
+	if isLocalBaseURLHeuristic(pc.BaseURL) {
+		return false
+	}
+	return strings.TrimSpace(pc.APIKey) != "" || strings.TrimSpace(pc.BaseURL) != ""
+}
+
+// isLocalBaseURLHeuristic 轻量判定 base_url 是否指向本地部署（loopback/localhost/容器内网）。
+// config 层不 import llmrouter（避免环），与 llmrouter.IsLocalProviderBaseURL 的判定意图一致。
+func isLocalBaseURLHeuristic(baseURL string) bool {
+	s := strings.ToLower(strings.TrimSpace(baseURL))
+	if s == "" {
+		return false
+	}
+	for _, h := range []string{"localhost", "127.0.0.1", "[::1]", "//::1", "0.0.0.0", "host.docker.internal", "host.containers.internal", ".local", "ollama"} {
+		if strings.Contains(s, h) {
+			return true
+		}
+	}
+	return false
 }
 
 // LLMToolsConfig 工具注入全局配置
