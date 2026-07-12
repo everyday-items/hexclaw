@@ -1496,6 +1496,46 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			k12Opts = append(k12Opts, k12assembly.WithRenderer(k12engineadapter.NewRenderAdapter(renderSvc)))
 		}
 
+		// BUG-20260712 治本²：「再练一道」轻量出题闭包——**裸 reasoning 模型 completion**，
+		// 不进 agent ReAct 循环（无 ~22 工具装载、无编排系统提示、无子 Agent 回执围栏）。
+		// 上一轮已从全对抗链降为单个 solver 子 Agent，但子 Agent 仍走完整 ReAct → 真机单次仍 40s；
+		// 本轮直接调 router.Default()（尊重用户为默认配的 reasoning 模型，与 RouteForVision 同策略，
+		// 不走 cost-aware 抓本地免费 provider）的 Complete，一次 prompt 直出「同知识点变式题+简答」，
+		// 云端 glm-4.5 实测 <10s。练习变式题非高风险批改：不 code_exec 验算 → adapter 侧 verdict=unverifiable，
+		// 绝不冒充「已程序验算」（信任红线）。egress 归 general_chat/general（只含学科/年级/知识点，非敏感档案）。
+		retryGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
+			provider := router.Default()
+			if provider == nil {
+				return "", fmt.Errorf("k12 再练一道: 没有可用的默认 LLM Provider")
+			}
+			task := prompt
+			if subject != "" {
+				task = "【学科：" + subject + "】" + task
+			}
+			if grade != "" {
+				task += "\n（只用" + grade + "学过的方法，给出题目与简要解答即可，无需反复验算。）"
+			}
+			// 只含教学任务本身（学科/年级/知识点），不含孩子敏感档案——归 general_chat/general，云端可出网。
+			cctx := egress.WithRequest(ctx, egress.PurposeGeneralChat, "k12-retry", egress.ClassGeneral)
+			cctx, ccancel := context.WithTimeout(cctx, 60*time.Second)
+			defer ccancel()
+			temp := 0.4
+			resp, err := provider.Complete(cctx, hexagon.CompletionRequest{
+				Messages: []hexagon.Message{
+					{Role: hexagon.RoleSystem, Content: "你是中小学出题老师。据给定学科/年级/知识点直接出一道同类变式练习题并给简要解答，" +
+						"直接给最终题目与答案、不要展开长篇推理。"},
+					{Role: hexagon.RoleUser, Content: task},
+				},
+				MaxTokens:   1024,
+				Temperature: &temp,
+			})
+			if err != nil {
+				return "", err
+			}
+			return resp.Content, nil
+		}
+		k12Opts = append(k12Opts, k12assembly.WithRetryGenerator(retryGenFn))
+
 		k12Solve := classifiedSolveExecutor{next: solveSkill}
 		if k12rt, k12err := k12assembly.Wire(store.DB(), k12Solve, k12Opts...); k12err != nil {
 			logger.Error("装配 K12 场景包失败", "error", k12err)

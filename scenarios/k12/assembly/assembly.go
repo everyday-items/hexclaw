@@ -66,6 +66,16 @@ func WithRenderer(r usecase.Renderer) Option {
 	return func(d *usecase.Deps) { d.Renderer = r }
 }
 
+// WithRetryGenerator 注入「再练一道」轻量出题闭包（BUG-20260712 治本）：让复习再练走单次
+// reasoning 出题、不复用全对抗验算链。回填进 SolveAdapter（此时 Deps.Solver 已建好）。
+func WithRetryGenerator(fn engineadapter.RetryGenerateFunc) Option {
+	return func(d *usecase.Deps) {
+		if sa, ok := d.Solver.(*engineadapter.SolveAdapter); ok && fn != nil {
+			sa.SetRetryGen(fn)
+		}
+	}
+}
+
 // Wire 装配 K12 运行时。
 //
 // solveSkill 由 composition root 传入（engine.NewSolveSkill(agentExecFn, reg) 的产物，

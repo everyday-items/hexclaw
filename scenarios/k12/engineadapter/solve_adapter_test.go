@@ -149,6 +149,68 @@ func TestSolveAdapter_TrivialArithmeticGoesThroughVerifier(t *testing.T) {
 	}
 }
 
+// countingExec 统计 SolveExecutor.Execute 被调次数——代表「走完整 solve/ReAct 工具循环」的路径。
+type countingExec struct{ calls int }
+
+func (c *countingExec) Execute(_ context.Context, _ map[string]any) (*skill.Result, error) {
+	c.calls++
+	return &skill.Result{Metadata: map[string]string{"solve_verdict": "agree", "solve_evidence": "numeric_exec"}}, nil
+}
+
+// TestSolveAdapter_GenerateSimilar_UsesBareClosure_NotReActExecutor —— BUG-20260712 治本²：
+// 注入轻量出题闭包后，「再练一道」只走裸闭包（对应 main.go 里裸 LLM Complete，不进 ReAct 工具循环），
+// **绝不**落到 SolveExecutor（完整 solve/ReAct 工具链）；且 subject/grade 透传、verdict=unverifiable、
+// 不给强证据（不冒充已程序验算）。
+//
+// RED：若 GenerateSimilar 回退/误走 exec.Execute（ReAct 全链），exec.calls>0 → 失败。
+// GREEN：注入 retryGen 时 exec.calls==0、闭包恰调 1 次、证据为 unverifiable/none。
+func TestSolveAdapter_GenerateSimilar_UsesBareClosure_NotReActExecutor(t *testing.T) {
+	exec := &countingExec{}
+	closureCalls := 0
+	var gotSubject, gotGrade string
+	a := NewSolveAdapter(exec, WithRetryGen(func(_ context.Context, subject, _, grade string) (string, error) {
+		closureCalls++
+		gotSubject, gotGrade = subject, grade
+		return "变式题：3.9×3=? 答案 11.7\n\n```hexclaw-subagents\n[{\"Agent\":\"solver\"}]\n```", nil
+	}))
+
+	sr, err := a.GenerateSimilar(context.Background(), "数学", "据「小数乘法」出一道同类练习", "五年级上")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exec.calls != 0 {
+		t.Fatalf("再练一道不得走 SolveExecutor(ReAct 工具循环), Execute 被调 %d 次", exec.calls)
+	}
+	if closureCalls != 1 {
+		t.Fatalf("应恰调 1 次裸出题闭包, got %d", closureCalls)
+	}
+	if gotSubject != "数学" || gotGrade != "五年级上" {
+		t.Fatalf("subject/grade 未透传: subject=%q grade=%q", gotSubject, gotGrade)
+	}
+	if sr.Evidence.Verdict != usecase.VerdictUnverifiable || sr.Evidence.EvidenceType != usecase.EvidenceNone {
+		t.Fatalf("未验算的练习变式题应 unverifiable/none（不冒充已程序验算), got %+v", sr.Evidence)
+	}
+	if sr.Evidence.StrongTrust() {
+		t.Fatal("练习变式题绝不给强证据")
+	}
+	if sr.Solution != "变式题：3.9×3=? 答案 11.7" {
+		t.Fatalf("解题正文应剥掉回执围栏, got %q", sr.Solution)
+	}
+}
+
+// TestSolveAdapter_GenerateSimilar_NilClosureFallsBackToFullChain —— 未注入闭包时安全回退
+// 全链（SolveSubject → exec），保证正确性不塌。
+func TestSolveAdapter_GenerateSimilar_NilClosureFallsBackToFullChain(t *testing.T) {
+	exec := &countingExec{}
+	a := NewSolveAdapter(exec) // 不注入 retryGen
+	if _, err := a.GenerateSimilar(context.Background(), "数学", "出一道练习", "五年级上"); err != nil {
+		t.Fatal(err)
+	}
+	if exec.calls != 1 {
+		t.Fatalf("nil 闭包应回退全链(SolveSubject→exec), Execute 调用次数 got %d want 1", exec.calls)
+	}
+}
+
 func TestSolveAdapter_SubjectPassThrough(t *testing.T) {
 	exec := &fakeExec{
 		solveResult: &skill.Result{Metadata: map[string]string{"solve_verdict": "agree"}},

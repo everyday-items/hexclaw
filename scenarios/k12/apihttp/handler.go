@@ -54,8 +54,10 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("GET /view-descriptor", h.viewDescriptor)
 	mux.HandleFunc("POST /recognize", h.recognize)
 	mux.HandleFunc("POST /grade", h.grade)
+	mux.HandleFunc("POST /record-mistake", h.recordMistake)
 	mux.HandleFunc("POST /solve", h.solve)
 	mux.HandleFunc("GET /mistakes", h.mistakes)
+	mux.HandleFunc("DELETE /mistakes/{record_id}", h.deleteMistake)
 	mux.HandleFunc("GET /review-queue", h.reviewQueue)
 	mux.HandleFunc("GET /insight-report", h.insightReport)
 	mux.HandleFunc("POST /mark-mastered", h.markMastered)
@@ -166,6 +168,14 @@ type recognizeReq struct {
 	ImageBase64 string `json:"image_base64"`
 }
 
+// bboxDTO 学生作答区域归一化边界框（0~1），随识题一次返回供前端原图叠加批改标记。
+type bboxDTO struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+	W float64 `json:"w"`
+	H float64 `json:"h"`
+}
+
 type recognizedQuestionDTO struct {
 	Question        string   `json:"question"`
 	KnowledgePoints []string `json:"knowledge_points"`
@@ -174,6 +184,9 @@ type recognizedQuestionDTO struct {
 	StudentAnswer string `json:"student_answer"`
 	// Subject 识题自动判定的题目学科（数学/语文/英语/物理/化学，判不出=空）。
 	Subject string `json:"subject,omitempty"`
+	// BBox 学生作答区域归一化边界框（0~1）；null=未定位（前端降级为纯文字批改，不叠加，绝不错位）。
+	// 用 omitempty + 指针：缺失时字段为 null，前端据 null 走降级路径。
+	BBox *bboxDTO `json:"bbox,omitempty"`
 }
 
 // recognize POST /recognize —— 作业图片（base64）→ 结构化题目清单。
@@ -194,7 +207,11 @@ func (h *handler) recognize(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]recognizedQuestionDTO, 0, len(qs))
 	for _, q := range qs {
-		out = append(out, recognizedQuestionDTO{Question: q.Question, KnowledgePoints: q.KnowledgePoints, StudentAnswer: q.StudentAnswer, Subject: q.Subject})
+		dto := recognizedQuestionDTO{Question: q.Question, KnowledgePoints: q.KnowledgePoints, StudentAnswer: q.StudentAnswer, Subject: q.Subject}
+		if q.BBox != nil { // 仅识题回收到合法框时下发；nil → 字段 null，前端降级纯文字批改。
+			dto.BBox = &bboxDTO{X: q.BBox.X, Y: q.BBox.Y, W: q.BBox.W, H: q.BBox.H}
+		}
+		out = append(out, dto)
 	}
 	// 顶层整卷学科：逐题判定后取多数（家长不必手选，前端据此预填学科下拉，仍可手动覆盖）。
 	writeJSON(w, http.StatusOK, map[string]any{"questions": out, "subject": dominantSubject(qs)})
@@ -268,6 +285,44 @@ func (h *handler) grade(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type recordMistakeReq struct {
+	Agent           string   `json:"agent"`
+	Subject         string   `json:"subject"`
+	Grade           string   `json:"grade"`
+	SourceSession   string   `json:"source_session"`
+	Problem         string   `json:"problem"`
+	StudentAnswer   string   `json:"student_answer"`
+	ErrorCause      string   `json:"error_cause"`
+	KnowledgePoints []string `json:"knowledge_points"`
+}
+
+type recordMistakeResp struct {
+	RecordCreated bool   `json:"record_created"`
+	RecordID      string `json:"record_id,omitempty"`
+	ErrorCause    string `json:"error_cause,omitempty"`
+}
+
+// recordMistake POST /record-mistake —— 家长「记一条错题」的**轻量记录路径**（BUG-20260712 治本）。
+// 直接把已知错题入错题本（错因留空时单次轻量归纳），**绝不跑 solve+verify 对抗验算链**（秒级完成）。
+func (h *handler) recordMistake(w http.ResponseWriter, r *http.Request) {
+	var req recordMistakeReq
+	if !decode(w, r, &req) {
+		return
+	}
+	res, err := h.rt.Deps.RecordMistake(r.Context(), usecase.RecordMistakeRequest{
+		AgentName: req.Agent, Subject: req.Subject, Grade: h.resolveGrade(r.Context(), req.Agent, req.Grade),
+		SourceSession: req.SourceSession, Problem: req.Problem, StudentAnswer: req.StudentAnswer,
+		ErrorCause: req.ErrorCause, KnowledgePoints: req.KnowledgePoints,
+	})
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, recordMistakeResp{
+		RecordCreated: res.RecordCreated, RecordID: res.RecordID, ErrorCause: res.ErrorCause,
+	})
+}
+
 type solveReq struct {
 	Agent           string   `json:"agent"`
 	Subject         string   `json:"subject"`
@@ -321,6 +376,24 @@ func (h *handler) mistakes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": toMistakeDTOs(recs)})
+}
+
+// deleteMistake DELETE /mistakes/{record_id}?agent=X —— 家长「删除这条错题」（UX-3 数据纠错）。
+// 校验 agent 归属后删对应记录；record 不存在 / 越权（非本 agent）→ 404。前端在详情弹层内
+// 经二次确认后调用（克制入口，非首屏主动作）。
+func (h *handler) deleteMistake(w http.ResponseWriter, r *http.Request) {
+	agent := r.URL.Query().Get("agent")
+	recordID := r.PathValue("record_id")
+	if agent == "" || recordID == "" {
+		writeErr(w, http.StatusBadRequest, "agent / record_id 必填")
+		return
+	}
+	if err := h.rt.Deps.DeleteMistake(r.Context(), agent, recordID); err != nil {
+		// 归属校验失败 / 记录不存在 → 404；输入错 → 400；其余存储错 → 500。
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // reviewQueue GET /review-queue?agent=X —— 到期该练队列。

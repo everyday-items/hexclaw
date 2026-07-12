@@ -23,17 +23,42 @@ type SolveExecutor interface {
 	Execute(ctx context.Context, args map[string]any) (*skill.Result, error)
 }
 
+// RetryGenerateFunc 是「再练一道」的轻量出题闭包（composition root 注入，BUG-20260712）。
+// 内部走**单个 reasoning 子 Agent**出题+解答——不派 verifier / 不 self-consistency / 不重出，
+// 返回出题正文（含回执围栏，adapter 侧剥离）。nil 时 GenerateSimilar 安全回退全链。
+type RetryGenerateFunc func(ctx context.Context, subject, prompt, grade string) (string, error)
+
 // SolveAdapter 用 engine 的 solve skill 实现用例层的 Solver + Grader 两个 port。
 type SolveAdapter struct {
-	exec SolveExecutor
+	exec     SolveExecutor
+	retryGen RetryGenerateFunc // 轻量「再练一道」出题；nil 时回退全链
 }
 
+// SolveAdapterOption 装配可选能力（保 NewSolveAdapter 单参数向后兼容）。
+type SolveAdapterOption func(*SolveAdapter)
+
+// WithRetryGen 注入轻量出题闭包，让「再练一道」走单次 reasoning、不落全对抗验算链。
+func WithRetryGen(fn RetryGenerateFunc) SolveAdapterOption {
+	return func(a *SolveAdapter) { a.retryGen = fn }
+}
+
+// SetRetryGen 事后注入轻量出题闭包（composition root 在 Deps.Solver 建好后回填）。
+func (a *SolveAdapter) SetRetryGen(fn RetryGenerateFunc) { a.retryGen = fn }
+
 // NewSolveAdapter 创建 adapter。s 通常是 engine.NewSolveSkill(...) 的产物。
-func NewSolveAdapter(s SolveExecutor) *SolveAdapter { return &SolveAdapter{exec: s} }
+func NewSolveAdapter(s SolveExecutor, opts ...SolveAdapterOption) *SolveAdapter {
+	a := &SolveAdapter{exec: s}
+	for _, o := range opts {
+		o(a)
+	}
+	return a
+}
 
 var (
-	_ usecase.Solver = (*SolveAdapter)(nil)
-	_ usecase.Grader = (*SolveAdapter)(nil)
+	_ usecase.Solver          = (*SolveAdapter)(nil)
+	_ usecase.Grader          = (*SolveAdapter)(nil)
+	_ usecase.RetryGenerator  = (*SolveAdapter)(nil)
+	_ usecase.CauseSummarizer = (*SolveAdapter)(nil)
 )
 
 // Solve 实现 usecase.Solver：调 solve skill 解题验算（透传 grade + constraint 约束年级边界），
@@ -69,6 +94,44 @@ func (a *SolveAdapter) SolveSubject(ctx context.Context, subject, problem, grade
 		Solution: stripReports(res.Content),
 		Evidence: evidenceFromMeta(res.Metadata),
 	}, nil
+}
+
+// GenerateSimilar 实现 usecase.RetryGenerator（BUG-20260712 治本「再练一道」轻量出题）：
+// 走单次 reasoning 出题闭包（单个子 Agent，不派 verifier / 不 self-consistency / 不重出），
+// 真机从全对抗链 68s 降到单次调用量级。练习变式题容错高：**不跑 code_exec 程序验算**，
+// 故 verdict=unverifiable、不给强徽章（信任红线：绝不把未验算的练习题冒充「已程序验算」）。
+// 未注入 retryGen 闭包时安全回退全链（SolveSubject），保证正确性不塌。
+func (a *SolveAdapter) GenerateSimilar(ctx context.Context, subject, prompt, grade string) (usecase.SolveResult, error) {
+	if a.retryGen == nil {
+		return a.SolveSubject(ctx, subject, prompt, grade, "")
+	}
+	out, err := a.retryGen(ctx, subject, prompt, grade)
+	if err != nil {
+		return usecase.SolveResult{}, err
+	}
+	return usecase.SolveResult{
+		Solution: stripReports(out),
+		Evidence: usecase.SolveEvidence{Verdict: usecase.VerdictUnverifiable, EvidenceType: usecase.EvidenceNone},
+	}, nil
+}
+
+// SummarizeCause 实现 usecase.CauseSummarizer（BUG-20260712「记一条错题」轻量错因归纳）：
+// 复用已注入的单次 reasoning 出题闭包（retryGen，单个子 Agent），只让它归纳一句话错因，
+// **不派 verifier / 不 self-consistency / 不 code_exec**——家长记的是已知错题，无需判对错。
+// 未注入闭包时返回空串（错因留空由用户填），绝不回退全对抗验算链（否则又变回 1-2 分钟）。
+func (a *SolveAdapter) SummarizeCause(ctx context.Context, subject, question, studentAnswer, grade string) (string, error) {
+	if a.retryGen == nil {
+		return "", nil
+	}
+	prompt := "这道题孩子做错了。用一句话（≤20 字）归纳错因本身，只输出错因、不要解题、不要复述题目。\n题目：" + question
+	if strings.TrimSpace(studentAnswer) != "" {
+		prompt += "\n孩子的答案/错处：" + studentAnswer
+	}
+	out, err := a.retryGen(ctx, subject, prompt, grade)
+	if err != nil {
+		return "", err
+	}
+	return stripReports(out), nil
 }
 
 // Grade 实现 usecase.Grader：solve skill 的 grading 模式内部会重新解题得 ground truth，

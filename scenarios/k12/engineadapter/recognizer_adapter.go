@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 
@@ -25,12 +26,21 @@ func NewRecognizerAdapter(v VisionFunc) *RecognizerAdapter { return &RecognizerA
 
 var _ usecase.Recognizer = (*RecognizerAdapter)(nil)
 
-const recognizePrompt = `识别这张作业图片里的所有题目，并逐题回收孩子的手写作答内容、判定题目学科。严格输出 JSON 数组，每个元素形如：
-{"question": "完整题干", "subject": "数学", "knowledge_points": ["知识点1"], "student_answer": "孩子写在题目上的作答（含算式/答案/涂改）"}
+const recognizePrompt = `识别这张作业图片里的所有题目，并逐题回收孩子的手写作答内容、判定题目学科、定位作答区域。严格输出 JSON 数组，每个元素形如：
+{"question": "完整题干", "subject": "数学", "knowledge_points": ["知识点1"], "student_answer": "孩子写在题目上的作答（含算式/答案/涂改）", "bbox": {"x": 0.12, "y": 0.34, "w": 0.18, "h": 0.05}}
 关键规则：
 - subject 逐题判定题目学科，只能取以下之一：数学 / 语文 / 英语 / 物理 / 化学；确实判不出学科时才留空字符串 ""。
 - student_answer 只如实誊录图中孩子**已经写下**的手写作答；这道题是空白/未作答的，student_answer 必须留空字符串 ""，绝不替孩子编造答案。
+- bbox 是这道题**学生作答区域**在整张图里的归一化边界框，用于在原图上标注对/错：x,y 是框左上角、w,h 是框宽高，四个值都必须是 0 到 1 之间的小数（相对整图宽/高的比例），且 x+w、y+h 不超过 1。定位不准或看不清作答位置时，把 bbox 整个字段省略（宁可不给，绝不给错位的框）。
 - 只输出 JSON，不要任何解释文字。`
+
+// bboxDTO 解析视觉模型返回的归一化边界框。指针字段——视觉模型省略 bbox 时为 nil（降级不叠加）。
+type bboxDTO struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+	W float64 `json:"w"`
+	H float64 `json:"h"`
+}
 
 // recognizedDTO 解析视觉模型 JSON 用（带 json tag）。
 type recognizedDTO struct {
@@ -38,6 +48,7 @@ type recognizedDTO struct {
 	Subject         string   `json:"subject"`
 	KnowledgePoints []string `json:"knowledge_points"`
 	StudentAnswer   string   `json:"student_answer"`
+	BBox            *bboxDTO `json:"bbox"`
 }
 
 // invalidJSONEscape 匹配 JSON 字符串中的非法转义（\x 且 x ∉ "\/bfnrtu）——视觉模型在题干里
@@ -67,6 +78,35 @@ func normalizeRecognizedSubject(s string) string {
 	return ""
 }
 
+// bboxEpsilon 容忍视觉模型归一化时的极小浮点误差（右/下边界略超 1 视为贴边，不算越界）。
+const bboxEpsilon = 0.005
+
+// normalizeBBox 是原图批改的**硬性诚实门**（设计文档 §6）：只放行合法归一化框，其余一律 nil。
+//
+// 合法 = 四值皆非负、x/y 在 [0,1]、w/h 严格 >0、右下角 x+w、y+h 不越界（含极小误差容忍）。
+// 缺失（模型省略）、零框（{0,0,0,0}）、负值、越界、NaN/Inf 全部降级为 nil——
+// 该题走纯文字批改，前端绝不叠加错位红叉（错位比不标更糟）。
+func normalizeBBox(b *bboxDTO) *usecase.BBox {
+	if b == nil {
+		return nil
+	}
+	// NaN/Inf 防护：NaN 的任何比较都为 false，会漏过下面的区间校验，显式拦掉。
+	if math.IsNaN(b.X) || math.IsNaN(b.Y) || math.IsNaN(b.W) || math.IsNaN(b.H) ||
+		math.IsInf(b.X, 0) || math.IsInf(b.Y, 0) || math.IsInf(b.W, 0) || math.IsInf(b.H, 0) {
+		return nil
+	}
+	if b.W <= 0 || b.H <= 0 { // 零/负宽高 → 不是可叠加的框
+		return nil
+	}
+	if b.X < 0 || b.Y < 0 || b.X > 1 || b.Y > 1 { // 左上角出界
+		return nil
+	}
+	if b.X+b.W > 1+bboxEpsilon || b.Y+b.H > 1+bboxEpsilon { // 右下角越界
+		return nil
+	}
+	return &usecase.BBox{X: b.X, Y: b.Y, W: b.W, H: b.H}
+}
+
 // Recognize 识题：调视觉模型 → 解析 JSON → 结构化题目值对象。
 
 func (a *RecognizerAdapter) Recognize(ctx context.Context, image []byte) ([]usecase.RecognizedQuestion, error) {
@@ -94,6 +134,7 @@ func (a *RecognizerAdapter) Recognize(ctx context.Context, image []byte) ([]usec
 			KnowledgePoints: d.KnowledgePoints,
 			StudentAnswer:   strings.TrimSpace(d.StudentAnswer),
 			Subject:         normalizeRecognizedSubject(d.Subject),
+			BBox:            normalizeBBox(d.BBox),
 		})
 	}
 	return out, nil

@@ -119,6 +119,17 @@ func (d Deps) MarkMastered(ctx context.Context, agentName, recordID string, expe
 	return d.Records.UpdateStatusScoped(ctx, agentName, recordID, mastered, nil, expectedVersion)
 }
 
+// DeleteMistake 家长「删除这条错题」（UX-3 · 数据纠错，非逃避难题）：移除记错的 / 重复的条目。
+// 校验 agent 归属后删除对应 agent_records 记录（Store.Delete 内按 agent_name 圈定）——
+// 不存在 / 不属于该实例 → records.ErrNotFound（HTTP 404）。产品评审定案为详情弹层内的克制入口
+// （二次确认），故此处只做归属校验 + 删除，不做任何状态机流转。
+func (d Deps) DeleteMistake(ctx context.Context, agentName, recordID string) error {
+	if agentName == "" || recordID == "" {
+		return fmt.Errorf("%w: agentName / recordID 不可空", ErrInvalidInput)
+	}
+	return d.Records.Delete(ctx, agentName, recordID)
+}
+
 // MasteryGapInterval 掌握判定的最小间隔（秒）：第二次做对距上次 ≥ 此值 → mastered（PRD §5.3.1）。
 const MasteryGapInterval int64 = 3 * 86400 // 3 天
 
@@ -181,8 +192,14 @@ func (d Deps) markRetriedAccum(ctx context.Context, rec *records.AgentRecord, ex
 	return d.Records.UpdateStatusFields(ctx, rec.RecordID, k12.AccumStatusReviewing, &due, string(raw), expectedVersion)
 }
 
-// GenerateRetry 「再练一道」：基于某错题出一道相似题，**必过 solve 验算链**（不合格由 Solver 侧弃用重出）。
+// GenerateRetry 「再练一道」：基于某错题出一道**同知识点相似练习题** + 合理答案。
 // 返回相似题解 + 证据对象；只读，不改错题状态。
+//
+// BUG-20260712 治本（真机 68s → 目标 <10s）：练习变式题非高风险批改，走 RetryGenerator 的
+// **单次 reasoning 出题**，不再复用为批改正确性设计的**全套对抗多智能体链**（变式生成 → solver →
+// verifier → code_exec → self-consistency → 不合格重出）——那套链路重、慢，出练习题用不上。
+// Solver 实现 RetryGenerator 即走轻量口（保 subject 路由 + grade 约束）；只实现 Solver 的
+// 老实现回退全链，向后兼容。
 func (d Deps) GenerateRetry(ctx context.Context, item ReviewItem, grade string) (SolveResult, error) {
 	if err := validateGradeInput(grade); err != nil {
 		return SolveResult{}, err
@@ -191,9 +208,18 @@ func (d Deps) GenerateRetry(ctx context.Context, item ReviewItem, grade string) 
 		return SolveResult{}, fmt.Errorf("usecase: 未配置 Solver")
 	}
 	prompt := fmt.Sprintf("参照这道错题出一道同知识点(%s)的相似题并解答：%s", item.Fields.KnowledgePoint, item.Fields.Question)
+	// 轻量优先：单次出题，不跑全对抗验算链（延迟优先，练习题容错高）。
+	if rg, ok := d.Solver.(RetryGenerator); ok {
+		sr, err := rg.GenerateSimilar(ctx, item.Subject(), prompt, grade)
+		if err != nil {
+			// BUG-2：下游解题执行失败标记为 ErrSolveFailed，HTTP 层据此回 502（非 400）。
+			return SolveResult{}, fmt.Errorf("%w: %v", ErrSolveFailed, err)
+		}
+		return sr, nil
+	}
+	// 回退：老 Solver（未实现轻量出题）仍走全链，保持向后兼容。
 	sr, err := d.solveProblem(ctx, item.Subject(), prompt, grade)
 	if err != nil {
-		// BUG-2：下游解题执行失败标记为 ErrSolveFailed，HTTP 层据此回 502（非 400）。
 		return SolveResult{}, fmt.Errorf("%w: %v", ErrSolveFailed, err)
 	}
 	return sr, nil

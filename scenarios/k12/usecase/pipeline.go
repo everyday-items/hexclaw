@@ -186,6 +186,9 @@ func (d Deps) GradeHomeworkProblem(ctx context.Context, req GradeRequest) (Grade
 	if err != nil {
 		return GradeResult{}, fmt.Errorf("%w: 批改: %w", ErrSolveFailed, err)
 	}
+	// 项-6b：grader 偶发把 verifier 自查过程/评审链原文塞进 misconception → 剥成简洁错因
+	// （家长要的是「错在哪/误区」，不是评审链）。入库 + 返回 + 学情信号统一用清洗后的值。
+	outcome.ErrorCause = sanitizeErrorCause(outcome.ErrorCause)
 	res.Outcome = outcome
 
 	// 4. 答对 → 若同题已在错题本则推进状态（对同题批改为对 → retried，PRD §3.4.4-2 / §5.3.1）。
@@ -230,6 +233,50 @@ func (d Deps) GradeHomeworkProblem(ctx context.Context, req GradeRequest) (Grade
 		}
 	}
 	return res, nil
+}
+
+// sanitizeErrorCause 把 grader 偶发 dump 的 verifier 自查过程/评审链原文剥离，只留简洁错因。
+//
+// 触发点（真机取证）：错因存成「未分析…自查:- 关键条件是否都用到? √…- 推理正确 √…自查通过」这类
+// verifier 的 self-check 全文——家长要的是「错在哪/误区」，不是评审链。治本：①截断到首个自查/评审
+// 标记之前；②逐行去掉核对清单行（含勾叉 √✓✗ 或「是否…」自查问句）；③清尾部结构性分隔符。
+func sanitizeErrorCause(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	// ① 砍掉自查/评审链标记及其后全文。
+	lower := strings.ToLower(s)
+	cut := len(s)
+	for _, m := range []string{"自查", "自我检查", "自我核查", "自检", "评审链", "self-check", "self check"} {
+		if idx := strings.Index(lower, strings.ToLower(m)); idx >= 0 && idx < cut {
+			cut = idx
+		}
+	}
+	s = s[:cut]
+	// ② 逐行剔除核对清单行（勾叉核对符 / 「是否」自查问句），只留真正的错因描述。
+	var kept []string
+	for _, line := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || isSelfCheckLine(t) {
+			continue
+		}
+		kept = append(kept, t)
+	}
+	out := strings.TrimSpace(strings.Join(kept, " "))
+	// ③ 清尾部结构性分隔符（保留句末 。，等语义标点）。
+	return strings.TrimRight(out, "：:·・、;； \t-—")
+}
+
+// isSelfCheckLine 判断某行是否 verifier 的自查核对行（勾叉核对符，或以项目符号起头的「是否」自查问句）。
+func isSelfCheckLine(t string) bool {
+	for _, mark := range []string{"√", "✓", "✔", "✗", "×", "❌", "✅"} {
+		if strings.Contains(t, mark) {
+			return true
+		}
+	}
+	bullet := strings.HasPrefix(t, "-") || strings.HasPrefix(t, "•") || strings.HasPrefix(t, "*")
+	return bullet && strings.Contains(t, "是否")
 }
 
 func isMathSubject(subject string) bool { return subject == "" || subject == "数学" }
