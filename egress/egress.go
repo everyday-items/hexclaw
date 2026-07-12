@@ -15,6 +15,7 @@ type Purpose string
 
 const (
 	PurposeVisionOCR       Purpose = "vision_ocr"         // 图像/OCR 识别
+	PurposeVisionChat      Purpose = "vision_chat"        // 用户主动附图的聊天（图片明确意图发给视觉模型）
 	PurposeSolveVerify     Purpose = "solve_verify"       // 受验证的推理（需程序/工具验证的推理）
 	PurposeGeneralChat     Purpose = "general_chat"       // 通用对话
 	PurposeRAGEmbed        Purpose = "rag_embed"          // 文档向量化
@@ -58,6 +59,7 @@ var sensitiveClasses = map[DataClass]bool{
 
 var knownPurposes = map[Purpose]bool{
 	PurposeVisionOCR:       true,
+	PurposeVisionChat:      true,
 	PurposeSolveVerify:     true,
 	PurposeGeneralChat:     true,
 	PurposeRAGEmbed:        true,
@@ -79,6 +81,10 @@ var knownDataClasses = map[DataClass]bool{
 var purposeAllowsSensitive = map[Purpose]map[DataClass]bool{
 	// 图像识别：敏感媒体（含手写/姓名的图片）必须出网给云端 vision。
 	PurposeVisionOCR: {ClassSensitiveMedia: true},
+	// 用户主动附图聊天：图片是明确意图（发给已配置的视觉模型看），允许上云；且图片只会发给
+	// 视觉能力 provider（shouldRejectImageAttachmentsForProvider 守卫）。仅放行媒体，记忆/档案
+	// /记录等其它敏感类仍走各自红线（与 general_chat 一致）。
+	PurposeVisionChat: {ClassSensitiveMedia: true},
 	// 受验证推理：文本出网给云端强模型；敏感个人档案随请求注入允许。
 	PurposeSolveVerify: {ClassSensitiveProfile: true, ClassSensitiveMedia: true},
 }

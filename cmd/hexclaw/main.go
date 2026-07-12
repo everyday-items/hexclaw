@@ -1402,10 +1402,16 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			if router == nil {
 				return "", fmt.Errorf("未配置视觉模型")
 			}
-			provider, _, rErr := router.Route(ctx)
+			// BUG-20260712：识题用**配置的默认**视觉模型（尊重「设置哪个模型走哪个」），不走
+			// cost-aware（那会抓本地免费 provider、无视用户配的 glm-4v-flash，既慢又曾 404）。
+			provider, visionModel, rErr := eng.RouteForVision(ctx)
 			if rErr != nil {
+				logger.Warn("[k12识题] 视觉模型路由失败", "err", rErr.Error(), "image_bytes", len(image))
 				return "", rErr
 			}
+			// 排查用：打印识题实际选中的 provider/model + egress 用途，一眼定位路由/出网问题。
+			logger.Info("[k12识题] 视觉模型已路由", "provider", provider.Name(), "model", visionModel,
+				"image_bytes", len(image), "egress", "vision_ocr[sensitive_media]")
 			dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(image)
 			resp, cErr := provider.Complete(ctx, hexagon.CompletionRequest{
 				Messages: []hexagon.Message{{
@@ -1417,6 +1423,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				}},
 			})
 			if cErr != nil {
+				logger.Warn("[k12识题] 视觉模型调用失败", "provider", provider.Name(), "model", visionModel, "err", cErr.Error())
 				return "", cErr
 			}
 			return resp.Content, nil

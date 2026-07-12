@@ -64,6 +64,13 @@ func labelMessageEgress(ctx context.Context, msg *adapter.Message) context.Conte
 			return labelMessagePayloadEgress(ctx, msg)
 		}
 	}
+	// BUG-20260712-d：用户主动附带图片 → vision_chat 用途（白名单允许 sensitive_media 上云给
+	// 已配置的视觉模型）。图片是明确意图、且只会发给视觉能力 provider（下游 shouldReject 守卫），
+	// 一律按 general_chat 拦死等于让「配了云端视觉模型的拍照辅导」彻底不可用（钉钉/桌面真机症状）。
+	// 纯文本聊天仍走 general_chat 严格红线。
+	if msg != nil && len(adapter.FilterImageAttachments(msg.Attachments)) > 0 {
+		purpose = egress.PurposeVisionChat
+	}
 	auditID := ""
 	if msg != nil {
 		auditID = messageRequestID(msg)
@@ -3890,6 +3897,24 @@ func (e *ReActEngine) resolveLLMSelection(ctx context.Context, msg *adapter.Mess
 		modelName:        modelName,
 		explicitProvider: providerHint != "",
 	}, nil
+}
+
+// RouteForVision 为识题/视觉任务选 provider+model：用**配置的默认 provider**（尊重「设置哪个模型
+// 走哪个模型」），而非 cost-aware 路由。BUG-20260712：桌面识题（K12 拍照识题）此前走 router.Route
+// → cost-aware 抓本地免费 provider，无视用户为视觉配的云端模型（glm-4v-flash），既慢又曾因本地
+// 模型指向未安装的 qwen2.5:3b 而 404。默认缺失时才退回常规路由兜底。
+func (e *ReActEngine) RouteForVision(ctx context.Context) (hexagon.Provider, string, error) {
+	e.mu.RLock()
+	router := e.router
+	e.mu.RUnlock()
+	if router == nil {
+		return nil, "", fmt.Errorf("没有可用的 LLM Provider")
+	}
+	if p := router.Default(); p != nil {
+		name := router.DefaultName()
+		return p, router.ProviderModel(name), nil
+	}
+	return router.Route(ctx)
 }
 
 func requestedProvider(metadata map[string]string) string {
