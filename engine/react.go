@@ -3918,6 +3918,13 @@ func applyAgentConfigToMetadata(metadata map[string]string, cfg *agentrouter.Age
 }
 
 func (e *ReActEngine) resolveLLMSelection(ctx context.Context, msg *adapter.Message) (llmSelection, error) {
+	// BUG-20260712-#1：解题/批改(solve 源)的 solver/verifier 子 Agent 用配置的**强文本推理模型**，
+	// 不用视觉默认模型——glm-4v-flash 擅长看图却不擅长多步文本解题 + 写验证代码，会把错答案判成
+	// unverifiable 漏判、错题入不了库。配了 reasoning_model 就走它；未配则沿用默认路由(无回归)。
+	if sel, ok := e.reasoningSelectionForSolve(msg); ok {
+		return sel, nil
+	}
+
 	providerHint := requestedProvider(msg.Metadata)
 	provider, providerName, err := e.resolveProvider(ctx, providerHint, msg)
 	if err != nil {
@@ -3935,6 +3942,44 @@ func (e *ReActEngine) resolveLLMSelection(ctx context.Context, msg *adapter.Mess
 		modelName:        modelName,
 		explicitProvider: providerHint != "",
 	}, nil
+}
+
+// reasoningSelectionForSolve 为 solve 源（solver/verifier）选配置的强文本推理模型。
+// 用户显式下发 provider/model 时不覆盖（尊重显式契约）；未配 reasoning_provider 时返回 false 走默认路由。
+func (e *ReActEngine) reasoningSelectionForSolve(msg *adapter.Message) (llmSelection, bool) {
+	if msg == nil || msg.Metadata == nil || msg.Metadata["source"] != solveDispatchSource {
+		return llmSelection{}, false
+	}
+	if requestedProvider(msg.Metadata) != "" || requestedModel(msg.Metadata) != "" {
+		return llmSelection{}, false // 显式指定则尊重，不覆盖
+	}
+	prov := strings.TrimSpace(e.cfg.LLM.ReasoningProvider)
+	if prov == "" {
+		return llmSelection{}, false
+	}
+	e.mu.RLock()
+	router := e.router
+	e.mu.RUnlock()
+	if router == nil {
+		return llmSelection{}, false
+	}
+	provider, ok := router.Get(prov)
+	if !ok || provider == nil {
+		return llmSelection{}, false
+	}
+	model := strings.TrimSpace(e.cfg.LLM.ReasoningModel)
+	if model == "" {
+		model = router.ProviderModel(prov)
+	}
+	if model != "" {
+		provider = &modelOverrideProvider{inner: provider, model: model}
+	}
+	return llmSelection{
+		provider:         provider,
+		providerName:     prov,
+		modelName:        model,
+		explicitProvider: true, // 配置的推理模型视作显式 pin，不被 cost-aware 改派回视觉模型
+	}, true
 }
 
 // RouteForVision 为识题/视觉任务选 provider+model：用**配置的默认 provider**（尊重「设置哪个模型

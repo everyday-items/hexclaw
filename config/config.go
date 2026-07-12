@@ -302,6 +302,12 @@ type LLMConfig struct {
 	Routing   LLMRoutingConfig             `yaml:"routing"`   // 智能路由
 	Cache     LLMCacheConfig               `yaml:"cache"`     // 语义缓存
 	Tools     LLMToolsConfig               `yaml:"tools"`     // 工具注入（全局）
+	// ReasoningProvider/Model 解题/批改等「多步文本推理 + 工具验证」任务专用的强文本模型
+	// （BUG-20260712-#1）。视觉默认模型（如 glm-4v-flash）擅长看图却不擅长多步数学推理与写
+	// 验证代码，会把错答案判成 unverifiable 漏判。配上强文本模型（如 智谱/glm-4.5）后，solve
+	// 源的 solver/verifier 子 Agent 走它；空=沿用默认路由（不改变现状，无回归）。
+	ReasoningProvider string `yaml:"reasoning_provider,omitempty" json:"reasoning_provider,omitempty"`
+	ReasoningModel    string `yaml:"reasoning_model,omitempty" json:"reasoning_model,omitempty"`
 }
 
 // LLMToolsConfig 工具注入全局配置
