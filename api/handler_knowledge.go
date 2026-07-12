@@ -3,7 +3,9 @@ package api
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,10 +13,29 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/knowledge"
 )
+
+// knowledgeUploadProcessTimeout 限定上传文档「解析(pdftotext/VLM)+向量嵌入」处理阶段的
+// 最长耗时。扫描件/超大 PDF 的提取或嵌入可能长时间无产出，无界等待会让前端字节传完后
+// 永远停在「100%」等不到响应（BUG-20260712 #8「卡 100% 不动」根因）。var 便于测试压小
+// 值验证超时分支。
+var knowledgeUploadProcessTimeout = 5 * time.Minute
+
+// uploadProcessTimedOut 判定上传处理是否命中有界超时（区别于普通解析/入库失败）。
+func uploadProcessTimedOut(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.DeadlineExceeded)
+}
+
+// writeUploadTimeout 回超时响应：504 + 可操作提示，不再让用户对着「100%」干等。
+func writeUploadTimeout(w http.ResponseWriter) {
+	writeJSON(w, http.StatusGatewayTimeout, map[string]string{
+		"error": "文档处理超时；扫描件/超大文件请配置视觉模型 后重试，或改用文本 / 可复制文字的 PDF",
+	})
+}
 
 // --- 知识库 API ---
 
@@ -122,8 +143,18 @@ func (s *Server) handleUploadDocument(w http.ResponseWriter, r *http.Request) {
 	}
 
 	title := strings.TrimSuffix(header.Filename, ext)
-	extracted, err := extractDocumentForKnowledge(r.Context(), ext, data, s.kb)
+
+	// BUG-20260712 #8：解析(pdftotext/VLM)+向量嵌入阶段套有界超时，扫描件/超大文件不再
+	// 无限挂起（前端字节传完却永远等不到响应=「卡 100% 不动」根因）。超时给可操作提示。
+	ctx, cancel := context.WithTimeout(r.Context(), knowledgeUploadProcessTimeout)
+	defer cancel()
+
+	extracted, err := extractDocumentForKnowledge(ctx, ext, data, s.kb)
 	if err != nil {
+		if uploadProcessTimedOut(ctx) {
+			writeUploadTimeout(w)
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "解析文件失败: " + err.Error(),
 		})
@@ -142,8 +173,12 @@ func (s *Server) handleUploadDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	doc, err := s.kb.AddDocument(r.Context(), title, extracted.Text, "upload:"+header.Filename)
+	doc, err := s.kb.AddDocument(ctx, title, extracted.Text, "upload:"+header.Filename)
 	if err != nil {
+		if uploadProcessTimedOut(ctx) {
+			writeUploadTimeout(w)
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "添加文档失败: " + err.Error(),
 		})
