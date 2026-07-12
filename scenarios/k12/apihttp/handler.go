@@ -54,6 +54,7 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("GET /view-descriptor", h.viewDescriptor)
 	mux.HandleFunc("POST /recognize", h.recognize)
 	mux.HandleFunc("POST /grade", h.grade)
+	mux.HandleFunc("POST /solve", h.solve)
 	mux.HandleFunc("GET /mistakes", h.mistakes)
 	mux.HandleFunc("GET /review-queue", h.reviewQueue)
 	mux.HandleFunc("GET /insight-report", h.insightReport)
@@ -110,6 +111,9 @@ type gradeResp struct {
 	OutOfScopeKP  string `json:"out_of_scope_kp,omitempty"`
 	RecordCreated bool   `json:"record_created"`
 	RecordID      string `json:"record_id,omitempty"`
+	// SolveOnly=true 表示本次 student_answer 为空，内部转「解题」分叉（非批改）：
+	// 只返回 solution，correct/record 无意义。前端应按解题口径呈现，不显示对/错。
+	SolveOnly bool `json:"solve_only"`
 }
 
 type mistakeDTO struct {
@@ -165,6 +169,11 @@ type recognizeReq struct {
 type recognizedQuestionDTO struct {
 	Question        string   `json:"question"`
 	KnowledgePoints []string `json:"knowledge_points"`
+	// StudentAnswer 识题回收的孩子手写作答（未作答=空串）。前端据此区分空白题(走 /solve 求解)
+	// 与已答题(走 /grade 批改)，家长可在回显门修改。
+	StudentAnswer string `json:"student_answer"`
+	// Subject 识题自动判定的题目学科（数学/语文/英语/物理/化学，判不出=空）。
+	Subject string `json:"subject,omitempty"`
 }
 
 // recognize POST /recognize —— 作业图片（base64）→ 结构化题目清单。
@@ -185,9 +194,32 @@ func (h *handler) recognize(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]recognizedQuestionDTO, 0, len(qs))
 	for _, q := range qs {
-		out = append(out, recognizedQuestionDTO{Question: q.Question, KnowledgePoints: q.KnowledgePoints})
+		out = append(out, recognizedQuestionDTO{Question: q.Question, KnowledgePoints: q.KnowledgePoints, StudentAnswer: q.StudentAnswer, Subject: q.Subject})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"questions": out})
+	// 顶层整卷学科：逐题判定后取多数（家长不必手选，前端据此预填学科下拉，仍可手动覆盖）。
+	writeJSON(w, http.StatusOK, map[string]any{"questions": out, "subject": dominantSubject(qs)})
+}
+
+// dominantSubject 取识题逐题学科里出现最多的那一个作为整卷学科（平票取先出现者，全空则空）。
+func dominantSubject(qs []usecase.RecognizedQuestion) string {
+	count := map[string]int{}
+	var order []string
+	for _, q := range qs {
+		if q.Subject == "" {
+			continue
+		}
+		if _, seen := count[q.Subject]; !seen {
+			order = append(order, q.Subject)
+		}
+		count[q.Subject]++
+	}
+	best := ""
+	for _, s := range order {
+		if best == "" || count[s] > count[best] {
+			best = s
+		}
+	}
+	return best
 }
 
 // resolveGrade 年级确定性注入（AP-4 / PRD §3.3.3+§5.2.4）：未显式传年级时据 agent 从孩子档案
@@ -232,6 +264,47 @@ func (h *handler) grade(w http.ResponseWriter, r *http.Request) {
 		Correct: res.Outcome.Correct, WrongStep: res.Outcome.WrongStep, ErrorCause: res.Outcome.ErrorCause,
 		OutOfScope: res.OutOfScope, OutOfScopeKP: res.OutOfScopeKP,
 		RecordCreated: res.RecordCreated, RecordID: res.RecordID,
+		SolveOnly: res.SolveOnly,
+	})
+}
+
+type solveReq struct {
+	Agent           string   `json:"agent"`
+	Subject         string   `json:"subject"`
+	Grade           string   `json:"grade"`
+	Problem         string   `json:"problem"`
+	KnowledgePoints []string `json:"knowledge_points"`
+}
+
+type solveResp struct {
+	Solution     string `json:"solution"`
+	Verdict      string `json:"verdict"`
+	EvidenceType string `json:"evidence_type"`
+	Badge        string `json:"badge"`
+	OutOfScope   bool   `json:"out_of_scope"`
+	OutOfScopeKP string `json:"out_of_scope_kp,omitempty"`
+}
+
+// solve POST /solve —— 空白/未作答题求解：给解法+答案+讲解，**不批改、不入错题本**。
+// 与 /grade 的分工是单一真相源的显式落地：空白题走此端点，不要求填 student_answer。
+func (h *handler) solve(w http.ResponseWriter, r *http.Request) {
+	var req solveReq
+	if !decode(w, r, &req) {
+		return
+	}
+	res, err := h.rt.Deps.SolveHomeworkProblem(r.Context(), usecase.GradeRequest{
+		AgentName: req.Agent, Subject: req.Subject,
+		Grade:   h.resolveGrade(r.Context(), req.Agent, req.Grade),
+		Problem: req.Problem, KnowledgePoints: req.KnowledgePoints,
+	})
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, solveResp{
+		Solution: res.Solution, Verdict: string(res.Evidence.Verdict),
+		EvidenceType: string(res.Evidence.EvidenceType), Badge: res.Evidence.Badge(),
+		OutOfScope: res.OutOfScope, OutOfScopeKP: res.OutOfScopeKP,
 	})
 }
 

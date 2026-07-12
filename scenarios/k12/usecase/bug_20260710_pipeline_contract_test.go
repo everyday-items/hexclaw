@@ -68,7 +68,8 @@ func TestGradeHomeworkProblem_DownstreamFailuresAreTyped(t *testing.T) {
 	})
 	t.Run("grader", func(t *testing.T) {
 		d, _ := newPipeline(t, fakeSolver{}, failingGrader{}, nil)
-		_, err := d.GradeHomeworkProblem(context.Background(), GradeRequest{AgentName: "mingming", Grade: "五年级上", Problem: "1+1"})
+		// 已答题（StudentAnswer 非空）才走批改路径——单一真相源分叉后，空作答走解题不触 grader。
+		_, err := d.GradeHomeworkProblem(context.Background(), GradeRequest{AgentName: "mingming", Grade: "五年级上", Problem: "1+1", StudentAnswer: "3"})
 		if !errors.Is(err, ErrSolveFailed) {
 			t.Fatalf("grader err=%v want ErrSolveFailed", err)
 		}
@@ -114,7 +115,7 @@ func TestGradeHomeworkProblem_RecognizedKnowledgePointWinsAndReturns(t *testing.
 		Correct: false, KnowledgePoint: "模型幻觉知识点", ErrorCause: "计算失误",
 	}}, nil)
 	res, err := d.GradeHomeworkProblem(context.Background(), GradeRequest{
-		AgentName: "mingming", Grade: "五年级上", SourceSession: "kp", Problem: "3.8x3", KnowledgePoints: []string{"小数乘法"},
+		AgentName: "mingming", Grade: "五年级上", SourceSession: "kp", Problem: "3.8x3", StudentAnswer: "10.4", KnowledgePoints: []string{"小数乘法"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -136,7 +137,7 @@ func TestGradeHomeworkProblem_PersistsSubjectForCrossSubjectReview(t *testing.T)
 	d, _ := newPipeline(t, fakeSolver{}, fakeGrader{outcome: GradeOutcome{Correct: false, ErrorCause: "单位错误"}}, nil)
 	res, err := d.GradeHomeworkProblem(context.Background(), GradeRequest{
 		AgentName: "mingming", Subject: "物理", Grade: "初二上", SourceSession: "physics",
-		Problem: "速度是多少", KnowledgePoints: []string{"速度"},
+		Problem: "速度是多少", StudentAnswer: "20m/s", KnowledgePoints: []string{"速度"},
 	})
 	if err != nil {
 		t.Fatal(err)

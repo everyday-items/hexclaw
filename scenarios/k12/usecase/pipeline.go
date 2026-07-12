@@ -59,6 +59,66 @@ type GradeResult struct {
 	OutOfScopeKP  string // 触发超纲的知识点
 	RecordCreated bool   // 是否新入库错题（幂等去重后）
 	RecordID      string
+	// SolveOnly 标识本次是**空白题解题**分叉（student_answer 为空）：只给解法+答案+讲解，
+	// 不批改、不写 grade_correct、不入错题本、不写学情。呈现层据此走「解题」而非「批改」口径。
+	SolveOnly bool
+}
+
+// SolveResult2 解题分叉结果（空白题只求解，不批改）。
+// 复用证据对象体系，但不产 GradeOutcome / 不入库。
+type SolveHomeworkResult struct {
+	Solution     string
+	Evidence     SolveEvidence
+	OutOfScope   bool
+	OutOfScopeKP string
+}
+
+// SolveHomeworkProblem 解一道**空白/未作答**题（单一真相源的「空白卷」分叉）：
+//
+//	年级校验（超纲→反问，不解题）→ 解题验算（证据对象）→ 返回解法+答案+讲解。
+//
+// 与 GradeHomeworkProblem 的本质区别：**不批改、不产 grade_correct、不入错题本、不写学情**。
+// 空白题没有学生答案可批改，硬走批改路径会让底层要 grade_correct 而 502（治本前的 P0 根因）。
+func (d Deps) SolveHomeworkProblem(ctx context.Context, req GradeRequest) (SolveHomeworkResult, error) {
+	if req.AgentName == "" || req.Problem == "" {
+		return SolveHomeworkResult{}, fmt.Errorf("%w: AgentName / Problem 不可空", ErrInvalidInput)
+	}
+	if err := validateGradeInput(req.Grade); err != nil {
+		return SolveHomeworkResult{}, err
+	}
+	subject, err := normalizeSubject(req.Subject)
+	if err != nil {
+		return SolveHomeworkResult{}, err
+	}
+	req.Subject = subject
+
+	// 年级校验（倒查超纲）：与批改同一红线——超纲则反问不解题（避免教超纲解法）。
+	if oos, kp := d.outOfScope(ctx, req); oos {
+		return SolveHomeworkResult{
+			OutOfScope:   true,
+			OutOfScopeKP: kp,
+			Evidence:     SolveEvidence{Verdict: VerdictOutOfScope, EvidenceType: EvidenceNone},
+		}, nil
+	}
+
+	sr, err := d.solveProblem(ctx, req.Subject, req.Problem, req.Grade)
+	if err != nil {
+		return SolveHomeworkResult{}, fmt.Errorf("%w: 解题: %w", ErrSolveFailed, err)
+	}
+	return SolveHomeworkResult{Solution: sr.Solution, Evidence: sr.Evidence}, nil
+}
+
+// outOfScope 倒查超纲：任一知识点首学年级晚于生效年级 = 错发（数学硬边界）。
+func (d Deps) outOfScope(ctx context.Context, req GradeRequest) (bool, string) {
+	if d.Constraint == nil || !isMathSubject(req.Subject) {
+		return false, ""
+	}
+	for _, kp := range req.KnowledgePoints {
+		if fg, ok := d.Constraint.FirstGrade(ctx, kp); ok && k12.IsBeyond(req.Grade, fg) {
+			return true, kp
+		}
+	}
+	return false, ""
 }
 
 // GradeHomeworkProblem 批改一道作业题的完整闭环：
@@ -80,20 +140,33 @@ func (d Deps) GradeHomeworkProblem(ctx context.Context, req GradeRequest) (Grade
 	}
 	req.Subject = subject
 
-	// 1. 年级校验（倒查超纲）：任一知识点首学年级晚于生效年级 = 错发，反问不批改。
-	if d.Constraint != nil && isMathSubject(req.Subject) {
-		for _, kp := range req.KnowledgePoints {
-			if fg, ok := d.Constraint.FirstGrade(ctx, kp); ok && k12.IsBeyond(req.Grade, fg) {
-				return GradeResult{
-					OutOfScope:   true,
-					OutOfScopeKP: kp,
-					Evidence: SolveEvidence{
-						Verdict:      VerdictOutOfScope,
-						EvidenceType: EvidenceNone,
-					},
-				}, nil
-			}
+	// 0. 单一真相源显式分叉（治本，PRD §3.3）：student_answer 为空 = **空白/未作答题** →
+	//    只解题给答案讲解（不批改、不入错题本），而非硬走批改路径让底层缺 grade_correct 而 502。
+	//    判定从 solve.go 的隐式空串上移为领域层显式决策（此处即测试锚点）。
+	if strings.TrimSpace(req.StudentAnswer) == "" {
+		sr, err := d.SolveHomeworkProblem(ctx, req)
+		if err != nil {
+			return GradeResult{}, err
 		}
+		return GradeResult{
+			Solution:     sr.Solution,
+			Evidence:     sr.Evidence,
+			OutOfScope:   sr.OutOfScope,
+			OutOfScopeKP: sr.OutOfScopeKP,
+			SolveOnly:    true,
+		}, nil
+	}
+
+	// 1. 年级校验（倒查超纲）：任一知识点首学年级晚于生效年级 = 错发，反问不批改。
+	if oos, kp := d.outOfScope(ctx, req); oos {
+		return GradeResult{
+			OutOfScope:   true,
+			OutOfScopeKP: kp,
+			Evidence: SolveEvidence{
+				Verdict:      VerdictOutOfScope,
+				EvidenceType: EvidenceNone,
+			},
+		}, nil
 	}
 
 	// 2. 解题验算（受年级约束）→ 解 + 证据对象。

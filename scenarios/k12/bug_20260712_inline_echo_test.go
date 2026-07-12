@@ -36,6 +36,19 @@ func TestHomeworkChecker_InlineEchoContract(t *testing.T) {
 		}
 	}
 
+	// BUG-20260712 Polish-1：回显作业表头时「姓名」取档案里孩子的称呼，不留空、不编造。
+	// 真机现象：微信识题回显 `姓名：(空)`——印刷作业「姓名：___」是留白行，模型照抄成空。
+	headerName := map[string]string{
+		"姓名":             "缺作业表头姓名回显指令",
+		"k12.child_name": "姓名应取档案 k12.child_name 里孩子的称呼",
+		"绝不编造别的名字":       "姓名护栏须禁止编造别的名字",
+	}
+	for sub, why := range headerName {
+		if !strings.Contains(body, sub) {
+			t.Errorf("作业表头姓名回显契约缺失「%s」：%s", sub, why)
+		}
+	}
+
 	// 不得回退：阻塞式两轮门的措辞（识别完先不解题、等家长确认读得对后才进入）已弃。
 	mustNotContain := map[string]string{
 		"先不解题": "不得回退到「识别完先不解题」的阻塞式两轮门（IM 往返代价高）",

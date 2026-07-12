@@ -2,8 +2,10 @@ package engineadapter
 
 import (
 	"context"
+	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
@@ -105,6 +107,45 @@ func TestSolveAdapter_GradeRejectsMissingOrInvalidCorrectMetadata(t *testing.T) 
 				t.Fatal("missing/invalid grade_correct must fail closed")
 			}
 		})
+	}
+}
+
+// TestSolveAdapter_TrivialArithmeticGoesThroughVerifier 用**真 solve skill**（非 canned Result）
+// 端到端证明：像 4.5×2= 这样的可执行简单题，K12 /solve 分叉必须走 verifier code_exec 精算，
+// 拿到 agree + numeric_exec 强证据，而非被 solve 的 trivial-skip triage 判成 unverifiable（BUG-20260712）。
+//
+// RED（fix 前）：SolveSubject 不传 self_consistency → engine triage 认定 4.5×2= 为 trivial → skipVerify
+// → verifier 从不被调用、verdict=skipped → 本层归一 unverifiable、弱证据。断言失败。
+// GREEN（fix 后）：SolveSubject 显式传 self_consistency=1 关掉 triage → verifier 真跑 → agree/numeric_exec。
+func TestSolveAdapter_TrivialArithmeticGoesThroughVerifier(t *testing.T) {
+	verifierCalled := false
+	execFn := func(_ context.Context, spec engine.SubAgentSpec) (engine.SubAgentResult, error) {
+		switch spec.Agent {
+		case "solver":
+			return engine.SubAgentResult{Output: "4.5 × 2 = 9\n答案：9"}, nil
+		case "verifier":
+			verifierCalled = true
+			return engine.SubAgentResult{Output: "VERDICT: AGREE\nCOMPUTED: 9\n说明：一致。"}, nil
+		}
+		return engine.SubAgentResult{}, nil
+	}
+	a := NewSolveAdapter(engine.NewSolveSkill(execFn, nil))
+
+	sr, err := a.Solve(context.Background(), "4.5×2=", "五年级上", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verifierCalled {
+		t.Fatal("可执行简单题应走 verifier code_exec 精算，实际未调用 verifier（被 trivial-skip triage 跳过）")
+	}
+	if sr.Evidence.Verdict != usecase.VerdictAgree {
+		t.Errorf("4.5×2= 应 verdict=agree，got %q", sr.Evidence.Verdict)
+	}
+	if sr.Evidence.EvidenceType != usecase.EvidenceNumericExec || !sr.Evidence.StrongTrust() {
+		t.Errorf("code_exec 精算相等应为 numeric_exec 强证据（verified-strong），got %+v", sr.Evidence)
+	}
+	if !strings.Contains(sr.Solution, "9") {
+		t.Errorf("解题正文应含最终答案 9，got %q", sr.Solution)
 	}
 }
 

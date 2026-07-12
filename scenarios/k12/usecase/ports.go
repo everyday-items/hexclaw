@@ -24,6 +24,13 @@ type Renderer interface {
 type RecognizedQuestion struct {
 	Question        string
 	KnowledgePoints []string
+	// StudentAnswer 识题时视觉模型逐题回收的孩子**手写作答**内容（未作答留空）。
+	// 这是「空白卷 vs 已答卷」的单一真相源：空=空白题→走解题（SolveHomeworkProblem），
+	// 非空=已答题→走批改（GradeHomeworkProblem）。绝不由 LLM 编造，未辨认出留空字符串。
+	StudentAnswer string
+	// Subject 识题时视觉模型逐题自动判定的学科（数学/语文/英语/物理/化学）；判不出留空。
+	// 家长不必手选学科——前端据此预填学科下拉（仍可手动覆盖），solve/批改不再 gate 在手选上。
+	Subject string
 }
 
 // Recognizer 拍题识别 port（adapter = OCR + 云端 vision，出网走 egress 白名单）。

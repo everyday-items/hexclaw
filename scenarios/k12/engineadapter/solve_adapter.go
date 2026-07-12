@@ -44,7 +44,11 @@ func (a *SolveAdapter) Solve(ctx context.Context, problem, grade, constraint str
 
 // SolveSubject 与 Solve 相同，并把显式学科传给 solve skill，避免非数学 eval/批改落入默认数学路由。
 func (a *SolveAdapter) SolveSubject(ctx context.Context, subject, problem, grade, constraint string) (usecase.SolveResult, error) {
-	args := map[string]any{"problem": problem}
+	// K12 作业辅导：正确性优先于延迟——显式传 self_consistency=1 关掉 solve 的「简单题跳过验算」triage
+	// （engine/solve.go 的 skipVerify：trivial 纯算术直接作答、verdict=skipped→本层归一 unverifiable）。
+	// 显式传参即视为调用方接管 triage，可执行题（如 4.5×2=）照常走 verifier code_exec 精算，
+	// 拿到 agree + numeric_exec 强证据（badge=已程序验算），而非规划式 unverifiable（BUG-20260712 真机取证）。
+	args := map[string]any{"problem": problem, "self_consistency": 1}
 	if subject != "" {
 		args["subject"] = subject
 	}

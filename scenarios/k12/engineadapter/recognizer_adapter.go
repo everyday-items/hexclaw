@@ -25,14 +25,19 @@ func NewRecognizerAdapter(v VisionFunc) *RecognizerAdapter { return &RecognizerA
 
 var _ usecase.Recognizer = (*RecognizerAdapter)(nil)
 
-const recognizePrompt = `识别这张作业图片里的所有题目。严格输出 JSON 数组，每个元素形如：
-{"question": "完整题干", "knowledge_points": ["知识点1"]}
-只输出 JSON，不要任何解释文字。`
+const recognizePrompt = `识别这张作业图片里的所有题目，并逐题回收孩子的手写作答内容、判定题目学科。严格输出 JSON 数组，每个元素形如：
+{"question": "完整题干", "subject": "数学", "knowledge_points": ["知识点1"], "student_answer": "孩子写在题目上的作答（含算式/答案/涂改）"}
+关键规则：
+- subject 逐题判定题目学科，只能取以下之一：数学 / 语文 / 英语 / 物理 / 化学；确实判不出学科时才留空字符串 ""。
+- student_answer 只如实誊录图中孩子**已经写下**的手写作答；这道题是空白/未作答的，student_answer 必须留空字符串 ""，绝不替孩子编造答案。
+- 只输出 JSON，不要任何解释文字。`
 
 // recognizedDTO 解析视觉模型 JSON 用（带 json tag）。
 type recognizedDTO struct {
 	Question        string   `json:"question"`
+	Subject         string   `json:"subject"`
 	KnowledgePoints []string `json:"knowledge_points"`
+	StudentAnswer   string   `json:"student_answer"`
 }
 
 // invalidJSONEscape 匹配 JSON 字符串中的非法转义（\x 且 x ∉ "\/bfnrtu）——视觉模型在题干里
@@ -45,6 +50,21 @@ var invalidJSONEscape = regexp.MustCompile(`\\([^"\\/bfnrtu])`)
 func sanitizeModelJSON(s string) string {
 	s = adapter.NormalizeMathText(s)
 	return invalidJSONEscape.ReplaceAllString(s, `\\$1`)
+}
+
+// recognizedSubjects 是识题允许回填的学科白名单——视觉模型判定越界（返回未知词/编造）时归零，
+// 避免脏学科流入 solve/批改路由（与 usecase.normalizeSubject 的领域约束对齐）。
+var recognizedSubjects = map[string]struct{}{
+	"数学": {}, "语文": {}, "英语": {}, "物理": {}, "化学": {},
+}
+
+// normalizeRecognizedSubject 只放行白名单内学科，其余（含空/未知）归一为空字符串。
+func normalizeRecognizedSubject(s string) string {
+	s = strings.TrimSpace(s)
+	if _, ok := recognizedSubjects[s]; ok {
+		return s
+	}
+	return ""
 }
 
 // Recognize 识题：调视觉模型 → 解析 JSON → 结构化题目值对象。
@@ -69,7 +89,12 @@ func (a *RecognizerAdapter) Recognize(ctx context.Context, image []byte) ([]usec
 		if strings.TrimSpace(d.Question) == "" {
 			continue
 		}
-		out = append(out, usecase.RecognizedQuestion{Question: d.Question, KnowledgePoints: d.KnowledgePoints})
+		out = append(out, usecase.RecognizedQuestion{
+			Question:        d.Question,
+			KnowledgePoints: d.KnowledgePoints,
+			StudentAnswer:   strings.TrimSpace(d.StudentAnswer),
+			Subject:         normalizeRecognizedSubject(d.Subject),
+		})
 	}
 	return out, nil
 }

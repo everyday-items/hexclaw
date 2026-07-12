@@ -32,25 +32,25 @@ func NewGradeSkill(deps usecase.Deps) *GradeSkill {
 func (s *GradeSkill) Name() string      { return "k12_grade" }
 func (s *GradeSkill) Match(string) bool { return false } // 只经 LLM 工具调用，不走关键词快路
 func (s *GradeSkill) Description() string {
-	return "批改孩子的一道作业题：独立解题验算后指出第一个错步与错因，判错自动记入错题本。"
+	return "处理孩子的一道作业题：已作答则批改（指出第一个错步与错因，判错自动入错题本）；空白/未作答则求解给完整解法与讲解（不批改、不入库）。空白题请把 student_answer 留空，绝不编造。"
 }
 
 func (s *GradeSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition("k12_grade",
-		"Grade ONE of the child's homework problems and silently log wrong ones to the mistake book. "+
-			"Independently solves & verifies, then compares the child's answer: on error, names the FIRST wrong step + error cause + a guiding hint (no direct answer). "+
-			"Use when a parent shares the child's written answer to a math problem. The child instance is resolved automatically — do NOT pass an agent id.",
+		"Handle ONE of the child's homework problems. If the child HAS written an answer, pass it as student_answer to GRADE it (independently solves & verifies, names the FIRST wrong step + error cause + a guiding hint, and silently logs wrong ones to the mistake book). "+
+			"If the problem is BLANK / UNANSWERED, LEAVE student_answer EMPTY — the tool will SOLVE it and return the full solution + answer + explanation (no grading, nothing logged). NEVER fabricate a student_answer. "+
+			"The child instance is resolved automatically — do NOT pass an agent id.",
 		&llm.Schema{
 			Type: "object",
 			Properties: map[string]*llm.Schema{
 				"problem":          {Type: "string", Description: "The problem statement."},
-				"student_answer":   {Type: "string", Description: "The child's submitted answer or worked steps."},
+				"student_answer":   {Type: "string", Description: "The child's submitted answer or worked steps. LEAVE EMPTY for blank/unanswered problems — do NOT invent one; empty means 'solve & explain' instead of 'grade'."},
 				"subject":          {Type: "string", Description: "Optional explicit subject: 数学/语文/英语/物理/化学."},
 				"grade":            {Type: "string", Description: "Optional. Effective grade term (e.g. 五年级上); left empty resolves from the child's profile."},
 				"knowledge_points": {Type: "array", Items: &llm.Schema{Type: "string"}, Description: "Optional knowledge points from recognition."},
 				"source_session":   {Type: "string", Description: "Optional source session/chat id for mistake dedup."},
 			},
-			Required: []string{"problem", "student_answer"},
+			Required: []string{"problem"},
 		})
 }
 
@@ -97,10 +97,17 @@ func (s *GradeSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 	}, nil
 }
 
-// renderGradeContent 面向家长/LLM 的批改文本（含入库提示条）。
+// renderGradeContent 面向家长/LLM 的批改/解题文本（含入库提示条）。
 func renderGradeContent(res usecase.GradeResult) string {
 	if res.OutOfScope {
 		return fmt.Sprintf("这道题涉及【%s】，超出孩子当前年级的进度——先确认是不是他的题，或按档案年级讲。", res.OutOfScopeKP)
+	}
+	// 空白/未作答题：解题分叉，给完整解法与讲解，不评对错、不提入库。
+	if res.SolveOnly {
+		if strings.TrimSpace(res.Solution) == "" {
+			return "这道题孩子还没作答。可以先让他试着写一写，再拍给我；需要的话我也能直接讲解法。"
+		}
+		return fmt.Sprintf("这道题孩子还没作答，先把解法和答案讲清楚：\n%s\n给家长的引导：让孩子照着思路自己再做一遍。", res.Solution)
 	}
 	var b strings.Builder
 	if res.Outcome.Correct {
