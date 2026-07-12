@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
@@ -163,9 +164,10 @@ func (a *SolveAdapter) GradeSubject(ctx context.Context, subject, problem, stude
 		return usecase.GradeOutcome{}, fmt.Errorf("solve adapter: invalid grade_correct %q: %w", raw, err)
 	}
 	return usecase.GradeOutcome{
-		Correct:    correct,
-		WrongStep:  m["grade_wrong_step"],
-		ErrorCause: m["grade_misconception"],
+		Correct: correct,
+		// 错步/错因也可能含模型 LaTeX（\times/\frac/\(…\)）——桌面直接展示，统一归一为 Unicode。
+		WrongStep:  adapter.NormalizeMathText(m["grade_wrong_step"]),
+		ErrorCause: adapter.NormalizeMathText(m["grade_misconception"]),
 		// KnowledgePoint 由识题/课标决定，不来自 grader；用例层从识题结果回填。
 	}, nil
 }
@@ -196,10 +198,14 @@ func evidenceFromMeta(m map[string]string) usecase.SolveEvidence {
 	return ev
 }
 
-// stripReports 剥掉解题文本尾部的子 Agent 回执围栏，只留教学解题正文。
+// stripReports 是 K12 解答文本出站的单一归一化 chokepoint（solve/grade 讲解/再练/prep-card/错因归纳都过它）：
+//  1. 剥掉解题文本尾部的子 Agent 回执围栏，只留教学解题正文；
+//  2. 数学 LaTeX → Unicode（adapter.NormalizeMathText：\times→× / \frac{a}{b}→a/b / \text{cm}^3→cm³ /
+//     剥 \(…\)\[…\]$…$）。治本 BUG-20260713：桌面 API 路径不经 IM egress，此前原样漏 LaTeX 给前端。
+//     幂等——IM egress 出站再归一化一次无害。
 func stripReports(content string) string {
 	if i := strings.Index(content, reportSentinel); i >= 0 {
-		return strings.TrimSpace(content[:i])
+		content = content[:i]
 	}
-	return strings.TrimSpace(content)
+	return adapter.NormalizeMathText(strings.TrimSpace(content))
 }

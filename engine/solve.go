@@ -439,6 +439,7 @@ func buildGraderPrompt(problem, solution, groundTruth, studentAnswer string) str
 正确答案：%s
 学生的答案：%s
 
+数学一律用 Unicode 符号（×÷√≤≥、分数 a/b、平方 x²、下标 H₂O、单位 cm³），**禁止 LaTeX**（不要 \times \frac \text{} ^{} $…$）。
 严格按以下格式输出（四行）：
 CORRECT: yes 或 no
 WRONG_STEP: <若错，第一个出错的步骤；答对则留空>
@@ -558,7 +559,8 @@ func buildSolverPrompt(problem, subject, method, grade, constraint string) strin
 要求：
 1. 分步推导，关键步骤说明依据；涉及计算时可调用 code_exec 写代码精确计算（别口算硬凑）。
 2. 解法务必控制在上面「学习阶段/允许范围」之内——宁可用更朴素但学过的方法，也不要为了简便用超纲方法。
-3. 最后单独用一行给出最终答案，格式严格为：答案：<最终答案>`, subjectLine, gradeLine, constraintLine, problem, methodLine)
+3. 数学一律用 Unicode 符号书写（×÷√≤≥≠、分数写 a/b、平方写 x²、下标写 H₂O、单位直接写 cm³），**禁止输出 LaTeX**（不要 \times \div \frac \text{} ^{} 也不要 $…$、\(…\)、\[…\] 定界符）。
+4. 最后单独用一行给出最终答案，格式严格为：答案：<最终答案>`, subjectLine, gradeLine, constraintLine, problem, methodLine)
 }
 
 func buildVerifierPrompt(problem, candidate, constraint string) string {
