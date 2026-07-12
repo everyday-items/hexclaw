@@ -78,8 +78,8 @@ func (e *ReActEngine) buildLongTermMemoryBlock(ctx context.Context, role, query 
 	// 预算分配：常驻先占（已 bounded ≤ residentBudgetRunes），事实填至总预算。
 	var b strings.Builder
 	used := 0
-	var recalledFactIDs []string // 缺陷F：被真正注入的检索层事实 = 一次召回
-	var injected []recall.Entry  // U9：真正进入注入块的记忆条目 → 结构化命中回传前端
+	var recalledFactIDs []string    // 缺陷F：被真正注入的检索层事实 = 一次召回
+	var recalledHits []recall.Entry // U9：**按相关性召回**并注入的条目 → 结构化命中回传前端
 	write := func(entries []recall.Entry, trackRecall bool) {
 		for _, en := range entries {
 			line := "- " + strings.TrimSpace(en.Content)
@@ -89,18 +89,20 @@ func (e *ReActEngine) buildLongTermMemoryBlock(ctx context.Context, role, query 
 			}
 			b.WriteString(line + "\n")
 			used += cost
-			injected = append(injected, en)
-			if trackRecall && en.ID != "" {
-				recalledFactIDs = append(recalledFactIDs, en.ID)
+			if trackRecall {
+				recalledHits = append(recalledHits, en)
+				if en.ID != "" {
+					recalledFactIDs = append(recalledFactIDs, en.ID)
+				}
 			}
 		}
 	}
 	write(resident, false) // 常驻恒注入，不计入「按相关性被召回」的频次信号
 	write(ranked, true)
 
-	// U9：把真正注入本轮的记忆条目记入命中 sink（与「标签显示的记忆命中」同源），
-	// 供 finalize/Reply 回传前端渲染「记忆命中」标签+详情。
-	recordMemoryHits(ctx, role, injected)
+	// U9：只把**检索层真命中**记入命中 sink（BUG-20260712-L：「记忆命中」语义=按相关性召回；
+	// 常驻层（pinned/rule/preference）是恒注入不是命中——pinned 垃圾对着 1+1 显示命中卡纯属误导）。
+	recordMemoryHits(ctx, role, recalledHits)
 
 	// 缺陷F：query 驱动的真召回里被注入的事实 → 自增 HitCount，复活行为 importance/晋升/做梦保护反馈环。
 	// 空 query（每轮 dump）不计：那不是「因相关被召回」，避免频次被无意义灌水。best-effort、不阻断。
@@ -160,8 +162,11 @@ func (e *ReActEngine) rankFacts(ctx context.Context, facts []recall.Entry, query
 	if src.embedAttempted {
 		e.recordMemEmbedOutcome(src.embedErr == nil)
 	}
+	// BUG-20260712-L：空结果不再兜底原样返回——配合 recall 零证据剔除后，空=真无相关，
+	// 把全部 facts 原样注入等于「1+1 也召回大大阿达」（真机取证）。注入是增强，空即是空；
+	// err 同理（对相关性一无所知时注入全量=噪音），不阻断聊天只是不注入检索层。
 	if err != nil || len(results) == 0 {
-		return facts // 失败兜底：原样返回（注入是增强，绝不阻断）
+		return nil
 	}
 	out := make([]recall.Entry, len(results))
 	for i, res := range results {

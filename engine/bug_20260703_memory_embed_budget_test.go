@@ -53,9 +53,10 @@ func (c *countingErrEmbedder) Embed(_ context.Context, _ []string) ([][]float32,
 }
 
 func budgetTestFacts() []recall.Entry {
-	// 内容与测试 query 零字面重叠 → BM25=0 → 0.3 地板砍空 → 触发 fallback 路径。
+	// m-1 与测试 query 有字面重叠（软降级 BM25 后仍有证据可召回）；m-2/m-3 零证据
+	// （BUG-20260712-L 起零证据不注入，故不再用「全零重叠」fixture 断言非空）。
 	return []recall.Entry{
-		factEntry("m-1", "alpha"),
+		factEntry("m-1", "预算 alpha"),
 		factEntry("m-2", "beta"),
 		factEntry("m-3", "gamma"),
 	}
@@ -75,7 +76,7 @@ func TestRankFacts_SlowEmbedderBoundedByBudget(t *testing.T) {
 		t.Fatalf("BUG-20260703①: 慢 embedder 拖垮召回，rankFacts 耗时 %v（应受预算约束 <5s，软降级 BM25）", elapsed)
 	}
 	if len(got) == 0 {
-		t.Fatal("软降级后应原样返回事实（注入是增强，绝不阻断）")
+		t.Fatal("软降级后有词法证据的事实应仍可召回（预算约束不等于失聪）")
 	}
 }
 

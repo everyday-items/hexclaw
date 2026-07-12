@@ -96,7 +96,9 @@ func TestAudit_MemoryInjectedWhenEmptyAtAttach_20260623(t *testing.T) {
 		t.Fatalf("写入记忆失败: %v", err)
 	}
 
-	msgs := eng.buildStreamMessages(context.Background(), "", nil, "", "我刚才告诉你的是什么", nil, nil)
+	// query 与新增记忆词法相关（BUG-20260712-L 起零相关检索层不注入——本测试意图是
+	// 「挂载后新增可见」，不是「无关也注入」）。
+	msgs := eng.buildStreamMessages(context.Background(), "", nil, "", "会话中新增的记忆是什么", nil, nil)
 	if !strings.Contains(msgs[len(msgs)-1].Content, marker) {
 		t.Errorf("BUG#3a: 挂载后新增的记忆未被注入：%q", marker)
 	}

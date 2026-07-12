@@ -28,10 +28,12 @@ func engineWithFileMem(t *testing.T, fm *memory.FileMemory) *ReActEngine {
 	return e
 }
 
-// 检索层按三维打分排序：与 query 相关的事实排在不相关填充之前（旧代码保文件顺序，无排序）。
+// 检索层按相关性选择性注入（BUG-20260712-L 更新）：与 query 相关的事实注入；
+// 零证据（词法零重叠+无向量）不再当「填充」注入——旧「无关也填充」正是
+// 「问 1+1 命中大大阿达」的根源。
 func TestScoredInjection_RanksRelevantFirst(t *testing.T) {
 	fm := newFileMem(t, 200)
-	// 写入顺序：无关在前，相关在中 —— 旧代码会保持此顺序。
+	// 写入顺序：无关在前，相关在中。
 	mustSave(t, fm, "用户养了一只橘猫", "fact")
 	mustSave(t, fm, "用户喜欢深色主题界面", "fact")
 	mustSave(t, fm, "用户住在杭州西湖区", "fact")
@@ -41,14 +43,11 @@ func TestScoredInjection_RanksRelevantFirst(t *testing.T) {
 	if block == "" {
 		t.Fatal("应注入长期记忆块")
 	}
-	rel := strings.Index(block, "深色主题")
-	cat := strings.Index(block, "橘猫")
-	hz := strings.Index(block, "西湖")
-	if rel < 0 || cat < 0 || hz < 0 {
-		t.Fatalf("三条都应在预算内注入: %q", block)
+	if !strings.Contains(block, "深色主题") {
+		t.Fatalf("相关事实应被注入: %q", block)
 	}
-	if !(rel < cat && rel < hz) {
-		t.Fatalf("相关事实应按打分排在不相关填充之前: rel=%d cat=%d hz=%d\n%s", rel, cat, hz, block)
+	if strings.Contains(block, "橘猫") || strings.Contains(block, "西湖") {
+		t.Fatalf("零证据事实不得再当填充注入（BUG-20260712-L）: %q", block)
 	}
 }
 

@@ -918,8 +918,14 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 	candidates := m.fuse(resultMap, rankedLists)
 
 	// 4. 相关度地板（#3）：宽召回模式带放宽回退；注入模式 fail-closed（B8）。
-	// 严格语义仅在向量路真实跑通时可用（否则退回宽召回，避免降级态 RAG 全盲）。
-	candidates = m.applyMinScore(candidates, strictFloor && vectorRouteRan)
+	// BUG-20260712-I：降级态（embedder 未配置 / Embed 失败超时 → 向量路未跑通）不再把
+	// 注入模式放宽成宽召回——没有语义证据即返回空。BM25 是结果集内 min-max 归一分，
+	// 「最佳垃圾恒 1.0」不构成相关性证据（真机取证：天气 query 注入《Go面试题》，相关度 0-2%
+	// 照样端给模型+前端命中卡）。「避免降级态 RAG 全盲」只属于显式检索（Search*）语义。
+	if strictFloor && !vectorRouteRan {
+		return nil, nil
+	}
+	candidates = m.applyMinScore(candidates, strictFloor)
 
 	// 5. 宽召回 → 重排 → 收窄（#6）；无 LLM/关闭时回退 MMR 多样性选取
 	return m.rerankTopK(ctx, query, candidates, topK), nil

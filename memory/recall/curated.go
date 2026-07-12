@@ -145,6 +145,12 @@ func (r *CuratedRetriever) Retrieve(ctx context.Context, userID, role, query str
 	out := make([]Result, 0, len(filtered))
 	for _, c := range filtered {
 		rel := relevance(c, anyVector)
+		// 零证据剔除（BUG-20260712-L）：rel=0 = 词法零重叠且无向量证据 = 「无相关」而非
+		// 「低相关」，不受 MinScore=0（关地板）豁免——真机取证：问 1+1 召回「大大阿达」。
+		// rel>0 的低分候选不受影响（S2「花生酱→花生过敏」场景由 MinScore 语义管）。
+		if rel <= 0 {
+			continue
+		}
 		if rel < r.MinScore { // 绝对阈值砍低相关，防误召污染
 			continue
 		}

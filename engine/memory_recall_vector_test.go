@@ -129,10 +129,14 @@ func TestRankFacts_VectorFlipsBM25Ranking(t *testing.T) {
 
 	query := "周末想去海边城市度假"
 
-	// 关 embedder（纯 BM25）：字面重叠(周末)的干扰应排在海景事实之前。
+	// 关 embedder（纯 BM25）：字面重叠(周末)的干扰可召回；海景事实词法零重叠且无向量
+	// = 零证据，被剔除（BUG-20260712-L——旧行为「零证据也注入排后」已废除）。
 	blockBM25 := eng.buildLongTermMemoryBlock(context.Background(), "", query)
-	if !(strings.Index(blockBM25, "团建") < strings.Index(blockBM25, "海景")) {
-		t.Fatalf("纯 BM25 下字面重叠干扰应在前:\n%s", blockBM25)
+	if !strings.Contains(blockBM25, "团建") {
+		t.Fatalf("纯 BM25 下字面重叠候选应可召回:\n%s", blockBM25)
+	}
+	if strings.Contains(blockBM25, "海景") {
+		t.Fatalf("纯 BM25 下零证据候选应被剔除（BUG-20260712-L）:\n%s", blockBM25)
 	}
 
 	// 开 embedder（hybrid + 相关性地板）：语义相关的海景事实应被召回到前面；
@@ -148,15 +152,25 @@ func TestRankFacts_VectorFlipsBM25Ranking(t *testing.T) {
 	}
 }
 
-// 回归锁（真机 S2 bug）：相关性地板绝不砍到空——所有事实都低于地板时，退回不设地板、仍召回，不漏召到空。
+// 回归锁（真机 S2 bug · BUG-20260712-L 修订）：地板不得把**有证据**（词法/语义 rel>0）的
+// 候选砍到空——S2 真机场景（花生酱→花生过敏，词法重叠低分）仍受保护；
+// 但**零证据**（cos=0 且字面零重叠）候选按新契约剔除、允许为空——旧「绝不为空」
+// 绝对主义正是「问 1+1 召回大大阿达」的根源。
 func TestRankFacts_FloorNeverEmpties(t *testing.T) {
 	fm := newFileMem(t, 200)
 	mustSave(t, fm, "用户在三亚买了海景房", "fact") // 海滨轴
 	eng := engineWithFileMem(t, fm)
 	eng.SetMemoryEmbedder(&topicEmbedder{}) // 配 embedder → 地板 0.3 生效
-	// query 落「山野」轴，与唯一事实「海滨」cosine=0、字面零重叠 → relevance≈0 < 地板 → 本会砍到空。
-	block := eng.buildLongTermMemoryBlock(context.Background(), "", "周末去爬山登山团建")
-	if !strings.Contains(block, "海景") {
-		t.Fatalf("🔴 相关性地板砍到空（真机 S2 回归）：唯一事实被地板滤掉、召回为空。地板不该砍到空。\n%q", block)
+
+	// ① 有词法证据（「海景」重叠）但向量跨轴低分 → 地板放宽回退救回，不砍空（真 S2 语义）。
+	blockEvidence := eng.buildLongTermMemoryBlock(context.Background(), "", "海景房现在什么行情")
+	if !strings.Contains(blockEvidence, "海景") {
+		t.Fatalf("🔴 有证据候选被地板砍到空（S2 回归）：\n%q", blockEvidence)
+	}
+
+	// ② 零证据（山野轴 query：cos=0 + 字面零重叠）→ 为空是正确行为（宁缺勿滥）。
+	blockZero := eng.buildLongTermMemoryBlock(context.Background(), "", "周末去爬山登山团建")
+	if strings.Contains(blockZero, "海景") {
+		t.Fatalf("零证据候选不得注入（BUG-20260712-L）：\n%q", blockZero)
 	}
 }

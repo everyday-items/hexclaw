@@ -26,7 +26,9 @@ func TestBuildTurnContext_SkipsCrossSessionMemoryOnCloud(t *testing.T) {
 		if err != nil {
 			t.Fatalf("创建 FileMemory 失败: %v", err)
 		}
-		if err := fm.SaveMemory("跨会话事实：" + marker); err != nil {
+		// identity=常驻层恒注入（BUG-20260712-L 起检索层零相关不注入；本测试意图是 locality
+		// 门控，不依赖相关性召回）。
+		if err := fm.SaveStructuredEntry("跨会话事实："+marker, "identity", "manual", "", memory.EntryMeta{}); err != nil {
 			t.Fatalf("写入记忆失败: %v", err)
 		}
 		eng.SetFileMemory(fm)

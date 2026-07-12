@@ -108,7 +108,9 @@ func TestManager_AddAndQuery(t *testing.T) {
 	}
 }
 
-// TestManager_AddAndQuery_NoEmbedder 测试无 Embedder 时退化为关键词搜索
+// TestManager_AddAndQuery_NoEmbedder：无 Embedder 时的双路径契约（BUG-20260712-I 更新）。
+// 旧契约「注入路径退化关键词搜索」已废除——注入无语义证据即空（宁缺勿滥，B8 延伸到降级态）；
+// 关键词退化只保留在显式检索（Search*，用户看得到相关度自行判断）。
 func TestManager_AddAndQuery_NoEmbedder(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
@@ -124,12 +126,21 @@ func TestManager_AddAndQuery_NoEmbedder(t *testing.T) {
 		t.Fatalf("添加文档失败: %v", err)
 	}
 
-	result, err := mgr.Query(ctx, "Python 编程", 3)
+	// 注入路径：无向量证据 → fail-closed 返回空（BM25 归一分不构成相关性证据）
+	injected, err := mgr.Query(ctx, "Python 编程", 3)
 	if err != nil {
 		t.Fatalf("查询失败: %v", err)
 	}
-	if result == "" {
-		t.Fatal("关键词搜索结果不应为空")
+	if injected != "" {
+		t.Fatalf("无 embedder 时注入路径应 fail-closed 为空，got %q", injected)
+	}
+	// 显式检索路径：关键词退化仍可用
+	hits, err := mgr.SearchWithFilter(ctx, "Python 编程", 3, Filter{})
+	if err != nil {
+		t.Fatalf("显式检索失败: %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("显式检索的关键词退化不应为空")
 	}
 }
 
@@ -153,12 +164,14 @@ func TestManager_AddDocumentFallsBackToTextIndexWhenEmbeddingFails(t *testing.T)
 		t.Fatal("降级写入后 chunk 数不应为 0")
 	}
 
-	result, err := mgr.Query(ctx, "FTS5 文本检索", 3)
+	// 降级写入后经**显式检索**可查（BUG-20260712-I：注入路径无向量证据 fail-closed，
+	// 关键词退化只保留在 Search* 显式语义）
+	hits, err := mgr.SearchWithFilter(ctx, "FTS5 文本检索", 3, Filter{})
 	if err != nil {
 		t.Fatalf("降级写入后的文本检索不应失败: %v", err)
 	}
-	if result == "" {
-		t.Fatal("降级写入后应可通过关键词检索到文档")
+	if len(hits) == 0 {
+		t.Fatal("降级写入后应可通过显式关键词检索到文档")
 	}
 }
 

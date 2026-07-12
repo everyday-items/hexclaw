@@ -307,12 +307,21 @@ func TestBug20260611_CronDispatchKnowledgeIngestClosedLoop(t *testing.T) {
 	if len(hits) == 0 {
 		t.Errorf("[BUG-20260611] ingested content is not retrievable via text search")
 	}
+	// BUG-20260712-I 契约更新：无 embedder（无语义证据）时聊天自动注入 fail-closed 为空，
+	// 用户可见的读路径 = 显式检索（宽召回，上面 TextSearch 已断言）。这里锁双语义：
 	kbResult, err := kbMgr.Query(ctx, "chip production ramp-up", 3)
 	if err != nil {
 		t.Fatalf("knowledge Query failed: %v", err)
 	}
-	if !strings.Contains(kbResult, "chip production") {
-		t.Errorf("[BUG-20260611] knowledge Query should surface the ingested content, got %q", kbResult)
+	if kbResult != "" {
+		t.Errorf("[BUG-20260712-I] 无 embedder 时注入路径应 fail-closed 为空, got %q", kbResult)
+	}
+	explicitHits, err := kbMgr.SearchWithFilter(ctx, "chip production ramp-up", 3, knowledge.Filter{})
+	if err != nil {
+		t.Fatalf("knowledge Search failed: %v", err)
+	}
+	if len(explicitHits) == 0 {
+		t.Errorf("[BUG-20260611] ingested content must be retrievable via explicit search")
 	}
 }
 
