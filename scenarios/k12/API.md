@@ -159,7 +159,9 @@
 
 ## 3. 关键流程
 
-- **识题回显护栏**：`recognize` → 前端展示识别结果让家长确认/纠正 → 确认后逐题 `grade`（带该题 `knowledge_points` + profile 的 `grade`）。
+- **识题回显护栏**（分渠道两种形态，同一信任链目标）：
+  - **桌面**：交互门——`recognize` → 前端 `RecognizeGuardPanel` 展示识别结果让家长确认/纠正 → 确认后逐题 `grade`（带该题 `knowledge_points` + profile 的 `grade`）。
+  - **IM（钉钉/微信）**：内联回显——`homework-checker` skill 在解答**同一条消息**开头先列「我读到的题目」抬头再给整页解答，不阻塞等确认（IM 多轮往返代价高）；`[?]` 不确定字符点名请确认、确认前该题不下批改结论。出站经 `NormalizeMathText` 把 LaTeX 降级为 Unicode 数学符号（钉钉 markdown 不渲染 LaTeX）。
 - **建档**：实例（agent）先经平台 Agent 创建，再 `PUT /profile` 写 K12 档案（落 `k12.child_name`/`k12.grade_term`/`k12.textbook_edition` metadata 键，不覆盖其他 metadata）。
 - **导出 PDF**：`format=pdf` 需服务器装 pandoc；未装则降级 markdown JSON — 前端要判断响应是二进制还是 `{content}`。
 
