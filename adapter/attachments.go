@@ -75,9 +75,17 @@ func BuildUserMessage(content string, attachments []Attachment) hexagon.Message 
 	return BuildMultimodalUserMessage(content, imageAttachments)
 }
 
+// imageOnlyDefaultInstruction 图片-only 消息的默认意图指令（BUG-20260712-Q，真机取证·钉钉）：
+// 用户只发作业照片不带文字时，裸图无指令会让模型自由发挥（自我介绍/寒暄）——补一条中性
+// 默认指令让模型直接处理图片内容；用户带了文字则绝不叠加。
+const imageOnlyDefaultInstruction = "请查看这张图片并给出有帮助的回应：如果是题目或作业，请直接解题；如果图里已有作答，请批改并指出错误；其他内容则说明要点。"
+
 // BuildMultimodalUserMessage 构建包含图片的多模态用户消息。
 func BuildMultimodalUserMessage(text string, images []Attachment) hexagon.Message {
 	parts := make([]llm.ContentPart, 0, 1+len(images))
+	if text == "" && len(images) > 0 {
+		text = imageOnlyDefaultInstruction
+	}
 	if text != "" {
 		parts = append(parts, llm.NewTextPart(text))
 	}

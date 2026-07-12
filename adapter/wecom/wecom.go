@@ -402,6 +402,8 @@ func (a *WecomAdapter) getAccessToken(ctx context.Context) (string, error) {
 
 // sendTextMessage 发送文本消息
 func (a *WecomAdapter) sendTextMessage(ctx context.Context, toUser, content string) error {
+	// LaTeX 数学降级（BUG-20260712-P）：企微 text 不渲染 LaTeX，出站前转 Unicode 符号。
+	content = adapter.NormalizeMathText(content)
 	token, err := a.getAccessToken(ctx)
 	if err != nil {
 		return err

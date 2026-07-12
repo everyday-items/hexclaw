@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
+	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
@@ -33,7 +35,20 @@ type recognizedDTO struct {
 	KnowledgePoints []string `json:"knowledge_points"`
 }
 
+// invalidJSONEscape 匹配 JSON 字符串中的非法转义（\x 且 x ∉ "\/bfnrtu）——视觉模型在题干里
+// 输出 LaTeX（\div 等）时 \d 会让 json.Unmarshal 直接失败（BUG-20260712-U 真机取证）。
+var invalidJSONEscape = regexp.MustCompile(`\\([^"\\/bfnrtu])`)
+
+// sanitizeModelJSON 让模型产出的 JSON 可安全解析：
+//  1. 数学命令降级（复用 adapter.NormalizeMathText：\times→× 等，题干顺带变家长可读）；
+//  2. 剩余非法转义加倍（\x → \\x），未知反斜杠永不再炸解析。
+func sanitizeModelJSON(s string) string {
+	s = adapter.NormalizeMathText(s)
+	return invalidJSONEscape.ReplaceAllString(s, `\\$1`)
+}
+
 // Recognize 识题：调视觉模型 → 解析 JSON → 结构化题目值对象。
+
 func (a *RecognizerAdapter) Recognize(ctx context.Context, image []byte) ([]usecase.RecognizedQuestion, error) {
 	if a.vision == nil {
 		return nil, fmt.Errorf("recognizer: 未配置视觉模型")
@@ -46,7 +61,7 @@ func (a *RecognizerAdapter) Recognize(ctx context.Context, image []byte) ([]usec
 		return nil, fmt.Errorf("recognizer: 视觉模型调用失败: %w", err)
 	}
 	var dtos []recognizedDTO
-	if err := json.Unmarshal([]byte(extractJSON(raw)), &dtos); err != nil {
+	if err := json.Unmarshal([]byte(sanitizeModelJSON(extractJSON(raw))), &dtos); err != nil {
 		return nil, fmt.Errorf("recognizer: 解析识题结果失败: %w（原始: %.120s）", err, raw)
 	}
 	out := make([]usecase.RecognizedQuestion, 0, len(dtos))

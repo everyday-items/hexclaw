@@ -174,7 +174,8 @@ func (a *WechatAdapter) sendReplyNow(ctx context.Context, chatID string, reply *
 	if reply == nil {
 		return nil
 	}
-	return a.sendCustomMessage(ctx, chatID, reply.Content)
+	// LaTeX 数学降级（BUG-20260712-P）：微信纯文本不渲染 LaTeX，出站前转 Unicode 符号。
+	return a.sendCustomMessage(ctx, chatID, adapter.NormalizeMathText(reply.Content))
 }
 
 // SendStream 流式发送（微信不支持消息编辑，合并后发送）
@@ -314,7 +315,7 @@ func (a *WechatAdapter) handleMessage(w http.ResponseWriter, r *http.Request) {
 		}
 		if reply != nil {
 			select {
-			case replyCh <- reply.Content:
+			case replyCh <- adapter.NormalizeMathText(reply.Content): // 被动回复同样降级（BUG-20260712-P）
 			default:
 			}
 		}

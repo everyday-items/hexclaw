@@ -2,6 +2,7 @@ package engineadapter
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/knowledge"
@@ -86,5 +87,25 @@ func TestRecognizerAdapter(t *testing.T) {
 	// 空图片报错
 	if _, err := NewRecognizerAdapter(vision).Recognize(context.Background(), nil); err == nil {
 		t.Error("空图片应报错")
+	}
+}
+
+// BUG-20260712-U（真实点击 E2E 取证）：视觉模型在 JSON 字符串里输出 LaTeX 反斜杠命令，
+// `\d`（\div）/`\t`（\times 的前缀）是非法/错义 JSON 转义 → json.Unmarshal 直接失败：
+// 「invalid character 'd' in string escape code」→ 识题整体报错。
+// 修复：解析前做数学符号降级（复用 adapter.NormalizeMathText，\times→× 等）+
+// 剩余非法转义兜底加倍（\x → \\x），模型输出的反斜杠永远不再炸解析。
+func TestBug20260712_RecognizeParsesLatexEscapes(t *testing.T) {
+	raw := "```json\n[ { \"question\": \"(4.5 \\times 2 = 9)\", \"knowledge_points\": [\"乘法运算\"] }, { \"question\": \"(4.5 \\div 0.01 = 450)\", \"knowledge_points\": [\"除法运算\"] } ]\n```"
+	a := NewRecognizerAdapter(func(context.Context, []byte, string) (string, error) { return raw, nil })
+	qs, err := a.Recognize(context.Background(), []byte{1})
+	if err != nil {
+		t.Fatalf("LaTeX 反斜杠不得炸解析（真机取证 invalid character 'd' in string escape）: %v", err)
+	}
+	if len(qs) != 2 {
+		t.Fatalf("应识出 2 题, got %d", len(qs))
+	}
+	if !strings.Contains(qs[0].Question, "×") || !strings.Contains(qs[1].Question, "÷") {
+		t.Fatalf("题干应降级为 Unicode 数学符号: %q / %q", qs[0].Question, qs[1].Question)
 	}
 }

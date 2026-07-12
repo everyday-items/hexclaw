@@ -586,13 +586,16 @@ const dingtalkEmptyReplyFallback = "⚠️ 本次没有生成有效内容，请�
 // 首个非空行派生（有兜底），text 同理：正文为空/纯空白时用兜底文案，绝不产出空 text
 // （BUG-20260704，与 title 兜底对称，使非法载荷在构造点即不可表达）。
 func dingtalkMarkdownMessage(content string) dingtalkOutboundMessage {
-	text := content
+	// LaTeX 数学降级（BUG-20260712-P，真机取证：解题回复「( 4.5 \times 2 = 9 )」原样漏给
+	// 钉钉用户）：sampleMarkdown 渲染 markdown 子集但**不渲染 LaTeX**，出站前确定性转
+	// Unicode 数学符号（×÷≤≥√ 等），不靠 prompt 恳求模型改写法。
+	text := adapter.NormalizeMathText(content)
 	if strings.TrimSpace(text) == "" {
 		text = dingtalkEmptyReplyFallback
 	}
 	return dingtalkOutboundMessage{
 		MsgKey:   "sampleMarkdown",
-		MsgParam: marshalMarkdownContent(dingtalkMessageTitle(content), text),
+		MsgParam: marshalMarkdownContent(dingtalkMessageTitle(text), text),
 	}
 }
 

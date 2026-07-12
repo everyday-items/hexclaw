@@ -668,3 +668,16 @@ func TestStopNoConnection(t *testing.T) {
 		t.Errorf("Stop 不应报错: %v", err)
 	}
 }
+
+// BUG-20260712-P 接线锁（真机取证·钉钉解题回复）：sampleMarkdown 出站必须做 LaTeX 数学降级，
+// title/text 双字段都不得漏 \times 之类命令给用户。
+func TestBug20260712_MarkdownMessageNormalizesLatexMath(t *testing.T) {
+	msg := dingtalkMarkdownMessage(`( 4.5 \times 2 = 9 )` + "\n" + `( 4.5 \div 0.01 = 450 )`)
+	payload := string(msg.MsgParam)
+	if strings.Contains(payload, `\\times`) || strings.Contains(payload, `\\div`) {
+		t.Fatalf("LaTeX 命令漏给钉钉用户：%s", payload)
+	}
+	if !strings.Contains(payload, "×") || !strings.Contains(payload, "÷") {
+		t.Fatalf("应转换为 Unicode 数学符号：%s", payload)
+	}
+}
