@@ -1448,8 +1448,18 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			// 排查用：打印识题实际选中的 provider/model + egress 用途，一眼定位路由/出网问题。
 			logger.Info("[k12识题] 视觉模型已路由", "provider", provider.Name(), "model", visionModel,
 				"image_bytes", len(image), "egress", "vision_ocr[sensitive_media]")
-			dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(image)
-			resp, cErr := provider.Complete(ctx, hexagon.CompletionRequest{
+			// mime 按魔数探测（BUG-20260712-T2：此前硬编码 png，jpeg 图打错标）；
+			// 识题输出=全量题目 JSON，加输出上限 + 150s 预算防上游挂死拖住前端。
+			mime := http.DetectContentType(image)
+			if !strings.HasPrefix(mime, "image/") {
+				mime = "image/png"
+			}
+			dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
+			vctx, vcancel := context.WithTimeout(ctx, 150*time.Second)
+			defer vcancel()
+			// 不设 MaxTokens：各家视觉模型上限差异大（glm-4v-flash 硬顶 1024，设 4096 即 400），
+			// 任何硬编码都会在某家翻车/截断——输出预算由 150s 超时兜底。
+			resp, cErr := provider.Complete(vctx, hexagon.CompletionRequest{
 				Messages: []hexagon.Message{{
 					Role: hexagon.RoleUser,
 					MultiContent: []llm.ContentPart{
