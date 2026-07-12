@@ -37,6 +37,11 @@ var ErrInvalidRecord = errors.New("invalid record envelope")
 // ErrIllegalTransition 状态转移不在记录集声明的转移偏序内（如倒退 / 离开终态）。
 var ErrIllegalTransition = errors.New("illegal status transition for collection")
 
+// ErrScopeNotFound 记录的隔离键 agent_name 外键指向的 agent 未注册（BUG-20260712-#2）。
+// 此前直接把原始 SQLite "FOREIGN KEY constraint failed" 甩成 500，用户看不懂；改为语义错误 →
+// 上层映射 400 + 清晰提示「agent 未注册，请先创建该辅导助手」。
+var ErrScopeNotFound = errors.New("record scope (agent) not registered")
+
 // AgentRecord 一条通用记录（agent_records 表的行映射）。
 //
 // 字段分两层：

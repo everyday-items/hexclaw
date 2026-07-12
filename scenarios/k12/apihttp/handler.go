@@ -953,7 +953,7 @@ func httpStatusForK12Error(err error, fallback int) int {
 		return http.StatusNotFound
 	case errors.Is(err, records.ErrInvalidStatus), errors.Is(err, records.ErrInvalidFields),
 		errors.Is(err, records.ErrInvalidRecord), errors.Is(err, records.ErrUnknownCollection),
-		errors.Is(err, usecase.ErrChecksumMismatch):
+		errors.Is(err, records.ErrScopeNotFound), errors.Is(err, usecase.ErrChecksumMismatch):
 		return http.StatusBadRequest
 	case errors.Is(err, usecase.ErrInvalidInput):
 		return http.StatusBadRequest

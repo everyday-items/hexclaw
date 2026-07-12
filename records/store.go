@@ -4,9 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
+
+// isForeignKeyErr 判断是否 agent_name 外键约束失败（隔离键指向的 agent 未注册）。
+func isForeignKeyErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "FOREIGN KEY constraint failed")
+}
 
 // Store agent_records 的 SQLite 存储。
 //
@@ -72,6 +78,11 @@ ON CONFLICT(agent_name, collection, dedupe_key) DO NOTHING`,
 		r.RecordID, r.AgentName, r.Collection, r.SchemaVersion, r.Status, r.Fields,
 		r.DedupeKey, r.Tags, r.DueAt, r.SourceSession, r.Version, r.CreatedAt, r.UpdatedAt)
 	if err != nil {
+		if isForeignKeyErr(err) {
+			// BUG-20260712-#2：agent_name 外键指向的 agent 未注册 → 语义错误 + 清晰提示，
+			// 不再把原始 "FOREIGN KEY constraint failed" 甩成 500。
+			return false, fmt.Errorf("%w: agent %q 未注册（请先创建该辅导助手再记录）", ErrScopeNotFound, r.AgentName)
+		}
 		return false, fmt.Errorf("records: 写入失败: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
