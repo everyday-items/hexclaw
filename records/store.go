@@ -120,6 +120,26 @@ func (s *Store) FindDuplicate(ctx context.Context, r *AgentRecord) (*AgentRecord
 	return rows[0], nil
 }
 
+// Delete 按 record_id 删除一条记录，**始终按 agent_name 圈定归属**（多孩隔离硬边界）——
+// 仅删属于该实例的记录，避免仅凭 record_id 跨实例删除。record 不存在 / 不属于该 agent
+// 均按 ErrNotFound 返回（幂等语义：调用方据此回 404）。agentName 空 = ErrNotFound。
+//
+// 通用数据纠错原语（场景包按自己语义解读，如 K12「删除记错/重复的错题」）。
+func (s *Store) Delete(ctx context.Context, agentName, recordID string) error {
+	if agentName == "" || recordID == "" {
+		return ErrNotFound
+	}
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM agent_records WHERE record_id = ? AND agent_name = ?`, recordID, agentName)
+	if err != nil {
+		return fmt.Errorf("records: 删除失败: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // Get 按 record_id 取记录。
 func (s *Store) Get(ctx context.Context, recordID string) (*AgentRecord, error) {
 	row := s.db.QueryRowContext(ctx, selectCols+` WHERE record_id = ?`, recordID)
