@@ -1051,9 +1051,9 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		recordPersistError(msg, "user_message", err) // 失败信号随 reply 返回，避免静默丢消息（W12-Bug2）
 	}
 
-	// 5.5 知识库检索（RAG 上下文增强）
+	// 5.5 知识库检索（RAG 上下文增强）——策略门（BUG-20260712-N）：场景实例/超短寒暄跳过
 	var kbContext string
-	if e.kb != nil && e.cfg.Knowledge.Enabled {
+	if e.kb != nil && e.cfg.Knowledge.Enabled && e.shouldAutoInjectKB(msg) {
 		topK := e.cfg.Knowledge.TopK
 		if topK <= 0 {
 			topK = 3
@@ -1984,9 +1984,9 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		recordPersistError(msg, "user_message", err) // 失败信号随 reply 返回，避免静默丢消息（W12-Bug2）
 	}
 
-	// 5.5 知识库检索（RAG）
+	// 5.5 知识库检索（RAG）——策略门（BUG-20260712-N）：场景实例/超短寒暄跳过
 	var kbContext string
-	if e.kb != nil && e.cfg.Knowledge.Enabled {
+	if e.kb != nil && e.cfg.Knowledge.Enabled && e.shouldAutoInjectKB(msg) {
 		topK := e.cfg.Knowledge.TopK
 		if topK <= 0 {
 			topK = 3
@@ -3189,6 +3189,44 @@ func (e *ReActEngine) pipeStreamWithTools(
 //
 // 当 attachments 包含图片时，用户消息会构建为 MultiContent 格式（文本 + image_url），
 // 底层 ai-core Provider 会自动识别并发送为多模态 API 请求。
+// shouldAutoInjectKB 判定本轮是否执行全局知识库自动注入（BUG-20260712-N，策略门·产品层）：
+//
+//	① 场景实例会话（role/pinned_agent 指向 metadata 含 "scenario" 的 agent）→ 跳过。
+//	   场景包有自己的数据通道（如 K12 错题本/学情），全局个人文档注入进场景会话=跨域污染
+//	   （真机取证：辅导会话问天气命中《Go面试题》）。待知识集支持按 agent 绑定后再开放；
+//	   显式 `@` 召唤知识不走此门，不受影响。
+//	② 超短输入（<4 rune：你好/ok/1+1）无检索意图 → 跳过整个 embed+检索往返（延迟优化）。
+//
+// 查无此人的 role 不在此拦（guardExplicitRoleExists 已 fail-loud，本门不越权）。
+func (e *ReActEngine) shouldAutoInjectKB(msg *adapter.Message) bool {
+	if msg == nil {
+		return false
+	}
+	if len([]rune(strings.TrimSpace(msg.Content))) < 4 {
+		return false
+	}
+	if msg.Metadata == nil {
+		return true
+	}
+	ar := e.getAgentRouter()
+	if ar == nil {
+		return true
+	}
+	identities := []string{strings.TrimSpace(msg.Metadata["role"])}
+	if pinned := strings.TrimSpace(msg.Metadata["pinned_agent"]); pinned != "" && !strings.EqualFold(pinned, "default") {
+		identities = append(identities, pinned)
+	}
+	for _, name := range identities {
+		if name == "" {
+			continue
+		}
+		if cfg, ok := ar.GetAgent(name); ok && cfg != nil && strings.TrimSpace(cfg.Metadata["scenario"]) != "" {
+			return false
+		}
+	}
+	return true
+}
+
 // guardExplicitRoleExists BUG-20260710：metadata.role 显式指定但既非内置工厂角色、也非注册 agent
 // （典型场景：K12 实例已删除、老会话绑定成孤儿）时，旧行为是静默回落默认助理人设继续作答——
 // 前端仍渲染场景皮肤、后端却换了人格，双端呈现撕裂（身份欺骗式降级）。现 fail-loud：明确报错
