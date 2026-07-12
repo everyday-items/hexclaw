@@ -237,7 +237,8 @@ type FileMemoryConfig struct {
 	//   "off" —— 不自动进记忆（仅显式 manage_memory / 用户手改文件）。
 	AutoMemory string `yaml:"auto_memory"`
 	// RecallMinScore 召回相关性地板（修复 minScore=0 噪音）：**仅当配了 embedding 时生效**（纯 BM25 稀疏、
-	// 不设地板防漏召）。hybrid relevance(0.7 向量 + 0.3 BM25) < 此值的事实不注入。默认 0.3（保守，由 eval 调）；置 0 关。
+	// 不设地板防漏召）。hybrid relevance(0.7 向量 + 0.3 BM25) < 此值的事实不注入。默认 0.5
+	// （真机标定 BUG-20260712-O：nomic 中文无关对 hybrid 0.36~0.45、相关对 ≥0.58）；置 0 关。
 	RecallMinScore float64 `yaml:"recall_min_score"`
 	// ActiveRecall 回复前主动会话深召回（增量 G② / 方案 §4.4.1 §7bis R13，对齐 OpenClaw active-memory）：
 	// 按 query 翻原始历史会话、把「该想起来」的旧上下文主动浮现（FTS-fast 零 LLM、超时+熔断、与策展事实去重）。

@@ -121,7 +121,7 @@ func DefaultConfig() *Config {
 			Rerank:            true,
 			QueryExpand:       true,
 			Contextual:        true,
-			MinScore:          0.55,
+			MinScore:          0.85, // 真机标定（BUG-20260712-O，nomic 中文实测）：无关对归一分 0.75~0.82、相关对 0.92~0.95——旧 0.55(=cos 0.1) 形同虚设
 			CandidateK:        50,
 			SnapshotRetention: 100,
 		},
@@ -142,7 +142,7 @@ func DefaultConfig() *Config {
 			Dreaming:             true,          // ★默认开：多阶段 dreaming（light 机械 + deep LLM 整合留史，对标 Claude/OpenClaw dreaming）
 			DreamingIntervalMins: 10080,         // 每周（深相低频，对标 OpenClaw REM dreaming）
 			AutoMemory:           "inline",      // Claude Code 式：主模型随手判断、顺手调 manage_memory（默认；零额外 LLM 调用）
-			RecallMinScore:       0.3,           // 召回相关性地板（仅 embedding 在时生效，砍低相关噪音；eval 可调）
+			RecallMinScore:       0.5,           // 真机标定（BUG-20260712-O，nomic 中文实测）：无关对 hybrid≈0.36~0.45，相关对≥0.58——旧 0.3 必过（你好→花生过敏）
 			ActiveRecall:         boolPtr(true), // 回复前主动会话深召回默认开（仅 DM/交互式，FTS-fast 零 LLM；§7bis R13）
 		},
 		Skills: SkillsConfig{

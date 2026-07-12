@@ -123,6 +123,11 @@ func (e *ReActEngine) rankFacts(ctx context.Context, facts []recall.Entry, query
 	if len(facts) == 0 {
 		return nil
 	}
+	// 寒暄门（BUG-20260712-O，对齐知识库侧 shouldAutoInjectKB）：<4 rune 超短输入无检索意图，
+	// 检索层直接跳过（常驻层不受影响）。真机取证：「你好」曾把「花生过敏」召回成记忆命中。
+	if q := strings.TrimSpace(query); q != "" && len([]rune(q)) < 4 {
+		return nil
+	}
 	if strings.TrimSpace(query) == "" {
 		sorted := append([]recall.Entry(nil), facts...)
 		sort.SliceStable(sorted, func(i, j int) bool {
@@ -151,10 +156,13 @@ func (e *ReActEngine) rankFacts(ctx context.Context, facts []recall.Entry, query
 		Now:      func() time.Time { return now },
 	}
 	results, err := r.Retrieve(ctx, "", "", query)
-	// 相关性地板绝不砍到空（修 S2 真机回归：「花生酱」query 因地板把唯一相关「花生过敏」也砍掉致空召回）。
-	// best practice：地板只用来在「有更相关备选时」滤噪音；若砍到空 → 退回不设地板，宁注入次相关也不漏召到空。
-	// fallback 复用 src 的 embed memo（BUG-20260703②）：同一轮同 query 同批文本绝不二次 Embed。
-	if r.MinScore > 0 && (err != nil || len(results) == 0) {
+	// 降级重试（BUG-20260712-O②，范围收窄）：地板刻度按 hybrid(0.7·cos) 真机标定
+	// （nomic 实测：无关对 ≤0.45、相关对 ≥0.58），**只对向量路真实跑通的轮次有语义**——
+	//  · embed 失败/超时 → 纯 BM25 轮次刻度失义 → 不设地板重试一次（软降级不失聪，
+	//    零证据剔除仍兜底）；复用 src 的 embed memo，绝不二次打端点（BUG-20260703②）；
+	//  · 向量路正常 → 砍空即空。旧「结果为空即放宽」已删：它唯一作用是复活地板下噪音
+	//    （真机取证：年假问题把 hybrid 0.380 的花生记忆捞回注入；真低分真命中直接过地板）。
+	if r.MinScore > 0 && src.embedAttempted && src.embedErr != nil && (err != nil || len(results) == 0) {
 		r.MinScore = 0
 		results, err = r.Retrieve(ctx, "", "", query)
 	}
@@ -207,7 +215,7 @@ func (e *ReActEngine) recallMinScore() float64 {
 		return 0
 	}
 	if e.cfg == nil {
-		return 0.3 // 测试/无 cfg：用默认地板
+		return 0.5 // 测试/无 cfg：用默认地板（真机标定 BUG-20260712-O）
 	}
 	// 经 RLock 快照读（BUG-20260703 P2-2：与 ReloadFileMemoryConfig 的热更新写互斥）
 	return e.ActiveFileMemoryConfig().RecallMinScore // DefaultConfig 设 0.3；用户可调/置 0 关

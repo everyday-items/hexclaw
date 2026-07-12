@@ -182,7 +182,11 @@ type HybridConfig struct {
 	TimeDecayDays int     // 时间衰减半衰期（天），默认 30，0=不衰减
 
 	// ── best-practice 检索参数（RRF 融合 + LLM 重排 + 查询扩展 + 相关度地板）──
-	MinScore      float64 // 向量相关度地板（作用于余弦归一分 (cos+1)/2 ∈ [0,1]），默认 0.55；0=关。空结果时放宽回退，保证不清空
+	// MinScore 向量相关度地板（作用于余弦归一分 (cos+1)/2 ∈ [0,1]），默认 0.85；0=关。
+	// 0.85 为真机标定值（BUG-20260712-O，nomic-embed-text 中文实测）：无关对归一分
+	// 0.754~0.820（旧默认 0.55=cos 0.1 形同虚设，天气 query 曾放行《Go面试题》），
+	// 相关对 0.917~0.952——0.85 落在分界带内、双侧留 margin。显式检索有放宽回退不受影响。
+	MinScore      float64
 	CandidateK    int     // 宽召回候选池大小（rerank 前 over-retrieve），默认 50
 	RRFK          float64 // RRF 融合常数 k，默认 60（业界标准，Cormack et al. SIGIR 2009）
 	UseRRF        bool    // true=用 RRF 融合替代朴素加权和（量纲不可比），默认 true
@@ -204,7 +208,7 @@ func DefaultHybridConfig() HybridConfig {
 		TextWeight:        0.3,
 		MMRLambda:         0.7,
 		TimeDecayDays:     30,
-		MinScore:          0.55,
+		MinScore:          0.85, // 真机标定（BUG-20260712-O），依据见字段注释
 		CandidateK:        50,
 		RRFK:              60,
 		UseRRF:            true,

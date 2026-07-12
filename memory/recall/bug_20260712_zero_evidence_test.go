@@ -54,3 +54,26 @@ func TestBug20260712_AllZeroEvidenceReturnsEmpty(t *testing.T) {
 		t.Fatalf("全零证据应返回空，got %v", ids(got))
 	}
 }
+
+// BUG-20260712-O 真机标定回归锁：nomic-embed-text 中文实测刻度（2026-07-12 取证）——
+// 无关对 hybrid(0.7·cos) ≈ 0.36~0.45（你好↔花生过敏 cos=0.640→0.448），
+// 相关对 ≥ 0.58（花生酱↔花生过敏 cos=0.905→0.633）。默认地板必须落在分界带内，
+// 否则真实嵌入下无关记忆必过（旧 0.3 的实锤真机 bug）。
+func TestBug20260712_FloorCalibratedForRealEmbeddings(t *testing.T) {
+	items := []Candidate{
+		{Entry: Entry{ID: "unrelated", UserID: "u1", Type: TypeFact, Content: "孩子对花生过敏"}, VectorScore: 0.640, HasVector: true},     // 你好↔花生（真机实测）
+		{Entry: Entry{ID: "related", UserID: "u1", Type: TypeFact, Content: "孩子对花生过敏，不能吃花生"}, VectorScore: 0.905, HasVector: true}, // 花生酱↔花生（真机实测）
+	}
+	r := newRetriever(items, 0.5 /* = config 默认 RecallMinScore（真机标定） */, 5)
+	got, err := r.Retrieve(context.Background(), "u1", "", "任意查询")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotIDs := ids(got)
+	if contains(gotIDs, "unrelated") {
+		t.Fatalf("真机无关刻度（cos 0.640→hybrid 0.448）必须被默认地板砍掉：%v", gotIDs)
+	}
+	if !contains(gotIDs, "related") {
+		t.Fatalf("真机相关刻度（cos 0.905→hybrid 0.633）必须保留：%v", gotIDs)
+	}
+}

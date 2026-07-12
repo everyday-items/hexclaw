@@ -75,8 +75,8 @@ func TestBug20260703P22_GetMemoryConfigDefaults(t *testing.T) {
 	if resp.AutoMemory != "inline" {
 		t.Fatalf("默认 auto_memory 应为 inline，实际 %q", resp.AutoMemory)
 	}
-	if resp.RecallMinScore != 0.3 {
-		t.Fatalf("默认 recall_min_score 应为 0.3，实际 %v", resp.RecallMinScore)
+	if resp.RecallMinScore != 0.5 {
+		t.Fatalf("默认 recall_min_score 应为 0.5（BUG-20260712-O 真机标定），实际 %v", resp.RecallMinScore)
 	}
 	if !resp.ActiveRecall {
 		t.Fatal("active_recall 未配时生效值应为 true（默认开）")

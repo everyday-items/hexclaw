@@ -59,9 +59,9 @@ func TestKnowledgeConfigEndpoints(t *testing.T) {
 		return w.Code
 	}
 
-	// 初始 GET = 默认（rerank 开、min_score 0.55、candidate_k 50）。
+	// 初始 GET = 默认（rerank 开、min_score 0.85（BUG-20260712-O 真机标定）、candidate_k 50）。
 	g := getCfg()
-	if g["rerank"] != true || g["min_score"] != 0.55 || g["candidate_k"] != float64(50) {
+	if g["rerank"] != true || g["min_score"] != 0.85 || g["candidate_k"] != float64(50) {
 		t.Fatalf("初始配置不符默认: %+v", g)
 	}
 
