@@ -603,6 +603,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	//   store:    hexclaw SQLite (文档元数据 + FTS5 + 向量 BLOB)
 	kbOK := false
 	var sharedEmbedder hexagon.VectorEmbedder // 共享 embedder: KB + VectorMemory + 语义搜索
+	// 嵌入接线信息（BUG-20260712-B1）：装配完成后注入 api server，
+	// 供 /knowledge/embedding-status 端点把「嵌入未就绪=自动注入休眠」可见化。
+	var kbEmbedProvider, kbEmbedModel, kbEmbedBaseURL string
+	var kbEmbedLocal bool
 	if cfg.Knowledge.Enabled {
 		kbStore := knowledge.NewSQLiteStore(store.DB())
 		if err := kbStore.Init(ctx); err == nil {
@@ -621,7 +625,16 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					if isOllamaProvider {
 						embProviderName = name
 						if embModel == "" {
-							embModel = "nomic-embed-text"
+							// 自动发现（BUG-20260712-B1 嵌入开箱保证）：已装任一嵌入模型 → 直接用
+							// （零配置零下载激活）；否则保持 nomic-embed-text 默认接线——用户经知识库页
+							// 一键安装后无需重启即生效（Embed 按模型名打 Ollama，模型就位即成功）。
+							if detected, ok := knowledge.DetectOllamaEmbeddingModel(ctx, pc.BaseURL); ok {
+								embModel = detected
+								logger.Info("[knowledge] 自动发现已安装的嵌入模型", "model", detected)
+							} else {
+								embModel = "nomic-embed-text"
+								logger.Warn("[knowledge] 未发现已安装嵌入模型，默认接线 nomic-embed-text（安装前语义检索休眠，可在知识库页一键安装）")
+							}
 						}
 						logger.Info("[knowledge] 自动选择 Ollama 作为 embedding provider", "name", name, "model", embModel)
 						break
@@ -662,6 +675,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 							hexagon.WithEmbedderDimension(dim),
 						)
 						logger.Info("[knowledge] 自动配置 embedding", "provider", embProviderName, "model", embModel)
+						kbEmbedProvider, kbEmbedModel = embProviderName, embModel
+						kbEmbedBaseURL, kbEmbedLocal = pc.BaseURL, isOllama
 					}
 				}
 			}
@@ -957,6 +972,27 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	// 8. 启动 HTTP 服务
 	srv := api.NewServer(cfg, eng, gw, store)
+	srv.SetKnowledgeEmbeddingInfo(api.KnowledgeEmbeddingInfo{
+		Enabled: cfg.Knowledge.Enabled, Provider: kbEmbedProvider, Model: kbEmbedModel,
+		BaseURL: kbEmbedBaseURL, Local: kbEmbedLocal,
+	})
+	// 嵌入模型首启静默预置（BUG-20260712-B1 三态机制：成功=用户零感知；失败=知识库页
+	// 浮手动重试横幅；可经 knowledge.embedding.disable_auto_install 关闭——计费网络逃生口）。
+	// 后台 goroutine 不阻塞启动；Ensure 幂等（已装 no-op），Embed 按模型名打 Ollama，
+	// 模型就位即生效无需重启。
+	if cfg.Knowledge.Enabled && kbEmbedLocal && kbEmbedModel != "" && !cfg.Knowledge.Embedding.DisableAutoInstall {
+		go func() {
+			api.SetKnowledgeEmbeddingPulling(true)
+			defer api.SetKnowledgeEmbeddingPulling(false)
+			pctx, pcancel := context.WithTimeout(context.Background(), 2*time.Hour)
+			defer pcancel()
+			if ok, err := knowledge.EnsureOllamaEmbeddingModel(pctx, kbEmbedBaseURL, kbEmbedModel); err != nil {
+				logger.Warn("[knowledge] 嵌入模型静默预置失败（知识库页可手动安装）", "model", kbEmbedModel, "error", err)
+			} else if ok {
+				logger.Info("[knowledge] 嵌入模型已就位，语义检索激活", "model", kbEmbedModel)
+			}
+		}()
+	}
 	srv.SetVersion(version)
 	// 自动化权限治理 API（Profile 热更 / 预检 / 决策日志 / 任务级授权）
 	srv.SetAutonomy(permHook, autonomyDecisions, autonomyGrants, configFile)

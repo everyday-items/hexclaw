@@ -86,3 +86,43 @@ func TestBug20260712_OllamaModelInstalled(t *testing.T) {
 		t.Fatal("未装模型不得判 ready")
 	}
 }
+
+// EnsureOllamaEmbeddingModel：首启静默预置（幂等；失败=前端浮手动重试，成功=用户零感知）。
+func TestBug20260712_EnsureOllamaEmbeddingModel(t *testing.T) {
+	ctx := context.Background()
+
+	// ① 已装 → no-op（不触发 pull）
+	installed := fakeOllama(t, "nomic-embed-text:latest")
+	if ok, err := EnsureOllamaEmbeddingModel(ctx, installed.URL, "nomic-embed-text"); err != nil || !ok {
+		t.Fatalf("已装应 no-op 返回 true, ok=%v err=%v", ok, err)
+	}
+
+	// ② 未装 → pull 成功 → 就位（fake：pull 后 tags 出现该模型）
+	var pulled bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if pulled {
+			_, _ = w.Write([]byte(`{"models":[{"name":"nomic-embed-text:latest"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"models":[{"name":"qwen3.5:9b"}]}`))
+	})
+	mux.HandleFunc("/api/pull", func(w http.ResponseWriter, _ *http.Request) {
+		pulled = true
+		_, _ = w.Write([]byte(`{"status":"success"}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	if ok, err := EnsureOllamaEmbeddingModel(ctx, srv.URL, "nomic-embed-text"); err != nil || !ok {
+		t.Fatalf("未装应静默 pull 后就位, ok=%v err=%v", ok, err)
+	}
+	if !pulled {
+		t.Fatal("应触发 pull")
+	}
+
+	// ③ 端点不可达 → 返回失败（前端浮手动重试横幅，绝不 panic/阻断启动）
+	if ok, err := EnsureOllamaEmbeddingModel(ctx, "http://127.0.0.1:1", "nomic-embed-text"); ok || err == nil {
+		t.Fatalf("不可达应失败, ok=%v err=%v", ok, err)
+	}
+}

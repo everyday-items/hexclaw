@@ -12,7 +12,10 @@ package knowledge
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -101,4 +104,43 @@ func OllamaModelInstalled(ctx context.Context, baseURL, model string) bool {
 		}
 	}
 	return false
+}
+
+// PullOllamaModel 阻塞式拉取模型（丢弃流式进度，只关心结果）。首启后台静默安装用；
+// 前端手动路径走 api 的 SSE 进度端点，不经此函数。
+func PullOllamaModel(ctx context.Context, baseURL, model string) error {
+	base := strings.TrimSuffix(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		base = "http://localhost:11434"
+	}
+	base = strings.TrimSuffix(base, "/v1")
+	body := strings.NewReader(`{"name":` + strconv.Quote(model) + `,"stream":false}`)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/pull", body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("ollama pull %s: HTTP %d", model, resp.StatusCode)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// EnsureOllamaEmbeddingModel 保证嵌入模型就位（BUG-20260712-B1 静默预置，幂等）：
+// 已装 → no-op 返回 true；未装 → 拉取（成功 true / 失败 false，调用方据此置状态，
+// 失败即前端知识库页浮出手动重试横幅——异常驱动披露，成功路径用户零感知）。
+func EnsureOllamaEmbeddingModel(ctx context.Context, baseURL, model string) (bool, error) {
+	if OllamaModelInstalled(ctx, baseURL, model) {
+		return true, nil
+	}
+	if err := PullOllamaModel(ctx, baseURL, model); err != nil {
+		return false, err
+	}
+	return OllamaModelInstalled(ctx, baseURL, model), nil
 }

@@ -276,6 +276,9 @@ type EmbeddingConfig struct {
 	Model       string `yaml:"model"`        // Embedding 模型名称（如 text-embedding-3-small）
 	QueryPrefix string `yaml:"query_prefix"` // 查询嵌入前缀（如 nomic 的 "search_query: "），空=按模型自动
 	DocPrefix   string `yaml:"doc_prefix"`   // 文档嵌入前缀（如 nomic 的 "search_document: "），空=按模型自动
+	// DisableAutoInstall 关闭「本地 Ollama 缺嵌入模型时首启后台静默安装」（BUG-20260712-B1，
+	// 计费网络/离线人群的逃生口）。零值=自动安装开启（batteries-included 默认）。
+	DisableAutoInstall bool `yaml:"disable_auto_install"`
 }
 
 // ServerConfig 服务器配置

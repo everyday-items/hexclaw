@@ -103,6 +103,7 @@ type Server struct {
 	renderSvc         *render.Service              // 文档渲染服务（可选）
 	capabilities      *llmrouter.CapabilityService // A7 模型 tool_call 能力探测（可选）
 	genStore          *genstore.Store              // 生成内容持久化（图像/视频）
+	kbEmbedding       *KnowledgeEmbeddingInfo      // 知识库嵌入接线信息（BUG-20260712-B1，可选）
 	reloadGenServices func()                       // LLM 配置变更后重建 gen 服务（main.go 注入）
 	desktopSvc        *desktop.Service             // 桌面集成服务（可选）
 	cfgWriter         *config.Writer               // 配置文件写入器（MCP 持久化用）
@@ -537,6 +538,7 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST /api/v1/knowledge/documents/{id}/reindex", s.handleReindexDocument)
 		mux.HandleFunc("POST /api/v1/knowledge/search", s.handleSearchKnowledge)
 		mux.HandleFunc("GET /api/v1/knowledge/config", s.handleGetKnowledgeConfig)
+		mux.HandleFunc("GET /api/v1/knowledge/embedding-status", s.handleKnowledgeEmbeddingStatus)
 		mux.HandleFunc("PUT /api/v1/knowledge/config", s.handlePutKnowledgeConfig)
 	} else {
 		mux.HandleFunc("GET /api/v1/knowledge/documents", emptyList("documents"))
