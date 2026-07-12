@@ -5,6 +5,9 @@
 package marketplace
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +15,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -102,6 +106,10 @@ func (m *Marketplace) SeedFromFS(fsys fs.FS, subdir string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("读取内嵌 seed 目录失败: %w", err)
 	}
+	// manifest 记录每个 seed 文件「上次由本程序写入的内容哈希」，用于版本感知 re-seed 时
+	// 区分「用户未改动（可安全升级覆盖）」与「用户已自定义（保护不覆盖）」（BUG-20260712）。
+	manifest := loadSeedManifest(m.skillDir)
+	manifestDirty := false
 	seeded := 0
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
@@ -112,12 +120,22 @@ func (m *Marketplace) SeedFromFS(fsys fs.FS, subdir string) (int, error) {
 			return seeded, fmt.Errorf("读取内嵌 skill %q 失败: %w", e.Name(), rerr)
 		}
 		dest := filepath.Join(m.skillDir, e.Name())
-		published, werr := publishSeedNoReplace(dest, data)
+		published, recordHash, werr := publishSeedVersionAware(dest, data, manifest[e.Name()])
 		if werr != nil {
 			return seeded, fmt.Errorf("写入 seed skill %q 失败: %w", e.Name(), werr)
 		}
 		if published {
 			seeded++
+		}
+		if recordHash != "" && manifest[e.Name()] != recordHash {
+			manifest[e.Name()] = recordHash
+			manifestDirty = true
+		}
+	}
+	if manifestDirty {
+		// manifest 只用于「用户是否改过 seed」的判定，写失败不影响本次 seed 正确性 → best-effort。
+		if err := saveSeedManifest(m.skillDir, manifest); err != nil {
+			logger.Warn("写入 seed manifest 失败（不影响本次 seed）", "error", err)
 		}
 	}
 	return seeded, nil
@@ -152,6 +170,189 @@ func publishSeedNoReplace(dest string, data []byte) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// publishSeedVersionAware 版本感知发布单个 seed 文件（BUG-20260712）。返回：
+//   - published：本次是否新写入/升级覆盖了磁盘（用于 seeded 计数）
+//   - recordHash：应写入 manifest 的内容哈希（磁盘现内容 == bundled 时才非空）
+//
+// 语义：①dest 不存在 → no-replace 原子写（保持并发单赢家）；②已存在且 bundled 版本更高
+// 且磁盘文件未被用户改（哈希 == 上次 seed 或无 manifest 的 legacy）→ 原子升级覆盖；
+// ③已存在但用户改过 → 保留用户版本不覆盖；④bundled 未升版 → 不动磁盘。
+func publishSeedVersionAware(dest string, data []byte, prevHash string) (bool, string, error) {
+	// 新文件：走 no-replace 原子发布（dest 缺失时唯一赢家写入，多进程并发只有一个成功）。
+	published, err := publishSeedNoReplace(dest, data)
+	if err != nil {
+		return false, "", err
+	}
+	if published {
+		return true, hashSeedContent(data), nil
+	}
+
+	// dest 已存在 → 版本感知。link 失败即 IsExist，说明磁盘上是一份完整文件（写者先写满 temp 再 link）。
+	existing, rerr := os.ReadFile(dest)
+	if rerr != nil {
+		return false, "", rerr
+	}
+	if compareSkillVersions(skillSeedVersion(data), skillSeedVersion(existing)) <= 0 {
+		// bundled 未比磁盘新：不动磁盘（含用户改动/更高本地版本）。内容恰与 bundled 一致时
+		// 回填 hash，让未来的编辑判定有基线。
+		if bytes.Equal(existing, data) {
+			return false, hashSeedContent(data), nil
+		}
+		return false, "", nil
+	}
+
+	// bundled 更新：仅当磁盘文件与「上次 seed 内容」一致（未被用户改）才升级覆盖。
+	// prevHash == "" 是 legacy（本特性上线前已 no-replace seed，无 manifest）——视作未改，放行升级，
+	// 让 skill 更新能到达老安装（信条：更新要流达用户；用户改动由 manifest 上线后开始受保护）。
+	if prevHash != "" && hashSeedContent(existing) != prevHash {
+		logger.Info("bundled skill 有新版但本地已被用户修改，保留用户版本不覆盖",
+			"skill", filepath.Base(dest), "bundled", skillSeedVersion(data), "local", skillSeedVersion(existing))
+		return false, "", nil
+	}
+	if err := overwriteSeedAtomic(dest, data); err != nil {
+		return false, "", err
+	}
+	return true, hashSeedContent(data), nil
+}
+
+// overwriteSeedAtomic 原子覆盖写（temp + rename），用于版本升级覆盖已存在文件。
+func overwriteSeedAtomic(dest string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(dest), seedTempPrefix+filepath.Base(dest)+"-*"+seedTempSuffix)
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		_ = tmp.Close()
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o644); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, dest); err != nil {
+		return err
+	}
+	cleanup = false // rename 已消费 temp，无泄漏
+	return nil
+}
+
+// skillSeedVersion 从 skill markdown 原始字节取 frontmatter version（无则空串，视为最低版本）。
+func skillSeedVersion(data []byte) string {
+	meta, _ := parseFrontmatter(string(data))
+	return strings.TrimSpace(meta.Version)
+}
+
+// compareSkillVersions 比较点分版本号（如 1.2.0），返回 -1/0/1。数字段按整数比、缺段补 0、
+// 非数字段回退字典序；空串视为最低。
+func compareSkillVersions(a, b string) int {
+	a = strings.TrimPrefix(strings.TrimSpace(a), "v")
+	b = strings.TrimPrefix(strings.TrimSpace(b), "v")
+	if a == b {
+		return 0
+	}
+	as := strings.Split(a, ".")
+	bs := strings.Split(b, ".")
+	n := len(as)
+	if len(bs) > n {
+		n = len(bs)
+	}
+	for i := 0; i < n; i++ {
+		var av, bv string
+		if i < len(as) {
+			av = as[i]
+		}
+		if i < len(bs) {
+			bv = bs[i]
+		}
+		ai, aerr := strconv.Atoi(av)
+		bi, berr := strconv.Atoi(bv)
+		if aerr == nil && berr == nil {
+			if ai != bi {
+				if ai < bi {
+					return -1
+				}
+				return 1
+			}
+			continue
+		}
+		if av != bv {
+			if av < bv {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+func hashSeedContent(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+const seedManifestName = ".hexclaw-seed-manifest.json"
+
+func seedManifestPath(skillDir string) string {
+	return filepath.Join(skillDir, seedManifestName)
+}
+
+// loadSeedManifest 读取 seed 内容哈希清单（filename → sha256hex）。缺失/损坏均返回空 map（best-effort）。
+func loadSeedManifest(skillDir string) map[string]string {
+	out := make(map[string]string)
+	data, err := os.ReadFile(seedManifestPath(skillDir))
+	if err != nil {
+		return out
+	}
+	_ = json.Unmarshal(data, &out)
+	if out == nil {
+		out = make(map[string]string)
+	}
+	return out
+}
+
+// saveSeedManifest 原子写清单（temp + rename）。
+func saveSeedManifest(skillDir string, manifest map[string]string) error {
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(skillDir, seedTempPrefix+seedManifestName+"-*"+seedTempSuffix)
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		_ = tmp.Close()
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, seedManifestPath(skillDir)); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
 }
 
 func cleanupStaleSeedTemps(dir string, now time.Time) error {
