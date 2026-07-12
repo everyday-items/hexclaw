@@ -19,7 +19,7 @@ func (s stubProvider) Complete(context.Context, llm.CompletionRequest) (*llm.Com
 func (s stubProvider) Stream(context.Context, llm.CompletionRequest) (*llm.Stream, error) {
 	return nil, nil
 }
-func (s stubProvider) Models() []llm.ModelInfo                  { return nil }
+func (s stubProvider) Models() []llm.ModelInfo                { return nil }
 func (s stubProvider) CountTokens([]llm.Message) (int, error) { return 0, nil }
 
 // fakeRouter 实现 cronRouterView，按用例注入 providers / default。
@@ -76,7 +76,7 @@ func TestPickCronCompileTarget(t *testing.T) {
 				defName: "Ollama (本地)",
 				configs: map[string]config.LLMProviderConfig{
 					"Ollama (本地)": {BaseURL: ollamaBase, Model: "qwen3.5:9b"},
-					"智谱 AI":        {BaseURL: zhipuBase, Model: "glm-5.1"},
+					"智谱 AI":       {BaseURL: zhipuBase, Model: "glm-5.1"},
 				},
 			},
 			wantName:  "智谱 AI",
@@ -88,7 +88,7 @@ func TestPickCronCompileTarget(t *testing.T) {
 				defName: "智谱 AI",
 				configs: map[string]config.LLMProviderConfig{
 					"Ollama (本地)": {BaseURL: ollamaBase, Model: "qwen3.5:9b"},
-					"智谱 AI":        {BaseURL: zhipuBase, Model: "glm-5.1"},
+					"智谱 AI":       {BaseURL: zhipuBase, Model: "glm-5.1"},
 				},
 			},
 			wantName:  "智谱 AI",
@@ -111,7 +111,7 @@ func TestPickCronCompileTarget(t *testing.T) {
 				defName: "Ollama (本地)",
 				configs: map[string]config.LLMProviderConfig{
 					"Ollama (本地)": {BaseURL: ollamaBase, Model: "qwen3.5:9b"},
-					"智谱 AI":        {BaseURL: zhipuBase, Model: "cogview-4"},
+					"智谱 AI":       {BaseURL: zhipuBase, Model: "cogview-4"},
 				},
 			},
 			wantName:  "Ollama (本地)",
@@ -123,8 +123,8 @@ func TestPickCronCompileTarget(t *testing.T) {
 				defName: "Ollama (本地)",
 				configs: map[string]config.LLMProviderConfig{
 					"Ollama (本地)": {BaseURL: ollamaBase, Model: "qwen3.5:9b"},
-					"智谱 AI":        {BaseURL: zhipuBase, Model: "glm-5.1"},
-					"DeepSeek":     {BaseURL: "https://api.deepseek.com/v1", Model: "deepseek-chat"},
+					"智谱 AI":       {BaseURL: zhipuBase, Model: "glm-5.1"},
+					"DeepSeek":    {BaseURL: "https://api.deepseek.com/v1", Model: "deepseek-chat"},
 				},
 			},
 			wantName:  "DeepSeek", // ASCII 'D' < 中文，sort.Strings 字节序在前
@@ -136,7 +136,7 @@ func TestPickCronCompileTarget(t *testing.T) {
 				defName: "Ollama (本地)",
 				configs: map[string]config.LLMProviderConfig{
 					"Ollama (本地)": {BaseURL: ollamaBase, Model: "qwen3.5:9b"},
-					"智谱 AI":        {BaseURL: zhipuBase, Model: "glm-5.1"},
+					"智谱 AI":       {BaseURL: zhipuBase, Model: "glm-5.1"},
 				},
 				available: map[string]bool{"智谱 AI": false},
 			},
@@ -155,7 +155,7 @@ func TestPickCronCompileTarget(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			p, model, err := pickCronCompileTarget(tc.router)
+			p, model, err := pickCronCompileTarget(tc.router, "", "")
 			if tc.wantName == "" {
 				if err == nil {
 					t.Fatalf("期望 error，得到 provider=%v model=%q", p, model)

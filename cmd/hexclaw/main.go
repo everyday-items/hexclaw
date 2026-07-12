@@ -1092,7 +1092,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		} else {
 			// 动态 resolver — 每次 Compile 时查最新 default。
 			// 用户在 GUI 切 chat 模型立即生效（无需重启），且模型无效时 fail-loud。
-			resolver := buildCronProviderResolver(router)
+			resolver := buildCronProviderResolver(router, cfg)
 			// 启动期试探一次：仅验证基础可用（不阻塞启动；用户可后续在 UI 改配置）
 			if _, model, err := resolver(); err != nil {
 				fmt.Printf("  ⚠ Cron        编译 LLM 暂不可用 (%v) — 创建任务时会重新尝试\n", err)
@@ -1255,7 +1255,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		srv.SetCronScheduler(scheduler)
 		// D2.1 Layer 2 cron 自然语言解析 — 启动期取当前默认；后续会被 SetCronParserResolver 替换
 		// （TODO 后续：parse 端点也走 resolver 路径，跟随 UI 切换）
-		if resolver := buildCronProviderResolver(router); resolver != nil {
+		if resolver := buildCronProviderResolver(router, cfg); resolver != nil {
 			if p, m, err := resolver(); err == nil && p != nil {
 				srv.SetCronParser(p, m)
 			}
@@ -1523,7 +1523,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			resp, err := provider.Complete(cctx, hexagon.CompletionRequest{
 				Messages: []hexagon.Message{
 					{Role: hexagon.RoleSystem, Content: "你是中小学出题老师。据给定学科/年级/知识点直接出一道同类变式练习题并给简要解答，" +
-						"直接给最终题目与答案、不要展开长篇推理。"},
+						"直接给最终题目与答案、不要展开长篇推理。数学一律用 Unicode 符号（×÷√≤≥、分数 a/b、平方 x²、下标 H₂O、单位 cm³），" +
+						"禁止输出 LaTeX（不要 \\times \\frac \\text{} ^{} 或 $…$、\\(…\\) 定界符）。"},
 					{Role: hexagon.RoleUser, Content: task},
 				},
 				MaxTokens:   1024,
@@ -2404,17 +2405,36 @@ type cronRouterView interface {
 //     由 llmcall/SSE 链路返回 humanize 后的友好错误（不会静默卡死）。
 //
 // 全程不静默换成「错误类别」的模型：非 chat（图像/嵌入/语音）一律跳过并最终友好报错。
-func buildCronProviderResolver(r *llmrouter.Selector) cron.ProviderResolver {
+//
+//  0. 优先用配置的 reasoning provider+model（智谱/glm-4.5 等真 chat 强文本模型）——
+//     cron 编译本质是文本推理，绝不能落到默认 provider 的视觉默认模型（BUG-20260713）。
+func buildCronProviderResolver(r *llmrouter.Selector, cfg *config.Config) cron.ProviderResolver {
+	var reasoningProvider, reasoningModel string
+	if cfg != nil {
+		reasoningProvider = cfg.LLM.ReasoningProvider
+		reasoningModel = cfg.LLM.ReasoningModel
+	}
 	return func() (hexagon.Provider, string, error) {
 		if r == nil {
 			return nil, "", fmt.Errorf("LLM router 未初始化")
 		}
-		return pickCronCompileTarget(r)
+		return pickCronCompileTarget(r, reasoningProvider, reasoningModel)
 	}
 }
 
-// pickCronCompileTarget 按「远程 chat 优先、本地兜底」优先级选 cron 编译目标。
-func pickCronCompileTarget(rv cronRouterView) (hexagon.Provider, string, error) {
+// pickCronCompileTarget 选 cron 编译目标。优先级：
+//  0. 配置了 reasoning provider+model（智谱/glm-4.5 等真 chat 强文本模型）→ 直接用它
+//     （BUG-20260713 治本）。cron 编译是「多步文本 → Starlark 脚本」，本质是文本推理任务，
+//     必须走 chat 模型；而默认 provider 的默认 model 可能是视觉模型（glm-4v-flash，K12 识题
+//     RouteForVision 故意复用「默认 provider model」当视觉模型），落到它会因智谱强制
+//     max_tokens≤1024 而 400 建任务失败。仅当 reasoning 未配 / 不可用 / 非 chat 时才回退。
+//  1. 默认 provider 本身就是「远程 + chat」→ 直接用默认。
+//  2. 默认是本地 → 挑一个「远程 + chat」provider。
+//  3. 没有任何远程可用 → 退回默认（本地，慢路径 + 运行时友好报错）。
+func pickCronCompileTarget(rv cronRouterView, reasoningProvider, reasoningModel string) (hexagon.Provider, string, error) {
+	if p, model, ok := resolveReasoningCompileTarget(rv, reasoningProvider, reasoningModel); ok {
+		return p, model, nil
+	}
 	defName := rv.DefaultName()
 	if defName == "" {
 		return nil, "", fmt.Errorf("未配置默认 LLM provider — 请到设置 → LLM 选一个 chat 模型作为默认")
@@ -2427,6 +2447,33 @@ func pickCronCompileTarget(rv cronRouterView) (hexagon.Provider, string, error) 
 	}
 	// 没有远程 chat 可用 → 退回默认（本地）；返回其详细错误语义（成功则走本地慢路径）。
 	return resolveChatProvider(rv, defName)
+}
+
+// resolveReasoningCompileTarget 尝试用配置的 reasoning provider+model 作 cron 编译目标。
+// ok=true 时 (provider,model) 可直接用；ok=false 表示未配置 / provider 不可用 / model 非 chat，
+// 调用方回退到「远程 chat 优先、本地兜底」逻辑（无回归）。
+//
+// reasoningModel 为空时回退该 provider 的配置默认 model（对齐 engine reasoningSelectionForSolve）。
+// model 仍须过 chat 校验：reasoning 字段被误填成视觉/嵌入模型时不静默使用，转而回退兜底。
+func resolveReasoningCompileTarget(rv cronRouterView, reasoningProvider, reasoningModel string) (hexagon.Provider, string, bool) {
+	name := strings.TrimSpace(reasoningProvider)
+	if name == "" {
+		return nil, "", false
+	}
+	p, ok := rv.Get(name)
+	if !ok || p == nil {
+		return nil, "", false // 不可用（无 key / 创建失败）→ 回退
+	}
+	model := strings.TrimSpace(reasoningModel)
+	if model == "" {
+		if pc, ok := rv.ProviderConfig(name); ok {
+			model = strings.TrimSpace(pc.Model)
+		}
+	}
+	if model == "" || isNonChatModel(model) {
+		return nil, "", false // 空 / 非 chat（视觉·嵌入·语音）→ 回退，绝不静默用错类模型
+	}
+	return p, model, true
 }
 
 // cronCompileCandidates 返回远程 chat 候选的有序列表：
@@ -2486,6 +2533,10 @@ func isNonChatModel(m string) bool {
 		"embedding", "embed-", "bge-", "m3e", "text-embedding", "nomic-embed",
 		"whisper", "tts", "audio-", "voice-",
 		"cogvideo", "video-",
+		// 视觉/多模态模型（BUG-20260713）：擅长看图但 cron 编译走它会因视觉模型的
+		// max_tokens 上限（如智谱 glm-4v-flash ≤1024）撞 400。子串取足够特异，
+		// 不误伤正常 chat 名（"glm-4v" 不命中 "glm-4-flash"；"v1"/"4o" 不在表内）。
+		"glm-4v", "-vl", "vision", "llava", "minicpm-v", "internvl", "cogvlm",
 	} {
 		if strings.Contains(n, kw) {
 			return true
