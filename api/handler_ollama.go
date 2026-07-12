@@ -227,6 +227,23 @@ func resolveWarmupNumCtx(reqNumCtx int) int {
 	return defaultWarmupNumCtx
 }
 
+// resolveOllamaNumCtx 预热 num_ctx 解析：Ollama provider 配了 num_ctx 上限则**恒用它**（预热与
+// 真实请求必须同档，否则 Ollama 载了大 runner 后小请求不降载、内存照样撑爆——BUG-20260712），
+// 未配置时回落 resolveWarmupNumCtx（请求显式 > 8192 稳态默认）。
+func (s *Server) resolveOllamaNumCtx(reqNumCtx int) int {
+	if s.cfg != nil {
+		for name, p := range s.cfg.LLM.Providers {
+			lower := strings.ToLower(name)
+			if lower == "ollama" || strings.Contains(strings.ToLower(p.BaseURL), "localhost:11434") {
+				if p.NumCtx > 0 {
+					return p.NumCtx
+				}
+			}
+		}
+	}
+	return resolveWarmupNumCtx(reqNumCtx)
+}
+
 // resolveOllamaKeepAlive 取 Ollama provider 配置的 keep_alive（与真实对话下发值一致），
 // 未配置时回落到与 ai-core 请求级默认一致的 30m。
 func (s *Server) resolveOllamaKeepAlive() string {
@@ -273,7 +290,7 @@ func (s *Server) handleOllamaLoad(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "model is required"})
 		return
 	}
-	loadBody := buildOllamaLoadBody(req.Model, resolveWarmupNumCtx(req.NumCtx), s.resolveOllamaKeepAlive())
+	loadBody := buildOllamaLoadBody(req.Model, s.resolveOllamaNumCtx(req.NumCtx), s.resolveOllamaKeepAlive())
 	client := httpx.RawClient(httpx.WithRawTimeout(30 * time.Second))
 	resp, err := client.Post("http://localhost:11434/api/generate", "application/json", bytes.NewReader(loadBody))
 	if err != nil {

@@ -19,6 +19,12 @@ type runtimeProviderSelector struct {
 	router interface {
 		Fallback(exclude ...string) (hexagon.Provider, string, error)
 	}
+	// markUnhealthy 在回退时短期熔断失败 provider（BUG-20260711）。此前 runner 内建的
+	// 单跳回退能换 provider 让本次对话成功，但**从不熔断**失败 provider——于是每条新消息
+	// 都先打一次挂掉的默认 provider（429）再回退，"额度耗尽即云端整体变慢/不可用"的观感由此
+	// 而来。仅对 isProviderUnavailableError（429/5xx/超时/连接失败）熔断，不误伤"工具不支持"
+	// （那条走去工具降级、不换 provider）。nil 时不熔断（保持旧行为）。
+	markUnhealthy    func(name, reason string)
 	initialProvider  hexagon.Provider
 	initialName      string
 	initialModel     string
@@ -28,47 +34,92 @@ type runtimeProviderSelector struct {
 	currentProvider  hexagon.Provider
 	currentName      string
 	currentModel     string
+	// tried 累积本次运行已尝试过的 provider 名，供多跳回退用 exclude 集合遍历所有健康
+	// provider 一轮、防止回到已失败的 provider 造成死循环（BUG-20260711 Gap-2）。
+	tried map[string]bool
+}
+
+func (s *runtimeProviderSelector) markTried(name string) {
+	if name == "" {
+		return
+	}
+	if s.tried == nil {
+		s.tried = make(map[string]bool)
+	}
+	s.tried[name] = true
+}
+
+func (s *runtimeProviderSelector) excludeList() []string {
+	names := make([]string, 0, len(s.tried))
+	for n := range s.tried {
+		names = append(names, n)
+	}
+	return names
+}
+
+func (s *runtimeProviderSelector) setCurrent(p hexagon.Provider, name, model string) {
+	s.currentProvider = s.wrap(p, name, model)
+	s.currentName = name
+	s.currentModel = model
 }
 
 func (s *runtimeProviderSelector) Select(context.Context, hruntime.Request) (hruntime.ProviderSelection, error) {
-	if s.initialProvider == nil {
-		return hruntime.ProviderSelection{}, hruntime.ErrNoProvider
+	// 首次进入用 initial；再次进入（engine 多跳回退重跑 runner）返回已 advance 的 current。
+	if s.currentProvider == nil {
+		if s.initialProvider == nil {
+			return hruntime.ProviderSelection{}, hruntime.ErrNoProvider
+		}
+		s.setCurrent(s.initialProvider, s.initialName, s.initialModel)
 	}
-	provider := s.wrap(s.initialProvider, s.initialName, s.initialModel)
-	s.currentProvider = provider
-	s.currentName = s.initialName
-	s.currentModel = s.initialModel
+	s.markTried(s.currentName)
 	return hruntime.ProviderSelection{
-		Provider: provider,
-		Name:     s.initialName,
-		Model:    s.initialModel,
+		Provider: s.currentProvider,
+		Name:     s.currentName,
+		Model:    s.currentModel,
 	}, nil
 }
 
-func (s *runtimeProviderSelector) Fallback(ctx context.Context, failed hruntime.ProviderSelection, cause error) (hruntime.ProviderSelection, error) {
-	if s.explicitProvider || s.router == nil {
-		return hruntime.ProviderSelection{}, hruntime.ErrNoFallback
+// tripBreaker 对"provider 级不可用"错误短期熔断给定 provider（工具不支持不熔断）。
+func (s *runtimeProviderSelector) tripBreaker(name string, cause error) {
+	if s.markUnhealthy != nil && isProviderUnavailableError(cause) {
+		s.markUnhealthy(name, causeReason(cause))
 	}
-	p, name, err := s.router.Fallback(failed.Name)
-	if err != nil {
-		trace.L(ctx).Warn("runtime tool-loop fallback exhausted",
-			"failed_provider", failed.Name, "cause", cause, "err", err)
-		return hruntime.ProviderSelection{}, err
+}
+
+// Fallback 现恒返回 ErrNoFallback：runner 的**内部单跳跨 provider fallback 已禁用**，多跳
+// failover 完全交给 engine 外层循环（completeWithTools / processStreamRuntime 里的
+// failoverAdvance 循环）。
+//
+// 修 BUG-20260712（option A）：runner 内部单跳换 provider 时用的是**传入的 messages**——即为
+// 初始（本地）provider 构建、带 <memory-context> 的请求，无法在 runner 内按目标 provider 的
+// locality 重建。于是本地超时后 runner 内部换到云端、复用带 memory 的请求 → 直接撞云 egress 拦截，
+// 且该 egress 错误不算 provider 不可用 → 外层不再回退 → 整条链断。把跨 provider 回退上移到 engine
+// 外层后，那里能用 rebuildRequestForFailover 起干净 egress 信封 + 盖目标 locality（云端不带 memory），
+// 从根因上不让带 memory 的请求出云。熔断/exclude 记账由外层 failoverAdvance 承担。
+func (s *runtimeProviderSelector) Fallback(context.Context, hruntime.ProviderSelection, error) (hruntime.ProviderSelection, error) {
+	return hruntime.ProviderSelection{}, hruntime.ErrNoFallback
+}
+
+// failoverAdvance 由 engine 在一次 runner.Run/Stream 返回"provider 级不可用"错误后调用，
+// 把当前 provider 熔断 + 遍历到下一个尚未尝试的健康 provider（多跳回退，Gap-2）。返回是否
+// 成功推进到一个新 provider——true 时调用方用同一 runner+selector 重跑（Select 会返回新 current）。
+// 显式 pin / 无 router / 无更多健康 provider 时返回 false。
+func (s *runtimeProviderSelector) failoverAdvance(cause error) bool {
+	if s.explicitProvider || s.router == nil {
+		return false
+	}
+	s.tripBreaker(s.currentName, cause)
+	s.markTried(s.currentName)
+	p, name, err := s.router.Fallback(s.excludeList()...)
+	if err != nil || p == nil || name == "" || s.tried[name] {
+		return false
 	}
 	model := name
 	if s.modelForProvider != nil {
 		model = s.modelForProvider(name)
 	}
-	// Provider degradation used to be invisible in logs, which made
-	// installed-app failures (e.g. silent OpenRouter→Ollama switches)
-	// hard to diagnose (BUG-20260612).
-	trace.L(ctx).Warn("runtime tool-loop provider fallback",
-		"from", failed.Name, "to", name, "model", model, "cause", cause)
-	p = s.wrap(p, name, model)
-	s.currentProvider = p
-	s.currentName = name
-	s.currentModel = model
-	return hruntime.ProviderSelection{Provider: p, Name: name, Model: model}, nil
+	s.setCurrent(p, name, model)
+	return true
 }
 
 func (s *runtimeProviderSelector) wrap(provider hexagon.Provider, name, model string) hexagon.Provider {

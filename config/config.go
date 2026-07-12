@@ -319,6 +319,12 @@ type LLMProviderConfig struct {
 	// KeepAlive 本地模型驻留时长(仅 Ollama 生效,如 "5m"/"30m";空=ai-core 默认 30m)。
 	// BUG-20260710:16GB 机器 9B 模型驻留≈7GB,可调短换内存。
 	KeepAlive string `yaml:"keep_alive,omitempty" json:"keep_alive,omitempty"`
+	// NumCtx 本地模型上下文长度上限(仅 Ollama 生效,如 4096/8192;0=ai-core 自动分档)。
+	// BUG-20260712:ai-core 自动分档会随大 prompt(K12 33 工具)+粘性"只升不降"+预热把 num_ctx
+	// 抬到 16384/32768,9B 模型 KV cache 在 16GB 机器上撑爆物理内存→狂刷 swap→整机卡死
+	// (真机:16384 请求超时 >120s;num_ctx=2048 热请求 7s)。显式设置被 ai-core 当契约,
+	// 跳过自动分档与 needed>numCtx 报错,长 prompt 由 Ollama context-shift 优雅截断而非撑爆内存。
+	NumCtx int `yaml:"num_ctx,omitempty" json:"num_ctx,omitempty"`
 }
 
 // LLMRoutingConfig 智能路由配置

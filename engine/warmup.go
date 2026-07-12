@@ -113,9 +113,16 @@ func (e *ReActEngine) WarmupLocalDefaultModel(ctx context.Context) (warmed bool,
 		req.Tools = tools
 	}
 	applyPerTurnRequestPolicy(&req, selection.modelName, msg, nil)
-	req.MaxTokens = 1 // 只要 prefill 进缓存，产出 1 个 token 即停
+	// BUG-20260712：预热必须与真实请求用同一 num_ctx，否则预热按自动分档把 runner 载到 16384
+	// （巨型 KV 常驻），真实请求即便注入 num_ctx=4096 也只会复用那个 16384 runner（Ollama 不会
+	// 为更小 ctx 降载），内存照样被撑爆。此处显式盖同一档，让 runner 一开始就载在 4096。
+	e.applyLocalNumCtxCap(&req, true) // 到此 selection 必为本地（上方已 return 云端）
+	req.MaxTokens = 1                 // 只要 prefill 进缓存，产出 1 个 token 即停
 
 	start := time.Now()
+	logger.Info("[warmup] 本地默认模型预热开始（把 system prompt+工具模板 prefill 进 KV 缓存）",
+		"provider", selection.providerName, "model", selection.modelName,
+		"tools", len(req.Tools), "num_ctx", reqNumCtxField(req), "prompt_bytes", promptBytesField(req))
 	// 必须走流式：非流式 Complete 的响应头超时 120s < 纯 CPU 大 prompt prefill（实测 344s），
 	// 预热自己就会超时（首版踩坑取证 sidecar2.log）。流式响应头即刻返回，prefill 期间连接保活。
 	stream, cerr := selection.provider.Stream(ctx, req)
@@ -134,6 +141,7 @@ func (e *ReActEngine) WarmupLocalDefaultModel(ctx context.Context) (warmed bool,
 	}
 	logger.Info("[warmup] 本地默认模型预热完成（system prompt+工具模板已入 KV 缓存）",
 		"provider", selection.providerName, "model", selection.modelName,
+		"num_ctx", reqNumCtxField(req), "prompt_bytes", promptBytesField(req),
 		"elapsed", time.Since(start).Round(time.Second).String())
 	return true, nil
 }

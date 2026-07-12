@@ -44,7 +44,16 @@ func (e *ToolExecutor) AddHook(h any) {
 //  2. Run beforeHooks (any can abort by returning error)
 //  3. Execute the tool
 //  4. Run afterHooks (can modify result, e.g. truncation)
-func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[string]any) (string, error) {
+func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[string]any) (result string, err error) {
+	// 排查用：逐个工具调用打点（开始 + 完成/失败 + 耗时 + 结果规模）。只记 arg 的 key，不记 value，
+	// 避免把敏感/超长参数写进日志。工具循环里模型到底调了哪些工具、成没成、多慢，一目了然。
+	toolStart := time.Now()
+	trace.L(ctx).Info("工具调用开始", "tool", toolName, "arg_keys", argKeysForLog(args))
+	defer func() {
+		trace.L(ctx).Info("工具调用完成", "tool", toolName,
+			"ok", err == nil, "result_bytes", len(result),
+			"elapsed_ms", time.Since(toolStart).Milliseconds(), "err", errStringForLog(err))
+	}()
 	call := &ToolCallInfo{
 		Name:      toolName,
 		Arguments: args,
@@ -96,6 +105,26 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 	}
 
 	return "", fmt.Errorf("tool '%s' not found in skills or MCP servers", toolName)
+}
+
+// argKeysForLog 返回工具参数的 key 列表（不含 value，防敏感/超长内容进日志）。
+func argKeysForLog(args map[string]any) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(args))
+	for k := range args {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// errStringForLog nil-safe 错误转字符串（成功时为空串，日志字段不显噪声）。
+func errStringForLog(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // resolveSkillBySlug finds the skill whose derived LLM tool slug matches name,

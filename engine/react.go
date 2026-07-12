@@ -135,6 +135,85 @@ func providerIsCloud(ctx context.Context) bool {
 	return ok && !local
 }
 
+// applyLocalNumCtxCap 为本地 Ollama 请求注入显式 num_ctx（来自 Ollama provider 配置的 num_ctx）。
+// BUG-20260712：内存受限机器（如 16GB Intel）上，ai-core 自动分档 + 粘性"只升不降" + 预热会把
+// num_ctx 抬到 16384/32768，9B 模型 KV cache 撑爆物理内存 → 狂刷 swap → 每 token 等磁盘 → 整机
+// 卡死（真机：16384 超时 >120s；num_ctx=2048 热请求 7s）。显式 num_ctx 被 ai-core 当契约（跳过
+// 自动分档与 needed>numCtx 报错），长 prompt 由 Ollama context-shift 优雅截断而非撑爆内存。
+// 0=不注入（保持自动分档，不影响大内存机；云端 provider isLocal=false 直接跳过、无副作用）。
+// 前端已显式下发 num_ctx 时不覆盖（尊重契约）。
+func (e *ReActEngine) applyLocalNumCtxCap(req *hexagon.CompletionRequest, isLocal bool) {
+	if !isLocal {
+		return
+	}
+	n := e.localOllamaNumCtx()
+	if n <= 0 {
+		return
+	}
+	if req.Metadata == nil {
+		req.Metadata = map[string]any{}
+	}
+	if _, ok := req.Metadata["num_ctx"]; !ok {
+		req.Metadata["num_ctx"] = n
+	}
+}
+
+// localOllamaNumCtx 返回本地 Ollama provider 配置的 num_ctx 上限（0=未配置=自动分档）。
+func (e *ReActEngine) localOllamaNumCtx() int {
+	if e.cfg == nil {
+		return 0
+	}
+	for name, p := range e.cfg.LLM.Providers {
+		if isLocalProvider(name) && p.NumCtx > 0 {
+			return p.NumCtx
+		}
+	}
+	return 0
+}
+
+// ——— 排查用日志字段 helper（BUG-20260712：以下三项曾是排障盲区，逐个补齐关键节点可见性）———
+
+// reqNumCtxField 返回请求 metadata 里的 num_ctx，供「调用准备」日志一眼看出本地上下文档位
+// （auto=交给 ai-core 自动分档；显式数值=已按配置钳制，防 KV 撑爆内存）。
+func reqNumCtxField(req hexagon.CompletionRequest) any {
+	if req.Metadata != nil {
+		if v, ok := req.Metadata["num_ctx"]; ok {
+			return v
+		}
+	}
+	return "auto"
+}
+
+// promptBytesField 汇总请求所有消息 content 字节数，反映 prompt 规模（纯 CPU 本地模型
+// prefill 成本与此成正比；巨型 prompt 慢/超时时此值一眼可见）。
+func promptBytesField(req hexagon.CompletionRequest) int {
+	n := 0
+	for _, m := range req.Messages {
+		n += len(m.Content)
+	}
+	return n
+}
+
+// egressSummaryField 汇总 ctx 里的 egress 信封为 "purpose[class1,class2]"，一眼看出
+// 「为什么被云 egress 拦」——如 general_chat[sensitive_media] 组合会撞红线拒绝上云
+// （钉钉拍照解题曾因此静默失败：图片走了 general_chat 而非 solve_verify 信封）。
+func egressSummaryField(ctx context.Context) string {
+	reqs, ok := egress.RequestsFromContext(ctx)
+	if !ok || len(reqs) == 0 {
+		return "none"
+	}
+	seen := map[string]bool{}
+	classes := make([]string, 0, len(reqs))
+	for _, r := range reqs {
+		c := string(r.DataClass)
+		if !seen[c] {
+			seen[c] = true
+			classes = append(classes, c)
+		}
+	}
+	return string(reqs[0].Purpose) + "[" + strings.Join(classes, ",") + "]"
+}
+
 // withSystemDispatch stamps the dispatch source onto ctx when msg is a system
 // dispatch (cron/heartbeat/webhook/spawn); returns ctx unchanged otherwise.
 //
@@ -1065,6 +1144,7 @@ func (e *ReActEngine) completeWithTools(
 		req.Tools = tools
 	}
 	applyPerTurnRequestPolicy(&req, modelName, msg, history)
+	e.applyLocalNumCtxCap(&req, isLocal) // 本地 Ollama：按配置钳 num_ctx，防 KV 撑爆内存（BUG-20260712）
 	// 本地 thinking 模型注入 /no_think（与流式路径对齐）
 	// Qwen3/DeepSeek-R1 通过 /no_think 抑制；Gemma 4 由 Ollama 模板层控制，不注入
 	if len(req.Tools) == 0 && isLocal && msg.Metadata["thinking"] != "on" && needsNoThinkInjection(modelName) {
@@ -1085,19 +1165,41 @@ func (e *ReActEngine) completeWithTools(
 					return e.finalizeReply(ctx, sessionID, msg, provider, req, resp, providerName, modelName, cacheInput, nil, nil)
 				}
 			}
-			if !explicitProvider {
-				markLLMProviderUnhealthy(e.router, providerName, err)
-				fallbackP, fbName, fbErr := e.router.Fallback(providerName)
-				if fbErr == nil {
-					trace.L(ctx).Warn("Provider 降级", "from", providerName, "to", fbName, "err", err, "session", sessionID)
+			// BUG-20260711 多跳 provider 回退（无工具直连路径）：provider 级不可用（429/5xx/
+			// 超时/连接失败）且非用户显式 pin 时，短期熔断失败者 + 遍历剩余健康 provider 一轮，
+			// 直到某个成功或全部试完。exclude 集合累积防死循环；显式 pin 不改派（尊重用户选择）。
+			if err != nil && !explicitProvider && isProviderUnavailableError(err) {
+				tried := map[string]bool{providerName: true}
+				for isProviderUnavailableError(err) {
+					e.failoverMarkUnhealthy(providerName, causeReason(err))
+					fallbackP, fbName, fbErr := e.router.Fallback(mapKeys(tried)...)
+					if fbErr != nil || fbName == "" || tried[fbName] {
+						break
+					}
+					trace.L(ctx).Warn("Provider 降级", "from", providerName, "to", fbName, "err", err.Error(), "session", sessionID)
 					provider = fallbackP
 					providerName = fbName
 					modelName = e.getProviderModel(fbName, msg.Metadata)
+					tried[fbName] = true
+					// BUG-20260712：按目标 provider locality 重建 cloud-safe 请求（回退到云端时
+					// 不再复用带 <memory-context> 的本地请求，规避云 egress 拦截）。无工具直连路径
+					// 无 tools 需重挂；重新套一次 per-turn policy 以匹配新 model。
+					ctx, req = e.rebuildRequestForFailover(ctx, msg, history, kbContext, fbName)
+					applyPerTurnRequestPolicy(&req, modelName, msg, history)
 					resp, _, err = e.completeWithThinkingTimeout(ctx, provider, providerName, modelName, req)
+					if err == nil {
+						break
+					}
 				}
 			}
 			if err != nil {
-				return nil, fmt.Errorf("provider %s 调用失败: %w", providerName, err)
+				if explicitProvider {
+					// 显式 pin：透传底层原因（既有契约，方便用户排障），不友好翻译、不改派 provider。
+					return nil, fmt.Errorf("provider %s 调用失败: %w", providerName, err)
+				}
+				// 非显式且回退全失败：原始技术错误只进日志，返回翻译后的友好中文（不 %w 泄漏堆栈/状态码）。
+				trace.L(ctx).Warn("provider 无工具直连调用失败", "provider", providerName, "model", modelName, "err", err.Error(), "session", sessionID)
+				return nil, friendlyLLMError(err)
 			}
 		}
 		return e.finalizeReply(ctx, sessionID, msg, provider, req, resp, providerName, modelName, cacheInput, nil, nil)
@@ -1110,6 +1212,7 @@ func (e *ReActEngine) completeWithTools(
 	thinkingTracker := &thinkingRecoveryTracker{}
 	selector := &runtimeProviderSelector{
 		router:           e.router,
+		markUnhealthy:    e.failoverMarkUnhealthy,
 		initialProvider:  provider,
 		initialName:      providerName,
 		initialModel:     modelName,
@@ -1162,6 +1265,12 @@ func (e *ReActEngine) completeWithTools(
 	// 以它为实例 scope（同 authUserCtxKey 纪律：不信 LLM 传的 agent 参数）。此前唯一
 	// stamp 点在零调用的死函数 processStreamToolLoop 里，活跃路径恒空。
 	ctx = skill.WithRoutedAgent(ctx, strings.TrimSpace(msg.Metadata["routed_agent"]))
+	trace.L(ctx).Info("Runtime Run 调用准备（工具循环）",
+		"provider", providerName, "model", modelName, "local", isLocal,
+		"tools", len(req.Tools), "attachments", len(msg.Attachments),
+		"num_ctx", reqNumCtxField(req), "prompt_bytes", promptBytesField(req),
+		"history", len(history), "egress", egressSummaryField(ctx),
+		"agent", msg.Metadata["routed_agent"], "source", msg.Metadata["source"], "session", sessionID)
 	result, err := runner.Run(ctx, hruntime.Request{
 		ID:           messageRequestID(msg),
 		Messages:     req.Messages,
@@ -1186,6 +1295,44 @@ func (e *ReActEngine) completeWithTools(
 			Limits:       hruntime.Limits{MaxTurns: maxTurns},
 		})
 	}
+	// BUG-20260711 多跳 provider 回退：runner 内建单跳回退能换一个 provider，但若那个也不可用
+	// 就放弃。provider 级不可用（429/5xx/超时/连接失败）且非用户显式 pin 时，遍历剩余健康
+	// provider 一轮——用同一 runner+selector 重跑（failoverAdvance 已熔断失败者并把 current 推进
+	// 到下一个未尝试的健康 provider，Select 会返回它）。exclude 集合累积防死循环，全失败落
+	// friendlyLLMError。显式 pin 由 failoverAdvance 内部拒绝（尊重用户选择，不静默改派）。
+	for err != nil && isProviderUnavailableError(err) && selector.failoverAdvance(err) {
+		_, fbName, fbModel := selector.Current()
+		trace.L(ctx).Warn("Provider 回退重试", "to", fbName, "model", fbModel, "err", err.Error(), "session", sessionID)
+		// BUG-20260712：按目标 provider locality 重建 cloud-safe 请求（回退到云端时 buildTurnContext
+		// 不注入跨会话记忆 → 信封不含 ClassMemory → 不触发云 egress 拦截）。工具沿用原 tools 重新挂上，
+		// 别把 tools 丢了；重套 per-turn policy 以匹配新 model。ctx 链上的 sink/routedAgent 值保留。
+		ctx, req = e.rebuildRequestForFailover(ctx, msg, history, kbContext, fbName)
+		if len(tools) > 0 {
+			req.Tools = tools
+		}
+		applyPerTurnRequestPolicy(&req, fbModel, msg, history)
+		result, err = runner.Run(ctx, hruntime.Request{
+			ID:           messageRequestID(msg),
+			Messages:     req.Messages,
+			Tools:        req.Tools,
+			ProviderName: fbName,
+			ModelName:    fbModel,
+			Metadata:     req.Metadata,
+			Limits:       hruntime.Limits{MaxTurns: maxTurns},
+		})
+		// 新 provider 若又不支持工具调用，同样去工具重试一次（与首个 provider 对称）。
+		if err != nil && len(req.Tools) > 0 && isToolUnsupportedError(err) {
+			result, err = runner.Run(ctx, hruntime.Request{
+				ID:           messageRequestID(msg),
+				Messages:     req.Messages,
+				Tools:        nil,
+				ProviderName: fbName,
+				ModelName:    fbModel,
+				Metadata:     req.Metadata,
+				Limits:       hruntime.Limits{MaxTurns: maxTurns},
+			})
+		}
+	}
 	// 用一等终止原因判断（而非 errors.Is 反查错误）：达到轮次上限时 runtime 仍带回模型已
 	// 产出的部分结果（含已计费 token），不当硬错误丢弃——照常落库/返回 + 追加轮次上限提示，
 	// 用户可继续追问，而不是看到“请求失败”。其余错误仍按硬失败处理。
@@ -1193,7 +1340,7 @@ func (e *ReActEngine) completeWithTools(
 	if err != nil && !maxTurnsHit {
 		// BUG-20260711-B：不把原始 500 / cmake / llama-server 堆栈甩给用户——原始 err 只进
 		// 日志，返回翻译后的友好中文（本地运行时缺组件 / 工具不支持兜底 / 限流 / 鉴权 / 超时）。
-		trace.L(ctx).Warn("runtime 工具循环失败", "provider", providerName, "model", modelName, "err", err.Error(), "session", sessionID)
+		trace.L(ctx).Warn("runtime 工具循环失败", "provider", providerName, "model", modelName, "num_ctx", reqNumCtxField(req), "attachments", len(msg.Attachments), "egress", egressSummaryField(ctx), "err", err.Error(), "session", sessionID)
 		return nil, friendlyLLMError(err)
 	}
 	if result == nil {
@@ -1453,6 +1600,15 @@ func (e *ReActEngine) getProviderModel(providerName string, metadata map[string]
 		}
 	}
 	return providerName // 回退到 Provider 名称本身
+}
+
+// failoverMarkUnhealthy 是 runtimeProviderSelector 回退时的熔断回调（BUG-20260711）：把失败
+// provider 短期打黑 providerFailoverTTL，让后续 Route 直接避让、不再每条消息先吃一次 429。
+func (e *ReActEngine) failoverMarkUnhealthy(name, reason string) {
+	if e == nil || e.router == nil {
+		return
+	}
+	e.router.MarkProviderUnhealthy(name, reason, providerFailoverTTL)
 }
 
 func markLLMProviderUnhealthy(router *llmrouter.Selector, providerName string, err error) {
@@ -1902,12 +2058,18 @@ func (e *ReActEngine) processStreamRuntime(
 			req.Tools = tools
 		}
 		applyPerTurnRequestPolicy(&req, selection.modelName, msg, history)
+		e.applyLocalNumCtxCap(&req, isLocal) // 本地 Ollama：按配置钳 num_ctx，防 KV 撑爆内存（BUG-20260712）
 		if len(req.Tools) == 0 && isLocal && msg.Metadata["thinking"] != "on" && needsNoThinkInjection(selection.modelName) {
 			injectNoThink(req.Messages)
 			trace.L(ctx).Info("注入 /no_think", "model", selection.modelName)
 		}
 
-		trace.L(ctx).Info("Runtime Stream 调用准备", "tools", len(req.Tools), "provider", selection.providerName, "model", selection.modelName, "local", isLocal)
+		trace.L(ctx).Info("Runtime Stream 调用准备",
+			"provider", selection.providerName, "model", selection.modelName, "local", isLocal,
+			"tools", len(req.Tools), "attachments", len(msg.Attachments),
+			"num_ctx", reqNumCtxField(req), "prompt_bytes", promptBytesField(req),
+			"history", len(history), "egress", egressSummaryField(ctx),
+			"agent", msg.Metadata["routed_agent"], "source", msg.Metadata["source"], "session", sessionID)
 
 		const hardMaxTurns = 50
 		var budget *BudgetController
@@ -1919,6 +2081,7 @@ func (e *ReActEngine) processStreamRuntime(
 		}
 		selector := &runtimeProviderSelector{
 			router:           e.router,
+			markUnhealthy:    e.failoverMarkUnhealthy,
 			initialProvider:  selection.provider,
 			initialName:      selection.providerName,
 			initialModel:     selection.modelName,
@@ -1990,6 +2153,44 @@ func (e *ReActEngine) processStreamRuntime(
 				StreamMode:   streamMode,
 			}, sink)
 		}
+		// BUG-20260711 多跳 provider 回退（流式，与非流式 completeWithTools 对称）：provider 级
+		// 不可用且非显式 pin 时，遍历剩余健康 provider 一轮，用同一 runner+selector+sink 重跑。
+		// 错误发生在 Stream 建连/首个 provider 调用、还没 emit 内容时，重试前不 notify/不塞
+		// error，回退安全；failoverAdvance 已熔断失败者并推进 current，Select 返回它。
+		for err != nil && isProviderUnavailableError(err) && selector.failoverAdvance(err) {
+			_, fbName, fbModel := selector.Current()
+			trace.L(ctx).Warn("Provider 回退重试（流式）", "to", fbName, "model", fbModel, "err", err.Error(), "session", sessionID)
+			// BUG-20260712：按目标 provider locality 重建 cloud-safe 请求（回退到云端时不注入跨会话
+			// 记忆 → 信封不含 ClassMemory → 不触发云 egress 拦截）。streamCtx 链上的 sink/routedAgent
+			// 值保留；工具沿用原 tools 重新挂上，别把 tools 丢了；重套 per-turn policy 匹配新 model。
+			streamCtx, req = e.rebuildRequestForFailover(streamCtx, msg, history, kbContext, fbName)
+			if len(tools) > 0 {
+				req.Tools = tools
+			}
+			applyPerTurnRequestPolicy(&req, fbModel, msg, history)
+			result, err = runner.Stream(streamCtx, hruntime.Request{
+				ID:           messageRequestID(msg),
+				Messages:     req.Messages,
+				Tools:        req.Tools,
+				ProviderName: fbName,
+				ModelName:    fbModel,
+				Metadata:     req.Metadata,
+				Limits:       hruntime.Limits{MaxTurns: maxTurns},
+				StreamMode:   streamMode,
+			}, sink)
+			if err != nil && len(req.Tools) > 0 && isToolUnsupportedError(err) {
+				result, err = runner.Stream(streamCtx, hruntime.Request{
+					ID:           messageRequestID(msg),
+					Messages:     req.Messages,
+					Tools:        nil,
+					ProviderName: fbName,
+					ModelName:    fbModel,
+					Metadata:     req.Metadata,
+					Limits:       hruntime.Limits{MaxTurns: maxTurns},
+					StreamMode:   streamMode,
+				}, sink)
+			}
+		}
 		// 用一等终止原因判断（而非 errors.Is 反查错误）：达到轮次上限时 runtime 仍带回模型
 		// 已产出的部分内容（多半已经流式给了客户端），不当硬错误丢弃——继续走 finalize，尾部
 		// 追加轮次上限提示，用户可继续追问。其余错误仍按硬失败处理。
@@ -1997,7 +2198,7 @@ func (e *ReActEngine) processStreamRuntime(
 		if err != nil && !maxTurnsHit {
 			// BUG-20260711-B：不把原始 500 / cmake / llama-server 堆栈甩给用户——原始 err 只
 			// 进日志，往客户端只发翻译后的友好中文。
-			trace.L(ctx).Warn("runtime stream 失败", "provider", selection.providerName, "model", selection.modelName, "err", err.Error(), "session", sessionID)
+			trace.L(ctx).Warn("runtime stream 失败", "provider", selection.providerName, "model", selection.modelName, "num_ctx", reqNumCtxField(req), "attachments", len(msg.Attachments), "egress", egressSummaryField(ctx), "err", err.Error(), "session", sessionID)
 			friendly := friendlyLLMError(err)
 			sink.notifyStarted(friendly)
 			ch <- &adapter.ReplyChunk{Error: friendly, Done: true}
@@ -3131,6 +3332,30 @@ func (e *ReActEngine) buildCompletionRequest(ctx context.Context, msg *adapter.M
 	}
 	applyCompletionOverrides(&req, msg.Metadata)
 	return req
+}
+
+// rebuildRequestForFailover 为回退目标 provider 重建 ctx+请求：起一个干净的 general_chat egress
+// 信封 + 盖目标 provider 的本地/云 locality，让 buildTurnContext 按目标决定是否携带跨会话记忆
+// （云端不带 → 信封不含 ClassMemory → 不触发云 egress 拦截）。
+//
+// 修 BUG-20260712：回退 local→cloud 若复用初始「为本地构建、带 <memory-context>」的请求，云端
+// cloudEgressProvider 守卫会按 ctx 信封里的 ClassMemory 把整条对话硬拦死（"敏感数据类 memory 不
+// 允许在用途 general_chat 下出本机"）。根因修法是**回退按目标 locality 重建 cloud-safe 请求**，让
+// 记忆遇云以「不注入」优雅降级，而不是把 egress 错误也加进重试（那样只会拿带 memory 的请求再撞一次）。
+//
+// 传入的 ctx 链上的非 egress 值（tool reply meta sink / routed agent 等）经 WithValue 链保留；
+// 只有 egress 信封被 labelMessageEgress 用一个全新的 envelope 覆盖（WithRequest 不继承父信封）。
+// 工具沿用原 tools（helper 不负责挂 tools，调用方在返回后重新挂上 req.Tools），别把 tools 丢了。
+func (e *ReActEngine) rebuildRequestForFailover(ctx context.Context, msg *adapter.Message, history []hexagon.Message, kbContext, providerName string) (context.Context, hexagon.CompletionRequest) {
+	// BUG-20260712-b：本地 provider 的 header 超时会 cancel 共享请求 ctx（错误呈 "context
+	// canceled"）——回退重试若继承这个已取消的 ctx，会对健康的目标 provider（如智谱）立刻
+	// "context canceled" 失败，回退白回退。用 WithoutCancel 脱离上游取消，让回退能真正打到
+	// 健康 provider；各 provider 客户端自带超时兜底，不会无限挂。真机取证：本地 Ollama 超时
+	// 取消后，回退到智谱 glm-4v-flash 立刻 context canceled → 整条对话仍失败。
+	base := context.WithoutCancel(ctx)
+	fresh := labelMessageEgress(base, msg) // 干净 general_chat 信封（含附件/文档类，但不含 memory）
+	fresh = withProviderLocality(fresh, isLocalProvider(providerName))
+	return fresh, e.buildCompletionRequest(fresh, msg, history, kbContext)
 }
 
 func (e *ReActEngine) completeDirect(
