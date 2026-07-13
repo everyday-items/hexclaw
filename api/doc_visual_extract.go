@@ -60,9 +60,17 @@ func extractDocumentForKnowledge(ctx context.Context, ext string, data []byte, k
 			res.Warnings = append(res.Warnings, "PDF 文本层解析失败，已尝试视觉 OCR/VLM："+err.Error())
 			res.Text = ""
 		}
-		sections, warnings := extractPDFVisualSections(ctx, data, kb)
-		res.Warnings = append(res.Warnings, warnings...)
-		res.Text = mergeVisualSections(res.Text, sections)
+		visualLimit, adaptiveWarning := pdfVisualPageLimit(res.Text, res.PageCount, docVisionMaxPages())
+		if adaptiveWarning != "" {
+			res.Warnings = append(res.Warnings, adaptiveWarning)
+		}
+		// 文本层完整的大 PDF 不在同步上传请求里再逐页调用 VLM；扫描版大 PDF 则
+		// 有界抽样，避免 20 次慢本地视觉请求把整个 5 分钟预算耗尽。
+		if visualLimit > 0 || adaptiveWarning == "" {
+			sections, warnings := extractPDFVisualSectionsWithLimit(ctx, data, kb, visualLimit)
+			res.Warnings = append(res.Warnings, warnings...)
+			res.Text = mergeVisualSections(res.Text, sections)
+		}
 		if strings.TrimSpace(res.Text) == "" && err != nil {
 			return res, err
 		}
@@ -162,7 +170,10 @@ func extractDocxVisualSections(ctx context.Context, data []byte, kb *knowledge.M
 }
 
 func extractPDFVisualSections(ctx context.Context, data []byte, kb *knowledge.Manager) ([]visualSection, []string) {
-	maxPages := docVisionMaxPages()
+	return extractPDFVisualSectionsWithLimit(ctx, data, kb, docVisionMaxPages())
+}
+
+func extractPDFVisualSectionsWithLimit(ctx context.Context, data []byte, kb *knowledge.Manager, maxPages int) ([]visualSection, []string) {
 	if maxPages <= 0 {
 		return nil, []string{"PDF 视觉解析已关闭，仅索引文本层"}
 	}
@@ -193,6 +204,44 @@ func extractPDFVisualSections(ctx context.Context, data []byte, kb *knowledge.Ma
 		})
 	}
 	return sections, warnings
+}
+
+const (
+	largePDFPageThreshold     = 40
+	largePDFVisualSamplePages = 3
+	minPDFTextRunesPerPage    = 80
+)
+
+// pdfVisualPageLimit 为同步上传阶段选择视觉页预算。页数较少时保持原配置；百页 PDF
+// 有可用文本层时直接索引全部文本，扫描版则只抽样少数页面，避免逐页 VLM 串行阻塞。
+func pdfVisualPageLimit(text string, pageCount, configured int) (int, string) {
+	if configured <= 0 || pageCount <= largePDFPageThreshold {
+		return configured, ""
+	}
+	if pdfHasUsableTextLayer(text, pageCount) {
+		return 0, fmt.Sprintf("PDF 共 %d 页且文本层可用，已优先完成全文文本索引；为避免大文档超时，本次跳过同步逐页视觉增强", pageCount)
+	}
+	limit := configured
+	if limit > largePDFVisualSamplePages {
+		limit = largePDFVisualSamplePages
+	}
+	return limit, fmt.Sprintf("PDF 共 %d 页且文本层不足，本次仅抽样前 %d 页做视觉解析以避免上传超时；建议按章节拆分扫描版 PDF 以完整入库", pageCount, limit)
+}
+
+func pdfHasUsableTextLayer(text string, pageCount int) bool {
+	if pageCount <= 0 {
+		return false
+	}
+	visibleRunes := 0
+	for _, r := range text {
+		switch r {
+		case ' ', '\t', '\r', '\n':
+			continue
+		default:
+			visibleRunes++
+		}
+	}
+	return visibleRunes >= pageCount*minPDFTextRunesPerPage
 }
 
 type docxImage struct {

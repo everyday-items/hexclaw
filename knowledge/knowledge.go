@@ -1219,7 +1219,12 @@ func (m *Manager) buildChunks(ctx context.Context, doc *Document, ts time.Time) 
 				embedTexts[i] = docPrefix + t
 			}
 		}
-		embeddings, err = m.embedder.Embed(ragEmbedContext(ctx), embedTexts)
+		// BUG-20260714：嵌入模型可能正在下载/冷启动（典型为本地 nomic-embed-text），
+		// 文档批量 Embed 若无独立预算会吞掉上传请求完整的 5 分钟总超时。embedding 是
+		// 增强能力，超时后先落 FTS 文本索引；模型就绪后用户可重新上传以补齐向量。
+		embedCtx, cancel := context.WithTimeout(ragEmbedContext(ctx), documentEmbeddingTimeout)
+		embeddings, err = m.embedder.Embed(embedCtx, embedTexts)
+		cancel()
 		if err != nil {
 			logger.Warn("[knowledge] 生成向量嵌入失败，降级为纯文本索引", "title", doc.Title, "error", err)
 			embeddings = nil
@@ -1251,12 +1256,20 @@ func (m *Manager) buildChunks(ctx context.Context, doc *Document, ts time.Time) 
 const (
 	contextualDocCharBudget   = 6000 // 喂给 LLM 的文档正文上限（rune）
 	contextualChunkCharBudget = 1200 // 喂给 LLM 的单 chunk 上限（rune）
-	maxContextualLLMChunks    = 200  // 单文档最多对前 N 个 chunk 生成 LLM 情境（控成本，超出打 WARN 不静默）
+	// maxInlineContextualLLMChunks 限制同步摄取阶段的逐 chunk LLM 增强。
+	// 百页教材通常产生数百个 chunk；继续逐块补全会让一次上传发出数百次串行模型请求。
+	// 超过阈值时所有 chunk 仍保留标题/章节定位，只跳过可选的 LLM 情境句。
+	maxInlineContextualLLMChunks = 24
 	// queryEmbedTimeout 检索路径单次查询向量化预算（BUG-20260703 同构防护）。
 	// 仅约束 Search 的 query embed（单条短文本，正常远 <1s）；文档导入的批量
 	// embedding 走 UpsertDocument 等独立路径，不受此预算限制。
 	queryEmbedTimeout = 4 * time.Second
 )
+
+// documentEmbeddingTimeout 是单次文档批量嵌入预算。独立于上传总预算，确保本地
+// embedding 模型缺失、下载中或冷启动时仍有时间把 chunks 降级写入 FTS5。
+// var 便于回归测试压小预算，不改变生产默认值。
+var documentEmbeddingTimeout = 60 * time.Second
 
 // contextualize 给每个 chunk 前置文档级上下文（Anthropic Contextual Retrieval）。
 //
@@ -1268,30 +1281,28 @@ func (m *Manager) contextualize(ctx context.Context, doc *Document, ragDocs []he
 	if !m.cfg().ContextualEnabled {
 		return
 	}
-	useLLM := m.llm != nil && len(ragDocs) > 1
+	useLLM := m.llm != nil && len(ragDocs) > 1 && len(ragDocs) <= maxInlineContextualLLMChunks
 	var docCtx string
 	if useLLM {
 		docCtx = clampRunes(doc.Content, contextualDocCharBudget)
 	}
-	llmBudget := maxContextualLLMChunks
 	for i := range ragDocs {
 		header := headerPathOf(ragDocs[i].Metadata)
 		var blurb string
-		if useLLM && llmBudget > 0 {
+		if useLLM {
 			if b, err := m.generateChunkContext(ctx, docCtx, ragDocs[i].Content); err != nil {
 				logger.Warn("[knowledge] contextual 情境生成失败，跳过该 chunk", "error", err)
 			} else {
 				blurb = b
-				llmBudget--
 			}
 		}
 		if prefix := buildContextPrefix(doc.Title, header, blurb); prefix != "" {
 			ragDocs[i].Content = prefix + "\n\n" + ragDocs[i].Content
 		}
 	}
-	if useLLM && len(ragDocs) > maxContextualLLMChunks {
-		logger.Warn("[knowledge] 文档 chunk 数超过 contextual LLM 上限，仅前 N 个生成情境摘要",
-			"chunks", len(ragDocs), "limit", maxContextualLLMChunks, "title", doc.Title)
+	if m.llm != nil && len(ragDocs) > maxInlineContextualLLMChunks {
+		logger.Info("[knowledge] 大文档跳过逐 chunk LLM 情境，保留确定性标题/章节定位",
+			"chunks", len(ragDocs), "limit", maxInlineContextualLLMChunks, "title", doc.Title)
 	}
 }
 
@@ -1338,7 +1349,9 @@ func (m *Manager) generateChunkContext(ctx context.Context, docContent, chunk st
 
 请用一句不超过 50 字的话，说明这个片段在整篇文档中的位置与主题，以便检索时更好地定位。只输出这一句话，不要任何解释或前后缀。`,
 		docContent, clampRunes(chunk, contextualChunkCharBudget))
-	out, err := m.llm.Complete(ragEnrichContext(ctx), prompt)
+	// 同步入库也使用辅助 LLM 的单次预算与共享熔断。小文档仍能获得情境增强，
+	// 但本地慢模型最多消耗两个预算窗口，之后快速退化为确定性定位。
+	out, err := m.retrievalLLM().Complete(ragEnrichContext(ctx), prompt)
 	if err != nil {
 		return "", err
 	}

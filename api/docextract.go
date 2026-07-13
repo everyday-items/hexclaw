@@ -80,31 +80,81 @@ var pdftotextKnownPaths = []string{"/opt/homebrew/bin/pdftotext", "/usr/local/bi
 // extractPDFText 优先用 poppler pdftotext（CJK 完整）；不可用/失败时降级 hexagon rag/loader
 // （纯 Go、无外部依赖，简单 PDF 可用，复杂中文 PDF 可能乱码——故仅作兜底）。
 func extractPDFText(ctx context.Context, data []byte) (string, int, error) {
+	pdftotextPageCount := 0
 	if bin := findTool("pdftotext", pdftotextKnownPaths...); bin != "" {
 		if text, err := runToolOnTemp(ctx, bin, ".pdf", data, "-enc", "UTF-8", "-q", "{}", "-"); err == nil {
+			normalized, pageCount := normalizeExtractedPDFText(text)
+			pdftotextPageCount = pageCount
 			if strings.TrimSpace(text) != "" {
-				return text, 0, nil
+				return normalized, pageCount, nil
 			}
+			// 扫描版 PDF 的 pdftotext 可能只返回分页符；先记下页数，但仍继续走
+			// 纯 Go loader 兜底。部分简单 PDF 没有字体映射，pdftotext 为空而 loader
+			// 仍能读到正文，不能因拿到了页数就提前返回空文本。
 		}
 	}
 	docs, err := loader.NewPDFLoaderFromReader(bytes.NewReader(data)).Load(ctx)
 	if err != nil {
-		return "", 0, err
+		return "", pdftotextPageCount, err
 	}
-	var sb strings.Builder
+	var raw strings.Builder
 	pageCount := 0
 	for i, d := range docs {
 		if i > 0 {
-			sb.WriteString("\n\n")
+			raw.WriteByte('\f')
 		}
-		sb.WriteString(d.Content)
+		raw.WriteString(d.Content)
 	}
 	if len(docs) > 0 {
 		if pc, ok := docs[0].Metadata["page_count"].(int); ok {
 			pageCount = pc
 		}
 	}
-	return sb.String(), pageCount, nil
+	normalized, inferredPages := normalizeExtractedPDFText(raw.String())
+	if pageCount <= 0 {
+		pageCount = inferredPages
+	}
+	if pageCount <= 0 {
+		pageCount = pdftotextPageCount
+	}
+	return normalized, pageCount, nil
+}
+
+// normalizeExtractedPDFText 把 pdftotext 的 form-feed 分页符转换为 Markdown 页标题，
+// 同时返回真实页数。这样 MarkdownSplitter 会把“第 N 页”写入 header_path，检索结果
+// 能定位页码；也让摄取层可以针对百页文档选择有界的视觉解析策略。
+func normalizeExtractedPDFText(raw string) (string, int) {
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	raw = strings.ReplaceAll(raw, "\r", "\n")
+	trimmedLineEnd := strings.TrimRight(raw, " \t\n")
+	separatorCount := strings.Count(raw, "\f")
+	pageCount := separatorCount
+	if !strings.HasSuffix(trimmedLineEnd, "\f") && strings.TrimSpace(raw) != "" {
+		pageCount++
+	}
+	if pageCount == 0 {
+		return strings.TrimSpace(raw), 0
+	}
+
+	pages := strings.Split(raw, "\f")
+	if pageCount == 1 {
+		return strings.TrimSpace(pages[0]), pageCount
+	}
+	var b strings.Builder
+	for i, page := range pages {
+		if i >= pageCount {
+			break
+		}
+		page = strings.TrimSpace(page)
+		if page == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		fmt.Fprintf(&b, "## PDF 第 %d 页\n\n%s", i+1, page)
+	}
+	return b.String(), pageCount
 }
 
 // extractDOCText 解析老版 .doc（OLE2 二进制）：用 macOS 内置 textutil（CJK 安全）。
