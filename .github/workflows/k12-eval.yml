@@ -1,6 +1,6 @@
 name: K12 Eval Gate
 
-# K12 v0.5.0 发版门（架构文档 §11 / 发版 checklist）：
+# K12 v0.5.0-beta 发版门（架构文档 §11 / 发版 checklist）：
 #  - harness 门（每次跑，无 key）：eval 集完整性 + 阈值判定逻辑 + 作文不代写启发式 + 超纲检出。
 #  - 真模型门（env-gated）：配置 HEXCLAW_REAL_LLM_EVAL secret 后跑真模型批改准确率 ≥90%；
 #    无 secret 时 TestK12EvalGate_RealModel 自动 skip（不阻断 fork PR）。

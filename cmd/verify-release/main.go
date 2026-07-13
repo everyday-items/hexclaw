@@ -8,8 +8,8 @@
 //
 // 任一阶段非 0 退出码即阻断发版。CI 流水线集成：
 //
-//	go run ./cmd/verify-release -repo $PWD -version 0.4.0 \
-//	    -version-files package.json,src-tauri/tauri.conf.json
+//	go run ./cmd/verify-release -repo $PWD -version 0.5.0-beta \
+//	    -version-files hexclaw.go,cmd/hexclaw/main.go,api/openapi.yaml
 //
 // flag eval.framework.v1 在本工具内部强制 ON（CI 必须跑 eval；不接受 OFF 跳过）。
 package main
@@ -31,7 +31,7 @@ import (
 func main() {
 	var (
 		repoRoot     = flag.String("repo", ".", "仓库根目录（用于版本一致检查）")
-		version      = flag.String("version", "", "期望发版版本（必填，如 0.4.0）")
+		version      = flag.String("version", "", "期望发版版本（必填，如 0.5.0-beta）")
 		versionFiles = flag.String("version-files", "package.json", "逗号分隔的版本文件列表（在仓库根目录下相对路径）")
 		canaryDryRun = flag.Bool("canary-dry-run", true, "canary 阶段做 dry-run（不真发布）")
 		failFast     = flag.Bool("fail-fast", true, "Gate 阶段任一 FAIL 立即返回")
@@ -39,7 +39,7 @@ func main() {
 	flag.Parse()
 
 	if *version == "" {
-		fmt.Fprintln(os.Stderr, "❌ -version 必填（如 0.4.0）")
+		fmt.Fprintln(os.Stderr, "❌ -version 必填（如 0.5.0-beta）")
 		os.Exit(2)
 	}
 

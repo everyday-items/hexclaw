@@ -168,7 +168,7 @@ func (p *MatrixPlugin) Adapter() adapter.Adapter {
 
 ```go
 mgr := hcplugin.NewManager()
-mgr.SetHostContext("0.5.0", flags)
+mgr.SetHostContext("0.5.0-beta", flags)
 
 // 注册插件
 mgr.Register(myplugin.New())

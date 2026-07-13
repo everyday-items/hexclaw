@@ -21,7 +21,7 @@
 - **LLM Smart Router** — Multi-provider auto-switching, failover, cost optimization, and model tool-call capability probing
 - **Skill System** — Built-in search/weather/translation/summary/media-generation/messaging/document-export and more, 7-phase pipeline, `.pending` approval flow, TrustLevel filtering, and TOCTOU checks
 - **Semantic Cache** — Singleflight anti-stampede + TTL jitter anti-avalanche + empty-value anti-penetration
-- **Knowledge Base** — FTS5 + vector hybrid retrieval, 5-stage RAG pipeline, and context augmentation
+- **Knowledge Base** — FTS5 + vector hybrid retrieval, a 5-stage RAG pipeline, automatic Ollama embedding discovery/install, and evidence-backed recall
 - **Scenario Packs** — Six extension seams in `scenario` (record collections, constraints, view slots, Agent modes, buttons, eval suites) so the platform does not hard-code business scenarios
 - **Generic Records** — `records.agent_records` isolates by Agent and supports state transitions, dedupe keys, due queues, optimistic locking, and scenario-level field validation
 
@@ -73,7 +73,7 @@ Ready-to-use built-in skills (no install required, invoked via LLM tool_call):
 - **Native MCP Support** — Compatible with 3200+ MCP Servers (stdio + SSE + streamable transports)
 - **Markdown Skill Marketplace** — Compatible with OpenClaw skill format, lazy-loaded on demand
 - **Multi-Agent Routing** — Host multiple agents in one instance, route by platform/user/group
-- **K12 Parent-Tutoring Scenario Pack** — Built-in mistake notebook, review queue, prep cards, grade constraints, homework recognition/grading, and default cron delivery
+- **K12 Parent-Tutoring Scenario Pack** — Built-in homework-image recognition/grading, mistake notebook, review variations, prep cards, grade constraints, and default cron delivery
 - **Canvas / A2UI** — Agent-generated interactive UIs (charts, forms, kanban, and 8+ component types)
 - **Security Audit CLI** — `hexclaw security audit` one-click security check + remediation suggestions
 - **Voice Interaction** — STT/TTS transcription and synthesis with chained MiniMax / Edge / OpenAI / Azure TTS fallback
@@ -747,14 +747,15 @@ go vet ./...
 golangci-lint run
 
 # Release gate + Eval + canary dry-run
-go run ./cmd/verify-release -repo . -version 0.5.0 -version-files hexclaw.go
+go run ./cmd/verify-release -repo . -version 0.5.0-beta \
+  -version-files hexclaw.go,cmd/hexclaw/main.go,api/openapi.yaml,README.md,README.en.md,SECURITY.md,SECURITY.zh.md
 ```
 
 ## Tech Stack
 
 | Component | Technology |
 |-----------|-----------|
-| Language | Go 1.25.7+ |
+| Language | Go 1.25.7+ compatibility baseline (1.25.12 release toolchain) |
 | Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.5.9 |
 | AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.2.4 |
 | Utility Library | [toolkit](https://github.com/hexagon-codes/toolkit) v0.2.6 |
@@ -799,7 +800,7 @@ chore: build/toolchain updates
 
 | Project | Description | Repository |
 |---------|-------------|------------|
-| **Hexagon** | Go AI Agent framework (core engine) v0.5.8 | [hexagon](https://github.com/hexagon-codes/hexagon) |
+| **Hexagon** | Go AI Agent framework (core engine) v0.5.9 | [hexagon](https://github.com/hexagon-codes/hexagon) |
 | **ai-core** | AI core library (LLM/Tool/Memory) v0.2.4 | [ai-core](https://github.com/hexagon-codes/ai-core) |
 | **toolkit** | Go utility library v0.2.6 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI dashboard (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
@@ -808,21 +809,29 @@ chore: build/toolchain updates
 
 ## Changelog
 
-### Unreleased
+### v0.5.0-beta (2026-07-13)
 
 **Scenario Packs & Records**
 - **Scenario extension seams** — Added the `scenario` registry for record collections, constraints, view slots, Agent modes, buttons, and eval suites without hard-coding business packages in the platform layer.
 - **Generic records** — Added `records.agent_records` with Agent isolation, schema validation, dedupe keys, due review queues, state transitions, and optimistic locking.
-- **K12 parent-tutoring pack** — Added `/api/k12/*`, `k12_grade`/`k12_review`, mistake and accumulation notebooks, grade constraints, prep cards, default cron delivery, and a K12-specific eval workflow.
+- **K12 parent-tutoring pack** — Closed the loop from inline homework-image recognition, subject/problem labeling and blank-problem solving through grading, mistake correction, review variations, prep cards, and default cron delivery.
 
-**Execution & Governance**
-- **Execution primitive convergence** — `code_exec` is now the recommended execution entrypoint with snippet/file/module/project support and artifact metadata. `code`/`shell` remain for compatibility but are deprecated, the top-level `runtime/` package was removed, and sandbox capability now converges on toolkit + `skill/sandbox`.
-- **Unattended governance API** — Added autonomy profile, preflight, summary, decision-audit, and task-grant endpoints, plus purpose/data-class egress policy.
+**Models, Knowledge & Execution**
+- **Reasoning and multimodal routing** — Solving/grading can use a dedicated reasoning model; vision, embedding, and rerank calls route by purpose, and failover rebuilds requests for the target provider's locality.
+- **Embedding and recall lifecycle** — Discovers installed Ollama embedding models and exposes status/install operations. Short-input and scenario-session gates avoid irrelevant injection, while zero-evidence recall no longer reports false hits.
+- **Execution primitive convergence** — `code_exec` is the recommended snippet/file/module/project entrypoint with artifact metadata. `code`/`shell` remain deprecated compatibility tools, and sandbox capability converges on toolkit + `skill/sandbox`.
+
+**Reliability & Delivery**
+- **Vision image budgets** — Historical images are bounded by routing strategy; when an upstream rejects the image count, HexClaw retains current-turn images, removes the oldest image, and retries to prevent multi-turn homework grading failures and timeouts.
+- **DingTalk image loop** — `picture` messages enter the multimodal pipeline through `downloadCode`; success, failure, and timeout paths all recall the thinking placeholder and deliver a terminal message.
+- **Adapter/workflow resilience** — Bounded send queues, webhook body limits, MCP/IM lifecycle handling, condition nodes, and atomic persistence were hardened. Cron compilation now uses a text reasoning model.
 
 **Dependencies & CI/CD**
-- **Framework dependency upgrade** — `go.mod` now targets hexagon v0.5.9 / ai-core v0.2.4 / toolkit v0.2.6 and Go 1.25.7. `GOWORK=off go test ./... -run '^$'` passes, so release/CI-mode compilation no longer depends on local workspace-only dependency APIs.
-- **Default Hub tag** — Skill Marketplace now defaults to `hexagon-codes/hexclaw-hub` tag `v0.0.6`.
-- **CI/CD verification notes** — `sandbox-code-exec.yml` is the dedicated workflow for Linux/macOS `code_exec` strong-sandbox paths against toolkit, while Windows keeps the toolkit sandbox gate. Windows `code_exec` runtime integration tests are gated by the current toolkit/device capabilities. Normal Linux CI gates real sandbox execution by backend capability; the dedicated workflow forces proof with `HEXCLAW_P0_SANDBOX_PROOF=1`. The runner-integrity probe is skipped by default and only runs when `HEXCLAW_RUNNER_PROBE=1`.
+- **Framework dependency upgrade** — `go.mod` targets hexagon v0.5.9 / ai-core v0.2.4 / toolkit v0.2.6, keeps Go 1.25.7 as the compatibility baseline, and selects Go 1.25.12 as the release toolchain.
+- **Version-aware skill seeds** — Embedded first-run skills can upgrade by seed version; the default catalog remains aligned with `hexagon-codes/hexclaw-hub` tag `v0.0.6`.
+- **CI/CD verification** — `sandbox-code-exec.yml` proves strong-sandbox behavior; normal Linux CI gates real execution by backend capability, the dedicated workflow sets `HEXCLAW_P0_SANDBOX_PROOF=1`, and the runner-integrity probe only runs manually with `HEXCLAW_RUNNER_PROBE=1`.
+
+> See [CHANGELOG.md](CHANGELOG.md) for the complete release history.
 
 ### v0.4.4
 

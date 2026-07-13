@@ -4,21 +4,68 @@
 
 ## [Unreleased]
 
+## [0.5.0-beta] - 2026-07-13
+> 家长辅导场景包正式落地，打通作业图片识题、批改、错题、复习和定时投递闭环；同时加固本地/云端模型路由、知识召回、IM 送达与沙箱执行。
+
 ### Added
 - **场景包扩展框架**：新增 `scenario` 六缝注册表（记录集 / 约束 / 视图槽 / Agent mode / 按钮 / eval suite），平台层不再硬编码具体业务包。
 - **通用记录本**：新增 `records.agent_records`，以 Agent 为隔离键，支持 schema 校验、去重键、到期复习队列、状态机和乐观锁。
-- **K12 家长辅导场景包**：内置 `/api/k12/*`、`k12_grade`/`k12_review`、错题本、积累本、年级约束、备课卡、默认 cron 投递和 K12 专项评测 workflow。
-- **无人值守治理 API**：新增 autonomy profile、preflight、summary、decision audit、task grant 端点，并补齐 purpose/data-class 出网策略。
+- **K12 家长辅导场景包**：内置 `/api/k12/*`、`k12_grade`/`k12_review`、错题本、积累本、年级约束、备课卡、默认 cron 投递和 K12 专项评测 workflow；支持图片识题内联回显、学科/题型标注、空白题求解、错题纠正与变式复习。
+- **专用推理模型与嵌入模型闭环**：解题/批改可独立选择 reasoning model；知识库可发现已安装的 Ollama 嵌入模型，并提供状态检查与自动安装闭环。
+- **出站上下文**：新增 purpose × data-class 出网策略，按 chat、vision、embedding、rerank 等用途隔离本地/云端数据边界。
 
 ### Changed
-- 升级框架依赖至 hexagon **v0.5.9**、ai-core **v0.2.4**、toolkit **v0.2.6**；`go.mod` 同步到 Go **1.25.7**。`GOWORK=off go test ./... -run '^$'` 已通过，发版/CI 模式下全仓编译不再依赖本地 `go.work` 的隐式下层源码。
+- 升级框架依赖至 hexagon **v0.5.9**、ai-core **v0.2.4**、toolkit **v0.2.6**；`go.mod` 保持 Go **1.25.7** 兼容基线，发版工具链为 Go **1.25.12**。`GOWORK=off go test ./... -run '^$'` 已通过，发版/CI 模式下全仓编译不再依赖本地 `go.work` 的隐式下层源码。
 - **执行原语收敛**：`code_exec` 成为推荐执行入口，支持 snippet/file/module/project 与 artifact metadata；`code`/`shell` 保留兼容但标记弃用，顶层 `runtime/` 包删除，沙箱能力收敛到 toolkit + `skill/sandbox`。
-- **默认 Hub 标签**：技能市场默认目录对齐 `hexagon-codes/hexclaw-hub` `v0.0.6`。
+- **技能种子版本化**：首启内嵌技能支持版本感知升级，默认市场目录对齐 `hexagon-codes/hexclaw-hub` `v0.0.6`。
+- **本地/云端路由韧性**：本地默认模型启动预热并对齐 `num_ctx`；推理、视觉、embedding 和 rerank 按用途选路，provider failover 时重建符合目标 locality 的请求。
+- **工作流与平台生命周期**：条件节点、路由规则与配置更新改为原子持久化；MCP 客户端与 IM adapter 收敛启停、重连和投递语义。
 - 更新 CI/CD 文档口径：补充 `sandbox-code-exec.yml` 专项门禁、Linux CI 等价命令，以及 runner 完整性探针不得进入默认 `go test ./...` 的规则。
 
 ### Fixed
 - 修复 release 构建不可复现的依赖锁定问题：`skill/builtin/code_exec.go` 依赖的 sandbox 限额字段已由 `toolkit v0.2.6` 提供，不再需要本地 workspace 才能编译。
 - 将 runner 完整性故意失败探针改为 `HEXCLAW_RUNNER_PROBE=1` 手工门控，默认 `go test ./...` 不再被取证用例打红。
+- **视觉多轮请求**：按路由策略限制历史图片预算，遇到上游图片数超限时保留当轮图并丢弃最旧图重试，避免多轮作业批改因图片累积失败或超时。
+- **钉钉图片与终态反馈**：`picture` 消息经 `downloadCode` 进入多模态管道，增加格式/大小/时限护栏；成功、错误和 handler 超时都会撤回思考占位并使用独立预算送达终态消息。
+- **知识与记忆召回**：短输入/场景会话增加注入门控，无证据召回不再伪造命中，记忆和知识上下文不会越过云端出站边界。
+- **适配器与任务韧性**：加固有界发送队列、webhook 体限额、停止上下文和多平台连接生命周期；数学纯文本降级新增 Unicode 归一化。
+- **定时任务编译**：使用文本推理模型而不是视觉模型，并加固持续任务的幂等创建、状态恢复与历史记录。
+
+### Security
+- 场景包挂载路由纳入统一鉴权前缀；执行、视觉、embedding 和 rerank 统一遵循出站用途/数据分类策略，避免本地记忆、知识命中或图片在 provider 回退时误出网。
+
+## [0.4.9] - 2026-07-04
+> `code_exec` 强沙箱与文件授权、无人值守派发治理、官方 IM SDK 与知识/记忆边界加固。
+
+### Added
+- **沙箱运行工作区**：`code_exec` 新增 run workspace、FileAccessBroker 和项目/文件授权边界。
+- **无人值守治理**：新增 autonomy profile、preflight、summary、decision audit、task grant 端点与显式派发矩阵。
+- **知识库与模型能力 API**：开放记忆配置/状态与模型能力查询，知识库支持视觉文档内容提取。
+
+### Changed
+- 功能优先配置成为默认，cron/webhook/spawn/heartbeat/workflow 按派发来源和工具类别裁决无人值守执行。
+- 飞书、钉钉、LINE 适配器对齐官方 SDK；路由规则、多模态回复、流式思考时长和 cron Starlark 修复语义收敛。
+- 升级至 ai-core **v0.2.1**，并同步当时的 hexagon/toolkit 依赖栈。
+
+### Fixed
+- 收紧记忆召回与 RAG 辅助调用的数量/超时边界，修复 cron、MCP 与钉钉集成中的生命周期问题。
+- 稳定 Linux/macOS/Windows `code_exec` 沙箱 CI，发版模式可使用离线 Go module cache。
+
+## [0.4.8] - 2026-06-28
+> 多 Agent 编排 + 记忆生命周期 + RAG 增强 + 持续型任务；依赖升级 ai-core v0.1.11 / hexagon v0.5.7 / toolkit v0.2.3。
+
+### Added
+- **多 Agent 编排**：新增子代理注册、监督、合成、写隔离、反挂起与 goal/solve 验收闭环。
+- **记忆生命周期**：新增梦境整理、反思、PII 处理、画像、原子写、迁移和结构化召回。
+- **RAG 增强**：新增多模态、忠实度评估、精排、快照和嵌入装饰器；内置知识检索、记忆管理与会话检索技能。
+- **持续型任务**：打通 continuous cron、webhook/知识库链路与目标触发，工作流支持并行恢复。
+
+### Changed
+- 持久化会话内容块、工具调用与技能推理；IM 支持会话模型切换、工具摘要与代理拨号。
+- 升级至 ai-core **v0.1.11**、hexagon **v0.5.7**、toolkit **v0.2.3**。
+
+### Fixed
+- 统一中英文人设拆分与本地化语义；字符串截断改为 rune 边界，避免多字节字符被切裂。
 
 ## [0.4.7] - 2026-06-26
 > 技能/MCP 市场离线优先 + 应用自省自愈 skill（app_query/app_heal）+ 文档上传抽取预览 + 会话附件持久化；一组 CJK 截断 / 上游脱敏 / API 契约修复；框架依赖升级 hexagon v0.5.5 / ai-core v0.1.8。

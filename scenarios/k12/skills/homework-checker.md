@@ -5,7 +5,7 @@ description: 拍题批改第一入口——识题、OCR 回显护栏核对、分
 author: hexclaw
 version: "1.4.0"
 schema_version: 1
-min_engine_version: "0.5.0"
+min_engine_version: "0.5.0-beta"
 license: Apache-2.0
 category: education
 icon: "📷"

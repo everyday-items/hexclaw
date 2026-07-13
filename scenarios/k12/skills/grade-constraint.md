@@ -5,7 +5,7 @@ description: 把讲解锁在孩子当前学段学过的知识内，提供超纲�
 author: hexclaw
 version: "1.0.0"
 schema_version: 1
-min_engine_version: "0.5.0"
+min_engine_version: "0.5.0-beta"
 license: Apache-2.0
 category: education
 icon: "📏"

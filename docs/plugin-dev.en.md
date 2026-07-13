@@ -170,7 +170,7 @@ Register at application startup:
 
 ```go
 mgr := hcplugin.NewManager()
-mgr.SetHostContext("0.5.0", flags)
+mgr.SetHostContext("0.5.0-beta", flags)
 
 // Register plugins
 mgr.Register(myplugin.New())

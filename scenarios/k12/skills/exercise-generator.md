@@ -5,7 +5,7 @@ description: 按年级边界出练习题、变式题、错题卷——每题过�
 author: hexclaw
 version: "1.1.0"
 schema_version: 1
-min_engine_version: "0.5.0"
+min_engine_version: "0.5.0-beta"
 license: Apache-2.0
 category: education
 icon: "✏️"

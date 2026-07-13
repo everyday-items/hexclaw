@@ -26,4 +26,4 @@
 package hexclaw
 
 // Version 当前版本号；运行时实际版本由 cmd/hexclaw 通过 -ldflags 在构建时注入。
-const Version = "0.5.0"
+const Version = "0.5.0-beta"

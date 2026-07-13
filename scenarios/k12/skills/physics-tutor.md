@@ -5,7 +5,7 @@ description: 辅导、批改初中物理——先建物理图景再套公式、�
 author: hexclaw
 version: "1.1.0"
 schema_version: 1
-min_engine_version: "0.5.0"
+min_engine_version: "0.5.0-beta"
 license: Apache-2.0
 category: education
 icon: "⚛️"

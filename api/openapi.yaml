@@ -11,8 +11,9 @@ info:
 
     Contract 测试见 `api/contract_test.go`，CI 跑 `spectral lint api/openapi.yaml` 校验规范。
 
-    本 MVP 仅覆盖 cron 与核心 health；imagegen/videogen/chat 在后续 milestone 补全。
-  version: 0.4.1
+    本规范当前覆盖 cron 与核心 health 契约；其余已实现 API 见 README 的端点索引，
+    场景包契约由各场景目录单独维护（例如 `scenarios/k12/API.md`）。
+  version: 0.5.0-beta
 servers:
   - url: http://127.0.0.1:16060
     description: 桌面端本地 sidecar
