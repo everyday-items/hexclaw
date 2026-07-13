@@ -558,6 +558,7 @@ type accumDTO struct {
 	Subject   string `json:"subject"`
 	EntryType string `json:"entry_type"`
 	Content   string `json:"content"`
+	Source    string `json:"source"`
 	Status    string `json:"status"`
 }
 
@@ -593,7 +594,7 @@ func (h *handler) listAccumulation(w http.ResponseWriter, r *http.Request) {
 	for _, it := range items {
 		out = append(out, accumDTO{
 			RecordID: it.Record.RecordID, Subject: it.Fields.Subject, EntryType: it.Fields.EntryType,
-			Content: it.Fields.Content, Status: it.Record.Status,
+			Content: it.Fields.Content, Source: it.Fields.Source, Status: it.Record.Status,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": out})
