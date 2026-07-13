@@ -59,10 +59,13 @@ func TestSendQueue_CancelledContextRejectsSend(t *testing.T) {
 	})
 	defer q.Stop(context.Background())
 
-	// 模拟: handler 耗尽 timeout 后，ctx 已 deadline exceeded
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	// 模拟: handler 耗尽 timeout 后，ctx 已 deadline exceeded。
+	// 用「已过期的 deadline」而非 WithTimeout(1ms)+Sleep：Go 在 dur<=0 时同步置
+	// DeadlineExceeded（context.WithDeadline 内 `if dur <= 0 { cancel(DeadlineExceeded) }`），
+	// 不依赖 timer goroutine 触发——避免全量并行套件下 timer 被调度饥饿、ctx.Err() 未翻转
+	// 就被 Send 读到 nil 的 flaky（隔离能过、全量偶发 FAIL 的根因）。
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Millisecond))
 	defer cancel()
-	time.Sleep(5 * time.Millisecond) // 确保 ctx 已过期
 
 	err := q.Send(ctx, "chat-1", &Reply{Content: "处理消息时出现错误"})
 

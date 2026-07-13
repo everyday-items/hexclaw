@@ -36,6 +36,7 @@ import (
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"github.com/hexagon-codes/toolkit/util/logger"
+	"github.com/hexagon-codes/toolkit/util/retry"
 )
 
 // DingtalkAdapter 钉钉 Bot 适配器
@@ -62,6 +63,66 @@ type DingtalkAdapter struct {
 	stopping     bool
 	connected    atomic.Bool
 	stopped      atomic.Bool
+
+	// handlerTimeout 单条消息的处理总预算；0 → 默认 defaultHandlerTimeout。可注入以在测试中
+	// 复现「占位已发 → handler 超时 → 返回 error」的终态路径，无需真等 2 分钟。
+	handlerTimeout time.Duration
+}
+
+// defaultHandlerTimeout 是单条消息处理的默认总预算。
+const defaultHandlerTimeout = 2 * time.Minute
+
+// terminalNotifyTimeout 是终态用户通知（错误提示 / 占位撤回 / 最终答案）的兜底 ctx 预算。
+const terminalNotifyTimeout = 15 * time.Second
+
+// messageHandlerTimeout 返回处理总预算（handlerTimeout 未设时用默认）。
+func (a *DingtalkAdapter) messageHandlerTimeout() time.Duration {
+	if a.handlerTimeout > 0 {
+		return a.handlerTimeout
+	}
+	return defaultHandlerTimeout
+}
+
+// terminalNotifyCtx 返回一个**独立于 handler ctx** 的兜底 context，用于终态用户通知。
+// 终态通知是「必达副作用」：handler ctx 可能已因超时失效，派生自它的发送会在发送队列
+// admission 处（send_queue.go 的 ctx.Err() 检查）静默失败。根在 Background 才能保证送达
+// （对齐 send_queue_test.go 的 FIX 契约）。
+func terminalNotifyCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), terminalNotifyTimeout)
+}
+
+// retryInitialStreamConnect 补齐官方 SDK AutoReconnect 的边界：SDK 仅在首次成功后的连接
+// 断开时自动重连，首次 Start 失败会直接返回。这里持续重试首次握手，直到成功或实例停止。
+func retryInitialStreamConnect(
+	ctx context.Context,
+	start func(context.Context) error,
+	onFailure func(error),
+	retryDelay func(int) time.Duration,
+) error {
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := start(ctx); err != nil {
+			if onFailure != nil {
+				onFailure(err)
+			}
+			timer := time.NewTimer(retryDelay(attempt))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			continue
+		}
+		return nil
+	}
+}
+
+func initialStreamRetryDelay(attempt int) time.Duration {
+	cfg := retry.DefaultConfig()
+	return retry.ExponentialBackoff(attempt+1, cfg)
 }
 
 // New 创建钉钉适配器
@@ -307,9 +368,8 @@ func (a *DingtalkAdapter) Start(ctx context.Context, handler adapter.MessageHand
 	a.streamCancel = cancel
 	a.mu.Unlock()
 
-	// 官方 SDK 的 Start 在首次建连成功后即返回（内部起 processLoop + 自动重连），失败才返回 error。
-	// 放到 goroutine 中执行：与飞书一致保持 Start 非阻塞，并把建连结果记入 connected/lastError 供
-	// Health 透出（首次建连失败是用户「点击测试报 Stream 未连接」最常见的场景）。
+	// 官方 SDK 的 AutoReconnect 只覆盖首次成功后的断线；首次建连失败会直接返回。放到 goroutine
+	// 中持续重试首次握手，成功后再由 SDK 接管断线重连。Start 保持非阻塞，失败原因同步供 Health 透出。
 	a.streamWG.Add(1)
 	go func() {
 		defer a.streamWG.Done()
@@ -326,14 +386,16 @@ func (a *DingtalkAdapter) Start(ctx context.Context, handler adapter.MessageHand
 			}
 		}()
 		logger.Info("钉钉适配器 Stream 连接启动中", "name", a.Name())
-		if err := cli.Start(streamCtx); err != nil {
+		err := retryInitialStreamConnect(streamCtx, cli.Start, func(err error) {
 			a.connected.Store(false)
 			if !a.stopped.Load() {
-				logger.Error("钉钉 Stream 连接失败", "error", err)
+				logger.Error("钉钉 Stream 首次连接失败，将自动重试", "error", err)
 				a.mu.Lock()
 				a.lastError = err.Error()
 				a.mu.Unlock()
 			}
+		}, initialStreamRetryDelay)
+		if err != nil || a.stopped.Load() {
 			return
 		}
 		a.connected.Store(true)
@@ -639,7 +701,7 @@ func (a *DingtalkAdapter) handleMessageContext(baseCtx context.Context, event dt
 
 	content := strings.TrimSpace(event.Text.Content)
 
-	ctx, cancel := context.WithTimeout(baseCtx, 2*time.Minute)
+	ctx, cancel := context.WithTimeout(baseCtx, a.messageHandlerTimeout())
 	defer cancel()
 
 	// picture 消息（BUG-20260709）：downloadCode → 临时下载 URL → 图片字节 → image 附件，
@@ -687,35 +749,37 @@ func (a *DingtalkAdapter) handleMessageContext(baseCtx context.Context, event dt
 		},
 	}
 
-	// 发送前先发「正在思考」占位给用户即时反馈；拿到其标识，答案就位后撤回（BUG-20260704）。
+	// 发送前先发「正在思考」占位给用户即时反馈（BUG-20260704）。占位是对用户的一个**承诺**：
+	// 无论成功 / 失败 / 超时，退出时都必须兑现（撤回），否则永久残留（BUG-20260713）。用 defer
+	// 统一保证撤回覆盖所有 return 路径，并在**退出时刻**用独立兜底 ctx 执行（不能在 defer 注册处
+	// 就创建 ctx——那样 15s 预算会在 2 分钟的 handler 跑完前就过期）。
 	thinkingKey := a.sendThinkingFeedback(ctx, msg.ChatID)
+	defer func() {
+		rc, cancel := terminalNotifyCtx()
+		defer cancel()
+		a.recallThinkingFeedback(rc, thinkingKey)
+	}()
 
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
-		if ctx.Err() != nil {
-			return
-		}
+		// 不因 ctx 已超时而提前 return：超时正是用户最需要反馈之时（BUG-20260713）。终态错误
+		// 提示用独立兜底 ctx 发送，绝不静默放弃；占位由上面的 defer 撤回。
 		logger.Error("钉钉: 处理消息失败", "error", err)
-		errCtx, errCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer errCancel()
-		_ = a.Send(errCtx, msg.ChatID, &adapter.Reply{Content: "处理消息时出现错误，请稍后重试。"})
-		a.recallThinkingFeedback(errCtx, thinkingKey)
+		nc, cancel := terminalNotifyCtx()
+		defer cancel()
+		_ = a.Send(nc, msg.ChatID, &adapter.Reply{Content: "处理消息时出现错误，请稍后重试。"})
 		return
 	}
 	if reply == nil {
-		rcCtx, rcCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer rcCancel()
-		a.recallThinkingFeedback(rcCtx, thinkingKey)
-		return
+		return // 占位由 defer 撤回
 	}
 
-	sendCtx, sendCancel := context.WithTimeout(ctx, 30*time.Second)
+	// 最终答案同为「必达」终态通知：用独立兜底 ctx，避免继承可能已耗尽的 handler ctx。
+	sendCtx, sendCancel := terminalNotifyCtx()
 	defer sendCancel()
 	if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
 		logger.Error("钉钉: 发送回复失败", "error", err)
 	}
-	// 答案已送达 → 撤回占位，使其不残留。
-	a.recallThinkingFeedback(sendCtx, thinkingKey)
 }
 
 // downloadPictureAttachment 把 picture 消息的 downloadCode 兑换成 image 附件（BUG-20260709）：
