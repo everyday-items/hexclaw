@@ -112,7 +112,7 @@ func (e *ReActEngine) WarmupLocalDefaultModel(ctx context.Context) (warmed bool,
 	if len(tools) > 0 {
 		req.Tools = tools
 	}
-	applyPerTurnRequestPolicy(&req, selection.modelName, msg, nil)
+	applyPerTurnRequestPolicy(ctx, &req, selection.modelName, e.visionRoutingStrategy(), msg, nil)
 	// BUG-20260712：预热必须与真实请求用同一 num_ctx，否则预热按自动分档把 runner 载到 16384
 	// （巨型 KV 常驻），真实请求即便注入 num_ctx=4096 也只会复用那个 16384 runner（Ollama 不会
 	// 为更小 ctx 降载），内存照样被撑爆。此处显式盖同一档，让 runner 一开始就载在 4096。

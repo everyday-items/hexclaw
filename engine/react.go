@@ -1111,6 +1111,11 @@ func (e *ReActEngine) completeWithTools(
 	}
 	useBudget := budget != nil
 
+	// 反应式视觉兜底（BUG-20260713）：套在真实 provider 外——无工具直连 Complete 与工具循环
+	// runner 的初始 provider 都经此。图片数量超限时丢最老图重试（幂等，selector.wrapProvider 里
+	// 的同名包装不会二次叠加）。
+	provider = wrapVisionImageLimitProvider(provider, modelName)
+
 	// 收集工具定义（C1+C2: 按当前 query 渐进召回 + agent_mode 条件过滤；C2/B2 联动）
 	var tools []llm.ToolDefinition
 	isLocal := isLocalProvider(providerName)
@@ -1150,7 +1155,7 @@ func (e *ReActEngine) completeWithTools(
 	if len(tools) > 0 {
 		req.Tools = tools
 	}
-	applyPerTurnRequestPolicy(&req, modelName, msg, history)
+	applyPerTurnRequestPolicy(ctx, &req, modelName, e.visionRoutingStrategy(), msg, history)
 	e.applyLocalNumCtxCap(&req, isLocal) // 本地 Ollama：按配置钳 num_ctx，防 KV 撑爆内存（BUG-20260712）
 	// 本地 thinking 模型注入 /no_think（与流式路径对齐）
 	// Qwen3/DeepSeek-R1 通过 /no_think 抑制；Gemma 4 由 Ollama 模板层控制，不注入
@@ -1184,15 +1189,15 @@ func (e *ReActEngine) completeWithTools(
 						break
 					}
 					trace.L(ctx).Warn("Provider 降级", "from", providerName, "to", fbName, "err", err.Error(), "session", sessionID)
-					provider = fallbackP
 					providerName = fbName
 					modelName = e.getProviderModel(fbName, msg.Metadata)
+					provider = wrapVisionImageLimitProvider(fallbackP, modelName) // 反应式视觉兜底（无工具直连 failover 目标）
 					tried[fbName] = true
 					// BUG-20260712：按目标 provider locality 重建 cloud-safe 请求（回退到云端时
 					// 不再复用带 <memory-context> 的本地请求，规避云 egress 拦截）。无工具直连路径
 					// 无 tools 需重挂；重新套一次 per-turn policy 以匹配新 model。
 					ctx, req = e.rebuildRequestForFailover(ctx, msg, history, kbContext, fbName)
-					applyPerTurnRequestPolicy(&req, modelName, msg, history)
+					applyPerTurnRequestPolicy(ctx, &req, modelName, e.visionRoutingStrategy(), msg, history)
 					resp, _, err = e.completeWithThinkingTimeout(ctx, provider, providerName, modelName, req)
 					if err == nil {
 						break
@@ -1228,6 +1233,7 @@ func (e *ReActEngine) completeWithTools(
 			return e.getProviderModel(name, msg.Metadata)
 		},
 		wrapProvider: func(p hexagon.Provider, name, model string) hexagon.Provider {
+			p = wrapVisionImageLimitProvider(p, model) // 反应式视觉兜底（含 failover 目标 provider）
 			p = wrapCodeExecToolChoiceProvider(p, msg.Content)
 			if !shouldBoundThinkingCompletion(name, model, req) {
 				return p
@@ -1317,7 +1323,7 @@ func (e *ReActEngine) completeWithTools(
 		if len(tools) > 0 {
 			req.Tools = tools
 		}
-		applyPerTurnRequestPolicy(&req, fbModel, msg, history)
+		applyPerTurnRequestPolicy(ctx, &req, fbModel, e.visionRoutingStrategy(), msg, history)
 		result, err = runner.Run(ctx, hruntime.Request{
 			ID:           messageRequestID(msg),
 			Messages:     req.Messages,
@@ -2064,7 +2070,7 @@ func (e *ReActEngine) processStreamRuntime(
 		if len(tools) > 0 {
 			req.Tools = tools
 		}
-		applyPerTurnRequestPolicy(&req, selection.modelName, msg, history)
+		applyPerTurnRequestPolicy(ctx, &req, selection.modelName, e.visionRoutingStrategy(), msg, history)
 		e.applyLocalNumCtxCap(&req, isLocal) // 本地 Ollama：按配置钳 num_ctx，防 KV 撑爆内存（BUG-20260712）
 		if shouldInjectNoThink(isLocal, len(req.Tools) > 0, msg.Metadata["thinking"], selection.modelName) {
 			injectNoThink(req.Messages)
@@ -2097,6 +2103,7 @@ func (e *ReActEngine) processStreamRuntime(
 				return e.getProviderModel(name, msg.Metadata)
 			},
 			wrapProvider: func(p hexagon.Provider, name, model string) hexagon.Provider {
+				p = wrapVisionImageLimitProvider(p, model) // 反应式视觉兜底（流式，含 failover 目标）
 				return wrapCodeExecToolChoiceProvider(p, msg.Content)
 			},
 		}
@@ -2174,7 +2181,7 @@ func (e *ReActEngine) processStreamRuntime(
 			if len(tools) > 0 {
 				req.Tools = tools
 			}
-			applyPerTurnRequestPolicy(&req, fbModel, msg, history)
+			applyPerTurnRequestPolicy(streamCtx, &req, fbModel, e.visionRoutingStrategy(), msg, history)
 			result, err = runner.Stream(streamCtx, hruntime.Request{
 				ID:           messageRequestID(msg),
 				Messages:     req.Messages,
@@ -3418,8 +3425,9 @@ func (e *ReActEngine) completeDirect(
 	if shouldRejectImageAttachmentsForProvider(provider, providerName, modelName, msg.Attachments) {
 		return nil, fmt.Errorf("当前模型 %s 不支持图片附件，请切换到视觉模型后重试", modelName)
 	}
+	provider = wrapVisionImageLimitProvider(provider, modelName) // 反应式视觉兜底（多模态直连路径）
 	req := e.buildCompletionRequest(ctx, msg, history, kbContext)
-	applyPerTurnRequestPolicy(&req, modelName, msg, history)
+	applyPerTurnRequestPolicy(ctx, &req, modelName, e.visionRoutingStrategy(), msg, history)
 	resp, err := provider.Complete(ctx, req)
 	if err != nil {
 		if explicitProvider {
@@ -3431,7 +3439,7 @@ func (e *ReActEngine) completeDirect(
 			return nil, fmt.Errorf("多模态补全失败且无可用备用: %w", err)
 		}
 		trace.L(ctx).Warn("Provider 多模态降级", "from", providerName, "to", fbName, "err", err, "session", sessionID)
-		resp, err = fallbackP.Complete(ctx, req)
+		resp, err = wrapVisionImageLimitProvider(fallbackP, e.getProviderModel(fbName, msg.Metadata)).Complete(ctx, req)
 		if err != nil {
 			return nil, fmt.Errorf("多模态补全失败（降级后）: %w", err)
 		}
@@ -3520,17 +3528,305 @@ func validSamplingTemperature(temperature float64) bool {
 	return !math.IsNaN(temperature) && !math.IsInf(temperature, 0) && temperature >= 0 && temperature <= 2
 }
 
-// applyPerTurnRequestPolicy 统一封装每轮请求的两步组装策略：模型 thinking 默认 +
-// cron intent guidance（含 markCronGuidanceActive）。三处组装点（非流式工具循环 /
-// 流式 / 多模态直连）此前逐字重复这两步，收敛到此单一 helper，消除漂移风险。
+// applyPerTurnRequestPolicy 统一封装每轮请求的组装策略：模型 thinking 默认 + 视觉图片
+// 预算裁剪 + cron intent guidance（含 markCronGuidanceActive）。多处组装点（非流式工具
+// 循环 / 流式 / 多模态直连 / 各自的 provider 回退）此前逐字重复这些步骤，收敛到此单一
+// helper，消除漂移风险。
 //
 // 调用点须在 req.Tools 已就位后调用：cron intent guidance 会按 req.Tools 收窄工具面。
-func applyPerTurnRequestPolicy(req *hexagon.CompletionRequest, modelName string, msg *adapter.Message, history []hexagon.Message) {
+func applyPerTurnRequestPolicy(ctx context.Context, req *hexagon.CompletionRequest, modelName, strategy string, msg *adapter.Message, history []hexagon.Message) {
 	applyModelThinkingDefaults(req, modelName, msg.Content)
+	// 视觉出口图片预算裁剪（BUG-20260713）：glm-4v-flash 等视觉模型单请求图片数有硬上限（实测
+	// glm-4v-flash：1~5 张 200，6+ 张报智谱 400 code 1210「输入图片数量超过限制」；且 5 张>2min 撞
+	// 钉钉超时，真机 session sess-xb9mJ1bu 取证）。多轮会话历史累积多图 + 当轮图会超限/超时。
+	// 发给视觉模型前把图片总数压到 effectiveVisionImageBudget（按路由策略在 [1, 硬顶] 内调，当前轮图
+	// 永不被削），超预算的更早图折叠为文字占位、保留文字上下文。反应式兜底再按真实上限丢最老图重试。
+	if req != nil {
+		currentTurnImages := imagePartsInLastMessage(req.Messages)
+		if budget := effectiveVisionImageBudget(modelName, strategy, currentTurnImages); budget > 0 {
+			if folded := clipVisionImagesForBudget(req.Messages, budget); folded > 0 {
+				trace.L(ctx).Info("视觉图片预算裁剪", "model", modelName, "strategy", strategy, "budget", budget, "folded", folded)
+			}
+		}
+	}
 	if shouldApplyCronIntentGuidance(msg, history) {
 		applyCronIntentGuidance(req)
 		markCronGuidanceActive(msg)
 	}
+}
+
+// visionImagePlaceholder 替换被裁剪/淘汰掉的图片：保留「这里曾有张图」的文字上下文，只削图不删话。
+const visionImagePlaceholder = "[早前发送的图片]"
+
+const (
+	// visionImageBudgetGLM4VFlash 实测 glm-4v-flash 单请求图片上限：1~5 张返回 200，6+ 张返回
+	// 400 {"code":"1210","message":"输入图片数量超过限制"}。取实测上限 5。
+	visionImageBudgetGLM4VFlash = 5
+	// visionImageBudgetDefault 未知视觉模型的保守默认——宁少勿多，真实上限由反应式兜底（丢最老图
+	// 重试）适配。仅作用于视觉出口：文本模型不带图，裁剪对其为 no-op。
+	visionImageBudgetDefault = 4
+)
+
+// visionImageBudget 返回视觉模型单请求图片**硬上限**（provider 侧不可逾越的正确性约束）。
+// glm-4v 系列取实测上限 5，其余（含未知视觉模型/文本模型）取保守默认 4。新模型在此登记。
+// 注意：这是硬顶，不是"发几张"的偏好——偏好由 effectiveVisionImageBudget 按路由策略在 [1, 硬顶] 内调。
+func visionImageBudget(modelName string) int {
+	m := strings.ToLower(strings.TrimSpace(modelName))
+	if strings.Contains(m, "glm-4v") { // glm-4v-flash / glm-4v
+		return visionImageBudgetGLM4VFlash
+	}
+	return visionImageBudgetDefault
+}
+
+const (
+	// visionBudgetLatencyFirst 延迟优先：只发当前图，最快、超时风险最低。
+	visionBudgetLatencyFirst = 1
+	// visionBudgetCostAware 成本优先（默认）：当前图 + 1 张近历史，省 token 又保一点连续性。
+	// 实测 glm-4v-flash：1 图≈30s、5 图>2min（撞钉钉 2 分钟 handler 超时）；默认 2 图≈60s 稳过关。
+	visionBudgetCostAware = 2
+)
+
+// effectiveVisionImageBudget 按「路由策略意图 + provider 硬上限 + 当前回合图片数」求实际图片预算。
+// 策略调"软预算"（发几张历史图）：
+//   - quality-first：用满 provider 硬上限（最大视觉上下文）
+//   - cost-aware（默认）：2 张
+//   - latency-first：1 张
+//
+// 两条护栏:① 当前回合的图永不被削（floor=currentTurnImages——策略只调历史回放深度，不砍当前 payload）；
+// ② 硬上限钳制（任何策略 ≤ provider 上限，否则 provider 直接报「图片数量超过限制」）。
+// 反应式兜底（visionImageLimitProvider 丢最老图重试）作为最终双保险不变。
+func effectiveVisionImageBudget(modelName, strategy string, currentTurnImages int) int {
+	hard := visionImageBudget(modelName)
+	var soft int
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case "quality-first", "quality_first", "quality":
+		soft = hard // 用满 provider 上限
+	case "latency-first", "latency_first", "latency", "speed-first", "speed":
+		soft = visionBudgetLatencyFirst
+	default: // cost-aware（默认）/ cost-first / cost / 空 / 未知
+		soft = visionBudgetCostAware
+	}
+	b := soft
+	if currentTurnImages > b {
+		b = currentTurnImages // 当前 payload 不削
+	}
+	if b > hard {
+		b = hard // 硬顶钳制
+	}
+	return b
+}
+
+// imagePartsInLastMessage 统计最后一条消息（= 当前回合用户输入）的图片 part 数。
+func imagePartsInLastMessage(messages []hexagon.Message) int {
+	if len(messages) == 0 {
+		return 0
+	}
+	return imagePartCount(messages[len(messages)-1].MultiContent)
+}
+
+// visionRoutingStrategy 返回当前生效的智能路由策略（cost-aware / quality-first / latency-first），
+// 供视觉图片预算按用户意图调档。未配置时返回空 → effectiveVisionImageBudget 落默认 cost-aware。
+func (e *ReActEngine) visionRoutingStrategy() string {
+	if e == nil {
+		return ""
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.cfg == nil {
+		return ""
+	}
+	return e.cfg.LLM.Routing.Strategy
+}
+
+// messageHasImagePart 报告消息的多模态内容里是否含图片 part。
+func messageHasImagePart(m hexagon.Message) bool {
+	for _, p := range m.MultiContent {
+		if p.Type == "image_url" {
+			return true
+		}
+	}
+	return false
+}
+
+// imagePartCount 统计多模态内容里的图片 part 数量。
+func imagePartCount(parts []llm.ContentPart) int {
+	n := 0
+	for _, p := range parts {
+		if p.Type == "image_url" {
+			n++
+		}
+	}
+	return n
+}
+
+// imagePartsInMessages 统计整段 messages 的图片 part 总数。
+func imagePartsInMessages(messages []hexagon.Message) int {
+	n := 0
+	for i := range messages {
+		n += imagePartCount(messages[i].MultiContent)
+	}
+	return n
+}
+
+// clipVisionImagesForBudget 主动预算裁剪：把发给视觉模型的 messages 里图片 part 总数压到 ≤ budget。
+// 优先保留最新的——当前轮的图在末尾最先保住，名额有余再从近到远保留历史图；超预算的更早图折叠为
+// 文字占位 visionImagePlaceholder（保留文字上下文，只削图不删话）。copy-on-write：改动前整条拷贝
+// MultiContent，绝不就地改到与 session 历史共享的底层数组。返回折叠掉的图片张数。
+func clipVisionImagesForBudget(messages []hexagon.Message, budget int) int {
+	if budget <= 0 {
+		return 0
+	}
+	toFold := imagePartsInMessages(messages) - budget
+	if toFold <= 0 {
+		return 0
+	}
+	folded := 0
+	// 从最老（最前）往新折叠，折够 toFold 张即停 → 留下的必是最新的 budget 张。
+	for i := 0; i < len(messages) && folded < toFold; i++ {
+		if !messageHasImagePart(messages[i]) {
+			continue
+		}
+		rebuilt := make([]llm.ContentPart, len(messages[i].MultiContent))
+		copy(rebuilt, messages[i].MultiContent)
+		changed := false
+		for j := range rebuilt {
+			if folded >= toFold {
+				break
+			}
+			if rebuilt[j].Type == "image_url" {
+				rebuilt[j] = llm.NewTextPart(visionImagePlaceholder)
+				folded++
+				changed = true
+			}
+		}
+		if changed {
+			messages[i].MultiContent = rebuilt
+		}
+	}
+	return folded
+}
+
+// isVisionImageCountLimitError 宽松识别「图片数量超限」类错误（智谱 code 1210 且文案是数量超限）。
+// 只认数量超限——图片格式/解析错误（同为 code 1210 但语义是图片本身坏，丢图重试无意义）及其它
+// 错误一律返回 false（照抛，绝不吞）。BUG-20260713 反应式兜底的触发闸门。
+func isVisionImageCountLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	// 排除：格式/解析类（丢图无益，不该触发淘汰重试）。
+	if strings.Contains(s, "格式") || strings.Contains(s, "解析") ||
+		strings.Contains(s, "parse") || strings.Contains(s, "format") {
+		return false
+	}
+	hasImage := strings.Contains(s, "图片") || strings.Contains(s, "image")
+	hasCountLimit := strings.Contains(s, "图片数量") || strings.Contains(s, "数量超") ||
+		strings.Contains(s, "超过限制") || strings.Contains(s, "超限") ||
+		(strings.Contains(s, "count") && strings.Contains(s, "limit")) ||
+		(strings.Contains(s, "too many") && strings.Contains(s, "image"))
+	return hasImage && hasCountLimit
+}
+
+// dropOldestVisionImage 把最老（最前）的一张图片 part 折叠为文字占位，仅当图片数 ≥2 时执行
+// （保留至少 1 张，绝不清空当前批改图）。copy-on-write，不动共享历史底层数组。返回 (新 messages,
+// 是否成功丢了一张)。
+func dropOldestVisionImage(messages []hexagon.Message) ([]hexagon.Message, bool) {
+	if imagePartsInMessages(messages) <= 1 {
+		return messages, false
+	}
+	out := make([]hexagon.Message, len(messages))
+	copy(out, messages)
+	for i := range out {
+		hit := -1
+		for j := range out[i].MultiContent {
+			if out[i].MultiContent[j].Type == "image_url" {
+				hit = j
+				break
+			}
+		}
+		if hit < 0 {
+			continue
+		}
+		rebuilt := make([]llm.ContentPart, len(out[i].MultiContent))
+		copy(rebuilt, out[i].MultiContent)
+		rebuilt[hit] = llm.NewTextPart(visionImagePlaceholder)
+		out[i].MultiContent = rebuilt
+		return out, true
+	}
+	return messages, false
+}
+
+// visionImageLimitProvider 反应式兜底装饰器（BUG-20260713）：视觉模型真实单请求图片上限可能比
+// 主动预算更严（或预算未登记）。若一次调用返回「图片数量超限」类错误，就丢掉 messages 里最老的
+// 一张图 → 重试，循环到通过或图片降到 1 张仍不过才放弃。重试有上限（=初始图片数）防死循环；每次
+// 丢图都 log。只针对数量超限（isVisionImageCountLimitError），格式/解析错误及其它错误照抛。
+type visionImageLimitProvider struct {
+	inner hexagon.Provider
+	model string
+}
+
+func (p *visionImageLimitProvider) Name() string { return p.inner.Name() }
+
+func (p *visionImageLimitProvider) Complete(ctx context.Context, req llm.CompletionRequest) (*llm.CompletionResponse, error) {
+	resp, err := p.inner.Complete(ctx, req)
+	if err == nil || !isVisionImageCountLimitError(err) {
+		return resp, err
+	}
+	maxRetries := imagePartsInMessages(req.Messages)
+	for i := 0; i < maxRetries; i++ {
+		dropped, ok := dropOldestVisionImage(req.Messages)
+		if !ok {
+			break // 只剩 1 张仍不过：放弃，抛出最后一次错误
+		}
+		req.Messages = dropped
+		trace.L(ctx).Warn("视觉图片数量超限，丢弃最老一张图重试",
+			"model", p.model, "retry", i+1, "remaining_images", imagePartsInMessages(req.Messages))
+		resp, err = p.inner.Complete(ctx, req)
+		if err == nil || !isVisionImageCountLimitError(err) {
+			return resp, err
+		}
+	}
+	return resp, err
+}
+
+func (p *visionImageLimitProvider) Stream(ctx context.Context, req llm.CompletionRequest) (*llm.Stream, error) {
+	stream, err := p.inner.Stream(ctx, req)
+	if err == nil || !isVisionImageCountLimitError(err) {
+		return stream, err
+	}
+	maxRetries := imagePartsInMessages(req.Messages)
+	for i := 0; i < maxRetries; i++ {
+		dropped, ok := dropOldestVisionImage(req.Messages)
+		if !ok {
+			break
+		}
+		req.Messages = dropped
+		trace.L(ctx).Warn("视觉图片数量超限，丢弃最老一张图重试（流式）",
+			"model", p.model, "retry", i+1, "remaining_images", imagePartsInMessages(req.Messages))
+		stream, err = p.inner.Stream(ctx, req)
+		if err == nil || !isVisionImageCountLimitError(err) {
+			return stream, err
+		}
+	}
+	return stream, err
+}
+
+func (p *visionImageLimitProvider) Models() []llm.ModelInfo { return p.inner.Models() }
+
+func (p *visionImageLimitProvider) CountTokens(messages []llm.Message) (int, error) {
+	return p.inner.CountTokens(messages)
+}
+
+// wrapVisionImageLimitProvider 给视觉出口 provider 套反应式兜底层（幂等：已套则原样返回，避免
+// 与 selector.wrapProvider 重复叠加）。视觉裁剪层应处最内、最贴近真实 provider，才能就地丢图重试。
+func wrapVisionImageLimitProvider(p hexagon.Provider, modelName string) hexagon.Provider {
+	if p == nil {
+		return p
+	}
+	if _, already := p.(*visionImageLimitProvider); already {
+		return p
+	}
+	return &visionImageLimitProvider{inner: p, model: modelName}
 }
 
 func applyModelThinkingDefaults(req *hexagon.CompletionRequest, modelName, userContent string) {
