@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/toolkit/net/httpx"
 	"github.com/hexagon-codes/toolkit/net/sse"
 )
@@ -305,6 +306,43 @@ func (s *Server) handleOllamaLoad(w http.ResponseWriter, r *http.Request) {
 // handleOllamaDelete 删除已下载的模型
 //
 // DELETE /api/v1/ollama/models/:name
+func ollamaModelBase(name string) string {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	colon := strings.LastIndex(normalized, ":")
+	slash := strings.LastIndex(normalized, "/")
+	if colon > slash {
+		return normalized[:colon]
+	}
+	return normalized
+}
+
+// disableEmbeddingAutoInstallForDeletedModel 记住用户的删除意图。
+// 否则当前知识库嵌入模型会在下次 sidecar 启动时被静默重新下载。
+func (s *Server) disableEmbeddingAutoInstallForDeletedModel(name string) error {
+	info := s.kbEmbedding
+	if info == nil || !info.Local || ollamaModelBase(info.Model) != ollamaModelBase(name) {
+		return nil
+	}
+
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	if s.cfg == nil || s.cfg.Knowledge.Embedding.DisableAutoInstall {
+		return nil
+	}
+
+	nextCfg := *s.cfg
+	nextKnowledge := s.cfg.Knowledge
+	nextEmbedding := nextKnowledge.Embedding
+	nextEmbedding.DisableAutoInstall = true
+	nextKnowledge.Embedding = nextEmbedding
+	nextCfg.Knowledge = nextKnowledge
+	if err := config.Save(&nextCfg, ""); err != nil {
+		return fmt.Errorf("保存知识库嵌入模型自动安装设置: %w", err)
+	}
+	s.cfg.Knowledge = nextKnowledge
+	return nil
+}
+
 func (s *Server) handleOllamaDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if name == "" {
@@ -324,6 +362,12 @@ func (s *Server) handleOllamaDelete(w http.ResponseWriter, r *http.Request) {
 	io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode >= 400 {
 		writeJSON(w, resp.StatusCode, map[string]string{"error": "Ollama 删除失败"})
+		return
+	}
+	if err := s.disableEmbeddingAutoInstallForDeletedModel(name); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "模型已删除，但关闭自动重装失败: " + err.Error(),
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
