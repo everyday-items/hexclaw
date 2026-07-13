@@ -1523,7 +1523,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			resp, err := provider.Complete(cctx, hexagon.CompletionRequest{
 				Messages: []hexagon.Message{
 					{Role: hexagon.RoleSystem, Content: "你是中小学出题老师。据给定学科/年级/知识点直接出一道同类变式练习题并给简要解答，" +
-						"直接给最终题目与答案、不要展开长篇推理。数学一律用 Unicode 符号（×÷√≤≥、分数 a/b、平方 x²、下标 H₂O、单位 cm³），" +
+						"直接给最终题目与答案、不要展开长篇推理。输出必须严格使用 GitHub Markdown，固定为 `## 问题`、`## 解答`、`## 答案` 三段；" +
+						"解答步骤必须用 `1. `、`2. ` 有序列表，最终答案用粗体，不要使用 Markdown 代码围栏，也不要用普通的“问题：/解答：/答案：”标签行。" +
+						"数学一律用 Unicode 符号（×÷√≤≥、分数 a/b、平方 x²、下标 H₂O、单位 cm³），" +
 						"禁止输出 LaTeX（不要 \\times \\frac \\text{} ^{} 或 $…$、\\(…\\) 定界符）。"},
 					{Role: hexagon.RoleUser, Content: task},
 				},

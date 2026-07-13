@@ -104,14 +104,18 @@ func (a *SolveAdapter) SolveSubject(ctx context.Context, subject, problem, grade
 // 未注入 retryGen 闭包时安全回退全链（SolveSubject），保证正确性不塌。
 func (a *SolveAdapter) GenerateSimilar(ctx context.Context, subject, prompt, grade string) (usecase.SolveResult, error) {
 	if a.retryGen == nil {
-		return a.SolveSubject(ctx, subject, prompt, grade, "")
+		sr, err := a.SolveSubject(ctx, subject, prompt, grade, "")
+		if err == nil {
+			sr.Solution = normalizeRetryMarkdown(sr.Solution)
+		}
+		return sr, err
 	}
 	out, err := a.retryGen(ctx, subject, prompt, grade)
 	if err != nil {
 		return usecase.SolveResult{}, err
 	}
 	return usecase.SolveResult{
-		Solution: stripReports(out),
+		Solution: normalizeRetryMarkdown(stripReports(out)),
 		Evidence: usecase.SolveEvidence{Verdict: usecase.VerdictUnverifiable, EvidenceType: usecase.EvidenceNone},
 	}, nil
 }
