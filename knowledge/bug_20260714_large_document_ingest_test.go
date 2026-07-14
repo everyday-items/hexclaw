@@ -54,6 +54,74 @@ func (deadlineAwareEmbedder) EmbedOne(ctx context.Context, _ string) ([]float32,
 
 func (deadlineAwareEmbedder) Dimension() int { return 768 }
 
+type fixedCountSplitter struct{ count int }
+
+func (s fixedCountSplitter) Split(_ context.Context, _ []hexagon.Document) ([]hexagon.Document, error) {
+	docs := make([]hexagon.Document, s.count)
+	for i := range docs {
+		docs[i] = hexagon.Document{ID: "chunk", Content: "教材正文"}
+	}
+	return docs, nil
+}
+
+func (fixedCountSplitter) Name() string { return "fixed-count" }
+
+type delayedCompleteEmbedder struct{ delay time.Duration }
+
+func (e delayedCompleteEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	timer := time.NewTimer(e.delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		out := make([][]float32, len(texts))
+		for i := range out {
+			out[i] = []float32{1, 0, 0}
+		}
+		return out, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (e delayedCompleteEmbedder) EmbedOne(ctx context.Context, _ string) ([]float32, error) {
+	result, err := e.Embed(ctx, []string{"one"})
+	if err != nil {
+		return nil, err
+	}
+	return result[0], nil
+}
+
+func (delayedCompleteEmbedder) Dimension() int { return 3 }
+
+// 本地 nomic-embed-text 按 100 个 chunk 一批处理。百页教材通常需要三批以上，
+// 文档预算必须随批次数增长；否则第一批虽已算完，第二批命中固定 60 秒总预算后，
+// 缓存/批处理层会把前面结果连同失败一起丢弃，最终静默落成 0 向量。
+func TestBUG20260714_LargeDocumentEmbeddingBudgetCoversAllBatches(t *testing.T) {
+	previous := documentEmbeddingTimeout
+	documentEmbeddingTimeout = 30 * time.Millisecond
+	t.Cleanup(func() { documentEmbeddingTimeout = previous })
+
+	cfg := DefaultHybridConfig()
+	cfg.ContextualEnabled = false
+	mgr := NewManager(rpFakeRepo{}, &rpFakeSearcher{}, delayedCompleteEmbedder{delay: 50 * time.Millisecond},
+		WithHybridConfig(cfg), WithSplitter(fixedCountSplitter{count: 201}))
+
+	chunks, err := mgr.buildChunks(context.Background(), &Document{
+		ID: "doc-large-vector", Title: "数学五年级下册", Content: "教材正文",
+	}, time.Now())
+	if err != nil {
+		t.Fatalf("buildChunks: %v", err)
+	}
+	if len(chunks) != 201 {
+		t.Fatalf("chunks=%d, want 201", len(chunks))
+	}
+	for i, chunk := range chunks {
+		if len(chunk.Embedding) != 3 {
+			t.Fatalf("chunk %d embedding dim=%d, want 3；大文档不能因固定单批预算静默丢失全部向量", i, len(chunk.Embedding))
+		}
+	}
+}
+
 // nomic-embed-text 尚在下载/启动时，嵌入 HTTP 可能长期无响应。摄取应在独立预算耗尽后
 // 降级为 FTS 文本索引，而不是吃完整个上传 5 分钟总超时、最终一条 chunk 都不落库。
 func TestBUG20260714_DocumentEmbeddingTimeoutFallsBackToTextChunks(t *testing.T) {

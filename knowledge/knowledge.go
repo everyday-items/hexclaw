@@ -1220,9 +1220,10 @@ func (m *Manager) buildChunks(ctx context.Context, doc *Document, ts time.Time) 
 			}
 		}
 		// BUG-20260714：嵌入模型可能正在下载/冷启动（典型为本地 nomic-embed-text），
-		// 文档批量 Embed 若无独立预算会吞掉上传请求完整的 5 分钟总超时。embedding 是
-		// 增强能力，超时后先落 FTS 文本索引；模型就绪后用户可重新上传以补齐向量。
-		embedCtx, cancel := context.WithTimeout(ragEmbedContext(ctx), documentEmbeddingTimeout)
+		// 文档批量 Embed 若无独立预算会吞掉上传请求完整的 5 分钟总超时。预算按实际
+		// 批次数增长：百页教材常有 200+ chunks，固定 60 秒只够第一批，后续超时会让
+		// 批处理层连同已完成结果一起丢弃，最终静默变成 0 向量。超时后仍保留 FTS。
+		embedCtx, cancel := context.WithTimeout(ragEmbedContext(ctx), documentEmbeddingBudget(len(embedTexts)))
 		embeddings, err = m.embedder.Embed(embedCtx, embedTexts)
 		cancel()
 		if err != nil {
@@ -1266,10 +1267,29 @@ const (
 	queryEmbedTimeout = 4 * time.Second
 )
 
-// documentEmbeddingTimeout 是单次文档批量嵌入预算。独立于上传总预算，确保本地
-// embedding 模型缺失、下载中或冷启动时仍有时间把 chunks 降级写入 FTS5。
-// var 便于回归测试压小预算，不改变生产默认值。
+const (
+	// OpenAIEmbedder 默认每 100 条发送一批；知识库预算按相同批次口径计算。
+	// 本地 nomic-embed-text 实测一批百条约 50 秒，因此每批保留 60 秒预算。
+	documentEmbeddingBatchSize = 100
+	// 上传处理总预算为 5 分钟；嵌入最多使用 4 分钟，给解析与 SQLite 落库留余量。
+	maxDocumentEmbeddingTimeout = 4 * time.Minute
+)
+
+// documentEmbeddingTimeout 是每一批文档嵌入的时间预算。var 便于回归测试压小预算，
+// 不改变生产默认值；整篇文档的预算由 documentEmbeddingBudget 按批次数计算。
 var documentEmbeddingTimeout = 60 * time.Second
+
+func documentEmbeddingBudget(chunkCount int) time.Duration {
+	batches := (chunkCount + documentEmbeddingBatchSize - 1) / documentEmbeddingBatchSize
+	if batches < 1 {
+		batches = 1
+	}
+	budget := time.Duration(batches) * documentEmbeddingTimeout
+	if budget > maxDocumentEmbeddingTimeout {
+		return maxDocumentEmbeddingTimeout
+	}
+	return budget
+}
 
 // contextualize 给每个 chunk 前置文档级上下文（Anthropic Contextual Retrieval）。
 //
