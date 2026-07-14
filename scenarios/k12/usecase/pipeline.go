@@ -16,14 +16,18 @@ const FirstReviewInterval int64 = 86400 // 1 天
 
 // Deps 用例依赖（端口注入 + 通用能力）。
 type Deps struct {
-	Solver          Solver
-	Grader          Grader
+	Solver Solver
+	Grader Grader
+	// VerifiedGrader 由生产装配显式接入。不能只依赖 Grader 的运行时类型断言：场景包装、
+	// mock 或后续 decorator 都可能擦掉可选方法，进而静默退回重复 solver+verifier 的慢路径。
+	VerifiedGrader  VerifiedSolutionGrader
 	Recognizer      Recognizer
 	Insights        Insights
 	Grounding       Grounding
 	Profiles        ProfileStore
 	ArchiveRestorer ArchiveRestorer
 	Renderer        Renderer
+	PhotoAnnotator  PhotoAnnotator
 	Records         *records.Store
 	Constraint      scenario.ConstraintProvider
 	// Now 取当前 unix 秒（测试可注入固定时钟）。nil 时用系统时钟。
@@ -105,6 +109,12 @@ func (d Deps) SolveHomeworkProblem(ctx context.Context, req GradeRequest) (Solve
 	if err != nil {
 		return SolveHomeworkResult{}, fmt.Errorf("%w: 解题: %w", ErrSolveFailed, err)
 	}
+	if sr.Evidence.Verdict == VerdictOutOfScope {
+		return SolveHomeworkResult{
+			OutOfScope: true, OutOfScopeKP: sr.OutOfScopeKP,
+			Evidence: sr.Evidence,
+		}, nil
+	}
 	return SolveHomeworkResult{Solution: sr.Solution, Evidence: sr.Evidence}, nil
 }
 
@@ -174,11 +184,23 @@ func (d Deps) GradeHomeworkProblem(ctx context.Context, req GradeRequest) (Grade
 	if err != nil {
 		return GradeResult{}, fmt.Errorf("%w: 解题: %w", ErrSolveFailed, err)
 	}
+	if sr.Evidence.Verdict == VerdictOutOfScope {
+		return GradeResult{
+			OutOfScope: true, OutOfScopeKP: sr.OutOfScopeKP,
+			Evidence: sr.Evidence,
+		}, nil
+	}
 	res := GradeResult{Solution: sr.Solution, Evidence: sr.Evidence}
 
 	// 3. 批改学生答案。
 	var outcome GradeOutcome
-	if grader, ok := d.Grader.(SubjectGrader); ok && req.Subject != "" {
+	if d.VerifiedGrader != nil {
+		outcome, err = d.VerifiedGrader.GradeVerified(ctx, req.Subject, req.Problem, req.StudentAnswer, sr.Solution)
+	} else if grader, ok := d.Grader.(VerifiedSolutionGrader); ok {
+		// sr.Solution 就是上一步 solver+verifier 已审过的解法。支持复用的 adapter 只派 grader
+		// 对比学生作答，禁止再次从零跑 solver+verifier（整卷批改的核心延迟修复）。
+		outcome, err = grader.GradeVerified(ctx, req.Subject, req.Problem, req.StudentAnswer, sr.Solution)
+	} else if grader, ok := d.Grader.(SubjectGrader); ok && req.Subject != "" {
 		outcome, err = grader.GradeSubject(ctx, req.Subject, req.Problem, req.StudentAnswer, sr.Solution)
 	} else {
 		outcome, err = d.Grader.Grade(ctx, req.Problem, req.StudentAnswer, sr.Solution)

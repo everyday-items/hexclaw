@@ -54,10 +54,29 @@ type Recognizer interface {
 	Recognize(ctx context.Context, image []byte) ([]RecognizedQuestion, error)
 }
 
+// PhotoAnnotation 是允许烧录到原作业图的可信批改标记。只有经过程序/强证据验算、
+// 且 bbox 合法的题目才能进入本结构；超纲、不可验证、失败项不得伪装成红叉。
+type PhotoAnnotation struct {
+	BBox    BBox
+	Correct bool
+}
+
+// RenderedPhoto 是平台无关的批改图产物。
+type RenderedPhoto struct {
+	Data []byte
+	MIME string
+}
+
+// PhotoAnnotator 在原图上确定性绘制勾/叉。实现只负责像素合成，不参与识题和判分。
+type PhotoAnnotator interface {
+	Annotate(ctx context.Context, image []byte, marks []PhotoAnnotation) (RenderedPhoto, error)
+}
+
 // SolveResult 解题结果 = 解 + 证据对象。
 type SolveResult struct {
-	Solution string
-	Evidence SolveEvidence
+	Solution     string
+	Evidence     SolveEvidence
+	OutOfScopeKP string
 }
 
 // Solver 解题验算 port（adapter = engine/solve）。
@@ -117,6 +136,12 @@ type Grader interface {
 // SubjectGrader 是支持显式学科路由的 Grader 扩展。
 type SubjectGrader interface {
 	GradeSubject(ctx context.Context, subject, problem, studentAnswer, solution string) (GradeOutcome, error)
+}
+
+// VerifiedSolutionGrader 复用本请求前一阶段已经过 verifier 的解法，只追加“学生答案 vs 正解”批改。
+// 它是可选扩展；老 Grader 仍走 Grade/GradeSubject，保持第三方 adapter 向后兼容。
+type VerifiedSolutionGrader interface {
+	GradeVerified(ctx context.Context, subject, problem, studentAnswer, verifiedSolution string) (GradeOutcome, error)
 }
 
 // Insights 学情信号写入 port（adapter = memory 反思管线）。

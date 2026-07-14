@@ -140,11 +140,14 @@ type MemoryHit struct {
 // 引擎处理完消息后返回的完整回复。
 // 适用于非流式场景。
 type Reply struct {
-	Content   string            // 回复文本内容
-	Metadata  map[string]string // 附加元数据（如工具调用结果、引用来源等）
-	Usage     *Usage            // Token 使用统计（可选）
-	ToolCalls []ToolCall        // 工具调用记录（可选）
-	Blocks    []Block           // 有序内容块（可选；客户端有此则按序渲染，否则回退 Content+ToolCalls）
+	Content string // 回复文本内容
+	// Attachments 是出站产物（当前主要为图片）。平台支持时上传并随正文发送；
+	// 不支持的平台应保留正文并明确降级，不能静默丢失附件。
+	Attachments []Attachment
+	Metadata    map[string]string // 附加元数据（如工具调用结果、引用来源等）
+	Usage       *Usage            // Token 使用统计（可选）
+	ToolCalls   []ToolCall        // 工具调用记录（可选）
+	Blocks      []Block           // 有序内容块（可选；客户端有此则按序渲染，否则回退 Content+ToolCalls）
 	// Interactive 结构化交互载荷（v0.4.0 G3）。
 	// 替代旧的 metadata["interactive_buttons"] JSON 字符串嵌入做法。
 	// 桌面端 / IM 适配器按 Type 渲染按钮 / 选项 / 审批 / 卡片。

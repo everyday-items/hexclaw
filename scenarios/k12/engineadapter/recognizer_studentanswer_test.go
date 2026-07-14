@@ -30,10 +30,46 @@ func TestRecognize_RecoversStudentAnswer(t *testing.T) {
 	}
 }
 
+func TestRecognize_FiltersSectionHeadingAndDeduplicatesNumberedQuestion(t *testing.T) {
+	vision := func(context.Context, []byte, string) (string, error) {
+		return `[{"question":"四、应用题","subject":"数学","student_answer":""},` +
+			`{"question":"二、计算下面各题，能简算","subject":"数学","student_answer":"8.7×17.4"},` +
+			`{"question":"-2","subject":"数学","student_answer":""},` +
+			`{"question":"8的1/4是多少？","subject":"数学","student_answer":"2"},` +
+			`{"question":"2、8的1/4是多少？","subject":"数学","student_answer":"2","bbox":{"x":0.1,"y":0.2,"w":0.2,"h":0.1}},` +
+			`{"question":"4.7+2.3","subject":"数学","student_answer":"","bbox":{"x":0.4,"y":0.2,"w":0.1,"h":0.1}},` +
+			`{"question":"4.7+2.3=7","subject":"数学","student_answer":""},` +
+			`{"question":"一个周长是300米的长方形鱼塘，长是宽的2倍。如果每平方米产鱼2.25千克，一共产鱼多少千克？","subject":"数学","student_answer":"300÷6=50m 100×2.25=225kg"},` +
+			`{"question":"如果每平方米产鱼2.25千克，一共产鱼多少千克？","subject":"数学","student_answer":"300÷6=50m 100×2.25=225kg 50×2=100m 答225kg","bbox":{"x":0.1,"y":0.7,"w":0.8,"h":0.1}}]`, nil
+	}
+	qs, err := NewRecognizerAdapter(vision).Recognize(context.Background(), []byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qs) != 3 {
+		t.Fatalf("section heading/numbered duplicate not normalized: %#v", qs)
+	}
+	if qs[0].BBox == nil {
+		t.Fatalf("dedupe should keep richer numbered variant: %#v", qs[0])
+	}
+	if qs[1].Question != "4.7+2.3" || qs[1].StudentAnswer != "7" || qs[1].BBox == nil {
+		t.Fatalf("equation variant should recover handwritten rhs without polluting question: %#v", qs[1])
+	}
+	if qs[2].Question != "一个周长是300米的长方形鱼塘，长是宽的2倍。如果每平方米产鱼2.25千克，一共产鱼多少千克？" ||
+		!contains(qs[2].StudentAnswer, "答225kg") || qs[2].BBox == nil {
+		t.Fatalf("overlapping word-problem fragment should merge into full question: %#v", qs[2])
+	}
+}
+
 // TestRecognizePrompt_AsksForStudentAnswerNoFabricate 提示词契约：显式要求逐题回收作答、
 // 空白留空、绝不编造。防回归——prompt 退回旧口径会让视觉模型不回收作答信号。
 func TestRecognizePrompt_AsksForStudentAnswerNoFabricate(t *testing.T) {
-	for _, kw := range []string{"student_answer", "手写作答", "留空", "绝不"} {
+	for _, kw := range []string{
+		"student_answer", "手写作答", "留空", "绝不",
+		// BUG-20260714：视觉模型曾把印刷题 `4÷0.5=` 后的手写 `8` 合进 question，
+		// 导致已完成作业被误判为空白卷。提示词必须明确分离印刷题干与手写墨迹并给例子。
+		"题干只抄印刷体", `question 写 "4÷0.5="`, `student_answer 写 "8"`,
+	} {
 		if !contains(recognizePrompt, kw) {
 			t.Errorf("识题 prompt 缺关键约束 %q", kw)
 		}

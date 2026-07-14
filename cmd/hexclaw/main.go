@@ -1431,6 +1431,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	// K12 场景包装配（v0.5.0）：六缝注册 + records 存储 + 真 adapter（solve/识题/学情/教材/档案/渲染）+ 用例，挂 /api/k12/。
 	// AP-1：K12 只经 scenarios/k12 通过 registry 注入；平台 engine/api 不认识 K12。
+	var k12Runtime *k12assembly.K12
 	{
 		// 识题视觉闭包：作业图片 → 云端 vision 文本（mirror knowledge captioner），出网前过 EgressPolicy。
 		visionFn := func(ctx context.Context, image []byte, prompt string) (string, error) {
@@ -1477,6 +1478,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 		k12Opts := []k12assembly.Option{
 			k12assembly.WithRecognizer(k12engineadapter.NewRecognizerAdapter(visionFn)),
+			k12assembly.WithPhotoAnnotator(k12engineadapter.NewPhotoAnnotator()),
 		}
 		if fileMem != nil {
 			k12Opts = append(k12Opts, k12assembly.WithInsights(k12engineadapter.NewInsightsAdapter(fileMem)))
@@ -1543,6 +1545,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		if k12rt, k12err := k12assembly.Wire(store.DB(), k12Solve, k12Opts...); k12err != nil {
 			logger.Error("装配 K12 场景包失败", "error", k12err)
 		} else {
+			k12Runtime = k12rt
 			// IM 入站错题入库副作用：把 K12 批改闭环包成通用 skill 注入工具面。
 			// engine 只见通用工具（守 AP-1）；辅导 Agent 在群里被路由命中时，LLM 调
 			// k12_grade 即跑完整批改+错题入库+学情，实例 scope 从 ctx 的已路由 Agent 取。
@@ -1870,6 +1873,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	messageHandler := func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
 		if err := gw.Check(ctx, msg); err != nil {
 			return &adapter.Reply{Content: "安全检查未通过: " + err.Error()}, nil
+		}
+		if k12Runtime != nil {
+			if reply, handled, err := maybeHandleK12DingtalkPhoto(ctx, msg, agentRouter, k12Runtime.Deps.GradeHomeworkPhoto); handled {
+				return reply, err
+			}
 		}
 		return eng.Process(ctx, msg)
 	}
@@ -2252,12 +2260,30 @@ type classifiedSolveExecutor struct {
 }
 
 func (e classifiedSolveExecutor) Execute(ctx context.Context, args map[string]any) (*skill.Result, error) {
-	ctx = egress.WithRequest(ctx, egress.PurposeSolveVerify, "",
-		egress.ClassGeneral, egress.ClassSensitiveProfile)
+	ctx = e.classify(ctx)
 	if e.next == nil {
 		return nil, fmt.Errorf("k12 solve executor 未注入")
 	}
 	return e.next.Execute(ctx, args)
+}
+
+// GradeVerified 保留底层 SolveSkill 的内部快口。此前这个 composition wrapper 只实现
+// Execute，动态方法集被擦掉，SolveAdapter 在生产环境静默回退为第二轮 solver+verifier。
+func (e classifiedSolveExecutor) GradeVerified(ctx context.Context, problem, verifiedSolution, studentAnswer string) (*skill.Result, error) {
+	ctx = e.classify(ctx)
+	if e.next == nil {
+		return nil, fmt.Errorf("k12 solve executor 未注入")
+	}
+	fast, ok := e.next.(k12engineadapter.VerifiedGradeExecutor)
+	if !ok {
+		return nil, fmt.Errorf("k12 solve executor 不支持复用已验证解法")
+	}
+	return fast.GradeVerified(ctx, problem, verifiedSolution, studentAnswer)
+}
+
+func (e classifiedSolveExecutor) classify(ctx context.Context) context.Context {
+	return egress.WithRequest(ctx, egress.PurposeSolveVerify, "",
+		egress.ClassGeneral, egress.ClassSensitiveProfile)
 }
 
 func (r k12CronRegistrar) Register(ctx context.Context, kind string, spec k12usecase.CronSpec, platform, chatID, userID string) (string, error) {

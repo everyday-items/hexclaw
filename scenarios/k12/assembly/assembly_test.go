@@ -64,6 +64,9 @@ func TestWire_RealAdapterClosedLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Wire: %v", err)
 	}
+	if k.Deps.VerifiedGrader == nil {
+		t.Fatal("production wiring must explicitly retain the verified-solution grader fast path")
+	}
 	ctx := context.Background()
 
 	// 六缝装配：错题本 schema 已注册

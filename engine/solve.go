@@ -156,11 +156,57 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 	samples := clampSamples(intArg(args["self_consistency"], 1))
 	studentAnswer, _ := args["student_answer"].(string)
 	gradingMode := strings.TrimSpace(studentAnswer) != ""
+	// 显式传 method_diversity/self_consistency 表示调用方要求完整的 solver/verifier 流程；
+	// 即使题目只是一步算术，也不能被确定性快速路径绕过。
+	auto := !hasArg(args, "method_diversity") && !hasArg(args, "self_consistency")
+
+	// 纯一步算式走本机精确求值器：这类题不该因云端余额/限流，或本地模型 tools 请求挂起而
+	// 变成“未能解出”。求值器只接受数字、四则运算与括号，拒绝变量/文字/方程；复杂题仍进入
+	// solver + verifier 多 Agent 链。结果来自确定性程序计算，可直接给 numeric_exec 强证据。
+	if auto && !gradingMode && trivialArithmeticAllowedByConstraint(problem, constraint) {
+		if worked, computed, ok := solveTrivialArithmetic(problem); ok {
+			return &skill.Result{
+				Content: worked,
+				Metadata: map[string]string{
+					"solve_mode":     "deterministic_arithmetic",
+					"solve_verdict":  verdictString(verdictAgree),
+					"solve_evidence": "numeric_exec",
+					"solve_computed": computed,
+				},
+			}, nil
+		}
+	}
+	// 少量结构严格、数量关系唯一的小学应用题也可由本机有理数程序精确求解。完整命中但
+	// 超出当前约束时直接返回 out_of_scope，不能再掉进 5 分钟慢模型链；题型本身缺条件/歧义
+	// 才交给 solver + verifier。
+	if auto && !gradingMode {
+		if solution, ok := solveElementaryWordProblemDetailed(problem); ok {
+			if !elementaryWordAllowedByConstraint(problem, constraint) {
+				return &skill.Result{
+					Content: fmt.Sprintf("本题涉及「%s」，超出当前已学范围。请先确认孩子的年级/学期，再决定是否讲解。", solution.knowledgePoint),
+					Metadata: map[string]string{
+						"solve_mode":            "deterministic_scope_guard",
+						"solve_verdict":         verdictString(verdictOutOfScope),
+						"solve_evidence":        "none",
+						"solve_out_of_scope_kp": solution.knowledgePoint,
+					},
+				}, nil
+			}
+			return &skill.Result{
+				Content: solution.worked,
+				Metadata: map[string]string{
+					"solve_mode":     "deterministic_elementary_word",
+					"solve_verdict":  verdictString(verdictAgree),
+					"solve_evidence": "numeric_exec",
+					"solve_computed": solution.value,
+				},
+			}, nil
+		}
+	}
 
 	// P0.5 复杂度 triage：调用方未显式指定力度时，按题目复杂度自适应——难题自动上 method_diversity
 	// 加交叉校验，简单题（单步算术）直接作答、省去校验子 Agent 的额外一次调用（桌面延迟优先，
 	// "默认轻、按需重"）。显式传 method_diversity/self_consistency 即视为调用方接管、不再自动 triage。
-	auto := !hasArg(args, "method_diversity") && !hasArg(args, "self_consistency")
 	complexity := assessComplexity(problem)
 	if auto && complexity == complexityHard {
 		methodDiversity = true
@@ -271,6 +317,104 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 			"solve_evidence": evidenceKind(numericGrounded),
 		},
 	}, nil
+}
+
+// GradeVerified 是场景层内部批改快口：verifiedSolution 已由同一请求前序 Execute 的
+// solver+verifier 链验证，本方法只派 grader 对比学生作答，避免整套链重复执行。
+// 该方法刻意不暴露在 ToolDefinition 中，LLM/外部工具调用无法声明“已验证解法”绕过校验。
+func (o *SolveSkill) GradeVerified(ctx context.Context, problem, verifiedSolution, studentAnswer string) (*skill.Result, error) {
+	if strings.TrimSpace(problem) == "" || strings.TrimSpace(verifiedSolution) == "" || strings.TrimSpace(studentAnswer) == "" {
+		return nil, fmt.Errorf("problem, verified solution and student answer are required")
+	}
+	groundTruth := extractFinalAnswer(verifiedSolution)
+	if groundTruth == "" {
+		return nil, fmt.Errorf("verified solution has no final answer")
+	}
+	// 可确定性求解的题已由本机程序复算；但快路只有在“本机复算结果”和调用方传入的
+	// verifiedSolution 完全一致时才能启用。否则必须尊重前序已验证解法，降级给 grader，
+	// 避免规则误匹配反过来覆盖可信 ground truth。
+	if _, computed, ok := solveTrivialArithmetic(problem); ok {
+		verifiedValue, verifiedOK := arithmeticAnswerValue(groundTruth)
+		if verifiedOK && verifiedValue == computed {
+			if studentValue, arithmeticAnswer := arithmeticAnswerValue(studentAnswer); arithmeticAnswer {
+				assess := deterministicGradeAssessment(studentValue == computed, false)
+				return deterministicGradeResult(studentAnswer, computed, "grading_deterministic_arithmetic", assess), nil
+			}
+		}
+	}
+	if solution, ok := solveElementaryWordProblemDetailed(problem); ok {
+		expected := answerQuantity{value: solution.value, unit: solution.unit}
+		verified, verifiedOK := parseAnswerQuantity(groundTruth)
+		// 单位是应用题答案的一部分；verifiedSolution 缺单位、单位冲突或数值冲突时都不走快路。
+		if verifiedOK && quantitiesEqual(verified, expected) {
+			if student, studentOK := parseAnswerQuantity(studentAnswer); studentOK {
+				workValid, conclusive := validateStudentArithmeticWork(studentAnswer)
+				if conclusive {
+					assess := deterministicGradeAssessment(quantitiesEqual(student, expected) && workValid, !workValid)
+					groundTruthWithUnit := solution.value + solution.unit
+					return deterministicGradeResult(studentAnswer, groundTruthWithUnit, "grading_deterministic_elementary_word", assess), nil
+				}
+			}
+		}
+	}
+
+	runCtx, cancel := context.WithTimeout(ctx, orchestrateMaxWall)
+	defer cancel()
+	runID := "grade-verified-" + idgen.NanoID()
+	o.registry.Start(&SubAgentRunRecord{
+		ID: runID, Agent: "solve", Role: roleForDepth(spawnDepthFromContext(ctx)),
+		Depth: spawnDepthFromContext(ctx), Mode: "run", Status: subAgentStatusRunning,
+	})
+	childCtx := withCurrentRunID(runCtx, runID)
+	childCtx = context.WithValue(childCtx, solveEgressClassesKey{}, solveEgressClasses(ctx, map[string]any{
+		"problem": problem, "student_answer": studentAnswer,
+	}))
+	assess := o.grade(childCtx, problem, verifiedSolution, groundTruth, studentAnswer)
+	o.registry.Finish(runID, subAgentStatusOK, "reused_verified_solution", "", "")
+	return &skill.Result{
+		Content: formatGrading(studentAnswer, groundTruth, assess) + encodeSubAgentReports([]SubAgentReport{
+			{Agent: graderAgentName, Status: subAgentStatusOK},
+		}),
+		Metadata: map[string]string{
+			"solve_run_id":        runID,
+			"solve_mode":          "grading_verified_reuse",
+			"grade_correct":       strconv.FormatBool(assess.correct),
+			"grade_wrong_step":    assess.wrongStep,
+			"grade_misconception": assess.misconception,
+			"grade_guidance":      assess.guidance,
+			"grade_ground_truth":  groundTruth,
+		},
+	}, nil
+}
+
+func deterministicGradeAssessment(correct, wrongWork bool) gradeAssessment {
+	assess := gradeAssessment{correct: correct}
+	if correct {
+		return assess
+	}
+	if wrongWork {
+		assess.wrongStep = "演算中至少有一个等式不成立"
+	} else {
+		assess.wrongStep = "最终结果或单位与精确计算不一致"
+	}
+	assess.misconception = "计算结果、数量关系或单位有误"
+	assess.guidance = "请先核对数量关系，逐步重算每个等式，并检查最终单位。"
+	return assess
+}
+
+func deterministicGradeResult(studentAnswer, groundTruth, mode string, assess gradeAssessment) *skill.Result {
+	return &skill.Result{
+		Content: formatGrading(studentAnswer, groundTruth, assess),
+		Metadata: map[string]string{
+			"solve_mode":          mode,
+			"solve_evidence":      "numeric_exec",
+			"grade_correct":       strconv.FormatBool(assess.correct),
+			"grade_wrong_step":    assess.wrongStep,
+			"grade_misconception": assess.misconception,
+			"grade_guidance":      assess.guidance,
+			"grade_ground_truth":  groundTruth,
+		},
+	}
 }
 
 // evidenceKind 把「是否有 code_exec 数值 ground truth」映射成 adapter 认得的证据类型串。
@@ -449,9 +593,11 @@ GUIDANCE: <一句引导或鼓励>`, problem, solution, groundTruth, studentAnswe
 
 var (
 	gradeCorrectRe = regexp.MustCompile(`(?im)CORRECT\s*[:：]\s*(yes|no|对|错|正确|错误|true|false)`)
-	gradeStepRe    = regexp.MustCompile(`(?im)WRONG_STEP\s*[:：]\s*(.+?)\s*$`)
-	gradeMisconRe  = regexp.MustCompile(`(?im)MISCONCEPTION\s*[:：]\s*(.+?)\s*$`)
-	gradeGuideRe   = regexp.MustCompile(`(?im)GUIDANCE\s*[:：]\s*(.+?)\s*$`)
+	// 标签值必须限制在同一行。这里不能用 \s*：它会吞掉换行，使空 WRONG_STEP
+	// 错把下一行 `MISCONCEPTION:` 当值，随后又把 GUIDANCE 当成 misconception。
+	gradeStepRe   = regexp.MustCompile(`(?im)^\s*WRONG_STEP[ \t]*[:：][ \t]*(.*)$`)
+	gradeMisconRe = regexp.MustCompile(`(?im)^\s*MISCONCEPTION[ \t]*[:：][ \t]*(.*)$`)
+	gradeGuideRe  = regexp.MustCompile(`(?im)^\s*GUIDANCE[ \t]*[:：][ \t]*(.*)$`)
 )
 
 // parseGrading 解析 grader 输出；CORRECT 缺失 → 回退按答案文本直接比对（防误判）。
@@ -473,6 +619,11 @@ func parseGrading(out, studentAnswer, groundTruth string) gradeAssessment {
 	}
 	if m := gradeGuideRe.FindStringSubmatch(out); len(m) > 1 {
 		a.guidance = strings.TrimSpace(m[1])
+	}
+	// 答对时错步/误区在领域上必为空；即使模型违反格式也不把噪声暴露给 API/UI。
+	if a.correct {
+		a.wrongStep = ""
+		a.misconception = ""
 	}
 	return a
 }

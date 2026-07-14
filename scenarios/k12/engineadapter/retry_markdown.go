@@ -59,6 +59,41 @@ func normalizeRetryMarkdown(content string) string {
 	return strings.Join(out, "\n")
 }
 
+// normalizeSolveMarkdown 是空白作业 /solve 的呈现边界。真实 solver 常给“计划/第1步/答案：”
+// 普通文本；补上稳定的 GitHub Markdown 章节，并突出最终答案，桌面与钉钉共用同一正文。
+func normalizeSolveMarkdown(content string) string {
+	content = normalizeRetryMarkdown(content)
+	if content == "" {
+		return ""
+	}
+	if !strings.Contains(content, "## 解答") {
+		content = "## 解答\n\n" + content
+	}
+
+	lines := strings.Split(content, "\n")
+	inAnswer := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "## 答案" {
+			inAnswer = true
+			continue
+		}
+		if !inAnswer || trimmed == "" {
+			continue
+		}
+		// 验算引用不是答案；模型漏答案正文时保持原样。
+		if strings.HasPrefix(trimmed, ">") || strings.HasPrefix(trimmed, "#") {
+			break
+		}
+		if !strings.HasPrefix(trimmed, "**") {
+			indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+			lines[i] = indent + "**" + trimmed + "**"
+		}
+		break
+	}
+	return strings.Join(lines, "\n")
+}
+
 // retrySectionLine 识别模型常见的纯文本、粗体和 Markdown 标题三种段名写法。
 func retrySectionLine(line string) (heading, tail string, ok bool) {
 	s := strings.TrimSpace(line)

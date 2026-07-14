@@ -34,11 +34,13 @@ type PrepCard struct {
 // consecutiveFailThreshold 连续挫败阈值：某知识点未掌握错题达此数 → 附情绪提示。
 const consecutiveFailThreshold = 2
 
-// warmupSolveBudget 热身题出题的墙钟预算——热身题是 prep-card 唯一真调 LLM 的段，慢本地模型 prefill
-// 可达数分钟，而 solve 内部墙钟 5min ≫ 前端 k12PrepCard 的 120s 超时 → 整个 prep-card 请求被
-// WKWebView 判「Load failed」。给热身题单独套一层远低于前端超时的墙钟：超时即诚实降级、让 prep-card
-// 快速返回其余四段，不把慢模型延迟顶到 HTTP 层。配了 reasoning_model 的强文本云端模型下秒级完成、无感知。
+// prepCardBuildBudget 约束整张卡（知识库 grounding + 热身题）的总墙钟，必须给前端 120s
+// 请求超时留出序列化/网络余量。只限制 warmup 不够：一张作业识出多个知识点时，逐点 grounding
+// 也可能先耗掉几十秒，再叠加 warmup 导致前端先中止。
 // var（非 const）以便测试收窄预算。
+var prepCardBuildBudget = 90 * time.Second
+
+// warmupSolveBudget 是总预算内热身题自己的上限；父 ctx 的更早 deadline 会自动优先。
 var warmupSolveBudget = 90 * time.Second
 
 // BuildPrepCard 生成一页备课卡（只读聚合 + grounding + 来源标注）。
@@ -52,6 +54,8 @@ func (d Deps) BuildPrepCard(ctx context.Context, agentName, grade string, knowle
 	if err := validateGradeInput(grade); err != nil {
 		return PrepCard{}, err
 	}
+	ctx, cancel := context.WithTimeout(ctx, prepCardBuildBudget)
+	defer cancel()
 	card := PrepCard{KnowledgePoints: knowledgePoints}
 
 	// 聚合孩子在这些知识点上的错题历史（只读）。
@@ -126,12 +130,28 @@ func (d Deps) sectionWarmup(ctx context.Context, grade, kp string) PrepSection {
 	// 保证 prep-card 请求整体快速返回，不被慢本地模型的热身题出题拖成 Load failed。
 	ctx, cancel := context.WithTimeout(ctx, warmupSolveBudget)
 	defer cancel()
-	sr, err := d.Solver.Solve(ctx, fmt.Sprintf("出一道低于作业难度半档的「%s」热身题并解答", kp), grade, d.constraintFor(ctx, grade))
-	if err != nil || !sr.Evidence.StrongTrust() {
+	type solveOutcome struct {
+		result SolveResult
+		err    error
+	}
+	outcome := make(chan solveOutcome, 1)
+	go func() {
+		sr, err := d.Solver.Solve(ctx, fmt.Sprintf("出一道低于作业难度半档的「%s」热身题并解答", kp), grade, d.constraintFor(ctx, grade))
+		outcome <- solveOutcome{result: sr, err: err}
+	}()
+
+	var solved solveOutcome
+	select {
+	case solved = <-outcome:
+	case <-ctx.Done():
+		// provider/SDK 即使没有及时响应 context 取消，也不能把整个 HTTP 请求拖过前端超时。
+		return PrepSection{Title: "④ 热身题", Content: "（本次未生成可靠热身题）", SourceLabel: SrcAIUnverified}
+	}
+	if solved.err != nil || !solved.result.Evidence.StrongTrust() {
 		// 出题未过验算链 → 不放热身题（诚实兜底）
 		return PrepSection{Title: "④ 热身题", Content: "（本次未生成可靠热身题）", SourceLabel: SrcAIUnverified}
 	}
-	return PrepSection{Title: "④ 热身题（已过验算链）", Content: sr.Solution, SourceLabel: SrcVerified}
+	return PrepSection{Title: "④ 热身题（已过验算链）", Content: solved.result.Solution, SourceLabel: SrcVerified}
 }
 
 func sectionEmotion(history []ReviewItem) (PrepSection, bool) {

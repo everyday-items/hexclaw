@@ -42,8 +42,8 @@ func TestSolveAdapter_Solve_AgreeStrong(t *testing.T) {
 	if !sr.Evidence.StrongTrust() {
 		t.Error("code_exec 一致应强证据")
 	}
-	if sr.Solution != "解题：3.8×3=11.4" {
-		t.Errorf("解题正文应剥掉回执围栏, got %q", sr.Solution)
+	if !strings.HasPrefix(sr.Solution, "## 解答\n\n") || !strings.Contains(sr.Solution, "解题：3.8×3=11.4") || strings.Contains(sr.Solution, "hexclaw-subagents") {
+		t.Errorf("解题正文应是 Markdown 且剥掉回执围栏, got %q", sr.Solution)
 	}
 }
 
@@ -92,6 +92,38 @@ func TestSolveAdapter_Grade_Correct(t *testing.T) {
 	}
 }
 
+type verifiedGradeExec struct {
+	executeCalls  int
+	verifiedCalls int
+	gotSolution   string
+}
+
+func (e *verifiedGradeExec) Execute(context.Context, map[string]any) (*skill.Result, error) {
+	e.executeCalls++
+	return &skill.Result{Metadata: map[string]string{"grade_correct": "false"}}, nil
+}
+
+func (e *verifiedGradeExec) GradeVerified(_ context.Context, _, verifiedSolution, _ string) (*skill.Result, error) {
+	e.verifiedCalls++
+	e.gotSolution = verifiedSolution
+	return &skill.Result{Metadata: map[string]string{"grade_correct": "true"}}, nil
+}
+
+func TestSolveAdapter_GradeVerifiedUsesInternalFastPath(t *testing.T) {
+	exec := &verifiedGradeExec{}
+	a := NewSolveAdapter(exec)
+	out, err := a.GradeVerified(context.Background(), "数学", "3.8×3=?", "11.4", "解：3.8×3=11.4\n答案：11.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Correct || exec.verifiedCalls != 1 || exec.executeCalls != 0 {
+		t.Fatalf("out=%+v verified=%d execute=%d", out, exec.verifiedCalls, exec.executeCalls)
+	}
+	if exec.gotSolution != "解：3.8×3=11.4\n答案：11.4" {
+		t.Fatalf("verified solution not forwarded: %q", exec.gotSolution)
+	}
+}
+
 func TestSolveAdapter_GradeRejectsMissingOrInvalidCorrectMetadata(t *testing.T) {
 	tests := []struct {
 		name string
@@ -110,21 +142,17 @@ func TestSolveAdapter_GradeRejectsMissingOrInvalidCorrectMetadata(t *testing.T) 
 	}
 }
 
-// TestSolveAdapter_TrivialArithmeticGoesThroughVerifier 用**真 solve skill**（非 canned Result）
-// 端到端证明：像 4.5×2= 这样的可执行简单题，K12 /solve 分叉必须走 verifier code_exec 精算，
-// 拿到 agree + numeric_exec 强证据，而非被 solve 的 trivial-skip triage 判成 unverifiable（BUG-20260712）。
-//
-// RED（fix 前）：SolveSubject 不传 self_consistency → engine triage 认定 4.5×2= 为 trivial → skipVerify
-// → verifier 从不被调用、verdict=skipped → 本层归一 unverifiable、弱证据。断言失败。
-// GREEN（fix 后）：SolveSubject 显式传 self_consistency=1 关掉 triage → verifier 真跑 → agree/numeric_exec。
-func TestSolveAdapter_TrivialArithmeticGoesThroughVerifier(t *testing.T) {
-	verifierCalled := false
+// TestSolveAdapter_TrivialArithmeticUsesDeterministicFastPath 用**真 solve skill**（非 canned Result）
+// 端到端证明：像 4.5×2= 这样的纯一步算式不依赖云端余额/本地模型工具调用，直接由本机精确
+// 算式求值器完成并给 numeric_exec 强证据；复杂题仍走 solver+verifier 多 Agent 链。
+func TestSolveAdapter_TrivialArithmeticUsesDeterministicFastPath(t *testing.T) {
+	execCalls := 0
 	execFn := func(_ context.Context, spec engine.SubAgentSpec) (engine.SubAgentResult, error) {
+		execCalls++
 		switch spec.Agent {
 		case "solver":
 			return engine.SubAgentResult{Output: "4.5 × 2 = 9\n答案：9"}, nil
 		case "verifier":
-			verifierCalled = true
 			return engine.SubAgentResult{Output: "VERDICT: AGREE\nCOMPUTED: 9\n说明：一致。"}, nil
 		}
 		return engine.SubAgentResult{}, nil
@@ -135,8 +163,8 @@ func TestSolveAdapter_TrivialArithmeticGoesThroughVerifier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !verifierCalled {
-		t.Fatal("可执行简单题应走 verifier code_exec 精算，实际未调用 verifier（被 trivial-skip triage 跳过）")
+	if execCalls != 0 {
+		t.Fatalf("纯一步算式应走本机确定性快路，不应调用模型子 Agent，calls=%d", execCalls)
 	}
 	if sr.Evidence.Verdict != usecase.VerdictAgree {
 		t.Errorf("4.5×2= 应 verdict=agree，got %q", sr.Evidence.Verdict)

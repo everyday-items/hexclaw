@@ -24,6 +24,12 @@ type SolveExecutor interface {
 	Execute(ctx context.Context, args map[string]any) (*skill.Result, error)
 }
 
+// VerifiedGradeExecutor 是 engine.SolveSkill 的内部快口：正确解已在上一步验证时，只派 grader。
+// 不放进 LLM tool schema，外部模型不能伪造“已验证”输入。
+type VerifiedGradeExecutor interface {
+	GradeVerified(ctx context.Context, problem, verifiedSolution, studentAnswer string) (*skill.Result, error)
+}
+
 // RetryGenerateFunc 是「再练一道」的轻量出题闭包（composition root 注入，BUG-20260712）。
 // 内部走**单个 reasoning 子 Agent**出题+解答——不派 verifier / 不 self-consistency / 不重出，
 // 返回出题正文（含回执围栏，adapter 侧剥离）。nil 时 GenerateSimilar 安全回退全链。
@@ -56,10 +62,11 @@ func NewSolveAdapter(s SolveExecutor, opts ...SolveAdapterOption) *SolveAdapter 
 }
 
 var (
-	_ usecase.Solver          = (*SolveAdapter)(nil)
-	_ usecase.Grader          = (*SolveAdapter)(nil)
-	_ usecase.RetryGenerator  = (*SolveAdapter)(nil)
-	_ usecase.CauseSummarizer = (*SolveAdapter)(nil)
+	_ usecase.Solver                 = (*SolveAdapter)(nil)
+	_ usecase.Grader                 = (*SolveAdapter)(nil)
+	_ usecase.VerifiedSolutionGrader = (*SolveAdapter)(nil)
+	_ usecase.RetryGenerator         = (*SolveAdapter)(nil)
+	_ usecase.CauseSummarizer        = (*SolveAdapter)(nil)
 )
 
 // Solve 实现 usecase.Solver：调 solve skill 解题验算（透传 grade + constraint 约束年级边界），
@@ -70,11 +77,10 @@ func (a *SolveAdapter) Solve(ctx context.Context, problem, grade, constraint str
 
 // SolveSubject 与 Solve 相同，并把显式学科传给 solve skill，避免非数学 eval/批改落入默认数学路由。
 func (a *SolveAdapter) SolveSubject(ctx context.Context, subject, problem, grade, constraint string) (usecase.SolveResult, error) {
-	// K12 作业辅导：正确性优先于延迟——显式传 self_consistency=1 关掉 solve 的「简单题跳过验算」triage
-	// （engine/solve.go 的 skipVerify：trivial 纯算术直接作答、verdict=skipped→本层归一 unverifiable）。
-	// 显式传参即视为调用方接管 triage，可执行题（如 4.5×2=）照常走 verifier code_exec 精算，
-	// 拿到 agree + numeric_exec 强证据（badge=已程序验算），而非规划式 unverifiable（BUG-20260712 真机取证）。
-	args := map[string]any{"problem": problem, "self_consistency": 1}
+	// 不注入 self_consistency 默认值：由 solve 自适应 triage。纯数字四则算式走本机精确求值器并给
+	// numeric_exec 强证据；复杂题仍走 solver + verifier。只有真正由调用方显式指定校验力度时，
+	// engine 才禁用快速路径。
+	args := map[string]any{"problem": problem}
 	if subject != "" {
 		args["subject"] = subject
 	}
@@ -92,8 +98,9 @@ func (a *SolveAdapter) SolveSubject(ctx context.Context, subject, problem, grade
 		return usecase.SolveResult{}, fmt.Errorf("solve adapter: empty solve result")
 	}
 	return usecase.SolveResult{
-		Solution: stripReports(res.Content),
-		Evidence: evidenceFromMeta(res.Metadata),
+		Solution:     normalizeSolveMarkdown(stripReports(res.Content)),
+		Evidence:     evidenceFromMeta(res.Metadata),
+		OutOfScopeKP: res.Metadata["solve_out_of_scope_kp"],
 	}, nil
 }
 
@@ -152,6 +159,20 @@ func (a *SolveAdapter) GradeSubject(ctx context.Context, subject, problem, stude
 		args["subject"] = subject
 	}
 	res, err := a.exec.Execute(ctx, args)
+	return gradeOutcomeFromResult(res, err)
+}
+
+// GradeVerified 复用用例层刚得到的已验证解法。生产 SolveSkill 实现内部快口时只派 grader；
+// 测试/第三方旧 executor 没实现时安全回退原完整批改链，兼容性优先。
+func (a *SolveAdapter) GradeVerified(ctx context.Context, subject, problem, studentAnswer, verifiedSolution string) (usecase.GradeOutcome, error) {
+	if exec, ok := a.exec.(VerifiedGradeExecutor); ok {
+		res, err := exec.GradeVerified(ctx, problem, verifiedSolution, studentAnswer)
+		return gradeOutcomeFromResult(res, err)
+	}
+	return a.GradeSubject(ctx, subject, problem, studentAnswer, verifiedSolution)
+}
+
+func gradeOutcomeFromResult(res *skill.Result, err error) (usecase.GradeOutcome, error) {
 	if err != nil {
 		return usecase.GradeOutcome{}, err
 	}
@@ -178,9 +199,9 @@ func (a *SolveAdapter) GradeSubject(ctx context.Context, subject, problem, stude
 
 // evidenceFromMeta 把 solve 的 Metadata 映射成证据对象。
 //
-// 关键（信任红线，§5.3.2/§8.1）：强徽章「已程序验算」只在 solve 真跑 code_exec 得到数值
-// ground truth 时才给——由 solve 下发的 `solve_evidence=numeric_exec` 决定，**不再对任意
-// agree 都标强证据**。solve_evidence=model（仅模型口头 agree）→ 弱证据 heuristic。
+// 关键（信任红线，§5.3.2/§8.1）：强徽章「已程序验算」只在 solve 通过 code_exec 或本机
+// 确定性算式求值器得到数值 ground truth 时才给——由 `solve_evidence=numeric_exec` 决定，
+// **不再对任意 agree 都标强证据**。solve_evidence=model（仅模型口头 agree）→ 弱证据 heuristic。
 func evidenceFromMeta(m map[string]string) usecase.SolveEvidence {
 	verdict := usecase.Verdict(m["solve_verdict"])
 	ev := usecase.SolveEvidence{Verdict: verdict}
