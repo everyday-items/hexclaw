@@ -1223,12 +1223,13 @@ func (e *ReActEngine) completeWithTools(
 	}
 	thinkingTracker := &thinkingRecoveryTracker{}
 	selector := &runtimeProviderSelector{
-		router:           e.router,
-		markUnhealthy:    e.failoverMarkUnhealthy,
-		initialProvider:  provider,
-		initialName:      providerName,
-		initialModel:     modelName,
-		explicitProvider: explicitProvider,
+		router:                      e.router,
+		markUnhealthy:               e.failoverMarkUnhealthy,
+		initialProvider:             provider,
+		initialName:                 providerName,
+		initialModel:                modelName,
+		initialSameProviderFallback: e.router.ProviderModel(providerName),
+		explicitProvider:            explicitProvider,
 		modelForProvider: func(name string) string {
 			return e.getProviderModel(name, msg.Metadata)
 		},
@@ -2093,12 +2094,13 @@ func (e *ReActEngine) processStreamRuntime(
 			budget = NewBudgetController(*cfg)
 		}
 		selector := &runtimeProviderSelector{
-			router:           e.router,
-			markUnhealthy:    e.failoverMarkUnhealthy,
-			initialProvider:  selection.provider,
-			initialName:      selection.providerName,
-			initialModel:     selection.modelName,
-			explicitProvider: selection.explicitProvider,
+			router:                      e.router,
+			markUnhealthy:               e.failoverMarkUnhealthy,
+			initialProvider:             selection.provider,
+			initialName:                 selection.providerName,
+			initialModel:                selection.modelName,
+			initialSameProviderFallback: e.router.ProviderModel(selection.providerName),
+			explicitProvider:            selection.explicitProvider,
 			modelForProvider: func(name string) string {
 				return e.getProviderModel(name, msg.Metadata)
 			},
@@ -4274,10 +4276,12 @@ func (e *ReActEngine) reasoningSelectionForSolve(msg *adapter.Message) (llmSelec
 		provider = &modelOverrideProvider{inner: provider, model: model}
 	}
 	return llmSelection{
-		provider:         provider,
-		providerName:     prov,
-		modelName:        model,
-		explicitProvider: true, // 配置的推理模型视作显式 pin，不被 cost-aware 改派回视觉模型
+		provider:     provider,
+		providerName: prov,
+		modelName:    model,
+		// 配置的推理模型是系统首选，不是用户本轮显式 pin。首选模型 429/故障时允许先降级到
+		// 同 provider 默认模型，再跨 provider；初始选择本身仍固定走 reasoning_model。
+		explicitProvider: false,
 	}, true
 }
 

@@ -44,6 +44,9 @@ func TestReasoningModel_SolveSourceUsesStrongTextModel(t *testing.T) {
 	if sel.modelName != "glm-4.5" {
 		t.Fatalf("BUG 复现:解题/批改未用配置的强文本模型 glm-4.5(仍用视觉默认→漏判),got model=%q provider=%q", sel.modelName, sel.providerName)
 	}
+	if sel.explicitProvider {
+		t.Fatal("配置的 reasoning_model 只是系统首选，不是用户本轮显式 pin；硬失败时必须允许降级")
+	}
 }
 
 // TestReasoningModel_NonSolveKeepsDefaultVisionModel 普通聊天/识题(非 solve 源)仍用默认视觉模型,不被误改。

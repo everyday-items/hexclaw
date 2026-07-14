@@ -24,16 +24,20 @@ type runtimeProviderSelector struct {
 	// 都先打一次挂掉的默认 provider（429）再回退，"额度耗尽即云端整体变慢/不可用"的观感由此
 	// 而来。仅对 isProviderUnavailableError（429/5xx/超时/连接失败）熔断，不误伤"工具不支持"
 	// （那条走去工具降级、不换 provider）。nil 时不熔断（保持旧行为）。
-	markUnhealthy    func(name, reason string)
-	initialProvider  hexagon.Provider
-	initialName      string
-	initialModel     string
-	explicitProvider bool
-	modelForProvider func(string) string
-	wrapProvider     func(hexagon.Provider, string, string) hexagon.Provider
-	currentProvider  hexagon.Provider
-	currentName      string
-	currentModel     string
+	markUnhealthy   func(name, reason string)
+	initialProvider hexagon.Provider
+	initialName     string
+	initialModel    string
+	// initialSameProviderFallback 是首选模型硬失败时，同一 provider 内可用的默认模型。
+	// 典型场景：K12 优先 glm-4.5 推理，但该模型 429；同一智谱的 glm-4v-flash 仍健康。
+	initialSameProviderFallback string
+	usedSameProviderFallback    bool
+	explicitProvider            bool
+	modelForProvider            func(string) string
+	wrapProvider                func(hexagon.Provider, string, string) hexagon.Provider
+	currentProvider             hexagon.Provider
+	currentName                 string
+	currentModel                string
 	// tried 累积本次运行已尝试过的 provider 名，供多跳回退用 exclude 集合遍历所有健康
 	// provider 一轮、防止回到已失败的 provider 造成死循环（BUG-20260711 Gap-2）。
 	tried map[string]bool
@@ -107,6 +111,17 @@ func (s *runtimeProviderSelector) Fallback(context.Context, hruntime.ProviderSel
 func (s *runtimeProviderSelector) failoverAdvance(cause error) bool {
 	if s.explicitProvider || s.router == nil {
 		return false
+	}
+	// 模型级失败不等于整个 provider 失败。首选推理模型不可用时，先用同 provider 的
+	// 配置默认模型兜底；只有默认模型也失败，才熔断 provider 并跨 provider 切换。
+	if !s.usedSameProviderFallback &&
+		s.currentName == s.initialName &&
+		s.initialProvider != nil &&
+		s.initialSameProviderFallback != "" &&
+		s.initialSameProviderFallback != s.currentModel {
+		s.usedSameProviderFallback = true
+		s.setCurrent(s.initialProvider, s.initialName, s.initialSameProviderFallback)
+		return true
 	}
 	s.tripBreaker(s.currentName, cause)
 	s.markTried(s.currentName)
