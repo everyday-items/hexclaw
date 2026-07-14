@@ -15,7 +15,7 @@ import (
 
 // subAgentRetryBackoff 是瞬时错误的退避序列（指数 + 固定，避免 rand 依赖）。
 // 重试次数 = len(序列)；每次失败后按对应时长退避再试。
-var subAgentRetryBackoff = []time.Duration{200 * time.Millisecond, 600 * time.Millisecond, 1500 * time.Millisecond}
+var subAgentRetryBackoff = []time.Duration{2 * time.Second, 5 * time.Second, 30 * time.Second}
 
 // defaultSubAgentTimeout 是 orchestrate 中单个子 Agent 的默认超时（spawn 自带 5min；orchestrate
 // 此前只有父 ctx，一个慢子拖垮整批——#8）。
@@ -28,6 +28,8 @@ var transientPhrases = []string{
 	"unexpected eof", "connection reset", "connection refused", "temporarily",
 	"overloaded", "unavailable", "bad gateway", "gateway timeout",
 	"service unavailable", "internal server error", "server error",
+	// 中文 provider/facade 会把 429 归一成用户友好文案，不能只认英文原始错误。
+	"请求过于频繁", "上游限流", "服务繁忙", "稍等片刻再试",
 }
 
 // transientStatusCodeRe 匹配独立的 HTTP 瞬时状态码（词边界，避免 5000 命中 500）。

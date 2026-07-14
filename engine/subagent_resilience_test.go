@@ -10,7 +10,11 @@ import (
 )
 
 func TestIsTransientErr(t *testing.T) {
-	transient := []string{"429 Too Many Requests", "rate limit exceeded", "context deadline exceeded", "unexpected EOF", "503 Service Unavailable", "model overloaded"}
+	transient := []string{
+		"429 Too Many Requests", "rate limit exceeded", "context deadline exceeded", "unexpected EOF",
+		"503 Service Unavailable", "model overloaded",
+		"请求过于频繁，已被上游限流。请稍等片刻再试。",
+	}
 	for _, s := range transient {
 		if !isTransientErr(errors.New(s)) {
 			t.Errorf("%q 应判瞬时", s)
@@ -21,6 +25,18 @@ func TestIsTransientErr(t *testing.T) {
 		if isTransientErr(e) {
 			t.Errorf("%v 不应判瞬时", e)
 		}
+	}
+}
+
+// BUG-20260714：真实视觉识题刚结束就进入 solver 时，上游可能按分钟限流。
+// 退避窗口若只到 15s，四次尝试会全部挤在同一限流窗口内，最终把可解题降级成
+// “未能解出本题”。默认序列必须至少留一次跨过 30s 冷却窗的重试机会。
+func TestDefaultSubAgentRetryBackoffCrossesProviderCooldown(t *testing.T) {
+	if len(subAgentRetryBackoff) == 0 {
+		t.Fatal("默认瞬时错误重试序列不能为空")
+	}
+	if got := subAgentRetryBackoff[len(subAgentRetryBackoff)-1]; got < 30*time.Second {
+		t.Fatalf("最后一次退避 = %v，至少应为 30s 以跨过真实 provider 限流冷却窗", got)
 	}
 }
 
