@@ -16,70 +16,20 @@ package dingtalk
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
-	"github.com/hexagon-codes/hexclaw/config"
-	"github.com/hexagon-codes/hexclaw/secret"
-	_ "modernc.org/sqlite"
 )
 
 func TestLiveSend_RealMarkdown(t *testing.T) {
-	if os.Getenv("DINGTALK_LIVE_SEND") == "" {
+	if os.Getenv("DINGTALK_LIVE_SEND") != "1" {
 		t.Skip("设 DINGTALK_LIVE_SEND=1 跑真机实发（会真的往你的钉钉发一条消息）")
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatalf("获取 HOME 失败: %v", err)
-	}
-	dataDir := filepath.Join(home, ".hexclaw")
-
-	// 1. 用应用自己的主密钥解密钉钉实例配置（in-memory，不落盘）。
-	box, err := secret.LoadBox(dataDir)
-	if err != nil {
-		t.Fatalf("加载主密钥失败: %v", err)
-	}
-	db, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "data.db")+"?mode=ro")
-	if err != nil {
-		t.Fatalf("打开 data.db 失败: %v", err)
-	}
-	defer db.Close()
-
-	var stored string
-	if err := db.QueryRow(`SELECT config_json FROM platform_instances WHERE provider='dingtalk' LIMIT 1`).Scan(&stored); err != nil {
-		t.Fatalf("读取钉钉实例配置失败（是否已在连接中心配置钉钉？）: %v", err)
-	}
-	plain := stored
-	if secret.IsEncrypted(stored) {
-		b, oerr := box.Open(stored)
-		if oerr != nil {
-			t.Fatalf("解密钉钉配置失败: %v", oerr)
-		}
-		plain = string(b)
-	}
-	var cfg config.DingtalkConfig
-	if err := json.Unmarshal([]byte(plain), &cfg); err != nil {
-		t.Fatalf("解析钉钉配置失败: %v", err)
-	}
-	if cfg.AppKey == "" || cfg.AppSecret == "" || cfg.RobotCode == "" {
-		t.Fatalf("钉钉配置缺 app_key/app_secret/robot_code（app_key<len %d> secret<len %d> robot<len %d>）",
-			len(cfg.AppKey), len(cfg.AppSecret), len(cfg.RobotCode))
-	}
-
-	// 2. 目标 userId：env 覆盖 > 最近钉钉会话 chat_id。
-	userID := os.Getenv("DINGTALK_LIVE_USERID")
-	if userID == "" {
-		_ = db.QueryRow(`SELECT chat_id FROM sessions WHERE platform='dingtalk' AND chat_id != '' ORDER BY updated_at DESC LIMIT 1`).Scan(&userID)
-	}
-	if userID == "" {
-		t.Fatalf("找不到目标 userId（无钉钉历史会话），请设 DINGTALK_LIVE_USERID=<你的钉钉 userid>")
-	}
+	// 1-2. 用共用 helper 精确选择真实实例与其用户，凭证仅在内存解密。
+	cfg, userID := loadLiveDingtalkConfig(t)
 
 	// 3. 走生产完全相同的发送路径：dingtalk.New → Send → sendReplyNow →
 	//    officialDingtalkOpenAPI.SendOTO → dingtalkMarkdownMessage → BatchSendOTO(sampleMarkdown)。

@@ -33,7 +33,7 @@ import (
 )
 
 func TestLivePicture_InvalidDownloadCode_BusinessErrorAndUserNotice(t *testing.T) {
-	if os.Getenv("DINGTALK_LIVE_SEND") == "" {
+	if os.Getenv("DINGTALK_LIVE_SEND") != "1" {
 		t.Skip("设 DINGTALK_LIVE_SEND=1 跑真机（会真的往你的钉钉发一条「图片获取失败」提示）")
 	}
 	cfg, userID := loadLiveDingtalkConfig(t)
@@ -93,7 +93,7 @@ func (l *livePictureOpenAPI) DownloadMessageFile(_ context.Context, _, _, _ stri
 //
 // 模型：DINGTALK_LIVE_PROVIDER 指定（需 vision，如 openrouter 的 omni 模型），仍是用户真实配置。
 func TestLivePicture_RealImageSolve_SendToDingtalk(t *testing.T) {
-	if os.Getenv("DINGTALK_LIVE_SEND") == "" {
+	if os.Getenv("DINGTALK_LIVE_SEND") != "1" {
 		t.Skip("设 DINGTALK_LIVE_SEND=1 跑真机（真实模型解题并发到你的钉钉）")
 	}
 	imgPath := os.Getenv("DINGTALK_LIVE_IMAGE")

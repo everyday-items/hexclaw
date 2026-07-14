@@ -33,6 +33,9 @@ import (
 )
 
 // loadLiveDingtalkConfig 从本机 ~/.hexclaw/data.db 解密真实钉钉配置 + 目标 userId（in-memory，不落盘）。
+// 多实例时可用 DINGTALK_LIVE_INSTANCE=<实例名> 精确选择；未指定则优先选已启用且最近更新的实例。
+// 目标默认取该实例最近会话的 user_id，而不是 chat_id：群聊的 chat_id 是
+// openConversationId，误拿它调 BatchSendOTO 会把群 ID 当 userId，导致真机门发错目标/失败。
 func loadLiveDingtalkConfig(t *testing.T) (config.DingtalkConfig, string) {
 	t.Helper()
 	home, err := os.UserHomeDir()
@@ -51,8 +54,15 @@ func loadLiveDingtalkConfig(t *testing.T) (config.DingtalkConfig, string) {
 	}
 	defer db.Close()
 
+	instanceName := strings.TrimSpace(os.Getenv("DINGTALK_LIVE_INSTANCE"))
 	var stored string
-	if err := db.QueryRow(`SELECT config_json FROM platform_instances WHERE provider='dingtalk' LIMIT 1`).Scan(&stored); err != nil {
+	var row *sql.Row
+	if instanceName != "" {
+		row = db.QueryRow(`SELECT name, config_json FROM platform_instances WHERE provider='dingtalk' AND name=? LIMIT 1`, instanceName)
+	} else {
+		row = db.QueryRow(`SELECT name, config_json FROM platform_instances WHERE provider='dingtalk' ORDER BY enabled DESC, updated_at DESC LIMIT 1`)
+	}
+	if err := row.Scan(&instanceName, &stored); err != nil {
 		t.Fatalf("读取钉钉实例配置失败（是否已在连接中心配置钉钉？）: %v", err)
 	}
 	plain := stored
@@ -67,22 +77,23 @@ func loadLiveDingtalkConfig(t *testing.T) (config.DingtalkConfig, string) {
 	if err := json.Unmarshal([]byte(plain), &cfg); err != nil {
 		t.Fatalf("解析钉钉配置失败: %v", err)
 	}
+	cfg.Name = instanceName // 与 instances.BuildAdapter 的生产行为一致。
 	if cfg.AppKey == "" || cfg.AppSecret == "" || cfg.RobotCode == "" {
 		t.Fatalf("钉钉配置缺 app_key/app_secret/robot_code")
 	}
 
 	userID := os.Getenv("DINGTALK_LIVE_USERID")
 	if userID == "" {
-		_ = db.QueryRow(`SELECT chat_id FROM sessions WHERE platform='dingtalk' AND chat_id != '' ORDER BY updated_at DESC LIMIT 1`).Scan(&userID)
+		_ = db.QueryRow(`SELECT user_id FROM sessions WHERE platform='dingtalk' AND instance_id=? AND user_id != '' AND status >= 0 ORDER BY updated_at DESC LIMIT 1`, instanceName).Scan(&userID)
 	}
 	if userID == "" {
-		t.Fatalf("找不到目标 userId（无钉钉历史会话），请设 DINGTALK_LIVE_USERID=<你的钉钉 userid>")
+		t.Fatalf("实例 %q 找不到目标 userId（无钉钉历史会话），请设 DINGTALK_LIVE_USERID=<你的钉钉 userid>", instanceName)
 	}
 	return cfg, userID
 }
 
 func TestLiveThinkingFeedbackRecall_BUG20260704(t *testing.T) {
-	if os.Getenv("DINGTALK_LIVE_SEND") == "" {
+	if os.Getenv("DINGTALK_LIVE_SEND") != "1" {
 		t.Skip("设 DINGTALK_LIVE_SEND=1 跑真机（会真的往你的钉钉发一条占位并撤回）")
 	}
 	cfg, userID := loadLiveDingtalkConfig(t)
@@ -122,7 +133,7 @@ func TestLiveThinkingFeedbackRecall_BUG20260704(t *testing.T) {
 //
 //	DINGTALK_LIVE_SEND=1 go test ./adapter/dingtalk/ -run TestLiveFullFlow -v
 func TestLiveFullFlow_BUG20260704(t *testing.T) {
-	if os.Getenv("DINGTALK_LIVE_SEND") == "" {
+	if os.Getenv("DINGTALK_LIVE_SEND") != "1" {
 		t.Skip("设 DINGTALK_LIVE_SEND=1 跑真机（会真的往你的钉钉连发几条完整消息）")
 	}
 	cfg, userID := loadLiveDingtalkConfig(t)
@@ -163,7 +174,7 @@ func TestLiveFullFlow_BUG20260704(t *testing.T) {
 //
 //	DINGTALK_LIVE_SEND=1 go test ./adapter/dingtalk/ -run TestLiveRealModelFullFlow -v -timeout 5m
 func TestLiveRealModelFullFlow_BUG20260704(t *testing.T) {
-	if os.Getenv("DINGTALK_LIVE_SEND") == "" {
+	if os.Getenv("DINGTALK_LIVE_SEND") != "1" {
 		t.Skip("设 DINGTALK_LIVE_SEND=1 跑真机（真实模型生成答案并发到你的钉钉）")
 	}
 	cfg, userID := loadLiveDingtalkConfig(t)
@@ -241,7 +252,7 @@ func TestLiveRealModelFullFlow_BUG20260704(t *testing.T) {
 //
 //	DINGTALK_LIVE_SEND=1 go test ./adapter/dingtalk/ -run TestLiveEmptyReplyDeliversFallback -v
 func TestLiveEmptyReplyDeliversFallback_BUG20260704(t *testing.T) {
-	if os.Getenv("DINGTALK_LIVE_SEND") == "" {
+	if os.Getenv("DINGTALK_LIVE_SEND") != "1" {
 		t.Skip("设 DINGTALK_LIVE_SEND=1 跑真机（会往你的钉钉发一条空正文兜底消息）")
 	}
 	cfg, userID := loadLiveDingtalkConfig(t)

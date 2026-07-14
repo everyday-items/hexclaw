@@ -10,13 +10,17 @@
 package dingtalk
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,13 +76,27 @@ type DingtalkAdapter struct {
 // defaultHandlerTimeout 是单条消息处理的默认总预算。
 const defaultHandlerTimeout = 2 * time.Minute
 
+// photoHandlerTimeout 给整页识题 + 多题批改留出真实预算。Stream 回调已经即时 ack，
+// 这里延长后台 worker 不会阻塞钉钉；用户会先收到带 ETA 的进度消息。
+const photoHandlerTimeout = 10 * time.Minute
+
 // terminalNotifyTimeout 是终态用户通知（错误提示 / 占位撤回 / 最终答案）的兜底 ctx 预算。
-const terminalNotifyTimeout = 15 * time.Second
+const terminalNotifyTimeout = 45 * time.Second
 
 // messageHandlerTimeout 返回处理总预算（handlerTimeout 未设时用默认）。
 func (a *DingtalkAdapter) messageHandlerTimeout() time.Duration {
 	if a.handlerTimeout > 0 {
 		return a.handlerTimeout
+	}
+	return defaultHandlerTimeout
+}
+
+func (a *DingtalkAdapter) messageHandlerTimeoutFor(event dtEvent) time.Duration {
+	if a.handlerTimeout > 0 {
+		return a.handlerTimeout
+	}
+	if event.MsgType == dtMsgTypePicture {
+		return photoHandlerTimeout
 	}
 	return defaultHandlerTimeout
 }
@@ -137,6 +155,15 @@ func New(cfg config.DingtalkConfig) *DingtalkAdapter {
 // 最终答案输出后再撤回（recall），使占位不残留（BUG-20260704：不删除占位、改为答案就位后撤回）。
 const dingtalkThinkingFeedback = "⌨️ 已收到，正在思考…"
 
+const dingtalkPhotoProcessingFeedback = "📷 已收到图片，正在识别和处理。通常预计 2–5 分钟；题量或图片内容较多时约 5–10 分钟。完成后会把处理结果（如有批改图）发回当前对话。"
+
+func thinkingFeedbackForEvent(event dtEvent) string {
+	if event.MsgType == dtMsgTypePicture {
+		return dingtalkPhotoProcessingFeedback
+	}
+	return dingtalkThinkingFeedback
+}
+
 // dtMsgTypePicture 是钉钉图片消息的 msgtype——唯一允许经 downloadCode 进图片
 // 多模态管道的富媒体类型（BUG-20260710：audio/video/file 同以 downloadCode 承载，
 // 硬贴 image 附件会让 provider 400）。
@@ -159,6 +186,15 @@ type dingtalkOpenAPI interface {
 	DownloadMessageFile(ctx context.Context, accessToken, robotCode, downloadCode string) (downloadURL string, err error)
 }
 
+type dingtalkGroupOpenAPI interface {
+	SendGroup(ctx context.Context, accessToken, robotCode, conversationID string, msg dingtalkOutboundMessage) (processQueryKey string, err error)
+	RecallGroup(ctx context.Context, accessToken, robotCode, conversationID string, processQueryKeys []string) error
+}
+
+type dingtalkMediaOpenAPI interface {
+	UploadImage(ctx context.Context, accessToken string, attachment adapter.Attachment) (mediaID string, err error)
+}
+
 // dingtalkOutboundMessage 是钉钉出站消息的传输形态：MsgKey 选择消息类型
 // （sampleText / sampleMarkdown），MsgParam 为对应 JSON 载荷。消息类型策略在
 // 适配器层决定，接口只负责传输（可测缝，BUG-20260703 B7）。
@@ -167,10 +203,144 @@ type dingtalkOutboundMessage struct {
 	MsgParam string
 }
 
+// groupQueueTargetPrefix lets the existing per-adapter SendQueue serialize
+// both OTO and group replies without exposing conversation type in the public
+// adapter.Send signature. A NUL-prefixed value cannot collide with a DingTalk
+// staff ID/openConversationId.
+const groupQueueTargetPrefix = "\x00dingtalk-group:"
+
+func groupQueueTarget(conversationID string) string {
+	return groupQueueTargetPrefix + conversationID
+}
+
+func parseGroupQueueTarget(target string) (string, bool) {
+	if !strings.HasPrefix(target, groupQueueTargetPrefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(target, groupQueueTargetPrefix), true
+}
+
 type officialDingtalkOpenAPI struct {
-	oauth   *dtoauth.Client
-	robot   *dtrobot.Client
-	runtime *util.RuntimeOptions
+	oauth    *dtoauth.Client
+	robot    *dtrobot.Client
+	runtime  *util.RuntimeOptions
+	http     *http.Client
+	mediaURL string
+}
+
+const dingtalkMediaUploadURL = "https://oapi.dingtalk.com/media/upload"
+
+// dingtalkMaxOutboundImageBytes follows DingTalk's robot image limit while also
+// preventing an accidentally huge in-memory attachment from being decoded and
+// copied into a multipart body.
+const dingtalkMaxOutboundImageBytes = 20 << 20
+
+type dingtalkMediaUploadResponse struct {
+	ErrCode int    `json:"errcode"`
+	ErrMsg  string `json:"errmsg"`
+	MediaID string `json:"media_id"`
+}
+
+// uploadDingtalkImage uploads an in-memory corrected worksheet to DingTalk's
+// media endpoint. The returned media_id can be embedded directly in a
+// sampleMarkdown image expression, so no public object-storage URL is needed.
+func uploadDingtalkImage(
+	ctx context.Context,
+	httpClient *http.Client,
+	endpoint string,
+	accessToken string,
+	attachment adapter.Attachment,
+) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if httpClient == nil {
+		return "", errors.New("钉钉图片上传 HTTP 客户端为空")
+	}
+	if !adapter.IsImageAttachment(attachment) {
+		return "", fmt.Errorf("钉钉仅支持上传图片附件: %s", attachment.Name)
+	}
+	encoded := strings.TrimSpace(attachment.Data)
+	if encoded == "" {
+		return "", errors.New("钉钉图片上传内容为空")
+	}
+	// Be tolerant of callers that pass a complete data URI even though the
+	// adapter contract normally stores only the base64 payload.
+	if comma := strings.IndexByte(encoded, ','); strings.HasPrefix(encoded, "data:") && comma >= 0 {
+		encoded = encoded[comma+1:]
+	}
+	if base64.StdEncoding.DecodedLen(len(encoded)) > dingtalkMaxOutboundImageBytes {
+		return "", fmt.Errorf("钉钉回复图片超过 %dMB 上限", dingtalkMaxOutboundImageBytes>>20)
+	}
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("解码钉钉回复图片失败: %w", err)
+	}
+	if len(raw) == 0 {
+		return "", errors.New("钉钉图片上传内容为空")
+	}
+	if len(raw) > dingtalkMaxOutboundImageBytes {
+		return "", fmt.Errorf("钉钉回复图片超过 %dMB 上限", dingtalkMaxOutboundImageBytes>>20)
+	}
+	detectedMIME := http.DetectContentType(raw)
+	if !strings.HasPrefix(strings.ToLower(detectedMIME), "image/") {
+		return "", fmt.Errorf("钉钉回复附件真实内容不是图片: %s", detectedMIME)
+	}
+
+	u, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("钉钉图片上传地址无效: %q", endpoint)
+	}
+	query := u.Query()
+	query.Set("access_token", accessToken)
+	u.RawQuery = query.Encode()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("type", "image"); err != nil {
+		return "", fmt.Errorf("构造钉钉图片上传参数失败: %w", err)
+	}
+	name := strings.TrimSpace(filepath.Base(attachment.Name))
+	if name == "" || name == "." {
+		name = "graded-homework.png"
+	}
+	part, err := writer.CreateFormFile("media", name)
+	if err != nil {
+		return "", fmt.Errorf("构造钉钉图片上传文件失败: %w", err)
+	}
+	if _, err := part.Write(raw); err != nil {
+		return "", fmt.Errorf("写入钉钉图片上传文件失败: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return "", fmt.Errorf("完成钉钉图片上传表单失败: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), &body)
+	if err != nil {
+		return "", fmt.Errorf("创建钉钉图片上传请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("上传钉钉图片失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("读取钉钉图片上传响应失败: %w", err)
+	}
+	var result dingtalkMediaUploadResponse
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		return "", fmt.Errorf("解析钉钉图片上传响应失败（HTTP %d）: %w", resp.StatusCode, err)
+	}
+	if resp.StatusCode != http.StatusOK || result.ErrCode != 0 {
+		return "", fmt.Errorf("钉钉图片上传失败（HTTP %d, errcode=%d）: %s", resp.StatusCode, result.ErrCode, result.ErrMsg)
+	}
+	if strings.TrimSpace(result.MediaID) == "" {
+		return "", errors.New("钉钉图片上传成功但 media_id 为空")
+	}
+	return result.MediaID, nil
 }
 
 func newOfficialDingtalkOpenAPI() (*officialDingtalkOpenAPI, error) {
@@ -189,14 +359,72 @@ func newOfficialDingtalkOpenAPI() (*officialDingtalkOpenAPI, error) {
 		return nil, err
 	}
 	return &officialDingtalkOpenAPI{
-		oauth: oauthClient,
-		robot: robotClient,
+		oauth:    oauthClient,
+		robot:    robotClient,
+		http:     &http.Client{Timeout: 20 * time.Second},
+		mediaURL: dingtalkMediaUploadURL,
 		runtime: &util.RuntimeOptions{
 			Autoretry:      tea.Bool(false),
 			ConnectTimeout: tea.Int(10_000),
 			ReadTimeout:    tea.Int(10_000),
 		},
 	}, nil
+}
+
+func (c *officialDingtalkOpenAPI) SendGroup(_ context.Context, accessToken, robotCode, conversationID string, msg dingtalkOutboundMessage) (string, error) {
+	resp, err := c.robot.OrgGroupSendWithOptions(
+		(&dtrobot.OrgGroupSendRequest{}).
+			SetRobotCode(robotCode).
+			SetOpenConversationId(conversationID).
+			SetMsgKey(msg.MsgKey).
+			SetMsgParam(msg.MsgParam),
+		(&dtrobot.OrgGroupSendHeaders{}).SetXAcsDingtalkAccessToken(accessToken),
+		c.runtime,
+	)
+	if err != nil {
+		return "", err
+	}
+	if resp != nil && resp.StatusCode != nil && *resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("钉钉机器人群发送返回 %d", *resp.StatusCode)
+	}
+	if resp != nil && resp.Body != nil && resp.Body.ProcessQueryKey != nil {
+		return *resp.Body.ProcessQueryKey, nil
+	}
+	return "", nil
+}
+
+func (c *officialDingtalkOpenAPI) RecallGroup(_ context.Context, accessToken, robotCode, conversationID string, processQueryKeys []string) error {
+	keys := make([]*string, 0, len(processQueryKeys))
+	for _, key := range processQueryKeys {
+		if strings.TrimSpace(key) != "" {
+			keys = append(keys, tea.String(key))
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	resp, err := c.robot.OrgGroupRecallWithOptions(
+		(&dtrobot.OrgGroupRecallRequest{}).
+			SetRobotCode(robotCode).
+			SetOpenConversationId(conversationID).
+			SetProcessQueryKeys(keys),
+		(&dtrobot.OrgGroupRecallHeaders{}).SetXAcsDingtalkAccessToken(accessToken),
+		c.runtime,
+	)
+	if err != nil {
+		return err
+	}
+	if resp != nil && resp.StatusCode != nil && *resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("钉钉机器人群撤回返回 %d", *resp.StatusCode)
+	}
+	if resp != nil && resp.Body != nil && len(resp.Body.FailedResult) > 0 {
+		return fmt.Errorf("钉钉机器人群撤回部分失败: %v", resp.Body.FailedResult)
+	}
+	return nil
+}
+
+func (c *officialDingtalkOpenAPI) UploadImage(ctx context.Context, accessToken string, attachment adapter.Attachment) (string, error) {
+	return uploadDingtalkImage(ctx, c.http, c.mediaURL, accessToken, attachment)
 }
 
 func (a *DingtalkAdapter) apiClient() (dingtalkOpenAPI, error) {
@@ -572,6 +800,9 @@ func (a *DingtalkAdapter) sendReplyNow(ctx context.Context, chatID string, reply
 	if reply == nil {
 		return nil
 	}
+	if conversationID, isGroup := parseGroupQueueTarget(chatID); isGroup {
+		return a.sendReplyToEventNow(ctx, dtEvent{ConversationType: "2", ConversationId: conversationID}, reply)
+	}
 	token, err := a.getAccessToken(ctx)
 	if err != nil {
 		return fmt.Errorf("获取 Access Token 失败: %w", err)
@@ -581,10 +812,112 @@ func (a *DingtalkAdapter) sendReplyNow(ctx context.Context, chatID string, reply
 	if err != nil {
 		return fmt.Errorf("初始化钉钉官方 SDK 失败: %w", err)
 	}
-	if _, err := api.SendOTO(ctx, token, a.cfg.RobotCode, chatID, dingtalkMarkdownMessage(reply.Content)); err != nil {
+	msg := a.replyMessageWithAttachments(ctx, api, token, reply)
+	if _, err := api.SendOTO(ctx, token, a.cfg.RobotCode, chatID, msg); err != nil {
 		return fmt.Errorf("发送消息失败: %w", err)
 	}
 	return nil
+}
+
+// sendReplyToEvent sends a terminal reply through the adapter's bounded,
+// 3-per-second queue while retaining the original conversation type.
+func (a *DingtalkAdapter) sendReplyToEvent(ctx context.Context, event dtEvent, reply *adapter.Reply) error {
+	if reply == nil {
+		return nil
+	}
+	if event.ConversationType == "2" {
+		conversationID := strings.TrimSpace(event.ConversationId)
+		if conversationID == "" {
+			return errors.New("钉钉群消息缺少 openConversationId，拒绝降级为私聊")
+		}
+		adapter.MaybeApplyTextFallback(ctx, reply)
+		if a.queue == nil {
+			return a.sendReplyToEventNow(ctx, event, reply)
+		}
+		return a.queue.Send(ctx, groupQueueTarget(conversationID), reply)
+	}
+	return a.Send(ctx, event.SenderStaffId, reply)
+}
+
+// sendReplyToEventNow 把入站消息回复到它原本所在的对话：普通单聊回 senderStaffId，
+// 群聊回 openConversationId。它不能复用 Send(chatID)，因为后者缺 conversation type。
+func (a *DingtalkAdapter) sendReplyToEventNow(ctx context.Context, event dtEvent, reply *adapter.Reply) error {
+	if reply == nil {
+		return nil
+	}
+	token, err := a.getAccessToken(ctx)
+	if err != nil {
+		return fmt.Errorf("获取 Access Token 失败: %w", err)
+	}
+	api, err := a.apiClient()
+	if err != nil {
+		return fmt.Errorf("初始化钉钉官方 SDK 失败: %w", err)
+	}
+	msg := a.replyMessageWithAttachments(ctx, api, token, reply)
+	if event.ConversationType == "2" {
+		if strings.TrimSpace(event.ConversationId) == "" {
+			return errors.New("钉钉群消息缺少 openConversationId，拒绝降级为私聊")
+		}
+		groupAPI, ok := api.(dingtalkGroupOpenAPI)
+		if !ok {
+			return fmt.Errorf("钉钉 OpenAPI 不支持群会话发送")
+		}
+		if _, err := groupAPI.SendGroup(ctx, token, a.cfg.RobotCode, event.ConversationId, msg); err != nil {
+			return fmt.Errorf("发送群消息失败: %w", err)
+		}
+		return nil
+	}
+	if _, err := api.SendOTO(ctx, token, a.cfg.RobotCode, event.SenderStaffId, msg); err != nil {
+		return fmt.Errorf("发送单聊消息失败: %w", err)
+	}
+	return nil
+}
+
+func (a *DingtalkAdapter) replyMessageWithAttachments(ctx context.Context, api dingtalkOpenAPI, token string, reply *adapter.Reply) dingtalkOutboundMessage {
+	content := reply.Content
+	for i, att := range reply.Attachments {
+		if !adapter.IsImageAttachment(att) {
+			content += "\n\n> ⚠️ 附件 “" + att.Name + "” 不是可发送的图片，已跳过。"
+			continue
+		}
+		imageRef := strings.TrimSpace(att.URL)
+		if imageRef == "" {
+			mediaAPI, ok := api.(dingtalkMediaOpenAPI)
+			if !ok {
+				content += "\n\n> ⚠️ 批改已完成，但当前钉钉连接不支持上传批改图。"
+				continue
+			}
+			mediaID, err := mediaAPI.UploadImage(ctx, token, att)
+			if err != nil {
+				logger.Error("[dingtalk] 上传回复图片失败", "name", att.Name, "error", err)
+				content += "\n\n> ⚠️ 批改已完成，但批改图上传失败，请稍后重试。"
+				continue
+			}
+			imageRef = mediaID
+		}
+		if !validDingtalkImageReference(imageRef) {
+			content += "\n\n> ⚠️ 批改已完成，但批改图地址无效，已拒绝发送。"
+			continue
+		}
+		alt := "批改后的作业"
+		if len(reply.Attachments) > 1 {
+			alt = fmt.Sprintf("批改后的作业 %d", i+1)
+		}
+		content += "\n\n![" + alt + "](" + imageRef + ")"
+	}
+	return dingtalkMarkdownMessage(content)
+}
+
+func validDingtalkImageReference(ref string) bool {
+	ref = strings.TrimSpace(ref)
+	if ref == "" || strings.ContainsAny(ref, "\r\n[]() \t") {
+		return false
+	}
+	if strings.HasPrefix(ref, "@") {
+		return len(ref) <= 512
+	}
+	u, err := url.Parse(ref)
+	return err == nil && strings.EqualFold(u.Scheme, "https") && u.Host != ""
 }
 
 // sendThinkingFeedback 发送「正在思考」占位并返回其 processQueryKey（供答案就位后撤回）。
@@ -614,6 +947,50 @@ func (a *DingtalkAdapter) sendThinkingFeedback(ctx context.Context, chatID strin
 	return key
 }
 
+func (a *DingtalkAdapter) sendThinkingFeedbackForEvent(ctx context.Context, event dtEvent) string {
+	content := thinkingFeedbackForEvent(event)
+	if strings.TrimSpace(event.SenderStaffId) == "" && strings.TrimSpace(event.ConversationId) == "" {
+		return ""
+	}
+	if a.cfg.AppKey == "" || a.cfg.AppSecret == "" || a.cfg.RobotCode == "" {
+		return ""
+	}
+	token, err := a.getAccessToken(ctx)
+	if err != nil {
+		logger.Error("[dingtalk] 处理进度取 Access Token 失败", "error", err)
+		return ""
+	}
+	api, err := a.apiClient()
+	if err != nil {
+		logger.Error("[dingtalk] 处理进度初始化 SDK 失败", "error", err)
+		return ""
+	}
+	msg := dingtalkMarkdownMessage(content)
+	if event.ConversationType == "2" {
+		if strings.TrimSpace(event.ConversationId) == "" {
+			logger.Error("[dingtalk] 群处理进度缺少 openConversationId，拒绝降级私聊")
+			return ""
+		}
+		groupAPI, ok := api.(dingtalkGroupOpenAPI)
+		if !ok {
+			logger.Error("[dingtalk] 当前 SDK 不支持群处理进度")
+			return ""
+		}
+		key, sendErr := groupAPI.SendGroup(ctx, token, a.cfg.RobotCode, event.ConversationId, msg)
+		if sendErr != nil {
+			logger.Error("[dingtalk] 发送群处理进度失败", "error", sendErr)
+			return ""
+		}
+		return key
+	}
+	key, sendErr := api.SendOTO(ctx, token, a.cfg.RobotCode, event.SenderStaffId, msg)
+	if sendErr != nil {
+		logger.Error("[dingtalk] 发送单聊处理进度失败", "error", sendErr)
+		return ""
+	}
+	return key
+}
+
 // recallThinkingFeedback 撤回先前发送的「正在思考」占位（processQueryKey 为空则跳过）。
 // 撤回失败仅记录不阻断：占位残留是可接受降级，最终答案已送达。
 func (a *DingtalkAdapter) recallThinkingFeedback(ctx context.Context, processQueryKey string) {
@@ -635,6 +1012,40 @@ func (a *DingtalkAdapter) recallThinkingFeedback(ctx context.Context, processQue
 	}
 }
 
+func (a *DingtalkAdapter) recallThinkingFeedbackForEvent(ctx context.Context, event dtEvent, processQueryKey string) {
+	if strings.TrimSpace(processQueryKey) == "" {
+		return
+	}
+	token, err := a.getAccessToken(ctx)
+	if err != nil {
+		logger.Error("[dingtalk] 撤回处理进度取 Access Token 失败", "error", err)
+		return
+	}
+	api, err := a.apiClient()
+	if err != nil {
+		logger.Error("[dingtalk] 撤回处理进度初始化 SDK 失败", "error", err)
+		return
+	}
+	if event.ConversationType == "2" {
+		if strings.TrimSpace(event.ConversationId) == "" {
+			logger.Error("[dingtalk] 群处理进度撤回缺少 openConversationId，拒绝降级私聊")
+			return
+		}
+		groupAPI, ok := api.(dingtalkGroupOpenAPI)
+		if !ok {
+			logger.Error("[dingtalk] 当前 SDK 不支持群处理进度撤回")
+			return
+		}
+		if err := groupAPI.RecallGroup(ctx, token, a.cfg.RobotCode, event.ConversationId, []string{processQueryKey}); err != nil {
+			logger.Error("[dingtalk] 撤回群处理进度失败", "error", err)
+		}
+		return
+	}
+	if err := api.RecallOTO(ctx, token, a.cfg.RobotCode, []string{processQueryKey}); err != nil {
+		logger.Error("[dingtalk] 撤回单聊处理进度失败", "error", err)
+	}
+}
+
 // dingtalkEmptyReplyFallback 是「正文为空」时的兜底文案（BUG-20260704）。
 // 钉钉 sampleMarkdown 的 text 必填，空 text 会被硬拒 400 miss.param.markdownTotext。
 // 空正文来源：推理型模型只产出 <think> 被 StripThinking 剥空、纯工具调用轮无正文、审核截断等。
@@ -648,6 +1059,7 @@ const dingtalkEmptyReplyFallback = "⚠️ 本次没有生成有效内容，请�
 // 首个非空行派生（有兜底），text 同理：正文为空/纯空白时用兜底文案，绝不产出空 text
 // （BUG-20260704，与 title 兜底对称，使非法载荷在构造点即不可表达）。
 func dingtalkMarkdownMessage(content string) dingtalkOutboundMessage {
+	content = restoreEscapedMarkdownNewlines(content)
 	// LaTeX 数学降级（BUG-20260712-P，真机取证：解题回复「( 4.5 \times 2 = 9 )」原样漏给
 	// 钉钉用户）：sampleMarkdown 渲染 markdown 子集但**不渲染 LaTeX**，出站前确定性转
 	// Unicode 数学符号（×÷≤≥√ 等），不靠 prompt 恳求模型改写法。
@@ -659,6 +1071,17 @@ func dingtalkMarkdownMessage(content string) dingtalkOutboundMessage {
 		MsgKey:   "sampleMarkdown",
 		MsgParam: marshalMarkdownContent(dingtalkMessageTitle(text), text),
 	}
+}
+
+// restoreEscapedMarkdownNewlines 兼容被上游 JSON/自动化脚本二次转义的整篇 Markdown。
+// 只在“正文没有任何真实换行且至少出现两个字面量 \\n”时恢复，避免把用户讨论
+// `a\nb`、Windows 路径或代码里的单个转义序列擅自改写。
+func restoreEscapedMarkdownNewlines(content string) string {
+	if strings.ContainsAny(content, "\r\n") || strings.Count(content, `\n`) < 2 {
+		return content
+	}
+	content = strings.ReplaceAll(content, `\r\n`, "\n")
+	return strings.ReplaceAll(content, `\n`, "\n")
 }
 
 // dingtalkMessageTitle 从正文派生 sampleMarkdown 必填的 title：取首个非空行，
@@ -698,11 +1121,30 @@ func (a *DingtalkAdapter) handleMessageContext(baseCtx context.Context, event dt
 	if baseCtx == nil {
 		baseCtx = context.Background()
 	}
+	if event.ConversationType == "2" && strings.TrimSpace(event.ConversationId) == "" {
+		logger.Error("钉钉: 群消息缺少 openConversationId，无法安全回复原会话")
+		return
+	}
 
 	content := strings.TrimSpace(event.Text.Content)
 
-	ctx, cancel := context.WithTimeout(baseCtx, a.messageHandlerTimeout())
+	ctx, cancel := context.WithTimeout(baseCtx, a.messageHandlerTimeoutFor(event))
 	defer cancel()
+
+	// 图片批改通常要经历下载、整页识题和逐题校验。先于图片下载发送 ETA，确保即使
+	// 下载或后续模型调用较慢，用户也能立即知道任务已经进入处理队列。所有退出路径
+	// 都在独立终态 ctx 中撤回这条临时进度，避免长期残留。
+	thinkingKey := ""
+	thinkingSent := false
+	if event.MsgType == dtMsgTypePicture && event.Content.DownloadCode != "" {
+		thinkingSent = true
+		thinkingKey = a.sendThinkingFeedbackForEvent(ctx, event)
+	}
+	defer func() {
+		rc, recallCancel := terminalNotifyCtx()
+		defer recallCancel()
+		a.recallThinkingFeedbackForEvent(rc, event, thinkingKey)
+	}()
 
 	// picture 消息（BUG-20260709）：downloadCode → 临时下载 URL → 图片字节 → image 附件，
 	// 与桌面/web 同走 BuildMultimodalUserMessage 多模态管道（无 vision 模型时引擎有友好拒绝）。
@@ -714,17 +1156,17 @@ func (a *DingtalkAdapter) handleMessageContext(baseCtx context.Context, event dt
 		// 会让 provider 400、用户收到不可归因报错——此处给出明确"暂不支持"提示后返回。
 		if event.MsgType != dtMsgTypePicture {
 			logger.Warn("钉钉: 收到暂不支持的富媒体消息", "msgtype", event.MsgType)
-			ntCtx, ntCancel := context.WithTimeout(ctx, 10*time.Second)
+			ntCtx, ntCancel := terminalNotifyCtx()
 			defer ntCancel()
-			_ = a.Send(ntCtx, event.SenderStaffId, &adapter.Reply{Content: dingtalkUnsupportedMediaFeedback})
+			_ = a.sendReplyToEvent(ntCtx, event, &adapter.Reply{Content: dingtalkUnsupportedMediaFeedback})
 			return
 		}
 		att, err := a.downloadPictureAttachment(ctx, event.Content.DownloadCode)
 		if err != nil {
 			logger.Error("钉钉: 下载图片消息失败", "error", err)
-			errCtx, errCancel := context.WithTimeout(ctx, 10*time.Second)
+			errCtx, errCancel := terminalNotifyCtx()
 			defer errCancel()
-			_ = a.Send(errCtx, event.SenderStaffId, &adapter.Reply{Content: "⚠️ 图片获取失败，请重新发送一次。"})
+			_ = a.sendReplyToEvent(errCtx, event, &adapter.Reply{Content: "⚠️ 图片获取失败，请重新发送一次。"})
 			return
 		}
 		attachments = append(attachments, att)
@@ -733,11 +1175,15 @@ func (a *DingtalkAdapter) handleMessageContext(baseCtx context.Context, event dt
 		return
 	}
 
+	chatID := event.SenderStaffId
+	if event.ConversationType == "2" && strings.TrimSpace(event.ConversationId) != "" {
+		chatID = event.ConversationId
+	}
 	msg := &adapter.Message{
 		ID:          "dt-" + idgen.ShortID(),
 		Platform:    adapter.PlatformDingtalk,
 		InstanceID:  a.Name(),
-		ChatID:      event.SenderStaffId,
+		ChatID:      chatID,
 		UserID:      event.SenderStaffId,
 		UserName:    event.SenderNick,
 		Content:     content,
@@ -749,25 +1195,20 @@ func (a *DingtalkAdapter) handleMessageContext(baseCtx context.Context, event dt
 		},
 	}
 
-	// 发送前先发「正在思考」占位给用户即时反馈（BUG-20260704）。占位是对用户的一个**承诺**：
-	// 无论成功 / 失败 / 超时，退出时都必须兑现（撤回），否则永久残留（BUG-20260713）。用 defer
-	// 统一保证撤回覆盖所有 return 路径，并在**退出时刻**用独立兜底 ctx 执行（不能在 defer 注册处
-	// 就创建 ctx——那样 15s 预算会在 2 分钟的 handler 跑完前就过期）。
-	thinkingKey := a.sendThinkingFeedback(ctx, msg.ChatID)
-	defer func() {
-		rc, cancel := terminalNotifyCtx()
-		defer cancel()
-		a.recallThinkingFeedback(rc, thinkingKey)
-	}()
+	// 普通文本在完成输入校验后发送原有思考占位；图片占位已在下载前发出。
+	if !thinkingSent {
+		thinkingSent = true
+		thinkingKey = a.sendThinkingFeedbackForEvent(ctx, event)
+	}
 
 	reply, err := a.handler(ctx, msg)
 	if err != nil {
 		// 不因 ctx 已超时而提前 return：超时正是用户最需要反馈之时（BUG-20260713）。终态错误
 		// 提示用独立兜底 ctx 发送，绝不静默放弃；占位由上面的 defer 撤回。
 		logger.Error("钉钉: 处理消息失败", "error", err)
-		nc, cancel := terminalNotifyCtx()
-		defer cancel()
-		_ = a.Send(nc, msg.ChatID, &adapter.Reply{Content: "处理消息时出现错误，请稍后重试。"})
+		nc, notifyCancel := terminalNotifyCtx()
+		defer notifyCancel()
+		_ = a.sendReplyToEvent(nc, event, &adapter.Reply{Content: "处理消息时出现错误，请稍后重试。"})
 		return
 	}
 	if reply == nil {
@@ -775,9 +1216,9 @@ func (a *DingtalkAdapter) handleMessageContext(baseCtx context.Context, event dt
 	}
 
 	// 最终答案同为「必达」终态通知：用独立兜底 ctx，避免继承可能已耗尽的 handler ctx。
-	sendCtx, sendCancel := terminalNotifyCtx()
-	defer sendCancel()
-	if err := a.Send(sendCtx, msg.ChatID, reply); err != nil {
+	sendCtx, finalCancel := terminalNotifyCtx()
+	defer finalCancel()
+	if err := a.sendReplyToEvent(sendCtx, event, reply); err != nil {
 		logger.Error("钉钉: 发送回复失败", "error", err)
 	}
 }
