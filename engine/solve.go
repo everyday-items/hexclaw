@@ -176,6 +176,21 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 			}, nil
 		}
 	}
+	// 单变量一次方程同样走本机精确有理数求解：严格白名单解析、左右都必须为 ax+b，
+	// 非线性/变量作除数/无解/无穷解一律 fail-closed 回到完整模型链。
+	if auto && !gradingMode && linearEquationAllowedByConstraint(problem, constraint) {
+		if worked, computed, ok := solveLinearEquation(problem); ok {
+			return &skill.Result{
+				Content: worked,
+				Metadata: map[string]string{
+					"solve_mode":     "deterministic_linear_equation",
+					"solve_verdict":  verdictString(verdictAgree),
+					"solve_evidence": "numeric_exec",
+					"solve_computed": computed,
+				},
+			}, nil
+		}
+	}
 	// 少量结构严格、数量关系唯一的小学应用题也可由本机有理数程序精确求解。完整命中但
 	// 超出当前约束时直接返回 out_of_scope，不能再掉进 5 分钟慢模型链；题型本身缺条件/歧义
 	// 才交给 solver + verifier。
@@ -189,6 +204,17 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 						"solve_verdict":         verdictString(verdictOutOfScope),
 						"solve_evidence":        "none",
 						"solve_out_of_scope_kp": solution.knowledgePoint,
+					},
+				}, nil
+			}
+			if solution.problemIssue != "" {
+				return &skill.Result{
+					Content: solution.problemIssue,
+					Metadata: map[string]string{
+						"solve_mode":          "deterministic_problem_validation",
+						"solve_verdict":       verdictString(verdictUnverifiable),
+						"solve_problem_issue": "inconsistent_gcd_lcm",
+						"solve_evidence":      "numeric_exec",
 					},
 				}, nil
 			}
@@ -342,7 +368,7 @@ func (o *SolveSkill) GradeVerified(ctx context.Context, problem, verifiedSolutio
 			}
 		}
 	}
-	if solution, ok := solveElementaryWordProblemDetailed(problem); ok {
+	if solution, ok := solveElementaryWordProblemDetailed(problem); ok && solution.problemIssue == "" {
 		expected := answerQuantity{value: solution.value, unit: solution.unit}
 		verified, verifiedOK := parseAnswerQuantity(groundTruth)
 		// 单位是应用题答案的一部分；verifiedSolution 缺单位、单位冲突或数值冲突时都不走快路。
