@@ -17,6 +17,7 @@ package dingtalk
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,6 +39,16 @@ func TestLiveSend_RealMarkdown(t *testing.T) {
 		"**加粗生效**、`行内代码`、[链接](https://hexclaw.net)：\n\n" +
 		"1. 第一点\n2. 第二点\n\n" +
 		"> 若你看到的是渲染后的富文本（而非裸 `###`），说明 sampleMarkdown 修复在真实钉钉端生效。"
+	if markdownFile := strings.TrimSpace(os.Getenv("DINGTALK_LIVE_MARKDOWN_FILE")); markdownFile != "" {
+		raw, err := os.ReadFile(markdownFile)
+		if err != nil {
+			t.Fatalf("读取 DINGTALK_LIVE_MARKDOWN_FILE: %v", err)
+		}
+		markdown = strings.TrimSpace(string(raw))
+		if markdown == "" {
+			t.Fatal("DINGTALK_LIVE_MARKDOWN_FILE 内容为空")
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

@@ -17,9 +17,11 @@ package dingtalk
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -85,6 +87,72 @@ func (l *livePictureOpenAPI) DownloadMessageFile(_ context.Context, _, _, _ stri
 	return l.mediaURL, nil
 }
 
+func liveVisionModelCandidates(providerName, routedModel string, configuredModels []string, override string) []string {
+	models := make([]string, 0, 1+len(configuredModels)+2)
+	seen := make(map[string]struct{}, cap(models))
+	add := func(model string) {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			return
+		}
+		if _, ok := seen[model]; ok {
+			return
+		}
+		seen[model] = struct{}{}
+		models = append(models, model)
+	}
+
+	add(override)
+	add(routedModel)
+	for _, model := range configuredModels {
+		add(model)
+	}
+
+	// These public model IDs are valid only on OpenRouter. Other compatible
+	// providers (for example 智谱 AI) must never receive an OpenRouter model ID.
+	if strings.Contains(strings.ToLower(strings.TrimSpace(providerName)), "openrouter") {
+		add("google/gemma-4-26b-a4b-it:free")
+		add("google/gemma-4-31b-it:free")
+	}
+	return models
+}
+
+const liveVisionDefaultMaxTokens = 4000
+
+// liveVisionMaxTokens keeps this env-gated live harness within known provider
+// output limits. The production adapter/model path deliberately does not use
+// this helper: it only protects the manual real-picture probe below.
+func liveVisionMaxTokens(providerName, model, override string) int {
+	maxTokens := liveVisionDefaultMaxTokens
+	if parsed, err := strconv.Atoi(strings.TrimSpace(override)); err == nil && parsed > 0 {
+		maxTokens = parsed
+	}
+
+	provider := strings.ToLower(strings.TrimSpace(providerName))
+	model = strings.ToLower(strings.TrimSpace(model))
+	if (strings.Contains(provider, "zhipu") || strings.Contains(provider, "智谱")) &&
+		(model == "glm-4v-flash" || strings.HasPrefix(model, "glm-4v-flash-")) &&
+		maxTokens > 1024 {
+		return 1024
+	}
+	return maxTokens
+}
+
+// validateLiveVisionCompletion prevents the live probe from forwarding a
+// plausible-looking but incomplete worksheet answer. Some providers return a
+// successful HTTP response when the output-token ceiling was reached, so the
+// finish reason is part of the success contract here.
+func validateLiveVisionCompletion(resp *llm.CompletionResponse) error {
+	if resp == nil {
+		return fmt.Errorf("视觉模型返回空响应，拒绝发送")
+	}
+	reason := strings.ToLower(strings.TrimSpace(resp.FinishReason))
+	if reason == "length" || reason == "max_tokens" {
+		return fmt.Errorf("视觉模型输出被截断（finish_reason=%q），拒绝发送不完整解答", resp.FinishReason)
+	}
+	return nil
+}
+
 // TestLivePicture_RealImageSolve_SendToDingtalk 用一张**真实作业照片**走生产 picture 全链路：
 // dtEvent(picture) → 下载图片字节 → image 附件 → 真实多模态 LLM 识题解答 → 真实发送到你的钉钉。
 //
@@ -117,7 +185,8 @@ func TestLivePicture_RealImageSolve_SendToDingtalk(t *testing.T) {
 	if provider == "" {
 		provider = "openrouter" // 默认 omni 多模态模型
 	}
-	if _, ok := appCfg.LLM.Providers[provider]; !ok {
+	providerCfg, ok := appCfg.LLM.Providers[provider]
+	if !ok {
 		t.Fatalf("配置里没有 provider %q", provider)
 	}
 	appCfg.LLM.Default = provider
@@ -155,18 +224,20 @@ func TestLivePicture_RealImageSolve_SendToDingtalk(t *testing.T) {
 		}
 		// v4：优先非推理型视觉模型——nemotron omni(reasoning) 遇到难题会把大段英文推理
 		// 写进 content（v3 真机取证：思维题触发长篇 GCD/LCM 英文纠结原样送达用户），
-		// 提示词不可控；推理模型出站剥离为 P2。免费池常 429 → 候选顺序尝试；
-		// DINGTALK_LIVE_VISION_MODEL 可插队首选。
-		candidates := []string{"google/gemma-4-26b-a4b-it:free", "google/gemma-4-31b-it:free", model}
-		if vm := os.Getenv("DINGTALK_LIVE_VISION_MODEL"); vm != "" {
-			candidates = append([]string{vm}, candidates...)
-		}
-		_ = model
+		// 提示词不可控；推理模型出站剥离为 P2。先用当前路由模型和该 provider
+		// 已配置模型；OpenRouter 的免费池只作为 OpenRouter 自身的尾部兜底。
+		candidates := liveVisionModelCandidates(
+			provider,
+			model,
+			providerCfg.Models,
+			os.Getenv("DINGTALK_LIVE_VISION_MODEL"),
+		)
 		temp := 0.4
 		var resp *llm.CompletionResponse
 		var cerr error
 		for _, cand := range candidates {
-			t.Logf("   → 尝试真实模型 model=%s", cand)
+			maxTokens := liveVisionMaxTokens(provider, cand, os.Getenv("DINGTALK_LIVE_MAX_TOKENS"))
+			t.Logf("   → 尝试真实模型 model=%s max_tokens=%d", cand, maxTokens)
 			resp, cerr = p.Complete(ctx, llm.CompletionRequest{
 				Model: cand,
 				Messages: []llm.Message{
@@ -185,9 +256,12 @@ func TestLivePicture_RealImageSolve_SendToDingtalk(t *testing.T) {
 						},
 					},
 				},
-				MaxTokens:   4000, // 整页 ~25 小题逐题作答，1200 不够截断
+				MaxTokens:   maxTokens,
 				Temperature: &temp,
 			})
+			if cerr == nil {
+				cerr = validateLiveVisionCompletion(resp)
+			}
 			if cerr == nil {
 				break
 			}

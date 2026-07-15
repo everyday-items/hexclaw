@@ -53,9 +53,21 @@ func TestLiveCorrectedPhotoAttachment_SendToDingtalk(t *testing.T) {
 	cfg, userID := loadLiveDingtalkConfig(t)
 	adp := New(cfg)
 	trace := "TRACE-DINGTALK-GRADED-IMAGE-" + time.Now().Format("20060102-150405")
+	content := "## 作业批改图片实发验证\n\n" +
+		"下面应显示一张批改后的作业图片。\n\n" + trace
+	if markdownPath := strings.TrimSpace(os.Getenv("DINGTALK_LIVE_MARKDOWN_FILE")); markdownPath != "" {
+		markdownBytes, readErr := os.ReadFile(markdownPath)
+		if readErr != nil {
+			t.Fatalf("读取批改 Markdown 失败: %v", readErr)
+		}
+		content = strings.TrimSpace(string(markdownBytes))
+		if content == "" {
+			t.Fatal("批改 Markdown 为空")
+		}
+		content += "\n\n---\n\n" + trace
+	}
 	reply := &adapter.Reply{
-		Content: "## 作业批改图片实发验证\n\n" +
-			"下面应显示一张批改后的作业图片。\n\n" + trace,
+		Content: content,
 		Attachments: []adapter.Attachment{{
 			Type: "image",
 			Name: filepath.Base(imagePath),

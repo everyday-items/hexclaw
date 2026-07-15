@@ -10,7 +10,10 @@ package dingtalk
 //
 // 运行（用户在自己会话里亲自跑，凭证只在进程内存、不落盘；会真往你的钉钉发一条并撤回）：
 //
-//	DINGTALK_LIVE_SEND=1 go test ./adapter/dingtalk/ -run TestLiveThinkingFeedbackRecall -v
+//	DINGTALK_LIVE_SEND=1 \
+//	DINGTALK_LIVE_CONFIRM=SEND_TO_EXPLICIT_DINGTALK_USER \
+//	DINGTALK_LIVE_INSTANCE=<实例名> DINGTALK_LIVE_USERID=<userid> \
+//	go test ./adapter/dingtalk/ -run TestLiveThinkingFeedbackRecall -v
 //
 // 凭证来源同 live_send_real_test.go：应用主密钥解密 ~/.hexclaw/data.db 的钉钉实例 config_json，全程 in-memory。
 
@@ -32,12 +35,28 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// loadLiveDingtalkConfig 从本机 ~/.hexclaw/data.db 解密真实钉钉配置 + 目标 userId（in-memory，不落盘）。
-// 多实例时可用 DINGTALK_LIVE_INSTANCE=<实例名> 精确选择；未指定则优先选已启用且最近更新的实例。
-// 目标默认取该实例最近会话的 user_id，而不是 chat_id：群聊的 chat_id 是
-// openConversationId，误拿它调 BatchSendOTO 会把群 ID 当 userId，导致真机门发错目标/失败。
+const liveDingtalkConfirmPhrase = "SEND_TO_EXPLICIT_DINGTALK_USER"
+
+// loadLiveDingtalkConfig 从本机 ~/.hexclaw/data.db 解密明确指定的真实钉钉配置 + 目标 userId
+// （in-memory，不落盘）。真机发送是破坏性测试门：send、confirm、instance、user 四项必须
+// 全部显式给出，绝不从「最近实例/最近会话」推断目标。
 func loadLiveDingtalkConfig(t *testing.T) (config.DingtalkConfig, string) {
 	t.Helper()
+	if strings.TrimSpace(os.Getenv("DINGTALK_LIVE_SEND")) != "1" {
+		t.Fatalf("真机发送必须显式设置 DINGTALK_LIVE_SEND=1")
+	}
+	if strings.TrimSpace(os.Getenv("DINGTALK_LIVE_CONFIRM")) != liveDingtalkConfirmPhrase {
+		t.Fatalf("真机发送必须显式确认 DINGTALK_LIVE_CONFIRM=%s", liveDingtalkConfirmPhrase)
+	}
+	instanceName := strings.TrimSpace(os.Getenv("DINGTALK_LIVE_INSTANCE"))
+	if instanceName == "" {
+		t.Fatalf("真机发送必须显式设置 DINGTALK_LIVE_INSTANCE=<实例名>，不会自动选择最近实例")
+	}
+	userID := strings.TrimSpace(os.Getenv("DINGTALK_LIVE_USERID"))
+	if userID == "" {
+		t.Fatalf("真机发送必须显式设置 DINGTALK_LIVE_USERID=<目标 userid>，不会自动选择最近用户")
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatalf("获取 HOME 失败: %v", err)
@@ -54,14 +73,8 @@ func loadLiveDingtalkConfig(t *testing.T) (config.DingtalkConfig, string) {
 	}
 	defer db.Close()
 
-	instanceName := strings.TrimSpace(os.Getenv("DINGTALK_LIVE_INSTANCE"))
 	var stored string
-	var row *sql.Row
-	if instanceName != "" {
-		row = db.QueryRow(`SELECT name, config_json FROM platform_instances WHERE provider='dingtalk' AND name=? LIMIT 1`, instanceName)
-	} else {
-		row = db.QueryRow(`SELECT name, config_json FROM platform_instances WHERE provider='dingtalk' ORDER BY enabled DESC, updated_at DESC LIMIT 1`)
-	}
+	row := db.QueryRow(`SELECT name, config_json FROM platform_instances WHERE provider='dingtalk' AND name=? LIMIT 1`, instanceName)
 	if err := row.Scan(&instanceName, &stored); err != nil {
 		t.Fatalf("读取钉钉实例配置失败（是否已在连接中心配置钉钉？）: %v", err)
 	}
@@ -82,13 +95,6 @@ func loadLiveDingtalkConfig(t *testing.T) (config.DingtalkConfig, string) {
 		t.Fatalf("钉钉配置缺 app_key/app_secret/robot_code")
 	}
 
-	userID := os.Getenv("DINGTALK_LIVE_USERID")
-	if userID == "" {
-		_ = db.QueryRow(`SELECT user_id FROM sessions WHERE platform='dingtalk' AND instance_id=? AND user_id != '' AND status >= 0 ORDER BY updated_at DESC LIMIT 1`, instanceName).Scan(&userID)
-	}
-	if userID == "" {
-		t.Fatalf("实例 %q 找不到目标 userId（无钉钉历史会话），请设 DINGTALK_LIVE_USERID=<你的钉钉 userid>", instanceName)
-	}
 	return cfg, userID
 }
 
