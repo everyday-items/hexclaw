@@ -10,12 +10,12 @@
 package knowledge
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -109,13 +109,23 @@ func OllamaModelInstalled(ctx context.Context, baseURL, model string) bool {
 // PullOllamaModel 阻塞式拉取模型（丢弃流式进度，只关心结果）。首启后台静默安装用；
 // 前端手动路径走 api 的 SSE 进度端点，不经此函数。
 func PullOllamaModel(ctx context.Context, baseURL, model string) error {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return fmt.Errorf("ollama pull: model is required")
+	}
 	base := strings.TrimSuffix(strings.TrimSpace(baseURL), "/")
 	if base == "" {
 		base = "http://localhost:11434"
 	}
 	base = strings.TrimSuffix(base, "/v1")
-	body := strings.NewReader(`{"name":` + strconv.Quote(model) + `,"stream":false}`)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/pull", body)
+	payload, err := json.Marshal(struct {
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
+	}{Model: model, Stream: false})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/pull", bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}

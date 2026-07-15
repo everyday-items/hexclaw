@@ -2,6 +2,7 @@ package knowledge
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -108,7 +109,21 @@ func TestBug20260712_EnsureOllamaEmbeddingModel(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"models":[{"name":"qwen3.5:9b"}]}`))
 	})
-	mux.HandleFunc("/api/pull", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/api/pull", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model  string `json:"model"`
+			Stream bool   `json:"stream"`
+		}
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil || req.Model == "" {
+			http.Error(w, "model is required", http.StatusBadRequest)
+			return
+		}
+		if req.Model != "nomic-embed-text" {
+			http.Error(w, "unexpected model", http.StatusBadRequest)
+			return
+		}
 		pulled = true
 		_, _ = w.Write([]byte(`{"status":"success"}`))
 	})
@@ -124,5 +139,21 @@ func TestBug20260712_EnsureOllamaEmbeddingModel(t *testing.T) {
 	// ③ 端点不可达 → 返回失败（前端浮手动重试横幅，绝不 panic/阻断启动）
 	if ok, err := EnsureOllamaEmbeddingModel(ctx, "http://127.0.0.1:1", "nomic-embed-text"); ok || err == nil {
 		t.Fatalf("不可达应失败, ok=%v err=%v", ok, err)
+	}
+}
+
+func TestPullOllamaModel_RejectsMissingModelBeforeNetwork(t *testing.T) {
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	if err := PullOllamaModel(context.Background(), srv.URL, "  "); err == nil {
+		t.Fatal("empty model must be rejected")
+	}
+	if called {
+		t.Fatal("empty model must be rejected before calling Ollama")
 	}
 }
