@@ -1539,7 +1539,69 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			}
 			return resp.Content, nil
 		}
-		k12Opts = append(k12Opts, k12assembly.WithRetryGenerator(retryGenFn))
+		prepReviewGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
+			provider := router.Default()
+			if provider == nil {
+				return "", fmt.Errorf("k12 辅导要点: 没有可用的默认 LLM Provider")
+			}
+			task := prompt
+			if subject != "" {
+				task = "【学科：" + subject + "】" + task
+			}
+			if grade != "" {
+				task += "\n（只使用" + grade + "已经学过的概念和方法。）"
+			}
+			cctx := egress.WithRequest(ctx, egress.PurposeGeneralChat, "k12-prep-review", egress.ClassGeneral)
+			cctx, ccancel := context.WithTimeout(cctx, 60*time.Second)
+			defer ccancel()
+			temp := 0.2
+			resp, err := provider.Complete(cctx, hexagon.CompletionRequest{
+				Messages: []hexagon.Message{
+					{Role: hexagon.RoleSystem, Content: "你是中小学家长辅导助手。针对给定年级和知识点，直接生成一段120字以内的知识点回顾：核心概念、一个常见卡点、一句家长引导话术。不要出题，不要给练习答案，不要声称引用教材原文。数学使用 Unicode 符号，禁止 LaTeX。"},
+					{Role: hexagon.RoleUser, Content: task},
+				},
+				MaxTokens:   512,
+				Temperature: &temp,
+			})
+			if err != nil {
+				return "", err
+			}
+			return resp.Content, nil
+		}
+		causeSummaryGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
+			provider := router.Default()
+			if provider == nil {
+				return "", fmt.Errorf("k12 错因摘要: 没有可用的默认 LLM Provider")
+			}
+			task := prompt
+			if subject != "" {
+				task = "【学科：" + subject + "】" + task
+			}
+			if grade != "" {
+				task += "\n（只使用" + grade + "已经学过的概念和方法。）"
+			}
+			cctx := egress.WithRequest(ctx, egress.PurposeGeneralChat, "k12-cause-summary", egress.ClassGeneral)
+			cctx, ccancel := context.WithTimeout(cctx, 60*time.Second)
+			defer ccancel()
+			temp := 0.1
+			resp, err := provider.Complete(cctx, hexagon.CompletionRequest{
+				Messages: []hexagon.Message{
+					{Role: hexagon.RoleSystem, Content: "你是中小学错题整理助手。根据题目和孩子的错误答案，仅归纳错因本身，20字以内；不要解题、不要出新题、不要复述题目、不要给答案。"},
+					{Role: hexagon.RoleUser, Content: task},
+				},
+				MaxTokens:   64,
+				Temperature: &temp,
+			})
+			if err != nil {
+				return "", err
+			}
+			return resp.Content, nil
+		}
+		k12Opts = append(k12Opts,
+			k12assembly.WithRetryGenerator(retryGenFn),
+			k12assembly.WithCauseSummaryGenerator(causeSummaryGenFn),
+			k12assembly.WithPrepReviewGenerator(prepReviewGenFn),
+		)
 
 		k12Solve := classifiedSolveExecutor{next: solveSkill}
 		if k12rt, k12err := k12assembly.Wire(store.DB(), k12Solve, k12Opts...); k12err != nil {
@@ -2310,16 +2372,23 @@ func (r k12CronRegistrar) Register(ctx context.Context, kind string, spec k12use
 	return job.ID, nil
 }
 
+type instanceReplySender interface {
+	Send(ctx context.Context, target, chatID string, reply *adapter.Reply) error
+}
+
 type instanceMessageSender struct {
-	mgr *instances.Manager
+	mgr instanceReplySender
 	ctx context.Context
 }
 
-func (s *instanceMessageSender) Send(ctx context.Context, channel, target, content string, _ []adapter.Attachment) error {
+func (s *instanceMessageSender) Send(ctx context.Context, channel, target, content string, atts []adapter.Attachment) error {
 	if ctx == nil {
 		ctx = s.ctx
 	}
-	return s.mgr.Send(ctx, channel, target, &adapter.Reply{Content: content})
+	return s.mgr.Send(ctx, channel, target, &adapter.Reply{
+		Content:     content,
+		Attachments: atts,
+	})
 }
 
 // runInit 初始化配置
