@@ -21,6 +21,7 @@ func TestBUG20260714_DenseTallWorksheetSplitsAndRemapsBBox(t *testing.T) {
 			img.Set(x, y, color.White)
 		}
 	}
+	addSyntheticWorksheetInk(img)
 	var encoded bytes.Buffer
 	if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: 80}); err != nil {
 		t.Fatal(err)
@@ -29,6 +30,13 @@ func TestBUG20260714_DenseTallWorksheetSplitsAndRemapsBBox(t *testing.T) {
 	var calls atomic.Int32
 	vision := func(_ context.Context, segment []byte, prompt string) (string, error) {
 		calls.Add(1)
+		if strings.Contains(prompt, "bbox 二次语义核验") {
+			index, err := semanticVerificationPromptIndex(prompt)
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf(`[{"index":%d,"observed_question":"分片%d题目","observed_student_answer":"%d"}]`, index, index, index), nil
+		}
 		if !strings.Contains(prompt, "纵向分片") {
 			return "", fmt.Errorf("长图未带分片约束")
 		}
@@ -47,8 +55,8 @@ func TestBUG20260714_DenseTallWorksheetSplitsAndRemapsBBox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Recognize() error = %v", err)
 	}
-	if got := calls.Load(); got != 5 {
-		t.Fatalf("vision calls = %d, want 5", got)
+	if got := calls.Load(); got != 10 {
+		t.Fatalf("vision calls = %d, want 5 segment calls + 5 isolated bbox OCR verifications", got)
 	}
 	if len(qs) != 5 {
 		t.Fatalf("questions = %d, want 5: %#v", len(qs), qs)
@@ -108,6 +116,7 @@ func TestBUG20260714_SuspiciousSegmentRecoversHandwritingOnFocusedPass(t *testin
 			img.Set(x, y, color.White)
 		}
 	}
+	addSyntheticWorksheetInk(img)
 	var encoded bytes.Buffer
 	if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: 80}); err != nil {
 		t.Fatal(err)
@@ -115,6 +124,13 @@ func TestBUG20260714_SuspiciousSegmentRecoversHandwritingOnFocusedPass(t *testin
 
 	var partCalls [5]atomic.Int32
 	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
+		if strings.Contains(prompt, "bbox 二次语义核验") {
+			index, err := semanticVerificationPromptIndex(prompt)
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf(`[{"index":%d,"observed_question":"4÷0.5=","observed_student_answer":"8"}]`, index), nil
+		}
 		var part int
 		if _, err := fmt.Sscanf(prompt[strings.LastIndex(prompt, "纵向分片"):], "纵向分片 %d/5", &part); err != nil {
 			return "", fmt.Errorf("缺少可解析的分片编号: %w", err)
@@ -153,6 +169,7 @@ func TestBUG20260714_SparseShortSegmentUsesHorizontalZoom(t *testing.T) {
 			img.Set(x, y, color.White)
 		}
 	}
+	addSyntheticWorksheetInk(img)
 	var encoded bytes.Buffer
 	if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: 80}); err != nil {
 		t.Fatal(err)
@@ -160,6 +177,13 @@ func TestBUG20260714_SparseShortSegmentUsesHorizontalZoom(t *testing.T) {
 
 	var partCalls [5]atomic.Int32
 	vision := func(_ context.Context, cropped []byte, prompt string) (string, error) {
+		if strings.Contains(prompt, "bbox 二次语义核验") {
+			index, err := semanticVerificationPromptIndex(prompt)
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf(`[{"index":%d,"observed_question":"放大%d题","observed_student_answer":"%d"}]`, index, index, index), nil
+		}
 		var part int
 		if _, err := fmt.Sscanf(prompt[strings.LastIndex(prompt, "纵向分片"):], "纵向分片 %d/5", &part); err != nil {
 			return "", err
@@ -198,4 +222,176 @@ func TestBUG20260714_SparseShortSegmentUsesHorizontalZoom(t *testing.T) {
 	if qs[4].BBox == nil || qs[4].BBox.X <= 0.58 {
 		t.Fatalf("right zoom bbox.x not remapped: %#v", qs[4].BBox)
 	}
+}
+
+// 936x1280 空白卷的“二、计算下面各题”落在后续纵向分片。旧逻辑只允许第 1 片横向
+// 放大，导致三个横排短算式一直漏识。横向放大应按内容触发，而不是写死分片编号；同时
+// 每页最多放大两个纵向分片（每片 3 个横向块），避免 5 片全部放大造成请求失控。
+func TestBUG20260715_LaterArithmeticSegmentUsesHorizontalZoomWithinPageBudget(t *testing.T) {
+	raw := encodeWorksheetJPEG(t, 936, 320)
+	segments := make([]worksheetSegment, 5)
+	for i := range segments {
+		segments[i] = worksheetSegment{
+			image: raw, index: i + 1, total: 5,
+			startY: float64(i) / 5, endY: float64(i+1) / 5,
+		}
+	}
+
+	var zoomCalls [5]atomic.Int32
+	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
+		var part int
+		if _, err := fmt.Sscanf(prompt[strings.LastIndex(prompt, "纵向分片"):], "纵向分片 %d/5", &part); err != nil {
+			return "", err
+		}
+		if strings.Contains(prompt, "横向放大") {
+			zoomCalls[part-1].Add(1)
+			var zoom int
+			if _, err := fmt.Sscanf(prompt[strings.LastIndex(prompt, "横向放大"):], "横向放大 %d/3", &zoom); err != nil {
+				return "", err
+			}
+			if part == 3 {
+				questions := []string{"0.4×0.8=", "0.25×32×0.125", "194-64.8÷1.8×0.9"}
+				return fmt.Sprintf(`[{"question":%q,"subject":"数学","student_answer":""}]`, questions[zoom-1]), nil
+			}
+			return fmt.Sprintf(`[{"question":"放大%d-%d=","subject":"数学","student_answer":""}]`, part, zoom), nil
+		}
+
+		switch part {
+		case 1:
+			return `[{"question":"4.5×2=","subject":"数学","student_answer":""},{"question":"15-5.7=","subject":"数学","student_answer":""}]`, nil
+		case 3:
+			return `[{"question":"135÷0.5=","subject":"数学","student_answer":""},{"question":"21×(9.3-3.7)-5.6","subject":"数学","student_answer":""}]`, nil
+		case 4:
+			// 第三个满足条件的分片用于钉死页面级预算，不应继续触发横向请求。
+			return `[{"question":"2.7+4x=12.7","subject":"数学","student_answer":""},{"question":"6x+15×7=141","subject":"数学","student_answer":""}]`, nil
+		default:
+			return fmt.Sprintf(`[{"question":"分片%d的长题目内容用于避免触发横向放大流程","subject":"数学","student_answer":""}]`, part), nil
+		}
+	}
+
+	qs, err := NewRecognizerAdapter(vision).recognizeSegments(context.Background(), segments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"0.4×0.8=", "0.25×32×0.125", "194-64.8÷1.8×0.9"} {
+		found := false
+		for _, q := range qs {
+			if q.Question == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("later arithmetic zoom did not recover %q: %#v", want, qs)
+		}
+	}
+	if got := zoomCalls[0].Load(); got != int32(len(horizontalZoomRanges)) {
+		t.Fatalf("first arithmetic segment zoom calls = %d, want %d", got, len(horizontalZoomRanges))
+	}
+	if got := zoomCalls[2].Load(); got != int32(len(horizontalZoomRanges)) {
+		t.Fatalf("later arithmetic segment zoom calls = %d, want %d", got, len(horizontalZoomRanges))
+	}
+	if got := zoomCalls[3].Load(); got != 0 {
+		t.Fatalf("third eligible segment exceeded page zoom budget: calls=%d", got)
+	}
+	var total int32
+	for i := range zoomCalls {
+		total += zoomCalls[i].Load()
+	}
+	if want := int32(2 * len(horizontalZoomRanges)); total != want {
+		t.Fatalf("page horizontal zoom calls = %d, want hard cap %d", total, want)
+	}
+}
+
+func semanticVerificationPromptIndex(prompt string) (int, error) {
+	start := strings.Index(prompt, "index=")
+	if start < 0 {
+		return 0, fmt.Errorf("semantic prompt missing candidate index")
+	}
+	var index int
+	if _, err := fmt.Sscanf(prompt[start:], "index=%d", &index); err != nil {
+		return 0, err
+	}
+	return index, nil
+}
+
+// The splitter tests use a generated page and a fake VLM. Add deterministic dark strokes so the
+// production blank-crop guard sees the same invariant as a real answered worksheet: a claimed answer
+// bbox must contain visible ink. The tests remain about split/remap behavior, not OCR rendering.
+func addSyntheticWorksheetInk(img *image.RGBA) {
+	bounds := img.Bounds()
+	ink := color.RGBA{R: 45, G: 45, B: 45, A: 255}
+	for y := bounds.Min.Y; y < bounds.Max.Y; y += 36 {
+		for dy := 0; dy < 2 && y+dy < bounds.Max.Y; dy++ {
+			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+				img.SetRGBA(x, y+dy, ink)
+			}
+		}
+	}
+	for x := bounds.Min.X; x < bounds.Max.X; x += 48 {
+		for dx := 0; dx < 2 && x+dx < bounds.Max.X; dx++ {
+			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+				img.SetRGBA(x+dx, y, ink)
+			}
+		}
+	}
+}
+
+// 真实空白练习卷经过客户端压缩后是 936x1280。旧的 1600px 高度门会把它整页交给
+// glm-4v-flash，密集题目的 JSON 在单次输出上限处截断；这个尺寸仍应走纵向分片。
+func TestBUG20260715_LowResolutionDenseWorksheetSplits(t *testing.T) {
+	raw := encodeWorksheetJPEG(t, 936, 1280)
+
+	segments, ok := splitDenseWorksheetImage(raw)
+	if !ok {
+		t.Fatal("936x1280 portrait worksheet was not split")
+	}
+	if got := len(segments); got != len(denseWorksheetRanges) {
+		t.Fatalf("segments = %d, want %d", got, len(denseWorksheetRanges))
+	}
+	for i, segment := range segments {
+		cfg, _, err := image.DecodeConfig(bytes.NewReader(segment.image))
+		if err != nil {
+			t.Fatalf("segment %d decode config: %v", i+1, err)
+		}
+		if cfg.Width != 936 || cfg.Height >= 1280 {
+			t.Fatalf("segment %d was not a real crop: %dx%d", i+1, cfg.Width, cfg.Height)
+		}
+	}
+}
+
+// 降低高度门不能把任意手机小图都放大成 5 次模型请求：低分辨率分支同时要求
+// 足够的宽、高和作业纸常见的纵向比例；原有 >=1600px 的长图规则保持不变。
+func TestBUG20260715_OrdinarySmallImagesDoNotSplit(t *testing.T) {
+	tests := []struct {
+		name          string
+		width, height int
+	}{
+		{name: "height below low-resolution floor", width: 800, height: 1199},
+		{name: "narrow phone crop", width: 720, height: 1280},
+		{name: "near square screenshot", width: 936, height: 1200},
+		{name: "landscape photo", width: 1280, height: 936},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if segments, ok := splitDenseWorksheetImage(encodeWorksheetJPEG(t, tt.width, tt.height)); ok {
+				t.Fatalf("%dx%d unexpectedly split into %d segments", tt.width, tt.height, len(segments))
+			}
+		})
+	}
+}
+
+func encodeWorksheetJPEG(t *testing.T, width, height int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.Set(x, y, color.White)
+		}
+	}
+	var encoded bytes.Buffer
+	if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: 80}); err != nil {
+		t.Fatal(err)
+	}
+	return encoded.Bytes()
 }

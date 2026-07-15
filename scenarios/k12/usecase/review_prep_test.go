@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -20,6 +22,29 @@ func (selectiveGrounding) Ground(_ context.Context, _ string, kp, _ string) (str
 		return "教材讲法", true, nil
 	}
 	return "", false, nil
+}
+
+type prepReviewSolver struct {
+	fakeSolver
+	calls int
+	gotKP string
+	text  string
+	err   error
+}
+
+type selectivePrepReviewSolver struct{ fakeSolver }
+
+func (s *selectivePrepReviewSolver) GeneratePrepReview(_ context.Context, _ string, kp, _ string) (string, error) {
+	if kp == "简易方程" {
+		return "AI 生成的方程回顾", nil
+	}
+	return "", errors.New("provider unavailable")
+}
+
+func (s *prepReviewSolver) GeneratePrepReview(_ context.Context, _ string, kp, _ string) (string, error) {
+	s.calls++
+	s.gotKP = kp
+	return s.text, s.err
 }
 
 // seedMistake 直接入库一条错题（绕过批改，供复习/备课测试造数据）。
@@ -111,7 +136,12 @@ func TestBuildPrepCard_ReadOnly_WithLabels(t *testing.T) {
 }
 
 func TestBuildPrepCard_NoTextbook_Degrades(t *testing.T) {
-	d, _ := newPipeline(t, fakeSolver{ev: SolveEvidence{EvidenceType: EvidenceNone}}, fakeGrader{}, &fakeInsights{})
+	gen := &prepReviewSolver{
+		fakeSolver: fakeSolver{ev: SolveEvidence{EvidenceType: EvidenceNone}},
+		text:       "先用等式表示数量关系，再利用等式性质逐步求解。",
+	}
+	d, _ := newPipeline(t, gen, fakeGrader{}, &fakeInsights{})
+	d.PrepReview = gen
 	d.Grounding = fakeGrounding{found: false} // 无教材
 	ctx := context.Background()
 	card, err := d.BuildPrepCard(ctx, "mingming", "五年级上", []string{"简易方程"})
@@ -121,6 +151,12 @@ func TestBuildPrepCard_NoTextbook_Degrades(t *testing.T) {
 	// ① 段降级 → 🤖 未校验
 	if card.Sections[0].SourceLabel != SrcAIUnverified {
 		t.Errorf("无教材①段应降级标 %q, got %q", SrcAIUnverified, card.Sections[0].SourceLabel)
+	}
+	if gen.calls != 1 || gen.gotKP != "简易方程" {
+		t.Fatalf("无教材应调用一次 AI 回顾生成器，calls=%d kp=%q", gen.calls, gen.gotKP)
+	}
+	if !strings.Contains(card.Sections[0].Content, gen.text) {
+		t.Fatalf("①段应使用 AI 实际生成内容，got %q", card.Sections[0].Content)
 	}
 	// ② 段无历史 → 「还没有他的历史记录」
 	if card.Sections[1].Content != "还没有他的历史记录" {
@@ -139,7 +175,61 @@ func TestBuildPrepCard_MixedGroundingDoesNotClaimWholeSectionIsTextbook(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if card.Sections[0].SourceLabel != SrcAIUnverified {
-		t.Fatalf("mixed section label=%q want %q", card.Sections[0].SourceLabel, SrcAIUnverified)
+	if card.Sections[0].SourceLabel != SrcGradeFallback {
+		t.Fatalf("mixed section label=%q want %q", card.Sections[0].SourceLabel, SrcGradeFallback)
+	}
+}
+
+func TestBuildPrepCard_GroundingHitDoesNotCallPrepReviewGenerator(t *testing.T) {
+	gen := &prepReviewSolver{fakeSolver: fakeSolver{ev: SolveEvidence{EvidenceType: EvidenceNone}}, text: "不应调用"}
+	d, _ := newPipeline(t, gen, fakeGrader{}, nil)
+	d.Grounding = fakeGrounding{found: true}
+	d.PrepReview = gen
+	card, err := d.BuildPrepCard(context.Background(), "mingming", "五年级上", []string{"小数乘法"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gen.calls != 0 {
+		t.Fatalf("教材命中不得调用 AI 回顾生成器，calls=%d", gen.calls)
+	}
+	if card.Sections[0].SourceLabel != SrcTextbook {
+		t.Fatalf("教材命中 label=%q want %q", card.Sections[0].SourceLabel, SrcTextbook)
+	}
+}
+
+func TestBuildPrepCard_PrepReviewFailureUsesHonestStaticLabel(t *testing.T) {
+	gen := &prepReviewSolver{
+		fakeSolver: fakeSolver{ev: SolveEvidence{EvidenceType: EvidenceNone}},
+		err:        errors.New("provider unavailable"),
+	}
+	d, _ := newPipeline(t, gen, fakeGrader{}, nil)
+	d.Grounding = fakeGrounding{found: false}
+	d.PrepReview = gen
+	card, err := d.BuildPrepCard(context.Background(), "mingming", "五年级上", []string{"简易方程"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gen.calls != 1 {
+		t.Fatalf("教材未命中仍应尝试一次生成，calls=%d", gen.calls)
+	}
+	if card.Sections[0].SourceLabel != SrcGradeFallback {
+		t.Fatalf("生成失败不得冒充 AI 归纳，label=%q want %q", card.Sections[0].SourceLabel, SrcGradeFallback)
+	}
+}
+
+func TestBuildPrepCard_MixedGeneratedAndFailedUsesFallbackLabel(t *testing.T) {
+	gen := &selectivePrepReviewSolver{fakeSolver: fakeSolver{ev: SolveEvidence{EvidenceType: EvidenceNone}}}
+	d, _ := newPipeline(t, gen, fakeGrader{}, nil)
+	d.Grounding = fakeGrounding{found: false}
+	d.PrepReview = gen
+	card, err := d.BuildPrepCard(context.Background(), "mingming", "五年级上", []string{"简易方程", "小数乘法"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if card.Sections[0].SourceLabel != SrcGradeFallback {
+		t.Fatalf("任一知识点生成失败时整段不得标 AI，label=%q want %q", card.Sections[0].SourceLabel, SrcGradeFallback)
+	}
+	if !strings.Contains(card.Sections[0].Content, "本次未生成可靠回顾") {
+		t.Fatalf("生成失败应给诚实静态提示，got %q", card.Sections[0].Content)
 	}
 }

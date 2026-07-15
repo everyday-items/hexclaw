@@ -11,11 +11,12 @@ import (
 
 // 备课卡各段来源标注（PRD §3.14.4 定稿）。
 const (
-	SrcTextbook     = "📖 依据课本"           // ① RAG grounding 命中教材
-	SrcAIUnverified = "🤖 AI 归纳·供参考（未校验）" // ① 无教材降级 LLM
-	SrcLocalRecord  = "🗂 本地记录"           // ②③ 错题本/学情
-	SrcVerified     = "✅ 已程序验算"          // ④ 热身题过验算链
-	SrcInsight      = "🧠 学情信号"           // ⑤ 连续挫败情绪提示
+	SrcTextbook      = "📖 依据课本"           // ① RAG grounding 命中教材
+	SrcAIUnverified  = "🤖 AI 归纳·供参考（未校验）" // ① 无教材降级 LLM
+	SrcGradeFallback = "⚠️ 本次未生成·请核对"     // ① LLM 不可用时的静态诚实降级
+	SrcLocalRecord   = "🗂 本地记录"           // ②③ 错题本/学情
+	SrcVerified      = "✅ 已程序验算"          // ④ 热身题过验算链
+	SrcInsight       = "🧠 学情信号"           // ⑤ 连续挫败情绪提示
 )
 
 // PrepSection 备课卡的一段（内容 + 来源标注）。
@@ -87,6 +88,8 @@ func (d Deps) sectionReview(ctx context.Context, agentName, grade string, kps []
 	var b strings.Builder
 	label := SrcTextbook
 	grounded := 0
+	generated := 0
+	fallback := 0
 	for _, kp := range kps {
 		if d.Grounding != nil {
 			if text, found, err := d.Grounding.Ground(ctx, agentName, kp, grade); err == nil && found {
@@ -95,10 +98,22 @@ func (d Deps) sectionReview(ctx context.Context, agentName, grade string, kps []
 				continue
 			}
 		}
-		fmt.Fprintf(&b, "【%s】（依据年级常识归纳，请自行核对）\n", kp)
+		if d.PrepReview != nil {
+			if text, err := d.PrepReview.GeneratePrepReview(ctx, "", kp, grade); err == nil && strings.TrimSpace(text) != "" {
+				fmt.Fprintf(&b, "【%s】%s\n", kp, strings.TrimSpace(text))
+				generated++
+				continue
+			}
+		}
+		fmt.Fprintf(&b, "【%s】（本次未生成可靠回顾，请结合教材核对）\n", kp)
+		fallback++
 	}
 	if grounded != len(kps) {
-		label = SrcAIUnverified // 任一知识点未命中，整段不得宣称全部依据课本
+		// 任一知识点未命中，整段不得宣称全部依据课本；只有真实生成过内容才标 AI。
+		label = SrcGradeFallback
+		if fallback == 0 && generated > 0 {
+			label = SrcAIUnverified
+		}
 	}
 	return PrepSection{Title: "① 知识点 3 分钟回顾", Content: strings.TrimSpace(b.String()), SourceLabel: label}
 }

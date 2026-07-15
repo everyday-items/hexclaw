@@ -24,6 +24,7 @@ type Deps struct {
 	Recognizer      Recognizer
 	Insights        Insights
 	Grounding       Grounding
+	PrepReview      PrepReviewGenerator
 	Profiles        ProfileStore
 	ArchiveRestorer ArchiveRestorer
 	Renderer        Renderer

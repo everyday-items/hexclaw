@@ -3,6 +3,8 @@ package engineadapter
 import (
 	"context"
 	"testing"
+
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
 // TestRecognize_RecoversStudentAnswer 识题回收学生作答信号（单一真相源上游）：
@@ -59,6 +61,112 @@ func TestRecognize_FiltersSectionHeadingAndDeduplicatesNumberedQuestion(t *testi
 		!contains(qs[2].StudentAnswer, "答225kg") || qs[2].BBox == nil {
 		t.Fatalf("overlapping word-problem fragment should merge into full question: %#v", qs[2])
 	}
+}
+
+func TestBUG20260715_DeduplicatesBlankLongQuestionWithDuplicatedParticle(t *testing.T) {
+	vision := func(context.Context, []byte, string) (string, error) {
+		return `[` +
+			`{"question":"小明有张10至40排的电影票，这张票的排数和座位号的的最大公约数是13，最小公倍数是72，小明这张电影票是（）排（）号。","subject":"数学","student_answer":""},` +
+			`{"question":"小明有张10至40排的电影票，这张票的排数和座位号的最大公约数是13，最小公倍数是72，小明这张电影票是（）排（）号。","subject":"数学","student_answer":""}` +
+			`]`, nil
+	}
+	qs, err := NewRecognizerAdapter(vision).Recognize(context.Background(), []byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qs) != 1 {
+		t.Fatalf("one duplicated 的 split one blank movie-ticket question into %d: %#v", len(qs), qs)
+	}
+	if contains(qs[0].Question, "的的最大公约数") {
+		t.Fatalf("dedupe kept duplicated particle instead of cleaner transcription: %q", qs[0].Question)
+	}
+}
+
+func TestBUG20260715_BlankLongNearTextWithDifferentQuestionIsNotMerged(t *testing.T) {
+	vision := func(context.Context, []byte, string) (string, error) {
+		return `[` +
+			`{"question":"某校五年级有120名学生，男生占总人数的五分之三，男生有多少人？","subject":"数学","student_answer":""},` +
+			`{"question":"某校五年级有120名学生，男生占总人数的五分之三，女生有多少人？","subject":"数学","student_answer":""}` +
+			`]`, nil
+	}
+	qs, err := NewRecognizerAdapter(vision).Recognize(context.Background(), []byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qs) != 2 {
+		t.Fatalf("same stem with a different question must remain two questions: %#v", qs)
+	}
+}
+
+// 单份视觉结果没有第二份独立证据时，不能凭规则猜测某个短算式是模型幻觉并静默删除。
+// 家长可见的保守回显比误删真实题更诚实。
+func TestBUG20260715_UncorroboratedArithmeticRemainsVisible(t *testing.T) {
+	vision := func(context.Context, []byte, string) (string, error) {
+		return `[{"question":"7.2×12.8","subject":"数学","student_answer":""}]`, nil
+	}
+	qs, err := NewRecognizerAdapter(vision).Recognize(context.Background(), []byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qs) != 1 || qs[0].Question != "7.2×12.8" {
+		t.Fatalf("single uncorroborated arithmetic item must be shown for parent review: %#v", qs)
+	}
+}
+
+func TestRecognize_FiltersBlankCroppedArithmeticFragmentsAfterMerge(t *testing.T) {
+	vision := func(context.Context, []byte, string) (string, error) {
+		return `[` +
+			`{"question":"21×","subject":"数学","student_answer":""},` +
+			`{"question":"4x+3","subject":"数学","student_answer":""},` +
+			`{"question":"4x+3×0.7=6.5","subject":"数学","student_answer":""},` +
+			`{"question":"2.7+4","subject":"数学","student_answer":""},` +
+			`{"question":"2.7+4x=12.7","subject":"数学","student_answer":""},` +
+			`{"question":"7.2×12.8","subject":"数学","student_answer":""},` +
+			`{"question":"8+5","subject":"数学","student_answer":""}` +
+			`]`, nil
+	}
+	qs, err := NewRecognizerAdapter(vision).Recognize(context.Background(), []byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qs) != 4 {
+		t.Fatalf("cropped blank fragments were not removed conservatively: %#v", qs)
+	}
+	for _, want := range []string{"4x+3×0.7=6.5", "2.7+4x=12.7", "7.2×12.8", "8+5"} {
+		if !containsRecognizedQuestion(qs, want) {
+			t.Errorf("complete/independent arithmetic %q was removed: %#v", want, qs)
+		}
+	}
+}
+
+func TestRecognize_CroppedArithmeticFilterNeverDropsStudentAnswerOrUnprovenPrefix(t *testing.T) {
+	vision := func(context.Context, []byte, string) (string, error) {
+		return `[` +
+			`{"question":"21×","subject":"数学","student_answer":"手写42"},` +
+			`{"question":"4x+3","subject":"数学","student_answer":"手写过程"},` +
+			`{"question":"4x+3×0.7=6.5","subject":"数学","student_answer":""},` +
+			`{"question":"3+4","subject":"数学","student_answer":""},` +
+			`{"question":"3+45=48","subject":"数学","student_answer":""}` +
+			`]`, nil
+	}
+	qs, err := NewRecognizerAdapter(vision).Recognize(context.Background(), []byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"21×", "4x+3", "4x+3×0.7=6.5", "3+4", "3+45=48"} {
+		if !containsRecognizedQuestion(qs, want) {
+			t.Errorf("answered or unproven item %q was removed: %#v", want, qs)
+		}
+	}
+}
+
+func containsRecognizedQuestion(questions []usecase.RecognizedQuestion, want string) bool {
+	for _, question := range questions {
+		if question.Question == want {
+			return true
+		}
+	}
+	return false
 }
 
 // TestRecognizePrompt_AsksForStudentAnswerNoFabricate 提示词契约：显式要求逐题回收作答、

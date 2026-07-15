@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -151,7 +152,7 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 	wg.Wait()
 
 	if mode == PhotoModeGrade {
-		marks := trustedPhotoMarks(result.Items)
+		marks := photoAnnotations(result.Items)
 		if len(marks) > 0 && d.PhotoAnnotator != nil {
 			rendered, renderErr := d.PhotoAnnotator.Annotate(ctx, req.Image, marks)
 			if renderErr == nil && len(rendered.Data) > 0 {
@@ -182,14 +183,61 @@ func photoEvidenceTrusted(e SolveEvidence) bool {
 }
 
 func trustedPhotoMarks(items []PhotoGradeItem) []PhotoAnnotation {
-	marks := make([]PhotoAnnotation, 0, len(items))
-	for _, item := range items {
-		if item.Recognized.BBox == nil || (item.Status != PhotoCorrect && item.Status != PhotoWrong) {
-			continue
+	annotations := photoAnnotations(items)
+	marks := make([]PhotoAnnotation, 0, len(annotations))
+	for _, annotation := range annotations {
+		if photoAnnotationHasTrustedBBox(annotation) {
+			marks = append(marks, annotation)
 		}
-		marks = append(marks, PhotoAnnotation{BBox: *item.Recognized.BBox, Correct: item.Status == PhotoCorrect})
 	}
 	return marks
+}
+
+func photoAnnotations(items []PhotoGradeItem) []PhotoAnnotation {
+	marks := make([]PhotoAnnotation, 0, len(items))
+	for i, item := range items {
+		if item.Status != PhotoCorrect && item.Status != PhotoWrong {
+			continue
+		}
+		mark := PhotoAnnotation{QuestionNumber: i + 1, Correct: item.Status == PhotoCorrect}
+		if anchor := item.Recognized.BBox; anchor != nil {
+			mark.BBox = *anchor
+		}
+		marks = append(marks, mark)
+	}
+	conflicted := make([]bool, len(marks))
+	for i := 0; i < len(marks); i++ {
+		if !photoAnnotationHasTrustedBBox(marks[i]) {
+			continue
+		}
+		for j := i + 1; j < len(marks); j++ {
+			if !photoAnnotationHasTrustedBBox(marks[j]) {
+				continue
+			}
+			a, b := marks[i].BBox, marks[j].BBox
+			aY, bY := a.Y+a.H*0.75, b.Y+b.H*0.75
+			if math.Abs(a.X-b.X) < 0.06 && math.Abs(aY-bY) < 0.04 {
+				conflicted[i], conflicted[j] = true, true
+			}
+		}
+	}
+	for i := range marks {
+		if conflicted[i] {
+			marks[i].BBox = BBox{}
+		}
+	}
+	return marks
+}
+
+func photoAnnotationHasTrustedBBox(mark PhotoAnnotation) bool {
+	b := mark.BBox
+	values := []float64{b.X, b.Y, b.W, b.H}
+	for _, value := range values {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return false
+		}
+	}
+	return b.X >= 0 && b.Y >= 0 && b.W > 0 && b.H > 0 && b.X+b.W <= 1.005 && b.Y+b.H <= 1.005
 }
 
 func photoGradeMarkdown(result PhotoGradeResult) string {
@@ -228,7 +276,7 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 			pending++
 		}
 	}
-	b.WriteString("## 作业批改完成\n\n")
+	b.WriteString("## 📊 作业批改完成\n\n")
 	fmt.Fprintf(&b, "- 共识别 **%d** 题\n- 正确 **%d** 题，需订正 **%d** 题", len(result.Items), correct, wrong)
 	if unanswered > 0 {
 		fmt.Fprintf(&b, "，未作答 **%d** 题", unanswered)
@@ -237,29 +285,92 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 		fmt.Fprintf(&b, "，待核对 **%d** 题", pending)
 	}
 	b.WriteString("\n\n")
+	determined := correct + wrong
+	annotated := 0
+	if result.AnnotatedImage != nil && len(result.AnnotatedImage.Data) > 0 {
+		annotated = len(trustedPhotoMarks(result.Items))
+	}
+	if result.AnnotatedImage != nil && len(result.AnnotatedImage.Data) > 0 && annotated < determined {
+		fmt.Fprintf(&b, "> ℹ️ 本次 %d 题已判定，其中 %d 题在原作答位置标注，其余 %d 题已在批改图右侧按题号标注，避免猜测坐标造成错位。\n\n",
+			determined, annotated, determined-annotated)
+	} else if annotated < determined {
+		if annotated == 0 {
+			fmt.Fprintf(&b, "> ℹ️ 本次 %d 题已判定，0 题已在图上标注；本次未生成批改图，判定结果仅作文字汇总，以避免标记错位。\n\n", determined)
+		} else {
+			fmt.Fprintf(&b, "> ℹ️ 本次 %d 题已判定，其中 %d 题找到作答位置并已标注；其余仅作文字汇总，以避免标记错位。\n\n", determined, annotated)
+		}
+	}
+	if correct > 0 {
+		fmt.Fprintf(&b, "### ✅ 答对的题（%d）\n\n", correct)
+		for i, item := range result.Items {
+			if item.Status != PhotoCorrect {
+				continue
+			}
+			fmt.Fprintf(&b, "%d. **%s** → **%s**\n", i+1,
+				photoInline(item.Recognized.Question, 180), photoInline(item.Recognized.StudentAnswer, 180))
+		}
+		b.WriteString("\n")
+	}
+	if wrong > 0 {
+		fmt.Fprintf(&b, "### ❌ 需要订正（%d）\n\n", wrong)
+	}
 	for i, item := range result.Items {
-		if item.Status == PhotoCorrect {
+		if item.Status != PhotoWrong {
 			continue
 		}
-		fmt.Fprintf(&b, "### %d. %s\n\n", i+1, photoClip(item.Recognized.Question, 240))
-		switch item.Status {
-		case PhotoWrong:
-			fmt.Fprintf(&b, "- **你的作答：** %s\n- **订正参考：** %s", photoClip(item.Recognized.StudentAnswer, 300), photoClip(item.Grade.Solution, 1000))
-			if item.Grade.Outcome.ErrorCause != "" {
-				fmt.Fprintf(&b, "\n- **错因：** %s", photoClip(item.Grade.Outcome.ErrorCause, 300))
-			}
-		case PhotoUnanswered:
-			b.WriteString("> ⏸️ 未作答，本次已答卷批改不会直接泄露该题答案。")
-		case PhotoOutOfScope:
-			fmt.Fprintf(&b, "> ⛔ 超出当前年级范围：%s", photoClip(item.Grade.OutOfScopeKP, 120))
-		case PhotoUntrusted:
-			fmt.Fprintf(&b, "> ⚠️ 待核对：%s", photoClip(item.Warning, 240))
-		default:
-			fmt.Fprintf(&b, "> ⚠️ 处理失败，待核对：%s", photoClip(item.Warning, 240))
+		fmt.Fprintf(&b, "#### 第 %d 题\n\n", i+1)
+		fmt.Fprintf(&b, "- **题目：** %s\n- **你的作答：** %s\n- **订正参考：**\n\n%s",
+			photoInline(item.Recognized.Question, 240), photoInline(item.Recognized.StudentAnswer, 300), photoMarkdownQuote(item.Grade.Solution, 1000))
+		if item.Grade.Outcome.ErrorCause != "" {
+			fmt.Fprintf(&b, "\n- **错因：** %s", photoInline(item.Grade.Outcome.ErrorCause, 300))
 		}
 		b.WriteString("\n\n")
 	}
+	if unanswered > 0 {
+		fmt.Fprintf(&b, "### ⏸ 未作答（%d）\n\n", unanswered)
+		for i, item := range result.Items {
+			if item.Status == PhotoUnanswered {
+				fmt.Fprintf(&b, "- 第 %d 题：%s\n", i+1, photoInline(item.Recognized.Question, 240))
+			}
+		}
+		b.WriteString("\n> 本次已答卷批改不会直接泄露未作答题的答案。\n\n")
+	}
+	if pending > 0 {
+		fmt.Fprintf(&b, "### ⚠️ 待核对（%d）\n\n", pending)
+		for i, item := range result.Items {
+			switch item.Status {
+			case PhotoOutOfScope:
+				fmt.Fprintf(&b, "- 第 %d 题超出当前年级范围：%s\n", i+1, photoInline(item.Grade.OutOfScopeKP, 120))
+			case PhotoUntrusted:
+				fmt.Fprintf(&b, "- 第 %d 题证据不足：%s\n", i+1, photoInline(item.Warning, 240))
+			case PhotoFailed:
+				fmt.Fprintf(&b, "- 第 %d 题处理失败：%s\n", i+1, photoInline(item.Warning, 240))
+			}
+		}
+	}
 	return strings.TrimSpace(b.String())
+}
+
+func photoInline(s string, max int) string {
+	return strings.Join(strings.Fields(photoClip(s, max)), " ")
+}
+
+func photoMarkdownQuote(s string, max int) string {
+	lines := strings.Split(photoClip(s, max), "\n")
+	quoted := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") {
+			line = strings.TrimSpace(strings.TrimLeft(line, "#"))
+		}
+		if line != "" {
+			quoted = append(quoted, "> "+line)
+		}
+	}
+	if len(quoted) == 0 {
+		return "> 暂无可靠订正参考"
+	}
+	return strings.Join(quoted, "  \n")
 }
 
 func photoClip(s string, max int) string {

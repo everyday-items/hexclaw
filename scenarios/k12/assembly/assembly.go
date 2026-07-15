@@ -81,6 +81,24 @@ func WithRetryGenerator(fn engineadapter.RetryGenerateFunc) Option {
 	}
 }
 
+// WithCauseSummaryGenerator 注入「记一条错题」的专用轻量错因摘要闭包。
+func WithCauseSummaryGenerator(fn engineadapter.CauseSummaryGenerateFunc) Option {
+	return func(d *usecase.Deps) {
+		if sa, ok := d.Solver.(*engineadapter.SolveAdapter); ok && fn != nil {
+			sa.SetCauseSummaryGen(fn)
+		}
+	}
+}
+
+// WithPrepReviewGenerator 注入教材未命中时的专用知识点回顾闭包。
+func WithPrepReviewGenerator(fn engineadapter.PrepReviewGenerateFunc) Option {
+	return func(d *usecase.Deps) {
+		if sa, ok := d.Solver.(*engineadapter.SolveAdapter); ok && fn != nil {
+			sa.SetPrepReviewGen(fn)
+		}
+	}
+}
+
 // Wire 装配 K12 运行时。
 //
 // solveSkill 由 composition root 传入（engine.NewSolveSkill(agentExecFn, reg) 的产物，
@@ -106,6 +124,7 @@ func Wire(db *sql.DB, solveSkill engineadapter.SolveExecutor, opts ...Option) (*
 		Solver:         solveAdapter,
 		Grader:         solveAdapter,
 		VerifiedGrader: solveAdapter,
+		PrepReview:     solveAdapter,
 		Records:        store,
 		Constraint:     constraint,
 	}

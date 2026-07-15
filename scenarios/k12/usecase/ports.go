@@ -54,11 +54,13 @@ type Recognizer interface {
 	Recognize(ctx context.Context, image []byte) ([]RecognizedQuestion, error)
 }
 
-// PhotoAnnotation 是允许烧录到原作业图的可信批改标记。只有经过程序/强证据验算、
-// 且 bbox 合法的题目才能进入本结构；超纲、不可验证、失败项不得伪装成红叉。
+// PhotoAnnotation 是允许进入批改图的可信批改结论。经过程序/强证据验算且 bbox
+// 合法时在原作答位置绘制；没有可靠 bbox 时 BBox 保持零值，由 adapter 在独立的题号结果栏
+// 绘制，绝不猜测坐标。超纲、不可验证、失败项不得伪装成红叉。
 type PhotoAnnotation struct {
-	BBox    BBox
-	Correct bool
+	BBox           BBox
+	QuestionNumber int
+	Correct        bool
 }
 
 // RenderedPhoto 是平台无关的批改图产物。
@@ -154,6 +156,12 @@ type Insights interface {
 // found=true 来自家长上传教材（可信）；false 时调用方降级为 LLM 生成并标未校验。
 type Grounding interface {
 	Ground(ctx context.Context, agentName, knowledgePoint, grade string) (text string, found bool, err error)
+}
+
+// PrepReviewGenerator 是备课卡①段在教材未命中时的单次 AI 回顾生成 port。
+// 它只生成按年级约束的讲法，不走 solve/verifier，也不得被标为程序验算结果。
+type PrepReviewGenerator interface {
+	GeneratePrepReview(ctx context.Context, subject, knowledgePoint, grade string) (string, error)
 }
 
 // GroundingWriter 是教材 grounding 的写缝；与 Grounding 使用同一 agent scope。

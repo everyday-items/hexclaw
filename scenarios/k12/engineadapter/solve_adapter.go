@@ -35,10 +35,20 @@ type VerifiedGradeExecutor interface {
 // 返回出题正文（含回执围栏，adapter 侧剥离）。nil 时 GenerateSimilar 安全回退全链。
 type RetryGenerateFunc func(ctx context.Context, subject, prompt, grade string) (string, error)
 
+// CauseSummaryGenerateFunc 是「记一条错题」的轻量错因摘要闭包。必须与变式出题分开，避免
+// “必须出题”的系统提示覆盖“只输出错因”的用户提示。
+type CauseSummaryGenerateFunc func(ctx context.Context, subject, prompt, grade string) (string, error)
+
+// PrepReviewGenerateFunc 是教材未命中时的轻量知识点回顾闭包。与变式出题分开，避免出题系统提示
+// 污染“不要出题、不要伪造教材引用”的备课回顾任务。
+type PrepReviewGenerateFunc func(ctx context.Context, subject, prompt, grade string) (string, error)
+
 // SolveAdapter 用 engine 的 solve skill 实现用例层的 Solver + Grader 两个 port。
 type SolveAdapter struct {
-	exec     SolveExecutor
-	retryGen RetryGenerateFunc // 轻量「再练一道」出题；nil 时回退全链
+	exec            SolveExecutor
+	retryGen        RetryGenerateFunc        // 轻量「再练一道」出题；nil 时回退全链
+	causeSummaryGen CauseSummaryGenerateFunc // 轻量错因摘要；nil 时留空由用户填写
+	prepReviewGen   PrepReviewGenerateFunc   // 轻量备课回顾；nil 时由用例层诚实降级
 }
 
 // SolveAdapterOption 装配可选能力（保 NewSolveAdapter 单参数向后兼容）。
@@ -49,8 +59,24 @@ func WithRetryGen(fn RetryGenerateFunc) SolveAdapterOption {
 	return func(a *SolveAdapter) { a.retryGen = fn }
 }
 
+// WithCauseSummaryGen 注入专用错因摘要闭包。
+func WithCauseSummaryGen(fn CauseSummaryGenerateFunc) SolveAdapterOption {
+	return func(a *SolveAdapter) { a.causeSummaryGen = fn }
+}
+
+// WithPrepReviewGen 注入专用备课回顾闭包。
+func WithPrepReviewGen(fn PrepReviewGenerateFunc) SolveAdapterOption {
+	return func(a *SolveAdapter) { a.prepReviewGen = fn }
+}
+
 // SetRetryGen 事后注入轻量出题闭包（composition root 在 Deps.Solver 建好后回填）。
 func (a *SolveAdapter) SetRetryGen(fn RetryGenerateFunc) { a.retryGen = fn }
+
+// SetCauseSummaryGen 事后注入专用错因摘要闭包。
+func (a *SolveAdapter) SetCauseSummaryGen(fn CauseSummaryGenerateFunc) { a.causeSummaryGen = fn }
+
+// SetPrepReviewGen 事后注入专用备课回顾闭包。
+func (a *SolveAdapter) SetPrepReviewGen(fn PrepReviewGenerateFunc) { a.prepReviewGen = fn }
 
 // NewSolveAdapter 创建 adapter。s 通常是 engine.NewSolveSkill(...) 的产物。
 func NewSolveAdapter(s SolveExecutor, opts ...SolveAdapterOption) *SolveAdapter {
@@ -67,6 +93,7 @@ var (
 	_ usecase.VerifiedSolutionGrader = (*SolveAdapter)(nil)
 	_ usecase.RetryGenerator         = (*SolveAdapter)(nil)
 	_ usecase.CauseSummarizer        = (*SolveAdapter)(nil)
+	_ usecase.PrepReviewGenerator    = (*SolveAdapter)(nil)
 )
 
 // Solve 实现 usecase.Solver：调 solve skill 解题验算（透传 grade + constraint 约束年级边界），
@@ -128,22 +155,37 @@ func (a *SolveAdapter) GenerateSimilar(ctx context.Context, subject, prompt, gra
 }
 
 // SummarizeCause 实现 usecase.CauseSummarizer（BUG-20260712「记一条错题」轻量错因归纳）：
-// 复用已注入的单次 reasoning 出题闭包（retryGen，单个子 Agent），只让它归纳一句话错因，
-// **不派 verifier / 不 self-consistency / 不 code_exec**——家长记的是已知错题，无需判对错。
+// 使用专用单次 reasoning 闭包归纳一句话错因，**不派 verifier / 不 self-consistency /
+// 不 code_exec**——家长记的是已知错题，无需判对错。
 // 未注入闭包时返回空串（错因留空由用户填），绝不回退全对抗验算链（否则又变回 1-2 分钟）。
 func (a *SolveAdapter) SummarizeCause(ctx context.Context, subject, question, studentAnswer, grade string) (string, error) {
-	if a.retryGen == nil {
+	if a.causeSummaryGen == nil {
 		return "", nil
 	}
 	prompt := "这道题孩子做错了。用一句话（≤20 字）归纳错因本身，只输出错因、不要解题、不要复述题目。\n题目：" + question
 	if strings.TrimSpace(studentAnswer) != "" {
 		prompt += "\n孩子的答案/错处：" + studentAnswer
 	}
-	out, err := a.retryGen(ctx, subject, prompt, grade)
+	out, err := a.causeSummaryGen(ctx, subject, prompt, grade)
 	if err != nil {
 		return "", err
 	}
 	return stripReports(out), nil
+}
+
+// GeneratePrepReview 在教材未命中时复用裸 reasoning completion 生成按年级约束的知识点回顾。
+// 不回退 SolveExecutor：备课讲法不需要全对抗验算链；无闭包时返回空，让用例层诚实标静态降级。
+func (a *SolveAdapter) GeneratePrepReview(ctx context.Context, subject, knowledgePoint, grade string) (string, error) {
+	if a.prepReviewGen == nil {
+		return "", nil
+	}
+	prompt := "为家长生成一段中小学知识点回顾。只讲核心概念、孩子常见卡点和一句引导话术，控制在120字内；" +
+		"不要出题、不要假称引用教材、不要输出未经提供的课本原文。知识点：" + knowledgePoint
+	out, err := a.prepReviewGen(ctx, subject, prompt, grade)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(stripReports(out)), nil
 }
 
 // Grade 实现 usecase.Grader：solve skill 的 grading 模式内部会重新解题得 ground truth，

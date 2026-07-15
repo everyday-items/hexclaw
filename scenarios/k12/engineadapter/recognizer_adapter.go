@@ -131,13 +131,22 @@ func (a *RecognizerAdapter) Recognize(ctx context.Context, image []byte) ([]usec
 	// JSON 截断。长图先切成 5 个有重叠的纵向分片，并发识别后把 bbox 映射回整图坐标。
 	// 非长图、无法解码的历史/测试载荷仍走原单请求路径，不扩大行为面。
 	if segments, ok := splitDenseWorksheetImage(image); ok {
-		return a.recognizeSegments(ctx, segments)
+		questions, err := a.recognizeSegments(ctx, segments)
+		if err != nil {
+			return nil, err
+		}
+		// 分片 bbox 必须先映射回原图并完成跨片合并，再用原图做一次语义核验。
+		return a.verifyRecognizedBBoxes(ctx, image, questions), nil
 	}
 	raw, err := a.vision(ctx, image, recognizePrompt)
 	if err != nil {
 		return nil, fmt.Errorf("recognizer: 视觉模型调用失败: %w", err)
 	}
-	return parseRecognizedQuestions(raw)
+	questions, err := parseRecognizedQuestions(raw)
+	if err != nil {
+		return nil, err
+	}
+	return a.verifyRecognizedBBoxes(ctx, image, questions), nil
 }
 
 func parseRecognizedQuestions(raw string) ([]usecase.RecognizedQuestion, error) {
@@ -151,12 +160,13 @@ func parseRecognizedQuestions(raw string) ([]usecase.RecognizedQuestion, error) 
 		if question == "" || sectionHeading.MatchString(question) || likelyCroppedFragment(question) {
 			continue
 		}
+		bbox := normalizeBBox(d.BBox)
 		out = append(out, usecase.RecognizedQuestion{
 			Question:        question,
 			KnowledgePoints: d.KnowledgePoints,
 			StudentAnswer:   strings.TrimSpace(d.StudentAnswer),
 			Subject:         normalizeRecognizedSubject(d.Subject),
-			BBox:            normalizeBBox(d.BBox),
+			BBox:            bbox,
 		})
 	}
 	return mergeRecognizedQuestions(nil, out), nil
@@ -183,6 +193,11 @@ var horizontalZoomRanges = [][2]float64{
 	{0.29, 0.71},
 	{0.58, 1.00},
 }
+
+// A dense page may contain more than one horizontal arithmetic section, but zooming every vertical
+// segment would multiply provider traffic dramatically. Pick eligible segments in page order and cap
+// the optional enhancement at two segments × three zoom crops = six vision calls per page.
+const maxHorizontalZoomSegmentsPerPage = 2
 
 type worksheetHorizontalZoom struct {
 	image        []byte
@@ -222,11 +237,16 @@ func splitHorizontalZooms(raw []byte) ([]worksheetHorizontalZoom, bool) {
 	return zooms, true
 }
 
-// splitDenseWorksheetImage 仅处理高像素、明显纵向的作业图。5 段间保留 4%~6% 重叠，
+// splitDenseWorksheetImage 仅处理尺寸足够、明显纵向的作业图。5 段间保留 4%~6% 重叠，
 // 让跨分界线的题至少在一个分片内完整出现；合并阶段按题干去重。
 func splitDenseWorksheetImage(raw []byte) ([]worksheetSegment, bool) {
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
-	if err != nil || cfg.Height < 1600 || cfg.Height*5 < cfg.Width*6 {
+	if err != nil {
+		return nil, false
+	}
+	legacyTall := cfg.Height >= 1600 && cfg.Height*5 >= cfg.Width*6
+	lowResolutionWorksheet := cfg.Height >= 1200 && cfg.Width >= 800 && cfg.Height*3 >= cfg.Width*4
+	if !legacyTall && !lowResolutionWorksheet {
 		return nil, false
 	}
 	src, _, err := image.Decode(bytes.NewReader(raw))
@@ -305,69 +325,102 @@ func (a *RecognizerAdapter) recognizeSegments(ctx context.Context, segments []wo
 					}
 				}
 			}
-			// 少量横排短算式通常意味着整宽分片把小字缩得过小。实际裁成 3 个重叠横向放大块，
-			// 让模型看清被漏掉的题/手写答案，再把局部 x 坐标映射回整宽分片。
-			if segment.index == 1 && segmentNeedsHorizontalZoom(questions) {
-				if zooms, ok := splitHorizontalZooms(segment.image); ok {
-					for _, zoom := range zooms {
-						zoomPrompt := fmt.Sprintf(`%s
-
-这是原作业图片的纵向分片 %d/%d、横向放大 %d/%d。只输出在当前放大块中题干完整可见的题，重点分离印刷题干与手写答案；左右边缘被截断的题忽略。bbox 坐标以当前裁剪块为 0~1。JSON 紧凑输出。`, recognizePrompt, segment.index, segment.total, zoom.index, zoom.total)
-						rawZoom, zoomErr := a.vision(ctx, zoom.image, zoomPrompt)
-						if zoomErr != nil {
-							continue
-						}
-						zoomQuestions, parseErr := parseRecognizedQuestions(rawZoom)
-						if parseErr != nil {
-							continue
-						}
-						if segmentNeedsHandwritingReview(zoomQuestions) {
-							focusZoomPrompt := zoomPrompt + "\n这是手写答案二次复核：已有题目的 bbox/作答区可见但答案未誊录时，请逐字读出手写内容放入 student_answer；不要把手写答案拼回 question。"
-							if focusRaw, focusErr := a.vision(ctx, zoom.image, focusZoomPrompt); focusErr == nil {
-								if focusQuestions, focusParseErr := parseRecognizedQuestions(focusRaw); focusParseErr == nil {
-									zoomQuestions = mergeRecognizedQuestions(zoomQuestions, focusQuestions)
-								}
-							}
-						}
-						spanX := zoom.endX - zoom.startX
-						for q := range zoomQuestions {
-							if zoomQuestions[q].BBox == nil {
-								continue
-							}
-							mapped := *zoomQuestions[q].BBox
-							mapped.X = zoom.startX + mapped.X*spanX
-							mapped.W *= spanX
-							zoomQuestions[q].BBox = &mapped
-						}
-						questions = mergeRecognizedQuestions(questions, zoomQuestions)
-					}
-				}
-			}
-			span := segment.endY - segment.startY
-			for q := range questions {
-				if questions[q].BBox == nil {
-					continue
-				}
-				mapped := *questions[q].BBox
-				mapped.Y = segment.startY + mapped.Y*span
-				mapped.H *= span
-				questions[q].BBox = &mapped
-			}
 			results[i].questions = questions
 		}()
 	}
 	wg.Wait()
-
-	merged := make([]usecase.RecognizedQuestion, 0)
 	for _, result := range results {
 		if result.err != nil {
 			return nil, fmt.Errorf("recognizer: %w", result.err)
 		}
+	}
+
+	// Content, not a hard-coded segment number, decides which vertical slices need horizontal zoom.
+	// Select deterministically in page order before launching work so the page-level budget cannot be
+	// stolen by goroutine scheduling. The two selected segments run in parallel; their three crops are
+	// sequential, keeping both total requests and provider concurrency bounded.
+	zoomIndexes := make([]int, 0, maxHorizontalZoomSegmentsPerPage)
+	for i := range results {
+		if segmentNeedsHorizontalZoom(results[i].questions) {
+			zoomIndexes = append(zoomIndexes, i)
+			if len(zoomIndexes) == maxHorizontalZoomSegmentsPerPage {
+				break
+			}
+		}
+	}
+	var zoomWG sync.WaitGroup
+	for _, index := range zoomIndexes {
+		index := index
+		zoomWG.Add(1)
+		go func() {
+			defer zoomWG.Done()
+			results[index].questions = a.recognizeHorizontalZooms(ctx, segments[index], results[index].questions)
+		}()
+	}
+	zoomWG.Wait()
+
+	// Zoom bbox.x is already mapped to the full segment width. Map every candidate's y coordinate only
+	// after optional zoom recovery so both base and recovered boxes share one transformation path.
+	for i, segment := range segments {
+		span := segment.endY - segment.startY
+		for q := range results[i].questions {
+			remapRecognizedGeometry(&results[i].questions[q], func(mapped *usecase.BBox) {
+				mapped.Y = segment.startY + mapped.Y*span
+				mapped.H *= span
+			})
+		}
+	}
+
+	merged := make([]usecase.RecognizedQuestion, 0)
+	for _, result := range results {
 		// 跨纵向分片也必须复用同一套 exact/equation/containment 合并规则。否则重叠区会同时
 		// 留下“如果每平方米……”残题和包含周长条件的完整题，后续批改把它们当成两道题。
 		merged = mergeRecognizedQuestions(merged, result.questions)
 	}
 	return merged, nil
+}
+
+func (a *RecognizerAdapter) recognizeHorizontalZooms(ctx context.Context, segment worksheetSegment, questions []usecase.RecognizedQuestion) []usecase.RecognizedQuestion {
+	zooms, ok := splitHorizontalZooms(segment.image)
+	if !ok {
+		return questions
+	}
+	for _, zoom := range zooms {
+		if ctx.Err() != nil {
+			break
+		}
+		zoomPrompt := fmt.Sprintf(`%s
+
+这是原作业图片的纵向分片 %d/%d、横向放大 %d/%d。只输出在当前放大块中题干完整可见的题，重点分离印刷题干与手写答案；左右边缘被截断的题忽略。bbox 坐标以当前裁剪块为 0~1。JSON 紧凑输出。`, recognizePrompt, segment.index, segment.total, zoom.index, zoom.total)
+		rawZoom, zoomErr := a.vision(ctx, zoom.image, zoomPrompt)
+		if zoomErr != nil {
+			continue
+		}
+		zoomQuestions, parseErr := parseRecognizedQuestions(rawZoom)
+		if parseErr != nil {
+			continue
+		}
+		spanX := zoom.endX - zoom.startX
+		for q := range zoomQuestions {
+			remapRecognizedGeometry(&zoomQuestions[q], func(mapped *usecase.BBox) {
+				mapped.X = zoom.startX + mapped.X*spanX
+				mapped.W *= spanX
+			})
+		}
+		questions = mergeRecognizedQuestions(questions, zoomQuestions)
+	}
+	return questions
+}
+
+func remapRecognizedGeometry(question *usecase.RecognizedQuestion, transform func(*usecase.BBox)) {
+	if question == nil || transform == nil {
+		return
+	}
+	if question.BBox != nil {
+		mapped := *question.BBox
+		transform(&mapped)
+		question.BBox = &mapped
+	}
 }
 
 func segmentNeedsHandwritingReview(questions []usecase.RecognizedQuestion) bool {
@@ -409,8 +462,11 @@ func mergeRecognizedQuestions(primary, recovery []usecase.RecognizedQuestion) []
 	for _, q := range recovery {
 		key := recognizedQuestionKey(q.Question)
 		if existing, ok := seen[key]; ok && key != "" {
-			if questionInformationScore(q) > questionInformationScore(merged[existing]) {
-				merged[existing] = q
+			existingQuestion := merged[existing]
+			if questionInformationScore(q) > questionInformationScore(existingQuestion) {
+				merged[existing] = mergeRecognizedGeometry(q, existingQuestion)
+			} else {
+				merged[existing] = mergeRecognizedGeometry(existingQuestion, q)
 			}
 			continue
 		}
@@ -484,10 +540,252 @@ func mergeRecognizedQuestions(primary, recovery []usecase.RecognizedQuestion) []
 		if containmentMerged {
 			continue
 		}
+		// Empty long questions from overlapping crops occasionally differ only by one duplicated
+		// grammatical particle (for example “座位号的的最大公约数” vs “座位号的最大公约数”).
+		// Merge only this tiny, structurally safe edit class. Same-stem questions whose actual ask
+		// changes by a meaningful substitution (男生/女生、是/不是) must remain separate.
+		nearDuplicateMerged := false
+		for existingKey, existing := range seen {
+			if !blankLongQuestionNearDuplicate(merged[existing], q, existingKey, key) {
+				continue
+			}
+			combined := mergeBlankLongNearDuplicate(merged[existing], q, existingKey, key)
+			merged[existing] = combined
+			newKey := recognizedQuestionKey(combined.Question)
+			if newKey != existingKey {
+				delete(seen, existingKey)
+				seen[newKey] = existing
+			}
+			nearDuplicateMerged = true
+			break
+		}
+		if nearDuplicateMerged {
+			continue
+		}
 		seen[key] = len(merged)
 		merged = append(merged, q)
 	}
-	return merged
+	return filterBlankCroppedArithmeticFragments(merged)
+}
+
+const blankArithmeticFragmentMaxRunes = 16
+
+// filterBlankCroppedArithmeticFragments removes only blank, short formula shards produced by
+// overlapping/zoom crops. An answered item is never touched. A short expression that does not end
+// mid-operator needs corroboration from a longer, complete equation in the same merged batch.
+func filterBlankCroppedArithmeticFragments(questions []usecase.RecognizedQuestion) []usecase.RecognizedQuestion {
+	filtered := make([]usecase.RecognizedQuestion, 0, len(questions))
+	for i, question := range questions {
+		if strings.TrimSpace(question.StudentAnswer) != "" {
+			filtered = append(filtered, question)
+			continue
+		}
+		short := normalizeArithmeticQuestion(question.Question)
+		if !isShortArithmeticFragment(short) {
+			filtered = append(filtered, question)
+			continue
+		}
+		if endsWithArithmeticOperator(short) || hasCompleteEquationContinuation(short, questions, i) {
+			continue
+		}
+		filtered = append(filtered, question)
+	}
+	return filtered
+}
+
+func normalizeArithmeticQuestion(question string) string {
+	replacer := strings.NewReplacer(
+		" ", "", "\t", "", "\n", "", "\r", "",
+		"？", "", "?", "", "＝", "=", "．", ".", "－", "-", "＋", "+",
+	)
+	return strings.ToLower(replacer.Replace(strings.TrimSpace(question)))
+}
+
+func isShortArithmeticFragment(question string) bool {
+	runes := []rune(question)
+	if len(runes) < 2 || len(runes) > blankArithmeticFragmentMaxRunes {
+		return false
+	}
+	hasDigit, hasSyntax := false, false
+	for _, r := range runes {
+		switch {
+		case r >= '0' && r <= '9':
+			hasDigit = true
+		case strings.ContainsRune("x.+-−×÷*/=()（）", r):
+			hasSyntax = true
+		default:
+			return false
+		}
+	}
+	return hasDigit && hasSyntax
+}
+
+func endsWithArithmeticOperator(question string) bool {
+	runes := []rune(question)
+	return len(runes) > 0 && strings.ContainsRune("+-−×÷*/", runes[len(runes)-1])
+}
+
+func hasCompleteEquationContinuation(short string, questions []usecase.RecognizedQuestion, shortIndex int) bool {
+	for i, question := range questions {
+		if i == shortIndex {
+			continue
+		}
+		longer := normalizeArithmeticQuestion(question.Question)
+		if !strings.HasPrefix(longer, short) || len([]rune(longer)) <= len([]rune(short)) || !isCompleteArithmeticEquation(longer) {
+			continue
+		}
+		suffix := []rune(strings.TrimPrefix(longer, short))
+		// A following digit can mean a separate valid item (for example 3+4 and 3+45=48),
+		// rather than a crop. Require a structural continuation boundary.
+		if len(suffix) > 0 && strings.ContainsRune("x.+-−×÷*/=(（", suffix[0]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCompleteArithmeticEquation(question string) bool {
+	if len([]rune(question)) > 48 || strings.Count(question, "=") != 1 {
+		return false
+	}
+	left, right, _ := strings.Cut(question, "=")
+	if left == "" || right == "" || endsWithArithmeticOperator(left) || endsWithArithmeticOperator(right) {
+		return false
+	}
+	for _, side := range []string{left, right} {
+		hasOperand := false
+		for _, r := range side {
+			switch {
+			case r >= '0' && r <= '9' || r == 'x':
+				hasOperand = true
+			case strings.ContainsRune(".+-−×÷*/()（）", r):
+			default:
+				return false
+			}
+		}
+		if !hasOperand {
+			return false
+		}
+	}
+	return true
+}
+
+const (
+	blankLongQuestionMinRunes        = 24
+	blankLongQuestionMaxEditDistance = 2
+)
+
+func blankLongQuestionNearDuplicate(a, b usecase.RecognizedQuestion, aKey, bKey string) bool {
+	if strings.TrimSpace(a.StudentAnswer) != "" || strings.TrimSpace(b.StudentAnswer) != "" {
+		return false
+	}
+	aRunes, bRunes := []rune(aKey), []rune(bKey)
+	if len(aRunes) < blankLongQuestionMinRunes || len(bRunes) < blankLongQuestionMinRunes || len(aRunes) == len(bRunes) {
+		return false
+	}
+	if !editDistanceAtMost(aRunes, bRunes, blankLongQuestionMaxEditDistance) {
+		return false
+	}
+	return differsOnlyByDuplicatedParticles(aRunes, bRunes, blankLongQuestionMaxEditDistance)
+}
+
+// differsOnlyByDuplicatedParticles accepts one or two extra adjacent 的/地/得 characters in the
+// longer transcription. Requiring an insertion/deletion of a duplicated particle intentionally rejects
+// equal-length substitutions, even when their Levenshtein distance is only one.
+func differsOnlyByDuplicatedParticles(a, b []rune, maxExtras int) bool {
+	longer, shorter := a, b
+	if len(longer) < len(shorter) {
+		longer, shorter = shorter, longer
+	}
+	if len(longer)-len(shorter) < 1 || len(longer)-len(shorter) > maxExtras {
+		return false
+	}
+	i, j, extras := 0, 0, 0
+	for i < len(longer) && j < len(shorter) {
+		if longer[i] == shorter[j] {
+			i++
+			j++
+			continue
+		}
+		particle := longer[i]
+		duplicated := (i > 0 && longer[i-1] == particle) || (i+1 < len(longer) && longer[i+1] == particle)
+		if !strings.ContainsRune("的地得", particle) || !duplicated {
+			return false
+		}
+		extras++
+		if extras > maxExtras {
+			return false
+		}
+		i++
+	}
+	for i < len(longer) {
+		particle := longer[i]
+		duplicated := i > 0 && longer[i-1] == particle
+		if !strings.ContainsRune("的地得", particle) || !duplicated {
+			return false
+		}
+		extras++
+		i++
+	}
+	return j == len(shorter) && extras == len(longer)-len(shorter)
+}
+
+func editDistanceAtMost(a, b []rune, limit int) bool {
+	lengthDelta := len(a) - len(b)
+	if lengthDelta < 0 {
+		lengthDelta = -lengthDelta
+	}
+	if lengthDelta > limit {
+		return false
+	}
+	previous := make([]int, len(b)+1)
+	current := make([]int, len(b)+1)
+	for j := range previous {
+		previous[j] = j
+	}
+	for i, left := range a {
+		current[0] = i + 1
+		for j, right := range b {
+			cost := 0
+			if left != right {
+				cost = 1
+			}
+			best := current[j] + 1
+			if candidate := previous[j+1] + 1; candidate < best {
+				best = candidate
+			}
+			if candidate := previous[j] + cost; candidate < best {
+				best = candidate
+			}
+			current[j+1] = best
+		}
+		previous, current = current, previous
+	}
+	return previous[len(b)] <= limit
+}
+
+func mergeRecognizedGeometry(preferred, other usecase.RecognizedQuestion) usecase.RecognizedQuestion {
+	if preferred.BBox == nil {
+		preferred.BBox = other.BBox
+	}
+	return preferred
+}
+
+func mergeBlankLongNearDuplicate(a, b usecase.RecognizedQuestion, aKey, bKey string) usecase.RecognizedQuestion {
+	cleaner, other := a, b
+	if len([]rune(bKey)) < len([]rune(aKey)) {
+		cleaner, other = b, a
+	}
+	if cleaner.Subject == "" {
+		cleaner.Subject = other.Subject
+	}
+	if len(other.KnowledgePoints) > len(cleaner.KnowledgePoints) {
+		cleaner.KnowledgePoints = other.KnowledgePoints
+	}
+	if cleaner.BBox == nil {
+		cleaner.BBox = other.BBox
+	}
+	return cleaner
 }
 
 func overlappingWordProblemDuplicate(a, b usecase.RecognizedQuestion, aKey, bKey string) bool {

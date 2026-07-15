@@ -226,6 +226,59 @@ func TestSolveAdapter_GenerateSimilar_UsesBareClosure_NotReActExecutor(t *testin
 	}
 }
 
+func TestSolveAdapter_GeneratePrepReview_UsesBareClosure_NotReActExecutor(t *testing.T) {
+	exec := &countingExec{}
+	closureCalls := 0
+	a := NewSolveAdapter(exec, WithPrepReviewGen(func(_ context.Context, subject, prompt, grade string) (string, error) {
+		closureCalls++
+		if subject != "数学" || grade != "五年级上" || !strings.Contains(prompt, "简易方程") {
+			t.Fatalf("备课回顾 prompt 未透传上下文: subject=%q grade=%q prompt=%q", subject, grade, prompt)
+		}
+		return "先找等量关系，再利用等式性质逐步求解。\n\n```hexclaw-subagents\n[{\"Agent\":\"solver\"}]\n```", nil
+	}))
+
+	got, err := a.GeneratePrepReview(context.Background(), "数学", "简易方程", "五年级上")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exec.calls != 0 || closureCalls != 1 {
+		t.Fatalf("备课回顾只应调用一次裸闭包: exec=%d closure=%d", exec.calls, closureCalls)
+	}
+	if got != "先找等量关系，再利用等式性质逐步求解。" {
+		t.Fatalf("备课回顾应剥掉子 Agent 回执, got %q", got)
+	}
+}
+
+func TestSolveAdapter_SummarizeCause_UsesDedicatedClosure(t *testing.T) {
+	exec := &countingExec{}
+	retryCalls := 0
+	causeCalls := 0
+	a := NewSolveAdapter(exec,
+		WithRetryGen(func(context.Context, string, string, string) (string, error) {
+			retryCalls++
+			return "不应调用的变式题", nil
+		}),
+		WithCauseSummaryGen(func(_ context.Context, subject, prompt, grade string) (string, error) {
+			causeCalls++
+			if subject != "数学" || grade != "五年级上" || !strings.Contains(prompt, "54") {
+				t.Fatalf("错因摘要 prompt 未透传上下文: subject=%q grade=%q prompt=%q", subject, grade, prompt)
+			}
+			return "乘法口算错误\n\n```hexclaw-subagents\n[{\"Agent\":\"solver\"}]\n```", nil
+		}),
+	)
+
+	got, err := a.SummarizeCause(context.Background(), "数学", "8×7=", "54", "五年级上")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exec.calls != 0 || retryCalls != 0 || causeCalls != 1 {
+		t.Fatalf("错因摘要只应调用专用裸闭包: exec=%d retry=%d cause=%d", exec.calls, retryCalls, causeCalls)
+	}
+	if got != "乘法口算错误" {
+		t.Fatalf("错因摘要应剥掉子 Agent 回执, got %q", got)
+	}
+}
+
 // TestSolveAdapter_GenerateSimilar_NilClosureFallsBackToFullChain —— 未注入闭包时安全回退
 // 全链（SolveSubject → exec），保证正确性不塌。
 func TestSolveAdapter_GenerateSimilar_NilClosureFallsBackToFullChain(t *testing.T) {
