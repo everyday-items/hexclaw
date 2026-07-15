@@ -43,7 +43,7 @@ func TestBeforeAfter_PullTimeout(t *testing.T) {
 		// 模拟修复前的配置：Timeout 设为 1s（模拟 30min 不够的场景）
 		client := &http.Client{Timeout: 1 * time.Second}
 
-		resp, err := client.Post(server.URL, "application/json", strings.NewReader(`{"name":"test"}`))
+		resp, err := client.Post(server.URL, "application/json", strings.NewReader(`{"model":"test"}`))
 		if err != nil {
 			t.Fatalf("连接失败: %v", err)
 		}
@@ -77,7 +77,7 @@ func TestBeforeAfter_PullTimeout(t *testing.T) {
 			},
 		}
 
-		resp, err := client.Post(server.URL, "application/json", strings.NewReader(`{"name":"test"}`))
+		resp, err := client.Post(server.URL, "application/json", strings.NewReader(`{"model":"test"}`))
 		if err != nil {
 			t.Fatalf("连接失败: %v", err)
 		}

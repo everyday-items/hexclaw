@@ -137,6 +137,7 @@ type Server struct {
 	statsCache                  statsResponse
 	statsJSON                   []byte
 	statsCacheAt                time.Time
+	ollamaBaseURL               string
 }
 
 // NewServer 创建 API 服务器
@@ -163,6 +164,7 @@ func NewServer(cfg *config.Config, eng engine.Engine, gw gateway.Gateway, store 
 		logCollector:  collector,
 		workflowStore: NewWorkflowStore(),
 		teamStore:     NewTeamStore(defaultDataDir()),
+		ollamaBaseURL: defaultOllamaBaseURL,
 	}
 }
 
