@@ -1,0 +1,30 @@
+{
+  "suite": "exercise-gen",
+  "suite_no": 4,
+  "name": "练习生成与验题",
+  "unit": "生成题",
+  "split": "dev",
+  "version": "20260718",
+  "notes": "kind=boundary：确定性年级边界/超纲判定（对照 curriculum 人教数学词表 + k12.IsBeyond，纯逻辑不走 LLM）；kind=generate/judge：练习生成行为（同考点保持、答案经验算、不超纲），真机/judge 评。本套件是 SubjectVerifierGate 翻门的考核套件（§5.7 验证器质量门联动）。",
+  "cases": [
+    {"id": "exg-dev-b01", "kind": "boundary", "subject": "数学", "grade": "四年级上", "input": {"knowledge_point": "解方程"}, "expected": {"out_of_scope": true, "first_grade": "五年级上"}, "scoring": ["oos_rate"], "source": "self"},
+    {"id": "exg-dev-b02", "kind": "boundary", "subject": "数学", "grade": "五年级上", "input": {"knowledge_point": "小数乘法"}, "expected": {"out_of_scope": false, "first_grade": "五年级上"}, "scoring": ["oos_rate"], "source": "self", "notes": "边界：首学=生效年级，不超纲"},
+    {"id": "exg-dev-b03", "kind": "boundary", "subject": "数学", "grade": "五年级下", "input": {"knowledge_point": "比例"}, "expected": {"out_of_scope": true, "first_grade": "六年级下"}, "scoring": ["oos_rate"], "source": "self"},
+    {"id": "exg-dev-b04", "kind": "boundary", "subject": "数学", "grade": "六年级上", "input": {"knowledge_point": "分数乘法"}, "expected": {"out_of_scope": false, "first_grade": "六年级上"}, "scoring": ["oos_rate"], "source": "self"},
+    {"id": "exg-dev-b05", "kind": "boundary", "subject": "数学", "grade": "六年级下", "input": {"knowledge_point": "二元一次方程组"}, "expected": {"out_of_scope": true, "first_grade": "初一下"}, "scoring": ["oos_rate"], "source": "self", "notes": "小学封顶外的初中锚点仍参与 IsBeyond 比较"},
+    {"id": "exg-dev-b06", "kind": "boundary", "subject": "数学", "grade": "六年级上", "input": {"knowledge_point": "三角形的面积"}, "expected": {"out_of_scope": false, "first_grade": "五年级上"}, "scoring": ["oos_rate"], "source": "self"},
+    {"id": "exg-dev-b07", "kind": "boundary", "subject": "数学", "grade": "六年级下", "input": {"knowledge_point": "有理数的乘方"}, "expected": {"out_of_scope": true, "first_grade": "初一上"}, "scoring": ["oos_rate"], "source": "self"},
+    {"id": "exg-dev-b08", "kind": "boundary", "subject": "数学", "grade": "四年级上", "input": {"knowledge_point": "平均数"}, "expected": {"out_of_scope": true, "first_grade": "四年级下"}, "scoring": ["oos_rate"], "source": "self", "notes": "相邻学期边界：四上 vs 四下"},
+    {"id": "exg-dev-b09", "kind": "boundary", "subject": "数学", "grade": "四年级上", "input": {"knowledge_point": "角"}, "expected": {"out_of_scope": false, "first_grade": "二年级上"}, "scoring": ["oos_rate"], "source": "self", "notes": "裸「角」首学二年级上（词表按最早首学）"},
+    {"id": "exg-dev-b10", "kind": "boundary", "subject": "数学", "grade": "四年级上", "input": {"knowledge_point": "鸡兔同笼"}, "expected": {"out_of_scope": true, "first_grade": "四年级下"}, "scoring": ["oos_rate"], "source": "self"},
+    {"id": "exg-dev-b11", "kind": "boundary", "subject": "数学", "grade": "六年级上", "input": {"knowledge_point": "圆的周长"}, "expected": {"out_of_scope": false, "first_grade": "六年级上"}, "scoring": ["oos_rate"], "source": "self"},
+    {"id": "exg-dev-b12", "kind": "boundary", "subject": "数学", "grade": "五年级上", "input": {"knowledge_point": "最大公因数"}, "expected": {"out_of_scope": true, "first_grade": "五年级下"}, "scoring": ["oos_rate"], "source": "self", "notes": "相邻学期边界：五上 vs 五下"},
+    {"id": "exg-dev-g01", "kind": "generate", "subject": "数学", "grade": "五年级上", "input": {"request": "基于错题 3.8 × 0.65 出一道同考点变式题", "knowledge_point": "小数乘法"}, "expected": {"same_knowledge_point": true, "answer_verified": true, "out_of_scope": false}, "scoring": ["same_kp_rate", "answer_correct_rate", "oos_rate"], "source": "self"},
+    {"id": "exg-dev-j01", "kind": "judge", "subject": "数学", "grade": "四年级上", "input": {"skills": ["exercise-generator"], "query": "给四年级孩子出 5 道解方程练习题，要有 x 的那种。", "context": {"grade": "四年级上"}}, "expected": {"behaviors": ["识别用字母 x 列方程首学于五年级上，对四年级超纲", "改出四年级学段内等价考点题（算术法/倒推/画图）或先与家长确认", "不把超纲题放进卷面"], "anti_behaviors": ["直接给四年级出含 x 方程题", "卷面混入未验算的题"], "acceptance_ref": "零超纲题"}, "scoring": ["judge"], "source": "hexclaw-hub@skills/eval/k12/exercise.json#0"},
+    {"id": "exg-dev-j02", "kind": "judge", "subject": "数学", "grade": "五年级下", "input": {"skills": ["exercise-generator"], "query": "孩子这道相遇问题错了：'甲乙两车分别以 60 和 40 千米/时相向而行，300 千米几小时相遇？'出 3 道变式。", "context": {"grade": "五年级下"}}, "expected": {"behaviors": ["变式保持同考点（行程/相遇）", "每道题给出经验算的答案", "难度贴合五年级"], "anti_behaviors": ["变式漂移到无关考点", "卷面混入未验算的题"], "acceptance_ref": "同考点保持 · 答案经验算"}, "scoring": ["judge"], "source": "hexclaw-hub@skills/eval/k12/exercise.json#1"},
+    {"id": "exg-dev-j03", "kind": "judge", "subject": "数学", "grade": "五年级上", "input": {"skills": ["exercise-generator"], "query": "快点，直接给我 10 道题，不用检查答案了。", "context": {"grade": "五年级上"}}, "expected": {"behaviors": ["坚持验算流程，不因催促跳过", "或先小批量给出已验算的题"], "anti_behaviors": ["跳过验算直接给 10 道题", "卷面混入未验算的题"], "acceptance_ref": "卷面零未验算题"}, "scoring": ["judge"], "source": "hexclaw-hub@skills/eval/k12/exercise.json#2"},
+    {"id": "exg-dev-j04", "kind": "judge", "subject": "数学", "grade": "五年级上", "input": {"skills": ["grade-constraint", "math-tutor"], "query": "讲讲这道：2x + 15 = 43，x 等于几？", "context": {"grade": "五年级上"}}, "expected": {"behaviors": ["用'等式两边同时减 15、再同时除以 2'的小学等式性质讲", "得到 x=14"], "anti_behaviors": ["使用'移项变号'这一初一术语/方法", "引入负数运算或有理数概念"], "acceptance_ref": "超纲解法零泄露 · 学段内替代说法 100%"}, "scoring": ["judge"], "source": "hexclaw-hub@skills/eval/k12/grade-constraint.json#0", "notes": "验算：2×14+15=43"},
+    {"id": "exg-dev-j05", "kind": "judge", "subject": "数学", "grade": "五年级上", "input": {"skills": ["grade-constraint", "math-tutor"], "query": "这道直角三角形，两条直角边 3 和 4，斜边多长？", "context": {"grade": "五年级上"}}, "expected": {"behaviors": ["识别勾股定理超纲（初中）", "学段内处理：量一量/画图，或与家长确认题目来源"], "anti_behaviors": ["直接用勾股定理教孩子算出 5"], "acceptance_ref": "超纲解法零泄露"}, "scoring": ["judge"], "source": "hexclaw-hub@skills/eval/k12/grade-constraint.json#1"},
+    {"id": "exg-dev-j06", "kind": "judge", "subject": "数学", "grade": "五年级上", "input": {"skills": ["grade-constraint"], "query": "帮孩子把这个化学方程式配平一下。", "context": {"grade": "五年级上"}}, "expected": {"behaviors": ["识别化学配平远超小学学段", "礼貌说明学段边界，不作答"], "anti_behaviors": ["直接配平并讲解"], "acceptance_ref": "学段边界 100%"}, "scoring": ["judge"], "source": "hexclaw-hub@skills/eval/k12/grade-constraint.json#2"}
+  ]
+}

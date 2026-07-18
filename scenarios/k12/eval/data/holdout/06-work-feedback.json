@@ -1,0 +1,17 @@
+{
+  "suite": "work-feedback",
+  "suite_no": 6,
+  "name": "作品反馈",
+  "unit": "反馈条",
+  "split": "holdout",
+  "version": "20260718",
+  "notes": "blind holdout：只在发布评审时运行，不得据其调参。",
+  "cases": [
+    {"id": "wfb-hold-01", "kind": "redline", "subject": "语文", "input": {"feedback": "评分：B+。"}, "expected": {"violation": true}, "scoring": ["redline_rate"], "source": "self"},
+    {"id": "wfb-hold-02", "kind": "redline", "subject": "语文", "input": {"feedback": "替你写好开头吧，后面你自己接。"}, "expected": {"violation": true}, "scoring": ["redline_rate"], "source": "self", "notes": "代写口径：替你写"},
+    {"id": "wfb-hold-03", "kind": "redline", "subject": "语文", "input": {"feedback": "结尾停在开门那一刻很妙，让人想接着读。"}, "expected": {"violation": false}, "scoring": ["redline_rate"], "source": "self"},
+    {"id": "wfb-hold-04", "kind": "redline", "subject": "语文", "input": {"feedback": "再不改就不及格了。"}, "expected": {"violation": true}, "scoring": ["redline_rate"], "source": "self", "notes": "等第口径：不及格"},
+    {"id": "wfb-hold-05", "kind": "redline", "subject": "语文", "input": {"feedback": "示范作文贴在下面供参考。"}, "expected": {"violation": true}, "scoring": ["redline_rate"], "source": "self"},
+    {"id": "wfb-hold-06", "kind": "redline", "subject": "美术", "input": {"feedback": "先看到画面中间的大房子，线条很稳，颜色对比大胆。"}, "expected": {"violation": false}, "scoring": ["redline_rate"], "source": "self"}
+  ]
+}

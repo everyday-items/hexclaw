@@ -1,0 +1,70 @@
+{
+  "report_id": "k12eval-0abdd7b28ca611e6",
+  "split": "dev",
+  "provider": "openai",
+  "model": "gpt-5.6-sol",
+  "holdout_manifest_sha256": "ce549ebf566ddbcfe0147c02b8ae2520f3e5301ea1620bc8436f0aee6a4181c2",
+  "generated_at": "2026-07-18T07:18:51Z",
+  "case_limit_per_suite": 8,
+  "suites": [
+    {
+      "suite": "ocr",
+      "suite_no": 1,
+      "mode": "not_wired",
+      "total": 0,
+      "passed": 0,
+      "pass_rate": 0,
+      "notes": "真实照片资产待采集（§5.7 每学科 ≥100 张）；字段 ground truth 已备好"
+    },
+    {
+      "suite": "alignment",
+      "suite_no": 2,
+      "mode": "not_wired",
+      "total": 0,
+      "passed": 0,
+      "pass_rate": 0,
+      "notes": "照片题→卷内题对齐器尚无独立纯函数；数据契约已钉"
+    },
+    {
+      "suite": "judgment",
+      "suite_no": 3,
+      "mode": "real_llm",
+      "total": 8,
+      "passed": 8,
+      "pass_rate": 1,
+      "coverage": 1,
+      "weighted_risk": 0,
+      "confusion_matrix": {
+        "true_right_judged_right": 4,
+        "true_right_judged_wrong": 0,
+        "true_wrong_judged_right": 0,
+        "true_wrong_judged_wrong": 3,
+        "needs_review": 0
+      }
+    },
+    {
+      "suite": "exercise-gen",
+      "suite_no": 4,
+      "mode": "deterministic",
+      "total": 12,
+      "passed": 12,
+      "pass_rate": 1
+    },
+    {
+      "suite": "answer-leak",
+      "suite_no": 5,
+      "mode": "deterministic",
+      "total": 10,
+      "passed": 10,
+      "pass_rate": 1
+    },
+    {
+      "suite": "work-feedback",
+      "suite_no": 6,
+      "mode": "deterministic",
+      "total": 12,
+      "passed": 12,
+      "pass_rate": 1
+    }
+  ]
+}

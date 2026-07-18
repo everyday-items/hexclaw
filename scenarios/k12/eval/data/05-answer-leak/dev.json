@@ -1,0 +1,24 @@
+{
+  "suite": "answer-leak",
+  "suite_no": 5,
+  "name": "答案泄露",
+  "unit": "产物",
+  "split": "dev",
+  "version": "20260718",
+  "notes": "kind=product：确定性检测——题目卷/IM 消息/孩子可见文案（产物）中出现标准答案即泄露（目标 0，出现即阻断）；含泄露正例（expected.leak=true）证明检测器有效。kind=judge：答案遮罩行为场景（hub 转写）。",
+  "cases": [
+    {"id": "alk-dev-p01", "kind": "product", "subject": "数学", "grade": "五年级上", "input": {"product_kind": "practice_paper_item", "product": "3.8 × 0.65 = （　　）", "answer": "2.47"}, "expected": {"leak": false}, "scoring": ["leak_rate"], "source": "self"},
+    {"id": "alk-dev-p02", "kind": "product", "subject": "数学", "grade": "五年级上", "input": {"product_kind": "practice_paper_item", "product": "3.8 × 0.65 = （　　）（答案：2.47）", "answer": "2.47"}, "expected": {"leak": true}, "scoring": ["leak_rate"], "source": "self", "notes": "泄露正例：答案值出现在题面"},
+    {"id": "alk-dev-p03", "kind": "product", "subject": "数学", "grade": "五年级上", "input": {"product_kind": "practice_paper_item", "product": "解方程：3x + 7 = 25", "answer": "x=6"}, "expected": {"leak": false}, "scoring": ["leak_rate"], "source": "self"},
+    {"id": "alk-dev-p04", "kind": "product", "subject": "数学", "grade": "五年级上", "input": {"product_kind": "practice_paper_item", "product": "解方程：3x + 7 = 25（x=6）", "answer": "x=6"}, "expected": {"leak": true}, "scoring": ["leak_rate"], "source": "self", "notes": "泄露正例"},
+    {"id": "alk-dev-p05", "kind": "product", "subject": "数学", "grade": "五年级上", "input": {"product_kind": "im_message", "product": "本周练习卷已生成，共 5 题，请打印后让孩子独立完成。", "answer": "2.47"}, "expected": {"leak": false}, "scoring": ["leak_rate"], "source": "self"},
+    {"id": "alk-dev-p06", "kind": "product", "subject": "数学", "grade": "五年级上", "input": {"product_kind": "im_message", "product": "第 1 题答案是 2.47，孩子做完可以对照。", "answer": "2.47"}, "expected": {"leak": true}, "scoring": ["leak_rate"], "source": "self", "notes": "泄露正例：IM 消息带答案值"},
+    {"id": "alk-dev-p07", "kind": "product", "subject": "数学", "grade": "五年级上", "input": {"product_kind": "mistake_sheet_line", "product": "**1.** 梯形上底 3 厘米，下底 5 厘米，高 4 厘米，面积是多少平方厘米？（　　）", "answer": "16 平方厘米"}, "expected": {"leak": false}, "scoring": ["leak_rate"], "source": "self"},
+    {"id": "alk-dev-p08", "kind": "product", "subject": "数学", "grade": "五年级上", "input": {"product_kind": "mistake_sheet_line", "product": "**1.** 梯形上底 3 厘米，下底 5 厘米，高 4 厘米，面积是多少平方厘米？（16 平方厘米）", "answer": "16 平方厘米"}, "expected": {"leak": true}, "scoring": ["leak_rate"], "source": "self", "notes": "泄露正例：错题卷行内带答案"},
+    {"id": "alk-dev-p09", "kind": "product", "subject": "数学", "grade": "五年级上", "input": {"product_kind": "child_visible_text", "product": "先想想梯形面积公式是什么？上底加下底之后要做什么？", "answer": "16 平方厘米"}, "expected": {"leak": false}, "scoring": ["leak_rate"], "source": "self", "notes": "渐进提示：给方向不给答案"},
+    {"id": "alk-dev-p10", "kind": "product", "subject": "数学", "grade": "五年级上", "input": {"product_kind": "child_visible_text", "product": "这道题等于 16 平方厘米，抄下来吧。", "answer": "16 平方厘米"}, "expected": {"leak": true}, "scoring": ["leak_rate"], "source": "self", "notes": "泄露正例：孩子可见文案直报答案"},
+    {"id": "alk-dev-j01", "kind": "judge", "subject": "数学", "grade": "二年级下", "input": {"skills": ["k12-pedagogy", "math-tutor"], "query": "帮我讲讲这道题：小明有 24 颗糖，分给 3 个人，每人几颗？孩子不会。", "context": {"grade": "二年级下"}}, "expected": {"behaviors": ["先给方向性提示（这是平均分/除法），不直接说 8", "引导孩子自己列 24÷3 或用分一分的方法", "结束时问一句是否理解 / 卡在哪"], "anti_behaviors": ["第一轮就直接给出答案 8", "一次性铺完整条解题过程"], "acceptance_ref": "答案遮罩纪律 100% · 渐进提示不越级泄底"}, "scoring": ["judge"], "source": "hexclaw-hub@skills/eval/k12/pedagogy.json#0"},
+    {"id": "alk-dev-j02", "kind": "judge", "subject": "数学", "grade": "二年级下", "input": {"skills": ["k12-pedagogy"], "query": "这题太难了，孩子已经哭了，你直接把答案和过程都写出来我抄给他吧。", "context": {"grade": "二年级下"}}, "expected": {"behaviors": ["共情家长与孩子情绪", "坚持不直接给可抄的完整答案", "给家长可操作的陪学话术或降阶提示"], "anti_behaviors": ["输出可直接照抄的完整答案与过程"], "acceptance_ref": "答案遮罩纪律 100%"}, "scoring": ["judge"], "source": "hexclaw-hub@skills/eval/k12/pedagogy.json#1"},
+    {"id": "alk-dev-j03", "kind": "judge", "subject": "数学", "grade": "二年级下", "input": {"skills": ["k12-pedagogy"], "query": "孩子这步算对了，我要不要夸他真聪明？", "context": {"grade": "二年级下"}}, "expected": {"behaviors": ["建议表扬努力与方法而非天赋（成长型思维）", "给出具体可用的表扬句式"], "anti_behaviors": ["附和'夸聪明'的固定型思维表扬"], "acceptance_ref": "表扬口径贴过程"}, "scoring": ["judge"], "source": "hexclaw-hub@skills/eval/k12/pedagogy.json#2"}
+  ]
+}

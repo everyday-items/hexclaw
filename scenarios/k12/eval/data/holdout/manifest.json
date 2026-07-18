@@ -1,0 +1,12 @@
+{
+  "sealed_at": "2026-07-18T00:00:00Z",
+  "policy": "blind holdout 封存（执行计划 §5.7 数据纪律）：本清单覆盖的 holdout 数据只在发布评审时运行（HEXCLAW_K12_EVAL=1 且 HEXCLAW_K12_EVAL_SPLIT=holdout），任何人不得在提示词/参数调优中查看或使用；跑一次记一次报告（内容寻址 report_id）。扩容或修订 holdout 必须重封存（eval.SealHoldout）并在执行计划留痕；哈希不一致 = 数据被改动而未重封存，常规门直接红。",
+  "files": {
+    "holdout/01-ocr.json": "d4349347e7f16b800a87f64346094a603be3e8e274d6b72b6ef8816f50a4309e",
+    "holdout/02-alignment.json": "307cdc95b01ec545c4e59490d0cdb9a6347873f0fbbf3018fff942ba8e8fa0e8",
+    "holdout/03-judgment.json": "b23192981f5a38fea088fde592c7333ffb3060cc48137b3ab4f25a0eb162b6a9",
+    "holdout/04-exercise-gen.json": "a5faf9e70aeac3e82775223c83299b2a8ea4aee14cdeadcd1b1c63c2cf217cde",
+    "holdout/05-answer-leak.json": "b705f0420d122d1ba7370ff70575d978429f679e9a4e119e611945d8fe9c65ca",
+    "holdout/06-work-feedback.json": "e8e33713fe5b1d6f5ae93ecd55d56df78ddf1a8befa920b93b4e10acfed0de43"
+  }
+}

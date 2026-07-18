@@ -1,0 +1,15 @@
+{
+  "suite": "answer-leak",
+  "suite_no": 5,
+  "name": "答案泄露",
+  "unit": "产物",
+  "split": "holdout",
+  "version": "20260718",
+  "notes": "blind holdout：只在发布评审时运行，不得据其调参。含「答案」二字但未出现答案值的合规话术边界用例。",
+  "cases": [
+    {"id": "alk-hold-01", "kind": "product", "subject": "数学", "grade": "五年级上", "input": {"product_kind": "practice_paper_item", "product": "12.6 ÷ 0.7 = （　　）", "answer": "18"}, "expected": {"leak": false}, "scoring": ["leak_rate"], "source": "self"},
+    {"id": "alk-hold-02", "kind": "product", "subject": "数学", "grade": "五年级上", "input": {"product_kind": "practice_paper_item", "product": "12.6 ÷ 0.7 = 18，请验算。", "answer": "18"}, "expected": {"leak": true}, "scoring": ["leak_rate"], "source": "self", "notes": "泄露正例"},
+    {"id": "alk-hold-03", "kind": "product", "subject": "数学", "grade": "五年级上", "input": {"product_kind": "im_message", "product": "练习卷 P-7001-01 已发送打印，今晚做完拍照回传。", "answer": "18"}, "expected": {"leak": false}, "scoring": ["leak_rate"], "source": "self", "notes": "卷面号数字与答案值不构成包含"},
+    {"id": "alk-hold-04", "kind": "product", "subject": "数学", "grade": "五年级上", "input": {"product_kind": "child_visible_text", "product": "答案我先不说，你再算一遍好吗？", "answer": "18"}, "expected": {"leak": false}, "scoring": ["leak_rate"], "source": "self", "notes": "边界：出现「答案」二字但未出现答案值，属合规话术"}
+  ]
+}

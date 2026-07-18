@@ -1,0 +1,13 @@
+{
+  "suite": "alignment",
+  "suite_no": 2,
+  "name": "题目对齐",
+  "unit": "题",
+  "split": "holdout",
+  "version": "20260718",
+  "notes": "blind holdout：只在发布评审时运行，不得据其调参。",
+  "cases": [
+    {"id": "aln-hold-01", "kind": "align", "subject": "数学", "grade": "五年级上", "input": {"photo_questions": [{"number": null, "text": "4.06×2.5="}, {"number": null, "text": "三角形底8高5面积"}], "paper_items": [{"paper_seq": 1, "question": "4.06 × 2.5 = （　　）"}, {"paper_seq": 2, "question": "三角形底 8 厘米，高 5 厘米，面积是多少平方厘米？"}]}, "expected": {"mapping": {"1": 1, "2": 2}}, "scoring": ["match_accuracy"], "source": "self"},
+    {"id": "aln-hold-02", "kind": "align", "subject": "数学", "grade": "五年级上", "input": {"photo_questions": [{"number": 2, "text": "三角形底8高5面积"}], "paper_items": [{"paper_seq": 1, "question": "4.06 × 2.5 = （　　）"}, {"paper_seq": 2, "question": "三角形底 8 厘米，高 5 厘米，面积是多少平方厘米？"}]}, "expected": {"mapping": {"1": 2}, "unmatched_paper": [1]}, "scoring": ["match_accuracy"], "source": "self", "notes": "只回传一题：缺席题显式报告"}
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "suite": "ocr",
+  "suite_no": 1,
+  "name": "OCR 识别",
+  "unit": "字段",
+  "split": "dev",
+  "version": "20260718",
+  "notes": "kind=field_extraction：字段级 ground truth（题干/作答/单位）已备好，photo_asset 为空 = 真实照片待采集（§5.7 每学科 ≥100 张覆盖手写/多题/多页/密集/歪斜/涂改——照片不可捏造，采集留专门批，本套件在照片就位前 runner 标 not_wired）。kind=judge：识题回显护栏行为场景（hub 转写）。",
+  "cases": [
+    {"id": "ocr-dev-01", "kind": "field_extraction", "subject": "数学", "grade": "五年级上", "input": {"photo_asset": "", "page_desc": "手写竖式：3.8×0.65，学生在横线上写答案 2.47"}, "expected": {"fields": {"stem": "3.8×0.65=", "student_answer": "2.47", "unit": ""}}, "scoring": ["field_accuracy", "char_error_rate"], "source": "self"},
+    {"id": "ocr-dev-02", "kind": "field_extraction", "subject": "数学", "grade": "五年级上", "input": {"photo_asset": "", "page_desc": "手写解方程：2x+15=43，学生写 x=14"}, "expected": {"fields": {"stem": "解方程：2x+15=43", "student_answer": "x=14", "unit": ""}}, "scoring": ["field_accuracy", "char_error_rate"], "source": "hexclaw-hub@skills/eval/k12/recognize.json#0", "notes": "验算：2×14+15=43"},
+    {"id": "ocr-dev-03", "kind": "field_extraction", "subject": "数学", "grade": "五年级上", "input": {"photo_asset": "", "page_desc": "应用题：苹果 3.8 元/千克，买 2.5 千克，学生写 9.5 元"}, "expected": {"fields": {"stem": "苹果每千克 3.8 元，买 2.5 千克要多少元？", "student_answer": "9.5", "unit": "元"}}, "scoring": ["field_accuracy", "char_error_rate"], "source": "hexclaw-hub@skills/eval/k12/recognize.json#0", "notes": "验算：3.8×2.5=9.5"},
+    {"id": "ocr-dev-04", "kind": "field_extraction", "subject": "语文", "grade": "三年级上", "input": {"photo_asset": "", "page_desc": "默写题，学生手写「凝是地上霜」（错字）"}, "expected": {"fields": {"stem": "床前明月光，＿＿＿", "student_answer": "凝是地上霜", "unit": ""}}, "scoring": ["field_accuracy", "char_error_rate"], "source": "self", "notes": "OCR 必须忠实识别学生写的错字，不得自动纠正为「疑」"},
+    {"id": "ocr-dev-05", "kind": "field_extraction", "subject": "英语", "grade": "五年级上", "input": {"photo_asset": "", "page_desc": "听写页，学生手写 libary（拼写错）"}, "expected": {"fields": {"stem": "图书馆", "student_answer": "libary", "unit": ""}}, "scoring": ["field_accuracy", "char_error_rate"], "source": "self", "notes": "忠实识别拼写错误，不得自动纠正"},
+    {"id": "ocr-dev-06", "kind": "field_extraction", "subject": "数学", "grade": "四年级上", "input": {"photo_asset": "", "page_desc": "多题密集页第 3 题：126×23 竖式，学生答 2898"}, "expected": {"fields": {"stem": "126×23=", "student_answer": "2898", "unit": ""}}, "scoring": ["field_accuracy", "char_error_rate"], "source": "self"},
+    {"id": "ocr-dev-07", "kind": "field_extraction", "subject": "数学", "grade": "五年级上", "input": {"photo_asset": "", "page_desc": "歪斜拍摄：梯形面积应用题，学生答 16 平方厘米"}, "expected": {"fields": {"stem": "梯形上底 3 厘米，下底 5 厘米，高 4 厘米，面积是多少平方厘米？", "student_answer": "16", "unit": "平方厘米"}}, "scoring": ["field_accuracy", "char_error_rate"], "source": "self"},
+    {"id": "ocr-dev-08", "kind": "field_extraction", "subject": "数学", "grade": "四年级下", "input": {"photo_asset": "", "page_desc": "涂改：平均分题，学生先写 88 划掉改为 89"}, "expected": {"fields": {"stem": "86、92、95、83 的平均数是多少？", "student_answer": "89", "unit": ""}}, "scoring": ["field_accuracy", "char_error_rate"], "source": "self", "notes": "涂改取最终作答"},
+    {"id": "ocr-dev-j01", "kind": "judge", "subject": "数学", "grade": "五年级上", "input": {"skills": ["homework-checker"], "query": "[家长上传一页数学作业照片，含手写：竖式 2.8×0.65、解方程 2x+15=43、苹果 3.8 元/千克买 2.5 千克]", "context": {"grade": "五年级上", "has_image": true}}, "expected": {"behaviors": ["识别后先把读到的数字/条件念一遍让家长核对，再解题", "把整页拆成有序题目清单让家长选题", "每题标注知识点"], "anti_behaviors": ["跳过回显核对直接开始批改", "把识别当成 100% 准确不给家长纠错机会"], "acceptance_ref": "识题回显护栏 100%"}, "scoring": ["judge"], "source": "hexclaw-hub@skills/eval/k12/recognize.json#0"},
+    {"id": "ocr-dev-j02", "kind": "judge", "subject": "数学", "grade": "五年级上", "input": {"skills": ["homework-checker"], "query": "[照片里有一个手写数字潦草，可能是 7 也可能是 1]", "context": {"grade": "五年级上", "has_image": true}}, "expected": {"behaviors": ["不确定字符标 [?] 并明确请家长确认", "不猜测后直接往下算"], "anti_behaviors": ["把不确定字符当确定值使用"], "acceptance_ref": "不确定标 [?] 不猜"}, "scoring": ["judge"], "source": "hexclaw-hub@skills/eval/k12/recognize.json#1"},
+    {"id": "ocr-dev-j03", "kind": "judge", "subject": "数学", "grade": "五年级上", "input": {"skills": ["homework-checker"], "query": "[照片是一页混合作业：3 道数学 + 2 道语文]", "context": {"grade": "五年级上", "has_image": true}}, "expected": {"behaviors": ["按学科分组拆成题目清单", "分别标注学科与知识点"], "anti_behaviors": ["混排不分学科", "丢题"], "acceptance_ref": "整页拆题完整"}, "scoring": ["judge"], "source": "hexclaw-hub@skills/eval/k12/recognize.json#2"}
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "suite": "ocr",
+  "suite_no": 1,
+  "name": "OCR 识别",
+  "unit": "字段",
+  "split": "holdout",
+  "version": "20260718",
+  "notes": "blind holdout：只在发布评审时运行，不得据其调参。photo_asset 为空 = 真实照片待采集（与 dev 同口径的数据欠账）。",
+  "cases": [
+    {"id": "ocr-hold-01", "kind": "field_extraction", "subject": "数学", "grade": "五年级上", "input": {"photo_asset": "", "page_desc": "手写竖式：4.06×2.5，学生答 10.15"}, "expected": {"fields": {"stem": "4.06×2.5=", "student_answer": "10.15", "unit": ""}}, "scoring": ["field_accuracy", "char_error_rate"], "source": "self", "notes": "验算：4.06×2.5=10.15"},
+    {"id": "ocr-hold-02", "kind": "field_extraction", "subject": "英语", "grade": "五年级上", "input": {"photo_asset": "", "page_desc": "听写页，学生手写 Wensday（拼写错）"}, "expected": {"fields": {"stem": "星期三", "student_answer": "Wensday", "unit": ""}}, "scoring": ["field_accuracy", "char_error_rate"], "source": "self"},
+    {"id": "ocr-hold-03", "kind": "field_extraction", "subject": "语文", "grade": "三年级上", "input": {"photo_asset": "", "page_desc": "默写题，学生手写「黄河入海流」"}, "expected": {"fields": {"stem": "白日依山尽，＿＿＿", "student_answer": "黄河入海流", "unit": ""}}, "scoring": ["field_accuracy", "char_error_rate"], "source": "self"}
+  ]
+}

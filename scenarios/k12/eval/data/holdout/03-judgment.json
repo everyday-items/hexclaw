@@ -1,0 +1,25 @@
+{
+  "suite": "judgment",
+  "suite_no": 3,
+  "name": "逐题判定",
+  "unit": "题",
+  "split": "holdout",
+  "version": "20260718",
+  "notes": "blind holdout：只在发布评审时运行，任何人不得据其调参（流程契约见 eval/README.md）。与 dev 集语义独立，逐题已独立验算。",
+  "cases": [
+    {"id": "jud-hold-01", "kind": "grade", "subject": "数学", "grade": "五年级上", "input": {"problem": "4.06 × 2.5 = ?", "student_answer": "10.15", "knowledge_points": ["小数乘法"]}, "expected": {"correct": true}, "scoring": ["confusion_matrix"], "source": "self", "notes": "验算：4.06×2=8.12，4.06×0.5=2.03，和=10.15"},
+    {"id": "jud-hold-02", "kind": "grade", "subject": "数学", "grade": "五年级上", "input": {"problem": "4.06 × 2.5 = ?", "student_answer": "101.5", "knowledge_points": ["小数乘法"]}, "expected": {"correct": false}, "scoring": ["confusion_matrix"], "source": "self"},
+    {"id": "jud-hold-03", "kind": "grade", "subject": "数学", "grade": "五年级下", "input": {"problem": "5/6 − 1/2 = ?", "student_answer": "1/3", "knowledge_points": ["异分母分数加减法"]}, "expected": {"correct": true}, "scoring": ["confusion_matrix"], "source": "self", "notes": "验算：5/6−3/6=2/6=1/3"},
+    {"id": "jud-hold-04", "kind": "grade", "subject": "数学", "grade": "五年级下", "input": {"problem": "5/6 − 1/2 = ?", "student_answer": "2/3", "knowledge_points": ["异分母分数加减法"]}, "expected": {"correct": false}, "scoring": ["confusion_matrix"], "source": "self", "notes": "未约分口径干扰：2/6 才等值，2/3 是通分错误"},
+    {"id": "jud-hold-05", "kind": "grade", "subject": "数学", "grade": "五年级上", "input": {"problem": "解方程：5x − 9 = 26", "student_answer": "x = 7", "knowledge_points": ["解方程"]}, "expected": {"correct": true}, "scoring": ["confusion_matrix"], "source": "self", "notes": "验算：5×7−9=26"},
+    {"id": "jud-hold-06", "kind": "grade", "subject": "数学", "grade": "五年级上", "input": {"problem": "解方程：5x − 9 = 26", "student_answer": "x = 5", "knowledge_points": ["解方程"]}, "expected": {"correct": false}, "scoring": ["confusion_matrix"], "source": "self"},
+    {"id": "jud-hold-07", "kind": "grade", "subject": "数学", "grade": "五年级上", "input": {"problem": "三角形底 8 厘米，高 5 厘米，面积是多少平方厘米？", "student_answer": "20 平方厘米", "knowledge_points": ["三角形的面积"]}, "expected": {"correct": true}, "scoring": ["confusion_matrix"], "source": "self", "notes": "验算：8×5÷2=20"},
+    {"id": "jud-hold-08", "kind": "grade", "subject": "数学", "grade": "五年级上", "input": {"problem": "三角形底 8 厘米，高 5 厘米，面积是多少平方厘米？", "student_answer": "40 平方厘米", "knowledge_points": ["三角形的面积"]}, "expected": {"correct": false}, "scoring": ["confusion_matrix"], "source": "self", "notes": "典型错误：忘记除以 2"},
+    {"id": "jud-hold-09", "kind": "grade", "subject": "语文", "grade": "三年级上", "input": {"problem": "默写《登鹳雀楼》：白日依山尽，＿＿＿", "student_answer": "黄河入海流"}, "expected": {"correct": true}, "scoring": ["confusion_matrix"], "source": "self"},
+    {"id": "jud-hold-10", "kind": "grade", "subject": "语文", "grade": "三年级上", "input": {"problem": "默写《登鹳雀楼》：白日依山尽，＿＿＿", "student_answer": "更上一层楼"}, "expected": {"correct": false}, "scoring": ["confusion_matrix"], "source": "self", "notes": "接错句：那是第四句"},
+    {"id": "jud-hold-11", "kind": "grade", "subject": "英语", "grade": "五年级上", "input": {"problem": "听写单词：星期三", "student_answer": "Wednesday"}, "expected": {"correct": true}, "scoring": ["confusion_matrix"], "source": "self"},
+    {"id": "jud-hold-12", "kind": "grade", "subject": "英语", "grade": "五年级上", "input": {"problem": "听写单词：星期三", "student_answer": "Wensday"}, "expected": {"correct": false}, "scoring": ["confusion_matrix"], "source": "self", "notes": "拼写错：漏 d-n-e 结构"},
+    {"id": "jud-hold-13", "kind": "oos", "subject": "数学", "grade": "四年级下", "input": {"problem": "一支笔 a 元，买 5 支要多少元？（用含字母的式子表示）", "knowledge_points": ["用字母表示数"]}, "expected": {"out_of_scope": true, "out_of_scope_kp": "用字母表示数"}, "scoring": ["oos_recall"], "source": "self", "notes": "用字母表示数首学五年级上，四年级下超纲"},
+    {"id": "jud-hold-14", "kind": "oos", "subject": "数学", "grade": "五年级下", "input": {"problem": "全班 40 人，男生占 55%，男生有多少人？", "knowledge_points": ["百分数"]}, "expected": {"out_of_scope": true, "out_of_scope_kp": "百分数"}, "scoring": ["oos_recall"], "source": "self", "notes": "百分数首学六年级上，五年级下超纲"}
+  ]
+}

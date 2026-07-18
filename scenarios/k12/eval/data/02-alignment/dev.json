@@ -1,0 +1,17 @@
+{
+  "suite": "alignment",
+  "suite_no": 2,
+  "name": "题目对齐",
+  "unit": "题",
+  "split": "dev",
+  "version": "20260718",
+  "notes": "照片题→卷内题匹配（含题号识别与顺序兜底）。mapping：照片题序(1-based)→paper_seq。生产尚无独立对齐纯函数（回传批改按逐题结论走 GradePracticeSetItems），本套件先钉数据契约，runner 待对齐器落地后接线（not_wired）。",
+  "cases": [
+    {"id": "aln-dev-01", "kind": "align", "subject": "数学", "grade": "五年级上", "input": {"photo_questions": [{"number": 1, "text": "3.8×0.65="}, {"number": 2, "text": "解方程 3x+7=25"}, {"number": 3, "text": "梯形上底3下底5高4面积"}], "paper_items": [{"paper_seq": 1, "question": "3.8 × 0.65 = （　　）"}, {"paper_seq": 2, "question": "解方程：3x + 7 = 25"}, {"paper_seq": 3, "question": "梯形上底 3 厘米，下底 5 厘米，高 4 厘米，面积是多少平方厘米？"}]}, "expected": {"mapping": {"1": 1, "2": 2, "3": 3}}, "scoring": ["match_accuracy"], "source": "self", "notes": "题号齐全的直通路径"},
+    {"id": "aln-dev-02", "kind": "align", "subject": "数学", "grade": "五年级上", "input": {"photo_questions": [{"number": null, "text": "3.8×0.65="}, {"number": null, "text": "解方程 3x+7=25"}], "paper_items": [{"paper_seq": 1, "question": "3.8 × 0.65 = （　　）"}, {"paper_seq": 2, "question": "解方程：3x + 7 = 25"}]}, "expected": {"mapping": {"1": 1, "2": 2}}, "scoring": ["match_accuracy"], "source": "self", "notes": "照片题号不可读：顺序兜底"},
+    {"id": "aln-dev-03", "kind": "align", "subject": "数学", "grade": "五年级上", "input": {"photo_questions": [{"number": 1, "text": "3.8×0.65="}, {"number": 3, "text": "梯形上底3下底5高4面积"}], "paper_items": [{"paper_seq": 1, "question": "3.8 × 0.65 = （　　）"}, {"paper_seq": 2, "question": "解方程：3x + 7 = 25"}, {"paper_seq": 3, "question": "梯形上底 3 厘米，下底 5 厘米，高 4 厘米，面积是多少平方厘米？"}]}, "expected": {"mapping": {"1": 1, "2": 3}, "unmatched_paper": [2]}, "scoring": ["match_accuracy"], "source": "self", "notes": "孩子跳过第 2 题：卷内题缺席要显式报告，不得错配"},
+    {"id": "aln-dev-04", "kind": "align", "subject": "数学", "grade": "五年级上", "input": {"photo_questions": [{"number": 2, "text": "解方程 3x+7=25"}, {"number": 1, "text": "3.8×0.65="}], "paper_items": [{"paper_seq": 1, "question": "3.8 × 0.65 = （　　）"}, {"paper_seq": 2, "question": "解方程：3x + 7 = 25"}]}, "expected": {"mapping": {"1": 2, "2": 1}}, "scoring": ["match_accuracy"], "source": "self", "notes": "照片顺序打乱但题号可读：按题号优先"},
+    {"id": "aln-dev-05", "kind": "align", "subject": "数学", "grade": "五年级上", "input": {"photo_questions": [{"number": 1, "text": "3.8×0.65="}, {"number": 2, "text": "解方程 3x+7=25"}, {"number": null, "text": "（草稿区涂鸦演算）"}], "paper_items": [{"paper_seq": 1, "question": "3.8 × 0.65 = （　　）"}, {"paper_seq": 2, "question": "解方程：3x + 7 = 25"}]}, "expected": {"mapping": {"1": 1, "2": 2}, "unmatched_photo": [3]}, "scoring": ["match_accuracy"], "source": "self", "notes": "照片多出的非题目内容不得硬配"},
+    {"id": "aln-dev-06", "kind": "align", "subject": "数学", "grade": "五年级上", "input": {"photo_questions": [{"number": 4, "text": "12.6÷0.7="}, {"number": 5, "text": "解方程 x+12=30"}], "paper_items": [{"paper_seq": 4, "question": "12.6 ÷ 0.7 = （　　）"}, {"paper_seq": 5, "question": "解方程：x + 12 = 30"}]}, "expected": {"mapping": {"1": 4, "2": 5}}, "scoring": ["match_accuracy"], "source": "self", "notes": "多页卷第二页：题号从 4 起，不得按页内顺序重编号"}
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "suite": "exercise-gen",
+  "suite_no": 4,
+  "name": "练习生成与验题",
+  "unit": "生成题",
+  "split": "holdout",
+  "version": "20260718",
+  "notes": "blind holdout：只在发布评审时运行，不得据其调参。科学/信息科技验证器翻门（SubjectVerifierGate）须以本套件 holdout 报告 ID 为证据。",
+  "cases": [
+    {"id": "exg-hold-01", "kind": "boundary", "subject": "数学", "grade": "五年级下", "input": {"knowledge_point": "解方程组"}, "expected": {"out_of_scope": true, "first_grade": "初一下"}, "scoring": ["oos_rate"], "source": "self"},
+    {"id": "exg-hold-02", "kind": "boundary", "subject": "数学", "grade": "五年级上", "input": {"knowledge_point": "负数"}, "expected": {"out_of_scope": true, "first_grade": "六年级下"}, "scoring": ["oos_rate"], "source": "self"},
+    {"id": "exg-hold-03", "kind": "boundary", "subject": "数学", "grade": "五年级下", "input": {"knowledge_point": "通分"}, "expected": {"out_of_scope": false, "first_grade": "五年级下"}, "scoring": ["oos_rate"], "source": "self"},
+    {"id": "exg-hold-04", "kind": "boundary", "subject": "数学", "grade": "六年级下", "input": {"knowledge_point": "平方根"}, "expected": {"out_of_scope": true, "first_grade": "初一下"}, "scoring": ["oos_rate"], "source": "self"},
+    {"id": "exg-hold-05", "kind": "boundary", "subject": "数学", "grade": "五年级上", "input": {"knowledge_point": "折线统计图"}, "expected": {"out_of_scope": true, "first_grade": "五年级下"}, "scoring": ["oos_rate"], "source": "self", "notes": "相邻学期边界"},
+    {"id": "exg-hold-06", "kind": "boundary", "subject": "数学", "grade": "四年级上", "input": {"knowledge_point": "条形统计图"}, "expected": {"out_of_scope": false, "first_grade": "四年级上"}, "scoring": ["oos_rate"], "source": "self"}
+  ]
+}
