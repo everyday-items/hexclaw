@@ -32,10 +32,12 @@ type LLMProviderConfigResponse struct {
 	Model        string   `json:"model"`
 	Models       []string `json:"models,omitempty"`
 	Compatible   string   `json:"compatible"`
+	Locality     string   `json:"locality,omitempty"`
 	ToolsEnabled *bool    `json:"tools_enabled,omitempty"`
 	MaxTools     int      `json:"max_tools,omitempty"`
 	Enabled      *bool    `json:"enabled,omitempty"`
 	KeepAlive    string   `json:"keep_alive,omitempty"`
+	NumCtx       int      `json:"num_ctx,omitempty"`
 }
 
 // LLMConfigUpdateRequest PUT /api/v1/config/llm 请求
@@ -53,10 +55,12 @@ type LLMProviderConfigUpdateItem struct {
 	Model        string   `json:"model"`
 	Models       []string `json:"models,omitempty"`
 	Compatible   string   `json:"compatible"`
+	Locality     string   `json:"locality,omitempty"`
 	ToolsEnabled *bool    `json:"tools_enabled,omitempty"`
 	MaxTools     int      `json:"max_tools,omitempty"`
 	Enabled      *bool    `json:"enabled,omitempty"`
 	KeepAlive    string   `json:"keep_alive,omitempty"`
+	NumCtx       int      `json:"num_ctx,omitempty"`
 }
 
 type llmConnectionTestProvider struct {
@@ -126,10 +130,12 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 			Model:        p.Model,
 			Models:       p.Models,
 			Compatible:   p.Compatible,
+			Locality:     p.Locality,
 			ToolsEnabled: p.ToolsEnabled,
 			MaxTools:     p.MaxTools,
 			Enabled:      p.Enabled,
 			KeepAlive:    p.KeepAlive,
+			NumCtx:       p.NumCtx,
 		}
 	}
 
@@ -157,6 +163,12 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 	// keep_alive 边界校验（C4）：非法值此前原样存盘 + 原样经 llmrouter 下发，直到 Ollama
 	// 首次聊天才 400。非事务路径（flag OFF）完全跳过 Config.Validate，故在此显式兜底。
 	for name, p := range req.Providers {
+		if !config.IsValidProviderLocality(p.Locality) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("provider %q 的 locality=%q 非法：应为 auto、local 或 cloud", name, p.Locality),
+			})
+			return
+		}
 		if !config.IsValidKeepAlive(p.KeepAlive) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{
 				"error": fmt.Sprintf("provider %q 的 keep_alive=%q 非法：应为 Go duration（如 30m/2h）、纯整数秒（如 3600）、0 或 -1", name, p.KeepAlive),
@@ -190,10 +202,12 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 				Model:        p.Model,
 				Models:       p.Models,
 				Compatible:   p.Compatible,
+				Locality:     p.Locality,
 				ToolsEnabled: p.ToolsEnabled,
 				MaxTools:     p.MaxTools,
 				Enabled:      p.Enabled, // 禁用态持久化；Key 经脱敏回传保留（IsMaskedKey 分支）
 				KeepAlive:    p.KeepAlive,
+				NumCtx:       p.NumCtx,
 			}
 		}
 		nextLLM.Providers = newProviders

@@ -633,6 +633,29 @@ func (r *Dispatcher) GetAgent(name string) (*AgentConfig, bool) {
 	return &cloned, true
 }
 
+// WithAgentLease runs fn while holding a read lease on an existing Agent.
+// Lifecycle-coupled writers (for example scenario cron provisioning) use this
+// to serialize their side effect with UnregisterPersisted's write lock:
+//
+//   - provisioning that starts first completes before deletion stages cleanup;
+//   - deletion that starts first removes the Agent before a new lease can pass.
+//
+// fn must not call another Dispatcher method, because the Go RWMutex is not
+// re-entrant. A cloned config is supplied so the callback cannot mutate router
+// state.
+func (r *Dispatcher) WithAgentLease(name string, fn func(AgentConfig) error) error {
+	if fn == nil {
+		return fmt.Errorf("agent lease callback 不能为空")
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cfg, ok := r.agents[name]
+	if !ok {
+		return fmt.Errorf("agent %q 未注册", name)
+	}
+	return fn(cloneAgentConfig(*cfg))
+}
+
 // DefaultAgent 返回默认 Agent 名称
 func (r *Dispatcher) DefaultAgent() string {
 	r.mu.RLock()

@@ -1237,8 +1237,26 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 // handleUnregisterAgent 注销 Agent（内存 + 持久化）
 func (s *Server) handleUnregisterAgent(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	agent, exists := s.agentRouter.GetAgent(name)
+	if !exists {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("agent %q 未注册", name)})
+		return
+	}
+
+	var rollbackResources func(context.Context) error
 	var persistErr error
+	var resourceErr error
 	err := s.agentRouter.UnregisterPersisted(name, func(name, nextDefault string, wasDefault bool) error {
+		// UnregisterPersisted holds the dispatcher write lock across this
+		// callback. Staging owned-resource cleanup here closes the provision vs
+		// delete race: a provisioner that validates through the same dispatcher
+		// cannot recreate schedules between cleanup and Agent removal.
+		if s.agentResources != nil {
+			rollbackResources, resourceErr = s.agentResources.DetachAgentResources(r.Context(), *agent)
+			if resourceErr != nil {
+				return fmt.Errorf("清理 Agent 归属资源失败: %w", resourceErr)
+			}
+		}
 		if s.agentStore == nil {
 			return nil
 		}
@@ -1257,7 +1275,18 @@ func (s *Server) handleUnregisterAgent(w http.ResponseWriter, r *http.Request) {
 		return persistErr
 	})
 	if err != nil {
-		if persistErr != nil {
+		if rollbackResources != nil {
+			// The request can already be canceled by the time persistence
+			// reports an error. Compensation must still get a chance to restore
+			// the resources staged above.
+			if rollbackErr := rollbackResources(context.WithoutCancel(r.Context())); rollbackErr != nil {
+				logger.Error("Agent 注销资源回滚失败", "agent", name, "error", rollbackErr)
+				err = fmt.Errorf("%w; 归属资源回滚失败: %v", err, rollbackErr)
+			}
+		}
+		if resourceErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": resourceErr.Error()})
+		} else if persistErr != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "持久化失败: " + persistErr.Error()})
 		} else {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})

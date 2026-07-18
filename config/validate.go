@@ -130,6 +130,14 @@ func (c *Config) Validate() error {
 
 	// 6. LLM provider keep_alive 格式（仅 Ollama 本地生效；非法值此前直达 Ollama 才 400）
 	for name, p := range c.LLM.Providers {
+		if !IsValidProviderLocality(p.Locality) {
+			errs = append(errs, &ValidationError{
+				Field:   fmt.Sprintf("llm.providers.%s.locality", name),
+				Value:   p.Locality,
+				Rule:    "auto / local / cloud",
+				Suggest: "本地反向代理云模型请选择 cloud；真正本机/LAN 模型请选择 local；不确定时留空或用 auto",
+			})
+		}
 		if !IsValidKeepAlive(p.KeepAlive) {
 			errs = append(errs, &ValidationError{
 				Field:   fmt.Sprintf("llm.providers.%s.keep_alive", name),

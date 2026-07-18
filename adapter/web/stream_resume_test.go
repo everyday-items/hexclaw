@@ -207,3 +207,89 @@ func TestWebAdapter_ResumeStreamSendsSnapshotAndContinuesStreaming(t *testing.T)
 		}
 	}
 }
+
+func TestBug20260717_DisconnectCancelsOrphanStreamAfterGrace(t *testing.T) {
+	a := New()
+	a.disconnectGrace = 20 * time.Millisecond
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	a.SetStreamHandler(func(ctx context.Context, _ *adapter.Message) (<-chan *adapter.ReplyChunk, error) {
+		chunks := make(chan *adapter.ReplyChunk)
+		close(started)
+		go func() {
+			<-ctx.Done()
+			close(canceled)
+			close(chunks)
+		}()
+		return chunks, nil
+	})
+
+	conn, ctx, _ := dialWebAdapter(t, a)
+	if err := wsjson.Write(ctx, conn, wsMessage{
+		Type: "message", Content: "long task", RequestID: "req-orphan", UserID: "desktop-user",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := conn.Close(websocket.StatusNormalClosure, "test disconnect"); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("orphan stream context was not canceled after all subscribers disconnected")
+	}
+}
+
+func TestBug20260717_ResumeWithinGraceKeepsStreamAlive(t *testing.T) {
+	a := New()
+	a.disconnectGrace = 250 * time.Millisecond
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	chunks := make(chan *adapter.ReplyChunk, 1)
+	a.SetStreamHandler(func(ctx context.Context, _ *adapter.Message) (<-chan *adapter.ReplyChunk, error) {
+		close(started)
+		go func() {
+			<-ctx.Done()
+			close(canceled)
+		}()
+		return chunks, nil
+	})
+
+	primary, primaryCtx, _ := dialWebAdapter(t, a)
+	if err := wsjson.Write(primaryCtx, primary, wsMessage{
+		Type: "message", Content: "resumable", RequestID: "req-grace", UserID: "desktop-user",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := primary.Close(websocket.StatusNormalClosure, "refresh"); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	resumed, resumedCtx, _ := dialWebAdapter(t, a)
+	if err := wsjson.Write(resumedCtx, resumed, wsMessage{
+		Type: "resume", RequestID: "req-grace", UserID: "desktop-user",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot wsMessage
+	if err := wsjson.Read(resumedCtx, resumed, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Type != "stream_snapshot" {
+		t.Fatalf("resume frame type = %q", snapshot.Type)
+	}
+
+	time.Sleep(a.disconnectGrace + 50*time.Millisecond)
+	select {
+	case <-canceled:
+		t.Fatal("stream was canceled even though a subscriber resumed within the grace period")
+	default:
+	}
+
+	chunks <- &adapter.ReplyChunk{Content: "done", Done: true}
+	close(chunks)
+}

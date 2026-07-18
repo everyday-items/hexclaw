@@ -1,6 +1,6 @@
 // Package records 提供领域中性的「记录本原语」（agent_records）。
 //
-// 设计目标（架构设计和执行计划-v0.5.0.md §5.2.3 / §6.4-6.5）：
+// 设计目标（架构设计-v0.5.0.md §5.1 数据分层 / §6.5 后端边界）：
 //   - 平台原语，任何场景包共用；平台**不认识**任何业务概念（领域字段一律进 Fields）；
 //   - 通用基建列 typed（record_id/agent_name/collection/schema_version/status/dedupe_key/
 //     tags/due_at/version/时间戳），领域字段进 Fields（JSON），保持领域中性；
@@ -84,6 +84,21 @@ type RecordSchema struct {
 	DedupeKey func(r *AgentRecord) string
 	// ValidateFields 校验领域字段（Fields JSON）。可为 nil（不校验）。
 	ValidateFields func(fieldsJSON string) error
+	// ReleaseDedupeOnStatuses 声明"进入这些状态即退出活跃空间、释放去重键"的状态集
+	// （典型：显式归档终态）。存储层在状态流转进入该集合时把 dedupe_key 改写为含
+	// record_id 的墓碑值，使同键新记录可以重新创建；不在集合内的状态保持原键
+	// （幂等去重语义不变）。nil/空 = 永不释放（向后兼容既有记录集）。
+	ReleaseDedupeOnStatuses []string
+}
+
+// ReleasesDedupeOn 判断进入 status 是否应释放去重键（见 ReleaseDedupeOnStatuses）。
+func (s *RecordSchema) ReleasesDedupeOn(status string) bool {
+	for _, v := range s.ReleaseDedupeOnStatuses {
+		if v == status {
+			return true
+		}
+	}
+	return false
 }
 
 // hasStatus 判断 status 是否在状态机声明内。

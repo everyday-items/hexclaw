@@ -960,6 +960,99 @@ func (s *Scheduler) RemoveJob(ctx context.Context, jobID string) error {
 	return nil
 }
 
+// JobsBySourceKeyPrefix returns read-only snapshots of every job whose stable
+// SourceKey starts with prefix, across all user IDs. Scenario provisioning uses
+// it to reconcile the declared job set for one logical owner (for example
+// "agent-name/") against historical registrations: legacy kinds that were
+// retired from the default spec set, or duplicates left under an older user ID,
+// are invisible to per-user idempotent upsert and can only be found here.
+// Jobs without a SourceKey (user-authored tasks) never match.
+func (s *Scheduler) JobsBySourceKeyPrefix(prefix string) []*Job {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*Job, 0)
+	for _, job := range s.jobs {
+		if job.SourceKey != "" && strings.HasPrefix(job.SourceKey, prefix) {
+			out = append(out, cloneJobSnapshot(job))
+		}
+	}
+	return out
+}
+
+// RemoveJobsBySourceKeyPrefix atomically detaches every job owned by one
+// logical resource. SourceKey is the stable ownership key used by scenario
+// provisioning (for example "agent-name/daily-reminder"). The returned
+// snapshots let the caller compensate if a later step in its deletion saga
+// fails.
+//
+// The lock -> transaction -> in-memory-map ordering intentionally matches
+// UpsertJobFromScript and RemoveJob, so a concurrent provision cannot recreate
+// a row between the durable delete and the map cleanup.
+func (s *Scheduler) RemoveJobsBySourceKeyPrefix(ctx context.Context, prefix string) ([]*Job, error) {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return nil, fmt.Errorf("source_key prefix is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	detached := make([]*Job, 0)
+	for _, job := range s.jobs {
+		if strings.HasPrefix(job.SourceKey, prefix) {
+			detached = append(detached, cloneJobSnapshot(job))
+		}
+	}
+	if len(detached) == 0 {
+		return detached, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("开始 cron 归属清理事务: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, job := range detached {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM cron_jobs WHERE id = ?`, job.ID); err != nil {
+			return nil, fmt.Errorf("删除归属 cron %s: %w", job.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("提交 cron 归属清理事务: %w", err)
+	}
+	for _, job := range detached {
+		delete(s.jobs, job.ID)
+		s.pruneAgentState(job.ID)
+	}
+	return detached, nil
+}
+
+func cloneJobSnapshot(job *Job) *Job {
+	if job == nil {
+		return nil
+	}
+	cloned := *job
+	cloned.Deliver = append([]string(nil), job.Deliver...)
+	cloned.ContextFrom = append([]string(nil), job.ContextFrom...)
+	cloned.FailureDeliver = append([]string(nil), job.FailureDeliver...)
+	if job.Spec != nil {
+		spec := *job.Spec
+		spec.Deps = append([]string(nil), job.Spec.Deps...)
+		if job.Spec.Inputs != nil {
+			spec.Inputs = make(map[string]any, len(job.Spec.Inputs))
+			for key, value := range job.Spec.Inputs {
+				spec.Inputs[key] = value
+			}
+		}
+		cloned.Spec = &spec
+	}
+	return &cloned
+}
+
 // PauseJob 暂停任务
 func (s *Scheduler) PauseJob(ctx context.Context, jobID string) error {
 	return s.updateJobStatus(ctx, jobID, StatusPaused)

@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -213,10 +212,8 @@ func (r *Selector) isLocalProviderName(name string) bool {
 	if canon, ok := r.canonicalNameLocked(name); ok {
 		key = canon
 	}
-	if pc, configured := r.cfg.Providers[key]; configured && strings.TrimSpace(pc.BaseURL) != "" {
-		// An explicit endpoint is authoritative. In particular, a public hosted
-		// service named "ollama" must still cross the cloud egress boundary.
-		return isLocalProvider(pc)
+	if pc, configured := r.cfg.Providers[key]; configured {
+		return isLocalProviderNamed(key, pc)
 	}
 	return strings.Contains(strings.ToLower(name), "ollama")
 }
@@ -234,33 +231,17 @@ func (r *Selector) IsLocalProviderName(name string) bool {
 
 // isLocalProvider 检查 provider 是否为本地部署（如 Ollama），本地 provider 不需要 API Key
 func isLocalProvider(pc config.LLMProviderConfig) bool {
-	return IsLocalProviderBaseURL(pc.BaseURL)
+	return config.IsLocalLLMProvider(pc)
+}
+
+func isLocalProviderNamed(name string, pc config.LLMProviderConfig) bool {
+	return config.IsLocalLLMProviderNamed(name, pc)
 }
 
 // IsLocalProviderBaseURL classifies only the parsed endpoint host. Local-looking
 // text in a public hostname, path, query, or userinfo must not bypass egress.
 func IsLocalProviderBaseURL(baseURL string) bool {
-	raw := strings.TrimSpace(baseURL)
-	if raw == "" {
-		return false
-	}
-	if !strings.Contains(raw, "://") {
-		raw = "//" + raw
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return false
-	}
-	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
-	if zone := strings.LastIndexByte(host, '%'); zone >= 0 {
-		host = host[:zone]
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback() || ip.IsUnspecified()
-	}
-	return host == "localhost" || host == "ollama" ||
-		host == "host.docker.internal" || host == "host.containers.internal" ||
-		strings.HasSuffix(host, ".local")
+	return config.IsLocalProviderBaseURL(baseURL)
 }
 
 const (
@@ -283,8 +264,8 @@ var localOllamaReachable = func() bool {
 
 // hasLocalProvider 判断配置里是否已有任一本地 provider（指向回环端点）。
 func hasLocalProvider(providers map[string]config.LLMProviderConfig) bool {
-	for _, pc := range providers {
-		if isLocalProvider(pc) {
+	for name, pc := range providers {
+		if isLocalProviderNamed(name, pc) {
 			return true
 		}
 	}
@@ -302,11 +283,11 @@ func buildSelectorState(cfg config.LLMConfig) (map[string]hexagon.Provider, conf
 			logger.Info("[router] 跳过已禁用 provider（配置/Key 保留，不参与路由）", "provider", name)
 			continue
 		}
-		if strings.TrimSpace(pc.APIKey) == "" && !isLocalProvider(pc) {
+		if strings.TrimSpace(pc.APIKey) == "" && !isLocalProviderNamed(name, pc) {
 			logger.Warn("[router] 跳过无 API Key 的远程 provider", "provider", name, "base_url", pc.BaseURL)
 			continue
 		}
-		logger.Info("[router] 加载 provider", "provider", name, "base_url", pc.BaseURL, "local", isLocalProvider(pc))
+		logger.Info("[router] 加载 provider", "provider", name, "base_url", pc.BaseURL, "local", isLocalProviderNamed(name, pc))
 		providerNames = append(providerNames, name)
 		activeCfg.Providers[name] = pc
 	}

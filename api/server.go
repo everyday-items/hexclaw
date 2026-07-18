@@ -25,6 +25,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -93,6 +94,7 @@ type Server struct {
 	skillHub          *hub.Hub                     // 在线技能市场（可选）
 	agentRouter       *router.Dispatcher           // 多 Agent 路由器（可选）
 	agentStore        router.Store                 // Agent/Rule 持久化（可选）
+	agentResources    AgentResourceCleaner         // Agent 归属资源删除 saga（可选）
 	instanceMgr       *instances.Manager           // 平台实例运行时（可选）
 	connectorStore    *connector.Store             // 数据连接器(GitHub/Notion 只读，token 加密)（可选）
 	canvasSvc         *canvas.Service              // Canvas/A2UI 服务（可选）
@@ -138,6 +140,17 @@ type Server struct {
 	statsJSON                   []byte
 	statsCacheAt                time.Time
 	ollamaBaseURL               string
+}
+
+// AgentResourceCleaner stages cleanup of resources owned by an Agent before
+// the Agent itself is durably removed. The rollback callback is invoked when
+// the subsequent router/store deletion fails, preventing a half-deleted
+// profile from silently losing its schedules or other owned resources.
+type AgentResourceCleaner interface {
+	DetachAgentResources(
+		ctx context.Context,
+		agent router.AgentConfig,
+	) (rollback func(context.Context) error, err error)
 }
 
 // NewServer 创建 API 服务器
@@ -309,6 +322,12 @@ func (s *Server) handleListSubAgentRuns(w http.ResponseWriter, r *http.Request) 
 // SetAgentStore 设置 Agent/Rule 持久化层
 func (s *Server) SetAgentStore(store router.Store) {
 	s.agentStore = store
+}
+
+// SetAgentResourceCleaner wires the lifecycle boundary for Agent-owned
+// resources such as scenario-provisioned cron jobs.
+func (s *Server) SetAgentResourceCleaner(cleaner AgentResourceCleaner) {
+	s.agentResources = cleaner
 }
 
 // SetInstanceManager 设置平台实例运行时管理器。
@@ -1028,6 +1047,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate an explicit provider before constructing/persisting a chat
+	// message. Invalid client input is 400 and must not leave a partial session.
+	if validator, ok := s.engine.(interface{ ValidateProvider(string) error }); ok {
+		if err := validator.ValidateProvider(req.Provider); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": upstreamerr.PublicMessage(err, "error"),
+			})
+			return
+		}
+	}
+
 	// 构建统一消息
 	userID := req.UserID
 	if userID == "" {
@@ -1129,7 +1159,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		chunks, err := se.ProcessStream(ctx, msg)
 		if err != nil {
 			trace.L(ctx).Error("处理失败", "err", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{
+			writeJSON(w, chatErrorStatus(req.Provider, err), map[string]string{
 				"error": upstreamerr.PublicMessage(err, "error"),
 			})
 			return
@@ -1145,7 +1175,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		for chunk := range chunks {
 			if chunk.Error != nil {
 				trace.L(ctx).Error("处理失败", "err", chunk.Error)
-				writeJSON(w, http.StatusInternalServerError, map[string]string{
+				writeJSON(w, chatErrorStatus(req.Provider, chunk.Error), map[string]string{
 					"error": upstreamerr.PublicMessage(chunk.Error, "error"),
 				})
 				return
@@ -1178,7 +1208,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		reply, err = s.engine.Process(ctx, msg)
 		if err != nil {
 			trace.L(ctx).Error("处理失败", "err", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{
+			writeJSON(w, chatErrorStatus(req.Provider, err), map[string]string{
 				"error": upstreamerr.PublicMessage(err, "error"),
 			})
 			return
@@ -1198,6 +1228,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		KnowledgeHits: reply.KnowledgeHits,
 		MemoryHits:    reply.MemoryHits,
 	})
+}
+
+func chatErrorStatus(explicitProvider string, err error) int {
+	var providerErr *engine.ProviderUnavailableError
+	if strings.TrimSpace(explicitProvider) != "" && errors.As(err, &providerErr) {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
 }
 
 // handleChatSSE 处理 SSE 流式聊天请求（BUG-20260523-v2）。

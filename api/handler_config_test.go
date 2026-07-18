@@ -133,7 +133,10 @@ func TestHandleGetLLMConfig_UsesRuntimeActiveConfig(t *testing.T) {
 	runtimeCfg := config.LLMConfig{
 		Default: "智谱",
 		Providers: map[string]config.LLMProviderConfig{
-			"智谱": {APIKey: "sk-zhipu", BaseURL: "https://open.bigmodel.cn/api/paas/v4", Model: "glm-5", KeepAlive: "15m"},
+			"智谱": {
+				APIKey: "sk-zhipu", BaseURL: "https://open.bigmodel.cn/api/paas/v4",
+				Model: "glm-5", KeepAlive: "15m", Locality: config.ProviderLocalityCloud, NumCtx: 8192,
+			},
 		},
 	}
 
@@ -163,6 +166,8 @@ func TestHandleGetLLMConfig_UsesRuntimeActiveConfig(t *testing.T) {
 	var wire struct {
 		Providers map[string]struct {
 			KeepAlive string `json:"keep_alive"`
+			Locality  string `json:"locality"`
+			NumCtx    int    `json:"num_ctx"`
 		} `json:"providers"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &wire); err != nil {
@@ -170,6 +175,12 @@ func TestHandleGetLLMConfig_UsesRuntimeActiveConfig(t *testing.T) {
 	}
 	if wire.Providers["智谱"].KeepAlive != "15m" {
 		t.Fatalf("GET 丢失 keep_alive，实际响应 %s", w.Body.String())
+	}
+	if wire.Providers["智谱"].Locality != config.ProviderLocalityCloud {
+		t.Fatalf("GET 丢失 locality，实际响应 %s", w.Body.String())
+	}
+	if wire.Providers["智谱"].NumCtx != 8192 {
+		t.Fatalf("GET 丢失 num_ctx，实际响应 %s", w.Body.String())
 	}
 }
 
@@ -188,7 +199,7 @@ func TestHandleUpdateLLMConfig_HotReloadsAndPersists(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/config/llm", strings.NewReader(`{
 		"default":"智谱",
 		"providers":{
-			"智谱":{"api_key":"sk-zhipu","base_url":"https://open.bigmodel.cn/api/paas/v4","model":"glm-5","compatible":"openai","keep_alive":"5m"}
+			"智谱":{"api_key":"sk-zhipu","base_url":"https://open.bigmodel.cn/api/paas/v4","model":"glm-5","compatible":"openai","locality":"cloud","keep_alive":"5m","num_ctx":4096}
 		}
 	}`))
 	w := httptest.NewRecorder()
@@ -206,6 +217,9 @@ func TestHandleUpdateLLMConfig_HotReloadsAndPersists(t *testing.T) {
 	if eng.activeLLM.Providers["智谱"].KeepAlive != "5m" {
 		t.Fatalf("引擎热更新丢失 keep_alive，实际 %+v", eng.activeLLM.Providers["智谱"])
 	}
+	if got := eng.activeLLM.Providers["智谱"]; got.Locality != config.ProviderLocalityCloud || got.NumCtx != 4096 {
+		t.Fatalf("引擎热更新丢失 locality/num_ctx，实际 %+v", got)
+	}
 	if srv.cfg.LLM.Default != "智谱" {
 		t.Fatalf("服务端内存配置未更新，实际 %q", srv.cfg.LLM.Default)
 	}
@@ -216,8 +230,28 @@ func TestHandleUpdateLLMConfig_HotReloadsAndPersists(t *testing.T) {
 		t.Fatalf("读取持久化配置失败: %v", err)
 	}
 	content := string(data)
-	if !strings.Contains(content, "glm-5") || !strings.Contains(content, "智谱") || !strings.Contains(content, "keep_alive: 5m") {
+	if !strings.Contains(content, "glm-5") || !strings.Contains(content, "智谱") ||
+		!strings.Contains(content, "keep_alive: 5m") || !strings.Contains(content, "locality: cloud") ||
+		!strings.Contains(content, "num_ctx: 4096") {
 		t.Fatalf("配置文件未写入新 provider: %s", content)
+	}
+}
+
+func TestHandleUpdateLLMConfig_RejectsInvalidLocality(t *testing.T) {
+	srv := NewServer(config.DefaultConfig(), &mockEngine{}, nil, nil)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/config/llm", strings.NewReader(`{
+		"providers":{
+			"openai":{"api_key":"sk-test","base_url":"http://localhost:18080/v1","model":"gpt-5.6-sol","locality":"somewhere"}
+		}
+	}`))
+	w := httptest.NewRecorder()
+
+	srv.handleUpdateLLMConfig(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid locality, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "locality") {
+		t.Fatalf("error must identify locality: %s", w.Body.String())
 	}
 }
 

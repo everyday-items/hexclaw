@@ -35,6 +35,8 @@ type WebAdapter struct {
 	sessionRequests    sync.Map // sessionID → requestID
 	requestConns       sync.Map // requestID → *requestSubscribers
 	cancelFuncs        sync.Map // requestID → context.CancelFunc
+	disconnectTimers   sync.Map // requestID → *time.Timer
+	disconnectGrace    time.Duration
 	streams            *streamstate.Registry
 	onApprovalResponse func(requestID string, approved, remember bool) // callback for tool approval
 }
@@ -76,6 +78,16 @@ func (s *requestSubscribers) Len() int {
 	return len(s.chatIDs)
 }
 
+func (s *requestSubscribers) IfEmpty(fn func()) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.chatIDs) != 0 {
+		return false
+	}
+	fn()
+	return true
+}
+
 // SetStreamHandler 设置流式消息处理器。
 func (a *WebAdapter) SetStreamHandler(h adapter.StreamMessageHandler) {
 	a.streamHandler = h
@@ -83,7 +95,10 @@ func (a *WebAdapter) SetStreamHandler(h adapter.StreamMessageHandler) {
 
 // New 创建 Web 适配器。
 func New() *WebAdapter {
-	return &WebAdapter{streams: streamstate.NewRegistry(2 * time.Minute)}
+	return &WebAdapter{
+		streams:         streamstate.NewRegistry(2 * time.Minute),
+		disconnectGrace: 5 * time.Second,
+	}
 }
 
 func (a *WebAdapter) Name() string               { return "web" }
@@ -97,6 +112,20 @@ func (a *WebAdapter) Start(_ context.Context, handler adapter.MessageHandler) er
 
 // Stop 关闭所有 WebSocket 连接。
 func (a *WebAdapter) Stop(_ context.Context) error {
+	a.disconnectTimers.Range(func(key, value any) bool {
+		if timer, ok := value.(*time.Timer); ok {
+			timer.Stop()
+		}
+		a.disconnectTimers.Delete(key)
+		return true
+	})
+	a.cancelFuncs.Range(func(key, value any) bool {
+		if cancel, ok := value.(context.CancelFunc); ok {
+			cancel()
+		}
+		a.cancelFuncs.Delete(key)
+		return true
+	})
 	a.conns.Range(func(key, value any) bool {
 		if conn, ok := value.(*websocket.Conn); ok {
 			_ = conn.Close(websocket.StatusGoingAway, "服务关闭")
@@ -252,6 +281,10 @@ func (a *WebAdapter) SendStream(ctx context.Context, chatID string, chunks <-cha
 }
 
 func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, requestID string, chunks <-chan *adapter.ReplyChunk) error {
+	if sessionID != "" {
+		a.sessionConns.Store(sessionID, chatID)
+		a.sessionRequests.Store(sessionID, requestID)
+	}
 	chunkCount := 0
 	reasoningCount := 0
 	for chunk := range chunks {
@@ -303,6 +336,10 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 			if msg.RequestID == "" {
 				msg.RequestID = msg.Metadata["request_id"]
 			}
+		}
+		if msg.SessionID != "" {
+			a.sessionConns.Store(msg.SessionID, chatID)
+			a.sessionRequests.Store(msg.SessionID, requestID)
 		}
 		if err := a.sendToTargets(ctx, chatID, requestID, msg); err != nil {
 			return err
@@ -360,6 +397,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			slog.Info("WebSocket cancel", "session", incoming.SessionID, "request_id", requestID)
 			if requestID != "" {
+				a.stopDisconnectTimer(requestID)
 				if cancelFn, ok := a.cancelFuncs.LoadAndDelete(requestID); ok {
 					cancelFn.(context.CancelFunc)()
 				}
@@ -430,6 +468,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			if incoming.RequestID != "" {
 				a.cancelFuncs.Store(incoming.RequestID, cancel)
 				defer a.cancelFuncs.Delete(incoming.RequestID)
+				defer func() { a.finishRequest(incoming.RequestID, msg.SessionID) }()
 			}
 
 			ctx = trace.WithLogger(ctx, logger)
@@ -506,19 +545,75 @@ func (a *WebAdapter) addSubscriber(requestID, chatID string) {
 	if requestID == "" || chatID == "" {
 		return
 	}
+	a.stopDisconnectTimer(requestID)
 	value, _ := a.requestConns.LoadOrStore(requestID, newRequestSubscribers())
 	value.(*requestSubscribers).Add(chatID)
 }
 
 func (a *WebAdapter) removeChatID(chatID string) {
 	a.requestConns.Range(func(key, value any) bool {
+		requestID, _ := key.(string)
 		subs := value.(*requestSubscribers)
 		subs.Delete(chatID)
 		if subs.Len() == 0 {
-			a.requestConns.Delete(key)
+			a.scheduleDisconnectCancel(requestID, subs)
 		}
 		return true
 	})
+}
+
+func (a *WebAdapter) stopDisconnectTimer(requestID string) {
+	if value, ok := a.disconnectTimers.LoadAndDelete(requestID); ok {
+		value.(*time.Timer).Stop()
+	}
+}
+
+func (a *WebAdapter) scheduleDisconnectCancel(requestID string, subs *requestSubscribers) {
+	if requestID == "" || subs == nil {
+		return
+	}
+	if _, active := a.cancelFuncs.Load(requestID); !active {
+		a.requestConns.Delete(requestID)
+		return
+	}
+	grace := a.disconnectGrace
+	if grace < 0 {
+		grace = 0
+	}
+	timer := time.AfterFunc(grace, func() {
+		a.disconnectTimers.Delete(requestID)
+		current, ok := a.requestConns.Load(requestID)
+		if !ok || current != subs {
+			return
+		}
+		canceled := subs.IfEmpty(func() {
+			if cancelFn, ok := a.cancelFuncs.LoadAndDelete(requestID); ok {
+				cancelFn.(context.CancelFunc)()
+			}
+			if a.streams != nil {
+				a.streams.Cancel(requestID)
+			}
+		})
+		if canceled {
+			a.requestConns.Delete(requestID)
+			slog.Info("WebSocket 请求因无订阅者取消", "request_id", requestID, "grace", grace)
+		}
+	})
+	if existing, loaded := a.disconnectTimers.LoadOrStore(requestID, timer); loaded {
+		timer.Stop()
+		_ = existing
+	}
+}
+
+func (a *WebAdapter) finishRequest(requestID, sessionID string) {
+	a.stopDisconnectTimer(requestID)
+	a.requestConns.Delete(requestID)
+	if sessionID == "" {
+		return
+	}
+	if current, ok := a.sessionRequests.Load(sessionID); ok && current == requestID {
+		a.sessionRequests.Delete(sessionID)
+	}
 }
 
 func (a *WebAdapter) sendToTargets(ctx context.Context, chatID, requestID string, msg wsMessage) error {

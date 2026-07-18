@@ -334,7 +334,7 @@ func (c *Config) ApplyReasoningDefault() (chosen string, applied bool) {
 			if !strings.Contains(strings.ToLower(name), token) {
 				continue
 			}
-			if !providerUsableCloud(c.LLM.Providers[name]) {
+			if !providerUsableCloud(name, c.LLM.Providers[name]) {
 				continue
 			}
 			c.LLM.ReasoningProvider = name
@@ -345,11 +345,11 @@ func (c *Config) ApplyReasoningDefault() (chosen string, applied bool) {
 }
 
 // providerUsableCloud 判定 provider 可作云端强文本兜底：启用 + 非本地部署 + 有 key 或自定义端点。
-func providerUsableCloud(pc LLMProviderConfig) bool {
+func providerUsableCloud(name string, pc LLMProviderConfig) bool {
 	if pc.Enabled != nil && !*pc.Enabled {
 		return false
 	}
-	if isLocalBaseURLHeuristic(pc.BaseURL) {
+	if IsLocalLLMProviderNamed(name, pc) {
 		return false
 	}
 	return strings.TrimSpace(pc.APIKey) != "" || strings.TrimSpace(pc.BaseURL) != ""
@@ -358,16 +358,7 @@ func providerUsableCloud(pc LLMProviderConfig) bool {
 // isLocalBaseURLHeuristic 轻量判定 base_url 是否指向本地部署（loopback/localhost/容器内网）。
 // config 层不 import llmrouter（避免环），与 llmrouter.IsLocalProviderBaseURL 的判定意图一致。
 func isLocalBaseURLHeuristic(baseURL string) bool {
-	s := strings.ToLower(strings.TrimSpace(baseURL))
-	if s == "" {
-		return false
-	}
-	for _, h := range []string{"localhost", "127.0.0.1", "[::1]", "//::1", "0.0.0.0", "host.docker.internal", "host.containers.internal", ".local", "ollama"} {
-		if strings.Contains(s, h) {
-			return true
-		}
-	}
-	return false
+	return IsLocalProviderBaseURL(baseURL)
 }
 
 // LLMToolsConfig 工具注入全局配置
@@ -378,14 +369,22 @@ type LLMToolsConfig struct {
 
 // LLMProviderConfig 单个 LLM Provider 配置
 type LLMProviderConfig struct {
-	APIKey       string   `yaml:"api_key"`                 // API Key
-	BaseURL      string   `yaml:"base_url"`                // 自定义 API 端点（支持中转/私有部署）
-	Model        string   `yaml:"model"`                   // 当前选中的模型
-	Models       []string `yaml:"models,omitempty"`        // 已配置的模型列表（桌面端持久化用）
-	Compatible   string   `yaml:"compatible"`              // 兼容协议: "openai"（用于中转/私有部署）
-	ToolsEnabled *bool    `yaml:"tools_enabled,omitempty"` // 是否启用工具注入（nil=自动判断, true=强制开启, false=强制关闭）
-	MaxTools     int      `yaml:"max_tools,omitempty"`     // 最大注入工具数（0=不限制）
-	Enabled      *bool    `yaml:"enabled,omitempty"`       // 是否启用（nil/true=启用, false=禁用但保留配置/Key，不参与路由）
+	APIKey     string   `yaml:"api_key"`          // API Key
+	BaseURL    string   `yaml:"base_url"`         // 自定义 API 端点（支持中转/私有部署）
+	Model      string   `yaml:"model"`            // 当前选中的模型
+	Models     []string `yaml:"models,omitempty"` // 已配置的模型列表（桌面端持久化用）
+	Compatible string   `yaml:"compatible"`       // 兼容协议: "openai"（用于中转/私有部署）
+	// Locality 描述模型算力/数据最终位置，而非 HTTP 监听地址：
+	//   - auto/空：按 endpoint host 自动判断
+	//   - local：本机/LAN 私有部署
+	//   - cloud：云端服务（包括 localhost 上的云 API 反向代理）
+	//
+	// 显式字段解决“本地网关代理云模型”被误判成本地模型：误判会绕过云端 egress
+	// 守卫、禁用 RAG 辅助 LLM，并错误套用本地单槽/并发策略。
+	Locality     string `yaml:"locality,omitempty" json:"locality,omitempty"`
+	ToolsEnabled *bool  `yaml:"tools_enabled,omitempty"` // 是否启用工具注入（nil=自动判断, true=强制开启, false=强制关闭）
+	MaxTools     int    `yaml:"max_tools,omitempty"`     // 最大注入工具数（0=不限制）
+	Enabled      *bool  `yaml:"enabled,omitempty"`       // 是否启用（nil/true=启用, false=禁用但保留配置/Key，不参与路由）
 	// KeepAlive 本地模型驻留时长(仅 Ollama 生效,如 "5m"/"30m";空=ai-core 默认 30m)。
 	// BUG-20260710:16GB 机器 9B 模型驻留≈7GB,可调短换内存。
 	KeepAlive string `yaml:"keep_alive,omitempty" json:"keep_alive,omitempty"`

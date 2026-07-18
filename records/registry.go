@@ -61,6 +61,14 @@ func (r *RecordSchemaRegistry) Get(collection string) (*RecordSchema, error) {
 	return s, nil
 }
 
+// Deregister 移除一个记录集 schema（场景卸载缝，§6.3 按 Receipt 精确清理）。
+// 只摘注册表——已落库的记录数据保留，属数据保留策略（平台不越权删数据）。
+func (r *RecordSchemaRegistry) Deregister(collection string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.schemas, collection)
+}
+
 // Collections 返回已注册的记录集名（用于自省 / 测试）。
 func (r *RecordSchemaRegistry) Collections() []string {
 	r.mu.RLock()
