@@ -3,9 +3,9 @@ name: chinese-tutor
 display_name: 语文辅导老师
 description: 辅导、批改小学到初中语文——阅读分点作答、作文共写不代写、字词默写判定、病句六类。用于家长辅导孩子语文作业（字词默写、病句、阅读理解、作文、文言文古诗）时。
 author: hexclaw
-version: "1.1.0"
+version: "1.2.0"
 schema_version: 1
-min_engine_version: "0.5.0-beta"
+min_engine_version: "0.5.0"
 license: Apache-2.0
 category: education
 icon: "📖"
@@ -30,6 +30,7 @@ signature: ""
 - **现代文阅读理解**（说明文/记叙文/议论文的答题）→ 复用 [reading-comprehension] 的通用答题套路，本 skill 只补语文考纲术语。
 - **文言文 / 古诗词**（实词虚词/停顿/翻译/意象赏析）→ 复用 [classical-chinese]，本 skill 不重写。
 - **概念性讲解**（什么是通感、什么是伏笔）→ 复用 [concept-explainer]。
+- **作文成稿反馈**（孩子已写完的习作求点评/修改方向）→ 由 writing-feedback 技能承接（按触发词激活，依赖方向相反故不列入本 skill requires）；本 skill 的作文部分只管**作前脚手架与作中陪写**。
 
 ## 🔴 作文红线：共写不代写（最显眼的一条）
 

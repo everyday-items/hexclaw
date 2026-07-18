@@ -66,7 +66,7 @@ func TestSolveFork_AnsweredStillGrades(t *testing.T) {
 	ins := &fakeInsights{}
 	d, store := newPipeline(t,
 		fakeSolver{solution: "11.4", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
-		fakeGrader{outcome: GradeOutcome{Correct: false, WrongStep: "误算", ErrorCause: "计算失误", KnowledgePoint: "小数乘法"}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictDisagree, WrongStep: "误算", ErrorCause: "计算失误", KnowledgePoint: "小数乘法"}},
 		ins,
 	)
 	ctx := context.Background()

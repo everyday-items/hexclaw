@@ -121,10 +121,12 @@ func RunEval(ctx context.Context, d Deps, cases []EvalCase) EvalResult {
 		}
 		if c.ExpectCorrect != nil {
 			res.GradeChecked++
-			if out.Outcome.Correct == *c.ExpectCorrect {
+			// 判定统一 Verdict 五值（§4.5）：ground truth 布尔标注对照 agree（答对）。
+			gotCorrect := out.Outcome.Verdict == VerdictAgree
+			if gotCorrect == *c.ExpectCorrect {
 				res.GradePassed++
 			} else {
-				res.Failures = append(res.Failures, fmt.Sprintf("[%s] 批改期望=%v 实际=%v", c.Name, *c.ExpectCorrect, out.Outcome.Correct))
+				res.Failures = append(res.Failures, fmt.Sprintf("[%s] 批改期望=%v 实际 verdict=%s", c.Name, *c.ExpectCorrect, out.Outcome.Verdict))
 			}
 		}
 	}

@@ -3,6 +3,8 @@ package usecase
 import (
 	"context"
 	"testing"
+
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
 type solverReportedOutOfScope struct{}
@@ -26,7 +28,7 @@ func TestBUG20260714_SolverReportedOutOfScopeSkipsGrader(t *testing.T) {
 	if !res.OutOfScope || res.OutOfScopeKP != "分数的意义和性质" || res.RecordCreated {
 		t.Fatalf("solver-reported scope result was not propagated: %+v", res)
 	}
-	items, err := store.ListByScope(context.Background(), "mingming", "mistakes", "")
+	items, err := store.ListByScope(context.Background(), "mingming", k12.CollectionMistakes, "")
 	if err != nil {
 		t.Fatal(err)
 	}

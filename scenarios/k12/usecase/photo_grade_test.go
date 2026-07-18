@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/curriculum"
 )
 
 type photoRecognizerFake struct {
@@ -15,6 +17,31 @@ type photoRecognizerFake struct {
 
 func (f photoRecognizerFake) Recognize(context.Context, []byte) ([]RecognizedQuestion, error) {
 	return f.questions, f.err
+}
+
+type photoAnchorerFake struct {
+	boxes map[int]BBox
+	err   error
+	calls int
+}
+
+func (f *photoAnchorerFake) AnchorAnswers(
+	_ context.Context,
+	_ []byte,
+	questions []RecognizedQuestion,
+) ([]RecognizedQuestion, error) {
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := append([]RecognizedQuestion(nil), questions...)
+	for index, bbox := range f.boxes {
+		if index >= 0 && index < len(out) {
+			box := bbox
+			out[index].BBox = &box
+		}
+	}
+	return out, nil
 }
 
 type photoAnnotatorFake struct {
@@ -34,13 +61,14 @@ func (f *photoAnnotatorFake) Annotate(_ context.Context, _ []byte, marks []Photo
 func TestGradeHomeworkPhoto_AnsweredSheetGradesAndAnnotatesTrustedBBox(t *testing.T) {
 	d, _ := newPipeline(t,
 		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
-		fakeGrader{outcome: GradeOutcome{Correct: true}}, nil,
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
 	)
-	box := &BBox{X: 0.2, Y: 0.3, W: 0.1, H: 0.05}
 	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{
-		{Question: "1+1=", Subject: "数学", StudentAnswer: "2", BBox: box},
+		{Question: "1+1=", Subject: "数学", StudentAnswer: "2"},
 		{Question: "2+2=", Subject: "数学", StudentAnswer: ""},
 	}}
+	anchorer := &photoAnchorerFake{boxes: map[int]BBox{0: {X: 0.2, Y: 0.3, W: 0.1, H: 0.05}}}
+	d.AnswerAnchorer = anchorer
 	annotator := &photoAnnotatorFake{}
 	d.PhotoAnnotator = annotator
 
@@ -62,15 +90,18 @@ func TestGradeHomeworkPhoto_AnsweredSheetGradesAndAnnotatesTrustedBBox(t *testin
 	if annotator.calls != 1 || len(annotator.marks) != 1 || !annotator.marks[0].Correct {
 		t.Fatalf("annotator calls/marks = %d/%#v", annotator.calls, annotator.marks)
 	}
+	if anchorer.calls != 1 {
+		t.Fatalf("photo grading must invoke the page-batch answer anchorer once, calls=%d", anchorer.calls)
+	}
 	if !strings.Contains(got.Markdown, "作业批改完成") || !strings.Contains(got.Markdown, "未作答") {
 		t.Fatalf("grade markdown missing summary: %s", got.Markdown)
 	}
 }
 
-func TestGradeHomeworkPhoto_VerifiedAnswersWithoutBBoxStillProduceNumberedCorrectionImage(t *testing.T) {
+func TestGradeHomeworkPhoto_VerifiedAnswersWithoutBBoxRemainTextOnlyInsteadOfSendingUnchangedPhoto(t *testing.T) {
 	d, _ := newPipeline(t,
 		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
-		fakeGrader{outcome: GradeOutcome{Correct: false}}, nil,
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictDisagree}}, nil,
 	)
 	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{
 		{Question: "1+1=", Subject: "数学", StudentAnswer: "3"},
@@ -84,26 +115,124 @@ func TestGradeHomeworkPhoto_VerifiedAnswersWithoutBBoxStillProduceNumberedCorrec
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.AnnotatedImage == nil || annotator.calls != 1 {
-		t.Fatalf("verified answers must still produce a correction image when recognition has no safe bbox: image=%v calls=%d", got.AnnotatedImage, annotator.calls)
+	if got.AnnotatedImage != nil || annotator.calls != 0 {
+		t.Fatalf("verified answers without safe coordinates must not send an unchanged photo as a correction image: image=%v calls=%d", got.AnnotatedImage, annotator.calls)
 	}
-	if len(annotator.marks) != 1 || annotator.marks[0].QuestionNumber != 1 {
-		t.Fatalf("numbered fallback annotations = %#v, want question number 1", annotator.marks)
-	}
-	for _, mark := range annotator.marks {
-		if mark.Correct || mark.BBox.W != 0 || mark.BBox.H != 0 {
-			t.Fatalf("fallback mark must preserve wrong verdict without inventing coordinates: %#v", mark)
+	for _, want := range []string{"1 题已判定", "0 题已在图上标注", "未生成批改图", "仅作文字汇总"} {
+		if !strings.Contains(got.Markdown, want) {
+			t.Fatalf("text-only fallback must explain missing safe coordinates; missing %q in:\n%s", want, got.Markdown)
 		}
 	}
-	if !strings.Contains(got.Markdown, "按题号标注") {
-		t.Fatalf("markdown must explain the truthful numbered fallback: %s", got.Markdown)
+}
+
+func TestGradeHomeworkPhoto_PartialCoordinatesOnlyPassTrustedMarksToAnnotator(t *testing.T) {
+	d, _ := newPipeline(t,
+		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
+	)
+	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{
+		{Question: "1+1=", Subject: "数学", StudentAnswer: "2"},
+		{Question: "2+2=", Subject: "数学", StudentAnswer: "4"},
+	}}
+	d.AnswerAnchorer = &photoAnchorerFake{boxes: map[int]BBox{
+		0: {X: 0.20, Y: 0.30, W: 0.15, H: 0.08},
+	}}
+	annotator := &photoAnnotatorFake{}
+	d.PhotoAnnotator = annotator
+
+	got, err := d.GradeHomeworkPhoto(context.Background(), PhotoGradeRequest{
+		AgentName: "mingming", Grade: "五年级上", Image: []byte("jpeg"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AnnotatedImage == nil || annotator.calls != 1 {
+		t.Fatalf("the safely located answer should still produce one correction image: image=%v calls=%d", got.AnnotatedImage, annotator.calls)
+	}
+	if len(annotator.marks) != 1 || annotator.marks[0].QuestionNumber != 1 || !photoAnnotationHasTrustedBBox(annotator.marks[0]) {
+		t.Fatalf("annotator received unpositioned or wrong marks: %#v", annotator.marks)
+	}
+}
+
+func TestGradeHomeworkPhoto_FifthGradeFractionOfQuantityIsNotRejectedByCoarseVisionLabel(t *testing.T) {
+	d, _ := newPipeline(t,
+		fakeSolver{solution: "8/5", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
+	)
+	d.Constraint = curriculum.New()
+	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{{
+		Question:        "8的1/4的4/5是多少？",
+		Subject:         "数学",
+		KnowledgePoints: []string{"分数乘法"},
+		StudentAnswer:   "8/5",
+	}}}
+	d.PhotoAnnotator = &photoAnnotatorFake{}
+
+	got, err := d.GradeHomeworkPhoto(context.Background(), PhotoGradeRequest{
+		AgentName: "mingming", Grade: "五年级下", Image: []byte("jpeg"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 1 || got.Items[0].Status != PhotoCorrect {
+		t.Fatalf("fifth-grade fraction-of-quantity problem was falsely rejected as out of scope: %#v", got.Items)
+	}
+}
+
+func TestGradeHomeworkPhoto_FifthGradeChineseFractionWordingIsNotRejectedByCoarseVisionLabel(t *testing.T) {
+	d, _ := newPipeline(t,
+		fakeSolver{solution: "10", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
+	)
+	d.Constraint = curriculum.New()
+	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{{
+		Question:        "8的四分之五是多少？",
+		Subject:         "数学",
+		KnowledgePoints: []string{"分数乘法"},
+		StudentAnswer:   "10",
+	}}}
+	d.PhotoAnnotator = &photoAnnotatorFake{}
+
+	got, err := d.GradeHomeworkPhoto(context.Background(), PhotoGradeRequest{
+		AgentName: "mingming", Grade: "五年级下", Image: []byte("jpeg"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 1 || got.Items[0].Status != PhotoCorrect {
+		t.Fatalf("Chinese fraction-of-quantity wording was falsely rejected as out of scope: %#v", got.Items)
+	}
+}
+
+func TestGradeHomeworkPhoto_FifthGradeUnknownWholeFractionProblemIsNotRejectedAsFormalFractionDivision(t *testing.T) {
+	d, _ := newPipeline(t,
+		fakeSolver{solution: "64", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
+	)
+	d.Constraint = curriculum.New()
+	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{{
+		Question:        "一个数的3/8是24，求这个数？",
+		Subject:         "数学",
+		KnowledgePoints: []string{"分数除法"},
+		StudentAnswer:   "64",
+	}}}
+	d.PhotoAnnotator = &photoAnnotatorFake{}
+
+	got, err := d.GradeHomeworkPhoto(context.Background(), PhotoGradeRequest{
+		AgentName: "mingming", Grade: "五年级下", Image: []byte("jpeg"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 1 || got.Items[0].Status != PhotoCorrect {
+		t.Fatalf("fifth-grade unknown-whole fraction problem was falsely rejected as formal fraction division: %#v", got.Items)
 	}
 }
 
 func TestGradeHomeworkPhoto_BlankSheetSolvesMarkdownWithoutFakeCorrectionImage(t *testing.T) {
 	d, _ := newPipeline(t,
 		fakeSolver{solution: "解：4.5×2=9", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
-		fakeGrader{outcome: GradeOutcome{Correct: true}}, nil,
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
 	)
 	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{
 		{Question: "4.5×2=", Subject: "数学"},
@@ -129,6 +258,86 @@ func TestGradeHomeworkPhoto_BlankSheetSolvesMarkdownWithoutFakeCorrectionImage(t
 	}
 }
 
+func TestGradeHomeworkPhoto_AnswerRegionWithoutReadableTextFailsClosedInsteadOfSolving(t *testing.T) {
+	d, _ := newPipeline(t,
+		fakeSolver{solution: "解：4.5×2=9", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
+	)
+	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{{
+		Question:      "4.5×2=",
+		Subject:       "数学",
+		AnswerState:   AnswerStateUnclear,
+		StudentAnswer: "",
+	}}}
+	d.AnswerAnchorer = &photoAnchorerFake{boxes: map[int]BBox{
+		0: {X: 0.2, Y: 0.3, W: 0.1, H: 0.05},
+	}}
+
+	got, err := d.GradeHomeworkPhoto(context.Background(), PhotoGradeRequest{
+		AgentName: "mingming", Grade: "五年级上", Image: []byte("jpeg"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != PhotoModeGrade {
+		t.Fatalf("a located answer region with unreadable text must fail closed as grade mode, got %q", got.Mode)
+	}
+	if len(got.Items) != 1 || got.Items[0].Status != PhotoAnswerUnclear {
+		t.Fatalf("ambiguous handwriting must be reported for review instead of receiving a generated solution: %#v", got.Items)
+	}
+	if strings.Contains(got.Markdown, "作业解题") || strings.Contains(got.Markdown, "4.5×2=9") {
+		t.Fatalf("ambiguous answered sheet leaked a solution:\n%s", got.Markdown)
+	}
+}
+
+func TestGradeHomeworkPhoto_ModelOnlyUnclearWithoutVerifiedInkIsBlankSolve(t *testing.T) {
+	d, _ := newPipeline(t,
+		fakeSolver{solution: "解：4.5×2=9", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
+	)
+	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{
+		{
+			Question:      "4.5×2=",
+			Subject:       "数学",
+			AnswerState:   AnswerStateUnclear,
+			StudentAnswer: "",
+		},
+		{
+			Question:    "2+2=",
+			Subject:     "数学",
+			AnswerState: AnswerStateBlank,
+		},
+	}}
+	anchorer := &photoAnchorerFake{}
+	d.AnswerAnchorer = anchorer
+	annotator := &photoAnnotatorFake{}
+	d.PhotoAnnotator = annotator
+
+	got, err := d.GradeHomeworkPhoto(context.Background(), PhotoGradeRequest{
+		AgentName: "mingming", Grade: "五年级上", Image: []byte("jpeg"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anchorer.calls != 1 {
+		t.Fatalf("model-only unclear candidates require one independent ink-verification pass, calls=%d", anchorer.calls)
+	}
+	if got.Mode != PhotoModeSolve {
+		t.Fatalf("unverified model-only unclear state must not turn a blank worksheet into grade mode, got %q", got.Mode)
+	}
+	if got.AnnotatedImage != nil || annotator.calls != 0 {
+		t.Fatalf("blank worksheet must not produce a fake correction image: image=%v calls=%d", got.AnnotatedImage, annotator.calls)
+	}
+	for i, item := range got.Items {
+		if item.Status != PhotoBlankSolved {
+			t.Fatalf("blank item %d was not solved after ink verification: %#v", i+1, item)
+		}
+	}
+	if !strings.Contains(got.Markdown, "作业解题") || !strings.Contains(got.Markdown, "4.5×2=9") {
+		t.Fatalf("blank solve markdown missing solution:\n%s", got.Markdown)
+	}
+}
+
 type problemSolverFake struct{}
 
 func (problemSolverFake) Solve(_ context.Context, problem, _, _ string) (SolveResult, error) {
@@ -139,7 +348,7 @@ func (problemSolverFake) Solve(_ context.Context, problem, _, _ string) (SolveRe
 }
 
 func TestGradeHomeworkPhoto_UntrustedOrFailedItemNeverBurnsRedCross(t *testing.T) {
-	d, _ := newPipeline(t, problemSolverFake{}, fakeGrader{outcome: GradeOutcome{Correct: false}}, nil)
+	d, _ := newPipeline(t, problemSolverFake{}, fakeGrader{outcome: GradeOutcome{Verdict: VerdictDisagree}}, nil)
 	box := &BBox{X: 0.2, Y: 0.3, W: 0.1, H: 0.05}
 	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{
 		{Question: "1+1=", Subject: "数学", StudentAnswer: "3", BBox: box},
@@ -178,7 +387,7 @@ func TestTrustedPhotoMarks_RejectsUnverifiedAnnotationAnchor(t *testing.T) {
 	}
 }
 
-func TestTrustedPhotoMarks_DropsCollidingAnchorsInsteadOfMakingAmbiguousCluster(t *testing.T) {
+func TestTrustedPhotoMarks_RetainsEveryVerifiedAnchorRegardlessOfNormalizedProximity(t *testing.T) {
 	items := []PhotoGradeItem{
 		{Recognized: RecognizedQuestion{BBox: &BBox{X: 0.50, Y: 0.20, W: 0.10, H: 0.08}}, Status: PhotoCorrect},
 		{Recognized: RecognizedQuestion{BBox: &BBox{X: 0.54, Y: 0.21, W: 0.10, H: 0.08}}, Status: PhotoWrong},
@@ -186,8 +395,8 @@ func TestTrustedPhotoMarks_DropsCollidingAnchorsInsteadOfMakingAmbiguousCluster(
 	}
 
 	marks := trustedPhotoMarks(items)
-	if len(marks) != 1 || marks[0].BBox.X != 0.80 || !marks[0].Correct {
-		t.Fatalf("colliding anchors must both degrade to text; got %#v", marks)
+	if len(marks) != len(items) {
+		t.Fatalf("domain layer must not discard verified anchors using normalized-distance guesses: %#v", marks)
 	}
 }
 
@@ -212,7 +421,7 @@ func TestPhotoGradeMarkdown_PartialTrustedCoordinatesExplainsImageCoverage(t *te
 	for _, want := range []string{
 		"7 题已判定",
 		"2 题在原作答位置标注",
-		"其余 5 题已在批改图右侧按题号标注",
+		"其余 5 题仅作文字汇总",
 		"### ✅ 答对的题（5）",
 		"**答对题不要逐题展开**",
 	} {

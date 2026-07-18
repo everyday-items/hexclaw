@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 )
 
 // FirstReviewInterval 错题首次复习到期间隔（秒）。间隔重排的起点（§5.3.1）。
@@ -22,6 +22,7 @@ type Deps struct {
 	// mock 或后续 decorator 都可能擦掉可选方法，进而静默退回重复 solver+verifier 的慢路径。
 	VerifiedGrader  VerifiedSolutionGrader
 	Recognizer      Recognizer
+	AnswerAnchorer  AnswerAnchorer
 	Insights        Insights
 	Grounding       Grounding
 	PrepReview      PrepReviewGenerator
@@ -29,8 +30,10 @@ type Deps struct {
 	ArchiveRestorer ArchiveRestorer
 	Renderer        Renderer
 	PhotoAnnotator  PhotoAnnotator
-	Records         *records.Store
-	Constraint      scenario.ConstraintProvider
+	// Records K12 类型化 canonical store（§6.9 k12_* 表 + Transactional Outbox；
+	// ADR-K12-013 一次切换：K12 collection 不再写 agent_records）。
+	Records    *k12storage.Store
+	Constraint scenario.ConstraintProvider
 	// Now 取当前 unix 秒（测试可注入固定时钟）。nil 时用系统时钟。
 	Now func() int64
 }
@@ -38,11 +41,58 @@ type Deps struct {
 // RecognizeHomework 识题：作业图片 → 结构化题目清单（识题入口，走云端 vision）。
 // 前端拿到题目后可逐题调 GradeHomeworkProblem。
 func (d Deps) RecognizeHomework(ctx context.Context, image []byte) ([]RecognizedQuestion, error) {
+	if len(image) == 0 {
+		return nil, fmt.Errorf("%w: Image 不可空", ErrInvalidInput)
+	}
 	if d.Recognizer == nil {
 		return nil, fmt.Errorf("usecase: 未配置识题能力")
 	}
-	return d.Recognizer.Recognize(ctx, image)
+	questions, err := d.Recognizer.Recognize(ctx, image)
+	if err != nil {
+		return nil, err
+	}
+	for i := range questions {
+		questions[i] = NormalizeRecognizedQuestion(questions[i])
+		// Core recognition deliberately exposes no geometry. BBox can only enter the value object through
+		// the independently verified AnswerAnchorer stage, so alternate Recognizer implementations cannot
+		// accidentally collapse the two API phases again.
+		questions[i].BBox = nil
+	}
+	return questions, nil
 }
+
+// AnchorHomeworkAnswers 执行独立的、非阻塞核心识题的图片定位阶段。
+func (d Deps) AnchorHomeworkAnswers(ctx context.Context, image []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
+	if len(image) == 0 {
+		return nil, fmt.Errorf("%w: Image 不可空", ErrInvalidInput)
+	}
+	normalized := append([]RecognizedQuestion(nil), questions...)
+	hasAnswerCandidate := false
+	for i := range normalized {
+		normalized[i] = NormalizeRecognizedQuestion(normalized[i])
+		hasAnswerCandidate = hasAnswerCandidate ||
+			normalized[i].AnswerState == AnswerStatePresent ||
+			normalized[i].AnswerState == AnswerStateUnclear
+	}
+	if !hasAnswerCandidate || d.AnswerAnchorer == nil {
+		return normalized, nil
+	}
+	anchored, err := d.AnswerAnchorer.AnchorAnswers(ctx, image, normalized)
+	if err != nil {
+		return nil, err
+	}
+	if len(anchored) != len(normalized) {
+		return nil, fmt.Errorf("usecase: 答案定位返回题数 %d，与核心识题题数 %d 不一致", len(anchored), len(normalized))
+	}
+	for i := range anchored {
+		anchored[i] = NormalizeRecognizedQuestion(anchored[i])
+	}
+	return anchored, nil
+}
+
+// AnchorHomeworkGeometry（互动 UI 专用的低延迟几何锚定）已随一次切换删除
+//（§6.14 · 2026-07-18）：它只服务被删的 POST /recognize/anchors 直连端点；
+// 统一 GradingJob 的锚点阶段走 AnchorHomeworkAnswers（含转写共识）。
 
 // GradeRequest 一道题的批改请求（识题后的结构化输入）。
 type GradeRequest struct {
@@ -57,13 +107,17 @@ type GradeRequest struct {
 
 // GradeResult 批改闭环结果。
 type GradeResult struct {
-	Solution      string
-	Evidence      SolveEvidence
-	Outcome       GradeOutcome
-	OutOfScope    bool   // 题目/解法超纲（错发）
-	OutOfScopeKP  string // 触发超纲的知识点
-	RecordCreated bool   // 是否新入库错题（幂等去重后）
-	RecordID      string
+	Solution     string
+	Evidence     SolveEvidence
+	Outcome      GradeOutcome
+	OutOfScope   bool   // 题目/解法超纲（错发）
+	OutOfScopeKP string // 触发超纲的知识点
+	// CurriculumUnmapped 词表外知识点（fail-visible，PRD §5.2.4 / bug 2026-07-18）：
+	// 这些 KP 不在课标映射内，超纲硬拦截对它们**不生效**——调用方必须显性提示
+	// 「不在课标映射内」，不得静默呈现为「已过年级校验」。
+	CurriculumUnmapped []string
+	RecordCreated      bool // 是否新入库错题（幂等去重后）
+	RecordID           string
 	// SolveOnly 标识本次是**空白题解题**分叉（student_answer 为空）：只给解法+答案+讲解，
 	// 不批改、不写 grade_correct、不入错题本、不写学情。呈现层据此走「解题」而非「批改」口径。
 	SolveOnly bool
@@ -76,6 +130,8 @@ type SolveHomeworkResult struct {
 	Evidence     SolveEvidence
 	OutOfScope   bool
 	OutOfScopeKP string
+	// CurriculumUnmapped 词表外知识点（fail-visible，见 GradeResult 同名字段）。
+	CurriculumUnmapped []string
 }
 
 // SolveHomeworkProblem 解一道**空白/未作答**题（单一真相源的「空白卷」分叉）：
@@ -98,11 +154,13 @@ func (d Deps) SolveHomeworkProblem(ctx context.Context, req GradeRequest) (Solve
 	req.Subject = subject
 
 	// 年级校验（倒查超纲）：与批改同一红线——超纲则反问不解题（避免教超纲解法）。
-	if oos, kp := d.outOfScope(ctx, req); oos {
+	oos, kp, unmapped := d.outOfScope(ctx, req)
+	if oos {
 		return SolveHomeworkResult{
-			OutOfScope:   true,
-			OutOfScopeKP: kp,
-			Evidence:     SolveEvidence{Verdict: VerdictOutOfScope, EvidenceType: EvidenceNone},
+			OutOfScope:         true,
+			OutOfScopeKP:       kp,
+			CurriculumUnmapped: unmapped,
+			Evidence:           SolveEvidence{Verdict: VerdictOutOfScope, EvidenceType: EvidenceNone},
 		}, nil
 	}
 
@@ -113,23 +171,33 @@ func (d Deps) SolveHomeworkProblem(ctx context.Context, req GradeRequest) (Solve
 	if sr.Evidence.Verdict == VerdictOutOfScope {
 		return SolveHomeworkResult{
 			OutOfScope: true, OutOfScopeKP: sr.OutOfScopeKP,
-			Evidence: sr.Evidence,
+			CurriculumUnmapped: unmapped,
+			Evidence:           sr.Evidence,
 		}, nil
 	}
-	return SolveHomeworkResult{Solution: sr.Solution, Evidence: sr.Evidence}, nil
+	return SolveHomeworkResult{Solution: sr.Solution, Evidence: sr.Evidence, CurriculumUnmapped: unmapped}, nil
 }
 
 // outOfScope 倒查超纲：任一知识点首学年级晚于生效年级 = 错发（数学硬边界）。
-func (d Deps) outOfScope(ctx context.Context, req GradeRequest) (bool, string) {
+// 第三个返回值 = 词表外知识点清单（fail-visible，PRD §5.2.4）：FirstGrade ok=false 的 KP
+// 硬拦截对其不生效，必须向上透出显性提示，不得静默跳过（bug 2026-07-18：初中题挂词表外
+// KP 名即可绕过超纲门被正常批改）。
+func (d Deps) outOfScope(ctx context.Context, req GradeRequest) (bool, string, []string) {
 	if d.Constraint == nil || !isMathSubject(req.Subject) {
-		return false, ""
+		return false, "", nil
 	}
+	var unmapped []string
 	for _, kp := range req.KnowledgePoints {
-		if fg, ok := d.Constraint.FirstGrade(ctx, kp); ok && k12.IsBeyond(req.Grade, fg) {
-			return true, kp
+		fg, ok := d.Constraint.FirstGrade(ctx, kp)
+		if !ok {
+			unmapped = append(unmapped, kp)
+			continue
+		}
+		if k12.IsBeyond(req.Grade, fg) {
+			return true, kp, unmapped
 		}
 	}
-	return false, ""
+	return false, "", unmapped
 }
 
 // GradeHomeworkProblem 批改一道作业题的完整闭环：
@@ -160,19 +228,22 @@ func (d Deps) GradeHomeworkProblem(ctx context.Context, req GradeRequest) (Grade
 			return GradeResult{}, err
 		}
 		return GradeResult{
-			Solution:     sr.Solution,
-			Evidence:     sr.Evidence,
-			OutOfScope:   sr.OutOfScope,
-			OutOfScopeKP: sr.OutOfScopeKP,
-			SolveOnly:    true,
+			Solution:           sr.Solution,
+			Evidence:           sr.Evidence,
+			OutOfScope:         sr.OutOfScope,
+			OutOfScopeKP:       sr.OutOfScopeKP,
+			CurriculumUnmapped: sr.CurriculumUnmapped,
+			SolveOnly:          true,
 		}, nil
 	}
 
 	// 1. 年级校验（倒查超纲）：任一知识点首学年级晚于生效年级 = 错发，反问不批改。
-	if oos, kp := d.outOfScope(ctx, req); oos {
+	oos, kp, unmapped := d.outOfScope(ctx, req)
+	if oos {
 		return GradeResult{
-			OutOfScope:   true,
-			OutOfScopeKP: kp,
+			OutOfScope:         true,
+			OutOfScopeKP:       kp,
+			CurriculumUnmapped: unmapped,
 			Evidence: SolveEvidence{
 				Verdict:      VerdictOutOfScope,
 				EvidenceType: EvidenceNone,
@@ -188,10 +259,11 @@ func (d Deps) GradeHomeworkProblem(ctx context.Context, req GradeRequest) (Grade
 	if sr.Evidence.Verdict == VerdictOutOfScope {
 		return GradeResult{
 			OutOfScope: true, OutOfScopeKP: sr.OutOfScopeKP,
-			Evidence: sr.Evidence,
+			CurriculumUnmapped: unmapped,
+			Evidence:           sr.Evidence,
 		}, nil
 	}
-	res := GradeResult{Solution: sr.Solution, Evidence: sr.Evidence}
+	res := GradeResult{Solution: sr.Solution, Evidence: sr.Evidence, CurriculumUnmapped: unmapped}
 
 	// 3. 批改学生答案。
 	var outcome GradeOutcome
@@ -214,14 +286,19 @@ func (d Deps) GradeHomeworkProblem(ctx context.Context, req GradeRequest) (Grade
 	outcome.ErrorCause = sanitizeErrorCause(outcome.ErrorCause)
 	res.Outcome = outcome
 
-	// 4. 答对 → 若同题已在错题本则推进状态（对同题批改为对 → retried，PRD §3.4.4-2 / §5.3.1）。
+	// 4. 判定统一 Verdict 五值（§4.5）：agree（答对）→ 若同题已在错题本则推进状态
+	//    （对同题批改为对 → retried，PRD §3.4.4-2 / §5.3.1）。
 	//    best-effort：推进失败绝不让批改失败（批改结论独立于记录副作用，PRD §3.4.6）。
-	if outcome.Correct {
+	if outcome.Verdict == VerdictAgree {
 		d.advanceMistakeOnCorrect(ctx, req)
 		return res, nil
 	}
+	// 非二元结论（unverifiable 等）：不判对错，也不得自动进错题本（§4.5「可自动进错题」仅 incorrect）。
+	if outcome.Verdict != VerdictDisagree {
+		return res, nil
+	}
 
-	// 5. 判错 → 无感入库错题（幂等去重）+ 首次复习到期 + 学情薄弱信号。
+	// 5. 判错（disagree）→ 无感入库错题（幂等去重）+ 首次复习到期 + 学情薄弱信号。
 	// 知识点由识题/课标决定（grader 不产 KP）：优先识题结果，回退 grader 若有。
 	knowledgePoint := outcome.KnowledgePoint
 	if len(req.KnowledgePoints) > 0 {
@@ -229,11 +306,13 @@ func (d Deps) GradeHomeworkProblem(ctx context.Context, req GradeRequest) (Grade
 	}
 	res.Outcome.KnowledgePoint = knowledgePoint
 	rec, err := k12.NewMistakeRecord(req.AgentName, req.SourceSession, k12.MistakeFields{
-		Subject:        req.Subject,
-		Question:       req.Problem,
-		KnowledgePoint: knowledgePoint,
-		ErrorCause:     outcome.ErrorCause,
-		WrongProcess:   outcome.WrongStep,
+		Subject:         req.Subject,
+		Question:        req.Problem,
+		KnowledgePoint:  knowledgePoint,
+		ErrorCause:      outcome.ErrorCause,
+		WrongProcess:    outcome.WrongStep,
+		CanonicalAnswer: sr.Solution, // §3.8 治本①：solve 链已验算解法随判错入库，供每周自动装篮出答案卷
+		EntrySource:     k12.MistakeEntryPhoto,
 	})
 	if err != nil {
 		return res, fmt.Errorf("usecase: 构造错题记录: %w", err)
@@ -248,13 +327,9 @@ func (d Deps) GradeHomeworkProblem(ctx context.Context, req GradeRequest) (Grade
 	res.RecordCreated = created
 	res.RecordID = rec.RecordID
 
-	// 学情：写薄弱点信号（错题本身不入记忆，AP-3）。
-	if d.Insights != nil && knowledgePoint != "" {
-		note := fmt.Sprintf("在「%s」出错：%s", knowledgePoint, outcome.ErrorCause)
-		if err := d.Insights.WriteWeakness(ctx, req.AgentName, knowledgePoint, note); err != nil {
-			return res, fmt.Errorf("usecase: 写学情信号: %w", err)
-		}
-	}
+	// 学情薄弱点信号改经 Transactional Outbox 投影（§6.9）：错题域写与
+	// k12.mistake.recorded 事件同事务提交，学情消费者（InsightsConsumer）幂等消费。
+	// 投影失败不撤销成功批改，重试只补投影——不再内联 WriteWeakness。
 	return res, nil
 }
 

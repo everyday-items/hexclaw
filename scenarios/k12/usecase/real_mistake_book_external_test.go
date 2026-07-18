@@ -22,7 +22,7 @@ import (
 
 // mistakeCase 一道题的批改用例（child 答案铁定对/错，模型可靠抓判）。
 type mistakeCase struct {
-	session     string   // 来源会话 = 幂等去重键的一半（同 session+题 = 同一道错题）
+	session     string // 来源会话 = 幂等去重键的一半（同 session+题 = 同一道错题）
 	subject     string
 	problem     string
 	answer      string   // 学生答案
@@ -155,19 +155,19 @@ func runMistakeChain(t *testing.T, ctx context.Context, deps usecase.Deps, cases
 			if res.Evidence.StrongTrust() {
 				strongVerify++
 			}
-			t.Logf("round %d | 题=%q child答=%q | verdict.Correct=%v RecordCreated=%v | WrongStep=%q ErrorCause=%q KP=%q | Badge=%q Verdict=%q EvidenceType=%q | 当前错题库计数=%d",
-				r, c.problem, c.answer, res.Outcome.Correct, res.RecordCreated,
+			t.Logf("round %d | 题=%q child答=%q | verdict=%v RecordCreated=%v | WrongStep=%q ErrorCause=%q KP=%q | Badge=%q Verdict=%q EvidenceType=%q | 当前错题库计数=%d",
+				r, c.problem, c.answer, res.Outcome.Verdict, res.RecordCreated,
 				res.Outcome.WrongStep, res.Outcome.ErrorCause, res.Outcome.KnowledgePoint,
 				badge, res.Evidence.Verdict, res.Evidence.EvidenceType, len(recs))
 
 			// 软对照：模型 verdict 与"铁定对/错"不符 = 免费模型能力问题，记 log 不 FAIL。
-			if res.Outcome.Correct == c.expectWrong {
+			if (res.Outcome.Verdict == usecase.VerdictAgree) == c.expectWrong {
 				t.Logf("🟡 inconclusive(模型能力，非链路 bug): round %d 题=%q child答=%q 期望判%s 实判%s——不 hard-fail，仅验证其判定之后的链路成立",
-					r, c.problem, c.answer, wrongWord(c.expectWrong), wrongWord(!res.Outcome.Correct))
+					r, c.problem, c.answer, wrongWord(c.expectWrong), wrongWord(res.Outcome.Verdict != usecase.VerdictAgree))
 			}
 
 			// 硬不变量：链路只对"模型实际判定"负责，与期望无关。
-			if !res.Outcome.Correct {
+			if res.Outcome.Verdict == usecase.VerdictDisagree {
 				// 判错分支：步骤清晰 + 入库 + 统计。
 				if strings.TrimSpace(res.Outcome.WrongStep) == "" {
 					t.Errorf("链路 bug: round %d 题=%q 判错但 WrongStep 为空（步骤不清晰）", r, c.problem)

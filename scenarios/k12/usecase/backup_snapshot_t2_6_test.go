@@ -9,6 +9,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/curriculum"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
 
@@ -18,7 +19,7 @@ import (
 type memProfileStore struct{ m map[string]k12.ChildProfile }
 
 type memArchiveRestorer struct {
-	records  *records.Store
+	records  *k12storage.Store
 	profiles *memProfileStore
 }
 
@@ -66,7 +67,7 @@ func newBackupDeps(t *testing.T) (usecase.Deps, *memProfileStore) {
 		t.Fatal(err)
 	}
 	ps := &memProfileStore{m: map[string]k12.ChildProfile{}}
-	recordStore := records.NewStore(db, reg.Records)
+	recordStore := k12storage.NewStore(db, reg.Records)
 	deps := usecase.Deps{
 		Solver: toggleSolver{}, Grader: &toggleGrader{}, Records: recordStore,
 		Profiles: ps, Constraint: cur, Now: func() int64 { return 1000 },

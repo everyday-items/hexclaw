@@ -29,12 +29,14 @@ func DailyReminderText(items []ReviewItem) (text string, skip bool) {
 
 // RenderReportMarkdown 把学情报告渲染成四段式 Markdown（§3.6.4-3：总览/强弱项/复习完成/下月建议）。
 // 无任何错题记录（Trend.Total==0）时 skip=true（不发空报告）。
-func RenderReportMarkdown(rep InsightReport) (md string, skip bool) {
+// 标题口径（§3.11 命名定案，与前端 K12InsightPanel titleWithGrade 一致）：
+// 「{年级}学习概览」，gradeTerm 取 Learner profile 的 grade_term；空 → 通用「学习概览」。
+func RenderReportMarkdown(rep InsightReport, gradeTerm string) (md string, skip bool) {
 	if rep.Trend.Total == 0 {
 		return "", true
 	}
 	var b strings.Builder
-	b.WriteString("# 本月学情报告\n\n")
+	b.WriteString("# " + gradeTerm + "学习概览\n\n")
 
 	// ① 总览（进步趋势）
 	b.WriteString("## 总览\n\n")
@@ -78,9 +80,9 @@ func RenderReportMarkdown(rep InsightReport) (md string, skip bool) {
 	return b.String(), false
 }
 
-// SemesterCheckText 生成学期确认提醒（§3.6.4-5，3.1/9.1 触发）。
+// SemesterCheckText 生成学期确认提醒（§3.13 学期确认，3.1/9.1 触发）。
 // 按当前档案推算下一学期，请家长确认（**绝不自动推进档案**）。
-// 档案无年级 / 已是最末档 → skip=true（无从推进）。
+// 档案无年级 / 已是六年级下（小学封顶，冻结#2：不产生升初中建议）→ skip=true。
 func SemesterCheckText(p k12.ChildProfile) (text string, next string, skip bool) {
 	nextTerm, ok := k12.NextGradeTerm(p.GradeTerm)
 	if !ok {
@@ -91,7 +93,7 @@ func SemesterCheckText(p k12.ChildProfile) (text string, next string, skip bool)
 		name = "孩子"
 	}
 	return fmt.Sprintf(
-		"%s现在是%s了吗？回复 是 我就把讲题范围更新到%s；如果是别的年级学期，直接回复该年级（比如「初一上」）。",
+		"%s现在是%s了吗？回复 是 我就把讲题范围更新到%s；如果是别的年级学期，直接回复该年级。",
 		name, nextTerm, nextTerm), nextTerm, false
 }
 
@@ -128,9 +130,11 @@ func (d Deps) constraintFor(ctx context.Context, grade string) string {
 // --- 投递入口（Deps 方法，供 HTTP 投递端点调用）---
 
 // DailyReminder 取复习队列 → 一句话提醒（skip=无待复习）。
+//
+// v0.5.0 冻结（架构设计-v0.5.0 §3.7 明令：「未掌握题不因长时间未练习自动隐藏；
+// 只按学期策略或家长显式操作归档」）：原 30 天静默归档（ArchiveStaleMistakes）与
+// PRD 冲突，已整体删除；归档只剩 学期策略 / 家长手动 / 证据已掌握（mastered）三条路径。
 func (d Deps) DailyReminder(ctx context.Context, agentName string) (text string, skip bool, err error) {
-	// T2.3：每日提醒前先归档 30 天静默的错题（移出活跃复习池），使 archived 自动推进随日跑落地。
-	_, _ = d.ArchiveStaleMistakes(ctx, agentName) // best-effort，不阻断提醒
 	items, err := d.ReviewQueue(ctx, agentName)
 	if err != nil {
 		return "", false, err
@@ -139,46 +143,27 @@ func (d Deps) DailyReminder(ctx context.Context, agentName string) (text string,
 	return text, skip, nil
 }
 
-// StaleArchiveInterval 静默归档阈值（秒）：错题超过此时长无任何状态变化 → 自动归档（PRD §5.3.1）。
-const StaleArchiveInterval int64 = 30 * 86400 // 30 天
-
-// ArchiveStaleMistakes 把某实例错题本内「超过 30 天未发生状态变化」的活跃错题推进 archived，
-// 移出活跃复习池（PRD §5.3.1 「30 天静默自动推进」）。返回归档条数。已归档/未过期的不动。
-func (d Deps) ArchiveStaleMistakes(ctx context.Context, agentName string) (int, error) {
-	recs, err := d.Records.ListByScope(ctx, agentName, k12.CollectionMistakes, "")
-	if err != nil {
-		return 0, fmt.Errorf("usecase: 取错题归档扫描: %w", err)
-	}
-	cutoff := d.now() - StaleArchiveInterval
-	n := 0
-	for _, r := range recs {
-		if r.Status == k12.StatusArchived || r.UpdatedAt > cutoff {
-			continue
-		}
-		// BUG-20260710：顶档（rung 4）间隔 = 30 天 == StaleArchiveInterval，卡片在 due 时刻
-		// UpdatedAt 恰满足静默条件，会先于进复习队列被归档。有未过期/刚到期排期 due 的卡片
-		// 是「按阶梯正常待练」而非静默——只有 due 也已过期 30 天以上（或无 due）才算无状态变化。
-		if r.DueAt != nil && *r.DueAt >= cutoff {
-			continue
-		}
-		if err := d.Records.UpdateStatus(ctx, r.RecordID, k12.StatusArchived, nil, r.Version); err == nil {
-			n++
-		}
-	}
-	return n, nil
-}
-
 // MonthlyReportMarkdown 聚合学情 → 四段式 Markdown（skip=无错题记录）。
+// §3.13（2026-07-18 裁决）不含月报工作流：内容端点保留供家长手动查看，不再默认注册 cron。
 func (d Deps) MonthlyReportMarkdown(ctx context.Context, agentName string) (md string, skip bool, err error) {
 	rep, err := d.InsightReport(ctx, agentName)
 	if err != nil {
 		return "", false, err
 	}
-	md, skip = RenderReportMarkdown(rep)
+	// 标题年级取 Learner profile（未建档/无年级 → 通用「学习概览」，不阻断报告）。
+	grade := ""
+	if d.Profiles != nil {
+		if p, perr := d.GetProfile(ctx, agentName); perr == nil {
+			grade = p.GradeTerm
+		}
+	}
+	md, skip = RenderReportMarkdown(rep, grade)
 	return md, skip, nil
 }
 
-// YearArchiveText 学年归档建议文案（PRD §3.6.2 学年 6 月底归档建议）。
+// YearArchiveText 学年归档建议文案（学年 6 月底备份建议）。
+// §3.13（2026-07-18 裁决）不含学年归档工作流：内容端点保留，不再默认注册 cron。
+// 注意这只是"导出备份"建议文案，不改任何错题状态（§3.7：归档只走学期策略/家长手动/mastered）。
 // 无任何记录 → skip（新账号不打扰）。
 func YearArchiveText(name string, recordCount int) (text string, skip bool) {
 	if recordCount <= 0 {

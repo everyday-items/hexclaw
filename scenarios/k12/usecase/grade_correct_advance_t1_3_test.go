@@ -9,6 +9,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/curriculum"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
 
@@ -25,9 +26,9 @@ type toggleGrader struct{ correct bool }
 
 func (g *toggleGrader) Grade(context.Context, string, string, string) (usecase.GradeOutcome, error) {
 	if g.correct {
-		return usecase.GradeOutcome{Correct: true}, nil
+		return usecase.GradeOutcome{Verdict: usecase.VerdictAgree}, nil
 	}
-	return usecase.GradeOutcome{Correct: false, WrongStep: "第一步", ErrorCause: "计算失误", KnowledgePoint: "小数乘法"}, nil
+	return usecase.GradeOutcome{Verdict: usecase.VerdictDisagree, WrongStep: "第一步", ErrorCause: "计算失误", KnowledgePoint: "小数乘法"}, nil
 }
 
 func newToggleDeps(t *testing.T) (usecase.Deps, *toggleGrader) {
@@ -48,7 +49,7 @@ func newToggleDeps(t *testing.T) (usecase.Deps, *toggleGrader) {
 	}
 	g := &toggleGrader{}
 	return usecase.Deps{
-		Solver: toggleSolver{}, Grader: g, Records: records.NewStore(db, reg.Records),
+		Solver: toggleSolver{}, Grader: g, Records: k12storage.NewStore(db, reg.Records),
 		Constraint: cur, Now: func() int64 { return 1000 },
 	}, g
 }

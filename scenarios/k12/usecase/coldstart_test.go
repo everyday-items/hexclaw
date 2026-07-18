@@ -49,8 +49,9 @@ func TestColdStart_InfersAndCreates(t *testing.T) {
 	if !res.Created || !res.Inferred || res.Grade != "六年级上" {
 		t.Fatalf("应新建+推断六年级上, got %+v", res)
 	}
-	if res.Profile.TextbookEdition != "人教版" {
-		t.Errorf("教材应默认人教版, got %q", res.Profile.TextbookEdition)
+	// §3.1 主流程 5：未配置教材显示待补充，不静默兜底人教版（2026-07-18 纠偏，删默认值）。
+	if res.Profile.TextbookEdition != "" {
+		t.Errorf("教材未提供应留空待补充, got %q", res.Profile.TextbookEdition)
 	}
 
 	// 已有档案 → 不覆盖。

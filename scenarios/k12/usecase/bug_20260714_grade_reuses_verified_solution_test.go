@@ -21,7 +21,7 @@ func (g *verifiedReuseGrader) GradeVerified(_ context.Context, subject, _, _, ve
 	g.verifiedCalls++
 	g.gotSubject = subject
 	g.gotSolution = verifiedSolution
-	return GradeOutcome{Correct: true}, nil
+	return GradeOutcome{Verdict: VerdictAgree}, nil
 }
 
 // BUG-20260714：GradeHomeworkProblem 已先跑过 solver+verifier，旧 adapter 随后又从零跑一遍
@@ -42,7 +42,7 @@ func TestBUG20260714_GradeReusesAlreadyVerifiedSolution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.Outcome.Correct {
+	if res.Outcome.Verdict != VerdictAgree {
 		t.Fatal("expected correct result")
 	}
 	if g.verifiedCalls != 1 || g.legacyCalls != 0 {

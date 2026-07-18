@@ -48,9 +48,10 @@ func TestInsightReport(t *testing.T) {
 	if !hasKP {
 		t.Errorf("连续挫败应含小数乘法, got %v", rep.ConsecutiveFailKPs)
 	}
-	// 复习完成率：当月 5 条，推进到 retried/mastered 的 2 条 → 0.4
-	if rep.ReviewCompletionRate < 0.39 || rep.ReviewCompletionRate > 0.41 {
-		t.Errorf("复习完成率应 ≈0.4, got %v", rep.ReviewCompletionRate)
+	// 复习完成率（§5.7 纠偏口径）：分母 = 已固化卷 verified 题目总数；本测试无固化卷 → -1 哨兵。
+	// 错题 retried/mastered 状态变更由复批投影产生，不再混入本指标口径。
+	if rep.ReviewCompletionRate != -1 {
+		t.Errorf("无已固化卷复习完成率应 -1（显示—）, got %v", rep.ReviewCompletionRate)
 	}
 	// 建议：优先提连续挫败点
 	if rep.Suggestion == "" {
@@ -69,6 +70,6 @@ func TestInsightReport_Empty(t *testing.T) {
 		t.Errorf("空应 0, got %+v", rep.Trend)
 	}
 	if rep.ReviewCompletionRate != -1 {
-		t.Errorf("无当月错题完成率应 -1（前端显示—）, got %v", rep.ReviewCompletionRate)
+		t.Errorf("无已固化卷完成率应 -1（前端显示—）, got %v", rep.ReviewCompletionRate)
 	}
 }

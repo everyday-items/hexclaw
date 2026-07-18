@@ -63,12 +63,16 @@ func (d Deps) RecordMistake(ctx context.Context, req RecordMistakeRequest) (Reco
 		}
 	}
 
+	// CanonicalAnswer 留空（§3.8 治本①探明）：手动录入请求没有「家长提供正确答案」字段
+	// （StudentAnswer 是孩子的错处，不是正解），且本路径不跑 solve 链——无可信答案可带。
+	// 自动装篮时该题按 pending 诚实阻断（默写类「默写：X」题面原文自含除外）。
 	rec, err := k12.NewMistakeRecord(req.AgentName, req.SourceSession, k12.MistakeFields{
 		Subject:        req.Subject,
 		Question:       req.Problem,
 		KnowledgePoint: knowledgePoint,
 		ErrorCause:     errorCause,
 		WrongProcess:   strings.TrimSpace(req.StudentAnswer),
+		EntrySource:    k12.MistakeEntryManual,
 	})
 	if err != nil {
 		return RecordMistakeResult{}, fmt.Errorf("usecase: 构造错题记录: %w", err)
@@ -81,13 +85,8 @@ func (d Deps) RecordMistake(ctx context.Context, req RecordMistakeRequest) (Reco
 		return RecordMistakeResult{}, fmt.Errorf("usecase: 错题入库: %w", err)
 	}
 
-	// 学情：写薄弱点信号（与 GradeHomeworkProblem 判错入库同口径；错题本身不入记忆，AP-3）。
-	if created && d.Insights != nil && knowledgePoint != "" {
-		note := fmt.Sprintf("在「%s」出错（家长手动记入）：%s", knowledgePoint, errorCause)
-		if werr := d.Insights.WriteWeakness(ctx, req.AgentName, knowledgePoint, note); werr != nil {
-			return RecordMistakeResult{}, fmt.Errorf("usecase: 写学情信号: %w", werr)
-		}
-	}
-
+	// 学情薄弱点信号改经 Transactional Outbox 投影（§6.9，与批改判错入库同口径）：
+	// entry_source=manual 的措辞差异由 InsightsConsumer 按 payload 还原；
+	// 手动路径「仅新建时写信号」的既有语义同样由消费者按 created 判定保持。
 	return RecordMistakeResult{RecordCreated: created, RecordID: rec.RecordID, ErrorCause: errorCause}, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -21,13 +22,14 @@ const (
 type PhotoItemStatus string
 
 const (
-	PhotoCorrect     PhotoItemStatus = "correct"
-	PhotoWrong       PhotoItemStatus = "wrong"
-	PhotoUnanswered  PhotoItemStatus = "unanswered"
-	PhotoBlankSolved PhotoItemStatus = "blank_solved"
-	PhotoOutOfScope  PhotoItemStatus = "out_of_scope"
-	PhotoUntrusted   PhotoItemStatus = "untrusted"
-	PhotoFailed      PhotoItemStatus = "failed"
+	PhotoCorrect       PhotoItemStatus = "correct"
+	PhotoWrong         PhotoItemStatus = "wrong"
+	PhotoUnanswered    PhotoItemStatus = "unanswered"
+	PhotoAnswerUnclear PhotoItemStatus = "answer_unclear"
+	PhotoBlankSolved   PhotoItemStatus = "blank_solved"
+	PhotoOutOfScope    PhotoItemStatus = "out_of_scope"
+	PhotoUntrusted     PhotoItemStatus = "untrusted"
+	PhotoFailed        PhotoItemStatus = "failed"
 )
 
 type PhotoGradeRequest struct {
@@ -50,6 +52,7 @@ type PhotoGradeResult struct {
 	Mode           PhotoMode
 	Items          []PhotoGradeItem
 	AnnotatedImage *RenderedPhoto
+	ImageWarning   string
 	Markdown       string
 }
 
@@ -75,15 +78,33 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 		}
 	}
 
-	mode := PhotoModeSolve
-	for _, q := range questions {
-		if strings.TrimSpace(q.StudentAnswer) != "" {
-			mode = PhotoModeGrade
-			break
+	imageWarning := ""
+	hasPresent, hasUnclear := photoAnswerCandidates(questions)
+	anchorVerified := false
+	if (hasPresent || hasUnclear) && d.AnswerAnchorer != nil {
+		anchored, anchorErr := d.AnchorHomeworkAnswers(ctx, req.Image, questions)
+		if anchorErr == nil {
+			questions = anchored
+			anchorVerified = true
+		} else {
+			if hasPresent {
+				imageWarning = "未能可靠定位作答位置，本次仅提供文字批改"
+			} else {
+				imageWarning = "未能独立核验疑似学生笔迹，为避免泄露答案，本次按批改卷处理"
+			}
+		}
+	}
+	mode := classifyPhotoMode(questions)
+	if mode == PhotoModeSolve && hasUnclear && !anchorVerified {
+		// An unavailable evidence adapter must fail closed: a genuinely answered but unreadable page
+		// must never receive generated answers merely because the independent verifier did not run.
+		mode = PhotoModeGrade
+		if imageWarning == "" {
+			imageWarning = "未配置疑似笔迹核验，为避免泄露答案，本次按批改卷处理"
 		}
 	}
 
-	result := PhotoGradeResult{Mode: mode, Items: make([]PhotoGradeItem, len(questions))}
+	result := PhotoGradeResult{Mode: mode, Items: make([]PhotoGradeItem, len(questions)), ImageWarning: imageWarning}
 	jobs := make(chan int)
 	var wg sync.WaitGroup
 	workerCount := 2
@@ -98,15 +119,21 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 				q := questions[i]
 				item := PhotoGradeItem{Recognized: q}
 				if mode == PhotoModeGrade {
-					if strings.TrimSpace(q.StudentAnswer) == "" {
+					switch q.AnswerState {
+					case AnswerStateBlank:
 						item.Status = PhotoUnanswered
+						result.Items[i] = item
+						continue
+					case AnswerStateUnclear:
+						item.Status = PhotoAnswerUnclear
+						item.Warning = "检测到学生笔迹，但未能可靠读出；请家长补录后再批改"
 						result.Items[i] = item
 						continue
 					}
 					graded, gradeErr := d.GradeHomeworkProblem(ctx, GradeRequest{
 						AgentName: req.AgentName, Subject: firstNonEmpty(q.Subject, req.Subject), Grade: req.Grade,
 						SourceSession: req.SourceSession, Problem: q.Question, StudentAnswer: q.StudentAnswer,
-						KnowledgePoints: q.KnowledgePoints,
+						KnowledgePoints: photoGradeKnowledgePoints(q),
 					})
 					item.Grade = graded
 					switch {
@@ -116,10 +143,13 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 						item.Status = PhotoOutOfScope
 					case !photoEvidenceTrusted(graded.Evidence):
 						item.Status, item.Warning = PhotoUntrusted, "验算证据不足，暂不在图片上判对错"
-					case graded.Outcome.Correct:
+					case graded.Outcome.Verdict == VerdictAgree:
 						item.Status = PhotoCorrect
-					default:
+					case graded.Outcome.Verdict == VerdictDisagree:
 						item.Status = PhotoWrong
+					default:
+						// 判定统一 Verdict 五值（§4.5）：非二元结论不伪装成对/错，按证据不足降级。
+						item.Status, item.Warning = PhotoUntrusted, "批改判定无二元结论，暂不在图片上判对错"
 					}
 					result.Items[i] = item
 					continue
@@ -127,7 +157,7 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 
 				solved, solveErr := d.SolveHomeworkProblem(ctx, GradeRequest{
 					AgentName: req.AgentName, Subject: firstNonEmpty(q.Subject, req.Subject), Grade: req.Grade,
-					SourceSession: req.SourceSession, Problem: q.Question, KnowledgePoints: q.KnowledgePoints,
+					SourceSession: req.SourceSession, Problem: q.Question, KnowledgePoints: photoGradeKnowledgePoints(q),
 				})
 				item.Solve = solved
 				switch {
@@ -152,7 +182,10 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 	wg.Wait()
 
 	if mode == PhotoModeGrade {
-		marks := photoAnnotations(result.Items)
+		// The renderer must never receive zero/invalid coordinates. Otherwise a verified verdict with
+		// no safely located answer can be encoded as an unchanged copy of the worksheet and falsely
+		// presented to the IM channel as a correction image.
+		marks := trustedPhotoMarks(result.Items)
 		if len(marks) > 0 && d.PhotoAnnotator != nil {
 			rendered, renderErr := d.PhotoAnnotator.Annotate(ctx, req.Image, marks)
 			if renderErr == nil && len(rendered.Data) > 0 {
@@ -169,6 +202,32 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 	}
 	result.Markdown = photoGradeMarkdown(result)
 	return result, nil
+}
+
+func classifyPhotoMode(questions []RecognizedQuestion) PhotoMode {
+	for _, question := range questions {
+		normalized := NormalizeRecognizedQuestion(question)
+		if normalized.AnswerState == AnswerStatePresent {
+			return PhotoModeGrade
+		}
+		if normalized.AnswerState == AnswerStateUnclear && normalized.BBox != nil &&
+			photoAnnotationHasTrustedBBox(PhotoAnnotation{BBox: *normalized.BBox}) {
+			return PhotoModeGrade
+		}
+	}
+	return PhotoModeSolve
+}
+
+func photoAnswerCandidates(questions []RecognizedQuestion) (present, unclear bool) {
+	for _, question := range questions {
+		switch NormalizeRecognizedQuestion(question).AnswerState {
+		case AnswerStatePresent:
+			present = true
+		case AnswerStateUnclear:
+			unclear = true
+		}
+	}
+	return present, unclear
 }
 
 func firstNonEmpty(a, b string) string {
@@ -205,28 +264,33 @@ func photoAnnotations(items []PhotoGradeItem) []PhotoAnnotation {
 		}
 		marks = append(marks, mark)
 	}
-	conflicted := make([]bool, len(marks))
-	for i := 0; i < len(marks); i++ {
-		if !photoAnnotationHasTrustedBBox(marks[i]) {
-			continue
-		}
-		for j := i + 1; j < len(marks); j++ {
-			if !photoAnnotationHasTrustedBBox(marks[j]) {
-				continue
-			}
-			a, b := marks[i].BBox, marks[j].BBox
-			aY, bY := a.Y+a.H*0.75, b.Y+b.H*0.75
-			if math.Abs(a.X-b.X) < 0.06 && math.Abs(aY-bY) < 0.04 {
-				conflicted[i], conflicted[j] = true, true
-			}
-		}
-	}
-	for i := range marks {
-		if conflicted[i] {
-			marks[i].BBox = BBox{}
-		}
-	}
 	return marks
+}
+
+var photoFractionToken = regexp.MustCompile(`\d+\s*/\s*\d+`)
+var photoChineseFractionToken = regexp.MustCompile(`[零〇一二两三四五六七八九十百]+\s*分之\s*[零〇一二两三四五六七八九十百]+`)
+
+// photoGradeKnowledgePoints corrects a coarse but common photo-recognition label without changing
+// the canonical curriculum. Problems such as “8 的 1/4 的 4/5” are an application of the meaning
+// of fractions in fifth grade; treating every such expression as the formal sixth-grade
+// “分数乘法” unit creates a false out-of-scope verdict.
+func photoGradeKnowledgePoints(question RecognizedQuestion) []string {
+	points := append([]string(nil), question.KnowledgePoints...)
+	problem := strings.TrimSpace(question.Question)
+	// Natural-language “a number's m/n” applications belong to the fifth-grade meaning of
+	// fractions even though their solution can be rewritten with multiplication/division. Only
+	// normalize that wording; explicit fraction ×/÷ expressions remain the formal sixth-grade unit.
+	if !strings.Contains(problem, "的") ||
+		(len(photoFractionToken.FindAllString(problem, -1)) == 0 && !photoChineseFractionToken.MatchString(problem)) ||
+		strings.ContainsAny(problem, "×÷") || strings.Contains(problem, "乘以") || strings.Contains(problem, "除以") {
+		return points
+	}
+	for i, point := range points {
+		if normalized := strings.TrimSpace(point); normalized == "分数乘法" || normalized == "分数除法" {
+			points[i] = "分数的意义和性质"
+		}
+	}
+	return points
 }
 
 func photoAnnotationHasTrustedBBox(mark PhotoAnnotation) bool {
@@ -263,7 +327,7 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 		return strings.TrimSpace(b.String())
 	}
 
-	correct, wrong, unanswered, pending := 0, 0, 0, 0
+	correct, wrong, unanswered, unclear, pending := 0, 0, 0, 0, 0
 	for _, item := range result.Items {
 		switch item.Status {
 		case PhotoCorrect:
@@ -272,6 +336,8 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 			wrong++
 		case PhotoUnanswered:
 			unanswered++
+		case PhotoAnswerUnclear:
+			unclear++
 		default:
 			pending++
 		}
@@ -281,17 +347,23 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 	if unanswered > 0 {
 		fmt.Fprintf(&b, "，未作答 **%d** 题", unanswered)
 	}
+	if unclear > 0 {
+		fmt.Fprintf(&b, "，作答待补录 **%d** 题", unclear)
+	}
 	if pending > 0 {
 		fmt.Fprintf(&b, "，待核对 **%d** 题", pending)
 	}
 	b.WriteString("\n\n")
+	if result.ImageWarning != "" {
+		fmt.Fprintf(&b, "> ℹ️ %s。\n\n", result.ImageWarning)
+	}
 	determined := correct + wrong
 	annotated := 0
 	if result.AnnotatedImage != nil && len(result.AnnotatedImage.Data) > 0 {
 		annotated = len(trustedPhotoMarks(result.Items))
 	}
 	if result.AnnotatedImage != nil && len(result.AnnotatedImage.Data) > 0 && annotated < determined {
-		fmt.Fprintf(&b, "> ℹ️ 本次 %d 题已判定，其中 %d 题在原作答位置标注，其余 %d 题已在批改图右侧按题号标注，避免猜测坐标造成错位。\n\n",
+		fmt.Fprintf(&b, "> ℹ️ 本次 %d 题已判定，其中 %d 题在原作答位置标注；其余 %d 题仅作文字汇总，未在图上猜测位置。\n\n",
 			determined, annotated, determined-annotated)
 	} else if annotated < determined {
 		if annotated == 0 {

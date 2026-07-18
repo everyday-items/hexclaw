@@ -5,10 +5,10 @@ import (
 	"database/sql"
 	"testing"
 
-	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/curriculum"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
 
@@ -34,7 +34,7 @@ func newClockDeps(t *testing.T, clock *int64) (usecase.Deps, *toggleGrader) {
 	}
 	g := &toggleGrader{}
 	return usecase.Deps{
-		Solver: toggleSolver{}, Grader: g, Records: records.NewStore(db, reg.Records),
+		Solver: toggleSolver{}, Grader: g, Records: k12storage.NewStore(db, reg.Records),
 		Constraint: cur, Now: func() int64 { return *clock },
 	}, g
 }

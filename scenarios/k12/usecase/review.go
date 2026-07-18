@@ -10,12 +10,17 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
-// reviewIntervalLadder 艾宾浩斯式间隔阶梯（秒）：卡片每成功重做一次，下次复习推得更远
-// （越记得牢间隔越长，抗遗忘曲线）。索引 = ReviewStage 轮次；超出末档按 30 天封顶。
+// ReviewPolicyVersion 生效复习策略版本（架构设计 §4.6：复习与掌握策略参数化为版本化
+// review policy；策略版本变更只影响其后的计算，不回溯改写既有状态）。
+const ReviewPolicyVersion = "v1"
+
+// reviewIntervalLadder 默认策略 v1 的间隔阶梯（秒，§4.6）：due_at 间隔序列 1、3、7、14 天，
+// 每次复练通过取下一档，未通过重置回首档（重置在 applyRegradeOutcome 执行）。
+// 索引 = ReviewStage 轮次；超出末档按 14 天封顶。
 //
 //	rung 0 = 1 天（入库首排，与 pipeline.FirstReviewInterval 对齐）
-//	rung 1 = 3 天（首次重做做对）· rung 2 = 7 天 · rung 3 = 15 天 · rung 4+ = 30 天封顶
-var reviewIntervalLadder = []int64{1 * 86400, 3 * 86400, 7 * 86400, 15 * 86400, 30 * 86400}
+//	rung 1 = 3 天（首次重做做对）· rung 2 = 7 天 · rung 3+ = 14 天封顶
+var reviewIntervalLadder = []int64{1 * 86400, 3 * 86400, 7 * 86400, 14 * 86400}
 
 // reviewIntervalForStage 取某复习轮次的到期间隔（秒），末档封顶、下界 0。
 func reviewIntervalForStage(stage int) int64 {
@@ -101,6 +106,11 @@ func (d Deps) ReviewQueue(ctx context.Context, agentName string) ([]ReviewItem, 
 
 // MarkMastered 家长「他会了」/复测掌握：状态 → 已掌握，清到期（移出复习队列）。**按 collection 分派**
 // 掌握态（错题本 mastered / 积累本 已掌握）——否则会撞记录集状态机校验。
+//
+// 抽查复验安排（§3.6，2026-07-18 落地）：错题确认已会时 spot_check_state none→scheduled，
+// 下一周期周卷混入一道抽查（FillBasketFromDue）。**最多自动安排一次**：已 scheduled/passed/
+// failed 的再次确认不重复安排——特别是 failed（复验未过）后家长再次确认，尊重家长判断
+// 不再强制抽查，仅保留「家长确认（复验未过）」事实标注（规则 4）。
 func (d Deps) MarkMastered(ctx context.Context, agentName, recordID string, expectedVersion int) error {
 	if agentName == "" || recordID == "" {
 		return fmt.Errorf("%w: agentName / recordID 不可空", ErrInvalidInput)
@@ -112,15 +122,22 @@ func (d Deps) MarkMastered(ctx context.Context, agentName, recordID string, expe
 	if rec.AgentName != agentName {
 		return fmt.Errorf("usecase: 取记录: %w", records.ErrNotFound)
 	}
-	mastered := k12.StatusMastered
 	if rec.Collection == k12.CollectionAccumulation {
-		mastered = k12.AccumStatusMastered
+		return d.Records.UpdateStatusScoped(ctx, agentName, recordID, k12.AccumStatusMastered, nil, expectedVersion)
 	}
-	return d.Records.UpdateStatusScoped(ctx, agentName, recordID, mastered, nil, expectedVersion)
+	f, _ := k12.ParseMistakeFields(rec.Fields)
+	if f.SpotCheckState == "" || f.SpotCheckState == k12.SpotCheckNone {
+		f.SpotCheckState = k12.SpotCheckScheduled // 最多自动安排一次；间隔档不动（复验未过要恢复原档）
+	}
+	raw, err := json.Marshal(f)
+	if err != nil {
+		return fmt.Errorf("usecase: marshal 错题字段: %w", err)
+	}
+	return d.Records.UpdateStatusFields(ctx, recordID, k12.StatusMastered, nil, string(raw), expectedVersion)
 }
 
 // DeleteMistake 家长「删除这条错题」（UX-3 · 数据纠错，非逃避难题）：移除记错的 / 重复的条目。
-// 校验 agent 归属后删除对应 agent_records 记录（Store.Delete 内按 agent_name 圈定）——
+// 校验 agent 归属后删除对应 k12_mistakes 记录（Store.Delete 内按 agent_name 圈定）——
 // 不存在 / 不属于该实例 → records.ErrNotFound（HTTP 404）。产品评审定案为详情弹层内的克制入口
 // （二次确认），故此处只做归属校验 + 删除，不做任何状态机流转。
 func (d Deps) DeleteMistake(ctx context.Context, agentName, recordID string) error {
@@ -145,6 +162,11 @@ func (d Deps) MarkRetried(ctx context.Context, recordID string, expectedVersion 
 	}
 	if rec.Collection == k12.CollectionAccumulation {
 		return d.markRetriedAccum(ctx, rec, expectedVersion) // 语英纠错型：同艾宾浩斯阶梯，用积累本状态
+	}
+	// 已掌握（家长确认/证据掌握）再做对：幂等不倒退——mastered→retried 仅保留给
+	// 抽查复验未过路径（§3.6 规则 3，applySpotCheckOutcome），普通复批不得触发。
+	if rec.Status == k12.StatusMastered {
+		return nil
 	}
 	f, _ := k12.ParseMistakeFields(rec.Fields)
 	now := d.now()

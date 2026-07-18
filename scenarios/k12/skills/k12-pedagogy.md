@@ -5,7 +5,7 @@ description: K12 各学科辅导的共享教学法基座——答案遮罩、渐
 author: hexclaw
 version: "1.1.0"
 schema_version: 1
-min_engine_version: "0.5.0-beta"
+min_engine_version: "0.5.0"
 license: Apache-2.0
 category: education
 icon: "🎓"

@@ -26,12 +26,15 @@ type WeakPoint struct {
 
 // InsightReport 学情报告（M2-5，只读聚合 §5.4 口径）。
 type InsightReport struct {
-	Trend                TrendCounts `json:"trend"`
-	WeakTop3             []WeakPoint `json:"weak_top3"`              // §5.4.1 当月新增错题 TOP3
-	MonthNewMistakes     int         `json:"month_new_mistakes"`     // 当月新增错题数
-	ReviewCompletionRate float64     `json:"review_completion_rate"` // §5.4.2；-1 = 分母0（显示「—」）
-	ConsecutiveFailKPs   []string    `json:"consecutive_fail_kps"`   // 连续挫败知识点（≥阈值未掌握）
-	Suggestion           string      `json:"suggestion"`             // 本月建议
+	Trend            TrendCounts `json:"trend"`
+	WeakTop3         []WeakPoint `json:"weak_top3"`          // §5.4.1 当月新增错题 TOP3
+	MonthNewMistakes int         `json:"month_new_mistakes"` // 当月新增错题数
+	// ReviewCompletionRate 复习完成率（架构设计 §5.7 口径）：已复批 PracticeSetItem 数 ÷
+	// 已固化（打印/发送）卷的 verified 题目总数；从练习集 collection 投影。
+	// 错题 retried/mastered 状态变更由复批投影产生，不混入本指标。-1 = 分母 0（显示「—」）。
+	ReviewCompletionRate float64  `json:"review_completion_rate"`
+	ConsecutiveFailKPs   []string `json:"consecutive_fail_kps"` // 连续挫败知识点（≥阈值未掌握）
+	Suggestion           string   `json:"suggestion"`           // 本月建议
 }
 
 // InsightReport 生成学情报告：趋势（累计状态）+ 当月薄弱 TOP3 + 复习完成率 + 连续挫败 + 建议。
@@ -48,7 +51,6 @@ func (d Deps) InsightReport(ctx context.Context, agentName string) (InsightRepor
 	var rep InsightReport
 	weakCount := map[string]int{} // 当月薄弱计数
 	failCount := map[string]int{} // 未掌握计数（连续挫败）
-	monthTotal, monthDone := 0, 0 // 复习完成率：分母/分子
 
 	for _, r := range all {
 		f, _ := k12.ParseMistakeFields(r.Fields)
@@ -74,23 +76,53 @@ func (d Deps) InsightReport(ctx context.Context, agentName string) (InsightRepor
 			if f.KnowledgePoint != "" {
 				weakCount[f.KnowledgePoint]++
 			}
-			monthTotal++
-			// §5.4.2 复习完成率分子：推进到已重做及以上
-			if r.Status == k12.StatusRetried || r.Status == k12.StatusMastered {
-				monthDone++
-			}
 		}
 	}
 
 	rep.WeakTop3 = topN(weakCount, 3)
-	if monthTotal == 0 {
-		rep.ReviewCompletionRate = -1 // 分母 0 → 前端显示「—」
-	} else {
-		rep.ReviewCompletionRate = float64(monthDone) / float64(monthTotal)
+	rate, err := d.reviewCompletionRate(ctx, agentName)
+	if err != nil {
+		return InsightReport{}, err
 	}
+	rep.ReviewCompletionRate = rate
 	rep.ConsecutiveFailKPs = keysAtLeast(failCount, consecutiveFailThreshold)
 	rep.Suggestion = buildSuggestion(rep)
 	return rep, nil
+}
+
+// reviewCompletionRate 复习完成率（§5.7 纠偏口径，2026-07-18）：
+// 分母 = 已固化（打印/发送）卷的 verified 题目总数；分子 = 其中已复批（有逐题结论，
+// 或整卷 graded/closed 的旧行为卷）的 PracticeSetItem 数。取消卷与未固化篮不入口径；
+// 分母 0 → -1 哨兵（前端显示「—」）。
+func (d Deps) reviewCompletionRate(ctx context.Context, agentName string) (float64, error) {
+	sets, err := d.Records.ListByScope(ctx, agentName, k12.CollectionPracticeSet, "")
+	if err != nil {
+		return 0, fmt.Errorf("usecase: 投影练习集完成率: %w", err)
+	}
+	total, done := 0, 0
+	for _, r := range sets {
+		if r.Status == k12.PracticeStatusCancelled {
+			continue
+		}
+		f, _ := k12.ParsePracticeSetFields(r.Fields)
+		if f.FinalizedAt == 0 { // 未固化（待打印篮）不入口径
+			continue
+		}
+		wholeGraded := r.Status == k12.PracticeStatusGraded || r.Status == k12.PracticeStatusClosed
+		for _, it := range f.Items {
+			if !k12.PracticeItemPublishable(it) {
+				continue // 阻断题不在卷面上
+			}
+			total++
+			if it.ResultCorrect != nil || wholeGraded {
+				done++
+			}
+		}
+	}
+	if total == 0 {
+		return -1, nil
+	}
+	return float64(done) / float64(total), nil
 }
 
 // topN 取计数最高的 N 个知识点（并列按名稳定）。

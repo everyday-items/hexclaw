@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"errors"
+	"strings"
 )
 
 // ErrRenderUnavailable render 服务未启用（调用方降级 markdown）。
@@ -33,20 +34,65 @@ type BBox struct {
 	H float64
 }
 
+// AnswerState 是视觉识别后的作答事实，必须与 StudentAnswer 文本分离。
+//
+//   - blank:   核心识别未发现学生作答；
+//   - present: 可以确认有作答，且 StudentAnswer 已可靠誊录；
+//   - unclear: 核心识别发现疑似笔迹/涂改，但无法可靠誊录，仍需独立图片证据确认。
+//
+// present 本身足以进入批改；只有 unclear 时，必须由 AnswerAnchorer 给出经过本地墨迹门禁的
+// BBox 才能确认是已答卷。这样既不会把空白卷上的印刷噪声当作作答，也不会用答案文本是否为空猜测。
+type AnswerState string
+
+const (
+	AnswerStateBlank   AnswerState = "blank"
+	AnswerStatePresent AnswerState = "present"
+	AnswerStateUnclear AnswerState = "unclear"
+)
+
 // RecognizedQuestion 识题产出的结构化题目值对象（engine 只产值对象，不含领域编排）。
 type RecognizedQuestion struct {
 	Question        string
 	KnowledgePoints []string
-	// StudentAnswer 识题时视觉模型逐题回收的孩子**手写作答**内容（未作答留空）。
-	// 这是「空白卷 vs 已答卷」的单一真相源：空=空白题→走解题（SolveHomeworkProblem），
-	// 非空=已答题→走批改（GradeHomeworkProblem）。绝不由 LLM 编造，未辨认出留空字符串。
+	// AnswerState 是“是否作答、能否可靠读出”的单一真相源。
+	AnswerState AnswerState
+	// StudentAnswer 仅承载可靠誊录出的学生作答。blank / unclear 时必须为空；
+	// present 时必须非空。模型解释文字、置信度说明和“无法辨认”等元描述不得进入本字段。
 	StudentAnswer string
 	// Subject 识题时视觉模型逐题自动判定的学科（数学/语文/英语/物理/化学）；判不出留空。
 	// 家长不必手选学科——前端据此预填学科下拉（仍可手动覆盖），solve/批改不再 gate 在手选上。
 	Subject string
-	// BBox 学生作答区域的归一化边界框（0~1），供前端在原图上叠加 ✓/✗（原图批改 Phase 1）。
-	// nil = 视觉模型未给/坐标非法（降级为纯文字批改，不叠加）；绝不是零值 struct（{0,0,0,0} 会误叠加）。
+	// BBox 是独立于核心识题、并通过本地几何与墨迹门禁的学生作答边界框。
+	// present 可用它原位回写批改标记；unclear 可用它确认确有不可辨认的学生笔迹，但不会画对错。
+	// nil = 尚未定位或证据不足；前端/IM 只能降级为文字结果，绝不能猜测位置。
 	BBox *BBox
+}
+
+// NormalizeRecognizedQuestion 把任何 Recognizer 实现的输出收敛到领域不变量。
+// 兼容未显式提供 AnswerState 的旧实现，但绝不使用 BBox 推断作答状态。
+func NormalizeRecognizedQuestion(q RecognizedQuestion) RecognizedQuestion {
+	q.Question = strings.TrimSpace(q.Question)
+	q.StudentAnswer = strings.TrimSpace(q.StudentAnswer)
+	switch q.AnswerState {
+	case AnswerStatePresent:
+		if q.StudentAnswer == "" {
+			q.AnswerState = AnswerStateUnclear
+		}
+	case AnswerStateBlank:
+		q.StudentAnswer = ""
+	case AnswerStateUnclear:
+		q.StudentAnswer = ""
+	default:
+		if q.StudentAnswer == "" {
+			q.AnswerState = AnswerStateBlank
+		} else {
+			q.AnswerState = AnswerStatePresent
+		}
+	}
+	if q.AnswerState == AnswerStateBlank {
+		q.BBox = nil
+	}
+	return q
 }
 
 // Recognizer 拍题识别 port（adapter = OCR + 云端 vision，出网走 egress 白名单）。
@@ -54,9 +100,20 @@ type Recognizer interface {
 	Recognize(ctx context.Context, image []byte) ([]RecognizedQuestion, error)
 }
 
-// PhotoAnnotation 是允许进入批改图的可信批改结论。经过程序/强证据验算且 bbox
-// 合法时在原作答位置绘制；没有可靠 bbox 时 BBox 保持零值，由 adapter 在独立的题号结果栏
-// 绘制，绝不猜测坐标。超纲、不可验证、失败项不得伪装成红叉。
+// AnswerAnchorer 是可选的第二阶段图片证据 port：在核心识题已经返回后，按页批量定位并独立
+// 核验学生答案的墨迹坐标。实现应先用固定次数的整页/批量证据解决无争议答案；只有仍冲突的
+// 单题才能进入隔离复核，避免为追求固定调用数而把多个争议答案塞进同一上下文相互污染。
+type AnswerAnchorer interface {
+	AnchorAnswers(ctx context.Context, image []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, error)
+}
+
+// AnswerGeometryAnchorer 端口已随一次切换删除（§6.14 · 2026-07-18）：它是被删的
+// POST /recognize/anchors 直连端点专用的低延迟几何子集；批改统一走 AnswerAnchorer
+//（含转写共识）。adapter 内部仍可自行分层实现几何 pass，但不再是 usecase 端口。
+
+// PhotoAnnotation 是允许进入批改图的可信批改结论。只有经过程序/强证据验算且 bbox
+// 合法的结论才可传给 adapter，并在原作答位置绘制。没有可靠 bbox 的结论只保留在文字
+// 汇总中，绝不猜测坐标或发送未改动原图。超纲、不可验证、失败项不得伪装成红叉。
 type PhotoAnnotation struct {
 	BBox           BBox
 	QuestionNumber int
@@ -122,9 +179,13 @@ type CauseSummarizer interface {
 	SummarizeCause(ctx context.Context, subject, question, studentAnswer, grade string) (string, error)
 }
 
-// GradeOutcome 批改结果（第一个错步 + 错因 + 命中知识点）。
+// GradeOutcome 批改结果（判定 + 第一个错步 + 错因 + 命中知识点）。
+//
+// 判定统一走 Verdict 五值（§3.4/§4.5：布尔 correct 只在迁移读取层短期兼容，切换后删除）：
+// agree=答对、disagree=答错（仅 disagree 自动入错题本，§4.5「可自动进错题」列）；
+// 其余值（unverifiable/out_of_scope/verbatim）表示无二元结论，不判对错、不自动入错题。
 type GradeOutcome struct {
-	Correct        bool
+	Verdict        Verdict
 	WrongStep      string
 	ErrorCause     string
 	KnowledgePoint string

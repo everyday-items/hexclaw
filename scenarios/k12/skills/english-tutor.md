@@ -5,7 +5,7 @@ description: 辅导、批改小学到初中英语——用法先于术语讲语�
 author: hexclaw
 version: "1.1.0"
 schema_version: 1
-min_engine_version: "0.5.0-beta"
+min_engine_version: "0.5.0"
 license: Apache-2.0
 category: education
 icon: "🔤"

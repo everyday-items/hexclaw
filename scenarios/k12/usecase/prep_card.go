@@ -44,15 +44,26 @@ var prepCardBuildBudget = 90 * time.Second
 // warmupSolveBudget 是总预算内热身题自己的上限；父 ctx 的更早 deadline 会自动优先。
 var warmupSolveBudget = 90 * time.Second
 
-// BuildPrepCard 生成一页备课卡（只读聚合 + grounding + 来源标注）。
+// BuildPrepCard 生成一页备课卡（只读聚合 + grounding + 来源标注）。不带学科的旧入口，
+// 等价于 BuildPrepCardSubject 空学科（不分科旧语义，前向兼容）。
+func (d Deps) BuildPrepCard(ctx context.Context, agentName, grade string, knowledgePoints []string) (PrepCard, error) {
+	return d.BuildPrepCardSubject(ctx, agentName, grade, "", knowledgePoints)
+}
+
+// BuildPrepCardSubject 生成一页备课卡（只读聚合 + grounding + 来源标注）。
 //
 // 五段：①知识点回顾(RAG/LLM) ②孩子历史(错题本) ③卡点+引导(错题本) ④热身题(验算) ⑤情绪提示(学情)。
 // 全程只读档案/错题/学情，不写入（§3.14.9）。solve 验算链只验解题、不验讲解——①段靠来源标注兜信任。
-func (d Deps) BuildPrepCard(ctx context.Context, agentName, grade string, knowledgePoints []string) (PrepCard, error) {
+// subject 为当前题目学科（§4.3 分科教材）：①段优先检索本学科教材，无本学科教材回退通用；
+// 空 = 不分科旧语义。
+func (d Deps) BuildPrepCardSubject(ctx context.Context, agentName, grade, subject string, knowledgePoints []string) (PrepCard, error) {
 	if agentName == "" || len(knowledgePoints) == 0 {
 		return PrepCard{}, fmt.Errorf("%w: 备课卡需 agentName + 至少一个知识点", ErrInvalidInput)
 	}
 	if err := validateGradeInput(grade); err != nil {
+		return PrepCard{}, err
+	}
+	if err := validateTextbookSubject(subject); err != nil {
 		return PrepCard{}, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, prepCardBuildBudget)
@@ -65,8 +76,8 @@ func (d Deps) BuildPrepCard(ctx context.Context, agentName, grade string, knowle
 		return PrepCard{}, err
 	}
 
-	// ① 知识点回顾：优先教材 grounding，否则降级 LLM（来源标注是唯一信任机制）。
-	card.Sections = append(card.Sections, d.sectionReview(ctx, agentName, grade, knowledgePoints))
+	// ① 知识点回顾：优先教材 grounding（分科优先本学科），否则降级 LLM（来源标注是唯一信任机制）。
+	card.Sections = append(card.Sections, d.sectionReview(ctx, agentName, grade, subject, knowledgePoints))
 
 	// ② 孩子历史表现。
 	card.Sections = append(card.Sections, sectionHistory(history))
@@ -84,7 +95,7 @@ func (d Deps) BuildPrepCard(ctx context.Context, agentName, grade string, knowle
 	return card, nil
 }
 
-func (d Deps) sectionReview(ctx context.Context, agentName, grade string, kps []string) PrepSection {
+func (d Deps) sectionReview(ctx context.Context, agentName, grade, subject string, kps []string) PrepSection {
 	var b strings.Builder
 	label := SrcTextbook
 	grounded := 0
@@ -92,14 +103,14 @@ func (d Deps) sectionReview(ctx context.Context, agentName, grade string, kps []
 	fallback := 0
 	for _, kp := range kps {
 		if d.Grounding != nil {
-			if text, found, err := d.Grounding.Ground(ctx, agentName, kp, grade); err == nil && found {
+			if text, found, err := d.groundForSubject(ctx, agentName, subject, kp, grade); err == nil && found {
 				fmt.Fprintf(&b, "【%s】%s\n", kp, text)
 				grounded++
 				continue
 			}
 		}
 		if d.PrepReview != nil {
-			if text, err := d.PrepReview.GeneratePrepReview(ctx, "", kp, grade); err == nil && strings.TrimSpace(text) != "" {
+			if text, err := d.PrepReview.GeneratePrepReview(ctx, subject, kp, grade); err == nil && strings.TrimSpace(text) != "" {
 				fmt.Fprintf(&b, "【%s】%s\n", kp, strings.TrimSpace(text))
 				generated++
 				continue
@@ -116,6 +127,15 @@ func (d Deps) sectionReview(ctx context.Context, agentName, grade string, kps []
 		}
 	}
 	return PrepSection{Title: "① 知识点 3 分钟回顾", Content: strings.TrimSpace(b.String()), SourceLabel: label}
+}
+
+// groundForSubject 分科检索路由：adapter 支持分科时按当前题目学科下推（空学科 = 检索全部
+// 教材的不分科旧语义）；老 adapter 只实现 Grounding 时走旧 Ground，保持向后兼容。
+func (d Deps) groundForSubject(ctx context.Context, agentName, subject, kp, grade string) (string, bool, error) {
+	if sg, ok := d.Grounding.(SubjectGrounding); ok {
+		return sg.GroundSubject(ctx, agentName, subject, kp, grade)
+	}
+	return d.Grounding.Ground(ctx, agentName, kp, grade)
 }
 
 func sectionHistory(history []ReviewItem) PrepSection {

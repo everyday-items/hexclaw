@@ -5,7 +5,7 @@ description: 费曼式把一个知识点讲透——类比、拆解、典型例�
 author: hexclaw
 version: "1.2.0"
 schema_version: 1
-min_engine_version: "0.5.0-beta"
+min_engine_version: "0.5.0"
 license: Apache-2.0
 category: education
 icon: "💡"

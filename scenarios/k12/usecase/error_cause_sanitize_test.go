@@ -16,7 +16,7 @@ func TestGrade_ErrorCause_StripsVerifierSelfCheck(t *testing.T) {
 	dump := "移项时把 +15 抄成 -15。\n自查:\n- 关键条件是否都用到? √\n- 推理正确 √\n自查通过"
 	d, store := newPipeline(t,
 		fakeSolver{solution: "x=14", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
-		fakeGrader{outcome: GradeOutcome{Correct: false, WrongStep: "移项", ErrorCause: dump, KnowledgePoint: "简易方程"}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictDisagree, WrongStep: "移项", ErrorCause: dump, KnowledgePoint: "简易方程"}},
 		&fakeInsights{},
 	)
 	ctx := context.Background()

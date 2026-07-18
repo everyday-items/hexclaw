@@ -43,40 +43,62 @@ type ColdStartResult struct {
 	Created  bool   // 是否新建了档案（false=实例已有档案，直接返回）
 }
 
-// ColdStartProvision 冷启动首拍建档：实例已有档案 → 直接返回（不覆盖）；否则按知识点推断年级
-// （推断不出用 fallbackGrade），教材默认人教版，写档案。childName 可空（家长后续可补）。
-//
-// PRD 硬规则：这是"推断 + 待家长确认"的建议值；调用方（前端/IM）须先向家长确认再落库，
-// 或把本方法当"确认后落库"入口。连续无法确认 → 传空 grade 走"不注入约束"降级（§3.1.8）。
-func (d Deps) ColdStartProvision(ctx context.Context, agentName, childName string, kps []string, fallbackGrade, textbook string) (ColdStartResult, error) {
+// InferProfile 冷启动只读推断（§3.1 主流程 4：「冷启动推断只返回建议，不写档案；
+// 家长确认后才创建或更新」）。实例已有档案 → 返回现档案（Created=false）；否则按知识点
+// 倒查推断年级组装建议档案，**绝不落库**。教材未提供 → 留空待补充（§3.1 主流程 5：
+// 不静默套用默认教材，2026-07-18 删人教版兜底）。
+func (d Deps) InferProfile(ctx context.Context, agentName, childName string, kps []string, fallbackGrade, textbook string) (ColdStartResult, error) {
 	if agentName == "" {
 		return ColdStartResult{}, fmt.Errorf("%w: agentName 不可空", ErrInvalidInput)
 	}
-	if d.Profiles == nil {
-		return ColdStartResult{}, fmt.Errorf("usecase: 未配置档案存储")
-	}
+	// 只读推断不强制档案存储（年级门必须先于一切基础设施校验生效，冻结#2）；
 	// 已建档 → 不覆盖，直接返回现档案。
-	if p, err := d.Profiles.GetProfile(ctx, agentName); err == nil && p.GradeTerm != "" {
-		return ColdStartResult{Profile: p, Grade: p.GradeTerm}, nil
+	if d.Profiles != nil {
+		if p, err := d.Profiles.GetProfile(ctx, agentName); err == nil && p.GradeTerm != "" {
+			return ColdStartResult{Profile: p, Grade: p.GradeTerm}, nil
+		}
 	}
-
 	grade, inferred := d.InferGradeFromKnowledgePoints(ctx, kps)
+	// 冻结#2 / §5.4 零容忍：冷启动是「初中可绕过进入」的通道之一——建议与落库一律收窄
+	// 小学 12 档白名单。知识点推断出初中（如拍到超纲题）不报错、视为推断失败走降级
+	// （§3.1：连续无法确认只允许文字说明，不以猜测执行）；显式传入初中 fallback 则硬拒。
+	if inferred && !k12.ValidProfileGradeTerm(grade) {
+		grade, inferred = "", false
+	}
 	if !inferred {
 		grade = fallbackGrade // 推断不出：用传入 grade（可空 → 降级不注入约束）
 	}
-	if grade != "" && !k12.ValidGradeTerm(grade) {
-		return ColdStartResult{}, fmt.Errorf("%w: 非法年级 %q", ErrInvalidInput, grade)
+	if grade != "" && !k12.ValidProfileGradeTerm(grade) {
+		return ColdStartResult{}, fmt.Errorf("%w: 年级 %q 不在当前开放学段（仅小学一至六年级）", ErrInvalidInput, grade)
 	}
-	if textbook == "" {
-		textbook = "人教版" // §3.1.8 覆盖外教材默认人教版
+	return ColdStartResult{
+		Profile:  k12.ChildProfile{ChildName: childName, GradeTerm: grade, TextbookEdition: textbook},
+		Inferred: inferred, Grade: grade,
+	}, nil
+}
+
+// ColdStartProvision 冷启动确认后落库入口：家长确认 InferProfile 的建议后调用。
+// 实例已有档案 → 直接返回（不覆盖）；否则按同一推断口径写档案。childName 可空（家长后续可补）。
+// 连续无法确认 → 传空 grade 走"不注入约束"降级（§3.1.8）。
+func (d Deps) ColdStartProvision(ctx context.Context, agentName, childName string, kps []string, fallbackGrade, textbook string) (ColdStartResult, error) {
+	res, err := d.InferProfile(ctx, agentName, childName, kps, fallbackGrade, textbook)
+	if err != nil {
+		return ColdStartResult{}, err
 	}
-	p := k12.ChildProfile{ChildName: childName, GradeTerm: grade, TextbookEdition: textbook}
-	if err := d.Profiles.SaveProfile(ctx, agentName, p); err != nil {
+	// 落库路径必须有档案存储（只读推断不要求，见 InferProfile）。
+	if d.Profiles == nil {
+		return ColdStartResult{}, fmt.Errorf("usecase: 未配置档案存储")
+	}
+	// 已建档 → 不覆盖，直接返回现档案（与 InferProfile 同判据）。
+	if p, perr := d.Profiles.GetProfile(ctx, agentName); perr == nil && p.GradeTerm != "" {
+		return ColdStartResult{Profile: p, Grade: p.GradeTerm}, nil
+	}
+	if err := d.Profiles.SaveProfile(ctx, agentName, res.Profile); err != nil {
 		return ColdStartResult{}, fmt.Errorf("usecase: 冷启动写档案: %w", err)
 	}
 	saved, err := d.Profiles.GetProfile(ctx, agentName)
 	if err != nil {
 		return ColdStartResult{}, err
 	}
-	return ColdStartResult{Profile: saved, Inferred: inferred, Grade: grade, Created: true}, nil
+	return ColdStartResult{Profile: saved, Inferred: res.Inferred, Grade: res.Grade, Created: true}, nil
 }

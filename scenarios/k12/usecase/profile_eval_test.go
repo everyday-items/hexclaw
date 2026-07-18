@@ -52,31 +52,15 @@ func TestProfile_CreateAndUpgradeGrade(t *testing.T) {
 	}
 }
 
-func TestStudyTime(t *testing.T) {
-	d, _ := newPipeline(t, fakeSolver{}, fakeGrader{}, &fakeInsights{})
-	ctx := context.Background()
-	seedMistake(t, d, "a", "小数乘法", "计算失误", 100)
-	seedMistake(t, d, "b", "分数加减", "概念不清", 100)
-	st, err := d.StudyTime(ctx, "mingming")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st.TotalRecords != 2 {
-		t.Errorf("总记录应 2, got %d", st.TotalRecords)
-	}
-	if len(st.Days) != 1 || st.Days[0].RecordCount != 2 || st.Days[0].EstimatedMinutes != 2*minutesPerRecord {
-		t.Errorf("单日应 2 条·%d 分钟, got %+v", 2*minutesPerRecord, st.Days)
-	}
-	if st.Note == "" {
-		t.Error("应标注近似说明")
-	}
-}
-
 // smartGrader 按学生答案与已知正确答案是否一致判对（供 eval harness 测试）。
 type smartGrader struct{ correct map[string]string } // problem -> 正确答案
 
 func (g smartGrader) Grade(_ context.Context, problem, studentAnswer, _ string) (GradeOutcome, error) {
-	return GradeOutcome{Correct: g.correct[problem] == studentAnswer}, nil
+	verdict := VerdictDisagree
+	if g.correct[problem] == studentAnswer {
+		verdict = VerdictAgree
+	}
+	return GradeOutcome{Verdict: verdict}, nil
 }
 
 func TestRunEval(t *testing.T) {

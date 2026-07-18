@@ -8,6 +8,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 )
 
 // replaceAwareProfiles deliberately keeps SaveProfile's public patch semantics
@@ -18,7 +19,7 @@ type replaceAwareProfiles struct {
 }
 
 type inMemoryArchiveRestorer struct {
-	records  *records.Store
+	records  *k12storage.Store
 	profiles *replaceAwareProfiles
 }
 

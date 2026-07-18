@@ -5,10 +5,10 @@ import (
 	"database/sql"
 	"testing"
 
-	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/curriculum"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
 
@@ -26,7 +26,7 @@ func (s *e2eSolver) Solve(_ context.Context, _, grade, constraint string) (useca
 type e2eGrader struct{}
 
 func (e2eGrader) Grade(context.Context, string, string, string) (usecase.GradeOutcome, error) {
-	return usecase.GradeOutcome{Correct: false, WrongStep: "第一步", ErrorCause: "计算失误"}, nil
+	return usecase.GradeOutcome{Verdict: usecase.VerdictDisagree, WrongStep: "第一步", ErrorCause: "计算失误"}, nil
 }
 
 func newRealDeps(t *testing.T) (usecase.Deps, *e2eSolver) {
@@ -47,7 +47,7 @@ func newRealDeps(t *testing.T) (usecase.Deps, *e2eSolver) {
 	}
 	sv := &e2eSolver{}
 	return usecase.Deps{
-		Solver: sv, Grader: e2eGrader{}, Records: records.NewStore(db, reg.Records),
+		Solver: sv, Grader: e2eGrader{}, Records: k12storage.NewStore(db, reg.Records),
 		Constraint: cur, Now: func() int64 { return 1000 },
 	}, sv
 }

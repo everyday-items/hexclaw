@@ -105,8 +105,10 @@ func (d Deps) Restore(ctx context.Context, bak *Hexbak) (int, error) {
 	if sum != bak.Checksum {
 		return 0, ErrChecksumMismatch
 	}
-	if bak.Version >= 2 && bak.Profile != nil && bak.Profile.GradeTerm != "" && !k12.ValidGradeTerm(bak.Profile.GradeTerm) {
-		return 0, fmt.Errorf("%w: 归档档案含非法年级 %q", ErrInvalidInput, bak.Profile.GradeTerm)
+	// 冻结#2 / §5.4 零容忍：备份恢复是「初中可绕过进入」最隐蔽的通道——恢复一份含初中
+	// 档案的 .hexbak 即绕过建档守门。恢复路径同样收窄小学 12 档白名单（ValidProfileGradeTerm）。
+	if bak.Version >= 2 && bak.Profile != nil && bak.Profile.GradeTerm != "" && !k12.ValidProfileGradeTerm(bak.Profile.GradeTerm) {
+		return 0, fmt.Errorf("%w: 归档档案年级 %q 不在当前开放学段（仅小学一至六年级）", ErrInvalidInput, bak.Profile.GradeTerm)
 	}
 	if bak.Version >= 2 {
 		// In v2 a nil profile is signed semantic data: it means clear the K12

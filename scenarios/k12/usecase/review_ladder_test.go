@@ -7,14 +7,14 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
-// TestMarkRetried_EbbinghausLadder 验证间隔阶梯：每次重做做对，ReviewStage +1，
-// 下次到期按 3/7/15/30/30 天推进（末档封顶），且轮次持久化回卡片 fields。
+// TestMarkRetried_EbbinghausLadder 验证间隔阶梯（§4.6 默认策略 v1：1/3/7/14 天）：
+// 每次重做做对，ReviewStage +1，下次到期按 3/7/14 天推进（末档封顶），轮次持久化回卡片 fields。
 func TestMarkRetried_EbbinghausLadder(t *testing.T) {
 	d, _ := newPipeline(t, fakeSolver{}, fakeGrader{}, &fakeInsights{}) // now()=1000
 	ctx := context.Background()
 	id := seedMistake(t, d, "a", "小数乘法", "计算失误", 500) // stage 0, version 0
 
-	wantDays := []int64{3, 7, 15, 30, 30} // rung 1..5（第 5 次仍封顶 30 天）
+	wantDays := []int64{3, 7, 14, 14, 14} // rung 1..5（第 4 次起封顶 14 天）
 	for i, days := range wantDays {
 		cur, err := d.Records.Get(ctx, id)
 		if err != nil {
@@ -45,26 +45,26 @@ func TestMarkRetried_EbbinghausLadder(t *testing.T) {
 	}
 }
 
-// TestReviewIntervalLadder_MonotonicAndCapped 属性检查：间隔单调不减、封顶 30 天、
-// 负轮次退化到 rung 0。防未来调阶梯时不小心弄出"越复习越频繁"的反效果。
+// TestReviewIntervalLadder_MonotonicAndCapped 属性检查（§4.6 策略 v1）：间隔单调不减、
+// 封顶 14 天、负轮次退化到 rung 0。防未来调阶梯时不小心弄出"越复习越频繁"的反效果。
 func TestReviewIntervalLadder_MonotonicAndCapped(t *testing.T) {
-	const cap30 = int64(30 * 86400)
+	const capV1 = int64(14 * 86400)
 	prev := int64(0)
 	for stage := 0; stage < 12; stage++ {
 		got := reviewIntervalForStage(stage)
 		if got < prev {
 			t.Errorf("间隔应单调不减: stage %d = %d < prev %d", stage, got, prev)
 		}
-		if got > cap30 {
-			t.Errorf("间隔应封顶 30 天: stage %d = %d", stage, got)
+		if got > capV1 {
+			t.Errorf("间隔应封顶 14 天（策略 v1）: stage %d = %d", stage, got)
 		}
 		prev = got
 	}
 	if reviewIntervalForStage(-5) != reviewIntervalForStage(0) {
 		t.Error("负轮次应退化到 rung 0")
 	}
-	if reviewIntervalForStage(100) != cap30 {
-		t.Error("超末档应封顶 30 天")
+	if reviewIntervalForStage(100) != capV1 {
+		t.Error("超末档应封顶 14 天（策略 v1）")
 	}
 }
 

@@ -34,9 +34,30 @@ func TestDailyReminderText_CountAndWeakest(t *testing.T) {
 }
 
 func TestRenderReportMarkdown_SkipWhenNoRecords(t *testing.T) {
-	md, skip := RenderReportMarkdown(InsightReport{})
+	md, skip := RenderReportMarkdown(InsightReport{}, "五年级上")
 	if !skip || md != "" {
 		t.Fatalf("无记录应 skip, got skip=%v md=%q", skip, md)
+	}
+}
+
+// 标题口径（§3.11 命名定案 + 前端 K12InsightPanel titleWithGrade）：「{年级}学习概览」，
+// 年级取 Learner profile 的 grade_term；无年级用通用「学习概览」。月报旧口径退役。
+func TestRenderReportMarkdown_TitleGradeOverview(t *testing.T) {
+	rep := InsightReport{Trend: TrendCounts{Total: 1, Reviewing: 1}, Suggestion: "继续保持。"}
+	md, skip := RenderReportMarkdown(rep, "五年级上")
+	if skip {
+		t.Fatal("有记录不应 skip")
+	}
+	if !strings.Contains(md, "# 五年级上学习概览") {
+		t.Errorf("标题应为「五年级上学习概览」, got %q", md)
+	}
+	if strings.Contains(md, "本月学情报告") {
+		t.Errorf("月报标题口径已退役，不得出现「本月学情报告」, got %q", md)
+	}
+	// 无年级：通用标题。
+	md, _ = RenderReportMarkdown(rep, "")
+	if !strings.Contains(md, "# 学习概览") {
+		t.Errorf("无年级应用通用标题「学习概览」, got %q", md)
 	}
 }
 
@@ -49,7 +70,7 @@ func TestRenderReportMarkdown_FourSections(t *testing.T) {
 		ConsecutiveFailKPs:   []string{"简易方程"},
 		Suggestion:           "本周集中复习简易方程。",
 	}
-	md, skip := RenderReportMarkdown(rep)
+	md, skip := RenderReportMarkdown(rep, "五年级上")
 	if skip {
 		t.Fatal("有记录不应 skip")
 	}
@@ -111,7 +132,8 @@ func TestDeliverEntrypoints_EndToEnd(t *testing.T) {
 	if err != nil || skip {
 		t.Fatalf("有记录不应 skip, skip=%v err=%v", skip, err)
 	}
-	if !strings.Contains(md, "本月学情报告") {
+	// 标题口径（§3.11 + K12InsightPanel）：该实例未建档 → 通用「学习概览」。
+	if !strings.Contains(md, "# 学习概览") {
 		t.Errorf("monthly markdown 不符: %q", md)
 	}
 }
