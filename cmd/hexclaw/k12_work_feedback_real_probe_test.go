@@ -10,6 +10,7 @@ package main
 //	go test ./cmd/hexclaw -run TestK12WorkFeedback_RealModel -v -count=1 -timeout 10m
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
 	"image"
@@ -33,6 +34,35 @@ import (
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
 	sqlitestore "github.com/hexagon-codes/hexclaw/storage/sqlite"
 )
+
+// §13.2 发布级要求：作品点评探针必须支持显式真实文件输入，并断言 FX-WRITING-001 /
+// FX-ART-001 的真实 SHA 确实进入模型请求（合成作文/合成画不能通过 LIVE-WRITING/LIVE-ART）。
+// 提供真实 fixture 绝对路径即切换到真素材通道；缺省仍走内置合成样本（PR 必跑不外泄隐私）。
+const (
+	fxWritingImageEnv = "HEXCLAW_K12_WRITING_FILE"
+	fxArtImageEnv     = "HEXCLAW_K12_ART_FILE"
+	fxWritingSHA256   = "3b238c46e0ae4515f7b35a28bcfd37081ba1d59a9dfa2b30bf17784aaf3e9157"
+	fxArtSHA256       = "7eb16fdbe398236cdf2ce31ea6d2fac5e4787ea3004b96ab74a3eebd540f1d93"
+)
+
+// readWorkFeedbackFixture 读取真实 fixture（只读），断言其字节 SHA-256 与 §1.2 冻结值一致，
+// 并确认是真图片。返回原始字节；任何不一致 fail-closed，杜绝拿错图/被压缩重编码的素材冒充。
+func readWorkFeedbackFixture(t *testing.T, path, wantSHA string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取真实 fixture 失败 path=%q: %v", path, err)
+	}
+	if mime := http.DetectContentType(raw); !strings.HasPrefix(mime, "image/") {
+		t.Fatalf("真实 fixture 不是图片 path=%q mime=%q", path, mime)
+	}
+	sum := fmt.Sprintf("%x", sha256.Sum256(raw))
+	if sum != wantSHA {
+		t.Fatalf("真实 fixture SHA 不符 path=%q got=%s want=%s（原图必须只读且与 §1.2 一致）", path, sum, wantSHA)
+	}
+	t.Logf("FIXTURE_VERIFIED: path=%s bytes=%d sha256=%s", path, len(raw), sum)
+	return raw
+}
 
 // workFeedbackProbeStubSolve 满足装配所需的 SolveExecutor；作品点评链路绝不触发 solve，
 // 一旦被调用即失败取证。
@@ -114,11 +144,15 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 	}
 	// 美术视觉闭包：与 main.go 的 workFeedbackVisionFn 同构。路由镜像 RouteForVision
 	// （配置的默认 provider + 其配置模型，不走 cost-aware）。
+	// lastVisionSHA 记录最近一次真正送进视觉请求的图片字节 SHA-256——用于断言真实
+	// FX-ART-001 / FX-WRITING-001 原图确实到达模型（§13.2 的 E1 证据），而非探针在别处替换。
+	var lastVisionSHA string
 	visionFn := func(visionCtx context.Context, imageBytes []byte, prompt string) (string, error) {
 		provider := router.Default()
 		if provider == nil {
 			return "", fmt.Errorf("没有可用的默认 LLM Provider")
 		}
+		lastVisionSHA = fmt.Sprintf("%x", sha256.Sum256(imageBytes))
 		visionModel := router.ProviderModel(router.DefaultName())
 		mime := http.DetectContentType(imageBytes)
 		if !strings.HasPrefix(mime, "image/") {
@@ -187,11 +221,38 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 	}
 
 	t.Run("写作点评_真机", func(t *testing.T) {
+		// 写作反馈消费文字原文；真实 FX-WRITING-001 是手写作文照片。给了真实文件即：
+		// ① 断言原图 SHA==§1.2；② 用同一批视觉模型逐字誊录（断言原图 SHA 进入誊录请求=E1）；
+		// ③ 把誊录文字作原文喂点评；④ 断言点评引用了作文真实内容（爸爸/程序员/河蟹…），不套模板。
+		var realWriting bool
+		var essayKeywords []string
 		essay := "今天放学的时候下了一场小雨。雨点打在伞上，发出嗒嗒嗒的声音，像是在敲小鼓。" +
 			"路边的小草被雨水洗得发亮，空气里有泥土的味道。我和同桌共撑一把伞，我们把伞往对方那边推来推去，" +
 			"到家的时候两个人的肩膀都湿了一半，可是我们都笑了。"
+		title, task := "《放学路上的小雨》", "写一段放学路上的见闻，写出真实感受"
+		if writingFile := strings.TrimSpace(os.Getenv(fxWritingImageEnv)); writingFile != "" {
+			raw := readWorkFeedbackFixture(t, writingFile, fxWritingSHA256)
+			transcribed, terr := visionFn(ctx, raw,
+				"这是一张小学生手写作文的照片。请逐字誊录图中作文正文（含标题），只输出作文文字本身，不要添加任何点评、说明或标注。")
+			if terr != nil {
+				t.Fatalf("真实作文誊录失败: %v", terr)
+			}
+			if lastVisionSHA != fxWritingSHA256 {
+				t.Fatalf("誊录请求进入的图片 SHA=%s，应为 FX-WRITING-001 %s（真实原图未到达模型）", lastVisionSHA, fxWritingSHA256)
+			}
+			if strings.TrimSpace(transcribed) == "" {
+				t.Fatal("真实作文誊录为空")
+			}
+			essay = transcribed
+			title, task = "《我的好爸爸》", "写一个你熟悉的人，写出他的特点和你们之间的事"
+			// 黄金锚点（§1.2）：作文涉及父亲、程序员、河蟹 AI、Skill、用提问教数学。
+			// 点评必须落在真实原文上——命中任一关键词即证明未套用「校园春景」类无关模板。
+			essayKeywords = []string{"爸爸", "父亲", "程序员", "河蟹", "Skill", "提问", "数学"}
+			realWriting = true
+			t.Logf("REAL_WRITING_TRANSCRIBED: chars=%d\n----\n%s\n----", len([]rune(essay)), essay)
+		}
 		id, _, err := runtime.Deps.CreateCreativeWork(ctx, "child-tutor", "workfb-probe", k12.CreativeWorkFields{
-			WorkType: k12.WorkTypeWriting, Title: "《放学路上的小雨》", Task: "写一段放学路上的见闻，写出真实感受",
+			WorkType: k12.WorkTypeWriting, Title: title, Task: task,
 			Versions: []k12.CreativeWorkVersion{{ContentMarkdown: essay}},
 		})
 		if err != nil {
@@ -224,18 +285,54 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 		if !strings.HasPrefix(last.FeedbackSkill, "writing-feedback@") || !strings.HasSuffix(last.FeedbackSkill, "/disk") {
 			t.Fatalf("落库 feedback_skill 应为 writing-feedback@…/disk，got %q", last.FeedbackSkill)
 		}
-		t.Logf("WRITING_FEEDBACK_OK: elapsed=%s chars=%d feedback_skill=%s\n----\n%s\n----",
-			time.Since(started).Round(time.Millisecond), len([]rune(last.Feedback)), last.FeedbackSkill, last.Feedback)
+		// 红线：只点评不打分（LIVE-WRITING-001）——任何路径都不得出现分数/等第/排名口径。
+		for _, banned := range []string{"打分", "评分", "等第", "甲等", "排名", "名次", "满分"} {
+			if strings.Contains(last.Feedback, banned) {
+				t.Fatalf("写作点评不得含 %q：%s", banned, last.Feedback)
+			}
+		}
+		if realWriting {
+			// LIVE-WRITING-001 黄金：点评必须引用真实原文，不得套用「校园春景」类无关模板。
+			hit := 0
+			for _, kw := range essayKeywords {
+				if strings.Contains(last.Feedback, kw) {
+					hit++
+				}
+			}
+			if hit == 0 {
+				t.Fatalf("真实写作点评未命中任何原文关键词 %v（疑似套用无关模板，未锚定真实原文）：\n%s",
+					essayKeywords, last.Feedback)
+			}
+			if strings.Contains(last.Feedback, "校园春景") {
+				t.Fatalf("真实写作点评出现无关模板词「校园春景」：%s", last.Feedback)
+			}
+			t.Logf("REAL_WRITING_FEEDBACK_ANCHORED: 命中原文关键词 %d/%d", hit, len(essayKeywords))
+		}
+		t.Logf("WRITING_FEEDBACK_OK: real=%v elapsed=%s chars=%d feedback_skill=%s\n----\n%s\n----",
+			realWriting, time.Since(started).Round(time.Millisecond), len([]rune(last.Feedback)), last.FeedbackSkill, last.Feedback)
 	})
 
 	t.Run("美术点评_真机_视觉通道", func(t *testing.T) {
+		// 给了真实 FX-ART-001 即走真素材：原图（只读，SHA==§1.2）作 SourceAssetID，
+		// 生产 loadWorkArtImage 读盘 → 多模态视觉调用；断言真实原图 SHA 进入请求=E1。
+		var realArt bool
+		var artFeatures []string
 		artPath := filepath.Join(t.TempDir(), "child-drawing.png")
-		if err := os.WriteFile(artPath, drawChildStyleArtPNG(t), 0o600); err != nil {
+		title, task, intent := "《我家门前》", "画一画自己家门前的景色", "想画出晴天里我家小房子和大树"
+		if artFile := strings.TrimSpace(os.Getenv(fxArtImageEnv)); artFile != "" {
+			readWorkFeedbackFixture(t, artFile, fxArtSHA256) // 校验只读 + SHA==§1.2
+			artPath = artFile
+			title, task, intent = "《我的画》", "画一幅自己喜欢的画", ""
+			// 黄金可见证据（§1.2）：中央棕发粉蝴蝶结女孩、紫爱心上衣、蓝裙粉鞋、右下橙猫、
+			// 左上彩虹白云、周围爱心星星、底部绿地面。观察须逐项属实——命中任一即证明看的是真图。
+			artFeatures = []string{"女孩", "蝴蝶结", "爱心", "裙", "猫", "彩虹", "星星", "云", "草", "地面"}
+			realArt = true
+		} else if err := os.WriteFile(artPath, drawChildStyleArtPNG(t), 0o600); err != nil {
 			t.Fatalf("write probe drawing: %v", err)
 		}
 		id, _, err := runtime.Deps.CreateCreativeWork(ctx, "child-tutor", "workfb-probe", k12.CreativeWorkFields{
-			WorkType: k12.WorkTypeArt, Title: "《我家门前》", Task: "画一画自己家门前的景色",
-			Intent:   "想画出晴天里我家小房子和大树",
+			WorkType: k12.WorkTypeArt, Title: title, Task: task,
+			Intent:   intent,
 			Versions: []k12.CreativeWorkVersion{{SourceAssetID: artPath}},
 		})
 		if err != nil {
@@ -266,8 +363,24 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 		if !strings.HasSuffix(last.FeedbackSkill, "/disk") {
 			t.Fatalf("美术点评 feedback_skill 应为盘上来源（…/disk），got %q", last.FeedbackSkill)
 		}
-		t.Logf("ART_FEEDBACK_OK: elapsed=%s chars=%d feedback_skill=%s\n----\n%s\n----",
-			time.Since(started).Round(time.Millisecond), len([]rune(last.Feedback)), last.FeedbackSkill, last.Feedback)
+		if realArt {
+			// LIVE-ART-001 黄金：真实文件 SHA 到达请求 + 可见证据准确。
+			if lastVisionSHA != fxArtSHA256 {
+				t.Fatalf("视觉请求进入的图片 SHA=%s，应为 FX-ART-001 %s（真实原图未到达模型）", lastVisionSHA, fxArtSHA256)
+			}
+			hit := 0
+			for _, feat := range artFeatures {
+				if strings.Contains(last.Feedback, feat) {
+					hit++
+				}
+			}
+			if hit == 0 {
+				t.Fatalf("真实美术点评未命中任何可见证据 %v（疑似虚构/未看真图）：\n%s", artFeatures, last.Feedback)
+			}
+			t.Logf("REAL_ART_FEEDBACK_ANCHORED: FX-ART SHA 进入请求✓ 命中可见证据 %d/%d", hit, len(artFeatures))
+		}
+		t.Logf("ART_FEEDBACK_OK: real=%v elapsed=%s chars=%d feedback_skill=%s\n----\n%s\n----",
+			realArt, time.Since(started).Round(time.Millisecond), len([]rune(last.Feedback)), last.FeedbackSkill, last.Feedback)
 	})
 }
 
