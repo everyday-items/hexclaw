@@ -72,7 +72,8 @@ type Pack struct {
 	EvalSuites     []string // eval 目录（文件系统约定）
 }
 
-// Registry 聚合六缝。平台持有一个；场景包 Assemble 进来。
+// Registry 聚合六缝。平台持有一个；场景包经 Manifest v2 Install 进来
+// （Assemble 保留为六缝直装契约，安装台账/卸载语义见 manifest.go）。
 type Registry struct {
 	Records     *records.RecordSchemaRegistry
 	Constraints *ConstraintRegistry
@@ -80,6 +81,12 @@ type Registry struct {
 	Modes       *ModeFeatureRegistry
 	Buttons     *ButtonRegistry
 	Evals       *EvalSuiteRegistry
+
+	// Recorder 可选的安装台账持久化端口（scenario_installations）；nil = 只内存台账。
+	Recorder InstallationRecorder
+
+	instMu    sync.Mutex
+	installed map[string]*Installation // scenario id -> 安装记录（声明 + 收据）
 }
 
 // NewRegistry 建一套空注入缝。
@@ -91,6 +98,7 @@ func NewRegistry() *Registry {
 		Modes:       newModeFeatureRegistry(),
 		Buttons:     newButtonRegistry(),
 		Evals:       newEvalSuiteRegistry(),
+		installed:   make(map[string]*Installation),
 	}
 }
 

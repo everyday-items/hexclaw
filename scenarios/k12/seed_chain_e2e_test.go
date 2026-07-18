@@ -22,8 +22,9 @@ func TestSeedChain_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("首启 seed 失败: %v", err)
 	}
-	if n < 14 {
-		t.Fatalf("seed 数量应 ≥14（10 挂载 + 4 委派）, got %d", n)
+	// 冻结#3/INV-014：physics/chemistry 已撤出出厂 seed → 8 挂载 + 4 委派 = 12。
+	if n < 12 {
+		t.Fatalf("seed 数量应 ≥12（8 挂载 + 4 委派）, got %d", n)
 	}
 
 	// 2) Init 扫描刚 seed 的目录 → 注册
@@ -49,8 +50,8 @@ func TestSeedChain_EndToEnd(t *testing.T) {
 			t.Errorf("%q 应默认 enabled（否则不被召回/挂载）", name)
 		}
 	}
-	if len(list) < 14 {
-		t.Errorf("注册 skill 数 %d < 14", len(list))
+	if len(list) < 12 {
+		t.Errorf("注册 skill 数 %d < 12", len(list))
 	}
 
 	// 4) 幂等：二次 seed 不重复写（全已存在）

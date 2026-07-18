@@ -1,10 +1,24 @@
 package k12
 
 // 年级学期 18 档有序枚举（PRD §5.2.2）。顺序即学习先后，用于超纲判定。
+//
+// v0.5.0 冻结（架构设计-v0.5.0《明确不做》#2：不做初中和高中辅导，发布阻断）：
+// 初中 6 档只作 IsBeyond 超纲判定的"晚于小学"比较锚点保留在全序里；
+// 档案写入/学期推进一律以小学 12 档封顶（ValidProfileGradeTerm / NextGradeTerm）。
 var gradeOrder = []string{
 	"一年级上", "一年级下", "二年级上", "二年级下", "三年级上", "三年级下",
 	"四年级上", "四年级下", "五年级上", "五年级下", "六年级上", "六年级下",
 	"初一上", "初一下", "初二上", "初二下", "初三上", "初三下",
+}
+
+// primaryGradeCount 小学档位数（一年级上～六年级下）。冻结#2 的档案边界。
+const primaryGradeCount = 12
+
+// ValidProfileGradeTerm 档案写入白名单：只允许小学 12 档（一年级上～六年级下）。
+// 冻结#2（发布阻断）：初中年级不可写入档案——超纲判定仍用 18 档全序，不受影响。
+func ValidProfileGradeTerm(g string) bool {
+	r := GradeRank(g)
+	return r >= 0 && r < primaryGradeCount
 }
 
 var gradeRank = func() map[string]int {
@@ -34,11 +48,12 @@ func IsBeyond(grade, firstGrade string) bool {
 }
 
 // NextGradeTerm 返回 current 学期的下一档（用于 3.1/9.1 学期确认提醒，PRD §3.6.4-5）。
-// current 未知或已是最末档（初三下）→ ok=false（无下一学期，不推进）。
+// 六年级下封顶（冻结#2）：current 未知、已是六年级下或更晚 → ok=false——学期确认
+// 绝不产生"升初中"建议。
 // 注意：只算出"建议值"，档案是否更新由家长确认，绝不自动推进（PRD 硬规则）。
 func NextGradeTerm(current string) (string, bool) {
 	r := GradeRank(current)
-	if r < 0 || r+1 >= len(gradeOrder) {
+	if r < 0 || r+1 >= primaryGradeCount {
 		return "", false
 	}
 	return gradeOrder[r+1], true
