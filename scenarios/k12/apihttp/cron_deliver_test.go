@@ -21,6 +21,10 @@ type fakeRegistrar struct {
 	platform  string
 	chatID    string
 	userID    string
+	// stale kind 回收（§6.14 一次切换终局批）：记录 provision 是否触发回收及入参。
+	reclaimAgent string
+	reclaimKeep  []string
+	reclaimOut   []apihttp.ReclaimedCronJob
 }
 
 func (f *fakeRegistrar) Register(_ context.Context, kind string, spec usecase.CronSpec, platform, chatID, userID string) (string, error) {
@@ -28,6 +32,12 @@ func (f *fakeRegistrar) Register(_ context.Context, kind string, spec usecase.Cr
 	f.schedules = append(f.schedules, spec.Schedule)
 	f.platform, f.chatID, f.userID = platform, chatID, userID
 	return "job-" + kind, nil
+}
+
+func (f *fakeRegistrar) ReclaimStale(_ context.Context, agentName string, keepJobIDs []string) ([]apihttp.ReclaimedCronJob, error) {
+	f.reclaimAgent = agentName
+	f.reclaimKeep = append([]string{}, keepJobIDs...)
+	return f.reclaimOut, nil
 }
 
 func newServerWithCron(t *testing.T, reg apihttp.CronRegistrar) http.Handler {
@@ -51,7 +61,10 @@ func newServerWithCron(t *testing.T, reg apihttp.CronRegistrar) http.Handler {
 	})
 }
 
-func TestCronProvision_RegistersFiveJobs(t *testing.T) {
+// provision 对齐架构设计-v0.5.0 §3.13：注册 5 个任务（每周复习/每日提醒/回传提醒/
+// 学期确认×2）；monthly-report 与 year-archive 不再随建档注册 cron（内容端点保留）。
+// kind 由描述符（CronSpec.Kind）携带——单一事实源，防 kind/spec 错位注册。
+func TestCronProvision_RegistersFourJobs(t *testing.T) {
 	reg := &fakeRegistrar{}
 	h := newServerWithCron(t, reg)
 	body := `{"agent":"mingming","platform":"dingtalk","chat_id":"grp1","deliver":["dingtalk"]}`
@@ -60,11 +73,52 @@ func TestCronProvision_RegistersFiveJobs(t *testing.T) {
 		t.Fatalf("provision 状态 %d", rec.Code)
 	}
 	jobs, _ := out["provisioned"].([]any)
-	if len(jobs) != 6 {
-		t.Fatalf("应注册 6 个任务, got %d", len(jobs))
+	if len(jobs) != 4 {
+		t.Fatalf("§3.13 对齐后应注册 4 个任务, got %d", len(jobs))
 	}
-	if len(reg.kinds) != 6 || reg.platform != "dingtalk" || reg.chatID != "grp1" {
-		t.Errorf("注册透传不符: kinds=%v platform=%q chat=%q", reg.kinds, reg.platform, reg.chatID)
+	wantKinds := []string{"weekly-sheet", "return-reminder", "semester-spring", "semester-fall"}
+	if len(reg.kinds) != len(wantKinds) || reg.platform != "dingtalk" || reg.chatID != "grp1" {
+		t.Fatalf("注册透传不符: kinds=%v platform=%q chat=%q", reg.kinds, reg.platform, reg.chatID)
+	}
+	for i, k := range wantKinds {
+		if reg.kinds[i] != k {
+			t.Errorf("kind[%d]=%q want %q（kind 必须与描述符对位）", i, reg.kinds[i], k)
+		}
+	}
+}
+
+// TestCronProvision_ReclaimsStaleKinds（§6.14 一次切换终局批）：provision 注册完 §3.13
+// 四任务后，必须回收本 agent 名下不在本次注册集合内的历史 K12 job（真实 DB 发现
+// monthly-report / daily-reminder / year-archive 残留 active 且绑真钉钉，每天打扰），
+// 并把回收结果透出到响应（可取证）。
+func TestCronProvision_ReclaimsStaleKinds(t *testing.T) {
+	reg := &fakeRegistrar{reclaimOut: []apihttp.ReclaimedCronJob{
+		{JobID: "cron-stale-1", Name: "学情报告（每月）·mingming", SourceKey: "mingming/monthly-report"},
+	}}
+	h := newServerWithCron(t, reg)
+	rec, out := do(t, h, "POST", "/cron/provision", `{"agent":"mingming"}`)
+	if rec.Code != 200 {
+		t.Fatalf("provision 状态 %d", rec.Code)
+	}
+	if reg.reclaimAgent != "mingming" {
+		t.Fatalf("provision 必须触发 stale kind 回收（agent=mingming），got %q", reg.reclaimAgent)
+	}
+	wantKeep := []string{"job-weekly-sheet", "job-return-reminder", "job-semester-spring", "job-semester-fall"}
+	if len(reg.reclaimKeep) != len(wantKeep) {
+		t.Fatalf("回收保留集应为本次注册的 4 个 job, got %v", reg.reclaimKeep)
+	}
+	for i, id := range wantKeep {
+		if reg.reclaimKeep[i] != id {
+			t.Errorf("keep[%d]=%q want %q", i, reg.reclaimKeep[i], id)
+		}
+	}
+	reclaimed, _ := out["reclaimed"].([]any)
+	if len(reclaimed) != 1 {
+		t.Fatalf("响应必须透出回收结果（取证），got %v", out["reclaimed"])
+	}
+	first, _ := reclaimed[0].(map[string]any)
+	if first["source_key"] != "mingming/monthly-report" {
+		t.Errorf("回收取证字段不符: %v", first)
 	}
 }
 
@@ -125,8 +179,12 @@ func TestCronDeliver_MonthlyReportHasContentAfterMistake(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("monthly 状态 %d", code)
 	}
-	if !strings.Contains(report, "本月学情报告") {
-		t.Errorf("入库后月报应有内容, got %q", report)
+	// 标题口径（§3.11 + 前端 K12InsightPanel）：「{年级}学习概览」；该实例未建档 → 通用「学习概览」。
+	if !strings.Contains(report, "学习概览") {
+		t.Errorf("入库后报告应有内容且标题为「学习概览」口径, got %q", report)
+	}
+	if strings.Contains(report, "本月学情报告") {
+		t.Errorf("月报标题口径已退役, got %q", report)
 	}
 	// 错题卷/每日提醒此刻仍空（首次复习到期在 1 天后，尚未 due）。
 	if _, sheet := getText(t, h, "/cron/mistake-sheet?agent=mingming"); strings.TrimSpace(sheet) != "" {

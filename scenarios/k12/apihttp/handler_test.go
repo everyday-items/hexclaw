@@ -66,9 +66,24 @@ func TestViewDescriptor(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("状态 %d", rec.Code)
 	}
+	// IA 定稿（PRD §1.5，2026-07-18 迁移）：顶栏三段「辅导｜学习档案｜学情」；
+	// §4.11 术语表禁止「错题本」作为整个导航名称。
 	tabs, _ := out["header_tabs"].([]any)
-	if len(tabs) != 2 || tabs[0] != "辅导" {
-		t.Errorf("头部 tab 契约不符: %v", out["header_tabs"])
+	if len(tabs) != 3 || tabs[0] != "辅导" || tabs[1] != "学习档案" || tabs[2] != "学情" {
+		t.Errorf("头部 tab 契约不符（应为 辅导|学习档案|学情）: %v", out["header_tabs"])
+	}
+	// 学习档案对象 collections 全量下发（错题本/练习集/积累本/作品）。
+	cols, _ := out["record_collections"].([]any)
+	if len(cols) != 4 {
+		t.Errorf("record_collections 应含四对象 collection: %v", cols)
+	}
+	// 反向契约（执行计划 §3.4）：备课卡独立侧栏/头部动作已退役（辅导要点内联进识题流），
+	// side_panels 与 actions 不得再下发 prep-card。
+	if panels, _ := out["side_panels"].([]any); len(panels) != 0 {
+		t.Errorf("side_panels 应为空（prep-card 侧栏已退役）: %v", panels)
+	}
+	if actions, _ := out["actions"].([]any); len(actions) != 0 {
+		t.Errorf("actions 应为空（IA 定稿头部无 prep-card 动作）: %v", actions)
 	}
 }
 

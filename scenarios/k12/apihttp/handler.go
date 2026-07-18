@@ -11,11 +11,13 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
@@ -24,7 +26,22 @@ import (
 type CronRegistrar interface {
 	// Register 注册一个默认任务（幂等键 = agent+kind，重复注册应覆盖或跳过由实现决定）。
 	Register(ctx context.Context, kind string, spec usecase.CronSpec, platform, chatID, userID string) (jobID string, err error)
+	// ReclaimStale 回收本 agent 名下不在 keepJobIDs 集合内的历史 K12 job（§6.14 一次
+	// 切换终局批）：以稳定幂等键前缀 "<agent>/" 识别 K12 归属（跨 user_id），绝不按
+	// 展示名匹配——用户自建任务（无稳定键）一个都不许动。返回回收清单供取证。
+	ReclaimStale(ctx context.Context, agentName string, keepJobIDs []string) (removed []ReclaimedCronJob, err error)
 }
+
+// ReclaimedCronJob 是 provision stale 回收的取证条目。
+type ReclaimedCronJob struct {
+	JobID     string `json:"job_id"`
+	Name      string `json:"name"`
+	SourceKey string `json:"source_key"`
+}
+
+// ErrBindConflict 限绑业务冲突哨兵（§3.12「一个私聊同时只能接收一个孩子的助手」）：
+// composition root 的 IMBinder 实现用它包装限绑拒绝，HTTP 层映射 409（区别于真内部错误 500）。
+var ErrBindConflict = errors.New("绑定冲突")
 
 // IMBinder 是 IM 入站路由「绑定」缝：把某 IM 群（platform+chat_id）绑到某辅导实例，
 // 之后该群的作业消息由平台路由（agent_rules）投给这个 Agent（PRD §3.1.7 "各绑各的群"）。
@@ -33,18 +50,33 @@ type IMBinder interface {
 	Bind(ctx context.Context, platform, instanceID, chatID, agentName string) error
 }
 
+// IMDeliverer 是「发送到手机」的即时投递缝（§3.10 点评发送 / §3.12 发送到手机）：
+// 把一段家长向文本作为**辅导延伸消息**投给绑定该实例的私聊目标。composition root 用
+// agent 路由规则 + 平台实例管理器实现（AP-1：K12 不 import router/instances）。
+// 未绑定/发送失败返回 error（文案家长向）；nil 时端点诚实降级（前端复制文本兜底）。
+type IMDeliverer interface {
+	DeliverText(ctx context.Context, agentName, content string) (target string, err error)
+}
+
 // Runtime 是本 handler 依赖的 K12 运行时（assembly.K12 满足它；用接口避免 import 环）。
 type Runtime struct {
 	Views   *scenario.ViewExtensionRegistry
-	Records *records.Store
+	Records *k12storage.Store
 	Deps    usecase.Deps
 	// Cron 可选：注入后 POST /cron/provision 可为实例注册默认自动化任务。
 	Cron CronRegistrar
 	// Binder 可选：注入后 POST /bind-im 可把 IM 群绑到辅导实例（入站路由）。
 	Binder IMBinder
+	// Deliver 可选：注入后 POST /creative-works/{id}/send-feedback 可把点评/练习卡
+	// 即时发到绑定私聊；nil 时端点回 501（前端降级为复制文本）。
+	Deliver IMDeliverer
 	// BaseURL 本机 API 基址（如 http://127.0.0.1:8787），生成投递脚本 http_get 目标用。
 	// 空时 provision 用请求体里的 base_url。
 	BaseURL string
+	// Grading 可选：统一 GradingJob 编排器（§6.7/§6.15）。注入后 POST /grading-jobs 可带
+	// image_base64 直接创建照片批改 Job 并异步推进；confirm/retry 走编排器续跑；
+	// GET /grading-jobs/{id} 附带识别停点产物与最终批改结果。nil 时保持纯状态机契约。
+	Grading *usecase.GradingOrchestrator
 }
 
 // NewHandler 返回 K12 的 HTTP 子路由（Go 1.22+ method+path 路由）。
@@ -52,7 +84,10 @@ func NewHandler(rt Runtime) http.Handler {
 	mux := http.NewServeMux()
 	h := &handler{rt: rt}
 	mux.HandleFunc("GET /view-descriptor", h.viewDescriptor)
-	mux.HandleFunc("POST /recognize", h.recognize)
+	// POST /recognize、POST /recognize/anchors 已随一次切换删除（§6.14 · 2026-07-18）：
+	// 识题→锚点→批改统一走 /grading-jobs*（停点产物含识别清单+整卷学科+锚点 bbox），
+	// 反向契约见 cutover_20260718_old_links_removed_test.go。
+	// /grade（单题补批）与 /solve（空白题求解）为甄别保留项：仍被 Job 外合法路径消费。
 	mux.HandleFunc("POST /grade", h.grade)
 	mux.HandleFunc("POST /record-mistake", h.recordMistake)
 	mux.HandleFunc("POST /solve", h.solve)
@@ -66,6 +101,47 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("POST /grounding", h.addGrounding)
 	mux.HandleFunc("POST /accumulation", h.addAccumulation)
 	mux.HandleFunc("GET /accumulation", h.listAccumulation)
+	// 积累检验出口（§3.9）：生成默写题加入练习集待打印（item added_via=accumulation）。
+	mux.HandleFunc("POST /accumulation/{id}/dictation-to-basket", h.accumDictationToBasket)
+	// 练习集（PRD §3.8）：草稿→确认（发布门）→发送→回传→复批→关闭；draft/confirmed 可取消。
+	// POST /practice-sets（整卷直建）已随切换日死刑名单删除（执行计划 §3.4 端点冻结）：
+	// 装篮命令（basket/items → finalize）是唯一创建路径。
+	mux.HandleFunc("GET /practice-sets", h.listPracticeSets)
+	mux.HandleFunc("GET /practice-sets/{id}", h.getPracticeSet)
+	mux.HandleFunc("GET /practice-sets/{id}/paper", h.getPracticePaper)
+	mux.HandleFunc("POST /practice-sets/{id}/verify", h.verifyPracticeItem)
+	// 2026-07-18 购物车裁决：命令端点。confirm/assign 已删除——打印/发送即确认（finalize 一步固化）。
+	mux.HandleFunc("POST /practice-sets/basket/items", h.addToBasket)
+	mux.HandleFunc("POST /practice-sets/{id}/items/remove", h.removeFromBasket)
+	mux.HandleFunc("POST /practice-sets/{id}/finalize", h.finalizePracticeSet)
+	mux.HandleFunc("POST /practice-sets/{id}/submit", h.submitPracticeSet)
+	mux.HandleFunc("POST /practice-sets/{id}/grade", h.gradePracticeSet)
+	mux.HandleFunc("POST /practice-sets/{id}/close", h.closePracticeSet)
+	mux.HandleFunc("POST /practice-sets/{id}/cancel", h.cancelPracticeSet)
+	// 统一 GradingJob（架构设计 §6.7 公共命令；advance 为编排器专用内部推进）
+	mux.HandleFunc("POST /grading-jobs", h.createGradingJob)
+	mux.HandleFunc("GET /grading-jobs", h.listGradingJobs)
+	mux.HandleFunc("GET /grading-jobs/{id}", h.getGradingJob)
+	mux.HandleFunc("POST /grading-jobs/{id}/confirm", h.confirmGradingJob)
+	mux.HandleFunc("POST /grading-jobs/{id}/revise", h.reviseGradingJob)
+	mux.HandleFunc("POST /grading-jobs/{id}/cancel", h.cancelGradingJob)
+	mux.HandleFunc("POST /grading-jobs/{id}/retry", h.retryGradingJob)
+	mux.HandleFunc("POST /grading-jobs/{id}/advance", h.advanceGradingJob)
+	// 作品（PRD §3.10）：draft→点评→修改稿→再点评；只点评不打分不代写（INV-011）。
+	mux.HandleFunc("POST /creative-works", h.createCreativeWork)
+	mux.HandleFunc("GET /creative-works", h.listCreativeWorks)
+	mux.HandleFunc("GET /creative-works/{id}", h.getCreativeWork)
+	mux.HandleFunc("POST /creative-works/{id}/feedback", h.attachWorkFeedback)
+	mux.HandleFunc("POST /creative-works/{id}/generate-feedback", h.generateWorkFeedback)
+	mux.HandleFunc("POST /creative-works/{id}/revision", h.submitWorkRevision)
+	mux.HandleFunc("POST /creative-works/{id}/archive", h.archiveCreativeWork)
+	// 点评/观察练习卡发送出口（§3.10 / §3.12）：走绑定私聊的辅导延伸消息；未接线/未绑定诚实降级。
+	mux.HandleFunc("POST /creative-works/{id}/send-feedback", h.sendWorkFeedback)
+	// 美术观察练习卡完成打卡（§3.10：练习必须有产物，产物归档在版本记录）。
+	mux.HandleFunc("POST /creative-works/{id}/practice-card/done", h.markPracticeCardDone)
+	// 作品照片最小资产服务（§3.10 / §5.5 source_asset_id；魔数/上限/归属契约见 asset_handler.go）。
+	mux.HandleFunc("POST /assets", h.uploadAsset)
+	mux.HandleFunc("GET /assets/{file}", h.getAsset)
 	mux.HandleFunc("GET /backup", h.backup)
 	mux.HandleFunc("POST /restore", h.restore)
 	mux.HandleFunc("GET /export", h.export)
@@ -73,12 +149,16 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("GET /profile", h.getProfile)
 	mux.HandleFunc("PUT /profile", h.updateProfile)
 	mux.HandleFunc("POST /cold-start", h.coldStart)
-	mux.HandleFunc("GET /study-time", h.studyTime)
+	// GET /study-time 已删除（架构设计 v0.5.0《明确不做》#6：不做学习时长与无证据投入指标）。
 	mux.HandleFunc("POST /tutor-turn", h.tutorTurn)
 	// 自动化沉淀投递端点（PRD §3.6）：返回**纯文本**投递内容，空 body = 本期无内容（静默跳过）。
 	// 供平台 cron 的 Starlark 脚本 http_get 抓取后 emit → Deliverer 投递到 IM 群/桌面。
 	mux.HandleFunc("GET /cron/mistake-sheet", h.cronMistakeSheet)
+	// §3.13 每周复习第一步（执行计划 §3.0 治本③）：到期错题自动装篮（幂等）；
+	// weekly-sheet 的 Starlark 脚本先 http_post 此端点再抓错题卷。
+	mux.HandleFunc("POST /cron/fill-basket", h.cronFillBasket)
 	mux.HandleFunc("GET /cron/daily-reminder", h.cronDailyReminder)
+	mux.HandleFunc("GET /cron/return-reminder", h.cronReturnReminder)
 	mux.HandleFunc("GET /cron/monthly-report", h.cronMonthlyReport)
 	mux.HandleFunc("GET /cron/semester-check", h.cronSemesterCheck)
 	mux.HandleFunc("GET /cron/year-archive", h.cronYearArchive)
@@ -102,19 +182,24 @@ type gradeReq struct {
 }
 
 type gradeResp struct {
-	Solution      string `json:"solution"`
+	Solution string `json:"solution"`
+	// Verdict 判定五值（§4.5 布尔 correct 删除，§6.14 授权破坏性契约变更）：
+	// 批改路径 = 批改判定（agree=答对 / disagree=答错）；解题分叉与超纲 = 验算/超纲结论。
+	// 徽章强弱仍由 badge/evidence_type（验算证据）承载，与批改判定解耦。
 	Verdict       string `json:"verdict"`
 	EvidenceType  string `json:"evidence_type"`
 	Badge         string `json:"badge"`
-	Correct       bool   `json:"correct"`
 	WrongStep     string `json:"wrong_step,omitempty"`
 	ErrorCause    string `json:"error_cause,omitempty"`
 	OutOfScope    bool   `json:"out_of_scope"`
 	OutOfScopeKP  string `json:"out_of_scope_kp,omitempty"`
 	RecordCreated bool   `json:"record_created"`
 	RecordID      string `json:"record_id,omitempty"`
+	// CurriculumUnmapped 词表外知识点（fail-visible，PRD §5.2.4 / bug 2026-07-18）：
+	// 超纲硬拦截对这些 KP 不生效，前端须显性提示「不在课标映射内」。
+	CurriculumUnmapped []string `json:"curriculum_unmapped,omitempty"`
 	// SolveOnly=true 表示本次 student_answer 为空，内部转「解题」分叉（非批改）：
-	// 只返回 solution，correct/record 无意义。前端应按解题口径呈现，不显示对/错。
+	// 只返回 solution，无批改判定与入库。前端应按解题口径呈现，不显示对/错。
 	SolveOnly bool `json:"solve_only"`
 }
 
@@ -129,6 +214,9 @@ type mistakeDTO struct {
 	// 跨科复习队列用：subject=学科（数学/语文/英语），review_kind=再练方式（verify=验算链变式 / verbatim=原词重现字符比对）。
 	Subject    string `json:"subject,omitempty"`
 	ReviewKind string `json:"review_kind,omitempty"`
+	// SpotCheckState 抽查复验状态（§3.6：none/scheduled/passed/failed）。前端只消费 failed
+	// →「家长确认（复验未过）」事实标注；scheduled 不呈现（不打抽查标签，规则 1）。
+	SpotCheckState string `json:"spot_check_state,omitempty"`
 }
 
 type viewDescriptorDTO struct {
@@ -164,11 +252,7 @@ func (h *handler) viewDescriptor(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-type recognizeReq struct {
-	ImageBase64 string `json:"image_base64"`
-}
-
-// bboxDTO 学生作答区域归一化边界框（0~1），随识题一次返回供前端原图叠加批改标记。
+// bboxDTO 是独立答案锚定阶段核验出的学生作答区域归一化边界框（0~1）。
 type bboxDTO struct {
 	X float64 `json:"x"`
 	Y float64 `json:"y"`
@@ -182,39 +266,32 @@ type recognizedQuestionDTO struct {
 	// StudentAnswer 识题回收的孩子手写作答（未作答=空串）。前端据此区分空白题(走 /solve 求解)
 	// 与已答题(走 /grade 批改)，家长可在回显门修改。
 	StudentAnswer string `json:"student_answer"`
+	// AnswerState 是作答事实的单一真相源。blank / present / unclear 与答案文本、图片坐标解耦。
+	AnswerState usecase.AnswerState `json:"answer_state"`
 	// Subject 识题自动判定的题目学科（数学/语文/英语/物理/化学，判不出=空）。
 	Subject string `json:"subject,omitempty"`
-	// BBox 学生作答区域归一化边界框（0~1）；null=未定位（前端降级为纯文字批改，不叠加，绝不错位）。
-	// 用 omitempty + 指针：缺失时字段为 null，前端据 null 走降级路径。
+	// BBox 只在独立答案锚定阶段之后出现（GradingJob 停点产物）；核心识题永远不携带坐标。
 	BBox *bboxDTO `json:"bbox,omitempty"`
 }
 
-// recognize POST /recognize —— 作业图片（base64）→ 结构化题目清单。
-func (h *handler) recognize(w http.ResponseWriter, r *http.Request) {
-	var req recognizeReq
-	if !decodeLimit(w, r, &req, 8<<20) {
-		return
+func recognizedQuestionToDTO(question usecase.RecognizedQuestion, includeBBox bool) recognizedQuestionDTO {
+	question = usecase.NormalizeRecognizedQuestion(question)
+	dto := recognizedQuestionDTO{
+		Question:        question.Question,
+		KnowledgePoints: question.KnowledgePoints,
+		AnswerState:     question.AnswerState,
+		StudentAnswer:   question.StudentAnswer,
+		Subject:         question.Subject,
 	}
-	img, err := base64.StdEncoding.DecodeString(strings.TrimSpace(stripDataURI(req.ImageBase64)))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid base64 image")
-		return
-	}
-	qs, err := h.rt.Deps.RecognizeHomework(r.Context(), img)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	out := make([]recognizedQuestionDTO, 0, len(qs))
-	for _, q := range qs {
-		dto := recognizedQuestionDTO{Question: q.Question, KnowledgePoints: q.KnowledgePoints, StudentAnswer: q.StudentAnswer, Subject: q.Subject}
-		if q.BBox != nil { // 仅识题回收到合法框时下发；nil → 字段 null，前端降级纯文字批改。
-			dto.BBox = &bboxDTO{X: q.BBox.X, Y: q.BBox.Y, W: q.BBox.W, H: q.BBox.H}
+	if includeBBox && question.BBox != nil {
+		dto.BBox = &bboxDTO{
+			X: question.BBox.X,
+			Y: question.BBox.Y,
+			W: question.BBox.W,
+			H: question.BBox.H,
 		}
-		out = append(out, dto)
 	}
-	// 顶层整卷学科：逐题判定后取多数（家长不必手选，前端据此预填学科下拉，仍可手动覆盖）。
-	writeJSON(w, http.StatusOK, map[string]any{"questions": out, "subject": dominantSubject(qs)})
+	return dto
 }
 
 // dominantSubject 取识题逐题学科里出现最多的那一个作为整卷学科（平票取先出现者，全空则空）。
@@ -261,6 +338,18 @@ func stripDataURI(s string) string {
 	return s
 }
 
+func decodeRequiredImage(encoded string) ([]byte, error) {
+	encoded = strings.TrimSpace(stripDataURI(encoded))
+	if encoded == "" {
+		return nil, errors.New("image_base64 is required")
+	}
+	image, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(image) == 0 {
+		return nil, errors.New("invalid base64 image")
+	}
+	return image, nil
+}
+
 // grade POST /grade —— 批改一道题的完整闭环。
 func (h *handler) grade(w http.ResponseWriter, r *http.Request) {
 	var req gradeReq
@@ -275,14 +364,26 @@ func (h *handler) grade(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, gradeResp{
-		Solution: res.Solution, Verdict: string(res.Evidence.Verdict),
+	writeJSON(w, http.StatusOK, gradeRespFromResult(res))
+}
+
+// gradeRespFromResult 统一 GradeResult → wire DTO（判定五值口径，§4.5）：
+// 批改发生时 verdict = 批改判定（Outcome.Verdict）；解题分叉/超纲无批改判定，
+// 沿用验算/超纲 verdict（Evidence.Verdict），不伪造二元结论。
+func gradeRespFromResult(res usecase.GradeResult) gradeResp {
+	verdict := res.Outcome.Verdict
+	if verdict == "" {
+		verdict = res.Evidence.Verdict
+	}
+	return gradeResp{
+		Solution: res.Solution, Verdict: string(verdict),
 		EvidenceType: string(res.Evidence.EvidenceType), Badge: res.Evidence.Badge(),
-		Correct: res.Outcome.Correct, WrongStep: res.Outcome.WrongStep, ErrorCause: res.Outcome.ErrorCause,
+		WrongStep: res.Outcome.WrongStep, ErrorCause: res.Outcome.ErrorCause,
 		OutOfScope: res.OutOfScope, OutOfScopeKP: res.OutOfScopeKP,
 		RecordCreated: res.RecordCreated, RecordID: res.RecordID,
-		SolveOnly: res.SolveOnly,
-	})
+		CurriculumUnmapped: res.CurriculumUnmapped,
+		SolveOnly:          res.SolveOnly,
+	}
 }
 
 type recordMistakeReq struct {
@@ -338,6 +439,8 @@ type solveResp struct {
 	Badge        string `json:"badge"`
 	OutOfScope   bool   `json:"out_of_scope"`
 	OutOfScopeKP string `json:"out_of_scope_kp,omitempty"`
+	// CurriculumUnmapped 词表外知识点（fail-visible，同 gradeResp）。
+	CurriculumUnmapped []string `json:"curriculum_unmapped,omitempty"`
 }
 
 // solve POST /solve —— 空白/未作答题求解：给解法+答案+讲解，**不批改、不入错题本**。
@@ -360,6 +463,7 @@ func (h *handler) solve(w http.ResponseWriter, r *http.Request) {
 		Solution: res.Solution, Verdict: string(res.Evidence.Verdict),
 		EvidenceType: string(res.Evidence.EvidenceType), Badge: res.Evidence.Badge(),
 		OutOfScope: res.OutOfScope, OutOfScopeKP: res.OutOfScopeKP,
+		CurriculumUnmapped: res.CurriculumUnmapped,
 	})
 }
 
@@ -472,6 +576,12 @@ type reviewRetryResp struct {
 	Solution string `json:"solution"`
 	Verdict  string `json:"verdict"`
 	Badge    string `json:"badge"`
+	// 题答分离（2026-07-18 P2 清偿，守答案遮罩红线）：question 先显、answer 默认遮罩；
+	// 拆不出题答边界时两者为空，前端整段遮罩 solution（最小闭环回退）。
+	Question string `json:"question,omitempty"`
+	Answer   string `json:"answer,omitempty"`
+	// ExpectedAnswer 最终答案（## 答案 章节正文）：装篮 expected_answer_markdown 用。
+	ExpectedAnswer string `json:"expected_answer,omitempty"`
 }
 
 // reviewRetry POST /review/retry —— 「再练一道」：按错题出同知识点相似题（过 solve 验算链）。
@@ -490,30 +600,36 @@ func (h *handler) reviewRetry(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, httpStatusForK12Error(err, http.StatusBadRequest), err.Error())
 		return
 	}
+	question, answer, expected := usecase.SplitRetryPresentation(res.Solution)
 	writeJSON(w, http.StatusOK, reviewRetryResp{
 		Solution: res.Solution, Verdict: string(res.Evidence.Verdict), Badge: res.Evidence.Badge(),
+		Question: question, Answer: answer, ExpectedAnswer: expected,
 	})
 }
 
 type prepCardReq struct {
-	Agent           string   `json:"agent"`
-	Grade           string   `json:"grade"`
+	Agent string `json:"agent"`
+	Grade string `json:"grade"`
+	// Subject 当前题目学科（§4.3 分科教材）：①段优先检索本学科教材；空 = 不分科旧语义。
+	Subject         string   `json:"subject"`
 	KnowledgePoints []string `json:"knowledge_points"`
 }
 
 type groundingReq struct {
-	Agent   string `json:"agent"`
+	Agent string `json:"agent"`
+	// Subject 分科教材学科（六学科枚举校验）；空 = 不分科旧语义（前向兼容）。
+	Subject string `json:"subject"`
 	Title   string `json:"title"`
 	Content string `json:"content"`
 }
 
-// addGrounding POST /grounding —— 家长教材按 agent scope 入库，与备课卡读侧同键。
+// addGrounding POST /grounding —— 家长教材按 agent（× 学科）scope 入库，与备课卡读侧同键。
 func (h *handler) addGrounding(w http.ResponseWriter, r *http.Request) {
 	var req groundingReq
 	if !decode(w, r, &req) {
 		return
 	}
-	if err := h.rt.Deps.AddGrounding(r.Context(), req.Agent, req.Title, req.Content); err != nil {
+	if err := h.rt.Deps.AddGrounding(r.Context(), req.Agent, req.Subject, req.Title, req.Content); err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
 	}
@@ -532,7 +648,7 @@ func (h *handler) prepCard(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	card, err := h.rt.Deps.BuildPrepCard(r.Context(), req.Agent, h.resolveGrade(r.Context(), req.Agent, req.Grade), req.KnowledgePoints)
+	card, err := h.rt.Deps.BuildPrepCardSubject(r.Context(), req.Agent, h.resolveGrade(r.Context(), req.Agent, req.Grade), req.Subject, req.KnowledgePoints)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
@@ -560,6 +676,7 @@ type accumDTO struct {
 	Content   string `json:"content"`
 	Source    string `json:"source"`
 	Status    string `json:"status"`
+	CreatedAt int64  `json:"created_at"` // unix 秒；引文列表收藏日期（原型 20260718 定案 acc-date）
 }
 
 // addAccumulation POST /accumulation —— 语文/英语积累本写入。
@@ -576,6 +693,33 @@ func (h *handler) addAccumulation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"record_id": id, "created": created})
+}
+
+// dictationReq POST /accumulation/{id}/dictation-to-basket 请求体。
+// full_dictation：古诗整首默写须家长在生成时显式选择（§3.9 默写出题格式，缺省补空式）。
+type dictationReq struct {
+	Agent         string `json:"agent"`
+	SourceSession string `json:"source_session"`
+	FullDictation bool   `json:"full_dictation"`
+}
+
+// accumDictationToBasket POST /accumulation/{id}/dictation-to-basket ——「生成默写题，加入练习集」
+// （§3.9 出口）：≤20 字全文默写 / 古诗默认补空 / >100 字拒绝（400）；装篮幂等去重，家长可移除。
+func (h *handler) accumDictationToBasket(w http.ResponseWriter, r *http.Request) {
+	var req dictationReq
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	basketID, added, err := h.rt.Deps.GenerateDictationToBasket(r.Context(), req.Agent, req.SourceSession, r.PathValue("id"), req.FullDictation)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusBadRequest), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"record_id": basketID, "added": added})
 }
 
 // listAccumulation GET /accumulation?agent=X&subject=语文 —— 积累本列表。
@@ -595,6 +739,7 @@ func (h *handler) listAccumulation(w http.ResponseWriter, r *http.Request) {
 		out = append(out, accumDTO{
 			RecordID: it.Record.RecordID, Subject: it.Fields.Subject, EntryType: it.Fields.EntryType,
 			Content: it.Fields.Content, Source: it.Fields.Source, Status: it.Record.Status,
+			CreatedAt: it.Record.CreatedAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": out})
@@ -656,7 +801,17 @@ func (h *handler) export(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Disposition", "attachment; filename=\"mistakes."+format+"\"")
+	// §4.13 文件名规范：导出（单孩）= {孩子称呼}_学习档案_{学期}.{ext}；
+	// 档案读不到（未接 Profiles / 未建档）回退现名 mistakes.{ext}。
+	name := "mistakes." + format
+	if h.rt.Deps.Profiles != nil {
+		if p, perr := h.rt.Deps.GetProfile(r.Context(), agent); perr == nil && p.ChildName != "" && p.GradeTerm != "" {
+			name = p.ChildName + "_学习档案_" + p.GradeTerm + "." + format
+		}
+	}
+	// filename* 携带 RFC 5987 UTF-8 编码，兼容非 ASCII 称呼；filename 保留原文供现代客户端。
+	w.Header().Set("Content-Disposition",
+		"attachment; filename=\""+name+"\"; filename*=UTF-8''"+url.PathEscape(name))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 }
@@ -688,6 +843,9 @@ type coldStartReq struct {
 	KnowledgePoints []string `json:"knowledge_points"`
 	FallbackGrade   string   `json:"fallback_grade"` // 推断不出时用（可空 → 降级不注入约束）
 	Textbook        string   `json:"textbook_edition"`
+	// Confirm 家长确认标记（§3.1 主流程 4：推断只返回建议，不写档案；家长确认后才创建）。
+	// 缺省 false = 只读推断；显式 true 才落库。
+	Confirm bool `json:"confirm"`
 }
 
 type coldStartResp struct {
@@ -698,14 +856,19 @@ type coldStartResp struct {
 	Created         bool   `json:"created"`  // 是否新建档案（false=已有档案）
 }
 
-// coldStart POST /cold-start —— 未建档实例首拍作业：按知识点倒查推断年级 → 建档（PRD §3.1.4-4）。
-// 已有档案则不覆盖直接返回；前端应先向家长确认推断年级再调此端点落库。
+// coldStart POST /cold-start —— 未建档实例首拍作业：按知识点倒查推断年级（PRD §3.1.4-4）。
+// 不带 confirm：只读推断，返回建议档案，**绝不写库**（§3.1 主流程 4）；
+// confirm=true：家长确认后落库（已有档案不覆盖）。教材未提供留空待补充，不默认人教版。
 func (h *handler) coldStart(w http.ResponseWriter, r *http.Request) {
 	var req coldStartReq
 	if !decode(w, r, &req) {
 		return
 	}
-	res, err := h.rt.Deps.ColdStartProvision(r.Context(), req.Agent, req.ChildName, req.KnowledgePoints, req.FallbackGrade, req.Textbook)
+	provision := h.rt.Deps.InferProfile
+	if req.Confirm {
+		provision = h.rt.Deps.ColdStartProvision
+	}
+	res, err := provision(r.Context(), req.Agent, req.ChildName, req.KnowledgePoints, req.FallbackGrade, req.Textbook)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
@@ -737,21 +900,6 @@ func (h *handler) updateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, profileDTO{ChildName: p.ChildName, GradeTerm: p.GradeTerm, TextbookEdition: p.TextbookEdition})
-}
-
-// studyTime GET /study-time?agent=X —— 学习时长（日粒度近似）。
-func (h *handler) studyTime(w http.ResponseWriter, r *http.Request) {
-	agent := r.URL.Query().Get("agent")
-	if agent == "" {
-		writeErr(w, http.StatusBadRequest, "agent required")
-		return
-	}
-	st, err := h.rt.Deps.StudyTime(r.Context(), agent)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, st)
 }
 
 // mistakeSheet GET /mistake-sheet?agent=X —— 生成本周错题卷（到期该练，只出题）。
@@ -845,6 +993,11 @@ func (h *handler) bindIM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.rt.Binder.Bind(r.Context(), req.Platform, req.InstanceID, req.ChatID, req.Agent); err != nil {
+		// 限绑冲突（§3.12）是业务裁决不是服务器故障：409 + 家长向文案原样透传。
+		if errors.Is(err, ErrBindConflict) {
+			writeErr(w, http.StatusConflict, strings.TrimPrefix(err.Error(), ErrBindConflict.Error()+": "))
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, "绑定失败: "+err.Error())
 		return
 	}
@@ -880,6 +1033,23 @@ func (h *handler) cronMistakeSheet(w http.ResponseWriter, r *http.Request) {
 	writeText(w, md)
 }
 
+// cronFillBasket POST /cron/fill-basket?agent=X —— §3.13 每周复习自动装篮（§3.8 装篮入口2）。
+// 调 FillBasketFromDue：到期复习项逐题原题重现装篮（added_via=weekly），幂等去重——
+// cron 重触发不重复装，重复调用安全。响应 {added, skipped}。
+func (h *handler) cronFillBasket(w http.ResponseWriter, r *http.Request) {
+	agent := r.URL.Query().Get("agent")
+	if agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	added, skipped, err := h.rt.Deps.FillBasketFromDue(r.Context(), agent, "cron-weekly")
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"added": added, "skipped": skipped})
+}
+
 // cronDailyReminder GET /cron/daily-reminder?agent=X —— 每日复习提醒。
 // 无待复习 → 空 body（跳过）。
 func (h *handler) cronDailyReminder(w http.ResponseWriter, r *http.Request) {
@@ -889,6 +1059,26 @@ func (h *handler) cronDailyReminder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	text, skip, err := h.rt.Deps.DailyReminder(r.Context(), agent)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if skip {
+		writeText(w, "")
+		return
+	}
+	writeText(w, text)
+}
+
+// cronReturnReminder GET /cron/return-reminder?agent=X —— §3.13 回传提醒（T+1 20:00 扫描节拍）。
+// 昨日固化且仍未回传的卷 → 提醒文案（含 paper_no 与题数，每卷最多一次）；无 → 空 body（跳过）。
+func (h *handler) cronReturnReminder(w http.ResponseWriter, r *http.Request) {
+	agent := r.URL.Query().Get("agent")
+	if agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	text, skip, err := h.rt.Deps.ReturnReminder(r.Context(), agent)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -985,21 +1175,32 @@ func (h *handler) cronProvision(w http.ResponseWriter, r *http.Request) {
 	if userID == "" {
 		userID = "k12"
 	}
+	// 任务集与 kind 都以描述符（DefaultCronSpecs，对齐 §3.13）为单一事实源——
+	// 原平行 kinds 数组随 monthly-report/year-archive 描述符撤下而删除，防 kind/spec 错位。
 	specs := usecase.DefaultCronSpecs(base, req.Agent, req.Deliver)
-	kinds := []usecase.K12CronKind{
-		usecase.KindWeeklySheet, usecase.KindDailyReminder, usecase.KindMonthlyReport,
-		usecase.KindYearEndArchive, usecase.KindSemesterSpring, usecase.KindSemesterFall,
-	}
 	out := make([]provisionedJob, 0, len(specs))
-	for i, s := range specs {
-		jobID, err := h.rt.Cron.Register(r.Context(), string(kinds[i]), s, req.Platform, req.ChatID, userID)
+	keep := make([]string, 0, len(specs))
+	for _, s := range specs {
+		jobID, err := h.rt.Cron.Register(r.Context(), string(s.Kind), s, req.Platform, req.ChatID, userID)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "注册 "+s.Name+" 失败: "+err.Error())
 			return
 		}
-		out = append(out, provisionedJob{Kind: string(kinds[i]), Name: s.Name, Schedule: s.Schedule, JobID: jobID})
+		out = append(out, provisionedJob{Kind: string(s.Kind), Name: s.Name, Schedule: s.Schedule, JobID: jobID})
+		keep = append(keep, jobID)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"provisioned": out})
+	// §6.14 一次切换终局批：注册完 §3.13 四任务后回收本 agent 名下的历史 K12 job
+	//（撤下 kind 如 monthly-report/daily-reminder/year-archive、旧 user_id 下的重复
+	// 投递源）。以稳定键前缀识别，用户自建任务与其他 agent 不受影响。
+	reclaimed, err := h.rt.Cron.ReclaimStale(r.Context(), req.Agent, keep)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "回收历史任务失败（本次注册已生效，可重试 provision）: "+err.Error())
+		return
+	}
+	if reclaimed == nil {
+		reclaimed = []ReclaimedCronJob{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"provisioned": out, "reclaimed": reclaimed})
 }
 
 // cronYearArchive GET /cron/year-archive?agent=X —— 学年 6 月底归档建议。
@@ -1044,7 +1245,7 @@ func mistakeDTOFrom(r *records.AgentRecord, f k12.MistakeFields) mistakeDTO {
 	return mistakeDTO{
 		RecordID: r.RecordID, Question: f.Question, KnowledgePoint: f.KnowledgePoint,
 		ErrorCause: f.ErrorCause, Status: r.Status, Version: r.Version, DueAt: r.DueAt,
-		Subject: f.Subject,
+		Subject: f.Subject, SpotCheckState: f.SpotCheckState,
 	}
 }
 

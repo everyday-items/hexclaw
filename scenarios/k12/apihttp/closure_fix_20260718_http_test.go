@@ -1,0 +1,145 @@
+package apihttp_test
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
+)
+
+// K12 闭环纠偏包 HTTP 契约（2026-07-18）：
+//   ① POST /practice-sets/{id}/grade 逐题结论 results（§3.8 第 3-4 条）；
+//   ② send 固化不虚标 delivered（§3.12 渠道失败不回滚领域对象）；
+//   ③ POST /accumulation/{id}/dictation-to-basket（§3.9 默写出题格式）；
+//   ④ /cold-start 不带 confirm 绝不写档案（§3.1 主流程 4）；
+//   ⑤ /export 文件名 {孩子称呼}_学习档案_{学期}.{ext}（§4.13）。
+
+func TestHTTPGradeResultsPartialThenComplete(t *testing.T) {
+	h := newServer(t)
+	// 装两题 verified 入篮 → 固化 → 回传。
+	_, out := do(t, h, "POST", "/practice-sets/basket/items", `{"agent":"mingming",
+		"item":{"item_id":"qa","subject":"数学","added_via":"weekly","question_markdown":"3.8×3=?","expected_answer_markdown":"11.4","verification_status":"verified","verification_evidence":"独立验算"}}`)
+	id := out["record_id"].(string)
+	do(t, h, "POST", "/practice-sets/basket/items", `{"agent":"mingming",
+		"item":{"item_id":"qb","subject":"数学","added_via":"weekly","question_markdown":"2.8×0.65=?","expected_answer_markdown":"1.82","verification_status":"verified","verification_evidence":"独立验算"}}`)
+	do(t, h, "POST", "/practice-sets/"+id+"/finalize", `{"agent":"mingming","via":"print"}`)
+	do(t, h, "POST", "/practice-sets/"+id+"/submit", `{"agent":"mingming"}`)
+
+	// 部分结论 → 卷保持 submitted（§3.8 第 4 条：全回传结论才 graded）。
+	rec, r := do(t, h, "POST", "/practice-sets/"+id+"/grade", `{"agent":"mingming","results":[{"item_id":"qa","correct":false}]}`)
+	if rec.Code != http.StatusOK || r["status"] != "submitted" {
+		t.Fatalf("部分结论应 200 且保持 submitted: code=%d %v", rec.Code, r["status"])
+	}
+	// 全结论 → graded。
+	rec, r = do(t, h, "POST", "/practice-sets/"+id+"/grade", `{"agent":"mingming","results":[{"item_id":"qa","correct":true},{"item_id":"qb","correct":true}]}`)
+	if rec.Code != http.StatusOK || r["status"] != "graded" {
+		t.Fatalf("全结论应转 graded: code=%d %v", rec.Code, r["status"])
+	}
+}
+
+func TestHTTPFinalizeSendDeliveryPending(t *testing.T) {
+	h := newServer(t)
+	_, out := do(t, h, "POST", "/practice-sets/basket/items", `{"agent":"mingming",
+		"item":{"subject":"数学","added_via":"weekly","question_markdown":"1+1=?","expected_answer_markdown":"2","verification_status":"verified","verification_evidence":"验算"}}`)
+	id := out["record_id"].(string)
+	rec, fin := do(t, h, "POST", "/practice-sets/"+id+"/finalize", `{"agent":"mingming","via":"send","target":"钉钉私聊"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("固化 HTTP %d: %v", rec.Code, fin)
+	}
+	set, _ := fin["set"].(map[string]any)
+	// §3.12：无真实投递器接线时不得虚标 delivered。
+	if set["delivery_status"] != k12.PracticeDeliveryPending {
+		t.Errorf("send 固化未接投递器应为 pending, got %v", set["delivery_status"])
+	}
+	if note, _ := fin["delivery_note"].(string); note == "" {
+		t.Error("响应应注明投递状态 pending 的原因")
+	}
+}
+
+func TestHTTPDictationToBasket(t *testing.T) {
+	h := newServer(t)
+	rec, out := do(t, h, "POST", "/accumulation", `{"agent":"mingming","subject":"语文","entry_type":"好词好句","content":"桂花香"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("加积累 HTTP %d: %v", rec.Code, out)
+	}
+	accumID := out["record_id"].(string)
+	rec, out = do(t, h, "POST", "/accumulation/"+accumID+"/dictation-to-basket", `{"agent":"mingming"}`)
+	if rec.Code != http.StatusOK || out["added"] != true {
+		t.Fatalf("默写出题装篮应 200+added: code=%d %v", rec.Code, out)
+	}
+	setID := out["record_id"].(string)
+	_, got := do(t, h, "GET", "/practice-sets/"+setID+"?agent=mingming", "")
+	items, _ := got["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("篮内应 1 题: %v", got["items"])
+	}
+	it := items[0].(map[string]any)
+	if it["added_via"] != "accumulation" || it["question_markdown"] != "默写：桂花香" {
+		t.Errorf("默写题契约不符: %v", it)
+	}
+
+	// >100 字长文 → 400。
+	long := strings.Repeat("好句素材内容很长", 15)
+	_, out = do(t, h, "POST", "/accumulation", `{"agent":"mingming","subject":"语文","entry_type":"写作素材","content":"`+long+`"}`)
+	longID := out["record_id"].(string)
+	rec, _ = do(t, h, "POST", "/accumulation/"+longID+"/dictation-to-basket", `{"agent":"mingming"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf(">100 字应 400 拒绝, got %d", rec.Code)
+	}
+}
+
+func TestHTTPColdStartRequiresConfirmToWrite(t *testing.T) {
+	h := newServerWithSolver(t, fakeSolveExec{}, assembly.WithProfiles(&memProfiles{m: map[string]k12.ChildProfile{}}))
+	// 不带 confirm：只返回建议，绝不写档案（§3.1 主流程 4）。
+	rec, out := do(t, h, "POST", "/cold-start", `{"agent":"mingming","child_name":"明明","knowledge_points":["简易方程"]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("推断建议应 200, got %d: %v", rec.Code, out)
+	}
+	if out["created"] == true {
+		t.Fatal("不带 confirm 的冷启动不得建档")
+	}
+	if out["grade_term"] != "五年级上" {
+		t.Errorf("应返回推断建议年级 五年级上, got %v", out["grade_term"])
+	}
+	if _, p := do(t, h, "GET", "/profile?agent=mingming", ""); p["grade_term"] != "" && p["grade_term"] != nil {
+		t.Fatalf("不带 confirm 绝不写档案, got %v", p["grade_term"])
+	}
+
+	// confirm=true：家长确认后落库；教材未提供 → 留空待补充（不再默认人教版）。
+	rec, out = do(t, h, "POST", "/cold-start", `{"agent":"mingming","child_name":"明明","knowledge_points":["简易方程"],"confirm":true}`)
+	if rec.Code != http.StatusOK || out["created"] != true {
+		t.Fatalf("confirm 落库应 created=true: code=%d %v", rec.Code, out)
+	}
+	if out["textbook_edition"] != "" {
+		t.Errorf("教材未提供应留空待补充（删人教版兜底），got %v", out["textbook_edition"])
+	}
+	if _, p := do(t, h, "GET", "/profile?agent=mingming", ""); p["grade_term"] != "五年级上" {
+		t.Errorf("confirm 后档案应写入, got %v", p["grade_term"])
+	}
+}
+
+// pdfRenderer 供导出文件名契约测试（渲染内容不重要，只看 Content-Disposition）。
+type pdfRenderer struct{}
+
+func (pdfRenderer) Render(_ context.Context, _, _ string) ([]byte, string, error) {
+	return []byte("%PDF-stub"), "application/pdf", nil
+}
+
+func TestHTTPExportFilenameFromProfile(t *testing.T) {
+	profiles := &memProfiles{m: map[string]k12.ChildProfile{}}
+	h := newServerWithSolver(t, fakeSolveExec{},
+		assembly.WithProfiles(profiles),
+		assembly.WithRenderer(pdfRenderer{}))
+	if rec, _ := do(t, h, "PUT", "/profile", `{"agent":"mingming","child_name":"明明","grade_term":"五年级上"}`); rec.Code != http.StatusOK {
+		t.Fatalf("设档案失败 %d", rec.Code)
+	}
+	req, _ := do(t, h, "GET", "/export?agent=mingming&format=pdf", "")
+	cd := req.Header().Get("Content-Disposition")
+	// §4.13 文件名：导出（单孩）= {孩子称呼}_学习档案_{学期}.{ext}。
+	if !strings.Contains(cd, "明明_学习档案_五年级上.pdf") {
+		t.Errorf("导出文件名应为 明明_学习档案_五年级上.pdf（§4.13），got %q", cd)
+	}
+}

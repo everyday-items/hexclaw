@@ -25,7 +25,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -53,6 +52,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/audit"
 	"github.com/hexagon-codes/hexclaw/autonomy"
 	"github.com/hexagon-codes/hexclaw/canvas"
+	"github.com/hexagon-codes/hexclaw/channel"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/connector"
 	"github.com/hexagon-codes/hexclaw/cron"
@@ -68,14 +68,15 @@ import (
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
-	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/render"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
+	"github.com/hexagon-codes/hexclaw/scenario"
 	k12 "github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12apihttp "github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	k12assembly "github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
 	k12engineadapter "github.com/hexagon-codes/hexclaw/scenarios/k12/engineadapter"
 	k12skilladapter "github.com/hexagon-codes/hexclaw/scenarios/k12/skilladapter"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/secret"
 	"github.com/hexagon-codes/hexclaw/security"
@@ -83,6 +84,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/skill/builtin"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
+	"github.com/hexagon-codes/hexclaw/storage/scenarioinstall"
 	sqlitestore "github.com/hexagon-codes/hexclaw/storage/sqlite"
 	"github.com/hexagon-codes/hexclaw/webhook"
 )
@@ -606,59 +608,22 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 嵌入接线信息（BUG-20260712-B1）：装配完成后注入 api server，
 	// 供 /knowledge/embedding-status 端点把「嵌入未就绪=自动注入休眠」可见化。
 	var kbEmbedProvider, kbEmbedModel, kbEmbedBaseURL string
-	var kbEmbedLocal bool
+	var kbEmbedLocal, kbEmbedReady, kbEmbedServiceAvailable bool
 	if cfg.Knowledge.Enabled {
 		kbStore := knowledge.NewSQLiteStore(store.DB())
 		if err := kbStore.Init(ctx); err == nil {
 			// 1. 构造 embedder: ai-core Provider → hexagon embedder 包装
 			var emb *hexagon.OpenAIEmbedder
 
-			// 确定 embedding provider：显式配置 > 自动检测（Ollama nomic-embed-text > 有 API Key 的云服务）
-			embProviderName := cfg.Knowledge.Embedding.Provider
-			embModel := cfg.Knowledge.Embedding.Model
-
-			if embProviderName == "" {
-				// 自动检测：优先 Ollama（本地、免费、无需 API Key）
-				for name, pc := range cfg.LLM.Providers {
-					lower := strings.ToLower(name)
-					isOllamaProvider := strings.Contains(lower, "ollama") || strings.Contains(strings.ToLower(pc.BaseURL), "localhost:11434")
-					if isOllamaProvider {
-						embProviderName = name
-						if embModel == "" {
-							// 自动发现（BUG-20260712-B1 嵌入开箱保证）：已装任一嵌入模型 → 直接用
-							// （零配置零下载激活）；否则保持 nomic-embed-text 默认接线——用户经知识库页
-							// 一键安装后无需重启即生效（Embed 按模型名打 Ollama，模型就位即成功）。
-							if detected, ok := knowledge.DetectOllamaEmbeddingModel(ctx, pc.BaseURL); ok {
-								embModel = detected
-								logger.Info("[knowledge] 自动发现已安装的嵌入模型", "model", detected)
-							} else {
-								embModel = "nomic-embed-text"
-								logger.Warn("[knowledge] 未发现已安装嵌入模型，默认接线 nomic-embed-text（安装前语义检索休眠，可在知识库页一键安装）")
-							}
-						}
-						logger.Info("[knowledge] 自动选择 Ollama 作为 embedding provider", "name", name, "model", embModel)
-						break
-					}
-				}
-			}
-			if embProviderName == "" {
-				// 其次：找第一个有 API Key 的云 provider
-				for name, pc := range cfg.LLM.Providers {
-					if pc.APIKey != "" {
-						embProviderName = name
-						logger.Info("[knowledge] 自动选择云服务作为 embedding provider", "name", name)
-						break
-					}
-				}
-			}
-
-			if embProviderName != "" {
+			// 显式配置优先；auto 只发现真实存在的 Ollama 能力，不再把任意 chat API
+			// 猜成 text-embedding-3-small，避免计费、404 和 map 遍历随机选路。
+			embeddingPlan := resolveKnowledgeEmbeddingPlan(ctx, cfg)
+			embProviderName := embeddingPlan.Provider
+			embModel := embeddingPlan.Model
+			if embeddingPlan.Configured {
 				if pc, ok := cfg.LLM.Providers[embProviderName]; ok {
-					if embModel == "" {
-						embModel = "text-embedding-3-small"
-					}
-					// Ollama 不需要 API Key，云服务需要
-					isOllama := strings.ToLower(embProviderName) == "ollama" || strings.Contains(strings.ToLower(pc.BaseURL), "localhost:11434")
+					// Ollama 不需要 API Key；云服务只有在 provider+model+key 均显式配置时才接线。
+					isOllama := embeddingPlan.Ollama
 					if isOllama || pc.APIKey != "" {
 						var providerOpts []hexagon.OpenAIOption
 						if pc.BaseURL != "" {
@@ -674,11 +639,17 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 							hexagon.WithEmbedderModel(embModel),
 							hexagon.WithEmbedderDimension(dim),
 						)
-						logger.Info("[knowledge] 自动配置 embedding", "provider", embProviderName, "model", embModel)
 						kbEmbedProvider, kbEmbedModel = embProviderName, embModel
 						kbEmbedBaseURL, kbEmbedLocal = pc.BaseURL, isOllama
+						kbEmbedReady = embeddingPlan.Ready
+						kbEmbedServiceAvailable = embeddingPlan.ServiceAvailable
 					}
 				}
+			} else if embProviderName != "" {
+				logger.Warn("[knowledge] embedding 配置不完整，保持 FTS5 检索",
+					"provider", embProviderName, "model", embModel)
+			} else {
+				logger.Info("[knowledge] 未配置可验证的 embedding 能力，使用 FTS5 检索")
 			}
 
 			if emb != nil {
@@ -689,13 +660,32 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					// miss requires an explicit RAG purpose/data classification.
 					guardedEmbedder = egress.NewCloudEmbedder(emb, cloudEgress)
 				}
-				// #2 Embedding 缓存：LRU 10000 + singleflight 防击穿，
-				//    消除每次查询/重导都重打 embedding API 的成本与延迟。
+				// Cache sits inside the readiness gate: standby requests do not
+				// touch the endpoint; once ready, cached results remain fast.
+				var runtimeEmbedder hexagon.VectorEmbedder = hexagon.NewCachedEmbedder(guardedEmbedder)
+				if kbEmbedLocal {
+					baseURL := kbEmbedBaseURL
+					model := kbEmbedModel
+					// Ollama 不可用/模型未安装时，缓存 miss 直接快速降级；周期实探使
+					// 一键安装或稍后启动 Ollama 后无需重启即可激活向量检索。
+					runtimeEmbedder = knowledge.NewReadinessGatedEmbedder(
+						runtimeEmbedder,
+						func(probeCtx context.Context) bool {
+							return knowledge.OllamaModelInstalled(probeCtx, baseURL, model)
+						},
+						kbEmbedReady,
+						5*time.Second,
+					)
+				}
 				// #5 截断闸：入 embedding API 前按 rune 截断超长文本，
 				//    防单条超长输入触发模型 token 超限错误/超量计费。
-				//    truncating 置于 cache 外层，使缓存键作用于截断后文本。
-				cached := hexagon.NewCachedEmbedder(guardedEmbedder) // 默认 LRU 10000
-				sharedEmbedder = knowledge.NewTruncatingEmbedder(cached, 0)
+				sharedEmbedder = knowledge.NewTruncatingEmbedder(runtimeEmbedder, 0)
+				if kbEmbedReady {
+					logger.Info("[knowledge] embedding 已就绪", "provider", embProviderName, "model", embModel)
+				} else {
+					logger.Info("[knowledge] embedding 待机，当前使用 FTS5；模型就位后自动激活",
+						"provider", embProviderName, "model", embModel)
+				}
 			}
 			// 2. 构造 splitter: MarkdownSplitter（#7 保留 header_path 结构元数据；
 			//    对纯文本/无标题内容会自动按 chunkSize 退化为递归切分，无回归）
@@ -830,7 +820,14 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		}
 	}
 	if kbOK {
-		fmt.Println("  ✓ Knowledge   FTS5 + 向量混合检索 (hexagon RAG)")
+		switch {
+		case kbEmbedProvider == "":
+			fmt.Println("  ✓ Knowledge   FTS5 检索（未配置向量模型）")
+		case kbEmbedReady:
+			fmt.Println("  ✓ Knowledge   FTS5 + 向量混合检索 (hexagon RAG)")
+		default:
+			fmt.Println("  ✓ Knowledge   FTS5 已就绪；向量检索待模型就位后自动激活")
+		}
 	} else {
 		fmt.Println("  ✗ Knowledge   未启用")
 	}
@@ -862,7 +859,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		// 复用 KB 共享 embedder（已含 LRU 缓存 + 截断闸）；没配 embedding 则不接线，召回降级纯 BM25（行为不变）。
 		if sharedEmbedder != nil {
 			eng.SetMemoryEmbedder(sharedEmbedder)
-			fmt.Println("  ✓ Memory      长期记忆 hybrid 召回 (向量 + BM25)")
+			if kbEmbedReady {
+				fmt.Println("  ✓ Memory      长期记忆 hybrid 召回 (向量 + BM25)")
+			} else {
+				fmt.Println("  ✓ Memory      长期记忆 BM25 召回；向量能力待机")
+			}
 		}
 		// 增量 C：manage_memory 自管工具（AI 显式管理长期记忆：记住/更新/忘掉/置顶）。
 		if err := skills.Register(builtin.NewManageMemorySkill(fileMem)); err != nil {
@@ -962,7 +963,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			AutoSave: cfg.Memory.Vector.AutoSave,
 		})
 		eng.SetVectorMemory(vecMem)
-		fmt.Println("  ✓ VectorMem   语义记忆 (内存向量库)")
+		if kbEmbedReady {
+			fmt.Println("  ✓ VectorMem   语义记忆 (内存向量库)")
+		} else {
+			fmt.Println("  ✓ VectorMem   已接线；向量能力待机")
+		}
 	}
 
 	if err := eng.Start(ctx); err != nil {
@@ -980,7 +985,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 浮手动重试横幅；可经 knowledge.embedding.disable_auto_install 关闭——计费网络逃生口）。
 	// 后台 goroutine 不阻塞启动；Ensure 幂等（已装 no-op），Embed 按模型名打 Ollama，
 	// 模型就位即生效无需重启。
-	if cfg.Knowledge.Enabled && kbEmbedLocal && kbEmbedModel != "" && !cfg.Knowledge.Embedding.DisableAutoInstall {
+	if cfg.Knowledge.Enabled && kbEmbedLocal && kbEmbedModel != "" && kbEmbedServiceAvailable &&
+		!kbEmbedReady && !cfg.Knowledge.Embedding.DisableAutoInstall {
 		go func() {
 			api.SetKnowledgeEmbeddingPulling(true)
 			defer api.SetKnowledgeEmbeddingPulling(false)
@@ -1357,6 +1363,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	eng.SetAgentRouter(agentRouter)
 	srv.SetAgentRouter(agentRouter)
 	srv.SetAgentStore(agentStore)
+	if scheduler != nil {
+		// Agent deletion owns the lifecycle of scenario-provisioned schedules.
+		// The cleaner stages K12 cron removal and provides compensation when the
+		// subsequent Agent persistence step fails.
+		srv.SetAgentResourceCleaner(k12CronRegistrar{sched: scheduler, router: agentRouter})
+	}
 
 	// 注册需要 dispatcher/executor 的 Agent 级 Skill
 	if err := skills.Register(engine.NewHandoffSkill(agentRouter)); err != nil {
@@ -1429,9 +1441,30 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		logger.Warn("[warn] 文档渲染服务未启用", "error", rErr)
 	}
 
-	// K12 场景包装配（v0.5.0）：六缝注册 + records 存储 + 真 adapter（solve/识题/学情/教材/档案/渲染）+ 用例，挂 /api/k12/。
+	// 平台级场景注册表（ScenarioManifest v2 / §6.2 §6.3 §6.5）：composition root 是唯一
+	// 知情点——场景按 Manifest 经 Registry.Install 原子安装（收据台账落 scenario_installations，
+	// 卸载按 Receipt 精确清理），平台内核不 import 场景包（AP-1）。多场景在此继续 Install。
+	scenarioReg := scenario.NewRegistry()
+	scenarioReg.Recorder = scenarioinstall.New(store.DB())
+
+	// K12 场景包装配（v0.5.0）：六缝注册 + records 存储 + 真 adapter（solve/识题/学情/教材/档案/渲染）+ 用例，挂载点由 Manifest 声明。
 	// AP-1：K12 只经 scenarios/k12 通过 registry 注入；平台 engine/api 不认识 K12。
 	var k12Runtime *k12assembly.K12
+	// 统一 GradingJob 编排器（§6.7/§6.15）：桌面 HTTP 与钉钉 IM 共用同一实例；
+	// 阶段产物落盘 dataDir/k12/grading-runs（崩溃恢复载体），异步推进用进程级 ctx。
+	var k12GradingOrch *k12usecase.GradingOrchestrator
+	// ChannelPort 通道注册表（§6.10 / ADR-K12-011）：name→通道端口，装配只此一处注册。
+	// 钉钉是 v0.5.0 唯一真实通道（sender 在 instanceMgr 建成后回填）；飞书/企微为留缝
+	// stub（方法集齐、诚实「未实现」，接入点见 channel/feishu.go|wecom.go 注释）。
+	// 通道选择由绑定规则的 platform 字段驱动（bind-im 即配置，同一真相源不另设开关）。
+	imChannels := channel.NewRegistry()
+	dingtalkChannel := channel.NewDingTalk()
+	imChannels.Register(dingtalkChannel)
+	imChannels.Register(channel.NewFeishu())
+	imChannels.Register(channel.NewWeCom())
+	// 作品点评/观察练习卡「发送到手机」投递缝（§3.10/§3.12）：mount 时先建（router 已就绪），
+	// 通道发送链路在 instanceMgr 建成后标记就绪（装配顺序使然）。
+	k12Deliver := &k12IMDeliverer{router: agentRouter, channels: imChannels}
 	{
 		// 识题视觉闭包：作业图片 → 云端 vision 文本（mirror knowledge captioner），出网前过 EgressPolicy。
 		visionFn := func(ctx context.Context, image []byte, prompt string) (string, error) {
@@ -1449,23 +1482,23 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			// 排查用：打印识题实际选中的 provider/model + egress 用途，一眼定位路由/出网问题。
 			logger.Info("[k12识题] 视觉模型已路由", "provider", provider.Name(), "model", visionModel,
 				"image_bytes", len(image), "egress", "vision_ocr[sensitive_media]")
-			// mime 按魔数探测（BUG-20260712-T2：此前硬编码 png，jpeg 图打错标）；
-			// 识题输出=全量题目 JSON，加输出上限 + 150s 预算防上游挂死拖住前端。
+			// mime 按魔数探测（BUG-20260712-T2：此前硬编码 png，jpeg 图打错标）。
+			// 调用只继承整条请求的 context：不在视觉适配层再叠加任意秒数的局部超时，
+			// 避免核心识题、异步锚定和 IM 链路各自维护一套会漂移的“魔法阈值”。
 			mime := http.DetectContentType(image)
 			if !strings.HasPrefix(mime, "image/") {
 				mime = "image/png"
 			}
 			dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
-			vctx, vcancel := context.WithTimeout(ctx, 150*time.Second)
-			defer vcancel()
 			// 不设 MaxTokens：各家视觉模型上限差异大（glm-4v-flash 硬顶 1024，设 4096 即 400），
-			// 任何硬编码都会在某家翻车/截断——输出预算由 150s 超时兜底。
-			resp, cErr := provider.Complete(vctx, hexagon.CompletionRequest{
+			// 任何硬编码都会在某家翻车/截断；取消与 deadline 统一由入口请求负责。
+			resp, cErr := provider.Complete(ctx, hexagon.CompletionRequest{
+				Model: visionModel,
 				Messages: []hexagon.Message{{
 					Role: hexagon.RoleUser,
 					MultiContent: []llm.ContentPart{
 						llm.NewTextPart(prompt),
-						llm.NewImageURLPart(dataURL, "auto"),
+						llm.NewImageURLPart(dataURL, "high"),
 					},
 				}},
 			})
@@ -1476,8 +1509,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			return resp.Content, nil
 		}
 
+		recognizerAdapter := k12engineadapter.NewRecognizerAdapter(visionFn)
 		k12Opts := []k12assembly.Option{
-			k12assembly.WithRecognizer(k12engineadapter.NewRecognizerAdapter(visionFn)),
+			k12assembly.WithRecognizer(recognizerAdapter),
+			k12assembly.WithAnswerAnchorer(recognizerAdapter),
 			k12assembly.WithPhotoAnnotator(k12engineadapter.NewPhotoAnnotator()),
 		}
 		if fileMem != nil {
@@ -1489,7 +1524,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		// 建档/改档：接 agent 路由 + 持久化（读改写 agents.metadata）。
 		k12Opts = append(k12Opts,
 			k12assembly.WithProfiles(k12engineadapter.NewProfileAdapter(agentRouter, agentStore)),
-			k12assembly.WithArchiveRestorer(func(recordStore *records.Store) k12usecase.ArchiveRestorer {
+			k12assembly.WithArchiveRestorer(func(recordStore *k12storage.Store) k12usecase.ArchiveRestorer {
 				return k12engineadapter.NewArchiveRestoreAdapter(store.DB(), recordStore, agentRouter, agentStore)
 			}),
 		)
@@ -1597,17 +1632,122 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			}
 			return resp.Content, nil
 		}
+		workFeedbackGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
+			provider := router.Default()
+			if provider == nil {
+				return "", fmt.Errorf("k12 作品点评: 没有可用的默认 LLM Provider")
+			}
+			// 美术观察式点评走独立的视觉闭包（workFeedbackVisionFn，原图随请求发多模态）；
+			// 本纯文本闭包只服务写作。防路由漂移的守卫：美术误入纯文本通道时诚实报错，
+			// 绝不凭创作任务文字虚构“观察”。
+			if subject == "美术" {
+				return "", fmt.Errorf("美术观察式点评必须走视觉通道（原图多模态），不允许纯文本生成")
+			}
+			task := prompt
+			if grade != "" {
+				task += "\n（点评口径贴合" + grade + "孩子的水平，用家长和孩子都能懂的话。）"
+			}
+			// 只含作品文本与教学任务（题目要求/原文），不含孩子敏感档案——归 general_chat/general。
+			cctx := egress.WithRequest(ctx, egress.PurposeGeneralChat, "k12-work-feedback", egress.ClassGeneral)
+			cctx, ccancel := context.WithTimeout(cctx, 60*time.Second)
+			defer ccancel()
+			temp := 0.3
+			// 点评框架与输出信封由任务提示词携带（writing-feedback skill 正文基座，
+			// engineadapter/work_feedback.go 注入；skill 缺失时回退硬编码两段式）。
+			// 系统提示只钉红线（与提示词红线、usecase INV-011 构成三道保险），
+			// 不再下发与 skill 输出信封冲突的固定两段式/字数上限。
+			resp, err := provider.Complete(cctx, hexagon.CompletionRequest{
+				Messages: []hexagon.Message{
+					{Role: hexagon.RoleSystem, Content: "你是小学写作辅导老师，给孩子作文做形成性点评。红线：只点评不打分——禁止输出任何分数、等第、评级、排名；" +
+						"不代写——禁止给范文、禁止改写或重写全文。点评框架与输出格式按用户消息里的技能指引执行；语气鼓励、具体、可执行。"},
+					{Role: hexagon.RoleUser, Content: task},
+				},
+				MaxTokens:   1536,
+				Temperature: &temp,
+			})
+			if err != nil {
+				return "", err
+			}
+			return resp.Content, nil
+		}
+		// 美术作品观察式点评的视觉闭包：复用识题链的图片调用原语（RouteForVision + 多模态
+		// Complete，同一批视觉模型同一构造方式）。孩子画作是敏感媒体；把图发给已配置的
+		// 视觉模型点评是明确意图 → egress 归 vision_chat[sensitive_media]（白名单放行）。
+		// 红线（只点评不打分不排名不重画）已由 adapter 侧提示词随任务下发，不依赖模型默认行为。
+		workFeedbackVisionFn := func(ctx context.Context, image []byte, prompt string) (string, error) {
+			ctx = egress.WithRequest(ctx, egress.PurposeVisionChat, "k12-work-feedback", egress.ClassSensitiveMedia)
+			if router == nil {
+				return "", fmt.Errorf("未配置视觉模型")
+			}
+			provider, visionModel, rErr := eng.RouteForVision(ctx)
+			if rErr != nil {
+				logger.Warn("[k12作品点评] 视觉模型路由失败", "err", rErr.Error(), "image_bytes", len(image))
+				return "", rErr
+			}
+			logger.Info("[k12作品点评] 视觉模型已路由", "provider", provider.Name(), "model", visionModel,
+				"image_bytes", len(image), "egress", "vision_chat[sensitive_media]")
+			mime := http.DetectContentType(image)
+			if !strings.HasPrefix(mime, "image/") {
+				mime = "image/png"
+			}
+			dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
+			// 与识题 visionFn 同纪律：不设 MaxTokens（各家视觉模型上限差异大），
+			// 取消与 deadline 统一由入口请求负责。
+			resp, cErr := provider.Complete(ctx, hexagon.CompletionRequest{
+				Model: visionModel,
+				Messages: []hexagon.Message{{
+					Role: hexagon.RoleUser,
+					MultiContent: []llm.ContentPart{
+						llm.NewTextPart(prompt),
+						llm.NewImageURLPart(dataURL, "high"),
+					},
+				}},
+			})
+			if cErr != nil {
+				logger.Warn("[k12作品点评] 视觉模型调用失败", "provider", provider.Name(), "model", visionModel, "err", cErr.Error())
+				return "", cErr
+			}
+			return resp.Content, nil
+		}
+		// 盘上 marketplace skill 内容加载闭包：作品点评方法论基座链的第一级（盘上→内嵌→硬编码）。
+		// 每次点评现读盘（不缓存）：hub Install/Refresh 或 seed 升级覆盖盘上文件后，
+		// 无需重编译/重启即用新正文；内容校验（非空/frontmatter/红线锚点/min_engine_version）
+		// 在 engineadapter 侧统一做，此处只负责取字节。marketplace 未启用/未注册时诚实报错，
+		// adapter 记日志并降级内嵌快照。
+		k12SkillLoaderFn := func(name string) (string, error) {
+			if mp == nil {
+				return "", fmt.Errorf("skill marketplace 未启用")
+			}
+			mdSkill, ok := mp.Get(name)
+			if !ok {
+				return "", fmt.Errorf("skill %q 未安装", name)
+			}
+			data, rerr := os.ReadFile(mdSkill.FilePath)
+			if rerr != nil {
+				return "", rerr
+			}
+			return string(data), nil
+		}
 		k12Opts = append(k12Opts,
 			k12assembly.WithRetryGenerator(retryGenFn),
 			k12assembly.WithCauseSummaryGenerator(causeSummaryGenFn),
 			k12assembly.WithPrepReviewGenerator(prepReviewGenFn),
+			k12assembly.WithWorkFeedbackGenerator(workFeedbackGenFn),
+			k12assembly.WithWorkFeedbackVision(workFeedbackVisionFn),
+			k12assembly.WithWorkFeedbackSkillLoader(k12SkillLoaderFn),
 		)
 
 		k12Solve := classifiedSolveExecutor{next: solveSkill}
-		if k12rt, k12err := k12assembly.Wire(store.DB(), k12Solve, k12Opts...); k12err != nil {
+		if k12rt, k12err := k12assembly.WireInto(ctx, scenarioReg, store.DB(), k12Solve, k12Opts...); k12err != nil {
 			logger.Error("装配 K12 场景包失败", "error", k12err)
 		} else {
 			k12Runtime = k12rt
+			logger.Info("K12 场景已按 Manifest v2 安装",
+				"scenario", k12rt.Manifest.ID, "version", k12rt.Manifest.Version,
+				"mount", k12rt.Manifest.MountPath, "resources", len(k12rt.Receipt.Resources))
+			// Transactional Outbox 投递器（§6.9/§6.15）：启动即补投 pending（崩溃恢复），
+			// 之后写提交 nudge 即时投递 + 周期轮询兜底；学情信号消费者已在装配时注册。
+			k12rt.Outbox.Start(ctx)
 			// IM 入站错题入库副作用：把 K12 批改闭环包成通用 skill 注入工具面。
 			// engine 只见通用工具（守 AP-1）；辅导 Agent 在群里被路由命中时，LLM 调
 			// k12_grade 即跑完整批改+错题入库+学情，实例 scope 从 ctx 的已路由 Agent 取。
@@ -1626,19 +1766,45 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			// POST /api/k12/cron/provision 即可为实例注册默认任务（周卷/日提醒/月报/学期确认）。
 			var k12Cron k12apihttp.CronRegistrar
 			if scheduler != nil {
-				k12Cron = k12CronRegistrar{sched: scheduler}
+				k12Cron = k12CronRegistrar{sched: scheduler, router: agentRouter}
 			}
 			// IM 入站路由「绑定」缝：POST /api/k12/bind-im 把家庭群绑到辅导实例。
 			k12Binder := &k12IMBinder{router: agentRouter, store: agentStore}
 			k12Base := fmt.Sprintf("http://127.0.0.1:%d", cfg.Server.Port)
-			srv.Mount("/api/k12", k12apihttp.NewHandler(k12apihttp.Runtime{
+			// 统一 GradingJob 编排器（§6.7 单一应用服务）：桌面 HTTP 入口与钉钉 IM 入口共用；
+			// §6.15 异步执行模型（进程级 ctx + 有界并发 + panic 不逃逸）+ 阶段产物落盘恢复。
+			k12GradingOrch = k12usecase.NewGradingOrchestrator(k12rt.Deps, func() k12.GradingModelSnapshot {
+				name := router.DefaultName()
+				return k12.GradingModelSnapshot{Provider: name, Model: router.ProviderModel(name), Capability: "vision"}
+			},
+				k12usecase.WithGradingRunDir(filepath.Join(dataDir, "k12", "grading-runs")),
+				k12usecase.WithGradingBaseContext(ctx),
+			)
+			// 挂载前缀取自 Manifest（路由命名空间由声明驱动，不再硬编码字面量）。
+			srv.Mount(k12rt.Manifest.MountPath, k12apihttp.NewHandler(k12apihttp.Runtime{
 				Views:   k12rt.Registry.Views,
 				Records: k12rt.Records,
 				Deps:    k12rt.Deps,
 				Cron:    k12Cron,
 				Binder:  k12Binder,
+				Deliver: k12Deliver,
 				BaseURL: k12Base,
+				Grading: k12GradingOrch,
 			}))
+			// 崩溃恢复扫描（§6.15/K12-INV-021）：启动即扫非终态 GradingJob——自动阶段从检查点
+			// 重新入列续跑，awaiting_confirmation 保持等待；不阻塞启动主线。
+			go func() {
+				agents := agentRouter.ListAgents()
+				names := make([]string, 0, len(agents))
+				for _, a := range agents {
+					names = append(names, a.Name)
+				}
+				if n, rerr := k12GradingOrch.RecoverGradingJobs(ctx, names); rerr != nil {
+					logger.Warn("K12 批改任务崩溃恢复扫描失败", "error", rerr)
+				} else if n > 0 {
+					logger.Info("K12 批改任务崩溃恢复扫描完成", "recovered", n)
+				}
+			}()
 			// 清债 P5：engine 的 agent-mode 路由消费场景包 mode 特性（K12 领域词不再 engine 硬编码）。
 			modes := k12rt.Registry.Modes
 			engine.SetModeKeywordMatcher(func(mode engine.AgentMode, text string) bool {
@@ -1932,12 +2098,18 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	_ = videogenSvc
 	_ = voiceChatSvc
 
+	// K12 统一 GradingJob 编排器：钉钉拍照批改入口与桌面 HTTP 入口共用 K12 mount 处创建的
+	// 同一实例（§6.7「桌面、API、IM 私聊和工作流共用的唯一应用服务」；入口自编排两侧均已收敛）。
+	var k12PhotoOrchestrator k12PhotoJobOrchestrator
+	if k12GradingOrch != nil {
+		k12PhotoOrchestrator = k12GradingOrch
+	}
 	messageHandler := func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
 		if err := gw.Check(ctx, msg); err != nil {
 			return &adapter.Reply{Content: "安全检查未通过: " + err.Error()}, nil
 		}
 		if k12Runtime != nil {
-			if reply, handled, err := maybeHandleK12DingtalkPhoto(ctx, msg, agentRouter, k12Runtime.Deps.GradeHomeworkPhoto); handled {
+			if reply, handled, err := maybeHandleK12DingtalkPhotoJob(ctx, msg, agentRouter, k12PhotoOrchestrator, k12Runtime.Deps.GradeHomeworkPhoto); handled {
 				return reply, err
 			}
 		}
@@ -1945,6 +2117,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 
 	instanceMgr := instances.NewManager(store.DB())
+	// 回填钉钉通道真实发送函数（ChannelPort 收敛：与 cron Deliverer / send_message 同走
+	// instanceMgr.Send → adapter.Send，per-platform SendQueue 限速同源），并标记
+	// K12「发送到手机」链路就绪。
+	dingtalkChannel.SetSender(func(ctx context.Context, to channel.Target, msg channel.Message) error {
+		return instanceMgr.Send(ctx, to.SendKey(), to.ChatID, adapterReplyFromChannelMessage(msg))
+	})
+	k12Deliver.MarkReady()
 	if disabled := parseDisabledIMProviders(os.Getenv("HEXCLAW_DISABLE_IM")); len(disabled) > 0 {
 		instanceMgr.SetDisabledProviders(disabled...)
 		logger.Warn("[instances] IM provider startup disabled by HEXCLAW_DISABLE_IM", "providers", strings.Join(disabled, ","))
@@ -2046,12 +2225,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		// running platform adapters. Desktop-class targets still go via the
 		// notifier wired above; this seam makes IM delivery actually send rather
 		// than only log (review L2).
-		scheduler.SetDeliverer(func(job *cron.Job, target, content string) error {
-			if job.ChatID == "" {
-				return fmt.Errorf("job %s has no chat_id for IM target %q", job.ID, target)
-			}
-			return instanceMgr.Send(ctx, target, job.ChatID, &adapter.Reply{Content: content})
-		})
+		// ChannelPort 收敛：已注册通道（钉钉）的投递走通道端口；未注册目标/留缝 stub
+		// 回退平台通用直发（见 newCronIMDeliver），行为逐字节不变。
+		scheduler.SetDeliverer(newCronIMDeliver(ctx, imChannels, func(ctx context.Context, target, chatID, content string) error {
+			return instanceMgr.Send(ctx, target, chatID, &adapter.Reply{Content: content})
+		}))
 	}
 
 	// Web WebSocket 适配器
@@ -2282,35 +2460,15 @@ func (a unattendedRiskAdapter) AssessLowRisk(ctx context.Context, action, payloa
 	return err == nil && lvl == builtin.RiskLow
 }
 
-// k12IMBinder 把平台 router.Dispatcher + store 包成 K12 的 IMBinder 缝（AP-1：K12 不 import router）。
-// 绑定 = 内存路由规则（即时生效）+ 持久化（重启存活），chat 级绑定（PRD §3.1.7 各绑各的群）。
-type k12IMBinder struct {
-	router *agentrouter.Dispatcher
-	store  *agentrouter.SQLiteStore
-	mu     sync.Mutex
-}
-
-func (b *k12IMBinder) Bind(ctx context.Context, platform, instanceID, chatID, agentName string) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	rule := agentrouter.Rule{
-		Platform:   platform,
-		InstanceID: instanceID,
-		ChatID:     chatID,
-		AgentName:  agentName,
-		Priority:   50, // 群级显式绑定，优先于平台默认
-	}
-	return b.router.ReplaceRulePersisted(rule, func(persisted *agentrouter.Rule) error {
-		if b.store == nil {
-			return nil
-		}
-		return b.store.ReplaceRuleScope(ctx, persisted)
-	})
-}
+// k12IMDeliverer / k12IMBinder 已随 ChannelPort 收敛迁至 k12_channel.go
+// （§6.10：钉钉直连 → 通道端口，飞书/企微留缝）。
 
 // k12CronRegistrar 把平台 cron.Scheduler 包成 K12 的 CronRegistrar 缝（AP-1：K12 不 import cron）。
 // 用 AddJobFromScript 直接喂 K12 产的确定性 Starlark 脚本，跳过 LLM 编译。
-type k12CronRegistrar struct{ sched *cron.Scheduler }
+type k12CronRegistrar struct {
+	sched  *cron.Scheduler
+	router *agentrouter.Dispatcher
+}
 
 // classifiedSolveExecutor is the composition boundary between K12 profile data
 // and the LLM-backed solve tool. The remote-provider facade performs the actual
@@ -2356,20 +2514,113 @@ func (r k12CronRegistrar) Register(ctx context.Context, kind string, spec k12use
 	if kind == "" || key == "" || !strings.HasSuffix(key, "/"+kind) {
 		return "", fmt.Errorf("k12 cron 幂等键与 kind 不匹配: key=%q kind=%q", key, kind)
 	}
-	req := cron.AddJobRequest{
-		Name:      spec.Name,
-		Schedule:  spec.Schedule,
-		UserID:    userID,
-		Platform:  platform,
-		ChatID:    chatID,
-		Deliver:   spec.Deliver,
-		SourceKey: key,
+	agentName := strings.TrimSuffix(key, "/"+kind)
+	if strings.TrimSpace(agentName) == "" {
+		return "", fmt.Errorf("k12 cron 幂等键缺少 agent: key=%q", key)
 	}
-	job, err := r.sched.UpsertJobFromScript(ctx, req, spec.Runtime, spec.Script)
+	register := func() (string, error) {
+		req := cron.AddJobRequest{
+			Name:      spec.Name,
+			Schedule:  spec.Schedule,
+			UserID:    userID,
+			Platform:  platform,
+			ChatID:    chatID,
+			Deliver:   spec.Deliver,
+			SourceKey: key,
+		}
+		job, err := r.sched.UpsertJobFromScript(ctx, req, spec.Runtime, spec.Script)
+		if err != nil {
+			return "", fmt.Errorf("k12 cron 原子覆盖（旧任务保持不变）: %w", err)
+		}
+		return job.ID, nil
+	}
+	if r.router == nil {
+		return register()
+	}
+	var jobID string
+	err := r.router.WithAgentLease(agentName, func(agentrouter.AgentConfig) error {
+		var registerErr error
+		jobID, registerErr = register()
+		return registerErr
+	})
 	if err != nil {
-		return "", fmt.Errorf("k12 cron 原子覆盖（旧任务保持不变）: %w", err)
+		return "", fmt.Errorf("k12 agent %q 不可用，拒绝创建孤儿定时任务: %w", agentName, err)
 	}
-	return job.ID, nil
+	return jobID, nil
+}
+
+// ReclaimStale 实现 apihttp.CronRegistrar 的 stale kind 回收（§6.14 一次切换终局批）：
+// 删除本 agent 名下（SourceKey 前缀 "<agent>/"）不在 keepJobIDs 集合内的历史 K12 job。
+// 覆盖两类残留：① §3.13 之外的撤下 kind（monthly-report / daily-reminder /
+// year-archive——描述符已撤但已注册的 job 无人回收，active 且绑真 IM，每天打扰）；
+// ② 同 agent 曾以不同 user_id provision 留下的重复投递源（per-user 幂等 upsert 看
+// 不见跨 user 的旧行）。识别只认稳定 SourceKey，绝不按展示名匹配——用户自建任务
+// （无 SourceKey）与其他 agent 的 job 一个都不动。
+func (r k12CronRegistrar) ReclaimStale(ctx context.Context, agentName string, keepJobIDs []string) ([]k12apihttp.ReclaimedCronJob, error) {
+	agentName = strings.TrimSpace(agentName)
+	if agentName == "" {
+		return nil, fmt.Errorf("k12 cron 回收缺少 agent")
+	}
+	keep := make(map[string]bool, len(keepJobIDs))
+	for _, id := range keepJobIDs {
+		keep[id] = true
+	}
+	removed := make([]k12apihttp.ReclaimedCronJob, 0)
+	for _, job := range r.sched.JobsBySourceKeyPrefix(agentName + "/") {
+		if keep[job.ID] {
+			continue
+		}
+		if err := r.sched.RemoveJob(ctx, job.ID); err != nil {
+			return removed, fmt.Errorf("回收历史 K12 定时任务 %s（%s）: %w", job.Name, job.ID, err)
+		}
+		removed = append(removed, k12apihttp.ReclaimedCronJob{JobID: job.ID, Name: job.Name, SourceKey: job.SourceKey})
+	}
+	return removed, nil
+}
+
+// DetachAgentResources implements api.AgentResourceCleaner. Only K12 agents
+// own the stable source-key family "<agent>/..."; unrelated Agents are a
+// deliberate no-op. The returned closure re-provisions the detached snapshots
+// when durable Agent deletion fails, making the cross-component deletion a
+// compensating saga instead of a best-effort cascade.
+func (r k12CronRegistrar) DetachAgentResources(
+	ctx context.Context,
+	agent agentrouter.AgentConfig,
+) (func(context.Context) error, error) {
+	if r.sched == nil || agent.Metadata["scenario"] != "k12-tutor" {
+		return nil, nil
+	}
+	detached, err := r.sched.RemoveJobsBySourceKeyPrefix(ctx, agent.Name+"/")
+	if err != nil {
+		return nil, fmt.Errorf("清理 K12 定时任务: %w", err)
+	}
+	if len(detached) == 0 {
+		return nil, nil
+	}
+
+	return func(rollbackCtx context.Context) error {
+		for _, job := range detached {
+			if job == nil || job.Spec == nil {
+				return fmt.Errorf("恢复 K12 定时任务失败: job spec 缺失")
+			}
+			_, err := r.sched.UpsertJobFromScript(rollbackCtx, cron.AddJobRequest{
+				Name:       job.Name,
+				Schedule:   job.Schedule,
+				Prompt:     job.SourcePrompt,
+				UserID:     job.UserID,
+				Platform:   job.Platform,
+				ChatID:     job.ChatID,
+				Deliver:    job.Deliver,
+				SourceKey:  job.SourceKey,
+				TimeoutSec: job.Spec.TimeoutSec,
+				Paused:     job.Status == cron.StatusPaused,
+			}, job.Spec.Runtime, job.Spec.Script)
+			if err != nil {
+				return fmt.Errorf("恢复 K12 定时任务 %s: %w", job.ID, err)
+			}
+		}
+		return nil
+	}, nil
 }
 
 type instanceReplySender interface {
@@ -2592,13 +2843,14 @@ func cronCompileCandidates(rv cronRouterView, defName string) []string {
 	return append(out, remotes...)
 }
 
-// isRemoteProvider 判定 provider 是否为远程（非 localhost / 127.0.0.1）。
+// isRemoteProvider 判定 provider 的最终算力位置是否在云端。显式 locality
+// 优先于监听地址：localhost 上的云 API 反向代理仍是远程模型。
 func isRemoteProvider(rv cronRouterView, name string) bool {
 	pc, ok := rv.ProviderConfig(name)
 	if !ok {
 		return false
 	}
-	return !strings.Contains(pc.BaseURL, "localhost") && !strings.Contains(pc.BaseURL, "127.0.0.1")
+	return !config.IsLocalLLMProviderNamed(name, pc)
 }
 
 // resolveChatProvider 校验单个 provider 可用且为 chat completion 类，返回 provider+model 或详细错误。
@@ -2773,7 +3025,7 @@ func typstVersion() string {
 	return "typst-unknown"
 }
 
-// defaultProviderIsLocal 判定默认 LLM provider 是否为本地（Ollama 类）：base_url 指向 localhost。
+// defaultProviderIsLocal 判定默认 LLM provider 的最终算力位置是否在本地。
 // 用于 orchestrate 并发自适应——本地模型同机扛不住多并发推理，并发应收到 2。
 func defaultProviderIsLocal(cfg *config.Config) bool {
 	if cfg == nil {
@@ -2783,16 +3035,11 @@ func defaultProviderIsLocal(cfg *config.Config) bool {
 	if !ok {
 		return false
 	}
-	url := strings.ToLower(p.BaseURL)
-	return strings.Contains(url, "localhost") || strings.Contains(url, "127.0.0.1") || strings.Contains(url, "11434")
+	return config.IsLocalLLMProviderNamed(cfg.LLM.Default, p)
 }
 
 func isLocalEmbeddingProvider(name string, provider config.LLMProviderConfig) bool {
-	name = strings.ToLower(strings.TrimSpace(name))
-	if strings.TrimSpace(provider.BaseURL) != "" {
-		return llmrouter.IsLocalProviderBaseURL(provider.BaseURL)
-	}
-	return strings.Contains(name, "ollama")
+	return config.IsLocalLLMProviderNamed(name, provider)
 }
 
 // llmCompleteFunc 把 router 文本补全闭包适配为 memory.ConsolidateLLM（dreaming 深相整合用）。

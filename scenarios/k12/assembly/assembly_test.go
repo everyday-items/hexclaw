@@ -88,6 +88,10 @@ func TestWire_RealAdapterClosedLoop(t *testing.T) {
 	if res.Evidence.Badge() != "verified-strong" {
 		t.Errorf("code_exec 一致应强徽章, got %q", res.Evidence.Badge())
 	}
+	// 学情信号经 Transactional Outbox 投影（§6.9）：显式补投 pending（生产由 Outbox.Start 驱动）。
+	if err := k.Outbox.ProcessPending(ctx); err != nil {
+		t.Fatalf("outbox 投递: %v", err)
+	}
 	if ins.n != 1 {
 		t.Errorf("应写 1 条学情, got %d", ins.n)
 	}

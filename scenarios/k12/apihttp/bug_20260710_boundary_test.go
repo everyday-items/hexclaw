@@ -9,10 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
@@ -35,7 +35,7 @@ func TestAddAccumulation_InternalStorageFailureIs500(t *testing.T) {
 	if err := reg.Assemble(k12.Pack(k12.NewCurriculumStub())); err != nil {
 		t.Fatal(err)
 	}
-	store := records.NewStore(db, reg.Records)
+	store := k12storage.NewStore(db, reg.Records)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}

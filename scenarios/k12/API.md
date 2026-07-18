@@ -25,9 +25,10 @@
 }
 ```
 
-**`POST /api/k12/recognize`** — 作业图片 → 结构化题目（云端 vision，**需 LLM 密钥**）
-- 请求：`{"image_base64": "<base64 或 data:image/png;base64,...>"}`
-- 响应：`{"questions": [{"question": "3.8×3=?", "knowledge_points": ["小数乘法"]}]}`
+**`POST /api/k12/recognize` / `POST /api/k12/recognize/anchors` — 已删除（§6.14 一次切换 · 2026-07-18）**
+拍照识题→锚点→批改统一走 `POST /grading-jobs*`（创建→轮询→`awaiting_confirmation` 停点产物含
+识别清单+整卷学科+锚点 bbox→confirm→completed 取逐题结果）。两直连端点现回 404（反向契约
+`cutover_20260718_old_links_removed_test.go`）。
 
 **`POST /api/k12/grade`** — 批改一道题完整闭环（**需 LLM 密钥**）
 - 请求：`{"agent","grade","source_session","problem","student_answer","knowledge_points":[]}`
@@ -79,12 +80,9 @@
 ```
 
 **`POST /api/k12/prep-card`** — 备课卡（只读，**热身题需 LLM 密钥**）
-- 请求：`{"agent","grade","knowledge_points":[]}`
+- 请求：`{"agent","grade","subject","knowledge_points":[]}`（`subject` 可选：当前题目学科，①段优先检索该学科教材，无则回退通用；空 = 不分科旧语义）
 - 响应：`{"knowledge_points":[], "sections":[{"title","content","source_label"}]}`
 - `source_label`：`📖 依据课本` / `🤖 AI 归纳·供参考（未校验）` / `🗂 本地记录` / `✅ 已程序验算` / `🧠 学情信号`
-
-**`GET /api/k12/study-time?agent=X`** — 学习时长（**近似值**）
-`{"days":[{"date":"2026-07-07","record_count":2,"estimated_minutes":30}], "total_records","total_minutes","note"}`
 
 ### 积累本 / 档案 / 导出 / 备份
 
@@ -126,6 +124,7 @@
 
 **`GET /api/k12/cron/mistake-sheet?agent=X`** — 周五错题卷（到期该练；无到期→空）
 **`GET /api/k12/cron/daily-reminder?agent=X`** — 每日复习提醒一句话（无待复习→空）
+**`GET /api/k12/cron/return-reminder?agent=X`** — 回传提醒（§3.13）：昨日固化仍未回传的卷 → 温和提醒（含卷面号与题数，**每卷最多一次**，reminder_sent_at 持久幂等；已回传/家长关闭/非昨日→空）
 **`GET /api/k12/cron/monthly-report?agent=X`** — 月度学情报告 Markdown（无记录→空）
 **`GET /api/k12/cron/semester-check?agent=X`** — 学期确认提醒（无档案/已最末档→空）
 **`GET /api/k12/cron/year-archive?agent=X`** — 学年 6 月底归档建议（无记录→空）
@@ -160,7 +159,7 @@
 ## 3. 关键流程
 
 - **识题回显护栏**（分渠道两种形态，同一信任链目标）：
-  - **桌面**：交互门——`recognize` → 前端 `RecognizeGuardPanel` 展示识别结果让家长确认/纠正 → 确认后逐题 `grade`（带该题 `knowledge_points` + profile 的 `grade`）。
+  - **桌面**：交互门——`POST /grading-jobs`（照片）→ 轮询到 `awaiting_confirmation` 停点（响应携带识别清单+锚点）→ 前端 `RecognizeGuardPanel` 展示让家长确认/纠正 → `confirm` → 轮询到 `completed` 取逐题结果；单题补批仍走 `grade`。
   - **IM（钉钉/微信）**：内联回显——`homework-checker` skill 在解答**同一条消息**开头先列「我读到的题目」抬头再给整页解答，不阻塞等确认（IM 多轮往返代价高）；`[?]` 不确定字符点名请确认、确认前该题不下批改结论。出站经 `NormalizeMathText` 把 LaTeX 降级为 Unicode 数学符号（钉钉 markdown 不渲染 LaTeX）。
 - **建档**：实例（agent）先经平台 Agent 创建，再 `PUT /profile` 写 K12 档案（落 `k12.child_name`/`k12.grade_term`/`k12.textbook_edition` metadata 键，不覆盖其他 metadata）。
 - **导出 PDF**：`format=pdf` 需服务器装 pandoc；未装则降级 markdown JSON — 前端要判断响应是二进制还是 `{content}`。
@@ -169,8 +168,8 @@
 
 | 功能 | 状态 |
 |---|---|
-| 真 LLM | `grade`/`recognize`/`prep-card 热身题`/`tutor-turn 阶段三 solution` 运行时真调云端模型，**服务器必须配 `cfg.LLM` provider+密钥**，否则报错。其余端点纯本地无需 LLM |
-| cron 自动投递（周五错题卷/日提醒/月报/学期确认/学年归档建议） | ✅ 已接：`cron/provision` 注册 6 个默认任务，投递内容走 `cron/*` 纯文本端点（空 body 静默跳过），复用平台 cron 调度 + Deliverer（IM/桌面）|
+| 真 LLM | `grade`/`grading-jobs`（识别+批改阶段）/`prep-card 热身题`/`tutor-turn 阶段三 solution` 运行时真调云端模型，**服务器必须配 `cfg.LLM` provider+密钥**，否则报错。其余端点纯本地无需 LLM |
+| cron 自动投递（周五错题卷/回传提醒/学期确认×2，§3.13 四任务） | ✅ 已接：`cron/provision` 注册 §3.13 四默认任务并**回收历史 kind 残留**（monthly-report/daily-reminder/year-archive 等，响应 `reclaimed` 取证），投递内容走 `cron/*` 纯文本端点（空 body 静默跳过），复用平台 cron 调度 + Deliverer（IM/桌面）|
 | IM 群绑定（各绑各的群） | ✅ 已接：`bind-im` 写 `agent_rules`，入站群消息路由到对应实例 |
 | 渐进三阶段提示 + 情绪守门 | ✅ 已接：`tutor-turn` 输出分阶段指令 + 守门标志；**桌面/HTTP 联调可用** |
 | IM 入站作业 → 自动错题入库副作用 | ✅ 结构已通：engine 把已路由 Agent 名 stamp 进 ctx（`skill.RoutedAgentName`），K12 提供通用 `k12_grade` skill 包全闭环（批改+错题入库+学情），实例 scope 从 ctx 取。**辅导 Agent 模板须在 Skills 声明 `k12_grade`**（建档时挂载）。真 IM+LLM 端到端仍需活环境验 |
@@ -180,4 +179,4 @@
 
 ## 5. 最容易踩的第一个坑
 
-联调报"LLM 未配置/解题失败"类错误时，先确认服务器端 `cfg.LLM` 有可用 provider + 密钥（`grade`/`recognize`/`prep-card` 依赖它）。纯数据端点（mistakes/review/report/profile/backup/export-md/study-time/accumulation）不依赖 LLM，可先联调这些。
+联调报"LLM 未配置/解题失败"类错误时，先确认服务器端 `cfg.LLM` 有可用 provider + 密钥（`grade`/`grading-jobs`/`prep-card` 依赖它）。纯数据端点（mistakes/review/report/profile/backup/export-md/accumulation）不依赖 LLM，可先联调这些。

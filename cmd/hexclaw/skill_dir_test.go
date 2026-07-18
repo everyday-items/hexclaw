@@ -15,9 +15,9 @@ func TestBUG20260501_ComputeSkillDraftDir_ExpandsTilde(t *testing.T) {
 	const home = "/Users/hexagon"
 
 	cases := []struct {
-		name     string
-		skills   string
-		want     string
+		name           string
+		skills         string
+		want           string
 		mustNotContain string
 	}{
 		{

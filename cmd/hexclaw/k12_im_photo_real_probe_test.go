@@ -22,8 +22,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/engine"
@@ -37,6 +39,8 @@ import (
 	"github.com/hexagon-codes/toolkit/os/sandbox"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
+
+const k12AnsweredFixtureSHA256 = "78cf3a1b5c52e12ca17ca13aa71c7a9439baed244e88b438aa2f1f70cd782fb5"
 
 func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	if os.Getenv("HEXCLAW_K12_PHOTO_PROBE") != "1" {
@@ -58,6 +62,7 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load local HexClaw config: %v", err)
 	}
+	applyK12PhotoProbeProviderOverride(t, cfg)
 	cfg.Compaction.Enabled = false
 	cfg.LLM.Tools.Enabled = "on"
 	realRouter, err := llmrouter.New(cfg.LLM)
@@ -124,15 +129,14 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 			mime = "image/jpeg"
 		}
 		dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
-		callCtx, cancel := context.WithTimeout(visionCtx, 150*time.Second)
-		defer cancel()
 		t.Logf("vision call: provider=%q model=%q bytes=%d", provider.Name(), model, len(image))
-		resp, completeErr := provider.Complete(callCtx, llm.CompletionRequest{
+		resp, completeErr := provider.Complete(visionCtx, hexagon.CompletionRequest{
+			Model: model,
 			Messages: []llm.Message{{
 				Role: llm.RoleUser,
 				MultiContent: []llm.ContentPart{
 					llm.NewTextPart(prompt),
-					llm.NewImageURLPart(dataURL, "auto"),
+					llm.NewImageURLPart(dataURL, "high"),
 				},
 			}},
 		})
@@ -142,10 +146,12 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 		return resp.Content, nil
 	}
 
+	recognizer := k12engineadapter.NewRecognizerAdapter(vision)
 	runtime, err := assembly.Wire(
 		store.DB(),
 		classifiedSolveExecutor{next: solveSkill},
-		assembly.WithRecognizer(k12engineadapter.NewRecognizerAdapter(vision)),
+		assembly.WithRecognizer(recognizer),
+		assembly.WithAnswerAnchorer(recognizer),
 		assembly.WithPhotoAnnotator(k12engineadapter.NewPhotoAnnotator()),
 	)
 	if err != nil {
@@ -162,10 +168,8 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	msg.SessionID = "real-photo-probe"
 	msg.Attachments[0].Data = base64.StdEncoding.EncodeToString(raw)
 
-	runCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-	defer cancel()
 	started := time.Now()
-	reply, handled, err := maybeHandleK12DingtalkPhoto(runCtx, msg, k12PhotoTestRouter(t, true, "k12-tutor"), process)
+	reply, handled, err := maybeHandleK12DingtalkPhoto(t.Context(), msg, k12PhotoTestRouter(t, true, "k12-tutor"), process)
 	if err != nil {
 		t.Fatalf("direct K12 photo route: %v", err)
 	}
@@ -180,14 +184,18 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 		if item.Status == k12usecase.PhotoCorrect || item.Status == k12usecase.PhotoWrong {
 			verifiedVerdicts++
 		}
-		t.Logf("item[%d] status=%s bbox=%v verdict=%s evidence=%s answer=%q question=%q",
-			i+1, item.Status, item.Recognized.BBox != nil, item.Grade.Evidence.Verdict,
+		t.Logf("item[%d] status=%s bbox=%+v knowledge_points=%v out_of_scope_kp=%q verdict=%s evidence=%s answer=%q question=%q",
+			i+1, item.Status, item.Recognized.BBox, item.Recognized.KnowledgePoints, item.Grade.OutOfScopeKP, item.Grade.Evidence.Verdict,
 			item.Grade.Evidence.EvidenceType, clipPhotoProbe(item.Recognized.StudentAnswer, 40),
 			clipPhotoProbe(item.Recognized.Question, 80))
 	}
 	t.Logf("result: elapsed=%s mode=%s items=%d statuses=%v markdown_chars=%d annotated=%v attachments=%d",
 		time.Since(started).Round(time.Millisecond), result.Mode, len(result.Items), statusCounts,
 		len([]rune(reply.Content)), result.AnnotatedImage != nil, len(reply.Attachments))
+	inputSum := sha256.Sum256(raw)
+	if fmt.Sprintf("%x", inputSum) == k12AnsweredFixtureSHA256 {
+		assertKnownAnsweredWorksheetSemantics(t, result)
+	}
 	if markdownOutput := strings.TrimSpace(os.Getenv("HEXCLAW_K12_PHOTO_MARKDOWN_OUTPUT")); markdownOutput != "" {
 		if err := writeK12PhotoProbeMarkdown(markdownOutput, reply.Content); err != nil {
 			t.Fatalf("write probe Markdown: %v", err)
@@ -232,12 +240,152 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 		att.Name, att.Mime, len(decoded), sum[:8], output)
 }
 
+func assertKnownAnsweredWorksheetSemantics(t *testing.T, result k12usecase.PhotoGradeResult) {
+	t.Helper()
+	expected := []struct {
+		question string
+		status   k12usecase.PhotoItemStatus
+	}{
+		{"4÷0.5=", k12usecase.PhotoCorrect},
+		{"10×0.01=", k12usecase.PhotoCorrect},
+		{"4.7+2.3=", k12usecase.PhotoCorrect},
+		{"1.8×50=", k12usecase.PhotoCorrect},
+		{"3.25+0.75=", k12usecase.PhotoCorrect},
+		{"5/7−1/5=", k12usecase.PhotoCorrect},
+		{"7−5/7=", k12usecase.PhotoCorrect},
+		{"0.5+1/3=", k12usecase.PhotoWrong},
+		{"4/5+2/5=", k12usecase.PhotoCorrect},
+		{"8.7×17.4−8.7×7.4", k12usecase.PhotoWrong},
+		{"15.02−6.8−1.02", k12usecase.PhotoCorrect},
+		{"0.25+11/15+4/15+3/4", k12usecase.PhotoCorrect},
+		{"1、一个数的3/8是24，求这个数？", k12usecase.PhotoCorrect},
+		{"2、8的1/4的4/5是多少？", k12usecase.PhotoCorrect},
+		{"一个周长是300米的长方形鱼塘，长是宽的2倍。如果每平方米产鱼2.25千克，一共产鱼多少千克？", k12usecase.PhotoWrong},
+		{"在下列六个数：5、6、12、14、23、29中划去数（ ）后，能使其中3个数的和为另外2个数和的2倍。", k12usecase.PhotoUnanswered},
+	}
+	if result.Mode != k12usecase.PhotoModeGrade || len(result.Items) != len(expected) {
+		t.Fatalf("known answered worksheet shape drift: mode=%s items=%d want=%d",
+			result.Mode, len(result.Items), len(expected))
+	}
+	itemsByQuestion := make(map[string]k12usecase.PhotoGradeItem, len(result.Items))
+	for _, item := range result.Items {
+		key := canonicalK12PhotoProbeText(item.Recognized.Question)
+		if _, duplicate := itemsByQuestion[key]; duplicate {
+			t.Fatalf("known answered worksheet has duplicate question key %q", key)
+		}
+		itemsByQuestion[key] = item
+	}
+	statusCounts := map[k12usecase.PhotoItemStatus]int{}
+	for _, want := range expected {
+		key := canonicalK12PhotoProbeText(want.question)
+		item, ok := itemsByQuestion[key]
+		if !ok {
+			t.Fatalf("known answered worksheet lost/corrupted question %q: %#v", want.question, result.Items)
+		}
+		if item.Status != want.status {
+			t.Fatalf("question %q status=%s want=%s answer=%q warning=%q",
+				want.question, item.Status, want.status, item.Recognized.StudentAnswer, item.Warning)
+		}
+		if want.status != k12usecase.PhotoUnanswered && item.Recognized.BBox == nil {
+			t.Fatalf("answered question %q has no verified image anchor", want.question)
+		}
+		statusCounts[item.Status]++
+	}
+	if statusCounts[k12usecase.PhotoCorrect] != 12 ||
+		statusCounts[k12usecase.PhotoWrong] != 3 ||
+		statusCounts[k12usecase.PhotoUnanswered] != 1 {
+		t.Fatalf("known answered worksheet status totals=%v want correct=12 wrong=3 unanswered=1", statusCounts)
+	}
+	firstFraction := itemsByQuestion[canonicalK12PhotoProbeText("5/7−1/5=")].Recognized.StudentAnswer
+	if canonicalK12PhotoProbeText(firstFraction) != canonicalK12PhotoProbeText("18/35") {
+		t.Fatalf("first fraction transcription=%q want actual handwriting 18/35", firstFraction)
+	}
+	decimalAnswer := itemsByQuestion[canonicalK12PhotoProbeText("10×0.01=")].Recognized.StudentAnswer
+	if canonicalK12PhotoProbeText(decimalAnswer) != canonicalK12PhotoProbeText("0.1") {
+		t.Fatalf("writer-specific 0/6 transcription=%q want actual handwriting 0.1", decimalAnswer)
+	}
+	divisionAnswer := canonicalK12PhotoProbeText(
+		itemsByQuestion[canonicalK12PhotoProbeText("一个数的3/8是24，求这个数？")].Recognized.StudentAnswer,
+	)
+	if (divisionAnswer != canonicalK12PhotoProbeText("64") &&
+		!strings.Contains(divisionAnswer, canonicalK12PhotoProbeText("24÷3×8=64"))) ||
+		strings.Contains(divisionAnswer, canonicalK12PhotoProbeText("3/8×8")) {
+		t.Fatalf("printed fraction leaked into isolated handwriting transcription: %q", divisionAnswer)
+	}
+	if result.AnnotatedImage == nil {
+		t.Fatal("known answered worksheet has verified verdicts but no annotated image")
+	}
+}
+
+func canonicalK12PhotoProbeText(value string) string {
+	value = strings.TrimSpace(adapter.NormalizeMathText(value))
+	value = strings.Map(func(char rune) rune {
+		if unicode.IsSpace(char) {
+			return -1
+		}
+		return char
+	}, value)
+	runes := []rune(value)
+	index := 0
+	for index < len(runes) && runes[index] >= '0' && runes[index] <= '9' {
+		index++
+	}
+	if index > 0 && index < len(runes) && strings.ContainsRune("、.．", runes[index]) {
+		value = string(runes[index+1:])
+	}
+	value = strings.NewReplacer(
+		"＋", "+", "－", "-", "−", "-", "×", "*", "÷", "/",
+		"＝", "=", "？", "", "?", "", "，", ",", "；", ";",
+	).Replace(value)
+	return strings.TrimSuffix(strings.ToLower(value), "=")
+}
+
 func clipPhotoProbe(s string, n int) string {
 	r := []rune(strings.TrimSpace(s))
 	if len(r) <= n {
 		return string(r)
 	}
 	return fmt.Sprintf("%s…", string(r[:n]))
+}
+
+func applyK12PhotoProbeProviderOverride(t *testing.T, cfg *config.Config) {
+	t.Helper()
+	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("HEXCLAW_REAL_LLM_BASE_URL")), "/")
+	if baseURL == "" {
+		return
+	}
+	if !strings.HasSuffix(strings.ToLower(baseURL), "/v1") {
+		baseURL += "/v1"
+	}
+	providerName := strings.TrimSpace(os.Getenv("HEXCLAW_REAL_LLM_PROVIDER"))
+	if providerName == "" {
+		providerName = "openai"
+	}
+	apiKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+	if apiKey == "" {
+		t.Fatalf("HEXCLAW_REAL_LLM_BASE_URL requires OPENAI_API_KEY for provider %q", providerName)
+	}
+	model := strings.TrimSpace(os.Getenv("HEXCLAW_REAL_LLM_MODEL"))
+	if model == "" {
+		model = "gpt-5.6"
+	}
+	if cfg.LLM.Providers == nil {
+		cfg.LLM.Providers = make(map[string]config.LLMProviderConfig)
+	}
+	for name, providerCfg := range cfg.LLM.Providers {
+		if !strings.EqualFold(strings.TrimSpace(name), providerName) {
+			disabled := false
+			providerCfg.Enabled = &disabled
+			cfg.LLM.Providers[name] = providerCfg
+		}
+	}
+	enabled := true
+	cfg.LLM.Providers[providerName] = config.LLMProviderConfig{
+		APIKey: apiKey, BaseURL: baseURL, Model: model, Compatible: "openai", Enabled: &enabled,
+	}
+	cfg.LLM.Default = providerName
+	cfg.LLM.ReasoningProvider = providerName
+	cfg.LLM.ReasoningModel = model
 }
 
 func writeK12PhotoProbeMarkdown(path, content string) error {
