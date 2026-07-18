@@ -193,6 +193,22 @@ func TestLiveStateRequestsBypassSemanticCache(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "explicit deep reasoning preserves live reasoning stream",
+			msg: &adapter.Message{
+				Content:  "请深度分析这个问题",
+				Metadata: map[string]string{"thinking": "on"},
+			},
+			want: true,
+		},
+		{
+			name: "thinking disabled may reuse stable answer",
+			msg: &adapter.Message{
+				Content:  "1+1等于几",
+				Metadata: map[string]string{"thinking": "off"},
+			},
+			want: false,
+		},
+		{
 			name: "plain stable chat",
 			msg:  &adapter.Message{Content: "1+1等于几"},
 			want: false,

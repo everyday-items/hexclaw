@@ -13,6 +13,13 @@ import (
 
 var writtenFinalAnswerRe = regexp.MustCompile(`(?:答案?|答)[^0-9+\-]*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)`)
 
+// itemNumberPrefixRe 题号列表前缀（bug 2026-07-18：照片识别题干自带「1. 」「3、」「4)」等
+// 题号，去空白后「1. 26*3」曾被误拼成小数「1.26*3」）。两类可安全剥离的形态：
+//   - 数字 + 顿号/右括号（、)）——这些分隔符不可能是小数点；
+//   - 数字 + 半角/全角句点 + 空白——小数写法不会在小数点后带空白。
+var itemNumberPrefixRe = regexp.MustCompile(`^[0-9]{1,3}\s*(?:[、)）]|[.．]\s)\s*`)
+var mixedNumberAnswerRe = regexp.MustCompile(`^([+\-]?)([0-9]+)(?:\s+|又)([0-9]+)\s*/\s*([0-9]+)$`)
+
 // solveTrivialArithmetic 对“只含数字、四则运算、括号，等号右侧为空/问号”的一步算式做
 // 本机精确求值。它刻意不接受变量、函数、单位或自然语言，避免把方程/应用题误判成纯计算。
 func solveTrivialArithmetic(problem string) (worked, answer string, ok bool) {
@@ -47,6 +54,7 @@ func normalizeTrivialArithmetic(problem string) (expr, display string, ok bool) 
 		"（", "(", "）", ")", "＝", "=", "？", "?",
 	)
 	s = replacer.Replace(s)
+	s = itemNumberPrefixRe.ReplaceAllString(s, "")
 	if i := strings.IndexByte(s, '='); i >= 0 {
 		// 只接受“表达式=”或“表达式=?”；已有等式/方程不是纯求值题。
 		rhs := strings.TrimSpace(s[i+1:])
@@ -106,6 +114,9 @@ func arithmeticAnswerValue(answer string) (string, bool) {
 			}
 			candidate = rhs
 		}
+		if value, ok := mixedNumberAnswerValue(candidate); ok {
+			return value, true
+		}
 		if _, value, ok := solveTrivialArithmetic(candidate); ok {
 			return value, true
 		}
@@ -119,6 +130,28 @@ func arithmeticAnswerValue(answer string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// mixedNumberAnswerValue parses elementary-school mixed numbers such as "6 2/7" or "6又2/7".
+// Passing the space-separated form through the ordinary expression normalizer would remove the
+// space and silently reinterpret it as 62/7 instead of 6+2/7.
+func mixedNumberAnswerValue(answer string) (string, bool) {
+	matches := mixedNumberAnswerRe.FindStringSubmatch(strings.TrimSpace(answer))
+	if len(matches) != 5 {
+		return "", false
+	}
+	whole, wholeOK := new(big.Int).SetString(matches[2], 10)
+	numerator, numeratorOK := new(big.Int).SetString(matches[3], 10)
+	denominator, denominatorOK := new(big.Int).SetString(matches[4], 10)
+	if !wholeOK || !numeratorOK || !denominatorOK || denominator.Sign() <= 0 ||
+		numerator.Sign() < 0 || numerator.Cmp(denominator) >= 0 {
+		return "", false
+	}
+	totalNumerator := new(big.Int).Add(new(big.Int).Mul(whole, denominator), numerator)
+	if matches[1] == "-" {
+		totalNumerator.Neg(totalNumerator)
+	}
+	return formatArithmeticRat(new(big.Rat).SetFrac(totalNumerator, denominator)), true
 }
 
 func evalArithmeticNode(node ast.Expr, remaining *int) (*big.Rat, bool) {

@@ -52,6 +52,11 @@ func (e *TruncatingEmbedder) EmbedOne(ctx context.Context, text string) ([]float
 // Dimension 实现 vector.Embedder：透传底层维度。
 func (e *TruncatingEmbedder) Dimension() int { return e.inner.Dimension() }
 
+// Ready propagates optional readiness through the outer truncation decorator.
+func (e *TruncatingEmbedder) Ready(ctx context.Context) bool {
+	return EmbeddingReady(ctx, e.inner)
+}
+
 // clampRunes 把 s 截断到最多 max 个 rune（按 rune 切，保证不切坏多字节字符）。
 func clampRunes(s string, max int) string {
 	if max <= 0 {

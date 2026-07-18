@@ -62,6 +62,34 @@ func TestBUG20260714_GradeVerifiedArithmeticComparesLocally(t *testing.T) {
 	}
 }
 
+func TestGradeVerifiedArithmeticTreatsMixedNumberAsWholePlusProperFraction(t *testing.T) {
+	for _, tt := range []struct {
+		name, studentAnswer, wantCorrect string
+	}{
+		{name: "space separated mixed number", studentAnswer: "6 2/7", wantCorrect: "true"},
+		{name: "Chinese mixed-number separator", studentAnswer: "6又2/7", wantCorrect: "true"},
+		{name: "wrong mixed number", studentAnswer: "6 1/7", wantCorrect: "false"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			s := NewSolveSkill(func(_ context.Context, _ SubAgentSpec) (SubAgentResult, error) {
+				calls++
+				return SubAgentResult{Output: "CORRECT: no"}, nil
+			}, NewSubAgentRegistry(""))
+			res, err := s.GradeVerified(context.Background(), "7-5/7=?", "答案：44/7", tt.studentAnswer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if calls != 0 {
+				t.Fatalf("mixed-number arithmetic should be compared exactly without a grader, calls=%d", calls)
+			}
+			if got := res.Metadata["grade_correct"]; got != tt.wantCorrect {
+				t.Fatalf("grade_correct=%q, want %q; metadata=%#v", got, tt.wantCorrect, res.Metadata)
+			}
+		})
+	}
+}
+
 func TestBUG20260714_GradeVerifiedElementaryWordProblemComparesLocally(t *testing.T) {
 	calls := 0
 	s := NewSolveSkill(func(_ context.Context, _ SubAgentSpec) (SubAgentResult, error) {

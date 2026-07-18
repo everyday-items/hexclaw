@@ -40,8 +40,9 @@ func IsEmbeddingModelName(name string) bool {
 
 const ollamaProbeTimeout = 2 * time.Second
 
-// ollamaTags 探测 baseURL 的已安装模型名列表；失败返回 nil（静默，不阻断启动）。
-func ollamaTags(ctx context.Context, baseURL string) []string {
+// ollamaTags 探测 baseURL 的已安装模型名列表。第二个返回值区分「服务可用但
+// 尚无模型」和「服务不可达」，避免启动装配把不可达端点当成可调用能力。
+func ollamaTags(ctx context.Context, baseURL string) ([]string, bool) {
 	base := strings.TrimSuffix(strings.TrimSpace(baseURL), "/")
 	if base == "" {
 		base = "http://localhost:11434"
@@ -52,15 +53,15 @@ func ollamaTags(ctx context.Context, baseURL string) []string {
 	defer cancel()
 	req, err := http.NewRequestWithContext(pctx, http.MethodGet, base+"/api/tags", nil)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil
+		return nil, false
 	}
 	var payload struct {
 		Models []struct {
@@ -68,7 +69,7 @@ func ollamaTags(ctx context.Context, baseURL string) []string {
 		} `json:"models"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil
+		return nil, false
 	}
 	names := make([]string, 0, len(payload.Models))
 	for _, m := range payload.Models {
@@ -76,18 +77,36 @@ func ollamaTags(ctx context.Context, baseURL string) []string {
 			names = append(names, m.Name)
 		}
 	}
-	return names
+	return names, true
+}
+
+// InspectOllamaEmbedding performs one Ollama tags probe and reports both the
+// first installed embedding model and whether the service itself is reachable.
+func InspectOllamaEmbedding(ctx context.Context, baseURL string) (model string, serviceAvailable bool) {
+	names, available := ollamaTags(ctx, baseURL)
+	if !available {
+		return "", false
+	}
+	for _, name := range names {
+		if IsEmbeddingModelName(name) {
+			return name, true
+		}
+	}
+	return "", true
 }
 
 // DetectOllamaEmbeddingModel 返回 Ollama 已安装的首个嵌入能力模型（零配置零下载激活）。
 // 无嵌入模型 / 端点不可达 → ("", false)，调用方保持默认接线。
 func DetectOllamaEmbeddingModel(ctx context.Context, baseURL string) (string, bool) {
-	for _, name := range ollamaTags(ctx, baseURL) {
-		if IsEmbeddingModelName(name) {
-			return name, true
-		}
-	}
-	return "", false
+	model, _ := InspectOllamaEmbedding(ctx, baseURL)
+	return model, model != ""
+}
+
+// OllamaServiceAvailable reports whether the Ollama native API is reachable,
+// including the valid zero-model state.
+func OllamaServiceAvailable(ctx context.Context, baseURL string) bool {
+	_, available := ollamaTags(ctx, baseURL)
+	return available
 }
 
 // OllamaModelInstalled 报告某模型是否已安装（按冒号前基名匹配，"nomic-embed-text"
@@ -97,7 +116,8 @@ func OllamaModelInstalled(ctx context.Context, baseURL, model string) bool {
 	if want == "" {
 		return false
 	}
-	for _, name := range ollamaTags(ctx, baseURL) {
+	names, _ := ollamaTags(ctx, baseURL)
+	for _, name := range names {
 		got := strings.ToLower(strings.SplitN(name, ":", 2)[0])
 		if got == want {
 			return true

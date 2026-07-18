@@ -20,6 +20,7 @@ package knowledge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -246,6 +247,13 @@ type DocumentRepository interface {
 
 	// Delete 删除文档及其所有关联数据（原子操作）
 	Delete(ctx context.Context, docID string) error
+}
+
+// SearchableCorpus reports whether retrieval has any indexed chunks. It is an
+// optional fast-path interface: repositories that implement it let Manager
+// avoid query expansion and embedding calls for an empty knowledge base.
+type SearchableCorpus interface {
+	HasSearchableDocuments(ctx context.Context) (bool, error)
 }
 
 // ─── Query Interface (Query — 读路径) ───────────────────
@@ -868,6 +876,12 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 	if topK <= 0 {
 		topK = 3
 	}
+	if corpus, ok := m.repo.(SearchableCorpus); ok {
+		hasDocuments, err := corpus.HasSearchableDocuments(ctx)
+		if err == nil && !hasDocuments {
+			return nil, nil
+		}
+	}
 	cfg := m.cfg()
 	candidateK := cfg.CandidateK
 	if candidateK <= 0 {
@@ -877,8 +891,13 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 		candidateK = topK * 3 // 至少留够 rerank 收窄空间
 	}
 
-	// 1. 查询扩展（#8 HyDE + multi-query）；缺 LLM/关闭时返回 [query]
-	queries := m.expandQueries(ctx, query)
+	// 1. 查询扩展（#8 HyDE + multi-query）。向量能力待机时直接走原始 query
+	// 的 FTS 路径：自动注入没有语义证据本就 fail-closed，调用辅助 LLM 只会平添延迟。
+	embeddingReady := m.embedder != nil && EmbeddingReady(ctx, m.embedder)
+	queries := []string{query}
+	if embeddingReady {
+		queries = m.expandQueries(ctx, query)
+	}
 
 	// 2. 宽召回：每个 query 各取一路向量 + 一路 BM25，记录各排序列表喂给 RRF（#6 over-retrieve）
 	resultMap := make(map[string]*SearchResult)
@@ -888,14 +907,16 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 	vectorRouteRan := false
 
 	for _, q := range queries {
-		if m.embedder != nil {
+		if embeddingReady {
 			// 查询向量化预算（BUG-20260703 同构防护，对齐 engine 记忆召回）：检索是增强，
 			// 不继承整请求 ctx 的漫长余量——慢 embedding 端点超预算即掐断，本轮走纯 BM25。
 			ectx, ecancel := context.WithTimeout(ragEmbedContext(ctx), queryEmbedTimeout)
 			qv, err := m.embedder.Embed(ectx, []string{cfg.EmbedQueryPrefix + q})
 			ecancel()
 			if err != nil {
-				logger.Error("[knowledge] 查询向量嵌入失败", "error", err)
+				if !errors.Is(err, ErrEmbeddingUnavailable) {
+					logger.Error("[knowledge] 查询向量嵌入失败", "error", err)
+				}
 			} else if len(qv) > 0 {
 				vres, vErr := m.searcher.VectorSearch(ctx, qv[0], candidateK, filter)
 				if vErr != nil {
@@ -919,7 +940,7 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 	}
 
 	// 3. 融合评分（#9 RRF 或加权和回退）+ 时间衰减
-	candidates := m.fuse(resultMap, rankedLists)
+	candidates := m.fuse(resultMap, rankedLists, vectorRouteRan)
 
 	// 4. 相关度地板（#3）：宽召回模式带放宽回退；注入模式 fail-closed（B8）。
 	// BUG-20260712-I：降级态（embedder 未配置 / Embed 失败超时 → 向量路未跑通）不再把
@@ -980,7 +1001,7 @@ func mergeRanked(resultMap map[string]*SearchResult, results []*SearchResult, is
 // TextScore)加权 rank 贡献：score(d) = Σ_list w_list · normScore(d,list) / (k + rank)。
 // 这样弱命中（低 normScore）的 rank 红利被同比缩小，而真正的精确命中（高 BM25 分）仍保留
 // 满权 —— 既根治虚假命中带偏，又不损失精确术语匹配能力。
-func (m *Manager) fuse(resultMap map[string]*SearchResult, rankedLists []rankedList) []*SearchResult {
+func (m *Manager) fuse(resultMap map[string]*SearchResult, rankedLists []rankedList, vectorRouteRan bool) []*SearchResult {
 	cfg := m.cfg()
 	candidates := make([]*SearchResult, 0, len(resultMap))
 	if cfg.UseRRF && len(rankedLists) > 0 {
@@ -992,7 +1013,7 @@ func (m *Manager) fuse(resultMap map[string]*SearchResult, rankedLists []rankedL
 		if vw <= 0 && tw <= 0 {
 			vw, tw = 0.7, 0.3
 		}
-		if m.embedder == nil {
+		if !vectorRouteRan {
 			vw, tw = 0, 1 // 无向量时退化纯关键词
 		}
 		fused := make(map[string]float64, len(resultMap))
@@ -1016,7 +1037,7 @@ func (m *Manager) fuse(resultMap map[string]*SearchResult, rankedLists []rankedL
 		}
 	} else {
 		for _, r := range resultMap {
-			r.Chunk.Score = m.hybridScore(r)
+			r.Chunk.Score = m.hybridScoreMode(r, vectorRouteRan)
 			candidates = append(candidates, r)
 		}
 	}
@@ -1227,7 +1248,9 @@ func (m *Manager) buildChunks(ctx context.Context, doc *Document, ts time.Time) 
 		embeddings, err = m.embedder.Embed(embedCtx, embedTexts)
 		cancel()
 		if err != nil {
-			logger.Warn("[knowledge] 生成向量嵌入失败，降级为纯文本索引", "title", doc.Title, "error", err)
+			if !errors.Is(err, ErrEmbeddingUnavailable) {
+				logger.Warn("[knowledge] 生成向量嵌入失败，降级为纯文本索引", "title", doc.Title, "error", err)
+			}
 			embeddings = nil
 		}
 	}
@@ -1378,11 +1401,18 @@ func (m *Manager) generateChunkContext(ctx context.Context, docContent, chunk st
 	return clampRunes(strings.TrimSpace(out), 200), nil
 }
 
+// hybridScore preserves the package-level scoring contract used by focused
+// tests and offline callers. The request path uses hybridScoreMode so a
+// temporarily unavailable embedder receives true lexical-only weighting.
 func (m *Manager) hybridScore(r *SearchResult) float64 {
+	return m.hybridScoreMode(r, m.embedder != nil)
+}
+
+func (m *Manager) hybridScoreMode(r *SearchResult, vectorRouteRan bool) float64 {
 	cfg := m.cfg()
 	vectorWeight := cfg.VectorWeight
 	textWeight := cfg.TextWeight
-	if m.embedder == nil {
+	if !vectorRouteRan {
 		vectorWeight = 0
 		textWeight = 1.0
 	}

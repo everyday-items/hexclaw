@@ -239,10 +239,10 @@ func TestBUG20260711_isLocalRuntimeUnavailable(t *testing.T) {
 
 func TestBUG20260711_friendlyLLMError(t *testing.T) {
 	cases := []struct {
-		name    string
-		raw     string
-		want    string
-		noleak  []string
+		name   string
+		raw    string
+		want   string
+		noleak []string
 	}{
 		{"local", "ollama api error: 500 llama-server binary not found. Run 'cmake --build'", "本地模型未就绪", []string{"llama-server", "cmake", "500"}},
 		{"tool", "No endpoints found that support tool use (code: 404)", "不支持工具调用", []string{"404", "No endpoints"}},

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -43,5 +44,12 @@ func TestResolveProvider_MissingProviderActionableNoSilentFallback(t *testing.T)
 	}
 	if !strings.Contains(msg, "改绑") && !strings.Contains(msg, "恢复") {
 		t.Fatalf("错误应可操作（怎么恢复/改绑），got: %s", msg)
+	}
+	var providerErr *ProviderUnavailableError
+	if !errors.As(err, &providerErr) || providerErr.Provider != "Ollama (本地)" {
+		t.Fatalf("missing provider must be a typed ProviderUnavailableError, got %T: %v", err, err)
+	}
+	if err := eng.ValidateProvider("Ollama (本地)"); !errors.As(err, &providerErr) {
+		t.Fatalf("boundary validation must reject the same provider without routing: %v", err)
 	}
 }

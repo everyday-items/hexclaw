@@ -2,11 +2,13 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/knowledge"
 	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/memory/recall"
 )
@@ -142,6 +144,9 @@ func (e *ReActEngine) rankFacts(ctx context.Context, facts []recall.Entry, query
 	}
 	// 熔断开闸期间跳过向量路径（BUG-20260703③）：端点持续慢/坏时不再逐条消息付代价。
 	emb := e.memEmbedderIfHealthy()
+	if emb != nil && !knowledge.EmbeddingReady(ctx, emb) {
+		emb = nil
+	}
 	src := &memEntrySource{entries: facts, embedder: emb}
 	minScore := 0.0
 	if emb != nil {
@@ -167,7 +172,7 @@ func (e *ReActEngine) rankFacts(ctx context.Context, facts []recall.Entry, query
 		results, err = r.Retrieve(ctx, "", "", query)
 	}
 	// 熔断记账（BUG-20260703③）：本轮真实尝试过向量化才计成败。
-	if src.embedAttempted {
+	if src.embedAttempted && !errors.Is(src.embedErr, knowledge.ErrEmbeddingUnavailable) {
 		e.recordMemEmbedOutcome(src.embedErr == nil)
 	}
 	// BUG-20260712-L：空结果不再兜底原样返回——配合 recall 零证据剔除后，空=真无相关，
@@ -255,8 +260,10 @@ func (s *memEntrySource) Candidates(ctx context.Context, _, _, query string, _ i
 		switch {
 		case err != nil:
 			s.embedErr = err
-			slog.Warn("[engine] 记忆召回向量化失败，软降级 BM25",
-				"error", err, "elapsed", time.Since(start).String(), "texts", len(texts))
+			if !errors.Is(err, knowledge.ErrEmbeddingUnavailable) {
+				slog.Warn("[engine] 记忆召回向量化失败，软降级 BM25",
+					"error", err, "elapsed", time.Since(start).String(), "texts", len(texts))
+			}
 		case len(vecs) != len(texts):
 			s.embedErr = context.Canceled // 形状不符视为失败（不重试）
 			slog.Warn("[engine] 记忆召回向量化返回形状不符，软降级 BM25",

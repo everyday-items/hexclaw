@@ -171,7 +171,7 @@ func (e *ReActEngine) localOllamaNumCtx() int {
 		return 0
 	}
 	for name, p := range e.cfg.LLM.Providers {
-		if isLocalProvider(name) && p.NumCtx > 0 {
+		if config.IsLocalLLMProviderNamed(name, p) && p.NumCtx > 0 {
 			return p.NumCtx
 		}
 	}
@@ -1473,6 +1473,9 @@ func (e *ReActEngine) finalizeReply(
 		blocks = append(blocks, adapter.Block{Type: "text", Text: notice})
 	}
 
+	ensureMessageMetadata(msg)
+	markReasoningPresentation(msg.Metadata, reasoning)
+
 	assistantMessageID := ""
 	if record, err := e.sessions.SaveAssistantReply(ctx, sessionID, content, session.AssistantMeta{
 		Provider:      providerName,
@@ -2448,6 +2451,7 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 	} else {
 		thinkingDuration = 0
 	}
+	markReasoningPresentation(msgMeta, reasoning)
 
 	assistantMessageID := ""
 	if record, err := e.sessions.SaveAssistantReply(saveCtx, sessionID, content, session.AssistantMeta{
@@ -2892,6 +2896,7 @@ func (e *ReActEngine) pipeStream(
 		}
 		thinkingDuration = int(end.Sub(reasoningStartTime).Seconds())
 	}
+	markReasoningPresentation(msgMeta, reasoning)
 	if record, err := e.sessions.SaveAssistantReply(saveCtx, sessionID, content, session.AssistantMeta{
 		Reasoning:        reasoning,
 		ThinkingDuration: thinkingDuration,
@@ -3109,6 +3114,7 @@ func (e *ReActEngine) pipeStreamWithTools(
 		}
 		thinkingDuration2 = int(end.Sub(reasoningStartTime2).Seconds())
 	}
+	markReasoningPresentation(msgMeta, reasoning)
 	if record, err := e.sessions.SaveAssistantReply(saveCtx, sessionID, content, session.AssistantMeta{
 		Reasoning:        reasoning,
 		ThinkingDuration: thinkingDuration2,
@@ -4053,7 +4059,7 @@ func buildReplyMetadata(metadata map[string]string, providerName, modelName, ass
 	if v := metadata["routed_agent"]; v != "" {
 		replyMeta["routed_agent"] = v
 	}
-	for _, key := range []string{"request_id", "session_id", "finish_reason", "recovered_from_reasoning_only", "thinking_duration", "record", persistErrorMetaKey} {
+	for _, key := range []string{"request_id", "session_id", "finish_reason", "recovered_from_reasoning_only", "thinking", "reasoning_visibility", "thinking_duration", "record", persistErrorMetaKey} {
 		if v := metadata[key]; v != "" {
 			replyMeta[key] = v
 		}
@@ -4063,6 +4069,36 @@ func buildReplyMetadata(metadata map[string]string, providerName, modelName, ass
 		replyMeta = WithInteractivePayload(replyMeta, p)
 	}
 	return withAssistantMessageID(replyMeta, assistantMessageID)
+}
+
+// markReasoningPresentation records only what the application can actually
+// observe. A reasoning model may use hidden reasoning tokens without exposing
+// a summary; in that case we report not_exposed instead of fabricating a chain
+// of thought. The fields are persisted and returned on the final wire chunk.
+func markReasoningPresentation(metadata map[string]string, reasoning string) {
+	if metadata == nil {
+		return
+	}
+	mode := strings.ToLower(strings.TrimSpace(metadata["thinking"]))
+	switch mode {
+	case "on":
+		metadata["thinking"] = "on"
+		if strings.TrimSpace(reasoning) != "" {
+			metadata["reasoning_visibility"] = "visible"
+		} else {
+			metadata["reasoning_visibility"] = "not_exposed"
+		}
+	case "off":
+		metadata["thinking"] = "off"
+		if strings.TrimSpace(reasoning) != "" {
+			metadata["reasoning_visibility"] = "visible"
+		} else {
+			metadata["reasoning_visibility"] = "disabled"
+		}
+	default:
+		delete(metadata, "thinking")
+		delete(metadata, "reasoning_visibility")
+	}
 }
 
 func withAssistantMessageID(metadata map[string]string, assistantMessageID string) map[string]string {
@@ -4171,7 +4207,27 @@ func (e *ReActEngine) resolveProvider(ctx context.Context, providerHint string, 
 	// provider 韧性（治本）：绑定的 provider 找不到时给**可操作**错误（点名 provider + 怎么恢复），
 	// 而非笼统「provider 不存在」。绝不静默回退到默认/云端 provider——本地会话被悄悄转发云端会
 	// 击穿隐私出口边界（egress）。本地模型缺失多因 Ollama 未启动，提示里点明（BUG-20260712）。
-	return nil, "", fmt.Errorf("智能体绑定的模型提供方 %q 当前不可用（未注册或已被移除）；请在「设置 → 模型」恢复该 provider，或在「智能体」里改绑到可用模型（本地模型请确认 Ollama 已启动）", hint)
+	return nil, "", &ProviderUnavailableError{Provider: hint}
+}
+
+// ValidateProvider validates only an explicit caller selection and performs no
+// routing, session creation, or model call. HTTP adapters use it at the request
+// boundary so malformed provider input cannot leave partial chat state.
+func (e *ReActEngine) ValidateProvider(providerHint string) error {
+	hint := strings.TrimSpace(providerHint)
+	if hint == "" || strings.EqualFold(hint, "auto") {
+		return nil
+	}
+	e.mu.RLock()
+	router := e.router
+	e.mu.RUnlock()
+	if router == nil {
+		return &ProviderUnavailableError{Provider: hint}
+	}
+	if _, ok := router.Get(hint); !ok {
+		return &ProviderUnavailableError{Provider: hint}
+	}
+	return nil
 }
 
 // applyPinnedAgent 处理显式锁定的收件 Agent（metadata pinned_agent，BUG-20260703）：

@@ -36,6 +36,7 @@ type SQLiteStore struct {
 var (
 	_ DocumentRepository = (*SQLiteStore)(nil)
 	_ ChunkSearcher      = (*SQLiteStore)(nil)
+	_ SearchableCorpus   = (*SQLiteStore)(nil)
 )
 
 // NewSQLiteStore 创建 SQLite 知识库存储
@@ -299,6 +300,14 @@ func (s *SQLiteStore) List(ctx context.Context) ([]*Document, error) {
 		docs = append(docs, doc)
 	}
 	return docs, rows.Err()
+}
+
+// HasSearchableDocuments uses an indexed existence query instead of loading
+// document metadata on every chat turn.
+func (s *SQLiteStore) HasSearchableDocuments(ctx context.Context) (bool, error) {
+	var exists bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM kb_chunks LIMIT 1)`).Scan(&exists)
+	return exists, err
 }
 
 // GetBySourceTitle 按 (source, title) 查询单个文档（不含正文）。
