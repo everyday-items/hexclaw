@@ -19,7 +19,7 @@ import (
 // （collection=错题本、fields 含 question/knowledge_point/error_cause、status=new）。
 func TestGradeSkill_BUG1_EmitsConsumableRecordMetadata(t *testing.T) {
 	deps := newDeps(t, usecase.GradeOutcome{
-		Correct: false, WrongStep: "小数点错位", ErrorCause: "计算失误", KnowledgePoint: "小数乘法",
+		Verdict: usecase.VerdictDisagree, WrongStep: "小数点错位", ErrorCause: "计算失误", KnowledgePoint: "小数乘法",
 	})
 	sk := skilladapter.NewGradeSkill(deps)
 	ctx := skill.WithRoutedAgent(context.Background(), "mingming")
@@ -64,7 +64,7 @@ func TestGradeSkill_BUG1_EmitsConsumableRecordMetadata(t *testing.T) {
 
 // 答对不入库 → 不得产出 record 元数据（避免前端渲染空徽章）。
 func TestGradeSkill_BUG1_NoRecordMetadataWhenCorrect(t *testing.T) {
-	deps := newDeps(t, usecase.GradeOutcome{Correct: true})
+	deps := newDeps(t, usecase.GradeOutcome{Verdict: usecase.VerdictAgree})
 	sk := skilladapter.NewGradeSkill(deps)
 	ctx := skill.WithRoutedAgent(context.Background(), "mingming")
 	res, err := sk.Execute(ctx, map[string]any{"problem": "1+1", "student_answer": "2", "grade": "一年级上"})

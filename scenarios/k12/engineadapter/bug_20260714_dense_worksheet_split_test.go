@@ -3,395 +3,552 @@ package engineadapter
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/jpeg"
+	"math"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
-// BUG-20260714：密集长作业整页交给 glm-4v-flash 时，模型的 1024 输出上限会把 JSON
-// 截断。长图必须拆成有重叠的纵向分片识别，再把分片 bbox 映射回原图坐标。
-func TestBUG20260714_DenseTallWorksheetSplitsAndRemapsBBox(t *testing.T) {
-	img := image.NewRGBA(image.Rect(0, 0, 600, 1800))
-	for y := 0; y < 1800; y++ {
-		for x := 0; x < 600; x++ {
-			img.Set(x, y, color.White)
-		}
-	}
-	addSyntheticWorksheetInk(img)
-	var encoded bytes.Buffer
-	if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: 80}); err != nil {
-		t.Fatal(err)
-	}
-
+func TestDenseWorksheetCoreRecognitionUsesFiveSegmentsPlusPrintedInventory(t *testing.T) {
 	var calls atomic.Int32
-	vision := func(_ context.Context, segment []byte, prompt string) (string, error) {
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
 		calls.Add(1)
-		if strings.Contains(prompt, "bbox 二次语义核验") {
-			index, err := semanticVerificationPromptIndex(prompt)
-			if err != nil {
-				return "", err
-			}
-			return fmt.Sprintf(`[{"index":%d,"observed_question":"分片%d题目","observed_student_answer":"%d"}]`, index, index, index), nil
-		}
-		if !strings.Contains(prompt, "纵向分片") {
-			return "", fmt.Errorf("长图未带分片约束")
-		}
-		var part int
-		if _, err := fmt.Sscanf(prompt[strings.LastIndex(prompt, "纵向分片"):], "纵向分片 %d/5", &part); err != nil {
-			return "", fmt.Errorf("缺少可解析的分片编号: %w", err)
-		}
-		cfg, _, err := image.DecodeConfig(bytes.NewReader(segment))
-		if err != nil || cfg.Height >= 1800 {
-			return "", fmt.Errorf("没有真正裁剪长图: size=%dx%d err=%v", cfg.Width, cfg.Height, err)
-		}
-		return fmt.Sprintf(`[{"question":"分片%d题目","subject":"数学","knowledge_points":["测试"],"student_answer":"%d","bbox":{"x":0.1,"y":0.5,"w":0.2,"h":0.1}}]`, part, part), nil
-	}
-
-	qs, err := NewRecognizerAdapter(vision).Recognize(context.Background(), encoded.Bytes())
-	if err != nil {
-		t.Fatalf("Recognize() error = %v", err)
-	}
-	if got := calls.Load(); got != 10 {
-		t.Fatalf("vision calls = %d, want 5 segment calls + 5 isolated bbox OCR verifications", got)
-	}
-	if len(qs) != 5 {
-		t.Fatalf("questions = %d, want 5: %#v", len(qs), qs)
-	}
-	for i, q := range qs {
-		if q.Question != fmt.Sprintf("分片%d题目", i+1) {
-			t.Fatalf("question[%d] = %q", i, q.Question)
-		}
-		if q.BBox == nil || q.BBox.Y <= 0 || q.BBox.Y >= 1 || q.BBox.Y+q.BBox.H > 1.005 {
-			t.Fatalf("question[%d] bbox not remapped to full image: %#v", i, q.BBox)
-		}
-		if i > 0 && qs[i-1].BBox != nil && q.BBox.Y <= qs[i-1].BBox.Y {
-			t.Fatalf("bbox order not preserved: prev=%#v current=%#v", qs[i-1].BBox, q.BBox)
-		}
-	}
-}
-
-// 底部应用题通常跨图片 72%～95% 高度。最后一片若从 78% 才开始，会只读到“如果每平方米…”
-// 后半句；倒数第二片又在 84% 截断答案，最终没有任何一片拥有完整题干 + 作答。
-func TestBUG20260714_BottomSegmentCoversWholeWordProblem(t *testing.T) {
-	last := denseWorksheetRanges[len(denseWorksheetRanges)-1]
-	if last[0] > 0.72 || last[1] < 1 {
-		t.Fatalf("最后分片必须完整覆盖底部应用题区，range=%v", last)
-	}
-}
-
-func TestBUG20260714_CrossSegmentFragmentMergesIntoCompleteWordProblem(t *testing.T) {
-	segments := []worksheetSegment{
-		{image: []byte("part-4"), index: 4, total: 5, startY: 0.58, endY: 0.84},
-		{image: []byte("part-5"), index: 5, total: 5, startY: 0.68, endY: 1.00},
-	}
-	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
-		if strings.Contains(prompt, "纵向分片 4/5") {
-			return `[{"question":"如果每平方米产鱼2.25千克，一共产鱼多少千克？","subject":"数学","knowledge_points":["长方形面积"],"student_answer":"5000×2.25=11250千克","bbox":{"x":0.48,"y":0.72,"w":0.42,"h":0.20}}]`, nil
-		}
-		if strings.Contains(prompt, "纵向分片 5/5") {
-			return `[{"question":"一个周长是300米的长方形鱼塘，长是宽的2倍。如果每平方米产鱼2.25千克，一共产鱼多少千克？","subject":"数学","knowledge_points":["长方形面积"],"student_answer":"300÷6=50米；50×2=100米；5000×2.25=11250千克","bbox":{"x":0.48,"y":0.02,"w":0.42,"h":0.82}}]`, nil
-		}
-		return `[]`, nil
-	}
-
-	qs, err := NewRecognizerAdapter(vision).recognizeSegments(context.Background(), segments)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(qs) != 1 || !strings.Contains(qs[0].Question, "周长是300米") {
-		t.Fatalf("cross-segment cropped/full variants were not merged: %#v", qs)
-	}
-}
-
-// 顶部横排小口算在整宽分片中字号很小，glm-4v-flash 偶发只返回印刷题干、漏掉所有手写答案。
-// 对“有题但整片 0 作答”的可疑分片必须做一次聚焦手写复核，再与首轮结果合并；否则已答卷会被误走空白解题。
-func TestBUG20260714_SuspiciousSegmentRecoversHandwritingOnFocusedPass(t *testing.T) {
-	img := image.NewRGBA(image.Rect(0, 0, 600, 1800))
-	for y := 0; y < 1800; y++ {
-		for x := 0; x < 600; x++ {
-			img.Set(x, y, color.White)
-		}
-	}
-	addSyntheticWorksheetInk(img)
-	var encoded bytes.Buffer
-	if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: 80}); err != nil {
-		t.Fatal(err)
-	}
-
-	var partCalls [5]atomic.Int32
-	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
-		if strings.Contains(prompt, "bbox 二次语义核验") {
-			index, err := semanticVerificationPromptIndex(prompt)
-			if err != nil {
-				return "", err
-			}
-			return fmt.Sprintf(`[{"index":%d,"observed_question":"4÷0.5=","observed_student_answer":"8"}]`, index), nil
-		}
-		var part int
-		if _, err := fmt.Sscanf(prompt[strings.LastIndex(prompt, "纵向分片"):], "纵向分片 %d/5", &part); err != nil {
-			return "", fmt.Errorf("缺少可解析的分片编号: %w", err)
-		}
-		call := partCalls[part-1].Add(1)
-		if part == 1 && call == 1 {
-			return `[{"question":"4÷0.5=","subject":"数学","knowledge_points":["小数除法"],"student_answer":""}]`, nil
-		}
-		if part == 1 {
-			if !strings.Contains(prompt, "复核手写答案") {
-				return "", fmt.Errorf("第二遍没有聚焦手写复核约束")
-			}
-			return `[{"question":"4÷0.5=","subject":"数学","knowledge_points":["小数除法"],"student_answer":"8","bbox":{"x":0.1,"y":0.4,"w":0.2,"h":0.1}}]`, nil
-		}
-		return fmt.Sprintf(`[{"question":"分片%d题目","subject":"数学","knowledge_points":["测试"],"student_answer":"%d"}]`, part, part), nil
-	}
-
-	qs, err := NewRecognizerAdapter(vision).Recognize(context.Background(), encoded.Bytes())
-	if err != nil {
-		t.Fatalf("Recognize() error = %v", err)
-	}
-	if got := partCalls[0].Load(); got != 2 {
-		t.Fatalf("suspicious segment calls = %d, want focused second pass", got)
-	}
-	if len(qs) != 5 || qs[0].StudentAnswer != "8" || qs[0].BBox == nil {
-		t.Fatalf("focused handwriting result not merged: %#v", qs)
-	}
-}
-
-// 整宽分片里的横排口算仍可能因字号过小而漏列；当首段只识出少量短题时，必须追加横向重叠放大，
-// 并把局部 bbox.x 映射回整图。这样不是依赖模型“再随机试一次”，而是实际给足视觉分辨率。
-func TestBUG20260714_SparseShortSegmentUsesHorizontalZoom(t *testing.T) {
-	img := image.NewRGBA(image.Rect(0, 0, 900, 1800))
-	for y := 0; y < 1800; y++ {
-		for x := 0; x < 900; x++ {
-			img.Set(x, y, color.White)
-		}
-	}
-	addSyntheticWorksheetInk(img)
-	var encoded bytes.Buffer
-	if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: 80}); err != nil {
-		t.Fatal(err)
-	}
-
-	var partCalls [5]atomic.Int32
-	vision := func(_ context.Context, cropped []byte, prompt string) (string, error) {
-		if strings.Contains(prompt, "bbox 二次语义核验") {
-			index, err := semanticVerificationPromptIndex(prompt)
-			if err != nil {
-				return "", err
-			}
-			return fmt.Sprintf(`[{"index":%d,"observed_question":"放大%d题","observed_student_answer":"%d"}]`, index, index, index), nil
-		}
-		var part int
-		if _, err := fmt.Sscanf(prompt[strings.LastIndex(prompt, "纵向分片"):], "纵向分片 %d/5", &part); err != nil {
-			return "", err
-		}
-		partCalls[part-1].Add(1)
-		if part == 1 && strings.Contains(prompt, "横向放大") {
-			cfg, _, err := image.DecodeConfig(bytes.NewReader(cropped))
-			if err != nil || cfg.Width >= 900 {
-				return "", fmt.Errorf("横向放大没有真正裁图: %dx%d err=%v", cfg.Width, cfg.Height, err)
-			}
-			var zoom int
-			if _, err := fmt.Sscanf(prompt[strings.LastIndex(prompt, "横向放大"):], "横向放大 %d/3", &zoom); err != nil {
-				return "", err
-			}
-			return fmt.Sprintf(`[{"question":"放大%d题","subject":"数学","knowledge_points":["口算"],"student_answer":"%d","bbox":{"x":0.5,"y":0.4,"w":0.1,"h":0.1}}]`, zoom, zoom), nil
-		}
-		if part == 1 {
-			return `[{"question":"1+1=","subject":"数学","knowledge_points":["口算"],"student_answer":"2"},{"question":"2+2=","subject":"数学","knowledge_points":["口算"],"student_answer":"4"}]`, nil
-		}
-		return fmt.Sprintf(`[{"question":"分片%d长题目内容用于避免横向放大","subject":"数学","knowledge_points":["测试"],"student_answer":"%d"}]`, part, part), nil
-	}
-
-	qs, err := NewRecognizerAdapter(vision).Recognize(context.Background(), encoded.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := partCalls[0].Load(); got != 4 { // 整宽 1 次 + 横向 3 次
-		t.Fatalf("first segment calls = %d, want 4", got)
-	}
-	if len(qs) != 9 { // 首轮 2 + 横向新增 3 + 其余 4 段
-		t.Fatalf("questions = %d, want 9: %#v", len(qs), qs)
-	}
-	if qs[2].BBox == nil || qs[2].BBox.X <= 0 || qs[2].BBox.X >= 0.42 {
-		t.Fatalf("left zoom bbox.x not remapped: %#v", qs[2].BBox)
-	}
-	if qs[4].BBox == nil || qs[4].BBox.X <= 0.58 {
-		t.Fatalf("right zoom bbox.x not remapped: %#v", qs[4].BBox)
-	}
-}
-
-// 936x1280 空白卷的“二、计算下面各题”落在后续纵向分片。旧逻辑只允许第 1 片横向
-// 放大，导致三个横排短算式一直漏识。横向放大应按内容触发，而不是写死分片编号；同时
-// 每页最多放大两个纵向分片（每片 3 个横向块），避免 5 片全部放大造成请求失控。
-func TestBUG20260715_LaterArithmeticSegmentUsesHorizontalZoomWithinPageBudget(t *testing.T) {
-	raw := encodeWorksheetJPEG(t, 936, 320)
-	segments := make([]worksheetSegment, 5)
-	for i := range segments {
-		segments[i] = worksheetSegment{
-			image: raw, index: i + 1, total: 5,
-			startY: float64(i) / 5, endY: float64(i+1) / 5,
-		}
-	}
-
-	var zoomCalls [5]atomic.Int32
-	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
-		var part int
-		if _, err := fmt.Sscanf(prompt[strings.LastIndex(prompt, "纵向分片"):], "纵向分片 %d/5", &part); err != nil {
-			return "", err
-		}
-		if strings.Contains(prompt, "横向放大") {
-			zoomCalls[part-1].Add(1)
-			var zoom int
-			if _, err := fmt.Sscanf(prompt[strings.LastIndex(prompt, "横向放大"):], "横向放大 %d/3", &zoom); err != nil {
-				return "", err
-			}
-			if part == 3 {
-				questions := []string{"0.4×0.8=", "0.25×32×0.125", "194-64.8÷1.8×0.9"}
-				return fmt.Sprintf(`[{"question":%q,"subject":"数学","student_answer":""}]`, questions[zoom-1]), nil
-			}
-			return fmt.Sprintf(`[{"question":"放大%d-%d=","subject":"数学","student_answer":""}]`, part, zoom), nil
-		}
-
-		switch part {
-		case 1:
-			return `[{"question":"4.5×2=","subject":"数学","student_answer":""},{"question":"15-5.7=","subject":"数学","student_answer":""}]`, nil
-		case 3:
-			return `[{"question":"135÷0.5=","subject":"数学","student_answer":""},{"question":"21×(9.3-3.7)-5.6","subject":"数学","student_answer":""}]`, nil
-		case 4:
-			// 第三个满足条件的分片用于钉死页面级预算，不应继续触发横向请求。
-			return `[{"question":"2.7+4x=12.7","subject":"数学","student_answer":""},{"question":"6x+15×7=141","subject":"数学","student_answer":""}]`, nil
-		default:
-			return fmt.Sprintf(`[{"question":"分片%d的长题目内容用于避免触发横向放大流程","subject":"数学","student_answer":""}]`, part), nil
-		}
-	}
-
-	qs, err := NewRecognizerAdapter(vision).recognizeSegments(context.Background(), segments)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{"0.4×0.8=", "0.25×32×0.125", "194-64.8÷1.8×0.9"} {
-		found := false
-		for _, q := range qs {
-			if q.Question == want {
-				found = true
+		current := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for {
+			previous := maxInFlight.Load()
+			if current <= previous || maxInFlight.CompareAndSwap(previous, current) {
 				break
 			}
 		}
-		if !found {
-			t.Fatalf("later arithmetic zoom did not recover %q: %#v", want, qs)
+		if strings.Contains(prompt, "bbox 坐标") || strings.Contains(prompt, "横向放大") ||
+			strings.Contains(prompt, "复核手写答案") {
+			return "", fmt.Errorf("core recognition leaked optional geometry/retry work into prompt")
 		}
-	}
-	if got := zoomCalls[0].Load(); got != int32(len(horizontalZoomRanges)) {
-		t.Fatalf("first arithmetic segment zoom calls = %d, want %d", got, len(horizontalZoomRanges))
-	}
-	if got := zoomCalls[2].Load(); got != int32(len(horizontalZoomRanges)) {
-		t.Fatalf("later arithmetic segment zoom calls = %d, want %d", got, len(horizontalZoomRanges))
-	}
-	if got := zoomCalls[3].Load(); got != 0 {
-		t.Fatalf("third eligible segment exceeded page zoom budget: calls=%d", got)
-	}
-	var total int32
-	for i := range zoomCalls {
-		total += zoomCalls[i].Load()
-	}
-	if want := int32(2 * len(horizontalZoomRanges)); total != want {
-		t.Fatalf("page horizontal zoom calls = %d, want hard cap %d", total, want)
-	}
-}
-
-func semanticVerificationPromptIndex(prompt string) (int, error) {
-	start := strings.Index(prompt, "index=")
-	if start < 0 {
-		return 0, fmt.Errorf("semantic prompt missing candidate index")
-	}
-	var index int
-	if _, err := fmt.Sscanf(prompt[start:], "index=%d", &index); err != nil {
-		return 0, err
-	}
-	return index, nil
-}
-
-// The splitter tests use a generated page and a fake VLM. Add deterministic dark strokes so the
-// production blank-crop guard sees the same invariant as a real answered worksheet: a claimed answer
-// bbox must contain visible ink. The tests remain about split/remap behavior, not OCR rendering.
-func addSyntheticWorksheetInk(img *image.RGBA) {
-	bounds := img.Bounds()
-	ink := color.RGBA{R: 45, G: 45, B: 45, A: 255}
-	for y := bounds.Min.Y; y < bounds.Max.Y; y += 36 {
-		for dy := 0; dy < 2 && y+dy < bounds.Max.Y; dy++ {
-			for x := bounds.Min.X; x < bounds.Max.X; x++ {
-				img.SetRGBA(x, y+dy, ink)
+		time.Sleep(5 * time.Millisecond)
+		if strings.Contains(prompt, "整页印刷题清单") {
+			return `[]`, nil
+		}
+		for i := 1; i <= len(denseWorksheetRanges); i++ {
+			if strings.Contains(prompt, fmt.Sprintf("纵向分片 %d/%d", i, len(denseWorksheetRanges))) {
+				return fmt.Sprintf(
+					`[{"question":"%d+1=","subject":"数学","answer_state":"present","student_answer":"%d"}]`,
+					i, i+1,
+				), nil
 			}
 		}
+		return "", fmt.Errorf("missing segment identity")
 	}
-	for x := bounds.Min.X; x < bounds.Max.X; x += 48 {
-		for dx := 0; dx < 2 && x+dx < bounds.Max.X; dx++ {
-			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-				img.SetRGBA(x+dx, y, ink)
-			}
-		}
-	}
-}
 
-// 真实空白练习卷经过客户端压缩后是 936x1280。旧的 1600px 高度门会把它整页交给
-// glm-4v-flash，密集题目的 JSON 在单次输出上限处截断；这个尺寸仍应走纵向分片。
-func TestBUG20260715_LowResolutionDenseWorksheetSplits(t *testing.T) {
-	raw := encodeWorksheetJPEG(t, 936, 1280)
-
-	segments, ok := splitDenseWorksheetImage(raw)
-	if !ok {
-		t.Fatal("936x1280 portrait worksheet was not split")
-	}
-	if got := len(segments); got != len(denseWorksheetRanges) {
-		t.Fatalf("segments = %d, want %d", got, len(denseWorksheetRanges))
-	}
-	for i, segment := range segments {
-		cfg, _, err := image.DecodeConfig(bytes.NewReader(segment.image))
-		if err != nil {
-			t.Fatalf("segment %d decode config: %v", i+1, err)
-		}
-		if cfg.Width != 936 || cfg.Height >= 1280 {
-			t.Fatalf("segment %d was not a real crop: %dx%d", i+1, cfg.Width, cfg.Height)
-		}
-	}
-}
-
-// 降低高度门不能把任意手机小图都放大成 5 次模型请求：低分辨率分支同时要求
-// 足够的宽、高和作业纸常见的纵向比例；原有 >=1600px 的长图规则保持不变。
-func TestBUG20260715_OrdinarySmallImagesDoNotSplit(t *testing.T) {
-	tests := []struct {
-		name          string
-		width, height int
-	}{
-		{name: "height below low-resolution floor", width: 800, height: 1199},
-		{name: "narrow phone crop", width: 720, height: 1280},
-		{name: "near square screenshot", width: 936, height: 1200},
-		{name: "landscape photo", width: 1280, height: 936},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if segments, ok := splitDenseWorksheetImage(encodeWorksheetJPEG(t, tt.width, tt.height)); ok {
-				t.Fatalf("%dx%d unexpectedly split into %d segments", tt.width, tt.height, len(segments))
-			}
-		})
-	}
-}
-
-func encodeWorksheetJPEG(t *testing.T, width, height int) []byte {
-	t.Helper()
-	img := image.NewRGBA(image.Rect(0, 0, width, height))
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			img.Set(x, y, color.White)
-		}
-	}
-	var encoded bytes.Buffer
-	if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: 80}); err != nil {
+	questions, err := NewRecognizerAdapter(vision).Recognize(
+		context.Background(),
+		denseWorksheetTestImage(t, 1000, 1800),
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return encoded.Bytes()
+	wantCalls := int32(len(denseWorksheetRanges) + 1)
+	if calls.Load() != wantCalls {
+		t.Fatalf("dense worksheet core calls=%d want=%d", calls.Load(), wantCalls)
+	}
+	if maxInFlight.Load() != wantCalls {
+		t.Fatalf("five segments plus printed inventory should run in one latency wave, max concurrency=%d want=%d",
+			maxInFlight.Load(), wantCalls)
+	}
+	if len(questions) != len(denseWorksheetRanges) {
+		t.Fatalf("dense worksheet questions=%d want=%d: %#v", len(questions), len(denseWorksheetRanges), questions)
+	}
+	for i, question := range questions {
+		if question.AnswerState != usecase.AnswerStatePresent || question.BBox != nil {
+			t.Fatalf("question %d violated core recognition contract: %#v", i+1, question)
+		}
+	}
+}
+
+func TestDenseWorksheetPrintedInventoryRepairsQuestionWhenEverySegmentElidesFraction(t *testing.T) {
+	var calls atomic.Int32
+	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
+		calls.Add(1)
+		switch {
+		case strings.Contains(prompt, "整页印刷题清单"):
+			return `[
+				{"question":"4.7+2.3=","subject":"数学"},
+				{"question":"1.8×50=","subject":"数学"},
+				{"question":"5/7−1/5=","subject":"数学"}
+			]`, nil
+		case strings.Contains(prompt, "纵向分片 1/5"), strings.Contains(prompt, "纵向分片 2/5"):
+			return `[
+				{"question":"4.7+2.3=","answer_state":"present","student_answer":"7"},
+				{"question":"1.8×50=","answer_state":"present","student_answer":"90"},
+				{"question":"5−1/5=","answer_state":"present","student_answer":"24/5"}
+			]`, nil
+		default:
+			return `[]`, nil
+		}
+	}
+
+	questions, err := NewRecognizerAdapter(vision).Recognize(
+		context.Background(),
+		denseWorksheetTestImage(t, 1000, 1800),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != int32(len(denseWorksheetRanges)+1) {
+		t.Fatalf("dense worksheet inventory was not a fixed sixth call: calls=%d", calls.Load())
+	}
+	var repaired usecase.RecognizedQuestion
+	for _, question := range questions {
+		if recognizedQuestionKey(question.Question) == recognizedQuestionKey("5/7−1/5=") {
+			repaired = question
+			break
+		}
+	}
+	if repaired.Question == "" {
+		t.Fatalf("printed inventory did not restore the complete fraction question: %#v", questions)
+	}
+	if repaired.AnswerState != usecase.AnswerStateUnclear || repaired.StudentAnswer != "" {
+		t.Fatalf("answer generated under the corrupted question context was not failed closed: %#v", repaired)
+	}
+}
+
+func TestDenseWorksheetOverlapDeduplicatesCanonicalMathGlyphs(t *testing.T) {
+	var calls atomic.Int32
+	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
+		calls.Add(1)
+		switch {
+		case strings.Contains(prompt, "纵向分片 1/5"):
+			return `[{"question":"4.7+2.3=","answer_state":"present","student_answer":"7"}]`, nil
+		case strings.Contains(prompt, "纵向分片 2/5"):
+			return `[{"question":"４．７＋２．３＝","answer_state":"present","student_answer":"７"}]`, nil
+		default:
+			return `[]`, nil
+		}
+	}
+	questions, err := NewRecognizerAdapter(vision).Recognize(
+		context.Background(),
+		denseWorksheetTestImage(t, 1000, 1800),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 6 {
+		t.Fatalf("calls=%d want=6", calls.Load())
+	}
+	if len(questions) != 1 {
+		t.Fatalf("overlap glyph variants were not deduplicated: %#v", questions)
+	}
+}
+
+func TestDenseWorksheetLowResolutionStillUsesFixedFiveSegments(t *testing.T) {
+	segments, ok := splitDenseWorksheetImage(denseWorksheetTestImage(t, 800, 1200))
+	if !ok || len(segments) != len(denseWorksheetRanges) {
+		t.Fatalf("low-resolution portrait worksheet split=%t segments=%d", ok, len(segments))
+	}
+}
+
+func TestDenseWorksheetRangesDoNotTrapAQuestionBetweenAdjacentCrops(t *testing.T) {
+	// A multi-line arithmetic item plus its handwriting commonly occupies about 10% of the page.
+	// Reserve 12% so any such semantic block is fully visible in at least one crop, instead of being
+	// clipped at the bottom of one segment and treated as an edge fragment at the top of the next.
+	const step = 0.001
+	for start := 0.0; start <= 1-denseWorksheetSemanticBlockFraction+1e-9; start += step {
+		end := start + denseWorksheetSemanticBlockFraction
+		covered := false
+		for _, pageRange := range denseWorksheetRanges {
+			if start+1e-9 >= pageRange[0] && end <= pageRange[1]+1e-9 {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			t.Fatalf("semantic block %.3f..%.3f is trapped between dense worksheet crops: %v",
+				start, end, denseWorksheetRanges)
+		}
+	}
+}
+
+func TestDenseWorksheetSegmentsPreserveDecodedPixelsLosslessly(t *testing.T) {
+	raw := denseWorksheetTestImage(t, 1000, 1800)
+	original, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	segments, ok := splitDenseWorksheetImage(raw)
+	if !ok || len(segments) == 0 {
+		t.Fatal("dense worksheet was not split")
+	}
+	cropped, _, err := image.Decode(bytes.NewReader(segments[0].image))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBounds := image.Rect(
+		0,
+		0,
+		original.Bounds().Dx(),
+		int(math.Ceil(float64(original.Bounds().Dy())*denseWorksheetRanges[0][1])),
+	)
+	if cropped.Bounds() != wantBounds {
+		t.Fatalf("first crop bounds=%v want=%v", cropped.Bounds(), wantBounds)
+	}
+	for y := 0; y < cropped.Bounds().Dy(); y += 11 {
+		for x := 0; x < cropped.Bounds().Dx(); x += 13 {
+			wantR, wantG, wantB, wantA := original.At(original.Bounds().Min.X+x, original.Bounds().Min.Y+y).RGBA()
+			gotR, gotG, gotB, gotA := cropped.At(x, y).RGBA()
+			if gotR != wantR || gotG != wantG || gotB != wantB || gotA != wantA {
+				t.Fatalf("OCR crop changed decoded pixel at (%d,%d): got=(%d,%d,%d,%d) want=(%d,%d,%d,%d)",
+					x, y, gotR, gotG, gotB, gotA, wantR, wantG, wantB, wantA)
+			}
+		}
+	}
+}
+
+func TestReconcileAdjacentSegmentOCRVariants_PrefersCompleteFractionObservation(t *testing.T) {
+	left := []usecase.RecognizedQuestion{
+		{Question: "4.7+2.3=", AnswerState: usecase.AnswerStatePresent, StudentAnswer: "7"},
+		{Question: "1.8×50=", AnswerState: usecase.AnswerStatePresent, StudentAnswer: "90"},
+		{Question: "5−1/5=", AnswerState: usecase.AnswerStatePresent, StudentAnswer: "24/5"},
+	}
+	right := []usecase.RecognizedQuestion{
+		{Question: "4.7＋2.3＝", AnswerState: usecase.AnswerStatePresent, StudentAnswer: "7"},
+		{Question: "1.8×50=", AnswerState: usecase.AnswerStatePresent, StudentAnswer: "90"},
+		{Question: "5/7−1/5=", AnswerState: usecase.AnswerStatePresent, StudentAnswer: "18/35"},
+	}
+
+	reconcileAdjacentSegmentOCRVariants(left, right)
+	merged := mergeRecognizedQuestions(left, right)
+	if len(merged) != 3 {
+		t.Fatalf("adjacent OCR variants were not reconciled: %#v", merged)
+	}
+	var fraction usecase.RecognizedQuestion
+	for _, question := range merged {
+		if recognizedQuestionKey(question.Question) == recognizedQuestionKey("5/7−1/5=") {
+			fraction = question
+			break
+		}
+	}
+	if fraction.Question == "" {
+		t.Fatalf("complete fraction question was lost: %#v", merged)
+	}
+	if recognizedQuestionKey(fraction.StudentAnswer) != recognizedQuestionKey("18/35") {
+		t.Fatalf("answer from the complete observation was not preserved: %#v", fraction)
+	}
+}
+
+func TestReconcileAdjacentSegmentOCRVariants_RequiresSharedNeighborConsensus(t *testing.T) {
+	left := []usecase.RecognizedQuestion{
+		{Question: "5−1/5=", AnswerState: usecase.AnswerStatePresent, StudentAnswer: "24/5"},
+	}
+	right := []usecase.RecognizedQuestion{
+		{Question: "5/7−1/5=", AnswerState: usecase.AnswerStatePresent, StudentAnswer: "18/35"},
+	}
+
+	reconcileAdjacentSegmentOCRVariants(left, right)
+	merged := mergeRecognizedQuestions(left, right)
+	if len(merged) != 2 {
+		t.Fatalf("unanchored fuzzy variants must remain separate: %#v", merged)
+	}
+}
+
+func TestReconcileAdjacentSegmentOCRVariants_DoesNotCollapseQuestionsSeenTogether(t *testing.T) {
+	left := []usecase.RecognizedQuestion{
+		{Question: "4.7+2.3=", AnswerState: usecase.AnswerStatePresent, StudentAnswer: "7"},
+		{Question: "1.8×50=", AnswerState: usecase.AnswerStatePresent, StudentAnswer: "90"},
+		{Question: "5−1/5=", AnswerState: usecase.AnswerStatePresent, StudentAnswer: "24/5"},
+		{Question: "5/7−1/5=", AnswerState: usecase.AnswerStatePresent, StudentAnswer: "18/35"},
+	}
+	right := append([]usecase.RecognizedQuestion(nil), left...)
+
+	reconcileAdjacentSegmentOCRVariants(left, right)
+	merged := mergeRecognizedQuestions(left, right)
+	if len(merged) != 4 {
+		t.Fatalf("questions independently distinguished in one view must remain separate: %#v", merged)
+	}
+	seen := map[string]int{}
+	for _, question := range merged {
+		seen[recognizedQuestionKey(question.Question)]++
+	}
+	if seen[recognizedQuestionKey("5−1/5=")] == 0 || seen[recognizedQuestionKey("5/7−1/5=")] == 0 {
+		t.Fatalf("one of the independently observed questions was rewritten away: %#v", merged)
+	}
+}
+
+func TestSmallImageUsesOneCoreCall(t *testing.T) {
+	var calls atomic.Int32
+	vision := func(context.Context, []byte, string) (string, error) {
+		calls.Add(1)
+		return `[{"question":"1+1=","answer_state":"blank","student_answer":""}]`, nil
+	}
+	questions, err := NewRecognizerAdapter(vision).Recognize(
+		context.Background(),
+		denseWorksheetTestImage(t, 640, 480),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 || len(questions) != 1 {
+		t.Fatalf("small image calls=%d questions=%#v", calls.Load(), questions)
+	}
+}
+
+func TestDenseWorksheetRetriesOnlyTransientFailedSegments(t *testing.T) {
+	var calls atomic.Int32
+	var segmentCalls [5]atomic.Int32
+	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
+		calls.Add(1)
+		segment := denseWorksheetPromptSegment(t, prompt)
+		if segment == 0 {
+			return `[]`, nil
+		}
+		attempt := segmentCalls[segment-1].Add(1)
+		if segment == 3 && attempt == 1 {
+			return "", &llm.ProviderError{
+				Provider:   "openai",
+				StatusCode: http.StatusBadGateway,
+				Status:     "502 Bad Gateway",
+			}
+		}
+		return fmt.Sprintf(
+			`[{"question":"%d+1=","answer_state":"present","student_answer":"%d"}]`,
+			segment, segment+1,
+		), nil
+	}
+	questions, err := NewRecognizerAdapter(vision).Recognize(
+		context.Background(),
+		denseWorksheetTestImage(t, 1000, 1800),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 7 {
+		t.Fatalf("only the failed segment should be retried after six base units, calls=%d want=7", calls.Load())
+	}
+	for i := range segmentCalls {
+		want := int32(1)
+		if i == 2 {
+			want = 2
+		}
+		if got := segmentCalls[i].Load(); got != want {
+			t.Fatalf("segment %d calls=%d want=%d", i+1, got, want)
+		}
+	}
+	if len(questions) != len(denseWorksheetRanges) {
+		t.Fatalf("questions=%d want=%d: %#v", len(questions), len(denseWorksheetRanges), questions)
+	}
+}
+
+func TestDenseWorksheetTransientRetryWaveCapsConcurrency(t *testing.T) {
+	var calls atomic.Int32
+	var segmentCalls [5]atomic.Int32
+	var retryInFlight atomic.Int32
+	var maxRetryInFlight atomic.Int32
+	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
+		calls.Add(1)
+		segment := denseWorksheetPromptSegment(t, prompt)
+		if segment == 0 {
+			return `[]`, nil
+		}
+		attempt := segmentCalls[segment-1].Add(1)
+		if segment >= 2 && segment <= 4 && attempt == 1 {
+			return "", &llm.ProviderError{
+				Provider:   "openai",
+				StatusCode: http.StatusServiceUnavailable,
+				Status:     "503 Service Unavailable",
+			}
+		}
+		if attempt == 2 {
+			current := retryInFlight.Add(1)
+			defer retryInFlight.Add(-1)
+			for {
+				previous := maxRetryInFlight.Load()
+				if current <= previous || maxRetryInFlight.CompareAndSwap(previous, current) {
+					break
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return `[]`, nil
+	}
+	if _, err := NewRecognizerAdapter(vision).Recognize(
+		context.Background(),
+		denseWorksheetTestImage(t, 1000, 1800),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 9 {
+		t.Fatalf("six base calls plus three failed-segment retries expected, calls=%d", calls.Load())
+	}
+	if got := maxRetryInFlight.Load(); got != denseWorksheetRetryMaxConcurrency {
+		t.Fatalf("retry wave concurrency=%d want=%d", got, denseWorksheetRetryMaxConcurrency)
+	}
+}
+
+func TestDenseWorksheetPermanentProviderFailureIsNotRetried(t *testing.T) {
+	var calls atomic.Int32
+	var failedSegmentCalls atomic.Int32
+	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
+		calls.Add(1)
+		if strings.Contains(prompt, "纵向分片 3/5") {
+			failedSegmentCalls.Add(1)
+			return "", &llm.ProviderError{
+				Provider:   "openai",
+				StatusCode: http.StatusUnauthorized,
+				Status:     "401 Unauthorized",
+			}
+		}
+		return `[]`, nil
+	}
+	_, err := NewRecognizerAdapter(vision).Recognize(
+		context.Background(),
+		denseWorksheetTestImage(t, 1000, 1800),
+	)
+	if err == nil {
+		t.Fatal("expected provider error")
+	}
+	if calls.Load() != 6 || failedSegmentCalls.Load() != 1 {
+		t.Fatalf("permanent failure must not be retried, calls=%d failed_segment_calls=%d",
+			calls.Load(), failedSegmentCalls.Load())
+	}
+}
+
+func TestDenseWorksheetTransientFailureStopsAfterOneRetry(t *testing.T) {
+	var calls atomic.Int32
+	var failedSegmentCalls atomic.Int32
+	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
+		calls.Add(1)
+		if strings.Contains(prompt, "纵向分片 3/5") {
+			failedSegmentCalls.Add(1)
+			return "", &llm.ProviderError{
+				Provider:   "openai",
+				StatusCode: http.StatusBadGateway,
+				Status:     "502 Bad Gateway",
+			}
+		}
+		return `[]`, nil
+	}
+	_, err := NewRecognizerAdapter(vision).Recognize(
+		context.Background(),
+		denseWorksheetTestImage(t, 1000, 1800),
+	)
+	if err == nil {
+		t.Fatal("expected provider error after bounded retry")
+	}
+	if calls.Load() != 7 || failedSegmentCalls.Load() != 2 {
+		t.Fatalf("transient failure must get exactly one segment retry, calls=%d failed_segment_calls=%d",
+			calls.Load(), failedSegmentCalls.Load())
+	}
+	var providerErr *llm.ProviderError
+	if !errors.As(err, &providerErr) || providerErr.StatusCode != http.StatusBadGateway {
+		t.Fatalf("final error lost structured provider cause: %T %v", err, err)
+	}
+}
+
+func TestDenseWorksheetParseFailureIsNotRetried(t *testing.T) {
+	var calls atomic.Int32
+	var failedSegmentCalls atomic.Int32
+	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
+		calls.Add(1)
+		if strings.Contains(prompt, "纵向分片 3/5") {
+			failedSegmentCalls.Add(1)
+			// The malformed model payload deliberately contains a transient-looking word.
+			// Retry eligibility comes from the failed operation type, not arbitrary output text.
+			return `timeout while formatting {"not":"an array"}`, nil
+		}
+		return `[]`, nil
+	}
+	_, err := NewRecognizerAdapter(vision).Recognize(
+		context.Background(),
+		denseWorksheetTestImage(t, 1000, 1800),
+	)
+	if err == nil {
+		t.Fatal("expected parse error")
+	}
+	if calls.Load() != 6 || failedSegmentCalls.Load() != 1 {
+		t.Fatalf("model contract/parse errors must not be retried, calls=%d failed_segment_calls=%d",
+			calls.Load(), failedSegmentCalls.Load())
+	}
+}
+
+func TestIsTransientVisionError(t *testing.T) {
+	for _, status := range []int{
+		http.StatusRequestTimeout,
+		http.StatusTooEarly,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	} {
+		err := &llm.ProviderError{Provider: "openai", StatusCode: status, Status: http.StatusText(status)}
+		if !isTransientVisionError(context.Background(), err) {
+			t.Errorf("status %d should be transient", status)
+		}
+	}
+	for _, status := range []int{
+		http.StatusBadRequest,
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusUnprocessableEntity,
+	} {
+		err := &llm.ProviderError{Provider: "openai", StatusCode: status, Status: http.StatusText(status)}
+		if isTransientVisionError(context.Background(), err) {
+			t.Errorf("status %d must not be transient", status)
+		}
+	}
+	if isTransientVisionError(context.Background(), context.Canceled) {
+		t.Error("user cancellation must not be retried")
+	}
+	if !isTransientVisionError(context.Background(), context.DeadlineExceeded) {
+		t.Error("an upstream child deadline with a live parent context should be retryable")
+	}
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	if isTransientVisionError(expired, context.DeadlineExceeded) {
+		t.Error("an expired parent context must not be retried")
+	}
+	if isTransientVisionError(context.Background(), errors.New("solver computed 500 items")) {
+		t.Error("an unrelated number must not be classified as an HTTP 500")
+	}
+}
+
+func denseWorksheetPromptSegment(t *testing.T, prompt string) int {
+	t.Helper()
+	if strings.Contains(prompt, "整页印刷题清单") {
+		return 0
+	}
+	for i := 1; i <= len(denseWorksheetRanges); i++ {
+		if strings.Contains(prompt, fmt.Sprintf("纵向分片 %d/%d", i, len(denseWorksheetRanges))) {
+			return i
+		}
+	}
+	t.Fatalf("prompt is missing a dense worksheet segment identity: %.160s", prompt)
+	return 0
+}
+
+func denseWorksheetTestImage(t *testing.T, width, height int) []byte {
+	t.Helper()
+	src := image.NewRGBA(image.Rect(0, 0, width, height))
+	draw.Draw(src, src.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+	for y := 30; y < height-20; y += 70 {
+		draw.Draw(src, image.Rect(20, y, width-20, min(height, y+4)), image.NewUniform(color.Black), image.Point{}, draw.Src)
+	}
+	var out bytes.Buffer
+	if err := jpeg.Encode(&out, src, &jpeg.Options{Quality: 90}); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
 }

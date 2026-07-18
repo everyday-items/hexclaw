@@ -4,19 +4,24 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
-	"image/jpeg"
-	_ "image/png"
 	"math"
+	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
+	"time"
+	"unicode"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // VisionFunc 把图片 + 提示词发给视觉模型返回文本。
@@ -33,45 +38,106 @@ func NewRecognizerAdapter(v VisionFunc) *RecognizerAdapter { return &RecognizerA
 
 var _ usecase.Recognizer = (*RecognizerAdapter)(nil)
 
-const recognizePrompt = `识别这张作业图片里的所有题目，并逐题回收孩子的手写作答内容、判定题目学科、定位作答区域。严格输出 JSON 数组，每个元素形如：
-{"question": "完整题干", "subject": "数学", "knowledge_points": ["知识点1"], "student_answer": "孩子写在题目上的作答（含算式/答案/涂改）", "bbox": {"x": 0.12, "y": 0.34, "w": 0.18, "h": 0.05}}
+const recognizePrompt = `识别这张作业图片里的所有题目，并逐题回收孩子的手写作答事实、判定题目学科。严格输出 JSON 数组，每个元素形如：
+{"question":"完整题干","subject":"数学","knowledge_points":["知识点1"],"answer_state":"present","student_answer":"孩子实际写下且能可靠辨认的作答"}
 关键规则：
+- 每个独立作答的小题必须对应一个 JSON 元素：即使多个口算、填空或选择小题横排在同一行，也要逐小题拆开，不能合并成一个大题/整行元素；章节标题不能当作题目。
 - subject 逐题判定题目学科，只能取以下之一：数学 / 语文 / 英语 / 物理 / 化学；确实判不出学科时才留空字符串 ""。
 - question 题干只抄印刷体/原题内容，绝不能把铅笔、黑笔等手写墨迹拼进题干；student_answer 只如实誊录图中孩子**已经写下**的手写作答（包括紧跟在印刷等号后的数字）。例如印刷题是“4÷0.5=”且等号后手写“8”，必须让 question 写 "4÷0.5="、student_answer 写 "8"，不能把 question 写成“4÷0.5=8”。
-- 只有确实完全没有手写作答的题，student_answer 才留空字符串 ""；绝不替孩子编造答案。印刷题干中本身带数字、选项或等号，不算 student_answer。
-- bbox 是这道题**学生作答区域**在整张图里的归一化边界框，用于在原图上标注对/错：x,y 是框左上角、w,h 是框宽高，四个值都必须是 0 到 1 之间的小数（相对整图宽/高的比例），且 x+w、y+h 不超过 1。定位不准或看不清作答位置时，把 bbox 整个字段省略（宁可不给，绝不给错位的框）。
+- answer_state 只能是 blank / present / unclear：
+  - blank：可以确认没有任何学生作答，student_answer 必须为 ""；
+  - present：可以确认存在作答且能可靠誊录，student_answer 必须是实际可见内容；
+  - unclear：可以确认有笔迹、涂改或答案区域，但无法可靠辨认，student_answer 必须为 ""。
+- “无法辨认”“有涂改”“看不清”“未作答”等是状态说明，绝不能写进 student_answer。
+- 本阶段不输出 bbox；作答坐标由后续独立批量证据阶段处理，避免可选图片增强阻塞核心识题。
 - 只输出 JSON，不要任何解释文字。`
 
-// bboxDTO 解析视觉模型返回的归一化边界框。指针字段——视觉模型省略 bbox 时为 nil（降级不叠加）。
-type bboxDTO struct {
-	X float64 `json:"x"`
-	Y float64 `json:"y"`
-	W float64 `json:"w"`
-	H float64 `json:"h"`
-}
+const printedQuestionInventoryPrompt = `这是“整页印刷题清单”识别，不是批改，也不要读取或推测学生答案。
+请按页面从上到下、同一行从左到右，逐小题准确抄录所有印刷体题干；横排口算必须逐题拆开，章节标题不能算题目。
+关键规则：
+- question 只允许包含印刷体原题，忽略铅笔、黑笔、涂改和手写等号右侧内容；
+- 分数的分子、分母和横线必须完整保留；看见 5/7−1/5 不能漏成 5−1/5；
+- 小数点、运算符、单位、括号和题号必须按图抄录，不能用数学常识改写；
+- subject 只能取 数学 / 语文 / 英语 / 物理 / 化学，无法判断时留空；
+- knowledge_points 只填写从印刷题干可确定的知识点。
+严格只输出紧凑 JSON 数组，每个对象仅含 question、subject、knowledge_points，不要输出 student_answer、answer_state、bbox 或解释。`
 
 // recognizedDTO 解析视觉模型 JSON 用（带 json tag）。
 type recognizedDTO struct {
 	Question        string   `json:"question"`
 	Subject         string   `json:"subject"`
 	KnowledgePoints []string `json:"knowledge_points"`
+	AnswerState     string   `json:"answer_state"`
 	StudentAnswer   string   `json:"student_answer"`
-	BBox            *bboxDTO `json:"bbox"`
 }
 
 // invalidJSONEscape 匹配 JSON 字符串中的非法转义（\x 且 x ∉ "\/bfnrtu）——视觉模型在题干里
 // 输出 LaTeX（\div 等）时 \d 会让 json.Unmarshal 直接失败（BUG-20260712-U 真机取证）。
-var invalidJSONEscape = regexp.MustCompile(`\\([^"\\/bfnrtu])`)
+var latexJSONCommandEscape = regexp.MustCompile(`\\(?:times|div|cdot|pm|mp|leq|geq|neq|le|ge|ne|approx|infty|pi|degree|sqrt|frac|text|mathrm|mathbf|mathit|mathsf|mathtt|operatorname)\b`)
 var sectionHeading = regexp.MustCompile(`^[一二三四五六七八九十]+[、.．]\s*[^?？=]{0,20}(?:题|得数|计算|解方程|简算)$`)
 var leadingChineseQuestionNumber = regexp.MustCompile(`^\s*\d+\s*、\s*`)
-var leadingDottedQuestionNumber = regexp.MustCompile(`^\s*\d+\s*[.．]\s+`)
 
-// sanitizeModelJSON 让模型产出的 JSON 可安全解析：
-//  1. 数学命令降级（复用 adapter.NormalizeMathText：\times→× 等，题干顺带变家长可读）；
-//  2. 剩余非法转义加倍（\x → \\x），未知反斜杠永不再炸解析。
+// A full-width dot is unambiguously Chinese list punctuation and models often omit the following
+// space ("2．题目"). An ASCII dot without whitespace may instead be a decimal operand ("2.5+1"),
+// so only strip that form when whitespace proves it is a question number.
+var leadingDottedQuestionNumber = regexp.MustCompile(`^\s*\d+\s*(?:．\s*|\.\s+)`)
+var explicitQuestionNumber = regexp.MustCompile(`^\s*(\d+)\s*[、.．]`)
+var recognizedArabicFraction = regexp.MustCompile(`\d+\s*/\s*\d+`)
+var recognizedChineseFraction = regexp.MustCompile(`[零〇一二两三四五六七八九十百]+\s*分之\s*[零〇一二两三四五六七八九十百]+`)
+var unreadableAnswerDescription = regexp.MustCompile(`(?i)(无可辨认|无法辨认|不能辨认|辨认不清|无法识别|未能识别|看不清|不可读|字迹模糊|答案模糊|no discernible answer|unreadable|illegible|cannot read|not legible)`)
+var blankAnswerDescription = regexp.MustCompile(`(?i)^(未作答|没有作答|无作答|空白|未填写|no answer|blank|unanswered)[。.!！]?$`)
+
+// sanitizeModelJSON 只修复模型在 JSON 字符串值中输出的 LaTeX/非法反斜杠转义。
+// 绝不能在反序列化前把整段 JSON 当数学文本规范化：那会改写 bbox_1000 等协议键。
+// 数学文本必须在字段反序列化后逐字段规范化。
 func sanitizeModelJSON(s string) string {
-	s = adapter.NormalizeMathText(s)
-	return invalidJSONEscape.ReplaceAllString(s, `\\$1`)
+	var out strings.Builder
+	out.Grow(len(s) + 16)
+	inString := false
+	for i := 0; i < len(s); i++ {
+		char := s[i]
+		if !inString {
+			out.WriteByte(char)
+			if char == '"' {
+				inString = true
+			}
+			continue
+		}
+		if char == '"' {
+			out.WriteByte(char)
+			inString = false
+			continue
+		}
+		if char != '\\' {
+			out.WriteByte(char)
+			continue
+		}
+
+		// \times、\text、\frac、\ne 等分别以 JSON 的合法 \t/\f/\n 开头；如果不先保护，
+		// json.Unmarshal 会把它们吞成制表符/换页符/换行，字段级数学规范化已无法恢复。
+		if match := latexJSONCommandEscape.FindStringIndex(s[i:]); match != nil && match[0] == 0 {
+			command := s[i : i+match[1]]
+			out.WriteByte('\\')
+			out.WriteString(command)
+			i += len(command) - 1
+			continue
+		}
+
+		if i+1 >= len(s) {
+			out.WriteByte('\\')
+			continue
+		}
+		next := s[i+1]
+		if strings.ContainsRune(`"\/bfnrtu`, rune(next)) {
+			out.WriteByte('\\')
+			out.WriteByte(next)
+			i++
+			continue
+		}
+		// 未知 \x 变成 JSON 字符串中的字面反斜杠：\\x。
+		out.WriteString(`\\`)
+	}
+	return out.String()
 }
 
 // recognizedSubjects 是识题允许回填的学科白名单——视觉模型判定越界（返回未知词/编造）时归零，
@@ -89,37 +155,7 @@ func normalizeRecognizedSubject(s string) string {
 	return ""
 }
 
-// bboxEpsilon 容忍视觉模型归一化时的极小浮点误差（右/下边界略超 1 视为贴边，不算越界）。
-const bboxEpsilon = 0.005
-
-// normalizeBBox 是原图批改的**硬性诚实门**（设计文档 §6）：只放行合法归一化框，其余一律 nil。
-//
-// 合法 = 四值皆非负、x/y 在 [0,1]、w/h 严格 >0、右下角 x+w、y+h 不越界（含极小误差容忍）。
-// 缺失（模型省略）、零框（{0,0,0,0}）、负值、越界、NaN/Inf 全部降级为 nil——
-// 该题走纯文字批改，前端绝不叠加错位红叉（错位比不标更糟）。
-func normalizeBBox(b *bboxDTO) *usecase.BBox {
-	if b == nil {
-		return nil
-	}
-	// NaN/Inf 防护：NaN 的任何比较都为 false，会漏过下面的区间校验，显式拦掉。
-	if math.IsNaN(b.X) || math.IsNaN(b.Y) || math.IsNaN(b.W) || math.IsNaN(b.H) ||
-		math.IsInf(b.X, 0) || math.IsInf(b.Y, 0) || math.IsInf(b.W, 0) || math.IsInf(b.H, 0) {
-		return nil
-	}
-	if b.W <= 0 || b.H <= 0 { // 零/负宽高 → 不是可叠加的框
-		return nil
-	}
-	if b.X < 0 || b.Y < 0 || b.X > 1 || b.Y > 1 { // 左上角出界
-		return nil
-	}
-	if b.X+b.W > 1+bboxEpsilon || b.Y+b.H > 1+bboxEpsilon { // 右下角越界
-		return nil
-	}
-	return &usecase.BBox{X: b.X, Y: b.Y, W: b.W, H: b.H}
-}
-
 // Recognize 识题：调视觉模型 → 解析 JSON → 结构化题目值对象。
-
 func (a *RecognizerAdapter) Recognize(ctx context.Context, image []byte) ([]usecase.RecognizedQuestion, error) {
 	if a.vision == nil {
 		return nil, fmt.Errorf("recognizer: 未配置视觉模型")
@@ -127,26 +163,20 @@ func (a *RecognizerAdapter) Recognize(ctx context.Context, image []byte) ([]usec
 	if len(image) == 0 {
 		return nil, fmt.Errorf("recognizer: 空图片")
 	}
-	// 密集长作业不能整页只调一次视觉模型：glm-4v-flash 等模型的输出上限会把几十道题的
-	// JSON 截断。长图先切成 5 个有重叠的纵向分片，并发识别后把 bbox 映射回整图坐标。
-	// 非长图、无法解码的历史/测试载荷仍走原单请求路径，不扩大行为面。
+	// 密集长作业按固定的页面几何切成 5 个重叠纵向分片，并追加 1 个整页印刷题清单
+	// 单元；六者同波并行。清单负责题干完整性，分片负责手写候选，图片坐标仍属于独立的
+	// AnswerAnchorer 第二阶段。明确的瞬时上游错误只低并发重试失败单元一次。
 	if segments, ok := splitDenseWorksheetImage(image); ok {
-		questions, err := a.recognizeSegments(ctx, segments)
-		if err != nil {
-			return nil, err
-		}
-		// 分片 bbox 必须先映射回原图并完成跨片合并，再用原图做一次语义核验。
-		return a.verifyRecognizedBBoxes(ctx, image, questions), nil
+		segments = append(segments, worksheetSegment{
+			image: image, index: 0, total: len(segments), printedInventory: true,
+		})
+		return a.recognizeSegments(ctx, segments)
 	}
 	raw, err := a.vision(ctx, image, recognizePrompt)
 	if err != nil {
 		return nil, fmt.Errorf("recognizer: 视觉模型调用失败: %w", err)
 	}
-	questions, err := parseRecognizedQuestions(raw)
-	if err != nil {
-		return nil, err
-	}
-	return a.verifyRecognizedBBoxes(ctx, image, questions), nil
+	return parseRecognizedQuestions(raw)
 }
 
 func parseRecognizedQuestions(raw string) ([]usecase.RecognizedQuestion, error) {
@@ -156,86 +186,118 @@ func parseRecognizedQuestions(raw string) ([]usecase.RecognizedQuestion, error) 
 	}
 	out := make([]usecase.RecognizedQuestion, 0, len(dtos))
 	for _, d := range dtos {
-		question := strings.TrimSpace(d.Question)
+		question := strings.TrimSpace(adapter.NormalizeMathText(d.Question))
 		if question == "" || sectionHeading.MatchString(question) || likelyCroppedFragment(question) {
 			continue
 		}
-		bbox := normalizeBBox(d.BBox)
+		answerState, studentAnswer := normalizeRecognizedAnswer(d.AnswerState, d.StudentAnswer)
 		out = append(out, usecase.RecognizedQuestion{
 			Question:        question,
 			KnowledgePoints: d.KnowledgePoints,
-			StudentAnswer:   strings.TrimSpace(d.StudentAnswer),
+			AnswerState:     answerState,
+			StudentAnswer:   studentAnswer,
 			Subject:         normalizeRecognizedSubject(d.Subject),
-			BBox:            bbox,
 		})
 	}
 	return mergeRecognizedQuestions(nil, out), nil
 }
 
-type worksheetSegment struct {
-	image  []byte
-	index  int
-	total  int
-	startY float64
-	endY   float64
-}
-
-var denseWorksheetRanges = [][2]float64{
-	{0.00, 0.24},
-	{0.18, 0.44},
-	{0.38, 0.64},
-	{0.58, 0.84},
-	{0.68, 1.00},
-}
-
-var horizontalZoomRanges = [][2]float64{
-	{0.00, 0.42},
-	{0.29, 0.71},
-	{0.58, 1.00},
-}
-
-// A dense page may contain more than one horizontal arithmetic section, but zooming every vertical
-// segment would multiply provider traffic dramatically. Pick eligible segments in page order and cap
-// the optional enhancement at two segments × three zoom crops = six vision calls per page.
-const maxHorizontalZoomSegmentsPerPage = 2
-
-type worksheetHorizontalZoom struct {
-	image        []byte
-	index        int
-	total        int
-	startX, endX float64
-}
-
-func splitHorizontalZooms(raw []byte) ([]worksheetHorizontalZoom, bool) {
-	src, _, err := image.Decode(bytes.NewReader(raw))
-	if err != nil {
-		return nil, false
+func parsePrintedQuestionInventory(raw string) ([]usecase.RecognizedQuestion, error) {
+	var dtos []recognizedDTO
+	if err := json.Unmarshal([]byte(sanitizeModelJSON(extractJSON(raw))), &dtos); err != nil {
+		return nil, fmt.Errorf("recognizer: 解析印刷题清单失败: %w（原始: %.120s）", err, raw)
 	}
-	bounds := src.Bounds()
-	zooms := make([]worksheetHorizontalZoom, 0, len(horizontalZoomRanges))
-	for i, r := range horizontalZoomRanges {
-		x0 := bounds.Min.X + int(math.Floor(float64(bounds.Dx())*r[0]))
-		x1 := bounds.Min.X + int(math.Ceil(float64(bounds.Dx())*r[1]))
-		if x1 > bounds.Max.X {
-			x1 = bounds.Max.X
+	out := make([]usecase.RecognizedQuestion, 0, len(dtos))
+	for _, dto := range dtos {
+		question := strings.TrimSpace(adapter.NormalizeMathText(dto.Question))
+		if question == "" || sectionHeading.MatchString(question) || likelyCroppedFragment(question) {
+			continue
 		}
-		if x1 <= x0 {
-			return nil, false
-		}
-		dst := image.NewRGBA(image.Rect(0, 0, x1-x0, bounds.Dy()))
-		draw.Draw(dst, dst.Bounds(), &image.Uniform{C: color.White}, image.Point{}, draw.Src)
-		draw.Draw(dst, dst.Bounds(), src, image.Pt(x0, bounds.Min.Y), draw.Over)
-		var encoded bytes.Buffer
-		if err := jpeg.Encode(&encoded, dst, &jpeg.Options{Quality: 90}); err != nil {
-			return nil, false
-		}
-		zooms = append(zooms, worksheetHorizontalZoom{
-			image: encoded.Bytes(), index: i + 1, total: len(horizontalZoomRanges),
-			startX: r[0], endX: r[1],
+		out = append(out, usecase.RecognizedQuestion{
+			Question:        question,
+			KnowledgePoints: dto.KnowledgePoints,
+			AnswerState:     usecase.AnswerStateBlank,
+			Subject:         normalizeRecognizedSubject(dto.Subject),
 		})
 	}
-	return zooms, true
+	return mergeRecognizedQuestions(nil, out), nil
 }
+
+func normalizeRecognizedAnswer(rawState, rawAnswer string) (usecase.AnswerState, string) {
+	answer := strings.TrimSpace(adapter.NormalizeMathText(rawAnswer))
+	switch {
+	case blankAnswerDescription.MatchString(answer):
+		return usecase.AnswerStateBlank, ""
+	case unreadableAnswerDescription.MatchString(answer):
+		return usecase.AnswerStateUnclear, ""
+	}
+
+	switch usecase.AnswerState(strings.ToLower(strings.TrimSpace(rawState))) {
+	case usecase.AnswerStateBlank:
+		return usecase.AnswerStateBlank, ""
+	case usecase.AnswerStateUnclear:
+		return usecase.AnswerStateUnclear, ""
+	case usecase.AnswerStatePresent:
+		if answer == "" {
+			return usecase.AnswerStateUnclear, ""
+		}
+		return usecase.AnswerStatePresent, answer
+	default:
+		// Backward-compatible parsing for providers/tests that have not emitted answer_state yet.
+		// This inference is deliberately based only on the transcribed answer, never on geometry.
+		if answer == "" {
+			return usecase.AnswerStateBlank, ""
+		}
+		return usecase.AnswerStatePresent, answer
+	}
+}
+
+type worksheetSegment struct {
+	image            []byte
+	index            int
+	total            int
+	printedInventory bool
+}
+
+type segmentRecognitionResult struct {
+	questions            []usecase.RecognizedQuestion
+	err                  error
+	retryableVisionError bool
+}
+
+const (
+	denseWorksheetSegmentCount           = 5
+	denseWorksheetSemanticBlockFraction  = 0.12
+	denseWorksheetSegmentOverlapFraction = 0.14
+)
+
+// denseWorksheetRanges 由“固定调用数 + 最大语义块高度”推导，而不是针对某张试卷手写坐标。
+// 相邻裁片重叠必须大于一个典型多行题块，才能保证任意 12% 高的题目/作答区域至少完整落入
+// 一个分片；额外 2% 是透视、拍照倾斜和模型 edge-fragment 判定的安全余量。
+var denseWorksheetRanges = buildDenseWorksheetRanges()
+
+func buildDenseWorksheetRanges() [denseWorksheetSegmentCount][2]float64 {
+	var ranges [denseWorksheetSegmentCount][2]float64
+	span := (1 + float64(denseWorksheetSegmentCount-1)*denseWorksheetSegmentOverlapFraction) /
+		float64(denseWorksheetSegmentCount)
+	step := span - denseWorksheetSegmentOverlapFraction
+	for i := range ranges {
+		start := float64(i) * step
+		end := start + span
+		if i == len(ranges)-1 {
+			end = 1
+		}
+		ranges[i] = [2]float64{start, end}
+	}
+	return ranges
+}
+
+const (
+	// ai-core 的 HTTP transport 已在单次 vision 调用内部做短退避重试。这里再等一小段时间，
+	// 让五分片首波的并发压力先完全释放，再对失败分支做一次批次级恢复。
+	denseWorksheetRetryDelay          = 750 * time.Millisecond
+	denseWorksheetRetryMaxConcurrency = 2
+)
 
 // splitDenseWorksheetImage 仅处理尺寸足够、明显纵向的作业图。5 段间保留 4%~6% 重叠，
 // 让跨分界线的题至少在一个分片内完整出现；合并阶段按题干去重。
@@ -267,206 +329,464 @@ func splitDenseWorksheetImage(raw []byte) ([]worksheetSegment, bool) {
 		dst := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), y1-y0))
 		draw.Draw(dst, dst.Bounds(), &image.Uniform{C: color.White}, image.Point{}, draw.Src)
 		draw.Draw(dst, dst.Bounds(), src, image.Pt(bounds.Min.X, y0), draw.Over)
-		var encoded bytes.Buffer
-		if err := jpeg.Encode(&encoded, dst, &jpeg.Options{Quality: 88}); err != nil {
+		encoded, err := encodePNG(dst, fmt.Sprintf("dense worksheet segment %d", i+1))
+		if err != nil {
 			return nil, false
 		}
 		segments = append(segments, worksheetSegment{
-			image: encoded.Bytes(), index: i + 1, total: len(denseWorksheetRanges),
-			startY: r[0], endY: r[1],
+			image: encoded, index: i + 1, total: len(denseWorksheetRanges),
 		})
 	}
 	return segments, true
 }
 
 func (a *RecognizerAdapter) recognizeSegments(ctx context.Context, segments []worksheetSegment) ([]usecase.RecognizedQuestion, error) {
-	type segmentResult struct {
-		questions []usecase.RecognizedQuestion
-		err       error
+	results := make([]segmentRecognitionResult, len(segments))
+	initialIndexes := make([]int, len(segments))
+	for i := range initialIndexes {
+		initialIndexes[i] = i
 	}
-	results := make([]segmentResult, len(segments))
-	sem := make(chan struct{}, 3) // 控制云端并发，避免 5 路瞬时触发 provider 限流。
-	var wg sync.WaitGroup
-	for i, segment := range segments {
-		i, segment := i, segment
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				results[i].err = ctx.Err()
-				return
-			}
-			prompt := fmt.Sprintf(`%s
+	a.recognizeSegmentWave(ctx, segments, initialIndexes, len(initialIndexes), results)
 
-这是原作业图片的纵向分片 %d/%d。只识别在本分片内题干完整可见的题目；紧贴上/下边缘且被截断的残题必须忽略，重叠区域的完整题照常输出。bbox 坐标仍以当前分片为 0~1。JSON 必须紧凑输出，不要缩进。`, recognizePrompt, segment.index, segment.total)
-			raw, err := a.vision(ctx, segment.image, prompt)
-			if err != nil {
-				results[i].err = fmt.Errorf("分片 %d/%d 视觉模型调用失败: %w", segment.index, segment.total, err)
-				return
-			}
-			questions, err := parseRecognizedQuestions(raw)
-			if err != nil {
-				results[i].err = fmt.Errorf("分片 %d/%d: %w", segment.index, segment.total, err)
-				return
-			}
-			// 横排小口算在整宽分片里字号很小，视觉模型偶发只抄到印刷题干、整片漏掉手写。
-			// “识出题但 0 作答”既可能真空白，也可能漏识；仅追加一次聚焦复核并合并，
-			// 不直接把首轮结果当成空白卷。复核失败保留首轮，避免可选增强拖垮整张识别。
-			if segmentNeedsHandwritingReview(questions) {
-				focusPrompt := fmt.Sprintf(`%s
-
-这是原作业图片的纵向分片 %d/%d，需要复核手写答案。首轮已识出印刷题，但没有回收到任何 student_answer。请放大辨认铅笔/黑笔等手写墨迹，尤其是印刷等号后的数字、涂改和演算；题干只保留印刷体。逐题重做紧凑 JSON，确实没有手写才留空。紧贴上/下边缘且题干不完整的残题仍忽略。bbox 坐标以当前分片为 0~1。`, recognizePrompt, segment.index, segment.total)
-				if retryRaw, retryErr := a.vision(ctx, segment.image, focusPrompt); retryErr == nil {
-					if retryQuestions, parseErr := parseRecognizedQuestions(retryRaw); parseErr == nil {
-						questions = mergeRecognizedQuestions(questions, retryQuestions)
-					}
-				}
-			}
-			results[i].questions = questions
-		}()
+	retryIndexes := make([]int, 0, len(segments))
+	for i, result := range results {
+		if result.err == nil {
+			continue
+		}
+		if !result.retryableVisionError {
+			return nil, fmt.Errorf("recognizer: %w", result.err)
+		}
+		retryIndexes = append(retryIndexes, i)
 	}
-	wg.Wait()
+	if len(retryIndexes) > 0 {
+		retryUnits := make([]string, 0, len(retryIndexes))
+		for _, i := range retryIndexes {
+			if segments[i].printedInventory {
+				retryUnits = append(retryUnits, "printed_inventory")
+			} else {
+				retryUnits = append(retryUnits, fmt.Sprintf("segment_%d", segments[i].index))
+			}
+		}
+		logger.WarnContext(ctx, "[k12识题] 密集卷识别单元瞬时失败，进入有界第二波重试",
+			"units", retryUnits,
+			"delay", denseWorksheetRetryDelay,
+			"max_concurrency", denseWorksheetRetryMaxConcurrency,
+		)
+		if err := waitDenseWorksheetRetry(ctx, denseWorksheetRetryDelay); err != nil {
+			return nil, fmt.Errorf("recognizer: 分片重试已取消: %w", err)
+		}
+		a.recognizeSegmentWave(
+			ctx,
+			segments,
+			retryIndexes,
+			denseWorksheetRetryMaxConcurrency,
+			results,
+		)
+	}
+
 	for _, result := range results {
 		if result.err != nil {
 			return nil, fmt.Errorf("recognizer: %w", result.err)
 		}
 	}
 
-	// Content, not a hard-coded segment number, decides which vertical slices need horizontal zoom.
-	// Select deterministically in page order before launching work so the page-level budget cannot be
-	// stolen by goroutine scheduling. The two selected segments run in parallel; their three crops are
-	// sequential, keeping both total requests and provider concurrency bounded.
-	zoomIndexes := make([]int, 0, maxHorizontalZoomSegmentsPerPage)
-	for i := range results {
-		if segmentNeedsHorizontalZoom(results[i].questions) {
-			zoomIndexes = append(zoomIndexes, i)
-			if len(zoomIndexes) == maxHorizontalZoomSegmentsPerPage {
-				break
-			}
+	inventoryIndex := -1
+	segmentIndexes := make([]int, 0, len(segments))
+	for i := range segments {
+		if segments[i].printedInventory {
+			inventoryIndex = i
+			continue
 		}
+		segmentIndexes = append(segmentIndexes, i)
 	}
-	var zoomWG sync.WaitGroup
-	for _, index := range zoomIndexes {
-		index := index
-		zoomWG.Add(1)
-		go func() {
-			defer zoomWG.Done()
-			results[index].questions = a.recognizeHorizontalZooms(ctx, segments[index], results[index].questions)
-		}()
-	}
-	zoomWG.Wait()
-
-	// Zoom bbox.x is already mapped to the full segment width. Map every candidate's y coordinate only
-	// after optional zoom recovery so both base and recovered boxes share one transformation path.
-	for i, segment := range segments {
-		span := segment.endY - segment.startY
-		for q := range results[i].questions {
-			remapRecognizedGeometry(&results[i].questions[q], func(mapped *usecase.BBox) {
-				mapped.Y = segment.startY + mapped.Y*span
-				mapped.H *= span
-			})
-		}
+	for i := 1; i < len(segmentIndexes); i++ {
+		left := segmentIndexes[i-1]
+		right := segmentIndexes[i]
+		reconcileAdjacentSegmentOCRVariants(results[left].questions, results[right].questions)
 	}
 
 	merged := make([]usecase.RecognizedQuestion, 0)
-	for _, result := range results {
+	for _, index := range segmentIndexes {
 		// 跨纵向分片也必须复用同一套 exact/equation/containment 合并规则。否则重叠区会同时
 		// 留下“如果每平方米……”残题和包含周长条件的完整题，后续批改把它们当成两道题。
-		merged = mergeRecognizedQuestions(merged, result.questions)
+		merged = mergeRecognizedQuestions(merged, results[index].questions)
+	}
+	if inventoryIndex >= 0 {
+		merged = reconcilePrintedQuestionInventory(merged, results[inventoryIndex].questions)
 	}
 	return merged, nil
 }
 
-func (a *RecognizerAdapter) recognizeHorizontalZooms(ctx context.Context, segment worksheetSegment, questions []usecase.RecognizedQuestion) []usecase.RecognizedQuestion {
-	zooms, ok := splitHorizontalZooms(segment.image)
-	if !ok {
-		return questions
-	}
-	for _, zoom := range zooms {
-		if ctx.Err() != nil {
-			break
-		}
-		zoomPrompt := fmt.Sprintf(`%s
-
-这是原作业图片的纵向分片 %d/%d、横向放大 %d/%d。只输出在当前放大块中题干完整可见的题，重点分离印刷题干与手写答案；左右边缘被截断的题忽略。bbox 坐标以当前裁剪块为 0~1。JSON 紧凑输出。`, recognizePrompt, segment.index, segment.total, zoom.index, zoom.total)
-		rawZoom, zoomErr := a.vision(ctx, zoom.image, zoomPrompt)
-		if zoomErr != nil {
-			continue
-		}
-		zoomQuestions, parseErr := parseRecognizedQuestions(rawZoom)
-		if parseErr != nil {
-			continue
-		}
-		spanX := zoom.endX - zoom.startX
-		for q := range zoomQuestions {
-			remapRecognizedGeometry(&zoomQuestions[q], func(mapped *usecase.BBox) {
-				mapped.X = zoom.startX + mapped.X*spanX
-				mapped.W *= spanX
-			})
-		}
-		questions = mergeRecognizedQuestions(questions, zoomQuestions)
-	}
-	return questions
-}
-
-func remapRecognizedGeometry(question *usecase.RecognizedQuestion, transform func(*usecase.BBox)) {
-	if question == nil || transform == nil {
+func (a *RecognizerAdapter) recognizeSegmentWave(
+	ctx context.Context,
+	segments []worksheetSegment,
+	indexes []int,
+	maxConcurrency int,
+	results []segmentRecognitionResult,
+) {
+	if len(indexes) == 0 {
 		return
 	}
-	if question.BBox != nil {
-		mapped := *question.BBox
-		transform(&mapped)
-		question.BBox = &mapped
+	if maxConcurrency <= 0 || maxConcurrency > len(indexes) {
+		maxConcurrency = len(indexes)
 	}
+	semaphore := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+	for _, i := range indexes {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				results[i] = segmentRecognitionResult{err: ctx.Err()}
+				return
+			}
+			results[i] = a.recognizeSegment(ctx, segments[i])
+		}()
+	}
+	wg.Wait()
 }
 
-func segmentNeedsHandwritingReview(questions []usecase.RecognizedQuestion) bool {
-	if len(questions) == 0 {
+func (a *RecognizerAdapter) recognizeSegment(ctx context.Context, segment worksheetSegment) segmentRecognitionResult {
+	if err := ctx.Err(); err != nil {
+		return segmentRecognitionResult{err: err}
+	}
+	if segment.printedInventory {
+		raw, err := a.vision(ctx, segment.image, printedQuestionInventoryPrompt)
+		if err != nil {
+			return segmentRecognitionResult{
+				err:                  fmt.Errorf("整页印刷题清单视觉模型调用失败: %w", err),
+				retryableVisionError: isTransientVisionError(ctx, err),
+			}
+		}
+		questions, err := parsePrintedQuestionInventory(raw)
+		if err != nil {
+			return segmentRecognitionResult{err: fmt.Errorf("整页印刷题清单: %w", err)}
+		}
+		return segmentRecognitionResult{questions: questions}
+	}
+	prompt := fmt.Sprintf(`%s
+
+这是原作业图片的纵向分片 %d/%d。只识别在本分片内题干完整可见的题目；紧贴上/下边缘且被截断的残题必须忽略，重叠区域的完整题照常输出。JSON 必须紧凑输出，不要缩进。`, recognizePrompt, segment.index, segment.total)
+	raw, err := a.vision(ctx, segment.image, prompt)
+	if err != nil {
+		return segmentRecognitionResult{
+			err:                  fmt.Errorf("分片 %d/%d 视觉模型调用失败: %w", segment.index, segment.total, err),
+			retryableVisionError: isTransientVisionError(ctx, err),
+		}
+	}
+	questions, err := parseRecognizedQuestions(raw)
+	if err != nil {
+		return segmentRecognitionResult{
+			err: fmt.Errorf("分片 %d/%d: %w", segment.index, segment.total, err),
+		}
+	}
+	return segmentRecognitionResult{questions: questions}
+}
+
+func isTransientVisionError(ctx context.Context, err error) bool {
+	if err == nil || ctx != nil && ctx.Err() != nil || errors.Is(err, context.Canceled) {
 		return false
 	}
-	allBlank := true
-	for _, q := range questions {
-		if strings.TrimSpace(q.StudentAnswer) != "" {
-			allBlank = false
-			continue
-		}
-		// 模型声称定位到了“作答区域”却没抄出内容，是强烈的漏识信号。
-		if q.BBox != nil {
+	var providerErr *llm.ProviderError
+	if errors.As(err, &providerErr) && providerErr.StatusCode != 0 {
+		switch providerErr.StatusCode {
+		case http.StatusRequestTimeout,
+			http.StatusTooEarly,
+			http.StatusTooManyRequests,
+			http.StatusInternalServerError,
+			http.StatusBadGateway,
+			http.StatusServiceUnavailable,
+			http.StatusGatewayTimeout:
 			return true
-		}
-	}
-	return allBlank
-}
-
-func segmentNeedsHorizontalZoom(questions []usecase.RecognizedQuestion) bool {
-	if len(questions) < 2 || len(questions) > 6 {
-		return false
-	}
-	for _, q := range questions {
-		if len([]rune(q.Question)) > 24 || !strings.ContainsAny(q.Question, "0123456789+-×÷*/=") {
+		default:
 			return false
 		}
 	}
-	return true
+	switch llm.ClassifyError(err, 0, "") {
+	case llm.FailRateLimit, llm.FailProviderDown:
+		return true
+	default:
+		return false
+	}
+}
+
+func waitDenseWorksheetRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+const adjacentSegmentConsensusMinQuestions = 2
+
+var fractionDenominatorSuffix = regexp.MustCompile(`/\d+`)
+
+// reconcileAdjacentSegmentOCRVariants 只在两个相邻裁片已通过多个精确邻题证明“看的是同一
+// 重叠区域”时，修复分数细横线/分母被 OCR 吞掉的变体。它不会做全页模糊去重：没有邻题
+// 共识时，即使两个算式只差一个分母也保留为独立题，避免误伤真实的相似小题。
+func reconcileAdjacentSegmentOCRVariants(left, right []usecase.RecognizedQuestion) {
+	if adjacentSegmentExactConsensus(left, right) < adjacentSegmentConsensusMinQuestions {
+		return
+	}
+	leftKeys := recognizedQuestionKeySet(left)
+	rightKeys := recognizedQuestionKeySet(right)
+	for leftIndex := range left {
+		for rightIndex := range right {
+			leftKey := recognizedQuestionKey(left[leftIndex].Question)
+			rightKey := recognizedQuestionKey(right[rightIndex].Question)
+			if _, independentlySeen := leftKeys[rightKey]; independentlySeen {
+				continue
+			}
+			if _, independentlySeen := rightKeys[leftKey]; independentlySeen {
+				continue
+			}
+			complete, ok := completeFractionObservation(left[leftIndex], right[rightIndex])
+			if !ok {
+				continue
+			}
+			complete = mergeObservationMetadata(complete, left[leftIndex])
+			complete = mergeObservationMetadata(complete, right[rightIndex])
+			left[leftIndex] = complete
+			right[rightIndex] = complete
+		}
+	}
+}
+
+func recognizedQuestionKeySet(questions []usecase.RecognizedQuestion) map[string]struct{} {
+	keys := make(map[string]struct{}, len(questions))
+	for _, question := range questions {
+		if key := recognizedQuestionKey(question.Question); key != "" {
+			keys[key] = struct{}{}
+		}
+	}
+	return keys
+}
+
+func adjacentSegmentExactConsensus(left, right []usecase.RecognizedQuestion) int {
+	leftKeys := recognizedQuestionKeySet(left)
+	seen := make(map[string]struct{}, min(len(leftKeys), len(right)))
+	for _, question := range right {
+		key := recognizedQuestionKey(question.Question)
+		if _, ok := leftKeys[key]; !ok || key == "" {
+			continue
+		}
+		seen[key] = struct{}{}
+	}
+	return len(seen)
+}
+
+func completeFractionObservation(
+	left,
+	right usecase.RecognizedQuestion,
+) (usecase.RecognizedQuestion, bool) {
+	left = usecase.NormalizeRecognizedQuestion(left)
+	right = usecase.NormalizeRecognizedQuestion(right)
+	if left.Subject != "" && right.Subject != "" && left.Subject != right.Subject {
+		return usecase.RecognizedQuestion{}, false
+	}
+	if leftNumber, leftOK := explicitRecognizedQuestionNumber(left.Question); leftOK {
+		if rightNumber, rightOK := explicitRecognizedQuestionNumber(right.Question); rightOK &&
+			leftNumber != rightNumber {
+			return usecase.RecognizedQuestion{}, false
+		}
+	}
+	leftKey := normalizeArithmeticQuestion(recognizedQuestionKey(left.Question))
+	rightKey := normalizeArithmeticQuestion(recognizedQuestionKey(right.Question))
+	switch {
+	case fractionDenominatorWasElided(leftKey, rightKey) &&
+		left.AnswerState == usecase.AnswerStatePresent && left.StudentAnswer != "":
+		return left, true
+	case fractionDenominatorWasElided(rightKey, leftKey) &&
+		right.AnswerState == usecase.AnswerStatePresent && right.StudentAnswer != "":
+		return right, true
+	default:
+		return usecase.RecognizedQuestion{}, false
+	}
+}
+
+// fractionDenominatorWasElided reports whether shorter is exactly longer with one "/denominator"
+// token removed. Requiring at least two fractions in the complete expression makes the rule target
+// the confirmed OCR class ("5/7-1/5" → "5-1/5") rather than arbitrary slash edits.
+func fractionDenominatorWasElided(longer, shorter string) bool {
+	if longer == "" || shorter == "" || len(longer) <= len(shorter) ||
+		!isShortArithmeticFragment(longer) || !isShortArithmeticFragment(shorter) {
+		return false
+	}
+	longFractions := recognizedArabicFraction.FindAllString(longer, -1)
+	shortFractions := recognizedArabicFraction.FindAllString(shorter, -1)
+	if len(longFractions) < 2 || len(shortFractions) != len(longFractions)-1 {
+		return false
+	}
+	for _, match := range fractionDenominatorSuffix.FindAllStringIndex(longer, -1) {
+		if match[0] == 0 {
+			continue
+		}
+		if longer[:match[0]]+longer[match[1]:] == shorter {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeObservationMetadata fills only non-semantic supporting metadata. Question, answer state and
+// transcribed answer stay bound to the complete visual observation; taking an answer generated from
+// the corrupted question would silently reintroduce the same OCR error.
+func mergeObservationMetadata(
+	preferred,
+	other usecase.RecognizedQuestion,
+) usecase.RecognizedQuestion {
+	preferred = usecase.NormalizeRecognizedQuestion(preferred)
+	other = usecase.NormalizeRecognizedQuestion(other)
+	if preferred.Subject == "" {
+		preferred.Subject = other.Subject
+	}
+	if len(other.KnowledgePoints) > len(preferred.KnowledgePoints) {
+		preferred.KnowledgePoints = other.KnowledgePoints
+	}
+	return preferred
+}
+
+// reconcilePrintedQuestionInventory uses an independent full-page print-only pass to repair question
+// text that every answer-bearing crop corrupted in the same way. It never invents an answer: when the
+// inventory materially rewrites a question, the answer generated under the old question context is
+// downgraded to unclear so the independent handwriting stage must re-establish it.
+func reconcilePrintedQuestionInventory(
+	observed,
+	inventory []usecase.RecognizedQuestion,
+) []usecase.RecognizedQuestion {
+	out := append([]usecase.RecognizedQuestion(nil), observed...)
+	used := make(map[int]struct{}, len(inventory))
+	for observedIndex := range out {
+		bestInventory, bestScore := -1, 0
+		for inventoryIndex := range inventory {
+			if _, alreadyUsed := used[inventoryIndex]; alreadyUsed {
+				continue
+			}
+			score := printedInventoryQuestionMatchScore(out[observedIndex], inventory[inventoryIndex])
+			if score > bestScore {
+				bestInventory, bestScore = inventoryIndex, score
+			}
+		}
+		if bestInventory < 0 {
+			continue
+		}
+		used[bestInventory] = struct{}{}
+		out[observedIndex] = mergePrintedInventoryObservation(
+			out[observedIndex],
+			inventory[bestInventory],
+		)
+	}
+	for i := range out {
+		out[i] = usecase.NormalizeRecognizedQuestion(out[i])
+	}
+	return out
+}
+
+func printedInventoryQuestionMatchScore(
+	observed,
+	inventory usecase.RecognizedQuestion,
+) int {
+	observed = usecase.NormalizeRecognizedQuestion(observed)
+	inventory = usecase.NormalizeRecognizedQuestion(inventory)
+	if observed.Subject != "" && inventory.Subject != "" && observed.Subject != inventory.Subject {
+		return 0
+	}
+	if observedNumber, ok := explicitRecognizedQuestionNumber(observed.Question); ok {
+		if inventoryNumber, inventoryOK := explicitRecognizedQuestionNumber(inventory.Question); inventoryOK &&
+			observedNumber != inventoryNumber {
+			return 0
+		}
+	}
+	observedKey := recognizedQuestionKey(observed.Question)
+	inventoryKey := recognizedQuestionKey(inventory.Question)
+	if observedKey == "" || inventoryKey == "" {
+		return 0
+	}
+	if observedKey == inventoryKey {
+		return 100
+	}
+	observedArithmetic := normalizeArithmeticQuestion(observedKey)
+	inventoryArithmetic := normalizeArithmeticQuestion(inventoryKey)
+	if fractionDenominatorWasElided(inventoryArithmetic, observedArithmetic) ||
+		fractionDenominatorWasElided(observedArithmetic, inventoryArithmetic) {
+		return 90
+	}
+	if _, ok := equationVariantAnswer(observedKey, inventoryKey); ok {
+		return 80
+	}
+	if _, ok := equationVariantAnswer(inventoryKey, observedKey); ok {
+		return 80
+	}
+	if overlappingWordProblemDuplicate(observed, inventory, observedKey, inventoryKey) {
+		return 70
+	}
+	return 0
+}
+
+func mergePrintedInventoryObservation(
+	observed,
+	inventory usecase.RecognizedQuestion,
+) usecase.RecognizedQuestion {
+	observed = usecase.NormalizeRecognizedQuestion(observed)
+	inventory = usecase.NormalizeRecognizedQuestion(inventory)
+	merged := mergeObservationMetadata(observed, inventory)
+	observedKey := normalizeArithmeticQuestion(recognizedQuestionKey(observed.Question))
+	inventoryKey := normalizeArithmeticQuestion(recognizedQuestionKey(inventory.Question))
+	_, observedContainsHandwrittenRHS := equationVariantAnswer(
+		recognizedQuestionKey(observed.Question),
+		recognizedQuestionKey(inventory.Question),
+	)
+
+	rewriteQuestion := false
+	switch {
+	case fractionDenominatorWasElided(inventoryKey, observedKey):
+		rewriteQuestion = true
+	case fractionDenominatorWasElided(observedKey, inventoryKey):
+		rewriteQuestion = false
+	case recognizedQuestionKey(observed.Question) == recognizedQuestionKey(inventory.Question):
+		rewriteQuestion = false
+	case len([]rune(inventory.Question)) > len([]rune(observed.Question)):
+		rewriteQuestion = true
+	case observedContainsHandwrittenRHS:
+		rewriteQuestion = true
+	}
+	if !rewriteQuestion {
+		return merged
+	}
+	merged.Question = inventory.Question
+	if merged.AnswerState != usecase.AnswerStateBlank {
+		merged.AnswerState = usecase.AnswerStateUnclear
+		merged.StudentAnswer = ""
+	}
+	return usecase.NormalizeRecognizedQuestion(merged)
 }
 
 func mergeRecognizedQuestions(primary, recovery []usecase.RecognizedQuestion) []usecase.RecognizedQuestion {
-	merged := append([]usecase.RecognizedQuestion(nil), primary...)
+	merged := make([]usecase.RecognizedQuestion, len(primary))
+	for i := range primary {
+		merged[i] = usecase.NormalizeRecognizedQuestion(primary[i])
+	}
 	seen := make(map[string]int, len(merged))
 	for i, q := range merged {
 		seen[recognizedQuestionKey(q.Question)] = i
 	}
-	for _, q := range recovery {
+	for _, candidate := range recovery {
+		q := usecase.NormalizeRecognizedQuestion(candidate)
 		key := recognizedQuestionKey(q.Question)
 		if existing, ok := seen[key]; ok && key != "" {
 			existingQuestion := merged[existing]
 			if questionInformationScore(q) > questionInformationScore(existingQuestion) {
-				merged[existing] = mergeRecognizedGeometry(q, existingQuestion)
+				merged[existing] = mergeRecognizedEvidence(q, existingQuestion)
 			} else {
-				merged[existing] = mergeRecognizedGeometry(existingQuestion, q)
+				merged[existing] = mergeRecognizedEvidence(existingQuestion, q)
 			}
 			continue
 		}
@@ -478,24 +798,20 @@ func mergeRecognizedQuestions(primary, recovery []usecase.RecognizedQuestion) []
 			if answer, ok := equationVariantAnswer(key, existingKey); ok {
 				combined := merged[existing]
 				if combined.StudentAnswer == "" {
+					combined.AnswerState = usecase.AnswerStatePresent
 					combined.StudentAnswer = answer
 				}
-				if combined.BBox == nil {
-					combined.BBox = q.BBox
-				}
-				merged[existing] = combined
+				merged[existing] = usecase.NormalizeRecognizedQuestion(combined)
 				variantMerged = true
 				break
 			}
 			if answer, ok := equationVariantAnswer(existingKey, key); ok {
 				combined := q
 				if combined.StudentAnswer == "" {
+					combined.AnswerState = usecase.AnswerStatePresent
 					combined.StudentAnswer = answer
 				}
-				if combined.BBox == nil {
-					combined.BBox = merged[existing].BBox
-				}
-				merged[existing] = combined
+				merged[existing] = mergeRecognizedEvidence(combined, merged[existing])
 				delete(seen, existingKey)
 				seen[key] = existing
 				variantMerged = true
@@ -514,21 +830,7 @@ func mergeRecognizedQuestions(primary, recovery []usecase.RecognizedQuestion) []
 			if len([]rune(q.Question)) > len([]rune(combined.Question)) {
 				combined.Question = q.Question
 			}
-			if len([]rune(q.StudentAnswer)) > len([]rune(combined.StudentAnswer)) {
-				combined.StudentAnswer = q.StudentAnswer
-				if q.BBox != nil {
-					combined.BBox = q.BBox
-				}
-			} else if combined.BBox == nil {
-				combined.BBox = q.BBox
-			}
-			if combined.Subject == "" {
-				combined.Subject = q.Subject
-			}
-			if len(q.KnowledgePoints) > len(combined.KnowledgePoints) {
-				combined.KnowledgePoints = q.KnowledgePoints
-			}
-			merged[existing] = combined
+			merged[existing] = mergeRecognizedEvidence(combined, q)
 			newKey := recognizedQuestionKey(combined.Question)
 			if newKey != existingKey {
 				delete(seen, existingKey)
@@ -565,7 +867,11 @@ func mergeRecognizedQuestions(primary, recovery []usecase.RecognizedQuestion) []
 		seen[key] = len(merged)
 		merged = append(merged, q)
 	}
-	return filterBlankCroppedArithmeticFragments(merged)
+	filtered := filterBlankCroppedArithmeticFragments(merged)
+	for i := range filtered {
+		filtered[i] = usecase.NormalizeRecognizedQuestion(filtered[i])
+	}
+	return filtered
 }
 
 const blankArithmeticFragmentMaxRunes = 16
@@ -575,17 +881,24 @@ const blankArithmeticFragmentMaxRunes = 16
 // mid-operator needs corroboration from a longer, complete equation in the same merged batch.
 func filterBlankCroppedArithmeticFragments(questions []usecase.RecognizedQuestion) []usecase.RecognizedQuestion {
 	filtered := make([]usecase.RecognizedQuestion, 0, len(questions))
-	for i, question := range questions {
-		if strings.TrimSpace(question.StudentAnswer) != "" {
+	for i, rawQuestion := range questions {
+		question := usecase.NormalizeRecognizedQuestion(rawQuestion)
+		if question.AnswerState != usecase.AnswerStateBlank {
 			filtered = append(filtered, question)
 			continue
 		}
 		short := normalizeArithmeticQuestion(question.Question)
+		// A bare value with no student answer is an OCR shard (usually an intermediate
+		// handwritten result), not a self-contained worksheet question.
+		if isBareUnsignedInteger(short) {
+			continue
+		}
 		if !isShortArithmeticFragment(short) {
 			filtered = append(filtered, question)
 			continue
 		}
-		if endsWithArithmeticOperator(short) || hasCompleteEquationContinuation(short, questions, i) {
+		if endsWithArithmeticOperator(short) || hasCompleteEquationContinuation(short, questions, i) ||
+			hasCorroboratedArithmeticContainment(short, questions, i) {
 			continue
 		}
 		filtered = append(filtered, question)
@@ -593,10 +906,23 @@ func filterBlankCroppedArithmeticFragments(questions []usecase.RecognizedQuestio
 	return filtered
 }
 
+func isBareUnsignedInteger(question string) bool {
+	if question == "" {
+		return false
+	}
+	for _, r := range question {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func normalizeArithmeticQuestion(question string) string {
+	question = canonicalizeMathGlyphs(question)
 	replacer := strings.NewReplacer(
 		" ", "", "\t", "", "\n", "", "\r", "",
-		"？", "", "?", "", "＝", "=", "．", ".", "－", "-", "＋", "+",
+		"？", "", "?", "", "．", ".",
 	)
 	return strings.ToLower(replacer.Replace(strings.TrimSpace(question)))
 }
@@ -644,6 +970,33 @@ func hasCompleteEquationContinuation(short string, questions []usecase.Recognize
 	return false
 }
 
+// hasCorroboratedArithmeticContainment removes a crop shard only when another
+// recognized item supplies the missing arithmetic tail/head. A following digit is
+// deliberately not a boundary: "3+4" and "3+45=48" may be independent questions.
+func hasCorroboratedArithmeticContainment(short string, questions []usecase.RecognizedQuestion, shortIndex int) bool {
+	shortRunes := []rune(short)
+	for i, question := range questions {
+		if i == shortIndex {
+			continue
+		}
+		longer := normalizeArithmeticQuestion(question.Question)
+		if len([]rune(longer)) <= len(shortRunes) || !isShortArithmeticFragment(longer) {
+			continue
+		}
+		if strings.HasPrefix(longer, short) {
+			suffix := []rune(strings.TrimPrefix(longer, short))
+			if len(suffix) > 0 && strings.ContainsRune("x.+-−×÷*/=(（", suffix[0]) {
+				return true
+			}
+		}
+		if strings.HasSuffix(longer, short) && len(shortRunes) > 0 &&
+			strings.ContainsRune("+-−×÷*/", shortRunes[0]) {
+			return true
+		}
+	}
+	return false
+}
+
 func isCompleteArithmeticEquation(question string) bool {
 	if len([]rune(question)) > 48 || strings.Count(question, "=") != 1 {
 		return false
@@ -676,7 +1029,9 @@ const (
 )
 
 func blankLongQuestionNearDuplicate(a, b usecase.RecognizedQuestion, aKey, bKey string) bool {
-	if strings.TrimSpace(a.StudentAnswer) != "" || strings.TrimSpace(b.StudentAnswer) != "" {
+	a = usecase.NormalizeRecognizedQuestion(a)
+	b = usecase.NormalizeRecognizedQuestion(b)
+	if a.AnswerState != usecase.AnswerStateBlank || b.AnswerState != usecase.AnswerStateBlank {
 		return false
 	}
 	aRunes, bRunes := []rune(aKey), []rune(bKey)
@@ -764,11 +1119,36 @@ func editDistanceAtMost(a, b []rune, limit int) bool {
 	return previous[len(b)] <= limit
 }
 
-func mergeRecognizedGeometry(preferred, other usecase.RecognizedQuestion) usecase.RecognizedQuestion {
-	if preferred.BBox == nil {
+func mergeRecognizedEvidence(preferred, other usecase.RecognizedQuestion) usecase.RecognizedQuestion {
+	preferred = usecase.NormalizeRecognizedQuestion(preferred)
+	other = usecase.NormalizeRecognizedQuestion(other)
+	if preferred.Subject == "" {
+		preferred.Subject = other.Subject
+	}
+	if len(other.KnowledgePoints) > len(preferred.KnowledgePoints) {
+		preferred.KnowledgePoints = other.KnowledgePoints
+	}
+	if answerEvidenceScore(other) > answerEvidenceScore(preferred) {
+		preferred.AnswerState = other.AnswerState
+		preferred.StudentAnswer = other.StudentAnswer
+		preferred.BBox = other.BBox
+	} else if preferred.BBox == nil && preferred.AnswerState == usecase.AnswerStatePresent &&
+		other.AnswerState == usecase.AnswerStatePresent && recognizedQuestionKey(preferred.StudentAnswer) == recognizedQuestionKey(other.StudentAnswer) {
 		preferred.BBox = other.BBox
 	}
-	return preferred
+	return usecase.NormalizeRecognizedQuestion(preferred)
+}
+
+func answerEvidenceScore(question usecase.RecognizedQuestion) int {
+	question = usecase.NormalizeRecognizedQuestion(question)
+	switch question.AnswerState {
+	case usecase.AnswerStatePresent:
+		return 100 + len([]rune(question.StudentAnswer))
+	case usecase.AnswerStateUnclear:
+		return 10
+	default:
+		return 0
+	}
 }
 
 func mergeBlankLongNearDuplicate(a, b usecase.RecognizedQuestion, aKey, bKey string) usecase.RecognizedQuestion {
@@ -782,16 +1162,16 @@ func mergeBlankLongNearDuplicate(a, b usecase.RecognizedQuestion, aKey, bKey str
 	if len(other.KnowledgePoints) > len(cleaner.KnowledgePoints) {
 		cleaner.KnowledgePoints = other.KnowledgePoints
 	}
-	if cleaner.BBox == nil {
-		cleaner.BBox = other.BBox
-	}
-	return cleaner
+	return mergeRecognizedEvidence(cleaner, other)
 }
 
 func overlappingWordProblemDuplicate(a, b usecase.RecognizedQuestion, aKey, bKey string) bool {
+	if collapsedFractionTailDuplicate(a, b) {
+		return true
+	}
 	if len([]rune(aKey)) < 12 || len([]rune(bKey)) < 12 ||
 		(!strings.Contains(aKey, bKey) && !strings.Contains(bKey, aKey)) {
-		return false
+		return trailingWordProblemFragmentDuplicate(aKey, bKey)
 	}
 	aAnswer := recognizedQuestionKey(a.StudentAnswer)
 	bAnswer := recognizedQuestionKey(b.StudentAnswer)
@@ -799,6 +1179,94 @@ func overlappingWordProblemDuplicate(a, b usecase.RecognizedQuestion, aKey, bKey
 		return false
 	}
 	return strings.Contains(aAnswer, bAnswer) || strings.Contains(bAnswer, aAnswer)
+}
+
+type fractionQuestionShape struct {
+	prefix       string
+	suffix       string
+	arabicCount  int
+	chineseCount int
+}
+
+func collapsedFractionTailDuplicate(a, b usecase.RecognizedQuestion) bool {
+	if a.Subject != "" && b.Subject != "" && a.Subject != b.Subject {
+		return false
+	}
+	if aNumber, aOK := explicitRecognizedQuestionNumber(a.Question); aOK {
+		if bNumber, bOK := explicitRecognizedQuestionNumber(b.Question); bOK && aNumber != bNumber {
+			return false
+		}
+	}
+	aShape, aOK := recognizedFractionQuestionShape(a.Question)
+	bShape, bOK := recognizedFractionQuestionShape(b.Question)
+	if !aOK || !bOK || aShape.prefix != bShape.prefix || aShape.suffix != bShape.suffix {
+		return false
+	}
+	return aShape.arabicCount >= 2 && bShape.arabicCount == 0 && bShape.chineseCount == 1 ||
+		bShape.arabicCount >= 2 && aShape.arabicCount == 0 && aShape.chineseCount == 1
+}
+
+func explicitRecognizedQuestionNumber(question string) (string, bool) {
+	match := explicitQuestionNumber.FindStringSubmatch(question)
+	return func() string {
+		if len(match) > 1 {
+			return match[1]
+		}
+		return ""
+	}(), len(match) > 1
+}
+
+func recognizedFractionQuestionShape(question string) (fractionQuestionShape, bool) {
+	key := recognizedQuestionKey(question)
+	type fractionMatch struct {
+		start   int
+		end     int
+		chinese bool
+	}
+	matches := make([]fractionMatch, 0, 3)
+	for _, pair := range recognizedArabicFraction.FindAllStringIndex(key, -1) {
+		matches = append(matches, fractionMatch{start: pair[0], end: pair[1]})
+	}
+	for _, pair := range recognizedChineseFraction.FindAllStringIndex(key, -1) {
+		matches = append(matches, fractionMatch{start: pair[0], end: pair[1], chinese: true})
+	}
+	if len(matches) == 0 {
+		return fractionQuestionShape{}, false
+	}
+	slices.SortFunc(matches, func(left, right fractionMatch) int { return left.start - right.start })
+	shape := fractionQuestionShape{
+		prefix: strings.TrimSuffix(key[:matches[0].start], "的"),
+		suffix: key[matches[len(matches)-1].end:],
+	}
+	if shape.prefix == "" || !strings.Contains(shape.suffix, "多少") {
+		return fractionQuestionShape{}, false
+	}
+	for _, match := range matches {
+		if match.chinese {
+			shape.chineseCount++
+		} else {
+			shape.arabicCount++
+		}
+	}
+	return shape, true
+}
+
+func trailingWordProblemFragmentDuplicate(aKey, bKey string) bool {
+	longer, shorter := aKey, bKey
+	if len([]rune(longer)) < len([]rune(shorter)) {
+		longer, shorter = shorter, longer
+	}
+	longRunes, shortRunes := []rune(longer), []rune(shorter)
+	if len(longRunes) < 12 || len(shortRunes) < 5 || len(longRunes)-len(shortRunes) < 4 ||
+		!strings.HasSuffix(longer, shorter) {
+		return false
+	}
+	for _, cue := range []string{"求", "多少", "几", "哪", "什么", "是否", "吗"} {
+		if strings.Contains(shorter, cue) {
+			return true
+		}
+	}
+	return false
 }
 
 func equationVariantAnswer(longer, base string) (string, bool) {
@@ -827,16 +1295,61 @@ func likelyCroppedFragment(question string) bool {
 func recognizedQuestionKey(question string) string {
 	question = leadingChineseQuestionNumber.ReplaceAllString(question, "")
 	question = leadingDottedQuestionNumber.ReplaceAllString(question, "")
-	replacer := strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "", "，", ",", "？", "", "?", "", "＝", "=")
+	question = canonicalizeMathGlyphs(adapter.NormalizeMathText(question))
+	question = removeUnicodeWhitespace(question)
+	replacer := strings.NewReplacer(
+		"，", "", ",", "", "？", "", "?", "",
+	)
 	key := strings.ToLower(replacer.Replace(strings.TrimSpace(question)))
 	return strings.TrimSuffix(key, "=")
 }
 
+func removeUnicodeWhitespace(value string) string {
+	return strings.Map(func(char rune) rune {
+		if unicode.IsSpace(char) {
+			return -1
+		}
+		return char
+	}, value)
+}
+
+func canonicalizeMathGlyphs(value string) string {
+	return strings.Map(func(char rune) rune {
+		if char >= '！' && char <= '～' {
+			return char - '！' + '!'
+		}
+		switch char {
+		case '＋', '﹢':
+			return '+'
+		case '－', '−', '﹣', '–', '—':
+			return '-'
+		case '×', '✕', '∙', '·':
+			return '*'
+		case '÷', '／':
+			return '/'
+		case '＝', '﹦':
+			return '='
+		case '（':
+			return '('
+		case '）':
+			return ')'
+		case '［':
+			return '['
+		case '］':
+			return ']'
+		case '｛':
+			return '{'
+		case '｝':
+			return '}'
+		default:
+			return char
+		}
+	}, value)
+}
+
 func questionInformationScore(q usecase.RecognizedQuestion) int {
-	score := len([]rune(q.Question)) + len([]rune(q.StudentAnswer))*2 + len(q.KnowledgePoints)
-	if q.BBox != nil {
-		score += 4
-	}
+	q = usecase.NormalizeRecognizedQuestion(q)
+	score := len([]rune(q.Question)) + answerEvidenceScore(q)*2 + len(q.KnowledgePoints)
 	if q.Subject != "" {
 		score++
 	}

@@ -111,17 +111,137 @@ func TestPhotoAnnotator_BenchmarkStyleUsesCompactGlyphsWithoutTintingAnswerArea(
 	if green < 40 || red < 40 {
 		t.Fatalf("compact ✓/✗ glyph colors missing: green=%d red=%d", green, red)
 	}
-	// A stabilized answer bbox may include the printed prompt above the actual handwriting.
-	// Put the glyph near the lower answer/final-result area, never at the bbox's top edge.
-	if greenY/green < 78 || redY/red < 168 {
+	// The independent anchorer returns a tight answer bbox. Put the glyph beside its
+	// right edge and in the upper-middle answer band, never over the handwriting.
+	if greenY/green < 70 || redY/red < 158 {
 		t.Fatalf("glyphs sit above the answer area: green_avg_y=%d red_avg_y=%d", greenY/green, redY/red)
 	}
-	if greenX/green > 50 || redX/red > 50 {
-		t.Fatalf("broad bbox moved glyph away from its stable left rail: green_avg_x=%d red_avg_x=%d", greenX/green, redX/red)
+	if greenX/green < 155 || redX/red < 155 {
+		t.Fatalf("tight bbox did not put glyph beside its right edge: green_avg_x=%d red_avg_x=%d", greenX/green, redX/red)
 	}
 }
 
-func TestPhotoAnnotator_UnpositionedVerifiedItemsAppendNumberedStatusRail(t *testing.T) {
+func TestPhotoAnnotator_PlacesGlyphAtAnswerSideInsteadOfQuestionStart(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 240, 240))
+	draw.Draw(src, src.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+	var raw bytes.Buffer
+	if err := png.Encode(&raw, src); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := NewPhotoAnnotator().Annotate(context.Background(), raw.Bytes(), []usecase.PhotoAnnotation{{
+		BBox: usecase.BBox{X: 0.20, Y: 0.20, W: 0.50, H: 0.25}, Correct: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := png.Decode(bytes.NewReader(got.Data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	green, sumX := 0, 0
+	for y := 0; y < out.Bounds().Dy(); y++ {
+		for x := 0; x < out.Bounds().Dx(); x++ {
+			pixel := color.RGBAModel.Convert(out.At(x, y)).(color.RGBA)
+			if int(pixel.G) > 130 && int(pixel.G) > int(pixel.R)+30 && int(pixel.G) > int(pixel.B)+30 {
+				green++
+				sumX += x
+			}
+		}
+	}
+	if green < 40 || sumX/green < 155 {
+		t.Fatalf("verdict glyph should sit beside the answer at the bbox right edge, not beside the printed question: green=%d avg_x=%d", green, sumX/maxInt(1, green))
+	}
+}
+
+func TestPhotoAnnotator_UsesVerifiedAnswerBBoxRightEdge(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 1000, 400))
+	draw.Draw(src, src.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+	var raw bytes.Buffer
+	if err := png.Encode(&raw, src); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := NewPhotoAnnotator().Annotate(context.Background(), raw.Bytes(), []usecase.PhotoAnnotation{{
+		BBox: usecase.BBox{X: 0.10, Y: 0.20, W: 0.80, H: 0.30}, Correct: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := png.Decode(bytes.NewReader(got.Data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	green, sumX := 0, 0
+	for y := 0; y < out.Bounds().Dy(); y++ {
+		for x := 0; x < out.Bounds().Dx(); x++ {
+			pixel := color.RGBAModel.Convert(out.At(x, y)).(color.RGBA)
+			if int(pixel.G) > 130 && int(pixel.G) > int(pixel.R)+30 && int(pixel.G) > int(pixel.B)+30 {
+				green++
+				sumX += x
+			}
+		}
+	}
+	if green == 0 {
+		t.Fatal("missing green verdict glyph")
+	}
+	avgX := sumX / green
+	if avgX < 875 || avgX > 925 {
+		t.Fatalf("verified answer bbox should place the glyph beside its right edge: avg_x=%d", avgX)
+	}
+}
+
+func TestLayoutPhotoMarks_ResolvesActualPixelCollisionWithoutDroppingVerdicts(t *testing.T) {
+	marks := []usecase.PhotoAnnotation{
+		{QuestionNumber: 1, BBox: usecase.BBox{X: 0.50, Y: 0.20, W: 0.10, H: 0.08}, Correct: true},
+		{QuestionNumber: 2, BBox: usecase.BBox{X: 0.50, Y: 0.20, W: 0.10, H: 0.08}, Correct: false},
+	}
+	placements := layoutPhotoMarks(image.Rect(0, 0, 1280, 1707), marks)
+	if len(placements) != len(marks) {
+		t.Fatalf("pixel layout dropped a verified verdict: got=%d want=%d", len(placements), len(marks))
+	}
+	if placements[0].bounds.Overlaps(placements[1].bounds) {
+		t.Fatalf("pixel layout left verdict glyphs overlapping: first=%v second=%v", placements[0].bounds, placements[1].bounds)
+	}
+}
+
+func TestPhotoAnnotator_LocatorTileUsesUpperAnswerBandInsteadOfFollowingSectionHeading(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 1000, 1000))
+	draw.Draw(src, src.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+	var raw bytes.Buffer
+	if err := png.Encode(&raw, src); err != nil {
+		t.Fatal(err)
+	}
+	got, err := NewPhotoAnnotator().Annotate(context.Background(), raw.Bytes(), []usecase.PhotoAnnotation{{
+		BBox: usecase.BBox{X: 0.20, Y: 0.20, W: 0.30, H: 0.12}, Correct: false,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := png.Decode(bytes.NewReader(got.Data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	red, sumY := 0, 0
+	for y := 0; y < out.Bounds().Dy(); y++ {
+		for x := 0; x < out.Bounds().Dx(); x++ {
+			pixel := color.RGBAModel.Convert(out.At(x, y)).(color.RGBA)
+			if int(pixel.R) > 180 && int(pixel.R) > int(pixel.G)+40 && int(pixel.R) > int(pixel.B)+40 {
+				red++
+				sumY += y
+			}
+		}
+	}
+	if red == 0 {
+		t.Fatal("missing red verdict glyph")
+	}
+	avgY := sumY / red
+	if avgY < 228 || avgY > 252 {
+		t.Fatalf("locator tile glyph should sit in the upper answer band, not at a following heading: avg_y=%d", avgY)
+	}
+}
+
+func TestPhotoAnnotator_UnpositionedVerifiedItemsDoNotAppendStatusRailOrGuessCoordinates(t *testing.T) {
 	src := image.NewRGBA(image.Rect(0, 0, 240, 320))
 	draw.Draw(src, src.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
 	var raw bytes.Buffer
@@ -140,39 +260,20 @@ func TestPhotoAnnotator_UnpositionedVerifiedItemsAppendNumberedStatusRail(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Bounds().Dx() <= src.Bounds().Dx() || out.Bounds().Dy() != src.Bounds().Dy() {
-		t.Fatalf("unpositioned results need a separate side rail without resizing the worksheet: got=%v source=%v", out.Bounds(), src.Bounds())
+	if out.Bounds() != src.Bounds() {
+		t.Fatalf("unpositioned results must not resize the original worksheet: got=%v source=%v", out.Bounds(), src.Bounds())
 	}
 
-	green, red, dark := 0, 0, 0
 	for y := 0; y < out.Bounds().Dy(); y++ {
-		for x := src.Bounds().Dx(); x < out.Bounds().Dx(); x++ {
-			pixel := color.RGBAModel.Convert(out.At(x, y)).(color.RGBA)
-			if int(pixel.G) > 130 && int(pixel.G) > int(pixel.R)+30 && int(pixel.G) > int(pixel.B)+30 {
-				green++
-			}
-			if int(pixel.R) > 180 && int(pixel.R) > int(pixel.G)+40 && int(pixel.R) > int(pixel.B)+40 {
-				red++
-			}
-			if pixel.R < 90 && pixel.G < 90 && pixel.B < 90 {
-				dark++
-			}
-		}
-	}
-	if green < 40 || red < 40 || dark < 20 {
-		t.Fatalf("numbered status rail is missing verdict glyphs or question-number ink: green=%d red=%d dark=%d", green, red, dark)
-	}
-	// No guessed coordinates are ever burned onto the worksheet itself.
-	for y := 0; y < src.Bounds().Dy(); y++ {
-		for x := 0; x < src.Bounds().Dx(); x++ {
+		for x := 0; x < out.Bounds().Dx(); x++ {
 			if pixel := color.RGBAModel.Convert(out.At(x, y)).(color.RGBA); pixel != (color.RGBA{255, 255, 255, 255}) {
-				t.Fatalf("fallback annotation modified worksheet pixel (%d,%d): %#v", x, y, pixel)
+				t.Fatalf("unpositioned verdict guessed a worksheet coordinate at (%d,%d): %#v", x, y, pixel)
 			}
 		}
 	}
 }
 
-func TestPhotoAnnotator_StatusRailDoesNotShiftTrustedBBoxCoordinates(t *testing.T) {
+func TestPhotoAnnotator_UnpositionedVerdictDoesNotShiftTrustedBBoxOrDimensions(t *testing.T) {
 	src := image.NewRGBA(image.Rect(0, 0, 240, 320))
 	draw.Draw(src, src.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
 	var raw bytes.Buffer
@@ -191,17 +292,45 @@ func TestPhotoAnnotator_StatusRailDoesNotShiftTrustedBBoxCoordinates(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	greenAtOriginalAnchor := 0
+	if out.Bounds() != src.Bounds() {
+		t.Fatalf("mixed positioned/unpositioned marks changed worksheet dimensions: got=%v source=%v", out.Bounds(), src.Bounds())
+	}
+	greenAtOriginalAnswerSide := 0
 	for y := 60; y <= 110; y++ {
-		for x := 80; x <= 130; x++ {
+		for x := 100; x <= 145; x++ {
 			pixel := color.RGBAModel.Convert(out.At(x, y)).(color.RGBA)
 			if int(pixel.G) > 130 && int(pixel.G) > int(pixel.R)+30 && int(pixel.G) > int(pixel.B)+30 {
-				greenAtOriginalAnchor++
+				greenAtOriginalAnswerSide++
 			}
 		}
 	}
-	if greenAtOriginalAnchor < 40 {
-		t.Fatalf("trusted bbox was shifted when the fallback rail expanded the canvas: green_at_original_anchor=%d", greenAtOriginalAnchor)
+	if greenAtOriginalAnswerSide < 40 {
+		t.Fatalf("trusted bbox moved away from its original answer side: green_at_original_answer_side=%d", greenAtOriginalAnswerSide)
+	}
+}
+
+func TestPhotoAnnotator_BenchmarkGlyphIsPlainColoredStrokeWithoutFilledBadge(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 240, 240))
+	draw.Draw(src, src.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+	var raw bytes.Buffer
+	if err := png.Encode(&raw, src); err != nil {
+		t.Fatal(err)
+	}
+	got, err := NewPhotoAnnotator().Annotate(context.Background(), raw.Bytes(), []usecase.PhotoAnnotation{{
+		BBox: usecase.BBox{X: 0.20, Y: 0.20, W: 0.50, H: 0.25}, Correct: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := png.Decode(bytes.NewReader(got.Data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A plain ✓ has no
+	// colored circular badge above the stroke, matching mainstream homework-marking visuals.
+	pixel := color.RGBAModel.Convert(out.At(138, 72)).(color.RGBA)
+	if pixel != (color.RGBA{255, 255, 255, 255}) {
+		t.Fatalf("verdict should be a plain colored stroke, not a filled badge: %#v", pixel)
 	}
 }
 

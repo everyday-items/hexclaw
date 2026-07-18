@@ -49,6 +49,13 @@ type SolveAdapter struct {
 	retryGen        RetryGenerateFunc        // 轻量「再练一道」出题；nil 时回退全链
 	causeSummaryGen CauseSummaryGenerateFunc // 轻量错因摘要；nil 时留空由用户填写
 	prepReviewGen   PrepReviewGenerateFunc   // 轻量备课回顾；nil 时由用例层诚实降级
+	workFeedbackGen WorkFeedbackGenerateFunc // 作品点评生成（work_feedback.go）；nil 时诚实报错
+	// workFeedbackVision 美术作品观察式点评的视觉闭包（work_feedback.go）：复用识题链的
+	// VisionFunc 原语（原图 bytes + 提示词 → 视觉模型文本）；nil 时美术点评诚实报错。
+	workFeedbackVision VisionFunc
+	// workFeedbackSkillLoader 盘上 marketplace skill 内容加载闭包（work_feedback.go）：
+	// 点评方法论基座「盘上→内嵌→硬编码」链的第一级；nil 时直接从内嵌快照起链。
+	workFeedbackSkillLoader SkillContentLoader
 }
 
 // SolveAdapterOption 装配可选能力（保 NewSolveAdapter 单参数向后兼容）。
@@ -230,9 +237,19 @@ func gradeOutcomeFromResult(res *skill.Result, err error) (usecase.GradeOutcome,
 	if err != nil {
 		return usecase.GradeOutcome{}, fmt.Errorf("solve adapter: invalid grade_correct %q: %w", raw, err)
 	}
+	// 判定统一 Verdict 五值（§4.5 布尔删除）：engine 侧 grade_correct 布尔在 adapter 边界
+	// 一次性收敛为 agree/disagree，领域层不再出现布尔判定。
+	verdict := usecase.VerdictDisagree
+	if correct {
+		verdict = usecase.VerdictAgree
+	}
 	return usecase.GradeOutcome{
-		Correct: correct,
+		Verdict: verdict,
 		// 错步/错因也可能含模型 LaTeX（\times/\frac/\(…\)）——桌面直接展示，统一归一为 Unicode。
+		// 口径裁决（K12-INV-019 终局对账 2026-07-18，存储规范形）：批改产物**入库前**在本
+		// adapter 边界 Normalize 为 Unicode 规范形态是正确口径——存储即规范形，下游 IM/导出/
+		// 桌面全部拿到干净 Unicode；channel.LaTeXToUnicode 出口兜底是第二道防线。
+		// 本 Normalize 保留勿删（守卫测试 inv019_canonical_store_test.go）。
 		WrongStep:  adapter.NormalizeMathText(m["grade_wrong_step"]),
 		ErrorCause: adapter.NormalizeMathText(m["grade_misconception"]),
 		// KnowledgePoint 由识题/课标决定，不来自 grader；用例层从识题结果回填。
@@ -270,6 +287,13 @@ func evidenceFromMeta(m map[string]string) usecase.SolveEvidence {
 //  2. 数学 LaTeX → Unicode（adapter.NormalizeMathText：\times→× / \frac{a}{b}→a/b / \text{cm}^3→cm³ /
 //     剥 \(…\)\[…\]$…$）。治本 BUG-20260713：桌面 API 路径不经 IM egress，此前原样漏 LaTeX 给前端。
 //     幂等——IM egress 出站再归一化一次无害。
+//
+// 口径裁决（K12-INV-019 终局对账 2026-07-18，存储规范形）：canonical_answer 与 solution
+// **入库前**经此处 Normalize 为 Unicode 规范形态是正确口径（usecase.pipeline 判错入库
+// CanonicalAnswer=sr.Solution 即已规范形）——存储即规范形，下游 IM/导出/桌面全部拿到干净
+// Unicode，导出侧因此**不做**二次转换（原样保留即 INV-019「导出保留 canonical 数学公式」）；
+// channel.LaTeXToUnicode 出口兜底是第二道防线。本 Normalize 保留勿删
+// （守卫测试 inv019_canonical_store_test.go / math_normalize_20260713_test.go）。
 func stripReports(content string) string {
 	if i := strings.Index(content, reportSentinel); i >= 0 {
 		content = content[:i]

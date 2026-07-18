@@ -74,7 +74,7 @@ func TestSolveAdapter_Grade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Correct {
+	if out.Verdict != usecase.VerdictDisagree {
 		t.Error("应判错")
 	}
 	if out.WrongStep != "3.8×3 误算为 10.4" || out.ErrorCause != "小数点错位" {
@@ -87,7 +87,7 @@ func TestSolveAdapter_Grade_Correct(t *testing.T) {
 		gradeResult: &skill.Result{Metadata: map[string]string{"grade_correct": "true"}},
 	})
 	out, _ := a.Grade(context.Background(), "1+1=?", "2", "")
-	if !out.Correct {
+	if out.Verdict != usecase.VerdictAgree {
 		t.Error("应判对")
 	}
 }
@@ -116,7 +116,7 @@ func TestSolveAdapter_GradeVerifiedUsesInternalFastPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !out.Correct || exec.verifiedCalls != 1 || exec.executeCalls != 0 {
+	if out.Verdict != usecase.VerdictAgree || exec.verifiedCalls != 1 || exec.executeCalls != 0 {
 		t.Fatalf("out=%+v verified=%d execute=%d", out, exec.verifiedCalls, exec.executeCalls)
 	}
 	if exec.gotSolution != "解：3.8×3=11.4\n答案：11.4" {

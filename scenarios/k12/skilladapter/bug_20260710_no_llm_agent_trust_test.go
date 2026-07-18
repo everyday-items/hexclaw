@@ -21,7 +21,7 @@ import (
 )
 
 func TestBUG20260710_H1_GradeSkillMustNotTrustLLMAgentArg(t *testing.T) {
-	deps := newDeps(t, usecase.GradeOutcome{Correct: true})
+	deps := newDeps(t, usecase.GradeOutcome{Verdict: usecase.VerdictAgree})
 	s := skilladapter.NewGradeSkill(deps)
 
 	// ctx 无 routed agent + LLM 幻觉传 agent 参数 → 必须报错拒绝，不得写库。
@@ -39,7 +39,7 @@ func TestBUG20260710_H1_GradeSkillMustNotTrustLLMAgentArg(t *testing.T) {
 }
 
 func TestBUG20260710_H1_ReviewSkillMustNotTrustLLMAgentArg(t *testing.T) {
-	deps := newDeps(t, usecase.GradeOutcome{Correct: true})
+	deps := newDeps(t, usecase.GradeOutcome{Verdict: usecase.VerdictAgree})
 	s := skilladapter.NewReviewSkill(deps)
 
 	_, err := s.Execute(context.Background(), map[string]any{
@@ -56,7 +56,7 @@ func TestBUG20260710_H1_ReviewSkillMustNotTrustLLMAgentArg(t *testing.T) {
 
 // 正路径不受影响：ctx 带已路由 Agent 时照常工作（防修复写宽成"全拒"）。
 func TestBUG20260710_H1_GradeSkillCtxScopeStillWorks(t *testing.T) {
-	deps := newDeps(t, usecase.GradeOutcome{Correct: true})
+	deps := newDeps(t, usecase.GradeOutcome{Verdict: usecase.VerdictAgree})
 	s := skilladapter.NewGradeSkill(deps)
 
 	ctx := skill.WithRoutedAgent(context.Background(), "mingming")

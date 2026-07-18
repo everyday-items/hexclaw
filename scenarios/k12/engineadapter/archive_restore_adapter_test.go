@@ -12,6 +12,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/curriculum"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
 
 	_ "modernc.org/sqlite"
@@ -19,7 +20,7 @@ import (
 
 type archiveRestoreFixture struct {
 	db            *sql.DB
-	records       *records.Store
+	records       *k12storage.Store
 	dispatcher    *router.Dispatcher
 	agentStore    *router.SQLiteStore
 	restore       *ArchiveRestoreAdapter
@@ -60,7 +61,7 @@ func newArchiveRestoreFixture(t *testing.T) *archiveRestoreFixture {
 	if err := reg.Assemble(k12.Pack(curriculum.New())); err != nil {
 		t.Fatal(err)
 	}
-	recordStore := records.NewStore(db, reg.Records)
+	recordStore := k12storage.NewStore(db, reg.Records)
 	old, err := k12.NewMistakeRecord("mingming", "old-session", k12.MistakeFields{Question: "旧题"})
 	if err != nil {
 		t.Fatal(err)

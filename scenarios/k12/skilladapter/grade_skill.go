@@ -110,7 +110,8 @@ func renderGradeContent(res usecase.GradeResult) string {
 		return fmt.Sprintf("这道题孩子还没作答，先把解法和答案讲清楚：\n%s\n给家长的引导：让孩子照着思路自己再做一遍。", res.Solution)
 	}
 	var b strings.Builder
-	if res.Outcome.Correct {
+	// 判定统一 Verdict 五值（§4.5 布尔删除）：agree=答对。
+	if res.Outcome.Verdict == usecase.VerdictAgree {
 		b.WriteString("答对了。可以追问一句他的思路，防止蒙对。")
 		return b.String()
 	}
@@ -124,7 +125,8 @@ func renderGradeContent(res usecase.GradeResult) string {
 
 func gradeMetadata(res usecase.GradeResult, problem string, knowledgePoints []string) map[string]string {
 	m := map[string]string{
-		"k12_correct":        boolStr(res.Outcome.Correct),
+		// 判定统一 Verdict 五值（§4.5 布尔删除）：k12_correct 布尔键随之退役。
+		"k12_verdict":        string(res.Outcome.Verdict),
 		"k12_out_of_scope":   boolStr(res.OutOfScope),
 		"k12_record_created": boolStr(res.RecordCreated),
 		"badge":              res.Evidence.Badge(),

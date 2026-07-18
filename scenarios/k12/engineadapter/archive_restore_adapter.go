@@ -8,23 +8,24 @@ import (
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
 // ArchiveRestoreAdapter is the production durability boundary for K12 restore.
-// agent_records and agents.metadata are written through the same SQLite tx;
+// k12_* typed tables and agents.metadata are written through the same SQLite tx;
 // Dispatcher keeps profile readers behind its write lock until that tx commits
 // and the committed AgentConfig has been published in memory.
 type ArchiveRestoreAdapter struct {
 	db         *sql.DB
-	records    *records.Store
+	records    *k12storage.Store
 	dispatcher *router.Dispatcher
 	agents     *router.SQLiteStore
 }
 
 func NewArchiveRestoreAdapter(
 	db *sql.DB,
-	recordStore *records.Store,
+	recordStore *k12storage.Store,
 	dispatcher *router.Dispatcher,
 	agentStore *router.SQLiteStore,
 ) *ArchiveRestoreAdapter {
