@@ -1,8 +1,8 @@
 {
   "version": "2.0.0",
-  "updated_at": "2026-07-08T03:20:38Z",
+  "updated_at": "2026-07-18T01:15:01Z",
   "generated_by": "scripts/generate-index.py",
-  "count": 73,
+  "count": 77,
   "skills": [
     {
       "name": "agent-browser",
@@ -77,6 +77,36 @@
       "size": 2106
     },
     {
+      "name": "art-feedback",
+      "display_name": "美术作品反馈",
+      "description": "小学生美术作品的形成性反馈与指导——构图/色彩/线条/空间/材料效果五要素观察 + 儿童绘画发展阶段适龄评价，只依据画面可见证据，不打分不排名不重画。用于家长上传孩子画作、手工照片求点评时。",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "icon": "🎨",
+      "trust": "first-party",
+      "min_engine_version": "0.5.0",
+      "license": "Apache-2.0",
+      "schema_version": "1",
+      "eval": "eval/k12/art-feedback",
+      "acceptance": "先描述后评价 · 只说画面可见证据 · 适龄不越阶 · 不打分不排名不重画 · 建议皆可执行",
+      "tags": [
+        "k12",
+        "art",
+        "feedback",
+        "works"
+      ],
+      "requires": [
+        "grade-constraint",
+        "k12-pedagogy"
+      ],
+      "file": "skills/art-feedback.md",
+      "sha256": "618d78d183f7cb7013307aa080cd57d6184a957d9742e479e604253536374326",
+      "size": 8434,
+      "downloads": 0,
+      "rating": 0
+    },
+    {
       "name": "arxiv-reader",
       "display_name": "arXiv Reader",
       "description": "自动解析 arXiv 论文，提取关键信息、方法论和结论，生成结构化摘要",
@@ -141,7 +171,7 @@
       "category": "education",
       "icon": "🧪",
       "trust": "first-party",
-      "min_engine_version": "0.5.0-beta",
+      "min_engine_version": "0.5.0",
       "license": "Apache-2.0",
       "schema_version": "1",
       "eval": "eval/k12/chemistry",
@@ -169,12 +199,12 @@
       "name": "chinese-tutor",
       "display_name": "语文辅导老师",
       "description": "辅导、批改小学到初中语文——阅读分点作答、作文共写不代写、字词默写判定、病句六类。用于家长辅导孩子语文作业（字词默写、病句、阅读理解、作文、文言文古诗）时。",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "author": "hexclaw",
       "category": "education",
       "icon": "📖",
       "trust": "first-party",
-      "min_engine_version": "0.5.0-beta",
+      "min_engine_version": "0.5.0",
       "license": "Apache-2.0",
       "schema_version": "1",
       "eval": "eval/k12/chinese",
@@ -195,8 +225,8 @@
         "record-candidate"
       ],
       "file": "skills/chinese-tutor.md",
-      "sha256": "c9a7d496938aa35b4c42addc0a6e5071fafe0c92305c6b9a7c7ed2559bd763a6",
-      "size": 4329,
+      "sha256": "d3d680010c7a596624234d4e69d4a6d9b0fc5fa6efe26e5b7adb3458870d7cee",
+      "size": 4589,
       "downloads": 0,
       "rating": 0
     },
@@ -308,7 +338,7 @@
       "rating": 0,
       "icon": "💡",
       "trust": "first-party",
-      "min_engine_version": "0.5.0-beta",
+      "min_engine_version": "0.5.0",
       "license": "Apache-2.0",
       "schema_version": "1",
       "eval": "eval/k12/concept",
@@ -493,7 +523,7 @@
       "category": "education",
       "icon": "🔤",
       "trust": "first-party",
-      "min_engine_version": "0.5.0-beta",
+      "min_engine_version": "0.5.0",
       "license": "Apache-2.0",
       "schema_version": "1",
       "eval": "eval/k12/english",
@@ -561,12 +591,12 @@
       "name": "exercise-generator",
       "display_name": "K12 出题器",
       "description": "按年级边界出练习题、变式题、错题卷——每题过验算、变式换数换情境不变考点、错题卷精准复现薄弱点。用于家长要给孩子出题、组卷、单元测、默写卷时。",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "author": "hexclaw",
       "category": "education",
       "icon": "✏️",
       "trust": "first-party",
-      "min_engine_version": "0.5.0-beta",
+      "min_engine_version": "0.5.0",
       "license": "Apache-2.0",
       "schema_version": "1",
       "eval": "eval/k12/exercise",
@@ -585,8 +615,8 @@
         "exercise-set"
       ],
       "file": "skills/exercise-generator.md",
-      "sha256": "4caa1d3ddb30899d6298fcddc5bcac8219b665871eb8b0442eda95e486123ebd",
-      "size": 4145,
+      "sha256": "40508ad75594b12c36c905fb2fcc388bfca568c9848c4d153def900d0d3995e1",
+      "size": 4226,
       "downloads": 0,
       "rating": 0
     },
@@ -702,12 +732,12 @@
       "name": "grade-constraint",
       "display_name": "年级边界约束（基座）",
       "description": "把讲解锁在孩子当前学段学过的知识内，提供超纲说法的学段内替代话术。所有学科 tutor 讲题前套用。用于判断解法/知识点是否超纲、需要按年级找替代讲法时。",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "author": "hexclaw",
       "category": "education",
       "icon": "📏",
       "trust": "first-party",
-      "min_engine_version": "0.5.0-beta",
+      "min_engine_version": "0.5.0",
       "license": "Apache-2.0",
       "schema_version": "1",
       "eval": "eval/k12/grade-constraint",
@@ -723,8 +753,8 @@
         "grade-boundary"
       ],
       "file": "skills/grade-constraint.md",
-      "sha256": "8e88f8a43bcb34f88550b6de43af8cb66056f36e10f470e39679aa42c99fe038",
-      "size": 6402,
+      "sha256": "81666df078c333d45c901f5cb4b391fbc1d95db4b50be3bdeff14a0fadc7f01d",
+      "size": 6462,
       "downloads": 0,
       "rating": 0
     },
@@ -732,12 +762,12 @@
       "name": "homework-checker",
       "display_name": "作业识题批改助手",
       "description": "拍题批改第一入口——识题、OCR 回显护栏核对、分题、路由到对应学科 tutor、逐题批改并把错题入库。用于家长拍照或粘贴整页作业让检查时。",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "author": "hexclaw",
       "category": "education",
       "icon": "📷",
       "trust": "first-party",
-      "min_engine_version": "0.5.0-beta",
+      "min_engine_version": "0.5.0",
       "license": "Apache-2.0",
       "schema_version": "1",
       "eval": "eval/k12/recognize",
@@ -754,8 +784,8 @@
         "math-tutor",
         "chinese-tutor",
         "english-tutor",
-        "physics-tutor",
-        "chemistry-tutor",
+        "science-tutor",
+        "information-technology-tutor",
         "concept-explainer"
       ],
       "outputs": [
@@ -763,8 +793,8 @@
         "record-candidate"
       ],
       "file": "skills/homework-checker.md",
-      "sha256": "e913ce06df88949899e58d2e65d70daaea08bfeafd6a76a06878e430e38ebd3c",
-      "size": 3094,
+      "sha256": "5d60b179b5ee9f967be0d07559f1a9490ea5bdbc56e9bb4d0f484fd2a255b039",
+      "size": 3588,
       "downloads": 0,
       "rating": 0
     },
@@ -854,6 +884,40 @@
       "size": 17723
     },
     {
+      "name": "information-technology-tutor",
+      "display_name": "信息科技辅导老师",
+      "description": "辅导小学信息科技——图形化编程（顺序/循环/分支）、算法步骤、规则题与程序运行结果，用 PRIMM 法带孩子读程序改程序，不代写完整程序，运行结果以沙箱为准。用于家长辅导孩子编程作业、Scratch 作品、信息科技题时。",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "icon": "💻",
+      "trust": "first-party",
+      "min_engine_version": "0.5.0",
+      "license": "Apache-2.0",
+      "schema_version": "1",
+      "eval": "eval/k12/infotech",
+      "acceptance": "不代写完整程序 · 运行结果以沙箱回传为准 · 小学只用图形化不上文本代码 · 信息安全适龄正向",
+      "tags": [
+        "k12",
+        "information-technology",
+        "coding",
+        "tutoring"
+      ],
+      "requires": [
+        "grade-constraint",
+        "k12-pedagogy",
+        "concept-explainer"
+      ],
+      "outputs": [
+        "record-candidate"
+      ],
+      "file": "skills/information-technology-tutor.md",
+      "sha256": "dd4cae246805766c20d79671a1923f81524952f379c2dcba0555f26f9a7d7b26",
+      "size": 5328,
+      "downloads": 0,
+      "rating": 0
+    },
+    {
       "name": "json-transformer",
       "display_name": "JSON Transformer",
       "description": "JSON 数据格式转换、清洗和验证工具，支持 JSONPath 和 Schema 校验",
@@ -880,7 +944,7 @@
       "category": "education",
       "icon": "🎓",
       "trust": "first-party",
-      "min_engine_version": "0.5.0-beta",
+      "min_engine_version": "0.5.0",
       "license": "Apache-2.0",
       "schema_version": "1",
       "eval": "eval/k12/pedagogy",
@@ -979,12 +1043,12 @@
       "name": "math-tutor",
       "display_name": "数学辅导老师",
       "description": "辅导、讲解、批改小学到初中数学——波利亚四步、按年级边界讲、渐进提示不直接给答案、批改归错因。用于家长辅导孩子数学作业或讲数学题（解方程、应用题、竖式、几何、分数小数）时。",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "author": "hexclaw",
       "category": "education",
       "icon": "🧮",
       "trust": "first-party",
-      "min_engine_version": "0.5.0-beta",
+      "min_engine_version": "0.5.0",
       "license": "Apache-2.0",
       "schema_version": "1",
       "eval": "eval/k12/math",
@@ -1004,8 +1068,8 @@
         "record-candidate"
       ],
       "file": "skills/math-tutor.md",
-      "sha256": "976fadf802b9a0958e7b3d848d2dd3c55963f76e6092363a40972a86d425abdb",
-      "size": 3236,
+      "sha256": "82c19ed9fd7b233865a596755cdf9c1b1b338eec9486d0aab364a805d842ad21",
+      "size": 4390,
       "downloads": 0,
       "rating": 0
     },
@@ -1109,7 +1173,7 @@
       "category": "education",
       "icon": "⚛️",
       "trust": "first-party",
-      "min_engine_version": "0.5.0-beta",
+      "min_engine_version": "0.5.0",
       "license": "Apache-2.0",
       "schema_version": "1",
       "eval": "eval/k12/physics",
@@ -1223,6 +1287,39 @@
       "file": "skills/reading-comprehension.md",
       "sha256": "c14d5a11547686be9bde261c6bc0179e2ed21f83f503927d7628a6467bb48086",
       "size": 1134
+    },
+    {
+      "name": "science-tutor",
+      "display_name": "科学辅导老师",
+      "description": "辅导小学科学——事实、观察、实验（公平实验/变量控制）与图结构题（食物链、电路、生命周期），探究式引导不灌结论，证据不足判待复核。用于家长辅导孩子科学作业、实验记录、观察日记时。",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "icon": "🔬",
+      "trust": "first-party",
+      "min_engine_version": "0.5.0",
+      "license": "Apache-2.0",
+      "schema_version": "1",
+      "eval": "eval/k12/science",
+      "acceptance": "证据不足判待复核 · 不编造实验结果 · 实验必带安全提示 · 不引入初中物化公式",
+      "tags": [
+        "k12",
+        "science",
+        "tutoring"
+      ],
+      "requires": [
+        "grade-constraint",
+        "k12-pedagogy",
+        "concept-explainer"
+      ],
+      "outputs": [
+        "record-candidate"
+      ],
+      "file": "skills/science-tutor.md",
+      "sha256": "1013aa65ba8a30d903d8331aa3fc817dbfb726c1421fcc73be4fa6034e902c36",
+      "size": 4965,
+      "downloads": 0,
+      "rating": 0
     },
     {
       "name": "security-audit",
@@ -1483,6 +1580,41 @@
       "file": "skills/web-researcher.md",
       "sha256": "0834f6358b043bf73336229dc55e22f3e500a76ac8e68272f4e4edfc0510b522",
       "size": 1583
+    },
+    {
+      "name": "writing-feedback",
+      "display_name": "语文写作反馈（作品）",
+      "description": "小学生作文/习作的形成性反馈与修改指导——切题、结构、表达、基础规范四维评价，引用原稿证据、一次只改 1～3 处、共写不代写、不打分。用于家长上传孩子作文照片或文字稿求点评、求修改方向时。",
+      "version": "1.0.0",
+      "author": "hexclaw",
+      "category": "education",
+      "icon": "✍️",
+      "trust": "first-party",
+      "min_engine_version": "0.5.0",
+      "license": "Apache-2.0",
+      "schema_version": "1",
+      "eval": "eval/k12/writing-feedback",
+      "acceptance": "零代写正文 · 反馈必引原句 · 一次最多 3 处 · 不打分不评级 · 学段不越级",
+      "tags": [
+        "k12",
+        "chinese",
+        "writing",
+        "feedback",
+        "works"
+      ],
+      "requires": [
+        "grade-constraint",
+        "k12-pedagogy",
+        "chinese-tutor"
+      ],
+      "outputs": [
+        "record-candidate"
+      ],
+      "file": "skills/writing-feedback.md",
+      "sha256": "42e8cc5b43b4db75d8b76681448c3d771c0e671b294d31d98fcac194198a9d0c",
+      "size": 8035,
+      "downloads": 0,
+      "rating": 0
     },
     {
       "name": "xlsx-generator",
