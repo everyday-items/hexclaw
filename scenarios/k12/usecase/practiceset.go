@@ -5,12 +5,15 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
 )
 
 // PracticeSetItem 练习集条目（记录 + 领域字段）。
@@ -154,11 +157,10 @@ func (d Deps) FinalizeBasket(ctx context.Context, agentName, recordID, via, targ
 		v.Fields.Title = k12.GeneratePaperTitle(v.Fields, ts)
 	}
 	// 呈现物（§4.13）：卷面号（OCR 友好双 ID）、按学科分组的卷面题号、固化时间与方式。
-	prior, err := d.countFinalizedSets(ctx, agentName)
+	v.Fields.PaperNo, err = d.Records.ReservePracticePaperNo(ctx, agentName, ts.Unix())
 	if err != nil {
-		return PracticeSetView{}, 0, err
+		return PracticeSetView{}, 0, fmt.Errorf("usecase: 预占卷面号: %w", err)
 	}
-	v.Fields.PaperNo = k12.GeneratePaperNo(ts, prior)
 	k12.AssignPaperSeqs(v.Fields.Items)
 	// #4c（2026-07-18）：入卷题铸造独立 practice_problem_id——变式题面≠原题，
 	// 复批 Attempt 归属铸造 Problem，不挂来源错题；SourceProblemID 保留为 derived_from。
@@ -471,46 +473,162 @@ func (d Deps) countFinalizedSets(ctx context.Context, agentName string) (int, er
 	return n, nil
 }
 
-// SubmitReturn 按题回传（2026-07-18 部分回传裁决，§3.8）：itemIDs 为本次照片覆盖的入卷题；
-// 部分回传合法（首次回传 assigned → submitted），补传是同一卷的合法追加，重复回传同一题幂等。
-func (d Deps) SubmitReturn(ctx context.Context, agentName, recordID string, itemIDs []string) error {
+// PracticeReturnInput 是一次只追加回传批次。Webhook 可以在一个已验签事件中携带
+// 多批；SubmitReturns 会先验证完整集合，再用一次聚合写事务提交，禁止“前一批成功、
+// 后一批失败”的半状态。
+type PracticeReturnInput struct {
+	ReturnID string
+	AssetID  string
+	ItemIDs  []string
+}
+
+// SubmitReturn 保留单批命令面，内部统一进入原子多批实现。
+func (d Deps) SubmitReturn(ctx context.Context, agentName, recordID, returnID, assetID string, itemIDs []string) (PracticeSetView, error) {
+	return d.SubmitReturns(ctx, agentName, recordID, []PracticeReturnInput{{
+		ReturnID: returnID, AssetID: assetID, ItemIDs: itemIDs,
+	}})
+}
+
+// SubmitReturns 原子追加一组作答照片证据（DD-019/DD-028）。所有资产归属、题号、
+// return_id 冲突和卷状态在写入前完成验证；最终只调用一次 savePracticeFields。
+func (d Deps) SubmitReturns(ctx context.Context, agentName, recordID string, inputs []PracticeReturnInput) (PracticeSetView, error) {
+	agentName = strings.TrimSpace(agentName)
+	recordID = strings.TrimSpace(recordID)
+	if agentName == "" || recordID == "" || len(inputs) == 0 {
+		return PracticeSetView{}, fmt.Errorf("%w: agent / record_id / return_assets 均必填", ErrInvalidInput)
+	}
 	v, err := d.GetPracticeSet(ctx, agentName, recordID)
 	if err != nil {
-		return err
+		return PracticeSetView{}, err
 	}
 	if v.Record.Status != k12.PracticeStatusAssigned && v.Record.Status != k12.PracticeStatusSubmitted {
-		return fmt.Errorf("usecase: 只有待完成/已回传卷可回传作答，当前 %s", v.Record.Status)
+		return PracticeSetView{}, fmt.Errorf("usecase: 只有待完成/已回传卷可回传作答，当前 %s", v.Record.Status)
 	}
-	byID := map[string]int{}
+	byID := make(map[string]int, len(v.Fields.Items))
 	for i := range v.Fields.Items {
 		byID[v.Fields.Items[i].ItemID] = i
 	}
-	for _, id := range itemIDs {
-		i, ok := byID[id]
-		if !ok {
-			return fmt.Errorf("usecase: 练习项 %s 不在本卷内", id)
+	changed := false
+	for _, input := range inputs {
+		returnID := strings.TrimSpace(input.ReturnID)
+		assetID := strings.TrimSpace(input.AssetID)
+		if returnID == "" || assetID == "" || len(input.ItemIDs) == 0 {
+			return PracticeSetView{}, fmt.Errorf("%w: return_id / asset_id / item_ids 均必填", ErrInvalidInput)
 		}
-		if !k12.PracticeItemPublishable(v.Fields.Items[i]) {
-			return fmt.Errorf("usecase: 练习项 %s 是被跳过的阻断题，不在卷面上", id)
+		owner, ok := assetstore.OwnerOf(assetID)
+		if !ok || owner != agentName {
+			return PracticeSetView{}, fmt.Errorf("%w: 回传照片不存在或不属于当前辅导实例", ErrInvalidInput)
 		}
-		v.Fields.Items[i].Returned = true // 幂等：重复回传同一题不产生副作用
+		if _, err := assetstore.PathFromID(assetID); err != nil {
+			return PracticeSetView{}, fmt.Errorf("%w: 回传照片不可用: %v", ErrInvalidInput, err)
+		}
+		requested := make(map[string]struct{}, len(input.ItemIDs))
+		for _, rawID := range input.ItemIDs {
+			id := strings.TrimSpace(rawID)
+			if id == "" {
+				return PracticeSetView{}, fmt.Errorf("%w: item_ids 不得含空值", ErrInvalidInput)
+			}
+			if _, exists := requested[id]; exists {
+				return PracticeSetView{}, fmt.Errorf("%w: item_id %q 重复", ErrInvalidInput, id)
+			}
+			requested[id] = struct{}{}
+		}
+		canonical := make([]string, 0, len(requested))
+		for _, item := range v.Fields.Items {
+			if _, selected := requested[item.ItemID]; selected {
+				canonical = append(canonical, item.ItemID)
+			}
+		}
+		if len(canonical) != len(requested) {
+			for id := range requested {
+				if _, exists := byID[id]; !exists {
+					return PracticeSetView{}, fmt.Errorf("%w: 练习项 %s 不在本卷内", ErrInvalidInput, id)
+				}
+			}
+		}
+		replayed := false
+		for _, prior := range v.Fields.ReturnAssets {
+			if prior.ReturnID != returnID {
+				continue
+			}
+			if prior.AssetID == assetID && equalStringSlice(prior.ItemIDs, canonical) {
+				replayed = true
+				break
+			}
+			return PracticeSetView{}, fmt.Errorf("%w: return_id %q 已绑定其他回传载荷", ErrInvalidInput, returnID)
+		}
+		if replayed {
+			continue
+		}
+		for _, id := range canonical {
+			i := byID[id]
+			if !k12.PracticeItemPublishable(v.Fields.Items[i]) {
+				return PracticeSetView{}, fmt.Errorf("%w: 练习项 %s 是被跳过的阻断题，不在卷面上", ErrInvalidInput, id)
+			}
+			v.Fields.Items[i].Returned = true
+		}
+		v.Fields.ReturnAssets = append(v.Fields.ReturnAssets, k12.PracticeReturnAsset{
+			ReturnID: returnID, AssetID: assetID, ItemIDs: canonical, ReturnedAt: d.now(),
+		})
+		changed = true
 	}
-	return d.savePracticeFields(ctx, v, k12.PracticeStatusSubmitted)
+	if !changed {
+		return v, nil
+	}
+	if err := d.savePracticeFields(ctx, v, k12.PracticeStatusSubmitted); err != nil {
+		// 并发完全重放的输家回读赢家；所有批次都完全一致才按幂等成功。
+		if errors.Is(err, records.ErrVersionConflict) {
+			latest, getErr := d.GetPracticeSet(ctx, agentName, recordID)
+			if getErr == nil && practiceReturnsContain(latest.Fields.ReturnAssets, inputs) {
+				return latest, nil
+			}
+			if getErr == nil {
+				for _, input := range inputs {
+					for _, prior := range latest.Fields.ReturnAssets {
+						if prior.ReturnID == strings.TrimSpace(input.ReturnID) && prior.AssetID != strings.TrimSpace(input.AssetID) {
+							return PracticeSetView{}, fmt.Errorf("%w: return_id %q 已绑定其他回传载荷", ErrInvalidInput, input.ReturnID)
+						}
+					}
+				}
+			}
+		}
+		return PracticeSetView{}, err
+	}
+	return d.GetPracticeSet(ctx, agentName, recordID)
 }
 
-// SubmitPracticeSet 整卷回传（= SubmitReturn 覆盖全部入卷题），兼容单步回传场景。
-func (d Deps) SubmitPracticeSet(ctx context.Context, agentName, recordID string) error {
-	v, err := d.GetPracticeSet(ctx, agentName, recordID)
-	if err != nil {
-		return err
-	}
-	all := []string{}
-	for _, it := range v.Fields.Items {
-		if k12.PracticeItemPublishable(it) {
-			all = append(all, it.ItemID)
+func practiceReturnsContain(prior []k12.PracticeReturnAsset, inputs []PracticeReturnInput) bool {
+	for _, input := range inputs {
+		found := false
+		for _, item := range prior {
+			if item.ReturnID == strings.TrimSpace(input.ReturnID) && item.AssetID == strings.TrimSpace(input.AssetID) {
+				requested := append([]string(nil), input.ItemIDs...)
+				sort.Strings(requested)
+				actual := append([]string(nil), item.ItemIDs...)
+				sort.Strings(actual)
+				if equalStringSlice(actual, requested) {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			return false
 		}
 	}
-	return d.SubmitReturn(ctx, agentName, recordID, all)
+	return true
+}
+
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // GradePracticeSet 复批（submitted → graded），空结论旧行为：整卷按已回传直接转已批改，
@@ -543,7 +661,8 @@ type PracticeGradeResult struct {
 }
 
 // GradePracticeSetItems 逐题结论复批（§3.8 第 3-4 条，2026-07-18 裁决）：
-//   - 结论只允许落在入卷（verified）题上；给结论即视为该题已回传（照片覆盖到即出结果）。
+//   - 结论只允许落在入卷（verified）且已有 return_assets 覆盖证据的题上；复批不得
+//     反向伪造照片回传事实。
 //   - 结论（复批 Attempt 的等价物）挂在练习项自身——其归属对象是固化时铸造的
 //     practice_problem_id（#4c 裁决：变式题面≠原题，不得挂来源错题 Problem）；
 //     source_problem_id 仅作 derived_from 来源链，用于向来源错题回写复习信号：
@@ -575,14 +694,16 @@ func (d Deps) GradePracticeSetItems(ctx context.Context, agentName, recordID str
 		if !k12.PracticeItemPublishable(*it) {
 			return PracticeSetView{}, fmt.Errorf("%w: 练习项 %s 是被跳过的阻断题，不在卷面上，不能给结论", ErrInvalidInput, res.ItemID)
 		}
+		if !it.Returned {
+			return PracticeSetView{}, fmt.Errorf("%w: 练习项 %s 尚无 return_assets 照片覆盖证据，不能给复批结论", ErrInvalidInput, res.ItemID)
+		}
 		if it.ResultCorrect != nil && *it.ResultCorrect == res.Correct {
 			continue // 幂等：重复同一结论不重复联动错题
 		}
 		correct := res.Correct
 		it.ResultCorrect = &correct
-		// Returned=回传覆盖（照片盖到哪些题）、ResultCorrect=复批结论（对错）——两字段语义
-		// 独立不合并；给结论蕴含照片已覆盖该题，故此处同步置回传（§3.8 第 4 条，补传合法）。
-		it.Returned = true
+		// Returned=return_assets 照片覆盖投影、ResultCorrect=复批结论（对错），两字段
+		// 独立不合并；DD-028 后复批不能反向伪造 Returned，证据必须先由 SubmitReturn 追加。
 		if it.SourceProblemID != "" {
 			if err := d.applyRegradeOutcome(ctx, it.SourceProblemID, correct); err != nil {
 				return PracticeSetView{}, err
@@ -630,6 +751,7 @@ func (d Deps) applyRegradeOutcome(ctx context.Context, sourceID string, correct 
 		return d.MarkRetried(ctx, sourceID, rec.Version)
 	}
 	now := d.now()
+	firstDue := now + reviewIntervalForStage(0)
 	switch rec.Collection {
 	case k12.CollectionMistakes:
 		f, _ := k12.ParseMistakeFields(rec.Fields)
@@ -638,7 +760,7 @@ func (d Deps) applyRegradeOutcome(ctx context.Context, sourceID string, correct 
 		if err != nil {
 			return fmt.Errorf("usecase: marshal 错题字段: %w", err)
 		}
-		return d.Records.UpdateStatusFields(ctx, rec.RecordID, rec.Status, &now, string(raw), rec.Version)
+		return d.Records.UpdateStatusFields(ctx, rec.RecordID, rec.Status, &firstDue, string(raw), rec.Version)
 	case k12.CollectionAccumulation:
 		f, _ := k12.ParseAccumFields(rec.Fields)
 		f.ReviewStage = 0
@@ -646,7 +768,7 @@ func (d Deps) applyRegradeOutcome(ctx context.Context, sourceID string, correct 
 		if err != nil {
 			return fmt.Errorf("usecase: marshal 积累字段: %w", err)
 		}
-		return d.Records.UpdateStatusFields(ctx, rec.RecordID, rec.Status, &now, string(raw), rec.Version)
+		return d.Records.UpdateStatusFields(ctx, rec.RecordID, rec.Status, &firstDue, string(raw), rec.Version)
 	default:
 		return fmt.Errorf("usecase: 复批来源 %s 不属于可复习记录集（%s）", sourceID, rec.Collection)
 	}

@@ -58,7 +58,7 @@ func (p *replaceAwareProfiles) ReplaceProfile(_ context.Context, _ string, next 
 
 func signedV2(t *testing.T, agent string, recs []*records.AgentRecord, profile *k12.ChildProfile) *Hexbak {
 	t.Helper()
-	bak := &Hexbak{Version: HexbakVersion, AgentName: agent, ExportedAt: 42, Records: recs, Profile: profile}
+	bak := &Hexbak{Version: 2, AgentName: agent, ExportedAt: 42, Records: recs, Profile: profile}
 	var err error
 	bak.Checksum, err = checksumHexbak(bak)
 	if err != nil {

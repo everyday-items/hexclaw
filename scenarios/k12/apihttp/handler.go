@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -43,19 +44,11 @@ type ReclaimedCronJob struct {
 // composition root 的 IMBinder 实现用它包装限绑拒绝，HTTP 层映射 409（区别于真内部错误 500）。
 var ErrBindConflict = errors.New("绑定冲突")
 
-// IMBinder 是 IM 入站路由「绑定」缝：把某 IM 群（platform+chat_id）绑到某辅导实例，
-// 之后该群的作业消息由平台路由（agent_rules）投给这个 Agent（PRD §3.1.7 "各绑各的群"）。
+// IMBinder 是 IM 入站路由「绑定」缝：把某 IM 私聊会话（platform+chat_id）绑到某辅导实例，
+// 之后该私聊的作业消息由平台路由（agent_rules）投给这个 Agent（架构 §4.11 一对一私聊）。
 // composition root 包平台 router.Dispatcher + store 实现（AP-1：K12 不 import router）。
 type IMBinder interface {
 	Bind(ctx context.Context, platform, instanceID, chatID, agentName string) error
-}
-
-// IMDeliverer 是「发送到手机」的即时投递缝（§3.10 点评发送 / §3.12 发送到手机）：
-// 把一段家长向文本作为**辅导延伸消息**投给绑定该实例的私聊目标。composition root 用
-// agent 路由规则 + 平台实例管理器实现（AP-1：K12 不 import router/instances）。
-// 未绑定/发送失败返回 error（文案家长向）；nil 时端点诚实降级（前端复制文本兜底）。
-type IMDeliverer interface {
-	DeliverText(ctx context.Context, agentName, content string) (target string, err error)
 }
 
 // Runtime 是本 handler 依赖的 K12 运行时（assembly.K12 满足它；用接口避免 import 环）。
@@ -67,9 +60,6 @@ type Runtime struct {
 	Cron CronRegistrar
 	// Binder 可选：注入后 POST /bind-im 可把 IM 群绑到辅导实例（入站路由）。
 	Binder IMBinder
-	// Deliver 可选：注入后 POST /creative-works/{id}/send-feedback 可把点评/练习卡
-	// 即时发到绑定私聊；nil 时端点回 501（前端降级为复制文本）。
-	Deliver IMDeliverer
 	// BaseURL 本机 API 基址（如 http://127.0.0.1:8787），生成投递脚本 http_get 目标用。
 	// 空时 provision 用请求体里的 base_url。
 	BaseURL string
@@ -98,6 +88,11 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("POST /mark-mastered", h.markMastered)
 	mux.HandleFunc("POST /review/retry", h.reviewRetry)
 	mux.HandleFunc("POST /prep-card", h.prepCard)
+	// DD-024：备课卡与作品点评共用持久投递回执；平台受理不等于已送达。
+	mux.HandleFunc("POST /prep-card/send", h.sendPrepCard)
+	mux.HandleFunc("GET /delivery-receipts/{id}", h.getDeliveryReceipt)
+	mux.HandleFunc("POST /delivery-receipts/{id}/retry", h.retryDeliveryReceipt)
+	mux.HandleFunc("POST /delivery-receipts/{id}/query", h.queryDeliveryReceipt)
 	mux.HandleFunc("POST /grounding", h.addGrounding)
 	mux.HandleFunc("POST /accumulation", h.addAccumulation)
 	mux.HandleFunc("GET /accumulation", h.listAccumulation)
@@ -111,22 +106,29 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("GET /practice-sets/{id}/paper", h.getPracticePaper)
 	mux.HandleFunc("POST /practice-sets/{id}/verify", h.verifyPracticeItem)
 	// 2026-07-18 购物车裁决：命令端点。confirm/assign 已删除——打印/发送即确认（finalize 一步固化）。
+	mux.HandleFunc("POST /practice-sets/custom-paper", h.generateCustomPaper)
 	mux.HandleFunc("POST /practice-sets/basket/items", h.addToBasket)
 	mux.HandleFunc("POST /practice-sets/{id}/items/remove", h.removeFromBasket)
 	mux.HandleFunc("POST /practice-sets/{id}/finalize", h.finalizePracticeSet)
+	// DD-023 native two-phase printing. The legacy /finalize endpoint remains for
+	// older clients; new Desktop builds use only PrintJob prepare/events/retry.
+	mux.HandleFunc("POST /practice-sets/{id}/print-jobs", h.preparePracticePrintJob)
+	mux.HandleFunc("GET /print-jobs/{id}", h.getPracticePrintJob)
+	mux.HandleFunc("GET /print-jobs/{id}/paper", h.getPracticePrintJobPaper)
+	mux.HandleFunc("POST /print-jobs/{id}/events", h.recordPracticePrintEvent)
+	mux.HandleFunc("POST /print-jobs/{id}/retry", h.retryPracticePrintJob)
 	mux.HandleFunc("POST /practice-sets/{id}/submit", h.submitPracticeSet)
 	mux.HandleFunc("POST /practice-sets/{id}/grade", h.gradePracticeSet)
 	mux.HandleFunc("POST /practice-sets/{id}/close", h.closePracticeSet)
 	mux.HandleFunc("POST /practice-sets/{id}/cancel", h.cancelPracticeSet)
-	// 统一 GradingJob（架构设计 §6.7 公共命令；advance 为编排器专用内部推进）
+	// 统一 GradingJob 公共边界（DD-001）：create/get/confirm/retry/cancel/result。
+	// list/revise/advance 与旧 recognize 直连入口均不注册；阶段推进只允许进程内编排器调用。
 	mux.HandleFunc("POST /grading-jobs", h.createGradingJob)
-	mux.HandleFunc("GET /grading-jobs", h.listGradingJobs)
 	mux.HandleFunc("GET /grading-jobs/{id}", h.getGradingJob)
 	mux.HandleFunc("POST /grading-jobs/{id}/confirm", h.confirmGradingJob)
-	mux.HandleFunc("POST /grading-jobs/{id}/revise", h.reviseGradingJob)
 	mux.HandleFunc("POST /grading-jobs/{id}/cancel", h.cancelGradingJob)
 	mux.HandleFunc("POST /grading-jobs/{id}/retry", h.retryGradingJob)
-	mux.HandleFunc("POST /grading-jobs/{id}/advance", h.advanceGradingJob)
+	mux.HandleFunc("GET /grading-jobs/{id}/result", h.getGradingJobResult)
 	// 作品（PRD §3.10）：draft→点评→修改稿→再点评；只点评不打分不代写（INV-011）。
 	mux.HandleFunc("POST /creative-works", h.createCreativeWork)
 	mux.HandleFunc("GET /creative-works", h.listCreativeWorks)
@@ -139,11 +141,18 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("POST /creative-works/{id}/send-feedback", h.sendWorkFeedback)
 	// 美术观察练习卡完成打卡（§3.10：练习必须有产物，产物归档在版本记录）。
 	mux.HandleFunc("POST /creative-works/{id}/practice-card/done", h.markPracticeCardDone)
+	// DD-013 writing-photo OCR public resource: durable create/get/retry/confirm.
+	mux.HandleFunc("POST /creative-work-ocr-jobs", h.createCreativeWorkOCRJob)
+	mux.HandleFunc("GET /creative-work-ocr-jobs/{id}", h.getCreativeWorkOCRJob)
+	mux.HandleFunc("POST /creative-work-ocr-jobs/{id}/retry", h.retryCreativeWorkOCRJob)
+	mux.HandleFunc("POST /creative-work-ocr-jobs/{id}/confirm", h.confirmCreativeWorkOCRJob)
 	// 作品照片最小资产服务（§3.10 / §5.5 source_asset_id；魔数/上限/归属契约见 asset_handler.go）。
 	mux.HandleFunc("POST /assets", h.uploadAsset)
 	mux.HandleFunc("GET /assets/{file}", h.getAsset)
 	mux.HandleFunc("GET /backup", h.backup)
 	mux.HandleFunc("POST /restore", h.restore)
+	mux.HandleFunc("POST /restore-as", h.restoreAs)
+	mux.HandleFunc("POST /restore-as/{migration_id}/rollback", h.rollbackRestoreAs)
 	mux.HandleFunc("GET /export", h.export)
 	mux.HandleFunc("GET /mistake-sheet", h.mistakeSheet)
 	mux.HandleFunc("GET /profile", h.getProfile)
@@ -261,15 +270,35 @@ type bboxDTO struct {
 }
 
 type recognizedQuestionDTO struct {
-	Question        string   `json:"question"`
-	KnowledgePoints []string `json:"knowledge_points"`
+	ProblemID       string              `json:"problem_id"`
+	ProblemKind     usecase.ProblemKind `json:"problem_kind"`
+	ParentProblemID string              `json:"parent_problem_id,omitempty"`
+	SubproblemNo    string              `json:"subproblem_no,omitempty"`
+	PageAssetID     string              `json:"page_asset_id"`
+	AttemptID       string              `json:"attempt_id,omitempty"`
+	// Question 是当前 surface 的安全展示投影；raw/canonical 双事实同时返回供确认 UI
+	// 对照。canonical_valid=false 时 Question 必须回退为可复制 raw，绝不返回空白。
+	Question          string   `json:"question"`
+	RawTranscription  string   `json:"raw_transcription"`
+	CanonicalMarkdown string   `json:"canonical_markdown"`
+	CanonicalValid    bool     `json:"canonical_valid"`
+	CanonicalVersion  int      `json:"canonical_version"`
+	KnowledgePoints   []string `json:"knowledge_points"`
 	// StudentAnswer 识题回收的孩子手写作答（未作答=空串）。前端据此区分空白题(走 /solve 求解)
 	// 与已答题(走 /grade 批改)，家长可在回显门修改。
-	StudentAnswer string `json:"student_answer"`
+	StudentAnswer           string `json:"student_answer"`
+	AnswerRawTranscription  string `json:"answer_raw_transcription,omitempty"`
+	AnswerCanonicalMarkdown string `json:"answer_canonical_markdown,omitempty"`
+	AnswerCanonicalValid    bool   `json:"answer_canonical_valid"`
 	// AnswerState 是作答事实的单一真相源。blank / present / unclear 与答案文本、图片坐标解耦。
 	AnswerState usecase.AnswerState `json:"answer_state"`
 	// Subject 识题自动判定的题目学科（数学/语文/英语/物理/化学，判不出=空）。
-	Subject string `json:"subject,omitempty"`
+	Subject               string                  `json:"subject,omitempty"`
+	RecognitionConfidence *float64                `json:"recognition_confidence,omitempty"`
+	ConfirmationRequired  bool                    `json:"confirmation_required"`
+	ConfirmationReasons   []usecase.OCRRiskReason `json:"confirmation_reasons,omitempty"`
+	ConfirmedVersion      int                     `json:"confirmed_version"`
+	InputDigest           string                  `json:"input_digest,omitempty"`
 	// BBox 只在独立答案锚定阶段之后出现（GradingJob 停点产物）；核心识题永远不携带坐标。
 	BBox *bboxDTO `json:"bbox,omitempty"`
 }
@@ -277,11 +306,25 @@ type recognizedQuestionDTO struct {
 func recognizedQuestionToDTO(question usecase.RecognizedQuestion, includeBBox bool) recognizedQuestionDTO {
 	question = usecase.NormalizeRecognizedQuestion(question)
 	dto := recognizedQuestionDTO{
-		Question:        question.Question,
-		KnowledgePoints: question.KnowledgePoints,
-		AnswerState:     question.AnswerState,
-		StudentAnswer:   question.StudentAnswer,
-		Subject:         question.Subject,
+		ProblemID: question.ProblemID, ProblemKind: question.ProblemKind,
+		ParentProblemID: question.ParentProblemID, SubproblemNo: question.SubproblemNo,
+		PageAssetID: question.PageAssetID, AttemptID: question.AttemptID,
+		Question:         usecase.RecognizedQuestionDisplayText(question),
+		RawTranscription: question.RawTranscription, CanonicalMarkdown: question.CanonicalMarkdown,
+		CanonicalValid:          usecase.CanonicalMarkdownValid(question.CanonicalMarkdown),
+		CanonicalVersion:        question.CanonicalVersion,
+		KnowledgePoints:         question.KnowledgePoints,
+		AnswerState:             question.AnswerState,
+		StudentAnswer:           question.StudentAnswer,
+		AnswerRawTranscription:  question.AnswerRawTranscription,
+		AnswerCanonicalMarkdown: question.AnswerCanonicalMarkdown,
+		AnswerCanonicalValid:    question.AnswerState != usecase.AnswerStatePresent || usecase.CanonicalMarkdownValid(question.AnswerCanonicalMarkdown),
+		Subject:                 question.Subject,
+		RecognitionConfidence:   question.RecognitionConfidence,
+		ConfirmationRequired:    question.ConfirmationRequired,
+		ConfirmationReasons:     question.ConfirmationReasons,
+		ConfirmedVersion:        question.ConfirmedVersion,
+		InputDigest:             question.InputDigest,
 	}
 	if includeBBox && question.BBox != nil {
 		dto.BBox = &bboxDTO{
@@ -539,7 +582,16 @@ func (h *handler) insightReport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, rep)
+	md, skip := usecase.RenderReportMarkdown(rep, "")
+	if skip {
+		md = "## 学习概览\n\n本月还没有错题记录，继续保持。"
+	}
+	content, manifest := k12RenderProjection(messagecontent.ProducerReport, "zh-CN", md)
+	writeJSON(w, http.StatusOK, struct {
+		usecase.InsightReport
+		MessageContent *messagecontent.MessageContent `json:"message_content,omitempty"`
+		RenderManifest *messagecontent.RenderManifest `json:"render_manifest,omitempty"`
+	}{InsightReport: rep, MessageContent: content, RenderManifest: manifest})
 }
 
 type markMasteredReq struct {
@@ -760,10 +812,14 @@ func (h *handler) backup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, bak)
 }
 
+// v3 内嵌内容文件经 base64 有约 4/3 膨胀；保留 128MiB 本地回环请求上限以容纳
+// 多张 10MiB 白名单图片，同时继续由 MaxBytesReader fail-closed 防无界内存输入。
+const maxHexbakRequestBytes int64 = 128 << 20
+
 // restore POST /restore —— 从 .hexbak 恢复（先校验 checksum）。
 func (h *handler) restore(w http.ResponseWriter, r *http.Request) {
 	var bak usecase.Hexbak
-	if !decodeLimit(w, r, &bak, 16<<20) {
+	if !decodeLimit(w, r, &bak, maxHexbakRequestBytes) {
 		return
 	}
 	// T2.6：恢复前自动快照（PRD §3.12.9），随响应回传供前端保存以便回退。
@@ -774,6 +830,38 @@ func (h *handler) restore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"restored": n, "snapshot": snapshot})
+}
+
+// restoreAs POST /restore-as —— 经监护人显式确认，把已完成版本与 checksum 校验的 v2/v3 archive
+// 迁移到重建后的 Tutor。原 archive、目标快照、owner rewrite journal 与领域写入
+// 由 adapter 在同一 SQLite 事务内提交。
+func (h *handler) restoreAs(w http.ResponseWriter, r *http.Request) {
+	var req usecase.RestoreAsRequest
+	if !decodeLimit(w, r, &req, maxHexbakRequestBytes) {
+		return
+	}
+	result, err := h.rt.Deps.RestoreAs(r.Context(), req)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// rollbackRestoreAs POST /restore-as/{migration_id}/rollback —— 从不可变恢复前快照
+// 精确回退，journal 追加 rollback 事实；重复请求返回同一 rolled_back 收据。
+func (h *handler) rollbackRestoreAs(w http.ResponseWriter, r *http.Request) {
+	var req usecase.RestoreAsRollbackRequest
+	if !decodeLimit(w, r, &req, 1<<20) {
+		return
+	}
+	req.MigrationID = r.PathValue("migration_id")
+	result, err := h.rt.Deps.RollbackRestoreAs(r.Context(), req)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 // export GET /export?agent=X&format=pdf|docx|md —— 错题本导出。
@@ -971,14 +1059,29 @@ func (h *handler) tutorTurn(w http.ResponseWriter, r *http.Request) {
 }
 
 type bindIMReq struct {
-	Agent      string `json:"agent"`       // 目标辅导实例名
-	Platform   string `json:"platform"`    // IM 平台（dingtalk/feishu/…）
-	InstanceID string `json:"instance_id"` // 平台实例标识（可空）
-	ChatID     string `json:"chat_id"`     // 家庭群/会话 ID
+	Agent      string `json:"agent"`             // 目标辅导实例名
+	Platform   string `json:"platform"`          // IM 平台（dingtalk/feishu/…）
+	InstanceID string `json:"instance_id"`       // 平台实例标识（可空）
+	ChatID     string `json:"chat_id"`           // 私聊会话 ID（direct；架构 §4.11 不接受群）
+	ConvType   string `json:"conversation_type"` // 会话类型（可空=direct）；群类型显式拒绝
 }
 
-// bindIM POST /bind-im —— 把 IM 群绑到辅导实例（PRD §3.1.7 "各绑各的群" / §3.2.3 通道路由）。
-// 绑定后该群的入站作业消息由平台 agent_rules 路由到这个 Agent。需注入 IMBinder。
+// isDirectConversation 判定绑定目标是否为 direct 私聊会话（架构 §4.11：仅一对一私聊，
+// 不接受群 conversation 类型；ChannelBinding.conversation_scope 当前只能是 direct）。
+// 缺省（历史前端不带该字段）视为 direct（向后兼容）；显式群类型（钉钉 "2" / 通用
+// "group"）与任何非 direct 值一律 fail-closed 拒绝，绝不悄悄按私聊处理。
+func isDirectConversation(convType string) bool {
+	switch strings.ToLower(strings.TrimSpace(convType)) {
+	case "", "1", "direct":
+		return true
+	default:
+		return false
+	}
+}
+
+// bindIM POST /bind-im —— 把某 IM 私聊会话（platform+chat_id）绑到辅导实例（架构 §4.11
+// 一对一私聊 / §6.10 忽略群消息）。绑定后该私聊的入站作业消息由平台 agent_rules 路由到
+// 这个 Agent。仅接受 direct 会话，群 conversation 类型拒绝。需注入 IMBinder。
 func (h *handler) bindIM(w http.ResponseWriter, r *http.Request) {
 	if h.rt.Binder == nil {
 		writeErr(w, http.StatusNotImplemented, "im binder 未注入")
@@ -990,6 +1093,11 @@ func (h *handler) bindIM(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Agent == "" || req.Platform == "" || req.ChatID == "" {
 		writeErr(w, http.StatusBadRequest, "agent / platform / chat_id 必填")
+		return
+	}
+	if !isDirectConversation(req.ConvType) {
+		// 架构 §4.11/§6.10：只支持家长与机器人的一对一私聊，群聊不绑不路由。
+		writeErr(w, http.StatusBadRequest, "仅支持一对一私聊绑定，不接受群聊会话")
 		return
 	}
 	if err := h.rt.Binder.Bind(r.Context(), req.Platform, req.InstanceID, req.ChatID, req.Agent); err != nil {
@@ -1301,7 +1409,10 @@ func httpStatusForK12Error(err error, fallback int) int {
 		return http.StatusNotFound
 	case errors.Is(err, records.ErrInvalidStatus), errors.Is(err, records.ErrInvalidFields),
 		errors.Is(err, records.ErrInvalidRecord), errors.Is(err, records.ErrUnknownCollection),
-		errors.Is(err, records.ErrScopeNotFound), errors.Is(err, usecase.ErrChecksumMismatch):
+		errors.Is(err, records.ErrScopeNotFound), errors.Is(err, usecase.ErrChecksumMismatch),
+		errors.Is(err, usecase.ErrHexbakAssetManifest),
+		errors.Is(err, usecase.ErrGuardianConfirmationRequired),
+		errors.Is(err, usecase.ErrArchiveScopeMismatch), errors.Is(err, usecase.ErrRestoreAsArchiveVersion):
 		return http.StatusBadRequest
 	case errors.Is(err, usecase.ErrInvalidInput):
 		return http.StatusBadRequest

@@ -115,9 +115,15 @@ func TestV11_K12DedupeReleaseBackfill(t *testing.T) {
 	}
 
 	// 3) 幂等可重跑：整段 V11 SQL 再执行一次，所有键保持不变。
-	v11 := migrate.All[len(migrate.All)-1]
+	var v11 migrate.Migration
+	for _, m := range migrate.All {
+		if m.Version == 11 {
+			v11 = m
+			break
+		}
+	}
 	if v11.Version != 11 {
-		t.Fatalf("末位迁移应为 V11, got v%d", v11.Version)
+		t.Fatalf("迁移清单应包含 V11, got v%d", v11.Version)
 	}
 	if _, err := db.ExecContext(ctx, v11.SQL); err != nil {
 		t.Fatalf("V11 重跑: %v", err)

@@ -176,9 +176,11 @@ func TestPartialReturnAndResubmit(t *testing.T) {
 	if _, _, err := d.FinalizeBasket(ctx, "xiaoming", id, "print", ""); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
+	assetID := saveReturnAsset(t, "xiaoming")
 
 	// 部分回传：只回传 q1 → submitted；q2 保持未回传。
-	if err := d.SubmitReturn(ctx, "xiaoming", id, []string{"q1"}); err != nil {
+	if _, err := d.SubmitReturn(ctx, "xiaoming", id, "return-partial-1", assetID, []string{"q1"}); err != nil {
 		t.Fatalf("部分回传应合法: %v", err)
 	}
 	v, _ := d.GetPracticeSet(ctx, "xiaoming", id)
@@ -192,11 +194,11 @@ func TestPartialReturnAndResubmit(t *testing.T) {
 		t.Fatalf("错误应提示未回传可补传，got %v", err)
 	}
 	// 补传是同一卷的合法追加；重复回传同一题幂等不报错。
-	if err := d.SubmitReturn(ctx, "xiaoming", id, []string{"q1", "q2"}); err != nil {
+	if _, err := d.SubmitReturn(ctx, "xiaoming", id, "return-partial-2", assetID, []string{"q1", "q2"}); err != nil {
 		t.Fatalf("补传应合法且幂等: %v", err)
 	}
 	// 回传不存在的题拒绝。
-	if err := d.SubmitReturn(ctx, "xiaoming", id, []string{"ghost"}); err == nil {
+	if _, err := d.SubmitReturn(ctx, "xiaoming", id, "return-ghost", assetID, []string{"ghost"}); err == nil {
 		t.Fatal("回传不存在的题应报错")
 	}
 	if err := d.GradePracticeSet(ctx, "xiaoming", id); err != nil {

@@ -9,7 +9,7 @@ import (
 
 // 复批逐题结论联动错题（架构设计 §3.8 历史与回传复批 第 3、4 条）RED 契约：
 //   - 复批按题给结论：通过题若有 source_problem_id → 走 MarkRetried 链路积掌握证据；
-//     未通过题 → 对应 Mistake due_at 重置回本周（due=now），复习轮次重置首档（§4.6）。
+//     未通过题 → 对应 Mistake 复习轮次重置首档，due_at 使用 v1 首档 1 天（§4.6）。
 //   - 部分回传：允许多次调用，每次覆盖已给结论的题，幂等；
 //     全部入卷题都有结论后卷才转 graded（§3.8 第 4 条）。
 
@@ -38,9 +38,7 @@ func seedRegradePaper(t *testing.T, d Deps, mid string) string {
 	if _, _, err := d.FinalizeBasket(ctx, "mingming", setID, "print", ""); err != nil {
 		t.Fatalf("固化: %v", err)
 	}
-	if err := d.SubmitPracticeSet(ctx, "mingming", setID); err != nil {
-		t.Fatalf("回传: %v", err)
-	}
+	submitWholeSetInternal(t, d, "mingming", setID)
 	return setID
 }
 
@@ -50,7 +48,7 @@ func TestGradeResults_FeedbackToMistakes(t *testing.T) {
 	mid := seedMistake(t, d, "s1", "小数乘法", "计算失误", 500)
 	setID := seedRegradePaper(t, d, mid)
 
-	// ① 部分结论：item-a 未通过 → 错题 due 重置回本周（due=now），轮次回首档；卷保持 submitted。
+	// ① 部分结论：item-a 未通过 → 错题轮次回首档，due 使用 v1 的 1 天；卷保持 submitted。
 	v, err := d.GradePracticeSetItems(ctx, "mingming", setID, []PracticeGradeResult{{ItemID: "item-a", Correct: false}})
 	if err != nil {
 		t.Fatalf("部分结论复批: %v", err)
@@ -62,8 +60,8 @@ func TestGradeResults_FeedbackToMistakes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.DueAt == nil || *rec.DueAt != 1000 {
-		t.Errorf("未通过题应把错题 due 重置回本周（due=now=1000），got %v", rec.DueAt)
+	if rec.DueAt == nil || *rec.DueAt != 1000+FirstReviewInterval {
+		t.Errorf("未通过题应把错题 due 重置到 v1 首档 1 天，got %v", rec.DueAt)
 	}
 	if f, _ := k12.ParseMistakeFields(rec.Fields); f.ReviewStage != 0 {
 		t.Errorf("未通过应重置复习轮次回首档（§4.6），got %d", f.ReviewStage)

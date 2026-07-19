@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strings"
@@ -59,6 +61,11 @@ func (d Deps) GenerateWorkFeedback(ctx context.Context, agentName, recordID stri
 	}
 
 	last := v.Fields.Versions[len(v.Fields.Versions)-1]
+	if v.Fields.WorkType == k12.WorkTypeWriting && strings.TrimSpace(last.SourceAssetID) != "" {
+		if err := validateConfirmedWritingFeedbackSnapshot(last); err != nil {
+			return CreativeWorkView{}, err
+		}
+	}
 	req := WorkFeedbackRequest{
 		WorkType:        v.Fields.WorkType,
 		Title:           v.Fields.Title,
@@ -94,6 +101,19 @@ func (d Deps) GenerateWorkFeedback(ctx context.Context, agentName, recordID stri
 		return CreativeWorkView{}, fmt.Errorf("%w: 生成点评违反 INV-011（%s），已拒绝入库", ErrSolveFailed, reason)
 	}
 	return d.attachFeedbackWithSource(ctx, agentName, recordID, feedback, k12.FeedbackSourceAI, strings.TrimSpace(out.SkillStamp))
+}
+
+func validateConfirmedWritingFeedbackSnapshot(version k12.CreativeWorkVersion) error {
+	content := strings.TrimSpace(version.ContentMarkdown)
+	if version.OCRJobID == "" || version.OCRVersion <= 0 ||
+		version.OCRConfirmedDigest == "" || version.ContentConfirmedAt <= 0 || content == "" {
+		return fmt.Errorf("%w: 作文照片没有完整的家长 OCR 确认证据，禁止生成点评", ErrInvalidInput)
+	}
+	sum := sha256.Sum256([]byte(content))
+	if hex.EncodeToString(sum[:]) != version.OCRConfirmedDigest {
+		return fmt.Errorf("%w: 作文正文与 OCR 确认摘要不一致，禁止复用旧摘要", ErrInvalidInput)
+	}
+	return nil
 }
 
 // scorePattern 命中“数字+分”打分口径；“分钟/分钟数”另行放行（见下）。

@@ -23,6 +23,13 @@ type ArchiveRestorer interface {
 	RestoreArchive(ctx context.Context, agentName string, recs []*records.AgentRecord, p *k12.ChildProfile) error
 }
 
+// HexbakArchiveRestorer extends ArchiveRestorer with v3 content-file restoration.
+// Legacy in-memory adapters may keep RestoreArchive for asset-free archives; production
+// must implement this port so records/profile/assets share one compensated command.
+type HexbakArchiveRestorer interface {
+	RestoreHexbak(ctx context.Context, bak *Hexbak) error
+}
+
 // GetProfile 读孩子档案。
 func (d Deps) GetProfile(ctx context.Context, agentName string) (k12.ChildProfile, error) {
 	if d.Profiles == nil {

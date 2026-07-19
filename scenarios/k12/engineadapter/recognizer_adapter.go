@@ -39,9 +39,12 @@ func NewRecognizerAdapter(v VisionFunc) *RecognizerAdapter { return &RecognizerA
 var _ usecase.Recognizer = (*RecognizerAdapter)(nil)
 
 const recognizePrompt = `识别这张作业图片里的所有题目，并逐题回收孩子的手写作答事实、判定题目学科。严格输出 JSON 数组，每个元素形如：
-{"question":"完整题干","subject":"数学","knowledge_points":["知识点1"],"answer_state":"present","student_answer":"孩子实际写下且能可靠辨认的作答"}
+{"problem_id":"本页内稳定引用","problem_kind":"standalone","parent_problem_id":"","subproblem_no":"","question":"逐字原始转写","canonical_markdown":"规范 Markdown/LaTeX","subject":"数学","knowledge_points":["知识点1"],"answer_state":"present","student_answer":"孩子实际写下且能可靠辨认的原始作答","answer_canonical_markdown":"规范 Markdown/LaTeX","recognition_confidence":0.98,"ocr_signals":[]}
 关键规则：
 - 每个独立作答的小题必须对应一个 JSON 元素：即使多个口算、填空或选择小题横排在同一行，也要逐小题拆开，不能合并成一个大题/整行元素；章节标题不能当作题目。
+- 复合题公共材料只输出一次 problem_kind=compound_parent（不得带孩子作答）；每个小题输出 problem_kind=subproblem、parent_problem_id 指向父题、subproblem_no 为稳定小题号。普通题用 standalone。
+- question/student_answer 必须逐字保留视觉原始转写；canonical_markdown/answer_canonical_markdown 独立输出可渲染 Markdown/LaTeX，不得用规范形覆盖原始转写。
+- recognition_confidence 是 0~1 置信度；ocr_signals 只可使用 fraction/decimal_point/negative_sign/unit/erasure/unclear_handwriting。高置信度也必须如实输出格式信号。
 - subject 逐题判定题目学科，只能取以下之一：数学 / 语文 / 英语 / 物理 / 化学；确实判不出学科时才留空字符串 ""。
 - question 题干只抄印刷体/原题内容，绝不能把铅笔、黑笔等手写墨迹拼进题干；student_answer 只如实誊录图中孩子**已经写下**的手写作答（包括紧跟在印刷等号后的数字）。例如印刷题是“4÷0.5=”且等号后手写“8”，必须让 question 写 "4÷0.5="、student_answer 写 "8"，不能把 question 写成“4÷0.5=8”。
 - answer_state 只能是 blank / present / unclear：
@@ -64,11 +67,21 @@ const printedQuestionInventoryPrompt = `这是“整页印刷题清单”识别�
 
 // recognizedDTO 解析视觉模型 JSON 用（带 json tag）。
 type recognizedDTO struct {
-	Question        string   `json:"question"`
-	Subject         string   `json:"subject"`
-	KnowledgePoints []string `json:"knowledge_points"`
-	AnswerState     string   `json:"answer_state"`
-	StudentAnswer   string   `json:"student_answer"`
+	ProblemID                    string   `json:"problem_id"`
+	ProblemKind                  string   `json:"problem_kind"`
+	ParentProblemID              string   `json:"parent_problem_id"`
+	SubproblemNo                 string   `json:"subproblem_no"`
+	Question                     string   `json:"question"`
+	CanonicalMarkdown            string   `json:"canonical_markdown"`
+	Subject                      string   `json:"subject"`
+	KnowledgePoints              []string `json:"knowledge_points"`
+	AnswerState                  string   `json:"answer_state"`
+	StudentAnswer                string   `json:"student_answer"`
+	AnswerCanonicalMarkdown      string   `json:"answer_canonical_markdown"`
+	RecognitionConfidence        *float64 `json:"recognition_confidence"`
+	OCRSignals                   []string `json:"ocr_signals"`
+	EvidenceTranscriptions       []string `json:"evidence_transcriptions"`
+	AnswerEvidenceTranscriptions []string `json:"answer_evidence_transcriptions"`
 }
 
 // invalidJSONEscape 匹配 JSON 字符串中的非法转义（\x 且 x ∉ "\/bfnrtu）——视觉模型在题干里
@@ -186,17 +199,30 @@ func parseRecognizedQuestions(raw string) ([]usecase.RecognizedQuestion, error) 
 	}
 	out := make([]usecase.RecognizedQuestion, 0, len(dtos))
 	for _, d := range dtos {
-		question := strings.TrimSpace(adapter.NormalizeMathText(d.Question))
+		rawQuestion := d.Question
+		question := strings.TrimSpace(adapter.NormalizeMathText(rawQuestion))
 		if question == "" || sectionHeading.MatchString(question) || likelyCroppedFragment(question) {
 			continue
 		}
 		answerState, studentAnswer := normalizeRecognizedAnswer(d.AnswerState, d.StudentAnswer)
+		canonicalQuestion := strings.TrimSpace(d.CanonicalMarkdown)
+		if canonicalQuestion == "" {
+			canonicalQuestion = question
+		}
+		canonicalAnswer := strings.TrimSpace(d.AnswerCanonicalMarkdown)
+		if canonicalAnswer == "" {
+			canonicalAnswer = studentAnswer
+		}
 		out = append(out, usecase.RecognizedQuestion{
-			Question:        question,
-			KnowledgePoints: d.KnowledgePoints,
-			AnswerState:     answerState,
-			StudentAnswer:   studentAnswer,
-			Subject:         normalizeRecognizedSubject(d.Subject),
+			ProblemID: d.ProblemID, ProblemKind: usecase.ProblemKind(d.ProblemKind),
+			ParentProblemID: d.ParentProblemID, SubproblemNo: d.SubproblemNo,
+			Question: question, RawTranscription: rawQuestion, CanonicalMarkdown: canonicalQuestion,
+			KnowledgePoints: d.KnowledgePoints, AnswerState: answerState,
+			StudentAnswer: studentAnswer, AnswerRawTranscription: d.StudentAnswer,
+			AnswerCanonicalMarkdown: canonicalAnswer,
+			Subject:                 normalizeRecognizedSubject(d.Subject), RecognitionConfidence: d.RecognitionConfidence,
+			OCRSignals: d.OCRSignals, EvidenceTranscriptions: d.EvidenceTranscriptions,
+			AnswerEvidenceTranscriptions: d.AnswerEvidenceTranscriptions,
 		})
 	}
 	return mergeRecognizedQuestions(nil, out), nil
@@ -209,15 +235,23 @@ func parsePrintedQuestionInventory(raw string) ([]usecase.RecognizedQuestion, er
 	}
 	out := make([]usecase.RecognizedQuestion, 0, len(dtos))
 	for _, dto := range dtos {
-		question := strings.TrimSpace(adapter.NormalizeMathText(dto.Question))
+		rawQuestion := dto.Question
+		question := strings.TrimSpace(adapter.NormalizeMathText(rawQuestion))
 		if question == "" || sectionHeading.MatchString(question) || likelyCroppedFragment(question) {
 			continue
 		}
+		canonicalQuestion := strings.TrimSpace(dto.CanonicalMarkdown)
+		if canonicalQuestion == "" {
+			canonicalQuestion = question
+		}
 		out = append(out, usecase.RecognizedQuestion{
-			Question:        question,
+			ProblemID: dto.ProblemID, ProblemKind: usecase.ProblemKind(dto.ProblemKind),
+			ParentProblemID: dto.ParentProblemID, SubproblemNo: dto.SubproblemNo,
+			Question: question, RawTranscription: rawQuestion, CanonicalMarkdown: canonicalQuestion,
 			KnowledgePoints: dto.KnowledgePoints,
 			AnswerState:     usecase.AnswerStateBlank,
-			Subject:         normalizeRecognizedSubject(dto.Subject),
+			Subject:         normalizeRecognizedSubject(dto.Subject), RecognitionConfidence: dto.RecognitionConfidence,
+			OCRSignals: dto.OCRSignals, EvidenceTranscriptions: dto.EvidenceTranscriptions,
 		})
 	}
 	return mergeRecognizedQuestions(nil, out), nil
@@ -645,6 +679,7 @@ func mergeObservationMetadata(
 ) usecase.RecognizedQuestion {
 	preferred = usecase.NormalizeRecognizedQuestion(preferred)
 	other = usecase.NormalizeRecognizedQuestion(other)
+	preferred = mergeRecognitionAuditEvidence(preferred, other)
 	if preferred.Subject == "" {
 		preferred.Subject = other.Subject
 	}
@@ -762,6 +797,7 @@ func mergePrintedInventoryObservation(
 		return merged
 	}
 	merged.Question = inventory.Question
+	merged.CanonicalMarkdown = inventory.CanonicalMarkdown
 	if merged.AnswerState != usecase.AnswerStateBlank {
 		merged.AnswerState = usecase.AnswerStateUnclear
 		merged.StudentAnswer = ""
@@ -800,6 +836,7 @@ func mergeRecognizedQuestions(primary, recovery []usecase.RecognizedQuestion) []
 				if combined.StudentAnswer == "" {
 					combined.AnswerState = usecase.AnswerStatePresent
 					combined.StudentAnswer = answer
+					combined.AnswerCanonicalMarkdown = answer
 				}
 				merged[existing] = usecase.NormalizeRecognizedQuestion(combined)
 				variantMerged = true
@@ -810,6 +847,7 @@ func mergeRecognizedQuestions(primary, recovery []usecase.RecognizedQuestion) []
 				if combined.StudentAnswer == "" {
 					combined.AnswerState = usecase.AnswerStatePresent
 					combined.StudentAnswer = answer
+					combined.AnswerCanonicalMarkdown = answer
 				}
 				merged[existing] = mergeRecognizedEvidence(combined, merged[existing])
 				delete(seen, existingKey)
@@ -829,6 +867,7 @@ func mergeRecognizedQuestions(primary, recovery []usecase.RecognizedQuestion) []
 			combined := merged[existing]
 			if len([]rune(q.Question)) > len([]rune(combined.Question)) {
 				combined.Question = q.Question
+				combined.CanonicalMarkdown = q.CanonicalMarkdown
 			}
 			merged[existing] = mergeRecognizedEvidence(combined, q)
 			newKey := recognizedQuestionKey(combined.Question)
@@ -1122,6 +1161,7 @@ func editDistanceAtMost(a, b []rune, limit int) bool {
 func mergeRecognizedEvidence(preferred, other usecase.RecognizedQuestion) usecase.RecognizedQuestion {
 	preferred = usecase.NormalizeRecognizedQuestion(preferred)
 	other = usecase.NormalizeRecognizedQuestion(other)
+	preferred = mergeRecognitionAuditEvidence(preferred, other)
 	if preferred.Subject == "" {
 		preferred.Subject = other.Subject
 	}
@@ -1131,12 +1171,50 @@ func mergeRecognizedEvidence(preferred, other usecase.RecognizedQuestion) usecas
 	if answerEvidenceScore(other) > answerEvidenceScore(preferred) {
 		preferred.AnswerState = other.AnswerState
 		preferred.StudentAnswer = other.StudentAnswer
+		preferred.AnswerCanonicalMarkdown = other.AnswerCanonicalMarkdown
 		preferred.BBox = other.BBox
 	} else if preferred.BBox == nil && preferred.AnswerState == usecase.AnswerStatePresent &&
 		other.AnswerState == usecase.AnswerStatePresent && recognizedQuestionKey(preferred.StudentAnswer) == recognizedQuestionKey(other.StudentAnswer) {
 		preferred.BBox = other.BBox
 	}
 	return usecase.NormalizeRecognizedQuestion(preferred)
+}
+
+// mergeRecognitionAuditEvidence keeps the selected canonical fact while retaining every independent
+// OCR observation for conflict policy. RawTranscription itself remains immutable; alternate raw values
+// are append-only evidence and therefore cannot silently overwrite the first observation.
+func mergeRecognitionAuditEvidence(preferred, other usecase.RecognizedQuestion) usecase.RecognizedQuestion {
+	preferred.EvidenceTranscriptions = appendUniqueEvidence(
+		preferred.EvidenceTranscriptions, preferred.RawTranscription, other.RawTranscription,
+	)
+	preferred.AnswerEvidenceTranscriptions = appendUniqueEvidence(
+		preferred.AnswerEvidenceTranscriptions, preferred.AnswerRawTranscription, other.AnswerRawTranscription,
+	)
+	preferred.OCRSignals = appendUniqueEvidence(preferred.OCRSignals, other.OCRSignals...)
+	if preferred.RecognitionConfidence == nil ||
+		(other.RecognitionConfidence != nil && *other.RecognitionConfidence < *preferred.RecognitionConfidence) {
+		preferred.RecognitionConfidence = other.RecognitionConfidence
+	}
+	return preferred
+}
+
+func appendUniqueEvidence(existing []string, values ...string) []string {
+	out := append([]string(nil), existing...)
+	seen := make(map[string]struct{}, len(out)+len(values))
+	for _, value := range out {
+		seen[value] = struct{}{}
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func answerEvidenceScore(question usecase.RecognizedQuestion) int {

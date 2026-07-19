@@ -10,10 +10,16 @@ import (
 
 // 作品 DTO（前端契约，PRD §3.10 / §5.5）。
 type workVersionDTO struct {
-	VersionID string `json:"version_id"`
-	AssetID   string `json:"source_asset_id,omitempty"`
-	Content   string `json:"content_markdown,omitempty"`
-	Feedback  string `json:"feedback,omitempty"`
+	VersionID          string            `json:"version_id"`
+	AssetID            string            `json:"source_asset_id,omitempty"`
+	Content            string            `json:"content_markdown,omitempty"`
+	OCRJobID           string            `json:"ocr_job_id,omitempty"`
+	OCRRaw             string            `json:"ocr_raw,omitempty"`
+	OCRVersion         int               `json:"ocr_version,omitempty"`
+	OCRConfirmedDigest string            `json:"ocr_confirmed_digest,omitempty"`
+	ContentConfirmedAt int64             `json:"content_confirmed_at,omitempty"`
+	Feedback           string            `json:"feedback,omitempty"`
+	StructuredFeedback *k12.WorkFeedback `json:"structured_feedback,omitempty"`
 	// FeedbackSource 点评来源（ai / parent）；老数据空值前向兼容。
 	FeedbackSource string `json:"feedback_source,omitempty"`
 	// FeedbackSkill AI 点评所用方法论基座来源戳（如 "writing-feedback@1.0.0/disk"，
@@ -42,7 +48,9 @@ func toCreativeWorkDTO(v usecase.CreativeWorkView) creativeWorkDTO {
 	for _, ver := range v.Fields.Versions {
 		dto := workVersionDTO{
 			VersionID: ver.VersionID, AssetID: ver.SourceAssetID,
-			Content: ver.ContentMarkdown, Feedback: ver.Feedback,
+			Content: ver.ContentMarkdown, Feedback: ver.Feedback, StructuredFeedback: ver.StructuredFeedback,
+			OCRJobID: ver.OCRJobID, OCRRaw: ver.OCRRaw, OCRVersion: ver.OCRVersion,
+			OCRConfirmedDigest: ver.OCRConfirmedDigest, ContentConfirmedAt: ver.ContentConfirmedAt,
 			FeedbackSource: ver.FeedbackSource, FeedbackSkill: ver.FeedbackSkill,
 			PracticeCardDoneAt: ver.PracticeCardDoneAt,
 		}
@@ -69,6 +77,9 @@ type createWorkReq struct {
 	Intent        string `json:"intent"`
 	Content       string `json:"content_markdown"`
 	AssetID       string `json:"source_asset_id"`
+	OCRJobID      string `json:"ocr_job_id"`
+	OCRVersion    int    `json:"ocr_version"`
+	OCRDigest     string `json:"ocr_confirmed_digest"`
 }
 
 func (h *handler) createCreativeWork(w http.ResponseWriter, r *http.Request) {
@@ -82,7 +93,10 @@ func (h *handler) createCreativeWork(w http.ResponseWriter, r *http.Request) {
 	}
 	id, created, err := h.rt.Deps.CreateCreativeWork(r.Context(), req.Agent, req.SourceSession, k12.CreativeWorkFields{
 		WorkType: req.WorkType, Title: req.Title, Task: req.Task, Intent: req.Intent,
-		Versions: []k12.CreativeWorkVersion{{ContentMarkdown: req.Content, SourceAssetID: req.AssetID}},
+		Versions: []k12.CreativeWorkVersion{{
+			ContentMarkdown: req.Content, SourceAssetID: req.AssetID,
+			OCRJobID: req.OCRJobID, OCRVersion: req.OCRVersion, OCRConfirmedDigest: req.OCRDigest,
+		}},
 	})
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
@@ -166,9 +180,12 @@ func (h *handler) generateWorkFeedback(w http.ResponseWriter, r *http.Request) {
 }
 
 type revisionReq struct {
-	Agent   string `json:"agent"`
-	Content string `json:"content_markdown"`
-	AssetID string `json:"source_asset_id"`
+	Agent      string `json:"agent"`
+	Content    string `json:"content_markdown"`
+	AssetID    string `json:"source_asset_id"`
+	OCRJobID   string `json:"ocr_job_id"`
+	OCRVersion int    `json:"ocr_version"`
+	OCRDigest  string `json:"ocr_confirmed_digest"`
 }
 
 func (h *handler) submitWorkRevision(w http.ResponseWriter, r *http.Request) {
@@ -180,7 +197,16 @@ func (h *handler) submitWorkRevision(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
-	v, err := h.rt.Deps.SubmitRevision(r.Context(), req.Agent, r.PathValue("id"), req.Content, req.AssetID)
+	var v usecase.CreativeWorkView
+	var err error
+	if req.OCRJobID != "" || req.OCRVersion != 0 || req.OCRDigest != "" {
+		v, err = h.rt.Deps.SubmitRevisionWithOCR(r.Context(), req.Agent, r.PathValue("id"), k12.CreativeWorkVersion{
+			ContentMarkdown: req.Content, SourceAssetID: req.AssetID,
+			OCRJobID: req.OCRJobID, OCRVersion: req.OCRVersion, OCRConfirmedDigest: req.OCRDigest,
+		})
+	} else {
+		v, err = h.rt.Deps.SubmitRevision(r.Context(), req.Agent, r.PathValue("id"), req.Content, req.AssetID)
+	}
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
 		return
@@ -196,7 +222,7 @@ type sendFeedbackReq struct {
 
 // sendWorkFeedback POST /creative-works/{id}/send-feedback —— 把点评要点/观察练习卡作为
 // 辅导延伸消息发到绑定该实例的私聊（§3.10「点评可发送到手机」/ §3.12 发送到手机）。
-// 未接线（Deliver=nil）→ 501、未绑定/发送失败 → 409：前端诚实降级为复制文本（不虚标已发送）。
+// 发送前先落 durable Receipt；平台 HTTP 接受只返回 sending，不能虚标 delivered。
 // 文案家长向（§4.11）：只说后果不说机制，无「验证器/机制」词。
 func (h *handler) sendWorkFeedback(w http.ResponseWriter, r *http.Request) {
 	var req sendFeedbackReq
@@ -243,17 +269,20 @@ func (h *handler) sendWorkFeedback(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "kind 只支持 feedback / practice_card")
 		return
 	}
-	if h.rt.Deliver == nil {
-		// 诚实降级：不假装发送成功；前端据 501 提供「复制文本」兜底。
-		writeErr(w, http.StatusNotImplemented, "发送到手机还没有开通，可以先复制文本发给家长")
+	if h.rt.Deps.Delivery != nil {
+		kind := "creative_work_feedback"
+		if req.Kind == "practice_card" {
+			kind = "creative_work_practice_card"
+		}
+		receipt, _, err := h.rt.Deps.PrepareAndSendText(r.Context(), req.Agent, kind, v.Record.RecordID, content)
+		if err != nil {
+			writeDeliveryError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, receipt)
 		return
 	}
-	target, err := h.rt.Deliver.DeliverText(r.Context(), req.Agent, content)
-	if err != nil {
-		writeErr(w, http.StatusConflict, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "target": target})
+	writeErr(w, http.StatusNotImplemented, "发送到手机还没有开通，请先在连接设置里完成私聊绑定")
 }
 
 // markPracticeCardDone POST /creative-works/{id}/practice-card/done —— 观察练习卡完成打卡

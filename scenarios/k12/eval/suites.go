@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
@@ -413,14 +412,16 @@ type SuiteResult struct {
 // Report 一次评测运行的落盘报告。ReportID 内容寻址（对除 report_id 外的规范化 JSON 取
 // SHA-256 前 16 位，前缀 "k12eval-"）；split=holdout 的 ReportID 即翻门证据 ID。
 type Report struct {
-	ReportID           string        `json:"report_id"`
-	Split              string        `json:"split"` // dev | holdout
-	Provider           string        `json:"provider"`
-	Model              string        `json:"model"`
-	HoldoutManifestSHA string        `json:"holdout_manifest_sha256"`
-	GeneratedAt        string        `json:"generated_at"`
-	CaseLimitPerSuite  int           `json:"case_limit_per_suite,omitempty"` // 0 = 全量
-	Suites             []SuiteResult `json:"suites"`
+	ReportID           string           `json:"report_id"`
+	Split              string           `json:"split"` // dev | holdout
+	Provider           string           `json:"provider"`
+	Model              string           `json:"model"`
+	HoldoutManifestSHA string           `json:"holdout_manifest_sha256"`
+	GeneratedAt        string           `json:"generated_at"`
+	CaseLimitPerSuite  int              `json:"case_limit_per_suite,omitempty"` // 0 = 全量
+	Suites             []SuiteResult    `json:"suites"`
+	QualityGate        *QualityGate     `json:"quality_gate,omitempty"`
+	Signature          *ReportSignature `json:"signature,omitempty"`
 }
 
 // ReportIDPrefix 报告 ID 前缀（SubjectVerifierGate 翻门证据的格式契约）。
@@ -428,9 +429,7 @@ const ReportIDPrefix = "k12eval-"
 
 // ComputeReportID 计算内容寻址报告 ID。
 func ComputeReportID(r Report) (string, error) {
-	r.ReportID = ""
-	sort.Slice(r.Suites, func(i, j int) bool { return r.Suites[i].SuiteNo < r.Suites[j].SuiteNo })
-	blob, err := json.Marshal(r)
+	blob, err := canonicalUnsignedReport(r)
 	if err != nil {
 		return "", err
 	}

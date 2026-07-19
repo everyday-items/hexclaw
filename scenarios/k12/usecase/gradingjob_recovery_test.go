@@ -113,6 +113,11 @@ func TestGradingRecovery_AwaitingConfirmationStaysWaiting(t *testing.T) {
 	if v, err = o1.RunGradingJob(ctx, jobID); err != nil || v.Record.Status != k12.GradingStageAwaitingConfirmation {
 		t.Fatalf("RunGradingJob 应停在确认点: %v stage=%s", err, v.Record.Status)
 	}
+	// 本用例模拟“确认停点已完整落盘后进程退出”；先等独立锚点分支回位，避免把仍存活的
+	// o1 goroutine 与新进程 o2 并跑误当成崩溃恢复（真实崩溃时旧 goroutine 已不存在）。
+	waitGradingView(t, o1, jobID, func(v GradingJobView) bool {
+		return v.Fields.AnchorState == k12.GradingAnchorLocated
+	})
 
 	o2 := newRecoverableOrchestrator(t, d, dir)
 	if _, err := o2.RecoverGradingJobs(ctx, []string{"mingming"}); err != nil {

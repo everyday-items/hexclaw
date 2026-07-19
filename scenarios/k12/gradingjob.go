@@ -1,6 +1,7 @@
 package k12
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -27,6 +28,7 @@ const (
 	GradingStageProjecting           = "projecting"
 	GradingStageCompleted            = "completed"
 	GradingStageCancelled            = "cancelled"
+	GradingStageOutcomeUnknown       = "outcome_unknown"
 	GradingStageFailedRetryable      = "failed_retryable"
 	GradingStageFailedTerminal       = "failed_terminal"
 )
@@ -34,7 +36,7 @@ const (
 // 等待态正交拆分（2026-07-18 裁决，外部评审 #4a）：awaiting_confirmation 阶段内
 // 「等家长确认」与「等锚点定位」是两个正交子态，防止未确认即批改 / 锚点无限等待 / 崩溃恢复错位。
 const (
-	// confirmation_state：批改执行的前置条件只看它 = confirmed。
+	// confirmation_state：确认分支的终止态；与 anchor_state 的终止态共同汇合后才可批改。
 	GradingConfirmationPending   = "pending"
 	GradingConfirmationConfirmed = "confirmed"
 	// anchor_state：锚点定位超时（默认 60s）显式 degraded，走 §4.9 无坐标降级（该题只出文字结果），
@@ -45,7 +47,7 @@ const (
 )
 
 // GradingAnchorTimeoutSeconds 锚点定位默认超时（§6.7 拆分裁决 60s）。
-// 超时判定与 degraded 落库由编排器执行（下一轮接线），领域只固化常量与降级语义。
+// 编排器用 context.WithTimeout 执行并把超时显式落为 degraded；该值可由运行时配置覆盖。
 const GradingAnchorTimeoutSeconds = 60
 
 // GradingMaxStageAttempts 每阶段重试上限（规则 4：达上限进 failed_terminal，不允许无限循环）。
@@ -54,11 +56,66 @@ const GradingMaxStageAttempts = 3
 
 // GradingModelSnapshot 实际模型路由快照（§5.4 model_snapshot：provider/model/capability/timeout/fallback）。
 type GradingModelSnapshot struct {
-	Provider   string `json:"provider"`
-	Model      string `json:"model"`
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	// Route is the immutable provider/model routing identity captured when the
+	// Job is created. A retry reuses it even if global defaults change.
+	Route      string `json:"route"`
 	Capability string `json:"capability,omitempty"`
 	TimeoutMS  int    `json:"timeout_ms,omitempty"`
 	Fallback   string `json:"fallback,omitempty"`
+}
+
+// NormalizeGradingModelSnapshot freezes a stable route identity for old
+// callers that only supplied provider/model. Fallback is descriptive only;
+// retry code must never interpret it as permission to change route.
+func NormalizeGradingModelSnapshot(snapshot GradingModelSnapshot) GradingModelSnapshot {
+	snapshot.Provider = strings.TrimSpace(snapshot.Provider)
+	snapshot.Model = strings.TrimSpace(snapshot.Model)
+	snapshot.Route = strings.TrimSpace(snapshot.Route)
+	if snapshot.Route == "" && snapshot.Provider != "" && snapshot.Model != "" {
+		snapshot.Route = snapshot.Provider + "/" + snapshot.Model
+	}
+	return snapshot
+}
+
+type gradingModelSnapshotContextKey struct{}
+
+// WithGradingModelSnapshot carries the Job's immutable route to every external
+// model adapter. Production adapters must route from this value, not a mutable
+// global default.
+func WithGradingModelSnapshot(ctx context.Context, snapshot GradingModelSnapshot) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, gradingModelSnapshotContextKey{}, NormalizeGradingModelSnapshot(snapshot))
+}
+
+func GradingModelSnapshotFromContext(ctx context.Context) (GradingModelSnapshot, bool) {
+	if ctx == nil {
+		return GradingModelSnapshot{}, false
+	}
+	snapshot, ok := ctx.Value(gradingModelSnapshotContextKey{}).(GradingModelSnapshot)
+	if !ok {
+		return GradingModelSnapshot{}, false
+	}
+	snapshot = NormalizeGradingModelSnapshot(snapshot)
+	return snapshot, snapshot.Provider != "" && snapshot.Model != "" && snapshot.Route != ""
+}
+
+// ValidateGradingModelRoute makes accidental cross-route execution fail closed.
+// Adapters call it immediately before sending an external request.
+func ValidateGradingModelRoute(ctx context.Context, provider, model string) error {
+	snapshot, ok := GradingModelSnapshotFromContext(ctx)
+	if !ok {
+		return fmt.Errorf("grading model route snapshot missing")
+	}
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider != snapshot.Provider || model != snapshot.Model || provider+"/"+model != snapshot.Route {
+		return fmt.Errorf("grading model route mismatch: frozen=%s actual=%s/%s", snapshot.Route, provider, model)
+	}
+	return nil
 }
 
 // GradingStageCheckpoint 已完成阶段的产物摘要（§5.4 stage_checkpoints）。
@@ -99,7 +156,8 @@ func BuildGradingIdempotencyKey(sourceKind, sourceKey string, confirmedVersion i
 func GradingStageCancellable(stage string) bool {
 	switch stage {
 	case GradingStageQueued, GradingStageNormalizing, GradingStageRecognizing,
-		GradingStageLocating, GradingStageAwaitingConfirmation, GradingStageAssessing:
+		GradingStageLocating, GradingStageAwaitingConfirmation, GradingStageAssessing,
+		GradingStageOutcomeUnknown:
 		return true
 	}
 	return false
@@ -181,7 +239,8 @@ func GradingJobSchema() *records.RecordSchema {
 			GradingStageQueued, GradingStageNormalizing, GradingStageRecognizing,
 			GradingStageLocating, GradingStageAwaitingConfirmation, GradingStageAssessing,
 			GradingStageRendering, GradingStageProjecting, GradingStageCompleted,
-			GradingStageCancelled, GradingStageFailedRetryable, GradingStageFailedTerminal,
+			GradingStageCancelled, GradingStageOutcomeUnknown,
+			GradingStageFailedRetryable, GradingStageFailedTerminal,
 		},
 		Transitions: map[string][]string{
 			GradingStageQueued: {
@@ -192,19 +251,22 @@ func GradingJobSchema() *records.RecordSchema {
 				GradingStageCancelled,
 			},
 			GradingStageNormalizing: {GradingStageRecognizing, GradingStageCancelled, GradingStageFailedRetryable},
-			GradingStageRecognizing: {GradingStageAwaitingConfirmation, GradingStageLocating, GradingStageCancelled, GradingStageFailedRetryable},
-			GradingStageLocating:    {GradingStageAssessing, GradingStageCancelled, GradingStageFailedRetryable},
+			GradingStageRecognizing: {GradingStageAwaitingConfirmation, GradingStageLocating, GradingStageCancelled, GradingStageOutcomeUnknown, GradingStageFailedRetryable},
+			GradingStageLocating:    {GradingStageAssessing, GradingStageCancelled, GradingStageOutcomeUnknown, GradingStageFailedRetryable},
 			GradingStageAwaitingConfirmation: {
 				GradingStageAssessing, // 与 locating 汇合后进入（规则 1）
 				GradingStageCancelled,
 			},
-			GradingStageAssessing:       {GradingStageRendering, GradingStageCancelled, GradingStageFailedRetryable},
+			GradingStageAssessing:       {GradingStageRendering, GradingStageCancelled, GradingStageOutcomeUnknown, GradingStageFailedRetryable},
 			GradingStageRendering:       {GradingStageProjecting},
 			GradingStageProjecting:      {GradingStageCompleted, GradingStageFailedRetryable},
 			GradingStageFailedRetryable: {GradingStageQueued, GradingStageFailedTerminal},
-			GradingStageCompleted:       {},
-			GradingStageCancelled:       {},
-			GradingStageFailedTerminal:  {},
+			// Only an explicit reconciliation command may take outcome_unknown
+			// to failed_retryable; ordinary RetryGradingJob cannot.
+			GradingStageOutcomeUnknown: {GradingStageFailedRetryable, GradingStageCancelled},
+			GradingStageCompleted:      {},
+			GradingStageCancelled:      {},
+			GradingStageFailedTerminal: {},
 		},
 		DedupeKey:      gradingJobDedupeKey,
 		ValidateFields: validateGradingJobFields,
@@ -245,8 +307,12 @@ func validateGradingJobFields(fieldsJSON string) error {
 	if f.ConfirmedVersion < 0 {
 		return fmt.Errorf("confirmed_version 不可为负: %d", f.ConfirmedVersion)
 	}
-	if strings.TrimSpace(f.ModelSnapshot.Provider) == "" || strings.TrimSpace(f.ModelSnapshot.Model) == "" {
+	f.ModelSnapshot = NormalizeGradingModelSnapshot(f.ModelSnapshot)
+	if f.ModelSnapshot.Provider == "" || f.ModelSnapshot.Model == "" {
 		return fmt.Errorf("model_snapshot 缺少 provider/model（§5.4 不可空）")
+	}
+	if f.ModelSnapshot.Route != f.ModelSnapshot.Provider+"/"+f.ModelSnapshot.Model {
+		return fmt.Errorf("model_snapshot route 与 provider/model 不一致")
 	}
 	valid := map[string]bool{}
 	for _, s := range GradingJobSchema().Statuses {
@@ -268,6 +334,7 @@ func NewGradingJobRecord(agentName, sourceSession string, f GradingJobFields) (*
 	if f.AnchorState == "" {
 		f.AnchorState = GradingAnchorPending
 	}
+	f.ModelSnapshot = NormalizeGradingModelSnapshot(f.ModelSnapshot)
 	raw, err := json.Marshal(f)
 	if err != nil {
 		return nil, fmt.Errorf("marshal 批改任务字段: %w", err)
@@ -284,6 +351,9 @@ func NewGradingJobRecord(agentName, sourceSession string, f GradingJobFields) (*
 // ParseGradingJobFields 解析批改任务字段。
 func ParseGradingJobFields(fieldsJSON string) (GradingJobFields, error) {
 	var f GradingJobFields
-	err := json.Unmarshal([]byte(fieldsJSON), &f)
-	return f, err
+	if err := json.Unmarshal([]byte(fieldsJSON), &f); err != nil {
+		return GradingJobFields{}, err
+	}
+	f.ModelSnapshot = NormalizeGradingModelSnapshot(f.ModelSnapshot)
+	return f, nil
 }

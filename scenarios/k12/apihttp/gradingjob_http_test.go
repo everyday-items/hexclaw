@@ -9,6 +9,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
 
 	_ "modernc.org/sqlite"
@@ -17,7 +18,12 @@ import (
 // HTTP 契约：统一 GradingJob（架构设计 §6.7 / §4.10 / 执行计划 §3.0 2026-07-18 新规格）。
 // 本轮为「领域+命令+HTTP 契约」阶段；桌面/钉钉入口迁移与真实编排器接线在下一轮。
 
-func newGradingServer(t *testing.T, agents ...string) http.Handler {
+type gradingFixture struct {
+	h    http.Handler
+	deps usecase.Deps
+}
+
+func newGradingFixture(t *testing.T, agents ...string) gradingFixture {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -39,20 +45,21 @@ func newGradingServer(t *testing.T, agents ...string) http.Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return apihttp.NewHandler(apihttp.Runtime{Views: k.Registry.Views, Records: k.Records, Deps: k.Deps})
+	return gradingFixture{
+		h:    apihttp.NewHandler(apihttp.Runtime{Views: k.Registry.Views, Records: k.Records, Deps: k.Deps}),
+		deps: k.Deps,
+	}
+}
+
+func newGradingServer(t *testing.T, agents ...string) http.Handler {
+	t.Helper()
+	return newGradingFixture(t, agents...).h
 }
 
 func createJobBody(sourceKey string) string {
 	return fmt.Sprintf(`{"agent":"mingming","source_session":"s1","submission_id":"sub-1",
 		"source_kind":"im","source_key":%q,
 		"model_snapshot":{"provider":"openrouter","model":"test-vlm","capability":"vision"}}`, sourceKey)
-}
-
-func advanceBody(extra string) string {
-	if extra == "" {
-		return `{"agent":"mingming","outcome":"ok"}`
-	}
-	return `{"agent":"mingming",` + extra + `}`
 }
 
 func httpJob(t *testing.T, h http.Handler, id string) map[string]any {
@@ -64,22 +71,29 @@ func httpJob(t *testing.T, h http.Handler, id string) map[string]any {
 	return out
 }
 
-// driveHTTPToAwaiting 创建并推进到 awaiting_confirmation，返回 job_id。
-func driveHTTPToAwaiting(t *testing.T, h http.Handler, sourceKey string) string {
+func advanceFixture(t *testing.T, f gradingFixture, id string, in usecase.AdvanceGradingInput) usecase.GradingJobView {
 	t.Helper()
-	rec, out := do(t, h, "POST", "/grading-jobs", createJobBody(sourceKey))
+	v, err := f.deps.AdvanceGradingStage(context.Background(), "mingming", id, in)
+	if err != nil {
+		t.Fatalf("内部编排推进: %v", err)
+	}
+	return v
+}
+
+// driveHTTPToAwaiting 通过公共 create 创建，再由进程内编排命令推进到确认停点。
+// HTTP /advance 已按 DD-001 删除，测试不得把内部阶段命令重新公开。
+func driveHTTPToAwaiting(t *testing.T, f gradingFixture, sourceKey string) string {
+	t.Helper()
+	rec, out := do(t, f.h, "POST", "/grading-jobs", createJobBody(sourceKey))
 	if rec.Code != http.StatusOK || out["created"] != true {
 		t.Fatalf("创建 %d: %v", rec.Code, out)
 	}
 	job, _ := out["job"].(map[string]any)
 	id, _ := job["job_id"].(string)
 	for i := 0; i < 3; i++ { // queued→normalizing→recognizing→awaiting_confirmation
-		rec, out = do(t, h, "POST", "/grading-jobs/"+id+"/advance", advanceBody(`"outcome":"ok","artifact_digest":"d"`))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("advance #%d %d: %v", i, rec.Code, out)
-		}
+		advanceFixture(t, f, id, usecase.AdvanceGradingInput{Outcome: usecase.GradingOutcomeOK, ArtifactDigest: "d"})
 	}
-	if got := httpJob(t, h, id)["stage"]; got != "awaiting_confirmation" {
+	if got := httpJob(t, f.h, id)["stage"]; got != "awaiting_confirmation" {
 		t.Fatalf("应 awaiting_confirmation, got %v", got)
 	}
 	return id
@@ -87,8 +101,9 @@ func driveHTTPToAwaiting(t *testing.T, h http.Handler, sourceKey string) string 
 
 // TestGradingJobHTTPLifecycle 创建（幂等）→ 推进 → 锚点 → 确认 → 完成 全链契约。
 func TestGradingJobHTTPLifecycle(t *testing.T) {
-	h := newGradingServer(t)
-	id := driveHTTPToAwaiting(t, h, "msg-1")
+	f := newGradingFixture(t)
+	h := f.h
+	id := driveHTTPToAwaiting(t, f, "msg-1")
 
 	// 幂等创建：同 source_key 返回既有 Job（§4.10）
 	rec, out := do(t, h, "POST", "/grading-jobs", createJobBody("msg-1"))
@@ -98,13 +113,6 @@ func TestGradingJobHTTPLifecycle(t *testing.T) {
 	job, _ := out["job"].(map[string]any)
 	if job["job_id"] != id {
 		t.Fatalf("同幂等键应返回既有 Job: %v", job["job_id"])
-	}
-
-	// 列表按 agent 查询
-	rec, out = do(t, h, "GET", "/grading-jobs?agent=mingming", "")
-	items, _ := out["items"].([]any)
-	if rec.Code != http.StatusOK || len(items) != 1 {
-		t.Fatalf("列表应 1 条: %d %v", rec.Code, out)
 	}
 
 	// 等待态正交拆分字段外显（2026-07-18 §6.7 修订）
@@ -118,67 +126,64 @@ func TestGradingJobHTTPLifecycle(t *testing.T) {
 	}
 
 	// 锚点回位 → 确认 → assessing
-	rec, _ = do(t, h, "POST", "/grading-jobs/"+id+"/advance", advanceBody(`"outcome":"anchor","anchor_state":"located","artifact_digest":"a"`))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("anchor %d", rec.Code)
-	}
+	advanceFixture(t, f, id, usecase.AdvanceGradingInput{
+		Outcome: usecase.GradingOutcomeAnchor, AnchorState: "located", ArtifactDigest: "a",
+	})
 	rec, out = do(t, h, "POST", "/grading-jobs/"+id+"/confirm", `{"agent":"mingming","corrections":["q1 确认"]}`)
 	if rec.Code != http.StatusOK || out["stage"] != "assessing" {
 		t.Fatalf("确认+锚点汇合应进 assessing: %d %v", rec.Code, out)
 	}
 	// assessing→rendering→projecting→completed
 	for _, want := range []string{"rendering", "projecting", "completed"} {
-		rec, out = do(t, h, "POST", "/grading-jobs/"+id+"/advance", advanceBody(`"outcome":"ok","artifact_digest":"d"`))
-		if rec.Code != http.StatusOK || out["stage"] != want {
-			t.Fatalf("推进应到 %s: %d %v", want, rec.Code, out)
+		v := advanceFixture(t, f, id, usecase.AdvanceGradingInput{Outcome: usecase.GradingOutcomeOK, ArtifactDigest: "d"})
+		if v.Record.Status != want {
+			t.Fatalf("推进应到 %s: %s", want, v.Record.Status)
 		}
 	}
 }
 
 // TestGradingJobHTTPAnchorDegraded 规则 1 拆分裁决：锚点超时 degraded 不阻塞确认后批改。
 func TestGradingJobHTTPAnchorDegraded(t *testing.T) {
-	h := newGradingServer(t)
-	id := driveHTTPToAwaiting(t, h, "msg-1")
-	rec, _ := do(t, h, "POST", "/grading-jobs/"+id+"/advance", advanceBody(`"outcome":"anchor","anchor_state":"degraded"`))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("anchor degraded %d", rec.Code)
-	}
+	f := newGradingFixture(t)
+	h := f.h
+	id := driveHTTPToAwaiting(t, f, "msg-1")
+	advanceFixture(t, f, id, usecase.AdvanceGradingInput{Outcome: usecase.GradingOutcomeAnchor, AnchorState: "degraded"})
 	rec, out := do(t, h, "POST", "/grading-jobs/"+id+"/confirm", `{"agent":"mingming"}`)
 	if rec.Code != http.StatusOK || out["stage"] != "assessing" || out["anchor_state"] != "degraded" {
 		t.Fatalf("degraded 不阻塞批改: %d %v", rec.Code, out)
 	}
 }
 
-// TestGradingJobHTTPReviseShortcut 规则 6：修正 → 新 Job（confirmed_version+1、新幂等键、
-// queued→assessing 捷径）；旧 Job 不回退。
-func TestGradingJobHTTPReviseShortcut(t *testing.T) {
-	h := newGradingServer(t)
-	id := driveHTTPToAwaiting(t, h, "msg-1")
-	do(t, h, "POST", "/grading-jobs/"+id+"/advance", advanceBody(`"outcome":"anchor","anchor_state":"located"`))
+// TestGradingJobInternalReviseShortcut 规则 6：修正命令保持应用层 internal-only；
+// confirmed_version+1 创建新 Job 并走 queued→assessing 捷径，旧 Job 不回退。
+func TestGradingJobInternalReviseShortcut(t *testing.T) {
+	f := newGradingFixture(t)
+	h := f.h
+	id := driveHTTPToAwaiting(t, f, "msg-1")
+	advanceFixture(t, f, id, usecase.AdvanceGradingInput{Outcome: usecase.GradingOutcomeAnchor, AnchorState: "located"})
 	do(t, h, "POST", "/grading-jobs/"+id+"/confirm", `{"agent":"mingming"}`)
 	for i := 0; i < 3; i++ {
-		do(t, h, "POST", "/grading-jobs/"+id+"/advance", advanceBody(`"outcome":"ok","artifact_digest":"d"`))
+		advanceFixture(t, f, id, usecase.AdvanceGradingInput{Outcome: usecase.GradingOutcomeOK, ArtifactDigest: "d"})
 	}
 	if got := httpJob(t, h, id)["stage"]; got != "completed" {
 		t.Fatalf("前置应 completed, got %v", got)
 	}
 
-	rec, out := do(t, h, "POST", "/grading-jobs/"+id+"/revise", `{"agent":"mingming","source_session":"s2","corrections":["q1 改 42"]}`)
-	if rec.Code != http.StatusOK || out["created"] != true {
-		t.Fatalf("revise %d: %v", rec.Code, out)
+	revised, created, err := f.deps.ReviseGradingJob(context.Background(), "mingming", id, "s2", []string{"q1 改 42"})
+	if err != nil || !created {
+		t.Fatalf("内部 revise: created=%v err=%v", created, err)
 	}
-	nj, _ := out["job"].(map[string]any)
-	nid, _ := nj["job_id"].(string)
+	nid := revised.Record.RecordID
 	if nid == "" || nid == id {
-		t.Fatalf("修正应创建新 Job: %v", nj)
+		t.Fatalf("修正应创建新 Job: %s", nid)
 	}
-	if nj["confirmed_version"] != float64(1) {
-		t.Fatalf("confirmed_version 应 1: %v", nj["confirmed_version"])
+	if revised.Fields.ConfirmedVersion != 1 {
+		t.Fatalf("confirmed_version 应 1: %v", revised.Fields.ConfirmedVersion)
 	}
 	// 捷径：首个非 queued 态 = assessing
-	rec, out = do(t, h, "POST", "/grading-jobs/"+nid+"/advance", advanceBody(`"outcome":"ok"`))
-	if rec.Code != http.StatusOK || out["stage"] != "assessing" {
-		t.Fatalf("修正重批捷径应直达 assessing: %d %v", rec.Code, out)
+	v := advanceFixture(t, f, nid, usecase.AdvanceGradingInput{Outcome: usecase.GradingOutcomeOK})
+	if v.Record.Status != "assessing" {
+		t.Fatalf("修正重批捷径应直达 assessing: %s", v.Record.Status)
 	}
 	// 旧 Job 不回退
 	if got := httpJob(t, h, id)["stage"]; got != "completed" {
@@ -189,8 +194,9 @@ func TestGradingJobHTTPReviseShortcut(t *testing.T) {
 // TestGradingJobHTTPCancelBoundaryAndRetry 规则 4/5：rendering/projecting 拒取消(409)；
 // 失败重试链路 + 重试上限收敛 failed_terminal。
 func TestGradingJobHTTPCancelBoundaryAndRetry(t *testing.T) {
-	h := newGradingServer(t)
-	id := driveHTTPToAwaiting(t, h, "msg-1")
+	f := newGradingFixture(t)
+	h := f.h
+	id := driveHTTPToAwaiting(t, f, "msg-1")
 	// 等待态可取消（规则 7：家长显式取消）——用另一个 Job 验证
 	id2 := ""
 	{
@@ -205,23 +211,25 @@ func TestGradingJobHTTPCancelBoundaryAndRetry(t *testing.T) {
 			t.Fatalf("queued 取消: %d %v", rec.Code, out)
 		}
 	}
-	do(t, h, "POST", "/grading-jobs/"+id+"/advance", advanceBody(`"outcome":"anchor","anchor_state":"located"`))
+	advanceFixture(t, f, id, usecase.AdvanceGradingInput{Outcome: usecase.GradingOutcomeAnchor, AnchorState: "located"})
 	do(t, h, "POST", "/grading-jobs/"+id+"/confirm", `{"agent":"mingming"}`)
 	// assessing 失败（可重试）→ retry → 捷径恢复
-	rec, out := do(t, h, "POST", "/grading-jobs/"+id+"/advance", advanceBody(`"outcome":"failed","failure_kind":"model_timeout","retryable":true`))
-	if rec.Code != http.StatusOK || out["stage"] != "failed_retryable" {
-		t.Fatalf("失败态: %d %v", rec.Code, out)
+	failed := advanceFixture(t, f, id, usecase.AdvanceGradingInput{
+		Outcome: usecase.GradingOutcomeFailed, FailureKind: "model_timeout", Retryable: true,
+	})
+	if failed.Record.Status != "failed_retryable" {
+		t.Fatalf("失败态: %s", failed.Record.Status)
 	}
-	rec, out = do(t, h, "POST", "/grading-jobs/"+id+"/retry", `{"agent":"mingming"}`)
+	rec, out := do(t, h, "POST", "/grading-jobs/"+id+"/retry", `{"agent":"mingming"}`)
 	if rec.Code != http.StatusOK || out["stage"] != "queued" {
 		t.Fatalf("retry: %d %v", rec.Code, out)
 	}
-	rec, out = do(t, h, "POST", "/grading-jobs/"+id+"/advance", advanceBody(`"outcome":"ok"`))
-	if rec.Code != http.StatusOK || out["stage"] != "assessing" {
-		t.Fatalf("恢复应直达 assessing: %d %v", rec.Code, out)
+	recovered := advanceFixture(t, f, id, usecase.AdvanceGradingInput{Outcome: usecase.GradingOutcomeOK})
+	if recovered.Record.Status != "assessing" {
+		t.Fatalf("恢复应直达 assessing: %s", recovered.Record.Status)
 	}
 	// 进 rendering 后取消被拒 409
-	do(t, h, "POST", "/grading-jobs/"+id+"/advance", advanceBody(`"outcome":"ok","artifact_digest":"d"`))
+	advanceFixture(t, f, id, usecase.AdvanceGradingInput{Outcome: usecase.GradingOutcomeOK, ArtifactDigest: "d"})
 	rec, _ = do(t, h, "POST", "/grading-jobs/"+id+"/cancel", `{"agent":"mingming"}`)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("rendering 取消应 409, got %d", rec.Code)
@@ -246,8 +254,7 @@ func TestGradingJobHTTPIsolation(t *testing.T) {
 		t.Fatalf("跨实例 cancel 应 404, got %d", rec.Code)
 	}
 	rec, out = do(t, h, "GET", "/grading-jobs?agent=gege", "")
-	items, _ := out["items"].([]any)
-	if rec.Code != http.StatusOK || len(items) != 0 {
-		t.Fatalf("跨实例列表应空: %d %v", rec.Code, out)
+	if rec.Code != http.StatusMethodNotAllowed && rec.Code != http.StatusNotFound {
+		t.Fatalf("公共列表端点必须不存在: %d %v", rec.Code, out)
 	}
 }

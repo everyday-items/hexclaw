@@ -265,6 +265,14 @@ func deleteChildren(ctx context.Context, ex dbExecer, mp rowMapper, recordID, ag
 	}
 	switch mp.(type) {
 	case practiceSetMapper:
+		if _, err := ex.ExecContext(ctx, `DELETE FROM k12_print_jobs WHERE practice_set_id IN
+            (SELECT record_id FROM k12_practice_sets WHERE record_id = ?`+scope+`)`, args...); err != nil {
+			return err
+		}
+		if _, err := ex.ExecContext(ctx, `DELETE FROM k12_practice_return_assets WHERE set_record_id IN
+            (SELECT record_id FROM k12_practice_sets WHERE record_id = ?`+scope+`)`, args...); err != nil {
+			return err
+		}
 		_, err := ex.ExecContext(ctx, `DELETE FROM k12_practice_set_items WHERE set_record_id IN
             (SELECT record_id FROM k12_practice_sets WHERE record_id = ?`+scope+`)`, args...)
 		return err
@@ -476,11 +484,24 @@ const dedupeTombstoneSep = "#released#"
 // ExportAgent 导出某实例全部 K12 记录（跨记录集），供备份（.hexbak）。
 // 排序与 agent_records 时代一致：collection（字节序）、created_at、record_id。
 func (s *Store) ExportAgent(ctx context.Context, agentName string) ([]*records.AgentRecord, error) {
+	return s.exportAgentVia(ctx, s.db, agentName)
+}
+
+// ExportAgentTx 在调用方事务的同一快照中导出实例，供 restore-as 在写入前冻结
+// 可精确回退的目标状态。
+func (s *Store) ExportAgentTx(ctx context.Context, tx *sql.Tx, agentName string) ([]*records.AgentRecord, error) {
+	if tx == nil {
+		return nil, fmt.Errorf("records: nil export transaction")
+	}
+	return s.exportAgentVia(ctx, tx, agentName)
+}
+
+func (s *Store) exportAgentVia(ctx context.Context, q dbQueryer, agentName string) ([]*records.AgentRecord, error) {
 	mappers := allMappers()
 	sort.Slice(mappers, func(i, j int) bool { return mappers[i].collection() < mappers[j].collection() })
 	var out []*records.AgentRecord
 	for _, mp := range mappers {
-		rows, err := s.queryRecords(ctx, mp, `WHERE agent_name = ? ORDER BY created_at, record_id`, agentName)
+		rows, err := s.queryRecordsVia(ctx, q, mp, `WHERE agent_name = ? ORDER BY created_at, record_id`, agentName)
 		if err != nil {
 			return nil, err
 		}
@@ -655,6 +676,10 @@ func (s *Store) replaceAgentRecordsVia(ctx context.Context, ex dbHandle, agentNa
 	for _, mp := range allMappers() {
 		switch mp.(type) {
 		case practiceSetMapper:
+			if _, err := ex.ExecContext(ctx, `DELETE FROM k12_practice_return_assets WHERE set_record_id IN
+                (SELECT record_id FROM k12_practice_sets WHERE agent_name = ?)`, agentName); err != nil {
+				return fmt.Errorf("records: 清理实例旧回传资产: %w", err)
+			}
 			if _, err := ex.ExecContext(ctx, `DELETE FROM k12_practice_set_items WHERE set_record_id IN
                 (SELECT record_id FROM k12_practice_sets WHERE agent_name = ?)`, agentName); err != nil {
 				return fmt.Errorf("records: 清理实例旧记录: %w", err)

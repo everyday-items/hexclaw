@@ -81,8 +81,8 @@ func checkpointStages(v GradingJobView) map[string]int {
 	return stages
 }
 
-// TestGradingOrchestratorFullChainCompletes 全链推进：Start → Run 停在 awaiting_confirmation
-// （锚点已回位 located）→ ConfirmAndRun → completed，检查点齐全，识别/锚点模型各只调一次，
+// TestGradingOrchestratorFullChainCompletes 全链推进：Start → Run 立即停在 awaiting_confirmation
+// （锚点独立回位 located）→ ConfirmAndRun → completed，检查点齐全，识别/锚点模型各只调一次，
 // 最终产物（批改图 + Markdown）可取。
 func TestGradingOrchestratorFullChainCompletes(t *testing.T) {
 	ctx := context.Background()
@@ -106,12 +106,15 @@ func TestGradingOrchestratorFullChainCompletes(t *testing.T) {
 	if v.Fields.ConfirmationState != k12.GradingConfirmationPending {
 		t.Fatalf("停点确认态应 pending: %s", v.Fields.ConfirmationState)
 	}
-	if v.Fields.AnchorState != k12.GradingAnchorLocated {
-		t.Fatalf("锚点并行分支应已回位 located: %s", v.Fields.AnchorState)
+	if v.Fields.AnchorState != k12.GradingAnchorPending {
+		t.Fatalf("主链不得等待锚点分支: %s", v.Fields.AnchorState)
 	}
 	if _, ok := o.PhotoResult(jobID); ok {
 		t.Fatalf("确认前不得有最终批改产物")
 	}
+	v = waitGradingView(t, o, jobID, func(v GradingJobView) bool {
+		return v.Fields.AnchorState == k12.GradingAnchorLocated
+	})
 
 	v, err = o.ConfirmAndRun(ctx, jobID, nil)
 	if err != nil {
@@ -170,6 +173,9 @@ func TestGradingOrchestratorRenderFailureDegrades(t *testing.T) {
 	if _, err := o.RunGradingJob(ctx, jobID); err != nil {
 		t.Fatalf("RunGradingJob: %v", err)
 	}
+	waitGradingView(t, o, jobID, func(v GradingJobView) bool {
+		return v.Fields.AnchorState == k12.GradingAnchorLocated
+	})
 	v, err := o.ConfirmAndRun(ctx, jobID, nil)
 	if err != nil {
 		t.Fatalf("渲染失败必须降级续跑而非报错: %v", err)
@@ -226,6 +232,9 @@ func TestGradingOrchestratorRecognizeFailureRetryResumes(t *testing.T) {
 	if v.Record.Status != k12.GradingStageAwaitingConfirmation {
 		t.Fatalf("重试续跑应到 awaiting_confirmation, got %s", v.Record.Status)
 	}
+	waitGradingView(t, o, jobID, func(v GradingJobView) bool {
+		return v.Fields.AnchorState == k12.GradingAnchorLocated
+	})
 	if _, err = o.ConfirmAndRun(ctx, jobID, nil); err != nil {
 		t.Fatalf("ConfirmAndRun: %v", err)
 	}
@@ -256,9 +265,12 @@ func TestGradingOrchestratorAnchorAbsentDegrades(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunGradingJob: %v", err)
 	}
-	if v.Record.Status != k12.GradingStageAwaitingConfirmation || v.Fields.AnchorState != k12.GradingAnchorDegraded {
-		t.Fatalf("无锚点能力应显式 degraded 并停在确认点: stage=%s anchor=%s", v.Record.Status, v.Fields.AnchorState)
+	if v.Record.Status != k12.GradingStageAwaitingConfirmation || v.Fields.AnchorState != k12.GradingAnchorPending {
+		t.Fatalf("主链应先返回确认点且不等待能力降级回位: stage=%s anchor=%s", v.Record.Status, v.Fields.AnchorState)
 	}
+	v = waitGradingView(t, o, jobID, func(v GradingJobView) bool {
+		return v.Fields.AnchorState == k12.GradingAnchorDegraded
+	})
 	v, err = o.ConfirmAndRun(ctx, jobID, nil)
 	if err != nil || v.Record.Status != k12.GradingStageCompleted {
 		t.Fatalf("degraded 不得阻塞批改: %v %s", err, v.Record.Status)

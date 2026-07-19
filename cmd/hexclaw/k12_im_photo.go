@@ -9,6 +9,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/channel"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	k12 "github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
@@ -193,17 +194,33 @@ func k12PhotoReply(result k12usecase.PhotoGradeResult) *adapter.Reply {
 // 真机取证过模型会违反提示词的 Unicode 约束——BUG-20260712-U）；桌面 HTTP 面的
 // 批改结果不经此路径，保持原文。
 func k12PhotoChannelMessage(result k12usecase.PhotoGradeResult) channel.Message {
-	msg := channel.Message{Text: imLaTeXFallback(result.Markdown, "k12_photo_grading")}
+	attachments := make([]channel.Attachment, 0, 1)
 	if result.AnnotatedImage != nil && len(result.AnnotatedImage.Data) > 0 {
 		mime := strings.TrimSpace(result.AnnotatedImage.MIME)
 		if mime == "" {
 			mime = "image/png"
 		}
-		msg.Attachments = []channel.Attachment{{
+		attachments = append(attachments, channel.Attachment{
 			Name: correctedPhotoFilename(mime),
 			MIME: mime,
 			Data: result.AnnotatedImage.Data,
-		}}
+		})
+	}
+	projected := imLaTeXFallback(result.Markdown, "k12_photo_grading")
+	fallbackReason := ""
+	if projected != result.Markdown {
+		fallbackReason = messagecontent.FallbackMathToReadableText
+	}
+	msg, err := channel.NewCanonicalMarkdownMessageWithAttachments(
+		messagecontent.ProducerK12,
+		"zh-CN",
+		result.Markdown,
+		projected,
+		fallbackReason,
+		attachments,
+	)
+	if err != nil {
+		return channel.Message{Text: "批改结果渲染失败，请重试。"}
 	}
 	return msg
 }

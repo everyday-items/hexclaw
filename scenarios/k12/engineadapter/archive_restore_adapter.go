@@ -3,6 +3,7 @@ package engineadapter
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/hexagon-codes/hexclaw/records"
@@ -33,6 +34,56 @@ func NewArchiveRestoreAdapter(
 }
 
 var _ usecase.ArchiveRestorer = (*ArchiveRestoreAdapter)(nil)
+var _ usecase.HexbakArchiveRestorer = (*ArchiveRestoreAdapter)(nil)
+
+// RestoreHexbak restores v3 records/profile plus packed content files. SQLite writes
+// commit together; files installed before commit are tracked and removed on every error.
+func (a *ArchiveRestoreAdapter) RestoreHexbak(ctx context.Context, bak *usecase.Hexbak) error {
+	if a == nil || a.db == nil || a.records == nil || a.dispatcher == nil || a.agents == nil {
+		return fmt.Errorf("k12 archive restore: atomic adapter is not fully configured")
+	}
+	if err := usecase.VerifyHexbak(bak); err != nil {
+		return err
+	}
+	if err := a.records.ValidateAgentRecords(bak.AgentName, bak.Records); err != nil {
+		return err
+	}
+	return a.dispatcher.UpdateAgentPersisted(bak.AgentName,
+		func(current router.AgentConfig) (router.AgentConfig, error) {
+			current.Metadata = k12.ReplaceProfileInMeta(current.Metadata, bak.Profile)
+			return current, nil
+		},
+		func(updated *router.AgentConfig) error {
+			tx, err := a.db.BeginTx(ctx, nil)
+			if err != nil {
+				return fmt.Errorf("begin shared v3 restore transaction: %w", err)
+			}
+			defer tx.Rollback()
+			if err := a.records.ImportAgentRecordsTx(ctx, tx, bak.AgentName, bak.Records); err != nil {
+				return fmt.Errorf("merge v3 records: %w", err)
+			}
+			if err := a.agents.SaveAgentTx(ctx, tx, updated); err != nil {
+				return fmt.Errorf("replace v3 profile metadata: %w", err)
+			}
+			if err := a.records.ImportCreativeWorkOCREvidenceTx(
+				ctx, tx, bak.AgentName, bak.CreativeWorkOCR,
+			); err != nil {
+				return fmt.Errorf("merge confirmed creative-work OCR evidence: %w", err)
+			}
+			installed, err := ensureArchiveAssets(bak)
+			if err != nil {
+				return fmt.Errorf("install v3 archive assets: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return errors.Join(
+					fmt.Errorf("commit shared v3 restore transaction: %w", err),
+					removeCreatedRestoreAssets(installed),
+				)
+			}
+			return nil
+		},
+	)
+}
 
 func (a *ArchiveRestoreAdapter) RestoreArchive(
 	ctx context.Context,

@@ -2,6 +2,7 @@ package apihttp
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
@@ -37,6 +38,8 @@ type gradingJobDTO struct {
 	Version           int                      `json:"version"`
 	CreatedAt         int64                    `json:"created_at"`
 	UpdatedAt         int64                    `json:"updated_at"`
+	// RecognizedQuestions 只在 GET 单任务详情的识别停点附带；创建/列表不扩大载荷。
+	RecognizedQuestions []recognizedQuestionDTO `json:"recognized_questions,omitempty"`
 }
 
 func toGradingJobDTO(v usecase.GradingJobView) gradingJobDTO {
@@ -184,23 +187,53 @@ func (h *handler) getGradingJob(w http.ResponseWriter, r *http.Request) {
 		"deadline": dto.Deadline, "confirmed_version": dto.ConfirmedVersion,
 		"job": dto,
 	}
-	// 编排器在场时附带阶段产物：识别停点产物（护栏回显数据源）与终态批改结果
-	// （桌面 PhotoGradeOverlay 数据源；批改图由前端按 bbox 客户端叠加，不回传合成图）。
+	// 编排器在场时附带识别停点产物（护栏回显数据源）。终态批改产物只由
+	// GET /grading-jobs/{id}/result 返回，避免详情轮询隐式扩大结果契约。
 	if h.rt.Grading != nil {
-		if qs, ok := h.rt.Grading.RecognizedQuestions(r.Context(), jobID); ok {
+		if qs, ok := h.rt.Grading.RecognizedQuestionsForOwner(r.Context(), agent, jobID); ok {
 			out := make([]recognizedQuestionDTO, 0, len(qs))
 			for _, q := range qs {
 				out = append(out, recognizedQuestionToDTO(q, true))
 			}
+			dto.RecognizedQuestions = out
+			resp["job"] = dto
 			resp["recognition"] = map[string]any{"questions": out, "subject": dominantSubject(qs)}
-		}
-		if v.Record.Status == k12.GradingStageCompleted {
-			if res, ok := h.rt.Grading.PhotoResult(jobID); ok {
-				resp["result"] = photoResultDTO(res)
-			}
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// getGradingJobResult GET /grading-jobs/{id}/result?agent= —— 独立读取终态产物。
+// 先按 agent 校验归属；未完成或产物尚不可读均返回 409，调用方继续轮询 Job 状态。
+func (h *handler) getGradingJobResult(w http.ResponseWriter, r *http.Request) {
+	agent := r.URL.Query().Get("agent")
+	if agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	jobID := r.PathValue("id")
+	v, err := h.rt.Deps.GetGradingJob(r.Context(), agent, jobID)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
+		return
+	}
+	if v.Record.Status != k12.GradingStageCompleted {
+		writeErr(w, http.StatusConflict, "grading job 尚未完成")
+		return
+	}
+	if h.rt.Grading == nil {
+		writeErr(w, http.StatusConflict, "grading result unavailable")
+		return
+	}
+	result, ok := h.rt.Grading.PhotoResult(jobID)
+	if !ok {
+		writeErr(w, http.StatusConflict, "grading result unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"job_id": jobID,
+		"result": photoResultDTO(result),
+	})
 }
 
 // photoItemDTO 逐题批改结果（判定五值口径；批改/解题分叉共用 gradeResp wire 形状）。
@@ -263,15 +296,17 @@ func (h *handler) confirmGradingJob(w http.ResponseWriter, r *http.Request) {
 	}
 	jobID := r.PathValue("id")
 	// 多孩隔离硬边界：编排器按 jobID 寻址，进入前必须先按请求 agent 校验归属（跨实例 404）。
-	if _, err := h.rt.Deps.GetGradingJob(r.Context(), req.Agent, jobID); err != nil {
+	job, err := h.rt.Deps.GetGradingJob(r.Context(), req.Agent, jobID)
+	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
 		return
 	}
 	if h.rt.Grading != nil {
-		v, ok, err := h.rt.Grading.ConfirmPhotoGradingJob(r.Context(), jobID, usecase.ConfirmPhotoGradingInput{
+		input := usecase.ConfirmPhotoGradingInput{
 			Subject: req.Subject, Grade: h.resolveGrade(r.Context(), req.Agent, req.Grade),
 			Corrections: req.QuestionCorrections,
-		})
+		}
+		v, ok, err := h.rt.Grading.ConfirmPersistedTextGradingJob(r.Context(), req.Agent, jobID, input)
 		if ok {
 			if err != nil {
 				writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
@@ -280,6 +315,19 @@ func (h *handler) confirmGradingJob(w http.ResponseWriter, r *http.Request) {
 			writeGradingJob(w, v)
 			return
 		}
+		v, ok, err = h.rt.Grading.ConfirmPhotoGradingJob(r.Context(), jobID, input)
+		if ok {
+			if err != nil {
+				writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+				return
+			}
+			writeGradingJob(w, v)
+			return
+		}
+	}
+	if job.Fields.SourceKind == "webhook" && strings.HasPrefix(job.Fields.SubmissionID, "webhook-receipt:") {
+		writeErr(w, http.StatusNotImplemented, "webhook 文本批改 worker 未注入")
+		return
 	}
 	v, err := h.rt.Deps.ConfirmGradingJob(r.Context(), req.Agent, jobID, req.Corrections)
 	if err != nil {

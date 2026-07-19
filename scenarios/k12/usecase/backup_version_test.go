@@ -20,7 +20,9 @@ func TestRestore_VersionGate(t *testing.T) {
 
 	// 当前版本空档案正常（round-trip 0 条）。
 	cur := &Hexbak{Version: HexbakVersion, AgentName: "mingming", Records: nil}
-	cur.Checksum, _ = checksumHexbak(cur)
+	if err := SealHexbak(cur); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := d.Restore(ctx, cur); err != nil {
 		t.Errorf("当前版本应正常恢复, got %v", err)
 	}

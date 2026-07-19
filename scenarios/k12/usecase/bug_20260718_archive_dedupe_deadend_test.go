@@ -21,7 +21,8 @@ func TestBug20260718_ArchivedWorkBlocksSameTitleRecreate(t *testing.T) {
 
 	f := k12.CreativeWorkFields{
 		WorkType: k12.WorkTypeWriting, Title: "我的好爸爸", Task: "写一篇写人记叙文",
-		Versions: []k12.CreativeWorkVersion{{SourceAssetID: "data:image/png;base64,xxxx"}},
+		// DD-013 后作文照片必须先走 OCR 确认；本测试只验证归档去重键，使用合法纯文本稿。
+		Versions: []k12.CreativeWorkVersion{{ContentMarkdown: "我的爸爸每天认真工作……"}},
 	}
 	id1, created, err := d.CreateCreativeWork(ctx, "xiaoming", "s", f)
 	if err != nil || !created {

@@ -29,9 +29,7 @@ func TestClosePracticeSetRecordsReason(t *testing.T) {
 		if _, _, err := d.FinalizeBasket(ctx, "xiaoming", id, "print", ""); err != nil {
 			t.Fatal(err)
 		}
-		if err := d.SubmitPracticeSet(ctx, "xiaoming", id); err != nil {
-			t.Fatal(err)
-		}
+		submitWholeSet(t, d, "xiaoming", id)
 		if err := d.GradePracticeSet(ctx, "xiaoming", id); err != nil {
 			t.Fatal(err)
 		}

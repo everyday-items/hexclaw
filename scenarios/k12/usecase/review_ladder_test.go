@@ -3,9 +3,48 @@ package usecase
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
+
+// TestReviewPolicyV1_DueIndependentOfTimezoneAndDST 钉死 due_at 的业务口径是
+// 策略规定的绝对时长，不受呈现时区或 DST 跳时影响。2026-03-08 纽约进入夏令时，
+// 从切换前一天完成一次重做仍必须精确排到 3*24h 后；上海同一瞬间结果完全一致。
+func TestReviewPolicyV1_DueIndependentOfTimezoneAndDST(t *testing.T) {
+	newYork, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedAt := time.Date(2026, 3, 7, 12, 0, 0, 0, newYork)
+	wantDue := completedAt.Unix() + 3*86400
+
+	for _, displayLocation := range []*time.Location{newYork, shanghai} {
+		t.Run(displayLocation.String(), func(t *testing.T) {
+			d, _ := newPipeline(t, fakeSolver{}, fakeGrader{}, &fakeInsights{})
+			d.Now = func() int64 { return completedAt.In(displayLocation).Unix() }
+			id := seedMistake(t, d, "dst-"+displayLocation.String(), "小数乘法", "计算失误", completedAt.Unix()-1)
+			cur, err := d.Records.Get(context.Background(), id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := d.MarkRetried(context.Background(), id, cur.Version); err != nil {
+				t.Fatal(err)
+			}
+			got, err := d.Records.Get(context.Background(), id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.DueAt == nil || *got.DueAt != wantDue {
+				t.Fatalf("due_at 受时区/DST 漂移: got=%v want=%d", got.DueAt, wantDue)
+			}
+		})
+	}
+}
 
 // TestMarkRetried_EbbinghausLadder 验证间隔阶梯（§4.6 默认策略 v1：1/3/7/14 天）：
 // 每次重做做对，ReviewStage +1，下次到期按 3/7/14 天推进（末档封顶），轮次持久化回卡片 fields。

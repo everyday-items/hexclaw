@@ -104,7 +104,8 @@ func (d Deps) sectionReview(ctx context.Context, agentName, grade, subject strin
 	for _, kp := range kps {
 		if d.Grounding != nil {
 			if text, found, err := d.groundForSubject(ctx, agentName, subject, kp, grade); err == nil && found {
-				fmt.Fprintf(&b, "【%s】%s\n", kp, text)
+				content := groundedTeachingMarkdown(ctx, d.PrepReview, subject, kp, grade, text)
+				fmt.Fprintf(&b, "### %s\n\n%s\n\n", kp, content)
 				grounded++
 				continue
 			}
@@ -127,6 +128,23 @@ func (d Deps) sectionReview(ctx context.Context, agentName, grade, subject strin
 		}
 	}
 	return PrepSection{Title: "① 知识点 3 分钟回顾", Content: strings.TrimSpace(b.String()), SourceLabel: label}
+}
+
+// groundedTeachingMarkdown 是“检索证据 → 用户可读教学内容”的唯一出口。
+// 检索返回值只作为证据输入；生产生成器可将其整理成适龄 Markdown/KaTeX。模型不可用时
+// 仍回退为带明确知识点标题的 Markdown，不把检索信封或相关度等协议字段暴露给家长。
+func groundedTeachingMarkdown(
+	ctx context.Context,
+	gen PrepReviewGenerator,
+	subject, knowledgePoint, grade, evidence string,
+) string {
+	evidence = strings.TrimSpace(evidence)
+	if grounded, ok := gen.(GroundedPrepReviewGenerator); ok {
+		if text, err := grounded.GenerateGroundedPrepReview(ctx, subject, knowledgePoint, grade, evidence); err == nil && strings.TrimSpace(text) != "" {
+			return strings.TrimSpace(text)
+		}
+	}
+	return evidence
 }
 
 // groundForSubject 分科检索路由：adapter 支持分科时按当前题目学科下推（空学科 = 检索全部

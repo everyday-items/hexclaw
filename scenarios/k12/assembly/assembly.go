@@ -53,6 +53,12 @@ func WithRecognizer(rec usecase.Recognizer) Option {
 	return func(d *usecase.Deps) { d.Recognizer = rec }
 }
 
+// WithCreativeWorkOCR injects the writing-photo OCR adapter. Production wires
+// it from the same VisionFunc used by homework recognition.
+func WithCreativeWorkOCR(rec usecase.CreativeWorkOCRRecognizer) Option {
+	return func(d *usecase.Deps) { d.CreativeWorkOCR = rec }
+}
+
 // WithAnswerAnchorer 注入识题后的批量答案坐标证据 adapter。
 // （AnswerGeometry 低延迟子集端口已随 /recognize/anchors 一次切换删除，§6.14。）
 func WithAnswerAnchorer(anchorer usecase.AnswerAnchorer) Option {
@@ -75,6 +81,9 @@ func WithArchiveRestorer(build ArchiveRestorerFactory) Option {
 	return func(d *usecase.Deps) {
 		if build != nil {
 			d.ArchiveRestorer = build(d.Records)
+			if migrator, ok := d.ArchiveRestorer.(usecase.ArchiveMigrationRestorer); ok {
+				d.ArchiveMigrator = migrator
+			}
 		}
 	}
 }
@@ -87,6 +96,13 @@ func WithRenderer(r usecase.Renderer) Option {
 // WithPhotoAnnotator 注入服务器端批改图像素合成 adapter（供 IM 原图批改回传）。
 func WithPhotoAnnotator(a usecase.PhotoAnnotator) Option {
 	return func(d *usecase.Deps) { d.PhotoAnnotator = a }
+}
+
+// WithDeliveryTransport wires the durable DD-024 send-to-phone seam. The
+// transport resolves bindings and renders channel payloads; Deps owns the
+// receipt-first state machine around it.
+func WithDeliveryTransport(delivery usecase.DeliveryTransport) Option {
+	return func(d *usecase.Deps) { d.Delivery = delivery }
 }
 
 // WithRetryGenerator 注入「再练一道」轻量出题闭包（BUG-20260712 治本）：让复习再练走单次

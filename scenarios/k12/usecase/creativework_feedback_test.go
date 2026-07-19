@@ -65,6 +65,24 @@ func TestGenerateWorkFeedback_Writing_AI(t *testing.T) {
 	if last.FeedbackSource != k12.FeedbackSourceAI {
 		t.Fatalf("AI 点评来源应为 %q，got %q", k12.FeedbackSourceAI, last.FeedbackSource)
 	}
+	if last.StructuredFeedback == nil {
+		t.Fatal("AI 点评必须持久化 canonical structured feedback，不能只存自由 Markdown")
+	}
+	if err := last.StructuredFeedback.Validate(); err != nil {
+		t.Fatalf("structured feedback invalid: %v (%#v)", err, last.StructuredFeedback)
+	}
+	if len(last.StructuredFeedback.EvidenceRefs) == 0 || len(last.StructuredFeedback.Suggestions) < 1 || len(last.StructuredFeedback.Suggestions) > 3 {
+		t.Fatalf("structured feedback evidence/suggestions incomplete: %#v", last.StructuredFeedback)
+	}
+	if last.StructuredFeedback.SourceSnapshot.Source != k12.FeedbackSourceAI || last.StructuredFeedback.Limitations == "" {
+		t.Fatalf("structured feedback source/limitations incomplete: %#v", last.StructuredFeedback)
+	}
+	if last.StructuredFeedback.FeedbackID == "" || last.StructuredFeedback.VersionID != "v1" ||
+		last.StructuredFeedback.FeedbackType != k12.WorkTypeWriting ||
+		last.StructuredFeedback.SourceSnapshot.Source != k12.FeedbackSourceAI ||
+		last.StructuredFeedback.ProjectionMarkdown == "" {
+		t.Fatalf("canonical feedback identity/type/source/projection incomplete: %#v", last.StructuredFeedback)
+	}
 	// 生成请求必须携带作品可见证据（题目要求 + 原文），不发明输入。
 	if gen.lastReq.WorkType != k12.WorkTypeWriting || gen.lastReq.Task == "" ||
 		!strings.Contains(gen.lastReq.ContentMarkdown, "绿色的丝带") {
@@ -113,6 +131,9 @@ func TestAttachFeedback_ParentNoSkillStamp(t *testing.T) {
 	}
 	if v.Fields.Versions[0].FeedbackSkill != "" {
 		t.Fatalf("家长手写点评不应带 feedback_skill，got %q", v.Fields.Versions[0].FeedbackSkill)
+	}
+	if structured := v.Fields.Versions[0].StructuredFeedback; structured == nil || structured.SourceSnapshot.Source != k12.FeedbackSourceParent {
+		t.Fatalf("家长点评也必须有结构化事实对象: %#v", structured)
 	}
 }
 
@@ -186,6 +207,9 @@ func TestGenerateWorkFeedback_Art_Observational(t *testing.T) {
 	last := v.Fields.Versions[len(v.Fields.Versions)-1]
 	if last.FeedbackSource != k12.FeedbackSourceAI {
 		t.Fatalf("来源应为 ai，got %q", last.FeedbackSource)
+	}
+	if structured := last.StructuredFeedback; structured == nil || structured.EvidenceRefs[0] == "" || len(structured.AllowedActions) == 0 {
+		t.Fatalf("美术点评结构化证据/允许动作缺失: %#v", structured)
 	}
 	if gen.lastReq.WorkType != k12.WorkTypeArt || gen.lastReq.Intent == "" || gen.lastReq.SourceAssetID != "asset-1" {
 		t.Fatalf("美术生成请求缺少可见证据来源: %+v", gen.lastReq)

@@ -7,6 +7,7 @@ package k12storage_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -194,11 +195,16 @@ func TestTyped_AggregateChildrenRoundTrip(t *testing.T) {
 	tru := true
 	setRec, err := k12.NewPracticeSetRecord("mingming", "s1", k12.PracticeSetFields{
 		SourceKind: k12.PracticeSourceWeekly, Title: "本周复习卷",
+		ReturnAssets: []k12.PracticeReturnAsset{{
+			ReturnID: "return-1", AssetID: "asset://mingming/return.png",
+			ItemIDs: []string{"item-one"}, ReturnedAt: 1701,
+		}},
 		Items: []k12.PracticeItem{
-			{Subject: "数学", AddedVia: k12.PracticeAddedViaWeekly, QuestionMarkdown: "3.8×3=?",
+			{ItemID: "item-one", Subject: "数学", AddedVia: k12.PracticeAddedViaWeekly, QuestionMarkdown: "3.8×3=?",
 				ExpectedAnswerMarkdown: "11.4", VerificationStatus: k12.PracticeItemVerified,
 				VerificationEvidence: "独立验算", PaperSeq: 1, Returned: true, ResultCorrect: &tru,
-				PracticeProblemID: "pp-1"},
+				PracticeProblemID: "pp-1", GenerationJobID: "pgen-1", VariantIndex: 2,
+				RequestedDifficulty: "harder", ActualDifficulty: "harder"},
 			{Subject: "语文", AddedVia: k12.PracticeAddedViaCustom, QuestionMarkdown: "默写：静夜思",
 				ExpectedAnswerMarkdown: "床前明月光…", VerificationStatus: k12.PracticeItemPending},
 		},
@@ -229,6 +235,12 @@ func TestTyped_AggregateChildrenRoundTrip(t *testing.T) {
 	if !f.Items[0].Returned || f.Items[0].PracticeProblemID != "pp-1" {
 		t.Fatalf("returned/practice_problem_id 应 round-trip: %+v", f.Items[0])
 	}
+	if f.Items[0].GenerationJobID != "pgen-1" || f.Items[0].VariantIndex != 2 || f.Items[0].ActualDifficulty != "harder" {
+		t.Fatalf("组卷来源/难度应 round-trip: %+v", f.Items[0])
+	}
+	if len(f.ReturnAssets) != 1 || f.ReturnAssets[0].ReturnID != "return-1" || f.ReturnAssets[0].ItemIDs[0] != "item-one" {
+		t.Fatalf("return_assets 应 round-trip: %+v", f.ReturnAssets)
+	}
 
 	workRec, err := k12.NewCreativeWorkRecord("mingming", "s1", k12.CreativeWorkFields{
 		WorkType: k12.WorkTypeArt, Title: "太空画", Task: "想象画",
@@ -258,6 +270,64 @@ func TestTyped_AggregateChildrenRoundTrip(t *testing.T) {
 	}
 }
 
+// TestTyped_ReturnAssetsAppendOnly DD-028：普通 fields 更新即使漏带旧批次也不得删除；
+// 同 return_id 改 asset/item 映射必须让外层 CAS 事务整体回滚。
+func TestTyped_ReturnAssetsAppendOnly(t *testing.T) {
+	s, db := setup(t)
+	ctx := context.Background()
+	rec, err := k12.NewPracticeSetRecord("mingming", "s", k12.PracticeSetFields{
+		SourceKind: k12.PracticeSourceManual, Title: "只追加回传卷",
+		Items:        []k12.PracticeItem{{ItemID: "q1", QuestionMarkdown: "题", VerificationStatus: k12.PracticeItemPending}},
+		ReturnAssets: []k12.PracticeReturnAsset{{ReturnID: "r1", AssetID: "asset://mingming/a.png", ItemIDs: []string{"q1"}, ReturnedAt: 100}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(ctx, rec.RecordID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, _ := k12.ParsePracticeSetFields(got.Fields)
+	if !f.Items[0].Returned {
+		t.Fatal("returned 必须可由 append-only return_assets 恢复，不能依赖可漂移的旧布尔投影")
+	}
+	// 模拟旧调用方漏带 return_assets：更新成功，但 append-only 子表不得被清空。
+	f.ReturnAssets = nil
+	f.Items[0].Returned = false
+	raw, _ := json.Marshal(f)
+	if err := s.UpdateStatusFields(ctx, rec.RecordID, got.Status, got.DueAt, string(raw), got.Version); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.Get(ctx, rec.RecordID)
+	f, _ = k12.ParsePracticeSetFields(got.Fields)
+	if len(f.ReturnAssets) != 1 || f.ReturnAssets[0].ReturnID != "r1" {
+		t.Fatalf("漏带字段不得删除旧批次: %+v", f.ReturnAssets)
+	}
+	if !f.Items[0].Returned {
+		t.Fatal("旧调用方写回 false 也不得抹掉由 return_assets 证明的 returned 投影")
+	}
+
+	// 改写旧 return_id 必须失败，且题目更新也一并回滚。
+	f.Title = "不应提交的标题"
+	f.ReturnAssets[0].AssetID = "asset://mingming/other.png"
+	raw, _ = json.Marshal(f)
+	if err := s.UpdateStatusFields(ctx, rec.RecordID, got.Status, got.DueAt, string(raw), got.Version); err == nil {
+		t.Fatal("同 return_id 改写载荷却成功")
+	}
+	got, _ = s.Get(ctx, rec.RecordID)
+	f, _ = k12.ParsePracticeSetFields(got.Fields)
+	if f.Title == "不应提交的标题" || f.ReturnAssets[0].AssetID != "asset://mingming/a.png" {
+		t.Fatalf("冲突更新必须整事务回滚: %+v", f)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM k12_practice_return_assets WHERE set_record_id=?`, rec.RecordID).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("append-only 表应恰有一条: n=%d err=%v", n, err)
+	}
+}
+
 // TestTyped_ExportImportRoundTrip 导出→替换导入 round-trip 逐字段一致（备份恢复底座）。
 func TestTyped_ExportImportRoundTrip(t *testing.T) {
 	s, _ := setup(t)
@@ -270,8 +340,10 @@ func TestTyped_ExportImportRoundTrip(t *testing.T) {
 	}
 	setRec, _ := k12.NewPracticeSetRecord("mingming", "s2", k12.PracticeSetFields{
 		SourceKind: k12.PracticeSourceManual, Title: "手工卷",
-		Items: []k12.PracticeItem{{Subject: "数学", QuestionMarkdown: "9×9=?", ExpectedAnswerMarkdown: "81",
-			VerificationStatus: k12.PracticeItemVerified, VerificationEvidence: "独立验算"}},
+		Items: []k12.PracticeItem{{ItemID: "backup-q1", Subject: "数学", QuestionMarkdown: "9×9=?", ExpectedAnswerMarkdown: "81",
+			VerificationStatus: k12.PracticeItemVerified, VerificationEvidence: "独立验算", Returned: true}},
+		ReturnAssets: []k12.PracticeReturnAsset{{ReturnID: "backup-return-1", AssetID: "asset://mingming/backup.png",
+			ItemIDs: []string{"backup-q1"}, ReturnedAt: 4243}},
 	})
 	if _, err := s.Put(ctx, setRec); err != nil {
 		t.Fatal(err)

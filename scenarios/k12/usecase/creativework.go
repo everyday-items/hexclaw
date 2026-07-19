@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -33,7 +34,16 @@ type CreativeWorkView struct {
 
 // CreateCreativeWork 新建作品（PRD §3.10），初始 draft，含首版原稿（若提供）。幂等去重：类型+标题+任务命中则不重复。
 func (d Deps) CreateCreativeWork(ctx context.Context, agentName, sourceSession string, f k12.CreativeWorkFields) (recordID string, created bool, err error) {
-	for _, v := range f.Versions {
+	for i := range f.Versions {
+		v := &f.Versions[i]
+		if f.WorkType == k12.WorkTypeWriting && strings.TrimSpace(v.SourceAssetID) != "" {
+			if err := d.hydrateConfirmedWritingVersion(ctx, agentName, v); err != nil {
+				return "", false, err
+			}
+		}
+		if f.WorkType == k12.WorkTypeWriting && strings.TrimSpace(v.ContentMarkdown) == "" {
+			return "", false, fmt.Errorf("%w: 语文写作必须提供纯文本原稿或已确认的照片 OCR 原稿", ErrInvalidInput)
+		}
 		if err := validateWorkAssetOwner(agentName, v.SourceAssetID); err != nil {
 			return "", false, err
 		}
@@ -100,25 +110,138 @@ func (d Deps) attachFeedbackWithSource(ctx context.Context, agentName, recordID,
 	if len(v.Fields.Versions) == 0 {
 		return CreativeWorkView{}, fmt.Errorf("usecase: 作品无版本可点评")
 	}
+	if reason := workFeedbackInvariantViolation(feedback); reason != "" {
+		return CreativeWorkView{}, fmt.Errorf("%w: 作品点评违反 INV-011（%s）", ErrInvalidInput, reason)
+	}
 	last := &v.Fields.Versions[len(v.Fields.Versions)-1]
 	last.Feedback = feedback
 	last.FeedbackSource = source
 	last.FeedbackSkill = skillStamp
+	structured := buildStructuredWorkFeedback(v.Fields.WorkType, *last, feedback, source, skillStamp)
+	if err := structured.Validate(); err != nil {
+		return CreativeWorkView{}, fmt.Errorf("%w: 结构化作品点评非法: %v", ErrInvalidInput, err)
+	}
+	last.StructuredFeedback = &structured
 	if err := d.saveWorkFields(ctx, v, k12.WorkStatusFeedbackReady); err != nil {
 		return CreativeWorkView{}, err
 	}
 	return d.GetCreativeWork(ctx, agentName, recordID)
 }
 
+func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersion, feedback, source, methodRef string) k12.WorkFeedback {
+	refs := make([]string, 0, 2)
+	if version.OCRJobID != "" && version.OCRVersion > 0 && version.OCRConfirmedDigest != "" {
+		refs = append(refs, fmt.Sprintf("ocr-confirmed:%s:v%d:sha256:%s",
+			version.OCRJobID, version.OCRVersion, version.OCRConfirmedDigest))
+	}
+	if asset := strings.TrimSpace(version.SourceAssetID); asset != "" {
+		sum := sha256.Sum256([]byte(asset))
+		refs = append(refs, fmt.Sprintf("asset-ref:sha256:%x", sum[:]))
+	}
+	if content := strings.TrimSpace(version.ContentMarkdown); content != "" {
+		sum := sha256.Sum256([]byte(content))
+		refs = append(refs, fmt.Sprintf("content-ref:sha256:%x", sum[:]))
+	}
+
+	clauses := strings.FieldsFunc(strings.TrimSpace(feedback), func(r rune) bool {
+		switch r {
+		case '。', '；', ';', '\n':
+			return true
+		default:
+			return false
+		}
+	})
+	isSuggestion := func(value string) bool {
+		for _, marker := range []string{"建议", "试试", "可以", "补一个", "补充", "加深", "调整", "比一比", "再加"} {
+			if strings.Contains(value, marker) {
+				return true
+			}
+		}
+		return false
+	}
+	dimension := "expression"
+	limitations := "仅依据本版本提交的孩子原文进行观察，不评价能力高低，也不代写全文。"
+	actions := []string{"send", "collect", "record_language_issue"}
+	if workType == k12.WorkTypeArt {
+		dimension = "composition"
+		limitations = "仅依据本版本提交的可见画面进行观察，不评分、不排名，也不替孩子重画。"
+		actions = []string{"send", "print_practice_card", "collect"}
+	}
+	observations := make([]k12.WorkFeedbackObservation, 0, 3)
+	suggestions := make([]string, 0, 3)
+	for _, clause := range clauses {
+		clause = strings.TrimSpace(clause)
+		if clause == "" {
+			continue
+		}
+		if isSuggestion(clause) {
+			if len(suggestions) < 3 {
+				suggestions = append(suggestions, clause)
+			}
+		} else if len(observations) < 3 {
+			observations = append(observations, k12.WorkFeedbackObservation{Dimension: dimension, Evidence: clause})
+		}
+	}
+	if len(observations) == 0 {
+		observations = append(observations, k12.WorkFeedbackObservation{Dimension: dimension, Evidence: strings.TrimSpace(feedback)})
+	}
+	if len(suggestions) == 0 {
+		suggestions = append(suggestions, "和孩子一起回看这条观察，并由孩子选择一处小改动后提交新版本。")
+	}
+	method := strings.TrimSpace(methodRef)
+	capability := "human_observation"
+	if source == k12.FeedbackSourceAI {
+		capability = "evidence_based_feedback"
+		if method == "" {
+			method = "unreported"
+		}
+	} else if method == "" {
+		method = "parent/manual"
+	}
+	projection := strings.TrimSpace(feedback)
+	idSum := sha256.Sum256([]byte(strings.Join([]string{version.VersionID, source, method, projection}, "\x00")))
+	return k12.WorkFeedback{
+		FeedbackID:   fmt.Sprintf("feedback-%x", idSum[:12]),
+		VersionID:    version.VersionID,
+		FeedbackType: workType,
+		EvidenceRefs: refs,
+		Observations: observations,
+		SourceSnapshot: k12.WorkFeedbackSourceSnapshot{
+			Source: source, MethodRef: method, Capability: capability,
+		},
+		Limitations:        limitations,
+		Suggestions:        suggestions,
+		AllowedActions:     actions,
+		ProjectionMarkdown: projection,
+	}
+}
+
 // SubmitRevision 提交修改稿形成新版本（feedback_ready → revised，PRD §3.10）。不代写：内容由孩子/家长提供。
 // §3.10（2026-07-18 裁决）：「修改稿必须来自真实上传（照片或粘贴文本）才形成新版本，
 // 禁止凭空 +1 版本」——content 与 asset 至少一项非空。
 func (d Deps) SubmitRevision(ctx context.Context, agentName, recordID, contentMarkdown, sourceAssetID string) (CreativeWorkView, error) {
+	return d.submitRevisionVersion(ctx, agentName, recordID, k12.CreativeWorkVersion{
+		ContentMarkdown: contentMarkdown,
+		SourceAssetID:   sourceAssetID,
+	})
+}
+
+// SubmitRevisionWithOCR is the writing-photo revision path. The client names
+// a confirmed snapshot, but the server rehydrates raw/canonical evidence from
+// the owner-scoped OCR ledger before persisting the version.
+func (d Deps) SubmitRevisionWithOCR(
+	ctx context.Context, agentName, recordID string, next k12.CreativeWorkVersion,
+) (CreativeWorkView, error) {
+	return d.submitRevisionVersion(ctx, agentName, recordID, next)
+}
+
+func (d Deps) submitRevisionVersion(
+	ctx context.Context, agentName, recordID string, next k12.CreativeWorkVersion,
+) (CreativeWorkView, error) {
+	contentMarkdown := next.ContentMarkdown
+	sourceAssetID := next.SourceAssetID
 	if strings.TrimSpace(contentMarkdown) == "" && strings.TrimSpace(sourceAssetID) == "" {
 		return CreativeWorkView{}, fmt.Errorf("%w: 修改稿必须来自真实上传（照片或粘贴文本），不能凭空形成新版本", ErrInvalidInput)
-	}
-	if err := validateWorkAssetOwner(agentName, sourceAssetID); err != nil {
-		return CreativeWorkView{}, err
 	}
 	v, err := d.GetCreativeWork(ctx, agentName, recordID)
 	if err != nil {
@@ -127,11 +250,15 @@ func (d Deps) SubmitRevision(ctx context.Context, agentName, recordID, contentMa
 	if v.Record.Status != k12.WorkStatusFeedbackReady {
 		return CreativeWorkView{}, fmt.Errorf("usecase: 只有已点评作品可提交修改稿，当前 %s", v.Record.Status)
 	}
-	next := k12.CreativeWorkVersion{
-		VersionID:       fmt.Sprintf("v%d", len(v.Fields.Versions)+1),
-		ContentMarkdown: contentMarkdown,
-		SourceAssetID:   sourceAssetID,
+	if v.Fields.WorkType == k12.WorkTypeWriting && strings.TrimSpace(next.SourceAssetID) != "" {
+		if err := d.hydrateConfirmedWritingVersion(ctx, agentName, &next); err != nil {
+			return CreativeWorkView{}, err
+		}
 	}
+	if err := validateWorkAssetOwner(agentName, next.SourceAssetID); err != nil {
+		return CreativeWorkView{}, err
+	}
+	next.VersionID = fmt.Sprintf("v%d", len(v.Fields.Versions)+1)
 	v.Fields.Versions = append(v.Fields.Versions, next)
 	if err := d.saveWorkFields(ctx, v, k12.WorkStatusRevised); err != nil {
 		return CreativeWorkView{}, err

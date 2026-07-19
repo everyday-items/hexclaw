@@ -13,16 +13,21 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/channel"
 	"github.com/hexagon-codes/hexclaw/cron"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
 // recordChannel 契约替身：记录经通道发出的消息。
 type recordChannel struct {
-	name string
-	sent []recordedSend
-	fail error
+	name       string
+	sent       []recordedSend
+	fail       error
+	sendAck    channel.DeliveryAck
+	queryAck   channel.DeliveryAck
+	queryCalls int
 }
 
 type recordedSend struct {
@@ -42,6 +47,31 @@ func (c *recordChannel) SendText(ctx context.Context, to channel.Target, text st
 
 func (c *recordChannel) SendMessage(ctx context.Context, to channel.Target, msg channel.Message) error {
 	return c.SendText(ctx, to, msg.Text)
+}
+
+func (c *recordChannel) SendMessageWithReceipt(ctx context.Context, to channel.Target, msg channel.Message) (channel.DeliveryAck, error) {
+	if err := c.SendMessage(ctx, to, msg); err != nil {
+		return channel.DeliveryAck{Status: channel.DeliveryFailed, Target: to}, err
+	}
+	ack := c.sendAck
+	if ack.Status == "" {
+		ack = channel.DeliveryAck{ExternalMessageID: "process-query-key", Status: channel.DeliveryAccepted}
+	}
+	ack.Target = to
+	return ack, nil
+}
+
+func (c *recordChannel) QueryReceipt(_ context.Context, to channel.Target, externalMessageID string) (channel.DeliveryAck, error) {
+	c.queryCalls++
+	ack := c.queryAck
+	if ack.Status == "" {
+		ack = channel.DeliveryAck{Status: channel.DeliveryDelivered}
+	}
+	if ack.ExternalMessageID == "" {
+		ack.ExternalMessageID = externalMessageID
+	}
+	ack.Target = to
+	return ack, nil
 }
 
 func newDelivererFixture(t *testing.T) (*k12IMDeliverer, *agentrouter.Dispatcher, *channel.Registry) {
@@ -141,6 +171,68 @@ func TestK12IMDeliverer_SendFailureKeepsParentFacingCopy(t *testing.T) {
 	}
 }
 
+func TestAdapterDeliveryAckMapsAcceptedWithoutClaimingDelivered(t *testing.T) {
+	target := channel.Target{Platform: "dingtalk", InstanceID: "pi-1", ChatID: "user-1"}
+	got := channelAckFromAdapter(adapter.DeliveryAck{
+		ExternalMessageID: "pqk-1",
+		Status:            adapter.DeliveryAccepted,
+	}, target)
+	if got.Status != channel.DeliveryAccepted || got.Status == channel.DeliveryDelivered || got.ExternalMessageID != "pqk-1" || got.Target != target {
+		t.Fatalf("mapped ack=%+v", got)
+	}
+}
+
+func TestK12IMDelivererFreezesReceiptPayloadBeforeProviderSend(t *testing.T) {
+	d, dispatcher, reg := newDelivererFixture(t)
+	ding := &recordChannel{name: "dingtalk", sendAck: channel.DeliveryAck{
+		ExternalMessageID: "pqk-24", Status: channel.DeliveryAccepted,
+	}}
+	reg.Register(ding)
+	bindRule(t, dispatcher, "dingtalk", "bot-1", "mom-chat", "child-a")
+	d.MarkReady()
+
+	prepared, err := d.PrepareText(context.Background(), "child-a", "计算 $x^2$ 的点评")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ding.sent) != 0 {
+		t.Fatal("PrepareText must be side-effect free until receipt persistence")
+	}
+	if !strings.HasPrefix(prepared.BindingID, "agent-rule:") || prepared.Target.ChatID != "mom-chat" ||
+		prepared.Target.InstanceID != "bot-1" || prepared.PayloadJSON == "" || prepared.RenderJSON == "" {
+		t.Fatalf("prepared delivery evidence incomplete: %+v", prepared)
+	}
+	receipt := k12.DeliveryReceipt{
+		DeliveryID: "delivery-24", AgentName: "child-a", BindingID: prepared.BindingID,
+		Target: prepared.Target, PayloadJSON: prepared.PayloadJSON, RenderJSON: prepared.RenderJSON,
+		PayloadDigest: deliveryPayloadDigest(prepared.PayloadJSON), Status: k12.DeliverySending,
+	}
+	ack, err := d.SendPrepared(context.Background(), receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack.Status != k12.DeliverySending || ack.ExternalMessageID != "pqk-24" {
+		t.Fatalf("provider acceptance must map to domain sending: %+v", ack)
+	}
+	if len(ding.sent) != 1 || strings.Contains(ding.sent[0].text, "$x^2$") {
+		t.Fatalf("send must reuse frozen readable projection exactly once: %+v", ding.sent)
+	}
+	tampered := receipt
+	tampered.BindingID = "agent-rule:rebound"
+	badAck, badErr := d.SendPrepared(context.Background(), tampered)
+	if badErr == nil || badAck.Status != k12.DeliveryFailed || len(ding.sent) != 1 {
+		t.Fatalf("stale/rebound receipt must fail before send: ack=%+v sends=%d err=%v", badAck, len(ding.sent), badErr)
+	}
+
+	ding.queryAck = channel.DeliveryAck{Status: channel.DeliveryDelivered}
+	queried, err := d.QueryPrepared(context.Background(), k12.DeliveryReceipt{
+		Target: prepared.Target, ExternalMessageID: "pqk-24",
+	})
+	if err != nil || queried.Status != k12.DeliveryDelivered || queried.ExternalMessageID != "pqk-24" || ding.queryCalls != 1 {
+		t.Fatalf("query must preserve provider evidence: ack=%+v calls=%d err=%v", queried, ding.queryCalls, err)
+	}
+}
+
 func TestCronIMDeliver_GoesThroughChannel(t *testing.T) {
 	reg := channel.NewRegistry()
 	ding := &recordChannel{name: "dingtalk"}
@@ -148,8 +240,8 @@ func TestCronIMDeliver_GoesThroughChannel(t *testing.T) {
 	reg.Register(channel.NewFeishu())
 
 	var direct []recordedSend
-	deliver := newCronIMDeliver(context.Background(), reg, func(ctx context.Context, target, chatID, content string) error {
-		direct = append(direct, recordedSend{to: channel.Target{Platform: target, ChatID: chatID}, text: content})
+	deliver := newCronIMDeliver(context.Background(), reg, func(ctx context.Context, target, chatID string, msg channel.Message) error {
+		direct = append(direct, recordedSend{to: channel.Target{Platform: target, ChatID: chatID}, text: msg.Text})
 		return nil
 	})
 

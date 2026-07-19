@@ -48,8 +48,8 @@ func TestCronIMDeliver_ConvertsLaTeX_ChannelAndDirectBranches(t *testing.T) {
 	reg.Register(ding)
 
 	var direct []recordedSend
-	deliver := newCronIMDeliver(context.Background(), reg, func(ctx context.Context, target, chatID, content string) error {
-		direct = append(direct, recordedSend{to: channel.Target{Platform: target, ChatID: chatID}, text: content})
+	deliver := newCronIMDeliver(context.Background(), reg, func(ctx context.Context, target, chatID string, msg channel.Message) error {
+		direct = append(direct, recordedSend{to: channel.Target{Platform: target, ChatID: chatID}, text: msg.Text})
 		return nil
 	})
 	job := &cron.Job{ID: "job-1", ChatID: "mom-chat"}

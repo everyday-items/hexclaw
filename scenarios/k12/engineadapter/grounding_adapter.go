@@ -17,6 +17,10 @@ type kbQuerier interface {
 	QueryWithFilter(ctx context.Context, query string, topK int, filter knowledge.Filter) (string, error)
 }
 
+type kbHitQuerier interface {
+	QueryHitsWithFilter(ctx context.Context, query string, topK int, filter knowledge.Filter) (string, []knowledge.SearchHit, error)
+}
+
 type kbWriter interface {
 	AddDocument(ctx context.Context, title, content, source string) (*knowledge.Document, error)
 }
@@ -120,9 +124,53 @@ func (a *GroundingAdapter) groundBySources(ctx context.Context, agentName, knowl
 		return "", false, fmt.Errorf("grounding: agentName 不可空")
 	}
 	query := grade + " " + knowledgePoint + " 教材讲法"
-	text, err := a.kb.QueryWithFilter(ctx, query, a.topK, knowledge.Filter{Sources: sources})
+	filter := knowledge.Filter{Sources: sources}
+	if structured, ok := a.kb.(kbHitQuerier); ok {
+		_, hits, err := structured.QueryHitsWithFilter(ctx, query, a.topK, filter)
+		if err != nil {
+			return "", false, err
+		}
+		parts := make([]string, 0, len(hits))
+		for _, hit := range hits {
+			if content := strings.TrimSpace(hit.Content); content != "" {
+				parts = append(parts, content)
+			}
+		}
+		text := strings.Join(parts, "\n\n")
+		return text, text != "", nil
+	}
+	text, err := a.kb.QueryWithFilter(ctx, query, a.topK, filter)
 	if err != nil {
 		return "", false, err
 	}
+	text = stripRetrievalEnvelope(text)
 	return text, text != "", nil // fail-closed：空串 = 未命中，调用方降级 LLM
+}
+
+// stripRetrievalEnvelope 仅服务于未实现 QueryHitsWithFilter 的旧/第三方 kbQuerier。
+// 生产 Manager 走上面的结构化命中分支；这里保持滚动升级兼容，同时阻止协议文本漏到 UI。
+func stripRetrievalEnvelope(text string) string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	var content []string
+	skipTitle := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "", strings.HasPrefix(trimmed, "以下是从个人知识库中检索到的相关信息"):
+			continue
+		case strings.HasPrefix(trimmed, "--- 参考 "):
+			skipTitle = true
+			continue
+		case strings.HasPrefix(trimmed, "请基于以上参考信息回答用户的问题"):
+			continue
+		case skipTitle:
+			// formatSearchHits 在每个参考块的第一行放文档标题/source；它是检索元数据，
+			// 不是教学正文。结构化分支不会经过这里。
+			skipTitle = false
+			continue
+		default:
+			content = append(content, line)
+		}
+	}
+	return strings.TrimSpace(strings.Join(content, "\n"))
 }

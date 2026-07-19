@@ -20,16 +20,24 @@ type Deps struct {
 	Grader Grader
 	// VerifiedGrader 由生产装配显式接入。不能只依赖 Grader 的运行时类型断言：场景包装、
 	// mock 或后续 decorator 都可能擦掉可选方法，进而静默退回重复 solver+verifier 的慢路径。
-	VerifiedGrader  VerifiedSolutionGrader
-	Recognizer      Recognizer
+	VerifiedGrader VerifiedSolutionGrader
+	Recognizer     Recognizer
+	// CreativeWorkOCR recognizes a writing-photo draft into immutable raw
+	// evidence. Parent corrections are versioned by the usecase/store, never by
+	// the model adapter.
+	CreativeWorkOCR CreativeWorkOCRRecognizer
 	AnswerAnchorer  AnswerAnchorer
 	Insights        Insights
 	Grounding       Grounding
 	PrepReview      PrepReviewGenerator
 	Profiles        ProfileStore
 	ArchiveRestorer ArchiveRestorer
+	ArchiveMigrator ArchiveMigrationRestorer
 	Renderer        Renderer
 	PhotoAnnotator  PhotoAnnotator
+	// Delivery is the durable send-to-phone transport. HTTP acceptance remains
+	// sending until QueryPrepared supplies delivered evidence.
+	Delivery DeliveryTransport
 	// Records K12 类型化 canonical store（§6.9 k12_* 表 + Transactional Outbox；
 	// ADR-K12-013 一次切换：K12 collection 不再写 agent_records）。
 	Records    *k12storage.Store

@@ -1,10 +1,12 @@
 package k12
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/records"
@@ -59,8 +61,19 @@ type CreativeWorkVersion struct {
 	VersionID       string `json:"version_id"`
 	SourceAssetID   string `json:"source_asset_id,omitempty"` // 原图；纯文字稿可空
 	ContentMarkdown string `json:"content_markdown,omitempty"`
+	// Writing-photo evidence snapshot (DD-013). OCRRaw is copied from the
+	// immutable OCR Job; ContentMarkdown is the exact confirmed canonical
+	// version named by OCRVersion/OCRConfirmedDigest.
+	OCRJobID           string `json:"ocr_job_id,omitempty"`
+	OCRRaw             string `json:"ocr_raw,omitempty"`
+	OCRVersion         int    `json:"ocr_version,omitempty"`
+	OCRConfirmedDigest string `json:"ocr_confirmed_digest,omitempty"`
+	ContentConfirmedAt int64  `json:"content_confirmed_at,omitempty"`
 	// Feedback 证据化点评：只依据可见证据，不打分不代写。
 	Feedback string `json:"feedback,omitempty"`
+	// StructuredFeedback is the canonical, testable feedback fact. Feedback is
+	// only its backwards-compatible Markdown projection.
+	StructuredFeedback *WorkFeedback `json:"structured_feedback,omitempty"`
 	// FeedbackSource 点评来源（ai / parent）；老数据空值前向兼容。
 	FeedbackSource string `json:"feedback_source,omitempty"`
 	// FeedbackSkill AI 点评所用方法论基座的来源戳（追溯每条点评用的哪版方法论）：
@@ -72,6 +85,174 @@ type CreativeWorkVersion struct {
 	// 归档在版本记录）。0 = 未打卡；卡内容不落库——由点评正文经 ObservationPracticeCard
 	// 确定性提炼（单一事实源，点评修订即卡修订）。
 	PracticeCardDoneAt int64 `json:"practice_card_done_at,omitempty"`
+}
+
+type CreativeWorkOCRStatus string
+
+const (
+	CreativeWorkOCRPending              CreativeWorkOCRStatus = "pending"
+	CreativeWorkOCRProcessing           CreativeWorkOCRStatus = "processing"
+	CreativeWorkOCRAwaitingConfirmation CreativeWorkOCRStatus = "awaiting_confirmation"
+	CreativeWorkOCRFailed               CreativeWorkOCRStatus = "failed"
+	CreativeWorkOCRConfirmed            CreativeWorkOCRStatus = "confirmed"
+)
+
+// CreativeWorkOCRJob is the durable pre-work resource for a writing photo.
+// OCRRaw becomes immutable once populated. Parent corrections are append-only
+// canonical versions; the current pointer is projected below for the client.
+type CreativeWorkOCRJob struct {
+	JobID            string                `json:"job_id"`
+	AgentName        string                `json:"agent_name"`
+	RequestID        string                `json:"request_id"`
+	SourceAssetID    string                `json:"source_asset_id"`
+	SourceDigest     string                `json:"source_digest"`
+	Status           CreativeWorkOCRStatus `json:"status"`
+	OCRRaw           string                `json:"ocr_raw,omitempty"`
+	ErrorMessage     string                `json:"error_message,omitempty"`
+	AttemptCount     int                   `json:"attempt_count"`
+	ConfirmedVersion int                   `json:"confirmed_version,omitempty"`
+	ConfirmedDigest  string                `json:"confirmed_digest,omitempty"`
+	ConfirmedContent string                `json:"confirmed_content,omitempty"`
+	ConfirmedAt      int64                 `json:"confirmed_at,omitempty"`
+	CreatedAt        int64                 `json:"created_at"`
+	UpdatedAt        int64                 `json:"updated_at"`
+}
+
+// CreativeWorkOCRArchiveEvidence is the self-contained, confirmed-only OCR
+// evidence carried by .hexbak v4. One entry names one canonical confirmation
+// version. Runtime-only pending/processing/failed jobs are deliberately not
+// representable in the archive format.
+type CreativeWorkOCRArchiveEvidence struct {
+	JobID            string `json:"job_id"`
+	AgentName        string `json:"agent_name"`
+	RequestID        string `json:"request_id,omitempty"`
+	SourceAssetID    string `json:"source_asset_id"`
+	SourceDigest     string `json:"source_digest"`
+	OCRRaw           string `json:"ocr_raw,omitempty"`
+	Version          int    `json:"version"`
+	ContentMarkdown  string `json:"content_markdown"`
+	ContentDigest    string `json:"content_digest"`
+	ConfirmedAt      int64  `json:"confirmed_at"`
+	AttemptCount     int    `json:"attempt_count,omitempty"`
+	JobCreatedAt     int64  `json:"job_created_at,omitempty"`
+	JobLastUpdatedAt int64  `json:"job_last_updated_at,omitempty"`
+}
+
+type WorkFeedbackObservation struct {
+	Dimension string `json:"dimension"`
+	Evidence  string `json:"evidence"`
+}
+
+type WorkFeedbackSourceSnapshot struct {
+	Source     string `json:"source"`
+	MethodRef  string `json:"method_ref"`
+	Capability string `json:"capability"`
+}
+
+// WorkFeedback is deliberately closed: scores, ranks and replacement
+// artwork/full rewrites are not representable fields.
+type WorkFeedback struct {
+	FeedbackID         string                     `json:"feedback_id"`
+	VersionID          string                     `json:"version_id"`
+	FeedbackType       string                     `json:"feedback_type"`
+	EvidenceRefs       []string                   `json:"evidence_refs"`
+	Observations       []WorkFeedbackObservation  `json:"observations"`
+	SourceSnapshot     WorkFeedbackSourceSnapshot `json:"source_snapshot"`
+	Limitations        string                     `json:"limitations"`
+	Suggestions        []string                   `json:"suggestions"`
+	AllowedActions     []string                   `json:"allowed_actions"`
+	ProjectionMarkdown string                     `json:"projection_markdown"`
+}
+
+func (f WorkFeedback) Validate() error {
+	if strings.TrimSpace(f.FeedbackID) == "" || strings.TrimSpace(f.VersionID) == "" {
+		return fmt.Errorf("作品点评缺少 feedback_id/version_id")
+	}
+	if f.FeedbackType != WorkTypeWriting && f.FeedbackType != WorkTypeArt {
+		return fmt.Errorf("作品点评 feedback_type 非法: %q", f.FeedbackType)
+	}
+	if len(f.EvidenceRefs) == 0 {
+		return fmt.Errorf("作品点评缺少 evidence_refs")
+	}
+	for _, ref := range f.EvidenceRefs {
+		if strings.TrimSpace(ref) == "" {
+			return fmt.Errorf("作品点评包含空 evidence_ref")
+		}
+	}
+	if len(f.Observations) == 0 {
+		return fmt.Errorf("作品点评缺少观察维度")
+	}
+	allowedDimensions := map[string]bool{}
+	if f.FeedbackType == WorkTypeWriting {
+		allowedDimensions = map[string]bool{"task_alignment": true, "structure": true, "expression": true, "language_detail": true}
+	} else {
+		allowedDimensions = map[string]bool{"composition": true, "color": true, "line": true, "visible_detail": true}
+	}
+	for _, observation := range f.Observations {
+		if strings.TrimSpace(observation.Dimension) == "" || strings.TrimSpace(observation.Evidence) == "" {
+			return fmt.Errorf("作品点评观察维度/证据不可空")
+		}
+		if !allowedDimensions[observation.Dimension] {
+			return fmt.Errorf("作品点评观察维度不在 %s 白名单: %q", f.FeedbackType, observation.Dimension)
+		}
+	}
+	if f.SourceSnapshot.Source != FeedbackSourceAI && f.SourceSnapshot.Source != FeedbackSourceParent {
+		return fmt.Errorf("作品点评来源非法: %q", f.SourceSnapshot.Source)
+	}
+	if strings.TrimSpace(f.SourceSnapshot.MethodRef) == "" || strings.TrimSpace(f.SourceSnapshot.Capability) == "" {
+		return fmt.Errorf("作品点评 source_snapshot 不完整")
+	}
+	if strings.TrimSpace(f.Limitations) == "" {
+		return fmt.Errorf("作品点评缺少能力限制")
+	}
+	if len(f.Suggestions) < 1 || len(f.Suggestions) > 3 {
+		return fmt.Errorf("作品点评建议必须为 1-3 条")
+	}
+	for _, suggestion := range f.Suggestions {
+		if strings.TrimSpace(suggestion) == "" {
+			return fmt.Errorf("作品点评包含空建议")
+		}
+	}
+	if len(f.AllowedActions) == 0 {
+		return fmt.Errorf("作品点评缺少允许动作")
+	}
+	allowedActionSet := map[string]bool{"send": true, "collect": true}
+	if f.FeedbackType == WorkTypeWriting {
+		allowedActionSet["record_language_issue"] = true
+	} else {
+		allowedActionSet["print_practice_card"] = true
+	}
+	for _, action := range f.AllowedActions {
+		if !allowedActionSet[action] {
+			return fmt.Errorf("作品点评动作不在 %s 白名单: %q", f.FeedbackType, action)
+		}
+	}
+	if strings.TrimSpace(f.ProjectionMarkdown) == "" {
+		return fmt.Errorf("作品点评缺少 projection_markdown")
+	}
+	return nil
+}
+
+// ParseWorkFeedbackJSON strictly decodes the closed canonical feedback schema.
+// Unknown fields (including score/rank/rewrite/redraw) fail closed instead of
+// silently becoming a second, unvalidated fact source.
+func ParseWorkFeedbackJSON(raw []byte) (WorkFeedback, error) {
+	var feedback WorkFeedback
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&feedback); err != nil {
+		return WorkFeedback{}, fmt.Errorf("解析结构化作品点评: %w", err)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("包含多余 JSON 值")
+		}
+		return WorkFeedback{}, fmt.Errorf("解析结构化作品点评: %w", err)
+	}
+	if err := feedback.Validate(); err != nil {
+		return WorkFeedback{}, err
+	}
+	return feedback, nil
 }
 
 // ObservationPracticeCard 从美术点评正文提炼「观察小练习」卡文本（§3.10，2026-07-18

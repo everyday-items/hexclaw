@@ -122,10 +122,8 @@ func TestRestore_AtomicFailureLeavesRecordsAndProfileUnchanged(t *testing.T) {
 		Records: []*records.AgentRecord{incoming},
 		Profile: &k12.ChildProfile{ChildName: "小明", GradeTerm: "六年级上"},
 	}
-	var sumErr error
-	bak.Checksum, sumErr = checksumHexbak(bak)
-	if sumErr != nil {
-		t.Fatal(sumErr)
+	if err := SealHexbak(bak); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := d.Restore(ctx, bak); err == nil {
 		t.Fatal("profile persistence failure must surface")
@@ -150,7 +148,9 @@ func TestRestore_RejectsNilAndCrossAgentRecords(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			bak := &Hexbak{Version: HexbakVersion, AgentName: "mingming", Records: recs}
-			bak.Checksum, _ = checksumHexbak(bak)
+			if err := SealHexbak(bak); err != nil {
+				t.Fatal(err)
+			}
 			if _, err := d.Restore(context.Background(), bak); err == nil {
 				t.Fatal("invalid archive must fail")
 			}
@@ -170,7 +170,9 @@ func TestRestore_RejectsInvalidProfileBeforeChangingRecords(t *testing.T) {
 		Version: HexbakVersion, AgentName: "mingming", Records: nil,
 		Profile: &k12.ChildProfile{ChildName: "小明", GradeTerm: "大学"},
 	}
-	bak.Checksum, _ = checksumHexbak(bak)
+	if err := SealHexbak(bak); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := d.Restore(ctx, bak); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("invalid profile err=%v want ErrInvalidInput", err)
 	}

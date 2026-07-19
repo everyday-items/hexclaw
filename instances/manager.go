@@ -598,7 +598,16 @@ func (m *Manager) Stop(ctx context.Context, name string) error {
 // Deterministic ordering at each step avoids routing to a random instance when
 // several share a provider. Returns an error if no running adapter matches.
 func (m *Manager) Send(ctx context.Context, target, chatID string, reply *adapter.Reply) error {
+	adp := m.resolveRunningAdapter(target)
+	if adp == nil {
+		return fmt.Errorf("no running adapter for target %q", target)
+	}
+	return adp.Send(ctx, chatID, reply)
+}
+
+func (m *Manager) resolveRunningAdapter(target string) adapter.Adapter {
 	m.mu.RLock()
+	defer m.mu.RUnlock()
 	// 预排序运行中的实例名，使按 ID / provider 命中时都走确定顺序。
 	names := make([]string, 0, len(m.running))
 	for name := range m.running {
@@ -627,11 +636,37 @@ func (m *Manager) Send(ctx context.Context, target, chatID string, reply *adapte
 			}
 		}
 	}
-	m.mu.RUnlock()
+	return adp
+}
+
+// SendWithReceipt requires a provider-backed external message identifier. It
+// deliberately refuses adapters that only implement basic Send so callers can
+// never convert a local nil error into a false "delivered" claim.
+func (m *Manager) SendWithReceipt(ctx context.Context, target, chatID string, reply *adapter.Reply) (adapter.DeliveryAck, error) {
+	adp := m.resolveRunningAdapter(target)
 	if adp == nil {
-		return fmt.Errorf("no running adapter for target %q", target)
+		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("no running adapter for target %q", target)
 	}
-	return adp.Send(ctx, chatID, reply)
+	receiptAdapter, ok := adp.(adapter.DeliveryReceiptAdapter)
+	if !ok {
+		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("adapter %q does not support delivery receipts", adp.Name())
+	}
+	return receiptAdapter.SendWithReceipt(ctx, chatID, reply)
+}
+
+// QueryReceipt reconciles an accepted or outcome-unknown proactive message
+// without resending it. The same stable instance target used at send time must
+// be retained by the domain receipt.
+func (m *Manager) QueryReceipt(ctx context.Context, target, externalMessageID string) (adapter.DeliveryAck, error) {
+	adp := m.resolveRunningAdapter(target)
+	if adp == nil {
+		return adapter.DeliveryAck{ExternalMessageID: externalMessageID, Status: adapter.DeliveryOutcomeUnknown}, fmt.Errorf("no running adapter for target %q", target)
+	}
+	receiptAdapter, ok := adp.(adapter.DeliveryReceiptAdapter)
+	if !ok {
+		return adapter.DeliveryAck{ExternalMessageID: externalMessageID, Status: adapter.DeliveryOutcomeUnknown}, fmt.Errorf("adapter %q does not support delivery receipts", adp.Name())
+	}
+	return receiptAdapter.QueryReceipt(ctx, externalMessageID)
 }
 
 func (m *Manager) StopAll(ctx context.Context) error {

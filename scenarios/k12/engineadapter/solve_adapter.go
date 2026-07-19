@@ -186,13 +186,37 @@ func (a *SolveAdapter) GeneratePrepReview(ctx context.Context, subject, knowledg
 	if a.prepReviewGen == nil {
 		return "", nil
 	}
-	prompt := "为家长生成一段中小学知识点回顾。只讲核心概念、孩子常见卡点和一句引导话术，控制在120字内；" +
+	prompt := "为家长生成一段中小学知识点回顾。使用简洁 Markdown；数学公式必须使用 $...$ 或 $$...$$ 的 LaTeX，" +
+		"不要用空格/换行拼分数。只讲核心概念、孩子常见卡点和一句引导话术，控制在120字内；" +
 		"不要出题、不要假称引用教材、不要输出未经提供的课本原文。知识点：" + knowledgePoint
 	out, err := a.prepReviewGen(ctx, subject, prompt, grade)
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(stripReports(out)), nil
+	return prepMarkdown(out), nil
+}
+
+// GenerateGroundedPrepReview 用检索到的教材正文作为证据，生成面向家长的适龄教学 Markdown。
+// 证据不直接透传到 UI；模型只允许整理证据，不得补写教材中没有的事实。
+func (a *SolveAdapter) GenerateGroundedPrepReview(ctx context.Context, subject, knowledgePoint, grade, evidence string) (string, error) {
+	if a.prepReviewGen == nil {
+		return "", nil
+	}
+	prompt := "请把下面教材证据整理成家长可直接照着讲的知识点回顾。输出简洁 Markdown，包含核心概念、常见卡点、" +
+		"一句引导话术；数学公式必须使用 $...$ 或 $$...$$ 的 LaTeX，不要用空格/换行拼分数；不得输出文档ID、相关度、" +
+		"检索参考编号，也不得补写证据中没有的事实。控制在180字内。\n知识点：" + knowledgePoint + "\n教材证据：\n" + evidence
+	out, err := a.prepReviewGen(ctx, subject, prompt, grade)
+	if err != nil {
+		return "", err
+	}
+	return prepMarkdown(out), nil
+}
+
+func prepMarkdown(content string) string {
+	if i := strings.Index(content, reportSentinel); i >= 0 {
+		content = content[:i]
+	}
+	return strings.TrimSpace(content)
 }
 
 // Grade 实现 usecase.Grader：solve skill 的 grading 模式内部会重新解题得 ground truth，

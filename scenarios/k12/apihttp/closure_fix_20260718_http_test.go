@@ -26,7 +26,8 @@ func TestHTTPGradeResultsPartialThenComplete(t *testing.T) {
 	do(t, h, "POST", "/practice-sets/basket/items", `{"agent":"mingming",
 		"item":{"item_id":"qb","subject":"数学","added_via":"weekly","question_markdown":"2.8×0.65=?","expected_answer_markdown":"1.82","verification_status":"verified","verification_evidence":"独立验算"}}`)
 	do(t, h, "POST", "/practice-sets/"+id+"/finalize", `{"agent":"mingming","via":"print"}`)
-	do(t, h, "POST", "/practice-sets/"+id+"/submit", `{"agent":"mingming"}`)
+	assetID := saveHTTPReturnAsset(t, "mingming")
+	do(t, h, "POST", "/practice-sets/"+id+"/submit", `{"agent":"mingming","return_id":"return-grade","asset_id":"`+assetID+`","item_ids":["qa","qb"]}`)
 
 	// 部分结论 → 卷保持 submitted（§3.8 第 4 条：全回传结论才 graded）。
 	rec, r := do(t, h, "POST", "/practice-sets/"+id+"/grade", `{"agent":"mingming","results":[{"item_id":"qa","correct":false}]}`)

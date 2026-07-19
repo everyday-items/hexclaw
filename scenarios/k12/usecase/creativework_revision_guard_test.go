@@ -10,7 +10,7 @@ import (
 )
 
 // TestSubmitRevision_RequiresRealUpload 修改稿必须来自真实上传（§3.10，2026-07-18 裁决：
-// 照片或粘贴文本，禁止凭空 +1 版本）——content 与 asset 至少一项非空。
+// 照片或粘贴文本，禁止凭空 +1 版本）。DD-013 后写作照片还必须携带 OCR 确认版本。
 func TestSubmitRevision_RequiresRealUpload(t *testing.T) {
 	d := newDataDeps(t)
 	ctx := context.Background()
@@ -36,10 +36,17 @@ func TestSubmitRevision_RequiresRealUpload(t *testing.T) {
 		t.Fatalf("拒绝后版本数应仍为 1，got %d", len(v.Fields.Versions))
 	}
 
-	// 只有照片 asset（无 OCR 文本）也是真实上传 → 允许。
-	rev, err := d.SubmitRevision(ctx, "xiaoming", id, "", "asset-photo-1")
+	// 写作只有照片但没有 OCR 确认证据 → 拒绝，不能把上传成功冒充正文已确认。
+	if _, err := d.SubmitRevision(ctx, "xiaoming", id, "", "asset-photo-1"); err == nil {
+		t.Fatal("写作照片缺 OCR 确认应拒绝")
+	} else if !errors.Is(err, usecase.ErrInvalidInput) {
+		t.Fatalf("写作照片确认门应为 ErrInvalidInput，got %v", err)
+	}
+
+	// 真实粘贴文本仍是合法修改稿降级路径。
+	rev, err := d.SubmitRevision(ctx, "xiaoming", id, "孩子粘贴的修改稿", "")
 	if err != nil {
-		t.Fatalf("仅照片上传应允许: %v", err)
+		t.Fatalf("纯文本修改稿应允许: %v", err)
 	}
 	if len(rev.Fields.Versions) != 2 {
 		t.Fatalf("应形成 v2，got %d", len(rev.Fields.Versions))

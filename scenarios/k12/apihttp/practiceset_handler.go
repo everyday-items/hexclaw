@@ -1,7 +1,9 @@
 package apihttp
 
 import (
+	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
@@ -9,40 +11,104 @@ import (
 
 // 练习集 DTO（前端契约，PRD §3.8 / §5.5）。
 type practiceItemDTO struct {
-	ItemID             string `json:"item_id"`
-	SourceProblemID    string `json:"source_problem_id,omitempty"`
-	Subject            string `json:"subject,omitempty"`
-	AddedVia           string `json:"added_via,omitempty"`
-	Question           string `json:"question_markdown"`
-	ExpectedAnswer     string `json:"expected_answer_markdown,omitempty"`
-	VerificationStatus string `json:"verification_status"`
-	VerificationBadge  string `json:"verification_evidence,omitempty"`
-	BlockedReason      string `json:"blocked_reason,omitempty"`
-	PaperSeq           int    `json:"paper_seq,omitempty"`
-	Returned           bool   `json:"returned,omitempty"`
+	ItemID              string   `json:"item_id"`
+	SourceProblemID     string   `json:"source_problem_id,omitempty"`
+	Subject             string   `json:"subject,omitempty"`
+	AddedVia            string   `json:"added_via,omitempty"`
+	Question            string   `json:"question_markdown"`
+	ExpectedAnswer      string   `json:"expected_answer_markdown,omitempty"`
+	VerificationStatus  string   `json:"verification_status"`
+	VerificationBadge   string   `json:"verification_evidence,omitempty"`
+	BlockedReason       string   `json:"blocked_reason,omitempty"`
+	PaperSeq            int      `json:"paper_seq,omitempty"`
+	Returned            bool     `json:"returned,omitempty"`
+	ReturnIDs           []string `json:"return_ids,omitempty"`
+	GenerationJobID     string   `json:"generation_job_id,omitempty"`
+	VariantIndex        int      `json:"variant_index,omitempty"`
+	RequestedDifficulty string   `json:"requested_difficulty,omitempty"`
+	ActualDifficulty    string   `json:"actual_difficulty,omitempty"`
 	// ResultCorrect 复批逐题结论（§3.8 第 3-4 条）：null=尚无结论。
 	ResultCorrect *bool `json:"result_correct,omitempty"`
 }
 
+type practiceReturnAssetDTO struct {
+	ReturnID   string   `json:"return_id"`
+	AssetID    string   `json:"asset_id"`
+	ItemIDs    []string `json:"item_ids"`
+	ReturnedAt int64    `json:"returned_at"`
+}
+
 type practiceSetDTO struct {
-	RecordID            string            `json:"record_id"`
-	Title               string            `json:"title"`
-	SourceKind          string            `json:"source_kind"`
-	Status              string            `json:"status"`
-	StatusLabel         string            `json:"status_label"`
-	Publishable         bool              `json:"publishable"`
-	QuestionSheet       string            `json:"question_artifact_id,omitempty"`
-	AnswerSheet         string            `json:"answer_artifact_id,omitempty"`
-	DeliveryStatus      string            `json:"delivery_status"`
-	DeliveryTarget      string            `json:"delivery_target,omitempty"`
-	SkippedBlockedCount int               `json:"skipped_blocked_count,omitempty"`
-	PaperNo             string            `json:"paper_no,omitempty"`
-	FinalizedAt         int64             `json:"finalized_at,omitempty"`
-	FinalizedVia        string            `json:"finalized_via,omitempty"`
-	Items               []practiceItemDTO `json:"items"`
+	RecordID            string                   `json:"record_id"`
+	Title               string                   `json:"title"`
+	SourceKind          string                   `json:"source_kind"`
+	Status              string                   `json:"status"`
+	StatusLabel         string                   `json:"status_label"`
+	Publishable         bool                     `json:"publishable"`
+	QuestionSheet       string                   `json:"question_artifact_id,omitempty"`
+	AnswerSheet         string                   `json:"answer_artifact_id,omitempty"`
+	DeliveryStatus      string                   `json:"delivery_status"`
+	DeliveryTarget      string                   `json:"delivery_target,omitempty"`
+	SkippedBlockedCount int                      `json:"skipped_blocked_count,omitempty"`
+	PaperNo             string                   `json:"paper_no,omitempty"`
+	FinalizedAt         int64                    `json:"finalized_at,omitempty"`
+	FinalizedVia        string                   `json:"finalized_via,omitempty"`
+	Items               []practiceItemDTO        `json:"items"`
+	ReturnAssets        []practiceReturnAssetDTO `json:"return_assets"`
+}
+
+type practicePrintJobDTO struct {
+	PrintJobID         string `json:"print_job_id"`
+	PracticeSetID      string `json:"practice_set_id"`
+	IdempotencyKey     string `json:"idempotency_key"`
+	Status             string `json:"status"`
+	PaperNo            string `json:"paper_no"`
+	ArtifactKind       string `json:"artifact_kind"`
+	ArtifactID         string `json:"artifact_id"`
+	QuestionArtifactID string `json:"question_artifact_id"`
+	AnswerArtifactID   string `json:"answer_artifact_id"`
+	SourceDigest       string `json:"source_digest"`
+	AttemptCount       int    `json:"attempt_count"`
+	NativeJobID        string `json:"native_job_id,omitempty"`
+	NativeReceiptID    string `json:"native_receipt_id,omitempty"`
+	PrinterSnapshot    any    `json:"printer_snapshot,omitempty"`
+	FailureKind        string `json:"failure_kind,omitempty"`
+	FailureDetail      string `json:"failure_detail,omitempty"`
+	PreparedAt         int64  `json:"prepared_at"`
+	PrintedAt          int64  `json:"printed_at,omitempty"`
+	UpdatedAt          int64  `json:"updated_at"`
+	Version            int    `json:"version"`
+}
+
+func toPracticePrintJobDTO(v usecase.PracticePrintView) practicePrintJobDTO {
+	job := v.Job
+	var printer any
+	if job.PrinterSnapshot != "" && job.PrinterSnapshot != "{}" {
+		_ = json.Unmarshal([]byte(job.PrinterSnapshot), &printer)
+	}
+	return practicePrintJobDTO{
+		PrintJobID: job.PrintJobID, PracticeSetID: job.PracticeSetID,
+		IdempotencyKey: job.IdempotencyKey, Status: job.Status, PaperNo: job.PaperNo,
+		ArtifactKind: job.ArtifactKind, ArtifactID: job.ArtifactID,
+		QuestionArtifactID: job.QuestionArtifactID, AnswerArtifactID: job.AnswerArtifactID,
+		SourceDigest: job.SourceDigest, AttemptCount: job.AttemptCount,
+		NativeJobID: job.NativeJobID, NativeReceiptID: job.NativeReceiptID,
+		PrinterSnapshot: printer, FailureKind: job.FailureKind, FailureDetail: job.FailureDetail,
+		PreparedAt: job.PreparedAt, PrintedAt: job.PrintedAt, UpdatedAt: job.UpdatedAt, Version: job.Version,
+	}
 }
 
 func toPracticeSetDTO(v usecase.PracticeSetView) practiceSetDTO {
+	returnIDsByItem := make(map[string][]string)
+	returnAssets := make([]practiceReturnAssetDTO, 0, len(v.Fields.ReturnAssets))
+	for _, ra := range v.Fields.ReturnAssets {
+		returnAssets = append(returnAssets, practiceReturnAssetDTO{
+			ReturnID: ra.ReturnID, AssetID: ra.AssetID, ItemIDs: ra.ItemIDs, ReturnedAt: ra.ReturnedAt,
+		})
+		for _, itemID := range ra.ItemIDs {
+			returnIDsByItem[itemID] = append(returnIDsByItem[itemID], ra.ReturnID)
+		}
+	}
 	items := make([]practiceItemDTO, 0, len(v.Fields.Items))
 	for _, it := range v.Fields.Items {
 		items = append(items, practiceItemDTO{
@@ -51,7 +117,10 @@ func toPracticeSetDTO(v usecase.PracticeSetView) practiceSetDTO {
 			Question: it.QuestionMarkdown, ExpectedAnswer: it.ExpectedAnswerMarkdown,
 			VerificationStatus: it.VerificationStatus, VerificationBadge: it.VerificationEvidence,
 			BlockedReason: it.BlockedReason,
-			PaperSeq:      it.PaperSeq, Returned: it.Returned, ResultCorrect: it.ResultCorrect,
+			PaperSeq:      it.PaperSeq, Returned: it.Returned, ReturnIDs: returnIDsByItem[it.ItemID],
+			GenerationJobID: it.GenerationJobID, VariantIndex: it.VariantIndex,
+			RequestedDifficulty: it.RequestedDifficulty, ActualDifficulty: it.ActualDifficulty,
+			ResultCorrect: it.ResultCorrect,
 		})
 	}
 	return practiceSetDTO{
@@ -62,7 +131,7 @@ func toPracticeSetDTO(v usecase.PracticeSetView) practiceSetDTO {
 		PaperNo:             v.Fields.PaperNo, FinalizedAt: v.Fields.FinalizedAt, FinalizedVia: v.Fields.FinalizedVia,
 		QuestionSheet: v.Fields.QuestionArtifact, AnswerSheet: v.Fields.AnswerArtifact,
 		DeliveryStatus: v.Fields.DeliveryStatus, DeliveryTarget: v.Fields.DeliveryTarget,
-		Items: items,
+		Items: items, ReturnAssets: returnAssets,
 	}
 }
 
@@ -179,6 +248,63 @@ func (h *handler) addToBasket(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"record_id": id, "added": added})
 }
 
+type customPaperReq struct {
+	Agent          string `json:"agent"`
+	IdempotencyKey string `json:"idempotency_key"`
+	Scope          string `json:"scope"`
+	Total          any    `json:"total"`
+	PerSource      int    `json:"per_source"`
+	Difficulty     string `json:"difficulty"`
+	Textbook       string `json:"textbook"`
+	Grade          string `json:"grade,omitempty"`
+	SourceSession  string `json:"source_session,omitempty"`
+}
+
+// generateCustomPaper 是 DD-027 唯一正式组卷命令。前端只提交一次冻结参数；生成、
+// 验证、去重和装入待打印集合均由后端完成并原子提交。
+func (h *handler) generateCustomPaper(w http.ResponseWriter, r *http.Request) {
+	var req customPaperReq
+	if !decode(w, r, &req) {
+		return
+	}
+	total, ok := customPaperTotal(req.Total)
+	if req.Agent == "" || req.IdempotencyKey == "" || !ok {
+		writeErr(w, http.StatusBadRequest, "agent / idempotency_key / total(all/5/10) 必填")
+		return
+	}
+	result, err := h.rt.Deps.GenerateCustomPaper(r.Context(), req.Agent, usecase.CustomPaperRequest{
+		IdempotencyKey: req.IdempotencyKey, Scope: req.Scope, Total: total,
+		PerSource: req.PerSource, Difficulty: req.Difficulty, Textbook: req.Textbook,
+		Grade: req.Grade, SourceSession: req.SourceSession,
+	})
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusBadGateway), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"generation_job_id": result.GenerationJobID,
+		"status":            result.Status,
+		"set":               toPracticeSetDTO(result.Set),
+		"items":             result.Items,
+		"added":             result.Added,
+		"deduplicated":      result.Deduplicated,
+	})
+}
+
+func customPaperTotal(v any) (string, bool) {
+	switch value := v.(type) {
+	case string:
+		if value == "all" || value == "5" || value == "10" {
+			return value, true
+		}
+	case float64:
+		if value == 5 || value == 10 {
+			return strconv.Itoa(int(value)), true
+		}
+	}
+	return "", false
+}
+
 type removeFromBasketReq struct {
 	Agent  string `json:"agent"`
 	ItemID string `json:"item_id"`
@@ -229,15 +355,103 @@ func (h *handler) finalizePracticeSet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// submitPracticeSet 回传作答：body 可带 item_ids（本次照片覆盖的题，部分回传/补传）；
-// 缺省 = 整卷回传。§3.8：全部入卷题回传后才可 graded。
-type submitReturnReq struct {
-	Agent   string   `json:"agent"`
-	ItemIDs []string `json:"item_ids,omitempty"`
+type preparePracticePrintReq struct {
+	Agent          string `json:"agent"`
+	IdempotencyKey string `json:"idempotency_key"`
+	ArtifactKind   string `json:"artifact_kind"`
 }
 
-func (h *handler) submitPracticeSet(w http.ResponseWriter, r *http.Request) {
-	var req submitReturnReq
+// preparePracticePrintJob is phase one: reserve a formal paper_no and immutable
+// source, but leave the PracticeSet draft until a native printed receipt arrives.
+func (h *handler) preparePracticePrintJob(w http.ResponseWriter, r *http.Request) {
+	var req preparePracticePrintReq
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Agent == "" || req.IdempotencyKey == "" {
+		writeErr(w, http.StatusBadRequest, "agent / idempotency_key 必填")
+		return
+	}
+	v, replay, err := h.rt.Deps.PreparePracticePrint(r.Context(), req.Agent, r.PathValue("id"),
+		req.IdempotencyKey, req.ArtifactKind)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+		return
+	}
+	status := http.StatusCreated
+	if replay {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, map[string]any{
+		"print_job": toPracticePrintJobDTO(v),
+		"replayed":  replay,
+	})
+}
+
+func (h *handler) getPracticePrintJob(w http.ResponseWriter, r *http.Request) {
+	agent := r.URL.Query().Get("agent")
+	if agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	v, err := h.rt.Deps.GetPracticePrint(r.Context(), agent, r.PathValue("id"))
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"print_job": toPracticePrintJobDTO(v)})
+}
+
+func (h *handler) getPracticePrintJobPaper(w http.ResponseWriter, r *http.Request) {
+	agent := r.URL.Query().Get("agent")
+	if agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	v, err := h.rt.Deps.RenderPracticePrintJobPaper(r.Context(), agent, r.PathValue("id"), r.URL.Query().Get("kind"))
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"print_job_id": v.PrintJobID, "kind": v.Kind, "title": v.Title,
+		"paper_no": v.PaperNo, "source_digest": v.SourceDigest,
+		"artifact_id": v.ArtifactID, "markdown": v.Markdown,
+	})
+}
+
+type practicePrintEventReq struct {
+	Agent           string          `json:"agent"`
+	Status          string          `json:"status"`
+	NativeJobID     string          `json:"native_job_id,omitempty"`
+	NativeReceiptID string          `json:"native_receipt_id,omitempty"`
+	PrinterSnapshot json.RawMessage `json:"printer_snapshot,omitempty"`
+	FailureKind     string          `json:"failure_kind,omitempty"`
+	FailureDetail   string          `json:"failure_detail,omitempty"`
+}
+
+func (h *handler) recordPracticePrintEvent(w http.ResponseWriter, r *http.Request) {
+	var req practicePrintEventReq
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Agent == "" || req.Status == "" {
+		writeErr(w, http.StatusBadRequest, "agent / status 必填")
+		return
+	}
+	v, err := h.rt.Deps.RecordPracticePrintEvent(r.Context(), req.Agent, r.PathValue("id"), usecase.PracticePrintEvent{
+		Status: req.Status, NativeJobID: req.NativeJobID, NativeReceiptID: req.NativeReceiptID,
+		PrinterSnapshot: string(req.PrinterSnapshot), FailureKind: req.FailureKind, FailureDetail: req.FailureDetail,
+	})
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"print_job": toPracticePrintJobDTO(v)})
+}
+
+func (h *handler) retryPracticePrintJob(w http.ResponseWriter, r *http.Request) {
+	var req agentOnlyReq
 	if !decode(w, r, &req) {
 		return
 	}
@@ -245,17 +459,38 @@ func (h *handler) submitPracticeSet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
-	var err error
-	if len(req.ItemIDs) > 0 {
-		err = h.rt.Deps.SubmitReturn(r.Context(), req.Agent, r.PathValue("id"), req.ItemIDs)
-	} else {
-		err = h.rt.Deps.SubmitPracticeSet(r.Context(), req.Agent, r.PathValue("id"))
-	}
+	v, err := h.rt.Deps.RetryPracticePrint(r.Context(), req.Agent, r.PathValue("id"))
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
 		return
 	}
-	h.respondPracticeSet(w, r, req.Agent)
+	writeJSON(w, http.StatusOK, map[string]any{"print_job": toPracticePrintJobDTO(v)})
+}
+
+// submitPracticeSet 回传作答（DD-028）：每次必须携带真实照片资产、幂等 return_id 与
+// 本批覆盖题目；缺任何字段都拒绝，绝不再把空 item_ids 猜成整卷回传。
+type submitReturnReq struct {
+	Agent    string   `json:"agent"`
+	ReturnID string   `json:"return_id"`
+	AssetID  string   `json:"asset_id"`
+	ItemIDs  []string `json:"item_ids"`
+}
+
+func (h *handler) submitPracticeSet(w http.ResponseWriter, r *http.Request) {
+	var req submitReturnReq
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Agent == "" || req.ReturnID == "" || req.AssetID == "" || len(req.ItemIDs) == 0 {
+		writeErr(w, http.StatusBadRequest, "agent / return_id / asset_id / item_ids 必填")
+		return
+	}
+	v, err := h.rt.Deps.SubmitReturn(r.Context(), req.Agent, r.PathValue("id"), req.ReturnID, req.AssetID, req.ItemIDs)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, toPracticeSetDTO(v))
 }
 
 // gradeResultsReq 复批命令 body（§3.8 第 3-4 条）：results 为逐题结论；

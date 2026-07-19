@@ -141,6 +141,22 @@ func TestPrepCard(t *testing.T) {
 	}
 }
 
+func TestInsightReportCarriesCanonicalRenderEvidence(t *testing.T) {
+	h := newServer(t)
+	rec, out := do(t, h, http.MethodGet, "/insight-report?agent=mingming", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("insight-report status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	content, _ := out["message_content"].(map[string]any)
+	manifest, _ := out["render_manifest"].(map[string]any)
+	if content["producer_kind"] != "report" || content["source_digest"] == "" {
+		t.Fatalf("report omitted canonical MessageContent: %#v", out)
+	}
+	if manifest["surface"] != "k12" || manifest["source_digest"] != content["source_digest"] {
+		t.Fatalf("report omitted same-source RenderManifest: content=%#v manifest=%#v", content, manifest)
+	}
+}
+
 func TestGradeBadRequest(t *testing.T) {
 	h := newServer(t)
 	rec, _ := do(t, h, "POST", "/grade", "not-json")

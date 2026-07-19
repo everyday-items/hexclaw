@@ -148,28 +148,72 @@ type PracticeItem struct {
 	PaperSeq               int    `json:"paper_seq,omitempty"`             // 卷面题号（§4.13）：固化时按学科分组连续编号，只给入卷题；题级对齐锚点
 	Returned               bool   `json:"returned,omitempty"`              // 该题作答是否已回传（§3.8 部分回传）；补传合法幂等
 	PracticeProblemID      string `json:"practice_problem_id,omitempty"`   // 固化时铸造的独立 Problem（2026-07-18 #4c）：复批 Attempt 的归属对象；SourceProblemID 即 derived_from 来源链
+	GenerationJobID        string `json:"generation_job_id,omitempty"`     // 自定义组卷命令来源；普通装篮为空
+	VariantIndex           int    `json:"variant_index,omitempty"`         // 同一来源题内从 1 开始的变式序号
+	RequestedDifficulty    string `json:"requested_difficulty,omitempty"`  // same / easier / harder
+	ActualDifficulty       string `json:"actual_difficulty,omitempty"`     // 生成并验证后实际采用的难度
 	// ResultCorrect 复批逐题结论（§3.8 第 3-4 条）：nil=尚无结论；部分回传允许多次复批，
 	// 每次覆盖已给结论的题、幂等；全部入卷题有结论后卷才转 graded。联动来源错题在用例层执行。
 	ResultCorrect *bool `json:"result_correct,omitempty"`
 }
 
+// PracticeReturnAsset 是一次不可变的作答照片回传批次（DD-028）。补传只能追加新记录，
+// 不得覆盖旧 asset 与题目映射；ReturnID 同时是命令幂等键。
+type PracticeReturnAsset struct {
+	ReturnID   string   `json:"return_id"`
+	AssetID    string   `json:"asset_id"`
+	ItemIDs    []string `json:"item_ids"`
+	ReturnedAt int64    `json:"returned_at"`
+}
+
 // PracticeSetFields 练习集领域字段（PRD §5.5）。
 type PracticeSetFields struct {
-	SourceKind          string         `json:"source_kind"`
-	Title               string         `json:"title"`
-	PaperNo             string         `json:"paper_no,omitempty"` // 卷面号（§4.13 双 ID）：固化时分配，P-YYWW-NN，OCR 友好，印于页眉；内部主键仍是 record_id
-	Items               []PracticeItem `json:"items"`
-	QuestionArtifact    string         `json:"question_artifact_id,omitempty"`  // 题目卷，固化（打印/发送）时生成，只含 verified 项
-	AnswerArtifact      string         `json:"answer_artifact_id,omitempty"`    // 答案卷，与题目卷分离
-	SkippedBlockedCount int            `json:"skipped_blocked_count,omitempty"` // 固化时被跳过的阻断题数（§3.8，审计+预览明示）
-	FinalizedAt         int64          `json:"finalized_at,omitempty"`          // 固化时间（§4.13）：历史排序、回传提醒 T+1、14 天启发窗口的统一依据
-	FinalizedVia        string         `json:"finalized_via,omitempty"`         // print | send
-	ReminderSentAt      int64          `json:"reminder_sent_at,omitempty"`      // 回传提醒发出时间（§3.13）：每卷幂等一次的持久依据
-	ReminderDismissed   bool           `json:"reminder_dismissed,omitempty"`    // 家长手动关闭本卷提醒
-	ClosedReason        string         `json:"closed_reason,omitempty"`         // graded→closed 触发原因（§3.8）：manual / semester
-	DeliveryStatus      string         `json:"delivery_status"`
-	DeliveryTarget      string         `json:"delivery_target,omitempty"`
+	SourceKind          string                `json:"source_kind"`
+	Title               string                `json:"title"`
+	PaperNo             string                `json:"paper_no,omitempty"` // 卷面号（§4.13 双 ID）：固化时分配，P-YYWW-NN，OCR 友好，印于页眉；内部主键仍是 record_id
+	Items               []PracticeItem        `json:"items"`
+	QuestionArtifact    string                `json:"question_artifact_id,omitempty"`  // 题目卷，固化（打印/发送）时生成，只含 verified 项
+	AnswerArtifact      string                `json:"answer_artifact_id,omitempty"`    // 答案卷，与题目卷分离
+	SkippedBlockedCount int                   `json:"skipped_blocked_count,omitempty"` // 固化时被跳过的阻断题数（§3.8，审计+预览明示）
+	FinalizedAt         int64                 `json:"finalized_at,omitempty"`          // 固化时间（§4.13）：历史排序、回传提醒 T+1、14 天启发窗口的统一依据
+	FinalizedVia        string                `json:"finalized_via,omitempty"`         // print | send
+	ReminderSentAt      int64                 `json:"reminder_sent_at,omitempty"`      // 回传提醒发出时间（§3.13）：每卷幂等一次的持久依据
+	ReminderDismissed   bool                  `json:"reminder_dismissed,omitempty"`    // 家长手动关闭本卷提醒
+	ClosedReason        string                `json:"closed_reason,omitempty"`         // graded→closed 触发原因（§3.8）：manual / semester
+	DeliveryStatus      string                `json:"delivery_status"`
+	DeliveryTarget      string                `json:"delivery_target,omitempty"`
+	ReturnAssets        []PracticeReturnAsset `json:"return_assets,omitempty"`
 }
+
+// PracticeGenerationJob 是 DD-027 后端正式组卷命令的持久收据。请求快照不可变；
+// committed 后 ResultSetID/ResultItemIDs 是幂等重放的唯一结果。
+type PracticeGenerationJob struct {
+	GenerationJobID   string   `json:"generation_job_id"`
+	AgentName         string   `json:"agent_name"`
+	IdempotencyKey    string   `json:"idempotency_key"`
+	RequestDigest     string   `json:"request_digest"`
+	Scope             string   `json:"scope"`
+	VariantsPerSource int      `json:"variants_per_source"`
+	Difficulty        string   `json:"difficulty"`
+	Total             string   `json:"total"`
+	Textbook          string   `json:"textbook"`
+	Status            string   `json:"status"`
+	ResultSetID       string   `json:"result_set_id,omitempty"`
+	ResultItemIDs     []string `json:"result_item_ids,omitempty"`
+	DeduplicatedCount int      `json:"deduplicated_count,omitempty"`
+	FailureReason     string   `json:"failure_reason,omitempty"`
+	CreatedAt         int64    `json:"created_at"`
+	UpdatedAt         int64    `json:"updated_at"`
+}
+
+const (
+	PracticeGenerationQueued     = "queued"
+	PracticeGenerationGenerating = "generating"
+	PracticeGenerationValidating = "validating"
+	PracticeGenerationCommitted  = "committed"
+	PracticeGenerationFailed     = "failed"
+	PracticeGenerationCancelled  = "cancelled"
+)
 
 // graded→closed 触发原因（2026-07-18 裁决）。
 const (
@@ -225,8 +269,14 @@ func AssignPaperSeqs(items []PracticeItem) {
 // 纯 P + 数字、无小写与易混字符，短到能印大号页眉、家长可口头核对、OCR 可稳定识别；
 // 序号为该 Learner 已固化卷数 +1，同 Learner 内唯一（跨 Learner 允许重复，回传按绑定实例路由）。
 func GeneratePaperNo(t time.Time, priorFinalized int) string {
+	return FormatPaperNo(t, priorFinalized+1)
+}
+
+// FormatPaperNo formats an already atomically reserved learner-local sequence.
+// Allocation belongs to storage; formatting remains a pure domain rule.
+func FormatPaperNo(t time.Time, sequence int) string {
 	year, week := t.ISOWeek()
-	return fmt.Sprintf("P-%02d%02d-%02d", year%100, week, priorFinalized+1)
+	return fmt.Sprintf("P-%02d%02d-%02d", year%100, week, sequence)
 }
 
 // PracticeSetSchema 返回练习集记录集 schema（注册进 RecordSchemaRegistry）。
@@ -293,6 +343,7 @@ func validatePracticeSetFields(fieldsJSON string) error {
 	default:
 		return fmt.Errorf("练习集来源非法: %q", f.SourceKind)
 	}
+	itemIDs := make(map[string]struct{}, len(f.Items))
 	for i, it := range f.Items {
 		if strings.TrimSpace(it.QuestionMarkdown) == "" {
 			return fmt.Errorf("练习项 #%d 缺少 question_markdown", i)
@@ -314,8 +365,47 @@ func validatePracticeSetFields(fieldsJSON string) error {
 			// §4.11 家长向术语：不出现「验证器/质量门」，统一「暂不支持自动验证」。
 			return fmt.Errorf("练习项 #%d 学科 %q 暂不支持自动验证，不得标记 verified", i, it.Subject)
 		}
+		if it.ItemID != "" {
+			if _, exists := itemIDs[it.ItemID]; exists {
+				return fmt.Errorf("练习项 item_id 重复: %q", it.ItemID)
+			}
+			itemIDs[it.ItemID] = struct{}{}
+		}
+		if it.RequestedDifficulty != "" && !validPracticeDifficulty(it.RequestedDifficulty) {
+			return fmt.Errorf("练习项 #%d requested_difficulty 非法: %q", i, it.RequestedDifficulty)
+		}
+		if it.ActualDifficulty != "" && !validPracticeDifficulty(it.ActualDifficulty) {
+			return fmt.Errorf("练习项 #%d actual_difficulty 非法: %q", i, it.ActualDifficulty)
+		}
+	}
+	returnIDs := make(map[string]struct{}, len(f.ReturnAssets))
+	for i, ra := range f.ReturnAssets {
+		if strings.TrimSpace(ra.ReturnID) == "" || strings.TrimSpace(ra.AssetID) == "" || ra.ReturnedAt <= 0 {
+			return fmt.Errorf("回传资产 #%d 缺少 return_id / asset_id / returned_at", i)
+		}
+		if _, exists := returnIDs[ra.ReturnID]; exists {
+			return fmt.Errorf("回传资产 return_id 重复: %q", ra.ReturnID)
+		}
+		returnIDs[ra.ReturnID] = struct{}{}
+		if len(ra.ItemIDs) == 0 {
+			return fmt.Errorf("回传资产 #%d 至少覆盖一道题", i)
+		}
+		seen := map[string]struct{}{}
+		for _, id := range ra.ItemIDs {
+			if _, exists := itemIDs[id]; !exists {
+				return fmt.Errorf("回传资产 #%d 引用了不属于本卷的 item_id %q", i, id)
+			}
+			if _, exists := seen[id]; exists {
+				return fmt.Errorf("回传资产 #%d 的 item_id 重复: %q", i, id)
+			}
+			seen[id] = struct{}{}
+		}
 	}
 	return nil
+}
+
+func validPracticeDifficulty(v string) bool {
+	return v == "same" || v == "easier" || v == "harder"
 }
 
 // PracticeItemPublishable 判断某练习项是否可进入打印版本（PRD §4.7）。

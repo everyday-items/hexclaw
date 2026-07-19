@@ -98,6 +98,39 @@ func TestGradeHomeworkPhoto_AnsweredSheetGradesAndAnnotatesTrustedBBox(t *testin
 	}
 }
 
+func TestGradeHomeworkPhoto_CompoundParentIsNotAssessedAndChildrenStayIndependent(t *testing.T) {
+	d, _ := newPipeline(t,
+		fakeSolver{solution: "答案", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
+	)
+	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{
+		{ProblemID: "parent-1", ProblemKind: ProblemKindCompoundParent, Question: "阅读短文《春天》", Subject: "语文"},
+		{ProblemID: "child-1", ProblemKind: ProblemKindSubproblem, ParentProblemID: "parent-1", SubproblemNo: "1", Question: "写出中心句", Subject: "语文", StudentAnswer: "春天来了"},
+		{ProblemID: "child-2", ProblemKind: ProblemKindSubproblem, ParentProblemID: "parent-1", SubproblemNo: "2", Question: "概括第二段", Subject: "语文"},
+	}}
+
+	got, err := d.GradeHomeworkPhoto(context.Background(), PhotoGradeRequest{
+		AgentName: "mingming", Grade: "五年级下", SourceSession: "dt-compound", Image: []byte("compound-photo"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 2 {
+		t.Fatalf("compound parent must not create assessment item: %#v", got.Items)
+	}
+	if got.Items[0].Recognized.ProblemID != "child-1" || got.Items[1].Recognized.ProblemID != "child-2" {
+		t.Fatalf("sibling identity crossed: %#v", got.Items)
+	}
+	for i, item := range got.Items {
+		if !strings.Contains(item.Recognized.Question, "阅读短文《春天》") {
+			t.Fatalf("child %d assessment input lacks shared stem: %q", i, item.Recognized.Question)
+		}
+	}
+	if got.Items[0].Recognized.StudentAnswer != "春天来了" || got.Items[1].Recognized.StudentAnswer != "" {
+		t.Fatalf("one sibling answer overwrote another: %#v", got.Items)
+	}
+}
+
 func TestGradeHomeworkPhoto_VerifiedAnswersWithoutBBoxRemainTextOnlyInsteadOfSendingUnchangedPhoto(t *testing.T) {
 	d, _ := newPipeline(t,
 		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},

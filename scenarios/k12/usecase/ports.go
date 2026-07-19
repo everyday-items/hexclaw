@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
 // ErrRenderUnavailable render 服务未启用（调用方降级 markdown）。
@@ -15,6 +17,45 @@ var ErrSolveFailed = errors.New("solve service failed")
 
 // ErrInvalidInput 标识客户端可修正的 K12 用例输入错误。
 var ErrInvalidInput = errors.New("invalid k12 input")
+
+// ErrDeliveryUnavailable means the durable send-to-phone transport has not
+// been wired. Callers must show a binding/setup action, never report success.
+var ErrDeliveryUnavailable = errors.New("delivery transport unavailable")
+
+// ErrDeliveryQueryUnavailable means the provider may have accepted a message
+// but returned no query key. Retrying would risk a duplicate, so the receipt
+// remains outcome_unknown until an operator can verify it externally.
+var ErrDeliveryQueryUnavailable = errors.New("delivery receipt cannot be queried safely")
+
+// PreparedTextDelivery is the immutable, channel-neutral payload projection
+// frozen before a provider send begins. PayloadJSON and RenderJSON are stored
+// verbatim and reused by retries/restart recovery.
+type PreparedTextDelivery struct {
+	BindingID   string
+	Target      k12.DeliveryTarget
+	PayloadJSON string
+	RenderJSON  string
+}
+
+// DeliveryTransportAck uses the durable domain statuses directly: provider
+// acceptance maps to DeliverySending, never DeliveryDelivered.
+type DeliveryTransportAck struct {
+	ExternalMessageID string
+	Status            k12.DeliveryReceiptStatus
+	Detail            string
+	// Err is not serialized; it lets deterministic fakes describe the paired
+	// transport error while production implementations normally leave it nil.
+	Err error
+}
+
+// DeliveryTransport is the DD-024 composition seam. Preparing is side-effect
+// free; SendPrepared may only be called after a durable receipt exists; query
+// is the sole legal operation for an outcome_unknown receipt.
+type DeliveryTransport interface {
+	PrepareText(ctx context.Context, agentName, content string) (PreparedTextDelivery, error)
+	SendPrepared(ctx context.Context, receipt k12.DeliveryReceipt) (DeliveryTransportAck, error)
+	QueryPrepared(ctx context.Context, receipt k12.DeliveryReceipt) (DeliveryTransportAck, error)
+}
 
 // Renderer 文档渲染 port（adapter = 平台 render 服务）。format=pdf/docx/...
 type Renderer interface {
@@ -52,6 +93,31 @@ const (
 
 // RecognizedQuestion 识题产出的结构化题目值对象（engine 只产值对象，不含领域编排）。
 type RecognizedQuestion struct {
+	// ProblemID 是一次 Submission 内稳定的问题标识。复合题的公共题干与每个可作答小题
+	// 都有独立 ID；锚点、确认版本与 Assessment 只能引用可作答题自己的 ID。
+	ProblemID       string      `json:"problem_id,omitempty"`
+	ProblemKind     ProblemKind `json:"problem_kind,omitempty"`
+	ParentProblemID string      `json:"parent_problem_id,omitempty"`
+	SubproblemNo    string      `json:"subproblem_no,omitempty"`
+	PageAssetID     string      `json:"page_asset_id,omitempty"`
+	AttemptID       string      `json:"attempt_id,omitempty"`
+
+	// OCR 原始转写与 canonical Markdown/LaTeX 是两份独立事实。Raw* 一经识别不得被
+	// 家长修正或增强模型覆盖；canonical 可在显式确认时形成新版本。
+	RawTranscription             string          `json:"raw_transcription,omitempty"`
+	CanonicalMarkdown            string          `json:"canonical_markdown,omitempty"`
+	AnswerRawTranscription       string          `json:"answer_raw_transcription,omitempty"`
+	AnswerCanonicalMarkdown      string          `json:"answer_canonical_markdown,omitempty"`
+	CanonicalVersion             int             `json:"canonical_version,omitempty"`
+	ConfirmedVersion             int             `json:"confirmed_version,omitempty"`
+	InputDigest                  string          `json:"input_digest,omitempty"`
+	RecognitionConfidence        *float64        `json:"recognition_confidence,omitempty"`
+	OCRSignals                   []string        `json:"ocr_signals,omitempty"`
+	EvidenceTranscriptions       []string        `json:"evidence_transcriptions,omitempty"`
+	AnswerEvidenceTranscriptions []string        `json:"answer_evidence_transcriptions,omitempty"`
+	ConfirmationRequired         bool            `json:"confirmation_required,omitempty"`
+	ConfirmationReasons          []OCRRiskReason `json:"confirmation_reasons,omitempty"`
+
 	Question        string
 	KnowledgePoints []string
 	// AnswerState 是“是否作答、能否可靠读出”的单一真相源。
@@ -71,8 +137,34 @@ type RecognizedQuestion struct {
 // NormalizeRecognizedQuestion 把任何 Recognizer 实现的输出收敛到领域不变量。
 // 兼容未显式提供 AnswerState 的旧实现，但绝不使用 BBox 推断作答状态。
 func NormalizeRecognizedQuestion(q RecognizedQuestion) RecognizedQuestion {
-	q.Question = strings.TrimSpace(q.Question)
-	q.StudentAnswer = strings.TrimSpace(q.StudentAnswer)
+	q = normalizeRecognizedQuestionFacts(q)
+	q = EvaluateOCRConfirmationRisk(q)
+	return q
+}
+
+// normalizeRecognizedQuestionFacts 只收敛事实投影，不执行风险策略；与
+// EvaluateOCRConfirmationRisk 分层，避免风险计算递归调用 Normalize。
+func normalizeRecognizedQuestionFacts(q RecognizedQuestion) RecognizedQuestion {
+	legacyQuestion := q.Question
+	legacyAnswer := q.StudentAnswer
+	q.ProblemKind = normalizeProblemKind(q.ProblemKind, q.ParentProblemID)
+	if q.RawTranscription == "" {
+		q.RawTranscription = legacyQuestion
+	}
+	if q.CanonicalMarkdown == "" {
+		q.CanonicalMarkdown = strings.TrimSpace(legacyQuestion)
+	}
+	if q.AnswerRawTranscription == "" && legacyAnswer != "" {
+		q.AnswerRawTranscription = legacyAnswer
+	}
+	if q.AnswerCanonicalMarkdown == "" && legacyAnswer != "" {
+		q.AnswerCanonicalMarkdown = strings.TrimSpace(legacyAnswer)
+	}
+	if q.CanonicalVersion <= 0 && (q.CanonicalMarkdown != "" || q.AnswerCanonicalMarkdown != "") {
+		q.CanonicalVersion = 1
+	}
+	q.Question = strings.TrimSpace(RecognizedQuestionDisplayText(q))
+	q.StudentAnswer = strings.TrimSpace(recognizedAnswerDisplayText(q))
 	switch q.AnswerState {
 	case AnswerStatePresent:
 		if q.StudentAnswer == "" {
@@ -98,6 +190,13 @@ func NormalizeRecognizedQuestion(q RecognizedQuestion) RecognizedQuestion {
 // Recognizer 拍题识别 port（adapter = OCR + 云端 vision，出网走 egress 白名单）。
 type Recognizer interface {
 	Recognize(ctx context.Context, image []byte) ([]RecognizedQuestion, error)
+}
+
+// CreativeWorkOCRRecognizer is deliberately narrower than homework
+// Recognizer: it returns one verbatim writing draft, not questions/answers.
+// The same production VisionFunc primitive powers both adapters.
+type CreativeWorkOCRRecognizer interface {
+	RecognizeWriting(ctx context.Context, image []byte) (string, error)
 }
 
 // AnswerAnchorer 是可选的第二阶段图片证据 port：在核心识题已经返回后，按页批量定位并独立
@@ -223,6 +322,13 @@ type Grounding interface {
 // 它只生成按年级约束的讲法，不走 solve/verifier，也不得被标为程序验算结果。
 type PrepReviewGenerator interface {
 	GeneratePrepReview(ctx context.Context, subject, knowledgePoint, grade string) (string, error)
+}
+
+// GroundedPrepReviewGenerator 把教材检索结果视为模型证据，而不是可直接展示的 UI 文本。
+// 可选能力：旧实现仍可只实现 PrepReviewGenerator；生产 SolveAdapter 实现本接口后，
+// 备课卡会把证据整理成适龄 Markdown，并用 $...$ / $$...$$ 表达数学公式。
+type GroundedPrepReviewGenerator interface {
+	GenerateGroundedPrepReview(ctx context.Context, subject, knowledgePoint, grade, evidence string) (string, error)
 }
 
 // GroundingWriter 是教材 grounding 的写缝；与 Grounding 使用同一 agent scope。

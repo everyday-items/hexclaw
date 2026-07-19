@@ -475,7 +475,157 @@ WHERE status IN ('confirmed','assigned','submitted','graded','closed','cancelled
   AND instr(dedupe_key, '#released#') = 0;
 `,
 	},
+	{
+		Version:     12,
+		Description: "v0.5.0 DD-027/DD-028：原子自定义组卷任务与只追加作答照片批次",
+		// DD-027：正式后端组卷命令以 k12_practice_generation_jobs 冻结请求与终态，
+		// committed 结果和练习篮在同一事务提交；同 agent + idempotency_key 唯一。
+		// DD-028：回传照片拆为 append-only 子表，return_id 在卷内唯一，item_ids_json
+		// 保留一张照片覆盖多题以及同题被多批照片覆盖的双向证据。
+		Func: migrateK12PracticeCommandsV12,
+	},
+	{
+		Version:     13,
+		Description: "v0.5.0 DD-004/DD-023：正式卷面号预占与原生两阶段 PrintJob",
+		// prepare 在一笔事务内预占 Tutor 内唯一 paper_no 并冻结同源题卷/答案卷；
+		// 原生 printed receipt 才能在另一笔事务内同时推进 PrintJob 与 PracticeSet。
+		SQL: k12PrintJobsV13DDL,
+	},
+	{
+		Version:     14,
+		Description: "v0.5.0 DD-016：作品点评结构化事实持久化",
+		// 自由 Markdown 只作为兼容投影；可审计的证据引用、观察维度、限制、建议和
+		// 允许动作统一保存在 structured_feedback_json。使用探测式迁移，兼容人工
+		// 修复或半迁移数据库并保持安全重入。
+		Func: migrateK12StructuredFeedbackV14,
+	},
+	{
+		Version:     15,
+		Description: "v0.5.0 DD-020：外部模型调用账本与结果未知态",
+		// 模型调用只承诺持久账本和 outcome_unknown 收敛；领域副作用继续由
+		// GradingJob checkpoint + Outbox 提供 exactly-once 边界。
+		SQL: K12ModelInvocationsV15DDL,
+	},
+	{
+		Version:     16,
+		Description: "v0.5.0 DD-005/DD-006：链路级原子切换与增量回滚 journal",
+		SQL:         K12CutoverV16DDL,
+	},
+	{
+		Version:     17,
+		Description: "v0.5.0 DD-025：archive v3 跨 Tutor restore-as、不可变快照与追加 journal",
+		SQL:         K12RestoreAsV17DDL,
+	},
+	{
+		Version:     18,
+		Description: "v0.5.0 DD-019：K12 Webhook binding、Receipt、nonce 与审计持久化",
+		Func:        migrateK12WebhooksV18,
+	},
+	{
+		Version:     19,
+		Description: "v0.5.0 DD-010～DD-012：父子 Problem、独立 Attempt 与 raw/canonical OCR 事实",
+		SQL:         K12ProblemAttemptsDDL,
+	},
+	{
+		Version:     20,
+		Description: "v0.5.0 DD-013：作文照片 OCR Job、不可变原文与版本化家长确认",
+		Func:        migrateK12CreativeWorkOCRV20,
+	},
+	{
+		Version:     21,
+		Description: "v0.5.0 DD-024：发送到手机的持久投递回执与结果未知态",
+		// HTTP 接受只记为 sending；只有平台状态查询返回 delivered 才进入终态。
+		// payload/render/target/binding 一次冻结，使失败重试与重启对账都复用同一事实。
+		SQL: K12DeliveryReceiptsV21DDL,
+	},
+	{
+		Version:     22,
+		Description: "v0.5.0 DD-019：Webhook Receipt 安全重试证据与尝试计数",
+		// 只有应用命令明确写入 retry_safe=1 的 failed Receipt 才能重新派发；
+		// 历史数据和结果未知态默认 fail closed，避免盲目重复外部副作用。
+		Func: migrateK12WebhookRetryV22,
+	},
 }
+
+const k12PrintJobsV13DDL = `CREATE TABLE IF NOT EXISTS k12_paper_no_counters (
+    agent_name    TEXT    PRIMARY KEY REFERENCES agents(name) ON DELETE CASCADE,
+    next_sequence INTEGER NOT NULL DEFAULT 1,
+    updated_at    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS k12_print_jobs (
+    print_job_id          TEXT    PRIMARY KEY,
+    agent_name            TEXT    NOT NULL REFERENCES agents(name) ON DELETE CASCADE,
+    idempotency_key       TEXT    NOT NULL,
+    request_digest        TEXT    NOT NULL,
+    practice_set_id       TEXT    NOT NULL REFERENCES k12_practice_sets(record_id) ON DELETE CASCADE,
+    base_set_version      INTEGER NOT NULL,
+    artifact_kind         TEXT    NOT NULL,
+    artifact_id           TEXT    NOT NULL,
+    question_artifact_id  TEXT    NOT NULL,
+    answer_artifact_id    TEXT    NOT NULL,
+    paper_no              TEXT    NOT NULL DEFAULT '',
+    source_digest         TEXT    NOT NULL DEFAULT '',
+    prepared_fields_json  TEXT    NOT NULL DEFAULT '{}',
+    status                TEXT    NOT NULL DEFAULT 'preparing',
+    attempt_count         INTEGER NOT NULL DEFAULT 1,
+    native_job_id         TEXT    NOT NULL DEFAULT '',
+    native_receipt_id     TEXT    NOT NULL DEFAULT '',
+    printer_snapshot_json TEXT    NOT NULL DEFAULT '{}',
+    failure_kind          TEXT    NOT NULL DEFAULT '',
+    failure_detail        TEXT    NOT NULL DEFAULT '',
+    prepared_at           INTEGER NOT NULL,
+    printed_at            INTEGER NOT NULL DEFAULT 0,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    version               INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (agent_name, idempotency_key),
+    UNIQUE (agent_name, practice_set_id, base_set_version),
+    UNIQUE (agent_name, paper_no)
+);
+CREATE INDEX IF NOT EXISTS idx_k12_print_jobs_set
+    ON k12_print_jobs(agent_name, practice_set_id, status, updated_at);
+
+-- DD-004: 已固化卷在同一 Tutor 下也必须由数据库拒绝重复卷面号；空值是 draft。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_k12_practice_sets_paper_no
+    ON k12_practice_sets(agent_name, paper_no) WHERE paper_no != '';
+`
+
+const k12PracticeCommandsV12DDL = `CREATE TABLE IF NOT EXISTS k12_practice_return_assets (
+    set_record_id TEXT    NOT NULL REFERENCES k12_practice_sets(record_id) ON DELETE CASCADE,
+    return_index  INTEGER NOT NULL,
+    return_id     TEXT    NOT NULL,
+    asset_id      TEXT    NOT NULL,
+    item_ids_json TEXT    NOT NULL DEFAULT '[]',
+    returned_at   INTEGER NOT NULL,
+    PRIMARY KEY (set_record_id, return_id),
+    UNIQUE (set_record_id, return_index)
+);
+CREATE INDEX IF NOT EXISTS idx_k12_return_assets_set_time
+    ON k12_practice_return_assets(set_record_id, returned_at, return_index);
+
+CREATE TABLE IF NOT EXISTS k12_practice_generation_jobs (
+    generation_job_id   TEXT    PRIMARY KEY,
+    agent_name          TEXT    NOT NULL REFERENCES agents(name) ON DELETE CASCADE,
+    idempotency_key     TEXT    NOT NULL,
+    request_digest      TEXT    NOT NULL,
+    scope               TEXT    NOT NULL,
+    variants_per_source INTEGER NOT NULL,
+    difficulty          TEXT    NOT NULL,
+    total               TEXT    NOT NULL,
+    textbook            TEXT    NOT NULL DEFAULT '',
+    status              TEXT    NOT NULL DEFAULT 'queued',
+    result_set_id       TEXT    NOT NULL DEFAULT '',
+    result_item_ids_json TEXT   NOT NULL DEFAULT '[]',
+    deduplicated_count  INTEGER NOT NULL DEFAULT 0,
+    failure_reason      TEXT    NOT NULL DEFAULT '',
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    UNIQUE (agent_name, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_k12_generation_jobs_scope
+    ON k12_practice_generation_jobs(agent_name, status, updated_at);
+`
 
 // k12TypedV9SQL V9 迁移全文（建表 + 数据迁移 + 一次切换清理）。
 const k12TypedV9SQL = `
@@ -973,6 +1123,51 @@ func rebuildCronJobs(ctx context.Context, db *sql.DB, hasSpecJSON bool) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// migrateK12PracticeCommandsV12 对 ADD COLUMN 逐列探测，使 V12 在半迁移/人工修复库上
+// 也可安全重入；两张新表及索引继续使用 IF NOT EXISTS。
+func migrateK12PracticeCommandsV12(ctx context.Context, db *sql.DB) error {
+	for _, col := range []struct {
+		name string
+		def  string
+	}{
+		{"generation_job_id", "TEXT NOT NULL DEFAULT ''"},
+		{"variant_index", "INTEGER NOT NULL DEFAULT 0"},
+		{"requested_difficulty", "TEXT NOT NULL DEFAULT ''"},
+		{"actual_difficulty", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		has, err := columnExists(ctx, db, "k12_practice_set_items", col.name)
+		if err != nil {
+			return fmt.Errorf("检查 k12_practice_set_items.%s: %w", col.name, err)
+		}
+		if has {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(
+			`ALTER TABLE k12_practice_set_items ADD COLUMN %s %s`, col.name, col.def)); err != nil {
+			return fmt.Errorf("新增 k12_practice_set_items.%s: %w", col.name, err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, k12PracticeCommandsV12DDL); err != nil {
+		return fmt.Errorf("创建 K12 组卷/回传表: %w", err)
+	}
+	return nil
+}
+
+func migrateK12StructuredFeedbackV14(ctx context.Context, db *sql.DB) error {
+	has, err := columnExists(ctx, db, "k12_work_feedback", "structured_feedback_json")
+	if err != nil {
+		return fmt.Errorf("检查 k12_work_feedback.structured_feedback_json: %w", err)
+	}
+	if has {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE k12_work_feedback
+        ADD COLUMN structured_feedback_json TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("新增 k12_work_feedback.structured_feedback_json: %w", err)
+	}
+	return nil
 }
 
 func tableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {

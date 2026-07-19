@@ -11,31 +11,47 @@ package apihttp_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
 )
 
-// fakeDeliverer 记录投递内容的 IMDeliverer 假实现。
+// fakeDeliverer 记录 Receipt-first DeliveryTransport 的冻结内容。
 type fakeDeliverer struct {
 	contents []string
 	err      error
 }
 
-func (f *fakeDeliverer) DeliverText(_ context.Context, agentName, content string) (string, error) {
+func (f *fakeDeliverer) PrepareText(_ context.Context, agentName, content string) (usecase.PreparedTextDelivery, error) {
 	if f.err != nil {
-		return "", f.err
+		return usecase.PreparedTextDelivery{}, f.err
 	}
 	f.contents = append(f.contents, agentName+"|"+content)
-	return "钉钉 · 妈妈", nil
+	payload, _ := json.Marshal(map[string]string{"text": content})
+	return usecase.PreparedTextDelivery{
+		BindingID:   "agent-rule:1",
+		Target:      k12.DeliveryTarget{Platform: "dingtalk", ChatID: "staff-1", Label: "钉钉 · 妈妈"},
+		PayloadJSON: string(payload), RenderJSON: `{}`,
+	}, nil
 }
 
-func newServerWithDeliverer(t *testing.T, d apihttp.IMDeliverer) http.Handler {
+func (f *fakeDeliverer) SendPrepared(_ context.Context, _ k12.DeliveryReceipt) (usecase.DeliveryTransportAck, error) {
+	return usecase.DeliveryTransportAck{Status: k12.DeliverySending, ExternalMessageID: "pqk-test"}, nil
+}
+
+func (f *fakeDeliverer) QueryPrepared(_ context.Context, _ k12.DeliveryReceipt) (usecase.DeliveryTransportAck, error) {
+	return usecase.DeliveryTransportAck{Status: k12.DeliveryDelivered, ExternalMessageID: "pqk-test"}, nil
+}
+
+func newServerWithDeliverer(t *testing.T, d usecase.DeliveryTransport) http.Handler {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -46,11 +62,11 @@ func newServerWithDeliverer(t *testing.T, d apihttp.IMDeliverer) http.Handler {
 		t.Fatal(err)
 	}
 	db.Exec(`INSERT INTO agents(name) VALUES('mingming')`)
-	k, err := assembly.Wire(db, fakeSolveExec{})
+	k, err := assembly.Wire(db, fakeSolveExec{}, assembly.WithDeliveryTransport(d))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return apihttp.NewHandler(apihttp.Runtime{Views: k.Registry.Views, Records: k.Records, Deps: k.Deps, Deliver: d})
+	return apihttp.NewHandler(apihttp.Runtime{Views: k.Registry.Views, Records: k.Records, Deps: k.Deps})
 }
 
 // mkArtWorkWithFeedback 建一件美术作品并附点评，返回 record_id。
@@ -78,10 +94,11 @@ func TestSendWorkFeedback_DeliversViaSeam(t *testing.T) {
 	id := mkArtWorkWithFeedback(t, h, artFeedback)
 
 	rec, out := do(t, h, "POST", "/creative-works/"+id+"/send-feedback", `{"agent":"mingming"}`)
-	if rec.Code != http.StatusOK || out["ok"] != true {
+	if rec.Code != http.StatusOK || out["status"] != "sending" {
 		t.Fatalf("发送点评应 200: %d %v", rec.Code, out)
 	}
-	if out["target"] != "钉钉 · 妈妈" {
+	target, _ := out["target"].(map[string]any)
+	if target["label"] != "钉钉 · 妈妈" {
 		t.Fatalf("应回显投递目标, got %v", out["target"])
 	}
 	if len(fd.contents) != 1 || !strings.Contains(fd.contents[0], "《雨后的校园》点评要点") ||

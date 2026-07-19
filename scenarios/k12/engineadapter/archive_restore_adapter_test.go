@@ -1,6 +1,7 @@
 package engineadapter
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"path/filepath"
@@ -11,12 +12,35 @@ import (
 	"github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/curriculum"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
 
 	_ "modernc.org/sqlite"
 )
+
+func TestArchiveRestoreAdapterRestoresV3PackedAssetContent(t *testing.T) {
+	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
+	f := newArchiveRestoreFixture(t)
+	bak, image := archiveForRestoreAsWithAsset(t)
+	if err := f.restore.RestoreHexbak(context.Background(), bak); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := usecase.ReferencedHexbakAssetIDs(bak.Records)
+	if err != nil || len(refs) != 1 {
+		t.Fatalf("refs=%v err=%v", refs, err)
+	}
+	owner, file, err := assetstore.Parse(refs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := assetstore.Read(owner, file)
+	if err != nil || !bytes.Equal(got, image) {
+		t.Fatalf("restored asset=%q err=%v", got, err)
+	}
+}
 
 type archiveRestoreFixture struct {
 	db            *sql.DB

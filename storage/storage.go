@@ -12,6 +12,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 )
 
 // ErrNotFound 表示请求的资源不存在
@@ -53,21 +55,26 @@ type Session struct {
 //   - content_type 区分 text / multimodal_json
 //   - meta JSON 存储 tool_calls / reasoning_content 等结构化数据
 type MessageRecord struct {
-	ID               string `json:"id"`
-	SessionID        string `json:"session_id"`
-	ParentID         string `json:"parent_id"`
-	Role             string `json:"role"`
-	Content          string `json:"content"`
-	ContentType      string `json:"content_type"` // text / multimodal_json
-	Metadata         string `json:"metadata"`     // 旧字段（attachments 等），保持兼容
-	Feedback         string `json:"feedback"`
-	ModelName        string `json:"model_name"`
-	PromptTokens     int    `json:"prompt_tokens"`
-	CompletionTokens int    `json:"completion_tokens"`
-	FinishReason     string `json:"finish_reason"` // stop / length / tool_calls
-	LatencyMs        int    `json:"latency_ms"`
-	RequestID        string `json:"request_id"`
-	Meta             string `json:"meta"` // 扩展元数据 (tool_calls, reasoning_content 等)
+	ID        string `json:"id"`
+	SessionID string `json:"session_id"`
+	ParentID  string `json:"parent_id"`
+	Role      string `json:"role"`
+	Content   string `json:"content"`
+	// MessageContent is derived from immutable stored content at API egress.
+	// It is intentionally not a second database truth and remains nil inside
+	// storage adapters until the owning surface supplies producer metadata.
+	MessageContent   *messagecontent.MessageContent `json:"message_content,omitempty"`
+	RenderManifest   *messagecontent.RenderManifest `json:"render_manifest,omitempty"`
+	ContentType      string                         `json:"content_type"` // text / multimodal_json
+	Metadata         string                         `json:"metadata"`     // 旧字段（attachments 等），保持兼容
+	Feedback         string                         `json:"feedback"`
+	ModelName        string                         `json:"model_name"`
+	PromptTokens     int                            `json:"prompt_tokens"`
+	CompletionTokens int                            `json:"completion_tokens"`
+	FinishReason     string                         `json:"finish_reason"` // stop / length / tool_calls
+	LatencyMs        int                            `json:"latency_ms"`
+	RequestID        string                         `json:"request_id"`
+	Meta             string                         `json:"meta"` // 扩展元数据 (tool_calls, reasoning_content 等)
 	// Attachments 图片等附件的完整 JSON（base64），独立列、不受 metadata 64KB 截断（BUG-20260626）。
 	// json:"-"：不单独下发前端；读取时由 scanMessage 合并进 Metadata，保持前端读 metadata.attachments 的既有契约。
 	Attachments string    `json:"-"`

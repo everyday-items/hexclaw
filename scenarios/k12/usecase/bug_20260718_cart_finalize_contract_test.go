@@ -85,9 +85,7 @@ func TestFinalizeBasketSendRecordsDelivery(t *testing.T) {
 		t.Fatalf("发送应记 pending（不虚标 delivered）与目标，got %s/%q", v.Fields.DeliveryStatus, v.Fields.DeliveryTarget)
 	}
 	// 固化后可继续回传→复批（原有生命周期不受影响）。
-	if err := d.SubmitPracticeSet(ctx, "xiaoming", id); err != nil {
-		t.Fatalf("固化后回传: %v", err)
-	}
+	submitWholeSet(t, d, "xiaoming", id)
 	if err := d.GradePracticeSet(ctx, "xiaoming", id); err != nil {
 		t.Fatalf("复批: %v", err)
 	}

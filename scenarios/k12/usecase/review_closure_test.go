@@ -17,7 +17,13 @@ func TestReviewFlywheel_Invariants_Property(t *testing.T) {
 	d, _ := newPipeline(t, fakeSolver{}, fakeGrader{}, &fakeInsights{}) // now()=1000
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(42))
-	const cap30 = int64(30 * 86400)
+	const capV1 = int64(14 * 86400)
+	allowedV1 := map[int64]bool{
+		1 * 86400:  true,
+		3 * 86400:  true,
+		7 * 86400:  true,
+		14 * 86400: true,
+	}
 	const iterations = 400
 
 	for iter := 0; iter < iterations; iter++ {
@@ -45,9 +51,13 @@ func TestReviewFlywheel_Invariants_Property(t *testing.T) {
 			if interval < prevInterval {
 				t.Fatalf("不变量② 间隔应单调不减: %d < %d", interval, prevInterval)
 			}
-			// 不变量③：间隔封顶 30 天
-			if interval > cap30 {
-				t.Fatalf("不变量③ 间隔应封顶 30 天: %d", interval)
+			// 不变量③：v1 exact-set 只能是 1/3/7/14 天，末档封顶 14 天；
+			// 不能用旧的 30 天宽松上限放过 15/30 天策略漂移。
+			if interval > capV1 {
+				t.Fatalf("不变量③ v1 间隔应封顶 14 天: %d", interval)
+			}
+			if !allowedV1[interval] {
+				t.Fatalf("不变量③ v1 间隔漂移，必须属于 1/3/7/14 天 exact-set: %d", interval)
 			}
 			// 不变量④：due 恒在未来
 			if *got.DueAt <= 1000 {

@@ -3,14 +3,21 @@ package usecase
 import (
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/toolkit/util/idgen"
 )
+
+var ErrModelInvocationRequiresReconciliation = errors.New("model invocation requires reconciliation")
 
 // GradingOrchestrator 统一 GradingJob 编排器（架构设计 §6.7 状态机 / §6.15 单机执行模型·二阶段）。
 //
@@ -40,11 +47,16 @@ type GradingOrchestrator struct {
 	baseCtx context.Context
 	// sem 异步推进有界并发信号量。
 	sem chan struct{}
+	// anchorTimeout 锚点增强分支的独立预算（默认 60s，可通过 option 配置）。
+	anchorTimeout time.Duration
 
-	mu     sync.Mutex
-	runs   map[string]*gradingRun
-	active map[string]bool        // 在途异步推进守卫（同 Job 不并发双跑）
-	locks  map[string]*sync.Mutex // 每 Job 执行互斥：异步推进与确认/重试/读产物串行化
+	mu           sync.Mutex
+	runs         map[string]*gradingRun
+	active       map[string]bool          // 在途异步推进守卫（同 Job 不并发双跑）
+	rerun        map[string]bool          // active 期间收到续跑信号时，退出前至少再检查一次状态机
+	anchorActive map[string]bool          // 独立锚点分支守卫（外部调用不占 Job 锁）
+	anchorDone   map[string]chan struct{} // 同步入口只等待分支完成，不让模型调用占用 Job 锁
+	locks        map[string]*sync.Mutex   // 每 Job 执行互斥：状态合并/写回与确认/重试/读产物串行化
 }
 
 // jobLock 取（或建）某 Job 的执行互斥。run 内存状态与状态机写回都只在持锁下发生，
@@ -67,6 +79,11 @@ func (o *GradingOrchestrator) jobLock(jobID string) *sync.Mutex {
 type gradingRun struct {
 	agentName string
 	req       PhotoGradeRequest
+	// textOnly marks a trusted text Submission. req.Image contains only a
+	// deterministic internal pipeline token so the shared grading pipeline can
+	// keep its non-empty input invariant; it is never persisted or sent to a
+	// recognizer/annotator.
+	textOnly bool
 	// questions recognizing 阶段产物（已 Normalize、BBox 已剥离）。
 	questions []RecognizedQuestion
 	// anchored locating 并行分支成功产物；nil = 未定位（缺席或失败）。
@@ -84,8 +101,10 @@ type gradingRun struct {
 func NewGradingOrchestrator(deps Deps, snapshotFn func() k12.GradingModelSnapshot, opts ...GradingOrchestratorOption) *GradingOrchestrator {
 	o := &GradingOrchestrator{
 		deps: deps, snapshotFn: snapshotFn,
-		runs: map[string]*gradingRun{}, active: map[string]bool{}, locks: map[string]*sync.Mutex{},
+		runs: map[string]*gradingRun{}, active: map[string]bool{}, rerun: map[string]bool{},
+		anchorActive: map[string]bool{}, anchorDone: map[string]chan struct{}{}, locks: map[string]*sync.Mutex{},
 		sem: make(chan struct{}, 2), baseCtx: context.Background(),
+		anchorTimeout: time.Duration(k12.GradingAnchorTimeoutSeconds) * time.Second,
 	}
 	for _, opt := range opts {
 		opt(o)
@@ -159,6 +178,9 @@ func (o *GradingOrchestrator) runLoop(ctx context.Context, run *gradingRun, jobI
 		if err != nil {
 			return GradingJobView{}, err
 		}
+		// DD-018: every model boundary receives the immutable route stored on
+		// this Job. Mutable global defaults are only consulted for new Jobs.
+		ctx = k12.WithGradingModelSnapshot(ctx, v.Fields.ModelSnapshot)
 		switch v.Record.Status {
 		case k12.GradingStageQueued:
 			// 起跑/恢复：AdvanceGradingStage(ok) 落到最近成功检查点的后继（规则 3/6）。
@@ -176,14 +198,10 @@ func (o *GradingOrchestrator) runLoop(ctx context.Context, run *gradingRun, jobI
 				return v, err
 			}
 		case k12.GradingStageAwaitingConfirmation:
-			// 规则 1：锚点是与确认并行的增强分支。识别一到位就先把锚点跑掉再停——
-			// 单机顺序编排下这等价于「并行启动、确认前汇合」，且保证 Confirm 命令
-			// 到达时 anchor_state 必已回位（located/degraded），不会卡等待。
+			// 规则 1：识别冻结后，确认与锚点是两个独立分支。锚点模型调用在 Job 锁外
+			// 异步执行，主链立即返回确认停点；二者任意顺序到达，均由状态机显式汇合。
 			if v.Fields.AnchorState == k12.GradingAnchorPending {
-				if v, err = o.runAnchor(ctx, run, jobID); err != nil {
-					return v, err
-				}
-				continue
+				o.startAnchorAsync(jobID, run, v.Fields.ModelSnapshot)
 			}
 			// 停点：等家长确认（规则 7 不自动过期）。ConfirmAndRun 续跑。
 			return v, nil
@@ -214,11 +232,49 @@ func (o *GradingOrchestrator) ConfirmAndRun(ctx context.Context, jobID string, c
 	}
 	l := o.jobLock(jobID)
 	l.Lock()
-	defer l.Unlock()
-	if _, err := o.deps.ConfirmGradingJob(ctx, run.agentName, jobID, corrections); err != nil {
+	candidate := *run
+	candidate.questions = cloneRecognizedQuestions(run.questions)
+	candidate.anchored = cloneRecognizedQuestions(run.anchored)
+	if err := applyAndValidateGradingConfirmation(&candidate, ConfirmPhotoGradingInput{}); err != nil {
+		l.Unlock()
 		return GradingJobView{}, err
 	}
-	return o.runLoop(ctx, run, jobID)
+	if err := o.persistRun(jobID, &candidate); err != nil {
+		l.Unlock()
+		return GradingJobView{}, fmt.Errorf("usecase: 固化确认后的识别产物: %w", err)
+	}
+	digestInputs := []string{"canonical-recognition:" + CanonicalRecognizedQuestionsDigest(candidate.questions)}
+	// 旧同步入口的自由文本只留作审计附录；结论身份始终由 canonical digest 决定。
+	for _, correction := range corrections {
+		digestInputs = append(digestInputs, "legacy-note:"+correction)
+	}
+	if _, err := o.deps.ConfirmGradingJob(ctx, run.agentName, jobID, digestInputs); err != nil {
+		l.Unlock()
+		return GradingJobView{}, err
+	}
+	run.questions = candidate.questions
+	run.anchored = candidate.anchored
+	for {
+		v, err := o.runLoop(ctx, run, jobID)
+		if err != nil || v.Record.Status != k12.GradingStageAwaitingConfirmation ||
+			v.Fields.ConfirmationState != k12.GradingConfirmationConfirmed ||
+			v.Fields.AnchorState != k12.GradingAnchorPending {
+			l.Unlock()
+			return v, err
+		}
+		// IM 等同步入口保留“确认并跑完”的语义，但先释放 Job 锁再等 anchor：确认已经
+		// 持久化，HTTP/桌面读写不被模型延迟阻塞；锚点回位后重新读状态机继续主链。
+		done := o.anchorDoneChannel(jobID)
+		l.Unlock()
+		if done != nil {
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return GradingJobView{}, ctx.Err()
+			}
+		}
+		l.Lock()
+	}
 }
 
 // RetryAndRun 安全重试（公共命令④）后从最近检查点续跑（规则 3）。
@@ -250,13 +306,23 @@ func (o *GradingOrchestrator) PhotoResult(jobID string) (PhotoGradeResult, bool)
 	return *run.result, true
 }
 
-// ReleaseGradingRun 投递完成后释放进程内运行时状态与落盘产物
-// （检查点已在 Job 持久化，摘要不丢；终态任务不再需要恢复载体）。
+// ReleaseGradingRun 投递完成后释放进程内运行时与原图/结果临时产物；识别阶段的
+// raw/canonical/结构/确认原因先写只追加审计归档，DD-012 要求 raw 不随任务清理消失。
 func (o *GradingOrchestrator) ReleaseGradingRun(jobID string) {
 	o.mu.Lock()
+	run := o.runs[jobID]
 	delete(o.runs, jobID)
+	delete(o.active, jobID)
+	delete(o.rerun, jobID)
+	delete(o.anchorActive, jobID)
+	delete(o.anchorDone, jobID)
 	delete(o.locks, jobID)
 	o.mu.Unlock()
+	if err := o.archiveRecognitionFacts(jobID, run); err != nil {
+		// 归档失败时保留原 run 目录；宁可暂不回收原图，也不能违反 raw 永久留存。
+		slog.Error("K12 识别事实终态归档失败（保留原运行目录）", "job", jobID, "err", err)
+		return
+	}
 	o.releaseRunFiles(jobID)
 }
 
@@ -265,12 +331,43 @@ func (o *GradingOrchestrator) ReleaseGradingRun(jobID string) {
 // runRecognize recognizing 阶段：调现有识题用例（公开入口），成功写检查点进
 // awaiting_confirmation；失败按 retryable 语义落 failed_*（规则 4）并原样返回下游错误。
 func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun, jobID string) (GradingJobView, error) {
-	questions, err := o.deps.RecognizeHomework(ctx, run.req.Image)
-	if err == nil && len(questions) == 0 {
-		// 与 GradeHomeworkPhoto 同口径：空清单是输入问题，不可重试。
-		err = fmt.Errorf("%w: 未识别到可处理的题目", ErrInvalidInput)
-	}
+	job, err := o.deps.GetGradingJob(ctx, run.agentName, jobID)
 	if err != nil {
+		return GradingJobView{}, err
+	}
+	invocation, err := o.beginModelInvocation(ctx, job, k12.GradingStageRecognizing,
+		modelInvocationDigest([]byte(k12.GradingStageRecognizing), run.req.Image))
+	if err != nil {
+		if recovered, v, recoverErr := o.recoverRecognizeInvocation(ctx, run, jobID, invocation); recovered {
+			return v, recoverErr
+		}
+		if invocation.Status == k12.ModelInvocationSent {
+			invocation, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx),
+				run.agentName, invocation.InvocationID, "recovered_after_send")
+		}
+		unknown, advanceErr := o.markGradingOutcomeUnknown(ctx, run, jobID, "invocation_reconciliation_required")
+		if advanceErr != nil {
+			return unknown, advanceErr
+		}
+		return unknown, err
+	}
+	questions, err := o.deps.RecognizeHomework(ctx, run.req.Image)
+	if err != nil {
+		if invocationOutcomeUnknown(err) {
+			_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), run.agentName, invocation.InvocationID, "provider_outcome_unknown")
+			v, aerr := o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run, jobID, "provider_outcome_unknown")
+			if aerr != nil {
+				return v, aerr
+			}
+			return v, err
+		}
+		if _, ledgerErr := o.deps.Records.MarkModelInvocationFailed(context.WithoutCancel(ctx), run.agentName, invocation.InvocationID, "recognize_failed"); ledgerErr != nil {
+			v, aerr := o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run, jobID, "invocation_ledger_write_failed")
+			if aerr != nil {
+				return v, aerr
+			}
+			return v, ledgerErr
+		}
 		v, aerr := o.deps.AdvanceGradingStage(ctx, run.agentName, jobID, AdvanceGradingInput{
 			Outcome:     GradingOutcomeFailed,
 			FailureKind: "recognize_failed",
@@ -281,42 +378,218 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 		}
 		return v, err
 	}
-	run.questions = questions
+	if len(questions) == 0 {
+		_, _ = o.deps.Records.MarkModelInvocationSucceeded(context.WithoutCancel(ctx), run.agentName,
+			invocation.InvocationID, modelInvocationResultDigest(questions), "")
+		err = fmt.Errorf("%w: 未识别到可处理的题目", ErrInvalidInput)
+		v, aerr := o.deps.AdvanceGradingStage(ctx, run.agentName, jobID, AdvanceGradingInput{
+			Outcome: GradingOutcomeFailed, FailureKind: "recognize_empty", Retryable: false,
+		})
+		if aerr != nil {
+			return v, aerr
+		}
+		return v, err
+	}
+	run.questions, err = NormalizeRecognizedProblems(job.Fields.SubmissionID, cloneRecognizedQuestions(questions))
+	if err != nil {
+		_, _ = o.deps.Records.MarkModelInvocationSucceeded(context.WithoutCancel(ctx), run.agentName,
+			invocation.InvocationID, modelInvocationResultDigest(questions), "")
+		v, aerr := o.deps.AdvanceGradingStage(ctx, run.agentName, jobID, AdvanceGradingInput{
+			Outcome: GradingOutcomeFailed, FailureKind: "recognize_structure_invalid", Retryable: false,
+		})
+		if aerr != nil {
+			return v, aerr
+		}
+		return v, err
+	}
+	for i := range run.questions {
+		// 核心识别冻结事实不接纳 geometry；BBox 只能由独立 anchor 分支补入。
+		run.questions[i].BBox = nil
+	}
+	if perr := o.persistProblemAttemptFacts(ctx, run.agentName, job.Fields.SubmissionID, run.questions); perr != nil {
+		_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), run.agentName,
+			invocation.InvocationID, "typed_result_not_durable")
+		v, aerr := o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run, jobID, "typed_result_not_durable")
+		if aerr != nil {
+			return v, aerr
+		}
+		return v, perr
+	}
 	// 先固化产物再写检查点（§6.15：检查点存在即产物可回放，崩溃窗口不产生"有检查点无产物"）。
 	if perr := o.persistRun(jobID, run); perr != nil {
-		return o.failStage(ctx, run, jobID, "persist_failed", perr)
+		_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), run.agentName,
+			invocation.InvocationID, "result_not_durable")
+		v, aerr := o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run, jobID, "result_not_durable")
+		if aerr != nil {
+			return v, aerr
+		}
+		return v, perr
+	}
+	if _, err := o.deps.Records.MarkModelInvocationSucceeded(context.WithoutCancel(ctx), run.agentName,
+		invocation.InvocationID, modelInvocationResultDigest(run.questions), ""); err != nil {
+		v, aerr := o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run, jobID, "invocation_ledger_write_failed")
+		if aerr != nil {
+			return v, aerr
+		}
+		return v, err
 	}
 	return o.advanceOK(ctx, run, jobID, fmt.Sprintf("questions:%d", len(questions)))
 }
 
-// runAnchor locating 并行分支：锚点回位 located / degraded（规则 1）。失败或能力缺席
-// 显式 degraded（§4.9 无坐标文字降级），绝不阻塞确认与批改。
-func (o *GradingOrchestrator) runAnchor(ctx context.Context, run *gradingRun, jobID string) (GradingJobView, error) {
-	state, digest := k12.GradingAnchorDegraded, "anchor:absent"
-	if o.deps.AnswerAnchorer != nil && hasAnswerCandidate(run.questions) {
-		anchored, err := o.deps.AnchorHomeworkAnswers(ctx, run.req.Image, run.questions)
-		if err != nil {
-			run.anchorFailed = true
-			digest = "anchor:failed"
-		} else {
-			run.anchored = anchored
-			state, digest = k12.GradingAnchorLocated, "anchor:located"
+// startAnchorAsync 启动 locating 独立分支。昂贵的模型调用不持 Job 锁，因此家长确认可
+// 同时持久化；只有几何合并、run 落盘与 anchor 检查点写回在 Job 锁内串行化。
+func (o *GradingOrchestrator) startAnchorAsync(jobID string, run *gradingRun, snapshot k12.GradingModelSnapshot) {
+	o.mu.Lock()
+	if o.anchorActive == nil {
+		o.anchorActive = map[string]bool{}
+	}
+	if o.anchorActive[jobID] {
+		o.mu.Unlock()
+		return
+	}
+	o.anchorActive[jobID] = true
+	done := make(chan struct{})
+	if o.anchorDone == nil {
+		o.anchorDone = map[string]chan struct{}{}
+	}
+	o.anchorDone[jobID] = done
+	o.mu.Unlock()
+
+	image := append([]byte(nil), run.req.Image...)
+	frozen := cloneRecognizedQuestions(run.questions)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("K12 批改任务锚点分支 panic（任务保留 anchor pending）", "job", jobID, "panic", r)
+			}
+			o.mu.Lock()
+			delete(o.anchorActive, jobID)
+			if current := o.anchorDone[jobID]; current == done {
+				delete(o.anchorDone, jobID)
+				close(done)
+			}
+			o.mu.Unlock()
+		}()
+
+		anchored, state, digest, failed := o.executeAnchor(jobID, run.agentName, image, frozen, snapshot)
+		ctx := o.gradingBaseContext()
+		l := o.jobLock(jobID)
+		l.Lock()
+		v, err := o.deps.GetGradingJob(ctx, run.agentName, jobID)
+		if err != nil || v.Fields.AnchorState != k12.GradingAnchorPending ||
+			(v.Record.Status != k12.GradingStageAwaitingConfirmation && v.Record.Status != k12.GradingStageLocating) {
+			l.Unlock()
+			return
 		}
+		run.anchorFailed = failed
+		if state == k12.GradingAnchorLocated {
+			// Adapter 只拥有 geometry 权限：以当前 canonical（可能已被家长确认修正）为底，
+			// 按索引拷贝 BBox，绝不接纳题干/答案/作答态/学科/知识点的反向覆盖。
+			run.anchored = mergeAnchorGeometry(run.questions, anchored)
+		} else {
+			run.anchored = nil
+		}
+		facts := run.questions
+		if run.anchored != nil {
+			facts = run.anchored
+		}
+		if err = o.persistProblemAttemptFacts(ctx, run.agentName, v.Fields.SubmissionID, facts); err == nil {
+			err = o.persistRun(jobID, run)
+		}
+		if err == nil {
+			v, err = o.deps.AdvanceGradingStage(ctx, run.agentName, jobID, AdvanceGradingInput{
+				Outcome: GradingOutcomeAnchor, AnchorState: state, ArtifactDigest: digest,
+			})
+		}
+		l.Unlock()
+		if err != nil {
+			slog.Warn("K12 批改任务锚点结果写回失败（保留当前状态供恢复）", "job", jobID, "err", err)
+			return
+		}
+		if v.Record.Status == k12.GradingStageAssessing {
+			o.StartAsync(jobID)
+		}
+	}()
+}
+
+func (o *GradingOrchestrator) anchorDoneChannel(jobID string) <-chan struct{} {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.anchorDone[jobID]
+}
+
+// executeAnchor 只包围锚点外部调用的 deadline。超时是可审计的 degraded，而不是任务失败；
+// 后续仍使用冻结的文字事实完成 assessing/rendering/projecting。
+func (o *GradingOrchestrator) executeAnchor(jobID, agentName string, image []byte, frozen []RecognizedQuestion, snapshot k12.GradingModelSnapshot) ([]RecognizedQuestion, string, string, bool) {
+	if o.deps.AnswerAnchorer == nil || !hasAnswerCandidate(frozen) {
+		return nil, k12.GradingAnchorDegraded, "anchor:absent", false
 	}
-	if perr := o.persistRun(jobID, run); perr != nil {
-		// 锚点回位发生在 awaiting_confirmation/locating：无失败转移边，保持 anchor pending
-		// 原样返回错误——下次推进重跑锚点分支（幂等）。
-		return GradingJobView{}, fmt.Errorf("usecase: 固化锚点产物: %w", perr)
+	ctx := k12.WithGradingModelSnapshot(o.gradingBaseContext(), snapshot)
+	ctx, cancel := context.WithTimeout(ctx, o.anchorTimeout)
+	job, err := o.deps.GetGradingJob(ctx, agentName, jobID)
+	if err != nil {
+		cancel()
+		return nil, k12.GradingAnchorDegraded, "anchor:ledger_job_missing", true
 	}
-	return o.deps.AdvanceGradingStage(ctx, run.agentName, jobID, AdvanceGradingInput{
-		Outcome: GradingOutcomeAnchor, AnchorState: state, ArtifactDigest: digest,
-	})
+	requestRaw, _ := json.Marshal(struct {
+		ImageDigest string               `json:"image_digest"`
+		Questions   []RecognizedQuestion `json:"questions"`
+	}{modelInvocationDigest(image), frozen})
+	invocation, err := o.beginModelInvocation(ctx, job, k12.GradingStageLocating,
+		modelInvocationDigest([]byte(k12.GradingStageLocating), requestRaw))
+	if err != nil {
+		cancel()
+		return nil, k12.GradingAnchorDegraded, "anchor:outcome_unknown", true
+	}
+	anchored, err := o.deps.AnchorHomeworkAnswers(ctx, image, frozen)
+	ctxErr := ctx.Err()
+	cancel()
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctxErr, context.DeadlineExceeded) {
+		_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), agentName,
+			invocation.InvocationID, "provider_outcome_unknown")
+		return nil, k12.GradingAnchorDegraded, "anchor:timeout", true
+	}
+	if err != nil {
+		_, _ = o.deps.Records.MarkModelInvocationFailed(context.WithoutCancel(ctx), agentName,
+			invocation.InvocationID, "anchor_failed")
+		return nil, k12.GradingAnchorDegraded, "anchor:failed", true
+	}
+	if _, err := o.deps.Records.MarkModelInvocationSucceeded(context.WithoutCancel(ctx), agentName,
+		invocation.InvocationID, modelInvocationResultDigest(anchored), ""); err != nil {
+		return nil, k12.GradingAnchorDegraded, "anchor:ledger_write_failed", true
+	}
+	return anchored, k12.GradingAnchorLocated, "anchor:located", false
 }
 
 // runAssess assessing 阶段：复用识别/锚点检查点产物调 GradeHomeworkPhoto（公开入口）——
 // 分流、证据门禁、逐题批改、错题入库、批注渲染、Markdown 汇总全走现网实现。
 // 渲染结果由 recordingAnnotator 捕获，rendering 阶段据此推进/降级。
 func (o *GradingOrchestrator) runAssess(ctx context.Context, run *gradingRun, jobID string) (GradingJobView, error) {
+	job, err := o.deps.GetGradingJob(ctx, run.agentName, jobID)
+	if err != nil {
+		return GradingJobView{}, err
+	}
+	requestRaw, _ := json.Marshal(struct {
+		Request   PhotoGradeRequest    `json:"request"`
+		Questions []RecognizedQuestion `json:"questions"`
+		Anchored  []RecognizedQuestion `json:"anchored,omitempty"`
+	}{run.req, run.questions, run.anchored})
+	invocation, err := o.beginModelInvocation(ctx, job, k12.GradingStageAssessing,
+		modelInvocationDigest([]byte(k12.GradingStageAssessing), requestRaw))
+	if err != nil {
+		if recovered, v, recoverErr := o.recoverAssessInvocation(ctx, run, jobID, invocation); recovered {
+			return v, recoverErr
+		}
+		if invocation.Status == k12.ModelInvocationSent {
+			invocation, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx),
+				run.agentName, invocation.InvocationID, "recovered_after_send")
+		}
+		unknown, advanceErr := o.markGradingOutcomeUnknown(ctx, run, jobID, "invocation_reconciliation_required")
+		if advanceErr != nil {
+			return unknown, advanceErr
+		}
+		return unknown, err
+	}
 	assessDeps := o.deps
 	// 预置识别产物：识别模型不二次调用（规则 3 禁止重复调模型）。
 	assessDeps.Recognizer = presetRecognizer{questions: run.questions}
@@ -331,13 +604,33 @@ func (o *GradingOrchestrator) runAssess(ctx context.Context, run *gradingRun, jo
 		assessDeps.AnswerAnchorer = nil
 	}
 	var recorder *recordingAnnotator
-	if o.deps.PhotoAnnotator != nil {
+	if run.textOnly {
+		// The deterministic text pipeline token is an internal invariant marker,
+		// never user media. Fail closed even if a restored/legacy checkpoint
+		// unexpectedly carries coordinates.
+		assessDeps.PhotoAnnotator = nil
+	} else if o.deps.PhotoAnnotator != nil {
 		recorder = &recordingAnnotator{inner: o.deps.PhotoAnnotator}
 		assessDeps.PhotoAnnotator = recorder
 	}
 
 	result, err := assessDeps.GradeHomeworkPhoto(ctx, run.req)
 	if err != nil {
+		if invocationOutcomeUnknown(err) {
+			_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), run.agentName, invocation.InvocationID, "provider_outcome_unknown")
+			v, aerr := o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run, jobID, "provider_outcome_unknown")
+			if aerr != nil {
+				return v, aerr
+			}
+			return v, err
+		}
+		if _, ledgerErr := o.deps.Records.MarkModelInvocationFailed(context.WithoutCancel(ctx), run.agentName, invocation.InvocationID, "assess_failed"); ledgerErr != nil {
+			v, aerr := o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run, jobID, "invocation_ledger_write_failed")
+			if aerr != nil {
+				return v, aerr
+			}
+			return v, ledgerErr
+		}
 		v, aerr := o.deps.AdvanceGradingStage(ctx, run.agentName, jobID, AdvanceGradingInput{
 			Outcome:     GradingOutcomeFailed,
 			FailureKind: "assess_failed",
@@ -354,7 +647,21 @@ func (o *GradingOrchestrator) runAssess(ctx context.Context, run *gradingRun, jo
 		run.renderFailure = recorder.failure
 	}
 	if perr := o.persistRun(jobID, run); perr != nil {
-		return o.failStage(ctx, run, jobID, "persist_failed", perr)
+		_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), run.agentName,
+			invocation.InvocationID, "result_not_durable")
+		v, aerr := o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run, jobID, "result_not_durable")
+		if aerr != nil {
+			return v, aerr
+		}
+		return v, perr
+	}
+	if _, err := o.deps.Records.MarkModelInvocationSucceeded(context.WithoutCancel(ctx), run.agentName,
+		invocation.InvocationID, modelInvocationResultDigest(result), ""); err != nil {
+		v, aerr := o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run, jobID, "invocation_ledger_write_failed")
+		if aerr != nil {
+			return v, aerr
+		}
+		return v, err
 	}
 	return o.advanceOK(ctx, run, jobID, fmt.Sprintf("items:%d mode:%s", len(result.Items), result.Mode))
 }
@@ -435,9 +742,150 @@ func hasAnswerCandidate(questions []RecognizedQuestion) bool {
 	return false
 }
 
+func cloneRecognizedQuestions(questions []RecognizedQuestion) []RecognizedQuestion {
+	if questions == nil {
+		return nil
+	}
+	out := make([]RecognizedQuestion, len(questions))
+	for i, question := range questions {
+		out[i] = question
+		out[i].KnowledgePoints = append([]string(nil), question.KnowledgePoints...)
+		out[i].OCRSignals = append([]string(nil), question.OCRSignals...)
+		out[i].EvidenceTranscriptions = append([]string(nil), question.EvidenceTranscriptions...)
+		out[i].AnswerEvidenceTranscriptions = append([]string(nil), question.AnswerEvidenceTranscriptions...)
+		out[i].ConfirmationReasons = append([]OCRRiskReason(nil), question.ConfirmationReasons...)
+		if question.RecognitionConfidence != nil {
+			confidence := *question.RecognitionConfidence
+			out[i].RecognitionConfidence = &confidence
+		}
+		if question.BBox != nil {
+			box := *question.BBox
+			out[i].BBox = &box
+		}
+	}
+	return out
+}
+
+// mergeAnchorGeometry 以 canonical 为唯一事实源，仅允许 anchor 输出补充对应题目的 BBox。
+func mergeAnchorGeometry(canonical, anchored []RecognizedQuestion) []RecognizedQuestion {
+	out := cloneRecognizedQuestions(canonical)
+	byProblemID := make(map[string]*BBox, len(anchored))
+	for i := range anchored {
+		if anchored[i].ProblemID != "" && anchored[i].BBox != nil {
+			byProblemID[anchored[i].ProblemID] = anchored[i].BBox
+		}
+	}
+	for i := range out {
+		out[i].BBox = nil
+		var source *BBox
+		if out[i].ProblemID != "" {
+			source = byProblemID[out[i].ProblemID]
+		} else if i < len(anchored) {
+			// 仅为老的、尚未分配 ProblemID 的内存值对象保留索引兼容；正式 Job
+			// 在调用 anchor 前已经冻结 ID，不能因返回顺序变化串到兄弟题。
+			source = anchored[i].BBox
+		}
+		if source == nil {
+			continue
+		}
+		switch NormalizeRecognizedQuestion(out[i]).AnswerState {
+		case AnswerStatePresent, AnswerStateUnclear:
+			box := *source
+			out[i].BBox = &box
+		}
+	}
+	return out
+}
+
 func shortSHA1(b []byte) string {
 	sum := sha1.Sum(b)
 	return hex.EncodeToString(sum[:8])
+}
+
+func modelInvocationDigest(parts ...[]byte) string {
+	h := sha256.New()
+	for _, part := range parts {
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write(part)
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+func modelInvocationResultDigest(value any) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return modelInvocationDigest([]byte(fmt.Sprintf("%#v", value)))
+	}
+	return modelInvocationDigest(raw)
+}
+
+func invocationOutcomeUnknown(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrModelInvocationRequiresReconciliation)
+}
+
+func (o *GradingOrchestrator) beginModelInvocation(ctx context.Context, job GradingJobView, stage, requestDigest string) (k12.ModelInvocation, error) {
+	invocation, _, err := o.deps.Records.PrepareModelInvocation(ctx, k12.ModelInvocation{
+		InvocationID: "modelinv-" + idgen.ShortID(), AgentName: job.Record.AgentName,
+		JobID: job.Record.RecordID, Stage: stage, RequestDigest: requestDigest,
+		RouteSnapshot: job.Fields.ModelSnapshot, Attempt: job.Fields.AttemptCount + 1,
+		CreatedAt: o.deps.now(), UpdatedAt: o.deps.now(),
+	})
+	if err != nil {
+		return k12.ModelInvocation{}, err
+	}
+	switch invocation.Status {
+	case k12.ModelInvocationPrepared:
+		return o.deps.Records.MarkModelInvocationSent(ctx, invocation.AgentName, invocation.InvocationID, "")
+	case k12.ModelInvocationSent, k12.ModelInvocationSucceeded, k12.ModelInvocationOutcomeUnknown,
+		k12.ModelInvocationReconciled:
+		return invocation, fmt.Errorf("%w: invocation=%s status=%s", ErrModelInvocationRequiresReconciliation,
+			invocation.InvocationID, invocation.Status)
+	default:
+		return invocation, fmt.Errorf("%w: invocation=%s unexpected status=%s", ErrModelInvocationRequiresReconciliation,
+			invocation.InvocationID, invocation.Status)
+	}
+}
+
+func (o *GradingOrchestrator) recoverRecognizeInvocation(ctx context.Context, run *gradingRun, jobID string, invocation k12.ModelInvocation) (bool, GradingJobView, error) {
+	if (invocation.Status != k12.ModelInvocationSent && invocation.Status != k12.ModelInvocationSucceeded) || len(run.questions) == 0 {
+		return false, GradingJobView{}, nil
+	}
+	digest := modelInvocationResultDigest(run.questions)
+	if invocation.Status == k12.ModelInvocationSucceeded && invocation.ResultDigest != digest {
+		return false, GradingJobView{}, nil
+	}
+	if invocation.Status == k12.ModelInvocationSent {
+		if _, err := o.deps.Records.MarkModelInvocationSucceeded(context.WithoutCancel(ctx), run.agentName,
+			invocation.InvocationID, digest, ""); err != nil {
+			return true, GradingJobView{}, err
+		}
+	}
+	v, err := o.advanceOK(ctx, run, jobID, fmt.Sprintf("questions:%d", len(run.questions)))
+	return true, v, err
+}
+
+func (o *GradingOrchestrator) recoverAssessInvocation(ctx context.Context, run *gradingRun, jobID string, invocation k12.ModelInvocation) (bool, GradingJobView, error) {
+	if (invocation.Status != k12.ModelInvocationSent && invocation.Status != k12.ModelInvocationSucceeded) || run.result == nil {
+		return false, GradingJobView{}, nil
+	}
+	digest := modelInvocationResultDigest(*run.result)
+	if invocation.Status == k12.ModelInvocationSucceeded && invocation.ResultDigest != digest {
+		return false, GradingJobView{}, nil
+	}
+	if invocation.Status == k12.ModelInvocationSent {
+		if _, err := o.deps.Records.MarkModelInvocationSucceeded(context.WithoutCancel(ctx), run.agentName,
+			invocation.InvocationID, digest, ""); err != nil {
+			return true, GradingJobView{}, err
+		}
+	}
+	v, err := o.advanceOK(ctx, run, jobID, fmt.Sprintf("items:%d mode:%s", len(run.result.Items), run.result.Mode))
+	return true, v, err
+}
+
+func (o *GradingOrchestrator) markGradingOutcomeUnknown(ctx context.Context, run *gradingRun, jobID, failureKind string) (GradingJobView, error) {
+	return o.deps.AdvanceGradingStage(ctx, run.agentName, jobID, AdvanceGradingInput{
+		Outcome: GradingOutcomeUnknown, FailureKind: failureKind,
+	})
 }
 
 // presetRecognizer 回放 recognizing 阶段已固化的识别产物（不再调识别模型）。

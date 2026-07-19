@@ -47,9 +47,17 @@ func TestPracticeSetHTTPLifecycle(t *testing.T) {
 	if set["question_artifact_id"] == "" || set["answer_artifact_id"] == "" {
 		t.Fatalf("固化后应生成题目卷+答案卷: %v", set)
 	}
+	items := set["items"].([]any)
+	returnItemID := items[0].(map[string]any)["item_id"].(string)
+	assetID := saveHTTPReturnAsset(t, "mingming")
+	rec, submitted := do(t, h, "POST", "/practice-sets/"+id+"/submit",
+		`{"agent":"mingming","return_id":"return-lifecycle","asset_id":"`+assetID+`","item_ids":["`+returnItemID+`"]}`)
+	if rec.Code != http.StatusOK || submitted["status"] != "submitted" {
+		t.Fatalf("带照片证据回传应到 submitted: code=%d %v", rec.Code, submitted)
+	}
 
 	for _, step := range []struct{ path, want string }{
-		{"/submit", "submitted"}, {"/grade", "graded"}, {"/close", "closed"},
+		{"/grade", "graded"}, {"/close", "closed"},
 	} {
 		rec, r := do(t, h, "POST", "/practice-sets/"+id+step.path, `{"agent":"mingming"}`)
 		if rec.Code != http.StatusOK || r["status"] != step.want {

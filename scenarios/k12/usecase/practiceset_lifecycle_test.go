@@ -23,6 +23,8 @@ func newDataDeps(t *testing.T, agents ...string) usecase.Deps {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// SQLite :memory: 是逐连接数据库；固定单连接，确保并发命令测试共享同一 schema/事务事实。
+	db.SetMaxOpenConns(1)
 	t.Cleanup(func() { db.Close() })
 	if err := migrate.Run(context.Background(), db, migrate.All); err != nil {
 		t.Fatal(err)
@@ -95,9 +97,7 @@ func TestPracticeSetFullLifecycle(t *testing.T) {
 		t.Fatal("题目卷与答案卷必须分离")
 	}
 
-	if err := d.SubmitPracticeSet(ctx, "xiaoming", id); err != nil {
-		t.Fatalf("回传: %v", err)
-	}
+	submitWholeSet(t, d, "xiaoming", id)
 	if err := d.GradePracticeSet(ctx, "xiaoming", id); err != nil {
 		t.Fatalf("复批: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestPracticeSetCancel(t *testing.T) {
 	if _, _, err := d.FinalizeBasket(ctx, "xiaoming", id2, "send", "t"); err != nil {
 		t.Fatalf("固化: %v", err)
 	}
-	d.SubmitPracticeSet(ctx, "xiaoming", id2)
+	submitWholeSet(t, d, "xiaoming", id2)
 	d.GradePracticeSet(ctx, "xiaoming", id2)
 	if err := d.CancelPracticeSet(ctx, "xiaoming", id2); err == nil {
 		t.Fatal("graded 态不应可取消")

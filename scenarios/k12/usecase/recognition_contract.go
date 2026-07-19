@@ -1,0 +1,598 @@
+package usecase
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+)
+
+// ProblemKind 描述识别题目的结构身份。compound_parent 只保存公共题干，不产生
+// Attempt/Assessment；subproblem 保存增量题干并独立确认、定位和批改。
+type ProblemKind string
+
+const (
+	ProblemKindStandalone     ProblemKind = "standalone"
+	ProblemKindCompoundParent ProblemKind = "compound_parent"
+	ProblemKindSubproblem     ProblemKind = "subproblem"
+)
+
+// OCRRiskReason 是跨 Desktop/API 可稳定判断的确认原因码，不把模型自然语言当协议。
+type OCRRiskReason string
+
+const (
+	OCRRiskFraction            OCRRiskReason = "fraction"
+	OCRRiskDecimalPoint        OCRRiskReason = "decimal_point"
+	OCRRiskNegativeSign        OCRRiskReason = "negative_sign"
+	OCRRiskUnit                OCRRiskReason = "unit"
+	OCRRiskErasure             OCRRiskReason = "erasure"
+	OCRRiskEvidenceConflict    OCRRiskReason = "evidence_conflict"
+	OCRRiskLowConfidence       OCRRiskReason = "low_confidence"
+	OCRRiskUnclearHandwriting  OCRRiskReason = "unclear_handwriting"
+	OCRRiskSubjectUndetermined OCRRiskReason = "subject_undetermined"
+	OCRRiskCanonicalInvalid    OCRRiskReason = "canonical_parse_failed"
+)
+
+const ocrConfidenceConfirmationThreshold = 0.90
+
+var (
+	fractionRiskPattern = regexp.MustCompile(`(?i)\\frac\s*\{|\d+\s*/\s*\d+|[零〇一二两三四五六七八九十百]+\s*分之\s*[零〇一二两三四五六七八九十百]+`)
+	decimalRiskPattern  = regexp.MustCompile(`\d[.．]\d`)
+	negativeRiskPattern = regexp.MustCompile(`(?:^|[=(（+×÷*/\s])[-−]\s*\d`)
+	unitRiskPattern     = regexp.MustCompile(`(?i)\d(?:[\d.]*\d)?\s*(?:mm|cm|dm|km|mg|kg|ml|mL|L|m²|cm²|m³|cm³|毫米|厘米|分米|千米|米|毫克|克|千克|毫升|升|平方米|平方厘米|立方米|立方厘米)(?:\b|$|[^[:alpha:]])`)
+	latexFraction       = regexp.MustCompile(`\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}`)
+)
+
+var ocrReasonOrder = []OCRRiskReason{
+	OCRRiskFraction,
+	OCRRiskDecimalPoint,
+	OCRRiskNegativeSign,
+	OCRRiskUnit,
+	OCRRiskErasure,
+	OCRRiskEvidenceConflict,
+	OCRRiskLowConfidence,
+	OCRRiskUnclearHandwriting,
+	OCRRiskSubjectUndetermined,
+	OCRRiskCanonicalInvalid,
+}
+
+// EvaluateOCRConfirmationRisk 以确定性规则生成确认原因。模型即使自报高置信度，也不能
+// 绕过分数、单位、负号、小数点、涂改或多证据冲突等格式门。
+func EvaluateOCRConfirmationRisk(q RecognizedQuestion) RecognizedQuestion {
+	q = normalizeRecognizedQuestionFacts(q)
+	reasons := make(map[OCRRiskReason]struct{}, len(q.ConfirmationReasons)+4)
+	for _, reason := range q.ConfirmationReasons {
+		if knownOCRRiskReason(reason) {
+			reasons[reason] = struct{}{}
+		}
+	}
+	for _, signal := range q.OCRSignals {
+		switch strings.ToLower(strings.TrimSpace(signal)) {
+		case "fraction", "fraction_bar":
+			reasons[OCRRiskFraction] = struct{}{}
+		case "decimal", "decimal_point":
+			reasons[OCRRiskDecimalPoint] = struct{}{}
+		case "negative", "negative_sign":
+			reasons[OCRRiskNegativeSign] = struct{}{}
+		case "unit", "measurement_unit":
+			reasons[OCRRiskUnit] = struct{}{}
+		case "erasure", "erasure_detected":
+			reasons[OCRRiskErasure] = struct{}{}
+		case "conflict", "evidence_conflict":
+			reasons[OCRRiskEvidenceConflict] = struct{}{}
+		case "unclear", "unclear_handwriting":
+			reasons[OCRRiskUnclearHandwriting] = struct{}{}
+		}
+	}
+	text := strings.Join([]string{
+		q.RawTranscription, q.CanonicalMarkdown,
+		q.AnswerRawTranscription, q.AnswerCanonicalMarkdown,
+	}, "\n")
+	if fractionRiskPattern.MatchString(text) {
+		reasons[OCRRiskFraction] = struct{}{}
+	}
+	if decimalRiskPattern.MatchString(text) {
+		reasons[OCRRiskDecimalPoint] = struct{}{}
+	}
+	if negativeRiskPattern.MatchString(text) {
+		reasons[OCRRiskNegativeSign] = struct{}{}
+	}
+	if unitRiskPattern.MatchString(text) {
+		reasons[OCRRiskUnit] = struct{}{}
+	}
+	if distinctEvidenceCount(q.EvidenceTranscriptions) > 1 || distinctEvidenceCount(q.AnswerEvidenceTranscriptions) > 1 {
+		reasons[OCRRiskEvidenceConflict] = struct{}{}
+	}
+	if q.RecognitionConfidence != nil && *q.RecognitionConfidence < ocrConfidenceConfirmationThreshold {
+		reasons[OCRRiskLowConfidence] = struct{}{}
+	}
+	if q.AnswerState == AnswerStateUnclear {
+		reasons[OCRRiskUnclearHandwriting] = struct{}{}
+	}
+	if strings.TrimSpace(q.Subject) == "" {
+		reasons[OCRRiskSubjectUndetermined] = struct{}{}
+	}
+	if !CanonicalMarkdownValid(q.CanonicalMarkdown) ||
+		(q.AnswerState == AnswerStatePresent && !CanonicalMarkdownValid(q.AnswerCanonicalMarkdown)) {
+		reasons[OCRRiskCanonicalInvalid] = struct{}{}
+	}
+	q.ConfirmationReasons = q.ConfirmationReasons[:0]
+	for _, reason := range ocrReasonOrder {
+		if _, ok := reasons[reason]; ok {
+			q.ConfirmationReasons = append(q.ConfirmationReasons, reason)
+		}
+	}
+	q.ConfirmationRequired = len(q.ConfirmationReasons) > 0
+	return q
+}
+
+func knownOCRRiskReason(reason OCRRiskReason) bool {
+	for _, known := range ocrReasonOrder {
+		if reason == known {
+			return true
+		}
+	}
+	return false
+}
+
+func distinctEvidenceCount(values []string) int {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.Join(strings.Fields(CanonicalPlainTextFallback(value)), " ")
+		if value != "" {
+			set[value] = struct{}{}
+		}
+	}
+	return len(set)
+}
+
+// CanonicalMarkdownValid 做不猜测语义的结构校验：UTF-8、花括号、\(...\)/\[...\]
+// 以及 \frac 的两个参数必须闭合。失败由 UI 回显 raw，不把损坏公式送去批改。
+func CanonicalMarkdownValid(markdown string) bool {
+	if strings.TrimSpace(markdown) == "" || !utf8.ValidString(markdown) || strings.ContainsRune(markdown, '\x00') {
+		return false
+	}
+	depth := 0
+	for i := 0; i < len(markdown); i++ {
+		switch markdown[i] {
+		case '\\':
+			i++ // escaped literal/control sequence 的下一字节不参与括号计数
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth < 0 {
+				return false
+			}
+		}
+	}
+	if depth != 0 || !balancedLatexDelimiter(markdown, `\(`, `\)`) || !balancedLatexDelimiter(markdown, `\[`, `\]`) {
+		return false
+	}
+	for offset := 0; ; {
+		idx := strings.Index(markdown[offset:], `\frac`)
+		if idx < 0 {
+			break
+		}
+		commandStart := offset + idx
+		idx = commandStart + len(`\frac`)
+		var ok bool
+		idx, ok = consumeLatexGroup(markdown, idx)
+		if !ok {
+			return false
+		}
+		idx, ok = consumeLatexGroup(markdown, idx)
+		if !ok {
+			return false
+		}
+		// 从命令名之后继续搜，既能前进，又不会跳过外层参数里的嵌套 \frac。
+		offset = commandStart + len(`\frac`)
+	}
+	return true
+}
+
+func balancedLatexDelimiter(s, open, close string) bool {
+	depth := 0
+	for i := 0; i < len(s); {
+		switch {
+		case strings.HasPrefix(s[i:], open):
+			depth++
+			i += len(open)
+		case strings.HasPrefix(s[i:], close):
+			depth--
+			if depth < 0 {
+				return false
+			}
+			i += len(close)
+		default:
+			i++
+		}
+	}
+	return depth == 0
+}
+
+func consumeLatexGroup(s string, pos int) (int, bool) {
+	for pos < len(s) && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\n') {
+		pos++
+	}
+	if pos >= len(s) || s[pos] != '{' {
+		return pos, false
+	}
+	depth := 0
+	for ; pos < len(s); pos++ {
+		switch s[pos] {
+		case '\\':
+			pos++
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return pos + 1, true
+			}
+		}
+	}
+	return pos, false
+}
+
+// CanonicalPlainTextFallback 生成可选择、可复制的降级文本；分数显式加括号，避免
+// 纯文本中的运算优先级歧义。
+func CanonicalPlainTextFallback(markdown string) string {
+	out := markdown
+	for {
+		next := latexFraction.ReplaceAllString(out, `($1)/($2)`)
+		if next == out {
+			break
+		}
+		out = next
+	}
+	out = strings.NewReplacer(
+		`\times`, "×", `\div`, "÷", `\cdot`, "·",
+		`\leq`, "≤", `\geq`, "≥", `\neq`, "≠",
+		`\(`, "", `\)`, "", `\[`, "", `\]`, "", "$", "",
+	).Replace(out)
+	return strings.TrimSpace(out)
+}
+
+func RecognizedQuestionDisplayText(q RecognizedQuestion) string {
+	if CanonicalMarkdownValid(q.CanonicalMarkdown) {
+		return q.CanonicalMarkdown
+	}
+	if fallback := CanonicalPlainTextFallback(q.RawTranscription); fallback != "" {
+		return fallback
+	}
+	return "[识别内容无法解析，请核对原图]"
+}
+
+func recognizedAnswerDisplayText(q RecognizedQuestion) string {
+	if CanonicalMarkdownValid(q.AnswerCanonicalMarkdown) {
+		return q.AnswerCanonicalMarkdown
+	}
+	return CanonicalPlainTextFallback(q.AnswerRawTranscription)
+}
+
+// NormalizeRecognizedProblems 冻结一次识别结果的结构身份并校验父子不变量。
+func NormalizeRecognizedProblems(scope string, questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
+	out := make([]RecognizedQuestion, len(questions))
+	pageAssetID := stableRecognitionID("page", scope)
+	originalToStable := make(map[string]string, len(questions))
+	ids := make(map[string]struct{}, len(questions))
+	for i, question := range questions {
+		originalID := strings.TrimSpace(question.ProblemID)
+		question = NormalizeRecognizedQuestion(question)
+		if question.RecognitionConfidence != nil && (*question.RecognitionConfidence < 0 || *question.RecognitionConfidence > 1) {
+			return nil, fmt.Errorf("%w: problem index %d recognition_confidence 超出 0..1", ErrInvalidInput, i)
+		}
+		question.ProblemKind = normalizeProblemKind(question.ProblemKind, question.ParentProblemID)
+		if originalID == "" {
+			question.ProblemID = stableProblemID(scope, i, question)
+		} else {
+			question.ProblemID = originalID
+			originalToStable[originalID] = question.ProblemID
+		}
+		if question.PageAssetID == "" {
+			question.PageAssetID = pageAssetID
+		}
+		if question.ProblemKind != ProblemKindCompoundParent && question.AttemptID == "" {
+			question.AttemptID = stableRecognitionID("attempt", scope+"\x00"+question.ProblemID)
+		}
+		if _, duplicate := ids[question.ProblemID]; duplicate {
+			return nil, fmt.Errorf("%w: duplicate problem_id %q", ErrInvalidInput, question.ProblemID)
+		}
+		ids[question.ProblemID] = struct{}{}
+		out[i] = question
+	}
+	parents := make(map[string]struct{})
+	parentPages := make(map[string]string)
+	for _, question := range out {
+		if question.ProblemKind == ProblemKindCompoundParent {
+			parents[question.ProblemID] = struct{}{}
+			parentPages[question.ProblemID] = question.PageAssetID
+		}
+	}
+	subproblemNos := make(map[string]map[string]struct{})
+	attemptIDs := make(map[string]struct{}, len(out))
+	for i := range out {
+		q := &out[i]
+		if mapped := originalToStable[strings.TrimSpace(q.ParentProblemID)]; mapped != "" {
+			q.ParentProblemID = mapped
+		} else {
+			q.ParentProblemID = strings.TrimSpace(q.ParentProblemID)
+		}
+		switch q.ProblemKind {
+		case ProblemKindStandalone:
+			if q.ParentProblemID != "" || q.SubproblemNo != "" {
+				return nil, fmt.Errorf("%w: standalone problem %q cannot have parent/subproblem_no", ErrInvalidInput, q.ProblemID)
+			}
+		case ProblemKindCompoundParent:
+			if q.ParentProblemID != "" || q.SubproblemNo != "" || q.AnswerState != AnswerStateBlank || q.AttemptID != "" || q.InputDigest != "" {
+				return nil, fmt.Errorf("%w: compound parent %q cannot own answer/parent/subproblem_no", ErrInvalidInput, q.ProblemID)
+			}
+		case ProblemKindSubproblem:
+			if _, ok := parents[q.ParentProblemID]; !ok || strings.TrimSpace(q.SubproblemNo) == "" {
+				return nil, fmt.Errorf("%w: subproblem %q needs an existing compound parent and subproblem_no", ErrInvalidInput, q.ProblemID)
+			}
+			q.SubproblemNo = strings.TrimSpace(q.SubproblemNo)
+			if subproblemNos[q.ParentProblemID] == nil {
+				subproblemNos[q.ParentProblemID] = map[string]struct{}{}
+			}
+			if _, duplicate := subproblemNos[q.ParentProblemID][q.SubproblemNo]; duplicate {
+				return nil, fmt.Errorf("%w: duplicate subproblem_no %q under parent %q", ErrInvalidInput, q.SubproblemNo, q.ParentProblemID)
+			}
+			subproblemNos[q.ParentProblemID][q.SubproblemNo] = struct{}{}
+		default:
+			return nil, fmt.Errorf("%w: unsupported problem_kind %q", ErrInvalidInput, q.ProblemKind)
+		}
+		if q.ProblemKind != ProblemKindCompoundParent {
+			if q.AttemptID == "" {
+				return nil, fmt.Errorf("%w: answerable problem %q needs attempt_id", ErrInvalidInput, q.ProblemID)
+			}
+			if _, duplicate := attemptIDs[q.AttemptID]; duplicate {
+				return nil, fmt.Errorf("%w: duplicate attempt_id %q", ErrInvalidInput, q.AttemptID)
+			}
+			attemptIDs[q.AttemptID] = struct{}{}
+		}
+		if q.ProblemKind == ProblemKindSubproblem && q.PageAssetID != parentPages[q.ParentProblemID] {
+			return nil, fmt.Errorf("%w: subproblem %q and parent must share page_asset_id", ErrInvalidInput, q.ProblemID)
+		}
+	}
+	return out, nil
+}
+
+func normalizeProblemKind(kind ProblemKind, parentID string) ProblemKind {
+	kind = ProblemKind(strings.TrimSpace(string(kind)))
+	if kind == "" {
+		if strings.TrimSpace(parentID) != "" {
+			return ProblemKindSubproblem
+		}
+		return ProblemKindStandalone
+	}
+	return kind
+}
+
+func stableProblemID(scope string, index int, q RecognizedQuestion) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s", scope, index, q.ProblemKind, q.ParentProblemID, q.SubproblemNo)))
+	return "problem-" + hex.EncodeToString(sum[:10])
+}
+
+func stableRecognitionID(prefix, seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	return prefix + "-" + hex.EncodeToString(sum[:10])
+}
+
+// RecognizedQuestionsForAssessment 丢弃无 Attempt 的公共父题，并把父题公共题干与子题
+// 增量题干组合成批改输入。子题自己的 ID、答案、锚点与 canonical 事实保持不变。
+func RecognizedQuestionsForAssessment(questions []RecognizedQuestion) []RecognizedQuestion {
+	parents := make(map[string]RecognizedQuestion)
+	for _, question := range questions {
+		if question.ProblemKind == ProblemKindCompoundParent {
+			parents[question.ProblemID] = question
+		}
+	}
+	out := make([]RecognizedQuestion, 0, len(questions))
+	for _, question := range questions {
+		if question.ProblemKind == ProblemKindCompoundParent {
+			continue
+		}
+		question = NormalizeRecognizedQuestion(question)
+		if question.ProblemKind == ProblemKindSubproblem {
+			if parent, ok := parents[question.ParentProblemID]; ok {
+				composed := strings.TrimSpace(RecognizedQuestionDisplayText(parent)) + "\n\n" + strings.TrimSpace(RecognizedQuestionDisplayText(question))
+				// 这是仅供 Assessment port 消费的副本；覆盖副本 canonical 才能穿过
+				// RecognizeHomework 的统一 Normalize。run.json 中的父/子 canonical 事实不变。
+				question.CanonicalMarkdown = composed
+				question.Question = composed
+			}
+		}
+		out = append(out, question)
+	}
+	return out
+}
+
+// CanonicalRecognizedQuestionsDigest 是确认检查点唯一使用的输入摘要；raw OCR、展示投影和
+// 修正命令的字段排列均不参与，避免同一 canonical 因表面载荷不同产生不同结论身份。
+func CanonicalRecognizedQuestionsDigest(questions []RecognizedQuestion) string {
+	type digestItem struct {
+		ProblemID        string      `json:"problem_id"`
+		ProblemKind      ProblemKind `json:"problem_kind"`
+		ParentProblemID  string      `json:"parent_problem_id,omitempty"`
+		SubproblemNo     string      `json:"subproblem_no,omitempty"`
+		Question         string      `json:"canonical_markdown"`
+		Answer           string      `json:"answer_canonical_markdown,omitempty"`
+		AnswerState      AnswerState `json:"answer_state"`
+		Subject          string      `json:"subject"`
+		CanonicalVersion int         `json:"canonical_version"`
+		ConfirmedVersion int         `json:"confirmed_version"`
+	}
+	items := make([]digestItem, 0, len(questions))
+	for _, q := range questions {
+		q = normalizeRecognizedQuestionFacts(q)
+		items = append(items, digestItem{
+			ProblemID: q.ProblemID, ProblemKind: q.ProblemKind, ParentProblemID: q.ParentProblemID,
+			SubproblemNo: q.SubproblemNo, Question: q.CanonicalMarkdown,
+			Answer: q.AnswerCanonicalMarkdown, AnswerState: q.AnswerState, Subject: q.Subject,
+			CanonicalVersion: q.CanonicalVersion, ConfirmedVersion: q.ConfirmedVersion,
+		})
+	}
+	raw, _ := json.Marshal(items)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+// FreezeRecognizedQuestionInputDigests 只在确认门通过后调用，为每个可作答题冻结批改输入。
+// 子题摘要包含父题公共 canonical stem，但父题本身不产生 Attempt/input_digest。
+func FreezeRecognizedQuestionInputDigests(questions []RecognizedQuestion, gradingContext ...string) []RecognizedQuestion {
+	out := cloneRecognizedQuestions(questions)
+	contextValue := ""
+	if len(gradingContext) > 0 {
+		contextValue = gradingContext[0]
+	}
+	parents := make(map[string]string)
+	for _, q := range out {
+		if q.ProblemKind == ProblemKindCompoundParent {
+			parents[q.ProblemID] = q.CanonicalMarkdown
+		}
+	}
+	for i := range out {
+		q := &out[i]
+		if q.ProblemKind == ProblemKindCompoundParent {
+			q.InputDigest = ""
+			continue
+		}
+		stem := q.CanonicalMarkdown
+		if q.ProblemKind == ProblemKindSubproblem {
+			stem = strings.TrimSpace(parents[q.ParentProblemID]) + "\n\n" + strings.TrimSpace(stem)
+		}
+		payload := struct {
+			ProblemKind ProblemKind `json:"problem_kind"`
+			Stem        string      `json:"stem_markdown"`
+			Answer      string      `json:"answer_markdown"`
+			AnswerState AnswerState `json:"answer_state"`
+			Subject     string      `json:"subject"`
+			Subproblem  string      `json:"subproblem_no,omitempty"`
+			Context     string      `json:"context,omitempty"`
+		}{q.ProblemKind, stem, q.AnswerCanonicalMarkdown, q.AnswerState, q.Subject, q.SubproblemNo, contextValue}
+		raw, _ := json.Marshal(payload)
+		sum := sha256.Sum256(raw)
+		q.InputDigest = hex.EncodeToString(sum[:])
+	}
+	return out
+}
+
+// RecognizedQuestionsProblemAttemptSnapshot projects the runtime recognition value
+// objects into the typed durable Problem/Attempt contract. Raw OCR facts are copied
+// verbatim; a compound parent owns no Attempt; every answerable child keeps its own
+// canonical answer, confirmation version, digest and geometry.
+func RecognizedQuestionsProblemAttemptSnapshot(agentName, submissionID string, questions []RecognizedQuestion, at int64) (k12.ProblemAttemptSnapshot, error) {
+	agentName = strings.TrimSpace(agentName)
+	submissionID = strings.TrimSpace(submissionID)
+	if agentName == "" || submissionID == "" || at <= 0 {
+		return k12.ProblemAttemptSnapshot{}, fmt.Errorf("%w: Problem/Attempt snapshot 缺少 owner/submission/time", ErrInvalidInput)
+	}
+	normalized, err := NormalizeRecognizedProblems(submissionID, questions)
+	if err != nil {
+		return k12.ProblemAttemptSnapshot{}, err
+	}
+	snapshot := k12.ProblemAttemptSnapshot{
+		Problems: make([]k12.Problem, 0, len(normalized)),
+		Attempts: make([]k12.Attempt, 0, len(normalized)),
+	}
+	for index, question := range normalized {
+		reasons := make([]string, len(question.ConfirmationReasons))
+		for i, reason := range question.ConfirmationReasons {
+			reasons[i] = string(reason)
+		}
+		snapshot.Problems = append(snapshot.Problems, k12.Problem{
+			ProblemID: question.ProblemID, AgentName: agentName, SubmissionID: submissionID,
+			PageAssetID: question.PageAssetID, Ordinal: index, ProblemKind: string(question.ProblemKind),
+			ParentProblemID: question.ParentProblemID, SubproblemNo: question.SubproblemNo,
+			Subject: question.Subject, StemRaw: question.RawTranscription,
+			StemMarkdown: question.CanonicalMarkdown, ConceptIDs: append([]string(nil), question.KnowledgePoints...),
+			TranscriptionConfidence: question.RecognitionConfidence,
+			ConfirmationRequired:    question.ConfirmationRequired, ConfirmationReasons: reasons,
+			CanonicalVersion: question.CanonicalVersion, CreatedAt: at, UpdatedAt: at,
+		})
+		if question.ProblemKind == ProblemKindCompoundParent {
+			continue
+		}
+		var box *k12.AttemptBBox
+		if question.BBox != nil {
+			box = &k12.AttemptBBox{X: question.BBox.X, Y: question.BBox.Y, W: question.BBox.W, H: question.BBox.H}
+		}
+		snapshot.Attempts = append(snapshot.Attempts, k12.Attempt{
+			AttemptID: question.AttemptID, AgentName: agentName, SubmissionID: submissionID,
+			ProblemID: question.ProblemID, AnswerState: string(question.AnswerState),
+			AnswerRaw: question.AnswerRawTranscription, AnswerMarkdown: question.AnswerCanonicalMarkdown,
+			ConfirmedVersion: question.ConfirmedVersion, InputDigest: question.InputDigest,
+			BBox: box, CreatedAt: at, UpdatedAt: at,
+		})
+	}
+	return snapshot, nil
+}
+
+// RecognizedQuestionsFromProblemAttemptSnapshot rebuilds the API/usecase value
+// objects from typed durable facts. Ordinal, not SQL row order, restores the original
+// page sequence; Attempt lookup is by ProblemID so sibling results cannot cross.
+func RecognizedQuestionsFromProblemAttemptSnapshot(snapshot k12.ProblemAttemptSnapshot) ([]RecognizedQuestion, error) {
+	if len(snapshot.Problems) == 0 {
+		return nil, fmt.Errorf("%w: Problem/Attempt snapshot 为空", ErrInvalidInput)
+	}
+	problems := append([]k12.Problem(nil), snapshot.Problems...)
+	sort.SliceStable(problems, func(i, j int) bool {
+		if problems[i].Ordinal == problems[j].Ordinal {
+			return problems[i].ProblemID < problems[j].ProblemID
+		}
+		return problems[i].Ordinal < problems[j].Ordinal
+	})
+	attempts := make(map[string]k12.Attempt, len(snapshot.Attempts))
+	for _, attempt := range snapshot.Attempts {
+		if _, exists := attempts[attempt.ProblemID]; exists {
+			return nil, fmt.Errorf("%w: Problem %s 拥有多个 Attempt", ErrInvalidInput, attempt.ProblemID)
+		}
+		attempts[attempt.ProblemID] = attempt
+	}
+	questions := make([]RecognizedQuestion, 0, len(problems))
+	for _, problem := range problems {
+		reasons := make([]OCRRiskReason, len(problem.ConfirmationReasons))
+		for i, reason := range problem.ConfirmationReasons {
+			reasons[i] = OCRRiskReason(reason)
+		}
+		question := RecognizedQuestion{
+			ProblemID: problem.ProblemID, ProblemKind: ProblemKind(problem.ProblemKind),
+			ParentProblemID: problem.ParentProblemID, SubproblemNo: problem.SubproblemNo,
+			PageAssetID: problem.PageAssetID, RawTranscription: problem.StemRaw,
+			CanonicalMarkdown: problem.StemMarkdown, CanonicalVersion: problem.CanonicalVersion,
+			KnowledgePoints: append([]string(nil), problem.ConceptIDs...), Subject: problem.Subject,
+			RecognitionConfidence: problem.TranscriptionConfidence,
+			ConfirmationRequired:  problem.ConfirmationRequired, ConfirmationReasons: reasons,
+			AnswerState: AnswerStateBlank,
+		}
+		if question.ProblemKind != ProblemKindCompoundParent {
+			attempt, ok := attempts[problem.ProblemID]
+			if !ok {
+				return nil, fmt.Errorf("%w: 可作答 Problem %s 缺少 Attempt", ErrInvalidInput, problem.ProblemID)
+			}
+			question.AttemptID = attempt.AttemptID
+			question.AnswerState = AnswerState(attempt.AnswerState)
+			question.AnswerRawTranscription = attempt.AnswerRaw
+			question.AnswerCanonicalMarkdown = attempt.AnswerMarkdown
+			question.ConfirmedVersion = attempt.ConfirmedVersion
+			question.InputDigest = attempt.InputDigest
+			if attempt.BBox != nil {
+				question.BBox = &BBox{X: attempt.BBox.X, Y: attempt.BBox.Y, W: attempt.BBox.W, H: attempt.BBox.H}
+			}
+			delete(attempts, problem.ProblemID)
+		}
+		questions = append(questions, NormalizeRecognizedQuestion(question))
+	}
+	if len(attempts) != 0 {
+		return nil, fmt.Errorf("%w: snapshot 含不属于 Problem 的 Attempt", ErrInvalidInput)
+	}
+	return NormalizeRecognizedProblems(problems[0].SubmissionID, questions)
+}

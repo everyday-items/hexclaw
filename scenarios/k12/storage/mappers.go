@@ -164,13 +164,47 @@ func (practiceSetMapper) syncChildren(ctx context.Context, ex dbExecer, recordID
 		if _, err := ex.ExecContext(ctx, `INSERT INTO k12_practice_set_items
             (set_record_id, item_index, item_id, source_problem_id, subject, added_via,
              question_markdown, expected_answer_markdown, verification_status,
-             verification_evidence, blocked_reason, paper_seq, returned, practice_problem_id, result_correct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             verification_evidence, blocked_reason, paper_seq, returned, practice_problem_id, result_correct,
+             generation_job_id, variant_index, requested_difficulty, actual_difficulty)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			recordID, i, it.ItemID, it.SourceProblemID, it.Subject, it.AddedVia,
 			it.QuestionMarkdown, it.ExpectedAnswerMarkdown, it.VerificationStatus,
 			it.VerificationEvidence, it.BlockedReason, it.PaperSeq, boolInt(it.Returned),
-			it.PracticeProblemID, rc); err != nil {
+			it.PracticeProblemID, rc, it.GenerationJobID, it.VariantIndex,
+			it.RequestedDifficulty, it.ActualDifficulty); err != nil {
 			return fmt.Errorf("k12storage: 写练习项 #%d: %w", i, err)
+		}
+	}
+	// DD-028：return_assets 是只追加审计表。普通聚合更新绝不 DELETE；既有 return_id
+	// 只允许完全相同的载荷重放，任何改写尝试都让整个外层事务回滚。
+	queryer, queryOK := ex.(dbQueryer)
+	for i, ra := range f.ReturnAssets {
+		itemIDsJSON, err := json.Marshal(ra.ItemIDs)
+		if err != nil {
+			return fmt.Errorf("k12storage: 编码回传资产 #%d item_ids: %w", i, err)
+		}
+		res, err := ex.ExecContext(ctx, `INSERT INTO k12_practice_return_assets
+            (set_record_id, return_index, return_id, asset_id, item_ids_json, returned_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(set_record_id, return_id) DO NOTHING`,
+			recordID, i, ra.ReturnID, ra.AssetID, string(itemIDsJSON), ra.ReturnedAt)
+		if err != nil {
+			return fmt.Errorf("k12storage: 追加回传资产 #%d: %w", i, err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			if !queryOK {
+				return fmt.Errorf("k12storage: 回查回传资产需要可查询事务句柄")
+			}
+			var storedAsset, storedItems string
+			var storedAt int64
+			if err := queryer.QueryRowContext(ctx, `SELECT asset_id, item_ids_json, returned_at
+                    FROM k12_practice_return_assets WHERE set_record_id = ? AND return_id = ?`,
+				recordID, ra.ReturnID).Scan(&storedAsset, &storedItems, &storedAt); err != nil {
+				return fmt.Errorf("k12storage: 回查回传资产 #%d: %w", i, err)
+			}
+			if storedAsset != ra.AssetID || storedItems != string(itemIDsJSON) || storedAt != ra.ReturnedAt {
+				return fmt.Errorf("k12storage: return_id %q 已存在且载荷不同，禁止覆盖", ra.ReturnID)
+			}
 		}
 	}
 	return nil
@@ -183,12 +217,12 @@ func (practiceSetMapper) attachChildren(ctx context.Context, q dbQueryer, record
 	}
 	rows, err := q.QueryContext(ctx, `SELECT item_id, source_problem_id, subject, added_via,
         question_markdown, expected_answer_markdown, verification_status, verification_evidence,
-        blocked_reason, paper_seq, returned, practice_problem_id, result_correct
+        blocked_reason, paper_seq, returned, practice_problem_id, result_correct,
+        generation_job_id, variant_index, requested_difficulty, actual_difficulty
         FROM k12_practice_set_items WHERE set_record_id = ? ORDER BY item_index`, recordID)
 	if err != nil {
 		return "", fmt.Errorf("k12storage: 读练习项: %w", err)
 	}
-	defer rows.Close()
 	f.Items = nil
 	for rows.Next() {
 		var it k12.PracticeItem
@@ -197,7 +231,9 @@ func (practiceSetMapper) attachChildren(ctx context.Context, q dbQueryer, record
 		if err := rows.Scan(&it.ItemID, &it.SourceProblemID, &it.Subject, &it.AddedVia,
 			&it.QuestionMarkdown, &it.ExpectedAnswerMarkdown, &it.VerificationStatus,
 			&it.VerificationEvidence, &it.BlockedReason, &it.PaperSeq, &returned,
-			&it.PracticeProblemID, &rc); err != nil {
+			&it.PracticeProblemID, &rc, &it.GenerationJobID, &it.VariantIndex,
+			&it.RequestedDifficulty, &it.ActualDifficulty); err != nil {
+			rows.Close()
 			return "", fmt.Errorf("k12storage: 扫描练习项: %w", err)
 		}
 		it.Returned = returned != 0
@@ -208,7 +244,49 @@ func (practiceSetMapper) attachChildren(ctx context.Context, q dbQueryer, record
 		f.Items = append(f.Items, it)
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return "", err
+	}
+	if err := rows.Close(); err != nil {
+		return "", err
+	}
+
+	returnRows, err := q.QueryContext(ctx, `SELECT return_id, asset_id, item_ids_json, returned_at
+        FROM k12_practice_return_assets WHERE set_record_id = ? ORDER BY return_index`, recordID)
+	if err != nil {
+		return "", fmt.Errorf("k12storage: 读回传资产: %w", err)
+	}
+	f.ReturnAssets = nil
+	returnedItemIDs := make(map[string]struct{})
+	for returnRows.Next() {
+		var ra k12.PracticeReturnAsset
+		var itemIDsJSON string
+		if err := returnRows.Scan(&ra.ReturnID, &ra.AssetID, &itemIDsJSON, &ra.ReturnedAt); err != nil {
+			returnRows.Close()
+			return "", fmt.Errorf("k12storage: 扫描回传资产: %w", err)
+		}
+		if err := json.Unmarshal([]byte(itemIDsJSON), &ra.ItemIDs); err != nil {
+			returnRows.Close()
+			return "", fmt.Errorf("k12storage: 解析回传资产 item_ids: %w", err)
+		}
+		f.ReturnAssets = append(f.ReturnAssets, ra)
+		for _, itemID := range ra.ItemIDs {
+			returnedItemIDs[itemID] = struct{}{}
+		}
+	}
+	if err := returnRows.Err(); err != nil {
+		returnRows.Close()
+		return "", err
+	}
+	if err := returnRows.Close(); err != nil {
+		return "", err
+	}
+	// DD-028：return_assets 是回传事实，PracticeItem.Returned 只是兼容旧 DTO 的投影。
+	// 旧调用方即使漏带 return_assets 或写回 false，也不能抹掉已有照片证据。
+	for i := range f.Items {
+		if _, covered := returnedItemIDs[f.Items[i].ItemID]; covered {
+			f.Items[i].Returned = true
+		}
 	}
 	// 零项保持 nil（与写入方零值 marshal 的 "items":null 同构）。
 	return marshalFields(f)
@@ -251,16 +329,31 @@ func (creativeWorkMapper) syncChildren(ctx context.Context, ex dbExecer, recordI
 	}
 	for i, v := range f.Versions {
 		if _, err := ex.ExecContext(ctx, `INSERT INTO k12_creative_work_versions
-            (work_record_id, version_index, version_id, source_asset_id, content_markdown, practice_card_done_at)
-            VALUES (?, ?, ?, ?, ?, ?)`,
-			recordID, i, v.VersionID, v.SourceAssetID, v.ContentMarkdown, v.PracticeCardDoneAt); err != nil {
+			(work_record_id, version_index, version_id, source_asset_id, content_markdown,
+			 practice_card_done_at, ocr_job_id, ocr_raw, ocr_version, ocr_confirmed_digest,
+			 content_confirmed_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			recordID, i, v.VersionID, v.SourceAssetID, v.ContentMarkdown, v.PracticeCardDoneAt,
+			v.OCRJobID, v.OCRRaw, v.OCRVersion, v.OCRConfirmedDigest, v.ContentConfirmedAt); err != nil {
 			return fmt.Errorf("k12storage: 写作品版本 #%d: %w", i, err)
 		}
-		if v.Feedback != "" || v.FeedbackSource != "" || v.FeedbackSkill != "" {
+		structuredJSON := ""
+		if v.StructuredFeedback != nil {
+			if err := v.StructuredFeedback.Validate(); err != nil {
+				return fmt.Errorf("k12storage: 结构化作品点评 #%d 非法: %w", i, err)
+			}
+			raw, err := json.Marshal(v.StructuredFeedback)
+			if err != nil {
+				return fmt.Errorf("k12storage: marshal 结构化作品点评 #%d: %w", i, err)
+			}
+			structuredJSON = string(raw)
+		}
+		if v.Feedback != "" || v.FeedbackSource != "" || v.FeedbackSkill != "" || structuredJSON != "" {
 			if _, err := ex.ExecContext(ctx, `INSERT INTO k12_work_feedback
-                (work_record_id, version_index, feedback_markdown, feedback_source, feedback_skill)
-                VALUES (?, ?, ?, ?, ?)`,
-				recordID, i, v.Feedback, v.FeedbackSource, v.FeedbackSkill); err != nil {
+				(work_record_id, version_index, feedback_markdown, feedback_source, feedback_skill,
+				 structured_feedback_json)
+				VALUES (?, ?, ?, ?, ?, ?)`,
+				recordID, i, v.Feedback, v.FeedbackSource, v.FeedbackSkill, structuredJSON); err != nil {
 				return fmt.Errorf("k12storage: 写形成性反馈 #%d: %w", i, err)
 			}
 		}
@@ -274,8 +367,10 @@ func (creativeWorkMapper) attachChildren(ctx context.Context, q dbQueryer, recor
 		return "", fmt.Errorf("k12storage: 解析作品字段: %w", err)
 	}
 	rows, err := q.QueryContext(ctx, `SELECT v.version_id, v.source_asset_id, v.content_markdown,
-        v.practice_card_done_at,
-        COALESCE(fb.feedback_markdown,''), COALESCE(fb.feedback_source,''), COALESCE(fb.feedback_skill,'')
+		v.practice_card_done_at, v.ocr_job_id, v.ocr_raw, v.ocr_version,
+		v.ocr_confirmed_digest, v.content_confirmed_at,
+		COALESCE(fb.feedback_markdown,''), COALESCE(fb.feedback_source,''), COALESCE(fb.feedback_skill,''),
+		COALESCE(fb.structured_feedback_json,'')
         FROM k12_creative_work_versions v
         LEFT JOIN k12_work_feedback fb
           ON fb.work_record_id = v.work_record_id AND fb.version_index = v.version_index
@@ -287,9 +382,20 @@ func (creativeWorkMapper) attachChildren(ctx context.Context, q dbQueryer, recor
 	f.Versions = nil
 	for rows.Next() {
 		var v k12.CreativeWorkVersion
+		var structuredJSON string
 		if err := rows.Scan(&v.VersionID, &v.SourceAssetID, &v.ContentMarkdown,
-			&v.PracticeCardDoneAt, &v.Feedback, &v.FeedbackSource, &v.FeedbackSkill); err != nil {
+			&v.PracticeCardDoneAt, &v.OCRJobID, &v.OCRRaw, &v.OCRVersion,
+			&v.OCRConfirmedDigest, &v.ContentConfirmedAt,
+			&v.Feedback, &v.FeedbackSource, &v.FeedbackSkill,
+			&structuredJSON); err != nil {
 			return "", fmt.Errorf("k12storage: 扫描作品版本: %w", err)
+		}
+		if structuredJSON != "" {
+			structured, err := k12.ParseWorkFeedbackJSON([]byte(structuredJSON))
+			if err != nil {
+				return "", fmt.Errorf("k12storage: 结构化作品点评非法: %w", err)
+			}
+			v.StructuredFeedback = &structured
 		}
 		f.Versions = append(f.Versions, v)
 	}

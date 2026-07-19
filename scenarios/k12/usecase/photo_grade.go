@@ -69,6 +69,10 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 	if err != nil {
 		return PhotoGradeResult{}, err
 	}
+	questions, err = NormalizeRecognizedProblems("photo-"+shortSHA1(req.Image), questions)
+	if err != nil {
+		return PhotoGradeResult{}, err
+	}
 	if len(questions) == 0 {
 		return PhotoGradeResult{}, fmt.Errorf("%w: 未识别到可处理的题目", ErrInvalidInput)
 	}
@@ -93,6 +97,12 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 				imageWarning = "未能独立核验疑似学生笔迹，为避免泄露答案，本次按批改卷处理"
 			}
 		}
+	}
+	// 锚点阶段保留父题与所有子题的同序结构；只有在几何回位后，才丢弃不产生
+	// Attempt/Assessment 的公共父题并把公共题干组合到各子题评估副本。
+	questions = RecognizedQuestionsForAssessment(questions)
+	if len(questions) == 0 {
+		return PhotoGradeResult{}, fmt.Errorf("%w: 未识别到可作答的独立题目", ErrInvalidInput)
 	}
 	mode := classifyPhotoMode(questions)
 	if mode == PhotoModeSolve && hasUnclear && !anchorVerified {

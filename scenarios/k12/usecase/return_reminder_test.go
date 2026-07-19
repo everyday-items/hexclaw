@@ -80,7 +80,9 @@ func TestReturnReminder_AlreadyReturnedSkips(t *testing.T) {
 	remindAt := time.Date(2026, 7, 17, 20, 0, 0, 0, reminderLoc)
 	id, _ := finalizeYesterdaySet(t, d, "xiaoming", finalizeAt)
 	// 昨日卷已回传（哪怕部分回传，状态离开 assigned）→ 不提醒。
-	if err := d.SubmitReturn(context.Background(), "xiaoming", id, []string{"q1"}); err != nil {
+	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
+	assetID := saveReturnAsset(t, "xiaoming")
+	if _, err := d.SubmitReturn(context.Background(), "xiaoming", id, "return-reminder", assetID, []string{"q1"}); err != nil {
 		t.Fatal(err)
 	}
 

@@ -73,9 +73,7 @@ func TestInsightReport_CompletionRatePaperProjection(t *testing.T) {
 		t.Errorf("已固化 2 道 verified、0 题复批 → 0，got %v", rep.ReviewCompletionRate)
 	}
 
-	if err := d.SubmitPracticeSet(ctx, "mingming", setID); err != nil {
-		t.Fatal(err)
-	}
+	submitWholeSetInternal(t, d, "mingming", setID)
 	if _, err := d.GradePracticeSetItems(ctx, "mingming", setID, []PracticeGradeResult{{ItemID: "qa", Correct: true}}); err != nil {
 		t.Fatal(err)
 	}

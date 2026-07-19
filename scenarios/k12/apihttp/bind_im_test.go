@@ -46,14 +46,14 @@ func TestBindIM_Success(t *testing.T) {
 	b := &fakeBinder{}
 	h := newServerWithBinder(t, b)
 	rec, out := do(t, h, "POST", "/bind-im",
-		`{"agent":"mingming","platform":"dingtalk","instance_id":"dt-家庭","chat_id":"grp-42"}`)
+		`{"agent":"mingming","platform":"dingtalk","instance_id":"dt-parent","chat_id":"direct-42"}`)
 	if rec.Code != 200 {
 		t.Fatalf("状态 %d", rec.Code)
 	}
 	if bound, _ := out["bound"].(bool); !bound {
 		t.Errorf("应 bound=true, got %v", out)
 	}
-	if b.calls != 1 || b.agent != "mingming" || b.platform != "dingtalk" || b.chatID != "grp-42" {
+	if b.calls != 1 || b.agent != "mingming" || b.platform != "dingtalk" || b.chatID != "direct-42" {
 		t.Errorf("绑定透传不符: %+v", b)
 	}
 }

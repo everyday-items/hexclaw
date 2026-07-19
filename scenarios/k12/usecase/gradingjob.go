@@ -36,9 +36,10 @@ type CreateGradingJobInput struct {
 
 // AdvanceGradingStage 的 outcome 枚举。
 const (
-	GradingOutcomeOK     = "ok"     // 当前阶段成功完成：写检查点、推进后继阶段
-	GradingOutcomeFailed = "failed" // 当前自动阶段失败：按规则 2/4 降级或进失败态
-	GradingOutcomeAnchor = "anchor" // 锚点增强结果回位：located / degraded（规则 1）
+	GradingOutcomeOK      = "ok"              // 当前阶段成功完成：写检查点、推进后继阶段
+	GradingOutcomeFailed  = "failed"          // 当前自动阶段失败：按规则 2/4 降级或进失败态
+	GradingOutcomeAnchor  = "anchor"          // 锚点增强结果回位：located / degraded（规则 1）
+	GradingOutcomeUnknown = "outcome_unknown" // 外部请求已发送但结果无法判定：禁止普通重试
 )
 
 // AdvanceGradingInput 阶段推进输入（编排器专用，见 AdvanceGradingStage）。
@@ -67,6 +68,7 @@ func (d Deps) CreateGradingJob(ctx context.Context, agentName, sourceSession str
 	if in.ConfirmedVersion < 0 {
 		return GradingJobView{}, false, fmt.Errorf("%w: confirmed_version 不可为负", ErrInvalidInput)
 	}
+	in.ModelSnapshot = k12.NormalizeGradingModelSnapshot(in.ModelSnapshot)
 	f := k12.GradingJobFields{
 		SubmissionID:      in.SubmissionID,
 		SourceKind:        in.SourceKind,
@@ -150,8 +152,26 @@ func (d Deps) AdvanceGradingStage(ctx context.Context, agentName, recordID strin
 		return d.advanceGradingFailed(ctx, v, in)
 	case GradingOutcomeAnchor:
 		return d.advanceGradingAnchor(ctx, v, in)
+	case GradingOutcomeUnknown:
+		return d.advanceGradingOutcomeUnknown(ctx, v, in)
 	}
-	return GradingJobView{}, fmt.Errorf("%w: outcome 非法: %q（允许 ok/failed/anchor）", ErrInvalidInput, in.Outcome)
+	return GradingJobView{}, fmt.Errorf("%w: outcome 非法: %q（允许 ok/failed/anchor/outcome_unknown）", ErrInvalidInput, in.Outcome)
+}
+
+func (d Deps) advanceGradingOutcomeUnknown(ctx context.Context, v GradingJobView, in AdvanceGradingInput) (GradingJobView, error) {
+	if strings.TrimSpace(in.FailureKind) == "" {
+		return GradingJobView{}, fmt.Errorf("%w: outcome_unknown 必须写明 failure_kind", ErrInvalidInput)
+	}
+	switch v.Record.Status {
+	case k12.GradingStageRecognizing, k12.GradingStageLocating, k12.GradingStageAssessing:
+	default:
+		return GradingJobView{}, errGradingStageConflict("阶段 %s 无 outcome_unknown 转移", v.Record.Status)
+	}
+	v.Fields.FailedStage = v.Record.Status
+	v.Fields.FailureKind = in.FailureKind
+	v.Fields.Retryable = false
+	v.Fields.Deadline = 0
+	return d.saveGradingJob(ctx, v, k12.GradingStageOutcomeUnknown)
 }
 
 // gradingNextStage 主链后继（ok 推进）。
@@ -251,7 +271,7 @@ func (d Deps) advanceGradingAnchor(ctx context.Context, v GradingJobView, in Adv
 	})
 	// 规则 1 汇合：确认已冻结 canonical 输入且锚点已回位（located 或 degraded）→ assessing。
 	next := stage
-	if v.Fields.ConfirmationState == k12.GradingConfirmationConfirmed {
+	if gradingJoinReady(v.Fields) {
 		next = k12.GradingStageAssessing
 		d.setGradingDeadline(&v.Fields, next)
 	}
@@ -261,7 +281,7 @@ func (d Deps) advanceGradingAnchor(ctx context.Context, v GradingJobView, in Adv
 // ConfirmGradingJob 批量确认/修正识别结果（§6.7 公共命令③，completed 前的等待态确认）。
 // corrections 为家长的逐题确认/修正输入摘要；确认冻结 canonical 输入并写确认检查点。
 // 规则 1：进入 assessing 须与锚点汇合——锚点未回位（pending）时保持等待，
-// 锚点超时会显式 degraded（不阻塞）；批改前置条件只看 confirmation_state=confirmed。
+// 锚点超时会显式 degraded（不阻塞）；只有 confirmed ∧ (located ∨ degraded) 才能批改。
 func (d Deps) ConfirmGradingJob(ctx context.Context, agentName, recordID string, corrections []string) (GradingJobView, error) {
 	v, err := d.GetGradingJob(ctx, agentName, recordID)
 	if err != nil {
@@ -277,12 +297,26 @@ func (d Deps) ConfirmGradingJob(ctx context.Context, agentName, recordID string,
 		RecordedAt:     d.now(),
 	})
 	next := v.Record.Status
-	if v.Fields.AnchorState != k12.GradingAnchorPending {
+	if gradingJoinReady(v.Fields) {
 		next = k12.GradingStageAssessing
 		// §5.4：确认恢复后按剩余阶段预算重新起算 deadline。
 		d.setGradingDeadline(&v.Fields, next)
 	}
 	return d.saveGradingJob(ctx, v, next)
+}
+
+// gradingJoinReady 是确认分支与定位分支的唯一汇合判定。显式列出终止锚点态，避免
+// 未知/损坏值被“非 pending”宽松判断误放行到 assessing。
+func gradingJoinReady(fields k12.GradingJobFields) bool {
+	if fields.ConfirmationState != k12.GradingConfirmationConfirmed {
+		return false
+	}
+	switch fields.AnchorState {
+	case k12.GradingAnchorLocated, k12.GradingAnchorDegraded:
+		return true
+	default:
+		return false
+	}
 }
 
 // ReviseGradingJob 修正重批（§6.7 规则 6）：completed 之后家长修改确认输入 → 不回退旧 Job，
@@ -359,6 +393,45 @@ func (d Deps) RetryGradingJob(ctx context.Context, agentName, recordID string) (
 	}
 	v.Fields.Deadline = d.now() + k12.GradingStageBudgetSeconds(k12.GradingStageQueued)
 	return d.saveGradingJob(ctx, v, k12.GradingStageQueued)
+}
+
+// ReconcileGradingInvocationNotExecuted is an operator/application-service
+// command, not the parent-facing ordinary retry action. Provider evidence must
+// prove the ambiguous request did not execute before this command exposes a
+// same-route retryable state.
+func (d Deps) ReconcileGradingInvocationNotExecuted(ctx context.Context, agentName, recordID, invocationID string) (GradingJobView, error) {
+	v, err := d.GetGradingJob(ctx, agentName, recordID)
+	if err != nil {
+		return GradingJobView{}, err
+	}
+	invocation, err := d.Records.GetModelInvocation(ctx, agentName, invocationID)
+	if err != nil {
+		return GradingJobView{}, err
+	}
+	if invocation.JobID != recordID || invocation.Stage != v.Fields.FailedStage {
+		return GradingJobView{}, errGradingStageConflict("invocation 不属于当前 Job/失败阶段")
+	}
+	if v.Record.Status == k12.GradingStageFailedRetryable &&
+		invocation.Status == k12.ModelInvocationReconciled && invocation.FailureKind == "reconciled_not_executed" {
+		return v, nil
+	}
+	if v.Record.Status != k12.GradingStageOutcomeUnknown {
+		return GradingJobView{}, errGradingStageConflict("阶段 %s 不可执行模型调用对账", v.Record.Status)
+	}
+	if invocation.Status == k12.ModelInvocationOutcomeUnknown {
+		invocation, err = d.Records.ReconcileModelInvocationNotExecuted(ctx, agentName, invocationID)
+		if err != nil {
+			return GradingJobView{}, err
+		}
+	}
+	if invocation.Status != k12.ModelInvocationReconciled || invocation.FailureKind != "reconciled_not_executed" {
+		return GradingJobView{}, errGradingStageConflict("invocation %s 尚未证实未执行", invocationID)
+	}
+	v.Fields.AttemptCount = invocation.Attempt
+	v.Fields.FailureKind = "reconciled_not_executed"
+	v.Fields.Retryable = true
+	v.Fields.Deadline = 0
+	return d.saveGradingJob(ctx, v, k12.GradingStageFailedRetryable)
 }
 
 // --- 内部辅助 ---

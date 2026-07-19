@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
@@ -49,14 +50,36 @@ func WithGradingConcurrency(n int) GradingOrchestratorOption {
 	}
 }
 
+// WithGradingAnchorTimeout 配置锚点增强分支的独立超时。未配置时默认 60 秒；
+// 非正数不覆盖默认值，避免误配造成无 deadline 或立即降级。
+func WithGradingAnchorTimeout(timeout time.Duration) GradingOrchestratorOption {
+	return func(o *GradingOrchestrator) {
+		if timeout > 0 {
+			o.anchorTimeout = timeout
+		}
+	}
+}
+
+func (o *GradingOrchestrator) gradingBaseContext() context.Context {
+	if o.baseCtx != nil {
+		return o.baseCtx
+	}
+	return context.Background()
+}
+
 // StartAsync 异步推进一个 Job 到下一停点/终态。与调用方（HTTP 请求）context 解耦；
-// 同一 Job 已在推进中则幂等跳过；panic 不逃逸（§6.15：进程不因单任务崩溃）。
+// 同一 Job 已在推进中时记录一次 rerun 信号，当前轮退出前至少再读一次状态机；这样确认
+// 与锚点同时回位时不会因 active 守卫吞掉最后一次续跑。panic 不逃逸（§6.15）。
 func (o *GradingOrchestrator) StartAsync(jobID string) {
 	o.mu.Lock()
 	if o.active == nil {
 		o.active = map[string]bool{}
 	}
 	if o.active[jobID] {
+		if o.rerun == nil {
+			o.rerun = map[string]bool{}
+		}
+		o.rerun[jobID] = true
 		o.mu.Unlock()
 		return
 	}
@@ -64,23 +87,30 @@ func (o *GradingOrchestrator) StartAsync(jobID string) {
 	o.mu.Unlock()
 
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("K12 批改任务异步推进 panic（已捕获，任务留在当前落库状态）", "job", jobID, "panic", r)
-			}
+		for {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("K12 批改任务异步推进 panic（已捕获，任务留在当前落库状态）", "job", jobID, "panic", r)
+					}
+				}()
+				o.sem <- struct{}{}
+				defer func() { <-o.sem }()
+				if _, err := o.RunGradingJob(o.gradingBaseContext(), jobID); err != nil {
+					// 阶段失败已由状态机安全落 failed_retryable/failed_terminal；此处仅取证。
+					slog.Warn("K12 批改任务异步推进结束于错误（状态机已落库对应失败态）", "job", jobID, "err", err)
+				}
+			}()
+
 			o.mu.Lock()
+			if o.rerun[jobID] {
+				delete(o.rerun, jobID)
+				o.mu.Unlock()
+				continue
+			}
 			delete(o.active, jobID)
 			o.mu.Unlock()
-		}()
-		o.sem <- struct{}{}
-		defer func() { <-o.sem }()
-		ctx := o.baseCtx
-		if ctx == nil {
-			ctx = context.Background()
-		}
-		if _, err := o.RunGradingJob(ctx, jobID); err != nil {
-			// 阶段失败已由状态机安全落 failed_retryable/failed_terminal；此处仅取证。
-			slog.Warn("K12 批改任务异步推进结束于错误（状态机已落库对应失败态）", "job", jobID, "err", err)
+			return
 		}
 	}()
 }
@@ -88,11 +118,18 @@ func (o *GradingOrchestrator) StartAsync(jobID string) {
 // GradingQuestionCorrection 家长对识别结果的逐题确认/修正（§6.7 公共命令③的结构化载荷）。
 // 空字段 = 该维度按识别结果确认不改。
 type GradingQuestionCorrection struct {
-	Index         int         `json:"index"`
-	Question      string      `json:"question,omitempty"`
-	StudentAnswer string      `json:"student_answer,omitempty"`
-	AnswerState   AnswerState `json:"answer_state,omitempty"`
-	Subject       string      `json:"subject,omitempty"`
+	Index     int    `json:"index"`
+	ProblemID string `json:"problem_id,omitempty"`
+	// Confirmed 必须由客户端逐题显式提交；高风险 OCR 不接受“整卷默认确认”。
+	Confirmed bool `json:"confirmed,omitempty"`
+	// Question / StudentAnswer 是旧客户端的 canonical 修正别名；新客户端直接使用
+	// CanonicalMarkdown / AnswerCanonicalMarkdown。两组字段都只改 canonical，永不改 raw。
+	Question                string      `json:"question,omitempty"`
+	CanonicalMarkdown       string      `json:"canonical_markdown,omitempty"`
+	StudentAnswer           string      `json:"student_answer,omitempty"`
+	AnswerCanonicalMarkdown string      `json:"answer_canonical_markdown,omitempty"`
+	AnswerState             AnswerState `json:"answer_state,omitempty"`
+	Subject                 string      `json:"subject,omitempty"`
 }
 
 // ConfirmPhotoGradingInput 桌面确认输入：整卷学科/年级 + 逐题修正。
@@ -107,17 +144,178 @@ type ConfirmPhotoGradingInput struct {
 // ok=false 表示该 Job 无在途运行时（非编排器创建），调用方回退纯状态机确认。
 func (o *GradingOrchestrator) ConfirmPhotoGradingJob(ctx context.Context, jobID string, in ConfirmPhotoGradingInput) (GradingJobView, bool, error) {
 	run, err := o.ensureRun(ctx, jobID)
-	if err != nil {
+	if err != nil || run.textOnly {
 		return GradingJobView{}, false, nil
 	}
+	return o.confirmRegisteredGradingJob(ctx, jobID, run, in)
+}
+
+// RegisterPersistedTextGradingJob installs the text-specific worker state for
+// a trusted webhook Submission. The typed Problem/Attempt snapshot remains the
+// source of truth; no image is fabricated or persisted.
+func (o *GradingOrchestrator) RegisterPersistedTextGradingJob(
+	ctx context.Context,
+	agentName, jobID, subject, grade string,
+) error {
+	run, ok, err := o.newPersistedTextRun(ctx, agentName, jobID, subject, grade)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("usecase: Job %s 不是 webhook 文本 Submission", jobID)
+	}
+	o.mu.Lock()
+	if existing := o.runs[jobID]; existing != nil {
+		if !existing.textOnly || existing.agentName != strings.TrimSpace(agentName) {
+			o.mu.Unlock()
+			return fmt.Errorf("usecase: Job %s 运行时类型或 owner 冲突", jobID)
+		}
+		run = existing
+	} else {
+		o.runs[jobID] = run
+	}
+	o.mu.Unlock()
+	if err := o.persistRun(jobID, run); err != nil {
+		return fmt.Errorf("usecase: 固化 webhook 文本运行时: %w", err)
+	}
+	return nil
+}
+
+// ConfirmPersistedTextGradingJob applies the same structured confirmation as
+// photo grading, then schedules the text-only worker through rendering and
+// projection to completed. It can reconstruct legacy typed text Jobs that
+// predate the in-memory registration.
+func (o *GradingOrchestrator) ConfirmPersistedTextGradingJob(
+	ctx context.Context,
+	agentName, jobID string,
+	in ConfirmPhotoGradingInput,
+) (GradingJobView, bool, error) {
+	run := o.lookup(jobID)
+	if run == nil {
+		if restored, err := o.ensureRun(ctx, jobID); err == nil {
+			run = restored
+		}
+	}
+	if run == nil {
+		candidate, ok, err := o.newPersistedTextRun(ctx, agentName, jobID, in.Subject, in.Grade)
+		if err != nil || !ok {
+			return GradingJobView{}, ok, err
+		}
+		o.mu.Lock()
+		if existing := o.runs[jobID]; existing != nil {
+			run = existing
+		} else {
+			o.runs[jobID] = candidate
+			run = candidate
+		}
+		o.mu.Unlock()
+		if err := o.persistRun(jobID, run); err != nil {
+			return GradingJobView{}, true, fmt.Errorf("usecase: 固化 webhook 文本运行时: %w", err)
+		}
+	}
+	if !run.textOnly || run.agentName != strings.TrimSpace(agentName) {
+		return GradingJobView{}, false, nil
+	}
+	return o.confirmRegisteredGradingJob(ctx, jobID, run, in)
+}
+
+func (o *GradingOrchestrator) newPersistedTextRun(
+	ctx context.Context,
+	agentName, jobID, subject, grade string,
+) (*gradingRun, bool, error) {
+	agentName = strings.TrimSpace(agentName)
+	job, err := o.deps.GetGradingJob(ctx, agentName, jobID)
+	if err != nil {
+		return nil, false, err
+	}
+	if job.Fields.SourceKind != "webhook" || !strings.HasPrefix(job.Fields.SubmissionID, "webhook-receipt:") {
+		return nil, false, nil
+	}
+	if o.deps.Records == nil {
+		return nil, true, fmt.Errorf("usecase: typed Problem/Attempt store 未配置")
+	}
+	snapshot, err := o.deps.Records.GetProblemAttemptSnapshot(ctx, agentName, job.Fields.SubmissionID)
+	if err != nil {
+		return nil, true, fmt.Errorf("usecase: 读取 webhook 文本 Problem/Attempt: %w", err)
+	}
+	questions, err := RecognizedQuestionsFromProblemAttemptSnapshot(snapshot)
+	if err != nil {
+		return nil, true, err
+	}
+	if strings.TrimSpace(subject) == "" {
+		for _, question := range questions {
+			if strings.TrimSpace(question.Subject) != "" {
+				subject = question.Subject
+				break
+			}
+		}
+	}
+	return &gradingRun{
+		agentName: agentName,
+		textOnly:  true,
+		req: PhotoGradeRequest{
+			AgentName: agentName, Subject: strings.TrimSpace(subject), Grade: strings.TrimSpace(grade),
+			SourceSession: job.Record.SourceSession, Image: k12TextPipelineToken(job.Fields.SubmissionID),
+		},
+		questions: questions,
+	}, true, nil
+}
+
+func k12TextPipelineToken(submissionID string) []byte {
+	return []byte("hexclaw:k12:text-run:v1\x00" + strings.TrimSpace(submissionID))
+}
+
+func (o *GradingOrchestrator) confirmRegisteredGradingJob(
+	ctx context.Context,
+	jobID string,
+	run *gradingRun,
+	in ConfirmPhotoGradingInput,
+) (GradingJobView, bool, error) {
 	l := o.jobLock(jobID)
 	l.Lock()
-	applyGradingCorrections(run, in)
-	if perr := o.persistRun(jobID, run); perr != nil {
+	// 先在副本上完成修正与风险校验。拒绝的命令不得污染内存或 run.json 中的冻结事实。
+	candidate := *run
+	candidate.req = run.req
+	candidate.questions = cloneRecognizedQuestions(run.questions)
+	candidate.anchored = cloneRecognizedQuestions(run.anchored)
+	if err := applyAndValidateGradingConfirmation(&candidate, in); err != nil {
+		l.Unlock()
+		return GradingJobView{}, true, err
+	}
+	job, jerr := o.deps.GetGradingJob(ctx, run.agentName, jobID)
+	if jerr != nil {
+		l.Unlock()
+		return GradingJobView{}, true, jerr
+	}
+	// Validate the state transition before writing candidate canonical facts.
+	// Otherwise a duplicate/late confirm could bump ConfirmedVersion even though
+	// the GradingJob command is rejected as a conflict.
+	if job.Record.Status != k12.GradingStageAwaitingConfirmation ||
+		job.Fields.ConfirmationState != k12.GradingConfirmationPending {
+		l.Unlock()
+		return GradingJobView{}, true, errGradingStageConflict(
+			"阶段 %s 不可确认（仅 awaiting_confirmation/pending）", job.Record.Status,
+		)
+	}
+	confirmedFacts := candidate.questions
+	if candidate.anchored != nil {
+		confirmedFacts = candidate.anchored
+	}
+	if perr := o.persistProblemAttemptFacts(ctx, run.agentName, job.Fields.SubmissionID, confirmedFacts); perr != nil {
+		l.Unlock()
+		return GradingJobView{}, true, fmt.Errorf("usecase: 固化确认后的 Problem/Attempt: %w", perr)
+	}
+	if perr := o.persistRun(jobID, &candidate); perr != nil {
 		l.Unlock()
 		return GradingJobView{}, true, fmt.Errorf("usecase: 固化确认后的识别产物: %w", perr)
 	}
-	v, err := o.deps.ConfirmGradingJob(ctx, run.agentName, jobID, gradingCorrectionStrings(in))
+	canonicalDigest := CanonicalRecognizedQuestionsDigest(candidate.questions)
+	v, err := o.deps.ConfirmGradingJob(ctx, run.agentName, jobID, []string{"canonical-recognition:" + canonicalDigest})
+	if err == nil {
+		run.req = candidate.req
+		run.questions = candidate.questions
+		run.anchored = candidate.anchored
+	}
 	l.Unlock()
 	if err != nil {
 		return GradingJobView{}, true, err
@@ -146,8 +344,41 @@ func (o *GradingOrchestrator) RetryPhotoGradingJob(ctx context.Context, jobID st
 
 // RecognizedQuestions 取识别停点产物（锚点已回位时含 BBox），供确认界面回显。
 func (o *GradingOrchestrator) RecognizedQuestions(ctx context.Context, jobID string) ([]RecognizedQuestion, bool) {
+	return o.recognizedQuestions(ctx, "", jobID)
+}
+
+// RecognizedQuestionsForOwner is the HTTP/public projection boundary. Text
+// webhook submissions have durable typed facts but deliberately no photo
+// run.json; the explicit owner lets this lookup recover those facts without a
+// cross-Tutor record scan.
+func (o *GradingOrchestrator) RecognizedQuestionsForOwner(ctx context.Context, agentName, jobID string) ([]RecognizedQuestion, bool) {
+	return o.recognizedQuestions(ctx, strings.TrimSpace(agentName), jobID)
+}
+
+func (o *GradingOrchestrator) recognizedQuestions(ctx context.Context, agentName, jobID string) ([]RecognizedQuestion, bool) {
 	run, err := o.ensureRun(ctx, jobID)
 	if err != nil {
+		if agentName != "" {
+			if typed, ok := o.typedRecognizedQuestions(ctx, jobID, agentName); ok {
+				return typed, true
+			}
+		}
+		archived, ok := o.archivedRecognizedQuestions(jobID)
+		if !ok || len(archived) == 0 {
+			return nil, false
+		}
+		if agentName != "" {
+			audit, auditOK := o.readRecognitionAudit(jobID)
+			if !auditOK || audit.AgentName != agentName {
+				return nil, false
+			}
+		}
+		if typed, typedOK := o.typedRecognizedQuestions(ctx, jobID, ""); typedOK {
+			return typed, true
+		}
+		return archived, true
+	}
+	if agentName != "" && run.agentName != agentName {
 		return nil, false
 	}
 	l := o.jobLock(jobID)
@@ -156,11 +387,39 @@ func (o *GradingOrchestrator) RecognizedQuestions(ctx context.Context, jobID str
 	if len(run.questions) == 0 {
 		return nil, false
 	}
+	if typed, ok := o.typedRecognizedQuestions(ctx, jobID, run.agentName); ok {
+		return typed, true
+	}
 	qs := run.questions
 	if run.anchored != nil {
 		qs = run.anchored
 	}
-	return append([]RecognizedQuestion(nil), qs...), true
+	return cloneRecognizedQuestions(qs), true
+}
+
+func (o *GradingOrchestrator) typedRecognizedQuestions(ctx context.Context, jobID, agentName string) ([]RecognizedQuestion, bool) {
+	if o == nil || o.deps.Records == nil {
+		return nil, false
+	}
+	// Terminal release may remove run.json. The append-only audit keeps the owner
+	// needed to scope the typed lookup without ever querying across Tutor instances.
+	if agentName == "" {
+		audit, ok := o.readRecognitionAudit(jobID)
+		if !ok {
+			return nil, false
+		}
+		agentName = audit.AgentName
+	}
+	job, err := o.deps.GetGradingJob(ctx, agentName, jobID)
+	if err != nil {
+		return nil, false
+	}
+	snapshot, err := o.deps.Records.GetProblemAttemptSnapshot(ctx, agentName, job.Fields.SubmissionID)
+	if err != nil {
+		return nil, false
+	}
+	questions, err := RecognizedQuestionsFromProblemAttemptSnapshot(snapshot)
+	return questions, err == nil
 }
 
 // RecoverGradingJobs 启动扫描（§6.15 崩溃恢复）：逐实例列非终态 GradingJob，从落盘运行时
@@ -220,51 +479,111 @@ func (o *GradingOrchestrator) RecoverGradingJobs(ctx context.Context, agents []s
 
 // applyGradingCorrections 把逐题修正同时应用到核心识别产物与锚点增强产物（assessing 消费
 // 的是两者回放，必须同步改）；整卷 subject/grade 覆盖批改请求。
-func applyGradingCorrections(run *gradingRun, in ConfirmPhotoGradingInput) {
+func applyGradingCorrections(run *gradingRun, in ConfirmPhotoGradingInput) (map[string]bool, error) {
 	if strings.TrimSpace(in.Subject) != "" {
 		run.req.Subject = in.Subject
 	}
 	if strings.TrimSpace(in.Grade) != "" {
 		run.req.Grade = in.Grade
 	}
+	confirmed := make(map[string]bool, len(in.Corrections))
+	seenTargets := make(map[string]struct{}, len(in.Corrections))
 	for _, c := range in.Corrections {
+		index := gradingCorrectionIndex(run.questions, c)
+		if index < 0 || index >= len(run.questions) {
+			return nil, fmt.Errorf("%w: question_correction target 不存在（problem_id=%q index=%d）", ErrInvalidInput, c.ProblemID, c.Index)
+		}
+		targetID := run.questions[index].ProblemID
+		if _, duplicate := seenTargets[targetID]; duplicate {
+			return nil, fmt.Errorf("%w: problem %s 存在重复 question_correction", ErrInvalidInput, targetID)
+		}
+		seenTargets[targetID] = struct{}{}
+		if c.AnswerState != "" && c.AnswerState != AnswerStateBlank && c.AnswerState != AnswerStatePresent && c.AnswerState != AnswerStateUnclear {
+			return nil, fmt.Errorf("%w: problem %s answer_state 非法: %q", ErrInvalidInput, targetID, c.AnswerState)
+		}
 		for _, list := range [][]RecognizedQuestion{run.questions, run.anchored} {
-			if c.Index < 0 || c.Index >= len(list) {
+			index := gradingCorrectionIndex(list, GradingQuestionCorrection{ProblemID: targetID, Index: index})
+			if index < 0 || index >= len(list) {
 				continue
 			}
-			q := &list[c.Index]
-			if strings.TrimSpace(c.Question) != "" {
-				q.Question = c.Question
+			q := &list[index]
+			canonicalChanged := false
+			canonicalQuestion := firstNonEmpty(c.CanonicalMarkdown, c.Question)
+			if strings.TrimSpace(canonicalQuestion) != "" && canonicalQuestion != q.CanonicalMarkdown {
+				q.CanonicalMarkdown = canonicalQuestion
+				canonicalChanged = true
 			}
-			if c.StudentAnswer != "" {
-				q.StudentAnswer = c.StudentAnswer
+			canonicalAnswer := firstNonEmpty(c.AnswerCanonicalMarkdown, c.StudentAnswer)
+			if canonicalAnswer != "" && canonicalAnswer != q.AnswerCanonicalMarkdown {
+				q.AnswerCanonicalMarkdown = canonicalAnswer
+				canonicalChanged = true
 				q.AnswerState = AnswerStatePresent
 			}
 			if c.AnswerState != "" {
 				q.AnswerState = c.AnswerState
-				if c.AnswerState != AnswerStatePresent {
-					q.StudentAnswer = ""
-				}
 			}
-			if strings.TrimSpace(c.Subject) != "" {
+			if strings.TrimSpace(c.Subject) != "" && q.Subject != strings.TrimSpace(c.Subject) {
 				q.Subject = c.Subject
+				canonicalChanged = true
+			}
+			if canonicalChanged {
+				q.CanonicalVersion++
 			}
 			*q = NormalizeRecognizedQuestion(*q)
+			if c.Confirmed {
+				confirmed[q.ProblemID] = true
+			}
 		}
 	}
+	return confirmed, nil
 }
 
-// gradingCorrectionStrings 结构化修正 → 确认检查点摘要输入（canonical 串，稳定可复算）。
-func gradingCorrectionStrings(in ConfirmPhotoGradingInput) []string {
-	if in.Subject == "" && in.Grade == "" && len(in.Corrections) == 0 {
-		return nil
+func gradingCorrectionIndex(questions []RecognizedQuestion, correction GradingQuestionCorrection) int {
+	if id := strings.TrimSpace(correction.ProblemID); id != "" {
+		for i := range questions {
+			if questions[i].ProblemID == id {
+				return i
+			}
+		}
+		return -1
 	}
-	out := make([]string, 0, len(in.Corrections)+1)
-	out = append(out, fmt.Sprintf("sheet|%s|%s", in.Subject, in.Grade))
-	for _, c := range in.Corrections {
-		out = append(out, fmt.Sprintf("%d|%s|%s|%s|%s", c.Index, c.Question, c.StudentAnswer, c.AnswerState, c.Subject))
+	return correction.Index
+}
+
+func applyAndValidateGradingConfirmation(run *gradingRun, in ConfirmPhotoGradingInput) error {
+	confirmed, err := applyGradingCorrections(run, in)
+	if err != nil {
+		return err
 	}
-	return out
+	for i := range run.questions {
+		q := NormalizeRecognizedQuestion(run.questions[i])
+		if !CanonicalMarkdownValid(q.CanonicalMarkdown) ||
+			(q.AnswerState == AnswerStatePresent && !CanonicalMarkdownValid(q.AnswerCanonicalMarkdown)) {
+			return fmt.Errorf("%w: problem %s canonical Markdown/LaTeX 无法解析，请先逐题修正", ErrInvalidInput, q.ProblemID)
+		}
+		if q.ConfirmationRequired && !confirmed[q.ProblemID] {
+			return fmt.Errorf("%w: problem %s 需逐题确认（%s）", ErrInvalidInput, q.ProblemID, joinOCRRiskReasons(q.ConfirmationReasons))
+		}
+		q.ConfirmedVersion++
+		run.questions[i] = q
+	}
+	run.questions = FreezeRecognizedQuestionInputDigests(run.questions, run.req.Grade)
+	// anchored 是 geometry 投影，确认版本必须与 canonical 同步，且禁止反向覆盖事实。
+	if run.anchored != nil {
+		run.anchored = mergeAnchorGeometry(run.questions, run.anchored)
+		for i := range run.anchored {
+			run.anchored[i].ConfirmedVersion = run.questions[i].ConfirmedVersion
+		}
+	}
+	return nil
+}
+
+func joinOCRRiskReasons(reasons []OCRRiskReason) string {
+	parts := make([]string, len(reasons))
+	for i := range reasons {
+		parts[i] = string(reasons[i])
+	}
+	return strings.Join(parts, ",")
 }
 
 // --- 运行时落盘 ---
@@ -272,6 +591,7 @@ func gradingCorrectionStrings(in ConfirmPhotoGradingInput) []string {
 // gradingRunFile run.json 结构（原图独立存 image.bin，避免每次改写都重写大字节）。
 type gradingRunFile struct {
 	AgentName     string               `json:"agent_name"`
+	TextOnly      bool                 `json:"text_only,omitempty"`
 	Subject       string               `json:"subject,omitempty"`
 	Grade         string               `json:"grade,omitempty"`
 	SourceSession string               `json:"source_session,omitempty"`
@@ -282,8 +602,24 @@ type gradingRunFile struct {
 	Result        *PhotoGradeResult    `json:"result,omitempty"`
 }
 
+type gradingRecognitionAuditFile struct {
+	JobID           string               `json:"job_id"`
+	AgentName       string               `json:"agent_name"`
+	CanonicalDigest string               `json:"canonical_digest"`
+	Questions       []RecognizedQuestion `json:"questions"`
+	ArchivedAt      int64                `json:"archived_at"`
+}
+
 func (o *GradingOrchestrator) runPath(jobID string, file string) string {
 	return filepath.Join(o.runDir, jobID, file)
+}
+
+func (o *GradingOrchestrator) persistProblemAttemptFacts(ctx context.Context, agentName, submissionID string, questions []RecognizedQuestion) error {
+	snapshot, err := RecognizedQuestionsProblemAttemptSnapshot(agentName, submissionID, questions, o.deps.now())
+	if err != nil {
+		return err
+	}
+	return o.deps.Records.PutProblemAttemptSnapshot(ctx, snapshot)
 }
 
 // persistRun 落盘运行时状态（runDir 未启用时为 no-op）。原图只写一次（内容不变）。
@@ -295,14 +631,16 @@ func (o *GradingOrchestrator) persistRun(jobID string, run *gradingRun) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("建运行时目录: %w", err)
 	}
-	imgPath := o.runPath(jobID, "image.bin")
-	if _, err := os.Stat(imgPath); err != nil {
-		if werr := atomicWriteFile(imgPath, run.req.Image); werr != nil {
-			return fmt.Errorf("固化原图: %w", werr)
+	if !run.textOnly {
+		imgPath := o.runPath(jobID, "image.bin")
+		if _, err := os.Stat(imgPath); err != nil {
+			if werr := atomicWriteFile(imgPath, run.req.Image); werr != nil {
+				return fmt.Errorf("固化原图: %w", werr)
+			}
 		}
 	}
 	meta := gradingRunFile{
-		AgentName: run.agentName, Subject: run.req.Subject, Grade: run.req.Grade,
+		AgentName: run.agentName, TextOnly: run.textOnly, Subject: run.req.Subject, Grade: run.req.Grade,
 		SourceSession: run.req.SourceSession,
 		Questions:     run.questions, Anchored: run.anchored, AnchorFailed: run.anchorFailed,
 		RenderFailure: run.renderFailure, Result: run.result,
@@ -333,26 +671,43 @@ func (o *GradingOrchestrator) ensureRun(ctx context.Context, jobID string) (*gra
 	if err := json.Unmarshal(raw, &meta); err != nil {
 		return nil, fmt.Errorf("usecase: 批改任务 %s 运行时状态损坏: %w", jobID, err)
 	}
-	image, err := os.ReadFile(o.runPath(jobID, "image.bin"))
-	if err != nil {
-		return nil, fmt.Errorf("usecase: 批改任务 %s 原图不可读: %w", jobID, err)
-	}
-	// 内容校验：SubmissionID = photo-sha1(原图)，防落盘文件被替换/半写。
 	v, err := o.deps.GetGradingJob(ctx, meta.AgentName, jobID)
 	if err != nil {
 		return nil, err
 	}
-	sum := sha1.Sum(image)
-	if want := "photo-" + hex.EncodeToString(sum[:]); v.Fields.SubmissionID != want {
-		return nil, fmt.Errorf("usecase: 批改任务 %s 原图校验失败（submission=%s 实测=%s）", jobID, v.Fields.SubmissionID, want)
+	var image []byte
+	questions := meta.Questions
+	if meta.TextOnly {
+		if v.Fields.SourceKind != "webhook" || !strings.HasPrefix(v.Fields.SubmissionID, "webhook-receipt:") || o.deps.Records == nil {
+			return nil, fmt.Errorf("usecase: 批改任务 %s text-only 身份无效", jobID)
+		}
+		typed, err := o.deps.Records.GetProblemAttemptSnapshot(ctx, meta.AgentName, v.Fields.SubmissionID)
+		if err != nil {
+			return nil, fmt.Errorf("usecase: 批改任务 %s typed 文本事实不可读: %w", jobID, err)
+		}
+		questions, err = RecognizedQuestionsFromProblemAttemptSnapshot(typed)
+		if err != nil {
+			return nil, fmt.Errorf("usecase: 批改任务 %s typed 文本事实损坏: %w", jobID, err)
+		}
+		image = k12TextPipelineToken(v.Fields.SubmissionID)
+	} else {
+		image, err = os.ReadFile(o.runPath(jobID, "image.bin"))
+		if err != nil {
+			return nil, fmt.Errorf("usecase: 批改任务 %s 原图不可读: %w", jobID, err)
+		}
+		// 内容校验：SubmissionID = photo-sha1(原图)，防落盘文件被替换/半写。
+		sum := sha1.Sum(image)
+		if want := "photo-" + hex.EncodeToString(sum[:]); v.Fields.SubmissionID != want {
+			return nil, fmt.Errorf("usecase: 批改任务 %s 原图校验失败（submission=%s 实测=%s）", jobID, v.Fields.SubmissionID, want)
+		}
 	}
 	run := &gradingRun{
-		agentName: meta.AgentName,
+		agentName: meta.AgentName, textOnly: meta.TextOnly,
 		req: PhotoGradeRequest{
 			AgentName: meta.AgentName, Subject: meta.Subject, Grade: meta.Grade,
 			SourceSession: meta.SourceSession, Image: image,
 		},
-		questions: meta.Questions, anchored: meta.Anchored, anchorFailed: meta.AnchorFailed,
+		questions: questions, anchored: meta.Anchored, anchorFailed: meta.AnchorFailed,
 		renderFailure: meta.RenderFailure, result: meta.Result,
 	}
 	o.mu.Lock()
@@ -363,6 +718,64 @@ func (o *GradingOrchestrator) ensureRun(ctx context.Context, jobID string) (*gra
 	}
 	o.mu.Unlock()
 	return run, nil
+}
+
+func (o *GradingOrchestrator) recognitionAuditPath(jobID string) string {
+	return filepath.Join(o.runDir, "recognition-audit", jobID+".json")
+}
+
+// archiveRecognitionFacts 是终态 append-only 审计载体。它不保存原图和最终生成内容，
+// 只保存识别 raw/canonical 及确认所需结构事实；已存在时不覆盖，避免晚到调用改写历史。
+func (o *GradingOrchestrator) archiveRecognitionFacts(jobID string, run *gradingRun) error {
+	if o.runDir == "" || run == nil || strings.TrimSpace(jobID) == "" || len(run.questions) == 0 {
+		return nil
+	}
+	path := o.recognitionAuditPath(jobID)
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("检查识别审计归档: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("创建识别审计目录: %w", err)
+	}
+	audit := gradingRecognitionAuditFile{
+		JobID: jobID, AgentName: run.agentName,
+		CanonicalDigest: CanonicalRecognizedQuestionsDigest(run.questions),
+		Questions:       cloneRecognizedQuestions(run.questions), ArchivedAt: time.Now().Unix(),
+	}
+	raw, err := json.Marshal(audit)
+	if err != nil {
+		return fmt.Errorf("marshal 识别审计归档: %w", err)
+	}
+	if err := atomicWriteFileNoReplace(path, raw); err != nil {
+		return fmt.Errorf("写识别审计归档: %w", err)
+	}
+	return nil
+}
+
+func (o *GradingOrchestrator) archivedRecognizedQuestions(jobID string) ([]RecognizedQuestion, bool) {
+	audit, ok := o.readRecognitionAudit(jobID)
+	if !ok {
+		return nil, false
+	}
+	return cloneRecognizedQuestions(audit.Questions), true
+}
+
+func (o *GradingOrchestrator) readRecognitionAudit(jobID string) (gradingRecognitionAuditFile, bool) {
+	if o.runDir == "" || strings.TrimSpace(jobID) == "" {
+		return gradingRecognitionAuditFile{}, false
+	}
+	raw, err := os.ReadFile(o.recognitionAuditPath(jobID))
+	if err != nil {
+		return gradingRecognitionAuditFile{}, false
+	}
+	var audit gradingRecognitionAuditFile
+	if json.Unmarshal(raw, &audit) != nil || audit.JobID != jobID || len(audit.Questions) == 0 ||
+		audit.CanonicalDigest != CanonicalRecognizedQuestionsDigest(audit.Questions) {
+		return gradingRecognitionAuditFile{}, false
+	}
+	return audit, true
 }
 
 // releaseRunFiles 删除落盘运行时（投递完成/终态清理）。
@@ -392,6 +805,33 @@ func atomicWriteFile(path string, data []byte) error {
 	}
 	if err := os.Rename(name, path); err != nil {
 		os.Remove(name)
+		return err
+	}
+	return nil
+}
+
+// atomicWriteFileNoReplace 通过同目录临时文件 + hard link 原子发布只追加事实；目标已存在
+// 视为幂等成功，任何重复 Release 都不能覆盖首次归档。
+func atomicWriteFileNoReplace(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".audit-tmp-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Link(name, path); err != nil && !os.IsExist(err) {
 		return err
 	}
 	return nil

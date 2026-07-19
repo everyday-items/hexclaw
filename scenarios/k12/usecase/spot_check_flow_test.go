@@ -118,9 +118,7 @@ func TestSpotCheck_GradeOutcomePassedAndFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.SubmitPracticeSet(context.Background(), "xiaoming", v.Record.RecordID); err != nil {
-		t.Fatal(err)
-	}
+	submitWholeSet(t, d, "xiaoming", v.Record.RecordID)
 	results := []usecase.PracticeGradeResult{}
 	for _, it := range v.Fields.Items {
 		correct := it.SourceProblemID == passID
