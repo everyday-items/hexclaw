@@ -91,6 +91,15 @@ func TestWorkflowRun_ParallelStage(t *testing.T) {
 	if len(got.NodeResults) != 4 {
 		t.Fatalf("期望 4 个节点结果，实际 %d", len(got.NodeResults))
 	}
+	if got.MessageContent == nil || got.MessageContent.ProducerKind != "workflow" {
+		t.Fatalf("workflow output omitted canonical content: %#v", got.MessageContent)
+	}
+	if got.RenderManifest == nil || got.RenderManifest.SourceDigest != got.MessageContent.SourceDigest {
+		t.Fatalf("workflow output omitted same-source render evidence: content=%#v manifest=%#v", got.MessageContent, got.RenderManifest)
+	}
+	if last := s.engine.(*workflowTestEngine).lastMsg; last == nil || last.Metadata["producer_kind"] != "workflow" {
+		t.Fatalf("workflow engine dispatch omitted producer stamp: %#v", last)
+	}
 }
 
 // TestWorkflowRun_FrontendFieldNames 验证 parse 兼容前端 CanvasNode/CanvasEdge 的字段名：

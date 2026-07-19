@@ -23,6 +23,7 @@ func TestBug20260712_NormalizeMathText(t *testing.T) {
 		// 上下标 → Unicode（x²、H₂O、10⁻³）
 		{`x^2 + y^{2} = r^2`, `x² + y² = r²`},
 		{`H_2O 与 CO_{2}`, `H₂O 与 CO₂`},
+		{`水的化学式是 $H_2O$`, `水的化学式是 H₂O`},
 		{`10^{-3} 和 2^{n}`, `10⁻³ 和 2ⁿ`},
 		// \text{}/\mathrm{} 单位剥壳 + 细空格 + 上标（真机桌面「再练一道」原样取证）
 		{`\( V = l \times w \times h \)`, `V = l × w × h`},

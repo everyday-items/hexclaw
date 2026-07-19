@@ -96,6 +96,36 @@ func TestLocalNumCtxCap_InjectedForLocalProvider(t *testing.T) {
 	}
 }
 
+func TestProviderLocality_ExplicitLocalConfigDrivesEnginePolicyWithoutNameHeuristic(t *testing.T) {
+	p := &numCtxCaptureProvider{}
+	eng := numCtxEngine(t, "private-box", config.LLMProviderConfig{
+		Model: "qwen3.5:9b", Locality: config.ProviderLocalityLocal, NumCtx: 4096,
+	}, p)
+	if _, err := eng.Process(context.Background(), &adapter.Message{
+		ID: "nc-explicit-local", Platform: adapter.PlatformAPI, UserID: "u", Content: "你好",
+	}); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if got := p.firstNumCtx(t); !numCtxEquals(got, 4096) {
+		t.Fatalf("explicit locality=local must drive engine policy even when provider name has no local marker, got %v", got)
+	}
+}
+
+func TestProviderLocality_ExplicitCloudOverridesLocalLookingNameInEnginePolicy(t *testing.T) {
+	p := &numCtxCaptureProvider{}
+	eng := numCtxEngine(t, "local-cloud-gateway", config.LLMProviderConfig{
+		Model: "qwen3.5:9b", Locality: config.ProviderLocalityCloud, NumCtx: 4096,
+	}, p)
+	if _, err := eng.Process(context.Background(), &adapter.Message{
+		ID: "nc-explicit-cloud", Platform: adapter.PlatformAPI, UserID: "u", Content: "你好",
+	}); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if got := p.firstNumCtx(t); got != nil {
+		t.Fatalf("explicit locality=cloud must override a local-looking provider name, got num_ctx %v", got)
+	}
+}
+
 // TestLocalNumCtxCap_NotInjectedWhenUnset 未配置 num_ctx → 不注入（保持 ai-core 自动分档，不影响大内存机）。
 func TestLocalNumCtxCap_NotInjectedWhenUnset(t *testing.T) {
 	p := &numCtxCaptureProvider{}

@@ -7,6 +7,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/knowledge"
 	"github.com/hexagon-codes/hexclaw/memory/recall"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 )
 
 // retrievalHitsSink 收集本轮请求的 RAG/记忆检索命中，供 finalize（done chunk）与
@@ -50,10 +51,11 @@ func recordKnowledgeHits(ctx context.Context, hits []knowledge.SearchHit) {
 	mapped := make([]adapter.KnowledgeHit, 0, len(hits))
 	for _, h := range hits {
 		mapped = append(mapped, adapter.KnowledgeHit{
-			DocTitle: h.DocTitle,
-			Source:   h.Source,
-			Content:  h.Content,
-			Score:    h.Score,
+			DocTitle:       h.DocTitle,
+			Source:         h.Source,
+			Content:        h.Content,
+			Score:          h.Score,
+			MessageContent: canonicalProducerContent(messagecontent.ProducerRAG, h.Content, "und"),
 		})
 	}
 	s.mu.Lock()
@@ -73,8 +75,9 @@ func recordMemoryHits(ctx context.Context, role string, entries []recall.Entry) 
 	mapped := make([]adapter.MemoryHit, 0, len(entries))
 	for _, en := range entries {
 		mapped = append(mapped, adapter.MemoryHit{
-			Content: en.Content,
-			Source:  role,
+			Content:        en.Content,
+			Source:         role,
+			MessageContent: canonicalProducerContent(messagecontent.ProducerRAG, en.Content, "und"),
 		})
 	}
 	s.mu.Lock()

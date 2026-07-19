@@ -13,6 +13,7 @@ import (
 	"github.com/hexagon-codes/hexagon/observe/trace"
 	hruntime "github.com/hexagon-codes/hexagon/runtime"
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 )
 
 type runtimeProviderSelector struct {
@@ -378,12 +379,14 @@ func (runtimeCompactionMiddleware) Finalize(context.Context, *hruntime.State) er
 func runtimeToolCallsToAdapter(calls []hruntime.ToolCallRecord) []adapter.ToolCall {
 	result := make([]adapter.ToolCall, 0, len(calls))
 	for _, c := range calls {
+		displayResult := truncateToolResultForDisplay(c.Name, c.Result.Content)
 		result = append(result, adapter.ToolCall{
 			ID:        c.ID,
 			Name:      c.Name,
 			Arguments: c.Arguments,
 			// 多 Agent 工具(orchestrate/spawn)放宽展示上限以保全尾部 hexclaw-subagents 哨兵块。
-			Result: truncateToolResultForDisplay(c.Name, c.Result.Content),
+			Result:         displayResult,
+			MessageContent: canonicalProducerContent(messagecontent.ProducerTool, displayResult, "und"),
 			// 透传 hexagon 框架在执行点产出的执行真相（状态/耗时），客户端免去正文嗅探。
 			Status:     string(c.Result.Status),
 			DurationMs: c.Result.DurationMs,
@@ -409,16 +412,22 @@ func runtimeBlocksToAdapter(blocks template.Blocks) []adapter.Block {
 	for _, b := range blocks {
 		switch b.Type {
 		case template.BlockText:
-			out = append(out, adapter.Block{Type: "text", Text: b.Text})
+			out = append(out, adapter.Block{
+				Type:           "text",
+				Text:           b.Text,
+				MessageContent: canonicalProducerContent(messagecontent.ProducerChat, b.Text, "und"),
+			})
 		case template.BlockToolUse:
 			out = append(out, adapter.Block{Type: "tool_use", ID: b.ID, Name: b.Name, Input: b.Input})
 		case template.BlockToolResult:
+			output := truncateToolResultForDisplay(names[b.ToolUseID], b.Output)
 			out = append(out, adapter.Block{
-				Type:      "tool_result",
-				ToolUseID: b.ToolUseID,
-				ToolName:  names[b.ToolUseID],
-				Output:    truncateToolResultForDisplay(names[b.ToolUseID], b.Output),
-				IsError:   b.IsError,
+				Type:           "tool_result",
+				MessageContent: canonicalProducerContent(messagecontent.ProducerTool, output, "und"),
+				ToolUseID:      b.ToolUseID,
+				ToolName:       names[b.ToolUseID],
+				Output:         output,
+				IsError:        b.IsError,
 			})
 		}
 	}

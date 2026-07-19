@@ -23,6 +23,7 @@ import (
 	"github.com/hexagon-codes/hexagon/observe/trace"
 	hruntime "github.com/hexagon-codes/hexagon/runtime"
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 )
 
 // cronDispatchSource is the metadata marker for messages dispatched by the
@@ -59,7 +60,12 @@ func NewCronDispatchMessage(userID, chatID, jobID, prompt string) *adapter.Messa
 		UserID:   userID,
 		ChatID:   chatID,
 		Content:  prompt + cronOutcomeContract,
-		Metadata: map[string]string{"source": cronDispatchSource, "cron_job_id": jobID},
+		Metadata: map[string]string{
+			"source":        cronDispatchSource,
+			"cron_job_id":   jobID,
+			"producer_kind": string(messagecontent.ProducerCron),
+			"locale":        "und",
+		},
 	}
 }
 

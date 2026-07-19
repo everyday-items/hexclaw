@@ -12,6 +12,7 @@ import (
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/engine"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 )
 
@@ -150,6 +151,13 @@ func (e *workflowExecutor) execute(ctx context.Context, run *WorkflowRun) *Workf
 	finished := *run
 	finished.Status = "completed"
 	finished.Output = output
+	finished.MessageContent, finished.RenderManifest = canonicalRenderProjection(
+		messagecontent.ProducerWorkflow,
+		firstNonEmpty(e.req.Metadata["locale"], "und"),
+		output,
+		messagecontent.SurfaceHistory,
+		"workflow-history-v1",
+	)
 	finished.NodeResults = e.listNodeRuns()
 	finished.FinishedAt = time.Now()
 	return &finished
@@ -427,6 +435,10 @@ func (e *workflowExecutor) executeAgent(ctx context.Context, node *workflowNode,
 	metadata["workflow_id"] = e.wf.ID
 	metadata["workflow_node_id"] = node.ID
 	metadata["source"] = "workflow"
+	metadata["producer_kind"] = string(messagecontent.ProducerWorkflow)
+	if strings.TrimSpace(metadata["locale"]) == "" {
+		metadata["locale"] = "und"
+	}
 
 	reply, err := e.server.engine.Process(ctx, (&agentrouterMessageAdapter{
 		UserID:     firstNonEmpty(e.req.UserID, "workflow-"+e.wf.ID),

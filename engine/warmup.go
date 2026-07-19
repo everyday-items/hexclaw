@@ -81,7 +81,7 @@ func (e *ReActEngine) WarmupLocalDefaultModel(ctx context.Context) (warmed bool,
 	if serr != nil {
 		return false, serr
 	}
-	if !isLocalProvider(selection.providerName) {
+	if !e.providerIsLocal(selection.providerName) {
 		return false, nil
 	}
 

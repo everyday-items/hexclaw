@@ -32,6 +32,12 @@ var latexSymbolReplacer = strings.NewReplacer(
 	`\approx`, "≈",
 	`\infty`, "∞",
 	`\pi`, "π",
+	`\alpha`, "α",
+	`\beta`, "β",
+	`\sum`, "∑",
+	`\int`, "∫",
+	`\left`, "",
+	`\right`, "",
 	`\degree`, "°",
 )
 
@@ -51,6 +57,10 @@ var (
 	reDollar  = regexp.MustCompile(`\$([^$\n]+)\$`)
 	reParen   = regexp.MustCompile(`\\\(\s*(.*?)\s*\\\)`)
 	reBracket = regexp.MustCompile(`\\\[\s*(.*?)\s*\\\]`)
+	// Common display environments degrade to readable lines; braces are layout,
+	// not mathematical facts. Unknown environments remain untouched and fail
+	// closed at the channel manifest boundary.
+	reBeginEnd = regexp.MustCompile(`\\(?:begin|end)\s*\{(?:aligned|align\*?|gathered|cases)\}`)
 )
 
 // 上/下标 → Unicode（K12 常见：数字、正负号、括号、幂指 n）。
@@ -106,10 +116,12 @@ func NormalizeMathText(s string) string {
 	// 3. 剥成对数学定界符（内容保留）。放最后：内容已是 Unicode 符号。
 	out = reParen.ReplaceAllString(out, `$1`)
 	out = reBracket.ReplaceAllString(out, `$1`)
+	out = reBeginEnd.ReplaceAllString(out, "")
+	out = strings.ReplaceAll(out, `\\`, "\n")
 	// $...$ 仅当内含数学痕迹（数字/运算符/已转换符号）才剥，避免误伤 `$HOME 变量` 这类文本
 	out = reDollar.ReplaceAllStringFunc(out, func(m string) string {
 		inner := m[1 : len(m)-1]
-		if strings.ContainsAny(inner, "0123456789×÷±≤≥≠≈√π=+-*/^") {
+		if strings.ContainsAny(inner, "0123456789⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉×÷±≤≥≠≈√π=+-*/^") {
 			return inner
 		}
 		return m

@@ -191,6 +191,13 @@ type dingtalkGroupOpenAPI interface {
 	RecallGroup(ctx context.Context, accessToken, robotCode, conversationID string, processQueryKeys []string) error
 }
 
+// dingtalkReceiptOpenAPI is kept optional so existing transport fakes and
+// older providers retain the base send contract. The official implementation
+// exposes BatchOTOQuery and therefore satisfies it in production.
+type dingtalkReceiptOpenAPI interface {
+	QueryOTO(ctx context.Context, accessToken, robotCode, processQueryKey string) (sendStatus string, err error)
+}
+
 type dingtalkMediaOpenAPI interface {
 	UploadImage(ctx context.Context, accessToken string, attachment adapter.Attachment) (mediaID string, err error)
 }
@@ -498,6 +505,26 @@ func (c *officialDingtalkOpenAPI) SendOTO(_ context.Context, accessToken, robotC
 	return "", nil
 }
 
+func (c *officialDingtalkOpenAPI) QueryOTO(_ context.Context, accessToken, robotCode, processQueryKey string) (string, error) {
+	resp, err := c.robot.BatchOTOQueryWithOptions(
+		(&dtrobot.BatchOTOQueryRequest{}).
+			SetRobotCode(robotCode).
+			SetProcessQueryKey(processQueryKey),
+		(&dtrobot.BatchOTOQueryHeaders{}).SetXAcsDingtalkAccessToken(accessToken),
+		c.runtime,
+	)
+	if err != nil {
+		return "", err
+	}
+	if resp != nil && resp.StatusCode != nil && *resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("钉钉机器人回执查询返回 %d", *resp.StatusCode)
+	}
+	if resp == nil || resp.Body == nil || resp.Body.SendStatus == nil || strings.TrimSpace(*resp.Body.SendStatus) == "" {
+		return "", fmt.Errorf("钉钉机器人回执查询未返回 sendStatus")
+	}
+	return *resp.Body.SendStatus, nil
+}
+
 // RecallOTO 按 processQueryKey 撤回此前发送的单聊消息（用于答案就位后撤回「正在思考」占位）。
 func (c *officialDingtalkOpenAPI) RecallOTO(_ context.Context, accessToken, robotCode string, processQueryKeys []string) error {
 	keys := make([]*string, 0, len(processQueryKeys))
@@ -790,33 +817,112 @@ func (a *DingtalkAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 // 自动追加文本 fallback 让按钮/选项/审批/卡片在钉钉基础可用。
 func (a *DingtalkAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
 	adapter.MaybeApplyTextFallback(ctx, reply)
+	if err := ensureDingTalkRenderEvidence(reply); err != nil {
+		return fmt.Errorf("钉钉渲染协议校验失败: %w", err)
+	}
 	if a.queue == nil {
 		return a.sendReplyNow(ctx, chatID, reply)
 	}
 	return a.queue.Send(ctx, chatID, reply)
 }
 
-func (a *DingtalkAdapter) sendReplyNow(ctx context.Context, chatID string, reply *adapter.Reply) error {
-	if reply == nil {
-		return nil
+// SendWithReceipt sends through the same per-adapter queue as ordinary
+// messages and returns DingTalk's processQueryKey. A key is only provider
+// acceptance evidence; delivered is established later by QueryReceipt.
+func (a *DingtalkAdapter) SendWithReceipt(ctx context.Context, chatID string, reply *adapter.Reply) (adapter.DeliveryAck, error) {
+	if _, isGroup := parseGroupQueueTarget(chatID); isGroup {
+		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("钉钉投递回执只支持一对一私聊")
 	}
-	if conversationID, isGroup := parseGroupQueueTarget(chatID); isGroup {
-		return a.sendReplyToEventNow(ctx, dtEvent{ConversationType: "2", ConversationId: conversationID}, reply)
+	adapter.MaybeApplyTextFallback(ctx, reply)
+	if err := ensureDingTalkRenderEvidence(reply); err != nil {
+		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("钉钉渲染协议校验失败: %w", err)
+	}
+	var externalID string
+	send := func(sendCtx context.Context, target string, candidate *adapter.Reply) error {
+		var err error
+		externalID, err = a.sendReplyNowWithReceipt(sendCtx, target, candidate)
+		return err
+	}
+	var err error
+	if a.queue == nil {
+		err = send(ctx, chatID, reply)
+	} else {
+		err = a.queue.SendWith(ctx, chatID, reply, send)
+	}
+	if err != nil {
+		status := adapter.DeliveryFailed
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			status = adapter.DeliveryOutcomeUnknown
+		}
+		return adapter.DeliveryAck{Status: status}, err
+	}
+	if strings.TrimSpace(externalID) == "" {
+		return adapter.DeliveryAck{Status: adapter.DeliveryOutcomeUnknown}, fmt.Errorf("钉钉已受理发送但未返回 processQueryKey，结果待核实")
+	}
+	return adapter.DeliveryAck{ExternalMessageID: externalID, Status: adapter.DeliveryAccepted}, nil
+}
+
+func (a *DingtalkAdapter) QueryReceipt(ctx context.Context, externalMessageID string) (adapter.DeliveryAck, error) {
+	ack := adapter.DeliveryAck{ExternalMessageID: strings.TrimSpace(externalMessageID), Status: adapter.DeliveryOutcomeUnknown}
+	if ack.ExternalMessageID == "" {
+		return ack, fmt.Errorf("钉钉回执缺少 external_message_id")
 	}
 	token, err := a.getAccessToken(ctx)
 	if err != nil {
-		return fmt.Errorf("获取 Access Token 失败: %w", err)
+		return ack, fmt.Errorf("获取 Access Token 失败: %w", err)
+	}
+	api, err := a.apiClient()
+	if err != nil {
+		return ack, fmt.Errorf("初始化钉钉官方 SDK 失败: %w", err)
+	}
+	query, ok := api.(dingtalkReceiptOpenAPI)
+	if !ok {
+		return ack, fmt.Errorf("钉钉回执查询能力不可用")
+	}
+	status, err := query.QueryOTO(ctx, token, a.cfg.RobotCode, ack.ExternalMessageID)
+	if err != nil {
+		return ack, fmt.Errorf("查询钉钉投递回执失败: %w", err)
+	}
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case "SUCCESS", "SUCESS", "DELIVERED":
+		ack.Status = adapter.DeliveryDelivered
+	case "SENDING", "PENDING", "ACCEPTED":
+		ack.Status = adapter.DeliveryAccepted
+	case "FAILED", "FAIL", "ERROR":
+		ack.Status = adapter.DeliveryFailed
+	default:
+		ack.Status = adapter.DeliveryOutcomeUnknown
+	}
+	return ack, nil
+}
+
+func (a *DingtalkAdapter) sendReplyNow(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	_, err := a.sendReplyNowWithReceipt(ctx, chatID, reply)
+	return err
+}
+
+func (a *DingtalkAdapter) sendReplyNowWithReceipt(ctx context.Context, chatID string, reply *adapter.Reply) (string, error) {
+	if reply == nil {
+		return "", nil
+	}
+	if conversationID, isGroup := parseGroupQueueTarget(chatID); isGroup {
+		return "", a.sendReplyToEventNow(ctx, dtEvent{ConversationType: "2", ConversationId: conversationID}, reply)
+	}
+	token, err := a.getAccessToken(ctx)
+	if err != nil {
+		return "", fmt.Errorf("获取 Access Token 失败: %w", err)
 	}
 
 	api, err := a.apiClient()
 	if err != nil {
-		return fmt.Errorf("初始化钉钉官方 SDK 失败: %w", err)
+		return "", fmt.Errorf("初始化钉钉官方 SDK 失败: %w", err)
 	}
 	msg := a.replyMessageWithAttachments(ctx, api, token, reply)
-	if _, err := api.SendOTO(ctx, token, a.cfg.RobotCode, chatID, msg); err != nil {
-		return fmt.Errorf("发送消息失败: %w", err)
+	externalID, err := api.SendOTO(ctx, token, a.cfg.RobotCode, chatID, msg)
+	if err != nil {
+		return "", fmt.Errorf("发送消息失败: %w", err)
 	}
-	return nil
+	return externalID, nil
 }
 
 // sendReplyToEvent sends a terminal reply through the adapter's bounded,
@@ -831,6 +937,9 @@ func (a *DingtalkAdapter) sendReplyToEvent(ctx context.Context, event dtEvent, r
 			return errors.New("钉钉群消息缺少 openConversationId，拒绝降级为私聊")
 		}
 		adapter.MaybeApplyTextFallback(ctx, reply)
+		if err := ensureDingTalkRenderEvidence(reply); err != nil {
+			return fmt.Errorf("钉钉渲染协议校验失败: %w", err)
+		}
 		if a.queue == nil {
 			return a.sendReplyToEventNow(ctx, event, reply)
 		}

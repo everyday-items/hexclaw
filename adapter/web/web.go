@@ -11,12 +11,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	"github.com/hexagon-codes/hexclaw/streamstate"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"nhooyr.io/websocket"
@@ -267,7 +269,11 @@ func (a *WebAdapter) Send(ctx context.Context, chatID string, reply *adapter.Rep
 	if !ok {
 		return nil
 	}
-	msg := wsMessage{Type: "reply", Content: reply.Content, Metadata: reply.Metadata, KnowledgeHits: reply.KnowledgeHits, MemoryHits: reply.MemoryHits} // U9
+	canonical := reply.MessageContent
+	if canonical == nil {
+		canonical = canonicalReplyContent(reply.Content, reply.Metadata)
+	}
+	msg := wsMessage{Type: "reply", Content: reply.Content, MessageContent: canonical, RenderManifest: reply.RenderManifest, Metadata: reply.Metadata, KnowledgeHits: reply.KnowledgeHits, MemoryHits: reply.MemoryHits} // U9
 	if reply.Metadata != nil {
 		msg.SessionID = reply.Metadata["session_id"]
 		msg.RequestID = reply.Metadata["request_id"]
@@ -287,6 +293,7 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 	}
 	chunkCount := 0
 	reasoningCount := 0
+	var canonical strings.Builder
 	for chunk := range chunks {
 		if chunk.Error != nil {
 			if requestID != "" && a.streams != nil {
@@ -305,6 +312,7 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 		}
 
 		chunkCount++
+		canonical.WriteString(chunk.Content)
 		if chunk.Reasoning != "" {
 			reasoningCount++
 			if reasoningCount == 1 {
@@ -328,6 +336,12 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 			Blocks:        chunk.Blocks,
 			KnowledgeHits: chunk.KnowledgeHits, // U9
 			MemoryHits:    chunk.MemoryHits,
+		}
+		if chunk.Done {
+			msg.MessageContent = chunk.MessageContent
+			if msg.MessageContent == nil {
+				msg.MessageContent = canonicalReplyContent(canonical.String(), chunk.Metadata)
+			}
 		}
 		if msg.Metadata != nil {
 			if msg.SessionID == "" {
@@ -515,17 +529,23 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 				_ = a.sendToTargets(ctx, chatID, "", errMsg)
 				return
 			}
+			canonical := reply.MessageContent
+			if canonical == nil {
+				canonical = canonicalReplyContent(reply.Content, reply.Metadata)
+			}
 			respMsg := wsMessage{
-				Type:          "reply",
-				Content:       reply.Content,
-				SessionID:     msg.SessionID,
-				RequestID:     incoming.RequestID,
-				Metadata:      reply.Metadata,
-				Usage:         reply.Usage,
-				ToolCalls:     reply.ToolCalls,
-				Blocks:        reply.Blocks,
-				KnowledgeHits: reply.KnowledgeHits, // U9
-				MemoryHits:    reply.MemoryHits,
+				Type:           "reply",
+				Content:        reply.Content,
+				MessageContent: canonical,
+				RenderManifest: reply.RenderManifest,
+				SessionID:      msg.SessionID,
+				RequestID:      incoming.RequestID,
+				Metadata:       reply.Metadata,
+				Usage:          reply.Usage,
+				ToolCalls:      reply.ToolCalls,
+				Blocks:         reply.Blocks,
+				KnowledgeHits:  reply.KnowledgeHits, // U9
+				MemoryHits:     reply.MemoryHits,
 			}
 			if reply.Metadata == nil {
 				respMsg.Metadata = map[string]string{}
@@ -646,17 +666,49 @@ func snapshotToMessage(snapshot *streamstate.Snapshot) wsMessage {
 		return wsMessage{Type: "error", Content: "stream not found"}
 	}
 	return wsMessage{
-		Type:      "stream_snapshot",
-		Content:   snapshot.Content,
-		Reasoning: snapshot.Reasoning,
-		SessionID: snapshot.SessionID,
-		RequestID: snapshot.RequestID,
-		Done:      snapshot.Done,
-		Metadata:  snapshot.Metadata,
-		Usage:     snapshot.Usage,
-		ToolCalls: snapshot.ToolCalls,
-		Blocks:    snapshot.Blocks,
+		Type:           "stream_snapshot",
+		Content:        snapshot.Content,
+		MessageContent: canonicalReplyContent(snapshot.Content, snapshot.Metadata),
+		Reasoning:      snapshot.Reasoning,
+		SessionID:      snapshot.SessionID,
+		RequestID:      snapshot.RequestID,
+		Done:           snapshot.Done,
+		Metadata:       snapshot.Metadata,
+		Usage:          snapshot.Usage,
+		ToolCalls:      snapshot.ToolCalls,
+		Blocks:         snapshot.Blocks,
 	}
+}
+
+func canonicalReplyContent(markdown string, metadata map[string]string) *messagecontent.MessageContent {
+	if strings.TrimSpace(markdown) == "" {
+		return nil
+	}
+	producer := messagecontent.ProducerChat
+	if metadata != nil {
+		switch messagecontent.ProducerKind(metadata["producer_kind"]) {
+		case messagecontent.ProducerChat,
+			messagecontent.ProducerQuickChat,
+			messagecontent.ProducerK12,
+			messagecontent.ProducerSkill,
+			messagecontent.ProducerTool,
+			messagecontent.ProducerRAG,
+			messagecontent.ProducerReport,
+			messagecontent.ProducerCron,
+			messagecontent.ProducerWebhook,
+			messagecontent.ProducerWorkflow:
+			producer = messagecontent.ProducerKind(metadata["producer_kind"])
+		}
+	}
+	locale := "und"
+	if metadata != nil && strings.TrimSpace(metadata["locale"]) != "" {
+		locale = metadata["locale"]
+	}
+	content, err := messagecontent.New(producer, locale, markdown, nil)
+	if err != nil {
+		return nil
+	}
+	return &content
 }
 
 func stringsTrim(v string) string {
@@ -674,23 +726,25 @@ func (a *WebAdapter) getConn(chatID string) (*websocket.Conn, bool) {
 
 // wsMessage WebSocket 消息格式。
 type wsMessage struct {
-	Type        string               `json:"type"` // message / reply / chunk / error / resume / stream_snapshot
-	Content     string               `json:"content"`
-	Reasoning   string               `json:"reasoning,omitempty"`
-	SessionID   string               `json:"session_id,omitempty"`
-	RequestID   string               `json:"request_id,omitempty"`
-	UserID      string               `json:"user_id,omitempty"`
-	Provider    string               `json:"provider,omitempty"`
-	Model       string               `json:"model,omitempty"`
-	Role        string               `json:"role,omitempty"`
-	Temperature *float64             `json:"temperature,omitempty"`
-	MaxTokens   *int                 `json:"max_tokens,omitempty"`
-	Done        bool                 `json:"done,omitempty"`
-	Metadata    map[string]string    `json:"metadata,omitempty"`
-	Usage       *adapter.Usage       `json:"usage,omitempty"`
-	ToolCalls   []adapter.ToolCall   `json:"tool_calls,omitempty"`
-	Blocks      []adapter.Block      `json:"blocks,omitempty"`
-	Attachments []adapter.Attachment `json:"attachments,omitempty"`
+	Type           string                         `json:"type"` // message / reply / chunk / error / resume / stream_snapshot
+	Content        string                         `json:"content"`
+	MessageContent *messagecontent.MessageContent `json:"message_content,omitempty"`
+	RenderManifest *messagecontent.RenderManifest `json:"render_manifest,omitempty"`
+	Reasoning      string                         `json:"reasoning,omitempty"`
+	SessionID      string                         `json:"session_id,omitempty"`
+	RequestID      string                         `json:"request_id,omitempty"`
+	UserID         string                         `json:"user_id,omitempty"`
+	Provider       string                         `json:"provider,omitempty"`
+	Model          string                         `json:"model,omitempty"`
+	Role           string                         `json:"role,omitempty"`
+	Temperature    *float64                       `json:"temperature,omitempty"`
+	MaxTokens      *int                           `json:"max_tokens,omitempty"`
+	Done           bool                           `json:"done,omitempty"`
+	Metadata       map[string]string              `json:"metadata,omitempty"`
+	Usage          *adapter.Usage                 `json:"usage,omitempty"`
+	ToolCalls      []adapter.ToolCall             `json:"tool_calls,omitempty"`
+	Blocks         []adapter.Block                `json:"blocks,omitempty"`
+	Attachments    []adapter.Attachment           `json:"attachments,omitempty"`
 	// U9：结构化 RAG/记忆命中（随 done chunk / reply 回传前端渲染命中标签+详情）。
 	KnowledgeHits []adapter.KnowledgeHit `json:"knowledge_hits,omitempty"`
 	MemoryHits    []adapter.MemoryHit    `json:"memory_hits,omitempty"`

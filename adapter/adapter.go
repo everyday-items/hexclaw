@@ -13,6 +13,8 @@ import (
 	"context"
 	"net/http"
 	"time"
+
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 )
 
 // Platform 平台类型
@@ -87,12 +89,13 @@ type Usage struct {
 // 经此透传给客户端——客户端据此渲染成功/失败/耗时，无需对结果正文做字符串嗅探。
 // omitempty：老路径/未填充时不出现在 wire，前端可选字段优雅降级。
 type ToolCall struct {
-	ID         string `json:"id"`                    // 调用 ID
-	Name       string `json:"name"`                  // 工具/技能名称
-	Arguments  string `json:"arguments"`             // 调用参数（JSON 字符串）
-	Result     string `json:"result,omitempty"`      // 调用结果
-	Status     string `json:"status,omitempty"`      // 执行状态：success / error（框架产出）
-	DurationMs int64  `json:"duration_ms,omitempty"` // 执行耗时（毫秒，框架测量）
+	ID             string                         `json:"id"`                        // 调用 ID
+	Name           string                         `json:"name"`                      // 工具/技能名称
+	Arguments      string                         `json:"arguments"`                 // 调用参数（JSON 字符串）
+	Result         string                         `json:"result,omitempty"`          // 调用结果
+	MessageContent *messagecontent.MessageContent `json:"message_content,omitempty"` // canonical 工具输出
+	Status         string                         `json:"status,omitempty"`          // 执行状态：success / error（框架产出）
+	DurationMs     int64                          `json:"duration_ms,omitempty"`     // 执行耗时（毫秒，框架测量）
 }
 
 // Block 有序内容块（wire 形态，对齐前端 ContentBlock 的 camelCase 字段）。
@@ -102,7 +105,8 @@ type ToolCall struct {
 // 富数据（status/duration/result）仍走扁平 ToolCalls；前端按 Block 顺序渲染、
 // 在每个 tool_use 处用 id 到 ToolCalls 里取完整数据。
 type Block struct {
-	Type string `json:"type"` // text | tool_use | tool_result
+	Type           string                         `json:"type"` // text | tool_use | tool_result
+	MessageContent *messagecontent.MessageContent `json:"message_content,omitempty"`
 	// text
 	Text string `json:"text,omitempty"`
 	// tool_use
@@ -122,17 +126,19 @@ type Block struct {
 // 故命中以独立结构化字段回传（而非塞进字符串 map）。字段名对齐前端 ChatView 的
 // getHitTitle（doc_title/source）与 getHitSubtitle（content）消费路径。
 type KnowledgeHit struct {
-	DocTitle string  `json:"doc_title,omitempty"` // 文档标题
-	Source   string  `json:"source,omitempty"`    // 来源
-	Content  string  `json:"content,omitempty"`   // 命中片段正文
-	Score    float64 `json:"score,omitempty"`     // 相关度分数
+	DocTitle       string                         `json:"doc_title,omitempty"` // 文档标题
+	Source         string                         `json:"source,omitempty"`    // 来源
+	Content        string                         `json:"content,omitempty"`   // 命中片段正文
+	Score          float64                        `json:"score,omitempty"`     // 相关度分数
+	MessageContent *messagecontent.MessageContent `json:"message_content,omitempty"`
 }
 
 // MemoryHit 长期记忆召回命中（结构化，驱动前端「记忆命中」标签+详情）。
 // 字段名对齐前端 ChatView 记忆命中渲染（content/source）。
 type MemoryHit struct {
-	Content string `json:"content,omitempty"` // 记忆内容
-	Source  string `json:"source,omitempty"`  // 记忆来源（角色/文件等）
+	Content        string                         `json:"content,omitempty"` // 记忆内容
+	Source         string                         `json:"source,omitempty"`  // 记忆来源（角色/文件等）
+	MessageContent *messagecontent.MessageContent `json:"message_content,omitempty"`
 }
 
 // Reply 同步回复
@@ -140,7 +146,9 @@ type MemoryHit struct {
 // 引擎处理完消息后返回的完整回复。
 // 适用于非流式场景。
 type Reply struct {
-	Content string // 回复文本内容
+	Content        string // 回复文本内容
+	MessageContent *messagecontent.MessageContent
+	RenderManifest *messagecontent.RenderManifest
 	// Attachments 是出站产物（当前主要为图片）。平台支持时上传并随正文发送；
 	// 不支持的平台应保留正文并明确降级，不能静默丢失附件。
 	Attachments []Attachment
@@ -162,14 +170,17 @@ type Reply struct {
 // 用于流式输出场景，引擎通过 channel 逐块发送回复。
 // Done=true 表示流式输出结束，此时 Usage 和 ToolCalls 字段可被填充。
 type ReplyChunk struct {
-	Content   string            `json:"content"`              // 当前片段的文本内容（增量）
-	Reasoning string            `json:"reasoning,omitempty"`  // 推理/思考过程（增量）
-	Done      bool              `json:"done"`                 // 是否为最后一个片段
-	Error     error             `json:"error,omitempty"`      // 出错时的错误信息
-	Metadata  map[string]string `json:"metadata,omitempty"`   // 附加元数据（仅在 Done=true 时填充）
-	Usage     *Usage            `json:"usage,omitempty"`      // Token 使用统计（仅在 Done=true 时填充）
-	ToolCalls []ToolCall        `json:"tool_calls,omitempty"` // 工具调用记录（仅在 Done=true 时填充）
-	Blocks    []Block           `json:"blocks,omitempty"`     // 有序内容块（仅在 Done=true 时填充）
+	Content string `json:"content"` // 当前片段的文本内容（增量）
+	// MessageContent is present only on the terminal chunk and covers the
+	// complete canonical reply, never an individual streaming delta.
+	MessageContent *messagecontent.MessageContent `json:"message_content,omitempty"`
+	Reasoning      string                         `json:"reasoning,omitempty"`  // 推理/思考过程（增量）
+	Done           bool                           `json:"done"`                 // 是否为最后一个片段
+	Error          error                          `json:"error,omitempty"`      // 出错时的错误信息
+	Metadata       map[string]string              `json:"metadata,omitempty"`   // 附加元数据（仅在 Done=true 时填充）
+	Usage          *Usage                         `json:"usage,omitempty"`      // Token 使用统计（仅在 Done=true 时填充）
+	ToolCalls      []ToolCall                     `json:"tool_calls,omitempty"` // 工具调用记录（仅在 Done=true 时填充）
+	Blocks         []Block                        `json:"blocks,omitempty"`     // 有序内容块（仅在 Done=true 时填充）
 	// Interactive 结构化交互载荷（仅在 Done=true 时填充；与 Reply.Interactive 同语义）。
 	Interactive *InteractivePayload `json:"interactive,omitempty"`
 	// U9：本轮 RAG/记忆检索命中（仅在 Done=true 时填充；非空时前端渲染命中标签+详情）。
@@ -212,6 +223,34 @@ type Adapter interface {
 	// 从 chunks channel 读取并逐块发送给用户
 	// 实现"打字机效果"：飞书/Telegram 通过"发送+编辑"，Web 通过 WebSocket 推送
 	SendStream(ctx context.Context, chatID string, chunks <-chan *ReplyChunk) error
+}
+
+// DeliveryStatus is the transport-level truth returned by adapters that can
+// expose a durable external message identifier. "accepted" only proves that
+// the provider accepted the request; it must not be presented as delivered
+// until QueryReceipt reaches a terminal provider status.
+type DeliveryStatus string
+
+const (
+	DeliveryAccepted       DeliveryStatus = "accepted"
+	DeliveryDelivered      DeliveryStatus = "delivered"
+	DeliveryFailed         DeliveryStatus = "failed"
+	DeliveryOutcomeUnknown DeliveryStatus = "outcome_unknown"
+)
+
+type DeliveryAck struct {
+	ExternalMessageID string         `json:"external_message_id"`
+	Status            DeliveryStatus `json:"status"`
+}
+
+// DeliveryReceiptAdapter is an optional capability implemented by adapters
+// whose provider offers an external message ID and a status-query endpoint.
+// Callers must feature-detect this interface; basic Adapter.Send remains the
+// compatibility surface for channels without receipt support.
+type DeliveryReceiptAdapter interface {
+	Adapter
+	SendWithReceipt(ctx context.Context, chatID string, reply *Reply) (DeliveryAck, error)
+	QueryReceipt(ctx context.Context, externalMessageID string) (DeliveryAck, error)
 }
 
 // WebhookAdapter 表示可挂载到统一 HTTP ingress 的适配器。

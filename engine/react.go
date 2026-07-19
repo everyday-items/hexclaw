@@ -29,6 +29,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/knowledge"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	"github.com/hexagon-codes/hexclaw/memory"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/security"
 	"github.com/hexagon-codes/hexclaw/session"
@@ -140,6 +141,19 @@ func withProviderLocality(ctx context.Context, isLocal bool) context.Context {
 func providerIsCloud(ctx context.Context) bool {
 	local, ok := ctx.Value(providerLocalityKey{}).(bool)
 	return ok && !local
+}
+
+// providerIsLocal resolves locality from the active router configuration. The
+// provider display name is not a deployment signal (a local-looking name may
+// still point to a cloud gateway, and vice versa).
+func (e *ReActEngine) providerIsLocal(providerName string) bool {
+	e.mu.RLock()
+	router := e.router
+	e.mu.RUnlock()
+	if router == nil {
+		return false
+	}
+	return router.IsLocalProviderName(providerName)
 }
 
 // applyLocalNumCtxCap 为本地 Ollama 请求注入显式 num_ctx（来自 Ollama provider 配置的 num_ctx）。
@@ -968,6 +982,7 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		if err != nil {
 			return nil, fmt.Errorf("skill %s 执行失败: %w", matched.Name(), err)
 		}
+		result.Metadata = withProducerMetadata(result.Metadata, messagecontent.ProducerSkill, msg.Metadata["user_locale"])
 
 		argsJSON, _ := json.Marshal(skillArgs)
 		tc := []adapter.ToolCall{{
@@ -991,9 +1006,10 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		}
 
 		return &adapter.Reply{
-			Content:   result.Content,
-			Metadata:  withReplyPersistError(withAssistantMessageID(result.Metadata, assistantMessageID), msg),
-			ToolCalls: tc,
+			Content:        result.Content,
+			MessageContent: canonicalProducerContent(messagecontent.ProducerSkill, result.Content, msg.Metadata["user_locale"]),
+			Metadata:       withReplyPersistError(withAssistantMessageID(result.Metadata, assistantMessageID), msg),
+			ToolCalls:      tc,
 		}, nil
 	}
 
@@ -1118,7 +1134,7 @@ func (e *ReActEngine) completeWithTools(
 
 	// 收集工具定义（C1+C2: 按当前 query 渐进召回 + agent_mode 条件过滤；C2/B2 联动）
 	var tools []llm.ToolDefinition
-	isLocal := isLocalProvider(providerName)
+	isLocal := e.providerIsLocal(providerName)
 	// BUG-20260711：把 provider 本地/云盖进 ctx，供 buildTurnContext 在注入前决定是否
 	// 携带跨会话记忆（记忆遇云静默略过，honor "记忆不出本机"而不硬失败整条对话）。
 	ctx = withProviderLocality(ctx, isLocal)
@@ -1236,7 +1252,7 @@ func (e *ReActEngine) completeWithTools(
 		wrapProvider: func(p hexagon.Provider, name, model string) hexagon.Provider {
 			p = wrapVisionImageLimitProvider(p, model) // 反应式视觉兜底（含 failover 目标 provider）
 			p = wrapCodeExecToolChoiceProvider(p, msg.Content)
-			if !shouldBoundThinkingCompletion(name, model, req) {
+			if !e.shouldBoundThinkingCompletion(name, model, req) {
 				return p
 			}
 			return &thinkingBoundProvider{
@@ -1565,7 +1581,7 @@ func (e *ReActEngine) completeWithThinkingTimeout(
 	providerName, modelName string,
 	req hexagon.CompletionRequest,
 ) (*llm.CompletionResponse, bool, error) {
-	if !shouldBoundThinkingCompletion(providerName, modelName, req) {
+	if !e.shouldBoundThinkingCompletion(providerName, modelName, req) {
 		resp, err := provider.Complete(ctx, req)
 		return resp, false, err
 	}
@@ -1593,8 +1609,8 @@ func (e *ReActEngine) completeWithThinkingTimeout(
 	return resp, false, err
 }
 
-func shouldBoundThinkingCompletion(providerName, modelName string, req hexagon.CompletionRequest) bool {
-	if !isLocalProvider(providerName) || !isLocalThinkingModel(modelName) {
+func (e *ReActEngine) shouldBoundThinkingCompletion(providerName, modelName string, req hexagon.CompletionRequest) bool {
+	if !e.providerIsLocal(providerName) || !isLocalThinkingModel(modelName) {
 		return false
 	}
 	if req.Metadata == nil {
@@ -1800,6 +1816,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		if err != nil {
 			return nil, fmt.Errorf("skill %s 执行失败: %w", matched.Name(), err)
 		}
+		result.Metadata = withProducerMetadata(result.Metadata, messagecontent.ProducerSkill, msg.Metadata["user_locale"])
 		argsJSON, _ := json.Marshal(skillArgs)
 		tc := []adapter.ToolCall{{
 			ID:        "tc-" + idgen.ShortID(),
@@ -2041,7 +2058,7 @@ func (e *ReActEngine) processStreamRuntime(
 			defer sessionUnlock()
 		}
 
-		isLocal := isLocalProvider(selection.providerName)
+		isLocal := e.providerIsLocal(selection.providerName)
 		// BUG-20260711：与非流式 completeWithTools 对称——先盖 provider 本地/云再构建请求，
 		// buildTurnContext 据此决定跨会话记忆是否注入（遇云静默略过，不硬失败整条对话）。
 		ctx = withProviderLocality(ctx, isLocal)
@@ -3414,7 +3431,7 @@ func (e *ReActEngine) rebuildRequestForFailover(ctx context.Context, msg *adapte
 	// 取消后，回退到智谱 glm-4v-flash 立刻 context canceled → 整条对话仍失败。
 	base := context.WithoutCancel(ctx)
 	fresh := labelMessageEgress(base, msg) // 干净 general_chat 信封（含附件/文档类，但不含 memory）
-	fresh = withProviderLocality(fresh, isLocalProvider(providerName))
+	fresh = withProviderLocality(fresh, e.providerIsLocal(providerName))
 	return fresh, e.buildCompletionRequest(fresh, msg, history, kbContext)
 }
 

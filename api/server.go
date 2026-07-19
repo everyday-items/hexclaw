@@ -61,6 +61,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	"github.com/hexagon-codes/hexclaw/render"
 	"github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/skill/hub"
@@ -991,12 +992,14 @@ type ChatRequest struct {
 
 // ChatResponse 聊天回复
 type ChatResponse struct {
-	Reply     string             `json:"reply"`                // 回复内容
-	SessionID string             `json:"session_id"`           // 会话 ID
-	Metadata  map[string]string  `json:"metadata,omitempty"`   // 元数据
-	Usage     *adapter.Usage     `json:"usage,omitempty"`      // Token 使用统计
-	ToolCalls []adapter.ToolCall `json:"tool_calls,omitempty"` // 工具调用记录
-	Blocks    []adapter.Block    `json:"blocks,omitempty"`     // 有序内容块（多步交错按序渲染）
+	Reply          string                         `json:"reply"`                     // 回复内容（legacy fallback）
+	MessageContent *messagecontent.MessageContent `json:"message_content,omitempty"` // canonical Markdown/LaTeX
+	RenderManifest *messagecontent.RenderManifest `json:"render_manifest,omitempty"` // projection receipt when supplied by owner surface
+	SessionID      string                         `json:"session_id"`                // 会话 ID
+	Metadata       map[string]string              `json:"metadata,omitempty"`        // 元数据
+	Usage          *adapter.Usage                 `json:"usage,omitempty"`           // Token 使用统计
+	ToolCalls      []adapter.ToolCall             `json:"tool_calls,omitempty"`      // 工具调用记录
+	Blocks         []adapter.Block                `json:"blocks,omitempty"`          // 有序内容块（多步交错按序渲染）
 	// U9：结构化 RAG/记忆命中（非空时前端渲染「知识库命中」「记忆命中」标签+详情）。
 	KnowledgeHits []adapter.KnowledgeHit `json:"knowledge_hits,omitempty"`
 	MemoryHits    []adapter.MemoryHit    `json:"memory_hits,omitempty"`
@@ -1218,15 +1221,21 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	trace.L(ctx).Info("→ 回复", "content_len", len([]rune(reply.Content)), "elapsed_ms", time.Since(start).Milliseconds())
 
 	// 返回响应
+	canonical := reply.MessageContent
+	if canonical == nil {
+		canonical = canonicalChatContent(reply.Content, reply.Metadata)
+	}
 	writeJSON(w, http.StatusOK, ChatResponse{
-		Reply:         reply.Content,
-		SessionID:     msg.SessionID,
-		Metadata:      reply.Metadata,
-		Usage:         reply.Usage,
-		ToolCalls:     reply.ToolCalls,
-		Blocks:        reply.Blocks,
-		KnowledgeHits: reply.KnowledgeHits,
-		MemoryHits:    reply.MemoryHits,
+		Reply:          reply.Content,
+		MessageContent: canonical,
+		RenderManifest: reply.RenderManifest,
+		SessionID:      msg.SessionID,
+		Metadata:       reply.Metadata,
+		Usage:          reply.Usage,
+		ToolCalls:      reply.ToolCalls,
+		Blocks:         reply.Blocks,
+		KnowledgeHits:  reply.KnowledgeHits,
+		MemoryHits:     reply.MemoryHits,
 	})
 }
 
@@ -1291,6 +1300,7 @@ func (s *Server) handleChatSSE(
 		reasoningBytes int
 		toolCallCount  int
 		hadError       bool
+		canonical      strings.Builder
 	)
 
 	for chunk := range chunks {
@@ -1307,9 +1317,15 @@ func (s *Server) handleChatSSE(
 
 		chunkCount++
 		contentBytes += len(chunk.Content)
+		canonical.WriteString(chunk.Content)
 		reasoningBytes += len(chunk.Reasoning)
 		if len(chunk.ToolCalls) > 0 {
 			toolCallCount = len(chunk.ToolCalls)
+		}
+
+		if chunk.Done {
+			finalContent := engine.StripAllThinking(canonical.String())
+			chunk.MessageContent = canonicalChatContent(finalContent, chunk.Metadata)
 		}
 
 		payload, err := json.Marshal(chunk)
@@ -1444,6 +1460,10 @@ func (s *Server) apiAuthMiddleware(next http.Handler) http.Handler {
 				strings.HasPrefix(path, "/api/v1/platforms/hooks/"))
 		isLogsAPI := path == "/api/v1/logs" || strings.HasPrefix(path, "/api/v1/logs/")
 		isDesktopAPI := strings.HasPrefix(path, "/api/v1/desktop/")
+		// The collection GET is the K12 binding/Receipt management plane. It
+		// exposes child-scoped metadata and therefore must not inherit the broad
+		// read-only exemption used by public status endpoints.
+		isWebhookManagement := path == "/api/v1/webhooks"
 		// 场景包挂载路径（/api/k12/ 等）**读写都需鉴权**——否则落在 /api/v1 前缀守卫之外，
 		// 非回环部署下 grade/restore/provision/bind-im（写）与 backup/export/profile/mistakes（读，
 		// 含孩子 PII 与全量 .hexbak 导出）会无凭证可达。读端点尤其敏感（整份错题/档案导出）。
@@ -1453,7 +1473,7 @@ func (s *Server) apiAuthMiddleware(next http.Handler) http.Handler {
 		// 新场景包挂到 `/api/<其他>/` 会重现 AP-184 绕过鉴权。任何 Mount 进来的场景子路由
 		// （注册为 prefix+"/"）自动纳入守卫。
 		isScenarioAPI := s.isMountedScenarioPath(path)
-		needsAuth := isDesktopAPI || isLogsAPI || isScenarioAPI ||
+		needsAuth := isDesktopAPI || isLogsAPI || isScenarioAPI || isWebhookManagement ||
 			(isWriteOp && strings.HasPrefix(path, "/api/v1/") && path != "/api/v1/chat" && !isWebhookReceiver)
 
 		if !needsAuth {

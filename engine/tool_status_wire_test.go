@@ -43,6 +43,9 @@ func TestRuntimeToolCallsToAdapter_StatusDuration(t *testing.T) {
 	if out[0].DurationMs != 1234 {
 		t.Errorf("out[0].DurationMs = %d, want 1234", out[0].DurationMs)
 	}
+	if out[0].MessageContent == nil || out[0].MessageContent.ProducerKind != "tool" || out[0].MessageContent.Markdown != out[0].Result {
+		t.Fatalf("out[0] omitted canonical tool output: %#v", out[0])
+	}
 	if out[1].Status != "error" {
 		t.Errorf("out[1].Status = %q, want error", out[1].Status)
 	}

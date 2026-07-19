@@ -12,6 +12,7 @@ type sendTask struct {
 	ctx    context.Context
 	chatID string
 	reply  *Reply
+	send   func(context.Context, string, *Reply) error
 	done   chan error
 }
 
@@ -67,6 +68,14 @@ func NewPlatformSendQueue(platform Platform, send func(context.Context, string, 
 
 // Send enqueues an outbound send and waits for completion.
 func (q *SendQueue) Send(ctx context.Context, chatID string, reply *Reply) error {
+	return q.SendWith(ctx, chatID, reply, nil)
+}
+
+// SendWith enqueues one send through the same bounded/rate-limited worker but
+// allows an adapter-specific sender for this task. DingTalk uses it to retain
+// the provider processQueryKey without creating a second queue that could
+// violate the platform-wide rate limit. A nil sender uses the queue default.
+func (q *SendQueue) SendWith(ctx context.Context, chatID string, reply *Reply, send func(context.Context, string, *Reply) error) error {
 	if reply == nil {
 		return nil
 	}
@@ -92,6 +101,7 @@ func (q *SendQueue) Send(ctx context.Context, chatID string, reply *Reply) error
 		ctx:    ctx,
 		chatID: chatID,
 		reply:  reply,
+		send:   send,
 		done:   make(chan error, 1),
 	}
 	select {
@@ -208,7 +218,11 @@ func (q *SendQueue) run() {
 			}
 		}
 
-		if q.send == nil {
+		send := task.send
+		if send == nil {
+			send = q.send
+		}
+		if send == nil {
 			task.done <- fmt.Errorf("send queue 未配置发送函数")
 			continue
 		}
@@ -230,7 +244,7 @@ func (q *SendQueue) run() {
 			task.done <- err
 			continue
 		}
-		err := q.send(sendCtx, task.chatID, task.reply)
+		err := send(sendCtx, task.chatID, task.reply)
 		stopCancel()
 		cancelSend()
 		lastSend = time.Now()

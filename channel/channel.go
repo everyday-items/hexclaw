@@ -2,7 +2,7 @@
 //
 // 职责边界：
 //   - 场景层（scenarios/k12）只产 ChannelNeutralMessage 语义的中立载荷，经窄缝
-//     （apihttp.IMDeliverer 等）触达本层，绝不 import 平台细节（AP-1 / K12-INV-012）；
+//     （usecase.DeliveryTransport）触达本层，绝不 import 平台细节（AP-1 / K12-INV-012）；
 //   - 本层声明「通道」这一端口（Port）与注册表（Registry），不含任何 K12 领域类型，
 //     也不 import adapter/instances——具体发送函数由 composition root（cmd/hexclaw）注入；
 //   - 限绑语义（§3.12：同一私聊目标同一时间只绑一个 TutorAgent）归属本层
@@ -15,7 +15,13 @@ package channel
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 )
 
 var (
@@ -78,8 +84,106 @@ type Attachment struct {
 type Message struct {
 	// Text 文本或 Markdown 正文；渠道适配层负责 Markdown/纯文本投影降级。
 	Text string
+	// Content is the immutable canonical Markdown/LaTeX source. Text is only
+	// the channel-specific visible projection and must be traceable through
+	// RenderManifest; both remain optional solely for legacy callers.
+	Content        *messagecontent.MessageContent
+	RenderManifest *messagecontent.RenderManifest
 	// Attachments 可选附件（现状全为图片；PDF 呈现物走同一形态）。
 	Attachments []Attachment
+}
+
+func NewCanonicalMessage(producer messagecontent.ProducerKind, locale, markdown, projectedText, fallbackReason string) (Message, error) {
+	return NewCanonicalMessageWithAttachments(producer, locale, markdown, projectedText, fallbackReason, nil)
+}
+
+func NewCanonicalMessageWithAttachments(producer messagecontent.ProducerKind, locale, markdown, projectedText, fallbackReason string, attachments []Attachment) (Message, error) {
+	return newCanonicalMessage(producer, locale, markdown, projectedText, fallbackReason, attachments, messagecontent.PartText, false)
+}
+
+func NewCanonicalMarkdownMessageWithAttachments(producer messagecontent.ProducerKind, locale, markdown, projectedMarkdown, fallbackReason string, attachments []Attachment) (Message, error) {
+	return newCanonicalMessage(producer, locale, markdown, projectedMarkdown, fallbackReason, attachments, messagecontent.PartMarkdown, true)
+}
+
+func newCanonicalMessage(producer messagecontent.ProducerKind, locale, markdown, projectedText, fallbackReason string, attachments []Attachment, partKind messagecontent.PartKind, supportsMarkdown bool) (Message, error) {
+	refs := make([]messagecontent.AttachmentRef, 0, len(attachments))
+	parts := []messagecontent.RenderPart{{Kind: partKind, Text: projectedText}}
+	for _, attachment := range attachments {
+		sum := sha256.Sum256(attachment.Data)
+		digest := "sha256:" + hex.EncodeToString(sum[:])
+		ref := "inline:" + hex.EncodeToString(sum[:])
+		refs = append(refs, messagecontent.AttachmentRef{
+			AssetID: ref,
+			Name:    attachment.Name,
+			MIME:    attachment.MIME,
+			Digest:  digest,
+			AltText: attachment.Name,
+		})
+		parts = append(parts, messagecontent.RenderPart{
+			Kind:           messagecontent.PartArtifact,
+			ArtifactRef:    ref,
+			ArtifactDigest: digest,
+			AltText:        attachment.Name,
+		})
+	}
+	content, err := messagecontent.New(producer, locale, markdown, refs)
+	if err != nil {
+		return Message{}, err
+	}
+	rendererVersion := "channel-readable-text-v1"
+	if supportsMarkdown {
+		rendererVersion = "channel-markdown-readable-math-v1"
+	}
+	manifest, err := messagecontent.BuildManifest(content, messagecontent.RenderRequest{
+		Surface:         messagecontent.SurfaceChannel,
+		RendererVersion: rendererVersion,
+		Capabilities: messagecontent.CapabilitySnapshot{
+			Markdown:    supportsMarkdown,
+			UnicodeMath: true,
+			Attachments: len(attachments) > 0,
+		},
+		Parts:          parts,
+		FallbackReason: fallbackReason,
+	})
+	if err != nil {
+		return Message{}, err
+	}
+	msg := Message{Text: projectedText, Content: &content, RenderManifest: &manifest, Attachments: append([]Attachment(nil), attachments...)}
+	return msg, msg.Validate()
+}
+
+func (m Message) Validate() error {
+	if (m.Content == nil) != (m.RenderManifest == nil) {
+		return errors.New("channel: canonical content and render manifest must be supplied together")
+	}
+	if m.Content == nil {
+		return nil
+	}
+	if err := m.RenderManifest.ValidateFor(*m.Content); err != nil {
+		return fmt.Errorf("channel: invalid render evidence: %w", err)
+	}
+	if len(m.Attachments) != len(m.Content.Attachments) {
+		return errors.New("channel: attachment projection does not match canonical references")
+	}
+	for i, attachment := range m.Attachments {
+		sum := sha256.Sum256(attachment.Data)
+		wantDigest := "sha256:" + hex.EncodeToString(sum[:])
+		ref := m.Content.Attachments[i]
+		if ref.Digest != wantDigest || ref.MIME != attachment.MIME || ref.Name != attachment.Name {
+			return fmt.Errorf("channel: attachment %d does not match canonical digest", i)
+		}
+	}
+	var visible strings.Builder
+	for _, part := range m.RenderManifest.Parts {
+		switch part.Kind {
+		case messagecontent.PartMarkdown, messagecontent.PartText:
+			visible.WriteString(part.Text)
+		}
+	}
+	if strings.TrimSpace(m.Text) != strings.TrimSpace(visible.String()) {
+		return errors.New("channel: visible text does not match render manifest parts")
+	}
+	return nil
 }
 
 // Port 是通道端口（ChannelPort）。方法集从现状消费点提炼：
@@ -97,4 +201,28 @@ type Port interface {
 	SendText(ctx context.Context, to Target, text string) error
 	// SendMessage 发送图文/呈现物（文本+附件）到私聊目标。
 	SendMessage(ctx context.Context, to Target, msg Message) error
+}
+
+type DeliveryStatus string
+
+const (
+	DeliveryAccepted       DeliveryStatus = "accepted"
+	DeliveryDelivered      DeliveryStatus = "delivered"
+	DeliveryFailed         DeliveryStatus = "failed"
+	DeliveryOutcomeUnknown DeliveryStatus = "outcome_unknown"
+)
+
+type DeliveryAck struct {
+	ExternalMessageID string         `json:"external_message_id"`
+	Status            DeliveryStatus `json:"status"`
+	Target            Target         `json:"target"`
+}
+
+// ReceiptPort is the optional ChannelPort capability used by user-facing
+// "send to phone" flows. SendMessageWithReceipt returns provider acceptance;
+// callers must query until a terminal status before claiming delivery.
+type ReceiptPort interface {
+	Port
+	SendMessageWithReceipt(ctx context.Context, to Target, msg Message) (DeliveryAck, error)
+	QueryReceipt(ctx context.Context, to Target, externalMessageID string) (DeliveryAck, error)
 }

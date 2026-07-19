@@ -94,6 +94,9 @@ func TestBug20260611_CronDispatchMessageContract(t *testing.T) {
 	if msg.Metadata["cron_job_id"] != "job-9" {
 		t.Errorf("cron dispatch must carry cron_job_id, got %q", msg.Metadata["cron_job_id"])
 	}
+	if msg.Metadata["producer_kind"] != "cron" {
+		t.Errorf("cron dispatch must stamp canonical producer_kind=cron, got %q", msg.Metadata["producer_kind"])
+	}
 	if msg.Platform != adapter.PlatformCron {
 		t.Errorf("cron dispatch platform must be cron (excluded from chat listings), got %q", msg.Platform)
 	}

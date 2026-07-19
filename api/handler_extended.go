@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/toolkit/util/logger"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	"github.com/hexagon-codes/hexclaw/skill/hub"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
@@ -533,15 +535,22 @@ type WorkflowData struct {
 
 // WorkflowRun 工作流执行记录
 type WorkflowRun struct {
-	ID          string            `json:"id"`
-	WorkflowID  string            `json:"workflow_id"`
-	Status      string            `json:"status"`
-	Input       string            `json:"input,omitempty"`
-	Output      string            `json:"output,omitempty"`
-	Error       string            `json:"error,omitempty"`
-	NodeResults []WorkflowNodeRun `json:"node_results,omitempty"`
-	StartedAt   time.Time         `json:"started_at"`
-	FinishedAt  time.Time         `json:"finished_at,omitempty"`
+	ID             string                         `json:"id"`
+	WorkflowID     string                         `json:"workflow_id"`
+	Status         string                         `json:"status"`
+	Input          string                         `json:"input,omitempty"`
+	Output         string                         `json:"output,omitempty"`
+	MessageContent *messagecontent.MessageContent `json:"message_content,omitempty"`
+	RenderManifest *messagecontent.RenderManifest `json:"render_manifest,omitempty"`
+	Error          string                         `json:"error,omitempty"`
+	NodeResults    []WorkflowNodeRun              `json:"node_results,omitempty"`
+	// TriggerKey is the stable webhook binding/event identity. PriorRunID links
+	// safe checkpoint continuations without changing the webhook Receipt/event.
+	TriggerKey string    `json:"trigger_key,omitempty"`
+	PriorRunID string    `json:"prior_run_id,omitempty"`
+	RetrySafe  bool      `json:"retry_safe,omitempty"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
 }
 
 // WorkflowStore 工作流存储（内存 + JSON 文件持久化）
@@ -921,6 +930,198 @@ func (s *Server) RunWorkflowByID(id, userID string) (string, error) {
 		s.executeWorkflow(wfCtx, wf, run, RunWorkflowRequest{})
 	}()
 	return run.ID, nil
+}
+
+// RunK12WorkflowFromWebhook triggers a versioned, owner-bound K12 workflow
+// through the same workflow executor used by the UI. Binding allowlisting is
+// performed by the webhook adapter; this second guard verifies that the saved
+// definition itself declares the same immutable owner and version. Unlike the
+// interactive Canvas command, this method waits for the durable workflow
+// terminal: returning a run ID while execution is merely running would let the
+// webhook Receipt falsely claim succeeded.
+func (s *Server) RunK12WorkflowFromWebhook(
+	ctx context.Context,
+	id, version, input, agentID, learnerID string,
+) (string, error) {
+	runID, _, err := s.RunK12WorkflowFromWebhookDispatch(
+		ctx, id, version, input, agentID, learnerID, "legacy:"+idgen.ShortID(),
+	)
+	return runID, err
+}
+
+var ErrK12WorkflowOutcomeUnknown = errors.New("K12 workflow 外部副作用结果未知")
+
+// RunK12WorkflowFromWebhookDispatch executes one stable webhook trigger. A
+// completed trigger is returned idempotently. A locally certain failure may
+// continue from durable completed-node outputs; an in-flight or failed
+// external boundary is outcome_unknown and is never replayed blindly.
+func (s *Server) RunK12WorkflowFromWebhookDispatch(
+	ctx context.Context,
+	id, version, input, agentID, learnerID, triggerKey string,
+) (string, bool, error) {
+	if s == nil || s.workflowStore == nil {
+		return "", true, fmt.Errorf("工作流存储不可用")
+	}
+	triggerKey = strings.TrimSpace(triggerKey)
+	if triggerKey == "" {
+		return "", true, fmt.Errorf("K12 workflow trigger_key 必填")
+	}
+
+	// Claim the stable trigger before creating a run. This is the in-process
+	// uniqueness boundary; persisted TriggerKey makes it survive restarts.
+	s.workflowStore.mu.Lock()
+	prior := s.workflowStore.latestRunByTriggerLocked(triggerKey)
+	var resumed map[string]string
+	if prior != nil {
+		switch prior.Status {
+		case "completed":
+			runID := prior.ID
+			s.workflowStore.mu.Unlock()
+			return runID, false, nil
+		case "running":
+			runID := prior.ID
+			s.workflowStore.mu.Unlock()
+			return runID, false, fmt.Errorf("%w: run %s 仍在执行或进程中断", ErrK12WorkflowOutcomeUnknown, runID)
+		case "failed":
+			safe, unknown, checkpoints := k12WorkflowRetryPlan(prior)
+			if !safe {
+				runID := prior.ID
+				s.workflowStore.mu.Unlock()
+				if unknown {
+					return runID, false, fmt.Errorf("%w: run %s 缺少外部副作用完成证据", ErrK12WorkflowOutcomeUnknown, runID)
+				}
+				return runID, false, fmt.Errorf("K12 workflow run %s 缺少可重放的控制流 checkpoint", runID)
+			}
+			resumed = checkpoints
+		default:
+			runID := prior.ID
+			s.workflowStore.mu.Unlock()
+			return runID, false, fmt.Errorf("%w: run %s 状态 %s 不可判定", ErrK12WorkflowOutcomeUnknown, runID, prior.Status)
+		}
+	}
+
+	wf, ok := s.workflowStore.workflows[id]
+	if !ok {
+		s.workflowStore.mu.Unlock()
+		return "", true, fmt.Errorf("工作流不存在: %s", id)
+	}
+	if strings.TrimSpace(version) == "" {
+		s.workflowStore.mu.Unlock()
+		return "", true, fmt.Errorf("K12 workflow_version 必填")
+	}
+	data := wf.Data
+	if data == nil || stringAny(data["scenario"]) != "k12" ||
+		stringAny(data["agent_id"]) != agentID || stringAny(data["learner_id"]) != learnerID ||
+		stringAny(data["version"]) != version {
+		s.workflowStore.mu.Unlock()
+		return "", true, fmt.Errorf("工作流定义的 K12 owner/version 与 binding 不一致")
+	}
+	priorID := ""
+	if prior != nil {
+		priorID = prior.ID
+	}
+	run := &WorkflowRun{
+		ID: "run-" + idgen.ShortID(), WorkflowID: wf.ID, Status: "running",
+		Input: input, TriggerKey: triggerKey, PriorRunID: priorID, StartedAt: time.Now(),
+	}
+	s.workflowStore.addRun(run)
+	s.workflowStore.mu.Unlock()
+
+	req := RunWorkflowRequest{
+		Input: input, UserID: "webhook:" + learnerID, Platform: "api",
+		Metadata: map[string]string{
+			"source": "webhook", "agent_id": agentID, "learner_id": learnerID,
+			"workflow_version": version, "webhook_trigger_key": triggerKey,
+		},
+	}
+	wfCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	exec := newWorkflowExecutor(s, wf, req)
+	if resumed != nil {
+		exec = exec.withResumed(resumed)
+	}
+	finished := exec.execute(wfCtx, run)
+	retrySafe, outcomeUnknown, _ := k12WorkflowRetryPlan(finished)
+	finished.RetrySafe = retrySafe
+	s.workflowStore.mu.Lock()
+	s.workflowStore.runs[run.ID] = finished
+	s.workflowStore.persistRuns()
+	s.workflowStore.mu.Unlock()
+	if finished.Status != "completed" {
+		failure := finished.Error
+		if failure == "" {
+			failure = "workflow 未产生可确认终态"
+		}
+		if outcomeUnknown {
+			return run.ID, false, fmt.Errorf("%w: %s", ErrK12WorkflowOutcomeUnknown, failure)
+		}
+		return run.ID, retrySafe, fmt.Errorf("K12 workflow 执行失败（status=%s）: %s", finished.Status, failure)
+	}
+	return run.ID, false, nil
+}
+
+func (ws *WorkflowStore) latestRunByTriggerLocked(triggerKey string) *WorkflowRun {
+	for index := len(ws.runOrder) - 1; index >= 0; index-- {
+		if run := ws.runs[ws.runOrder[index]]; run != nil && run.TriggerKey == triggerKey {
+			return run
+		}
+	}
+	// Defensive fallback for stores assembled directly in tests or imported
+	// from an older file without runOrder.
+	var latest *WorkflowRun
+	for _, run := range ws.runs {
+		if run != nil && run.TriggerKey == triggerKey && (latest == nil || latest.StartedAt.Before(run.StartedAt)) {
+			latest = run
+		}
+	}
+	return latest
+}
+
+// k12WorkflowRetryPlan returns a safe continuation only when every completed
+// external node has a durable output checkpoint and no failed/running external
+// boundary can have an unobserved side effect. Condition/handoff state is not
+// represented by the legacy output-only resume map, so it fails closed.
+func k12WorkflowRetryPlan(run *WorkflowRun) (safe bool, outcomeUnknown bool, resumed map[string]string) {
+	if run == nil || run.Status != "failed" {
+		return false, false, nil
+	}
+	resumed = make(map[string]string)
+	for _, node := range run.NodeResults {
+		typeName := strings.ToLower(strings.TrimSpace(node.Type))
+		switch node.Status {
+		case nodeStatusCompleted:
+			switch typeName {
+			case "condition", "handoff", "agent_handoff":
+				return false, false, nil
+			default:
+				resumed[node.NodeID] = node.Output
+			}
+		case nodeStatusFailed, nodeStatusRunning:
+			if k12WorkflowExternalNode(typeName) {
+				return false, true, nil
+			}
+		case nodeStatusPending, nodeStatusSkipped:
+			// Pending deterministic work is safe to execute. Skipped work can only
+			// be trusted when no stateful condition/handoff checkpoint was seen.
+		default:
+			return false, false, nil
+		}
+	}
+	return true, false, resumed
+}
+
+func k12WorkflowExternalNode(typeName string) bool {
+	switch typeName {
+	case "agent", "tool", "handoff", "agent_handoff", "parallel", "fanout":
+		return true
+	default:
+		return false
+	}
+}
+
+func stringAny(v any) string {
+	s, _ := v.(string)
+	return s
 }
 
 func (s *Server) handleGetWorkflowRun(w http.ResponseWriter, r *http.Request) {
