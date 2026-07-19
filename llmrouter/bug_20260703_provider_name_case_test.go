@@ -121,7 +121,7 @@ func TestBug20260703_IsLocalProviderNameCaseInsensitive(t *testing.T) {
 	s := NewWithProviders(config.LLMConfig{
 		Default: "localllm",
 		Providers: map[string]config.LLMProviderConfig{
-			"localllm": {APIKey: "x", Model: "m", BaseURL: "http://127.0.0.1:11434/v1"},
+			"localllm": {APIKey: "x", Model: "m", BaseURL: "http://127.0.0.1:11434/v1", Locality: config.ProviderLocalityLocal},
 		},
 	}, map[string]hexagon.Provider{
 		"localllm": &caseFakeProvider{name: "localllm"},

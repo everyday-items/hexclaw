@@ -10,11 +10,11 @@ import (
 	"github.com/hexagon-codes/hexclaw/egress"
 )
 
-func newLocalitySelector(name, baseURL string, provider *egressCaptureProvider) *Selector {
+func newLocalitySelector(name, baseURL, locality string, provider *egressCaptureProvider) *Selector {
 	cfg := config.LLMConfig{
 		Default: name,
 		Providers: map[string]config.LLMProviderConfig{
-			name: {BaseURL: baseURL, APIKey: "test", Model: "test"},
+			name: {BaseURL: baseURL, APIKey: "test", Model: "test", Locality: locality},
 		},
 	}
 	r := NewWithProviders(cfg, map[string]hexagon.Provider{name: provider})
@@ -32,7 +32,7 @@ func TestEgressLocality_PublicURLContainingLocalTextStillGuarded(t *testing.T) {
 	for _, baseURL := range tests {
 		t.Run(baseURL, func(t *testing.T) {
 			p := &egressCaptureProvider{}
-			r := newLocalitySelector("remote", baseURL, p)
+			r := newLocalitySelector("remote", baseURL, config.ProviderLocalityCloud, p)
 
 			_, err := r.Default().Complete(context.Background(), hexagon.CompletionRequest{})
 			if err == nil || !strings.Contains(err.Error(), "egress") {
@@ -47,7 +47,7 @@ func TestEgressLocality_PublicURLContainingLocalTextStillGuarded(t *testing.T) {
 
 func TestEgressLocality_PublicHostedOllamaStillGuarded(t *testing.T) {
 	p := &egressCaptureProvider{}
-	r := newLocalitySelector("ollama", "https://ollama.example/v1", p)
+	r := newLocalitySelector("ollama", "https://ollama.example/v1", config.ProviderLocalityCloud, p)
 
 	_, err := r.Default().Complete(context.Background(), hexagon.CompletionRequest{})
 	if err == nil || !strings.Contains(err.Error(), "egress") {
@@ -68,7 +68,7 @@ func TestEgressLocality_ExactLoopbackEndpointsStayLocal(t *testing.T) {
 	for _, baseURL := range tests {
 		t.Run(baseURL, func(t *testing.T) {
 			p := &egressCaptureProvider{}
-			r := newLocalitySelector("local", baseURL, p)
+			r := newLocalitySelector("local", baseURL, config.ProviderLocalityLocal, p)
 
 			if _, err := r.Default().Complete(context.Background(), hexagon.CompletionRequest{}); err != nil {
 				t.Fatalf("loopback endpoint %q must stay local: %v", baseURL, err)

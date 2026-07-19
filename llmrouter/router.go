@@ -283,6 +283,10 @@ func buildSelectorState(cfg config.LLMConfig) (map[string]hexagon.Provider, conf
 			logger.Info("[router] 跳过已禁用 provider（配置/Key 保留，不参与路由）", "provider", name)
 			continue
 		}
+		if err := config.ValidateProviderEndpointAccess(pc.BaseURL, pc.PrivateNetworkAccess); err != nil {
+			logger.Warn("[router] 跳过未授权或不安全的 provider endpoint", "provider", name, "error", err)
+			continue
+		}
 		if strings.TrimSpace(pc.APIKey) == "" && !isLocalProviderNamed(name, pc) {
 			logger.Warn("[router] 跳过无 API Key 的远程 provider", "provider", name, "base_url", pc.BaseURL)
 			continue

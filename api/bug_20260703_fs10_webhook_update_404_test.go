@@ -15,6 +15,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/storage/migrate"
 	"github.com/hexagon-codes/hexclaw/webhook"
 )
 
@@ -26,6 +27,9 @@ func newWebhookTestServer(t *testing.T) *Server {
 	}
 	db.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = db.Close() })
+	if err := migrate.Run(context.Background(), db, migrate.All); err != nil {
+		t.Fatalf("init numbered webhook migrations: %v", err)
+	}
 	mgr := webhook.NewManager(db)
 	if err := mgr.Init(context.Background()); err != nil {
 		t.Fatalf("webhook Init: %v", err)

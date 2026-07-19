@@ -848,6 +848,18 @@ func (m *Manager) QueryWithFilter(ctx context.Context, query string, topK int, f
 	return formatSearchHits(hitsFromResults(selected)), nil
 }
 
+// QueryHitsWithFilter 与 QueryWithFilter 使用同一次严格检索，但把结构化命中一并返回。
+// 面向 UI/领域适配器的调用方必须消费 SearchHit.Content，不能把给 LLM 的注入信封
+// （“参考 N / 相关度 / 请基于…”）当成面向用户的正文。
+func (m *Manager) QueryHitsWithFilter(ctx context.Context, query string, topK int, filter Filter) (string, []SearchHit, error) {
+	selected, err := m.searchResultsMode(ctx, query, topK, filter, true)
+	if err != nil {
+		return "", nil, err
+	}
+	hits := hitsFromResults(selected)
+	return formatSearchHits(hits), hits, nil
+}
+
 // QueryHits 同 Query（fail-closed 严格地板），但同时返回格式化上下文与结构化命中列表。
 //
 // U9：引擎自动 RAG 注入点需要「注入了什么」的结构化命中回传前端渲染命中标签+详情。

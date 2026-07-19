@@ -27,17 +27,20 @@ type LLMConfigResponse struct {
 
 // LLMProviderConfigResponse 脱敏后的 Provider 配置
 type LLMProviderConfigResponse struct {
-	APIKey       string   `json:"api_key"`
-	BaseURL      string   `json:"base_url"`
-	Model        string   `json:"model"`
-	Models       []string `json:"models,omitempty"`
-	Compatible   string   `json:"compatible"`
-	Locality     string   `json:"locality,omitempty"`
-	ToolsEnabled *bool    `json:"tools_enabled,omitempty"`
-	MaxTools     int      `json:"max_tools,omitempty"`
-	Enabled      *bool    `json:"enabled,omitempty"`
-	KeepAlive    string   `json:"keep_alive,omitempty"`
-	NumCtx       int      `json:"num_ctx,omitempty"`
+	APIKey                string                               `json:"api_key"`
+	BaseURL               string                               `json:"base_url"`
+	Model                 string                               `json:"model"`
+	Models                []string                             `json:"models,omitempty"`
+	Compatible            string                               `json:"compatible"`
+	Locality              string                               `json:"locality,omitempty"`
+	LocalitySource        string                               `json:"locality_source,omitempty"`
+	ConfirmedEndpointHost string                               `json:"confirmed_endpoint_host,omitempty"`
+	PrivateNetworkAccess  *config.ProviderPrivateNetworkAccess `json:"private_network_access,omitempty"`
+	ToolsEnabled          *bool                                `json:"tools_enabled,omitempty"`
+	MaxTools              int                                  `json:"max_tools,omitempty"`
+	Enabled               *bool                                `json:"enabled,omitempty"`
+	KeepAlive             string                               `json:"keep_alive,omitempty"`
+	NumCtx                int                                  `json:"num_ctx,omitempty"`
 }
 
 // LLMConfigUpdateRequest PUT /api/v1/config/llm 请求
@@ -50,24 +53,29 @@ type LLMConfigUpdateRequest struct {
 
 // LLMProviderConfigUpdateItem 更新请求中的 Provider 项
 type LLMProviderConfigUpdateItem struct {
-	APIKey       string   `json:"api_key"`
-	BaseURL      string   `json:"base_url"`
-	Model        string   `json:"model"`
-	Models       []string `json:"models,omitempty"`
-	Compatible   string   `json:"compatible"`
-	Locality     string   `json:"locality,omitempty"`
-	ToolsEnabled *bool    `json:"tools_enabled,omitempty"`
-	MaxTools     int      `json:"max_tools,omitempty"`
-	Enabled      *bool    `json:"enabled,omitempty"`
-	KeepAlive    string   `json:"keep_alive,omitempty"`
-	NumCtx       int      `json:"num_ctx,omitempty"`
+	APIKey                string                              `json:"api_key"`
+	BaseURL               string                              `json:"base_url"`
+	Model                 string                              `json:"model"`
+	Models                []string                            `json:"models,omitempty"`
+	Compatible            string                              `json:"compatible"`
+	Locality              string                              `json:"locality,omitempty"`
+	LocalitySource        string                              `json:"locality_source,omitempty"`
+	ConfirmedEndpointHost string                              `json:"confirmed_endpoint_host,omitempty"`
+	PrivateNetworkAccess  config.ProviderPrivateNetworkAccess `json:"private_network_access,omitempty"`
+	ToolsEnabled          *bool                               `json:"tools_enabled,omitempty"`
+	MaxTools              int                                 `json:"max_tools,omitempty"`
+	Enabled               *bool                               `json:"enabled,omitempty"`
+	KeepAlive             string                              `json:"keep_alive,omitempty"`
+	NumCtx                int                                 `json:"num_ctx,omitempty"`
 }
 
 type llmConnectionTestProvider struct {
-	Type    string `json:"type"`
-	BaseURL string `json:"base_url"`
-	APIKey  string `json:"api_key"`
-	Model   string `json:"model"`
+	Type                 string                              `json:"type"`
+	BaseURL              string                              `json:"base_url"`
+	APIKey               string                              `json:"api_key"`
+	Model                string                              `json:"model"`
+	Locality             string                              `json:"locality,omitempty"`
+	PrivateNetworkAccess config.ProviderPrivateNetworkAccess `json:"private_network_access,omitempty"`
 }
 
 type LLMConnectionTestRequest struct {
@@ -103,6 +111,14 @@ func effectiveLLMConfig(base config.LLMConfig, runtime llmConfigRuntime) config.
 	return live
 }
 
+func providerPrivateNetworkAccessResponse(access config.ProviderPrivateNetworkAccess) *config.ProviderPrivateNetworkAccess {
+	if strings.TrimSpace(access.Host) == "" && !access.Allowed {
+		return nil
+	}
+	copy := access
+	return &copy
+}
+
 var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvider {
 	// 复用真实路由的类型感知工厂（ollama/anthropic 原生 / 其余 OpenAI 兼容），
 	// 消除「测试连接一律当 OpenAI 打」的协议漂移（契约#2）。
@@ -125,17 +141,20 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	providers := make(map[string]LLMProviderConfigResponse, len(llmCfg.Providers))
 	for name, p := range llmCfg.Providers {
 		providers[name] = LLMProviderConfigResponse{
-			APIKey:       config.MaskAPIKey(p.APIKey),
-			BaseURL:      p.BaseURL,
-			Model:        p.Model,
-			Models:       p.Models,
-			Compatible:   p.Compatible,
-			Locality:     p.Locality,
-			ToolsEnabled: p.ToolsEnabled,
-			MaxTools:     p.MaxTools,
-			Enabled:      p.Enabled,
-			KeepAlive:    p.KeepAlive,
-			NumCtx:       p.NumCtx,
+			APIKey:                config.MaskAPIKey(p.APIKey),
+			BaseURL:               p.BaseURL,
+			Model:                 p.Model,
+			Models:                p.Models,
+			Compatible:            p.Compatible,
+			Locality:              p.Locality,
+			LocalitySource:        p.LocalitySource,
+			ConfirmedEndpointHost: p.ConfirmedEndpointHost,
+			PrivateNetworkAccess:  providerPrivateNetworkAccessResponse(p.PrivateNetworkAccess),
+			ToolsEnabled:          p.ToolsEnabled,
+			MaxTools:              p.MaxTools,
+			Enabled:               p.Enabled,
+			KeepAlive:             p.KeepAlive,
+			NumCtx:                p.NumCtx,
 		}
 	}
 
@@ -169,6 +188,18 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		if !config.IsValidProviderLocalitySource(p.LocalitySource) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("provider %q 的 locality_source=%q 非法：应为 system 或 user", name, p.LocalitySource),
+			})
+			return
+		}
+		if err := config.ValidateProviderEndpointAccess(p.BaseURL, p.PrivateNetworkAccess); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("provider %q 的 base_url 不安全: %v", name, err),
+			})
+			return
+		}
 		if !config.IsValidKeepAlive(p.KeepAlive) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{
 				"error": fmt.Sprintf("provider %q 的 keep_alive=%q 非法：应为 Go duration（如 30m/2h）、纯整数秒（如 3600）、0 或 -1", name, p.KeepAlive),
@@ -197,17 +228,20 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			newProviders[name] = config.LLMProviderConfig{
-				APIKey:       apiKey,
-				BaseURL:      p.BaseURL,
-				Model:        p.Model,
-				Models:       p.Models,
-				Compatible:   p.Compatible,
-				Locality:     p.Locality,
-				ToolsEnabled: p.ToolsEnabled,
-				MaxTools:     p.MaxTools,
-				Enabled:      p.Enabled, // 禁用态持久化；Key 经脱敏回传保留（IsMaskedKey 分支）
-				KeepAlive:    p.KeepAlive,
-				NumCtx:       p.NumCtx,
+				APIKey:                apiKey,
+				BaseURL:               p.BaseURL,
+				Model:                 p.Model,
+				Models:                p.Models,
+				Compatible:            p.Compatible,
+				Locality:              p.Locality,
+				LocalitySource:        p.LocalitySource,
+				ConfirmedEndpointHost: p.ConfirmedEndpointHost,
+				PrivateNetworkAccess:  p.PrivateNetworkAccess,
+				ToolsEnabled:          p.ToolsEnabled,
+				MaxTools:              p.MaxTools,
+				Enabled:               p.Enabled, // 禁用态持久化；Key 经脱敏回传保留（IsMaskedKey 分支）
+				KeepAlive:             p.KeepAlive,
+				NumCtx:                p.NumCtx,
 			}
 		}
 		nextLLM.Providers = newProviders
@@ -339,12 +373,18 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if err := config.ValidateProviderEndpointAccess(baseURL, req.Provider.PrivateNetworkAccess); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 
 	provider := llmTestProviderFactory(llmConnectionTestProvider{
-		Type:    providerType,
-		BaseURL: baseURL,
-		APIKey:  apiKey,
-		Model:   model,
+		Type:                 providerType,
+		BaseURL:              baseURL,
+		APIKey:               apiKey,
+		Model:                model,
+		Locality:             req.Provider.Locality,
+		PrivateNetworkAccess: req.Provider.PrivateNetworkAccess,
 	})
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
@@ -386,8 +426,10 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 // 向 {base_url}/models 发请求（OpenAI 兼容格式），返回标准化的模型列表。
 func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		BaseURL string `json:"base_url"`
-		APIKey  string `json:"api_key"`
+		BaseURL              string                              `json:"base_url"`
+		APIKey               string                              `json:"api_key"`
+		Locality             string                              `json:"locality,omitempty"`
+		PrivateNetworkAccess config.ProviderPrivateNetworkAccess `json:"private_network_access,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误"})
@@ -396,6 +438,10 @@ func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Reques
 	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
 	if baseURL == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "base_url 不能为空"})
+		return
+	}
+	if err := config.ValidateProviderEndpointAccess(baseURL, req.PrivateNetworkAccess); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 

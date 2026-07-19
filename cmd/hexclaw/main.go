@@ -74,6 +74,7 @@ import (
 	k12 "github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12apihttp "github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	k12assembly "github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
 	k12engineadapter "github.com/hexagon-codes/hexclaw/scenarios/k12/engineadapter"
 	k12skilladapter "github.com/hexagon-codes/hexclaw/scenarios/k12/skilladapter"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
@@ -1363,12 +1364,27 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	eng.SetAgentRouter(agentRouter)
 	srv.SetAgentRouter(agentRouter)
 	srv.SetAgentStore(agentStore)
-	if scheduler != nil {
-		// Agent deletion owns the lifecycle of scenario-provisioned schedules.
-		// The cleaner stages K12 cron removal and provides compensation when the
-		// subsequent Agent persistence step fails.
-		srv.SetAgentResourceCleaner(k12CronRegistrar{sched: scheduler, router: agentRouter})
+	if webhookMgr != nil {
+		webhookMgr.SetK12BindingAuthorizer(func(_ context.Context, _ string, agentID, learnerID string) error {
+			agent, ok := agentRouter.GetAgent(agentID)
+			if !ok || agent.Metadata["scenario"] != "k12-tutor" {
+				return fmt.Errorf("TutorAgent %q 不存在或不是 K12 辅导实例", agentID)
+			}
+			expectedLearner := strings.TrimSpace(agent.Metadata["k12.learner_id"])
+			if expectedLearner == "" {
+				// Typed Learner 尚未迁移前，一 Learner 一 TutorAgent 的稳定 ID
+				// 退化为 Agent name；绝不接受请求随意声明另一 learner。
+				expectedLearner = agent.Name
+			}
+			if learnerID != expectedLearner {
+				return fmt.Errorf("learner_id 与 TutorAgent 绑定档案不一致")
+			}
+			return nil
+		})
 	}
+	// Agent deletion owns all out-of-band K12 resources even when cron is
+	// disabled: Webhook endpoints must be disabled first and local assets removed.
+	srv.SetAgentResourceCleaner(k12CronRegistrar{sched: scheduler, router: agentRouter, webhookMgr: webhookMgr})
 
 	// 注册需要 dispatcher/executor 的 Agent 级 Skill
 	if err := skills.Register(engine.NewHandoffSkill(agentRouter)); err != nil {
@@ -1413,6 +1429,17 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			Content:  spec.Task,
 		}
 		engine.ApplySpecToMessage(msg, spec)
+		// DD-018: K12 GradingJob calls pin provider/model in context. Explicit
+		// message routing disables the engine's normal cross-provider fallback;
+		// a settings change therefore affects only newly created Jobs.
+		if snapshot, ok := k12.GradingModelSnapshotFromContext(ctx); ok {
+			if msg.Metadata == nil {
+				msg.Metadata = map[string]string{}
+			}
+			msg.Metadata["provider"] = snapshot.Provider
+			msg.Metadata["model"] = snapshot.Model
+			msg.Metadata["route_snapshot"] = snapshot.Route
+		}
 		reply, err := eng.Process(ctx, msg)
 		if err != nil {
 			return engine.SubAgentResult{}, err
@@ -1474,10 +1501,25 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			}
 			// BUG-20260712：识题用**配置的默认**视觉模型（尊重「设置哪个模型走哪个」），不走
 			// cost-aware（那会抓本地免费 provider、无视用户配的 glm-4v-flash，既慢又曾 404）。
-			provider, visionModel, rErr := eng.RouteForVision(ctx)
-			if rErr != nil {
-				logger.Warn("[k12识题] 视觉模型路由失败", "err", rErr.Error(), "image_bytes", len(image))
-				return "", rErr
+			var provider hexagon.Provider
+			var visionModel string
+			if snapshot, pinned := k12.GradingModelSnapshotFromContext(ctx); pinned {
+				var found bool
+				provider, found = router.Get(snapshot.Provider)
+				if !found || provider == nil {
+					return "", fmt.Errorf("K12 GradingJob 冻结 provider %q 不可用，拒绝跨路由 fallback", snapshot.Provider)
+				}
+				visionModel = snapshot.Model
+				if err := k12.ValidateGradingModelRoute(ctx, snapshot.Provider, visionModel); err != nil {
+					return "", err
+				}
+			} else {
+				var rErr error
+				provider, visionModel, rErr = eng.RouteForVision(ctx)
+				if rErr != nil {
+					logger.Warn("[k12识题] 视觉模型路由失败", "err", rErr.Error(), "image_bytes", len(image))
+					return "", rErr
+				}
 			}
 			// 排查用：打印识题实际选中的 provider/model + egress 用途，一眼定位路由/出网问题。
 			logger.Info("[k12识题] 视觉模型已路由", "provider", provider.Name(), "model", visionModel,
@@ -1512,8 +1554,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		recognizerAdapter := k12engineadapter.NewRecognizerAdapter(visionFn)
 		k12Opts := []k12assembly.Option{
 			k12assembly.WithRecognizer(recognizerAdapter),
+			k12assembly.WithCreativeWorkOCR(k12engineadapter.NewCreativeWorkOCRAdapter(visionFn)),
 			k12assembly.WithAnswerAnchorer(recognizerAdapter),
 			k12assembly.WithPhotoAnnotator(k12engineadapter.NewPhotoAnnotator()),
+			k12assembly.WithDeliveryTransport(k12Deliver),
 		}
 		if fileMem != nil {
 			k12Opts = append(k12Opts, k12assembly.WithInsights(k12engineadapter.NewInsightsAdapter(fileMem)))
@@ -1768,18 +1812,31 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			if scheduler != nil {
 				k12Cron = k12CronRegistrar{sched: scheduler, router: agentRouter}
 			}
-			// IM 入站路由「绑定」缝：POST /api/k12/bind-im 把家庭群绑到辅导实例。
+			// IM 入站路由「绑定」缝：POST /api/k12/bind-im 把家长私聊会话绑到辅导实例（仅 direct）。
 			k12Binder := &k12IMBinder{router: agentRouter, store: agentStore}
 			k12Base := fmt.Sprintf("http://127.0.0.1:%d", cfg.Server.Port)
 			// 统一 GradingJob 编排器（§6.7 单一应用服务）：桌面 HTTP 入口与钉钉 IM 入口共用；
 			// §6.15 异步执行模型（进程级 ctx + 有界并发 + panic 不逃逸）+ 阶段产物落盘恢复。
-			k12GradingOrch = k12usecase.NewGradingOrchestrator(k12rt.Deps, func() k12.GradingModelSnapshot {
+			k12ModelSnapshot := func() k12.GradingModelSnapshot {
 				name := router.DefaultName()
 				return k12.GradingModelSnapshot{Provider: name, Model: router.ProviderModel(name), Capability: "vision"}
-			},
+			}
+			k12GradingOrch = k12usecase.NewGradingOrchestrator(k12rt.Deps, k12ModelSnapshot,
 				k12usecase.WithGradingRunDir(filepath.Join(dataDir, "k12", "grading-runs")),
 				k12usecase.WithGradingBaseContext(ctx),
 			)
+			if webhookMgr != nil {
+				// DD-019: K12 Webhook is a TriggerAdapter into the same application
+				// commands as Desktop/IM/Workflow; it never falls back to the generic
+				// webhook-system prompt path.
+				recovered, recoverErr := installK12WebhookHandler(ctx, webhookMgr,
+					newK12WebhookEventHandler(k12rt.Deps, k12GradingOrch, k12ModelSnapshot, srv))
+				if recoverErr != nil {
+					logger.Warn("K12 Webhook 持久派发恢复失败", "error", recoverErr)
+				} else if recovered > 0 {
+					logger.Info("K12 Webhook 持久派发恢复完成", "recovered", recovered)
+				}
+			}
 			// 挂载前缀取自 Manifest（路由命名空间由声明驱动，不再硬编码字面量）。
 			srv.Mount(k12rt.Manifest.MountPath, k12apihttp.NewHandler(k12apihttp.Runtime{
 				Views:   k12rt.Registry.Views,
@@ -1787,7 +1844,6 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				Deps:    k12rt.Deps,
 				Cron:    k12Cron,
 				Binder:  k12Binder,
-				Deliver: k12Deliver,
 				BaseURL: k12Base,
 				Grading: k12GradingOrch,
 			}))
@@ -2123,6 +2179,16 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	dingtalkChannel.SetSender(func(ctx context.Context, to channel.Target, msg channel.Message) error {
 		return instanceMgr.Send(ctx, to.SendKey(), to.ChatID, adapterReplyFromChannelMessage(msg))
 	})
+	dingtalkChannel.SetReceiptTransport(
+		func(ctx context.Context, to channel.Target, msg channel.Message) (channel.DeliveryAck, error) {
+			ack, err := instanceMgr.SendWithReceipt(ctx, to.SendKey(), to.ChatID, adapterReplyFromChannelMessage(msg))
+			return channelAckFromAdapter(ack, to), err
+		},
+		func(ctx context.Context, to channel.Target, externalMessageID string) (channel.DeliveryAck, error) {
+			ack, err := instanceMgr.QueryReceipt(ctx, to.SendKey(), externalMessageID)
+			return channelAckFromAdapter(ack, to), err
+		},
+	)
 	k12Deliver.MarkReady()
 	if disabled := parseDisabledIMProviders(os.Getenv("HEXCLAW_DISABLE_IM")); len(disabled) > 0 {
 		instanceMgr.SetDisabledProviders(disabled...)
@@ -2138,6 +2204,23 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 	if err := instanceMgr.SeedFromConfig(ctx, cfg); err != nil {
 		return fmt.Errorf("写入平台实例种子失败: %w", err)
+	}
+	// DD-024 restart recovery runs only after live provider instances exist.
+	// Pending rows were never attempted and may start once; sending/unknown rows
+	// are query-only, so a process crash can never turn into a blind duplicate.
+	if k12Runtime != nil && k12Runtime.Deps.Delivery != nil {
+		go func() {
+			for _, agent := range agentRouter.ListAgents() {
+				recovered, recoverErr := k12Runtime.Deps.RecoverDeliveryReceipts(ctx, agent.Name)
+				if recoverErr != nil {
+					logger.Warn("K12 投递回执恢复失败", "agent", agent.Name, "error", recoverErr)
+					continue
+				}
+				if recovered > 0 {
+					logger.Info("K12 投递回执恢复完成", "agent", agent.Name, "recovered", recovered)
+				}
+			}
+		}()
 	}
 	// 历史明文 config_json 静态加密回填（box 未注入时为 no-op）。
 	if n, eerr := instanceMgr.EncryptExistingAtRest(ctx); eerr != nil {
@@ -2227,8 +2310,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		// than only log (review L2).
 		// ChannelPort 收敛：已注册通道（钉钉）的投递走通道端口；未注册目标/留缝 stub
 		// 回退平台通用直发（见 newCronIMDeliver），行为逐字节不变。
-		scheduler.SetDeliverer(newCronIMDeliver(ctx, imChannels, func(ctx context.Context, target, chatID, content string) error {
-			return instanceMgr.Send(ctx, target, chatID, &adapter.Reply{Content: content})
+		scheduler.SetDeliverer(newCronIMDeliver(ctx, imChannels, func(ctx context.Context, target, chatID string, msg channel.Message) error {
+			return instanceMgr.Send(ctx, target, chatID, adapterReplyFromChannelMessage(msg))
 		}))
 	}
 
@@ -2466,8 +2549,9 @@ func (a unattendedRiskAdapter) AssessLowRisk(ctx context.Context, action, payloa
 // k12CronRegistrar 把平台 cron.Scheduler 包成 K12 的 CronRegistrar 缝（AP-1：K12 不 import cron）。
 // 用 AddJobFromScript 直接喂 K12 产的确定性 Starlark 脚本，跳过 LLM 编译。
 type k12CronRegistrar struct {
-	sched  *cron.Scheduler
-	router *agentrouter.Dispatcher
+	sched      *cron.Scheduler
+	router     *agentrouter.Dispatcher
+	webhookMgr *webhook.Manager
 }
 
 // classifiedSolveExecutor is the composition boundary between K12 profile data
@@ -2578,24 +2662,64 @@ func (r k12CronRegistrar) ReclaimStale(ctx context.Context, agentName string, ke
 	return removed, nil
 }
 
-// DetachAgentResources implements api.AgentResourceCleaner. Only K12 agents
-// own the stable source-key family "<agent>/..."; unrelated Agents are a
-// deliberate no-op. The returned closure re-provisions the detached snapshots
-// when durable Agent deletion fails, making the cross-component deletion a
-// compensating saga instead of a best-effort cascade.
+// DetachAgentResources implements api.AgentResourceCleaner. Only K12 agents own
+// the stable source-key cron family "<agent>/..." and本机作品资产
+// (assetstore/<agent>/); unrelated Agents are a deliberate no-op. K12 records and
+// IM bindings live in DB tables with `REFERENCES agents(name) ON DELETE CASCADE`,
+// so the durable Agent-row deletion抹除 them atomically——this cleaner covers the
+// two out-of-band resources that外键级联 cannot reach: live cron jobs and
+// filesystem asset files. The returned closure re-provisions the detached cron
+// snapshots and restores the asset bytes when durable Agent deletion fails, making
+// the cross-component deletion a compensating saga instead of a best-effort cascade.
 func (r k12CronRegistrar) DetachAgentResources(
 	ctx context.Context,
 	agent agentrouter.AgentConfig,
 ) (func(context.Context) error, error) {
-	if r.sched == nil || agent.Metadata["scenario"] != "k12-tutor" {
+	if agent.Metadata["scenario"] != "k12-tutor" {
 		return nil, nil
 	}
-	detached, err := r.sched.RemoveJobsBySourceKeyPrefix(ctx, agent.Name+"/")
+
+	// 0) Webhook TriggerAdapter 必须最先失效，关闭 Agent 删除窗口内的新入站。
+	var restoreWebhooks func(context.Context) error
+	if r.webhookMgr != nil {
+		var err error
+		restoreWebhooks, err = r.webhookMgr.DetachK12BindingsByAgent(ctx, agent.Name)
+		if err != nil {
+			return nil, fmt.Errorf("停用 K12 Webhook binding: %w", err)
+		}
+	}
+
+	// 1) 作品资产：删前快照（saga 补偿载体），再抹除本机文件与目录。
+	assetSnap, err := assetstore.SnapshotAgent(agent.Name)
 	if err != nil {
-		return nil, fmt.Errorf("清理 K12 定时任务: %w", err)
+		if restoreWebhooks != nil {
+			_ = restoreWebhooks(context.WithoutCancel(ctx))
+		}
+		return nil, fmt.Errorf("快照 K12 作品资产: %w", err)
 	}
-	if len(detached) == 0 {
-		return nil, nil
+	if _, err := assetstore.DeleteAgent(agent.Name); err != nil {
+		if restoreWebhooks != nil {
+			_ = restoreWebhooks(context.WithoutCancel(ctx))
+		}
+		return nil, fmt.Errorf("清理 K12 作品资产: %w", err)
+	}
+
+	// 2) 定时任务：摘除稳定 source-key 家族（可空调度器时跳过）。
+	var detached []*cron.Job
+	if r.sched != nil {
+		detached, err = r.sched.RemoveJobsBySourceKeyPrefix(ctx, agent.Name+"/")
+		if err != nil {
+			// cron 摘除失败：先回填已删资产，避免半清理残缺。
+			if rErr := assetSnap.Restore(); rErr != nil {
+				return nil, fmt.Errorf("清理 K12 定时任务失败(%v)；资产回滚亦失败: %w", err, rErr)
+			}
+			if restoreWebhooks != nil {
+				if rErr := restoreWebhooks(context.WithoutCancel(ctx)); rErr != nil {
+					return nil, fmt.Errorf("清理 K12 定时任务失败(%v)；Webhook 回滚亦失败: %w", err, rErr)
+				}
+			}
+			return nil, fmt.Errorf("清理 K12 定时任务: %w", err)
+		}
 	}
 
 	return func(rollbackCtx context.Context) error {
@@ -2617,6 +2741,14 @@ func (r k12CronRegistrar) DetachAgentResources(
 			}, job.Spec.Runtime, job.Spec.Script)
 			if err != nil {
 				return fmt.Errorf("恢复 K12 定时任务 %s: %w", job.ID, err)
+			}
+		}
+		if err := assetSnap.Restore(); err != nil {
+			return fmt.Errorf("恢复 K12 作品资产: %w", err)
+		}
+		if restoreWebhooks != nil {
+			if err := restoreWebhooks(rollbackCtx); err != nil {
+				return fmt.Errorf("恢复 K12 Webhook binding: %w", err)
 			}
 		}
 		return nil

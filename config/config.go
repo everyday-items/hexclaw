@@ -381,10 +381,13 @@ type LLMProviderConfig struct {
 	//
 	// 显式字段解决“本地网关代理云模型”被误判成本地模型：误判会绕过云端 egress
 	// 守卫、禁用 RAG 辅助 LLM，并错误套用本地单槽/并发策略。
-	Locality     string `yaml:"locality,omitempty" json:"locality,omitempty"`
-	ToolsEnabled *bool  `yaml:"tools_enabled,omitempty"` // 是否启用工具注入（nil=自动判断, true=强制开启, false=强制关闭）
-	MaxTools     int    `yaml:"max_tools,omitempty"`     // 最大注入工具数（0=不限制）
-	Enabled      *bool  `yaml:"enabled,omitempty"`       // 是否启用（nil/true=启用, false=禁用但保留配置/Key，不参与路由）
+	Locality              string                       `yaml:"locality,omitempty" json:"locality,omitempty"`
+	LocalitySource        string                       `yaml:"locality_source,omitempty" json:"locality_source,omitempty"`
+	ConfirmedEndpointHost string                       `yaml:"confirmed_endpoint_host,omitempty" json:"confirmed_endpoint_host,omitempty"`
+	PrivateNetworkAccess  ProviderPrivateNetworkAccess `yaml:"private_network_access,omitempty" json:"private_network_access,omitempty"`
+	ToolsEnabled          *bool                        `yaml:"tools_enabled,omitempty"` // 是否启用工具注入（nil=自动判断, true=强制开启, false=强制关闭）
+	MaxTools              int                          `yaml:"max_tools,omitempty"`     // 最大注入工具数（0=不限制）
+	Enabled               *bool                        `yaml:"enabled,omitempty"`       // 是否启用（nil/true=启用, false=禁用但保留配置/Key，不参与路由）
 	// KeepAlive 本地模型驻留时长(仅 Ollama 生效,如 "5m"/"30m";空=ai-core 默认 30m)。
 	// BUG-20260710:16GB 机器 9B 模型驻留≈7GB,可调短换内存。
 	KeepAlive string `yaml:"keep_alive,omitempty" json:"keep_alive,omitempty"`

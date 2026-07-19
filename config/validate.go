@@ -138,6 +138,14 @@ func (c *Config) Validate() error {
 				Suggest: "本地反向代理云模型请选择 cloud；真正本机/LAN 模型请选择 local；不确定时留空或用 auto",
 			})
 		}
+		if !IsValidProviderLocalitySource(p.LocalitySource) {
+			errs = append(errs, &ValidationError{
+				Field:   fmt.Sprintf("llm.providers.%s.locality_source", name),
+				Value:   p.LocalitySource,
+				Rule:    "system / user",
+				Suggest: "由系统推断时使用 system；用户确认时使用 user",
+			})
+		}
 		if !IsValidKeepAlive(p.KeepAlive) {
 			errs = append(errs, &ValidationError{
 				Field:   fmt.Sprintf("llm.providers.%s.keep_alive", name),

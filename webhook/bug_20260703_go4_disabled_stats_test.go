@@ -16,13 +16,17 @@ import (
 func TestBug20260703_DisabledEndpointWritesNoStats(t *testing.T) {
 	mgr := newDisabledTestManager(t)
 	ctx := context.Background()
-	// 无 Secret（跳过验签）+ 默认未启用：最坏情形，任意未授权对端可直打。
-	if err := mgr.Register(ctx, &Webhook{Name: "nostats", Type: TypeGeneric, Prompt: "p", UserID: "u"}); err != nil {
+	// 已验签（BUG-20260718 fail-closed 后空 Secret 直接 401）+ 默认未启用：
+	// 验证已授权对端打未启用端点也只 423、零统计写入。
+	secret := "nostats-s3cret"
+	if err := mgr.Register(ctx, &Webhook{Name: "nostats", Type: TypeGeneric, Secret: secret, Prompt: "p", UserID: "u"}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
+	payload := []byte(`{"n":1}`)
 	for i := 0; i < 3; i++ {
-		req := httptest.NewRequest("POST", "/api/v1/webhooks/nostats", bytes.NewReader([]byte(`{"n":1}`)))
+		req := httptest.NewRequest("POST", "/api/v1/webhooks/nostats", bytes.NewReader(payload))
+		req.Header.Set("X-Webhook-Signature", genericSigHeader(secret, payload))
 		if rec := serveWebhook(mgr, req); rec.Code != http.StatusLocked {
 			t.Fatalf("未启用端点应 423，得到 %d: %s", rec.Code, rec.Body.String())
 		}
@@ -44,11 +48,14 @@ func TestBug20260703_DisabledEndpointWritesNoStats(t *testing.T) {
 func TestBug20260703_EnabledEndpointStillCountsEvents(t *testing.T) {
 	mgr := newDisabledTestManager(t)
 	ctx := context.Background()
-	if err := mgr.Register(ctx, &Webhook{Name: "counting", Type: TypeGeneric, Prompt: "p", UserID: "u", Enabled: true}); err != nil {
+	secret := "counting-s3cret"
+	if err := mgr.Register(ctx, &Webhook{Name: "counting", Type: TypeGeneric, Secret: secret, Prompt: "p", UserID: "u", Enabled: true}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
-	req := httptest.NewRequest("POST", "/api/v1/webhooks/counting", bytes.NewReader([]byte(`{"n":1}`)))
+	payload := []byte(`{"n":1}`)
+	req := httptest.NewRequest("POST", "/api/v1/webhooks/counting", bytes.NewReader(payload))
+	req.Header.Set("X-Webhook-Signature", genericSigHeader(secret, payload))
 	if rec := serveWebhook(mgr, req); rec.Code != http.StatusOK {
 		t.Fatalf("启用端点应 200，得到 %d: %s", rec.Code, rec.Body.String())
 	}

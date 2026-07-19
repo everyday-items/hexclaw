@@ -31,10 +31,14 @@ func (p *egressCaptureProvider) CountTokens([]llm.Message) (int, error) {
 }
 
 func newEgressSelector(baseURL string, provider *egressCaptureProvider) *Selector {
+	return newEgressSelectorWithLocality(baseURL, "", provider)
+}
+
+func newEgressSelectorWithLocality(baseURL, locality string, provider *egressCaptureProvider) *Selector {
 	cfg := config.LLMConfig{
 		Default: "remote",
 		Providers: map[string]config.LLMProviderConfig{
-			"remote": {BaseURL: baseURL, APIKey: "test", Model: "test"},
+			"remote": {BaseURL: baseURL, APIKey: "test", Model: "test", Locality: locality},
 		},
 	}
 	r := NewWithProviders(cfg, map[string]hexagon.Provider{"remote": provider})
@@ -90,7 +94,7 @@ func TestCloudProviderRejectsSensitiveGeneralChat(t *testing.T) {
 
 func TestLocalProviderBypassesCloudEgressEnvelope(t *testing.T) {
 	p := &egressCaptureProvider{}
-	r := newEgressSelector("http://127.0.0.1:11434/v1", p)
+	r := newEgressSelectorWithLocality("http://127.0.0.1:11434/v1", config.ProviderLocalityLocal, p)
 	if _, err := r.Default().Complete(context.Background(), hexagon.CompletionRequest{}); err != nil {
 		t.Fatalf("local provider must not require cloud egress envelope: %v", err)
 	}

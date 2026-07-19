@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/hexagon-codes/hexclaw/storage/migrate"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -21,6 +23,10 @@ func setupDisabledTestDB(t *testing.T) *sql.DB {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("打开测试数据库失败: %v", err)
+	}
+	if _, err := db.Exec(migrate.K12WebhooksV18DDL); err != nil {
+		db.Close()
+		t.Fatalf("初始化 K12 webhook fixture: %v", err)
 	}
 	db.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = db.Close() })
@@ -149,11 +155,17 @@ func TestTestEventEchoesWithoutDispatch(t *testing.T) {
 func TestGitHubPingTreatedAsTest(t *testing.T) {
 	mgr := newDisabledTestManager(t)
 	ctx := context.Background()
-	if err := mgr.Register(ctx, &Webhook{Name: "gh", Type: TypeGitHub, Prompt: "p", UserID: "u"}); err != nil {
+	secret := "gh-s3cret"
+	if err := mgr.Register(ctx, &Webhook{Name: "gh", Type: TypeGitHub, Secret: secret, Prompt: "p", UserID: "u"}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	req := httptest.NewRequest("POST", "/api/v1/webhooks/gh", bytes.NewReader([]byte(`{"zen":"keep it simple"}`)))
+	// fail-closed（BUG-20260718）：ping 测试事件也须先验签。GitHub 用 X-Hub-Signature-256。
+	payload := []byte(`{"zen":"keep it simple"}`)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(payload)
+	req := httptest.NewRequest("POST", "/api/v1/webhooks/gh", bytes.NewReader(payload))
 	req.Header.Set("X-GitHub-Event", "ping")
+	req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
 	rec := serveWebhook(mgr, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GitHub ping 应 200 回显，得到 %d: %s", rec.Code, rec.Body.String())
@@ -168,8 +180,14 @@ func TestSetEnabledAndReloadKeepsDisabledEndpoints(t *testing.T) {
 	if err := mgr.Init(ctx); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	if err := mgr.Register(ctx, &Webhook{Name: "triage", Type: TypeGeneric, Prompt: "p", UserID: "u"}); err != nil {
+	secret := "triage-s3cret"
+	if err := mgr.Register(ctx, &Webhook{Name: "triage", Type: TypeGeneric, Secret: secret, Prompt: "p", UserID: "u"}); err != nil {
 		t.Fatalf("Register: %v", err)
+	}
+	sign := func(payload []byte) string {
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write(payload)
+		return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 	}
 
 	var dispatched atomic.Int32
@@ -182,7 +200,9 @@ func TestSetEnabledAndReloadKeepsDisabledEndpoints(t *testing.T) {
 	if err := mgr.SetEnabled(ctx, "triage", true); err != nil {
 		t.Fatalf("SetEnabled: %v", err)
 	}
-	req := httptest.NewRequest("POST", "/api/v1/webhooks/triage", bytes.NewReader([]byte(`{"a":1}`)))
+	p1 := []byte(`{"a":1}`)
+	req := httptest.NewRequest("POST", "/api/v1/webhooks/triage", bytes.NewReader(p1))
+	req.Header.Set("X-Webhook-Signature", sign(p1))
 	if rec := serveWebhook(mgr, req); rec.Code != http.StatusOK {
 		t.Fatalf("启用后应 200，得到 %d", rec.Code)
 	}
@@ -191,7 +211,9 @@ func TestSetEnabledAndReloadKeepsDisabledEndpoints(t *testing.T) {
 	if err := mgr.SetEnabled(ctx, "triage", false); err != nil {
 		t.Fatalf("SetEnabled(false): %v", err)
 	}
-	req = httptest.NewRequest("POST", "/api/v1/webhooks/triage", bytes.NewReader([]byte(`{"a":2}`)))
+	p2 := []byte(`{"a":2}`)
+	req = httptest.NewRequest("POST", "/api/v1/webhooks/triage", bytes.NewReader(p2))
+	req.Header.Set("X-Webhook-Signature", sign(p2))
 	if rec := serveWebhook(mgr, req); rec.Code != http.StatusLocked {
 		t.Fatalf("停用后应 423，得到 %d", rec.Code)
 	}
@@ -209,7 +231,9 @@ func TestSetEnabledAndReloadKeepsDisabledEndpoints(t *testing.T) {
 	if _, ok := mgr2.Get("triage"); !ok {
 		t.Fatal("重载后未启用端点丢失")
 	}
-	req = httptest.NewRequest("POST", "/api/v1/webhooks/triage", bytes.NewReader([]byte(`{"a":3}`)))
+	p3 := []byte(`{"a":3}`)
+	req = httptest.NewRequest("POST", "/api/v1/webhooks/triage", bytes.NewReader(p3))
+	req.Header.Set("X-Webhook-Signature", sign(p3))
 	if rec := serveWebhook(mgr2, req); rec.Code != http.StatusLocked {
 		t.Fatalf("重载后的未启用端点应 423，得到 %d", rec.Code)
 	}

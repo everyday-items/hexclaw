@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/storage/migrate"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -23,7 +25,20 @@ func setupTestDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatalf("打开测试数据库失败: %v", err)
 	}
+	if _, err := db.Exec(migrate.K12WebhooksV18DDL); err != nil {
+		db.Close()
+		t.Fatalf("初始化 K12 webhook fixture: %v", err)
+	}
 	return db
+}
+
+// genericSigHeader 计算通用 Webhook 的 HMAC-SHA256 签名头值（X-Webhook-Signature）。
+// BUG-20260718 fail-closed 后：空 Secret 端点一律拒绝，测试须以真实 Secret + 有效签名
+// 走验签门（与生产「创建时自动生成 Secret」一致）。
+func genericSigHeader(secret string, payload []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(payload)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
 // TestManager_RegisterAndList 测试注册和列出 Webhook
@@ -98,6 +113,7 @@ func TestManager_HandleGenericWebhook(t *testing.T) {
 	mgr.Register(ctx, &Webhook{
 		Name:    "test",
 		Type:    TypeGeneric,
+		Secret:  "s3cret-generic",
 		Prompt:  "处理事件",
 		UserID:  "user-1",
 		Enabled: true, // 派发路径测试：显式启用（默认未启用）
@@ -120,6 +136,7 @@ func TestManager_HandleGenericWebhook(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/api/v1/webhooks/test", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Webhook-Signature", genericSigHeader("s3cret-generic", payload))
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -148,6 +165,7 @@ func TestManager_EventTriggerCarriesJobID(t *testing.T) {
 	if err := mgr.Register(ctx, &Webhook{
 		Name:    "trigger",
 		Type:    TypeGeneric,
+		Secret:  "s3cret-trigger",
 		Prompt:  "unused when job bound",
 		JobID:   "job-42",
 		UserID:  "user-1",
@@ -171,8 +189,10 @@ func TestManager_EventTriggerCarriesJobID(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/webhooks/{name}", mgr.Handler())
-	req := httptest.NewRequest("POST", "/api/v1/webhooks/trigger", bytes.NewReader([]byte(`{"x":1}`)))
+	triggerPayload := []byte(`{"x":1}`)
+	req := httptest.NewRequest("POST", "/api/v1/webhooks/trigger", bytes.NewReader(triggerPayload))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Webhook-Signature", genericSigHeader("s3cret-trigger", triggerPayload))
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {

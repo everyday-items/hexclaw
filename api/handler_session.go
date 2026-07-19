@@ -161,6 +161,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	if messages == nil {
 		messages = []*storage.MessageRecord{}
 	}
+	hydrateMessageContents(messages)
 
 	// 获取真实总数用于分页
 	total := len(messages) + offset // 近似值，实际由 store 提供
@@ -527,6 +528,11 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	if results == nil {
 		results = []*storage.SearchResult{}
+	}
+	for _, result := range results {
+		if result != nil {
+			hydrateMessageContents([]*storage.MessageRecord{result.Message})
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{

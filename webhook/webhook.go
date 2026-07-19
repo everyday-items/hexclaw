@@ -89,17 +89,27 @@ type EventHandler func(ctx context.Context, event *Event, prompt string) error
 // 管理 Webhook 注册、接收和分发。
 // 提供 HTTP Handler 挂载到 API 路由。
 type Manager struct {
-	mu       sync.RWMutex
-	db       *sql.DB
-	webhooks map[string]*Webhook // name -> webhook
-	handler  EventHandler
+	mu                   sync.RWMutex
+	k12Mu                sync.Mutex // K12 lifecycle/nonce/event acceptance linearization boundary
+	db                   *sql.DB
+	webhooks             map[string]*Webhook // name -> webhook
+	handler              EventHandler
+	k12Handler           K12EventHandler
+	k12Clock             func() time.Time
+	k12BindingAuthorizer K12BindingAuthorizer
+	k12RateWindows       map[string]k12RateWindow
+	k12AttemptRateLimit  int
+	k12OwnerRateLimit    int
 }
 
 // NewManager 创建 Webhook 管理器
 func NewManager(db *sql.DB) *Manager {
 	return &Manager{
-		db:       db,
-		webhooks: make(map[string]*Webhook),
+		db:                  db,
+		webhooks:            make(map[string]*Webhook),
+		k12RateWindows:      make(map[string]k12RateWindow),
+		k12AttemptRateLimit: 240,
+		k12OwnerRateLimit:   120,
 	}
 }
 
@@ -126,7 +136,6 @@ func (m *Manager) Init(ctx context.Context) error {
 	if _, aerr := m.db.ExecContext(ctx, `ALTER TABLE webhooks ADD COLUMN job_id TEXT NOT NULL DEFAULT ''`); aerr != nil && !strings.Contains(aerr.Error(), "duplicate column") {
 		logger.Warn("Webhook: 添加 job_id 列失败（非 duplicate）", "err", aerr.Error())
 	}
-
 	return m.loadWebhooks(ctx)
 }
 
@@ -151,6 +160,18 @@ func (m *Manager) Register(ctx context.Context, wh *Webhook) error {
 	}
 	if wh.CreatedAt.IsZero() {
 		wh.CreatedAt = time.Now()
+	}
+	if wh.Type == TypeK12 {
+		return fmt.Errorf("K12 webhook 必须通过 CreateK12Binding 创建")
+	}
+	// 与 CreateK12Binding 共用名称线性化边界，避免两个独立表并发插入
+	// 同名 endpoint 后由路由查询顺序随机决定实际协议。
+	m.k12Mu.Lock()
+	defer m.k12Mu.Unlock()
+	if _, err := m.getK12BindingByName(ctx, wh.Name); err == nil {
+		return fmt.Errorf("%w: %s", ErrWebhookExists, wh.Name)
+	} else if !errors.Is(err, ErrK12BindingNotFound) {
+		return fmt.Errorf("检查 K12 webhook 重名: %w", err)
 	}
 
 	enabled := 0
@@ -266,6 +287,17 @@ func (m *Manager) Handler() http.HandlerFunc {
 			return
 		}
 
+		// K12 binding shares the public receiver route but owns an independent,
+		// fail-closed protocol (timestamp+nonce+raw-body HMAC, owner binding,
+		// Receipt/idempotency). Never fall through to the generic prompt parser.
+		if binding, err := m.getK12BindingByName(r.Context(), name); err == nil {
+			m.handleK12(w, r, binding)
+			return
+		} else if !errors.Is(err, ErrK12BindingNotFound) {
+			http.Error(w, "webhook lookup failed", http.StatusInternalServerError)
+			return
+		}
+
 		// 查找 webhook（含未启用的：未启用端点仍要验签/记录/回 423，
 		// 让用户在启用前就能把 URL 配到对端并跑通测试事件）
 		m.mu.RLock()
@@ -277,21 +309,33 @@ func (m *Manager) Handler() http.HandlerFunc {
 			return
 		}
 
-		// 读取请求体
+		// 读取请求体：MaxBytesReader 超限返回显式错误（区别于 io.LimitReader 的静默
+		// 截断——截断后的半个 payload 既会验签失败、又可能被按合法事件解析派发）。
 		defer r.Body.Close()
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxPayloadSize))
+		r.Body = http.MaxBytesReader(w, r.Body, maxPayloadSize)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				logger.Error("Webhook 拒绝：请求体超限", "name", name, "limit", maxPayloadSize)
+				http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "read body failed", http.StatusBadRequest)
 			return
 		}
 
-		// 签名验证
-		if wh.Secret != "" {
-			if !m.verifySignature(wh, r, body) {
-				logger.Error("Webhook", "name", name)
-				http.Error(w, "signature verification failed", http.StatusUnauthorized)
-				return
-			}
+		// 签名验证（fail-closed）：外部触发是第一道门，绝不裸奔。空 Secret 的端点
+		// 无法验签——不是「跳过验签」而是配置缺陷，一律拒绝，绝不静默放行派发 Agent。
+		if strings.TrimSpace(wh.Secret) == "" {
+			logger.Error("Webhook 拒绝：端点未配置验签 Secret（fail-closed，不静默跳过）", "name", name)
+			http.Error(w, "webhook secret not configured; refusing unverified request", http.StatusUnauthorized)
+			return
+		}
+		if !m.verifySignature(wh, r, body) {
+			logger.Error("Webhook", "name", name)
+			http.Error(w, "signature verification failed", http.StatusUnauthorized)
+			return
 		}
 
 		// 解析事件
@@ -377,10 +421,11 @@ func isTestEvent(wh *Webhook, r *http.Request, event *Event) bool {
 	return wh.Type == TypeGitHub && event.EventType == "ping"
 }
 
-// signatureStatus 报告本次请求验签状态：配置了 Secret 的到这里必已通过。
+// signatureStatus 报告本次请求验签状态。空 Secret 端点已在 Handler 前置 fail-closed
+// 拒绝（不再有「skipped」裸奔路径），能走到测试事件回显的必已通过验签。
 func signatureStatus(wh *Webhook) string {
-	if wh.Secret == "" {
-		return "skipped"
+	if strings.TrimSpace(wh.Secret) == "" {
+		return "rejected"
 	}
 	return "ok"
 }

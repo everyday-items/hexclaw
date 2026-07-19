@@ -23,6 +23,15 @@ func IsValidProviderLocality(locality string) bool {
 	}
 }
 
+func IsValidProviderLocalitySource(source string) bool {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "", "system", "user":
+		return true
+	default:
+		return false
+	}
+}
+
 // IsLocalLLMProvider classifies the final model deployment location.
 // Explicit locality is authoritative because a loopback endpoint can be a
 // reverse proxy to a cloud model, while a private-LAN endpoint can host a real
@@ -41,10 +50,22 @@ func IsLocalLLMProviderNamed(name string, provider LLMProviderConfig) bool {
 	case ProviderLocalityCloud:
 		return false
 	}
-	if strings.TrimSpace(provider.BaseURL) != "" {
+	// auto/empty is deliberately cloud-safe for generic loopback gateways: the
+	// HTTP listener location does not reveal where model compute/data end up.
+	// Only the built-in Ollama provider is deterministic without user input.
+	isOllama := strings.Contains(strings.ToLower(strings.TrimSpace(name)), "ollama")
+	if name == "" {
+		// Preserve the legacy unnamed helper contract. Production routing always
+		// has the provider key and uses the cloud-safe branch above.
 		return IsLocalProviderBaseURL(provider.BaseURL)
 	}
-	return strings.Contains(strings.ToLower(strings.TrimSpace(name)), "ollama")
+	if !isOllama {
+		return false
+	}
+	if strings.TrimSpace(provider.BaseURL) == "" {
+		return true
+	}
+	return IsLocalProviderBaseURL(provider.BaseURL)
 }
 
 // IsLocalProviderBaseURL classifies only the parsed endpoint host. Local-looking
