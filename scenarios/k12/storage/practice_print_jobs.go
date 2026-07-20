@@ -321,8 +321,9 @@ func (s *Store) RetryPracticePrintJob(ctx context.Context, agentName, jobID stri
 // after the set update rolls the entire transaction back.
 func (s *Store) CommitPracticePrintJob(ctx context.Context, agentName, jobID, nativeJobID,
 	nativeReceiptID, printerSnapshot string, at int64) (k12.PracticePrintJob, error) {
-	if strings.TrimSpace(nativeJobID) == "" || strings.TrimSpace(nativeReceiptID) == "" {
-		return k12.PracticePrintJob{}, fmt.Errorf("k12storage: printed 必须携带 native_job_id 与 native_receipt_id")
+	if strings.TrimSpace(nativeJobID) == "" || strings.TrimSpace(nativeReceiptID) == "" ||
+		!validPrinterSnapshotJSON(printerSnapshot) {
+		return k12.PracticePrintJob{}, fmt.Errorf("k12storage: printed 必须携带 native_job_id、native_receipt_id 与 printer snapshot")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

@@ -113,6 +113,7 @@ func NewHandler(rt Runtime) http.Handler {
 	// DD-023 native two-phase printing. The legacy /finalize endpoint remains for
 	// older clients; new Desktop builds use only PrintJob prepare/events/retry.
 	mux.HandleFunc("POST /practice-sets/{id}/print-jobs", h.preparePracticePrintJob)
+	mux.HandleFunc("POST /print-jobs", h.prepareGenericPrintJob)
 	mux.HandleFunc("GET /print-jobs/{id}", h.getPracticePrintJob)
 	mux.HandleFunc("GET /print-jobs/{id}/paper", h.getPracticePrintJobPaper)
 	mux.HandleFunc("POST /print-jobs/{id}/events", h.recordPracticePrintEvent)

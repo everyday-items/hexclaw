@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
@@ -59,14 +60,17 @@ type practiceSetDTO struct {
 
 type practicePrintJobDTO struct {
 	PrintJobID         string `json:"print_job_id"`
-	PracticeSetID      string `json:"practice_set_id"`
+	PracticeSetID      string `json:"practice_set_id,omitempty"`
 	IdempotencyKey     string `json:"idempotency_key"`
 	Status             string `json:"status"`
-	PaperNo            string `json:"paper_no"`
+	PaperNo            string `json:"paper_no,omitempty"`
 	ArtifactKind       string `json:"artifact_kind"`
 	ArtifactID         string `json:"artifact_id"`
-	QuestionArtifactID string `json:"question_artifact_id"`
-	AnswerArtifactID   string `json:"answer_artifact_id"`
+	QuestionArtifactID string `json:"question_artifact_id,omitempty"`
+	AnswerArtifactID   string `json:"answer_artifact_id,omitempty"`
+	SourceKind         string `json:"source_kind,omitempty"`
+	SourceRef          string `json:"source_ref,omitempty"`
+	Title              string `json:"title,omitempty"`
 	SourceDigest       string `json:"source_digest"`
 	AttemptCount       int    `json:"attempt_count"`
 	NativeJobID        string `json:"native_job_id,omitempty"`
@@ -78,6 +82,23 @@ type practicePrintJobDTO struct {
 	PrintedAt          int64  `json:"printed_at,omitempty"`
 	UpdatedAt          int64  `json:"updated_at"`
 	Version            int    `json:"version"`
+}
+
+func toGenericPrintJobDTO(v usecase.GenericPrintView) practicePrintJobDTO {
+	job, artifact := v.Job, v.Artifact
+	var printer any
+	if job.PrinterSnapshot != "" && job.PrinterSnapshot != "{}" {
+		_ = json.Unmarshal([]byte(job.PrinterSnapshot), &printer)
+	}
+	return practicePrintJobDTO{
+		PrintJobID: job.PrintJobID, IdempotencyKey: job.IdempotencyKey,
+		Status: job.Status, ArtifactKind: artifact.SourceKind, ArtifactID: artifact.ArtifactID,
+		SourceKind: artifact.SourceKind, SourceRef: artifact.SourceRef, Title: artifact.Title,
+		SourceDigest: artifact.SourceDigest, AttemptCount: job.AttemptCount,
+		NativeJobID: job.NativeJobID, NativeReceiptID: job.NativeReceiptID,
+		PrinterSnapshot: printer, FailureKind: job.FailureKind, FailureDetail: job.FailureDetail,
+		PreparedAt: job.PreparedAt, PrintedAt: job.PrintedAt, UpdatedAt: job.UpdatedAt, Version: job.Version,
+	}
 }
 
 func toPracticePrintJobDTO(v usecase.PracticePrintView) practicePrintJobDTO {
@@ -388,13 +409,57 @@ func (h *handler) preparePracticePrintJob(w http.ResponseWriter, r *http.Request
 	})
 }
 
+type prepareGenericPrintReq struct {
+	Agent             string `json:"agent"`
+	IdempotencyKey    string `json:"idempotency_key"`
+	SourceKind        string `json:"source_kind"`
+	SourceRef         string `json:"source_ref"`
+	Title             string `json:"title"`
+	CanonicalMarkdown string `json:"canonical_markdown"`
+}
+
+// prepareGenericPrintJob freezes a non-mutating printable Artifact. Query,
+// paper, event and retry recovery deliberately share the public /print-jobs
+// routes with practice-specific jobs.
+func (h *handler) prepareGenericPrintJob(w http.ResponseWriter, r *http.Request) {
+	var req prepareGenericPrintReq
+	if !decode(w, r, &req) {
+		return
+	}
+	v, replay, err := h.rt.Deps.PrepareGenericPrint(r.Context(), usecase.PrepareGenericPrintRequest{
+		AgentName: req.Agent, IdempotencyKey: req.IdempotencyKey, SourceKind: req.SourceKind,
+		SourceRef: req.SourceRef, Title: req.Title, CanonicalMarkdown: req.CanonicalMarkdown,
+	})
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+		return
+	}
+	status := http.StatusCreated
+	if replay {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, map[string]any{"print_job": toGenericPrintJobDTO(v), "replayed": replay})
+}
+
+func isGenericPrintJobID(id string) bool { return strings.HasPrefix(id, "gprint-") }
+
 func (h *handler) getPracticePrintJob(w http.ResponseWriter, r *http.Request) {
 	agent := r.URL.Query().Get("agent")
 	if agent == "" {
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
-	v, err := h.rt.Deps.GetPracticePrint(r.Context(), agent, r.PathValue("id"))
+	jobID := r.PathValue("id")
+	if isGenericPrintJobID(jobID) {
+		v, err := h.rt.Deps.GetGenericPrint(r.Context(), agent, jobID)
+		if err != nil {
+			writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"print_job": toGenericPrintJobDTO(v)})
+		return
+	}
+	v, err := h.rt.Deps.GetPracticePrint(r.Context(), agent, jobID)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
 		return
@@ -408,7 +473,21 @@ func (h *handler) getPracticePrintJobPaper(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
-	v, err := h.rt.Deps.RenderPracticePrintJobPaper(r.Context(), agent, r.PathValue("id"), r.URL.Query().Get("kind"))
+	jobID := r.PathValue("id")
+	if isGenericPrintJobID(jobID) {
+		v, err := h.rt.Deps.RenderGenericPrintArtifact(r.Context(), agent, jobID)
+		if err != nil {
+			writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"print_job_id": v.PrintJobID, "artifact_id": v.ArtifactID,
+			"source_kind": v.SourceKind, "source_ref": v.SourceRef,
+			"title": v.Title, "source_digest": v.SourceDigest, "markdown": v.Markdown,
+		})
+		return
+	}
+	v, err := h.rt.Deps.RenderPracticePrintJobPaper(r.Context(), agent, jobID, r.URL.Query().Get("kind"))
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
 		return
@@ -439,10 +518,21 @@ func (h *handler) recordPracticePrintEvent(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusBadRequest, "agent / status 必填")
 		return
 	}
-	v, err := h.rt.Deps.RecordPracticePrintEvent(r.Context(), req.Agent, r.PathValue("id"), usecase.PracticePrintEvent{
+	event := usecase.PracticePrintEvent{
 		Status: req.Status, NativeJobID: req.NativeJobID, NativeReceiptID: req.NativeReceiptID,
 		PrinterSnapshot: string(req.PrinterSnapshot), FailureKind: req.FailureKind, FailureDetail: req.FailureDetail,
-	})
+	}
+	jobID := r.PathValue("id")
+	if isGenericPrintJobID(jobID) {
+		v, err := h.rt.Deps.RecordGenericPrintEvent(r.Context(), req.Agent, jobID, event)
+		if err != nil {
+			writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"print_job": toGenericPrintJobDTO(v)})
+		return
+	}
+	v, err := h.rt.Deps.RecordPracticePrintEvent(r.Context(), req.Agent, jobID, event)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
 		return
@@ -459,7 +549,17 @@ func (h *handler) retryPracticePrintJob(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
-	v, err := h.rt.Deps.RetryPracticePrint(r.Context(), req.Agent, r.PathValue("id"))
+	jobID := r.PathValue("id")
+	if isGenericPrintJobID(jobID) {
+		v, err := h.rt.Deps.RetryGenericPrint(r.Context(), req.Agent, jobID)
+		if err != nil {
+			writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"print_job": toGenericPrintJobDTO(v)})
+		return
+	}
+	v, err := h.rt.Deps.RetryPracticePrint(r.Context(), req.Agent, jobID)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
 		return

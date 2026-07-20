@@ -40,6 +40,11 @@ type PracticePrintPaperView struct {
 	Markdown     string
 }
 
+func validPrinterSnapshot(raw string) bool {
+	var snapshot map[string]any
+	return json.Unmarshal([]byte(raw), &snapshot) == nil && len(snapshot) > 0
+}
+
 // PreparePracticePrint performs phase one of DD-023. It freezes the verified paper
 // source and reserves a formal paper_no, while the PracticeSet remains draft.
 func (d Deps) PreparePracticePrint(ctx context.Context, agentName, recordID, idempotencyKey,
@@ -183,7 +188,7 @@ func (d Deps) RecordPracticePrintEvent(ctx context.Context, agentName, jobID str
 	switch event.Status {
 	case k12.PrintJobPrinted:
 		if strings.TrimSpace(event.NativeJobID) == "" || strings.TrimSpace(event.NativeReceiptID) == "" ||
-			strings.TrimSpace(event.PrinterSnapshot) == "" || !json.Valid([]byte(event.PrinterSnapshot)) {
+			!validPrinterSnapshot(event.PrinterSnapshot) {
 			return PracticePrintView{}, fmt.Errorf("%w: printed 必须携带有效 native_job_id / native_receipt_id / printer_snapshot", ErrInvalidInput)
 		}
 		job, err := d.Records.CommitPracticePrintJob(ctx, agentName, jobID, event.NativeJobID,
