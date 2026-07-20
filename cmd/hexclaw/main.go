@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -25,6 +26,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,7 +43,6 @@ import (
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexagon/observe/events"
 	"github.com/hexagon-codes/hexagon/observe/trace"
-	"github.com/hexagon-codes/hexagon/rag/reranker"
 	"github.com/hexagon-codes/hexagon/rag/splitter"
 	genstore "github.com/hexagon-codes/toolkit/blobstore"
 
@@ -69,6 +70,7 @@ import (
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/render"
+	"github.com/hexagon-codes/hexclaw/resourcegov"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/scenario"
 	k12 "github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -240,6 +242,79 @@ func applyDesktopOverrides(cfg *config.Config) {
 	cfg.Security.ContentFilter.Enabled = false      // 不按 harmful/illegal 拦内容
 }
 
+const (
+	installedSemanticActivationAttempts   = 4
+	installedSemanticActivationRetryDelay = 500 * time.Millisecond
+	knowledgeOllamaInstallTimeout         = 4 * time.Hour
+)
+
+func sameOllamaModel(installed, configured string) bool {
+	return knowledge.OllamaModelMatches(installed, configured)
+}
+
+// retryInstalledKnowledgeSemanticIndexActivation closes the short
+// post-install consistency window between Ollama's terminal pull event and
+// /api/tags visibility. Only capability-not-yet-visible errors are retried;
+// shutdown and all other failures return immediately.
+func retryInstalledKnowledgeSemanticIndexActivation(
+	ctx context.Context,
+	maxAttempts int,
+	retryDelay time.Duration,
+	activate func(context.Context) error,
+) error {
+	if activate == nil {
+		return fmt.Errorf("knowledge: installed-model activation is nil")
+	}
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
+	delay := retryDelay
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := activate(ctx)
+		if err == nil || !errors.Is(err, knowledge.ErrProfileUnavailable) || attempt == maxAttempts {
+			return err
+		}
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return ctx.Err()
+			case <-timer.C:
+			}
+			if delay < (1 << 62) {
+				delay *= 2
+			}
+		}
+	}
+	return nil
+}
+
+func newProcessResourceGovernor(cfg config.ResourceGovernorConfig) (*resourcegov.Governor, error) {
+	backgroundAging, err := time.ParseDuration(cfg.BackgroundAging)
+	if err != nil {
+		return nil, fmt.Errorf("resource_governor.background_aging: %w", err)
+	}
+	return resourcegov.New(resourcegov.Config{
+		Limits: map[resourcegov.Resource]int{
+			resourcegov.ResourceVLM:         cfg.VLMConcurrency,
+			resourcegov.ResourceAccelerator: cfg.AcceleratorConcurrency,
+			resourcegov.ResourceCPUHeavy:    cfg.CPUHeavyConcurrency,
+			resourcegov.ResourceSQLiteWrite: cfg.SQLiteWriteConcurrency,
+		},
+		BackgroundAging:     backgroundAging,
+		MaxInteractiveBurst: cfg.MaxInteractiveBurst,
+	})
+}
+
 func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, desktopMode bool) error {
 	// 1. 加载配置
 	cfg, err := config.Load(configFile)
@@ -314,6 +389,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 业务路径用 featureflag.Enabled(ctx, "name") 查询，未注册 flag 仍按配置错误处理为 OFF。
 	flags := featureflag.NewStatic(featureflag.Registered(), cfg.Features)
 	ctx := featureflag.WithContext(context.Background(), flags)
+	processResources, err := newProcessResourceGovernor(cfg.ResourceGovernor)
+	if err != nil {
+		return fmt.Errorf("初始化进程资源治理失败: %w", err)
+	}
+	defer processResources.Close()
 	if registered := featureflag.Registered(); len(registered) > 0 {
 		fmt.Printf("  ✓ Features    %d 个 flag 注册（其中 %d 启用）\n",
 			len(registered), countEnabledFlags(flags))
@@ -606,6 +686,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	//   store:    hexclaw SQLite (文档元数据 + FTS5 + 向量 BLOB)
 	kbOK := false
 	var sharedEmbedder hexagon.VectorEmbedder // 共享 embedder: KB + VectorMemory + 语义搜索
+	var kbSemanticRuntime *knowledgeSemanticIndexRuntime
+	var kbSemanticResolver *knowledgeEmbeddingRuntimeHolder
 	// 嵌入接线信息（BUG-20260712-B1）：装配完成后注入 api server，
 	// 供 /knowledge/embedding-status 端点把「嵌入未就绪=自动注入休眠」可见化。
 	var kbEmbedProvider, kbEmbedModel, kbEmbedBaseURL string
@@ -626,24 +708,38 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					// Ollama 不需要 API Key；云服务只有在 provider+model+key 均显式配置时才接线。
 					isOllama := embeddingPlan.Ollama
 					if isOllama || pc.APIKey != "" {
+						effectiveBaseURL := knowledgeEmbeddingEffectiveBaseURL(embeddingPlan, pc)
 						var providerOpts []hexagon.OpenAIOption
-						if pc.BaseURL != "" {
-							providerOpts = append(providerOpts, hexagon.OpenAIWithBaseURL(pc.BaseURL))
+						if effectiveBaseURL != "" {
+							providerOpts = append(providerOpts, hexagon.OpenAIWithBaseURL(effectiveBaseURL))
 						}
-						apiKey := pc.APIKey
-						if apiKey == "" {
-							apiKey = "ollama" // Ollama 不需要真实 key，但 OpenAI client 要求非空
+						providerTransportReady := true
+						providerClient, clientErr := newKnowledgeEmbeddingProviderHTTPClient(embeddingPlan, pc)
+						if clientErr != nil {
+							providerTransportReady = false
+							logger.Warn("[knowledge] embedding endpoint 被安全策略拒绝",
+								"provider", embProviderName, "error", clientErr)
+						} else {
+							providerOpts = append(providerOpts, hexagon.OpenAIWithHTTPClient(providerClient))
 						}
-						aiProvider := hexagon.NewOpenAI(apiKey, providerOpts...)
-						dim := hexagon.OpenAIEmbeddingDimension(embModel)
-						emb = hexagon.NewOpenAIEmbedder(aiProvider,
-							hexagon.WithEmbedderModel(embModel),
-							hexagon.WithEmbedderDimension(dim),
-						)
-						kbEmbedProvider, kbEmbedModel = embProviderName, embModel
-						kbEmbedBaseURL, kbEmbedLocal = pc.BaseURL, isOllama
-						kbEmbedReady = embeddingPlan.Ready
-						kbEmbedServiceAvailable = embeddingPlan.ServiceAvailable
+						apiKey := knowledgeEmbeddingProviderAPIKey(embeddingPlan, pc)
+						if providerTransportReady {
+							dim := knowledgeEmbeddingDimensionForProvider(pc, embModel)
+							if dim <= 0 {
+								logger.Warn("[knowledge] embedding 向量维度未知，旧版共享向量路径保持关闭",
+									"provider", embProviderName, "model", embModel)
+							} else {
+								aiProvider := hexagon.NewOpenAI(apiKey, providerOpts...)
+								emb = hexagon.NewOpenAIEmbedder(aiProvider,
+									hexagon.WithEmbedderModel(embModel),
+									hexagon.WithEmbedderDimension(dim),
+								)
+								kbEmbedProvider, kbEmbedModel = embProviderName, embModel
+								kbEmbedBaseURL, kbEmbedLocal = effectiveBaseURL, isOllama
+								kbEmbedReady = embeddingPlan.Ready
+								kbEmbedServiceAvailable = embeddingPlan.ServiceAvailable
+							}
+						}
 					}
 				}
 			} else if embProviderName != "" {
@@ -727,23 +823,57 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			}
 			// #12 query/doc 嵌入非对称：显式配置优先，否则按模型智能默认
 			//（nomic 系用其官方任务前缀 search_query/search_document；bge-m3/openai 无需前缀）
-			qp, dp := cfg.Knowledge.Embedding.QueryPrefix, cfg.Knowledge.Embedding.DocPrefix
-			if qp == "" && dp == "" && strings.Contains(strings.ToLower(embModel), "nomic") {
-				qp, dp = "search_query: ", "search_document: "
-			}
+			qp, dp := knowledgeEmbeddingPrefixes(cfg, embModel)
 			hybridCfg.EmbedQueryPrefix = qp
 			hybridCfg.EmbedDocPrefix = dp
 
-			// 4. 创建 Manager (kbStore 同时实现 DocumentRepository + ChunkSearcher)
-			// 注意: 传 sharedEmbedder（接口类型）而非 emb（*OpenAIEmbedder），
-			// 避免 Go 接口 nil 陷阱（typed nil pointer 使接口非 nil 但 receiver 为 nil）
+			// Desktop's legacy KB is one authenticated local corpus. Bind it once,
+			// then install the revision-scoped API/search/worker bundle before any
+			// document writes can enter the Manager.
+			var managerEmbedder = sharedEmbedder
+			if desktopMode {
+				semanticRuntimeGate := newKnowledgeSemanticRuntimeGate()
+				embeddingProfiles := buildKnowledgeEmbeddingRuntimeProfiles(
+					ctx, cfg, cloudEgress, semanticRuntimeGate,
+				)
+				profiles, profilesErr := newKnowledgeEmbeddingRuntimeHolder(embeddingProfiles)
+				var semanticRuntime *knowledgeSemanticIndexRuntime
+				semanticErr := profilesErr
+				if profilesErr == nil {
+					semanticRuntime, semanticErr = setupKnowledgeSemanticIndex(
+						ctx, store.DB(), profiles, profiles, "desktop-"+idgen.NanoID(),
+						withKnowledgeSemanticRuntimeGate(semanticRuntimeGate),
+						withKnowledgeSemanticResourceGovernor(processResources),
+					)
+				}
+				if semanticRuntime == nil {
+					logger.Warn("[knowledge] 语义索引运行时初始化失败，保持旧版 FTS 路径", "error", semanticErr)
+				} else {
+					kbSemanticRuntime = semanticRuntime
+					kbSemanticResolver = profiles
+					kbStore = knowledge.NewSQLiteStore(store.DB(),
+						knowledge.WithSQLiteSemanticMutations(knowledgeDesktopOwnerID, knowledgeDefaultCorpusID))
+					managerEmbedder = nil // revision worker owns document/query embedding; never double-write legacy vectors.
+					if semanticErr != nil {
+						logger.Warn("[knowledge] 默认语义策略初始化失败，保持受作用域保护的 FTS 路径", "error", semanticErr)
+					}
+				}
+			}
+
+			// 4. 创建 Manager (kbStore 同时实现 DocumentRepository + ChunkSearcher)。
+			// revision runtime 启用后 Manager 不再同步写 legacy embedding；共享 embedder
+			// 只由持久 Worker/active revision 查询使用，避免双写和向量空间混用。
 			mgrOpts := []knowledge.ManagerOption{
 				knowledge.WithSplitter(sp),
 				knowledge.WithHybridConfig(hybridCfg),
+				knowledge.WithResourceGovernor(processResources),
 				// Bound each scheduled-task snapshot series so an @hourly collector
 				// cannot grow the local KB without limit (IngestSnapshot prunes the
 				// oldest past this cap).
 				knowledge.WithSnapshotRetention(cfg.Knowledge.SnapshotRetention),
+			}
+			if kbSemanticRuntime != nil {
+				mgrOpts = append(mgrOpts, knowledge.WithRevisionSemanticSearcher(kbSemanticRuntime.Searcher))
 			}
 			// #6/#8 注入 LLM（复用 Agent 的 LLM router）：重排 + 查询扩展。
 			// router 为 nil 时不注入 → rerank/query-expand 自动降级关闭（安全）。
@@ -779,25 +909,40 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					})))
 			}
 			// 专用 cross-encoder 重排：配置 rerank_model（或 SiliconFlow 自动）时，用
-			// hexagon CohereReranker 指向同 provider 的 /rerank 端点，替代慢/贵的 LLM 重排。
+			// 同源安全客户端调用 provider 的 /rerank 端点，替代慢/贵的 LLM 重排。
 			if pc, ok := cfg.LLM.Providers[embProviderName]; ok {
 				rerankModel := cfg.Knowledge.RerankModel
 				if rerankModel == "" && strings.Contains(strings.ToLower(pc.BaseURL), "siliconflow") {
 					rerankModel = "BAAI/bge-reranker-v2-m3"
 				}
 				if rerankModel != "" && pc.APIKey != "" {
-					rerankBase := strings.TrimSuffix(strings.TrimSuffix(pc.BaseURL, "/"), "/v1")
-					cloudReranker := reranker.NewCohereReranker(pc.APIKey,
-						reranker.WithCohereBaseURL(rerankBase),
-						reranker.WithCohereModel(rerankModel),
-						reranker.WithCohereTopK(hybridCfg.CandidateK))
-					mgrOpts = append(mgrOpts, knowledge.WithDocReranker(guardedDocReranker{
-						next: cloudReranker, guard: cloudEgress.GuardContext,
-					}))
-					logger.Info("[knowledge] 启用专用 cross-encoder 重排", "model", rerankModel)
+					cloudReranker, rerankErr := newSafeCohereReranker(
+						pc.BaseURL, pc.APIKey, rerankModel, hybridCfg.CandidateK, pc.PrivateNetworkAccess,
+					)
+					if rerankErr != nil {
+						logger.Warn("[knowledge] 专用 cross-encoder 重排保持关闭", "model", rerankModel, "error", rerankErr)
+					} else {
+						mgrOpts = append(mgrOpts, knowledge.WithDocReranker(guardedDocReranker{
+							next: cloudReranker, guard: cloudEgress.GuardContext,
+						}))
+						logger.Info("[knowledge] 启用专用 cross-encoder 重排", "model", rerankModel)
+					}
 				}
 			}
-			kbMgr := knowledge.NewManager(kbStore, kbStore, sharedEmbedder, mgrOpts...)
+			kbMgr := knowledge.NewManager(kbStore, kbStore, managerEmbedder, mgrOpts...)
+			if kbSemanticRuntime != nil {
+				if err := kbSemanticRuntime.Service.ConfigureDocumentIngest(
+					filepath.Join(dataDir, "knowledge", "objects"),
+				); err != nil {
+					logger.Warn("[knowledge] 异步文档对象存储初始化失败，上传入口保持不可用", "error", err)
+				} else {
+					kbSemanticRuntime.Worker.SetDocumentIngestProcessor(
+						api.NewKnowledgeDocumentIngestProcessor(
+							kbMgr, api.WithKnowledgeResourceGovernor(processResources),
+						),
+					)
+				}
+			}
 			eng.SetKnowledgeBase(kbMgr)
 			// Register the knowledge_ingest skill: the only channel for the Agent
 			// to persist content into the knowledge base. Without it the
@@ -978,6 +1123,75 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	// 8. 启动 HTTP 服务
 	srv := api.NewServer(cfg, eng, gw, store)
+	if kbSemanticRuntime != nil {
+		srv.SetSemanticIndexService(kbSemanticRuntime.Service)
+		srv.SetSemanticRuntimeInvalidator(kbSemanticRuntime.Revoke)
+		if kbSemanticResolver != nil {
+			srv.SetSemanticRuntimeReloader(func(reloadCtx context.Context, nextLLM config.LLMConfig) error {
+				nextCfg := *cfg
+				nextCfg.LLM = nextLLM
+				nextGate := newKnowledgeSemanticRuntimeGate()
+				nextProfiles := buildKnowledgeEmbeddingRuntimeProfiles(
+					reloadCtx, &nextCfg, cloudEgress, nextGate,
+				)
+				return kbSemanticResolver.Replace(reloadCtx, nextProfiles)
+			})
+		}
+	}
+	embeddingLifecycleCtx, stopEmbeddingLifecycle := context.WithCancel(ctx)
+	var embeddingInstallDone chan struct{}
+	defer func() {
+		stopEmbeddingLifecycle()
+		if embeddingInstallDone != nil {
+			select {
+			case <-embeddingInstallDone:
+			case <-time.After(5 * time.Second):
+				logger.Warn("[knowledge] 等待本地模型安装任务退出超时")
+			}
+		}
+	}()
+	var embeddingActivationMu sync.Mutex
+	activateInstalledSemanticIndex := func(activationCtx context.Context) {
+		if kbSemanticRuntime == nil || kbSemanticResolver == nil || embeddingLifecycleCtx.Err() != nil {
+			return
+		}
+		embeddingActivationMu.Lock()
+		defer embeddingActivationMu.Unlock()
+		if embeddingLifecycleCtx.Err() != nil {
+			return
+		}
+		activationErr := retryInstalledKnowledgeSemanticIndexActivation(
+			activationCtx,
+			installedSemanticActivationAttempts,
+			installedSemanticActivationRetryDelay,
+			func(attemptCtx context.Context) error {
+				return activateInstalledKnowledgeSemanticIndex(
+					attemptCtx, kbSemanticRuntime, kbSemanticResolver,
+				)
+			},
+		)
+		if activationErr != nil && embeddingLifecycleCtx.Err() == nil {
+			logger.Warn("[knowledge] 模型安装后创建默认语义索引失败", "error", activationErr)
+		}
+	}
+	kbNativeOllamaManagement := kbEmbedLocal
+	if kbNativeOllamaManagement && kbEmbedBaseURL != "" {
+		if err := srv.SetOllamaBaseURL(kbEmbedBaseURL); err != nil {
+			// Discovery and management intentionally share the same validator, but
+			// keep this fail-closed guard so a future wiring drift can never turn a
+			// rejected endpoint into an implicit localhost pull.
+			kbNativeOllamaManagement = false
+			logger.Warn("[knowledge] Ollama 管理端点配置无效，已禁用知识库模型管理和自动安装", "error", err)
+		}
+	}
+	if kbNativeOllamaManagement && kbSemanticRuntime != nil {
+		srv.SetOllamaModelInstalledCallback(func(_ context.Context, installedModel string) {
+			if !sameOllamaModel(installedModel, kbEmbedModel) {
+				return
+			}
+			activateInstalledSemanticIndex(embeddingLifecycleCtx)
+		})
+	}
 	srv.SetKnowledgeEmbeddingInfo(api.KnowledgeEmbeddingInfo{
 		Enabled: cfg.Knowledge.Enabled, Provider: kbEmbedProvider, Model: kbEmbedModel,
 		BaseURL: kbEmbedBaseURL, Local: kbEmbedLocal,
@@ -986,17 +1200,27 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 浮手动重试横幅；可经 knowledge.embedding.disable_auto_install 关闭——计费网络逃生口）。
 	// 后台 goroutine 不阻塞启动；Ensure 幂等（已装 no-op），Embed 按模型名打 Ollama，
 	// 模型就位即生效无需重启。
-	if cfg.Knowledge.Enabled && kbEmbedLocal && kbEmbedModel != "" && kbEmbedServiceAvailable &&
+	if cfg.Knowledge.Enabled && kbNativeOllamaManagement && kbEmbedModel != "" && kbEmbedServiceAvailable &&
 		!kbEmbedReady && !cfg.Knowledge.Embedding.DisableAutoInstall {
+		embeddingInstallDone = make(chan struct{})
 		go func() {
+			defer close(embeddingInstallDone)
 			api.SetKnowledgeEmbeddingPulling(true)
 			defer api.SetKnowledgeEmbeddingPulling(false)
-			pctx, pcancel := context.WithTimeout(context.Background(), 2*time.Hour)
+			pctx, pcancel := context.WithTimeout(embeddingLifecycleCtx, knowledgeOllamaInstallTimeout)
 			defer pcancel()
 			if ok, err := knowledge.EnsureOllamaEmbeddingModel(pctx, kbEmbedBaseURL, kbEmbedModel); err != nil {
-				logger.Warn("[knowledge] 嵌入模型静默预置失败（知识库页可手动安装）", "model", kbEmbedModel, "error", err)
-			} else if ok {
-				logger.Info("[knowledge] 嵌入模型已就位，语义检索激活", "model", kbEmbedModel)
+				if embeddingLifecycleCtx.Err() == nil {
+					logger.Warn("[knowledge] 嵌入模型静默预置失败（知识库页可手动安装）", "model", kbEmbedModel, "error", err)
+				}
+			} else {
+				if ok {
+					logger.Info("[knowledge] 嵌入模型已就位，语义检索激活", "model", kbEmbedModel)
+				}
+				// A successful pull may become visible in /api/tags a moment later.
+				// Retry the exact resolver transition even when Ensure's immediate
+				// post-check returned false, and report a final unresolved state.
+				activateInstalledSemanticIndex(pctx)
 			}
 		}()
 	}
@@ -1480,6 +1704,19 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 统一 GradingJob 编排器（§6.7/§6.15）：桌面 HTTP 与钉钉 IM 共用同一实例；
 	// 阶段产物落盘 dataDir/k12/grading-runs（崩溃恢复载体），异步推进用进程级 ctx。
 	var k12GradingOrch *k12usecase.GradingOrchestrator
+	k12GradingShutdown := false
+	// This defer is the early-return safety net. It is registered after store.Close,
+	// so every path that assembled K12 seals and drains it before SQLite closes.
+	defer func() {
+		if k12GradingOrch == nil || k12GradingShutdown {
+			return
+		}
+		drainCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := k12GradingOrch.Shutdown(drainCtx); err != nil {
+			logger.Warn("K12 批改任务退出兜底超时", "error", err)
+		}
+	}()
 	// ChannelPort 通道注册表（§6.10 / ADR-K12-011）：name→通道端口，装配只此一处注册。
 	// 钉钉是 v0.5.0 唯一真实通道（sender 在 instanceMgr 建成后回填）；飞书/企微为留缝
 	// stub（方法集齐、诚实「未实现」，接入点见 channel/feishu.go|wecom.go 注释）。
@@ -1551,7 +1788,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			return resp.Content, nil
 		}
 
-		recognizerAdapter := k12engineadapter.NewRecognizerAdapter(visionFn)
+		recognizerAdapter := k12engineadapter.NewRecognizerAdapter(
+			visionFn,
+			k12engineadapter.WithRecognizerResourceGovernor(processResources),
+		)
 		k12Opts := []k12assembly.Option{
 			k12assembly.WithRecognizer(recognizerAdapter),
 			k12assembly.WithCreativeWorkOCR(k12engineadapter.NewCreativeWorkOCRAdapter(visionFn)),
@@ -2373,7 +2613,31 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	// 监听退出信号，优雅关闭
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	var semanticWorkerDone chan struct{}
+	if kbSemanticRuntime != nil {
+		semanticWorkerDone = make(chan struct{})
+		go func() {
+			defer close(semanticWorkerDone)
+			runKnowledgeSemanticIndexWorker(embeddingLifecycleCtx, kbSemanticRuntime.Worker, 500*time.Millisecond, func(workerErr error) {
+				logger.Warn("[knowledge] 语义索引任务执行失败", "error", workerErr)
+			})
+		}()
+	}
+	// Also cover server-start/runtime errors that return before the normal
+	// shutdown block. This defer is registered after the worker starts and runs
+	// before the earlier database-close defer, so a cancelled worker can finish
+	// its short fenced lease transition without racing a closed SQLite handle.
+	defer func() {
+		stop()
+		stopEmbeddingLifecycle()
+		if semanticWorkerDone != nil {
+			select {
+			case <-semanticWorkerDone:
+			case <-time.After(6 * time.Second):
+				logger.Warn("[knowledge] 等待语义索引 Worker 异常路径退出超时")
+			}
+		}
+	}()
 
 	errCh := make(chan error, 1)
 	readyCh := make(chan struct{})
@@ -2385,7 +2649,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		close(readyCh)
 	}
 	go func() {
-		if err := srv.Start(sigCtx, onReady); err != nil && err != http.ErrServerClosed {
+		if err := srv.Start(embeddingLifecycleCtx, onReady); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
 		close(errCh)
@@ -2467,20 +2731,52 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	fmt.Println()
 
 	// 等待退出信号或服务器错误
+	var serveErr error
 	select {
 	case <-sigCtx.Done():
 		fmt.Println("\n  🦀 收到退出信号，正在关闭...")
-	case err := <-errCh:
-		if err != nil {
-			return fmt.Errorf("服务器异常: %w", err)
+	case err, ok := <-errCh:
+		if ok && err != nil {
+			serveErr = fmt.Errorf("服务器异常: %w", err)
 		}
 	}
-
 	// 优雅关闭（30 秒超时，防止永久阻塞）
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
+	// Stop closes listeners before invoking the drain hook. No new HTTP request
+	// can enter while detached model pulls and the semantic worker are cancelled.
+	if err := srv.StopWithDrain(shutdownCtx, func() {
+		stop()
+		stopEmbeddingLifecycle()
+	}); err != nil {
+		logger.Error("error", "error", err)
+	}
+	// HTTP listeners and in-flight handlers are closed before sealing the K12
+	// orchestrator. Cancel and drain its grading/anchor/recovery workers while
+	// SQLite is still open; deferred store.Close runs only after this function returns.
+	if k12GradingOrch != nil {
+		if err := k12GradingOrch.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("K12 批改任务停止超时", "error", err)
+		} else {
+			k12GradingShutdown = true
+		}
+	}
+	if semanticWorkerDone != nil {
+		select {
+		case <-semanticWorkerDone:
+		case <-shutdownCtx.Done():
+			logger.Warn("[knowledge] 等待语义索引 Worker 退出超时")
+		}
+	}
+	if embeddingInstallDone != nil {
+		select {
+		case <-embeddingInstallDone:
+		case <-shutdownCtx.Done():
+			logger.Warn("[knowledge] 等待本地模型安装任务退出超时")
+		}
+	}
 
-	// 先停止心跳和定时任务，再关闭 HTTP 服务
+	// HTTP 已停止接收新请求；继续关闭其余后台组件。
 	if hb != nil {
 		hb.Stop()
 	}
@@ -2491,16 +2787,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 持久化 LLM 缓存到 SQLite（下次启动恢复）
 	eng.LLMCache().PersistToDB(store.DB())
 
-	if err := srv.Stop(shutdownCtx); err != nil {
-		logger.Error("error", "error", err)
-	}
-
 	if err := instanceMgr.StopAll(shutdownCtx); err != nil {
 		logger.Error("error", "error", err)
 	}
 
 	fmt.Println("  🦀 HexClaw 已停止")
-	return nil
+	return serveErr
 }
 
 // webPermissionBridge adapts WebAdapter to engine.PermissionSender interface.

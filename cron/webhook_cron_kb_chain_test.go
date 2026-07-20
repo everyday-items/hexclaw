@@ -32,7 +32,23 @@ import (
 	"github.com/hexagon-codes/hexclaw/knowledge"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/webhook"
+	"github.com/hexagon-codes/toolkit/crypto/sign"
 )
+
+func postSignedGenericWebhook(t *testing.T, client *http.Client, url, secret string, body []byte) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatalf("build webhook request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Webhook-Signature", "sha256="+sign.HMACSHA256Hex(body, []byte(secret)))
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST webhook: %v", err)
+	}
+	return resp
+}
 
 func TestWebhookCronKBSnapshotChain_E2E(t *testing.T) {
 	db := setupTestDB(t)
@@ -82,13 +98,14 @@ func TestWebhookCronKBSnapshotChain_E2E(t *testing.T) {
 	}
 
 	// Webhook bound to the job (JobID set → trigger job, prompt ignored).
+	const webhookSecret = "deploy-hook-test-secret"
 	wmgr := webhook.NewManager(db)
 	if err := wmgr.Init(ctx); err != nil {
 		t.Fatalf("webhook init: %v", err)
 	}
 	if err := wmgr.Register(ctx, &webhook.Webhook{
 		Name: "deploy-hook", Type: webhook.TypeGeneric, JobID: job.ID, UserID: "u1",
-		Enabled: true, // 派发链路测试：显式启用（默认未启用）
+		Secret: webhookSecret, Enabled: true, // 派发链路测试：显式启用（默认未启用）
 	}); err != nil {
 		t.Fatalf("register webhook: %v", err)
 	}
@@ -106,10 +123,8 @@ func TestWebhookCronKBSnapshotChain_E2E(t *testing.T) {
 	defer srv.Close()
 
 	fireEvent := func() {
-		resp, err := http.Post(srv.URL+"/webhooks/deploy-hook", "application/json", strings.NewReader(`{"ref":"main"}`))
-		if err != nil {
-			t.Fatalf("POST webhook: %v", err)
-		}
+		payload := []byte(`{"ref":"main"}`)
+		resp := postSignedGenericWebhook(t, srv.Client(), srv.URL+"/webhooks/deploy-hook", webhookSecret, payload)
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("webhook responded %d, want 200", resp.StatusCode)
@@ -181,13 +196,14 @@ func TestWebhookNoJob_TakesPromptPath(t *testing.T) {
 		return AgentResult{Content: "x"}, nil
 	})
 
+	const webhookSecret = "notify-hook-test-secret"
 	wmgr := webhook.NewManager(db)
 	if err := wmgr.Init(ctx); err != nil {
 		t.Fatalf("webhook init: %v", err)
 	}
 	if err := wmgr.Register(ctx, &webhook.Webhook{
 		Name: "notify-hook", Type: webhook.TypeGeneric, Prompt: "处理事件", UserID: "u1", // no JobID
-		Enabled: true, // 派发链路测试：显式启用（默认未启用）
+		Secret: webhookSecret, Enabled: true, // 派发链路测试：显式启用（默认未启用）
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -207,10 +223,7 @@ func TestWebhookNoJob_TakesPromptPath(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	resp, err := http.Post(srv.URL+"/webhooks/notify-hook", "application/json", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatalf("POST: %v", err)
-	}
+	resp := postSignedGenericWebhook(t, srv.Client(), srv.URL+"/webhooks/notify-hook", webhookSecret, []byte(`{}`))
 	resp.Body.Close()
 
 	deadline := time.Now().Add(3 * time.Second)

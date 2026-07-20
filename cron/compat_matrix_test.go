@@ -90,11 +90,14 @@ func TestCompat_F2_V1WithLegacyJobs(t *testing.T) {
 	}
 	assertV2Schema(t, db)
 
-	// 旧任务已被清理
+	// 旧任务保留但暂停，不进入调度。
 	var n int
-	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cron_jobs`).Scan(&n)
-	if n != 0 {
-		t.Errorf("旧任务应清理，剩 %d", n)
+	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cron_jobs WHERE status='paused'`).Scan(&n)
+	if n != 1 {
+		t.Errorf("旧任务应保留并暂停，实际 %d", n)
+	}
+	if len(s.jobs) != 0 {
+		t.Errorf("隔离任务不应加载，jobs=%d", len(s.jobs))
 	}
 }
 
@@ -126,16 +129,21 @@ func TestCompat_F3_V1HalfWithV2Job(t *testing.T) {
 	}
 	assertV2Schema(t, db)
 
-	// v2 任务应保留、v1 应被清理
+	// v2 任务活跃保留、v1 暂停保留。
 	var n int
 	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cron_jobs`).Scan(&n)
-	if n != 1 {
-		t.Errorf("应保留 1 条 v2 任务，实际 %d", n)
+	if n != 2 {
+		t.Errorf("应保留 v1/v2 共 2 条任务，实际 %d", n)
 	}
 	var id string
-	_ = db.QueryRowContext(ctx, `SELECT id FROM cron_jobs LIMIT 1`).Scan(&id)
+	_ = db.QueryRowContext(ctx, `SELECT id FROM cron_jobs WHERE status='active'`).Scan(&id)
 	if id != "v2-1" {
-		t.Errorf("保留的应是 v2-1，实际 %q", id)
+		t.Errorf("活跃的应是 v2-1，实际 %q", id)
+	}
+	var legacyStatus string
+	_ = db.QueryRowContext(ctx, `SELECT status FROM cron_jobs WHERE id='legacy'`).Scan(&legacyStatus)
+	if legacyStatus != "paused" {
+		t.Errorf("legacy status=%q, want paused", legacyStatus)
 	}
 }
 

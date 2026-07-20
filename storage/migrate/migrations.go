@@ -271,40 +271,7 @@ CREATE INDEX IF NOT EXISTS idx_platform_events_created_at ON platform_events(cre
 	},
 	{
 		Version:     2,
-		Description: "v0.3.12 H8 全表 UNIQUE 约束审计：kb_documents / cron_jobs 防重复累积",
-		SQL: `
--- ========== v0.3.12 H8：kb_documents 防同文件多次上传累积 ==========
--- 场景：家长同一教材 PDF 重传一次 → 产生 2 条记录但 id 不同；未来 Sync 逻辑可能累积
--- 策略：(source, title) 非空组合唯一；先 dedupe 历史重复
--- tiebreak 用 rowid（deterministic，保留最早插入的那条），避免 created_at 毫秒级碰撞
--- 导致多行同时匹配 MAX → UNIQUE INDEX 创建失败
-DELETE FROM kb_documents
-WHERE source != ''
-  AND rowid NOT IN (
-    SELECT MIN(rowid) FROM kb_documents
-    WHERE source != ''
-    GROUP BY source, title
-  );
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_documents_unique
-    ON kb_documents(source, title) WHERE source != '';
-
--- ========== v0.3.12 H8：cron_jobs 防同用户重复声明 ==========
--- 场景：家长通过配置 + API 双写同名任务 → 重复触发
--- 策略：(user_id, name) 唯一；同样用 MIN(rowid) 做 deterministic tiebreak
--- NULL 保护：GROUP BY 对 NULL 的处理 SQLite 会把所有 NULL 归一组；
--- 虽然 schema 里 user_id/name 都是 NOT NULL DEFAULT ''，历史数据不一定严格遵守，显式过滤
-DELETE FROM cron_jobs
-WHERE user_id IS NOT NULL AND name IS NOT NULL
-  AND rowid NOT IN (
-    SELECT MIN(rowid) FROM cron_jobs
-    WHERE user_id IS NOT NULL AND name IS NOT NULL
-    GROUP BY user_id, name
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_jobs_user_name
-    ON cron_jobs(user_id, name);
-`,
+		Description: "v0.3.12 H8 唯一约束占位：无损隔离延后到兼容 schema 的 v4/v5 Func",
 	},
 	{
 		Version:     3,
@@ -324,26 +291,8 @@ CREATE TABLE IF NOT EXISTS model_capabilities (
 	},
 	{
 		Version:     4,
-		Description: "v0.4.0 E3 H8 真表 UNIQUE 收口：kb_chunks(doc_id, chunk_index) 防重复入库膨胀",
-		SQL: `
--- ========== v0.4.0 E3：kb_chunks 防同文档同位置重复 chunk 累积 ==========
--- 场景：知识库 ingestion 失败 retry / 重新分块 → 旧 chunk 未删导致 (doc_id, chunk_index) 多行
--- 业务唯一键：(doc_id, chunk_index)
--- 策略：先 dedupe 历史重复（用 MIN(rowid) 做 deterministic tiebreak），再 CREATE UNIQUE INDEX
--- 注意：kb_chunks_fts FTS5 trigger 会随主表 DELETE 自动同步（content='kb_chunks' 的 external content）
-DELETE FROM kb_chunks
-WHERE rowid NOT IN (
-    SELECT MIN(rowid) FROM kb_chunks
-    GROUP BY doc_id, chunk_index
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_chunks_doc_index
-    ON kb_chunks(doc_id, chunk_index);
-
--- 注：messages 表 id 是 PRIMARY KEY，业务唯一性已由 PK 保证，无需补复合 UNIQUE。
---     E3 评审时一度计划补 messages(session_id, seq_no)，但 schema 无 seq_no 字段，
---     且 id 已是 PK，重复持久化会被 PK 冲突拒绝，无需复合 UNIQUE。
-`,
+		Description: "v0.4.0 E3/H8 Knowledge parent/chunk 无损隔离与唯一约束",
+		Func:        migrateKnowledgeUniqueV4,
 	},
 	{
 		Version:     5,
@@ -545,6 +494,13 @@ WHERE status IN ('confirmed','assigned','submitted','graded','closed','cancelled
 		// 历史数据和结果未知态默认 fail closed，避免盲目重复外部副作用。
 		Func: migrateK12WebhookRetryV22,
 	},
+	KnowledgeIndexV23,
+	KnowledgeIngestV24,
+	K12GenericPrintJobsV25,
+	KnowledgeIngestGenerationsV26,
+	KnowledgeDocumentScopeV27,
+	KnowledgeIngestCheckpointV28,
+	CronIntegrityV29,
 }
 
 const k12PrintJobsV13DDL = `CREATE TABLE IF NOT EXISTS k12_paper_no_counters (
@@ -979,150 +935,16 @@ DELETE FROM agent_records WHERE collection IN ('错题本','积累本','练习�
 
 // migrateCronV2 把 cron v1 schema 升级到 v2（详见 .claude/cron-script-compilation-design.md）。
 //
-// 用 Func 而非 SQL 是因为：
-//   - SQLite 不支持 conditional ALTER（基于 pragma 结果分支）
-//   - 需要根据现有 cron_jobs 列状态动态构造 SELECT/INSERT
-//   - DDL（ALTER/DROP/CREATE）在事务里行为复杂，分阶段更稳
+// 用 Func 而非 SQL 是因为要先探测列，再在固定连接的事务中原地 DROP prompt。
+// 禁止通过 DROP/RENAME 重建父表：foreign_keys=ON 时会级联删除 run/state。
 //
 // 流程：
-//  1. cron_jobs 不存在 → CREATE 全新 v2 schema 就行（migrate v1 应该已建表，这里兜底）
-//  2. cron_jobs 已存在但缺 spec_json 列（v1 schema）→ 表重建迁移
-//  3. cron_jobs 已含 spec_json（v2 部分迁移过的旧库）→ 检查是否还有 prompt 列；有就重建
-//  4. cron_job_runs 同理补 stdout/stderr/exit_code/data_json
+//  1. cron_jobs 不存在 → CREATE canonical schema（兜底）
+//  2. 原地补 spec_json/source_prompt/meta，再 ALTER DROP prompt
+//  3. 原地补 cron_job_runs 执行结果列
+//  4. 恢复父/历史索引，并在提交前跑 FK/integrity check
 func migrateCronV2(ctx context.Context, db *sql.DB) error {
-	// — cron_jobs —
-	hasJobs, err := tableExists(ctx, db, "cron_jobs")
-	if err != nil {
-		return fmt.Errorf("检查 cron_jobs: %w", err)
-	}
-	if !hasJobs {
-		// v1 schema 应该已建表；兜底直接建 v2 schema
-		if _, err := db.ExecContext(ctx, cronJobsV2DDL); err != nil {
-			return fmt.Errorf("创建 v2 cron_jobs: %w", err)
-		}
-	} else {
-		hasSpecJSON, _ := columnExists(ctx, db, "cron_jobs", "spec_json")
-		hasPrompt, _ := columnExists(ctx, db, "cron_jobs", "prompt")
-		// 任一不一致都走表重建（涵盖：v1 schema / 半 v2 / 完全 v2 但 prompt 残留）
-		if !hasSpecJSON || hasPrompt {
-			if err := rebuildCronJobs(ctx, db, hasSpecJSON); err != nil {
-				return fmt.Errorf("重建 cron_jobs: %w", err)
-			}
-		}
-	}
-
-	// — cron_job_runs —
-	hasRuns, err := tableExists(ctx, db, "cron_job_runs")
-	if err != nil {
-		return fmt.Errorf("检查 cron_job_runs: %w", err)
-	}
-	if !hasRuns {
-		if _, err := db.ExecContext(ctx, cronJobRunsV2DDL); err != nil {
-			return fmt.Errorf("创建 v2 cron_job_runs: %w", err)
-		}
-	} else {
-		for _, col := range []struct{ name, def string }{
-			{"stdout", "TEXT NOT NULL DEFAULT ''"},
-			{"stderr", "TEXT NOT NULL DEFAULT ''"},
-			{"exit_code", "INTEGER NOT NULL DEFAULT 0"},
-			{"data_json", "TEXT NOT NULL DEFAULT ''"},
-		} {
-			has, _ := columnExists(ctx, db, "cron_job_runs", col.name)
-			if has {
-				continue
-			}
-			stmt := fmt.Sprintf(`ALTER TABLE cron_job_runs ADD COLUMN %s %s`, col.name, col.def)
-			if _, err := db.ExecContext(ctx, stmt); err != nil {
-				return fmt.Errorf("ALTER cron_job_runs ADD %s: %w", col.name, err)
-			}
-		}
-	}
-	return nil
-}
-
-const cronJobsV2DDL = `CREATE TABLE cron_jobs (
-    id            TEXT     PRIMARY KEY,
-    name          TEXT     NOT NULL,
-    type          TEXT     NOT NULL DEFAULT 'cron',
-    schedule      TEXT     NOT NULL,
-    spec_json     TEXT     NOT NULL DEFAULT '',
-    source_prompt TEXT     NOT NULL DEFAULT '',
-    user_id       TEXT     NOT NULL,
-    platform      TEXT     DEFAULT '',
-    chat_id       TEXT     DEFAULT '',
-    status        TEXT     NOT NULL DEFAULT 'active',
-    last_run_at   DATETIME,
-    next_run_at   DATETIME NOT NULL,
-    run_count     INTEGER  DEFAULT 0,
-    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
-)`
-
-const cronJobRunsV2DDL = `CREATE TABLE cron_job_runs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id      TEXT    NOT NULL,
-    status      TEXT    NOT NULL DEFAULT 'success',
-    result      TEXT    NOT NULL DEFAULT '',
-    error       TEXT    NOT NULL DEFAULT '',
-    duration_ms INTEGER NOT NULL DEFAULT 0,
-    run_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
-    stdout      TEXT    NOT NULL DEFAULT '',
-    stderr      TEXT    NOT NULL DEFAULT '',
-    exit_code   INTEGER NOT NULL DEFAULT 0,
-    data_json   TEXT    NOT NULL DEFAULT ''
-)`
-
-// rebuildCronJobs 重建 cron_jobs：保留 spec_json 非空的 v2 任务，丢弃 v1 任务。
-// hasSpecJSON 控制 INSERT SELECT 是否引用旧 spec_json 列。
-func rebuildCronJobs(ctx context.Context, db *sql.DB, hasSpecJSON bool) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(ctx, `CREATE TABLE cron_jobs_v5_new (
-        id            TEXT     PRIMARY KEY,
-        name          TEXT     NOT NULL,
-        type          TEXT     NOT NULL DEFAULT 'cron',
-        schedule      TEXT     NOT NULL,
-        spec_json     TEXT     NOT NULL DEFAULT '',
-        source_prompt TEXT     NOT NULL DEFAULT '',
-        user_id       TEXT     NOT NULL,
-        platform      TEXT     DEFAULT '',
-        chat_id       TEXT     DEFAULT '',
-        status        TEXT     NOT NULL DEFAULT 'active',
-        last_run_at   DATETIME,
-        next_run_at   DATETIME NOT NULL,
-        run_count     INTEGER  DEFAULT 0,
-        created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`); err != nil {
-		return err
-	}
-
-	if hasSpecJSON {
-		// 已 v2 部分迁移过：保留 spec_json 非空的 v2 任务
-		if _, err := tx.ExecContext(ctx, `INSERT INTO cron_jobs_v5_new
-            (id, name, type, schedule, spec_json, source_prompt, user_id, platform, chat_id, status,
-             last_run_at, next_run_at, run_count, created_at)
-            SELECT id, name, COALESCE(type,'cron'), schedule,
-                   COALESCE(spec_json,''), COALESCE(source_prompt,''),
-                   user_id, COALESCE(platform,''), COALESCE(chat_id,''), COALESCE(status,'active'),
-                   last_run_at, next_run_at, COALESCE(run_count,0),
-                   COALESCE(created_at, CURRENT_TIMESTAMP)
-            FROM cron_jobs
-            WHERE spec_json IS NOT NULL AND spec_json != ''`); err != nil {
-			return err
-		}
-	}
-	// 否则纯 v1 schema：v1 任务在 v2 架构下无法运行（没编译 Spec），不复制即丢弃
-
-	if _, err := tx.ExecContext(ctx, `DROP TABLE cron_jobs`); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `ALTER TABLE cron_jobs_v5_new RENAME TO cron_jobs`); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return migrateCronV2InPlace(ctx, db)
 }
 
 // migrateK12PracticeCommandsV12 对 ADD COLUMN 逐列探测，使 V12 在半迁移/人工修复库上

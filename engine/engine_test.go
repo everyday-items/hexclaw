@@ -945,7 +945,7 @@ func TestReActEngine_ProcessHonorsExplicitProviderModelAndDisablesFallback(t *te
 		"智谱": primary,
 		"通义": fallback,
 	}, map[string]config.LLMProviderConfig{
-		"智谱": {Model: "glm-4"},
+		"智谱": {Model: "glm-4", Models: []string{"glm-4", "glm-5"}},
 		"通义": {Model: "qwen-max"},
 	}, "智谱")
 
@@ -985,7 +985,7 @@ func TestReActEngine_ProcessStreamHonorsExplicitProviderModelAndDisablesFallback
 		"智谱": primary,
 		"通义": fallback,
 	}, map[string]config.LLMProviderConfig{
-		"智谱": {Model: "glm-4"},
+		"智谱": {Model: "glm-4", Models: []string{"glm-4", "glm-5"}},
 		"通义": {Model: "qwen-max"},
 	}, "智谱")
 

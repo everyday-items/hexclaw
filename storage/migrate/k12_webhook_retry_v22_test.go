@@ -106,7 +106,7 @@ func TestK12WebhookRetryV22HasUniqueOrderedMigrationNumber(t *testing.T) {
 			}
 		}
 	}
-	if found != 1 || last != 22 {
-		t.Fatalf("expected exactly one latest V22 migration, found=%d latest=%d", found, last)
+	if found != 1 || last < 22 {
+		t.Fatalf("expected exactly one ordered V22 migration, found=%d latest=%d", found, last)
 	}
 }

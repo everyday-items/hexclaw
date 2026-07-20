@@ -33,6 +33,11 @@ func TestHandleSearchKnowledge_MetadataFilter(t *testing.T) {
 	add := func(id, source, stype string, created time.Time) {
 		doc := &knowledge.Document{ID: id, Title: id, Source: source, SourceType: stype, ChunkCount: 1, CreatedAt: created, UpdatedAt: created, Status: "indexed"}
 		ch := &knowledge.Chunk{ID: id + "-c0", DocID: id, DocTitle: id, Source: source, ChunkCount: 1, Content: "shared widget content", Index: 0, CreatedAt: created}
+		if id == "A" {
+			ch.PageStart, ch.PageEnd = 7, 7
+			ch.SourceDigest = strings.Repeat("a", 64)
+			ch.SourceOffsetStart, ch.SourceOffsetEnd = 300, 360
+		}
 		if err := store.Add(ctx, doc, []*knowledge.Chunk{ch}); err != nil {
 			t.Fatalf("add %s: %v", id, err)
 		}
@@ -81,6 +86,12 @@ func TestHandleSearchKnowledge_MetadataFilter(t *testing.T) {
 	}
 	if st, _ := bOnly[0].Metadata["source_type"].(string); st != "agent" {
 		t.Errorf("Metadata.source_type 应回填 agent，得 %v", bOnly[0].Metadata)
+	}
+	aOnly := post(`{"query":"widget","top_k":10,"sources":["upload:a.pdf"]}`)
+	if len(aOnly) != 1 || aOnly[0].PageStart != 7 || aOnly[0].PageEnd != 7 ||
+		aOnly[0].SourceDigest != strings.Repeat("a", 64) ||
+		aOnly[0].SourceOffsetStart != 300 || aOnly[0].SourceOffsetEnd != 360 {
+		t.Fatalf("search API structured source span=%+v", aOnly)
 	}
 	// created_before=06-10：只剩 A（日期在 Go 层按真实时刻过滤）。
 	if g := docIDs(post(`{"query":"widget","top_k":10,"created_before":"2026-06-10"}`)); !g["A"] || g["B"] {

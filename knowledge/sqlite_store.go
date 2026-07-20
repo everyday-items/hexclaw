@@ -29,7 +29,19 @@ import (
 // 余弦相似度在 Go 层计算。对于个人知识库规模（< 10万 chunk），
 // 这种方案性能完全够用，且避免了 CGO/sqlite-vec 的编译依赖。
 type SQLiteStore struct {
-	db *sql.DB
+	db                *sql.DB
+	semanticMutations *sqliteSemanticMutationScope
+}
+
+type SQLiteStoreOption func(*SQLiteStore)
+
+// WithSQLiteSemanticMutations binds document writes to one explicit
+// owner/corpus. The hook runs inside the same SQLite transaction as the legacy
+// document/chunk/FTS write, so a control-plane failure rolls everything back.
+func WithSQLiteSemanticMutations(ownerID, corpusID string) SQLiteStoreOption {
+	return func(store *SQLiteStore) {
+		store.semanticMutations = &sqliteSemanticMutationScope{ownerID: ownerID, corpusID: corpusID}
+	}
 }
 
 // 编译期接口满足性检查
@@ -40,8 +52,27 @@ var (
 )
 
 // NewSQLiteStore 创建 SQLite 知识库存储
-func NewSQLiteStore(db *sql.DB) *SQLiteStore {
-	return &SQLiteStore{db: db}
+func NewSQLiteStore(db *sql.DB, options ...SQLiteStoreOption) *SQLiteStore {
+	store := &SQLiteStore{db: db}
+	for _, option := range options {
+		if option != nil {
+			option(store)
+		}
+	}
+	return store
+}
+
+// semanticScopeClause returns a fail-closed owner+corpus predicate for reads.
+// The public API uses the stable corpus alias ("default"), while documents
+// persist the immutable internal corpus UID.
+func (s *SQLiteStore) semanticScopeClause(documentAlias string) (string, []any) {
+	if s.semanticMutations == nil {
+		return "", nil
+	}
+	return documentAlias + `.corpus_uid=(
+		SELECT c.corpus_uid FROM kb_semantic_corpora c
+		WHERE c.owner_id=? AND c.corpus_alias=?
+	)`, []any{s.semanticMutations.ownerID, s.semanticMutations.corpusID}
 }
 
 // buildFilterClause 把 Filter 的「源 / 源类型」维度编译为下推到 SQL 的 AND 片段
@@ -79,6 +110,23 @@ func inPlaceholders(vals []string) (string, []any) {
 	return strings.Join(ph, ","), args
 }
 
+func nullablePositiveInt(value int) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
+}
+
+func nullableOffset(start, end int64, wantEnd bool) any {
+	if start < 0 || end <= start {
+		return nil
+	}
+	if wantEnd {
+		return end
+	}
+	return start
+}
+
 // Init 初始化知识库表 + FTS5 索引
 func (s *SQLiteStore) Init(ctx context.Context) error {
 	queries := []string{
@@ -92,8 +140,10 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			status TEXT NOT NULL DEFAULT 'indexed',
+			deleted INTEGER NOT NULL DEFAULT 0,
 			error_message TEXT NOT NULL DEFAULT '',
-			source_type TEXT NOT NULL DEFAULT 'manual'
+			source_type TEXT NOT NULL DEFAULT 'manual',
+			corpus_uid TEXT
 		)`,
 
 		// Chunk 表（含向量嵌入 BLOB）
@@ -104,6 +154,11 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 			chunk_index INTEGER NOT NULL,
 			embedding BLOB,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			page_start INTEGER,
+			page_end INTEGER,
+			source_digest TEXT NOT NULL DEFAULT '',
+			source_offset_start INTEGER,
+			source_offset_end INTEGER,
 			FOREIGN KEY (doc_id) REFERENCES kb_documents(id) ON DELETE CASCADE
 		)`,
 
@@ -132,8 +187,15 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 	migrations := []string{
 		`ALTER TABLE kb_documents ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP`,
 		`ALTER TABLE kb_documents ADD COLUMN status TEXT NOT NULL DEFAULT 'indexed'`,
+		`ALTER TABLE kb_documents ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE kb_documents ADD COLUMN error_message TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE kb_documents ADD COLUMN source_type TEXT NOT NULL DEFAULT 'manual'`,
+		`ALTER TABLE kb_documents ADD COLUMN corpus_uid TEXT`,
+		`ALTER TABLE kb_chunks ADD COLUMN page_start INTEGER`,
+		`ALTER TABLE kb_chunks ADD COLUMN page_end INTEGER`,
+		`ALTER TABLE kb_chunks ADD COLUMN source_digest TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE kb_chunks ADD COLUMN source_offset_start INTEGER`,
+		`ALTER TABLE kb_chunks ADD COLUMN source_offset_end INTEGER`,
 	}
 	for _, stmt := range migrations {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
@@ -159,12 +221,29 @@ func (s *SQLiteStore) Add(ctx context.Context, doc *Document, chunks []*Chunk) e
 	}
 	defer tx.Rollback()
 
-	// 插入文档
-	_, err = tx.ExecContext(ctx,
-		`INSERT INTO kb_documents (id, title, content, source, chunk_count, created_at, updated_at, status, error_message, source_type)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		doc.ID, doc.Title, doc.Content, doc.Source, doc.ChunkCount, doc.CreatedAt, doc.UpdatedAt, doc.Status, doc.ErrorMessage, doc.SourceType,
-	)
+	// A scoped document owns its corpus before any binding/job row is created;
+	// this makes the database uniqueness boundary authoritative even between
+	// concurrent writers. Legacy/unscoped stores retain a NULL corpus UID.
+	if s.semanticMutations != nil {
+		state, scopeErr := loadSemanticPolicyState(ctx, tx,
+			s.semanticMutations.ownerID, s.semanticMutations.corpusID)
+		if scopeErr != nil {
+			return scopeErr
+		}
+		_, err = tx.ExecContext(ctx,
+			`INSERT INTO kb_documents (id, title, content, source, chunk_count, created_at, updated_at, status, error_message, source_type, corpus_uid)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			doc.ID, doc.Title, doc.Content, doc.Source, doc.ChunkCount, doc.CreatedAt,
+			doc.UpdatedAt, doc.Status, doc.ErrorMessage, doc.SourceType, state.corpusUID,
+		)
+	} else {
+		_, err = tx.ExecContext(ctx,
+			`INSERT INTO kb_documents (id, title, content, source, chunk_count, created_at, updated_at, status, error_message, source_type)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			doc.ID, doc.Title, doc.Content, doc.Source, doc.ChunkCount, doc.CreatedAt,
+			doc.UpdatedAt, doc.Status, doc.ErrorMessage, doc.SourceType,
+		)
+	}
 	if err != nil {
 		return fmt.Errorf("插入文档失败: %w", err)
 	}
@@ -180,14 +259,23 @@ func (s *SQLiteStore) Add(ctx context.Context, doc *Document, chunks []*Chunk) e
 		// v0.4.0 E3：kb_chunks (doc_id, chunk_index) UNIQUE 收口；
 		// ingestion retry / 重新分块时同位置覆盖而非累积（防 v0.3.12 故障复发）
 		_, err = tx.ExecContext(ctx,
-			`INSERT INTO kb_chunks (id, doc_id, content, chunk_index, embedding, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?)
+			`INSERT INTO kb_chunks (id, doc_id, content, chunk_index, embedding, created_at,
+			 page_start,page_end,source_digest,source_offset_start,source_offset_end)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(doc_id, chunk_index) DO UPDATE SET
 			   id = excluded.id,
 			   content = excluded.content,
 			   embedding = excluded.embedding,
-			   created_at = excluded.created_at`,
+			   created_at = excluded.created_at,
+			   page_start = excluded.page_start,
+			   page_end = excluded.page_end,
+			   source_digest = excluded.source_digest,
+			   source_offset_start = excluded.source_offset_start,
+			   source_offset_end = excluded.source_offset_end`,
 			chunk.ID, chunk.DocID, chunk.Content, chunk.Index, embBlob, chunk.CreatedAt,
+			nullablePositiveInt(chunk.PageStart), nullablePositiveInt(chunk.PageEnd), chunk.SourceDigest,
+			nullableOffset(chunk.SourceOffsetStart, chunk.SourceOffsetEnd, false),
+			nullableOffset(chunk.SourceOffsetStart, chunk.SourceOffsetEnd, true),
 		)
 		if err != nil {
 			return fmt.Errorf("插入 chunk 失败: %w", err)
@@ -199,6 +287,11 @@ func (s *SQLiteStore) Add(ctx context.Context, doc *Document, chunks []*Chunk) e
 			chunk.Content, chunk.ID,
 		); err != nil {
 			return fmt.Errorf("fts5 索引插入失败: %w", err)
+		}
+	}
+	if s.semanticMutations != nil {
+		if err := s.semanticMutations.documentAddedTx(ctx, tx, doc, chunks); err != nil {
+			return fmt.Errorf("更新语义索引任务失败: %w", err)
 		}
 	}
 
@@ -213,6 +306,16 @@ func (s *SQLiteStore) Replace(ctx context.Context, doc *Document, chunks []*Chun
 	}
 	defer tx.Rollback()
 
+	var scopeUID string
+	if s.semanticMutations != nil {
+		state, scopeErr := loadSemanticPolicyState(ctx, tx,
+			s.semanticMutations.ownerID, s.semanticMutations.corpusID)
+		if scopeErr != nil {
+			return scopeErr
+		}
+		scopeUID = state.corpusUID
+	}
+
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM kb_chunks_fts WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE doc_id = ?)`,
 		doc.ID,
@@ -222,13 +325,23 @@ func (s *SQLiteStore) Replace(ctx context.Context, doc *Document, chunks []*Chun
 	if _, err := tx.ExecContext(ctx, `DELETE FROM kb_chunks WHERE doc_id = ?`, doc.ID); err != nil {
 		return fmt.Errorf("删除旧 chunk 失败: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE kb_documents
-		 SET title = ?, content = ?, source = ?, chunk_count = ?, updated_at = ?, status = ?, error_message = ?, source_type = ?
-		 WHERE id = ?`,
-		doc.Title, doc.Content, doc.Source, doc.ChunkCount, doc.UpdatedAt, doc.Status, doc.ErrorMessage, doc.SourceType, doc.ID,
-	); err != nil {
+	updateSQL := `UPDATE kb_documents
+		 SET title = ?, content = ?, source = ?, chunk_count = ?, updated_at = ?, status = ?, deleted = 0, error_message = ?, source_type = ?
+		 WHERE id = ?`
+	updateArgs := []any{doc.Title, doc.Content, doc.Source, doc.ChunkCount, doc.UpdatedAt,
+		doc.Status, doc.ErrorMessage, doc.SourceType, doc.ID}
+	if scopeUID != "" {
+		updateSQL += ` AND corpus_uid = ?`
+		updateArgs = append(updateArgs, scopeUID)
+	}
+	res, err := tx.ExecContext(ctx, updateSQL, updateArgs...)
+	if err != nil {
 		return fmt.Errorf("更新文档失败: %w", err)
+	}
+	if scopeUID != "" {
+		if affected, _ := res.RowsAffected(); affected != 1 {
+			return ErrSemanticIndexNotFound
+		}
 	}
 
 	for _, chunk := range chunks {
@@ -237,8 +350,13 @@ func (s *SQLiteStore) Replace(ctx context.Context, doc *Document, chunks []*Chun
 			embBlob = encodeFloat32Slice(chunk.Embedding)
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO kb_chunks (id, doc_id, content, chunk_index, embedding, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO kb_chunks (id, doc_id, content, chunk_index, embedding, created_at,
+			 page_start,page_end,source_digest,source_offset_start,source_offset_end)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			chunk.ID, chunk.DocID, chunk.Content, chunk.Index, embBlob, chunk.CreatedAt,
+			nullablePositiveInt(chunk.PageStart), nullablePositiveInt(chunk.PageEnd), chunk.SourceDigest,
+			nullableOffset(chunk.SourceOffsetStart, chunk.SourceOffsetEnd, false),
+			nullableOffset(chunk.SourceOffsetStart, chunk.SourceOffsetEnd, true),
 		); err != nil {
 			return fmt.Errorf("插入重建 chunk 失败: %w", err)
 		}
@@ -247,6 +365,11 @@ func (s *SQLiteStore) Replace(ctx context.Context, doc *Document, chunks []*Chun
 			chunk.Content, chunk.ID,
 		); err != nil {
 			return fmt.Errorf("重建 fts5 索引失败: %w", err)
+		}
+	}
+	if s.semanticMutations != nil {
+		if err := s.semanticMutations.documentReplacedTx(ctx, tx, doc, chunks); err != nil {
+			return fmt.Errorf("更新语义索引任务失败: %w", err)
 		}
 	}
 
@@ -269,7 +392,14 @@ func (s *SQLiteStore) Delete(ctx context.Context, docID string) error {
 		return fmt.Errorf("fts5 索引删除失败: %w", err)
 	}
 
-	// 删除 chunk 和文档
+	if s.semanticMutations != nil {
+		if err := s.semanticMutations.documentDeletedTx(ctx, tx, docID); err != nil {
+			return fmt.Errorf("更新语义索引删除状态失败: %w", err)
+		}
+		return tx.Commit()
+	}
+
+	// 未启用语义 revision 运行时时保留旧版物理删除语义。
 	if _, err := tx.ExecContext(ctx, `DELETE FROM kb_chunks WHERE doc_id = ?`, docID); err != nil {
 		return err
 	}
@@ -282,10 +412,15 @@ func (s *SQLiteStore) Delete(ctx context.Context, docID string) error {
 
 // List 列出所有文档
 func (s *SQLiteStore) List(ctx context.Context) ([]*Document, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, title, source, chunk_count, created_at, updated_at, status, error_message, source_type
-		 FROM kb_documents ORDER BY created_at DESC`,
-	)
+	query := `SELECT id, title, source, chunk_count, created_at, updated_at, status, error_message, source_type
+		 FROM kb_documents d WHERE d.deleted=0`
+	args := []any{}
+	if clause, scopeArgs := s.semanticScopeClause("d"); clause != "" {
+		query += " AND " + clause
+		args = append(args, scopeArgs...)
+	}
+	query += ` ORDER BY created_at DESC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -306,7 +441,15 @@ func (s *SQLiteStore) List(ctx context.Context) ([]*Document, error) {
 // document metadata on every chat turn.
 func (s *SQLiteStore) HasSearchableDocuments(ctx context.Context) (bool, error) {
 	var exists bool
-	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM kb_chunks LIMIT 1)`).Scan(&exists)
+	query := `SELECT EXISTS(SELECT 1 FROM kb_chunks c
+		JOIN kb_documents d ON d.id=c.doc_id WHERE d.deleted=0`
+	args := []any{}
+	if clause, scopeArgs := s.semanticScopeClause("d"); clause != "" {
+		query += " AND " + clause
+		args = append(args, scopeArgs...)
+	}
+	query += ` LIMIT 1)`
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&exists)
 	return exists, err
 }
 
@@ -317,11 +460,23 @@ func (s *SQLiteStore) GetBySourceTitle(ctx context.Context, source, title string
 	if title == "" {
 		return nil, nil
 	}
-	row := s.db.QueryRowContext(ctx,
-		`SELECT id, title, source, chunk_count, created_at, updated_at, status, error_message, source_type
-		 FROM kb_documents WHERE source = ? AND title = ? LIMIT 1`,
-		source, title,
-	)
+	deletedClause := " AND deleted=0"
+	if s.semanticMutations != nil {
+		// Semantic deletes are tombstones because immutable revision history
+		// still references the document row. Return that row to the Manager's
+		// upsert path so re-upload revives it as a new content generation instead
+		// of colliding with the production UNIQUE(source,title) index.
+		deletedClause = ""
+	}
+	query := `SELECT id, title, source, chunk_count, created_at, updated_at, status, error_message, source_type
+		 FROM kb_documents d WHERE source = ? AND title = ?` + deletedClause
+	args := []any{source, title}
+	if clause, scopeArgs := s.semanticScopeClause("d"); clause != "" {
+		query += " AND " + clause
+		args = append(args, scopeArgs...)
+	}
+	query += ` LIMIT 1`
+	row := s.db.QueryRowContext(ctx, query, args...)
 	doc := &Document{}
 	if err := row.Scan(&doc.ID, &doc.Title, &doc.Source, &doc.ChunkCount, &doc.CreatedAt, &doc.UpdatedAt, &doc.Status, &doc.ErrorMessage, &doc.SourceType); err != nil {
 		if err == sql.ErrNoRows {
@@ -334,15 +489,21 @@ func (s *SQLiteStore) GetBySourceTitle(ctx context.Context, source, title string
 
 // Get 获取单个文档详情
 func (s *SQLiteStore) Get(ctx context.Context, docID string) (*Document, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT id, title, content, source, chunk_count, created_at, updated_at, status, error_message, source_type
-		 FROM kb_documents WHERE id = ?`,
-		docID,
-	)
+	query := `SELECT id, title, content, source, chunk_count, created_at, updated_at, status, error_message, source_type
+		 FROM kb_documents d WHERE id = ? AND deleted=0`
+	args := []any{docID}
+	if clause, scopeArgs := s.semanticScopeClause("d"); clause != "" {
+		query += " AND " + clause
+		args = append(args, scopeArgs...)
+	}
+	row := s.db.QueryRowContext(ctx, query, args...)
 
 	doc := &Document{}
 	if err := row.Scan(&doc.ID, &doc.Title, &doc.Content, &doc.Source, &doc.ChunkCount, &doc.CreatedAt, &doc.UpdatedAt, &doc.Status, &doc.ErrorMessage, &doc.SourceType); err != nil {
 		if err == sql.ErrNoRows {
+			if s.semanticMutations != nil {
+				return nil, fmt.Errorf("%w: 文档不存在", ErrSemanticIndexNotFound)
+			}
 			return nil, fmt.Errorf("文档不存在")
 		}
 		return nil, err
@@ -373,21 +534,26 @@ func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK
 	//   - 日期：取 d.created_at 在 Go 层按真实 time.Time 比较（见 Filter.matchesDate）。
 	// 无任何过滤时走原快路径（不 JOIN，零回归）。
 	clause, fargs := buildFilterClause(filter, "d")
+	scopeClause, scopeArgs := s.semanticScopeClause("d")
 	needDate := filter.hasDateBound()
 	var query string
 	var args []any
 	switch {
-	case clause == "" && !needDate:
+	case clause == "" && scopeClause == "" && !needDate:
 		query = `SELECT c.id, c.doc_id, c.chunk_index, c.embedding FROM kb_chunks c WHERE c.embedding IS NOT NULL`
 	default:
 		sel := "c.id, c.doc_id, c.chunk_index, c.embedding"
 		if needDate {
 			sel += ", d.created_at"
 		}
-		query = "SELECT " + sel + " FROM kb_chunks c JOIN kb_documents d ON d.id = c.doc_id WHERE c.embedding IS NOT NULL"
+		query = "SELECT " + sel + " FROM kb_chunks c JOIN kb_documents d ON d.id = c.doc_id WHERE c.embedding IS NOT NULL AND d.deleted=0"
 		if clause != "" {
 			query += " AND " + clause
-			args = fargs
+			args = append(args, fargs...)
+		}
+		if scopeClause != "" {
+			query += " AND " + scopeClause
+			args = append(args, scopeArgs...)
 		}
 	}
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -499,24 +665,28 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int, fi
 	// 日期取 d.created_at 在 Go 层按真实时刻比较。带日期过滤时不能用 SQL LIMIT（否则日期
 	// 匹配项可能因 bm25 排序落在 LIMIT 之外被漏召回），改为按 score 顺序扫描、Go 过滤后取 topK。
 	clause, fargs := buildFilterClause(filter, "d")
+	scopeClause, scopeArgs := s.semanticScopeClause("d")
 	needDate := filter.hasDateBound()
-	needJoin := clause != "" || needDate
 
 	sel := "f.chunk_id, f.content, bm25(kb_chunks_fts) as score"
 	if needDate {
 		sel += ", d.created_at"
 	}
-	from := "kb_chunks_fts f"
-	if needJoin {
-		from = `kb_chunks_fts f
-			 JOIN kb_chunks c ON c.id = f.chunk_id
-			 JOIN kb_documents d ON d.id = c.doc_id`
-	}
-	where := "kb_chunks_fts MATCH ?"
+	// Always join the document tombstone boundary. Semantic deletes retain
+	// immutable chunks for revision history; neither FTS nor LIKE fallback may
+	// surface those chunks after d.deleted becomes true.
+	from := `kb_chunks_fts f
+		 JOIN kb_chunks c ON c.id = f.chunk_id
+		 JOIN kb_documents d ON d.id = c.doc_id`
+	where := "d.deleted=0 AND kb_chunks_fts MATCH ?"
 	args := []any{ftsQuery}
 	if clause != "" {
 		where += " AND " + clause
 		args = append(args, fargs...)
+	}
+	if scopeClause != "" {
+		where += " AND " + scopeClause
+		args = append(args, scopeArgs...)
 	}
 	sqlQuery := "SELECT " + sel + " FROM " + from + " WHERE " + where + " ORDER BY score"
 	if !needDate {
@@ -626,22 +796,20 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 	var args []any
 
 	clause, fargs := buildFilterClause(filter, "d")
+	scopeClause, scopeArgs := s.semanticScopeClause("d")
 	needDate := filter.hasDateBound()
-	needJoin := clause != "" || needDate
 
 	// Fix 15: 不查询 embedding 列，文本降级搜索无需加载向量 BLOB。
 	// 统一以别名 c 引用 kb_chunks，便于在有过滤时 JOIN kb_documents。
 	// chunk.CreatedAt 取 c.created_at（片段时间，供时间衰减/展示）；日期过滤用 d.created_at
 	// （文档时间，与主路径语义一致），故 needDate 时额外多取一列。
-	if needJoin {
-		query.WriteString("SELECT c.id, c.doc_id, c.content, c.chunk_index, c.created_at")
-		if needDate {
-			query.WriteString(", d.created_at")
-		}
-		query.WriteString(" FROM kb_chunks c JOIN kb_documents d ON d.id = c.doc_id WHERE (")
-	} else {
-		query.WriteString("SELECT c.id, c.doc_id, c.content, c.chunk_index, c.created_at FROM kb_chunks c WHERE (")
+	query.WriteString(`SELECT c.id, c.doc_id, c.content, c.chunk_index, c.created_at,
+		COALESCE(c.page_start,0),COALESCE(c.page_end,0),c.source_digest,
+		COALESCE(c.source_offset_start,0),COALESCE(c.source_offset_end,0)`)
+	if needDate {
+		query.WriteString(", d.created_at")
 	}
+	query.WriteString(" FROM kb_chunks c JOIN kb_documents d ON d.id = c.doc_id WHERE d.deleted=0 AND (")
 	for i, kw := range keywords {
 		if i > 0 {
 			query.WriteString(" OR ")
@@ -654,6 +822,11 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 		query.WriteString(" AND ")
 		query.WriteString(clause)
 		args = append(args, fargs...)
+	}
+	if scopeClause != "" {
+		query.WriteString(" AND ")
+		query.WriteString(scopeClause)
+		args = append(args, scopeArgs...)
 	}
 	// 带日期过滤时不能用 SQL LIMIT（日期在 Go 层裁，匹配项可能排在 LIMIT 之外）。
 	if !needDate {
@@ -673,14 +846,18 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 		var docCreatedAt time.Time
 		// Fix 15: Scan 与 SELECT 对齐（已移除 embedding 列）
 		if needDate {
-			if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &chunk.CreatedAt, &docCreatedAt); err != nil {
+			if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &chunk.CreatedAt,
+				&chunk.PageStart, &chunk.PageEnd, &chunk.SourceDigest,
+				&chunk.SourceOffsetStart, &chunk.SourceOffsetEnd, &docCreatedAt); err != nil {
 				logger.Error("[knowledge] fallbackTextSearch scan 失败", "error", err)
 				continue
 			}
 			if !filter.matchesDate(docCreatedAt) {
 				continue
 			}
-		} else if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &chunk.CreatedAt); err != nil {
+		} else if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.Content, &chunk.Index, &chunk.CreatedAt,
+			&chunk.PageStart, &chunk.PageEnd, &chunk.SourceDigest,
+			&chunk.SourceOffsetStart, &chunk.SourceOffsetEnd); err != nil {
 			logger.Error("[knowledge] fallbackTextSearch scan 失败", "error", err)
 			continue
 		}
@@ -720,12 +897,19 @@ func (s *SQLiteStore) getChunksByIDs(ctx context.Context, ids []string) (map[str
 	}
 
 	var query strings.Builder
-	query.WriteString(`SELECT c.id, c.doc_id, d.title, d.source, d.source_type, d.chunk_count, c.content, c.chunk_index, c.embedding, c.created_at
+	query.WriteString(`SELECT c.id, c.doc_id, d.title, d.source, d.source_type, d.chunk_count, c.content, c.chunk_index, c.embedding, c.created_at,
+		COALESCE(c.page_start,0),COALESCE(c.page_end,0),c.source_digest,
+		COALESCE(c.source_offset_start,0),COALESCE(c.source_offset_end,0)
 		 FROM kb_chunks c
 		 JOIN kb_documents d ON d.id = c.doc_id
 		 WHERE c.id IN (`)
 	query.WriteString(strings.Join(placeholders, ","))
 	query.WriteString(")")
+	if clause, scopeArgs := s.semanticScopeClause("d"); clause != "" {
+		query.WriteString(" AND ")
+		query.WriteString(clause)
+		args = append(args, scopeArgs...)
+	}
 
 	rows, err := s.db.QueryContext(ctx, query.String(), args...)
 	if err != nil {
@@ -736,7 +920,10 @@ func (s *SQLiteStore) getChunksByIDs(ctx context.Context, ids []string) (map[str
 	for rows.Next() {
 		chunk := &Chunk{}
 		var embBlob []byte
-		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.DocTitle, &chunk.Source, &chunk.SourceType, &chunk.ChunkCount, &chunk.Content, &chunk.Index, &embBlob, &chunk.CreatedAt); err != nil {
+		if err := rows.Scan(&chunk.ID, &chunk.DocID, &chunk.DocTitle, &chunk.Source,
+			&chunk.SourceType, &chunk.ChunkCount, &chunk.Content, &chunk.Index, &embBlob,
+			&chunk.CreatedAt, &chunk.PageStart, &chunk.PageEnd, &chunk.SourceDigest,
+			&chunk.SourceOffsetStart, &chunk.SourceOffsetEnd); err != nil {
 			logger.Error("[knowledge] scan chunk", "id", chunk.ID, "error", err)
 			continue
 		}

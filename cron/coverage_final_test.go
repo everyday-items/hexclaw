@@ -15,14 +15,14 @@ import (
 // "executor returned nil" recovery branch.
 type nilResultEngine struct{}
 
-func (nilResultEngine) Name() string                                       { return "nilres" }
-func (nilResultEngine) Available() bool                                    { return true }
-func (nilResultEngine) Validate(string) error                             { return nil }
+func (nilResultEngine) Name() string          { return "nilres" }
+func (nilResultEngine) Available() bool       { return true }
+func (nilResultEngine) Validate(string) error { return nil }
 func (nilResultEngine) Execute(context.Context, *JobSpec) (*RunResult, error) {
 	return nil, errors.New("venv prep failed")
 }
 
-func TestDetectAndCleanupLegacyJobs_Deletes(t *testing.T) {
+func TestDetectAndCleanupLegacyJobs_Quarantines(t *testing.T) {
 	s, done := freshScheduler(t)
 	defer done()
 	ctx := context.Background()
@@ -30,7 +30,7 @@ func TestDetectAndCleanupLegacyJobs_Deletes(t *testing.T) {
 	for _, id := range []string{"leg1", "leg2"} {
 		_, err := s.db.ExecContext(ctx,
 			`INSERT INTO cron_jobs (id,name,type,schedule,spec_json,user_id,status,next_run_at) VALUES (?,?,?,?,?,?,?,?)`,
-			id, "old", "cron", "@daily", "", "u", "active", time.Now())
+			id, "old-"+id, "cron", "@daily", "", "u", "active", time.Now())
 		if err != nil {
 			t.Fatalf("seed: %v", err)
 		}
@@ -39,9 +39,9 @@ func TestDetectAndCleanupLegacyJobs_Deletes(t *testing.T) {
 		t.Fatalf("detect: %v", err)
 	}
 	var n int
-	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cron_jobs WHERE spec_json=''`).Scan(&n)
-	if n != 0 {
-		t.Errorf("spec-less legacy jobs must be deleted, %d remain", n)
+	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cron_jobs WHERE spec_json='' AND status='paused'`).Scan(&n)
+	if n != 2 {
+		t.Errorf("spec-less legacy jobs must be retained and paused, got %d", n)
 	}
 }
 

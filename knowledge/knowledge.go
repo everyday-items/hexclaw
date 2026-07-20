@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,7 @@ import (
 	hrag "github.com/hexagon-codes/hexagon/rag"
 	ragquery "github.com/hexagon-codes/hexagon/rag/query"
 	"github.com/hexagon-codes/hexagon/rag/reranker"
+	"github.com/hexagon-codes/hexclaw/resourcegov"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
@@ -41,45 +43,63 @@ import (
 
 // Document 文档
 type Document struct {
-	ID           string    `json:"id"`
-	Title        string    `json:"title"`
-	Content      string    `json:"content,omitempty"`
-	Source       string    `json:"source"`
-	ChunkCount   int       `json:"chunk_count"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at,omitempty"`
-	Status       string    `json:"status,omitempty"`        // processing / indexed / failed
-	ErrorMessage string    `json:"error_message,omitempty"` // 失败原因
-	SourceType   string    `json:"source_type,omitempty"`   // manual / upload / url / file / agent
+	ID                   string            `json:"id"`
+	Title                string            `json:"title"`
+	Content              string            `json:"content,omitempty"`
+	Source               string            `json:"source"`
+	ChunkCount           int               `json:"chunk_count"`
+	CreatedAt            time.Time         `json:"created_at"`
+	UpdatedAt            time.Time         `json:"updated_at,omitempty"`
+	Status               string            `json:"status,omitempty"`        // processing / indexed / failed
+	ErrorMessage         string            `json:"error_message,omitempty"` // 失败原因
+	SourceType           string            `json:"source_type,omitempty"`   // manual / upload / url / file / agent
+	VectorIndexState     VectorIndexState  `json:"vector_index_state,omitempty"`
+	VectorJobID          string            `json:"vector_job_id,omitempty"`
+	VectorJobState       KnowledgeJobState `json:"vector_job_state,omitempty"`
+	VectorJobStage       JobStage          `json:"vector_job_stage,omitempty"`
+	VectorChunksDone     *int64            `json:"vector_chunks_done,omitempty"`
+	VectorChunksTotal    *int64            `json:"vector_chunks_total,omitempty"`
+	VectorError          string            `json:"vector_error,omitempty"`
+	VectorOutcomeUnknown bool              `json:"vector_outcome_unknown,omitempty"`
 }
 
 // Chunk 文档片段
 type Chunk struct {
-	ID         string    `json:"id"`
-	DocID      string    `json:"doc_id"`
-	DocTitle   string    `json:"doc_title"`
-	Source     string    `json:"source"`
-	SourceType string    `json:"source_type,omitempty"` // 继承自所属文档（manual/upload/url/file/agent），供元数据过滤与展示
-	ChunkCount int       `json:"chunk_count"`
-	Content    string    `json:"content"`
-	Index      int       `json:"index"`
-	Embedding  []float32 `json:"-"`
-	Score      float64   `json:"score"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID                string    `json:"id"`
+	DocID             string    `json:"doc_id"`
+	DocTitle          string    `json:"doc_title"`
+	Source            string    `json:"source"`
+	SourceType        string    `json:"source_type,omitempty"` // 继承自所属文档（manual/upload/url/file/agent），供元数据过滤与展示
+	ChunkCount        int       `json:"chunk_count"`
+	Content           string    `json:"content"`
+	Index             int       `json:"index"`
+	Embedding         []float32 `json:"-"`
+	Score             float64   `json:"score"`
+	CreatedAt         time.Time `json:"created_at"`
+	PageStart         int       `json:"page_start,omitempty"`
+	PageEnd           int       `json:"page_end,omitempty"`
+	SourceDigest      string    `json:"source_digest,omitempty"`
+	SourceOffsetStart int64     `json:"source_offset_start,omitempty"`
+	SourceOffsetEnd   int64     `json:"source_offset_end,omitempty"`
 }
 
 // SearchHit 结构化知识库搜索结果（对外暴露）
 type SearchHit struct {
-	DocID      string         `json:"doc_id"`
-	DocTitle   string         `json:"doc_title"`
-	Source     string         `json:"source,omitempty"`
-	ChunkID    string         `json:"chunk_id"`
-	ChunkIndex int            `json:"chunk_index"`
-	ChunkCount int            `json:"chunk_count"`
-	Content    string         `json:"content"`
-	Score      float64        `json:"score"`
-	CreatedAt  time.Time      `json:"created_at,omitempty"`
-	Metadata   map[string]any `json:"metadata,omitempty"`
+	DocID             string         `json:"doc_id"`
+	DocTitle          string         `json:"doc_title"`
+	Source            string         `json:"source,omitempty"`
+	ChunkID           string         `json:"chunk_id"`
+	ChunkIndex        int            `json:"chunk_index"`
+	ChunkCount        int            `json:"chunk_count"`
+	Content           string         `json:"content"`
+	Score             float64        `json:"score"`
+	CreatedAt         time.Time      `json:"created_at,omitempty"`
+	Metadata          map[string]any `json:"metadata,omitempty"`
+	PageStart         int            `json:"page_start,omitempty"`
+	PageEnd           int            `json:"page_end,omitempty"`
+	SourceDigest      string         `json:"source_digest,omitempty"`
+	SourceOffsetStart int64          `json:"source_offset_start,omitempty"`
+	SourceOffsetEnd   int64          `json:"source_offset_end,omitempty"`
 }
 
 // SearchResult 单条搜索结果（内部使用）
@@ -279,13 +299,18 @@ type ChunkSearcher interface {
 // 协调写路径（DocumentRepository）和读路径（ChunkSearcher），
 // 加上 hexagon 的 Splitter / Embedder，完成完整的 RAG 管线。
 type Manager struct {
-	repo      DocumentRepository     // 写路径: 文档 + Chunk CRUD
-	searcher  ChunkSearcher          // 读路径: 向量搜索 + 关键词搜索
-	embedder  hexagon.VectorEmbedder // hexagon/ai-core 向量嵌入（可为 nil）
-	splitter  hexagon.Splitter       // hexagon 文本分块器
-	llm       RerankLLM              // 查询扩展 / contextual-ingest / LLM 兜底重排用的 LLM（可为 nil → 自动降级）
-	reranker  reranker.Reranker      // 专用文档重排器（如 cross-encoder via /rerank）；nil 时退回 LLM 重排
-	captioner Captioner              // 图像转写器（VLM caption）；nil 时 AddImageDocument 优雅报错（见 multimodal.go）
+	repo     DocumentRepository     // 写路径: 文档 + Chunk CRUD
+	searcher ChunkSearcher          // 读路径: 向量搜索 + 关键词搜索
+	embedder hexagon.VectorEmbedder // hexagon/ai-core 向量嵌入（可为 nil）
+	// revisionSearcher 是 v0.5.0 revision-scoped 语义查询路径。配置后它是
+	// 向量检索的唯一入口，旧 embedder + kb_chunks.embedding 只保留回滚兼容，
+	// 不能与 active revision 向量混用。
+	revisionSearcher RevisionSemanticSearcher
+	splitter         hexagon.Splitter  // hexagon 文本分块器
+	llm              RerankLLM         // 查询扩展 / contextual-ingest / LLM 兜底重排用的 LLM（可为 nil → 自动降级）
+	reranker         reranker.Reranker // 专用文档重排器（如 cross-encoder via /rerank）；nil 时退回 LLM 重排
+	captioner        Captioner         // 图像转写器（VLM caption）；nil 时 AddImageDocument 优雅报错（见 multimodal.go）
+	resourceGovernor *resourcegov.Governor
 
 	// config 混合检索配置。atomic.Pointer 使其可在运行时被 SetHybridConfig 原子热替换
 	// （检索参数面板 PUT /knowledge/config），而读路径（searchResults 等）在并发检索时
@@ -350,6 +375,19 @@ func WithSplitter(s hexagon.Splitter) ManagerOption {
 	return func(m *Manager) { m.splitter = s }
 }
 
+// WithRevisionSemanticSearcher installs the active-revision semantic route.
+// Once installed, Manager never falls back to the legacy bare-vector route;
+// lack of an active revision degrades to FTS only.
+func WithRevisionSemanticSearcher(searcher RevisionSemanticSearcher) ManagerOption {
+	return func(m *Manager) { m.revisionSearcher = searcher }
+}
+
+// WithResourceGovernor installs the process-scoped resource budget used by
+// Manager-owned legacy embedding and VLM caption boundaries.
+func WithResourceGovernor(governor *resourcegov.Governor) ManagerOption {
+	return func(m *Manager) { m.resourceGovernor = governor }
+}
+
 // WithLLM 注入重排 / 查询扩展 / contextual-ingest 所用的 LLM（通常复用 Agent 的 LLM router）。
 // 不注入时，rerank / query-expand / contextual 自动降级关闭（省成本，安全）。
 func WithLLM(llm RerankLLM) ManagerOption {
@@ -392,6 +430,17 @@ func NewManager(repo DocumentRepository, searcher ChunkSearcher, embedder hexago
 		opt(m)
 	}
 	return m
+}
+
+func (m *Manager) acquireResource(
+	ctx context.Context,
+	resource resourcegov.Resource,
+	priority resourcegov.Priority,
+) (*resourcegov.Permit, error) {
+	if m == nil || m.resourceGovernor == nil {
+		return nil, nil
+	}
+	return m.resourceGovernor.Acquire(ctx, resource, priority)
 }
 
 // ─── Command Methods (写路径) ───────────────────────────
@@ -795,16 +844,21 @@ func hitsFromResults(selected []*SearchResult) []SearchHit {
 	hits := make([]SearchHit, 0, len(selected))
 	for _, r := range selected {
 		hits = append(hits, SearchHit{
-			DocID:      r.Chunk.DocID,
-			DocTitle:   r.Chunk.DocTitle,
-			Source:     r.Chunk.Source,
-			ChunkID:    r.Chunk.ID,
-			ChunkIndex: r.Chunk.Index,
-			ChunkCount: r.Chunk.ChunkCount,
-			Content:    r.Chunk.Content,
-			Score:      r.Chunk.Score,
-			CreatedAt:  r.Chunk.CreatedAt,
-			Metadata:   chunkMetadata(r.Chunk),
+			DocID:             r.Chunk.DocID,
+			DocTitle:          r.Chunk.DocTitle,
+			Source:            r.Chunk.Source,
+			ChunkID:           r.Chunk.ID,
+			ChunkIndex:        r.Chunk.Index,
+			ChunkCount:        r.Chunk.ChunkCount,
+			Content:           r.Chunk.Content,
+			Score:             r.Chunk.Score,
+			CreatedAt:         r.Chunk.CreatedAt,
+			Metadata:          chunkMetadata(r.Chunk),
+			PageStart:         r.Chunk.PageStart,
+			PageEnd:           r.Chunk.PageEnd,
+			SourceDigest:      r.Chunk.SourceDigest,
+			SourceOffsetStart: r.Chunk.SourceOffsetStart,
+			SourceOffsetEnd:   r.Chunk.SourceOffsetEnd,
 		})
 	}
 	return hits
@@ -813,12 +867,23 @@ func hitsFromResults(selected []*SearchResult) []SearchHit {
 // chunkMetadata 暴露 chunk 的可过滤/可展示元数据（source_type、创建时间），
 // 让上层（API/UI/agent）能按维度筛选与回显。无可用字段时返回 nil（保持 JSON 干净）。
 func chunkMetadata(c *Chunk) map[string]any {
-	md := make(map[string]any, 2)
+	md := make(map[string]any, 7)
 	if c.SourceType != "" {
 		md["source_type"] = c.SourceType
 	}
 	if !c.CreatedAt.IsZero() {
 		md["created_at"] = c.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	if c.PageStart > 0 {
+		md["page_start"] = c.PageStart
+		md["page_end"] = c.PageEnd
+	}
+	if c.SourceDigest != "" {
+		md["source_digest"] = c.SourceDigest
+	}
+	if c.SourceOffsetEnd > c.SourceOffsetStart {
+		md["source_offset_start"] = c.SourceOffsetStart
+		md["source_offset_end"] = c.SourceOffsetEnd
 	}
 	if len(md) == 0 {
 		return nil
@@ -905,7 +970,17 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 
 	// 1. 查询扩展（#8 HyDE + multi-query）。向量能力待机时直接走原始 query
 	// 的 FTS 路径：自动注入没有语义证据本就 fail-closed，调用辅助 LLM 只会平添延迟。
-	embeddingReady := m.embedder != nil && EmbeddingReady(ctx, m.embedder)
+	revisionEmbeddingReady := m.revisionSearcher != nil
+	if readiness, ok := m.revisionSearcher.(RevisionSemanticReadiness); ok {
+		ready, readyErr := readiness.HasActiveRevision(ctx)
+		if readyErr != nil {
+			logger.Warn("[knowledge] active revision readiness 探测失败，跳过查询扩展", "error", readyErr)
+			ready = false
+		}
+		revisionEmbeddingReady = ready
+	}
+	legacyEmbeddingReady := m.revisionSearcher == nil && m.embedder != nil && EmbeddingReady(ctx, m.embedder)
+	embeddingReady := revisionEmbeddingReady || legacyEmbeddingReady
 	queries := []string{query}
 	if embeddingReady {
 		queries = m.expandQueries(ctx, query)
@@ -919,11 +994,33 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 	vectorRouteRan := false
 
 	for _, q := range queries {
-		if embeddingReady {
+		if m.revisionSearcher != nil {
+			// Query embedding and vector scan are one revision-bound operation:
+			// both use the immutable active profile snapshot. No fallback to the
+			// legacy embedder is allowed when no active revision exists.
+			rctx, rcancel := context.WithTimeout(ragEmbedContext(ctx), queryEmbedTimeout)
+			vres, ran, vErr := m.revisionSearcher.Search(rctx, q, candidateK, filter)
+			rcancel()
+			if vErr != nil {
+				if !errors.Is(vErr, ErrEmbeddingUnavailable) {
+					logger.Error("[knowledge] active revision 向量搜索失败", "error", vErr)
+				}
+			} else if ran {
+				rankedLists = append(rankedLists, mergeRanked(resultMap, vres, true))
+				vectorRouteRan = true
+			}
+		} else if legacyEmbeddingReady {
 			// 查询向量化预算（BUG-20260703 同构防护，对齐 engine 记忆召回）：检索是增强，
 			// 不继承整请求 ctx 的漫长余量——慢 embedding 端点超预算即掐断，本轮走纯 BM25。
 			ectx, ecancel := context.WithTimeout(ragEmbedContext(ctx), queryEmbedTimeout)
-			qv, err := m.embedder.Embed(ectx, []string{cfg.EmbedQueryPrefix + q})
+			permit, err := m.acquireResource(ectx, resourcegov.ResourceAccelerator, resourcegov.PriorityInteractive)
+			var qv [][]float32
+			if err == nil {
+				qv, err = m.embedder.Embed(ectx, []string{cfg.EmbedQueryPrefix + q})
+			}
+			if permit != nil {
+				permit.Release()
+			}
 			ecancel()
 			if err != nil {
 				if !errors.Is(err, ErrEmbeddingUnavailable) {
@@ -939,7 +1036,13 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 				}
 			}
 		}
-		tres, tErr := m.searcher.TextSearch(ctx, q, candidateK, filter)
+		var tres []*SearchResult
+		var tErr error
+		if m.revisionSearcher != nil {
+			tres, tErr = m.revisionSearcher.TextSearch(ctx, q, candidateK, filter)
+		} else {
+			tres, tErr = m.searcher.TextSearch(ctx, q, candidateK, filter)
+		}
 		if tErr != nil {
 			logger.Error("[knowledge] 关键词搜索失败", "error", tErr)
 		} else {
@@ -962,9 +1065,19 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 	if strictFloor && !vectorRouteRan {
 		return nil, nil
 	}
-	candidates = m.applyMinScore(candidates, strictFloor)
+	candidates = m.applyMinScore(candidates, strictFloor, vectorRouteRan)
 
 	// 5. 宽召回 → 重排 → 收窄（#6）；无 LLM/关闭时回退 MMR 多样性选取
+	// A configured revision runtime with no active revision is deliberately
+	// text-only/standby. Keep this entire retrieval deterministic: scoped FTS
+	// remains usable, but neither auxiliary LLM nor a dedicated reranker may run.
+	if m.revisionSearcher != nil && !revisionEmbeddingReady {
+		sortByScore(candidates)
+		if topK > 0 && len(candidates) > topK {
+			candidates = candidates[:topK]
+		}
+		return candidates, nil
+	}
 	return m.rerankTopK(ctx, query, candidates, topK), nil
 }
 
@@ -1065,10 +1178,10 @@ func (m *Manager) fuse(resultMap map[string]*SearchResult, rankedLists []rankedL
 // 结果集内 min-max 归一分（最佳垃圾恒 1.0），不构成跨查询可比的相关性证据；清空即
 // 返回空，无放宽回退（BUG-20260703 B8：宁缺勿滥，无强命中让模型如实答"未找到"）。
 //
-// 两种模式下，MinScore=0 或无 embedder（纯关键词检索）时均不施加地板。
-func (m *Manager) applyMinScore(candidates []*SearchResult, strict bool) []*SearchResult {
+// 两种模式下，MinScore=0 或本轮向量路未真实运行时均不施加地板。
+func (m *Manager) applyMinScore(candidates []*SearchResult, strict, vectorRouteRan bool) []*SearchResult {
 	minScore := m.cfg().MinScore
-	if minScore <= 0 || m.embedder == nil {
+	if minScore <= 0 || !vectorRouteRan {
 		return candidates
 	}
 	kept := make([]*SearchResult, 0, len(candidates))
@@ -1215,6 +1328,174 @@ func (m *Manager) expandQueries(ctx context.Context, query string) []string {
 // ─── Internal ───────────────────────────────────────────
 
 func (m *Manager) buildChunks(ctx context.Context, doc *Document, ts time.Time) ([]*Chunk, error) {
+	return m.buildChunksWithEmbedder(ctx, doc, ts, m.embedder)
+}
+
+// PrepareIngestDocument performs the canonical splitter/contextualization
+// path without writing legacy vectors. The asynchronous ingest worker first
+// publishes text/FTS atomically; revision-scoped embedding is queued as a
+// separate durable child job by CompleteIngestDocument.
+func (m *Manager) PrepareIngestDocument(ctx context.Context, doc *Document) ([]*Chunk, error) {
+	if doc == nil {
+		return nil, fmt.Errorf("文档不能为空")
+	}
+	// Original filenames and local paths are UI/source metadata, not semantic
+	// content. Build contextual chunks from a title-free copy so a cloud
+	// embedding request can never receive them; restore DocTitle only as local
+	// result metadata after chunk content has been frozen.
+	semanticDocument := *doc
+	semanticDocument.Title = ""
+	chunks, err := m.buildChunksWithEmbedder(ctx, &semanticDocument, time.Now().UTC(), nil)
+	if err != nil {
+		return nil, err
+	}
+	doc.ChunkCount = semanticDocument.ChunkCount
+	for _, chunk := range chunks {
+		chunk.DocTitle = doc.Title
+	}
+	return chunks, nil
+}
+
+// SourcePage is one canonical extracted page and its coordinates in the
+// assembled document text. A splitter receives these values as metadata, so
+// page identity survives chunking without relying on HTML marker parsing.
+type SourcePage struct {
+	PageStart         int
+	PageEnd           int
+	Text              string
+	SourceDigest      string
+	SourceOffsetStart int64
+	SourceOffsetEnd   int64
+}
+
+// PrepareIngestPages performs the canonical no-vector splitter path while
+// preserving structured source coordinates on every produced chunk.
+func (m *Manager) PrepareIngestPages(
+	ctx context.Context,
+	doc *Document,
+	pages []SourcePage,
+) ([]*Chunk, error) {
+	if doc == nil || len(pages) == 0 {
+		return nil, fmt.Errorf("文档页面不能为空")
+	}
+	if m.splitter == nil {
+		return nil, fmt.Errorf("未配置文本分块器 (splitter)")
+	}
+	inputs := make([]hexagon.Document, 0, len(pages))
+	pageByParentID := make(map[string]SourcePage, len(pages))
+	for _, page := range pages {
+		if page.PageStart <= 0 || page.PageEnd < page.PageStart ||
+			strings.TrimSpace(page.Text) == "" || page.SourceOffsetStart < 0 ||
+			page.SourceOffsetEnd <= page.SourceOffsetStart {
+			return nil, fmt.Errorf("无效的文档页面来源跨度")
+		}
+		parentID := fmt.Sprintf("%s-page-%d", doc.ID, page.PageStart)
+		pageByParentID[parentID] = page
+		inputs = append(inputs, hexagon.Document{
+			ID:      parentID,
+			Content: page.Text,
+			Source:  doc.Source,
+			Metadata: map[string]any{
+				"page_start":          page.PageStart,
+				"page_end":            page.PageEnd,
+				"source_digest":       page.SourceDigest,
+				"source_offset_start": page.SourceOffsetStart,
+				"source_offset_end":   page.SourceOffsetEnd,
+			},
+		})
+	}
+	ragDocs, err := m.splitter.Split(ctx, inputs)
+	if err != nil {
+		return nil, fmt.Errorf("文本分块失败: %w", err)
+	}
+	if len(ragDocs) == 0 {
+		return nil, fmt.Errorf("文档分块后无有效片段，请检查文档内容")
+	}
+	// Splitter metadata first carries the honest page envelope. When the
+	// splitter output is an exact substring (the normal Markdown/recursive
+	// paths), narrow that envelope to byte-exact chunk coordinates before
+	// contextual prefixes are added. If a custom splitter rewrites text, keep
+	// the broader page range rather than fabricating precision.
+	for i := range ragDocs {
+		parentID, _ := ragDocs[i].Metadata["parent_id"].(string)
+		page, ok := pageByParentID[parentID]
+		if !ok {
+			continue
+		}
+		content := strings.TrimSpace(ragDocs[i].Content)
+		if offset := strings.Index(page.Text, content); offset >= 0 && content != "" {
+			ragDocs[i].Metadata["source_offset_start"] = page.SourceOffsetStart + int64(offset)
+			ragDocs[i].Metadata["source_offset_end"] = page.SourceOffsetStart + int64(offset+len(content))
+		}
+	}
+	semanticDocument := *doc
+	semanticDocument.Title = ""
+	semanticDocument.ChunkCount = len(ragDocs)
+	m.contextualize(ctx, &semanticDocument, ragDocs)
+
+	doc.ChunkCount = len(ragDocs)
+	createdAt := time.Now().UTC()
+	chunks := make([]*Chunk, 0, len(ragDocs))
+	for i, ragDoc := range ragDocs {
+		pageStart, okStart := metadataInt(ragDoc.Metadata, "page_start")
+		pageEnd, okEnd := metadataInt(ragDoc.Metadata, "page_end")
+		offsetStart, okOffsetStart := metadataInt64(ragDoc.Metadata, "source_offset_start")
+		offsetEnd, okOffsetEnd := metadataInt64(ragDoc.Metadata, "source_offset_end")
+		sourceDigest, okDigest := ragDoc.Metadata["source_digest"].(string)
+		if !okStart || !okEnd || !okOffsetStart || !okOffsetEnd || !okDigest {
+			return nil, fmt.Errorf("文本分块器丢失结构化来源跨度")
+		}
+		chunks = append(chunks, &Chunk{
+			ID: doc.ID + "-chunk-" + strconv.Itoa(i), DocID: doc.ID,
+			DocTitle: doc.Title, Source: doc.Source, SourceType: doc.SourceType,
+			ChunkCount: len(ragDocs), Content: ragDoc.Content, Index: i, CreatedAt: createdAt,
+			PageStart: pageStart, PageEnd: pageEnd, SourceDigest: sourceDigest,
+			SourceOffsetStart: offsetStart, SourceOffsetEnd: offsetEnd,
+		})
+	}
+	return chunks, nil
+}
+
+func metadataInt(metadata map[string]any, key string) (int, bool) {
+	value, ok := metadata[key]
+	if !ok {
+		return 0, false
+	}
+	switch number := value.(type) {
+	case int:
+		return number, true
+	case int64:
+		return int(number), true
+	case float64:
+		return int(number), true
+	default:
+		return 0, false
+	}
+}
+
+func metadataInt64(metadata map[string]any, key string) (int64, bool) {
+	value, ok := metadata[key]
+	if !ok {
+		return 0, false
+	}
+	switch number := value.(type) {
+	case int:
+		return int64(number), true
+	case int64:
+		return number, true
+	case float64:
+		return int64(number), true
+	default:
+		return 0, false
+	}
+}
+
+func (m *Manager) buildChunksWithEmbedder(
+	ctx context.Context,
+	doc *Document,
+	ts time.Time,
+	embedder hexagon.VectorEmbedder,
+) ([]*Chunk, error) {
 	if m.splitter == nil {
 		return nil, fmt.Errorf("未配置文本分块器 (splitter)")
 	}
@@ -1243,7 +1524,7 @@ func (m *Manager) buildChunks(ctx context.Context, doc *Document, ts time.Time) 
 	}
 
 	var embeddings [][]float32
-	if m.embedder != nil && len(chunkTexts) > 0 {
+	if embedder != nil && len(chunkTexts) > 0 {
 		// #12 文档侧前缀只作用于 embedding 输入；Chunk.Content（FTS/展示）仍用原文。
 		embedTexts := chunkTexts
 		if docPrefix := m.cfg().EmbedDocPrefix; docPrefix != "" {
@@ -1257,7 +1538,19 @@ func (m *Manager) buildChunks(ctx context.Context, doc *Document, ts time.Time) 
 		// 批次数增长：百页教材常有 200+ chunks，固定 60 秒只够第一批，后续超时会让
 		// 批处理层连同已完成结果一起丢弃，最终静默变成 0 向量。超时后仍保留 FTS。
 		embedCtx, cancel := context.WithTimeout(ragEmbedContext(ctx), documentEmbeddingBudget(len(embedTexts)))
-		embeddings, err = m.embedder.Embed(embedCtx, embedTexts)
+		permit, acquireErr := m.acquireResource(
+			embedCtx,
+			resourcegov.ResourceAccelerator,
+			resourcegov.PriorityFromContext(ctx, resourcegov.PriorityInteractive),
+		)
+		if acquireErr != nil {
+			err = acquireErr
+		} else {
+			embeddings, err = embedder.Embed(embedCtx, embedTexts)
+		}
+		if permit != nil {
+			permit.Release()
+		}
 		cancel()
 		if err != nil {
 			if !errors.Is(err, ErrEmbeddingUnavailable) {

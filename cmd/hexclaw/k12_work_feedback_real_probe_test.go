@@ -4,7 +4,8 @@ package main
 // ① 写作点评走纯文本 completion；② 美术点评走视觉通道（程序生成一张儿童画风格 PNG，
 // 原图多模态发给视觉模型做观察式点评）。全链走生产用例 GenerateWorkFeedback：
 // 归属校验 → adapter 构造提示词/载图 → 真机调用 → INV-011 入库拦截 → feedback_ready。
-// 若模型输出违反 INV-011 被拦截，探针如实记录（拦截器工作，不是 bug）。运行示例：
+// 若模型输出违反 INV-011 被拦截，说明本次没有形成可交付点评，发布探针必须失败。
+// 运行示例：
 //
 //	HEXCLAW_K12_WORKFB_PROBE=1 \
 //	go test ./cmd/hexclaw -run TestK12WorkFeedback_RealModel -v -count=1 -timeout 10m
@@ -51,16 +52,16 @@ func readWorkFeedbackFixture(t *testing.T, path, wantSHA string) []byte {
 	t.Helper()
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("读取真实 fixture 失败 path=%q: %v", path, err)
+		t.Fatalf("读取真实 fixture 失败: error_type=%T", err)
 	}
 	if mime := http.DetectContentType(raw); !strings.HasPrefix(mime, "image/") {
-		t.Fatalf("真实 fixture 不是图片 path=%q mime=%q", path, mime)
+		t.Fatalf("真实 fixture 不是图片: mime=%q", mime)
 	}
 	sum := fmt.Sprintf("%x", sha256.Sum256(raw))
 	if sum != wantSHA {
-		t.Fatalf("真实 fixture SHA 不符 path=%q got=%s want=%s（原图必须只读且与 §1.2 一致）", path, sum, wantSHA)
+		t.Fatalf("真实 fixture SHA 不符: got=%s want=%s（原图必须只读且与 §1.2 一致）", sum, wantSHA)
 	}
-	t.Logf("FIXTURE_VERIFIED: path=%s bytes=%d sha256=%s", path, len(raw), sum)
+	t.Logf("FIXTURE_VERIFIED: bytes=%d sha256=%s", len(raw), sum)
 	return raw
 }
 
@@ -89,25 +90,25 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 	}
 	cfg, err := config.Load("")
 	if err != nil {
-		t.Fatalf("load local HexClaw config: %v", err)
+		t.Fatalf("load local HexClaw config: error_type=%T", err)
 	}
 	applyK12PhotoProbeProviderOverride(t, cfg)
 	router, err := llmrouter.New(cfg.LLM)
 	if err != nil {
-		t.Fatalf("build real provider router: %v", err)
+		t.Fatalf("build real provider router: error_type=%T", err)
 	}
 
 	ctx := context.Background()
 	store, err := sqlitestore.New(filepath.Join(t.TempDir(), "k12-workfb-probe.db"))
 	if err != nil {
-		t.Fatalf("create isolated store: %v", err)
+		t.Fatalf("create isolated store: error_type=%T", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	if err := store.Init(ctx); err != nil {
-		t.Fatalf("init isolated store: %v", err)
+		t.Fatalf("init isolated store: error_type=%T", err)
 	}
 	if _, err := store.DB().ExecContext(ctx, `INSERT OR IGNORE INTO agents(name) VALUES('child-tutor')`); err != nil {
-		t.Fatalf("seed probe agent: %v", err)
+		t.Fatalf("seed probe agent: error_type=%T", err)
 	}
 
 	// 写作纯文本闭包：与 cmd/hexclaw/main.go 的 workFeedbackGenFn 同构（系统提示、红线、
@@ -138,7 +139,8 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 			Temperature: &temp,
 		})
 		if err != nil {
-			return "", err
+			t.Logf("writing provider error_type=%T", err)
+			return "", fmt.Errorf("work feedback provider completion failed: %T", err)
 		}
 		return resp.Content, nil
 	}
@@ -174,7 +176,8 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 			}},
 		})
 		if err != nil {
-			return "", err
+			t.Logf("vision provider error_type=%T", err)
+			return "", fmt.Errorf("work feedback vision completion failed: %T", err)
 		}
 		return resp.Content, nil
 	}
@@ -184,10 +187,10 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 	// （证据：DISK_SKILL_LOADED 日志 + 落库 feedback_skill 以 /disk 结尾）。
 	mp := marketplace.NewMarketplace(cfg.Skills.Dir)
 	if _, serr := mp.SeedFromFS(k12.BundledSkillsFS(), "skills"); serr != nil {
-		t.Fatalf("seed skills to disk: %v", serr)
+		t.Fatalf("seed skills to disk: error_type=%T", serr)
 	}
 	if err := mp.Init(); err != nil {
-		t.Fatalf("init marketplace: %v", err)
+		t.Fatalf("init marketplace: error_type=%T", err)
 	}
 	var diskLoaded []string
 	diskLoader := func(name string) (string, error) {
@@ -200,7 +203,7 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 			return "", rerr
 		}
 		diskLoaded = append(diskLoaded, name)
-		t.Logf("DISK_SKILL_LOADED: %s (%d bytes) from %s", name, len(data), mdSkill.FilePath)
+		t.Logf("DISK_SKILL_LOADED: name=%s bytes=%d", name, len(data))
 		return string(data), nil
 	}
 
@@ -217,7 +220,7 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 		assembly.WithProfiles(profiles),
 	)
 	if err != nil {
-		t.Fatalf("wire K12 runtime: %v", err)
+		t.Fatalf("wire K12 runtime: error_type=%T", err)
 	}
 
 	t.Run("写作点评_真机", func(t *testing.T) {
@@ -235,7 +238,7 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 			transcribed, terr := visionFn(ctx, raw,
 				"这是一张小学生手写作文的照片。请逐字誊录图中作文正文（含标题），只输出作文文字本身，不要添加任何点评、说明或标注。")
 			if terr != nil {
-				t.Fatalf("真实作文誊录失败: %v", terr)
+				t.Fatalf("真实作文誊录失败: error_type=%T", terr)
 			}
 			if lastVisionSHA != fxWritingSHA256 {
 				t.Fatalf("誊录请求进入的图片 SHA=%s，应为 FX-WRITING-001 %s（真实原图未到达模型）", lastVisionSHA, fxWritingSHA256)
@@ -249,24 +252,25 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 			// 点评必须落在真实原文上——命中任一关键词即证明未套用「校园春景」类无关模板。
 			essayKeywords = []string{"爸爸", "父亲", "程序员", "河蟹", "Skill", "提问", "数学"}
 			realWriting = true
-			t.Logf("REAL_WRITING_TRANSCRIBED: chars=%d\n----\n%s\n----", len([]rune(essay)), essay)
+			t.Logf("REAL_WRITING_TRANSCRIBED: chars=%d", len([]rune(essay)))
 		}
 		id, _, err := runtime.Deps.CreateCreativeWork(ctx, "child-tutor", "workfb-probe", k12.CreativeWorkFields{
 			WorkType: k12.WorkTypeWriting, Title: title, Task: task,
 			Versions: []k12.CreativeWorkVersion{{ContentMarkdown: essay}},
 		})
 		if err != nil {
-			t.Fatalf("创建写作作品: %v", err)
+			t.Fatalf("创建写作作品: error_type=%T", err)
 		}
 		started := time.Now()
 		v, err := runtime.Deps.GenerateWorkFeedback(ctx, "child-tutor", id)
 		if err != nil {
 			if strings.Contains(err.Error(), "INV-011") {
-				// 拦截器按契约工作：模型返回了打分/等第/代写口径，被拒绝入库。如实记录。
-				t.Logf("INV011_INTERCEPTED（写作）: %v", err)
-				return
+				t.Fatalf("写作点评触发 INV-011，未形成 feedback_ready 可交付产物")
 			}
-			t.Fatalf("写作点评真机生成失败: %v", err)
+			t.Fatalf("写作点评真机生成失败: error_type=%T", err)
+		}
+		if len(v.Fields.Versions) == 0 {
+			t.Fatal("写作点评没有版本化产物")
 		}
 		last := v.Fields.Versions[len(v.Fields.Versions)-1]
 		if v.Record.Status != k12.WorkStatusFeedbackReady {
@@ -288,7 +292,7 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 		// 红线：只点评不打分（LIVE-WRITING-001）——任何路径都不得出现分数/等第/排名口径。
 		for _, banned := range []string{"打分", "评分", "等第", "甲等", "排名", "名次", "满分"} {
 			if strings.Contains(last.Feedback, banned) {
-				t.Fatalf("写作点评不得含 %q：%s", banned, last.Feedback)
+				t.Fatalf("写作点评命中禁用口径 %q：feedback_chars=%d", banned, len([]rune(last.Feedback)))
 			}
 		}
 		if realWriting {
@@ -300,16 +304,16 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 				}
 			}
 			if hit == 0 {
-				t.Fatalf("真实写作点评未命中任何原文关键词 %v（疑似套用无关模板，未锚定真实原文）：\n%s",
-					essayKeywords, last.Feedback)
+				t.Fatalf("真实写作点评未命中原文锚点（疑似套用无关模板）：expected_anchors=%d feedback_chars=%d",
+					len(essayKeywords), len([]rune(last.Feedback)))
 			}
 			if strings.Contains(last.Feedback, "校园春景") {
-				t.Fatalf("真实写作点评出现无关模板词「校园春景」：%s", last.Feedback)
+				t.Fatalf("真实写作点评出现无关模板词「校园春景」：feedback_chars=%d", len([]rune(last.Feedback)))
 			}
 			t.Logf("REAL_WRITING_FEEDBACK_ANCHORED: 命中原文关键词 %d/%d", hit, len(essayKeywords))
 		}
-		t.Logf("WRITING_FEEDBACK_OK: real=%v elapsed=%s chars=%d feedback_skill=%s\n----\n%s\n----",
-			realWriting, time.Since(started).Round(time.Millisecond), len([]rune(last.Feedback)), last.FeedbackSkill, last.Feedback)
+		t.Logf("WRITING_FEEDBACK_OK: real=%v elapsed=%s chars=%d feedback_skill=%s",
+			realWriting, time.Since(started).Round(time.Millisecond), len([]rune(last.Feedback)), last.FeedbackSkill)
 	})
 
 	t.Run("美术点评_真机_视觉通道", func(t *testing.T) {
@@ -328,7 +332,7 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 			artFeatures = []string{"女孩", "蝴蝶结", "爱心", "裙", "猫", "彩虹", "星星", "云", "草", "地面"}
 			realArt = true
 		} else if err := os.WriteFile(artPath, drawChildStyleArtPNG(t), 0o600); err != nil {
-			t.Fatalf("write probe drawing: %v", err)
+			t.Fatalf("write probe drawing: error_type=%T", err)
 		}
 		id, _, err := runtime.Deps.CreateCreativeWork(ctx, "child-tutor", "workfb-probe", k12.CreativeWorkFields{
 			WorkType: k12.WorkTypeArt, Title: title, Task: task,
@@ -336,16 +340,18 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 			Versions: []k12.CreativeWorkVersion{{SourceAssetID: artPath}},
 		})
 		if err != nil {
-			t.Fatalf("创建美术作品: %v", err)
+			t.Fatalf("创建美术作品: error_type=%T", err)
 		}
 		started := time.Now()
 		v, err := runtime.Deps.GenerateWorkFeedback(ctx, "child-tutor", id)
 		if err != nil {
 			if strings.Contains(err.Error(), "INV-011") {
-				t.Logf("INV011_INTERCEPTED（美术）: %v", err)
-				return
+				t.Fatalf("美术点评触发 INV-011，未形成 feedback_ready 可交付产物")
 			}
-			t.Fatalf("美术点评真机生成失败（含 proxy 图片格式证据时如实上报）: %v", err)
+			t.Fatalf("美术点评真机生成失败（含 proxy 图片格式证据时如实上报）: error_type=%T", err)
+		}
+		if len(v.Fields.Versions) == 0 {
+			t.Fatal("美术点评没有版本化产物")
 		}
 		last := v.Fields.Versions[len(v.Fields.Versions)-1]
 		if v.Record.Status != k12.WorkStatusFeedbackReady {
@@ -354,10 +360,13 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 		if last.FeedbackSource != k12.FeedbackSourceAI {
 			t.Fatalf("来源应为 ai，got %q", last.FeedbackSource)
 		}
+		if strings.TrimSpace(last.Feedback) == "" {
+			t.Fatal("美术点评不得为空")
+		}
 		// 入库成功即 INV-011 已通过；再显式断言不含打分/等第口径（双保险取证）。
 		for _, banned := range []string{"打分", "评分", "等第", "甲等", "排名", "名次"} {
 			if strings.Contains(last.Feedback, banned) {
-				t.Fatalf("美术点评不得含 %q：%s", banned, last.Feedback)
+				t.Fatalf("美术点评命中禁用口径 %q：feedback_chars=%d", banned, len([]rune(last.Feedback)))
 			}
 		}
 		if !strings.HasSuffix(last.FeedbackSkill, "/disk") {
@@ -375,12 +384,13 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 				}
 			}
 			if hit == 0 {
-				t.Fatalf("真实美术点评未命中任何可见证据 %v（疑似虚构/未看真图）：\n%s", artFeatures, last.Feedback)
+				t.Fatalf("真实美术点评未命中可见证据（疑似虚构/未看真图）：expected_features=%d feedback_chars=%d",
+					len(artFeatures), len([]rune(last.Feedback)))
 			}
 			t.Logf("REAL_ART_FEEDBACK_ANCHORED: FX-ART SHA 进入请求✓ 命中可见证据 %d/%d", hit, len(artFeatures))
 		}
-		t.Logf("ART_FEEDBACK_OK: real=%v elapsed=%s chars=%d feedback_skill=%s\n----\n%s\n----",
-			realArt, time.Since(started).Round(time.Millisecond), len([]rune(last.Feedback)), last.FeedbackSkill, last.Feedback)
+		t.Logf("ART_FEEDBACK_OK: real=%v elapsed=%s chars=%d feedback_skill=%s",
+			realArt, time.Since(started).Round(time.Millisecond), len([]rune(last.Feedback)), last.FeedbackSkill)
 	})
 }
 

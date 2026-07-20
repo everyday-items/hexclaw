@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/knowledge"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // knowledgeUploadProcessTimeout 限定上传文档「解析(pdftotext/VLM)+向量嵌入」处理阶段的
@@ -61,6 +63,10 @@ type knowledgeDocumentResponse struct {
 
 // handleAddDocument 添加文档到知识库
 func (s *Server) handleAddDocument(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
+		s.handleCreateKnowledgeDocument(w, r)
+		return
+	}
 	var req AddDocumentRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 200<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -85,6 +91,98 @@ func (s *Server) handleAddDocument(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, knowledgeDocResponse(doc))
+}
+
+// handleCreateKnowledgeDocument is the canonical asynchronous upload path.
+// ParseMultipartForm is configured with only 1 MiB memory, so large sources
+// stream through an OS temp file before the application service fsyncs them
+// into its content-addressed store. Parsing/OCR/chunking never runs here.
+func (s *Server) handleCreateKnowledgeDocument(w http.ResponseWriter, r *http.Request) {
+	service, ok := s.semanticIndex.(KnowledgeDocumentIngestAPI)
+	if !ok {
+		writeDocumentIngestError(w, knowledge.ErrDocumentIngestUnavailable)
+		return
+	}
+	const multipartOverhead = 2 << 20
+	r.Body = http.MaxBytesReader(w, r.Body, knowledge.MaxKnowledgeDocumentBytes+multipartOverhead)
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
+				"error": "文件过大，最大允许 200MB",
+			})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "解析上传失败: " + err.Error()})
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "未找到上传文件"})
+		return
+	}
+	defer file.Close()
+	if header.Size > knowledge.MaxKnowledgeDocumentBytes {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "文件过大，最大允许 200MB"})
+		return
+	}
+	idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if idempotencyKey == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
+		return
+	}
+	corpusID := strings.TrimSpace(r.FormValue("corpus_id"))
+	if corpusID == "" {
+		corpusID = strings.TrimSpace(r.URL.Query().Get("corpus_id"))
+	}
+	if corpusID == "" {
+		corpusID = knowledgeDefaultCorpusID
+	}
+	if !requireSupportedKnowledgeCorpus(w, corpusID) {
+		return
+	}
+	mediaType := strings.TrimSpace(header.Header.Get("Content-Type"))
+	if mediaType == "" || mediaType == "application/octet-stream" {
+		if inferred := mime.TypeByExtension(strings.ToLower(filepath.Ext(header.Filename))); inferred != "" {
+			mediaType = inferred
+		}
+	}
+	result, err := service.CreateDocument(r.Context(), knowledgePrincipalID(r), corpusID,
+		knowledge.CreateDocumentInput{
+			IdempotencyKey: idempotencyKey,
+			Filename:       header.Filename,
+			MediaType:      mediaType,
+			SizeBytes:      header.Size,
+			Body:           file,
+			AgentID:        strings.TrimSpace(r.FormValue("agent_id")),
+			LearnerID:      strings.TrimSpace(r.FormValue("learner_id")),
+			Subject:        strings.TrimSpace(r.FormValue("subject")),
+			Grade:          strings.TrimSpace(r.FormValue("grade")),
+		})
+	if err != nil {
+		writeDocumentIngestError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
+func writeDocumentIngestError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, knowledge.ErrDocumentTooLarge):
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": err.Error(), "code": "knowledge_document_too_large"})
+	case errors.Is(err, knowledge.ErrInvalidDocumentUpload):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error(), "code": "knowledge_document_invalid"})
+	case errors.Is(err, knowledge.ErrIdempotencyConflict):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "code": "knowledge_idempotency_conflict"})
+	case errors.Is(err, knowledge.ErrDocumentIngestUnavailable):
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "knowledge document ingest unavailable", "code": "knowledge_ingest_unavailable"})
+	default:
+		logger.Error("[knowledge] asynchronous document acceptance failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "knowledge document acceptance failed", "code": "knowledge_ingest_internal"})
+	}
 }
 
 // handleUploadDocument 上传文件到知识库。
@@ -190,6 +288,22 @@ func (s *Server) handleUploadDocument(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+var errDOCXXMLTooLarge = errors.New("DOCX word/document.xml exceeds extraction limit")
+
+func readDOCXXMLLimited(reader io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("%w: invalid limit", errDOCXXMLTooLarge)
+	}
+	raw, err := io.ReadAll(io.LimitReader(reader, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > maxBytes {
+		return nil, fmt.Errorf("%w: maximum is %d bytes", errDOCXXMLTooLarge, maxBytes)
+	}
+	return raw, nil
+}
+
 // extractDocxText 从 DOCX 中提取纯文本（DOCX 为 ZIP，内含 word/document.xml）
 func extractDocxText(data []byte) (string, error) {
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
@@ -213,7 +327,7 @@ func extractDocxText(data []byte) (string, error) {
 		return "", err
 	}
 	defer rc.Close()
-	raw, err := io.ReadAll(io.LimitReader(rc, maxDocXMLSize))
+	raw, err := readDOCXXMLLimited(rc, maxDocXMLSize)
 	if err != nil {
 		return "", err
 	}
@@ -252,6 +366,20 @@ func (s *Server) handleListDocuments(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if projectionService, ok := s.semanticIndex.(KnowledgeDocumentVectorProjectionAPI); ok {
+		projections, projectionErr := projectionService.ListDocumentVectorProjections(
+			r.Context(), knowledgePrincipalID(r), knowledgeDefaultCorpusID,
+		)
+		if projectionErr != nil && !errors.Is(projectionErr, knowledge.ErrSemanticIndexNotFound) {
+			writeSemanticIndexError(w, projectionErr)
+			return
+		}
+		for _, document := range res.Documents {
+			if projection, found := projections[document.ID]; found {
+				applyKnowledgeDocumentVectorProjection(document, projection)
+			}
+		}
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"documents": res.Documents, // ListDocumentsPaged guarantees non-nil
@@ -284,10 +412,41 @@ func (s *Server) handleGetDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if projectionService, ok := s.semanticIndex.(KnowledgeDocumentProjectionAPI); ok {
+		projection, projectionErr := projectionService.GetIngestDocumentProjectionForCorpus(
+			r.Context(), knowledgePrincipalID(r), knowledgeDefaultCorpusID, docID,
+		)
+		if projectionErr == nil {
+			if projection.CorpusID != knowledgeDefaultCorpusID {
+				writeSemanticIndexError(w, knowledge.ErrSemanticIndexNotFound)
+				return
+			}
+			payload := s.knowledgeDocumentDetail(r, projection)
+			if vectorService, vectorOK := s.semanticIndex.(KnowledgeDocumentVectorProjectionAPI); vectorOK {
+				vectors, vectorErr := vectorService.ListDocumentVectorProjections(
+					r.Context(), knowledgePrincipalID(r), knowledgeDefaultCorpusID,
+				)
+				if vectorErr != nil && !errors.Is(vectorErr, knowledge.ErrSemanticIndexNotFound) {
+					writeSemanticIndexError(w, vectorErr)
+					return
+				}
+				if vector, found := vectors[docID]; found {
+					applyKnowledgeDocumentVectorPayload(payload, vector)
+				}
+			}
+			writeJSON(w, http.StatusOK, payload)
+			return
+		}
+		if !errors.Is(projectionErr, knowledge.ErrSemanticIndexNotFound) {
+			writeSemanticIndexError(w, projectionErr)
+			return
+		}
+	}
+
 	doc, err := s.kb.GetDocument(r.Context(), docID)
 	if err != nil {
 		status := http.StatusInternalServerError
-		if strings.Contains(err.Error(), "不存在") {
+		if errors.Is(err, knowledge.ErrSemanticIndexNotFound) || strings.Contains(err.Error(), "不存在") {
 			status = http.StatusNotFound
 		}
 		writeJSON(w, status, map[string]string{
@@ -297,6 +456,87 @@ func (s *Server) handleGetDocument(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, doc)
+}
+
+func applyKnowledgeDocumentVectorProjection(
+	document *knowledge.Document,
+	projection knowledge.DocumentVectorProjection,
+) {
+	document.VectorIndexState = projection.VectorIndexState
+	document.VectorJobID = projection.JobID
+	document.VectorJobState = projection.JobState
+	document.VectorJobStage = projection.Stage
+	document.VectorChunksDone = projection.ChunksDone
+	document.VectorChunksTotal = projection.ChunksTotal
+	document.VectorError = projection.LastError
+	document.VectorOutcomeUnknown = projection.OutcomeUnknown
+}
+
+func applyKnowledgeDocumentVectorPayload(
+	payload map[string]any,
+	projection knowledge.DocumentVectorProjection,
+) {
+	payload["vector_index_state"] = projection.VectorIndexState
+	payload["vector_job_id"] = projection.JobID
+	payload["vector_job_state"] = projection.JobState
+	payload["vector_job_stage"] = projection.Stage
+	payload["vector_chunks_done"] = projection.ChunksDone
+	payload["vector_chunks_total"] = projection.ChunksTotal
+	payload["vector_error"] = projection.LastError
+	payload["vector_outcome_unknown"] = projection.OutcomeUnknown
+}
+
+func (s *Server) knowledgeDocumentDetail(
+	r *http.Request,
+	projection knowledge.KnowledgeDocumentProjection,
+) map[string]any {
+	payload := map[string]any{}
+	if legacy, err := s.kb.GetDocument(r.Context(), projection.DocumentID); err == nil {
+		if raw, marshalErr := json.Marshal(legacy); marshalErr == nil {
+			_ = json.Unmarshal(raw, &payload)
+		}
+	}
+	status := string(projection.TextIndexState)
+	if projection.TextIndexState == knowledge.TextIndexReady {
+		status = "indexed"
+	}
+	if current, ok := payload["status"].(string); !ok || strings.TrimSpace(current) == "" {
+		payload["status"] = status
+	}
+	payload["id"] = projection.DocumentID
+	payload["document_id"] = projection.DocumentID
+	payload["owner_id"] = projection.OwnerID
+	payload["corpus_id"] = projection.CorpusID
+	payload["filename"] = projection.Filename
+	payload["media_type"] = projection.MediaType
+	payload["size_bytes"] = projection.SizeBytes
+	payload["sha256"] = projection.SHA256
+	payload["source_digest"] = projection.SHA256
+	payload["agent_id"] = projection.AgentID
+	payload["learner_id"] = projection.LearnerID
+	payload["subject"] = projection.Subject
+	payload["grade"] = projection.Grade
+	payload["text_index_state"] = projection.TextIndexState
+	payload["warnings"] = projection.Warnings
+	payload["source_spans"] = projection.SourceSpans
+	if projection.PageCount != nil {
+		payload["page_count"] = *projection.PageCount
+		payload["pages_total"] = *projection.PageCount
+		if projection.TextIndexState == knowledge.TextIndexReady {
+			payload["pages_done"] = *projection.PageCount
+		} else {
+			payload["pages_done"] = int64(0)
+		}
+	}
+	if chunks, ok := payload["chunk_count"]; ok {
+		payload["chunks_total"] = chunks
+		if projection.TextIndexState == knowledge.TextIndexReady {
+			payload["chunks_done"] = chunks
+		} else {
+			payload["chunks_done"] = 0
+		}
+	}
+	return payload
 }
 
 // handleDeleteDocument 删除知识库文档
@@ -310,7 +550,11 @@ func (s *Server) handleDeleteDocument(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.kb.DeleteDocument(r.Context(), docID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
+		status := http.StatusInternalServerError
+		if errors.Is(err, knowledge.ErrSemanticIndexNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{
 			"error": "删除文档失败: " + err.Error(),
 		})
 		return
@@ -331,7 +575,11 @@ func (s *Server) handleReindexDocument(w http.ResponseWriter, r *http.Request) {
 
 	doc, err := s.kb.ReindexDocument(r.Context(), docID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
+		status := http.StatusInternalServerError
+		if errors.Is(err, knowledge.ErrSemanticIndexNotFound) || strings.Contains(err.Error(), "不存在") {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{
 			"status":  "failed",
 			"message": "重建索引失败: " + err.Error(),
 		})

@@ -152,6 +152,9 @@ func TestServer_Chat(t *testing.T) {
 
 func TestServer_ChatForwardsExplicitProviderAndModel(t *testing.T) {
 	cfg := config.DefaultConfig()
+	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
+		"智谱": {Model: "glm-5", Models: []string{"glm-5"}},
+	}
 	eng := &mockEngine{
 		reply: &adapter.Reply{
 			Content:  "收到",
@@ -186,6 +189,9 @@ func TestServer_ChatForwardsExplicitProviderAndModel(t *testing.T) {
 
 func TestServer_ChatForwardsMetadataAndRequestID(t *testing.T) {
 	cfg := config.DefaultConfig()
+	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
+		"ollama": {Model: "qwen3.5:9b", Models: []string{"qwen3.5:9b"}},
+	}
 	eng := &mockEngine{
 		reply: &adapter.Reply{Content: "收到"},
 	}

@@ -85,6 +85,7 @@ type Server struct {
 	gateway           gateway.Gateway
 	store             storage.Store                // 数据存储层
 	kb                *knowledge.Manager           // 知识库管理器（可选）
+	semanticIndex     SemanticIndexAPI             // corpus 级语义索引策略/持久 Job（可选）
 	webhookMgr        *webhook.Manager             // Webhook 管理器（可选）
 	scheduler         *cron.Scheduler              // Cron 调度器（可选）
 	promptStore       *library.PromptStore         // §11.8 Prompt 库（可选）
@@ -108,24 +109,29 @@ type Server struct {
 	genStore          *genstore.Store              // 生成内容持久化（图像/视频）
 	kbEmbedding       *KnowledgeEmbeddingInfo      // 知识库嵌入接线信息（BUG-20260712-B1，可选）
 	reloadGenServices func()                       // LLM 配置变更后重建 gen 服务（main.go 注入）
-	desktopSvc        *desktop.Service             // 桌面集成服务（可选）
-	cfgWriter         *config.Writer               // 配置文件写入器（MCP 持久化用）
-	wsHandler         http.Handler                 // WebSocket Handler（可选）
-	extraMounts       []mountedHandler             // 场景包子路由（前缀 → handler，AP-1：平台不认识场景内容）
-	streamStates      streamstate.Provider         // 流式 in-flight 状态（可选）
-	logCollector      *LogCollector                // 日志收集器
-	workflowStore     *WorkflowStore               // 工作流存储
-	teamStore         *TeamStore                   // 团队数据存储
-	budgetCtrl        *engine.BudgetController     // 预算控制器（可选）
-	toolCache         *engine.ToolCache            // 工具缓存（可选）
-	toolMetrics       *engine.ToolMetricsCollector // 工具指标（可选）
-	toolPerms         *engine.ToolPermissions      // 工具权限（可选）
-	checkpointMgr     *engine.CheckpointManager    // 检查点管理器（可选）
-	subagentRegistry  *engine.SubAgentRegistry     // 子 Agent 派生运行注册表（可选，观测/续接）
-	cfgTxMgr          *config.TransactionManager   // v0.4.0 F9 配置事务热加载（可选）
-	cronParseProvider hexagon.Provider             // D2.1 Layer 2 cron parse LLM provider
-	cronParseModel    string                       // D2.1 cron parse 模型名（建议 haiku/mini 类快模型）
-	version           string                       // 版本号
+	// reloadSemanticRuntime builds and atomically installs the next embedding
+	// resolver/registry generation while draining the prior gate. The legacy
+	// invalidator remains for non-desktop callers and compatibility tests.
+	reloadSemanticRuntime     func(context.Context, config.LLMConfig) error
+	invalidateSemanticRuntime func(context.Context) error
+	desktopSvc                *desktop.Service             // 桌面集成服务（可选）
+	cfgWriter                 *config.Writer               // 配置文件写入器（MCP 持久化用）
+	wsHandler                 http.Handler                 // WebSocket Handler（可选）
+	extraMounts               []mountedHandler             // 场景包子路由（前缀 → handler，AP-1：平台不认识场景内容）
+	streamStates              streamstate.Provider         // 流式 in-flight 状态（可选）
+	logCollector              *LogCollector                // 日志收集器
+	workflowStore             *WorkflowStore               // 工作流存储
+	teamStore                 *TeamStore                   // 团队数据存储
+	budgetCtrl                *engine.BudgetController     // 预算控制器（可选）
+	toolCache                 *engine.ToolCache            // 工具缓存（可选）
+	toolMetrics               *engine.ToolMetricsCollector // 工具指标（可选）
+	toolPerms                 *engine.ToolPermissions      // 工具权限（可选）
+	checkpointMgr             *engine.CheckpointManager    // 检查点管理器（可选）
+	subagentRegistry          *engine.SubAgentRegistry     // 子 Agent 派生运行注册表（可选，观测/续接）
+	cfgTxMgr                  *config.TransactionManager   // v0.4.0 F9 配置事务热加载（可选）
+	cronParseProvider         hexagon.Provider             // D2.1 Layer 2 cron parse LLM provider
+	cronParseModel            string                       // D2.1 cron parse 模型名（建议 haiku/mini 类快模型）
+	version                   string                       // 版本号
 	// 自动化权限治理（可选，main.go 经 SetAutonomy 注入）
 	autonomyHook      *engine.PermissionHook  // 权限闸引用：Profile 热更新 + 当前策略
 	autonomyDecisions *autonomy.DecisionStore // 权限决策审计日志（持久化）
@@ -141,6 +147,8 @@ type Server struct {
 	statsJSON                   []byte
 	statsCacheAt                time.Time
 	ollamaBaseURL               string
+	onOllamaModelInstalled      func(context.Context, string)
+	serviceLifecycleCtx         context.Context
 }
 
 // AgentResourceCleaner stages cleanup of resources owned by an Agent before
@@ -268,6 +276,22 @@ func (s *Server) SetMCPManager(mgr *hexmcp.Manager) {
 // SetCfgWriter 设置配置文件写入器（MCP 动态添加持久化用）
 func (s *Server) SetCfgWriter(w *config.Writer) {
 	s.cfgWriter = w
+}
+
+// SetSemanticRuntimeInvalidator installs the fail-closed boundary used by
+// config hot reloads. It has no UI surface and is intentionally one-way.
+func (s *Server) SetSemanticRuntimeInvalidator(invalidate func(context.Context) error) {
+	s.invalidateSemanticRuntime = invalidate
+}
+
+// SetSemanticRuntimeReloader installs the provider hot-reload boundary. The
+// callback receives the fully merged next LLM config before s.cfg is exposed;
+// it must return only after the old generation is drained and the successor is
+// ready for Catalog/Apply calls.
+func (s *Server) SetSemanticRuntimeReloader(
+	reload func(context.Context, config.LLMConfig) error,
+) {
+	s.reloadSemanticRuntime = reload
 }
 
 // SetCapabilityService 设置模型 tool_call 能力探测服务（A7）。
@@ -553,7 +577,6 @@ func (s *Server) routes() http.Handler {
 	// 知识库 API
 	if s.kb != nil {
 		mux.HandleFunc("POST /api/v1/knowledge/documents", s.handleAddDocument)
-		mux.HandleFunc("POST /api/v1/knowledge/upload", s.handleUploadDocument)
 		mux.HandleFunc("GET /api/v1/knowledge/documents", s.handleListDocuments)
 		mux.HandleFunc("GET /api/v1/knowledge/documents/{id}", s.handleGetDocument)
 		mux.HandleFunc("DELETE /api/v1/knowledge/documents/{id}", s.handleDeleteDocument)
@@ -564,6 +587,13 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("PUT /api/v1/knowledge/config", s.handlePutKnowledgeConfig)
 	} else {
 		mux.HandleFunc("GET /api/v1/knowledge/documents", emptyList("documents"))
+	}
+	if s.semanticIndex != nil {
+		mux.HandleFunc("POST /api/v1/knowledge/documents/{id}/retry", s.handleRetryKnowledgeDocument)
+		mux.HandleFunc("GET /api/v1/knowledge/corpora/{corpus_id}/embedding-policy", s.handleGetKnowledgeEmbeddingPolicy)
+		mux.HandleFunc("POST /api/v1/knowledge/corpora/{corpus_id}/embedding-policy:apply", s.handleApplyKnowledgeEmbeddingPolicy)
+		mux.HandleFunc("GET /api/v1/knowledge/jobs/{job_id}", s.handleGetKnowledgeJob)
+		mux.HandleFunc("POST /api/v1/knowledge/jobs/{job_id}/cancel", s.handleCancelKnowledgeJob)
 	}
 
 	// 文档解析（无状态，不依赖知识库）：把上传文档抽取为纯文本供对话注入。
@@ -930,6 +960,13 @@ func (s *Server) Start(ctx context.Context, onReady func()) error {
 }
 
 func (s *Server) buildHTTPServer(ctx context.Context) *http.Server {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Long-running operations may intentionally detach from one browser
+	// request, but must still be owned by the serving process. This is assigned
+	// during construction, before Serve exposes any handler concurrently.
+	s.serviceLifecycleCtx = ctx
 	handler := s.routes()
 	addr := fmt.Sprintf("%s:%d", s.cfg.Server.Host, s.cfg.Server.Port)
 	return &http.Server{
@@ -954,10 +991,32 @@ func emptyList(key string) http.HandlerFunc {
 //
 // 使用调用方传入的 context 控制超时，避免双重超时。
 func (s *Server) Stop(ctx context.Context) error {
+	return s.StopWithDrain(ctx, nil)
+}
+
+// StopWithDrain closes every HTTP listener before invoking drain, then waits
+// for in-flight requests to become idle. The hook is intended for cancelling
+// process-owned workers and detached streaming operations: no new request can
+// enter once it runs, while existing requests still receive graceful shutdown.
+func (s *Server) StopWithDrain(ctx context.Context, drain func()) error {
+	var drainOnce sync.Once
+	runDrain := func() {
+		if drain != nil {
+			drainOnce.Do(drain)
+		}
+	}
 	if s.server == nil {
+		runDrain()
 		return nil
 	}
-	return s.server.Shutdown(ctx)
+	if drain != nil {
+		s.server.RegisterOnShutdown(runDrain)
+	}
+	err := s.server.Shutdown(ctx)
+	// RegisterOnShutdown callbacks run asynchronously. Ensure the caller never
+	// observes StopWithDrain returning before its runtime cancellation ran.
+	runDrain()
+	return err
 }
 
 // handleHealth 健康检查端点
@@ -1060,6 +1119,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if err := validateRequestedCompletionModel(s.activeLLMConfig(), req.Provider, req.Model); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 
 	// 构建统一消息
 	userID := req.UserID
@@ -1089,6 +1152,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// GO-3：外部聊天入口是信任边界——剥除只能由受信内部派发器盖章的保留键，
 	// 否则客户端可伪造 source=cron + cron_job_id 盗用他人任务的授权（提权）。
 	engine.StripReservedDispatchMetadata(msg.Metadata)
+	metadataModel := strings.TrimSpace(msg.Metadata["model"])
+	if metadataModel == "" {
+		metadataModel = strings.TrimSpace(msg.Metadata["agent_model"])
+	}
+	if err := validateRequestedCompletionModel(
+		s.activeLLMConfig(),
+		msg.Metadata["provider"],
+		metadataModel,
+	); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	if err := adapter.ApplyRequestSamplingOverrides(msg.Metadata, req.Temperature, req.MaxTokens); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -1385,7 +1460,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 			isLoopback127 {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key")
 			w.Header().Set("Access-Control-Max-Age", "3600")
 		}
 
@@ -1460,6 +1535,7 @@ func (s *Server) apiAuthMiddleware(next http.Handler) http.Handler {
 				strings.HasPrefix(path, "/api/v1/platforms/hooks/"))
 		isLogsAPI := path == "/api/v1/logs" || strings.HasPrefix(path, "/api/v1/logs/")
 		isDesktopAPI := strings.HasPrefix(path, "/api/v1/desktop/")
+		isKnowledgeAPI := path == "/api/v1/knowledge" || strings.HasPrefix(path, "/api/v1/knowledge/")
 		// The collection GET is the K12 binding/Receipt management plane. It
 		// exposes child-scoped metadata and therefore must not inherit the broad
 		// read-only exemption used by public status endpoints.
@@ -1473,7 +1549,7 @@ func (s *Server) apiAuthMiddleware(next http.Handler) http.Handler {
 		// 新场景包挂到 `/api/<其他>/` 会重现 AP-184 绕过鉴权。任何 Mount 进来的场景子路由
 		// （注册为 prefix+"/"）自动纳入守卫。
 		isScenarioAPI := s.isMountedScenarioPath(path)
-		needsAuth := isDesktopAPI || isLogsAPI || isScenarioAPI || isWebhookManagement ||
+		needsAuth := isDesktopAPI || isLogsAPI || isKnowledgeAPI || isScenarioAPI || isWebhookManagement ||
 			(isWriteOp && strings.HasPrefix(path, "/api/v1/") && path != "/api/v1/chat" && !isWebhookReceiver)
 
 		if !needsAuth {

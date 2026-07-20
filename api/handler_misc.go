@@ -1066,6 +1066,9 @@ func (s *Server) validateAgentLLMConfig(cfg *router.AgentConfig) error {
 	if p := llmCfg.Providers[providerKey]; p.Enabled != nil && !*p.Enabled {
 		return fmt.Errorf("指定的 provider %q 已禁用，请先在设置中启用", cfg.Provider)
 	}
+	if err := validateConfiguredTextModel(llmCfg, providerKey, cfg.Model); err != nil {
+		return err
+	}
 	cfg.Provider = providerKey
 	return nil
 }

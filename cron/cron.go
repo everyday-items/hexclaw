@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/security"
+	"github.com/hexagon-codes/hexclaw/storage/migrate"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
@@ -394,13 +395,6 @@ func (s *Scheduler) Init(ctx context.Context) error {
 	// D4.2 多 deliver 桥接：meta JSON 列承载 deliver 数组
 	addColumnExpectDuplicate(ctx, s.db, "cron_jobs", `ALTER TABLE cron_jobs ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'`)
 
-	// 旧库的 prompt 列带 NOT NULL 约束，v2 INSERT 不写它就触发约束失败。
-	// SQLite ALTER DROP COLUMN 在带索引/约束的列上可能静默失败，因此用表重建
-	// 兜底：检测到 prompt 列存在 → 重建 cron_jobs（v1 旧任务已被 detect 清理）。
-	if err := s.rebuildCronJobsIfLegacy(ctx); err != nil {
-		return fmt.Errorf("v2 migration 重建 cron_jobs 失败: %w", err)
-	}
-
 	// v2 history migration：为脚本执行新增 stdout/stderr/exit_code/data_json 列
 	addColumnExpectDuplicate(ctx, s.db, "cron_job_runs", `ALTER TABLE cron_job_runs ADD COLUMN stdout TEXT NOT NULL DEFAULT ''`)
 	addColumnExpectDuplicate(ctx, s.db, "cron_job_runs", `ALTER TABLE cron_job_runs ADD COLUMN stderr TEXT NOT NULL DEFAULT ''`)
@@ -414,108 +408,30 @@ func (s *Scheduler) Init(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_cron_job_runs_job_id ON cron_job_runs(job_id, id)`); err != nil {
 		return fmt.Errorf("创建 cron_job_runs 索引失败: %w", err)
 	}
+	// Runtime tests and imported/legacy databases may reach Scheduler without
+	// first passing through storage.Init. Reuse the numbered migration's exact
+	// fixed-connection repair so Init and startup cannot diverge on parent/child
+	// preservation, duplicate handling, indexes or FK constraints.
+	if err := migrate.RepairCronIntegrityV29(ctx, s.db); err != nil {
+		return fmt.Errorf("Cron 完整性修复失败: %w", err)
+	}
 
-	// 清理 v1 遗留任务（只有 prompt 无 spec_json）—— 不自动编译，提示用户重建
+	// 隔离 v1 遗留任务（只有 prompt 无 spec_json）—— 不自动编译，提示用户重建。
+	// 保留父记录后，历史 run/state 证据也继续可查。
 	if err := s.detectAndCleanupLegacyJobs(ctx); err != nil {
-		return fmt.Errorf("清理 v1 遗留任务失败: %w", err)
+		return fmt.Errorf("隔离 v1 遗留任务失败: %w", err)
 	}
 
 	// 加载所有活跃任务
 	return s.loadJobs(ctx)
 }
 
-// rebuildCronJobsIfLegacy 若 cron_jobs 表含 v1 遗留的 prompt 列，做表重建：
-//   - CREATE TABLE cron_jobs_v2 with the canonical v2 schema
-//   - 拷贝 spec_json 非空的 v2 任务（v1 任务在 detectAndCleanupLegacyJobs 阶段已被 DELETE）
-//   - DROP TABLE cron_jobs; ALTER RENAME cron_jobs_v2 → cron_jobs
-//   - 重建索引
-//
-// 全程在 transaction 内，失败 ROLLBACK。
-func (s *Scheduler) rebuildCronJobsIfLegacy(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(cron_jobs)`)
-	if err != nil {
-		return err
-	}
-	hasPrompt := false
-	for rows.Next() {
-		var cid int
-		var name, ctype string
-		var notnull, pk int
-		var dflt sql.NullString
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			rows.Close()
-			return err
-		}
-		if name == "prompt" {
-			hasPrompt = true
-		}
-	}
-	rows.Close()
-	if !hasPrompt {
-		return nil
-	}
-
-	logger.Warn("[cron] 检测到 v1 遗留 prompt 列，执行 cron_jobs 表重建迁移")
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	rollback := func() { _ = tx.Rollback() }
-
-	if _, err := tx.ExecContext(ctx, `CREATE TABLE cron_jobs_v2 (
-		id TEXT PRIMARY KEY,
-		name TEXT NOT NULL,
-		type TEXT NOT NULL DEFAULT 'cron',
-		schedule TEXT NOT NULL,
-		spec_json TEXT NOT NULL DEFAULT '',
-		source_prompt TEXT NOT NULL DEFAULT '',
-		user_id TEXT NOT NULL,
-		platform TEXT DEFAULT '',
-		chat_id TEXT DEFAULT '',
-		status TEXT NOT NULL DEFAULT 'active',
-		last_run_at DATETIME,
-		next_run_at DATETIME NOT NULL,
-		run_count INTEGER DEFAULT 0,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		meta TEXT NOT NULL DEFAULT '{}'
-	)`); err != nil {
-		rollback()
-		return fmt.Errorf("CREATE cron_jobs_v2: %w", err)
-	}
-
-	if _, err := tx.ExecContext(ctx, `INSERT INTO cron_jobs_v2
-		(id, name, type, schedule, spec_json, source_prompt, user_id, platform, chat_id, status, last_run_at, next_run_at, run_count, created_at, meta)
-		SELECT id, name, type, schedule, spec_json, source_prompt,
-		       user_id, COALESCE(platform,''), COALESCE(chat_id,''), status, last_run_at, next_run_at,
-		       COALESCE(run_count,0), created_at, '{}'
-		FROM cron_jobs
-		WHERE spec_json IS NOT NULL AND spec_json != ''`); err != nil {
-		rollback()
-		return fmt.Errorf("拷贝 v2 任务: %w", err)
-	}
-
-	for _, ddl := range []string{
-		`DROP TABLE cron_jobs`,
-		`ALTER TABLE cron_jobs_v2 RENAME TO cron_jobs`,
-	} {
-		if _, err := tx.ExecContext(ctx, ddl); err != nil {
-			rollback()
-			return fmt.Errorf("%s: %w", ddl, err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
-	}
-	logger.Warn("[cron] cron_jobs 表重建完成 — v1 schema 已清退")
-	return nil
-}
-
-// detectAndCleanupLegacyJobs 启动时清理 v1 遗留任务。
+// detectAndCleanupLegacyJobs 启动时隔离 v1 遗留任务。
 //
 // 判定：spec_json 为空 → 该任务未经 v2 编译，运行时不知道怎么执行。
 // 不自动编译（避免启动期 LLM 调用 + 旧 prompt 可能已过时）。
-// 直接 DELETE 并通过日志告知用户在 UI 重建。
+// 置 paused 并通过日志告知用户在 UI 重建；不能 DELETE，因为 run/state 是
+// 用户可审计证据，且在 foreign_keys=ON 时会被父表级联删除。
 func (s *Scheduler) detectAndCleanupLegacyJobs(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, name FROM cron_jobs WHERE spec_json IS NULL OR spec_json = ''`)
@@ -541,14 +457,14 @@ func (s *Scheduler) detectAndCleanupLegacyJobs(ctx context.Context) error {
 	}
 
 	for _, l := range legs {
-		logger.Warn("[cron] 清理 v1 遗留任务 — 请在 UI 重新创建",
+		logger.Warn("[cron] 隔离 v1 遗留任务 — 请在 UI 重新创建",
 			"id", l.id, "name", l.name)
 	}
 	if _, err := s.db.ExecContext(ctx,
-		`DELETE FROM cron_jobs WHERE spec_json IS NULL OR spec_json = ''`); err != nil {
-		return fmt.Errorf("DELETE legacy jobs: %w", err)
+		`UPDATE cron_jobs SET status='paused' WHERE spec_json IS NULL OR spec_json = ''`); err != nil {
+		return fmt.Errorf("pause legacy jobs: %w", err)
 	}
-	logger.Warn("[cron] v1 遗留任务已清理", "count", len(legs))
+	logger.Warn("[cron] v1 遗留任务已隔离", "count", len(legs))
 	return nil
 }
 
@@ -901,9 +817,18 @@ func (s *Scheduler) UpsertJobFromScript(ctx context.Context, req AddJobRequest, 
 		job.Status = keep.Status
 		for _, duplicate := range matches[1:] {
 			staleIDs = append(staleIDs, duplicate.ID)
-			if _, err := tx.ExecContext(ctx, `DELETE FROM cron_jobs WHERE id = ?`, duplicate.ID); err != nil {
-				return nil, fmt.Errorf("清理重复 cron %s: %w", duplicate.ID, err)
-			}
+		}
+		if err := migrate.MergeCronJobsTx(ctx, tx, keep.ID, staleIDs, "runtime_source_key_upsert"); err != nil {
+			return nil, fmt.Errorf("归并重复 cron 证据: %w", err)
+		}
+		var mergedLastRun sql.NullTime
+		if err := tx.QueryRowContext(ctx, `SELECT run_count,last_run_at FROM cron_jobs WHERE id=?`, keep.ID).
+			Scan(&job.RunCount, &mergedLastRun); err != nil {
+			return nil, fmt.Errorf("读取归并后的 cron 运行统计: %w", err)
+		}
+		job.LastRunAt = time.Time{}
+		if mergedLastRun.Valid {
+			job.LastRunAt = mergedLastRun.Time
 		}
 	}
 

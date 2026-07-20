@@ -31,13 +31,13 @@ func TestBUG20260714_LargePDFUsesAdaptiveVisualBudget(t *testing.T) {
 		}
 	})
 
-	t.Run("large scanned PDF samples a bounded number of pages", func(t *testing.T) {
-		limit, warning := pdfVisualPageLimit("", 123, 20)
-		if limit <= 0 || limit > largePDFVisualSamplePages {
-			t.Fatalf("扫描版大 PDF 应有限抽样，limit=%d", limit)
+	t.Run("large scanned PDF never silently samples the first three pages", func(t *testing.T) {
+		limit, warning := pdfVisualPageLimit("", 122, 250)
+		if limit != 122 {
+			t.Fatalf("122 页扫描 PDF 必须逐页进入 OCR/VLM，不能抽样冒充全文，limit=%d", limit)
 		}
-		if !strings.Contains(warning, "抽样") {
-			t.Fatalf("应明确视觉解析为抽样，got %q", warning)
+		if strings.Contains(warning, "抽样") || strings.Contains(warning, "前 3 页") {
+			t.Fatalf("不得把抽样结果标成可继续索引，warning=%q", warning)
 		}
 	})
 

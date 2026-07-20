@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -27,10 +29,13 @@ type LLMConfigResponse struct {
 
 // LLMProviderConfigResponse 脱敏后的 Provider 配置
 type LLMProviderConfigResponse struct {
+	ProviderInstanceID    string                               `json:"provider_instance_id"`
 	APIKey                string                               `json:"api_key"`
 	BaseURL               string                               `json:"base_url"`
 	Model                 string                               `json:"model"`
-	Models                []string                             `json:"models,omitempty"`
+	Models                []string                             `json:"models"`
+	ModelSpecs            []config.LLMProviderModelSpec        `json:"model_specs"`
+	ModelSpecsMode        string                               `json:"model_specs_mode"`
 	Compatible            string                               `json:"compatible"`
 	Locality              string                               `json:"locality,omitempty"`
 	LocalitySource        string                               `json:"locality_source,omitempty"`
@@ -53,10 +58,12 @@ type LLMConfigUpdateRequest struct {
 
 // LLMProviderConfigUpdateItem 更新请求中的 Provider 项
 type LLMProviderConfigUpdateItem struct {
+	ProviderInstanceID    string                              `json:"provider_instance_id,omitempty"`
 	APIKey                string                              `json:"api_key"`
 	BaseURL               string                              `json:"base_url"`
 	Model                 string                              `json:"model"`
 	Models                []string                            `json:"models,omitempty"`
+	ModelSpecs            *[]config.LLMProviderModelSpec      `json:"model_specs"`
 	Compatible            string                              `json:"compatible"`
 	Locality              string                              `json:"locality,omitempty"`
 	LocalitySource        string                              `json:"locality_source,omitempty"`
@@ -99,6 +106,95 @@ type llmConfigRuntime interface {
 	ReloadLLMConfig(context.Context, config.LLMConfig) error
 }
 
+const semanticRuntimeDrainTimeout = 60 * time.Second
+
+func (s *Server) drainSemanticRuntime(ctx context.Context, next config.LLMConfig) error {
+	if s == nil {
+		return nil
+	}
+	drainCtx, cancel := context.WithTimeout(ctx, semanticRuntimeDrainTimeout)
+	defer cancel()
+	if s.reloadSemanticRuntime != nil {
+		return s.reloadSemanticRuntime(drainCtx, next)
+	}
+	if s.invalidateSemanticRuntime == nil {
+		return nil
+	}
+	return s.invalidateSemanticRuntime(drainCtx)
+}
+
+func (s *Server) restoreSemanticRuntime(previous config.LLMConfig) error {
+	if s == nil || s.reloadSemanticRuntime == nil {
+		return nil
+	}
+	// Compensation must not be cancelled when the client disconnects after the
+	// forward transition has already mutated a runtime. Give restoration its own
+	// bounded lifecycle so API, disk and both runtimes converge before return.
+	restoreCtx, cancel := context.WithTimeout(context.Background(), semanticRuntimeDrainTimeout)
+	defer cancel()
+	return s.reloadSemanticRuntime(restoreCtx, previous)
+}
+
+func (s *Server) rollbackCommittedLLMTransaction(
+	ctx context.Context,
+	rollbackCfg *config.Config,
+) error {
+	if s == nil || s.cfgTxMgr == nil || rollbackCfg == nil {
+		return errors.New("LLM transaction rollback is unavailable")
+	}
+	// The forward transaction may already have committed when the client drops
+	// its connection. Preserve request-scoped values (notably feature flags),
+	// but detach cancellation and give compensation its own finite lifecycle so
+	// disk and every runtime cannot be stranded on different configurations.
+	rollbackParent := context.Background()
+	if ctx != nil {
+		rollbackParent = context.WithoutCancel(ctx)
+	}
+	rollbackCtx, cancel := context.WithTimeout(rollbackParent, semanticRuntimeDrainTimeout)
+	defer cancel()
+
+	rollbackTx, err := s.cfgTxMgr.Begin(rollbackCtx)
+	if err != nil {
+		return fmt.Errorf("begin compensation: %w", err)
+	}
+	if err := rollbackTx.Stage(rollbackCtx, rollbackCfg); err != nil {
+		_ = rollbackTx.Rollback()
+		return fmt.Errorf("stage compensation: %w", err)
+	}
+	if err := config.Save(rollbackCfg, ""); err != nil {
+		_ = rollbackTx.Rollback()
+		return fmt.Errorf("persist compensation: %w", err)
+	}
+	if err := rollbackTx.Commit(rollbackCtx); err != nil {
+		return fmt.Errorf("commit compensation: %w", err)
+	}
+	return nil
+}
+
+func (s *Server) rollbackLegacyLLMTransition(
+	previousCfg *config.Config,
+	runtime llmConfigRuntime,
+) error {
+	if previousCfg == nil {
+		return errors.New("LLM rollback config is nil")
+	}
+	var rollbackErrors []error
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), semanticRuntimeDrainTimeout)
+	defer cancel()
+	if runtime != nil {
+		if err := runtime.ReloadLLMConfig(rollbackCtx, previousCfg.LLM); err != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("restore LLM runtime: %w", err))
+		}
+	}
+	if err := config.Save(previousCfg, ""); err != nil {
+		rollbackErrors = append(rollbackErrors, fmt.Errorf("restore config file: %w", err))
+	}
+	if err := s.restoreSemanticRuntime(previousCfg.LLM); err != nil {
+		rollbackErrors = append(rollbackErrors, fmt.Errorf("restore semantic runtime: %w", err))
+	}
+	return errors.Join(rollbackErrors...)
+}
+
 func effectiveLLMConfig(base config.LLMConfig, runtime llmConfigRuntime) config.LLMConfig {
 	if runtime == nil {
 		return base
@@ -123,9 +219,10 @@ var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvi
 	// 复用真实路由的类型感知工厂（ollama/anthropic 原生 / 其余 OpenAI 兼容），
 	// 消除「测试连接一律当 OpenAI 打」的协议漂移（契约#2）。
 	return llmrouter.NewProviderFromConfig(cfg.Type, config.LLMProviderConfig{
-		BaseURL: cfg.BaseURL,
-		APIKey:  cfg.APIKey,
-		Model:   cfg.Model,
+		BaseURL:              cfg.BaseURL,
+		APIKey:               cfg.APIKey,
+		Model:                cfg.Model,
+		PrivateNetworkAccess: cfg.PrivateNetworkAccess,
 	})
 }
 
@@ -140,11 +237,15 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 
 	providers := make(map[string]LLMProviderConfigResponse, len(llmCfg.Providers))
 	for name, p := range llmCfg.Providers {
+		modelSpecsMode, modelSpecs := config.NormalizeProviderModelSpecs(p)
 		providers[name] = LLMProviderConfigResponse{
+			ProviderInstanceID:    config.EffectiveProviderInstanceID(name, p),
 			APIKey:                config.MaskAPIKey(p.APIKey),
 			BaseURL:               p.BaseURL,
 			Model:                 p.Model,
 			Models:                p.Models,
+			ModelSpecs:            modelSpecs,
+			ModelSpecsMode:        modelSpecsMode,
 			Compatible:            p.Compatible,
 			Locality:              p.Locality,
 			LocalitySource:        p.LocalitySource,
@@ -220,18 +321,34 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 	if req.Providers != nil {
 		newProviders := make(map[string]config.LLMProviderConfig, len(req.Providers))
 		for name, p := range req.Providers {
+			old, oldExists := oldLLM.Providers[name]
 			apiKey := p.APIKey
 			// 脱敏值 → 保留原有 Key
 			if config.IsMaskedKey(apiKey) {
-				if old, ok := oldLLM.Providers[name]; ok {
-					apiKey = old.APIKey
+				if !oldExists {
+					writeJSON(w, http.StatusBadRequest, map[string]string{
+						"error": fmt.Sprintf("provider %q 的脱敏 API Key 没有可保留的旧配置", name),
+					})
+					return
 				}
+				apiKey = old.APIKey
 			}
-			newProviders[name] = config.LLMProviderConfig{
+			providerInstanceID, err := resolveProviderInstanceID(name, old, oldExists, p.ProviderInstanceID)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": fmt.Sprintf("provider %q 的 provider_instance_id 非法: %v", name, err),
+				})
+				return
+			}
+			modelSpecsMode, modelSpecs := resolveProviderModelSpecs(old, oldExists, p)
+			candidate := config.LLMProviderConfig{
+				ProviderInstanceID:    providerInstanceID,
 				APIKey:                apiKey,
 				BaseURL:               p.BaseURL,
 				Model:                 p.Model,
 				Models:                p.Models,
+				ModelSpecsMode:        modelSpecsMode,
+				ModelSpecs:            modelSpecs,
 				Compatible:            p.Compatible,
 				Locality:              p.Locality,
 				LocalitySource:        p.LocalitySource,
@@ -243,6 +360,17 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 				KeepAlive:             p.KeepAlive,
 				NumCtx:                p.NumCtx,
 			}
+			if err := config.ValidateProviderModelSpecs(candidate); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": fmt.Sprintf("provider %q 的模型能力配置非法: %v", name, err),
+				})
+				return
+			}
+			newProviders[name] = candidate
+		}
+		if err := validateUniqueProviderInstanceIDs(newProviders); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
 		}
 		nextLLM.Providers = newProviders
 	}
@@ -258,9 +386,18 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 	if req.Cache != nil {
 		nextLLM.Cache = *req.Cache
 	}
+	if defaultProvider, exists := nextLLM.Providers[nextLLM.Default]; exists {
+		if defaultProvider.Model == "" || !config.ModelHasCapability(defaultProvider, defaultProvider.Model, config.LLMModelCapabilityText) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("default provider %q 必须选择包含 text capability 的 model", nextLLM.Default),
+			})
+			return
+		}
+	}
 
 	nextCfg := *s.cfg
 	nextCfg.LLM = nextLLM
+	semanticProvidersChanged := !reflect.DeepEqual(oldLLM.Providers, nextLLM.Providers)
 
 	// v0.4.0 F9：当注入了 cfgTxMgr 且 flag config.tx.hotload.v1 ON 时，
 	// 走事务路径（Begin → Stage 校验 → Save → Commit/Rollback）。
@@ -296,6 +433,21 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 				})
 				return
 			}
+			if semanticProvidersChanged {
+				if drainErr := s.drainSemanticRuntime(r.Context(), nextLLM); drainErr != nil {
+					rollbackCfg := *s.cfg
+					rollbackCfg.LLM = oldLLM
+					configRollbackErr := s.rollbackCommittedLLMTransaction(r.Context(), &rollbackCfg)
+					semanticRollbackErr := s.restoreSemanticRuntime(oldLLM)
+					if rollbackErr := errors.Join(configRollbackErr, semanticRollbackErr); rollbackErr != nil {
+						logger.Error("语义运行时热更新失败且配置补偿不完整", "reload", drainErr, "rollback", rollbackErr)
+					}
+					writeJSON(w, http.StatusInternalServerError, map[string]string{
+						"error": "语义索引运行时热更新失败: " + drainErr.Error(),
+					})
+					return
+				}
+			}
 			s.cfg.LLM = nextLLM
 			if s.reloadGenServices != nil {
 				s.reloadGenServices()
@@ -317,7 +469,8 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if runtime, ok := s.engine.(llmConfigRuntime); ok {
+	runtime, hasRuntime := s.engine.(llmConfigRuntime)
+	if hasRuntime {
 		if err := runtime.ReloadLLMConfig(r.Context(), nextLLM); err != nil {
 			rollbackCfg := *s.cfg
 			rollbackCfg.LLM = oldLLM
@@ -331,6 +484,19 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if semanticProvidersChanged {
+		if drainErr := s.drainSemanticRuntime(r.Context(), nextLLM); drainErr != nil {
+			rollbackCfg := *s.cfg
+			rollbackCfg.LLM = oldLLM
+			if rollbackErr := s.rollbackLegacyLLMTransition(&rollbackCfg, runtime); rollbackErr != nil {
+				logger.Error("语义运行时热更新失败且旧配置补偿不完整", "reload", drainErr, "rollback", rollbackErr)
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "语义索引运行时热更新失败: " + drainErr.Error(),
+			})
+			return
+		}
+	}
 	s.cfg.LLM = nextLLM
 
 	// LLM 配置变更后，重建 image/video/voice 生成服务（用新 API Key 构建 Provider）
@@ -363,6 +529,16 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 	if providerType == "" || model == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "provider.type、provider.model 不能为空",
+		})
+		return
+	}
+	llmCfg := s.cfg.LLM
+	if runtime, ok := s.engine.(llmConfigRuntime); ok {
+		llmCfg = effectiveLLMConfig(llmCfg, runtime)
+	}
+	if isEmbeddingOnlyCompletionModel(llmCfg, providerType, baseURL, model) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "embedding-only 模型不能执行 completion 连接测试",
 		})
 		return
 	}
@@ -444,6 +620,11 @@ func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	providerClient, err := egress.NewProviderHTTPClient(baseURL, req.PrivateNetworkAccess)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}, "error": err.Error()})
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
@@ -458,7 +639,7 @@ func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Reques
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := providerClient.Do(httpReq)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}, "error": err.Error()})
 		return

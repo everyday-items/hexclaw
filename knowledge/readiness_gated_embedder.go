@@ -118,11 +118,26 @@ func (e *ReadinessGatedEmbedder) Ready(ctx context.Context) bool {
 	return ready
 }
 
-func (e *ReadinessGatedEmbedder) markUnavailable() {
+// ObserveReady synchronizes an out-of-band control-plane probe with the data
+// gate. Semantic profile Apply probes use this to ensure a freshly observed
+// outage suppresses active search/worker cache misses for the same TTL instead
+// of allowing one uncontrolled request per caller.
+func (e *ReadinessGatedEmbedder) ObserveReady(ready bool) {
+	if e == nil {
+		return
+	}
 	e.mu.Lock()
-	e.ready = false
-	e.nextProbe = time.Now().Add(e.retryInterval)
+	e.ready = ready
+	if ready {
+		e.nextProbe = time.Time{}
+	} else {
+		e.nextProbe = time.Now().Add(e.retryInterval)
+	}
 	e.mu.Unlock()
+}
+
+func (e *ReadinessGatedEmbedder) markUnavailable() {
+	e.ObserveReady(false)
 }
 
 func (e *ReadinessGatedEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {

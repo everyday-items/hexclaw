@@ -6,10 +6,10 @@ import (
 	"time"
 )
 
-// TestMigration_DropsLegacyJobsAndLogsWarn 验证 Sprint 1.2 migration：
+// TestMigration_QuarantinesLegacyJobsAndLogsWarn 验证无损 migration：
 //   - 旧库（含 prompt 列，无 spec_json）启动时被自动加上新列
-//   - 无 spec_json 的旧 row 被 DELETE（不自动编译，提示用户重建）
-func TestMigration_DropsLegacyJobsAndLogsWarn(t *testing.T) {
+//   - 无 spec_json 的旧 row 保留并暂停（不自动编译，提示用户重建）
+func TestMigration_QuarantinesLegacyJobsAndLogsWarn(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
 	ctx := context.Background()
@@ -45,19 +45,26 @@ func TestMigration_DropsLegacyJobsAndLogsWarn(t *testing.T) {
 
 	// Scheduler.Init 应：
 	//   1. ALTER TABLE 加 spec_json / source_prompt 列（旧库兼容）
-	//   2. detectAndCleanupLegacyJobs DELETE 2 条旧任务
+	//   2. detectAndCleanupLegacyJobs 暂停 2 条旧任务且保留审计证据
 	s := newTestScheduler(t, db)
 	if err := s.Init(ctx); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 
-	// 验证旧 row 已被清理
+	// 验证旧 row 被保留并暂停，不进入活跃内存调度表。
 	var count int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cron_jobs`).Scan(&count); err != nil {
 		t.Fatalf("COUNT: %v", err)
 	}
-	if count != 0 {
-		t.Errorf("Init 后应清理 v1 旧任务，剩 %d 行", count)
+	if count != 2 {
+		t.Errorf("Init 后应保留 2 条 v1 旧任务，实际 %d 行", count)
+	}
+	var paused int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cron_jobs WHERE status='paused'`).Scan(&paused); err != nil {
+		t.Fatal(err)
+	}
+	if paused != 2 {
+		t.Errorf("v1 旧任务暂停数=%d，期望 2", paused)
 	}
 	if len(s.jobs) != 0 {
 		t.Errorf("内存 jobs map 应为空，实际 %d", len(s.jobs))
@@ -79,8 +86,11 @@ func TestMigration_DropsLegacyJobsAndLogsWarn(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cron_jobs`).Scan(&count); err != nil {
 		t.Fatalf("COUNT2: %v", err)
 	}
-	if count != 1 {
-		t.Errorf("v2 任务应保留，实际剩 %d 行", count)
+	if count != 3 {
+		t.Errorf("2 条隔离旧任务 + 1 条 v2 任务应全部保留，实际 %d 行", count)
+	}
+	if len(s2.jobs) != 1 || s2.jobs["new-1"] == nil {
+		t.Errorf("仅 v2 活跃任务应加载，内存 jobs=%v", s2.jobs)
 	}
 }
 

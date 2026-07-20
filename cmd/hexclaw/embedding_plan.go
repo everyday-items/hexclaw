@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"sort"
 	"strings"
 
+	"github.com/hexagon-codes/hexclaw/api"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/knowledge"
 )
@@ -19,11 +21,125 @@ type knowledgeEmbeddingPlan struct {
 	ServiceAvailable bool
 }
 
+const defaultKnowledgeOllamaEmbeddingBaseURL = "http://localhost:11434/v1"
+const knowledgeOllamaEmbeddingDummyAPIKey = "ollama"
+
+// knowledgeEmbeddingEffectiveBaseURL keeps discovery, provider construction,
+// readiness probes and native model management on the same endpoint. The
+// endpoint-less legacy Ollama entry means the built-in localhost service; an
+// endpoint-less official OpenAI provider keeps the SDK's OpenAI default.
+func knowledgeEmbeddingEffectiveBaseURL(
+	plan knowledgeEmbeddingPlan,
+	provider config.LLMProviderConfig,
+) string {
+	baseURL := strings.TrimSpace(provider.BaseURL)
+	if plan.Ollama {
+		if baseURL == "" {
+			return defaultKnowledgeOllamaEmbeddingBaseURL
+		}
+		baseURL = strings.TrimRight(baseURL, "/")
+		if !strings.HasSuffix(baseURL, "/v1") {
+			baseURL += "/v1"
+		}
+	}
+	return baseURL
+}
+
+func knowledgeEmbeddingProviderAPIKey(
+	plan knowledgeEmbeddingPlan,
+	provider config.LLMProviderConfig,
+) string {
+	if plan.Ollama {
+		return knowledgeOllamaEmbeddingDummyAPIKey
+	}
+	return provider.APIKey
+}
+
+func validateKnowledgeEmbeddingEndpoint(
+	plan knowledgeEmbeddingPlan,
+	provider config.LLMProviderConfig,
+) error {
+	if strings.TrimSpace(provider.BaseURL) != "" || plan.Ollama {
+		return nil
+	}
+	// An empty URL is meaningful only for the canonical OpenAI provider. A
+	// custom OpenAI-compatible or explicitly local provider without an endpoint
+	// must never silently inherit api.openai.com and exfiltrate its input.
+	providerID := strings.ToLower(strings.TrimSpace(plan.Provider))
+	compatible := strings.ToLower(strings.TrimSpace(provider.Compatible))
+	locality := strings.ToLower(strings.TrimSpace(provider.Locality))
+	if providerID == "openai" && locality != config.ProviderLocalityLocal &&
+		(compatible == "" || compatible == "openai") {
+		return nil
+	}
+	return fmt.Errorf("knowledge: provider %q requires an explicit embedding base URL", plan.Provider)
+}
+
+// knowledgeEmbeddingDimension is part of the immutable vector-space contract.
+// ai-core's OpenAI compatibility helper intentionally defaults unknown models
+// to 1536, which is unsafe for common Ollama embedding models whose native
+// dimensions differ. Keep the explicitly supported catalog models exact and
+// require every other model to obtain an explicit or trusted exact dimension.
+func knowledgeEmbeddingDimension(model string) int {
+	name := strings.ToLower(strings.TrimSpace(model))
+	switch name {
+	case "text-embedding-3-small":
+		return 1536
+	case "text-embedding-3-large":
+		return 3072
+	case "nvidia/nemotron-3-embed-1b",
+		"nvidia/nemotron-3-embed-1b:free",
+		"nvidia/llama-nemotron-embed-vl-1b-v2",
+		"nvidia/llama-nemotron-embed-vl-1b-v2:free":
+		return 2048
+	case "nomic-embed-text", "nomic-embed-text:latest", "nomic-embed-text:v1.5":
+		return 768
+	case "mxbai-embed-large", "mxbai-embed-large:latest",
+		"baai/bge-m3", "baai/bge-m3:latest", "bge-m3", "bge-m3:latest":
+		return 1024
+	case "all-minilm", "all-minilm:latest", "all-minilm:l6-v2", "all-minilm:l12-v2":
+		return 384
+	default:
+		return 0
+	}
+}
+
+func knowledgeEmbeddingDimensionForProvider(provider config.LLMProviderConfig, model string) int {
+	_, specs := config.NormalizeProviderModelSpecs(provider)
+	for _, spec := range specs {
+		if spec.ID != model || !knowledgeEmbeddingSpecHasCapability(spec, config.LLMModelCapabilityEmbedding) {
+			continue
+		}
+		if spec.Embedding != nil && spec.Embedding.Dimension > 0 {
+			return spec.Embedding.Dimension
+		}
+		break
+	}
+	return knowledgeEmbeddingDimension(model)
+}
+
 func isOllamaEmbeddingCandidate(name string, provider config.LLMProviderConfig) bool {
-	if strings.Contains(strings.ToLower(strings.TrimSpace(name)), "ollama") {
+	// Native Ollama management is a local-only capability. Provider names are
+	// merely legacy hints and must never override the authoritative locality /
+	// endpoint classification (for example, "Ollama Cloud" on a public host).
+	if !config.IsLocalLLMProviderNamed(name, provider) {
+		return false
+	}
+	nameIsOllama := strings.Contains(strings.ToLower(strings.TrimSpace(name)), "ollama")
+	baseURL := strings.TrimSpace(provider.BaseURL)
+	// An endpoint-less legacy Ollama provider intentionally means the built-in
+	// localhost:11434 default. Every configured endpoint must pass exactly the
+	// same loopback/path policy as the side-effecting management API.
+	if baseURL == "" {
+		return nameIsOllama
+	}
+	if api.ValidateNativeOllamaBaseURL(baseURL) != nil {
+		return false
+	}
+	if nameIsOllama {
 		return true
 	}
-	u, err := url.Parse(strings.TrimSpace(provider.BaseURL))
+	u, err := url.Parse(baseURL)
 	if err != nil {
 		return false
 	}
@@ -66,14 +182,16 @@ func resolveKnowledgeEmbeddingPlan(ctx context.Context, cfg *config.Config) know
 		}
 		// Cloud/custom embedding is an explicit paid capability. A provider name
 		// alone is insufficient evidence that text-embedding-3-small exists.
-		configured := requestedModel != "" && provider.APIKey != ""
-		return knowledgeEmbeddingPlan{
-			Provider:         requestedProvider,
-			Model:            requestedModel,
-			Configured:       configured,
-			Ready:            configured,
-			ServiceAvailable: configured,
+		plan := knowledgeEmbeddingPlan{
+			Provider: requestedProvider,
+			Model:    requestedModel,
 		}
+		configured := requestedModel != "" && provider.APIKey != "" &&
+			validateKnowledgeEmbeddingEndpoint(plan, provider) == nil
+		plan.Configured = configured
+		plan.Ready = configured
+		plan.ServiceAvailable = configured
+		return plan
 	}
 
 	names := make([]string, 0, len(cfg.LLM.Providers))

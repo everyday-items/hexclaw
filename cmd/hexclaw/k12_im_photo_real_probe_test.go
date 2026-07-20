@@ -52,7 +52,7 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	}
 	raw, err := os.ReadFile(imagePath)
 	if err != nil {
-		t.Fatalf("read probe image: %v", err)
+		t.Fatalf("read probe image: error_type=%T", err)
 	}
 	if mime := http.DetectContentType(raw); !strings.HasPrefix(strings.ToLower(mime), "image/") {
 		t.Fatalf("probe input is not an image: mime=%q", mime)
@@ -60,42 +60,42 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 
 	cfg, err := config.Load("")
 	if err != nil {
-		t.Fatalf("load local HexClaw config: %v", err)
+		t.Fatalf("load local HexClaw config: error_type=%T", err)
 	}
 	applyK12PhotoProbeProviderOverride(t, cfg)
 	cfg.Compaction.Enabled = false
 	cfg.LLM.Tools.Enabled = "on"
 	realRouter, err := llmrouter.New(cfg.LLM)
 	if err != nil {
-		t.Fatalf("build real provider router: %v", err)
+		t.Fatalf("build real provider router: error_type=%T", err)
 	}
 
 	ctx := context.Background()
 	store, err := sqlitestore.New(filepath.Join(t.TempDir(), "k12-photo-probe.db"))
 	if err != nil {
-		t.Fatalf("create isolated store: %v", err)
+		t.Fatalf("create isolated store: error_type=%T", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	if err := store.Init(ctx); err != nil {
-		t.Fatalf("init isolated store: %v", err)
+		t.Fatalf("init isolated store: error_type=%T", err)
 	}
 	if _, err := store.DB().ExecContext(ctx, `INSERT OR IGNORE INTO agents(name) VALUES('child-tutor')`); err != nil {
-		t.Fatalf("seed probe agent: %v", err)
+		t.Fatalf("seed probe agent: error_type=%T", err)
 	}
 
 	skills := skill.NewRegistry()
 	sandboxCfg := sandbox.Config{Workspace: t.TempDir(), Timeout: 30}
 	sb, err := sandbox.New(sandboxCfg)
 	if err != nil {
-		t.Fatalf("create code sandbox: %v", err)
+		t.Fatalf("create code sandbox: error_type=%T", err)
 	}
 	if err := skills.Register(builtin.NewCodeExecSkill(sb, sandboxCfg)); err != nil {
-		t.Fatalf("register code_exec: %v", err)
+		t.Fatalf("register code_exec: error_type=%T", err)
 	}
 
 	react := engine.NewReActEngine(cfg, realRouter, store, skills)
 	if err := react.Start(ctx); err != nil {
-		t.Fatalf("start real ReAct engine: %v", err)
+		t.Fatalf("start real ReAct engine: error_type=%T", err)
 	}
 	t.Cleanup(func() { _ = react.Stop(context.Background()) })
 	react.SetToolCollector(engine.NewToolCollector(skills, nil, 40))
@@ -141,7 +141,8 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 			}},
 		})
 		if completeErr != nil {
-			return "", completeErr
+			t.Logf("vision provider error_type=%T", completeErr)
+			return "", fmt.Errorf("photo probe provider completion failed: %T", completeErr)
 		}
 		return resp.Content, nil
 	}
@@ -155,7 +156,7 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 		assembly.WithPhotoAnnotator(k12engineadapter.NewPhotoAnnotator()),
 	)
 	if err != nil {
-		t.Fatalf("wire K12 runtime: %v", err)
+		t.Fatalf("wire K12 runtime: error_type=%T", err)
 	}
 
 	var result k12usecase.PhotoGradeResult
@@ -171,10 +172,10 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	started := time.Now()
 	reply, handled, err := maybeHandleK12DingtalkPhoto(t.Context(), msg, k12PhotoTestRouter(t, true, "k12-tutor"), process)
 	if err != nil {
-		t.Fatalf("direct K12 photo route: %v", err)
+		t.Fatalf("direct K12 photo route failed: error_type=%T", err)
 	}
 	if !handled || reply == nil {
-		t.Fatalf("direct K12 photo route not handled: handled=%v reply=%#v", handled, reply)
+		t.Fatalf("direct K12 photo route not handled: handled=%v reply_present=%v", handled, reply != nil)
 	}
 
 	statusCounts := map[k12usecase.PhotoItemStatus]int{}
@@ -184,10 +185,11 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 		if item.Status == k12usecase.PhotoCorrect || item.Status == k12usecase.PhotoWrong {
 			verifiedVerdicts++
 		}
-		t.Logf("item[%d] status=%s bbox=%+v knowledge_points=%v out_of_scope_kp=%q verdict=%s evidence=%s answer=%q question=%q",
-			i+1, item.Status, item.Recognized.BBox, item.Recognized.KnowledgePoints, item.Grade.OutOfScopeKP, item.Grade.Evidence.Verdict,
-			item.Grade.Evidence.EvidenceType, clipPhotoProbe(item.Recognized.StudentAnswer, 40),
-			clipPhotoProbe(item.Recognized.Question, 80))
+		t.Logf("item[%d] status=%s bbox=%t knowledge_points=%d out_of_scope=%t verdict=%s evidence=%s answer_chars=%d question_chars=%d warning_chars=%d",
+			i+1, item.Status, item.Recognized.BBox != nil, len(item.Recognized.KnowledgePoints),
+			strings.TrimSpace(item.Grade.OutOfScopeKP) != "", item.Grade.Evidence.Verdict,
+			item.Grade.Evidence.EvidenceType, len([]rune(item.Recognized.StudentAnswer)),
+			len([]rune(item.Recognized.Question)), len([]rune(item.Warning)))
 	}
 	t.Logf("result: elapsed=%s mode=%s items=%d statuses=%v markdown_chars=%d annotated=%v attachments=%d",
 		time.Since(started).Round(time.Millisecond), result.Mode, len(result.Items), statusCounts,
@@ -198,14 +200,14 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	}
 	if markdownOutput := strings.TrimSpace(os.Getenv("HEXCLAW_K12_PHOTO_MARKDOWN_OUTPUT")); markdownOutput != "" {
 		if err := writeK12PhotoProbeMarkdown(markdownOutput, reply.Content); err != nil {
-			t.Fatalf("write probe Markdown: %v", err)
+			t.Fatalf("write probe Markdown: error_type=%T", err)
 		}
-		t.Logf("MARKDOWN_PRODUCED: chars=%d output=%s", len([]rune(reply.Content)), markdownOutput)
+		t.Logf("MARKDOWN_PRODUCED: chars=%d", len([]rune(reply.Content)))
 	}
 
 	if result.AnnotatedImage == nil {
 		if len(reply.Attachments) != 0 {
-			t.Fatalf("reply has attachment without annotated image: %#v", reply.Attachments)
+			t.Fatalf("reply has %d attachment(s) without annotated image", len(reply.Attachments))
 		}
 		if result.Mode == k12usecase.PhotoModeGrade && verifiedVerdicts > 0 {
 			t.Fatalf("answered sheet has %d verified verdicts but no correction-image attachment", verifiedVerdicts)
@@ -233,11 +235,10 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 		output = filepath.Join(os.TempDir(), "hexclaw-k12-direct-reply"+ext)
 	}
 	if err := os.WriteFile(output, decoded, 0o600); err != nil {
-		t.Fatalf("write probe output: %v", err)
+		t.Fatalf("write probe output: error_type=%T", err)
 	}
 	sum := sha256.Sum256(decoded)
-	t.Logf("ATTACHMENT_PRODUCED: name=%q mime=%q bytes=%d sha256=%x output=%s",
-		att.Name, att.Mime, len(decoded), sum[:8], output)
+	t.Logf("ATTACHMENT_PRODUCED: mime=%q bytes=%d sha256=%x", att.Mime, len(decoded), sum[:8])
 }
 
 func assertKnownAnsweredWorksheetSemantics(t *testing.T, result k12usecase.PhotoGradeResult) {
@@ -268,26 +269,28 @@ func assertKnownAnsweredWorksheetSemantics(t *testing.T, result k12usecase.Photo
 			result.Mode, len(result.Items), len(expected))
 	}
 	itemsByQuestion := make(map[string]k12usecase.PhotoGradeItem, len(result.Items))
-	for _, item := range result.Items {
+	for itemIndex, item := range result.Items {
 		key := canonicalK12PhotoProbeText(item.Recognized.Question)
 		if _, duplicate := itemsByQuestion[key]; duplicate {
-			t.Fatalf("known answered worksheet has duplicate question key %q", key)
+			t.Fatalf("known answered worksheet has duplicate question at item=%d", itemIndex+1)
 		}
 		itemsByQuestion[key] = item
 	}
 	statusCounts := map[k12usecase.PhotoItemStatus]int{}
-	for _, want := range expected {
+	for expectedIndex, want := range expected {
 		key := canonicalK12PhotoProbeText(want.question)
 		item, ok := itemsByQuestion[key]
 		if !ok {
-			t.Fatalf("known answered worksheet lost/corrupted question %q: %#v", want.question, result.Items)
+			t.Fatalf("known answered worksheet lost/corrupted question index=%d: items=%d",
+				expectedIndex+1, len(result.Items))
 		}
 		if item.Status != want.status {
-			t.Fatalf("question %q status=%s want=%s answer=%q warning=%q",
-				want.question, item.Status, want.status, item.Recognized.StudentAnswer, item.Warning)
+			t.Fatalf("question index=%d status=%s want=%s answer_chars=%d warning_chars=%d",
+				expectedIndex+1, item.Status, want.status, len([]rune(item.Recognized.StudentAnswer)),
+				len([]rune(item.Warning)))
 		}
 		if want.status != k12usecase.PhotoUnanswered && item.Recognized.BBox == nil {
-			t.Fatalf("answered question %q has no verified image anchor", want.question)
+			t.Fatalf("answered question index=%d has no verified image anchor", expectedIndex+1)
 		}
 		statusCounts[item.Status]++
 	}
@@ -298,11 +301,11 @@ func assertKnownAnsweredWorksheetSemantics(t *testing.T, result k12usecase.Photo
 	}
 	firstFraction := itemsByQuestion[canonicalK12PhotoProbeText("5/7−1/5=")].Recognized.StudentAnswer
 	if canonicalK12PhotoProbeText(firstFraction) != canonicalK12PhotoProbeText("18/35") {
-		t.Fatalf("first fraction transcription=%q want actual handwriting 18/35", firstFraction)
+		t.Fatalf("first fraction transcription mismatch: answer_chars=%d", len([]rune(firstFraction)))
 	}
 	decimalAnswer := itemsByQuestion[canonicalK12PhotoProbeText("10×0.01=")].Recognized.StudentAnswer
 	if canonicalK12PhotoProbeText(decimalAnswer) != canonicalK12PhotoProbeText("0.1") {
-		t.Fatalf("writer-specific 0/6 transcription=%q want actual handwriting 0.1", decimalAnswer)
+		t.Fatalf("writer-specific 0/6 transcription mismatch: answer_chars=%d", len([]rune(decimalAnswer)))
 	}
 	divisionAnswer := canonicalK12PhotoProbeText(
 		itemsByQuestion[canonicalK12PhotoProbeText("一个数的3/8是24，求这个数？")].Recognized.StudentAnswer,
@@ -310,7 +313,8 @@ func assertKnownAnsweredWorksheetSemantics(t *testing.T, result k12usecase.Photo
 	if (divisionAnswer != canonicalK12PhotoProbeText("64") &&
 		!strings.Contains(divisionAnswer, canonicalK12PhotoProbeText("24÷3×8=64"))) ||
 		strings.Contains(divisionAnswer, canonicalK12PhotoProbeText("3/8×8")) {
-		t.Fatalf("printed fraction leaked into isolated handwriting transcription: %q", divisionAnswer)
+		t.Fatalf("printed fraction leaked into isolated handwriting transcription: answer_chars=%d",
+			len([]rune(divisionAnswer)))
 	}
 	if result.AnnotatedImage == nil {
 		t.Fatal("known answered worksheet has verified verdicts but no annotated image")
@@ -338,14 +342,6 @@ func canonicalK12PhotoProbeText(value string) string {
 		"＝", "=", "？", "", "?", "", "，", ",", "；", ";",
 	).Replace(value)
 	return strings.TrimSuffix(strings.ToLower(value), "=")
-}
-
-func clipPhotoProbe(s string, n int) string {
-	r := []rune(strings.TrimSpace(s))
-	if len(r) <= n {
-		return string(r)
-	}
-	return fmt.Sprintf("%s…", string(r[:n]))
 }
 
 func applyK12PhotoProbeProviderOverride(t *testing.T, cfg *config.Config) {

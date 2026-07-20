@@ -10,10 +10,10 @@ import (
 
 // addColumnExpectDuplicate 跑 ALTER TABLE ADD COLUMN，对"列已存在"这一预期错误
 // 静默忽略；其他错误（语法 / 权限 / IO）必须打 warn 日志，避免在生产环境 schema
-// 漂移而被静默吞掉（参考本次表重建迁移 30 分钟漏掉 DROP COLUMN 失败的教训）。
+// 漂移而被静默吞掉。
 //
-// 不是 panic — migration 失败让 Init() 继续是可接受的（detectAndCleanupLegacyJobs
-// 会再尝试 rebuild），但必须留下可观测信号。
+// 这里先记录，随后 RepairCronIntegrityV29 会在固定连接事务内重新探测并 fail closed；
+// Init 不会在 schema 未收敛时继续加载任务。
 func addColumnExpectDuplicate(ctx context.Context, db *sql.DB, table, sqlStmt string) {
 	if _, err := db.ExecContext(ctx, sqlStmt); err != nil {
 		if isDuplicateColumnErr(err) {

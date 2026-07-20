@@ -3,9 +3,13 @@ package knowledge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+
+	"github.com/hexagon-codes/hexclaw/egress"
 )
 
 // BUG-20260712-B1（嵌入模型开箱保证 · 自动发现）：真机取证——auto-config 选定
@@ -76,7 +80,8 @@ func TestBug20260712_IsEmbeddingModelName(t *testing.T) {
 	}
 }
 
-// OllamaModelInstalled：embedding-status 端点用它做 ready 判定（按冒号前基名匹配）。
+// OllamaModelInstalled：embedding-status 端点用它做 ready 判定。显式 tag 必须
+// 精确匹配；未配置 tag 时只接受裸名或 :latest，不能误认任意版本。
 func TestBug20260712_OllamaModelInstalled(t *testing.T) {
 	ctx := context.Background()
 	srv := fakeOllama(t, "nomic-embed-text:latest", "qwen3.5:9b")
@@ -85,6 +90,22 @@ func TestBug20260712_OllamaModelInstalled(t *testing.T) {
 	}
 	if OllamaModelInstalled(ctx, srv.URL, "bge-m3") {
 		t.Fatal("未装模型不得判 ready")
+	}
+
+	versionedOnly := fakeOllama(t, "nomic-embed-text:v1.5")
+	if OllamaModelInstalled(ctx, versionedOnly.URL, "nomic-embed-text") {
+		t.Fatal("未配置 tag 不得把显式 v1.5 误认为 bare/:latest")
+	}
+	if !OllamaModelInstalled(ctx, versionedOnly.URL, "nomic-embed-text:v1.5") {
+		t.Fatal("显式 v1.5 应精确命中同版本")
+	}
+	if OllamaModelInstalled(ctx, versionedOnly.URL, "nomic-embed-text:v1.6") {
+		t.Fatal("显式 v1.6 不得命中已安装 v1.5")
+	}
+
+	bareOnly := fakeOllama(t, "nomic-embed-text")
+	if OllamaModelInstalled(ctx, bareOnly.URL, "nomic-embed-text:latest") {
+		t.Fatal("显式 :latest 必须精确匹配，不得命中裸名")
 	}
 }
 
@@ -155,5 +176,48 @@ func TestPullOllamaModel_RejectsMissingModelBeforeNetwork(t *testing.T) {
 	}
 	if called {
 		t.Fatal("empty model must be rejected before calling Ollama")
+	}
+}
+
+func TestOllamaEmbeddingDiscoveryRejectsCrossOriginRedirectBeforeReadinessSpoof(t *testing.T) {
+	var redirectedRequests atomic.Int64
+	redirected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirectedRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"models":[{"name":"nomic-embed-text:latest"}]}`))
+	}))
+	t.Cleanup(redirected.Close)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirected.URL+"/api/tags", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(origin.Close)
+
+	model, available := InspectOllamaEmbedding(context.Background(), origin.URL)
+	if available || model != "" {
+		t.Fatalf("redirected readiness model=%q available=%t, want fail-closed", model, available)
+	}
+	if redirectedRequests.Load() != 0 {
+		t.Fatalf("readiness redirect reached foreign origin %d times", redirectedRequests.Load())
+	}
+}
+
+func TestPullOllamaModelRejects307BeforeReplayingModelBodyCrossOrigin(t *testing.T) {
+	var redirectedRequests atomic.Int64
+	redirected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirectedRequests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(redirected.Close)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirected.URL+"/exfiltrate", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(origin.Close)
+
+	err := PullOllamaModel(context.Background(), origin.URL, "private-model-name")
+	if !errors.Is(err, egress.ErrProviderEndpointPolicy) {
+		t.Fatalf("cross-origin pull redirect error = %v, want endpoint policy rejection", err)
+	}
+	if redirectedRequests.Load() != 0 {
+		t.Fatalf("pull redirect replay reached foreign origin %d times", redirectedRequests.Load())
 	}
 }

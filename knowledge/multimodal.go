@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/hexagon-codes/hexclaw/resourcegov"
 )
 
 // 多模态图像摄取（best practice，provider-agnostic）。
@@ -64,6 +66,17 @@ func (m *Manager) CaptionImage(ctx context.Context, image []byte, mime string) (
 	}
 	if m == nil || m.captioner == nil {
 		return "", fmt.Errorf("图片入库需要先配置具备视觉能力的模型（视觉模型 / VLM），当前未配置；请在设置中为知识库配置视觉模型后重试")
+	}
+	permit, err := m.acquireResource(
+		ctx,
+		resourcegov.ResourceVLM,
+		resourcegov.PriorityFromContext(ctx, resourcegov.PriorityInteractive),
+	)
+	if err != nil {
+		return "", err
+	}
+	if permit != nil {
+		defer permit.Release()
 	}
 	caption, err := m.captioner.Caption(ragEnrichContext(ctx), image, mime)
 	if err != nil {

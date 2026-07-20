@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 	"testing"
@@ -13,7 +14,7 @@ import (
 // 修复前（v0.3.12 之前）kb_documents 和 cron_jobs 无业务唯一键保护；
 // kb_documents: 同一教材重上传 → 记录重复 → 知识检索返回重复命中 + DB 体积累加
 // cron_jobs: 同用户同名任务重复声明 → 定时触发 2 次 → 误触发+成本翻倍
-// 修复后：Version 2 migration 加 UNIQUE + 对历史重复保留最新一条。
+// 修复后：v2 不再直接删除 parent；v4/v5 在兼容 schema 下无损隔离或归并后加 UNIQUE。
 func TestH8_UniqueAudit_Fix_v0_3_12(t *testing.T) {
 	t.Run("before_fix_behavior_kb_documents_allow_dupes", func(t *testing.T) {
 		db := openMigrated(t, 1) // 只跑 v1，未应用 v2
@@ -34,7 +35,7 @@ func TestH8_UniqueAudit_Fix_v0_3_12(t *testing.T) {
 		t.Logf("修复前：同 source+title 重复上传产生 %d 条记录", count)
 	})
 
-	t.Run("after_fix_kb_documents_migration_dedupes_and_blocks", func(t *testing.T) {
+	t.Run("after_fix_kb_documents_migration_isolates_and_blocks", func(t *testing.T) {
 		db := openMigrated(t, 1)
 		defer db.Close()
 
@@ -46,21 +47,23 @@ func TestH8_UniqueAudit_Fix_v0_3_12(t *testing.T) {
 				now.Add(time.Duration(i)*time.Second), now.Add(time.Duration(i)*time.Second))
 		}
 
-		// 跑 v2 migration
-		runMigration(t, db, 2)
+		// v2 只占位；v4 在兼容 schema 下隔离重复并建唯一索引。
+		runMigration(t, db, 4)
 
-		// 应只保留 1 条（MIN(rowid) = d1，最早插入的那条；deterministic 无时间戳碰撞风险）
+		// 三条 parent 全保留；最早的 d1 占原业务键，其余使用可恢复的稳定隔离 source。
 		var count int
-		db.QueryRow("SELECT COUNT(*) FROM kb_documents WHERE source='math.pdf'").Scan(&count)
-		if count != 1 {
-			t.Errorf("期望 dedupe 后保留 1 条，实际 %d", count)
+		db.QueryRow("SELECT COUNT(*) FROM kb_documents WHERE title='数学书'").Scan(&count)
+		if count != 3 {
+			t.Errorf("期望隔离后保留 3 条，实际 %d", count)
 		}
-		var keptID string
-		db.QueryRow("SELECT id FROM kb_documents WHERE source='math.pdf'").Scan(&keptID)
-		if keptID != "d1" {
-			t.Errorf("应保留 MIN(rowid) 的 d1，实际保留 %q", keptID)
+		var original, isolated int
+		db.QueryRow(`SELECT
+			SUM(CASE WHEN source='math.pdf' AND id='d1' THEN 1 ELSE 0 END),
+			SUM(CASE WHEN source IN ('math.pdf · 隔离 · d2','math.pdf · 隔离 · d3') THEN 1 ELSE 0 END)
+			FROM kb_documents WHERE title='数学书'`).Scan(&original, &isolated)
+		if original != 1 || isolated != 2 {
+			t.Errorf("确定性原键/隔离行=%d/%d，期望 1/2", original, isolated)
 		}
-		t.Logf("修复后：dedupe 3 条 → 保留最早（d1，rowid 最小）✓")
 
 		// 再插入相同 source+title 应被唯一索引拒绝
 		_, err := db.Exec(`INSERT INTO kb_documents (id, title, content, source, source_type, created_at, updated_at)
@@ -72,7 +75,7 @@ func TestH8_UniqueAudit_Fix_v0_3_12(t *testing.T) {
 
 	t.Run("after_fix_kb_documents_empty_source_not_constrained", func(t *testing.T) {
 		// 手动输入（source 为空）不受唯一性约束，允许多条同标题
-		db := openMigrated(t, 2)
+		db := openMigrated(t, 4)
 		defer db.Close()
 
 		now := time.Now()
@@ -102,7 +105,7 @@ func TestH8_UniqueAudit_Fix_v0_3_12(t *testing.T) {
 		}
 	})
 
-	t.Run("after_fix_cron_jobs_migration_dedupes_and_blocks", func(t *testing.T) {
+	t.Run("after_fix_cron_jobs_migration_merges_and_blocks", func(t *testing.T) {
 		db := openMigrated(t, 1)
 		defer db.Close()
 
@@ -114,7 +117,7 @@ func TestH8_UniqueAudit_Fix_v0_3_12(t *testing.T) {
 				now.Add(time.Duration(i)*time.Second), now.Add(time.Duration(i)*time.Second))
 		}
 
-		runMigration(t, db, 2)
+		runMigration(t, db, 5)
 
 		var count int
 		db.QueryRow("SELECT COUNT(*) FROM cron_jobs WHERE user_id='u1' AND name='每周错题卷'").Scan(&count)
@@ -125,12 +128,13 @@ func TestH8_UniqueAudit_Fix_v0_3_12(t *testing.T) {
 		var keptID string
 		db.QueryRow("SELECT id FROM cron_jobs WHERE user_id='u1'").Scan(&keptID)
 		if keptID != "j1" {
-			t.Errorf("应保留 MIN(rowid) 的 j1，实际 %q", keptID)
+			t.Errorf("应保留 created_at/id 最早的 j1，实际 %q", keptID)
 		}
 
 		// 再插入同 user_id+name 应被唯一索引拒绝
-		_, err := db.Exec(`INSERT INTO cron_jobs (id, name, schedule, prompt, user_id, next_run_at, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)`, "j4", "每周错题卷", "0 19 * * 5", "p", "u1", now, now)
+		_, err := db.Exec(`INSERT INTO cron_jobs
+			(id,name,schedule,spec_json,source_prompt,user_id,next_run_at,created_at)
+			VALUES (?, ?, ?, '{}', ?, ?, ?, ?)`, "j4", "每周错题卷", "0 19 * * 5", "p", "u1", now, now)
 		if err == nil {
 			t.Error("应被 UNIQUE 拦截")
 		}
@@ -138,12 +142,13 @@ func TestH8_UniqueAudit_Fix_v0_3_12(t *testing.T) {
 
 	t.Run("after_fix_cron_jobs_different_users_ok", func(t *testing.T) {
 		// 不同用户可以有同名任务
-		db := openMigrated(t, 2)
+		db := openMigrated(t, 5)
 		defer db.Close()
 		now := time.Now()
 		for _, user := range []string{"alice", "bob"} {
-			_, err := db.Exec(`INSERT INTO cron_jobs (id, name, schedule, prompt, user_id, next_run_at, created_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			_, err := db.Exec(`INSERT INTO cron_jobs
+				(id,name,schedule,spec_json,source_prompt,user_id,next_run_at,created_at)
+				VALUES (?, ?, ?, '{}', ?, ?, ?, ?)`,
 				user+"-j1", "每周错题卷", "0 19 * * 5", "prompt", user, now, now)
 			if err != nil {
 				t.Errorf("不同用户同名不应冲突：%v", err)
@@ -153,7 +158,7 @@ func TestH8_UniqueAudit_Fix_v0_3_12(t *testing.T) {
 
 	t.Run("after_fix_handles_identical_created_at_timestamps", func(t *testing.T) {
 		// F6 回归：即使 created_at 毫秒级完全相同（批量写入 / 迁移脚本场景），
-		// MIN(rowid) tiebreak 仍能保证只保留一行，UNIQUE INDEX 不会因"多行匹配 MAX"失败。
+		// created_at 相同时按 id 选原业务键，其余隔离，全部 parent 都保留。
 		db := openMigrated(t, 1)
 		defer db.Close()
 
@@ -164,22 +169,27 @@ func TestH8_UniqueAudit_Fix_v0_3_12(t *testing.T) {
 				id, "教材", "c", "同一时刻.pdf", "batch", sameTime, sameTime)
 		}
 
-		// 此时 3 行 created_at 完全相同；旧实现 MAX(created_at) 条件会匹配全部 3 行
-		// → 一条都不删 → CREATE UNIQUE INDEX 报错。新实现用 MIN(rowid) 可正常处理。
-		runMigration(t, db, 2)
+		runMigration(t, db, 4)
 
 		var count int
-		db.QueryRow("SELECT COUNT(*) FROM kb_documents WHERE source='同一时刻.pdf'").Scan(&count)
-		if count != 1 {
-			t.Errorf("时间戳碰撞 tiebreak 失败：期望 1 行，实际 %d", count)
+		db.QueryRow("SELECT COUNT(*) FROM kb_documents WHERE title='教材'").Scan(&count)
+		if count != 3 {
+			t.Errorf("时间戳碰撞隔离失败：期望保留 3 行，实际 %d", count)
+		}
+		var originalID string
+		if err := db.QueryRow("SELECT id FROM kb_documents WHERE source='同一时刻.pdf'").Scan(&originalID); err != nil {
+			t.Fatal(err)
+		}
+		if originalID != "t1" {
+			t.Errorf("时间戳碰撞 survivor=%q，期望 t1", originalID)
 		}
 	})
 
 	t.Run("after_fix_migration_is_idempotent", func(t *testing.T) {
 		// 跑两次 v2 migration 不应报错（IF NOT EXISTS 保护）
-		db := openMigrated(t, 2)
+		db := openMigrated(t, 4)
 		defer db.Close()
-		runMigration(t, db, 2) // 第二次跑
+		runMigration(t, db, 4) // 第二次跑
 		// 不 panic 即为成功
 	})
 }
@@ -203,7 +213,11 @@ func openMigrated(t *testing.T, upToVersion int) *sql.DB {
 		if m.Version > upToVersion {
 			break
 		}
-		if _, err := db.Exec(m.SQL); err != nil {
+		if m.Func != nil {
+			if err := m.Func(context.Background(), db); err != nil {
+				t.Fatalf("apply migration %d: %v", m.Version, err)
+			}
+		} else if _, err := db.Exec(m.SQL); err != nil {
 			t.Fatalf("apply migration %d: %v", m.Version, err)
 		}
 	}
@@ -215,7 +229,11 @@ func runMigration(t *testing.T, db *sql.DB, version int) {
 	t.Helper()
 	for _, m := range All {
 		if m.Version == version {
-			if _, err := db.Exec(m.SQL); err != nil {
+			if m.Func != nil {
+				if err := m.Func(context.Background(), db); err != nil {
+					t.Fatalf("run migration %d: %v", version, err)
+				}
+			} else if _, err := db.Exec(m.SQL); err != nil {
 				t.Fatalf("run migration %d: %v", version, err)
 			}
 			return
