@@ -111,11 +111,16 @@ func TestCorsMiddleware_Preflight(t *testing.T) {
 
 	req := httptest.NewRequest("OPTIONS", "/api/v1/chat", nil)
 	req.Header.Set("Origin", "http://localhost:3000")
+	req.Header.Set("Access-Control-Request-Headers", "content-type, idempotency-key")
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
 	if w.Code != http.StatusNoContent {
 		t.Errorf("preflight status = %d, want 204", w.Code)
+	}
+	allowedHeaders := strings.ToLower(w.Header().Get("Access-Control-Allow-Headers"))
+	if !strings.Contains(allowedHeaders, "idempotency-key") {
+		t.Errorf("preflight must allow Knowledge upload idempotency header, got %q", allowedHeaders)
 	}
 }
 

@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/config"
-	"github.com/hexagon-codes/toolkit/net/httpx"
+	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/toolkit/net/sse"
 )
 
@@ -27,30 +27,55 @@ const defaultOllamaBaseURL = "http://localhost:11434"
 // so a test seam must not become an SSRF or accidental remote-management seam.
 // Call it during server construction, before serving requests.
 func (s *Server) SetOllamaBaseURL(rawURL string) error {
+	normalized, err := normalizeNativeOllamaBaseURL(rawURL)
+	if err != nil {
+		return err
+	}
+	s.ollamaBaseURL = normalized
+	return nil
+}
+
+// ValidateNativeOllamaBaseURL applies the same loopback-only endpoint contract
+// as SetOllamaBaseURL without mutating a Server. Startup capability discovery
+// uses it so probing and automatic installation cannot drift from the native
+// management boundary.
+func ValidateNativeOllamaBaseURL(rawURL string) error {
+	_, err := normalizeNativeOllamaBaseURL(rawURL)
+	return err
+}
+
+func normalizeNativeOllamaBaseURL(rawURL string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return fmt.Errorf("invalid Ollama base URL %q", rawURL)
+		return "", fmt.Errorf("invalid Ollama base URL %q", rawURL)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fmt.Errorf("Ollama base URL scheme must be http or https")
+		return "", fmt.Errorf("Ollama base URL scheme must be http or https")
 	}
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return fmt.Errorf("Ollama base URL must not contain credentials, query, or fragment")
+		return "", fmt.Errorf("Ollama base URL must not contain credentials, query, or fragment")
 	}
 	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
 	ip := net.ParseIP(host)
 	if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-		return fmt.Errorf("Ollama base URL must use a loopback host")
+		return "", fmt.Errorf("Ollama base URL must use a loopback host")
 	}
 	path := strings.TrimSuffix(parsed.Path, "/")
 	if path != "" && path != "/v1" {
-		return fmt.Errorf("Ollama base URL path must be empty or /v1")
+		return "", fmt.Errorf("Ollama base URL path must be empty or /v1")
 	}
 	parsed.Path = ""
 	parsed.RawPath = ""
 	parsed.ForceQuery = false
-	s.ollamaBaseURL = strings.TrimSuffix(parsed.String(), "/")
-	return nil
+	return strings.TrimSuffix(parsed.String(), "/"), nil
+}
+
+// SetOllamaModelInstalledCallback installs a post-pull lifecycle hook. It is
+// invoked only after Ollama emits a successful terminal event, allowing
+// runtime capabilities (such as a semantic-index catalog) to refresh without
+// coupling the generic model-management handler to those domains.
+func (s *Server) SetOllamaModelInstalledCallback(callback func(context.Context, string)) {
+	s.onOllamaModelInstalled = callback
 }
 
 func (s *Server) ollamaEndpoint(path string) string {
@@ -59,6 +84,41 @@ func (s *Server) ollamaEndpoint(path string) string {
 		baseURL = defaultOllamaBaseURL
 	}
 	return baseURL + "/" + strings.TrimPrefix(path, "/")
+}
+
+type ollamaEndpointPolicyErrorTransport struct{ err error }
+
+func (t ollamaEndpointPolicyErrorTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, t.err
+}
+
+// ollamaHTTPClient applies the same exact-origin, pre-resolved loopback and
+// no-proxy policy to every native management call. A construction error is
+// represented as a failing transport so status probes can retain their normal
+// unavailable behavior while side-effecting handlers return their existing
+// gateway error paths.
+func (s *Server) ollamaHTTPClient(totalTimeout, responseHeaderTimeout time.Duration) *http.Client {
+	options := []egress.ProviderHTTPClientOption{}
+	if responseHeaderTimeout > 0 {
+		options = append(options, egress.WithProviderResponseHeaderTimeout(responseHeaderTimeout))
+	}
+	client, err := egress.NewProviderHTTPClient(
+		s.ollamaEndpoint("/"),
+		config.ProviderPrivateNetworkAccess{},
+		options...,
+	)
+	if err != nil {
+		client = &http.Client{Transport: ollamaEndpointPolicyErrorTransport{err: err}}
+	}
+	client.Timeout = totalTimeout
+	return client
+}
+
+func (s *Server) ollamaLifecycleContext() context.Context {
+	if s.serviceLifecycleCtx != nil {
+		return s.serviceLifecycleCtx
+	}
+	return context.Background()
 }
 
 // OllamaStatus Ollama 运行时状态 (14.15 本地 LLM 管理)
@@ -127,7 +187,7 @@ func parseOllamaTags(body []byte) []OllamaModel {
 //
 //	detecting → not_installed / installed_not_running / running_not_associated / associated / updatable
 func (s *Server) handleOllamaStatus(w http.ResponseWriter, r *http.Request) {
-	client := httpx.RawClient(httpx.WithRawTimeout(3 * time.Second))
+	client := s.ollamaHTTPClient(3*time.Second, 3*time.Second)
 
 	status := OllamaStatus{}
 
@@ -176,7 +236,7 @@ func (s *Server) handleOllamaStatus(w http.ResponseWriter, r *http.Request) {
 //
 // GET /api/v1/ollama/running
 func (s *Server) handleOllamaRunning(w http.ResponseWriter, r *http.Request) {
-	client := httpx.RawClient(httpx.WithRawTimeout(3 * time.Second))
+	client := s.ollamaHTTPClient(3*time.Second, 3*time.Second)
 	resp, err := client.Get(s.ollamaEndpoint("/api/ps"))
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("Ollama 连接失败: %v", err)})
@@ -237,7 +297,7 @@ func (s *Server) handleOllamaUnload(w http.ResponseWriter, r *http.Request) {
 	}
 	// keep_alive=0 让 Ollama 立即卸载模型
 	unloadBody, _ := json.Marshal(map[string]any{"model": req.Model, "keep_alive": 0})
-	client := httpx.RawClient(httpx.WithRawTimeout(10 * time.Second))
+	client := s.ollamaHTTPClient(10*time.Second, 10*time.Second)
 	resp, err := client.Post(s.ollamaEndpoint("/api/generate"), "application/json", bytes.NewReader(unloadBody))
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("卸载失败: %v", err)})
@@ -335,7 +395,7 @@ func (s *Server) handleOllamaLoad(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	loadBody := buildOllamaLoadBody(req.Model, s.resolveOllamaNumCtx(req.NumCtx), s.resolveOllamaKeepAlive())
-	client := httpx.RawClient(httpx.WithRawTimeout(30 * time.Second))
+	client := s.ollamaHTTPClient(30*time.Second, 30*time.Second)
 	resp, err := client.Post(s.ollamaEndpoint("/api/generate"), "application/json", bytes.NewReader(loadBody))
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("预热失败: %v", err)})
@@ -395,7 +455,7 @@ func (s *Server) handleOllamaDelete(w http.ResponseWriter, r *http.Request) {
 	delBody, _ := json.Marshal(map[string]string{"model": name})
 	req2, _ := http.NewRequestWithContext(r.Context(), "DELETE", s.ollamaEndpoint("/api/delete"), bytes.NewReader(delBody))
 	req2.Header.Set("Content-Type", "application/json")
-	client := httpx.RawClient(httpx.WithRawTimeout(10 * time.Second))
+	client := s.ollamaHTTPClient(10*time.Second, 10*time.Second)
 	resp, err := client.Do(req2)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("删除失败: %v", err)})
@@ -423,7 +483,7 @@ func (s *Server) handleOllamaDelete(w http.ResponseWriter, r *http.Request) {
 // Linux: systemctl restart ollama 或 ollama serve
 func (s *Server) handleOllamaRestart(w http.ResponseWriter, r *http.Request) {
 	// 先检测当前是否在运行
-	client := httpx.RawClient(httpx.WithRawTimeout(2 * time.Second))
+	client := s.ollamaHTTPClient(2*time.Second, 2*time.Second)
 	wasRunning := false
 	if resp, err := client.Get(s.ollamaEndpoint("/api/version")); err == nil {
 		resp.Body.Close()
@@ -491,7 +551,7 @@ func (s *Server) handleOllamaPull(w http.ResponseWriter, r *http.Request) {
 	// 调用 Ollama pull API (POST /api/pull, 流式 JSON)
 	// 使用独立 context（不绑定前端 SSE 连接）：前端断开只停止推送进度，不中断 Ollama 下载。
 	// 超时设 4 小时（大模型如 DeepSeek 70B 在慢速网络可能需要数小时）。
-	pullCtx, pullCancel := context.WithTimeout(context.Background(), 4*time.Hour)
+	pullCtx, pullCancel := context.WithTimeout(s.ollamaLifecycleContext(), 4*time.Hour)
 	defer pullCancel()
 	pullBody, _ := json.Marshal(map[string]any{"model": req.Model, "stream": true})
 	pullReq, _ := http.NewRequestWithContext(pullCtx, "POST", s.ollamaEndpoint("/api/pull"), bytes.NewReader(pullBody))
@@ -499,7 +559,7 @@ func (s *Server) handleOllamaPull(w http.ResponseWriter, r *http.Request) {
 
 	// 流式下载不设全局 Timeout（它会在 body 读取阶段触发超时）。
 	// 仅用 ResponseHeaderTimeout 控制等待首个响应头的时间。
-	client := httpx.RawClient(httpx.WithResponseHeaderTimeout(30 * time.Second))
+	client := s.ollamaHTTPClient(0, 30*time.Second)
 	pullResp, err := client.Do(pullReq)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("Ollama 连接失败: %v", err)})
@@ -518,10 +578,20 @@ func (s *Server) handleOllamaPull(w http.ResponseWriter, r *http.Request) {
 	// Ollama 的 /api/pull 是流式 JSON（每行一个 JSON 对象），逐行透传为 SSE data 事件。
 	scanner := bufio.NewScanner(pullResp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 256*1024)
+	pullSucceeded := false
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
 			continue
+		}
+		var event struct {
+			Status string `json:"status"`
+		}
+		if json.Unmarshal([]byte(line), &event) == nil && event.Status != "" {
+			// Ollama's final status is authoritative. Do not activate a model
+			// merely because a malformed/non-conforming upstream emitted an
+			// earlier success event followed by a later failure.
+			pullSucceeded = event.Status == "success"
 		}
 		_ = writer.WriteData(line)
 	}
@@ -529,5 +599,9 @@ func (s *Server) handleOllamaPull(w http.ResponseWriter, r *http.Request) {
 		// 用 json.Marshal 生成错误负载，确保 error 文案被正确 JSON 转义。
 		errPayload, _ := json.Marshal(map[string]string{"status": "error", "error": err.Error()})
 		_ = writer.WriteData(string(errPayload))
+		return
+	}
+	if pullSucceeded && s.onOllamaModelInstalled != nil {
+		s.onOllamaModelInstalled(pullCtx, req.Model)
 	}
 }

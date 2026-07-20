@@ -19,28 +19,40 @@ import (
 
 // Config HexClaw 全局配置
 type Config struct {
-	Server     ServerConfig     `yaml:"server"`
-	LLM        LLMConfig        `yaml:"llm"`
-	Platforms  PlatformsConfig  `yaml:"platforms"`
-	Security   SecurityConfig   `yaml:"security"`
-	Skill      SkillConfig      `yaml:"skill"`
-	Storage    StorageConfig    `yaml:"storage"`
-	Memory     MemoryConfig     `yaml:"memory"`
-	Knowledge  KnowledgeConfig  `yaml:"knowledge"`
-	Observe    ObserveConfig    `yaml:"observe"`
-	MCP        MCPConfig        `yaml:"mcp"`
-	Skills     SkillsConfig     `yaml:"skills"`
-	Heartbeat  HeartbeatConfig  `yaml:"heartbeat"`
-	Cron       CronConfig       `yaml:"cron"`
-	Webhook    WebhookConfig    `yaml:"webhook"`
-	Compaction CompactionConfig `yaml:"compaction"`
-	FileMemory FileMemoryConfig `yaml:"file_memory"`
-	Router     RouterConfig     `yaml:"router"`
-	Canvas     CanvasConfig     `yaml:"canvas"`
-	Audit      AuditConfig      `yaml:"audit"`
-	Voice      VoiceConfig      `yaml:"voice"`
-	Budget     BudgetConfig     `yaml:"budget"`
-	Features   map[string]bool  `yaml:"features"` // v0.4.0 feature flag override（key=flag name）
+	Server           ServerConfig           `yaml:"server"`
+	LLM              LLMConfig              `yaml:"llm"`
+	Platforms        PlatformsConfig        `yaml:"platforms"`
+	Security         SecurityConfig         `yaml:"security"`
+	Skill            SkillConfig            `yaml:"skill"`
+	Storage          StorageConfig          `yaml:"storage"`
+	Memory           MemoryConfig           `yaml:"memory"`
+	Knowledge        KnowledgeConfig        `yaml:"knowledge"`
+	Observe          ObserveConfig          `yaml:"observe"`
+	MCP              MCPConfig              `yaml:"mcp"`
+	Skills           SkillsConfig           `yaml:"skills"`
+	Heartbeat        HeartbeatConfig        `yaml:"heartbeat"`
+	Cron             CronConfig             `yaml:"cron"`
+	Webhook          WebhookConfig          `yaml:"webhook"`
+	Compaction       CompactionConfig       `yaml:"compaction"`
+	FileMemory       FileMemoryConfig       `yaml:"file_memory"`
+	Router           RouterConfig           `yaml:"router"`
+	Canvas           CanvasConfig           `yaml:"canvas"`
+	Audit            AuditConfig            `yaml:"audit"`
+	Voice            VoiceConfig            `yaml:"voice"`
+	Budget           BudgetConfig           `yaml:"budget"`
+	ResourceGovernor ResourceGovernorConfig `yaml:"resource_governor"`
+	Features         map[string]bool        `yaml:"features"` // v0.4.0 feature flag override（key=flag name）
+}
+
+// ResourceGovernorConfig bounds process-wide expensive resources shared by
+// interactive grading/query and durable Knowledge work.
+type ResourceGovernorConfig struct {
+	VLMConcurrency         int    `yaml:"vlm_concurrency"`
+	AcceleratorConcurrency int    `yaml:"accelerator_concurrency"`
+	CPUHeavyConcurrency    int    `yaml:"cpu_heavy_concurrency"`
+	SQLiteWriteConcurrency int    `yaml:"sqlite_write_concurrency"`
+	BackgroundAging        string `yaml:"background_aging"`
+	MaxInteractiveBurst    int    `yaml:"max_interactive_burst"`
 }
 
 // BudgetConfig 单任务三维预算控制 (G1 前置关卡)
@@ -369,11 +381,14 @@ type LLMToolsConfig struct {
 
 // LLMProviderConfig 单个 LLM Provider 配置
 type LLMProviderConfig struct {
-	APIKey     string   `yaml:"api_key"`          // API Key
-	BaseURL    string   `yaml:"base_url"`         // 自定义 API 端点（支持中转/私有部署）
-	Model      string   `yaml:"model"`            // 当前选中的模型
-	Models     []string `yaml:"models,omitempty"` // 已配置的模型列表（桌面端持久化用）
-	Compatible string   `yaml:"compatible"`       // 兼容协议: "openai"（用于中转/私有部署）
+	ProviderInstanceID string                 `yaml:"provider_instance_id,omitempty" json:"provider_instance_id,omitempty"` // 稳定内部身份，不随名称/Key/端点变化
+	APIKey             string                 `yaml:"api_key"`                                                              // API Key
+	BaseURL            string                 `yaml:"base_url"`                                                             // 自定义 API 端点（支持中转/私有部署）
+	Model              string                 `yaml:"model"`                                                                // 当前选中的文本模型；可空
+	Models             []string               `yaml:"models,omitempty"`                                                     // 已配置的模型 ID 列表（legacy API 兼容）
+	ModelSpecsMode     string                 `yaml:"model_specs_mode,omitempty"`                                           // legacy / explicit；区分 omitted 与显式 []
+	ModelSpecs         []LLMProviderModelSpec `yaml:"model_specs,omitempty"`                                                // 模型级能力声明
+	Compatible         string                 `yaml:"compatible"`                                                           // 兼容协议: "openai"（用于中转/私有部署）
 	// Locality 描述模型算力/数据最终位置，而非 HTTP 监听地址：
 	//   - auto/空：按 endpoint host 自动判断
 	//   - local：本机/LAN 私有部署

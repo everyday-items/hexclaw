@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -194,10 +195,71 @@ func (p *cloudEgressProvider) CountTokens(messages []llm.Message) (int, error) {
 // Caller must hold at least r.mu.RLock.
 func (r *Selector) providerLocked(name string) hexagon.Provider {
 	p := r.providers[name]
-	if p == nil || r.egressPolicy == nil || r.isLocalProviderName(name) {
+	if p == nil {
 		return p
 	}
-	return &cloudEgressProvider{next: p, policy: r.egressPolicy}
+	if r.egressPolicy != nil && !r.isLocalProviderName(name) {
+		p = &cloudEgressProvider{next: p, policy: r.egressPolicy}
+	}
+	if providerConfig, configured := r.cfg.Providers[name]; configured {
+		// This wrapper is the final completion/stream boundary shared by Chat,
+		// Agents, QuickChat, channels and capability probes. UI filtering is not
+		// a security boundary: a stale session or direct API caller must still be
+		// unable to send embedding-only/unclassified IDs to chat transports.
+		p = &textCapabilityProvider{
+			next: p, providerName: name, providerConfig: providerConfig,
+		}
+	}
+	return p
+}
+
+type textCapabilityProvider struct {
+	next           hexagon.Provider
+	providerName   string
+	providerConfig config.LLMProviderConfig
+}
+
+func (p *textCapabilityProvider) Name() string { return p.next.Name() }
+
+func (p *textCapabilityProvider) validate(model string) error {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = strings.TrimSpace(p.providerConfig.Model)
+	}
+	if model == "" || !config.ModelHasCapability(
+		p.providerConfig,
+		model,
+		config.LLMModelCapabilityText,
+	) {
+		return fmt.Errorf("provider %q model %q is not eligible for text completion", p.providerName, model)
+	}
+	return nil
+}
+
+func (p *textCapabilityProvider) Complete(
+	ctx context.Context,
+	req llm.CompletionRequest,
+) (*llm.CompletionResponse, error) {
+	if err := p.validate(req.Model); err != nil {
+		return nil, err
+	}
+	return p.next.Complete(ctx, req)
+}
+
+func (p *textCapabilityProvider) Stream(
+	ctx context.Context,
+	req llm.CompletionRequest,
+) (*llm.Stream, error) {
+	if err := p.validate(req.Model); err != nil {
+		return nil, err
+	}
+	return p.next.Stream(ctx, req)
+}
+
+func (p *textCapabilityProvider) Models() []llm.ModelInfo { return p.next.Models() }
+
+func (p *textCapabilityProvider) CountTokens(messages []llm.Message) (int, error) {
+	return p.next.CountTokens(messages)
 }
 
 // isLocalProviderName reports whether a provider should rank last in fallback.
@@ -353,14 +415,65 @@ func (r *Selector) createProvider(name string, pc config.LLMProviderConfig) hexa
 	return NewProviderFromConfig(name, pc)
 }
 
+const (
+	defaultOpenAIProviderBaseURL    = "https://api.openai.com/v1"
+	defaultAnthropicProviderBaseURL = "https://api.anthropic.com/v1"
+	defaultOllamaProviderBaseURL    = "http://localhost:11434"
+	ollamaResponseHeaderTimeout     = 10 * time.Minute
+)
+
+func providerEndpointBaseURL(name string, pc config.LLMProviderConfig) string {
+	baseURL := strings.TrimSpace(pc.BaseURL)
+	if isOllamaProviderConfig(name, pc) {
+		if baseURL == "" {
+			return defaultOllamaProviderBaseURL
+		}
+		return normalizeOllamaBaseURL(baseURL)
+	}
+	if baseURL != "" {
+		return baseURL
+	}
+	if name == "anthropic" {
+		return defaultAnthropicProviderBaseURL
+	}
+	return defaultOpenAIProviderBaseURL
+}
+
+func providerHTTPClient(name string, pc config.LLMProviderConfig) *http.Client {
+	options := []egress.ProviderHTTPClientOption(nil)
+	if isOllamaProviderConfig(name, pc) {
+		options = append(options,
+			egress.WithProviderResponseHeaderTimeout(ollamaResponseHeaderTimeout),
+			egress.WithProviderFixedOriginAdapterTransport(),
+		)
+	}
+	client, err := egress.NewProviderHTTPClient(
+		providerEndpointBaseURL(name, pc), pc.PrivateNetworkAccess, options...,
+	)
+	if err != nil {
+		// Preserve the public factory's no-error signature while ensuring a rejected
+		// endpoint can never fall back to ai-core's proxy-aware default client. A
+		// concrete transport remains compatible with Ollama's secondary policy clone.
+		reject := func(context.Context, string, string) (net.Conn, error) {
+			return nil, err
+		}
+		return &http.Client{Transport: &http.Transport{
+			Proxy: nil, DialContext: reject, DialTLSContext: reject,
+		}}
+	}
+	return client
+}
+
 // NewProviderFromConfig 按 provider 名/配置选择正确协议创建 Provider（ollama 原生 /
 // anthropic 原生 SDK / 其余 OpenAI 兼容）。测试连接与真实路由共用此单一工厂，避免
 // 「测试连接一律当 OpenAI 打」的协议漂移（契约#2）。
 func NewProviderFromConfig(name string, pc config.LLMProviderConfig) hexagon.Provider {
+	baseURL := providerEndpointBaseURL(name, pc)
+	httpClient := providerHTTPClient(name, pc)
 	if isOllamaProviderConfig(name, pc) {
-		var opts []ollama.Option
-		if baseURL := normalizeOllamaBaseURL(pc.BaseURL); baseURL != "" {
-			opts = append(opts, ollama.WithBaseURL(baseURL))
+		opts := []ollama.Option{
+			ollama.WithBaseURL(baseURL),
+			ollama.WithHTTPClient(httpClient),
 		}
 		if pc.Model != "" {
 			opts = append(opts, ollama.WithModel(pc.Model))
@@ -373,9 +486,9 @@ func NewProviderFromConfig(name string, pc config.LLMProviderConfig) hexagon.Pro
 
 	// Anthropic 使用原生 SDK（非 OpenAI 兼容协议）
 	if name == "anthropic" {
-		var aopts []anthropic.Option
-		if pc.BaseURL != "" {
-			aopts = append(aopts, anthropic.WithBaseURL(pc.BaseURL))
+		aopts := []anthropic.Option{
+			anthropic.WithBaseURL(baseURL),
+			anthropic.WithHTTPClient(httpClient),
 		}
 		if pc.Model != "" {
 			aopts = append(aopts, anthropic.WithModel(pc.Model))
@@ -384,9 +497,9 @@ func NewProviderFromConfig(name string, pc config.LLMProviderConfig) hexagon.Pro
 	}
 
 	// 其他 Provider 统一使用 OpenAI 兼容协议
-	opts := []hexagon.OpenAIOption{}
-	if pc.BaseURL != "" {
-		opts = append(opts, hexagon.OpenAIWithBaseURL(pc.BaseURL))
+	opts := []hexagon.OpenAIOption{
+		hexagon.OpenAIWithBaseURL(baseURL),
+		hexagon.OpenAIWithHTTPClient(httpClient),
 	}
 	if pc.Model != "" {
 		opts = append(opts, hexagon.OpenAIWithModel(pc.Model))

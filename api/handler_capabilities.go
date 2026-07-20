@@ -46,6 +46,10 @@ func (s *Server) handleProbeCapability(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "provider 和 model 参数必填", http.StatusBadRequest)
 		return
 	}
+	if err := validateConfiguredTextModel(s.activeLLMConfig(), provider, model); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	cap, err := s.capabilities.Probe(r.Context(), provider, model)
 	if err != nil {

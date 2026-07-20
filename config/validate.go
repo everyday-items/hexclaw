@@ -81,6 +81,43 @@ func (c *Config) Validate() error {
 		})
 	}
 
+	// Config is sometimes assembled as a narrow zero-value fixture by callers
+	// that validate an unrelated section. Loader/Writer always overlay on
+	// DefaultConfig, so a wholly absent governor block means "use defaults";
+	// once any governor field is present, validate the complete budget strictly.
+	if c.ResourceGovernor != (ResourceGovernorConfig{}) {
+		resourceLimits := []struct {
+			field string
+			value int
+		}{
+			{"resource_governor.vlm_concurrency", c.ResourceGovernor.VLMConcurrency},
+			{"resource_governor.accelerator_concurrency", c.ResourceGovernor.AcceleratorConcurrency},
+			{"resource_governor.cpu_heavy_concurrency", c.ResourceGovernor.CPUHeavyConcurrency},
+			{"resource_governor.sqlite_write_concurrency", c.ResourceGovernor.SQLiteWriteConcurrency},
+		}
+		for _, limit := range resourceLimits {
+			if limit.value <= 0 {
+				errs = append(errs, &ValidationError{
+					Field: limit.field, Value: fmt.Sprintf("%d", limit.value),
+					Rule: "必须为正整数", Suggest: "使用默认值或按设备基准调低/调高",
+				})
+			}
+		}
+		if aging, err := time.ParseDuration(c.ResourceGovernor.BackgroundAging); err != nil || aging <= 0 {
+			errs = append(errs, &ValidationError{
+				Field: "resource_governor.background_aging", Value: c.ResourceGovernor.BackgroundAging,
+				Rule: "正数 Go duration（如 5s）", Suggest: "使用默认 5s",
+			})
+		}
+		if c.ResourceGovernor.MaxInteractiveBurst <= 0 {
+			errs = append(errs, &ValidationError{
+				Field: "resource_governor.max_interactive_burst",
+				Value: fmt.Sprintf("%d", c.ResourceGovernor.MaxInteractiveBurst),
+				Rule:  "必须为正整数", Suggest: "使用默认 8",
+			})
+		}
+	}
+
 	// 3. Router：配置了静态 Agents 时，DefaultAgent（若指定）必须在列表中
 	// （不强制 Enabled → 必填 DefaultAgent，因为 Agents 可通过 API 运行时注入）
 	if len(c.Router.Agents) > 0 && c.Router.DefaultAgent != "" {
@@ -129,7 +166,35 @@ func (c *Config) Validate() error {
 	}
 
 	// 6. LLM provider keep_alive 格式（仅 Ollama 本地生效；非法值此前直达 Ollama 才 400）
+	providerInstanceIDs := make(map[string]string, len(c.LLM.Providers))
 	for name, p := range c.LLM.Providers {
+		if p.ProviderInstanceID != "" {
+			if err := ValidateProviderInstanceID(p.ProviderInstanceID); err != nil {
+				errs = append(errs, &ValidationError{
+					Field:   fmt.Sprintf("llm.providers.%s.provider_instance_id", name),
+					Value:   p.ProviderInstanceID,
+					Rule:    "稳定、非密钥的 canonical Provider ID",
+					Suggest: "保留服务端生成的 provider_instance_id，不要用展示名、API Key 或 Base URL 替换",
+				})
+			} else if previous, duplicate := providerInstanceIDs[p.ProviderInstanceID]; duplicate {
+				errs = append(errs, &ValidationError{
+					Field:   fmt.Sprintf("llm.providers.%s.provider_instance_id", name),
+					Value:   p.ProviderInstanceID,
+					Rule:    "在 llm.providers 中唯一",
+					Suggest: fmt.Sprintf("不得与 provider %q 复用同一 ID", previous),
+				})
+			} else {
+				providerInstanceIDs[p.ProviderInstanceID] = name
+			}
+		}
+		if err := ValidateProviderModelSpecs(p); err != nil {
+			errs = append(errs, &ValidationError{
+				Field:   fmt.Sprintf("llm.providers.%s.model_specs", name),
+				Value:   err.Error(),
+				Rule:    "模型 ID、能力、Embedding 契约与当前文本模型必须一致",
+				Suggest: "仅声明受支持 capability；Embedding 需提供合法 protocol/dimension，当前 model 只能选择 text 模型",
+			})
+		}
 		if !IsValidProviderLocality(p.Locality) {
 			errs = append(errs, &ValidationError{
 				Field:   fmt.Sprintf("llm.providers.%s.locality", name),
@@ -152,6 +217,16 @@ func (c *Config) Validate() error {
 				Value:   p.KeepAlive,
 				Rule:    "Go duration（如 30m/2h/1h30m）、纯整数秒（如 3600）、0（立即卸载）或 -1（永久驻留）",
 				Suggest: "示例：\"30m\"、\"-1\"、\"0\"、\"3600\"；留空则用默认 30m",
+			})
+		}
+	}
+	if defaultProvider, exists := c.LLM.Providers[c.LLM.Default]; exists {
+		if defaultProvider.Model == "" || !ModelHasCapability(defaultProvider, defaultProvider.Model, LLMModelCapabilityText) {
+			errs = append(errs, &ValidationError{
+				Field:   "llm.default",
+				Value:   c.LLM.Default,
+				Rule:    "默认 Provider 必须选择一个包含 text capability 的 model",
+				Suggest: "选择可对话模型；embedding-only Provider 可保留，但不能作为全局默认",
 			})
 		}
 	}

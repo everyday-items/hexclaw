@@ -259,6 +259,15 @@ server:
   port: 16060
   mode: "production"
 
+# 进程级重资源预算（K12 批改与 Knowledge 摄取/查询共用）
+resource_governor:
+  vlm_concurrency: 1
+  accelerator_concurrency: 1
+  cpu_heavy_concurrency: 2
+  sqlite_write_concurrency: 1
+  background_aging: "5s"
+  max_interactive_burst: 8
+
 # LLM 配置
 llm:
   default: "deepseek"

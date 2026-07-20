@@ -180,6 +180,14 @@ func DefaultConfig() *Config {
 			MaxDuration: "30m",
 			MaxCost:     5.0,
 		},
+		ResourceGovernor: ResourceGovernorConfig{
+			VLMConcurrency:         1,
+			AcceleratorConcurrency: 1,
+			CPUHeavyConcurrency:    2,
+			SQLiteWriteConcurrency: 1,
+			BackgroundAging:        "5s",
+			MaxInteractiveBurst:    8,
+		},
 	}
 }
 

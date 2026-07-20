@@ -4,10 +4,37 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 )
 
 type contextKey struct{}
+type providerClientRequestKeyContextKey struct{}
+
+// WithProviderClientRequestKey binds a durable upstream request identity to
+// this request only. Provider transports may map it to an idempotency contract;
+// an upstream that ignores that contract remains at-least-once.
+func WithProviderClientRequestKey(ctx context.Context, key string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, providerClientRequestKeyContextKey{}, key)
+}
+
+// ProviderClientRequestKeyFromContext returns the request-local durable
+// identity, if one was explicitly bound by the caller.
+func ProviderClientRequestKeyFromContext(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	key, ok := ctx.Value(providerClientRequestKeyContextKey{}).(string)
+	key = strings.TrimSpace(key)
+	return key, ok && key != ""
+}
 
 // requestEnvelope is mutable on purpose: a request acquires data classes while
 // the engine assembles prompt context (attachments, memory, records). The
