@@ -230,17 +230,19 @@ func cloneHexbak(bak *Hexbak) *Hexbak {
 		p := *bak.Profile
 		out.Profile = &p
 	}
-	out.Records = make([]*records.AgentRecord, len(bak.Records))
-	for i, rec := range bak.Records {
-		if rec == nil {
-			continue
+	if bak.Records != nil {
+		out.Records = make([]*records.AgentRecord, len(bak.Records))
+		for i, rec := range bak.Records {
+			if rec == nil {
+				continue
+			}
+			clone := *rec
+			if rec.DueAt != nil {
+				due := *rec.DueAt
+				clone.DueAt = &due
+			}
+			out.Records[i] = &clone
 		}
-		clone := *rec
-		if rec.DueAt != nil {
-			due := *rec.DueAt
-			clone.DueAt = &due
-		}
-		out.Records[i] = &clone
 	}
 	out.Assets = make([]HexbakAsset, len(bak.Assets))
 	for i, item := range bak.Assets {

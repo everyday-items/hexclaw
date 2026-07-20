@@ -64,6 +64,10 @@ func (a *ArchiveRestoreAdapter) RestoreArchiveAs(
 			if err != nil {
 				return fmt.Errorf("snapshot target records: %w", err)
 			}
+			preProblemAttempts, err := a.records.ExportProblemAttemptSnapshotsTx(ctx, tx, plan.TargetAgent)
+			if err != nil {
+				return fmt.Errorf("snapshot target Problem/Attempt ledger: %w", err)
+			}
 			profile := k12.ProfileFromMeta(updated.Metadata)
 			var snapshotProfile *k12.ChildProfile
 			if profile != (k12.ChildProfile{}) {
@@ -72,10 +76,19 @@ func (a *ArchiveRestoreAdapter) RestoreArchiveAs(
 			snapshot := &usecase.Hexbak{
 				Version: usecase.HexbakVersion, AgentName: plan.TargetAgent,
 				ExportedAt: plan.RequestedAt, Records: preRecords, Profile: snapshotProfile,
+				ProblemAttempts: preProblemAttempts,
 			}
-			snapshot.Assets, err = usecase.PackHexbakAssets(plan.TargetAgent, preRecords)
+			recordAssets, err := usecase.PackHexbakAssets(plan.TargetAgent, preRecords)
 			if err != nil {
 				return fmt.Errorf("pack pre-restore snapshot assets: %w", err)
+			}
+			problemAssets, err := usecase.PackHexbakProblemAttemptAssets(plan.TargetAgent, preProblemAttempts)
+			if err != nil {
+				return fmt.Errorf("pack pre-restore snapshot Problem page assets: %w", err)
+			}
+			snapshot.Assets, err = usecase.MergeHexbakAssets(recordAssets, problemAssets)
+			if err != nil {
+				return fmt.Errorf("merge pre-restore snapshot assets: %w", err)
 			}
 			snapshot.CreativeWorkOCR, err = usecase.PackHexbakCreativeWorkOCRWithResolver(
 				ctx, plan.TargetAgent, preRecords,
@@ -132,6 +145,11 @@ func (a *ArchiveRestoreAdapter) RestoreArchiveAs(
 			}
 			if err := a.records.ImportAgentRecordsTx(ctx, tx, plan.TargetAgent, migrated.Records); err != nil {
 				return fmt.Errorf("merge owner-rewritten records: %w", err)
+			}
+			if err := a.records.ImportProblemAttemptSnapshotsTx(
+				ctx, tx, plan.TargetAgent, migrated.ProblemAttempts,
+			); err != nil {
+				return fmt.Errorf("merge owner-rewritten Problem/Attempt ledger: %w", err)
 			}
 			updated.Metadata = k12.ReplaceProfileInMeta(updated.Metadata, migrated.Profile)
 			if err := a.agents.SaveAgentTx(ctx, tx, updated); err != nil {
@@ -254,8 +272,17 @@ func (a *ArchiveRestoreAdapter) RollbackRestoreAs(
 			if err != nil {
 				return rollbackFailure(fmt.Errorf("snapshot current restore state: %w", err), nil)
 			}
+			beforeProblemAttempts, err := a.records.ExportProblemAttemptSnapshotsTx(ctx, tx, req.TargetAgent)
+			if err != nil {
+				return rollbackFailure(fmt.Errorf("snapshot current Problem/Attempt state: %w", err), nil)
+			}
 			if err := a.records.ReplaceAgentRecordsTx(ctx, tx, req.TargetAgent, current.Snapshot.Records); err != nil {
 				return rollbackFailure(fmt.Errorf("restore pre-migration records: %w", err), nil)
+			}
+			if err := a.records.ReplaceProblemAttemptSnapshotsTx(
+				ctx, tx, req.TargetAgent, current.Snapshot.ProblemAttempts,
+			); err != nil {
+				return rollbackFailure(fmt.Errorf("restore pre-migration Problem/Attempt ledger: %w", err), nil)
 			}
 			if err := a.records.ImportCreativeWorkOCREvidenceTx(
 				ctx, tx, req.TargetAgent, current.Snapshot.CreativeWorkOCR,
@@ -276,8 +303,14 @@ func (a *ArchiveRestoreAdapter) RollbackRestoreAs(
 				return rollbackFailure(fmt.Errorf("restore pre-migration profile: %w", err), nil)
 			}
 			at := time.Now().Unix()
-			beforeJSON, _ := json.Marshal(before)
-			afterJSON, _ := json.Marshal(current.Snapshot.Records)
+			beforeJSON, _ := json.Marshal(struct {
+				Records         []*records.AgentRecord       `json:"records"`
+				ProblemAttempts []k12.ProblemAttemptSnapshot `json:"problem_attempts"`
+			}{before, beforeProblemAttempts})
+			afterJSON, _ := json.Marshal(struct {
+				Records         []*records.AgentRecord       `json:"records"`
+				ProblemAttempts []k12.ProblemAttemptSnapshot `json:"problem_attempts"`
+			}{current.Snapshot.Records, current.Snapshot.ProblemAttempts})
 			var ordinal int
 			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(ordinal),0)+1 FROM k12_restore_journal WHERE migration_id=?`, req.MigrationID).Scan(&ordinal); err != nil {
 				return rollbackFailure(fmt.Errorf("next rollback journal ordinal: %w", err), nil)
@@ -556,7 +589,7 @@ func (a *ArchiveRestoreAdapter) validateRestoreAsPlan(plan usecase.RestoreAsPlan
 		return fmt.Errorf("%w: incomplete restore-as plan", usecase.ErrInvalidInput)
 	}
 	if err := usecase.VerifyHexbak(plan.OriginalArchive); err != nil {
-		return err
+		return fmt.Errorf("verify original restore-as archive: %w", err)
 	}
 	digest, err := usecase.HexbakDigest(plan.OriginalArchive)
 	if err != nil {
@@ -566,7 +599,7 @@ func (a *ArchiveRestoreAdapter) validateRestoreAsPlan(plan usecase.RestoreAsPlan
 		return usecase.ErrArchiveScopeMismatch
 	}
 	if err := usecase.VerifyHexbak(plan.MigratedArchive); err != nil {
-		return err
+		return fmt.Errorf("verify migrated restore-as archive: %w", err)
 	}
 	if plan.MigratedArchive.AgentName != plan.TargetAgent {
 		return usecase.ErrArchiveScopeMismatch
@@ -615,6 +648,13 @@ func appendRestoreAsJournal(
 		}{migrated.CreativeWorkOCR, ocrMigrations})
 		entries = append(entries, entry{
 			"rewrite_owner", "creative_work_ocr_ledger", plan.TargetAgent, string(before), string(after),
+		})
+	}
+	if len(migrated.ProblemAttempts) > 0 || len(plan.OriginalArchive.ProblemAttempts) > 0 {
+		before, _ := json.Marshal(plan.OriginalArchive.ProblemAttempts)
+		after, _ := json.Marshal(migrated.ProblemAttempts)
+		entries = append(entries, entry{
+			"rewrite_owner", "problem_attempt_ledger", plan.TargetAgent, string(before), string(after),
 		})
 	}
 	beforeProfile, _ := json.Marshal(snapshot.Profile)

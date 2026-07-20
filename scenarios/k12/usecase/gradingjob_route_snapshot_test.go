@@ -39,7 +39,7 @@ func TestGradingRetryKeepsOriginalProviderModelRouteSnapshot(t *testing.T) {
 		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil)
 	d.Recognizer = recognizer
 	current := k12.GradingModelSnapshot{Provider: "provider-a", Model: "vision-a", Route: "provider-a/vision-a", Capability: "vision"}
-	o := NewGradingOrchestrator(d, func() k12.GradingModelSnapshot { return current })
+	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, func() k12.GradingModelSnapshot { return current }))
 	v, created, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "im", SourceKey: "route-snapshot",
 	})
@@ -112,9 +112,9 @@ func TestGradingModelTimeoutUsesInvocationLedgerAndBlocksBlindRetry(t *testing.T
 		t.Fatalf("init invocation ledger: %v", err)
 	}
 	d.Recognizer = recognizer
-	o := NewGradingOrchestrator(d, func() k12.GradingModelSnapshot {
+	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, func() k12.GradingModelSnapshot {
 		return k12.GradingModelSnapshot{Provider: "provider-a", Model: "vision-a", Route: "provider-a/vision-a"}
-	})
+	}))
 	v, _, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "im", SourceKey: "unknown-ledger",
 	})
@@ -154,7 +154,7 @@ func TestGradingSucceededInvocationBeforeCheckpointIsNotBlindlyReplayed(t *testi
 		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil)
 	d.Recognizer = recognizer
 	snapshot := k12.GradingModelSnapshot{Provider: "provider-a", Model: "vision-a", Route: "provider-a/vision-a"}
-	o := NewGradingOrchestrator(d, func() k12.GradingModelSnapshot { return snapshot })
+	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, func() k12.GradingModelSnapshot { return snapshot }))
 	v, _, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "im", SourceKey: "crash-after-result",
 	})
@@ -207,7 +207,7 @@ func TestGradingSucceededInvocationWithDurableArtifactRecoversCheckpointWithoutP
 		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil)
 	d.Recognizer = recognizer
 	snapshot := k12.GradingModelSnapshot{Provider: "provider-a", Model: "vision-a", Route: "provider-a/vision-a"}
-	o := NewGradingOrchestrator(d, func() k12.GradingModelSnapshot { return snapshot }, WithGradingRunDir(t.TempDir()))
+	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, func() k12.GradingModelSnapshot { return snapshot }, WithGradingRunDir(t.TempDir())))
 	v, _, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "im", SourceKey: "crash-with-artifact",
 	})
@@ -260,7 +260,7 @@ func TestGradingReconciliationProvesNotExecutedBeforeSafeSameRouteRetry(t *testi
 		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil)
 	d.Recognizer = recognizer
 	snapshot := k12.GradingModelSnapshot{Provider: "provider-a", Model: "vision-a", Route: "provider-a/vision-a"}
-	o := NewGradingOrchestrator(d, func() k12.GradingModelSnapshot { return snapshot })
+	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, func() k12.GradingModelSnapshot { return snapshot }))
 	v, _, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "im", SourceKey: "reconcile-then-retry",
 	})

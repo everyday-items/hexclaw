@@ -2,7 +2,6 @@ package usecase_test
 
 import (
 	"context"
-	"database/sql"
 	"strings"
 	"testing"
 
@@ -11,24 +10,12 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/curriculum"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
-	"github.com/hexagon-codes/hexclaw/storage/migrate"
-
-	_ "modernc.org/sqlite"
 )
 
 // newDataDeps 建一个只需 records 存储的 Deps（练习集/作品是纯数据实体，无需 LLM）。
 func newDataDeps(t *testing.T, agents ...string) usecase.Deps {
 	t.Helper()
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// SQLite :memory: 是逐连接数据库；固定单连接，确保并发命令测试共享同一 schema/事务事实。
-	db.SetMaxOpenConns(1)
-	t.Cleanup(func() { db.Close() })
-	if err := migrate.Run(context.Background(), db, migrate.All); err != nil {
-		t.Fatal(err)
-	}
+	db := openMigratedTestDB(t)
 	if len(agents) == 0 {
 		agents = []string{"xiaoming"}
 	}

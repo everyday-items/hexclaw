@@ -3,7 +3,6 @@ package usecase_test
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,9 +16,6 @@ import (
 	"github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
-	"github.com/hexagon-codes/hexclaw/storage/migrate"
-
-	_ "modernc.org/sqlite"
 )
 
 // TestK12EvalGate_RealModel 是可执行的真模型发版门：真正装配 SolveSkill 和
@@ -35,14 +31,7 @@ func TestK12EvalGate_RealModel(t *testing.T) {
 	base := envOr("HEXCLAW_REAL_LLM_BASE", "https://api.siliconflow.cn/v1/chat/completions")
 	model := envOr("HEXCLAW_REAL_LLM_MODEL", "Qwen/Qwen3.6-35B-A3B")
 
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	if err := migrate.Run(context.Background(), db, migrate.All); err != nil {
-		t.Fatal(err)
-	}
+	db := openMigratedTestDB(t)
 	if _, err := db.Exec(`INSERT INTO agents(name) VALUES('eval-agent')`); err != nil {
 		t.Fatal(err)
 	}
@@ -57,10 +46,11 @@ func TestK12EvalGate_RealModel(t *testing.T) {
 	defer cancel()
 	cases := usecase.K12ReleaseEvalCases()
 	result := usecase.RunEval(ctx, k.Deps, cases)
-	pretty, _ := json.MarshalIndent(result, "", "  ")
-	t.Logf("real K12 eval model=%q result=%s", model, pretty)
+	t.Logf("real K12 eval model=%q total=%d grade=%d/%d oos=%d/%d ghostwrite=%d/%d failures=%d",
+		model, result.Total, result.GradePassed, result.GradeChecked, result.OOSPassed,
+		result.OOSChecked, result.GhostRefused, result.GhostChecked, len(result.Failures))
 	if ok, reasons := result.Passes(); !ok {
-		t.Fatalf("real K12 eval gate failed: %v; failures=%v", reasons, result.Failures)
+		t.Fatalf("real K12 eval gate failed: %v; failure_count=%d", reasons, len(result.Failures))
 	}
 }
 
@@ -171,7 +161,7 @@ func realEvalChat(ctx context.Context, base, model, key string, messages []map[s
 		return "", nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", nil, fmt.Errorf("real eval provider status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return "", nil, fmt.Errorf("real eval provider status %d", resp.StatusCode)
 	}
 	var out struct {
 		Choices []struct {
@@ -188,7 +178,7 @@ func realEvalChat(ctx context.Context, base, model, key string, messages []map[s
 		return "", nil, err
 	}
 	if out.Error != nil {
-		return "", nil, fmt.Errorf("real eval provider: %s", out.Error.Message)
+		return "", nil, fmt.Errorf("real eval provider returned an error response")
 	}
 	if len(out.Choices) == 0 {
 		return "", nil, fmt.Errorf("real eval provider returned no choices")

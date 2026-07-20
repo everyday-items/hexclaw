@@ -230,6 +230,15 @@ type PhotoAnnotator interface {
 	Annotate(ctx context.Context, image []byte, marks []PhotoAnnotation) (RenderedPhoto, error)
 }
 
+// PageAssetStore persists the immutable source page before photo recognition is
+// promoted into the V19 Problem/Attempt ledger. Ensure is content-addressed and
+// owner-scoped; Remove is used only to compensate a newly-created blob when the
+// paired typed write fails.
+type PageAssetStore interface {
+	Ensure(agentName string, image []byte) (assetID string, created bool, err error)
+	Remove(agentName, assetID string) (removed bool, err error)
+}
+
 // SolveResult 解题结果 = 解 + 证据对象。
 type SolveResult struct {
 	Solution     string

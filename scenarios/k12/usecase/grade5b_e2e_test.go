@@ -2,7 +2,6 @@ package usecase_test
 
 import (
 	"context"
-	"database/sql"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/scenario"
@@ -10,9 +9,6 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/curriculum"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
-	"github.com/hexagon-codes/hexclaw/storage/migrate"
-
-	_ "modernc.org/sqlite"
 )
 
 // e2eSolver / e2eGrader：记录收到的 constraint，判错以触发入库。
@@ -31,14 +27,7 @@ func (e2eGrader) Grade(context.Context, string, string, string) (usecase.GradeOu
 
 func newRealDeps(t *testing.T) (usecase.Deps, *e2eSolver) {
 	t.Helper()
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	if err := migrate.Run(context.Background(), db, migrate.All); err != nil {
-		t.Fatal(err)
-	}
+	db := openMigratedTestDB(t)
 	db.Exec(`INSERT INTO agents(name) VALUES('xiaoming')`)
 	cur := curriculum.New() // 真人教版课标（含本轮补的 5 下）
 	reg := scenario.NewRegistry()

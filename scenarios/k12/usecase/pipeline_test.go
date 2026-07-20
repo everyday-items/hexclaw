@@ -2,15 +2,11 @@ package usecase
 
 import (
 	"context"
-	"database/sql"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
-	"github.com/hexagon-codes/hexclaw/storage/migrate"
-
-	_ "modernc.org/sqlite"
 )
 
 // --- fakes（engine 能力的替身，用例层可脱离真 engine 测全闭环）---
@@ -39,17 +35,7 @@ func (f *fakeInsights) WriteWeakness(_ context.Context, _, _, note string) error
 
 func newPipeline(t *testing.T, solver Solver, grader Grader, ins Insights) (Deps, *k12storage.Store) {
 	t.Helper()
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	// :memory: 每条连接各是一个独立空库——编排器异步 goroutine 会触发连接池开第二条连接
-	// （表全丢）。收敛单连接与生产“写路径单写连接”（§6.15）同构。
-	db.SetMaxOpenConns(1)
-	t.Cleanup(func() { db.Close() })
-	if err := migrate.Run(context.Background(), db, migrate.All); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	db := openMigratedTestDB(t)
 	for _, a := range []string{"mingming", "eval-agent"} {
 		if _, err := db.Exec(`INSERT INTO agents(name) VALUES(?)`, a); err != nil {
 			t.Fatalf("agent %s: %v", a, err)

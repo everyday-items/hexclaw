@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -12,6 +13,8 @@ import (
 )
 
 var ErrHexbakProblemAttempt = errors.New("hexbak Problem/Attempt ledger invalid")
+
+var legacyVirtualPageID = regexp.MustCompile(`^page-[0-9a-f]{20}$`)
 
 // PackHexbakProblemAttempts exports every V19 canonical submission owned by the
 // Tutor. Operational GradingJob runtime files are not reconstructed here: stable
@@ -43,6 +46,12 @@ func ReferencedHexbakProblemAssetIDs(
 	seen := make(map[string]struct{})
 	for i, snapshot := range snapshots {
 		for j, problem := range snapshot.Problems {
+			if legacyVirtualPageID.MatchString(problem.PageAssetID) {
+				// Webhook text submissions and pre-v5 photo facts used a stable page
+				// identity without a Blob. Preserve that signed fact, but never invent
+				// bytes or include it in the content manifest.
+				continue
+			}
 			owner, _, err := assetstore.Parse(problem.PageAssetID)
 			if err != nil || owner != agentName {
 				return nil, fmt.Errorf("%w: problem_attempts[%d].problems[%d] page asset owner/header 不一致", ErrHexbakProblemAttempt, i, j)
@@ -111,12 +120,14 @@ func migrateHexbakProblemAttempts(
 	for i := range out {
 		for j := range out[i].Problems {
 			problem := &out[i].Problems[j]
-			targetAssetID := assetIDs[problem.PageAssetID]
-			if targetAssetID == "" {
-				return nil, fmt.Errorf("%w: page asset %q has no target mapping", ErrHexbakProblemAttempt, problem.PageAssetID)
+			if !legacyVirtualPageID.MatchString(problem.PageAssetID) {
+				targetAssetID := assetIDs[problem.PageAssetID]
+				if targetAssetID == "" {
+					return nil, fmt.Errorf("%w: page asset %q has no target mapping", ErrHexbakProblemAttempt, problem.PageAssetID)
+				}
+				problem.PageAssetID = targetAssetID
 			}
 			problem.AgentName = targetAgent
-			problem.PageAssetID = targetAssetID
 		}
 		for j := range out[i].Attempts {
 			out[i].Attempts[j].AgentName = targetAgent

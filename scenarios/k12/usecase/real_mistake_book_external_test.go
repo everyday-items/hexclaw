@@ -2,7 +2,6 @@ package usecase_test
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,7 +16,6 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
-	"github.com/hexagon-codes/hexclaw/storage/migrate"
 )
 
 // mistakeCase 一道题的批改用例（child 答案铁定对/错，模型可靠抓判）。
@@ -27,7 +25,7 @@ type mistakeCase struct {
 	problem     string
 	answer      string   // 学生答案
 	kp          []string // 识题产出的知识点（回填进错题库 knowledge_point）
-	expectWrong bool     // 期望模型判错（软期望：仅用于对照，不 hard-fail）
+	expectWrong bool     // 固定算术真值；真实验收必须与该判定一致
 }
 
 // mistakeCases 3 道明确打错 + 2 道明确答对（对/错各复用题面，但用独立 session 隔离）。
@@ -54,7 +52,7 @@ func TestK12RealMistakeBookChain_RealModel(t *testing.T) {
 	}
 	base := envOr("HEXCLAW_REAL_LLM_BASE", "https://api.siliconflow.cn/v1/chat/completions")
 	model := envOr("HEXCLAW_REAL_LLM_MODEL", "Qwen/Qwen3.6-35B-A3B")
-	t.Logf("real mistake-book chain model=%q base=%q", model, base)
+	t.Logf("real mistake-book chain model=%q endpoint_configured=%t", model, strings.TrimSpace(base) != "")
 
 	k := newMistakeK12(t, realEvalExec(base, model, key))
 	// 免费 nano 模型每次 solve 20~90s；3 轮 × ~3~5 题 × (solve+grade) → 给足 20min。
@@ -75,14 +73,7 @@ func TestK12MistakeBookChain_StubWiring(t *testing.T) {
 // newMistakeK12 装配一套内存库 + 真实 SolveSkill/Grader（exec 决定桩/真模型）。
 func newMistakeK12(t *testing.T, exec engine.SubAgentExecFunc) *assembly.K12 {
 	t.Helper()
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	if err := migrate.Run(context.Background(), db, migrate.All); err != nil {
-		t.Fatal(err)
-	}
+	db := openMigratedTestDB(t)
 	if _, err := db.Exec(`INSERT INTO agents(name) VALUES('eval-agent')`); err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +86,8 @@ func newMistakeK12(t *testing.T, exec engine.SubAgentExecFunc) *assembly.K12 {
 	return k
 }
 
-// runMistakeChain 跑 rounds 轮批改，落全链路硬断言（链路 bug=FAIL）+ 软对照（模型能力=🟡 log）。
+// runMistakeChain 跑 rounds 轮批改，落全链路硬断言；固定算术题的 verdict 也是发布门，
+// 不能把模型误判或全程无结果记成 PASS。
 //
 // 硬不变量：
 //   - 判错 ⟹ 首次入库(RecordCreated) ⟹ 出现在错题库 ⟹ 记录 knowledge_point/error_cause 非空；WrongStep/ErrorCause 非空。
@@ -108,9 +100,10 @@ func runMistakeChain(t *testing.T, ctx context.Context, deps usecase.Deps, cases
 	createdSessions := map[string]bool{}
 	strongVerify := 0 // verifier 真用 code_exec / 强证据的题数（solve 方法论命脉）
 	graded := 0       // 成功拿到模型判定的题次（区分"链路验证过"与"全被上游限流"）
+	inconclusive := 0 // 上游/模型未产出可验收结果的题次
 
 	for r := 1; r <= rounds; r++ {
-		for _, c := range cases {
+		for caseIndex, c := range cases {
 			// 幂等复跑只重跑错题（对题第二轮无新语义）。
 			if r > 1 && !c.expectWrong {
 				continue
@@ -133,20 +126,24 @@ func runMistakeChain(t *testing.T, ctx context.Context, deps usecase.Deps, cases
 				if err == nil || ctx.Err() != nil {
 					break
 				}
-				t.Logf("round %d 题=%q attempt %d 失败, 重试: %v", r, c.problem, attempt, err)
+				t.Logf("round=%d case=%d attempt=%d failed error_type=%T; retrying", r, caseIndex+1, attempt, err)
 			}
 			if err != nil {
 				// ErrSolveFailed = solver/grader 上游或输出格式失败（免费 nano reasoning 模型能力/429/超时），
-				// 非链路 bug → 记 🟡 inconclusive 跳过本题，不 hard-fail。
+				// 单题上游波动先记 inconclusive 并继续收集其它证据；若最终没有任何
+				// 可验收判定，终态门必须 FAIL，不能形成 vacuous PASS。
 				// 其余（ErrInvalidInput 等结构性错误）= 真链路 bug → FAIL。
 				if errors.Is(err, usecase.ErrSolveFailed) || ctx.Err() != nil {
-					t.Logf("🟡 inconclusive(模型能力/上游，非链路 bug): round %d 题=%q 批改上游失败, 跳过: %v", r, c.problem, err)
+					inconclusive++
+					t.Logf("🟡 inconclusive(模型能力/上游，非链路 bug): round=%d case=%d error_type=%T",
+						r, caseIndex+1, err)
 					continue
 				}
-				t.Fatalf("round %d 题=%q: 批改链路错误(链路 bug): %v", r, c.problem, err)
+				t.Fatalf("round=%d case=%d: 批改链路错误(链路 bug): error_type=%T", r, caseIndex+1, err)
 			}
 			if res.OutOfScope {
-				t.Fatalf("round %d 题=%q: 意外超纲(OutOfScope=true, KP=%q)——本组题不应触发超纲", r, c.problem, res.OutOfScopeKP)
+				t.Fatalf("round=%d case=%d: 意外超纲(OutOfScope=true, kp_chars=%d)——本组题不应触发超纲",
+					r, caseIndex+1, len([]rune(res.OutOfScopeKP)))
 			}
 
 			graded++
@@ -155,56 +152,57 @@ func runMistakeChain(t *testing.T, ctx context.Context, deps usecase.Deps, cases
 			if res.Evidence.StrongTrust() {
 				strongVerify++
 			}
-			t.Logf("round %d | 题=%q child答=%q | verdict=%v RecordCreated=%v | WrongStep=%q ErrorCause=%q KP=%q | Badge=%q Verdict=%q EvidenceType=%q | 当前错题库计数=%d",
-				r, c.problem, c.answer, res.Outcome.Verdict, res.RecordCreated,
-				res.Outcome.WrongStep, res.Outcome.ErrorCause, res.Outcome.KnowledgePoint,
-				badge, res.Evidence.Verdict, res.Evidence.EvidenceType, len(recs))
+			t.Logf("round=%d case=%d verdict=%v record_created=%v wrong_step_chars=%d error_cause_chars=%d kp_chars=%d badge=%q evidence_verdict=%q evidence_type=%q mistake_count=%d",
+				r, caseIndex+1, res.Outcome.Verdict, res.RecordCreated,
+				len([]rune(res.Outcome.WrongStep)), len([]rune(res.Outcome.ErrorCause)),
+				len([]rune(res.Outcome.KnowledgePoint)), badge, res.Evidence.Verdict,
+				res.Evidence.EvidenceType, len(recs))
 
-			// 软对照：模型 verdict 与"铁定对/错"不符 = 免费模型能力问题，记 log 不 FAIL。
+			// 固定算术真值是 LIVE 门的一部分；模型误判不是可接受的链路通过证据。
 			if (res.Outcome.Verdict == usecase.VerdictAgree) == c.expectWrong {
-				t.Logf("🟡 inconclusive(模型能力，非链路 bug): round %d 题=%q child答=%q 期望判%s 实判%s——不 hard-fail，仅验证其判定之后的链路成立",
-					r, c.problem, c.answer, wrongWord(c.expectWrong), wrongWord(res.Outcome.Verdict != usecase.VerdictAgree))
+				t.Errorf("发布门判定错误: round=%d case=%d 期望判%s 实判%s",
+					r, caseIndex+1, wrongWord(c.expectWrong), wrongWord(res.Outcome.Verdict != usecase.VerdictAgree))
 			}
 
 			// 硬不变量：链路只对"模型实际判定"负责，与期望无关。
 			if res.Outcome.Verdict == usecase.VerdictDisagree {
 				// 判错分支：步骤清晰 + 入库 + 统计。
 				if strings.TrimSpace(res.Outcome.WrongStep) == "" {
-					t.Errorf("链路 bug: round %d 题=%q 判错但 WrongStep 为空（步骤不清晰）", r, c.problem)
+					t.Errorf("链路 bug: round=%d case=%d 判错但 WrongStep 为空（步骤不清晰）", r, caseIndex+1)
 				}
 				if strings.TrimSpace(res.Outcome.ErrorCause) == "" {
-					t.Errorf("链路 bug: round %d 题=%q 判错但 ErrorCause 为空（错因缺失）", r, c.problem)
+					t.Errorf("链路 bug: round=%d case=%d 判错但 ErrorCause 为空（错因缺失）", r, caseIndex+1)
 				}
 				if !already {
 					if !res.RecordCreated {
-						t.Errorf("链路 bug: round %d 题=%q 首次判错但未入库(RecordCreated=false)", r, c.problem)
+						t.Errorf("链路 bug: round=%d case=%d 首次判错但未入库(RecordCreated=false)", r, caseIndex+1)
 					}
 				} else {
 					if res.RecordCreated {
-						t.Errorf("链路 bug: round %d 题=%q 同 session 重复判错却再次入库(幂等去重失效)", r, c.problem)
+						t.Errorf("链路 bug: round=%d case=%d 同 session 重复判错却再次入库(幂等去重失效)", r, caseIndex+1)
 					}
 				}
 				// 判错题必须出现在错题库，且领域字段非空。
 				rec := findMistake(recs, c.session, c.problem)
 				if rec == nil {
-					t.Errorf("链路 bug: round %d 题=%q 判错却未出现在错题库(ListByScope)", r, c.problem)
+					t.Errorf("链路 bug: round=%d case=%d 判错却未出现在错题库(ListByScope)", r, caseIndex+1)
 				} else {
 					var f k12.MistakeFields
 					if err := json.Unmarshal([]byte(rec.Fields), &f); err != nil {
-						t.Errorf("链路 bug: round %d 题=%q 错题记录 Fields 非法 JSON: %v", r, c.problem, err)
+						t.Errorf("链路 bug: round=%d case=%d 错题记录 Fields 非法 JSON: error_type=%T", r, caseIndex+1, err)
 					} else {
 						if strings.TrimSpace(f.KnowledgePoint) == "" {
-							t.Errorf("链路 bug: round %d 题=%q 错题记录 knowledge_point 为空", r, c.problem)
+							t.Errorf("链路 bug: round=%d case=%d 错题记录 knowledge_point 为空", r, caseIndex+1)
 						}
 						if strings.TrimSpace(f.ErrorCause) == "" {
-							t.Errorf("链路 bug: round %d 题=%q 错题记录 error_cause 为空", r, c.problem)
+							t.Errorf("链路 bug: round=%d case=%d 错题记录 error_cause 为空", r, caseIndex+1)
 						}
 					}
 				}
 			} else {
 				// 判对分支：不得新入库。
 				if res.RecordCreated {
-					t.Errorf("链路 bug: round %d 题=%q 判对却新入错题库(RecordCreated=true)", r, c.problem)
+					t.Errorf("链路 bug: round=%d case=%d 判对却新入错题库(RecordCreated=true)", r, caseIndex+1)
 				}
 			}
 
@@ -219,18 +217,17 @@ func runMistakeChain(t *testing.T, ctx context.Context, deps usecase.Deps, cases
 	if len(final) != len(createdSessions) {
 		t.Errorf("链路 bug: 统计不准——错题库计数=%d, 期望去重题数=%d", len(final), len(createdSessions))
 	}
-	t.Logf("==== 终态：错题库计数=%d 去重入库 session=%d 成功批改题次=%d 强验证(verifier code_exec/异构)题次=%d ====",
-		len(final), len(createdSessions), graded, strongVerify)
+	t.Logf("==== 终态：错题库计数=%d 去重入库 session=%d 成功批改题次=%d inconclusive=%d 强验证(verifier code_exec/异构)题次=%d ====",
+		len(final), len(createdSessions), graded, inconclusive, strongVerify)
 	if graded == 0 {
-		// 全部 inconclusive（通常=免费额度耗尽/上游全限流）：非链路 bug，但也非有效链路证据——
-		// 此时"通过"是 vacuous，明确标注，避免误读为链路验证成功。
-		t.Logf("⚠️ 警告：本次 0 题拿到模型判定（多半是免费额度耗尽/上游全限流）——链路未被真实验证，通过为 vacuous，请择时重跑")
+		t.Fatalf("发布门无有效证据：成功批改题次=0 inconclusive=%d；必须在上游可用时重跑", inconclusive)
 	}
-	for _, rec := range final {
+	for recordIndex, rec := range final {
 		var f k12.MistakeFields
 		_ = json.Unmarshal([]byte(rec.Fields), &f)
-		t.Logf("  错题库记录: session=%q question=%q knowledge_point=%q error_cause=%q status=%q",
-			rec.SourceSession, f.Question, f.KnowledgePoint, f.ErrorCause, rec.Status)
+		t.Logf("mistake_record=%d question_chars=%d knowledge_point_chars=%d error_cause_chars=%d status=%q",
+			recordIndex+1, len([]rune(f.Question)), len([]rune(f.KnowledgePoint)),
+			len([]rune(f.ErrorCause)), rec.Status)
 	}
 }
 
@@ -238,7 +235,7 @@ func mustList(t *testing.T, ctx context.Context, deps usecase.Deps, agent string
 	t.Helper()
 	recs, err := deps.Records.ListByScope(ctx, agent, k12.CollectionMistakes, "")
 	if err != nil {
-		t.Fatalf("ListByScope(错题本) 失败: %v", err)
+		t.Fatalf("ListByScope(错题本) 失败: error_type=%T", err)
 	}
 	return recs
 }

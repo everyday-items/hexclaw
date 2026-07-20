@@ -2,7 +2,6 @@ package usecase_test
 
 import (
 	"context"
-	"database/sql"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/records"
@@ -11,9 +10,6 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/curriculum"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
-	"github.com/hexagon-codes/hexclaw/storage/migrate"
-
-	_ "modernc.org/sqlite"
 )
 
 type memProfileStore struct{ m map[string]k12.ChildProfile }
@@ -52,14 +48,7 @@ func (s *memProfileStore) ReplaceProfile(_ context.Context, a string, p *k12.Chi
 
 func newBackupDeps(t *testing.T) (usecase.Deps, *memProfileStore) {
 	t.Helper()
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	if err := migrate.Run(context.Background(), db, migrate.All); err != nil {
-		t.Fatal(err)
-	}
+	db := openMigratedTestDB(t)
 	db.Exec(`INSERT INTO agents(name) VALUES('xiaoming')`)
 	cur := curriculum.New()
 	reg := scenario.NewRegistry()

@@ -67,11 +67,122 @@ func (o *GradingOrchestrator) gradingBaseContext() context.Context {
 	return context.Background()
 }
 
+// beginWorkerLocked registers one process-owned operation. The seal check and
+// the 0->1 transition share o.mu with Shutdown, so a worker can never appear
+// after Shutdown captured the idle generation it waits on.
+func (o *GradingOrchestrator) beginWorkerLocked() bool {
+	if o.sealed {
+		return false
+	}
+	if o.workerCount == 0 {
+		o.workerIdle = make(chan struct{})
+	}
+	o.workerCount++
+	return true
+}
+
+func (o *GradingOrchestrator) finishWorker() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.workerCount <= 0 {
+		panic("grading orchestrator worker counter underflow")
+	}
+	o.workerCount--
+	if o.workerCount == 0 {
+		close(o.workerIdle)
+	}
+}
+
+// WaitForIdle waits for the current worker generation. It is observational and
+// does not seal the orchestrator; callers closing dependencies must use Shutdown.
+// Waiting selects directly on the generation channel and never creates a waiter
+// goroutine that could survive a context timeout.
+func (o *GradingOrchestrator) WaitForIdle(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	o.mu.Lock()
+	done := o.workerIdle
+	o.mu.Unlock()
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Shutdown seals the orchestrator, cancels all process-owned work, and waits
+// until grading, anchor, and recovery operations have returned. It is safe to
+// call repeatedly. Once sealed, StartAsync and recovery reject new work.
+func (o *GradingOrchestrator) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	o.mu.Lock()
+	o.sealed = true
+	done := o.workerIdle
+	cancel := o.runCancel
+	o.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// beginTrackedContext registers synchronous recovery work and merges the
+// caller's cancellation with the orchestrator lifecycle without starting a
+// waiter goroutine. Values and deadlines continue to come from the caller.
+func (o *GradingOrchestrator) beginTrackedContext(parent context.Context) (context.Context, func(), bool) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	o.mu.Lock()
+	if !o.beginWorkerLocked() {
+		o.mu.Unlock()
+		return nil, nil, false
+	}
+	runtimeCtx := o.baseCtx
+	o.mu.Unlock()
+
+	ctx, cancel := context.WithCancelCause(parent)
+	stopRuntimeCancel := context.AfterFunc(runtimeCtx, func() {
+		cancel(context.Cause(runtimeCtx))
+	})
+	if cause := context.Cause(runtimeCtx); cause != nil {
+		cancel(cause)
+	}
+	return ctx, func() {
+		stopRuntimeCancel()
+		cancel(context.Canceled)
+		o.finishWorker()
+	}, true
+}
+
 // StartAsync 异步推进一个 Job 到下一停点/终态。与调用方（HTTP 请求）context 解耦；
 // 同一 Job 已在推进中时记录一次 rerun 信号，当前轮退出前至少再读一次状态机；这样确认
 // 与锚点同时回位时不会因 active 守卫吞掉最后一次续跑。panic 不逃逸（§6.15）。
-func (o *GradingOrchestrator) StartAsync(jobID string) {
+func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 	o.mu.Lock()
+	if o.sealed {
+		o.mu.Unlock()
+		return false
+	}
 	if o.active == nil {
 		o.active = map[string]bool{}
 	}
@@ -81,12 +192,18 @@ func (o *GradingOrchestrator) StartAsync(jobID string) {
 		}
 		o.rerun[jobID] = true
 		o.mu.Unlock()
-		return
+		return true
 	}
 	o.active[jobID] = true
+	if !o.beginWorkerLocked() {
+		delete(o.active, jobID)
+		o.mu.Unlock()
+		return false
+	}
 	o.mu.Unlock()
 
 	go func() {
+		defer o.finishWorker()
 		for {
 			func() {
 				defer func() {
@@ -94,7 +211,11 @@ func (o *GradingOrchestrator) StartAsync(jobID string) {
 						slog.Error("K12 批改任务异步推进 panic（已捕获，任务留在当前落库状态）", "job", jobID, "panic", r)
 					}
 				}()
-				o.sem <- struct{}{}
+				select {
+				case o.sem <- struct{}{}:
+				case <-o.gradingBaseContext().Done():
+					return
+				}
 				defer func() { <-o.sem }()
 				if _, err := o.RunGradingJob(o.gradingBaseContext(), jobID); err != nil {
 					// 阶段失败已由状态机安全落 failed_retryable/failed_terminal；此处仅取证。
@@ -113,6 +234,7 @@ func (o *GradingOrchestrator) StartAsync(jobID string) {
 			return
 		}
 	}()
+	return true
 }
 
 // GradingQuestionCorrection 家长对识别结果的逐题确认/修正（§6.7 公共命令③的结构化载荷）。
@@ -427,6 +549,12 @@ func (o *GradingOrchestrator) typedRecognizedQuestions(ctx context.Context, jobI
 // 且可重试回 queued 重新入列；其余自动阶段直接异步续跑（RunGradingJob 从当前 stage 起，
 // 已固化检查点的阶段回放产物，不重复调模型）。恢复不产生重复 Submission（同 Job 续跑）。
 func (o *GradingOrchestrator) RecoverGradingJobs(ctx context.Context, agents []string) (int, error) {
+	trackedCtx, finish, ok := o.beginTrackedContext(ctx)
+	if !ok {
+		return 0, ErrGradingOrchestratorShutdown
+	}
+	defer finish()
+	ctx = trackedCtx
 	if o.runDir == "" {
 		return 0, nil
 	}

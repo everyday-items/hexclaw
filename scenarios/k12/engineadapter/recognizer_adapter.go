@@ -20,6 +20,7 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/resourcegov"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
@@ -31,10 +32,58 @@ import (
 type VisionFunc func(ctx context.Context, image []byte, prompt string) (string, error)
 
 // RecognizerAdapter 用视觉模型把作业照片识别成结构化题目。
-type RecognizerAdapter struct{ vision VisionFunc }
+type RecognizerAdapter struct {
+	vision   VisionFunc
+	governor *resourcegov.Governor
+}
+
+type RecognizerOption func(*RecognizerAdapter)
+
+// WithRecognizerResourceGovernor injects the process-scoped VLM budget. Dense
+// page fan-out still competes with Knowledge OCR through this same governor.
+func WithRecognizerResourceGovernor(governor *resourcegov.Governor) RecognizerOption {
+	return func(adapter *RecognizerAdapter) { adapter.governor = governor }
+}
 
 // NewRecognizerAdapter 创建 adapter。
-func NewRecognizerAdapter(v VisionFunc) *RecognizerAdapter { return &RecognizerAdapter{vision: v} }
+func NewRecognizerAdapter(v VisionFunc, options ...RecognizerOption) *RecognizerAdapter {
+	adapter := &RecognizerAdapter{vision: v}
+	for _, option := range options {
+		if option != nil {
+			option(adapter)
+		}
+	}
+	return adapter
+}
+
+func (a *RecognizerAdapter) callVision(ctx context.Context, image []byte, prompt string) (string, error) {
+	if a.governor == nil {
+		return a.vision(ctx, image, prompt)
+	}
+	permit, err := a.governor.Acquire(ctx, resourcegov.ResourceVLM, resourcegov.PriorityInteractive)
+	if err != nil {
+		return "", err
+	}
+	defer permit.Release()
+	return a.vision(ctx, image, prompt)
+}
+
+func (a *RecognizerAdapter) splitWorksheet(
+	ctx context.Context,
+	image []byte,
+) ([]worksheetSegment, bool, error) {
+	if a.governor == nil {
+		segments, ok := splitDenseWorksheetImage(image)
+		return segments, ok, nil
+	}
+	permit, err := a.governor.Acquire(ctx, resourcegov.ResourceCPUHeavy, resourcegov.PriorityInteractive)
+	if err != nil {
+		return nil, false, err
+	}
+	defer permit.Release()
+	segments, ok := splitDenseWorksheetImage(image)
+	return segments, ok, nil
+}
 
 var _ usecase.Recognizer = (*RecognizerAdapter)(nil)
 
@@ -179,13 +228,17 @@ func (a *RecognizerAdapter) Recognize(ctx context.Context, image []byte) ([]usec
 	// 密集长作业按固定的页面几何切成 5 个重叠纵向分片，并追加 1 个整页印刷题清单
 	// 单元；六者同波并行。清单负责题干完整性，分片负责手写候选，图片坐标仍属于独立的
 	// AnswerAnchorer 第二阶段。明确的瞬时上游错误只低并发重试失败单元一次。
-	if segments, ok := splitDenseWorksheetImage(image); ok {
+	segments, dense, err := a.splitWorksheet(ctx, image)
+	if err != nil {
+		return nil, fmt.Errorf("recognizer: 图片预处理被取消: %w", err)
+	}
+	if dense {
 		segments = append(segments, worksheetSegment{
 			image: image, index: 0, total: len(segments), printedInventory: true,
 		})
 		return a.recognizeSegments(ctx, segments)
 	}
-	raw, err := a.vision(ctx, image, recognizePrompt)
+	raw, err := a.callVision(ctx, image, recognizePrompt)
 	if err != nil {
 		return nil, fmt.Errorf("recognizer: 视觉模型调用失败: %w", err)
 	}
@@ -195,7 +248,7 @@ func (a *RecognizerAdapter) Recognize(ctx context.Context, image []byte) ([]usec
 func parseRecognizedQuestions(raw string) ([]usecase.RecognizedQuestion, error) {
 	var dtos []recognizedDTO
 	if err := json.Unmarshal([]byte(sanitizeModelJSON(extractJSON(raw))), &dtos); err != nil {
-		return nil, fmt.Errorf("recognizer: 解析识题结果失败: %w（原始: %.120s）", err, raw)
+		return nil, fmt.Errorf("recognizer: 解析识题结果失败: %w", err)
 	}
 	out := make([]usecase.RecognizedQuestion, 0, len(dtos))
 	for _, d := range dtos {
@@ -231,7 +284,7 @@ func parseRecognizedQuestions(raw string) ([]usecase.RecognizedQuestion, error) 
 func parsePrintedQuestionInventory(raw string) ([]usecase.RecognizedQuestion, error) {
 	var dtos []recognizedDTO
 	if err := json.Unmarshal([]byte(sanitizeModelJSON(extractJSON(raw))), &dtos); err != nil {
-		return nil, fmt.Errorf("recognizer: 解析印刷题清单失败: %w（原始: %.120s）", err, raw)
+		return nil, fmt.Errorf("recognizer: 解析印刷题清单失败: %w", err)
 	}
 	out := make([]usecase.RecognizedQuestion, 0, len(dtos))
 	for _, dto := range dtos {
@@ -489,7 +542,7 @@ func (a *RecognizerAdapter) recognizeSegment(ctx context.Context, segment worksh
 		return segmentRecognitionResult{err: err}
 	}
 	if segment.printedInventory {
-		raw, err := a.vision(ctx, segment.image, printedQuestionInventoryPrompt)
+		raw, err := a.callVision(ctx, segment.image, printedQuestionInventoryPrompt)
 		if err != nil {
 			return segmentRecognitionResult{
 				err:                  fmt.Errorf("整页印刷题清单视觉模型调用失败: %w", err),
@@ -505,7 +558,7 @@ func (a *RecognizerAdapter) recognizeSegment(ctx context.Context, segment worksh
 	prompt := fmt.Sprintf(`%s
 
 这是原作业图片的纵向分片 %d/%d。只识别在本分片内题干完整可见的题目；紧贴上/下边缘且被截断的残题必须忽略，重叠区域的完整题照常输出。JSON 必须紧凑输出，不要缩进。`, recognizePrompt, segment.index, segment.total)
-	raw, err := a.vision(ctx, segment.image, prompt)
+	raw, err := a.callVision(ctx, segment.image, prompt)
 	if err != nil {
 		return segmentRecognitionResult{
 			err:                  fmt.Errorf("分片 %d/%d 视觉模型调用失败: %w", segment.index, segment.total, err),

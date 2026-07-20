@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
@@ -52,7 +53,19 @@ func newOrchestrator(t *testing.T, rec Recognizer, anchorer AnswerAnchorer, anno
 	d.Recognizer = rec
 	d.AnswerAnchorer = anchorer
 	d.PhotoAnnotator = annotator
-	return NewGradingOrchestrator(d, orchestratorSnapshot)
+	return trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshot))
+}
+
+func trackGradingOrchestrator(t *testing.T, o *GradingOrchestrator) *GradingOrchestrator {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := o.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown grading orchestrator before test database cleanup: %v", err)
+		}
+	})
+	return o
 }
 
 func orchestratorPhotoRequest() PhotoGradeRequest {

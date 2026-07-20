@@ -41,6 +41,16 @@ var extByMIME = map[string]string{
 	"image/webp": "webp",
 }
 
+// PageStore adapts the package's content-addressed file operations to the K12
+// usecase PageAssetStore port without exposing filesystem paths to the domain.
+type PageStore struct{}
+
+func (PageStore) Ensure(agent string, data []byte) (string, bool, error) {
+	return Ensure(agent, data)
+}
+
+func (PageStore) Remove(agent, id string) (bool, error) { return Remove(agent, id) }
+
 // fileRe 落盘文件名白名单：64 位 sha256 hex + 白名单扩展名。杜绝路径穿越/注入。
 var fileRe = regexp.MustCompile(`^[0-9a-f]{64}\.(png|jpg|gif|webp)$`)
 

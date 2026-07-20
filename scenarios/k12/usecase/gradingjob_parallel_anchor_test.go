@@ -2,7 +2,9 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"reflect"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -61,6 +63,32 @@ func (a *deadlineGradingAnchorer) AnchorAnswers(ctx context.Context, _ []byte, _
 	return nil, ctx.Err()
 }
 
+type cancelBlockingRecognizer struct {
+	started chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (r *cancelBlockingRecognizer) Recognize(ctx context.Context, _ []byte) ([]RecognizedQuestion, error) {
+	r.once.Do(func() { close(r.started) })
+	<-ctx.Done()
+	close(r.done)
+	return nil, ctx.Err()
+}
+
+type remainingBudgetAnchorer struct {
+	remaining chan time.Duration
+}
+
+func (a *remainingBudgetAnchorer) AnchorAnswers(ctx context.Context, _ []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil, errors.New("anchor provider context has no deadline")
+	}
+	a.remaining <- time.Until(deadline)
+	return cloneRecognizedQuestions(questions), nil
+}
+
 func newParallelAnchorOrchestrator(t *testing.T, rec Recognizer, anchorer AnswerAnchorer, opts ...GradingOrchestratorOption) *GradingOrchestrator {
 	t.Helper()
 	d, _ := newPipeline(t,
@@ -71,7 +99,7 @@ func newParallelAnchorOrchestrator(t *testing.T, rec Recognizer, anchorer Answer
 	d.Recognizer = rec
 	d.AnswerAnchorer = anchorer
 	d.PhotoAnnotator = &photoAnnotatorFake{}
-	return NewGradingOrchestrator(d, orchestratorSnapshot, opts...)
+	return trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshot, opts...))
 }
 
 func waitGradingView(t *testing.T, o *GradingOrchestrator, jobID string, match func(GradingJobView) bool) GradingJobView {
@@ -294,6 +322,230 @@ func TestGradingOrchestratorAnchorTimeoutPersistsDegradedAndTextGradingContinues
 	result, ok := o.PhotoResult(jobID)
 	if !ok || result.Markdown == "" {
 		t.Fatalf("锚点超时不得阻断文字批改: ok=%v result=%+v", ok, result)
+	}
+}
+
+func TestGradingOrchestratorWaitForIdleIncludesAnchorAndFollowupWorkers(t *testing.T) {
+	anchorer := &blockingGradingAnchorer{started: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() {
+		select {
+		case <-anchorer.release:
+		default:
+			close(anchorer.release)
+		}
+	})
+	rec := &countingRecognizer{questions: []RecognizedQuestion{{
+		Question: "1+1=", Subject: "数学", StudentAnswer: "3", AnswerState: AnswerStatePresent,
+	}}}
+	o := newParallelAnchorOrchestrator(t, rec, anchorer)
+	jobID := startOrchestratorJob(t, o, "msg-worker-lifecycle").Record.RecordID
+	if _, err := o.RunGradingJob(context.Background(), jobID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-anchorer.started:
+	case <-time.After(time.Second):
+		t.Fatal("未启动锚点分支")
+	}
+	if _, ok, err := o.ConfirmPhotoGradingJob(context.Background(), jobID, ConfirmPhotoGradingInput{}); err != nil || !ok {
+		t.Fatalf("confirm: ok=%v err=%v", ok, err)
+	}
+
+	blockedCtx, cancelBlocked := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancelBlocked()
+	if err := o.WaitForIdle(blockedCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("blocked anchor must keep orchestrator non-idle, got %v", err)
+	}
+	baselineGoroutines := runtime.NumGoroutine()
+	for i := 0; i < 32; i++ {
+		cancelledCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := o.WaitForIdle(cancelledCtx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled wait %d: %v", i, err)
+		}
+	}
+	runtime.Gosched()
+	if delta := runtime.NumGoroutine() - baselineGoroutines; delta > 4 {
+		t.Fatalf("timed-out WaitForIdle leaked waiter goroutines: delta=%d", delta)
+	}
+	close(anchorer.release)
+
+	drainedCtx, cancelDrained := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelDrained()
+	if err := o.WaitForIdle(drainedCtx); err != nil {
+		t.Fatalf("wait for anchor and follow-up grading workers: %v", err)
+	}
+	final, err := o.deps.GetGradingJob(context.Background(), "mingming", jobID)
+	if err != nil || final.Record.Status != k12.GradingStageCompleted {
+		t.Fatalf("drained orchestrator must persist terminal state: stage=%v err=%v", final.Record.Status, err)
+	}
+}
+
+func TestGradingOrchestratorShutdownTracksRecoveryAndRejectsPostSealScan(t *testing.T) {
+	d, _ := newPipeline(t,
+		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil)
+	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshot, WithGradingRunDir(t.TempDir())))
+
+	conn, err := d.Records.DB().Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	recoveryDone := make(chan error, 1)
+	go func() {
+		_, recoverErr := o.RecoverGradingJobs(context.Background(), []string{"mingming"})
+		recoveryDone <- recoverErr
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		o.mu.Lock()
+		workers := o.workerCount
+		o.mu.Unlock()
+		if workers == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("recovery was not registered as a tracked worker")
+		}
+		runtime.Gosched()
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := o.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutdown recovery scan: %v", err)
+	}
+	select {
+	case err := <-recoveryDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("recovery cancellation error=%v", err)
+		}
+	default:
+		t.Fatal("Shutdown returned before recovery exited")
+	}
+	if _, err := o.RecoverGradingJobs(context.Background(), []string{"mingming"}); !errors.Is(err, ErrGradingOrchestratorShutdown) {
+		t.Fatalf("post-seal recovery error=%v, want ErrGradingOrchestratorShutdown", err)
+	}
+}
+
+func TestGradingOrchestratorShutdownSealsCancelsAndDrainsAsyncGrading(t *testing.T) {
+	recognizer := &cancelBlockingRecognizer{started: make(chan struct{}), done: make(chan struct{})}
+	o := newParallelAnchorOrchestrator(t, recognizer, nil)
+	jobID := startOrchestratorJob(t, o, "msg-shutdown-grading").Record.RecordID
+	if accepted := o.StartAsync(jobID); !accepted {
+		t.Fatal("running orchestrator must accept asynchronous grading")
+	}
+	select {
+	case <-recognizer.started:
+	case <-time.After(time.Second):
+		t.Fatal("recognizer worker did not start")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := o.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutdown grading worker: %v", err)
+	}
+	select {
+	case <-recognizer.done:
+	default:
+		t.Fatal("Shutdown returned before the canceled recognizer exited")
+	}
+	if accepted := o.StartAsync(jobID); accepted {
+		t.Fatal("sealed orchestrator accepted work after Shutdown")
+	}
+	view, err := o.deps.GetGradingJob(context.Background(), "mingming", jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Record.Status != k12.GradingStageOutcomeUnknown {
+		t.Fatalf("sent provider call canceled by shutdown must be outcome_unknown, got %s", view.Record.Status)
+	}
+	invocations, err := o.deps.Records.ListModelInvocations(context.Background(), "mingming", jobID)
+	if err != nil || len(invocations) != 1 {
+		t.Fatalf("list canceled invocation: count=%d err=%v", len(invocations), err)
+	}
+	if invocations[0].Status != k12.ModelInvocationOutcomeUnknown {
+		t.Fatalf("canceled sent invocation status=%s, want outcome_unknown", invocations[0].Status)
+	}
+}
+
+func TestGradingOrchestratorShutdownCancelsAndDrainsAnchor(t *testing.T) {
+	anchorer := &blockingGradingAnchorer{started: make(chan struct{}), release: make(chan struct{})}
+	recognizer := &countingRecognizer{questions: []RecognizedQuestion{{
+		Question: "1+1=", Subject: "数学", StudentAnswer: "3", AnswerState: AnswerStatePresent,
+	}}}
+	o := newParallelAnchorOrchestrator(t, recognizer, anchorer)
+	jobID := startOrchestratorJob(t, o, "msg-shutdown-anchor").Record.RecordID
+	if _, err := o.RunGradingJob(context.Background(), jobID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-anchorer.started:
+	case <-time.After(time.Second):
+		t.Fatal("anchor worker did not start")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := o.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutdown anchor worker: %v", err)
+	}
+	invocations, err := o.deps.Records.ListModelInvocations(context.Background(), "mingming", jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundUnknownAnchor := false
+	for _, invocation := range invocations {
+		if invocation.Stage == k12.GradingStageLocating && invocation.Status == k12.ModelInvocationOutcomeUnknown {
+			foundUnknownAnchor = true
+		}
+	}
+	if !foundUnknownAnchor {
+		t.Fatalf("shutdown-canceled anchor must retain outcome_unknown ledger evidence: %+v", invocations)
+	}
+}
+
+func TestGradingOrchestratorAnchorProviderBudgetStartsAfterSlowLedger(t *testing.T) {
+	const providerBudget = 200 * time.Millisecond
+	const ledgerDelay = 120 * time.Millisecond
+	anchorer := &remainingBudgetAnchorer{remaining: make(chan time.Duration, 1)}
+	recognizer := &countingRecognizer{questions: []RecognizedQuestion{{
+		Question: "1+1=", Subject: "数学", StudentAnswer: "3", AnswerState: AnswerStatePresent,
+	}}}
+	o := newParallelAnchorOrchestrator(t, recognizer, anchorer, WithGradingAnchorTimeout(providerBudget))
+	job := startOrchestratorJob(t, o, "msg-slow-ledger-anchor")
+
+	conn, err := o.deps.Records.DB().Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, _, _, _ = o.executeAnchor(job.Record.RecordID, "mingming", []byte("image"),
+			[]RecognizedQuestion{{Question: "1+1=", StudentAnswer: "3", AnswerState: AnswerStatePresent}},
+			orchestratorSnapshot())
+		result <- nil
+	}()
+	timer := time.NewTimer(ledgerDelay)
+	<-timer.C
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case remaining := <-anchorer.remaining:
+		if remaining < providerBudget-ledgerDelay/3 {
+			t.Fatalf("slow ledger consumed provider timeout: remaining=%s budget=%s", remaining, providerBudget)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("anchor provider was not called after releasing the ledger connection")
+	}
+	select {
+	case <-result:
+	case <-time.After(time.Second):
+		t.Fatal("executeAnchor did not return")
 	}
 }
 

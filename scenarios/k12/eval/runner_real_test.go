@@ -30,7 +30,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -65,7 +64,7 @@ func TestK12EvalSuites_RealModel(t *testing.T) {
 	}
 	// holdout 前置：封存哈希必须一致（跑在被改动的 holdout 上的报告无效）。
 	if err := VerifyHoldoutSealed(); err != nil {
-		t.Fatalf("holdout 封存校验失败: %v", err)
+		t.Fatalf("holdout 封存校验失败: error_type=%T", err)
 	}
 	manifestSHA, err := HoldoutManifestSHA()
 	if err != nil {
@@ -73,7 +72,7 @@ func TestK12EvalSuites_RealModel(t *testing.T) {
 	}
 
 	providerName, model, baseURL, apiKey := resolveRealProvider(t)
-	t.Logf("real eval provider=%s model=%s base=%s split=%s limit=%d", providerName, model, safeHost(baseURL), split, limit)
+	t.Logf("real eval provider=%s model=%s split=%s limit=%d", providerName, model, split, limit)
 
 	deps := wireRealDeps(t, baseURL, model, apiKey)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
@@ -101,19 +100,22 @@ func TestK12EvalSuites_RealModel(t *testing.T) {
 	// 套件 4/5/6 确定性部分（同分割）。
 	report.Suites = append(report.Suites, runBoundaryCases(t, split), runProductCases(t, split), runRedlineCases(t, split))
 
-	path, finalized, err := WriteReport("reports", report)
+	_, finalized, err := WriteReport("reports", report)
 	if err != nil {
-		t.Fatalf("报告落盘失败: %v", err)
+		t.Fatalf("报告落盘失败: error_type=%T", err)
 	}
-	blob, _ := json.MarshalIndent(finalized, "", "  ")
-	t.Logf("eval report %s written to %s\n%s", finalized.ReportID, path, blob)
+	t.Logf("eval report ready: report_id=%s suites=%d", finalized.ReportID, len(finalized.Suites))
 
 	// 执行类失败（调用错误）一律 FAIL——启用真机门后不允许静默降级。
 	for _, s := range finalized.Suites {
+		executionFailures := 0
 		for _, f := range s.Failures {
 			if strings.Contains(f, "执行错误") {
-				t.Fatalf("套件 %s 存在执行错误: %s", s.Suite, f)
+				executionFailures++
 			}
+		}
+		if executionFailures > 0 {
+			t.Fatalf("套件 %s 存在执行错误: count=%d", s.Suite, executionFailures)
 		}
 	}
 	// 门槛执行：holdout 全量运行 = 发布评审口径（§5.7）；dev/小规模 = 冒烟取证，只记录不判门。
@@ -126,7 +128,8 @@ func TestK12EvalSuites_RealModel(t *testing.T) {
 		}
 		for _, s := range finalized.Suites {
 			if s.Mode == "deterministic" && s.Passed != s.Total {
-				t.Fatalf("确定性套件 %s holdout %d/%d 未全过: %v", s.Suite, s.Passed, s.Total, s.Failures)
+				t.Fatalf("确定性套件 %s holdout %d/%d 未全过: failure_count=%d",
+					s.Suite, s.Passed, s.Total, len(s.Failures))
 			}
 		}
 	}
@@ -165,7 +168,7 @@ func runJudgmentReal(ctx context.Context, t *testing.T, deps usecase.Deps, split
 			Problem: in.Problem, StudentAnswer: in.StudentAnswer, KnowledgePoints: in.KnowledgePoints,
 		})
 		if err != nil {
-			res.Failures = append(res.Failures, fmt.Sprintf("%s: 执行错误: %v", c.ID, err))
+			res.Failures = append(res.Failures, fmt.Sprintf("%s: 执行错误: error_type=%T", c.ID, err))
 			continue
 		}
 		if c.Kind == "oos" {
@@ -222,7 +225,7 @@ func resolveRealProvider(t *testing.T) (providerName, model, baseURL, apiKey str
 	t.Helper()
 	cfg, err := config.Load("")
 	if err != nil {
-		t.Fatalf("加载本机 HexClaw 配置: %v", err)
+		t.Fatalf("加载本机 HexClaw 配置: error_type=%T", err)
 	}
 	providerName = envDefault("HEXCLAW_K12_EVAL_PROVIDER", strings.TrimSpace(cfg.LLM.ReasoningProvider))
 	if providerName == "" {
@@ -387,11 +390,4 @@ func envDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-func safeHost(raw string) string {
-	if u, err := url.Parse(raw); err == nil {
-		return u.Host
-	}
-	return "unparsed"
 }

@@ -57,10 +57,10 @@ func packHexbakAssetIDs(agent string, refs []string) ([]HexbakAsset, error) {
 	return out, nil
 }
 
-// mergeHexbakAssets combines independently discovered canonical references into
+// MergeHexbakAssets combines independently discovered canonical references into
 // one deterministic exact-set manifest. The same content ID may be referenced by
 // records and V19 Problems, but its bytes are packed once.
-func mergeHexbakAssets(groups ...[]HexbakAsset) ([]HexbakAsset, error) {
+func MergeHexbakAssets(groups ...[]HexbakAsset) ([]HexbakAsset, error) {
 	byID := make(map[string]HexbakAsset)
 	for _, group := range groups {
 		for _, item := range group {

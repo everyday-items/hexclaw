@@ -68,6 +68,7 @@ func (photoJobAnnotator) Annotate(context.Context, []byte, []usecase.PhotoAnnota
 
 func newPhotoJobServer(t *testing.T, rec usecase.Recognizer) http.Handler {
 	t.Helper()
+	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +138,7 @@ func pollJobAnchorState(t *testing.T, h http.Handler, jobID, want string) map[st
 
 func createPhotoJob(t *testing.T, h http.Handler, sourceKey string) string {
 	t.Helper()
-	img := base64.StdEncoding.EncodeToString([]byte("photo-bytes-" + sourceKey))
+	img := base64.StdEncoding.EncodeToString(photoJobPNG(sourceKey))
 	rec, out := do(t, h, "POST", "/grading-jobs",
 		fmt.Sprintf(`{"agent":"mingming","source_kind":"desktop","source_key":%q,"image_base64":%q}`, sourceKey, img))
 	if rec.Code != http.StatusOK {
@@ -149,6 +150,10 @@ func createPhotoJob(t *testing.T, h http.Handler, sourceKey string) string {
 		t.Fatalf("响应缺 job_id: %v", out)
 	}
 	return id
+}
+
+func photoJobPNG(sourceKey string) []byte {
+	return []byte("\x89PNG\r\n\x1a\nphoto-bytes-" + sourceKey)
 }
 
 func TestPhotoJobHTTP_DesktopFlowToCompleted(t *testing.T) {
@@ -191,7 +196,7 @@ func TestPhotoJobHTTP_DesktopFlowToCompleted(t *testing.T) {
 	}
 
 	// 幂等：同键重投命中既有 Job。
-	img := base64.StdEncoding.EncodeToString([]byte("photo-bytes-req-1"))
+	img := base64.StdEncoding.EncodeToString(photoJobPNG("req-1"))
 	rec2, out2 := do(t, h, "POST", "/grading-jobs",
 		fmt.Sprintf(`{"agent":"mingming","source_kind":"desktop","source_key":"req-1","image_base64":%q}`, img))
 	if rec2.Code != http.StatusOK || out2["created"] != false {

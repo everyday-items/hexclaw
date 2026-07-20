@@ -17,7 +17,10 @@ import (
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
-var ErrModelInvocationRequiresReconciliation = errors.New("model invocation requires reconciliation")
+var (
+	ErrModelInvocationRequiresReconciliation = errors.New("model invocation requires reconciliation")
+	ErrGradingOrchestratorShutdown           = errors.New("grading orchestrator is shut down")
+)
 
 // GradingOrchestrator 统一 GradingJob 编排器（架构设计 §6.7 状态机 / §6.15 单机执行模型·二阶段）。
 //
@@ -45,6 +48,8 @@ type GradingOrchestrator struct {
 	runDir string
 	// baseCtx 异步推进基座 context（与 HTTP 请求解耦，§6.15 任务执行模型）。
 	baseCtx context.Context
+	// runCancel 取消全部进程持有的 grading/anchor/recovery 工作；只由 Shutdown 调用。
+	runCancel context.CancelFunc
 	// sem 异步推进有界并发信号量。
 	sem chan struct{}
 	// anchorTimeout 锚点增强分支的独立预算（默认 60s，可通过 option 配置）。
@@ -57,6 +62,18 @@ type GradingOrchestrator struct {
 	anchorActive map[string]bool          // 独立锚点分支守卫（外部调用不占 Job 锁）
 	anchorDone   map[string]chan struct{} // 同步入口只等待分支完成，不让模型调用占用 Job 锁
 	locks        map[string]*sync.Mutex   // 每 Job 执行互斥：状态合并/写回与确认/重试/读产物串行化
+	sealed       bool                     // Shutdown 后拒绝新的异步推进/锚点/恢复工作
+	workerCount  int                      // mu 下维护，覆盖 grading + anchor + recovery
+	workerIdle   chan struct{}            // workerCount 归零时关闭；新一轮 0→1 时替换
+	// pageAssetLocks serializes the file+V19 compensated command by owner and
+	// SubmissionID, so two same-photo Jobs cannot race one failure cleanup against
+	// another successful reference.
+	pageAssetLocks map[string]*pageAssetLockEntry
+}
+
+type pageAssetLockEntry struct {
+	mutex sync.Mutex
+	refs  int
 }
 
 // jobLock 取（或建）某 Job 的执行互斥。run 内存状态与状态机写回都只在持锁下发生，
@@ -73,6 +90,32 @@ func (o *GradingOrchestrator) jobLock(jobID string) *sync.Mutex {
 		o.locks[jobID] = l
 	}
 	return l
+}
+
+func (o *GradingOrchestrator) acquirePageAssetLock(agentName, submissionID string) func() {
+	key := agentName + "\x00" + submissionID
+	o.mu.Lock()
+	if o.pageAssetLocks == nil {
+		o.pageAssetLocks = map[string]*pageAssetLockEntry{}
+	}
+	entry, ok := o.pageAssetLocks[key]
+	if !ok {
+		entry = &pageAssetLockEntry{}
+		o.pageAssetLocks[key] = entry
+	}
+	entry.refs++
+	o.mu.Unlock()
+
+	entry.mutex.Lock()
+	return func() {
+		entry.mutex.Unlock()
+		o.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(o.pageAssetLocks, key)
+		}
+		o.mu.Unlock()
+	}
 }
 
 // gradingRun 一个在途 Job 的进程内运行时状态（阶段中间产物）。
@@ -103,12 +146,19 @@ func NewGradingOrchestrator(deps Deps, snapshotFn func() k12.GradingModelSnapsho
 		deps: deps, snapshotFn: snapshotFn,
 		runs: map[string]*gradingRun{}, active: map[string]bool{}, rerun: map[string]bool{},
 		anchorActive: map[string]bool{}, anchorDone: map[string]chan struct{}{}, locks: map[string]*sync.Mutex{},
-		sem: make(chan struct{}, 2), baseCtx: context.Background(),
+		pageAssetLocks: map[string]*pageAssetLockEntry{},
+		sem:            make(chan struct{}, 2), baseCtx: context.Background(),
 		anchorTimeout: time.Duration(k12.GradingAnchorTimeoutSeconds) * time.Second,
 	}
 	for _, opt := range opts {
 		opt(o)
 	}
+	if o.baseCtx == nil {
+		o.baseCtx = context.Background()
+	}
+	o.baseCtx, o.runCancel = context.WithCancel(o.baseCtx)
+	o.workerIdle = make(chan struct{})
+	close(o.workerIdle)
 	return o
 }
 
@@ -406,7 +456,7 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 		// 核心识别冻结事实不接纳 geometry；BBox 只能由独立 anchor 分支补入。
 		run.questions[i].BBox = nil
 	}
-	if perr := o.persistProblemAttemptFacts(ctx, run.agentName, job.Fields.SubmissionID, run.questions); perr != nil {
+	if perr := o.persistRecognizedPhotoFacts(ctx, run, job.Fields.SubmissionID); perr != nil {
 		_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), run.agentName,
 			invocation.InvocationID, "typed_result_not_durable")
 		v, aerr := o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run, jobID, "typed_result_not_durable")
@@ -436,10 +486,62 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 	return o.advanceOK(ctx, run, jobID, fmt.Sprintf("questions:%d", len(questions)))
 }
 
+// persistRecognizedPhotoFacts is the compensated local command that promotes a
+// source image and its typed recognition together. The file store cannot join a
+// SQLite transaction, so a newly-created blob is removed if the atomic V19 write
+// fails. Same-submission calls are serialized to keep that cleanup race-free in
+// the single-process execution model.
+func (o *GradingOrchestrator) persistRecognizedPhotoFacts(
+	ctx context.Context,
+	run *gradingRun,
+	submissionID string,
+) error {
+	if o.deps.PageAssets == nil {
+		// Compatibility for embedded/test compositions and historical page-* facts.
+		// Production assembly always injects PageAssets.
+		return o.persistProblemAttemptFacts(ctx, run.agentName, submissionID, run.questions)
+	}
+	release := o.acquirePageAssetLock(run.agentName, submissionID)
+	defer release()
+
+	assetID, created, err := o.deps.PageAssets.Ensure(run.agentName, run.req.Image)
+	if err != nil {
+		return fmt.Errorf("usecase: 固化识题原图资产: %w", err)
+	}
+	if strings.TrimSpace(assetID) == "" {
+		if created {
+			_, _ = o.deps.PageAssets.Remove(run.agentName, assetID)
+		}
+		return fmt.Errorf("usecase: 固化识题原图资产返回空 ID")
+	}
+	previousPageIDs := make([]string, len(run.questions))
+	for i := range run.questions {
+		previousPageIDs[i] = run.questions[i].PageAssetID
+		run.questions[i].PageAssetID = assetID
+	}
+	if err := o.persistProblemAttemptFacts(ctx, run.agentName, submissionID, run.questions); err != nil {
+		for i := range run.questions {
+			run.questions[i].PageAssetID = previousPageIDs[i]
+		}
+		if created {
+			_, removeErr := o.deps.PageAssets.Remove(run.agentName, assetID)
+			if removeErr != nil {
+				return errors.Join(err, fmt.Errorf("usecase: 补偿识题原图资产 %q: %w", assetID, removeErr))
+			}
+		}
+		return err
+	}
+	return nil
+}
+
 // startAnchorAsync 启动 locating 独立分支。昂贵的模型调用不持 Job 锁，因此家长确认可
 // 同时持久化；只有几何合并、run 落盘与 anchor 检查点写回在 Job 锁内串行化。
 func (o *GradingOrchestrator) startAnchorAsync(jobID string, run *gradingRun, snapshot k12.GradingModelSnapshot) {
 	o.mu.Lock()
+	if o.sealed {
+		o.mu.Unlock()
+		return
+	}
 	if o.anchorActive == nil {
 		o.anchorActive = map[string]bool{}
 	}
@@ -453,11 +555,18 @@ func (o *GradingOrchestrator) startAnchorAsync(jobID string, run *gradingRun, sn
 		o.anchorDone = map[string]chan struct{}{}
 	}
 	o.anchorDone[jobID] = done
+	if !o.beginWorkerLocked() {
+		delete(o.anchorActive, jobID)
+		delete(o.anchorDone, jobID)
+		o.mu.Unlock()
+		return
+	}
 	o.mu.Unlock()
 
 	image := append([]byte(nil), run.req.Image...)
 	frozen := cloneRecognizedQuestions(run.questions)
 	go func() {
+		defer o.finishWorker()
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("K12 批改任务锚点分支 panic（任务保留 anchor pending）", "job", jobID, "panic", r)
@@ -524,30 +633,35 @@ func (o *GradingOrchestrator) executeAnchor(jobID, agentName string, image []byt
 	if o.deps.AnswerAnchorer == nil || !hasAnswerCandidate(frozen) {
 		return nil, k12.GradingAnchorDegraded, "anchor:absent", false
 	}
-	ctx := k12.WithGradingModelSnapshot(o.gradingBaseContext(), snapshot)
-	ctx, cancel := context.WithTimeout(ctx, o.anchorTimeout)
-	job, err := o.deps.GetGradingJob(ctx, agentName, jobID)
+	baseCtx := k12.WithGradingModelSnapshot(o.gradingBaseContext(), snapshot)
+	job, err := o.deps.GetGradingJob(baseCtx, agentName, jobID)
 	if err != nil {
-		cancel()
 		return nil, k12.GradingAnchorDegraded, "anchor:ledger_job_missing", true
 	}
 	requestRaw, _ := json.Marshal(struct {
 		ImageDigest string               `json:"image_digest"`
 		Questions   []RecognizedQuestion `json:"questions"`
 	}{modelInvocationDigest(image), frozen})
-	invocation, err := o.beginModelInvocation(ctx, job, k12.GradingStageLocating,
+	invocation, err := o.beginModelInvocation(baseCtx, job, k12.GradingStageLocating,
 		modelInvocationDigest([]byte(k12.GradingStageLocating), requestRaw))
 	if err != nil {
-		cancel()
 		return nil, k12.GradingAnchorDegraded, "anchor:outcome_unknown", true
 	}
+	// The provider budget starts at the provider boundary. Local ledger reads/writes
+	// must not consume the AnswerAnchorer deadline, especially under slow storage.
+	ctx, cancel := context.WithTimeout(baseCtx, o.anchorTimeout)
 	anchored, err := o.deps.AnchorHomeworkAnswers(ctx, image, frozen)
 	ctxErr := ctx.Err()
 	cancel()
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctxErr, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(ctxErr, context.DeadlineExceeded) || errors.Is(ctxErr, context.Canceled) {
 		_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), agentName,
 			invocation.InvocationID, "provider_outcome_unknown")
-		return nil, k12.GradingAnchorDegraded, "anchor:timeout", true
+		artifact := "anchor:cancelled"
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctxErr, context.DeadlineExceeded) {
+			artifact = "anchor:timeout"
+		}
+		return nil, k12.GradingAnchorDegraded, artifact, true
 	}
 	if err != nil {
 		_, _ = o.deps.Records.MarkModelInvocationFailed(context.WithoutCancel(ctx), agentName,
@@ -820,7 +934,8 @@ func modelInvocationResultDigest(value any) string {
 }
 
 func invocationOutcomeUnknown(err error) bool {
-	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrModelInvocationRequiresReconciliation)
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, ErrModelInvocationRequiresReconciliation)
 }
 
 func (o *GradingOrchestrator) beginModelInvocation(ctx context.Context, job GradingJobView, stage, requestDigest string) (k12.ModelInvocation, error) {

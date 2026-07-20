@@ -65,6 +65,16 @@ func TestArchiveRestoreAsV5MigratesStableProblemAttemptIDsAndRollbackIsExact(t *
 		t.Fatal(err)
 	}
 	archive, _ := problemAttemptArchiveForAdapter(t, "source-child", "source")
+	if err := usecase.VerifyHexbak(archive); err != nil {
+		t.Fatalf("source archive precondition: %v", err)
+	}
+	preflight, err := usecase.MigrateHexbakOwner(archive, "target-child")
+	if err != nil {
+		t.Fatalf("migration precondition: %v", err)
+	}
+	if err := usecase.VerifyHexbak(preflight); err != nil {
+		t.Fatalf("migrated archive precondition: %v", err)
+	}
 
 	d := usecase.Deps{ArchiveMigrator: f.restore, Now: func() int64 { return 500 }}
 	result, err := d.RestoreAs(ctx, usecase.RestoreAsRequest{
@@ -170,6 +180,57 @@ func TestArchiveRestoreAsSourceStillInDatabaseFailsClosedWithoutPartialV19Writes
 		var count int
 		if err := f.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table).Scan(&count); err != nil || count != 0 {
 			t.Fatalf("failed restore leaked %s rows=%d err=%v", table, count, err)
+		}
+	}
+}
+
+func TestArchiveRestoreAsV5JournalFailureRollsBackProblemAttemptAndPageAsset(t *testing.T) {
+	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
+	f := newArchiveRestoreFixture(t)
+	registerRestoreTarget(t, f)
+	ctx := context.Background()
+
+	preImage := []byte("\x89PNG\r\n\x1a\npre-journal-failure")
+	preAssetID, err := assetstore.Save("target-child", preImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pre := problemAttemptSnapshotForAdapter("target-child", "pre-failure", "submission-pre-failure", preAssetID)
+	if err := f.records.PutProblemAttemptSnapshot(ctx, pre); err != nil {
+		t.Fatal(err)
+	}
+	archive, sourceImage := problemAttemptArchiveForAdapter(t, "source-child", "journal-failure")
+	targetAssetID, _, _, err := assetstore.Describe("target-child", sourceImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.ExecContext(ctx, `CREATE TRIGGER reject_problem_restore_journal
+		BEFORE INSERT ON k12_restore_journal
+		BEGIN SELECT RAISE(ABORT, 'injected v5 journal failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	d := usecase.Deps{ArchiveMigrator: f.restore, Now: func() int64 { return 800 }}
+	if _, err := d.RestoreAs(ctx, usecase.RestoreAsRequest{
+		Archive: archive, SourceAgent: "source-child", TargetAgent: "target-child",
+		GuardianConfirmed: true, IdempotencyKey: "problem-attempt-journal-failure",
+	}); err == nil {
+		t.Fatal("injected journal failure must surface")
+	}
+	after, err := f.records.ExportProblemAttemptSnapshots(ctx, "target-child")
+	if err != nil || len(after) != 1 || !reflect.DeepEqual(after[0], pre) {
+		t.Fatalf("failed transaction leaked Problem/Attempt rows: err=%v got=%+v", err, after)
+	}
+	if _, err := assetstore.PathFromID(targetAssetID); err == nil {
+		t.Fatalf("failed transaction leaked target page asset %q", targetAssetID)
+	}
+	if _, err := assetstore.PathFromID(preAssetID); err != nil {
+		t.Fatalf("failed compensation removed pre-existing page asset: %v", err)
+	}
+	for _, table := range []string{"k12_restore_archives", "k12_restore_snapshots", "k12_restore_migrations", "k12_restore_journal", "k12_restore_asset_migrations"} {
+		var count int
+		if err := f.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("failed transaction leaked %s rows=%d err=%v", table, count, err)
 		}
 	}
 }

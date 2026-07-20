@@ -36,8 +36,9 @@ func NewArchiveRestoreAdapter(
 var _ usecase.ArchiveRestorer = (*ArchiveRestoreAdapter)(nil)
 var _ usecase.HexbakArchiveRestorer = (*ArchiveRestoreAdapter)(nil)
 
-// RestoreHexbak restores v3 records/profile plus packed content files. SQLite writes
-// commit together; files installed before commit are tracked and removed on every error.
+// RestoreHexbak restores current and historical records/profile, confirmed OCR,
+// V19 Problem/Attempt and packed content files. SQLite writes commit together;
+// files installed before commit are tracked and removed on every error.
 func (a *ArchiveRestoreAdapter) RestoreHexbak(ctx context.Context, bak *usecase.Hexbak) error {
 	if a == nil || a.db == nil || a.records == nil || a.dispatcher == nil || a.agents == nil {
 		return fmt.Errorf("k12 archive restore: atomic adapter is not fully configured")
@@ -56,14 +57,19 @@ func (a *ArchiveRestoreAdapter) RestoreHexbak(ctx context.Context, bak *usecase.
 		func(updated *router.AgentConfig) error {
 			tx, err := a.db.BeginTx(ctx, nil)
 			if err != nil {
-				return fmt.Errorf("begin shared v3 restore transaction: %w", err)
+				return fmt.Errorf("begin shared hexbak restore transaction: %w", err)
 			}
 			defer tx.Rollback()
 			if err := a.records.ImportAgentRecordsTx(ctx, tx, bak.AgentName, bak.Records); err != nil {
-				return fmt.Errorf("merge v3 records: %w", err)
+				return fmt.Errorf("merge hexbak records: %w", err)
+			}
+			if err := a.records.ImportProblemAttemptSnapshotsTx(
+				ctx, tx, bak.AgentName, bak.ProblemAttempts,
+			); err != nil {
+				return fmt.Errorf("merge Problem/Attempt ledger: %w", err)
 			}
 			if err := a.agents.SaveAgentTx(ctx, tx, updated); err != nil {
-				return fmt.Errorf("replace v3 profile metadata: %w", err)
+				return fmt.Errorf("replace hexbak profile metadata: %w", err)
 			}
 			if err := a.records.ImportCreativeWorkOCREvidenceTx(
 				ctx, tx, bak.AgentName, bak.CreativeWorkOCR,
@@ -72,11 +78,11 @@ func (a *ArchiveRestoreAdapter) RestoreHexbak(ctx context.Context, bak *usecase.
 			}
 			installed, err := ensureArchiveAssets(bak)
 			if err != nil {
-				return fmt.Errorf("install v3 archive assets: %w", err)
+				return fmt.Errorf("install hexbak archive assets: %w", err)
 			}
 			if err := tx.Commit(); err != nil {
 				return errors.Join(
-					fmt.Errorf("commit shared v3 restore transaction: %w", err),
+					fmt.Errorf("commit shared hexbak restore transaction: %w", err),
 					removeCreatedRestoreAssets(installed),
 				)
 			}

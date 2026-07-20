@@ -3,6 +3,7 @@ package engineadapter
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -27,20 +28,20 @@ func TestRealAnswerAnchoring(t *testing.T) {
 	}
 	imagePath := strings.TrimSpace(os.Getenv("HEXCLAW_REAL_BBOX_IMAGE"))
 	if imagePath == "" {
-		imagePath = "/Users/guoyanjun/Downloads/作业测试做好的需批改.jpg"
+		t.Fatal("HEXCLAW_REAL_BBOX_IMAGE is required")
 	}
 	imageBytes, err := os.ReadFile(imagePath)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read real bbox fixture: error_type=%T", err)
 	}
 	appCfg, err := config.Load("")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("load real bbox config: error_type=%T", err)
 	}
 	applyRealBBoxProviderOverride(t, appCfg)
 	selector, err := llmrouter.New(appCfg.LLM)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("build real bbox provider selector: error_type=%T", err)
 	}
 	provider, providerName, model := selectRealBBoxProvider(t, selector)
 
@@ -60,10 +61,10 @@ func TestRealAnswerAnchoring(t *testing.T) {
 			}},
 		})
 		if completeErr != nil {
-			t.Logf("call=%d provider=%s model=%s error=%v", call, providerName, model, completeErr)
-			return "", completeErr
+			t.Logf("call=%d provider=%s model=%s error_type=%T", call, providerName, model, completeErr)
+			return "", fmt.Errorf("real bbox provider completion failed: %T", completeErr)
 		}
-		t.Logf("call=%d provider=%s model=%s raw=%s", call, providerName, model, response.Content)
+		t.Logf("call=%d provider=%s model=%s response_chars=%d", call, providerName, model, len([]rune(response.Content)))
 		return response.Content, nil
 	}
 
@@ -72,7 +73,7 @@ func TestRealAnswerAnchoring(t *testing.T) {
 	startedAt := time.Now()
 	questions, err := adapter.Recognize(ctx, imageBytes)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("real bbox recognition failed: error_type=%T", err)
 	}
 	coreCallCount := int32(len(denseWorksheetRanges) + 1)
 	if calls.Load() != coreCallCount {
@@ -83,12 +84,13 @@ func TestRealAnswerAnchoring(t *testing.T) {
 	seenQuestions := make(map[string]int, len(questions))
 	for i, question := range questions {
 		if question.BBox != nil {
-			t.Fatalf("core question %d leaked unverified bbox: %#v", i+1, question)
+			t.Fatalf("core question %d leaked unverified bbox: state=%s question_chars=%d answer_chars=%d raw_chars=%d",
+				i+1, question.AnswerState, len([]rune(question.Question)),
+				len([]rune(question.StudentAnswer)), len([]rune(question.RawTranscription)))
 		}
 		key := recognizedQuestionKey(question.Question)
 		if previous, duplicate := seenQuestions[key]; key != "" && duplicate {
-			t.Fatalf("core questions %d and %d are duplicate variants: %q / %q",
-				previous+1, i+1, questions[previous].Question, question.Question)
+			t.Fatalf("core questions %d and %d are duplicate variants", previous+1, i+1)
 		}
 		seenQuestions[key] = i
 		if question.AnswerState == usecase.AnswerStatePresent {
@@ -96,7 +98,8 @@ func TestRealAnswerAnchoring(t *testing.T) {
 		} else if question.AnswerState == usecase.AnswerStateUnclear {
 			unclear++
 		}
-		t.Logf("core[%d] state=%s question=%q answer=%q", i+1, question.AnswerState, question.Question, question.StudentAnswer)
+		t.Logf("core[%d] state=%s question_chars=%d answer_chars=%d", i+1, question.AnswerState,
+			len([]rune(question.Question)), len([]rune(question.StudentAnswer)))
 	}
 	answerCandidates := present + unclear
 	if len(questions) != 16 || answerCandidates != 15 {
@@ -121,15 +124,16 @@ func TestRealAnswerAnchoring(t *testing.T) {
 		"一个周长是300米的长方形鱼塘，长是宽的2倍。如果每平方米产鱼2.25千克，一共产鱼多少千克？",
 		"在下列六个数：5、6、12、14、23、29中划去数（ ）后，能使其中3个数的和为另外2个数和的2倍。",
 	}
-	for _, expected := range expectedQuestions {
+	for expectedIndex, expected := range expectedQuestions {
 		if _, ok := seenQuestions[recognizedQuestionKey(expected)]; !ok {
-			t.Fatalf("real answered worksheet lost or corrupted expected question %q: %#v", expected, questions)
+			t.Fatalf("real answered worksheet lost or corrupted expected question index=%d: questions=%d",
+				expectedIndex+1, len(questions))
 		}
 	}
 
 	anchored, err := adapter.AnchorAnswers(ctx, imageBytes, questions)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("real answer anchoring failed: error_type=%T", err)
 	}
 	baseCalls := int32(len(denseWorksheetRanges) + 4)
 	extraCalls := calls.Load() - baseCalls
@@ -149,8 +153,9 @@ func TestRealAnswerAnchoring(t *testing.T) {
 			anchoredPresent++
 		}
 		anchoredByKey[recognizedQuestionKey(question.Question)] = question
-		t.Logf("anchored[%d] state=%s question=%q answer=%q bbox=%+v",
-			i+1, question.AnswerState, question.Question, question.StudentAnswer, question.BBox)
+		t.Logf("anchored[%d] state=%s question_chars=%d answer_chars=%d bbox=%t",
+			i+1, question.AnswerState, len([]rune(question.Question)),
+			len([]rune(question.StudentAnswer)), question.BBox != nil)
 	}
 	expectedFinalAnswers := map[string]string{
 		"4÷0.5=":              "8",
@@ -173,23 +178,24 @@ func TestRealAnswerAnchoring(t *testing.T) {
 		item := anchoredByKey[recognizedQuestionKey(question)]
 		actual := finalTranscribedAnswer(item.StudentAnswer)
 		if canonicalTranscribedAnswer(actual) != canonicalTranscribedAnswer(expected) {
-			t.Fatalf("real handwriting final answer drift: question=%q answer=%q final=%q want=%q state=%s",
-				question, item.StudentAnswer, actual, expected, item.AnswerState)
+			t.Fatalf("real handwriting final answer drift: question_key_chars=%d answer_chars=%d final_chars=%d want_chars=%d state=%s",
+				len([]rune(recognizedQuestionKey(question))), len([]rune(item.StudentAnswer)),
+				len([]rune(actual)), len([]rune(expected)), item.AnswerState)
 		}
 	}
 	divisionAnswer := anchoredByKey[recognizedQuestionKey("1、一个数的3/8是24，求这个数？")].StudentAnswer
 	divisionAnswerKey := recognizedQuestionKey(divisionAnswer)
 	if strings.Contains(divisionAnswerKey, recognizedQuestionKey("3/8×8")) {
-		t.Fatalf("isolated handwriting transcription still contains printed-question contamination: %q",
-			divisionAnswer)
+		t.Fatalf("isolated handwriting transcription still contains printed-question contamination: answer_chars=%d",
+			len([]rune(divisionAnswer)))
 	}
 	firstFractionAnswer := anchoredByKey[recognizedQuestionKey("5/7−1/5=")].StudentAnswer
 	if recognizedQuestionKey(firstFractionAnswer) != recognizedQuestionKey("18/35") {
-		t.Fatalf("isolated handwriting transcription=%q want actual written answer %q",
-			firstFractionAnswer, "18/35")
+		t.Fatalf("isolated handwriting transcription mismatch: answer_chars=%d want_chars=%d",
+			len([]rune(firstFractionAnswer)), len([]rune("18/35")))
 	}
-	t.Logf("image=%s questions=%d core_present=%d core_unclear=%d anchored=%d calls=%d elapsed=%s",
-		imagePath, len(questions), present, unclear, boxed, calls.Load(), time.Since(startedAt).Round(time.Millisecond))
+	t.Logf("questions=%d core_present=%d core_unclear=%d anchored=%d calls=%d elapsed=%s",
+		len(questions), present, unclear, boxed, calls.Load(), time.Since(startedAt).Round(time.Millisecond))
 	if boxed != answerCandidates || anchoredPresent != answerCandidates {
 		t.Fatalf("real answered worksheet retained anchors=%d present=%d want=%d",
 			boxed, anchoredPresent, answerCandidates)

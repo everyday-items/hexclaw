@@ -13,6 +13,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/curriculum"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/engineadapter"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
@@ -208,6 +209,7 @@ func WireInto(ctx context.Context, reg *scenario.Registry, db *sql.DB, solveSkil
 		VerifiedGrader: solveAdapter,
 		PrepReview:     solveAdapter,
 		Records:        store,
+		PageAssets:     assetstore.PageStore{},
 		Constraint:     constraint,
 	}
 	for _, o := range opts {

@@ -192,7 +192,7 @@ answer_state=present 表示答案文字已可靠誊录；answer_state=unclear �
 对于 unclear，只有肉眼能确认存在学生手写笔迹或涂改时才返回框；如果只是印刷字、横线、表格线、阴影、折痕或空白，必须省略。
 框内不得包含印刷题干、表格线或相邻题答案；标题、纯印刷内容、相邻题答案都不能选。不能唯一确认位置的目标直接省略。
 严格只输出紧凑 JSON 数组，每个对象仅含整数 index、bbox_1000；四个坐标范围均为 0..1000 且 right>left、bottom>top。index 必须原样回传。`, string(targetJSON))
-	rawLocated, err := a.vision(ctx, locatorImage, locatorPrompt)
+	rawLocated, err := a.callVision(ctx, locatorImage, locatorPrompt)
 	if err != nil {
 		return nil, fmt.Errorf("answer anchorer: 批量定位调用失败: %w", err)
 	}
@@ -320,7 +320,7 @@ func (a *RecognizerAdapter) transcribeAnchoredAnswers(
 			go func() {
 				defer wg.Done()
 				request := requests[requestIndex]
-				raw, callErr := a.vision(ctx, request.image, request.prompt)
+				raw, callErr := a.callVision(ctx, request.image, request.prompt)
 				if callErr != nil {
 					evidence[requestIndex].err = fmt.Errorf("%s: 批量调用失败: %w",
 						request.label, callErr)

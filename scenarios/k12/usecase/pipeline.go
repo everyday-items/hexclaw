@@ -35,6 +35,9 @@ type Deps struct {
 	ArchiveMigrator ArchiveMigrationRestorer
 	Renderer        Renderer
 	PhotoAnnotator  PhotoAnnotator
+	// PageAssets promotes a photo Submission's immutable source image into the
+	// owner-scoped asset:// store before V19 Problem facts reference it.
+	PageAssets PageAssetStore
 	// Delivery is the durable send-to-phone transport. HTTP acceptance remains
 	// sending until QueryPrepared supplies delivered evidence.
 	Delivery DeliveryTransport

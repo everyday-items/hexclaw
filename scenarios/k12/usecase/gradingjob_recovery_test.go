@@ -39,7 +39,7 @@ func waitForStage(t *testing.T, d Deps, agent, jobID, want string) GradingJobVie
 // newRecoverableOrchestrator 与 newOrchestrator 相同，但启用运行时落盘目录（崩溃恢复载体）。
 func newRecoverableOrchestrator(t *testing.T, d Deps, dir string) *GradingOrchestrator {
 	t.Helper()
-	return NewGradingOrchestrator(d, orchestratorSnapshot, WithGradingRunDir(dir))
+	return trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshot, WithGradingRunDir(dir)))
 }
 
 func recoveryDeps(t *testing.T, rec Recognizer, anchorer AnswerAnchorer, annotator PhotoAnnotator) Deps {

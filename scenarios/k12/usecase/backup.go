@@ -83,7 +83,7 @@ func (d Deps) Backup(ctx context.Context, agentName string) (*Hexbak, error) {
 	if err != nil {
 		return nil, fmt.Errorf("usecase: 打包 Problem 页面资产: %w", err)
 	}
-	bak.Assets, err = mergeHexbakAssets(recordAssets, problemAssets)
+	bak.Assets, err = MergeHexbakAssets(recordAssets, problemAssets)
 	if err != nil {
 		return nil, fmt.Errorf("usecase: 合并档案资产: %w", err)
 	}
