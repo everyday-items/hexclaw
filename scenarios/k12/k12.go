@@ -176,8 +176,8 @@ func Pack(constraint scenario.ConstraintProvider) *scenario.Pack {
 				// 值须对齐前端契约枚举 MessageBadgeKind = 'verify' | 'record-chip'
 				// （contracts/view-descriptor.ts）——此前用 "verify-badge" 与契约漂移（BUG-20260708）。
 				MessageBadges:       []string{"verify", "record-chip"},
-				ComposerPlaceholder: "发消息，或 ⌘V 粘贴作业照片",
-				ComposerChips:       []string{"🧮 数学讲解", "💡 渐进提示", "📷 识题校验"},
+				ComposerPlaceholder: "发消息、粘贴带分数/公式的题目，或 ⌘V 粘贴作业照片",
+				ComposerChips:       []string{"📚 自动识别学科", "💡 渐进提示", "📷 识题校验"},
 				RecordCollections:   []string{CollectionMistakes, CollectionPracticeSet, CollectionAccumulation, CollectionCreativeWork},
 				// 备课卡独立侧栏/头部动作已退役（执行计划 §3.4）：辅导要点内联进识题流
 				// （前端 descriptor.ts sidePanels 亦为空），IA 定稿头部无 prep-card 动作；

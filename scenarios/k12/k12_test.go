@@ -3,6 +3,7 @@ package k12
 import (
 	"context"
 	"database/sql"
+	"reflect"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/records"
@@ -148,5 +149,19 @@ func TestPack_MessageBadgesMatchContract(t *testing.T) {
 		if !valid[b] {
 			t.Errorf("message_badge %q 不在前端契约枚举 {verify,record-chip} 内", b)
 		}
+	}
+}
+
+func TestPack_ComposerMatchesAuthoritativePrototype(t *testing.T) {
+	ve, ok := Pack(NewCurriculumStub()).ViewExtensions["tutor"]
+	if !ok {
+		t.Fatal("缺 tutor 视图扩展")
+	}
+	if got, want := ve.ComposerPlaceholder, "发消息、粘贴带分数/公式的题目，或 ⌘V 粘贴作业照片"; got != want {
+		t.Fatalf("composer placeholder = %q, want %q", got, want)
+	}
+	wantChips := []string{"📚 自动识别学科", "💡 渐进提示", "📷 识题校验"}
+	if !reflect.DeepEqual(ve.ComposerChips, wantChips) {
+		t.Fatalf("composer chips = %#v, want %#v", ve.ComposerChips, wantChips)
 	}
 }
