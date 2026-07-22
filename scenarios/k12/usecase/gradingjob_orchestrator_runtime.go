@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -65,6 +66,47 @@ func (o *GradingOrchestrator) gradingBaseContext() context.Context {
 		return o.baseCtx
 	}
 	return context.Background()
+}
+
+// registerGradingModelCall makes a provider call independently cancellable by
+// the public per-Job cancel command. A Job can temporarily own both the main
+// grading call and its locating branch, so the registry is one-to-many.
+func (o *GradingOrchestrator) registerGradingModelCall(jobID string, cancel context.CancelFunc) func() {
+	o.mu.Lock()
+	if o.modelCancels == nil {
+		o.modelCancels = map[string]map[uint64]context.CancelFunc{}
+	}
+	o.nextModelCallID++
+	callID := o.nextModelCallID
+	if o.modelCancels[jobID] == nil {
+		o.modelCancels[jobID] = map[uint64]context.CancelFunc{}
+	}
+	o.modelCancels[jobID][callID] = cancel
+	o.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			o.mu.Lock()
+			delete(o.modelCancels[jobID], callID)
+			if len(o.modelCancels[jobID]) == 0 {
+				delete(o.modelCancels, jobID)
+			}
+			o.mu.Unlock()
+		})
+	}
+}
+
+func (o *GradingOrchestrator) cancelGradingModelCalls(jobID string) {
+	o.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(o.modelCancels[jobID]))
+	for _, cancel := range o.modelCancels[jobID] {
+		cancels = append(cancels, cancel)
+	}
+	o.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
 }
 
 // beginWorkerLocked registers one process-owned operation. The seal check and
@@ -464,6 +506,24 @@ func (o *GradingOrchestrator) RetryPhotoGradingJob(ctx context.Context, jobID st
 	return v, true, nil
 }
 
+// CancelPhotoGradingJob persists the public cancellation first, then interrupts
+// every provider call currently owned by the Job. It deliberately does not take
+// jobLock: cancellation must remain responsive while a provider call is in flight.
+// ok=false lets callers retain the state-machine-only path for Jobs without a
+// registered runtime.
+func (o *GradingOrchestrator) CancelPhotoGradingJob(ctx context.Context, agentName, jobID string) (GradingJobView, bool, error) {
+	run := o.lookup(jobID)
+	if run == nil {
+		return GradingJobView{}, false, nil
+	}
+	v, err := o.deps.CancelGradingJob(ctx, agentName, jobID)
+	if err != nil {
+		return GradingJobView{}, true, err
+	}
+	o.cancelGradingModelCalls(jobID)
+	return v, true, nil
+}
+
 // RecognizedQuestions 取识别停点产物（锚点已回位时含 BBox），供确认界面回显。
 func (o *GradingOrchestrator) RecognizedQuestions(ctx context.Context, jobID string) ([]RecognizedQuestion, bool) {
 	return o.recognizedQuestions(ctx, "", jobID)
@@ -503,8 +563,21 @@ func (o *GradingOrchestrator) recognizedQuestions(ctx context.Context, agentName
 	if agentName != "" && run.agentName != agentName {
 		return nil, false
 	}
+	// Recognition facts are committed before the durable Job advances to the
+	// confirmation stop. Prefer that persisted projection without taking the
+	// process-local execution lock: a poll can observe awaiting_confirmation in
+	// the small window before RunGradingJob releases the lock, and the response
+	// must still contain the facts needed by the confirmation command.
+	if typed, ok := o.typedRecognizedQuestions(ctx, jobID, run.agentName); ok {
+		return typed, true
+	}
 	l := o.jobLock(jobID)
-	l.Lock()
+	if !l.TryLock() {
+		// The durable Job row remains independently readable while an automatic
+		// stage owns the execution lock. A poll must not wait for provider latency;
+		// the recognition projection becomes available at the confirmation stop.
+		return nil, false
+	}
 	defer l.Unlock()
 	if len(run.questions) == 0 {
 		return nil, false

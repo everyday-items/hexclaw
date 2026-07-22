@@ -373,7 +373,19 @@ func (h *handler) cancelGradingJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
-	v, err := h.rt.Deps.CancelGradingJob(r.Context(), req.Agent, r.PathValue("id"))
+	jobID := r.PathValue("id")
+	if h.rt.Grading != nil {
+		v, ok, err := h.rt.Grading.CancelPhotoGradingJob(r.Context(), req.Agent, jobID)
+		if ok {
+			if err != nil {
+				writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+				return
+			}
+			writeGradingJob(w, v)
+			return
+		}
+	}
+	v, err := h.rt.Deps.CancelGradingJob(r.Context(), req.Agent, jobID)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return

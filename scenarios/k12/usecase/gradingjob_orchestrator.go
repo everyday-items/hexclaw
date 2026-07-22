@@ -55,16 +55,18 @@ type GradingOrchestrator struct {
 	// anchorTimeout 锚点增强分支的独立预算（默认 60s，可通过 option 配置）。
 	anchorTimeout time.Duration
 
-	mu           sync.Mutex
-	runs         map[string]*gradingRun
-	active       map[string]bool          // 在途异步推进守卫（同 Job 不并发双跑）
-	rerun        map[string]bool          // active 期间收到续跑信号时，退出前至少再检查一次状态机
-	anchorActive map[string]bool          // 独立锚点分支守卫（外部调用不占 Job 锁）
-	anchorDone   map[string]chan struct{} // 同步入口只等待分支完成，不让模型调用占用 Job 锁
-	locks        map[string]*sync.Mutex   // 每 Job 执行互斥：状态合并/写回与确认/重试/读产物串行化
-	sealed       bool                     // Shutdown 后拒绝新的异步推进/锚点/恢复工作
-	workerCount  int                      // mu 下维护，覆盖 grading + anchor + recovery
-	workerIdle   chan struct{}            // workerCount 归零时关闭；新一轮 0→1 时替换
+	mu              sync.Mutex
+	runs            map[string]*gradingRun
+	active          map[string]bool                          // 在途异步推进守卫（同 Job 不并发双跑）
+	rerun           map[string]bool                          // active 期间收到续跑信号时，退出前至少再检查一次状态机
+	anchorActive    map[string]bool                          // 独立锚点分支守卫（外部调用不占 Job 锁）
+	anchorDone      map[string]chan struct{}                 // 同步入口只等待分支完成，不让模型调用占用 Job 锁
+	locks           map[string]*sync.Mutex                   // 每 Job 执行互斥：状态合并/写回与确认/重试/读产物串行化
+	modelCancels    map[string]map[uint64]context.CancelFunc // 每 Job 在途模型调用；取消命令向 provider 传播
+	nextModelCallID uint64
+	sealed          bool          // Shutdown 后拒绝新的异步推进/锚点/恢复工作
+	workerCount     int           // mu 下维护，覆盖 grading + anchor + recovery
+	workerIdle      chan struct{} // workerCount 归零时关闭；新一轮 0→1 时替换
 	// pageAssetLocks serializes the file+V19 compensated command by owner and
 	// SubmissionID, so two same-photo Jobs cannot race one failure cleanup against
 	// another successful reference.
@@ -146,6 +148,7 @@ func NewGradingOrchestrator(deps Deps, snapshotFn func() k12.GradingModelSnapsho
 		deps: deps, snapshotFn: snapshotFn,
 		runs: map[string]*gradingRun{}, active: map[string]bool{}, rerun: map[string]bool{},
 		anchorActive: map[string]bool{}, anchorDone: map[string]chan struct{}{}, locks: map[string]*sync.Mutex{},
+		modelCancels:   map[string]map[uint64]context.CancelFunc{},
 		pageAssetLocks: map[string]*pageAssetLockEntry{},
 		sem:            make(chan struct{}, 2), baseCtx: context.Background(),
 		anchorTimeout: time.Duration(k12.GradingAnchorTimeoutSeconds) * time.Second,
@@ -401,10 +404,32 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 		}
 		return unknown, err
 	}
-	questions, err := o.deps.RecognizeHomework(ctx, run.req.Image)
+	// Fields.Deadline is the durable budget for the current automatic stage.
+	// Derive the provider call from it so synchronous runs, async workers, and
+	// recovered jobs all honor the same absolute cutoff. context.WithDeadline
+	// also preserves an earlier caller/process deadline.
+	providerCtx, cancelProvider := gradingStageContext(ctx, job.Fields.Deadline)
+	unregisterProvider := o.registerGradingModelCall(jobID, cancelProvider)
+	if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), run.agentName, jobID); readErr != nil {
+		cancelProvider()
+		unregisterProvider()
+		return GradingJobView{}, readErr
+	} else if current.Record.Status == k12.GradingStageCancelled {
+		cancelProvider()
+		unregisterProvider()
+		_, _ = o.deps.Records.MarkModelInvocationFailed(context.WithoutCancel(ctx), run.agentName,
+			invocation.InvocationID, "cancelled_before_provider_call")
+		return current, nil
+	}
+	questions, err := o.deps.RecognizeHomework(providerCtx, run.req.Image)
+	cancelProvider()
+	unregisterProvider()
 	if err != nil {
 		if invocationOutcomeUnknown(err) {
 			_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), run.agentName, invocation.InvocationID, "provider_outcome_unknown")
+			if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), run.agentName, jobID); readErr == nil && current.Record.Status == k12.GradingStageCancelled {
+				return current, nil
+			}
 			v, aerr := o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run, jobID, "provider_outcome_unknown")
 			if aerr != nil {
 				return v, aerr
@@ -484,6 +509,13 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 		return v, err
 	}
 	return o.advanceOK(ctx, run, jobID, fmt.Sprintf("questions:%d", len(questions)))
+}
+
+func gradingStageContext(parent context.Context, deadline int64) (context.Context, context.CancelFunc) {
+	if deadline <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithDeadline(parent, time.Unix(deadline, 0))
 }
 
 // persistRecognizedPhotoFacts is the compensated local command that promotes a
@@ -650,9 +682,22 @@ func (o *GradingOrchestrator) executeAnchor(jobID, agentName string, image []byt
 	// The provider budget starts at the provider boundary. Local ledger reads/writes
 	// must not consume the AnswerAnchorer deadline, especially under slow storage.
 	ctx, cancel := context.WithTimeout(baseCtx, o.anchorTimeout)
+	unregisterProvider := o.registerGradingModelCall(jobID, cancel)
+	if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), agentName, jobID); readErr != nil {
+		cancel()
+		unregisterProvider()
+		return nil, k12.GradingAnchorDegraded, "anchor:job_read_failed", true
+	} else if current.Record.Status == k12.GradingStageCancelled {
+		cancel()
+		unregisterProvider()
+		_, _ = o.deps.Records.MarkModelInvocationFailed(context.WithoutCancel(ctx), agentName,
+			invocation.InvocationID, "cancelled_before_provider_call")
+		return nil, k12.GradingAnchorDegraded, "anchor:cancelled", false
+	}
 	anchored, err := o.deps.AnchorHomeworkAnswers(ctx, image, frozen)
 	ctxErr := ctx.Err()
 	cancel()
+	unregisterProvider()
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
 		errors.Is(ctxErr, context.DeadlineExceeded) || errors.Is(ctxErr, context.Canceled) {
 		_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), agentName,
@@ -728,10 +773,28 @@ func (o *GradingOrchestrator) runAssess(ctx context.Context, run *gradingRun, jo
 		assessDeps.PhotoAnnotator = recorder
 	}
 
-	result, err := assessDeps.GradeHomeworkPhoto(ctx, run.req)
+	providerCtx, cancelProvider := gradingStageContext(ctx, job.Fields.Deadline)
+	unregisterProvider := o.registerGradingModelCall(jobID, cancelProvider)
+	if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), run.agentName, jobID); readErr != nil {
+		cancelProvider()
+		unregisterProvider()
+		return GradingJobView{}, readErr
+	} else if current.Record.Status == k12.GradingStageCancelled {
+		cancelProvider()
+		unregisterProvider()
+		_, _ = o.deps.Records.MarkModelInvocationFailed(context.WithoutCancel(ctx), run.agentName,
+			invocation.InvocationID, "cancelled_before_provider_call")
+		return current, nil
+	}
+	result, err := assessDeps.GradeHomeworkPhoto(providerCtx, run.req)
+	cancelProvider()
+	unregisterProvider()
 	if err != nil {
 		if invocationOutcomeUnknown(err) {
 			_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), run.agentName, invocation.InvocationID, "provider_outcome_unknown")
+			if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), run.agentName, jobID); readErr == nil && current.Record.Status == k12.GradingStageCancelled {
+				return current, nil
+			}
 			v, aerr := o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run, jobID, "provider_outcome_unknown")
 			if aerr != nil {
 				return v, aerr

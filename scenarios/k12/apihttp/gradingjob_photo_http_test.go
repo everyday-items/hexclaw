@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,6 +40,40 @@ type photoJobRecognizer struct {
 	questions    []usecase.RecognizedQuestion
 }
 
+type blockingPhotoJobRecognizer struct {
+	started     chan struct{}
+	done        chan struct{}
+	testRelease chan struct{}
+	startOnce   sync.Once
+	doneOnce    sync.Once
+}
+
+func newBlockingPhotoJobRecognizer() *blockingPhotoJobRecognizer {
+	return &blockingPhotoJobRecognizer{
+		started: make(chan struct{}), done: make(chan struct{}), testRelease: make(chan struct{}),
+	}
+}
+
+func (r *blockingPhotoJobRecognizer) Recognize(ctx context.Context, _ []byte) ([]usecase.RecognizedQuestion, error) {
+	r.startOnce.Do(func() { close(r.started) })
+	select {
+	case <-ctx.Done():
+		r.doneOnce.Do(func() { close(r.done) })
+		return nil, ctx.Err()
+	case <-r.testRelease:
+		r.doneOnce.Do(func() { close(r.done) })
+		return nil, fmt.Errorf("test recognizer released")
+	}
+}
+
+func (r *blockingPhotoJobRecognizer) releaseForCleanup() {
+	select {
+	case <-r.testRelease:
+	default:
+		close(r.testRelease)
+	}
+}
+
 func (r *photoJobRecognizer) Recognize(context.Context, []byte) ([]usecase.RecognizedQuestion, error) {
 	r.calls++
 	if r.failuresLeft > 0 {
@@ -68,6 +103,12 @@ func (photoJobAnnotator) Annotate(context.Context, []byte, []usecase.PhotoAnnota
 
 func newPhotoJobServer(t *testing.T, rec usecase.Recognizer) http.Handler {
 	t.Helper()
+	h, _ := newPhotoJobServerWithOrchestrator(t, rec)
+	return h
+}
+
+func newPhotoJobServerWithOrchestrator(t *testing.T, rec usecase.Recognizer) (http.Handler, *usecase.GradingOrchestrator) {
+	t.Helper()
 	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -90,7 +131,7 @@ func newPhotoJobServer(t *testing.T, rec usecase.Recognizer) http.Handler {
 	orch := usecase.NewGradingOrchestrator(k.Deps, func() k12.GradingModelSnapshot {
 		return k12.GradingModelSnapshot{Provider: "test", Model: "test-vlm", Capability: "vision"}
 	}, usecase.WithGradingRunDir(t.TempDir()))
-	return apihttp.NewHandler(apihttp.Runtime{Views: k.Registry.Views, Records: k.Records, Deps: k.Deps, Grading: orch})
+	return apihttp.NewHandler(apihttp.Runtime{Views: k.Registry.Views, Records: k.Records, Deps: k.Deps, Grading: orch}), orch
 }
 
 func photoJobQuestions() []usecase.RecognizedQuestion {
@@ -150,6 +191,83 @@ func createPhotoJob(t *testing.T, h http.Handler, sourceKey string) string {
 		t.Fatalf("响应缺 job_id: %v", out)
 	}
 	return id
+}
+
+func TestPhotoJobHTTP_GetRemainsResponsiveWhileRecognizerIsRunning(t *testing.T) {
+	recognizer := newBlockingPhotoJobRecognizer()
+	t.Cleanup(recognizer.releaseForCleanup)
+	h, orchestrator := newPhotoJobServerWithOrchestrator(t, recognizer)
+	jobID := createPhotoJob(t, h, "poll-during-recognition")
+
+	select {
+	case <-recognizer.started:
+	case <-time.After(time.Second):
+		t.Fatal("recognizer did not start")
+	}
+
+	type response struct {
+		status int
+		body   map[string]any
+	}
+	got := make(chan response, 1)
+	go func() {
+		recorder, body := do(t, h, http.MethodGet, "/grading-jobs/"+jobID+"?agent=mingming", "")
+		got <- response{status: recorder.Code, body: body}
+	}()
+	select {
+	case res := <-got:
+		if res.status != http.StatusOK || res.body["stage"] != k12.GradingStageRecognizing {
+			t.Fatalf("running Job GET=%d body=%v, want immediate recognizing snapshot", res.status, res.body)
+		}
+	case <-time.After(250 * time.Millisecond):
+		recognizer.releaseForCleanup()
+		<-got
+		t.Fatal("GET /grading-jobs/{id} blocked behind the in-flight recognizer")
+	}
+	recognizer.releaseForCleanup()
+	idleCtx, cancelIdle := context.WithTimeout(context.Background(), time.Second)
+	defer cancelIdle()
+	if err := orchestrator.WaitForIdle(idleCtx); err != nil {
+		t.Fatalf("released recognizer left an async worker running: %v", err)
+	}
+}
+
+func TestPhotoJobHTTP_CancelRunningRecognitionPropagatesAndDrains(t *testing.T) {
+	recognizer := newBlockingPhotoJobRecognizer()
+	t.Cleanup(recognizer.releaseForCleanup)
+	h, orchestrator := newPhotoJobServerWithOrchestrator(t, recognizer)
+	jobID := createPhotoJob(t, h, "cancel-during-recognition")
+
+	select {
+	case <-recognizer.started:
+	case <-time.After(time.Second):
+		t.Fatal("recognizer did not start")
+	}
+
+	started := time.Now()
+	response, body := do(t, h, http.MethodPost, "/grading-jobs/"+jobID+"/cancel", `{"agent":"mingming"}`)
+	if response.Code != http.StatusOK || body["stage"] != k12.GradingStageCancelled {
+		t.Fatalf("cancel=%d body=%v, want cancelled", response.Code, body)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("cancel response took %v, want <=250ms", elapsed)
+	}
+	select {
+	case <-recognizer.done:
+	case <-time.After(250 * time.Millisecond):
+		recognizer.releaseForCleanup()
+		t.Fatal("cancelled Job did not propagate cancellation to the in-flight recognizer")
+	}
+	idleCtx, cancelIdle := context.WithTimeout(context.Background(), time.Second)
+	defer cancelIdle()
+	if err := orchestrator.WaitForIdle(idleCtx); err != nil {
+		t.Fatalf("cancelled recognizer left an async worker running: %v", err)
+	}
+
+	get, current := do(t, h, http.MethodGet, "/grading-jobs/"+jobID+"?agent=mingming", "")
+	if get.Code != http.StatusOK || current["stage"] != k12.GradingStageCancelled {
+		t.Fatalf("post-cancel Job=%d body=%v, want durable cancelled", get.Code, current)
+	}
 }
 
 func photoJobPNG(sourceKey string) []byte {

@@ -53,6 +53,10 @@ func newOrchestrator(t *testing.T, rec Recognizer, anchorer AnswerAnchorer, anno
 	d.Recognizer = rec
 	d.AnswerAnchorer = anchorer
 	d.PhotoAnnotator = annotator
+	// GradingJob deadlines are absolute Unix timestamps. This helper exercises
+	// provider boundaries, so it must use a wall clock rather than newPipeline's
+	// deterministic domain-record clock (1000).
+	d.Now = func() int64 { return time.Now().Unix() }
 	return trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshot))
 }
 
@@ -167,6 +171,37 @@ func TestGradingOrchestratorFullChainCompletes(t *testing.T) {
 	}
 	if result.Markdown == "" {
 		t.Fatalf("最终 Markdown 不可空")
+	}
+}
+
+// Once the durable Job reaches the confirmation stop, its already-persisted
+// recognition projection must stay readable even if the in-process runner still
+// owns the execution lock for a few instructions. HTTP polling observes the
+// durable stage independently and must never receive awaiting_confirmation
+// without the facts required by the confirmation form.
+func TestGradingOrchestratorRecognitionReadableWhileExecutionLockIsHeld(t *testing.T) {
+	ctx := context.Background()
+	rec := &countingRecognizer{questions: []RecognizedQuestion{
+		{Question: "3.8×3=?", Subject: "数学", StudentAnswer: "10.4"},
+	}}
+	o := newOrchestrator(t, rec, &photoAnchorerFake{}, &photoAnnotatorFake{})
+
+	v := startOrchestratorJob(t, o, "recognition-projection-lock")
+	jobID := v.Record.RecordID
+	v, err := o.RunGradingJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("RunGradingJob: %v", err)
+	}
+	if v.Record.Status != k12.GradingStageAwaitingConfirmation {
+		t.Fatalf("应停在 awaiting_confirmation, got %s", v.Record.Status)
+	}
+
+	l := o.jobLock(jobID)
+	l.Lock()
+	questions, ok := o.RecognizedQuestionsForOwner(ctx, "mingming", jobID)
+	l.Unlock()
+	if !ok || len(questions) != 1 || questions[0].Question != "3.8×3=?" {
+		t.Fatalf("confirmation stop must expose durable recognition while execution lock is held: ok=%v questions=%#v", ok, questions)
 	}
 }
 
