@@ -96,9 +96,9 @@ func TestGroundingAdapter_LegacyDataCompatible(t *testing.T) {
 	}
 }
 
-// TestGroundingAdapter_EmptySubjectSeesAll subject 空 = 不分科旧语义：检索该实例全部教材
-// （通用 + 各学科），不因分科上线而丢失可见性。
-func TestGroundingAdapter_EmptySubjectSeesAll(t *testing.T) {
+// TestGroundingAdapter_EmptySubjectSeesLegacyGenericOnly subject 空只保留旧版不分科桶语义。
+// 分科上线后的六科桶不能扩散到空学科请求，否则学科识别失败会串取其他学科教材。
+func TestGroundingAdapter_EmptySubjectSeesLegacyGenericOnly(t *testing.T) {
 	a := NewGroundingAdapter(&subjectKB{})
 	ctx := context.Background()
 	if err := a.AddGrounding(ctx, "mingming", "通用", "通用讲法"); err != nil {
@@ -108,8 +108,8 @@ func TestGroundingAdapter_EmptySubjectSeesAll(t *testing.T) {
 		t.Fatal(err)
 	}
 	text, found, err := a.GroundSubject(ctx, "mingming", "", "小数乘法", "五年级上")
-	if err != nil || !found || !strings.Contains(text, "通用讲法") || !strings.Contains(text, "小数乘法讲法") {
-		t.Fatalf("不分科检索应见全部教材: text=%q found=%v err=%v", text, found, err)
+	if err != nil || !found || !strings.Contains(text, "通用讲法") || strings.Contains(text, "小数乘法讲法") {
+		t.Fatalf("空学科只能检索 legacy 通用桶: text=%q found=%v err=%v", text, found, err)
 	}
 }
 

@@ -147,8 +147,8 @@ func groundedTeachingMarkdown(
 	return evidence
 }
 
-// groundForSubject 分科检索路由：adapter 支持分科时按当前题目学科下推（空学科 = 检索全部
-// 教材的不分科旧语义）；老 adapter 只实现 Grounding 时走旧 Ground，保持向后兼容。
+// groundForSubject 分科检索路由：adapter 支持分科时按当前题目学科下推（空学科只查
+// 不分科旧桶）；老 adapter 只实现 Grounding 时走旧 Ground，保持向后兼容。
 func (d Deps) groundForSubject(ctx context.Context, agentName, subject, kp, grade string) (string, bool, error) {
 	if sg, ok := d.Grounding.(SubjectGrounding); ok {
 		return sg.GroundSubject(ctx, agentName, subject, kp, grade)

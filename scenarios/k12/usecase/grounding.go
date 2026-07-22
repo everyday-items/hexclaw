@@ -15,7 +15,7 @@ type SubjectGroundingWriter interface {
 }
 
 // SubjectGrounding 是分科教材检索的可选扩展缝：按当前题目学科优先取本学科教材，
-// 无本学科教材回退通用（不分科）教材，绝不跨学科串取。subject 空 = 检索全部教材（旧语义）。
+// 无本学科教材回退通用（不分科）教材，绝不跨学科串取。subject 空 = 只检索旧版不分科桶。
 type SubjectGrounding interface {
 	GroundSubject(ctx context.Context, agentName, subject, knowledgePoint, grade string) (text string, found bool, err error)
 }

@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/knowledge"
-	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
@@ -97,16 +96,11 @@ func (a *GroundingAdapter) Ground(ctx context.Context, agentName, knowledgePoint
 }
 
 // GroundSubject 分科检索：优先本学科教材；无本学科教材只回退**通用（不分科）**桶，
-// 绝不跨学科串取（数学题不取语文教材）。subject 空 = 不分科旧语义，检索该实例全部教材
-// （通用 + 六学科），保证分科上线后老调用方可见性不缩水。
+// 绝不跨学科串取（数学题不取语文教材）。subject 空只检索不分科旧桶，
+// 避免学科识别失败时将六科教材合并为一个候选集。
 func (a *GroundingAdapter) GroundSubject(ctx context.Context, agentName, subject, knowledgePoint, grade string) (string, bool, error) {
 	if subject == "" {
-		sources := make([]string, 0, len(k12.TextbookSubjects)+1)
-		sources = append(sources, GroundingSource(agentName))
-		for _, s := range k12.TextbookSubjects {
-			sources = append(sources, GroundingSubjectSource(agentName, s))
-		}
-		return a.groundBySources(ctx, agentName, knowledgePoint, grade, sources)
+		return a.Ground(ctx, agentName, knowledgePoint, grade)
 	}
 	text, found, err := a.groundBySources(ctx, agentName, knowledgePoint, grade, []string{GroundingSubjectSource(agentName, subject)})
 	if err != nil || found {
