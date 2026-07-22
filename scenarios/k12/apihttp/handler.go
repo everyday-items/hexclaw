@@ -27,6 +27,9 @@ import (
 type CronRegistrar interface {
 	// Register 注册一个默认任务（幂等键 = agent+kind，重复注册应覆盖或跳过由实现决定）。
 	Register(ctx context.Context, kind string, spec usecase.CronSpec, platform, chatID, userID string) (jobID string, err error)
+	// ProvisionDefaults 在同一 durable 事务中覆盖四个默认任务并回收历史超集。
+	// 任一注册/归并/回收失败时，durable rows 与 active map 必须都保持调用前快照。
+	ProvisionDefaults(ctx context.Context, specs []usecase.CronSpec, platform, chatID, userID string) (jobIDs []string, removed []ReclaimedCronJob, err error)
 	// ReclaimStale 回收本 agent 名下不在 keepJobIDs 集合内的历史 K12 job（§6.14 一次
 	// 切换终局批）：以稳定幂等键前缀 "<agent>/" 识别 K12 归属（跨 user_id），绝不按
 	// 展示名匹配——用户自建任务（无稳定键）一个都不许动。返回回收清单供取证。
@@ -120,6 +123,7 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("GET /print-jobs/{id}", h.getPracticePrintJob)
 	mux.HandleFunc("GET /print-jobs/{id}/paper", h.getPracticePrintJobPaper)
 	mux.HandleFunc("POST /print-jobs/{id}/events", h.recordPracticePrintEvent)
+	mux.HandleFunc("POST /print-jobs/{id}/commit", h.commitPracticePrintReceipt)
 	mux.HandleFunc("POST /print-jobs/{id}/retry", h.retryPracticePrintJob)
 	mux.HandleFunc("POST /practice-sets/{id}/submit", h.submitPracticeSet)
 	mux.HandleFunc("POST /practice-sets/{id}/grade", h.gradePracticeSet)
@@ -1335,31 +1339,28 @@ func (h *handler) cronProvision(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "base_url required（Runtime.BaseURL 未配）")
 		return
 	}
-	userID := req.UserID
-	if userID == "" {
-		userID = "k12"
+	const desktopPrincipal = "desktop-user"
+	claimedUserID := strings.TrimSpace(req.UserID)
+	if claimedUserID != "" && claimedUserID != desktopPrincipal {
+		writeErr(w, http.StatusBadRequest, "user_id must match desktop principal")
+		return
 	}
+	userID := desktopPrincipal
 	// 任务集与 kind 都以描述符（DefaultCronSpecs，对齐 §3.13）为单一事实源——
 	// 原平行 kinds 数组随 monthly-report/year-archive 描述符撤下而删除，防 kind/spec 错位。
 	specs := usecase.DefaultCronSpecs(base, req.Agent, req.Deliver)
-	out := make([]provisionedJob, 0, len(specs))
-	keep := make([]string, 0, len(specs))
-	for _, s := range specs {
-		jobID, err := h.rt.Cron.Register(r.Context(), string(s.Kind), s, req.Platform, req.ChatID, userID)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "注册 "+s.Name+" 失败: "+err.Error())
-			return
-		}
-		out = append(out, provisionedJob{Kind: string(s.Kind), Name: s.Name, Schedule: s.Schedule, JobID: jobID})
-		keep = append(keep, jobID)
-	}
-	// §6.14 一次切换终局批：注册完 §3.13 四任务后回收本 agent 名下的历史 K12 job
-	//（撤下 kind 如 monthly-report/daily-reminder/year-archive、旧 user_id 下的重复
-	// 投递源）。以稳定键前缀识别，用户自建任务与其他 agent 不受影响。
-	reclaimed, err := h.rt.Cron.ReclaimStale(r.Context(), req.Agent, keep)
+	jobIDs, reclaimed, err := h.rt.Cron.ProvisionDefaults(r.Context(), specs, req.Platform, req.ChatID, userID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "回收历史任务失败（本次注册已生效，可重试 provision）: "+err.Error())
 		return
+	}
+	if len(jobIDs) != len(specs) {
+		writeErr(w, http.StatusInternalServerError, "cron registrar 返回的默认任务数不完整")
+		return
+	}
+	out := make([]provisionedJob, 0, len(specs))
+	for i, s := range specs {
+		out = append(out, provisionedJob{Kind: string(s.Kind), Name: s.Name, Schedule: s.Schedule, JobID: jobIDs[i]})
 	}
 	if reclaimed == nil {
 		reclaimed = []ReclaimedCronJob{}

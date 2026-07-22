@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -23,26 +24,74 @@ type fakeRegistrar struct {
 	chatID    string
 	userID    string
 	// stale kind 回收（§6.14 一次切换终局批）：记录 provision 是否触发回收及入参。
-	reclaimAgent string
-	reclaimKeep  []string
-	reclaimOut   []apihttp.ReclaimedCronJob
-	ensureCalls  int
-	ensureWrites int
-	failEnsureAt int
-	ensured      map[string]string
-	ensureUsers  []string
+	reclaimAgent     string
+	reclaimKeep      []string
+	reclaimOut       []apihttp.ReclaimedCronJob
+	ensureCalls      int
+	ensureWrites     int
+	failEnsureAt     int
+	ensured          map[string]string
+	ensureUsers      []string
+	jobs             map[string]string // job_id -> source_key，模拟 durable/active 共同终态
+	registerCalls    int
+	failRegisterAt   int
+	failReclaimAfter int
 }
 
 func (f *fakeRegistrar) Register(_ context.Context, kind string, spec usecase.CronSpec, platform, chatID, userID string) (string, error) {
+	f.registerCalls++
+	if f.failRegisterAt == f.registerCalls {
+		return "", errors.New("injected register failure")
+	}
 	f.kinds = append(f.kinds, kind)
 	f.schedules = append(f.schedules, spec.Schedule)
 	f.platform, f.chatID, f.userID = platform, chatID, userID
-	return "job-" + kind, nil
+	id := "job-" + kind
+	if f.jobs != nil {
+		f.jobs[id] = spec.Key
+	}
+	return id, nil
+}
+
+func (f *fakeRegistrar) ProvisionDefaults(ctx context.Context, specs []usecase.CronSpec, platform, chatID, userID string) ([]string, []apihttp.ReclaimedCronJob, error) {
+	before := cloneStringMap(f.jobs)
+	jobIDs := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		id, err := f.Register(ctx, string(spec.Kind), spec, platform, chatID, userID)
+		if err != nil {
+			f.jobs = before
+			return nil, nil, err
+		}
+		jobIDs = append(jobIDs, id)
+	}
+	agentName := strings.TrimSuffix(specs[0].Key, "/"+string(specs[0].Kind))
+	removed, err := f.ReclaimStale(ctx, agentName, jobIDs)
+	if err != nil {
+		f.jobs = before
+		return nil, nil, err
+	}
+	return jobIDs, removed, nil
 }
 
 func (f *fakeRegistrar) ReclaimStale(_ context.Context, agentName string, keepJobIDs []string) ([]apihttp.ReclaimedCronJob, error) {
 	f.reclaimAgent = agentName
 	f.reclaimKeep = append([]string{}, keepJobIDs...)
+	if f.jobs != nil {
+		keep := make(map[string]bool, len(keepJobIDs))
+		for _, id := range keepJobIDs {
+			keep[id] = true
+		}
+		removed := 0
+		for id, sourceKey := range f.jobs {
+			if strings.HasPrefix(sourceKey, agentName+"/") && !keep[id] {
+				delete(f.jobs, id)
+				removed++
+				if f.failReclaimAfter == removed {
+					return nil, errors.New("injected reclaim failure")
+				}
+			}
+		}
+	}
 	return f.reclaimOut, nil
 }
 
@@ -85,8 +134,8 @@ func newServerWithCron(t *testing.T, reg apihttp.CronRegistrar) http.Handler {
 	})
 }
 
-// provision 对齐架构设计-v0.5.0 §3.13：注册 5 个任务（每周复习/每日提醒/回传提醒/
-// 学期确认×2）；monthly-report 与 year-archive 不再随建档注册 cron（内容端点保留）。
+// provision 对齐架构设计-v0.5.0 §3.13：注册 4 个任务（每周复习/回传提醒/
+// 春秋学期确认）；daily/monthly/year 仅保留兼容内容端点，不随建档注册 cron。
 // kind 由描述符（CronSpec.Kind）携带——单一事实源，防 kind/spec 错位注册。
 func TestCronProvision_RegistersFourJobs(t *testing.T) {
 	reg := &fakeRegistrar{}
@@ -151,6 +200,103 @@ func TestCronProvision_501WhenNoRegistrar(t *testing.T) {
 	rec, _ := do(t, h, "POST", "/cron/provision", `{"agent":"mingming"}`)
 	if rec.Code != http.StatusNotImplemented {
 		t.Errorf("无 registrar 应 501, got %d", rec.Code)
+	}
+}
+
+func TestCronProvision_UsesDesktopPrincipalAndRejectsForgedOwner(t *testing.T) {
+	reg := &fakeRegistrar{}
+	h := newServerWithCron(t, reg)
+
+	rec, _ := do(t, h, "POST", "/cron/provision", `{"agent":"mingming"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("missing user_id should use trusted desktop principal, got %d", rec.Code)
+	}
+	if reg.userID != "desktop-user" {
+		t.Fatalf("provision used untrusted/default owner %q", reg.userID)
+	}
+
+	before := reg.registerCalls
+	rec, _ = do(t, h, "POST", "/cron/provision", `{"agent":"mingming","user_id":"other-owner"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("forged user_id must fail closed, got %d", rec.Code)
+	}
+	if reg.registerCalls != before {
+		t.Fatal("forged owner reached cron registrar")
+	}
+}
+
+func TestCronProvision_RegisterFailureRestoresWholePreCallJobSetAndRetryConverges(t *testing.T) {
+	for failAt := 1; failAt <= 4; failAt++ {
+		t.Run(string(rune('0'+failAt)), func(t *testing.T) {
+			before := map[string]string{
+				"legacy-weekly": "mingming/weekly-sheet",
+				"legacy-daily":  "mingming/daily-reminder",
+			}
+			reg := &fakeRegistrar{jobs: cloneStringMap(before), failRegisterAt: failAt}
+			h := newServerWithCron(t, reg)
+
+			rec, _ := do(t, h, "POST", "/cron/provision", `{"agent":"mingming","user_id":"desktop-user"}`)
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("register %d failure should return 500, got %d", failAt, rec.Code)
+			}
+			if !reflect.DeepEqual(reg.jobs, before) {
+				t.Fatalf("register %d failure left a partial job set\nbefore=%v\nafter=%v", failAt, before, reg.jobs)
+			}
+
+			reg.failRegisterAt = 0
+			reg.registerCalls = 0
+			rec, _ = do(t, h, "POST", "/cron/provision", `{"agent":"mingming","user_id":"desktop-user"}`)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("retry should converge, got %d", rec.Code)
+			}
+			assertExactProvisionedFakeJobs(t, reg.jobs, "mingming")
+		})
+	}
+}
+
+func TestCronProvision_ReclaimFailureRestoresWholePreCallJobSetAndRetryConverges(t *testing.T) {
+	before := map[string]string{
+		"legacy-weekly": "mingming/weekly-sheet",
+		"legacy-daily":  "mingming/daily-reminder",
+	}
+	reg := &fakeRegistrar{jobs: cloneStringMap(before), failReclaimAfter: 1}
+	h := newServerWithCron(t, reg)
+
+	rec, _ := do(t, h, "POST", "/cron/provision", `{"agent":"mingming","user_id":"desktop-user"}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("reclaim failure should return 500, got %d", rec.Code)
+	}
+	if !reflect.DeepEqual(reg.jobs, before) {
+		t.Fatalf("reclaim failure left a partial job set\nbefore=%v\nafter=%v", before, reg.jobs)
+	}
+
+	reg.failReclaimAfter = 0
+	reg.registerCalls = 0
+	rec, _ = do(t, h, "POST", "/cron/provision", `{"agent":"mingming","user_id":"desktop-user"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("retry should converge, got %d", rec.Code)
+	}
+	assertExactProvisionedFakeJobs(t, reg.jobs, "mingming")
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func assertExactProvisionedFakeJobs(t *testing.T, jobs map[string]string, agent string) {
+	t.Helper()
+	want := map[string]string{
+		"job-weekly-sheet":    agent + "/weekly-sheet",
+		"job-return-reminder": agent + "/return-reminder",
+		"job-semester-spring": agent + "/semester-spring",
+		"job-semester-fall":   agent + "/semester-fall",
+	}
+	if !reflect.DeepEqual(jobs, want) {
+		t.Fatalf("provision did not converge to exact defaults\nwant=%v\ngot=%v", want, jobs)
 	}
 }
 

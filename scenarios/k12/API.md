@@ -129,8 +129,8 @@
 **`GET /api/k12/cron/semester-check?agent=X`** — 学期确认提醒（无档案/已最末档→空）
 **`GET /api/k12/cron/year-archive?agent=X`** — 学年 6 月底归档建议（无记录→空）
 
-**`POST /api/k12/cron/provision`** `{"agent","platform","chat_id","deliver":["dingtalk"],"user_id","base_url"}` → `{"provisioned":[{"kind","name","schedule","job_id"}]}`
-- 显式切换兼容入口：注册 §3.13 四个默认任务，并回收历史默认任务残留。
+**`POST /api/k12/cron/provision`** `{"agent","platform","chat_id","deliver":["dingtalk"],"user_id","base_url"}` → `{"provisioned":[{"kind","name","schedule","job_id"}],"reclaimed":[{"job_id","name","source_key"}]}`
+- 显式切换兼容入口：在同一 durable 事务内注册/覆盖 §3.13 四个默认任务，并回收历史默认任务超集；任一注册、归并或回收失败时 durable/active 状态均保持调用前快照。
 - 需服务器注入 cron.Scheduler（桌面默认有）；未注入 → **501**。`base_url` 服务器已配时可省。
 
 **`POST /api/k12/cron/reconcile-defaults`** `{"agent","platform","chat_id","deliver":["dingtalk"],"user_id","base_url"}` → `{"provisioned":[{"kind","name","schedule","job_id","created"}]}`

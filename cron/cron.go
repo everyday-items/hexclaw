@@ -167,6 +167,14 @@ type AddJobRequest struct {
 	LocalAPIBase    string   `json:"-"` // 服务端注入
 }
 
+// ScriptJobRequest 是一个已编写脚本任务的原子批处理单元。
+// Runtime/Script 与 AddJobRequest 分开，保持单任务 API 的现有 JSON 契约。
+type ScriptJobRequest struct {
+	Request AddJobRequest
+	Runtime string
+	Script  string
+}
+
 // initialJobStatus 由 Paused 求初始状态。
 func initialJobStatus(paused bool) JobStatus {
 	if paused {
@@ -872,10 +880,42 @@ func (s *Scheduler) UpsertJobFromScript(ctx context.Context, req AddJobRequest, 
 		return nil, fmt.Errorf("开始 cron 覆盖事务: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	staleIDs, err := upsertPreparedJobTx(ctx, tx, req, job, specJSON, metaJSON, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("提交 cron 覆盖事务: %w", err)
+	}
+	for _, id := range staleIDs {
+		delete(s.jobs, id)
+		s.pruneAgentState(id)
+	}
+	s.jobs[job.ID] = job
+	logger.Info("Cron 任务已覆盖注册", "name", job.Name, "source_key", job.SourceKey, "schedule", job.Schedule)
+	return job, nil
+}
 
-	rows, err := tx.QueryContext(ctx, `SELECT id, name, type, schedule, spec_json, source_prompt, user_id, platform, chat_id, status,
-		last_run_at, next_run_at, run_count, created_at, meta
-		FROM cron_jobs WHERE user_id = ? ORDER BY created_at, id`, req.UserID)
+// upsertPreparedJobTx 在调用方已持有 Scheduler.mu 的事务内执行单任务覆盖。
+// 它保留 UpsertJobFromScript 的 legacy name 迁移、暂停状态和运行证据合并语义，
+// 同时供场景整组 provision 复用同一事务。
+func upsertPreparedJobTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	req AddJobRequest,
+	job *Job,
+	specJSON, metaJSON string,
+	matchExactAcrossUsers bool,
+) ([]string, error) {
+	query := `SELECT id, name, type, schedule, spec_json, source_prompt, user_id, platform, chat_id, status,
+		last_run_at, next_run_at, run_count, created_at, meta FROM cron_jobs`
+	var queryArgs []any
+	if !matchExactAcrossUsers {
+		query += ` WHERE user_id = ?`
+		queryArgs = append(queryArgs, req.UserID)
+	}
+	query += ` ORDER BY created_at, id`
+	rows, err := tx.QueryContext(ctx, query, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("查询 cron 幂等键: %w", err)
 	}
@@ -888,7 +928,16 @@ func (s *Scheduler) UpsertJobFromScript(ctx context.Context, req AddJobRequest, 
 		}
 		// Name fallback migrates jobs created before SourceKey existed. A job
 		// already owned by another non-empty key is never stolen by display name.
-		if jobMatchesIdempotencyKey(existing.SourceKey, existing.Name, req.SourceKey, req.Name) {
+		exactStableKey := existing.SourceKey != "" && existing.SourceKey == req.SourceKey &&
+			(matchExactAcrossUsers || existing.UserID == req.UserID)
+		// Whole-family cutover crosses principal boundaries and therefore only
+		// trusts a non-empty exact SourceKey. A SourceKey-empty row is user-owned;
+		// display-name fallback here could absorb or delete it while migrating an
+		// exact key from an older principal. Single-job Upsert retains the scoped
+		// same-owner legacy-name migration below.
+		sameOwnerLegacyMatch := !matchExactAcrossUsers && existing.UserID == req.UserID &&
+			jobMatchesIdempotencyKey(existing.SourceKey, existing.Name, req.SourceKey, req.Name)
+		if exactStableKey || sameOwnerLegacyMatch {
 			matches = append(matches, existing)
 		}
 	}
@@ -912,6 +961,9 @@ func (s *Scheduler) UpsertJobFromScript(ctx context.Context, req AddJobRequest, 
 		job.Status = keep.Status
 		for _, duplicate := range matches[1:] {
 			staleIDs = append(staleIDs, duplicate.ID)
+			if duplicate.Status == StatusPaused {
+				job.Status = StatusPaused
+			}
 		}
 		if err := migrate.MergeCronJobsTx(ctx, tx, keep.ID, staleIDs, "runtime_source_key_upsert"); err != nil {
 			return nil, fmt.Errorf("归并重复 cron 证据: %w", err)
@@ -948,16 +1000,121 @@ func (s *Scheduler) UpsertJobFromScript(ctx context.Context, req AddJobRequest, 
 	if err != nil {
 		return nil, fmt.Errorf("原子保存 cron 任务: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("提交 cron 覆盖事务: %w", err)
+	return staleIDs, nil
+}
+
+// ProvisionJobsFromScriptsAtomic 在一个 SQLite 事务中覆盖声明的脚本任务并回收
+// 同一 SourceKey 前缀下的历史超集。所有脚本/调度在加锁和写 DB 前先完成验证；
+// 任一 upsert/合并/回收/提交失败都不改变 durable rows 或 active map。
+func (s *Scheduler) ProvisionJobsFromScriptsAtomic(
+	ctx context.Context,
+	prefix string,
+	requests []ScriptJobRequest,
+) (provisioned, reclaimed []*Job, err error) {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return nil, nil, fmt.Errorf("source_key prefix is required")
 	}
-	for _, id := range staleIDs {
+	if len(requests) == 0 {
+		return nil, nil, fmt.Errorf("at least one cron job is required")
+	}
+
+	type preparedJob struct {
+		req                AddJobRequest
+		job                *Job
+		specJSON, metaJSON string
+	}
+	prepared := make([]preparedJob, 0, len(requests))
+	seenKeys := make(map[string]bool, len(requests))
+	for _, input := range requests {
+		req := input.Request
+		if strings.TrimSpace(req.UserID) == "" {
+			return nil, nil, fmt.Errorf("user_id is required for cron provision")
+		}
+		if req.SourceKey == prefix || !strings.HasPrefix(req.SourceKey, prefix) {
+			return nil, nil, fmt.Errorf("source_key %q is outside provision prefix %q", req.SourceKey, prefix)
+		}
+		if seenKeys[req.SourceKey] {
+			return nil, nil, fmt.Errorf("duplicate source_key in cron provision: %q", req.SourceKey)
+		}
+		seenKeys[req.SourceKey] = true
+		job, buildErr := s.buildJobFromScript(req, input.Runtime, input.Script)
+		if buildErr != nil {
+			return nil, nil, buildErr
+		}
+		sum := sha256.Sum256([]byte(req.UserID + "\x00" + req.SourceKey))
+		job.ID = fmt.Sprintf("cron-%x", sum[:12])
+		specJSON, metaJSON, prepareErr := prepareJobForPersistence(job)
+		if prepareErr != nil {
+			return nil, nil, prepareErr
+		}
+		prepared = append(prepared, preparedJob{req: req, job: job, specJSON: specJSON, metaJSON: metaJSON})
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("开始 cron 整组 provision 事务: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	removedIDs := make(map[string]bool)
+	keepIDs := make(map[string]bool, len(prepared))
+	for _, item := range prepared {
+		staleIDs, upsertErr := upsertPreparedJobTx(ctx, tx, item.req, item.job, item.specJSON, item.metaJSON, true)
+		if upsertErr != nil {
+			return nil, nil, upsertErr
+		}
+		for _, id := range staleIDs {
+			removedIDs[id] = true
+		}
+		keepIDs[item.job.ID] = true
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT id, name, type, schedule, spec_json, source_prompt, user_id, platform, chat_id, status,
+		last_run_at, next_run_at, run_count, created_at, meta
+		FROM cron_jobs ORDER BY created_at, id`)
+	if err != nil {
+		return nil, nil, fmt.Errorf("查询 cron provision 历史超集: %w", err)
+	}
+	for rows.Next() {
+		candidate, scanErr := scanJobRow(rows)
+		if scanErr != nil {
+			_ = rows.Close()
+			return nil, nil, fmt.Errorf("读取 cron provision 历史超集: %w", scanErr)
+		}
+		if candidate.SourceKey != "" && strings.HasPrefix(candidate.SourceKey, prefix) && !keepIDs[candidate.ID] {
+			reclaimed = append(reclaimed, cloneJobSnapshot(candidate))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, nil, fmt.Errorf("遍历 cron provision 历史超集: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, nil, fmt.Errorf("关闭 cron provision 历史超集查询: %w", err)
+	}
+	for _, job := range reclaimed {
+		if _, deleteErr := tx.ExecContext(ctx, `DELETE FROM cron_jobs WHERE id = ?`, job.ID); deleteErr != nil {
+			return nil, nil, fmt.Errorf("回收历史 K12 定时任务 %s（%s）: %w", job.Name, job.ID, deleteErr)
+		}
+		removedIDs[job.ID] = true
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, fmt.Errorf("提交 cron 整组 provision 事务: %w", err)
+	}
+
+	for id := range removedIDs {
 		delete(s.jobs, id)
 		s.pruneAgentState(id)
 	}
-	s.jobs[job.ID] = job
-	logger.Info("Cron 任务已覆盖注册", "name", job.Name, "source_key", job.SourceKey, "schedule", job.Schedule)
-	return job, nil
+	provisioned = make([]*Job, 0, len(prepared))
+	for _, item := range prepared {
+		s.jobs[item.job.ID] = item.job
+		provisioned = append(provisioned, cloneJobSnapshot(item.job))
+	}
+	return provisioned, reclaimed, nil
 }
 
 // RemoveJob 删除任务

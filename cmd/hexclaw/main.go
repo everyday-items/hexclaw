@@ -2047,7 +2047,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				logger.Warn("注册 k12_review skill 失败", "error", err)
 			}
 			// 自动化沉淀「调度」缝：注入平台 cron.Scheduler 包成 CronRegistrar，
-			// POST /api/k12/cron/provision 即可为实例注册默认任务（周卷/日提醒/月报/学期确认）。
+			// POST /api/k12/cron/provision 原子切换四任务（周卷/回传提醒/春秋学期确认）。
 			var k12Cron k12apihttp.CronRegistrar
 			if scheduler != nil {
 				k12Cron = k12CronRegistrar{sched: scheduler, router: agentRouter}
@@ -2915,7 +2915,10 @@ func (r k12CronRegistrar) Register(ctx context.Context, kind string, spec k12use
 		return register()
 	}
 	var jobID string
-	err := r.router.WithAgentLease(agentName, func(agentrouter.AgentConfig) error {
+	err := r.router.WithAgentLease(agentName, func(agent agentrouter.AgentConfig) error {
+		if err := requireK12CronAgent(agent); err != nil {
+			return err
+		}
 		var registerErr error
 		jobID, registerErr = register()
 		return registerErr
@@ -2924,6 +2927,75 @@ func (r k12CronRegistrar) Register(ctx context.Context, kind string, spec k12use
 		return "", fmt.Errorf("k12 agent %q 不可用，拒绝创建孤儿定时任务: %w", agentName, err)
 	}
 	return jobID, nil
+}
+
+// ProvisionDefaults 把显式 cutover 的“四任务覆盖 + 历史超集回收”收敛到
+// Scheduler 的单事务原语。与 missing-only EnsureMissing 互不替代：前者是显式切换，
+// 后者只补缺项并保留用户定制。
+func (r k12CronRegistrar) ProvisionDefaults(
+	ctx context.Context,
+	specs []k12usecase.CronSpec,
+	platform, chatID, userID string,
+) ([]string, []k12apihttp.ReclaimedCronJob, error) {
+	if len(specs) == 0 {
+		return nil, nil, fmt.Errorf("k12 cron provision 缺少默认任务")
+	}
+	var agentName string
+	requests := make([]cron.ScriptJobRequest, 0, len(specs))
+	for _, spec := range specs {
+		kind := strings.TrimSpace(string(spec.Kind))
+		key := strings.TrimSpace(spec.Key)
+		if kind == "" || key == "" || !strings.HasSuffix(key, "/"+kind) {
+			return nil, nil, fmt.Errorf("k12 cron 幂等键与 kind 不匹配: key=%q kind=%q", key, kind)
+		}
+		currentAgent := strings.TrimSuffix(key, "/"+kind)
+		if strings.TrimSpace(currentAgent) == "" {
+			return nil, nil, fmt.Errorf("k12 cron 幂等键缺少 agent: key=%q", key)
+		}
+		if agentName == "" {
+			agentName = currentAgent
+		} else if currentAgent != agentName {
+			return nil, nil, fmt.Errorf("k12 cron provision 不得混合多个 agent: %q/%q", agentName, currentAgent)
+		}
+		requests = append(requests, cron.ScriptJobRequest{
+			Request: cron.AddJobRequest{
+				Name: spec.Name, Schedule: spec.Schedule, UserID: userID,
+				Platform: platform, ChatID: chatID, TZ: "Asia/Shanghai", Deliver: spec.Deliver, SourceKey: key,
+			},
+			Runtime: spec.Runtime,
+			Script:  spec.Script,
+		})
+	}
+
+	provision := func() ([]*cron.Job, []*cron.Job, error) {
+		return r.sched.ProvisionJobsFromScriptsAtomic(ctx, agentName+"/", requests)
+	}
+	var jobs, reclaimed []*cron.Job
+	var err error
+	if r.router == nil {
+		jobs, reclaimed, err = provision()
+	} else {
+		err = r.router.WithAgentLease(agentName, func(agent agentrouter.AgentConfig) error {
+			if err := requireK12CronAgent(agent); err != nil {
+				return err
+			}
+			var provisionErr error
+			jobs, reclaimed, provisionErr = provision()
+			return provisionErr
+		})
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("k12 cron 整组原子 provision: %w", err)
+	}
+	jobIDs := make([]string, 0, len(jobs))
+	for _, job := range jobs {
+		jobIDs = append(jobIDs, job.ID)
+	}
+	removed := make([]k12apihttp.ReclaimedCronJob, 0, len(reclaimed))
+	for _, job := range reclaimed {
+		removed = append(removed, k12apihttp.ReclaimedCronJob{JobID: job.ID, Name: job.Name, SourceKey: job.SourceKey})
+	}
+	return jobIDs, removed, nil
 }
 
 // EnsureMissing is the scoped profile-lifecycle reconciliation path. It shares
@@ -2954,7 +3026,10 @@ func (r k12CronRegistrar) EnsureMissing(ctx context.Context, kind string, spec k
 	}
 	var jobID string
 	var created bool
-	err := r.router.WithAgentLease(agentName, func(agentrouter.AgentConfig) error {
+	err := r.router.WithAgentLease(agentName, func(agent agentrouter.AgentConfig) error {
+		if err := requireK12CronAgent(agent); err != nil {
+			return err
+		}
 		var ensureErr error
 		jobID, created, ensureErr = ensure()
 		return ensureErr
@@ -2963,6 +3038,13 @@ func (r k12CronRegistrar) EnsureMissing(ctx context.Context, kind string, spec k
 		return "", false, fmt.Errorf("k12 agent %q 不可用，拒绝创建孤儿定时任务: %w", agentName, err)
 	}
 	return jobID, created, nil
+}
+
+func requireK12CronAgent(agent agentrouter.AgentConfig) error {
+	if agent.Metadata["scenario"] != k12TutorScenario {
+		return fmt.Errorf("TutorAgent %q 不存在或不是 K12 辅导实例", agent.Name)
+	}
+	return nil
 }
 
 // ReclaimStale 实现 apihttp.CronRegistrar 的 stale kind 回收（§6.14 一次切换终局批）：

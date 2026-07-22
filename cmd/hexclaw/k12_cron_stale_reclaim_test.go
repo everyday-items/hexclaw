@@ -19,10 +19,12 @@ package main
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/cron"
+	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
@@ -160,5 +162,74 @@ func TestCutover20260718_ProvisionReclaimIdempotent(t *testing.T) {
 	}
 	if len(jobs) != len(specs) {
 		t.Errorf("回收后 §3.13 四任务应原样存活, got %d", len(jobs))
+	}
+}
+
+func TestK12CronProvisionDefaultsUsesSingleAtomicCutoverAndRetryIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	reg := newCronRegistrarFixture(t)
+	const agent = "k12-tutor-atomic"
+
+	staleID := seedLegacyJob(t, reg.sched, "legacy-user", agent, "daily-reminder", "复习提醒（每天）")
+	pausedWeekly, err := reg.sched.UpsertJobFromScript(ctx, cron.AddJobRequest{
+		Name: "家长自定义周卷", Schedule: "13 7 * * 6", UserID: "desktop-user",
+		SourceKey: agent + "/weekly-sheet", TZ: "Asia/Shanghai", Paused: true,
+	}, cron.RuntimeStarlark, `emit({"status": "success", "custom": True})`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	specs := k12usecase.DefaultCronSpecs("http://127.0.0.1:1", agent, []string{"dingtalk"})
+	jobIDs, reclaimed, err := reg.ProvisionDefaults(ctx, specs, "dingtalk", "chat-1", "desktop-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobIDs) != 4 || len(reclaimed) != 1 || reclaimed[0].JobID != staleID {
+		t.Fatalf("atomic cutover result mismatch: ids=%v reclaimed=%+v", jobIDs, reclaimed)
+	}
+	jobs, err := reg.sched.ListJobs(ctx, "desktop-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 4 {
+		t.Fatalf("atomic cutover must converge exact four jobs, got %+v", jobs)
+	}
+	for _, job := range jobs {
+		if job.ID == pausedWeekly.ID && job.Status != cron.StatusPaused {
+			t.Fatalf("explicit cutover must preserve a user-paused default, got %+v", job)
+		}
+	}
+
+	secondIDs, secondReclaimed, err := reg.ProvisionDefaults(ctx, specs, "dingtalk", "chat-1", "desktop-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(secondIDs, jobIDs) || len(secondReclaimed) != 0 {
+		t.Fatalf("repeat cutover must be idempotent: first=%v second=%v reclaimed=%+v", jobIDs, secondIDs, secondReclaimed)
+	}
+}
+
+func TestK12CronProvisionDefaultsRejectsNonK12AgentUnderLease(t *testing.T) {
+	ctx := context.Background()
+	reg := newCronRegistrarFixture(t)
+	const agent = "general-agent"
+	router := agentrouter.New()
+	if err := router.Register(agentrouter.AgentConfig{
+		Name: agent, Metadata: map[string]string{"scenario": "general"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reg.router = router
+
+	specs := k12usecase.DefaultCronSpecs("http://127.0.0.1:1", agent, nil)
+	if _, _, err := reg.ProvisionDefaults(ctx, specs, "", "", "desktop-user"); err == nil {
+		t.Fatal("non-K12 Agent must not acquire a K12 cron provision side effect")
+	}
+	jobs, err := reg.sched.ListJobs(ctx, "desktop-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("rejected non-K12 provision wrote cron rows: %+v", jobs)
 	}
 }
