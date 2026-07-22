@@ -1018,10 +1018,49 @@ func validateAgentTemperature(t *float64) error {
 	return nil
 }
 
+func cloneLLMConfigSnapshot(source config.LLMConfig) config.LLMConfig {
+	clone := source
+	clone.Providers = make(map[string]config.LLMProviderConfig, len(source.Providers))
+	for name, provider := range source.Providers {
+		providerClone := provider
+		providerClone.Models = append([]string(nil), provider.Models...)
+		providerClone.ModelSpecs = make([]config.LLMProviderModelSpec, len(provider.ModelSpecs))
+		for index, spec := range provider.ModelSpecs {
+			specClone := spec
+			specClone.Capabilities = append([]string(nil), spec.Capabilities...)
+			if spec.Embedding != nil {
+				embedding := *spec.Embedding
+				specClone.Embedding = &embedding
+			}
+			providerClone.ModelSpecs[index] = specClone
+		}
+		if provider.ToolsEnabled != nil {
+			toolsEnabled := *provider.ToolsEnabled
+			providerClone.ToolsEnabled = &toolsEnabled
+		}
+		if provider.Enabled != nil {
+			enabled := *provider.Enabled
+			providerClone.Enabled = &enabled
+		}
+		clone.Providers[name] = providerClone
+	}
+	return clone
+}
+
 func (s *Server) activeLLMConfig() config.LLMConfig {
-	llmCfg := s.cfg.LLM
+	// cfgMu also covers runtime ReloadLLMConfig in the PUT path. Reading both
+	// sources and cloning every mutable map/slice/pointer while holding the same
+	// lock yields one immutable generation and prevents catalog probes from
+	// racing a concurrent config transition.
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+
+	llmCfg := cloneLLMConfigSnapshot(s.cfg.LLM)
 	if runtime, ok := s.engine.(llmConfigRuntime); ok {
-		llmCfg = effectiveLLMConfig(llmCfg, runtime)
+		live := runtime.ActiveLLMConfig()
+		if len(live.Providers) > 0 {
+			llmCfg = cloneLLMConfigSnapshot(live)
+		}
 	}
 	return llmCfg
 }

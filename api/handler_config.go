@@ -199,18 +199,6 @@ func (s *Server) rollbackLegacyLLMTransition(
 	return errors.Join(rollbackErrors...)
 }
 
-func effectiveLLMConfig(base config.LLMConfig, runtime llmConfigRuntime) config.LLMConfig {
-	if runtime == nil {
-		return base
-	}
-
-	live := runtime.ActiveLLMConfig()
-	if len(live.Providers) == 0 {
-		return base
-	}
-	return live
-}
-
 func providerPrivateNetworkAccessResponse(access config.ProviderPrivateNetworkAccess) *config.ProviderPrivateNetworkAccess {
 	if strings.TrimSpace(access.Host) == "" && !access.Allowed {
 		return nil
@@ -316,10 +304,7 @@ var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvi
 //
 // 返回当前 LLM 配置，API Key 脱敏显示。
 func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
-	llmCfg := s.cfg.LLM
-	if runtime, ok := s.engine.(llmConfigRuntime); ok {
-		llmCfg = effectiveLLMConfig(llmCfg, runtime)
-	}
+	llmCfg := s.activeLLMConfig()
 
 	providers := make(map[string]LLMProviderConfigResponse, len(llmCfg.Providers))
 	for name, p := range llmCfg.Providers {
@@ -624,10 +609,7 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	llmCfg := s.cfg.LLM
-	if runtime, ok := s.engine.(llmConfigRuntime); ok {
-		llmCfg = effectiveLLMConfig(llmCfg, runtime)
-	}
+	llmCfg := s.activeLLMConfig()
 	if isEmbeddingOnlyCompletionModel(llmCfg, providerType, baseURL, model) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "embedding-only 模型不能执行 completion 连接测试",
@@ -747,7 +729,7 @@ func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Reques
 	modelsURL := baseURL + "/models"
 	httpReq, err := http.NewRequestWithContext(ctx, "GET", modelsURL, nil)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}})
+		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}, "error": err.Error()})
 		return
 	}
 	if apiKey := strings.TrimSpace(req.APIKey); apiKey != "" {
@@ -774,7 +756,7 @@ func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Reques
 	}
 	// OpenRouter 等聚合商返回全量目录（数百模型 + 元数据），1MB 不够用
 	if err := json.NewDecoder(http.MaxBytesReader(w, resp.Body, 8<<20)).Decode(&body); err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}})
+		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}, "error": "上游模型目录不是有效 JSON: " + err.Error()})
 		return
 	}
 
@@ -782,12 +764,20 @@ func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Reques
 	if len(rawModels) == 0 {
 		rawModels = body.Models
 	}
+	if len(rawModels) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}, "error": "上游返回空模型目录"})
+		return
+	}
 
 	models := make([]providerModelInfo, 0, len(rawModels))
 	for _, raw := range rawModels {
 		if m, ok := parseProviderModel(raw); ok {
 			models = append(models, m)
 		}
+	}
+	if len(models) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}, "error": "上游模型目录未包含可识别的模型 ID"})
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"models": models})

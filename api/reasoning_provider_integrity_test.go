@@ -116,3 +116,28 @@ func TestLLMConfigUpdate_DanglingReasoningCannotFallBackToLocalDefault(t *testin
 		t.Fatalf("invalid transition reached runtime: reloads=%d active=%+v", eng.reloadCalls, eng.activeLLM)
 	}
 }
+
+func TestLLMConfigUpdate_OrphanedReasoningUsesUsableCloudDefault(t *testing.T) {
+	old := config.LLMConfig{
+		Default:           "cloud-old",
+		ReasoningProvider: "cloud-old",
+		ReasoningModel:    "old-reasoner",
+		Providers: map[string]config.LLMProviderConfig{
+			"cloud-old": {ProviderInstanceID: reasoningProviderID, APIKey: "sk-old", Model: "old-reasoner", Locality: config.ProviderLocalityCloud},
+		},
+	}
+	next := config.LLMConfig{
+		Default:           "cloud-default",
+		ReasoningProvider: old.ReasoningProvider,
+		ReasoningModel:    old.ReasoningModel,
+		Providers: map[string]config.LLMProviderConfig{
+			"cloud-default": {APIKey: "sk-new", Model: "new-reasoner", Locality: config.ProviderLocalityCloud},
+		},
+	}
+	if err := reconcileReasoningSelection(old, &next, LLMConfigUpdateRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if next.ReasoningProvider != "cloud-default" || next.ReasoningModel != "new-reasoner" {
+		t.Fatalf("cloud fallback not applied atomically: %+v", next)
+	}
+}
