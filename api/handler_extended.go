@@ -225,8 +225,9 @@ func (s *Server) handleMCPStatus(w http.ResponseWriter, r *http.Request) {
 // ─── Config: GET /api/v1/config ──
 
 func (s *Server) handleGetFullConfig(w http.ResponseWriter, r *http.Request) {
-	providers := make(map[string]any, len(s.cfg.LLM.Providers))
-	for name, p := range s.cfg.LLM.Providers {
+	llmCfg := s.persistedLLMConfig()
+	providers := make(map[string]any, len(llmCfg.Providers))
+	for name, p := range llmCfg.Providers {
 		providers[name] = fullConfigProviderStatus(name, p)
 	}
 	// sandbox 网络状态：优先读运行时真值，回退到配置
@@ -237,7 +238,7 @@ func (s *Server) handleGetFullConfig(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"server":    map[string]any{"host": s.cfg.Server.Host, "port": s.cfg.Server.Port, "mode": s.cfg.Server.Mode},
-		"llm":       map[string]any{"default": s.cfg.LLM.Default, "providers": providers},
+		"llm":       map[string]any{"default": llmCfg.Default, "providers": providers},
 		"knowledge": map[string]any{"enabled": s.cfg.Knowledge.Enabled},
 		"mcp":       map[string]any{"enabled": s.cfg.MCP.Enabled},
 		"cron":      map[string]any{"enabled": s.cfg.Cron.Enabled},
@@ -424,7 +425,7 @@ func (s *Server) handleUpdateFullConfig(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	var models []map[string]string
-	for name, pc := range s.cfg.LLM.Providers {
+	for name, pc := range s.activeLLMConfig().Providers {
 		if pc.Model != "" {
 			models = append(models, map[string]string{"id": name + "/" + pc.Model, "name": pc.Model, "provider": name})
 		}

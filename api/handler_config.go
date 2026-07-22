@@ -304,7 +304,7 @@ var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvi
 //
 // 返回当前 LLM 配置，API Key 脱敏显示。
 func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
-	llmCfg := s.activeLLMConfig()
+	llmCfg := s.persistedLLMConfig()
 
 	providers := make(map[string]LLMProviderConfigResponse, len(llmCfg.Providers))
 	for name, p := range llmCfg.Providers {
@@ -692,7 +692,7 @@ func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		providerFound := false
-		for providerKey, provider := range s.activeLLMConfig().Providers {
+		for providerKey, provider := range s.persistedLLMConfig().Providers {
 			if config.EffectiveProviderInstanceID(providerKey, provider) != providerInstanceID {
 				continue
 			}

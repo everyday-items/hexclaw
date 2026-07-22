@@ -66,6 +66,13 @@ func Load(configFile string) (*Config, error) {
 	// 展开路径中的 ~
 	expandTildePaths(cfg)
 
+	// 升级兼容：reasoning_provider/model 是可选的派生选择。旧桌面端可能在删除或禁用
+	// Provider 后留下成对悬空值；只在文件加载边界清空这对陈旧引用，再走现有默认推导。
+	// 不写回文件，避免把已经展开的环境变量（尤其凭据）持久化。
+	if migrateStaleReasoningSelection(cfg) {
+		logger.Warn("[llm] 检测到陈旧的可选 reasoning 配置，已在内存中清空并重新推导")
+	}
+
 	// reasoning 兜底：未显式配强文本模型时指向云端强 provider（BUG-20260712 治本 #5）。
 	applyReasoningDefault(cfg)
 
@@ -216,6 +223,26 @@ func applyEnvProviders(cfg *Config) {
 		sort.Strings(names)
 		cfg.LLM.Default = names[0]
 	}
+}
+
+// migrateStaleReasoningSelection repairs only the optional cross-field reference loaded from
+// persisted configuration. Direct Config.Validate and API updates remain strict so a caller
+// cannot use this compatibility path to submit an unknown or disabled provider explicitly.
+func migrateStaleReasoningSelection(cfg *Config) bool {
+	if cfg == nil {
+		return false
+	}
+	providerName := strings.TrimSpace(cfg.LLM.ReasoningProvider)
+	if providerName == "" {
+		return false
+	}
+	provider, exists := cfg.LLM.Providers[providerName]
+	if exists && (provider.Enabled == nil || *provider.Enabled) {
+		return false
+	}
+	cfg.LLM.ReasoningProvider = ""
+	cfg.LLM.ReasoningModel = ""
+	return true
 }
 
 // applyReasoningDefault 未显式配 reasoning_provider 时挑云端强文本 provider 兜底，并 warn。

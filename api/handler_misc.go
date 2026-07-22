@@ -1023,16 +1023,22 @@ func cloneLLMConfigSnapshot(source config.LLMConfig) config.LLMConfig {
 	clone.Providers = make(map[string]config.LLMProviderConfig, len(source.Providers))
 	for name, provider := range source.Providers {
 		providerClone := provider
-		providerClone.Models = append([]string(nil), provider.Models...)
-		providerClone.ModelSpecs = make([]config.LLMProviderModelSpec, len(provider.ModelSpecs))
-		for index, spec := range provider.ModelSpecs {
-			specClone := spec
-			specClone.Capabilities = append([]string(nil), spec.Capabilities...)
-			if spec.Embedding != nil {
-				embedding := *spec.Embedding
-				specClone.Embedding = &embedding
+		if provider.Models != nil {
+			providerClone.Models = append([]string{}, provider.Models...)
+		}
+		if provider.ModelSpecs != nil {
+			providerClone.ModelSpecs = make([]config.LLMProviderModelSpec, len(provider.ModelSpecs))
+			for index, spec := range provider.ModelSpecs {
+				specClone := spec
+				if spec.Capabilities != nil {
+					specClone.Capabilities = append([]string{}, spec.Capabilities...)
+				}
+				if spec.Embedding != nil {
+					embedding := *spec.Embedding
+					specClone.Embedding = &embedding
+				}
+				providerClone.ModelSpecs[index] = specClone
 			}
-			providerClone.ModelSpecs[index] = specClone
 		}
 		if provider.ToolsEnabled != nil {
 			toolsEnabled := *provider.ToolsEnabled
@@ -1045,6 +1051,16 @@ func cloneLLMConfigSnapshot(source config.LLMConfig) config.LLMConfig {
 		clone.Providers[name] = providerClone
 	}
 	return clone
+}
+
+// persistedLLMConfig returns the complete control-plane configuration, including
+// disabled or temporarily unloadable providers. Configuration GETs and stable
+// provider-identity lookups must use this snapshot rather than the routing
+// runtime, whose active set intentionally filters those providers.
+func (s *Server) persistedLLMConfig() config.LLMConfig {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	return cloneLLMConfigSnapshot(s.cfg.LLM)
 }
 
 func (s *Server) activeLLMConfig() config.LLMConfig {

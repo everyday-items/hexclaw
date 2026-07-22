@@ -220,7 +220,7 @@ func (s *Server) handleOllamaStatus(w http.ResponseWriter, r *http.Request) {
 
 	// 3. 检查是否已关联为 Provider
 	if s.cfg != nil {
-		for name, p := range s.cfg.LLM.Providers {
+		for name, p := range s.persistedLLMConfig().Providers {
 			lower := strings.ToLower(name)
 			if lower == "ollama" || strings.Contains(strings.ToLower(p.BaseURL), "localhost:11434") {
 				status.Associated = true
@@ -336,7 +336,7 @@ func resolveWarmupNumCtx(reqNumCtx int) int {
 // 未配置时回落 resolveWarmupNumCtx（请求显式 > 8192 稳态默认）。
 func (s *Server) resolveOllamaNumCtx(reqNumCtx int) int {
 	if s.cfg != nil {
-		for name, p := range s.cfg.LLM.Providers {
+		for name, p := range s.persistedLLMConfig().Providers {
 			lower := strings.ToLower(name)
 			if lower == "ollama" || strings.Contains(strings.ToLower(p.BaseURL), "localhost:11434") {
 				if p.NumCtx > 0 {
@@ -352,7 +352,7 @@ func (s *Server) resolveOllamaNumCtx(reqNumCtx int) int {
 // 未配置时回落到与 ai-core 请求级默认一致的 30m。
 func (s *Server) resolveOllamaKeepAlive() string {
 	if s.cfg != nil {
-		for name, p := range s.cfg.LLM.Providers {
+		for name, p := range s.persistedLLMConfig().Providers {
 			lower := strings.ToLower(name)
 			if lower == "ollama" || strings.Contains(strings.ToLower(p.BaseURL), "localhost:11434") {
 				if ka := strings.TrimSpace(p.KeepAlive); ka != "" {

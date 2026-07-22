@@ -180,7 +180,7 @@ func TestHandleTestLLMConfig_RejectsEmptyAPIKeyForOpenAI(t *testing.T) {
 	}
 }
 
-func TestHandleGetLLMConfig_UsesRuntimeActiveConfig(t *testing.T) {
+func TestHandleGetLLMConfig_UsesPersistedControlPlaneConfig(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LLM.Default = "openai"
 	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
@@ -211,14 +211,14 @@ func TestHandleGetLLMConfig_UsesRuntimeActiveConfig(t *testing.T) {
 		t.Fatalf("解析响应失败: %v", err)
 	}
 
-	if resp.Default != "智谱" {
-		t.Fatalf("期望默认 provider 为运行时配置，实际 %q", resp.Default)
+	if resp.Default != "openai" {
+		t.Fatalf("期望默认 provider 为完整持久配置，实际 %q", resp.Default)
 	}
-	if _, ok := resp.Providers["智谱"]; !ok {
-		t.Fatalf("期望返回运行时 provider，实际 %+v", resp.Providers)
+	if _, ok := resp.Providers["openai"]; !ok {
+		t.Fatalf("期望返回持久 provider，实际 %+v", resp.Providers)
 	}
-	if _, ok := resp.Providers["openai"]; ok {
-		t.Fatalf("不应回退到磁盘配置，实际 %+v", resp.Providers)
+	if _, ok := resp.Providers["智谱"]; ok {
+		t.Fatalf("运行时路由快照不应覆盖设置控制面，实际 %+v", resp.Providers)
 	}
 	var wire struct {
 		Providers map[string]struct {
@@ -230,14 +230,14 @@ func TestHandleGetLLMConfig_UsesRuntimeActiveConfig(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &wire); err != nil {
 		t.Fatalf("解析 wire 响应失败: %v", err)
 	}
-	if wire.Providers["智谱"].KeepAlive != "15m" {
-		t.Fatalf("GET 丢失 keep_alive，实际响应 %s", w.Body.String())
+	if wire.Providers["openai"].KeepAlive != "" {
+		t.Fatalf("GET 持久配置 keep_alive 漂移，实际响应 %s", w.Body.String())
 	}
-	if wire.Providers["智谱"].Locality != config.ProviderLocalityCloud {
-		t.Fatalf("GET 丢失 locality，实际响应 %s", w.Body.String())
+	if wire.Providers["openai"].Locality != "" {
+		t.Fatalf("GET 持久配置 locality 漂移，实际响应 %s", w.Body.String())
 	}
-	if wire.Providers["智谱"].NumCtx != 8192 {
-		t.Fatalf("GET 丢失 num_ctx，实际响应 %s", w.Body.String())
+	if wire.Providers["openai"].NumCtx != 0 {
+		t.Fatalf("GET 持久配置 num_ctx 漂移，实际响应 %s", w.Body.String())
 	}
 }
 
