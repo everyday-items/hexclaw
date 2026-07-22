@@ -9,6 +9,7 @@ package engine
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexagon"
@@ -77,5 +78,21 @@ func TestReasoningModel_ExplicitProviderNotOverridden(t *testing.T) {
 	}
 	if sel.modelName != "glm-4v-flash" {
 		t.Fatalf("显式下发的 model 应被尊重,不被推理模型覆盖,got %q", sel.modelName)
+	}
+}
+
+// 热更新后若 reasoning_provider 悬空，绝不能返回 false 让 resolveLLMSelection 静默走
+// 默认 provider（默认很可能是 Ollama）。这是配置错误，应在调用边界显式失败。
+func TestReasoningModel_DanglingProviderFailsExplicitly(t *testing.T) {
+	eng := newReasoningEngine(t)
+	eng.cfg.LLM.ReasoningProvider = "provider-that-no-longer-exists"
+	msg := &adapter.Message{
+		ID: "solve-dangling", Platform: adapter.PlatformAPI, UserID: "system", Content: "1+1",
+		Metadata: map[string]string{"source": solveDispatchSource, "role": solverAgentName},
+	}
+
+	_, err := eng.resolveLLMSelection(context.Background(), msg)
+	if err == nil || !strings.Contains(err.Error(), "reasoning_provider") {
+		t.Fatalf("dangling reasoning provider error=%v, want explicit reasoning_provider error", err)
 	}
 }

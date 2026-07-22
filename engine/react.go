@@ -4295,7 +4295,9 @@ func (e *ReActEngine) resolveLLMSelection(ctx context.Context, msg *adapter.Mess
 	// BUG-20260712-#1：解题/批改(solve 源)的 solver/verifier 子 Agent 用配置的**强文本推理模型**，
 	// 不用视觉默认模型——glm-4v-flash 擅长看图却不擅长多步文本解题 + 写验证代码，会把错答案判成
 	// unverifiable 漏判、错题入不了库。配了 reasoning_model 就走它；未配则沿用默认路由(无回归)。
-	if sel, ok := e.reasoningSelectionForSolve(msg); ok {
+	if sel, ok, err := e.reasoningSelectionForSolve(msg); err != nil {
+		return llmSelection{}, err
+	} else if ok {
 		return sel, nil
 	}
 
@@ -4320,26 +4322,26 @@ func (e *ReActEngine) resolveLLMSelection(ctx context.Context, msg *adapter.Mess
 
 // reasoningSelectionForSolve 为 solve 源（solver/verifier）选配置的强文本推理模型。
 // 用户显式下发 provider/model 时不覆盖（尊重显式契约）；未配 reasoning_provider 时返回 false 走默认路由。
-func (e *ReActEngine) reasoningSelectionForSolve(msg *adapter.Message) (llmSelection, bool) {
+func (e *ReActEngine) reasoningSelectionForSolve(msg *adapter.Message) (llmSelection, bool, error) {
 	if msg == nil || msg.Metadata == nil || msg.Metadata["source"] != solveDispatchSource {
-		return llmSelection{}, false
+		return llmSelection{}, false, nil
 	}
 	if requestedProvider(msg.Metadata) != "" || requestedModel(msg.Metadata) != "" {
-		return llmSelection{}, false // 显式指定则尊重，不覆盖
+		return llmSelection{}, false, nil // 显式指定则尊重，不覆盖
 	}
 	prov := strings.TrimSpace(e.cfg.LLM.ReasoningProvider)
 	if prov == "" {
-		return llmSelection{}, false
+		return llmSelection{}, false, nil
 	}
 	e.mu.RLock()
 	router := e.router
 	e.mu.RUnlock()
 	if router == nil {
-		return llmSelection{}, false
+		return llmSelection{}, false, fmt.Errorf("reasoning_provider %q 无法解析：LLM router 未初始化", prov)
 	}
 	provider, ok := router.Get(prov)
 	if !ok || provider == nil {
-		return llmSelection{}, false
+		return llmSelection{}, false, fmt.Errorf("reasoning_provider %q 未引用当前已启用的 Provider", prov)
 	}
 	model := strings.TrimSpace(e.cfg.LLM.ReasoningModel)
 	if model == "" {
@@ -4355,7 +4357,7 @@ func (e *ReActEngine) reasoningSelectionForSolve(msg *adapter.Message) (llmSelec
 		// 配置的推理模型是系统首选，不是用户本轮显式 pin。首选模型 429/故障时允许先降级到
 		// 同 provider 默认模型，再跨 provider；初始选择本身仍固定走 reasoning_model。
 		explicitProvider: false,
-	}, true
+	}, true, nil
 }
 
 // RouteForVision 为识题/视觉任务选 provider+model：用**配置的默认 provider**（尊重「设置哪个模型

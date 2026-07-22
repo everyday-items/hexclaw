@@ -21,10 +21,12 @@ import (
 
 // LLMConfigResponse GET /api/v1/config/llm 响应
 type LLMConfigResponse struct {
-	Default   string                               `json:"default"`
-	Providers map[string]LLMProviderConfigResponse `json:"providers"`
-	Routing   config.LLMRoutingConfig              `json:"routing"`
-	Cache     config.LLMCacheConfig                `json:"cache"`
+	Default           string                               `json:"default"`
+	Providers         map[string]LLMProviderConfigResponse `json:"providers"`
+	Routing           config.LLMRoutingConfig              `json:"routing"`
+	Cache             config.LLMCacheConfig                `json:"cache"`
+	ReasoningProvider string                               `json:"reasoning_provider,omitempty"`
+	ReasoningModel    string                               `json:"reasoning_model,omitempty"`
 }
 
 // LLMProviderConfigResponse 脱敏后的 Provider 配置
@@ -50,10 +52,12 @@ type LLMProviderConfigResponse struct {
 
 // LLMConfigUpdateRequest PUT /api/v1/config/llm 请求
 type LLMConfigUpdateRequest struct {
-	Default   string                                 `json:"default"`
-	Providers map[string]LLMProviderConfigUpdateItem `json:"providers"`
-	Routing   *config.LLMRoutingConfig               `json:"routing,omitempty"`
-	Cache     *config.LLMCacheConfig                 `json:"cache,omitempty"`
+	Default           string                                 `json:"default"`
+	Providers         map[string]LLMProviderConfigUpdateItem `json:"providers"`
+	Routing           *config.LLMRoutingConfig               `json:"routing,omitempty"`
+	Cache             *config.LLMCacheConfig                 `json:"cache,omitempty"`
+	ReasoningProvider *string                                `json:"reasoning_provider,omitempty"`
+	ReasoningModel    *string                                `json:"reasoning_model,omitempty"`
 }
 
 // LLMProviderConfigUpdateItem 更新请求中的 Provider 项
@@ -215,6 +219,88 @@ func providerPrivateNetworkAccessResponse(access config.ProviderPrivateNetworkAc
 	return &copy
 }
 
+func providerEligibleAsReasoningFallback(name string, provider config.LLMProviderConfig) bool {
+	if provider.Enabled != nil && !*provider.Enabled {
+		return false
+	}
+	if config.IsLocalLLMProviderNamed(name, provider) {
+		return false
+	}
+	if strings.TrimSpace(provider.Model) == "" ||
+		!config.ModelHasCapability(provider, provider.Model, config.LLMModelCapabilityText) {
+		return false
+	}
+	return strings.TrimSpace(provider.APIKey) != "" || strings.TrimSpace(provider.BaseURL) != ""
+}
+
+// reconcileReasoningSelection keeps the cross-field reasoning_provider reference valid across
+// provider rename/delete hot updates. Stable provider_instance_id wins; only a usable cloud text
+// default may replace a removed identity. Otherwise the transition fails explicitly instead of
+// leaving solve to silently route through the (often local/Ollama) global default.
+func reconcileReasoningSelection(
+	oldLLM config.LLMConfig,
+	nextLLM *config.LLMConfig,
+	req LLMConfigUpdateRequest,
+) error {
+	if nextLLM == nil {
+		return fmt.Errorf("reasoning_provider 配置为空")
+	}
+	if req.ReasoningProvider != nil {
+		nextLLM.ReasoningProvider = strings.TrimSpace(*req.ReasoningProvider)
+		if nextLLM.ReasoningProvider == "" && req.ReasoningModel == nil {
+			nextLLM.ReasoningModel = ""
+		}
+	}
+	if req.ReasoningModel != nil {
+		nextLLM.ReasoningModel = strings.TrimSpace(*req.ReasoningModel)
+	}
+
+	providerName := strings.TrimSpace(nextLLM.ReasoningProvider)
+	if providerName == "" {
+		if strings.TrimSpace(nextLLM.ReasoningModel) != "" {
+			return fmt.Errorf("reasoning_model 已配置但 reasoning_provider 为空")
+		}
+		return nil
+	}
+	if provider, exists := nextLLM.Providers[providerName]; exists {
+		if provider.Enabled != nil && !*provider.Enabled {
+			return fmt.Errorf("reasoning_provider %q 已被禁用", providerName)
+		}
+		return nil
+	}
+
+	// A renamed provider retains its canonical server identity. Resolve by that identity before
+	// considering any fallback, including when a GET→edit→PUT client echoed the old display key.
+	if oldProvider, exists := oldLLM.Providers[providerName]; exists {
+		oldID := config.EffectiveProviderInstanceID(providerName, oldProvider)
+		for candidateName, candidate := range nextLLM.Providers {
+			if config.EffectiveProviderInstanceID(candidateName, candidate) != oldID {
+				continue
+			}
+			if candidate.Enabled != nil && !*candidate.Enabled {
+				return fmt.Errorf("reasoning_provider %q 重命名为 %q 后处于禁用状态", providerName, candidateName)
+			}
+			nextLLM.ReasoningProvider = candidateName
+			return nil
+		}
+	}
+
+	// An explicitly selected unknown provider is a caller/configuration error. The fallback below
+	// is only for an existing reference orphaned by this provider-set update.
+	if req.ReasoningProvider != nil && providerName != strings.TrimSpace(oldLLM.ReasoningProvider) {
+		return fmt.Errorf("reasoning_provider %q 不存在", providerName)
+	}
+	if defaultProvider, exists := nextLLM.Providers[nextLLM.Default]; exists &&
+		providerEligibleAsReasoningFallback(nextLLM.Default, defaultProvider) {
+		nextLLM.ReasoningProvider = nextLLM.Default
+		if req.ReasoningModel == nil {
+			nextLLM.ReasoningModel = defaultProvider.Model
+		}
+		return nil
+	}
+	return fmt.Errorf("reasoning_provider %q 已失效，且无法安全解析到稳定 Provider 身份或云端默认模型", providerName)
+}
+
 var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvider {
 	// 复用真实路由的类型感知工厂（ollama/anthropic 原生 / 其余 OpenAI 兼容），
 	// 消除「测试连接一律当 OpenAI 打」的协议漂移（契约#2）。
@@ -260,10 +346,12 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, LLMConfigResponse{
-		Default:   llmCfg.Default,
-		Providers: providers,
-		Routing:   llmCfg.Routing,
-		Cache:     llmCfg.Cache,
+		Default:           llmCfg.Default,
+		Providers:         providers,
+		Routing:           llmCfg.Routing,
+		Cache:             llmCfg.Cache,
+		ReasoningProvider: llmCfg.ReasoningProvider,
+		ReasoningModel:    llmCfg.ReasoningModel,
 	})
 }
 
@@ -385,6 +473,10 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 
 	if req.Cache != nil {
 		nextLLM.Cache = *req.Cache
+	}
+	if err := reconcileReasoningSelection(oldLLM, &nextLLM, req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
 	}
 	if defaultProvider, exists := nextLLM.Providers[nextLLM.Default]; exists {
 		if defaultProvider.Model == "" || !config.ModelHasCapability(defaultProvider, defaultProvider.Model, config.LLMModelCapabilityText) {
@@ -602,6 +694,7 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 // 向 {base_url}/models 发请求（OpenAI 兼容格式），返回标准化的模型列表。
 func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Request) {
 	var req struct {
+		ProviderInstanceID   string                              `json:"provider_instance_id,omitempty"`
 		BaseURL              string                              `json:"base_url"`
 		APIKey               string                              `json:"api_key"`
 		Locality             string                              `json:"locality,omitempty"`
@@ -610,6 +703,28 @@ func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Reques
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误"})
 		return
+	}
+	if providerInstanceID := strings.TrimSpace(req.ProviderInstanceID); providerInstanceID != "" {
+		if err := config.ValidateProviderInstanceID(providerInstanceID); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider_instance_id 非法: " + err.Error()})
+			return
+		}
+		providerFound := false
+		for providerKey, provider := range s.activeLLMConfig().Providers {
+			if config.EffectiveProviderInstanceID(providerKey, provider) != providerInstanceID {
+				continue
+			}
+			req.BaseURL = provider.BaseURL
+			req.APIKey = provider.APIKey
+			req.Locality = provider.Locality
+			req.PrivateNetworkAccess = provider.PrivateNetworkAccess
+			providerFound = true
+			break
+		}
+		if !providerFound {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider_instance_id 未找到对应的已保存服务商"})
+			return
+		}
 	}
 	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
 	if baseURL == "" {

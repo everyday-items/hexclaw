@@ -58,3 +58,19 @@ func TestApplyReasoningDefault_SkipsDisabled(t *testing.T) {
 		t.Fatalf("应跳过禁用的 deepseek 选 openai, got %q applied=%v", chosen, applied)
 	}
 }
+
+// reasoning_provider 是一个跨字段引用。配置一旦保存了该引用，就不能在 provider 被删后
+// 留下悬空值，否则 solve 会静默掉回默认（常见是本地 Ollama），把“强推理模型”契约悄悄改掉。
+func TestValidate_RejectsDanglingReasoningProvider(t *testing.T) {
+	c := DefaultConfig()
+	c.LLM.Default = "ollama"
+	c.LLM.Providers = map[string]LLMProviderConfig{
+		"ollama": {BaseURL: "http://127.0.0.1:11434/v1", Model: "qwen3.5:9b"},
+	}
+	c.LLM.ReasoningProvider = "deleted-cloud"
+	c.LLM.ReasoningModel = "gpt-5.6-sol"
+
+	if err := c.Validate(); err == nil {
+		t.Fatal("dangling reasoning_provider must be an explicit configuration error")
+	}
+}

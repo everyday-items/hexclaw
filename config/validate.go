@@ -230,6 +230,24 @@ func (c *Config) Validate() error {
 			})
 		}
 	}
+	if reasoningProvider := strings.TrimSpace(c.LLM.ReasoningProvider); reasoningProvider != "" {
+		provider, exists := c.LLM.Providers[reasoningProvider]
+		if !exists || provider.Enabled != nil && !*provider.Enabled {
+			errs = append(errs, &ValidationError{
+				Field:   "llm.reasoning_provider",
+				Value:   reasoningProvider,
+				Rule:    "必须引用一个存在且已启用的 llm.providers 项",
+				Suggest: "重新选择强文本 Provider，或清空 reasoning_provider 让系统重新推导",
+			})
+		}
+	} else if strings.TrimSpace(c.LLM.ReasoningModel) != "" {
+		errs = append(errs, &ValidationError{
+			Field:   "llm.reasoning_model",
+			Value:   c.LLM.ReasoningModel,
+			Rule:    "配置 reasoning_model 时必须同时配置 reasoning_provider",
+			Suggest: "选择对应 Provider，或同时清空 reasoning_model",
+		})
+	}
 
 	if len(errs) > 0 {
 		return errs
