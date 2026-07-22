@@ -19,11 +19,13 @@ var writtenFinalAnswerRe = regexp.MustCompile(`(?:答案?|答)[^0-9+\-]*([+\-]?[
 //   - 数字 + 半角/全角句点 + 空白——小数写法不会在小数点后带空白。
 var itemNumberPrefixRe = regexp.MustCompile(`^[0-9]{1,3}\s*(?:[、)）]|[.．]\s)\s*`)
 var mixedNumberAnswerRe = regexp.MustCompile(`^([+\-]?)([0-9]+)(?:\s+|又)([0-9]+)\s*/\s*([0-9]+)$`)
+var simplestFractionRequestRe = regexp.MustCompile(`^计算[ \t]*(.+?)[ \t]*[，,][ \t]*并把结果化成最简分数[。.]?$`)
 
 // solveTrivialArithmetic 对“只含数字、四则运算、括号，等号右侧为空/问号”的一步算式做
 // 本机精确求值。它刻意不接受变量、函数、单位或自然语言，避免把方程/应用题误判成纯计算。
 func solveTrivialArithmetic(problem string) (worked, answer string, ok bool) {
-	expr, display, ok := normalizeTrivialArithmetic(problem)
+	normalizedProblem, forceFraction := unwrapSimplestFractionRequest(problem)
+	expr, display, ok := normalizeTrivialArithmetic(normalizedProblem)
 	if !ok {
 		return "", "", false
 	}
@@ -36,12 +38,28 @@ func solveTrivialArithmetic(problem string) (worked, answer string, ok bool) {
 	if !ok {
 		return "", "", false
 	}
-	answer = formatArithmeticRat(value)
+	if forceFraction {
+		answer = value.RatString()
+	} else {
+		answer = formatArithmeticRat(value)
+	}
 	if answer == "" {
 		return "", "", false
 	}
 	worked = fmt.Sprintf("按四则运算规则计算：\n%s = %s\n\n答案：%s", display, answer, answer)
 	return worked, answer, true
+}
+
+// unwrapSimplestFractionRequest 只接受产品链路使用的这一句固定自然语言包装。包装剥离后仍
+// 必须通过 normalizeTrivialArithmetic 的字符白名单与 Go AST 白名单；任何尾随指令、变量、
+// 函数或多行内容都会 fail closed 回完整模型链，不能把“自然语言支持”扩成表达式注入面。
+func unwrapSimplestFractionRequest(problem string) (string, bool) {
+	s := strings.TrimSpace(problem)
+	matches := simplestFractionRequestRe.FindStringSubmatch(s)
+	if len(matches) != 2 {
+		return problem, false
+	}
+	return strings.TrimSpace(matches[1]), true
 }
 
 func normalizeTrivialArithmetic(problem string) (expr, display string, ok bool) {

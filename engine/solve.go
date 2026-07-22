@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -253,18 +254,29 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 
 	// 1) Solver 阶段：method_diversity → 2 个不同方法；否则 self_consistency 同法多采样。
 	var sols []solverSolution
+	var solverErrs []error
 	for _, sp := range o.solverSpecs(problem, subject, grade, constraint, methodDiversity, samples) {
 		if childCtx.Err() != nil {
 			break
 		}
-		out, _ := o.runSolveAgent(childCtx, sp)
+		out, err := o.runSolveAgent(childCtx, sp)
+		if err != nil {
+			solverErrs = append(solverErrs, err)
+			continue
+		}
 		if strings.TrimSpace(out) != "" {
 			sols = append(sols, solverSolution{output: out, answer: extractFinalAnswer(out)})
 		}
 	}
 	if len(sols) == 0 {
 		o.registry.Finish(solveRunID, subAgentStatusError, "", "solver produced no solution", "")
-		return &skill.Result{Content: "未能解出本题，请补充题目信息或换一种问法。"}, nil
+		if len(solverErrs) > 0 {
+			return nil, fmt.Errorf("solve: solver execution failed: %w", errors.Join(solverErrs...))
+		}
+		if err := childCtx.Err(); err != nil {
+			return nil, fmt.Errorf("solve: solver execution stopped: %w", err)
+		}
+		return nil, fmt.Errorf("solve: solver produced no solution")
 	}
 	groups := groupByAnswer(sols)
 	primary := groups[0]
