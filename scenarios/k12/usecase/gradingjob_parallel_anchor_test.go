@@ -49,6 +49,40 @@ func (maliciousGradingAnchorer) AnchorAnswers(_ context.Context, _ []byte, quest
 	return out, nil
 }
 
+// dualPathGradingAnchorer models the production recognizer adapter: it exposes
+// a one-call geometry pass and a much more expensive full transcription pass.
+// The GradingJob locating branch owns geometry only, so invoking AnchorAnswers
+// here would spend its 60-second budget on facts that the orchestrator must
+// discard when it merges the frozen recognition result.
+type dualPathGradingAnchorer struct {
+	mu            sync.Mutex
+	geometryCalls int
+	fullCalls     int
+}
+
+func (a *dualPathGradingAnchorer) AnchorAnswerGeometry(_ context.Context, _ []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
+	a.mu.Lock()
+	a.geometryCalls++
+	a.mu.Unlock()
+	out := cloneRecognizedQuestions(questions)
+	box := BBox{X: 0.2, Y: 0.3, W: 0.1, H: 0.05}
+	out[0].BBox = &box
+	return out, nil
+}
+
+func (a *dualPathGradingAnchorer) AnchorAnswers(_ context.Context, _ []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
+	a.mu.Lock()
+	a.fullCalls++
+	a.mu.Unlock()
+	return cloneRecognizedQuestions(questions), nil
+}
+
+func (a *dualPathGradingAnchorer) calls() (geometry, full int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.geometryCalls, a.fullCalls
+}
+
 type deadlineGradingAnchorer struct {
 	started     chan struct{}
 	hadDeadline chan bool
@@ -99,6 +133,7 @@ func newParallelAnchorOrchestrator(t *testing.T, rec Recognizer, anchorer Answer
 	d.Recognizer = rec
 	d.AnswerAnchorer = anchorer
 	d.PhotoAnnotator = &photoAnnotatorFake{}
+	d.Now = func() int64 { return time.Now().Unix() }
 	return trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshot, opts...))
 }
 
@@ -268,6 +303,26 @@ func TestGradingOrchestratorAnchorCanOnlyAddGeometryToFrozenRecognition(t *testi
 	}
 	if box == nil || *box != (BBox{X: 0.2, Y: 0.3, W: 0.1, H: 0.05}) {
 		t.Fatalf("锚点返回的可信几何应被合并: %#v", box)
+	}
+}
+
+func TestGradingOrchestratorLocatingUsesGeometryPassWhenAdapterProvidesIt(t *testing.T) {
+	anchorer := &dualPathGradingAnchorer{}
+	rec := &countingRecognizer{questions: []RecognizedQuestion{{
+		Question: "3.8×3=", StudentAnswer: "10.4", AnswerState: AnswerStatePresent, Subject: "数学",
+	}}}
+	o := newParallelAnchorOrchestrator(t, rec, anchorer)
+	jobID := startOrchestratorJob(t, o, "msg-anchor-prefers-geometry").Record.RecordID
+
+	if _, err := o.RunGradingJob(context.Background(), jobID); err != nil {
+		t.Fatalf("RunGradingJob: %v", err)
+	}
+	waitGradingView(t, o, jobID, func(v GradingJobView) bool {
+		return v.Fields.AnchorState == k12.GradingAnchorLocated
+	})
+	geometryCalls, fullCalls := anchorer.calls()
+	if geometryCalls != 1 || fullCalls != 0 {
+		t.Fatalf("locating calls geometry=%d full=%d, want geometry=1 full=0", geometryCalls, fullCalls)
 	}
 }
 

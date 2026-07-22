@@ -694,7 +694,7 @@ func (o *GradingOrchestrator) executeAnchor(jobID, agentName string, image []byt
 			invocation.InvocationID, "cancelled_before_provider_call")
 		return nil, k12.GradingAnchorDegraded, "anchor:cancelled", false
 	}
-	anchored, err := o.deps.AnchorHomeworkAnswers(ctx, image, frozen)
+	anchored, err := o.deps.anchorHomeworkGeometry(ctx, image, frozen)
 	ctxErr := ctx.Err()
 	cancel()
 	unregisterProvider()
@@ -787,10 +787,25 @@ func (o *GradingOrchestrator) runAssess(ctx context.Context, run *gradingRun, jo
 		return current, nil
 	}
 	result, err := assessDeps.GradeHomeworkPhoto(providerCtx, run.req)
+	// Sample the provider context before invoking our own cancel function. Some
+	// adapters sanitize timeout errors into opaque text; after cancelProvider every
+	// ordinary failure would look cancelled and could be misclassified as unknown.
+	providerCtxErr := providerCtx.Err()
 	cancelProvider()
 	unregisterProvider()
+	if err == nil && invocationOutcomeUnknown(providerCtxErr) {
+		// GradeHomeworkPhoto intentionally keeps ordinary per-item failures as a
+		// partial result. If the provider budget also expired, an opaque adapter may
+		// have hidden the typed timeout; do not publish that partial result as final.
+		for _, item := range result.Items {
+			if item.Status == PhotoFailed {
+				err = providerCtxErr
+				break
+			}
+		}
+	}
 	if err != nil {
-		if invocationOutcomeUnknown(err) {
+		if invocationOutcomeUnknown(err) || invocationOutcomeUnknown(providerCtxErr) {
 			_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), run.agentName, invocation.InvocationID, "provider_outcome_unknown")
 			if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), run.agentName, jobID); readErr == nil && current.Record.Status == k12.GradingStageCancelled {
 				return current, nil

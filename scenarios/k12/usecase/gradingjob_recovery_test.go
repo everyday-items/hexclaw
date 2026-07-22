@@ -52,6 +52,7 @@ func recoveryDeps(t *testing.T, rec Recognizer, anchorer AnswerAnchorer, annotat
 	d.Recognizer = rec
 	d.AnswerAnchorer = anchorer
 	d.PhotoAnnotator = annotator
+	d.Now = func() int64 { return time.Now().Unix() }
 	return d
 }
 

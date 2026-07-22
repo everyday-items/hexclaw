@@ -57,7 +57,8 @@ type PhotoGradeResult struct {
 }
 
 // GradeHomeworkPhoto 编排一整张作业图：识题 → 页级分流 → 并发上限 2 的逐题批改/解题 →
-// 强证据 bbox 标记 → Markdown 摘要。单题失败只降级该题，其他题仍须完成。
+// 强证据 bbox 标记 → Markdown 摘要。普通单题失败只降级该题，其他题仍须完成；
+// 结果未知类错误必须向聚合层传播，避免 GradingJob 把未收敛的部分结果标成 completed。
 func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (PhotoGradeResult, error) {
 	if strings.TrimSpace(req.AgentName) == "" || len(req.Image) == 0 {
 		return PhotoGradeResult{}, fmt.Errorf("%w: AgentName / Image 不可空", ErrInvalidInput)
@@ -115,8 +116,29 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 	}
 
 	result := PhotoGradeResult{Mode: mode, Items: make([]PhotoGradeItem, len(questions)), ImageWarning: imageWarning}
-	jobs := make(chan int)
 	var wg sync.WaitGroup
+	var dispatchMu sync.Mutex
+	nextQuestion := 0
+	dispatchStopped := false
+	var unknownErr error
+	var unknownErrOnce sync.Once
+	var firstItemErr error
+	var firstItemErrOnce sync.Once
+	claimQuestion := func() (int, bool) {
+		dispatchMu.Lock()
+		defer dispatchMu.Unlock()
+		if dispatchStopped || nextQuestion >= len(questions) {
+			return 0, false
+		}
+		i := nextQuestion
+		nextQuestion++
+		return i, true
+	}
+	stopDispatch := func() {
+		dispatchMu.Lock()
+		dispatchStopped = true
+		dispatchMu.Unlock()
+	}
 	workerCount := 2
 	if len(questions) < workerCount {
 		workerCount = len(questions)
@@ -125,7 +147,11 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := range jobs {
+			for {
+				i, ok := claimQuestion()
+				if !ok {
+					return
+				}
 				q := questions[i]
 				item := PhotoGradeItem{Recognized: q}
 				if mode == PhotoModeGrade {
@@ -149,6 +175,13 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 					switch {
 					case gradeErr != nil:
 						item.Status, item.Warning = PhotoFailed, gradeErr.Error()
+						firstItemErrOnce.Do(func() { firstItemErr = gradeErr })
+						if invocationOutcomeUnknown(gradeErr) {
+							unknownErrOnce.Do(func() {
+								unknownErr = gradeErr
+								stopDispatch()
+							})
+						}
 					case graded.OutOfScope:
 						item.Status = PhotoOutOfScope
 					case !photoEvidenceTrusted(graded.Evidence):
@@ -173,6 +206,13 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 				switch {
 				case solveErr != nil:
 					item.Status, item.Warning = PhotoFailed, solveErr.Error()
+					firstItemErrOnce.Do(func() { firstItemErr = solveErr })
+					if invocationOutcomeUnknown(solveErr) {
+						unknownErrOnce.Do(func() {
+							unknownErr = solveErr
+							stopDispatch()
+						})
+					}
 				case solved.OutOfScope:
 					item.Status = PhotoOutOfScope
 				default:
@@ -185,11 +225,15 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 			}
 		}()
 	}
-	for i := range questions {
-		jobs <- i
-	}
-	close(jobs)
 	wg.Wait()
+	if unknownErr != nil {
+		result.Markdown = photoGradeMarkdown(result)
+		return result, unknownErr
+	}
+	if firstItemErr != nil && !photoHasSuccessfulItem(result.Items) {
+		result.Markdown = photoGradeMarkdown(result)
+		return result, firstItemErr
+	}
 
 	if mode == PhotoModeGrade {
 		// The renderer must never receive zero/invalid coordinates. Otherwise a verified verdict with
@@ -212,6 +256,16 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 	}
 	result.Markdown = photoGradeMarkdown(result)
 	return result, nil
+}
+
+func photoHasSuccessfulItem(items []PhotoGradeItem) bool {
+	for _, item := range items {
+		switch item.Status {
+		case PhotoCorrect, PhotoWrong, PhotoBlankSolved, PhotoOutOfScope, PhotoUntrusted:
+			return true
+		}
+	}
+	return false
 }
 
 func classifyPhotoMode(questions []RecognizedQuestion) PhotoMode {

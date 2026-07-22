@@ -72,10 +72,9 @@ func (d Deps) RecognizeHomework(ctx context.Context, image []byte) ([]Recognized
 	return questions, nil
 }
 
-// AnchorHomeworkAnswers 执行独立的、非阻塞核心识题的图片定位阶段。
-func (d Deps) AnchorHomeworkAnswers(ctx context.Context, image []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
+func prepareAnswerAnchorInput(image []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, bool, error) {
 	if len(image) == 0 {
-		return nil, fmt.Errorf("%w: Image 不可空", ErrInvalidInput)
+		return nil, false, fmt.Errorf("%w: Image 不可空", ErrInvalidInput)
 	}
 	normalized := append([]RecognizedQuestion(nil), questions...)
 	hasAnswerCandidate := false
@@ -85,13 +84,10 @@ func (d Deps) AnchorHomeworkAnswers(ctx context.Context, image []byte, questions
 			normalized[i].AnswerState == AnswerStatePresent ||
 			normalized[i].AnswerState == AnswerStateUnclear
 	}
-	if !hasAnswerCandidate || d.AnswerAnchorer == nil {
-		return normalized, nil
-	}
-	anchored, err := d.AnswerAnchorer.AnchorAnswers(ctx, image, normalized)
-	if err != nil {
-		return nil, err
-	}
+	return normalized, hasAnswerCandidate, nil
+}
+
+func normalizeAnswerAnchorOutput(anchored, normalized []RecognizedQuestion) ([]RecognizedQuestion, error) {
 	if len(anchored) != len(normalized) {
 		return nil, fmt.Errorf("usecase: 答案定位返回题数 %d，与核心识题题数 %d 不一致", len(anchored), len(normalized))
 	}
@@ -101,9 +97,55 @@ func (d Deps) AnchorHomeworkAnswers(ctx context.Context, image []byte, questions
 	return anchored, nil
 }
 
-// AnchorHomeworkGeometry（互动 UI 专用的低延迟几何锚定）已随一次切换删除
-//（§6.14 · 2026-07-18）：它只服务被删的 POST /recognize/anchors 直连端点；
-// 统一 GradingJob 的锚点阶段走 AnchorHomeworkAnswers（含转写共识）。
+// AnchorHomeworkAnswers executes the full independent handwriting consensus
+// used by the legacy/direct photo pipeline. The GradingJob locating branch
+// calls anchorHomeworkGeometry below because frozen recognition facts cannot be
+// rewritten there and only BBox survives its merge boundary.
+func (d Deps) AnchorHomeworkAnswers(ctx context.Context, image []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
+	normalized, hasAnswerCandidate, err := prepareAnswerAnchorInput(image, questions)
+	if err != nil {
+		return nil, err
+	}
+	if !hasAnswerCandidate || d.AnswerAnchorer == nil {
+		return normalized, nil
+	}
+	anchored, err := d.AnswerAnchorer.AnchorAnswers(ctx, image, normalized)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeAnswerAnchorOutput(anchored, normalized)
+}
+
+// gradingGeometryAnchorer is an internal capability, not a public two-stage
+// API. Production RecognizerAdapter implements it with one page-batch locator
+// request. Keeping it structural lets older/test anchorers fall back to the
+// full AnswerAnchorer contract without adding another assembly dependency.
+type gradingGeometryAnchorer interface {
+	AnchorAnswerGeometry(ctx context.Context, image []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, error)
+}
+
+// anchorHomeworkGeometry is exclusively for GradingJob.locating. That stage is
+// allowed to add geometry but must not rewrite the already frozen question or
+// answer facts, so running the full transcription-consensus path only consumes
+// the 60-second locator budget for output that the orchestrator discards.
+func (d Deps) anchorHomeworkGeometry(ctx context.Context, image []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
+	normalized, hasAnswerCandidate, err := prepareAnswerAnchorInput(image, questions)
+	if err != nil {
+		return nil, err
+	}
+	if !hasAnswerCandidate || d.AnswerAnchorer == nil {
+		return normalized, nil
+	}
+	geometry, ok := d.AnswerAnchorer.(gradingGeometryAnchorer)
+	if !ok {
+		return d.AnchorHomeworkAnswers(ctx, image, normalized)
+	}
+	anchored, err := geometry.AnchorAnswerGeometry(ctx, image, normalized)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeAnswerAnchorOutput(anchored, normalized)
+}
 
 // GradeRequest 一道题的批改请求（识题后的结构化输入）。
 type GradeRequest struct {
