@@ -41,6 +41,28 @@ func TestObservationPracticeCard_WholeFeedbackFallback(t *testing.T) {
 	}
 }
 
+func TestObservationPracticeCardFromStructured_UsesCanonicalSuggestions(t *testing.T) {
+	feedback := &WorkFeedback{
+		FeedbackType: WorkTypeArt,
+		Suggestions: []string{
+			"试试让人物的视线和右下角的小猫发生联系。",
+			"如果愿意，可以让地面的绿色再分出深浅两层。",
+		},
+		ProjectionMarkdown: "# 下一步建议\n这段旧投影故意与结构化建议不同。",
+	}
+	card := ObservationPracticeCardFromStructured(feedback, "旧自由文本也不应成为第二事实源")
+	for _, want := range feedback.Suggestions {
+		if !strings.Contains(card, want) {
+			t.Fatalf("观察卡必须完整保留 canonical suggestion %q, got %q", want, card)
+		}
+	}
+	for _, unwanted := range []string{"旧投影", "旧自由文本"} {
+		if strings.Contains(card, unwanted) {
+			t.Fatalf("已有结构化点评时不得回退二次解析 %q: %q", unwanted, card)
+		}
+	}
+}
+
 // PracticeCardDoneAt 字段随版本 JSON 往返（打卡记录的持久载体）。
 func TestCreativeWorkVersion_PracticeCardDoneRoundtrip(t *testing.T) {
 	f := CreativeWorkFields{WorkType: WorkTypeArt, Title: "雨后的校园", Task: "写生",

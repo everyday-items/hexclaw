@@ -307,6 +307,27 @@ func ObservationPracticeCard(feedback string) string {
 	return feedback
 }
 
+// ObservationPracticeCardFromStructured projects an art practice card from the
+// canonical WorkFeedback suggestions. The legacy Markdown parser remains only
+// for historical versions that predate StructuredFeedback; once structured
+// facts exist, reparsing the display Markdown would create a second source of
+// truth and can truncate multi-line suggestions.
+func ObservationPracticeCardFromStructured(feedback *WorkFeedback, legacyMarkdown string) string {
+	if feedback == nil {
+		return ObservationPracticeCard(legacyMarkdown)
+	}
+	items := make([]string, 0, len(feedback.Suggestions))
+	for _, suggestion := range feedback.Suggestions {
+		if value := strings.TrimSpace(suggestion); value != "" {
+			items = append(items, value)
+		}
+	}
+	if len(items) == 0 {
+		return ""
+	}
+	return strings.Join(items, "\n")
+}
+
 // CreativeWorkFields 作品领域字段（PRD §5.5）。
 type CreativeWorkFields struct {
 	WorkType string                `json:"work_type"` // writing / art

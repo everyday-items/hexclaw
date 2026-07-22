@@ -309,6 +309,30 @@ func TestBuildWorkFeedbackPrompt_Art_InjectsSkillBody(t *testing.T) {
 	}
 }
 
+// TestBuildWorkFeedbackPrompt_Art_RequiresNamedElementCoverage locks the real-fixture
+// contract: when the task or intent names concrete visual elements, the vision model
+// must verify every named element against the image instead of silently omitting one.
+func TestBuildWorkFeedbackPrompt_Art_RequiresNamedElementCoverage(t *testing.T) {
+	req := artReq()
+	req.Task = "观察人物、猫、彩虹和地面的构图"
+	req.Intent = "想画快乐的户外场景"
+	_, prompt, _, err := buildWorkFeedbackPrompt(req, nil)
+	if err != nil {
+		t.Fatalf("构造美术提示词失败: %v", err)
+	}
+	for _, want := range []string{
+		"逐项核对创作任务和孩子意图中明确提到的具体画面元素",
+		"看得见就必须在观察证据中点名",
+		"看不见则明确说明没有观察到",
+		"强制覆盖清单：观察人物、猫、彩虹和地面的构图",
+		"最终正文必须逐字包含清单中的每个具体名词",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("美术提示词缺具体元素覆盖约束 %q", want)
+		}
+	}
+}
+
 // TestStripSkillFrontmatter 剥离器边界：有/无 frontmatter、残缺定界都不丢正文。
 func TestStripSkillFrontmatter(t *testing.T) {
 	cases := []struct{ name, in, want string }{

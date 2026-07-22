@@ -401,6 +401,13 @@ func buildWorkFeedbackPrompt(req usecase.WorkFeedbackRequest, loader SkillConten
 		if req.Intent != "" {
 			b.WriteString("孩子想表达的内容：" + req.Intent + "\n")
 		}
+		if req.Task != "" || req.Intent != "" {
+			b.WriteString("证据覆盖：逐项核对创作任务和孩子意图中明确提到的具体画面元素；看得见就必须在观察证据中点名，看不见则明确说明没有观察到，不得静默遗漏或凭文字说明虚构为可见。\n")
+		}
+		if req.Task != "" {
+			b.WriteString("强制覆盖清单：" + req.Task + "\n")
+			b.WriteString("最终正文必须逐字包含清单中的每个具体名词，并对每项分别写明图中可见的位置/颜色证据或明确没有观察到；遗漏任一项即为不合格。\n")
+		}
 		if strings.TrimSpace(req.ContentMarkdown) != "" {
 			b.WriteString("画面文字说明：\n" + req.ContentMarkdown)
 		}

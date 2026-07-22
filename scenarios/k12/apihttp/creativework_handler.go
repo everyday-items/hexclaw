@@ -56,7 +56,7 @@ func toCreativeWorkDTO(v usecase.CreativeWorkView) creativeWorkDTO {
 		}
 		// 观察练习卡（§3.10 美术）：由点评正文服务端提炼，随版本下发。
 		if v.Fields.WorkType == k12.WorkTypeArt {
-			dto.PracticeCard = k12.ObservationPracticeCard(ver.Feedback)
+			dto.PracticeCard = k12.ObservationPracticeCardFromStructured(ver.StructuredFeedback, ver.Feedback)
 		}
 		vers = append(vers, dto)
 	}
@@ -240,9 +240,11 @@ func (h *handler) sendWorkFeedback(w http.ResponseWriter, r *http.Request) {
 	}
 	// 取最新一条带点评的版本（修改稿新版本可能尚无点评）。
 	feedback := ""
+	var structured *k12.WorkFeedback
 	for i := len(v.Fields.Versions) - 1; i >= 0; i-- {
 		if fb := strings.TrimSpace(v.Fields.Versions[i].Feedback); fb != "" {
 			feedback = fb
+			structured = v.Fields.Versions[i].StructuredFeedback
 			break
 		}
 	}
@@ -259,7 +261,7 @@ func (h *handler) sendWorkFeedback(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "观察练习卡只属于美术作品")
 			return
 		}
-		card := k12.ObservationPracticeCard(feedback)
+		card := k12.ObservationPracticeCardFromStructured(structured, feedback)
 		if card == "" {
 			writeErr(w, http.StatusConflict, "这件作品还没有观察练习卡")
 			return

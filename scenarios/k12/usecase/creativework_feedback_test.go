@@ -216,6 +216,94 @@ func TestGenerateWorkFeedback_Art_Observational(t *testing.T) {
 	}
 }
 
+// TestGenerateWorkFeedback_Art_StructuredProjectionPreservesAllVisualEvidence
+// locks the structure-first projection boundary: Markdown scaffolding must not consume
+// one of the three observation slots, and later real image evidence must not be dropped.
+func TestGenerateWorkFeedback_Art_StructuredProjectionPreservesAllVisualEvidence(t *testing.T) {
+	d := newDataDeps(t)
+	gen := &fakeWorkFeedbackSolver{feedback: `# 观察与依据
+1. 我在画里看到……
+人物在画面中央，占据最大的面积。
+右下方有一只橙色小猫，尾巴向上弯。
+左上方还可以看到带白云的明亮彩虹。
+底部有绿色地面和小草。
+# 下一步建议
+试试让人物的视线和小猫发生联系。`}
+	d.Solver = gen
+	ctx := context.Background()
+	id, _, err := d.CreateCreativeWork(ctx, "xiaoming", "s", k12.CreativeWorkFields{
+		WorkType: k12.WorkTypeArt, Title: "《彩虹和小猫》", Task: "观察人物、猫、彩虹和地面的构图",
+		Intent:   "想画快乐的户外场景",
+		Versions: []k12.CreativeWorkVersion{{SourceAssetID: "asset-1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := d.GenerateWorkFeedback(ctx, "xiaoming", id)
+	if err != nil {
+		t.Fatalf("美术点评生成: %v", err)
+	}
+	structured := v.Fields.Versions[0].StructuredFeedback
+	if structured == nil {
+		t.Fatal("结构化点评缺失")
+	}
+	if len(structured.Observations) > 3 {
+		t.Fatalf("结构化观察仍应保持最多 3 条，got %d", len(structured.Observations))
+	}
+	var evidence strings.Builder
+	for _, observation := range structured.Observations {
+		evidence.WriteString(observation.Evidence)
+		evidence.WriteByte('\n')
+	}
+	for _, want := range []string{"人物", "小猫", "彩虹", "地面"} {
+		if !strings.Contains(evidence.String(), want) {
+			t.Errorf("结构化观察丢失真实画面证据 %q: %q", want, evidence.String())
+		}
+	}
+	if strings.Contains(evidence.String(), "我在画里看到") || strings.Contains(evidence.String(), "观察与依据") {
+		t.Fatalf("Markdown 标题/占位语不应占 observation: %q", evidence.String())
+	}
+}
+
+func TestGenerateWorkFeedback_Art_StructuredProjectionKeepsSuggestionsOutOfObservations(t *testing.T) {
+	d := newDataDeps(t)
+	d.Solver = &fakeWorkFeedbackSolver{feedback: `# 观察与依据
+人物在画面中央。
+左上方还可以看到彩虹和白云。
+# 下一步建议
+画面右下角可以补一朵花。
+如果愿意，可以让地面颜色再深一点。`}
+	ctx := context.Background()
+	id, _, err := d.CreateCreativeWork(ctx, "xiaoming", "s", k12.CreativeWorkFields{
+		WorkType: k12.WorkTypeArt, Title: "《彩虹和小猫》", Task: "观察人物、猫、彩虹和地面的构图",
+		Versions: []k12.CreativeWorkVersion{{SourceAssetID: "asset-1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := d.GenerateWorkFeedback(ctx, "xiaoming", id)
+	if err != nil {
+		t.Fatalf("美术点评生成: %v", err)
+	}
+	structured := v.Fields.Versions[0].StructuredFeedback
+	if structured == nil {
+		t.Fatal("结构化点评缺失")
+	}
+	joinedSuggestions := strings.Join(structured.Suggestions, "\n")
+	for _, want := range []string{"右下角可以补一朵花", "如果愿意，可以让地面颜色再深一点"} {
+		if !strings.Contains(joinedSuggestions, want) {
+			t.Errorf("真实建议被误归为观察，missing %q in suggestions=%q observations=%#v", want, joinedSuggestions, structured.Observations)
+		}
+	}
+	joinedObservations := ""
+	for _, observation := range structured.Observations {
+		joinedObservations += observation.Evidence + "\n"
+	}
+	if !strings.Contains(joinedObservations, "还可以看到彩虹") {
+		t.Fatalf("描述可见证据的“还可以看到”必须保留为观察: %q", joinedObservations)
+	}
+}
+
 // TestGenerateWorkFeedback_Art_INV011_Rejected INV-011 拦截对美术输出同样生效：
 // 视觉通道生成的点评出现打分/等第/重画口径 → 拒绝入库，作品保持 draft、不留假点评。
 func TestGenerateWorkFeedback_Art_INV011_Rejected(t *testing.T) {

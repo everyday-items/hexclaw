@@ -143,17 +143,60 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 		refs = append(refs, fmt.Sprintf("content-ref:sha256:%x", sum[:]))
 	}
 
-	clauses := strings.FieldsFunc(strings.TrimSpace(feedback), func(r rune) bool {
-		switch r {
-		case '。', '；', ';', '\n':
+	normalizeClause := func(value string) string {
+		value = strings.TrimSpace(value)
+		value = strings.TrimLeft(value, "#*_`0123456789０１２３４５６７８９.．、)） \t")
+		return strings.TrimSpace(value)
+	}
+	type feedbackClause struct {
+		text              string
+		suggestionSection bool
+	}
+	clauses := make([]feedbackClause, 0, 8)
+	inSuggestionSection := false
+	for _, line := range strings.Split(strings.TrimSpace(feedback), "\n") {
+		normalizedLine := strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(normalizeClause(line), "："), ":"))
+		switch normalizedLine {
+		case "观察与依据", "观察", "我在画里看到", "我在画里看到……", "我在画里看到...":
+			inSuggestionSection = false
+			continue
+		case "下一步建议", "建议", "下次可以试试", "下次可以试试的小实验":
+			inSuggestionSection = true
+			continue
+		}
+		for _, clause := range strings.FieldsFunc(line, func(r rune) bool {
+			switch r {
+			case '。', '；', ';':
+				return true
+			default:
+				return false
+			}
+		}) {
+			clauses = append(clauses, feedbackClause{text: clause, suggestionSection: inSuggestionSection})
+		}
+	}
+	isScaffold := func(value string) bool {
+		normalized := normalizeClause(value)
+		switch normalized {
+		case "观察与依据", "观察", "下一步建议", "建议", "下次可以试试", "下次可以试试的小实验", "我在画里看到", "我在画里看到……", "我在画里看到...":
 			return true
 		default:
 			return false
 		}
-	})
+	}
 	isSuggestion := func(value string) bool {
-		for _, marker := range []string{"建议", "试试", "可以", "补一个", "补充", "加深", "调整", "比一比", "再加"} {
-			if strings.Contains(value, marker) {
+		normalized := normalizeClause(value)
+		if strings.Contains(normalized, "建议") || strings.Contains(normalized, "试试") || strings.Contains(normalized, "比一比") {
+			return true
+		}
+		if strings.Contains(normalized, "可以") &&
+			!strings.Contains(normalized, "可以看到") &&
+			!strings.Contains(normalized, "可以看见") &&
+			!strings.Contains(normalized, "可以观察到") {
+			return true
+		}
+		for _, marker := range []string{"下次", "补一个", "补充", "加深", "调整", "再加"} {
+			if strings.Contains(normalized, marker) {
 				return true
 			}
 		}
@@ -167,23 +210,33 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 		limitations = "仅依据本版本提交的可见画面进行观察，不评分、不排名，也不替孩子重画。"
 		actions = []string{"send", "print_practice_card", "collect"}
 	}
-	observations := make([]k12.WorkFeedbackObservation, 0, 3)
+	observationEvidence := make([]string, 0, 5)
 	suggestions := make([]string, 0, 3)
-	for _, clause := range clauses {
-		clause = strings.TrimSpace(clause)
-		if clause == "" {
+	for _, item := range clauses {
+		clause := strings.TrimSpace(item.text)
+		if clause == "" || isScaffold(clause) {
 			continue
 		}
-		if isSuggestion(clause) {
+		if item.suggestionSection || isSuggestion(clause) {
 			if len(suggestions) < 3 {
 				suggestions = append(suggestions, clause)
 			}
-		} else if len(observations) < 3 {
-			observations = append(observations, k12.WorkFeedbackObservation{Dimension: dimension, Evidence: clause})
+		} else {
+			observationEvidence = append(observationEvidence, clause)
 		}
 	}
-	if len(observations) == 0 {
-		observations = append(observations, k12.WorkFeedbackObservation{Dimension: dimension, Evidence: strings.TrimSpace(feedback)})
+	if len(observationEvidence) == 0 {
+		observationEvidence = append(observationEvidence, strings.TrimSpace(feedback))
+	} else if len(observationEvidence) > 3 {
+		observationEvidence = []string{
+			observationEvidence[0],
+			observationEvidence[1],
+			strings.Join(observationEvidence[2:], "；"),
+		}
+	}
+	observations := make([]k12.WorkFeedbackObservation, 0, len(observationEvidence))
+	for _, evidence := range observationEvidence {
+		observations = append(observations, k12.WorkFeedbackObservation{Dimension: dimension, Evidence: evidence})
 	}
 	if len(suggestions) == 0 {
 		suggestions = append(suggestions, "和孩子一起回看这条观察，并由孩子选择一处小改动后提交新版本。")
