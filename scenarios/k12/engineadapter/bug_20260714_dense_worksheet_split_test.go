@@ -20,6 +20,31 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
+// Segment-specific tests exercise the bounded fallback directly. Production/default recognition
+// is page-first; a separate contract test proves valid whole-page output stays at one request.
+type denseSegmentTestRecognizer struct{ *RecognizerAdapter }
+
+func newDenseSegmentTestRecognizer(vision VisionFunc) *denseSegmentTestRecognizer {
+	return &denseSegmentTestRecognizer{RecognizerAdapter: NewRecognizerAdapter(vision)}
+}
+
+func (recognizer *denseSegmentTestRecognizer) Recognize(
+	ctx context.Context,
+	image []byte,
+) ([]usecase.RecognizedQuestion, error) {
+	segments, dense, err := recognizer.splitWorksheet(ctx, image)
+	if err != nil {
+		return nil, err
+	}
+	if !dense {
+		return recognizer.RecognizerAdapter.Recognize(ctx, image)
+	}
+	segments = append(segments, worksheetSegment{
+		image: image, index: 0, total: len(segments), printedInventory: true,
+	})
+	return recognizer.recognizeSegments(ctx, segments)
+}
+
 func TestDenseWorksheetCoreRecognitionUsesFiveSegmentsPlusPrintedInventory(t *testing.T) {
 	var calls atomic.Int32
 	var inFlight atomic.Int32
@@ -53,7 +78,7 @@ func TestDenseWorksheetCoreRecognitionUsesFiveSegmentsPlusPrintedInventory(t *te
 		return "", fmt.Errorf("missing segment identity")
 	}
 
-	questions, err := NewRecognizerAdapter(vision).Recognize(
+	questions, err := newDenseSegmentTestRecognizer(vision).Recognize(
 		context.Background(),
 		denseWorksheetTestImage(t, 1000, 1800),
 	)
@@ -100,7 +125,7 @@ func TestDenseWorksheetPrintedInventoryRepairsQuestionWhenEverySegmentElidesFrac
 		}
 	}
 
-	questions, err := NewRecognizerAdapter(vision).Recognize(
+	questions, err := newDenseSegmentTestRecognizer(vision).Recognize(
 		context.Background(),
 		denseWorksheetTestImage(t, 1000, 1800),
 	)
@@ -138,7 +163,7 @@ func TestDenseWorksheetOverlapDeduplicatesCanonicalMathGlyphs(t *testing.T) {
 			return `[]`, nil
 		}
 	}
-	questions, err := NewRecognizerAdapter(vision).Recognize(
+	questions, err := newDenseSegmentTestRecognizer(vision).Recognize(
 		context.Background(),
 		denseWorksheetTestImage(t, 1000, 1800),
 	)
@@ -292,7 +317,7 @@ func TestSmallImageUsesOneCoreCall(t *testing.T) {
 		calls.Add(1)
 		return `[{"question":"1+1=","answer_state":"blank","student_answer":""}]`, nil
 	}
-	questions, err := NewRecognizerAdapter(vision).Recognize(
+	questions, err := newDenseSegmentTestRecognizer(vision).Recognize(
 		context.Background(),
 		denseWorksheetTestImage(t, 640, 480),
 	)
@@ -326,7 +351,7 @@ func TestDenseWorksheetRetriesOnlyTransientFailedSegments(t *testing.T) {
 			segment, segment+1,
 		), nil
 	}
-	questions, err := NewRecognizerAdapter(vision).Recognize(
+	questions, err := newDenseSegmentTestRecognizer(vision).Recognize(
 		context.Background(),
 		denseWorksheetTestImage(t, 1000, 1800),
 	)
@@ -382,7 +407,7 @@ func TestDenseWorksheetTransientRetryWaveCapsConcurrency(t *testing.T) {
 		}
 		return `[]`, nil
 	}
-	if _, err := NewRecognizerAdapter(vision).Recognize(
+	if _, err := newDenseSegmentTestRecognizer(vision).Recognize(
 		context.Background(),
 		denseWorksheetTestImage(t, 1000, 1800),
 	); err != nil {
@@ -411,7 +436,7 @@ func TestDenseWorksheetPermanentProviderFailureIsNotRetried(t *testing.T) {
 		}
 		return `[]`, nil
 	}
-	_, err := NewRecognizerAdapter(vision).Recognize(
+	_, err := newDenseSegmentTestRecognizer(vision).Recognize(
 		context.Background(),
 		denseWorksheetTestImage(t, 1000, 1800),
 	)
@@ -439,7 +464,7 @@ func TestDenseWorksheetTransientFailureStopsAfterOneRetry(t *testing.T) {
 		}
 		return `[]`, nil
 	}
-	_, err := NewRecognizerAdapter(vision).Recognize(
+	_, err := newDenseSegmentTestRecognizer(vision).Recognize(
 		context.Background(),
 		denseWorksheetTestImage(t, 1000, 1800),
 	)
@@ -469,7 +494,7 @@ func TestDenseWorksheetParseFailureIsNotRetried(t *testing.T) {
 		}
 		return `[]`, nil
 	}
-	_, err := NewRecognizerAdapter(vision).Recognize(
+	_, err := newDenseSegmentTestRecognizer(vision).Recognize(
 		context.Background(),
 		denseWorksheetTestImage(t, 1000, 1800),
 	)

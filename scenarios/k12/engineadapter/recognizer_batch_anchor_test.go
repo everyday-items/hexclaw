@@ -714,10 +714,13 @@ func TestAnchorAnswers_IndependentTranscriptionsRunConcurrently(t *testing.T) {
 		questions []usecase.RecognizedQuestion
 		err       error
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// Build the heavyweight PNG fixture before starting the execution budget. Under
+	// -race, image preparation is much slower and must not be misreported as request
+	// serialization before the vision stage has even been reached.
+	testImage := anchorTestImage(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	done := make(chan anchorResult, 1)
-	testImage := anchorTestImage(t)
 	go func() {
 		questions, err := adapter.AnchorAnswers(ctx, testImage, []usecase.RecognizedQuestion{{
 			Question: "5/7−1/5=", AnswerState: usecase.AnswerStatePresent, StudentAnswer: "14/35",
@@ -725,7 +728,16 @@ func TestAnchorAnswers_IndependentTranscriptionsRunConcurrently(t *testing.T) {
 		done <- anchorResult{questions: questions, err: err}
 	}()
 
-	for i := 0; i < answerTranscriptionViewCount; i++ {
+	// First prove the pipeline reached the vision stage. Only then start the short
+	// concurrency clock: a genuinely serialized second call remains blocked by
+	// release and deterministically fails this assertion.
+	select {
+	case <-started:
+	case <-time.After(20 * time.Second):
+		close(release)
+		t.Fatal("independent transcription stage was not reached")
+	}
+	for i := 1; i < answerTranscriptionViewCount; i++ {
 		select {
 		case <-started:
 		case <-time.After(5 * time.Second):
@@ -773,10 +785,10 @@ func TestAnchorAnswers_FocusedAdjudicationsRunConcurrently(t *testing.T) {
 		questions []usecase.RecognizedQuestion
 		err       error
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	testImage := anchorTestImage(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	done := make(chan anchorResult, 1)
-	testImage := anchorTestImage(t)
 	go func() {
 		questions, err := adapter.AnchorAnswers(ctx, testImage, []usecase.RecognizedQuestion{{
 			Question: "5/7−1/5=", AnswerState: usecase.AnswerStatePresent, StudentAnswer: "14/35",
@@ -784,7 +796,13 @@ func TestAnchorAnswers_FocusedAdjudicationsRunConcurrently(t *testing.T) {
 		done <- anchorResult{questions: questions, err: err}
 	}()
 
-	for i := 0; i < answerTranscriptionFocusCalls; i++ {
+	select {
+	case <-started:
+	case <-time.After(20 * time.Second):
+		close(release)
+		t.Fatal("focused adjudication stage was not reached")
+	}
+	for i := 1; i < answerTranscriptionFocusCalls; i++ {
 		select {
 		case <-started:
 		case <-time.After(5 * time.Second):

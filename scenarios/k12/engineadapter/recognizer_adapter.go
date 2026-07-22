@@ -225,14 +225,27 @@ func (a *RecognizerAdapter) Recognize(ctx context.Context, image []byte) ([]usec
 	if len(image) == 0 {
 		return nil, fmt.Errorf("recognizer: 空图片")
 	}
-	// 密集长作业按固定的页面几何切成 5 个重叠纵向分片，并追加 1 个整页印刷题清单
-	// 单元；六者同波并行。清单负责题干完整性，分片负责手写候选，图片坐标仍属于独立的
-	// AnswerAnchorer 第二阶段。明确的瞬时上游错误只低并发重试失败单元一次。
+	// 先用整页做一次结构化识别。生产 VLM governor 默认并发为 1；旧的“5 个分片 + 1 个
+	// 清单”会把单页固定膨胀成 6 个串行物理请求，在 120s stage budget 内天然无法完成。
+	// 整页 JSON 通过结构校验即作为该页事实；仅当模型返回了不可解析的协议结果时，才用
+	// 旧分片路径做有界补救。Provider/ctx 错误直接透传，不能把一次故障放大成六次请求。
 	segments, dense, err := a.splitWorksheet(ctx, image)
 	if err != nil {
 		return nil, fmt.Errorf("recognizer: 图片预处理被取消: %w", err)
 	}
 	if dense {
+		raw, visionErr := a.callVision(ctx, image, recognizePrompt)
+		if visionErr != nil {
+			return nil, fmt.Errorf("recognizer: 视觉模型调用失败: %w", visionErr)
+		}
+		questions, parseErr := parseRecognizedQuestions(raw)
+		if parseErr == nil {
+			return questions, nil
+		}
+		logger.WarnContext(ctx, "[k12识题] 整页结构化结果校验失败，进入有界分片补救",
+			"error", parseErr,
+			"segments", len(segments),
+		)
 		segments = append(segments, worksheetSegment{
 			image: image, index: 0, total: len(segments), printedInventory: true,
 		})
