@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/hexagon-codes/hexclaw/internal/sqliteutil"
 )
 
 const documentRetryIdempotencyPrefix = "document-retry|"
@@ -204,7 +206,19 @@ func (r *SQLiteSemanticIndexRepository) RetryIngestDocument(
 	if documentID == "" {
 		return CreateDocumentResult{}, fmt.Errorf("%w: document_id is required", ErrInvalidDocumentRetry)
 	}
+	var result CreateDocumentResult
+	err = sqliteutil.RetryOnBusy(ctx, func() error {
+		var attemptErr error
+		result, attemptErr = r.retryIngestDocumentOnce(ctx, ownerID, corpusID, documentID, storageKey)
+		return attemptErr
+	})
+	return result, err
+}
 
+func (r *SQLiteSemanticIndexRepository) retryIngestDocumentOnce(
+	ctx context.Context,
+	ownerID, corpusID, documentID, storageKey string,
+) (CreateDocumentResult, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return CreateDocumentResult{}, err

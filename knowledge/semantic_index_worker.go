@@ -46,6 +46,10 @@ type semanticIndexLeaseRenewer interface {
 	RenewJobLease(ctx context.Context, lease JobLease, now time.Time, leaseDuration time.Duration) (JobLease, error)
 }
 
+type runningJobCancelRegistrar interface {
+	registerRunningJobCancel(jobID string, cancel context.CancelFunc) func()
+}
+
 type ingestPageCheckpointRepository interface {
 	SetIngestPageTotal(context.Context, JobLease, time.Time, string, int64) error
 	LoadIngestPageCheckpoints(context.Context, JobLease, time.Time, string, int64) ([]IngestPageCheckpoint, error)
@@ -162,8 +166,14 @@ func (w *SemanticIndexWorker) RunOnce(ctx context.Context) (bool, error) {
 	if err != nil || !claimed {
 		return false, err
 	}
+	jobCtx, cancelJob := context.WithCancel(ctx)
+	defer cancelJob()
+	if registrar, ok := w.repository.(runningJobCancelRegistrar); ok {
+		unregister := registrar.registerRunningJobCancel(job.JobID, cancelJob)
+		defer unregister()
+	}
 	lease := job.Lease()
-	err = w.executeClaimed(ctx, job, &lease)
+	err = w.executeClaimed(jobCtx, job, &lease)
 	if err == nil {
 		return true, nil
 	}

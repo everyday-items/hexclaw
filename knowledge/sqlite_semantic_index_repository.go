@@ -21,14 +21,25 @@ import (
 // SQLiteSemanticIndexRepository persists the semantic-index control plane in
 // additive tables. It never reads or writes kb_chunks.embedding.
 type SQLiteSemanticIndexRepository struct {
-	db              *sql.DB
-	ingestBlobStore *localIngestBlobStore
+	db                *sql.DB
+	ingestBlobStore   *localIngestBlobStore
+	runningJobCancels *runningJobCancelRegistry
 }
 
 var _ SemanticIndexRepository = (*SQLiteSemanticIndexRepository)(nil)
 
 func NewSQLiteSemanticIndexRepository(db *sql.DB) *SQLiteSemanticIndexRepository {
-	return &SQLiteSemanticIndexRepository{db: db}
+	return &SQLiteSemanticIndexRepository{
+		db:                db,
+		runningJobCancels: newRunningJobCancelRegistry(),
+	}
+}
+
+func (r *SQLiteSemanticIndexRepository) registerRunningJobCancel(
+	jobID string,
+	cancel context.CancelFunc,
+) func() {
+	return r.runningJobCancels.register(jobID, cancel)
 }
 
 type semanticPolicyState struct {
@@ -1148,6 +1159,9 @@ func (r *SQLiteSemanticIndexRepository) CancelJob(ctx context.Context, ownerID, 
 		job, attemptErr = r.cancelJobOnce(ctx, ownerID, jobID)
 		return attemptErr
 	})
+	if err == nil {
+		r.runningJobCancels.cancel(jobID)
+	}
 	return job, err
 }
 

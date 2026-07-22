@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -44,6 +45,112 @@ func (p delayedIngestProcessor) Prepare(ctx context.Context, source PersistedIng
 		return PreparedIngestDocument{}, ctx.Err()
 	case <-timer.C:
 		return deterministicIngestProcessor{}.Prepare(ctx, source)
+	}
+}
+
+type blockingPageCaptionerProcessor struct {
+	entered   chan struct{}
+	cancelled chan struct{}
+	release   chan struct{}
+	calls     atomic.Int32
+}
+
+func (p *blockingPageCaptionerProcessor) Prepare(
+	ctx context.Context,
+	source PersistedIngestDocument,
+) (PreparedIngestDocument, error) {
+	return p.PrepareResumable(ctx, source, nil)
+}
+
+func (p *blockingPageCaptionerProcessor) PrepareResumable(
+	ctx context.Context,
+	_ PersistedIngestDocument,
+	_ IngestPageProgress,
+) (PreparedIngestDocument, error) {
+	for page := int32(1); page <= 2; page++ {
+		p.calls.Add(1)
+		if page != 1 {
+			continue
+		}
+		close(p.entered)
+		select {
+		case <-ctx.Done():
+			close(p.cancelled)
+			return PreparedIngestDocument{}, ctx.Err()
+		case <-p.release:
+			return PreparedIngestDocument{}, errors.New("test: release blocked captioner")
+		}
+	}
+	return PreparedIngestDocument{}, errors.New("test: captioner unexpectedly reached page two")
+}
+
+func TestCancelRunningIngestInterruptsCurrentProviderBeforeNextPage(t *testing.T) {
+	db, _, ctx := newAsyncIngestHarness(t)
+	repository := NewSQLiteSemanticIndexRepository(db)
+	service := NewSemanticIndexService(repository, &staticEmbeddingResolver{})
+	if err := service.ConfigureDocumentIngest(filepath.Join(t.TempDir(), "objects")); err != nil {
+		t.Fatal(err)
+	}
+	body := "%PDF-1.4\ntwo scanned pages"
+	accepted, err := service.CreateDocument(ctx, "desktop-user", "default", CreateDocumentInput{
+		IdempotencyKey: "cancel-running-captioner", Filename: "scanned.pdf", MediaType: "application/pdf",
+		SizeBytes: int64(len(body)), Body: strings.NewReader(body),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	processor := &blockingPageCaptionerProcessor{
+		entered: make(chan struct{}), cancelled: make(chan struct{}), release: make(chan struct{}),
+	}
+	worker := NewSemanticIndexWorker(repository, nil, SemanticIndexWorkerConfig{
+		OwnerID: "desktop-user", CorpusID: "default", WorkerID: "cancel-running-worker",
+		LeaseDuration: time.Minute,
+	})
+	worker.SetDocumentIngestProcessor(processor)
+	type workerResult struct {
+		worked bool
+		err    error
+	}
+	workerDone := make(chan workerResult, 1)
+	go func() {
+		worked, runErr := worker.RunOnce(ctx)
+		workerDone <- workerResult{worked: worked, err: runErr}
+	}()
+
+	select {
+	case <-processor.entered:
+	case <-time.After(2 * time.Second):
+		close(processor.release)
+		t.Fatal("captioner did not enter the first page")
+	}
+	cancelledJob, err := service.CancelJob(ctx, "desktop-user", accepted.JobID)
+	if err != nil || cancelledJob.State != KnowledgeJobCancelled {
+		close(processor.release)
+		t.Fatalf("CancelJob job=%+v err=%v", cancelledJob, err)
+	}
+
+	cancelObserved := false
+	select {
+	case <-processor.cancelled:
+		cancelObserved = true
+	case <-time.After(500 * time.Millisecond):
+	}
+	close(processor.release)
+	var result workerResult
+	select {
+	case result = <-workerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop after cancellation")
+	}
+	if !cancelObserved {
+		t.Fatal("running captioner context was not cancelled promptly")
+	}
+	if got := processor.calls.Load(); got != 1 {
+		t.Fatalf("captioner calls=%d, want only the in-flight first page", got)
+	}
+	if !result.worked || !errors.Is(result.err, ErrJobFenced) {
+		t.Fatalf("RunOnce after CancelJob worked=%v err=%v, want worked with ErrJobFenced", result.worked, result.err)
 	}
 }
 
