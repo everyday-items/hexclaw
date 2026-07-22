@@ -31,6 +31,9 @@ type CronRegistrar interface {
 	// 切换终局批）：以稳定幂等键前缀 "<agent>/" 识别 K12 归属（跨 user_id），绝不按
 	// 展示名匹配——用户自建任务（无稳定键）一个都不许动。返回回收清单供取证。
 	ReclaimStale(ctx context.Context, agentName string, keepJobIDs []string) (removed []ReclaimedCronJob, err error)
+	// EnsureMissing 只补 exact SourceKey 缺项；已有任务（含暂停、改时区、改投递、改脚本）
+	// 必须原样保留。用于存量档案保存后的作用域修复，不做全局启动扫描。
+	EnsureMissing(ctx context.Context, kind string, spec usecase.CronSpec, platform, chatID, userID string) (jobID string, created bool, err error)
 }
 
 // ReclaimedCronJob 是 provision stale 回收的取证条目。
@@ -173,6 +176,7 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("GET /cron/semester-check", h.cronSemesterCheck)
 	mux.HandleFunc("GET /cron/year-archive", h.cronYearArchive)
 	mux.HandleFunc("POST /cron/provision", h.cronProvision)
+	mux.HandleFunc("POST /cron/reconcile-defaults", h.cronReconcileDefaults)
 	mux.HandleFunc("POST /bind-im", h.bindIM)
 	return mux
 }
@@ -1255,6 +1259,57 @@ type provisionedJob struct {
 	Name     string `json:"name"`
 	Schedule string `json:"schedule"`
 	JobID    string `json:"job_id"`
+	Created  bool   `json:"created,omitempty"`
+}
+
+// cronReconcileDefaults is the profile-lifecycle repair path. It is deliberately
+// separate from legacy /cron/provision: provision may overwrite/reclaim during
+// an explicit cutover, while this endpoint only fills missing frozen defaults.
+// A partial failure is retryable; already-created keys are preserved and the
+// next call only attempts the remaining keys.
+func (h *handler) cronReconcileDefaults(w http.ResponseWriter, r *http.Request) {
+	if h.rt.Cron == nil {
+		writeErr(w, http.StatusNotImplemented, "cron registrar 未注入")
+		return
+	}
+	var req provisionReq
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	base := h.rt.BaseURL
+	if base == "" {
+		base = req.BaseURL
+	}
+	if base == "" {
+		writeErr(w, http.StatusBadRequest, "base_url required（Runtime.BaseURL 未配）")
+		return
+	}
+	const desktopPrincipal = "desktop-user"
+	claimedUserID := strings.TrimSpace(req.UserID)
+	if claimedUserID != "" && claimedUserID != desktopPrincipal {
+		writeErr(w, http.StatusBadRequest, "user_id must match desktop principal")
+		return
+	}
+	userID := desktopPrincipal
+	specs := usecase.DefaultCronSpecs(base, req.Agent, req.Deliver)
+	out := make([]provisionedJob, 0, len(specs))
+	for _, spec := range specs {
+		jobID, created, err := h.rt.Cron.EnsureMissing(
+			r.Context(), string(spec.Kind), spec, req.Platform, req.ChatID, userID,
+		)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "补齐 "+spec.Name+" 失败: "+err.Error())
+			return
+		}
+		out = append(out, provisionedJob{
+			Kind: string(spec.Kind), Name: spec.Name, Schedule: spec.Schedule, JobID: jobID, Created: created,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"provisioned": out})
 }
 
 // cronProvision POST /cron/provision —— 为某辅导实例注册默认自动化任务（PRD §3.6.2

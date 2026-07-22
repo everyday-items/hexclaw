@@ -35,7 +35,7 @@ func TestK12WriteEndpointsRequireAuth(t *testing.T) {
 	}
 
 	// 非回环 + 无 token → K12 写端点必须 401（此前 bug：直接 200 放行）。
-	for _, p := range []string{"/api/k12/grade", "/api/k12/restore", "/api/k12/cron/provision", "/api/k12/bind-im"} {
+	for _, p := range []string{"/api/k12/grade", "/api/k12/restore", "/api/k12/cron/provision", "/api/k12/cron/reconcile-defaults", "/api/k12/bind-im"} {
 		if code, hit := call(http.MethodPost, p, "203.0.113.7:5555", ""); code != http.StatusUnauthorized || hit {
 			t.Errorf("%s 非回环无 token 应 401 且不进 handler，got code=%d hit=%v", p, code, hit)
 		}

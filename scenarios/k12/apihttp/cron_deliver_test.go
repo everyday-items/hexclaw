@@ -3,6 +3,7 @@ package apihttp_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -25,6 +26,11 @@ type fakeRegistrar struct {
 	reclaimAgent string
 	reclaimKeep  []string
 	reclaimOut   []apihttp.ReclaimedCronJob
+	ensureCalls  int
+	ensureWrites int
+	failEnsureAt int
+	ensured      map[string]string
+	ensureUsers  []string
 }
 
 func (f *fakeRegistrar) Register(_ context.Context, kind string, spec usecase.CronSpec, platform, chatID, userID string) (string, error) {
@@ -38,6 +44,24 @@ func (f *fakeRegistrar) ReclaimStale(_ context.Context, agentName string, keepJo
 	f.reclaimAgent = agentName
 	f.reclaimKeep = append([]string{}, keepJobIDs...)
 	return f.reclaimOut, nil
+}
+
+func (f *fakeRegistrar) EnsureMissing(_ context.Context, kind string, spec usecase.CronSpec, _, _, userID string) (string, bool, error) {
+	f.ensureCalls++
+	f.ensureUsers = append(f.ensureUsers, userID)
+	if f.failEnsureAt == f.ensureCalls {
+		return "", false, errors.New("injected register failure")
+	}
+	if f.ensured == nil {
+		f.ensured = map[string]string{}
+	}
+	if id := f.ensured[spec.Key]; id != "" {
+		return id, false, nil
+	}
+	id := "job-" + kind
+	f.ensured[spec.Key] = id
+	f.ensureWrites++
+	return id, true, nil
 }
 
 func newServerWithCron(t *testing.T, reg apihttp.CronRegistrar) http.Handler {
@@ -127,6 +151,71 @@ func TestCronProvision_501WhenNoRegistrar(t *testing.T) {
 	rec, _ := do(t, h, "POST", "/cron/provision", `{"agent":"mingming"}`)
 	if rec.Code != http.StatusNotImplemented {
 		t.Errorf("无 registrar 应 501, got %d", rec.Code)
+	}
+}
+
+func TestCronReconcileDefaults_RetryAfterEachRegistrationFailureConvergesWithoutRewrites(t *testing.T) {
+	for failAt := 1; failAt <= 4; failAt++ {
+		t.Run(string(rune('0'+failAt)), func(t *testing.T) {
+			reg := &fakeRegistrar{failEnsureAt: failAt}
+			h := newServerWithCron(t, reg)
+			first, _ := do(t, h, "POST", "/cron/reconcile-defaults", `{"agent":"mingming"}`)
+			if first.Code != http.StatusInternalServerError {
+				t.Fatalf("第 %d 项注入失败应返回 500, got %d", failAt, first.Code)
+			}
+			if reg.ensureWrites != failAt-1 {
+				t.Fatalf("失败前只允许写入 %d 个缺项, got %d", failAt-1, reg.ensureWrites)
+			}
+
+			reg.failEnsureAt = 0
+			reg.ensureCalls = 0
+			second, out := do(t, h, "POST", "/cron/reconcile-defaults", `{"agent":"mingming"}`)
+			if second.Code != http.StatusOK {
+				t.Fatalf("失败后重试应收敛, got %d: %v", second.Code, out)
+			}
+			jobs, _ := out["provisioned"].([]any)
+			if len(jobs) != 4 || reg.ensureWrites != 4 {
+				t.Fatalf("重试后应恰好具备四项且总写入四次: jobs=%v writes=%d", jobs, reg.ensureWrites)
+			}
+
+			writesBeforeRepeat := reg.ensureWrites
+			reg.ensureCalls = 0
+			third, _ := do(t, h, "POST", "/cron/reconcile-defaults", `{"agent":"mingming"}`)
+			if third.Code != http.StatusOK || reg.ensureWrites != writesBeforeRepeat {
+				t.Fatalf("二次成功执行必须零写: code=%d before=%d after=%d", third.Code, writesBeforeRepeat, reg.ensureWrites)
+			}
+		})
+	}
+}
+
+func TestCronReconcileDefaults_501WhenNoRegistrar(t *testing.T) {
+	h := newServer(t)
+	rec, _ := do(t, h, "POST", "/cron/reconcile-defaults", `{"agent":"mingming"}`)
+	if rec.Code != http.StatusNotImplemented {
+		t.Errorf("无 registrar 应 501, got %d", rec.Code)
+	}
+}
+
+func TestCronReconcileDefaults_UsesDesktopPrincipalAndRejectsForgedOwner(t *testing.T) {
+	reg := &fakeRegistrar{}
+	h := newServerWithCron(t, reg)
+	rec, _ := do(t, h, "POST", "/cron/reconcile-defaults", `{"agent":"mingming"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("missing user_id should use trusted desktop principal, got %d", rec.Code)
+	}
+	for _, userID := range reg.ensureUsers {
+		if userID != "desktop-user" {
+			t.Fatalf("reconcile used untrusted owner %q", userID)
+		}
+	}
+
+	before := reg.ensureCalls
+	rec, _ = do(t, h, "POST", "/cron/reconcile-defaults", `{"agent":"mingming","user_id":"other-owner"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("forged user_id must fail closed, got %d", rec.Code)
+	}
+	if reg.ensureCalls != before {
+		t.Fatal("forged owner reached cron registrar")
 	}
 }
 

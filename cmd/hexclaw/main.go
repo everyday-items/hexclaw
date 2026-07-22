@@ -2901,6 +2901,7 @@ func (r k12CronRegistrar) Register(ctx context.Context, kind string, spec k12use
 			UserID:    userID,
 			Platform:  platform,
 			ChatID:    chatID,
+			TZ:        "Asia/Shanghai",
 			Deliver:   spec.Deliver,
 			SourceKey: key,
 		}
@@ -2923,6 +2924,45 @@ func (r k12CronRegistrar) Register(ctx context.Context, kind string, spec k12use
 		return "", fmt.Errorf("k12 agent %q 不可用，拒绝创建孤儿定时任务: %w", agentName, err)
 	}
 	return jobID, nil
+}
+
+// EnsureMissing is the scoped profile-lifecycle reconciliation path. It shares
+// the K12 identity validation and agent lease with Register, but delegates to a
+// scheduler primitive that never rewrites an existing exact SourceKey.
+func (r k12CronRegistrar) EnsureMissing(ctx context.Context, kind string, spec k12usecase.CronSpec, platform, chatID, userID string) (string, bool, error) {
+	kind = strings.TrimSpace(kind)
+	key := strings.TrimSpace(spec.Key)
+	if kind == "" || key == "" || !strings.HasSuffix(key, "/"+kind) {
+		return "", false, fmt.Errorf("k12 cron 幂等键与 kind 不匹配: key=%q kind=%q", key, kind)
+	}
+	agentName := strings.TrimSuffix(key, "/"+kind)
+	if strings.TrimSpace(agentName) == "" {
+		return "", false, fmt.Errorf("k12 cron 幂等键缺少 agent: key=%q", key)
+	}
+	ensure := func() (string, bool, error) {
+		job, created, err := r.sched.EnsureJobFromScriptMissingOnly(ctx, cron.AddJobRequest{
+			Name: spec.Name, Schedule: spec.Schedule, UserID: userID,
+			Platform: platform, ChatID: chatID, TZ: "Asia/Shanghai", Deliver: spec.Deliver, SourceKey: key,
+		}, spec.Runtime, spec.Script)
+		if err != nil {
+			return "", false, fmt.Errorf("k12 cron 缺项注册（已有任务保持不变）: %w", err)
+		}
+		return job.ID, created, nil
+	}
+	if r.router == nil {
+		return ensure()
+	}
+	var jobID string
+	var created bool
+	err := r.router.WithAgentLease(agentName, func(agentrouter.AgentConfig) error {
+		var ensureErr error
+		jobID, created, ensureErr = ensure()
+		return ensureErr
+	})
+	if err != nil {
+		return "", false, fmt.Errorf("k12 agent %q 不可用，拒绝创建孤儿定时任务: %w", agentName, err)
+	}
+	return jobID, created, nil
 }
 
 // ReclaimStale 实现 apihttp.CronRegistrar 的 stale kind 回收（§6.14 一次切换终局批）：
@@ -3026,6 +3066,7 @@ func (r k12CronRegistrar) DetachAgentResources(
 				UserID:     job.UserID,
 				Platform:   job.Platform,
 				ChatID:     job.ChatID,
+				TZ:         job.TZ,
 				Deliver:    job.Deliver,
 				SourceKey:  job.SourceKey,
 				TimeoutSec: job.Spec.TimeoutSec,

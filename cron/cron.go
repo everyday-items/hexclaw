@@ -144,6 +144,8 @@ type AddJobRequest struct {
 	UserID   string `json:"user_id"`
 	Platform string `json:"platform,omitempty"`
 	ChatID   string `json:"chat_id,omitempty"`
+	// TZ 显式指定任务时区；留空时保持现有跟随宿主时区的语义。
+	TZ string `json:"tz,omitempty"`
 	// D4.2 多 deliver 桥接：chat / push / feishu / discord / wechat 任意组合
 	// 留空 → 默认 ["chat"]（仅在 chat 流回写）
 	Deliver []string `json:"deliver,omitempty"`
@@ -616,6 +618,7 @@ func (s *Scheduler) AddJobFromPromptWithProgress(
 			UserID:       req.UserID,
 			Platform:     req.Platform,
 			ChatID:       req.ChatID,
+			TZ:           req.TZ,
 			Status:       initialJobStatus(req.Paused),
 			SourcePrompt: req.Prompt,
 			Spec:         &JobSpec{Runtime: RuntimeAgent, TimeoutSec: agentTimeoutSec(req.TimeoutSec)},
@@ -655,6 +658,7 @@ func (s *Scheduler) AddJobFromPromptWithProgress(
 		UserID:       req.UserID,
 		Platform:     req.Platform,
 		ChatID:       req.ChatID,
+		TZ:           req.TZ,
 		Status:       initialJobStatus(req.Paused),
 		SourcePrompt: req.Prompt,
 		Spec:         spec,
@@ -681,6 +685,96 @@ func (s *Scheduler) AddJobFromScript(ctx context.Context, req AddJobRequest, run
 		return nil, err
 	}
 	return job, nil
+}
+
+// EnsureJobFromScriptMissingOnly creates a script job only when no durable job
+// already owns the exact SourceKey. Unlike UpsertJobFromScript it never updates,
+// resumes, migrates, merges, or deletes an existing job: schedule, status,
+// timezone, delivery targets, platform/chat binding, and script remain byte
+// semantically unchanged. The lookup spans every user_id because scenario-owned
+// jobs may survive an owner/principal migration.
+//
+// SourceKey-empty jobs are deliberately invisible to this method. They are
+// user-authored tasks, not scenario defaults, and must never be claimed by a
+// background reconciliation.
+func (s *Scheduler) EnsureJobFromScriptMissingOnly(
+	ctx context.Context,
+	req AddJobRequest,
+	runtime, script string,
+) (*Job, bool, error) {
+	if strings.TrimSpace(req.SourceKey) == "" {
+		return nil, false, fmt.Errorf("source_key is required for missing-only cron ensure")
+	}
+	if strings.TrimSpace(req.UserID) == "" {
+		return nil, false, fmt.Errorf("user_id is required for missing-only cron ensure")
+	}
+	job, err := s.buildJobFromScript(req, runtime, script)
+	if err != nil {
+		return nil, false, err
+	}
+	// Keep the existing stable-key ID shape for newly created jobs. Exact-key
+	// preservation is global across user IDs; the owner is only part of the ID
+	// for compatibility with jobs created by UpsertJobFromScript.
+	sum := sha256.Sum256([]byte(req.UserID + "\x00" + req.SourceKey))
+	job.ID = fmt.Sprintf("cron-%x", sum[:12])
+	specJSON, metaJSON, err := prepareJobForPersistence(job)
+	if err != nil {
+		return nil, false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("开始 cron missing-only 事务: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Query the durable table rather than s.jobs: loadJobs intentionally loads
+	// active jobs only, while a user-paused default must still block creation.
+	rows, err := tx.QueryContext(ctx, `SELECT id, name, type, schedule, spec_json, source_prompt, user_id, platform, chat_id, status,
+		last_run_at, next_run_at, run_count, created_at, meta
+		FROM cron_jobs ORDER BY created_at, id`)
+	if err != nil {
+		return nil, false, fmt.Errorf("查询 cron stable key: %w", err)
+	}
+	var existing *Job
+	for rows.Next() {
+		candidate, scanErr := scanJobRow(rows)
+		if scanErr != nil {
+			_ = rows.Close()
+			return nil, false, fmt.Errorf("读取 cron stable key: %w", scanErr)
+		}
+		if candidate.SourceKey == req.SourceKey && existing == nil {
+			existing = candidate
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, false, fmt.Errorf("遍历 cron stable key: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, false, fmt.Errorf("关闭 cron stable key 查询: %w", err)
+	}
+	if existing != nil {
+		return cloneJobSnapshot(existing), false, nil
+	}
+
+	_, err = tx.ExecContext(ctx, `INSERT INTO cron_jobs
+		(id, name, type, schedule, spec_json, source_prompt, user_id, platform, chat_id, status,
+		 next_run_at, created_at, meta)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		job.ID, job.Name, job.Type, job.Schedule, specJSON, job.SourcePrompt,
+		job.UserID, job.Platform, job.ChatID, job.Status, job.NextRunAt, job.CreatedAt, metaJSON)
+	if err != nil {
+		return nil, false, fmt.Errorf("保存 missing-only cron 任务: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("提交 cron missing-only 事务: %w", err)
+	}
+	s.jobs[job.ID] = job
+	logger.Info("Cron 缺项已注册", "name", job.Name, "source_key", job.SourceKey, "schedule", job.Schedule)
+	return cloneJobSnapshot(job), true, nil
 }
 
 // buildJobFromScript validates a pre-authored script completely before any DB
@@ -718,6 +812,7 @@ func (s *Scheduler) buildJobFromScript(req AddJobRequest, runtime, script string
 		UserID:       req.UserID,
 		Platform:     req.Platform,
 		ChatID:       req.ChatID,
+		TZ:           req.TZ,
 		Status:       initialJobStatus(req.Paused),
 		SourcePrompt: req.Prompt,
 		Spec:         spec,
@@ -926,21 +1021,39 @@ func (s *Scheduler) RemoveJobsBySourceKeyPrefix(ctx context.Context, prefix stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	detached := make([]*Job, 0)
-	for _, job := range s.jobs {
-		if strings.HasPrefix(job.SourceKey, prefix) {
-			detached = append(detached, cloneJobSnapshot(job))
-		}
-	}
-	if len(detached) == 0 {
-		return detached, nil
-	}
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("开始 cron 归属清理事务: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// loadJobs 只把 active job 放入 s.jobs；已暂停任务只在持久层。
+	// 因此归属清理必须在同一事务内以全量持久行为权威集合，
+	// 否则重启后删 agent 会遗留 paused orphan。
+	rows, err := tx.QueryContext(ctx, `SELECT id, name, type, schedule, spec_json, source_prompt, user_id, platform, chat_id, status,
+		last_run_at, next_run_at, run_count, created_at, meta
+		FROM cron_jobs ORDER BY created_at, id`)
+	if err != nil {
+		return nil, fmt.Errorf("查询 cron 归属清理集合: %w", err)
+	}
+	detached := make([]*Job, 0)
+	for rows.Next() {
+		job, scanErr := scanJobRow(rows)
+		if scanErr != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("读取 cron 归属清理集合: %w", scanErr)
+		}
+		if job.SourceKey != "" && strings.HasPrefix(job.SourceKey, prefix) {
+			detached = append(detached, cloneJobSnapshot(job))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("遍历 cron 归属清理集合: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("关闭 cron 归属清理查询: %w", err)
+	}
 	for _, job := range detached {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM cron_jobs WHERE id = ?`, job.ID); err != nil {
 			return nil, fmt.Errorf("删除归属 cron %s: %w", job.ID, err)

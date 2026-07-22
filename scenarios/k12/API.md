@@ -130,7 +130,13 @@
 **`GET /api/k12/cron/year-archive?agent=X`** — 学年 6 月底归档建议（无记录→空）
 
 **`POST /api/k12/cron/provision`** `{"agent","platform","chat_id","deliver":["dingtalk"],"user_id","base_url"}` → `{"provisioned":[{"kind","name","schedule","job_id"}]}`
-- 为实例注册 6 个默认 cron 任务（周五 19:00 错题卷 / 每日 20:00 提醒 / 每月 1 日报告 / 6 月底学年归档建议 / 3.1、9.1 学期确认）。建档后调一次。
+- 显式切换兼容入口：注册 §3.13 四个默认任务，并回收历史默认任务残留。
+- 需服务器注入 cron.Scheduler（桌面默认有）；未注入 → **501**。`base_url` 服务器已配时可省。
+
+**`POST /api/k12/cron/reconcile-defaults`** `{"agent","platform","chat_id","deliver":["dingtalk"],"user_id","base_url"}` → `{"provisioned":[{"kind","name","schedule","job_id","created"}]}`
+- 档案新建/编辑成功后的作用域修复入口，只补该 `agent` 缺失的 §3.13 默认任务。
+- exact `source_key` 已存在时零写入：保留用户的暂停状态、时间表、时区、投递目标、平台/会话和脚本；`source_key` 为空的用户任务永不参与。
+- 逐项失败可安全重试，二次成功调用零写；不做全局启动扫描。
 - 需服务器注入 cron.Scheduler（桌面默认有）；未注入 → **501**。`base_url` 服务器已配时可省。
 
 ### IM 入站路由绑定（§3.1.7）
@@ -169,7 +175,7 @@
 | 功能 | 状态 |
 |---|---|
 | 真 LLM | `grade`/`grading-jobs`（识别+批改阶段）/`prep-card 热身题`/`tutor-turn 阶段三 solution` 运行时真调云端模型，**服务器必须配 `cfg.LLM` provider+密钥**，否则报错。其余端点纯本地无需 LLM |
-| cron 自动投递（周五错题卷/回传提醒/学期确认×2，§3.13 四任务） | ✅ 已接：`cron/provision` 注册 §3.13 四默认任务并**回收历史 kind 残留**（monthly-report/daily-reminder/year-archive 等，响应 `reclaimed` 取证），投递内容走 `cron/*` 纯文本端点（空 body 静默跳过），复用平台 cron 调度 + Deliverer（IM/桌面）|
+| cron 自动投递（周五错题卷/回传提醒/学期确认×2，§3.13 四任务） | ✅ 已接：档案保存走 `cron/reconcile-defaults` missing-only 补齐，保留用户已改任务；显式切换兼容入口 `cron/provision` 仍负责注册并回收历史 kind 残留。投递内容走 `cron/*` 纯文本端点（空 body 静默跳过），复用平台 cron 调度 + Deliverer（IM/桌面）|
 | IM 群绑定（各绑各的群） | ✅ 已接：`bind-im` 写 `agent_rules`，入站群消息路由到对应实例 |
 | 渐进三阶段提示 + 情绪守门 | ✅ 已接：`tutor-turn` 输出分阶段指令 + 守门标志；**桌面/HTTP 联调可用** |
 | IM 入站作业 → 自动错题入库副作用 | ✅ 结构已通：engine 把已路由 Agent 名 stamp 进 ctx（`skill.RoutedAgentName`），K12 提供通用 `k12_grade` skill 包全闭环（批改+错题入库+学情），实例 scope 从 ctx 取。**辅导 Agent 模板须在 Skills 声明 `k12_grade`**（建档时挂载）。真 IM+LLM 端到端仍需活环境验 |

@@ -13,8 +13,10 @@ package main
 import (
 	"context"
 	"database/sql"
+	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/cron"
 	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
@@ -160,5 +162,65 @@ func TestBUG20260710_H3_CronFailedReplacementKeepsPreviousJob(t *testing.T) {
 	}
 	if len(jobs) != 1 || jobs[0].ID != firstID || jobs[0].Schedule != spec.Schedule {
 		t.Fatalf("替换失败后旧任务必须字节语义不变: first=%s jobs=%+v", firstID, jobs)
+	}
+}
+
+func TestK12CronEnsureMissingPreservesCustomizedPausedJob(t *testing.T) {
+	ctx := context.Background()
+	reg := newCronRegistrarFixture(t)
+	const sourceKey = "mingming/weekly-sheet"
+	existing := &cron.Job{
+		ID: "cron-existing-custom", Name: "家长重命名", Type: cron.JobTypeCron,
+		Schedule: "13 7 * * 6", UserID: "old-owner", Platform: "dingtalk", ChatID: "family-chat",
+		Status: cron.StatusPaused, Deliver: []string{"dingtalk", "chat"}, TZ: "Asia/Shanghai",
+		SourceKey: sourceKey,
+		Spec:      &cron.JobSpec{Runtime: cron.RuntimeStarlark, Script: `emit({"status": "success", "custom": True})`},
+	}
+	if err := reg.sched.AddJob(ctx, existing); err != nil {
+		t.Fatal(err)
+	}
+	before := reg.sched.JobsBySourceKeyPrefix("mingming/")[0]
+	spec := k12usecase.DefaultCronSpecs("http://127.0.0.1:1", "mingming", nil)[0]
+	id, created, err := reg.EnsureMissing(ctx, string(spec.Kind), spec, "chat", "desktop", "desktop-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || id != existing.ID {
+		t.Fatalf("existing exact SourceKey must be preserved: id=%q created=%v", id, created)
+	}
+	after := reg.sched.JobsBySourceKeyPrefix("mingming/")[0]
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("K12 missing-only reconcile changed customized job\nbefore=%+v\nafter=%+v", before, after)
+	}
+}
+
+func TestK12CronEnsureMissingCreatesDefaultsInAsiaShanghaiOnUTCServer(t *testing.T) {
+	originalLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = originalLocal })
+
+	ctx := context.Background()
+	reg := newCronRegistrarFixture(t)
+	spec := k12usecase.DefaultCronSpecs("http://127.0.0.1:1", "mingming", nil)[0]
+	_, created, err := reg.EnsureMissing(ctx, string(spec.Kind), spec, "chat", "desktop", "desktop-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("missing default must be created")
+	}
+	jobs, err := reg.sched.ListJobs(ctx, "desktop-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].TZ != "Asia/Shanghai" {
+		t.Fatalf("K12 default timezone must be explicit Asia/Shanghai, jobs=%+v", jobs)
+	}
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := jobs[0].NextRunAt.In(shanghai).Hour(); got != 19 {
+		t.Fatalf("weekly default must still fire at Shanghai 19:00 on a UTC host, next=%s", jobs[0].NextRunAt)
 	}
 }
