@@ -43,13 +43,16 @@ var (
 	// latexCommandRe 反斜杠命令（全词：[a-zA-Z]+ 贪婪，\leq2 只取 leq、\fracture 取整词不误配 \frac）。
 	latexCommandRe = regexp.MustCompile(`\\([a-zA-Z]+)`)
 	// latexHintRe $…$ 内部的 LaTeX 特征：\命令 / ^指数 / _下标。
-	latexHintRe  = regexp.MustCompile(`\\[a-zA-Z]|\^[{0-9-]|_[{0-9]`)
-	supBracedRe  = regexp.MustCompile(`\^\{(-?[0-9]+)\}`)
-	supBareRe    = regexp.MustCompile(`\^(-?[0-9]+)`)
-	subBracedRe  = regexp.MustCompile(`_\{([0-9]+)\}`)
-	subBareRe    = regexp.MustCompile(`_([0-9]+)`)
-	superscripts = map[rune]rune{'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹', '-': '⁻'}
-	subscripts   = map[rune]rune{'0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉', '-': '₋'}
+	latexHintRe = regexp.MustCompile(`\\[a-zA-Z]|\^[{0-9-]|_[{0-9]`)
+	supBracedRe = regexp.MustCompile(`\^\{(-?[0-9]+)\}`)
+	supBareRe   = regexp.MustCompile(`\^(-?[0-9]+)`)
+	subBracedRe = regexp.MustCompile(`_\{([0-9]+)\}`)
+	subBareRe   = regexp.MustCompile(`_([0-9]+)`)
+	// LaTeX 细/负间距命令：\\, \\; \\: \\!。数字与单位间统一降级为单空格；
+	// 与 adapter.NormalizeMathText 的既有 IM 投影规则保持一致。
+	latexSpacingRe = regexp.MustCompile("\\s*\\\\[,;:!]\\s*")
+	superscripts   = map[rune]rune{'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹', '-': '⁻'}
+	subscripts     = map[rune]rune{'0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉', '-': '₋'}
 )
 
 // LaTeXToUnicode 把常见 LaTeX 写法确定性映射为 Unicode 数学符号，返回转换结果与是否改动。
@@ -149,6 +152,7 @@ func stripDollarMath(s string) string {
 // math=true 表示已证实处于数学定界符内：未知命令剥反斜杠保留词干、裸下标 _2 也转换；
 // math=false（定界符外）只按精确词表转换，未知命令原样保留。
 func convertMath(s string, math bool) string {
+	s = latexSpacingRe.ReplaceAllString(s, " ")
 	s = expandStructural(s, math)
 	s = strings.ReplaceAll(s, `^{\circ}`, "°")
 	s = strings.ReplaceAll(s, `^\circ`, "°")

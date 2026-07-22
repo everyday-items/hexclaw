@@ -38,6 +38,7 @@ func TestLaTeXToUnicode_CommonMappings(t *testing.T) {
 		{"sub-bare-in-math", `$a_2 + a_3$`, "a₂ + a₃"},
 		{"text", `\text{厘米}`, "厘米"},
 		{"mathrm", `\mathrm{kg}`, "kg"},
+		{"spacing-unit", `$12 \, \mathrm{cm}$`, "12 cm"},
 		{"dollar-inline", `$\pi r^2$`, "π r²"},
 		{"paren-delim", `\(a \times b\)`, "a × b"},
 		{"bracket-delim", `\[x^2 + y^2 = z^2\]`, "x² + y² = z²"},

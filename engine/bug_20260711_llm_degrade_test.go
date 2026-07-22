@@ -14,6 +14,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -266,5 +267,75 @@ func TestBUG20260711_friendlyLLMError(t *testing.T) {
 	}
 	if friendlyLLMError(nil) != nil {
 		t.Fatal("friendlyLLMError(nil) 应返回 nil")
+	}
+}
+
+func TestFriendlyLLMErrorPreservesContextSemanticsWithoutLeakingRawCause(t *testing.T) {
+	tests := []struct {
+		name        string
+		raw         error
+		wantCause   error
+		wantMessage string
+	}{
+		{
+			name:        "deadline",
+			raw:         context.DeadlineExceeded,
+			wantCause:   context.DeadlineExceeded,
+			wantMessage: "模型响应超时，请稍后重试或切换到更快的模型。",
+		},
+		{
+			name:        "wrapped deadline",
+			raw:         fmt.Errorf("secret sk-test: %w", context.DeadlineExceeded),
+			wantCause:   context.DeadlineExceeded,
+			wantMessage: "模型响应超时，请稍后重试或切换到更快的模型。",
+		},
+		{
+			name:        "cancelled",
+			raw:         context.Canceled,
+			wantCause:   context.Canceled,
+			wantMessage: "模型服务暂时不可用，请稍后重试或切换模型。",
+		},
+		{
+			name:        "wrapped cancelled",
+			raw:         fmt.Errorf("secret sk-test: %w", context.Canceled),
+			wantCause:   context.Canceled,
+			wantMessage: "模型服务暂时不可用，请稍后重试或切换模型。",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := friendlyLLMError(tt.raw)
+			if !errors.Is(got, tt.wantCause) {
+				t.Fatalf("friendly error lost context cause: got=%T %v want errors.Is(_, %v)", got, got, tt.wantCause)
+			}
+			if got.Error() != tt.wantMessage {
+				t.Fatalf("friendly Error()=%q, want existing copy %q", got.Error(), tt.wantMessage)
+			}
+			if unwrapped := errors.Unwrap(got); unwrapped != tt.wantCause {
+				t.Fatalf("friendly Unwrap()=%T %v, want only standard sentinel %v", unwrapped, unwrapped, tt.wantCause)
+			}
+			for _, rendered := range []string{
+				got.Error(),
+				fmt.Sprintf("%v", got),
+				fmt.Sprintf("%+v", got),
+				fmt.Sprintf("%#v", got),
+				fmt.Errorf("outer: %w", got).Error(),
+			} {
+				for _, leak := range []string{"context deadline exceeded", "context canceled", "secret sk-test"} {
+					if strings.Contains(rendered, leak) {
+						t.Fatalf("friendly formatting leaked raw cause %q: %q", leak, rendered)
+					}
+				}
+			}
+		})
+	}
+
+	rateLimited := friendlyLLMError(errors.New("429 Too Many Requests: rate limit exceeded"))
+	if rateLimited.Error() != "请求过于频繁，已被上游限流。请稍等片刻再试。" {
+		t.Fatalf("rate-limit copy changed: %q", rateLimited.Error())
+	}
+	if errors.Is(rateLimited, context.DeadlineExceeded) || errors.Is(rateLimited, context.Canceled) || errors.Unwrap(rateLimited) != nil {
+		t.Fatalf("ordinary rate-limit error must not acquire context semantics: %T %v", rateLimited, rateLimited)
 	}
 }

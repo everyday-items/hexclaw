@@ -86,6 +86,28 @@ func TestBuildRenderManifestFailsVisibleForUnsupportedMath(t *testing.T) {
 	}
 }
 
+func TestBuildRenderManifestRejectsLeakedLaTeXSpacingCommand(t *testing.T) {
+	content, err := New(ProducerK12, "zh-CN", "$12 \\, \\mathrm{cm}$", nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = BuildManifest(content, RenderRequest{
+		Surface:         SurfaceChannel,
+		RendererVersion: "channel-markdown-readable-math-v1",
+		Capabilities: CapabilitySnapshot{
+			Markdown:    true,
+			TeXMath:     false,
+			UnicodeMath: true,
+		},
+		Parts:          []RenderPart{{Kind: PartMarkdown, Text: "12 \\,cm"}},
+		FallbackReason: FallbackMathToReadableText,
+	})
+	if err == nil || !strings.Contains(err.Error(), "raw LaTeX") {
+		t.Fatalf("symbol-form spacing command must fail closed, got %v", err)
+	}
+}
+
 func TestManifestRejectsSourceMismatchAndEmptyProjection(t *testing.T) {
 	content, err := New(ProducerWebhook, "en", "**accepted**", nil)
 	if err != nil {

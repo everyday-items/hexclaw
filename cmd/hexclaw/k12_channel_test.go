@@ -191,7 +191,7 @@ func TestK12IMDelivererFreezesReceiptPayloadBeforeProviderSend(t *testing.T) {
 	bindRule(t, dispatcher, "dingtalk", "bot-1", "mom-chat", "child-a")
 	d.MarkReady()
 
-	prepared, err := d.PrepareText(context.Background(), "child-a", "计算 $x^2$ 的点评")
+	prepared, err := d.PrepareText(context.Background(), "child-a", "计算 $x^2$，长度 $12 \\, \\mathrm{cm}$ 的点评")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,10 @@ func TestK12IMDelivererFreezesReceiptPayloadBeforeProviderSend(t *testing.T) {
 	if ack.Status != k12.DeliverySending || ack.ExternalMessageID != "pqk-24" {
 		t.Fatalf("provider acceptance must map to domain sending: %+v", ack)
 	}
-	if len(ding.sent) != 1 || strings.Contains(ding.sent[0].text, "$x^2$") {
+	if len(ding.sent) != 1 || !strings.Contains(ding.sent[0].text, "x²") ||
+		!strings.Contains(ding.sent[0].text, "12 cm") ||
+		strings.Contains(ding.sent[0].text, "\\,") ||
+		strings.Contains(ding.sent[0].text, "\\mathrm") {
 		t.Fatalf("send must reuse frozen readable projection exactly once: %+v", ding.sent)
 	}
 	tampered := receipt

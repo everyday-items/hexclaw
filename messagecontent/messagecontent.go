@@ -236,7 +236,7 @@ type RenderRequest struct {
 	ReceiptRef      string
 }
 
-var rawTeXPattern = regexp.MustCompile(`(?s)(\\(?:frac|sqrt|sum|int|begin|left|right|times|cdot|leq|geq|alpha|beta)\b|\$[^$\n]+\$|\\\(|\\\[)`)
+var rawTeXPattern = regexp.MustCompile(`(?s)(\\(?:frac|sqrt|sum|int|begin|left|right|times|cdot|leq|geq|alpha|beta)\b|\\[,;:!]|\$[^$\n]+\$|\\\(|\\\[)`)
 
 func BuildManifest(content MessageContent, request RenderRequest) (RenderManifest, error) {
 	if err := content.Validate(); err != nil {
