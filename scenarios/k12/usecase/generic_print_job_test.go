@@ -29,6 +29,11 @@ func TestGenericPrintUsecaseFreezesCanonicalArtifactAndDoesNotMutateSource(t *te
 		t.Fatalf("paper=%+v err=%v", paper, err)
 	}
 	if _, err := d.RecordGenericPrintEvent(ctx, "xiaoming", prepared.Job.PrintJobID, usecase.PracticePrintEvent{
+		Status: k12.PrintJobDialogOpen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.RecordGenericPrintEvent(ctx, "xiaoming", prepared.Job.PrintJobID, usecase.PracticePrintEvent{
 		Status: k12.PrintJobPrinted, NativeJobID: "native-1", NativeReceiptID: "receipt-1",
 		PrinterSnapshot: `{"printer":"Office","paper":"A4"}`,
 	}); err != nil {

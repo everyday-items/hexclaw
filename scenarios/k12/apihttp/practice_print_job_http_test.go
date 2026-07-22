@@ -79,3 +79,47 @@ func TestPracticePrintJobHTTPUnknownHasNoOrdinaryRetry(t *testing.T) {
 		t.Fatalf("unknown must remain queryable: code=%d %#v", rec.Code, out)
 	}
 }
+
+func TestPracticePrintJobHTTPCommitReceiptAtomicallyFinalizesSetAndReplays(t *testing.T) {
+	h := newServer(t)
+	_, seeded := do(t, h, http.MethodPost, "/practice-sets/basket/items", `{"agent":"mingming",
+		"item":{"item_id":"q1","subject":"数学","question_markdown":"1+1=?","expected_answer_markdown":"2","verification_status":"verified","verification_evidence":"验算"}}`)
+	setID := seeded["record_id"].(string)
+	_, out := do(t, h, http.MethodPost, "/practice-sets/"+setID+"/print-jobs",
+		`{"agent":"mingming","idempotency_key":"atomic-commit-1","artifact_kind":"question"}`)
+	jobID := out["print_job"].(map[string]any)["print_job_id"].(string)
+	receipt := `{"agent":"mingming","native_job_id":"native-practice-1","native_receipt_id":"receipt-practice-1","printer_snapshot":{"printer":"Office","paper":"A4"}}`
+	rec, _ := do(t, h, http.MethodPost, "/print-jobs/"+jobID+"/commit", receipt)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("preparing must not bypass dialog_open, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec, _ = do(t, h, http.MethodPost, "/print-jobs/"+jobID+"/events",
+		`{"agent":"mingming","status":"dialog_open"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dialog_open status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec, out = do(t, h, http.MethodPost, "/print-jobs/"+jobID+"/commit", receipt)
+	if rec.Code != http.StatusOK || out["print_job"].(map[string]any)["status"] != "printed" {
+		t.Fatalf("atomic commit status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rec, set := do(t, h, http.MethodGet, "/practice-sets/"+setID+"?agent=mingming", "")
+	if rec.Code != http.StatusOK || set["status"] != "assigned" {
+		t.Fatalf("commit did not atomically finalize practice set: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec, out = do(t, h, http.MethodPost, "/print-jobs/"+jobID+"/commit", receipt)
+	if rec.Code != http.StatusOK || out["print_job"].(map[string]any)["native_receipt_id"] != "receipt-practice-1" {
+		t.Fatalf("idempotent replay status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rec, _ = do(t, h, http.MethodPost, "/print-jobs/"+jobID+"/commit",
+		`{"agent":"mingming","native_job_id":"native-practice-1","native_receipt_id":"receipt-practice-1","printer_snapshot":{"paper":"A4","printer":"Office"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("semantically identical snapshot replay status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rec, _ = do(t, h, http.MethodPost, "/print-jobs/"+jobID+"/commit",
+		`{"agent":"mingming","native_job_id":"native-practice-1","native_receipt_id":"receipt-practice-1","printer_snapshot":{"printer":"Office","paper":"Letter"}}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("same receipt IDs with conflicting snapshot must be 409, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}

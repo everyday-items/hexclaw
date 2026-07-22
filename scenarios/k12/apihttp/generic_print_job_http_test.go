@@ -58,3 +58,51 @@ func TestGenericPrintJobHTTPUsesSharedRecoveryRoutes(t *testing.T) {
 		t.Fatalf("replay code=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestGenericPrintJobHTTPCommitReceiptIsAtomicAndIdempotent(t *testing.T) {
+	h := newServer(t)
+	rec, out := do(t, h, http.MethodPost, "/print-jobs", `{
+		"agent":"mingming","idempotency_key":"prep-commit-1","source_kind":"prep_card",
+		"source_ref":"submission:s1","title":"辅导要点","canonical_markdown":"# 辅导要点"
+	}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("prepare status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	jobID := out["print_job"].(map[string]any)["print_job_id"].(string)
+	receipt := `{"agent":"mingming","native_job_id":"native-commit-1","native_receipt_id":"receipt-commit-1","printer_snapshot":{"printer":"Office","paper":"A4"}}`
+	rec, _ = do(t, h, http.MethodPost, "/print-jobs/"+jobID+"/commit", receipt)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("preparing must not bypass dialog_open, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec, _ = do(t, h, http.MethodPost, "/print-jobs/"+jobID+"/events",
+		`{"agent":"mingming","status":"dialog_open"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dialog_open status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec, out = do(t, h, http.MethodPost, "/print-jobs/"+jobID+"/commit", receipt)
+	if rec.Code != http.StatusOK || out["print_job"].(map[string]any)["status"] != "printed" {
+		t.Fatalf("atomic commit status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// A lost HTTP response is recovered by replaying the exact same native receipt.
+	rec, out = do(t, h, http.MethodPost, "/print-jobs/"+jobID+"/commit", receipt)
+	if rec.Code != http.StatusOK || out["print_job"].(map[string]any)["native_receipt_id"] != "receipt-commit-1" {
+		t.Fatalf("idempotent replay status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rec, _ = do(t, h, http.MethodPost, "/print-jobs/"+jobID+"/commit",
+		`{"agent":"mingming","native_job_id":"native-commit-1","native_receipt_id":"receipt-commit-1","printer_snapshot":{"paper":"A4","printer":"Office"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("semantically identical snapshot replay status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rec, _ = do(t, h, http.MethodPost, "/print-jobs/"+jobID+"/commit",
+		`{"agent":"mingming","native_job_id":"native-commit-1","native_receipt_id":"receipt-commit-1","printer_snapshot":{"printer":"Office","paper":"Letter"}}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("same receipt IDs with conflicting snapshot must be 409, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec, _ = do(t, h, http.MethodPost, "/print-jobs/"+jobID+"/commit",
+		`{"agent":"mingming","native_job_id":"native-other","native_receipt_id":"receipt-other","printer_snapshot":{"printer":"Office","paper":"A4"}}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("conflicting receipt must be 409, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/records"
@@ -36,6 +37,15 @@ func scanPrintArtifact(row rowScanner) (k12.PrintArtifact, error) {
 func validPrinterSnapshotJSON(raw string) bool {
 	var snapshot map[string]any
 	return json.Unmarshal([]byte(raw), &snapshot) == nil && len(snapshot) > 0
+}
+
+func printerSnapshotsEqual(left, right string) bool {
+	var leftSnapshot, rightSnapshot any
+	if json.Unmarshal([]byte(left), &leftSnapshot) != nil ||
+		json.Unmarshal([]byte(right), &rightSnapshot) != nil {
+		return false
+	}
+	return reflect.DeepEqual(leftSnapshot, rightSnapshot)
 }
 
 func getGenericPrintJobVia(ctx context.Context, q dbQueryer, agentName, jobID string) (k12.GenericPrintJob, error) {
@@ -274,13 +284,14 @@ func (s *Store) CommitGenericPrintJob(ctx context.Context, agentName, jobID, nat
 		return k12.GenericPrintJob{}, err
 	}
 	if job.Status == k12.PrintJobPrinted {
-		if job.NativeJobID != nativeJobID || job.NativeReceiptID != nativeReceiptID {
+		if job.NativeJobID != nativeJobID || job.NativeReceiptID != nativeReceiptID ||
+			!printerSnapshotsEqual(job.PrinterSnapshot, printerSnapshot) {
 			return k12.GenericPrintJob{}, fmt.Errorf("k12storage: PrintJob 已由其他原生 receipt 提交")
 		}
 		return job, nil
 	}
-	if job.Status == k12.PrintJobCancelled || job.Status == k12.PrintJobFailed {
-		return k12.GenericPrintJob{}, fmt.Errorf("k12storage: %s PrintJob 必须先 retry", job.Status)
+	if err := validatePrintReceiptCommitBoundary(job.Status, job.NativeJobID, nativeJobID); err != nil {
+		return k12.GenericPrintJob{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE k12_generic_print_jobs SET status=?,native_job_id=?,
         native_receipt_id=?,printer_snapshot_json=?,failure_kind='',failure_detail='',printed_at=?,

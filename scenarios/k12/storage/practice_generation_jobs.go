@@ -103,15 +103,6 @@ func (s *Store) CommitPracticeGeneration(ctx context.Context, rec *records.Agent
 	if err != nil {
 		return nil, false, err
 	}
-	if schema.ValidateFields != nil {
-		if err := schema.ValidateFields(rec.Fields); err != nil {
-			return nil, false, fmt.Errorf("%w: 记录集 %q: %v", records.ErrInvalidFields, rec.Collection, err)
-		}
-	}
-	domainVals, err := mp.encode(rec.Fields)
-	if err != nil {
-		return nil, false, err
-	}
 	if err := ensureAgentRegistered(ctx, s.db, rec.AgentName); err != nil {
 		return nil, false, err
 	}
@@ -162,6 +153,15 @@ func (s *Store) CommitPracticeGeneration(ctx context.Context, rec *records.Agent
 			k12.PracticeGenerationValidating, job.UpdatedAt, job.AgentName, job.IdempotencyKey); err != nil {
 			return nil, false, fmt.Errorf("k12storage: 推进组卷重试: %w", err)
 		}
+	}
+	if schema.ValidateFields != nil {
+		if err := schema.ValidateFields(rec.Fields); err != nil {
+			return nil, false, fmt.Errorf("%w: 记录集 %q: %v", records.ErrInvalidFields, rec.Collection, err)
+		}
+	}
+	domainVals, err := mp.encode(rec.Fields)
+	if err != nil {
+		return nil, false, err
 	}
 
 	created := expectedVersion < 0

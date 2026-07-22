@@ -228,6 +228,11 @@ func TestPracticePrintCommitRollsBackBothSidesAndRecoversAfterCrashPoint(t *test
 	if err != nil || !replay || recovered.Job.PrintJobID != prepared.Job.PrintJobID || recovered.Job.PaperNo != prepared.Job.PaperNo {
 		t.Fatalf("prepare crash recovery drifted: before=%+v recovered=%+v replay=%v err=%v", prepared.Job, recovered.Job, replay, err)
 	}
+	if _, err := d.RecordPracticePrintEvent(ctx, "xiaoming", prepared.Job.PrintJobID, usecase.PracticePrintEvent{
+		Status: k12.PrintJobDialogOpen,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// Inject a crash/failure exactly after the PracticeSet UPDATE would run and
 	// before the PrintJob receipt UPDATE. SQLite must roll the set mutation back.
@@ -280,6 +285,11 @@ func TestPracticePrintCommitRequiresNativeReceiptAndIsIdempotent(t *testing.T) {
 	set, _ := d.GetPracticeSet(ctx, "xiaoming", id)
 	if set.Record.Status != k12.PracticeStatusDraft || set.Fields.PaperNo != "" {
 		t.Fatal("invalid receipt caused partial finalization")
+	}
+	if _, err := d.RecordPracticePrintEvent(ctx, "xiaoming", prepared.Job.PrintJobID, usecase.PracticePrintEvent{
+		Status: k12.PrintJobDialogOpen,
+	}); err != nil {
+		t.Fatal(err)
 	}
 
 	printed, err := d.RecordPracticePrintEvent(ctx, "xiaoming", prepared.Job.PrintJobID, usecase.PracticePrintEvent{

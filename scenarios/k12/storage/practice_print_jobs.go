@@ -220,6 +220,23 @@ func canAdvancePracticePrintJob(from, to string) bool {
 	}
 }
 
+func validatePrintReceiptCommitBoundary(status, storedNativeJobID, nativeJobID string) error {
+	switch status {
+	case k12.PrintJobDialogOpen, k12.PrintJobSubmitted:
+		if storedNativeJobID != "" && storedNativeJobID != nativeJobID {
+			return fmt.Errorf("k12storage: 原生 receipt 与 PrintJob 的 native_job_id 冲突")
+		}
+		return nil
+	case k12.PrintJobOutcomeUnknown:
+		if storedNativeJobID == "" || storedNativeJobID != nativeJobID {
+			return fmt.Errorf("k12storage: outcome_unknown 仅允许同 native_job_id 的明确 reconciliation receipt")
+		}
+		return nil
+	default:
+		return fmt.Errorf("k12storage: %s PrintJob 未证明 dialog_open，不能提交 printed receipt", status)
+	}
+}
+
 // AdvancePracticePrintJob persists non-success native events. Printed is handled
 // by CommitPracticePrintJob so it cannot diverge from PracticeSet finalization.
 func (s *Store) AdvancePracticePrintJob(ctx context.Context, agentName, jobID, status,
@@ -343,13 +360,14 @@ func (s *Store) CommitPracticePrintJob(ctx context.Context, agentName, jobID, na
 		return k12.PracticePrintJob{}, err
 	}
 	if job.Status == k12.PrintJobPrinted {
-		if job.NativeJobID != nativeJobID || job.NativeReceiptID != nativeReceiptID {
+		if job.NativeJobID != nativeJobID || job.NativeReceiptID != nativeReceiptID ||
+			!printerSnapshotsEqual(job.PrinterSnapshot, printerSnapshot) {
 			return k12.PracticePrintJob{}, fmt.Errorf("k12storage: PrintJob 已由其他原生 receipt 提交")
 		}
 		return job, nil
 	}
-	if job.Status == k12.PrintJobCancelled || job.Status == k12.PrintJobFailed {
-		return k12.PracticePrintJob{}, fmt.Errorf("k12storage: %s PrintJob 必须先 retry，不能直接伪装 printed", job.Status)
+	if err := validatePrintReceiptCommitBoundary(job.Status, job.NativeJobID, nativeJobID); err != nil {
+		return k12.PracticePrintJob{}, err
 	}
 
 	var prepared k12.PracticeSetFields

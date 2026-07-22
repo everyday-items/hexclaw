@@ -97,3 +97,51 @@ func TestGenericPrintJobStorageRequiresReceiptAndBoundsRetry(t *testing.T) {
 		t.Fatal("outcome_unknown must not permit blind retry")
 	}
 }
+
+func TestGenericPrintCommitRequiresDialogBoundaryAndMatchesUnknownNativeJob(t *testing.T) {
+	store, _ := setup(t)
+	ctx := context.Background()
+	artifact := k12.PrintArtifact{ArtifactID: "part-boundary", AgentName: "mingming", SourceKind: k12.PrintSourcePrepCard,
+		SourceRef: "submission:boundary", Title: "辅导要点", CanonicalMarkdown: "# 卡片", SourceDigest: strings.Repeat("a", 64), CreatedAt: 100}
+	job := k12.GenericPrintJob{PrintJobID: "gprint-boundary", AgentName: "mingming", IdempotencyKey: "boundary",
+		RequestDigest: strings.Repeat("b", 64), ArtifactID: artifact.ArtifactID, PreparedAt: 100}
+	if _, _, err := store.PrepareGenericPrintJob(ctx, artifact, job); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := `{"printer":"Office","paper":"A4"}`
+	if _, err := store.CommitGenericPrintJob(ctx, "mingming", job.PrintJobID, "native-1", "receipt-1", snapshot, 101); err == nil {
+		t.Fatal("preparing must not commit without a proven dialog_open boundary")
+	}
+	if _, err := store.AdvanceGenericPrintJob(ctx, "mingming", job.PrintJobID, k12.PrintJobDialogOpen, "", "", "", 102); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CommitGenericPrintJob(ctx, "mingming", job.PrintJobID, "native-1", "receipt-1", snapshot, 103); err != nil {
+		t.Fatalf("dialog_open receipt should commit: %v", err)
+	}
+	if _, err := store.CommitGenericPrintJob(ctx, "mingming", job.PrintJobID, "native-1", "receipt-1", `{"paper":"A4","printer":"Office"}`, 104); err != nil {
+		t.Fatalf("snapshot key order must not change receipt identity: %v", err)
+	}
+	if _, err := store.CommitGenericPrintJob(ctx, "mingming", job.PrintJobID, "native-1", "receipt-1", `{"printer":"Office","paper":"Letter"}`, 105); err == nil {
+		t.Fatal("matching receipt IDs with a different snapshot must conflict")
+	}
+
+	unknownArtifact := artifact
+	unknownArtifact.ArtifactID, unknownArtifact.SourceRef = "part-unknown-boundary", "submission:unknown-boundary"
+	unknownJob := job
+	unknownJob.PrintJobID, unknownJob.IdempotencyKey, unknownJob.ArtifactID = "gprint-unknown-boundary", "unknown-boundary", unknownArtifact.ArtifactID
+	if _, _, err := store.PrepareGenericPrintJob(ctx, unknownArtifact, unknownJob); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AdvanceGenericPrintJob(ctx, "mingming", unknownJob.PrintJobID, k12.PrintJobDialogOpen, "", "", "", 106); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AdvanceGenericPrintJob(ctx, "mingming", unknownJob.PrintJobID, k12.PrintJobOutcomeUnknown, "native-known", "driver_result_ambiguous", "redacted", 107); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CommitGenericPrintJob(ctx, "mingming", unknownJob.PrintJobID, "native-other", "receipt-other", snapshot, 108); err == nil {
+		t.Fatal("outcome_unknown must reject a receipt for a different native job")
+	}
+	if _, err := store.CommitGenericPrintJob(ctx, "mingming", unknownJob.PrintJobID, "native-known", "receipt-known", snapshot, 109); err != nil {
+		t.Fatalf("matching reconciliation receipt should settle outcome_unknown: %v", err)
+	}
+}

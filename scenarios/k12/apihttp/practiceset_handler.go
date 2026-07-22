@@ -509,6 +509,49 @@ type practicePrintEventReq struct {
 	FailureDetail   string          `json:"failure_detail,omitempty"`
 }
 
+type practicePrintCommitReq struct {
+	Agent           string          `json:"agent"`
+	NativeJobID     string          `json:"native_job_id"`
+	NativeReceiptID string          `json:"native_receipt_id"`
+	PrinterSnapshot json.RawMessage `json:"printer_snapshot"`
+}
+
+// commitPracticePrintReceipt is the single success boundary for both generic
+// artifacts and practice baskets. The storage commit is idempotent for the
+// exact native receipt; practice baskets additionally finalize the frozen set
+// in the same SQLite transaction.
+func (h *handler) commitPracticePrintReceipt(w http.ResponseWriter, r *http.Request) {
+	var req practicePrintCommitReq
+	if !decode(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.Agent) == "" || strings.TrimSpace(req.NativeJobID) == "" ||
+		strings.TrimSpace(req.NativeReceiptID) == "" || len(req.PrinterSnapshot) == 0 {
+		writeErr(w, http.StatusBadRequest, "agent / native_job_id / native_receipt_id / printer_snapshot 必填")
+		return
+	}
+	event := usecase.PracticePrintEvent{
+		Status: k12.PrintJobPrinted, NativeJobID: req.NativeJobID,
+		NativeReceiptID: req.NativeReceiptID, PrinterSnapshot: string(req.PrinterSnapshot),
+	}
+	jobID := r.PathValue("id")
+	if isGenericPrintJobID(jobID) {
+		v, err := h.rt.Deps.RecordGenericPrintEvent(r.Context(), req.Agent, jobID, event)
+		if err != nil {
+			writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"print_job": toGenericPrintJobDTO(v)})
+		return
+	}
+	v, err := h.rt.Deps.RecordPracticePrintEvent(r.Context(), req.Agent, jobID, event)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"print_job": toPracticePrintJobDTO(v)})
+}
+
 func (h *handler) recordPracticePrintEvent(w http.ResponseWriter, r *http.Request) {
 	var req practicePrintEventReq
 	if !decode(w, r, &req) {
