@@ -13,7 +13,7 @@ import (
 // `\text{cm}^3`，数学符号没渲染。桌面 API 路径不像 IM egress 会过 NormalizeMathText。
 //
 // 治本：把数学归一化下沉到 engineadapter 的单一出站口（stripReports/GradeSubject 元数据），
-// 让 solve / grade 讲解 / 再练 / prep-card / 错因 全部拿到干净 Unicode。
+// 让 solve / grade 讲解 / 再练 / 辅导要点 / 错因全部拿到干净 Unicode。
 //
 // RED（fix 前）：Solution/ErrorCause 原样含 \( \times \text{ \frac $ → 断言失败。
 // GREEN（fix 后）：不含任何 LaTeX 痕迹、含 Unicode ×÷ 上下标。

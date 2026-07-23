@@ -73,7 +73,7 @@ Ready-to-use built-in skills (no install required, invoked via LLM tool_call):
 - **Native MCP Support** — Compatible with 3200+ MCP Servers (stdio + SSE + streamable transports)
 - **Markdown Skill Marketplace** — Compatible with OpenClaw skill format, lazy-loaded on demand
 - **Multi-Agent Routing** — Host multiple agents in one instance, route by platform/user/group
-- **K12 Parent-Tutoring Scenario Pack** — Built-in homework-image recognition/grading, mistake notebook, review variations, prep cards, grade constraints, and default cron delivery
+- **K12 Parent-Tutoring Scenario Pack** — Built-in homework-image recognition/grading, confirmation-triggered inline tutoring tips, mistake notebook, review variations, grade constraints, and default cron delivery
 - **Canvas / A2UI** — Agent-generated interactive UIs (charts, forms, kanban, and 8+ component types)
 - **Security Audit CLI** — `hexclaw security audit` one-click security check + remediation suggestions
 - **Voice Interaction** — STT/TTS transcription and synthesis with chained MiniMax / Edge / OpenAI / Azure TTS fallback
@@ -814,7 +814,7 @@ chore: build/toolchain updates
 **Scenario Packs & Records**
 - **Scenario extension seams** — Added the `scenario` registry for record collections, constraints, view slots, Agent modes, buttons, and eval suites without hard-coding business packages in the platform layer.
 - **Generic records** — Added `records.agent_records` with Agent isolation, schema validation, dedupe keys, due review queues, state transitions, and optimistic locking.
-- **K12 parent-tutoring pack** — Closed the loop from inline homework-image recognition, subject/problem labeling and blank-problem solving through grading, mistake correction, review variations, prep cards, and default cron delivery.
+- **K12 parent-tutoring pack** — Closed the loop from inline homework-image recognition, subject/problem labeling and blank-problem solving through grading, mistake correction, review variations, confirmation-triggered inline tutoring tips, and default cron delivery.
 
 **Models, Knowledge & Execution**
 - **Reasoning and multimodal routing** — Solving/grading can use a dedicated reasoning model; vision, embedding, and rerank calls route by purpose, and failover rebuilds requests for the target provider's locality.

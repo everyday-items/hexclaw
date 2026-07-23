@@ -24,7 +24,7 @@ type kbWriter interface {
 	AddDocument(ctx context.Context, title, content, source string) (*knowledge.Document, error)
 }
 
-// GroundingAdapter 用知识库检索备课卡①段的教材讲法。
+// GroundingAdapter retrieves textbook evidence for tutoring tips.
 type GroundingAdapter struct {
 	kb   kbQuerier
 	topK int
@@ -90,7 +90,8 @@ func (a *GroundingAdapter) AddGroundingSubject(ctx context.Context, agentName, s
 // Ground 检索某知识点的教材讲法（不分科旧接口，行为不变：只查不分科旧桶）。
 //
 // agent scope 通过 Document.Source 的 k12-agent:<base64(agentName)> 精确过滤下推到 KB 存储层；
-// 未按该约定入库的共享/旧文档不会被备课卡召回，安全地降级为“未校验”。
+// Documents outside this scope are not recalled and safely degrade to an
+// explicitly unverified explanation.
 func (a *GroundingAdapter) Ground(ctx context.Context, agentName, knowledgePoint, grade string) (string, bool, error) {
 	return a.groundBySources(ctx, agentName, knowledgePoint, grade, []string{GroundingSource(agentName)})
 }

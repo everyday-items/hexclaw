@@ -680,7 +680,7 @@ Config files are backward-compatible — upgrades typically require no config ch
 
 **"No LLM provider available"**
 
-The service can start, but chat, K12 recognition/grading, prep-card warmups, voice/media, and other provider-dependent features require at least one usable local or cloud provider:
+The service can start, but chat, K12 recognition/grading, provider-generated tutoring-tip explanations, voice/media, and other provider-dependent features require at least one usable local or cloud provider:
 
 ```bash
 export DEEPSEEK_API_KEY="sk-xxx"

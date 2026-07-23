@@ -53,7 +53,7 @@ func TestGenericPrintUsecaseRejectsEmptyPrinterSnapshot(t *testing.T) {
 	ctx := context.Background()
 	prepared, _, err := d.PrepareGenericPrint(ctx, usecase.PrepareGenericPrintRequest{
 		AgentName: "xiaoming", IdempotencyKey: "empty-snapshot",
-		SourceKind: k12.PrintSourcePrepCard, SourceRef: "submission:s1",
+		SourceKind: k12.PrintSourceTutoringTips, SourceRef: "submission:s1",
 		Title: "辅导要点", CanonicalMarkdown: "# 辅导要点",
 	})
 	if err != nil {

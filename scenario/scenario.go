@@ -41,7 +41,7 @@ type ViewExtension struct {
 	ComposerPlaceholder string   // composer 提示语（同一 composer，仅提示语变）
 	ComposerChips       []string // composer 预设 chip（由场景包声明）
 	RecordCollections   []string // 关联记录集
-	SidePanels          []string // 侧栏产物（如 prep-card）
+	SidePanels          []string // 可选侧栏产物
 	Actions             []string // 头部动作
 	I18nKeys            []string // 文案 key（三语）
 	SchemaVersion       int      // 描述符版本

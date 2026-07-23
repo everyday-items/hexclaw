@@ -18,7 +18,7 @@ import (
 )
 
 // WorkFeedbackGenerateFunc 是作品证据化点评的轻量生成闭包（composition root 注入，
-// 与 PrepReviewGenerateFunc 同模式）：单次 reasoning 生成，不派 verifier / 不
+// 与 TutoringTipsReviewGenerateFunc 同模式）：单次 reasoning 生成，不派 verifier / 不
 // self-consistency——点评是形成性反馈，不是判分，无需全对抗验算链。
 // subject 用中文学科名路由（写作=语文，美术=美术）；prompt 已含作品可见证据与红线指令。
 type WorkFeedbackGenerateFunc func(ctx context.Context, subject, prompt, grade string) (string, error)

@@ -93,9 +93,10 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("GET /insight-report", h.insightReport)
 	mux.HandleFunc("POST /mark-mastered", h.markMastered)
 	mux.HandleFunc("POST /review/retry", h.reviewRetry)
-	mux.HandleFunc("POST /prep-card", h.prepCard)
-	// DD-024：备课卡与作品点评共用持久投递回执；平台受理不等于已送达。
-	mux.HandleFunc("POST /prep-card/send", h.sendPrepCard)
+	mux.HandleFunc("POST /tutoring-tips", h.tutoringTips)
+	// DD-024: tutoring tips and creative-work feedback share durable delivery
+	// receipts; provider acceptance is not proof of delivery.
+	mux.HandleFunc("POST /tutoring-tips/send", h.sendTutoringTips)
 	mux.HandleFunc("GET /delivery-receipts/{id}", h.getDeliveryReceipt)
 	mux.HandleFunc("POST /delivery-receipts/{id}/retry", h.retryDeliveryReceipt)
 	mux.HandleFunc("POST /delivery-receipts/{id}/query", h.queryDeliveryReceipt)
@@ -369,9 +370,8 @@ func dominantSubject(qs []usecase.RecognizedQuestion) string {
 }
 
 // resolveGrade 年级确定性注入（AP-4 / PRD §3.3.3+§5.2.4）：未显式传年级时据 agent 从孩子档案
-// 取生效年级，供 solve/验算链携带年级边界，避免超纲解法。grade 不信客户端裸传——tutor-turn /
-// grade / prep-card 三个入口同一纪律（此前仅 tutor-turn/复习端点做了，/grade 与 /prep-card 裸传，
-// hex-test 审计发现的一致性缺口）。agent 空或档案缺失时回退原值（不阻断）。
+// 取生效年级，供仍接受年级字段的 solve/grade/tutor-turn 携带学段边界，避免超纲解法。
+// 辅导要点不接受客户端年级，而是从 owner-scoped 持久档案派生。agent 空或档案缺失时回退原值。
 func (h *handler) resolveGrade(ctx context.Context, agent, grade string) string {
 	if grade != "" || agent == "" {
 		return grade
@@ -668,12 +668,9 @@ func (h *handler) reviewRetry(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-type prepCardReq struct {
-	Agent string `json:"agent"`
-	Grade string `json:"grade"`
-	// Subject 当前题目学科（§4.3 分科教材）：①段优先检索本学科教材；空 = 不分科旧语义。
-	Subject         string   `json:"subject"`
-	KnowledgePoints []string `json:"knowledge_points"`
+type tutoringTipsReq struct {
+	Agent        string `json:"agent"`
+	GradingJobID string `json:"grading_job_id"`
 }
 
 type groundingReq struct {
@@ -684,7 +681,7 @@ type groundingReq struct {
 	Content string `json:"content"`
 }
 
-// addGrounding POST /grounding —— 家长教材按 agent（× 学科）scope 入库，与备课卡读侧同键。
+// addGrounding POST /grounding —— 家长教材按 agent（× 学科）scope 入库，与辅导要点读侧同键。
 func (h *handler) addGrounding(w http.ResponseWriter, r *http.Request) {
 	var req groundingReq
 	if !decode(w, r, &req) {
@@ -697,28 +694,35 @@ func (h *handler) addGrounding(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-type prepSectionDTO struct {
+type tutoringTipsSectionDTO struct {
 	Title       string `json:"title"`
 	Content     string `json:"content"`
 	SourceLabel string `json:"source_label"`
 }
 
-// prepCard POST /prep-card —— 生成一页备课卡（只读）。
-func (h *handler) prepCard(w http.ResponseWriter, r *http.Request) {
-	var req prepCardReq
-	if !decode(w, r, &req) {
+// tutoringTips POST /tutoring-tips builds the inline guidance projection from
+// one owner-scoped, confirmed GradingJob and its durable Problem/Attempt facts.
+func (h *handler) tutoringTips(w http.ResponseWriter, r *http.Request) {
+	var req tutoringTipsReq
+	if !decodeStrict(w, r, &req) {
 		return
 	}
-	card, err := h.rt.Deps.BuildPrepCardSubject(r.Context(), req.Agent, h.resolveGrade(r.Context(), req.Agent, req.Grade), req.Subject, req.KnowledgePoints)
+	if strings.TrimSpace(req.Agent) == "" || strings.TrimSpace(req.GradingJobID) == "" {
+		writeErr(w, http.StatusBadRequest, "agent / grading_job_id required")
+		return
+	}
+	tips, err := h.rt.Deps.BuildTutoringTips(r.Context(), req.Agent, req.GradingJobID)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
 	}
-	secs := make([]prepSectionDTO, 0, len(card.Sections))
-	for _, s := range card.Sections {
-		secs = append(secs, prepSectionDTO{Title: s.Title, Content: s.Content, SourceLabel: s.SourceLabel})
+	sections := make([]tutoringTipsSectionDTO, 0, len(tips.Sections))
+	for _, section := range tips.Sections {
+		sections = append(sections, tutoringTipsSectionDTO{
+			Title: section.Title, Content: section.Content, SourceLabel: section.SourceLabel,
+		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"knowledge_points": card.KnowledgePoints, "sections": secs})
+	writeJSON(w, http.StatusOK, map[string]any{"knowledge_points": tips.KnowledgePoints, "sections": sections})
 }
 
 type accumReq struct {
@@ -1418,9 +1422,20 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	return decodeLimit(w, r, v, 1<<20)
 }
 
+func decodeStrict(w http.ResponseWriter, r *http.Request, v any) bool {
+	return decodeLimitMode(w, r, v, 1<<20, true)
+}
+
 func decodeLimit(w http.ResponseWriter, r *http.Request, v any, maxBytes int64) bool {
+	return decodeLimitMode(w, r, v, maxBytes, false)
+}
+
+func decodeLimitMode(w http.ResponseWriter, r *http.Request, v any, maxBytes int64, strict bool) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	dec := json.NewDecoder(r.Body)
+	if strict {
+		dec.DisallowUnknownFields()
+	}
 	if err := dec.Decode(v); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {

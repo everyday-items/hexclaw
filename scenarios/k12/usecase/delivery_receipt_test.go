@@ -94,7 +94,7 @@ func TestDeliveryReceiptFailedRetryReusesFrozenReceipt(t *testing.T) {
 	}
 	d.Delivery = fake
 
-	failed, _, err := d.PrepareAndSendText(context.Background(), "xiaoming", "prep_card", "prep-1", "备课卡正文")
+	failed, _, err := d.PrepareAndSendText(context.Background(), "xiaoming", "tutoring_tips", "tutoring-tips-1", "辅导要点正文")
 	if err != nil || failed.Status != k12.DeliveryFailed || failed.Attempt != 1 {
 		t.Fatalf("first explicit failure must be durable: %+v err=%v", failed, err)
 	}
@@ -153,7 +153,7 @@ func TestDeliveryReceiptRestartRecoveryQueriesInFlightWithoutResend(t *testing.T
 		Status: k12.DeliverySending, ExternalMessageID: "process-query-key-restart",
 	}}
 	d.Delivery = fake
-	started, _, err := d.PrepareAndSendText(context.Background(), "xiaoming", "prep_card", "prep-restart", "备课卡正文")
+	started, _, err := d.PrepareAndSendText(context.Background(), "xiaoming", "tutoring_tips", "tutoring-tips-restart", "辅导要点正文")
 	if err != nil || started.Status != k12.DeliverySending {
 		t.Fatalf("seed in-flight receipt: %+v err=%v", started, err)
 	}

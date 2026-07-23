@@ -321,23 +321,22 @@ type Insights interface {
 	WriteWeakness(ctx context.Context, agentName, knowledgePoint, note string) error
 }
 
-// Grounding 备课卡①段知识点讲法检索 port（adapter = knowledge/RAG，按 agent_id scope）。
-// found=true 来自家长上传教材（可信）；false 时调用方降级为 LLM 生成并标未校验。
+// Grounding retrieves textbook evidence for the first tutoring-tips section
+// (adapter = knowledge/RAG, scoped by agent_id).
 type Grounding interface {
 	Ground(ctx context.Context, agentName, knowledgePoint, grade string) (text string, found bool, err error)
 }
 
-// PrepReviewGenerator 是备课卡①段在教材未命中时的单次 AI 回顾生成 port。
-// 它只生成按年级约束的讲法，不走 solve/verifier，也不得被标为程序验算结果。
-type PrepReviewGenerator interface {
-	GeneratePrepReview(ctx context.Context, subject, knowledgePoint, grade string) (string, error)
+// TutoringTipsReviewGenerator produces one bounded explanation when textbook
+// evidence is unavailable. It does not enter the grading solve pipeline.
+type TutoringTipsReviewGenerator interface {
+	GenerateTutoringTipsReview(ctx context.Context, subject, knowledgePoint, grade string) (string, error)
 }
 
-// GroundedPrepReviewGenerator 把教材检索结果视为模型证据，而不是可直接展示的 UI 文本。
-// 可选能力：旧实现仍可只实现 PrepReviewGenerator；生产 SolveAdapter 实现本接口后，
-// 备课卡会把证据整理成适龄 Markdown，并用 $...$ / $$...$$ 表达数学公式。
-type GroundedPrepReviewGenerator interface {
-	GenerateGroundedPrepReview(ctx context.Context, subject, knowledgePoint, grade, evidence string) (string, error)
+// GroundedTutoringTipsReviewGenerator turns retrieved textbook evidence into
+// parent-facing Markdown while preserving the evidence boundary.
+type GroundedTutoringTipsReviewGenerator interface {
+	GenerateGroundedTutoringTipsReview(ctx context.Context, subject, knowledgePoint, grade, evidence string) (string, error)
 }
 
 // GroundingWriter 是教材 grounding 的写缝；与 Grounding 使用同一 agent scope。

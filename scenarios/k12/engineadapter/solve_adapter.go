@@ -6,10 +6,12 @@ package engineadapter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/skill"
@@ -39,17 +41,17 @@ type RetryGenerateFunc func(ctx context.Context, subject, prompt, grade string) 
 // “必须出题”的系统提示覆盖“只输出错因”的用户提示。
 type CauseSummaryGenerateFunc func(ctx context.Context, subject, prompt, grade string) (string, error)
 
-// PrepReviewGenerateFunc 是教材未命中时的轻量知识点回顾闭包。与变式出题分开，避免出题系统提示
-// 污染“不要出题、不要伪造教材引用”的备课回顾任务。
-type PrepReviewGenerateFunc func(ctx context.Context, subject, prompt, grade string) (string, error)
+// TutoringTipsReviewGenerateFunc is the bounded explanation closure used when
+// textbook evidence is unavailable. It is isolated from exercise generation.
+type TutoringTipsReviewGenerateFunc func(ctx context.Context, subject, prompt, grade string) (string, error)
 
 // SolveAdapter 用 engine 的 solve skill 实现用例层的 Solver + Grader 两个 port。
 type SolveAdapter struct {
-	exec            SolveExecutor
-	retryGen        RetryGenerateFunc        // 轻量「再练一道」出题；nil 时回退全链
-	causeSummaryGen CauseSummaryGenerateFunc // 轻量错因摘要；nil 时留空由用户填写
-	prepReviewGen   PrepReviewGenerateFunc   // 轻量备课回顾；nil 时由用例层诚实降级
-	workFeedbackGen WorkFeedbackGenerateFunc // 作品点评生成（work_feedback.go）；nil 时诚实报错
+	exec                  SolveExecutor
+	retryGen              RetryGenerateFunc              // 轻量「再练一道」出题；nil 时回退全链
+	causeSummaryGen       CauseSummaryGenerateFunc       // 轻量错因摘要；nil 时留空由用户填写
+	tutoringTipsReviewGen TutoringTipsReviewGenerateFunc // nil means an honest static degradation
+	workFeedbackGen       WorkFeedbackGenerateFunc       // 作品点评生成（work_feedback.go）；nil 时诚实报错
 	// workFeedbackVision 美术作品观察式点评的视觉闭包（work_feedback.go）：复用识题链的
 	// VisionFunc 原语（原图 bytes + 提示词 → 视觉模型文本）；nil 时美术点评诚实报错。
 	workFeedbackVision VisionFunc
@@ -71,9 +73,9 @@ func WithCauseSummaryGen(fn CauseSummaryGenerateFunc) SolveAdapterOption {
 	return func(a *SolveAdapter) { a.causeSummaryGen = fn }
 }
 
-// WithPrepReviewGen 注入专用备课回顾闭包。
-func WithPrepReviewGen(fn PrepReviewGenerateFunc) SolveAdapterOption {
-	return func(a *SolveAdapter) { a.prepReviewGen = fn }
+// WithTutoringTipsReviewGen injects the dedicated explanation closure.
+func WithTutoringTipsReviewGen(fn TutoringTipsReviewGenerateFunc) SolveAdapterOption {
+	return func(a *SolveAdapter) { a.tutoringTipsReviewGen = fn }
 }
 
 // SetRetryGen 事后注入轻量出题闭包（composition root 在 Deps.Solver 建好后回填）。
@@ -82,8 +84,10 @@ func (a *SolveAdapter) SetRetryGen(fn RetryGenerateFunc) { a.retryGen = fn }
 // SetCauseSummaryGen 事后注入专用错因摘要闭包。
 func (a *SolveAdapter) SetCauseSummaryGen(fn CauseSummaryGenerateFunc) { a.causeSummaryGen = fn }
 
-// SetPrepReviewGen 事后注入专用备课回顾闭包。
-func (a *SolveAdapter) SetPrepReviewGen(fn PrepReviewGenerateFunc) { a.prepReviewGen = fn }
+// SetTutoringTipsReviewGen injects the explanation closure after composition.
+func (a *SolveAdapter) SetTutoringTipsReviewGen(fn TutoringTipsReviewGenerateFunc) {
+	a.tutoringTipsReviewGen = fn
+}
 
 // NewSolveAdapter 创建 adapter。s 通常是 engine.NewSolveSkill(...) 的产物。
 func NewSolveAdapter(s SolveExecutor, opts ...SolveAdapterOption) *SolveAdapter {
@@ -95,12 +99,12 @@ func NewSolveAdapter(s SolveExecutor, opts ...SolveAdapterOption) *SolveAdapter 
 }
 
 var (
-	_ usecase.Solver                 = (*SolveAdapter)(nil)
-	_ usecase.Grader                 = (*SolveAdapter)(nil)
-	_ usecase.VerifiedSolutionGrader = (*SolveAdapter)(nil)
-	_ usecase.RetryGenerator         = (*SolveAdapter)(nil)
-	_ usecase.CauseSummarizer        = (*SolveAdapter)(nil)
-	_ usecase.PrepReviewGenerator    = (*SolveAdapter)(nil)
+	_ usecase.Solver                      = (*SolveAdapter)(nil)
+	_ usecase.Grader                      = (*SolveAdapter)(nil)
+	_ usecase.VerifiedSolutionGrader      = (*SolveAdapter)(nil)
+	_ usecase.RetryGenerator              = (*SolveAdapter)(nil)
+	_ usecase.CauseSummarizer             = (*SolveAdapter)(nil)
+	_ usecase.TutoringTipsReviewGenerator = (*SolveAdapter)(nil)
 )
 
 // Solve 实现 usecase.Solver：调 solve skill 解题验算（透传 grade + constraint 约束年级边界），
@@ -126,7 +130,7 @@ func (a *SolveAdapter) SolveSubject(ctx context.Context, subject, problem, grade
 	}
 	res, err := a.exec.Execute(ctx, args)
 	if err != nil {
-		return usecase.SolveResult{}, err
+		return usecase.SolveResult{}, providerResponseError(err)
 	}
 	if res == nil {
 		return usecase.SolveResult{}, fmt.Errorf("solve adapter: empty solve result")
@@ -180,39 +184,39 @@ func (a *SolveAdapter) SummarizeCause(ctx context.Context, subject, question, st
 	return stripReports(out), nil
 }
 
-// GeneratePrepReview 在教材未命中时复用裸 reasoning completion 生成按年级约束的知识点回顾。
-// 不回退 SolveExecutor：备课讲法不需要全对抗验算链；无闭包时返回空，让用例层诚实标静态降级。
-func (a *SolveAdapter) GeneratePrepReview(ctx context.Context, subject, knowledgePoint, grade string) (string, error) {
-	if a.prepReviewGen == nil {
+// GenerateTutoringTipsReview uses one reasoning completion for a grade-bounded
+// explanation. It never enters the adversarial grading pipeline.
+func (a *SolveAdapter) GenerateTutoringTipsReview(ctx context.Context, subject, knowledgePoint, grade string) (string, error) {
+	if a.tutoringTipsReviewGen == nil {
 		return "", nil
 	}
 	prompt := "为家长生成一段中小学知识点回顾。使用简洁 Markdown；数学公式必须使用 $...$ 或 $$...$$ 的 LaTeX，" +
 		"不要用空格/换行拼分数。只讲核心概念、孩子常见卡点和一句引导话术，控制在120字内；" +
 		"不要出题、不要假称引用教材、不要输出未经提供的课本原文。知识点：" + knowledgePoint
-	out, err := a.prepReviewGen(ctx, subject, prompt, grade)
+	out, err := a.tutoringTipsReviewGen(ctx, subject, prompt, grade)
 	if err != nil {
 		return "", err
 	}
-	return prepMarkdown(out), nil
+	return tutoringTipsMarkdown(out), nil
 }
 
-// GenerateGroundedPrepReview 用检索到的教材正文作为证据，生成面向家长的适龄教学 Markdown。
-// 证据不直接透传到 UI；模型只允许整理证据，不得补写教材中没有的事实。
-func (a *SolveAdapter) GenerateGroundedPrepReview(ctx context.Context, subject, knowledgePoint, grade, evidence string) (string, error) {
-	if a.prepReviewGen == nil {
+// GenerateGroundedTutoringTipsReview turns textbook evidence into concise
+// parent-facing Markdown without adding unsupported facts.
+func (a *SolveAdapter) GenerateGroundedTutoringTipsReview(ctx context.Context, subject, knowledgePoint, grade, evidence string) (string, error) {
+	if a.tutoringTipsReviewGen == nil {
 		return "", nil
 	}
 	prompt := "请把下面教材证据整理成家长可直接照着讲的知识点回顾。输出简洁 Markdown，包含核心概念、常见卡点、" +
 		"一句引导话术；数学公式必须使用 $...$ 或 $$...$$ 的 LaTeX，不要用空格/换行拼分数；不得输出文档ID、相关度、" +
 		"检索参考编号，也不得补写证据中没有的事实。控制在180字内。\n知识点：" + knowledgePoint + "\n教材证据：\n" + evidence
-	out, err := a.prepReviewGen(ctx, subject, prompt, grade)
+	out, err := a.tutoringTipsReviewGen(ctx, subject, prompt, grade)
 	if err != nil {
 		return "", err
 	}
-	return prepMarkdown(out), nil
+	return tutoringTipsMarkdown(out), nil
 }
 
-func prepMarkdown(content string) string {
+func tutoringTipsMarkdown(content string) string {
 	if i := strings.Index(content, reportSentinel); i >= 0 {
 		content = content[:i]
 	}
@@ -247,7 +251,7 @@ func (a *SolveAdapter) GradeVerified(ctx context.Context, subject, problem, stud
 
 func gradeOutcomeFromResult(res *skill.Result, err error) (usecase.GradeOutcome, error) {
 	if err != nil {
-		return usecase.GradeOutcome{}, err
+		return usecase.GradeOutcome{}, providerResponseError(err)
 	}
 	if res == nil {
 		return usecase.GradeOutcome{}, fmt.Errorf("solve adapter: empty grading result")
@@ -280,6 +284,38 @@ func gradeOutcomeFromResult(res *skill.Result, err error) (usecase.GradeOutcome,
 	}, nil
 }
 
+type definitiveProviderResponseError struct {
+	statusCode int
+	cause      error
+}
+
+func (e *definitiveProviderResponseError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *definitiveProviderResponseError) Unwrap() error {
+	return e.cause
+}
+
+func (e *definitiveProviderResponseError) ProviderResponseStatusCode() int {
+	return e.statusCode
+}
+
+// providerResponseError translates the concrete ai-core transport error into
+// the usecase port's narrow outcome contract. The usecase layer therefore does
+// not depend on ai-core, while still distinguishing an HTTP response (safe to
+// retry according to policy) from EOF/reset/timeout after send (ambiguous).
+func providerResponseError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var providerErr *llm.ProviderError
+	if errors.As(err, &providerErr) && providerErr != nil && providerErr.StatusCode > 0 {
+		return &definitiveProviderResponseError{statusCode: providerErr.StatusCode, cause: err}
+	}
+	return err
+}
+
 // evidenceFromMeta 把 solve 的 Metadata 映射成证据对象。
 //
 // 关键（信任红线，§5.3.2/§8.1）：强徽章「已程序验算」只在 solve 通过 code_exec 或本机
@@ -306,7 +342,7 @@ func evidenceFromMeta(m map[string]string) usecase.SolveEvidence {
 	return ev
 }
 
-// stripReports 是 K12 解答文本出站的单一归一化 chokepoint（solve/grade 讲解/再练/prep-card/错因归纳都过它）：
+// stripReports 是 K12 解答文本出站的单一归一化 chokepoint（solve/grade 讲解/再练/辅导要点/错因归纳都过它）：
 //  1. 剥掉解题文本尾部的子 Agent 回执围栏，只留教学解题正文；
 //  2. 数学 LaTeX → Unicode（adapter.NormalizeMathText：\times→× / \frac{a}{b}→a/b / \text{cm}^3→cm³ /
 //     剥 \(…\)\[…\]$…$）。治本 BUG-20260713：桌面 API 路径不经 IM egress，此前原样漏 LaTeX 给前端。

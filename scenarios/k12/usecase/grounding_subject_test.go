@@ -3,7 +3,6 @@ package usecase_test
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
@@ -95,52 +94,5 @@ func TestAddGrounding_SubjectWithoutCapabilityRejected(t *testing.T) {
 	// 不带学科仍可写（旧语义不受影响）。
 	if err := d.AddGrounding(context.Background(), "mingming", "", "教材", "内容"); err != nil {
 		t.Fatalf("旧语义写入应可用: %v", err)
-	}
-}
-
-// TestBuildPrepCardSubject_PrefersSubjectTextbook 注入侧契约：备课卡按当前题目学科
-// 检索本学科教材（数学题带数学 subject 下推，不再裸查全部）。
-func TestBuildPrepCardSubject_PrefersSubjectTextbook(t *testing.T) {
-	d := newDataDeps(t)
-	spy := &subjectGroundingSpy{text: "小数乘法竖式教材讲法"}
-	d.Grounding = spy
-	ctx := context.Background()
-
-	card, err := d.BuildPrepCardSubject(ctx, "xiaoming", "五年级上", "数学", []string{"小数乘法"})
-	if err != nil {
-		t.Fatalf("BuildPrepCardSubject: %v", err)
-	}
-	if len(spy.queried) != 1 || spy.queried[0] != "数学" {
-		t.Fatalf("检索应携带学科 数学, got %v (legacy=%d)", spy.queried, spy.legacyQueried)
-	}
-	if !strings.Contains(card.Sections[0].Content, "小数乘法竖式教材讲法") ||
-		card.Sections[0].SourceLabel != usecase.SrcTextbook {
-		t.Fatalf("①段应命中教材: %+v", card.Sections[0])
-	}
-
-	// 非法学科从紧拒绝。
-	if _, err := d.BuildPrepCardSubject(ctx, "xiaoming", "五年级上", "体育", []string{"x"}); !errors.Is(err, usecase.ErrInvalidInput) {
-		t.Fatalf("非法学科应拒: %v", err)
-	}
-}
-
-// TestBuildPrepCard_LegacyNoSubjectCompatible 旧入口不带学科：分科读侧收到空 subject
-// （不分科旧语义），老 adapter（无分科能力）仍走旧 Ground。
-func TestBuildPrepCard_LegacyNoSubjectCompatible(t *testing.T) {
-	d := newDataDeps(t)
-	spy := &subjectGroundingSpy{text: "通用教材讲法"}
-	d.Grounding = spy
-	ctx := context.Background()
-	if _, err := d.BuildPrepCard(ctx, "xiaoming", "五年级上", []string{"小数乘法"}); err != nil {
-		t.Fatalf("BuildPrepCard: %v", err)
-	}
-	if len(spy.queried) != 1 || spy.queried[0] != "" {
-		t.Fatalf("旧入口应以空学科检索, got %v", spy.queried)
-	}
-
-	legacy := &legacyGroundingSpy{}
-	d.Grounding = legacy
-	if _, err := d.BuildPrepCardSubject(ctx, "xiaoming", "五年级上", "数学", []string{"小数乘法"}); err != nil {
-		t.Fatalf("老 adapter 兼容: %v", err)
 	}
 }

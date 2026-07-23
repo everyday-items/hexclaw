@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS k12_print_artifacts (
     artifact_id        TEXT    PRIMARY KEY,
     agent_name         TEXT    NOT NULL REFERENCES agents(name) ON DELETE CASCADE,
     source_kind        TEXT    NOT NULL CHECK(source_kind IN
-        ('prep_card','creative_observation_card','practice_question','practice_answer')),
+        ('tutoring_tips','creative_observation_card','practice_question','practice_answer')),
     source_ref         TEXT    NOT NULL CHECK(length(trim(source_ref)) BETWEEN 1 AND 512),
     title              TEXT    NOT NULL CHECK(length(trim(title)) BETWEEN 1 AND 256),
     canonical_markdown TEXT    NOT NULL CHECK(length(trim(canonical_markdown)) BETWEEN 1 AND 4194304),

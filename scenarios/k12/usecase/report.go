@@ -9,6 +9,8 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
+const repeatedUnmasteredThreshold = 2
+
 // TrendCounts 进步趋势（PRD §3.5.4 顶部行「已掌握 X·待复习 Y·已重做 Z」）。
 type TrendCounts struct {
 	Mastered  int `json:"mastered"`  // 已掌握
@@ -85,7 +87,7 @@ func (d Deps) InsightReport(ctx context.Context, agentName string) (InsightRepor
 		return InsightReport{}, err
 	}
 	rep.ReviewCompletionRate = rate
-	rep.ConsecutiveFailKPs = keysAtLeast(failCount, consecutiveFailThreshold)
+	rep.ConsecutiveFailKPs = keysAtLeast(failCount, repeatedUnmasteredThreshold)
 	rep.Suggestion = buildSuggestion(rep)
 	return rep, nil
 }

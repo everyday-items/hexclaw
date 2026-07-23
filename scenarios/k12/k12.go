@@ -1,5 +1,5 @@
 // Package k12 是 K12 家长辅导场景包——**平台里唯一允许出现领域词**
-// （错题本 / 年级 / 复习 / 备课卡 / 孩子）的地方（架构 §6.5）。
+// （错题本 / 年级 / 复习 / 辅导要点 / 孩子）的地方（架构 §6.5）。
 //
 // 它通过 scenario 六缝声明式接入平台；engine/records/router/chat shell 不认识 K12。
 // 删掉本目录后，Assemble 不再发生，平台回到干净通用形态（AP-1 反向门）。
@@ -179,9 +179,8 @@ func Pack(constraint scenario.ConstraintProvider) *scenario.Pack {
 				ComposerPlaceholder: "发消息、粘贴带分数/公式的题目，或 ⌘V 粘贴作业照片",
 				ComposerChips:       []string{"📚 自动识别学科", "💡 渐进提示", "📷 识题校验"},
 				RecordCollections:   []string{CollectionMistakes, CollectionPracticeSet, CollectionAccumulation, CollectionCreativeWork},
-				// 备课卡独立侧栏/头部动作已退役（执行计划 §3.4）：辅导要点内联进识题流
-				// （前端 descriptor.ts sidePanels 亦为空），IA 定稿头部无 prep-card 动作；
-				// POST /prep-card 数据端点保留，仅供内联辅导要点取数。
+				// 辅导要点只在识题确认后内联呈现；当前 IA 不声明独立侧栏或头部动作，
+				// 因而 SidePanels 与 Actions 保持空集合。
 				I18nKeys:      []string{"k12.tab.tutor", "k12.tab.archive", "k12.tab.insights"},
 				SchemaVersion: 1,
 			},

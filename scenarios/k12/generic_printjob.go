@@ -1,7 +1,7 @@
 package k12
 
 const (
-	PrintSourcePrepCard            = "prep_card"
+	PrintSourceTutoringTips        = "tutoring_tips"
 	PrintSourceCreativeObservation = "creative_observation_card"
 	PrintSourcePracticeQuestion    = "practice_question"
 	PrintSourcePracticeAnswer      = "practice_answer"
@@ -10,7 +10,7 @@ const (
 
 func GenericPrintSourceKindAllowed(kind string) bool {
 	switch kind {
-	case PrintSourcePrepCard, PrintSourceCreativeObservation,
+	case PrintSourceTutoringTips, PrintSourceCreativeObservation,
 		PrintSourcePracticeQuestion, PrintSourcePracticeAnswer:
 		return true
 	default:
@@ -32,7 +32,7 @@ type PrintArtifact struct {
 }
 
 // GenericPrintJob records native-print state without changing the source
-// CreativeWork, PrepCard or already-finalized PracticeSet.
+// CreativeWork, TutoringTips or already-finalized PracticeSet.
 type GenericPrintJob struct {
 	PrintJobID      string `json:"print_job_id"`
 	AgentName       string `json:"agent_name"`

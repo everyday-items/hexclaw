@@ -11,22 +11,22 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
-type prepCardSendReq struct {
+type tutoringTipsSendReq struct {
 	Agent   string `json:"agent"`
 	Content string `json:"content"`
 }
 
-func prepCardObjectID(agentName, content string) string {
+func tutoringTipsObjectID(agentName, content string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(agentName) + "\x00" + strings.TrimSpace(content)))
-	return "prep-card:" + hex.EncodeToString(sum[:])
+	return "tutoring-tips:" + hex.EncodeToString(sum[:])
 }
 
-// sendPrepCard POST /prep-card/send sends the already rendered in-session card
+// sendTutoringTips POST /tutoring-tips/send sends the already rendered inline guidance
 // without re-running its model/grounding pipeline. The exact text is frozen in
 // the Receipt before any provider request.
-func (h *handler) sendPrepCard(w http.ResponseWriter, r *http.Request) {
-	var req prepCardSendReq
-	if !decode(w, r, &req) {
+func (h *handler) sendTutoringTips(w http.ResponseWriter, r *http.Request) {
+	var req tutoringTipsSendReq
+	if !decodeStrict(w, r, &req) {
 		return
 	}
 	req.Agent = strings.TrimSpace(req.Agent)
@@ -36,7 +36,7 @@ func (h *handler) sendPrepCard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	receipt, _, err := h.rt.Deps.PrepareAndSendText(
-		r.Context(), req.Agent, "prep_card", prepCardObjectID(req.Agent, req.Content), req.Content,
+		r.Context(), req.Agent, "tutoring_tips", tutoringTipsObjectID(req.Agent, req.Content), req.Content,
 	)
 	if err != nil {
 		writeDeliveryError(w, err)

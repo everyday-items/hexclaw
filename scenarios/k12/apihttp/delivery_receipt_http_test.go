@@ -130,18 +130,18 @@ func TestFailedReceiptHasExplicitSafeRetryAndUnknownRejectsIt(t *testing.T) {
 	}
 }
 
-func TestPrepCardSendUsesTheSameDurableReceiptProtocol(t *testing.T) {
+func TestTutoringTipsSendUsesTheSameDurableReceiptProtocol(t *testing.T) {
 	delivery := &httpReceiptTransport{send: []usecase.DeliveryTransportAck{{
-		Status: k12.DeliverySending, ExternalMessageID: "pqk-prep",
+		Status: k12.DeliverySending, ExternalMessageID: "pqk-tips",
 	}}}
 	h := newServerWithReceiptTransport(t, delivery)
-	rec, out := do(t, h, "POST", "/prep-card/send", `{
+	rec, out := do(t, h, "POST", "/tutoring-tips/send", `{
 		"agent":"mingming","content":"【这份作业的辅导要点】五年级下\n知识点回顾\n小数乘法"
 	}`)
-	if rec.Code != http.StatusOK || out["status"] != "sending" || out["object_kind"] != "prep_card" {
-		t.Fatalf("prep-card send must return durable receipt: %d %v", rec.Code, out)
+	if rec.Code != http.StatusOK || out["status"] != "sending" || out["object_kind"] != "tutoring_tips" {
+		t.Fatalf("tutoring-tips send must return durable receipt: %d %v", rec.Code, out)
 	}
 	if len(delivery.content) != 1 || delivery.content[0] == "" {
-		t.Fatalf("prep-card content was not sent: %v", delivery.content)
+		t.Fatalf("tutoring-tips content was not sent: %v", delivery.content)
 	}
 }

@@ -2,9 +2,11 @@ package engineadapter
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/skill"
@@ -15,14 +17,56 @@ type fakeExec struct {
 	solveResult *skill.Result
 	gradeResult *skill.Result
 	lastArgs    map[string]any
+	err         error
 }
 
 func (f *fakeExec) Execute(_ context.Context, args map[string]any) (*skill.Result, error) {
 	f.lastArgs = args
+	if f.err != nil {
+		return nil, f.err
+	}
 	if _, grading := args["student_answer"]; grading {
 		return f.gradeResult, nil
 	}
 	return f.solveResult, nil
+}
+
+func TestSolveAdapterTranslatesOnlyDefinitiveProviderResponses(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		provider   error
+		definitive bool
+	}{
+		{
+			name: "http response",
+			provider: &llm.ProviderError{
+				Provider: "test", StatusCode: 503, Status: "503 Service Unavailable",
+			},
+			definitive: true,
+		},
+		{
+			name: "transport failure",
+			provider: &llm.ProviderError{
+				Provider: "test", Cause: errors.New("connection reset"),
+			},
+			definitive: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := NewSolveAdapter(&fakeExec{err: tc.provider})
+			_, err := a.Solve(context.Background(), "1+1=?", "五年级上", "")
+			var response usecase.DefinitiveProviderResponse
+			if got := errors.As(err, &response); got != tc.definitive {
+				t.Fatalf("definitive=%v, want %v, err=%v", got, tc.definitive, err)
+			}
+			if tc.definitive && response.ProviderResponseStatusCode() != 503 {
+				t.Fatalf("status=%d, want 503", response.ProviderResponseStatusCode())
+			}
+			if !errors.Is(err, tc.provider) {
+				t.Fatalf("adapter lost original error identity: %v", err)
+			}
+		})
+	}
 }
 
 func TestSolveAdapter_Solve_AgreeStrong(t *testing.T) {
@@ -226,10 +270,10 @@ func TestSolveAdapter_GenerateSimilar_UsesBareClosure_NotReActExecutor(t *testin
 	}
 }
 
-func TestSolveAdapter_GeneratePrepReview_UsesBareClosure_NotReActExecutor(t *testing.T) {
+func TestSolveAdapter_GenerateTutoringTipsReview_UsesBareClosure_NotReActExecutor(t *testing.T) {
 	exec := &countingExec{}
 	closureCalls := 0
-	a := NewSolveAdapter(exec, WithPrepReviewGen(func(_ context.Context, subject, prompt, grade string) (string, error) {
+	a := NewSolveAdapter(exec, WithTutoringTipsReviewGen(func(_ context.Context, subject, prompt, grade string) (string, error) {
 		closureCalls++
 		if subject != "数学" || grade != "五年级上" || !strings.Contains(prompt, "简易方程") {
 			t.Fatalf("备课回顾 prompt 未透传上下文: subject=%q grade=%q prompt=%q", subject, grade, prompt)
@@ -237,7 +281,7 @@ func TestSolveAdapter_GeneratePrepReview_UsesBareClosure_NotReActExecutor(t *tes
 		return "先找等量关系，再利用等式性质逐步求解。\n\n```hexclaw-subagents\n[{\"Agent\":\"solver\"}]\n```", nil
 	}))
 
-	got, err := a.GeneratePrepReview(context.Background(), "数学", "简易方程", "五年级上")
+	got, err := a.GenerateTutoringTipsReview(context.Background(), "数学", "简易方程", "五年级上")
 	if err != nil {
 		t.Fatal(err)
 	}

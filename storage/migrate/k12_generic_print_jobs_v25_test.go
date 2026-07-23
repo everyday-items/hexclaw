@@ -37,7 +37,7 @@ func TestK12GenericPrintJobsV25InstallsImmutableArtifactsAndDurableJobs(t *testi
 	}
 	if _, err := db.Exec(`INSERT INTO k12_print_artifacts
 		(artifact_id,agent_name,source_kind,source_ref,title,canonical_markdown,source_digest,created_at)
-		VALUES('part-1','ming','prep_card','submission:s1','辅导要点','# 原稿','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1)`); err != nil {
+		VALUES('part-1','ming','tutoring_tips','submission:s1','辅导要点','# 原稿','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`UPDATE k12_print_artifacts SET canonical_markdown='# 被篡改' WHERE artifact_id='part-1'`); err == nil {
@@ -75,7 +75,7 @@ func TestK12GenericPrintJobsV25AgentCascadeClearsArtifactAndJobTogether(t *testi
 	if _, err := db.Exec(`INSERT INTO agents(name) VALUES('ming');
 		INSERT INTO k12_print_artifacts
 		(artifact_id,agent_name,source_kind,source_ref,title,canonical_markdown,source_digest,created_at)
-		VALUES('part-1','ming','prep_card','submission:s1','辅导要点','# 原稿','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1);
+		VALUES('part-1','ming','tutoring_tips','submission:s1','辅导要点','# 原稿','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1);
 		INSERT INTO k12_generic_print_jobs
 		(print_job_id,agent_name,idempotency_key,request_digest,artifact_id,status,attempt_count,
 		 prepared_at,created_at,updated_at)

@@ -14,7 +14,7 @@ func TestGenericPrintJobStorageFreezesArtifactAndScopesIdempotency(t *testing.T)
 	store, _ := setup(t)
 	ctx := context.Background()
 	artifact := k12.PrintArtifact{
-		ArtifactID: "part-a", AgentName: "mingming", SourceKind: k12.PrintSourcePrepCard,
+		ArtifactID: "part-a", AgentName: "mingming", SourceKind: k12.PrintSourceTutoringTips,
 		SourceRef: "submission:s1", Title: "这份作业的辅导要点",
 		CanonicalMarkdown: "# 辅导要点\n\n小数点对齐", SourceDigest: strings.Repeat("a", 64), CreatedAt: 100,
 	}
@@ -101,7 +101,7 @@ func TestGenericPrintJobStorageRequiresReceiptAndBoundsRetry(t *testing.T) {
 func TestGenericPrintCommitRequiresDialogBoundaryAndMatchesUnknownNativeJob(t *testing.T) {
 	store, _ := setup(t)
 	ctx := context.Background()
-	artifact := k12.PrintArtifact{ArtifactID: "part-boundary", AgentName: "mingming", SourceKind: k12.PrintSourcePrepCard,
+	artifact := k12.PrintArtifact{ArtifactID: "part-boundary", AgentName: "mingming", SourceKind: k12.PrintSourceTutoringTips,
 		SourceRef: "submission:boundary", Title: "辅导要点", CanonicalMarkdown: "# 卡片", SourceDigest: strings.Repeat("a", 64), CreatedAt: 100}
 	job := k12.GenericPrintJob{PrintJobID: "gprint-boundary", AgentName: "mingming", IdempotencyKey: "boundary",
 		RequestDigest: strings.Repeat("b", 64), ArtifactID: artifact.ArtifactID, PreparedAt: 100}

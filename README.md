@@ -73,7 +73,7 @@
 - **MCP 原生支持** — 兼容 3200+ MCP Server（stdio + SSE + streamable 传输）
 - **Markdown 技能市场** — 兼容 OpenClaw 技能格式，按需延迟加载
 - **多 Agent 路由** — 一个实例托管多个 Agent，按平台/用户/群组路由
-- **K12 家长辅导场景包** — 出厂内置作业图片识题/批改、错题本、变式复习、备课卡、年级约束和默认 cron 投递
+- **K12 家长辅导场景包** — 出厂内置作业图片识题/批改、确认后内联辅导要点、错题本、变式复习、年级约束和默认 cron 投递
 - **Canvas / A2UI** — Agent 生成交互式 UI（图表、表单、看板等 8 种组件）
 - **安全审计 CLI** — `hexclaw security audit` 一键安全检查 + 修复建议
 - **语音交互** — STT/TTS 转写与合成，支持 MiniMax / Edge / OpenAI / Azure TTS 串联 fallback
@@ -812,7 +812,7 @@ chore: 构建/工具链
 **场景包与记录系统**
 - **场景包六缝扩展** — 新增 `scenario` 注册表，统一注入记录集、约束、视图槽、Agent mode、按钮和 eval suite，平台层不硬编码业务包。
 - **通用记录本** — 新增 `records.agent_records`，以 Agent 为隔离键，支持 schema 校验、去重键、到期复习队列、状态机和乐观锁。
-- **K12 家长辅导包** — 打通作业图片识题内联回显、学科/题型标注、空白题求解、批改入本、错题纠正、变式复习、备课卡与默认 cron 投递。
+- **K12 家长辅导包** — 打通作业图片识题内联回显、学科/题型标注、空白题求解、批改入本、错题纠正、变式复习、确认后内联辅导要点与默认 cron 投递。
 
 **模型、知识与执行**
 - **推理与多模态路由** — 解题/批改使用专用 reasoning model；视觉、embedding、rerank 按用途选路，failover 时重建符合目标 locality 的请求。

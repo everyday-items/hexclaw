@@ -44,7 +44,7 @@ func WithInsights(ins usecase.Insights) Option {
 	return func(d *usecase.Deps) { d.Insights = ins }
 }
 
-// WithGrounding 注入备课卡①段教材检索 adapter（knowledge/RAG）。
+// WithGrounding injects textbook retrieval for tutoring tips.
 func WithGrounding(g usecase.Grounding) Option {
 	return func(d *usecase.Deps) { d.Grounding = g }
 }
@@ -125,11 +125,12 @@ func WithCauseSummaryGenerator(fn engineadapter.CauseSummaryGenerateFunc) Option
 	}
 }
 
-// WithPrepReviewGenerator 注入教材未命中时的专用知识点回顾闭包。
-func WithPrepReviewGenerator(fn engineadapter.PrepReviewGenerateFunc) Option {
+// WithTutoringTipsReviewGenerator injects the bounded explanation generator
+// used when textbook evidence is unavailable.
+func WithTutoringTipsReviewGenerator(fn engineadapter.TutoringTipsReviewGenerateFunc) Option {
 	return func(d *usecase.Deps) {
 		if sa, ok := d.Solver.(*engineadapter.SolveAdapter); ok && fn != nil {
-			sa.SetPrepReviewGen(fn)
+			sa.SetTutoringTipsReviewGen(fn)
 		}
 	}
 }
@@ -204,13 +205,13 @@ func WireInto(ctx context.Context, reg *scenario.Registry, db *sql.DB, solveSkil
 	solveAdapter := engineadapter.NewSolveAdapter(solveSkill)
 
 	deps := usecase.Deps{
-		Solver:         solveAdapter,
-		Grader:         solveAdapter,
-		VerifiedGrader: solveAdapter,
-		PrepReview:     solveAdapter,
-		Records:        store,
-		PageAssets:     assetstore.PageStore{},
-		Constraint:     constraint,
+		Solver:             solveAdapter,
+		Grader:             solveAdapter,
+		VerifiedGrader:     solveAdapter,
+		TutoringTipsReview: solveAdapter,
+		Records:            store,
+		PageAssets:         assetstore.PageStore{},
+		Constraint:         constraint,
 	}
 	for _, o := range opts {
 		o(&deps)

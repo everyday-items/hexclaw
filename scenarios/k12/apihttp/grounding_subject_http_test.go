@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
-	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
@@ -56,33 +55,6 @@ func TestGroundingUpload_InvalidSubjectRejected(t *testing.T) {
 	}
 	if spy.subject != "" || spy.legacy {
 		t.Fatalf("非法学科不得写入: %+v", spy)
-	}
-}
-
-// subjectGroundSpy 记录备课卡检索侧收到的学科。
-type subjectGroundSpy struct{ queried []string }
-
-func (s *subjectGroundSpy) Ground(context.Context, string, string, string) (string, bool, error) {
-	return "通用讲法", true, nil
-}
-
-func (s *subjectGroundSpy) GroundSubject(_ context.Context, _, subject, _, _ string) (string, bool, error) {
-	s.queried = append(s.queried, subject)
-	return "数学教材讲法", true, nil
-}
-
-// TestPrepCard_SubjectThreadedToGrounding POST /prep-card 带 subject：
-// 注入侧按当前题目学科检索本学科教材。
-func TestPrepCard_SubjectThreadedToGrounding(t *testing.T) {
-	spy := &subjectGroundSpy{}
-	h := newServerWithSolver(t, fakeSolveExec{}, assembly.WithGrounding(spy))
-	rec, out := do(t, h, http.MethodPost, "/prep-card",
-		`{"agent":"mingming","grade":"五年级上","subject":"数学","knowledge_points":["小数乘法"]}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("prep-card status=%d %v", rec.Code, out)
-	}
-	if len(spy.queried) != 1 || spy.queried[0] != "数学" {
-		t.Fatalf("学科应下推检索侧: %v", spy.queried)
 	}
 }
 

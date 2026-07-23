@@ -77,13 +77,12 @@ func TestViewDescriptor(t *testing.T) {
 	if len(cols) != 4 {
 		t.Errorf("record_collections 应含四对象 collection: %v", cols)
 	}
-	// 反向契约（执行计划 §3.4）：备课卡独立侧栏/头部动作已退役（辅导要点内联进识题流），
-	// side_panels 与 actions 不得再下发 prep-card。
+	// 辅导要点在识题流中内联生成，清单不下发独立侧栏或头部动作。
 	if panels, _ := out["side_panels"].([]any); len(panels) != 0 {
-		t.Errorf("side_panels 应为空（prep-card 侧栏已退役）: %v", panels)
+		t.Errorf("side_panels 应为空: %v", panels)
 	}
 	if actions, _ := out["actions"].([]any); len(actions) != 0 {
-		t.Errorf("actions 应为空（IA 定稿头部无 prep-card 动作）: %v", actions)
+		t.Errorf("actions 应为空: %v", actions)
 	}
 }
 
@@ -125,19 +124,6 @@ func TestOutOfScope(t *testing.T) {
 	}
 	if out["verdict"] != "out_of_scope" || out["evidence_type"] != "none" || out["badge"] != "out-of-scope" {
 		t.Errorf("超纲证据/徽章契约不一致: %v", out)
-	}
-}
-
-func TestPrepCard(t *testing.T) {
-	h := newServer(t)
-	body := `{"agent":"mingming","grade":"五年级上","knowledge_points":["小数乘法"]}`
-	rec, out := do(t, h, "POST", "/prep-card", body)
-	if rec.Code != 200 {
-		t.Fatalf("prep-card 状态 %d", rec.Code)
-	}
-	secs, _ := out["sections"].([]any)
-	if len(secs) < 4 {
-		t.Errorf("备课卡应≥4段: %v", out)
 	}
 }
 

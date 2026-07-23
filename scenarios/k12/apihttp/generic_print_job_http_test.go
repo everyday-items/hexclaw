@@ -8,7 +8,7 @@ import (
 func TestGenericPrintJobHTTPUsesSharedRecoveryRoutes(t *testing.T) {
 	h := newServer(t)
 	rec, out := do(t, h, http.MethodPost, "/print-jobs", `{
-		"agent":"mingming","idempotency_key":"prep-click-1","source_kind":"prep_card",
+		"agent":"mingming","idempotency_key":"tips-click-1","source_kind":"tutoring_tips",
 		"source_ref":"submission:s1","title":"这份作业的辅导要点",
 		"canonical_markdown":"# 辅导要点\n\n小数点对齐"
 	}`)
@@ -17,7 +17,7 @@ func TestGenericPrintJobHTTPUsesSharedRecoveryRoutes(t *testing.T) {
 	}
 	job := out["print_job"].(map[string]any)
 	jobID := job["print_job_id"].(string)
-	if job["status"] != "preparing" || job["source_kind"] != "prep_card" || job["source_digest"] == "" {
+	if job["status"] != "preparing" || job["source_kind"] != "tutoring_tips" || job["source_digest"] == "" {
 		t.Fatalf("generic prepare missing durable facts: %#v", job)
 	}
 	rec, paper := do(t, h, http.MethodGet, "/print-jobs/"+jobID+"/paper?agent=mingming", "")
@@ -29,7 +29,7 @@ func TestGenericPrintJobHTTPUsesSharedRecoveryRoutes(t *testing.T) {
 		t.Fatalf("cross-owner query code=%d body=%s", rec.Code, rec.Body.String())
 	}
 	rec, recovered := do(t, h, http.MethodPost, "/print-jobs", `{
-		"agent":"mingming","idempotency_key":"fresh-key-after-reload","source_kind":"prep_card",
+		"agent":"mingming","idempotency_key":"fresh-key-after-reload","source_kind":"tutoring_tips",
 		"source_ref":"submission:s1","title":"这份作业的辅导要点",
 		"canonical_markdown":"# 辅导要点\n\n小数点对齐"
 	}`)
@@ -50,7 +50,7 @@ func TestGenericPrintJobHTTPUsesSharedRecoveryRoutes(t *testing.T) {
 		t.Fatalf("printed status missing: %#v", out)
 	}
 	rec, replay := do(t, h, http.MethodPost, "/print-jobs", `{
-		"agent":"mingming","idempotency_key":"prep-click-1","source_kind":"prep_card",
+		"agent":"mingming","idempotency_key":"tips-click-1","source_kind":"tutoring_tips",
 		"source_ref":"submission:s1","title":"这份作业的辅导要点",
 		"canonical_markdown":"# 辅导要点\n\n小数点对齐"
 	}`)
@@ -62,7 +62,7 @@ func TestGenericPrintJobHTTPUsesSharedRecoveryRoutes(t *testing.T) {
 func TestGenericPrintJobHTTPCommitReceiptIsAtomicAndIdempotent(t *testing.T) {
 	h := newServer(t)
 	rec, out := do(t, h, http.MethodPost, "/print-jobs", `{
-		"agent":"mingming","idempotency_key":"prep-commit-1","source_kind":"prep_card",
+		"agent":"mingming","idempotency_key":"tips-commit-1","source_kind":"tutoring_tips",
 		"source_ref":"submission:s1","title":"辅导要点","canonical_markdown":"# 辅导要点"
 	}`)
 	if rec.Code != http.StatusCreated {

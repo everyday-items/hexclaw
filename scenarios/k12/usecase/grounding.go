@@ -29,7 +29,7 @@ func validateTextbookSubject(subject string) error {
 		ErrInvalidInput, strings.Join(k12.TextbookSubjects, "/"), subject)
 }
 
-// AddGrounding 把家长上传的教材内容按辅导实例隔离入库，供备课卡召回。
+// AddGrounding 把家长上传的教材内容按辅导实例隔离入库，供辅导要点召回。
 // subject 非空时按学科分科入库（六学科枚举校验）；空保持不分科旧语义（前向兼容）。
 // 写侧不支持分科而请求带学科时报错，绝不静默丢学科降级。
 func (d Deps) AddGrounding(ctx context.Context, agentName, subject, title, content string) error {
