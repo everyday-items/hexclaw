@@ -118,6 +118,59 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// K12 grading budgets are publish evidence, not a tuning guess. The all-zero
+	// block is the only unfrozen state. Once policy_version is positive, every
+	// automatic stage and the measured 1/8/16/32 buckets are mandatory.
+	gradingBudget := c.K12.GradingBudget
+	if !gradingBudget.IsZero() {
+		if gradingBudget.PolicyVersion <= 0 {
+			errs = append(errs, &ValidationError{
+				Field: "k12.grading_budget.policy_version", Value: fmt.Sprintf("%d", gradingBudget.PolicyVersion),
+				Rule: "未冻结必须全零；冻结策略版本必须为正整数", Suggest: "真实性能门完成前删除整个 grading_budget 配置",
+			})
+		}
+		for _, stage := range []struct {
+			field string
+			value int64
+		}{
+			{"queued_seconds", gradingBudget.QueuedSeconds},
+			{"normalizing_seconds", gradingBudget.NormalizingSeconds},
+			{"recognizing_seconds", gradingBudget.RecognizingSeconds},
+			{"locating_seconds", gradingBudget.LocatingSeconds},
+			{"rendering_seconds", gradingBudget.RenderingSeconds},
+			{"projecting_seconds", gradingBudget.ProjectingSeconds},
+		} {
+			if stage.value <= 0 {
+				errs = append(errs, &ValidationError{
+					Field: "k12.grading_budget." + stage.field, Value: fmt.Sprintf("%d", stage.value),
+					Rule: "冻结策略的自动阶段秒数必须为正整数", Suggest: "使用同一路由真实性能报告定版",
+				})
+			}
+		}
+		if gradingBudget.ItemConcurrency <= 0 || gradingBudget.ItemConcurrency > 32 {
+			errs = append(errs, &ValidationError{
+				Field: "k12.grading_budget.item_concurrency", Value: fmt.Sprintf("%d", gradingBudget.ItemConcurrency),
+				Rule: "1-32", Suggest: "使用真实性能报告对应的并发策略",
+			})
+		}
+		bucketShapeOK := len(gradingBudget.AssessingBuckets) == 4
+		wantMax := [...]int{1, 8, 16, 32}
+		if bucketShapeOK {
+			for i, bucket := range gradingBudget.AssessingBuckets {
+				if bucket.MaxProblems != wantMax[i] || bucket.Seconds <= 0 {
+					bucketShapeOK = false
+					break
+				}
+			}
+		}
+		if !bucketShapeOK {
+			errs = append(errs, &ValidationError{
+				Field: "k12.grading_budget.assessing_buckets", Value: fmt.Sprintf("%v", gradingBudget.AssessingBuckets),
+				Rule: "按顺序完整提供 max_problems=1/8/16/32 且 seconds>0", Suggest: "缺任一真实样本桶时保持未冻结",
+			})
+		}
+	}
+
 	// 3. Router：配置了静态 Agents 时，DefaultAgent（若指定）必须在列表中
 	// （不强制 Enabled → 必填 DefaultAgent，因为 Agents 可通过 API 运行时注入）
 	if len(c.Router.Agents) > 0 && c.Router.DefaultAgent != "" {

@@ -187,6 +187,134 @@ func TestNormalizeRecognizedProblems_CompoundParentAndStableChildren(t *testing.
 	}
 }
 
+func TestNormalizeRecognizedProblems_ServerMintsIdentityFromUntrustedModelReferences(t *testing.T) {
+	input := []RecognizedQuestion{
+		{
+			ProblemID: "../../model-duplicate", AttemptID: "model-attempt",
+			ConfirmedVersion: 91, InputDigest: "model-digest",
+			Question: "1+1=", Subject: "数学",
+		},
+		{
+			ProblemID: "../../model-duplicate", AttemptID: "model-attempt",
+			ConfirmedVersion: 92, InputDigest: "model-digest",
+			Question: "2+2=", Subject: "数学",
+		},
+		{
+			ProblemID: "\x00malformed", AttemptID: "\x00attempt",
+			ConfirmedVersion: 93, InputDigest: "model-digest",
+			Question: "3+3=", Subject: "数学",
+		},
+	}
+
+	first, err := NormalizeRecognizedProblems("submission-server-owned", input)
+	if err != nil {
+		t.Fatalf("NormalizeRecognizedProblems: %v", err)
+	}
+	second, err := NormalizeRecognizedProblems("submission-server-owned", input)
+	if err != nil {
+		t.Fatalf("second normalization: %v", err)
+	}
+
+	problemIDs := map[string]struct{}{}
+	attemptIDs := map[string]struct{}{}
+	for i, question := range first {
+		if !strings.HasPrefix(question.ProblemID, "problem-") || question.ProblemID == input[i].ProblemID {
+			t.Fatalf("problem %d kept model-owned identity: got=%q model=%q", i, question.ProblemID, input[i].ProblemID)
+		}
+		if !strings.HasPrefix(question.AttemptID, "attempt-") || question.AttemptID == input[i].AttemptID {
+			t.Fatalf("problem %d kept model-owned attempt: got=%q model=%q", i, question.AttemptID, input[i].AttemptID)
+		}
+		if question.ConfirmedVersion != 0 || question.InputDigest != "" {
+			t.Fatalf("problem %d kept model-owned confirmation facts: version=%d digest=%q", i, question.ConfirmedVersion, question.InputDigest)
+		}
+		if question.ProblemID != second[i].ProblemID || question.AttemptID != second[i].AttemptID {
+			t.Fatalf("server identity is not deterministic at %d: first=%#v second=%#v", i, question, second[i])
+		}
+		if _, duplicate := problemIDs[question.ProblemID]; duplicate {
+			t.Fatalf("server minted duplicate problem_id %q", question.ProblemID)
+		}
+		problemIDs[question.ProblemID] = struct{}{}
+		if _, duplicate := attemptIDs[question.AttemptID]; duplicate {
+			t.Fatalf("server minted duplicate attempt_id %q", question.AttemptID)
+		}
+		attemptIDs[question.AttemptID] = struct{}{}
+	}
+}
+
+func TestNormalizeRecognizedProblems_MapsOpaqueCompoundReferencesToServerIdentity(t *testing.T) {
+	input := []RecognizedQuestion{
+		{ProblemID: "../model parent/\x00", ProblemKind: ProblemKindCompoundParent, Question: "公共题干", Subject: "语文"},
+		{ProblemID: "duplicate-child", ProblemKind: ProblemKindSubproblem, ParentProblemID: " ../model parent/\x00 ", SubproblemNo: " (1) ", Question: "第一问", StudentAnswer: "甲", Subject: "语文"},
+		{ProblemID: "duplicate-child", ProblemKind: ProblemKindSubproblem, ParentProblemID: "../model parent/\x00", SubproblemNo: "(2)", Question: "第二问", StudentAnswer: "乙", Subject: "语文"},
+	}
+
+	got, err := NormalizeRecognizedProblems("submission-compound", input)
+	if err != nil {
+		t.Fatalf("NormalizeRecognizedProblems: %v", err)
+	}
+	if got[0].ProblemID == input[0].ProblemID || !strings.HasPrefix(got[0].ProblemID, "problem-") {
+		t.Fatalf("compound parent identity must be server-owned: %#v", got[0])
+	}
+	for _, child := range got[1:] {
+		if child.ParentProblemID != got[0].ProblemID {
+			t.Fatalf("child did not map opaque model reference to server parent: child=%#v parent=%#v", child, got[0])
+		}
+		if child.ProblemID == "duplicate-child" || child.AttemptID == "" {
+			t.Fatalf("child identity must be server-owned: %#v", child)
+		}
+	}
+	if got[1].ProblemID == got[2].ProblemID || got[1].AttemptID == got[2].AttemptID {
+		t.Fatalf("duplicate model child references must not merge siblings: %#v", got)
+	}
+}
+
+func TestNormalizeRecognizedProblems_RejectsAmbiguousOrDanglingCompoundReferences(t *testing.T) {
+	for name, questions := range map[string][]RecognizedQuestion{
+		"ambiguous duplicate parent reference": {
+			{ProblemID: "parent", ProblemKind: ProblemKindCompoundParent, Question: "材料一", Subject: "语文"},
+			{ProblemID: "parent", ProblemKind: ProblemKindCompoundParent, Question: "材料二", Subject: "语文"},
+			{ProblemKind: ProblemKindSubproblem, ParentProblemID: "parent", SubproblemNo: "1", Question: "问题", Subject: "语文"},
+		},
+		"dangling parent reference": {
+			{ProblemID: "parent", ProblemKind: ProblemKindCompoundParent, Question: "材料", Subject: "语文"},
+			{ProblemKind: ProblemKindSubproblem, ParentProblemID: "missing", SubproblemNo: "1", Question: "问题", Subject: "语文"},
+		},
+		"missing parent reference": {
+			{ProblemID: "parent", ProblemKind: ProblemKindCompoundParent, Question: "材料", Subject: "语文"},
+			{ProblemKind: ProblemKindSubproblem, SubproblemNo: "1", Question: "问题", Subject: "语文"},
+		},
+		"standalone contradicts parent reference": {
+			{ProblemID: "parent", ProblemKind: ProblemKindCompoundParent, Question: "材料", Subject: "语文"},
+			{ProblemKind: ProblemKindStandalone, ParentProblemID: "parent", Question: "问题", Subject: "语文"},
+		},
+		"compound parent contradicts child number": {
+			{ProblemID: "parent", ProblemKind: ProblemKindCompoundParent, SubproblemNo: "1", Question: "材料", Subject: "语文"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NormalizeRecognizedProblems("submission-invalid-compound", questions); !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("err = %v, want ErrInvalidInput", err)
+			}
+		})
+	}
+}
+
+func TestNormalizeRecognizedProblems_RejectsInvalidConfidenceAndGeometry(t *testing.T) {
+	for name, question := range map[string]RecognizedQuestion{
+		"confidence below zero":              {Question: "题目", Subject: "数学", RecognitionConfidence: float64Ptr(-0.01)},
+		"confidence above one":               {Question: "题目", Subject: "数学", RecognitionConfidence: float64Ptr(1.01)},
+		"geometry outside page":              {Question: "题目", StudentAnswer: "1", AnswerState: AnswerStatePresent, Subject: "数学", BBox: &BBox{X: .9, Y: .1, W: .2, H: .2}},
+		"geometry with no area":              {Question: "题目", StudentAnswer: "1", AnswerState: AnswerStatePresent, Subject: "数学", BBox: &BBox{X: .1, Y: .1, W: 0, H: .2}},
+		"blank cannot hide invalid geometry": {Question: "题目", AnswerState: AnswerStateBlank, Subject: "数学", BBox: &BBox{X: -.1, Y: .1, W: .2, H: .2}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NormalizeRecognizedProblems("submission-invalid-evidence", []RecognizedQuestion{question}); !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("err = %v, want ErrInvalidInput", err)
+			}
+		})
+	}
+}
+
 func TestRecognizedQuestionsProblemAttemptSnapshot_ParentAndSiblingFacts(t *testing.T) {
 	questions, err := NormalizeRecognizedProblems("submission-typed", []RecognizedQuestion{
 		{ProblemID: "parent", ProblemKind: ProblemKindCompoundParent, Question: "公共题干", Subject: "数学"},
@@ -207,15 +335,59 @@ func TestRecognizedQuestionsProblemAttemptSnapshot_ParentAndSiblingFacts(t *test
 	if len(snapshot.Problems) != 3 || len(snapshot.Attempts) != 2 {
 		t.Fatalf("compound parent must own no Attempt: %+v", snapshot)
 	}
-	if snapshot.Problems[0].ProblemKind != "compound_parent" || snapshot.Problems[1].ParentProblemID != "parent" {
+	if snapshot.Problems[0].ProblemKind != "compound_parent" || snapshot.Problems[1].ParentProblemID != questions[0].ProblemID {
 		t.Fatalf("parent-child identity lost: %+v", snapshot.Problems)
 	}
-	if snapshot.Attempts[0].ProblemID != "child-1" || snapshot.Attempts[0].AnswerRaw != "31" ||
+	if snapshot.Attempts[0].ProblemID != questions[1].ProblemID || snapshot.Attempts[0].AnswerRaw != "31" ||
 		snapshot.Attempts[0].AnswerMarkdown != "31" || snapshot.Attempts[0].InputDigest == "" || snapshot.Attempts[0].BBox == nil {
 		t.Fatalf("child-1 Attempt facts lost: %+v", snapshot.Attempts[0])
 	}
-	if snapshot.Attempts[1].ProblemID != "child-2" || snapshot.Attempts[1].AttemptID == snapshot.Attempts[0].AttemptID {
+	if snapshot.Attempts[1].ProblemID != questions[2].ProblemID || snapshot.Attempts[1].AttemptID == snapshot.Attempts[0].AttemptID {
 		t.Fatalf("siblings must keep independent attempts: %+v", snapshot.Attempts)
+	}
+	restored, err := RecognizedQuestionsFromProblemAttemptSnapshot(snapshot)
+	if err != nil {
+		t.Fatalf("restore Problem/Attempt snapshot: %v", err)
+	}
+	for i := range questions {
+		if restored[i].ProblemID != questions[i].ProblemID || restored[i].ParentProblemID != questions[i].ParentProblemID ||
+			restored[i].AttemptID != questions[i].AttemptID || restored[i].ConfirmedVersion != questions[i].ConfirmedVersion ||
+			restored[i].InputDigest != questions[i].InputDigest {
+			t.Fatalf("server-owned facts changed across durable round-trip at %d:\n got=%#v\nwant=%#v", i, restored[i], questions[i])
+		}
+	}
+}
+
+func TestRecognizedQuestionsProblemAttemptSnapshot_UpgradesLegacyRunWithoutServerAttempt(t *testing.T) {
+	snapshot, err := RecognizedQuestionsProblemAttemptSnapshot("mingming", "submission-legacy-run", []RecognizedQuestion{{
+		ProblemID: "legacy-p1", AttemptID: "",
+		Question: "1+1=", CanonicalMarkdown: "1+1=", Subject: "数学", AnswerState: AnswerStateBlank,
+	}}, 100)
+	if err != nil {
+		t.Fatalf("legacy run upgrade: %v", err)
+	}
+	if len(snapshot.Problems) != 1 || len(snapshot.Attempts) != 1 {
+		t.Fatalf("legacy run was not materialized: %+v", snapshot)
+	}
+	if snapshot.Problems[0].ProblemID != "legacy-p1" || snapshot.Attempts[0].ProblemID != "legacy-p1" ||
+		snapshot.Attempts[0].AttemptID == "" || snapshot.Attempts[0].ConfirmedVersion != 0 || snapshot.Attempts[0].InputDigest != "" {
+		t.Fatalf("legacy Problem identity must stay stable while its missing Attempt is minted: problems=%+v attempts=%+v", snapshot.Problems, snapshot.Attempts)
+	}
+}
+
+func TestRecognizedQuestionsProblemAttemptSnapshot_RejectsPartiallyMintedLegacyIdentity(t *testing.T) {
+	_, err := RecognizedQuestionsProblemAttemptSnapshot("mingming", "submission-partial-identity", []RecognizedQuestion{
+		{
+			ProblemID: "already-exposed-p1",
+			Question:  "1+1=", CanonicalMarkdown: "1+1=", Subject: "数学", AnswerState: AnswerStateBlank,
+		},
+		{
+			ProblemID: "",
+			Question:  "2+2=", CanonicalMarkdown: "2+2=", Subject: "数学", AnswerState: AnswerStateBlank,
+		},
+	}, 100)
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("partially minted identity must fail closed instead of replacing an exposed problem_id: %v", err)
 	}
 }
 

@@ -168,10 +168,11 @@ func NewGradingOrchestrator(deps Deps, snapshotFn func() k12.GradingModelSnapsho
 // StartPhotoGradingInput 照片批改 Job 创建输入。SourceKind/SourceKey 映射统一幂等键
 // （§4.10：IM = "im"/message_id）。ModelSnapshot 为空时取 snapshotFn()。
 type StartPhotoGradingInput struct {
-	Photo         PhotoGradeRequest
-	SourceKind    string
-	SourceKey     string
-	ModelSnapshot k12.GradingModelSnapshot
+	Photo          PhotoGradeRequest
+	SourceKind     string
+	SourceKey      string
+	ModelSnapshot  k12.GradingModelSnapshot
+	BudgetSnapshot k12.GradingBudgetSnapshot
 }
 
 // StartPhotoGradingJob 创建照片批改 Job 并登记进程内运行时。幂等：同键命中既有 Job
@@ -188,10 +189,12 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 	v, created, err := o.deps.CreateGradingJob(ctx, in.Photo.AgentName, in.Photo.SourceSession, CreateGradingJobInput{
 		// Submission 聚合未落库（§6.9 类型化存储待接线）：以原图内容摘要为提交标识，
 		// 同图重投可追溯到同一 submission。
-		SubmissionID:  "photo-" + hex.EncodeToString(sum[:]),
-		SourceKind:    in.SourceKind,
-		SourceKey:     in.SourceKey,
-		ModelSnapshot: snap,
+		SubmissionID:                "photo-" + hex.EncodeToString(sum[:]),
+		SourceKind:                  in.SourceKind,
+		SourceKey:                   in.SourceKey,
+		ModelSnapshot:               snap,
+		BudgetSnapshot:              in.BudgetSnapshot,
+		MaterializesProblemAttempts: true,
 	})
 	if err != nil {
 		return GradingJobView{}, false, err
@@ -291,6 +294,19 @@ func (o *GradingOrchestrator) ConfirmAndRun(ctx context.Context, jobID string, c
 	if err := applyAndValidateGradingConfirmation(&candidate, ConfirmPhotoGradingInput{}); err != nil {
 		l.Unlock()
 		return GradingJobView{}, err
+	}
+	job, err := o.deps.GetGradingJob(ctx, run.agentName, jobID)
+	if err != nil {
+		l.Unlock()
+		return GradingJobView{}, err
+	}
+	confirmedFacts := candidate.questions
+	if candidate.anchored != nil {
+		confirmedFacts = candidate.anchored
+	}
+	if err := o.persistProblemAttemptFacts(ctx, run.agentName, job.Fields.SubmissionID, confirmedFacts); err != nil {
+		l.Unlock()
+		return GradingJobView{}, fmt.Errorf("usecase: 固化确认后的 Problem/Attempt: %w", err)
 	}
 	if err := o.persistRun(jobID, &candidate); err != nil {
 		l.Unlock()
@@ -681,7 +697,17 @@ func (o *GradingOrchestrator) executeAnchor(jobID, agentName string, image []byt
 	}
 	// The provider budget starts at the provider boundary. Local ledger reads/writes
 	// must not consume the AnswerAnchorer deadline, especially under slow storage.
-	ctx, cancel := context.WithTimeout(baseCtx, o.anchorTimeout)
+	anchorTimeout := o.anchorTimeout
+	if job.Fields.BudgetSnapshot.IsFrozen() {
+		seconds, ok := job.Fields.BudgetSnapshot.StageBudgetSeconds(k12.GradingStageLocating, 0)
+		if !ok {
+			_, _ = o.deps.Records.MarkModelInvocationFailed(context.WithoutCancel(baseCtx), agentName,
+				invocation.InvocationID, "invalid_frozen_locating_budget")
+			return nil, k12.GradingAnchorDegraded, "anchor:invalid_budget", true
+		}
+		anchorTimeout = time.Duration(seconds) * time.Second
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, anchorTimeout)
 	unregisterProvider := o.registerGradingModelCall(jobID, cancel)
 	if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), agentName, jobID); readErr != nil {
 		cancel()
@@ -727,6 +753,12 @@ func (o *GradingOrchestrator) runAssess(ctx context.Context, run *gradingRun, jo
 	job, err := o.deps.GetGradingJob(ctx, run.agentName, jobID)
 	if err != nil {
 		return GradingJobView{}, err
+	}
+	// ADR-K12-021 is an explicit one-way cutover. Legacy jobs keep the existing
+	// page-level invocation path; only a validated, frozen policy may write the
+	// V30 per-item ledger and receipts.
+	if job.Fields.BudgetSnapshot.IsFrozen() {
+		return o.runAssessItems(ctx, run, job)
 	}
 	requestRaw, _ := json.Marshal(struct {
 		Request   PhotoGradeRequest    `json:"request"`
@@ -793,6 +825,12 @@ func (o *GradingOrchestrator) runAssess(ctx context.Context, run *gradingRun, jo
 	providerCtxErr := providerCtx.Err()
 	cancelProvider()
 	unregisterProvider()
+	if err != nil && invocationOutcomeUnknown(providerCtxErr) && photoHasCompletedItem(result.Items) {
+		// An opaque adapter may replace the typed context error with friendly
+		// text. Once another item completed, the page is provably partial, so the
+		// provider deadline is the authoritative non-retryable cause.
+		err = providerCtxErr
+	}
 	if err == nil && invocationOutcomeUnknown(providerCtxErr) {
 		// GradeHomeworkPhoto intentionally keeps ordinary per-item failures as a
 		// partial result. If the provider budget also expired, an opaque adapter may
@@ -858,6 +896,15 @@ func (o *GradingOrchestrator) runAssess(ctx context.Context, run *gradingRun, jo
 	return o.advanceOK(ctx, run, jobID, fmt.Sprintf("items:%d mode:%s", len(result.Items), result.Mode))
 }
 
+func photoHasCompletedItem(items []PhotoGradeItem) bool {
+	for _, item := range items {
+		if item.Status != "" && item.Status != PhotoFailed {
+			return true
+		}
+	}
+	return false
+}
+
 // runRender rendering 阶段：像素合成已在 assessing 内联执行（现网实现），本阶段回写其结果——
 // 失败走规则 2 降级（不终态，续跑 projecting），成功/无可信坐标可渲染则正常推进。
 func (o *GradingOrchestrator) runRender(ctx context.Context, run *gradingRun, jobID string) (GradingJobView, error) {
@@ -886,7 +933,7 @@ func (o *GradingOrchestrator) runProject(ctx context.Context, run *gradingRun, j
 	}
 	mistakes := 0
 	for _, item := range run.result.Items {
-		if item.Status == PhotoWrong && item.Grade.RecordID != "" {
+		if item.Status == PhotoWrong {
 			mistakes++
 		}
 	}

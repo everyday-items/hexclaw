@@ -161,8 +161,8 @@ func TestCronIntegrityV29RepairsSchemaAndMergesWithoutDroppingEvidence(t *testin
 	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&latest); err != nil {
 		t.Fatal(err)
 	}
-	if latest != 29 {
-		t.Fatalf("latest migration=%d, want 29", latest)
+	if latest != 31 {
+		t.Fatalf("latest migration=%d, want 31", latest)
 	}
 	assertCanonicalCronSchema(t, db)
 

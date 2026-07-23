@@ -166,10 +166,11 @@ func (a k12WebhookApplication) startSubmission(ctx context.Context, event webhoo
 	}
 	sum := sha256.Sum256([]byte(text))
 	job, _, err := a.deps.CreateGradingJob(ctx, event.AgentID, sourceSession, k12usecase.CreateGradingJobInput{
-		SubmissionID:  "webhook-receipt:" + event.ReceiptID,
-		SourceKind:    "webhook",
-		SourceKey:     event.EventID,
-		ModelSnapshot: a.snapshot(),
+		SubmissionID:                "webhook-receipt:" + event.ReceiptID,
+		SourceKind:                  "webhook",
+		SourceKey:                   event.EventID,
+		ModelSnapshot:               a.snapshot(),
+		MaterializesProblemAttempts: true,
 	})
 	if err != nil {
 		return webhook.K12DispatchResult{}, err

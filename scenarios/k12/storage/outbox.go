@@ -24,7 +24,10 @@ import (
 )
 
 // 事件类型。
-const EventMistakeRecorded = "k12.mistake.recorded"
+const (
+	EventMistakeRecorded            = "k12.mistake.recorded"
+	EventGradingAssessmentCommitted = "k12.grading.assessment.committed"
+)
 
 // Outbox 事件状态。
 const (
@@ -59,12 +62,30 @@ type MistakeRecordedPayload struct {
 	EntrySource    string `json:"entry_source,omitempty"` // photo/manual…（§5.5）
 }
 
+// GradingAssessmentCommittedPayload is deliberately metadata-only. Model
+// output remains in the local receipt; the Outbox never duplicates potentially
+// sensitive model text.
+type GradingAssessmentCommittedPayload struct {
+	AgentName    string `json:"agent_name"`
+	JobID        string `json:"job_id"`
+	ProblemID    string `json:"problem_id"`
+	AttemptID    string `json:"attempt_id"`
+	Status       string `json:"status"`
+	ResultDigest string `json:"result_digest"`
+}
+
 // appendDomainEvents 在领域写事务内追加 Outbox 事件（§6.9 同事务提交）。
 // 返回是否有事件入队（供提交后通知 Dispatcher）。
-func appendDomainEvents(ctx context.Context, ex dbExecer, r *records.AgentRecord, created bool) (bool, error) {
+func appendDomainEvents(ctx context.Context, ex dbHandle, r *records.AgentRecord, created bool) (bool, error) {
 	if r.Collection != k12.CollectionMistakes {
 		return false, nil
 	}
+	return appendMistakeRecordedEvent(ctx, ex, r, created, idgen.NanoID())
+}
+
+func appendMistakeRecordedEvent(ctx context.Context, ex dbHandle, r *records.AgentRecord,
+	created bool, eventID string,
+) (bool, error) {
 	f, err := k12.ParseMistakeFields(r.Fields)
 	if err != nil {
 		return false, fmt.Errorf("k12storage: 解析错题字段(事件): %w", err)
@@ -81,16 +102,38 @@ func appendDomainEvents(ctx context.Context, ex dbExecer, r *records.AgentRecord
 	if err != nil {
 		return false, fmt.Errorf("k12storage: marshal 事件 payload: %w", err)
 	}
+	return appendOutboxEvent(ctx, ex, OutboxEvent{
+		EventID: eventID, AgentName: r.AgentName, AggregateID: r.RecordID,
+		EventType: EventMistakeRecorded, PayloadVersion: 1, Payload: string(payload),
+	})
+}
+
+func appendOutboxEvent(ctx context.Context, ex dbHandle, event OutboxEvent) (bool, error) {
 	now := nowUnix()
-	if _, err := ex.ExecContext(ctx, `INSERT INTO outbox_events
+	res, err := ex.ExecContext(ctx, `INSERT INTO outbox_events
         (event_id, agent_name, aggregate_id, event_type, payload_version, payload_json,
          status, attempts, last_error, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 1, ?, ?, 0, '', ?, ?)`,
-		idgen.NanoID(), r.AgentName, r.RecordID, EventMistakeRecorded, string(payload),
-		OutboxPending, now, now); err != nil {
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?, ?)
+		ON CONFLICT(event_id) DO NOTHING`, event.EventID, event.AgentName, event.AggregateID,
+		event.EventType, event.PayloadVersion, event.Payload, OutboxPending, now, now)
+	if err != nil {
 		return false, fmt.Errorf("k12storage: 写 outbox 事件: %w", err)
 	}
-	return true, nil
+	if inserted, _ := res.RowsAffected(); inserted > 0 {
+		return true, nil
+	}
+	var stored OutboxEvent
+	if err := ex.QueryRowContext(ctx, `SELECT agent_name,aggregate_id,event_type,payload_version,payload_json
+		FROM outbox_events WHERE event_id=?`, event.EventID).Scan(&stored.AgentName, &stored.AggregateID,
+		&stored.EventType, &stored.PayloadVersion, &stored.Payload); err != nil {
+		return false, fmt.Errorf("k12storage: 回读 deterministic outbox 事件: %w", err)
+	}
+	if stored.AgentName != event.AgentName || stored.AggregateID != event.AggregateID ||
+		stored.EventType != event.EventType || stored.PayloadVersion != event.PayloadVersion ||
+		stored.Payload != event.Payload {
+		return false, fmt.Errorf("k12storage: deterministic outbox event %q payload conflict", event.EventID)
+	}
+	return false, nil
 }
 
 // PendingEvents 按序取 pending 事件（Dispatcher / 取证用）。

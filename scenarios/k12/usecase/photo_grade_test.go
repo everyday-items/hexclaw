@@ -118,8 +118,13 @@ func TestGradeHomeworkPhoto_CompoundParentIsNotAssessedAndChildrenStayIndependen
 	if len(got.Items) != 2 {
 		t.Fatalf("compound parent must not create assessment item: %#v", got.Items)
 	}
-	if got.Items[0].Recognized.ProblemID != "child-1" || got.Items[1].Recognized.ProblemID != "child-2" {
-		t.Fatalf("sibling identity crossed: %#v", got.Items)
+	firstID := got.Items[0].Recognized.ProblemID
+	secondID := got.Items[1].Recognized.ProblemID
+	firstParentID := got.Items[0].Recognized.ParentProblemID
+	secondParentID := got.Items[1].Recognized.ParentProblemID
+	if firstID == "" || secondID == "" || firstID == secondID || firstID == "child-1" || secondID == "child-2" ||
+		firstParentID == "" || firstParentID != secondParentID || firstParentID == "parent-1" {
+		t.Fatalf("siblings need independent server identity under one server parent: %#v", got.Items)
 	}
 	for i, item := range got.Items {
 		if !strings.Contains(item.Recognized.Question, "阅读短文《春天》") {
@@ -393,8 +398,8 @@ func TestGradeHomeworkPhoto_UntrustedOrFailedItemNeverBurnsRedCross(t *testing.T
 	got, err := d.GradeHomeworkPhoto(context.Background(), PhotoGradeRequest{
 		AgentName: "mingming", Grade: "五年级上", Image: []byte("jpeg"),
 	})
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		t.Fatal("failed item must keep the page incomplete while retaining diagnostic output")
 	}
 	if got.AnnotatedImage != nil || annotator.calls != 0 {
 		t.Fatalf("untrusted/failed results must not be burned into image: image=%v calls=%d", got.AnnotatedImage, annotator.calls)

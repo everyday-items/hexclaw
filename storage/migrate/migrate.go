@@ -13,22 +13,34 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"time"
+
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
+
+// AtomicMigrationFunc runs a migration-specific transaction and invokes
+// recordVersion inside that same transaction immediately before commit. It is
+// reserved for migrations that need connection-scoped PRAGMAs around DDL.
+type AtomicMigrationFunc func(
+	ctx context.Context,
+	db *sql.DB,
+	recordVersion func(context.Context, *sql.Tx) error,
+) error
 
 // Migration 单次迁移定义。
 //
-// 两种模式（互斥）：
+// 三种模式（互斥）：
 //   - SQL: 纯 SQL 串（最常见），整段在一个事务里跑
 //   - Func: Go 函数（用于需要 schema 检测 / 条件分支的迁移，事务由 Func 自己管理）
+//   - AtomicFunc: Func 的连接级变体，数据与版本行由同一事务提交
 //
-// 若两者都填，Func 优先；都空则 NOOP（仅写 schema_migrations 占位）。
+// 优先级为 AtomicFunc > Func > SQL；都空则 NOOP（仅写 schema_migrations 占位）。
 type Migration struct {
 	Version     int
 	Description string
 	SQL         string
 	Func        func(ctx context.Context, db *sql.DB) error
+	AtomicFunc  AtomicMigrationFunc
 }
 
 // Run 执行所有未应用的迁移
@@ -78,6 +90,31 @@ func Run(ctx context.Context, db *sql.DB, migrations []Migration) error {
 }
 
 func applyMigration(ctx context.Context, db *sql.DB, m Migration) error {
+	if m.AtomicFunc != nil {
+		recordVersion := func(recordCtx context.Context, tx *sql.Tx) error {
+			if _, err := tx.ExecContext(recordCtx,
+				"INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
+				m.Version, m.Description, time.Now().Unix(),
+			); err != nil {
+				return fmt.Errorf("记录迁移版本失败: %w", err)
+			}
+			return nil
+		}
+		if err := m.AtomicFunc(ctx, db, recordVersion); err != nil {
+			return fmt.Errorf("执行 AtomicFunc 失败: %w", err)
+		}
+		var recordedDescription string
+		if err := db.QueryRowContext(ctx,
+			"SELECT description FROM schema_migrations WHERE version=?", m.Version,
+		).Scan(&recordedDescription); err != nil {
+			return fmt.Errorf("AtomicFunc 未原子提交迁移版本: %w", err)
+		}
+		if recordedDescription != m.Description {
+			return fmt.Errorf("AtomicFunc 迁移版本描述不一致: got %q want %q", recordedDescription, m.Description)
+		}
+		return nil
+	}
+
 	// Func 模式：DDL 由 Func 自管事务（SQLite ALTER 等不能与 DML 共事务）。
 	if m.Func != nil {
 		if err := m.Func(ctx, db); err != nil {

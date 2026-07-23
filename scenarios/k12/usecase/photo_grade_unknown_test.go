@@ -205,7 +205,7 @@ func TestGradeHomeworkPhoto_UnansweredItemDoesNotHideZeroSuccessfulAssessments(t
 	}
 }
 
-func TestGradeHomeworkPhoto_OrdinaryFailureAfterOneSuccessfulItemRemainsPartialSuccess(t *testing.T) {
+func TestGradeHomeworkPhoto_OrdinaryFailureAfterOneSuccessfulItemReturnsAggregateError(t *testing.T) {
 	ordinaryErr := errors.New("provider returned 503")
 	d, _ := newPipeline(t,
 		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
@@ -219,8 +219,8 @@ func TestGradeHomeworkPhoto_OrdinaryFailureAfterOneSuccessfulItemRemainsPartialS
 	result, err := d.GradeHomeworkPhoto(context.Background(), PhotoGradeRequest{
 		AgentName: "mingming", Grade: "五年级上", Image: []byte("jpeg"),
 	})
-	if err != nil {
-		t.Fatalf("one successful item must retain partial-success contract: %v", err)
+	if !errors.Is(err, ordinaryErr) {
+		t.Fatalf("one failed assessment must keep the page incomplete: err=%v", err)
 	}
 	if len(result.Items) != 2 || result.Items[0].Status != PhotoCorrect || result.Items[1].Status != PhotoFailed {
 		t.Fatalf("partial statuses=%#v, want correct then failed", result.Items)

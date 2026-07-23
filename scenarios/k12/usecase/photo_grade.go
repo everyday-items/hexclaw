@@ -60,8 +60,48 @@ type PhotoGradeResult struct {
 // 强证据 bbox 标记 → Markdown 摘要。普通单题失败只降级该题，其他题仍须完成；
 // 结果未知类错误必须向聚合层传播，避免 GradingJob 把未收敛的部分结果标成 completed。
 func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (PhotoGradeResult, error) {
+	return d.gradeHomeworkPhotoWithAssessor(ctx, req, 2, d.assessPhotoItem)
+}
+
+type photoItemAssessor func(context.Context, PhotoGradeRequest, PhotoMode, RecognizedQuestion) (PhotoGradeItem, error)
+
+// gradeHomeworkPhotoWithAssessor keeps page normalization, answer-mode routing,
+// bounded fan-out, annotation and rendering shared between the historical
+// direct path and the durable GradingJob item executor.
+func (d Deps) gradeHomeworkPhotoWithAssessor(
+	ctx context.Context,
+	req PhotoGradeRequest,
+	itemConcurrency int,
+	assess photoItemAssessor,
+) (PhotoGradeResult, error) {
+	return d.gradeHomeworkPhotoWithAssessorInput(ctx, req, itemConcurrency, assess, false)
+}
+
+// gradeFrozenHomeworkPhotoWithAssessor consumes the already-normalized,
+// parent-confirmed Problem/Attempt identity restored from a GradingJob
+// checkpoint. Re-normalizing that value would mint/reset identity at the
+// assessment boundary and invalidate the durable per-item authorization.
+func (d Deps) gradeFrozenHomeworkPhotoWithAssessor(
+	ctx context.Context,
+	req PhotoGradeRequest,
+	itemConcurrency int,
+	assess photoItemAssessor,
+) (PhotoGradeResult, error) {
+	return d.gradeHomeworkPhotoWithAssessorInput(ctx, req, itemConcurrency, assess, true)
+}
+
+func (d Deps) gradeHomeworkPhotoWithAssessorInput(
+	ctx context.Context,
+	req PhotoGradeRequest,
+	itemConcurrency int,
+	assess photoItemAssessor,
+	frozenIdentity bool,
+) (PhotoGradeResult, error) {
 	if strings.TrimSpace(req.AgentName) == "" || len(req.Image) == 0 {
 		return PhotoGradeResult{}, fmt.Errorf("%w: AgentName / Image 不可空", ErrInvalidInput)
+	}
+	if itemConcurrency <= 0 || assess == nil {
+		return PhotoGradeResult{}, fmt.Errorf("%w: item concurrency / assessor 非法", ErrInvalidInput)
 	}
 	if err := validateGradeInput(req.Grade); err != nil {
 		return PhotoGradeResult{}, err
@@ -70,9 +110,16 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 	if err != nil {
 		return PhotoGradeResult{}, err
 	}
-	questions, err = NormalizeRecognizedProblems("photo-"+shortSHA1(req.Image), questions)
-	if err != nil {
-		return PhotoGradeResult{}, err
+	if frozenIdentity {
+		questions = cloneRecognizedQuestions(questions)
+		if err := validateNormalizedRecognizedProblems(questions); err != nil {
+			return PhotoGradeResult{}, err
+		}
+	} else {
+		questions, err = NormalizeRecognizedProblems("photo-"+shortSHA1(req.Image), questions)
+		if err != nil {
+			return PhotoGradeResult{}, err
+		}
 	}
 	if len(questions) == 0 {
 		return PhotoGradeResult{}, fmt.Errorf("%w: 未识别到可处理的题目", ErrInvalidInput)
@@ -139,7 +186,7 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 		dispatchStopped = true
 		dispatchMu.Unlock()
 	}
-	workerCount := 2
+	workerCount := itemConcurrency
 	if len(questions) < workerCount {
 		workerCount = len(questions)
 	}
@@ -152,73 +199,15 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 				if !ok {
 					return
 				}
-				q := questions[i]
-				item := PhotoGradeItem{Recognized: q}
-				if mode == PhotoModeGrade {
-					switch q.AnswerState {
-					case AnswerStateBlank:
-						item.Status = PhotoUnanswered
-						result.Items[i] = item
-						continue
-					case AnswerStateUnclear:
-						item.Status = PhotoAnswerUnclear
-						item.Warning = "检测到学生笔迹，但未能可靠读出；请家长补录后再批改"
-						result.Items[i] = item
-						continue
-					}
-					graded, gradeErr := d.GradeHomeworkProblem(ctx, GradeRequest{
-						AgentName: req.AgentName, Subject: firstNonEmpty(q.Subject, req.Subject), Grade: req.Grade,
-						SourceSession: req.SourceSession, Problem: q.Question, StudentAnswer: q.StudentAnswer,
-						KnowledgePoints: photoGradeKnowledgePoints(q),
-					})
-					item.Grade = graded
-					switch {
-					case gradeErr != nil:
-						item.Status, item.Warning = PhotoFailed, gradeErr.Error()
-						firstItemErrOnce.Do(func() { firstItemErr = gradeErr })
-						if invocationOutcomeUnknown(gradeErr) {
-							unknownErrOnce.Do(func() {
-								unknownErr = gradeErr
-								stopDispatch()
-							})
-						}
-					case graded.OutOfScope:
-						item.Status = PhotoOutOfScope
-					case !photoEvidenceTrusted(graded.Evidence):
-						item.Status, item.Warning = PhotoUntrusted, "验算证据不足，暂不在图片上判对错"
-					case graded.Outcome.Verdict == VerdictAgree:
-						item.Status = PhotoCorrect
-					case graded.Outcome.Verdict == VerdictDisagree:
-						item.Status = PhotoWrong
-					default:
-						// 判定统一 Verdict 五值（§4.5）：非二元结论不伪装成对/错，按证据不足降级。
-						item.Status, item.Warning = PhotoUntrusted, "批改判定无二元结论，暂不在图片上判对错"
-					}
-					result.Items[i] = item
-					continue
-				}
-
-				solved, solveErr := d.SolveHomeworkProblem(ctx, GradeRequest{
-					AgentName: req.AgentName, Subject: firstNonEmpty(q.Subject, req.Subject), Grade: req.Grade,
-					SourceSession: req.SourceSession, Problem: q.Question, KnowledgePoints: photoGradeKnowledgePoints(q),
-				})
-				item.Solve = solved
-				switch {
-				case solveErr != nil:
-					item.Status, item.Warning = PhotoFailed, solveErr.Error()
-					firstItemErrOnce.Do(func() { firstItemErr = solveErr })
-					if invocationOutcomeUnknown(solveErr) {
+				item, itemErr := assess(ctx, req, mode, questions[i])
+				if itemErr != nil {
+					item.Status, item.Warning = PhotoFailed, itemErr.Error()
+					firstItemErrOnce.Do(func() { firstItemErr = itemErr })
+					if invocationOutcomeUnknown(itemErr) {
 						unknownErrOnce.Do(func() {
-							unknownErr = solveErr
+							unknownErr = itemErr
 							stopDispatch()
 						})
-					}
-				case solved.OutOfScope:
-					item.Status = PhotoOutOfScope
-				default:
-					item.Status = PhotoBlankSolved
-					if !photoEvidenceTrusted(solved.Evidence) {
-						item.Warning = "答案未通过程序级验算，请家长核对"
 					}
 				}
 				result.Items[i] = item
@@ -230,7 +219,7 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 		result.Markdown = photoGradeMarkdown(result)
 		return result, unknownErr
 	}
-	if firstItemErr != nil && !photoHasSuccessfulItem(result.Items) {
+	if firstItemErr != nil {
 		result.Markdown = photoGradeMarkdown(result)
 		return result, firstItemErr
 	}
@@ -258,14 +247,63 @@ func (d Deps) GradeHomeworkPhoto(ctx context.Context, req PhotoGradeRequest) (Ph
 	return result, nil
 }
 
-func photoHasSuccessfulItem(items []PhotoGradeItem) bool {
-	for _, item := range items {
-		switch item.Status {
-		case PhotoCorrect, PhotoWrong, PhotoBlankSolved, PhotoOutOfScope, PhotoUntrusted:
-			return true
-		}
+func (d Deps) assessPhotoItem(
+	ctx context.Context,
+	req PhotoGradeRequest,
+	mode PhotoMode,
+	q RecognizedQuestion,
+) (PhotoGradeItem, error) {
+	item := PhotoGradeItem{Recognized: q}
+	gradeReq := GradeRequest{
+		AgentName: req.AgentName, Subject: firstNonEmpty(q.Subject, req.Subject), Grade: req.Grade,
+		SourceSession: req.SourceSession, Problem: q.Question, StudentAnswer: q.StudentAnswer,
+		KnowledgePoints: photoGradeKnowledgePoints(q),
 	}
-	return false
+	if mode == PhotoModeGrade {
+		switch q.AnswerState {
+		case AnswerStateBlank:
+			item.Status = PhotoUnanswered
+			return item, nil
+		case AnswerStateUnclear:
+			item.Status = PhotoAnswerUnclear
+			item.Warning = "检测到学生笔迹，但未能可靠读出；请家长补录后再批改"
+			return item, nil
+		}
+		graded, err := d.GradeHomeworkProblem(ctx, gradeReq)
+		item.Grade = graded
+		if err != nil {
+			return item, err
+		}
+		switch {
+		case graded.OutOfScope:
+			item.Status = PhotoOutOfScope
+		case !photoEvidenceTrusted(graded.Evidence):
+			item.Status, item.Warning = PhotoUntrusted, "验算证据不足，暂不在图片上判对错"
+		case graded.Outcome.Verdict == VerdictAgree:
+			item.Status = PhotoCorrect
+		case graded.Outcome.Verdict == VerdictDisagree:
+			item.Status = PhotoWrong
+		default:
+			item.Status, item.Warning = PhotoUntrusted, "批改判定无二元结论，暂不在图片上判对错"
+		}
+		return item, nil
+	}
+
+	gradeReq.StudentAnswer = ""
+	solved, err := d.SolveHomeworkProblem(ctx, gradeReq)
+	item.Solve = solved
+	if err != nil {
+		return item, err
+	}
+	if solved.OutOfScope {
+		item.Status = PhotoOutOfScope
+		return item, nil
+	}
+	item.Status = PhotoBlankSolved
+	if !photoEvidenceTrusted(solved.Evidence) {
+		item.Warning = "答案未通过程序级验算，请家长核对"
+	}
+	return item, nil
 }
 
 func classifyPhotoMode(questions []RecognizedQuestion) PhotoMode {

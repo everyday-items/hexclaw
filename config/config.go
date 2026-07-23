@@ -41,7 +41,38 @@ type Config struct {
 	Voice            VoiceConfig            `yaml:"voice"`
 	Budget           BudgetConfig           `yaml:"budget"`
 	ResourceGovernor ResourceGovernorConfig `yaml:"resource_governor"`
+	K12              K12Config              `yaml:"k12,omitempty"`
 	Features         map[string]bool        `yaml:"features"` // v0.4.0 feature flag override（key=flag name）
+}
+
+// K12Config contains scenario policy inputs that must be frozen into durable
+// K12 Jobs. A zero GradingBudget means the 1/8/16/32 real-model release gate is
+// not complete; it is deliberately different from an active policy.
+type K12Config struct {
+	GradingBudget K12GradingBudgetConfig `yaml:"grading_budget,omitempty"`
+}
+
+type K12AssessingBudgetBucketConfig struct {
+	MaxProblems int   `yaml:"max_problems"`
+	Seconds     int64 `yaml:"seconds"`
+}
+
+type K12GradingBudgetConfig struct {
+	PolicyVersion      int                              `yaml:"policy_version"`
+	QueuedSeconds      int64                            `yaml:"queued_seconds"`
+	NormalizingSeconds int64                            `yaml:"normalizing_seconds"`
+	RecognizingSeconds int64                            `yaml:"recognizing_seconds"`
+	LocatingSeconds    int64                            `yaml:"locating_seconds"`
+	RenderingSeconds   int64                            `yaml:"rendering_seconds"`
+	ProjectingSeconds  int64                            `yaml:"projecting_seconds"`
+	AssessingBuckets   []K12AssessingBudgetBucketConfig `yaml:"assessing_buckets"`
+	ItemConcurrency    int                              `yaml:"item_concurrency"`
+}
+
+func (c K12GradingBudgetConfig) IsZero() bool {
+	return c.PolicyVersion == 0 && c.QueuedSeconds == 0 && c.NormalizingSeconds == 0 &&
+		c.RecognizingSeconds == 0 && c.LocatingSeconds == 0 && c.RenderingSeconds == 0 &&
+		c.ProjectingSeconds == 0 && len(c.AssessingBuckets) == 0 && c.ItemConcurrency == 0
 }
 
 // ResourceGovernorConfig bounds process-wide expensive resources shared by

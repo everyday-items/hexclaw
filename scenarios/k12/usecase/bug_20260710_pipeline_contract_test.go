@@ -91,7 +91,6 @@ func TestAllSolveEntrypointsRejectInvalidGrade(t *testing.T) {
 		name string
 		fn   func() error
 	}{
-		{name: "prep", fn: func() error { _, err := d.BuildPrepCard(ctx, "mingming", "大学", []string{"数学"}); return err }},
 		{name: "retry", fn: func() error {
 			_, err := d.GenerateRetry(ctx, ReviewItem{Fields: k12.MistakeFields{Question: "1+1"}}, "大学")
 			return err

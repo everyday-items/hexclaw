@@ -415,7 +415,7 @@ func (gradingJobMapper) table() string      { return "k12_grading_jobs" }
 func (gradingJobMapper) domainCols() []string {
 	return []string{"submission_id", "source_kind", "idempotency_key", "confirmed_version",
 		"confirmation_state", "anchor_state", "deadline", "model_snapshot_json",
-		"stage_checkpoints_json", "attempt_count", "failure_kind", "retryable", "failed_stage"}
+		"budget_snapshot_json", "stage_checkpoints_json", "attempt_count", "failure_kind", "retryable", "failed_stage"}
 }
 
 func (gradingJobMapper) encode(fieldsJSON string) ([]any, error) {
@@ -427,6 +427,14 @@ func (gradingJobMapper) encode(fieldsJSON string) ([]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("k12storage: marshal model_snapshot: %w", err)
 	}
+	budget := ""
+	if f.BudgetSnapshot.IsFrozen() {
+		raw, err := json.Marshal(f.BudgetSnapshot)
+		if err != nil {
+			return nil, fmt.Errorf("k12storage: marshal budget_snapshot: %w", err)
+		}
+		budget = string(raw)
+	}
 	checkpoints := ""
 	if len(f.StageCheckpoints) > 0 {
 		raw, err := json.Marshal(f.StageCheckpoints)
@@ -437,21 +445,29 @@ func (gradingJobMapper) encode(fieldsJSON string) ([]any, error) {
 	}
 	return []any{f.SubmissionID, f.SourceKind, f.IdempotencyKey, f.ConfirmedVersion,
 		f.ConfirmationState, f.AnchorState, f.Deadline, string(snap),
-		checkpoints, f.AttemptCount, f.FailureKind, boolInt(f.Retryable), f.FailedStage}, nil
+		budget, checkpoints, f.AttemptCount, f.FailureKind, boolInt(f.Retryable), f.FailedStage}, nil
 }
 
 func (gradingJobMapper) newScan() ([]any, func() (string, error)) {
 	var f k12.GradingJobFields
-	var snapJSON, checkpointsJSON string
+	var snapJSON, budgetJSON, checkpointsJSON string
 	var retryable int64
 	dest := []any{&f.SubmissionID, &f.SourceKind, &f.IdempotencyKey, &f.ConfirmedVersion,
 		&f.ConfirmationState, &f.AnchorState, &f.Deadline, &snapJSON,
-		&checkpointsJSON, &f.AttemptCount, &f.FailureKind, &retryable, &f.FailedStage}
+		&budgetJSON, &checkpointsJSON, &f.AttemptCount, &f.FailureKind, &retryable, &f.FailedStage}
 	return dest, func() (string, error) {
 		f.Retryable = retryable != 0
 		if snapJSON != "" {
 			if err := json.Unmarshal([]byte(snapJSON), &f.ModelSnapshot); err != nil {
 				return "", fmt.Errorf("k12storage: unmarshal model_snapshot: %w", err)
+			}
+		}
+		if budgetJSON != "" && budgetJSON != "null" {
+			if err := json.Unmarshal([]byte(budgetJSON), &f.BudgetSnapshot); err != nil {
+				return "", fmt.Errorf("k12storage: unmarshal budget_snapshot: %w", err)
+			}
+			if err := f.BudgetSnapshot.Validate(); err != nil {
+				return "", fmt.Errorf("k12storage: invalid budget_snapshot: %w", err)
 			}
 		}
 		if checkpointsJSON != "" && checkpointsJSON != "null" {

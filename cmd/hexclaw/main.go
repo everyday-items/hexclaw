@@ -1858,7 +1858,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			}
 			return resp.Content, nil
 		}
-		prepReviewGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
+		tutoringTipsReviewGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
 			provider := router.Default()
 			if provider == nil {
 				return "", fmt.Errorf("k12 辅导要点: 没有可用的默认 LLM Provider")
@@ -1870,7 +1870,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			if grade != "" {
 				task += "\n（只使用" + grade + "已经学过的概念和方法。）"
 			}
-			cctx := egress.WithRequest(ctx, egress.PurposeGeneralChat, "k12-prep-review", egress.ClassGeneral)
+			cctx := egress.WithRequest(ctx, egress.PurposeGeneralChat, "k12-tutoring-tips-review", egress.ClassGeneral)
 			cctx, ccancel := context.WithTimeout(cctx, 60*time.Second)
 			defer ccancel()
 			temp := 0.2
@@ -2015,7 +2015,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		k12Opts = append(k12Opts,
 			k12assembly.WithRetryGenerator(retryGenFn),
 			k12assembly.WithCauseSummaryGenerator(causeSummaryGenFn),
-			k12assembly.WithPrepReviewGenerator(prepReviewGenFn),
+			k12assembly.WithTutoringTipsReviewGenerator(tutoringTipsReviewGenFn),
 			k12assembly.WithWorkFeedbackGenerator(workFeedbackGenFn),
 			k12assembly.WithWorkFeedbackVision(workFeedbackVisionFn),
 			k12assembly.WithWorkFeedbackSkillLoader(k12SkillLoaderFn),
@@ -2025,6 +2025,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		if k12rt, k12err := k12assembly.WireInto(ctx, scenarioReg, store.DB(), k12Solve, k12Opts...); k12err != nil {
 			logger.Error("装配 K12 场景包失败", "error", k12err)
 		} else {
+			// Freeze the validated release policy at composition. Every subsequent
+			// CreateGradingJob copies this value; retries only read the Job snapshot.
+			k12rt.Deps.GradingBudgetSnapshot = k12GradingBudgetSnapshotFromConfig(cfg.K12.GradingBudget)
 			k12Runtime = k12rt
 			logger.Info("K12 场景已按 Manifest v2 安装",
 				"scenario", k12rt.Manifest.ID, "version", k12rt.Manifest.Version,

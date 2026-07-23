@@ -289,6 +289,58 @@ func TestGradingOrchestratorAssessCompleteResultAtDeadlineDoesNotBecomeUnknown(t
 	}
 }
 
+func TestGradingOrchestratorFrozenAssessCompleteResultAtDeadlinePersistsSuccess(t *testing.T) {
+	grader := &successAfterDeadlineAssessGrader{started: make(chan struct{})}
+	recognizer := &countingRecognizer{questions: []RecognizedQuestion{{
+		Question: "1+1=", Subject: "数学", StudentAnswer: "2", AnswerState: AnswerStatePresent,
+	}}}
+	o := newParallelAnchorOrchestrator(t, recognizer, nil)
+	o.deps.Grader = grader
+	o.deps.Now = func() int64 { return time.Now().Unix() }
+
+	jobID := startOrchestratorJob(t, o, "msg-frozen-assess-complete-at-deadline").Record.RecordID
+	freezeItemResumeBudget(t, o, jobID)
+	if _, err := o.RunGradingJob(context.Background(), jobID); err != nil {
+		t.Fatalf("RunGradingJob recognizing: %v", err)
+	}
+	waitGradingView(t, o, jobID, func(v GradingJobView) bool {
+		return v.Record.Status == k12.GradingStageAwaitingConfirmation &&
+			v.Fields.AnchorState == k12.GradingAnchorDegraded
+	})
+
+	o.deps.Now = func() int64 {
+		return time.Now().Unix() - 90 + 1
+	}
+	view, err := o.ConfirmAndRun(context.Background(), jobID, nil)
+	if err != nil {
+		t.Fatalf("complete frozen item returned after context expiry must remain usable: %v", err)
+	}
+	select {
+	case <-grader.started:
+	default:
+		t.Fatal("regression setup did not enter the adapter call")
+	}
+	if view.Record.Status != k12.GradingStageCompleted {
+		t.Fatalf("complete frozen item must not become false unknown: stage=%s fields=%+v", view.Record.Status, view.Fields)
+	}
+	result, ok := o.PhotoResult(jobID)
+	if !ok || len(result.Items) != 1 || result.Items[0].Status != PhotoCorrect {
+		t.Fatalf("completed frozen result missing: ok=%v result=%#v", ok, result)
+	}
+	invocations, listErr := o.deps.Records.ListGradingItemInvocations(context.Background(), "mingming", jobID)
+	if listErr != nil {
+		t.Fatalf("list item invocations: %v", listErr)
+	}
+	if len(invocations) != 2 {
+		t.Fatalf("solve and grade invocations=%d, want 2", len(invocations))
+	}
+	for _, invocation := range invocations {
+		if invocation.Status != k12.ModelInvocationSucceeded {
+			t.Fatalf("complete item invocation status=%s, want succeeded", invocation.Status)
+		}
+	}
+}
+
 func TestGradingOrchestratorAssessTypedUnknownItemDoesNotComplete(t *testing.T) {
 	for _, tc := range []struct {
 		name string

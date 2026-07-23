@@ -138,6 +138,7 @@ type GradingJobFields struct {
 	AnchorState       string                   `json:"anchor_state"`
 	Deadline          int64                    `json:"deadline,omitempty"` // 当前自动阶段截止（unix 秒）；awaiting_confirmation 人工等待不计入 = 0（规则 7）
 	ModelSnapshot     GradingModelSnapshot     `json:"model_snapshot"`
+	BudgetSnapshot    GradingBudgetSnapshot    `json:"budget_snapshot,omitempty"` // policy_version=0：旧任务/发布预算尚未冻结
 	StageCheckpoints  []GradingStageCheckpoint `json:"stage_checkpoints,omitempty"`
 	AttemptCount      int                      `json:"attempt_count,omitempty"` // 当前阶段重试计数（规则 4）
 	FailureKind       string                   `json:"failure_kind,omitempty"`  // 仅失败态有值
@@ -313,6 +314,9 @@ func validateGradingJobFields(fieldsJSON string) error {
 	}
 	if f.ModelSnapshot.Route != f.ModelSnapshot.Provider+"/"+f.ModelSnapshot.Model {
 		return fmt.Errorf("model_snapshot route 与 provider/model 不一致")
+	}
+	if err := f.BudgetSnapshot.Validate(); err != nil {
+		return fmt.Errorf("budget_snapshot 非法: %w", err)
 	}
 	valid := map[string]bool{}
 	for _, s := range GradingJobSchema().Statuses {

@@ -3,6 +3,9 @@ package apihttp_test
 import (
 	"net/http"
 	"testing"
+
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 )
 
 // TestGradingJobPublicSurfaceExactSet 固定 DD-001 公共边界：客户端只能创建、查询、
@@ -71,5 +74,29 @@ func TestGradingJobResultHonorsAgentIsolation(t *testing.T) {
 	rec, out = do(t, h, http.MethodGet, "/grading-jobs/"+jobID+"/result?agent=gege", "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("跨实例读取 result 必须 404: %d %v", rec.Code, out)
+	}
+}
+
+func TestFrozenBudgetRejectsGenericPublicJobWithoutProblemAttemptMaterializer(t *testing.T) {
+	f := newGradingFixture(t)
+	f.deps.GradingBudgetSnapshot = k12.GradingBudgetSnapshot{
+		PolicyVersion: 1,
+		StageSeconds: k12.GradingStageBudgets{
+			Queued: 30, Normalizing: 30, Recognizing: 60,
+			Locating: 30, Rendering: 30, Projecting: 30,
+		},
+		AssessingBuckets: []k12.GradingAssessingBudgetBucket{
+			{MaxProblems: 1, Seconds: 60},
+			{MaxProblems: 8, Seconds: 120},
+			{MaxProblems: 16, Seconds: 240},
+			{MaxProblems: 32, Seconds: 480},
+		},
+		ItemConcurrency: 2,
+	}
+	h := apihttp.NewHandler(apihttp.Runtime{Records: f.deps.Records, Deps: f.deps})
+
+	rec, out := do(t, h, http.MethodPost, "/grading-jobs", createJobBody("frozen-generic-no-materializer"))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("generic public creation under frozen per-item policy: got %d want 400 body=%v", rec.Code, out)
 	}
 }

@@ -15,11 +15,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
@@ -119,7 +121,9 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	}
 	solveSkill := engine.NewSolveSkill(execSubagent, subagents)
 
+	var visionCalls atomic.Int32
 	vision := func(visionCtx context.Context, image []byte, prompt string) (string, error) {
+		call := visionCalls.Add(1)
 		provider, model, routeErr := react.RouteForVision(visionCtx)
 		if routeErr != nil {
 			return "", routeErr
@@ -129,7 +133,7 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 			mime = "image/jpeg"
 		}
 		dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
-		t.Logf("vision call: provider=%q model=%q bytes=%d", provider.Name(), model, len(image))
+		t.Logf("vision call: call=%d provider=%q model=%q bytes=%d", call, provider.Name(), model, len(image))
 		resp, completeErr := provider.Complete(visionCtx, hexagon.CompletionRequest{
 			Model: model,
 			Messages: []llm.Message{{
@@ -172,7 +176,8 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	started := time.Now()
 	reply, handled, err := maybeHandleK12DingtalkPhoto(t.Context(), msg, k12PhotoTestRouter(t, true, "k12-tutor"), process)
 	if err != nil {
-		t.Fatalf("direct K12 photo route failed: error_type=%T", err)
+		t.Fatalf("direct K12 photo route failed: failure_kind=%s vision_calls=%d error_type=%T",
+			classifyK12PhotoProbeFailure(err), visionCalls.Load(), err)
 	}
 	if !handled || reply == nil {
 		t.Fatalf("direct K12 photo route not handled: handled=%v reply_present=%v", handled, reply != nil)
@@ -393,6 +398,49 @@ func writeK12PhotoProbeMarkdown(path, content string) error {
 	return os.Chmod(path, 0o600)
 }
 
+// classifyK12PhotoProbeFailure converts the nested production error into a
+// fixed, non-sensitive diagnostic vocabulary. It deliberately never returns
+// err.Error(): provider bodies, OCR text and child content must not enter CI
+// logs merely to make this opt-in probe debuggable.
+func classifyK12PhotoProbeFailure(err error) string {
+	if err == nil {
+		return "none"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "未识别到可处理的题目") ||
+		strings.Contains(message, "未识别到可作答的独立题目"):
+		return "recognition_empty"
+	case strings.Contains(message, "解析识题结果失败") ||
+		strings.Contains(message, "解析印刷题清单失败"):
+		return "recognition_protocol"
+	case strings.Contains(message, "duplicate problem_id") ||
+		strings.Contains(message, "recognition_confidence") ||
+		strings.Contains(message, "unsupported problem_kind") ||
+		strings.Contains(message, "cannot have parent/subproblem_no") ||
+		strings.Contains(message, "cannot own answer/parent/subproblem_no") ||
+		strings.Contains(message, "needs an existing compound parent") ||
+		strings.Contains(message, "duplicate subproblem_no") ||
+		strings.Contains(message, "needs attempt_id") ||
+		strings.Contains(message, "duplicate attempt_id") ||
+		strings.Contains(message, "must share page_asset_id"):
+		return "recognition_identity_invalid"
+	case strings.Contains(message, "视觉模型调用失败") ||
+		strings.Contains(message, "photo probe provider completion failed"):
+		return "vision_provider"
+	case strings.Contains(message, "作答坐标") || strings.Contains(message, "anchor"):
+		return "answer_anchor"
+	default:
+		return "unknown"
+	}
+}
+
 func TestWriteK12PhotoProbeMarkdown_OwnerOnly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "result.md")
 	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
@@ -415,5 +463,31 @@ func TestWriteK12PhotoProbeMarkdown_OwnerOnly(t *testing.T) {
 	}
 	if gotMode := info.Mode().Perm(); gotMode != 0o600 {
 		t.Fatalf("Markdown mode = %o, want 600", gotMode)
+	}
+}
+
+func TestClassifyK12PhotoProbeFailure_SanitizesKnownCauses(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "nil", err: nil, want: "none"},
+		{name: "deadline", err: fmt.Errorf("wrapped: %w", context.DeadlineExceeded), want: "deadline_exceeded"},
+		{name: "canceled", err: fmt.Errorf("wrapped: %w", context.Canceled), want: "canceled"},
+		{name: "empty recognition", err: fmt.Errorf("usecase: 未识别到可处理的题目"), want: "recognition_empty"},
+		{name: "recognition protocol", err: fmt.Errorf("recognizer: 解析识题结果失败"), want: "recognition_protocol"},
+		{name: "duplicate identity", err: fmt.Errorf("invalid input: duplicate problem_id"), want: "recognition_identity_invalid"},
+		{name: "standalone identity", err: fmt.Errorf("standalone problem cannot have parent/subproblem_no"), want: "recognition_identity_invalid"},
+		{name: "vision provider", err: fmt.Errorf("recognizer: 视觉模型调用失败"), want: "vision_provider"},
+		{name: "anchor", err: fmt.Errorf("usecase: 作答坐标核验失败"), want: "answer_anchor"},
+		{name: "unknown does not echo detail", err: fmt.Errorf("private upstream detail must stay hidden"), want: "unknown"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyK12PhotoProbeFailure(test.err); got != test.want {
+				t.Fatalf("classifyK12PhotoProbeFailure()=%q want=%q", got, test.want)
+			}
+		})
 	}
 }

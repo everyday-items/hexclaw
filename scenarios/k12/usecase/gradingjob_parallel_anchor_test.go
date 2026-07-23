@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"runtime"
@@ -601,6 +602,41 @@ func TestGradingOrchestratorAnchorProviderBudgetStartsAfterSlowLedger(t *testing
 	case <-result:
 	case <-time.After(time.Second):
 		t.Fatal("executeAnchor did not return")
+	}
+}
+
+func TestGradingOrchestratorFrozenJobUsesItsOwnLocatingBudget(t *testing.T) {
+	anchorer := &remainingBudgetAnchorer{remaining: make(chan time.Duration, 1)}
+	recognizer := &countingRecognizer{questions: []RecognizedQuestion{{
+		Question: "1+1=", Subject: "数学", StudentAnswer: "3", AnswerState: AnswerStatePresent,
+	}}}
+	o := newParallelAnchorOrchestrator(t, recognizer, anchorer, WithGradingAnchorTimeout(5*time.Second))
+	job := startOrchestratorJob(t, o, "msg-frozen-anchor-budget")
+	view, err := o.deps.GetGradingJob(context.Background(), "mingming", job.Record.RecordID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view.Fields.BudgetSnapshot = frozenWiringBudget()
+	view.Fields.BudgetSnapshot.StageSeconds.Locating = 1
+	raw, err := json.Marshal(view.Fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := o.deps.Records.UpdateStatusFields(context.Background(), view.Record.RecordID,
+		view.Record.Status, view.Record.DueAt, string(raw), view.Record.Version); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, _, _ = o.executeAnchor(job.Record.RecordID, "mingming", []byte("image"),
+		[]RecognizedQuestion{{Question: "1+1=", StudentAnswer: "3", AnswerState: AnswerStatePresent}},
+		orchestratorSnapshot())
+	select {
+	case remaining := <-anchorer.remaining:
+		if remaining < 500*time.Millisecond || remaining > 2*time.Second {
+			t.Fatalf("provider remaining=%s, want frozen locating budget near 1s (legacy option was 5s)", remaining)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("anchor provider did not observe deadline")
 	}
 }
 

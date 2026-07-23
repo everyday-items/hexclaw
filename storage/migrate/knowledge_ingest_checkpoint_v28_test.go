@@ -93,7 +93,7 @@ func TestKnowledgeIngestCheckpointV28IsLatest(t *testing.T) {
 	if KnowledgeIngestCheckpointV28.Version != 28 {
 		t.Fatalf("KnowledgeIngestCheckpointV28.Version=%d, want 28", KnowledgeIngestCheckpointV28.Version)
 	}
-	if len(All) == 0 || All[len(All)-1].Version != 29 {
-		t.Fatalf("latest migration=%d, want 29", All[len(All)-1].Version)
+	if len(All) == 0 || All[len(All)-1].Version != 31 {
+		t.Fatalf("latest migration=%d, want 31", All[len(All)-1].Version)
 	}
 }

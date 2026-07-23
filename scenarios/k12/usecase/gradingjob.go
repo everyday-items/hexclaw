@@ -32,6 +32,14 @@ type CreateGradingJobInput struct {
 	SourceKey        string
 	ConfirmedVersion int
 	ModelSnapshot    k12.GradingModelSnapshot
+	// BudgetSnapshot is reserved for trusted internal callers/tests. When zero,
+	// CreateGradingJob freezes Deps.GradingBudgetSnapshot. API payloads do not
+	// expose this field, so a client cannot select a release policy per request.
+	BudgetSnapshot k12.GradingBudgetSnapshot
+	// MaterializesProblemAttempts is a trusted caller contract: before this Job
+	// can leave confirmation, the caller will persist typed Problem/Attempt facts.
+	// Frozen policies reject generic placeholder Jobs that have no such path.
+	MaterializesProblemAttempts bool
 }
 
 // AdvanceGradingStage 的 outcome 枚举。
@@ -69,6 +77,23 @@ func (d Deps) CreateGradingJob(ctx context.Context, agentName, sourceSession str
 		return GradingJobView{}, false, fmt.Errorf("%w: confirmed_version 不可为负", ErrInvalidInput)
 	}
 	in.ModelSnapshot = k12.NormalizeGradingModelSnapshot(in.ModelSnapshot)
+	budgetSnapshot := in.BudgetSnapshot
+	if !budgetSnapshot.IsFrozen() {
+		if err := budgetSnapshot.Validate(); err != nil {
+			return GradingJobView{}, false, fmt.Errorf("%w: invalid grading budget snapshot: %v", ErrInvalidInput, err)
+		}
+		budgetSnapshot = d.GradingBudgetSnapshot
+	}
+	if err := budgetSnapshot.Validate(); err != nil {
+		return GradingJobView{}, false, fmt.Errorf("%w: invalid grading budget snapshot: %v", ErrInvalidInput, err)
+	}
+	if budgetSnapshot.IsFrozen() && !in.MaterializesProblemAttempts {
+		return GradingJobView{}, false, fmt.Errorf("%w: frozen grading jobs require a typed Problem/Attempt materialization path", ErrInvalidInput)
+	}
+	queuedBudget, ok := gradingBudgetSeconds(budgetSnapshot, k12.GradingStageQueued, 0)
+	if !ok {
+		return GradingJobView{}, false, fmt.Errorf("%w: missing queued grading budget", ErrInvalidInput)
+	}
 	f := k12.GradingJobFields{
 		SubmissionID:      in.SubmissionID,
 		SourceKind:        in.SourceKind,
@@ -76,8 +101,9 @@ func (d Deps) CreateGradingJob(ctx context.Context, agentName, sourceSession str
 		ConfirmedVersion:  in.ConfirmedVersion,
 		ConfirmationState: k12.GradingConfirmationPending,
 		AnchorState:       k12.GradingAnchorPending,
-		Deadline:          d.now() + k12.GradingStageBudgetSeconds(k12.GradingStageQueued),
+		Deadline:          d.now() + queuedBudget,
 		ModelSnapshot:     in.ModelSnapshot,
+		BudgetSnapshot:    budgetSnapshot,
 	}
 	return d.putGradingJob(ctx, agentName, sourceSession, f)
 }
@@ -213,7 +239,9 @@ func (d Deps) advanceGradingOK(ctx context.Context, v GradingJobView, in Advance
 		v.Fields.Retryable = false
 		v.Fields.FailedStage = ""
 	}
-	d.setGradingDeadline(&v.Fields, next)
+	if err := d.setGradingDeadline(ctx, v.Record.AgentName, &v.Fields, next); err != nil {
+		return GradingJobView{}, err
+	}
 	return d.saveGradingJob(ctx, v, next)
 }
 
@@ -228,7 +256,9 @@ func (d Deps) advanceGradingFailed(ctx context.Context, v GradingJobView, in Adv
 		v.Fields.StageCheckpoints = append(v.Fields.StageCheckpoints, k12.GradingStageCheckpoint{
 			Stage: stage, ArtifactDigest: "degraded:" + in.FailureKind, RecordedAt: d.now(), Degraded: true,
 		})
-		d.setGradingDeadline(&v.Fields, k12.GradingStageProjecting)
+		if err := d.setGradingDeadline(ctx, v.Record.AgentName, &v.Fields, k12.GradingStageProjecting); err != nil {
+			return GradingJobView{}, err
+		}
 		return d.saveGradingJob(ctx, v, k12.GradingStageProjecting)
 	}
 	switch stage {
@@ -273,7 +303,9 @@ func (d Deps) advanceGradingAnchor(ctx context.Context, v GradingJobView, in Adv
 	next := stage
 	if gradingJoinReady(v.Fields) {
 		next = k12.GradingStageAssessing
-		d.setGradingDeadline(&v.Fields, next)
+		if err := d.setGradingDeadline(ctx, v.Record.AgentName, &v.Fields, next); err != nil {
+			return GradingJobView{}, err
+		}
 	}
 	return d.saveGradingJob(ctx, v, next)
 }
@@ -300,7 +332,9 @@ func (d Deps) ConfirmGradingJob(ctx context.Context, agentName, recordID string,
 	if gradingJoinReady(v.Fields) {
 		next = k12.GradingStageAssessing
 		// §5.4：确认恢复后按剩余阶段预算重新起算 deadline。
-		d.setGradingDeadline(&v.Fields, next)
+		if err := d.setGradingDeadline(ctx, v.Record.AgentName, &v.Fields, next); err != nil {
+			return GradingJobView{}, err
+		}
 	}
 	return d.saveGradingJob(ctx, v, next)
 }
@@ -343,9 +377,15 @@ func (d Deps) ReviseGradingJob(ctx context.Context, agentName, recordID, sourceS
 		ConfirmedVersion:  newVersion,
 		ConfirmationState: k12.GradingConfirmationConfirmed, // 修正即新确认输入已冻结
 		AnchorState:       old.Fields.AnchorState,           // 复用已固化定位结论（located/degraded）
-		Deadline:          d.now() + k12.GradingStageBudgetSeconds(k12.GradingStageQueued),
+		Deadline:          0,
 		ModelSnapshot:     old.Fields.ModelSnapshot,
+		BudgetSnapshot:    old.Fields.BudgetSnapshot,
 	}
+	queuedBudget, ok := gradingBudgetSeconds(f.BudgetSnapshot, k12.GradingStageQueued, 0)
+	if !ok {
+		return GradingJobView{}, false, fmt.Errorf("%w: missing queued grading budget", ErrInvalidInput)
+	}
+	f.Deadline = d.now() + queuedBudget
 	// 检查点预置：复用识别/定位产物 + 新确认输入摘要 → GradingResumeStage 直达 assessing。
 	for _, cp := range old.Fields.StageCheckpoints {
 		switch cp.Stage {
@@ -391,7 +431,11 @@ func (d Deps) RetryGradingJob(ctx context.Context, agentName, recordID string) (
 	if !v.Fields.Retryable {
 		return GradingJobView{}, errGradingStageConflict("该失败不可安全重试（failure_kind=%s）", v.Fields.FailureKind)
 	}
-	v.Fields.Deadline = d.now() + k12.GradingStageBudgetSeconds(k12.GradingStageQueued)
+	queuedBudget, ok := gradingBudgetSeconds(v.Fields.BudgetSnapshot, k12.GradingStageQueued, 0)
+	if !ok {
+		return GradingJobView{}, fmt.Errorf("%w: missing queued grading budget", ErrInvalidInput)
+	}
+	v.Fields.Deadline = d.now() + queuedBudget
 	return d.saveGradingJob(ctx, v, k12.GradingStageQueued)
 }
 
@@ -436,15 +480,39 @@ func (d Deps) ReconcileGradingInvocationNotExecuted(ctx context.Context, agentNa
 
 // --- 内部辅助 ---
 
-// setGradingDeadline 进入 next 阶段时按阶段预算重算 deadline；
-// awaiting_confirmation 预算为 0 = 人工等待不计入（规则 7），终态清零。
-func (d Deps) setGradingDeadline(f *k12.GradingJobFields, next string) {
-	budget := k12.GradingStageBudgetSeconds(next)
-	if budget <= 0 {
-		f.Deadline = 0
-		return
+// setGradingDeadline reads only the immutable Job snapshot for a frozen Job.
+// Assessing selects its measured bucket from the durable Attempt count; legacy
+// policy_version=0 keeps the historical compatibility budgets.
+func (d Deps) setGradingDeadline(ctx context.Context, agentName string, f *k12.GradingJobFields, next string) error {
+	problemCount := 0
+	if f.BudgetSnapshot.IsFrozen() && next == k12.GradingStageAssessing {
+		snapshot, err := d.Records.GetProblemAttemptSnapshot(ctx, agentName, f.SubmissionID)
+		if err != nil {
+			return fmt.Errorf("usecase: read assessing item count: %w", err)
+		}
+		problemCount = len(snapshot.Attempts)
+	}
+	budget, ok := gradingBudgetSeconds(f.BudgetSnapshot, next, problemCount)
+	if !ok {
+		if k12.GradingStageTerminal(next) || next == k12.GradingStageAwaitingConfirmation {
+			f.Deadline = 0
+			return nil
+		}
+		return fmt.Errorf("%w: no grading budget for stage=%s problems=%d", ErrInvalidInput, next, problemCount)
 	}
 	f.Deadline = d.now() + budget
+	return nil
+}
+
+func gradingBudgetSeconds(snapshot k12.GradingBudgetSnapshot, stage string, problemCount int) (int64, bool) {
+	if snapshot.IsFrozen() {
+		return snapshot.StageBudgetSeconds(stage, problemCount)
+	}
+	if snapshot.Validate() != nil {
+		return 0, false
+	}
+	budget := k12.GradingStageBudgetSeconds(stage)
+	return budget, budget > 0
 }
 
 // saveGradingJob 乐观锁写回（状态机合法性由 records schema Transitions 强制）。

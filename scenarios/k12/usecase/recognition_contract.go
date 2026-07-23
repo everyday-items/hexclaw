@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strings"
@@ -281,36 +282,158 @@ func recognizedAnswerDisplayText(q RecognizedQuestion) string {
 func NormalizeRecognizedProblems(scope string, questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
 	out := make([]RecognizedQuestion, len(questions))
 	pageAssetID := stableRecognitionID("page", scope)
-	originalToStable := make(map[string]string, len(questions))
-	ids := make(map[string]struct{}, len(questions))
+	modelParentRefs := make(map[string]string, len(questions))
+	parentRefs := make([]string, len(questions))
 	for i, question := range questions {
-		originalID := strings.TrimSpace(question.ProblemID)
+		modelRef := strings.TrimSpace(question.ProblemID)
+		parentRefs[i] = strings.TrimSpace(question.ParentProblemID)
+		if err := validateRecognitionEvidence(i, question); err != nil {
+			return nil, err
+		}
 		question = NormalizeRecognizedQuestion(question)
-		if question.RecognitionConfidence != nil && (*question.RecognitionConfidence < 0 || *question.RecognitionConfidence > 1) {
-			return nil, fmt.Errorf("%w: problem index %d recognition_confidence 超出 0..1", ErrInvalidInput, i)
-		}
-		question.ProblemKind = normalizeProblemKind(question.ProblemKind, question.ParentProblemID)
-		if originalID == "" {
-			question.ProblemID = stableProblemID(scope, i, question)
-		} else {
-			question.ProblemID = originalID
-			originalToStable[originalID] = question.ProblemID
-		}
+		question.ProblemKind = normalizeProblemKind(question.ProblemKind, parentRefs[i])
+		// Model identity fields are response-local hints, never durable facts. The
+		// server mints all durable identity and confirmation fields below.
+		question.ProblemID = ""
+		question.AttemptID = ""
+		question.ConfirmedVersion = 0
+		question.InputDigest = ""
 		if question.PageAssetID == "" {
 			question.PageAssetID = pageAssetID
 		}
-		if question.ProblemKind != ProblemKindCompoundParent && question.AttemptID == "" {
+		switch question.ProblemKind {
+		case ProblemKindStandalone:
+			if parentRefs[i] != "" || strings.TrimSpace(question.SubproblemNo) != "" {
+				return nil, fmt.Errorf("%w: standalone problem index %d cannot have parent/subproblem_no", ErrInvalidInput, i)
+			}
+			question.ParentProblemID = ""
+			question.ProblemID = stableProblemID(scope, i, question)
 			question.AttemptID = stableRecognitionID("attempt", scope+"\x00"+question.ProblemID)
+		case ProblemKindCompoundParent:
+			if parentRefs[i] != "" || strings.TrimSpace(question.SubproblemNo) != "" || question.AnswerState != AnswerStateBlank {
+				return nil, fmt.Errorf("%w: compound parent index %d cannot own answer/parent/subproblem_no", ErrInvalidInput, i)
+			}
+			question.ParentProblemID = ""
+			question.ProblemID = stableProblemID(scope, i, question)
+			if modelRef != "" {
+				if _, duplicate := modelParentRefs[modelRef]; duplicate {
+					return nil, fmt.Errorf("%w: ambiguous compound parent reference %q", ErrInvalidInput, modelRef)
+				}
+				modelParentRefs[modelRef] = question.ProblemID
+			}
+		case ProblemKindSubproblem:
+			// Resolve after every compound parent has been assigned a server ID.
+		default:
+			return nil, fmt.Errorf("%w: unsupported problem_kind %q", ErrInvalidInput, question.ProblemKind)
 		}
-		if _, duplicate := ids[question.ProblemID]; duplicate {
-			return nil, fmt.Errorf("%w: duplicate problem_id %q", ErrInvalidInput, question.ProblemID)
-		}
-		ids[question.ProblemID] = struct{}{}
 		out[i] = question
 	}
+	for i := range out {
+		if out[i].ProblemKind != ProblemKindSubproblem {
+			continue
+		}
+		parentID, ok := modelParentRefs[parentRefs[i]]
+		if parentRefs[i] == "" || !ok {
+			return nil, fmt.Errorf("%w: subproblem index %d has dangling parent reference %q", ErrInvalidInput, i, parentRefs[i])
+		}
+		out[i].ParentProblemID = parentID
+		out[i].SubproblemNo = strings.TrimSpace(out[i].SubproblemNo)
+		if out[i].SubproblemNo == "" {
+			return nil, fmt.Errorf("%w: subproblem index %d needs subproblem_no", ErrInvalidInput, i)
+		}
+		out[i].ProblemID = stableProblemID(scope, i, out[i])
+		out[i].AttemptID = stableRecognitionID("attempt", scope+"\x00"+out[i].ProblemID)
+	}
+	if err := validateNormalizedRecognizedProblems(out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func validateRecognitionEvidence(index int, question RecognizedQuestion) error {
+	if question.RecognitionConfidence != nil &&
+		(math.IsNaN(*question.RecognitionConfidence) || math.IsInf(*question.RecognitionConfidence, 0) ||
+			*question.RecognitionConfidence < 0 || *question.RecognitionConfidence > 1) {
+		return fmt.Errorf("%w: problem index %d recognition_confidence 超出 0..1", ErrInvalidInput, index)
+	}
+	if question.BBox != nil {
+		box := *question.BBox
+		values := []float64{box.X, box.Y, box.W, box.H}
+		for _, value := range values {
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				return fmt.Errorf("%w: problem index %d bbox 非法", ErrInvalidInput, index)
+			}
+		}
+		if box.X < 0 || box.Y < 0 || box.W <= 0 || box.H <= 0 || box.X+box.W > 1.005 || box.Y+box.H > 1.005 {
+			return fmt.Errorf("%w: problem index %d bbox 超出归一化页面", ErrInvalidInput, index)
+		}
+	}
+	return nil
+}
+
+func normalizeAndValidateServerRecognizedProblems(questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
+	out := cloneRecognizedQuestions(questions)
+	for i := range out {
+		if err := validateRecognitionEvidence(i, out[i]); err != nil {
+			return nil, err
+		}
+		out[i] = NormalizeRecognizedQuestion(out[i])
+	}
+	if err := validateNormalizedRecognizedProblems(out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func normalizeRecognizedProblemsForSnapshot(scope string, questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
+	missingProblemIDs := 0
+	for i := range questions {
+		if strings.TrimSpace(questions[i].ProblemID) == "" {
+			missingProblemIDs++
+		}
+	}
+	if missingProblemIDs == len(questions) {
+		// A not-yet-promoted recognition batch has no durable identity at all.
+		return NormalizeRecognizedProblems(scope, questions)
+	}
+	if missingProblemIDs > 0 {
+		// Never replace an identity that a legacy checkpoint may already have
+		// exposed to confirmation/correction callers.
+		return nil, fmt.Errorf("%w: recognition snapshot contains partially minted problem identity", ErrInvalidInput)
+	}
+
+	out := cloneRecognizedQuestions(questions)
+	for i := range out {
+		if err := validateRecognitionEvidence(i, out[i]); err != nil {
+			return nil, err
+		}
+		out[i] = NormalizeRecognizedQuestion(out[i])
+		if out[i].ProblemKind != ProblemKindCompoundParent && strings.TrimSpace(out[i].AttemptID) == "" {
+			// Pre-V19 run.json can contain an identity already exposed by its
+			// checkpoint but no Attempt. Preserve that historical ProblemID and
+			// deterministically add the missing server-owned Attempt so recovery
+			// never changes the job's visible/correction target mid-flight.
+			out[i].AttemptID = stableRecognitionID("attempt", scope+"\x00"+out[i].ProblemID)
+		}
+	}
+	if err := validateNormalizedRecognizedProblems(out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func validateNormalizedRecognizedProblems(out []RecognizedQuestion) error {
+	ids := make(map[string]struct{}, len(out))
 	parents := make(map[string]struct{})
 	parentPages := make(map[string]string)
 	for _, question := range out {
+		if strings.TrimSpace(question.ProblemID) == "" {
+			return fmt.Errorf("%w: normalized problem_id 不可空", ErrInvalidInput)
+		}
+		if _, duplicate := ids[question.ProblemID]; duplicate {
+			return fmt.Errorf("%w: duplicate problem_id %q", ErrInvalidInput, question.ProblemID)
+		}
+		ids[question.ProblemID] = struct{}{}
 		if question.ProblemKind == ProblemKindCompoundParent {
 			parents[question.ProblemID] = struct{}{}
 			parentPages[question.ProblemID] = question.PageAssetID
@@ -320,49 +443,45 @@ func NormalizeRecognizedProblems(scope string, questions []RecognizedQuestion) (
 	attemptIDs := make(map[string]struct{}, len(out))
 	for i := range out {
 		q := &out[i]
-		if mapped := originalToStable[strings.TrimSpace(q.ParentProblemID)]; mapped != "" {
-			q.ParentProblemID = mapped
-		} else {
-			q.ParentProblemID = strings.TrimSpace(q.ParentProblemID)
-		}
+		q.ParentProblemID = strings.TrimSpace(q.ParentProblemID)
 		switch q.ProblemKind {
 		case ProblemKindStandalone:
 			if q.ParentProblemID != "" || q.SubproblemNo != "" {
-				return nil, fmt.Errorf("%w: standalone problem %q cannot have parent/subproblem_no", ErrInvalidInput, q.ProblemID)
+				return fmt.Errorf("%w: standalone problem %q cannot have parent/subproblem_no", ErrInvalidInput, q.ProblemID)
 			}
 		case ProblemKindCompoundParent:
 			if q.ParentProblemID != "" || q.SubproblemNo != "" || q.AnswerState != AnswerStateBlank || q.AttemptID != "" || q.InputDigest != "" {
-				return nil, fmt.Errorf("%w: compound parent %q cannot own answer/parent/subproblem_no", ErrInvalidInput, q.ProblemID)
+				return fmt.Errorf("%w: compound parent %q cannot own answer/parent/subproblem_no", ErrInvalidInput, q.ProblemID)
 			}
 		case ProblemKindSubproblem:
 			if _, ok := parents[q.ParentProblemID]; !ok || strings.TrimSpace(q.SubproblemNo) == "" {
-				return nil, fmt.Errorf("%w: subproblem %q needs an existing compound parent and subproblem_no", ErrInvalidInput, q.ProblemID)
+				return fmt.Errorf("%w: subproblem %q needs an existing compound parent and subproblem_no", ErrInvalidInput, q.ProblemID)
 			}
 			q.SubproblemNo = strings.TrimSpace(q.SubproblemNo)
 			if subproblemNos[q.ParentProblemID] == nil {
 				subproblemNos[q.ParentProblemID] = map[string]struct{}{}
 			}
 			if _, duplicate := subproblemNos[q.ParentProblemID][q.SubproblemNo]; duplicate {
-				return nil, fmt.Errorf("%w: duplicate subproblem_no %q under parent %q", ErrInvalidInput, q.SubproblemNo, q.ParentProblemID)
+				return fmt.Errorf("%w: duplicate subproblem_no %q under parent %q", ErrInvalidInput, q.SubproblemNo, q.ParentProblemID)
 			}
 			subproblemNos[q.ParentProblemID][q.SubproblemNo] = struct{}{}
 		default:
-			return nil, fmt.Errorf("%w: unsupported problem_kind %q", ErrInvalidInput, q.ProblemKind)
+			return fmt.Errorf("%w: unsupported problem_kind %q", ErrInvalidInput, q.ProblemKind)
 		}
 		if q.ProblemKind != ProblemKindCompoundParent {
 			if q.AttemptID == "" {
-				return nil, fmt.Errorf("%w: answerable problem %q needs attempt_id", ErrInvalidInput, q.ProblemID)
+				return fmt.Errorf("%w: answerable problem %q needs attempt_id", ErrInvalidInput, q.ProblemID)
 			}
 			if _, duplicate := attemptIDs[q.AttemptID]; duplicate {
-				return nil, fmt.Errorf("%w: duplicate attempt_id %q", ErrInvalidInput, q.AttemptID)
+				return fmt.Errorf("%w: duplicate attempt_id %q", ErrInvalidInput, q.AttemptID)
 			}
 			attemptIDs[q.AttemptID] = struct{}{}
 		}
 		if q.ProblemKind == ProblemKindSubproblem && q.PageAssetID != parentPages[q.ParentProblemID] {
-			return nil, fmt.Errorf("%w: subproblem %q and parent must share page_asset_id", ErrInvalidInput, q.ProblemID)
+			return fmt.Errorf("%w: subproblem %q and parent must share page_asset_id", ErrInvalidInput, q.ProblemID)
 		}
 	}
-	return out, nil
+	return nil
 }
 
 func normalizeProblemKind(kind ProblemKind, parentID string) ProblemKind {
@@ -495,7 +614,7 @@ func RecognizedQuestionsProblemAttemptSnapshot(agentName, submissionID string, q
 	if agentName == "" || submissionID == "" || at <= 0 {
 		return k12.ProblemAttemptSnapshot{}, fmt.Errorf("%w: Problem/Attempt snapshot 缺少 owner/submission/time", ErrInvalidInput)
 	}
-	normalized, err := NormalizeRecognizedProblems(submissionID, questions)
+	normalized, err := normalizeRecognizedProblemsForSnapshot(submissionID, questions)
 	if err != nil {
 		return k12.ProblemAttemptSnapshot{}, err
 	}
@@ -594,5 +713,5 @@ func RecognizedQuestionsFromProblemAttemptSnapshot(snapshot k12.ProblemAttemptSn
 	if len(attempts) != 0 {
 		return nil, fmt.Errorf("%w: snapshot 含不属于 Problem 的 Attempt", ErrInvalidInput)
 	}
-	return NormalizeRecognizedProblems(problems[0].SubmissionID, questions)
+	return normalizeAndValidateServerRecognizedProblems(questions)
 }
