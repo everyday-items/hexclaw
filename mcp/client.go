@@ -491,6 +491,16 @@ func (m *Manager) ListToolDefinitions() []llm.ToolDefinition {
 			continue
 		}
 		for _, t := range srv.tools {
+			if path, err := validateLLMToolSchema(t.Schema()); err != nil {
+				logger.Warn(
+					"MCP 工具 Schema 无法安全注入 LLM，已隔离该工具",
+					"server", srv.name,
+					"tool", t.Name(),
+					"path", path,
+					"error", err,
+				)
+				continue
+			}
 			// Convert hexagon.Tool (ai-core/tool.Tool) to llm.ToolDefinition
 			// tool.Tool has: Name(), Description(), Schema() *schema.Schema
 			// llm.ToolDefinition has: Type="function", Function{Name, Description, Parameters *Schema}
