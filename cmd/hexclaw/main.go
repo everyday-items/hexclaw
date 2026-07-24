@@ -1755,6 +1755,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				provider, visionModel, rErr = eng.RouteForVision(ctx)
 				if rErr != nil {
 					logger.Warn("[k12识题] 视觉模型路由失败", "err", rErr.Error(), "image_bytes", len(image))
+					if errors.Is(rErr, llmrouter.ErrNoCapableModel) ||
+						errors.Is(rErr, llmrouter.ErrModelCapabilityMismatch) {
+						return "", fmt.Errorf("%w: %v", k12usecase.ErrInvalidInput, rErr)
+					}
 					return "", rErr
 				}
 			}
@@ -1783,6 +1787,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			})
 			if cErr != nil {
 				logger.Warn("[k12识题] 视觉模型调用失败", "provider", provider.Name(), "model", visionModel, "err", cErr.Error())
+				if errors.Is(cErr, llmrouter.ErrModelCapabilityMismatch) {
+					return "", fmt.Errorf("%w: %v", k12usecase.ErrInvalidInput, cErr)
+				}
 				return "", cErr
 			}
 			return resp.Content, nil
@@ -2060,9 +2067,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			k12Base := fmt.Sprintf("http://127.0.0.1:%d", cfg.Server.Port)
 			// 统一 GradingJob 编排器（§6.7 单一应用服务）：桌面 HTTP 入口与钉钉 IM 入口共用；
 			// §6.15 异步执行模型（进程级 ctx + 有界并发 + panic 不逃逸）+ 阶段产物落盘恢复。
-			k12ModelSnapshot := func() k12.GradingModelSnapshot {
-				name := router.DefaultName()
-				return k12.GradingModelSnapshot{Provider: name, Model: router.ProviderModel(name), Capability: "vision"}
+			k12ModelSnapshot := func(requested k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
+				return resolveK12GradingModelSnapshot(router, requested)
 			}
 			k12GradingOrch = k12usecase.NewGradingOrchestrator(k12rt.Deps, k12ModelSnapshot,
 				k12usecase.WithGradingRunDir(filepath.Join(dataDir, "k12", "grading-runs")),
@@ -2082,13 +2088,14 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			}
 			// 挂载前缀取自 Manifest（路由命名空间由声明驱动，不再硬编码字面量）。
 			srv.Mount(k12rt.Manifest.MountPath, k12apihttp.NewHandler(k12apihttp.Runtime{
-				Views:   k12rt.Registry.Views,
-				Records: k12rt.Records,
-				Deps:    k12rt.Deps,
-				Cron:    k12Cron,
-				Binder:  k12Binder,
-				BaseURL: k12Base,
-				Grading: k12GradingOrch,
+				Views:                 k12rt.Registry.Views,
+				Records:               k12rt.Records,
+				Deps:                  k12rt.Deps,
+				ModelSnapshotResolver: k12ModelSnapshot,
+				Cron:                  k12Cron,
+				Binder:                k12Binder,
+				BaseURL:               k12Base,
+				Grading:               k12GradingOrch,
 			}))
 			// 崩溃恢复扫描（§6.15/K12-INV-021）：启动即扫非终态 GradingJob——自动阶段从检查点
 			// 重新入列续跑，awaiting_confirmation 保持等待；不阻塞启动主线。

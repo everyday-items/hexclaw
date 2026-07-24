@@ -128,8 +128,11 @@ func newPhotoJobServerWithOrchestrator(t *testing.T, rec usecase.Recognizer) (ht
 	if err != nil {
 		t.Fatal(err)
 	}
-	orch := usecase.NewGradingOrchestrator(k.Deps, func() k12.GradingModelSnapshot {
-		return k12.GradingModelSnapshot{Provider: "test", Model: "test-vlm", Capability: "vision"}
+	orch := usecase.NewGradingOrchestrator(k.Deps, func(requested k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
+		if requested.Provider != "" || requested.Model != "" {
+			return k12.NormalizeGradingModelSnapshot(requested), nil
+		}
+		return k12.GradingModelSnapshot{Provider: "test", Model: "test-vlm", Capability: "vision"}, nil
 	}, usecase.WithGradingRunDir(t.TempDir()))
 	return apihttp.NewHandler(apihttp.Runtime{Views: k.Registry.Views, Records: k.Records, Deps: k.Deps, Grading: orch}), orch
 }
@@ -191,6 +194,33 @@ func createPhotoJob(t *testing.T, h http.Handler, sourceKey string) string {
 		t.Fatalf("响应缺 job_id: %v", out)
 	}
 	return id
+}
+
+func TestPhotoJobHTTPPreservesExplicitSessionModelSnapshot(t *testing.T) {
+	h, orchestrator := newPhotoJobServerWithOrchestrator(t, &photoJobRecognizer{questions: photoJobQuestions()})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := orchestrator.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown grading orchestrator: %v", err)
+		}
+	})
+	img := base64.StdEncoding.EncodeToString(photoJobPNG("explicit-session-route"))
+	rec, out := do(t, h, http.MethodPost, "/grading-jobs", fmt.Sprintf(
+		`{"agent":"mingming","source_kind":"desktop","source_key":"explicit-session-route",`+
+			`"image_base64":%q,"model_snapshot":{"provider":"hexclaw-gpt","model":"gpt-5.6-sol"}}`,
+		img,
+	))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("explicit snapshot create status=%d out=%v", rec.Code, out)
+	}
+	job, _ := out["job"].(map[string]any)
+	snapshot, _ := job["model_snapshot"].(map[string]any)
+	if snapshot["provider"] != "hexclaw-gpt" ||
+		snapshot["model"] != "gpt-5.6-sol" ||
+		snapshot["route"] != "hexclaw-gpt/gpt-5.6-sol" {
+		t.Fatalf("HTTP dropped or changed explicit session route: %v", snapshot)
+	}
 }
 
 func TestPhotoJobHTTP_GetRemainsResponsiveWhileRecognizerIsRunning(t *testing.T) {

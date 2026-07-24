@@ -46,9 +46,18 @@ type creativeWorkDTO struct {
 func toCreativeWorkDTO(v usecase.CreativeWorkView) creativeWorkDTO {
 	vers := make([]workVersionDTO, 0, len(v.Fields.Versions))
 	for _, ver := range v.Fields.Versions {
+		structured := ver.StructuredFeedback
+		// Historical builds persisted provider-authored Markdown fragments inside
+		// canonical atoms. Treat those records as legacy at the API boundary so
+		// polluted facts cannot drive actions, print cards or phone delivery.
+		if structured != nil {
+			if err := structured.Validate(); err != nil {
+				structured = nil
+			}
+		}
 		dto := workVersionDTO{
 			VersionID: ver.VersionID, AssetID: ver.SourceAssetID,
-			Content: ver.ContentMarkdown, Feedback: ver.Feedback, StructuredFeedback: ver.StructuredFeedback,
+			Content: ver.ContentMarkdown, Feedback: ver.Feedback, StructuredFeedback: structured,
 			OCRJobID: ver.OCRJobID, OCRRaw: ver.OCRRaw, OCRVersion: ver.OCRVersion,
 			OCRConfirmedDigest: ver.OCRConfirmedDigest, ContentConfirmedAt: ver.ContentConfirmedAt,
 			FeedbackSource: ver.FeedbackSource, FeedbackSkill: ver.FeedbackSkill,
@@ -56,7 +65,7 @@ func toCreativeWorkDTO(v usecase.CreativeWorkView) creativeWorkDTO {
 		}
 		// 观察练习卡（§3.10 美术）：由点评正文服务端提炼，随版本下发。
 		if v.Fields.WorkType == k12.WorkTypeArt {
-			dto.PracticeCard = k12.ObservationPracticeCardFromStructured(ver.StructuredFeedback, ver.Feedback)
+			dto.PracticeCard = k12.ObservationPracticeCardFromStructured(structured, ver.Feedback)
 		}
 		vers = append(vers, dto)
 	}
@@ -238,14 +247,24 @@ func (h *handler) sendWorkFeedback(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
 		return
 	}
-	// 取最新一条带点评的版本（修改稿新版本可能尚无点评）。
-	feedback := ""
-	var structured *k12.WorkFeedback
-	for i := len(v.Fields.Versions) - 1; i >= 0; i-- {
-		if fb := strings.TrimSpace(v.Fields.Versions[i].Feedback); fb != "" {
-			feedback = fb
-			structured = v.Fields.Versions[i].StructuredFeedback
-			break
+	if v.Record.Status == k12.WorkStatusArchived {
+		writeErr(w, http.StatusConflict, "已归档作品不可继续发送点评或练习卡")
+		return
+	}
+	// Actions are version-bound: a revised version awaiting its own feedback
+	// must not silently send the prior version's review.
+	if len(v.Fields.Versions) == 0 {
+		writeErr(w, http.StatusConflict, "这件作品还没有可发送的版本")
+		return
+	}
+	current := v.Fields.Versions[len(v.Fields.Versions)-1]
+	feedback := strings.TrimSpace(current.Feedback)
+	structured := current.StructuredFeedback
+	if structured != nil {
+		if err := structured.Validate(); err != nil {
+			structured = nil
+		} else {
+			feedback = structured.ProjectionMarkdown
 		}
 	}
 	if feedback == "" {

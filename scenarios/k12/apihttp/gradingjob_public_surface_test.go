@@ -93,7 +93,10 @@ func TestFrozenBudgetRejectsGenericPublicJobWithoutProblemAttemptMaterializer(t 
 		},
 		ItemConcurrency: 2,
 	}
-	h := apihttp.NewHandler(apihttp.Runtime{Records: f.deps.Records, Deps: f.deps})
+	h := apihttp.NewHandler(apihttp.Runtime{
+		Records: f.deps.Records, Deps: f.deps,
+		ModelSnapshotResolver: testGradingModelSnapshotResolver,
+	})
 
 	rec, out := do(t, h, http.MethodPost, "/grading-jobs", createJobBody("frozen-generic-no-materializer"))
 	if rec.Code != http.StatusBadRequest {

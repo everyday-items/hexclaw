@@ -105,9 +105,18 @@ func (h *handler) createGradingJob(w http.ResponseWriter, r *http.Request) {
 		h.createPhotoGradingJob(w, r, req)
 		return
 	}
+	if h.rt.ModelSnapshotResolver == nil {
+		writeErr(w, http.StatusInternalServerError, "grading model snapshot resolver 未配置")
+		return
+	}
+	modelSnapshot, err := h.rt.ModelSnapshotResolver(req.ModelSnapshot)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	v, created, err := h.rt.Deps.CreateGradingJob(r.Context(), req.Agent, req.SourceSession, usecase.CreateGradingJobInput{
 		SubmissionID: req.SubmissionID, SourceKind: req.SourceKind, SourceKey: req.SourceKey,
-		ConfirmedVersion: req.ConfirmedVersion, ModelSnapshot: req.ModelSnapshot,
+		ConfirmedVersion: req.ConfirmedVersion, ModelSnapshot: modelSnapshot,
 	})
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())

@@ -135,7 +135,7 @@ func newParallelAnchorOrchestrator(t *testing.T, rec Recognizer, anchorer Answer
 	d.AnswerAnchorer = anchorer
 	d.PhotoAnnotator = &photoAnnotatorFake{}
 	d.Now = func() int64 { return time.Now().Unix() }
-	return trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshot, opts...))
+	return trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshotResolver, opts...))
 }
 
 func waitGradingView(t *testing.T, o *GradingOrchestrator, jobID string, match func(GradingJobView) bool) GradingJobView {
@@ -441,7 +441,7 @@ func TestGradingOrchestratorShutdownTracksRecoveryAndRejectsPostSealScan(t *test
 	d, _ := newPipeline(t,
 		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
 		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil)
-	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshot, WithGradingRunDir(t.TempDir())))
+	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshotResolver, WithGradingRunDir(t.TempDir())))
 
 	conn, err := d.Records.DB().Conn(context.Background())
 	if err != nil {

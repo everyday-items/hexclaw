@@ -59,8 +59,8 @@ func TestGenerateWorkFeedback_Writing_AI(t *testing.T) {
 		t.Fatalf("生成点评后应为 feedback_ready，got %s", v.Record.Status)
 	}
 	last := v.Fields.Versions[len(v.Fields.Versions)-1]
-	if last.Feedback != gen.feedback {
-		t.Fatalf("点评应写入最新版本，got %q", last.Feedback)
+	if last.Feedback == gen.feedback || !strings.Contains(last.Feedback, "## 观察与依据") {
+		t.Fatalf("点评应写入由 canonical facts 生成的确定性投影，got %q", last.Feedback)
 	}
 	if last.FeedbackSource != k12.FeedbackSourceAI {
 		t.Fatalf("AI 点评来源应为 %q，got %q", k12.FeedbackSourceAI, last.FeedbackSource)
@@ -301,6 +301,82 @@ func TestGenerateWorkFeedback_Art_StructuredProjectionKeepsSuggestionsOutOfObser
 	}
 	if !strings.Contains(joinedObservations, "还可以看到彩虹") {
 		t.Fatalf("描述可见证据的“还可以看到”必须保留为观察: %q", joinedObservations)
+	}
+}
+
+func TestBuildStructuredWorkFeedback_StripsProjectionMarkdownFromCanonicalFields(t *testing.T) {
+	raw := `### 1. 总体评价
+文章围绕爸爸帮助孩子学习展开，中心明确。
+
+### 2. 亮点与证据
+- **维度：表达**：原文中的对话让人物更真实。
+- **维度：结构**：开头、中间和结尾衔接清楚。
+
+### 3. 维度与问题
+- **维度与问题：语言细节**
+  - **原句**：“爸爸每天工作很忙。”
+  - **建议**：补充一个爸爸陪伴孩子的具体动作。
+
+### 4. 基础规范清单
+没有发现需要家长确认的确定性字词问题。
+
+### 5. 下一步小任务
+只修改一个段落，补充一处真实互动。
+
+### 6. 给家长的一句话
+先请孩子朗读，再由孩子决定最想修改的一处。`
+
+	d := newDataDeps(t)
+	d.Solver = &fakeWorkFeedbackSolver{feedback: raw}
+	id, _, err := d.CreateCreativeWork(context.Background(), "xiaoming", "s", k12.CreativeWorkFields{
+		WorkType: k12.WorkTypeWriting,
+		Title:    "我的好爸爸",
+		Task:     "写一个真实片段",
+		Versions: []k12.CreativeWorkVersion{{ContentMarkdown: "孩子的原稿"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := d.GenerateWorkFeedback(context.Background(), "xiaoming", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	feedback := view.Fields.Versions[0].StructuredFeedback
+	if feedback == nil {
+		t.Fatal("structured feedback missing")
+	}
+	if err := feedback.Validate(); err != nil {
+		t.Fatalf("structured feedback should remain valid: %v", err)
+	}
+	if len(feedback.Observations) == 0 || len(feedback.Observations) > 3 {
+		t.Fatalf("observations must remain atomic (1-3), got %#v", feedback.Observations)
+	}
+	for _, observation := range feedback.Observations {
+		if strings.Contains(observation.Evidence, "###") ||
+			strings.Contains(observation.Evidence, "**") ||
+			strings.Contains(observation.Evidence, "\n") {
+			t.Fatalf("canonical observation leaked projection Markdown: %q", observation.Evidence)
+		}
+	}
+	if len(feedback.Suggestions) == 0 || len(feedback.Suggestions) > 3 {
+		t.Fatalf("suggestions must remain atomic (1-3), got %#v", feedback.Suggestions)
+	}
+	for _, suggestion := range feedback.Suggestions {
+		if strings.Contains(suggestion, "###") ||
+			strings.Contains(suggestion, "**") ||
+			strings.Contains(suggestion, "\n") {
+			t.Fatalf("canonical suggestion leaked projection Markdown: %q", suggestion)
+		}
+	}
+	joinedSuggestions := strings.Join(feedback.Suggestions, "\n")
+	if !strings.Contains(joinedSuggestions, "补充一个爸爸陪伴孩子的具体动作") &&
+		!strings.Contains(joinedSuggestions, "补充一处真实互动") {
+		t.Fatalf("actionable suggestion was lost: %#v", feedback.Suggestions)
+	}
+	if feedback.ProjectionMarkdown == raw ||
+		!strings.Contains(feedback.ProjectionMarkdown, "## 观察与依据") ||
+		!strings.Contains(feedback.ProjectionMarkdown, "## 下一步建议") {
+		t.Fatalf("display projection must be deterministically generated from canonical fields, got %q", feedback.ProjectionMarkdown)
 	}
 }
 

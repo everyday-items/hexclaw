@@ -58,14 +58,16 @@ func NewRecognizerAdapter(v VisionFunc, options ...RecognizerOption) *Recognizer
 
 func (a *RecognizerAdapter) callVision(ctx context.Context, image []byte, prompt string) (string, error) {
 	if a.governor == nil {
-		return a.vision(ctx, image, prompt)
+		raw, err := a.vision(ctx, image, prompt)
+		return raw, providerResponseError(err)
 	}
 	permit, err := a.governor.Acquire(ctx, resourcegov.ResourceVLM, resourcegov.PriorityInteractive)
 	if err != nil {
 		return "", err
 	}
 	defer permit.Release()
-	return a.vision(ctx, image, prompt)
+	raw, err := a.vision(ctx, image, prompt)
+	return raw, providerResponseError(err)
 }
 
 func (a *RecognizerAdapter) splitWorksheet(

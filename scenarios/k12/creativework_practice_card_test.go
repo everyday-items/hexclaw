@@ -63,6 +63,33 @@ func TestObservationPracticeCardFromStructured_UsesCanonicalSuggestions(t *testi
 	}
 }
 
+func TestObservationPracticeCardFromStructured_RejectsPollutedCanonicalAtoms(t *testing.T) {
+	feedback := &WorkFeedback{
+		FeedbackID:   "feedback-art-v1",
+		VersionID:    "v1",
+		FeedbackType: WorkTypeArt,
+		EvidenceRefs: []string{"asset-ref:sha256:abc"},
+		Observations: []WorkFeedbackObservation{{
+			Dimension: "composition",
+			Evidence:  "### 1. 总体评价",
+		}},
+		SourceSnapshot: WorkFeedbackSourceSnapshot{
+			Source: "ai", MethodRef: "art-feedback@1.0.0/embedded", Capability: "evidence_based_feedback",
+		},
+		Limitations:        "只依据可见画面。",
+		Suggestions:        []string{"**", "1. **试试把主体画大一些。**"},
+		AllowedActions:     []string{"send", "print_practice_card"},
+		ProjectionMarkdown: "## 建议\n- 试试把主体画大一些。",
+	}
+	card := ObservationPracticeCardFromStructured(feedback, feedback.ProjectionMarkdown)
+	if strings.Contains(card, "**") || strings.Contains(card, "###") {
+		t.Fatalf("polluted canonical atoms must never reach print/send card: %q", card)
+	}
+	if !strings.Contains(card, "试试把主体画大一些") {
+		t.Fatalf("legacy projection should remain a safe compatibility source: %q", card)
+	}
+}
+
 // PracticeCardDoneAt 字段随版本 JSON 往返（打卡记录的持久载体）。
 func TestCreativeWorkVersion_PracticeCardDoneRoundtrip(t *testing.T) {
 	f := CreativeWorkFields{WorkType: WorkTypeArt, Title: "雨后的校园", Task: "写生",

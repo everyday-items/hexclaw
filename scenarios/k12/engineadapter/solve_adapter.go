@@ -6,12 +6,10 @@ package engineadapter
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
-	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/skill"
@@ -282,38 +280,6 @@ func gradeOutcomeFromResult(res *skill.Result, err error) (usecase.GradeOutcome,
 		ErrorCause: adapter.NormalizeMathText(m["grade_misconception"]),
 		// KnowledgePoint 由识题/课标决定，不来自 grader；用例层从识题结果回填。
 	}, nil
-}
-
-type definitiveProviderResponseError struct {
-	statusCode int
-	cause      error
-}
-
-func (e *definitiveProviderResponseError) Error() string {
-	return e.cause.Error()
-}
-
-func (e *definitiveProviderResponseError) Unwrap() error {
-	return e.cause
-}
-
-func (e *definitiveProviderResponseError) ProviderResponseStatusCode() int {
-	return e.statusCode
-}
-
-// providerResponseError translates the concrete ai-core transport error into
-// the usecase port's narrow outcome contract. The usecase layer therefore does
-// not depend on ai-core, while still distinguishing an HTTP response (safe to
-// retry according to policy) from EOF/reset/timeout after send (ambiguous).
-func providerResponseError(err error) error {
-	if err == nil {
-		return nil
-	}
-	var providerErr *llm.ProviderError
-	if errors.As(err, &providerErr) && providerErr != nil && providerErr.StatusCode > 0 {
-		return &definitiveProviderResponseError{statusCode: providerErr.StatusCode, cause: err}
-	}
-	return err
 }
 
 // evidenceFromMeta 把 solve 的 Metadata 映射成证据对象。

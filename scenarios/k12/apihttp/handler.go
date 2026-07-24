@@ -62,6 +62,10 @@ type Runtime struct {
 	Views   *scenario.ViewExtensionRegistry
 	Records *k12storage.Store
 	Deps    usecase.Deps
+	// ModelSnapshotResolver is the shared control-plane guard for generic
+	// GradingJob creation. It validates explicit provider/model selections and
+	// resolves automatic selections before any durable record is written.
+	ModelSnapshotResolver usecase.GradingModelSnapshotResolver
 	// Cron 可选：注入后 POST /cron/provision 可为实例注册默认自动化任务。
 	Cron CronRegistrar
 	// Binder 可选：注入后 POST /bind-im 可把 IM 群绑到辅导实例（入站路由）。

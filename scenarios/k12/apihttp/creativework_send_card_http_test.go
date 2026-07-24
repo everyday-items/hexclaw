@@ -155,6 +155,55 @@ func TestSendWorkFeedback_RequiresFeedbackAndOwnership(t *testing.T) {
 	}
 }
 
+func TestSendWorkFeedback_DoesNotReusePriorVersionFeedback(t *testing.T) {
+	fd := &fakeDeliverer{}
+	h := newServerWithDeliverer(t, fd)
+	rec, out := do(t, h, "POST", "/creative-works",
+		`{"agent":"mingming","work_type":"writing","title":"作文","task":"写一段话","content_markdown":"第一版"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create: %d %v", rec.Code, out)
+	}
+	id := out["record_id"].(string)
+	if rec, out := do(t, h, "POST", "/creative-works/"+id+"/feedback",
+		`{"agent":"mingming","feedback":"第一版表达清楚；建议补一个细节。"}`); rec.Code != http.StatusOK {
+		t.Fatalf("feedback: %d %v", rec.Code, out)
+	}
+	if rec, out := do(t, h, "POST", "/creative-works/"+id+"/revision",
+		`{"agent":"mingming","content_markdown":"第二版尚待点评"}`); rec.Code != http.StatusOK {
+		t.Fatalf("revision: %d %v", rec.Code, out)
+	}
+
+	rec, _ = do(t, h, "POST", "/creative-works/"+id+"/send-feedback", `{"agent":"mingming"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("current revised version has no feedback; prior version must not be sent, got %d", rec.Code)
+	}
+	if len(fd.contents) != 0 {
+		t.Fatalf("prior-version feedback crossed version boundary: %v", fd.contents)
+	}
+}
+
+func TestPracticeCardActions_DoNotCrossVersionBoundary(t *testing.T) {
+	fd := &fakeDeliverer{}
+	h := newServerWithDeliverer(t, fd)
+	id := mkArtWorkWithFeedback(t, h, artFeedback)
+	if rec, out := do(t, h, "POST", "/creative-works/"+id+"/revision",
+		`{"agent":"mingming","source_asset_id":"a2"}`); rec.Code != http.StatusOK {
+		t.Fatalf("revision: %d %v", rec.Code, out)
+	}
+
+	if rec, _ := do(t, h, "POST", "/creative-works/"+id+"/send-feedback",
+		`{"agent":"mingming","kind":"practice_card"}`); rec.Code != http.StatusConflict {
+		t.Fatalf("prior-version practice card must not be sent for current revision, got %d", rec.Code)
+	}
+	if rec, _ := do(t, h, "POST", "/creative-works/"+id+"/practice-card/done",
+		`{"agent":"mingming"}`); rec.Code == http.StatusOK {
+		t.Fatalf("prior-version practice card must not be marked done for current revision")
+	}
+	if len(fd.contents) != 0 {
+		t.Fatalf("prior-version card crossed version boundary: %v", fd.contents)
+	}
+}
+
 func TestPracticeCard_DTODerivedAndDoneIdempotent(t *testing.T) {
 	h := newServer(t)
 	id := mkArtWorkWithFeedback(t, h, artFeedback)

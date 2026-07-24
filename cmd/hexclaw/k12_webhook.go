@@ -31,7 +31,7 @@ type k12WebhookWorkflowRunner interface {
 type k12WebhookApplication struct {
 	deps      k12usecase.Deps
 	grading   *k12usecase.GradingOrchestrator
-	snapshot  func() k12.GradingModelSnapshot
+	snapshot  k12usecase.GradingModelSnapshotResolver
 	workflows k12WebhookWorkflowRunner
 }
 
@@ -61,7 +61,7 @@ type k12WebhookWorkflowPayload struct {
 func newK12WebhookEventHandler(
 	deps k12usecase.Deps,
 	grading *k12usecase.GradingOrchestrator,
-	snapshot func() k12.GradingModelSnapshot,
+	snapshot k12usecase.GradingModelSnapshotResolver,
 	workflows *platformapi.Server,
 ) webhook.K12EventHandler {
 	app := k12WebhookApplication{deps: deps, grading: grading, snapshot: snapshot, workflows: workflows}
@@ -164,12 +164,16 @@ func (a k12WebhookApplication) startSubmission(ctx context.Context, event webhoo
 	if a.grading == nil {
 		return webhook.K12DispatchResult{}, fmt.Errorf("K12 GradingJob 文本 worker 未配置")
 	}
+	snapshot, err := a.snapshot(k12.GradingModelSnapshot{})
+	if err != nil {
+		return webhook.K12DispatchResult{}, fmt.Errorf("解析 K12 GradingJob 模型快照: %w", err)
+	}
 	sum := sha256.Sum256([]byte(text))
 	job, _, err := a.deps.CreateGradingJob(ctx, event.AgentID, sourceSession, k12usecase.CreateGradingJobInput{
 		SubmissionID:                "webhook-receipt:" + event.ReceiptID,
 		SourceKind:                  "webhook",
 		SourceKey:                   event.EventID,
-		ModelSnapshot:               a.snapshot(),
+		ModelSnapshot:               snapshot,
 		MaterializesProblemAttempts: true,
 	})
 	if err != nil {

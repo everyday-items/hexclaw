@@ -122,6 +122,15 @@ func (d Deps) putGradingJob(ctx context.Context, agentName, sourceSession string
 	if err != nil {
 		return GradingJobView{}, false, err
 	}
+	if !created && v.Fields.ModelSnapshot != f.ModelSnapshot {
+		return GradingJobView{}, false, fmt.Errorf(
+			"%w: idempotency key %q is already bound to model route %q, requested %q",
+			ErrInvalidInput,
+			f.IdempotencyKey,
+			v.Fields.ModelSnapshot.Route,
+			f.ModelSnapshot.Route,
+		)
+	}
 	return v, created, nil
 }
 

@@ -121,6 +121,10 @@ func (d Deps) attachFeedbackWithSource(ctx context.Context, agentName, recordID,
 	if err := structured.Validate(); err != nil {
 		return CreativeWorkView{}, fmt.Errorf("%w: 结构化作品点评非法: %v", ErrInvalidInput, err)
 	}
+	// Persist the deterministic canonical projection, never the provider's raw
+	// Markdown envelope. Historical raw feedback remains readable through the
+	// API compatibility path but cannot be created by this write path again.
+	last.Feedback = structured.ProjectionMarkdown
 	last.StructuredFeedback = &structured
 	if err := d.saveWorkFields(ctx, v, k12.WorkStatusFeedbackReady); err != nil {
 		return CreativeWorkView{}, err
@@ -143,11 +147,6 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 		refs = append(refs, fmt.Sprintf("content-ref:sha256:%x", sum[:]))
 	}
 
-	normalizeClause := func(value string) string {
-		value = strings.TrimSpace(value)
-		value = strings.TrimLeft(value, "#*_`0123456789０１２３４５６７８９.．、)） \t")
-		return strings.TrimSpace(value)
-	}
 	type feedbackClause struct {
 		text              string
 		suggestionSection bool
@@ -155,7 +154,19 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 	clauses := make([]feedbackClause, 0, 8)
 	inSuggestionSection := false
 	for _, line := range strings.Split(strings.TrimSpace(feedback), "\n") {
-		normalizedLine := strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(normalizeClause(line), "："), ":"))
+		rawLine := strings.TrimSpace(line)
+		normalizedLine := strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(k12.NormalizeWorkFeedbackAtom(rawLine), "："), ":"))
+		isHeading := strings.HasPrefix(rawLine, "#")
+		if isHeading {
+			if strings.Contains(normalizedLine, "建议") ||
+				strings.Contains(normalizedLine, "下一步") ||
+				strings.Contains(normalizedLine, "小任务") {
+				inSuggestionSection = true
+			} else {
+				inSuggestionSection = false
+			}
+			continue
+		}
 		switch normalizedLine {
 		case "观察与依据", "观察", "我在画里看到", "我在画里看到……", "我在画里看到...":
 			inSuggestionSection = false
@@ -164,7 +175,7 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 			inSuggestionSection = true
 			continue
 		}
-		for _, clause := range strings.FieldsFunc(line, func(r rune) bool {
+		for _, clause := range strings.FieldsFunc(rawLine, func(r rune) bool {
 			switch r {
 			case '。', '；', ';':
 				return true
@@ -172,11 +183,14 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 				return false
 			}
 		}) {
-			clauses = append(clauses, feedbackClause{text: clause, suggestionSection: inSuggestionSection})
+			normalized := k12.NormalizeWorkFeedbackAtom(clause)
+			if normalized != "" {
+				clauses = append(clauses, feedbackClause{text: normalized, suggestionSection: inSuggestionSection})
+			}
 		}
 	}
 	isScaffold := func(value string) bool {
-		normalized := normalizeClause(value)
+		normalized := k12.NormalizeWorkFeedbackAtom(value)
 		switch normalized {
 		case "观察与依据", "观察", "下一步建议", "建议", "下次可以试试", "下次可以试试的小实验", "我在画里看到", "我在画里看到……", "我在画里看到...":
 			return true
@@ -185,7 +199,7 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 		}
 	}
 	isSuggestion := func(value string) bool {
-		normalized := normalizeClause(value)
+		normalized := k12.NormalizeWorkFeedbackAtom(value)
 		if strings.Contains(normalized, "建议") || strings.Contains(normalized, "试试") || strings.Contains(normalized, "比一比") {
 			return true
 		}
@@ -202,18 +216,16 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 		}
 		return false
 	}
-	dimension := "expression"
 	limitations := "仅依据本版本提交的孩子原文进行观察，不评价能力高低，也不代写全文。"
-	actions := []string{"send", "collect", "record_language_issue"}
+	actions := []string{"send"}
 	if workType == k12.WorkTypeArt {
-		dimension = "composition"
 		limitations = "仅依据本版本提交的可见画面进行观察，不评分、不排名，也不替孩子重画。"
-		actions = []string{"send", "print_practice_card", "collect"}
+		actions = []string{"send", "print_practice_card"}
 	}
 	observationEvidence := make([]string, 0, 5)
 	suggestions := make([]string, 0, 3)
 	for _, item := range clauses {
-		clause := strings.TrimSpace(item.text)
+		clause := k12.NormalizeWorkFeedbackAtom(item.text)
 		if clause == "" || isScaffold(clause) {
 			continue
 		}
@@ -226,17 +238,60 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 		}
 	}
 	if len(observationEvidence) == 0 {
-		observationEvidence = append(observationEvidence, strings.TrimSpace(feedback))
+		for _, item := range clauses {
+			if clause := k12.NormalizeWorkFeedbackAtom(item.text); clause != "" && !isScaffold(clause) {
+				observationEvidence = append(observationEvidence, clause)
+				break
+			}
+		}
+		if len(observationEvidence) == 0 {
+			for _, line := range strings.Split(feedback, "\n") {
+				if clause := k12.NormalizeWorkFeedbackAtom(line); clause != "" && !isScaffold(clause) {
+					observationEvidence = append(observationEvidence, clause)
+					break
+				}
+			}
+		}
 	} else if len(observationEvidence) > 3 {
+		// Preserve every visible fact while keeping the 1-3 focused-row
+		// contract: the third row may contain the remaining short sentences,
+		// but never headings or line breaks.
 		observationEvidence = []string{
 			observationEvidence[0],
 			observationEvidence[1],
 			strings.Join(observationEvidence[2:], "；"),
 		}
 	}
+	classifyDimension := func(evidence string) string {
+		if workType == k12.WorkTypeArt {
+			switch {
+			case strings.Contains(evidence, "色") || strings.Contains(evidence, "明暗"):
+				return "color"
+			case strings.Contains(evidence, "线"):
+				return "line"
+			case strings.Contains(evidence, "细节") || strings.Contains(evidence, "看见") || strings.Contains(evidence, "看到"):
+				return "visible_detail"
+			default:
+				return "composition"
+			}
+		}
+		switch {
+		case strings.Contains(evidence, "切题") || strings.Contains(evidence, "题目") || strings.Contains(evidence, "要求"):
+			return "task_alignment"
+		case strings.Contains(evidence, "结构") || strings.Contains(evidence, "开头") || strings.Contains(evidence, "结尾") || strings.Contains(evidence, "段落"):
+			return "structure"
+		case strings.Contains(evidence, "错别字") || strings.Contains(evidence, "标点") || strings.Contains(evidence, "病句") || strings.Contains(evidence, "用字") || strings.Contains(evidence, "的、地、得"):
+			return "language_detail"
+		default:
+			return "expression"
+		}
+	}
 	observations := make([]k12.WorkFeedbackObservation, 0, len(observationEvidence))
 	for _, evidence := range observationEvidence {
-		observations = append(observations, k12.WorkFeedbackObservation{Dimension: dimension, Evidence: evidence})
+		observations = append(observations, k12.WorkFeedbackObservation{
+			Dimension: classifyDimension(evidence),
+			Evidence:  evidence,
+		})
 	}
 	if len(suggestions) == 0 {
 		suggestions = append(suggestions, "和孩子一起回看这条观察，并由孩子选择一处小改动后提交新版本。")
@@ -251,9 +306,26 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 	} else if method == "" {
 		method = "parent/manual"
 	}
-	projection := strings.TrimSpace(feedback)
-	idSum := sha256.Sum256([]byte(strings.Join([]string{version.VersionID, source, method, projection}, "\x00")))
-	return k12.WorkFeedback{
+	if workType == k12.WorkTypeWriting {
+		hasCollect := false
+		hasLanguageIssue := false
+		for _, observation := range observations {
+			switch observation.Dimension {
+			case "expression":
+				hasCollect = true
+			case "language_detail":
+				hasLanguageIssue = true
+			}
+		}
+		if hasCollect {
+			actions = append(actions, "collect")
+		}
+		if hasLanguageIssue {
+			actions = append(actions, "record_language_issue")
+		}
+	}
+	idSum := sha256.Sum256([]byte(strings.Join([]string{version.VersionID, source, method, strings.TrimSpace(feedback)}, "\x00")))
+	structured := k12.WorkFeedback{
 		FeedbackID:   fmt.Sprintf("feedback-%x", idSum[:12]),
 		VersionID:    version.VersionID,
 		FeedbackType: workType,
@@ -265,8 +337,10 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 		Limitations:        limitations,
 		Suggestions:        suggestions,
 		AllowedActions:     actions,
-		ProjectionMarkdown: projection,
+		ProjectionMarkdown: "",
 	}
+	structured.ProjectionMarkdown = k12.ProjectWorkFeedbackMarkdown(structured)
+	return structured
 }
 
 // SubmitRevision 提交修改稿形成新版本（feedback_ready → revised，PRD §3.10）。不代写：内容由孩子/家长提供。
@@ -330,15 +404,11 @@ func (d Deps) MarkPracticeCardDone(ctx context.Context, agentName, recordID stri
 	if v.Fields.WorkType != k12.WorkTypeArt {
 		return CreativeWorkView{}, fmt.Errorf("%w: 观察练习卡只属于美术作品", ErrInvalidInput)
 	}
-	// 最新一条带点评的版本（修改稿新版本可能尚无点评，卡仍挂在上一条点评版本上）。
-	idx := -1
-	for i := len(v.Fields.Versions) - 1; i >= 0; i-- {
-		if strings.TrimSpace(v.Fields.Versions[i].Feedback) != "" {
-			idx = i
-			break
-		}
+	if v.Record.Status == k12.WorkStatusArchived {
+		return CreativeWorkView{}, fmt.Errorf("%w: 已归档作品不可继续打卡", ErrInvalidInput)
 	}
-	if idx < 0 {
+	idx := len(v.Fields.Versions) - 1
+	if idx < 0 || strings.TrimSpace(v.Fields.Versions[idx].Feedback) == "" {
 		return CreativeWorkView{}, fmt.Errorf("%w: 这件作品还没有点评，尚无观察练习卡", ErrInvalidInput)
 	}
 	if v.Fields.Versions[idx].PracticeCardDoneAt == 0 {

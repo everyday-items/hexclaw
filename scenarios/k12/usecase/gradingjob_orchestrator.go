@@ -41,8 +41,8 @@ var (
 type GradingOrchestrator struct {
 	deps Deps
 	// snapshotFn 提供实际模型路由快照（§6.12：GradingJob 保存不可变路由快照）。
-	// StartPhotoGradingInput 未显式给出快照时由它兜底。
-	snapshotFn func() k12.GradingModelSnapshot
+	// 它既校验调用方显式选择，也为未显式选择的入口解析默认能力路由。
+	snapshotFn GradingModelSnapshotResolver
 
 	// runDir 阶段产物落盘目录（§6.15 崩溃恢复载体；空 = 仅内存，见 *_runtime.go）。
 	runDir string
@@ -141,9 +141,16 @@ type gradingRun struct {
 	renderFailure string
 }
 
+// GradingModelSnapshotResolver validates an exact caller-selected route or,
+// for an empty request, resolves the configured automatic route. It runs
+// before persistence so an incapable model cannot create a doomed Job.
+type GradingModelSnapshotResolver func(
+	requested k12.GradingModelSnapshot,
+) (k12.GradingModelSnapshot, error)
+
 // NewGradingOrchestrator 组装编排器。snapshotFn 可为 nil（调用方须在 Start 输入里给快照）。
 // opts 见 *_runtime.go（落盘恢复目录 / 异步基座 context / 有界并发）。
-func NewGradingOrchestrator(deps Deps, snapshotFn func() k12.GradingModelSnapshot, opts ...GradingOrchestratorOption) *GradingOrchestrator {
+func NewGradingOrchestrator(deps Deps, snapshotFn GradingModelSnapshotResolver, opts ...GradingOrchestratorOption) *GradingOrchestrator {
 	o := &GradingOrchestrator{
 		deps: deps, snapshotFn: snapshotFn,
 		runs: map[string]*gradingRun{}, active: map[string]bool{}, rerun: map[string]bool{},
@@ -182,8 +189,18 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 		return GradingJobView{}, false, fmt.Errorf("%w: Image 不可空", ErrInvalidInput)
 	}
 	snap := in.ModelSnapshot
-	if strings.TrimSpace(snap.Provider) == "" && o.snapshotFn != nil {
-		snap = o.snapshotFn()
+	if o.snapshotFn != nil {
+		var err error
+		snap, err = o.snapshotFn(snap)
+		if err != nil {
+			return GradingJobView{}, false, fmt.Errorf("%w: resolve grading model snapshot: %w", ErrInvalidInput, err)
+		}
+	} else if strings.TrimSpace(snap.Provider) == "" || strings.TrimSpace(snap.Model) == "" {
+		return GradingJobView{}, false, fmt.Errorf("%w: grading model snapshot resolver 未配置且 provider/model 不完整", ErrInvalidInput)
+	}
+	snap = k12.NormalizeGradingModelSnapshot(snap)
+	if snap.Provider == "" || snap.Model == "" {
+		return GradingJobView{}, false, fmt.Errorf("%w: grading model snapshot 缺少 provider/model", ErrInvalidInput)
 	}
 	sum := sha1.Sum(in.Photo.Image)
 	v, created, err := o.deps.CreateGradingJob(ctx, in.Photo.AgentName, in.Photo.SourceSession, CreateGradingJobInput{
@@ -965,10 +982,21 @@ func (o *GradingOrchestrator) failStage(ctx context.Context, run *gradingRun, jo
 	return v, cause
 }
 
-// gradingErrRetryable 失败可重试判定：输入类错误（ErrInvalidInput）重跑必然同败 → 不可重试；
-// 下游服务错误（超时/上游不可用等）→ 可安全重试（阶段有幂等检查点，规则 3）。
+// gradingErrRetryable 失败可重试判定：输入类错误重跑必然同败；收到明确 HTTP
+// 响应时，仅 408/425/429 和 5xx 属瞬态。其余未类型化错误沿用既有可重试语义。
 func gradingErrRetryable(err error) bool {
-	return !errors.Is(err, ErrInvalidInput)
+	if errors.Is(err, ErrInvalidInput) {
+		return false
+	}
+	if statusCode, definitive := definitiveProviderResponseStatus(err); definitive {
+		switch statusCode {
+		case 408, 425, 429:
+			return true
+		default:
+			return statusCode >= 500 && statusCode <= 599
+		}
+	}
+	return true
 }
 
 func hasAnswerCandidate(questions []RecognizedQuestion) bool {

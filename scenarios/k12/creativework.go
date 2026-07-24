@@ -164,6 +164,113 @@ type WorkFeedback struct {
 	ProjectionMarkdown string                     `json:"projection_markdown"`
 }
 
+// NormalizeWorkFeedbackAtom removes display-only Markdown scaffolding from one
+// observation/suggestion candidate. Canonical atoms remain plain text; Markdown
+// is produced only by ProjectWorkFeedbackMarkdown.
+func NormalizeWorkFeedbackAtom(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimLeft(value, "# \t")
+	value = strings.TrimSpace(value)
+	for _, prefix := range []string{"- ", "+ ", "* ", "> ", "• "} {
+		if strings.HasPrefix(value, prefix) {
+			value = strings.TrimSpace(strings.TrimPrefix(value, prefix))
+			break
+		}
+	}
+	runes := []rune(value)
+	i := 0
+	for i < len(runes) && ((runes[i] >= '0' && runes[i] <= '9') ||
+		(runes[i] >= '０' && runes[i] <= '９')) {
+		i++
+	}
+	if i > 0 && i < len(runes) && strings.ContainsRune(".．、)）", runes[i]) {
+		value = strings.TrimSpace(string(runes[i+1:]))
+	}
+	value = strings.NewReplacer("**", "", "__", "", "`", "").Replace(value)
+	return strings.TrimSpace(value)
+}
+
+func validateWorkFeedbackAtom(kind, value string) error {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return fmt.Errorf("作品点评%s不可空", kind)
+	}
+	if strings.ContainsAny(trimmed, "\r\n") {
+		return fmt.Errorf("作品点评%s必须是单条原子事实", kind)
+	}
+	if len([]rune(trimmed)) > 500 {
+		return fmt.Errorf("作品点评%s超过 500 字", kind)
+	}
+	if strings.HasPrefix(trimmed, "#") ||
+		strings.HasPrefix(trimmed, "- ") ||
+		strings.HasPrefix(trimmed, "+ ") ||
+		strings.HasPrefix(trimmed, "* ") ||
+		strings.HasPrefix(trimmed, "> ") ||
+		strings.HasPrefix(trimmed, "• ") ||
+		strings.Contains(trimmed, "**") ||
+		strings.Contains(trimmed, "__") ||
+		strings.Contains(trimmed, "`") {
+		return fmt.Errorf("作品点评%s混入 Markdown 结构符", kind)
+	}
+	normalized := NormalizeWorkFeedbackAtom(trimmed)
+	if normalized == "" || strings.Trim(normalized, "*_#`-+>• \t") == "" {
+		return fmt.Errorf("作品点评%s只有控制符", kind)
+	}
+	return nil
+}
+
+func validateWorkFeedbackAtoms(feedback WorkFeedback) error {
+	if len(feedback.Observations) < 1 || len(feedback.Observations) > 3 {
+		return fmt.Errorf("作品点评观察必须为 1-3 条")
+	}
+	for _, observation := range feedback.Observations {
+		if err := validateWorkFeedbackAtom("观察证据", observation.Evidence); err != nil {
+			return err
+		}
+	}
+	for _, suggestion := range feedback.Suggestions {
+		if err := validateWorkFeedbackAtom("建议", suggestion); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ProjectWorkFeedbackMarkdown is the sole display projection for new
+// structured feedback. It is deterministic and contains no provider-authored
+// Markdown envelope.
+func ProjectWorkFeedbackMarkdown(feedback WorkFeedback) string {
+	dimensionLabels := map[string]string{
+		"task_alignment":  "切题",
+		"structure":       "结构",
+		"expression":      "表达",
+		"language_detail": "基础规范",
+		"composition":     "构图",
+		"color":           "色彩",
+		"line":            "线条",
+		"visible_detail":  "可见细节",
+	}
+	var b strings.Builder
+	b.WriteString("## 观察与依据\n\n")
+	for _, observation := range feedback.Observations {
+		label := dimensionLabels[observation.Dimension]
+		if label == "" {
+			label = observation.Dimension
+		}
+		fmt.Fprintf(&b, "- **%s**：%s\n", label, strings.TrimSpace(observation.Evidence))
+	}
+	b.WriteString("\n## 下一步建议\n\n")
+	for i, suggestion := range feedback.Suggestions {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, strings.TrimSpace(suggestion))
+	}
+	if limitation := strings.TrimSpace(feedback.Limitations); limitation != "" {
+		b.WriteString("\n## 能力与证据限制\n\n")
+		b.WriteString(limitation)
+		b.WriteByte('\n')
+	}
+	return strings.TrimSpace(b.String())
+}
+
 func (f WorkFeedback) Validate() error {
 	if strings.TrimSpace(f.FeedbackID) == "" || strings.TrimSpace(f.VersionID) == "" {
 		return fmt.Errorf("作品点评缺少 feedback_id/version_id")
@@ -181,6 +288,9 @@ func (f WorkFeedback) Validate() error {
 	}
 	if len(f.Observations) == 0 {
 		return fmt.Errorf("作品点评缺少观察维度")
+	}
+	if err := validateWorkFeedbackAtoms(f); err != nil {
+		return err
 	}
 	allowedDimensions := map[string]bool{}
 	if f.FeedbackType == WorkTypeWriting {
@@ -205,13 +315,11 @@ func (f WorkFeedback) Validate() error {
 	if strings.TrimSpace(f.Limitations) == "" {
 		return fmt.Errorf("作品点评缺少能力限制")
 	}
+	if err := validateWorkFeedbackAtom("能力限制", f.Limitations); err != nil {
+		return err
+	}
 	if len(f.Suggestions) < 1 || len(f.Suggestions) > 3 {
 		return fmt.Errorf("作品点评建议必须为 1-3 条")
-	}
-	for _, suggestion := range f.Suggestions {
-		if strings.TrimSpace(suggestion) == "" {
-			return fmt.Errorf("作品点评包含空建议")
-		}
 	}
 	if len(f.AllowedActions) == 0 {
 		return fmt.Errorf("作品点评缺少允许动作")
@@ -281,7 +389,7 @@ func ObservationPracticeCard(feedback string) string {
 			if isHeading(next) {
 				break
 			}
-			if t := strings.TrimSpace(next); t != "" {
+			if t := NormalizeWorkFeedbackAtom(next); t != "" {
 				section = append(section, t)
 			}
 		}
@@ -292,8 +400,11 @@ func ObservationPracticeCard(feedback string) string {
 	// ② 含「试试 / 比一比 / 练习」的行。
 	var hits []string
 	for _, ln := range lines {
-		t := strings.TrimSpace(ln)
-		if t == "" || isHeading(t) {
+		if isHeading(ln) {
+			continue
+		}
+		t := NormalizeWorkFeedbackAtom(ln)
+		if t == "" {
 			continue
 		}
 		if strings.Contains(t, "试试") || strings.Contains(t, "比一比") || strings.Contains(t, "练习") {
@@ -304,7 +415,16 @@ func ObservationPracticeCard(feedback string) string {
 		return strings.Join(hits, "\n")
 	}
 	// ③ 整段兜底：练习必须有产物，宁全勿空。
-	return feedback
+	clean := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if isHeading(line) {
+			continue
+		}
+		if value := NormalizeWorkFeedbackAtom(line); value != "" {
+			clean = append(clean, value)
+		}
+	}
+	return strings.Join(clean, "\n")
 }
 
 // ObservationPracticeCardFromStructured projects an art practice card from the
@@ -315,6 +435,22 @@ func ObservationPracticeCard(feedback string) string {
 func ObservationPracticeCardFromStructured(feedback *WorkFeedback, legacyMarkdown string) string {
 	if feedback == nil {
 		return ObservationPracticeCard(legacyMarkdown)
+	}
+	suggestionsSafe := len(feedback.Suggestions) >= 1 && len(feedback.Suggestions) <= 3
+	if suggestionsSafe {
+		for _, suggestion := range feedback.Suggestions {
+			if err := validateWorkFeedbackAtom("建议", suggestion); err != nil {
+				suggestionsSafe = false
+				break
+			}
+		}
+	}
+	if !suggestionsSafe {
+		projection := strings.TrimSpace(feedback.ProjectionMarkdown)
+		if projection == "" {
+			projection = legacyMarkdown
+		}
+		return ObservationPracticeCard(projection)
 	}
 	items := make([]string, 0, len(feedback.Suggestions))
 	for _, suggestion := range feedback.Suggestions {

@@ -300,7 +300,7 @@ func TestGradingOrchestratorItemResume_OutcomeUnknownDoesNotResendAfterRecovery(
 	}
 	assertAssessStageInvocationStatuses(t, o1, jobID, k12.ModelInvocationOutcomeUnknown)
 
-	o2 := trackGradingOrchestrator(t, NewGradingOrchestrator(o1.deps, orchestratorSnapshot,
+	o2 := trackGradingOrchestrator(t, NewGradingOrchestrator(o1.deps, orchestratorSnapshotResolver,
 		WithGradingRunDir(runDir)))
 	if _, err := o2.RecoverGradingJobs(context.Background(), []string{"mingming"}); err != nil {
 		t.Fatalf("recover unknown job: %v", err)
@@ -455,7 +455,7 @@ func TestGradingOrchestratorItemResume_WrongProjectionFactsSurviveCrashAndDedupe
 
 	// Rebuild the page with a new orchestrator. q1 must come exclusively from
 	// its durable receipt; the pre-crash page result was never persisted.
-	o2 := trackGradingOrchestrator(t, NewGradingOrchestrator(o1.deps, orchestratorSnapshot,
+	o2 := trackGradingOrchestrator(t, NewGradingOrchestrator(o1.deps, orchestratorSnapshotResolver,
 		WithGradingRunDir(runDir)))
 	completed, err := o2.RetryAndRun(context.Background(), jobID)
 	if err != nil || completed.Record.Status != k12.GradingStageCompleted {
@@ -475,7 +475,7 @@ func TestGradingOrchestratorItemResume_WrongProjectionFactsSurviveCrashAndDedupe
 
 	// A different Job for the same canonical mistake must retain the existing
 	// record identity while honestly reporting that it did not create it.
-	o3 := trackGradingOrchestrator(t, NewGradingOrchestrator(o1.deps, orchestratorSnapshot,
+	o3 := trackGradingOrchestrator(t, NewGradingOrchestrator(o1.deps, orchestratorSnapshotResolver,
 		WithGradingRunDir(t.TempDir())))
 	job2View, created, err := o3.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
 		Photo: PhotoGradeRequest{

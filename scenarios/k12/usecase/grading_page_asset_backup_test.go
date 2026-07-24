@@ -19,7 +19,7 @@ func TestPhotoGradingPersistsOwnerScopedPageAssetAndBackupExactSet(t *testing.T)
 		RawTranscription: "8÷2=?", CanonicalMarkdown: "8\\div2=?",
 		AnswerState: AnswerStateBlank, Subject: "数学",
 	}}}
-	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshot))
+	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshotResolver))
 	ctx := context.Background()
 	image := []byte("\x89PNG\r\n\x1a\ncanonical-homework-page")
 
@@ -79,7 +79,7 @@ func TestPhotoGradingPageAssetFailureAndProblemWriteFailureNeverReportSuccess(t 
 		d.Recognizer = &countingRecognizer{questions: []RecognizedQuestion{{
 			RawTranscription: "2+2=?", CanonicalMarkdown: "2+2=?", AnswerState: AnswerStateBlank, Subject: "数学",
 		}}}
-		o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshot))
+		o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshotResolver))
 		job, _, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
 			Photo:      PhotoGradeRequest{AgentName: "mingming", Grade: "五年级上", Image: []byte("image")},
 			SourceKind: "desktop", SourceKey: "asset-write-fails",
@@ -107,7 +107,7 @@ func TestPhotoGradingPageAssetFailureAndProblemWriteFailureNeverReportSuccess(t 
 			BEGIN SELECT RAISE(ABORT, 'injected problem write failure'); END`); err != nil {
 			t.Fatal(err)
 		}
-		o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshot))
+		o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshotResolver))
 		image := []byte("\x89PNG\r\n\x1a\ncompensated-page")
 		assetID, _, _, err := assetstore.Describe("mingming", image)
 		if err != nil {

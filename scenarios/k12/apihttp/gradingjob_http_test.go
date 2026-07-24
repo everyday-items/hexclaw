@@ -3,10 +3,12 @@ package apihttp_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
 
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
@@ -21,6 +23,13 @@ import (
 type gradingFixture struct {
 	h    http.Handler
 	deps usecase.Deps
+}
+
+func testGradingModelSnapshotResolver(requested k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
+	if requested.Provider == "" && requested.Model == "" {
+		requested = k12.GradingModelSnapshot{Provider: "openrouter", Model: "test-vlm", Capability: "vision"}
+	}
+	return k12.NormalizeGradingModelSnapshot(requested), nil
 }
 
 func newGradingFixture(t *testing.T, agents ...string) gradingFixture {
@@ -46,7 +55,10 @@ func newGradingFixture(t *testing.T, agents ...string) gradingFixture {
 		t.Fatal(err)
 	}
 	return gradingFixture{
-		h:    apihttp.NewHandler(apihttp.Runtime{Views: k.Registry.Views, Records: k.Records, Deps: k.Deps}),
+		h: apihttp.NewHandler(apihttp.Runtime{
+			Views: k.Registry.Views, Records: k.Records, Deps: k.Deps,
+			ModelSnapshotResolver: testGradingModelSnapshotResolver,
+		}),
 		deps: k.Deps,
 	}
 }
@@ -139,6 +151,42 @@ func TestGradingJobHTTPLifecycle(t *testing.T) {
 		if v.Record.Status != want {
 			t.Fatalf("推进应到 %s: %s", want, v.Record.Status)
 		}
+	}
+}
+
+func TestGradingJobHTTPRejectsIdempotencyRouteConflict(t *testing.T) {
+	h := newGradingServer(t)
+	rec, out := do(t, h, http.MethodPost, "/grading-jobs", createJobBody("route-conflict"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first create status=%d out=%v", rec.Code, out)
+	}
+	conflict := `{"agent":"mingming","source_session":"s1","submission_id":"sub-1",
+		"source_kind":"im","source_key":"route-conflict",
+		"model_snapshot":{"provider":"openrouter","model":"different-vlm","capability":"vision"}}`
+	rec, out = do(t, h, http.MethodPost, "/grading-jobs", conflict)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("route conflict status=%d out=%v, want 400", rec.Code, out)
+	}
+}
+
+func TestGradingJobHTTPRejectsInvalidRouteBeforeFirstPersistence(t *testing.T) {
+	f := newGradingFixture(t)
+	h := apihttp.NewHandler(apihttp.Runtime{
+		Records: f.deps.Records, Deps: f.deps,
+		ModelSnapshotResolver: func(k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
+			return k12.GradingModelSnapshot{}, errors.New("model lacks text+vision capability")
+		},
+	})
+	rec, out := do(t, h, http.MethodPost, "/grading-jobs", createJobBody("invalid-first-route"))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid first route status=%d out=%v, want 400", rec.Code, out)
+	}
+	jobs, err := f.deps.ListGradingJobs(context.Background(), "mingming", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("invalid route persisted %d jobs", len(jobs))
 	}
 }
 

@@ -59,8 +59,11 @@ func newK12WebhookRuntime(t *testing.T) *assembly.K12 {
 
 func TestK12WebhookTextSubmissionUsesGradingJobApplicationCommand(t *testing.T) {
 	runtime := newK12WebhookRuntime(t)
-	snapshot := func() k12.GradingModelSnapshot {
-		return k12.GradingModelSnapshot{Provider: "test", Model: "test-model", Capability: "vision"}
+	snapshot := func(requested k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
+		if requested.Provider != "" || requested.Model != "" {
+			return k12.NormalizeGradingModelSnapshot(requested), nil
+		}
+		return k12.GradingModelSnapshot{Provider: "test", Model: "test-model", Capability: "vision"}, nil
 	}
 	runDir := t.TempDir()
 	grading := usecase.NewGradingOrchestrator(runtime.Deps, snapshot, usecase.WithGradingRunDir(runDir))

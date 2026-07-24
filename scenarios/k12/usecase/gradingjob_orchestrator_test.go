@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,6 +44,35 @@ func orchestratorSnapshot() k12.GradingModelSnapshot {
 	return k12.GradingModelSnapshot{Provider: "openrouter", Model: "test-vlm", Capability: "vision"}
 }
 
+func orchestratorSnapshotResolver(requested k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
+	if strings.TrimSpace(requested.Provider) != "" || strings.TrimSpace(requested.Model) != "" {
+		return k12.NormalizeGradingModelSnapshot(requested), nil
+	}
+	return orchestratorSnapshot(), nil
+}
+
+type gradingProviderResponseError struct {
+	status int
+}
+
+func (e *gradingProviderResponseError) Error() string {
+	return fmt.Sprintf("provider returned HTTP %d", e.status)
+}
+
+func (e *gradingProviderResponseError) ProviderResponseStatusCode() int {
+	return e.status
+}
+
+type providerErrorRecognizer struct {
+	err   error
+	calls int
+}
+
+func (r *providerErrorRecognizer) Recognize(context.Context, []byte) ([]RecognizedQuestion, error) {
+	r.calls++
+	return nil, r.err
+}
+
 func newOrchestrator(t *testing.T, rec Recognizer, anchorer AnswerAnchorer, annotator PhotoAnnotator) *GradingOrchestrator {
 	t.Helper()
 	d, _ := newPipeline(t,
@@ -57,7 +87,7 @@ func newOrchestrator(t *testing.T, rec Recognizer, anchorer AnswerAnchorer, anno
 	// provider boundaries, so it must use a wall clock rather than newPipeline's
 	// deterministic domain-record clock (1000).
 	d.Now = func() int64 { return time.Now().Unix() }
-	return trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshot))
+	return trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshotResolver))
 }
 
 func trackGradingOrchestrator(t *testing.T, o *GradingOrchestrator) *GradingOrchestrator {
@@ -295,6 +325,107 @@ func TestGradingOrchestratorRecognizeFailureRetryResumes(t *testing.T) {
 	}
 	if rec.calls != 2 {
 		t.Fatalf("识别应恰好调 2 次（1 失败 + 1 重试成功）, got %d", rec.calls)
+	}
+}
+
+func TestStartPhotoGradingJobFailsBeforePersistWhenSnapshotResolverRejects(t *testing.T) {
+	d, _ := newPipeline(t,
+		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil)
+	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d,
+		func(k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
+			return k12.GradingModelSnapshot{}, errors.New("no text+vision model")
+		},
+	))
+
+	_, created, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "no-vision",
+	})
+	if !errors.Is(err, ErrInvalidInput) || created {
+		t.Fatalf("start err=%v created=%v, want ErrInvalidInput before persistence", err, created)
+	}
+	jobs, listErr := d.ListGradingJobs(context.Background(), "mingming", "")
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("resolver failure persisted %d jobs", len(jobs))
+	}
+}
+
+func TestStartPhotoGradingJobRejectsIdempotencySnapshotConflict(t *testing.T) {
+	d, _ := newPipeline(t,
+		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil)
+	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d,
+		func(requested k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
+			return k12.NormalizeGradingModelSnapshot(requested), nil
+		},
+	))
+	firstSnapshot := k12.GradingModelSnapshot{
+		Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", Capability: "vision",
+	}
+	first, created, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "same-key",
+		ModelSnapshot: firstSnapshot,
+	})
+	if err != nil || !created {
+		t.Fatalf("first start err=%v created=%v", err, created)
+	}
+
+	_, created, err = o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "same-key",
+		ModelSnapshot: k12.GradingModelSnapshot{
+			Provider: "hexclaw-gpt", Model: "another-vision", Capability: "vision",
+		},
+	})
+	if !errors.Is(err, ErrInvalidInput) || created {
+		t.Fatalf("route conflict err=%v created=%v, want ErrInvalidInput", err, created)
+	}
+	stored, err := d.GetGradingJob(context.Background(), "mingming", first.Record.RecordID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Fields.ModelSnapshot.Model != "gpt-5.6-sol" {
+		t.Fatalf("idempotency conflict overwrote frozen route: %+v", stored.Fields.ModelSnapshot)
+	}
+}
+
+func TestGradingProvider400IsTerminalWithoutRetry(t *testing.T) {
+	rec := &providerErrorRecognizer{err: &gradingProviderResponseError{status: 400}}
+	o := newOrchestrator(t, rec, nil, nil)
+	started := startOrchestratorJob(t, o, "provider-400")
+
+	failed, err := o.RunGradingJob(context.Background(), started.Record.RecordID)
+	if err == nil {
+		t.Fatal("provider 400 should be returned")
+	}
+	if failed.Record.Status != k12.GradingStageFailedTerminal ||
+		failed.Fields.Retryable ||
+		failed.Fields.AttemptCount != 1 {
+		t.Fatalf("provider 400 job=%+v fields=%+v", failed.Record, failed.Fields)
+	}
+	if _, retryErr := o.RetryAndRun(context.Background(), started.Record.RecordID); retryErr == nil {
+		t.Fatal("permanent provider 400 exposed retry")
+	}
+	if rec.calls != 1 {
+		t.Fatalf("provider 400 called recognizer %d times, want 1", rec.calls)
+	}
+}
+
+func TestGradingProvider429RemainsRetryable(t *testing.T) {
+	rec := &providerErrorRecognizer{err: &gradingProviderResponseError{status: 429}}
+	o := newOrchestrator(t, rec, nil, nil)
+	started := startOrchestratorJob(t, o, "provider-429")
+
+	failed, err := o.RunGradingJob(context.Background(), started.Record.RecordID)
+	if err == nil {
+		t.Fatal("provider 429 should be returned")
+	}
+	if failed.Record.Status != k12.GradingStageFailedRetryable ||
+		!failed.Fields.Retryable ||
+		failed.Fields.AttemptCount != 1 {
+		t.Fatalf("provider 429 job=%+v fields=%+v", failed.Record, failed.Fields)
 	}
 }
 
