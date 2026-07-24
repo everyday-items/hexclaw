@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/instances"
 )
 
@@ -47,9 +48,142 @@ func instanceToResponse(inst *instances.Instance, message string) instanceRespon
 		Enabled:   inst.Enabled,
 		Status:    inst.Status,
 		LastError: inst.LastError,
-		Config:    inst.Config,
+		Config:    maskInstanceConfig(inst.Config),
 		UpdatedAt: inst.UpdatedAt.Format(http.TimeFormat),
 		Message:   message,
+	}
+}
+
+func maskInstance(inst *instances.Instance) *instances.Instance {
+	projected := *inst
+	projected.Config = maskInstanceConfig(inst.Config)
+	return &projected
+}
+
+func maskInstanceConfig(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil
+	}
+	masked, err := json.Marshal(maskInstanceConfigValue("", decoded))
+	if err != nil {
+		return nil
+	}
+	return masked
+}
+
+func maskInstanceConfigValue(key string, value any) any {
+	if isInstanceCredentialKey(key) {
+		if value == nil {
+			return nil
+		}
+		if text, ok := value.(string); ok {
+			return config.MaskAPIKey(text)
+		}
+		return "****"
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for childKey, childValue := range typed {
+			out[childKey] = maskInstanceConfigValue(childKey, childValue)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, childValue := range typed {
+			out[i] = maskInstanceConfigValue("", childValue)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func isInstanceCredentialKey(key string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	compact := strings.ReplaceAll(normalized, "_", "")
+	switch compact {
+	case "password", "passwd", "pwd", "secret", "token", "apikey",
+		"authorization", "credential", "credentials", "aeskey", "encryptionkey",
+		"privatekey", "accesskey", "secretkey":
+		return true
+	}
+	for _, suffix := range []string{
+		"password", "secret", "token", "apikey", "privatekey", "credential",
+	} {
+		if strings.HasSuffix(compact, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeMaskedInstanceConfig(current, incoming json.RawMessage) (json.RawMessage, error) {
+	var currentValue any
+	if len(current) > 0 {
+		if err := json.Unmarshal(current, &currentValue); err != nil {
+			return nil, fmt.Errorf("现有实例 config 格式错误")
+		}
+	}
+	var incomingValue any
+	if err := json.Unmarshal(incoming, &incomingValue); err != nil {
+		return nil, fmt.Errorf("实例 config 格式错误")
+	}
+	merged, err := mergeMaskedInstanceConfigValue("", currentValue, incomingValue)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(merged)
+}
+
+func mergeMaskedInstanceConfigValue(key string, current, incoming any) (any, error) {
+	if isInstanceCredentialKey(key) {
+		if text, ok := incoming.(string); ok && config.IsMaskedKey(text) {
+			if current == nil {
+				return nil, fmt.Errorf("凭据字段 %q 不能使用脱敏占位值", key)
+			}
+			return current, nil
+		}
+		return incoming, nil
+	}
+	switch next := incoming.(type) {
+	case map[string]any:
+		previous, _ := current.(map[string]any)
+		out := make(map[string]any, len(next))
+		for childKey, childValue := range next {
+			var oldValue any
+			if previous != nil {
+				oldValue = previous[childKey]
+			}
+			merged, err := mergeMaskedInstanceConfigValue(childKey, oldValue, childValue)
+			if err != nil {
+				return nil, err
+			}
+			out[childKey] = merged
+		}
+		return out, nil
+	case []any:
+		previous, _ := current.([]any)
+		out := make([]any, len(next))
+		for i, childValue := range next {
+			var oldValue any
+			if i < len(previous) {
+				oldValue = previous[i]
+			}
+			merged, err := mergeMaskedInstanceConfigValue("", oldValue, childValue)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = merged
+		}
+		return out, nil
+	default:
+		return incoming, nil
 	}
 }
 
@@ -62,8 +196,12 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	projected := make([]*instances.Instance, 0, len(list))
+	for _, inst := range list {
+		projected = append(projected, maskInstance(inst))
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"instances": list,
+		"instances": projected,
 		"total":     len(list),
 	})
 }
@@ -76,6 +214,23 @@ func (s *Server) handleUpsertInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	if name := r.PathValue("name"); name != "" {
 		req.Name = name
+	}
+	current, err := s.instanceMgr.Get(r.Context(), req.Name)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(req.Config) > 0 {
+		var currentConfig json.RawMessage
+		if current != nil {
+			currentConfig = current.Config
+		}
+		merged, mergeErr := mergeMaskedInstanceConfig(currentConfig, req.Config)
+		if mergeErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": mergeErr.Error()})
+			return
+		}
+		req.Config = merged
 	}
 	inst := &instances.Instance{
 		Provider: req.Provider,
@@ -133,6 +288,13 @@ func (s *Server) handleUpdateInstanceByID(w http.ResponseWriter, r *http.Request
 	}
 	if len(req.Config) == 0 {
 		req.Config = current.Config
+	} else {
+		merged, mergeErr := mergeMaskedInstanceConfig(current.Config, req.Config)
+		if mergeErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": mergeErr.Error()})
+			return
+		}
+		req.Config = merged
 	}
 
 	_ = s.instanceMgr.Stop(r.Context(), current.Name)
