@@ -3325,8 +3325,10 @@ func (e *ReActEngine) buildStreamMessages(ctx context.Context, roleName string, 
 		sysContent = decorateSystemPrompt(soulWithManual(soul), metadata)
 	}
 	// bug#7 2026-06-23：@Agent 时人设被正确应用，但弱模型遇到"你能做什么"等元提问会逐字复述系统指令。
-	// 给 Agent 派生 prompt 追加防复述守则，让模型用自己的话作答。
+	// Agent 派生 prompt 覆盖默认 prompt 后，也必须统一补回可信的模型身份与语言指令；
+	// 最后再追加防复述守则，保证 locale 指令不会被角色覆盖路径丢失。
 	if fromAgent {
+		sysContent = decorateSystemPrompt(sysContent, metadata)
 		sysContent += agentAntiRecitationGuard
 	}
 	// 追加「稳定」能力上下文：知识库文件列表、Skill/MCP 工具、Agent/设置/自感知名片。
@@ -4360,10 +4362,9 @@ func (e *ReActEngine) reasoningSelectionForSolve(msg *adapter.Message) (llmSelec
 	}, true, nil
 }
 
-// RouteForVision 为识题/视觉任务选 provider+model：用**配置的默认 provider**（尊重「设置哪个模型
-// 走哪个模型」），而非 cost-aware 路由。BUG-20260712：桌面识题（K12 拍照识题）此前走 router.Route
-// → cost-aware 抓本地免费 provider，无视用户为视觉配的云端模型（glm-4v-flash），既慢又曾因本地
-// 模型指向未安装的 qwen2.5:3b 而 404。默认缺失时才退回常规路由兜底。
+// RouteForVision 为未显式 pin 路由的识题/视觉任务选择模型。它只在配置的默认
+// provider 内按显式 capability metadata 稳定选择 text+vision 模型，不走
+// cost-aware，也不跨 provider。显式会话路由由 GradingJob 快照冻结，不经此方法替换。
 func (e *ReActEngine) RouteForVision(ctx context.Context) (hexagon.Provider, string, error) {
 	e.mu.RLock()
 	router := e.router
@@ -4371,11 +4372,14 @@ func (e *ReActEngine) RouteForVision(ctx context.Context) (hexagon.Provider, str
 	if router == nil {
 		return nil, "", fmt.Errorf("没有可用的 LLM Provider")
 	}
-	if p := router.Default(); p != nil {
-		name := router.DefaultName()
-		return p, router.ProviderModel(name), nil
+	route, err := router.DefaultRouteForCapabilities(
+		config.LLMModelCapabilityText,
+		config.LLMModelCapabilityVision,
+	)
+	if err != nil {
+		return nil, "", err
 	}
-	return router.Route(ctx)
+	return route.Provider, route.Model, nil
 }
 
 func requestedProvider(metadata map[string]string) string {

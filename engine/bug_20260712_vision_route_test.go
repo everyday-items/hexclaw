@@ -61,7 +61,14 @@ func TestRouteForVision_UsesConfiguredDefaultNotCostAware(t *testing.T) {
 		},
 		map[string]config.LLMProviderConfig{
 			"Ollama (本地)": {Model: "qwen3.5:9b"},
-			"智谱 AI":       {Model: "glm-4v-flash"},
+			"智谱 AI": {
+				Model: "text-default", Models: []string{"text-default", "glm-4v-flash"},
+				ModelSpecsMode: config.LLMModelSpecsModeExplicit,
+				ModelSpecs: []config.LLMProviderModelSpec{
+					{ID: "text-default", Capabilities: []string{config.LLMModelCapabilityText}},
+					{ID: "glm-4v-flash", Capabilities: []string{config.LLMModelCapabilityText, config.LLMModelCapabilityVision}},
+				},
+			},
 		},
 		"智谱 AI", // 配置的默认 provider
 	)
@@ -82,5 +89,37 @@ func TestRouteForVision_UsesConfiguredDefaultNotCostAware(t *testing.T) {
 	// assert the selected provider identity instead of its concrete pointer.
 	if provider.Name() != cloud.Name() {
 		t.Fatalf("BUG 复现：识题路由到了非默认 provider（应为配置默认智谱 AI）")
+	}
+}
+
+func TestRouteForVisionFailsClosedWhenOnlyAnotherProviderHasVision(t *testing.T) {
+	defaultProvider := mockllm.NewLLMProvider("default")
+	otherProvider := mockllm.NewLLMProvider("other")
+	eng := newCostAwareEngine(t,
+		map[string]hexagon.Provider{
+			"default": defaultProvider,
+			"other":   otherProvider,
+		},
+		map[string]config.LLMProviderConfig{
+			"default": {
+				Model: "text-only", Models: []string{"text-only"},
+				ModelSpecsMode: config.LLMModelSpecsModeExplicit,
+				ModelSpecs: []config.LLMProviderModelSpec{{
+					ID: "text-only", Capabilities: []string{config.LLMModelCapabilityText},
+				}},
+			},
+			"other": {
+				Model: "vision", Models: []string{"vision"},
+				ModelSpecsMode: config.LLMModelSpecsModeExplicit,
+				ModelSpecs: []config.LLMProviderModelSpec{{
+					ID: "vision", Capabilities: []string{config.LLMModelCapabilityText, config.LLMModelCapabilityVision},
+				}},
+			},
+		},
+		"default",
+	)
+
+	if _, _, err := eng.RouteForVision(context.Background()); err == nil {
+		t.Fatal("RouteForVision crossed provider instead of failing closed")
 	}
 }

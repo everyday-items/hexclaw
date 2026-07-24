@@ -14,6 +14,7 @@ package llmrouter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -71,6 +72,24 @@ type Selector struct {
 }
 
 const defaultProviderCooldown = 2 * time.Minute
+
+var (
+	// ErrNoCapableModel means the configured default provider has no exact
+	// model declaration satisfying a required capability set.
+	ErrNoCapableModel = errors.New("no model satisfies required capabilities")
+	// ErrModelCapabilityMismatch means an explicit provider/model selection
+	// does not satisfy the request. Callers must not silently replace it.
+	ErrModelCapabilityMismatch = errors.New("model capability mismatch")
+)
+
+// CapabilityRoute is an exact provider/model route selected from explicit
+// backend capability metadata. Provider is the facade captured under the same
+// selector read lock as ProviderName and Model, preventing a reload split-read.
+type CapabilityRoute struct {
+	Provider     hexagon.Provider
+	ProviderName string
+	Model        string
+}
 
 // New 创建 LLM 路由器
 //
@@ -206,60 +225,77 @@ func (r *Selector) providerLocked(name string) hexagon.Provider {
 		// Agents, QuickChat, channels and capability probes. UI filtering is not
 		// a security boundary: a stale session or direct API caller must still be
 		// unable to send embedding-only/unclassified IDs to chat transports.
-		p = &textCapabilityProvider{
+		p = &completionCapabilityProvider{
 			next: p, providerName: name, providerConfig: providerConfig,
 		}
 	}
 	return p
 }
 
-type textCapabilityProvider struct {
+type completionCapabilityProvider struct {
 	next           hexagon.Provider
 	providerName   string
 	providerConfig config.LLMProviderConfig
 }
 
-func (p *textCapabilityProvider) Name() string { return p.next.Name() }
+func (p *completionCapabilityProvider) Name() string { return p.next.Name() }
 
-func (p *textCapabilityProvider) validate(model string) error {
-	model = strings.TrimSpace(model)
+func (p *completionCapabilityProvider) validate(req llm.CompletionRequest) error {
+	model := strings.TrimSpace(req.Model)
 	if model == "" {
 		model = strings.TrimSpace(p.providerConfig.Model)
 	}
-	if model == "" || !config.ModelHasCapability(
-		p.providerConfig,
-		model,
-		config.LLMModelCapabilityText,
-	) {
-		return fmt.Errorf("provider %q model %q is not eligible for text completion", p.providerName, model)
+	required := []string{config.LLMModelCapabilityText}
+	if completionRequestContainsImage(req) {
+		required = append(required, config.LLMModelCapabilityVision)
+	}
+	if model == "" || !config.ModelHasCapabilities(p.providerConfig, model, required...) {
+		return fmt.Errorf(
+			"%w: provider %q model %q lacks required capabilities %v",
+			ErrModelCapabilityMismatch,
+			p.providerName,
+			model,
+			required,
+		)
 	}
 	return nil
 }
 
-func (p *textCapabilityProvider) Complete(
+func (p *completionCapabilityProvider) Complete(
 	ctx context.Context,
 	req llm.CompletionRequest,
 ) (*llm.CompletionResponse, error) {
-	if err := p.validate(req.Model); err != nil {
+	if err := p.validate(req); err != nil {
 		return nil, err
 	}
 	return p.next.Complete(ctx, req)
 }
 
-func (p *textCapabilityProvider) Stream(
+func (p *completionCapabilityProvider) Stream(
 	ctx context.Context,
 	req llm.CompletionRequest,
 ) (*llm.Stream, error) {
-	if err := p.validate(req.Model); err != nil {
+	if err := p.validate(req); err != nil {
 		return nil, err
 	}
 	return p.next.Stream(ctx, req)
 }
 
-func (p *textCapabilityProvider) Models() []llm.ModelInfo { return p.next.Models() }
+func (p *completionCapabilityProvider) Models() []llm.ModelInfo { return p.next.Models() }
 
-func (p *textCapabilityProvider) CountTokens(messages []llm.Message) (int, error) {
+func (p *completionCapabilityProvider) CountTokens(messages []llm.Message) (int, error) {
 	return p.next.CountTokens(messages)
+}
+
+func completionRequestContainsImage(req llm.CompletionRequest) bool {
+	for _, message := range req.Messages {
+		for _, part := range message.MultiContent {
+			if strings.EqualFold(strings.TrimSpace(part.Type), "image_url") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // isLocalProviderName reports whether a provider should rank last in fallback.
@@ -579,9 +615,100 @@ func (r *Selector) Default() hexagon.Provider {
 
 // DefaultName 返回默认 Provider 名称
 func (r *Selector) DefaultName() string {
+	if r == nil {
+		return ""
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.defaultP
+}
+
+// DefaultRouteForCapabilities selects a model only inside the configured
+// default provider. It never falls back across providers.
+func (r *Selector) DefaultRouteForCapabilities(required ...string) (CapabilityRoute, error) {
+	return r.ResolveRouteForCapabilities("", "", required...)
+}
+
+// ResolveRouteForCapabilities resolves either an exact explicit provider/model
+// pair or, when both are empty, a stable capable model in the default provider.
+// A partial or incapable explicit selection fails closed and is never replaced.
+func (r *Selector) ResolveRouteForCapabilities(
+	providerName string,
+	model string,
+	required ...string,
+) (CapabilityRoute, error) {
+	if r == nil {
+		return CapabilityRoute{}, fmt.Errorf("%w: LLM router is not initialized", ErrNoCapableModel)
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	providerName = strings.TrimSpace(providerName)
+	model = strings.TrimSpace(model)
+	providerAutomatic := providerName == "" || strings.EqualFold(providerName, "auto")
+	modelAutomatic := model == "" || strings.EqualFold(model, "auto")
+	explicit := !providerAutomatic || !modelAutomatic
+	if explicit && (providerAutomatic || modelAutomatic) {
+		return CapabilityRoute{}, fmt.Errorf(
+			"%w: explicit provider and model must both be set",
+			ErrModelCapabilityMismatch,
+		)
+	}
+	if !explicit {
+		providerName = r.defaultP
+		model = ""
+	}
+	key, ok := r.canonicalNameLocked(providerName)
+	if !ok {
+		return CapabilityRoute{}, fmt.Errorf(
+			"%w: provider %q is not configured",
+			ErrModelCapabilityMismatch,
+			providerName,
+		)
+	}
+	if _, loaded := r.providers[key]; !loaded {
+		return CapabilityRoute{}, fmt.Errorf(
+			"%w: provider %q is not loaded",
+			ErrModelCapabilityMismatch,
+			key,
+		)
+	}
+	providerConfig, configured := r.cfg.Providers[key]
+	if !configured {
+		return CapabilityRoute{}, fmt.Errorf(
+			"%w: provider %q has no capability catalog",
+			ErrModelCapabilityMismatch,
+			key,
+		)
+	}
+
+	if explicit {
+		if !config.ModelHasCapabilities(providerConfig, model, required...) {
+			return CapabilityRoute{}, fmt.Errorf(
+				"%w: provider %q model %q lacks required capabilities %v",
+				ErrModelCapabilityMismatch,
+				key,
+				model,
+				required,
+			)
+		}
+	} else {
+		var found bool
+		model, found = config.PreferredModelWithCapabilities(providerConfig, required...)
+		if !found {
+			return CapabilityRoute{}, fmt.Errorf(
+				"%w: default provider %q has no model with capabilities %v",
+				ErrNoCapableModel,
+				key,
+				required,
+			)
+		}
+	}
+	return CapabilityRoute{
+		Provider:     r.providerLocked(key),
+		ProviderName: key,
+		Model:        model,
+	}, nil
 }
 
 // Route 根据策略选择最优 Provider

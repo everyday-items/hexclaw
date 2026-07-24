@@ -181,6 +181,55 @@ func TestProviderModelSpecs_YAMLRoundTripPreservesExplicitEmpty(t *testing.T) {
 	}
 }
 
+func TestPreferredModelWithCapabilitiesUsesCurrentThenStableCatalogOrder(t *testing.T) {
+	provider := LLMProviderConfig{
+		Model:          "text-default",
+		Models:         []string{"text-default", "vision-first", "vision-second"},
+		ModelSpecsMode: LLMModelSpecsModeExplicit,
+		ModelSpecs: []LLMProviderModelSpec{
+			{ID: "text-default", Capabilities: []string{LLMModelCapabilityText}},
+			{ID: "vision-first", Capabilities: []string{LLMModelCapabilityText, LLMModelCapabilityVision}},
+			{ID: "vision-second", Capabilities: []string{LLMModelCapabilityText, LLMModelCapabilityVision}},
+		},
+	}
+
+	if ModelHasCapabilities(provider, "text-default", LLMModelCapabilityText, LLMModelCapabilityVision) {
+		t.Fatal("text-only default unexpectedly satisfies text+vision")
+	}
+	model, ok := PreferredModelWithCapabilities(
+		provider,
+		LLMModelCapabilityText,
+		LLMModelCapabilityVision,
+	)
+	if !ok || model != "vision-first" {
+		t.Fatalf("stable same-provider vision selection=(%q,%v), want (vision-first,true)", model, ok)
+	}
+
+	provider.Model = "vision-second"
+	model, ok = PreferredModelWithCapabilities(
+		provider,
+		LLMModelCapabilityText,
+		LLMModelCapabilityVision,
+	)
+	if !ok || model != "vision-second" {
+		t.Fatalf("capable current model must win, got (%q,%v)", model, ok)
+	}
+}
+
+func TestPreferredModelWithCapabilitiesDoesNotInferVisionFromModelName(t *testing.T) {
+	provider := LLMProviderConfig{
+		Model:  "gpt-super-vision-vl",
+		Models: []string{"gpt-super-vision-vl"},
+	}
+	if model, ok := PreferredModelWithCapabilities(
+		provider,
+		LLMModelCapabilityText,
+		LLMModelCapabilityVision,
+	); ok || model != "" {
+		t.Fatalf("legacy/model-name heuristic selected undeclared vision model (%q,%v)", model, ok)
+	}
+}
+
 func TestValidateProviderModelSpecs_RejectsInvalidContractsAndNonTextSelection(t *testing.T) {
 	validEmbedding := LLMProviderModelSpec{
 		ID:           testOpenRouterNemotronEmbedID,

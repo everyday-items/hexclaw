@@ -79,8 +79,17 @@ func TestBug20260703_OllamaNativeProviderSendsImagesToAPIChat(t *testing.T) {
 		Default: "Ollama (本地)",
 		Providers: map[string]config.LLMProviderConfig{
 			"Ollama (本地)": {
-				BaseURL: srv.URL + "/v1",
-				Model:   "qwen3.5:9b",
+				BaseURL:        srv.URL + "/v1",
+				Model:          "qwen3.5:9b",
+				Models:         []string{"qwen3.5:9b"},
+				ModelSpecsMode: config.LLMModelSpecsModeExplicit,
+				ModelSpecs: []config.LLMProviderModelSpec{{
+					ID: "qwen3.5:9b",
+					Capabilities: []string{
+						config.LLMModelCapabilityText,
+						config.LLMModelCapabilityVision,
+					},
+				}},
 			},
 		},
 	}

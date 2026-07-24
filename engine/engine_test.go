@@ -1112,7 +1112,17 @@ func newEngineWithProvider(t *testing.T, provider hexagon.Provider) *ReActEngine
 	cfg.Compaction.Enabled = false // 禁用压缩，防止后台 goroutine 与测试 DB 竞争
 	cfg.LLM.Default = "test"
 	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
-		"test": {Model: "mock-model"},
+		"test": {
+			Model:          "mock-model",
+			ModelSpecsMode: config.LLMModelSpecsModeExplicit,
+			ModelSpecs: []config.LLMProviderModelSpec{{
+				ID: "mock-model",
+				Capabilities: []string{
+					config.LLMModelCapabilityText,
+					config.LLMModelCapabilityVision,
+				},
+			}},
+		},
 	}
 	router := llmrouter.NewWithProviders(cfg.LLM, map[string]hexagon.Provider{
 		"test": provider,

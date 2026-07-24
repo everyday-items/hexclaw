@@ -193,19 +193,68 @@ func NormalizeProviderModelSpecs(provider LLMProviderConfig) (string, []LLMProvi
 // ModelHasCapability checks only normalized explicit metadata. It never
 // infers from the provider name or arbitrary model-ID substrings.
 func ModelHasCapability(provider LLMProviderConfig, modelID, capability string) bool {
+	return ModelHasCapabilities(provider, modelID, capability)
+}
+
+// ModelHasCapabilities checks one exact model against all required normalized
+// capability declarations. Provider names and model-ID substrings are never
+// treated as capability evidence.
+func ModelHasCapabilities(provider LLMProviderConfig, modelID string, required ...string) bool {
+	if strings.TrimSpace(modelID) == "" || len(required) == 0 {
+		return false
+	}
 	_, specs := NormalizeProviderModelSpecs(provider)
 	for _, spec := range specs {
 		if spec.ID != modelID {
 			continue
 		}
-		for _, candidate := range spec.Capabilities {
-			if candidate == capability {
-				return true
-			}
-		}
-		return false
+		return modelSpecHasCapabilities(spec, required)
 	}
 	return false
+}
+
+// PreferredModelWithCapabilities selects within one provider only. A capable
+// current model wins; otherwise the normalized model-spec catalog order is the
+// stable fallback. Legacy configurations synthesize text only, so media
+// capabilities remain fail-closed until explicitly declared.
+func PreferredModelWithCapabilities(provider LLMProviderConfig, required ...string) (string, bool) {
+	current := strings.TrimSpace(provider.Model)
+	_, specs := NormalizeProviderModelSpecs(provider)
+	if current != "" {
+		for _, spec := range specs {
+			if spec.ID == current && modelSpecHasCapabilities(spec, required) {
+				return current, true
+			}
+		}
+	}
+	for _, spec := range specs {
+		if spec.ID == current {
+			continue
+		}
+		if modelSpecHasCapabilities(spec, required) {
+			return spec.ID, true
+		}
+	}
+	return "", false
+}
+
+func modelSpecHasCapabilities(spec LLMProviderModelSpec, required []string) bool {
+	if len(required) == 0 {
+		return false
+	}
+	for _, capability := range required {
+		found := false
+		for _, candidate := range spec.Capabilities {
+			if candidate == capability {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // ValidateProviderModelSpecs rejects ambiguous or internally inconsistent

@@ -41,7 +41,17 @@ func newEgressGuardedCloudEngine(t *testing.T, provider hexagon.Provider, mem *m
 	cfg.Compaction.Enabled = false
 	cfg.LLM.Default = "cloud-openai"
 	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
-		"cloud-openai": {Model: "gpt-x"}, // 无 base_url + 名不含 ollama → 云端
+		"cloud-openai": {
+			Model:          "gpt-x", // 无 base_url + 名不含 ollama → 云端
+			ModelSpecsMode: config.LLMModelSpecsModeExplicit,
+			ModelSpecs: []config.LLMProviderModelSpec{{
+				ID: "gpt-x",
+				Capabilities: []string{
+					config.LLMModelCapabilityText,
+					config.LLMModelCapabilityVision,
+				},
+			}},
+		},
 	}
 	router := llmrouter.NewWithProviders(cfg.LLM, map[string]hexagon.Provider{
 		"cloud-openai": provider,
