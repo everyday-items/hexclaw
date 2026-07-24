@@ -16,7 +16,9 @@ func TestK12DingTalkMarkdownLaTeXProjectionMatrix(t *testing.T) {
 	}{
 		{name: "heading-list", markdown: "## 辅导要点\n\n- 先审题\n- 再验算", visible: []string{"## 辅导要点", "- 先审题"}},
 		{name: "inline-fraction", markdown: "答案是 $\\frac{3}{4} \\times 8 = 6$。", visible: []string{"3/4", "×", "= 6"}},
+		{name: "mixed-number", markdown: "第一天修了 $2\\frac{3}{4}$ 千米，第二天多修 $1\\frac{1}{2}$ 千米。", visible: []string{"2 3/4", "1 1/2"}},
 		{name: "block-square-root", markdown: "推导：\n\\[\\sqrt{16} = 4\\]", visible: []string{"√16", "= 4"}},
+		{name: "aligned-block", markdown: "推导：\\[\\begin{aligned}2x + 1 &= 5 \\\\ 2x &= 4\\end{aligned}\\]", visible: []string{"2x + 1 = 5\n2x = 4"}},
 		{name: "scripts-units", markdown: "面积是 $6 \\, \\mathrm{cm}^2$，水是 $H_2O$。", visible: []string{"6 cm²", "H₂O"}},
 		{name: "comparison", markdown: "因为 $\\alpha + \\beta \\geq 1$，所以成立。", visible: []string{"α + β ≥ 1"}},
 	}
@@ -48,7 +50,7 @@ func TestK12DingTalkMarkdownLaTeXProjectionMatrix(t *testing.T) {
 					t.Fatalf("projection %q does not contain %q", projected, want)
 				}
 			}
-			for _, raw := range []string{"\\frac", "\\sqrt", "\\times", "\\alpha", "\\beta", "\\geq", "\\mathrm", "\\,", "\\[", "\\]"} {
+			for _, raw := range []string{"\\frac", "\\sqrt", "\\times", "\\alpha", "\\beta", "\\geq", "\\mathrm", "\\begin", "\\end", "\\\\", "\\,", "\\[", "\\]", "$"} {
 				if strings.Contains(projected, raw) {
 					t.Fatalf("raw LaTeX %q leaked into projection %q", raw, projected)
 				}
