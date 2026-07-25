@@ -83,7 +83,7 @@ func (s *mockStore) UpdateSession(_ context.Context, _ *storage.Session) error  
 func (s *mockStore) SearchMessages(_ context.Context, _, _ string, _, _ int) ([]*storage.SearchResult, int, error) {
 	return nil, 0, nil
 }
-func (s *mockStore) ForkSession(_ context.Context, _, _, _ string) (*storage.Session, error) {
+func (s *mockStore) ForkSession(_ context.Context, _, _, _ string, _ ...storage.ForkSessionOptions) (*storage.Session, error) {
 	return nil, nil
 }
 func (s *mockStore) ListSessionBranches(_ context.Context, _ string) ([]*storage.Session, error) {

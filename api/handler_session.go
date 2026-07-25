@@ -546,8 +546,9 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 
 // ForkSessionRequest 创建分支请求
 type ForkSessionRequest struct {
-	MessageID string `json:"message_id"` // 从哪条消息开始分支
-	UserID    string `json:"user_id"`    // 用户 ID（可选）
+	MessageID      string `json:"message_id"` // 从哪条消息开始分支
+	UserID         string `json:"user_id"`    // 用户 ID（可选）
+	IncludeMessage *bool  `json:"include_message,omitempty"`
 }
 
 // handleForkSession 从指定消息处创建对话分支
@@ -578,7 +579,11 @@ func (s *Server) handleForkSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newSession, err := s.store.ForkSession(r.Context(), sessionID, req.MessageID, userID)
+	options := []storage.ForkSessionOptions(nil)
+	if req.IncludeMessage != nil {
+		options = append(options, storage.ForkSessionOptions{IncludeMessage: *req.IncludeMessage})
+	}
+	newSession, err := s.store.ForkSession(r.Context(), sessionID, req.MessageID, userID, options...)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "创建分支失败: " + err.Error(),

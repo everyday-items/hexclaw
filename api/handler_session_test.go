@@ -89,6 +89,46 @@ func TestForkSession_EmptyBody(t *testing.T) {
 	}
 }
 
+func TestForkSession_ExclusivePrefixRequest(t *testing.T) {
+	store := newTestStoreForAPI(t)
+	ctx := context.Background()
+	if err := store.CreateSession(ctx, &storage.Session{
+		ID: "sess-edit-source", UserID: "editor", Platform: "web", Title: "编辑源会话",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"before", "edited", "tail"} {
+		if err := store.SaveMessage(ctx, &storage.MessageRecord{
+			ID: id, SessionID: "sess-edit-source", Role: "user", Content: id, Metadata: "{}",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := config.DefaultConfig()
+	srv := NewServer(cfg, &mockEngine{reply: &adapter.Reply{Content: "ok"}}, nil, store)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/sess-edit-source/fork",
+		strings.NewReader(`{"message_id":"edited","user_id":"editor","include_message":false}`))
+	req.SetPathValue("id", "sess-edit-source")
+	w := httptest.NewRecorder()
+	srv.handleForkSession(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("fork status = %d: %s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Session storage.Session `json:"session"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	messages, err := store.ListMessages(ctx, response.Session.ID, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || messages[0].Content != "before" {
+		t.Fatalf("exclusive API fork copied %#v, want only before", messages)
+	}
+}
+
 // 测试 handleSearchMessages 缺少 q 参数
 func TestSearchMessages_MissingQuery(t *testing.T) {
 	store := newTestStoreForAPI(t)
