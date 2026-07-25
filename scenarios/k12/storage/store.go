@@ -296,7 +296,12 @@ func (s *Store) Get(ctx context.Context, recordID string) (*records.AgentRecord,
 
 func (s *Store) getVia(ctx context.Context, q dbQueryer, recordID string) (*records.AgentRecord, error) {
 	for _, mp := range allMappers() {
-		rows, err := s.queryRecordsVia(ctx, q, mp, `WHERE record_id = ?`, recordID)
+		where := `WHERE record_id = ?`
+		switch mp.(type) {
+		case creativeWorkMapper, accumMapper:
+			where += ` AND deleted_at IS NULL`
+		}
+		rows, err := s.queryRecordsVia(ctx, q, mp, where, recordID)
 		if err != nil {
 			return nil, err
 		}
@@ -318,6 +323,10 @@ func (s *Store) ListByScope(ctx context.Context, agentName, collection, status s
 	}
 	where := `WHERE agent_name = ?`
 	args := []any{agentName}
+	switch mp.(type) {
+	case creativeWorkMapper, accumMapper:
+		where += ` AND deleted_at IS NULL`
+	}
 	if status != "" {
 		where += ` AND status = ?`
 		args = append(args, status)
