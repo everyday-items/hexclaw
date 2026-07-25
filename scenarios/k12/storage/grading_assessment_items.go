@@ -43,16 +43,16 @@ type GradingReviewEffect struct {
 
 const gradingAssessmentItemColumns = `agent_name,job_id,problem_id,attempt_id,confirmed_version,
     input_digest,status,result_json,result_digest,solve_invocation_id,grade_invocation_id,
-    projection_record_id,projection_created,projection_status,created_at,updated_at`
+    parent_guide_invocation_id,projection_record_id,projection_created,projection_status,created_at,updated_at`
 
 func scanGradingAssessmentItem(row rowScanner) (k12.GradingAssessmentItem, error) {
 	var item k12.GradingAssessmentItem
 	var status string
-	var solveID, gradeID sql.NullString
+	var solveID, gradeID, parentGuideID sql.NullString
 	var projectionCreated int64
 	err := row.Scan(&item.AgentName, &item.JobID, &item.ProblemID, &item.AttemptID,
 		&item.ConfirmedVersion, &item.InputDigest, &status, &item.ResultJSON, &item.ResultDigest,
-		&solveID, &gradeID, &item.ProjectionRecordID, &projectionCreated,
+		&solveID, &gradeID, &parentGuideID, &item.ProjectionRecordID, &projectionCreated,
 		&item.ProjectionStatus, &item.CreatedAt, &item.UpdatedAt)
 	if err != nil {
 		return k12.GradingAssessmentItem{}, err
@@ -65,6 +65,9 @@ func scanGradingAssessmentItem(row rowScanner) (k12.GradingAssessmentItem, error
 	if gradeID.Valid {
 		item.GradeInvocationID = gradeID.String
 	}
+	if parentGuideID.Valid {
+		item.ParentGuideInvocationID = parentGuideID.String
+	}
 	return item, nil
 }
 
@@ -73,7 +76,9 @@ func sameGradingAssessmentReceipt(a, b k12.GradingAssessmentItem) bool {
 		a.AttemptID == b.AttemptID && a.ConfirmedVersion == b.ConfirmedVersion &&
 		a.InputDigest == b.InputDigest && a.Status == b.Status && a.ResultJSON == b.ResultJSON &&
 		a.ResultDigest == b.ResultDigest && a.SolveInvocationID == b.SolveInvocationID &&
-		a.GradeInvocationID == b.GradeInvocationID && a.ProjectionStatus == b.ProjectionStatus
+		a.GradeInvocationID == b.GradeInvocationID &&
+		a.ParentGuideInvocationID == b.ParentGuideInvocationID &&
+		a.ProjectionStatus == b.ProjectionStatus
 }
 
 func gradingAssessmentEventID(item k12.GradingAssessmentItem, effectKind string) string {
@@ -143,6 +148,14 @@ func (s *Store) CommitGradingAssessmentItem(ctx context.Context, item k12.Gradin
 	if err := s.validateAssessmentInvocationRef(ctx, item, item.GradeInvocationID, k12.GradingItemOperationGrade); err != nil {
 		return k12.GradingAssessmentItem{}, false, err
 	}
+	if err := s.validateAssessmentInvocationRef(
+		ctx,
+		item,
+		item.ParentGuideInvocationID,
+		k12.GradingItemOperationParentGuide,
+	); err != nil {
+		return k12.GradingAssessmentItem{}, false, err
+	}
 	if item.CreatedAt <= 0 {
 		item.CreatedAt = nowUnix()
 	}
@@ -153,17 +166,20 @@ func (s *Store) CommitGradingAssessmentItem(ctx context.Context, item k12.Gradin
 		return k12.GradingAssessmentItem{}, false, fmt.Errorf("k12storage: begin grading assessment transaction: %w", err)
 	}
 	defer tx.Rollback()
-	var solveID, gradeID any
+	var solveID, gradeID, parentGuideID any
 	if item.SolveInvocationID != "" {
 		solveID = item.SolveInvocationID
 	}
 	if item.GradeInvocationID != "" {
 		gradeID = item.GradeInvocationID
 	}
+	if item.ParentGuideInvocationID != "" {
+		parentGuideID = item.ParentGuideInvocationID
+	}
 	res, err := tx.ExecContext(ctx, `INSERT INTO k12_grading_assessment_items (`+gradingAssessmentItemColumns+`)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id,problem_id) DO NOTHING`,
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id,problem_id) DO NOTHING`,
 		item.AgentName, item.JobID, item.ProblemID, item.AttemptID, item.ConfirmedVersion,
-		item.InputDigest, item.Status, item.ResultJSON, item.ResultDigest, solveID, gradeID,
+		item.InputDigest, item.Status, item.ResultJSON, item.ResultDigest, solveID, gradeID, parentGuideID,
 		item.ProjectionRecordID, boolInt(item.ProjectionCreated), item.ProjectionStatus,
 		item.CreatedAt, item.UpdatedAt)
 	if err != nil {

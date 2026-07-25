@@ -13,8 +13,9 @@ import (
 )
 
 var ErrDeliveryReceiptConflict = errors.New("delivery receipt immutable identity conflict")
+var ErrDeliveryBatchConflict = errors.New("delivery batch immutable identity conflict")
 
-const deliveryReceiptColumns = `delivery_id,agent_name,object_kind,object_id,binding_id,
+const deliveryReceiptColumns = `delivery_id,batch_id,batch_ordinal,agent_name,object_kind,object_id,binding_id,
     platform,instance_id,chat_id,target_label,status,dedupe_key,payload_digest,payload_json,
     render_manifest_json,external_message_id,attempt,last_error,created_at,updated_at`
 
@@ -22,7 +23,8 @@ func scanDeliveryReceipt(row rowScanner) (k12.DeliveryReceipt, error) {
 	var receipt k12.DeliveryReceipt
 	var status string
 	err := row.Scan(
-		&receipt.DeliveryID, &receipt.AgentName, &receipt.ObjectKind, &receipt.ObjectID,
+		&receipt.DeliveryID, &receipt.BatchID, &receipt.BatchOrdinal,
+		&receipt.AgentName, &receipt.ObjectKind, &receipt.ObjectID,
 		&receipt.BindingID, &receipt.Target.Platform, &receipt.Target.InstanceID,
 		&receipt.Target.ChatID, &receipt.Target.Label, &status, &receipt.DedupeKey,
 		&receipt.PayloadDigest, &receipt.PayloadJSON, &receipt.RenderJSON,
@@ -35,6 +37,7 @@ func scanDeliveryReceipt(row rowScanner) (k12.DeliveryReceipt, error) {
 
 func normalizeDeliveryReceipt(receipt k12.DeliveryReceipt) (k12.DeliveryReceipt, error) {
 	receipt.DeliveryID = strings.TrimSpace(receipt.DeliveryID)
+	receipt.BatchID = strings.TrimSpace(receipt.BatchID)
 	receipt.AgentName = strings.TrimSpace(receipt.AgentName)
 	receipt.ObjectKind = strings.TrimSpace(receipt.ObjectKind)
 	receipt.ObjectID = strings.TrimSpace(receipt.ObjectID)
@@ -52,6 +55,9 @@ func normalizeDeliveryReceipt(receipt k12.DeliveryReceipt) (k12.DeliveryReceipt,
 		receipt.Target.ChatID == "" || receipt.DedupeKey == "" || receipt.PayloadDigest == "" ||
 		receipt.PayloadJSON == "" {
 		return k12.DeliveryReceipt{}, fmt.Errorf("k12storage: DeliveryReceipt 缺少 id/owner/object/binding/target/dedupe/payload")
+	}
+	if receipt.BatchOrdinal < 0 || (receipt.BatchID != "" && receipt.BatchOrdinal < 1) {
+		return k12.DeliveryReceipt{}, fmt.Errorf("k12storage: DeliveryReceipt batch ordinal 非法")
 	}
 	if strings.HasPrefix(receipt.Target.ChatID, "\x00") {
 		return k12.DeliveryReceipt{}, fmt.Errorf("k12storage: DeliveryReceipt 只允许 direct target")
@@ -74,7 +80,8 @@ func normalizeDeliveryReceipt(receipt k12.DeliveryReceipt) (k12.DeliveryReceipt,
 }
 
 func deliveryIdentityEqual(a, b k12.DeliveryReceipt) bool {
-	return a.AgentName == b.AgentName && a.ObjectKind == b.ObjectKind && a.ObjectID == b.ObjectID &&
+	return a.BatchID == b.BatchID && a.BatchOrdinal == b.BatchOrdinal &&
+		a.AgentName == b.AgentName && a.ObjectKind == b.ObjectKind && a.ObjectID == b.ObjectID &&
 		a.BindingID == b.BindingID && a.Target == b.Target && a.DedupeKey == b.DedupeKey &&
 		a.PayloadDigest == b.PayloadDigest && a.PayloadJSON == b.PayloadJSON && a.RenderJSON == b.RenderJSON
 }
@@ -88,9 +95,10 @@ func (s *Store) PrepareDeliveryReceipt(ctx context.Context, input k12.DeliveryRe
 		return k12.DeliveryReceipt{}, false, err
 	}
 	res, err := s.db.ExecContext(ctx, `INSERT INTO k12_delivery_receipts (`+deliveryReceiptColumns+`)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(agent_name,dedupe_key) DO NOTHING`,
-		receipt.DeliveryID, receipt.AgentName, receipt.ObjectKind, receipt.ObjectID,
+		receipt.DeliveryID, receipt.BatchID, receipt.BatchOrdinal,
+		receipt.AgentName, receipt.ObjectKind, receipt.ObjectID,
 		receipt.BindingID, receipt.Target.Platform, receipt.Target.InstanceID,
 		receipt.Target.ChatID, receipt.Target.Label, receipt.Status, receipt.DedupeKey,
 		receipt.PayloadDigest, receipt.PayloadJSON, receipt.RenderJSON, "",
@@ -132,6 +140,261 @@ func (s *Store) GetDeliveryReceipt(ctx context.Context, agentName, deliveryID st
 		return k12.DeliveryReceipt{}, fmt.Errorf("k12storage: get DeliveryReceipt: %w", err)
 	}
 	return receipt, nil
+}
+
+const deliveryBatchColumns = `batch_id,agent_name,object_kind,object_id,dedupe_key,
+    content_digest,created_at,updated_at`
+
+func scanDeliveryBatchRoot(row rowScanner) (k12.DeliveryBatch, error) {
+	var batch k12.DeliveryBatch
+	err := row.Scan(
+		&batch.BatchID, &batch.AgentName, &batch.ObjectKind, &batch.ObjectID,
+		&batch.DedupeKey, &batch.ContentDigest, &batch.CreatedAt, &batch.UpdatedAt,
+	)
+	return batch, err
+}
+
+func normalizeDeliveryBatch(input k12.DeliveryBatch) (k12.DeliveryBatch, error) {
+	input.BatchID = strings.TrimSpace(input.BatchID)
+	input.AgentName = strings.TrimSpace(input.AgentName)
+	input.ObjectKind = strings.TrimSpace(input.ObjectKind)
+	input.ObjectID = strings.TrimSpace(input.ObjectID)
+	input.DedupeKey = strings.TrimSpace(input.DedupeKey)
+	input.ContentDigest = strings.TrimSpace(input.ContentDigest)
+	if input.BatchID == "" || input.AgentName == "" || input.ObjectKind == "" ||
+		input.ObjectID == "" || input.DedupeKey == "" || input.ContentDigest == "" {
+		return k12.DeliveryBatch{}, fmt.Errorf("k12storage: DeliveryBatch 缺少 id/owner/object/dedupe/content")
+	}
+	if len(input.Receipts) == 0 {
+		return k12.DeliveryBatch{}, fmt.Errorf("k12storage: DeliveryBatch 至少需要一个子回执")
+	}
+	if input.CreatedAt <= 0 {
+		input.CreatedAt = nowUnix()
+	}
+	input.UpdatedAt = input.CreatedAt
+	input.Status = ""
+	targets := make(map[string]struct{}, len(input.Receipts))
+	bindings := make(map[string]struct{}, len(input.Receipts))
+	normalized := make([]k12.DeliveryReceipt, 0, len(input.Receipts))
+	for i, child := range input.Receipts {
+		child.BatchID = input.BatchID
+		child.BatchOrdinal = i + 1
+		child.AgentName = input.AgentName
+		child.ObjectKind = input.ObjectKind
+		child.ObjectID = input.ObjectID
+		child.CreatedAt = input.CreatedAt
+		child, err := normalizeDeliveryReceipt(child)
+		if err != nil {
+			return k12.DeliveryBatch{}, fmt.Errorf("k12storage: normalize DeliveryBatch child %d: %w", i+1, err)
+		}
+		targetKey := strings.Join([]string{
+			child.Target.Platform, child.Target.InstanceID, child.Target.ChatID,
+		}, "\x00")
+		if _, exists := targets[targetKey]; exists {
+			return k12.DeliveryBatch{}, fmt.Errorf("k12storage: DeliveryBatch 含重复目标 %q", targetKey)
+		}
+		if _, exists := bindings[child.BindingID]; exists {
+			return k12.DeliveryBatch{}, fmt.Errorf("k12storage: DeliveryBatch 含重复 binding %q", child.BindingID)
+		}
+		targets[targetKey] = struct{}{}
+		bindings[child.BindingID] = struct{}{}
+		normalized = append(normalized, child)
+	}
+	input.Receipts = normalized
+	return input, nil
+}
+
+func deliveryBatchIdentityEqual(a, b k12.DeliveryBatch) bool {
+	return a.AgentName == b.AgentName && a.ObjectKind == b.ObjectKind &&
+		a.ObjectID == b.ObjectID && a.DedupeKey == b.DedupeKey &&
+		a.ContentDigest == b.ContentDigest
+}
+
+func insertDeliveryBatchRoot(
+	ctx context.Context,
+	ex dbExecer,
+	batch k12.DeliveryBatch,
+	ignoreDedupeConflict bool,
+) (bool, error) {
+	query := `INSERT INTO k12_delivery_batches (` + deliveryBatchColumns + `)
+        VALUES(?,?,?,?,?,?,?,?)`
+	if ignoreDedupeConflict {
+		query += ` ON CONFLICT(agent_name,dedupe_key) DO NOTHING`
+	}
+	res, err := ex.ExecContext(ctx, query,
+		batch.BatchID, batch.AgentName, batch.ObjectKind, batch.ObjectID,
+		batch.DedupeKey, batch.ContentDigest, batch.CreatedAt, batch.UpdatedAt,
+	)
+	if err != nil {
+		return false, fmt.Errorf("k12storage: prepare DeliveryBatch: %w", err)
+	}
+	created, _ := res.RowsAffected()
+	return created > 0, nil
+}
+
+func insertDeliveryBatchChildren(
+	ctx context.Context,
+	ex dbExecer,
+	batch k12.DeliveryBatch,
+) error {
+	for _, receipt := range batch.Receipts {
+		if _, err := ex.ExecContext(ctx, `INSERT INTO k12_delivery_receipts (`+deliveryReceiptColumns+`)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			receipt.DeliveryID, receipt.BatchID, receipt.BatchOrdinal,
+			receipt.AgentName, receipt.ObjectKind, receipt.ObjectID,
+			receipt.BindingID, receipt.Target.Platform, receipt.Target.InstanceID,
+			receipt.Target.ChatID, receipt.Target.Label, receipt.Status, receipt.DedupeKey,
+			receipt.PayloadDigest, receipt.PayloadJSON, receipt.RenderJSON,
+			receipt.ExternalMessageID, receipt.Attempt, receipt.LastError,
+			receipt.CreatedAt, receipt.UpdatedAt,
+		); err != nil {
+			return fmt.Errorf(
+				"k12storage: prepare DeliveryBatch child %d: %w", receipt.BatchOrdinal, err,
+			)
+		}
+	}
+	return nil
+}
+
+// PrepareDeliveryBatch atomically freezes the logical batch root and every
+// child receipt before any provider call. The first writer wins a concurrent
+// binding-snapshot race; later command replays return that frozen batch.
+func (s *Store) PrepareDeliveryBatch(ctx context.Context, input k12.DeliveryBatch) (k12.DeliveryBatch, bool, error) {
+	batch, err := normalizeDeliveryBatch(input)
+	if err != nil {
+		return k12.DeliveryBatch{}, false, err
+	}
+	// Keep the deferred SQLite transaction write-first. A transactional read
+	// followed by INSERT can fail its lock upgrade under concurrent writers.
+	if err := ensureAgentRegistered(ctx, s.db, batch.AgentName); err != nil {
+		return k12.DeliveryBatch{}, false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return k12.DeliveryBatch{}, false, fmt.Errorf("k12storage: begin DeliveryBatch: %w", err)
+	}
+	defer tx.Rollback()
+	created, err := insertDeliveryBatchRoot(ctx, tx, batch, true)
+	if err != nil {
+		return k12.DeliveryBatch{}, false, err
+	}
+	storedRoot := batch
+	if !created {
+		storedRoot, err = scanDeliveryBatchRoot(tx.QueryRowContext(ctx,
+			`SELECT `+deliveryBatchColumns+` FROM k12_delivery_batches
+             WHERE agent_name=? AND dedupe_key=?`,
+			batch.AgentName, batch.DedupeKey,
+		))
+		if errors.Is(err, sql.ErrNoRows) {
+			return k12.DeliveryBatch{}, false, records.ErrNotFound
+		}
+		if err != nil {
+			return k12.DeliveryBatch{}, false, fmt.Errorf("k12storage: replay DeliveryBatch: %w", err)
+		}
+		if !deliveryBatchIdentityEqual(storedRoot, batch) {
+			return k12.DeliveryBatch{}, false, fmt.Errorf(
+				"%w: owner=%s dedupe=%s", ErrDeliveryBatchConflict, batch.AgentName, batch.DedupeKey,
+			)
+		}
+	} else {
+		if err := insertDeliveryBatchChildren(ctx, tx, batch); err != nil {
+			return k12.DeliveryBatch{}, false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return k12.DeliveryBatch{}, false, fmt.Errorf("k12storage: commit DeliveryBatch: %w", err)
+	}
+	stored, err := s.GetDeliveryBatch(ctx, batch.AgentName, storedRoot.BatchID)
+	return stored, created, err
+}
+
+func (s *Store) GetDeliveryBatchByDedupe(ctx context.Context, agentName, dedupeKey string) (k12.DeliveryBatch, error) {
+	return getDeliveryBatchByDedupeVia(
+		ctx, s.db, strings.TrimSpace(agentName), strings.TrimSpace(dedupeKey),
+	)
+}
+
+func getDeliveryBatchByDedupeVia(
+	ctx context.Context,
+	q dbQueryer,
+	agentName, dedupeKey string,
+) (k12.DeliveryBatch, error) {
+	root, err := scanDeliveryBatchRoot(q.QueryRowContext(ctx,
+		`SELECT `+deliveryBatchColumns+` FROM k12_delivery_batches
+         WHERE agent_name=? AND dedupe_key=?`,
+		agentName, dedupeKey,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return k12.DeliveryBatch{}, records.ErrNotFound
+	}
+	if err != nil {
+		return k12.DeliveryBatch{}, fmt.Errorf("k12storage: get DeliveryBatch by dedupe: %w", err)
+	}
+	return attachDeliveryBatchReceiptsVia(ctx, q, root)
+}
+
+func (s *Store) GetDeliveryBatch(ctx context.Context, agentName, batchID string) (k12.DeliveryBatch, error) {
+	return getDeliveryBatchVia(
+		ctx, s.db, strings.TrimSpace(agentName), strings.TrimSpace(batchID),
+	)
+}
+
+func getDeliveryBatchVia(
+	ctx context.Context,
+	q dbQueryer,
+	agentName, batchID string,
+) (k12.DeliveryBatch, error) {
+	root, err := scanDeliveryBatchRoot(q.QueryRowContext(ctx,
+		`SELECT `+deliveryBatchColumns+` FROM k12_delivery_batches
+         WHERE agent_name=? AND batch_id=?`,
+		agentName, batchID,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return k12.DeliveryBatch{}, records.ErrNotFound
+	}
+	if err != nil {
+		return k12.DeliveryBatch{}, fmt.Errorf("k12storage: get DeliveryBatch: %w", err)
+	}
+	return attachDeliveryBatchReceiptsVia(ctx, q, root)
+}
+
+func (s *Store) attachDeliveryBatchReceipts(ctx context.Context, batch k12.DeliveryBatch) (k12.DeliveryBatch, error) {
+	return attachDeliveryBatchReceiptsVia(ctx, s.db, batch)
+}
+
+func attachDeliveryBatchReceiptsVia(
+	ctx context.Context,
+	q dbQueryer,
+	batch k12.DeliveryBatch,
+) (k12.DeliveryBatch, error) {
+	rows, err := q.QueryContext(ctx, `SELECT `+deliveryReceiptColumns+`
+        FROM k12_delivery_receipts WHERE agent_name=? AND batch_id=?
+        ORDER BY batch_ordinal,delivery_id`, batch.AgentName, batch.BatchID)
+	if err != nil {
+		return k12.DeliveryBatch{}, fmt.Errorf("k12storage: list DeliveryBatch children: %w", err)
+	}
+	defer rows.Close()
+	batch.Receipts = nil
+	for rows.Next() {
+		receipt, scanErr := scanDeliveryReceipt(rows)
+		if scanErr != nil {
+			return k12.DeliveryBatch{}, scanErr
+		}
+		batch.Receipts = append(batch.Receipts, receipt)
+		if receipt.UpdatedAt > batch.UpdatedAt {
+			batch.UpdatedAt = receipt.UpdatedAt
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return k12.DeliveryBatch{}, err
+	}
+	if len(batch.Receipts) == 0 {
+		return k12.DeliveryBatch{}, fmt.Errorf(
+			"%w: DeliveryBatch %s has no child receipts", ErrDeliveryBatchConflict, batch.BatchID,
+		)
+	}
+	batch.Status = k12.DeliveryBatchStatusOf(batch.Receipts)
+	return batch, nil
 }
 
 func (s *Store) BeginDeliveryAttempt(ctx context.Context, agentName, deliveryID string) (k12.DeliveryReceipt, bool, error) {

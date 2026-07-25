@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
@@ -14,8 +15,8 @@ func deliveryFixture(agent, deliveryID, dedupe string) k12.DeliveryReceipt {
 	return k12.DeliveryReceipt{
 		DeliveryID: deliveryID,
 		AgentName:  agent,
-		ObjectKind: "creative_work_feedback",
-		ObjectID:   "work-1",
+		ObjectKind: "accumulation",
+		ObjectID:   "accumulation-1",
 		BindingID:  "binding-1",
 		Target: k12.DeliveryTarget{
 			Platform: "dingtalk", InstanceID: "pi-1", ChatID: "user-1", Label: "妈妈的钉钉",
@@ -136,5 +137,81 @@ func TestDeliveryReceiptOutcomeUnknownBlocksBlindRetryAndSurvivesRestart(t *test
 	replayed, err := restarted.ReconcileDeliveryReceipt(ctx, "mingming", receipt.DeliveryID, k12.DeliveryDelivered, "pqk-reconciled", "")
 	if err != nil || replayed != terminal {
 		t.Fatalf("terminal reconciliation replay must be idempotent: replay=%+v err=%v", replayed, err)
+	}
+}
+
+func deliveryBatchFixture(batchID, dedupe string) k12.DeliveryBatch {
+	return k12.DeliveryBatch{
+		BatchID:       batchID,
+		AgentName:     "mingming",
+		ObjectKind:    "accumulation",
+		ObjectID:      "accumulation-1",
+		DedupeKey:     dedupe,
+		ContentDigest: "sha256:content",
+		Receipts: []k12.DeliveryReceipt{
+			{
+				DeliveryID: "delivery-a", BindingID: "binding-a",
+				Target: k12.DeliveryTarget{
+					Platform: "dingtalk", InstanceID: "bot-a", ChatID: "parent",
+				},
+				DedupeKey: "child-a", PayloadDigest: "sha256:payload-a",
+				PayloadJSON: `{"text":"积累内容"}`, RenderJSON: `{}`,
+			},
+			{
+				DeliveryID: "delivery-b", BindingID: "binding-b",
+				Target: k12.DeliveryTarget{
+					Platform: "dingtalk", InstanceID: "bot-b", ChatID: "parent",
+				},
+				DedupeKey: "child-b", PayloadDigest: "sha256:payload-b",
+				PayloadJSON: `{"text":"积累内容"}`, RenderJSON: `{}`,
+			},
+		},
+	}
+}
+
+func TestDeliveryBatchPrepareAtomicallyFreezesFirstBindingSnapshot(t *testing.T) {
+	store := setupDeliveryStore(t)
+	ctx := context.Background()
+	first, created, err := store.PrepareDeliveryBatch(
+		ctx, deliveryBatchFixture("batch-first", "batch-dedupe"),
+	)
+	if err != nil || !created || first.BatchID != "batch-first" ||
+		first.Status != k12.DeliveryBatchPending || len(first.Receipts) != 2 {
+		t.Fatalf("first batch=%+v created=%v err=%v", first, created, err)
+	}
+	for i, receipt := range first.Receipts {
+		if receipt.BatchID != first.BatchID || receipt.BatchOrdinal != i+1 {
+			t.Fatalf("child %d not attached in stable order: %+v", i, receipt)
+		}
+	}
+
+	replayInput := deliveryBatchFixture("batch-loser", "batch-dedupe")
+	replayInput.Receipts = replayInput.Receipts[:1]
+	replayInput.Receipts[0].DeliveryID = "delivery-loser"
+	replayInput.Receipts[0].BindingID = "binding-new"
+	replayInput.Receipts[0].Target.InstanceID = "bot-new"
+	replay, created, err := store.PrepareDeliveryBatch(ctx, replayInput)
+	if err != nil || created || replay.BatchID != first.BatchID || len(replay.Receipts) != 2 {
+		t.Fatalf("replay must return first frozen binding snapshot: batch=%+v created=%v err=%v",
+			replay, created, err)
+	}
+
+	conflict := deliveryBatchFixture("batch-conflict", "batch-dedupe")
+	conflict.ContentDigest = "sha256:changed"
+	if _, _, err := store.PrepareDeliveryBatch(ctx, conflict); !errors.Is(err, k12storage.ErrDeliveryBatchConflict) {
+		t.Fatalf("same dedupe with changed content must fail closed: %v", err)
+	}
+}
+
+func TestDeliveryBatchChildInsertFailureRollsBackRoot(t *testing.T) {
+	store := setupDeliveryStore(t)
+	ctx := context.Background()
+	input := deliveryBatchFixture("batch-rollback", "batch-rollback-dedupe")
+	input.Receipts[1].DedupeKey = input.Receipts[0].DedupeKey
+	if _, _, err := store.PrepareDeliveryBatch(ctx, input); err == nil {
+		t.Fatal("duplicate child dedupe must fail")
+	}
+	if _, err := store.GetDeliveryBatchByDedupe(ctx, input.AgentName, input.DedupeKey); !errors.Is(err, records.ErrNotFound) {
+		t.Fatalf("failed child insert left a visible root: %v", err)
 	}
 }

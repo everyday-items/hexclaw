@@ -287,8 +287,9 @@ func TestCronV1ToLatestMergesDuplicatesWithoutLosingParentOrChildEvidence(t *tes
 	if err := db.QueryRow(`PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
 		t.Fatal(err)
 	}
-	if latest != 31 || foreignKeys != 1 {
-		t.Errorf("latest/FK=%d/%d, want 31/1", latest, foreignKeys)
+	wantLatest := All[len(All)-1].Version
+	if latest != wantLatest || foreignKeys != 1 {
+		t.Errorf("latest/FK=%d/%d, want %d/1", latest, foreignKeys, wantLatest)
 	}
 	assertCanonicalCronSchema(t, db)
 }

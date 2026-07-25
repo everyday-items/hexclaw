@@ -21,6 +21,7 @@ import (
 	"github.com/hexagon-codes/toolkit/util/idgen"
 
 	"github.com/hexagon-codes/hexclaw/records"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
 // nowUnix 当前 unix 秒（测试可注入）。
@@ -459,6 +460,71 @@ func (s *Store) UpdateStatusFields(ctx context.Context, recordID, newStatus stri
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("k12storage: 提交更新事务: %w", err)
+	}
+	return nil
+}
+
+// RestoreArchivedMistake 是错题 archived 终态唯一受控出边。通用状态机仍拒绝
+// archived→*；本方法仅允许在 agent 归属、当前 archived、version CAS 和字段校验
+// 同时满足时，恢复用例按归档快照给出的活跃状态与调度。
+func (s *Store) RestoreArchivedMistake(
+	ctx context.Context,
+	recordID, restoredStatus string,
+	dueAt *int64,
+	fieldsJSON string,
+	expectedVersion int,
+	agentName string,
+) error {
+	if agentName == "" {
+		return records.ErrNotFound
+	}
+	switch restoredStatus {
+	case k12.StatusNew, k12.StatusExplained, k12.StatusRetried, k12.StatusMastered:
+	default:
+		return fmt.Errorf("%w: 非法错题恢复状态 %q", records.ErrInvalidStatus, restoredStatus)
+	}
+	cur, err := s.Get(ctx, recordID)
+	if err != nil {
+		return err
+	}
+	if cur.AgentName != agentName || cur.Collection != k12.CollectionMistakes {
+		return records.ErrNotFound
+	}
+	if cur.Status != k12.StatusArchived {
+		return fmt.Errorf("%w: 错题当前状态 %q 不是 archived", records.ErrIllegalTransition, cur.Status)
+	}
+	schema, err := s.registry.Get(k12.CollectionMistakes)
+	if err != nil {
+		return err
+	}
+	if schema.ValidateFields != nil {
+		if err := schema.ValidateFields(fieldsJSON); err != nil {
+			return fmt.Errorf("%w: 记录集 %q: %v", records.ErrInvalidFields, cur.Collection, err)
+		}
+	}
+	mp := mistakeMapper{}
+	domainVals, err := mp.encode(fieldsJSON)
+	if err != nil {
+		return err
+	}
+	cols := mp.domainCols()
+	assigns := make([]string, 0, len(cols))
+	for _, column := range cols {
+		assigns = append(assigns, column+" = ?")
+	}
+	query := `UPDATE k12_mistakes SET status = ?, due_at = ?, ` +
+		strings.Join(assigns, ", ") +
+		`, version = version + 1, updated_at = ?
+         WHERE record_id = ? AND agent_name = ? AND status = ? AND version = ?`
+	args := []any{restoredStatus, dueAt}
+	args = append(args, domainVals...)
+	args = append(args, nowUnix(), recordID, agentName, k12.StatusArchived, expectedVersion)
+	result, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("records: 恢复归档错题失败: %w", err)
+	}
+	if count, _ := result.RowsAffected(); count == 0 {
+		return records.ErrVersionConflict
 	}
 	return nil
 }

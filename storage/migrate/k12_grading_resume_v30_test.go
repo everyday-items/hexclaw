@@ -62,8 +62,9 @@ func TestK12GradingResumeV30IsRegisteredAndAdditive(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&maxVersion); err != nil {
 		t.Fatal(err)
 	}
-	if maxVersion != 31 {
-		t.Fatalf("latest migration=%d, want 31", maxVersion)
+	wantLatest := All[len(All)-1].Version
+	if maxVersion != wantLatest {
+		t.Fatalf("latest migration=%d, want %d", maxVersion, wantLatest)
 	}
 	for _, table := range []string{"k12_grading_item_invocations", "k12_grading_assessment_items"} {
 		has, err := tableExists(ctx, db, table)

@@ -60,7 +60,9 @@ func (mistakeMapper) collection() string { return k12.CollectionMistakes }
 func (mistakeMapper) table() string      { return "k12_mistakes" }
 func (mistakeMapper) domainCols() []string {
 	return []string{"subject", "question", "knowledge_point", "error_cause", "wrong_process",
-		"canonical_answer", "review_stage", "last_retried_at", "spot_check_state", "entry_source"}
+		"canonical_answer", "review_stage", "last_retried_at", "spot_check_state", "entry_source",
+		"archived_reason", "archived_at", "archive_command_id", "archived_from_status",
+		"archived_from_due_at", "archived_from_spot_check_state", "last_archive_snapshot_json"}
 }
 
 func (mistakeMapper) encode(fieldsJSON string) ([]any, error) {
@@ -68,15 +70,45 @@ func (mistakeMapper) encode(fieldsJSON string) ([]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("k12storage: 解析错题字段: %w", err)
 	}
+	archivedFromDueAt := int64(0)
+	if f.ArchivedFromDueAt != nil {
+		archivedFromDueAt = *f.ArchivedFromDueAt
+	}
+	lastArchiveJSON := ""
+	if f.LastArchive != nil {
+		raw, marshalErr := json.Marshal(f.LastArchive)
+		if marshalErr != nil {
+			return nil, fmt.Errorf("k12storage: marshal 最近归档快照: %w", marshalErr)
+		}
+		lastArchiveJSON = string(raw)
+	}
 	return []any{f.Subject, f.Question, f.KnowledgePoint, f.ErrorCause, f.WrongProcess,
-		f.CanonicalAnswer, f.ReviewStage, f.LastRetriedAt, f.SpotCheckState, f.EntrySource}, nil
+		f.CanonicalAnswer, f.ReviewStage, f.LastRetriedAt, f.SpotCheckState, f.EntrySource,
+		f.ArchivedReason, f.ArchivedAt, f.ArchiveCommandID, f.ArchivedFromStatus,
+		archivedFromDueAt, f.ArchivedFromSpotCheckState, lastArchiveJSON}, nil
 }
 
 func (mistakeMapper) newScan() ([]any, func() (string, error)) {
 	var f k12.MistakeFields
+	var archivedFromDueAt int64
+	var lastArchiveJSON string
 	dest := []any{&f.Subject, &f.Question, &f.KnowledgePoint, &f.ErrorCause, &f.WrongProcess,
-		&f.CanonicalAnswer, &f.ReviewStage, &f.LastRetriedAt, &f.SpotCheckState, &f.EntrySource}
-	return dest, func() (string, error) { return marshalFields(f) }
+		&f.CanonicalAnswer, &f.ReviewStage, &f.LastRetriedAt, &f.SpotCheckState, &f.EntrySource,
+		&f.ArchivedReason, &f.ArchivedAt, &f.ArchiveCommandID, &f.ArchivedFromStatus,
+		&archivedFromDueAt, &f.ArchivedFromSpotCheckState, &lastArchiveJSON}
+	return dest, func() (string, error) {
+		if archivedFromDueAt > 0 {
+			f.ArchivedFromDueAt = &archivedFromDueAt
+		}
+		if lastArchiveJSON != "" {
+			var snapshot k12.MistakeArchiveSnapshot
+			if err := json.Unmarshal([]byte(lastArchiveJSON), &snapshot); err != nil {
+				return "", fmt.Errorf("k12storage: 解析最近归档快照: %w", err)
+			}
+			f.LastArchive = &snapshot
+		}
+		return marshalFields(f)
+	}
 }
 
 func (mistakeMapper) syncChildren(context.Context, dbExecer, string, string) error { return nil }
@@ -122,7 +154,7 @@ func (practiceSetMapper) table() string      { return "k12_practice_sets" }
 func (practiceSetMapper) domainCols() []string {
 	return []string{"source_kind", "title", "paper_no", "question_artifact_id", "answer_artifact_id",
 		"skipped_blocked_count", "finalized_at", "finalized_via", "reminder_sent_at",
-		"reminder_dismissed", "closed_reason", "delivery_status", "delivery_target"}
+		"reminder_dismissed", "closed_reason", "delivery_status", "delivery_batch_id", "delivery_target"}
 }
 
 func (practiceSetMapper) encode(fieldsJSON string) ([]any, error) {
@@ -132,7 +164,7 @@ func (practiceSetMapper) encode(fieldsJSON string) ([]any, error) {
 	}
 	return []any{f.SourceKind, f.Title, f.PaperNo, f.QuestionArtifact, f.AnswerArtifact,
 		f.SkippedBlockedCount, f.FinalizedAt, f.FinalizedVia, f.ReminderSentAt,
-		boolInt(f.ReminderDismissed), f.ClosedReason, f.DeliveryStatus, f.DeliveryTarget}, nil
+		boolInt(f.ReminderDismissed), f.ClosedReason, f.DeliveryStatus, f.DeliveryBatchID, f.DeliveryTarget}, nil
 }
 
 func (practiceSetMapper) newScan() ([]any, func() (string, error)) {
@@ -140,7 +172,7 @@ func (practiceSetMapper) newScan() ([]any, func() (string, error)) {
 	var dismissed int64
 	dest := []any{&f.SourceKind, &f.Title, &f.PaperNo, &f.QuestionArtifact, &f.AnswerArtifact,
 		&f.SkippedBlockedCount, &f.FinalizedAt, &f.FinalizedVia, &f.ReminderSentAt,
-		&dismissed, &f.ClosedReason, &f.DeliveryStatus, &f.DeliveryTarget}
+		&dismissed, &f.ClosedReason, &f.DeliveryStatus, &f.DeliveryBatchID, &f.DeliveryTarget}
 	return dest, func() (string, error) {
 		f.ReminderDismissed = dismissed != 0
 		// Items 由 attachChildren 从 k12_practice_set_items 补齐。
@@ -299,7 +331,8 @@ type creativeWorkMapper struct{}
 func (creativeWorkMapper) collection() string { return k12.CollectionCreativeWork }
 func (creativeWorkMapper) table() string      { return "k12_creative_works" }
 func (creativeWorkMapper) domainCols() []string {
-	return []string{"work_type", "title", "task", "intent"}
+	return []string{"work_type", "title", "task", "intent", "display_name", "work_title",
+		"task_requirement", "title_task_provenance_json", "source_intake_id"}
 }
 
 func (creativeWorkMapper) encode(fieldsJSON string) ([]any, error) {
@@ -307,13 +340,27 @@ func (creativeWorkMapper) encode(fieldsJSON string) ([]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("k12storage: 解析作品字段: %w", err)
 	}
-	return []any{f.WorkType, f.Title, f.Task, f.Intent}, nil
+	provenance, err := json.Marshal(f.TitleTaskProvenance)
+	if err != nil {
+		return nil, fmt.Errorf("k12storage: marshal 作品标题/任务 provenance: %w", err)
+	}
+	return []any{f.WorkType, f.Title, f.Task, f.Intent, f.DisplayName, f.WorkTitle,
+		f.TaskRequirement, string(provenance), f.SourceIntakeID}, nil
 }
 
 func (creativeWorkMapper) newScan() ([]any, func() (string, error)) {
 	var f k12.CreativeWorkFields
-	dest := []any{&f.WorkType, &f.Title, &f.Task, &f.Intent}
-	return dest, func() (string, error) { return marshalFields(f) }
+	var provenanceJSON string
+	dest := []any{&f.WorkType, &f.Title, &f.Task, &f.Intent, &f.DisplayName, &f.WorkTitle,
+		&f.TaskRequirement, &provenanceJSON, &f.SourceIntakeID}
+	return dest, func() (string, error) {
+		if provenanceJSON != "" && provenanceJSON != "{}" {
+			if err := json.Unmarshal([]byte(provenanceJSON), &f.TitleTaskProvenance); err != nil {
+				return "", fmt.Errorf("k12storage: 解析作品标题/任务 provenance: %w", err)
+			}
+		}
+		return marshalFields(k12.NormalizeCreativeWorkFields(f))
+	}
 }
 
 func (creativeWorkMapper) syncChildren(ctx context.Context, ex dbExecer, recordID, fieldsJSON string) error {
@@ -393,7 +440,16 @@ func (creativeWorkMapper) attachChildren(ctx context.Context, q dbQueryer, recor
 		if structuredJSON != "" {
 			structured, err := k12.ParseWorkFeedbackJSON([]byte(structuredJSON))
 			if err != nil {
-				return "", fmt.Errorf("k12storage: 结构化作品点评非法: %w", err)
+				// Historical builds could persist provider Markdown inside
+				// canonical atoms. Recover only the closed-schema, display-only
+				// pollution case. Anything else is isolated to this version's
+				// legacy Markdown projection so one bad row cannot poison the
+				// owner's whole works list or acquire structured actions.
+				structured, err = k12.ParseLegacyWorkFeedbackJSON([]byte(structuredJSON))
+				if err != nil {
+					f.Versions = append(f.Versions, v)
+					continue
+				}
 			}
 			v.StructuredFeedback = &structured
 		}

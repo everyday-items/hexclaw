@@ -90,6 +90,60 @@ func TestModelInvocationLedgerOutcomeUnknownSurvivesStoreRestart(t *testing.T) {
 	}
 }
 
+func TestModelInvocationLedgerReconcilesDurableSuccessWithoutResend(t *testing.T) {
+	store, db := setup(t)
+	if _, err := db.ExecContext(context.Background(), migrate.K12ModelInvocationsV15DDL); err != nil {
+		t.Fatalf("create invocation ledger: %v", err)
+	}
+	job := newGradingJobRecord(t, "mingming", "reconcile-success")
+	if _, err := store.Put(context.Background(), job); err != nil {
+		t.Fatalf("create grading job: %v", err)
+	}
+	ctx := context.Background()
+	prepared, _, err := store.PrepareModelInvocation(ctx, k12.ModelInvocation{
+		InvocationID: "inv-reconcile-success", AgentName: "mingming", JobID: job.RecordID,
+		Stage: k12.GradingStageRecognizing, RequestDigest: "sha256:request",
+		RouteSnapshot: k12.GradingModelSnapshot{
+			Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", Route: "hexclaw-gpt/gpt-5.6-sol",
+		},
+		Attempt: 1, CreatedAt: 300, UpdatedAt: 300,
+	})
+	if err != nil {
+		t.Fatalf("prepare invocation: %v", err)
+	}
+	if _, err = store.MarkModelInvocationSent(ctx, "mingming", prepared.InvocationID, "provider-key"); err != nil {
+		t.Fatalf("mark sent: %v", err)
+	}
+	if _, err = store.MarkModelInvocationOutcomeUnknown(ctx, "mingming", prepared.InvocationID, "response_lost"); err != nil {
+		t.Fatalf("mark outcome unknown: %v", err)
+	}
+
+	reconciled, err := store.ReconcileModelInvocationSucceeded(
+		ctx, "mingming", prepared.InvocationID, "sha256:durable-result", "provider-request-1",
+	)
+	if err != nil {
+		t.Fatalf("reconcile durable success: %v", err)
+	}
+	if reconciled.Status != k12.ModelInvocationReconciled ||
+		reconciled.ResultDigest != "sha256:durable-result" ||
+		reconciled.ExternalRequestID != "provider-request-1" ||
+		reconciled.FailureKind != "reconciled_succeeded" {
+		t.Fatalf("unexpected reconciled invocation: %+v", reconciled)
+	}
+
+	replay, err := store.ReconcileModelInvocationSucceeded(
+		ctx, "mingming", prepared.InvocationID, "sha256:durable-result", "provider-request-1",
+	)
+	if err != nil || replay != reconciled {
+		t.Fatalf("exact reconciliation replay must be idempotent: replay=%+v err=%v", replay, err)
+	}
+	if _, err = store.ReconcileModelInvocationSucceeded(
+		ctx, "mingming", prepared.InvocationID, "sha256:different", "provider-request-1",
+	); !errors.Is(err, k12storage.ErrModelInvocationConflict) {
+		t.Fatalf("conflicting durable result must fail closed, got %v", err)
+	}
+}
+
 func newGradingJobRecord(t *testing.T, agent, sourceKey string) *records.AgentRecord {
 	t.Helper()
 	rec, err := k12.NewGradingJobRecord(agent, "session-1", k12.GradingJobFields{

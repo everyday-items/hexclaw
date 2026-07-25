@@ -864,7 +864,7 @@ func (s *Store) searchMessagesLike(ctx context.Context, userID, query string, li
 //
 // 使用 rowid 比较而非 created_at，避免 datetime 精度丢失导致
 // 边界消息被遗漏（time.Time 经 SQLite 存储后纳秒精度丢失）。
-func (s *Store) ForkSession(ctx context.Context, sourceSessionID, messageID, userID string) (*storage.Session, error) {
+func (s *Store) ForkSession(ctx context.Context, sourceSessionID, messageID, userID string, options ...storage.ForkSessionOptions) (*storage.Session, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("开启事务失败: %w", err)
@@ -922,8 +922,17 @@ func (s *Store) ForkSession(ctx context.Context, sourceSessionID, messageID, use
 		return nil, fmt.Errorf("创建分支会话失败: %w", err)
 	}
 
-	// 3. 复制源会话中 messageID 之前（含）的所有消息到新会话
-	// 使用 rowid <= ? 而非 created_at <= ?，避免精度丢失
+	// 3. 复制源会话的稳定前缀。默认（手工分支）包含 messageID；历史消息编辑
+	// 显式要求排除它，随后由发送管道把编辑后的新消息写入该分支。
+	// 使用 rowid 比较而非 created_at，避免精度丢失。
+	includeMessage := true
+	if len(options) > 0 {
+		includeMessage = options[0].IncludeMessage
+	}
+	comparison := "<="
+	if !includeMessage {
+		comparison = "<"
+	}
 	// 不依赖插入顺序；读取时仍按 created_at 排序
 	forkPrefix := "msg-fork-" + strings.TrimPrefix(newSessionID, "sess-") + "-"
 	_, err = tx.ExecContext(ctx,
@@ -931,7 +940,7 @@ func (s *Store) ForkSession(ctx context.Context, sourceSessionID, messageID, use
 			 SELECT ? || rowid, ?, parent_id, role, content, content_type, metadata, feedback,
 			        model_name, prompt_tokens, completion_tokens, finish_reason, latency_ms, request_id, meta, attachments, created_at
 			 FROM messages
-			 WHERE session_id = ? AND rowid <= ?`,
+		 WHERE session_id = ? AND rowid `+comparison+` ?`,
 		forkPrefix, newSessionID, sourceSessionID, msgRowID,
 	)
 	if err != nil {

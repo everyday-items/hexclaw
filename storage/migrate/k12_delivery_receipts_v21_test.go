@@ -61,7 +61,7 @@ func TestK12DeliveryReceiptsV21RejectsDeliveredWithoutProviderEvidence(t *testin
 	_, err = db.Exec(`INSERT INTO k12_delivery_receipts
 		(delivery_id,agent_name,object_kind,object_id,binding_id,platform,chat_id,status,
 		 dedupe_key,payload_digest,payload_json,created_at,updated_at)
-		VALUES ('d1','kid','creative_work_feedback','w1','rule:1','dingtalk','staff-1','delivered',
+		VALUES ('d1','kid','tutoring_tips','tips-1','rule:1','dingtalk','staff-1','delivered',
 		        'once','sha256:x','{}',1,1)`)
 	if err == nil {
 		t.Fatal("delivered must require an external provider message id")

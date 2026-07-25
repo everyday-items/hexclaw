@@ -62,7 +62,7 @@ func TestGenericPrintJobStorageRequiresReceiptAndBoundsRetry(t *testing.T) {
 	store, _ := setup(t)
 	ctx := context.Background()
 	artifact := k12.PrintArtifact{ArtifactID: "part-a", AgentName: "mingming", SourceKind: k12.PrintSourceCreativeObservation,
-		SourceRef: "creative-work:w1:v1", Title: "观察练习卡", CanonicalMarkdown: "# 卡片", SourceDigest: strings.Repeat("a", 64), CreatedAt: 100}
+		SourceRef: "tutoring-tips:tips-1", Title: "辅导要点", CanonicalMarkdown: "# 辅导要点", SourceDigest: strings.Repeat("a", 64), CreatedAt: 100}
 	job := k12.GenericPrintJob{PrintJobID: "gprint-a", AgentName: "mingming", IdempotencyKey: "click",
 		RequestDigest: strings.Repeat("b", 64), ArtifactID: artifact.ArtifactID, PreparedAt: 100}
 	if _, _, err := store.PrepareGenericPrintJob(ctx, artifact, job); err != nil {

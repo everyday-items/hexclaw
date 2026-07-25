@@ -276,6 +276,56 @@ func TestForkSession_Basic(t *testing.T) {
 	}
 }
 
+// 编辑历史消息必须从目标消息之前的稳定前缀开始：旧会话的目标消息和尾部都不能泄漏进编辑分支。
+// 手工“由此分叉”不传 options，仍由 TestForkSession_Basic 钉住 inclusive 兼容语义。
+func TestForkSession_ExclusivePrefix(t *testing.T) {
+	store := newTestStoreV2(t)
+	ctx := context.Background()
+	if err := store.CreateSession(ctx, &storage.Session{
+		ID: "sess-exclusive", UserID: "user-1", Platform: "web", Title: "源会话",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"msg-A", "msg-B", "msg-C"} {
+		if err := store.SaveMessage(ctx, &storage.MessageRecord{
+			ID: id, SessionID: "sess-exclusive", Role: "user", Content: id, Metadata: "{}",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	branch, err := store.ForkSession(ctx, "sess-exclusive", "msg-B", "user-1", storage.ForkSessionOptions{
+		IncludeMessage: false,
+	})
+	if err != nil {
+		t.Fatalf("ForkSession exclusive 失败: %v", err)
+	}
+	if branch.BranchMessageID != "msg-B" {
+		t.Fatalf("BranchMessageID = %q, want msg-B", branch.BranchMessageID)
+	}
+	messages, err := store.ListMessages(ctx, branch.ID, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || messages[0].Content != "msg-A" {
+		t.Fatalf("exclusive prefix = %#v, want only msg-A", messages)
+	}
+
+	firstBranch, err := store.ForkSession(ctx, "sess-exclusive", "msg-A", "user-1", storage.ForkSessionOptions{
+		IncludeMessage: false,
+	})
+	if err != nil {
+		t.Fatalf("ForkSession first-message exclusive 失败: %v", err)
+	}
+	firstMessages, err := store.ListMessages(ctx, firstBranch.ID, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstMessages) != 0 {
+		t.Fatalf("first-message exclusive prefix should be empty, got %d", len(firstMessages))
+	}
+}
+
 func TestForkSession_CopiesAllMessagesBeyondTenThousand(t *testing.T) {
 	store := newTestStoreV2(t)
 	ctx := context.Background()

@@ -255,7 +255,7 @@ func (s *txStore) SearchMessages(_ context.Context, _, _ string, _, _ int) ([]*s
 	return nil, 0, fmt.Errorf("不支持在事务中搜索消息")
 }
 
-func (s *txStore) ForkSession(_ context.Context, _, _, _ string) (*storage.Session, error) {
+func (s *txStore) ForkSession(_ context.Context, _, _, _ string, _ ...storage.ForkSessionOptions) (*storage.Session, error) {
 	return nil, fmt.Errorf("不支持在事务中创建分支")
 }
 

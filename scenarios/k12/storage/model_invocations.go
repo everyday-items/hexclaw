@@ -216,3 +216,35 @@ func (s *Store) ReconcileModelInvocationNotExecuted(ctx context.Context, agentNa
 		[]k12.ModelInvocationStatus{k12.ModelInvocationOutcomeUnknown}, k12.ModelInvocationReconciled,
 		"", "", "", "reconciled_not_executed")
 }
+
+// ReconcileModelInvocationSucceeded records conclusive, already-durable result
+// evidence for a request whose transport outcome was previously unknown. It is
+// a ledger-only reconciliation: callers must validate the durable artifact
+// against the frozen Job before invoking it, and must never use it to justify a
+// second provider request.
+func (s *Store) ReconcileModelInvocationSucceeded(
+	ctx context.Context,
+	agentName, invocationID, resultDigest, externalRequestID string,
+) (k12.ModelInvocation, error) {
+	resultDigest = strings.TrimSpace(resultDigest)
+	externalRequestID = strings.TrimSpace(externalRequestID)
+	if resultDigest == "" {
+		return k12.ModelInvocation{}, fmt.Errorf("k12storage: reconciled model success requires result_digest")
+	}
+	stored, err := s.transitionModelInvocation(ctx, agentName, invocationID,
+		[]k12.ModelInvocationStatus{k12.ModelInvocationOutcomeUnknown}, k12.ModelInvocationReconciled,
+		"", resultDigest, externalRequestID, "reconciled_succeeded")
+	if err != nil {
+		return k12.ModelInvocation{}, err
+	}
+	if stored.Status != k12.ModelInvocationReconciled ||
+		stored.FailureKind != "reconciled_succeeded" ||
+		stored.ResultDigest != resultDigest ||
+		(externalRequestID != "" && stored.ExternalRequestID != externalRequestID) {
+		return k12.ModelInvocation{}, fmt.Errorf(
+			"%w: invocation %s reconciled result identity changed",
+			ErrModelInvocationConflict, invocationID,
+		)
+	}
+	return stored, nil
+}

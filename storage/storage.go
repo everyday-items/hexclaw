@@ -170,9 +170,9 @@ type Store interface {
 
 	// --- 对话分支 ---
 
-	// ForkSession 从指定消息处创建分支会话
-	// 复制源会话中 messageID 之前（含）的所有消息到新会话
-	ForkSession(ctx context.Context, sourceSessionID, messageID, userID string) (*Session, error)
+	// ForkSession 从指定消息处创建分支会话。未传 options 时复制源会话中 messageID
+	// 之前（含）的所有消息，保持手工分支兼容；编辑历史消息可显式排除分支点。
+	ForkSession(ctx context.Context, sourceSessionID, messageID, userID string, options ...ForkSessionOptions) (*Session, error)
 
 	// ListSessionBranches 列出会话的所有分支
 	ListSessionBranches(ctx context.Context, sessionID string) ([]*Session, error)
@@ -193,4 +193,10 @@ type Store interface {
 	// WithTx 在事务中执行操作
 	// fn 返回 error 时自动回滚，否则自动提交
 	WithTx(ctx context.Context, fn func(Store) error) error
+}
+
+// ForkSessionOptions controls the copy boundary for a fork. Its zero/default behavior is
+// intentionally inclusive so existing manual forks remain backward compatible.
+type ForkSessionOptions struct {
+	IncludeMessage bool
 }
