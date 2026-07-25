@@ -251,6 +251,18 @@ func Read(agent, file string) (data []byte, mime string, err error) {
 	if !strings.HasPrefix(mime, "image/") {
 		return nil, "", fmt.Errorf("assetstore: 资产内容不是图片（探测到 %s）", mime)
 	}
+	// The filename is the immutable content address, not merely a convenient
+	// path. Re-derive it on every read so a valid image swapped in underneath an
+	// existing asset ID cannot silently change the evidence consumed by a
+	// resumed task.
+	actualID, actualMIME, _, describeErr := Describe(agent, raw)
+	if describeErr != nil {
+		return nil, "", fmt.Errorf("assetstore: 校验资产内容寻址: %w", describeErr)
+	}
+	if actualID != IDPrefix+agent+"/"+file {
+		return nil, "", fmt.Errorf("assetstore: 资产内容摘要与文件名不一致")
+	}
+	mime = actualMIME
 	return raw, mime, nil
 }
 

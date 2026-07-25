@@ -224,9 +224,8 @@ func GradingStageBudgetSeconds(stage string) int64 {
 
 // GradingJobSchema 返回批改任务记录集 schema（注册进 RecordSchemaRegistry）。
 //
-// Transitions 逐边对照 §6.7 状态机图；额外的 queued→{recognizing,locating,awaiting_confirmation}
-// 恢复边由规则 3 授权（failed_retryable→queued 后从最近成功阶段的后继起跑，
-// 图中 queued→assessing 捷径即其中修正重批/批改阶段恢复的特例）。
+// Transitions 逐边对照 §6.7 状态机图；额外的 queued→后继自动阶段/终态恢复边
+// 由规则 3 授权（failed_retryable→queued 后从最近成功阶段的后继起跑）。
 // 规则 2：rendering 无 failed_* 出边——失败降级续跑 projecting，不进失败态。
 // 规则 5：rendering/projecting 无 cancelled 出边。
 // 规则 6：completed 无出边——修正 = confirmed_version+1 的新 Job。
@@ -249,6 +248,7 @@ func GradingJobSchema() *records.RecordSchema {
 				// 规则 3 检查点恢复边 + 规则 6 修正重批捷径（assessing）
 				GradingStageRecognizing, GradingStageLocating,
 				GradingStageAwaitingConfirmation, GradingStageAssessing,
+				GradingStageRendering, GradingStageProjecting, GradingStageCompleted,
 				GradingStageCancelled,
 			},
 			GradingStageNormalizing: {GradingStageRecognizing, GradingStageCancelled, GradingStageFailedRetryable},

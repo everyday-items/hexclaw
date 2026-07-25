@@ -23,9 +23,9 @@ const (
 	WorkTypeArt     = "art"     // 美术作品
 )
 
-// 作品生命周期状态（PRD §5.5，已删除 revising 中间态——提交修改稿是瞬时命令）。
-// draft →（生成点评）→ feedback_ready →（提交修改稿）→ revised；revised 可再点评回 feedback_ready；
-// archived 仅由家长显式归档。内部英文枚举，UI 译名见 CreativeWorkLabel。
+// 作品生命周期状态。当前写路径为 draft →（生成点评）→ feedback_ready
+// →（提交修改稿）→ revised；revised 可再点评回 feedback_ready。
+// archived 仅用于历史数据读取兼容。
 const (
 	WorkStatusDraft         = "draft"
 	WorkStatusFeedbackReady = "feedback_ready"
@@ -33,11 +33,10 @@ const (
 	WorkStatusArchived      = "archived"
 )
 
-// 点评来源（feedback_source）：区分 AI 生成与家长手写。前向兼容：老数据空值合法
-// （字段 omitempty），展示侧按未标注处理，不猜来源。
+// 点评来源（feedback_source）。当前写路径仅生成 ai；parent 与空值用于历史数据兼容。
 const (
 	FeedbackSourceAI     = "ai"     // Skill 生成的证据化点评
-	FeedbackSourceParent = "parent" // 家长手写点评
+	FeedbackSourceParent = "parent" // historical read compatibility only
 )
 
 var creativeWorkLabels = map[string]string{
@@ -74,16 +73,14 @@ type CreativeWorkVersion struct {
 	// StructuredFeedback is the canonical, testable feedback fact. Feedback is
 	// only its backwards-compatible Markdown projection.
 	StructuredFeedback *WorkFeedback `json:"structured_feedback,omitempty"`
-	// FeedbackSource 点评来源（ai / parent）；老数据空值前向兼容。
+	// FeedbackSource 点评来源。新写入仅使用 ai；parent 只为历史数据读取兼容。
 	FeedbackSource string `json:"feedback_source,omitempty"`
 	// FeedbackSkill AI 点评所用方法论基座的来源戳（追溯每条点评用的哪版方法论）：
 	// "<skill>@<version>/disk"（盘上 marketplace 版本）、"<skill>@<version>/embedded"
-	// （发版内嵌快照）、"builtin"（硬编码红线兜底）。家长手写与老数据为空
-	// （omitempty 前向兼容），展示侧按未标注处理，不猜。
+	// （发版内嵌快照）、"builtin"（硬编码红线兜底）。历史数据可为空。
 	FeedbackSkill string `json:"feedback_skill,omitempty"`
-	// PracticeCardDoneAt 美术观察练习卡完成打卡时间（unix 秒，§3.10：练习必须有产物且
-	// 归档在版本记录）。0 = 未打卡；卡内容不落库——由点评正文经 ObservationPracticeCard
-	// 确定性提炼（单一事实源，点评修订即卡修订）。
+	// PracticeCardDoneAt is a read-only compatibility field for historical
+	// records. No current command or DTO exposes observation-card behavior.
 	PracticeCardDoneAt int64 `json:"practice_card_done_at,omitempty"`
 }
 
@@ -160,7 +157,6 @@ type WorkFeedback struct {
 	SourceSnapshot     WorkFeedbackSourceSnapshot `json:"source_snapshot"`
 	Limitations        string                     `json:"limitations"`
 	Suggestions        []string                   `json:"suggestions"`
-	AllowedActions     []string                   `json:"allowed_actions"`
 	ProjectionMarkdown string                     `json:"projection_markdown"`
 }
 
@@ -321,30 +317,13 @@ func (f WorkFeedback) Validate() error {
 	if len(f.Suggestions) < 1 || len(f.Suggestions) > 3 {
 		return fmt.Errorf("作品点评建议必须为 1-3 条")
 	}
-	if len(f.AllowedActions) == 0 {
-		return fmt.Errorf("作品点评缺少允许动作")
-	}
-	allowedActionSet := map[string]bool{"send": true, "collect": true}
-	if f.FeedbackType == WorkTypeWriting {
-		allowedActionSet["record_language_issue"] = true
-	} else {
-		allowedActionSet["print_practice_card"] = true
-	}
-	for _, action := range f.AllowedActions {
-		if !allowedActionSet[action] {
-			return fmt.Errorf("作品点评动作不在 %s 白名单: %q", f.FeedbackType, action)
-		}
-	}
 	if strings.TrimSpace(f.ProjectionMarkdown) == "" {
 		return fmt.Errorf("作品点评缺少 projection_markdown")
 	}
 	return nil
 }
 
-// ParseWorkFeedbackJSON strictly decodes the closed canonical feedback schema.
-// Unknown fields (including score/rank/rewrite/redraw) fail closed instead of
-// silently becoming a second, unvalidated fact source.
-func ParseWorkFeedbackJSON(raw []byte) (WorkFeedback, error) {
+func decodeWorkFeedbackJSON(raw []byte) (WorkFeedback, error) {
 	var feedback WorkFeedback
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
@@ -357,120 +336,121 @@ func ParseWorkFeedbackJSON(raw []byte) (WorkFeedback, error) {
 		}
 		return WorkFeedback{}, fmt.Errorf("解析结构化作品点评: %w", err)
 	}
+	return feedback, nil
+}
+
+func decodeLegacyWorkFeedbackJSON(raw []byte) (WorkFeedback, error) {
+	// allowed_actions was removed from the active schema. Accept exactly that
+	// retired field at this read-only boundary, discard it, and keep rejecting
+	// every other unknown field.
+	var legacy struct {
+		WorkFeedback
+		RetiredAllowedActions []string `json:"allowed_actions"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&legacy); err != nil {
+		return WorkFeedback{}, fmt.Errorf("解析历史结构化作品点评: %w", err)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("包含多余 JSON 值")
+		}
+		return WorkFeedback{}, fmt.Errorf("解析历史结构化作品点评: %w", err)
+	}
+	return legacy.WorkFeedback, nil
+}
+
+// ParseWorkFeedbackJSON strictly decodes the closed canonical feedback schema.
+// Unknown fields (including score/rank/rewrite/redraw) fail closed instead of
+// silently becoming a second, unvalidated fact source.
+func ParseWorkFeedbackJSON(raw []byte) (WorkFeedback, error) {
+	feedback, err := decodeWorkFeedbackJSON(raw)
+	if err != nil {
+		return WorkFeedback{}, err
+	}
 	if err := feedback.Validate(); err != nil {
 		return WorkFeedback{}, err
 	}
 	return feedback, nil
 }
 
-// ObservationPracticeCard 从美术点评正文提炼「观察小练习」卡文本（§3.10，2026-07-18
-// 裁决：练习必须有产物、承诺即动作）。规格申报（v0.5 最小实现）：
-//  1. 优先取标题含「建议」的小节正文（art-feedback skill 输出信封的建议段）；
-//  2. 无小节结构时收集含「试试 / 比一比 / 练习」的行（skill 红线：建议全部用试试/比一比表达）；
-//  3. 全都提不出时整段点评兜底（宁全勿空）；空点评 → 空卡。
-func ObservationPracticeCard(feedback string) string {
-	feedback = strings.TrimSpace(feedback)
-	if feedback == "" {
-		return ""
+// ParseLegacyWorkFeedbackJSON is a read-only compatibility boundary for
+// historical rows that were written before canonical atoms became plain text.
+// It accepts only the same closed JSON schema, removes display-only Markdown
+// from atoms, then rebuilds the sole projection and re-runs strict validation.
+// Unknown fields and semantic contract violations remain rejected.
+func ParseLegacyWorkFeedbackJSON(raw []byte) (WorkFeedback, error) {
+	feedback, err := decodeLegacyWorkFeedbackJSON(raw)
+	if err != nil {
+		return WorkFeedback{}, err
 	}
-	lines := strings.Split(feedback, "\n")
-	isHeading := func(s string) bool {
-		s = strings.TrimSpace(s)
-		return strings.HasPrefix(s, "#") || strings.HasPrefix(s, "【") ||
-			(strings.HasSuffix(s, "：") && len([]rune(s)) <= 12)
+	for i := range feedback.Observations {
+		feedback.Observations[i].Evidence = NormalizeWorkFeedbackAtom(
+			feedback.Observations[i].Evidence,
+		)
 	}
-	// ① 「建议」小节。
-	for i, ln := range lines {
-		if !isHeading(ln) || !strings.Contains(ln, "建议") {
-			continue
-		}
-		var section []string
-		for _, next := range lines[i+1:] {
-			if isHeading(next) {
-				break
-			}
-			if t := NormalizeWorkFeedbackAtom(next); t != "" {
-				section = append(section, t)
-			}
-		}
-		if len(section) > 0 {
-			return strings.Join(section, "\n")
-		}
+	for i := range feedback.Suggestions {
+		feedback.Suggestions[i] = NormalizeWorkFeedbackAtom(feedback.Suggestions[i])
 	}
-	// ② 含「试试 / 比一比 / 练习」的行。
-	var hits []string
-	for _, ln := range lines {
-		if isHeading(ln) {
-			continue
-		}
-		t := NormalizeWorkFeedbackAtom(ln)
-		if t == "" {
-			continue
-		}
-		if strings.Contains(t, "试试") || strings.Contains(t, "比一比") || strings.Contains(t, "练习") {
-			hits = append(hits, t)
-		}
+	feedback.Limitations = NormalizeWorkFeedbackAtom(feedback.Limitations)
+	feedback.ProjectionMarkdown = ProjectWorkFeedbackMarkdown(feedback)
+	if err := feedback.Validate(); err != nil {
+		return WorkFeedback{}, err
 	}
-	if len(hits) > 0 {
-		return strings.Join(hits, "\n")
-	}
-	// ③ 整段兜底：练习必须有产物，宁全勿空。
-	clean := make([]string, 0, len(lines))
-	for _, line := range lines {
-		if isHeading(line) {
-			continue
-		}
-		if value := NormalizeWorkFeedbackAtom(line); value != "" {
-			clean = append(clean, value)
-		}
-	}
-	return strings.Join(clean, "\n")
-}
-
-// ObservationPracticeCardFromStructured projects an art practice card from the
-// canonical WorkFeedback suggestions. The legacy Markdown parser remains only
-// for historical versions that predate StructuredFeedback; once structured
-// facts exist, reparsing the display Markdown would create a second source of
-// truth and can truncate multi-line suggestions.
-func ObservationPracticeCardFromStructured(feedback *WorkFeedback, legacyMarkdown string) string {
-	if feedback == nil {
-		return ObservationPracticeCard(legacyMarkdown)
-	}
-	suggestionsSafe := len(feedback.Suggestions) >= 1 && len(feedback.Suggestions) <= 3
-	if suggestionsSafe {
-		for _, suggestion := range feedback.Suggestions {
-			if err := validateWorkFeedbackAtom("建议", suggestion); err != nil {
-				suggestionsSafe = false
-				break
-			}
-		}
-	}
-	if !suggestionsSafe {
-		projection := strings.TrimSpace(feedback.ProjectionMarkdown)
-		if projection == "" {
-			projection = legacyMarkdown
-		}
-		return ObservationPracticeCard(projection)
-	}
-	items := make([]string, 0, len(feedback.Suggestions))
-	for _, suggestion := range feedback.Suggestions {
-		if value := strings.TrimSpace(suggestion); value != "" {
-			items = append(items, value)
-		}
-	}
-	if len(items) == 0 {
-		return ""
-	}
-	return strings.Join(items, "\n")
+	return feedback, nil
 }
 
 // CreativeWorkFields 作品领域字段（PRD §5.5）。
 type CreativeWorkFields struct {
-	WorkType string                `json:"work_type"` // writing / art
-	Title    string                `json:"title"`
-	Task     string                `json:"task"`             // 题目要求或创作任务
+	WorkType            string              `json:"work_type"` // writing / art
+	DisplayName         string              `json:"display_name,omitempty"`
+	WorkTitle           string              `json:"work_title,omitempty"`
+	TaskRequirement     string              `json:"task_requirement,omitempty"`
+	TitleTaskProvenance TitleTaskProvenance `json:"title_task_provenance,omitempty"`
+	SourceIntakeID      string              `json:"source_intake_id,omitempty"`
+	// Title/Task are compatibility projections for historical archives and
+	// callers. They may only mirror evidence-backed content facts; display
+	// fallbacks are never written here.
+	Title    string                `json:"title,omitempty"`
+	Task     string                `json:"task,omitempty"`
 	Intent   string                `json:"intent,omitempty"` // 孩子想表达的内容（美术建议提供）
 	Versions []CreativeWorkVersion `json:"versions"`
+}
+
+type TitleTaskProvenance struct {
+	WorkTitle       *FactCandidate `json:"work_title,omitempty"`
+	TaskRequirement *FactCandidate `json:"task_requirement,omitempty"`
+}
+
+// NormalizeCreativeWorkFields upgrades historical title/task fields while
+// keeping the distinction between an archive display name and content facts.
+func NormalizeCreativeWorkFields(f CreativeWorkFields) CreativeWorkFields {
+	f.WorkType = strings.TrimSpace(f.WorkType)
+	f.WorkTitle = strings.TrimSpace(f.WorkTitle)
+	f.TaskRequirement = strings.TrimSpace(f.TaskRequirement)
+	f.Title = strings.TrimSpace(f.Title)
+	f.Task = strings.TrimSpace(f.Task)
+	if f.WorkTitle == "" && f.Title != "" {
+		f.WorkTitle = f.Title
+	}
+	if f.TaskRequirement == "" && f.Task != "" {
+		f.TaskRequirement = f.Task
+	}
+	// Legacy columns remain true projections only.
+	f.Title = f.WorkTitle
+	f.Task = f.TaskRequirement
+	f.DisplayName = strings.TrimSpace(f.DisplayName)
+	if f.DisplayName == "" {
+		if f.WorkTitle != "" {
+			f.DisplayName = f.WorkTitle
+		} else if f.WorkType == WorkTypeWriting {
+			f.DisplayName = "语文写作"
+		} else if f.WorkType == WorkTypeArt {
+			f.DisplayName = "美术作品"
+		}
+	}
+	return f
 }
 
 // CreativeWorkSchema 返回作品记录集 schema。去重键 = 类型+标题+任务摘要。
@@ -497,7 +477,12 @@ func CreativeWorkSchema() *records.RecordSchema {
 func creativeWorkDedupeKey(r *records.AgentRecord) string {
 	var f CreativeWorkFields
 	_ = json.Unmarshal([]byte(r.Fields), &f)
-	norm := strings.ToLower(strings.Join(strings.Fields(f.Title+"|"+f.Task), ""))
+	f = NormalizeCreativeWorkFields(f)
+	if f.SourceIntakeID != "" {
+		sum := sha1.Sum([]byte("intake|" + f.SourceIntakeID))
+		return hex.EncodeToString(sum[:])
+	}
+	norm := strings.ToLower(strings.Join(strings.Fields(f.WorkTitle+"|"+f.TaskRequirement), ""))
 	sum := sha1.Sum([]byte(f.WorkType + "|" + norm))
 	return hex.EncodeToString(sum[:])
 }
@@ -507,20 +492,33 @@ func validateCreativeWorkFields(fieldsJSON string) error {
 	if err := json.Unmarshal([]byte(fieldsJSON), &f); err != nil {
 		return fmt.Errorf("作品字段非法 JSON: %w", err)
 	}
+	f = NormalizeCreativeWorkFields(f)
 	if f.WorkType != WorkTypeWriting && f.WorkType != WorkTypeArt {
 		return fmt.Errorf("作品类型只允许 writing/art，got %q", f.WorkType)
 	}
-	if strings.TrimSpace(f.Title) == "" {
-		return fmt.Errorf("作品缺少 title")
+	if strings.TrimSpace(f.DisplayName) == "" {
+		return fmt.Errorf("作品缺少 display_name")
 	}
-	if strings.TrimSpace(f.Task) == "" {
-		return fmt.Errorf("作品缺少 task")
+	if f.WorkTitle != "" {
+		if f.TitleTaskProvenance.WorkTitle != nil {
+			if err := f.TitleTaskProvenance.WorkTitle.Validate(); err != nil {
+				return fmt.Errorf("作品标题 provenance 非法: %w", err)
+			}
+		}
+	}
+	if f.TaskRequirement != "" {
+		if f.TitleTaskProvenance.TaskRequirement != nil {
+			if err := f.TitleTaskProvenance.TaskRequirement.Validate(); err != nil {
+				return fmt.Errorf("作品任务 provenance 非法: %w", err)
+			}
+		}
 	}
 	return nil
 }
 
 // NewCreativeWorkRecord 从领域字段构造一条作品记录（初始 draft，含首版原稿）。
 func NewCreativeWorkRecord(agentName, sourceSession string, f CreativeWorkFields) (*records.AgentRecord, error) {
+	f = NormalizeCreativeWorkFields(f)
 	for i := range f.Versions {
 		if f.Versions[i].VersionID == "" {
 			f.Versions[i].VersionID = fmt.Sprintf("v%d", i+1)
@@ -543,5 +541,5 @@ func NewCreativeWorkRecord(agentName, sourceSession string, f CreativeWorkFields
 func ParseCreativeWorkFields(fieldsJSON string) (CreativeWorkFields, error) {
 	var f CreativeWorkFields
 	err := json.Unmarshal([]byte(fieldsJSON), &f)
-	return f, err
+	return NormalizeCreativeWorkFields(f), err
 }

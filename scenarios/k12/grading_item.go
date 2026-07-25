@@ -2,6 +2,7 @@ package k12
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -9,15 +10,18 @@ import (
 type GradingItemOperation string
 
 const (
-	GradingItemOperationSolve GradingItemOperation = "solve"
-	GradingItemOperationGrade GradingItemOperation = "grade"
+	GradingItemOperationSolve       GradingItemOperation = "solve"
+	GradingItemOperationGrade       GradingItemOperation = "grade"
+	GradingItemOperationParentGuide GradingItemOperation = "parent_guide"
 )
 
 func (o GradingItemOperation) Valid() bool {
-	return o == GradingItemOperationSolve || o == GradingItemOperationGrade
+	return o == GradingItemOperationSolve ||
+		o == GradingItemOperationGrade ||
+		o == GradingItemOperationParentGuide
 }
 
-// GradingItemInvocation records one logical solve/grade operation. It is not a
+// GradingItemInvocation records one logical solve/grade/parent-guide operation. It is not a
 // provider billing counter: one logical operation may contain multiple physical
 // gateway requests, and those require separate correlated telemetry.
 type GradingItemInvocation struct {
@@ -82,26 +86,29 @@ func (s GradingAssessmentStatus) Valid() bool {
 
 const GradingProjectionCommitted = "committed"
 
+var ErrGradingAssessmentTerminalInvariant = errors.New("grading assessment terminal invariant violated")
+
 // GradingAssessmentItem is the exactly-once local receipt for one stable
 // problem. Invocation references are status-dependent: unanswered/unclear make
 // no model call, blank_solved has solve only, and a graded verdict has both.
 type GradingAssessmentItem struct {
-	AgentName          string                  `json:"agent_name"`
-	JobID              string                  `json:"job_id"`
-	ProblemID          string                  `json:"problem_id"`
-	AttemptID          string                  `json:"attempt_id"`
-	ConfirmedVersion   int                     `json:"confirmed_version"`
-	InputDigest        string                  `json:"input_digest"`
-	Status             GradingAssessmentStatus `json:"status"`
-	ResultJSON         string                  `json:"result_json"`
-	ResultDigest       string                  `json:"result_digest"`
-	SolveInvocationID  string                  `json:"solve_invocation_id,omitempty"`
-	GradeInvocationID  string                  `json:"grade_invocation_id,omitempty"`
-	ProjectionRecordID string                  `json:"projection_record_id,omitempty"`
-	ProjectionCreated  bool                    `json:"projection_created,omitempty"`
-	ProjectionStatus   string                  `json:"projection_status"`
-	CreatedAt          int64                   `json:"created_at"`
-	UpdatedAt          int64                   `json:"updated_at"`
+	AgentName               string                  `json:"agent_name"`
+	JobID                   string                  `json:"job_id"`
+	ProblemID               string                  `json:"problem_id"`
+	AttemptID               string                  `json:"attempt_id"`
+	ConfirmedVersion        int                     `json:"confirmed_version"`
+	InputDigest             string                  `json:"input_digest"`
+	Status                  GradingAssessmentStatus `json:"status"`
+	ResultJSON              string                  `json:"result_json"`
+	ResultDigest            string                  `json:"result_digest"`
+	SolveInvocationID       string                  `json:"solve_invocation_id,omitempty"`
+	GradeInvocationID       string                  `json:"grade_invocation_id,omitempty"`
+	ParentGuideInvocationID string                  `json:"parent_guide_invocation_id,omitempty"`
+	ProjectionRecordID      string                  `json:"projection_record_id,omitempty"`
+	ProjectionCreated       bool                    `json:"projection_created,omitempty"`
+	ProjectionStatus        string                  `json:"projection_status"`
+	CreatedAt               int64                   `json:"created_at"`
+	UpdatedAt               int64                   `json:"updated_at"`
 }
 
 func (v *GradingAssessmentItem) Validate() error {
@@ -117,6 +124,7 @@ func (v *GradingAssessmentItem) Validate() error {
 	v.ResultJSON = strings.TrimSpace(v.ResultJSON)
 	v.SolveInvocationID = strings.TrimSpace(v.SolveInvocationID)
 	v.GradeInvocationID = strings.TrimSpace(v.GradeInvocationID)
+	v.ParentGuideInvocationID = strings.TrimSpace(v.ParentGuideInvocationID)
 	if v.AgentName == "" || v.JobID == "" || v.ProblemID == "" || v.AttemptID == "" ||
 		v.ConfirmedVersion < 1 || v.InputDigest == "" || !v.Status.Valid() ||
 		v.ResultDigest == "" || v.ResultJSON == "" || !json.Valid([]byte(v.ResultJSON)) ||
@@ -139,6 +147,41 @@ func (v *GradingAssessmentItem) Validate() error {
 	case GradingAssessmentOutOfScope:
 		if v.GradeInvocationID != "" {
 			return fmt.Errorf("out_of_scope must not claim a grade invocation")
+		}
+	}
+	if v.ParentGuideInvocationID != "" &&
+		v.Status != GradingAssessmentWrong &&
+		v.Status != GradingAssessmentBlankSolved {
+		return fmt.Errorf("grading assessment %s must not claim a parent guide invocation", v.Status)
+	}
+	return nil
+}
+
+// ValidateTerminalParentGuideReference is stricter than Validate on purpose.
+// Validate keeps historical receipts readable, while this boundary prevents a
+// legacy/incomplete wrong or blank-solved item from being published as a
+// current terminal result. CommitGradingAssessmentItem separately proves that
+// every non-empty reference names a matching succeeded invocation.
+func (v GradingAssessmentItem) ValidateTerminalParentGuideReference() error {
+	if err := v.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrGradingAssessmentTerminalInvariant, err)
+	}
+	switch v.Status {
+	case GradingAssessmentWrong, GradingAssessmentBlankSolved:
+		if v.ParentGuideInvocationID == "" {
+			return fmt.Errorf(
+				"%w: grading assessment %s requires a succeeded parent guide reference",
+				ErrGradingAssessmentTerminalInvariant,
+				v.Status,
+			)
+		}
+	default:
+		if v.ParentGuideInvocationID != "" {
+			return fmt.Errorf(
+				"%w: grading assessment %s must remain parent-guide-free",
+				ErrGradingAssessmentTerminalInvariant,
+				v.Status,
+			)
 		}
 	}
 	return nil

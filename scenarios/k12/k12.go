@@ -59,6 +59,73 @@ type MistakeFields struct {
 	// §6.9 类型化存储批补齐）：photo=拍照批改判错自动入库；manual=家长手动记入。
 	// Outbox 学情消费者据此还原两条路径的措辞差异；老记录空串按 photo 口径兼容。
 	EntrySource string `json:"entry_source,omitempty"`
+	// 手动归档是可恢复的学习队列退出，而不是删除或掌握证据。下面字段冻结最近一次
+	// 归档前的学习状态/调度事实，供 8 秒 Undo 与「已归档」长期恢复共用同一命令。
+	ArchivedReason             string                  `json:"archived_reason,omitempty"`
+	ArchivedAt                 int64                   `json:"archived_at,omitempty"`
+	ArchiveCommandID           string                  `json:"archive_command_id,omitempty"`
+	ArchivedFromStatus         string                  `json:"archived_from_status,omitempty"`
+	ArchivedFromDueAt          *int64                  `json:"archived_from_due_at,omitempty"`
+	ArchivedFromSpotCheckState string                  `json:"archived_from_spot_check_state,omitempty"`
+	LastArchive                *MistakeArchiveSnapshot `json:"last_archive,omitempty"`
+}
+
+const MistakeArchivedReasonManual = "manual"
+
+// MistakeArchiveSnapshot 保留最近一次归档/恢复的审计事实。当前归档态字段只在
+// status=archived 时非空；恢复后清空当前字段，但保留本快照用于审计与迟到命令去重。
+type MistakeArchiveSnapshot struct {
+	Reason             string `json:"reason"`
+	ArchivedAt         int64  `json:"archived_at"`
+	ArchiveCommandID   string `json:"archive_command_id"`
+	FromStatus         string `json:"from_status"`
+	FromDueAt          *int64 `json:"from_due_at,omitempty"`
+	FromSpotCheckState string `json:"from_spot_check_state,omitempty"`
+	RestoredAt         int64  `json:"restored_at,omitempty"`
+	RestoreCommandID   string `json:"restore_command_id,omitempty"`
+}
+
+// MistakeRestorable 是错题恢复能力的领域投影，不是持久化事实。只有当前确为
+// archived，且当前归档字段与一份完整、未恢复的 LastArchive 快照严格一致时才为真。
+// V35 前已经 archived 的历史行没有快照，因此明确为 false；不得猜造原状态或调度。
+func MistakeRestorable(status string, f MistakeFields) bool {
+	if status != StatusArchived || f.LastArchive == nil {
+		return false
+	}
+	snapshot := f.LastArchive
+	if snapshot.Reason != MistakeArchivedReasonManual ||
+		snapshot.ArchivedAt <= 0 ||
+		strings.TrimSpace(snapshot.ArchiveCommandID) == "" ||
+		snapshot.RestoredAt != 0 ||
+		strings.TrimSpace(snapshot.RestoreCommandID) != "" {
+		return false
+	}
+	switch snapshot.FromStatus {
+	case StatusNew, StatusExplained, StatusRetried, StatusMastered:
+	default:
+		return false
+	}
+	switch snapshot.FromSpotCheckState {
+	case "", SpotCheckNone, SpotCheckScheduled, SpotCheckPassed, SpotCheckFailed:
+	default:
+		return false
+	}
+	if snapshot.FromDueAt != nil && *snapshot.FromDueAt <= 0 {
+		return false
+	}
+	return f.ArchivedReason == snapshot.Reason &&
+		f.ArchivedAt == snapshot.ArchivedAt &&
+		f.ArchiveCommandID == snapshot.ArchiveCommandID &&
+		f.ArchivedFromStatus == snapshot.FromStatus &&
+		unixPointersEqual(f.ArchivedFromDueAt, snapshot.FromDueAt) &&
+		f.ArchivedFromSpotCheckState == snapshot.FromSpotCheckState
+}
+
+func unixPointersEqual(left, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 // 错题录入来源枚举（§5.5 entry_source）。
@@ -96,7 +163,9 @@ func MistakeSchema() *records.RecordSchema {
 			StatusExplained: {StatusRetried, StatusMastered, StatusArchived},
 			StatusRetried:   {StatusMastered, StatusArchived},
 			StatusMastered:  {StatusRetried, StatusArchived},
-			StatusArchived:  {},
+			// 通用状态机里 archived 仍是终态；恢复只允许走受控 RestoreMistake
+			// 命令，按冻结快照复原，不能借通用 UpdateStatus 任意改写目标状态。
+			StatusArchived: {},
 		},
 		DedupeKey:      mistakeDedupeKey,
 		ValidateFields: validateMistakeFields,
@@ -133,6 +202,26 @@ func validateMistakeFields(fieldsJSON string) error {
 	case "", MistakeEntryPhoto, MistakeEntryVerified, MistakeEntryManual, MistakeEntryWritingConfirmed:
 	default:
 		return fmt.Errorf("entry_source 非法值 %q（photo/verified/manual/writing_confirmed）", f.EntrySource)
+	}
+	switch f.ArchivedReason {
+	case "", MistakeArchivedReasonManual:
+	default:
+		return fmt.Errorf("archived_reason 非法值 %q", f.ArchivedReason)
+	}
+	switch f.ArchivedFromStatus {
+	case "", StatusNew, StatusExplained, StatusRetried, StatusMastered:
+	default:
+		return fmt.Errorf("archived_from_status 非法值 %q", f.ArchivedFromStatus)
+	}
+	if f.LastArchive != nil {
+		if f.LastArchive.Reason != MistakeArchivedReasonManual {
+			return fmt.Errorf("last_archive.reason 非法值 %q", f.LastArchive.Reason)
+		}
+		switch f.LastArchive.FromStatus {
+		case StatusNew, StatusExplained, StatusRetried, StatusMastered:
+		default:
+			return fmt.Errorf("last_archive.from_status 非法值 %q", f.LastArchive.FromStatus)
+		}
 	}
 	return nil
 }

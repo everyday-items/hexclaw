@@ -107,10 +107,13 @@ func SubjectVerifierGatePassed(subject string) bool {
 
 // 练习集发送状态（PRD §5.5 delivery_status）。
 const (
-	PracticeDeliveryNotSent   = "not_sent"
-	PracticeDeliveryPending   = "pending"
-	PracticeDeliveryDelivered = "delivered"
-	PracticeDeliveryFailed    = "failed"
+	PracticeDeliveryNotSent        = "not_sent"
+	PracticeDeliveryPending        = "pending"
+	PracticeDeliverySending        = "sending"
+	PracticeDeliveryDelivered      = "delivered"
+	PracticeDeliveryFailed         = "failed"
+	PracticeDeliveryPartialFailed  = "partial_failed"
+	PracticeDeliveryOutcomeUnknown = "outcome_unknown"
 )
 
 // practiceLabels 内部状态 → UI 译名（PRD §3.8「界面译名固定为」）。
@@ -168,21 +171,24 @@ type PracticeReturnAsset struct {
 
 // PracticeSetFields 练习集领域字段（PRD §5.5）。
 type PracticeSetFields struct {
-	SourceKind          string                `json:"source_kind"`
-	Title               string                `json:"title"`
-	PaperNo             string                `json:"paper_no,omitempty"` // 卷面号（§4.13 双 ID）：固化时分配，P-YYWW-NN，OCR 友好，印于页眉；内部主键仍是 record_id
-	Items               []PracticeItem        `json:"items"`
-	QuestionArtifact    string                `json:"question_artifact_id,omitempty"`  // 题目卷，固化（打印/发送）时生成，只含 verified 项
-	AnswerArtifact      string                `json:"answer_artifact_id,omitempty"`    // 答案卷，与题目卷分离
-	SkippedBlockedCount int                   `json:"skipped_blocked_count,omitempty"` // 固化时被跳过的阻断题数（§3.8，审计+预览明示）
-	FinalizedAt         int64                 `json:"finalized_at,omitempty"`          // 固化时间（§4.13）：历史排序、回传提醒 T+1、14 天启发窗口的统一依据
-	FinalizedVia        string                `json:"finalized_via,omitempty"`         // print | send
-	ReminderSentAt      int64                 `json:"reminder_sent_at,omitempty"`      // 回传提醒发出时间（§3.13）：每卷幂等一次的持久依据
-	ReminderDismissed   bool                  `json:"reminder_dismissed,omitempty"`    // 家长手动关闭本卷提醒
-	ClosedReason        string                `json:"closed_reason,omitempty"`         // graded→closed 触发原因（§3.8）：manual / semester
-	DeliveryStatus      string                `json:"delivery_status"`
-	DeliveryTarget      string                `json:"delivery_target,omitempty"`
-	ReturnAssets        []PracticeReturnAsset `json:"return_assets,omitempty"`
+	SourceKind          string         `json:"source_kind"`
+	Title               string         `json:"title"`
+	PaperNo             string         `json:"paper_no,omitempty"` // 卷面号（§4.13 双 ID）：固化时分配，P-YYWW-NN，OCR 友好，印于页眉；内部主键仍是 record_id
+	Items               []PracticeItem `json:"items"`
+	QuestionArtifact    string         `json:"question_artifact_id,omitempty"`  // 题目卷，固化（打印/发送）时生成，只含 verified 项
+	AnswerArtifact      string         `json:"answer_artifact_id,omitempty"`    // 答案卷，与题目卷分离
+	SkippedBlockedCount int            `json:"skipped_blocked_count,omitempty"` // 固化时被跳过的阻断题数（§3.8，审计+预览明示）
+	FinalizedAt         int64          `json:"finalized_at,omitempty"`          // 固化时间（§4.13）：历史排序、回传提醒 T+1、14 天启发窗口的统一依据
+	FinalizedVia        string         `json:"finalized_via,omitempty"`         // print | send
+	ReminderSentAt      int64          `json:"reminder_sent_at,omitempty"`      // 回传提醒发出时间（§3.13）：每卷幂等一次的持久依据
+	ReminderDismissed   bool           `json:"reminder_dismissed,omitempty"`    // 家长手动关闭本卷提醒
+	ClosedReason        string         `json:"closed_reason,omitempty"`         // graded→closed 触发原因（§3.8）：manual / semester
+	DeliveryStatus      string         `json:"delivery_status"`
+	DeliveryBatchID     string         `json:"delivery_batch_id,omitempty"`
+	// DeliveryTarget is retained only for reading pre-V36 singleton rows.
+	// New send commands never accept or persist a client-selected target.
+	DeliveryTarget string                `json:"delivery_target,omitempty"`
+	ReturnAssets   []PracticeReturnAsset `json:"return_assets,omitempty"`
 }
 
 // PracticeGenerationJob 是 DD-027 后端正式组卷命令的持久收据。请求快照不可变；

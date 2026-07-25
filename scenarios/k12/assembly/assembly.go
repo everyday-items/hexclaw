@@ -135,6 +135,16 @@ func WithTutoringTipsReviewGenerator(fn engineadapter.TutoringTipsReviewGenerate
 	}
 }
 
+// WithParentTeachingGuideGenerator injects the dedicated structured generator
+// for each problem on a blank worksheet.
+func WithParentTeachingGuideGenerator(fn engineadapter.ParentTeachingGuideGenerateFunc) Option {
+	return func(d *usecase.Deps) {
+		if sa, ok := d.Solver.(*engineadapter.SolveAdapter); ok && fn != nil {
+			sa.SetParentTeachingGuideGen(fn)
+		}
+	}
+}
+
 // WithWorkFeedbackGenerator 注入作品证据化点评生成闭包（PRD §3.10 / INV-011）：
 // 写作好句摘出+一处具体建议、美术观察描述式，单次 reasoning，不走验算链。
 func WithWorkFeedbackGenerator(fn engineadapter.WorkFeedbackGenerateFunc) Option {
@@ -205,13 +215,14 @@ func WireInto(ctx context.Context, reg *scenario.Registry, db *sql.DB, solveSkil
 	solveAdapter := engineadapter.NewSolveAdapter(solveSkill)
 
 	deps := usecase.Deps{
-		Solver:             solveAdapter,
-		Grader:             solveAdapter,
-		VerifiedGrader:     solveAdapter,
-		TutoringTipsReview: solveAdapter,
-		Records:            store,
-		PageAssets:         assetstore.PageStore{},
-		Constraint:         constraint,
+		Solver:              solveAdapter,
+		Grader:              solveAdapter,
+		VerifiedGrader:      solveAdapter,
+		TutoringTipsReview:  solveAdapter,
+		ParentTeachingGuide: solveAdapter,
+		Records:             store,
+		PageAssets:          assetstore.PageStore{},
+		Constraint:          constraint,
 	}
 	for _, o := range opts {
 		o(&deps)

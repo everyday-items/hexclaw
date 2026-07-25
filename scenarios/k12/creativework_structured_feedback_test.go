@@ -1,6 +1,7 @@
 package k12
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -17,7 +18,6 @@ func TestWorkFeedbackCanonicalContractAndStrictJSON(t *testing.T) {
 		},
 		Limitations:        "只依据已确认原文。",
 		Suggestions:        []string{"由孩子补充一个听觉细节。"},
-		AllowedActions:     []string{"send", "collect", "record_language_issue"},
 		ProjectionMarkdown: "### 观察\n\n- 使用了可见的比喻句。",
 	}
 	if err := feedback.Validate(); err != nil {
@@ -30,7 +30,7 @@ func TestWorkFeedbackCanonicalContractAndStrictJSON(t *testing.T) {
 		"observations":[{"dimension":"expression","evidence":"可见证据"}],
 		"source_snapshot":{"source":"ai","method_ref":"builtin","capability":"evidence_based_feedback"},
 		"limitations":"只依据已确认原文","suggestions":["孩子自己补一个细节"],
-		"allowed_actions":["send"],"projection_markdown":"### 观察",
+		"projection_markdown":"### 观察",
 		"score":95
 	}`)); err == nil {
 		t.Fatal("unknown/prohibited score field must fail closed")
@@ -52,7 +52,6 @@ func TestWorkFeedbackCanonicalContractRejectsMarkdownScaffoldingInsideAtoms(t *t
 		},
 		Limitations:        "只依据已确认原文。",
 		Suggestions:        []string{"由孩子补充一个听觉细节。"},
-		AllowedActions:     []string{"send", "collect"},
 		ProjectionMarkdown: "### 观察\n\n- 使用了可见的比喻句。",
 	}
 	cases := []struct {
@@ -105,5 +104,28 @@ func TestProjectWorkFeedbackMarkdownIsDeterministicFromCanonicalFields(t *testin
 	}
 	if strings.Contains(got, "feedback_id") || strings.Contains(got, "allowed_actions") {
 		t.Fatalf("display projection must not leak internal schema: %q", got)
+	}
+}
+
+func TestParseLegacyWorkFeedbackStripsRetiredAllowedActions(t *testing.T) {
+	raw := []byte(`{
+		"feedback_id":"feedback-legacy","version_id":"v1","feedback_type":"writing",
+		"evidence_refs":["content-ref:sha256:abc"],
+		"observations":[{"dimension":"expression","evidence":"使用了可见的比喻句。"}],
+		"source_snapshot":{"source":"ai","method_ref":"builtin","capability":"evidence_based_feedback"},
+		"limitations":"只依据已确认原文。","suggestions":["由孩子补充一个听觉细节。"],
+		"allowed_actions":["send","collect","record_language_issue"],
+		"projection_markdown":"旧投影"
+	}`)
+	feedback, err := ParseLegacyWorkFeedbackJSON(raw)
+	if err != nil {
+		t.Fatalf("historical feedback should remain readable after action retirement: %v", err)
+	}
+	encoded, err := json.Marshal(feedback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "allowed_actions") {
+		t.Fatalf("retired actions must be stripped at compatibility boundary: %s", encoded)
 	}
 }

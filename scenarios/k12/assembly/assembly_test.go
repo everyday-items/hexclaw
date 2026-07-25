@@ -122,3 +122,36 @@ func TestWire_NilGuards(t *testing.T) {
 		t.Error("solveSkill=nil 应报错")
 	}
 }
+
+func TestWire_ParentTeachingGuideUsesDedicatedGenerator(t *testing.T) {
+	db := newDB(t)
+	calls := 0
+	k, err := Wire(db, fakeSolveExec{}, WithParentTeachingGuideGenerator(func(
+		context.Context, string, string, string,
+	) (string, error) {
+		calls++
+		return `{
+			"answer":"11.4",
+			"full_solution_steps":["先按整数乘法计算","再点回一位小数"],
+			"grade_level_method":"使用五年级小数乘法",
+			"likely_mistakes":["小数点错位"],
+			"parent_teaching_sequence":["先让孩子计算整数乘法，再点小数点"],
+			"follow_up_questions":["两个因数共有几位小数？"],
+			"checking_method":"用除法验算"
+		}`, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k.Deps.ParentTeachingGuide == nil {
+		t.Fatal("production wiring omitted ParentTeachingGuideGenerator")
+	}
+	guide, err := k.Deps.ParentTeachingGuide.GenerateParentTeachingGuide(context.Background(),
+		usecase.ParentTeachingGuideRequest{
+			Subject: "数学", Grade: "五年级上", Problem: "3.8×3=",
+			VerifiedSolution: "11.4", KnowledgePoints: []string{"小数乘法"},
+		})
+	if err != nil || calls != 1 || guide.CheckingMethod != "用除法验算" {
+		t.Fatalf("dedicated generator wiring: calls=%d guide=%#v err=%v", calls, guide, err)
+	}
+}
