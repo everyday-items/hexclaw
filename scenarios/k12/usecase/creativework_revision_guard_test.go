@@ -21,9 +21,7 @@ func TestSubmitRevision_RequiresRealUpload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.AttachFeedback(ctx, "xiaoming", id, "结构清晰，可加感官细节。"); err != nil {
-		t.Fatal(err)
-	}
+	generateCreativeWorkFeedbackForTest(t, &d, id, "结构清晰；建议加一个感官细节。")
 
 	// 空修改稿（无文本无照片）→ 拒绝，版本数不变。
 	if _, err := d.SubmitRevision(ctx, "xiaoming", id, "", ""); err == nil {

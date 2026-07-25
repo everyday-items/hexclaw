@@ -2,6 +2,9 @@ package usecase
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -56,6 +59,13 @@ func recoveryDeps(t *testing.T, rec Recognizer, anchorer AnswerAnchorer, annotat
 	return d
 }
 
+type recoveryOutcomeUnknownRecognizer struct{ calls int }
+
+func (r *recoveryOutcomeUnknownRecognizer) Recognize(context.Context, []byte) ([]RecognizedQuestion, error) {
+	r.calls++
+	return nil, context.DeadlineExceeded
+}
+
 // 崩溃点①：Job 创建后（queued）进程崩溃——重启扫描应从头续跑到确认停点。
 func TestGradingRecovery_QueuedJobResumesToConfirmationStop(t *testing.T) {
 	ctx := context.Background()
@@ -92,6 +102,74 @@ func TestGradingRecovery_QueuedJobResumesToConfirmationStop(t *testing.T) {
 		t.Fatalf("恢复后 ConfirmAndRun: %v", err)
 	}
 	waitForStage(t, d, "mingming", jobID, k12.GradingStageCompleted)
+}
+
+func TestGradingRecovery_ClearImageTaskAtConfirmationCheckpointAutoFreezes(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	rec := &countingRecognizer{questions: []RecognizedQuestion{{
+		Question: "4÷0.5=", Subject: "数学",
+		AnswerState: AnswerStatePresent, StudentAnswer: "8",
+		RecognitionConfidence: float64Ptr(0.99), OCRSignals: []string{"decimal_point"},
+	}}}
+	d := recoveryDeps(t, rec, nil, nil)
+	o1 := newRecoverableOrchestrator(t, d, dir)
+	v, _, err := o1.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "image_task", SourceKey: "recover-auto-freeze",
+	})
+	if err != nil {
+		t.Fatalf("StartPhotoGradingJob: %v", err)
+	}
+	jobID := v.Record.RecordID
+	run := o1.lookup(jobID)
+	if run == nil {
+		t.Fatal("missing grading runtime")
+	}
+	if _, err = o1.advanceOK(ctx, run, jobID, ""); err != nil {
+		t.Fatalf("advance queued: %v", err)
+	}
+	if _, err = o1.advanceOK(ctx, run, jobID, "image:test"); err != nil {
+		t.Fatalf("advance normalizing: %v", err)
+	}
+	v, err = o1.runRecognize(ctx, run, jobID)
+	if err != nil || v.Record.Status != k12.GradingStageAwaitingConfirmation ||
+		v.Fields.ConfirmationState != k12.GradingConfirmationPending {
+		t.Fatalf("prepare confirmation checkpoint: stage=%s confirmation=%s err=%v",
+			v.Record.Status, v.Fields.ConfirmationState, err)
+	}
+	v, err = d.AdvanceGradingStage(ctx, "mingming", jobID, AdvanceGradingInput{
+		Outcome: GradingOutcomeAnchor, AnchorState: k12.GradingAnchorLocated, ArtifactDigest: "anchor:test",
+	})
+	if err != nil || v.Record.Status != k12.GradingStageAwaitingConfirmation {
+		t.Fatalf("prepare located checkpoint: stage=%s err=%v", v.Record.Status, err)
+	}
+
+	// Simulate a run checkpoint written by the previous policy, where a clear
+	// decimal was persisted as if it were uncertainty. Recovery must re-evaluate
+	// this historical fact rather than only fixing newly recognized jobs.
+	candidate := *run
+	candidate.questions = cloneRecognizedQuestions(run.questions)
+	candidate.questions[0].ConfirmationRequired = true
+	candidate.questions[0].ConfirmationReasons = []OCRRiskReason{OCRRiskDecimalPoint}
+	if err = o1.persistRun(jobID, &candidate); err != nil {
+		t.Fatalf("persist historical run checkpoint: %v", err)
+	}
+
+	o2 := newRecoverableOrchestrator(t, d, dir)
+	if _, err = o2.RecoverGradingJobs(ctx, []string{"mingming"}); err != nil {
+		t.Fatalf("RecoverGradingJobs: %v", err)
+	}
+	v = waitForStage(t, d, "mingming", jobID, k12.GradingStageCompleted)
+	if v.Fields.ConfirmationState != k12.GradingConfirmationConfirmed {
+		t.Fatalf("clear recovered image task was not auto-frozen: %#v", v.Fields)
+	}
+	snapshot, err := d.Records.GetProblemAttemptSnapshot(ctx, run.agentName, v.Fields.SubmissionID)
+	if err != nil {
+		t.Fatalf("load re-evaluated Problem/Attempt checkpoint: %v", err)
+	}
+	if snapshot.Problems[0].ConfirmationRequired || len(snapshot.Problems[0].ConfirmationReasons) != 0 {
+		t.Fatalf("stale format reason survived recovery: %#v", snapshot.Problems[0])
+	}
 }
 
 // 崩溃点②：停在 awaiting_confirmation 时崩溃——重启后保持等待（不自动确认、不重复调模型），
@@ -170,6 +248,286 @@ func TestGradingRecovery_FailedRetryableReenqueued(t *testing.T) {
 	waitForStage(t, d, "mingming", jobID, k12.GradingStageAwaitingConfirmation)
 	if rec.calls != 2 {
 		t.Fatalf("重试应恰好再调一次识别（首次失败+重试成功）, got %d", rec.calls)
+	}
+}
+
+// REG-BUG-20260724-015: if recognition facts were committed but the local
+// run.json write or invocation-ledger acknowledgement was lost, restart must
+// reconcile that exact durable result and continue the same Job. It must not
+// call the recognition provider a second time.
+func TestGradingRecovery_OutcomeUnknownWithDurableRecognitionReconcilesWithoutResend(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	rec := &countingRecognizer{questions: []RecognizedQuestion{{
+		Question: "1+1=", Subject: "数学", StudentAnswer: "2", AnswerState: AnswerStatePresent,
+	}}}
+	d := recoveryDeps(t, rec, nil, &photoAnnotatorFake{})
+
+	o1 := newRecoverableOrchestrator(t, d, dir)
+	v, _, err := o1.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "req-reconcile-durable-recognition",
+	})
+	if err != nil {
+		t.Fatalf("StartPhotoGradingJob: %v", err)
+	}
+	jobID := v.Record.RecordID
+	jobDir := o1.runPath(jobID, "")
+	if err := os.Chmod(jobDir, 0o500); err != nil {
+		t.Fatalf("make runtime directory read-only: %v", err)
+	}
+	_, runErr := o1.RunGradingJob(ctx, jobID)
+	if err := os.Chmod(jobDir, 0o700); err != nil {
+		t.Fatalf("restore runtime directory permissions: %v", err)
+	}
+	if runErr == nil {
+		t.Fatal("recognition run must expose the injected run.json durability failure")
+	}
+	parked, err := d.GetGradingJob(ctx, "mingming", jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parked.Record.Status != k12.GradingStageOutcomeUnknown {
+		t.Fatalf("durability ambiguity stage=%s, want outcome_unknown", parked.Record.Status)
+	}
+	if rec.calls != 1 {
+		t.Fatalf("initial recognition provider calls=%d, want 1", rec.calls)
+	}
+
+	o2 := newRecoverableOrchestrator(t, d, dir)
+	if _, err := o2.RecoverGradingJobs(ctx, []string{"mingming"}); err != nil {
+		t.Fatalf("RecoverGradingJobs: %v", err)
+	}
+	waitForStage(t, d, "mingming", jobID, k12.GradingStageAwaitingConfirmation)
+	if rec.calls != 1 {
+		t.Fatalf("durable-result recovery resent recognition: calls=%d", rec.calls)
+	}
+	invocations, err := d.Records.ListModelInvocations(ctx, "mingming", jobID)
+	if err != nil || len(invocations) != 1 {
+		t.Fatalf("list model invocations: count=%d err=%v", len(invocations), err)
+	}
+	if invocations[0].Status != k12.ModelInvocationReconciled ||
+		invocations[0].FailureKind != "reconciled_succeeded" {
+		t.Fatalf("recognition invocation not reconciled from durable evidence: %+v", invocations[0])
+	}
+}
+
+func TestGradingRecovery_OutcomeUnknownWithoutDurableResultStaysParkedWithoutResend(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	rec := &recoveryOutcomeUnknownRecognizer{}
+	d := recoveryDeps(t, rec, nil, &photoAnnotatorFake{})
+
+	o1 := newRecoverableOrchestrator(t, d, dir)
+	v, _, err := o1.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "req-unknown-no-result",
+	})
+	if err != nil {
+		t.Fatalf("StartPhotoGradingJob: %v", err)
+	}
+	jobID := v.Record.RecordID
+	if _, err := o1.RunGradingJob(ctx, jobID); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("recognition outcome=%v, want deadline ambiguity", err)
+	}
+	if rec.calls != 1 {
+		t.Fatalf("initial recognition calls=%d, want 1", rec.calls)
+	}
+
+	o2 := newRecoverableOrchestrator(t, d, dir)
+	if _, err := o2.RecoverGradingJobs(ctx, []string{"mingming"}); err != nil {
+		t.Fatalf("RecoverGradingJobs: %v", err)
+	}
+	parked, err := d.GetGradingJob(ctx, "mingming", jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parked.Record.Status != k12.GradingStageOutcomeUnknown {
+		t.Fatalf("unproven provider outcome stage=%s, want outcome_unknown", parked.Record.Status)
+	}
+	if rec.calls != 1 {
+		t.Fatalf("recovery blindly resent recognition: calls=%d", rec.calls)
+	}
+}
+
+// A Problem/Attempt snapshot is keyed by the content-derived SubmissionID and can
+// therefore predate this Job (for example, the same photo was previously run on
+// another route). It is not proof that this Job's ambiguous invocation succeeded.
+// Recovery may only reconcile recognition from a Job-scoped immutable receipt.
+func TestGradingRecovery_OutcomeUnknownRejectsStaleSamePhotoSnapshotFromAnotherJob(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	rec := &recoveryOutcomeUnknownRecognizer{}
+	d := recoveryDeps(t, rec, nil, &photoAnnotatorFake{})
+
+	o1 := newRecoverableOrchestrator(t, d, dir)
+	v, _, err := o1.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "req-unknown-stale-snapshot",
+	})
+	if err != nil {
+		t.Fatalf("StartPhotoGradingJob: %v", err)
+	}
+	jobID := v.Record.RecordID
+	if _, err := o1.RunGradingJob(ctx, jobID); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("recognition outcome=%v, want deadline ambiguity", err)
+	}
+	parked, err := d.GetGradingJob(ctx, "mingming", jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleQuestions, err := NormalizeRecognizedProblems(parked.Fields.SubmissionID, []RecognizedQuestion{{
+		Question: "9+9=", Subject: "数学", StudentAnswer: "18", AnswerState: AnswerStatePresent,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range staleQuestions {
+		staleQuestions[i].PageAssetID = "page-stale-other-job"
+	}
+	stale, err := RecognizedQuestionsProblemAttemptSnapshot(
+		"mingming", parked.Fields.SubmissionID, staleQuestions, d.now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Records.PutProblemAttemptSnapshot(ctx, stale); err != nil {
+		t.Fatalf("seed stale same-photo snapshot: %v", err)
+	}
+
+	o2 := newRecoverableOrchestrator(t, d, dir)
+	if _, err := o2.RecoverGradingJobs(ctx, []string{"mingming"}); err != nil {
+		t.Fatalf("RecoverGradingJobs: %v", err)
+	}
+	got, err := d.GetGradingJob(ctx, "mingming", jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Record.Status != k12.GradingStageOutcomeUnknown {
+		t.Fatalf("stale same-photo snapshot reconciled another Job: stage=%s", got.Record.Status)
+	}
+	if rec.calls != 1 {
+		t.Fatalf("recovery resent ambiguous recognition: calls=%d", rec.calls)
+	}
+}
+
+func TestGradingRecovery_OutcomeUnknownWithDurableAssessmentReconcilesWithoutResend(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	rec := &countingRecognizer{questions: []RecognizedQuestion{{
+		Question: "1+1=", Subject: "数学", StudentAnswer: "2", AnswerState: AnswerStatePresent,
+	}}}
+	d := recoveryDeps(t, rec, nil, &photoAnnotatorFake{})
+	o1 := newRecoverableOrchestrator(t, d, dir)
+	v, _, err := o1.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "req-reconcile-durable-assessment",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID := v.Record.RecordID
+	if _, err = o1.RunGradingJob(ctx, jobID); err != nil {
+		t.Fatalf("recognition: %v", err)
+	}
+	waitGradingView(t, o1, jobID, func(view GradingJobView) bool {
+		return view.Record.Status == k12.GradingStageAwaitingConfirmation &&
+			view.Fields.AnchorState != k12.GradingAnchorPending
+	})
+	run := o1.lookup(jobID)
+	if run == nil {
+		t.Fatal("grading runtime missing")
+	}
+	candidate := *run
+	candidate.questions = cloneRecognizedQuestions(run.questions)
+	candidate.anchored = cloneRecognizedQuestions(run.anchored)
+	if err := applyAndValidateGradingConfirmation(&candidate, ConfirmPhotoGradingInput{}); err != nil {
+		t.Fatalf("freeze confirmation: %v", err)
+	}
+	job, err := d.GetGradingJob(ctx, run.agentName, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := o1.persistProblemAttemptFacts(ctx, run.agentName, job.Fields.SubmissionID, candidate.questions); err != nil {
+		t.Fatal(err)
+	}
+	if err := o1.persistRun(jobID, &candidate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.ConfirmGradingJob(ctx, run.agentName, jobID, []string{
+		"canonical-recognition:" + CanonicalRecognizedQuestionsDigest(candidate.questions),
+	}); err != nil {
+		t.Fatalf("confirm job: %v", err)
+	}
+	run.questions = candidate.questions
+	run.anchored = candidate.anchored
+
+	assessmentQuestions := RecognizedQuestionsForAssessment(cloneRecognizedQuestions(run.questions))
+	result := PhotoGradeResult{
+		Mode: PhotoModeGrade, TaskIntent: PhotoTaskCompletedHomework,
+		ResultSurface: PhotoSurfaceAnnotatedHomework,
+		Items: []PhotoGradeItem{{
+			Recognized: assessmentQuestions[0],
+			Status:     PhotoCorrect,
+			ResultKind: PhotoItemAssessment,
+			Grade: GradeResult{
+				Solution: "2",
+				Evidence: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec},
+				Outcome:  GradeOutcome{Verdict: VerdictAgree},
+			},
+		}},
+		Markdown: "批改完成",
+	}
+	run.result = &result
+	if err := o1.persistRun(jobID, run); err != nil {
+		t.Fatalf("persist complete assessment: %v", err)
+	}
+	job, err = d.GetGradingJob(ctx, run.agentName, jobID)
+	if err != nil || job.Record.Status != k12.GradingStageAssessing {
+		t.Fatalf("assessment job: stage=%s err=%v", job.Record.Status, err)
+	}
+	requestRaw, _ := json.Marshal(struct {
+		Request   PhotoGradeRequest    `json:"request"`
+		Questions []RecognizedQuestion `json:"questions"`
+		Anchored  []RecognizedQuestion `json:"anchored,omitempty"`
+	}{run.req, run.questions, run.anchored})
+	invocation, _, err := d.Records.PrepareModelInvocation(ctx, k12.ModelInvocation{
+		InvocationID: "modelinv-durable-assessment", AgentName: run.agentName,
+		JobID: jobID, Stage: k12.GradingStageAssessing,
+		RequestDigest: modelInvocationDigest([]byte(k12.GradingStageAssessing), requestRaw),
+		RouteSnapshot: job.Fields.ModelSnapshot, Attempt: job.Fields.AttemptCount + 1,
+		CreatedAt: d.now(), UpdatedAt: d.now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if invocation, err = d.Records.MarkModelInvocationSent(ctx, run.agentName, invocation.InvocationID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = d.Records.MarkModelInvocationOutcomeUnknown(ctx, run.agentName, invocation.InvocationID, "ack_lost"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = d.AdvanceGradingStage(ctx, run.agentName, jobID, AdvanceGradingInput{
+		Outcome: GradingOutcomeUnknown, FailureKind: "ack_lost",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	o2 := newRecoverableOrchestrator(t, d, dir)
+	if _, err := o2.RecoverGradingJobs(ctx, []string{"mingming"}); err != nil {
+		t.Fatalf("RecoverGradingJobs: %v", err)
+	}
+	waitForStage(t, d, "mingming", jobID, k12.GradingStageCompleted)
+	invocations, err := d.Records.ListModelInvocations(ctx, "mingming", jobID)
+	if err != nil || len(invocations) != 2 {
+		t.Fatalf("model invocations count=%d err=%v", len(invocations), err)
+	}
+	var assessmentInvocation *k12.ModelInvocation
+	for i := range invocations {
+		if invocations[i].Stage == k12.GradingStageAssessing {
+			assessmentInvocation = &invocations[i]
+		}
+	}
+	if assessmentInvocation == nil ||
+		assessmentInvocation.Status != k12.ModelInvocationReconciled ||
+		assessmentInvocation.FailureKind != "reconciled_succeeded" {
+		t.Fatalf("assessment invocation not reconciled: %+v", assessmentInvocation)
 	}
 }
 

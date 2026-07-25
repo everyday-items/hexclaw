@@ -3,8 +3,10 @@ package usecase
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -145,6 +147,165 @@ func (d Deps) DeleteMistake(ctx context.Context, agentName, recordID string) err
 		return fmt.Errorf("%w: agentName / recordID 不可空", ErrInvalidInput)
 	}
 	return d.Records.Delete(ctx, agentName, recordID)
+}
+
+// ArchiveMistake 将错题从复习调度中软归档。它冻结归档前状态、到期和抽查状态，
+// 但不删除题目、不写掌握证据。idempotencyKey 钉住一次用户意图：同一命令即使在
+// Undo 之后迟到重放，也只返回当前事实，绝不把已恢复的题再次归档。
+func (d Deps) ArchiveMistake(
+	ctx context.Context,
+	agentName, recordID string,
+	expectedVersion int,
+	idempotencyKey string,
+) (*records.AgentRecord, error) {
+	if strings.TrimSpace(agentName) == "" || strings.TrimSpace(recordID) == "" ||
+		strings.TrimSpace(idempotencyKey) == "" {
+		return nil, fmt.Errorf("%w: agentName / recordID / idempotencyKey 不可空", ErrInvalidInput)
+	}
+	rec, err := d.Records.Get(ctx, recordID)
+	if err != nil {
+		return nil, fmt.Errorf("usecase: 取错题记录: %w", err)
+	}
+	if rec.AgentName != agentName || rec.Collection != k12.CollectionMistakes {
+		return nil, fmt.Errorf("usecase: 取错题记录: %w", records.ErrNotFound)
+	}
+	f, err := k12.ParseMistakeFields(rec.Fields)
+	if err != nil {
+		return nil, fmt.Errorf("usecase: 解析错题字段: %w", err)
+	}
+	if f.ArchiveCommandID == idempotencyKey ||
+		(f.LastArchive != nil && f.LastArchive.ArchiveCommandID == idempotencyKey) {
+		return rec, nil
+	}
+	if rec.Version != expectedVersion {
+		return nil, records.ErrVersionConflict
+	}
+	if rec.Status == k12.StatusArchived {
+		return nil, fmt.Errorf("%w: 错题已由另一命令归档", records.ErrIllegalTransition)
+	}
+	fromDue := cloneUnixPointer(rec.DueAt)
+	f.ArchivedReason = k12.MistakeArchivedReasonManual
+	f.ArchivedAt = d.now()
+	f.ArchiveCommandID = idempotencyKey
+	f.ArchivedFromStatus = rec.Status
+	f.ArchivedFromDueAt = fromDue
+	f.ArchivedFromSpotCheckState = f.SpotCheckState
+	f.LastArchive = &k12.MistakeArchiveSnapshot{
+		Reason:             f.ArchivedReason,
+		ArchivedAt:         f.ArchivedAt,
+		ArchiveCommandID:   f.ArchiveCommandID,
+		FromStatus:         f.ArchivedFromStatus,
+		FromDueAt:          cloneUnixPointer(f.ArchivedFromDueAt),
+		FromSpotCheckState: f.ArchivedFromSpotCheckState,
+	}
+	// 已归档对象不参与下一周期抽查；原值已冻结，恢复时原样写回。
+	f.SpotCheckState = k12.SpotCheckNone
+	raw, err := json.Marshal(f)
+	if err != nil {
+		return nil, fmt.Errorf("usecase: marshal 错题归档快照: %w", err)
+	}
+	if err := d.Records.UpdateStatusFields(
+		ctx, recordID, k12.StatusArchived, nil, string(raw), expectedVersion,
+	); err != nil {
+		if errors.Is(err, records.ErrVersionConflict) {
+			latest, latestErr := d.Records.Get(ctx, recordID)
+			if latestErr == nil {
+				latestFields, parseErr := k12.ParseMistakeFields(latest.Fields)
+				if parseErr == nil && (latestFields.ArchiveCommandID == idempotencyKey ||
+					(latestFields.LastArchive != nil &&
+						latestFields.LastArchive.ArchiveCommandID == idempotencyKey)) {
+					return latest, nil
+				}
+			}
+		}
+		return nil, err
+	}
+	return d.Records.Get(ctx, recordID)
+}
+
+// RestoreMistake 是 8 秒 Undo 与「已归档」长期恢复的唯一命令。它只恢复冻结的
+// 学习状态和调度；绝不升级状态、增加复习轮次或制造掌握证据。历史 due 已过期时，
+// 原样恢复会使它立即回到待练队列，避免无证据地推迟复习。
+func (d Deps) RestoreMistake(
+	ctx context.Context,
+	agentName, recordID string,
+	expectedVersion int,
+	idempotencyKey string,
+) (*records.AgentRecord, error) {
+	if strings.TrimSpace(agentName) == "" || strings.TrimSpace(recordID) == "" ||
+		strings.TrimSpace(idempotencyKey) == "" {
+		return nil, fmt.Errorf("%w: agentName / recordID / idempotencyKey 不可空", ErrInvalidInput)
+	}
+	rec, err := d.Records.Get(ctx, recordID)
+	if err != nil {
+		return nil, fmt.Errorf("usecase: 取错题记录: %w", err)
+	}
+	if rec.AgentName != agentName || rec.Collection != k12.CollectionMistakes {
+		return nil, fmt.Errorf("usecase: 取错题记录: %w", records.ErrNotFound)
+	}
+	f, err := k12.ParseMistakeFields(rec.Fields)
+	if err != nil {
+		return nil, fmt.Errorf("usecase: 解析错题字段: %w", err)
+	}
+	if rec.Status != k12.StatusArchived &&
+		f.LastArchive != nil && f.LastArchive.RestoreCommandID == idempotencyKey {
+		return rec, nil
+	}
+	if rec.Version != expectedVersion {
+		return nil, records.ErrVersionConflict
+	}
+	if rec.Status != k12.StatusArchived {
+		return nil, fmt.Errorf("%w: 错题未归档", records.ErrIllegalTransition)
+	}
+	if !k12.MistakeRestorable(rec.Status, f) {
+		return nil, fmt.Errorf("%w: 缺少可恢复的归档前状态", records.ErrInvalidFields)
+	}
+	snapshot := f.LastArchive
+	restoredStatus := snapshot.FromStatus
+	restoredDueAt := cloneUnixPointer(snapshot.FromDueAt)
+	restoredSpotCheckState := snapshot.FromSpotCheckState
+	f.SpotCheckState = restoredSpotCheckState
+	if f.SpotCheckState == "" {
+		f.SpotCheckState = k12.SpotCheckNone
+	}
+	f.LastArchive.RestoredAt = d.now()
+	f.LastArchive.RestoreCommandID = idempotencyKey
+	// 当前归档态字段与 status 严格同生命周期；审计事实已进入 LastArchive。
+	f.ArchivedReason = ""
+	f.ArchivedAt = 0
+	f.ArchiveCommandID = ""
+	f.ArchivedFromStatus = ""
+	f.ArchivedFromDueAt = nil
+	f.ArchivedFromSpotCheckState = ""
+	raw, err := json.Marshal(f)
+	if err != nil {
+		return nil, fmt.Errorf("usecase: marshal 错题恢复快照: %w", err)
+	}
+	if err := d.Records.RestoreArchivedMistake(
+		ctx, recordID, restoredStatus, restoredDueAt,
+		string(raw), expectedVersion, agentName,
+	); err != nil {
+		if errors.Is(err, records.ErrVersionConflict) {
+			latest, latestErr := d.Records.Get(ctx, recordID)
+			if latestErr == nil {
+				latestFields, parseErr := k12.ParseMistakeFields(latest.Fields)
+				if parseErr == nil && latestFields.LastArchive != nil &&
+					latestFields.LastArchive.RestoreCommandID == idempotencyKey {
+					return latest, nil
+				}
+			}
+		}
+		return nil, err
+	}
+	return d.Records.Get(ctx, recordID)
+}
+
+func cloneUnixPointer(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 // MasteryGapInterval 掌握判定的最小间隔（秒）：第二次做对距上次 ≥ 此值 → mastered（PRD §5.3.1）。

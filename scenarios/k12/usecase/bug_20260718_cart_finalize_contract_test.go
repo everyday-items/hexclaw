@@ -68,21 +68,23 @@ func TestFinalizeBasketOneStepSkipsBlocked(t *testing.T) {
 // TestFinalizeBasketSendRecordsDelivery ①：发送路径同样一步固化，并记录发送目标。
 func TestFinalizeBasketSendRecordsDelivery(t *testing.T) {
 	d := newDataDeps(t)
+	attachDeliveredPracticeTransport(&d, 1)
 	ctx := context.Background()
 	f := k12.PracticeSetFields{SourceKind: k12.PracticeSourceWeekly, Title: "发送卷",
 		Items: []k12.PracticeItem{verifiedItem("q1", "题", "答")}}
 	id, _, _ := d.CreatePracticeSet(ctx, "xiaoming", "s", f)
 
-	v, _, err := d.FinalizeBasket(ctx, "xiaoming", id, "send", "钉钉私聊·小明妈妈")
+	v, _, err := d.FinalizeBasket(ctx, "xiaoming", id, "send")
 	if err != nil {
 		t.Fatalf("发送固化: %v", err)
 	}
 	if v.Record.Status != k12.PracticeStatusAssigned {
 		t.Fatalf("发送即确认：应一步到 assigned，got %s", v.Record.Status)
 	}
-	// §3.12：无真实投递器接线时不得虚标 delivered——置 pending，投递结果由 ChannelPort 适配器回写。
-	if v.Fields.DeliveryStatus != k12.PracticeDeliveryPending || v.Fields.DeliveryTarget != "钉钉私聊·小明妈妈" {
-		t.Fatalf("发送应记 pending（不虚标 delivered）与目标，got %s/%q", v.Fields.DeliveryStatus, v.Fields.DeliveryTarget)
+	if v.Fields.DeliveryStatus != k12.PracticeDeliveryDelivered ||
+		v.Fields.DeliveryBatchID == "" || v.Fields.DeliveryTarget != "" {
+		t.Fatalf("发送应关联服务端批次且不保存客户端目标, got status=%s batch=%q target=%q",
+			v.Fields.DeliveryStatus, v.Fields.DeliveryBatchID, v.Fields.DeliveryTarget)
 	}
 	// 固化后可继续回传→复批（原有生命周期不受影响）。
 	submitWholeSet(t, d, "xiaoming", id)

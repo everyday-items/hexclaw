@@ -23,32 +23,67 @@ func TestEvaluateOCRConfirmationRisk_Table(t *testing.T) {
 			},
 		},
 		{
-			name: "high confidence cannot bypass fraction risk",
+			name: "clear high confidence fraction auto freezes",
 			q: RecognizedQuestion{
 				Question: `计算 \frac{3}{5}+\frac{1}{5}`, Subject: "数学",
 				RecognitionConfidence: float64Ptr(0.99),
+				OCRSignals:            []string{"fraction"},
 			},
-			want: []OCRRiskReason{OCRRiskFraction},
 		},
 		{
-			name: "unit is high risk",
-			q:    RecognizedQuestion{Question: "长 12.5 cm", Subject: "数学"},
-			want: []OCRRiskReason{OCRRiskDecimalPoint, OCRRiskUnit},
+			name: "clear high confidence decimal and unit auto freeze",
+			q: RecognizedQuestion{
+				Question: "长 12.5 cm", Subject: "数学",
+				RecognitionConfidence: float64Ptr(0.99),
+				OCRSignals:            []string{"decimal_point", "unit"},
+			},
 		},
 		{
-			name: "negative sign is high risk",
-			q:    RecognizedQuestion{Question: "x=-3", Subject: "数学"},
-			want: []OCRRiskReason{OCRRiskNegativeSign},
+			name: "clear high confidence negative sign auto freezes",
+			q: RecognizedQuestion{
+				Question: "x=-3", Subject: "数学",
+				RecognitionConfidence: float64Ptr(0.99),
+				OCRSignals:            []string{"negative_sign"},
+			},
+		},
+		{
+			name: "stale format only reasons are discarded on reevaluation",
+			q: RecognizedQuestion{
+				Question: "(-3)÷0.5= -6 cm", Subject: "数学",
+				RecognitionConfidence: float64Ptr(0.99),
+				ConfirmationReasons: []OCRRiskReason{
+					OCRRiskFraction,
+					OCRRiskDecimalPoint,
+					OCRRiskNegativeSign,
+					OCRRiskUnit,
+				},
+			},
+		},
+		{
+			name: "stale format reason does not mask real uncertainty",
+			q: RecognizedQuestion{
+				Question: "4÷0.5=", Subject: "数学",
+				RecognitionConfidence: float64Ptr(0.99),
+				ConfirmationReasons: []OCRRiskReason{
+					OCRRiskDecimalPoint,
+					OCRRiskEvidenceConflict,
+				},
+			},
+			want: []OCRRiskReason{OCRRiskEvidenceConflict},
 		},
 		{
 			name: "explicit erasure signal is high risk",
-			q:    RecognizedQuestion{Question: "7+8=", Subject: "数学", OCRSignals: []string{"erasure"}},
+			q: RecognizedQuestion{
+				Question: "7+8=", Subject: "数学",
+				RecognitionConfidence: float64Ptr(0.99), OCRSignals: []string{"erasure"},
+			},
 			want: []OCRRiskReason{OCRRiskErasure},
 		},
 		{
 			name: "independent observations disagree",
 			q: RecognizedQuestion{
 				Question: "7+8=", Subject: "数学",
+				RecognitionConfidence:  float64Ptr(0.99),
 				EvidenceTranscriptions: []string{"15", "18", "15"},
 			},
 			want: []OCRRiskReason{OCRRiskEvidenceConflict},
@@ -355,6 +390,34 @@ func TestRecognizedQuestionsProblemAttemptSnapshot_ParentAndSiblingFacts(t *test
 			restored[i].InputDigest != questions[i].InputDigest {
 			t.Fatalf("server-owned facts changed across durable round-trip at %d:\n got=%#v\nwant=%#v", i, restored[i], questions[i])
 		}
+	}
+}
+
+func TestRecognizedQuestionsFromProblemAttemptSnapshot_DropsHistoricalFormatOnlyReasons(t *testing.T) {
+	questions, err := NormalizeRecognizedProblems("submission-stale-format", []RecognizedQuestion{{
+		Question: "4÷0.5=", Subject: "数学",
+		StudentAnswer: "8", AnswerState: AnswerStatePresent,
+		RecognitionConfidence: float64Ptr(0.99),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := RecognizedQuestionsProblemAttemptSnapshot(
+		"mingming", "submission-stale-format", questions, 100,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Persisted shape produced by the previous policy.
+	snapshot.Problems[0].ConfirmationRequired = true
+	snapshot.Problems[0].ConfirmationReasons = []string{string(OCRRiskDecimalPoint)}
+
+	restored, err := RecognizedQuestionsFromProblemAttemptSnapshot(snapshot)
+	if err != nil {
+		t.Fatalf("restore historical Problem/Attempt snapshot: %v", err)
+	}
+	if restored[0].ConfirmationRequired || len(restored[0].ConfirmationReasons) != 0 {
+		t.Fatalf("historical format-only reason survived re-evaluation: %#v", restored[0])
 	}
 }
 

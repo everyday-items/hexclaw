@@ -247,6 +247,7 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 	go func() {
 		defer o.finishWorker()
 		for {
+			reconciledForReplay := false
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -259,14 +260,28 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 					return
 				}
 				defer func() { <-o.sem }()
-				if _, err := o.RunGradingJob(o.gradingBaseContext(), jobID); err != nil {
+				view, err := o.RunGradingJob(o.gradingBaseContext(), jobID)
+				if err != nil {
 					// 阶段失败已由状态机安全落 failed_retryable/failed_terminal；此处仅取证。
 					slog.Warn("K12 批改任务异步推进结束于错误（状态机已落库对应失败态）", "job", jobID, "err", err)
+				}
+				if view.Record != nil && view.Record.Status == k12.GradingStageOutcomeUnknown {
+					run := o.lookup(jobID)
+					reconciled, next, reconcileErr := o.reconcileDurableGradingOutcome(
+						o.gradingBaseContext(), run, view,
+					)
+					if reconcileErr != nil {
+						slog.Warn("K12 批改任务即时结果对账未收敛，保持结果未知且禁止重发",
+							"job", jobID, "stage", view.Fields.FailedStage, "err", reconcileErr)
+					} else if reconciled && next.Record != nil &&
+						next.Record.Status == k12.GradingStageQueued {
+						reconciledForReplay = true
+					}
 				}
 			}()
 
 			o.mu.Lock()
-			if o.rerun[jobID] {
+			if reconciledForReplay || o.rerun[jobID] {
 				delete(o.rerun, jobID)
 				o.mu.Unlock()
 				continue
@@ -651,8 +666,25 @@ func (o *GradingOrchestrator) RecoverGradingJobs(ctx context.Context, agents []s
 			recovered++
 			switch v.Record.Status {
 			case k12.GradingStageAwaitingConfirmation:
-				// 等待态不动（等家长）；锚点增强分支未回位时仅补跑锚点后停。
-				if v.Fields.AnchorState == k12.GradingAnchorPending {
+				// 真实风险继续等待家长；ImageTask 清晰事实还会补跑自动冻结。锚点未回位
+				// 时同一次续跑也会恢复独立锚点分支。
+				if v.Fields.AnchorState == k12.GradingAnchorPending ||
+					(v.Fields.SourceKind == "image_task" &&
+						v.Fields.ConfirmationState == k12.GradingConfirmationPending) {
+					o.StartAsync(jobID)
+				}
+			case k12.GradingStageOutcomeUnknown:
+				reconciled, next, reconcileErr := o.reconcileDurableGradingOutcome(ctx, run, v)
+				if reconcileErr != nil {
+					slog.Warn("K12 批改任务崩溃恢复: 持久结果自动对账失败，保持结果未知且禁止重发",
+						"job", jobID, "stage", v.Fields.FailedStage, "err", reconcileErr)
+					continue
+				}
+				if !reconciled {
+					// 没有结论性持久证据时绝不把查询/重启变成第二次模型调用。
+					continue
+				}
+				if next.Record.Status == k12.GradingStageQueued {
 					o.StartAsync(jobID)
 				}
 			case k12.GradingStageFailedRetryable:
@@ -674,6 +706,211 @@ func (o *GradingOrchestrator) RecoverGradingJobs(ctx context.Context, agents []s
 		}
 	}
 	return recovered, nil
+}
+
+// reconcileDurableGradingOutcome only handles ambiguity that can be settled
+// from immutable local evidence. Provider transport ambiguity without such
+// evidence deliberately remains parked; recovery must never turn a read or
+// restart into a duplicate paid request.
+func (o *GradingOrchestrator) reconcileDurableGradingOutcome(
+	ctx context.Context,
+	run *gradingRun,
+	job GradingJobView,
+) (bool, GradingJobView, error) {
+	if o == nil || run == nil || o.deps.Records == nil ||
+		job.Record.Status != k12.GradingStageOutcomeUnknown {
+		return false, GradingJobView{}, nil
+	}
+	invocations, err := o.deps.Records.ListModelInvocations(ctx, run.agentName, job.Record.RecordID)
+	if err != nil {
+		return false, GradingJobView{}, err
+	}
+	var invocation *k12.ModelInvocation
+	for i := range invocations {
+		candidate := &invocations[i]
+		if candidate.Stage != job.Fields.FailedStage {
+			continue
+		}
+		if invocation == nil || candidate.Attempt > invocation.Attempt {
+			invocation = candidate
+		}
+	}
+	if invocation == nil {
+		return false, GradingJobView{}, nil
+	}
+	switch invocation.Status {
+	case k12.ModelInvocationSent, k12.ModelInvocationSucceeded,
+		k12.ModelInvocationOutcomeUnknown, k12.ModelInvocationReconciled:
+	default:
+		return false, GradingJobView{}, nil
+	}
+	wantRoute := k12.NormalizeGradingModelSnapshot(job.Fields.ModelSnapshot)
+	gotRoute := k12.NormalizeGradingModelSnapshot(invocation.RouteSnapshot)
+	if gotRoute.Provider != wantRoute.Provider || gotRoute.Model != wantRoute.Model ||
+		gotRoute.Route != wantRoute.Route {
+		return false, GradingJobView{}, fmt.Errorf("model invocation route drift")
+	}
+
+	switch job.Fields.FailedStage {
+	case k12.GradingStageRecognizing:
+		wantRequestDigest := modelInvocationDigest(
+			[]byte(k12.GradingStageRecognizing), run.req.Image,
+		)
+		if invocation.RequestDigest != wantRequestDigest {
+			return false, GradingJobView{}, fmt.Errorf("recognition invocation request digest drift")
+		}
+		// SubmissionID is content-derived and shared by separate same-photo Jobs.
+		// A generic Problem/Attempt snapshot can therefore be stale evidence from
+		// another route/attempt. Only this Job's append-only recognition receipt
+		// can prove which result belongs to the ambiguous invocation.
+		receipt, ok := o.readRecognitionReceipt(job.Record.RecordID)
+		if !ok || receipt.AgentName != run.agentName ||
+			receipt.InvocationID != invocation.InvocationID {
+			return false, GradingJobView{}, nil
+		}
+		questions := cloneRecognizedQuestions(receipt.Questions)
+		if len(questions) == 0 {
+			return false, GradingJobView{}, nil
+		}
+		candidate := *run
+		candidate.questions = questions
+		if persistErr := o.persistRecognizedPhotoFacts(
+			ctx, &candidate, job.Fields.SubmissionID,
+		); persistErr != nil {
+			return false, GradingJobView{}, persistErr
+		}
+		if persistErr := o.persistRun(job.Record.RecordID, &candidate); persistErr != nil {
+			return false, GradingJobView{}, persistErr
+		}
+		resultDigest := modelInvocationResultDigest(candidate.questions)
+		reconciled, reconcileErr := o.deps.ReconcileGradingInvocationSucceeded(
+			ctx, run.agentName, job.Record.RecordID, invocation.InvocationID,
+			resultDigest, fmt.Sprintf("questions:%d", len(candidate.questions)), "",
+		)
+		if reconcileErr != nil {
+			return false, GradingJobView{}, reconcileErr
+		}
+		run.questions = candidate.questions
+		if reconciled.Record.Status != k12.GradingStageFailedRetryable {
+			return true, reconciled, nil
+		}
+		queued, retryErr := o.deps.RetryGradingJob(
+			ctx, run.agentName, job.Record.RecordID,
+		)
+		return true, queued, retryErr
+	case k12.GradingStageAssessing:
+		requestRaw, marshalErr := json.Marshal(struct {
+			Request   PhotoGradeRequest    `json:"request"`
+			Questions []RecognizedQuestion `json:"questions"`
+			Anchored  []RecognizedQuestion `json:"anchored,omitempty"`
+		}{run.req, run.questions, run.anchored})
+		if marshalErr != nil {
+			return false, GradingJobView{}, marshalErr
+		}
+		wantRequestDigest := modelInvocationDigest(
+			[]byte(k12.GradingStageAssessing), requestRaw,
+		)
+		if invocation.RequestDigest != wantRequestDigest {
+			return false, GradingJobView{}, fmt.Errorf("assessment invocation request digest drift")
+		}
+		result, durable, resultErr := o.durableAssessmentResult(ctx, run, job)
+		if resultErr != nil {
+			return false, GradingJobView{}, resultErr
+		}
+		if !durable {
+			return false, GradingJobView{}, nil
+		}
+		candidate := *run
+		candidate.result = result
+		if persistErr := o.persistRun(job.Record.RecordID, &candidate); persistErr != nil {
+			return false, GradingJobView{}, persistErr
+		}
+		resultDigest := modelInvocationResultDigest(*result)
+		reconciled, reconcileErr := o.deps.ReconcileGradingInvocationSucceeded(
+			ctx, run.agentName, job.Record.RecordID, invocation.InvocationID,
+			resultDigest, fmt.Sprintf("items:%d mode:%s", len(result.Items), result.Mode), "",
+		)
+		if reconcileErr != nil {
+			return false, GradingJobView{}, reconcileErr
+		}
+		run.result = result
+		if reconciled.Record.Status != k12.GradingStageFailedRetryable {
+			return true, reconciled, nil
+		}
+		queued, retryErr := o.deps.RetryGradingJob(
+			ctx, run.agentName, job.Record.RecordID,
+		)
+		return true, queued, retryErr
+	default:
+		return false, GradingJobView{}, nil
+	}
+}
+
+// durableAssessmentResult accepts only a complete run artifact or an exact
+// set of immutable per-item receipts. The latter is replayed through a
+// receipt-only assessor, so rebuilding the page result cannot invoke a model.
+func (o *GradingOrchestrator) durableAssessmentResult(
+	ctx context.Context,
+	run *gradingRun,
+	job GradingJobView,
+) (*PhotoGradeResult, bool, error) {
+	if run.result != nil {
+		if job.Fields.BudgetSnapshot.IsFrozen() {
+			receipts, err := o.deps.Records.ListGradingAssessmentItems(
+				ctx, run.agentName, job.Record.RecordID,
+			)
+			if err != nil || validateGradingAssessmentExactSet(*run.result, receipts) != nil {
+				return nil, false, nil
+			}
+		}
+		result := *run.result
+		return &result, true, nil
+	}
+	if !job.Fields.BudgetSnapshot.IsFrozen() {
+		return nil, false, nil
+	}
+	receipts, err := o.deps.Records.ListGradingAssessmentItems(
+		ctx, run.agentName, job.Record.RecordID,
+	)
+	if err != nil || validateFrozenAssessReceiptSet(run, receipts) != nil {
+		return nil, false, nil
+	}
+	byProblem := make(map[string]k12.GradingAssessmentItem, len(receipts))
+	for _, receipt := range receipts {
+		byProblem[receipt.ProblemID] = receipt
+	}
+	replayDeps := o.deps
+	replayDeps.Recognizer = presetRecognizer{questions: run.questions}
+	switch {
+	case run.anchored != nil:
+		replayDeps.AnswerAnchorer = presetAnchorer{questions: run.anchored}
+	case run.anchorFailed:
+		replayDeps.AnswerAnchorer = presetAnchorer{err: fmt.Errorf("anchor checkpoint degraded")}
+	default:
+		replayDeps.AnswerAnchorer = nil
+	}
+	if run.textOnly {
+		replayDeps.PhotoAnnotator = nil
+	}
+	result, err := replayDeps.gradeFrozenHomeworkPhotoWithAssessor(
+		ctx,
+		run.req,
+		job.Fields.BudgetSnapshot.ItemConcurrency,
+		func(_ context.Context, _ PhotoGradeRequest, _ PhotoMode, question RecognizedQuestion) (PhotoGradeItem, error) {
+			receipt, ok := byProblem[question.ProblemID]
+			if !ok {
+				return PhotoGradeItem{}, fmt.Errorf(
+					"%w: missing receipt problem=%s",
+					ErrGradingAssessmentExactSet, question.ProblemID,
+				)
+			}
+			return replayGradingAssessmentItem(question, receipt)
+		},
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	return &result, true, nil
 }
 
 // --- 家长修正应用 ---
@@ -811,6 +1048,15 @@ type gradingRecognitionAuditFile struct {
 	ArchivedAt      int64                `json:"archived_at"`
 }
 
+type gradingRecognitionReceiptFile struct {
+	JobID           string               `json:"job_id"`
+	InvocationID    string               `json:"invocation_id"`
+	AgentName       string               `json:"agent_name"`
+	CanonicalDigest string               `json:"canonical_digest"`
+	Questions       []RecognizedQuestion `json:"questions"`
+	CreatedAt       int64                `json:"created_at"`
+}
+
 func (o *GradingOrchestrator) runPath(jobID string, file string) string {
 	return filepath.Join(o.runDir, jobID, file)
 }
@@ -925,8 +1171,68 @@ func (o *GradingOrchestrator) recognitionAuditPath(jobID string) string {
 	return filepath.Join(o.runDir, "recognition-audit", jobID+".json")
 }
 
-// archiveRecognitionFacts 是终态 append-only 审计载体。它不保存原图和最终生成内容，
-// 只保存识别 raw/canonical 及确认所需结构事实；已存在时不覆盖，避免晚到调用改写历史。
+func (o *GradingOrchestrator) recognitionReceiptPath(jobID string) string {
+	return filepath.Join(o.runDir, "recognition-results", jobID+".json")
+}
+
+// persistRecognitionReceipt writes the immutable provider result before any
+// shared Submission projection. The Job+Invocation binding is the only local
+// evidence allowed to reconcile an ambiguous recognizing call.
+func (o *GradingOrchestrator) persistRecognitionReceipt(jobID, invocationID string, run *gradingRun) error {
+	if o.runDir == "" || run == nil || strings.TrimSpace(jobID) == "" ||
+		strings.TrimSpace(invocationID) == "" || len(run.questions) == 0 {
+		return nil
+	}
+	path := o.recognitionReceiptPath(jobID)
+	if _, err := os.Stat(path); err == nil {
+		existing, ok := o.readRecognitionReceipt(jobID)
+		wantDigest := CanonicalRecognizedQuestionsDigest(run.questions)
+		if !ok || existing.InvocationID != invocationID ||
+			existing.AgentName != run.agentName || existing.CanonicalDigest != wantDigest {
+			return fmt.Errorf("识别结果回执与当前 Job 调用事实冲突")
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("检查识别结果回执: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("创建识别结果回执目录: %w", err)
+	}
+	receipt := gradingRecognitionReceiptFile{
+		JobID: jobID, InvocationID: invocationID, AgentName: run.agentName,
+		CanonicalDigest: CanonicalRecognizedQuestionsDigest(run.questions),
+		Questions:       cloneRecognizedQuestions(run.questions), CreatedAt: time.Now().Unix(),
+	}
+	raw, err := json.Marshal(receipt)
+	if err != nil {
+		return fmt.Errorf("marshal 识别结果回执: %w", err)
+	}
+	if err := atomicWriteFileNoReplace(path, raw); err != nil {
+		return fmt.Errorf("写识别结果回执: %w", err)
+	}
+	return nil
+}
+
+func (o *GradingOrchestrator) readRecognitionReceipt(jobID string) (gradingRecognitionReceiptFile, bool) {
+	if o.runDir == "" || strings.TrimSpace(jobID) == "" {
+		return gradingRecognitionReceiptFile{}, false
+	}
+	raw, err := os.ReadFile(o.recognitionReceiptPath(jobID))
+	if err != nil {
+		return gradingRecognitionReceiptFile{}, false
+	}
+	var receipt gradingRecognitionReceiptFile
+	if json.Unmarshal(raw, &receipt) != nil || receipt.JobID != jobID ||
+		strings.TrimSpace(receipt.InvocationID) == "" || len(receipt.Questions) == 0 ||
+		receipt.CanonicalDigest != CanonicalRecognizedQuestionsDigest(receipt.Questions) {
+		return gradingRecognitionReceiptFile{}, false
+	}
+	return receipt, true
+}
+
+// archiveRecognitionFacts is the terminal append-only audit. Unlike the
+// transient invocation receipt it records the final confirmed recognition
+// facts and therefore must only be created during ReleaseGradingRun.
 func (o *GradingOrchestrator) archiveRecognitionFacts(jobID string, run *gradingRun) error {
 	if o.runDir == "" || run == nil || strings.TrimSpace(jobID) == "" || len(run.questions) == 0 {
 		return nil

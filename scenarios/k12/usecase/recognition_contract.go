@@ -43,11 +43,7 @@ const (
 const ocrConfidenceConfirmationThreshold = 0.90
 
 var (
-	fractionRiskPattern = regexp.MustCompile(`(?i)\\frac\s*\{|\d+\s*/\s*\d+|[零〇一二两三四五六七八九十百]+\s*分之\s*[零〇一二两三四五六七八九十百]+`)
-	decimalRiskPattern  = regexp.MustCompile(`\d[.．]\d`)
-	negativeRiskPattern = regexp.MustCompile(`(?:^|[=(（+×÷*/\s])[-−]\s*\d`)
-	unitRiskPattern     = regexp.MustCompile(`(?i)\d(?:[\d.]*\d)?\s*(?:mm|cm|dm|km|mg|kg|ml|mL|L|m²|cm²|m³|cm³|毫米|厘米|分米|千米|米|毫克|克|千克|毫升|升|平方米|平方厘米|立方米|立方厘米)(?:\b|$|[^[:alpha:]])`)
-	latexFraction       = regexp.MustCompile(`\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}`)
+	latexFraction = regexp.MustCompile(`\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}`)
 )
 
 var ocrReasonOrder = []OCRRiskReason{
@@ -63,26 +59,22 @@ var ocrReasonOrder = []OCRRiskReason{
 	OCRRiskCanonicalInvalid,
 }
 
-// EvaluateOCRConfirmationRisk 以确定性规则生成确认原因。模型即使自报高置信度，也不能
-// 绕过分数、单位、负号、小数点、涂改或多证据冲突等格式门。
+// EvaluateOCRConfirmationRisk 以确定性规则生成确认原因。分数、单位、负号和小数点
+// 是识别到的内容形态，不等于识别不确定；清晰且高置信的格式事实自动冻结。只有证据
+// 缺失/不足、涂改、字迹不清或多观察冲突才要求家长确认。
 func EvaluateOCRConfirmationRisk(q RecognizedQuestion) RecognizedQuestion {
 	q = normalizeRecognizedQuestionFacts(q)
 	reasons := make(map[OCRRiskReason]struct{}, len(q.ConfirmationReasons)+4)
 	for _, reason := range q.ConfirmationReasons {
-		if knownOCRRiskReason(reason) {
+		// Re-evaluate checkpoints written by the former policy. A persisted
+		// fraction/decimal/negative/unit reason describes content shape only and
+		// must not survive as independent uncertainty.
+		if independentOCRUncertaintyReason(reason) {
 			reasons[reason] = struct{}{}
 		}
 	}
 	for _, signal := range q.OCRSignals {
 		switch strings.ToLower(strings.TrimSpace(signal)) {
-		case "fraction", "fraction_bar":
-			reasons[OCRRiskFraction] = struct{}{}
-		case "decimal", "decimal_point":
-			reasons[OCRRiskDecimalPoint] = struct{}{}
-		case "negative", "negative_sign":
-			reasons[OCRRiskNegativeSign] = struct{}{}
-		case "unit", "measurement_unit":
-			reasons[OCRRiskUnit] = struct{}{}
 		case "erasure", "erasure_detected":
 			reasons[OCRRiskErasure] = struct{}{}
 		case "conflict", "evidence_conflict":
@@ -90,22 +82,6 @@ func EvaluateOCRConfirmationRisk(q RecognizedQuestion) RecognizedQuestion {
 		case "unclear", "unclear_handwriting":
 			reasons[OCRRiskUnclearHandwriting] = struct{}{}
 		}
-	}
-	text := strings.Join([]string{
-		q.RawTranscription, q.CanonicalMarkdown,
-		q.AnswerRawTranscription, q.AnswerCanonicalMarkdown,
-	}, "\n")
-	if fractionRiskPattern.MatchString(text) {
-		reasons[OCRRiskFraction] = struct{}{}
-	}
-	if decimalRiskPattern.MatchString(text) {
-		reasons[OCRRiskDecimalPoint] = struct{}{}
-	}
-	if negativeRiskPattern.MatchString(text) {
-		reasons[OCRRiskNegativeSign] = struct{}{}
-	}
-	if unitRiskPattern.MatchString(text) {
-		reasons[OCRRiskUnit] = struct{}{}
 	}
 	if distinctEvidenceCount(q.EvidenceTranscriptions) > 1 || distinctEvidenceCount(q.AnswerEvidenceTranscriptions) > 1 {
 		reasons[OCRRiskEvidenceConflict] = struct{}{}
@@ -123,7 +99,7 @@ func EvaluateOCRConfirmationRisk(q RecognizedQuestion) RecognizedQuestion {
 		(q.AnswerState == AnswerStatePresent && !CanonicalMarkdownValid(q.AnswerCanonicalMarkdown)) {
 		reasons[OCRRiskCanonicalInvalid] = struct{}{}
 	}
-	q.ConfirmationReasons = q.ConfirmationReasons[:0]
+	q.ConfirmationReasons = nil
 	for _, reason := range ocrReasonOrder {
 		if _, ok := reasons[reason]; ok {
 			q.ConfirmationReasons = append(q.ConfirmationReasons, reason)
@@ -133,13 +109,18 @@ func EvaluateOCRConfirmationRisk(q RecognizedQuestion) RecognizedQuestion {
 	return q
 }
 
-func knownOCRRiskReason(reason OCRRiskReason) bool {
-	for _, known := range ocrReasonOrder {
-		if reason == known {
-			return true
-		}
+func independentOCRUncertaintyReason(reason OCRRiskReason) bool {
+	switch reason {
+	case OCRRiskErasure,
+		OCRRiskEvidenceConflict,
+		OCRRiskLowConfidence,
+		OCRRiskUnclearHandwriting,
+		OCRRiskSubjectUndetermined,
+		OCRRiskCanonicalInvalid:
+		return true
+	default:
+		return false
 	}
-	return false
 }
 
 func distinctEvidenceCount(values []string) int {

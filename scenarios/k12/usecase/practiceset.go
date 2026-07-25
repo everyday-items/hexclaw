@@ -59,6 +59,13 @@ func (d Deps) GetPracticeSet(ctx context.Context, agentName, recordID string) (P
 		return PracticeSetView{}, fmt.Errorf("usecase: 练习集不存在或不属于该实例")
 	}
 	f, _ := k12.ParsePracticeSetFields(rec.Fields)
+	if f.DeliveryBatchID != "" {
+		batch, batchErr := d.Records.GetDeliveryBatch(ctx, agentName, f.DeliveryBatchID)
+		if batchErr != nil {
+			return PracticeSetView{}, fmt.Errorf("usecase: 取练习集投递批次: %w", batchErr)
+		}
+		f.DeliveryStatus = string(batch.Status)
+	}
 	return PracticeSetView{Record: rec, Fields: f}, nil
 }
 
@@ -116,23 +123,40 @@ func blockedReasonFor(status string) string {
 // 从 draft 一步到 assigned（待完成）；confirmed 仅作为审计中间态由本命令隐式写入，
 // 不存在独立的家长确认命令。固化逐题跳过非 verified 项（skipped 返回并持久化），
 // 整卷不被拒绝；仅当一道 verified 题都没有时拒绝出卷。
-// via: "print"（打印，delivery 保持 not_sent）| "send"（发送私聊，须带 target）。
-func (d Deps) FinalizeBasket(ctx context.Context, agentName, recordID, via, target string) (PracticeSetView, int, error) {
+// via: "print"（打印，delivery 保持 not_sent）| "send"（服务端解析全部 active direct bindings）。
+// 末尾可变参数只为源码兼容旧调用点；其中的历史 target 值会被忽略，绝不参与解析或持久化。
+func (d Deps) FinalizeBasket(ctx context.Context, agentName, recordID, via string, _ ...string) (PracticeSetView, int, error) {
 	v, err := d.GetPracticeSet(ctx, agentName, recordID)
 	if err != nil {
 		return PracticeSetView{}, 0, err
 	}
-	if v.Record.Status != k12.PracticeStatusDraft {
-		return PracticeSetView{}, 0, fmt.Errorf("usecase: 只有待打印（draft）练习集可固化出卷，当前 %s", v.Record.Status)
-	}
+	var deliveryTargets []ResolvedDeliveryTarget
 	switch via {
 	case "print":
 	case "send":
-		if target == "" {
-			return PracticeSetView{}, 0, fmt.Errorf("usecase: 发送固化必须提供私聊目标")
+		// A completed HTTP replay reads the frozen batch and never consults the
+		// current mutable binding set.
+		if v.Record.Status == k12.PracticeStatusAssigned &&
+			v.Fields.FinalizedVia == "send" && v.Fields.DeliveryBatchID != "" {
+			return v, v.Fields.SkippedBlockedCount, nil
+		}
+		deliveryTargets, err = d.ResolveDeliveryTargets(ctx, agentName)
+		if err != nil {
+			return PracticeSetView{}, 0, err
 		}
 	default:
 		return PracticeSetView{}, 0, fmt.Errorf("usecase: 固化方式非法 %q（print/send）", via)
+	}
+	if v.Record.Status != k12.PracticeStatusDraft {
+		// Recovery for a crash after the PracticeSet reached assigned but before
+		// its batch link was written. No provider request can have happened
+		// without the batch, so resolving the current bindings is still safe.
+		if via == "send" && v.Record.Status == k12.PracticeStatusAssigned &&
+			v.Fields.FinalizedVia == "send" && v.Fields.DeliveryBatchID == "" {
+			v, err = d.finishPracticeSetDelivery(ctx, v, deliveryTargets)
+			return v, v.Fields.SkippedBlockedCount, err
+		}
+		return PracticeSetView{}, 0, fmt.Errorf("usecase: 只有待打印（draft）练习集可固化出卷，当前 %s", v.Record.Status)
 	}
 	publishable, skipped := k12.PublishableItems(v.Fields)
 	if len(publishable) == 0 {
@@ -156,11 +180,8 @@ func (d Deps) FinalizeBasket(ctx context.Context, agentName, recordID, via, targ
 	if v.Fields.Title == basketTitle {
 		v.Fields.Title = k12.GeneratePaperTitle(v.Fields, ts)
 	}
-	// 呈现物（§4.13）：卷面号（OCR 友好双 ID）、按学科分组的卷面题号、固化时间与方式。
-	v.Fields.PaperNo, err = d.Records.ReservePracticePaperNo(ctx, agentName, ts.Unix())
-	if err != nil {
-		return PracticeSetView{}, 0, fmt.Errorf("usecase: 预占卷面号: %w", err)
-	}
+	// 呈现物（§4.13）：按学科分组的卷面题号、固化时间与方式。
+	// send 的卷面号由下面的跨聚合事务分配；print 仍走原生打印命令的兼容路径。
 	k12.AssignPaperSeqs(v.Fields.Items)
 	// #4c（2026-07-18）：入卷题铸造独立 practice_problem_id——变式题面≠原题，
 	// 复批 Attempt 归属铸造 Problem，不挂来源错题；SourceProblemID 保留为 derived_from。
@@ -172,6 +193,57 @@ func (d Deps) FinalizeBasket(ctx context.Context, agentName, recordID, via, targ
 	v.Fields.FinalizedAt = ts.Unix()
 	v.Fields.FinalizedVia = via
 	v.Fields.SourceKind = k12.AggregateSourceKind(v.Fields, v.Fields.SourceKind)
+
+	if via == "send" {
+		term := ""
+		if d.Profiles != nil {
+			if profile, profileErr := d.GetProfile(ctx, agentName); profileErr == nil {
+				term = profile.GradeTerm
+			}
+		}
+		batch, replay, finalizeErr := d.Records.FinalizePracticeSetWithDeliveryBatch(
+			ctx,
+			agentName,
+			recordID,
+			v.Record.Version,
+			ts.Unix(),
+			v.Fields,
+			func(factoryCtx context.Context, fields k12.PracticeSetFields) (k12.DeliveryBatch, error) {
+				markdown := k12.RenderPaperMarkdown(
+					fields,
+					k12.PaperKindQuestion,
+					k12.PaperMeta{Term: term, Date: ts, Preview: false},
+				)
+				return d.buildPreparedTextBatch(
+					factoryCtx,
+					agentName,
+					"practice_set_question",
+					recordID,
+					markdown,
+					deliveryTargets,
+				)
+			},
+		)
+		if finalizeErr != nil {
+			return PracticeSetView{}, 0, finalizeErr
+		}
+		if !replay {
+			if _, sendErr := d.sendDeliveryBatch(ctx, batch); sendErr != nil {
+				current, getErr := d.GetPracticeSet(ctx, agentName, recordID)
+				if getErr != nil {
+					return PracticeSetView{}, 0, getErr
+				}
+				return current, skipped, sendErr
+			}
+		}
+		current, getErr := d.GetPracticeSet(ctx, agentName, recordID)
+		return current, skipped, getErr
+	}
+
+	v.Fields.PaperNo, err = d.Records.ReservePracticePaperNo(ctx, agentName, ts.Unix())
+	if err != nil {
+		return PracticeSetView{}, 0, fmt.Errorf("usecase: 预占卷面号: %w", err)
+	}
 	// 隐式 confirmed（审计中间态）→ assigned，两次状态写入同一命令内完成。
 	if err := d.savePracticeFields(ctx, v, k12.PracticeStatusConfirmed); err != nil {
 		return PracticeSetView{}, 0, err
@@ -180,18 +252,46 @@ func (d Deps) FinalizeBasket(ctx context.Context, agentName, recordID, via, targ
 	if err != nil {
 		return PracticeSetView{}, 0, err
 	}
-	if via == "send" {
-		// §3.12：「记录 delivery id、目标、状态和去重键；渠道失败不回滚领域对象」——
-		// 当前无真实投递器接线，不得虚标 delivered：置 pending，真实投递结果由
-		// ChannelPort 适配器接线后回写（delivered / failed），固化领域对象不受投递影响。
-		v.Fields.DeliveryStatus = k12.PracticeDeliveryPending
-		v.Fields.DeliveryTarget = target
-	}
 	if err := d.savePracticeFields(ctx, v, k12.PracticeStatusAssigned); err != nil {
 		return PracticeSetView{}, 0, err
 	}
 	v, err = d.GetPracticeSet(ctx, agentName, recordID)
 	return v, skipped, err
+}
+
+func (d Deps) finishPracticeSetDelivery(
+	ctx context.Context,
+	v PracticeSetView,
+	targets []ResolvedDeliveryTarget,
+) (PracticeSetView, error) {
+	paper, err := d.RenderPracticePaper(
+		ctx, v.Record.AgentName, v.Record.RecordID, k12.PaperKindQuestion,
+	)
+	if err != nil {
+		return v, err
+	}
+	batch, _, err := d.prepareAndSendTextBatchWithTargets(
+		ctx,
+		v.Record.AgentName,
+		"practice_set_question",
+		v.Record.RecordID,
+		paper.Markdown,
+		targets,
+	)
+	if err != nil {
+		return v, err
+	}
+	v, err = d.GetPracticeSet(ctx, v.Record.AgentName, v.Record.RecordID)
+	if err != nil {
+		return PracticeSetView{}, err
+	}
+	v.Fields.DeliveryBatchID = batch.BatchID
+	v.Fields.DeliveryStatus = string(batch.Status)
+	v.Fields.DeliveryTarget = ""
+	if err := d.savePracticeFields(ctx, v, k12.PracticeStatusAssigned); err != nil {
+		return PracticeSetView{}, err
+	}
+	return d.GetPracticeSet(ctx, v.Record.AgentName, v.Record.RecordID)
 }
 
 // basketTitle 待打印篮的固定标题；单 Learner 单篮的查找锚点之一。

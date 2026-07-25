@@ -42,6 +42,7 @@ func verifiedItem(id, q, a string) k12.PracticeItem {
 // TestPracticeSetFullLifecycle 覆盖 draft→confirmed→assigned→submitted→graded→closed 全链路。
 func TestPracticeSetFullLifecycle(t *testing.T) {
 	d := newDataDeps(t)
+	attachDeliveredPracticeTransport(&d, 1)
 	ctx := context.Background()
 	f := k12.PracticeSetFields{
 		SourceKind: k12.PracticeSourceWeekly, Title: "本周复习卷 · 07/18",
@@ -67,7 +68,7 @@ func TestPracticeSetFullLifecycle(t *testing.T) {
 	}
 
 	// 2026-07-18 购物车裁决：打印/发送即确认——finalize 一步固化，无独立 confirm/assign。
-	finalized, skipped, err := d.FinalizeBasket(ctx, "xiaoming", id, "send", "钉钉私聊·小明妈妈")
+	finalized, skipped, err := d.FinalizeBasket(ctx, "xiaoming", id, "send")
 	if err != nil {
 		t.Fatalf("固化出卷: %v", err)
 	}
@@ -95,8 +96,11 @@ func TestPracticeSetFullLifecycle(t *testing.T) {
 	if final.Record.Status != k12.PracticeStatusClosed {
 		t.Fatalf("最终应为 closed，got %s", final.Record.Status)
 	}
-	if final.Fields.DeliveryTarget != "钉钉私聊·小明妈妈" {
-		t.Fatalf("发送目标应保留，got %q", final.Fields.DeliveryTarget)
+	if final.Fields.DeliveryTarget != "" {
+		t.Fatalf("新发送流程不应持久化展示标签，got %q", final.Fields.DeliveryTarget)
+	}
+	if final.Fields.DeliveryBatchID == "" {
+		t.Fatal("发送后的练习卷应关联冻结的 delivery batch")
 	}
 }
 
@@ -157,6 +161,7 @@ func TestPracticeSetVerifiedNeedsEvidence(t *testing.T) {
 // TestPracticeSetCancel 只有 draft/confirmed 可取消。
 func TestPracticeSetCancel(t *testing.T) {
 	d := newDataDeps(t)
+	attachDeliveredPracticeTransport(&d, 1)
 	ctx := context.Background()
 	f := k12.PracticeSetFields{SourceKind: k12.PracticeSourceWeekly, Title: "卷",
 		Items: []k12.PracticeItem{verifiedItem("q1", "题", "答")}}
@@ -173,7 +178,7 @@ func TestPracticeSetCancel(t *testing.T) {
 	f2 := k12.PracticeSetFields{SourceKind: k12.PracticeSourceWeekly, Title: "卷2",
 		Items: []k12.PracticeItem{verifiedItem("q1", "题2", "答2")}}
 	id2, _, _ := d.CreatePracticeSet(ctx, "xiaoming", "s", f2)
-	if _, _, err := d.FinalizeBasket(ctx, "xiaoming", id2, "send", "t"); err != nil {
+	if _, _, err := d.FinalizeBasket(ctx, "xiaoming", id2, "send"); err != nil {
 		t.Fatalf("固化: %v", err)
 	}
 	submitWholeSet(t, d, "xiaoming", id2)

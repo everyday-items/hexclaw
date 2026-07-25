@@ -28,9 +28,7 @@ func TestBug20260718_ArchivedWorkBlocksSameTitleRecreate(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("首次创建: created=%v err=%v", created, err)
 	}
-	if err := d.ArchiveCreativeWork(ctx, "xiaoming", id1); err != nil {
-		t.Fatalf("归档: %v", err)
-	}
+	forceCreativeWorkStatus(t, d, id1, k12.WorkStatusArchived)
 
 	// 归档后同题名重建：必须成功产出新记录，而不是去重命中归档件。
 	f2 := k12.CreativeWorkFields{
@@ -65,9 +63,7 @@ func TestBug20260718_ArchivedWorkBlocksSameTitleRecreate(t *testing.T) {
 	}
 
 	// 二次归档-重建循环也必须可行（tombstone 键不得相互碰撞）。
-	if err := d.ArchiveCreativeWork(ctx, "xiaoming", id2); err != nil {
-		t.Fatalf("二次归档: %v", err)
-	}
+	forceCreativeWorkStatus(t, d, id2, k12.WorkStatusArchived)
 	_, created4, err := d.CreateCreativeWork(ctx, "xiaoming", "s", f2)
 	if err != nil || !created4 {
 		t.Fatalf("二次归档后重建: created=%v err=%v", created4, err)

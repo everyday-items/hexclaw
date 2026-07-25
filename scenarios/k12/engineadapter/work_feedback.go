@@ -84,7 +84,7 @@ func (a *SolveAdapter) GenerateWorkFeedback(ctx context.Context, req usecase.Wor
 	}
 	out, err := a.workFeedbackGen(ctx, subject, prompt, req.Grade)
 	if err != nil {
-		return usecase.WorkFeedbackOutput{}, err
+		return usecase.WorkFeedbackOutput{}, providerResponseError(err)
 	}
 	return usecase.WorkFeedbackOutput{Feedback: stripReports(out), SkillStamp: stamp}, nil
 }
@@ -104,7 +104,7 @@ func (a *SolveAdapter) generateArtFeedback(ctx context.Context, req usecase.Work
 	}
 	out, err := a.workFeedbackVision(ctx, image, prompt)
 	if err != nil {
-		return "", err
+		return "", providerResponseError(err)
 	}
 	return stripReports(out), nil
 }

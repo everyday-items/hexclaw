@@ -4,11 +4,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 
+	"github.com/hexagon-codes/toolkit/util/idgen"
+
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 )
 
 // WorkFeedbackRequest 是作品点评生成请求：只携带作品的可见证据（题目要求、原文/原图、
@@ -41,6 +46,53 @@ type WorkFeedbackGenerator interface {
 	GenerateWorkFeedback(ctx context.Context, req WorkFeedbackRequest) (WorkFeedbackOutput, error)
 }
 
+type WorkFeedbackRouteResolver func(
+	context.Context,
+	string,
+) (k12.ImageTaskRouteSnapshot, error)
+
+type workFeedbackRouteSnapshotContextKey struct{}
+
+// withWorkFeedbackRouteSnapshot carries the owning ImageTask's frozen route
+// into work promotion. It is deliberately separate from the provider-facing
+// GradingModelSnapshot: this value is consumed while preparing the durable
+// invocation, before any provider call can happen.
+func withWorkFeedbackRouteSnapshot(
+	ctx context.Context,
+	snapshot k12.ImageTaskRouteSnapshot,
+) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(
+		ctx,
+		workFeedbackRouteSnapshotContextKey{},
+		k12.NormalizeImageTaskRouteSnapshot(snapshot),
+	)
+}
+
+func workFeedbackRouteSnapshotFromContext(
+	ctx context.Context,
+	workType string,
+) (k12.ImageTaskRouteSnapshot, bool) {
+	if ctx == nil {
+		return k12.ImageTaskRouteSnapshot{}, false
+	}
+	snapshot, ok := ctx.Value(workFeedbackRouteSnapshotContextKey{}).(k12.ImageTaskRouteSnapshot)
+	if !ok {
+		return k12.ImageTaskRouteSnapshot{}, false
+	}
+	snapshot = k12.NormalizeImageTaskRouteSnapshot(snapshot)
+	if strings.TrimSpace(workType) == k12.WorkTypeArt {
+		snapshot.Capability = "text+vision"
+		snapshot.PromptVersion = "art-feedback-v1"
+	} else {
+		snapshot.Capability = "text"
+		snapshot.PromptVersion = "writing-feedback-v1"
+	}
+	return snapshot, true
+}
+
 // GenerateWorkFeedback 对 draft/revised 作品调 Skill Executor 生成证据化点评并落库
 // （→ feedback_ready，来源标记 ai，与家长手写 parent 区分）。
 // 失败路径全部诚实报错：未接线、生成失败、违反 INV-011 都不写库。
@@ -62,8 +114,14 @@ func (d Deps) GenerateWorkFeedback(ctx context.Context, agentName, recordID stri
 
 	last := v.Fields.Versions[len(v.Fields.Versions)-1]
 	if v.Fields.WorkType == k12.WorkTypeWriting && strings.TrimSpace(last.SourceAssetID) != "" {
-		if err := validateConfirmedWritingFeedbackSnapshot(last); err != nil {
-			return CreativeWorkView{}, err
+		var validateErr error
+		if strings.TrimSpace(v.Fields.SourceIntakeID) != "" {
+			validateErr = d.validatePromotedWritingFeedbackSnapshot(ctx, v, last)
+		} else {
+			validateErr = validateConfirmedWritingFeedbackSnapshot(last)
+		}
+		if validateErr != nil {
+			return CreativeWorkView{}, validateErr
 		}
 	}
 	req := WorkFeedbackRequest{
@@ -89,18 +147,207 @@ func (d Deps) GenerateWorkFeedback(ctx context.Context, agentName, recordID stri
 		}
 	}
 
-	out, err := gen.GenerateWorkFeedback(ctx, req)
+	invocation, replay, err := d.prepareWorkFeedbackInvocation(ctx, v, last, req)
 	if err != nil {
-		return CreativeWorkView{}, fmt.Errorf("%w: 作品点评生成失败: %v", ErrSolveFailed, err)
+		return CreativeWorkView{}, err
+	}
+	var out WorkFeedbackOutput
+	if replay != nil {
+		out = *replay
+	} else {
+		providerCtx := ctx
+		if invocation != nil {
+			if _, err := d.Records.MarkImageTaskInvocationSent(
+				ctx, agentName, invocation.InvocationID,
+				"creative-work:"+recordID+":feedback",
+			); err != nil {
+				return CreativeWorkView{}, err
+			}
+			var cancelProvider context.CancelFunc
+			providerCtx, cancelProvider = imageTaskProviderContext(
+				ctx,
+				invocation.RouteSnapshot,
+			)
+			defer cancelProvider()
+		}
+		out, err = gen.GenerateWorkFeedback(providerCtx, req)
+		if err != nil {
+			if invocation != nil {
+				unknown := sentProviderOutcomeUnknown(err, providerCtx.Err())
+				_ = d.Records.FailWorkFeedbackInvocation(
+					context.WithoutCancel(ctx), agentName, invocation.InvocationID,
+					"work_feedback_provider_failed", unknown, !unknown,
+				)
+			}
+			return CreativeWorkView{}, fmt.Errorf("%w: 作品点评生成失败: %v", ErrSolveFailed, err)
+		}
 	}
 	feedback := strings.TrimSpace(out.Feedback)
 	if feedback == "" {
+		if invocation != nil && replay == nil {
+			_ = d.Records.FailWorkFeedbackInvocation(
+				context.WithoutCancel(ctx), agentName, invocation.InvocationID,
+				"work_feedback_empty", false, true,
+			)
+		}
 		return CreativeWorkView{}, fmt.Errorf("%w: 作品点评生成为空", ErrSolveFailed)
 	}
 	if reason := workFeedbackInvariantViolation(feedback); reason != "" {
+		if invocation != nil && replay == nil {
+			_ = d.Records.FailWorkFeedbackInvocation(
+				context.WithoutCancel(ctx), agentName, invocation.InvocationID,
+				"work_feedback_contract_invalid", false, true,
+			)
+		}
 		return CreativeWorkView{}, fmt.Errorf("%w: 生成点评违反 INV-011（%s），已拒绝入库", ErrSolveFailed, reason)
 	}
-	return d.attachFeedbackWithSource(ctx, agentName, recordID, feedback, k12.FeedbackSourceAI, strings.TrimSpace(out.SkillStamp))
+	if invocation != nil && replay == nil {
+		resultJSON, marshalErr := json.Marshal(out)
+		if marshalErr != nil {
+			return CreativeWorkView{}, marshalErr
+		}
+		if err := d.Records.CompleteWorkFeedbackInvocation(
+			ctx, agentName, invocation.InvocationID, digestJSON(out), string(resultJSON),
+		); err != nil {
+			_ = d.Records.FailWorkFeedbackInvocation(
+				context.WithoutCancel(ctx), agentName, invocation.InvocationID,
+				"work_feedback_receipt_commit_failed", true, false,
+			)
+			return CreativeWorkView{}, err
+		}
+	}
+	return d.attachAIFeedback(ctx, agentName, recordID, feedback, strings.TrimSpace(out.SkillStamp))
+}
+
+func (d Deps) validatePromotedWritingFeedbackSnapshot(
+	ctx context.Context,
+	work CreativeWorkView,
+	version k12.CreativeWorkVersion,
+) error {
+	if d.Records == nil || work.Record == nil {
+		return fmt.Errorf("%w: 作文图片接入证据存储未配置", ErrInvalidInput)
+	}
+	intake, err := d.Records.GetCreativeWorkIntake(
+		ctx, work.Record.AgentName, work.Fields.SourceIntakeID,
+	)
+	if err != nil {
+		return err
+	}
+	if intake.AgentName != work.Record.AgentName ||
+		intake.Status != k12.CreativeWorkIntakePromoted ||
+		intake.PromotedWorkID != work.Record.RecordID ||
+		intake.WorkType != k12.WorkTypeWriting ||
+		intake.OCREvidence == nil ||
+		len(intake.SourceAssetRefs) == 0 ||
+		version.SourceAssetID != intake.SourceAssetRefs[0] ||
+		strings.TrimSpace(version.ContentMarkdown) == "" ||
+		version.ContentMarkdown != intake.OCREvidence.CanonicalContent ||
+		version.OCRVersion != intake.OCREvidence.CanonicalVersion ||
+		version.OCRConfirmedDigest != intake.OCREvidence.CanonicalDigest ||
+		version.ContentConfirmedAt <= 0 ||
+		intake.OCREvidence.FrozenAt <= 0 {
+		return fmt.Errorf("%w: 作文图片接入的 canonical OCR 证据不完整或已漂移", ErrInvalidInput)
+	}
+	sum := sha256.Sum256([]byte(version.ContentMarkdown))
+	if "sha256:"+hex.EncodeToString(sum[:]) != version.OCRConfirmedDigest {
+		return fmt.Errorf("%w: 作文正文与接入 OCR 确认摘要不一致", ErrInvalidInput)
+	}
+	switch intake.ConfirmationProvenance {
+	case k12.CreativeWorkEvidenceAutoFreeze,
+		k12.CreativeWorkParentConfirmed,
+		k12.CreativeWorkParentCorrected:
+		return nil
+	default:
+		return fmt.Errorf("%w: 作文图片接入缺少冻结 provenance", ErrInvalidInput)
+	}
+}
+
+func (d Deps) prepareWorkFeedbackInvocation(
+	ctx context.Context,
+	work CreativeWorkView,
+	version k12.CreativeWorkVersion,
+	req WorkFeedbackRequest,
+) (*k12.ImageTaskInvocation, *WorkFeedbackOutput, error) {
+	if strings.TrimSpace(work.Fields.SourceIntakeID) == "" {
+		return nil, nil, nil
+	}
+	if d.Records == nil {
+		return nil, nil, fmt.Errorf("usecase: image task store 未配置")
+	}
+	intake, err := d.Records.GetCreativeWorkIntake(
+		ctx, work.Record.AgentName, work.Fields.SourceIntakeID,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	if intake.Status != k12.CreativeWorkIntakePromoted ||
+		intake.PromotedWorkID != work.Record.RecordID ||
+		intake.AgentName != work.Record.AgentName {
+		return nil, nil, k12storage.ErrImageTaskConflict
+	}
+	operationKey := "work:" + work.Record.RecordID + ":version:" +
+		version.VersionID + ":feedback"
+	requestDigest := digestJSON(req)
+	prior, err := d.Records.GetLatestWorkFeedbackInvocation(
+		ctx, work.Record.AgentName, work.Record.RecordID, operationKey,
+	)
+	switch {
+	case err == nil && prior.Status == k12.ImageTaskInvocationSucceeded:
+		var out WorkFeedbackOutput
+		if jsonErr := json.Unmarshal([]byte(prior.ResultJSON), &out); jsonErr != nil {
+			return nil, nil, k12storage.ErrImageTaskConflict
+		}
+		return &prior, &out, nil
+	case err == nil && prior.Status == k12.ImageTaskInvocationPrepared:
+		if prior.RequestDigest != requestDigest {
+			return nil, nil, k12storage.ErrImageTaskConflict
+		}
+		return &prior, nil, nil
+	case err == nil && prior.Status == k12.ImageTaskInvocationFailed && prior.RetrySafe:
+		if prior.RequestDigest != requestDigest {
+			return nil, nil, k12storage.ErrImageTaskConflict
+		}
+		next := k12.ImageTaskInvocation{
+			InvocationID: idgen.NanoID(), AgentName: work.Record.AgentName,
+			WorkRecordID: work.Record.RecordID,
+			Operation:    k12.ImageTaskOperationWorkFeedback,
+			OperationKey: prior.OperationKey, RequestDigest: prior.RequestDigest,
+			RouteSnapshot: prior.RouteSnapshot, Status: k12.ImageTaskInvocationPrepared,
+			Attempt: prior.Attempt + 1,
+		}
+		prepared, _, prepareErr := d.Records.PrepareImageTaskInvocation(ctx, next)
+		return &prepared, nil, prepareErr
+	case err == nil:
+		return nil, nil, k12storage.ErrImageTaskInvalidState
+	case !errors.Is(err, k12storage.ErrImageTaskNotFound):
+		return nil, nil, err
+	}
+	route, pinned := workFeedbackRouteSnapshotFromContext(ctx, work.Fields.WorkType)
+	if !pinned {
+		// Legacy/manual CreativeWork has no owning ImageTask dispatch. Only that
+		// path may resolve the current default when its first invocation is
+		// prepared.
+		if d.WorkFeedbackRoute == nil {
+			return nil, nil, fmt.Errorf("usecase: promoted 作品点评 route resolver 未配置")
+		}
+		route, err = d.WorkFeedbackRoute(ctx, work.Fields.WorkType)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	route = k12.NormalizeImageTaskRouteSnapshot(route)
+	if err := route.Validate(); err != nil {
+		return nil, nil, err
+	}
+	invocation := k12.ImageTaskInvocation{
+		InvocationID: idgen.NanoID(), AgentName: work.Record.AgentName,
+		WorkRecordID: work.Record.RecordID,
+		Operation:    k12.ImageTaskOperationWorkFeedback,
+		OperationKey: operationKey, RequestDigest: requestDigest,
+		RouteSnapshot: route, Status: k12.ImageTaskInvocationPrepared, Attempt: 1,
+	}
+	prepared, _, err := d.Records.PrepareImageTaskInvocation(ctx, invocation)
+	return &prepared, nil, err
 }
 
 func validateConfirmedWritingFeedbackSnapshot(version k12.CreativeWorkVersion) error {

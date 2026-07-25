@@ -98,6 +98,44 @@ func TestGradeHomeworkPhoto_AnsweredSheetGradesAndAnnotatesTrustedBBox(t *testin
 	}
 }
 
+func TestGradeHomeworkPhotoFrozenDispatchIntentFailsClosedOnRecognitionMismatch(t *testing.T) {
+	tests := []struct {
+		name      string
+		intent    PhotoTaskIntent
+		answer    string
+		wantError string
+	}{
+		{
+			name:   "completed dispatch but recognition has no answer evidence",
+			intent: PhotoTaskCompletedHomework, answer: "",
+			wantError: "与识别到的作答证据冲突",
+		},
+		{
+			name:   "blank dispatch but recognition has answer evidence",
+			intent: PhotoTaskBlankWorksheet, answer: "2",
+			wantError: "与识别到的作答证据冲突",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d, _ := newPipeline(t,
+				fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+				fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
+			)
+			d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{{
+				Question: "1+1=", Subject: "数学", StudentAnswer: tt.answer,
+			}}}
+			_, err := d.GradeHomeworkPhoto(context.Background(), PhotoGradeRequest{
+				AgentName: "mingming", Grade: "五年级上", Image: []byte("jpeg"),
+				TaskIntent: tt.intent,
+			})
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("mismatch must fail closed, got %v", err)
+			}
+		})
+	}
+}
+
 func TestGradeHomeworkPhoto_CompoundParentIsNotAssessedAndChildrenStayIndependent(t *testing.T) {
 	d, _ := newPipeline(t,
 		fakeSolver{solution: "答案", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
@@ -269,13 +307,14 @@ func TestGradeHomeworkPhoto_FifthGradeUnknownWholeFractionProblemIsNotRejectedAs
 
 func TestGradeHomeworkPhoto_BlankSheetSolvesMarkdownWithoutFakeCorrectionImage(t *testing.T) {
 	d, _ := newPipeline(t,
-		fakeSolver{solution: "解：4.5×2=9", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		blankWorksheetSolver{},
 		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
 	)
 	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{
 		{Question: "4.5×2=", Subject: "数学"},
 		{Question: "2+2=", Subject: "数学"},
 	}}
+	d.ParentTeachingGuide = &parentTeachingGuideSpy{}
 	annotator := &photoAnnotatorFake{}
 	d.PhotoAnnotator = annotator
 
@@ -291,7 +330,9 @@ func TestGradeHomeworkPhoto_BlankSheetSolvesMarkdownWithoutFakeCorrectionImage(t
 	if len(got.Items) != 2 || got.Items[0].Status != PhotoBlankSolved || got.Items[1].Status != PhotoBlankSolved {
 		t.Fatalf("blank items should be solved: %#v", got.Items)
 	}
-	if !strings.Contains(got.Markdown, "作业解题") || !strings.Contains(got.Markdown, "4.5×2=9") {
+	if !strings.Contains(got.Markdown, "家长辅导指南") ||
+		!strings.Contains(got.Markdown, "4.5×2=") ||
+		!strings.Contains(got.Markdown, "**答案：** 9") {
 		t.Fatalf("solve markdown missing content: %s", got.Markdown)
 	}
 }
@@ -330,7 +371,7 @@ func TestGradeHomeworkPhoto_AnswerRegionWithoutReadableTextFailsClosedInsteadOfS
 
 func TestGradeHomeworkPhoto_ModelOnlyUnclearWithoutVerifiedInkIsBlankSolve(t *testing.T) {
 	d, _ := newPipeline(t,
-		fakeSolver{solution: "解：4.5×2=9", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		blankWorksheetSolver{},
 		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
 	)
 	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{
@@ -348,6 +389,7 @@ func TestGradeHomeworkPhoto_ModelOnlyUnclearWithoutVerifiedInkIsBlankSolve(t *te
 	}}
 	anchorer := &photoAnchorerFake{}
 	d.AnswerAnchorer = anchorer
+	d.ParentTeachingGuide = &parentTeachingGuideSpy{}
 	annotator := &photoAnnotatorFake{}
 	d.PhotoAnnotator = annotator
 
@@ -371,7 +413,9 @@ func TestGradeHomeworkPhoto_ModelOnlyUnclearWithoutVerifiedInkIsBlankSolve(t *te
 			t.Fatalf("blank item %d was not solved after ink verification: %#v", i+1, item)
 		}
 	}
-	if !strings.Contains(got.Markdown, "作业解题") || !strings.Contains(got.Markdown, "4.5×2=9") {
+	if !strings.Contains(got.Markdown, "家长辅导指南") ||
+		!strings.Contains(got.Markdown, "4.5×2=") ||
+		!strings.Contains(got.Markdown, "**答案：** 9") {
 		t.Fatalf("blank solve markdown missing solution:\n%s", got.Markdown)
 	}
 }

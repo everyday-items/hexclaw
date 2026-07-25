@@ -30,16 +30,21 @@ var errItemResumeProvider503 = &itemResumeProviderResponseError{
 }
 
 type itemResumeSolver struct {
-	mu    sync.Mutex
-	calls map[string]int
+	mu        sync.Mutex
+	calls     map[string]int
+	solutions map[string]string
 }
 
 func (s *itemResumeSolver) Solve(_ context.Context, problem, _, _ string) (SolveResult, error) {
 	s.mu.Lock()
 	s.calls[problem]++
+	solution := s.solutions[problem]
 	s.mu.Unlock()
+	if solution == "" {
+		solution = "2"
+	}
 	return SolveResult{
-		Solution: "2",
+		Solution: solution,
 		Evidence: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec},
 	}, nil
 }
@@ -93,6 +98,10 @@ func newItemResumeOrchestrator(
 	o.deps.Solver = solver
 	o.deps.Grader = grader
 	o.deps.VerifiedGrader = nil
+	// Durable V33 completed-homework wrong items require their own parent-guide
+	// provider operation. Keep this shared fixture production-shaped; tests that
+	// need a failure/spy replace it explicitly.
+	o.deps.ParentTeachingGuide = &parentTeachingGuideSpy{}
 	return o
 }
 

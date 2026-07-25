@@ -255,9 +255,7 @@ func TestWritingPhotoRevisionAlsoRequiresConfirmedOCRSnapshot(t *testing.T) {
 	d := newDataDeps(t)
 	ctx := context.Background()
 	workID := newWritingWork(t, d, "xiaoming")
-	if _, err := d.AttachFeedback(ctx, "xiaoming", workID, "原稿切题；建议修改一处细节。"); err != nil {
-		t.Fatal(err)
-	}
+	generateCreativeWorkFeedbackForTest(t, &d, workID, "原稿切题；建议修改一处细节。")
 	assetID := creativeWorkOCRAsset(t, "xiaoming")
 	if _, err := d.SubmitRevision(ctx, "xiaoming", workID, "修改稿", assetID); err == nil {
 		t.Fatal("writing photo revision must not bypass OCR confirmation")

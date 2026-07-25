@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -188,33 +190,65 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 	if len(in.Photo.Image) == 0 {
 		return GradingJobView{}, false, fmt.Errorf("%w: Image 不可空", ErrInvalidInput)
 	}
-	snap := in.ModelSnapshot
-	if o.snapshotFn != nil {
-		var err error
-		snap, err = o.snapshotFn(snap)
-		if err != nil {
-			return GradingJobView{}, false, fmt.Errorf("%w: resolve grading model snapshot: %w", ErrInvalidInput, err)
-		}
-	} else if strings.TrimSpace(snap.Provider) == "" || strings.TrimSpace(snap.Model) == "" {
-		return GradingJobView{}, false, fmt.Errorf("%w: grading model snapshot resolver 未配置且 provider/model 不完整", ErrInvalidInput)
-	}
-	snap = k12.NormalizeGradingModelSnapshot(snap)
-	if snap.Provider == "" || snap.Model == "" {
-		return GradingJobView{}, false, fmt.Errorf("%w: grading model snapshot 缺少 provider/model", ErrInvalidInput)
-	}
 	sum := sha1.Sum(in.Photo.Image)
-	v, created, err := o.deps.CreateGradingJob(ctx, in.Photo.AgentName, in.Photo.SourceSession, CreateGradingJobInput{
-		// Submission 聚合未落库（§6.9 类型化存储待接线）：以原图内容摘要为提交标识，
-		// 同图重投可追溯到同一 submission。
-		SubmissionID:                "photo-" + hex.EncodeToString(sum[:]),
-		SourceKind:                  in.SourceKind,
-		SourceKey:                   in.SourceKey,
-		ModelSnapshot:               snap,
-		BudgetSnapshot:              in.BudgetSnapshot,
-		MaterializesProblemAttempts: true,
-	})
+	submissionID := "photo-" + hex.EncodeToString(sum[:])
+	v, found, err := o.deps.findGradingJobByIdempotency(
+		ctx, in.Photo.AgentName, in.SourceKind, in.SourceKey, 0,
+	)
 	if err != nil {
 		return GradingJobView{}, false, err
+	}
+	created := false
+	if found {
+		if v.Fields.SubmissionID != submissionID {
+			return GradingJobView{}, false, fmt.Errorf(
+				"%w: idempotency key %q is already bound to submission %q, requested %q",
+				ErrInvalidInput, v.Fields.IdempotencyKey, v.Fields.SubmissionID, submissionID,
+			)
+		}
+		providerAuto := strings.TrimSpace(in.ModelSnapshot.Provider) == "" ||
+			strings.EqualFold(strings.TrimSpace(in.ModelSnapshot.Provider), "auto")
+		modelAuto := strings.TrimSpace(in.ModelSnapshot.Model) == "" ||
+			strings.EqualFold(strings.TrimSpace(in.ModelSnapshot.Model), "auto")
+		if !providerAuto || !modelAuto {
+			storedRoute := k12.NormalizeGradingModelSnapshot(v.Fields.ModelSnapshot)
+			requestedRoute := k12.NormalizeGradingModelSnapshot(in.ModelSnapshot)
+			if storedRoute.Provider != requestedRoute.Provider ||
+				storedRoute.Model != requestedRoute.Model ||
+				storedRoute.Route != requestedRoute.Route {
+				return GradingJobView{}, false, fmt.Errorf(
+					"%w: idempotency key %q is already bound to model route %q, requested %q",
+					ErrInvalidInput, v.Fields.IdempotencyKey, storedRoute.Route, requestedRoute.Route,
+				)
+			}
+		}
+	} else {
+		snap := in.ModelSnapshot
+		if o.snapshotFn != nil {
+			snap, err = o.snapshotFn(snap)
+			if err != nil {
+				return GradingJobView{}, false, fmt.Errorf("%w: resolve grading model snapshot: %w", ErrInvalidInput, err)
+			}
+		} else if strings.TrimSpace(snap.Provider) == "" || strings.TrimSpace(snap.Model) == "" {
+			return GradingJobView{}, false, fmt.Errorf("%w: grading model snapshot resolver 未配置且 provider/model 不完整", ErrInvalidInput)
+		}
+		snap = k12.NormalizeGradingModelSnapshot(snap)
+		if snap.Provider == "" || snap.Model == "" {
+			return GradingJobView{}, false, fmt.Errorf("%w: grading model snapshot 缺少 provider/model", ErrInvalidInput)
+		}
+		v, created, err = o.deps.CreateGradingJob(ctx, in.Photo.AgentName, in.Photo.SourceSession, CreateGradingJobInput{
+			// Submission 聚合未落库（§6.9 类型化存储待接线）：以原图内容摘要为提交标识，
+			// 同图重投可追溯到同一 submission。
+			SubmissionID:                submissionID,
+			SourceKind:                  in.SourceKind,
+			SourceKey:                   in.SourceKey,
+			ModelSnapshot:               snap,
+			BudgetSnapshot:              in.BudgetSnapshot,
+			MaterializesProblemAttempts: true,
+		})
+		if err != nil {
+			return GradingJobView{}, false, err
+		}
 	}
 	o.mu.Lock()
 	run, ok := o.runs[v.Record.RecordID]
@@ -276,6 +310,18 @@ func (o *GradingOrchestrator) runLoop(ctx context.Context, run *gradingRun, jobI
 			if v.Fields.AnchorState == k12.GradingAnchorPending {
 				o.startAnchorAsync(jobID, run, v.Fields.ModelSnapshot)
 			}
+			// ImageTask facade 对清晰、证据充足的事实直接自动冻结；只有稳定风险原因
+			// 存在时才停下来等家长确认。旧 GradingJob 入口保持原显式确认语义。
+			if v.Fields.SourceKind == "image_task" &&
+				v.Fields.ConfirmationState == k12.GradingConfirmationPending &&
+				!recognizedQuestionsRequireGuardianConfirmation(run.questions) {
+				if v, err = o.autoFreezeClearRecognition(ctx, run, v); err != nil {
+					return v, err
+				}
+				if v.Record.Status == k12.GradingStageAssessing {
+					continue
+				}
+			}
 			// 停点：等家长确认（规则 7 不自动过期）。ConfirmAndRun 续跑。
 			return v, nil
 		case k12.GradingStageAssessing:
@@ -295,6 +341,56 @@ func (o *GradingOrchestrator) runLoop(ctx context.Context, run *gradingRun, jobI
 			return v, nil
 		}
 	}
+}
+
+func recognizedQuestionsRequireGuardianConfirmation(questions []RecognizedQuestion) bool {
+	for _, question := range questions {
+		if NormalizeRecognizedQuestion(question).ConfirmationRequired {
+			return true
+		}
+	}
+	return false
+}
+
+// autoFreezeClearRecognition runs with the Job lock held. It follows the same
+// persist-before-checkpoint order as an explicit confirmation, but supplies no
+// parent correction because every recognized fact passed the risk policy.
+func (o *GradingOrchestrator) autoFreezeClearRecognition(
+	ctx context.Context,
+	run *gradingRun,
+	job GradingJobView,
+) (GradingJobView, error) {
+	candidate := *run
+	candidate.questions = cloneRecognizedQuestions(run.questions)
+	candidate.anchored = cloneRecognizedQuestions(run.anchored)
+	if err := applyAndValidateGradingConfirmation(&candidate, ConfirmPhotoGradingInput{}); err != nil {
+		return GradingJobView{}, err
+	}
+	confirmedFacts := candidate.questions
+	if candidate.anchored != nil {
+		confirmedFacts = candidate.anchored
+	}
+	if err := o.persistProblemAttemptFacts(
+		ctx, run.agentName, job.Fields.SubmissionID, confirmedFacts,
+	); err != nil {
+		return GradingJobView{}, fmt.Errorf("usecase: 自动冻结 Problem/Attempt: %w", err)
+	}
+	if err := o.persistRun(job.Record.RecordID, &candidate); err != nil {
+		return GradingJobView{}, fmt.Errorf("usecase: 自动冻结识别产物: %w", err)
+	}
+	canonicalDigest := CanonicalRecognizedQuestionsDigest(candidate.questions)
+	view, err := o.deps.ConfirmGradingJob(
+		ctx,
+		run.agentName,
+		job.Record.RecordID,
+		[]string{"canonical-recognition:" + canonicalDigest},
+	)
+	if err != nil {
+		return view, err
+	}
+	run.questions = candidate.questions
+	run.anchored = candidate.anchored
+	return view, nil
 }
 
 // ConfirmAndRun 家长确认（公共命令③）后继续推进到下一停点/终态。
@@ -409,6 +505,7 @@ func (o *GradingOrchestrator) ReleaseGradingRun(jobID string) {
 		slog.Error("K12 识别事实终态归档失败（保留原运行目录）", "job", jobID, "err", err)
 		return
 	}
+	_ = os.Remove(o.recognitionReceiptPath(jobID))
 	o.releaseRunFiles(jobID)
 }
 
@@ -424,6 +521,9 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 	invocation, err := o.beginModelInvocation(ctx, job, k12.GradingStageRecognizing,
 		modelInvocationDigest([]byte(k12.GradingStageRecognizing), run.req.Image))
 	if err != nil {
+		if invocation.InvocationID == "" {
+			return o.failModelInvocationBeforeSend(ctx, run, jobID, err)
+		}
 		if recovered, v, recoverErr := o.recoverRecognizeInvocation(ctx, run, jobID, invocation); recovered {
 			return v, recoverErr
 		}
@@ -458,7 +558,7 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 	cancelProvider()
 	unregisterProvider()
 	if err != nil {
-		if invocationOutcomeUnknown(err) {
+		if sentProviderOutcomeUnknown(err, nil) {
 			_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), run.agentName, invocation.InvocationID, "provider_outcome_unknown")
 			if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), run.agentName, jobID); readErr == nil && current.Record.Status == k12.GradingStageCancelled {
 				return current, nil
@@ -510,9 +610,38 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 		}
 		return v, err
 	}
+	if job.Fields.SourceKind == "image_task" {
+		for i := range run.questions {
+			// The current facade requires confidence evidence before automatic
+			// freezing. Keep nil compatible for legacy GradingJob callers, but
+			// fail closed for every new public image task.
+			if run.questions[i].RecognitionConfidence == nil {
+				run.questions[i].ConfirmationReasons = append(
+					run.questions[i].ConfirmationReasons, OCRRiskLowConfidence,
+				)
+				run.questions[i] = NormalizeRecognizedQuestion(run.questions[i])
+			}
+		}
+	}
 	for i := range run.questions {
 		// 核心识别冻结事实不接纳 geometry；BBox 只能由独立 anchor 分支补入。
 		run.questions[i].BBox = nil
+	}
+	// Provider 已返回后先写 Job+Invocation-scoped 不可变结果回执，再把同一事实投影到按
+	// SubmissionID 共享的 Problem/Attempt ledger。后者可能来自另一条同图 Job，
+	// 不能单独证明当前 invocation 成功；回执是 outcome_unknown 自动对账的 provenance。
+	if receiptErr := o.persistRecognitionReceipt(jobID, invocation.InvocationID, run); receiptErr != nil {
+		_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(
+			context.WithoutCancel(ctx), run.agentName, invocation.InvocationID,
+			"recognition_receipt_not_durable",
+		)
+		v, aerr := o.markGradingOutcomeUnknown(
+			context.WithoutCancel(ctx), run, jobID, "recognition_receipt_not_durable",
+		)
+		if aerr != nil {
+			return v, aerr
+		}
+		return v, receiptErr
 	}
 	if perr := o.persistRecognizedPhotoFacts(ctx, run, job.Fields.SubmissionID); perr != nil {
 		_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), run.agentName,
@@ -785,6 +914,9 @@ func (o *GradingOrchestrator) runAssess(ctx context.Context, run *gradingRun, jo
 	invocation, err := o.beginModelInvocation(ctx, job, k12.GradingStageAssessing,
 		modelInvocationDigest([]byte(k12.GradingStageAssessing), requestRaw))
 	if err != nil {
+		if invocation.InvocationID == "" {
+			return o.failModelInvocationBeforeSend(ctx, run, jobID, err)
+		}
 		if recovered, v, recoverErr := o.recoverAssessInvocation(ctx, run, jobID, invocation); recovered {
 			return v, recoverErr
 		}
@@ -860,7 +992,7 @@ func (o *GradingOrchestrator) runAssess(ctx context.Context, run *gradingRun, jo
 		}
 	}
 	if err != nil {
-		if invocationOutcomeUnknown(err) || invocationOutcomeUnknown(providerCtxErr) {
+		if sentProviderOutcomeUnknown(err, providerCtxErr) {
 			_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), run.agentName, invocation.InvocationID, "provider_outcome_unknown")
 			if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), run.agentName, jobID); readErr == nil && current.Record.Status == k12.GradingStageCancelled {
 				return current, nil
@@ -978,6 +1110,32 @@ func (o *GradingOrchestrator) failStage(ctx context.Context, run *gradingRun, jo
 	})
 	if aerr != nil {
 		return v, aerr
+	}
+	return v, cause
+}
+
+// failModelInvocationBeforeSend handles a durable-ledger preparation failure.
+// No provider request can have escaped before PrepareModelInvocation returns,
+// so parking this case as outcome_unknown would be both inaccurate and
+// unrecoverable. Immutable identity conflicts are terminal for the frozen Job;
+// ordinary local storage failures remain safely retryable.
+func (o *GradingOrchestrator) failModelInvocationBeforeSend(
+	ctx context.Context,
+	run *gradingRun,
+	jobID string,
+	cause error,
+) (GradingJobView, error) {
+	kind := "invocation_prepare_failed"
+	retryable := true
+	if errors.Is(cause, k12storage.ErrModelInvocationConflict) {
+		kind = "invocation_identity_conflict"
+		retryable = false
+	}
+	v, err := o.deps.AdvanceGradingStage(ctx, run.agentName, jobID, AdvanceGradingInput{
+		Outcome: GradingOutcomeFailed, FailureKind: kind, Retryable: retryable,
+	})
+	if err != nil {
+		return v, err
 	}
 	return v, cause
 }

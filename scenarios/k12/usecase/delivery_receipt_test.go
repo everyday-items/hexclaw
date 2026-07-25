@@ -60,7 +60,7 @@ func TestDeliveryReceiptProviderAcceptanceIsNotDeliveredAndReplayDoesNotResend(t
 	}}
 	d.Delivery = fake
 
-	got, created, err := d.PrepareAndSendText(context.Background(), "xiaoming", "creative_work_feedback", "work-1", "点评正文")
+	got, created, err := d.PrepareAndSendText(context.Background(), "xiaoming", "tutoring_tips", "tips-1", "辅导要点")
 	if err != nil || !created {
 		t.Fatalf("first send: created=%v err=%v", created, err)
 	}
@@ -73,7 +73,7 @@ func TestDeliveryReceiptProviderAcceptanceIsNotDeliveredAndReplayDoesNotResend(t
 		t.Fatalf("durable receipt did not freeze complete evidence: %+v", got)
 	}
 
-	replay, created, err := d.PrepareAndSendText(context.Background(), "xiaoming", "creative_work_feedback", "work-1", "点评正文")
+	replay, created, err := d.PrepareAndSendText(context.Background(), "xiaoming", "tutoring_tips", "tips-1", "辅导要点")
 	if err != nil || created || replay.DeliveryID != got.DeliveryID {
 		t.Fatalf("same delivery must replay one receipt: created=%v receipt=%+v err=%v", created, replay, err)
 	}
@@ -122,7 +122,7 @@ func TestDeliveryReceiptOutcomeUnknownCannotBlindRetryAndOnlyQueryCanResolve(t *
 	}}
 	d.Delivery = fake
 
-	unknown, _, err := d.PrepareAndSendText(context.Background(), "xiaoming", "creative_work_feedback", "work-2", "点评正文")
+	unknown, _, err := d.PrepareAndSendText(context.Background(), "xiaoming", "tutoring_tips", "tips-2", "另一份辅导要点")
 	if err != nil || unknown.Status != k12.DeliveryOutcomeUnknown {
 		t.Fatalf("unknown outcome must be durable: %+v err=%v", unknown, err)
 	}

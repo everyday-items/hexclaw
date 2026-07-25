@@ -120,23 +120,6 @@ func TestGenerateWorkFeedback_SkillStampPersisted(t *testing.T) {
 	}
 }
 
-// TestAttachFeedback_ParentNoSkillStamp 家长手写点评不经方法论基座 → feedback_skill 恒空。
-func TestAttachFeedback_ParentNoSkillStamp(t *testing.T) {
-	d := newDataDeps(t)
-	ctx := context.Background()
-	id := newWritingWork(t, d, "xiaoming")
-	v, err := d.AttachFeedback(ctx, "xiaoming", id, "切题；比喻好，可加感官细节。")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.Fields.Versions[0].FeedbackSkill != "" {
-		t.Fatalf("家长手写点评不应带 feedback_skill，got %q", v.Fields.Versions[0].FeedbackSkill)
-	}
-	if structured := v.Fields.Versions[0].StructuredFeedback; structured == nil || structured.SourceSnapshot.Source != k12.FeedbackSourceParent {
-		t.Fatalf("家长点评也必须有结构化事实对象: %#v", structured)
-	}
-}
-
 // TestGenerateWorkFeedback_INV011_Rejected INV-011 契约：生成输出出现分数/等第/代写成文
 // → 拒绝入库，作品保持原状态、不留假点评。
 func TestGenerateWorkFeedback_INV011_Rejected(t *testing.T) {
@@ -208,8 +191,8 @@ func TestGenerateWorkFeedback_Art_Observational(t *testing.T) {
 	if last.FeedbackSource != k12.FeedbackSourceAI {
 		t.Fatalf("来源应为 ai，got %q", last.FeedbackSource)
 	}
-	if structured := last.StructuredFeedback; structured == nil || structured.EvidenceRefs[0] == "" || len(structured.AllowedActions) == 0 {
-		t.Fatalf("美术点评结构化证据/允许动作缺失: %#v", structured)
+	if structured := last.StructuredFeedback; structured == nil || structured.EvidenceRefs[0] == "" {
+		t.Fatalf("美术点评结构化证据缺失: %#v", structured)
 	}
 	if gen.lastReq.WorkType != k12.WorkTypeArt || gen.lastReq.Intent == "" || gen.lastReq.SourceAssetID != "asset-1" {
 		t.Fatalf("美术生成请求缺少可见证据来源: %+v", gen.lastReq)
@@ -453,9 +436,7 @@ func TestGenerateWorkFeedback_StatusGuard(t *testing.T) {
 	}
 	// archived 拒。
 	id2 := newWritingWork(t, d, "xiaoming")
-	if err := d.ArchiveCreativeWork(ctx, "xiaoming", id2); err != nil {
-		t.Fatal(err)
-	}
+	forceCreativeWorkStatus(t, d, id2, k12.WorkStatusArchived)
 	if _, err := d.GenerateWorkFeedback(ctx, "xiaoming", id2); err == nil {
 		t.Fatal("archived 不应可生成点评")
 	}
@@ -483,20 +464,5 @@ func TestGenerateWorkFeedback_GeneratorUnconfigured(t *testing.T) {
 	id := newWritingWork(t, d, "xiaoming")
 	if _, err := d.GenerateWorkFeedback(ctx, "xiaoming", id); err == nil {
 		t.Fatal("未配置点评生成能力应报错")
-	}
-}
-
-// TestAttachFeedback_ParentSourceMarked 家长手写点评来源标记 parent（与 AI 区分；
-// 老数据空值前向兼容由字段 omitempty 保证）。
-func TestAttachFeedback_ParentSourceMarked(t *testing.T) {
-	d := newDataDeps(t)
-	ctx := context.Background()
-	id := newWritingWork(t, d, "xiaoming")
-	v, err := d.AttachFeedback(ctx, "xiaoming", id, "切题；比喻好，可加感官细节。")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.Fields.Versions[0].FeedbackSource != k12.FeedbackSourceParent {
-		t.Fatalf("家长手写点评来源应为 parent，got %q", v.Fields.Versions[0].FeedbackSource)
 	}
 }

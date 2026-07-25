@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
 )
 
@@ -24,7 +25,7 @@ func (r *routeSnapshotRecognizer) Recognize(ctx context.Context, _ []byte) ([]Re
 	}
 	r.seen = append(r.seen, snapshot)
 	if r.calls <= r.failures {
-		return nil, errors.New("provider unavailable before acceptance")
+		return nil, &gradingProviderResponseError{status: 503}
 	}
 	return []RecognizedQuestion{{Question: "1+1=", AnswerState: AnswerStateBlank}}, nil
 }
@@ -201,6 +202,61 @@ func TestGradingSucceededInvocationBeforeCheckpointIsNotBlindlyReplayed(t *testi
 	rows, err := d.Records.ListModelInvocations(context.Background(), "mingming", v.Record.RecordID)
 	if err != nil || len(rows) != 1 || rows[0].Status != k12.ModelInvocationSucceeded {
 		t.Fatalf("ledger=%+v err=%v", rows, err)
+	}
+}
+
+func TestGradingInvocationIdentityConflictBeforeSendFailsTerminalInsteadOfOutcomeUnknown(t *testing.T) {
+	recognizer := &routeSnapshotRecognizer{}
+	d, _ := newPipeline(t,
+		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil)
+	d.Recognizer = recognizer
+	currentRoute := k12.GradingModelSnapshot{
+		Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", Route: "hexclaw-gpt/gpt-5.6-sol",
+	}
+	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, func(k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
+		return currentRoute, nil
+	}))
+	v, _, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "route-conflict-before-send",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, err = d.AdvanceGradingStage(context.Background(), "mingming", v.Record.RecordID, AdvanceGradingInput{Outcome: GradingOutcomeOK}); err != nil {
+		t.Fatal(err)
+	}
+	if v, err = d.AdvanceGradingStage(context.Background(), "mingming", v.Record.RecordID, AdvanceGradingInput{
+		Outcome: GradingOutcomeOK, ArtifactDigest: "image",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := d.Records.PrepareModelInvocation(context.Background(), k12.ModelInvocation{
+		InvocationID: "inv-bound-to-old-spark", AgentName: "mingming", JobID: v.Record.RecordID,
+		Stage: k12.GradingStageRecognizing,
+		RequestDigest: modelInvocationDigest(
+			[]byte(k12.GradingStageRecognizing), orchestratorPhotoRequest().Image,
+		),
+		RouteSnapshot: k12.GradingModelSnapshot{
+			Provider: "hexclaw-gpt", Model: "gpt-5.3-codex-spark",
+			Route: "hexclaw-gpt/gpt-5.3-codex-spark",
+		},
+		Attempt: 1, CreatedAt: 100, UpdatedAt: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	failed, err := o.RunGradingJob(context.Background(), v.Record.RecordID)
+	if !errors.Is(err, k12storage.ErrModelInvocationConflict) {
+		t.Fatalf("run error=%v, want immutable invocation conflict", err)
+	}
+	if failed.Record.Status != k12.GradingStageFailedTerminal ||
+		failed.Fields.FailureKind != "invocation_identity_conflict" {
+		t.Fatalf("pre-send identity conflict must fail terminal, got record=%+v fields=%+v",
+			failed.Record, failed.Fields)
+	}
+	if recognizer.calls != 0 {
+		t.Fatalf("provider must not run after pre-send identity conflict: calls=%d", recognizer.calls)
 	}
 }
 

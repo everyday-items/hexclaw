@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/hexagon-codes/toolkit/util/idgen"
@@ -24,6 +25,10 @@ func deliveryDedupeKey(agentName, objectKind, objectID, bindingID, payloadDigest
 	return deliveryDigest(strings.Join([]string{agentName, objectKind, objectID, bindingID, payloadDigest}, "\x00"))
 }
 
+func deliveryBatchDedupeKey(agentName, objectKind, objectID, contentDigest string) string {
+	return deliveryDigest(strings.Join([]string{agentName, objectKind, objectID, contentDigest}, "\x00"))
+}
+
 func validatePreparedDelivery(prepared PreparedTextDelivery) error {
 	if strings.TrimSpace(prepared.BindingID) == "" || strings.TrimSpace(prepared.Target.Platform) == "" ||
 		strings.TrimSpace(prepared.Target.ChatID) == "" || strings.TrimSpace(prepared.PayloadJSON) == "" {
@@ -36,6 +41,321 @@ func validatePreparedDelivery(prepared PreparedTextDelivery) error {
 		return fmt.Errorf("%w: 冻结渲染证据不是 JSON", ErrInvalidInput)
 	}
 	return nil
+}
+
+func (d Deps) ResolveDeliveryTargets(
+	ctx context.Context,
+	agentName string,
+) ([]ResolvedDeliveryTarget, error) {
+	if d.Delivery == nil {
+		return nil, ErrDeliveryUnavailable
+	}
+	batchTransport, ok := d.Delivery.(BatchDeliveryTransport)
+	if !ok {
+		return nil, ErrDeliveryUnavailable
+	}
+	targets, err := batchTransport.ResolveTextTargets(ctx, strings.TrimSpace(agentName))
+	if err != nil {
+		return nil, err
+	}
+	if len(targets) == 0 {
+		return nil, ErrNoActiveDirectBindings
+	}
+	for i := range targets {
+		targets[i].BindingID = strings.TrimSpace(targets[i].BindingID)
+		targets[i].Target.Platform = strings.ToLower(strings.TrimSpace(targets[i].Target.Platform))
+		targets[i].Target.InstanceID = strings.TrimSpace(targets[i].Target.InstanceID)
+		targets[i].Target.ChatID = strings.TrimSpace(targets[i].Target.ChatID)
+		targets[i].Target.Label = strings.TrimSpace(targets[i].Target.Label)
+		if targets[i].BindingID == "" || targets[i].Target.Platform == "" ||
+			targets[i].Target.ChatID == "" ||
+			(targets[i].Target.ChatID[0] < 0x20) {
+			return nil, fmt.Errorf("%w: resolved direct binding %d is invalid", ErrInvalidInput, i+1)
+		}
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		left, right := targets[i], targets[j]
+		if left.Target.Platform != right.Target.Platform {
+			return left.Target.Platform < right.Target.Platform
+		}
+		if left.Target.InstanceID != right.Target.InstanceID {
+			return left.Target.InstanceID < right.Target.InstanceID
+		}
+		if left.Target.ChatID != right.Target.ChatID {
+			return left.Target.ChatID < right.Target.ChatID
+		}
+		return left.BindingID < right.BindingID
+	})
+	for i := 1; i < len(targets); i++ {
+		if targets[i-1].Target.Platform == targets[i].Target.Platform &&
+			targets[i-1].Target.InstanceID == targets[i].Target.InstanceID &&
+			targets[i-1].Target.ChatID == targets[i].Target.ChatID {
+			return nil, fmt.Errorf("%w: resolved direct bindings contain duplicate target", ErrInvalidInput)
+		}
+	}
+	return targets, nil
+}
+
+func (d Deps) prepareTextForResolvedTargets(
+	ctx context.Context,
+	content string,
+	targets []ResolvedDeliveryTarget,
+) ([]PreparedTextDelivery, error) {
+	batchTransport, ok := d.Delivery.(BatchDeliveryTransport)
+	if !ok {
+		return nil, ErrDeliveryUnavailable
+	}
+	prepared, err := batchTransport.PrepareTextForTargets(ctx, content, targets)
+	if err != nil {
+		return nil, err
+	}
+	if len(prepared) != len(targets) {
+		return nil, fmt.Errorf(
+			"%w: prepared deliveries=%d resolved targets=%d",
+			ErrInvalidInput, len(prepared), len(targets),
+		)
+	}
+	for i := range prepared {
+		if err := validatePreparedDelivery(prepared[i]); err != nil {
+			return nil, fmt.Errorf("prepared delivery %d: %w", i+1, err)
+		}
+		if prepared[i].BindingID != targets[i].BindingID ||
+			prepared[i].Target != targets[i].Target {
+			return nil, fmt.Errorf(
+				"%w: prepared delivery %d changed its resolved binding target",
+				ErrInvalidInput, i+1,
+			)
+		}
+	}
+	return prepared, nil
+}
+
+func (d Deps) resolveAndPrepareTextBatch(
+	ctx context.Context,
+	agentName, content string,
+) ([]PreparedTextDelivery, error) {
+	if _, ok := d.Delivery.(BatchDeliveryTransport); ok {
+		targets, err := d.ResolveDeliveryTargets(ctx, agentName)
+		if err != nil {
+			return nil, err
+		}
+		return d.prepareTextForResolvedTargets(ctx, content, targets)
+	}
+	prepared, err := d.Delivery.PrepareText(ctx, agentName, content)
+	if err != nil {
+		return nil, err
+	}
+	if err := validatePreparedDelivery(prepared); err != nil {
+		return nil, err
+	}
+	return []PreparedTextDelivery{prepared}, nil
+}
+
+// PrepareAndSendTextBatch freezes one logical command and every current active
+// direct binding as child receipts in one transaction, then starts each pending
+// provider request. A command replay returns the frozen batch before consulting
+// mutable bindings and therefore cannot add recipients or resend.
+func (d Deps) PrepareAndSendTextBatch(
+	ctx context.Context,
+	agentName, objectKind, objectID, content string,
+) (k12.DeliveryBatch, bool, error) {
+	return d.prepareAndSendTextBatch(ctx, agentName, objectKind, objectID, content, nil)
+}
+
+func (d Deps) prepareAndSendTextBatchWithTargets(
+	ctx context.Context,
+	agentName, objectKind, objectID, content string,
+	targets []ResolvedDeliveryTarget,
+) (k12.DeliveryBatch, bool, error) {
+	if len(targets) == 0 {
+		return k12.DeliveryBatch{}, false, ErrNoActiveDirectBindings
+	}
+	return d.prepareAndSendTextBatch(ctx, agentName, objectKind, objectID, content, targets)
+}
+
+func (d Deps) prepareAndSendTextBatch(
+	ctx context.Context,
+	agentName, objectKind, objectID, content string,
+	targets []ResolvedDeliveryTarget,
+) (k12.DeliveryBatch, bool, error) {
+	agentName = strings.TrimSpace(agentName)
+	objectKind = strings.TrimSpace(objectKind)
+	objectID = strings.TrimSpace(objectID)
+	content = strings.TrimSpace(content)
+	if agentName == "" || objectKind == "" || objectID == "" || content == "" {
+		return k12.DeliveryBatch{}, false, fmt.Errorf("%w: agent/object/content required", ErrInvalidInput)
+	}
+	if d.Records == nil || d.Delivery == nil {
+		return k12.DeliveryBatch{}, false, ErrDeliveryUnavailable
+	}
+	contentDigest := deliveryDigest(content)
+	dedupeKey := deliveryBatchDedupeKey(agentName, objectKind, objectID, contentDigest)
+	existing, err := d.Records.GetDeliveryBatchByDedupe(ctx, agentName, dedupeKey)
+	if err == nil {
+		return existing, false, nil
+	}
+	if !errors.Is(err, records.ErrNotFound) {
+		return k12.DeliveryBatch{}, false, err
+	}
+	batch, err := d.buildPreparedTextBatch(
+		ctx, agentName, objectKind, objectID, content, targets,
+	)
+	if err != nil {
+		return k12.DeliveryBatch{}, false, err
+	}
+	batch, created, err := d.Records.PrepareDeliveryBatch(ctx, batch)
+	if err != nil || !created {
+		return batch, created, err
+	}
+	batch, err = d.sendDeliveryBatch(ctx, batch)
+	return batch, true, err
+}
+
+// buildPreparedTextBatch freezes the target-specific payloads and constructs
+// the durable root/children value without writing the database or calling a
+// provider. Aggregate transactions may safely invoke it before their commit.
+func (d Deps) buildPreparedTextBatch(
+	ctx context.Context,
+	agentName, objectKind, objectID, content string,
+	targets []ResolvedDeliveryTarget,
+) (k12.DeliveryBatch, error) {
+	agentName = strings.TrimSpace(agentName)
+	objectKind = strings.TrimSpace(objectKind)
+	objectID = strings.TrimSpace(objectID)
+	content = strings.TrimSpace(content)
+	if agentName == "" || objectKind == "" || objectID == "" || content == "" {
+		return k12.DeliveryBatch{}, fmt.Errorf(
+			"%w: agent/object/content required", ErrInvalidInput,
+		)
+	}
+	if d.Delivery == nil {
+		return k12.DeliveryBatch{}, ErrDeliveryUnavailable
+	}
+	var prepared []PreparedTextDelivery
+	var err error
+	if targets == nil {
+		prepared, err = d.resolveAndPrepareTextBatch(ctx, agentName, content)
+	} else {
+		prepared, err = d.prepareTextForResolvedTargets(ctx, content, targets)
+	}
+	if err != nil {
+		return k12.DeliveryBatch{}, err
+	}
+	if len(prepared) == 0 {
+		return k12.DeliveryBatch{}, ErrNoActiveDirectBindings
+	}
+	contentDigest := deliveryDigest(content)
+	dedupeKey := deliveryBatchDedupeKey(agentName, objectKind, objectID, contentDigest)
+	batchID := idgen.NanoID()
+	receipts := make([]k12.DeliveryReceipt, 0, len(prepared))
+	for i, item := range prepared {
+		payloadDigest := deliveryDigest(item.PayloadJSON)
+		receipts = append(receipts, k12.DeliveryReceipt{
+			DeliveryID:    idgen.NanoID(),
+			BatchID:       batchID,
+			BatchOrdinal:  i + 1,
+			AgentName:     agentName,
+			ObjectKind:    objectKind,
+			ObjectID:      objectID,
+			BindingID:     item.BindingID,
+			Target:        item.Target,
+			DedupeKey:     deliveryDedupeKey(agentName, objectKind, objectID, item.BindingID, payloadDigest),
+			PayloadDigest: payloadDigest,
+			PayloadJSON:   item.PayloadJSON,
+			RenderJSON:    item.RenderJSON,
+		})
+	}
+	return k12.DeliveryBatch{
+		BatchID:       batchID,
+		AgentName:     agentName,
+		ObjectKind:    objectKind,
+		ObjectID:      objectID,
+		DedupeKey:     dedupeKey,
+		ContentDigest: contentDigest,
+		Receipts:      receipts,
+	}, nil
+}
+
+// sendDeliveryBatch starts only children that are durably pending. It is
+// intentionally separate from construction so callers cannot reach a provider
+// until their complete transaction has committed.
+func (d Deps) sendDeliveryBatch(
+	ctx context.Context,
+	batch k12.DeliveryBatch,
+) (k12.DeliveryBatch, error) {
+	for _, receipt := range batch.Receipts {
+		if receipt.Status != k12.DeliveryPending {
+			continue
+		}
+		if _, err := d.sendPreparedDelivery(ctx, receipt); err != nil {
+			current, getErr := d.Records.GetDeliveryBatch(
+				ctx, batch.AgentName, batch.BatchID,
+			)
+			if getErr != nil {
+				return batch, getErr
+			}
+			return current, err
+		}
+	}
+	batch, err := d.Records.GetDeliveryBatch(ctx, batch.AgentName, batch.BatchID)
+	return batch, err
+}
+
+func (d Deps) GetDeliveryBatch(ctx context.Context, agentName, batchID string) (k12.DeliveryBatch, error) {
+	if d.Records == nil {
+		return k12.DeliveryBatch{}, ErrDeliveryUnavailable
+	}
+	return d.Records.GetDeliveryBatch(ctx, strings.TrimSpace(agentName), strings.TrimSpace(batchID))
+}
+
+// RetryDeliveryBatch retries only children with explicit failed evidence.
+// Delivered, sending and outcome_unknown children are never sent here.
+func (d Deps) RetryDeliveryBatch(ctx context.Context, agentName, batchID string) (k12.DeliveryBatch, error) {
+	if d.Records == nil || d.Delivery == nil {
+		return k12.DeliveryBatch{}, ErrDeliveryUnavailable
+	}
+	batch, err := d.GetDeliveryBatch(ctx, agentName, batchID)
+	if err != nil {
+		return k12.DeliveryBatch{}, err
+	}
+	for _, receipt := range batch.Receipts {
+		if receipt.Status != k12.DeliveryFailed {
+			continue
+		}
+		if _, sendErr := d.sendPreparedDelivery(ctx, receipt); sendErr != nil {
+			current, getErr := d.GetDeliveryBatch(ctx, batch.AgentName, batch.BatchID)
+			if getErr != nil {
+				return k12.DeliveryBatch{}, getErr
+			}
+			return current, sendErr
+		}
+	}
+	return d.GetDeliveryBatch(ctx, batch.AgentName, batch.BatchID)
+}
+
+// QueryDeliveryBatch queries only in-flight or outcome_unknown children.
+// It never calls SendPrepared and terminal children remain untouched.
+func (d Deps) QueryDeliveryBatch(ctx context.Context, agentName, batchID string) (k12.DeliveryBatch, error) {
+	if d.Records == nil || d.Delivery == nil {
+		return k12.DeliveryBatch{}, ErrDeliveryUnavailable
+	}
+	batch, err := d.GetDeliveryBatch(ctx, agentName, batchID)
+	if err != nil {
+		return k12.DeliveryBatch{}, err
+	}
+	for _, receipt := range batch.Receipts {
+		if receipt.Status != k12.DeliverySending && receipt.Status != k12.DeliveryOutcomeUnknown {
+			continue
+		}
+		if _, queryErr := d.QueryDeliveryReceipt(ctx, receipt.AgentName, receipt.DeliveryID); queryErr != nil {
+			current, getErr := d.GetDeliveryBatch(ctx, batch.AgentName, batch.BatchID)
+			if getErr != nil {
+				return k12.DeliveryBatch{}, getErr
+			}
+			return current, queryErr
+		}
+	}
+	return d.GetDeliveryBatch(ctx, batch.AgentName, batch.BatchID)
 }
 
 // PrepareAndSendText freezes target/payload/render evidence, creates the

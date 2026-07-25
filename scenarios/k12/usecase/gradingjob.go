@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -122,16 +123,64 @@ func (d Deps) putGradingJob(ctx context.Context, agentName, sourceSession string
 	if err != nil {
 		return GradingJobView{}, false, err
 	}
-	if !created && v.Fields.ModelSnapshot != f.ModelSnapshot {
-		return GradingJobView{}, false, fmt.Errorf(
-			"%w: idempotency key %q is already bound to model route %q, requested %q",
-			ErrInvalidInput,
-			f.IdempotencyKey,
-			v.Fields.ModelSnapshot.Route,
-			f.ModelSnapshot.Route,
-		)
+	if !created {
+		if v.Fields.SubmissionID != f.SubmissionID {
+			return GradingJobView{}, false, fmt.Errorf(
+				"%w: idempotency key %q is already bound to submission %q, requested %q",
+				ErrInvalidInput,
+				f.IdempotencyKey,
+				v.Fields.SubmissionID,
+				f.SubmissionID,
+			)
+		}
+		storedRoute := k12.NormalizeGradingModelSnapshot(v.Fields.ModelSnapshot)
+		requestedRoute := k12.NormalizeGradingModelSnapshot(f.ModelSnapshot)
+		if storedRoute.Provider != requestedRoute.Provider ||
+			storedRoute.Model != requestedRoute.Model ||
+			storedRoute.Route != requestedRoute.Route {
+			return GradingJobView{}, false, fmt.Errorf(
+				"%w: idempotency key %q is already bound to model route %q, requested %q",
+				ErrInvalidInput,
+				f.IdempotencyKey,
+				storedRoute.Route,
+				requestedRoute.Route,
+			)
+		}
 	}
 	return v, created, nil
+}
+
+// findGradingJobByIdempotency reads the immutable Job before any mutable
+// creation dependency (notably the model catalog resolver) is consulted.
+// records.Store derives its typed dedupe key from Fields.IdempotencyKey, so the
+// probe intentionally contains only the owner, collection, and canonical key.
+func (d Deps) findGradingJobByIdempotency(
+	ctx context.Context,
+	agentName, sourceKind, sourceKey string,
+	confirmedVersion int,
+) (GradingJobView, bool, error) {
+	fields, err := json.Marshal(k12.GradingJobFields{
+		IdempotencyKey: k12.BuildGradingIdempotencyKey(sourceKind, sourceKey, confirmedVersion),
+	})
+	if err != nil {
+		return GradingJobView{}, false, fmt.Errorf("usecase: 编码批改任务幂等探针: %w", err)
+	}
+	rec, err := d.Records.FindDuplicate(ctx, &records.AgentRecord{
+		AgentName:  agentName,
+		Collection: k12.CollectionGradingJob,
+		Fields:     string(fields),
+	})
+	if errors.Is(err, records.ErrNotFound) {
+		return GradingJobView{}, false, nil
+	}
+	if err != nil {
+		return GradingJobView{}, false, fmt.Errorf("usecase: 查找幂等批改任务: %w", err)
+	}
+	v, err := d.GetGradingJob(ctx, agentName, rec.RecordID)
+	if err != nil {
+		return GradingJobView{}, false, err
+	}
+	return v, true, nil
 }
 
 // ListGradingJobs 列批改任务（§6.7 公共命令②查询；stage 空 = 全部）。始终按 agent 圈定归属。
@@ -236,6 +285,21 @@ func (d Deps) advanceGradingOK(ctx context.Context, v GradingJobView, in Advance
 	next, err := gradingNextStage(v)
 	if err != nil {
 		return GradingJobView{}, err
+	}
+	if v.Record.Status == k12.GradingStageQueued && v.Fields.FailedStage != "" {
+		for _, checkpoint := range v.Fields.StageCheckpoints {
+			if checkpoint.Stage != v.Fields.FailedStage {
+				continue
+			}
+			// A conclusive reconciliation checkpoint proves the formerly
+			// ambiguous stage completed. Clear its transient failure projection
+			// before exposing the resumed successor stage.
+			v.Fields.AttemptCount = 0
+			v.Fields.FailureKind = ""
+			v.Fields.Retryable = false
+			v.Fields.FailedStage = ""
+			break
+		}
 	}
 	// queued 只是起跑位，不产阶段产物；其余阶段成功即写检查点（规则 3）。
 	if v.Record.Status != k12.GradingStageQueued {
@@ -482,6 +546,95 @@ func (d Deps) ReconcileGradingInvocationNotExecuted(ctx context.Context, agentNa
 	}
 	v.Fields.AttemptCount = invocation.Attempt
 	v.Fields.FailureKind = "reconciled_not_executed"
+	v.Fields.Retryable = true
+	v.Fields.Deadline = 0
+	return d.saveGradingJob(ctx, v, k12.GradingStageFailedRetryable)
+}
+
+// ReconcileGradingInvocationSucceeded is an internal recovery command for the
+// opposite conclusive outcome: the exact provider result is already durable
+// locally, but the Job was parked because its acknowledgement/checkpoint write
+// was interrupted. It records the frozen stage checkpoint and exposes only a
+// checkpoint replay; it never authorizes another provider request.
+func (d Deps) ReconcileGradingInvocationSucceeded(
+	ctx context.Context,
+	agentName, recordID, invocationID, resultDigest, artifactDigest, externalRequestID string,
+) (GradingJobView, error) {
+	if d.Records == nil || strings.TrimSpace(resultDigest) == "" {
+		return GradingJobView{}, fmt.Errorf("%w: durable model result evidence is required", ErrInvalidInput)
+	}
+	v, err := d.GetGradingJob(ctx, agentName, recordID)
+	if err != nil {
+		return GradingJobView{}, err
+	}
+	invocation, err := d.Records.GetModelInvocation(ctx, agentName, invocationID)
+	if err != nil {
+		return GradingJobView{}, err
+	}
+	if invocation.JobID != recordID || invocation.Stage != v.Fields.FailedStage {
+		return GradingJobView{}, errGradingStageConflict("invocation 不属于当前 Job/失败阶段")
+	}
+	wantRoute := k12.NormalizeGradingModelSnapshot(v.Fields.ModelSnapshot)
+	gotRoute := k12.NormalizeGradingModelSnapshot(invocation.RouteSnapshot)
+	if gotRoute.Provider != wantRoute.Provider || gotRoute.Model != wantRoute.Model ||
+		gotRoute.Route != wantRoute.Route {
+		return GradingJobView{}, errGradingStageConflict("invocation 模型路由与冻结 Job 不一致")
+	}
+	if v.Record.Status == k12.GradingStageFailedRetryable &&
+		invocation.Status == k12.ModelInvocationReconciled &&
+		invocation.FailureKind == "reconciled_succeeded" &&
+		invocation.ResultDigest == resultDigest {
+		return v, nil
+	}
+	if v.Record.Status != k12.GradingStageOutcomeUnknown {
+		return GradingJobView{}, errGradingStageConflict("阶段 %s 不可执行成功结果对账", v.Record.Status)
+	}
+	switch invocation.Status {
+	case k12.ModelInvocationOutcomeUnknown:
+		invocation, err = d.Records.ReconcileModelInvocationSucceeded(
+			ctx, agentName, invocationID, resultDigest, externalRequestID,
+		)
+	case k12.ModelInvocationSent:
+		invocation, err = d.Records.MarkModelInvocationSucceeded(
+			ctx, agentName, invocationID, resultDigest, externalRequestID,
+		)
+	case k12.ModelInvocationSucceeded, k12.ModelInvocationReconciled:
+		// Validate the already-written conclusive ledger row below.
+	default:
+		return GradingJobView{}, errGradingStageConflict(
+			"invocation %s 状态 %s 不能按成功结果对账", invocationID, invocation.Status,
+		)
+	}
+	if err != nil {
+		return GradingJobView{}, err
+	}
+	if invocation.ResultDigest != resultDigest ||
+		(invocation.Status != k12.ModelInvocationSucceeded &&
+			(invocation.Status != k12.ModelInvocationReconciled ||
+				invocation.FailureKind != "reconciled_succeeded")) {
+		return GradingJobView{}, errGradingStageConflict("invocation %s 的持久结果证据不一致", invocationID)
+	}
+	checkpointReady := false
+	for _, checkpoint := range v.Fields.StageCheckpoints {
+		if checkpoint.Stage != invocation.Stage {
+			continue
+		}
+		if checkpoint.ArtifactDigest != artifactDigest {
+			return GradingJobView{}, errGradingStageConflict("阶段 %s 已存在不同结果检查点", invocation.Stage)
+		}
+		checkpointReady = true
+		break
+	}
+	if !checkpointReady {
+		v.Fields.StageCheckpoints = append(v.Fields.StageCheckpoints, k12.GradingStageCheckpoint{
+			Stage: invocation.Stage, ArtifactDigest: artifactDigest, RecordedAt: d.now(),
+		})
+	}
+	// failed_retryable is a recoverable state-machine bridge only. Recovery
+	// immediately returns it to queued, whose checkpoint replay skips the
+	// already-completed provider stage.
+	v.Fields.AttemptCount = 0
+	v.Fields.FailureKind = "reconciled_succeeded"
 	v.Fields.Retryable = true
 	v.Fields.Deadline = 0
 	return d.saveGradingJob(ctx, v, k12.GradingStageFailedRetryable)

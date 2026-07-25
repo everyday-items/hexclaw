@@ -33,9 +33,7 @@ func TestCreativeWork_RejectsForeignAsset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("本实例资产应可创建: %v", err)
 	}
-	if _, err := d.AttachFeedback(context.Background(), "xiaoming", id, "构图完整。"); err != nil {
-		t.Fatal(err)
-	}
+	generateCreativeWorkFeedbackForTest(t, &d, id, "构图完整；建议再观察一处细节。")
 	if _, err := d.SubmitRevision(context.Background(), "xiaoming", id, "", foreignAsset); err == nil {
 		t.Fatal("修改稿引用他人资产应拒绝")
 	}

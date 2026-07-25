@@ -145,9 +145,10 @@ func TestPracticeProblemMintedAtFinalize(t *testing.T) {
 // TestFinalizedAtRecorded ③：固化时间与方式持久化。
 func TestFinalizedAtRecorded(t *testing.T) {
 	d := newDataDeps(t)
+	attachDeliveredPracticeTransport(&d, 1)
 	ctx := context.Background()
 	id := mustAddVerified(t, d, ctx, "xiaoming", "数学", "1+1=?", "2", k12.PracticeAddedViaWeekly)
-	v, _, err := d.FinalizeBasket(ctx, "xiaoming", id, "send", "钉钉私聊")
+	v, _, err := d.FinalizeBasket(ctx, "xiaoming", id, "send")
 	if err != nil {
 		t.Fatal(err)
 	}

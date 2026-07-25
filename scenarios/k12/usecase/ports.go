@@ -27,6 +27,17 @@ var ErrDeliveryUnavailable = errors.New("delivery transport unavailable")
 // remains outcome_unknown until an operator can verify it externally.
 var ErrDeliveryQueryUnavailable = errors.New("delivery receipt cannot be queried safely")
 
+// ErrNoActiveDirectBindings is returned before any delivery-domain write when
+// the TutorAgent currently has no active one-to-one IM binding.
+var ErrNoActiveDirectBindings = errors.New("no active direct delivery bindings")
+
+// ResolvedDeliveryTarget is the immutable binding identity and normalized
+// direct target captured during a server-side binding-resolution pass.
+type ResolvedDeliveryTarget struct {
+	BindingID string
+	Target    k12.DeliveryTarget
+}
+
 // PreparedTextDelivery is the immutable, channel-neutral payload projection
 // frozen before a provider send begins. PayloadJSON and RenderJSON are stored
 // verbatim and reused by retries/restart recovery.
@@ -55,6 +66,19 @@ type DeliveryTransport interface {
 	PrepareText(ctx context.Context, agentName, content string) (PreparedTextDelivery, error)
 	SendPrepared(ctx context.Context, receipt k12.DeliveryReceipt) (DeliveryTransportAck, error)
 	QueryPrepared(ctx context.Context, receipt k12.DeliveryReceipt) (DeliveryTransportAck, error)
+}
+
+// BatchDeliveryTransport resolves all current active direct bindings and then
+// prepares one frozen payload per resolved target. ResolveTextTargets is split
+// from payload preparation so aggregate commands can fail with zero bindings
+// before mutating their own domain object.
+type BatchDeliveryTransport interface {
+	ResolveTextTargets(ctx context.Context, agentName string) ([]ResolvedDeliveryTarget, error)
+	PrepareTextForTargets(
+		ctx context.Context,
+		content string,
+		targets []ResolvedDeliveryTarget,
+	) ([]PreparedTextDelivery, error)
 }
 
 // Renderer 文档渲染 port（adapter = 平台 render 服务）。format=pdf/docx/...

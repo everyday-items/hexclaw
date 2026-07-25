@@ -34,6 +34,39 @@ func (d Deps) AddAccumulation(ctx context.Context, agentName, sourceSession stri
 	return rec.RecordID, created, nil
 }
 
+// SendAccumulation freezes the stored accumulation content and sends it to the
+// complete current direct-binding snapshot. The caller cannot supply or
+// override message text.
+func (d Deps) SendAccumulation(
+	ctx context.Context,
+	agentName, recordID string,
+) (k12.DeliveryBatch, bool, error) {
+	agentName = strings.TrimSpace(agentName)
+	recordID = strings.TrimSpace(recordID)
+	if agentName == "" || recordID == "" {
+		return k12.DeliveryBatch{}, false, fmt.Errorf("%w: agentName / recordID 不可空", ErrInvalidInput)
+	}
+	if d.Records == nil {
+		return k12.DeliveryBatch{}, false, ErrDeliveryUnavailable
+	}
+	rec, err := d.Records.Get(ctx, recordID)
+	if err != nil {
+		return k12.DeliveryBatch{}, false, fmt.Errorf("usecase: 取积累: %w", err)
+	}
+	if rec == nil || rec.AgentName != agentName || rec.Collection != k12.CollectionAccumulation {
+		return k12.DeliveryBatch{}, false, fmt.Errorf("%w: 积累不存在或不属于该实例", records.ErrNotFound)
+	}
+	fields, err := k12.ParseAccumFields(rec.Fields)
+	if err != nil {
+		return k12.DeliveryBatch{}, false, fmt.Errorf("usecase: 解析积累: %w", err)
+	}
+	content := strings.TrimSpace(fields.Content)
+	if content == "" {
+		return k12.DeliveryBatch{}, false, fmt.Errorf("%w: 积累内容不可空", ErrInvalidInput)
+	}
+	return d.PrepareAndSendTextBatch(ctx, agentName, "accumulation", rec.RecordID, content)
+}
+
 // 默写出题格式参数（架构设计 §3.9，2026-07-18 定死）。
 const (
 	dictationFullTextMaxRunes = 20  // ≤20 字（单词/短句）→ 全文默写

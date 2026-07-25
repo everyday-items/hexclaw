@@ -52,6 +52,9 @@ func (o *GradingOrchestrator) runAssessItems(
 
 	stageInvocation, err := o.beginFrozenAssessInvocation(ctx, run, job)
 	if err != nil {
+		if stageInvocation.InvocationID == "" {
+			return o.failModelInvocationBeforeSend(ctx, run, job.Record.RecordID, err)
+		}
 		if errors.Is(err, ErrModelInvocationRequiresReconciliation) {
 			v, advanceErr := o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run,
 				job.Record.RecordID, "invocation_reconciliation_required")
@@ -397,11 +400,13 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 		switch q.AnswerState {
 		case AnswerStateBlank:
 			item.Status = PhotoUnanswered
-			return commitGradingAssessmentItem(ctx, deps, job, q, item, "", "", k12storage.GradingAssessmentEffects{})
+			return commitGradingAssessmentItem(ctx, deps, job, q, item, "", "", "",
+				k12storage.GradingAssessmentEffects{})
 		case AnswerStateUnclear:
 			item.Status = PhotoAnswerUnclear
 			item.Warning = "检测到学生笔迹，但未能可靠读出；请家长补录后再批改"
-			return commitGradingAssessmentItem(ctx, deps, job, q, item, "", "", k12storage.GradingAssessmentEffects{})
+			return commitGradingAssessmentItem(ctx, deps, job, q, item, "", "", "",
+				k12storage.GradingAssessmentEffects{})
 		}
 	}
 
@@ -426,7 +431,54 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 				OutOfScope: true, OutOfScopeKP: kp, CurriculumUnmapped: unmapped, Evidence: solved.Evidence,
 			}
 		}
-		return commitGradingAssessmentItem(ctx, deps, job, q, item, "", "", k12storage.GradingAssessmentEffects{})
+		return commitGradingAssessmentItem(ctx, deps, job, q, item, "", "", "",
+			k12storage.GradingAssessmentEffects{})
+	}
+
+	if mode == PhotoModeSolve {
+		solved, solveInvocationID, err := executeGradingItemOperation(ctx, o, job, q,
+			k12.GradingItemOperationSolve,
+			struct {
+				InputDigest string       `json:"input_digest"`
+				Request     GradeRequest `json:"request"`
+			}{q.InputDigest, gradeReq},
+			func(callCtx context.Context) (SolveHomeworkResult, error) {
+				return deps.SolveHomeworkProblem(callCtx, gradeReq)
+			})
+		item.Solve = solved
+		if err != nil {
+			return item, err
+		}
+		durableCtx := context.WithoutCancel(ctx)
+		if solved.OutOfScope {
+			item.Status = PhotoOutOfScope
+			return commitGradingAssessmentItem(durableCtx, deps, job, q, item,
+				solveInvocationID, "", "", k12storage.GradingAssessmentEffects{})
+		}
+		guideRequest := parentTeachingGuideRequest(gradeReq, solved, GradeOutcome{})
+		rawGuide, parentGuideInvocationID, err := executeGradingItemOperation(ctx, o, job, q,
+			k12.GradingItemOperationParentGuide,
+			struct {
+				InputDigest string                     `json:"input_digest"`
+				Request     ParentTeachingGuideRequest `json:"request"`
+			}{q.InputDigest, guideRequest},
+			func(callCtx context.Context) (ParentTeachingGuide, error) {
+				return deps.generateParentTeachingGuide(callCtx, guideRequest)
+			})
+		if err != nil {
+			return item, err
+		}
+		guide, err := finalizeParentTeachingGuide(rawGuide, solved.Solution)
+		if err != nil {
+			return item, err
+		}
+		item.ParentGuide = &guide
+		item.Status = PhotoBlankSolved
+		if !photoEvidenceTrusted(solved.Evidence) {
+			item.Warning = "答案未通过程序级验算，请家长核对"
+		}
+		return commitGradingAssessmentItem(durableCtx, deps, job, q, item,
+			solveInvocationID, "", parentGuideInvocationID, k12storage.GradingAssessmentEffects{})
 	}
 
 	solved, solveInvocationID, err := executeGradingItemOperation(ctx, o, job, q,
@@ -456,16 +508,9 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 				CurriculumUnmapped: solved.CurriculumUnmapped, Evidence: solved.Evidence,
 			}
 		}
-		return commitGradingAssessmentItem(durableCtx, deps, job, q, item, solveInvocationID, "", k12storage.GradingAssessmentEffects{})
+		return commitGradingAssessmentItem(durableCtx, deps, job, q, item,
+			solveInvocationID, "", "", k12storage.GradingAssessmentEffects{})
 	}
-	if mode == PhotoModeSolve {
-		item.Status = PhotoBlankSolved
-		if !photoEvidenceTrusted(solved.Evidence) {
-			item.Warning = "答案未通过程序级验算，请家长核对"
-		}
-		return commitGradingAssessmentItem(durableCtx, deps, job, q, item, solveInvocationID, "", k12storage.GradingAssessmentEffects{})
-	}
-
 	graded, gradeInvocationID, err := executeGradingItemOperation(ctx, o, job, q,
 		k12.GradingItemOperationGrade,
 		struct {
@@ -498,7 +543,30 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 	if err != nil {
 		return item, err
 	}
-	return commitGradingAssessmentItem(durableCtx, deps, job, q, item, solveInvocationID, gradeInvocationID, effects)
+	parentGuideInvocationID := ""
+	if item.Status == PhotoWrong {
+		guideRequest := parentTeachingGuideRequest(gradeReq, solved, graded.Outcome)
+		rawGuide, invocationID, guideErr := executeGradingItemOperation(ctx, o, job, q,
+			k12.GradingItemOperationParentGuide,
+			struct {
+				InputDigest string                     `json:"input_digest"`
+				Request     ParentTeachingGuideRequest `json:"request"`
+			}{q.InputDigest, guideRequest},
+			func(callCtx context.Context) (ParentTeachingGuide, error) {
+				return deps.generateParentTeachingGuide(callCtx, guideRequest)
+			})
+		if guideErr != nil {
+			return item, guideErr
+		}
+		guide, guideErr := finalizeParentTeachingGuide(rawGuide, solved.Solution)
+		if guideErr != nil {
+			return item, guideErr
+		}
+		item.ParentGuide = &guide
+		parentGuideInvocationID = invocationID
+	}
+	return commitGradingAssessmentItem(durableCtx, deps, job, q, item,
+		solveInvocationID, gradeInvocationID, parentGuideInvocationID, effects)
 }
 
 func executeGradingItemOperation[T any](
@@ -638,6 +706,17 @@ func definitiveProviderResponse(err error) bool {
 
 }
 
+// sentProviderOutcomeUnknown applies only after the durable invocation ledger
+// has crossed MarkSent. At that point EOF/reset/generic adapter errors cannot
+// prove whether the upstream executed the request. Only a typed provider
+// response makes the failure definitive enough for an ordinary retry policy.
+func sentProviderOutcomeUnknown(callErr, ctxErr error) bool {
+	if invocationOutcomeUnknown(callErr) || invocationOutcomeUnknown(ctxErr) {
+		return true
+	}
+	return callErr != nil && !definitiveProviderResponse(callErr)
+}
+
 func definitiveProviderResponseStatus(err error) (int, bool) {
 	var providerErr DefinitiveProviderResponse
 	if !errors.As(err, &providerErr) || providerErr == nil {
@@ -676,8 +755,24 @@ func commitGradingAssessmentItem(
 	item PhotoGradeItem,
 	solveInvocationID string,
 	gradeInvocationID string,
+	parentGuideInvocationID string,
 	effects k12storage.GradingAssessmentEffects,
 ) (PhotoGradeItem, error) {
+	if (item.ParentGuide != nil) != (strings.TrimSpace(parentGuideInvocationID) != "") {
+		return item, fmt.Errorf(
+			"%w: parent guide result/invocation reference mismatch",
+			ErrGradingAssessmentExactSet,
+		)
+	}
+	if parentGuideInvocationID != "" &&
+		item.Status != PhotoWrong &&
+		item.Status != PhotoBlankSolved {
+		return item, fmt.Errorf(
+			"%w: parent guide cannot attach to status %s",
+			ErrGradingAssessmentExactSet,
+			item.Status,
+		)
+	}
 	status, err := gradingAssessmentStatus(item.Status)
 	if err != nil {
 		return item, err
@@ -692,7 +787,8 @@ func commitGradingAssessmentItem(
 		ConfirmedVersion: q.ConfirmedVersion, InputDigest: q.InputDigest,
 		Status: status, ResultJSON: string(raw), ResultDigest: modelInvocationDigest(raw),
 		SolveInvocationID: solveInvocationID, GradeInvocationID: gradeInvocationID,
-		ProjectionStatus: k12.GradingProjectionCommitted, CreatedAt: deps.now(), UpdatedAt: deps.now(),
+		ParentGuideInvocationID: parentGuideInvocationID,
+		ProjectionStatus:        k12.GradingProjectionCommitted, CreatedAt: deps.now(), UpdatedAt: deps.now(),
 	}
 	stored, _, err := deps.Records.CommitGradingAssessmentItem(ctx, receipt, effects)
 	if err != nil {
@@ -719,11 +815,17 @@ func replayGradingAssessmentItem(q RecognizedQuestion, receipt k12.GradingAssess
 		return PhotoGradeItem{Recognized: q}, fmt.Errorf("%w: problem=%s receipt payload mismatch",
 			ErrGradingAssessmentExactSet, q.ProblemID)
 	}
+	if err := validateGradingAssessmentTerminalItem(item, receipt); err != nil {
+		return PhotoGradeItem{Recognized: q}, err
+	}
 	// Projection metadata is storage-owned because only the atomic receipt
 	// transaction knows whether the Mistake insert won or hit an existing row.
 	// Overlay it after validating the immutable model-result payload.
 	item.Grade.RecordID = receipt.ProjectionRecordID
 	item.Grade.RecordCreated = receipt.ProjectionCreated
+	if item.ResultKind == "" {
+		item.ResultKind = photoItemResultKind(item.Status)
+	}
 	return item, nil
 }
 
@@ -779,6 +881,9 @@ func validateGradingAssessmentExactSet(result PhotoGradeResult, receipts []k12.G
 			receipt.ConfirmedVersion != item.Recognized.ConfirmedVersion || receipt.InputDigest != item.Recognized.InputDigest {
 			return fmt.Errorf("%w: result identity mismatch problem=%s", ErrGradingAssessmentExactSet, problemID)
 		}
+		if err := validateGradingAssessmentTerminalItem(item, receipt); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -813,11 +918,61 @@ func validateFrozenAssessReceiptSet(run *gradingRun, receipts []k12.GradingAsses
 			return fmt.Errorf("%w: receipt identity mismatch problem=%s",
 				ErrGradingAssessmentExactSet, question.ProblemID)
 		}
+		if _, err := replayGradingAssessmentItem(question, receipt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateGradingAssessmentTerminalItem(
+	item PhotoGradeItem,
+	receipt k12.GradingAssessmentItem,
+) error {
+	if err := receipt.ValidateTerminalParentGuideReference(); err != nil {
+		return fmt.Errorf(
+			"%w: problem=%s: %v",
+			ErrGradingAssessmentExactSet,
+			receipt.ProblemID,
+			err,
+		)
+	}
+	switch receipt.Status {
+	case k12.GradingAssessmentWrong, k12.GradingAssessmentBlankSolved:
+		if item.ParentGuide == nil {
+			return fmt.Errorf(
+				"%w: problem=%s status=%s requires a complete parent guide",
+				ErrGradingAssessmentExactSet,
+				receipt.ProblemID,
+				receipt.Status,
+			)
+		}
+		if err := validateParentTeachingGuide(*item.ParentGuide); err != nil {
+			return fmt.Errorf(
+				"%w: problem=%s incomplete parent guide: %v",
+				ErrGradingAssessmentExactSet,
+				receipt.ProblemID,
+				err,
+			)
+		}
+	default:
+		if item.ParentGuide != nil {
+			return fmt.Errorf(
+				"%w: problem=%s status=%s must remain parent-guide-free",
+				ErrGradingAssessmentExactSet,
+				receipt.ProblemID,
+				receipt.Status,
+			)
+		}
 	}
 	return nil
 }
 
 func gradingAssessmentCanonicalResult(item PhotoGradeItem) PhotoGradeItem {
+	// ResultKind is a deterministic projection of Status. Excluding it keeps
+	// pre-field receipts replayable while every live/API result still exposes
+	// the explicit item semantics.
+	item.ResultKind = ""
 	item.Grade.RecordID = ""
 	item.Grade.RecordCreated = false
 	return item

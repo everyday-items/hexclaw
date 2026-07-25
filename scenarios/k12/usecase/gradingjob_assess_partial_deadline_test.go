@@ -387,7 +387,9 @@ func TestGradingOrchestratorAssessOrdinaryFailureWithZeroCompletedItemsBecomesFa
 		Question: "1+1=", Subject: "数学", StudentAnswer: "2", AnswerState: AnswerStatePresent,
 	}}}
 	o := newParallelAnchorOrchestrator(t, recognizer, nil)
-	o.deps.Grader = photoGradeErrorGrader{err: errors.New("provider returned 503")}
+	o.deps.Grader = photoGradeErrorGrader{
+		err: &gradingProviderResponseError{status: 503},
+	}
 
 	jobID := startOrchestratorJob(t, o, "msg-assess-ordinary-item-failure").Record.RecordID
 	if _, err := o.RunGradingJob(context.Background(), jobID); err != nil {

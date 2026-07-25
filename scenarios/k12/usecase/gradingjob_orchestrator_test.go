@@ -17,8 +17,8 @@ import (
 
 // --- 编排器专用替身（pipeline_test.go / photo_grade_test.go 替身的计数扩展）---
 
-// countingRecognizer 前 failures 次调用返回可重试的下游错误，之后成功；calls 计数用于
-// 断言「检查点恢复不重复调用识别模型」（§6.7 规则 3）。
+// countingRecognizer 前 failures 次调用返回已收到 HTTP 503 的确定性下游错误，
+// 之后成功；calls 计数用于断言「检查点恢复不重复调用识别模型」（§6.7 规则 3）。
 type countingRecognizer struct {
 	questions []RecognizedQuestion
 	failures  int
@@ -28,7 +28,7 @@ type countingRecognizer struct {
 func (r *countingRecognizer) Recognize(context.Context, []byte) ([]RecognizedQuestion, error) {
 	r.calls++
 	if r.calls <= r.failures {
-		return nil, fmt.Errorf("vision provider timeout")
+		return nil, &gradingProviderResponseError{status: 503}
 	}
 	return append([]RecognizedQuestion(nil), r.questions...), nil
 }
@@ -391,6 +391,159 @@ func TestStartPhotoGradingJobRejectsIdempotencySnapshotConflict(t *testing.T) {
 	}
 }
 
+func TestStartPhotoGradingJobSameRouteReplayKeepsFrozenSnapshotMetadata(t *testing.T) {
+	d, _ := newPipeline(t,
+		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil)
+	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d,
+		func(requested k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
+			return k12.NormalizeGradingModelSnapshot(requested), nil
+		},
+	))
+	firstSnapshot := k12.GradingModelSnapshot{
+		Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", Capability: "vision", TimeoutMS: 30_000,
+	}
+	first, created, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "same-route-replay",
+		ModelSnapshot: firstSnapshot,
+	})
+	if err != nil || !created {
+		t.Fatalf("first start err=%v created=%v", err, created)
+	}
+
+	replayed, created, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "same-route-replay",
+		ModelSnapshot: k12.GradingModelSnapshot{
+			Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", Capability: "vision", TimeoutMS: 60_000,
+		},
+	})
+	if err != nil || created || replayed.Record.RecordID != first.Record.RecordID {
+		t.Fatalf("same route replay err=%v created=%v id=%s want=%s", err, created, replayed.Record.RecordID, first.Record.RecordID)
+	}
+	if replayed.Fields.ModelSnapshot.TimeoutMS != firstSnapshot.TimeoutMS {
+		t.Fatalf("replay rewrote frozen snapshot metadata: got=%+v want=%+v", replayed.Fields.ModelSnapshot, firstSnapshot)
+	}
+}
+
+func TestStartPhotoGradingJobReplayUsesFrozenRouteBeforeMutableResolver(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		replay k12.GradingModelSnapshot
+	}{
+		{name: "empty request"},
+		{name: "auto request", replay: k12.GradingModelSnapshot{Model: "auto"}},
+		{
+			name: "same explicit route after model removal",
+			replay: k12.GradingModelSnapshot{
+				Provider: "provider-a", Model: "vision-a", Route: "provider-a/vision-a",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _ := newPipeline(t,
+				fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+				fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil)
+			resolverCalls := 0
+			modelAvailable := true
+			current := k12.GradingModelSnapshot{
+				Provider: "provider-a", Model: "vision-a", Route: "provider-a/vision-a", Capability: "vision",
+			}
+			o := trackGradingOrchestrator(t, NewGradingOrchestrator(d,
+				func(k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
+					resolverCalls++
+					if !modelAvailable {
+						return k12.GradingModelSnapshot{}, errors.New("configured model was removed")
+					}
+					return current, nil
+				},
+			))
+			first, created, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
+				Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "frozen-replay",
+			})
+			if err != nil || !created {
+				t.Fatalf("first start err=%v created=%v", err, created)
+			}
+			if resolverCalls != 1 {
+				t.Fatalf("first start resolver calls=%d want=1", resolverCalls)
+			}
+
+			// Both a changed default and a removed/disabled catalog entry must be
+			// irrelevant to an exact idempotent replay of the persisted Job.
+			current = k12.GradingModelSnapshot{
+				Provider: "provider-b", Model: "vision-b", Route: "provider-b/vision-b", Capability: "vision",
+			}
+			modelAvailable = false
+			replayed, created, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
+				Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "frozen-replay",
+				ModelSnapshot: tc.replay,
+			})
+			if err != nil || created {
+				t.Fatalf("replay err=%v created=%v", err, created)
+			}
+			if replayed.Record.RecordID != first.Record.RecordID {
+				t.Fatalf("replay record=%s want=%s", replayed.Record.RecordID, first.Record.RecordID)
+			}
+			if replayed.Fields.ModelSnapshot.Route != "provider-a/vision-a" {
+				t.Fatalf("replay route=%+v want frozen provider-a/vision-a", replayed.Fields.ModelSnapshot)
+			}
+			if resolverCalls != 1 {
+				t.Fatalf("idempotent replay consulted mutable resolver: calls=%d want=1", resolverCalls)
+			}
+		})
+	}
+}
+
+func TestStartPhotoGradingJobReplayValidatesIdentityBeforeMutableResolver(t *testing.T) {
+	d, _ := newPipeline(t,
+		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil)
+	resolverCalls := 0
+	modelAvailable := true
+	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d,
+		func(requested k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
+			resolverCalls++
+			if !modelAvailable {
+				return k12.GradingModelSnapshot{}, errors.New("configured model was removed")
+			}
+			if strings.TrimSpace(requested.Provider) == "" {
+				return k12.GradingModelSnapshot{
+					Provider: "provider-a", Model: "vision-a", Route: "provider-a/vision-a",
+				}, nil
+			}
+			return k12.NormalizeGradingModelSnapshot(requested), nil
+		},
+	))
+	if _, created, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "identity-before-resolver",
+	}); err != nil || !created {
+		t.Fatalf("first start err=%v created=%v", err, created)
+	}
+	modelAvailable = false
+
+	changedPhoto := orchestratorPhotoRequest()
+	changedPhoto.Image = []byte("different image bytes")
+	if _, created, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
+		Photo: changedPhoto, SourceKind: "desktop", SourceKey: "identity-before-resolver",
+	}); !errors.Is(err, ErrInvalidInput) || created || !strings.Contains(err.Error(), "submission") {
+		t.Fatalf("submission conflict err=%v created=%v, want immutable submission rejection", err, created)
+	}
+	if resolverCalls != 1 {
+		t.Fatalf("submission conflict consulted mutable resolver: calls=%d want=1", resolverCalls)
+	}
+
+	if _, created, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "identity-before-resolver",
+		ModelSnapshot: k12.GradingModelSnapshot{
+			Provider: "provider-b", Model: "vision-b", Route: "provider-b/vision-b",
+		},
+	}); !errors.Is(err, ErrInvalidInput) || created || !strings.Contains(err.Error(), "model route") {
+		t.Fatalf("route conflict err=%v created=%v, want frozen route rejection", err, created)
+	}
+	if resolverCalls != 1 {
+		t.Fatalf("route conflict consulted mutable resolver: calls=%d want=1", resolverCalls)
+	}
+}
+
 func TestGradingProvider400IsTerminalWithoutRetry(t *testing.T) {
 	rec := &providerErrorRecognizer{err: &gradingProviderResponseError{status: 400}}
 	o := newOrchestrator(t, rec, nil, nil)
@@ -478,5 +631,33 @@ func TestGradingOrchestratorIdempotentStart(t *testing.T) {
 	}
 	if created2 || v2.Record.RecordID != v1.Record.RecordID {
 		t.Fatalf("同幂等键应命中既有 Job: created=%v id=%s want %s", created2, v2.Record.RecordID, v1.Record.RecordID)
+	}
+}
+
+func TestStartPhotoGradingJobSameKeyDifferentImageFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	o := newOrchestrator(t, &countingRecognizer{}, nil, nil)
+
+	first, firstCreated, firstErr := o.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "desktop-request-immutable",
+	})
+	if firstErr != nil || !firstCreated {
+		t.Fatalf("first StartPhotoGradingJob: created=%v err=%v", firstCreated, firstErr)
+	}
+	changed := orchestratorPhotoRequest()
+	changed.Image = []byte("different inbound jpeg bytes")
+	got, created, err := o.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
+		Photo: changed, SourceKind: "desktop", SourceKey: "desktop-request-immutable",
+	})
+	if !errors.Is(err, ErrInvalidInput) || created {
+		t.Fatalf("same request_id with different image must fail closed: got=%+v created=%v err=%v", got, created, err)
+	}
+
+	stored, getErr := o.deps.GetGradingJob(ctx, "mingming", first.Record.RecordID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if stored.Fields.SubmissionID != first.Fields.SubmissionID {
+		t.Fatalf("identity conflict overwrote immutable submission: got=%s want=%s", stored.Fields.SubmissionID, first.Fields.SubmissionID)
 	}
 }

@@ -9,7 +9,91 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
-func TestConfirmPhotoGradingJob_RiskyOCRRequiresExplicitItemConfirmationAndPreservesRaw(t *testing.T) {
+func TestImageTaskPhotoGrading_ClearFormattedOCRAutoFreezesAndCompletes(t *testing.T) {
+	ctx := context.Background()
+	rec := &countingRecognizer{questions: []RecognizedQuestion{
+		{
+			Question: "4÷0.5=", Subject: "数学",
+			AnswerState: AnswerStatePresent, StudentAnswer: "8",
+			RecognitionConfidence: float64Ptr(0.99), OCRSignals: []string{"decimal_point"},
+		},
+		{
+			Question: `\frac{5}{7}-\frac{1}{5}=`, Subject: "数学",
+			AnswerState: AnswerStatePresent, StudentAnswer: `\frac{18}{35}`,
+			RecognitionConfidence: float64Ptr(0.99), OCRSignals: []string{"fraction"},
+		},
+	}}
+	d := recoveryDeps(t, rec, nil, nil)
+	o := newRecoverableOrchestrator(t, d, t.TempDir())
+	v, _, err := o.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "image_task", SourceKey: "clear-formatted-auto-freeze",
+	})
+	if err != nil {
+		t.Fatalf("StartPhotoGradingJob: %v", err)
+	}
+	jobID := v.Record.RecordID
+	v, err = o.RunGradingJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("RunGradingJob: %v", err)
+	}
+	if v.Fields.ConfirmationState != k12.GradingConfirmationConfirmed {
+		t.Fatalf("clear image-task facts must auto-freeze, got stage=%s confirmation=%s",
+			v.Record.Status, v.Fields.ConfirmationState)
+	}
+	v = waitForStage(t, d, "mingming", jobID, k12.GradingStageCompleted)
+	questions, ok := o.RecognizedQuestions(ctx, jobID)
+	if !ok || len(questions) != 2 {
+		t.Fatalf("missing recognized questions: %#v", questions)
+	}
+	for _, question := range questions {
+		if question.ConfirmationRequired || question.ConfirmedVersion != 1 || question.InputDigest == "" {
+			t.Fatalf("clear formatted fact was not auto-frozen: %#v", question)
+		}
+	}
+	result, ok := o.PhotoResult(jobID)
+	if !ok || len(result.Items) != 2 {
+		t.Fatalf("program-verified grading did not run after auto-freeze: %#v", result)
+	}
+}
+
+func TestImageTaskPhotoGrading_MissingConfidenceRequiresConfirmation(t *testing.T) {
+	ctx := context.Background()
+	rec := &countingRecognizer{questions: []RecognizedQuestion{{
+		Question: "7+8=", Subject: "数学",
+		AnswerState: AnswerStatePresent, StudentAnswer: "15",
+	}}}
+	d := recoveryDeps(t, rec, nil, nil)
+	o := newRecoverableOrchestrator(t, d, t.TempDir())
+	v, _, err := o.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
+		Photo: orchestratorPhotoRequest(), SourceKind: "image_task", SourceKey: "missing-confidence",
+	})
+	if err != nil {
+		t.Fatalf("StartPhotoGradingJob: %v", err)
+	}
+	jobID := v.Record.RecordID
+	v, err = o.RunGradingJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("RunGradingJob: %v", err)
+	}
+	if v.Record.Status != k12.GradingStageAwaitingConfirmation ||
+		v.Fields.ConfirmationState != k12.GradingConfirmationPending {
+		t.Fatalf("missing confidence must stop for confirmation, got stage=%s confirmation=%s",
+			v.Record.Status, v.Fields.ConfirmationState)
+	}
+	questions, ok := o.RecognizedQuestions(ctx, jobID)
+	if !ok || len(questions) != 1 || !questions[0].ConfirmationRequired {
+		t.Fatalf("missing confidence risk was not projected: %#v", questions)
+	}
+	hasLowConfidence := false
+	for _, reason := range questions[0].ConfirmationReasons {
+		hasLowConfidence = hasLowConfidence || reason == OCRRiskLowConfidence
+	}
+	if !hasLowConfidence {
+		t.Fatalf("missing confidence must expose low_confidence: %#v", questions[0].ConfirmationReasons)
+	}
+}
+
+func TestConfirmPhotoGradingJob_ConflictingOCRRequiresExplicitItemConfirmationAndPreservesRaw(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	raw := `原图转写：\frac{3}{5}+\frac{1}{5}=`
@@ -22,6 +106,10 @@ func TestConfirmPhotoGradingJob_RiskyOCRRequiresExplicitItemConfirmationAndPrese
 		StudentAnswer:          "3/5",
 		AnswerRawTranscription: "3/5",
 		RecognitionConfidence:  float64Ptr(0.99),
+		EvidenceTranscriptions: []string{
+			`3/5+1/5=`,
+			`3/5+7/5=`,
+		},
 	}}}
 	d := recoveryDeps(t, rec, &photoAnchorerFake{boxes: map[int]BBox{0: {X: .2, Y: .3, W: .1, H: .05}}}, &photoAnnotatorFake{})
 	o := newRecoverableOrchestrator(t, d, dir)
@@ -41,6 +129,13 @@ func TestConfirmPhotoGradingJob_RiskyOCRRequiresExplicitItemConfirmationAndPrese
 	qs, ok := o.RecognizedQuestions(ctx, jobID)
 	if !ok || len(qs) != 1 || !qs[0].ConfirmationRequired || qs[0].ProblemID == "" {
 		t.Fatalf("recognition must expose stable risky item: %#v", qs)
+	}
+	hasConflict := false
+	for _, reason := range qs[0].ConfirmationReasons {
+		hasConflict = hasConflict || reason == OCRRiskEvidenceConflict
+	}
+	if !hasConflict {
+		t.Fatalf("conflicting OCR must preserve evidence_conflict reason: %#v", qs[0].ConfirmationReasons)
 	}
 
 	_, handled, err := o.ConfirmPhotoGradingJob(ctx, jobID, ConfirmPhotoGradingInput{})

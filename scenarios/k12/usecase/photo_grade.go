@@ -18,6 +18,39 @@ const (
 	PhotoModeSolve PhotoMode = "solve"
 )
 
+// PhotoTaskIntent is the domain meaning of a page-level photo task. PhotoMode
+// remains the legacy processing switch; this additive field gives result
+// consumers stable product semantics without changing existing grade/solve
+// clients.
+type PhotoTaskIntent string
+
+const (
+	PhotoTaskCompletedHomework PhotoTaskIntent = "completed_homework"
+	PhotoTaskBlankWorksheet    PhotoTaskIntent = "blank_worksheet"
+)
+
+// PhotoResultSurface identifies the approved result presentation selected by a
+// photo task. It is data semantics only; clients retain control of rendering.
+type PhotoResultSurface string
+
+const (
+	PhotoSurfaceAnnotatedHomework   PhotoResultSurface = "annotated_homework"
+	PhotoSurfaceParentTeachingGuide PhotoResultSurface = "parent_teaching_guide"
+)
+
+// PhotoItemResultKind makes item-level routing explicit, including the
+// unanswered items preserved on a completed-homework page.
+type PhotoItemResultKind string
+
+const (
+	PhotoItemAssessment          PhotoItemResultKind = "assessment"
+	PhotoItemParentTeachingGuide PhotoItemResultKind = "parent_teaching_guide"
+	PhotoItemUnanswered          PhotoItemResultKind = "unanswered"
+	PhotoItemNeedsReview         PhotoItemResultKind = "needs_review"
+	PhotoItemOutOfScope          PhotoItemResultKind = "out_of_scope"
+	PhotoItemFailed              PhotoItemResultKind = "failed"
+)
+
 // PhotoItemStatus 避免用一个 correct=false 混淆“答错、超纲、待核对、处理失败”。
 type PhotoItemStatus string
 
@@ -38,18 +71,25 @@ type PhotoGradeRequest struct {
 	Grade         string
 	SourceSession string
 	Image         []byte
+	// TaskIntent is frozen by ImageTaskDispatch. Empty preserves the legacy
+	// direct-photo path which infers intent from recognition evidence.
+	TaskIntent PhotoTaskIntent
 }
 
 type PhotoGradeItem struct {
-	Recognized RecognizedQuestion
-	Status     PhotoItemStatus
-	Grade      GradeResult
-	Solve      SolveHomeworkResult
-	Warning    string
+	Recognized  RecognizedQuestion
+	Status      PhotoItemStatus
+	ResultKind  PhotoItemResultKind
+	Grade       GradeResult
+	Solve       SolveHomeworkResult
+	ParentGuide *ParentTeachingGuide
+	Warning     string
 }
 
 type PhotoGradeResult struct {
 	Mode           PhotoMode
+	TaskIntent     PhotoTaskIntent
+	ResultSurface  PhotoResultSurface
 	Items          []PhotoGradeItem
 	AnnotatedImage *RenderedPhoto
 	ImageWarning   string
@@ -161,8 +201,30 @@ func (d Deps) gradeHomeworkPhotoWithAssessorInput(
 			imageWarning = "未配置疑似笔迹核验，为避免泄露答案，本次按批改卷处理"
 		}
 	}
+	if req.TaskIntent != "" {
+		expectedMode := PhotoModeGrade
+		switch req.TaskIntent {
+		case PhotoTaskCompletedHomework:
+			expectedMode = PhotoModeGrade
+		case PhotoTaskBlankWorksheet:
+			expectedMode = PhotoModeSolve
+		default:
+			return PhotoGradeResult{}, fmt.Errorf("%w: frozen photo task intent 非法: %q", ErrInvalidInput, req.TaskIntent)
+		}
+		if mode != expectedMode {
+			return PhotoGradeResult{}, fmt.Errorf(
+				"%w: frozen photo task intent %q 与识别到的作答证据冲突",
+				ErrInvalidInput, req.TaskIntent,
+			)
+		}
+		mode = expectedMode
+	}
 
-	result := PhotoGradeResult{Mode: mode, Items: make([]PhotoGradeItem, len(questions)), ImageWarning: imageWarning}
+	taskIntent, resultSurface := photoTaskSemantics(mode)
+	result := PhotoGradeResult{
+		Mode: mode, TaskIntent: taskIntent, ResultSurface: resultSurface,
+		Items: make([]PhotoGradeItem, len(questions)), ImageWarning: imageWarning,
+	}
 	var wg sync.WaitGroup
 	var dispatchMu sync.Mutex
 	nextQuestion := 0
@@ -215,6 +277,11 @@ func (d Deps) gradeHomeworkPhotoWithAssessorInput(
 		}()
 	}
 	wg.Wait()
+	for i := range result.Items {
+		if result.Items[i].ResultKind == "" {
+			result.Items[i].ResultKind = photoItemResultKind(result.Items[i].Status)
+		}
+	}
 	if unknownErr != nil {
 		result.Markdown = photoGradeMarkdown(result)
 		return result, unknownErr
@@ -290,17 +357,18 @@ func (d Deps) assessPhotoItem(
 	}
 
 	gradeReq.StudentAnswer = ""
-	solved, err := d.SolveHomeworkProblem(ctx, gradeReq)
-	item.Solve = solved
+	blankResult, err := d.SolveBlankWorksheetProblem(ctx, gradeReq)
+	item.Solve = blankResult.Solved
 	if err != nil {
 		return item, err
 	}
-	if solved.OutOfScope {
+	if blankResult.Solved.OutOfScope {
 		item.Status = PhotoOutOfScope
 		return item, nil
 	}
+	item.ParentGuide = &blankResult.Guide
 	item.Status = PhotoBlankSolved
-	if !photoEvidenceTrusted(solved.Evidence) {
+	if !photoEvidenceTrusted(blankResult.Solved.Evidence) {
 		item.Warning = "答案未通过程序级验算，请家长核对"
 	}
 	return item, nil
@@ -318,6 +386,58 @@ func classifyPhotoMode(questions []RecognizedQuestion) PhotoMode {
 		}
 	}
 	return PhotoModeSolve
+}
+
+func photoTaskSemantics(mode PhotoMode) (PhotoTaskIntent, PhotoResultSurface) {
+	if mode == PhotoModeSolve {
+		return PhotoTaskBlankWorksheet, PhotoSurfaceParentTeachingGuide
+	}
+	return PhotoTaskCompletedHomework, PhotoSurfaceAnnotatedHomework
+}
+
+func photoItemResultKind(status PhotoItemStatus) PhotoItemResultKind {
+	switch status {
+	case PhotoCorrect, PhotoWrong:
+		return PhotoItemAssessment
+	case PhotoBlankSolved:
+		return PhotoItemParentTeachingGuide
+	case PhotoUnanswered:
+		return PhotoItemUnanswered
+	case PhotoAnswerUnclear, PhotoUntrusted:
+		return PhotoItemNeedsReview
+	case PhotoOutOfScope:
+		return PhotoItemOutOfScope
+	default:
+		return PhotoItemFailed
+	}
+}
+
+// EffectiveTaskIntent preserves compatibility with historical/restored values
+// which predate the explicit domain fields.
+func (r PhotoGradeResult) EffectiveTaskIntent() PhotoTaskIntent {
+	if r.TaskIntent != "" {
+		return r.TaskIntent
+	}
+	intent, _ := photoTaskSemantics(r.Mode)
+	return intent
+}
+
+// EffectiveResultSurface preserves compatibility with historical/restored
+// values which predate the explicit domain fields.
+func (r PhotoGradeResult) EffectiveResultSurface() PhotoResultSurface {
+	if r.ResultSurface != "" {
+		return r.ResultSurface
+	}
+	_, surface := photoTaskSemantics(r.Mode)
+	return surface
+}
+
+// EffectiveResultKind preserves compatibility with historical item receipts.
+func (i PhotoGradeItem) EffectiveResultKind() PhotoItemResultKind {
+	if i.ResultKind != "" {
+		return i.ResultKind
+	}
+	return photoItemResultKind(i.Status)
 }
 
 func photoAnswerCandidates(questions []RecognizedQuestion) (present, unclear bool) {
@@ -409,13 +529,17 @@ func photoAnnotationHasTrustedBBox(mark PhotoAnnotation) bool {
 func photoGradeMarkdown(result PhotoGradeResult) string {
 	var b strings.Builder
 	if result.Mode == PhotoModeSolve {
-		b.WriteString("## 作业解题\n\n")
-		b.WriteString(fmt.Sprintf("共识别 **%d** 道空白题，下面按题号给出解答。\n\n", len(result.Items)))
+		b.WriteString("## 家长辅导指南\n\n")
+		b.WriteString(fmt.Sprintf("共识别 **%d** 道空白题，下面按题号给出家长辅导步骤。\n\n", len(result.Items)))
 		for i, item := range result.Items {
 			fmt.Fprintf(&b, "### %d. %s\n\n", i+1, photoClip(item.Recognized.Question, 240))
 			switch item.Status {
 			case PhotoBlankSolved:
-				b.WriteString(photoClip(item.Solve.Solution, 1200))
+				if item.ParentGuide != nil {
+					writeParentTeachingGuideMarkdown(&b, *item.ParentGuide)
+				} else {
+					b.WriteString(photoClip(item.Solve.Solution, 1200))
+				}
 				if item.Warning != "" {
 					fmt.Fprintf(&b, "\n\n> ⚠️ %s", item.Warning)
 				}
@@ -495,8 +619,15 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 		fmt.Fprintf(&b, "#### 第 %d 题\n\n", i+1)
 		fmt.Fprintf(&b, "- **题目：** %s\n- **你的作答：** %s\n- **订正参考：**\n\n%s",
 			photoInline(item.Recognized.Question, 240), photoInline(item.Recognized.StudentAnswer, 300), photoMarkdownQuote(item.Grade.Solution, 1000))
+		if item.Grade.Outcome.WrongStep != "" {
+			fmt.Fprintf(&b, "\n- **第一个错步：** %s", photoInline(item.Grade.Outcome.WrongStep, 300))
+		}
 		if item.Grade.Outcome.ErrorCause != "" {
 			fmt.Fprintf(&b, "\n- **错因：** %s", photoInline(item.Grade.Outcome.ErrorCause, 300))
+		}
+		if item.ParentGuide != nil {
+			b.WriteString("\n\n##### 家长讲法\n\n")
+			writeParentTeachingGuideMarkdown(&b, *item.ParentGuide)
 		}
 		b.WriteString("\n\n")
 	}
@@ -523,6 +654,25 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 		}
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func writeParentTeachingGuideMarkdown(b *strings.Builder, guide ParentTeachingGuide) {
+	fmt.Fprintf(b, "**答案：** %s\n\n", photoInline(guide.Answer, 600))
+	writeParentGuideListMarkdown(b, "**必要步骤：**", guide.FullSolutionSteps)
+	fmt.Fprintf(b, "**本年级方法：** %s\n\n", photoInline(guide.GradeLevelMethod, 1200))
+	writeParentGuideListMarkdown(b, "**易错点：**", guide.LikelyMistakes)
+	writeParentGuideListMarkdown(b, "**家长怎么讲：**", guide.ParentTeachingSequence)
+	writeParentGuideListMarkdown(b, "**可以追问：**", guide.FollowUpQuestions)
+	fmt.Fprintf(b, "**怎么检查：** %s", photoInline(guide.CheckingMethod, 1200))
+}
+
+func writeParentGuideListMarkdown(b *strings.Builder, label string, values []string) {
+	b.WriteString(label)
+	b.WriteString("\n\n")
+	for i, value := range values {
+		fmt.Fprintf(b, "%d. %s\n", i+1, photoInline(value, 600))
+	}
+	b.WriteString("\n")
 }
 
 func photoInline(s string, max int) string {

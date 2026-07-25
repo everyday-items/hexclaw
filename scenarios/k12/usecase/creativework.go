@@ -89,17 +89,9 @@ func (d Deps) GetCreativeWork(ctx context.Context, agentName, recordID string) (
 	return CreativeWorkView{Record: rec, Fields: f}, nil
 }
 
-// AttachFeedback 给作品最新版本附上家长手写的证据化点评（draft/revised → feedback_ready，
-// PRD §3.10 / INV-011）。来源标记 parent，与 AI 生成（GenerateWorkFeedback，source=ai）区分。
-// 家长手写不经方法论基座，skillStamp 恒空。
-func (d Deps) AttachFeedback(ctx context.Context, agentName, recordID, feedback string) (CreativeWorkView, error) {
-	return d.attachFeedbackWithSource(ctx, agentName, recordID, feedback, k12.FeedbackSourceParent, "")
-}
-
-// attachFeedbackWithSource 点评落库的公共路径：状态门（draft/revised）→ 写最新版本 →
-// feedback_ready。source 标记点评来源（ai / parent）；skillStamp 标记 AI 点评所用方法论
-// 基座来源戳（如 "writing-feedback@1.0.0/disk"，家长手写为空），供追溯每条点评用的哪版方法论。
-func (d Deps) attachFeedbackWithSource(ctx context.Context, agentName, recordID, feedback, source, skillStamp string) (CreativeWorkView, error) {
+// attachAIFeedback is the internal AI-feedback persistence path:
+// state gate (draft/revised), latest-version write, then feedback_ready.
+func (d Deps) attachAIFeedback(ctx context.Context, agentName, recordID, feedback, skillStamp string) (CreativeWorkView, error) {
 	v, err := d.GetCreativeWork(ctx, agentName, recordID)
 	if err != nil {
 		return CreativeWorkView{}, err
@@ -115,9 +107,11 @@ func (d Deps) attachFeedbackWithSource(ctx context.Context, agentName, recordID,
 	}
 	last := &v.Fields.Versions[len(v.Fields.Versions)-1]
 	last.Feedback = feedback
-	last.FeedbackSource = source
+	last.FeedbackSource = k12.FeedbackSourceAI
 	last.FeedbackSkill = skillStamp
-	structured := buildStructuredWorkFeedback(v.Fields.WorkType, *last, feedback, source, skillStamp)
+	structured := buildStructuredWorkFeedback(
+		v.Fields.WorkType, *last, feedback, k12.FeedbackSourceAI, skillStamp,
+	)
 	if err := structured.Validate(); err != nil {
 		return CreativeWorkView{}, fmt.Errorf("%w: 结构化作品点评非法: %v", ErrInvalidInput, err)
 	}
@@ -217,10 +211,8 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 		return false
 	}
 	limitations := "仅依据本版本提交的孩子原文进行观察，不评价能力高低，也不代写全文。"
-	actions := []string{"send"}
 	if workType == k12.WorkTypeArt {
 		limitations = "仅依据本版本提交的可见画面进行观察，不评分、不排名，也不替孩子重画。"
-		actions = []string{"send", "print_practice_card"}
 	}
 	observationEvidence := make([]string, 0, 5)
 	suggestions := make([]string, 0, 3)
@@ -306,24 +298,6 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 	} else if method == "" {
 		method = "parent/manual"
 	}
-	if workType == k12.WorkTypeWriting {
-		hasCollect := false
-		hasLanguageIssue := false
-		for _, observation := range observations {
-			switch observation.Dimension {
-			case "expression":
-				hasCollect = true
-			case "language_detail":
-				hasLanguageIssue = true
-			}
-		}
-		if hasCollect {
-			actions = append(actions, "collect")
-		}
-		if hasLanguageIssue {
-			actions = append(actions, "record_language_issue")
-		}
-	}
 	idSum := sha256.Sum256([]byte(strings.Join([]string{version.VersionID, source, method, strings.TrimSpace(feedback)}, "\x00")))
 	structured := k12.WorkFeedback{
 		FeedbackID:   fmt.Sprintf("feedback-%x", idSum[:12]),
@@ -336,7 +310,6 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 		},
 		Limitations:        limitations,
 		Suggestions:        suggestions,
-		AllowedActions:     actions,
 		ProjectionMarkdown: "",
 	}
 	structured.ProjectionMarkdown = k12.ProjectWorkFeedbackMarkdown(structured)
@@ -391,45 +364,6 @@ func (d Deps) submitRevisionVersion(
 		return CreativeWorkView{}, err
 	}
 	return d.GetCreativeWork(ctx, agentName, recordID)
-}
-
-// MarkPracticeCardDone 观察练习卡完成打卡（§3.10：练习必须有产物，产物归档在版本记录）。
-// 卡内容由最新一条带点评版本的点评正文提炼（k12.ObservationPracticeCard），此处只记完成
-// 时间：幂等——已打卡保留首次时间，不重复计。仅美术作品有观察练习卡。
-func (d Deps) MarkPracticeCardDone(ctx context.Context, agentName, recordID string) (CreativeWorkView, error) {
-	v, err := d.GetCreativeWork(ctx, agentName, recordID)
-	if err != nil {
-		return CreativeWorkView{}, err
-	}
-	if v.Fields.WorkType != k12.WorkTypeArt {
-		return CreativeWorkView{}, fmt.Errorf("%w: 观察练习卡只属于美术作品", ErrInvalidInput)
-	}
-	if v.Record.Status == k12.WorkStatusArchived {
-		return CreativeWorkView{}, fmt.Errorf("%w: 已归档作品不可继续打卡", ErrInvalidInput)
-	}
-	idx := len(v.Fields.Versions) - 1
-	if idx < 0 || strings.TrimSpace(v.Fields.Versions[idx].Feedback) == "" {
-		return CreativeWorkView{}, fmt.Errorf("%w: 这件作品还没有点评，尚无观察练习卡", ErrInvalidInput)
-	}
-	if v.Fields.Versions[idx].PracticeCardDoneAt == 0 {
-		v.Fields.Versions[idx].PracticeCardDoneAt = d.now()
-		if err := d.saveWorkFields(ctx, v, v.Record.Status); err != nil {
-			return CreativeWorkView{}, err
-		}
-	}
-	return d.GetCreativeWork(ctx, agentName, recordID)
-}
-
-// ArchiveCreativeWork 归档作品（任意非归档态 → archived，家长显式操作）。
-func (d Deps) ArchiveCreativeWork(ctx context.Context, agentName, recordID string) error {
-	v, err := d.GetCreativeWork(ctx, agentName, recordID)
-	if err != nil {
-		return err
-	}
-	if v.Record.Status == k12.WorkStatusArchived {
-		return nil
-	}
-	return d.saveWorkFields(ctx, v, k12.WorkStatusArchived)
 }
 
 func (d Deps) saveWorkFields(ctx context.Context, v CreativeWorkView, newStatus string) error {

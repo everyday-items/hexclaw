@@ -30,10 +30,9 @@ func TestCreativeWorkWritingLifecycle(t *testing.T) {
 		t.Fatalf("首版应为 v1，got %s", v.Fields.Versions[0].VersionID)
 	}
 
-	fb, err := d.AttachFeedback(ctx, "xiaoming", id, "切题；结构三段清晰；「像绿色的丝带」比喻好，可再加一个感官细节。")
-	if err != nil {
-		t.Fatalf("点评: %v", err)
-	}
+	fb := generateCreativeWorkFeedbackForTest(
+		t, &d, id, "切题；结构三段清晰；「像绿色的丝带」比喻好；建议再加一个感官细节。",
+	)
 	if fb.Record.Status != k12.WorkStatusFeedbackReady {
 		t.Fatalf("点评后应为 feedback_ready，got %s", fb.Record.Status)
 	}
@@ -53,10 +52,7 @@ func TestCreativeWorkWritingLifecycle(t *testing.T) {
 	}
 
 	// revised 可再点评回 feedback_ready。
-	fb2, err := d.AttachFeedback(ctx, "xiaoming", id, "加了听觉细节，更生动了。")
-	if err != nil {
-		t.Fatalf("二次点评: %v", err)
-	}
+	fb2 := generateCreativeWorkFeedbackForTest(t, &d, id, "加了听觉细节，更生动了；建议保留这个细节。")
 	if fb2.Record.Status != k12.WorkStatusFeedbackReady {
 		t.Fatalf("二次点评后应为 feedback_ready")
 	}
@@ -78,10 +74,9 @@ func TestCreativeWorkArtLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fb, err := d.AttachFeedback(ctx, "xiaoming", id, "构图主体偏右，天空留白呼应了安静；下一步可让地面倒影再明显一点。")
-	if err != nil {
-		t.Fatalf("美术点评: %v", err)
-	}
+	fb := generateCreativeWorkFeedbackForTest(
+		t, &d, id, "构图主体偏右，天空留白呼应了安静；建议让地面倒影再明显一点。",
+	)
 	if fb.Fields.Intent != "想画出雨后安静的感觉" {
 		t.Fatal("创作意图应保留")
 	}
@@ -127,24 +122,5 @@ func TestCreativeWorkOwnerIsolation(t *testing.T) {
 		Versions: []k12.CreativeWorkVersion{{ContentMarkdown: "x"}}})
 	if _, err := d.GetCreativeWork(ctx, "xiaohong", id); err == nil {
 		t.Fatal("小红不应读到小明的作品")
-	}
-}
-
-// TestCreativeWorkArchive 归档幂等。
-func TestCreativeWorkArchive(t *testing.T) {
-	d := newDataDeps(t)
-	ctx := context.Background()
-	id, _, _ := d.CreateCreativeWork(ctx, "xiaoming", "s", k12.CreativeWorkFields{
-		WorkType: k12.WorkTypeWriting, Title: "归档作文", Task: "t",
-		Versions: []k12.CreativeWorkVersion{{ContentMarkdown: "x"}}})
-	if err := d.ArchiveCreativeWork(ctx, "xiaoming", id); err != nil {
-		t.Fatalf("归档: %v", err)
-	}
-	if err := d.ArchiveCreativeWork(ctx, "xiaoming", id); err != nil {
-		t.Fatalf("重复归档应幂等: %v", err)
-	}
-	v, _ := d.GetCreativeWork(ctx, "xiaoming", id)
-	if v.Record.Status != k12.WorkStatusArchived {
-		t.Fatalf("应为 archived，got %s", v.Record.Status)
 	}
 }

@@ -27,16 +27,21 @@ type Deps struct {
 	// CreativeWorkOCR recognizes a writing-photo draft into immutable raw
 	// evidence. Parent corrections are versioned by the usecase/store, never by
 	// the model adapter.
-	CreativeWorkOCR    CreativeWorkOCRRecognizer
-	AnswerAnchorer     AnswerAnchorer
-	Insights           Insights
-	Grounding          Grounding
-	TutoringTipsReview TutoringTipsReviewGenerator
-	Profiles           ProfileStore
-	ArchiveRestorer    ArchiveRestorer
-	ArchiveMigrator    ArchiveMigrationRestorer
-	Renderer           Renderer
-	PhotoAnnotator     PhotoAnnotator
+	CreativeWorkOCR     CreativeWorkOCRRecognizer
+	AnswerAnchorer      AnswerAnchorer
+	Insights            Insights
+	Grounding           Grounding
+	TutoringTipsReview  TutoringTipsReviewGenerator
+	ParentTeachingGuide ParentTeachingGuideGenerator
+	// WorkFeedbackRoute resolves the actual provider/model only when a promoted
+	// ImageTask work starts its feedback operation. The resulting snapshot is
+	// persisted before the provider call and reused verbatim on retry.
+	WorkFeedbackRoute WorkFeedbackRouteResolver
+	Profiles          ProfileStore
+	ArchiveRestorer   ArchiveRestorer
+	ArchiveMigrator   ArchiveMigrationRestorer
+	Renderer          Renderer
+	PhotoAnnotator    PhotoAnnotator
 	// PageAssets promotes a photo Submission's immutable source image into the
 	// owner-scoped asset:// store before V19 Problem facts reference it.
 	PageAssets PageAssetStore
