@@ -50,7 +50,13 @@ func newServerWithSolver(t *testing.T, exec engineadapter.SolveExecutor, opts ..
 		t.Fatal(err)
 	}
 	db.Exec(`INSERT INTO agents(name) VALUES('mingming')`)
-	k, err := assembly.Wire(db, exec, opts...)
+	allOptions := append(
+		[]assembly.Option{
+			assembly.WithAccumulationMetadataDeriver(fixedAccumulationMetadataDeriver{}),
+		},
+		opts...,
+	)
+	k, err := assembly.Wire(db, exec, allOptions...)
 	if err != nil {
 		t.Fatal(err)
 	}

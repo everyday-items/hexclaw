@@ -68,30 +68,25 @@ func TestHTTPFinalizeSendUsesServerResolvedBatch(t *testing.T) {
 
 func TestHTTPDictationToBasket(t *testing.T) {
 	h := newServer(t)
-	rec, out := do(t, h, "POST", "/accumulation", `{"agent":"mingming","subject":"语文","entry_type":"好词好句","content":"桂花香"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("加积累 HTTP %d: %v", rec.Code, out)
-	}
-	accumID := out["record_id"].(string)
-	rec, out = do(t, h, "POST", "/accumulation/"+accumID+"/dictation-to-basket", `{"agent":"mingming"}`)
-	if rec.Code != http.StatusOK || out["added"] != true {
-		t.Fatalf("默写出题装篮应 200+added: code=%d %v", rec.Code, out)
-	}
-	setID := out["record_id"].(string)
-	_, got := do(t, h, "GET", "/practice-sets/"+setID+"?agent=mingming", "")
-	items, _ := got["items"].([]any)
-	if len(items) != 1 {
-		t.Fatalf("篮内应 1 题: %v", got["items"])
-	}
-	it := items[0].(map[string]any)
-	if it["added_via"] != "accumulation" || it["question_markdown"] != "默写：桂花香" {
-		t.Errorf("默写题契约不符: %v", it)
+	accumID := addAccumulationHTTP(t, h, "桂花香")
+	rec, out := do(
+		t,
+		h,
+		http.MethodPost,
+		"/accumulation/"+accumID+"/dictation-to-basket",
+		`{"agent":"mingming"}`,
+	)
+	generation, _ := out["dictation_generation"].(map[string]any)
+	if rec.Code != http.StatusOK ||
+		generation["status"] != k12.DictationCommitted ||
+		generation["generation_id"] == "" ||
+		generation["practice_item_id"] == "" {
+		t.Fatalf("默写出题装篮应返回持久 generation: code=%d %v", rec.Code, out)
 	}
 
 	// >100 字长文 → 400。
 	long := strings.Repeat("好句素材内容很长", 15)
-	_, out = do(t, h, "POST", "/accumulation", `{"agent":"mingming","subject":"语文","entry_type":"写作素材","content":"`+long+`"}`)
-	longID := out["record_id"].(string)
+	longID := addAccumulationHTTP(t, h, long)
 	rec, _ = do(t, h, "POST", "/accumulation/"+longID+"/dictation-to-basket", `{"agent":"mingming"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf(">100 字应 400 拒绝, got %d", rec.Code)

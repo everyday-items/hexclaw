@@ -2,11 +2,16 @@ package apihttp_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/engineadapter"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
@@ -81,10 +86,16 @@ func httpBatchTargets() []usecase.ResolvedDeliveryTarget {
 
 func addAccumulationHTTP(t *testing.T, h http.Handler, content string) string {
 	t.Helper()
-	body, _ := json.Marshal(map[string]string{
-		"agent": "mingming", "subject": "语文", "entry_type": "好词好句", "content": content,
-	})
-	rec, out := do(t, h, "POST", "/accumulation", string(body))
+	body, _ := json.Marshal(map[string]string{"content": content})
+	commandKey := "test-accumulation-" + fmt.Sprintf("%x", sha256.Sum256([]byte(content)))
+	rec, out := doCurrent(
+		t,
+		h,
+		http.MethodPost,
+		"/accumulation?agent=mingming",
+		string(body),
+		map[string]string{"Idempotency-Key": commandKey},
+	)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("seed accumulation: status=%d body=%v", rec.Code, out)
 	}
@@ -187,13 +198,7 @@ func TestAccumulationSendReadsServerRecordAndRejectsClientContent(t *testing.T) 
 		},
 	}
 	h := newServerWithReceiptTransport(t, delivery)
-	_, added := do(t, h, "POST", "/accumulation",
-		`{"agent":"mingming","subject":"语文","entry_type":"好词好句",`+
-			`"content":"落霞与孤鹜齐飞","source":"《滕王阁序》"}`)
-	recordID, _ := added["record_id"].(string)
-	if recordID == "" {
-		t.Fatalf("seed accumulation: %v", added)
-	}
+	recordID := addAccumulationHTTP(t, h, "落霞与孤鹜齐飞")
 
 	rec, _ := do(t, h, "POST", "/accumulation/"+recordID+"/send",
 		`{"agent":"mingming","content":"客户端伪造正文"}`)
@@ -225,6 +230,101 @@ func TestAccumulationSendReadsServerRecordAndRejectsClientContent(t *testing.T) 
 	rec, replay := do(t, h, "POST", "/accumulation/"+recordID+"/send", `{"agent":"mingming"}`)
 	if rec.Code != http.StatusOK || replay["batch_id"] != batch["batch_id"] || len(delivery.sends) != 2 {
 		t.Fatalf("accumulation replay changed batch or resent: status=%d body=%v sends=%d",
+			rec.Code, replay, len(delivery.sends))
+	}
+}
+
+func TestCreativeWorkSendFreezesCurrentWorkAndLatestFeedback(t *testing.T) {
+	delivery := &httpBatchTransport{
+		targets: httpBatchTargets(),
+		send: []usecase.DeliveryTransportAck{
+			{Status: k12.DeliveryDelivered, ExternalMessageID: "work-a"},
+			{Status: k12.DeliveryDelivered, ExternalMessageID: "work-b"},
+		},
+	}
+	h := newServerWithSolver(
+		t,
+		fakeSolveExec{},
+		assembly.WithWorkFeedbackGenerator(engineadapter.WorkFeedbackGenerateFunc(
+			func(context.Context, string, string, string) (string, error) {
+				return "柳枝的比喻有可见依据；可以追问风吹时的声音。", nil
+			},
+		)),
+		assembly.WithDeliveryTransport(delivery),
+	)
+	rec, created := doCurrent(
+		t,
+		h,
+		http.MethodPost,
+		"/creative-works",
+		`{"agent":"mingming","work_type":"writing","content_markdown":"柳枝像绿色的丝带"}`,
+		map[string]string{"Idempotency-Key": "send-work-create"},
+	)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("seed creative work: status=%d body=%v", rec.Code, created)
+	}
+	workID := created["work_id"].(string)
+	sendPath := "/creative-works/" + workID + "/send"
+
+	rec, _ = do(t, h, http.MethodPost, sendPath, `{"agent":"mingming"}`)
+	if rec.Code == http.StatusOK || len(delivery.sends) != 0 {
+		t.Fatalf("未完成点评的作品不得发送: status=%d sends=%d", rec.Code, len(delivery.sends))
+	}
+
+	rec, feedback := doCurrent(
+		t,
+		h,
+		http.MethodPost,
+		"/creative-works/"+workID+"/generate-feedback",
+		`{"agent":"mingming"}`,
+		map[string]string{"Idempotency-Key": "send-work-feedback"},
+	)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("generate creative feedback: status=%d body=%v", rec.Code, feedback)
+	}
+
+	rec, _ = do(
+		t,
+		h,
+		http.MethodPost,
+		sendPath,
+		`{"agent":"mingming","content":"客户端伪造正文"}`,
+	)
+	if rec.Code != http.StatusBadRequest || len(delivery.sends) != 0 {
+		t.Fatalf("作品发送不得接受客户端正文: status=%d sends=%d", rec.Code, len(delivery.sends))
+	}
+
+	rec, batch := do(t, h, http.MethodPost, sendPath, `{"agent":"mingming"}`)
+	if rec.Code != http.StatusOK ||
+		batch["object_kind"] != "creative_work" ||
+		batch["object_id"] != workID ||
+		batch["status"] != string(k12.DeliveryBatchDelivered) ||
+		len(delivery.sends) != 2 {
+		t.Fatalf("creative work batch: status=%d body=%v sends=%d",
+			rec.Code, batch, len(delivery.sends))
+	}
+	for _, sent := range delivery.sends {
+		var payload map[string]string
+		if err := json.Unmarshal([]byte(sent.PayloadJSON), &payload); err != nil {
+			t.Fatal(err)
+		}
+		text := payload["text"]
+		for _, expected := range []string{
+			"语文写作",
+			"柳枝像绿色的丝带",
+			"柳枝的比喻有可见依据",
+		} {
+			if !strings.Contains(text, expected) {
+				t.Fatalf("provider payload missing %q: %q", expected, text)
+			}
+		}
+	}
+
+	rec, replay := do(t, h, http.MethodPost, sendPath, `{"agent":"mingming"}`)
+	if rec.Code != http.StatusOK ||
+		replay["batch_id"] != batch["batch_id"] ||
+		len(delivery.sends) != 2 {
+		t.Fatalf("creative work replay changed batch or resent: status=%d body=%v sends=%d",
 			rec.Code, replay, len(delivery.sends))
 	}
 }

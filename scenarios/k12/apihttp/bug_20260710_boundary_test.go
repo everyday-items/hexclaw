@@ -39,8 +39,18 @@ func TestAddAccumulation_InternalStorageFailureIs500(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	h := apihttp.NewHandler(apihttp.Runtime{Deps: usecase.Deps{Records: store}})
-	rec, _ := do(t, h, http.MethodPost, "/accumulation", `{"agent":"mingming","subject":"英语","entry_type":"错词","content":"believe"}`)
+	h := apihttp.NewHandler(apihttp.Runtime{Deps: usecase.Deps{
+		Records:              store,
+		AccumulationMetadata: fixedAccumulationMetadataDeriver{},
+	}})
+	rec, _ := doCurrent(
+		t,
+		h,
+		http.MethodPost,
+		"/accumulation?agent=mingming",
+		`{"content":"believe"}`,
+		map[string]string{"Idempotency-Key": "storage-failure"},
+	)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("accumulation storage failure status=%d want 500", rec.Code)
 	}

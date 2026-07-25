@@ -7,12 +7,18 @@ import (
 
 func TestCreativeWorkRetiredCommandsAreAbsent(t *testing.T) {
 	h := newServer(t)
-	rec, out := do(t, h, "POST", "/creative-works",
-		`{"agent":"mingming","work_type":"art","title":"雨后的校园","task":"写生","source_asset_id":"a1"}`)
+	rec, out := doCurrent(
+		t,
+		h,
+		http.MethodPost,
+		"/creative-works",
+		`{"agent":"mingming","work_type":"writing","content_markdown":"雨后的校园"}`,
+		map[string]string{"Idempotency-Key": "retired-route-seed"},
+	)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("seed creative work: status=%d body=%v", rec.Code, out)
 	}
-	recordID := out["record_id"].(string)
+	recordID := out["work_id"].(string)
 
 	tests := []struct {
 		name string
@@ -38,6 +44,11 @@ func TestCreativeWorkRetiredCommandsAreAbsent(t *testing.T) {
 			name: "archive",
 			path: "/creative-works/" + recordID + "/archive",
 			body: `{"agent":"mingming"}`,
+		},
+		{
+			name: "revision",
+			path: "/creative-works/" + recordID + "/revision",
+			body: `{"agent":"mingming","content_markdown":"修改稿"}`,
 		},
 	}
 	for _, tt := range tests {

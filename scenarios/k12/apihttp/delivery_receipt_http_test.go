@@ -61,7 +61,12 @@ func newServerWithReceiptTransport(t *testing.T, delivery usecase.DeliveryTransp
 	if _, err := db.Exec(`INSERT INTO agents(name) VALUES('mingming'),('other')`); err != nil {
 		t.Fatal(err)
 	}
-	rt, err := assembly.Wire(db, fakeSolveExec{}, assembly.WithDeliveryTransport(delivery))
+	rt, err := assembly.Wire(
+		db,
+		fakeSolveExec{},
+		assembly.WithAccumulationMetadataDeriver(fixedAccumulationMetadataDeriver{}),
+		assembly.WithDeliveryTransport(delivery),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

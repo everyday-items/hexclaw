@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/messagecontent"
@@ -113,9 +114,11 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("POST /grounding", h.addGrounding)
 	mux.HandleFunc("POST /accumulation", h.addAccumulation)
 	mux.HandleFunc("GET /accumulation", h.listAccumulation)
+	mux.HandleFunc("GET /accumulation/{id}", h.getAccumulation)
 	mux.HandleFunc("POST /accumulation/{id}/send", h.sendAccumulation)
 	// 积累检验出口（§3.9）：生成默写题加入练习集待打印（item added_via=accumulation）。
 	mux.HandleFunc("POST /accumulation/{id}/dictation-to-basket", h.accumDictationToBasket)
+	mux.HandleFunc("DELETE /accumulation/{id}", h.deleteAccumulation)
 	// 练习集（PRD §3.8）：草稿→确认（发布门）→发送→回传→复批→关闭；draft/confirmed 可取消。
 	// POST /practice-sets（整卷直建）已随切换日死刑名单删除（执行计划 §3.4 端点冻结）：
 	// 装篮命令（basket/items → finalize）是唯一创建路径。
@@ -153,7 +156,8 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("GET /creative-works", h.listCreativeWorks)
 	mux.HandleFunc("GET /creative-works/{id}", h.getCreativeWork)
 	mux.HandleFunc("POST /creative-works/{id}/generate-feedback", h.generateWorkFeedback)
-	mux.HandleFunc("POST /creative-works/{id}/revision", h.submitWorkRevision)
+	mux.HandleFunc("POST /creative-works/{id}/send", h.sendCreativeWork)
+	mux.HandleFunc("DELETE /creative-works/{id}", h.deleteCreativeWork)
 	// 作品照片最小资产服务（§3.10 / §5.5 source_asset_id；魔数/上限/归属契约见 asset_handler.go）。
 	mux.HandleFunc("POST /assets", h.uploadAsset)
 	mux.HandleFunc("GET /assets/{file}", h.getAsset)
@@ -803,33 +807,68 @@ func (h *handler) tutoringTips(w http.ResponseWriter, r *http.Request) {
 }
 
 type accumReq struct {
-	Agent         string `json:"agent"`
-	SourceSession string `json:"source_session"`
-	Subject       string `json:"subject"`
-	EntryType     string `json:"entry_type"`
-	Content       string `json:"content"`
-	Source        string `json:"source"`
+	Content string `json:"content"`
 }
 
 type accumDTO struct {
-	RecordID  string `json:"record_id"`
-	Subject   string `json:"subject"`
-	EntryType string `json:"entry_type"`
-	Content   string `json:"content"`
-	Source    string `json:"source"`
-	Status    string `json:"status"`
-	CreatedAt int64  `json:"created_at"` // unix 秒；引文列表收藏日期（原型 20260718 定案 acc-date）
+	RecordID            string                              `json:"record_id"`
+	Subject             string                              `json:"subject"`
+	EntryType           string                              `json:"entry_type"`
+	Content             string                              `json:"content"`
+	Source              string                              `json:"source,omitempty"`
+	Version             int                                 `json:"version"`
+	DictationGeneration *accumulationDictationGenerationDTO `json:"dictation_generation,omitempty"`
+	CreatedAt           int64                               `json:"created_at"` // unix 秒；引文列表收藏日期（原型 20260718 定案 acc-date）
+}
+
+type accumulationDictationGenerationDTO struct {
+	GenerationID   string `json:"generation_id"`
+	Status         string `json:"status"`
+	PracticeItemID string `json:"practice_item_id,omitempty"`
+	FailureReason  string `json:"failure_reason,omitempty"`
+	Attempt        int    `json:"attempt,omitempty"`
+	UpdatedAt      int64  `json:"updated_at,omitempty"`
+}
+
+func accumulationGenerationDTO(
+	generation *k12.AccumulationDictationGeneration,
+) *accumulationDictationGenerationDTO {
+	if generation == nil {
+		return nil
+	}
+	return &accumulationDictationGenerationDTO{
+		GenerationID: generation.GenerationID, Status: generation.Status,
+		PracticeItemID: generation.PracticeItemID,
+		FailureReason:  generation.FailureReason,
+		Attempt:        generation.Attempt, UpdatedAt: generation.UpdatedAt,
+	}
+}
+
+func accumulationItemDTO(item usecase.AccumItem) accumDTO {
+	return accumDTO{
+		RecordID: item.Record.RecordID, Subject: item.Fields.Subject,
+		EntryType: item.Fields.EntryType, Content: item.Fields.Content,
+		Source: item.Fields.Source, Version: item.RowVersion,
+		DictationGeneration: accumulationGenerationDTO(item.DictationGeneration),
+		CreatedAt:           item.Record.CreatedAt,
+	}
 }
 
 // addAccumulation POST /accumulation —— 语文/英语积累本写入。
 func (h *handler) addAccumulation(w http.ResponseWriter, r *http.Request) {
 	var req accumReq
-	if !decode(w, r, &req) {
+	if !decodeStrict(w, r, &req) {
 		return
 	}
-	id, created, err := h.rt.Deps.AddAccumulation(r.Context(), req.Agent, req.SourceSession, k12.AccumFields{
-		Subject: req.Subject, EntryType: req.EntryType, Content: req.Content, Source: req.Source,
-	})
+	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
+	commandKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if agent == "" || commandKey == "" {
+		writeErr(w, http.StatusBadRequest, "agent query and Idempotency-Key required")
+		return
+	}
+	id, created, err := h.rt.Deps.CreateCurrentAccumulation(
+		r.Context(), agent, req.Content, commandKey,
+	)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
@@ -870,19 +909,24 @@ type dictationReq struct {
 // （§3.9 出口）：≤20 字全文默写 / 古诗默认补空 / >100 字拒绝（400）；装篮幂等去重，家长可移除。
 func (h *handler) accumDictationToBasket(w http.ResponseWriter, r *http.Request) {
 	var req dictationReq
-	if !decode(w, r, &req) {
+	if !decodeStrict(w, r, &req) {
 		return
 	}
 	if req.Agent == "" {
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
-	basketID, added, err := h.rt.Deps.GenerateDictationToBasket(r.Context(), req.Agent, req.SourceSession, r.PathValue("id"), req.FullDictation)
+	generation, _, _, err := h.rt.Deps.GenerateCurrentDictationToBasket(
+		r.Context(), req.Agent, req.SourceSession, r.PathValue("id"),
+		req.FullDictation, "dictation:"+r.PathValue("id"),
+	)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusBadRequest), err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"record_id": basketID, "added": added})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"dictation_generation": accumulationGenerationDTO(&generation),
+	})
 }
 
 // listAccumulation GET /accumulation?agent=X&subject=语文 —— 积累本列表。
@@ -899,13 +943,47 @@ func (h *handler) listAccumulation(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]accumDTO, 0, len(items))
 	for _, it := range items {
-		out = append(out, accumDTO{
-			RecordID: it.Record.RecordID, Subject: it.Fields.Subject, EntryType: it.Fields.EntryType,
-			Content: it.Fields.Content, Source: it.Fields.Source, Status: it.Record.Status,
-			CreatedAt: it.Record.CreatedAt,
-		})
+		out = append(out, accumulationItemDTO(it))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": out})
+}
+
+func (h *handler) getAccumulation(w http.ResponseWriter, r *http.Request) {
+	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
+	if agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	item, err := h.rt.Deps.GetAccumulation(r.Context(), agent, r.PathValue("id"))
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, accumulationItemDTO(item))
+}
+
+func (h *handler) deleteAccumulation(w http.ResponseWriter, r *http.Request) {
+	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
+	expected, commandKey, ok := parseDeleteCommand(w, r)
+	if !ok {
+		return
+	}
+	if agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	receipt, err := h.rt.Records.TombstoneCurrentObject(
+		r.Context(), agent, "accumulation", r.PathValue("id"), expected, commandKey,
+	)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accumulation_id": receipt.ObjectID,
+		"deleted":         receipt.Deleted,
+		"version":         receipt.RowVersion,
+	})
 }
 
 // backup GET /backup?agent=X —— 导出家庭学习档案 .hexbak（含 checksum）。
@@ -1529,6 +1607,24 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	return decodeLimit(w, r, v, 1<<20)
 }
 
+func parseDeleteCommand(
+	w http.ResponseWriter,
+	r *http.Request,
+) (expectedVersion int, commandKey string, ok bool) {
+	rawVersion := strings.TrimSpace(r.Header.Get("If-Match"))
+	commandKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if strings.HasPrefix(rawVersion, "W/") {
+		rawVersion = strings.TrimSpace(strings.TrimPrefix(rawVersion, "W/"))
+	}
+	rawVersion = strings.Trim(rawVersion, `"`)
+	expectedVersion, err := strconv.Atoi(rawVersion)
+	if err != nil || expectedVersion <= 0 || commandKey == "" {
+		writeErr(w, http.StatusBadRequest, "valid If-Match and Idempotency-Key required")
+		return 0, "", false
+	}
+	return expectedVersion, commandKey, true
+}
+
 func decodeStrict(w http.ResponseWriter, r *http.Request, v any) bool {
 	return decodeLimitMode(w, r, v, 1<<20, true)
 }
@@ -1585,7 +1681,8 @@ func httpStatusForK12Error(err error, fallback int) int {
 		errors.Is(err, records.ErrIllegalTransition),
 		errors.Is(err, k12storage.ErrImageTaskVersionConflict),
 		errors.Is(err, k12storage.ErrImageTaskConflict),
-		errors.Is(err, k12storage.ErrImageTaskInvalidState):
+		errors.Is(err, k12storage.ErrImageTaskInvalidState),
+		errors.Is(err, k12storage.ErrCurrentCommandConflict):
 		return http.StatusConflict
 	case errors.Is(err, records.ErrNotFound), errors.Is(err, k12storage.ErrImageTaskNotFound):
 		return http.StatusNotFound

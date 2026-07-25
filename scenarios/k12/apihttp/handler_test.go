@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
 	"github.com/hexagon-codes/hexclaw/skill"
@@ -30,6 +31,23 @@ func (fakeSolveExec) Execute(_ context.Context, args map[string]any) (*skill.Res
 	return &skill.Result{Content: "解：11.4", Metadata: map[string]string{"solve_verdict": "agree", "solve_evidence": "numeric_exec"}}, nil
 }
 
+type fixedAccumulationMetadataDeriver struct{}
+
+func (fixedAccumulationMetadataDeriver) DeriveAccumulationMetadata(
+	context.Context,
+	string,
+) (k12.AccumulationDerivedMetadata, error) {
+	return k12.AccumulationDerivedMetadata{
+		Subject: "语文", EntryType: "好词好句",
+		SubjectProvenance: k12.DerivationProvenance{
+			Method: "model", Policy: "test", Version: "1",
+		},
+		EntryTypeProvenance: k12.DerivationProvenance{
+			Method: "model", Policy: "test", Version: "1",
+		},
+	}, nil
+}
+
 func newServer(t *testing.T) http.Handler {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:")
@@ -41,7 +59,11 @@ func newServer(t *testing.T) http.Handler {
 		t.Fatal(err)
 	}
 	db.Exec(`INSERT INTO agents(name) VALUES('mingming')`)
-	k, err := assembly.Wire(db, fakeSolveExec{})
+	k, err := assembly.Wire(
+		db,
+		fakeSolveExec{},
+		assembly.WithAccumulationMetadataDeriver(fixedAccumulationMetadataDeriver{}),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -451,14 +451,19 @@ func (h *handler) getImageTaskResult(w http.ResponseWriter, r *http.Request) {
 				"display_name": result.CreativeDisplayName,
 			}
 		}
-		if result.CreativeWork != nil &&
-			len(result.CreativeWork.Fields.Versions) > 0 {
-			version := result.CreativeWork.Fields.Versions[len(result.CreativeWork.Fields.Versions)-1]
-			if version.StructuredFeedback != nil &&
-				version.StructuredFeedback.ProjectionMarkdown != "" {
+		if result.CreativeWork != nil {
+			var feedback *k12.WorkFeedback
+			if latest := result.CreativeWork.GenerationState.Latest; latest != nil &&
+				latest.Status == k12.WorkFeedbackSucceeded {
+				feedback = latest.Feedback
+			} else if len(result.CreativeWork.Fields.Versions) > 0 {
+				version := result.CreativeWork.Fields.Versions[len(result.CreativeWork.Fields.Versions)-1]
+				feedback = version.StructuredFeedback
+			}
+			if feedback != nil && feedback.ProjectionMarkdown != "" {
 				payload["feedback"] = map[string]any{
-					"structured_feedback": version.StructuredFeedback,
-					"projection_markdown": version.StructuredFeedback.ProjectionMarkdown,
+					"structured_feedback": feedback,
+					"projection_markdown": feedback.ProjectionMarkdown,
 				}
 			}
 		}
