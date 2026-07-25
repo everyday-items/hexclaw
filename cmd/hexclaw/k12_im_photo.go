@@ -4,134 +4,175 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/channel"
 	"github.com/hexagon-codes/hexclaw/messagecontent"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	k12 "github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
 	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
 const k12TutorScenario = "k12-tutor"
 
-type k12PhotoProcessor func(context.Context, k12usecase.PhotoGradeRequest) (k12usecase.PhotoGradeResult, error)
+const k12IMImageTaskWaitTimeout = 125 * time.Second
 
-// k12PhotoJobOrchestrator 是钉钉拍照批改入口所需的统一 GradingJob 编排器子集
-// （usecase.GradingOrchestrator 实现；接口化便于入口测试注入替身）。
-type k12PhotoJobOrchestrator interface {
-	StartPhotoGradingJob(ctx context.Context, in k12usecase.StartPhotoGradingInput) (k12usecase.GradingJobView, bool, error)
-	RunGradingJob(ctx context.Context, jobID string) (k12usecase.GradingJobView, error)
-	ConfirmAndRun(ctx context.Context, jobID string, corrections []string) (k12usecase.GradingJobView, error)
-	PhotoResult(jobID string) (k12usecase.PhotoGradeResult, bool)
-	ReleaseGradingRun(jobID string)
-}
-
-// maybeHandleK12DingtalkPhotoJob 是钉钉拍照批改的统一 GradingJob 入口（架构设计 §6.7）：
-// 收到照片 → CreateGradingJob → 编排器推进 → awaiting_confirmation 按现有 IM 交互确认 →
-// completed 后按现有投递逻辑发结果。行为对家长不变（消息文案/附件与旧路径一致），内部走 Job。
-//
-// 过渡降级（一次切换前的临时路径，执行计划 §3.4「入口自编排」钉钉侧收敛后删除）：
-// Job 创建失败回退旧自编排路径并记日志；orchestrator 未装配时同样走旧路径。
-func maybeHandleK12DingtalkPhotoJob(
-	ctx context.Context,
-	msg *adapter.Message,
-	router *agentrouter.Dispatcher,
-	orchestrator k12PhotoJobOrchestrator,
-	process k12PhotoProcessor,
-) (*adapter.Reply, bool, error) {
-	routed := routeK12DingtalkPhotoTutor(msg, router)
-	if routed == nil || process == nil {
-		return nil, false, nil
-	}
-	req, err := k12PhotoRequestFromMessage(msg, routed)
-	if err != nil {
-		return nil, true, err
-	}
-	if orchestrator != nil {
-		result, jobStarted, jobErr := gradeK12PhotoViaJob(ctx, orchestrator, msg, req)
-		if jobStarted {
-			if jobErr != nil {
-				// Job 已创建：阶段失败已安全落 failed_retryable/failed_terminal，
-				// 错误面与旧路径一致返回；不得二次跑旧路径重复调模型。
-				return nil, true, jobErr
-			}
-			return k12PhotoReply(result), true, nil
-		}
-		slog.Warn("K12 钉钉拍照批改: GradingJob 创建失败，本次回退旧自编排路径（过渡降级）",
-			"err", jobErr, "message_id", msg.ID)
-	}
-	result, err := process(ctx, req)
-	if err != nil {
-		return nil, true, err
-	}
-	return k12PhotoReply(result), true, nil
-}
-
-// gradeK12PhotoViaJob 走统一 GradingJob 状态机推进一次照片批改。
-// 返回 jobStarted=false 表示 Job 尚未创建成功（调用方可回退旧路径）。
-func gradeK12PhotoViaJob(
-	ctx context.Context,
-	orchestrator k12PhotoJobOrchestrator,
-	msg *adapter.Message,
-	req k12usecase.PhotoGradeRequest,
-) (k12usecase.PhotoGradeResult, bool, error) {
-	sourceKey := strings.TrimSpace(msg.ID)
-	if sourceKey == "" {
-		sourceKey = req.SourceSession
-	}
-	view, _, err := orchestrator.StartPhotoGradingJob(ctx, k12usecase.StartPhotoGradingInput{
-		Photo:      req,
-		SourceKind: "im", // §4.10 统一幂等键：IM 用 message_id
-		SourceKey:  sourceKey,
-	})
-	if err != nil {
-		return k12usecase.PhotoGradeResult{}, false, err
-	}
-	jobID := view.Record.RecordID
-	defer orchestrator.ReleaseGradingRun(jobID)
-
-	view, err = orchestrator.RunGradingJob(ctx, jobID)
-	if err != nil {
-		return k12usecase.PhotoGradeResult{}, true, err
-	}
-	if view.Record.Status == k12.GradingStageAwaitingConfirmation {
-		// 现有钉钉交互没有确认停留（拍照即整卷按识别结果批改）。Job 化保持对家长
-		// 行为不变 = 到停点立即按识别结果确认（corrections 空）；将来上确认卡片
-		// 交互时，这里改为真正停等家长的 Confirm 命令。
-		view, err = orchestrator.ConfirmAndRun(ctx, jobID, nil)
-		if err != nil {
-			return k12usecase.PhotoGradeResult{}, true, err
-		}
-	}
-	if view.Record.Status != k12.GradingStageCompleted {
-		return k12usecase.PhotoGradeResult{}, true, fmt.Errorf(
-			"K12 钉钉拍照批改: 任务未完成（stage=%s failure=%s）", view.Record.Status, view.Fields.FailureKind)
-	}
-	result, ok := orchestrator.PhotoResult(jobID)
-	if !ok {
-		return k12usecase.PhotoGradeResult{}, true, fmt.Errorf("K12 钉钉拍照批改: 任务已完成但批改产物缺失（job=%s）", jobID)
-	}
-	return result, true, nil
+// k12ImageTaskFacade is the only application boundary accepted by image
+// ingress adapters. Desktop, API, webhook and IM all create the same durable
+// dispatch before any model call; adapters cannot fall back to GradingJob or a
+// provider function after that boundary.
+type k12ImageTaskFacade interface {
+	Create(context.Context, k12usecase.CreateImageTaskInput) (k12usecase.ImageTaskView, bool, error)
+	StartAsync(agentName, dispatchID string) bool
+	Get(context.Context, string, string) (k12usecase.ImageTaskView, error)
+	Confirm(context.Context, k12usecase.ConfirmImageTaskInput) (k12usecase.ImageTaskView, error)
+	Result(context.Context, string, string) (k12usecase.ImageTaskResult, error)
 }
 
 // maybeHandleK12DingtalkPhoto is the composition-root seam between generic IM
-// delivery and the K12 photo workflow. It deliberately requires an explicit
-// routing rule: making a K12 agent the global default must not turn every
-// unrelated DingTalk picture into a homework-grading request.
-//
-// 旧自编排路径（执行计划 §3.4 待删除项·钉钉侧）：生产 messageHandler 已改走
-// maybeHandleK12DingtalkPhotoJob；本函数保留为其过渡降级与既有测试入口，
-// 切换观察窗结束后随「入口自编排」一并删除。
+// delivery and the unified K12 ImageTask facade. It deliberately requires an
+// explicit direct-message routing rule: a K12 default agent must not steal an
+// unrelated picture. Once matched, failure is surfaced honestly; there is no
+// second provider path that could duplicate model work or bind idempotency to a
+// different route.
 func maybeHandleK12DingtalkPhoto(
 	ctx context.Context,
 	msg *adapter.Message,
 	router *agentrouter.Dispatcher,
-	process k12PhotoProcessor,
+	imageTasks k12ImageTaskFacade,
 ) (*adapter.Reply, bool, error) {
-	return maybeHandleK12DingtalkPhotoJob(ctx, msg, router, nil, process)
+	routed := routeK12DingtalkPhotoTutor(msg, router)
+	if routed == nil {
+		return nil, false, nil
+	}
+	if imageTasks == nil {
+		return nil, true, fmt.Errorf("K12 图片任务服务未配置")
+	}
+	raw, err := decodeK12PhotoAttachment(msg.Attachments[0])
+	if err != nil {
+		return nil, true, err
+	}
+	assetRef, err := assetstore.Save(routed.AgentName, raw)
+	if err != nil {
+		return nil, true, fmt.Errorf("K12 钉钉图片入库: %w", err)
+	}
+	sourceRef := strings.TrimSpace(msg.ID)
+	sourceSession := k12PhotoSourceSession(msg)
+	if sourceRef == "" {
+		sourceRef = sourceSession
+	}
+	view, created, err := imageTasks.Create(ctx, k12usecase.CreateImageTaskInput{
+		AgentName: routed.AgentName, LearnerID: routed.AgentName,
+		SourceKind: k12.ImageTaskSourceIM, SourceRef: sourceRef,
+		SourceSessionID: sourceSession, SourceAssetRefs: []string{assetRef},
+		MessageIntent: strings.TrimSpace(msg.Content), AttemptGeneration: 1,
+	})
+	if err != nil {
+		return nil, true, err
+	}
+	if started := imageTasks.StartAsync(
+		routed.AgentName, view.Dispatch.DispatchID,
+	); created && !started {
+		return nil, true, fmt.Errorf(
+			"K12 图片任务已创建但未能启动（dispatch=%s）",
+			view.Dispatch.DispatchID,
+		)
+	}
+
+	waitCtx := ctx
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, k12IMImageTaskWaitTimeout)
+		defer cancel()
+	}
+	reply, err := waitK12IMImageTaskResult(
+		waitCtx, imageTasks, routed.AgentName, view.Dispatch.DispatchID,
+	)
+	return reply, true, err
+}
+
+func waitK12IMImageTaskResult(
+	ctx context.Context,
+	imageTasks k12ImageTaskFacade,
+	agentName, dispatchID string,
+) (*adapter.Reply, error) {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	homeworkConfirmed := false
+	for {
+		view, err := imageTasks.Get(ctx, agentName, dispatchID)
+		if err != nil {
+			return nil, err
+		}
+		switch view.Dispatch.Status {
+		case k12.ImageTaskStatusFailed:
+			return nil, fmt.Errorf("K12 图片任务失败: %s", view.Dispatch.FailureKind)
+		case k12.ImageTaskStatusCancelled:
+			return nil, fmt.Errorf("K12 图片任务已取消")
+		case k12.ImageTaskStatusAwaitingConfirmation:
+			return nil, fmt.Errorf("K12 图片任务需要家长确认图片类型")
+		}
+		if !homeworkConfirmed && view.HomeworkProjection != nil &&
+			view.HomeworkProjection.Stage == k12.GradingStageAwaitingConfirmation {
+			if _, err := imageTasks.Confirm(ctx, k12usecase.ConfirmImageTaskInput{
+				AgentName: agentName, DispatchID: dispatchID,
+				ExpectedVersion: view.Dispatch.Version, Intent: view.Dispatch.TaskIntent,
+				Subject: view.HomeworkProjection.Subject,
+			}); err != nil {
+				return nil, err
+			}
+			homeworkConfirmed = true
+		}
+		result, err := imageTasks.Result(ctx, agentName, dispatchID)
+		if err != nil {
+			return nil, err
+		}
+		switch result.Kind {
+		case string(k12.ImageTaskIntentCompletedHomework), string(k12.ImageTaskIntentBlankWorksheet):
+			if result.Photo == nil {
+				return nil, fmt.Errorf("K12 图片任务已完成但结果缺失")
+			}
+			return k12PhotoReply(*result.Photo), nil
+		case "creative":
+			return k12CreativeWorkReply(result)
+		case "awaiting_confirmation":
+			return nil, fmt.Errorf("K12 图片任务需要家长确认识别内容")
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("等待 K12 图片任务结果: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func k12CreativeWorkReply(result k12usecase.ImageTaskResult) (*adapter.Reply, error) {
+	if result.CreativeWork == nil || len(result.CreativeWork.Fields.Versions) == 0 {
+		return nil, fmt.Errorf("K12 作品任务已完成但点评缺失")
+	}
+	version := result.CreativeWork.Fields.Versions[len(result.CreativeWork.Fields.Versions)-1]
+	markdown := strings.TrimSpace(version.Feedback)
+	if version.StructuredFeedback != nil {
+		markdown = strings.TrimSpace(version.StructuredFeedback.ProjectionMarkdown)
+	}
+	if markdown == "" {
+		return nil, fmt.Errorf("K12 作品任务已完成但点评投影为空")
+	}
+	projected := imLaTeXFallback(markdown, "k12_creative_feedback")
+	fallbackReason := ""
+	if projected != markdown {
+		fallbackReason = messagecontent.FallbackMathToReadableText
+	}
+	msg, err := channel.NewCanonicalMarkdownMessageWithAttachments(
+		messagecontent.ProducerK12, "zh-CN", markdown, projected, fallbackReason, nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return adapterReplyFromChannelMessage(msg), nil
 }
 
 // routeK12DingtalkPhotoTutor 路由门禁：仅钉钉单图 + 显式绑定 K12 辅导 Agent 时接管。
@@ -160,12 +201,7 @@ func routeK12DingtalkPhotoTutor(msg *adapter.Message, router *agentrouter.Dispat
 	return routed
 }
 
-// k12PhotoRequestFromMessage 解码附件并组装批改请求（含 source session 回退链）。
-func k12PhotoRequestFromMessage(msg *adapter.Message, routed *agentrouter.RoutingResult) (k12usecase.PhotoGradeRequest, error) {
-	raw, err := decodeK12PhotoAttachment(msg.Attachments[0])
-	if err != nil {
-		return k12usecase.PhotoGradeRequest{}, err
-	}
+func k12PhotoSourceSession(msg *adapter.Message) string {
 	sourceSession := strings.TrimSpace(msg.SessionID)
 	if sourceSession == "" {
 		sourceSession = strings.TrimSpace(msg.ChatID)
@@ -173,12 +209,7 @@ func k12PhotoRequestFromMessage(msg *adapter.Message, routed *agentrouter.Routin
 	if sourceSession == "" {
 		sourceSession = strings.TrimSpace(msg.ID)
 	}
-	return k12usecase.PhotoGradeRequest{
-		AgentName:     routed.AgentName,
-		Grade:         strings.TrimSpace(routed.AgentConfig.Metadata[k12.MetaKeyGradeTerm]),
-		SourceSession: sourceSession,
-		Image:         raw,
-	}, nil
+	return sourceSession
 }
 
 // k12PhotoReply 按既有投递逻辑组装 IM 回复：先产 ChannelNeutralMessage（§6.10 ChannelPort

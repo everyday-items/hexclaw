@@ -29,10 +29,11 @@ type k12WebhookWorkflowRunner interface {
 }
 
 type k12WebhookApplication struct {
-	deps      k12usecase.Deps
-	grading   *k12usecase.GradingOrchestrator
-	snapshot  k12usecase.GradingModelSnapshotResolver
-	workflows k12WebhookWorkflowRunner
+	deps       k12usecase.Deps
+	grading    *k12usecase.GradingOrchestrator
+	imageTasks k12ImageTaskFacade
+	snapshot   k12usecase.GradingModelSnapshotResolver
+	workflows  k12WebhookWorkflowRunner
 }
 
 type k12WebhookSubmissionPayload struct {
@@ -61,10 +62,14 @@ type k12WebhookWorkflowPayload struct {
 func newK12WebhookEventHandler(
 	deps k12usecase.Deps,
 	grading *k12usecase.GradingOrchestrator,
+	imageTasks k12ImageTaskFacade,
 	snapshot k12usecase.GradingModelSnapshotResolver,
 	workflows *platformapi.Server,
 ) webhook.K12EventHandler {
-	app := k12WebhookApplication{deps: deps, grading: grading, snapshot: snapshot, workflows: workflows}
+	app := k12WebhookApplication{
+		deps: deps, grading: grading, imageTasks: imageTasks,
+		snapshot: snapshot, workflows: workflows,
+	}
 	return app.handle
 }
 
@@ -110,43 +115,42 @@ func (a k12WebhookApplication) startSubmission(ctx context.Context, event webhoo
 		return webhook.K12DispatchResult{}, fmt.Errorf("submission v0.5.0 每次只允许一个 asset_ref")
 	}
 	if len(payload.AssetRefs) == 1 {
-		if a.grading == nil {
-			return webhook.K12DispatchResult{}, fmt.Errorf("K12 GradingJob 编排器未配置")
+		if a.imageTasks == nil {
+			return webhook.K12DispatchResult{}, fmt.Errorf("K12 ImageTask 编排器未配置")
 		}
 		assetID := strings.TrimSpace(payload.AssetRefs[0])
 		owner, ok := assetstore.OwnerOf(assetID)
 		if !ok || owner != event.AgentID {
 			return webhook.K12DispatchResult{}, fmt.Errorf("asset_ref 不存在或不属于绑定的 TutorAgent")
 		}
-		owner, file, err := assetstore.Parse(assetID)
-		if err != nil {
-			return webhook.K12DispatchResult{}, fmt.Errorf("解析 asset_ref: %w", err)
+		learnerID := strings.TrimSpace(event.LearnerID)
+		if learnerID == "" {
+			learnerID = event.AgentID
 		}
-		image, _, err := assetstore.Read(owner, file)
-		if err != nil {
-			return webhook.K12DispatchResult{}, err
-		}
-		job, _, err := a.grading.StartPhotoGradingJob(ctx, k12usecase.StartPhotoGradingInput{
-			Photo: k12usecase.PhotoGradeRequest{
-				AgentName: event.AgentID, Subject: payload.Subject, Grade: payload.Grade,
-				SourceSession: sourceSession, Image: image,
-			},
-			SourceKind: "webhook", SourceKey: event.EventID,
+		task, created, err := a.imageTasks.Create(ctx, k12usecase.CreateImageTaskInput{
+			AgentName: event.AgentID, LearnerID: learnerID,
+			SourceKind: k12.ImageTaskSourceAPI, SourceRef: event.EventID,
+			SourceSessionID: sourceSession, SourceAssetRefs: []string{assetID},
+			MessageIntent: strings.TrimSpace(payload.Text), AttemptGeneration: 1,
 		})
 		if err != nil {
 			return webhook.K12DispatchResult{}, err
 		}
-		terminal, err := a.grading.RunGradingJob(ctx, job.Record.RecordID)
-		if err != nil {
-			return webhook.K12DispatchResult{}, err
-		}
-		if terminal.Record.Status != k12.GradingStageAwaitingConfirmation {
-			return webhook.K12DispatchResult{}, fmt.Errorf("照片批改未到达确认停点: %s", terminal.Record.Status)
-		}
-		return webhook.K12DispatchResult{
-			Reference: "grading_job:" + job.Record.RecordID,
+		result := webhook.K12DispatchResult{
+			Reference: "image_task:" + task.Dispatch.DispatchID,
 			Status:    webhook.K12ReceiptSucceeded,
-		}, nil
+		}
+		if started := a.imageTasks.StartAsync(
+			event.AgentID, task.Dispatch.DispatchID,
+		); created && !started {
+			result.Status = webhook.K12ReceiptFailed
+			result.RetrySafe = true
+			return result, fmt.Errorf(
+				"K12 ImageTask 已创建但未能启动（dispatch=%s）",
+				task.Dispatch.DispatchID,
+			)
+		}
+		return result, nil
 	}
 
 	// The typed Submission aggregate is not present yet. The durable dispatch

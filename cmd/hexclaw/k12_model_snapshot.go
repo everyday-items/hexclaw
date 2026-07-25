@@ -34,5 +34,6 @@ func resolveK12GradingModelSnapshot(
 		Model:      route.Model,
 		Route:      route.ProviderName + "/" + route.Model,
 		Capability: config.LLMModelCapabilityVision,
+		TimeoutMS:  int(k12.GradingStageBudgetSeconds(k12.GradingStageRecognizing) * 1000),
 	}, nil
 }

@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,7 +31,7 @@ import (
 	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
-// k12IMDeliverer 把 K12「发送到手机」（作品点评/观察练习卡，§3.10/§3.12）接到通道端口：
+// k12IMDeliverer 把 K12「发送到手机」（辅导要点、练习集、积累内容）接到通道端口：
 // 按 agent 查绑定私聊路由规则（与 bind-im 同一规则源、天然继承限绑裁决）→ 按规则的
 // platform 从通道注册表取 ChannelPort 发辅导延伸消息。就绪标记在实例管理器建成后
 // 回填（K12 mount 早于 instances.NewManager 的装配顺序使然）；未就绪/未绑定/通道未
@@ -65,27 +66,90 @@ func (d *k12IMDeliverer) MarkReady() {
 	d.mu.Unlock()
 }
 
-func (d *k12IMDeliverer) resolveDirectBinding(agentName string) (agentrouter.Rule, channel.Target, error) {
+type resolvedDirectBinding struct {
+	rule   agentrouter.Rule
+	target channel.Target
+}
+
+func normalizeDirectRule(rule agentrouter.Rule) agentrouter.Rule {
+	rule.Platform = strings.ToLower(strings.TrimSpace(rule.Platform))
+	rule.InstanceID = strings.TrimSpace(rule.InstanceID)
+	rule.UserID = strings.TrimSpace(rule.UserID)
+	rule.ChatID = strings.TrimSpace(rule.ChatID)
+	rule.AgentName = strings.TrimSpace(rule.AgentName)
+	return rule
+}
+
+func (d *k12IMDeliverer) resolveDirectBindings(agentName string) ([]resolvedDirectBinding, error) {
 	d.mu.RLock()
 	ready := d.ready
 	d.mu.RUnlock()
 	if !ready {
-		return agentrouter.Rule{}, channel.Target{}, fmt.Errorf("发送通道还没就绪，稍等片刻再试")
+		return nil, fmt.Errorf("发送通道还没就绪，稍等片刻再试")
 	}
+	agentName = strings.TrimSpace(agentName)
+	candidates := make([]resolvedDirectBinding, 0)
 	for _, rule := range d.router.ListRules() {
+		rule = normalizeDirectRule(rule)
 		if rule.AgentName != agentName || rule.ChatID == "" {
 			continue
 		}
 		target := channel.Target{Platform: rule.Platform, InstanceID: rule.InstanceID, ChatID: rule.ChatID}
 		if err := target.EnsureDirect(); err != nil {
-			return agentrouter.Rule{}, channel.Target{}, fmt.Errorf("绑定目标不是一对一私聊，请重新绑定: %w", err)
+			continue
 		}
-		return rule, target, nil
+		if target.Platform == "" {
+			continue
+		}
+		candidates = append(candidates, resolvedDirectBinding{rule: rule, target: target})
 	}
-	return agentrouter.Rule{}, channel.Target{}, fmt.Errorf("这个辅导助手还没绑定手机私聊：先在连接设置里绑定")
+	sort.Slice(candidates, func(i, j int) bool {
+		left, right := candidates[i], candidates[j]
+		if left.target.Platform != right.target.Platform {
+			return left.target.Platform < right.target.Platform
+		}
+		if left.target.InstanceID != right.target.InstanceID {
+			return left.target.InstanceID < right.target.InstanceID
+		}
+		if left.target.ChatID != right.target.ChatID {
+			return left.target.ChatID < right.target.ChatID
+		}
+		if left.rule.ID > 0 && right.rule.ID > 0 && left.rule.ID != right.rule.ID {
+			return left.rule.ID < right.rule.ID
+		}
+		return stableBindingID(left.rule) < stableBindingID(right.rule)
+	})
+	out := candidates[:0]
+	for _, candidate := range candidates {
+		if len(out) > 0 && out[len(out)-1].target == candidate.target {
+			continue
+		}
+		out = append(out, candidate)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf(
+			"%w: 这个辅导助手还没绑定手机私聊：先在连接设置里绑定",
+			k12usecase.ErrNoActiveDirectBindings,
+		)
+	}
+	return out, nil
+}
+
+func (d *k12IMDeliverer) resolveDirectBinding(agentName string) (agentrouter.Rule, channel.Target, error) {
+	bindings, err := d.resolveDirectBindings(agentName)
+	if err != nil {
+		return agentrouter.Rule{}, channel.Target{}, err
+	}
+	if len(bindings) != 1 {
+		return agentrouter.Rule{}, channel.Target{}, fmt.Errorf(
+			"这个辅导助手有 %d 个手机私聊绑定，必须使用批次投递", len(bindings),
+		)
+	}
+	return bindings[0].rule, bindings[0].target, nil
 }
 
 func stableBindingID(rule agentrouter.Rule) string {
+	rule = normalizeDirectRule(rule)
 	if rule.ID > 0 {
 		return "agent-rule:" + strconv.Itoa(rule.ID)
 	}
@@ -100,12 +164,36 @@ func deliveryPayloadDigest(payloadJSON string) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// PrepareText is side-effect free: it resolves the durable binding and freezes
-// the exact canonical/render payload before the receipt row is created.
-func (d *k12IMDeliverer) PrepareText(_ context.Context, agentName, content string) (k12usecase.PreparedTextDelivery, error) {
-	rule, target, err := d.resolveDirectBinding(agentName)
+func (d *k12IMDeliverer) ResolveTextTargets(
+	_ context.Context,
+	agentName string,
+) ([]k12usecase.ResolvedDeliveryTarget, error) {
+	bindings, err := d.resolveDirectBindings(agentName)
 	if err != nil {
-		return k12usecase.PreparedTextDelivery{}, err
+		return nil, err
+	}
+	out := make([]k12usecase.ResolvedDeliveryTarget, 0, len(bindings))
+	for _, binding := range bindings {
+		out = append(out, k12usecase.ResolvedDeliveryTarget{
+			BindingID: stableBindingID(binding.rule),
+			Target: k12.DeliveryTarget{
+				Platform:   binding.target.Platform,
+				InstanceID: binding.target.InstanceID,
+				ChatID:     binding.target.ChatID,
+				Label:      binding.target.Platform,
+			},
+		})
+	}
+	return out, nil
+}
+
+func (d *k12IMDeliverer) PrepareTextForTargets(
+	_ context.Context,
+	content string,
+	targets []k12usecase.ResolvedDeliveryTarget,
+) ([]k12usecase.PreparedTextDelivery, error) {
+	if len(targets) == 0 {
+		return nil, k12usecase.ErrNoActiveDirectBindings
 	}
 	canonical := content
 	projected := imLaTeXFallback(canonical, "k12_send_to_phone")
@@ -117,22 +205,65 @@ func (d *k12IMDeliverer) PrepareText(_ context.Context, agentName, content strin
 		messagecontent.ProducerK12, "zh-CN", canonical, projected, fallbackReason, nil,
 	)
 	if err != nil {
-		return k12usecase.PreparedTextDelivery{}, fmt.Errorf("发送内容校验失败，请重试: %w", err)
+		return nil, fmt.Errorf("发送内容校验失败，请重试: %w", err)
 	}
 	payloadJSON, err := json.Marshal(message)
 	if err != nil {
-		return k12usecase.PreparedTextDelivery{}, fmt.Errorf("冻结发送内容失败: %w", err)
+		return nil, fmt.Errorf("冻结发送内容失败: %w", err)
 	}
 	renderJSON, err := json.Marshal(message.RenderManifest)
 	if err != nil {
-		return k12usecase.PreparedTextDelivery{}, fmt.Errorf("冻结渲染证据失败: %w", err)
+		return nil, fmt.Errorf("冻结渲染证据失败: %w", err)
 	}
-	return k12usecase.PreparedTextDelivery{
-		BindingID:   stableBindingID(rule),
-		Target:      k12.DeliveryTarget{Platform: target.Platform, InstanceID: target.InstanceID, ChatID: target.ChatID, Label: target.Platform},
-		PayloadJSON: string(payloadJSON),
-		RenderJSON:  string(renderJSON),
-	}, nil
+	out := make([]k12usecase.PreparedTextDelivery, 0, len(targets))
+	seen := make(map[channel.Target]struct{}, len(targets))
+	for _, resolved := range targets {
+		target := channel.Target{
+			Platform:   strings.ToLower(strings.TrimSpace(resolved.Target.Platform)),
+			InstanceID: strings.TrimSpace(resolved.Target.InstanceID),
+			ChatID:     strings.TrimSpace(resolved.Target.ChatID),
+		}
+		if strings.TrimSpace(resolved.BindingID) == "" || target.Platform == "" || target.ChatID == "" {
+			return nil, fmt.Errorf("冻结发送目标失败：绑定或私聊目标不完整")
+		}
+		if err := target.EnsureDirect(); err != nil {
+			return nil, fmt.Errorf("冻结发送目标失败：%w", err)
+		}
+		if _, duplicate := seen[target]; duplicate {
+			return nil, fmt.Errorf("冻结发送目标失败：存在重复私聊目标")
+		}
+		seen[target] = struct{}{}
+		out = append(out, k12usecase.PreparedTextDelivery{
+			BindingID: strings.TrimSpace(resolved.BindingID),
+			Target: k12.DeliveryTarget{
+				Platform: target.Platform, InstanceID: target.InstanceID, ChatID: target.ChatID,
+				Label: strings.TrimSpace(resolved.Target.Label),
+			},
+			PayloadJSON: string(payloadJSON),
+			RenderJSON:  string(renderJSON),
+		})
+	}
+	return out, nil
+}
+
+// PrepareText is retained for compatibility with singleton callers. Production
+// K12 commands use ResolveTextTargets + PrepareTextForTargets and never choose
+// the first binding from a multi-binding snapshot.
+func (d *k12IMDeliverer) PrepareText(ctx context.Context, agentName, content string) (k12usecase.PreparedTextDelivery, error) {
+	targets, err := d.ResolveTextTargets(ctx, agentName)
+	if err != nil {
+		return k12usecase.PreparedTextDelivery{}, err
+	}
+	if len(targets) != 1 {
+		return k12usecase.PreparedTextDelivery{}, fmt.Errorf(
+			"这个辅导助手有 %d 个手机私聊绑定，必须使用批次投递", len(targets),
+		)
+	}
+	prepared, err := d.PrepareTextForTargets(ctx, content, targets)
+	if err != nil {
+		return k12usecase.PreparedTextDelivery{}, err
+	}
+	return prepared[0], nil
 }
 
 func channelTargetFromReceipt(receipt k12.DeliveryReceipt) channel.Target {
@@ -143,6 +274,7 @@ func channelTargetFromReceipt(receipt k12.DeliveryReceipt) channel.Target {
 
 func (d *k12IMDeliverer) receiptBindingIsActive(receipt k12.DeliveryReceipt) bool {
 	for _, rule := range d.router.ListRules() {
+		rule = normalizeDirectRule(rule)
 		if rule.AgentName != receipt.AgentName || stableBindingID(rule) != receipt.BindingID {
 			continue
 		}

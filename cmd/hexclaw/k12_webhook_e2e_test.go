@@ -7,9 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,7 +16,6 @@ import (
 
 	platformapi "github.com/hexagon-codes/hexclaw/api"
 	k12 "github.com/hexagon-codes/hexclaw/scenarios/k12"
-	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
@@ -50,7 +46,21 @@ func newK12WebhookRuntime(t *testing.T) *assembly.K12 {
 	if _, err := db.Exec(`INSERT INTO agents(name) VALUES('kid-agent')`); err != nil {
 		t.Fatal(err)
 	}
-	runtime, err := assembly.Wire(db, k12WebhookSolveStub{})
+	runtime, err := assembly.Wire(db, k12WebhookSolveStub{},
+		assembly.WithParentTeachingGuideGenerator(func(
+			context.Context, string, string, string,
+		) (string, error) {
+			return `{
+				"answer":"unused",
+				"full_solution_steps":["分别列出两个数的因数","再取最大的公因数"],
+				"grade_level_method":"使用当前年级的列举因数法",
+				"likely_mistakes":["漏列因数"],
+				"parent_teaching_sequence":["先让孩子列因数，再找公共因数"],
+				"follow_up_questions":["两个数各有哪些因数？","最大的公共因数是哪一个？"],
+				"checking_method":"确认结果能同时整除12和18"
+			}`, nil
+		}),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,51 +132,34 @@ func TestK12WebhookTextSubmissionUsesGradingJobApplicationCommand(t *testing.T) 
 		t.Fatalf("text submission must create an independent blank Attempt: %+v", attempt)
 	}
 
-	// The production GET/confirm surface recovers the typed facts through a
-	// text-specific run. It persists run metadata but never invents an image.
-	h := apihttp.NewHandler(apihttp.Runtime{
-		Views: runtime.Registry.Views, Records: runtime.Records, Deps: runtime.Deps, Grading: grading,
-	})
-	getReq := httptest.NewRequest(http.MethodGet, "/grading-jobs/"+jobID+"?agent=kid-agent", nil)
-	getRec := httptest.NewRecorder()
-	h.ServeHTTP(getRec, getReq)
-	if getRec.Code != http.StatusOK {
-		body, _ := io.ReadAll(getRec.Result().Body)
-		t.Fatalf("GET text GradingJob status=%d body=%s", getRec.Code, body)
+	// GradingJob is now strictly internal. The webhook adapter and this test use
+	// the application command directly; removed public /grading-jobs routes must
+	// not be resurrected just to continue a trusted text delivery.
+	recognized, recognizedOK := grading.RecognizedQuestionsForOwner(
+		context.Background(), "kid-agent", jobID,
+	)
+	if !recognizedOK || len(recognized) != 1 ||
+		recognized[0].ProblemID != problem.ProblemID ||
+		recognized[0].AnswerState != "blank" {
+		t.Fatalf("internal text projection lost typed question: %+v ok=%v", recognized, recognizedOK)
 	}
-	var getBody struct {
-		Job struct {
-			RecognizedQuestions []struct {
-				ProblemID   string `json:"problem_id"`
-				AnswerState string `json:"answer_state"`
-			} `json:"recognized_questions"`
-		} `json:"job"`
+	confirmedView, ok, err := grading.ConfirmPersistedTextGradingJob(
+		context.Background(), "kid-agent", jobID,
+		usecase.ConfirmPhotoGradingInput{
+			Corrections: []usecase.GradingQuestionCorrection{{
+				ProblemID: problem.ProblemID, Confirmed: true,
+			}},
+		},
+	)
+	if err != nil || !ok {
+		t.Fatalf("internal text confirmation rejected: view=%+v ok=%v err=%v",
+			confirmedView, ok, err)
 	}
-	if err := json.NewDecoder(getRec.Result().Body).Decode(&getBody); err != nil {
-		t.Fatal(err)
-	}
-	if len(getBody.Job.RecognizedQuestions) != 1 ||
-		getBody.Job.RecognizedQuestions[0].ProblemID != problem.ProblemID ||
-		getBody.Job.RecognizedQuestions[0].AnswerState != "blank" {
-		t.Fatalf("GET GradingJob did not expose typed text question: %+v", getBody.Job.RecognizedQuestions)
-	}
-
-	confirmBody := strings.NewReader(`{"agent":"kid-agent","question_corrections":[{"problem_id":"` + problem.ProblemID + `","confirmed":true}]}`)
-	confirmReq := httptest.NewRequest(http.MethodPost, "/grading-jobs/"+jobID+"/confirm", confirmBody)
-	confirmReq.Header.Set("Content-Type", "application/json")
-	confirmRec := httptest.NewRecorder()
-	h.ServeHTTP(confirmRec, confirmReq)
-	if confirmRec.Code != http.StatusOK {
-		body, _ := io.ReadAll(confirmRec.Result().Body)
-		t.Fatalf("confirm text GradingJob status=%d body=%s", confirmRec.Code, body)
-	}
-	var confirmResult map[string]any
-	if err := json.NewDecoder(confirmRec.Result().Body).Decode(&confirmResult); err != nil {
-		t.Fatal(err)
-	}
-	if confirmResult["stage"] != k12.GradingStageAssessing && confirmResult["stage"] != k12.GradingStageRendering &&
-		confirmResult["stage"] != k12.GradingStageProjecting && confirmResult["stage"] != k12.GradingStageCompleted {
-		t.Fatalf("confirmed text GradingJob was not accepted by the text worker: %+v", confirmResult)
+	switch confirmedView.Record.Status {
+	case k12.GradingStageAssessing, k12.GradingStageRendering,
+		k12.GradingStageProjecting, k12.GradingStageCompleted:
+	default:
+		t.Fatalf("confirmed text Job did not advance: %+v", confirmedView)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -179,24 +172,9 @@ func TestK12WebhookTextSubmissionUsesGradingJobApplicationCommand(t *testing.T) 
 	if err != nil || job.Record.Status != k12.GradingStageCompleted {
 		t.Fatalf("text worker did not reach completed: job=%+v err=%v", job, err)
 	}
-	resultReq := httptest.NewRequest(http.MethodGet, "/grading-jobs/"+jobID+"/result?agent=kid-agent", nil)
-	resultRec := httptest.NewRecorder()
-	h.ServeHTTP(resultRec, resultReq)
-	if resultRec.Code != http.StatusOK {
-		body, _ := io.ReadAll(resultRec.Result().Body)
-		t.Fatalf("GET text GradingJob result status=%d body=%s", resultRec.Code, body)
-	}
-	var resultBody struct {
-		Result struct {
-			Markdown string `json:"markdown"`
-			Items    []any  `json:"items"`
-		} `json:"result"`
-	}
-	if err := json.NewDecoder(resultRec.Result().Body).Decode(&resultBody); err != nil {
-		t.Fatal(err)
-	}
-	if strings.TrimSpace(resultBody.Result.Markdown) == "" || len(resultBody.Result.Items) != 1 {
-		t.Fatalf("text result is not readable: %+v", resultBody.Result)
+	textResult, ok := grading.PhotoResult(jobID)
+	if !ok || strings.TrimSpace(textResult.Markdown) == "" || len(textResult.Items) != 1 {
+		t.Fatalf("internal text result is not readable: %+v ok=%v", textResult, ok)
 	}
 	if _, statErr := os.Stat(filepath.Join(runDir, jobID, "run.json")); statErr != nil {
 		t.Fatalf("text run metadata was not persisted: %v", statErr)
@@ -212,14 +190,17 @@ func TestK12WebhookTextSubmissionUsesGradingJobApplicationCommand(t *testing.T) 
 
 	// A repeated confirm is an illegal state transition. It must not mutate the
 	// already-frozen typed facts before returning the conflict.
-	duplicateConfirm := httptest.NewRequest(http.MethodPost, "/grading-jobs/"+jobID+"/confirm",
-		strings.NewReader(`{"agent":"kid-agent","question_corrections":[{"problem_id":"`+problem.ProblemID+`","confirmed":true}]}`))
-	duplicateConfirm.Header.Set("Content-Type", "application/json")
-	duplicateRec := httptest.NewRecorder()
-	h.ServeHTTP(duplicateRec, duplicateConfirm)
-	if duplicateRec.Code != http.StatusConflict {
-		body, _ := io.ReadAll(duplicateRec.Result().Body)
-		t.Fatalf("duplicate text confirm status=%d body=%s", duplicateRec.Code, body)
+	_, duplicateOK, duplicateErr := grading.ConfirmPersistedTextGradingJob(
+		context.Background(), "kid-agent", jobID,
+		usecase.ConfirmPhotoGradingInput{
+			Corrections: []usecase.GradingQuestionCorrection{{
+				ProblemID: problem.ProblemID, Confirmed: true,
+			}},
+		},
+	)
+	if duplicateErr == nil || !duplicateOK {
+		t.Fatalf("duplicate text confirm must be rejected: ok=%v err=%v",
+			duplicateOK, duplicateErr)
 	}
 	afterDuplicate, err := runtime.Deps.Records.GetProblemAttemptSnapshot(context.Background(), "kid-agent", job.Fields.SubmissionID)
 	if err != nil || len(afterDuplicate.Attempts) != 1 || afterDuplicate.Attempts[0].ConfirmedVersion != 1 {
@@ -231,6 +212,71 @@ func TestK12WebhookTextSubmissionUsesGradingJobApplicationCommand(t *testing.T) 
 	retry, err := app.handle(context.Background(), event)
 	if err != nil || retry.Reference != result.Reference {
 		t.Fatalf("stable delivery retry=%+v err=%v, want %+v", retry, err, result)
+	}
+}
+
+func TestK12WebhookImageSubmissionCreatesDurableImageTaskWithoutWaitingForProvider(t *testing.T) {
+	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
+	raw, _ := base64.StdEncoding.DecodeString(
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+	)
+	assetID, err := assetstore.Save("kid-agent", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facade := &fakeK12ImageTaskFacade{}
+	app := k12WebhookApplication{imageTasks: facade}
+	event := webhook.K12Dispatch{
+		ReceiptID: "receipt-image", BindingID: "binding-image", EventID: "delivery-image",
+		EventType: webhook.K12EventSubmissionRequested,
+		AgentID:   "kid-agent", LearnerID: "kid-learner",
+		Payload: json.RawMessage(`{"asset_refs":["` + assetID +
+			`"],"source_session":"parent-webhook","text":"请批改这张作业"}`),
+	}
+	result, err := app.handle(context.Background(), event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Reference != "image_task:dispatch-1" ||
+		result.Status != webhook.K12ReceiptSucceeded {
+		t.Fatalf("webhook durable acceptance=%+v", result)
+	}
+	if got := strings.Join(facade.events, ","); got != "create,start" {
+		t.Fatalf("webhook 只应固化并调度 ImageTask，不得同步等待 provider: %s", got)
+	}
+	in := facade.createInput
+	if in.AgentName != "kid-agent" || in.LearnerID != "kid-learner" ||
+		in.SourceKind != k12.ImageTaskSourceAPI || in.SourceRef != "delivery-image" ||
+		in.SourceSessionID != "parent-webhook" || in.AttemptGeneration != 1 ||
+		in.MessageIntent != "请批改这张作业" ||
+		len(in.SourceAssetRefs) != 1 || in.SourceAssetRefs[0] != assetID {
+		t.Fatalf("webhook ImageTask 来源/幂等身份丢失: %+v", in)
+	}
+}
+
+func TestK12WebhookImageSubmissionRejectsUnschedulableNewDispatch(t *testing.T) {
+	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
+	raw, _ := base64.StdEncoding.DecodeString(
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+	)
+	assetID, err := assetstore.Save("kid-agent", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facade := &fakeK12ImageTaskFacade{rejectStart: true}
+	result, err := (k12WebhookApplication{imageTasks: facade}).handle(
+		context.Background(),
+		webhook.K12Dispatch{
+			ReceiptID: "receipt-image-reject", BindingID: "binding-image",
+			EventID:   "delivery-image-reject",
+			EventType: webhook.K12EventSubmissionRequested,
+			AgentID:   "kid-agent", LearnerID: "kid-learner",
+			Payload: json.RawMessage(`{"asset_refs":["` + assetID + `"]}`),
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "未能启动") ||
+		result.Reference != "image_task:dispatch-1" {
+		t.Fatalf("新 dispatch 未排队不得谎报成功: result=%+v err=%v", result, err)
 	}
 }
 

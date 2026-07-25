@@ -2,8 +2,9 @@ package main
 
 // 真实模型、本地图片、零钉钉发送的 K12 直连探针。
 //
-// 它刻意从 maybeHandleK12DingtalkPhoto 进入，与生产 messageHandler 的 K12 分支相同；
-// 但不会构造/启动 DingtalkAdapter，因此绝不调用钉钉发送或媒体上传接口。运行示例：
+// 它覆盖真实批改 provider 与钉钉结果投影，但不会构造/启动 DingtalkAdapter，
+// 因此绝不调用钉钉发送或媒体上传接口。统一 ImageTask 入口本身由隔离的确定性测试覆盖；
+// 本探针只在显式授权真实模型时验证其下游能力。运行示例：
 //
 //   HEXCLAW_K12_PHOTO_PROBE=1 \
 //   HEXCLAW_K12_PHOTO_IMAGE=/tmp/hexclaw-k12-photo-probe.jpg \
@@ -174,7 +175,12 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	msg.Attachments[0].Data = base64.StdEncoding.EncodeToString(raw)
 
 	started := time.Now()
-	reply, handled, err := maybeHandleK12DingtalkPhoto(t.Context(), msg, k12PhotoTestRouter(t, true, "k12-tutor"), process)
+	result, err = process(t.Context(), k12usecase.PhotoGradeRequest{
+		AgentName: "child-tutor", Grade: "五年级下",
+		SourceSession: msg.SessionID, Image: raw,
+	})
+	reply := k12PhotoReply(result)
+	handled := true
 	if err != nil {
 		t.Fatalf("direct K12 photo route failed: failure_kind=%s vision_calls=%d error_type=%T",
 			classifyK12PhotoProbeFailure(err), visionCalls.Load(), err)

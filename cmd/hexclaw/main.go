@@ -1704,17 +1704,23 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 统一 GradingJob 编排器（§6.7/§6.15）：桌面 HTTP 与钉钉 IM 共用同一实例；
 	// 阶段产物落盘 dataDir/k12/grading-runs（崩溃恢复载体），异步推进用进程级 ctx。
 	var k12GradingOrch *k12usecase.GradingOrchestrator
+	var k12ImageTasks *k12usecase.ImageTaskCoordinator
 	k12GradingShutdown := false
+	k12ImageTasksShutdown := false
 	// This defer is the early-return safety net. It is registered after store.Close,
 	// so every path that assembled K12 seals and drains it before SQLite closes.
 	defer func() {
-		if k12GradingOrch == nil || k12GradingShutdown {
-			return
-		}
 		drainCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := k12GradingOrch.Shutdown(drainCtx); err != nil {
-			logger.Warn("K12 批改任务退出兜底超时", "error", err)
+		if k12ImageTasks != nil && !k12ImageTasksShutdown {
+			if err := k12ImageTasks.Shutdown(drainCtx); err != nil {
+				logger.Warn("K12 图片任务退出兜底超时", "error", err)
+			}
+		}
+		if k12GradingOrch != nil && !k12GradingShutdown {
+			if err := k12GradingOrch.Shutdown(drainCtx); err != nil {
+				logger.Warn("K12 批改任务退出兜底超时", "error", err)
+			}
 		}
 	}()
 	// ChannelPort 通道注册表（§6.10 / ADR-K12-011）：name→通道端口，装配只此一处注册。
@@ -1726,7 +1732,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	imChannels.Register(dingtalkChannel)
 	imChannels.Register(channel.NewFeishu())
 	imChannels.Register(channel.NewWeCom())
-	// 作品点评/观察练习卡「发送到手机」投递缝（§3.10/§3.12）：mount 时先建（router 已就绪），
+	// 辅导要点、练习集与积累内容「发送到手机」投递缝：mount 时先建（router 已就绪），
 	// 通道发送链路在 instanceMgr 建成后标记就绪（装配顺序使然）。
 	k12Deliver := &k12IMDeliverer{router: agentRouter, channels: imChannels}
 	{
@@ -1775,7 +1781,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
 			// 不设 MaxTokens：各家视觉模型上限差异大（glm-4v-flash 硬顶 1024，设 4096 即 400），
 			// 任何硬编码都会在某家翻车/截断；取消与 deadline 统一由入口请求负责。
-			resp, cErr := provider.Complete(ctx, hexagon.CompletionRequest{
+			resp, cErr := provider.Complete(k12NonIdempotentLLMContext(ctx), hexagon.CompletionRequest{
 				Model: visionModel,
 				Messages: []hexagon.Message{{
 					Role: hexagon.RoleUser,
@@ -1848,7 +1854,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			cctx, ccancel := context.WithTimeout(cctx, 60*time.Second)
 			defer ccancel()
 			temp := 0.4
-			resp, err := provider.Complete(cctx, hexagon.CompletionRequest{
+			resp, err := provider.Complete(k12NonIdempotentLLMContext(cctx), hexagon.CompletionRequest{
 				Messages: []hexagon.Message{
 					{Role: hexagon.RoleSystem, Content: "你是中小学出题老师。据给定学科/年级/知识点直接出一道同类变式练习题并给简要解答，" +
 						"直接给最终题目与答案、不要展开长篇推理。输出必须严格使用 GitHub Markdown，固定为 `## 问题`、`## 解答`、`## 答案` 三段；" +
@@ -1881,12 +1887,57 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			cctx, ccancel := context.WithTimeout(cctx, 60*time.Second)
 			defer ccancel()
 			temp := 0.2
-			resp, err := provider.Complete(cctx, hexagon.CompletionRequest{
+			resp, err := provider.Complete(k12NonIdempotentLLMContext(cctx), hexagon.CompletionRequest{
 				Messages: []hexagon.Message{
 					{Role: hexagon.RoleSystem, Content: "你是中小学家长辅导助手。针对给定年级和知识点，直接生成一段120字以内的知识点回顾：核心概念、一个常见卡点、一句家长引导话术。不要出题，不要给练习答案，不要声称引用教材原文。数学使用 Unicode 符号，禁止 LaTeX。"},
 					{Role: hexagon.RoleUser, Content: task},
 				},
 				MaxTokens:   512,
+				Temperature: &temp,
+			})
+			if err != nil {
+				return "", err
+			}
+			return resp.Content, nil
+		}
+		parentTeachingGuideGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
+			provider := router.Default()
+			model := ""
+			if snapshot, pinned := k12.GradingModelSnapshotFromContext(ctx); pinned {
+				var found bool
+				provider, found = router.Get(snapshot.Provider)
+				if !found || provider == nil {
+					return "", fmt.Errorf("K12 GradingJob 冻结 provider %q 不可用，拒绝跨路由 fallback", snapshot.Provider)
+				}
+				model = snapshot.Model
+				if err := k12.ValidateGradingModelRoute(ctx, snapshot.Provider, model); err != nil {
+					return "", err
+				}
+			}
+			if provider == nil {
+				return "", fmt.Errorf("k12 家长辅导指南: 没有可用的 LLM Provider")
+			}
+			task := prompt
+			if subject != "" {
+				task = "【学科：" + subject + "】" + task
+			}
+			if grade != "" {
+				task += "\n（只使用" + grade + "已经学过的概念和方法。）"
+			}
+			cctx := egress.WithRequest(ctx, egress.PurposeGeneralChat,
+				"k12-parent-teaching-guide", egress.ClassGeneral)
+			temp := 0.2
+			resp, err := provider.Complete(k12NonIdempotentLLMContext(cctx), hexagon.CompletionRequest{
+				Model: model,
+				Messages: []hexagon.Message{
+					{Role: hexagon.RoleSystem, Content: "你是中小学家长辅导助手。只处理用户给出的这一道题及已验算解答，" +
+						"不得改写答案或完整方法，不得声称引用未提供的教材。answer 只能是已验算解答中明确出现的简短最终答案，" +
+						"禁止把整段解答塞入 answer。输出必须是单个 JSON 对象且不要代码围栏；" +
+						"必须且只能包含 answer、full_solution_steps、grade_level_method、likely_mistakes、" +
+						"parent_teaching_sequence、follow_up_questions、checking_method 七个字段，四个复数字段必须是非空字符串数组。" +
+						"每一项都要针对当前题目，不得输出可套用到任意题的通用建议。"},
+					{Role: hexagon.RoleUser, Content: task},
+				},
 				Temperature: &temp,
 			})
 			if err != nil {
@@ -1910,7 +1961,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			cctx, ccancel := context.WithTimeout(cctx, 60*time.Second)
 			defer ccancel()
 			temp := 0.1
-			resp, err := provider.Complete(cctx, hexagon.CompletionRequest{
+			resp, err := provider.Complete(k12NonIdempotentLLMContext(cctx), hexagon.CompletionRequest{
 				Messages: []hexagon.Message{
 					{Role: hexagon.RoleSystem, Content: "你是中小学错题整理助手。根据题目和孩子的错误答案，仅归纳错因本身，20字以内；不要解题、不要出新题、不要复述题目、不要给答案。"},
 					{Role: hexagon.RoleUser, Content: task},
@@ -1925,6 +1976,20 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		}
 		workFeedbackGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
 			provider := router.Default()
+			model := ""
+			if snapshot, pinned := k12.GradingModelSnapshotFromContext(ctx); pinned {
+				var found bool
+				provider, found = router.Get(snapshot.Provider)
+				if !found || provider == nil {
+					return "", fmt.Errorf("K12 作品点评冻结 provider %q 不可用，拒绝跨路由 fallback", snapshot.Provider)
+				}
+				model = snapshot.Model
+				if err := k12.ValidateGradingModelRoute(
+					ctx, snapshot.Provider, model,
+				); err != nil {
+					return "", err
+				}
+			}
 			if provider == nil {
 				return "", fmt.Errorf("k12 作品点评: 没有可用的默认 LLM Provider")
 			}
@@ -1947,7 +2012,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			// engineadapter/work_feedback.go 注入；skill 缺失时回退硬编码两段式）。
 			// 系统提示只钉红线（与提示词红线、usecase INV-011 构成三道保险），
 			// 不再下发与 skill 输出信封冲突的固定两段式/字数上限。
-			resp, err := provider.Complete(cctx, hexagon.CompletionRequest{
+			resp, err := provider.Complete(k12NonIdempotentLLMContext(cctx), hexagon.CompletionRequest{
+				Model: model,
 				Messages: []hexagon.Message{
 					{Role: hexagon.RoleSystem, Content: "你是小学写作辅导老师，给孩子作文做形成性点评。红线：只点评不打分——禁止输出任何分数、等第、评级、排名；" +
 						"不代写——禁止给范文、禁止改写或重写全文。点评框架与输出格式按用户消息里的技能指引执行；语气鼓励、具体、可执行。"},
@@ -1970,10 +2036,27 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			if router == nil {
 				return "", fmt.Errorf("未配置视觉模型")
 			}
-			provider, visionModel, rErr := eng.RouteForVision(ctx)
-			if rErr != nil {
-				logger.Warn("[k12作品点评] 视觉模型路由失败", "err", rErr.Error(), "image_bytes", len(image))
-				return "", rErr
+			var provider hexagon.Provider
+			var visionModel string
+			if snapshot, pinned := k12.GradingModelSnapshotFromContext(ctx); pinned {
+				var found bool
+				provider, found = router.Get(snapshot.Provider)
+				if !found || provider == nil {
+					return "", fmt.Errorf("K12 作品点评冻结 provider %q 不可用，拒绝跨路由 fallback", snapshot.Provider)
+				}
+				visionModel = snapshot.Model
+				if err := k12.ValidateGradingModelRoute(
+					ctx, snapshot.Provider, visionModel,
+				); err != nil {
+					return "", err
+				}
+			} else {
+				var rErr error
+				provider, visionModel, rErr = eng.RouteForVision(ctx)
+				if rErr != nil {
+					logger.Warn("[k12作品点评] 视觉模型路由失败", "err", rErr.Error(), "image_bytes", len(image))
+					return "", rErr
+				}
 			}
 			logger.Info("[k12作品点评] 视觉模型已路由", "provider", provider.Name(), "model", visionModel,
 				"image_bytes", len(image), "egress", "vision_chat[sensitive_media]")
@@ -1984,7 +2067,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
 			// 与识题 visionFn 同纪律：不设 MaxTokens（各家视觉模型上限差异大），
 			// 取消与 deadline 统一由入口请求负责。
-			resp, cErr := provider.Complete(ctx, hexagon.CompletionRequest{
+			resp, cErr := provider.Complete(k12NonIdempotentLLMContext(ctx), hexagon.CompletionRequest{
 				Model: visionModel,
 				Messages: []hexagon.Message{{
 					Role: hexagon.RoleUser,
@@ -2023,6 +2106,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			k12assembly.WithRetryGenerator(retryGenFn),
 			k12assembly.WithCauseSummaryGenerator(causeSummaryGenFn),
 			k12assembly.WithTutoringTipsReviewGenerator(tutoringTipsReviewGenFn),
+			k12assembly.WithParentTeachingGuideGenerator(parentTeachingGuideGenFn),
 			k12assembly.WithWorkFeedbackGenerator(workFeedbackGenFn),
 			k12assembly.WithWorkFeedbackVision(workFeedbackVisionFn),
 			k12assembly.WithWorkFeedbackSkillLoader(k12SkillLoaderFn),
@@ -2074,12 +2158,74 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				k12usecase.WithGradingRunDir(filepath.Join(dataDir, "k12", "grading-runs")),
 				k12usecase.WithGradingBaseContext(ctx),
 			)
+			k12rt.Deps.WorkFeedbackRoute = func(
+				_ context.Context, workType string,
+			) (k12.ImageTaskRouteSnapshot, error) {
+				capabilities := []string{config.LLMModelCapabilityText}
+				promptVersion := "writing-feedback-v1"
+				if workType == k12.WorkTypeArt {
+					capabilities = append(capabilities, config.LLMModelCapabilityVision)
+					promptVersion = "art-feedback-v1"
+				}
+				route, routeErr := router.ResolveRouteForCapabilities("", "", capabilities...)
+				if routeErr != nil {
+					return k12.ImageTaskRouteSnapshot{}, routeErr
+				}
+				return k12.ImageTaskRouteSnapshot{
+					Provider: route.ProviderName, Model: route.Model,
+					Route:           route.ProviderName + "/" + route.Model,
+					Capability:      strings.Join(capabilities, "+"),
+					SelectionSource: "auto", PolicyVersion: "work-feedback-routing-v1",
+					PromptVersion: promptVersion,
+				}, nil
+			}
+			imageTaskAdapter := k12engineadapter.NewImageTaskAdapter(visionFn)
+			k12ImageTasks = &k12usecase.ImageTaskCoordinator{
+				Records: k12rt.Records, Classifier: imageTaskAdapter,
+				WritingOCR: imageTaskAdapter, Grading: k12GradingOrch,
+				WorkFeedback: &k12rt.Deps,
+				BaseContext:  ctx,
+				ResolveGrade: func(
+					profileCtx context.Context,
+					agentName string,
+				) (string, error) {
+					profile, profileErr := k12rt.Deps.GetProfile(profileCtx, agentName)
+					if profileErr != nil {
+						return "", profileErr
+					}
+					return profile.GradeTerm, nil
+				},
+				ResolveRoute: func(
+					requested k12.ImageTaskRouteSnapshot,
+				) (k12.ImageTaskRouteSnapshot, error) {
+					resolved, resolveErr := k12ModelSnapshot(k12.GradingModelSnapshot{
+						Provider: requested.Provider, Model: requested.Model,
+					})
+					if resolveErr != nil {
+						return k12.ImageTaskRouteSnapshot{}, resolveErr
+					}
+					selectionSource := strings.TrimSpace(requested.SelectionSource)
+					if selectionSource == "" {
+						selectionSource = "auto"
+					}
+					return k12.ImageTaskRouteSnapshot{
+						Provider: resolved.Provider, Model: resolved.Model,
+						Route: resolved.Route, Capability: resolved.Capability,
+						SelectionSource: selectionSource,
+						PolicyVersion:   "image-task-routing-v1",
+						PromptVersion:   "image-task-classifier-v1",
+						TimeoutMS:       resolved.TimeoutMS,
+					}, nil
+				},
+			}
 			if webhookMgr != nil {
 				// DD-019: K12 Webhook is a TriggerAdapter into the same application
 				// commands as Desktop/IM/Workflow; it never falls back to the generic
 				// webhook-system prompt path.
 				recovered, recoverErr := installK12WebhookHandler(ctx, webhookMgr,
-					newK12WebhookEventHandler(k12rt.Deps, k12GradingOrch, k12ModelSnapshot, srv))
+					newK12WebhookEventHandler(
+						k12rt.Deps, k12GradingOrch, k12ImageTasks, k12ModelSnapshot, srv,
+					))
 				if recoverErr != nil {
 					logger.Warn("K12 Webhook 持久派发恢复失败", "error", recoverErr)
 				} else if recovered > 0 {
@@ -2096,6 +2242,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				Binder:                k12Binder,
 				BaseURL:               k12Base,
 				Grading:               k12GradingOrch,
+				ImageTasks:            k12ImageTasks,
 			}))
 			// 崩溃恢复扫描（§6.15/K12-INV-021）：启动即扫非终态 GradingJob——自动阶段从检查点
 			// 重新入列续跑，awaiting_confirmation 保持等待；不阻塞启动主线。
@@ -2104,6 +2251,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				names := make([]string, 0, len(agents))
 				for _, a := range agents {
 					names = append(names, a.Name)
+				}
+				if n, rerr := k12ImageTasks.Recover(ctx, names); rerr != nil {
+					logger.Warn("K12 图片任务崩溃恢复扫描失败", "error", rerr)
+				} else if n > 0 {
+					logger.Info("K12 图片任务崩溃恢复扫描完成", "recovered", n)
 				}
 				if n, rerr := k12GradingOrch.RecoverGradingJobs(ctx, names); rerr != nil {
 					logger.Warn("K12 批改任务崩溃恢复扫描失败", "error", rerr)
@@ -2404,18 +2556,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	_ = videogenSvc
 	_ = voiceChatSvc
 
-	// K12 统一 GradingJob 编排器：钉钉拍照批改入口与桌面 HTTP 入口共用 K12 mount 处创建的
-	// 同一实例（§6.7「桌面、API、IM 私聊和工作流共用的唯一应用服务」；入口自编排两侧均已收敛）。
-	var k12PhotoOrchestrator k12PhotoJobOrchestrator
-	if k12GradingOrch != nil {
-		k12PhotoOrchestrator = k12GradingOrch
-	}
 	messageHandler := func(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
 		if err := gw.Check(ctx, msg); err != nil {
 			return &adapter.Reply{Content: "安全检查未通过: " + err.Error()}, nil
 		}
-		if k12Runtime != nil {
-			if reply, handled, err := maybeHandleK12DingtalkPhotoJob(ctx, msg, agentRouter, k12PhotoOrchestrator, k12Runtime.Deps.GradeHomeworkPhoto); handled {
+		if k12ImageTasks != nil {
+			if reply, handled, err := maybeHandleK12DingtalkPhoto(ctx, msg, agentRouter, k12ImageTasks); handled {
 				return reply, err
 			}
 		}
@@ -2764,6 +2910,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// HTTP listeners and in-flight handlers are closed before sealing the K12
 	// orchestrator. Cancel and drain its grading/anchor/recovery workers while
 	// SQLite is still open; deferred store.Close runs only after this function returns.
+	if k12ImageTasks != nil {
+		if err := k12ImageTasks.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("K12 图片任务停止超时", "error", err)
+		} else {
+			k12ImageTasksShutdown = true
+		}
+	}
 	if k12GradingOrch != nil {
 		if err := k12GradingOrch.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("K12 批改任务停止超时", "error", err)

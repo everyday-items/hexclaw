@@ -11,17 +11,13 @@ import (
 	"context"
 	"testing"
 
+	k12 "github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
 func TestINV015_GroupConversationNeverEntersK12PhotoFlow(t *testing.T) {
 	router := k12PhotoTestRouter(t, true, "k12-tutor")
-	processCalls := 0
-	process := func(_ context.Context, _ k12usecase.PhotoGradeRequest) (k12usecase.PhotoGradeResult, error) {
-		processCalls++
-		return k12usecase.PhotoGradeResult{}, nil
-	}
-	orchestrator := &countingPhotoOrchestrator{}
+	facade := &fakeK12ImageTaskFacade{}
 
 	msg := k12PhotoTestMessage()
 	msg.Metadata = map[string]string{
@@ -29,15 +25,15 @@ func TestINV015_GroupConversationNeverEntersK12PhotoFlow(t *testing.T) {
 		"conversation_type": "2", // 钉钉群聊
 	}
 
-	reply, handled, err := maybeHandleK12DingtalkPhotoJob(context.Background(), msg, router, orchestrator, process)
+	reply, handled, err := maybeHandleK12DingtalkPhoto(context.Background(), msg, router, facade)
 	if err != nil {
 		t.Fatalf("群消息应被静默忽略而非报错: %v", err)
 	}
 	if handled || reply != nil {
 		t.Fatalf("K12-INV-015 违规：群 conversation 进入了 K12 拍照批改链路（handled=%v reply=%#v）", handled, reply)
 	}
-	if processCalls != 0 || orchestrator.startCalls != 0 {
-		t.Fatalf("K12-INV-015 违规：群消息触发了批改（process=%d orchestratorStart=%d）", processCalls, orchestrator.startCalls)
+	if len(facade.events) != 0 {
+		t.Fatalf("K12-INV-015 违规：群消息触发了 ImageTask（events=%v）", facade.events)
 	}
 }
 
@@ -49,34 +45,20 @@ func TestINV015_DirectConversationStillHandled(t *testing.T) {
 		"缺省 metadata": nil,
 	} {
 		t.Run(name, func(t *testing.T) {
+			t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
 			router := k12PhotoTestRouter(t, true, "k12-tutor")
-			process := func(_ context.Context, _ k12usecase.PhotoGradeRequest) (k12usecase.PhotoGradeResult, error) {
-				return k12usecase.PhotoGradeResult{Mode: k12usecase.PhotoModeGrade, Markdown: "## 作业批改"}, nil
-			}
+			facade := &fakeK12ImageTaskFacade{result: k12usecase.ImageTaskResult{
+				Kind: string(k12.ImageTaskIntentCompletedHomework),
+				Photo: &k12usecase.PhotoGradeResult{
+					Mode: k12usecase.PhotoModeGrade, Markdown: "## 作业批改",
+				},
+			}}
 			msg := k12PhotoTestMessage()
 			msg.Metadata = meta
-			reply, handled, err := maybeHandleK12DingtalkPhoto(context.Background(), msg, router, process)
+			reply, handled, err := maybeHandleK12DingtalkPhoto(context.Background(), msg, router, facade)
 			if err != nil || !handled || reply == nil {
 				t.Fatalf("direct 私聊必须照常进入 K12 链路: handled=%v reply=%#v err=%v", handled, reply, err)
 			}
 		})
 	}
 }
-
-// countingPhotoOrchestrator 只数调用，任何进入即违规。
-type countingPhotoOrchestrator struct{ startCalls int }
-
-func (c *countingPhotoOrchestrator) StartPhotoGradingJob(context.Context, k12usecase.StartPhotoGradingInput) (k12usecase.GradingJobView, bool, error) {
-	c.startCalls++
-	return k12usecase.GradingJobView{}, false, nil
-}
-func (c *countingPhotoOrchestrator) RunGradingJob(context.Context, string) (k12usecase.GradingJobView, error) {
-	return k12usecase.GradingJobView{}, nil
-}
-func (c *countingPhotoOrchestrator) ConfirmAndRun(context.Context, string, []string) (k12usecase.GradingJobView, error) {
-	return k12usecase.GradingJobView{}, nil
-}
-func (c *countingPhotoOrchestrator) PhotoResult(string) (k12usecase.PhotoGradeResult, bool) {
-	return k12usecase.PhotoGradeResult{}, false
-}
-func (c *countingPhotoOrchestrator) ReleaseGradingRun(string) {}
