@@ -8,6 +8,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
 // K12 闭环纠偏包 HTTP 契约（2026-07-18）：
@@ -41,22 +42,27 @@ func TestHTTPGradeResultsPartialThenComplete(t *testing.T) {
 	}
 }
 
-func TestHTTPFinalizeSendDeliveryPending(t *testing.T) {
-	h := newServer(t)
+func TestHTTPFinalizeSendUsesServerResolvedBatch(t *testing.T) {
+	delivery := &httpBatchTransport{
+		targets: httpBatchTargets()[:1],
+		send: []usecase.DeliveryTransportAck{{
+			Status: k12.DeliveryDelivered, ExternalMessageID: "paper-closure",
+		}},
+	}
+	h := newServerWithReceiptTransport(t, delivery)
 	_, out := do(t, h, "POST", "/practice-sets/basket/items", `{"agent":"mingming",
 		"item":{"subject":"数学","added_via":"weekly","question_markdown":"1+1=?","expected_answer_markdown":"2","verification_status":"verified","verification_evidence":"验算"}}`)
 	id := out["record_id"].(string)
-	rec, fin := do(t, h, "POST", "/practice-sets/"+id+"/finalize", `{"agent":"mingming","via":"send","target":"钉钉私聊"}`)
+	rec, fin := do(t, h, "POST", "/practice-sets/"+id+"/finalize", `{"agent":"mingming","via":"send"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("固化 HTTP %d: %v", rec.Code, fin)
 	}
 	set, _ := fin["set"].(map[string]any)
-	// §3.12：无真实投递器接线时不得虚标 delivered。
-	if set["delivery_status"] != k12.PracticeDeliveryPending {
-		t.Errorf("send 固化未接投递器应为 pending, got %v", set["delivery_status"])
+	if set["delivery_status"] != k12.PracticeDeliveryDelivered || set["delivery_batch_id"] == "" {
+		t.Errorf("send 固化应关联可核验批次, got %v", set)
 	}
-	if note, _ := fin["delivery_note"].(string); note == "" {
-		t.Error("响应应注明投递状态 pending 的原因")
+	if _, ok := fin["delivery_batch"].(map[string]any); !ok {
+		t.Errorf("响应应返回投递批次, got %v", fin)
 	}
 }
 

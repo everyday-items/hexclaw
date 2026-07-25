@@ -25,10 +25,24 @@
 }
 ```
 
-**`POST /api/k12/recognize` / `POST /api/k12/recognize/anchors` — 已删除（§6.14 一次切换 · 2026-07-18）**
-拍照识题→锚点→批改统一走 `POST /grading-jobs*`（创建→轮询→`awaiting_confirmation` 停点产物含
-识别清单+整卷学科+锚点 bbox→confirm→completed 取逐题结果）。两直连端点现回 404（反向契约
-`cutover_20260718_old_links_removed_test.go`）。
+**图片任务唯一公开 facade（六个端点）**
+
+- `POST /api/k12/image-tasks`
+- `GET /api/k12/image-tasks/{dispatch_id}?agent=...`
+- `POST /api/k12/image-tasks/{dispatch_id}/confirm`
+- `POST /api/k12/image-tasks/{dispatch_id}/retry`
+- `POST /api/k12/image-tasks/{dispatch_id}/cancel`
+- `GET /api/k12/image-tasks/{dispatch_id}/result?agent=...`
+
+同一入口把图片分流为 `completed_homework`、`blank_worksheet`、`writing` 或 `artwork`。
+前两类内部使用 HomeworkSubmission/GradingJob，后两类使用 CreativeWorkIntake；这些内部对象不再
+拥有客户端可寻址的图片任务路由。`/recognize*`、`/grading-jobs*` 和
+`/creative-work-ocr-jobs*` 均不属于公开契约并返回 404/405。
+
+学习档案中的手工作品图片也走同一 facade，但必须携带严格 `creative_entry`：
+新作品为 `{"kind":"new_work","task_intent":"writing|artwork"}`，修改稿另带
+`work_id/base_version_id`。该路径采用家长已选类型、跳过模型分类；上传、写作 OCR 冻结和恢复
+都不会创建正式作品，只有现有保存动作提交 `creative.action=commit` 才原子创建 v1 或追加版本。
 
 **`POST /api/k12/grade`** — 批改一道题完整闭环（**需 LLM 密钥**）
 - 请求：`{"agent","grade","source_session","problem","student_answer","knowledge_points":[]}`
@@ -168,7 +182,7 @@
 ## 3. 关键流程
 
 - **识题回显护栏**（分渠道两种形态，同一信任链目标）：
-  - **桌面**：交互门——`POST /grading-jobs`（照片）→ 轮询到 `awaiting_confirmation` 停点（响应携带识别清单+锚点）→ 前端 `RecognizeGuardPanel` 展示让家长确认/纠正 → `confirm` → 轮询到 `completed` 取逐题结果；单题补批仍走 `grade`。
+  - **桌面**：`POST /image-tasks` → 轮询同一 dispatch；清晰证据自动推进，只有模糊或冲突的最小原题事实进入 `confirm`。终态统一从同 dispatch 的 `/result` 读取；已作答作业返回批注原图和错题家长讲法，空白卷返回每题完整家长讲题指南。单题补批仍走 `grade`。
   - **IM（钉钉/微信）**：内联回显——`homework-checker` skill 在解答**同一条消息**开头先列「我读到的题目」抬头再给整页解答，不阻塞等确认（IM 多轮往返代价高）；`[?]` 不确定字符点名请确认、确认前该题不下批改结论。出站经 `NormalizeMathText` 把 LaTeX 降级为 Unicode 数学符号（钉钉 markdown 不渲染 LaTeX）。
 - **建档**：实例（agent）先经平台 Agent 创建，再 `PUT /profile` 写 K12 档案（落 `k12.child_name`/`k12.grade_term`/`k12.textbook_edition` metadata 键，不覆盖其他 metadata）。
 - **导出 PDF**：`format=pdf` 需服务器装 pandoc；未装则降级 markdown JSON — 前端要判断响应是二进制还是 `{content}`。
@@ -177,7 +191,7 @@
 
 | 功能 | 状态 |
 |---|---|
-| 真 LLM | `grade`/`grading-jobs`（识别+批改阶段）/`tutor-turn 阶段三 solution` 运行时真调本地或云端模型，**服务器必须有可用 `cfg.LLM` provider**，否则报错。`tutoring-tips` 在无教材依据时会使用可用生成器；生成器不可用或失败则返回明确降级内容。其余端点纯本地无需 LLM |
+| 真 LLM | `grade`、`image-tasks` 的分类/OCR/批改/讲题/作品反馈阶段，以及 `tutor-turn` 阶段三 solution 会调用本地或云端模型，**服务器必须有可用 `cfg.LLM` provider**。每个实际调用冻结自己的模型路由；家长明确选择的手工作品类型不调用分类模型。`tutoring-tips` 在无教材依据时会使用可用生成器；生成器不可用或失败则返回明确降级内容。其余纯数据端点不依赖 LLM |
 | cron 自动投递（周五错题卷/回传提醒/学期确认×2，§3.13 四任务） | ✅ 已接：档案保存走 `cron/reconcile-defaults` missing-only 补齐，保留用户已改任务；显式切换兼容入口 `cron/provision` 仍负责注册并回收历史 kind 残留。投递内容走 `cron/*` 纯文本端点（空 body 静默跳过），复用平台 cron 调度 + Deliverer（IM/桌面）|
 | IM 群绑定（各绑各的群） | ✅ 已接：`bind-im` 写 `agent_rules`，入站群消息路由到对应实例 |
 | 渐进三阶段提示 + 情绪守门 | ✅ 已接：`tutor-turn` 输出分阶段指令 + 守门标志；**桌面/HTTP 联调可用** |
@@ -187,4 +201,7 @@
 
 ## 5. 最容易踩的第一个坑
 
-联调报"LLM 未配置/解题失败"类错误时，先确认服务器端 `cfg.LLM` 有可用 provider（`grade`/`grading-jobs` 依赖它，`tutoring-tips` 的无教材讲解也会使用它）。纯数据端点（mistakes/review/report/profile/backup/export-md/accumulation）不依赖 LLM，可先联调这些。
+联调报"LLM 未配置/解题失败"类错误时，先确认服务器端 `cfg.LLM` 有可用 provider
+（`grade`、自动图片分流/识别/批改/讲题及 `tutoring-tips` 的无教材讲解会使用它）。
+手工美术作品的 `parent_selected + explicit_commit` 路径不应因缺少分类/OCR模型而失败。
+纯数据端点（mistakes/review/report/profile/backup/export-md/accumulation）不依赖 LLM，可先联调这些。

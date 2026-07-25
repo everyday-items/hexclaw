@@ -2,6 +2,7 @@ package apihttp
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -49,7 +50,7 @@ type practiceSetDTO struct {
 	QuestionSheet       string                   `json:"question_artifact_id,omitempty"`
 	AnswerSheet         string                   `json:"answer_artifact_id,omitempty"`
 	DeliveryStatus      string                   `json:"delivery_status"`
-	DeliveryTarget      string                   `json:"delivery_target,omitempty"`
+	DeliveryBatchID     string                   `json:"delivery_batch_id,omitempty"`
 	SkippedBlockedCount int                      `json:"skipped_blocked_count,omitempty"`
 	PaperNo             string                   `json:"paper_no,omitempty"`
 	FinalizedAt         int64                    `json:"finalized_at,omitempty"`
@@ -151,7 +152,7 @@ func toPracticeSetDTO(v usecase.PracticeSetView) practiceSetDTO {
 		SkippedBlockedCount: v.Fields.SkippedBlockedCount,
 		PaperNo:             v.Fields.PaperNo, FinalizedAt: v.Fields.FinalizedAt, FinalizedVia: v.Fields.FinalizedVia,
 		QuestionSheet: v.Fields.QuestionArtifact, AnswerSheet: v.Fields.AnswerArtifact,
-		DeliveryStatus: v.Fields.DeliveryStatus, DeliveryTarget: v.Fields.DeliveryTarget,
+		DeliveryStatus: v.Fields.DeliveryStatus, DeliveryBatchID: v.Fields.DeliveryBatchID,
 		Items: items, ReturnAssets: returnAssets,
 	}
 }
@@ -236,8 +237,7 @@ func (h *handler) verifyPracticeItem(w http.ResponseWriter, r *http.Request) {
 }
 
 type agentOnlyReq struct {
-	Agent  string `json:"agent"`
-	Target string `json:"target,omitempty"`
+	Agent string `json:"agent"`
 }
 
 // addToBasket 装篮命令（2026-07-18 购物车裁决）：单 Learner 单篮、幂等去重。
@@ -349,29 +349,38 @@ func (h *handler) removeFromBasket(w http.ResponseWriter, r *http.Request) {
 
 // finalizePracticeSet 固化出卷命令：打印/发送即确认，跳过阻断题（§3.8）。
 type finalizeReq struct {
-	Agent  string `json:"agent"`
-	Via    string `json:"via"` // print | send
-	Target string `json:"target,omitempty"`
+	Agent string `json:"agent"`
+	Via   string `json:"via"` // print | send
 }
 
 func (h *handler) finalizePracticeSet(w http.ResponseWriter, r *http.Request) {
 	var req finalizeReq
-	if !decode(w, r, &req) {
+	if !decodeStrict(w, r, &req) {
 		return
 	}
 	if req.Agent == "" {
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
-	v, skipped, err := h.rt.Deps.FinalizeBasket(r.Context(), req.Agent, r.PathValue("id"), req.Via, req.Target)
+	v, skipped, err := h.rt.Deps.FinalizeBasket(r.Context(), req.Agent, r.PathValue("id"), req.Via)
 	if err != nil {
+		if req.Via == "send" &&
+			(errors.Is(err, usecase.ErrDeliveryUnavailable) ||
+				errors.Is(err, usecase.ErrNoActiveDirectBindings)) {
+			writeDeliveryError(w, err)
+			return
+		}
 		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
 		return
 	}
 	resp := map[string]any{"set": toPracticeSetDTO(v), "skipped_blocked_count": skipped}
-	// §3.12：send 固化未接真实投递器时 delivery_status=pending，响应注明——不虚标 delivered。
-	if v.Fields.DeliveryStatus == k12.PracticeDeliveryPending {
-		resp["delivery_note"] = "卷已固化，投递待执行（delivery_status=pending）：投递器未接线，投递结果由渠道适配器回写；渠道失败不回滚已固化的卷"
+	if v.Fields.DeliveryBatchID != "" {
+		batch, batchErr := h.rt.Deps.GetDeliveryBatch(r.Context(), req.Agent, v.Fields.DeliveryBatchID)
+		if batchErr != nil {
+			writeDeliveryError(w, batchErr)
+			return
+		}
+		resp["delivery_batch"] = batch
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -686,7 +695,6 @@ func (h *handler) cancelPracticeSet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) doClosePractice(agent, id string, r *http.Request) error {
-	// closed_reason 经 agentOnlyReq.Target 复用会造成语义混淆，close 用独立解码；
 	// practiceStep 已消费过 body，这里从 query 取 reason（manual/semester，缺省 manual）。
 	return h.rt.Deps.ClosePracticeSet(r.Context(), agent, id, r.URL.Query().Get("reason"))
 }

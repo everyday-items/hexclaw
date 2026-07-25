@@ -1,6 +1,9 @@
 package apihttp
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -247,10 +250,12 @@ func (h *handler) getGradingJobResult(w http.ResponseWriter, r *http.Request) {
 
 // photoItemDTO 逐题批改结果（判定五值口径；批改/解题分叉共用 gradeResp wire 形状）。
 type photoItemDTO struct {
-	Question recognizedQuestionDTO `json:"question"`
-	Status   string                `json:"status"`
-	Warning  string                `json:"warning,omitempty"`
-	Grade    *gradeResp            `json:"grade,omitempty"`
+	Question    recognizedQuestionDTO        `json:"question"`
+	Status      string                       `json:"status"`
+	ResultKind  string                       `json:"result_kind"`
+	Warning     string                       `json:"warning,omitempty"`
+	Grade       *gradeResp                   `json:"grade,omitempty"`
+	ParentGuide *usecase.ParentTeachingGuide `json:"parent_guide,omitempty"`
 }
 
 func photoResultDTO(res usecase.PhotoGradeResult) map[string]any {
@@ -258,7 +263,8 @@ func photoResultDTO(res usecase.PhotoGradeResult) map[string]any {
 	for _, it := range res.Items {
 		d := photoItemDTO{
 			Question: recognizedQuestionToDTO(it.Recognized, true),
-			Status:   string(it.Status), Warning: it.Warning,
+			Status:   string(it.Status), ResultKind: string(it.EffectiveResultKind()),
+			Warning: it.Warning, ParentGuide: it.ParentGuide,
 		}
 		switch {
 		case it.Status == usecase.PhotoBlankSolved,
@@ -275,10 +281,23 @@ func photoResultDTO(res usecase.PhotoGradeResult) map[string]any {
 		}
 		items = append(items, d)
 	}
-	return map[string]any{
+	out := map[string]any{
 		"mode": string(res.Mode), "items": items,
+		"task_intent": string(res.EffectiveTaskIntent()), "result_surface": string(res.EffectiveResultSurface()),
 		"markdown": res.Markdown, "image_warning": res.ImageWarning,
 	}
+	if res.AnnotatedImage != nil && len(res.AnnotatedImage.Data) > 0 {
+		sum := sha256.Sum256(res.AnnotatedImage.Data)
+		mime := strings.TrimSpace(res.AnnotatedImage.MIME)
+		if mime == "" {
+			mime = "application/octet-stream"
+		}
+		out["annotated_image"] = map[string]any{
+			"mime": mime, "data_base64": base64.StdEncoding.EncodeToString(res.AnnotatedImage.Data),
+			"digest": fmt.Sprintf("sha256:%x", sum[:]),
+		}
+	}
+	return out
 }
 
 type confirmGradingJobReq struct {

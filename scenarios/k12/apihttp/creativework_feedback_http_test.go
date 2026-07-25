@@ -47,6 +47,10 @@ func TestGenerateWorkFeedbackHTTP_Writing(t *testing.T) {
 	if v0["feedback_skill"] != "writing-feedback@1.0.0/embedded" {
 		t.Fatalf("feedback_skill 应透出内嵌来源戳: %v", v0["feedback_skill"])
 	}
+	structured, _ := v0["structured_feedback"].(map[string]any)
+	if _, exists := structured["allowed_actions"]; exists {
+		t.Fatalf("退役动作不得残留在结构化点评 DTO: %v", structured["allowed_actions"])
+	}
 }
 
 // TestGenerateWorkFeedbackHTTP_ScoreRejected INV-011：生成输出含打分 → 拒绝入库，

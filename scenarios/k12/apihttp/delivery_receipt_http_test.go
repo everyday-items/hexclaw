@@ -68,21 +68,34 @@ func newServerWithReceiptTransport(t *testing.T, delivery usecase.DeliveryTransp
 	return apihttp.NewHandler(apihttp.Runtime{Views: rt.Registry.Views, Records: rt.Records, Deps: rt.Deps})
 }
 
-func TestCreativeWorkSendReturnsDurableReceiptAndQueryIsOnlyDeliveredProof(t *testing.T) {
+func onlyBatchReceipt(t *testing.T, batch map[string]any) map[string]any {
+	t.Helper()
+	items, _ := batch["receipts"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("batch receipts=%v want singleton fixture", batch["receipts"])
+	}
+	receipt, _ := items[0].(map[string]any)
+	return receipt
+}
+
+func TestAccumulationSendReturnsDurableReceiptAndQueryIsOnlyDeliveredProof(t *testing.T) {
 	delivery := &httpReceiptTransport{
 		send:  []usecase.DeliveryTransportAck{{Status: k12.DeliverySending, ExternalMessageID: "pqk-http-1"}},
 		query: []usecase.DeliveryTransportAck{{Status: k12.DeliveryDelivered, ExternalMessageID: "pqk-http-1"}},
 	}
 	h := newServerWithReceiptTransport(t, delivery)
-	id := mkArtWorkWithFeedback(t, h, artFeedback)
+	id := addAccumulationHTTP(t, h, "海内存知己，天涯若比邻")
 
-	rec, out := do(t, h, "POST", "/creative-works/"+id+"/send-feedback", `{"agent":"mingming"}`)
-	if rec.Code != http.StatusOK || out["status"] != "sending" || out["external_message_id"] != "pqk-http-1" {
-		t.Fatalf("provider acceptance must return a sending Receipt: %d %v", rec.Code, out)
+	rec, out := do(t, h, "POST", "/accumulation/"+id+"/send", `{"agent":"mingming"}`)
+	if rec.Code != http.StatusOK || out["status"] != "sending" {
+		t.Fatalf("provider acceptance must return a sending DeliveryBatch: %d %v", rec.Code, out)
 	}
-	deliveryID, _ := out["delivery_id"].(string)
-	if deliveryID == "" || out["binding_id"] != "agent-rule:24" || out["payload_digest"] == "" || out["render_manifest_json"] == "" {
-		t.Fatalf("receipt evidence incomplete: %v", out)
+	child := onlyBatchReceipt(t, out)
+	deliveryID, _ := child["delivery_id"].(string)
+	if deliveryID == "" || child["external_message_id"] != "pqk-http-1" ||
+		child["binding_id"] != "agent-rule:24" || child["payload_digest"] == "" ||
+		child["render_manifest_json"] == "" {
+		t.Fatalf("receipt evidence incomplete: %v", child)
 	}
 	if delivery.sendN != 1 {
 		t.Fatalf("send count=%d", delivery.sendN)
@@ -108,23 +121,25 @@ func TestFailedReceiptHasExplicitSafeRetryAndUnknownRejectsIt(t *testing.T) {
 		{Status: k12.DeliveryOutcomeUnknown, ExternalMessageID: "pqk-http-unknown", Detail: "结果未知"},
 	}}
 	h := newServerWithReceiptTransport(t, delivery)
-	id := mkArtWorkWithFeedback(t, h, artFeedback)
+	failedID := addAccumulationHTTP(t, h, "欲穷千里目，更上一层楼")
 
-	_, failed := do(t, h, "POST", "/creative-works/"+id+"/send-feedback", `{"agent":"mingming"}`)
+	_, failed := do(t, h, "POST", "/accumulation/"+failedID+"/send", `{"agent":"mingming"}`)
 	if failed["status"] != "failed" {
-		t.Fatalf("failed receipt not returned: %v", failed)
+		t.Fatalf("failed batch not returned: %v", failed)
 	}
-	deliveryID := failed["delivery_id"].(string)
+	deliveryID := onlyBatchReceipt(t, failed)["delivery_id"].(string)
 	rec, retried := do(t, h, "POST", "/delivery-receipts/"+deliveryID+"/retry", `{"agent":"mingming"}`)
 	if rec.Code != http.StatusOK || retried["status"] != "sending" || retried["delivery_id"] != deliveryID {
 		t.Fatalf("failed retry must reuse receipt: %d %v", rec.Code, retried)
 	}
 
-	_, unknown := do(t, h, "POST", "/creative-works/"+id+"/send-feedback", `{"agent":"mingming","kind":"practice_card"}`)
+	unknownIDRecord := addAccumulationHTTP(t, h, "会当凌绝顶，一览众山小")
+	_, unknown := do(t, h, "POST", "/accumulation/"+unknownIDRecord+"/send", `{"agent":"mingming"}`)
 	if unknown["status"] != "outcome_unknown" {
-		t.Fatalf("unknown receipt not returned: %v", unknown)
+		t.Fatalf("unknown batch not returned: %v", unknown)
 	}
-	rec, _ = do(t, h, "POST", "/delivery-receipts/"+unknown["delivery_id"].(string)+"/retry", `{"agent":"mingming"}`)
+	unknownID := onlyBatchReceipt(t, unknown)["delivery_id"].(string)
+	rec, _ = do(t, h, "POST", "/delivery-receipts/"+unknownID+"/retry", `{"agent":"mingming"}`)
 	if rec.Code != http.StatusConflict || delivery.sendN != 3 {
 		t.Fatalf("unknown blind retry must be rejected without send: status=%d sends=%d", rec.Code, delivery.sendN)
 	}
@@ -139,7 +154,7 @@ func TestTutoringTipsSendUsesTheSameDurableReceiptProtocol(t *testing.T) {
 		"agent":"mingming","content":"【这份作业的辅导要点】五年级下\n知识点回顾\n小数乘法"
 	}`)
 	if rec.Code != http.StatusOK || out["status"] != "sending" || out["object_kind"] != "tutoring_tips" {
-		t.Fatalf("tutoring-tips send must return durable receipt: %d %v", rec.Code, out)
+		t.Fatalf("tutoring-tips send must return durable batch: %d %v", rec.Code, out)
 	}
 	if len(delivery.content) != 1 || delivery.content[0] == "" {
 		t.Fatalf("tutoring-tips content was not sent: %v", delivery.content)

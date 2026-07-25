@@ -1,13 +1,16 @@
 package apihttp_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
 )
 
-// TestCreativeWorkHTTPLifecycle 通过真实 mux 跑作品 create→feedback→revision→再 feedback。
+// TestCreativeWorkHTTPLifecycle 通过真实 mux 跑作品 create→AI feedback→revision→再 AI feedback。
 func TestCreativeWorkHTTPLifecycle(t *testing.T) {
-	h := newServer(t)
+	h := newFeedbackServer(t, func(context.Context, string, string, string) (string, error) {
+		return "「柳枝像绿色的丝带」比喻贴切；建议补一个听觉细节。", nil
+	})
 	body := `{"agent":"mingming","source_session":"s","work_type":"writing","title":"《春天的校园》","task":"观察春景","content_markdown":"柳枝像绿色的丝带"}`
 	rec, out := do(t, h, "POST", "/creative-works", body)
 	if rec.Code != http.StatusOK || out["created"] != true {
@@ -20,7 +23,7 @@ func TestCreativeWorkHTTPLifecycle(t *testing.T) {
 		t.Fatalf("GET 作品异常: %d %v", rec.Code, got)
 	}
 
-	rec, fb := do(t, h, "POST", "/creative-works/"+id+"/feedback", `{"agent":"mingming","feedback":"切题；比喻好，可加感官细节。"}`)
+	rec, fb := do(t, h, "POST", "/creative-works/"+id+"/generate-feedback", `{"agent":"mingming"}`)
 	if rec.Code != http.StatusOK || fb["status"] != "feedback_ready" {
 		t.Fatalf("点评异常: %d %v", rec.Code, fb)
 	}
@@ -34,7 +37,7 @@ func TestCreativeWorkHTTPLifecycle(t *testing.T) {
 		t.Fatalf("应有 2 个版本，got %d", len(vers))
 	}
 
-	rec, fb2 := do(t, h, "POST", "/creative-works/"+id+"/feedback", `{"agent":"mingming","feedback":"加了听觉细节，更生动。"}`)
+	rec, fb2 := do(t, h, "POST", "/creative-works/"+id+"/generate-feedback", `{"agent":"mingming"}`)
 	if rec.Code != http.StatusOK || fb2["status"] != "feedback_ready" {
 		t.Fatalf("二次点评异常: %d %v", rec.Code, fb2)
 	}

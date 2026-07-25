@@ -3,12 +3,21 @@ package apihttp_test
 import (
 	"net/http"
 	"testing"
+
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
 // TestPracticeSetHTTPLifecycle 通过真实 mux 跑购物车命令流（2026-07-18 裁决）：
 // 装篮 → 移除 → 固化（打印/发送即确认，跳过阻断题）→ 回传 → 复批 → 关闭。
 func TestPracticeSetHTTPLifecycle(t *testing.T) {
-	h := newServer(t)
+	delivery := &httpBatchTransport{
+		targets: httpBatchTargets()[:1],
+		send: []usecase.DeliveryTransportAck{{
+			Status: k12.DeliveryDelivered, ExternalMessageID: "paper-lifecycle",
+		}},
+	}
+	h := newServerWithReceiptTransport(t, delivery)
 	// 装篮两题（幂等去重：第三次重复装同题 added=false）。
 	rec, out := do(t, h, "POST", "/practice-sets/basket/items", `{"agent":"mingming","source_session":"s1",
 		"item":{"subject":"数学","added_via":"weekly","question_markdown":"2.8×0.65=?","expected_answer_markdown":"1.82","verification_status":"verified","verification_evidence":"独立验算"}}`)
@@ -33,7 +42,7 @@ func TestPracticeSetHTTPLifecycle(t *testing.T) {
 	}
 
 	// 固化：打印即确认，一步到 assigned，科学题（pending）被跳过。
-	rec, fin := do(t, h, "POST", "/practice-sets/"+id+"/finalize", `{"agent":"mingming","via":"send","target":"钉钉私聊"}`)
+	rec, fin := do(t, h, "POST", "/practice-sets/"+id+"/finalize", `{"agent":"mingming","via":"send"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("固化 HTTP %d: %v", rec.Code, fin)
 	}

@@ -73,10 +73,12 @@ type Runtime struct {
 	// BaseURL 本机 API 基址（如 http://127.0.0.1:8787），生成投递脚本 http_get 目标用。
 	// 空时 provision 用请求体里的 base_url。
 	BaseURL string
-	// Grading 可选：统一 GradingJob 编排器（§6.7/§6.15）。注入后 POST /grading-jobs 可带
-	// image_base64 直接创建照片批改 Job 并异步推进；confirm/retry 走编排器续跑；
-	// GET /grading-jobs/{id} 附带识别停点产物与最终批改结果。nil 时保持纯状态机契约。
+	// Grading 可选：作业子链内部的 GradingJob 编排器（§6.7/§6.15）。
+	// 客户端只能通过 ImageTasks facade 驱动图片任务；GradingJob 不再拥有公开路由。
 	Grading *usecase.GradingOrchestrator
+	// ImageTasks is the sole public image command/query facade. Internal
+	// GradingJob and OCR resources are never addressed by clients.
+	ImageTasks *usecase.ImageTaskCoordinator
 }
 
 // NewHandler 返回 K12 的 HTTP 子路由（Go 1.22+ method+path 路由）。
@@ -84,15 +86,16 @@ func NewHandler(rt Runtime) http.Handler {
 	mux := http.NewServeMux()
 	h := &handler{rt: rt}
 	mux.HandleFunc("GET /view-descriptor", h.viewDescriptor)
-	// POST /recognize、POST /recognize/anchors 已随一次切换删除（§6.14 · 2026-07-18）：
-	// 识题→锚点→批改统一走 /grading-jobs*（停点产物含识别清单+整卷学科+锚点 bbox），
-	// 反向契约见 cutover_20260718_old_links_removed_test.go。
+	// POST /recognize、POST /recognize/anchors 与全部 /grading-jobs* 公开路由已删除：
+	// 图片任务统一走 /image-tasks exact-set，识题、锚点和 GradingJob 只属于内部作业子链。
 	// /grade（单题补批）与 /solve（空白题求解）为甄别保留项：仍被 Job 外合法路径消费。
 	mux.HandleFunc("POST /grade", h.grade)
 	mux.HandleFunc("POST /record-mistake", h.recordMistake)
 	mux.HandleFunc("POST /solve", h.solve)
 	mux.HandleFunc("GET /mistakes", h.mistakes)
 	mux.HandleFunc("DELETE /mistakes/{record_id}", h.deleteMistake)
+	mux.HandleFunc("POST /mistakes/{record_id}/archive", h.archiveMistake)
+	mux.HandleFunc("POST /mistakes/{record_id}/restore", h.restoreMistake)
 	mux.HandleFunc("GET /review-queue", h.reviewQueue)
 	mux.HandleFunc("GET /insight-report", h.insightReport)
 	mux.HandleFunc("POST /mark-mastered", h.markMastered)
@@ -104,9 +107,13 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("GET /delivery-receipts/{id}", h.getDeliveryReceipt)
 	mux.HandleFunc("POST /delivery-receipts/{id}/retry", h.retryDeliveryReceipt)
 	mux.HandleFunc("POST /delivery-receipts/{id}/query", h.queryDeliveryReceipt)
+	mux.HandleFunc("GET /delivery-batches/{id}", h.getDeliveryBatch)
+	mux.HandleFunc("POST /delivery-batches/{id}/retry", h.retryDeliveryBatch)
+	mux.HandleFunc("POST /delivery-batches/{id}/query", h.queryDeliveryBatch)
 	mux.HandleFunc("POST /grounding", h.addGrounding)
 	mux.HandleFunc("POST /accumulation", h.addAccumulation)
 	mux.HandleFunc("GET /accumulation", h.listAccumulation)
+	mux.HandleFunc("POST /accumulation/{id}/send", h.sendAccumulation)
 	// 积累检验出口（§3.9）：生成默写题加入练习集待打印（item added_via=accumulation）。
 	mux.HandleFunc("POST /accumulation/{id}/dictation-to-basket", h.accumDictationToBasket)
 	// 练习集（PRD §3.8）：草稿→确认（发布门）→发送→回传→复批→关闭；draft/confirmed 可取消。
@@ -134,31 +141,19 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("POST /practice-sets/{id}/grade", h.gradePracticeSet)
 	mux.HandleFunc("POST /practice-sets/{id}/close", h.closePracticeSet)
 	mux.HandleFunc("POST /practice-sets/{id}/cancel", h.cancelPracticeSet)
-	// 统一 GradingJob 公共边界（DD-001）：create/get/confirm/retry/cancel/result。
-	// list/revise/advance 与旧 recognize 直连入口均不注册；阶段推进只允许进程内编排器调用。
-	mux.HandleFunc("POST /grading-jobs", h.createGradingJob)
-	mux.HandleFunc("GET /grading-jobs/{id}", h.getGradingJob)
-	mux.HandleFunc("POST /grading-jobs/{id}/confirm", h.confirmGradingJob)
-	mux.HandleFunc("POST /grading-jobs/{id}/cancel", h.cancelGradingJob)
-	mux.HandleFunc("POST /grading-jobs/{id}/retry", h.retryGradingJob)
-	mux.HandleFunc("GET /grading-jobs/{id}/result", h.getGradingJobResult)
+	// Sole public image exact-set. GradingJob/OCR remain internal aggregates.
+	mux.HandleFunc("POST /image-tasks", h.createImageTask)
+	mux.HandleFunc("GET /image-tasks/{id}", h.getImageTask)
+	mux.HandleFunc("POST /image-tasks/{id}/confirm", h.confirmImageTask)
+	mux.HandleFunc("POST /image-tasks/{id}/retry", h.retryImageTask)
+	mux.HandleFunc("POST /image-tasks/{id}/cancel", h.cancelImageTask)
+	mux.HandleFunc("GET /image-tasks/{id}/result", h.getImageTaskResult)
 	// 作品（PRD §3.10）：draft→点评→修改稿→再点评；只点评不打分不代写（INV-011）。
 	mux.HandleFunc("POST /creative-works", h.createCreativeWork)
 	mux.HandleFunc("GET /creative-works", h.listCreativeWorks)
 	mux.HandleFunc("GET /creative-works/{id}", h.getCreativeWork)
-	mux.HandleFunc("POST /creative-works/{id}/feedback", h.attachWorkFeedback)
 	mux.HandleFunc("POST /creative-works/{id}/generate-feedback", h.generateWorkFeedback)
 	mux.HandleFunc("POST /creative-works/{id}/revision", h.submitWorkRevision)
-	mux.HandleFunc("POST /creative-works/{id}/archive", h.archiveCreativeWork)
-	// 点评/观察练习卡发送出口（§3.10 / §3.12）：走绑定私聊的辅导延伸消息；未接线/未绑定诚实降级。
-	mux.HandleFunc("POST /creative-works/{id}/send-feedback", h.sendWorkFeedback)
-	// 美术观察练习卡完成打卡（§3.10：练习必须有产物，产物归档在版本记录）。
-	mux.HandleFunc("POST /creative-works/{id}/practice-card/done", h.markPracticeCardDone)
-	// DD-013 writing-photo OCR public resource: durable create/get/retry/confirm.
-	mux.HandleFunc("POST /creative-work-ocr-jobs", h.createCreativeWorkOCRJob)
-	mux.HandleFunc("GET /creative-work-ocr-jobs/{id}", h.getCreativeWorkOCRJob)
-	mux.HandleFunc("POST /creative-work-ocr-jobs/{id}/retry", h.retryCreativeWorkOCRJob)
-	mux.HandleFunc("POST /creative-work-ocr-jobs/{id}/confirm", h.confirmCreativeWorkOCRJob)
 	// 作品照片最小资产服务（§3.10 / §5.5 source_asset_id；魔数/上限/归属契约见 asset_handler.go）。
 	mux.HandleFunc("POST /assets", h.uploadAsset)
 	mux.HandleFunc("GET /assets/{file}", h.getAsset)
@@ -240,6 +235,11 @@ type mistakeDTO struct {
 	// SpotCheckState 抽查复验状态（§3.6：none/scheduled/passed/failed）。前端只消费 failed
 	// →「家长确认（复验未过）」事实标注；scheduled 不呈现（不打抽查标签，规则 1）。
 	SpotCheckState string `json:"spot_check_state,omitempty"`
+	ArchivedReason string `json:"archived_reason,omitempty"`
+	ArchivedAt     int64  `json:"archived_at,omitempty"`
+	RestoredAt     int64  `json:"archive_restored_at,omitempty"`
+	// Restorable 是服务端按当前状态与合法快照计算的能力投影，不进入持久化或备份。
+	Restorable bool `json:"restorable"`
 }
 
 type viewDescriptorDTO struct {
@@ -327,7 +327,7 @@ func recognizedQuestionToDTO(question usecase.RecognizedQuestion, includeBBox bo
 		RawTranscription: question.RawTranscription, CanonicalMarkdown: question.CanonicalMarkdown,
 		CanonicalValid:          usecase.CanonicalMarkdownValid(question.CanonicalMarkdown),
 		CanonicalVersion:        question.CanonicalVersion,
-		KnowledgePoints:         question.KnowledgePoints,
+		KnowledgePoints:         append([]string{}, question.KnowledgePoints...),
 		AnswerState:             question.AnswerState,
 		StudentAnswer:           question.StudentAnswer,
 		AnswerRawTranscription:  question.AnswerRawTranscription,
@@ -556,6 +556,67 @@ func (h *handler) deleteMistake(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+type mistakeArchiveCommandReq struct {
+	Agent          string `json:"agent"`
+	Version        *int   `json:"version"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
+// archiveMistake POST /mistakes/{record_id}/archive —— 家长「不再复习」。
+// 这是可恢复软归档；返回推进后的 version，供 8 秒 Undo 直接做 CAS。
+func (h *handler) archiveMistake(w http.ResponseWriter, r *http.Request) {
+	var req mistakeArchiveCommandReq
+	if !decodeStrict(w, r, &req) {
+		return
+	}
+	recordID := r.PathValue("record_id")
+	if req.Agent == "" || recordID == "" || req.IdempotencyKey == "" ||
+		req.Version == nil || *req.Version < 0 {
+		writeErr(w, http.StatusBadRequest, "agent / record_id / version / idempotency_key 必填，version 不可为负数")
+		return
+	}
+	rec, err := h.rt.Deps.ArchiveMistake(
+		r.Context(), req.Agent, recordID, *req.Version, req.IdempotencyKey,
+	)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	fields, err := k12.ParseMistakeFields(rec.Fields)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, mistakeDTOFrom(rec, fields))
+}
+
+// restoreMistake POST /mistakes/{record_id}/restore —— Undo 与已归档长期恢复共用。
+func (h *handler) restoreMistake(w http.ResponseWriter, r *http.Request) {
+	var req mistakeArchiveCommandReq
+	if !decodeStrict(w, r, &req) {
+		return
+	}
+	recordID := r.PathValue("record_id")
+	if req.Agent == "" || recordID == "" || req.IdempotencyKey == "" ||
+		req.Version == nil || *req.Version < 0 {
+		writeErr(w, http.StatusBadRequest, "agent / record_id / version / idempotency_key 必填，version 不可为负数")
+		return
+	}
+	rec, err := h.rt.Deps.RestoreMistake(
+		r.Context(), req.Agent, recordID, *req.Version, req.IdempotencyKey,
+	)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	fields, err := k12.ParseMistakeFields(rec.Fields)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, mistakeDTOFrom(rec, fields))
+}
+
 // reviewQueue GET /review-queue?agent=X —— 到期该练队列。
 func (h *handler) reviewQueue(w http.ResponseWriter, r *http.Request) {
 	agent := r.URL.Query().Get("agent")
@@ -673,8 +734,8 @@ func (h *handler) reviewRetry(w http.ResponseWriter, r *http.Request) {
 }
 
 type tutoringTipsReq struct {
-	Agent        string `json:"agent"`
-	GradingJobID string `json:"grading_job_id"`
+	Agent      string `json:"agent"`
+	DispatchID string `json:"dispatch_id"`
 }
 
 type groundingReq struct {
@@ -704,18 +765,30 @@ type tutoringTipsSectionDTO struct {
 	SourceLabel string `json:"source_label"`
 }
 
-// tutoringTips POST /tutoring-tips builds the inline guidance projection from
-// one owner-scoped, confirmed GradingJob and its durable Problem/Attempt facts.
+// tutoringTips POST /tutoring-tips resolves the owner-scoped ImageTaskDispatch
+// to its internal confirmed homework facts. The GradingJob identity is never a
+// public request or response field.
 func (h *handler) tutoringTips(w http.ResponseWriter, r *http.Request) {
 	var req tutoringTipsReq
 	if !decodeStrict(w, r, &req) {
 		return
 	}
-	if strings.TrimSpace(req.Agent) == "" || strings.TrimSpace(req.GradingJobID) == "" {
-		writeErr(w, http.StatusBadRequest, "agent / grading_job_id required")
+	if strings.TrimSpace(req.Agent) == "" || strings.TrimSpace(req.DispatchID) == "" {
+		writeErr(w, http.StatusBadRequest, "agent / dispatch_id required")
 		return
 	}
-	tips, err := h.rt.Deps.BuildTutoringTips(r.Context(), req.Agent, req.GradingJobID)
+	if h.rt.ImageTasks == nil {
+		writeErr(w, http.StatusServiceUnavailable, "image task facade unavailable")
+		return
+	}
+	gradingJobID, err := h.rt.ImageTasks.ResolveTutoringTipsGradingJob(
+		r.Context(), req.Agent, req.DispatchID,
+	)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+		return
+	}
+	tips, err := h.rt.Deps.BuildTutoringTips(r.Context(), req.Agent, gradingJobID)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
@@ -762,6 +835,27 @@ func (h *handler) addAccumulation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"record_id": id, "created": created})
+}
+
+// sendAccumulation POST /accumulation/{id}/send reads the message content from
+// the owned server-side record. Unknown request fields are rejected so clients
+// cannot substitute arbitrary delivery text.
+func (h *handler) sendAccumulation(w http.ResponseWriter, r *http.Request) {
+	var req agentOnlyReq
+	if !decodeStrict(w, r, &req) {
+		return
+	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	if req.Agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	batch, _, err := h.rt.Deps.SendAccumulation(r.Context(), req.Agent, r.PathValue("id"))
+	if err != nil {
+		writeDeliveryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, batch)
 }
 
 // dictationReq POST /accumulation/{id}/dictation-to-basket 请求体。
@@ -1415,11 +1509,20 @@ func toMistakeDTOs(recs []*records.AgentRecord) []mistakeDTO {
 }
 
 func mistakeDTOFrom(r *records.AgentRecord, f k12.MistakeFields) mistakeDTO {
-	return mistakeDTO{
+	dto := mistakeDTO{
 		RecordID: r.RecordID, Question: f.Question, KnowledgePoint: f.KnowledgePoint,
 		ErrorCause: f.ErrorCause, Status: r.Status, Version: r.Version, DueAt: r.DueAt,
 		Subject: f.Subject, SpotCheckState: f.SpotCheckState,
+		Restorable: k12.MistakeRestorable(r.Status, f),
 	}
+	if r.Status == k12.StatusArchived {
+		dto.ArchivedReason = f.ArchivedReason
+		dto.ArchivedAt = f.ArchivedAt
+	}
+	if f.LastArchive != nil {
+		dto.RestoredAt = f.LastArchive.RestoredAt
+	}
+	return dto
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -1479,9 +1582,12 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 func httpStatusForK12Error(err error, fallback int) int {
 	switch {
 	case errors.Is(err, records.ErrVersionConflict), errors.Is(err, usecase.ErrVersionUnsupported),
-		errors.Is(err, records.ErrIllegalTransition):
+		errors.Is(err, records.ErrIllegalTransition),
+		errors.Is(err, k12storage.ErrImageTaskVersionConflict),
+		errors.Is(err, k12storage.ErrImageTaskConflict),
+		errors.Is(err, k12storage.ErrImageTaskInvalidState):
 		return http.StatusConflict
-	case errors.Is(err, records.ErrNotFound):
+	case errors.Is(err, records.ErrNotFound), errors.Is(err, k12storage.ErrImageTaskNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, records.ErrInvalidStatus), errors.Is(err, records.ErrInvalidFields),
 		errors.Is(err, records.ErrInvalidRecord), errors.Is(err, records.ErrUnknownCollection),
