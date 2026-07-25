@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -11,8 +13,74 @@ import (
 
 // AccumItem 积累本条目（记录 + 领域字段）。
 type AccumItem struct {
-	Record *records.AgentRecord
-	Fields k12.AccumFields
+	Record              *records.AgentRecord
+	Fields              k12.AccumFields
+	RowVersion          int
+	DictationGeneration *k12.AccumulationDictationGeneration
+}
+
+// AccumulationMetadataDeriver is the only current path from content to
+// subject/type/source. Implementations must return the closed controlled
+// taxonomy and auditable provenance; the use case has no heuristic fallback.
+type AccumulationMetadataDeriver interface {
+	DeriveAccumulationMetadata(
+		context.Context,
+		string,
+	) (k12.AccumulationDerivedMetadata, error)
+}
+
+// CreateCurrentAccumulation implements the content-only current command.
+// owner and commandKey are command/auth metadata, not editable business fields.
+func (d Deps) CreateCurrentAccumulation(
+	ctx context.Context,
+	agentName, content, commandKey string,
+) (recordID string, created bool, err error) {
+	agentName = strings.TrimSpace(agentName)
+	content = strings.TrimSpace(content)
+	commandKey = strings.TrimSpace(commandKey)
+	if agentName == "" || content == "" || commandKey == "" {
+		return "", false, fmt.Errorf("%w: agent/content/Idempotency-Key required", ErrInvalidInput)
+	}
+	requestDigest := digestJSON(struct {
+		Content string `json:"content"`
+	}{Content: content})
+	if receipt, err := d.Records.GetCurrentCreateReceipt(
+		ctx, agentName, "accumulation", commandKey, requestDigest,
+	); err == nil {
+		return receipt.ObjectID, false, nil
+	} else if !errors.Is(err, records.ErrNotFound) {
+		return "", false, err
+	}
+	if d.AccumulationMetadata == nil {
+		return "", false, fmt.Errorf("%w: 未配置积累元数据派生能力", ErrSolveFailed)
+	}
+	metadata, err := d.AccumulationMetadata.DeriveAccumulationMetadata(ctx, content)
+	if err != nil {
+		return "", false, fmt.Errorf("%w: 积累元数据派生失败: %v", ErrSolveFailed, err)
+	}
+	metadata.Subject = strings.TrimSpace(metadata.Subject)
+	metadata.EntryType = strings.TrimSpace(metadata.EntryType)
+	metadata.Source = strings.TrimSpace(metadata.Source)
+	if err := metadata.Validate(); err != nil {
+		return "", false, fmt.Errorf("%w: 积累元数据派生结果非法: %v", ErrSolveFailed, err)
+	}
+	rec, err := k12.NewAccumRecord(agentName, "", k12.AccumFields{
+		Subject: metadata.Subject, EntryType: metadata.EntryType,
+		Content: content,
+		// source_ref is legacy-only. The nullable current source and provenance
+		// are written by CreateAccumulationWithDerivedMetadata.
+		Source: "",
+	})
+	if err != nil {
+		return "", false, err
+	}
+	created, err = d.Records.CreateAccumulationWithDerivedMetadata(
+		ctx, rec, metadata, commandKey, requestDigest,
+	)
+	if err != nil {
+		return "", false, fmt.Errorf("usecase: 当前积累入库: %w", err)
+	}
+	return rec.RecordID, created, nil
 }
 
 // AddAccumulation 往积累本写一条（语文/英语沉淀，幂等去重）。
@@ -82,21 +150,76 @@ const (
 //
 // 积累本身无状态机：生成默写题不改积累状态（取用不污染闭环）；装篮幂等去重，家长可移除。
 func (d Deps) GenerateDictationToBasket(ctx context.Context, agentName, sourceSession, recordID string, fullDictation bool) (basketID string, added bool, err error) {
+	_, basketID, added, err = d.GenerateCurrentDictationToBasket(
+		ctx, agentName, sourceSession, recordID, fullDictation,
+		"dictation:"+strings.TrimSpace(recordID),
+	)
+	return basketID, added, err
+}
+
+// GenerateCurrentDictationToBasket persists the generation checkpoint before
+// producing or validating a PracticeSetItem. A replay or failed retry always
+// resumes the same generation and frozen source snapshot.
+func (d Deps) GenerateCurrentDictationToBasket(
+	ctx context.Context,
+	agentName, sourceSession, recordID string,
+	fullDictation bool,
+	commandKey string,
+) (
+	generation k12.AccumulationDictationGeneration,
+	basketID string,
+	added bool,
+	err error,
+) {
 	if agentName == "" || recordID == "" {
-		return "", false, fmt.Errorf("%w: agentName / recordID 不可空", ErrInvalidInput)
+		return generation, "", false, fmt.Errorf("%w: agentName / recordID 不可空", ErrInvalidInput)
 	}
 	rec, err := d.Records.Get(ctx, recordID)
 	if err != nil {
-		return "", false, fmt.Errorf("usecase: 取积累: %w", err)
+		return generation, "", false, fmt.Errorf("usecase: 取积累: %w", err)
 	}
 	if rec == nil || rec.AgentName != agentName || rec.Collection != k12.CollectionAccumulation {
-		return "", false, fmt.Errorf("%w: 积累不存在或不属于该实例", records.ErrNotFound)
+		return generation, "", false, fmt.Errorf("%w: 积累不存在或不属于该实例", records.ErrNotFound)
 	}
 	f, _ := k12.ParseAccumFields(rec.Fields)
 	content := strings.TrimSpace(f.Content)
+	sourceSnapshot, err := json.Marshal(struct {
+		Content        string `json:"content"`
+		Subject        string `json:"subject"`
+		EntryType      string `json:"entry_type"`
+		FullDictation  bool   `json:"full_dictation"`
+		FormatPolicy   string `json:"format_policy"`
+		VerifierPolicy string `json:"verifier_policy"`
+	}{
+		Content: content, Subject: f.Subject, EntryType: f.EntryType,
+		FullDictation: fullDictation, FormatPolicy: "dictation-format-v1",
+		VerifierPolicy: "subject-verifier-gate-v1",
+	})
+	if err != nil {
+		return generation, "", false, err
+	}
+	requestDigest := digestJSON(struct {
+		AccumulationID string `json:"accumulation_id"`
+		CommandKey     string `json:"command_key"`
+		SourceSnapshot string `json:"source_snapshot"`
+	}{recordID, strings.TrimSpace(commandKey), string(sourceSnapshot)})
+	generation, _, err = d.Records.PrepareAccumulationDictationGeneration(
+		ctx, agentName, recordID, strings.TrimSpace(commandKey),
+		requestDigest, string(sourceSnapshot),
+	)
+	if err != nil {
+		return generation, "", false, err
+	}
+	if generation.Status == k12.DictationCommitted {
+		return generation, "", false, nil
+	}
 	runes := []rune(content)
 	if len(runes) > dictationMaxRunes {
-		return "", false, fmt.Errorf("%w: 内容过长，不适合默写练习", ErrInvalidInput)
+		generation, _ = d.Records.FailAccumulationDictationGeneration(
+			context.WithoutCancel(ctx), agentName, generation.GenerationID,
+			"内容过长，不适合默写练习",
+		)
+		return generation, "", false, fmt.Errorf("%w: 内容过长，不适合默写练习", ErrInvalidInput)
 	}
 	isPoem := f.EntryType == "古诗" || f.EntryType == "古诗积累"
 	question := "默写：" + content // 全文默写（≤20 字单词/短句；或家长显式选择整首默写的古诗）
@@ -110,6 +233,7 @@ func (d Deps) GenerateDictationToBasket(ctx context.Context, agentName, sourceSe
 		status, evidence = k12.PracticeItemVerified, "字符级比对（确定性默写判定，一字不差即正确）"
 	}
 	item := k12.PracticeItem{
+		ItemID:                 "dictation-" + generation.GenerationID,
 		Subject:                f.Subject,
 		AddedVia:               k12.PracticeAddedViaAccumulation,
 		QuestionMarkdown:       question,
@@ -117,7 +241,38 @@ func (d Deps) GenerateDictationToBasket(ctx context.Context, agentName, sourceSe
 		VerificationStatus:     status,
 		VerificationEvidence:   evidence,
 	}
-	return d.AddToBasket(ctx, agentName, sourceSession, item)
+	basketID, added, err = d.AddToBasket(ctx, agentName, sourceSession, item)
+	if err != nil {
+		generation, _ = d.Records.FailAccumulationDictationGeneration(
+			context.WithoutCancel(ctx), agentName, generation.GenerationID, err.Error(),
+		)
+		return generation, "", false, err
+	}
+	// AddToBasket may legitimately deduplicate against an existing identical
+	// item. Resolve the actual durable item id before committing the generation.
+	basket, err := d.GetPracticeSet(ctx, agentName, basketID)
+	if err != nil {
+		return generation, basketID, added, err
+	}
+	practiceItemID := ""
+	for _, candidate := range basket.Fields.Items {
+		if samePracticeItem(candidate, item) {
+			practiceItemID = candidate.ItemID
+			break
+		}
+	}
+	if practiceItemID == "" {
+		return generation, basketID, added, fmt.Errorf(
+			"usecase: 默写题加入练习集后无法解析 durable item",
+		)
+	}
+	generation, err = d.Records.CommitAccumulationDictationGeneration(
+		ctx, agentName, generation.GenerationID, practiceItemID,
+	)
+	if err != nil {
+		return generation, basketID, added, err
+	}
+	return generation, basketID, added, nil
 }
 
 // blankFillClauses 古诗/长句补空（§3.9）：按标点逐句留 1～2 个关键字空（句末关键字挖空，
@@ -170,7 +325,58 @@ func (d Deps) ListAccumulation(ctx context.Context, agentName, subject string) (
 		if subject != "" && f.Subject != subject {
 			continue
 		}
-		out = append(out, AccumItem{Record: r, Fields: f})
+		item, err := d.accumItemFromRecord(ctx, r, f)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, item)
 	}
 	return out, nil
+}
+
+func (d Deps) GetAccumulation(
+	ctx context.Context,
+	agentName, recordID string,
+) (AccumItem, error) {
+	rec, err := d.Records.Get(ctx, recordID)
+	if err != nil {
+		return AccumItem{}, fmt.Errorf("usecase: 取积累: %w", err)
+	}
+	if rec.AgentName != agentName || rec.Collection != k12.CollectionAccumulation {
+		return AccumItem{}, records.ErrNotFound
+	}
+	fields, err := k12.ParseAccumFields(rec.Fields)
+	if err != nil {
+		return AccumItem{}, err
+	}
+	return d.accumItemFromRecord(ctx, rec, fields)
+}
+
+func (d Deps) accumItemFromRecord(
+	ctx context.Context,
+	rec *records.AgentRecord,
+	fields k12.AccumFields,
+) (AccumItem, error) {
+	derivedSource, rowVersion, err := d.Records.GetAccumulationCurrentProjection(
+		ctx, rec.AgentName, rec.RecordID,
+	)
+	if err != nil {
+		return AccumItem{}, err
+	}
+	if derivedSource != nil {
+		fields.Source = *derivedSource
+	} else if fields.Source == "" {
+		// V37 maps a legacy empty source to absent; keep the DTO empty/omitempty.
+		fields.Source = ""
+	}
+	generation, err := d.Records.GetLatestAccumulationDictationGeneration(
+		ctx, rec.AgentName, rec.RecordID,
+	)
+	if err != nil {
+		return AccumItem{}, err
+	}
+	return AccumItem{
+		Record: rec, Fields: fields, RowVersion: rowVersion,
+		DictationGeneration: generation,
+	}, nil
 }

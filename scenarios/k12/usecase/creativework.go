@@ -28,8 +28,45 @@ func validateWorkAssetOwner(agentName, assetID string) error {
 
 // CreativeWorkView 作品视图（记录 + 领域字段）。
 type CreativeWorkView struct {
-	Record *records.AgentRecord
-	Fields k12.CreativeWorkFields
+	Record          *records.AgentRecord
+	Fields          k12.CreativeWorkFields
+	GenerationState k12.CreativeWorkGenerationState
+}
+
+// CreateCurrentTextWork is the sole direct current create path. Image-bearing
+// writing and all artwork continue through the ImageTask facade.
+func (d Deps) CreateCurrentTextWork(
+	ctx context.Context,
+	agentName, contentMarkdown, commandKey string,
+) (workID, initialGenerationID string, created bool, err error) {
+	agentName = strings.TrimSpace(agentName)
+	contentMarkdown = strings.TrimSpace(contentMarkdown)
+	commandKey = strings.TrimSpace(commandKey)
+	if agentName == "" || contentMarkdown == "" || commandKey == "" {
+		return "", "", false, fmt.Errorf(
+			"%w: agent/content_markdown/Idempotency-Key required", ErrInvalidInput,
+		)
+	}
+	fields := k12.CreativeWorkFields{WorkType: k12.WorkTypeWriting}
+	rec, err := k12.NewCreativeWorkRecord(agentName, "", fields)
+	if err != nil {
+		return "", "", false, err
+	}
+	generation, created, err := d.Records.CreateCreativeWorkWithInitialGeneration(
+		ctx, rec, commandKey,
+		digestJSON(struct {
+			WorkType string `json:"work_type"`
+			Content  string `json:"content_markdown"`
+		}{k12.WorkTypeWriting, contentMarkdown}),
+		k12.CreativeWorkSourceSnapshot{
+			WorkType: k12.WorkTypeWriting, DisplayName: "语文写作",
+			ContentMarkdown: contentMarkdown,
+		},
+	)
+	if err != nil {
+		return "", "", false, fmt.Errorf("usecase: 当前作品入库: %w", err)
+	}
+	return rec.RecordID, generation.GenerationID, created, nil
 }
 
 // CreateCreativeWork 新建作品（PRD §3.10），初始 draft，含首版原稿（若提供）。幂等去重：类型+标题+任务命中则不重复。
@@ -71,7 +108,11 @@ func (d Deps) ListCreativeWorks(ctx context.Context, agentName, workType string)
 		if workType != "" && f.WorkType != workType {
 			continue
 		}
-		out = append(out, CreativeWorkView{Record: r, Fields: f})
+		view, err := d.creativeWorkViewFromRecord(ctx, r, f)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, view)
 	}
 	return out, nil
 }
@@ -86,7 +127,33 @@ func (d Deps) GetCreativeWork(ctx context.Context, agentName, recordID string) (
 		return CreativeWorkView{}, fmt.Errorf("usecase: 作品不存在或不属于该实例")
 	}
 	f, _ := k12.ParseCreativeWorkFields(rec.Fields)
-	return CreativeWorkView{Record: rec, Fields: f}, nil
+	return d.creativeWorkViewFromRecord(ctx, rec, f)
+}
+
+func (d Deps) creativeWorkViewFromRecord(
+	ctx context.Context,
+	rec *records.AgentRecord,
+	fields k12.CreativeWorkFields,
+) (CreativeWorkView, error) {
+	state, err := d.Records.GetCreativeWorkGenerationState(
+		ctx, rec.AgentName, rec.RecordID,
+	)
+	if err != nil {
+		return CreativeWorkView{}, fmt.Errorf("usecase: 取作品点评 generation: %w", err)
+	}
+	// Legacy version data remains readable internally. Overlay the current
+	// latest generation in memory only; never replace/delete legacy rows.
+	if state.Latest != nil && state.Latest.Feedback != nil &&
+		len(fields.Versions) > 0 {
+		last := &fields.Versions[len(fields.Versions)-1]
+		last.StructuredFeedback = state.Latest.Feedback
+		last.Feedback = state.Latest.Feedback.ProjectionMarkdown
+		last.FeedbackSource = state.Latest.Feedback.SourceSnapshot.Source
+		last.FeedbackSkill = state.Latest.Feedback.SourceSnapshot.MethodRef
+	}
+	return CreativeWorkView{
+		Record: rec, Fields: fields, GenerationState: state,
+	}, nil
 }
 
 // attachAIFeedback is the internal AI-feedback persistence path:

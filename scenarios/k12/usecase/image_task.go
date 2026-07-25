@@ -889,8 +889,18 @@ func (c *ImageTaskCoordinator) projectTarget(
 		if parseErr != nil {
 			return ImageTaskView{}, parseErr
 		}
+		generationState, stateErr := c.Records.GetCreativeWorkGenerationState(
+			ctx, dispatch.AgentName, record.RecordID,
+		)
+		if stateErr != nil {
+			return ImageTaskView{}, stateErr
+		}
 		view.CreativeDisplayName = fields.DisplayName
-		work := CreativeWorkView{Record: record, Fields: fields}
+		work := CreativeWorkView{
+			Record:          record,
+			Fields:          fields,
+			GenerationState: generationState,
+		}
 		view.CreativeWork = &work
 		view.CreativeFeedback = creativeFeedbackProjectionState(work)
 		if view.CreativeFeedback != "feedback_ready" && len(fields.Versions) > 0 {
@@ -913,6 +923,11 @@ func (c *ImageTaskCoordinator) projectTarget(
 }
 
 func creativeFeedbackProjectionState(work CreativeWorkView) string {
+	if work.GenerationState.Latest != nil &&
+		work.GenerationState.Latest.Status == k12.WorkFeedbackSucceeded &&
+		work.GenerationState.Latest.Feedback != nil {
+		return "feedback_ready"
+	}
 	if work.Record != nil && work.Record.Status == k12.WorkStatusFeedbackReady &&
 		len(work.Fields.Versions) > 0 {
 		version := work.Fields.Versions[len(work.Fields.Versions)-1]

@@ -93,9 +93,9 @@ func workFeedbackRouteSnapshotFromContext(
 	return snapshot, true
 }
 
-// GenerateWorkFeedback 对 draft/revised 作品调 Skill Executor 生成证据化点评并落库
-// （→ feedback_ready，来源标记 ai，与家长手写 parent 区分）。
-// 失败路径全部诚实报错：未接线、生成失败、违反 INV-011 都不写库。
+// GenerateWorkFeedback preserves the internal legacy caller contract used by
+// ImageTask promotion and read-only revision fixtures. The current public HTTP
+// command calls GenerateWorkFeedbackCommand with its Idempotency-Key.
 func (d Deps) GenerateWorkFeedback(ctx context.Context, agentName, recordID string) (CreativeWorkView, error) {
 	v, err := d.GetCreativeWork(ctx, agentName, recordID) // 归属校验先行，未过不触发生成
 	if err != nil {
@@ -104,15 +104,48 @@ func (d Deps) GenerateWorkFeedback(ctx context.Context, agentName, recordID stri
 	if v.Record.Status != k12.WorkStatusDraft && v.Record.Status != k12.WorkStatusRevised {
 		return CreativeWorkView{}, fmt.Errorf("usecase: 只有待点评/已修改作品可生成点评，当前 %s", v.Record.Status)
 	}
-	if len(v.Fields.Versions) == 0 {
-		return CreativeWorkView{}, fmt.Errorf("usecase: 作品无版本可点评")
+	return d.GenerateWorkFeedbackCommand(
+		ctx, agentName, recordID,
+		"legacy:"+digestJSON(struct {
+			WorkID  string `json:"work_id"`
+			Version int    `json:"version"`
+		}{recordID, v.Record.Version}),
+	)
+}
+
+// GenerateWorkFeedbackCommand resumes a failed initial generation in place or
+// appends one generation keyed by the caller command. Provider/invariant
+// failures persist on that generation and never replace an existing latest.
+func (d Deps) GenerateWorkFeedbackCommand(
+	ctx context.Context,
+	agentName, recordID, commandKey string,
+) (CreativeWorkView, error) {
+	v, err := d.GetCreativeWork(ctx, agentName, recordID)
+	if err != nil {
+		return CreativeWorkView{}, err
+	}
+	commandKey = strings.TrimSpace(commandKey)
+	if commandKey == "" {
+		return CreativeWorkView{}, fmt.Errorf("%w: Idempotency-Key required", ErrInvalidInput)
+	}
+	var last k12.CreativeWorkVersion
+	if len(v.Fields.Versions) > 0 {
+		last = v.Fields.Versions[len(v.Fields.Versions)-1]
+	} else if v.GenerationState.Initial != nil {
+		source := v.GenerationState.Initial.Source
+		last = k12.CreativeWorkVersion{
+			SourceAssetID:      source.SourceAssetID,
+			ContentMarkdown:    source.ContentMarkdown,
+			OCRRaw:             source.OCRRaw,
+			OCRVersion:         source.OCRVersion,
+			OCRConfirmedDigest: source.OCRDigest,
+			ContentConfirmedAt: source.ContentConfirmedAt,
+		}
+	} else {
+		return CreativeWorkView{}, fmt.Errorf("usecase: 作品无可点评证据")
 	}
 	gen, ok := d.Solver.(WorkFeedbackGenerator)
-	if !ok {
-		return CreativeWorkView{}, fmt.Errorf("%w: 未配置作品点评生成能力", ErrSolveFailed)
-	}
 
-	last := v.Fields.Versions[len(v.Fields.Versions)-1]
 	if v.Fields.WorkType == k12.WorkTypeWriting && strings.TrimSpace(last.SourceAssetID) != "" {
 		var validateErr error
 		if strings.TrimSpace(v.Fields.SourceIntakeID) != "" {
@@ -146,9 +179,33 @@ func (d Deps) GenerateWorkFeedback(ctx context.Context, agentName, recordID stri
 			req.Grade = p.GradeTerm
 		}
 	}
+	generation, _, err := d.Records.PrepareWorkFeedbackGeneration(
+		ctx, agentName, recordID, commandKey, digestJSON(req),
+	)
+	if err != nil {
+		return CreativeWorkView{}, err
+	}
+	if generation.Status == k12.WorkFeedbackSucceeded {
+		return d.GetCreativeWork(ctx, agentName, recordID)
+	}
+	if !ok {
+		_, _ = d.Records.FailWorkFeedbackGeneration(
+			context.WithoutCancel(ctx), agentName, generation.GenerationID,
+			"未配置作品点评生成能力",
+		)
+		return CreativeWorkView{}, fmt.Errorf("%w: 未配置作品点评生成能力", ErrSolveFailed)
+	}
+	if last.VersionID == "" {
+		// Internal compatibility identity only. It is never emitted by the
+		// current DTO and does not create a legacy version row.
+		last.VersionID = generation.GenerationID
+	}
 
 	invocation, replay, err := d.prepareWorkFeedbackInvocation(ctx, v, last, req)
 	if err != nil {
+		_, _ = d.Records.FailWorkFeedbackGeneration(
+			context.WithoutCancel(ctx), agentName, generation.GenerationID, err.Error(),
+		)
 		return CreativeWorkView{}, err
 	}
 	var out WorkFeedbackOutput
@@ -161,6 +218,9 @@ func (d Deps) GenerateWorkFeedback(ctx context.Context, agentName, recordID stri
 				ctx, agentName, invocation.InvocationID,
 				"creative-work:"+recordID+":feedback",
 			); err != nil {
+				_, _ = d.Records.FailWorkFeedbackGeneration(
+					context.WithoutCancel(ctx), agentName, generation.GenerationID, err.Error(),
+				)
 				return CreativeWorkView{}, err
 			}
 			var cancelProvider context.CancelFunc
@@ -179,6 +239,10 @@ func (d Deps) GenerateWorkFeedback(ctx context.Context, agentName, recordID stri
 					"work_feedback_provider_failed", unknown, !unknown,
 				)
 			}
+			_, _ = d.Records.FailWorkFeedbackGeneration(
+				context.WithoutCancel(ctx), agentName, generation.GenerationID,
+				"作品点评生成失败",
+			)
 			return CreativeWorkView{}, fmt.Errorf("%w: 作品点评生成失败: %v", ErrSolveFailed, err)
 		}
 	}
@@ -190,6 +254,10 @@ func (d Deps) GenerateWorkFeedback(ctx context.Context, agentName, recordID stri
 				"work_feedback_empty", false, true,
 			)
 		}
+		_, _ = d.Records.FailWorkFeedbackGeneration(
+			context.WithoutCancel(ctx), agentName, generation.GenerationID,
+			"作品点评生成为空",
+		)
 		return CreativeWorkView{}, fmt.Errorf("%w: 作品点评生成为空", ErrSolveFailed)
 	}
 	if reason := workFeedbackInvariantViolation(feedback); reason != "" {
@@ -199,11 +267,18 @@ func (d Deps) GenerateWorkFeedback(ctx context.Context, agentName, recordID stri
 				"work_feedback_contract_invalid", false, true,
 			)
 		}
+		_, _ = d.Records.FailWorkFeedbackGeneration(
+			context.WithoutCancel(ctx), agentName, generation.GenerationID,
+			"作品点评违反 INV-011",
+		)
 		return CreativeWorkView{}, fmt.Errorf("%w: 生成点评违反 INV-011（%s），已拒绝入库", ErrSolveFailed, reason)
 	}
 	if invocation != nil && replay == nil {
 		resultJSON, marshalErr := json.Marshal(out)
 		if marshalErr != nil {
+			_, _ = d.Records.FailWorkFeedbackGeneration(
+				context.WithoutCancel(ctx), agentName, generation.GenerationID, marshalErr.Error(),
+			)
 			return CreativeWorkView{}, marshalErr
 		}
 		if err := d.Records.CompleteWorkFeedbackInvocation(
@@ -216,7 +291,24 @@ func (d Deps) GenerateWorkFeedback(ctx context.Context, agentName, recordID stri
 			return CreativeWorkView{}, err
 		}
 	}
-	return d.attachAIFeedback(ctx, agentName, recordID, feedback, strings.TrimSpace(out.SkillStamp))
+	structured := buildStructuredWorkFeedback(
+		v.Fields.WorkType, last, feedback, k12.FeedbackSourceAI,
+		strings.TrimSpace(out.SkillStamp),
+	)
+	if err := structured.Validate(); err != nil {
+		_, _ = d.Records.FailWorkFeedbackGeneration(
+			context.WithoutCancel(ctx), agentName, generation.GenerationID, err.Error(),
+		)
+		return CreativeWorkView{}, fmt.Errorf(
+			"%w: 结构化作品点评非法: %v", ErrInvalidInput, err,
+		)
+	}
+	if _, err := d.Records.CompleteWorkFeedbackGeneration(
+		ctx, agentName, generation.GenerationID, structured,
+	); err != nil {
+		return CreativeWorkView{}, err
+	}
+	return d.GetCreativeWork(ctx, agentName, recordID)
 }
 
 func (d Deps) validatePromotedWritingFeedbackSnapshot(

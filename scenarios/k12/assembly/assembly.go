@@ -155,6 +155,17 @@ func WithWorkFeedbackGenerator(fn engineadapter.WorkFeedbackGenerateFunc) Option
 	}
 }
 
+// WithAccumulationMetadataDeriver wires the trusted structured classifier used
+// by the content-only current accumulation command. Production must provide an
+// implementation explicitly; the use case has no guessed fallback.
+func WithAccumulationMetadataDeriver(
+	deriver usecase.AccumulationMetadataDeriver,
+) Option {
+	return func(d *usecase.Deps) {
+		d.AccumulationMetadata = deriver
+	}
+}
+
 // WithWorkFeedbackVision 注入美术作品观察式点评的视觉闭包（PRD §3.10）：复用识题链的
 // VisionFunc 原语（原图 bytes + 提示词 → 视觉模型文本），美术点评据原图可见证据生成；
 // 未注入时美术点评在 adapter 层诚实报错（需要视觉通道）。

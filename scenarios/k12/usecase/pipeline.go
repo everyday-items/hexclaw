@@ -37,11 +37,15 @@ type Deps struct {
 	// ImageTask work starts its feedback operation. The resulting snapshot is
 	// persisted before the provider call and reused verbatim on retry.
 	WorkFeedbackRoute WorkFeedbackRouteResolver
-	Profiles          ProfileStore
-	ArchiveRestorer   ArchiveRestorer
-	ArchiveMigrator   ArchiveMigrationRestorer
-	Renderer          Renderer
-	PhotoAnnotator    PhotoAnnotator
+	// AccumulationMetadata derives the controlled subject/type and optional
+	// source with auditable provenance. It is mandatory for the current
+	// content-only accumulation command; there is no heuristic fallback.
+	AccumulationMetadata AccumulationMetadataDeriver
+	Profiles             ProfileStore
+	ArchiveRestorer      ArchiveRestorer
+	ArchiveMigrator      ArchiveMigrationRestorer
+	Renderer             Renderer
+	PhotoAnnotator       PhotoAnnotator
 	// PageAssets promotes a photo Submission's immutable source image into the
 	// owner-scoped asset:// store before V19 Problem facts reference it.
 	PageAssets PageAssetStore
