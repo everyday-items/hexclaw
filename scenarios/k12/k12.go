@@ -35,6 +35,10 @@ const (
 // MistakeFields 错题的领域字段（PRD §5.2.3 错题本 fields 约定）。
 // 它被 marshal 进 AgentRecord.Fields（JSON），平台不 typed 这些字段。
 type MistakeFields struct {
+	// GradeTerm freezes the learner profile term at creation time. It is an
+	// attribution fact for insight snapshots; changing the current profile must
+	// never rewrite historical mistakes. V41 legacy rows remain empty.
+	GradeTerm      string `json:"grade_term,omitempty"`
 	Subject        string `json:"subject,omitempty"` // 数学/物理/化学；老记录空值按数学兼容
 	Question       string `json:"question"`          // 题干
 	KnowledgePoint string `json:"knowledge_point"`   // 命中课标词表；命不中记「其他」
@@ -50,6 +54,9 @@ type MistakeFields struct {
 	// LastRetriedAt 上次「做对」的 unix 秒（T2.2 掌握判定用）：第二次做对距上次 ≥3 天 → mastered。
 	// 老记录缺此字段 = 0，前向兼容（0 视为无上次做对，不触发掌握升级）。
 	LastRetriedAt int64 `json:"last_retried_at"`
+	// ParentConfirmedAt is a parent's subjective “会了” confirmation. It is an
+	// audit/scheduling fact only and must never be used as mastery evidence.
+	ParentConfirmedAt int64 `json:"parent_confirmed_at,omitempty"`
 	// SpotCheckState 抽查复验状态（架构设计-v0.5.0 §5.2 数据字段表 / §3.6 抽查复验，
 	// 2026-07-18 闭环补缺批）：none/scheduled/passed/failed。「最多自动安排一次」与
 	// 「家长确认（复验未过）」标注的持久依据，跨重启幂等。老记录缺字段 = 空串，视同 none
@@ -192,6 +199,9 @@ func validateMistakeFields(fieldsJSON string) error {
 	}
 	if strings.TrimSpace(f.Question) == "" {
 		return fmt.Errorf("错题缺少题干 question")
+	}
+	if f.GradeTerm != "" && !ValidProfileGradeTerm(f.GradeTerm) {
+		return fmt.Errorf("grade_term 非法值 %q", f.GradeTerm)
 	}
 	switch f.SpotCheckState {
 	case "", SpotCheckNone, SpotCheckScheduled, SpotCheckPassed, SpotCheckFailed:

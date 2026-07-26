@@ -1,5 +1,7 @@
 package k12
 
+import "fmt"
+
 // 年级学期 18 档有序枚举（PRD §5.2.2）。顺序即学习先后，用于超纲判定。
 //
 // v0.5.0 冻结（架构设计-v0.5.0《明确不做》#2：不做初中和高中辅导，发布阻断）：
@@ -19,6 +21,17 @@ const primaryGradeCount = 12
 func ValidProfileGradeTerm(g string) bool {
 	r := GradeRank(g)
 	return r >= 0 && r < primaryGradeCount
+}
+
+// ValidateProfileGradeTerm is the canonical capability guard for every path
+// that can persist the K12 profile grade. An empty value means the caller is
+// not changing/creating the grade field; every non-empty value is constrained
+// to the primary-school contract.
+func ValidateProfileGradeTerm(g string) error {
+	if g == "" || ValidProfileGradeTerm(g) {
+		return nil
+	}
+	return fmt.Errorf("非法年级学期 %q（须为小学 12 档：一年级上～六年级下）", g)
 }
 
 var gradeRank = func() map[string]int {

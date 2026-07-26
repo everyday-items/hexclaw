@@ -17,6 +17,8 @@ type Problem struct {
 	ProblemKind             string   `json:"problem_kind"`
 	ParentProblemID         string   `json:"parent_problem_id,omitempty"`
 	SubproblemNo            string   `json:"subproblem_no,omitempty"`
+	SourceNumberPath        []string `json:"source_number_path,omitempty"`
+	DisplayLabel            string   `json:"display_label,omitempty"`
 	Subject                 string   `json:"subject,omitempty"`
 	StemRaw                 string   `json:"stem_raw"`
 	StemMarkdown            string   `json:"stem_markdown"`

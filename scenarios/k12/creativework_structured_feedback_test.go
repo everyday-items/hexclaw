@@ -97,13 +97,46 @@ func TestProjectWorkFeedbackMarkdownIsDeterministicFromCanonicalFields(t *testin
 		Suggestions: []string{"由孩子补充一个听觉细节。"},
 	}
 	got := ProjectWorkFeedbackMarkdown(feedback)
-	for _, want := range []string{"## 观察与依据", "使用了可见的比喻句。", "## 下一步建议", "由孩子补充一个听觉细节。", "## 能力与证据限制", "只依据已确认原文。"} {
+	for _, want := range []string{"## 可见证据", "使用了可见的比喻句。", "## 先这样肯定", "## 家长可以这样问或讲", "## 下一次只试一个点", "由孩子补充一个听觉细节。", "## 说明", "只依据已确认原文。"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("deterministic projection missing %q: %q", want, got)
 		}
 	}
 	if strings.Contains(got, "feedback_id") || strings.Contains(got, "allowed_actions") {
 		t.Fatalf("display projection must not leak internal schema: %q", got)
+	}
+}
+
+func TestProjectWorkFeedbackMarkdownUsesApprovedParentFacingFourPartProjection(t *testing.T) {
+	feedback := WorkFeedback{
+		FeedbackType: WorkTypeArt,
+		Observations: []WorkFeedbackObservation{
+			{Dimension: "composition", Evidence: "主体位于画面中央。"},
+			{Dimension: "color", Evidence: "使用了紫色上衣和蓝色裙子。"},
+		},
+		Limitations: "只依据当前原图中可见内容，不猜测创作意图。",
+		Suggestions: []string{"保留主体位置，再加强最亮与最暗处的差别。"},
+	}
+
+	got := ProjectWorkFeedbackMarkdown(feedback)
+	for _, want := range []string{
+		"## 可见证据",
+		"主体位于画面中央。",
+		"## 先这样肯定",
+		"## 家长可以这样问或讲",
+		"## 下一次只试一个点",
+		"保留主体位置，再加强最亮与最暗处的差别。",
+		"## 说明",
+		"只依据当前原图中可见内容，不猜测创作意图。",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("approved parent-facing projection missing %q: %q", want, got)
+		}
+	}
+	for _, retiredHeading := range []string{"## 观察与依据", "## 下一步建议", "## 能力与证据限制"} {
+		if strings.Contains(got, retiredHeading) {
+			t.Fatalf("retired projection heading %q must not remain: %q", retiredHeading, got)
+		}
 	}
 }
 

@@ -141,8 +141,10 @@ func PracticeSetLabel(status string) string {
 type PracticeItem struct {
 	ItemID                 string `json:"item_id"`
 	SourceProblemID        string `json:"source_problem_id,omitempty"` // 来源题；手工题可空
+	SourceMistakeSummary   string `json:"source_mistake_summary,omitempty"`
 	Subject                string `json:"subject"`
 	AddedVia               string `json:"added_via,omitempty"`             // 装篮来源（PRD §5.5），见 PracticeAddedVia*
+	GenerationStatus       string `json:"generation_status,omitempty"`     // queued/generating/validating/ready/failed
 	QuestionMarkdown       string `json:"question_markdown"`               // 规范题目，不含答案泄露
 	ExpectedAnswerMarkdown string `json:"expected_answer_markdown"`        // 规范答案，答案卷使用
 	VerificationStatus     string `json:"verification_status"`             // 见 §4.7，默认 pending
@@ -157,20 +159,45 @@ type PracticeItem struct {
 	ActualDifficulty       string `json:"actual_difficulty,omitempty"`     // 生成并验证后实际采用的难度
 	// ResultCorrect 复批逐题结论（§3.8 第 3-4 条）：nil=尚无结论；部分回传允许多次复批，
 	// 每次覆盖已给结论的题、幂等；全部入卷题有结论后卷才转 graded。联动来源错题在用例层执行。
-	ResultCorrect *bool `json:"result_correct,omitempty"`
+	ResultCorrect  *bool  `json:"result_correct,omitempty"`
+	ResultEvidence string `json:"result_evidence,omitempty"` // system_verified / human_confirmed
 }
 
+const (
+	PracticeResultSystemVerified = "system_verified"
+	PracticeResultHumanConfirmed = EvidenceLevelHumanConfirmed
+
+	PracticeRegradeQueued          = "queued"
+	PracticeRegradeRunning         = "running"
+	PracticeRegradeNeedsReview     = "needs_review"
+	PracticeRegradeCompleted       = "completed"
+	PracticeRegradeFailedRetryable = "failed_retryable"
+	PracticeRegradeFailedTerminal  = "failed_terminal"
+	PracticeRegradeOutcomeUnknown  = "outcome_unknown"
+)
+
 // PracticeReturnAsset 是一次不可变的作答照片回传批次（DD-028）。补传只能追加新记录，
-// 不得覆盖旧 asset 与题目映射；ReturnID 同时是命令幂等键。
+// 不得覆盖旧 asset 与题目映射；ReturnID 同时是命令幂等键。Regrade* 是同一
+// PracticeSet 聚合内的自动复批投影，可在 CAS 下推进，但永远不能改写原始回传 exact-set。
 type PracticeReturnAsset struct {
-	ReturnID   string   `json:"return_id"`
-	AssetID    string   `json:"asset_id"`
-	ItemIDs    []string `json:"item_ids"`
-	ReturnedAt int64    `json:"returned_at"`
+	ReturnID          string               `json:"return_id"`
+	AssetID           string               `json:"asset_id"`
+	ItemIDs           []string             `json:"item_ids"`
+	ReturnedAt        int64                `json:"returned_at"`
+	RegradeJobID      string               `json:"regrade_job_id,omitempty"`
+	RegradeStatus     string               `json:"regrade_status,omitempty"`
+	RouteSnapshot     GradingModelSnapshot `json:"route_snapshot,omitempty"`
+	AnnotatedAssetID  string               `json:"annotated_asset_id,omitempty"`
+	ResultMarkdown    string               `json:"result_markdown,omitempty"`
+	UnresolvedItemIDs []string             `json:"unresolved_item_ids,omitempty"`
+	RegradeUpdatedAt  int64                `json:"regrade_updated_at,omitempty"`
 }
 
 // PracticeSetFields 练习集领域字段（PRD §5.5）。
 type PracticeSetFields struct {
+	// GradeTerm freezes the learner profile term when the set is created. It is
+	// immutable report attribution, not a live join to the current profile.
+	GradeTerm           string         `json:"grade_term,omitempty"`
 	SourceKind          string         `json:"source_kind"`
 	Title               string         `json:"title"`
 	PaperNo             string         `json:"paper_no,omitempty"` // 卷面号（§4.13 双 ID）：固化时分配，P-YYWW-NN，OCR 友好，印于页眉；内部主键仍是 record_id
@@ -208,6 +235,17 @@ type PracticeGenerationJob struct {
 	ResultItemIDs     []string `json:"result_item_ids,omitempty"`
 	DeduplicatedCount int      `json:"deduplicated_count,omitempty"`
 	FailureReason     string   `json:"failure_reason,omitempty"`
+	SourceMistakeID   string   `json:"source_mistake_id,omitempty"`
+	SourceSummary     string   `json:"source_mistake_summary,omitempty"`
+	RequestSnapshot   string   `json:"request_snapshot_json,omitempty"`
+	RouteSnapshot     string   `json:"route_snapshot_json,omitempty"`
+	Attempt           int      `json:"attempt,omitempty"`
+	GenerationOutput  string   `json:"generation_output_json,omitempty"`
+	OutputAttempt     int      `json:"generation_output_attempt,omitempty"`
+	ValidationOutput  string   `json:"validation_output_json,omitempty"`
+	ValidationAttempt int      `json:"validation_output_attempt,omitempty"`
+	RetiredAt         int64    `json:"retired_at,omitempty"`
+	RetiredReason     string   `json:"retired_reason,omitempty"`
 	CreatedAt         int64    `json:"created_at"`
 	UpdatedAt         int64    `json:"updated_at"`
 }
@@ -219,6 +257,19 @@ const (
 	PracticeGenerationCommitted  = "committed"
 	PracticeGenerationFailed     = "failed"
 	PracticeGenerationCancelled  = "cancelled"
+)
+
+const (
+	PracticeGenerationStageGenerate = "practice_generate"
+	PracticeGenerationStageValidate = "practice_validate"
+)
+
+const (
+	PracticeItemGenerationQueued     = "queued"
+	PracticeItemGenerationGenerating = "generating"
+	PracticeItemGenerationValidating = "validating"
+	PracticeItemGenerationReady      = "ready"
+	PracticeItemGenerationFailed     = "failed"
 )
 
 // graded→closed 触发原因（2026-07-18 裁决）。
@@ -344,6 +395,9 @@ func validatePracticeSetFields(fieldsJSON string) error {
 	if strings.TrimSpace(f.Title) == "" {
 		return fmt.Errorf("练习集缺少 title")
 	}
+	if f.GradeTerm != "" && !ValidProfileGradeTerm(f.GradeTerm) {
+		return fmt.Errorf("练习集 grade_term 非法值 %q", f.GradeTerm)
+	}
 	switch f.SourceKind {
 	case PracticeSourceWeekly, PracticeSourceCustom, PracticeSourceSingleVariant, PracticeSourceManual, PracticeSourceMixed:
 	default:
@@ -351,15 +405,36 @@ func validatePracticeSetFields(fieldsJSON string) error {
 	}
 	itemIDs := make(map[string]struct{}, len(f.Items))
 	for i, it := range f.Items {
-		if strings.TrimSpace(it.QuestionMarkdown) == "" {
-			return fmt.Errorf("练习项 #%d 缺少 question_markdown", i)
-		}
 		switch it.AddedVia {
 		case "", PracticeAddedViaWeekly, PracticeAddedViaCustom, PracticeAddedViaSingleVariant,
 			PracticeAddedViaManual, PracticeAddedViaAccumulation, PracticeAddedViaSpotCheck:
 		default:
 			// §4.11 家长向术语：错误文案不出现「装篮」，统一「加入练习集」。
 			return fmt.Errorf("练习项 #%d 加入练习集来源非法: %q", i, it.AddedVia)
+		}
+		switch it.GenerationStatus {
+		case "":
+			// V39 前的既有练习项没有 generation_status，仍按 ready 事实读取。
+			if strings.TrimSpace(it.QuestionMarkdown) == "" {
+				return fmt.Errorf("练习项 #%d 缺少 question_markdown", i)
+			}
+		case PracticeItemGenerationQueued, PracticeItemGenerationGenerating,
+			PracticeItemGenerationValidating, PracticeItemGenerationFailed:
+			if it.AddedVia != PracticeAddedViaSingleVariant ||
+				strings.TrimSpace(it.ItemID) == "" ||
+				strings.TrimSpace(it.SourceProblemID) == "" ||
+				strings.TrimSpace(it.SourceMistakeSummary) == "" ||
+				strings.TrimSpace(it.GenerationJobID) == "" {
+				return fmt.Errorf("练习项 #%d 的异步占位缺少 item/source/summary/generation 身份", i)
+			}
+		case PracticeItemGenerationReady:
+			if strings.TrimSpace(it.QuestionMarkdown) == "" ||
+				strings.TrimSpace(it.ExpectedAnswerMarkdown) == "" ||
+				it.VerificationStatus != PracticeItemVerified {
+				return fmt.Errorf("练习项 #%d ready 时必须有完整题答和 verified 证据", i)
+			}
+		default:
+			return fmt.Errorf("练习项 #%d generation_status 非法: %q", i, it.GenerationStatus)
 		}
 		// 学科取值权威（2026-07-18 裁决）：可组卷五科中文名或空；美术与别名/英文值拒绝。
 		if !PracticeSubjectAllowed(it.Subject) {
@@ -416,7 +491,8 @@ func validPracticeDifficulty(v string) bool {
 
 // PracticeItemPublishable 判断某练习项是否可进入打印版本（PRD §4.7）。
 func PracticeItemPublishable(it PracticeItem) bool {
-	return it.VerificationStatus == PracticeItemVerified
+	return (it.GenerationStatus == "" || it.GenerationStatus == PracticeItemGenerationReady) &&
+		it.VerificationStatus == PracticeItemVerified
 }
 
 // PublishableItems 拆分可进入打印版本的项与被跳过的阻断项数（2026-07-18 购物车裁决，§3.8）：

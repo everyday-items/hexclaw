@@ -247,7 +247,7 @@ func ProjectWorkFeedbackMarkdown(feedback WorkFeedback) string {
 		"visible_detail":  "可见细节",
 	}
 	var b strings.Builder
-	b.WriteString("## 观察与依据\n\n")
+	b.WriteString("## 可见证据\n\n")
 	for _, observation := range feedback.Observations {
 		label := dimensionLabels[observation.Dimension]
 		if label == "" {
@@ -255,12 +255,31 @@ func ProjectWorkFeedbackMarkdown(feedback WorkFeedback) string {
 		}
 		fmt.Fprintf(&b, "- **%s**：%s\n", label, strings.TrimSpace(observation.Evidence))
 	}
-	b.WriteString("\n## 下一步建议\n\n")
-	for i, suggestion := range feedback.Suggestions {
-		fmt.Fprintf(&b, "%d. %s\n", i+1, strings.TrimSpace(suggestion))
+
+	if len(feedback.Observations) > 0 {
+		evidence := strings.TrimSpace(feedback.Observations[0].Evidence)
+		b.WriteString("\n## 先这样肯定\n\n")
+		if feedback.FeedbackType == WorkTypeArt {
+			fmt.Fprintf(&b, "可以先这样肯定孩子：“我看到了你画里的具体安排：%s”\n", evidence)
+		} else {
+			fmt.Fprintf(&b, "可以先这样肯定孩子：“我注意到了你写出的具体内容：%s”\n", evidence)
+		}
+	}
+
+	b.WriteString("\n## 家长可以这样问或讲\n\n")
+	if feedback.FeedbackType == WorkTypeArt {
+		b.WriteString("可以问孩子：“画面里你最想保留的是哪一处？为什么？”\n")
+	} else {
+		b.WriteString("可以问孩子：“这篇作文里你最想保留的是哪一句或哪一段？为什么？”\n")
+	}
+
+	if len(feedback.Suggestions) > 0 {
+		b.WriteString("\n## 下一次只试一个点\n\n")
+		b.WriteString(strings.TrimSpace(feedback.Suggestions[0]))
+		b.WriteByte('\n')
 	}
 	if limitation := strings.TrimSpace(feedback.Limitations); limitation != "" {
-		b.WriteString("\n## 能力与证据限制\n\n")
+		b.WriteString("\n## 说明\n\n")
 		b.WriteString(limitation)
 		b.WriteByte('\n')
 	}

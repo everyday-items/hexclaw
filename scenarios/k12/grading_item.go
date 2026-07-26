@@ -10,20 +10,26 @@ import (
 type GradingItemOperation string
 
 const (
-	GradingItemOperationSolve       GradingItemOperation = "solve"
-	GradingItemOperationGrade       GradingItemOperation = "grade"
-	GradingItemOperationParentGuide GradingItemOperation = "parent_guide"
+	// GradingItemOperationSolve is retained only for historical/third-party
+	// logical ledgers. Current production grading records each physical solver
+	// request independently as solve_generate and solve_verify.
+	GradingItemOperationSolve         GradingItemOperation = "solve"
+	GradingItemOperationSolveGenerate GradingItemOperation = "solve_generate"
+	GradingItemOperationSolveVerify   GradingItemOperation = "solve_verify"
+	GradingItemOperationGrade         GradingItemOperation = "grade"
+	GradingItemOperationParentGuide   GradingItemOperation = "parent_guide"
 )
 
 func (o GradingItemOperation) Valid() bool {
 	return o == GradingItemOperationSolve ||
+		o == GradingItemOperationSolveGenerate ||
+		o == GradingItemOperationSolveVerify ||
 		o == GradingItemOperationGrade ||
 		o == GradingItemOperationParentGuide
 }
 
-// GradingItemInvocation records one logical solve/grade/parent-guide operation. It is not a
-// provider billing counter: one logical operation may contain multiple physical
-// gateway requests, and those require separate correlated telemetry.
+// GradingItemInvocation records one durable provider request. CostReceiptID is
+// assigned atomically with the succeeded transition and is globally unique.
 type GradingItemInvocation struct {
 	InvocationID     string                `json:"item_invocation_id"`
 	AgentName        string                `json:"agent_name"`
@@ -35,6 +41,7 @@ type GradingItemInvocation struct {
 	RequestDigest    string                `json:"request_digest"`
 	RouteSnapshot    GradingModelSnapshot  `json:"route_snapshot"`
 	Status           ModelInvocationStatus `json:"status"`
+	CostReceiptID    string                `json:"cost_receipt_id,omitempty"`
 	ResultDigest     string                `json:"result_digest,omitempty"`
 	ResultJSON       string                `json:"result_json,omitempty"`
 	FailureClass     string                `json:"failure_class,omitempty"`
@@ -53,6 +60,7 @@ func (v *GradingItemInvocation) ValidateIdentity() error {
 	v.ProblemID = strings.TrimSpace(v.ProblemID)
 	v.AttemptID = strings.TrimSpace(v.AttemptID)
 	v.RequestDigest = strings.TrimSpace(v.RequestDigest)
+	v.CostReceiptID = strings.TrimSpace(v.CostReceiptID)
 	v.RouteSnapshot = NormalizeGradingModelSnapshot(v.RouteSnapshot)
 	if v.InvocationID == "" || v.AgentName == "" || v.JobID == "" || v.ProblemID == "" ||
 		v.AttemptID == "" || v.RequestDigest == "" || v.OperationAttempt < 1 || !v.Operation.Valid() ||
@@ -86,6 +94,12 @@ func (s GradingAssessmentStatus) Valid() bool {
 
 const GradingProjectionCommitted = "committed"
 
+const (
+	GradingAssessmentDispositionCurrent    = "current"
+	GradingAssessmentDispositionSuperseded = "superseded"
+	GradingAssessmentStructureVersion      = 1
+)
+
 var ErrGradingAssessmentTerminalInvariant = errors.New("grading assessment terminal invariant violated")
 
 // GradingAssessmentItem is the exactly-once local receipt for one stable
@@ -97,6 +111,10 @@ type GradingAssessmentItem struct {
 	ProblemID               string                  `json:"problem_id"`
 	AttemptID               string                  `json:"attempt_id"`
 	ConfirmedVersion        int                     `json:"confirmed_version"`
+	InputRevision           int                     `json:"input_revision"`
+	PublishedRevision       int                     `json:"published_revision"`
+	CurrentDisposition      string                  `json:"current_disposition"`
+	StructureVersion        int                     `json:"structure_version"`
 	InputDigest             string                  `json:"input_digest"`
 	Status                  GradingAssessmentStatus `json:"status"`
 	ResultJSON              string                  `json:"result_json"`

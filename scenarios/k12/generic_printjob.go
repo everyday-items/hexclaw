@@ -5,13 +5,16 @@ const (
 	PrintSourceCreativeObservation = "creative_observation_card"
 	PrintSourcePracticeQuestion    = "practice_question"
 	PrintSourcePracticeAnswer      = "practice_answer"
+	PrintSourceGradingFinalArtifact = "grading_final_artifact"
+	PrintSourceWeeklyPracticeSnapshot = "weekly_practice_snapshot"
 	MaxPrintAttempts               = 3
 )
 
 func GenericPrintSourceKindAllowed(kind string) bool {
 	switch kind {
 	case PrintSourceTutoringTips, PrintSourceCreativeObservation,
-		PrintSourcePracticeQuestion, PrintSourcePracticeAnswer:
+		PrintSourcePracticeQuestion, PrintSourcePracticeAnswer,
+		PrintSourceGradingFinalArtifact, PrintSourceWeeklyPracticeSnapshot:
 		return true
 	default:
 		return false
@@ -29,6 +32,20 @@ type PrintArtifact struct {
 	CanonicalMarkdown string `json:"canonical_markdown"`
 	SourceDigest      string `json:"source_digest"`
 	CreatedAt         int64  `json:"created_at"`
+}
+
+// PrintArtifactRender is the immutable PDF projection of one PrintArtifact.
+// ArtifactID remains the only public identity: print and export must read these
+// exact frozen bytes rather than rendering the Markdown independently.
+type PrintArtifactRender struct {
+	ArtifactID            string `json:"artifact_id"`
+	Format                string `json:"format"`
+	RenderContractVersion string `json:"render_contract_version"`
+	ContentType           string `json:"content_type"`
+	ByteDigest            string `json:"byte_digest"`
+	ByteSize              int64  `json:"byte_size"`
+	Payload               []byte `json:"-"`
+	CreatedAt             int64  `json:"created_at"`
 }
 
 // GenericPrintJob records native-print state without changing the source

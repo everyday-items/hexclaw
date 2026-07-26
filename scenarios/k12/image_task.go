@@ -206,10 +206,16 @@ type ImageTaskDispatch struct {
 	AttemptGeneration           int                        `json:"attempt_generation"`
 	RetrySafe                   bool                       `json:"retry_safe"`
 	FailureKind                 string                     `json:"failure_kind,omitempty"`
+	AutomaticBudgetSeconds      int                        `json:"automatic_budget_seconds"`
+	AutomaticStartedAt          int64                      `json:"automatic_started_at"`
+	AutomaticDeadlineAt         int64                      `json:"automatic_deadline_at"`
+	AutomaticRemainingSeconds   int                        `json:"automatic_remaining_seconds"`
 	Version                     int                        `json:"version"`
 	CreatedAt                   int64                      `json:"created_at"`
 	UpdatedAt                   int64                      `json:"updated_at"`
 }
+
+const ImageTaskAutomaticBudgetSeconds = 300
 
 func validImageTaskIntent(intent ImageTaskIntent) bool {
 	switch intent {
@@ -650,6 +656,7 @@ type ImageTaskInvocation struct {
 	ResultJSON         string                    `json:"result_json,omitempty"`
 	ErrorKind          string                    `json:"error_kind,omitempty"`
 	RetrySafe          bool                      `json:"retry_safe"`
+	DeadlineAt         int64                     `json:"deadline_at,omitempty"`
 	StartedAt          int64                     `json:"started_at,omitempty"`
 	FinishedAt         int64                     `json:"finished_at,omitempty"`
 	CreatedAt          int64                     `json:"created_at"`

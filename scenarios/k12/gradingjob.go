@@ -130,20 +130,23 @@ type GradingStageCheckpoint struct {
 // GradingJobFields GradingJob 领域字段（§5.4 字段表 + 等待态正交拆分两字段）。
 // job_id = 记录 record_id；stage = 记录 status；乐观锁 = 记录 version。
 type GradingJobFields struct {
-	SubmissionID      string                   `json:"submission_id"`
-	SourceKind        string                   `json:"source_kind"` // 创建来源：desktop request_id / http idempotency_key / im message_id / workflow execution_id（§4.10）
-	IdempotencyKey    string                   `json:"idempotency_key"`
-	ConfirmedVersion  int                      `json:"confirmed_version"` // 家长确认版本；修正 +1 产新 Job（规则 6）
-	ConfirmationState string                   `json:"confirmation_state"`
-	AnchorState       string                   `json:"anchor_state"`
-	Deadline          int64                    `json:"deadline,omitempty"` // 当前自动阶段截止（unix 秒）；awaiting_confirmation 人工等待不计入 = 0（规则 7）
-	ModelSnapshot     GradingModelSnapshot     `json:"model_snapshot"`
-	BudgetSnapshot    GradingBudgetSnapshot    `json:"budget_snapshot,omitempty"` // policy_version=0：旧任务/发布预算尚未冻结
-	StageCheckpoints  []GradingStageCheckpoint `json:"stage_checkpoints,omitempty"`
-	AttemptCount      int                      `json:"attempt_count,omitempty"` // 当前阶段重试计数（规则 4）
-	FailureKind       string                   `json:"failure_kind,omitempty"`  // 仅失败态有值
-	Retryable         bool                     `json:"retryable,omitempty"`     // 是否安全重试（由阶段和错误决定）
-	FailedStage       string                   `json:"failed_stage,omitempty"`  // 失败发生的自动阶段（审计/恢复取证）
+	SubmissionID                    string                   `json:"submission_id"`
+	SourceKind                      string                   `json:"source_kind"` // 创建来源：desktop request_id / http idempotency_key / im message_id / workflow execution_id（§4.10）
+	IdempotencyKey                  string                   `json:"idempotency_key"`
+	ConfirmedVersion                int                      `json:"confirmed_version"` // 家长确认版本；修正 +1 产新 Job（规则 6）
+	ConfirmationState               string                   `json:"confirmation_state"`
+	AnchorState                     string                   `json:"anchor_state"`
+	Deadline                        int64                    `json:"deadline,omitempty"` // 当前自动阶段截止（unix 秒）；awaiting_confirmation 人工等待不计入 = 0（规则 7）
+	ParentAutomaticAttemptID        string                   `json:"parent_automatic_attempt_id,omitempty"`
+	ParentAutomaticDeadlineAt       int64                    `json:"parent_automatic_deadline_at,omitempty"`
+	ParentAutomaticRemainingSeconds int64                    `json:"parent_automatic_remaining_seconds,omitempty"`
+	ModelSnapshot                   GradingModelSnapshot     `json:"model_snapshot"`
+	BudgetSnapshot                  GradingBudgetSnapshot    `json:"budget_snapshot,omitempty"` // policy_version=0：旧任务/发布预算尚未冻结
+	StageCheckpoints                []GradingStageCheckpoint `json:"stage_checkpoints,omitempty"`
+	AttemptCount                    int                      `json:"attempt_count,omitempty"` // 当前阶段重试计数（规则 4）
+	FailureKind                     string                   `json:"failure_kind,omitempty"`  // 仅失败态有值
+	Retryable                       bool                     `json:"retryable,omitempty"`     // 是否安全重试（由阶段和错误决定）
+	FailedStage                     string                   `json:"failed_stage,omitempty"`  // 失败发生的自动阶段（审计/恢复取证）
 }
 
 // BuildGradingIdempotencyKey 统一批改幂等键（§4.10）：创建来源 + 来源键 + confirmed_version。
@@ -249,7 +252,7 @@ func GradingJobSchema() *records.RecordSchema {
 				GradingStageRecognizing, GradingStageLocating,
 				GradingStageAwaitingConfirmation, GradingStageAssessing,
 				GradingStageRendering, GradingStageProjecting, GradingStageCompleted,
-				GradingStageCancelled,
+				GradingStageCancelled, GradingStageFailedRetryable,
 			},
 			GradingStageNormalizing: {GradingStageRecognizing, GradingStageCancelled, GradingStageFailedRetryable},
 			GradingStageRecognizing: {GradingStageAwaitingConfirmation, GradingStageLocating, GradingStageCancelled, GradingStageOutcomeUnknown, GradingStageFailedRetryable},
@@ -307,6 +310,14 @@ func validateGradingJobFields(fieldsJSON string) error {
 	}
 	if f.ConfirmedVersion < 0 {
 		return fmt.Errorf("confirmed_version 不可为负: %d", f.ConfirmedVersion)
+	}
+	f.ParentAutomaticAttemptID = strings.TrimSpace(f.ParentAutomaticAttemptID)
+	if f.ParentAutomaticAttemptID == "" {
+		if f.ParentAutomaticDeadlineAt != 0 || f.ParentAutomaticRemainingSeconds != 0 {
+			return fmt.Errorf("parent automatic deadline/remaining 缺少 attempt identity")
+		}
+	} else if f.ParentAutomaticDeadlineAt < 0 || f.ParentAutomaticRemainingSeconds < 0 {
+		return fmt.Errorf("parent automatic deadline/remaining 不可为负")
 	}
 	f.ModelSnapshot = NormalizeGradingModelSnapshot(f.ModelSnapshot)
 	if f.ModelSnapshot.Provider == "" || f.ModelSnapshot.Model == "" {
