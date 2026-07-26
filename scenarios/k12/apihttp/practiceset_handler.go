@@ -30,14 +30,22 @@ type practiceItemDTO struct {
 	RequestedDifficulty string   `json:"requested_difficulty,omitempty"`
 	ActualDifficulty    string   `json:"actual_difficulty,omitempty"`
 	// ResultCorrect 复批逐题结论（§3.8 第 3-4 条）：null=尚无结论。
-	ResultCorrect *bool `json:"result_correct,omitempty"`
+	ResultCorrect  *bool  `json:"result_correct,omitempty"`
+	ResultEvidence string `json:"result_evidence,omitempty"`
 }
 
 type practiceReturnAssetDTO struct {
-	ReturnID   string   `json:"return_id"`
-	AssetID    string   `json:"asset_id"`
-	ItemIDs    []string `json:"item_ids"`
-	ReturnedAt int64    `json:"returned_at"`
+	ReturnID          string                   `json:"return_id"`
+	AssetID           string                   `json:"asset_id"`
+	ItemIDs           []string                 `json:"item_ids"`
+	ReturnedAt        int64                    `json:"returned_at"`
+	RegradeJobID      string                   `json:"regrade_job_id,omitempty"`
+	RegradeStatus     string                   `json:"regrade_status,omitempty"`
+	RouteSnapshot     k12.GradingModelSnapshot `json:"route_snapshot,omitempty"`
+	AnnotatedAssetID  string                   `json:"annotated_asset_id,omitempty"`
+	ResultMarkdown    string                   `json:"result_markdown,omitempty"`
+	UnresolvedItemIDs []string                 `json:"unresolved_item_ids,omitempty"`
+	RegradeUpdatedAt  int64                    `json:"regrade_updated_at,omitempty"`
 }
 
 type practiceSetDTO struct {
@@ -126,6 +134,10 @@ func toPracticeSetDTO(v usecase.PracticeSetView) practiceSetDTO {
 	for _, ra := range v.Fields.ReturnAssets {
 		returnAssets = append(returnAssets, practiceReturnAssetDTO{
 			ReturnID: ra.ReturnID, AssetID: ra.AssetID, ItemIDs: ra.ItemIDs, ReturnedAt: ra.ReturnedAt,
+			RegradeJobID: ra.RegradeJobID, RegradeStatus: ra.RegradeStatus,
+			RouteSnapshot: ra.RouteSnapshot, AnnotatedAssetID: ra.AnnotatedAssetID,
+			ResultMarkdown: ra.ResultMarkdown, UnresolvedItemIDs: ra.UnresolvedItemIDs,
+			RegradeUpdatedAt: ra.RegradeUpdatedAt,
 		})
 		for _, itemID := range ra.ItemIDs {
 			returnIDsByItem[itemID] = append(returnIDsByItem[itemID], ra.ReturnID)
@@ -142,7 +154,7 @@ func toPracticeSetDTO(v usecase.PracticeSetView) practiceSetDTO {
 			PaperSeq:      it.PaperSeq, Returned: it.Returned, ReturnIDs: returnIDsByItem[it.ItemID],
 			GenerationJobID: it.GenerationJobID, VariantIndex: it.VariantIndex,
 			RequestedDifficulty: it.RequestedDifficulty, ActualDifficulty: it.ActualDifficulty,
-			ResultCorrect: it.ResultCorrect,
+			ResultCorrect: it.ResultCorrect, ResultEvidence: it.ResultEvidence,
 		})
 	}
 	return practiceSetDTO{
@@ -278,6 +290,8 @@ type customPaperReq struct {
 	Difficulty     string `json:"difficulty"`
 	Textbook       string `json:"textbook"`
 	Grade          string `json:"grade,omitempty"`
+	Provider       string `json:"provider,omitempty"`
+	Model          string `json:"model,omitempty"`
 	SourceSession  string `json:"source_session,omitempty"`
 }
 
@@ -296,7 +310,8 @@ func (h *handler) generateCustomPaper(w http.ResponseWriter, r *http.Request) {
 	result, err := h.rt.Deps.GenerateCustomPaper(r.Context(), req.Agent, usecase.CustomPaperRequest{
 		IdempotencyKey: req.IdempotencyKey, Scope: req.Scope, Total: total,
 		PerSource: req.PerSource, Difficulty: req.Difficulty, Textbook: req.Textbook,
-		Grade: req.Grade, SourceSession: req.SourceSession,
+		Grade: req.Grade, Provider: req.Provider, Model: req.Model,
+		SourceSession: req.SourceSession,
 	})
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusBadGateway), err.Error())
@@ -421,10 +436,61 @@ func (h *handler) preparePracticePrintJob(w http.ResponseWriter, r *http.Request
 type prepareGenericPrintReq struct {
 	Agent             string `json:"agent"`
 	IdempotencyKey    string `json:"idempotency_key"`
+	ArtifactID        string `json:"artifact_id,omitempty"`
 	SourceKind        string `json:"source_kind"`
 	SourceRef         string `json:"source_ref"`
 	Title             string `json:"title"`
 	CanonicalMarkdown string `json:"canonical_markdown"`
+}
+
+func printableArtifactDTO(v usecase.PrintableArtifactView) map[string]any {
+	return map[string]any{
+		"artifact_id": v.Artifact.ArtifactID, "source_kind": v.Artifact.SourceKind,
+		"source_ref": v.Artifact.SourceRef, "title": v.Artifact.Title,
+		"source_digest": v.Artifact.SourceDigest, "format": v.Render.Format,
+		"render_contract_version": v.Render.RenderContractVersion,
+		"content_type":            v.Render.ContentType, "byte_digest": v.Render.ByteDigest,
+		"byte_size": v.Render.ByteSize,
+	}
+}
+
+func (h *handler) preparePrintableArtifact(w http.ResponseWriter, r *http.Request) {
+	var req prepareGenericPrintReq
+	if !decode(w, r, &req) {
+		return
+	}
+	v, replay, err := h.rt.Deps.PreparePrintableArtifact(r.Context(),
+		usecase.PreparePrintableArtifactRequest{
+			AgentName: req.Agent, SourceKind: req.SourceKind, SourceRef: req.SourceRef,
+			Title: req.Title, CanonicalMarkdown: req.CanonicalMarkdown,
+		})
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+		return
+	}
+	status := http.StatusCreated
+	if replay {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, map[string]any{"artifact": printableArtifactDTO(v), "replayed": replay})
+}
+
+func (h *handler) getPrintableArtifactContent(w http.ResponseWriter, r *http.Request) {
+	agent := strings.TrimSpace(r.URL.Query().Get("agent"))
+	if agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	v, err := h.rt.Deps.GetPrintableArtifactPDF(r.Context(), agent, r.PathValue("id"))
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", v.Render.ContentType)
+	w.Header().Set("X-Content-SHA256", v.Render.ByteDigest)
+	w.Header().Set("ETag", `"`+v.Render.ByteDigest+`"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(v.Render.Payload)
 }
 
 // prepareGenericPrintJob freezes a non-mutating printable Artifact. Query,
@@ -435,10 +501,28 @@ func (h *handler) prepareGenericPrintJob(w http.ResponseWriter, r *http.Request)
 	if !decode(w, r, &req) {
 		return
 	}
-	v, replay, err := h.rt.Deps.PrepareGenericPrint(r.Context(), usecase.PrepareGenericPrintRequest{
-		AgentName: req.Agent, IdempotencyKey: req.IdempotencyKey, SourceKind: req.SourceKind,
-		SourceRef: req.SourceRef, Title: req.Title, CanonicalMarkdown: req.CanonicalMarkdown,
-	})
+	artifactVariant := strings.TrimSpace(req.ArtifactID) != ""
+	canonicalVariant := strings.TrimSpace(req.SourceKind) != "" ||
+		strings.TrimSpace(req.SourceRef) != "" || strings.TrimSpace(req.Title) != "" ||
+		strings.TrimSpace(req.CanonicalMarkdown) != ""
+	if artifactVariant == canonicalVariant {
+		writeErr(w, http.StatusBadRequest, "artifact_id 与 canonical_markdown variant 必须且只能选择一个")
+		return
+	}
+	var (
+		v      usecase.GenericPrintView
+		replay bool
+		err    error
+	)
+	if artifactVariant {
+		v, replay, err = h.rt.Deps.PrepareGenericPrintFromArtifact(
+			r.Context(), req.Agent, req.IdempotencyKey, req.ArtifactID)
+	} else {
+		v, replay, err = h.rt.Deps.PrepareGenericPrint(r.Context(), usecase.PrepareGenericPrintRequest{
+			AgentName: req.Agent, IdempotencyKey: req.IdempotencyKey, SourceKind: req.SourceKind,
+			SourceRef: req.SourceRef, Title: req.Title, CanonicalMarkdown: req.CanonicalMarkdown,
+		})
+	}
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
 		return
@@ -642,6 +726,9 @@ func (h *handler) submitPracticeSet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
 		return
 	}
+	if h.rt.PracticeReturnRegrade != nil {
+		h.rt.PracticeReturnRegrade.StartAsync(req.Agent, r.PathValue("id"), req.ReturnID)
+	}
 	writeJSON(w, http.StatusOK, toPracticeSetDTO(v))
 }
 
@@ -655,9 +742,9 @@ type gradeResultsReq struct {
 	} `json:"results,omitempty"`
 }
 
-// gradePracticeSet POST /practice-sets/{id}/grade —— 复批。带 results 走逐题结论链路
-// （通过题积掌握证据、未通过题回本周；全部有结论才 graded，允许多次补传覆盖）；
-// 空 results 走整卷通过旧行为。
+// gradePracticeSet POST /practice-sets/{id}/grade —— “手动记结果”降级路径。
+// 带 results 只写 human_confirmed：推进复习间隔但绝不形成系统掌握证据；
+// 照片自动复批由 PracticeReturnRegradeCoordinator 内部调用系统结论命令。
 func (h *handler) gradePracticeSet(w http.ResponseWriter, r *http.Request) {
 	var req gradeResultsReq
 	if !decode(w, r, &req) {
@@ -679,7 +766,7 @@ func (h *handler) gradePracticeSet(w http.ResponseWriter, r *http.Request) {
 	for _, res := range req.Results {
 		results = append(results, usecase.PracticeGradeResult{ItemID: res.ItemID, Correct: res.Correct})
 	}
-	v, err := h.rt.Deps.GradePracticeSetItems(r.Context(), req.Agent, r.PathValue("id"), results)
+	v, err := h.rt.Deps.ConfirmPracticeSetItems(r.Context(), req.Agent, r.PathValue("id"), results)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
 		return

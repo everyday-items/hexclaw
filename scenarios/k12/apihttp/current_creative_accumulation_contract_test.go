@@ -7,9 +7,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
 type currentAccumulationDeriver struct {
@@ -203,5 +206,71 @@ func TestCurrentCreativeWorkHTTPExactDTOGenerationAndDelete(t *testing.T) {
 	if rec.Code != http.StatusOK || deleted["deleted"] != true ||
 		deleted["work_id"] != id || deleted["row_version"] != float64(3) {
 		t.Fatalf("delete work: status=%d body=%v", rec.Code, deleted)
+	}
+}
+
+func TestCurrentCreativeWorkHTTPCreateAutomaticallyRunsInitialFeedback(t *testing.T) {
+	runtime := newRuntimeWithSolver(
+		t,
+		fakeSolveExec{},
+		assembly.WithWorkFeedbackGenerator(func(
+			context.Context,
+			string,
+			string,
+			string,
+		) (string, error) {
+			return "原文中的桂花细节清楚；家长可以追问声音；下一次只补一处听觉细节。", nil
+		}),
+	)
+	coordinator := &usecase.CreativeWorkFeedbackCoordinator{
+		Deps: &runtime.Deps, Records: runtime.Records,
+		BaseContext: context.Background(),
+	}
+	runtime.WorkFeedback = coordinator
+	h := apihttp.NewHandler(runtime)
+
+	rec, created := doCurrent(
+		t,
+		h,
+		http.MethodPost,
+		"/creative-works",
+		`{"agent":"mingming","work_type":"writing","content_markdown":"桂花落在青石板上。"}`,
+		map[string]string{"Idempotency-Key": "auto-feedback-work"},
+	)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create current work: status=%d body=%v", rec.Code, created)
+	}
+	workID, _ := created["work_id"].(string)
+	generationID, _ := created["initial_feedback_generation_id"].(string)
+	if workID == "" || generationID == "" {
+		t.Fatalf("create identities missing: %v", created)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		rec, detail := doCurrent(
+			t,
+			h,
+			http.MethodGet,
+			"/creative-works/"+workID+"?agent=mingming",
+			"",
+			nil,
+		)
+		latest, _ := detail["latest_feedback"].(map[string]any)
+		if rec.Code == http.StatusOK &&
+			latest["generation_id"] == generationID &&
+			latest["status"] == k12.WorkFeedbackSucceeded {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("automatic feedback did not finish: status=%d body=%v", rec.Code, detail)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := coordinator.Shutdown(waitCtx); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -48,7 +48,11 @@ func (f *httpReceiptTransport) QueryPrepared(_ context.Context, _ k12.DeliveryRe
 	return ack, nil
 }
 
-func newServerWithReceiptTransport(t *testing.T, delivery usecase.DeliveryTransport) http.Handler {
+func newServerWithReceiptTransport(
+	t *testing.T,
+	delivery usecase.DeliveryTransport,
+	seed ...func(*sql.DB),
+) http.Handler {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -60,6 +64,9 @@ func newServerWithReceiptTransport(t *testing.T, delivery usecase.DeliveryTransp
 	}
 	if _, err := db.Exec(`INSERT INTO agents(name) VALUES('mingming'),('other')`); err != nil {
 		t.Fatal(err)
+	}
+	if len(seed) > 0 && seed[0] != nil {
+		seed[0](db)
 	}
 	rt, err := assembly.Wire(
 		db,
@@ -88,7 +95,7 @@ func TestAccumulationSendReturnsDurableReceiptAndQueryIsOnlyDeliveredProof(t *te
 		send:  []usecase.DeliveryTransportAck{{Status: k12.DeliverySending, ExternalMessageID: "pqk-http-1"}},
 		query: []usecase.DeliveryTransportAck{{Status: k12.DeliveryDelivered, ExternalMessageID: "pqk-http-1"}},
 	}
-	h := newServerWithReceiptTransport(t, delivery)
+	h := newServerWithReceiptTransport(t, delivery, nil)
 	id := addAccumulationHTTP(t, h, "海内存知己，天涯若比邻")
 
 	rec, out := do(t, h, "POST", "/accumulation/"+id+"/send", `{"agent":"mingming"}`)
@@ -125,7 +132,7 @@ func TestFailedReceiptHasExplicitSafeRetryAndUnknownRejectsIt(t *testing.T) {
 		{Status: k12.DeliverySending, ExternalMessageID: "pqk-http-retry"},
 		{Status: k12.DeliveryOutcomeUnknown, ExternalMessageID: "pqk-http-unknown", Detail: "结果未知"},
 	}}
-	h := newServerWithReceiptTransport(t, delivery)
+	h := newServerWithReceiptTransport(t, delivery, nil)
 	failedID := addAccumulationHTTP(t, h, "欲穷千里目，更上一层楼")
 
 	_, failed := do(t, h, "POST", "/accumulation/"+failedID+"/send", `{"agent":"mingming"}`)
@@ -154,14 +161,35 @@ func TestTutoringTipsSendUsesTheSameDurableReceiptProtocol(t *testing.T) {
 	delivery := &httpReceiptTransport{send: []usecase.DeliveryTransportAck{{
 		Status: k12.DeliverySending, ExternalMessageID: "pqk-tips",
 	}}}
-	h := newServerWithReceiptTransport(t, delivery)
+	const (
+		artifactID = "grading-final-http"
+		content    = "【这份作业的辅导要点】五年级下\n知识点回顾\n小数乘法"
+		digest     = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	)
+	h := newServerWithReceiptTransport(t, delivery, func(db *sql.DB) {
+		if _, err := db.Exec(`
+			INSERT INTO k12_grading_jobs
+				(record_id,agent_name,status,dedupe_key,created_at,updated_at)
+			VALUES('job-http','mingming','completed','job-http',100,100);
+			INSERT INTO k12_grading_final_artifacts
+				(artifact_id,agent_name,job_id,structure_version,coverage_status,
+				 total_count,published_count,skipped_count,ordered_current_digests_json,
+				 canonical_markdown,artifact_digest,summary_invocation_id,created_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			artifactID, "mingming", "job-http", 1, "complete",
+			1, 1, 0, `["`+digest+`"]`, content, digest, "summary-http", 100, 100,
+		); err != nil {
+			t.Fatal(err)
+		}
+	})
 	rec, out := do(t, h, "POST", "/tutoring-tips/send", `{
-		"agent":"mingming","content":"【这份作业的辅导要点】五年级下\n知识点回顾\n小数乘法"
+		"agent":"mingming","final_artifact_id":"grading-final-http"
 	}`)
-	if rec.Code != http.StatusOK || out["status"] != "sending" || out["object_kind"] != "tutoring_tips" {
+	if rec.Code != http.StatusOK || out["status"] != "sending" ||
+		out["object_kind"] != "grading_final_artifact" {
 		t.Fatalf("tutoring-tips send must return durable batch: %d %v", rec.Code, out)
 	}
-	if len(delivery.content) != 1 || delivery.content[0] == "" {
+	if len(delivery.content) != 1 || delivery.content[0] != content {
 		t.Fatalf("tutoring-tips content was not sent: %v", delivery.content)
 	}
 }

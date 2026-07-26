@@ -1,8 +1,6 @@
 package apihttp
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"net/http"
 	"strings"
@@ -12,31 +10,25 @@ import (
 )
 
 type tutoringTipsSendReq struct {
-	Agent   string `json:"agent"`
-	Content string `json:"content"`
+	Agent           string `json:"agent"`
+	FinalArtifactID string `json:"final_artifact_id"`
 }
 
-func tutoringTipsObjectID(agentName, content string) string {
-	sum := sha256.Sum256([]byte(strings.TrimSpace(agentName) + "\x00" + strings.TrimSpace(content)))
-	return "tutoring-tips:" + hex.EncodeToString(sum[:])
-}
-
-// sendTutoringTips POST /tutoring-tips/send sends the already rendered inline guidance
-// without re-running its model/grounding pipeline. The exact text is frozen in
-// the DeliveryBatch and child Receipts before any provider request.
+// sendTutoringTips sends only the canonical frozen grading final_artifact.
+// The client cannot inject page content.
 func (h *handler) sendTutoringTips(w http.ResponseWriter, r *http.Request) {
 	var req tutoringTipsSendReq
 	if !decodeStrict(w, r, &req) {
 		return
 	}
 	req.Agent = strings.TrimSpace(req.Agent)
-	req.Content = strings.TrimSpace(req.Content)
-	if req.Agent == "" || req.Content == "" {
-		writeErr(w, http.StatusBadRequest, "agent / content required")
+	req.FinalArtifactID = strings.TrimSpace(req.FinalArtifactID)
+	if req.Agent == "" || req.FinalArtifactID == "" {
+		writeErr(w, http.StatusBadRequest, "agent / final_artifact_id required")
 		return
 	}
-	batch, _, err := h.rt.Deps.PrepareAndSendTextBatch(
-		r.Context(), req.Agent, "tutoring_tips", tutoringTipsObjectID(req.Agent, req.Content), req.Content,
+	batch, _, err := h.rt.Deps.PrepareAndSendGradingFinalArtifact(
+		r.Context(), req.Agent, req.FinalArtifactID,
 	)
 	if err != nil {
 		writeDeliveryError(w, err)

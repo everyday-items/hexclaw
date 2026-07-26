@@ -80,10 +80,40 @@ type Runtime struct {
 	// ImageTasks is the sole public image command/query facade. Internal
 	// GradingJob and OCR resources are never addressed by clients.
 	ImageTasks *usecase.ImageTaskCoordinator
+	// WorkFeedback owns direct-text CreativeWork feedback workers. Image-backed
+	// works remain under ImageTasks; both coordinators share durable generation
+	// checkpoints but recover disjoint roots.
+	WorkFeedback *usecase.CreativeWorkFeedbackCoordinator
+	// PracticeGeneration owns durable one-click mistake -> practice workers.
+	// SQLite is the queue/source of truth; HTTP only accepts commands and
+	// schedules the already-persisted job.
+	PracticeGeneration *usecase.SinglePracticeGenerationCoordinator
+	// PracticeReturnRegrade owns durable PracticeReturnAsset -> GradingJob
+	// workers. The HTTP handler persists the return first and only then nudges
+	// this coordinator.
+	PracticeReturnRegrade *usecase.PracticeReturnRegradeCoordinator
+	// PrincipalMode is "local_loopback" for the single-user Desktop runtime or
+	// "remote" when an authentication middleware owns identity.
+	PrincipalMode string
+	// OwnerScope is server composition state in local_loopback mode. It is
+	// never read from an HTTP body, query, or header.
+	OwnerScope string
+	// AuthenticatedOwnerScope resolves only an already-authenticated middleware
+	// context in remote mode. Taking context.Context (not *http.Request)
+	// deliberately prevents this endpoint from treating request headers as
+	// identity.
+	AuthenticatedOwnerScope func(context.Context) (string, error)
 }
 
 // NewHandler 返回 K12 的 HTTP 子路由（Go 1.22+ method+path 路由）。
 func NewHandler(rt Runtime) http.Handler {
+	if strings.TrimSpace(rt.PrincipalMode) == "" {
+		rt.PrincipalMode = "local_loopback"
+	}
+	if rt.PrincipalMode == "local_loopback" &&
+		strings.TrimSpace(rt.OwnerScope) == "" {
+		rt.OwnerScope = "desktop-user"
+	}
 	mux := http.NewServeMux()
 	h := &handler{rt: rt}
 	mux.HandleFunc("GET /view-descriptor", h.viewDescriptor)
@@ -97,10 +127,12 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("DELETE /mistakes/{record_id}", h.deleteMistake)
 	mux.HandleFunc("POST /mistakes/{record_id}/archive", h.archiveMistake)
 	mux.HandleFunc("POST /mistakes/{record_id}/restore", h.restoreMistake)
+	mux.HandleFunc("POST /mistakes/{record_id}/practice-generation", h.startPracticeGeneration)
+	mux.HandleFunc("GET /mistakes/{record_id}/practice-generation", h.getPracticeGeneration)
+	mux.HandleFunc("POST /mistakes/{record_id}/practice-generation/retry", h.retryPracticeGeneration)
 	mux.HandleFunc("GET /review-queue", h.reviewQueue)
 	mux.HandleFunc("GET /insight-report", h.insightReport)
 	mux.HandleFunc("POST /mark-mastered", h.markMastered)
-	mux.HandleFunc("POST /review/retry", h.reviewRetry)
 	mux.HandleFunc("POST /tutoring-tips", h.tutoringTips)
 	// DD-024: tutoring tips and creative-work feedback share durable delivery
 	// receipts; provider acceptance is not proof of delivery.
@@ -135,6 +167,8 @@ func NewHandler(rt Runtime) http.Handler {
 	// older clients; new Desktop builds use only PrintJob prepare/events/retry.
 	mux.HandleFunc("POST /practice-sets/{id}/print-jobs", h.preparePracticePrintJob)
 	mux.HandleFunc("POST /print-jobs", h.prepareGenericPrintJob)
+	mux.HandleFunc("POST /print-artifacts", h.preparePrintableArtifact)
+	mux.HandleFunc("GET /print-artifacts/{id}/content", h.getPrintableArtifactContent)
 	mux.HandleFunc("GET /print-jobs/{id}", h.getPracticePrintJob)
 	mux.HandleFunc("GET /print-jobs/{id}/paper", h.getPracticePrintJobPaper)
 	mux.HandleFunc("POST /print-jobs/{id}/events", h.recordPracticePrintEvent)
@@ -151,6 +185,7 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("POST /image-tasks/{id}/retry", h.retryImageTask)
 	mux.HandleFunc("POST /image-tasks/{id}/cancel", h.cancelImageTask)
 	mux.HandleFunc("GET /image-tasks/{id}/result", h.getImageTaskResult)
+	mux.HandleFunc("POST /image-tasks/{dispatch_id}/problems/{problem_id}/source-actions", h.problemSourceAction)
 	// 作品（PRD §3.10）：draft→点评→修改稿→再点评；只点评不打分不代写（INV-011）。
 	mux.HandleFunc("POST /creative-works", h.createCreativeWork)
 	mux.HandleFunc("GET /creative-works", h.listCreativeWorks)
@@ -169,6 +204,18 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("GET /mistake-sheet", h.mistakeSheet)
 	mux.HandleFunc("GET /profile", h.getProfile)
 	mux.HandleFunc("PUT /profile", h.updateProfile)
+	mux.HandleFunc("GET /curriculum-catalog", h.getCurriculumCatalog)
+	mux.HandleFunc("GET /curriculum-progress", h.getCurriculumProgress)
+	mux.HandleFunc("GET /weekly-practice/settings", h.getWeeklyPracticeSettings)
+	mux.HandleFunc("PUT /profile-bundle", h.updateProfileBundle)
+	mux.HandleFunc("POST /weekly-practice/plans", h.ensureWeeklyPracticePlan)
+	mux.HandleFunc("GET /weekly-practice/plans/current", h.getCurrentWeeklyPracticePlan)
+	mux.HandleFunc("GET /weekly-practice/plans/history", h.listWeeklyPracticeHistory)
+	mux.HandleFunc("GET /weekly-practice/snapshots/{id}", h.getWeeklyPracticeSnapshot)
+	mux.HandleFunc("POST /weekly-practice/plans/{id}/prepare-output", h.prepareWeeklyPracticeOutput)
+	mux.HandleFunc("POST /weekly-practice/snapshots/{id}/send", h.sendWeeklyPracticeSnapshot)
+	mux.HandleFunc("POST /weekly-practice/snapshots/{id}/attempts", h.submitWeeklyPracticeAttempt)
+	mux.HandleFunc("POST /weekly-practice/plans/{id}/save-to-practice-set", h.saveWeeklyPracticeToPracticeSet)
 	mux.HandleFunc("POST /cold-start", h.coldStart)
 	// GET /study-time 已删除（架构设计 v0.5.0《明确不做》#6：不做学习时长与无证据投入指标）。
 	mux.HandleFunc("POST /tutor-turn", h.tutorTurn)
@@ -238,10 +285,11 @@ type mistakeDTO struct {
 	ReviewKind string `json:"review_kind,omitempty"`
 	// SpotCheckState 抽查复验状态（§3.6：none/scheduled/passed/failed）。前端只消费 failed
 	// →「家长确认（复验未过）」事实标注；scheduled 不呈现（不打抽查标签，规则 1）。
-	SpotCheckState string `json:"spot_check_state,omitempty"`
-	ArchivedReason string `json:"archived_reason,omitempty"`
-	ArchivedAt     int64  `json:"archived_at,omitempty"`
-	RestoredAt     int64  `json:"archive_restored_at,omitempty"`
+	SpotCheckState    string `json:"spot_check_state,omitempty"`
+	ParentConfirmedAt int64  `json:"parent_confirmed_at,omitempty"`
+	ArchivedReason    string `json:"archived_reason,omitempty"`
+	ArchivedAt        int64  `json:"archived_at,omitempty"`
+	RestoredAt        int64  `json:"archive_restored_at,omitempty"`
 	// Restorable 是服务端按当前状态与合法快照计算的能力投影，不进入持久化或备份。
 	Restorable bool `json:"restorable"`
 }
@@ -288,12 +336,14 @@ type bboxDTO struct {
 }
 
 type recognizedQuestionDTO struct {
-	ProblemID       string              `json:"problem_id"`
-	ProblemKind     usecase.ProblemKind `json:"problem_kind"`
-	ParentProblemID string              `json:"parent_problem_id,omitempty"`
-	SubproblemNo    string              `json:"subproblem_no,omitempty"`
-	PageAssetID     string              `json:"page_asset_id"`
-	AttemptID       string              `json:"attempt_id,omitempty"`
+	ProblemID        string              `json:"problem_id"`
+	ProblemKind      usecase.ProblemKind `json:"problem_kind"`
+	ParentProblemID  string              `json:"parent_problem_id,omitempty"`
+	SubproblemNo     string              `json:"subproblem_no,omitempty"`
+	SourceNumberPath []string            `json:"source_number_path"`
+	DisplayLabel     string              `json:"display_label"`
+	PageAssetID      string              `json:"page_asset_id"`
+	AttemptID        string              `json:"attempt_id,omitempty"`
 	// Question 是当前 surface 的安全展示投影；raw/canonical 双事实同时返回供确认 UI
 	// 对照。canonical_valid=false 时 Question 必须回退为可复制 raw，绝不返回空白。
 	Question          string   `json:"question"`
@@ -326,7 +376,9 @@ func recognizedQuestionToDTO(question usecase.RecognizedQuestion, includeBBox bo
 	dto := recognizedQuestionDTO{
 		ProblemID: question.ProblemID, ProblemKind: question.ProblemKind,
 		ParentProblemID: question.ParentProblemID, SubproblemNo: question.SubproblemNo,
-		PageAssetID: question.PageAssetID, AttemptID: question.AttemptID,
+		SourceNumberPath: append([]string{}, question.SourceNumberPath...),
+		DisplayLabel:     question.DisplayLabel,
+		PageAssetID:      question.PageAssetID, AttemptID: question.AttemptID,
 		Question:         usecase.RecognizedQuestionDisplayText(question),
 		RawTranscription: question.RawTranscription, CanonicalMarkdown: question.CanonicalMarkdown,
 		CanonicalValid:          usecase.CanonicalMarkdownValid(question.CanonicalMarkdown),
@@ -660,9 +712,13 @@ func (h *handler) insightReport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	md, skip := usecase.RenderReportMarkdown(rep, "")
+	md, skip := usecase.RenderReportMarkdown(rep, rep.GradeTerm)
 	if skip {
-		md = "## 学习概览\n\n本月还没有错题记录，继续保持。"
+		title := rep.GradeTerm + "学习概览"
+		if rep.GradeTerm == "" {
+			title = "学习概览"
+		}
+		md = "## " + title + "\n\n本月还没有错题记录，继续保持。"
 	}
 	content, manifest := k12RenderProjection(messagecontent.ProducerReport, "zh-CN", md)
 	writeJSON(w, http.StatusOK, struct {
@@ -696,45 +752,98 @@ func (h *handler) markMastered(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-type reviewRetryReq struct {
-	Agent    string `json:"agent"`
-	RecordID string `json:"record_id"`
-	Grade    string `json:"grade"`
+type singlePracticeGenerationReq struct {
+	Agent          string `json:"agent"`
+	IdempotencyKey string `json:"idempotency_key"`
+	Grade          string `json:"grade,omitempty"`
+	Textbook       string `json:"textbook,omitempty"`
+	Difficulty     string `json:"difficulty,omitempty"`
+	Provider       string `json:"provider,omitempty"`
+	Model          string `json:"model,omitempty"`
+	SourceSession  string `json:"source_session,omitempty"`
 }
 
-type reviewRetryResp struct {
-	Solution string `json:"solution"`
-	Verdict  string `json:"verdict"`
-	Badge    string `json:"badge"`
-	// 题答分离（2026-07-18 P2 清偿，守答案遮罩红线）：question 先显、answer 默认遮罩；
-	// 拆不出题答边界时两者为空，前端整段遮罩 solution（最小闭环回退）。
-	Question string `json:"question,omitempty"`
-	Answer   string `json:"answer,omitempty"`
-	// ExpectedAnswer 最终答案（## 答案 章节正文）：装篮 expected_answer_markdown 用。
-	ExpectedAnswer string `json:"expected_answer,omitempty"`
+func (req singlePracticeGenerationReq) command() usecase.SinglePracticeGenerationRequest {
+	return usecase.SinglePracticeGenerationRequest{
+		IdempotencyKey: req.IdempotencyKey,
+		Grade:          req.Grade,
+		Textbook:       req.Textbook,
+		Difficulty:     req.Difficulty,
+		Provider:       req.Provider,
+		Model:          req.Model,
+		SourceSession:  req.SourceSession,
+	}
 }
 
-// reviewRetry POST /review/retry —— 「再练一道」：按错题出同知识点相似题（过 solve 验算链）。
-func (h *handler) reviewRetry(w http.ResponseWriter, r *http.Request) {
-	var req reviewRetryReq
+func (h *handler) startPracticeGeneration(w http.ResponseWriter, r *http.Request) {
+	if h.rt.PracticeGeneration == nil {
+		writeErr(w, http.StatusServiceUnavailable, "逐题出题任务暂不可用")
+		return
+	}
+	var req singlePracticeGenerationReq
 	if !decode(w, r, &req) {
 		return
 	}
-	if req.Agent == "" || req.RecordID == "" {
+	sourceID := strings.TrimSpace(r.PathValue("record_id"))
+	if strings.TrimSpace(req.Agent) == "" || sourceID == "" {
 		writeErr(w, http.StatusBadRequest, "agent / record_id 必填")
 		return
 	}
-	res, err := h.rt.Deps.GenerateRetryByRecord(r.Context(), req.Agent, req.RecordID, req.Grade)
+	view, err := h.rt.Deps.StartSinglePracticeGeneration(
+		r.Context(), req.Agent, sourceID, req.command(),
+	)
 	if err != nil {
-		// BUG-2：错题不存在 404 / 下游解题失败 502（对齐 recognize）/ 其余请求校验 400。
-		writeErr(w, httpStatusForK12Error(err, http.StatusBadRequest), err.Error())
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
 	}
-	question, answer, expected := usecase.SplitRetryPresentation(res.Solution)
-	writeJSON(w, http.StatusOK, reviewRetryResp{
-		Solution: res.Solution, Verdict: string(res.Evidence.Verdict), Badge: res.Evidence.Badge(),
-		Question: question, Answer: answer, ExpectedAnswer: expected,
-	})
+	if view.State == usecase.SinglePracticePending {
+		h.rt.PracticeGeneration.StartAsync(req.Agent, view.GenerationJobID)
+	}
+	writeJSON(w, http.StatusAccepted, view)
+}
+
+func (h *handler) getPracticeGeneration(w http.ResponseWriter, r *http.Request) {
+	agentName := strings.TrimSpace(r.URL.Query().Get("agent"))
+	sourceID := strings.TrimSpace(r.PathValue("record_id"))
+	if agentName == "" || sourceID == "" {
+		writeErr(w, http.StatusBadRequest, "agent / record_id 必填")
+		return
+	}
+	view, err := h.rt.Deps.GetSinglePracticeGeneration(
+		r.Context(), agentName, sourceID,
+	)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (h *handler) retryPracticeGeneration(w http.ResponseWriter, r *http.Request) {
+	if h.rt.PracticeGeneration == nil {
+		writeErr(w, http.StatusServiceUnavailable, "逐题出题任务暂不可用")
+		return
+	}
+	var req struct {
+		Agent string `json:"agent"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	sourceID := strings.TrimSpace(r.PathValue("record_id"))
+	if strings.TrimSpace(req.Agent) == "" || sourceID == "" {
+		writeErr(w, http.StatusBadRequest, "agent / record_id 必填")
+		return
+	}
+	view, err := h.rt.Deps.RetrySinglePracticeGeneration(
+		r.Context(), req.Agent, sourceID,
+	)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+		return
+	}
+	h.rt.PracticeGeneration.StartAsync(req.Agent, view.GenerationJobID)
+	writeJSON(w, http.StatusAccepted, view)
 }
 
 type tutoringTipsReq struct {
@@ -1097,6 +1206,7 @@ type profileDTO struct {
 	ChildName       string `json:"child_name"`
 	GradeTerm       string `json:"grade_term"`
 	TextbookEdition string `json:"textbook_edition"`
+	Revision        int    `json:"revision"`
 }
 
 // getProfile GET /profile?agent=X —— 读孩子档案。
@@ -1106,12 +1216,12 @@ func (h *handler) getProfile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
-	p, err := h.rt.Deps.GetProfile(r.Context(), agent)
+	p, err := h.rt.Deps.GetProfileWithRevision(r.Context(), agent)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, profileDTO{ChildName: p.ChildName, GradeTerm: p.GradeTerm, TextbookEdition: p.TextbookEdition})
+	writeJSON(w, http.StatusOK, profileDTO{ChildName: p.ChildName, GradeTerm: p.GradeTerm, TextbookEdition: p.TextbookEdition, Revision: p.Revision})
 }
 
 type coldStartReq struct {
@@ -1176,7 +1286,12 @@ func (h *handler) updateProfile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, profileDTO{ChildName: p.ChildName, GradeTerm: p.GradeTerm, TextbookEdition: p.TextbookEdition})
+	view, viewErr := h.rt.Deps.GetProfileWithRevision(r.Context(), req.Agent)
+	if viewErr != nil {
+		writeErr(w, httpStatusForK12Error(viewErr, http.StatusInternalServerError), viewErr.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, profileDTO{ChildName: p.ChildName, GradeTerm: p.GradeTerm, TextbookEdition: p.TextbookEdition, Revision: view.Revision})
 }
 
 // mistakeSheet GET /mistake-sheet?agent=X —— 生成本周错题卷（到期该练，只出题）。
@@ -1591,7 +1706,8 @@ func mistakeDTOFrom(r *records.AgentRecord, f k12.MistakeFields) mistakeDTO {
 		RecordID: r.RecordID, Question: f.Question, KnowledgePoint: f.KnowledgePoint,
 		ErrorCause: f.ErrorCause, Status: r.Status, Version: r.Version, DueAt: r.DueAt,
 		Subject: f.Subject, SpotCheckState: f.SpotCheckState,
-		Restorable: k12.MistakeRestorable(r.Status, f),
+		ParentConfirmedAt: f.ParentConfirmedAt,
+		Restorable:        k12.MistakeRestorable(r.Status, f),
 	}
 	if r.Status == k12.StatusArchived {
 		dto.ArchivedReason = f.ArchivedReason
@@ -1682,7 +1798,9 @@ func httpStatusForK12Error(err error, fallback int) int {
 		errors.Is(err, k12storage.ErrImageTaskVersionConflict),
 		errors.Is(err, k12storage.ErrImageTaskConflict),
 		errors.Is(err, k12storage.ErrImageTaskInvalidState),
-		errors.Is(err, k12storage.ErrCurrentCommandConflict):
+		errors.Is(err, k12storage.ErrCurrentCommandConflict),
+		errors.Is(err, k12storage.ErrPracticeGenerationOutputConflict),
+		errors.Is(err, usecase.ErrModelInvocationRequiresReconciliation):
 		return http.StatusConflict
 	case errors.Is(err, records.ErrNotFound), errors.Is(err, k12storage.ErrImageTaskNotFound):
 		return http.StatusNotFound
@@ -1696,6 +1814,8 @@ func httpStatusForK12Error(err error, fallback int) int {
 	case errors.Is(err, usecase.ErrInvalidInput):
 		return http.StatusBadRequest
 	case errors.Is(err, usecase.ErrSolveFailed), errors.Is(err, usecase.ErrRenderUnavailable):
+		return http.StatusBadGateway
+	case errors.Is(err, usecase.ErrCurriculumCatalogUnavailable):
 		return http.StatusBadGateway
 	default:
 		return fallback

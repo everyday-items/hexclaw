@@ -5,46 +5,30 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
-	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/engineadapter"
-	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
 
 	_ "modernc.org/sqlite"
 )
 
-// gradeOKSolveFailExec：批改（带 student_answer）成功以便造出错题记录；纯解题（review/retry
-// 走的 Solve，无 student_answer）返回错误，模拟下游 solver 执行失败。
-type gradeOKSolveFailExec struct{}
-
-func (gradeOKSolveFailExec) Execute(_ context.Context, args map[string]any) (*skill.Result, error) {
-	if _, grading := args["student_answer"]; grading {
-		return &skill.Result{Metadata: map[string]string{
-			"solve_verdict": "agree", "solve_evidence": "numeric_exec", "grade_correct": "false",
-			"grade_wrong_step": "小数点错位", "grade_misconception": "对位错误",
-		}}, nil
-	}
-	// 仅 review/retry 的「相似题」解题失败；grade 内部对原题的解题正常，以便先造出错题记录。
-	problem, _ := args["problem"].(string)
-	if strings.Contains(problem, "相似题") || strings.Contains(problem, "参照这道错题") {
-		return nil, fmt.Errorf("上游解题服务不可用")
-	}
-	return &skill.Result{Content: "解：11.4", Metadata: map[string]string{
-		"solve_verdict": "agree", "solve_evidence": "numeric_exec",
-	}}, nil
-}
-
-func newServerWithSolver(t *testing.T, exec engineadapter.SolveExecutor, opts ...assembly.Option) http.Handler {
+func newRuntimeWithSolver(
+	t *testing.T,
+	exec engineadapter.SolveExecutor,
+	opts ...assembly.Option,
+) apihttp.Runtime {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Async K12 workers must observe the same in-memory SQLite database.
+	// A plain ":memory:" DSN creates one database per connection.
+	db.SetMaxOpenConns(1)
 	t.Cleanup(func() { db.Close() })
 	if err := migrate.Run(context.Background(), db, migrate.All); err != nil {
 		t.Fatal(err)
@@ -60,7 +44,25 @@ func newServerWithSolver(t *testing.T, exec engineadapter.SolveExecutor, opts ..
 	if err != nil {
 		t.Fatal(err)
 	}
-	return apihttp.NewHandler(apihttp.Runtime{Views: k.Registry.Views, Records: k.Records, Deps: k.Deps})
+	k.Deps.WorkFeedbackRoute = func(
+		context.Context,
+		string,
+	) (k12.ImageTaskRouteSnapshot, error) {
+		return k12.ImageTaskRouteSnapshot{
+			Provider: "test-provider", Model: "test-model",
+			Route: "test-provider/test-model", Capability: "text",
+			SelectionSource: "auto", PolicyVersion: "test-work-feedback",
+			PromptVersion: "writing-feedback-v1",
+		}, nil
+	}
+	return apihttp.Runtime{
+		Views: k.Registry.Views, Records: k.Records, Deps: k.Deps,
+	}
+}
+
+func newServerWithSolver(t *testing.T, exec engineadapter.SolveExecutor, opts ...assembly.Option) http.Handler {
+	t.Helper()
+	return apihttp.NewHandler(newRuntimeWithSolver(t, exec, opts...))
 }
 
 // memProfiles 是内存孩子档案存储（测试用），供 assembly.WithProfiles 注入年级确定性注入链路。
@@ -101,30 +103,6 @@ func TestBUG2_MarkMastered_VersionConflictIs409(t *testing.T) {
 	rec, _ := do(t, h, "POST", "/mark-mastered", fmt.Sprintf(`{"agent":"mingming","record_id":%q,"version":99}`, rid))
 	if rec.Code != http.StatusConflict {
 		t.Errorf("版本冲突应 409, got %d", rec.Code)
-	}
-}
-
-// BUG-2：review/retry 记录不存在应 404，不是 400。
-func TestBUG2_ReviewRetry_NotFoundIs404(t *testing.T) {
-	h := newServer(t)
-	rec, _ := do(t, h, "POST", "/review/retry", `{"agent":"mingming","record_id":"nope","grade":"五年级上"}`)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("错题不存在应 404, got %d", rec.Code)
-	}
-}
-
-// BUG-2：review/retry 下游 solver 执行失败应 502（对齐 recognize 用 502），不是 400。
-func TestBUG2_ReviewRetry_SolverFailureIs502(t *testing.T) {
-	h := newServerWithSolver(t, gradeOKSolveFailExec{})
-	body := `{"agent":"mingming","grade":"五年级上","source_session":"s1","problem":"3.8×3=?","student_answer":"10.4","knowledge_points":["小数乘法"]}`
-	_, out := do(t, h, "POST", "/grade", body)
-	rid, _ := out["record_id"].(string)
-	if rid == "" {
-		t.Fatalf("应造出错题记录, out=%v", out)
-	}
-	rec, _ := do(t, h, "POST", "/review/retry", fmt.Sprintf(`{"agent":"mingming","record_id":%q,"grade":"五年级上"}`, rid))
-	if rec.Code != http.StatusBadGateway {
-		t.Errorf("下游解题失败应 502, got %d", rec.Code)
 	}
 }
 

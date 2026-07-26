@@ -137,6 +137,9 @@ func (h *handler) createCreativeWork(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, httpStatusForK12Error(err, http.StatusBadRequest), err.Error())
 		return
 	}
+	if h.rt.WorkFeedback != nil {
+		h.rt.WorkFeedback.StartAsync(req.Agent, generationID)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"work_id": workID, "created": created,
 		"initial_feedback_generation_id": generationID,

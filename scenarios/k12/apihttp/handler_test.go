@@ -33,6 +33,12 @@ func (fakeSolveExec) Execute(_ context.Context, args map[string]any) (*skill.Res
 
 type fixedAccumulationMetadataDeriver struct{}
 
+type fixedPDFRenderer struct{}
+
+func (fixedPDFRenderer) Render(context.Context, string, string) ([]byte, string, error) {
+	return []byte("%PDF-1.7\nfixed-http-render"), "application/pdf", nil
+}
+
 func (fixedAccumulationMetadataDeriver) DeriveAccumulationMetadata(
 	context.Context,
 	string,
@@ -48,7 +54,7 @@ func (fixedAccumulationMetadataDeriver) DeriveAccumulationMetadata(
 	}, nil
 }
 
-func newServer(t *testing.T) http.Handler {
+func newServer(t *testing.T, seededProfiles ...k12.ChildProfile) http.Handler {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -58,12 +64,26 @@ func newServer(t *testing.T) http.Handler {
 	if err := migrate.Run(context.Background(), db, migrate.All); err != nil {
 		t.Fatal(err)
 	}
-	db.Exec(`INSERT INTO agents(name) VALUES('mingming')`)
-	k, err := assembly.Wire(
-		db,
-		fakeSolveExec{},
+	options := []assembly.Option{
 		assembly.WithAccumulationMetadataDeriver(fixedAccumulationMetadataDeriver{}),
-	)
+		assembly.WithRenderer(fixedPDFRenderer{}),
+	}
+	if len(seededProfiles) > 0 {
+		profile := seededProfiles[0]
+		metadata, marshalErr := json.Marshal(k12.ApplyProfileToMeta(nil, profile))
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if _, err = db.Exec(`INSERT INTO agents(name, metadata) VALUES('mingming', ?)`, string(metadata)); err != nil {
+			t.Fatal(err)
+		}
+		options = append(options, assembly.WithProfiles(&memProfiles{
+			m: map[string]k12.ChildProfile{"mingming": profile},
+		}))
+	} else if _, err = db.Exec(`INSERT INTO agents(name) VALUES('mingming')`); err != nil {
+		t.Fatal(err)
+	}
+	k, err := assembly.Wire(db, fakeSolveExec{}, options...)
 	if err != nil {
 		t.Fatal(err)
 	}

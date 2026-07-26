@@ -32,18 +32,24 @@ type createImageTaskReq struct {
 }
 
 type publicImageTaskDispatch struct {
-	DispatchID             string                `json:"dispatch_id"`
-	TaskIntent             k12.ImageTaskIntent   `json:"task_intent"`
-	Status                 k12.ImageTaskStatus   `json:"status"`
-	IntentEvidence         []string              `json:"intent_evidence"`
-	IntentConfidence       float64               `json:"intent_confidence"`
-	ConfirmationCandidates []k12.ImageTaskIntent `json:"confirmation_candidates"`
-	Target                 *imageTaskTargetDTO   `json:"target,omitempty"`
-	Progress               imageTaskProgressDTO  `json:"progress"`
-	TargetProjection       any                   `json:"target_projection,omitempty"`
-	Version                int                   `json:"version"`
-	CreatedAt              int64                 `json:"created_at"`
-	UpdatedAt              int64                 `json:"updated_at"`
+	DispatchID                string                `json:"dispatch_id"`
+	TaskIntent                k12.ImageTaskIntent   `json:"task_intent"`
+	Status                    k12.ImageTaskStatus   `json:"status"`
+	Retryable                 bool                  `json:"retryable"`
+	IntentEvidence            []string              `json:"intent_evidence"`
+	IntentConfidence          float64               `json:"intent_confidence"`
+	ConfirmationCandidates    []k12.ImageTaskIntent `json:"confirmation_candidates"`
+	Target                    *imageTaskTargetDTO   `json:"target,omitempty"`
+	Progress                  imageTaskProgressDTO  `json:"progress"`
+	TargetProjection          any                   `json:"target_projection,omitempty"`
+	Version                   int                   `json:"version"`
+	CreatedAt                 int64                 `json:"created_at"`
+	UpdatedAt                 int64                 `json:"updated_at"`
+	AutomaticBudgetSeconds    int                   `json:"automatic_budget_seconds"`
+	AutomaticStartedAt        int64                 `json:"automatic_started_at"`
+	AutomaticDeadlineAt       int64                 `json:"automatic_deadline_at"`
+	AutomaticRemainingSeconds int                   `json:"automatic_remaining_seconds"`
+	OperationDeadlineAt       int64                 `json:"operation_deadline_at,omitempty"`
 }
 
 type imageTaskTargetDTO struct {
@@ -57,11 +63,70 @@ type imageTaskProgressDTO struct {
 }
 
 type imageTaskHomeworkProjectionDTO struct {
-	Kind              string         `json:"kind"`
-	Stage             string         `json:"stage"`
-	ConfirmationState string         `json:"confirmation_state"`
-	AnchorState       string         `json:"anchor_state"`
-	Recognition       map[string]any `json:"recognition,omitempty"`
+	Kind              string                  `json:"kind"`
+	Stage             string                  `json:"stage"`
+	ConfirmationState string                  `json:"confirmation_state"`
+	AnchorState       string                  `json:"anchor_state"`
+	Recognition       map[string]any          `json:"recognition,omitempty"`
+	Progressive       imageTaskProgressiveDTO `json:"progressive"`
+}
+
+type imageTaskProgressiveDTO struct {
+	StructureVersion int                             `json:"structure_version"`
+	SnapshotRevision int                             `json:"snapshot_revision"`
+	ProblemProgress  []imageTaskProblemProgressDTO   `json:"problem_progress"`
+	Coverage         imageTaskProgressiveCoverageDTO `json:"coverage"`
+}
+
+type imageTaskProblemProgressDTO struct {
+	ProblemID          string `json:"problem_id"`
+	Status             string `json:"status"`
+	InputRevision      int    `json:"input_revision"`
+	PublishedRevision  int    `json:"published_revision"`
+	CurrentDisposition string `json:"current_disposition"`
+}
+
+type imageTaskProgressiveCoverageDTO struct {
+	Total              int    `json:"total"`
+	Published          int    `json:"published"`
+	Skipped            int    `json:"skipped"`
+	Awaiting           int    `json:"awaiting"`
+	Failed             int    `json:"failed"`
+	Status             string `json:"status"`
+	ProjectionRevision int    `json:"projection_revision"`
+}
+
+func publicImageTaskProgressive(
+	snapshot usecase.ImageTaskProgressiveSnapshot,
+) imageTaskProgressiveDTO {
+	problems := make([]imageTaskProblemProgressDTO, 0, len(snapshot.ProblemProgress))
+	for _, problem := range snapshot.ProblemProgress {
+		problems = append(problems, imageTaskProblemProgressDTO{
+			ProblemID:          problem.ProblemID,
+			Status:             problem.Status,
+			InputRevision:      problem.InputRevision,
+			PublishedRevision:  problem.PublishedRevision,
+			CurrentDisposition: problem.CurrentDisposition,
+		})
+	}
+	status := snapshot.Coverage.Status
+	if status == "" {
+		status = "incomplete"
+	}
+	return imageTaskProgressiveDTO{
+		StructureVersion: snapshot.StructureVersion,
+		SnapshotRevision: snapshot.SnapshotRevision,
+		ProblemProgress:  problems,
+		Coverage: imageTaskProgressiveCoverageDTO{
+			Total:              snapshot.Coverage.Total,
+			Published:          snapshot.Coverage.Published,
+			Skipped:            snapshot.Coverage.Skipped,
+			Awaiting:           snapshot.Coverage.Awaiting,
+			Failed:             snapshot.Coverage.Failed,
+			Status:             status,
+			ProjectionRevision: snapshot.Coverage.ProjectionRevision,
+		},
+	}
 }
 
 type imageTaskCreativeConflictDTO struct {
@@ -121,6 +186,7 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 	dispatch := view.Dispatch
 	out := publicImageTaskDispatch{
 		DispatchID: dispatch.DispatchID, TaskIntent: dispatch.TaskIntent, Status: dispatch.Status,
+		Retryable:              dispatch.RetrySafe,
 		IntentEvidence:         nonNilStrings(dispatch.IntentEvidence),
 		IntentConfidence:       dispatch.IntentConfidence,
 		ConfirmationCandidates: nonNilIntents(dispatch.ConfirmationCandidates),
@@ -129,6 +195,11 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 		},
 		Version:   dispatch.Version,
 		CreatedAt: dispatch.CreatedAt, UpdatedAt: dispatch.UpdatedAt,
+		AutomaticBudgetSeconds:    dispatch.AutomaticBudgetSeconds,
+		AutomaticStartedAt:        dispatch.AutomaticStartedAt,
+		AutomaticDeadlineAt:       dispatch.AutomaticDeadlineAt,
+		AutomaticRemainingSeconds: dispatch.AutomaticRemainingSeconds,
+		OperationDeadlineAt:       view.ActiveInvocationDeadlineAt,
 	}
 	if dispatch.TargetObjectType != "" && dispatch.TargetObjectID != "" {
 		out.Target = &imageTaskTargetDTO{
@@ -140,6 +211,7 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 		projection := imageTaskHomeworkProjectionDTO{
 			Kind: "homework", Stage: "queued",
 			ConfirmationState: "pending", AnchorState: "pending",
+			Progressive: publicImageTaskProgressive(usecase.ImageTaskProgressiveSnapshot{}),
 		}
 		if view.Homework.Status == k12.HomeworkSubmissionCancelled {
 			projection.Stage = "cancelled"
@@ -153,8 +225,10 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 				questions = append(questions, recognizedQuestionToDTO(question, true))
 			}
 			projection.Stage = publicImageTaskProgressState(view.HomeworkProjection.Stage)
+			out.Retryable = view.HomeworkProjection.Retryable
 			projection.ConfirmationState = view.HomeworkProjection.ConfirmationState
 			projection.AnchorState = view.HomeworkProjection.AnchorState
+			projection.Progressive = publicImageTaskProgressive(view.HomeworkProjection.Progressive)
 			projection.Recognition = map[string]any{
 				"subject": view.HomeworkProjection.Subject, "questions": questions,
 			}
@@ -163,6 +237,7 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 		out.TargetProjection = projection
 	}
 	if view.Creative != nil {
+		out.Retryable = view.Creative.RetrySafe
 		entryKind := view.Creative.EntryKind
 		if entryKind == "" {
 			entryKind = k12.CreativeWorkEntryAuto
@@ -225,6 +300,13 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 			out.Progress.State = publicImageTaskProgressState(view.CreativeFeedback)
 		}
 		out.TargetProjection = projection
+	}
+	if dispatch.Status == k12.ImageTaskStatusFailed {
+		out.Retryable = dispatch.RetrySafe
+		out.Progress.State = "failed"
+		if strings.Contains(dispatch.FailureKind, "outcome_unknown") {
+			out.Progress.State = "recovering"
+		}
 	}
 	return out
 }
@@ -375,6 +457,9 @@ func (h *handler) confirmImageTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
 		return
 	}
+	if req.Creative != nil && req.Creative.Action == usecase.CreativeImageTaskActionCommit {
+		h.rt.ImageTasks.StartAsync(req.Agent, view.Dispatch.DispatchID)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"dispatch": publicImageTask(view)})
 }
 
@@ -453,15 +538,15 @@ func (h *handler) getImageTaskResult(w http.ResponseWriter, r *http.Request) {
 		}
 		if result.CreativeWork != nil {
 			var feedback *k12.WorkFeedback
+			generationID := ""
 			if latest := result.CreativeWork.GenerationState.Latest; latest != nil &&
 				latest.Status == k12.WorkFeedbackSucceeded {
 				feedback = latest.Feedback
-			} else if len(result.CreativeWork.Fields.Versions) > 0 {
-				version := result.CreativeWork.Fields.Versions[len(result.CreativeWork.Fields.Versions)-1]
-				feedback = version.StructuredFeedback
+				generationID = latest.GenerationID
 			}
-			if feedback != nil && feedback.ProjectionMarkdown != "" {
+			if generationID != "" && feedback != nil && feedback.ProjectionMarkdown != "" {
 				payload["feedback"] = map[string]any{
+					"generation_id":       generationID,
 					"structured_feedback": feedback,
 					"projection_markdown": feedback.ProjectionMarkdown,
 				}

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
@@ -402,7 +403,9 @@ func TestCronDeliver_MissingAgent(t *testing.T) {
 }
 
 func TestCronDeliver_MonthlyReportHasContentAfterMistake(t *testing.T) {
-	h := newServer(t)
+	// V41 学情同一快照必须先冻结当前 learner + grade_term；不得把未归属
+	// 的历史记录猜进任一学期。
+	h := newServer(t, k12.ChildProfile{ChildName: "明明", GradeTerm: "五年级上"})
 	// 批改一道错题（fakeSolveExec 判 grade_correct=false → 入库）。
 	body := `{"agent":"mingming","grade":"五年级上","source_session":"s1","problem":"3.8×3","student_answer":"11.6","knowledge_points":["小数乘法"]}`
 	rec, _ := do(t, h, "POST", "/grade", body)
@@ -414,9 +417,9 @@ func TestCronDeliver_MonthlyReportHasContentAfterMistake(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("monthly 状态 %d", code)
 	}
-	// 标题口径（§3.11 + 前端 K12InsightPanel）：「{年级}学习概览」；该实例未建档 → 通用「学习概览」。
-	if !strings.Contains(report, "学习概览") {
-		t.Errorf("入库后报告应有内容且标题为「学习概览」口径, got %q", report)
+	// 标题口径（§3.11 + 前端 K12InsightPanel）严格来自同一份档案快照。
+	if !strings.Contains(report, "五年级上学习概览") {
+		t.Errorf("入库后报告应有内容且标题来自冻结学期, got %q", report)
 	}
 	if strings.Contains(report, "本月学情报告") {
 		t.Errorf("月报标题口径已退役, got %q", report)
@@ -424,36 +427,5 @@ func TestCronDeliver_MonthlyReportHasContentAfterMistake(t *testing.T) {
 	// 错题卷/每日提醒此刻仍空（首次复习到期在 1 天后，尚未 due）。
 	if _, sheet := getText(t, h, "/cron/mistake-sheet?agent=mingming"); strings.TrimSpace(sheet) != "" {
 		t.Errorf("未到期错题不应出现在错题卷, got %q", sheet)
-	}
-}
-
-func TestReviewRetry_GeneratesVariant(t *testing.T) {
-	h := newServer(t)
-	// 先批改错一道题入库，拿到 record_id。
-	body := `{"agent":"mingming","grade":"五年级上","source_session":"s1","problem":"3.8×3","student_answer":"11.6","knowledge_points":["小数乘法"]}`
-	rec, out := do(t, h, "POST", "/grade", body)
-	if rec.Code != 200 {
-		t.Fatalf("grade 状态 %d", rec.Code)
-	}
-	rid, _ := out["record_id"].(string)
-	if rid == "" {
-		t.Fatal("应有 record_id")
-	}
-	// 再练一道：过 solve 验算链返回相似题解。
-	rec2, out2 := do(t, h, "POST", "/review/retry", `{"agent":"mingming","record_id":"`+rid+`","grade":"五年级上"}`)
-	if rec2.Code != 200 {
-		t.Fatalf("retry 状态 %d, body=%v", rec2.Code, out2)
-	}
-	if s, _ := out2["solution"].(string); s == "" {
-		t.Errorf("再练应返回相似题解, got %v", out2)
-	}
-}
-
-func TestReviewRetry_RejectsForeignRecord(t *testing.T) {
-	h := newServer(t)
-	rec, _ := do(t, h, "POST", "/review/retry", `{"agent":"mingming","record_id":"nonexistent"}`)
-	// BUG-2 修复后：记录不存在按 404 分流（不再泛化为 400）。
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("不存在的错题应 404, got %d", rec.Code)
 	}
 }

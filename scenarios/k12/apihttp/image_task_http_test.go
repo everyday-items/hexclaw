@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,7 +40,9 @@ func (s *imageTaskHTTPWritingOCRStub) RecognizeImageTaskWriting(
 	return s.result, nil
 }
 
-type imageTaskHTTPFeedbackSolver struct{}
+type imageTaskHTTPFeedbackSolver struct {
+	calls *atomic.Int32
+}
 
 func (imageTaskHTTPFeedbackSolver) Solve(
 	context.Context, string, string, string,
@@ -47,9 +50,10 @@ func (imageTaskHTTPFeedbackSolver) Solve(
 	return usecase.SolveResult{}, nil
 }
 
-func (imageTaskHTTPFeedbackSolver) GenerateWorkFeedback(
+func (s *imageTaskHTTPFeedbackSolver) GenerateWorkFeedback(
 	context.Context, usecase.WorkFeedbackRequest,
 ) (usecase.WorkFeedbackOutput, error) {
+	s.calls.Add(1)
 	return usecase.WorkFeedbackOutput{
 		Feedback:   "画面中的人物和小猫位置清楚；建议补充地面上的可见阴影细节。",
 		SkillStamp: "art-feedback@1.0.0/test",
@@ -76,6 +80,8 @@ type imageTaskHTTPFixture struct {
 	ocr         *imageTaskHTTPWritingOCRStub
 	coordinator *usecase.ImageTaskCoordinator
 	assetID     string
+	feedbackCalls *atomic.Int32
+	db            *sql.DB
 }
 
 type imageTaskDispatchContract struct {
@@ -128,11 +134,29 @@ type imageTaskResultContract struct {
 			} `json:"intake"`
 			Work     *imageTaskCreativeWorkContract `json:"work,omitempty"`
 			Feedback *struct {
+				GenerationID      string           `json:"generation_id"`
 				StructuredFeedback k12.WorkFeedback `json:"structured_feedback"`
 				ProjectionMarkdown string           `json:"projection_markdown"`
 			} `json:"feedback,omitempty"`
 		} `json:"payload"`
 	} `json:"result"`
+}
+
+type creativeWorkFeedbackHTTPContract struct {
+	FeedbackID         string `json:"feedback_id"`
+	ProjectionMarkdown string `json:"projection_markdown"`
+}
+
+type creativeWorkGenerationHTTPContract struct {
+	GenerationID string                            `json:"generation_id"`
+	Status       string                            `json:"status"`
+	Feedback     *creativeWorkFeedbackHTTPContract `json:"feedback,omitempty"`
+}
+
+type creativeWorkHTTPContract struct {
+	WorkID          string                              `json:"work_id"`
+	InitialFeedback creativeWorkGenerationHTTPContract  `json:"initial_feedback"`
+	LatestFeedback  *creativeWorkGenerationHTTPContract `json:"latest_feedback,omitempty"`
 }
 
 func newImageTaskHTTPFixture(t *testing.T) imageTaskHTTPFixture {
@@ -178,8 +202,9 @@ func newImageTaskHTTPFixture(t *testing.T) imageTaskHTTPFixture {
 			Reasons: []string{"illegible"},
 		}},
 	}}
+	feedbackCalls := &atomic.Int32{}
 	feedbackDeps := wired.Deps
-	feedbackDeps.Solver = imageTaskHTTPFeedbackSolver{}
+	feedbackDeps.Solver = &imageTaskHTTPFeedbackSolver{calls: feedbackCalls}
 	feedbackDeps.WorkFeedbackRoute = func(
 		context.Context, string,
 	) (k12.ImageTaskRouteSnapshot, error) {
@@ -223,6 +248,7 @@ func newImageTaskHTTPFixture(t *testing.T) imageTaskHTTPFixture {
 			ImageTasks: coordinator,
 		}),
 		classifier: classifier, ocr: ocr, coordinator: coordinator, assetID: assetID,
+		feedbackCalls: feedbackCalls, db: db,
 	}
 }
 
@@ -362,6 +388,7 @@ func TestImageTaskPublicSurfaceExactSetAndNoInternalLeak(t *testing.T) {
 		result.Result.Payload.Work == nil ||
 		result.Result.Payload.Work.DisplayName != "美术作品" ||
 		result.Result.Payload.Feedback == nil ||
+		result.Result.Payload.Feedback.GenerationID == "" ||
 		result.Result.Payload.Feedback.ProjectionMarkdown == "" ||
 		result.Result.Payload.Feedback.StructuredFeedback.ProjectionMarkdown !=
 			result.Result.Payload.Feedback.ProjectionMarkdown {
@@ -378,12 +405,44 @@ func TestImageTaskPublicSurfaceExactSetAndNoInternalLeak(t *testing.T) {
 	rawPayload := rawProjection["payload"].(map[string]any)
 	assertJSONExactKeys(t, rawPayload, "feedback", "intake", "work")
 	rawFeedback := rawPayload["feedback"].(map[string]any)
-	assertJSONExactKeys(t, rawFeedback, "projection_markdown", "structured_feedback")
+	assertJSONExactKeys(t, rawFeedback,
+		"generation_id", "projection_markdown", "structured_feedback")
 	rawStructured := rawFeedback["structured_feedback"].(map[string]any)
 	assertJSONExactKeys(t, rawStructured,
 		"evidence_refs", "feedback_id", "feedback_type",
 		"limitations", "observations", "projection_markdown", "source_snapshot",
 		"suggestions", "version_id")
+
+	workID := result.Result.Payload.Work.WorkID
+	rec, _ = do(t, fixture.handler, http.MethodGet,
+		"/creative-works/"+workID+"?agent=mingming", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get promoted creative work: %d %s", rec.Code, rec.Body.String())
+	}
+	var work creativeWorkHTTPContract
+	if err := json.Unmarshal(rec.Body.Bytes(), &work); err != nil {
+		t.Fatalf("decode creative work: %v", err)
+	}
+	if work.WorkID != workID ||
+		work.LatestFeedback == nil ||
+		work.LatestFeedback.Feedback == nil ||
+		result.Result.Payload.Feedback.GenerationID != work.InitialFeedback.GenerationID ||
+		result.Result.Payload.Feedback.GenerationID != work.LatestFeedback.GenerationID ||
+		result.Result.Payload.Feedback.StructuredFeedback.FeedbackID !=
+			work.LatestFeedback.Feedback.FeedbackID ||
+		result.Result.Payload.Feedback.ProjectionMarkdown !=
+			work.LatestFeedback.Feedback.ProjectionMarkdown {
+		t.Fatalf("image-task/work feedback identity drift: result=%#v work=%#v", result, work)
+	}
+	var generationCount int
+	if err := fixture.db.QueryRow(`SELECT count(*) FROM k12_work_feedback_generations
+		WHERE work_id=?`, workID).Scan(&generationCount); err != nil {
+		t.Fatal(err)
+	}
+	if generationCount != 1 || fixture.feedbackCalls.Load() != 1 {
+		t.Fatalf("feedback cardinality generations=%d provider_calls=%d want 1/1",
+			generationCount, fixture.feedbackCalls.Load())
+	}
 
 	for _, path := range []string{
 		"/grading-jobs", "/grading-jobs/internal-id", "/grading-jobs/internal-id/result",

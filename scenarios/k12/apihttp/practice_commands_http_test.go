@@ -21,7 +21,7 @@ import (
 
 type practiceCommandSolver struct{ n int }
 
-func (s *practiceCommandSolver) GenerateSimilar(context.Context, string, string, string) (usecase.SolveResult, error) {
+func (s *practiceCommandSolver) GeneratePracticeVariant(context.Context, string, string, string) (usecase.SolveResult, error) {
 	s.n++
 	return usecase.SolveResult{Solution: fmt.Sprintf("## 问题\n变式 %d\n## 解答\n过程\n## 答案\n%d", s.n, s.n)}, nil
 }
@@ -53,7 +53,8 @@ func newPracticeCommandServer(t *testing.T) (http.Handler, usecase.Deps) {
 	}
 	d := usecase.Deps{
 		Records: k12storage.NewStore(db, reg.Records), Constraint: cur,
-		Solver: &practiceCommandSolver{}, Now: func() int64 { return 1000 },
+		Solver: &practiceCommandSolver{}, PracticeVariant: &practiceCommandSolver{},
+		Now: func() int64 { return 1000 },
 	}
 	return apihttp.NewHandler(apihttp.Runtime{Views: reg.Views, Records: d.Records, Deps: d}), d
 }

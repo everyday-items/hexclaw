@@ -75,9 +75,16 @@
 **`POST /api/k12/mark-mastered`** — 「他会了」（乐观锁）
 - 请求：`{"record_id","version"}` → 响应：`{"ok":true}`；**version 陈旧 → 409**
 
-**`POST /api/k12/review/retry`** — 「再练一道」（按错题出同知识点相似题，过 solve 验算链）
-- 请求：`{"agent","record_id","grade"}`（grade 可空，后端可按档案解析）
-- 响应：`{"solution","verdict","badge"}`
+**`POST /api/k12/mistakes/{record_id}/practice-generation`** — 一键加入练习集并异步出题
+- 请求：`{"agent","idempotency_key","grade?","textbook?","difficulty?","provider?","model?","source_session?"}`
+- 接受后返回持久状态：`pending`；同一来源同时只允许一个活动任务。
+- 成功状态：`joined`，并返回 `practice_set_id`、`practice_item_id` 与只读 `item`。
+- 失败状态：`failed`，前端只显示“出题失败，重试”。
+
+**`GET /api/k12/mistakes/{record_id}/practice-generation?agent=X`** — 查询持久出题状态
+
+**`POST /api/k12/mistakes/{record_id}/practice-generation/retry`** — 仅重试已明确失败的同一任务
+- 请求：`{"agent"}`；复用原题、占位项和冻结模型路由，不创建第二份练习题。
 
 ### 学情 / 辅导要点
 

@@ -5,7 +5,7 @@ import (
 )
 
 // TestE2E_ParentSession 模拟真实家长会话完整链路（真 HTTP 请求）：
-// 批改答错 → 错题进本 → 拿 record_id+version → 「他会了」→ 状态变 mastered。
+// 批改答错 → 错题进本 → 拿 record_id+version → 「他会了」→ 记录家长确认并安排抽查。
 // 这是"真实用户请求"级别的端到端验证（solve/grade 在 Execute 边界用 fake，其余全真）。
 func TestE2E_ParentSession(t *testing.T) {
 	h := newServer(t)
@@ -43,11 +43,26 @@ func TestE2E_ParentSession(t *testing.T) {
 		t.Fatalf("mark-mastered 应成功: code=%d %v", rec.Code, out)
 	}
 
-	// 4) 再看错题本 → 状态已 mastered（掌握链路闭环）
-	_, out = do(t, h, "GET", "/mistakes?agent=mingming&status=mastered", "")
+	// 4) 再看错题本 → 学习状态不冒充系统掌握证据，同时可见家长确认与抽查事实。
+	_, out = do(t, h, "GET", "/mistakes?agent=mingming", "")
 	items, _ = out["items"].([]any)
 	if len(items) != 1 {
-		t.Fatalf("应有 1 条 mastered, got %v", out)
+		t.Fatalf("确认后错题仍应保留, got %v", out)
+	}
+	confirmed := items[0].(map[string]any)
+	if confirmed["status"] != "new" {
+		t.Fatalf("家长确认不得直接写 mastered, got %v", confirmed["status"])
+	}
+	if confirmed["parent_confirmed_at"].(float64) <= 0 {
+		t.Fatalf("应记录 parent_confirmed_at, got %v", confirmed)
+	}
+	if confirmed["spot_check_state"] != "scheduled" {
+		t.Fatalf("应安排一次抽查, got %v", confirmed["spot_check_state"])
+	}
+	_, out = do(t, h, "GET", "/mistakes?agent=mingming&status=mastered", "")
+	items, _ = out["items"].([]any)
+	if len(items) != 0 {
+		t.Fatalf("没有复做证据时不得进入 mastered, got %v", out)
 	}
 
 	// 5) 陈旧 version 再点 → 乐观锁冲突 409（防并发重复推进）
