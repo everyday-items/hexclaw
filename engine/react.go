@@ -404,6 +404,7 @@ type ReActEngine struct {
 	cfg          *config.Config
 	router       *llmrouter.Selector
 	agentRouter  *agentrouter.Dispatcher // 多 Agent 路由器（可为 nil）
+	agentSystemPromptPolicy AgentSystemPromptPolicy
 	sessions     *session.Manager
 	skills       *skill.DefaultRegistry
 	store        storage.Store
@@ -1013,11 +1014,14 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 		}, nil
 	}
 
-	cacheInput := buildLLMCacheInput(msg)
 	selection, err := e.resolveLLMSelection(ctx, msg)
 	if err != nil {
 		return nil, fmt.Errorf("llm 路由失败: %w", err)
 	}
+	if err := e.prepareAgentSystemPromptPolicy(ctx, msg); err != nil {
+		return nil, err
+	}
+	cacheInput := buildLLMCacheInput(msg)
 
 	// 3. Semantic cache lookup. System dispatches and explicit code execution
 	// requests must re-execute every time; the guard runs BEFORE cache.Get so
@@ -1840,11 +1844,14 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		return singleChunkWithTools(result.Content, withReplyPersistError(withAssistantMessageID(result.Metadata, assistantMessageID), msg), tc), nil
 	}
 
-	cacheInput := buildLLMCacheInput(msg)
 	selection, err := e.resolveLLMSelection(ctx, msg)
 	if err != nil {
 		return nil, fmt.Errorf("llm 路由失败: %w", err)
 	}
+	if err := e.prepareAgentSystemPromptPolicy(ctx, msg); err != nil {
+		return nil, err
+	}
+	cacheInput := buildLLMCacheInput(msg)
 	if shouldRejectImageAttachmentsForProvider(selection.provider, selection.providerName, selection.modelName, msg.Attachments) {
 		return nil, fmt.Errorf("当前模型 %s 不支持图片附件，请切换到视觉模型后重试", selection.modelName)
 	}
@@ -3350,6 +3357,7 @@ func (e *ReActEngine) buildStreamMessages(ctx context.Context, roleName string, 
 			sysContent = prefix + "\n" + sysContent
 		}
 	}
+	sysContent = appendPreparedAgentSystemPromptDirective(sysContent, metadata)
 	messages = append(messages, hexagon.Message{
 		Role:    "system",
 		Content: sysContent,
@@ -3896,6 +3904,7 @@ func buildLLMCacheInput(msg *adapter.Message) string {
 		{key: "agent_prompt", value: msg.Metadata["agent_prompt"]},
 		{key: "routed_agent", value: msg.Metadata["routed_agent"]},
 		{key: "agent_model", value: msg.Metadata["agent_model"]},
+		{key: "agent_system_prompt_policy", value: msg.Metadata[metadataAgentSystemPromptPolicyKey]},
 	} {
 		if item.value == "" {
 			continue

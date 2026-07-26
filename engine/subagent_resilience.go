@@ -48,6 +48,10 @@ func isTransientErr(err error) bool {
 	if errors.Is(err, errSubAgentEmptyOutput) {
 		return true
 	}
+	var retryPolicy interface{ SubAgentRetryable() bool }
+	if errors.As(err, &retryPolicy) && !retryPolicy.SubAgentRetryable() {
+		return false
+	}
 	if err == context.Canceled {
 		return false
 	}
@@ -82,7 +86,7 @@ func runSubAgentWithRetry(ctx context.Context, execFn SubAgentExecFunc, spec Sub
 	// 尝试次数 = 1（首发）+ len(backoff)（重试）。
 	for attempt := 0; attempt <= len(subAgentRetryBackoff); attempt++ {
 		tryCtx, cancel := context.WithTimeout(ctx, perTry)
-		res, err := execFn(tryCtx, spec)
+		res, err := executeSubAgentCall(tryCtx, execFn, spec)
 		cancel()
 		if err == nil && strings.TrimSpace(res.Output) == "" {
 			err = errSubAgentEmptyOutput

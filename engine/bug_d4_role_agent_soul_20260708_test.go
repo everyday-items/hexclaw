@@ -34,7 +34,7 @@ func TestBugD4_RoleNamedRegisteredAgentUsesSystemPrompt(t *testing.T) {
 	const tutorName = "k12-tutor-KKE5v8zQ"
 	if err := dispatcher.Register(agentrouter.AgentConfig{
 		Name:         tutorName,
-		SystemPrompt: "你是小明的五年级上辅导老师，不是通用助手小蟹。被问身份时明确回答你是小明的辅导老师。",
+		SystemPrompt: "你是小明的五年级上辅导助手，不是通用助手小蟹。被问身份时明确回答你是小明的辅导助手。",
 	}); err != nil {
 		t.Fatalf("注册 tutor agent 失败: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestBugD4_RoleNamedRegisteredAgentUsesSystemPrompt(t *testing.T) {
 	if len(msgs) == 0 || msgs[0].Role != "system" {
 		t.Fatalf("首条应为 system 消息，实际 %+v", msgs)
 	}
-	if !strings.Contains(msgs[0].Content, "你是小明的辅导老师") {
+	if !strings.Contains(msgs[0].Content, "你是小明的辅导助手") {
 		t.Fatalf("pin 注册 agent 时必须应用其 system_prompt 人设（防回落小蟹），实际 sysContent=%q", msgs[0].Content)
 	}
 	// 不得回落默认小蟹 SOUL——查其独有特征句（tutor 人设里不会有），而非查"小蟹"二字

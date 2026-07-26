@@ -39,6 +39,8 @@ func NewSolveSkill(execFn SubAgentExecFunc, reg *SubAgentRegistry) *SolveSkill {
 	return &SolveSkill{executeFunc: execFn, registry: reg}
 }
 
+func (*SolveSkill) SupportsSubAgentCallInterceptor() bool { return true }
+
 func (o *SolveSkill) Name() string { return "solve" }
 func (o *SolveSkill) Description() string {
 	return "Solve a homework/exam problem and return a step-by-step solution whose final answer has been independently verified by executing code."

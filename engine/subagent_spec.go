@@ -30,6 +30,52 @@ type SubAgentResult struct {
 // SubAgentExecFunc 执行一个子 Agent spec。由 cmd/hexclaw 注入（内部经 eng.Process 跑子任务）。
 type SubAgentExecFunc func(ctx context.Context, spec SubAgentSpec) (SubAgentResult, error)
 
+// SubAgentCallInterceptor observes exactly one physical SubAgentExecFunc call.
+// Durable scenario adapters use it to establish before-send ledgers without
+// coupling the engine to scenario storage.
+type SubAgentCallInterceptor interface {
+	ExecuteSubAgentCall(
+		context.Context,
+		SubAgentSpec,
+		SubAgentExecFunc,
+	) (SubAgentResult, error)
+}
+
+type SubAgentCallInterceptorFunc func(
+	context.Context,
+	SubAgentSpec,
+	SubAgentExecFunc,
+) (SubAgentResult, error)
+
+func (f SubAgentCallInterceptorFunc) ExecuteSubAgentCall(
+	ctx context.Context,
+	spec SubAgentSpec,
+	next SubAgentExecFunc,
+) (SubAgentResult, error) {
+	return f(ctx, spec, next)
+}
+
+type subAgentCallInterceptorContextKey struct{}
+
+func WithSubAgentCallInterceptor(ctx context.Context, interceptor SubAgentCallInterceptor) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, subAgentCallInterceptorContextKey{}, interceptor)
+}
+
+func executeSubAgentCall(
+	ctx context.Context,
+	execFn SubAgentExecFunc,
+	spec SubAgentSpec,
+) (SubAgentResult, error) {
+	if interceptor, ok := ctx.Value(subAgentCallInterceptorContextKey{}).(SubAgentCallInterceptor); ok &&
+		interceptor != nil {
+		return interceptor.ExecuteSubAgentCall(ctx, spec, execFn)
+	}
+	return execFn(ctx, spec)
+}
+
 // ── 当前运行 id 的 ctx 透传（构建注册表派生树：子的 ParentID = 当前 run id）──
 
 type ctxKeyCurrentRunIDType struct{}
