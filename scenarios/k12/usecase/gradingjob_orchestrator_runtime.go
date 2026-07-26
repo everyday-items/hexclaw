@@ -521,6 +521,44 @@ func (o *GradingOrchestrator) RetryPhotoGradingJob(ctx context.Context, jobID st
 	return v, true, nil
 }
 
+func (o *GradingOrchestrator) CanRetryPhotoGradingWithParentAutomaticWindow(
+	ctx context.Context,
+	jobID string,
+) (bool, error) {
+	run, err := o.ensureRun(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	v, err := o.deps.GetGradingJob(ctx, run.agentName, jobID)
+	if err != nil {
+		return false, err
+	}
+	return gradingInteractiveDeadlineRetryEligible(v), nil
+}
+
+func (o *GradingOrchestrator) RetryPhotoGradingJobWithParentAutomaticWindow(
+	ctx context.Context,
+	jobID, parentAutomaticAttemptID string,
+	parentAutomaticDeadlineAt int64,
+) (GradingJobView, bool, error) {
+	run, err := o.ensureRun(ctx, jobID)
+	if err != nil {
+		return GradingJobView{}, false, nil
+	}
+	l := o.jobLock(jobID)
+	l.Lock()
+	v, err := o.deps.RetryGradingJobWithParentAutomaticWindow(
+		ctx, run.agentName, jobID,
+		parentAutomaticAttemptID, parentAutomaticDeadlineAt,
+	)
+	l.Unlock()
+	if err != nil {
+		return GradingJobView{}, true, err
+	}
+	o.StartAsync(jobID)
+	return v, true, nil
+}
+
 // CancelPhotoGradingJob persists the public cancellation first, then interrupts
 // every provider call currently owned by the Job. It deliberately does not take
 // jobLock: cancellation must remain responsive while a provider call is in flight.
@@ -636,6 +674,8 @@ func (o *GradingOrchestrator) typedRecognizedQuestions(ctx context.Context, jobI
 // 重建 run 并按阶段处置——awaiting_confirmation（锚点已回位）保持等待；failed_retryable
 // 且可重试回 queued 重新入列；其余自动阶段直接异步续跑（RunGradingJob 从当前 stage 起，
 // 已固化检查点的阶段回放产物，不重复调模型）。恢复不产生重复 Submission（同 Job 续跑）。
+const gradingFailureInteractiveDeadlineExceeded = "interactive_deadline_exceeded"
+
 func (o *GradingOrchestrator) RecoverGradingJobs(ctx context.Context, agents []string) (int, error) {
 	trackedCtx, finish, ok := o.beginTrackedContext(ctx)
 	if !ok {
@@ -669,7 +709,7 @@ func (o *GradingOrchestrator) RecoverGradingJobs(ctx context.Context, agents []s
 				// 真实风险继续等待家长；ImageTask 清晰事实还会补跑自动冻结。锚点未回位
 				// 时同一次续跑也会恢复独立锚点分支。
 				if v.Fields.AnchorState == k12.GradingAnchorPending ||
-					(v.Fields.SourceKind == "image_task" &&
+					(automaticPhotoConfirmationSource(v.Fields.SourceKind) &&
 						v.Fields.ConfirmationState == k12.GradingConfirmationPending) {
 					o.StartAsync(jobID)
 				}
@@ -688,7 +728,8 @@ func (o *GradingOrchestrator) RecoverGradingJobs(ctx context.Context, agents []s
 					o.StartAsync(jobID)
 				}
 			case k12.GradingStageFailedRetryable:
-				if !v.Fields.Retryable {
+				if !v.Fields.Retryable ||
+					v.Fields.FailureKind == gradingFailureInteractiveDeadlineExceeded {
 					continue // 不可重试残留（正常应已收敛 failed_terminal）：留人工处置
 				}
 				l := o.jobLock(jobID)
@@ -855,13 +896,14 @@ func (o *GradingOrchestrator) durableAssessmentResult(
 	job GradingJobView,
 ) (*PhotoGradeResult, bool, error) {
 	if run.result != nil {
-		if job.Fields.BudgetSnapshot.IsFrozen() {
-			receipts, err := o.deps.Records.ListGradingAssessmentItems(
-				ctx, run.agentName, job.Record.RecordID,
-			)
-			if err != nil || validateGradingAssessmentExactSet(*run.result, receipts) != nil {
-				return nil, false, nil
-			}
+		receipts, err := o.deps.Records.ListGradingAssessmentItems(
+			ctx, run.agentName, job.Record.RecordID,
+		)
+		// Process-local run.result is not a durable assessment boundary.
+		// Recovery may advance only from the exact canonical receipt set;
+		// otherwise outcome_unknown remains parked and is never resent.
+		if err != nil || validateGradingAssessmentExactSet(*run.result, receipts) != nil {
+			return nil, false, nil
 		}
 		result := *run.result
 		return &result, true, nil
@@ -1014,6 +1056,40 @@ func applyAndValidateGradingConfirmation(run *gradingRun, in ConfirmPhotoGrading
 		}
 	}
 	return nil
+}
+
+// applyProgressiveGradingConfirmation freezes every syntactically valid item
+// independently. An item that still lacks trustworthy source evidence remains
+// gated, while its clear siblings may continue without confirming the page.
+func applyProgressiveGradingConfirmation(run *gradingRun, in ConfirmPhotoGradingInput) (bool, error) {
+	confirmed, err := applyGradingCorrections(run, in)
+	if err != nil {
+		return false, err
+	}
+	awaitingSource := false
+	for i := range run.questions {
+		q := NormalizeRecognizedQuestion(run.questions[i])
+		if !CanonicalMarkdownValid(q.CanonicalMarkdown) ||
+			(q.AnswerState == AnswerStatePresent && !CanonicalMarkdownValid(q.AnswerCanonicalMarkdown)) {
+			return false, fmt.Errorf(
+				"%w: problem %s canonical Markdown/LaTeX 无法解析，请先逐题修正",
+				ErrInvalidInput, q.ProblemID,
+			)
+		}
+		if q.ConfirmationRequired && !confirmed[q.ProblemID] {
+			awaitingSource = true
+		}
+		q.ConfirmedVersion++
+		run.questions[i] = q
+	}
+	run.questions = FreezeRecognizedQuestionInputDigests(run.questions, run.req.Grade)
+	if run.anchored != nil {
+		run.anchored = mergeAnchorGeometry(run.questions, run.anchored)
+		for i := range run.anchored {
+			run.anchored[i].ConfirmedVersion = run.questions[i].ConfirmedVersion
+		}
+	}
+	return awaitingSource, nil
 }
 
 func joinOCRRiskReasons(reasons []OCRRiskReason) string {

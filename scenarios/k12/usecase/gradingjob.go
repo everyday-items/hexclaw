@@ -28,11 +28,13 @@ type GradingJobView struct {
 // CreateGradingJobInput 创建输入。SourceKind/SourceKey 映射统一幂等键（§4.10：
 // 桌面 request_id / HTTP idempotency_key / IM message_id / 工作流 execution_id）。
 type CreateGradingJobInput struct {
-	SubmissionID     string
-	SourceKind       string
-	SourceKey        string
-	ConfirmedVersion int
-	ModelSnapshot    k12.GradingModelSnapshot
+	SubmissionID              string
+	SourceKind                string
+	SourceKey                 string
+	ConfirmedVersion          int
+	ModelSnapshot             k12.GradingModelSnapshot
+	ParentAutomaticAttemptID  string
+	ParentAutomaticDeadlineAt int64
 	// BudgetSnapshot is reserved for trusted internal callers/tests. When zero,
 	// CreateGradingJob freezes Deps.GradingBudgetSnapshot. API payloads do not
 	// expose this field, so a client cannot select a release policy per request.
@@ -77,6 +79,18 @@ func (d Deps) CreateGradingJob(ctx context.Context, agentName, sourceSession str
 	if in.ConfirmedVersion < 0 {
 		return GradingJobView{}, false, fmt.Errorf("%w: confirmed_version 不可为负", ErrInvalidInput)
 	}
+	in.ParentAutomaticAttemptID = strings.TrimSpace(in.ParentAutomaticAttemptID)
+	if in.ParentAutomaticAttemptID == "" {
+		if in.ParentAutomaticDeadlineAt != 0 {
+			return GradingJobView{}, false, fmt.Errorf(
+				"%w: parent automatic deadline requires attempt identity", ErrInvalidInput,
+			)
+		}
+	} else if in.ParentAutomaticDeadlineAt <= d.now() {
+		return GradingJobView{}, false, fmt.Errorf(
+			"%w: parent automatic deadline must be in the future", ErrInvalidInput,
+		)
+	}
 	in.ModelSnapshot = k12.NormalizeGradingModelSnapshot(in.ModelSnapshot)
 	budgetSnapshot := in.BudgetSnapshot
 	if !budgetSnapshot.IsFrozen() {
@@ -91,20 +105,23 @@ func (d Deps) CreateGradingJob(ctx context.Context, agentName, sourceSession str
 	if budgetSnapshot.IsFrozen() && !in.MaterializesProblemAttempts {
 		return GradingJobView{}, false, fmt.Errorf("%w: frozen grading jobs require a typed Problem/Attempt materialization path", ErrInvalidInput)
 	}
-	queuedBudget, ok := gradingBudgetSeconds(budgetSnapshot, k12.GradingStageQueued, 0)
-	if !ok {
-		return GradingJobView{}, false, fmt.Errorf("%w: missing queued grading budget", ErrInvalidInput)
-	}
 	f := k12.GradingJobFields{
-		SubmissionID:      in.SubmissionID,
-		SourceKind:        in.SourceKind,
-		IdempotencyKey:    k12.BuildGradingIdempotencyKey(in.SourceKind, in.SourceKey, in.ConfirmedVersion),
-		ConfirmedVersion:  in.ConfirmedVersion,
-		ConfirmationState: k12.GradingConfirmationPending,
-		AnchorState:       k12.GradingAnchorPending,
-		Deadline:          d.now() + queuedBudget,
-		ModelSnapshot:     in.ModelSnapshot,
-		BudgetSnapshot:    budgetSnapshot,
+		SubmissionID:              in.SubmissionID,
+		SourceKind:                in.SourceKind,
+		IdempotencyKey:            k12.BuildGradingIdempotencyKey(in.SourceKind, in.SourceKey, in.ConfirmedVersion),
+		ConfirmedVersion:          in.ConfirmedVersion,
+		ConfirmationState:         k12.GradingConfirmationPending,
+		AnchorState:               k12.GradingAnchorPending,
+		ParentAutomaticAttemptID:  in.ParentAutomaticAttemptID,
+		ParentAutomaticDeadlineAt: in.ParentAutomaticDeadlineAt,
+		ModelSnapshot:             in.ModelSnapshot,
+		BudgetSnapshot:            budgetSnapshot,
+	}
+	if in.ParentAutomaticAttemptID != "" {
+		f.ParentAutomaticRemainingSeconds = in.ParentAutomaticDeadlineAt - d.now()
+	}
+	if err := d.setGradingDeadline(ctx, agentName, &f, k12.GradingStageQueued); err != nil {
+		return GradingJobView{}, false, err
 	}
 	return d.putGradingJob(ctx, agentName, sourceSession, f)
 }
@@ -335,8 +352,8 @@ func (d Deps) advanceGradingFailed(ctx context.Context, v GradingJobView, in Adv
 		return d.saveGradingJob(ctx, v, k12.GradingStageProjecting)
 	}
 	switch stage {
-	case k12.GradingStageNormalizing, k12.GradingStageRecognizing, k12.GradingStageLocating,
-		k12.GradingStageAssessing, k12.GradingStageProjecting:
+	case k12.GradingStageQueued, k12.GradingStageNormalizing, k12.GradingStageRecognizing,
+		k12.GradingStageLocating, k12.GradingStageAssessing, k12.GradingStageProjecting:
 	default:
 		return GradingJobView{}, errGradingStageConflict("阶段 %s 无失败转移", stage)
 	}
@@ -401,6 +418,7 @@ func (d Deps) ConfirmGradingJob(ctx context.Context, agentName, recordID string,
 		ArtifactDigest: gradingCorrectionsDigest(corrections),
 		RecordedAt:     d.now(),
 	})
+	resumeParentAutomaticWindow(&v.Fields, d.now())
 	next := v.Record.Status
 	if gradingJoinReady(v.Fields) {
 		next = k12.GradingStageAssessing
@@ -504,11 +522,47 @@ func (d Deps) RetryGradingJob(ctx context.Context, agentName, recordID string) (
 	if !v.Fields.Retryable {
 		return GradingJobView{}, errGradingStageConflict("该失败不可安全重试（failure_kind=%s）", v.Fields.FailureKind)
 	}
-	queuedBudget, ok := gradingBudgetSeconds(v.Fields.BudgetSnapshot, k12.GradingStageQueued, 0)
-	if !ok {
-		return GradingJobView{}, fmt.Errorf("%w: missing queued grading budget", ErrInvalidInput)
+	if err := d.setGradingDeadline(ctx, agentName, &v.Fields, k12.GradingStageQueued); err != nil {
+		return GradingJobView{}, err
 	}
-	v.Fields.Deadline = d.now() + queuedBudget
+	return d.saveGradingJob(ctx, v, k12.GradingStageQueued)
+}
+
+func gradingInteractiveDeadlineRetryEligible(v GradingJobView) bool {
+	return v.Record.Status == k12.GradingStageFailedRetryable &&
+		v.Fields.Retryable &&
+		v.Fields.FailureKind == gradingFailureInteractiveDeadlineExceeded
+}
+
+func (d Deps) RetryGradingJobWithParentAutomaticWindow(
+	ctx context.Context,
+	agentName, recordID, parentAutomaticAttemptID string,
+	parentAutomaticDeadlineAt int64,
+) (GradingJobView, error) {
+	v, err := d.GetGradingJob(ctx, agentName, recordID)
+	if err != nil {
+		return GradingJobView{}, err
+	}
+	if !gradingInteractiveDeadlineRetryEligible(v) {
+		return GradingJobView{}, errGradingStageConflict(
+			"阶段 %s/failure_kind=%s 不可刷新 parent automatic window",
+			v.Record.Status, v.Fields.FailureKind,
+		)
+	}
+	parentAutomaticAttemptID = strings.TrimSpace(parentAutomaticAttemptID)
+	now := d.now()
+	if parentAutomaticAttemptID == "" || parentAutomaticAttemptID == v.Fields.ParentAutomaticAttemptID ||
+		parentAutomaticDeadlineAt <= now {
+		return GradingJobView{}, fmt.Errorf(
+			"%w: fresh parent automatic attempt identity/deadline required", ErrInvalidInput,
+		)
+	}
+	v.Fields.ParentAutomaticAttemptID = parentAutomaticAttemptID
+	v.Fields.ParentAutomaticDeadlineAt = parentAutomaticDeadlineAt
+	v.Fields.ParentAutomaticRemainingSeconds = parentAutomaticDeadlineAt - now
+	if err := d.setGradingDeadline(ctx, agentName, &v.Fields, k12.GradingStageQueued); err != nil {
+		return GradingJobView{}, err
+	}
 	return d.saveGradingJob(ctx, v, k12.GradingStageQueued)
 }
 
@@ -646,6 +700,12 @@ func (d Deps) ReconcileGradingInvocationSucceeded(
 // Assessing selects its measured bucket from the durable Attempt count; legacy
 // policy_version=0 keeps the historical compatibility budgets.
 func (d Deps) setGradingDeadline(ctx context.Context, agentName string, f *k12.GradingJobFields, next string) error {
+	now := d.now()
+	if next == k12.GradingStageAwaitingConfirmation {
+		pauseParentAutomaticWindow(f, now)
+		f.Deadline = 0
+		return nil
+	}
 	problemCount := 0
 	if f.BudgetSnapshot.IsFrozen() && next == k12.GradingStageAssessing {
 		snapshot, err := d.Records.GetProblemAttemptSnapshot(ctx, agentName, f.SubmissionID)
@@ -662,8 +722,46 @@ func (d Deps) setGradingDeadline(ctx context.Context, agentName string, f *k12.G
 		}
 		return fmt.Errorf("%w: no grading budget for stage=%s problems=%d", ErrInvalidInput, next, problemCount)
 	}
-	f.Deadline = d.now() + budget
+	f.Deadline = now + budget
+	if strings.TrimSpace(f.ParentAutomaticAttemptID) != "" {
+		if f.ParentAutomaticDeadlineAt <= 0 {
+			f.Deadline = now
+		} else if f.ParentAutomaticDeadlineAt < f.Deadline {
+			f.Deadline = f.ParentAutomaticDeadlineAt
+		}
+	}
 	return nil
+}
+
+func pauseParentAutomaticWindow(f *k12.GradingJobFields, now int64) {
+	if f == nil || strings.TrimSpace(f.ParentAutomaticAttemptID) == "" ||
+		f.ParentAutomaticDeadlineAt <= 0 {
+		return
+	}
+	remaining := f.ParentAutomaticDeadlineAt - now
+	if remaining < 0 {
+		remaining = 0
+	}
+	if f.ParentAutomaticRemainingSeconds > 0 &&
+		remaining > f.ParentAutomaticRemainingSeconds {
+		remaining = f.ParentAutomaticRemainingSeconds
+	}
+	f.ParentAutomaticRemainingSeconds = remaining
+	f.ParentAutomaticDeadlineAt = 0
+}
+
+func resumeParentAutomaticWindow(f *k12.GradingJobFields, now int64) {
+	if f == nil || strings.TrimSpace(f.ParentAutomaticAttemptID) == "" ||
+		f.ParentAutomaticDeadlineAt > 0 {
+		return
+	}
+	f.ParentAutomaticDeadlineAt = now + f.ParentAutomaticRemainingSeconds
+}
+
+func parentAutomaticDeadlineExceeded(f k12.GradingJobFields, now int64) bool {
+	return strings.TrimSpace(f.ParentAutomaticAttemptID) != "" &&
+		f.ParentAutomaticDeadlineAt > 0 &&
+		f.ParentAutomaticDeadlineAt <= now
 }
 
 func gradingBudgetSeconds(snapshot k12.GradingBudgetSnapshot, stage string, problemCount int) (int64, bool) {

@@ -24,9 +24,13 @@ func TestImageTaskPhotoGrading_ClearFormattedOCRAutoFreezesAndCompletes(t *testi
 		},
 	}}
 	d := recoveryDeps(t, rec, nil, nil)
+	d.ParentTeachingGuide = &parentTeachingGuideSpy{}
 	o := newRecoverableOrchestrator(t, d, t.TempDir())
 	v, _, err := o.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "image_task", SourceKey: "clear-formatted-auto-freeze",
+		BudgetSnapshot:            frozenWiringBudget(),
+		ParentAutomaticAttemptID:  "clear-formatted-auto-freeze:1",
+		ParentAutomaticDeadlineAt: d.now() + 300,
 	})
 	if err != nil {
 		t.Fatalf("StartPhotoGradingJob: %v", err)
@@ -66,6 +70,9 @@ func TestImageTaskPhotoGrading_MissingConfidenceRequiresConfirmation(t *testing.
 	o := newRecoverableOrchestrator(t, d, t.TempDir())
 	v, _, err := o.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "image_task", SourceKey: "missing-confidence",
+		BudgetSnapshot:            frozenWiringBudget(),
+		ParentAutomaticAttemptID:  "missing-confidence:1",
+		ParentAutomaticDeadlineAt: d.now() + 300,
 	})
 	if err != nil {
 		t.Fatalf("StartPhotoGradingJob: %v", err)

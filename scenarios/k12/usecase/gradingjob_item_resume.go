@@ -162,12 +162,12 @@ func (o *GradingOrchestrator) runAssessItems(
 			return o.assessDurablePhotoItem(itemCtx, assessDeps, job, req, mode, q)
 		},
 	)
-	providerCtxErr := providerCtx.Err()
 	cancelProvider()
 	unregisterProvider()
 
 	if assessErr != nil {
-		if invocationOutcomeUnknown(assessErr) || invocationOutcomeUnknown(providerCtxErr) {
+		if errors.Is(assessErr, ErrGradingPhysicalCallOutcomeUnknown) ||
+			errors.Is(assessErr, ErrModelInvocationRequiresReconciliation) {
 			if ledgerErr := o.markFrozenAssessInvocationOutcomeUnknown(context.WithoutCancel(ctx),
 				stageInvocation, "item_invocation_outcome_unknown"); ledgerErr != nil {
 				return o.markFrozenAssessLedgerUnknown(ctx, run, job.Record.RecordID,
@@ -385,6 +385,13 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 		q.ConfirmedVersion < 1 || strings.TrimSpace(q.InputDigest) == "" {
 		return item, fmt.Errorf("%w: durable assessment problem/attempt identity is incomplete", ErrInvalidInput)
 	}
+	skipped, err := currentProblemSkipMatchesInput(ctx, deps, job, q)
+	if err != nil {
+		return item, err
+	}
+	if skipped {
+		return item, nil
+	}
 	if receipt, err := deps.Records.GetGradingAssessmentItem(ctx, req.AgentName, job.Record.RecordID, q.ProblemID); err == nil {
 		return replayGradingAssessmentItem(q, receipt)
 	} else if !errors.Is(err, records.ErrNotFound) {
@@ -436,18 +443,19 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 	}
 
 	if mode == PhotoModeSolve {
-		solved, solveInvocationID, err := executeGradingItemOperation(ctx, o, job, q,
-			k12.GradingItemOperationSolve,
-			struct {
-				InputDigest string       `json:"input_digest"`
-				Request     GradeRequest `json:"request"`
-			}{q.InputDigest, gradeReq},
-			func(callCtx context.Context) (SolveHomeworkResult, error) {
-				return deps.SolveHomeworkProblem(callCtx, gradeReq)
-			})
+		solved, solveInvocationID, err := executeDurableSolveOperation(
+			ctx, o, deps, job, q, gradeReq,
+		)
 		item.Solve = solved
 		if err != nil {
 			return item, err
+		}
+		skipped, err := currentProblemSkipMatchesInput(ctx, deps, job, q)
+		if err != nil {
+			return item, err
+		}
+		if skipped {
+			return item, nil
 		}
 		durableCtx := context.WithoutCancel(ctx)
 		if solved.OutOfScope {
@@ -481,24 +489,28 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 			solveInvocationID, "", parentGuideInvocationID, k12storage.GradingAssessmentEffects{})
 	}
 
-	solved, solveInvocationID, err := executeGradingItemOperation(ctx, o, job, q,
-		k12.GradingItemOperationSolve,
-		struct {
-			InputDigest string       `json:"input_digest"`
-			Request     GradeRequest `json:"request"`
-		}{q.InputDigest, gradeReq},
-		func(callCtx context.Context) (SolveHomeworkResult, error) {
-			return deps.SolveHomeworkProblem(callCtx, gradeReq)
-		})
+	solved, solveInvocationID, err := executeDurableSolveOperation(
+		ctx, o, deps, job, q, gradeReq,
+	)
 	item.Solve = solved
 	if err != nil {
 		return item, err
+	}
+	// The solve response and invocation success are already durable. A deadline
+	// racing with that commit must not discard the result during local receipt
+	// reconciliation.
+	durableCtx := context.WithoutCancel(ctx)
+	skipped, err = currentProblemSkipMatchesInput(durableCtx, deps, job, q)
+	if err != nil {
+		return item, err
+	}
+	if skipped {
+		return item, nil
 	}
 	// Once the provider has returned a complete response and the invocation
 	// ledger is durably succeeded, finish the local receipt transaction even if
 	// the stage deadline fired at the same instant. Retrying instead would turn a
 	// known result into an artificial ambiguous state.
-	durableCtx := context.WithoutCancel(ctx)
 	if solved.OutOfScope {
 		item.Status = PhotoOutOfScope
 		if mode == PhotoModeGrade {
@@ -511,22 +523,21 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 		return commitGradingAssessmentItem(durableCtx, deps, job, q, item,
 			solveInvocationID, "", "", k12storage.GradingAssessmentEffects{})
 	}
-	graded, gradeInvocationID, err := executeGradingItemOperation(ctx, o, job, q,
-		k12.GradingItemOperationGrade,
-		struct {
-			InputDigest string              `json:"input_digest"`
-			Request     GradeRequest        `json:"request"`
-			Solved      SolveHomeworkResult `json:"solved"`
-		}{q.InputDigest, gradeReq, solved},
-		func(callCtx context.Context) (GradeResult, error) {
-			return deps.gradeSolvedHomeworkProblem(callCtx, gradeReq, solved)
-		})
+	graded, gradeInvocationID, err := executeDurableGradeOperation(
+		ctx, o, deps, job, q, gradeReq, solved,
+	)
 	item.Grade = graded
 	item.Solve = SolveHomeworkResult{}
 	if err != nil {
 		return item, err
 	}
-	durableCtx = context.WithoutCancel(ctx)
+	skipped, err = currentProblemSkipMatchesInput(durableCtx, deps, job, q)
+	if err != nil {
+		return item, err
+	}
+	if skipped {
+		return item, nil
+	}
 	switch {
 	case graded.OutOfScope:
 		item.Status = PhotoOutOfScope
@@ -539,9 +550,13 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 	default:
 		item.Status, item.Warning = PhotoUntrusted, "批改判定无二元结论，暂不在图片上判对错"
 	}
-	effects, err := deps.gradingAssessmentEffects(durableCtx, gradeReq, graded)
-	if err != nil {
-		return item, err
+	effects := k12storage.GradingAssessmentEffects{}
+	if job.Fields.SourceKind != PracticeReturnGradingSourceKind {
+		var effectsErr error
+		effects, effectsErr = deps.gradingAssessmentEffects(durableCtx, gradeReq, graded)
+		if effectsErr != nil {
+			return item, effectsErr
+		}
 	}
 	parentGuideInvocationID := ""
 	if item.Status == PhotoWrong {
@@ -569,6 +584,36 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 		solveInvocationID, gradeInvocationID, parentGuideInvocationID, effects)
 }
 
+func currentProblemSkipMatchesInput(
+	ctx context.Context,
+	deps Deps,
+	job GradingJobView,
+	q RecognizedQuestion,
+) (bool, error) {
+	revision, err := deps.Records.GetCurrentProblemSkipRevision(
+		ctx, job.Record.AgentName, job.Record.RecordID, q.ProblemID,
+	)
+	if errors.Is(err, records.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case revision == q.ConfirmedVersion:
+		return true, nil
+	case revision < q.ConfirmedVersion:
+		return false, nil
+	default:
+		return false, fmt.Errorf(
+			"%w: current skip revision %d is newer than problem revision %d",
+			k12storage.ErrGradingAssessmentItemConflict,
+			revision,
+			q.ConfirmedVersion,
+		)
+	}
+}
+
 func executeGradingItemOperation[T any](
 	ctx context.Context,
 	o *GradingOrchestrator,
@@ -579,6 +624,9 @@ func executeGradingItemOperation[T any](
 	call func(context.Context) (T, error),
 ) (T, string, error) {
 	var zero T
+	if err := ctx.Err(); err != nil {
+		return zero, "", err
+	}
 	requestDigest := modelInvocationResultDigest(request)
 	currentAttempt := job.Fields.AttemptCount + 1
 	invocations, err := o.deps.Records.ListGradingItemInvocations(ctx, qAgent(job, q), job.Record.RecordID)
@@ -650,29 +698,47 @@ func executeGradingItemOperation[T any](
 				ErrModelInvocationRequiresReconciliation, invocation.InvocationID, invocation.Status)
 		}
 	}
-	invocation, err = o.deps.Records.MarkGradingItemInvocationSent(ctx, job.Record.AgentName, invocation.InvocationID)
+	claimCtx, cancelClaim := gradingDurableCommitContext(ctx)
+	invocation, claimed, err := o.deps.Records.ClaimGradingItemInvocationSent(
+		claimCtx, job.Record.AgentName, invocation.InvocationID,
+	)
+	cancelClaim()
 	if err != nil {
 		return zero, invocation.InvocationID, err
 	}
-	result, callErr := call(ctx)
-	ctxErr := ctx.Err()
+	if !claimed {
+		return zero, invocation.InvocationID, fmt.Errorf(
+			"%w: invocation=%s concurrently claimed with status=%s",
+			ErrModelInvocationRequiresReconciliation, invocation.InvocationID, invocation.Status,
+		)
+	}
+	callCtx, cancelCall := gradingIndependentCallContext(ctx, job.Fields.ModelSnapshot.TimeoutMS)
+	result, callErr := call(callCtx)
+	callCtxErr := callCtx.Err()
+	cancelCall()
 	if callErr != nil {
 		ambiguousTransport := !definitiveProviderResponse(callErr)
-		if invocationOutcomeUnknown(callErr) || invocationOutcomeUnknown(ctxErr) || ambiguousTransport {
+		if invocationOutcomeUnknown(callErr) || invocationOutcomeUnknown(callCtxErr) || ambiguousTransport {
+			commitCtx, cancelCommit := gradingDurableCommitContext(ctx)
 			_, ledgerErr := o.deps.Records.MarkGradingItemInvocationOutcomeUnknown(
-				context.WithoutCancel(ctx), job.Record.AgentName, invocation.InvocationID, "provider_transport", "outcome_unknown")
+				commitCtx, job.Record.AgentName, invocation.InvocationID, "provider_transport", "outcome_unknown")
+			cancelCommit()
 			if ledgerErr != nil {
 				return zero, invocation.InvocationID, errors.Join(callErr, ErrModelInvocationRequiresReconciliation, ledgerErr)
 			}
-			if ambiguousTransport && !invocationOutcomeUnknown(callErr) && !invocationOutcomeUnknown(ctxErr) {
-				return zero, invocation.InvocationID, errors.Join(callErr, ErrModelInvocationRequiresReconciliation)
+			if ambiguousTransport && !invocationOutcomeUnknown(callErr) && !invocationOutcomeUnknown(callCtxErr) {
+				return zero, invocation.InvocationID, errors.Join(
+					callErr, ErrGradingPhysicalCallOutcomeUnknown, ErrModelInvocationRequiresReconciliation,
+				)
 			}
-			return zero, invocation.InvocationID, callErr
+			return zero, invocation.InvocationID, errors.Join(callErr, ErrGradingPhysicalCallOutcomeUnknown)
 		}
 		statusCode, _ := definitiveProviderResponseStatus(callErr)
 		failureCode := fmt.Sprintf("http_%d", statusCode)
+		commitCtx, cancelCommit := gradingDurableCommitContext(ctx)
 		_, ledgerErr := o.deps.Records.MarkGradingItemInvocationFailed(
-			context.WithoutCancel(ctx), job.Record.AgentName, invocation.InvocationID, "provider_response", failureCode)
+			commitCtx, job.Record.AgentName, invocation.InvocationID, "provider_response", failureCode)
+		cancelCommit()
 		if ledgerErr != nil {
 			return zero, invocation.InvocationID, errors.Join(callErr, ledgerErr)
 		}
@@ -683,16 +749,23 @@ func executeGradingItemOperation[T any](
 	// already supplied the full operation result.
 	raw, err := json.Marshal(result)
 	if err != nil {
+		commitCtx, cancelCommit := gradingDurableCommitContext(ctx)
 		_, _ = o.deps.Records.MarkGradingItemInvocationOutcomeUnknown(
-			context.WithoutCancel(ctx), job.Record.AgentName, invocation.InvocationID, "local", "result_encode_failed")
+			commitCtx, job.Record.AgentName, invocation.InvocationID, "local", "result_encode_failed")
+		cancelCommit()
 		return zero, invocation.InvocationID, fmt.Errorf("%w: result encode: %v", ErrModelInvocationRequiresReconciliation, err)
 	}
-	if _, err := o.deps.Records.MarkGradingItemInvocationSucceeded(context.WithoutCancel(ctx),
+	commitCtx, cancelCommit := gradingDurableCommitContext(ctx)
+	if _, err := o.deps.Records.MarkGradingItemInvocationSucceeded(commitCtx,
 		job.Record.AgentName, invocation.InvocationID, modelInvocationDigest(raw), string(raw)); err != nil {
+		cancelCommit()
+		unknownCtx, cancelUnknown := gradingDurableCommitContext(ctx)
 		_, unknownErr := o.deps.Records.MarkGradingItemInvocationOutcomeUnknown(
-			context.WithoutCancel(ctx), job.Record.AgentName, invocation.InvocationID, "local", "result_not_durable")
+			unknownCtx, job.Record.AgentName, invocation.InvocationID, "local", "result_not_durable")
+		cancelUnknown()
 		return zero, invocation.InvocationID, errors.Join(ErrModelInvocationRequiresReconciliation, err, unknownErr)
 	}
+	cancelCommit()
 	return result, invocation.InvocationID, nil
 }
 

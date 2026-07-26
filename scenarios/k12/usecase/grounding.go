@@ -20,6 +20,25 @@ type SubjectGrounding interface {
 	GroundSubject(ctx context.Context, agentName, subject, knowledgePoint, grade string) (text string, found bool, err error)
 }
 
+// GroundingSnapshot freezes every mutable selector used by one tutoring-tips
+// generation. A blank TextbookBindingID is an explicit legacy/text-only read
+// and must never be labelled as verified textbook evidence.
+type GroundingSnapshot struct {
+	AgentName         string
+	LearnerID         string
+	Subject           string
+	TextbookBindingID string
+	Edition           string
+	Volume            string
+	VectorRevisionID  string
+}
+
+// SnapshotGrounding is the canonical multi-query retrieval seam.
+type SnapshotGrounding interface {
+	FreezeGroundingSnapshot(ctx context.Context, requested GroundingSnapshot) (GroundingSnapshot, error)
+	GroundSnapshot(ctx context.Context, snapshot GroundingSnapshot, knowledgePoint, grade string) (text string, found bool, err error)
+}
+
 // validateTextbookSubject 校验分科教材学科：空 = 不分科旧语义（合法）；非空必须是六学科之一。
 func validateTextbookSubject(subject string) error {
 	if subject == "" || k12.ValidTextbookSubject(subject) {

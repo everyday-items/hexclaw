@@ -12,7 +12,7 @@ import (
 func seedMistake(t *testing.T, d Deps, session, concept, cause string, due int64) string {
 	t.Helper()
 	record, err := k12.NewMistakeRecord("mingming", session, k12.MistakeFields{
-		Question: "题-" + session, KnowledgePoint: concept, ErrorCause: cause,
+		GradeTerm: "五年级上", Question: "题-" + session, KnowledgePoint: concept, ErrorCause: cause,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -44,9 +44,5 @@ func TestReviewQueueAndMastery(t *testing.T) {
 	queue, err = d.ReviewQueue(ctx, "mingming")
 	if err != nil || len(queue) != 1 {
 		t.Fatalf("mastered record remained due: len=%d err=%v", len(queue), err)
-	}
-	result, err := d.GenerateRetry(ctx, queue[0], "五年级上")
-	if err != nil || !result.Evidence.StrongTrust() {
-		t.Fatalf("retry evidence=%+v err=%v", result.Evidence, err)
 	}
 }

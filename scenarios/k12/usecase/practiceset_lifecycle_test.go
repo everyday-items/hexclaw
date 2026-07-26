@@ -29,7 +29,21 @@ func newDataDeps(t *testing.T, agents ...string) usecase.Deps {
 	if err := reg.Assemble(k12.Pack(cur)); err != nil {
 		t.Fatal(err)
 	}
-	return usecase.Deps{Records: k12storage.NewStore(db, reg.Records), Constraint: cur, Now: func() int64 { return 1000 }}
+	return usecase.Deps{
+		Records: k12storage.NewStore(db, reg.Records), Constraint: cur,
+		Now: func() int64 { return 1000 },
+		WorkFeedbackRoute: func(
+			context.Context,
+			string,
+		) (k12.ImageTaskRouteSnapshot, error) {
+			return k12.ImageTaskRouteSnapshot{
+				Provider: "test-provider", Model: "test-model",
+				Route: "test-provider/test-model", Capability: "text",
+				SelectionSource: "auto", PolicyVersion: "test-work-feedback",
+				PromptVersion: "writing-feedback-v1",
+			}, nil
+		},
+	}
 }
 
 func verifiedItem(id, q, a string) k12.PracticeItem {

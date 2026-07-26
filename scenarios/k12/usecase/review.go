@@ -94,7 +94,17 @@ func (d Deps) ReviewQueue(ctx context.Context, agentName string) ([]ReviewItem, 
 	if err != nil {
 		return nil, fmt.Errorf("usecase: 取积累复习队列: %w", err)
 	}
-	items := toItems(mrecs) // 错题本（数理化）
+	// 已安排抽查的错题只能由 FillBasketFromDue 的 spot-check 通道投放。
+	// 若同时留在普通到期队列，同一来源题会既作为抽查题、又作为普通复习题入卷，
+	// 破坏“最多混入两道且在途不重复”的产品不变量。
+	items := make([]ReviewItem, 0, len(mrecs)+len(arecs))
+	for _, r := range mrecs {
+		f, _ := k12.ParseMistakeFields(r.Fields)
+		if f.SpotCheckState == k12.SpotCheckScheduled {
+			continue
+		}
+		items = append(items, ReviewItem{Record: r, Fields: f})
+	}
 	for _, r := range arecs {
 		f, _ := k12.ParseAccumFields(r.Fields)
 		if !k12.AccumIsCorrective(f.EntryType) {
@@ -106,8 +116,10 @@ func (d Deps) ReviewQueue(ctx context.Context, agentName string) ([]ReviewItem, 
 	return items, nil
 }
 
-// MarkMastered 家长「他会了」/复测掌握：状态 → 已掌握，清到期（移出复习队列）。**按 collection 分派**
-// 掌握态（错题本 mastered / 积累本 已掌握）——否则会撞记录集状态机校验。
+// MarkMastered retains its legacy command name for API compatibility, but its
+// current product meaning is strictly “家长确认已会”. It records an independent
+// parent fact and schedules one later spot check; it never promotes evidence
+// mastery or mutates the current learning status.
 //
 // 抽查复验安排（§3.6，2026-07-18 落地）：错题确认已会时 spot_check_state none→scheduled，
 // 下一周期周卷混入一道抽查（FillBasketFromDue）。**最多自动安排一次**：已 scheduled/passed/
@@ -124,18 +136,21 @@ func (d Deps) MarkMastered(ctx context.Context, agentName, recordID string, expe
 	if rec.AgentName != agentName {
 		return fmt.Errorf("usecase: 取记录: %w", records.ErrNotFound)
 	}
-	if rec.Collection == k12.CollectionAccumulation {
-		return d.Records.UpdateStatusScoped(ctx, agentName, recordID, k12.AccumStatusMastered, nil, expectedVersion)
+	if rec.Collection != k12.CollectionMistakes {
+		return fmt.Errorf("%w: 家长确认只适用于错题", ErrInvalidInput)
 	}
 	f, _ := k12.ParseMistakeFields(rec.Fields)
+	now := d.now()
+	f.ParentConfirmedAt = now
 	if f.SpotCheckState == "" || f.SpotCheckState == k12.SpotCheckNone {
-		f.SpotCheckState = k12.SpotCheckScheduled // 最多自动安排一次；间隔档不动（复验未过要恢复原档）
+		f.SpotCheckState = k12.SpotCheckScheduled
 	}
+	due := now + reviewIntervalForStage(f.ReviewStage+1)
 	raw, err := json.Marshal(f)
 	if err != nil {
 		return fmt.Errorf("usecase: marshal 错题字段: %w", err)
 	}
-	return d.Records.UpdateStatusFields(ctx, recordID, k12.StatusMastered, nil, string(raw), expectedVersion)
+	return d.Records.UpdateStatusFields(ctx, recordID, rec.Status, &due, string(raw), expectedVersion)
 }
 
 // DeleteMistake 家长「删除这条错题」（UX-3 · 数据纠错，非逃避难题）：移除记错的 / 重复的条目。
@@ -373,71 +388,6 @@ func (d Deps) markRetriedAccum(ctx context.Context, rec *records.AgentRecord, ex
 		return fmt.Errorf("usecase: marshal 积累字段: %w", err)
 	}
 	return d.Records.UpdateStatusFields(ctx, rec.RecordID, k12.AccumStatusReviewing, &due, string(raw), expectedVersion)
-}
-
-// GenerateRetry 「再练一道」：基于某错题出一道**同知识点相似练习题** + 合理答案。
-// 返回相似题解 + 证据对象；只读，不改错题状态。
-//
-// BUG-20260712 治本（真机 68s → 目标 <10s）：练习变式题非高风险批改，走 RetryGenerator 的
-// **单次 reasoning 出题**，不再复用为批改正确性设计的**全套对抗多智能体链**（变式生成 → solver →
-// verifier → code_exec → self-consistency → 不合格重出）——那套链路重、慢，出练习题用不上。
-// Solver 实现 RetryGenerator 即走轻量口（保 subject 路由 + grade 约束）；只实现 Solver 的
-// 老实现回退全链，向后兼容。
-func (d Deps) GenerateRetry(ctx context.Context, item ReviewItem, grade string) (SolveResult, error) {
-	if err := validateGradeInput(grade); err != nil {
-		return SolveResult{}, err
-	}
-	if d.Solver == nil {
-		return SolveResult{}, fmt.Errorf("usecase: 未配置 Solver")
-	}
-	prompt := fmt.Sprintf("参照这道错题出一道同知识点(%s)的相似题并解答：%s", item.Fields.KnowledgePoint, item.Fields.Question)
-	// 轻量优先：单次出题，不跑全对抗验算链（延迟优先，练习题容错高）。
-	if rg, ok := d.Solver.(RetryGenerator); ok {
-		sr, err := rg.GenerateSimilar(ctx, item.Subject(), prompt, grade)
-		if err != nil {
-			// BUG-2：下游解题执行失败标记为 ErrSolveFailed，HTTP 层据此回 502（非 400）。
-			return SolveResult{}, fmt.Errorf("%w: %v", ErrSolveFailed, err)
-		}
-		return sr, nil
-	}
-	// 回退：老 Solver（未实现轻量出题）仍走全链，保持向后兼容。
-	sr, err := d.solveProblem(ctx, item.Subject(), prompt, grade)
-	if err != nil {
-		return SolveResult{}, fmt.Errorf("%w: %v", ErrSolveFailed, err)
-	}
-	return sr, nil
-}
-
-// GenerateRetryByRecord 按错题 record_id「再练一道」（HTTP/前端入口）。grade 空时从档案取。
-func (d Deps) GenerateRetryByRecord(ctx context.Context, agentName, recordID, grade string) (SolveResult, error) {
-	if recordID == "" {
-		return SolveResult{}, fmt.Errorf("usecase: recordID 不可空")
-	}
-	rec, err := d.Records.Get(ctx, recordID)
-	if err != nil {
-		return SolveResult{}, fmt.Errorf("usecase: 取错题: %w", err)
-	}
-	if rec == nil || rec.AgentName != agentName {
-		return SolveResult{}, fmt.Errorf("usecase: 错题不属于该实例: %w", records.ErrNotFound)
-	}
-	// 语英纠错型：**原词重现 + 确定性字符比对**，不走 solve 验算链（PRD §3.5.4：语英字词再练机制适配）。
-	if rec.Collection == k12.CollectionAccumulation {
-		af, _ := k12.ParseAccumFields(rec.Fields)
-		return SolveResult{
-			Solution: fmt.Sprintf("再默一遍（%s·%s）：%s\n判定：一字不差即正确（确定性字符比对，非验算链）。", af.Subject, af.EntryType, af.Content),
-			Evidence: SolveEvidence{Verdict: VerdictVerbatim, EvidenceType: EvidenceVerbatim},
-		}, nil
-	}
-	if rec.Collection != k12.CollectionMistakes {
-		return SolveResult{}, fmt.Errorf("usecase: 记录不属于 K12 复习集: %w", records.ErrNotFound)
-	}
-	if grade == "" && d.Profiles != nil {
-		if p, perr := d.GetProfile(ctx, agentName); perr == nil {
-			grade = p.GradeTerm
-		}
-	}
-	f, _ := k12.ParseMistakeFields(rec.Fields)
-	return d.GenerateRetry(ctx, ReviewItem{Record: rec, Fields: f}, grade)
 }
 
 func toItems(recs []*records.AgentRecord) []ReviewItem {

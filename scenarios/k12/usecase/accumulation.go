@@ -65,7 +65,8 @@ func (d Deps) CreateCurrentAccumulation(
 		return "", false, fmt.Errorf("%w: 积累元数据派生结果非法: %v", ErrSolveFailed, err)
 	}
 	rec, err := k12.NewAccumRecord(agentName, "", k12.AccumFields{
-		Subject: metadata.Subject, EntryType: metadata.EntryType,
+		GradeTerm: d.creationGradeTerm(ctx, agentName, ""),
+		Subject:   metadata.Subject, EntryType: metadata.EntryType,
 		Content: content,
 		// source_ref is legacy-only. The nullable current source and provenance
 		// are written by CreateAccumulationWithDerivedMetadata.
@@ -87,6 +88,9 @@ func (d Deps) CreateCurrentAccumulation(
 // **纠错型**（默写错/错词/语法改错）设首次复习到期 → 进统一复习队列（与错题本同飞轮，PRD §3.5.4）；
 // 积累/留档型不设到期。
 func (d Deps) AddAccumulation(ctx context.Context, agentName, sourceSession string, f k12.AccumFields) (recordID string, created bool, err error) {
+	if f.GradeTerm == "" {
+		f.GradeTerm = d.creationGradeTerm(ctx, agentName, "")
+	}
 	rec, err := k12.NewAccumRecord(agentName, sourceSession, f)
 	if err != nil {
 		return "", false, err

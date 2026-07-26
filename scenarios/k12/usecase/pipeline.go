@@ -37,6 +37,22 @@ type Deps struct {
 	// ImageTask work starts its feedback operation. The resulting snapshot is
 	// persisted before the provider call and reused verbatim on retry.
 	WorkFeedbackRoute WorkFeedbackRouteResolver
+	// PracticeGenerationRoute resolves the exact text-capable provider/model
+	// before a single-mistake generation is accepted. The snapshot is persisted
+	// with the job and every retry reuses it verbatim.
+	PracticeGenerationRoute PracticeGenerationRouteResolver
+	// PracticeVariant executes one bounded generation attempt on the frozen
+	// route carried in context. It must not reread the mutable default model.
+	PracticeVariant PracticeVariantGenerator
+	// WeeklyCurriculum resolves only authoritative textbook bindings and
+	// segments. No static or model-invented catalog is used as a fallback.
+	WeeklyCurriculum WeeklyCurriculumCatalogSource
+	// WeeklyCandidates supplies supplemental questions. A missing source
+	// degrades only the requested supplemental track.
+	WeeklyCandidates WeeklyPracticeCandidateSource
+	// WeeklyAssessment verifies a real submitted answer. Missing verification
+	// produces needs_review and never creates a Mistake.
+	WeeklyAssessment WeeklyPracticeAnswerAssessor
 	// AccumulationMetadata derives the controlled subject/type and optional
 	// source with auditable provenance. It is mandatory for the current
 	// content-only accumulation command; there is no heuristic fallback.
@@ -392,6 +408,7 @@ func (d Deps) projectGradeResult(ctx context.Context, req GradeRequest, res Grad
 
 	// 判错（disagree）→ 无感入库错题（幂等去重）+ 首次复习到期 + 学情薄弱信号。
 	rec, err := k12.NewMistakeRecord(req.AgentName, req.SourceSession, k12.MistakeFields{
+		GradeTerm:       d.creationGradeTerm(ctx, req.AgentName, req.Grade),
 		Subject:         req.Subject,
 		Question:        req.Problem,
 		KnowledgePoint:  res.Outcome.KnowledgePoint,
@@ -434,7 +451,8 @@ func (d Deps) gradingAssessmentEffects(
 			SourceSession: req.SourceSession,
 			DueAt:         &due,
 			Fields: k12.MistakeFields{
-				Subject: req.Subject, Question: req.Problem,
+				GradeTerm: d.creationGradeTerm(ctx, req.AgentName, req.Grade),
+				Subject:   req.Subject, Question: req.Problem,
 				KnowledgePoint:  res.Outcome.KnowledgePoint,
 				ErrorCause:      res.Outcome.ErrorCause,
 				WrongProcess:    res.Outcome.WrongStep,

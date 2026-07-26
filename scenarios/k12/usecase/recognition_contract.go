@@ -332,6 +332,14 @@ func NormalizeRecognizedProblems(scope string, questions []RecognizedQuestion) (
 }
 
 func validateRecognitionEvidence(index int, question RecognizedQuestion) error {
+	if (len(question.SourceNumberPath) == 0) != (strings.TrimSpace(question.DisplayLabel) == "") {
+		return fmt.Errorf("%w: problem index %d source_number_path/display_label 必须同时存在或同时为空", ErrInvalidInput, index)
+	}
+	for _, token := range question.SourceNumberPath {
+		if strings.TrimSpace(token) == "" {
+			return fmt.Errorf("%w: problem index %d source_number_path 含空 token", ErrInvalidInput, index)
+		}
+	}
 	if question.RecognitionConfidence != nil &&
 		(math.IsNaN(*question.RecognitionConfidence) || math.IsInf(*question.RecognitionConfidence, 0) ||
 			*question.RecognitionConfidence < 0 || *question.RecognitionConfidence > 1) {
@@ -523,6 +531,8 @@ func CanonicalRecognizedQuestionsDigest(questions []RecognizedQuestion) string {
 		ProblemKind      ProblemKind `json:"problem_kind"`
 		ParentProblemID  string      `json:"parent_problem_id,omitempty"`
 		SubproblemNo     string      `json:"subproblem_no,omitempty"`
+		SourceNumberPath []string    `json:"source_number_path,omitempty"`
+		DisplayLabel     string      `json:"display_label,omitempty"`
 		Question         string      `json:"canonical_markdown"`
 		Answer           string      `json:"answer_canonical_markdown,omitempty"`
 		AnswerState      AnswerState `json:"answer_state"`
@@ -535,7 +545,8 @@ func CanonicalRecognizedQuestionsDigest(questions []RecognizedQuestion) string {
 		q = normalizeRecognizedQuestionFacts(q)
 		items = append(items, digestItem{
 			ProblemID: q.ProblemID, ProblemKind: q.ProblemKind, ParentProblemID: q.ParentProblemID,
-			SubproblemNo: q.SubproblemNo, Question: q.CanonicalMarkdown,
+			SubproblemNo: q.SubproblemNo, SourceNumberPath: append([]string(nil), q.SourceNumberPath...),
+			DisplayLabel: q.DisplayLabel, Question: q.CanonicalMarkdown,
 			Answer: q.AnswerCanonicalMarkdown, AnswerState: q.AnswerState, Subject: q.Subject,
 			CanonicalVersion: q.CanonicalVersion, ConfirmedVersion: q.ConfirmedVersion,
 		})
@@ -576,8 +587,14 @@ func FreezeRecognizedQuestionInputDigests(questions []RecognizedQuestion, gradin
 			AnswerState AnswerState `json:"answer_state"`
 			Subject     string      `json:"subject"`
 			Subproblem  string      `json:"subproblem_no,omitempty"`
+			SourceNumberPath []string `json:"source_number_path,omitempty"`
+			DisplayLabel string       `json:"display_label,omitempty"`
 			Context     string      `json:"context,omitempty"`
-		}{q.ProblemKind, stem, q.AnswerCanonicalMarkdown, q.AnswerState, q.Subject, q.SubproblemNo, contextValue}
+		}{
+			q.ProblemKind, stem, q.AnswerCanonicalMarkdown, q.AnswerState, q.Subject,
+			q.SubproblemNo, append([]string(nil), q.SourceNumberPath...), q.DisplayLabel,
+			contextValue,
+		}
 		raw, _ := json.Marshal(payload)
 		sum := sha256.Sum256(raw)
 		q.InputDigest = hex.EncodeToString(sum[:])
@@ -612,6 +629,8 @@ func RecognizedQuestionsProblemAttemptSnapshot(agentName, submissionID string, q
 			ProblemID: question.ProblemID, AgentName: agentName, SubmissionID: submissionID,
 			PageAssetID: question.PageAssetID, Ordinal: index, ProblemKind: string(question.ProblemKind),
 			ParentProblemID: question.ParentProblemID, SubproblemNo: question.SubproblemNo,
+			SourceNumberPath: append([]string(nil), question.SourceNumberPath...),
+			DisplayLabel: question.DisplayLabel,
 			Subject: question.Subject, StemRaw: question.RawTranscription,
 			StemMarkdown: question.CanonicalMarkdown, ConceptIDs: append([]string(nil), question.KnowledgePoints...),
 			TranscriptionConfidence: question.RecognitionConfidence,
@@ -666,6 +685,8 @@ func RecognizedQuestionsFromProblemAttemptSnapshot(snapshot k12.ProblemAttemptSn
 		question := RecognizedQuestion{
 			ProblemID: problem.ProblemID, ProblemKind: ProblemKind(problem.ProblemKind),
 			ParentProblemID: problem.ParentProblemID, SubproblemNo: problem.SubproblemNo,
+			SourceNumberPath: append([]string(nil), problem.SourceNumberPath...),
+			DisplayLabel: problem.DisplayLabel,
 			PageAssetID: problem.PageAssetID, RawTranscription: problem.StemRaw,
 			CanonicalMarkdown: problem.StemMarkdown, CanonicalVersion: problem.CanonicalVersion,
 			KnowledgePoints: append([]string(nil), problem.ConceptIDs...), Subject: problem.Subject,

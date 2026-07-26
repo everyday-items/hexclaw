@@ -91,10 +91,6 @@ func TestAllSolveEntrypointsRejectInvalidGrade(t *testing.T) {
 		name string
 		fn   func() error
 	}{
-		{name: "retry", fn: func() error {
-			_, err := d.GenerateRetry(ctx, ReviewItem{Fields: k12.MistakeFields{Question: "1+1"}}, "大学")
-			return err
-		}},
 		{name: "tutor", fn: func() error {
 			_, err := d.TutorTurn(ctx, TutorTurnRequest{AgentName: "mingming", PriorStage: StageHint2, ParentMessage: "直接讲"}, "1+1", "大学")
 			return err

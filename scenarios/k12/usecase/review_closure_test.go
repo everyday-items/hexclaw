@@ -69,16 +69,25 @@ func TestReviewFlywheel_Invariants_Property(t *testing.T) {
 			}
 			prevInterval = interval
 		}
-		// 随机以 mastered 收尾 → 断言清 due（移出复习队列）
+		// 随机以两次相隔 ≥3 天的系统正确证据收尾 → 断言清 due。
 		if rng.Intn(2) == 0 {
 			cur, _ := d.Records.Get(ctx, id)
-			if err := d.MarkMastered(ctx, "mingming", id, cur.Version); err != nil {
+			if cur.Status != k12.StatusRetried {
+				d.Now = func() int64 { return 1000 }
+				if err := d.MarkRetried(ctx, id, cur.Version); err != nil {
+					t.Fatal(err)
+				}
+				cur, _ = d.Records.Get(ctx, id)
+			}
+			d.Now = func() int64 { return 1000 + MasteryGapInterval }
+			if err := d.MarkRetried(ctx, id, cur.Version); err != nil {
 				t.Fatal(err)
 			}
 			got, _ := d.Records.Get(ctx, id)
 			if got.DueAt != nil {
-				t.Fatalf("不变量⑥ mastered 应清 due, got %v", *got.DueAt)
+				t.Fatalf("不变量⑥ evidence mastery 应清 due, got %v", *got.DueAt)
 			}
+			d.Now = func() int64 { return 1000 }
 		}
 	}
 }

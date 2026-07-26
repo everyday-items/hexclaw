@@ -1,6 +1,7 @@
 package usecase
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -169,6 +170,72 @@ func TestCanonicalRecognizedQuestionsDigest_IgnoresRawButChangesWithCanonical(t 
 	changedCanonical[0].CanonicalMarkdown = `$\frac{2}{3}$`
 	if CanonicalRecognizedQuestionsDigest(changedCanonical) == CanonicalRecognizedQuestionsDigest(base) {
 		t.Fatal("canonical correction must alter digest")
+	}
+}
+
+func TestBUG20260726_D_SourceNumberPathSurvivesCanonicalDigestAndDurableRoundTrip(t *testing.T) {
+	var input []RecognizedQuestion
+	if err := json.Unmarshal([]byte(`[{
+		"problem_kind":"standalone",
+		"source_number_path":["三","1"],
+		"display_label":"三、1",
+		"question":"24÷8=",
+		"canonical_markdown":"24\\div8=",
+		"subject":"数学",
+		"answer_state":"present",
+		"student_answer":"3",
+		"answer_canonical_markdown":"3"
+	}]`), &input); err != nil {
+		t.Fatal(err)
+	}
+	normalized, err := NormalizeRecognizedProblems("submission-numbering", input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := RecognizedQuestionsProblemAttemptSnapshot(
+		"mingming", "submission-numbering", normalized, 100,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := RecognizedQuestionsFromProblemAttemptSnapshot(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(restored[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(wire["source_number_path"], []any{"三", "1"}) ||
+		wire["display_label"] != "三、1" {
+		t.Fatalf("BUG-20260726-D durable round-trip dropped source numbering: %s", encoded)
+	}
+
+	var changedInput []RecognizedQuestion
+	if err := json.Unmarshal([]byte(`[{
+		"problem_kind":"standalone",
+		"source_number_path":["三","2"],
+		"display_label":"三、2",
+		"question":"24÷8=",
+		"canonical_markdown":"24\\div8=",
+		"subject":"数学",
+		"answer_state":"present",
+		"student_answer":"3",
+		"answer_canonical_markdown":"3"
+	}]`), &changedInput); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := NormalizeRecognizedProblems("submission-numbering", changedInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if CanonicalRecognizedQuestionsDigest(normalized) ==
+		CanonicalRecognizedQuestionsDigest(changed) {
+		t.Fatal("BUG-20260726-D original number path must participate in canonical digest")
 	}
 }
 

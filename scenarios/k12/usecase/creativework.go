@@ -141,19 +141,30 @@ func (d Deps) creativeWorkViewFromRecord(
 	if err != nil {
 		return CreativeWorkView{}, fmt.Errorf("usecase: 取作品点评 generation: %w", err)
 	}
-	// Legacy version data remains readable internally. Overlay the current
-	// latest generation in memory only; never replace/delete legacy rows.
-	if state.Latest != nil && state.Latest.Feedback != nil &&
-		len(fields.Versions) > 0 {
-		last := &fields.Versions[len(fields.Versions)-1]
-		last.StructuredFeedback = state.Latest.Feedback
-		last.Feedback = state.Latest.Feedback.ProjectionMarkdown
-		last.FeedbackSource = state.Latest.Feedback.SourceSnapshot.Source
-		last.FeedbackSkill = state.Latest.Feedback.SourceSnapshot.MethodRef
-	}
+	fields = overlayCurrentCreativeWorkFeedback(fields, state)
 	return CreativeWorkView{
 		Record: rec, Fields: fields, GenerationState: state,
 	}, nil
+}
+
+// overlayCurrentCreativeWorkFeedback is the single read adapter from current
+// generation facts to legacy version-shaped internal consumers. It never
+// writes the legacy child table. Every projection path (including ImageTask)
+// must use it so status and visible canonical feedback cannot diverge.
+func overlayCurrentCreativeWorkFeedback(
+	fields k12.CreativeWorkFields,
+	state k12.CreativeWorkGenerationState,
+) k12.CreativeWorkFields {
+	if state.Latest == nil || state.Latest.Feedback == nil ||
+		len(fields.Versions) == 0 {
+		return fields
+	}
+	last := &fields.Versions[len(fields.Versions)-1]
+	last.StructuredFeedback = state.Latest.Feedback
+	last.Feedback = state.Latest.Feedback.ProjectionMarkdown
+	last.FeedbackSource = state.Latest.Feedback.SourceSnapshot.Source
+	last.FeedbackSkill = state.Latest.Feedback.SourceSnapshot.MethodRef
+	return fields
 }
 
 // attachAIFeedback is the internal AI-feedback persistence path:
@@ -311,15 +322,64 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 				}
 			}
 		}
-	} else if len(observationEvidence) > 3 {
-		// Preserve every visible fact while keeping the 1-3 focused-row
-		// contract: the third row may contain the remaining short sentences,
-		// but never headings or line breaks.
-		observationEvidence = []string{
-			observationEvidence[0],
-			observationEvidence[1],
-			strings.Join(observationEvidence[2:], "；"),
+	} else {
+		// BUG-20260726-003: a detailed provider response can contain many valid
+		// short observations. Joining every item after the second into one row
+		// made that row exceed the canonical 500-rune atom limit and rejected
+		// the entire first feedback generation. Deduplicate repeated evidence,
+		// then pack at existing clause boundaries into at most three valid atoms.
+		const maxObservationRunes = 500
+		const maxObservationAtoms = 3
+		unique := make([]string, 0, len(observationEvidence))
+		seen := make(map[string]struct{}, len(observationEvidence))
+		for _, evidence := range observationEvidence {
+			evidence = strings.TrimSpace(evidence)
+			if evidence == "" {
+				continue
+			}
+			if _, ok := seen[evidence]; ok {
+				continue
+			}
+			seen[evidence] = struct{}{}
+			runes := []rune(evidence)
+			for len(runes) > 0 {
+				cut := len(runes)
+				if cut > maxObservationRunes {
+					cut = maxObservationRunes
+					// Prefer a sentence boundary near the end of the allowed
+					// atom. A provider may still emit one unpunctuated span;
+					// the hard rune boundary is the safe final fallback.
+					for i := cut - 1; i >= maxObservationRunes*3/4; i-- {
+						if strings.ContainsRune("。！？；.!?;", runes[i]) {
+							cut = i + 1
+							break
+						}
+					}
+				}
+				part := strings.TrimSpace(string(runes[:cut]))
+				if part != "" {
+					unique = append(unique, part)
+				}
+				runes = runes[cut:]
+			}
 		}
+		packed := make([]string, 0, maxObservationAtoms)
+		for _, evidence := range unique {
+			if len(packed) == 0 {
+				packed = append(packed, evidence)
+				continue
+			}
+			last := len(packed) - 1
+			joined := packed[last] + "；" + evidence
+			if len([]rune(joined)) <= maxObservationRunes {
+				packed[last] = joined
+				continue
+			}
+			if len(packed) < maxObservationAtoms {
+				packed = append(packed, evidence)
+			}
+		}
+		observationEvidence = packed
 	}
 	classifyDimension := func(evidence string) string {
 		if workType == k12.WorkTypeArt {

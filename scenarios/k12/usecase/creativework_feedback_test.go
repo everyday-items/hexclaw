@@ -59,7 +59,7 @@ func TestGenerateWorkFeedback_Writing_AI(t *testing.T) {
 		t.Fatalf("生成点评后应为 feedback_ready，got %s", v.Record.Status)
 	}
 	last := v.Fields.Versions[len(v.Fields.Versions)-1]
-	if last.Feedback == gen.feedback || !strings.Contains(last.Feedback, "## 观察与依据") {
+	if last.Feedback == gen.feedback || !strings.Contains(last.Feedback, "## 可见证据") {
 		t.Fatalf("点评应写入由 canonical facts 生成的确定性投影，got %q", last.Feedback)
 	}
 	if last.FeedbackSource != k12.FeedbackSourceAI {
@@ -93,18 +93,18 @@ func TestGenerateWorkFeedback_Writing_AI(t *testing.T) {
 // TestGenerateWorkFeedback_SkillStampPersisted 追溯契约：生成器申报的方法论基座来源戳
 // 随点评落库到版本记录 feedback_skill 字段（能查到每条点评用的哪版方法论）。
 func TestGenerateWorkFeedback_SkillStampPersisted(t *testing.T) {
-	cases := []struct{ name, stamp string }{
-		{"盘上版本", "writing-feedback@1.2.0/disk"},
-		{"内嵌快照", "writing-feedback@1.0.0/embedded"},
-		{"硬编码兜底", "builtin"},
-		{"未申报为空", ""}, // 前向兼容：老生成器不申报，落空值不猜
+	cases := []struct{ name, input, want string }{
+		{"盘上版本", "writing-feedback@1.2.0/disk", "writing-feedback@1.2.0/disk"},
+		{"内嵌快照", "writing-feedback@1.0.0/embedded", "writing-feedback@1.0.0/embedded"},
+		{"硬编码兜底", "builtin", "builtin"},
+		{"未申报时诚实标记", "", "unreported"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			d := newDataDeps(t)
 			d.Solver = &fakeWorkFeedbackSolver{
 				feedback:   "「柳枝像绿色的丝带」比喻好；建议结尾补一个听觉细节。",
-				skillStamp: tc.stamp,
+				skillStamp: tc.input,
 			}
 			ctx := context.Background()
 			id := newWritingWork(t, d, "xiaoming")
@@ -113,8 +113,8 @@ func TestGenerateWorkFeedback_SkillStampPersisted(t *testing.T) {
 				t.Fatalf("生成点评: %v", err)
 			}
 			last := v.Fields.Versions[len(v.Fields.Versions)-1]
-			if last.FeedbackSkill != tc.stamp {
-				t.Fatalf("feedback_skill 应落库 %q，got %q", tc.stamp, last.FeedbackSkill)
+			if last.FeedbackSkill != tc.want {
+				t.Fatalf("feedback_skill 应落库 %q，got %q", tc.want, last.FeedbackSkill)
 			}
 		})
 	}
@@ -162,6 +162,75 @@ func TestGenerateWorkFeedback_FeedbackNotFalselyRejected(t *testing.T) {
 	id := newWritingWork(t, d, "xiaoming")
 	if _, err := d.GenerateWorkFeedback(ctx, "xiaoming", id); err != nil {
 		t.Fatalf("“10 分钟”不是打分，不应被拒: %v", err)
+	}
+}
+
+// BUG-20260726-003: real vision feedback can contain many short, valid observations.
+// Packing every observation after the second into one row used to exceed the canonical
+// 500-rune atom limit and discard the entire first feedback generation.
+func TestBUG20260726003_GenerateWorkFeedback_PacksVerboseEvidenceIntoValidAtoms(t *testing.T) {
+	d := newDataDeps(t)
+	var raw strings.Builder
+	labels := []rune("甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥天地玄黄宇宙洪荒日月盈昃辰宿列张")
+	for i := 0; i < 36; i++ {
+		raw.WriteRune(labels[i])
+		raw.WriteString("原文写出了爸爸下班后仍陪孩子分析题目的具体动作，人物关系清楚。")
+	}
+	raw.WriteString("建议下一次只补充一处能听见的生活细节。")
+	d.Solver = &fakeWorkFeedbackSolver{feedback: raw.String()}
+	ctx := context.Background()
+	id := newWritingWork(t, d, "xiaoming")
+
+	view, err := d.GenerateWorkFeedback(ctx, "xiaoming", id)
+	if err != nil {
+		t.Fatalf("有效但详细的真实模型点评不得因内部装箱超过 500 字而整单失败: %v", err)
+	}
+	feedback := view.Fields.Versions[0].StructuredFeedback
+	if feedback == nil {
+		t.Fatal("详细点评必须生成 canonical structured feedback")
+	}
+	if len(feedback.Observations) < 1 || len(feedback.Observations) > 3 {
+		t.Fatalf("观察仍须保持 1-3 条，got %d", len(feedback.Observations))
+	}
+	for _, observation := range feedback.Observations {
+		if got := len([]rune(observation.Evidence)); got > 500 {
+			t.Fatalf("观察原子仍超过 500 字: %d", got)
+		}
+	}
+	var packed strings.Builder
+	for _, observation := range feedback.Observations {
+		packed.WriteString(observation.Evidence)
+	}
+	if !strings.Contains(packed.String(), "甲原文") || !strings.Contains(packed.String(), "宿原文") {
+		t.Fatalf("装箱不得静默丢掉首尾有效证据: %q", packed.String())
+	}
+}
+
+func TestBUG20260726003_GenerateWorkFeedback_SplitsOneOversizedEvidenceAtom(t *testing.T) {
+	d := newDataDeps(t)
+	raw := strings.Repeat("原文里能看到爸爸陪孩子分析题目的具体动作", 40) +
+		"收尾证据。建议下一次只补充一处能听见的生活细节。"
+	d.Solver = &fakeWorkFeedbackSolver{feedback: raw}
+	ctx := context.Background()
+	id := newWritingWork(t, d, "xiaoming")
+
+	view, err := d.GenerateWorkFeedback(ctx, "xiaoming", id)
+	if err != nil {
+		t.Fatalf("单条有效观察较长时应拆成 canonical atoms，而不是整单失败: %v", err)
+	}
+	feedback := view.Fields.Versions[0].StructuredFeedback
+	if feedback == nil {
+		t.Fatal("长观察必须生成 canonical structured feedback")
+	}
+	var packed strings.Builder
+	for _, observation := range feedback.Observations {
+		if got := len([]rune(observation.Evidence)); got > 500 {
+			t.Fatalf("拆分后观察原子仍超过 500 字: %d", got)
+		}
+		packed.WriteString(observation.Evidence)
+	}
+	if !strings.Contains(packed.String(), "收尾证据") {
+		t.Fatalf("拆分不得丢失长观察末尾的有效证据: %q", packed.String())
 	}
 }
 
@@ -357,8 +426,11 @@ func TestBuildStructuredWorkFeedback_StripsProjectionMarkdownFromCanonicalFields
 		t.Fatalf("actionable suggestion was lost: %#v", feedback.Suggestions)
 	}
 	if feedback.ProjectionMarkdown == raw ||
-		!strings.Contains(feedback.ProjectionMarkdown, "## 观察与依据") ||
-		!strings.Contains(feedback.ProjectionMarkdown, "## 下一步建议") {
+		!strings.Contains(feedback.ProjectionMarkdown, "## 可见证据") ||
+		!strings.Contains(feedback.ProjectionMarkdown, "## 先这样肯定") ||
+		!strings.Contains(feedback.ProjectionMarkdown, "## 家长可以这样问或讲") ||
+		!strings.Contains(feedback.ProjectionMarkdown, "## 下一次只试一个点") ||
+		!strings.Contains(feedback.ProjectionMarkdown, "## 说明") {
 		t.Fatalf("display projection must be deterministically generated from canonical fields, got %q", feedback.ProjectionMarkdown)
 	}
 }

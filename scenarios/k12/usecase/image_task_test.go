@@ -56,10 +56,13 @@ func (s *imageTaskClassifierStub) ClassifyImageTask(ctx context.Context, in Imag
 }
 
 type imageTaskGradingStub struct {
-	starts  int
-	async   int
-	cancels int
-	input   StartPhotoGradingInput
+	starts                int
+	async                 int
+	cancels               int
+	input                 StartPhotoGradingInput
+	parentRetryAllowed    bool
+	parentRetryAttemptID  string
+	parentRetryDeadlineAt int64
 }
 
 func (s *imageTaskGradingStub) StartPhotoGradingJob(_ context.Context, in StartPhotoGradingInput) (GradingJobView, bool, error) {
@@ -89,6 +92,28 @@ func (s *imageTaskGradingStub) CancelImageTaskHomework(
 	}
 	s.cancels++
 	return nil
+}
+
+func (s *imageTaskGradingStub) CanRetryPhotoGradingWithParentAutomaticWindow(
+	context.Context,
+	string,
+) (bool, error) {
+	return s.parentRetryAllowed, nil
+}
+
+func (s *imageTaskGradingStub) RetryPhotoGradingJobWithParentAutomaticWindow(
+	_ context.Context,
+	jobID, parentAutomaticAttemptID string,
+	parentAutomaticDeadlineAt int64,
+) (GradingJobView, bool, error) {
+	if jobID != "internal-grading-job" {
+		return GradingJobView{}, false, errors.New("unexpected grading retry job")
+	}
+	s.parentRetryAttemptID = parentAutomaticAttemptID
+	s.parentRetryDeadlineAt = parentAutomaticDeadlineAt
+	return GradingJobView{
+		Record: &records.AgentRecord{RecordID: jobID},
+	}, true, nil
 }
 
 type imageTaskOCRStub struct {
@@ -291,16 +316,32 @@ func TestManualArtworkSkipsClassificationAndWaitsForCommit(t *testing.T) {
 		committed.Creative.PromotedVersionID != "v1" {
 		t.Fatalf("manual commit did not create exactly one v1: %+v", committed.Creative)
 	}
-	if _, err := coordinator.Run(
+	completed, err := coordinator.Run(
 		context.Background(), input.AgentName, prepared.Dispatch.DispatchID,
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := coordinator.Records.GetLatestWorkFeedbackInvocation(
+	if completed.CreativeFeedback != "feedback_ready" {
+		t.Fatalf("manual commit did not complete automatic feedback: %+v", completed)
+	}
+	invocation, err := coordinator.Records.GetLatestWorkFeedbackInvocation(
 		context.Background(), input.AgentName, committed.Creative.PromotedWorkID,
 		"work:"+committed.Creative.PromotedWorkID+":version:v1:feedback",
-	); !errors.Is(err, k12storage.ErrImageTaskNotFound) {
-		t.Fatalf("manual commit triggered automatic feedback: %v", err)
+	)
+	if err != nil {
+		t.Fatalf("manual commit did not register automatic feedback: %v", err)
+	}
+	if invocation.Status != k12.ImageTaskInvocationSucceeded {
+		t.Fatalf("automatic feedback invocation did not succeed: %+v", invocation)
+	}
+	if err := invocation.RouteSnapshot.Validate(); err != nil {
+		t.Fatalf("automatic feedback route snapshot not frozen: %+v err=%v", invocation, err)
+	}
+	if invocation.RouteSnapshot.Provider != "new-default" ||
+		invocation.RouteSnapshot.Model != "model-b" ||
+		invocation.RouteSnapshot.Route != "new-default/model-b" {
+		t.Fatalf("automatic feedback did not use the independent feedback route: %+v", invocation)
 	}
 }
 
@@ -533,13 +574,14 @@ func TestImageTaskCoordinatorRecoveryNeverResendsSentCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := original.Records.MarkImageTaskInvocationSent(
+	if _, claimed, err := original.Records.ClaimImageTaskInvocationSend(
 		context.Background(),
 		"mingming",
 		prepared.Dispatch.ClassificationInvocationID,
 		"image-task:"+prepared.Dispatch.DispatchID+":classification",
-	); err != nil {
-		t.Fatal(err)
+		1000,
+	); err != nil || !claimed {
+		t.Fatalf("claim sent checkpoint: claimed=%v err=%v", claimed, err)
 	}
 	recoveryClassifier := &imageTaskClassifierStub{}
 	restarted := restartImageTaskCoordinator(original, recoveryClassifier)

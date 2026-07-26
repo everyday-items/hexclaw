@@ -2,6 +2,7 @@ package usecase_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -21,13 +22,18 @@ type customPaperSolver struct {
 	wrongGeneratedAnswer bool
 	duplicate            bool
 	prompts              []string
+	generateSnapshots    []k12.GradingModelSnapshot
+	validateSnapshots    []k12.GradingModelSnapshot
 }
 
-func (s *customPaperSolver) GenerateSimilar(_ context.Context, _ string, prompt, _ string) (usecase.SolveResult, error) {
+func (s *customPaperSolver) GeneratePracticeVariant(ctx context.Context, _ string, prompt, _ string) (usecase.SolveResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.generateCalls++
 	s.prompts = append(s.prompts, prompt)
+	if snapshot, ok := k12.GradingModelSnapshotFromContext(ctx); ok {
+		s.generateSnapshots = append(s.generateSnapshots, snapshot)
+	}
 	if s.failAt > 0 && s.generateCalls == s.failAt {
 		return usecase.SolveResult{}, fmt.Errorf("generator unavailable")
 	}
@@ -42,10 +48,13 @@ func (s *customPaperSolver) GenerateSimilar(_ context.Context, _ string, prompt,
 	return usecase.SolveResult{Solution: fmt.Sprintf("## 问题\n变式题 %d\n\n## 解答\n过程 %d\n\n## 答案\n%d", n, n, answer)}, nil
 }
 
-func (s *customPaperSolver) Solve(_ context.Context, problem, _, _ string) (usecase.SolveResult, error) {
+func (s *customPaperSolver) Solve(ctx context.Context, problem, _, _ string) (usecase.SolveResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.validateCalls++
+	if snapshot, ok := k12.GradingModelSnapshotFromContext(ctx); ok {
+		s.validateSnapshots = append(s.validateSnapshots, snapshot)
+	}
 	if s.validateFailAt > 0 && s.validateCalls == s.validateFailAt {
 		return usecase.SolveResult{}, fmt.Errorf("validator unavailable")
 	}
@@ -92,6 +101,7 @@ func TestGenerateCustomPaper_UsesAllParametersAndCommitsOnce(t *testing.T) {
 	seedCustomPaperMistakes(t, d, 3)
 	solver := &customPaperSolver{}
 	d.Solver = solver
+	d.PracticeVariant = solver
 
 	result, err := d.GenerateCustomPaper(context.Background(), "xiaoming", customPaperReq("paper-command-1"))
 	if err != nil {
@@ -125,11 +135,85 @@ func TestGenerateCustomPaper_UsesAllParametersAndCommitsOnce(t *testing.T) {
 	}
 }
 
+func TestGenerateCustomPaper_FreezesExactSelectedRouteForGenerationAndValidation(t *testing.T) {
+	d := newDataDeps(t)
+	seedCustomPaperMistakes(t, d, 3)
+	solver := &customPaperSolver{}
+	d.Solver = solver
+	d.PracticeVariant = solver
+	routeCalls := 0
+	d.PracticeGenerationRoute = func(
+		_ context.Context,
+		requested k12.GradingModelSnapshot,
+	) (k12.GradingModelSnapshot, error) {
+		routeCalls++
+		if requested.Provider != "hexclaw-gpt" ||
+			requested.Model != "gpt-5.6-sol" {
+			t.Fatalf("selected route lost before resolution: %+v", requested)
+		}
+		return k12.GradingModelSnapshot{
+			Provider: "hexclaw-gpt", Model: "gpt-5.6-sol",
+			Route: "hexclaw-gpt/gpt-5.6-sol", Capability: "text",
+		}, nil
+	}
+	req := customPaperReq("paper-command-frozen-route")
+	req.Provider = "hexclaw-gpt"
+	req.Model = "gpt-5.6-sol"
+
+	result, err := d.GenerateCustomPaper(context.Background(), "xiaoming", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routeCalls != 1 {
+		t.Fatalf("route resolved %d times, want once", routeCalls)
+	}
+	job, err := d.Records.GetPracticeGenerationJobByID(
+		context.Background(), "xiaoming", result.GenerationJobID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frozen k12.GradingModelSnapshot
+	if err := json.Unmarshal([]byte(job.RouteSnapshot), &frozen); err != nil {
+		t.Fatal(err)
+	}
+	if frozen.Provider != "hexclaw-gpt" ||
+		frozen.Model != "gpt-5.6-sol" ||
+		frozen.Route != "hexclaw-gpt/gpt-5.6-sol" {
+		t.Fatalf("job route snapshot=%+v", frozen)
+	}
+	if len(solver.generateSnapshots) != solver.generateCalls ||
+		len(solver.validateSnapshots) != solver.validateCalls {
+		t.Fatalf(
+			"not every model call received frozen route: generate=%d/%d validate=%d/%d",
+			len(solver.generateSnapshots), solver.generateCalls,
+			len(solver.validateSnapshots), solver.validateCalls,
+		)
+	}
+	for _, snapshot := range append(
+		append([]k12.GradingModelSnapshot{}, solver.generateSnapshots...),
+		solver.validateSnapshots...,
+	) {
+		if snapshot.Route != "hexclaw-gpt/gpt-5.6-sol" {
+			t.Fatalf("model call route drifted: %+v", snapshot)
+		}
+	}
+	if _, err := d.GenerateCustomPaper(
+		context.Background(), "xiaoming", req,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if routeCalls != 1 {
+		t.Fatalf("committed replay re-resolved mutable route: calls=%d", routeCalls)
+	}
+}
+
 func TestGenerateCustomPaper_IdempotentReplayAndDigestConflict(t *testing.T) {
 	d := newDataDeps(t)
 	seedCustomPaperMistakes(t, d, 3)
 	solver := &customPaperSolver{}
 	d.Solver = solver
+	d.PracticeVariant = solver
 	req := customPaperReq("paper-command-idem")
 	first, err := d.GenerateCustomPaper(context.Background(), "xiaoming", req)
 	if err != nil {
@@ -160,6 +244,7 @@ func TestGenerateCustomPaper_FailureLeavesZeroHalfBasketAndRetryDoesNotDuplicate
 	seedCustomPaperMistakes(t, d, 3)
 	solver := &customPaperSolver{failAt: 2}
 	d.Solver = solver
+	d.PracticeVariant = solver
 	req := customPaperReq("paper-command-retry")
 	if _, err := d.GenerateCustomPaper(context.Background(), "xiaoming", req); !errors.Is(err, usecase.ErrSolveFailed) {
 		t.Fatalf("生成失败应透传 ErrSolveFailed: %v", err)
@@ -195,6 +280,7 @@ func TestGenerateCustomPaper_UsesIndependentlyValidatedAnswer(t *testing.T) {
 	seedCustomPaperMistakes(t, d, 3)
 	solver := &customPaperSolver{wrongGeneratedAnswer: true}
 	d.Solver = solver
+	d.PracticeVariant = solver
 
 	result, err := d.GenerateCustomPaper(context.Background(), "xiaoming", customPaperReq("paper-command-answer"))
 	if err != nil {
@@ -228,6 +314,7 @@ func TestGenerateCustomPaper_ValidationFailureDoesNotMutateExistingBasket(t *tes
 	}
 	solver := &customPaperSolver{validateFailAt: 2}
 	d.Solver = solver
+	d.PracticeVariant = solver
 	req := customPaperReq("paper-command-validation-fail")
 	if _, err := d.GenerateCustomPaper(context.Background(), "xiaoming", req); !errors.Is(err, usecase.ErrSolveFailed) {
 		t.Fatalf("验证失败应透传 ErrSolveFailed: %v", err)
@@ -262,6 +349,7 @@ func TestGenerateCustomPaper_AllDeduplicatedCommitsReceiptWithoutTouchingBasket(
 	}
 	solver := &customPaperSolver{duplicate: true}
 	d.Solver = solver
+	d.PracticeVariant = solver
 	result, err := d.GenerateCustomPaper(context.Background(), "xiaoming", customPaperReq("paper-command-all-deduped"))
 	if err != nil {
 		t.Fatal(err)
@@ -287,6 +375,7 @@ func TestGenerateCustomPaper_ConcurrentSameCommandCommitsOneBasket(t *testing.T)
 	seedCustomPaperMistakes(t, d, 3)
 	solver := &customPaperSolver{}
 	d.Solver = solver
+	d.PracticeVariant = solver
 	req := customPaperReq("paper-command-concurrent")
 
 	start := make(chan struct{})

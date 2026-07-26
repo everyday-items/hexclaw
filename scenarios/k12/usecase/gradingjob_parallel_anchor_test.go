@@ -134,6 +134,11 @@ func newParallelAnchorOrchestrator(t *testing.T, rec Recognizer, anchorer Answer
 	d.Recognizer = rec
 	d.AnswerAnchorer = anchorer
 	d.PhotoAnnotator = &photoAnnotatorFake{}
+	d.ParentTeachingGuide = &parentTeachingGuideSpy{}
+	d.Profiles = newMemProfiles()
+	d.Profiles.(*memProfiles).m["mingming"] = k12.ChildProfile{
+		ChildName: "小明", GradeTerm: "五年级上",
+	}
 	d.Now = func() int64 { return time.Now().Unix() }
 	return trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshotResolver, opts...))
 }
@@ -171,6 +176,7 @@ func TestGradingOrchestratorRecognitionStartsIndependentAnchorAndDoesNotBlockCon
 	}}}
 	o := newParallelAnchorOrchestrator(t, rec, anchorer)
 	jobID := startOrchestratorJob(t, o, "msg-parallel-anchor").Record.RecordID
+	freezeItemResumeBudget(t, o, jobID)
 
 	runDone := make(chan GradingJobView, 1)
 	runErr := make(chan error, 1)
@@ -233,6 +239,7 @@ func TestGradingOrchestratorConfirmAndRunWaitsOutsideJobLockForSynchronousIMCons
 	}}}
 	o := newParallelAnchorOrchestrator(t, rec, anchorer)
 	jobID := startOrchestratorJob(t, o, "msg-sync-im-anchor").Record.RecordID
+	freezeItemResumeBudget(t, o, jobID)
 	if _, err := o.RunGradingJob(context.Background(), jobID); err != nil {
 		t.Fatalf("RunGradingJob: %v", err)
 	}
@@ -352,6 +359,10 @@ func TestGradingOrchestratorAnchorTimeoutPersistsDegradedAndTextGradingContinues
 	if !<-anchorer.hadDeadline {
 		t.Fatal("锚点调用必须使用 context.WithTimeout 派生的 deadline context")
 	}
+	waitGradingView(t, o, jobID, func(v GradingJobView) bool {
+		return v.Fields.AnchorState == k12.GradingAnchorDegraded
+	})
+	freezeItemResumeBudget(t, o, jobID)
 
 	confirmed, ok, err := o.ConfirmPhotoGradingJob(context.Background(), jobID, ConfirmPhotoGradingInput{})
 	if err != nil || !ok {
@@ -395,6 +406,7 @@ func TestGradingOrchestratorWaitForIdleIncludesAnchorAndFollowupWorkers(t *testi
 	}}}
 	o := newParallelAnchorOrchestrator(t, rec, anchorer)
 	jobID := startOrchestratorJob(t, o, "msg-worker-lifecycle").Record.RecordID
+	freezeItemResumeBudget(t, o, jobID)
 	if _, err := o.RunGradingJob(context.Background(), jobID); err != nil {
 		t.Fatal(err)
 	}

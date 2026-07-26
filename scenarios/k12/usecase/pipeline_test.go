@@ -37,7 +37,11 @@ func newPipeline(t *testing.T, solver Solver, grader Grader, ins Insights) (Deps
 	t.Helper()
 	db := openMigratedTestDB(t)
 	for _, a := range []string{"mingming", "eval-agent"} {
-		if _, err := db.Exec(`INSERT INTO agents(name) VALUES(?)`, a); err != nil {
+		if _, err := db.Exec(
+			`INSERT INTO agents(name, metadata) VALUES(?, ?)`,
+			a,
+			`{"k12.grade_term":"五年级上"}`,
+		); err != nil {
 			t.Fatalf("agent %s: %v", a, err)
 		}
 	}

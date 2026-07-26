@@ -10,6 +10,7 @@ import (
 
 func TestGenericPrintUsecaseFreezesCanonicalArtifactAndDoesNotMutateSource(t *testing.T) {
 	d := newDataDeps(t)
+	d.Renderer = &v45PDFRenderer{data: []byte("%PDF-1.7\nexisting-usecase")}
 	ctx := context.Background()
 	setID := seedPaperBasket(t, d, ctx, "xiaoming")
 	before, err := d.GetPracticeSet(ctx, "xiaoming", setID)
@@ -50,6 +51,7 @@ func TestGenericPrintUsecaseFreezesCanonicalArtifactAndDoesNotMutateSource(t *te
 
 func TestGenericPrintUsecaseRejectsEmptyPrinterSnapshot(t *testing.T) {
 	d := newDataDeps(t)
+	d.Renderer = &v45PDFRenderer{data: []byte("%PDF-1.7\nexisting-snapshot")}
 	ctx := context.Background()
 	prepared, _, err := d.PrepareGenericPrint(ctx, usecase.PrepareGenericPrintRequest{
 		AgentName: "xiaoming", IdempotencyKey: "empty-snapshot",

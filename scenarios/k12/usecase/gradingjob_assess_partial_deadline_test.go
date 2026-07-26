@@ -245,12 +245,18 @@ func TestGradingOrchestratorAssessCompleteResultAtDeadlineDoesNotBecomeUnknown(t
 	grader := &successAfterDeadlineAssessGrader{started: make(chan struct{})}
 	recognizer := &countingRecognizer{questions: []RecognizedQuestion{{
 		Question: "1+1=", Subject: "数学", StudentAnswer: "2", AnswerState: AnswerStatePresent,
+		KnowledgePoints: []string{"整数加法"},
 	}}}
 	o := newParallelAnchorOrchestrator(t, recognizer, nil)
 	o.deps.Grader = grader
+	o.deps.Profiles = newMemProfiles()
+	o.deps.Profiles.(*memProfiles).m["mingming"] = k12.ChildProfile{
+		ChildName: "小明", GradeTerm: "五年级下",
+	}
 	o.deps.Now = func() int64 { return time.Now().Unix() }
 
 	jobID := startOrchestratorJob(t, o, "msg-assess-complete-at-deadline").Record.RecordID
+	freezeItemResumeBudget(t, o, jobID)
 	if _, err := o.RunGradingJob(context.Background(), jobID); err != nil {
 		t.Fatalf("RunGradingJob recognizing: %v", err)
 	}
@@ -260,7 +266,7 @@ func TestGradingOrchestratorAssessCompleteResultAtDeadlineDoesNotBecomeUnknown(t
 	})
 
 	o.deps.Now = func() int64 {
-		return time.Now().Unix() - k12.GradingStageBudgetSeconds(k12.GradingStageAssessing) + 1
+		return time.Now().Unix() - 90 + 1
 	}
 	view, err := o.ConfirmAndRun(context.Background(), jobID, nil)
 	if err != nil {
@@ -293,9 +299,14 @@ func TestGradingOrchestratorFrozenAssessCompleteResultAtDeadlinePersistsSuccess(
 	grader := &successAfterDeadlineAssessGrader{started: make(chan struct{})}
 	recognizer := &countingRecognizer{questions: []RecognizedQuestion{{
 		Question: "1+1=", Subject: "数学", StudentAnswer: "2", AnswerState: AnswerStatePresent,
+		KnowledgePoints: []string{"整数加法"},
 	}}}
 	o := newParallelAnchorOrchestrator(t, recognizer, nil)
 	o.deps.Grader = grader
+	o.deps.Profiles = newMemProfiles()
+	o.deps.Profiles.(*memProfiles).m["mingming"] = k12.ChildProfile{
+		ChildName: "小明", GradeTerm: "五年级下",
+	}
 	o.deps.Now = func() int64 { return time.Now().Unix() }
 
 	jobID := startOrchestratorJob(t, o, "msg-frozen-assess-complete-at-deadline").Record.RecordID

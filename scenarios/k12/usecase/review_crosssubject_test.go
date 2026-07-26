@@ -3,7 +3,6 @@ package usecase
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/records"
@@ -31,7 +30,12 @@ func TestAccumulationTerminalStatesCannotReenterReview(t *testing.T) {
 	ctx := context.Background()
 	id := seedAccumDue(t, d, "英语", "错词", "believe", 400)
 	cur, _ := d.Records.Get(ctx, id)
-	if err := d.MarkMastered(ctx, "mingming", id, cur.Version); err != nil {
+	if err := d.MarkRetried(ctx, id, cur.Version); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := d.Records.Get(ctx, id)
+	d.Now = func() int64 { return 1000 + MasteryGapInterval }
+	if err := d.MarkRetried(ctx, id, first.Version); err != nil {
 		t.Fatal(err)
 	}
 	mastered, _ := d.Records.Get(ctx, id)
@@ -101,8 +105,8 @@ func TestAccum_AddSetsDueForCorrectiveOnly(t *testing.T) {
 	}
 }
 
-// TestAccum_MarkRetriedAndMastered accum 纠错型复习闭环：MarkRetried 进阶轮次、MarkMastered 清到期。
-func TestAccum_MarkRetriedAndMastered(t *testing.T) {
+// TestAccum_EvidenceMastery accum 纠错型也只由两次独立正确证据升级掌握。
+func TestAccum_EvidenceMastery(t *testing.T) {
 	d, _ := newPipeline(t, fakeSolver{}, fakeGrader{}, &fakeInsights{})
 	ctx := context.Background()
 	id := seedAccumDue(t, d, "英语", "错词", "believe", 400)
@@ -121,7 +125,8 @@ func TestAccum_MarkRetriedAndMastered(t *testing.T) {
 	}
 
 	cur2, _ := d.Records.Get(ctx, id)
-	if err := d.MarkMastered(ctx, "mingming", id, cur2.Version); err != nil {
+	d.Now = func() int64 { return 1000 + MasteryGapInterval }
+	if err := d.MarkRetried(ctx, id, cur2.Version); err != nil {
 		t.Fatal(err)
 	}
 	got2, _ := d.Records.Get(ctx, id)
@@ -130,27 +135,5 @@ func TestAccum_MarkRetriedAndMastered(t *testing.T) {
 	}
 	if got2.DueAt != nil {
 		t.Error("掌握后应清到期")
-	}
-}
-
-// TestAccum_GenerateRetry_VerbatimNotSolve 语英再练走原词重现（确定性），不走 solve 验算链。
-func TestAccum_GenerateRetry_VerbatimNotSolve(t *testing.T) {
-	// fakeSolver 会返回 "解：11.4"；若语英误走 solve，Solution 会是它而非原词重现。
-	d, _ := newPipeline(t, fakeSolver{solution: "解：11.4"}, fakeGrader{}, &fakeInsights{})
-	ctx := context.Background()
-	id := seedAccumDue(t, d, "英语", "错词", "believe", 400)
-
-	res, err := d.GenerateRetryByRecord(ctx, "mingming", id, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(res.Solution, "believe") || !strings.Contains(res.Solution, "再默一遍") {
-		t.Errorf("语英再练应原词重现（含原词 + 再默一遍），got %q", res.Solution)
-	}
-	if strings.Contains(res.Solution, "11.4") {
-		t.Error("语英再练误走了 solve 验算链（不应）")
-	}
-	if res.Evidence.Badge() != "verbatim-recall" {
-		t.Errorf("徽章应 verbatim-recall, got %q", res.Evidence.Badge())
 	}
 }

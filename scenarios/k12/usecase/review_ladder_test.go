@@ -107,14 +107,19 @@ func TestReviewIntervalLadder_MonotonicAndCapped(t *testing.T) {
 	}
 }
 
-// TestMarkMastered_ClearsDue 掌握后清到期，移出复习队列（回归保护：阶梯改造不破坏掌握态）。
-func TestMarkMastered_ClearsDue(t *testing.T) {
+// TestEvidenceMasteryClearsDue 两次相隔足够的正确证据才升级掌握并清到期。
+func TestEvidenceMasteryClearsDue(t *testing.T) {
 	d, _ := newPipeline(t, fakeSolver{}, fakeGrader{}, &fakeInsights{})
 	ctx := context.Background()
 	id := seedMistake(t, d, "a", "小数乘法", "计算失误", 500)
 
 	cur, _ := d.Records.Get(ctx, id)
-	if err := d.MarkMastered(ctx, "mingming", id, cur.Version); err != nil {
+	if err := d.MarkRetried(ctx, id, cur.Version); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := d.Records.Get(ctx, id)
+	d.Now = func() int64 { return 1000 + MasteryGapInterval }
+	if err := d.MarkRetried(ctx, id, first.Version); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := d.Records.Get(ctx, id)

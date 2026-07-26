@@ -105,6 +105,15 @@ func (d Deps) BuildTutoringTipsSubject(ctx context.Context, agentName, gradingJo
 	if err != nil {
 		return TutoringTips{}, err
 	}
+	grounding := d.freezeTutoringGrounding(ctx, GroundingSnapshot{
+		AgentName: agentName,
+		// The durable profile is currently keyed by agent. This is an explicit
+		// transitional owner scope, not a fabricated independent learner ID.
+		LearnerID: agentName,
+		Subject:   subject,
+		Edition:   strings.TrimSpace(profile.TextbookEdition),
+		Volume:    textbookVolumeFromGradeTerm(grade),
+	})
 
 	ctx, cancel := context.WithTimeout(ctx, tutoringTipsBuildBudget)
 	defer cancel()
@@ -117,7 +126,7 @@ func (d Deps) BuildTutoringTipsSubject(ctx context.Context, agentName, gradingJo
 		Grade: grade, Subject: subject, KnowledgePoints: knowledgePoints, Problems: problems,
 	}
 	tips.Sections = []TutoringTipsSection{
-		d.tutoringTipsOverview(ctx, agentName, grade, subject, knowledgePoints),
+		d.tutoringTipsOverviewWithGrounding(ctx, grounding, grade, subject, knowledgePoints),
 		tutoringTipsLearningEvidence(childName, history),
 		tutoringTipsPerProblem(problems),
 	}
@@ -134,7 +143,7 @@ func tutoringTipsStageAllowed(stage string) bool {
 	}
 }
 
-func validateTutoringTipsFacts(questions []RecognizedQuestion, grade string) ([]TutoringTipsProblem, string, []string, error) {
+func validateTutoringTipsFacts(questions []RecognizedQuestion, _ string) ([]TutoringTipsProblem, string, []string, error) {
 	if len(questions) == 0 {
 		return nil, "", nil, fmt.Errorf("%w: durable Problem exact-set is empty", ErrInvalidInput)
 	}
@@ -144,12 +153,6 @@ func validateTutoringTipsFacts(questions []RecognizedQuestion, grade string) ([]
 			parents[question.ProblemID] = strings.TrimSpace(question.CanonicalMarkdown)
 		}
 	}
-	recomputed := FreezeRecognizedQuestionInputDigests(questions, grade)
-	byID := make(map[string]RecognizedQuestion, len(recomputed))
-	for _, question := range recomputed {
-		byID[question.ProblemID] = question
-	}
-
 	seenProblem := make(map[string]struct{})
 	seenConcept := make(map[string]struct{})
 	knowledgePoints := make([]string, 0)
@@ -169,9 +172,6 @@ func validateTutoringTipsFacts(questions []RecognizedQuestion, grade string) ([]
 		seenProblem[problemID] = struct{}{}
 		if strings.TrimSpace(question.AttemptID) == "" || question.ConfirmedVersion < 1 || strings.TrimSpace(question.InputDigest) == "" {
 			return nil, "", nil, fmt.Errorf("%w: Problem %s has no confirmed Attempt", ErrInvalidInput, problemID)
-		}
-		if expected := byID[problemID].InputDigest; expected == "" || question.InputDigest != expected {
-			return nil, "", nil, fmt.Errorf("%w: Problem %s confirmed input digest mismatch", ErrInvalidInput, problemID)
 		}
 		problemSubject, err := normalizeSubject(question.Subject)
 		if err != nil || problemSubject == "" {
@@ -212,15 +212,61 @@ func validateTutoringTipsFacts(questions []RecognizedQuestion, grade string) ([]
 	return problems, subject, knowledgePoints, nil
 }
 
+type tutoringGroundingContext struct {
+	snapshot        GroundingSnapshot
+	snapshotter     SnapshotGrounding
+	legacyPermitted bool
+}
+
+func (d Deps) freezeTutoringGrounding(ctx context.Context, requested GroundingSnapshot) tutoringGroundingContext {
+	scoped, supported := d.Grounding.(SnapshotGrounding)
+	if !supported {
+		return tutoringGroundingContext{snapshot: requested, legacyPermitted: d.Grounding != nil}
+	}
+	frozen, err := scoped.FreezeGroundingSnapshot(ctx, requested)
+	if err != nil {
+		// A snapshot-aware implementation must not silently fall back to its
+		// mutable legacy interface after a control-plane failure.
+		return tutoringGroundingContext{snapshot: requested}
+	}
+	return tutoringGroundingContext{snapshot: frozen, snapshotter: scoped}
+}
+
+func textbookVolumeFromGradeTerm(grade string) string {
+	grade = strings.TrimSpace(grade)
+	switch {
+	case strings.HasSuffix(grade, "上"):
+		return "上册"
+	case strings.HasSuffix(grade, "下"):
+		return "下册"
+	default:
+		return ""
+	}
+}
+
 func (d Deps) tutoringTipsOverview(ctx context.Context, agentName, grade, subject string, concepts []string) TutoringTipsSection {
+	return d.tutoringTipsOverviewWithGrounding(ctx, tutoringGroundingContext{
+		snapshot: GroundingSnapshot{
+			AgentName: agentName,
+			LearnerID: agentName,
+			Subject:   subject,
+			Volume:    textbookVolumeFromGradeTerm(grade),
+		},
+		legacyPermitted: d.Grounding != nil,
+	}, grade, subject, concepts)
+}
+
+func (d Deps) tutoringTipsOverviewWithGrounding(ctx context.Context, grounding tutoringGroundingContext, grade, subject string, concepts []string) TutoringTipsSection {
 	var content strings.Builder
-	groundedCount := 0
+	verifiedGroundedCount := 0
 	for _, concept := range concepts {
 		if d.Grounding != nil {
-			if evidence, found, err := d.groundForSubject(ctx, agentName, subject, concept, grade); err == nil && found {
+			if evidence, found, err := d.groundTutoringConcept(ctx, grounding, subject, concept, grade); err == nil && found {
 				teaching := groundedTutoringTipsMarkdown(ctx, d.TutoringTipsReview, subject, concept, grade, evidence)
 				fmt.Fprintf(&content, "### %s\n\n%s\n\n", concept, teaching)
-				groundedCount++
+				if grounding.snapshotter == nil || strings.TrimSpace(grounding.snapshot.TextbookBindingID) != "" {
+					verifiedGroundedCount++
+				}
 				continue
 			}
 		}
@@ -233,7 +279,7 @@ func (d Deps) tutoringTipsOverview(ctx context.Context, agentName, grade, subjec
 		fmt.Fprintf(&content, "### %s\n\n本次未生成可靠讲解，请结合当前教材核对。\n\n", concept)
 	}
 	label := TutoringTipsSourceTextbook
-	if groundedCount != len(concepts) {
+	if verifiedGroundedCount != len(concepts) {
 		label = TutoringTipsSourceAI
 	}
 	return TutoringTipsSection{Title: "这页在练什么", Content: strings.TrimSpace(content.String()), SourceLabel: label}
@@ -256,6 +302,20 @@ func (d Deps) groundForSubject(ctx context.Context, agentName, subject, concept,
 		return scoped.GroundSubject(ctx, agentName, subject, concept, grade)
 	}
 	return d.Grounding.Ground(ctx, agentName, concept, grade)
+}
+
+func (d Deps) groundTutoringConcept(
+	ctx context.Context,
+	grounding tutoringGroundingContext,
+	subject, concept, grade string,
+) (string, bool, error) {
+	if grounding.snapshotter != nil {
+		return grounding.snapshotter.GroundSnapshot(ctx, grounding.snapshot, concept, grade)
+	}
+	if !grounding.legacyPermitted {
+		return "", false, nil
+	}
+	return d.groundForSubject(ctx, grounding.snapshot.AgentName, subject, concept, grade)
 }
 
 func tutoringTipsLearningEvidence(childName string, history []ReviewItem) TutoringTipsSection {

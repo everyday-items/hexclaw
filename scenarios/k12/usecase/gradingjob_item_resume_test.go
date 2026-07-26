@@ -519,18 +519,19 @@ func TestGradingOrchestratorItemResume_WrongProjectionFactsSurviveCrashAndDedupe
 	}
 }
 
-func TestGradingOrchestratorItemResume_LegacyPolicyDoesNotWriteItemTables(t *testing.T) {
+func TestGradingOrchestratorItemResume_V51PolicyWritesCanonicalItemReceipts(t *testing.T) {
 	solver := &itemResumeSolver{calls: map[string]int{}}
 	grader := &itemResumeGrader{calls: map[string]int{}}
-	// No frozen budget option is supplied: policy_version=0 is the historical
-	// page-level path and must never silently dual-write the V30 item tables.
+	// ADR-K12-024/V51 has one production path. Completion is authorized by
+	// per-problem invocation and assessment receipts rather than a page result.
 	o := newItemResumeOrchestrator(t, t.TempDir(), []RecognizedQuestion{{
 		Question: "q1", Subject: "数学", StudentAnswer: "1", AnswerState: AnswerStatePresent,
 	}}, solver, grader)
-	jobID := startOrchestratorJob(t, o, "item-resume-legacy-no-dual-write").Record.RecordID
+	o.deps.GradingBudgetSnapshot = orchestratorTestBudget()
+	jobID := startOrchestratorJob(t, o, "item-resume-v51-canonical-receipts").Record.RecordID
 	view, err := o.RunGradingJob(context.Background(), jobID)
 	if err != nil || view.Record.Status != k12.GradingStageAwaitingConfirmation {
-		t.Fatalf("legacy run to confirmation: stage=%s err=%v", view.Record.Status, err)
+		t.Fatalf("V51 run to confirmation: stage=%s err=%v", view.Record.Status, err)
 	}
 	waitGradingView(t, o, jobID, func(v GradingJobView) bool {
 		return v.Fields.AnchorState == k12.GradingAnchorLocated ||
@@ -539,15 +540,19 @@ func TestGradingOrchestratorItemResume_LegacyPolicyDoesNotWriteItemTables(t *tes
 
 	completed, err := o.ConfirmAndRun(context.Background(), jobID, nil)
 	if err != nil || completed.Record.Status != k12.GradingStageCompleted {
-		t.Fatalf("legacy grading: stage=%s err=%v", completed.Record.Status, err)
+		t.Fatalf("V51 grading: stage=%s err=%v", completed.Record.Status, err)
 	}
-	for _, table := range []string{"k12_grading_item_invocations", "k12_grading_assessment_items"} {
+	wantRows := map[string]int{
+		"k12_grading_item_invocations": 2,
+		"k12_grading_assessment_items": 1,
+	}
+	for table, want := range wantRows {
 		var rows int
 		if err := o.deps.Records.DB().QueryRow("SELECT COUNT(*) FROM "+table+" WHERE job_id=?", jobID).Scan(&rows); err != nil {
 			t.Fatalf("count %s: %v", table, err)
 		}
-		if rows != 0 {
-			t.Fatalf("legacy policy dual-wrote %d rows to %s", rows, table)
+		if rows != want {
+			t.Fatalf("V51 canonical receipts in %s=%d, want %d", table, rows, want)
 		}
 	}
 }

@@ -24,6 +24,9 @@ type PracticeSetView struct {
 
 // CreatePracticeSet 新建练习集草稿（PRD §3.8）。幂等去重：同来源+标题+题目内容命中已存在则不重复入库。
 func (d Deps) CreatePracticeSet(ctx context.Context, agentName, sourceSession string, f k12.PracticeSetFields) (recordID string, created bool, err error) {
+	if f.GradeTerm == "" {
+		f.GradeTerm = d.creationGradeTerm(ctx, agentName, "")
+	}
 	rec, err := k12.NewPracticeSetRecord(agentName, sourceSession, f)
 	if err != nil {
 		return "", false, err
@@ -415,10 +418,11 @@ func (d Deps) FillBasketFromDue(ctx context.Context, agentName, sourceSession st
 // 防「确认了一堆」把周卷塞满抽查题；超出的顺延到下次装篮）。
 const spotCheckWeeklyCap = 2
 
-// spotCheckCandidates 取本次应混入周卷的抽查复验错题（§3.6）：已掌握且
-// spot_check_state=scheduled；跳过在途（已固化未复批卷中）的抽查；最早确认优先，≤2 道。
+// spotCheckCandidates 取本次应混入周卷的抽查复验错题（§3.6）。
+// 家长确认不再篡改 evidence status，所以候选由独立 scheduled + due_at 事实选出；
+// 历史 mastered+scheduled 行仍可继续完成一次抽查。
 func (d Deps) spotCheckCandidates(ctx context.Context, agentName string) ([]ReviewItem, error) {
-	recs, err := d.Records.ListByScope(ctx, agentName, k12.CollectionMistakes, k12.StatusMastered)
+	recs, err := d.Records.ListByScope(ctx, agentName, k12.CollectionMistakes, "")
 	if err != nil {
 		return nil, fmt.Errorf("usecase: 取抽查复验候选: %w", err)
 	}
@@ -427,17 +431,31 @@ func (d Deps) spotCheckCandidates(ctx context.Context, agentName string) ([]Revi
 		return nil, err
 	}
 	var out []ReviewItem
-	// ListByScope 按创建倒序；抽查顺延语义按最早确认优先 → 反向遍历。
-	for i := len(recs) - 1; i >= 0; i-- {
-		r := recs[i]
+	now := d.now()
+	for _, r := range recs {
 		f, _ := k12.ParseMistakeFields(r.Fields)
-		if f.SpotCheckState != k12.SpotCheckScheduled || inFlight[r.RecordID] {
+		if r.Status == k12.StatusArchived ||
+			f.SpotCheckState != k12.SpotCheckScheduled ||
+			r.DueAt == nil || *r.DueAt > now ||
+			inFlight[r.RecordID] {
 			continue
 		}
 		out = append(out, ReviewItem{Record: r, Fields: f})
-		if len(out) >= spotCheckWeeklyCap {
-			break
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		fi, _ := k12.ParseMistakeFields(out[i].Record.Fields)
+		fj, _ := k12.ParseMistakeFields(out[j].Record.Fields)
+		ti, tj := fi.ParentConfirmedAt, fj.ParentConfirmedAt
+		if ti == 0 {
+			ti = out[i].Record.CreatedAt
 		}
+		if tj == 0 {
+			tj = out[j].Record.CreatedAt
+		}
+		return ti < tj
+	})
+	if len(out) > spotCheckWeeklyCap {
+		out = out[:spotCheckWeeklyCap]
 	}
 	return out, nil
 }
@@ -515,11 +533,15 @@ func (d Deps) RemoveFromBasket(ctx context.Context, agentName, recordID, itemID 
 	if v.Record.Status != k12.PracticeStatusDraft {
 		return fmt.Errorf("usecase: 只有待打印（draft）练习集可移除题目，当前 %s", v.Record.Status)
 	}
-	kept := v.Fields.Items[:0]
+	// 先按原长度分配：空篮再次移除必须返回“项不存在”，不能因 len-1 为负触发 panic。
+	// 实际少一个元素只影响至多一个 slot，不值得用不安全的容量算术换取。
+	kept := make([]k12.PracticeItem, 0, len(v.Fields.Items))
 	found := false
+	var removed k12.PracticeItem
 	for _, it := range v.Fields.Items {
 		if it.ItemID == itemID {
 			found = true
+			removed = it
 			continue
 		}
 		kept = append(kept, it)
@@ -528,7 +550,17 @@ func (d Deps) RemoveFromBasket(ctx context.Context, agentName, recordID, itemID 
 		return fmt.Errorf("usecase: 练习项 %s 不在待打印列表中", itemID)
 	}
 	v.Fields.Items = kept
-	return d.savePracticeFields(ctx, v, v.Record.Status)
+	raw, err := marshalPracticeFields(v.Fields)
+	if err != nil {
+		return err
+	}
+	if err := d.Records.RemovePracticeItemAndRetireGeneration(
+		ctx, v.Record.AgentName, v.Record.RecordID, itemID,
+		removed.GenerationJobID, raw, v.Record.Version,
+	); err != nil {
+		return fmt.Errorf("usecase: 移除练习项: %w", err)
+	}
+	return nil
 }
 
 func samePracticeItem(a, b k12.PracticeItem) bool {
@@ -669,6 +701,7 @@ func (d Deps) SubmitReturns(ctx context.Context, agentName, recordID string, inp
 		}
 		v.Fields.ReturnAssets = append(v.Fields.ReturnAssets, k12.PracticeReturnAsset{
 			ReturnID: returnID, AssetID: assetID, ItemIDs: canonical, ReturnedAt: d.now(),
+			RegradeStatus: k12.PracticeRegradeQueued, RegradeUpdatedAt: d.now(),
 		})
 		changed = true
 	}
@@ -771,6 +804,34 @@ type PracticeGradeResult struct {
 //   - 部分回传合法：允许多次调用，每次覆盖已给结论的题，重复同一结论幂等（不二次推进阶梯）；
 //     全部入卷题都有结论后卷才转 graded；graded 后仍可修正重批（覆盖结论，卷保持 graded）。
 func (d Deps) GradePracticeSetItems(ctx context.Context, agentName, recordID string, results []PracticeGradeResult) (PracticeSetView, error) {
+	return d.gradePracticeSetItems(ctx, agentName, recordID, results, k12.PracticeResultSystemVerified)
+}
+
+// ConfirmPracticeSetItems is the no-photo/manual fallback. It advances the
+// spaced-review schedule so a truthful parent check is useful, but records
+// human_confirmed and can never promote a source record to system mastery.
+func (d Deps) ConfirmPracticeSetItems(ctx context.Context, agentName, recordID string, results []PracticeGradeResult) (PracticeSetView, error) {
+	view, err := d.GetPracticeSet(ctx, agentName, recordID)
+	if err != nil {
+		return PracticeSetView{}, err
+	}
+	if view.Record.Status == k12.PracticeStatusAssigned {
+		if err := d.savePracticeFields(ctx, view, k12.PracticeStatusSubmitted); err != nil {
+			return PracticeSetView{}, err
+		}
+	}
+	return d.gradePracticeSetItems(ctx, agentName, recordID, results, k12.PracticeResultHumanConfirmed)
+}
+
+func (d Deps) gradePracticeSetItems(
+	ctx context.Context,
+	agentName, recordID string,
+	results []PracticeGradeResult,
+	evidence string,
+) (PracticeSetView, error) {
+	if evidence != k12.PracticeResultSystemVerified && evidence != k12.PracticeResultHumanConfirmed {
+		return PracticeSetView{}, fmt.Errorf("%w: 复批证据等级非法 %q", ErrInvalidInput, evidence)
+	}
 	v, err := d.GetPracticeSet(ctx, agentName, recordID)
 	if err != nil {
 		return PracticeSetView{}, err
@@ -794,19 +855,26 @@ func (d Deps) GradePracticeSetItems(ctx context.Context, agentName, recordID str
 		if !k12.PracticeItemPublishable(*it) {
 			return PracticeSetView{}, fmt.Errorf("%w: 练习项 %s 是被跳过的阻断题，不在卷面上，不能给结论", ErrInvalidInput, res.ItemID)
 		}
-		if !it.Returned {
+		if evidence == k12.PracticeResultSystemVerified && !it.Returned {
 			return PracticeSetView{}, fmt.Errorf("%w: 练习项 %s 尚无 return_assets 照片覆盖证据，不能给复批结论", ErrInvalidInput, res.ItemID)
 		}
-		if it.ResultCorrect != nil && *it.ResultCorrect == res.Correct {
+		if it.ResultCorrect != nil && *it.ResultCorrect == res.Correct && it.ResultEvidence == evidence {
 			continue // 幂等：重复同一结论不重复联动错题
 		}
 		correct := res.Correct
 		it.ResultCorrect = &correct
+		it.ResultEvidence = evidence
 		// Returned=return_assets 照片覆盖投影、ResultCorrect=复批结论（对错），两字段
 		// 独立不合并；DD-028 后复批不能反向伪造 Returned，证据必须先由 SubmitReturn 追加。
 		if it.SourceProblemID != "" {
-			if err := d.applyRegradeOutcome(ctx, it.SourceProblemID, correct); err != nil {
-				return PracticeSetView{}, err
+			var projectionErr error
+			if evidence == k12.PracticeResultSystemVerified {
+				projectionErr = d.applyRegradeOutcome(ctx, it.SourceProblemID, correct)
+			} else {
+				projectionErr = d.applyHumanConfirmedRegradeOutcome(ctx, it.SourceProblemID, correct)
+			}
+			if projectionErr != nil {
+				return PracticeSetView{}, projectionErr
 			}
 		}
 	}
@@ -819,6 +887,58 @@ func (d Deps) GradePracticeSetItems(ctx context.Context, agentName, recordID str
 		return PracticeSetView{}, err
 	}
 	return d.GetPracticeSet(ctx, agentName, recordID)
+}
+
+// applyHumanConfirmedRegradeOutcome mirrors the scheduling effect of a
+// truthful manual check without ever writing LastRetriedAt or mastered. Those
+// two facts are reserved for system-verified attempts.
+func (d Deps) applyHumanConfirmedRegradeOutcome(ctx context.Context, sourceID string, correct bool) error {
+	if !correct {
+		return d.applyRegradeOutcome(ctx, sourceID, false)
+	}
+	rec, err := d.Records.Get(ctx, sourceID)
+	if err != nil {
+		return fmt.Errorf("usecase: 取人工复批来源题 %s: %w", sourceID, err)
+	}
+	now := d.now()
+	switch rec.Collection {
+	case k12.CollectionMistakes:
+		if rec.Status == k12.StatusMastered {
+			return nil
+		}
+		f, err := k12.ParseMistakeFields(rec.Fields)
+		if err != nil {
+			return fmt.Errorf("usecase: 解析人工复批错题字段: %w", err)
+		}
+		f.ReviewStage++
+		due := now + reviewIntervalForStage(f.ReviewStage)
+		raw, err := json.Marshal(f)
+		if err != nil {
+			return fmt.Errorf("usecase: marshal 人工复批错题字段: %w", err)
+		}
+		return d.Records.UpdateStatusFields(
+			ctx, rec.RecordID, k12.StatusRetried, &due, string(raw), rec.Version,
+		)
+	case k12.CollectionAccumulation:
+		if rec.Status == k12.AccumStatusMastered || rec.Status == k12.AccumStatusKept {
+			return nil
+		}
+		f, err := k12.ParseAccumFields(rec.Fields)
+		if err != nil {
+			return fmt.Errorf("usecase: 解析人工复批积累字段: %w", err)
+		}
+		f.ReviewStage++
+		due := now + reviewIntervalForStage(f.ReviewStage)
+		raw, err := json.Marshal(f)
+		if err != nil {
+			return fmt.Errorf("usecase: marshal 人工复批积累字段: %w", err)
+		}
+		return d.Records.UpdateStatusFields(
+			ctx, rec.RecordID, k12.AccumStatusReviewing, &due, string(raw), rec.Version,
+		)
+	default:
+		return fmt.Errorf("usecase: 人工复批来源 %s 不属于可复习记录集（%s）", sourceID, rec.Collection)
+	}
 }
 
 // allItemsConcluded 是否全部入卷（verified）题都已有逐题结论。
@@ -875,7 +995,7 @@ func (d Deps) applyRegradeOutcome(ctx context.Context, sourceID string, correct 
 }
 
 // applySpotCheckOutcome 抽查复验结论落地（§3.6 规则 2/3/4）：
-//   - 通过 → passed：保持已掌握（parent_confirmed 事实与系统证据一致），不动到期；
+//   - 通过 → passed：把本次真实作答按正常 mastery policy 累积，不能把家长确认冒充证据；
 //   - 未过 → failed：回到本周复习队列（due=now、mastered→retried——状态机唯一合法回退），
 //     间隔档保持确认前档位（确认动作未改 ReviewStage，不清零）；档案据 failed 呈现
 //     「家长确认（复验未过）」标注，话术温和不指责由前端文案承担；
@@ -883,11 +1003,28 @@ func (d Deps) applyRegradeOutcome(ctx context.Context, sourceID string, correct 
 func (d Deps) applySpotCheckOutcome(ctx context.Context, rec *records.AgentRecord, f k12.MistakeFields, correct bool) error {
 	if correct {
 		f.SpotCheckState = k12.SpotCheckPassed
+		now := d.now()
+		status := rec.Status
+		var due *int64
+		if status == k12.StatusMastered {
+			due = nil // 兼容旧 mastered+scheduled 数据；系统证据已在旧状态中。
+		} else if status == k12.StatusRetried && f.LastRetriedAt > 0 &&
+			now-f.LastRetriedAt >= MasteryGapInterval {
+			f.LastRetriedAt = now
+			status = k12.StatusMastered
+			due = nil
+		} else {
+			f.ReviewStage++
+			f.LastRetriedAt = now
+			nextDue := now + reviewIntervalForStage(f.ReviewStage)
+			due = &nextDue
+			status = k12.StatusRetried
+		}
 		raw, err := json.Marshal(f)
 		if err != nil {
 			return fmt.Errorf("usecase: marshal 错题字段: %w", err)
 		}
-		return d.Records.UpdateStatusFields(ctx, rec.RecordID, rec.Status, rec.DueAt, string(raw), rec.Version)
+		return d.Records.UpdateStatusFields(ctx, rec.RecordID, status, due, string(raw), rec.Version)
 	}
 	f.SpotCheckState = k12.SpotCheckFailed
 	raw, err := json.Marshal(f)

@@ -65,12 +65,12 @@ func RenderReportMarkdown(rep InsightReport, gradeTerm string) (md string, skip 
 			rep.ConsecutiveFailKPs[0])
 	}
 
-	// ③ 复习完成
+	// ③ 当前复习周完成
 	b.WriteString("## 复习完成\n\n")
 	if rep.ReviewCompletionRate < 0 {
-		b.WriteString("本月还没有需要复习的错题。\n\n")
+		b.WriteString("本周还没有已固化的练习卷。\n\n")
 	} else {
-		fmt.Fprintf(&b, "本月复习完成率 %.0f%%。\n\n", rep.ReviewCompletionRate*100)
+		fmt.Fprintf(&b, "本周复习完成率 %.0f%%。\n\n", rep.ReviewCompletionRate*100)
 	}
 
 	// ④ 下月建议

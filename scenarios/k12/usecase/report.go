@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -11,167 +12,249 @@ import (
 
 const repeatedUnmasteredThreshold = 2
 
-// TrendCounts 进步趋势（PRD §3.5.4 顶部行「已掌握 X·待复习 Y·已重做 Z」）。
+var insightLocation = time.FixedZone("Asia/Shanghai", 8*60*60)
+
+// TrendCounts is the current grade-term mistake-state distribution.
 type TrendCounts struct {
-	Mastered  int `json:"mastered"`  // 已掌握
-	Reviewing int `json:"reviewing"` // 待复习（new + explained）
-	Retried   int `json:"retried"`   // 已重做
-	Archived  int `json:"archived"`  // 已归档
+	Mastered  int `json:"mastered"`
+	Reviewing int `json:"reviewing"`
+	Retried   int `json:"retried"`
+	Archived  int `json:"archived"`
 	Total     int `json:"total"`
 }
 
-// WeakPoint 薄弱知识点（当月错题计数）。
+// WeakPoint is a current-month, current-term source projection. Share always
+// uses MonthNewMistakes as its denominator; Desktop must not recompute it from
+// another request or window.
 type WeakPoint struct {
-	KnowledgePoint string `json:"knowledge_point"`
-	Count          int    `json:"count"`
+	Subject        string  `json:"subject"`
+	KnowledgePoint string  `json:"knowledge_point"`
+	Count          int     `json:"count"`
+	Share          float64 `json:"share"`
 }
 
-// InsightReport 学情报告（M2-5，只读聚合 §5.4 口径）。
+// InsightReport is a one-snapshot read model. Every visible number, drill-down
+// filter and canonical report render is derived from SourceRecordIDs at AsOf.
 type InsightReport struct {
+	Learner             string   `json:"learner"`
+	GradeTerm           string   `json:"grade_term"`
+	AsOf                int64    `json:"as_of"`
+	SourceDigest        string   `json:"source_digest"`
+	SourceRecordIDs     []string `json:"source_record_ids"`
+	UnscopedSourceCount int      `json:"unscoped_source_count"`
+	ReviewWeekStart     int64    `json:"review_week_start"`
+	ReviewWeekEnd       int64    `json:"review_week_end"`
+
 	Trend            TrendCounts `json:"trend"`
-	WeakTop3         []WeakPoint `json:"weak_top3"`          // §5.4.1 当月新增错题 TOP3
-	MonthNewMistakes int         `json:"month_new_mistakes"` // 当月新增错题数
-	// ReviewCompletionRate 复习完成率（架构设计 §5.7 口径）：已复批 PracticeSetItem 数 ÷
-	// 已固化（打印/发送）卷的 verified 题目总数；从练习集 collection 投影。
-	// 错题 retried/mastered 状态变更由复批投影产生，不混入本指标。-1 = 分母 0（显示「—」）。
+	WeakTop3         []WeakPoint `json:"weak_top3"`
+	MonthNewMistakes int         `json:"month_new_mistakes"`
+	WeekPending      int         `json:"week_pending"`
+	PracticePending  int         `json:"practice_pending"`
+	// -1 means the current review-week denominator is zero.
 	ReviewCompletionRate float64  `json:"review_completion_rate"`
-	ConsecutiveFailKPs   []string `json:"consecutive_fail_kps"` // 连续挫败知识点（≥阈值未掌握）
-	Suggestion           string   `json:"suggestion"`           // 本月建议
+	ConsecutiveFailKPs   []string `json:"consecutive_fail_kps"`
+	Suggestion           string   `json:"suggestion"`
 }
 
-// InsightReport 生成学情报告：趋势（累计状态）+ 当月薄弱 TOP3 + 复习完成率 + 连续挫败 + 建议。
+type weakPointKey struct {
+	subject string
+	point   string
+}
+
+// InsightReport freezes profile, mistakes, corrective accumulations and
+// practice sets in one storage transaction, then derives independent semester,
+// month and review-week windows from that exact source set.
 func (d Deps) InsightReport(ctx context.Context, agentName string) (InsightReport, error) {
-	if agentName == "" {
+	if strings.TrimSpace(agentName) == "" {
 		return InsightReport{}, fmt.Errorf("usecase: agentName 不可空")
 	}
-	all, err := d.Records.ListByScope(ctx, agentName, k12.CollectionMistakes, "")
-	if err != nil {
-		return InsightReport{}, fmt.Errorf("usecase: 聚合学情: %w", err)
+	if d.Records == nil {
+		return InsightReport{}, fmt.Errorf("usecase: 未配置 K12 记录存储")
 	}
-	monthStart := startOfMonth(d.now())
+	asOf := d.now()
+	source, err := d.Records.ReadInsightSourceSnapshot(ctx, agentName, asOf)
+	if err != nil {
+		return InsightReport{}, fmt.Errorf("usecase: 冻结学情快照: %w", err)
+	}
+	weekStart, weekEnd := reviewWeekWindow(asOf)
+	report := InsightReport{
+		Learner:              source.Learner,
+		GradeTerm:            source.Profile.GradeTerm,
+		AsOf:                 source.AsOf,
+		SourceDigest:         source.SourceDigest,
+		SourceRecordIDs:      append([]string(nil), source.SourceRecordIDs...),
+		UnscopedSourceCount:  source.UnscopedSourceCount,
+		ReviewWeekStart:      weekStart,
+		ReviewWeekEnd:        weekEnd,
+		ReviewCompletionRate: -1,
+	}
+	monthStart := startOfInsightMonth(asOf)
+	weakCount := map[weakPointKey]int{}
+	failCount := map[string]int{}
 
-	var rep InsightReport
-	weakCount := map[string]int{} // 当月薄弱计数
-	failCount := map[string]int{} // 未掌握计数（连续挫败）
-
-	for _, r := range all {
-		f, _ := k12.ParseMistakeFields(r.Fields)
-		// 趋势（累计状态机分布）
-		rep.Trend.Total++
-		switch r.Status {
+	for _, record := range source.Mistakes {
+		fields, parseErr := k12.ParseMistakeFields(record.Fields)
+		if parseErr != nil {
+			return InsightReport{}, fmt.Errorf("usecase: 解析学情错题 %s: %w", record.RecordID, parseErr)
+		}
+		report.Trend.Total++
+		switch record.Status {
 		case k12.StatusMastered:
-			rep.Trend.Mastered++
+			report.Trend.Mastered++
 		case k12.StatusRetried:
-			rep.Trend.Retried++
+			report.Trend.Retried++
 		case k12.StatusArchived:
-			rep.Trend.Archived++
-		default: // new / explained = 待复习
-			rep.Trend.Reviewing++
+			report.Trend.Archived++
+		default:
+			report.Trend.Reviewing++
 		}
-		// 连续挫败：未掌握的错题按知识点累计
-		if r.Status != k12.StatusMastered && r.Status != k12.StatusArchived && f.KnowledgePoint != "" {
-			failCount[f.KnowledgePoint]++
+		if record.Status != k12.StatusMastered &&
+			record.Status != k12.StatusArchived &&
+			strings.TrimSpace(fields.KnowledgePoint) != "" {
+			failCount[fields.KnowledgePoint]++
 		}
-		// 当月口径
-		if r.CreatedAt >= monthStart {
-			rep.MonthNewMistakes++
-			if f.KnowledgePoint != "" {
-				weakCount[f.KnowledgePoint]++
+		if record.CreatedAt >= monthStart && record.CreatedAt <= asOf {
+			report.MonthNewMistakes++
+			point := strings.TrimSpace(fields.KnowledgePoint)
+			if point != "" {
+				subject := strings.TrimSpace(fields.Subject)
+				if subject == "" {
+					subject = "数学"
+				}
+				weakCount[weakPointKey{subject: subject, point: point}]++
 			}
 		}
+		if insightMistakeDue(record.Status, fields.SpotCheckState, record.DueAt, asOf) {
+			report.WeekPending++
+		}
+	}
+	for _, record := range source.Accumulations {
+		fields, parseErr := k12.ParseAccumFields(record.Fields)
+		if parseErr != nil {
+			return InsightReport{}, fmt.Errorf("usecase: 解析学情积累 %s: %w", record.RecordID, parseErr)
+		}
+		if record.Status == k12.AccumStatusReviewing &&
+			k12.AccumIsCorrective(fields.EntryType) &&
+			record.DueAt != nil &&
+			*record.DueAt <= asOf {
+			report.WeekPending++
+		}
 	}
 
-	rep.WeakTop3 = topN(weakCount, 3)
-	rate, err := d.reviewCompletionRate(ctx, agentName)
-	if err != nil {
-		return InsightReport{}, err
-	}
-	rep.ReviewCompletionRate = rate
-	rep.ConsecutiveFailKPs = keysAtLeast(failCount, repeatedUnmasteredThreshold)
-	rep.Suggestion = buildSuggestion(rep)
-	return rep, nil
-}
-
-// reviewCompletionRate 复习完成率（§5.7 纠偏口径，2026-07-18）：
-// 分母 = 已固化（打印/发送）卷的 verified 题目总数；分子 = 其中已复批（有逐题结论，
-// 或整卷 graded/closed 的旧行为卷）的 PracticeSetItem 数。取消卷与未固化篮不入口径；
-// 分母 0 → -1 哨兵（前端显示「—」）。
-func (d Deps) reviewCompletionRate(ctx context.Context, agentName string) (float64, error) {
-	sets, err := d.Records.ListByScope(ctx, agentName, k12.CollectionPracticeSet, "")
-	if err != nil {
-		return 0, fmt.Errorf("usecase: 投影练习集完成率: %w", err)
-	}
 	total, done := 0, 0
-	for _, r := range sets {
-		if r.Status == k12.PracticeStatusCancelled {
+	for _, record := range source.PracticeSets {
+		if record.Status == k12.PracticeStatusCancelled {
 			continue
 		}
-		f, _ := k12.ParsePracticeSetFields(r.Fields)
-		if f.FinalizedAt == 0 { // 未固化（待打印篮）不入口径
+		fields, parseErr := k12.ParsePracticeSetFields(record.Fields)
+		if parseErr != nil {
+			return InsightReport{}, fmt.Errorf("usecase: 解析学情练习集 %s: %w", record.RecordID, parseErr)
+		}
+		if record.Status == k12.PracticeStatusDraft {
+			for _, item := range fields.Items {
+				if k12.PracticeItemPublishable(item) {
+					report.PracticePending++
+				}
+			}
+		}
+		if fields.FinalizedAt < weekStart || fields.FinalizedAt >= weekEnd {
 			continue
 		}
-		wholeGraded := r.Status == k12.PracticeStatusGraded || r.Status == k12.PracticeStatusClosed
-		for _, it := range f.Items {
-			if !k12.PracticeItemPublishable(it) {
-				continue // 阻断题不在卷面上
+		wholeGraded := record.Status == k12.PracticeStatusGraded ||
+			record.Status == k12.PracticeStatusClosed
+		for _, item := range fields.Items {
+			if !k12.PracticeItemPublishable(item) {
+				continue
 			}
 			total++
-			if it.ResultCorrect != nil || wholeGraded {
+			if item.ResultCorrect != nil || wholeGraded {
 				done++
 			}
 		}
 	}
-	if total == 0 {
-		return -1, nil
+	if total > 0 {
+		report.ReviewCompletionRate = float64(done) / float64(total)
 	}
-	return float64(done) / float64(total), nil
+	report.WeakTop3 = topWeakPoints(weakCount, report.MonthNewMistakes, 3)
+	report.ConsecutiveFailKPs = keysAtLeast(failCount, repeatedUnmasteredThreshold)
+	report.Suggestion = buildSuggestion(report)
+	return report, nil
 }
 
-// topN 取计数最高的 N 个知识点（并列按名稳定）。
-func topN(m map[string]int, n int) []WeakPoint {
-	out := make([]WeakPoint, 0, len(m))
-	for k, c := range m {
-		out = append(out, WeakPoint{KnowledgePoint: k, Count: c})
+func insightMistakeDue(status, spotCheckState string, dueAt *int64, asOf int64) bool {
+	if dueAt == nil || *dueAt > asOf || spotCheckState == k12.SpotCheckScheduled {
+		return false
+	}
+	return status == k12.StatusNew || status == k12.StatusExplained
+}
+
+func topWeakPoints(counts map[weakPointKey]int, denominator, limit int) []WeakPoint {
+	out := make([]WeakPoint, 0, len(counts))
+	for key, count := range counts {
+		share := 0.0
+		if denominator > 0 {
+			share = float64(count) / float64(denominator)
+		}
+		out = append(out, WeakPoint{
+			Subject:        key.subject,
+			KnowledgePoint: key.point,
+			Count:          count,
+			Share:          share,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Count != out[j].Count {
 			return out[i].Count > out[j].Count
 		}
+		if out[i].Subject != out[j].Subject {
+			return out[i].Subject < out[j].Subject
+		}
 		return out[i].KnowledgePoint < out[j].KnowledgePoint
 	})
-	if len(out) > n {
-		out = out[:n]
+	if len(out) > limit {
+		out = out[:limit]
 	}
 	return out
 }
 
-func keysAtLeast(m map[string]int, min int) []string {
+func keysAtLeast(counts map[string]int, minimum int) []string {
 	var out []string
-	for k, c := range m {
-		if c >= min {
-			out = append(out, k)
+	for key, count := range counts {
+		if count >= minimum {
+			out = append(out, key)
 		}
 	}
 	sort.Strings(out)
 	return out
 }
 
-// buildSuggestion 由报告派生「本月建议」文案。
-func buildSuggestion(r InsightReport) string {
-	if r.Trend.Total == 0 {
+func buildSuggestion(report InsightReport) string {
+	if report.Trend.Total == 0 {
 		return "本月还没有错题记录，继续保持。"
 	}
-	if len(r.ConsecutiveFailKPs) > 0 {
-		return fmt.Sprintf("「%s」连续受挫，建议本周集中复习这个知识点。", r.ConsecutiveFailKPs[0])
+	if len(report.ConsecutiveFailKPs) > 0 {
+		return fmt.Sprintf("「%s」连续受挫，建议本周集中复习这个知识点。", report.ConsecutiveFailKPs[0])
 	}
-	if len(r.WeakTop3) > 0 {
-		return fmt.Sprintf("本月薄弱点是「%s」，可优先出这个知识点的错题卷。", r.WeakTop3[0].KnowledgePoint)
+	if len(report.WeakTop3) > 0 {
+		return fmt.Sprintf("本月薄弱点是「%s」，可优先出这个知识点的错题卷。", report.WeakTop3[0].KnowledgePoint)
 	}
 	return "本月复习进展不错，保持节奏。"
 }
 
-// startOfMonth 返回 unix 时间戳所在自然月的月初（本地时区 00:00）unix 秒。
-func startOfMonth(unixSec int64) int64 {
-	t := time.Unix(unixSec, 0)
-	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, t.Location()).Unix()
+func startOfInsightMonth(unixSeconds int64) int64 {
+	current := time.Unix(unixSeconds, 0).In(insightLocation)
+	return time.Date(current.Year(), current.Month(), 1, 0, 0, 0, 0, insightLocation).Unix()
+}
+
+func reviewWeekWindow(unixSeconds int64) (int64, int64) {
+	current := time.Unix(unixSeconds, 0).In(insightLocation)
+	daysSinceFriday := (int(current.Weekday()) - int(time.Friday) + 7) % 7
+	startDay := current.AddDate(0, 0, -daysSinceFriday)
+	start := time.Date(
+		startDay.Year(), startDay.Month(), startDay.Day(), 19, 0, 0, 0, insightLocation,
+	)
+	if current.Before(start) {
+		start = start.AddDate(0, 0, -7)
+	}
+	return start.Unix(), start.AddDate(0, 0, 7).Unix()
 }

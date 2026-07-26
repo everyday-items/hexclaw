@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/hexagon-codes/toolkit/util/idgen"
 
@@ -38,7 +39,7 @@ type WorkFeedbackOutput struct {
 	SkillStamp string
 }
 
-// WorkFeedbackGenerator 是作品点评生成的可选 Skill Executor 扩展 port（与 RetryGenerator/
+// WorkFeedbackGenerator 是作品点评生成的可选 Skill Executor 扩展 port（与
 // CauseSummarizer 同纪律：由 Solver 实现发现，未实现即诚实报错，不留假点评）。
 // 输出契约（INV-011）：只点评不打分不代写——写作为好句摘出 + 一处具体建议，美术为
 // 观察描述式点评；含分数/等第/代写成文的输出由用例层拒绝入库。
@@ -188,6 +189,12 @@ func (d Deps) GenerateWorkFeedbackCommand(
 	if generation.Status == k12.WorkFeedbackSucceeded {
 		return d.GetCreativeWork(ctx, agentName, recordID)
 	}
+	generation, err = d.Records.MarkWorkFeedbackGenerationRunning(
+		ctx, agentName, generation.GenerationID,
+	)
+	if err != nil {
+		return CreativeWorkView{}, err
+	}
 	if !ok {
 		_, _ = d.Records.FailWorkFeedbackGeneration(
 			context.WithoutCancel(ctx), agentName, generation.GenerationID,
@@ -214,15 +221,43 @@ func (d Deps) GenerateWorkFeedbackCommand(
 	} else {
 		providerCtx := ctx
 		if invocation != nil {
-			if _, err := d.Records.MarkImageTaskInvocationSent(
+			now := time.Now().Unix()
+			if window, ok := imageTaskAutomaticWindowFromContext(ctx); ok {
+				now = window.NowAt
+			}
+			claimedInvocation, claimed, err := d.Records.ClaimImageTaskInvocationSend(
 				ctx, agentName, invocation.InvocationID,
 				"creative-work:"+recordID+":feedback",
-			); err != nil {
+				now,
+			)
+			if err != nil {
 				_, _ = d.Records.FailWorkFeedbackGeneration(
 					context.WithoutCancel(ctx), agentName, generation.GenerationID, err.Error(),
 				)
 				return CreativeWorkView{}, err
 			}
+			if !claimed {
+				if window, ok := imageTaskAutomaticWindowFromContext(ctx); ok &&
+					window.DispatchID != "" &&
+					claimedInvocation.Status == k12.ImageTaskInvocationPrepared &&
+					claimedInvocation.DeadlineAt > 0 &&
+					claimedInvocation.DeadlineAt <= now {
+					if _, _, _, expireErr := d.Records.ExpireImageTaskInvocation(
+						context.WithoutCancel(ctx),
+						agentName,
+						window.DispatchID,
+						claimedInvocation.InvocationID,
+						now,
+					); expireErr != nil {
+						return CreativeWorkView{}, expireErr
+					}
+				}
+				// Another caller owns the only prepared->sent transition.
+				// It will commit or park the shared generation; the CAS loser
+				// must not call the Provider or mark that generation failed.
+				return d.GetCreativeWork(ctx, agentName, recordID)
+			}
+			invocation = &claimedInvocation
 			var cancelProvider context.CancelFunc
 			providerCtx, cancelProvider = imageTaskProviderContext(
 				ctx,
@@ -360,22 +395,21 @@ func (d Deps) prepareWorkFeedbackInvocation(
 	version k12.CreativeWorkVersion,
 	req WorkFeedbackRequest,
 ) (*k12.ImageTaskInvocation, *WorkFeedbackOutput, error) {
-	if strings.TrimSpace(work.Fields.SourceIntakeID) == "" {
-		return nil, nil, nil
-	}
 	if d.Records == nil {
 		return nil, nil, fmt.Errorf("usecase: image task store 未配置")
 	}
-	intake, err := d.Records.GetCreativeWorkIntake(
-		ctx, work.Record.AgentName, work.Fields.SourceIntakeID,
-	)
-	if err != nil {
-		return nil, nil, err
-	}
-	if intake.Status != k12.CreativeWorkIntakePromoted ||
-		intake.PromotedWorkID != work.Record.RecordID ||
-		intake.AgentName != work.Record.AgentName {
-		return nil, nil, k12storage.ErrImageTaskConflict
+	if strings.TrimSpace(work.Fields.SourceIntakeID) != "" {
+		intake, err := d.Records.GetCreativeWorkIntake(
+			ctx, work.Record.AgentName, work.Fields.SourceIntakeID,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		if intake.Status != k12.CreativeWorkIntakePromoted ||
+			intake.PromotedWorkID != work.Record.RecordID ||
+			intake.AgentName != work.Record.AgentName {
+			return nil, nil, k12storage.ErrImageTaskConflict
+		}
 	}
 	operationKey := "work:" + work.Record.RecordID + ":version:" +
 		version.VersionID + ":feedback"
@@ -407,6 +441,9 @@ func (d Deps) prepareWorkFeedbackInvocation(
 			RouteSnapshot: prior.RouteSnapshot, Status: k12.ImageTaskInvocationPrepared,
 			Attempt: prior.Attempt + 1,
 		}
+		if window, ok := imageTaskAutomaticWindowFromContext(ctx); ok {
+			next.DeadlineAt = window.DeadlineAt
+		}
 		prepared, _, prepareErr := d.Records.PrepareImageTaskInvocation(ctx, next)
 		return &prepared, nil, prepareErr
 	case err == nil:
@@ -437,6 +474,9 @@ func (d Deps) prepareWorkFeedbackInvocation(
 		Operation:    k12.ImageTaskOperationWorkFeedback,
 		OperationKey: operationKey, RequestDigest: requestDigest,
 		RouteSnapshot: route, Status: k12.ImageTaskInvocationPrepared, Attempt: 1,
+	}
+	if window, ok := imageTaskAutomaticWindowFromContext(ctx); ok {
+		invocation.DeadlineAt = window.DeadlineAt
 	}
 	prepared, _, err := d.Records.PrepareImageTaskInvocation(ctx, invocation)
 	return &prepared, nil, err
@@ -478,6 +518,17 @@ func WorkFeedbackRedlineViolation(feedback string) string {
 // workFeedbackInvariantViolation 检查生成点评是否违反 INV-011（只点评不打分不代写）。
 // 返回非空原因即违规。关键词/模式为确定性契约（契约测试钉死），不依赖模型自律。
 func workFeedbackInvariantViolation(feedback string) string {
+	for _, marker := range []string{
+		"在继续点评前",
+		"等孩子讲完后",
+		"再给完整点评",
+		"再继续点评",
+		"暂不点评",
+	} {
+		if strings.Contains(feedback, marker) {
+			return "延期点评口径「" + marker + "」"
+		}
+	}
 	for _, w := range scoreWords {
 		if strings.Contains(feedback, w) {
 			return "出现打分口径「" + w + "」"

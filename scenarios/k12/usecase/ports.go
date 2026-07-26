@@ -123,6 +123,8 @@ type RecognizedQuestion struct {
 	ProblemKind     ProblemKind `json:"problem_kind,omitempty"`
 	ParentProblemID string      `json:"parent_problem_id,omitempty"`
 	SubproblemNo    string      `json:"subproblem_no,omitempty"`
+	SourceNumberPath []string   `json:"source_number_path,omitempty"`
+	DisplayLabel     string     `json:"display_label,omitempty"`
 	PageAssetID     string      `json:"page_asset_id,omitempty"`
 	AttemptID       string      `json:"attempt_id,omitempty"`
 
@@ -172,6 +174,11 @@ func normalizeRecognizedQuestionFacts(q RecognizedQuestion) RecognizedQuestion {
 	legacyQuestion := q.Question
 	legacyAnswer := q.StudentAnswer
 	q.ProblemKind = normalizeProblemKind(q.ProblemKind, q.ParentProblemID)
+	q.SourceNumberPath = append([]string(nil), q.SourceNumberPath...)
+	for i := range q.SourceNumberPath {
+		q.SourceNumberPath[i] = strings.TrimSpace(q.SourceNumberPath[i])
+	}
+	q.DisplayLabel = strings.TrimSpace(q.DisplayLabel)
 	if q.RawTranscription == "" {
 		q.RawTranscription = legacyQuestion
 	}
@@ -284,19 +291,6 @@ type Solver interface {
 // 老 Solver 仍可只实现 Solver，保持场景扩展向后兼容。
 type SubjectSolver interface {
 	SolveSubject(ctx context.Context, subject, problem, grade, constraint string) (SolveResult, error)
-}
-
-// RetryGenerator 是「再练一道」的轻量出题 port（Solver 的可选扩展，BUG-20260712 治本）。
-//
-// 与 Solve 的全对抗多智能体验算链（变式生成 → solver → verifier → code_exec →
-// self-consistency 多数表决 → 不合格重出，为**批改正确性**设计，真机 68s）相反：练习变式题
-// 非高风险批改、容错高，只需**单次 reasoning 出题 + 解答**，延迟优先（目标 <10s）。
-// prompt 已含知识点约束，subject 透传保学科路由，grade 约束「只用学过的方法」。
-//
-// SolveAdapter 实现之（走单个 solver 子 Agent，不派 verifier / 不 self-consistency / 不重出）；
-// 只实现 Solver 的老实现不满足本接口，GenerateRetry 自动回退全链，向后兼容。
-type RetryGenerator interface {
-	GenerateSimilar(ctx context.Context, subject, prompt, grade string) (SolveResult, error)
 }
 
 // CauseSummarizer 是「记一条错题」的**轻量错因归纳** port（Solver 的可选扩展，BUG-20260712-记一条错题）。

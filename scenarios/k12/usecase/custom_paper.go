@@ -25,6 +25,8 @@ type CustomPaperRequest struct {
 	Difficulty     string `json:"difficulty"`
 	Textbook       string `json:"textbook"`
 	Grade          string `json:"grade,omitempty"`
+	Provider       string `json:"provider,omitempty"`
+	Model          string `json:"model,omitempty"`
 	SourceSession  string `json:"source_session,omitempty"`
 }
 
@@ -57,6 +59,8 @@ type normalizedCustomPaperRequest struct {
 	Difficulty    string `json:"difficulty"`
 	Textbook      string `json:"textbook"`
 	Grade         string `json:"grade"`
+	Provider      string `json:"provider,omitempty"`
+	Model         string `json:"model,omitempty"`
 	SourceSession string `json:"source_session"`
 }
 
@@ -75,15 +79,95 @@ func (d Deps) GenerateCustomPaper(ctx context.Context, agentName string, req Cus
 	}
 	digest := customPaperDigest(norm)
 	jobID := customPaperJobID(agentName, req.IdempotencyKey)
-	if prior, err := d.Records.GetPracticeGenerationJob(ctx, agentName, req.IdempotencyKey); err == nil {
+	var prior *k12.PracticeGenerationJob
+	if stored, err := d.Records.GetPracticeGenerationJob(ctx, agentName, req.IdempotencyKey); err == nil {
+		prior = &stored
 		if prior.RequestDigest != digest {
 			return CustomPaperResult{}, fmt.Errorf("%w: idempotency_key %q 已绑定其他组卷参数", ErrInvalidInput, req.IdempotencyKey)
 		}
 		if prior.Status == k12.PracticeGenerationCommitted {
-			return d.customPaperResultFromJob(ctx, prior)
+			return d.customPaperResultFromJob(ctx, *prior)
 		}
 	} else if !errors.Is(err, records.ErrNotFound) {
 		return CustomPaperResult{}, err
+	}
+	requestJSON, err := json.Marshal(norm)
+	if err != nil {
+		return CustomPaperResult{}, err
+	}
+	routeJSON := "{}"
+	var route k12.GradingModelSnapshot
+	if prior != nil && strings.TrimSpace(prior.RouteSnapshot) != "" &&
+		strings.TrimSpace(prior.RouteSnapshot) != "{}" {
+		if err := json.Unmarshal([]byte(prior.RouteSnapshot), &route); err != nil {
+			return CustomPaperResult{}, fmt.Errorf(
+				"%w: 已接受组卷任务的冻结路由快照损坏",
+				ErrModelInvocationRequiresReconciliation,
+			)
+		}
+		route = k12.NormalizeGradingModelSnapshot(route)
+		if route.Provider == "" || route.Model == "" ||
+			route.Route != route.Provider+"/"+route.Model {
+			return CustomPaperResult{}, fmt.Errorf(
+				"%w: 已接受组卷任务的冻结路由快照不完整",
+				ErrModelInvocationRequiresReconciliation,
+			)
+		}
+		routeJSON = prior.RouteSnapshot
+	} else if d.PracticeGenerationRoute != nil {
+		if prior != nil {
+			return CustomPaperResult{}, fmt.Errorf(
+				"%w: 历史组卷任务没有可安全重放的路由快照，请创建新组卷命令",
+				ErrModelInvocationRequiresReconciliation,
+			)
+		}
+		route, err = d.PracticeGenerationRoute(ctx, k12.GradingModelSnapshot{
+			Provider: norm.Provider,
+			Model:    norm.Model,
+		})
+		if err != nil {
+			return CustomPaperResult{}, fmt.Errorf("usecase: 冻结自定义组卷模型路由: %w", err)
+		}
+		route = k12.NormalizeGradingModelSnapshot(route)
+		if route.Provider == "" || route.Model == "" ||
+			route.Route != route.Provider+"/"+route.Model ||
+			route.Capability != "text" {
+			return CustomPaperResult{}, fmt.Errorf(
+				"usecase: 自定义组卷冻结路由必须是完整 text provider/model 快照",
+			)
+		}
+		routeRaw, marshalErr := json.Marshal(route)
+		if marshalErr != nil {
+			return CustomPaperResult{}, marshalErr
+		}
+		routeJSON = string(routeRaw)
+	}
+	if route.Provider != "" {
+		ctx = k12.WithGradingModelSnapshot(ctx, route)
+	}
+	now := d.now()
+	job := k12.PracticeGenerationJob{
+		GenerationJobID:   jobID,
+		AgentName:         agentName,
+		IdempotencyKey:    req.IdempotencyKey,
+		RequestDigest:     digest,
+		Scope:             norm.Scope,
+		VariantsPerSource: norm.PerSource,
+		Difficulty:        norm.Difficulty,
+		Total:             norm.Total,
+		Textbook:          norm.Textbook,
+		Status:            k12.PracticeGenerationQueued,
+		RequestSnapshot:   string(requestJSON),
+		RouteSnapshot:     routeJSON,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+	if d.PracticeGenerationRoute != nil {
+		accepted, _, beginErr := d.Records.BeginCustomPaperGeneration(ctx, job)
+		if beginErr != nil {
+			return CustomPaperResult{}, beginErr
+		}
+		job = accepted
 	}
 
 	sources, err := d.customPaperSources(ctx, agentName, norm.Scope)
@@ -116,7 +200,7 @@ func (d Deps) GenerateCustomPaper(ctx context.Context, agentName string, req Cus
 		for variant := 1; variant <= norm.PerSource && len(generated) < target; variant++ {
 			candidate, genErr := d.generateCustomPaperItem(ctx, source, norm, jobID, variant)
 			if genErr != nil {
-				d.recordCustomPaperFailure(ctx, jobID, agentName, req.IdempotencyKey, digest, norm, genErr)
+				d.recordCustomPaperFailure(ctx, job, genErr)
 				return CustomPaperResult{}, genErr
 			}
 			key := normalizeQuestion(candidate.QuestionMarkdown)
@@ -133,7 +217,7 @@ func (d Deps) GenerateCustomPaper(ctx context.Context, agentName string, req Cus
 	}
 	if len(generated) == 0 && basket == nil {
 		err := fmt.Errorf("%w: 所有生成题都与现有题目重复，未创建空练习篮", ErrInvalidInput)
-		d.recordCustomPaperFailure(ctx, jobID, agentName, req.IdempotencyKey, digest, norm, err)
+		d.recordCustomPaperFailure(ctx, job, err)
 		return CustomPaperResult{}, err
 	}
 
@@ -141,6 +225,7 @@ func (d Deps) GenerateCustomPaper(ctx context.Context, agentName string, req Cus
 	expectedVersion := -1
 	if basket == nil {
 		rec, err = k12.NewPracticeSetRecord(agentName, norm.SourceSession, k12.PracticeSetFields{
+			GradeTerm:  norm.Grade,
 			SourceKind: k12.PracticeSourceMixed,
 			Title:      basketTitle,
 			Items:      generated,
@@ -157,24 +242,20 @@ func (d Deps) GenerateCustomPaper(ctx context.Context, agentName string, req Cus
 		}
 	}
 	if err != nil {
-		d.recordCustomPaperFailure(ctx, jobID, agentName, req.IdempotencyKey, digest, norm, err)
+		d.recordCustomPaperFailure(ctx, job, err)
 		return CustomPaperResult{}, err
 	}
 	itemIDs := make([]string, 0, len(generated))
 	for _, item := range generated {
 		itemIDs = append(itemIDs, item.ItemID)
 	}
-	now := d.now()
-	job := k12.PracticeGenerationJob{
-		GenerationJobID: jobID, AgentName: agentName, IdempotencyKey: req.IdempotencyKey,
-		RequestDigest: digest, Scope: norm.Scope, VariantsPerSource: norm.PerSource,
-		Difficulty: norm.Difficulty, Total: norm.Total, Textbook: norm.Textbook,
-		Status: k12.PracticeGenerationCommitted, ResultItemIDs: itemIDs, DeduplicatedCount: deduplicated,
-		CreatedAt: now, UpdatedAt: now,
-	}
+	job.Status = k12.PracticeGenerationCommitted
+	job.ResultItemIDs = itemIDs
+	job.DeduplicatedCount = deduplicated
+	job.UpdatedAt = d.now()
 	stored, alreadyCommitted, err := d.Records.CommitPracticeGeneration(ctx, rec, expectedVersion, job)
 	if err != nil {
-		d.recordCustomPaperFailure(ctx, jobID, agentName, req.IdempotencyKey, digest, norm, err)
+		d.recordCustomPaperFailure(ctx, job, err)
 		return CustomPaperResult{}, err
 	}
 	if alreadyCommitted {
@@ -203,7 +284,12 @@ func (d Deps) normalizeCustomPaperRequest(ctx context.Context, agentName string,
 		Scope: strings.TrimSpace(req.Scope), Total: strings.TrimSpace(req.Total),
 		PerSource: req.PerSource, Difficulty: strings.TrimSpace(req.Difficulty),
 		Textbook: strings.TrimSpace(req.Textbook), Grade: strings.TrimSpace(req.Grade),
+		Provider: strings.TrimSpace(req.Provider), Model: strings.TrimSpace(req.Model),
 		SourceSession: strings.TrimSpace(req.SourceSession),
+	}
+	if (n.Provider == "") != (n.Model == "") {
+		return normalizedCustomPaperRequest{}, 0,
+			fmt.Errorf("%w: 显式 provider/model 必须同时填写", ErrInvalidInput)
 	}
 	if d.Profiles != nil && (n.Grade == "" || n.Textbook == "") {
 		if p, err := d.GetProfile(ctx, agentName); err == nil {
@@ -279,19 +365,15 @@ func (d Deps) customPaperSources(ctx context.Context, agentName, scope string) (
 
 func (d Deps) generateCustomPaperItem(ctx context.Context, source ReviewItem, req normalizedCustomPaperRequest,
 	jobID string, variant int) (k12.PracticeItem, error) {
-	if d.Solver == nil {
-		return k12.PracticeItem{}, fmt.Errorf("usecase: 未配置 Solver")
+	if d.PracticeVariant == nil {
+		return k12.PracticeItem{}, fmt.Errorf("usecase: 未配置练习变式生成器")
 	}
 	difficultyCN := map[string]string{"same": "同等难度", "easier": "更简单", "harder": "更难"}[req.Difficulty]
 	prompt := fmt.Sprintf("生成一道%s的小学变式练习。必须保持来源知识点，不复述原题，不泄露答案；教材边界=%s；年级=%s；来源题=%s；知识点=%s；同源变式序号=%d。严格输出 ## 问题 / ## 解答 / ## 答案 三段 Markdown。",
 		difficultyCN, req.Textbook, req.Grade, source.Title(), source.Point(), variant)
-	var generated SolveResult
-	var err error
-	if generator, ok := d.Solver.(RetryGenerator); ok {
-		generated, err = generator.GenerateSimilar(ctx, source.Subject(), prompt, req.Grade)
-	} else {
-		generated, err = d.solveProblem(ctx, source.Subject(), prompt, req.Grade)
-	}
+	generated, err := d.PracticeVariant.GeneratePracticeVariant(
+		ctx, source.Subject(), prompt, req.Grade,
+	)
 	if err != nil {
 		return k12.PracticeItem{}, fmt.Errorf("%w: 生成来源题 %s 的第 %d 道变式: %v", ErrSolveFailed, source.Record.RecordID, variant, err)
 	}
@@ -335,19 +417,19 @@ func classifyGeneratedPracticeItem(subject string, validation SolveResult, hasVa
 	return k12.PracticeItemNeedsReview, string(validation.Evidence.EvidenceType), "验证证据不足，已阻断打印并等待复核"
 }
 
-func (d Deps) recordCustomPaperFailure(ctx context.Context, jobID, agentName, key, digest string,
-	req normalizedCustomPaperRequest, cause error) {
-	now := d.now()
+func (d Deps) recordCustomPaperFailure(
+	ctx context.Context,
+	job k12.PracticeGenerationJob,
+	cause error,
+) {
 	reason := cause.Error()
 	if len(reason) > 500 {
 		reason = reason[:500]
 	}
-	_ = d.Records.RecordPracticeGenerationFailure(ctx, k12.PracticeGenerationJob{
-		GenerationJobID: jobID, AgentName: agentName, IdempotencyKey: key, RequestDigest: digest,
-		Scope: req.Scope, VariantsPerSource: req.PerSource, Difficulty: req.Difficulty,
-		Total: req.Total, Textbook: req.Textbook, Status: k12.PracticeGenerationFailed,
-		FailureReason: reason, CreatedAt: now, UpdatedAt: now,
-	})
+	job.Status = k12.PracticeGenerationFailed
+	job.FailureReason = reason
+	job.UpdatedAt = d.now()
+	_ = d.Records.RecordPracticeGenerationFailure(ctx, job)
 }
 
 func (d Deps) customPaperResultFromJob(ctx context.Context, job k12.PracticeGenerationJob) (CustomPaperResult, error) {

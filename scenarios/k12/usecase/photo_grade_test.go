@@ -550,9 +550,9 @@ func TestPhotoGradeMarkdown_DingtalkUsesStructuredCorrectAndCorrectionSections(t
 	for _, want := range []string{
 		"## 📊 作业批改",
 		"### ✅ 答对的题（1）",
-		"1. **4÷0.5=** → **8**",
+		"- **4÷0.5=** → **8**",
 		"### ❌ 需要订正（1）",
-		"#### 第 2 题",
+		"#### 0.5+1/3=",
 		"- **题目：** 0.5+1/3=",
 		"- **你的作答：** 2/3",
 		"- **订正参考：**\n\n> 解答  \n> 0.5+1/3=1/2+1/3=5/6  \n> 答案  \n> **5/6**",

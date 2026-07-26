@@ -30,7 +30,13 @@ func (r *countingRecognizer) Recognize(context.Context, []byte) ([]RecognizedQue
 	if r.calls <= r.failures {
 		return nil, &gradingProviderResponseError{status: 503}
 	}
-	return append([]RecognizedQuestion(nil), r.questions...), nil
+	questions := cloneRecognizedQuestions(r.questions)
+	for i := range questions {
+		if len(questions[i].KnowledgePoints) == 0 {
+			questions[i].KnowledgePoints = []string{"整数加法"}
+		}
+	}
+	return questions, nil
 }
 
 type failingAnnotator struct{ calls int }
@@ -83,11 +89,34 @@ func newOrchestrator(t *testing.T, rec Recognizer, anchorer AnswerAnchorer, anno
 	d.Recognizer = rec
 	d.AnswerAnchorer = anchorer
 	d.PhotoAnnotator = annotator
+	d.ParentTeachingGuide = &parentTeachingGuideSpy{}
+	d.Profiles = newMemProfiles()
+	d.Profiles.(*memProfiles).m["mingming"] = k12.ChildProfile{
+		ChildName: "小明", GradeTerm: "五年级上",
+	}
+	d.GradingBudgetSnapshot = orchestratorTestBudget()
 	// GradingJob deadlines are absolute Unix timestamps. This helper exercises
 	// provider boundaries, so it must use a wall clock rather than newPipeline's
 	// deterministic domain-record clock (1000).
 	d.Now = func() int64 { return time.Now().Unix() }
 	return trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshotResolver))
+}
+
+func orchestratorTestBudget() k12.GradingBudgetSnapshot {
+	return k12.GradingBudgetSnapshot{
+		PolicyVersion: 1,
+		StageSeconds: k12.GradingStageBudgets{
+			Queued: 60, Normalizing: 60, Recognizing: 120,
+			Locating: 60, Rendering: 60, Projecting: 60,
+		},
+		AssessingBuckets: []k12.GradingAssessingBudgetBucket{
+			{MaxProblems: 1, Seconds: 90},
+			{MaxProblems: 8, Seconds: 180},
+			{MaxProblems: 16, Seconds: 300},
+			{MaxProblems: 32, Seconds: 540},
+		},
+		ItemConcurrency: 2,
+	}
 }
 
 func trackGradingOrchestrator(t *testing.T, o *GradingOrchestrator) *GradingOrchestrator {

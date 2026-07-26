@@ -44,14 +44,21 @@ func (d Deps) GetProfile(ctx context.Context, agentName string) (k12.ChildProfil
 // 发布阻断）——初中/高中年级不可写入档案；超纲判定仍用 18 档全序，不受影响。
 // 只改传入的非空字段（保留其他）。改年级 → 下次辅导边界随之重算。
 func (d Deps) UpdateProfile(ctx context.Context, agentName string, p k12.ChildProfile) (k12.ChildProfile, error) {
-	if d.Profiles == nil {
-		return k12.ChildProfile{}, fmt.Errorf("usecase: 未配置档案存储")
-	}
 	if agentName == "" {
 		return k12.ChildProfile{}, fmt.Errorf("%w: agentName 不可空", ErrInvalidInput)
 	}
-	if p.GradeTerm != "" && !k12.ValidProfileGradeTerm(p.GradeTerm) {
-		return k12.ChildProfile{}, fmt.Errorf("%w: 非法年级学期 %q（须为小学 12 档：一年级上～六年级下）", ErrInvalidInput, p.GradeTerm)
+	if err := k12.ValidateProfileGradeTerm(p.GradeTerm); err != nil {
+		return k12.ChildProfile{}, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+	}
+	if d.Profiles == nil {
+		if d.Records == nil {
+			return k12.ChildProfile{}, fmt.Errorf("usecase: 未配置档案存储")
+		}
+		stored, err := d.Records.PatchLegacyProfile(ctx, agentName, p, d.now())
+		if err != nil {
+			return k12.ChildProfile{}, fmt.Errorf("usecase: 保存档案: %w", err)
+		}
+		return stored, nil
 	}
 	if err := d.Profiles.SaveProfile(ctx, agentName, p); err != nil {
 		return k12.ChildProfile{}, fmt.Errorf("usecase: 保存档案: %w", err)

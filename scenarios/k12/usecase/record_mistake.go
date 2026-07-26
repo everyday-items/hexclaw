@@ -67,6 +67,7 @@ func (d Deps) RecordMistake(ctx context.Context, req RecordMistakeRequest) (Reco
 	// （StudentAnswer 是孩子的错处，不是正解），且本路径不跑 solve 链——无可信答案可带。
 	// 自动装篮时该题按 pending 诚实阻断（默写类「默写：X」题面原文自含除外）。
 	rec, err := k12.NewMistakeRecord(req.AgentName, req.SourceSession, k12.MistakeFields{
+		GradeTerm:      d.creationGradeTerm(ctx, req.AgentName, req.Grade),
 		Subject:        req.Subject,
 		Question:       req.Problem,
 		KnowledgePoint: knowledgePoint,

@@ -301,12 +301,10 @@ func (d Deps) gradeHomeworkPhotoWithAssessorInput(
 			if renderErr == nil && len(rendered.Data) > 0 {
 				result.AnnotatedImage = &rendered
 			} else if renderErr != nil {
-				for i := range result.Items {
-					if result.Items[i].Warning == "" {
-						result.Items[i].Warning = "批改结论已完成，但批改图生成失败"
-						break
-					}
-				}
+				// Rendering is a page-level projection. Per-item results may
+				// already be committed as immutable assessment receipts, so a
+				// compositor failure must not rewrite their canonical facts.
+				result.ImageWarning = "批改结论已完成，但批改图生成失败"
 			}
 		}
 	}
@@ -526,13 +524,62 @@ func photoAnnotationHasTrustedBBox(mark PhotoAnnotation) bool {
 	return b.X >= 0 && b.Y >= 0 && b.W > 0 && b.H > 0 && b.X+b.W <= 1.005 && b.Y+b.H <= 1.005
 }
 
+func photoQuestionSourceLabel(question RecognizedQuestion) string {
+	return strings.TrimSpace(question.DisplayLabel)
+}
+
+func photoQuestionStem(question RecognizedQuestion) string {
+	stem := strings.TrimSpace(question.Question)
+	if photoQuestionSourceLabel(question) == "" || stem == "" {
+		return stem
+	}
+	candidates := []string{photoQuestionSourceLabel(question)}
+	if count := len(question.SourceNumberPath); count > 0 {
+		candidates = append(candidates, strings.TrimSpace(question.SourceNumberPath[count-1]))
+	}
+	for _, candidate := range candidates {
+		if candidate == "" || !strings.HasPrefix(stem, candidate) {
+			continue
+		}
+		rest := strings.TrimPrefix(stem, candidate)
+		if rest == "" {
+			return ""
+		}
+		if !strings.ContainsRune(" .．、)）:：\t", []rune(rest)[0]) {
+			continue
+		}
+		return strings.TrimSpace(strings.TrimLeft(rest, " .．、)）:：\t"))
+	}
+	return stem
+}
+
+func photoQuestionHeading(question RecognizedQuestion, max int) string {
+	label := photoQuestionSourceLabel(question)
+	stem := photoClip(photoQuestionStem(question), max)
+	switch {
+	case label == "":
+		return stem
+	case stem == "":
+		return label
+	default:
+		return label + " " + stem
+	}
+}
+
+func photoQuestionReference(question RecognizedQuestion) string {
+	if label := photoQuestionSourceLabel(question); label != "" {
+		return label
+	}
+	return photoClip(photoQuestionStem(question), 120)
+}
+
 func photoGradeMarkdown(result PhotoGradeResult) string {
 	var b strings.Builder
 	if result.Mode == PhotoModeSolve {
 		b.WriteString("## 家长辅导指南\n\n")
 		b.WriteString(fmt.Sprintf("共识别 **%d** 道空白题，下面按题号给出家长辅导步骤。\n\n", len(result.Items)))
-		for i, item := range result.Items {
-			fmt.Fprintf(&b, "### %d. %s\n\n", i+1, photoClip(item.Recognized.Question, 240))
+		for _, item := range result.Items {
+			fmt.Fprintf(&b, "### %s\n\n", photoQuestionHeading(item.Recognized, 240))
 			switch item.Status {
 			case PhotoBlankSolved:
 				if item.ParentGuide != nil {
@@ -600,25 +647,25 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 	}
 	if correct > 0 {
 		fmt.Fprintf(&b, "### ✅ 答对的题（%d）\n\n", correct)
-		for i, item := range result.Items {
+		for _, item := range result.Items {
 			if item.Status != PhotoCorrect {
 				continue
 			}
-			fmt.Fprintf(&b, "%d. **%s** → **%s**\n", i+1,
-				photoInline(item.Recognized.Question, 180), photoInline(item.Recognized.StudentAnswer, 180))
+			fmt.Fprintf(&b, "- **%s** → **%s**\n",
+				photoQuestionHeading(item.Recognized, 180), photoInline(item.Recognized.StudentAnswer, 180))
 		}
 		b.WriteString("\n")
 	}
 	if wrong > 0 {
 		fmt.Fprintf(&b, "### ❌ 需要订正（%d）\n\n", wrong)
 	}
-	for i, item := range result.Items {
+	for _, item := range result.Items {
 		if item.Status != PhotoWrong {
 			continue
 		}
-		fmt.Fprintf(&b, "#### 第 %d 题\n\n", i+1)
+		fmt.Fprintf(&b, "#### %s\n\n", photoQuestionReference(item.Recognized))
 		fmt.Fprintf(&b, "- **题目：** %s\n- **你的作答：** %s\n- **订正参考：**\n\n%s",
-			photoInline(item.Recognized.Question, 240), photoInline(item.Recognized.StudentAnswer, 300), photoMarkdownQuote(item.Grade.Solution, 1000))
+			photoInline(photoQuestionStem(item.Recognized), 240), photoInline(item.Recognized.StudentAnswer, 300), photoMarkdownQuote(item.Grade.Solution, 1000))
 		if item.Grade.Outcome.WrongStep != "" {
 			fmt.Fprintf(&b, "\n- **第一个错步：** %s", photoInline(item.Grade.Outcome.WrongStep, 300))
 		}
@@ -633,23 +680,26 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 	}
 	if unanswered > 0 {
 		fmt.Fprintf(&b, "### ⏸ 未作答（%d）\n\n", unanswered)
-		for i, item := range result.Items {
+		for _, item := range result.Items {
 			if item.Status == PhotoUnanswered {
-				fmt.Fprintf(&b, "- 第 %d 题：%s\n", i+1, photoInline(item.Recognized.Question, 240))
+				fmt.Fprintf(&b, "- %s\n", photoQuestionHeading(item.Recognized, 240))
 			}
 		}
 		b.WriteString("\n> 本次已答卷批改不会直接泄露未作答题的答案。\n\n")
 	}
 	if pending > 0 {
 		fmt.Fprintf(&b, "### ⚠️ 待核对（%d）\n\n", pending)
-		for i, item := range result.Items {
+		for _, item := range result.Items {
 			switch item.Status {
 			case PhotoOutOfScope:
-				fmt.Fprintf(&b, "- 第 %d 题超出当前年级范围：%s\n", i+1, photoInline(item.Grade.OutOfScopeKP, 120))
+				fmt.Fprintf(&b, "- %s 超出当前年级范围：%s\n",
+					photoQuestionReference(item.Recognized), photoInline(item.Grade.OutOfScopeKP, 120))
 			case PhotoUntrusted:
-				fmt.Fprintf(&b, "- 第 %d 题证据不足：%s\n", i+1, photoInline(item.Warning, 240))
+				fmt.Fprintf(&b, "- %s 证据不足：%s\n",
+					photoQuestionReference(item.Recognized), photoInline(item.Warning, 240))
 			case PhotoFailed:
-				fmt.Fprintf(&b, "- 第 %d 题处理失败：%s\n", i+1, photoInline(item.Warning, 240))
+				fmt.Fprintf(&b, "- %s 处理失败：%s\n",
+					photoQuestionReference(item.Recognized), photoInline(item.Warning, 240))
 			}
 		}
 	}

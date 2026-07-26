@@ -55,6 +55,12 @@ func recoveryDeps(t *testing.T, rec Recognizer, anchorer AnswerAnchorer, annotat
 	d.Recognizer = rec
 	d.AnswerAnchorer = anchorer
 	d.PhotoAnnotator = annotator
+	d.ParentTeachingGuide = &parentTeachingGuideSpy{}
+	d.Profiles = newMemProfiles()
+	d.Profiles.(*memProfiles).m["mingming"] = k12.ChildProfile{
+		ChildName: "小明", GradeTerm: "五年级上",
+	}
+	d.GradingBudgetSnapshot = orchestratorTestBudget()
 	d.Now = func() int64 { return time.Now().Unix() }
 	return d
 }
@@ -113,9 +119,13 @@ func TestGradingRecovery_ClearImageTaskAtConfirmationCheckpointAutoFreezes(t *te
 		RecognitionConfidence: float64Ptr(0.99), OCRSignals: []string{"decimal_point"},
 	}}}
 	d := recoveryDeps(t, rec, nil, nil)
+	d.ParentTeachingGuide = &parentTeachingGuideSpy{}
 	o1 := newRecoverableOrchestrator(t, d, dir)
 	v, _, err := o1.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "image_task", SourceKey: "recover-auto-freeze",
+		BudgetSnapshot:            frozenWiringBudget(),
+		ParentAutomaticAttemptID:  "recover-auto-freeze:1",
+		ParentAutomaticDeadlineAt: d.now() + 300,
 	})
 	if err != nil {
 		t.Fatalf("StartPhotoGradingJob: %v", err)
@@ -408,7 +418,7 @@ func TestGradingRecovery_OutcomeUnknownRejectsStaleSamePhotoSnapshotFromAnotherJ
 	}
 }
 
-func TestGradingRecovery_OutcomeUnknownWithDurableAssessmentReconcilesWithoutResend(t *testing.T) {
+func TestGradingRecovery_OutcomeUnknownWithProcessLocalAssessmentStaysUnknownWithoutResend(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	rec := &countingRecognizer{questions: []RecognizedQuestion{{
@@ -513,7 +523,13 @@ func TestGradingRecovery_OutcomeUnknownWithDurableAssessmentReconcilesWithoutRes
 	if _, err := o2.RecoverGradingJobs(ctx, []string{"mingming"}); err != nil {
 		t.Fatalf("RecoverGradingJobs: %v", err)
 	}
-	waitForStage(t, d, "mingming", jobID, k12.GradingStageCompleted)
+	parked, err := d.GetGradingJob(ctx, "mingming", jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parked.Record.Status != k12.GradingStageOutcomeUnknown {
+		t.Fatalf("process-local assessment advanced recovery: stage=%s", parked.Record.Status)
+	}
 	invocations, err := d.Records.ListModelInvocations(ctx, "mingming", jobID)
 	if err != nil || len(invocations) != 2 {
 		t.Fatalf("model invocations count=%d err=%v", len(invocations), err)
@@ -525,9 +541,9 @@ func TestGradingRecovery_OutcomeUnknownWithDurableAssessmentReconcilesWithoutRes
 		}
 	}
 	if assessmentInvocation == nil ||
-		assessmentInvocation.Status != k12.ModelInvocationReconciled ||
-		assessmentInvocation.FailureKind != "reconciled_succeeded" {
-		t.Fatalf("assessment invocation not reconciled: %+v", assessmentInvocation)
+		assessmentInvocation.Status != k12.ModelInvocationOutcomeUnknown ||
+		assessmentInvocation.FailureKind != "ack_lost" {
+		t.Fatalf("assessment invocation must remain unknown without canonical receipts: %+v", assessmentInvocation)
 	}
 }
 

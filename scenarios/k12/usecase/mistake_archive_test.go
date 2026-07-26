@@ -152,8 +152,15 @@ func TestRestoreMistake_RestoresFrozenLearningStateWithoutInventingEvidence(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(queue) != 1 || queue[0].Record.RecordID != id {
-		t.Fatalf("restored due item not returned to queue: %#v", queue)
+	if len(queue) != 0 {
+		t.Fatalf("restored scheduled spot-check item leaked into normal review queue: %#v", queue)
+	}
+	spotChecks, err := d.spotCheckCandidates(ctx, "mingming")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spotChecks) != 1 || spotChecks[0].Record.RecordID != id {
+		t.Fatalf("restored scheduled item not returned to spot-check queue: %#v", spotChecks)
 	}
 
 	replayed, err := d.RestoreMistake(ctx, "mingming", id, archived.Version, "restore-command")

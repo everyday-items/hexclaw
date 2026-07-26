@@ -197,23 +197,3 @@ func TestRunEval_FullEssayWithFirstYouCanStillFails(t *testing.T) {
 		t.Fatalf("first/you can pair masked finished essay: %+v", res)
 	}
 }
-
-func TestGenerateRetryByRecord_PreservesPhysicsSubjectRouting(t *testing.T) {
-	solver := &subjectCaptureSolver{}
-	d, _ := newPipeline(t, solver, fakeGrader{}, nil)
-	rec, err := k12.NewMistakeRecord("mingming", "physics", k12.MistakeFields{
-		Subject: "物理", Question: "速度是多少", KnowledgePoint: "速度",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := d.Records.Put(context.Background(), rec); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := d.GenerateRetryByRecord(context.Background(), "mingming", rec.RecordID, "初二上"); err != nil {
-		t.Fatal(err)
-	}
-	if solver.subject != "物理" || solver.constraint != "" {
-		t.Fatalf("review retry lost subject routing: subject=%q constraint=%q", solver.subject, solver.constraint)
-	}
-}

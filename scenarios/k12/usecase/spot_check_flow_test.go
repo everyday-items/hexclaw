@@ -1,7 +1,8 @@
 package usecase_test
 
 // 抽查复验行为链路契约（RED 先行）——架构设计-v0.5.0 §3.6 抽查复验（2026-07-18 闭环补缺批）：
-//   1. 家长「确认已会」（MarkMastered）→ spot_check_state none→scheduled，**最多自动安排一次**；
+//   1. 家长「确认已会」（MarkMastered）只写 parent_confirmed_at、顺延 due_at，
+//      spot_check_state none→scheduled，**不写 mastered**，且最多自动安排一次；
 //      复验未过（failed）后家长再次确认：尊重家长判断不再抽查，failed 标注保留（规则 4）。
 //   2. 到期抽查混入下一次周卷（FillBasketFromDue）：scheduled 错题优先入卷、每次 ≤2 道（规则 2a）、
 //      added_via=spot_check（内部标识；卷级 source_kind 仍聚合为 weekly——呈现上不打「抽查」标签，规则 1）。
@@ -45,14 +46,17 @@ func TestSpotCheck_MarkMasteredSchedulesOnce(t *testing.T) {
 	})
 	markMastered(t, d, "xiaoming", id)
 	f, status := mistakeFieldsOf(t, d, "xiaoming", id)
-	if status != k12.StatusMastered {
-		t.Fatalf("确认已会应到 mastered, got %s", status)
+	if status != k12.StatusNew {
+		t.Fatalf("确认已会不得改变 evidence status, got %s", status)
 	}
 	if f.SpotCheckState != k12.SpotCheckScheduled {
 		t.Fatalf("确认已会应安排抽查 scheduled, got %q", f.SpotCheckState)
 	}
 	if f.ReviewStage != 2 {
 		t.Fatalf("确认动作不得改动间隔档（复验未过要恢复原档）, got %d", f.ReviewStage)
+	}
+	if f.ParentConfirmedAt != 1000 {
+		t.Fatalf("确认时间=%d want 1000", f.ParentConfirmedAt)
 	}
 }
 
@@ -70,6 +74,7 @@ func TestSpotCheck_FillBasketMixesScheduledFirstCapTwo(t *testing.T) {
 	putDueMistake(t, d, "xiaoming", k12.MistakeFields{
 		Subject: "数学", Question: "5×5=?", KnowledgePoint: "口算", CanonicalAnswer: "25",
 	})
+	d.Now = func() int64 { return 1000 + 3*86400 + 1 }
 
 	added, _, err := d.FillBasketFromDue(context.Background(), "xiaoming", "sess-fill")
 	if err != nil {
@@ -108,6 +113,7 @@ func TestSpotCheck_GradeOutcomePassedAndFailed(t *testing.T) {
 	})
 	markMastered(t, d, "xiaoming", passID)
 	markMastered(t, d, "xiaoming", failID)
+	d.Now = func() int64 { return 1000 + 14*86400 + 1 }
 
 	if _, _, err := d.FillBasketFromDue(context.Background(), "xiaoming", "sess"); err != nil {
 		t.Fatal(err)
@@ -128,10 +134,10 @@ func TestSpotCheck_GradeOutcomePassedAndFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 通过：passed、保持已掌握、不回队列。
+	// 通过：passed，并把真实作答作为一次系统证据推进到 retried。
 	pf, pStatus := mistakeFieldsOf(t, d, "xiaoming", passID)
-	if pf.SpotCheckState != k12.SpotCheckPassed || pStatus != k12.StatusMastered {
-		t.Fatalf("抽查通过应 passed+保持 mastered, got %q/%s", pf.SpotCheckState, pStatus)
+	if pf.SpotCheckState != k12.SpotCheckPassed || pStatus != k12.StatusRetried {
+		t.Fatalf("抽查通过应 passed+正常累积证据, got %q/%s", pf.SpotCheckState, pStatus)
 	}
 	// 未通过：failed、回到本周复习队列（due 立即到期）、间隔档保持确认前档位（规则 3）。
 	ff, fStatus := mistakeFieldsOf(t, d, "xiaoming", failID)
@@ -172,6 +178,7 @@ func TestSpotCheck_NoDuplicateWhileInFlight(t *testing.T) {
 		Subject: "数学", Question: "6×7=?", KnowledgePoint: "口算", CanonicalAnswer: "42",
 	})
 	markMastered(t, d, "xiaoming", id)
+	d.Now = func() int64 { return 1000 + 3*86400 + 1 }
 	if _, _, err := d.FillBasketFromDue(context.Background(), "xiaoming", "s"); err != nil {
 		t.Fatal(err)
 	}

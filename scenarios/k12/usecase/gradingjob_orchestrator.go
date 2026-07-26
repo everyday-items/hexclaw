@@ -177,11 +177,13 @@ func NewGradingOrchestrator(deps Deps, snapshotFn GradingModelSnapshotResolver, 
 // StartPhotoGradingInput 照片批改 Job 创建输入。SourceKind/SourceKey 映射统一幂等键
 // （§4.10：IM = "im"/message_id）。ModelSnapshot 为空时取 snapshotFn()。
 type StartPhotoGradingInput struct {
-	Photo          PhotoGradeRequest
-	SourceKind     string
-	SourceKey      string
-	ModelSnapshot  k12.GradingModelSnapshot
-	BudgetSnapshot k12.GradingBudgetSnapshot
+	Photo                     PhotoGradeRequest
+	SourceKind                string
+	SourceKey                 string
+	ModelSnapshot             k12.GradingModelSnapshot
+	BudgetSnapshot            k12.GradingBudgetSnapshot
+	ParentAutomaticAttemptID  string
+	ParentAutomaticDeadlineAt int64
 }
 
 // StartPhotoGradingJob 创建照片批改 Job 并登记进程内运行时。幂等：同键命中既有 Job
@@ -189,6 +191,28 @@ type StartPhotoGradingInput struct {
 func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in StartPhotoGradingInput) (GradingJobView, bool, error) {
 	if len(in.Photo.Image) == 0 {
 		return GradingJobView{}, false, fmt.Errorf("%w: Image 不可空", ErrInvalidInput)
+	}
+	if strings.TrimSpace(in.SourceKind) == "image_task" {
+		if in.BudgetSnapshot.PolicyVersion <= 0 {
+			return GradingJobView{}, false, fmt.Errorf(
+				"%w: public image_task requires a frozen grading budget policy",
+				ErrInvalidInput,
+			)
+		}
+		if err := in.BudgetSnapshot.Validate(); err != nil {
+			return GradingJobView{}, false, fmt.Errorf(
+				"%w: invalid public image_task grading budget: %v",
+				ErrInvalidInput,
+				err,
+			)
+		}
+		if strings.TrimSpace(in.ParentAutomaticAttemptID) == "" ||
+			in.ParentAutomaticDeadlineAt <= o.deps.now() {
+			return GradingJobView{}, false, fmt.Errorf(
+				"%w: public image_task requires a live parent automatic attempt",
+				ErrInvalidInput,
+			)
+		}
 	}
 	sum := sha1.Sum(in.Photo.Image)
 	submissionID := "photo-" + hex.EncodeToString(sum[:])
@@ -222,6 +246,22 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 				)
 			}
 		}
+		if strings.TrimSpace(in.ParentAutomaticAttemptID) != "" &&
+			v.Fields.ParentAutomaticAttemptID != strings.TrimSpace(in.ParentAutomaticAttemptID) {
+			return GradingJobView{}, false, fmt.Errorf(
+				"%w: idempotency key %q is already bound to parent automatic attempt %q, requested %q",
+				ErrInvalidInput, v.Fields.IdempotencyKey,
+				v.Fields.ParentAutomaticAttemptID, strings.TrimSpace(in.ParentAutomaticAttemptID),
+			)
+		}
+		if strings.TrimSpace(in.ParentAutomaticAttemptID) != "" &&
+			v.Fields.ParentAutomaticDeadlineAt != in.ParentAutomaticDeadlineAt {
+			return GradingJobView{}, false, fmt.Errorf(
+				"%w: idempotency key %q is already bound to parent automatic deadline %d, requested %d",
+				ErrInvalidInput, v.Fields.IdempotencyKey,
+				v.Fields.ParentAutomaticDeadlineAt, in.ParentAutomaticDeadlineAt,
+			)
+		}
 	} else {
 		snap := in.ModelSnapshot
 		if o.snapshotFn != nil {
@@ -243,6 +283,8 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 			SourceKind:                  in.SourceKind,
 			SourceKey:                   in.SourceKey,
 			ModelSnapshot:               snap,
+			ParentAutomaticAttemptID:    in.ParentAutomaticAttemptID,
+			ParentAutomaticDeadlineAt:   in.ParentAutomaticDeadlineAt,
 			BudgetSnapshot:              in.BudgetSnapshot,
 			MaterializesProblemAttempts: true,
 		})
@@ -288,6 +330,13 @@ func (o *GradingOrchestrator) runLoop(ctx context.Context, run *gradingRun, jobI
 		// DD-018: every model boundary receives the immutable route stored on
 		// this Job. Mutable global defaults are only consulted for new Jobs.
 		ctx = k12.WithGradingModelSnapshot(ctx, v.Fields.ModelSnapshot)
+		if parentAutomaticDeadlineExceeded(v.Fields, o.deps.now()) &&
+			gradingStageMayStartPhysicalWork(v.Record.Status) {
+			handled, expired, expiryErr := o.expireParentAutomaticStageBeforeSend(ctx, run, v)
+			if handled {
+				return expired, expiryErr
+			}
+		}
 		switch v.Record.Status {
 		case k12.GradingStageQueued:
 			// 起跑/恢复：AdvanceGradingStage(ok) 落到最近成功检查点的后继（规则 3/6）。
@@ -312,7 +361,7 @@ func (o *GradingOrchestrator) runLoop(ctx context.Context, run *gradingRun, jobI
 			}
 			// ImageTask facade 对清晰、证据充足的事实直接自动冻结；只有稳定风险原因
 			// 存在时才停下来等家长确认。旧 GradingJob 入口保持原显式确认语义。
-			if v.Fields.SourceKind == "image_task" &&
+			if automaticPhotoConfirmationSource(v.Fields.SourceKind) &&
 				v.Fields.ConfirmationState == k12.GradingConfirmationPending &&
 				!recognizedQuestionsRequireGuardianConfirmation(run.questions) {
 				if v, err = o.autoFreezeClearRecognition(ctx, run, v); err != nil {
@@ -350,6 +399,10 @@ func recognizedQuestionsRequireGuardianConfirmation(questions []RecognizedQuesti
 		}
 	}
 	return false
+}
+
+func automaticPhotoConfirmationSource(sourceKind string) bool {
+	return sourceKind == "image_task" || sourceKind == PracticeReturnGradingSourceKind
 }
 
 // autoFreezeClearRecognition runs with the Job lock held. It follows the same
@@ -404,11 +457,20 @@ func (o *GradingOrchestrator) ConfirmAndRun(ctx context.Context, jobID string, c
 	candidate := *run
 	candidate.questions = cloneRecognizedQuestions(run.questions)
 	candidate.anchored = cloneRecognizedQuestions(run.anchored)
-	if err := applyAndValidateGradingConfirmation(&candidate, ConfirmPhotoGradingInput{}); err != nil {
+	job, err := o.deps.GetGradingJob(ctx, run.agentName, jobID)
+	if err != nil {
 		l.Unlock()
 		return GradingJobView{}, err
 	}
-	job, err := o.deps.GetGradingJob(ctx, run.agentName, jobID)
+	awaitingItemSource := false
+	if job.Fields.BudgetSnapshot.IsFrozen() {
+		awaitingItemSource, err = applyProgressiveGradingConfirmation(
+			&candidate,
+			ConfirmPhotoGradingInput{},
+		)
+	} else {
+		err = applyAndValidateGradingConfirmation(&candidate, ConfirmPhotoGradingInput{})
+	}
 	if err != nil {
 		l.Unlock()
 		return GradingJobView{}, err
@@ -436,6 +498,26 @@ func (o *GradingOrchestrator) ConfirmAndRun(ctx context.Context, jobID string, c
 	}
 	run.questions = candidate.questions
 	run.anchored = candidate.anchored
+	if awaitingItemSource {
+		for _, q := range candidate.questions {
+			q = NormalizeRecognizedQuestion(q)
+			if q.ConfirmationRequired {
+				continue
+			}
+			if _, itemErr := o.assessDurablePhotoItem(
+				ctx, o.deps, job, run.req, PhotoModeGrade, q,
+			); itemErr != nil {
+				l.Unlock()
+				return GradingJobView{}, itemErr
+			}
+		}
+		current, getErr := o.deps.GetGradingJob(ctx, run.agentName, jobID)
+		l.Unlock()
+		if getErr != nil {
+			return GradingJobView{}, getErr
+		}
+		return current, nil
+	}
 	for {
 		v, err := o.runLoop(ctx, run, jobID)
 		if err != nil || v.Record.Status != k12.GradingStageAwaitingConfirmation ||
@@ -610,7 +692,7 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 		}
 		return v, err
 	}
-	if job.Fields.SourceKind == "image_task" {
+	if automaticPhotoConfirmationSource(job.Fields.SourceKind) {
 		for i := range run.questions {
 			// The current facade requires confidence evidence before automatic
 			// freezing. Keep nil compatible for legacy GradingJob callers, but
@@ -678,6 +760,76 @@ func gradingStageContext(parent context.Context, deadline int64) (context.Contex
 		return context.WithCancel(parent)
 	}
 	return context.WithDeadline(parent, time.Unix(deadline, 0))
+}
+
+func gradingStageMayStartPhysicalWork(stage string) bool {
+	switch stage {
+	case k12.GradingStageQueued, k12.GradingStageNormalizing,
+		k12.GradingStageRecognizing, k12.GradingStageLocating,
+		k12.GradingStageAssessing:
+		return true
+	default:
+		return false
+	}
+}
+
+func (o *GradingOrchestrator) expireParentAutomaticStageBeforeSend(
+	ctx context.Context,
+	run *gradingRun,
+	job GradingJobView,
+) (bool, GradingJobView, error) {
+	invocations, err := o.deps.Records.ListModelInvocations(
+		context.WithoutCancel(ctx), run.agentName, job.Record.RecordID,
+	)
+	if err != nil {
+		return true, GradingJobView{}, err
+	}
+	for _, invocation := range invocations {
+		if invocation.Stage != job.Record.Status {
+			continue
+		}
+		switch invocation.Status {
+		case k12.ModelInvocationSent, k12.ModelInvocationOutcomeUnknown,
+			k12.ModelInvocationSucceeded, k12.ModelInvocationReconciled:
+			return false, GradingJobView{}, nil
+		case k12.ModelInvocationPrepared:
+			if _, markErr := o.deps.Records.MarkModelInvocationFailed(
+				context.WithoutCancel(ctx), run.agentName, invocation.InvocationID,
+				gradingFailureInteractiveDeadlineExceeded,
+			); markErr != nil {
+				current, readErr := o.deps.Records.GetModelInvocation(
+					context.WithoutCancel(ctx), run.agentName, invocation.InvocationID,
+				)
+				if readErr == nil {
+					switch current.Status {
+					case k12.ModelInvocationSent, k12.ModelInvocationOutcomeUnknown,
+						k12.ModelInvocationSucceeded, k12.ModelInvocationReconciled:
+						return false, GradingJobView{}, nil
+					}
+				}
+				return true, GradingJobView{}, markErr
+			}
+		}
+	}
+	expired, err := o.deps.AdvanceGradingStage(ctx, run.agentName, job.Record.RecordID,
+		AdvanceGradingInput{
+			Outcome:     GradingOutcomeFailed,
+			FailureKind: gradingFailureInteractiveDeadlineExceeded,
+			Retryable:   true,
+		})
+	if err != nil {
+		current, readErr := o.deps.GetGradingJob(
+			context.WithoutCancel(ctx), run.agentName, job.Record.RecordID,
+		)
+		if readErr == nil && k12.GradingStageTerminal(current.Record.Status) {
+			return true, current, nil
+		}
+		return true, expired, err
+	}
+	return true, expired, fmt.Errorf(
+		"%w: parent automatic attempt %s",
+		context.DeadlineExceeded, job.Fields.ParentAutomaticAttemptID,
+	)
 }
 
 // persistRecognizedPhotoFacts is the compensated local command that promotes a
@@ -853,7 +1005,22 @@ func (o *GradingOrchestrator) executeAnchor(jobID, agentName string, image []byt
 		}
 		anchorTimeout = time.Duration(seconds) * time.Second
 	}
-	ctx, cancel := context.WithTimeout(baseCtx, anchorTimeout)
+	anchorDeadline := time.Now().Add(anchorTimeout)
+	if strings.TrimSpace(job.Fields.ParentAutomaticAttemptID) != "" {
+		switch {
+		case job.Fields.ParentAutomaticDeadlineAt > 0 &&
+			time.Unix(job.Fields.ParentAutomaticDeadlineAt, 0).Before(anchorDeadline):
+			anchorDeadline = time.Unix(job.Fields.ParentAutomaticDeadlineAt, 0)
+		case job.Fields.ParentAutomaticDeadlineAt == 0:
+			remainingDeadline := time.Now().Add(
+				time.Duration(job.Fields.ParentAutomaticRemainingSeconds) * time.Second,
+			)
+			if remainingDeadline.Before(anchorDeadline) {
+				anchorDeadline = remainingDeadline
+			}
+		}
+	}
+	ctx, cancel := context.WithDeadline(baseCtx, anchorDeadline)
 	unregisterProvider := o.registerGradingModelCall(jobID, cancel)
 	if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), agentName, jobID); readErr != nil {
 		cancel()
@@ -1072,21 +1239,27 @@ func (o *GradingOrchestrator) runRender(ctx context.Context, run *gradingRun, jo
 	return o.advanceOK(ctx, run, jobID, digest)
 }
 
-// runProject projecting 阶段：错题投影已在批改用例内联幂等入库（pipeline.go 判错步骤，
-// 含首次复习到期与学情信号），本阶段固化投影摘要检查点后收敛 completed。
-// 错题域写与 Outbox 事件已同事务提交（§6.9，k12storage V9）；
-// TODO(Assessment 聚合)：k12_assessments 聚合落库后，本阶段改为 Assessment 投影事务。
+// runProject is the only page-finalization entry. Completion is authorized by
+// one durable GradingFinalArtifact, never by the process-local page result.
 func (o *GradingOrchestrator) runProject(ctx context.Context, run *gradingRun, jobID string) (GradingJobView, error) {
-	if run.result == nil {
-		return GradingJobView{}, fmt.Errorf("usecase: 批改任务 %s projecting 缺批改产物（运行时状态丢失）", jobID)
+	job, err := o.deps.GetGradingJob(ctx, run.agentName, jobID)
+	if err != nil {
+		return GradingJobView{}, err
 	}
-	mistakes := 0
-	for _, item := range run.result.Items {
-		if item.Status == PhotoWrong {
-			mistakes++
-		}
+	finalArtifact, err := o.finalizeGradingPage(ctx, run, job)
+	if err != nil {
+		return job, err
 	}
-	return o.advanceOK(ctx, run, jobID, fmt.Sprintf("mistakes:%d", mistakes))
+	return o.completeFinalizedGrading(ctx, run, jobID, finalArtifact.ArtifactDigest)
+}
+
+func (o *GradingOrchestrator) completeFinalizedGrading(
+	ctx context.Context,
+	run *gradingRun,
+	jobID string,
+	finalArtifactDigest string,
+) (GradingJobView, error) {
+	return o.advanceOK(ctx, run, jobID, finalArtifactDigest)
 }
 
 // --- 内部辅助 ---
@@ -1127,6 +1300,11 @@ func (o *GradingOrchestrator) failModelInvocationBeforeSend(
 ) (GradingJobView, error) {
 	kind := "invocation_prepare_failed"
 	retryable := true
+	if current, err := o.deps.GetGradingJob(
+		context.WithoutCancel(ctx), run.agentName, jobID,
+	); err == nil && parentAutomaticDeadlineExceeded(current.Fields, o.deps.now()) {
+		kind = gradingFailureInteractiveDeadlineExceeded
+	}
 	if errors.Is(cause, k12storage.ErrModelInvocationConflict) {
 		kind = "invocation_identity_conflict"
 		retryable = false
