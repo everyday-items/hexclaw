@@ -509,6 +509,22 @@ WHERE status IN ('confirmed','assigned','submitted','graded','closed','cancelled
 	K12MistakeArchiveV35,
 	K12DeliveryBatchesV36,
 	K12CreativeAccumulationV37,
+	K12ParentConfirmationV38,
+	K12SinglePracticeGenerationV39,
+	K12PracticeReturnRegradeV40,
+	K12InsightSnapshotV41,
+	K12ProblemSourceNumberV42,
+	SessionStatsRepairV43,
+	K12GradingPhysicalCallsV44,
+	K12PrintArtifactRendersV45,
+	KnowledgeIngestExecutionV46,
+	K12ImageTaskAutomaticDeadlineV47,
+	K12ProblemProgressiveV48,
+	K12GradingFinalArtifactsV49,
+	K12ProblemSourceActionsV50,
+	K12ProblemStructuresV51,
+	K12WeeklyPracticeV52,
+	K12SubjectTextbooksV53,
 }
 
 const k12PrintJobsV13DDL = `CREATE TABLE IF NOT EXISTS k12_paper_no_counters (

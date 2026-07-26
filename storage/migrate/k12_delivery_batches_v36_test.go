@@ -44,8 +44,12 @@ func TestK12DeliveryBatchesV36AddsBatchRootAndChildLink(t *testing.T) {
 	}
 }
 
-func TestK12DeliveryBatchesV36IsLatestNumberedMigration(t *testing.T) {
-	if len(All) == 0 || All[len(All)-1].Version != K12DeliveryBatchesV36.Version {
-		t.Fatalf("latest migration=%d want %d", All[len(All)-1].Version, K12DeliveryBatchesV36.Version)
+func TestK12DeliveryBatchesV36IsRegisteredInOrder(t *testing.T) {
+	if K12DeliveryBatchesV36.Version != 36 {
+		t.Fatalf("K12DeliveryBatchesV36.Version=%d want 36", K12DeliveryBatchesV36.Version)
+	}
+	if len(All) < K12DeliveryBatchesV36.Version ||
+		All[K12DeliveryBatchesV36.Version-1].Version != K12DeliveryBatchesV36.Version {
+		t.Fatalf("migration v36 is not registered at its ordered position")
 	}
 }

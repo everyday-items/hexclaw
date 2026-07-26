@@ -172,8 +172,9 @@ VALUES
 	}
 }
 
-func TestK12CreativeAccumulationV37IsLatestNumberedMigration(t *testing.T) {
-	if len(All) == 0 || All[len(All)-1].Version != K12CreativeAccumulationV37.Version {
-		t.Fatalf("latest migration=%d want %d", All[len(All)-1].Version, K12CreativeAccumulationV37.Version)
+func TestK12CreativeAccumulationV37IsRegisteredAtItsNumber(t *testing.T) {
+	if len(All) < K12CreativeAccumulationV37.Version ||
+		All[K12CreativeAccumulationV37.Version-1].Version != K12CreativeAccumulationV37.Version {
+		t.Fatalf("migration %d is not registered at its numbered position", K12CreativeAccumulationV37.Version)
 	}
 }

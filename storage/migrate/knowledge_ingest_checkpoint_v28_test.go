@@ -89,11 +89,12 @@ func TestKnowledgeIngestCheckpointV28AddsPageLedgerAndBackfillsChunkSourceDigest
 	}
 }
 
-func TestKnowledgeIngestCheckpointV28IsLatest(t *testing.T) {
+func TestKnowledgeIngestCheckpointV28IsRegisteredInOrder(t *testing.T) {
 	if KnowledgeIngestCheckpointV28.Version != 28 {
 		t.Fatalf("KnowledgeIngestCheckpointV28.Version=%d, want 28", KnowledgeIngestCheckpointV28.Version)
 	}
-	if len(All) == 0 || All[len(All)-1].Version != K12DeliveryBatchesV36.Version {
-		t.Fatalf("latest migration=%d, want %d", All[len(All)-1].Version, K12DeliveryBatchesV36.Version)
+	if len(All) < KnowledgeIngestCheckpointV28.Version ||
+		All[KnowledgeIngestCheckpointV28.Version-1].Version != KnowledgeIngestCheckpointV28.Version {
+		t.Fatalf("migration v28 is not registered at its ordered position")
 	}
 }

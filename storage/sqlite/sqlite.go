@@ -40,6 +40,11 @@ type Store struct {
 
 	forkCacheMu sync.RWMutex
 	forkCache   map[forkCacheKey]forkCacheEntry
+
+	// messageMutationMu linearizes canonical message writes with their
+	// denormalized session-stat updates inside one Store. SQLite busy retry
+	// remains responsible only for competing external connections.
+	messageMutationMu sync.Mutex
 }
 
 type searchCacheKey struct {
@@ -540,13 +545,24 @@ func (s *Store) SaveMessage(ctx context.Context, msg *storage.MessageRecord) err
 		msg.Meta = "{}"
 	}
 
-	if err := sqliteutil.RetryOnBusy(ctx, func() error {
+	if err := s.withMessageMutation(ctx, func() error {
 		return s.saveMessageTx(ctx, msg)
 	}); err != nil {
 		return err
 	}
 	s.invalidateSearchCache()
 	return nil
+}
+
+// withMessageMutation serializes message facts and their session aggregates
+// within this Store, then retains the existing BUSY retry for external writers.
+func (s *Store) withMessageMutation(ctx context.Context, fn func() error) error {
+	s.messageMutationMu.Lock()
+	defer s.messageMutationMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return sqliteutil.RetryOnBusy(ctx, fn)
 }
 
 // saveMessageTx 在单个事务内插入消息并更新会话冗余字段。
@@ -597,12 +613,71 @@ func (s *Store) GetMessage(ctx context.Context, id string) (*storage.MessageReco
 
 // DeleteMessage 删除单条消息
 func (s *Store) DeleteMessage(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM messages WHERE id = ?`, id)
-	if err == nil {
-		s.invalidateSearchCache()
-		s.invalidateForkCache()
+	err := s.withMessageMutation(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("开启删除消息事务失败: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		var sessionID string
+		if err := tx.QueryRowContext(ctx, `SELECT session_id FROM messages WHERE id = ?`, id).
+			Scan(&sessionID); err != nil {
+			if err == sql.ErrNoRows {
+				// DeleteMessage remains idempotent for client compensation and retry.
+				return nil
+			}
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE id = ?`, id); err != nil {
+			return err
+		}
+
+		var count, promptTokens, completionTokens int
+		var lastContent string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT
+				COUNT(*),
+				COALESCE(SUM(prompt_tokens), 0),
+				COALESCE(SUM(completion_tokens), 0),
+				COALESCE((
+					SELECT content
+					FROM messages
+					WHERE session_id = ?
+					ORDER BY created_at DESC, rowid DESC
+					LIMIT 1
+				), '')
+			FROM messages
+			WHERE session_id = ?`,
+			sessionID, sessionID,
+		).Scan(&count, &promptTokens, &completionTokens, &lastContent); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE sessions SET
+				updated_at = ?,
+				message_count = ?,
+				total_prompt_tokens = ?,
+				total_completion_tokens = ?,
+				last_message_preview = ?
+			WHERE id = ?`,
+			time.Now(),
+			count,
+			promptTokens,
+			completionTokens,
+			previewByteLimit(lastContent, 200),
+			sessionID,
+		); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+	if err != nil {
+		return err
 	}
-	return err
+	s.invalidateSearchCache()
+	s.invalidateForkCache()
+	return nil
 }
 
 // ListMessages 获取会话的消息历史
