@@ -6,11 +6,16 @@ package engineadapter
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/engine"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
@@ -30,11 +35,6 @@ type VerifiedGradeExecutor interface {
 	GradeVerified(ctx context.Context, problem, verifiedSolution, studentAnswer string) (*skill.Result, error)
 }
 
-// RetryGenerateFunc 是「再练一道」的轻量出题闭包（composition root 注入，BUG-20260712）。
-// 内部走**单个 reasoning 子 Agent**出题+解答——不派 verifier / 不 self-consistency / 不重出，
-// 返回出题正文（含回执围栏，adapter 侧剥离）。nil 时 GenerateSimilar 安全回退全链。
-type RetryGenerateFunc func(ctx context.Context, subject, prompt, grade string) (string, error)
-
 // CauseSummaryGenerateFunc 是「记一条错题」的轻量错因摘要闭包。必须与变式出题分开，避免
 // “必须出题”的系统提示覆盖“只输出错因”的用户提示。
 type CauseSummaryGenerateFunc func(ctx context.Context, subject, prompt, grade string) (string, error)
@@ -46,7 +46,6 @@ type TutoringTipsReviewGenerateFunc func(ctx context.Context, subject, prompt, g
 // SolveAdapter 用 engine 的 solve skill 实现用例层的 Solver + Grader 两个 port。
 type SolveAdapter struct {
 	exec                   SolveExecutor
-	retryGen               RetryGenerateFunc              // 轻量「再练一道」出题；nil 时回退全链
 	causeSummaryGen        CauseSummaryGenerateFunc       // 轻量错因摘要；nil 时留空由用户填写
 	tutoringTipsReviewGen  TutoringTipsReviewGenerateFunc // nil means an honest static degradation
 	parentTeachingGuideGen ParentTeachingGuideGenerateFunc
@@ -62,11 +61,6 @@ type SolveAdapter struct {
 // SolveAdapterOption 装配可选能力（保 NewSolveAdapter 单参数向后兼容）。
 type SolveAdapterOption func(*SolveAdapter)
 
-// WithRetryGen 注入轻量出题闭包，让「再练一道」走单次 reasoning、不落全对抗验算链。
-func WithRetryGen(fn RetryGenerateFunc) SolveAdapterOption {
-	return func(a *SolveAdapter) { a.retryGen = fn }
-}
-
 // WithCauseSummaryGen 注入专用错因摘要闭包。
 func WithCauseSummaryGen(fn CauseSummaryGenerateFunc) SolveAdapterOption {
 	return func(a *SolveAdapter) { a.causeSummaryGen = fn }
@@ -76,9 +70,6 @@ func WithCauseSummaryGen(fn CauseSummaryGenerateFunc) SolveAdapterOption {
 func WithTutoringTipsReviewGen(fn TutoringTipsReviewGenerateFunc) SolveAdapterOption {
 	return func(a *SolveAdapter) { a.tutoringTipsReviewGen = fn }
 }
-
-// SetRetryGen 事后注入轻量出题闭包（composition root 在 Deps.Solver 建好后回填）。
-func (a *SolveAdapter) SetRetryGen(fn RetryGenerateFunc) { a.retryGen = fn }
 
 // SetCauseSummaryGen 事后注入专用错因摘要闭包。
 func (a *SolveAdapter) SetCauseSummaryGen(fn CauseSummaryGenerateFunc) { a.causeSummaryGen = fn }
@@ -101,10 +92,71 @@ var (
 	_ usecase.Solver                      = (*SolveAdapter)(nil)
 	_ usecase.Grader                      = (*SolveAdapter)(nil)
 	_ usecase.VerifiedSolutionGrader      = (*SolveAdapter)(nil)
-	_ usecase.RetryGenerator              = (*SolveAdapter)(nil)
 	_ usecase.CauseSummarizer             = (*SolveAdapter)(nil)
 	_ usecase.TutoringTipsReviewGenerator = (*SolveAdapter)(nil)
 )
+
+func (a *SolveAdapter) UsesGradingPhysicalCalls() bool {
+	capable, ok := a.exec.(interface{ SupportsSubAgentCallInterceptor() bool })
+	return ok && capable.SupportsSubAgentCallInterceptor()
+}
+
+func (a *SolveAdapter) withGradingPhysicalCallInterceptor(ctx context.Context) context.Context {
+	if !usecase.HasGradingPhysicalCallExecutor(ctx) {
+		return ctx
+	}
+	return engine.WithSubAgentCallInterceptor(ctx, engine.SubAgentCallInterceptorFunc(
+		func(
+			callCtx context.Context,
+			spec engine.SubAgentSpec,
+			next engine.SubAgentExecFunc,
+		) (engine.SubAgentResult, error) {
+			var operation k12.GradingItemOperation
+			switch strings.ToLower(strings.TrimSpace(spec.Agent)) {
+			case "solver":
+				operation = k12.GradingItemOperationSolveGenerate
+			case "verifier":
+				operation = k12.GradingItemOperationSolveVerify
+			case "grader":
+				operation = k12.GradingItemOperationGrade
+			default:
+				return next(callCtx, spec)
+			}
+			requestRaw, err := json.Marshal(struct {
+				Agent  string `json:"agent"`
+				Task   string `json:"task"`
+				Source string `json:"source"`
+				Mode   string `json:"mode"`
+			}{spec.Agent, spec.Task, spec.Source, spec.Mode})
+			if err != nil {
+				return engine.SubAgentResult{}, err
+			}
+			digestRaw := sha256.Sum256(requestRaw)
+			physical, err := usecase.ExecuteGradingPhysicalCall(
+				callCtx,
+				usecase.GradingPhysicalCallSpec{
+					Operation: operation, RequestDigest: hex.EncodeToString(digestRaw[:]),
+				},
+				func(providerCtx context.Context) (string, error) {
+					result, callErr := next(providerCtx, spec)
+					if callErr != nil {
+						return "", callErr
+					}
+					raw, marshalErr := json.Marshal(result)
+					return string(raw), marshalErr
+				},
+			)
+			if err != nil {
+				return engine.SubAgentResult{}, err
+			}
+			var result engine.SubAgentResult
+			if err := json.Unmarshal([]byte(physical.Payload), &result); err != nil {
+				return engine.SubAgentResult{}, fmt.Errorf("solve adapter: decode physical call result: %w", err)
+			}
+			return result, nil
+		},
+	))
+}
 
 // Solve 实现 usecase.Solver：调 solve skill 解题验算（透传 grade + constraint 约束年级边界），
 // 把 Metadata 里的 verdict + evidence 映射成证据对象。
@@ -127,6 +179,12 @@ func (a *SolveAdapter) SolveSubject(ctx context.Context, subject, problem, grade
 	if constraint != "" {
 		args["constraint"] = constraint
 	}
+	if usecase.HasGradingPhysicalCallExecutor(ctx) {
+		// Durable grading requires an explicit solver + verifier pair. This also
+		// prevents deterministic fast paths from producing a fake provider ledger.
+		args["self_consistency"] = 1
+		ctx = a.withGradingPhysicalCallInterceptor(ctx)
+	}
 	res, err := a.exec.Execute(ctx, args)
 	if err != nil {
 		return usecase.SolveResult{}, providerResponseError(err)
@@ -138,29 +196,6 @@ func (a *SolveAdapter) SolveSubject(ctx context.Context, subject, problem, grade
 		Solution:     normalizeSolveMarkdown(stripReports(res.Content)),
 		Evidence:     evidenceFromMeta(res.Metadata),
 		OutOfScopeKP: res.Metadata["solve_out_of_scope_kp"],
-	}, nil
-}
-
-// GenerateSimilar 实现 usecase.RetryGenerator（BUG-20260712 治本「再练一道」轻量出题）：
-// 走单次 reasoning 出题闭包（单个子 Agent，不派 verifier / 不 self-consistency / 不重出），
-// 真机从全对抗链 68s 降到单次调用量级。练习变式题容错高：**不跑 code_exec 程序验算**，
-// 故 verdict=unverifiable、不给强徽章（信任红线：绝不把未验算的练习题冒充「已程序验算」）。
-// 未注入 retryGen 闭包时安全回退全链（SolveSubject），保证正确性不塌。
-func (a *SolveAdapter) GenerateSimilar(ctx context.Context, subject, prompt, grade string) (usecase.SolveResult, error) {
-	if a.retryGen == nil {
-		sr, err := a.SolveSubject(ctx, subject, prompt, grade, "")
-		if err == nil {
-			sr.Solution = normalizeRetryMarkdown(sr.Solution)
-		}
-		return sr, err
-	}
-	out, err := a.retryGen(ctx, subject, prompt, grade)
-	if err != nil {
-		return usecase.SolveResult{}, err
-	}
-	return usecase.SolveResult{
-		Solution: normalizeRetryMarkdown(stripReports(out)),
-		Evidence: usecase.SolveEvidence{Verdict: usecase.VerdictUnverifiable, EvidenceType: usecase.EvidenceNone},
 	}, nil
 }
 
@@ -234,6 +269,7 @@ func (a *SolveAdapter) GradeSubject(ctx context.Context, subject, problem, stude
 	if subject != "" {
 		args["subject"] = subject
 	}
+	ctx = a.withGradingPhysicalCallInterceptor(ctx)
 	res, err := a.exec.Execute(ctx, args)
 	return gradeOutcomeFromResult(res, err)
 }
@@ -242,6 +278,7 @@ func (a *SolveAdapter) GradeSubject(ctx context.Context, subject, problem, stude
 // 测试/第三方旧 executor 没实现时安全回退原完整批改链，兼容性优先。
 func (a *SolveAdapter) GradeVerified(ctx context.Context, subject, problem, studentAnswer, verifiedSolution string) (usecase.GradeOutcome, error) {
 	if exec, ok := a.exec.(VerifiedGradeExecutor); ok {
+		ctx = a.withGradingPhysicalCallInterceptor(ctx)
 		res, err := exec.GradeVerified(ctx, problem, verifiedSolution, studentAnswer)
 		return gradeOutcomeFromResult(res, err)
 	}

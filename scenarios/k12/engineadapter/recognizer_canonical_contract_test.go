@@ -1,6 +1,7 @@
 package engineadapter
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
@@ -56,5 +57,38 @@ func TestMergeRecognizedEvidence_RetainsConflictingObservationsForConfirmation(t
 	}
 	if !foundConflict {
 		t.Fatalf("conflicting observations must force confirmation: %v", merged.ConfirmationReasons)
+	}
+}
+
+func TestBUG20260726_D_RecognizerPreservesSourceNumberPathAndDisplayLabel(t *testing.T) {
+	questions, err := parseRecognizedQuestions(`[{
+		"problem_id":"p-3-1",
+		"problem_kind":"standalone",
+		"source_number_path":["三","1"],
+		"display_label":"三、1",
+		"question":"24÷8=",
+		"canonical_markdown":"24\\div8=",
+		"subject":"数学",
+		"knowledge_points":["整数除法"],
+		"answer_state":"present",
+		"student_answer":"3",
+		"answer_canonical_markdown":"3",
+		"recognition_confidence":0.99
+	}]`)
+	if err != nil {
+		t.Fatalf("parseRecognizedQuestions: %v", err)
+	}
+	if len(questions) != 1 {
+		t.Fatalf("questions=%#v", questions)
+	}
+	value := reflect.ValueOf(questions[0])
+	pathField := value.FieldByName("SourceNumberPath")
+	labelField := value.FieldByName("DisplayLabel")
+	if !pathField.IsValid() || !labelField.IsValid() {
+		t.Fatalf("BUG-20260726-D recognized question dropped source_number_path/display_label: %#v", questions[0])
+	}
+	path, ok := pathField.Interface().([]string)
+	if !ok || !reflect.DeepEqual(path, []string{"三", "1"}) || labelField.String() != "三、1" {
+		t.Fatalf("BUG-20260726-D source number drift: path=%#v label=%q", pathField.Interface(), labelField.String())
 	}
 }

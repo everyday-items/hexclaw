@@ -90,9 +90,10 @@ func (a *RecognizerAdapter) splitWorksheet(
 var _ usecase.Recognizer = (*RecognizerAdapter)(nil)
 
 const recognizePrompt = `识别这张作业图片里的所有题目，并逐题回收孩子的手写作答事实、判定题目学科。严格输出 JSON 数组，每个元素形如：
-{"problem_id":"仅用于本次 JSON 内父子关联的临时引用","problem_kind":"standalone","parent_problem_id":"","subproblem_no":"","question":"逐字原始转写","canonical_markdown":"规范 Markdown/LaTeX","subject":"数学","knowledge_points":["知识点1"],"answer_state":"present","student_answer":"孩子实际写下且能可靠辨认的原始作答","answer_canonical_markdown":"规范 Markdown/LaTeX","recognition_confidence":0.98,"ocr_signals":[]}
+{"problem_id":"仅用于本次 JSON 内父子关联的临时引用","problem_kind":"standalone","parent_problem_id":"","subproblem_no":"","source_number_path":["三","1"],"display_label":"三、1","question":"逐字原始转写","canonical_markdown":"规范 Markdown/LaTeX","subject":"数学","knowledge_points":["知识点1"],"answer_state":"present","student_answer":"孩子实际写下且能可靠辨认的原始作答","answer_canonical_markdown":"规范 Markdown/LaTeX","recognition_confidence":0.98,"ocr_signals":[]}
 关键规则：
-- 每个独立作答的小题必须对应一个 JSON 元素：即使多个口算、填空或选择小题横排在同一行，也要逐小题拆开，不能合并成一个大题/整行元素；章节标题不能当作题目。
+- 每个独立作答的小题必须对应一个 JSON 元素：即使多个口算、填空或选择小题横排在同一行，也要逐小题拆开，不能合并成一个大题/整行元素；章节标题不能当作题目，但章节原题号必须作为下属题目的 source_number_path 上级 token 保留。
+- source_number_path 必须逐层保留原卷实际可见题号字符，例如大题“三”下第“1”题输出 ["三","1"]；display_label 必须按原卷层级输出“三、1”。原卷没有题号时两者分别输出 [] 和 ""，禁止按识别顺序自造连续题号。
 - problem_id 只是在本次 JSON 内供 parent_problem_id 引用的临时标签，不是持久 ID；不要输出 attempt_id、input_digest、confirmed_version 等系统字段。
 - 复合题公共材料只输出一次 problem_kind=compound_parent（不得带孩子作答）；每个小题输出 problem_kind=subproblem、parent_problem_id 精确指向本次 JSON 内父题的 problem_id、subproblem_no 为稳定小题号。普通题用 standalone。
 - question/student_answer 必须逐字保留视觉原始转写；canonical_markdown/answer_canonical_markdown 独立输出可渲染 Markdown/LaTeX，不得用规范形覆盖原始转写。
@@ -115,7 +116,7 @@ const printedQuestionInventoryPrompt = `这是“整页印刷题清单”识别�
 - 小数点、运算符、单位、括号和题号必须按图抄录，不能用数学常识改写；
 - subject 只能取 数学 / 语文 / 英语 / 物理 / 化学，无法判断时留空；
 - knowledge_points 只填写从印刷题干可确定的知识点。
-严格只输出紧凑 JSON 数组，每个对象仅含 question、subject、knowledge_points，不要输出 student_answer、answer_state、bbox 或解释。`
+严格只输出紧凑 JSON 数组，每个对象仅含 source_number_path、display_label、question、subject、knowledge_points，不要输出 student_answer、answer_state、bbox 或解释。`
 
 // recognizedDTO 解析视觉模型 JSON 用（带 json tag）。
 type recognizedDTO struct {
@@ -123,6 +124,8 @@ type recognizedDTO struct {
 	ProblemKind                  string   `json:"problem_kind"`
 	ParentProblemID              string   `json:"parent_problem_id"`
 	SubproblemNo                 string   `json:"subproblem_no"`
+	SourceNumberPath             []string `json:"source_number_path"`
+	DisplayLabel                 string   `json:"display_label"`
 	Question                     string   `json:"question"`
 	CanonicalMarkdown            string   `json:"canonical_markdown"`
 	Subject                      string   `json:"subject"`
@@ -285,6 +288,7 @@ func parseRecognizedQuestions(raw string) ([]usecase.RecognizedQuestion, error) 
 		out = append(out, usecase.RecognizedQuestion{
 			ProblemID: d.ProblemID, ProblemKind: usecase.ProblemKind(d.ProblemKind),
 			ParentProblemID: d.ParentProblemID, SubproblemNo: d.SubproblemNo,
+			SourceNumberPath: append([]string(nil), d.SourceNumberPath...), DisplayLabel: d.DisplayLabel,
 			Question: question, RawTranscription: rawQuestion, CanonicalMarkdown: canonicalQuestion,
 			KnowledgePoints: d.KnowledgePoints, AnswerState: answerState,
 			StudentAnswer: studentAnswer, AnswerRawTranscription: d.StudentAnswer,
@@ -316,6 +320,7 @@ func parsePrintedQuestionInventory(raw string) ([]usecase.RecognizedQuestion, er
 		out = append(out, usecase.RecognizedQuestion{
 			ProblemID: dto.ProblemID, ProblemKind: usecase.ProblemKind(dto.ProblemKind),
 			ParentProblemID: dto.ParentProblemID, SubproblemNo: dto.SubproblemNo,
+			SourceNumberPath: append([]string(nil), dto.SourceNumberPath...), DisplayLabel: dto.DisplayLabel,
 			Question: question, RawTranscription: rawQuestion, CanonicalMarkdown: canonicalQuestion,
 			KnowledgePoints: dto.KnowledgePoints,
 			AnswerState:     usecase.AnswerStateBlank,

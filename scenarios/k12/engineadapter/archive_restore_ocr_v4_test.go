@@ -77,7 +77,20 @@ func TestArchiveRestoreAsWritingOCRKeepsWorkFeedbackEvidenceResolvableAndRollbac
 		t.Fatalf("target job/version mismatch: job=%+v version=%+v", job, version)
 	}
 
-	feedbackDeps := usecase.Deps{Records: f.records, Solver: archiveOCRFeedbackSolver{}}
+	feedbackDeps := usecase.Deps{
+		Records: f.records,
+		Solver:  archiveOCRFeedbackSolver{},
+		WorkFeedbackRoute: func(
+			context.Context, string,
+		) (k12.ImageTaskRouteSnapshot, error) {
+			return k12.ImageTaskRouteSnapshot{
+				Provider: "test", Model: "feedback-v1",
+				Route: "test/feedback-v1", Capability: "text",
+				SelectionSource: "explicit", PolicyVersion: "test-v1",
+				PromptVersion: "writing-feedback-v1",
+			}, nil
+		},
+	}
 	view, err := feedbackDeps.GenerateWorkFeedback(ctx, "target-child", work.RecordID)
 	if err != nil {
 		t.Fatal(err)

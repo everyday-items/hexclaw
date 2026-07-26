@@ -51,8 +51,8 @@ func diskSkillDoc(name, version, extraFrontmatter, body string) string {
 // validDiskWritingBody 携带写作红线锚点（零代写/不打分）的盘上演进版正文。
 const validDiskWritingBody = "# 盘上演进版写作反馈 v9\n新增的演进方法论段落。\n红线：零代写、不打分。"
 
-// validDiskArtBody 携带美术红线锚点（不打分/不重画）的盘上演进版正文。
-const validDiskArtBody = "# 盘上演进版美术反馈 v9\n新增的观察演进段落。\n红线：不打分、不重画。"
+// validDiskArtBody 携带美术红线锚点（不打分/不重画/不得先追问）的盘上演进版正文。
+const validDiskArtBody = "# 盘上演进版美术反馈 v9\n新增的观察演进段落。\n红线：不打分、不重画、不得先追问。"
 
 // TestBuildWorkFeedbackPrompt_DiskPreferredOverEmbedded 盘上有效版本优先于内嵌：
 // 提示词用盘上正文（内嵌独有句不出现）、frontmatter 剥离、来源戳 /disk、硬编码红线仍叠加。
@@ -277,7 +277,7 @@ func TestBuildWorkFeedbackPrompt_Art_InjectsSkillBody(t *testing.T) {
 	if subject != "美术" {
 		t.Errorf("美术学科应为美术, got %q", subject)
 	}
-	if stamp != "art-feedback@1.0.0/embedded" {
+	if stamp != "art-feedback@1.0.1/embedded" {
 		t.Errorf("无 loader 时来源戳应为 embedded，got %q", stamp)
 	}
 	// skill 正文关键方法论句（来自 hub v0.0.7 art-feedback.md 正文）。

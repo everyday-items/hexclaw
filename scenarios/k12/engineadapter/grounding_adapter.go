@@ -24,6 +24,10 @@ type kbWriter interface {
 	AddDocument(ctx context.Context, title, content, source string) (*knowledge.Document, error)
 }
 
+type kbRevisionSnapshotter interface {
+	ActiveSemanticRevision(ctx context.Context) (revisionID string, active bool, err error)
+}
+
 // GroundingAdapter retrieves textbook evidence for tutoring tips.
 type GroundingAdapter struct {
 	kb   kbQuerier
@@ -37,6 +41,7 @@ var _ usecase.Grounding = (*GroundingAdapter)(nil)
 var _ usecase.GroundingWriter = (*GroundingAdapter)(nil)
 var _ usecase.SubjectGrounding = (*GroundingAdapter)(nil)
 var _ usecase.SubjectGroundingWriter = (*GroundingAdapter)(nil)
+var _ usecase.SnapshotGrounding = (*GroundingAdapter)(nil)
 
 // GroundingSource 是 K12 家长上传**不分科**教材的 KB source 命名约定（旧语义，
 // 分科上线前的存量数据全在此桶）。Agent 名按原始字节做 URL-safe base64，既保留精确
@@ -50,6 +55,17 @@ func GroundingSource(agentName string) string {
 // 出现在 base64 字符集内，与不分科桶零碰撞；写读两侧必须同键。
 func GroundingSubjectSource(agentName, subject string) string {
 	return GroundingSource(agentName) + ":subject:" + base64.RawURLEncoding.EncodeToString([]byte(subject))
+}
+
+// GroundingBindingSource is the exact Knowledge source for one immutable
+// Learner x Subject textbook binding.
+func GroundingBindingSource(learnerID, subject, bindingID string) string {
+	encode := func(value string) string {
+		return base64.RawURLEncoding.EncodeToString([]byte(value))
+	}
+	return "k12-learner:" + encode(learnerID) +
+		":subject:" + encode(subject) +
+		":binding:" + encode(bindingID)
 }
 
 // AddGrounding 用与读侧完全相同的 source 将家长教材入库。
@@ -111,14 +127,103 @@ func (a *GroundingAdapter) GroundSubject(ctx context.Context, agentName, subject
 	return a.groundBySources(ctx, agentName, knowledgePoint, grade, []string{GroundingSource(agentName)})
 }
 
+// FreezeGroundingSnapshot captures the active vector revision exactly once.
+// Typed binding resolution belongs to the durable K12 binding store and is not
+// guessed from an edition label here.
+func (a *GroundingAdapter) FreezeGroundingSnapshot(
+	ctx context.Context,
+	requested usecase.GroundingSnapshot,
+) (usecase.GroundingSnapshot, error) {
+	requested.AgentName = strings.TrimSpace(requested.AgentName)
+	requested.LearnerID = strings.TrimSpace(requested.LearnerID)
+	requested.Subject = strings.TrimSpace(requested.Subject)
+	requested.TextbookBindingID = strings.TrimSpace(requested.TextbookBindingID)
+	requested.Edition = strings.TrimSpace(requested.Edition)
+	requested.Volume = strings.TrimSpace(requested.Volume)
+	if requested.AgentName == "" || requested.LearnerID == "" || requested.Subject == "" {
+		return usecase.GroundingSnapshot{}, fmt.Errorf("grounding: agent / learner / subject required")
+	}
+	if requested.TextbookBindingID != "" && (requested.Edition == "" || requested.Volume == "") {
+		return usecase.GroundingSnapshot{}, fmt.Errorf("grounding: typed binding requires edition and volume")
+	}
+	if revisions, ok := a.kb.(kbRevisionSnapshotter); ok {
+		revisionID, active, err := revisions.ActiveSemanticRevision(ctx)
+		if err != nil {
+			return usecase.GroundingSnapshot{}, fmt.Errorf("grounding: freeze vector revision: %w", err)
+		}
+		if active {
+			requested.VectorRevisionID = strings.TrimSpace(revisionID)
+		}
+	}
+	return requested, nil
+}
+
+// GroundSnapshot consumes only the previously frozen scope. A pinned vector
+// revision must still be current or the query fails closed.
+func (a *GroundingAdapter) GroundSnapshot(
+	ctx context.Context,
+	snapshot usecase.GroundingSnapshot,
+	knowledgePoint, grade string,
+) (string, bool, error) {
+	if strings.TrimSpace(snapshot.AgentName) == "" ||
+		strings.TrimSpace(snapshot.LearnerID) == "" ||
+		strings.TrimSpace(snapshot.Subject) == "" {
+		return "", false, fmt.Errorf("grounding: invalid frozen scope")
+	}
+	if pinned := strings.TrimSpace(snapshot.VectorRevisionID); pinned != "" {
+		revisions, ok := a.kb.(kbRevisionSnapshotter)
+		if !ok {
+			return "", false, fmt.Errorf("grounding: pinned vector revision cannot be verified")
+		}
+		current, active, err := revisions.ActiveSemanticRevision(ctx)
+		if err != nil {
+			return "", false, fmt.Errorf("grounding: verify vector revision: %w", err)
+		}
+		if !active || strings.TrimSpace(current) != pinned {
+			return "", false, fmt.Errorf("grounding: frozen vector revision changed")
+		}
+	}
+
+	var sources []string
+	if bindingID := strings.TrimSpace(snapshot.TextbookBindingID); bindingID != "" {
+		sources = []string{GroundingBindingSource(snapshot.LearnerID, snapshot.Subject, bindingID)}
+	} else {
+		// Explicit legacy compatibility. The projection does not label these
+		// hits as verified because there is no typed binding.
+		sources = []string{GroundingSubjectSource(snapshot.AgentName, snapshot.Subject)}
+	}
+	query := strings.Join(nonEmptyGroundingFacts(
+		snapshot.Edition,
+		snapshot.Volume,
+		grade,
+		knowledgePoint,
+		"教材讲法",
+	), " ")
+	return a.groundBySourcesQuery(ctx, snapshot.AgentName, query, sources)
+}
+
+func nonEmptyGroundingFacts(values ...string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
 func (a *GroundingAdapter) groundBySources(ctx context.Context, agentName, knowledgePoint, grade string, sources []string) (string, bool, error) {
+	query := strings.Join(nonEmptyGroundingFacts(grade, knowledgePoint, "教材讲法"), " ")
+	return a.groundBySourcesQuery(ctx, agentName, query, sources)
+}
+
+func (a *GroundingAdapter) groundBySourcesQuery(ctx context.Context, agentName, query string, sources []string) (string, bool, error) {
 	if a.kb == nil {
 		return "", false, nil
 	}
 	if strings.TrimSpace(agentName) == "" {
 		return "", false, fmt.Errorf("grounding: agentName 不可空")
 	}
-	query := grade + " " + knowledgePoint + " 教材讲法"
 	filter := knowledge.Filter{Sources: sources}
 	if structured, ok := a.kb.(kbHitQuerier); ok {
 		_, hits, err := structured.QueryHitsWithFilter(ctx, query, a.topK, filter)

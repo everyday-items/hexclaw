@@ -48,11 +48,11 @@ func TestSolveAdapter_Solve_NormalizesLatexToUnicode(t *testing.T) {
 	}
 }
 
-func TestSolveAdapter_GenerateSimilar_NormalizesLatex(t *testing.T) {
-	a := NewSolveAdapter(&countingExec{}, WithRetryGen(func(_ context.Context, _, _, _ string) (string, error) {
+func TestPracticeVariantAdapter_NormalizesLatex(t *testing.T) {
+	a := NewPracticeVariantAdapter(func(_ context.Context, _, _, _ string) (string, error) {
 		return `再练：$3.9 \times 3 = ?$，用 \frac{1}{2} 想一想。`, nil
-	}))
-	sr, err := a.GenerateSimilar(context.Background(), "数学", "出一道", "五年级上")
+	})
+	sr, err := a.GeneratePracticeVariant(context.Background(), "数学", "出一道", "五年级上")
 	if err != nil {
 		t.Fatal(err)
 	}

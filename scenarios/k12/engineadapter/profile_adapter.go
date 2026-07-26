@@ -44,6 +44,20 @@ func NewProfileAdapter(rw agentReadWriter, store agentPersister) *ProfileAdapter
 
 var _ usecase.ProfileStore = (*ProfileAdapter)(nil)
 
+// PublishProfile updates only the in-memory router after a profile-bundle
+// transaction has already committed agents.metadata in the shared SQLite DB.
+func (a *ProfileAdapter) PublishProfile(agentName string, p k12.ChildProfile) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cfg, ok := a.rw.GetAgent(agentName)
+	if !ok {
+		return fmt.Errorf("profile: 实例 %q 不存在", agentName)
+	}
+	updated := *cfg
+	updated.Metadata = k12.ApplyProfileToMeta(cfg.Metadata, p)
+	return a.rw.UpdateAgent(updated)
+}
+
 // GetProfile 从实例 metadata 读孩子档案。
 func (a *ProfileAdapter) GetProfile(_ context.Context, agentName string) (k12.ChildProfile, error) {
 	a.mu.Lock()

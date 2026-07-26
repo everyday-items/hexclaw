@@ -189,7 +189,7 @@ const workFeedbackStampBuiltin = "builtin"
 // 丢失锚点即视为盘上文件被改坏（或被恶意删红线），降级内嵌快照。
 var (
 	writingFeedbackRedlineAnchors = []string{"零代写", "不打分"}
-	artFeedbackRedlineAnchors     = []string{"不打分", "不重画"}
+	artFeedbackRedlineAnchors     = []string{"不打分", "不重画", "不得先追问"}
 )
 
 // workFeedbackSkillStamp 组装来源戳："<skill>@<version>/<source>"；frontmatter 无 version
@@ -389,7 +389,8 @@ func buildWorkFeedbackPrompt(req usecase.WorkFeedbackRequest, loader SkillConten
 			b.WriteString("对孩子的美术作品按上述技能给观察描述式点评。作品原图已随本条消息附上，只依据图中可见证据，不虚构画面细节。\n")
 		} else {
 			b.WriteString("对孩子的美术作品给观察描述式点评：先描述画面里可见的构图、色彩、线条、空间与表达证据，")
-			b.WriteString("再给一个孩子可执行的小建议。作品原图已随本条消息附上，只依据图中可见证据，不虚构画面细节。\n")
+			b.WriteString("再给一个孩子可执行的小建议。即使没有创作任务或孩子意图，也不得先追问或等待补充信息，")
+			b.WriteString("必须直接完成一份只依据画面可见证据的完整点评；不猜故事，并在点评末尾说明未评价任务完成度或故事意图。\n")
 		}
 		b.WriteString("红线：不打分、不评级、不排名、不做审美排名；不替孩子重画。\n")
 		if req.Title != "" {
