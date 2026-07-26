@@ -46,6 +46,58 @@ func testImageTaskDispatch() k12.ImageTaskDispatch {
 	}
 }
 
+func TestWorkFeedbackInvocationSentClaimHasSingleWinner(t *testing.T) {
+	store, _ := setup(t)
+	ctx := context.Background()
+	rec, err := k12.NewCreativeWorkRecord(
+		"mingming",
+		"session-claim",
+		k12.CreativeWorkFields{WorkType: k12.WorkTypeWriting},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.CreateCreativeWorkWithInitialGeneration(
+		ctx,
+		rec,
+		"auto:claim-test",
+		"sha256:claim-test",
+		k12.CreativeWorkSourceSnapshot{
+			WorkType:        k12.WorkTypeWriting,
+			ContentMarkdown: "桂花落在青石板上。",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invocation := k12.ImageTaskInvocation{
+		InvocationID: "invocation-feedback-claim", AgentName: "mingming",
+		WorkRecordID: rec.RecordID, Operation: k12.ImageTaskOperationWorkFeedback,
+		OperationKey:  "work:" + rec.RecordID + ":version:v1:feedback",
+		RequestDigest: "sha256:feedback-request", RouteSnapshot: testImageRoute(),
+		Status: k12.ImageTaskInvocationPrepared, Attempt: 1,
+		CreatedAt: 100, UpdatedAt: 100,
+	}
+	prepared, created, err := store.PrepareImageTaskInvocation(ctx, invocation)
+	if err != nil || !created {
+		t.Fatalf("prepare feedback invocation: created=%v err=%v", created, err)
+	}
+	if _, claimed, err := store.ClaimImageTaskInvocationSend(
+		ctx, "mingming", prepared.InvocationID, "provider-request-1", 100,
+	); err != nil || !claimed {
+		t.Fatalf("first claim must win: claimed=%v err=%v", claimed, err)
+	}
+	if _, claimed, err := store.ClaimImageTaskInvocationSend(
+		ctx, "mingming", prepared.InvocationID, "provider-request-1", 100,
+	); err != nil || claimed {
+		t.Fatalf(
+			"second work-feedback sender claim=%v err=%v; want clean CAS loss",
+			claimed,
+			err,
+		)
+	}
+}
+
 func TestImageTaskPrepareIsIdempotentAndRouteImmutable(t *testing.T) {
 	store, _ := setup(t)
 	ctx := context.Background()
@@ -200,6 +252,44 @@ func TestImageTaskArtworkRoutesToIntakeThenPromotesExactlyOnce(t *testing.T) {
 	if err != nil || intake.Status != k12.CreativeWorkIntakePromoted || intake.PromotedWorkID != workID {
 		t.Fatalf("promoted intake=%+v err=%v", intake, err)
 	}
+	t.Run("BUG-20260726-C1 automatic promotion commits work v1 and initial queued generation together", func(t *testing.T) {
+		record, err := store.Get(ctx, workID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fields, err := k12.ParseCreativeWorkFields(record.Fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(fields.Versions) != 1 || fields.Versions[0].VersionID != "v1" {
+			t.Fatalf("BUG-20260726-C1 promoted work versions=%+v, want exactly v1", fields.Versions)
+		}
+		var generationCount int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM k12_work_feedback_generations
+			WHERE work_id=?`, workID).Scan(&generationCount); err != nil {
+			t.Fatal(err)
+		}
+		if generationCount != 1 {
+			t.Fatalf("BUG-20260726-C1 promotion returned with generations=%d, want 1 queued atomically", generationCount)
+		}
+		var generationID, status, initialID, feedbackState string
+		var generationNo int
+		if err := db.QueryRow(`SELECT generation_id, generation_no, status
+			FROM k12_work_feedback_generations WHERE work_id=?`, workID).
+			Scan(&generationID, &generationNo, &status); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRow(`SELECT initial_feedback_generation_id, feedback_state
+			FROM k12_creative_works WHERE record_id=?`, workID).
+			Scan(&initialID, &feedbackState); err != nil {
+			t.Fatal(err)
+		}
+		if generationID == "" || generationNo != 1 || status != "queued" ||
+			initialID != generationID || feedbackState != "queued" {
+			t.Fatalf("BUG-20260726-C1 generation=%q no=%d status=%q initial=%q work_state=%q",
+				generationID, generationNo, status, initialID, feedbackState)
+		}
+	})
 }
 
 func TestPromoteCreativeWorkIntakeRejectsNonAssetSourceEvenWhenStorageCalledDirectly(t *testing.T) {
@@ -335,6 +425,48 @@ func TestParentSelectedArtworkWaitsForExplicitCommitAndReplaysReceipt(t *testing
 		replayed.CommitReceipt.CommandDigest != command.CommandDigest {
 		t.Fatalf("explicit commit receipt/replay drift: first=%+v replay=%+v", committed, replayed)
 	}
+	t.Run("BUG-20260726-C2 manual commit returns work v1 and initial queued generation atomically", func(t *testing.T) {
+		record, err := store.Get(ctx, committed.PromotedWorkID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fields, err := k12.ParseCreativeWorkFields(record.Fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(fields.Versions) != 1 || fields.Versions[0].VersionID != "v1" {
+			t.Fatalf("BUG-20260726-C2 committed work versions=%+v, want exactly v1", fields.Versions)
+		}
+		var works, generations int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM k12_creative_works
+			WHERE source_intake_id=?`, intake.IntakeID).Scan(&works); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRow(`SELECT COUNT(*) FROM k12_work_feedback_generations
+			WHERE work_id=?`, committed.PromotedWorkID).Scan(&generations); err != nil {
+			t.Fatal(err)
+		}
+		if works != 1 || generations != 1 {
+			t.Fatalf("BUG-20260726-C2 replay left works=%d generations=%d, want 1/1", works, generations)
+		}
+		var generationID, status, initialID, feedbackState string
+		var generationNo int
+		if err := db.QueryRow(`SELECT generation_id, generation_no, status
+			FROM k12_work_feedback_generations WHERE work_id=?`, committed.PromotedWorkID).
+			Scan(&generationID, &generationNo, &status); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRow(`SELECT initial_feedback_generation_id, feedback_state
+			FROM k12_creative_works WHERE record_id=?`, committed.PromotedWorkID).
+			Scan(&initialID, &feedbackState); err != nil {
+			t.Fatal(err)
+		}
+		if generationID == "" || generationNo != 1 || status != "queued" ||
+			initialID != generationID || feedbackState != "queued" {
+			t.Fatalf("BUG-20260726-C2 generation=%q no=%d status=%q initial=%q work_state=%q",
+				generationID, generationNo, status, initialID, feedbackState)
+		}
+	})
 }
 
 func TestParentSelectedRevisionValidatesLatestBaseAndAppendsOneVersion(t *testing.T) {

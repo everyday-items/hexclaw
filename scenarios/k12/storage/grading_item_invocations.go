@@ -16,7 +16,7 @@ var ErrGradingItemInvocationConflict = errors.New("grading item invocation immut
 
 const gradingItemInvocationColumns = `item_invocation_id,agent_name,job_id,problem_id,attempt_id,
     operation,operation_attempt,request_digest,provider,model,route_snapshot_json,status,
-    result_digest,result_json,failure_class,failure_code,created_at,updated_at`
+    cost_receipt_id,result_digest,result_json,failure_class,failure_code,created_at,updated_at`
 
 func scanGradingItemInvocation(row rowScanner) (k12.GradingItemInvocation, error) {
 	var item k12.GradingItemInvocation
@@ -24,7 +24,7 @@ func scanGradingItemInvocation(row rowScanner) (k12.GradingItemInvocation, error
 	err := row.Scan(&item.InvocationID, &item.AgentName, &item.JobID, &item.ProblemID, &item.AttemptID,
 		&operation, &item.OperationAttempt, &item.RequestDigest,
 		&item.RouteSnapshot.Provider, &item.RouteSnapshot.Model, &routeJSON, &status,
-		&item.ResultDigest, &item.ResultJSON, &item.FailureClass, &item.FailureCode,
+		&item.CostReceiptID, &item.ResultDigest, &item.ResultJSON, &item.FailureClass, &item.FailureCode,
 		&item.CreatedAt, &item.UpdatedAt)
 	if err != nil {
 		return k12.GradingItemInvocation{}, err
@@ -85,12 +85,12 @@ func (s *Store) PrepareGradingItemInvocation(ctx context.Context, item k12.Gradi
 		return k12.GradingItemInvocation{}, false, fmt.Errorf("k12storage: marshal grading item route: %w", err)
 	}
 	res, err := s.db.ExecContext(ctx, `INSERT INTO k12_grading_item_invocations (`+gradingItemInvocationColumns+`)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(job_id,problem_id,operation,operation_attempt) DO NOTHING`,
 		item.InvocationID, item.AgentName, item.JobID, item.ProblemID, item.AttemptID,
 		item.Operation, item.OperationAttempt, item.RequestDigest,
 		item.RouteSnapshot.Provider, item.RouteSnapshot.Model, string(routeJSON), item.Status,
-		"", "", "", "", item.CreatedAt, item.UpdatedAt)
+		"", "", "", "", "", item.CreatedAt, item.UpdatedAt)
 	if err != nil {
 		return k12.GradingItemInvocation{}, false, fmt.Errorf("k12storage: prepare grading item invocation: %w", err)
 	}
@@ -156,12 +156,12 @@ func (s *Store) ListGradingItemInvocations(ctx context.Context, agentName, jobID
 
 func (s *Store) transitionGradingItemInvocation(ctx context.Context, agentName, invocationID string,
 	from k12.ModelInvocationStatus, to k12.ModelInvocationStatus,
-	resultDigest, resultJSON, failureClass, failureCode string,
+	costReceiptID, resultDigest, resultJSON, failureClass, failureCode string,
 ) (k12.GradingItemInvocation, error) {
 	res, err := s.db.ExecContext(ctx, `UPDATE k12_grading_item_invocations SET
-        status=?,result_digest=?,result_json=?,failure_class=?,failure_code=?,updated_at=?
+        status=?,cost_receipt_id=?,result_digest=?,result_json=?,failure_class=?,failure_code=?,updated_at=?
         WHERE agent_name=? AND item_invocation_id=? AND status=?`,
-		to, resultDigest, resultJSON, failureClass, failureCode, nowUnix(), agentName, invocationID, from)
+		to, costReceiptID, resultDigest, resultJSON, failureClass, failureCode, nowUnix(), agentName, invocationID, from)
 	if err != nil {
 		return k12.GradingItemInvocation{}, fmt.Errorf("k12storage: transition grading item invocation to %s: %w", to, err)
 	}
@@ -174,7 +174,8 @@ func (s *Store) transitionGradingItemInvocation(ctx context.Context, agentName, 
 			return k12.GradingItemInvocation{}, fmt.Errorf("%w: item invocation %s status %s -> %s",
 				records.ErrIllegalTransition, invocationID, current.Status, to)
 		}
-		if current.ResultDigest != resultDigest || current.ResultJSON != resultJSON ||
+		if current.CostReceiptID != costReceiptID ||
+			current.ResultDigest != resultDigest || current.ResultJSON != resultJSON ||
 			current.FailureClass != failureClass || current.FailureCode != failureCode {
 			return k12.GradingItemInvocation{}, fmt.Errorf("%w: item invocation %s terminal payload changed",
 				ErrGradingItemInvocationConflict, invocationID)
@@ -186,7 +187,28 @@ func (s *Store) transitionGradingItemInvocation(ctx context.Context, agentName, 
 
 func (s *Store) MarkGradingItemInvocationSent(ctx context.Context, agentName, invocationID string) (k12.GradingItemInvocation, error) {
 	return s.transitionGradingItemInvocation(ctx, agentName, invocationID,
-		k12.ModelInvocationPrepared, k12.ModelInvocationSent, "", "", "", "")
+		k12.ModelInvocationPrepared, k12.ModelInvocationSent, "", "", "", "", "")
+}
+
+// ClaimGradingItemInvocationSent is the cross-worker prepared -> sent CAS. A
+// false claim means another worker owns (or already completed) the provider
+// request; callers must not POST.
+func (s *Store) ClaimGradingItemInvocationSent(
+	ctx context.Context,
+	agentName, invocationID string,
+) (k12.GradingItemInvocation, bool, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE k12_grading_item_invocations SET
+        status=?,updated_at=? WHERE agent_name=? AND item_invocation_id=? AND status=?`,
+		k12.ModelInvocationSent, nowUnix(), agentName, invocationID, k12.ModelInvocationPrepared)
+	if err != nil {
+		return k12.GradingItemInvocation{}, false, fmt.Errorf("k12storage: claim grading item invocation sent: %w", err)
+	}
+	claimed, _ := res.RowsAffected()
+	current, err := s.GetGradingItemInvocation(ctx, agentName, invocationID)
+	if err != nil {
+		return k12.GradingItemInvocation{}, false, err
+	}
+	return current, claimed == 1, nil
 }
 
 func (s *Store) MarkGradingItemInvocationSucceeded(ctx context.Context, agentName, invocationID, resultDigest, resultJSON string) (k12.GradingItemInvocation, error) {
@@ -196,7 +218,8 @@ func (s *Store) MarkGradingItemInvocationSucceeded(ctx context.Context, agentNam
 		return k12.GradingItemInvocation{}, fmt.Errorf("k12storage: successful grading item invocation requires digest and valid result JSON")
 	}
 	return s.transitionGradingItemInvocation(ctx, agentName, invocationID,
-		k12.ModelInvocationSent, k12.ModelInvocationSucceeded, resultDigest, resultJSON, "", "")
+		k12.ModelInvocationSent, k12.ModelInvocationSucceeded,
+		"cost-"+invocationID, resultDigest, resultJSON, "", "")
 }
 
 func (s *Store) MarkGradingItemInvocationFailed(ctx context.Context, agentName, invocationID, failureClass, failureCode string) (k12.GradingItemInvocation, error) {
@@ -205,7 +228,7 @@ func (s *Store) MarkGradingItemInvocationFailed(ctx context.Context, agentName, 
 		return k12.GradingItemInvocation{}, fmt.Errorf("k12storage: failed grading item invocation requires failure class and code")
 	}
 	return s.transitionGradingItemInvocation(ctx, agentName, invocationID,
-		k12.ModelInvocationSent, k12.ModelInvocationFailed, "", "", failureClass, failureCode)
+		k12.ModelInvocationSent, k12.ModelInvocationFailed, "", "", "", failureClass, failureCode)
 }
 
 func (s *Store) MarkGradingItemInvocationOutcomeUnknown(ctx context.Context, agentName, invocationID, failureClass, failureCode string) (k12.GradingItemInvocation, error) {
@@ -214,5 +237,5 @@ func (s *Store) MarkGradingItemInvocationOutcomeUnknown(ctx context.Context, age
 		return k12.GradingItemInvocation{}, fmt.Errorf("k12storage: outcome_unknown grading item invocation requires failure class and code")
 	}
 	return s.transitionGradingItemInvocation(ctx, agentName, invocationID,
-		k12.ModelInvocationSent, k12.ModelInvocationOutcomeUnknown, "", "", failureClass, failureCode)
+		k12.ModelInvocationSent, k12.ModelInvocationOutcomeUnknown, "", "", "", failureClass, failureCode)
 }

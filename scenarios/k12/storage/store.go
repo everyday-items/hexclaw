@@ -278,6 +278,14 @@ func deleteChildren(ctx context.Context, ex dbExecer, mp rowMapper, recordID, ag
             (SELECT record_id FROM k12_practice_sets WHERE record_id = ?`+scope+`)`, args...)
 		return err
 	case creativeWorkMapper:
+		if _, err := ex.ExecContext(ctx, `DELETE FROM k12_image_task_invocations WHERE work_record_id IN
+            (SELECT record_id FROM k12_creative_works WHERE record_id = ?`+scope+`)`, args...); err != nil {
+			return err
+		}
+		if _, err := ex.ExecContext(ctx, `DELETE FROM k12_work_feedback_generations WHERE work_id IN
+            (SELECT record_id FROM k12_creative_works WHERE record_id = ?`+scope+`)`, args...); err != nil {
+			return err
+		}
 		if _, err := ex.ExecContext(ctx, `DELETE FROM k12_creative_work_versions WHERE work_record_id IN
             (SELECT record_id FROM k12_creative_works WHERE record_id = ?`+scope+`)`, args...); err != nil {
 			return err
@@ -760,6 +768,14 @@ func (s *Store) replaceAgentRecordsVia(ctx context.Context, ex dbHandle, agentNa
 				return fmt.Errorf("records: 清理实例旧记录: %w", err)
 			}
 		case creativeWorkMapper:
+			if _, err := ex.ExecContext(ctx, `DELETE FROM k12_image_task_invocations WHERE work_record_id IN
+                (SELECT record_id FROM k12_creative_works WHERE agent_name = ?)`, agentName); err != nil {
+				return fmt.Errorf("records: 清理实例旧作品调用账本: %w", err)
+			}
+			if _, err := ex.ExecContext(ctx, `DELETE FROM k12_work_feedback_generations WHERE work_id IN
+                (SELECT record_id FROM k12_creative_works WHERE agent_name = ?)`, agentName); err != nil {
+				return fmt.Errorf("records: 清理实例旧作品点评代次: %w", err)
+			}
 			if _, err := ex.ExecContext(ctx, `DELETE FROM k12_creative_work_versions WHERE work_record_id IN
                 (SELECT record_id FROM k12_creative_works WHERE agent_name = ?)`, agentName); err != nil {
 				return fmt.Errorf("records: 清理实例旧记录: %w", err)

@@ -24,6 +24,8 @@ var (
 	ErrImageTaskInvalidState    = errors.New("image task invalid state")
 )
 
+const imageTaskAutomaticBudgetSeconds = 300
+
 type ImageTaskRoutingDecision struct {
 	Intent                   k12.ImageTaskIntent
 	Evidence                 []string
@@ -133,6 +135,7 @@ func (s *Store) PrepareImageTaskDispatch(
 	if dispatch.UpdatedAt == 0 {
 		dispatch.UpdatedAt = dispatch.CreatedAt
 	}
+	normalizeImageTaskAutomaticWindow(&dispatch)
 	if invocation.CreatedAt == 0 {
 		invocation.CreatedAt = dispatch.CreatedAt
 	}
@@ -142,6 +145,7 @@ func (s *Store) PrepareImageTaskDispatch(
 	if invocation.Status == "" {
 		invocation.Status = k12.ImageTaskInvocationPrepared
 	}
+	invocation.DeadlineAt = dispatch.AutomaticDeadlineAt
 	if dispatch.RoutingProvenance == "" {
 		dispatch.RoutingProvenance = k12.ImageTaskRoutingModelClassified
 	}
@@ -157,8 +161,9 @@ func (s *Store) PrepareImageTaskDispatch(
          intent_confidence,confirmation_candidates_json,status,target_object_type,target_object_id,
          classification_route_snapshot_json,classification_invocation_id,route_policy_snapshot_json,
          idempotency_key,request_digest,attempt_generation,retry_safe,failure_kind,version,created_at,updated_at,
-         routing_provenance,creative_entry_json,operation_route_request_json)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         routing_provenance,creative_entry_json,operation_route_request_json,
+         automatic_budget_seconds,automatic_started_at,automatic_deadline_at,automatic_remaining_seconds)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(agent_name,idempotency_key) DO NOTHING`,
 		dispatch.DispatchID, dispatch.AgentName, dispatch.LearnerID, dispatch.SourceKind,
 		dispatch.SourceRef, dispatch.SourceSessionID, sourceAssetsJSON, dispatch.SourceDigest,
@@ -167,7 +172,9 @@ func (s *Store) PrepareImageTaskDispatch(
 		classificationRouteJSON, dispatch.ClassificationInvocationID, routePolicyJSON,
 		dispatch.IdempotencyKey, dispatch.RequestDigest, dispatch.AttemptGeneration,
 		boolInt(dispatch.RetrySafe), dispatch.FailureKind, dispatch.Version,
-		dispatch.CreatedAt, dispatch.UpdatedAt, dispatch.RoutingProvenance, "", "")
+		dispatch.CreatedAt, dispatch.UpdatedAt, dispatch.RoutingProvenance, "", "",
+		dispatch.AutomaticBudgetSeconds, dispatch.AutomaticStartedAt,
+		dispatch.AutomaticDeadlineAt, dispatch.AutomaticRemainingSeconds)
 	if err != nil {
 		return k12.ImageTaskDispatch{}, false, fmt.Errorf("prepare image task dispatch: %w", err)
 	}
@@ -202,14 +209,15 @@ func (s *Store) PrepareImageTaskDispatch(
 	if _, err := tx.ExecContext(ctx, `INSERT INTO k12_image_task_invocations
         (invocation_id,agent_name,dispatch_id,intake_id,work_record_id,operation,operation_key,
          request_digest,route_snapshot_json,status,attempt,provider_request_key,result_digest,
-         result_json,error_kind,retry_safe,started_at,finished_at,created_at,updated_at)
-        VALUES(?,?,?,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         result_json,error_kind,retry_safe,started_at,finished_at,created_at,updated_at,deadline_at)
+        VALUES(?,?,?,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		invocation.InvocationID, invocation.AgentName, invocation.DispatchID,
 		invocation.Operation, invocation.OperationKey, invocation.RequestDigest,
 		invocationRouteJSON, invocation.Status, invocation.Attempt,
 		invocation.ProviderRequestKey, invocation.ResultDigest, invocation.ResultJSON,
 		invocation.ErrorKind, boolInt(invocation.RetrySafe), invocation.StartedAt,
-		invocation.FinishedAt, invocation.CreatedAt, invocation.UpdatedAt); err != nil {
+		invocation.FinishedAt, invocation.CreatedAt, invocation.UpdatedAt,
+		invocation.DeadlineAt); err != nil {
 		return k12.ImageTaskDispatch{}, false, fmt.Errorf("prepare classification invocation: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -267,6 +275,7 @@ func (s *Store) PrepareParentSelectedCreativeDispatch(
 	if dispatch.UpdatedAt == 0 {
 		dispatch.UpdatedAt = dispatch.CreatedAt
 	}
+	normalizeImageTaskAutomaticWindow(&dispatch)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -279,8 +288,9 @@ func (s *Store) PrepareParentSelectedCreativeDispatch(
          intent_confidence,confirmation_candidates_json,status,target_object_type,target_object_id,
          classification_route_snapshot_json,classification_invocation_id,route_policy_snapshot_json,
          idempotency_key,request_digest,attempt_generation,retry_safe,failure_kind,version,created_at,updated_at,
-         routing_provenance,creative_entry_json,operation_route_request_json)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         routing_provenance,creative_entry_json,operation_route_request_json,
+         automatic_budget_seconds,automatic_started_at,automatic_deadline_at,automatic_remaining_seconds)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(agent_name,idempotency_key) DO NOTHING`,
 		dispatch.DispatchID, dispatch.AgentName, dispatch.LearnerID, dispatch.SourceKind,
 		dispatch.SourceRef, dispatch.SourceSessionID, sourceAssetsJSON, dispatch.SourceDigest,
@@ -289,7 +299,9 @@ func (s *Store) PrepareParentSelectedCreativeDispatch(
 		"", "", routePolicyJSON, dispatch.IdempotencyKey, dispatch.RequestDigest,
 		dispatch.AttemptGeneration, boolInt(dispatch.RetrySafe), dispatch.FailureKind,
 		dispatch.Version, dispatch.CreatedAt, dispatch.UpdatedAt,
-		dispatch.RoutingProvenance, creativeEntryJSON, operationRouteRequestJSON)
+		dispatch.RoutingProvenance, creativeEntryJSON, operationRouteRequestJSON,
+		dispatch.AutomaticBudgetSeconds, dispatch.AutomaticStartedAt,
+		dispatch.AutomaticDeadlineAt, dispatch.AutomaticRemainingSeconds)
 	if err != nil {
 		return k12.ImageTaskDispatch{}, nil, false,
 			fmt.Errorf("prepare parent-selected image task dispatch: %w", err)
@@ -378,7 +390,9 @@ func scanImageTaskDispatch(row imageTaskRowScanner) (k12.ImageTaskDispatch, erro
 		&classificationRouteJSON, &d.ClassificationInvocationID, &routePolicyJSON,
 		&d.IdempotencyKey, &d.RequestDigest, &d.AttemptGeneration, &retrySafe,
 		&d.FailureKind, &d.Version, &d.CreatedAt, &d.UpdatedAt,
-		&d.RoutingProvenance, &creativeEntryJSON, &operationRouteRequestJSON)
+		&d.RoutingProvenance, &creativeEntryJSON, &operationRouteRequestJSON,
+		&d.AutomaticBudgetSeconds, &d.AutomaticStartedAt,
+		&d.AutomaticDeadlineAt, &d.AutomaticRemainingSeconds)
 	if err != nil {
 		return k12.ImageTaskDispatch{}, err
 	}
@@ -424,7 +438,9 @@ const imageTaskDispatchSelect = `SELECT dispatch_id,agent_name,learner_id,source
     target_object_type,target_object_id,classification_route_snapshot_json,
     classification_invocation_id,route_policy_snapshot_json,idempotency_key,request_digest,
     attempt_generation,retry_safe,failure_kind,version,created_at,updated_at,
-    routing_provenance,creative_entry_json,operation_route_request_json
+    routing_provenance,creative_entry_json,operation_route_request_json,
+    automatic_budget_seconds,automatic_started_at,automatic_deadline_at,
+    automatic_remaining_seconds
     FROM k12_image_task_dispatches`
 
 func getImageTaskDispatch(
@@ -530,13 +546,13 @@ func getImageTaskInvocation(
 	err := q.QueryRowContext(ctx, `SELECT invocation_id,agent_name,dispatch_id,intake_id,
         work_record_id,operation,operation_key,request_digest,route_snapshot_json,status,
         attempt,provider_request_key,result_digest,result_json,error_kind,retry_safe,
-        started_at,finished_at,created_at,updated_at
+        started_at,finished_at,created_at,updated_at,deadline_at
         FROM k12_image_task_invocations WHERE agent_name=? AND invocation_id=?`,
 		agentName, invocationID).Scan(&inv.InvocationID, &inv.AgentName, &dispatchID, &intakeID,
 		&workID, &inv.Operation, &inv.OperationKey, &inv.RequestDigest, &routeJSON,
 		&inv.Status, &inv.Attempt, &inv.ProviderRequestKey, &inv.ResultDigest,
 		&inv.ResultJSON, &inv.ErrorKind, &retrySafe, &inv.StartedAt,
-		&inv.FinishedAt, &inv.CreatedAt, &inv.UpdatedAt)
+		&inv.FinishedAt, &inv.CreatedAt, &inv.UpdatedAt, &inv.DeadlineAt)
 	if err == sql.ErrNoRows {
 		return inv, ErrImageTaskNotFound
 	}
@@ -660,6 +676,8 @@ func (s *Store) CommitImageTaskRouting(
 	var target ImageTaskRouteTarget
 	if len(decision.ConfirmationCandidates) >= 2 || decision.Intent == k12.ImageTaskIntentUnknown {
 		dispatch.Status = k12.ImageTaskStatusAwaitingConfirmation
+		dispatch.AutomaticRemainingSeconds = remainingImageTaskAutomaticSeconds(dispatch, now)
+		dispatch.AutomaticDeadlineAt = 0
 	} else {
 		dispatch.Status = k12.ImageTaskStatusRouted
 		target, err = createImageTaskRouteTarget(
@@ -673,10 +691,12 @@ func (s *Store) CommitImageTaskRouting(
 	res, err := tx.ExecContext(ctx, `UPDATE k12_image_task_dispatches
         SET task_intent=?,intent_evidence_json=?,intent_confidence=?,
             confirmation_candidates_json=?,status=?,target_object_type=?,target_object_id=?,
-            retry_safe=0,failure_kind='',version=version+1,updated_at=?
+            retry_safe=0,failure_kind='',version=version+1,updated_at=?,
+            automatic_deadline_at=?,automatic_remaining_seconds=?
         WHERE agent_name=? AND dispatch_id=? AND version=?`,
 		dispatch.TaskIntent, evidenceJSON, dispatch.IntentConfidence, candidatesJSON,
 		dispatch.Status, dispatch.TargetObjectType, dispatch.TargetObjectID, now,
+		dispatch.AutomaticDeadlineAt, dispatch.AutomaticRemainingSeconds,
 		agentName, dispatchID, expectedVersion)
 	if err != nil {
 		return dispatch, target, fmt.Errorf("commit image task route: %w", err)
@@ -845,6 +865,7 @@ func (s *Store) ConfirmImageTaskIntent(
 	now := nowUnix()
 	dispatch.TaskIntent = intent
 	dispatch.Status = k12.ImageTaskStatusRouted
+	dispatch.AutomaticDeadlineAt = now + int64(dispatch.AutomaticRemainingSeconds)
 	target, err := createImageTaskRouteTarget(
 		ctx, tx, &dispatch, intent,
 		classified.WorkTitleCandidate, classified.TaskRequirementCandidate, now,
@@ -854,9 +875,11 @@ func (s *Store) ConfirmImageTaskIntent(
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE k12_image_task_dispatches
         SET task_intent=?,status='routed',target_object_type=?,target_object_id=?,
-            retry_safe=0,failure_kind='',version=version+1,updated_at=?
+            retry_safe=0,failure_kind='',version=version+1,updated_at=?,
+            automatic_deadline_at=?
         WHERE agent_name=? AND dispatch_id=? AND status='awaiting_confirmation' AND version=?`,
 		intent, dispatch.TargetObjectType, dispatch.TargetObjectID, now,
+		dispatch.AutomaticDeadlineAt,
 		agentName, dispatchID, expectedVersion)
 	if err != nil {
 		return dispatch, target, err
@@ -1095,6 +1118,41 @@ func (s *Store) GetCreativeWorkIntake(
 	return getCreativeWorkIntake(ctx, s.db, agentName, intakeID)
 }
 
+func insertInitialCreativeFeedbackGeneration(
+	ctx context.Context,
+	tx *sql.Tx,
+	agentName, workID, requestDigest string,
+	now int64,
+) error {
+	source, err := legacyCreativeWorkSourceSnapshot(ctx, tx, agentName, workID)
+	if err != nil {
+		return err
+	}
+	sourceJSON, err := json.Marshal(source)
+	if err != nil {
+		return err
+	}
+	generation := k12.WorkFeedbackGeneration{
+		GenerationID: idgen.NanoID(), WorkID: workID, AgentName: agentName,
+		GenerationNo: 1, CommandKey: "auto:" + workID,
+		RequestDigest: requestDigest, Status: k12.WorkFeedbackQueued,
+		FeedbackType: source.WorkType, Source: source,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := insertWorkFeedbackGeneration(ctx, tx, generation, string(sourceJSON)); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE k12_creative_works
+		SET initial_feedback_generation_id=?, feedback_state='queued',
+		    row_version=row_version+1
+		WHERE record_id=? AND agent_name=? AND deleted_at IS NULL`,
+		generation.GenerationID, workID, agentName,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
 // PromoteCreativeWorkIntake creates the formal work and v1 and advances the
 // intake in one short transaction. A replay after commit returns the same work.
 func (s *Store) PromoteCreativeWorkIntake(
@@ -1208,6 +1266,11 @@ func (s *Store) PromoteCreativeWorkIntake(
 		return "", false, fmt.Errorf("create promoted CreativeWork: %w", err)
 	}
 	if err := mapper.syncChildren(ctx, tx, rec.RecordID, rec.Fields); err != nil {
+		return "", false, err
+	}
+	if err := insertInitialCreativeFeedbackGeneration(
+		ctx, tx, agentName, rec.RecordID, intake.RequestDigest, now,
+	); err != nil {
 		return "", false, err
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE k12_creative_work_intakes
@@ -1380,6 +1443,11 @@ func (s *Store) CommitManualCreativeWorkIntake(
 		if err := mapper.syncChildren(ctx, tx, rec.RecordID, rec.Fields); err != nil {
 			return intake, err
 		}
+		if err := insertInitialCreativeFeedbackGeneration(
+			ctx, tx, agentName, rec.RecordID, command.CommandDigest, now,
+		); err != nil {
+			return intake, err
+		}
 		workID = rec.RecordID
 	case k12.CreativeWorkEntryRevision:
 		rec, getErr := s.getVia(ctx, tx, intake.TargetWorkID)
@@ -1484,6 +1552,13 @@ func (s *Store) PrepareImageTaskInvocation(
 	if invocation.UpdatedAt == 0 {
 		invocation.UpdatedAt = invocation.CreatedAt
 	}
+	if deadline, found, err := s.resolveImageTaskInvocationDeadline(
+		ctx, invocation,
+	); err != nil {
+		return invocation, false, err
+	} else if found {
+		invocation.DeadlineAt = deadline
+	}
 	var dispatchID, intakeID, workID any
 	if invocation.DispatchID != "" {
 		dispatchID = invocation.DispatchID
@@ -1497,15 +1572,15 @@ func (s *Store) PrepareImageTaskInvocation(
 	res, err := s.db.ExecContext(ctx, `INSERT INTO k12_image_task_invocations
         (invocation_id,agent_name,dispatch_id,intake_id,work_record_id,operation,operation_key,
          request_digest,route_snapshot_json,status,attempt,provider_request_key,result_digest,
-         result_json,error_kind,retry_safe,started_at,finished_at,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         result_json,error_kind,retry_safe,started_at,finished_at,created_at,updated_at,deadline_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(agent_name,operation_key,attempt) DO NOTHING`,
 		invocation.InvocationID, invocation.AgentName, dispatchID, intakeID, workID,
 		invocation.Operation, invocation.OperationKey, invocation.RequestDigest, routeJSON,
 		k12.ImageTaskInvocationPrepared, invocation.Attempt, invocation.ProviderRequestKey,
 		invocation.ResultDigest, invocation.ResultJSON, invocation.ErrorKind,
 		boolInt(invocation.RetrySafe), invocation.StartedAt, invocation.FinishedAt,
-		invocation.CreatedAt, invocation.UpdatedAt)
+		invocation.CreatedAt, invocation.UpdatedAt, invocation.DeadlineAt)
 	if err != nil {
 		return invocation, false, err
 	}
@@ -1531,26 +1606,32 @@ func (s *Store) PrepareImageTaskInvocation(
 	return existing, false, nil
 }
 
-func (s *Store) MarkImageTaskInvocationSent(
+// ClaimImageTaskInvocationSend is the only prepared -> sent ownership gate.
+// A losing caller receives the current immutable ledger row with claimed=false
+// and must not call the provider. Caller time is authoritative so tests and
+// coordinators share one clock; an invocation at its deadline cannot escape.
+func (s *Store) ClaimImageTaskInvocationSend(
 	ctx context.Context,
 	agentName, invocationID, providerKey string,
-) (k12.ImageTaskInvocation, error) {
-	now := nowUnix()
+	now int64,
+) (k12.ImageTaskInvocation, bool, error) {
 	res, err := s.db.ExecContext(ctx, `UPDATE k12_image_task_invocations
         SET status='sent',provider_request_key=?,started_at=?,updated_at=?
-        WHERE agent_name=? AND invocation_id=? AND status='prepared'`,
-		providerKey, now, now, agentName, invocationID)
+        WHERE agent_name=? AND invocation_id=? AND status='prepared'
+          AND (deadline_at=0 OR deadline_at>?)`,
+		providerKey, now, now, agentName, invocationID, now)
 	if err != nil {
-		return k12.ImageTaskInvocation{}, err
+		return k12.ImageTaskInvocation{}, false, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		inv, getErr := getImageTaskInvocation(ctx, s.db, agentName, invocationID)
-		if getErr != nil || inv.Status != k12.ImageTaskInvocationSent {
-			return inv, ErrImageTaskInvalidState
+		if getErr != nil {
+			return inv, false, getErr
 		}
-		return inv, nil
+		return inv, false, nil
 	}
-	return getImageTaskInvocation(ctx, s.db, agentName, invocationID)
+	inv, err := getImageTaskInvocation(ctx, s.db, agentName, invocationID)
+	return inv, true, err
 }
 
 func (s *Store) GetLatestWorkFeedbackInvocation(
@@ -1713,6 +1794,19 @@ func (s *Store) PrepareImageTaskRetry(
 	var prior k12.ImageTaskInvocation
 	var intake *k12.CreativeWorkIntake
 	switch {
+	case dispatch.Status == k12.ImageTaskStatusFailed &&
+		dispatch.TargetObjectType == k12.ImageTaskTargetCreativeWorkIntake:
+		value, getErr := getCreativeWorkIntake(ctx, tx, agentName, dispatch.TargetObjectID)
+		if getErr != nil {
+			return dispatch, prior, getErr
+		}
+		if value.Status != k12.CreativeWorkIntakeFailed || !value.RetrySafe {
+			return dispatch, prior, ErrImageTaskInvalidState
+		}
+		intake = &value
+		prior, err = getLatestImageTaskInvocation(
+			ctx, tx, agentName, k12.ImageTaskOperationWritingOCR, "", intake.IntakeID,
+		)
 	case dispatch.Status == k12.ImageTaskStatusFailed:
 		if !dispatch.RetrySafe {
 			return dispatch, prior, ErrImageTaskInvalidState
@@ -1743,13 +1837,14 @@ func (s *Store) PrepareImageTaskRetry(
 		return dispatch, prior, ErrImageTaskInvalidState
 	}
 	now := nowUnix()
+	freshDeadline := now + imageTaskAutomaticBudgetSeconds
 	next := k12.ImageTaskInvocation{
 		InvocationID: strings.TrimSpace(newInvocationID), AgentName: agentName,
 		DispatchID: prior.DispatchID, IntakeID: prior.IntakeID, WorkRecordID: prior.WorkRecordID,
 		Operation: prior.Operation, OperationKey: prior.OperationKey,
 		RequestDigest: prior.RequestDigest, RouteSnapshot: prior.RouteSnapshot,
 		Status: k12.ImageTaskInvocationPrepared, Attempt: prior.Attempt + 1,
-		CreatedAt: now, UpdatedAt: now,
+		CreatedAt: now, UpdatedAt: now, DeadlineAt: freshDeadline,
 	}
 	if err := validateImageTaskInvocation(next); err != nil {
 		return dispatch, next, err
@@ -1768,19 +1863,22 @@ func (s *Store) PrepareImageTaskRetry(
 	_, err = tx.ExecContext(ctx, `INSERT INTO k12_image_task_invocations
         (invocation_id,agent_name,dispatch_id,intake_id,work_record_id,operation,operation_key,
          request_digest,route_snapshot_json,status,attempt,provider_request_key,result_digest,
-         result_json,error_kind,retry_safe,started_at,finished_at,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?,'prepared',?,'','','','',0,0,0,?,?)`,
+         result_json,error_kind,retry_safe,started_at,finished_at,created_at,updated_at,deadline_at)
+        VALUES(?,?,?,?,?,?,?,?,?,'prepared',?,'','','','',0,0,0,?,?,?)`,
 		next.InvocationID, next.AgentName, dispatchRef, intakeRef, workRef,
 		next.Operation, next.OperationKey, next.RequestDigest, routeJSON, next.Attempt,
-		next.CreatedAt, next.UpdatedAt)
+		next.CreatedAt, next.UpdatedAt, next.DeadlineAt)
 	if err != nil {
 		return dispatch, next, err
 	}
 	if intake == nil {
 		_, err = tx.ExecContext(ctx, `UPDATE k12_image_task_dispatches
-            SET status='routing',failure_kind='',retry_safe=0,version=version+1,updated_at=?
+            SET status='routing',failure_kind='',retry_safe=0,version=version+1,updated_at=?,
+                automatic_budget_seconds=?,automatic_started_at=?,
+                automatic_deadline_at=?,automatic_remaining_seconds=?
             WHERE agent_name=? AND dispatch_id=? AND version=? AND status='failed'`,
-			now, agentName, dispatchID, expectedVersion)
+			now, imageTaskAutomaticBudgetSeconds, now, freshDeadline,
+			imageTaskAutomaticBudgetSeconds, agentName, dispatchID, expectedVersion)
 		dispatch.Status = k12.ImageTaskStatusRouting
 	} else {
 		_, err = tx.ExecContext(ctx, `UPDATE k12_creative_work_intakes
@@ -1789,9 +1887,13 @@ func (s *Store) PrepareImageTaskRetry(
 			now, agentName, intake.IntakeID)
 		if err == nil {
 			_, err = tx.ExecContext(ctx, `UPDATE k12_image_task_dispatches
-                SET version=version+1,updated_at=?
+                SET status='routed',failure_kind='',retry_safe=0,
+                    version=version+1,updated_at=?,
+                    automatic_budget_seconds=?,automatic_started_at=?,
+                    automatic_deadline_at=?,automatic_remaining_seconds=?
                 WHERE agent_name=? AND dispatch_id=? AND version=?`,
-				now, agentName, dispatchID, expectedVersion)
+				now, imageTaskAutomaticBudgetSeconds, now, freshDeadline,
+				imageTaskAutomaticBudgetSeconds, agentName, dispatchID, expectedVersion)
 		}
 	}
 	if err != nil {
@@ -1968,10 +2070,337 @@ func (s *Store) HoldCreativeWorkIntakeOCRConfirmation(
 	if n, _ := res.RowsAffected(); n != 1 {
 		return intake, ErrImageTaskVersionConflict
 	}
+	if _, err := pauseImageTaskAutomaticWindow(
+		ctx, tx, agentName, intake.DispatchID, now,
+	); err != nil {
+		return intake, err
+	}
 	if err := tx.Commit(); err != nil {
 		return intake, err
 	}
 	return getCreativeWorkIntake(ctx, s.db, agentName, intakeID)
+}
+
+// ExpireImageTaskInvocation closes one elapsed automatic window exactly once.
+// The invocation transition is won first, so a concurrent terminal success
+// can never be overwritten by the aggregate failure projection.
+func (s *Store) ExpireImageTaskInvocation(
+	ctx context.Context,
+	agentName, dispatchID, invocationID string,
+	now int64,
+) (k12.ImageTaskDispatch, k12.ImageTaskInvocation, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return k12.ImageTaskDispatch{}, k12.ImageTaskInvocation{}, false, err
+	}
+	defer tx.Rollback()
+	dispatch, err := getImageTaskDispatch(ctx, tx, agentName, dispatchID, "")
+	if err != nil {
+		return dispatch, k12.ImageTaskInvocation{}, false, err
+	}
+	if dispatch.AutomaticDeadlineAt == 0 || dispatch.AutomaticDeadlineAt > now {
+		var invocation k12.ImageTaskInvocation
+		if strings.TrimSpace(invocationID) != "" {
+			invocation, err = getImageTaskInvocation(ctx, tx, agentName, invocationID)
+			if err != nil {
+				return dispatch, invocation, false, err
+			}
+		}
+		return dispatch, invocation, false, tx.Commit()
+	}
+	if strings.TrimSpace(invocationID) == "" {
+		var active int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)
+            FROM k12_image_task_invocations i
+            WHERE i.agent_name=? AND i.status IN ('prepared','sent') AND (
+                i.dispatch_id=? OR
+                i.intake_id=(SELECT target_object_id FROM k12_image_task_dispatches
+                    WHERE agent_name=? AND dispatch_id=?) OR
+                i.work_record_id IN (SELECT promoted_work_id
+                    FROM k12_creative_work_intakes
+                    WHERE agent_name=? AND dispatch_id=? AND promoted_work_id!='')
+            )`,
+			agentName, dispatchID, agentName, dispatchID, agentName, dispatchID).
+			Scan(&active); err != nil {
+			return dispatch, k12.ImageTaskInvocation{}, false, err
+		}
+		if active != 0 ||
+			(dispatch.Status != k12.ImageTaskStatusRouting &&
+				dispatch.Status != k12.ImageTaskStatusRouted) {
+			return dispatch, k12.ImageTaskInvocation{}, false, tx.Commit()
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE k12_image_task_dispatches
+            SET status='failed',failure_kind='interactive_deadline_exceeded',
+                retry_safe=1,automatic_deadline_at=0,
+                automatic_remaining_seconds=0,version=version+1,updated_at=?
+            WHERE agent_name=? AND dispatch_id=? AND version=?
+              AND status IN ('routing','routed')
+              AND automatic_deadline_at>0 AND automatic_deadline_at<=?`,
+			now, agentName, dispatchID, dispatch.Version, now)
+		if err != nil {
+			return dispatch, k12.ImageTaskInvocation{}, false, err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			current, getErr := getImageTaskDispatch(ctx, tx, agentName, dispatchID, "")
+			if getErr != nil {
+				return dispatch, k12.ImageTaskInvocation{}, false, getErr
+			}
+			return current, k12.ImageTaskInvocation{}, false, tx.Commit()
+		}
+		if err := tx.Commit(); err != nil {
+			return dispatch, k12.ImageTaskInvocation{}, false, err
+		}
+		current, err := s.GetImageTaskDispatch(ctx, agentName, dispatchID)
+		return current, k12.ImageTaskInvocation{}, true, err
+	}
+
+	invocation, err := getImageTaskInvocation(ctx, tx, agentName, invocationID)
+	if err != nil {
+		return dispatch, invocation, false, err
+	}
+	owned, err := imageTaskInvocationBelongsToDispatch(
+		ctx, tx, agentName, dispatchID, invocation,
+	)
+	if err != nil {
+		return dispatch, invocation, false, err
+	}
+	if !owned {
+		return dispatch, invocation, false, ErrImageTaskConflict
+	}
+	if invocation.Status != k12.ImageTaskInvocationPrepared &&
+		invocation.Status != k12.ImageTaskInvocationSent {
+		return dispatch, invocation, false, tx.Commit()
+	}
+	if invocation.DeadlineAt > now {
+		return dispatch, invocation, false, tx.Commit()
+	}
+	failureKind := "interactive_deadline_exceeded"
+	nextStatus := k12.ImageTaskInvocationFailed
+	retrySafe := true
+	if invocation.Status == k12.ImageTaskInvocationSent {
+		failureKind = "interactive_deadline_outcome_unknown"
+		nextStatus = k12.ImageTaskInvocationOutcomeUnknown
+		retrySafe = false
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE k12_image_task_invocations
+        SET status=?,error_kind=?,retry_safe=?,finished_at=?,updated_at=?
+        WHERE agent_name=? AND invocation_id=? AND status=?
+          AND (deadline_at=0 OR deadline_at<=?)`,
+		nextStatus, failureKind, boolInt(retrySafe), now, now,
+		agentName, invocationID, invocation.Status, now)
+	if err != nil {
+		return dispatch, invocation, false, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		current, getErr := getImageTaskInvocation(ctx, tx, agentName, invocationID)
+		if getErr != nil {
+			return dispatch, invocation, false, getErr
+		}
+		return dispatch, current, false, tx.Commit()
+	}
+	if invocation.Operation == k12.ImageTaskOperationWritingOCR {
+		if _, err := tx.ExecContext(ctx, `UPDATE k12_creative_work_intakes
+            SET status='failed',failure_kind=?,retry_safe=?,
+                version=version+1,updated_at=?
+            WHERE agent_name=? AND intake_id=? AND status='preparing'`,
+			failureKind, boolInt(retrySafe), now,
+			agentName, invocation.IntakeID); err != nil {
+			return dispatch, invocation, false, err
+		}
+	}
+	res, err = tx.ExecContext(ctx, `UPDATE k12_image_task_dispatches
+        SET status='failed',failure_kind=?,retry_safe=?,
+            automatic_deadline_at=0,automatic_remaining_seconds=0,
+            version=version+1,updated_at=?
+        WHERE agent_name=? AND dispatch_id=? AND version=?
+          AND status IN ('routing','routed')`,
+		failureKind, boolInt(retrySafe), now,
+		agentName, dispatchID, dispatch.Version)
+	if err != nil {
+		return dispatch, invocation, false, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return dispatch, invocation, false, ErrImageTaskVersionConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return dispatch, invocation, false, err
+	}
+	currentDispatch, err := s.GetImageTaskDispatch(ctx, agentName, dispatchID)
+	if err != nil {
+		return currentDispatch, invocation, false, err
+	}
+	currentInvocation, err := s.GetImageTaskInvocation(ctx, agentName, invocationID)
+	return currentDispatch, currentInvocation, true, err
+}
+
+// RestartImageTaskAutomaticWindow is an explicit user retry fence for
+// downstream work-feedback failures where no new classification/OCR
+// invocation is prepared.
+func (s *Store) RestartImageTaskAutomaticWindow(
+	ctx context.Context,
+	agentName, dispatchID string,
+	expectedVersion int,
+	now int64,
+) (k12.ImageTaskDispatch, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE k12_image_task_dispatches
+        SET status='routed',failure_kind='',retry_safe=0,
+            automatic_budget_seconds=?,automatic_started_at=?,
+            automatic_deadline_at=?,automatic_remaining_seconds=?,
+            version=version+1,updated_at=?
+        WHERE agent_name=? AND dispatch_id=? AND version=?
+          AND target_object_id!=''
+          AND (
+            (status='failed' AND retry_safe=1)
+            OR (
+              status='routed'
+              AND target_object_type='homework_submission'
+              AND automatic_deadline_at>0
+              AND automatic_deadline_at<=?
+            )
+          )`,
+		imageTaskAutomaticBudgetSeconds, now,
+		now+imageTaskAutomaticBudgetSeconds, imageTaskAutomaticBudgetSeconds,
+		now, agentName, dispatchID, expectedVersion, now)
+	if err != nil {
+		return k12.ImageTaskDispatch{}, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return k12.ImageTaskDispatch{}, ErrImageTaskVersionConflict
+	}
+	return s.GetImageTaskDispatch(ctx, agentName, dispatchID)
+}
+
+func normalizeImageTaskAutomaticWindow(dispatch *k12.ImageTaskDispatch) {
+	dispatch.AutomaticBudgetSeconds = imageTaskAutomaticBudgetSeconds
+	dispatch.AutomaticStartedAt = dispatch.CreatedAt
+	dispatch.AutomaticDeadlineAt = dispatch.CreatedAt + imageTaskAutomaticBudgetSeconds
+	dispatch.AutomaticRemainingSeconds = imageTaskAutomaticBudgetSeconds
+}
+
+func remainingImageTaskAutomaticSeconds(
+	dispatch k12.ImageTaskDispatch,
+	now int64,
+) int {
+	if dispatch.AutomaticDeadlineAt == 0 {
+		return dispatch.AutomaticRemainingSeconds
+	}
+	if dispatch.AutomaticDeadlineAt <= now {
+		return 0
+	}
+	remaining := dispatch.AutomaticDeadlineAt - now
+	if remaining > int64(dispatch.AutomaticBudgetSeconds) {
+		return dispatch.AutomaticBudgetSeconds
+	}
+	return int(remaining)
+}
+
+func pauseImageTaskAutomaticWindow(
+	ctx context.Context,
+	tx *sql.Tx,
+	agentName, dispatchID string,
+	now int64,
+) (k12.ImageTaskDispatch, error) {
+	dispatch, err := getImageTaskDispatch(ctx, tx, agentName, dispatchID, "")
+	if err != nil {
+		return dispatch, err
+	}
+	if dispatch.AutomaticDeadlineAt == 0 {
+		return dispatch, nil
+	}
+	dispatch.AutomaticRemainingSeconds = remainingImageTaskAutomaticSeconds(dispatch, now)
+	dispatch.AutomaticDeadlineAt = 0
+	_, err = tx.ExecContext(ctx, `UPDATE k12_image_task_dispatches
+        SET automatic_deadline_at=0,automatic_remaining_seconds=?,updated_at=?
+        WHERE agent_name=? AND dispatch_id=?`,
+		dispatch.AutomaticRemainingSeconds, now, agentName, dispatchID)
+	return dispatch, err
+}
+
+func resumeImageTaskAutomaticWindow(
+	ctx context.Context,
+	tx *sql.Tx,
+	agentName, dispatchID string,
+	now int64,
+) (k12.ImageTaskDispatch, error) {
+	dispatch, err := getImageTaskDispatch(ctx, tx, agentName, dispatchID, "")
+	if err != nil {
+		return dispatch, err
+	}
+	if dispatch.AutomaticDeadlineAt != 0 {
+		return dispatch, nil
+	}
+	dispatch.AutomaticDeadlineAt = now + int64(dispatch.AutomaticRemainingSeconds)
+	_, err = tx.ExecContext(ctx, `UPDATE k12_image_task_dispatches
+        SET automatic_deadline_at=?,updated_at=?
+        WHERE agent_name=? AND dispatch_id=?`,
+		dispatch.AutomaticDeadlineAt, now, agentName, dispatchID)
+	return dispatch, err
+}
+
+func (s *Store) resolveImageTaskInvocationDeadline(
+	ctx context.Context,
+	invocation k12.ImageTaskInvocation,
+) (int64, bool, error) {
+	var row *sql.Row
+	switch invocation.Operation {
+	case k12.ImageTaskOperationClassification:
+		row = s.db.QueryRowContext(ctx, `SELECT automatic_deadline_at
+            FROM k12_image_task_dispatches
+            WHERE agent_name=? AND dispatch_id=?`,
+			invocation.AgentName, invocation.DispatchID)
+	case k12.ImageTaskOperationWritingOCR:
+		row = s.db.QueryRowContext(ctx, `SELECT d.automatic_deadline_at
+            FROM k12_image_task_dispatches d
+            JOIN k12_creative_work_intakes i ON i.dispatch_id=d.dispatch_id
+            WHERE d.agent_name=? AND i.agent_name=? AND i.intake_id=?`,
+			invocation.AgentName, invocation.AgentName, invocation.IntakeID)
+	case k12.ImageTaskOperationWorkFeedback:
+		row = s.db.QueryRowContext(ctx, `SELECT d.automatic_deadline_at
+            FROM k12_image_task_dispatches d
+            JOIN k12_creative_work_intakes i ON i.dispatch_id=d.dispatch_id
+            WHERE d.agent_name=? AND i.agent_name=? AND i.promoted_work_id=?
+            ORDER BY i.updated_at DESC LIMIT 1`,
+			invocation.AgentName, invocation.AgentName, invocation.WorkRecordID)
+	default:
+		return 0, false, ErrImageTaskInvalidState
+	}
+	var deadline int64
+	if err := row.Scan(&deadline); err != nil {
+		if err == sql.ErrNoRows &&
+			invocation.Operation == k12.ImageTaskOperationWorkFeedback {
+			return invocation.DeadlineAt, false, nil
+		}
+		return 0, false, err
+	}
+	return deadline, true, nil
+}
+
+func imageTaskInvocationBelongsToDispatch(
+	ctx context.Context,
+	tx *sql.Tx,
+	agentName, dispatchID string,
+	invocation k12.ImageTaskInvocation,
+) (bool, error) {
+	switch invocation.Operation {
+	case k12.ImageTaskOperationClassification:
+		return invocation.DispatchID == dispatchID, nil
+	case k12.ImageTaskOperationWritingOCR:
+		var n int
+		err := tx.QueryRowContext(ctx, `SELECT COUNT(*)
+            FROM k12_creative_work_intakes
+            WHERE agent_name=? AND intake_id=? AND dispatch_id=?`,
+			agentName, invocation.IntakeID, dispatchID).Scan(&n)
+		return n == 1, err
+	case k12.ImageTaskOperationWorkFeedback:
+		var n int
+		err := tx.QueryRowContext(ctx, `SELECT COUNT(*)
+            FROM k12_creative_work_intakes
+            WHERE agent_name=? AND promoted_work_id=? AND dispatch_id=?`,
+			agentName, invocation.WorkRecordID, dispatchID).Scan(&n)
+		return n == 1, err
+	default:
+		return false, ErrImageTaskInvalidState
+	}
 }
 
 func (s *Store) ConfirmCreativeWorkIntakeOCR(
@@ -2096,6 +2525,11 @@ func (s *Store) ConfirmCreativeWorkIntakeOCR(
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return intake, ErrImageTaskVersionConflict
+	}
+	if _, err := resumeImageTaskAutomaticWindow(
+		ctx, tx, agentName, intake.DispatchID, evidence.FrozenAt,
+	); err != nil {
+		return intake, err
 	}
 	if err := tx.Commit(); err != nil {
 		return intake, err

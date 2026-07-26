@@ -243,7 +243,7 @@ func insertCurrentCreateReceipt(
 func (s *Store) CreateCreativeWorkWithInitialGeneration(
 	ctx context.Context,
 	rec *records.AgentRecord,
-	_ string,
+	commandKey string,
 	requestDigest string,
 	source k12.CreativeWorkSourceSnapshot,
 ) (k12.WorkFeedbackGeneration, bool, error) {
@@ -251,9 +251,11 @@ func (s *Store) CreateCreativeWorkWithInitialGeneration(
 		rec.Collection != k12.CollectionCreativeWork {
 		return k12.WorkFeedbackGeneration{}, false, records.ErrInvalidRecord
 	}
-	if strings.TrimSpace(requestDigest) == "" {
+	commandKey = strings.TrimSpace(commandKey)
+	requestDigest = strings.TrimSpace(requestDigest)
+	if commandKey == "" || requestDigest == "" {
 		return k12.WorkFeedbackGeneration{}, false, fmt.Errorf(
-			"%w: creative work request_digest required", ErrCurrentCommandConflict,
+			"%w: creative work command_key/request_digest required", ErrCurrentCommandConflict,
 		)
 	}
 	if len(rec.Fields) == 0 {
@@ -336,9 +338,12 @@ func (s *Store) CreateCreativeWorkWithInitialGeneration(
 	}
 	now := nowUnix()
 	rec.CreatedAt, rec.UpdatedAt, rec.Version = now, now, 0
-	dedupeSum := sha256.Sum256(append(
-		[]byte(rec.AgentName+"\x00"),
-		sourceJSON...,
+	// A save command is the identity boundary. Two independent saves of byte-
+	// identical content are two works; only an exact replay of the same command
+	// may collapse. The durable receipt below is the primary replay source and
+	// this command-derived dedupe key is the concurrent-insert backstop.
+	dedupeSum := sha256.Sum256([]byte(
+		rec.AgentName + "\x00creative_work\x00" + commandKey,
 	))
 	rec.DedupeKey = hex.EncodeToString(dedupeSum[:])
 
@@ -347,6 +352,36 @@ func (s *Store) CreateCreativeWorkWithInitialGeneration(
 		return k12.WorkFeedbackGeneration{}, false, err
 	}
 	defer tx.Rollback()
+	if receipt, err := getCurrentCreateReceiptVia(
+		ctx, tx, rec.AgentName, "creative_work", commandKey,
+	); err == nil {
+		if receipt.RequestDigest != requestDigest {
+			return k12.WorkFeedbackGeneration{}, false, ErrCurrentCommandConflict
+		}
+		rec.RecordID = receipt.ObjectID
+		var initialID string
+		if err := tx.QueryRowContext(ctx, `SELECT initial_feedback_generation_id
+			FROM k12_creative_works
+			WHERE record_id=? AND agent_name=? AND deleted_at IS NULL`,
+			rec.RecordID, rec.AgentName,
+		).Scan(&initialID); err == sql.ErrNoRows {
+			return k12.WorkFeedbackGeneration{}, false, records.ErrNotFound
+		} else if err != nil {
+			return k12.WorkFeedbackGeneration{}, false, err
+		}
+		generation, err := getWorkFeedbackGenerationVia(
+			ctx, tx, rec.AgentName, initialID,
+		)
+		if err != nil {
+			return k12.WorkFeedbackGeneration{}, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return k12.WorkFeedbackGeneration{}, false, err
+		}
+		return generation, false, nil
+	} else if !errors.Is(err, records.ErrNotFound) {
+		return k12.WorkFeedbackGeneration{}, false, err
+	}
 	cols := mp.domainCols()
 	query := fmt.Sprintf(`INSERT INTO %s (%s, %s) VALUES (%s)
         ON CONFLICT(agent_name, dedupe_key) DO NOTHING`,
@@ -396,6 +431,24 @@ func (s *Store) CreateCreativeWorkWithInitialGeneration(
 				"%w: duplicate work request digest changed", ErrCurrentCommandConflict,
 			)
 		}
+		receipt := k12.CurrentCreateReceipt{
+			ObjectKind: "creative_work", ObjectID: rec.RecordID,
+			CommandKey: commandKey, RequestDigest: requestDigest,
+			Created: false, CreatedAt: now,
+		}
+		if err := insertCurrentCreateReceipt(
+			ctx, tx, rec.AgentName, receipt,
+		); err != nil {
+			// A concurrent winner may already have committed the same receipt.
+			// Re-read and validate instead of manufacturing a second identity.
+			existing, readErr := getCurrentCreateReceiptVia(
+				ctx, tx, rec.AgentName, "creative_work", commandKey,
+			)
+			if readErr != nil || existing.RequestDigest != requestDigest ||
+				existing.ObjectID != rec.RecordID {
+				return k12.WorkFeedbackGeneration{}, false, err
+			}
+		}
 		if err := tx.Commit(); err != nil {
 			return k12.WorkFeedbackGeneration{}, false, err
 		}
@@ -422,6 +475,16 @@ func (s *Store) CreateCreativeWorkWithInitialGeneration(
 		SET initial_feedback_generation_id=?, feedback_state='queued'
 		WHERE record_id=? AND agent_name=? AND deleted_at IS NULL`,
 		generation.GenerationID, rec.RecordID, rec.AgentName,
+	); err != nil {
+		return k12.WorkFeedbackGeneration{}, false, err
+	}
+	receipt := k12.CurrentCreateReceipt{
+		ObjectKind: "creative_work", ObjectID: rec.RecordID,
+		CommandKey: commandKey, RequestDigest: requestDigest,
+		Created: true, CreatedAt: now,
+	}
+	if err := insertCurrentCreateReceipt(
+		ctx, tx, rec.AgentName, receipt,
 	); err != nil {
 		return k12.WorkFeedbackGeneration{}, false, err
 	}
@@ -519,6 +582,68 @@ func (s *Store) GetWorkFeedbackGeneration(
 	agentName, generationID string,
 ) (k12.WorkFeedbackGeneration, error) {
 	return getWorkFeedbackGenerationVia(ctx, s.db, agentName, generationID)
+}
+
+// ListDirectWorkFeedbackGenerationsForRecovery returns only current works that
+// are not owned by ImageTask. ImageTask-promoted works are recovered by the
+// ImageTask coordinator so the two runners can never schedule the same
+// generation.
+func (s *Store) ListDirectWorkFeedbackGenerationsForRecovery(
+	ctx context.Context,
+	agentName string,
+) ([]k12.WorkFeedbackGeneration, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT g.generation_id, g.work_id, g.agent_name, g.generation_no,
+       g.command_key, g.request_digest, g.status, g.feedback_type,
+       g.source_snapshot_json, g.feedback_json, g.projection_markdown,
+       g.failure_reason, g.attempt, g.created_at, g.updated_at
+FROM k12_work_feedback_generations g
+JOIN k12_creative_works w
+  ON w.record_id=g.work_id AND w.agent_name=g.agent_name
+WHERE g.agent_name=?
+  AND g.status IN ('queued','running')
+  AND w.deleted_at IS NULL
+  AND COALESCE(w.source_intake_id,'')=''
+ORDER BY g.created_at,g.generation_id`, strings.TrimSpace(agentName))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]k12.WorkFeedbackGeneration, 0)
+	for rows.Next() {
+		generation, err := scanWorkFeedbackGeneration(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, generation)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) MarkWorkFeedbackGenerationRunning(
+	ctx context.Context,
+	agentName, generationID string,
+) (k12.WorkFeedbackGeneration, error) {
+	now := nowUnix()
+	if _, err := s.db.ExecContext(ctx, `UPDATE k12_work_feedback_generations
+		SET status='running', updated_at=?
+		WHERE generation_id=? AND agent_name=? AND status='queued'`,
+		now, generationID, agentName,
+	); err != nil {
+		return k12.WorkFeedbackGeneration{}, err
+	}
+	generation, err := getWorkFeedbackGenerationVia(
+		ctx, s.db, agentName, generationID,
+	)
+	if err != nil {
+		return k12.WorkFeedbackGeneration{}, err
+	}
+	switch generation.Status {
+	case k12.WorkFeedbackRunning, k12.WorkFeedbackSucceeded:
+		return generation, nil
+	default:
+		return k12.WorkFeedbackGeneration{}, records.ErrVersionConflict
+	}
 }
 
 // PrepareWorkFeedbackGeneration resumes generation 1 after an initial failure,

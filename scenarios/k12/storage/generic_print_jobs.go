@@ -1,8 +1,11 @@
 package k12storage
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -32,6 +35,14 @@ func scanPrintArtifact(row rowScanner) (k12.PrintArtifact, error) {
 		&artifact.SourceRef, &artifact.Title, &artifact.CanonicalMarkdown,
 		&artifact.SourceDigest, &artifact.CreatedAt)
 	return artifact, err
+}
+
+func scanPrintArtifactRender(row rowScanner) (k12.PrintArtifactRender, error) {
+	var render k12.PrintArtifactRender
+	err := row.Scan(&render.ArtifactID, &render.Format, &render.RenderContractVersion,
+		&render.ContentType, &render.ByteDigest, &render.ByteSize, &render.Payload,
+		&render.CreatedAt)
+	return render, err
 }
 
 func validPrinterSnapshotJSON(raw string) bool {
@@ -73,6 +84,23 @@ func getPrintArtifactVia(ctx context.Context, q dbQueryer, agentName, artifactID
 	return artifact, nil
 }
 
+func getPrintArtifactRenderVia(ctx context.Context, q dbQueryer, agentName,
+	artifactID string) (k12.PrintArtifactRender, error) {
+	render, err := scanPrintArtifactRender(q.QueryRowContext(ctx, `SELECT
+        r.artifact_id,r.format,r.render_contract_version,r.content_type,
+        r.byte_digest,r.byte_size,r.payload,r.created_at
+        FROM k12_print_artifact_renders r
+        JOIN k12_print_artifacts a ON a.artifact_id=r.artifact_id
+        WHERE r.artifact_id=? AND a.agent_name=?`, artifactID, agentName))
+	if err == sql.ErrNoRows {
+		return k12.PrintArtifactRender{}, records.ErrNotFound
+	}
+	if err != nil {
+		return k12.PrintArtifactRender{}, fmt.Errorf("k12storage: 读打印 Artifact PDF: %w", err)
+	}
+	return render, nil
+}
+
 func (s *Store) GetGenericPrintJob(ctx context.Context, agentName, jobID string) (k12.GenericPrintJob, error) {
 	if strings.TrimSpace(agentName) == "" || strings.TrimSpace(jobID) == "" {
 		return k12.GenericPrintJob{}, records.ErrNotFound
@@ -85,6 +113,96 @@ func (s *Store) GetPrintArtifact(ctx context.Context, agentName, artifactID stri
 		return k12.PrintArtifact{}, records.ErrNotFound
 	}
 	return getPrintArtifactVia(ctx, s.db, agentName, artifactID)
+}
+
+func (s *Store) GetPrintArtifactRender(ctx context.Context, agentName,
+	artifactID string) (k12.PrintArtifactRender, error) {
+	if strings.TrimSpace(agentName) == "" || strings.TrimSpace(artifactID) == "" {
+		return k12.PrintArtifactRender{}, records.ErrNotFound
+	}
+	return getPrintArtifactRenderVia(ctx, s.db, agentName, artifactID)
+}
+
+func validPrintArtifactRender(artifact k12.PrintArtifact, render k12.PrintArtifactRender) bool {
+	if render.ArtifactID != artifact.ArtifactID || render.Format != "pdf" ||
+		strings.TrimSpace(render.RenderContractVersion) == "" ||
+		render.ContentType != "application/pdf" || len(render.ByteDigest) != 64 ||
+		render.ByteSize != int64(len(render.Payload)) || render.ByteSize <= 0 ||
+		render.ByteSize > 30<<20 || render.CreatedAt <= 0 {
+		return false
+	}
+	headerLimit := min(len(render.Payload), 1024)
+	if !bytes.Contains(render.Payload[:headerLimit], []byte("%PDF-")) {
+		return false
+	}
+	sum := sha256.Sum256(render.Payload)
+	return hex.EncodeToString(sum[:]) == render.ByteDigest
+}
+
+// FreezePrintArtifact stores the canonical Markdown and its first valid PDF in
+// one short transaction. Rendering happens before this boundary. Concurrent
+// callers converge on the first committed PDF and receive those frozen bytes.
+func (s *Store) FreezePrintArtifact(ctx context.Context, artifact k12.PrintArtifact,
+	render k12.PrintArtifactRender) (storedArtifact k12.PrintArtifact,
+	storedRender k12.PrintArtifactRender, replay bool, err error) {
+	if strings.TrimSpace(artifact.ArtifactID) == "" || strings.TrimSpace(artifact.AgentName) == "" ||
+		!k12.GenericPrintSourceKindAllowed(artifact.SourceKind) || strings.TrimSpace(artifact.SourceRef) == "" ||
+		strings.TrimSpace(artifact.Title) == "" || strings.TrimSpace(artifact.CanonicalMarkdown) == "" ||
+		len(artifact.SourceDigest) != 64 || artifact.CreatedAt <= 0 ||
+		!validPrintArtifactRender(artifact, render) {
+		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, false,
+			fmt.Errorf("k12storage: 冻结打印 Artifact/PDF 字段不完整")
+	}
+	if err := ensureAgentRegistered(ctx, s.db, artifact.AgentName); err != nil {
+		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, false, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO k12_print_artifacts
+        (artifact_id,agent_name,source_kind,source_ref,title,canonical_markdown,source_digest,created_at)
+        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, artifact.ArtifactID, artifact.AgentName,
+		artifact.SourceKind, artifact.SourceRef, artifact.Title, artifact.CanonicalMarkdown,
+		artifact.SourceDigest, artifact.CreatedAt); err != nil {
+		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, false,
+			fmt.Errorf("k12storage: freeze 打印 Artifact: %w", err)
+	}
+	storedArtifact, err = getPrintArtifactVia(ctx, tx, artifact.AgentName, artifact.ArtifactID)
+	if err != nil {
+		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, false, err
+	}
+	if storedArtifact.SourceKind != artifact.SourceKind || storedArtifact.SourceRef != artifact.SourceRef ||
+		storedArtifact.Title != artifact.Title ||
+		storedArtifact.CanonicalMarkdown != artifact.CanonicalMarkdown ||
+		storedArtifact.SourceDigest != artifact.SourceDigest {
+		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, false,
+			fmt.Errorf("k12storage: 打印 Artifact ID 已绑定其他内容")
+	}
+	res, err := tx.ExecContext(ctx, `INSERT INTO k12_print_artifact_renders
+        (artifact_id,format,render_contract_version,content_type,byte_digest,byte_size,payload,created_at)
+        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, render.ArtifactID, render.Format,
+		render.RenderContractVersion, render.ContentType, render.ByteDigest, render.ByteSize,
+		render.Payload, render.CreatedAt)
+	if err != nil {
+		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, false,
+			fmt.Errorf("k12storage: freeze 打印 Artifact PDF: %w", err)
+	}
+	storedRender, err = getPrintArtifactRenderVia(ctx, tx, artifact.AgentName, artifact.ArtifactID)
+	if err != nil {
+		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, false, err
+	}
+	if !validPrintArtifactRender(storedArtifact, storedRender) {
+		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, false,
+			fmt.Errorf("k12storage: 已冻结打印 Artifact PDF 校验失败")
+	}
+	affected, _ := res.RowsAffected()
+	replay = affected == 0
+	if err := tx.Commit(); err != nil {
+		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, false, err
+	}
+	return storedArtifact, storedRender, replay, nil
 }
 
 // PrepareGenericPrintJob freezes the Artifact and establishes the idempotency
@@ -127,6 +245,10 @@ func (s *Store) PrepareGenericPrintJob(ctx context.Context, artifact k12.PrintAr
 		frozen.Title != artifact.Title || frozen.CanonicalMarkdown != artifact.CanonicalMarkdown ||
 		frozen.SourceDigest != artifact.SourceDigest {
 		return k12.GenericPrintJob{}, false, fmt.Errorf("k12storage: 打印 Artifact ID 已绑定其他内容")
+	}
+	if _, err := getPrintArtifactRenderVia(ctx, tx, artifact.AgentName, artifact.ArtifactID); err != nil {
+		return k12.GenericPrintJob{}, false,
+			fmt.Errorf("k12storage: PrintJob 必须引用已冻结 PDF Artifact: %w", err)
 	}
 	// A renderer reload may generate a fresh UI idempotency key. Recover the
 	// unresolved job for the exact immutable Artifact instead of opening a

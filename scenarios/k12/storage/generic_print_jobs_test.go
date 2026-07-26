@@ -1,14 +1,36 @@
 package k12storage_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
+
+func freezeGenericPDF(t *testing.T, store interface {
+	FreezePrintArtifact(context.Context, k12.PrintArtifact, k12.PrintArtifactRender) (k12.PrintArtifact, k12.PrintArtifactRender, bool, error)
+}, ctx context.Context, artifact k12.PrintArtifact, payload []byte) k12.PrintArtifactRender {
+	t.Helper()
+	sum := sha256.Sum256(payload)
+	render := k12.PrintArtifactRender{
+		ArtifactID: artifact.ArtifactID, Format: "pdf",
+		RenderContractVersion: "k12-pdf-v1", ContentType: "application/pdf",
+		ByteDigest: hex.EncodeToString(sum[:]), ByteSize: int64(len(payload)),
+		Payload: append([]byte(nil), payload...), CreatedAt: artifact.CreatedAt,
+	}
+	_, stored, _, err := store.FreezePrintArtifact(ctx, artifact, render)
+	if err != nil {
+		t.Fatalf("freeze PDF artifact: %v", err)
+	}
+	return stored
+}
 
 func TestGenericPrintJobStorageFreezesArtifactAndScopesIdempotency(t *testing.T) {
 	store, _ := setup(t)
@@ -22,6 +44,7 @@ func TestGenericPrintJobStorageFreezesArtifactAndScopesIdempotency(t *testing.T)
 		PrintJobID: "gprint-a", AgentName: "mingming", IdempotencyKey: "click-a",
 		RequestDigest: strings.Repeat("b", 64), ArtifactID: artifact.ArtifactID, PreparedAt: 100,
 	}
+	freezeGenericPDF(t, store, ctx, artifact, []byte("%PDF-1.7\nfirst"))
 	first, replay, err := store.PrepareGenericPrintJob(ctx, artifact, job)
 	if err != nil || replay || first.Status != k12.PrintJobPreparing || first.AttemptCount != 1 {
 		t.Fatalf("first=%+v replay=%v err=%v", first, replay, err)
@@ -53,6 +76,7 @@ func TestGenericPrintJobStorageFreezesArtifactAndScopesIdempotency(t *testing.T)
 	changed.PrintJobID = "gprint-b"
 	changed.RequestDigest = strings.Repeat("d", 64)
 	changed.ArtifactID = changedArtifact.ArtifactID
+	freezeGenericPDF(t, store, ctx, changedArtifact, []byte("%PDF-1.7\nchanged"))
 	if _, _, err := store.PrepareGenericPrintJob(ctx, changedArtifact, changed); err == nil {
 		t.Fatal("same owner/idempotency key with changed artifact must fail closed")
 	}
@@ -65,6 +89,7 @@ func TestGenericPrintJobStorageRequiresReceiptAndBoundsRetry(t *testing.T) {
 		SourceRef: "tutoring-tips:tips-1", Title: "辅导要点", CanonicalMarkdown: "# 辅导要点", SourceDigest: strings.Repeat("a", 64), CreatedAt: 100}
 	job := k12.GenericPrintJob{PrintJobID: "gprint-a", AgentName: "mingming", IdempotencyKey: "click",
 		RequestDigest: strings.Repeat("b", 64), ArtifactID: artifact.ArtifactID, PreparedAt: 100}
+	freezeGenericPDF(t, store, ctx, artifact, []byte("%PDF-1.7\nretry"))
 	if _, _, err := store.PrepareGenericPrintJob(ctx, artifact, job); err != nil {
 		t.Fatal(err)
 	}
@@ -105,6 +130,7 @@ func TestGenericPrintCommitRequiresDialogBoundaryAndMatchesUnknownNativeJob(t *t
 		SourceRef: "submission:boundary", Title: "辅导要点", CanonicalMarkdown: "# 卡片", SourceDigest: strings.Repeat("a", 64), CreatedAt: 100}
 	job := k12.GenericPrintJob{PrintJobID: "gprint-boundary", AgentName: "mingming", IdempotencyKey: "boundary",
 		RequestDigest: strings.Repeat("b", 64), ArtifactID: artifact.ArtifactID, PreparedAt: 100}
+	freezeGenericPDF(t, store, ctx, artifact, []byte("%PDF-1.7\nboundary"))
 	if _, _, err := store.PrepareGenericPrintJob(ctx, artifact, job); err != nil {
 		t.Fatal(err)
 	}
@@ -129,6 +155,7 @@ func TestGenericPrintCommitRequiresDialogBoundaryAndMatchesUnknownNativeJob(t *t
 	unknownArtifact.ArtifactID, unknownArtifact.SourceRef = "part-unknown-boundary", "submission:unknown-boundary"
 	unknownJob := job
 	unknownJob.PrintJobID, unknownJob.IdempotencyKey, unknownJob.ArtifactID = "gprint-unknown-boundary", "unknown-boundary", unknownArtifact.ArtifactID
+	freezeGenericPDF(t, store, ctx, unknownArtifact, []byte("%PDF-1.7\nunknown-boundary"))
 	if _, _, err := store.PrepareGenericPrintJob(ctx, unknownArtifact, unknownJob); err != nil {
 		t.Fatal(err)
 	}
@@ -143,5 +170,63 @@ func TestGenericPrintCommitRequiresDialogBoundaryAndMatchesUnknownNativeJob(t *t
 	}
 	if _, err := store.CommitGenericPrintJob(ctx, "mingming", unknownJob.PrintJobID, "native-known", "receipt-known", snapshot, 109); err != nil {
 		t.Fatalf("matching reconciliation receipt should settle outcome_unknown: %v", err)
+	}
+}
+
+func TestPrintArtifactRenderFirstWriterWinsAndArtifactOnlyCreatesNoPrintJob(t *testing.T) {
+	store, db := setup(t)
+	ctx := context.Background()
+	artifact := k12.PrintArtifact{
+		ArtifactID: "part-concurrent", AgentName: "mingming", SourceKind: k12.PrintSourceTutoringTips,
+		SourceRef: "submission:concurrent", Title: "辅导要点",
+		CanonicalMarkdown: "# 并发冻结", SourceDigest: strings.Repeat("e", 64), CreatedAt: 200,
+	}
+	payloads := [][]byte{
+		[]byte("%PDF-1.7\nwriter-a"),
+		[]byte("%PDF-1.7\nwriter-b"),
+	}
+	results := make([]k12.PrintArtifactRender, len(payloads))
+	errs := make([]error, len(payloads))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range payloads {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			sum := sha256.Sum256(payloads[i])
+			render := k12.PrintArtifactRender{
+				ArtifactID: artifact.ArtifactID, Format: "pdf",
+				RenderContractVersion: "k12-pdf-v1", ContentType: "application/pdf",
+				ByteDigest: hex.EncodeToString(sum[:]), ByteSize: int64(len(payloads[i])),
+				Payload: payloads[i], CreatedAt: 200,
+			}
+			_, results[i], _, errs[i] = store.FreezePrintArtifact(ctx, artifact, render)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("writer %d: %v", i, err)
+		}
+	}
+	if !bytes.Equal(results[0].Payload, results[1].Payload) ||
+		results[0].ByteDigest != results[1].ByteDigest {
+		t.Fatalf("writers did not converge: %#v %#v", results[0], results[1])
+	}
+	if !bytes.Equal(results[0].Payload, payloads[0]) && !bytes.Equal(results[0].Payload, payloads[1]) {
+		t.Fatalf("stored payload was not one of the valid first-writer candidates: %q", results[0].Payload)
+	}
+	var jobs int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM k12_generic_print_jobs WHERE artifact_id=?`,
+		artifact.ArtifactID).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 0 {
+		t.Fatalf("artifact-only freeze created %d PrintJobs", jobs)
+	}
+	if _, err := store.GetPrintArtifactRender(ctx, "lele", artifact.ArtifactID); !errors.Is(err, records.ErrNotFound) {
+		t.Fatalf("cross-owner PDF lookup must fail: %v", err)
 	}
 }

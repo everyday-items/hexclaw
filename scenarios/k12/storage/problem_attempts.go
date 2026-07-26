@@ -18,7 +18,8 @@ import (
 var ErrProblemAttemptConflict = errors.New("problem/attempt immutable fact conflict")
 
 const problemColumns = `problem_id,agent_name,submission_id,page_asset_id,ordinal,
-    problem_kind,parent_problem_id,subproblem_no,subject,stem_raw,stem_markdown,
+    problem_kind,parent_problem_id,subproblem_no,source_number_path_json,display_label,
+    subject,stem_raw,stem_markdown,
     concept_ids_json,transcription_confidence,confirmation_required,
     confirmation_reasons_json,canonical_version,created_at,updated_at`
 
@@ -33,6 +34,17 @@ func normalizeProblem(problem k12.Problem, at int64) (k12.Problem, error) {
 	problem.ProblemKind = strings.TrimSpace(problem.ProblemKind)
 	problem.ParentProblemID = strings.TrimSpace(problem.ParentProblemID)
 	problem.SubproblemNo = strings.TrimSpace(problem.SubproblemNo)
+	problem.SourceNumberPath = append([]string(nil), problem.SourceNumberPath...)
+	for i := range problem.SourceNumberPath {
+		problem.SourceNumberPath[i] = strings.TrimSpace(problem.SourceNumberPath[i])
+		if problem.SourceNumberPath[i] == "" {
+			return k12.Problem{}, fmt.Errorf("k12storage: source_number_path 含空 token")
+		}
+	}
+	problem.DisplayLabel = strings.TrimSpace(problem.DisplayLabel)
+	if (len(problem.SourceNumberPath) == 0) != (problem.DisplayLabel == "") {
+		return k12.Problem{}, fmt.Errorf("k12storage: source_number_path/display_label 必须同时存在或同时为空")
+	}
 	problem.Subject = strings.TrimSpace(problem.Subject)
 	problem.StemMarkdown = strings.TrimSpace(problem.StemMarkdown)
 	if problem.ProblemID == "" || problem.AgentName == "" || problem.SubmissionID == "" ||
@@ -284,6 +296,14 @@ func (s *Store) PutProblemAttemptSnapshot(ctx context.Context, snapshot k12.Prob
 			return err
 		}
 	}
+	if err := advanceProblemStructureSnapshotTx(
+		ctx,
+		tx,
+		normalized,
+		nowUnix(),
+	); err != nil {
+		return fmt.Errorf("k12storage: freeze Problem structure snapshot: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("k12storage: 提交 Problem/Attempt 事务: %w", err)
 	}
@@ -471,14 +491,16 @@ func (s *Store) ReplaceProblemAttemptSnapshotsTx(
 func putProblemTx(ctx context.Context, tx *sql.Tx, problem k12.Problem) error {
 	conceptsJSON, _ := json.Marshal(problem.ConceptIDs)
 	reasonsJSON, _ := json.Marshal(problem.ConfirmationReasons)
+	sourceNumberPathJSON, _ := json.Marshal(problem.SourceNumberPath)
 	var confidence any
 	if problem.TranscriptionConfidence != nil {
 		confidence = *problem.TranscriptionConfidence
 	}
 	res, err := tx.ExecContext(ctx, `INSERT INTO k12_problems (`+problemColumns+`)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent_name,problem_id) DO NOTHING`,
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent_name,problem_id) DO NOTHING`,
 		problem.ProblemID, problem.AgentName, problem.SubmissionID, problem.PageAssetID, problem.Ordinal,
-		problem.ProblemKind, nullableString(problem.ParentProblemID), problem.SubproblemNo, problem.Subject,
+		problem.ProblemKind, nullableString(problem.ParentProblemID), problem.SubproblemNo,
+		string(sourceNumberPathJSON), problem.DisplayLabel, problem.Subject,
 		problem.StemRaw, problem.StemMarkdown, string(conceptsJSON), confidence, boolInt(problem.ConfirmationRequired),
 		string(reasonsJSON), problem.CanonicalVersion, problem.CreatedAt, problem.UpdatedAt)
 	if err != nil {
@@ -495,6 +517,8 @@ func putProblemTx(ctx context.Context, tx *sql.Tx, problem k12.Problem) error {
 	if existing.SubmissionID != problem.SubmissionID || existing.PageAssetID != problem.PageAssetID ||
 		existing.Ordinal != problem.Ordinal || existing.ProblemKind != problem.ProblemKind ||
 		existing.ParentProblemID != problem.ParentProblemID || existing.SubproblemNo != problem.SubproblemNo ||
+		!reflect.DeepEqual(existing.SourceNumberPath, problem.SourceNumberPath) ||
+		existing.DisplayLabel != problem.DisplayLabel ||
 		existing.StemRaw != problem.StemRaw {
 		return fmt.Errorf("%w: Problem %s raw/structure", ErrProblemAttemptConflict, problem.ProblemID)
 	}
@@ -647,18 +671,22 @@ func (s *Store) GetProblemAttemptSnapshot(ctx context.Context, agentName, submis
 func scanProblem(row rowScanner) (k12.Problem, error) {
 	var problem k12.Problem
 	var parent sql.NullString
-	var conceptsJSON, reasonsJSON string
+	var sourceNumberPathJSON, conceptsJSON, reasonsJSON string
 	var confidence sql.NullFloat64
 	var confirmationRequired int
 	err := row.Scan(&problem.ProblemID, &problem.AgentName, &problem.SubmissionID,
 		&problem.PageAssetID, &problem.Ordinal, &problem.ProblemKind, &parent,
-		&problem.SubproblemNo, &problem.Subject, &problem.StemRaw, &problem.StemMarkdown,
+		&problem.SubproblemNo, &sourceNumberPathJSON, &problem.DisplayLabel,
+		&problem.Subject, &problem.StemRaw, &problem.StemMarkdown,
 		&conceptsJSON, &confidence, &confirmationRequired, &reasonsJSON,
 		&problem.CanonicalVersion, &problem.CreatedAt, &problem.UpdatedAt)
 	if err != nil {
 		return k12.Problem{}, err
 	}
 	problem.ParentProblemID = parent.String
+	if err := json.Unmarshal([]byte(sourceNumberPathJSON), &problem.SourceNumberPath); err != nil {
+		return k12.Problem{}, fmt.Errorf("decode source_number_path_json: %w", err)
+	}
 	problem.ConfirmationRequired = confirmationRequired != 0
 	if confidence.Valid {
 		value := confidence.Float64

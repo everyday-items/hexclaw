@@ -8,6 +8,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 )
 
 func TestCurrentCreativeWorkCreateAtomicallyInstallsInitialGenerationWithoutLegacyVersionWrite(t *testing.T) {
@@ -56,6 +57,88 @@ func TestCurrentCreativeWorkCreateAtomicallyInstallsInitialGenerationWithoutLega
 	}
 	if legacyVersions != 0 {
 		t.Fatalf("current create wrote %d legacy versions", legacyVersions)
+	}
+}
+
+func TestCurrentCreativeWorkCreateUsesCommandReceiptNotSourceDedupe(t *testing.T) {
+	store, db := setup(t)
+	create := func(commandKey, requestDigest, content string) (
+		*records.AgentRecord,
+		k12.WorkFeedbackGeneration,
+		bool,
+		error,
+	) {
+		rec, err := k12.NewCreativeWorkRecord(
+			"mingming",
+			"session",
+			k12.CreativeWorkFields{WorkType: k12.WorkTypeWriting},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		generation, created, err := store.CreateCreativeWorkWithInitialGeneration(
+			context.Background(),
+			rec,
+			commandKey,
+			requestDigest,
+			k12.CreativeWorkSourceSnapshot{
+				WorkType:        k12.WorkTypeWriting,
+				ContentMarkdown: content,
+			},
+		)
+		return rec, generation, created, err
+	}
+
+	first, firstGeneration, created, err := create(
+		"save-work-1", "sha256:same", "同一篇正文",
+	)
+	if err != nil || !created {
+		t.Fatalf("first create: created=%v err=%v", created, err)
+	}
+	second, secondGeneration, created, err := create(
+		"save-work-2", "sha256:same", "同一篇正文",
+	)
+	if err != nil || !created {
+		t.Fatalf("independent save: created=%v err=%v", created, err)
+	}
+	if first.RecordID == second.RecordID ||
+		firstGeneration.GenerationID == secondGeneration.GenerationID {
+		t.Fatalf(
+			"separate save commands must create independent works: first=%s/%s second=%s/%s",
+			first.RecordID, firstGeneration.GenerationID,
+			second.RecordID, secondGeneration.GenerationID,
+		)
+	}
+
+	replayed, replayGeneration, created, err := create(
+		"save-work-1", "sha256:same", "同一篇正文",
+	)
+	if err != nil || created ||
+		replayed.RecordID != first.RecordID ||
+		replayGeneration.GenerationID != firstGeneration.GenerationID {
+		t.Fatalf(
+			"same command replay drift: created=%v work=%s generation=%s err=%v",
+			created, replayed.RecordID, replayGeneration.GenerationID, err,
+		)
+	}
+	if _, _, _, err := create(
+		"save-work-1", "sha256:changed", "改过的正文",
+	); !errors.Is(err, k12storage.ErrCurrentCommandConflict) {
+		t.Fatalf("same command with changed digest must conflict, got %v", err)
+	}
+
+	for table, want := range map[string]int{
+		"k12_creative_works":            2,
+		"k12_work_feedback_generations": 2,
+		"k12_current_create_receipts":   2,
+	} {
+		var got int
+		if err := db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("%s count=%d want=%d", table, got, want)
+		}
 	}
 }
 
