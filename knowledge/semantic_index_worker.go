@@ -54,6 +54,7 @@ type ingestPageCheckpointRepository interface {
 	SetIngestPageTotal(context.Context, JobLease, time.Time, string, int64) error
 	LoadIngestPageCheckpoints(context.Context, JobLease, time.Time, string, int64) ([]IngestPageCheckpoint, error)
 	SaveIngestPageCheckpoint(context.Context, JobLease, time.Time, IngestPageCheckpoint) error
+	SaveIngestSegmentPlan(context.Context, JobLease, time.Time, string, []IngestSegmentPlan) error
 }
 
 type workerIngestPageProgress struct {
@@ -76,6 +77,14 @@ func (p workerIngestPageProgress) LoadCompletedPages(
 
 func (p workerIngestPageProgress) CommitPage(ctx context.Context, page IngestPageCheckpoint) error {
 	return p.repository.SaveIngestPageCheckpoint(ctx, p.lease(), p.now(), page)
+}
+
+func (p workerIngestPageProgress) SaveSegmentPlan(
+	ctx context.Context,
+	digest string,
+	segments []IngestSegmentPlan,
+) error {
+	return p.repository.SaveIngestSegmentPlan(ctx, p.lease(), p.now(), digest, segments)
 }
 
 type SemanticIndexWorkerConfig struct {
@@ -185,7 +194,17 @@ func (w *SemanticIndexWorker) RunOnce(ctx context.Context) (bool, error) {
 	transitionCtx, cancelTransition := semanticWorkerTransitionContext(ctx)
 	defer cancelTransition()
 	if isPermanentSemanticWorkerError(err) || job.Attempt >= w.config.MaxAttempts {
-		if _, transitionErr := w.repository.FailJob(transitionCtx, lease, failureTime, message); transitionErr != nil {
+		var transitionErr error
+		if structuredRepository, ok := w.repository.(interface {
+			FailJobWithFailure(context.Context, JobLease, time.Time, KnowledgeJobFailure) (KnowledgeJob, error)
+		}); ok && errors.Is(err, ErrVisionModelRequired) {
+			_, transitionErr = structuredRepository.FailJobWithFailure(
+				transitionCtx, lease, failureTime, KnowledgeJobFailureFromError(err),
+			)
+		} else {
+			_, transitionErr = w.repository.FailJob(transitionCtx, lease, failureTime, message)
+		}
+		if transitionErr != nil {
 			if errors.Is(transitionErr, ErrJobFenced) {
 				return true, ErrJobFenced
 			}
@@ -392,9 +411,17 @@ func (w *SemanticIndexWorker) executeIngest(ctx context.Context, job KnowledgeJo
 	if !ok || w.ingestProcessor == nil || job.DocumentID == "" {
 		return fmt.Errorf("%w: ingest processor unavailable", ErrUnsupportedKnowledgeJob)
 	}
-	source, err := repository.GetIngestDocumentForCorpusUID(
-		ctx, job.OwnerID, job.CorpusUID, job.DocumentID,
-	)
+	var source PersistedIngestDocument
+	var err error
+	if jobRepository, ok := w.repository.(jobScopedDocumentIngestRepository); ok {
+		source, err = jobRepository.GetIngestDocumentForJob(
+			ctx, job.OwnerID, job.CorpusUID, job.DocumentID, job.JobID,
+		)
+	} else {
+		source, err = repository.GetIngestDocumentForCorpusUID(
+			ctx, job.OwnerID, job.CorpusUID, job.DocumentID,
+		)
+	}
 	if err != nil {
 		return err
 	}
@@ -432,6 +459,9 @@ func (w *SemanticIndexWorker) prepareIngestWithHeartbeat(
 	}
 	prepareCtx, cancelPrepare := context.WithCancel(ctx)
 	defer cancelPrepare()
+	if source.VisionRoute != nil {
+		prepareCtx = WithVisionRouteSnapshot(prepareCtx, *source.VisionRoute)
+	}
 
 	type leaseState struct {
 		sync.Mutex
@@ -520,6 +550,7 @@ func (w *SemanticIndexWorker) now() time.Time { return w.config.Now().UTC() }
 
 func isPermanentSemanticWorkerError(err error) bool {
 	return errors.Is(err, ErrUnsupportedKnowledgeJob) ||
+		errors.Is(err, ErrVisionModelRequired) ||
 		errors.Is(err, ErrEmbeddingBatchOutcomeUnknown) ||
 		errors.Is(err, ErrInvalidDocumentUpload) ||
 		errors.Is(err, ErrProfileUnavailable) ||

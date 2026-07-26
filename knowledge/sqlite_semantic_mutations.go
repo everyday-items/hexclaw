@@ -201,7 +201,23 @@ func (s *sqliteSemanticMutationScope) documentDeletedTx(
 		WHERE owner_id=? AND corpus_uid=? AND document_id=? AND lifecycle_state='active'`,
 		s.ownerID, state.corpusUID, documentID).Scan(&previousGeneration); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrSemanticIndexNotFound
+			var deleted int
+			var lifecycle string
+			tombstoneErr := tx.QueryRowContext(ctx, `SELECT d.deleted,b.lifecycle_state
+				FROM kb_documents d JOIN kb_semantic_document_bindings b
+				  ON b.document_id=d.id AND b.corpus_uid=d.corpus_uid
+				WHERE b.owner_id=? AND b.corpus_uid=? AND b.document_id=?`,
+				s.ownerID, state.corpusUID, documentID).Scan(&deleted, &lifecycle)
+			if errors.Is(tombstoneErr, sql.ErrNoRows) {
+				return ErrSemanticIndexNotFound
+			}
+			if tombstoneErr != nil {
+				return tombstoneErr
+			}
+			if deleted != 1 || lifecycle != "tombstoned" {
+				return ErrSemanticIndexNotFound
+			}
+			return queueDocumentGCTx(ctx, tx, s.ownerID, state.corpusUID, documentID, now)
 		}
 		return err
 	}

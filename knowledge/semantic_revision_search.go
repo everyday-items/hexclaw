@@ -159,6 +159,16 @@ func (s *SQLiteRevisionSemanticSearcher) HasActiveRevision(ctx context.Context) 
 	return true, nil
 }
 
+// ActiveRevisionID exposes only the control-plane identity needed to freeze a
+// multi-query read. It does not execute an embedding request.
+func (s *SQLiteRevisionSemanticSearcher) ActiveRevisionID(ctx context.Context) (string, bool, error) {
+	plan, active, err := s.loadActivePlan(ctx)
+	if err != nil || !active {
+		return "", active, err
+	}
+	return plan.revision, true, nil
+}
+
 func (s *SQLiteRevisionSemanticSearcher) Search(
 	ctx context.Context,
 	query string,
@@ -281,6 +291,7 @@ func (s *SQLiteRevisionSemanticSearcher) ftsTextSearch(
 		  ON b.document_id=d.id AND b.corpus_uid=?
 		WHERE kb_chunks_fts MATCH ? AND b.lifecycle_state='active' AND d.deleted=0`
 	args := []any{corpusUID, strings.Join(keywords, " OR ")}
+	query += " AND " + readyIngestSegmentVisibilitySQL("b", "c")
 	if clause != "" {
 		query += " AND " + clause
 		args = append(args, filterArgs...)
@@ -363,6 +374,8 @@ func (s *SQLiteRevisionSemanticSearcher) likeTextSearch(
 		args = append(args, "%"+sqliteutil.EscapeLike(keyword)+"%")
 	}
 	query.WriteString(")")
+	query.WriteString(" AND ")
+	query.WriteString(readyIngestSegmentVisibilitySQL("b", "c"))
 	if clause != "" {
 		query.WriteString(" AND ")
 		query.WriteString(clause)
@@ -451,6 +464,7 @@ func (s *SQLiteRevisionSemanticSearcher) searchActiveVectors(
 		WHERE v.corpus_uid=? AND v.revision_id=? AND v.profile_config_hash=?
 		  AND v.dimension=? AND rd.visible_at IS NOT NULL
 		  AND rd.vector_state='ready' AND b.lifecycle_state='active' AND d.deleted=0`
+	query += " AND " + readyIngestSegmentVisibilitySQL("b", "c")
 	args := []any{plan.corpusUID, plan.revision, plan.profile.ProfileConfigHash, plan.profile.Profile.Dimension}
 	if clause != "" {
 		query += " AND " + clause

@@ -15,6 +15,16 @@ type EmbeddingProfileResolver interface {
 	Catalog(ctx context.Context, ownerID, corpusID string) (EmbeddingProfileCatalog, error)
 }
 
+type VisionRouteSnapshotResolver interface {
+	FreezeDefaultVisionRoute(context.Context) (VisionRouteSnapshot, error)
+}
+
+type VisionRouteSnapshotResolverFunc func(context.Context) (VisionRouteSnapshot, error)
+
+func (f VisionRouteSnapshotResolverFunc) FreezeDefaultVisionRoute(ctx context.Context) (VisionRouteSnapshot, error) {
+	return f(ctx)
+}
+
 // SemanticIndexRepository owns all atomic policy, revision and job transitions.
 type SemanticIndexRepository interface {
 	GetPolicy(ctx context.Context, ownerID, corpusID string) (EmbeddingPolicyProjection, error)
@@ -37,6 +47,26 @@ type SemanticIndexService struct {
 	resolver   EmbeddingProfileResolver
 	ingestRepo DocumentIngestRepository
 	blobStore  *localIngestBlobStore
+	visionRouteResolver VisionRouteSnapshotResolver
+}
+
+func (s *SemanticIndexService) ConfigureVisionRouteResolver(resolver VisionRouteSnapshotResolver) {
+	s.visionRouteResolver = resolver
+}
+
+func (s *SemanticIndexService) freezeVisionRoute(ctx context.Context) (*VisionRouteSnapshot, error) {
+	if s.visionRouteResolver == nil {
+		return nil, nil
+	}
+	snapshot, err := s.visionRouteResolver.FreezeDefaultVisionRoute(ctx)
+	if err != nil {
+		return nil, err
+	}
+	snapshot = snapshot.Canonical()
+	if err := snapshot.Validate(); err != nil {
+		return nil, err
+	}
+	return &snapshot, nil
 }
 
 func NewSemanticIndexService(repository SemanticIndexRepository, resolver EmbeddingProfileResolver) *SemanticIndexService {
@@ -84,6 +114,11 @@ func (s *SemanticIndexService) CreateDocument(
 	if s.ingestRepo == nil || s.blobStore == nil {
 		return CreateDocumentResult{}, ErrDocumentIngestUnavailable
 	}
+	visionRoute, err := s.freezeVisionRoute(ctx)
+	if err != nil {
+		return CreateDocumentResult{}, err
+	}
+	input.VisionRoute = visionRoute
 	blob, release, err := s.blobStore.Persist(ctx, ownerID, corpusID, input)
 	if err != nil {
 		return CreateDocumentResult{}, err
@@ -120,6 +155,15 @@ func (s *SemanticIndexService) RetryDocument(
 ) (CreateDocumentResult, error) {
 	if s.ingestRepo == nil {
 		return CreateDocumentResult{}, ErrDocumentIngestUnavailable
+	}
+	visionRoute, err := s.freezeVisionRoute(ctx)
+	if err != nil {
+		return CreateDocumentResult{}, err
+	}
+	if repository, ok := s.ingestRepo.(visionRouteRetryRepository); ok {
+		return repository.RetryIngestDocumentWithVisionRoute(
+			ctx, ownerID, corpusID, documentID, idempotencyKey, visionRoute,
+		)
 	}
 	return s.ingestRepo.RetryIngestDocument(ctx, ownerID, corpusID, documentID, idempotencyKey)
 }

@@ -167,6 +167,9 @@ func (r *SQLiteSemanticIndexRepository) CreateIngestDocument(
 		nowMillis, nowMillis); err != nil {
 		return CreateDocumentResult{}, fmt.Errorf("knowledge: queue ingest job: %w", err)
 	}
+	if err := persistVisionRouteSnapshotTx(ctx, tx, jobID, input.VisionRoute, nowMillis); err != nil {
+		return CreateDocumentResult{}, err
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO kb_job_stage_checkpoints
 		(job_id,stage,input_fingerprint,artifact_ref,artifact_digest,state,lease_epoch,created_at,updated_at)
 		VALUES(?,'extracting',?,? ,?,'prepared',0,?,?)`, jobID,
@@ -195,6 +198,24 @@ func (r *SQLiteSemanticIndexRepository) RetryIngestDocument(
 	ctx context.Context,
 	ownerID, corpusID, documentID, idempotencyKey string,
 ) (CreateDocumentResult, error) {
+	return r.retryIngestDocument(ctx, ownerID, corpusID, documentID, idempotencyKey, nil)
+}
+
+func (r *SQLiteSemanticIndexRepository) RetryIngestDocumentWithVisionRoute(
+	ctx context.Context,
+	ownerID, corpusID, documentID, idempotencyKey string,
+	visionRoute *VisionRouteSnapshot,
+) (CreateDocumentResult, error) {
+	return r.retryIngestDocument(
+		ctx, ownerID, corpusID, documentID, idempotencyKey, visionRoute,
+	)
+}
+
+func (r *SQLiteSemanticIndexRepository) retryIngestDocument(
+	ctx context.Context,
+	ownerID, corpusID, documentID, idempotencyKey string,
+	visionRoute *VisionRouteSnapshot,
+) (CreateDocumentResult, error) {
 	if err := validateSemanticScope(ownerID, corpusID); err != nil {
 		return CreateDocumentResult{}, err
 	}
@@ -209,7 +230,9 @@ func (r *SQLiteSemanticIndexRepository) RetryIngestDocument(
 	var result CreateDocumentResult
 	err = sqliteutil.RetryOnBusy(ctx, func() error {
 		var attemptErr error
-		result, attemptErr = r.retryIngestDocumentOnce(ctx, ownerID, corpusID, documentID, storageKey)
+		result, attemptErr = r.retryIngestDocumentOnce(
+			ctx, ownerID, corpusID, documentID, storageKey, visionRoute,
+		)
 		return attemptErr
 	})
 	return result, err
@@ -218,6 +241,7 @@ func (r *SQLiteSemanticIndexRepository) RetryIngestDocument(
 func (r *SQLiteSemanticIndexRepository) retryIngestDocumentOnce(
 	ctx context.Context,
 	ownerID, corpusID, documentID, storageKey string,
+	visionRoute *VisionRouteSnapshot,
 ) (CreateDocumentResult, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -283,7 +307,7 @@ func (r *SQLiteSemanticIndexRepository) retryIngestDocumentOnce(
 	switch {
 	case TextIndexState(textState) == TextIndexFailed && documentStatus == "failed":
 		if err := queueFailedTextRetryTx(ctx, tx, ownerID, policy.corpusUID, documentID,
-			generation, storageKey, jobID, nowMillis); err != nil {
+			generation, storageKey, jobID, nowMillis, visionRoute); err != nil {
 			return CreateDocumentResult{}, err
 		}
 		vectorState, err := vectorStateForPolicyTx(ctx, tx, policy)
@@ -369,6 +393,7 @@ func queueFailedTextRetryTx(
 	generation int64,
 	storageKey, jobID string,
 	nowMillis int64,
+	visionRoute *VisionRouteSnapshot,
 ) error {
 	var failedRoots int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM kb_knowledge_jobs
@@ -428,6 +453,9 @@ func queueFailedTextRetryTx(
 		VALUES(?,'extracting',?,?,?,'prepared',0,?,?)`, jobID,
 		hashStrings(digest, extension, mediaType), "blob://"+digest, digest, nowMillis, nowMillis); err != nil {
 		return fmt.Errorf("knowledge: prepare ingest retry checkpoint: %w", err)
+	}
+	if err := persistVisionRouteSnapshotTx(ctx, tx, jobID, visionRoute, nowMillis); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1001,6 +1029,9 @@ func (r *SQLiteSemanticIndexRepository) SaveIngestPageCheckpoint(
 	if rows, _ := res.RowsAffected(); rows != 1 {
 		return ErrJobFenced
 	}
+	if err := refreshIngestSegmentStatesTx(ctx, tx, job.JobID, nowMillis); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -1113,6 +1144,11 @@ func (r *SQLiteSemanticIndexRepository) CompleteIngestDocument(
 			return fmt.Errorf("%w: incomplete durable page checkpoint set %d/%d",
 				ErrInvalidDocumentUpload, checkpointCount, prepared.PageCount)
 		}
+	}
+	if err := validateReadyIngestSegmentsTx(
+		ctx, tx, job.JobID, prepared.PageCount,
+	); err != nil {
+		return err
 	}
 	now = now.UTC()
 	nowMillis := now.UnixMilli()

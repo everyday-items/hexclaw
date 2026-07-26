@@ -1077,7 +1077,12 @@ func (r *SQLiteSemanticIndexRepository) GetJob(ctx context.Context, ownerID, job
 	if strings.TrimSpace(ownerID) == "" || strings.TrimSpace(jobID) == "" {
 		return KnowledgeJob{}, ErrSemanticIndexNotFound
 	}
-	return scanSemanticJob(r.db.QueryRowContext(ctx, semanticJobSelect+` WHERE owner_id=? AND job_id=?`, ownerID, jobID))
+	job, err := scanSemanticJob(r.db.QueryRowContext(ctx, semanticJobSelect+` WHERE owner_id=? AND job_id=?`, ownerID, jobID))
+	if err != nil {
+		return KnowledgeJob{}, err
+	}
+	job.Failure, err = r.loadJobFailure(ctx, job.JobID)
+	return job, err
 }
 
 func (r *SQLiteSemanticIndexRepository) GetJobForCorpus(
@@ -1086,11 +1091,16 @@ func (r *SQLiteSemanticIndexRepository) GetJobForCorpus(
 	if err := validateSemanticScope(ownerID, corpusID); err != nil || strings.TrimSpace(jobID) == "" {
 		return KnowledgeJob{}, ErrSemanticIndexNotFound
 	}
-	return scanSemanticJob(r.db.QueryRowContext(ctx, semanticJobSelect+`
+	job, err := scanSemanticJob(r.db.QueryRowContext(ctx, semanticJobSelect+`
 		WHERE owner_id=? AND corpus_uid=(
 			SELECT c.corpus_uid FROM kb_semantic_corpora c
 			WHERE c.owner_id=? AND c.corpus_alias=?
 		) AND job_id=?`, ownerID, ownerID, corpusID, jobID))
+	if err != nil {
+		return KnowledgeJob{}, err
+	}
+	job.Failure, err = r.loadJobFailure(ctx, job.JobID)
+	return job, err
 }
 
 func (r *SQLiteSemanticIndexRepository) getRevisionJob(
@@ -1549,6 +1559,28 @@ func (r *SQLiteSemanticIndexRepository) FailJob(
 	now time.Time,
 	lastError string,
 ) (KnowledgeJob, error) {
+	return r.failJob(ctx, lease, now, lastError, nil)
+}
+
+func (r *SQLiteSemanticIndexRepository) FailJobWithFailure(
+	ctx context.Context,
+	lease JobLease,
+	now time.Time,
+	failure KnowledgeJobFailure,
+) (KnowledgeJob, error) {
+	if err := failure.validate(); err != nil {
+		return KnowledgeJob{}, err
+	}
+	return r.failJob(ctx, lease, now, failure.Message, &failure)
+}
+
+func (r *SQLiteSemanticIndexRepository) failJob(
+	ctx context.Context,
+	lease JobLease,
+	now time.Time,
+	lastError string,
+	failure *KnowledgeJobFailure,
+) (KnowledgeJob, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return KnowledgeJob{}, err
@@ -1581,6 +1613,13 @@ func (r *SQLiteSemanticIndexRepository) FailJob(
 		return KnowledgeJob{}, err
 	}
 	if job.Kind == KnowledgeJobIngest && job.DocumentID != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE kb_ingest_segments
+			SET state='failed',last_error=?,updated_at=?
+			WHERE job_id=? AND state IN ('planned','processing')`,
+			lastError, nowMillis, job.JobID); err != nil &&
+			!strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return KnowledgeJob{}, err
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE kb_documents
 			SET status='failed',error_message=?,updated_at=?
 			WHERE id=? AND corpus_uid=? AND deleted=0 AND status='processing'`, lastError,
@@ -1631,6 +1670,20 @@ func (r *SQLiteSemanticIndexRepository) FailJob(
 			WHERE revision_id=? AND corpus_uid=? AND lease_epoch=?`,
 			nowMillis, job.TargetRevisionID, job.CorpusUID, lease.Epoch); err != nil {
 			return KnowledgeJob{}, err
+		}
+	}
+	if failure != nil {
+		affectedPages, err := json.Marshal(failure.AffectedPages)
+		if err != nil {
+			return KnowledgeJob{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO kb_job_failures
+			(job_id,code,message,affected_pages_json,provider_display_name,model,action_code,created_at)
+			VALUES(?,?,?,?,?,?,?,?)`, job.JobID, strings.TrimSpace(failure.Code),
+			strings.TrimSpace(failure.Message), string(affectedPages),
+			strings.TrimSpace(failure.ProviderDisplayName), strings.TrimSpace(failure.Model),
+			strings.TrimSpace(failure.ActionCode), nowMillis); err != nil {
+			return KnowledgeJob{}, fmt.Errorf("knowledge: persist structured job failure: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {

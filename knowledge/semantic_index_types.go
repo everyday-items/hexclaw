@@ -286,6 +286,7 @@ type KnowledgeJob struct {
 	LeaseExpiresAt     *time.Time        `json:"-"`
 	HeartbeatAt        *time.Time        `json:"-"`
 	LastError          string            `json:"last_error,omitempty"`
+	Failure            *KnowledgeJobFailure `json:"failure,omitempty"`
 	CreatedAt          time.Time         `json:"created_at"`
 	UpdatedAt          time.Time         `json:"updated_at"`
 }

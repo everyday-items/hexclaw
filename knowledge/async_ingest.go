@@ -50,6 +50,7 @@ type CreateDocumentInput struct {
 	LearnerID      string
 	Subject        string
 	Grade          string
+	VisionRoute    *VisionRouteSnapshot
 }
 
 type CreateDocumentResult struct {
@@ -67,6 +68,7 @@ type IngestBlob struct {
 }
 
 type PersistedIngestDocument struct {
+	JobID             string
 	DocumentID        string
 	OwnerID           string
 	CorpusUID         string
@@ -82,6 +84,7 @@ type PersistedIngestDocument struct {
 	LearnerID         string
 	Subject           string
 	Grade             string
+	VisionRoute       *VisionRouteSnapshot
 }
 
 type KnowledgeDocumentProjection struct {
@@ -170,6 +173,10 @@ type documentIngestWorkerRepository interface {
 	CompleteIngestDocument(context.Context, JobLease, time.Time, PreparedIngestDocument) error
 }
 
+type jobScopedDocumentIngestRepository interface {
+	GetIngestDocumentForJob(context.Context, string, string, string, string) (PersistedIngestDocument, error)
+}
+
 type DocumentIngestRepository interface {
 	CreateIngestDocument(context.Context, string, string, CreateDocumentInput, IngestBlob) (CreateDocumentResult, error)
 	RetryIngestDocument(context.Context, string, string, string, string) (CreateDocumentResult, error)
@@ -177,6 +184,12 @@ type DocumentIngestRepository interface {
 	GetIngestDocumentProjection(context.Context, string, string) (KnowledgeDocumentProjection, error)
 	ListIngestBlobPaths(context.Context) ([]string, error)
 	IsIngestBlobPathReferenced(context.Context, string) (bool, error)
+}
+
+type visionRouteRetryRepository interface {
+	RetryIngestDocumentWithVisionRoute(
+		context.Context, string, string, string, string, *VisionRouteSnapshot,
+	) (CreateDocumentResult, error)
 }
 
 type localIngestBlobStore struct {

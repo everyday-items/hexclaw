@@ -905,6 +905,22 @@ func (m *Manager) Query(ctx context.Context, query string, topK int) (string, er
 // 注入语义（BUG-20260703 B8）：本路径 fail-closed——仅语义相关度过地板（VectorScore >=
 // MinScore）的候选可进上下文，无强命中返回空串，让模型如实答"未找到"；绝不把仅
 // 通用词法重叠的弱相关文档（"公司/地址"这类分词命中）端给模型编答案。
+// ActiveSemanticRevision returns the immutable revision identity currently
+// used by semantic queries. Text-only and legacy searchers return active=false.
+func (m *Manager) ActiveSemanticRevision(ctx context.Context) (string, bool, error) {
+	if m == nil || m.revisionSearcher == nil {
+		return "", false, nil
+	}
+	type activeRevisionSnapshotter interface {
+		ActiveRevisionID(context.Context) (string, bool, error)
+	}
+	snapshotter, ok := m.revisionSearcher.(activeRevisionSnapshotter)
+	if !ok {
+		return "", false, nil
+	}
+	return snapshotter.ActiveRevisionID(ctx)
+}
+
 func (m *Manager) QueryWithFilter(ctx context.Context, query string, topK int, filter Filter) (string, error) {
 	selected, err := m.searchResultsMode(ctx, query, topK, filter, true)
 	if err != nil {
