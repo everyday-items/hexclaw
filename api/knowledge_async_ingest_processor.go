@@ -105,6 +105,11 @@ func (p *knowledgeDocumentIngestProcessor) prepare(
 			pageCount = int64(extracted.PageCount)
 		}
 	} else if strings.HasPrefix(strings.ToLower(source.MediaType), "image/") {
+		if snapshot, ok := knowledge.VisionRouteSnapshotFromContext(ctx); ok &&
+			!snapshot.HasCapability("vision") {
+			return knowledge.PreparedIngestDocument{},
+				knowledge.NewVisionModelRequiredError(snapshot, []int{1})
+		}
 		data, err := readAndVerifyBufferedIngestSource(ctx, source, maxAsyncImageSourceBytes)
 		if err != nil {
 			return knowledge.PreparedIngestDocument{}, err

@@ -105,3 +105,64 @@ func TestResolveK12GradingModelSnapshotAutoUsesStableDefaultProviderVisionModel(
 		t.Fatalf("automatic route=%+v, want stable default-provider vision-first", got)
 	}
 }
+
+func TestResolveK12PracticeModelSnapshotHonorsExplicitTextModel(t *testing.T) {
+	cfg := config.LLMConfig{
+		Default: "hexclaw-gpt",
+		Providers: map[string]config.LLMProviderConfig{
+			"hexclaw-gpt": {
+				Model:          "gpt-5.3-codex-spark",
+				Models:         []string{"gpt-5.3-codex-spark", "gpt-5.6-sol"},
+				ModelSpecsMode: config.LLMModelSpecsModeExplicit,
+				ModelSpecs: []config.LLMProviderModelSpec{
+					{ID: "gpt-5.3-codex-spark", Capabilities: []string{config.LLMModelCapabilityText}},
+					{ID: "gpt-5.6-sol", Capabilities: []string{config.LLMModelCapabilityText, config.LLMModelCapabilityVision}},
+				},
+			},
+		},
+	}
+	router := llmrouter.NewWithProviders(cfg, map[string]hexagon.Provider{
+		"hexclaw-gpt": mockllm.NewLLMProvider("hexclaw-gpt"),
+	})
+
+	got, err := resolveK12PracticeModelSnapshot(router, k12.GradingModelSnapshot{
+		Provider: "hexclaw-gpt",
+		Model:    "gpt-5.6-sol",
+	})
+	if err != nil {
+		t.Fatalf("resolve explicit practice snapshot: %v", err)
+	}
+	if got.Provider != "hexclaw-gpt" || got.Model != "gpt-5.6-sol" ||
+		got.Route != "hexclaw-gpt/gpt-5.6-sol" ||
+		got.Capability != config.LLMModelCapabilityText {
+		t.Fatalf("explicit practice route drifted: %+v", got)
+	}
+}
+
+func TestResolveK12PracticeModelSnapshotAutomaticUsesConfiguredDefaultModel(t *testing.T) {
+	cfg := config.LLMConfig{
+		Default: "hexclaw-gpt",
+		Providers: map[string]config.LLMProviderConfig{
+			"hexclaw-gpt": {
+				Model:          "gpt-5.6-sol",
+				Models:         []string{"gpt-5.3-codex-spark", "gpt-5.6-sol"},
+				ModelSpecsMode: config.LLMModelSpecsModeExplicit,
+				ModelSpecs: []config.LLMProviderModelSpec{
+					{ID: "gpt-5.3-codex-spark", Capabilities: []string{config.LLMModelCapabilityText}},
+					{ID: "gpt-5.6-sol", Capabilities: []string{config.LLMModelCapabilityText}},
+				},
+			},
+		},
+	}
+	router := llmrouter.NewWithProviders(cfg, map[string]hexagon.Provider{
+		"hexclaw-gpt": mockllm.NewLLMProvider("hexclaw-gpt"),
+	})
+
+	got, err := resolveK12PracticeModelSnapshot(router, k12.GradingModelSnapshot{})
+	if err != nil {
+		t.Fatalf("resolve automatic practice snapshot: %v", err)
+	}
+	if got.Provider != "hexclaw-gpt" || got.Model != "gpt-5.6-sol" {
+		t.Fatalf("automatic practice route=%+v, want configured gpt-5.6-sol", got)
+	}
+}

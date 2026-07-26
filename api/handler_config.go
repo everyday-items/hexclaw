@@ -32,6 +32,7 @@ type LLMConfigResponse struct {
 // LLMProviderConfigResponse 脱敏后的 Provider 配置
 type LLMProviderConfigResponse struct {
 	ProviderInstanceID    string                               `json:"provider_instance_id"`
+	DisplayName           string                               `json:"display_name,omitempty"`
 	APIKey                string                               `json:"api_key"`
 	BaseURL               string                               `json:"base_url"`
 	Model                 string                               `json:"model"`
@@ -63,6 +64,7 @@ type LLMConfigUpdateRequest struct {
 // LLMProviderConfigUpdateItem 更新请求中的 Provider 项
 type LLMProviderConfigUpdateItem struct {
 	ProviderInstanceID    string                              `json:"provider_instance_id,omitempty"`
+	DisplayName           string                              `json:"display_name,omitempty"`
 	APIKey                string                              `json:"api_key"`
 	BaseURL               string                              `json:"base_url"`
 	Model                 string                              `json:"model"`
@@ -311,6 +313,7 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 		modelSpecsMode, modelSpecs := config.NormalizeProviderModelSpecs(p)
 		providers[name] = LLMProviderConfigResponse{
 			ProviderInstanceID:    config.EffectiveProviderInstanceID(name, p),
+			DisplayName:           p.DisplayName,
 			APIKey:                config.MaskAPIKey(p.APIKey),
 			BaseURL:               p.BaseURL,
 			Model:                 p.Model,
@@ -416,6 +419,7 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 			modelSpecsMode, modelSpecs := resolveProviderModelSpecs(old, oldExists, p)
 			candidate := config.LLMProviderConfig{
 				ProviderInstanceID:    providerInstanceID,
+				DisplayName:           p.DisplayName,
 				APIKey:                apiKey,
 				BaseURL:               p.BaseURL,
 				Model:                 p.Model,

@@ -347,9 +347,37 @@ func validateProviderIPTarget(
 	access config.ProviderPrivateNetworkAccess,
 ) error {
 	if err := config.ValidateProviderResolvedEndpointAccess(logicalHost, ip, access); err != nil {
-		return fmt.Errorf("%w: %v", ErrProviderEndpointPolicy, err)
+		return &providerEndpointResolutionError{
+			logicalHost: normalizeProviderHost(logicalHost),
+			resolvedIP:  ip.String(),
+			cause:       err,
+		}
 	}
 	return nil
+}
+
+// providerEndpointResolutionError preserves non-secret DNS evidence for
+// diagnostics while keeping the established user-facing Error() text stable.
+type providerEndpointResolutionError struct {
+	logicalHost string
+	resolvedIP  string
+	cause       error
+}
+
+func (e *providerEndpointResolutionError) Error() string {
+	return fmt.Sprintf("%v: %v", ErrProviderEndpointPolicy, e.cause)
+}
+
+func (e *providerEndpointResolutionError) Unwrap() error {
+	return ErrProviderEndpointPolicy
+}
+
+func (e *providerEndpointResolutionError) ProviderEndpointLogicalHost() string {
+	return e.logicalHost
+}
+
+func (e *providerEndpointResolutionError) ProviderEndpointResolvedIP() string {
+	return e.resolvedIP
 }
 
 func lookupProviderCandidates(

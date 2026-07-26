@@ -1018,6 +1018,15 @@ func validateAgentTemperature(t *float64) error {
 	return nil
 }
 
+// validateAgentMetadataCapabilities applies the scenario-owned capability
+// guard before generic Agent state reaches the router or persistent store.
+func (s *Server) validateAgentMetadataCapabilities(metadata map[string]string) error {
+	if metadata == nil || s.agentMetadataGuard == nil {
+		return nil
+	}
+	return s.agentMetadataGuard(metadata)
+}
+
 func cloneLLMConfigSnapshot(source config.LLMConfig) config.LLMConfig {
 	clone := source
 	clone.Providers = make(map[string]config.LLMProviderConfig, len(source.Providers))
@@ -1153,6 +1162,10 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		Metadata:     req.Metadata,
 	}
 
+	if err := s.validateAgentMetadataCapabilities(cfg.Metadata); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	if err := s.validateAgentLLMConfig(&cfg); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -1228,6 +1241,10 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Metadata != nil {
 		cfg.Metadata = *req.Metadata
+	}
+	if err := s.validateAgentMetadataCapabilities(cfg.Metadata); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
 	}
 	// BUG-20260703 D3：LLM 配置校验只跟着真改动走——请求未碰（或原样回传）model/provider
 	// 时不重审存量值，否则 provider 失效后连 display_name/system_prompt 都被连坐锁死。

@@ -19,7 +19,7 @@ func TestK12ProductionLLMClosuresMarkEveryCompleteAsNonIdempotent(t *testing.T) 
 	}
 	required := map[string]bool{
 		"visionFn":                 false,
-		"retryGenFn":               false,
+		"practiceGenFn":            false,
 		"tutoringTipsReviewGenFn":  false,
 		"parentTeachingGuideGenFn": false,
 		"causeSummaryGenFn":        false,

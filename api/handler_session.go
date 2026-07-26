@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -701,6 +702,15 @@ func buildMessageRecord(sessionID string, req *appendMessageRequest) *storage.Me
 	if id == "" {
 		id = "msg-" + idgen.ShortID()
 	}
+	metadata := string(req.Metadata)
+	attachments := ""
+	if metadataContainsAttachments(req.Metadata) {
+		// Keep the complete metadata envelope in the dedicated attachments
+		// column. scanMessage restores this envelope on reads, preserving
+		// attachments together with sibling scenario metadata without the
+		// generic metadata column's 64 KiB clamp.
+		attachments = metadata
+	}
 	return &storage.MessageRecord{
 		ID:               id,
 		SessionID:        sessionID,
@@ -708,13 +718,28 @@ func buildMessageRecord(sessionID string, req *appendMessageRequest) *storage.Me
 		Role:             req.Role,
 		Content:          req.Content,
 		ContentType:      req.ContentType,
-		Metadata:         string(req.Metadata),
+		Metadata:         metadata,
+		Attachments:      attachments,
 		ModelName:        req.ModelName,
 		PromptTokens:     req.PromptTokens,
 		CompletionTokens: req.CompletionTokens,
 		FinishReason:     req.FinishReason,
 		RequestID:        req.RequestID,
 	}
+}
+
+func metadataContainsAttachments(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var envelope struct {
+		Attachments json.RawMessage `json:"attachments"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return false
+	}
+	value := bytes.TrimSpace(envelope.Attachments)
+	return len(value) > 0 && !bytes.Equal(value, []byte("null")) && !bytes.Equal(value, []byte("[]"))
 }
 
 // handleBatchAppendMessages POST /api/v1/sessions/{id}/messages/batch

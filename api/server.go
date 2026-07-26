@@ -80,35 +80,36 @@ type Server struct {
 	// cfgMu 串行化 s.cfg 的 read-copy-save-apply 写路径（GO-7/BUG-20260703）：
 	// 各配置写 handler 都做「整结构浅拷贝→落盘→回写」，无锁时既有同址读写
 	// 竞争（拷贝读 vs 字段写），也有 lost-update（旧副本落盘抹掉他人变更）。
-	cfgMu             sync.Mutex
-	engine            engine.Engine
-	gateway           gateway.Gateway
-	store             storage.Store                // 数据存储层
-	kb                *knowledge.Manager           // 知识库管理器（可选）
-	semanticIndex     SemanticIndexAPI             // corpus 级语义索引策略/持久 Job（可选）
-	webhookMgr        *webhook.Manager             // Webhook 管理器（可选）
-	scheduler         *cron.Scheduler              // Cron 调度器（可选）
-	promptStore       *library.PromptStore         // §11.8 Prompt 库（可选）
-	fileMem           *memory.FileMemory           // 文件记忆（可选）
-	vectorMem         *memory.VectorMemory         // 向量语义记忆（可选）
-	mcpMgr            *hexmcp.Manager              // MCP 管理器（可选）
-	mp                *marketplace.Marketplace     // 技能市场（可选）
-	skillHub          *hub.Hub                     // 在线技能市场（可选）
-	agentRouter       *router.Dispatcher           // 多 Agent 路由器（可选）
-	agentStore        router.Store                 // Agent/Rule 持久化（可选）
-	agentResources    AgentResourceCleaner         // Agent 归属资源删除 saga（可选）
-	instanceMgr       *instances.Manager           // 平台实例运行时（可选）
-	connectorStore    *connector.Store             // 数据连接器(GitHub/Notion 只读，token 加密)（可选）
-	canvasSvc         *canvas.Service              // Canvas/A2UI 服务（可选）
-	voiceSvc          *voice.Service               // 语音服务（可选）
-	voiceChatSvc      *voicechat.Service           // 语音对话服务（可选）
-	imagegenSvc       *imagegen.Service            // 图像生成服务（可选）
-	videogenSvc       *videogen.Service            // 视频生成服务（可选）
-	renderSvc         *render.Service              // 文档渲染服务（可选）
-	capabilities      *llmrouter.CapabilityService // A7 模型 tool_call 能力探测（可选）
-	genStore          *genstore.Store              // 生成内容持久化（图像/视频）
-	kbEmbedding       *KnowledgeEmbeddingInfo      // 知识库嵌入接线信息（BUG-20260712-B1，可选）
-	reloadGenServices func()                       // LLM 配置变更后重建 gen 服务（main.go 注入）
+	cfgMu              sync.Mutex
+	engine             engine.Engine
+	gateway            gateway.Gateway
+	store              storage.Store                 // 数据存储层
+	kb                 *knowledge.Manager            // 知识库管理器（可选）
+	semanticIndex      SemanticIndexAPI              // corpus 级语义索引策略/持久 Job（可选）
+	webhookMgr         *webhook.Manager              // Webhook 管理器（可选）
+	scheduler          *cron.Scheduler               // Cron 调度器（可选）
+	promptStore        *library.PromptStore          // §11.8 Prompt 库（可选）
+	fileMem            *memory.FileMemory            // 文件记忆（可选）
+	vectorMem          *memory.VectorMemory          // 向量语义记忆（可选）
+	mcpMgr             *hexmcp.Manager               // MCP 管理器（可选）
+	mp                 *marketplace.Marketplace      // 技能市场（可选）
+	skillHub           *hub.Hub                      // 在线技能市场（可选）
+	agentRouter        *router.Dispatcher            // 多 Agent 路由器（可选）
+	agentStore         router.Store                  // Agent/Rule 持久化（可选）
+	agentMetadataGuard func(map[string]string) error // 场景 metadata capability guard（可选）
+	agentResources     AgentResourceCleaner          // Agent 归属资源删除 saga（可选）
+	instanceMgr        *instances.Manager            // 平台实例运行时（可选）
+	connectorStore     *connector.Store              // 数据连接器(GitHub/Notion 只读，token 加密)（可选）
+	canvasSvc          *canvas.Service               // Canvas/A2UI 服务（可选）
+	voiceSvc           *voice.Service                // 语音服务（可选）
+	voiceChatSvc       *voicechat.Service            // 语音对话服务（可选）
+	imagegenSvc        *imagegen.Service             // 图像生成服务（可选）
+	videogenSvc        *videogen.Service             // 视频生成服务（可选）
+	renderSvc          *render.Service               // 文档渲染服务（可选）
+	capabilities       *llmrouter.CapabilityService  // A7 模型 tool_call 能力探测（可选）
+	genStore           *genstore.Store               // 生成内容持久化（图像/视频）
+	kbEmbedding        *KnowledgeEmbeddingInfo       // 知识库嵌入接线信息（BUG-20260712-B1，可选）
+	reloadGenServices  func()                        // LLM 配置变更后重建 gen 服务（main.go 注入）
 	// reloadSemanticRuntime builds and atomically installs the next embedding
 	// resolver/registry generation while draining the prior gate. The legacy
 	// invalidator remains for non-desktop callers and compatibility tests.
@@ -347,6 +348,12 @@ func (s *Server) handleListSubAgentRuns(w http.ResponseWriter, r *http.Request) 
 // SetAgentStore 设置 Agent/Rule 持久化层
 func (s *Server) SetAgentStore(store router.Store) {
 	s.agentStore = store
+}
+
+// SetAgentMetadataGuard injects scenario-owned validation without teaching the
+// platform API any scenario metadata keys or value semantics.
+func (s *Server) SetAgentMetadataGuard(guard func(map[string]string) error) {
+	s.agentMetadataGuard = guard
 }
 
 // SetAgentResourceCleaner wires the lifecycle boundary for Agent-owned

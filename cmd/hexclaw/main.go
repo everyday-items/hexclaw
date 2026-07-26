@@ -878,6 +878,38 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			// #6/#8 注入 LLM（复用 Agent 的 LLM router）：重排 + 查询扩展。
 			// router 为 nil 时不注入 → rerank/query-expand 自动降级关闭（安全）。
 			if router != nil {
+				if kbSemanticRuntime != nil {
+					kbSemanticRuntime.Service.ConfigureVisionRouteResolver(
+						knowledge.VisionRouteSnapshotResolverFunc(func(context.Context) (knowledge.VisionRouteSnapshot, error) {
+							providerName := router.DefaultName()
+							providerConfig, ok := router.ProviderConfig(providerName)
+							if !ok || strings.TrimSpace(providerConfig.Model) == "" {
+								return knowledge.VisionRouteSnapshot{}, fmt.Errorf(
+									"knowledge: configure a default LLM provider and model before document ingestion",
+								)
+							}
+							displayName := strings.TrimSpace(providerConfig.DisplayName)
+							if displayName == "" {
+								displayName = providerName
+							}
+							capabilities := []string{}
+							_, modelSpecs := config.NormalizeProviderModelSpecs(providerConfig)
+							for _, spec := range modelSpecs {
+								if spec.ID == providerConfig.Model {
+									capabilities = append(capabilities, spec.Capabilities...)
+									break
+								}
+							}
+							return knowledge.VisionRouteSnapshot{
+								ProviderInstanceID:  providerConfig.ProviderInstanceID,
+								ProviderName:        providerName,
+								ProviderDisplayName: displayName,
+								Model:               providerConfig.Model,
+								Capabilities:        capabilities,
+							}.Canonical(), nil
+						}),
+					)
+				}
 				// BUG-20260704：辅助 LLM 路由到本地单槽 provider 时跳过，避让前台主聊天（见 retrieval_llm.go）。
 				mgrOpts = append(mgrOpts, knowledge.WithLLM(newRetrievalRerankLLM(router)))
 				// 多模态入库：注入视觉转写器（router 的视觉模型给图片生成中文描述，再走文本 RAG 入库）。
@@ -885,15 +917,38 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				mgrOpts = append(mgrOpts, knowledge.WithCaptioner(knowledge.CaptionerFunc(
 					func(ctx context.Context, image []byte, mime string) (string, error) {
 						ctx = egress.WithRequest(ctx, egress.PurposeVisionOCR, "", egress.ClassSensitiveMedia)
-						provider, _, rErr := router.Route(ctx)
-						if rErr != nil {
-							return "", rErr
+						var provider hexagon.Provider
+						var model string
+						if snapshot, frozen := knowledge.VisionRouteSnapshotFromContext(ctx); frozen {
+							route, rErr := router.ResolveRouteForCapabilities(
+								snapshot.ProviderName, snapshot.Model, "text", "vision",
+							)
+							if rErr != nil {
+								return "", rErr
+							}
+							currentConfig, configured := router.ProviderConfig(route.ProviderName)
+							if !configured || currentConfig.ProviderInstanceID != snapshot.ProviderInstanceID {
+								return "", fmt.Errorf(
+									"knowledge: frozen vision provider %q is no longer configured",
+									snapshot.ProviderDisplayName,
+								)
+							}
+							provider, model = route.Provider, route.Model
+						} else {
+							var providerName string
+							var rErr error
+							provider, providerName, rErr = router.Route(ctx)
+							if rErr != nil {
+								return "", rErr
+							}
+							model = router.ProviderModel(providerName)
 						}
 						if mime == "" {
 							mime = "image/png"
 						}
 						dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
 						resp, cErr := provider.Complete(ctx, hexagon.CompletionRequest{
+							Model: model,
 							Messages: []hexagon.Message{{
 								Role: hexagon.RoleUser,
 								MultiContent: []llm.ContentPart{
@@ -1586,8 +1641,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 
 	eng.SetAgentRouter(agentRouter)
+	eng.SetAgentSystemPromptPolicy(newK12TutorIdentityPolicy(agentRouter, agentStore))
 	srv.SetAgentRouter(agentRouter)
 	srv.SetAgentStore(agentStore)
+	srv.SetAgentMetadataGuard(func(metadata map[string]string) error {
+		return k12.ValidateProfileGradeTerm(metadata[k12.MetaKeyGradeTerm])
+	})
 	if webhookMgr != nil {
 		webhookMgr.SetK12BindingAuthorizer(func(_ context.Context, _ string, agentID, learnerID string) error {
 			agent, ok := agentRouter.GetAgent(agentID)
@@ -1705,8 +1764,14 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 阶段产物落盘 dataDir/k12/grading-runs（崩溃恢复载体），异步推进用进程级 ctx。
 	var k12GradingOrch *k12usecase.GradingOrchestrator
 	var k12ImageTasks *k12usecase.ImageTaskCoordinator
+	var k12WorkFeedback *k12usecase.CreativeWorkFeedbackCoordinator
+	var k12PracticeGeneration *k12usecase.SinglePracticeGenerationCoordinator
+	var k12PracticeReturnRegrade *k12usecase.PracticeReturnRegradeCoordinator
 	k12GradingShutdown := false
 	k12ImageTasksShutdown := false
+	k12WorkFeedbackShutdown := false
+	k12PracticeGenerationShutdown := false
+	k12PracticeReturnRegradeShutdown := false
 	// This defer is the early-return safety net. It is registered after store.Close,
 	// so every path that assembled K12 seals and drains it before SQLite closes.
 	defer func() {
@@ -1715,6 +1780,21 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		if k12ImageTasks != nil && !k12ImageTasksShutdown {
 			if err := k12ImageTasks.Shutdown(drainCtx); err != nil {
 				logger.Warn("K12 图片任务退出兜底超时", "error", err)
+			}
+		}
+		if k12WorkFeedback != nil && !k12WorkFeedbackShutdown {
+			if err := k12WorkFeedback.Shutdown(drainCtx); err != nil {
+				logger.Warn("K12 作品点评任务退出兜底超时", "error", err)
+			}
+		}
+		if k12PracticeGeneration != nil && !k12PracticeGenerationShutdown {
+			if err := k12PracticeGeneration.Shutdown(drainCtx); err != nil {
+				logger.Warn("K12 逐题出题任务退出兜底超时", "error", err)
+			}
+		}
+		if k12PracticeReturnRegrade != nil && !k12PracticeReturnRegradeShutdown {
+			if err := k12PracticeReturnRegrade.Shutdown(drainCtx); err != nil {
+				logger.Warn("K12 练习回传自动复批退出兜底超时", "error", err)
 			}
 		}
 		if k12GradingOrch != nil && !k12GradingShutdown {
@@ -1830,17 +1910,25 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			k12Opts = append(k12Opts, k12assembly.WithRenderer(k12engineadapter.NewRenderAdapter(renderSvc)))
 		}
 
-		// BUG-20260712 治本²：「再练一道」轻量出题闭包——**裸 reasoning 模型 completion**，
-		// 不进 agent ReAct 循环（无 ~22 工具装载、无编排系统提示、无子 Agent 回执围栏）。
-		// 上一轮已从全对抗链降为单个 solver 子 Agent，但子 Agent 仍走完整 ReAct → 真机单次仍 40s；
-		// 本轮直接调 router.Default()（尊重用户为默认配的 reasoning 模型，与 RouteForVision 同策略，
-		// 不走 cost-aware 抓本地免费 provider）的 Complete，一次 prompt 直出「同知识点变式题+简答」，
-		// 云端 glm-4.5 实测 <10s。练习变式题非高风险批改：不 code_exec 验算 → adapter 侧 verdict=unverifiable，
-		// 绝不冒充「已程序验算」（信任红线）。egress 归 general_chat/general（只含学科/年级/知识点，非敏感档案）。
-		retryGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
-			provider := router.Default()
-			if provider == nil {
-				return "", fmt.Errorf("k12 再练一道: 没有可用的默认 LLM Provider")
+		// 单题练习生成只消费 usecase 已持久化的 provider/model 快照。它不读取
+		// router.Default()，因此设置页、会话框与后台执行不会因默认模型变化而漂移；
+		// ai-core 隐式重试也被关闭，由持久 invocation ledger 唯一决定能否重放。
+		practiceGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
+			snapshot, pinned := k12.GradingModelSnapshotFromContext(ctx)
+			if !pinned {
+				return "", fmt.Errorf("k12 逐题出题: 缺少冻结模型路由")
+			}
+			provider, found := router.Get(snapshot.Provider)
+			if !found || provider == nil {
+				return "", fmt.Errorf(
+					"k12 逐题出题: 冻结 provider %q 不可用，拒绝跨路由 fallback",
+					snapshot.Provider,
+				)
+			}
+			if err := k12.ValidateGradingModelRoute(
+				ctx, snapshot.Provider, snapshot.Model,
+			); err != nil {
+				return "", err
 			}
 			task := prompt
 			if subject != "" {
@@ -1850,11 +1938,19 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				task += "\n（只用" + grade + "学过的方法，给出题目与简要解答即可，无需反复验算。）"
 			}
 			// 只含教学任务本身（学科/年级/知识点），不含孩子敏感档案——归 general_chat/general，云端可出网。
-			cctx := egress.WithRequest(ctx, egress.PurposeGeneralChat, "k12-retry", egress.ClassGeneral)
-			cctx, ccancel := context.WithTimeout(cctx, 60*time.Second)
+			cctx := egress.WithRequest(
+				ctx, egress.PurposeGeneralChat, "k12-practice-generation",
+				egress.ClassGeneral,
+			)
+			timeout := 60 * time.Second
+			if snapshot.TimeoutMS > 0 {
+				timeout = time.Duration(snapshot.TimeoutMS) * time.Millisecond
+			}
+			cctx, ccancel := context.WithTimeout(cctx, timeout)
 			defer ccancel()
 			temp := 0.4
 			resp, err := provider.Complete(k12NonIdempotentLLMContext(cctx), hexagon.CompletionRequest{
+				Model: snapshot.Model,
 				Messages: []hexagon.Message{
 					{Role: hexagon.RoleSystem, Content: "你是中小学出题老师。据给定学科/年级/知识点直接出一道同类变式练习题并给简要解答，" +
 						"直接给最终题目与答案、不要展开长篇推理。输出必须严格使用 GitHub Markdown，固定为 `## 问题`、`## 解答`、`## 答案` 三段；" +
@@ -2103,7 +2199,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			return string(data), nil
 		}
 		k12Opts = append(k12Opts,
-			k12assembly.WithRetryGenerator(retryGenFn),
+			k12assembly.WithPracticeVariantGenerator(
+				k12engineadapter.NewPracticeVariantAdapter(practiceGenFn),
+			),
 			k12assembly.WithCauseSummaryGenerator(causeSummaryGenFn),
 			k12assembly.WithTutoringTipsReviewGenerator(tutoringTipsReviewGenFn),
 			k12assembly.WithParentTeachingGuideGenerator(parentTeachingGuideGenFn),
@@ -2154,10 +2252,22 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			k12ModelSnapshot := func(requested k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
 				return resolveK12GradingModelSnapshot(router, requested)
 			}
+			k12rt.Deps.PracticeGenerationRoute = func(
+				_ context.Context,
+				requested k12.GradingModelSnapshot,
+			) (k12.GradingModelSnapshot, error) {
+				return resolveK12PracticeModelSnapshot(router, requested)
+			}
 			k12GradingOrch = k12usecase.NewGradingOrchestrator(k12rt.Deps, k12ModelSnapshot,
 				k12usecase.WithGradingRunDir(filepath.Join(dataDir, "k12", "grading-runs")),
 				k12usecase.WithGradingBaseContext(ctx),
 			)
+			k12PracticeGeneration = &k12usecase.SinglePracticeGenerationCoordinator{
+				Deps: &k12rt.Deps, Records: k12rt.Records, BaseContext: ctx,
+			}
+			k12PracticeReturnRegrade = &k12usecase.PracticeReturnRegradeCoordinator{
+				Deps: &k12rt.Deps, Grading: k12GradingOrch, BaseContext: ctx,
+			}
 			k12rt.Deps.WorkFeedbackRoute = func(
 				_ context.Context, workType string,
 			) (k12.ImageTaskRouteSnapshot, error) {
@@ -2179,12 +2289,16 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					PromptVersion: promptVersion,
 				}, nil
 			}
+			k12WorkFeedback = &k12usecase.CreativeWorkFeedbackCoordinator{
+				Deps: &k12rt.Deps, Records: k12rt.Records, BaseContext: ctx,
+			}
 			imageTaskAdapter := k12engineadapter.NewImageTaskAdapter(visionFn)
 			k12ImageTasks = &k12usecase.ImageTaskCoordinator{
 				Records: k12rt.Records, Classifier: imageTaskAdapter,
 				WritingOCR: imageTaskAdapter, Grading: k12GradingOrch,
-				WorkFeedback: &k12rt.Deps,
-				BaseContext:  ctx,
+				WorkFeedback:          &k12rt.Deps,
+				BaseContext:           ctx,
+				GradingBudgetSnapshot: k12rt.Deps.GradingBudgetSnapshot,
 				ResolveGrade: func(
 					profileCtx context.Context,
 					agentName string,
@@ -2243,6 +2357,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				BaseURL:               k12Base,
 				Grading:               k12GradingOrch,
 				ImageTasks:            k12ImageTasks,
+				WorkFeedback:          k12WorkFeedback,
+				PracticeGeneration:    k12PracticeGeneration,
+				PracticeReturnRegrade: k12PracticeReturnRegrade,
 			}))
 			// 崩溃恢复扫描（§6.15/K12-INV-021）：启动即扫非终态 GradingJob——自动阶段从检查点
 			// 重新入列续跑，awaiting_confirmation 保持等待；不阻塞启动主线。
@@ -2257,10 +2374,25 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				} else if n > 0 {
 					logger.Info("K12 图片任务崩溃恢复扫描完成", "recovered", n)
 				}
+				if n, rerr := k12WorkFeedback.Recover(ctx, names); rerr != nil {
+					logger.Warn("K12 作品点评任务崩溃恢复扫描失败", "error", rerr)
+				} else if n > 0 {
+					logger.Info("K12 作品点评任务崩溃恢复扫描完成", "recovered", n)
+				}
+				if n, rerr := k12PracticeGeneration.Recover(ctx); rerr != nil {
+					logger.Warn("K12 逐题出题任务崩溃恢复扫描失败", "error", rerr)
+				} else if n > 0 {
+					logger.Info("K12 逐题出题任务崩溃恢复扫描完成", "recovered", n)
+				}
 				if n, rerr := k12GradingOrch.RecoverGradingJobs(ctx, names); rerr != nil {
 					logger.Warn("K12 批改任务崩溃恢复扫描失败", "error", rerr)
 				} else if n > 0 {
 					logger.Info("K12 批改任务崩溃恢复扫描完成", "recovered", n)
+				}
+				if n, rerr := k12PracticeReturnRegrade.Recover(ctx, names); rerr != nil {
+					logger.Warn("K12 练习回传自动复批恢复扫描失败", "error", rerr)
+				} else if n > 0 {
+					logger.Info("K12 练习回传自动复批恢复扫描完成", "recovered", n)
 				}
 			}()
 			// 清债 P5：engine 的 agent-mode 路由消费场景包 mode 特性（K12 领域词不再 engine 硬编码）。
@@ -2915,6 +3047,27 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			logger.Warn("K12 图片任务停止超时", "error", err)
 		} else {
 			k12ImageTasksShutdown = true
+		}
+	}
+	if k12WorkFeedback != nil {
+		if err := k12WorkFeedback.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("K12 作品点评任务停止超时", "error", err)
+		} else {
+			k12WorkFeedbackShutdown = true
+		}
+	}
+	if k12PracticeGeneration != nil {
+		if err := k12PracticeGeneration.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("K12 逐题出题任务停止超时", "error", err)
+		} else {
+			k12PracticeGenerationShutdown = true
+		}
+	}
+	if k12PracticeReturnRegrade != nil {
+		if err := k12PracticeReturnRegrade.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("K12 练习回传自动复批停止超时", "error", err)
+		} else {
+			k12PracticeReturnRegradeShutdown = true
 		}
 	}
 	if k12GradingOrch != nil {

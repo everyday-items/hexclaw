@@ -442,6 +442,30 @@ func extractPDFForAsyncIngestWithProgress(
 			}
 		}
 	}
+	pagePlans := make([]knowledge.IngestPagePlan, 0, len(result.Pages))
+	for _, page := range result.Pages {
+		mode := knowledge.IngestSegmentText
+		if page.Mode == "ocr_vlm" {
+			mode = knowledge.IngestSegmentVisual
+		}
+		pagePlans = append(pagePlans, knowledge.IngestPagePlan{
+			PageNumber: page.PageNumber,
+			Mode: mode,
+		})
+	}
+	segments, err := knowledge.PlanAdaptiveIngestSegments(pagePlans, limits.RenderBatchPages)
+	if err != nil {
+		return result, err
+	}
+	if segmentProgress, ok := progress.(knowledge.IngestSegmentProgress); ok {
+		if err := segmentProgress.SaveSegmentPlan(ctx, sourceDigest, segments); err != nil {
+			return result, err
+		}
+	}
+	if snapshot, ok := knowledge.VisionRouteSnapshotFromContext(ctx); ok &&
+		len(visualPages) > 0 && !snapshot.HasCapability("vision") {
+		return result, knowledge.NewVisionModelRequiredError(snapshot, visualPages)
+	}
 	if len(visualPages) > 0 && (kb == nil || !kb.HasCaptioner()) {
 		failed := make(map[int]string, len(visualPages))
 		for _, page := range visualPages {

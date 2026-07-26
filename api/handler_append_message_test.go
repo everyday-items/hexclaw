@@ -58,6 +58,53 @@ func TestAppendMessage_Success(t *testing.T) {
 	}
 }
 
+func TestBUG20260726001_AppendMessagePreservesLargeAttachmentMetadata(t *testing.T) {
+	srv, sid := newAppendTestServer(t, "test")
+	imageData := "data:image/png;base64," + strings.Repeat("A", 70*1024)
+	body, err := json.Marshal(map[string]any{
+		"id":      "msg-large-attachment",
+		"role":    "user",
+		"content": "",
+		"metadata": map[string]any{
+			"attachments": []map[string]string{{
+				"type": "image",
+				"name": "k12-test.png",
+				"mime": "image/png",
+				"data": imageData,
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/api/v1/sessions/"+sid+"/messages?user_id=test", strings.NewReader(string(body)))
+	req.SetPathValue("id", sid)
+	w := httptest.NewRecorder()
+	srv.handleAppendMessage(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("want 201, got %d: %s", w.Code, w.Body.String())
+	}
+	msg, err := srv.store.GetMessage(context.Background(), "msg-large-attachment")
+	if err != nil {
+		t.Fatalf("message not in DB: %v", err)
+	}
+	var metadata struct {
+		Attachments []struct {
+			Data string `json:"data"`
+		} `json:"attachments"`
+	}
+	if err := json.Unmarshal([]byte(msg.Metadata), &metadata); err != nil {
+		t.Fatalf("persisted attachment metadata must remain valid JSON: %v", err)
+	}
+	if len(metadata.Attachments) != 1 {
+		t.Fatalf("attachments=%d want 1", len(metadata.Attachments))
+	}
+	if metadata.Attachments[0].Data != imageData {
+		t.Fatalf("attachment data length=%d want %d", len(metadata.Attachments[0].Data), len(imageData))
+	}
+}
+
 func TestAppendMessage_GeneratesIDIfMissing(t *testing.T) {
 	srv, sid := newAppendTestServer(t, "test")
 	body := `{"role":"user","content":"auto-id"}`

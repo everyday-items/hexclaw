@@ -82,6 +82,60 @@ func TestProviderHTTPClientPrevalidatesEveryDNSCandidateBeforeDial(t *testing.T)
 	}
 }
 
+func TestProviderHTTPClientPreservesLogicalHostAndResolvedIPForFakeIPDiagnosis(t *testing.T) {
+	type resolutionEvidence interface {
+		ProviderEndpointLogicalHost() string
+		ProviderEndpointResolvedIP() string
+	}
+	tests := []struct {
+		name string
+		ip   string
+	}{
+		{name: "benchmark IPv4", ip: "198.18.0.115"},
+		{name: "ULA IPv6", ip: "fdfe:dcba:9876::40"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dialCalls atomic.Int64
+			const logicalHost = "open.bigmodel.cn"
+			client, err := newProviderHTTPClient(
+				"https://"+logicalHost+"/v1",
+				config.ProviderPrivateNetworkAccess{},
+				func(context.Context, string) ([]net.IPAddr, error) {
+					return []net.IPAddr{{IP: net.ParseIP(tt.ip)}}, nil
+				},
+				func(context.Context, string, string) (net.Conn, error) {
+					dialCalls.Add(1)
+					return nil, errors.New("unexpected dial")
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, requestErr := client.Get("https://" + logicalHost + "/v1/models")
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			if !errors.Is(requestErr, ErrProviderEndpointPolicy) {
+				t.Fatalf("request error = %v, want ErrProviderEndpointPolicy", requestErr)
+			}
+			if dialCalls.Load() != 0 {
+				t.Fatalf("blocked fake-IP candidate opened %d TCP connections", dialCalls.Load())
+			}
+			var evidence resolutionEvidence
+			if !errors.As(requestErr, &evidence) {
+				t.Fatalf("error %T does not expose structured resolution evidence", requestErr)
+			}
+			if got := evidence.ProviderEndpointLogicalHost(); got != logicalHost {
+				t.Fatalf("logical host = %q, want %q", got, logicalHost)
+			}
+			if got := evidence.ProviderEndpointResolvedIP(); got != tt.ip {
+				t.Fatalf("resolved IP = %q, want %q", got, tt.ip)
+			}
+		})
+	}
+}
+
 func TestProviderHTTPClientDoesNotTreatPrivateHTTPAuthorizationAsPublicPlaintextOptIn(t *testing.T) {
 	var dialCalls atomic.Int64
 	client, err := newProviderHTTPClient(
