@@ -199,14 +199,15 @@ func (practiceSetMapper) syncChildren(ctx context.Context, ex dbExecer, recordID
              question_markdown, expected_answer_markdown, verification_status,
              verification_evidence, blocked_reason, paper_seq, returned, practice_problem_id, result_correct,
              result_evidence,
-             generation_job_id, variant_index, requested_difficulty, actual_difficulty)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             generation_job_id, variant_index, requested_difficulty, actual_difficulty,
+             normalized_content_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			recordID, i, it.ItemID, it.SourceProblemID, it.SourceMistakeSummary,
 			it.Subject, it.AddedVia, it.GenerationStatus,
 			it.QuestionMarkdown, it.ExpectedAnswerMarkdown, it.VerificationStatus,
 			it.VerificationEvidence, it.BlockedReason, it.PaperSeq, boolInt(it.Returned),
 			it.PracticeProblemID, rc, it.ResultEvidence, it.GenerationJobID, it.VariantIndex,
-			it.RequestedDifficulty, it.ActualDifficulty); err != nil {
+			it.RequestedDifficulty, it.ActualDifficulty, it.NormalizedContentHash); err != nil {
 			return fmt.Errorf("k12storage: 写练习项 #%d: %w", i, err)
 		}
 	}
@@ -279,7 +280,8 @@ func (practiceSetMapper) attachChildren(ctx context.Context, q dbQueryer, record
         subject, added_via, generation_status,
         question_markdown, expected_answer_markdown, verification_status, verification_evidence,
         blocked_reason, paper_seq, returned, practice_problem_id, result_correct, result_evidence,
-        generation_job_id, variant_index, requested_difficulty, actual_difficulty
+        generation_job_id, variant_index, requested_difficulty, actual_difficulty,
+        normalized_content_hash
         FROM k12_practice_set_items WHERE set_record_id = ? ORDER BY item_index`, recordID)
 	if err != nil {
 		return "", fmt.Errorf("k12storage: 读练习项: %w", err)
@@ -294,7 +296,7 @@ func (practiceSetMapper) attachChildren(ctx context.Context, q dbQueryer, record
 			&it.QuestionMarkdown, &it.ExpectedAnswerMarkdown, &it.VerificationStatus,
 			&it.VerificationEvidence, &it.BlockedReason, &it.PaperSeq, &returned,
 			&it.PracticeProblemID, &rc, &it.ResultEvidence, &it.GenerationJobID, &it.VariantIndex,
-			&it.RequestedDifficulty, &it.ActualDifficulty); err != nil {
+			&it.RequestedDifficulty, &it.ActualDifficulty, &it.NormalizedContentHash); err != nil {
 			rows.Close()
 			return "", fmt.Errorf("k12storage: 扫描练习项: %w", err)
 		}

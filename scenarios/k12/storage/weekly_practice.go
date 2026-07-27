@@ -14,16 +14,17 @@ import (
 )
 
 type ProfileBundleMutation struct {
-	AgentName               string
-	IdempotencyKey          string
-	RequestDigest           string
-	ExpectedProfileRevision int
+	AgentName                string
+	IdempotencyKey           string
+	RequestDigest            string
+	ExpectedProfileRevision  int
 	ExpectedProgressRevision int
 	ExpectedSettingsRevision int
-	Profile                 k12.ChildProfile
-	Progress                k12.CurriculumProgress
-	Settings                k12.WeeklyPracticeSettings
-	At                      int64
+	AgentConfig              *k12.ProfileBundleAgentConfig
+	Profile                  k12.ChildProfile
+	Progress                 k12.CurriculumProgress
+	Settings                 k12.WeeklyPracticeSettings
+	At                       int64
 }
 
 func (s *Store) GetProfileState(ctx context.Context, agentName string) (k12.WeeklyProfile, error) {
@@ -47,7 +48,7 @@ func (s *Store) GetProfileState(ctx context.Context, agentName string) (k12.Week
 	return k12.WeeklyProfile{
 		ChildName: p.ChildName, GradeTerm: p.GradeTerm,
 		SubjectTextbooks: p.SubjectTextbooks,
-		TextbookEdition: p.TextbookEdition, Revision: revision,
+		TextbookEdition:  p.TextbookEdition, Revision: revision,
 	}, nil
 }
 
@@ -100,7 +101,7 @@ func (s *Store) GetCurriculumProgress(ctx context.Context, agentName, subject st
 }
 
 const curriculumProgressSelect = `SELECT progress_id,agent_name,subject,revision,
-    textbook_binding_id,textbook_edition,textbook_version,title,volume,
+    textbook_binding_id,textbook_manifest_id,textbook_edition,textbook_version,title,volume,
     unit_id,unit_title,lesson_id,lesson_title,requested_page_from,requested_page_to,
     verified_page_from,verified_page_to,page_verification_status,segment_refs_json,
     evidence_source,confirmed_at,created_at,updated_at FROM k12_curriculum_progress`
@@ -111,7 +112,8 @@ func scanCurriculumProgress(row rowScanner) (k12.CurriculumProgress, error) {
 	var refsJSON string
 	err := row.Scan(
 		&p.ProgressID, &p.AgentName, &p.Subject, &p.Revision,
-		&p.TextbookBindingID, &p.TextbookEdition, &p.TextbookVersion, &p.Title, &p.Volume,
+		&p.TextbookBindingID, &p.TextbookManifestID, &p.TextbookEdition,
+		&p.TextbookVersion, &p.Title, &p.Volume,
 		&p.UnitID, &p.UnitTitle, &p.LessonID, &p.LessonTitle,
 		&requestedFrom, &requestedTo, &verifiedFrom, &verifiedTo,
 		&p.PageVerificationStatus, &refsJSON, &p.EvidenceSource,
@@ -153,10 +155,10 @@ func (s *Store) GetWeeklyPracticeSettings(ctx context.Context, agentName string)
 	var due, textbook, arithmetic int
 	err := s.db.QueryRowContext(ctx, `SELECT agent_name,revision,timezone,
         due_review_enabled,textbook_consolidation_enabled,arithmetic_warmup_enabled,
-        arithmetic_minutes,created_at,updated_at
+        textbook_consolidation_tier,arithmetic_minutes,created_at,updated_at
         FROM k12_weekly_practice_settings WHERE agent_name=?`, agentName).Scan(
 		&out.AgentName, &out.Revision, &out.Timezone, &due, &textbook, &arithmetic,
-		&out.ArithmeticMinutes, &out.CreatedAt, &out.UpdatedAt,
+		&out.TextbookConsolidationTier, &out.ArithmeticMinutes, &out.CreatedAt, &out.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return k12.DefaultWeeklyPracticeSettings(agentName), nil
@@ -229,6 +231,15 @@ func (s *Store) UpdateProfileBundle(ctx context.Context, in ProfileBundleMutatio
 		settingsRevision != in.ExpectedSettingsRevision {
 		return k12.ProfileBundleResult{}, false, records.ErrVersionConflict
 	}
+	if strings.TrimSpace(in.Progress.TextbookManifestID) != "" {
+		bindingID, bindErr := activateTextbookBindingTx(
+			ctx, tx, in.AgentName, in.Profile, in.Progress, in.At,
+		)
+		if bindErr != nil {
+			return k12.ProfileBundleResult{}, false, bindErr
+		}
+		in.Progress.TextbookBindingID = bindingID
+	}
 
 	var meta map[string]string
 	if err := json.Unmarshal([]byte(metadata), &meta); err != nil {
@@ -239,9 +250,24 @@ func (s *Store) UpdateProfileBundle(ctx context.Context, in ProfileBundleMutatio
 	if err != nil {
 		return k12.ProfileBundleResult{}, false, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE agents SET metadata=?,updated_at=? WHERE name=?`,
-		string(metadataBytes), in.At, in.AgentName); err != nil {
-		return k12.ProfileBundleResult{}, false, err
+	if in.AgentConfig != nil {
+		skillsJSON, marshalErr := json.Marshal(in.AgentConfig.Skills)
+		if marshalErr != nil {
+			return k12.ProfileBundleResult{}, false, marshalErr
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE agents
+		    SET display_name=?,description=?,system_prompt=?,provider=?,model=?,skills=?,
+		        metadata=?,updated_at=? WHERE name=?`,
+			in.AgentConfig.DisplayName, in.AgentConfig.Description,
+			in.AgentConfig.SystemPrompt, in.AgentConfig.Provider, in.AgentConfig.Model,
+			string(skillsJSON), string(metadataBytes), in.At, in.AgentName); err != nil {
+			return k12.ProfileBundleResult{}, false, err
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `UPDATE agents SET metadata=?,updated_at=? WHERE name=?`,
+			string(metadataBytes), in.At, in.AgentName); err != nil {
+			return k12.ProfileBundleResult{}, false, err
+		}
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT revision FROM k12_profile_revisions WHERE agent_name=?`,
 		in.AgentName).Scan(&profileRevision); err != nil {
@@ -269,10 +295,11 @@ func (s *Store) UpdateProfileBundle(ctx context.Context, in ProfileBundleMutatio
 	}
 
 	result := k12.ProfileBundleResult{
+		AgentConfig: in.AgentConfig,
 		Profile: k12.ProfileBundleProfile{
 			ChildName: in.Profile.ChildName, GradeTerm: in.Profile.GradeTerm,
 			SubjectTextbooks: in.Profile.SubjectTextbooks,
-			TextbookEdition: in.Profile.SubjectTextbooks.Math,
+			TextbookEdition:  in.Profile.SubjectTextbooks.Math,
 		},
 		CurriculumProgress: in.Progress, WeeklyPracticeSettings: in.Settings,
 	}
@@ -304,14 +331,15 @@ func revisionVia(ctx context.Context, tx *sql.Tx, query string, args ...any) (in
 func upsertCurriculumProgress(ctx context.Context, tx *sql.Tx, p k12.CurriculumProgress) error {
 	refs, _ := json.Marshal(p.SegmentRefs)
 	_, err := tx.ExecContext(ctx, `INSERT INTO k12_curriculum_progress
-        (progress_id,agent_name,subject,revision,textbook_binding_id,textbook_edition,
+        (progress_id,agent_name,subject,revision,textbook_binding_id,textbook_manifest_id,textbook_edition,
          textbook_version,title,volume,unit_id,unit_title,lesson_id,lesson_title,
          requested_page_from,requested_page_to,verified_page_from,verified_page_to,
          page_verification_status,segment_refs_json,evidence_source,confirmed_at,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(agent_name,subject) DO UPDATE SET
          progress_id=excluded.progress_id,revision=excluded.revision,
          textbook_binding_id=excluded.textbook_binding_id,
+         textbook_manifest_id=excluded.textbook_manifest_id,
          textbook_edition=excluded.textbook_edition,textbook_version=excluded.textbook_version,
          title=excluded.title,volume=excluded.volume,unit_id=excluded.unit_id,
          unit_title=excluded.unit_title,lesson_id=excluded.lesson_id,
@@ -322,6 +350,7 @@ func upsertCurriculumProgress(ctx context.Context, tx *sql.Tx, p k12.CurriculumP
          segment_refs_json=excluded.segment_refs_json,evidence_source=excluded.evidence_source,
          confirmed_at=excluded.confirmed_at,updated_at=excluded.updated_at`,
 		p.ProgressID, p.AgentName, p.Subject, p.Revision, p.TextbookBindingID,
+		p.TextbookManifestID,
 		p.TextbookEdition, p.TextbookVersion, p.Title, p.Volume, p.UnitID, p.UnitTitle,
 		p.LessonID, p.LessonTitle, p.RequestedPageFrom, p.RequestedPageTo,
 		p.VerifiedPageFrom, p.VerifiedPageTo, p.PageVerificationStatus, string(refs),
@@ -332,15 +361,17 @@ func upsertCurriculumProgress(ctx context.Context, tx *sql.Tx, p k12.CurriculumP
 func upsertWeeklySettings(ctx context.Context, tx *sql.Tx, v k12.WeeklyPracticeSettings) error {
 	_, err := tx.ExecContext(ctx, `INSERT INTO k12_weekly_practice_settings
         (agent_name,revision,timezone,due_review_enabled,textbook_consolidation_enabled,
-         arithmetic_warmup_enabled,arithmetic_minutes,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?)
+         arithmetic_warmup_enabled,textbook_consolidation_tier,arithmetic_minutes,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(agent_name) DO UPDATE SET revision=excluded.revision,
          timezone=excluded.timezone,due_review_enabled=excluded.due_review_enabled,
          textbook_consolidation_enabled=excluded.textbook_consolidation_enabled,
          arithmetic_warmup_enabled=excluded.arithmetic_warmup_enabled,
+         textbook_consolidation_tier=excluded.textbook_consolidation_tier,
          arithmetic_minutes=excluded.arithmetic_minutes,updated_at=excluded.updated_at`,
 		v.AgentName, v.Revision, v.Timezone, 1, boolInt(v.TextbookConsolidationEnabled),
-		boolInt(v.ArithmeticWarmupEnabled), v.ArithmeticMinutes, v.CreatedAt, v.UpdatedAt)
+		boolInt(v.ArithmeticWarmupEnabled), v.TextbookConsolidationTier,
+		v.ArithmeticMinutes, v.CreatedAt, v.UpdatedAt)
 	return err
 }
 
@@ -554,11 +585,49 @@ func getWeeklyPlanVia(ctx context.Context, q weeklyPlanQuerier, agentName, where
 	_ = json.Unmarshal([]byte(keysJSON), &plan.AnswerKeys)
 	plan.Status, plan.Revision, plan.SourceDigest = status, revision, digest
 	plan.CreatedAt, plan.UpdatedAt = createdAt, updatedAt
+	for trackIndex := range plan.Tracks {
+		items := plan.Tracks[trackIndex].Items
+		projected := make([]k12.WeeklyPracticeItem, 0, len(items))
+		for _, item := range items {
+			review, reviewErr := getMistakeReviewStateVia(
+				ctx, q, agentName, item.SourceRef,
+			)
+			if reviewErr != nil && !errors.Is(reviewErr, records.ErrNotFound) {
+				return k12.WeeklyPracticePlan{}, reviewErr
+			}
+			if reviewErr == nil {
+				if review.State == k12.MistakeReviewSuppressed ||
+					review.State == k12.MistakeReviewMastered ||
+					(review.State == k12.MistakeReviewDeferredThisWeek &&
+						review.DeferredISOYear == plan.ISOWeekYear &&
+						review.DeferredISOWeek == plan.ISOWeekNumber) {
+					continue
+				}
+			}
+			projected = append(projected, item)
+		}
+		plan.Tracks[trackIndex].Items = projected
+	}
 	return plan, nil
 }
 
 func (s *Store) GetWeeklyPracticePlan(ctx context.Context, agentName, planID string) (k12.WeeklyPracticePlan, error) {
 	return getWeeklyPlanVia(ctx, s.db, strings.TrimSpace(agentName), `plan_id=?`, strings.TrimSpace(planID))
+}
+
+func (s *Store) ResolveWeeklyPracticePlanAgent(ctx context.Context, planID string) (string, error) {
+	planID = strings.TrimSpace(planID)
+	if planID == "" {
+		return "", records.ErrInvalidFields
+	}
+	var agentName string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT agent_name FROM k12_weekly_practice_plans WHERE plan_id=?`, planID,
+	).Scan(&agentName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", records.ErrNotFound
+	}
+	return agentName, err
 }
 
 func (s *Store) GetWeeklyPracticePlanForWeek(ctx context.Context, agentName string,
@@ -615,6 +684,7 @@ func (s *Store) FreezeWeeklyPracticeOutput(ctx context.Context,
 	render k12.PrintArtifactRender) (storedSnapshot k12.WeeklyPracticeSnapshot,
 	storedArtifact k12.PrintArtifact, storedRender k12.PrintArtifactRender,
 	replay bool, err error) {
+	snapshot.ArtifactID = artifact.ArtifactID
 	if strings.TrimSpace(snapshot.SnapshotID) == "" ||
 		strings.TrimSpace(snapshot.PlanID) == "" || snapshot.PlanRevision < 1 ||
 		strings.TrimSpace(snapshot.AgentName) == "" ||
@@ -757,10 +827,14 @@ func (s *Store) FreezeWeeklyPracticeOutput(ctx context.Context,
 func getWeeklySnapshotVia(ctx context.Context, q weeklyPlanQuerier, agentName, where string,
 	args ...any) (k12.WeeklyPracticeSnapshot, error) {
 	all := append([]any{agentName}, args...)
-	var snapshotJSON, keysJSON string
-	err := q.QueryRowContext(ctx, `SELECT snapshot_json,answer_keys_json
-        FROM k12_weekly_practice_snapshots WHERE agent_name=? AND `+where, all...).Scan(
-		&snapshotJSON, &keysJSON)
+	var snapshotJSON, keysJSON, artifactID string
+	err := q.QueryRowContext(ctx, `SELECT s.snapshot_json,s.answer_keys_json,
+        COALESCE((SELECT a.artifact_id FROM k12_print_artifacts a
+          WHERE a.agent_name=s.agent_name
+            AND a.source_kind='weekly_practice_snapshot'
+            AND a.source_ref=s.snapshot_id LIMIT 1),'')
+        FROM k12_weekly_practice_snapshots s WHERE s.agent_name=? AND `+where, all...).Scan(
+		&snapshotJSON, &keysJSON, &artifactID)
 	if err == sql.ErrNoRows {
 		return k12.WeeklyPracticeSnapshot{}, records.ErrNotFound
 	}
@@ -772,6 +846,7 @@ func getWeeklySnapshotVia(ctx context.Context, q weeklyPlanQuerier, agentName, w
 		return k12.WeeklyPracticeSnapshot{}, err
 	}
 	_ = json.Unmarshal([]byte(keysJSON), &snapshot.AnswerKeys)
+	snapshot.ArtifactID = artifactID
 	return snapshot, nil
 }
 
@@ -795,10 +870,28 @@ func (s *Store) ListWeeklyPracticeHistory(ctx context.Context, agentName, cursor
 		}
 		offset = n
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT s.snapshot_json,p.updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT s.snapshot_json,p.updated_at,artifact.artifact_id,
+        COALESCE(SUM(CASE WHEN json_extract(a.attempt_json,'$.result')='correct' THEN 1 ELSE 0 END),0),
+        COALESCE(SUM(CASE WHEN json_extract(a.attempt_json,'$.result')='wrong' THEN 1 ELSE 0 END),0),
+        COALESCE(SUM(CASE WHEN json_extract(a.attempt_json,'$.result')='needs_review' THEN 1 ELSE 0 END),0)
         FROM k12_weekly_practice_snapshots s
         JOIN k12_weekly_practice_plans p ON p.plan_id=s.plan_id
+        JOIN k12_print_artifacts artifact
+          ON artifact.agent_name=s.agent_name
+         AND artifact.source_kind='weekly_practice_snapshot'
+         AND artifact.source_ref=s.snapshot_id
+        LEFT JOIN (
+          SELECT attempt_id,agent_name,snapshot_id,item_id,attempt_json FROM (
+            SELECT attempt_id,agent_name,snapshot_id,item_id,attempt_json,
+              ROW_NUMBER() OVER (
+                PARTITION BY agent_name,snapshot_id,item_id
+                ORDER BY updated_at DESC,attempt_id DESC
+              ) AS latest_rank
+            FROM k12_weekly_practice_attempts
+          ) latest WHERE latest_rank=1
+        ) a ON a.snapshot_id=s.snapshot_id AND a.agent_name=s.agent_name
         WHERE s.agent_name=? AND p.status='archived'
+        GROUP BY s.snapshot_id,s.snapshot_json,p.updated_at,artifact.artifact_id
         ORDER BY p.updated_at DESC,s.snapshot_id DESC LIMIT ? OFFSET ?`,
 		strings.TrimSpace(agentName), limit+1, offset)
 	if err != nil {
@@ -807,9 +900,11 @@ func (s *Store) ListWeeklyPracticeHistory(ctx context.Context, agentName, cursor
 	defer rows.Close()
 	out := make([]k12.WeeklyPracticeHistorySummary, 0, limit)
 	for rows.Next() {
-		var snapshotJSON string
+		var snapshotJSON, artifactID string
 		var archivedAt int64
-		if err := rows.Scan(&snapshotJSON, &archivedAt); err != nil {
+		var correctCount, wrongCount, needsReviewCount int
+		if err := rows.Scan(&snapshotJSON, &archivedAt, &artifactID,
+			&correctCount, &wrongCount, &needsReviewCount); err != nil {
 			return nil, nil, err
 		}
 		if len(out) == limit {
@@ -825,10 +920,12 @@ func (s *Store) ListWeeklyPracticeHistory(ctx context.Context, agentName, cursor
 			count += len(track.Items)
 		}
 		out = append(out, k12.WeeklyPracticeHistorySummary{
-			SnapshotID: snapshot.SnapshotID, PlanID: snapshot.PlanID,
+			SnapshotID: snapshot.SnapshotID, ArtifactID: artifactID, PlanID: snapshot.PlanID,
 			ISOWeekYear: snapshot.ISOWeekYear, ISOWeekNumber: snapshot.ISOWeekNumber,
 			Timezone: snapshot.Timezone, LocalStartDate: snapshot.LocalStartDate,
-			LocalEndDate: snapshot.LocalEndDate, ItemCount: count, ArchivedAt: archivedAt,
+			LocalEndDate: snapshot.LocalEndDate, ItemCount: count,
+			CorrectCount: correctCount, WrongCount: wrongCount,
+			NeedsReviewCount: needsReviewCount, ArchivedAt: archivedAt,
 		})
 	}
 	return out, nil, rows.Err()

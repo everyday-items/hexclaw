@@ -23,6 +23,13 @@ var K12SubjectTextbooksV53 = Migration{
 }
 
 func migrateK12SubjectTextbooksV53(ctx context.Context, db *sql.DB) error {
+	exists, err := tableExists(ctx, db, "agents")
+	if err != nil {
+		return fmt.Errorf("检查 V53 agents 表: %w", err)
+	}
+	if !exists {
+		return nil
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("开启 V53 迁移事务: %w", err)

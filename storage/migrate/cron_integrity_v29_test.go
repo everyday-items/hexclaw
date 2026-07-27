@@ -153,7 +153,7 @@ func TestCronIntegrityV29RepairsSchemaAndMergesWithoutDroppingEvidence(t *testin
 	seedConflictGroup(t, db)
 	execCronIntegritySQL(t, db, `VACUUM`)
 
-	if err := Run(context.Background(), db, All); err != nil {
+	if err := Run(context.Background(), db, []Migration{cronMigrationByVersion(t, 29)}); err != nil {
 		t.Fatalf("run v29: %v", err)
 	}
 
@@ -161,7 +161,7 @@ func TestCronIntegrityV29RepairsSchemaAndMergesWithoutDroppingEvidence(t *testin
 	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&latest); err != nil {
 		t.Fatal(err)
 	}
-	wantLatest := All[len(All)-1].Version
+	wantLatest := 29
 	if latest != wantLatest {
 		t.Fatalf("latest migration=%d, want %d", latest, wantLatest)
 	}
@@ -328,7 +328,7 @@ func TestCronIntegrityV29RepairsSchemaAndMergesWithoutDroppingEvidence(t *testin
 		t.Fatal(err)
 	}
 	execCronIntegritySQL(t, db, `DELETE FROM schema_migrations WHERE version=29`)
-	if err := Run(context.Background(), db, All); err != nil {
+	if err := Run(context.Background(), db, []Migration{cronMigrationByVersion(t, 29)}); err != nil {
 		t.Fatalf("v29 reentry: %v", err)
 	}
 	var auditAfter int
@@ -360,7 +360,7 @@ func TestCronIntegrityV29RunCountOverflowRollsBackWithoutMutation(t *testing.T) 
 			        '{"source_key":"same-source"}')`, row.id, row.runCount, row.created)
 	}
 
-	err := Run(context.Background(), db, All)
+	err := Run(context.Background(), db, []Migration{cronMigrationByVersion(t, 29)})
 	if err == nil || !strings.Contains(err.Error(), "run_count overflow") {
 		t.Fatalf("v29 must fail closed on run_count overflow, got %v", err)
 	}
@@ -396,7 +396,7 @@ func TestCronIntegrityV29RollsBackOnForeignKeyViolation(t *testing.T) {
 		VALUES (77,'missing-parent','success','{"must":"survive-rollback"}')`)
 	execCronIntegritySQL(t, db, `PRAGMA foreign_keys=ON`)
 
-	err := Run(context.Background(), db, All)
+	err := Run(context.Background(), db, []Migration{cronMigrationByVersion(t, 29)})
 	if err == nil {
 		t.Fatal("v29 must reject an orphan instead of committing an invalid repair")
 	}

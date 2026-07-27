@@ -20,6 +20,7 @@ var (
 
 type ProblemSourceActionCommand struct {
 	OwnerScope            string
+	TrustedAgentName      string
 	DispatchID            string
 	ProblemID             string
 	IdempotencyKey        string
@@ -79,6 +80,27 @@ type problemSourceActionDigestInput struct {
 	Payload               json.RawMessage `json:"payload"`
 }
 
+type correctTextProblemSourceActionPayload struct {
+	QuestionCanonicalMarkdown string `json:"question_canonical_markdown"`
+	AnswerCanonicalMarkdown   string `json:"answer_canonical_markdown"`
+}
+
+type sourcePixelRegion struct {
+	X      int `json:"x"`
+	Y      int `json:"y"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
+type selectRegionProblemSourceActionPayload struct {
+	PageAssetID string            `json:"page_asset_id"`
+	Region      sourcePixelRegion `json:"region"`
+}
+
+type retakeProblemSourceActionPayload struct {
+	PageAssetID string `json:"page_asset_id"`
+}
+
 func canonicalProblemSourceActionPayload(raw json.RawMessage) (json.RawMessage, error) {
 	var value any
 	if err := json.Unmarshal(raw, &value); err != nil {
@@ -126,7 +148,7 @@ func validateProblemSourceActionCommand(command ProblemSourceActionCommand) erro
 		return fmt.Errorf("%w: incomplete command identity", ErrProblemSourceActionConflict)
 	}
 	switch command.Action {
-	case "skip", "resume":
+	case "correct_text", "select_region", "retake", "skip", "resume":
 		return nil
 	default:
 		return fmt.Errorf("%w: action %q has no committed state transition",
@@ -328,7 +350,8 @@ func commitProblemSkip(
 		return err
 	}
 	if existing != 0 {
-		return nil
+		return fmt.Errorf("%w: a skip receipt already owns the current head",
+			ErrProblemSourceActionConflict)
 	}
 	publishedRevision, err := nextProblemSourcePublishedRevision(
 		ctx, tx, scope, command.ProblemID,
@@ -387,6 +410,339 @@ func commitProblemResume(
 	if rows != 1 {
 		return fmt.Errorf("%w: resume requires the current skip head",
 			ErrProblemSourceActionConflict)
+	}
+	return nil
+}
+
+func affectedProblemSourceActionMembers(
+	ctx context.Context,
+	tx *sql.Tx,
+	command ProblemSourceActionCommand,
+	scope problemSourceActionScope,
+) ([]string, string, error) {
+	var problemKind, dependencyGroupID string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT problem_kind,dependency_group_id
+		FROM k12_problem_structure_members
+		WHERE agent_name=? AND submission_id=? AND structure_version=?
+		  AND problem_id=?`,
+		scope.AgentName,
+		scope.SubmissionID,
+		scope.StructureVersion,
+		command.ProblemID,
+	).Scan(&problemKind, &dependencyGroupID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, "", ErrProblemSourceActionNotFound
+		}
+		return nil, "", err
+	}
+	if problemKind != "compound_parent" {
+		return []string{command.ProblemID}, dependencyGroupID, nil
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT problem_id,input_revision
+		FROM k12_problem_structure_members
+		WHERE agent_name=? AND submission_id=? AND structure_version=?
+		  AND dependency_group_id=?
+		ORDER BY ordinal,problem_id`,
+		scope.AgentName,
+		scope.SubmissionID,
+		scope.StructureVersion,
+		dependencyGroupID,
+	)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+	problemIDs := make([]string, 0)
+	for rows.Next() {
+		var problemID string
+		var inputRevision int
+		if err := rows.Scan(&problemID, &inputRevision); err != nil {
+			return nil, "", err
+		}
+		if inputRevision != command.ExpectedInputRevision {
+			return nil, "", fmt.Errorf(
+				"%w: dependency group member %s input_revision=%d expected=%d",
+				ErrProblemSourceActionConflict,
+				problemID,
+				inputRevision,
+				command.ExpectedInputRevision,
+			)
+		}
+		problemIDs = append(problemIDs, problemID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	if len(problemIDs) == 0 {
+		return nil, "", ErrProblemSourceActionNotFound
+	}
+	return problemIDs, dependencyGroupID, nil
+}
+
+func problemSourceInputDigest(
+	requestDigest string,
+	problemID string,
+	inputRevision int,
+) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf(
+		"%s\x00%s\x00%d",
+		requestDigest,
+		problemID,
+		inputRevision,
+	)))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func supersedeProblemSourceActionHeads(
+	ctx context.Context,
+	tx *sql.Tx,
+	scope problemSourceActionScope,
+	problemID string,
+	resultRevision int,
+	now int64,
+) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE k12_grading_assessment_items
+		SET current_disposition='superseded',updated_at=?
+		WHERE agent_name=? AND job_id=? AND problem_id=?
+		  AND structure_version=? AND current_disposition='current'
+		  AND input_revision<?`,
+		now,
+		scope.AgentName,
+		scope.JobID,
+		problemID,
+		scope.StructureVersion,
+		resultRevision,
+	); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `
+		UPDATE k12_problem_skip_receipts
+		SET current_disposition='superseded',superseded_at=?,updated_at=?
+		WHERE agent_name=? AND job_id=? AND problem_id=?
+		  AND structure_version=? AND current_disposition='current'
+		  AND input_revision<?`,
+		now,
+		now,
+		scope.AgentName,
+		scope.JobID,
+		problemID,
+		scope.StructureVersion,
+		resultRevision,
+	)
+	return err
+}
+
+func commitProblemInputChange(
+	ctx context.Context,
+	tx *sql.Tx,
+	command ProblemSourceActionCommand,
+	scope problemSourceActionScope,
+	requestDigest string,
+	resultRevision int,
+	now int64,
+) error {
+	problemIDs, dependencyGroupID, err := affectedProblemSourceActionMembers(
+		ctx,
+		tx,
+		command,
+		scope,
+	)
+	if err != nil {
+		return err
+	}
+
+	switch command.Action {
+	case "correct_text":
+		var payload correctTextProblemSourceActionPayload
+		if err := json.Unmarshal(command.Payload, &payload); err != nil {
+			return fmt.Errorf("%w: invalid correct_text payload", ErrProblemSourceActionConflict)
+		}
+		payload.QuestionCanonicalMarkdown = strings.TrimSpace(payload.QuestionCanonicalMarkdown)
+		payload.AnswerCanonicalMarkdown = strings.TrimSpace(payload.AnswerCanonicalMarkdown)
+		if payload.QuestionCanonicalMarkdown == "" && payload.AnswerCanonicalMarkdown == "" {
+			return fmt.Errorf("%w: correct_text requires corrected text",
+				ErrProblemSourceActionConflict)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE k12_problems
+			SET canonical_version=?,confirmation_required=0,
+			    confirmation_reasons_json='[]',updated_at=?
+			WHERE agent_name=? AND submission_id=? AND problem_id=?`,
+			resultRevision,
+			now,
+			scope.AgentName,
+			scope.SubmissionID,
+			command.ProblemID,
+		); err != nil {
+			return err
+		}
+		if payload.QuestionCanonicalMarkdown != "" {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE k12_problems
+				SET stem_raw=?,stem_markdown=?,updated_at=?
+				WHERE agent_name=? AND submission_id=? AND problem_id=?`,
+				payload.QuestionCanonicalMarkdown,
+				payload.QuestionCanonicalMarkdown,
+				now,
+				scope.AgentName,
+				scope.SubmissionID,
+				command.ProblemID,
+			); err != nil {
+				return err
+			}
+		}
+		if payload.AnswerCanonicalMarkdown != "" {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE k12_attempts
+				SET answer_state='present',answer_raw=?,answer_markdown=?,updated_at=?
+				WHERE agent_name=? AND submission_id=? AND problem_id=?`,
+				payload.AnswerCanonicalMarkdown,
+				payload.AnswerCanonicalMarkdown,
+				now,
+				scope.AgentName,
+				scope.SubmissionID,
+				command.ProblemID,
+			); err != nil {
+				return err
+			}
+		}
+	case "select_region":
+		var payload selectRegionProblemSourceActionPayload
+		if err := json.Unmarshal(command.Payload, &payload); err != nil {
+			return fmt.Errorf("%w: invalid select_region payload",
+				ErrProblemSourceActionConflict)
+		}
+		payload.PageAssetID = strings.TrimSpace(payload.PageAssetID)
+		if payload.PageAssetID == "" || payload.Region.X < 0 ||
+			payload.Region.Y < 0 || payload.Region.Width <= 0 ||
+			payload.Region.Height <= 0 {
+			return fmt.Errorf("%w: invalid select_region source",
+				ErrProblemSourceActionConflict)
+		}
+		regionJSON, err := json.Marshal(payload.Region)
+		if err != nil {
+			return err
+		}
+		for _, problemID := range problemIDs {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE k12_problems SET page_asset_id=?,updated_at=?
+				WHERE agent_name=? AND submission_id=? AND problem_id=?`,
+				payload.PageAssetID,
+				now,
+				scope.AgentName,
+				scope.SubmissionID,
+				problemID,
+			); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE k12_attempts SET bbox_json=?,updated_at=?
+				WHERE agent_name=? AND submission_id=? AND problem_id=?`,
+				string(regionJSON),
+				now,
+				scope.AgentName,
+				scope.SubmissionID,
+				problemID,
+			); err != nil {
+				return err
+			}
+		}
+	case "retake":
+		var payload retakeProblemSourceActionPayload
+		if err := json.Unmarshal(command.Payload, &payload); err != nil {
+			return fmt.Errorf("%w: invalid retake payload", ErrProblemSourceActionConflict)
+		}
+		payload.PageAssetID = strings.TrimSpace(payload.PageAssetID)
+		if payload.PageAssetID == "" {
+			return fmt.Errorf("%w: retake requires page asset",
+				ErrProblemSourceActionConflict)
+		}
+		for _, problemID := range problemIDs {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE k12_problems SET page_asset_id=?,updated_at=?
+				WHERE agent_name=? AND submission_id=? AND problem_id=?`,
+				payload.PageAssetID,
+				now,
+				scope.AgentName,
+				scope.SubmissionID,
+				problemID,
+			); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE k12_attempts SET bbox_json='',updated_at=?
+				WHERE agent_name=? AND submission_id=? AND problem_id=?`,
+				now,
+				scope.AgentName,
+				scope.SubmissionID,
+				problemID,
+			); err != nil {
+				return err
+			}
+		}
+	}
+
+	for _, problemID := range problemIDs {
+		inputDigest := problemSourceInputDigest(
+			requestDigest,
+			problemID,
+			resultRevision,
+		)
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE k12_problem_structure_members
+			SET input_revision=?
+			WHERE agent_name=? AND submission_id=? AND structure_version=?
+			  AND problem_id=? AND input_revision=?`,
+			resultRevision,
+			scope.AgentName,
+			scope.SubmissionID,
+			scope.StructureVersion,
+			problemID,
+			command.ExpectedInputRevision,
+		); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE k12_attempts
+			SET confirmed_version=?,input_digest=?,updated_at=?
+			WHERE agent_name=? AND submission_id=? AND problem_id=?`,
+			resultRevision,
+			inputDigest,
+			now,
+			scope.AgentName,
+			scope.SubmissionID,
+			problemID,
+		); err != nil {
+			return err
+		}
+		if err := supersedeProblemSourceActionHeads(
+			ctx,
+			tx,
+			scope,
+			problemID,
+			resultRevision,
+			now,
+		); err != nil {
+			return err
+		}
+	}
+	if dependencyGroupID != "" {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE k12_problem_dependency_groups
+			SET state='pending',state_revision=state_revision+1,updated_at=?
+			WHERE agent_name=? AND submission_id=? AND structure_version=?
+			  AND dependency_group_id=?`,
+			now,
+			scope.AgentName,
+			scope.SubmissionID,
+			scope.StructureVersion,
+			dependencyGroupID,
+		); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -536,6 +892,7 @@ func (s *Store) CommitProblemSourceAction(
 	command ProblemSourceActionCommand,
 ) (ProblemSourceActionResult, error) {
 	command.OwnerScope = strings.TrimSpace(command.OwnerScope)
+	command.TrustedAgentName = strings.TrimSpace(command.TrustedAgentName)
 	command.DispatchID = strings.TrimSpace(command.DispatchID)
 	command.ProblemID = strings.TrimSpace(command.ProblemID)
 	command.IdempotencyKey = strings.TrimSpace(command.IdempotencyKey)
@@ -552,6 +909,10 @@ func (s *Store) CommitProblemSourceAction(
 	scope, err := lockAndResolveProblemSourceActionScope(ctx, tx, command)
 	if err != nil {
 		return ProblemSourceActionResult{}, err
+	}
+	if command.TrustedAgentName != "" &&
+		command.TrustedAgentName != scope.AgentName {
+		return ProblemSourceActionResult{}, ErrProblemSourceActionNotFound
 	}
 	requestDigest, err := problemSourceActionDigest(command, scope.AgentName)
 	if err != nil {
@@ -592,6 +953,17 @@ func (s *Store) CommitProblemSourceAction(
 	now := nowUnix()
 	resultRevision := currentRevision
 	switch command.Action {
+	case "correct_text", "select_region", "retake":
+		resultRevision++
+		err = commitProblemInputChange(
+			ctx,
+			tx,
+			command,
+			scope,
+			requestDigest,
+			resultRevision,
+			now,
+		)
 	case "skip":
 		err = commitProblemSkip(ctx, tx, command, scope, requestDigest, now)
 	case "resume":

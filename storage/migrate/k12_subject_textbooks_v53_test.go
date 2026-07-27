@@ -67,3 +67,23 @@ func TestK12SubjectTextbooksV53_BackfillsMathAndRepairsDerivedMirror(t *testing.
 		t.Fatalf("migration invented math mirror: %v", noMath)
 	}
 }
+
+func TestBUG20260726034_V53NoOpsWithoutAgents(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "partial-schema.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := Run(context.Background(), db, []Migration{K12SubjectTextbooksV53}); err != nil {
+		t.Fatalf("BUG-20260726-034: partial schema without agents must be a no-op: %v", err)
+	}
+	var applied int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=53`).
+		Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("BUG-20260726-034: v53 receipt count=%d want 1", applied)
+	}
+}

@@ -1,0 +1,336 @@
+package k12storage
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/hexagon-codes/toolkit/util/idgen"
+
+	"github.com/hexagon-codes/hexclaw/records"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+)
+
+// TextbookBindingOption is the exact HTTP projection of one immutable
+// textbook manifest candidate. Catalog is raw canonical JSON so the options
+// endpoint never invents or drops manifest-owned catalog fields.
+type TextbookBindingOption struct {
+	ManifestID         string          `json:"manifest_id"`
+	DocumentID         string          `json:"document_id"`
+	DocumentGeneration int64           `json:"document_generation"`
+	DocumentTitle      string          `json:"document_title"`
+	State              string          `json:"state"`
+	Retryable          bool            `json:"retryable"`
+	FailureMessage     string          `json:"failure_message"`
+	TextIndexState     string          `json:"text_index_state"`
+	VectorIndexState   string          `json:"vector_index_state"`
+	Catalog            json.RawMessage `json:"catalog"`
+	UpdatedAt          int64           `json:"updated_at"`
+}
+
+func (s *Store) ListTextbookBindingOptions(
+	ctx context.Context, agentName, subject string,
+) ([]TextbookBindingOption, error) {
+	agentName, subject = strings.TrimSpace(agentName), strings.TrimSpace(subject)
+	if agentName == "" || subject != "math" {
+		return nil, fmt.Errorf("k12storage: agent and subject=math required")
+	}
+	if err := requireTextbookAgent(ctx, s.db, agentName); err != nil {
+		return nil, err
+	}
+	if err := reconcileTextbookManifestCandidates(
+		ctx, s.db, agentName, subject, nowUnix(),
+	); err != nil {
+		return nil, err
+	}
+	if err := reconcileTextbookBindings(ctx, s.db, agentName, subject, nowUnix()); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT manifest_id,document_id,document_generation,
+	    document_title,state,retryable,failure_message,text_index_state,vector_index_state,
+	    catalog_json,updated_at
+	    FROM k12_textbook_manifests
+	    WHERE owner_id=? AND subject=?
+	    ORDER BY updated_at DESC,manifest_id`, agentName, subject)
+	if err != nil {
+		return nil, fmt.Errorf("k12storage: list textbook manifests: %w", err)
+	}
+	defer rows.Close()
+	items := make([]TextbookBindingOption, 0)
+	for rows.Next() {
+		var item TextbookBindingOption
+		var retryable int
+		var catalog sql.NullString
+		if err := rows.Scan(
+			&item.ManifestID, &item.DocumentID, &item.DocumentGeneration,
+			&item.DocumentTitle, &item.State, &retryable, &item.FailureMessage,
+			&item.TextIndexState, &item.VectorIndexState, &catalog, &item.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		item.Retryable = retryable == 1
+		item.Catalog = json.RawMessage("null")
+		if catalog.Valid && strings.TrimSpace(catalog.String) != "" {
+			if !json.Valid([]byte(catalog.String)) {
+				return nil, fmt.Errorf("k12storage: manifest %q has invalid catalog", item.ManifestID)
+			}
+			item.Catalog = json.RawMessage(catalog.String)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) GetTextbookManifestCatalog(
+	ctx context.Context, agentName, subject, manifestID string,
+) (k12.CurriculumCatalog, error) {
+	agentName = strings.TrimSpace(agentName)
+	subject = strings.TrimSpace(subject)
+	manifestID = strings.TrimSpace(manifestID)
+	if agentName == "" || subject != "math" || manifestID == "" {
+		return k12.CurriculumCatalog{}, fmt.Errorf("k12storage: incomplete textbook manifest lookup")
+	}
+	if err := requireTextbookAgent(ctx, s.db, agentName); err != nil {
+		return k12.CurriculumCatalog{}, err
+	}
+	if err := reconcileTextbookBindings(ctx, s.db, agentName, subject, nowUnix()); err != nil {
+		return k12.CurriculumCatalog{}, err
+	}
+	var state string
+	var catalog sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT state,catalog_json
+	    FROM k12_textbook_manifests
+	    WHERE manifest_id=? AND owner_id=? AND subject=?`,
+		manifestID, agentName, subject).Scan(&state, &catalog)
+	if err == sql.ErrNoRows {
+		return k12.CurriculumCatalog{}, records.ErrNotFound
+	}
+	if err != nil {
+		return k12.CurriculumCatalog{}, err
+	}
+	if state != "ready_for_confirmation" || !catalog.Valid ||
+		strings.TrimSpace(catalog.String) == "" {
+		return k12.CurriculumCatalog{}, fmt.Errorf(
+			"%w: textbook manifest is not ready for confirmation", records.ErrIllegalTransition,
+		)
+	}
+	out, err := decodeTextbookCatalog(catalog.String)
+	if err != nil {
+		return k12.CurriculumCatalog{}, err
+	}
+	out.AgentName = agentName
+	return out, nil
+}
+
+// GetActiveTextbookCatalog returns handled=false only when this agent/subject
+// has never used the v54 binding aggregate. That narrow result preserves the
+// migration window for old profile rows without making stale bindings fall
+// through to an unrelated catalog source.
+func (s *Store) GetActiveTextbookCatalog(
+	ctx context.Context, agentName, subject string,
+) (catalog k12.CurriculumCatalog, handled bool, err error) {
+	agentName, subject = strings.TrimSpace(agentName), strings.TrimSpace(subject)
+	if agentName == "" || subject != "math" {
+		return k12.CurriculumCatalog{}, true, fmt.Errorf("k12storage: agent and subject=math required")
+	}
+	if err := requireTextbookAgent(ctx, s.db, agentName); err != nil {
+		return k12.CurriculumCatalog{}, true, err
+	}
+	if err := reconcileTextbookBindings(ctx, s.db, agentName, subject, nowUnix()); err != nil {
+		return k12.CurriculumCatalog{}, true, err
+	}
+	var bindingID, raw string
+	err = s.db.QueryRowContext(ctx, `SELECT b.textbook_binding_id,m.catalog_json
+	    FROM k12_textbook_bindings b
+	    JOIN k12_textbook_manifests m ON m.manifest_id=b.textbook_manifest_id
+	    WHERE b.owner_id=? AND b.agent_name=? AND b.subject=? AND b.status='active'`,
+		agentName, agentName, subject).Scan(&bindingID, &raw)
+	if err == nil {
+		catalog, err = decodeTextbookCatalog(raw)
+		if err != nil {
+			return k12.CurriculumCatalog{}, true, err
+		}
+		catalog.AgentName = agentName
+		catalog.TextbookBindingID = bindingID
+		return catalog, true, nil
+	}
+	if err != sql.ErrNoRows {
+		return k12.CurriculumCatalog{}, true, err
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM k12_textbook_bindings
+	    WHERE owner_id=? AND agent_name=? AND subject=?`,
+		agentName, agentName, subject).Scan(&count); err != nil {
+		return k12.CurriculumCatalog{}, true, err
+	}
+	if count > 0 {
+		return k12.CurriculumCatalog{}, true, records.ErrNotFound
+	}
+	return k12.CurriculumCatalog{}, false, nil
+}
+
+func activateTextbookBindingTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	agentName string,
+	profile k12.ChildProfile,
+	progress k12.CurriculumProgress,
+	at int64,
+) (string, error) {
+	manifestID := strings.TrimSpace(progress.TextbookManifestID)
+	var ownerID, subject, documentID, state, raw string
+	var generation int64
+	err := tx.QueryRowContext(ctx, `SELECT owner_id,subject,document_id,document_generation,
+	    state,catalog_json FROM k12_textbook_manifests
+	    WHERE manifest_id=? AND owner_id=? AND subject=?`,
+		manifestID, agentName, progress.Subject).Scan(
+		&ownerID, &subject, &documentID, &generation, &state, &raw,
+	)
+	if err == sql.ErrNoRows {
+		return "", records.ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	var current int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+	    SELECT 1 FROM kb_semantic_document_bindings b
+	    JOIN kb_documents d ON d.id=b.document_id
+	    WHERE b.owner_id=? AND b.document_id=? AND b.content_generation=?
+	      AND b.lifecycle_state='active' AND d.deleted=0
+	)`, ownerID, documentID, generation).Scan(&current); err != nil {
+		return "", err
+	}
+	if state != "ready_for_confirmation" || current != 1 {
+		return "", fmt.Errorf(
+			"%w: textbook manifest generation is not active and ready",
+			records.ErrIllegalTransition,
+		)
+	}
+	catalog, err := decodeTextbookCatalog(raw)
+	if err != nil {
+		return "", err
+	}
+	if catalog.Subject != subject || catalog.TextbookEdition != profile.SubjectTextbooks.Math ||
+		catalog.Volume != progress.Volume || !catalogContainsProgress(catalog, progress) {
+		return "", fmt.Errorf(
+			"%w: textbook manifest does not match confirmed profile progress",
+			records.ErrIllegalTransition,
+		)
+	}
+	var activeID, activeManifest string
+	err = tx.QueryRowContext(ctx, `SELECT textbook_binding_id,textbook_manifest_id
+	    FROM k12_textbook_bindings
+	    WHERE owner_id=? AND agent_name=? AND subject=? AND status='active'`,
+		ownerID, agentName, subject).Scan(&activeID, &activeManifest)
+	if err == nil && activeManifest == manifestID {
+		return activeID, nil
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE k12_textbook_bindings
+	    SET status='superseded',updated_at=?
+	    WHERE owner_id=? AND agent_name=? AND subject=? AND status='active'`,
+		at, ownerID, agentName, subject); err != nil {
+		return "", err
+	}
+	bindingID := "tb-" + idgen.NanoID()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO k12_textbook_bindings
+	    (textbook_binding_id,owner_id,agent_name,subject,textbook_manifest_id,
+	     document_id,document_generation,status,created_at,updated_at)
+	    VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		bindingID, ownerID, agentName, subject, manifestID, documentID, generation,
+		"active", at, at); err != nil {
+		return "", err
+	}
+	return bindingID, nil
+}
+
+func reconcileTextbookBindings(
+	ctx context.Context,
+	exec interface {
+		ExecContext(context.Context, string, ...any) (sql.Result, error)
+	},
+	ownerID, subject string,
+	at int64,
+) error {
+	if _, err := exec.ExecContext(ctx, `UPDATE k12_textbook_manifests
+	    SET state='stale',retryable=0,failure_message='',updated_at=?
+	    WHERE owner_id=? AND subject=? AND state<>'stale'
+	      AND NOT EXISTS(
+	        SELECT 1 FROM kb_semantic_document_bindings b
+	        JOIN kb_documents d ON d.id=b.document_id
+	        WHERE b.owner_id=k12_textbook_manifests.owner_id
+	          AND b.document_id=k12_textbook_manifests.document_id
+	          AND b.content_generation=k12_textbook_manifests.document_generation
+	          AND b.lifecycle_state='active' AND d.deleted=0
+	      )`, at, ownerID, subject); err != nil {
+		return fmt.Errorf("k12storage: reconcile textbook manifests: %w", err)
+	}
+	if _, err := exec.ExecContext(ctx, `UPDATE k12_textbook_bindings
+	    SET status='invalidated',updated_at=?
+	    WHERE owner_id=? AND subject=? AND status='active'
+	      AND NOT EXISTS(
+	        SELECT 1 FROM k12_textbook_manifests m
+	        JOIN kb_semantic_document_bindings b
+	          ON b.document_id=m.document_id
+	         AND b.content_generation=m.document_generation
+	        JOIN kb_documents d ON d.id=m.document_id
+	        WHERE m.manifest_id=k12_textbook_bindings.textbook_manifest_id
+	          AND m.state='ready_for_confirmation'
+	          AND b.owner_id=k12_textbook_bindings.owner_id
+	          AND b.lifecycle_state='active' AND d.deleted=0
+	      )`, at, ownerID, subject); err != nil {
+		return fmt.Errorf("k12storage: reconcile textbook bindings: %w", err)
+	}
+	return nil
+}
+
+func decodeTextbookCatalog(raw string) (k12.CurriculumCatalog, error) {
+	var out k12.CurriculumCatalog
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return k12.CurriculumCatalog{}, fmt.Errorf("k12storage: decode textbook catalog: %w", err)
+	}
+	if out.Subject != "math" || strings.TrimSpace(out.TextbookEdition) == "" ||
+		strings.TrimSpace(out.TextbookVersion) == "" || strings.TrimSpace(out.Title) == "" ||
+		strings.TrimSpace(out.Volume) == "" || out.PageMin < 1 ||
+		out.PageMax < out.PageMin || len(out.Units) == 0 {
+		return k12.CurriculumCatalog{}, fmt.Errorf(
+			"%w: invalid textbook catalog", records.ErrIllegalTransition,
+		)
+	}
+	return out, nil
+}
+
+func requireTextbookAgent(ctx context.Context, db *sql.DB, agentName string) error {
+	var exists int
+	if err := db.QueryRowContext(
+		ctx, `SELECT EXISTS(SELECT 1 FROM agents WHERE name=?)`, agentName,
+	).Scan(&exists); err != nil {
+		return err
+	}
+	if exists != 1 {
+		return records.ErrNotFound
+	}
+	return nil
+}
+
+func catalogContainsProgress(catalog k12.CurriculumCatalog, progress k12.CurriculumProgress) bool {
+	for _, unit := range catalog.Units {
+		if unit.UnitID != progress.UnitID {
+			continue
+		}
+		if progress.LessonID == "" {
+			return true
+		}
+		for _, lesson := range unit.Lessons {
+			if lesson.LessonID == progress.LessonID {
+				return true
+			}
+		}
+	}
+	return false
+}
