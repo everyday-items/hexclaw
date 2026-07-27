@@ -32,13 +32,11 @@ func (e gradeCapturingExec) Execute(_ context.Context, args map[string]any) (*sk
 // 据 agent 从档案推导年级，而非留空（原实现忽略 agent → 阶段三 solve 丢年级边界）。
 func TestBUG3_TutorTurnDerivesGradeFromProfileWhenOmitted(t *testing.T) {
 	captured := ""
+	profiles := &memProfiles{m: map[string]k12.ChildProfile{
+		"mingming": {ChildName: "明明", GradeTerm: "五年级上"},
+	}}
 	h := newServerWithSolver(t, gradeCapturingExec{lastGrade: &captured},
-		assembly.WithProfiles(&memProfiles{m: map[string]k12.ChildProfile{}}))
-
-	// 设孩子档案生效年级。
-	if rec, _ := do(t, h, "PUT", "/profile", `{"agent":"mingming","child_name":"明明","grade_term":"五年级上"}`); rec.Code != http.StatusOK {
-		t.Fatalf("设档案应 200, got %d", rec.Code)
-	}
+		assembly.WithProfiles(profiles))
 
 	// 阶段三（"直接讲" 命中 fullRequestCue）+ 有题目 + **不传 grade** → 应从档案取五年级上。
 	rec, _ := do(t, h, "POST", "/tutor-turn",
@@ -54,9 +52,11 @@ func TestBUG3_TutorTurnDerivesGradeFromProfileWhenOmitted(t *testing.T) {
 // 显式传 grade 时以显式为准（不被档案覆盖）。
 func TestBUG3_TutorTurnExplicitGradeWins(t *testing.T) {
 	captured := ""
+	profiles := &memProfiles{m: map[string]k12.ChildProfile{
+		"mingming": {ChildName: "明明", GradeTerm: "五年级上"},
+	}}
 	h := newServerWithSolver(t, gradeCapturingExec{lastGrade: &captured},
-		assembly.WithProfiles(&memProfiles{m: map[string]k12.ChildProfile{}}))
-	do(t, h, "PUT", "/profile", `{"agent":"mingming","child_name":"明明","grade_term":"五年级上"}`)
+		assembly.WithProfiles(profiles))
 	do(t, h, "POST", "/tutor-turn",
 		`{"agent":"mingming","prior_stage":2,"parent_message":"直接讲","problem":"x","grade":"六年级下"}`)
 	if captured != "六年级下" {

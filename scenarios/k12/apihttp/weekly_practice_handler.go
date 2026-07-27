@@ -1,6 +1,7 @@
 package apihttp
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,7 +15,7 @@ func (h *handler) getCurriculumCatalog(w http.ResponseWriter, r *http.Request) {
 		usecase.WeeklyCurriculumCatalogRequest{
 			AgentName: r.URL.Query().Get("agent"), Subject: r.URL.Query().Get("subject"),
 			TextbookEdition: r.URL.Query().Get("textbook_edition"),
-			Volume: r.URL.Query().Get("volume"),
+			Volume:          r.URL.Query().Get("volume"),
 		})
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
@@ -43,29 +44,39 @@ func (h *handler) getWeeklyPracticeSettings(w http.ResponseWriter, r *http.Reque
 }
 
 type profileBundleRequest struct {
-	AgentName                  string `json:"agent"`
-	IdempotencyKey             string `json:"idempotency_key"`
-	ExpectedProfileRevision    int    `json:"expected_profile_revision"`
-	ExpectedProgressRevision   int    `json:"expected_progress_revision"`
-	ExpectedSettingsRevision   int    `json:"expected_settings_revision"`
+	AgentName                string `json:"agent"`
+	IdempotencyKey           string `json:"idempotency_key"`
+	ExpectedProfileRevision  int    `json:"expected_profile_revision"`
+	ExpectedProgressRevision int    `json:"expected_progress_revision"`
+	ExpectedSettingsRevision int    `json:"expected_settings_revision"`
+	AgentConfig              *struct {
+		DisplayName  string   `json:"display_name"`
+		Description  string   `json:"description"`
+		SystemPrompt string   `json:"system_prompt"`
+		Provider     string   `json:"provider"`
+		Model        string   `json:"model"`
+		Skills       []string `json:"skills"`
+	} `json:"agent_config"`
 	Profile struct {
 		ChildName        string               `json:"child_name"`
 		GradeTerm        string               `json:"grade_term"`
 		SubjectTextbooks k12.SubjectTextbooks `json:"subject_textbooks"`
 	} `json:"profile"`
 	CurriculumProgress struct {
-		Subject           string `json:"subject"`
-		TextbookBindingID string `json:"textbook_binding_id"`
-		Volume            string `json:"volume"`
-		UnitID            string `json:"unit_id"`
-		LessonID          string `json:"lesson_id,omitempty"`
-		PageFrom          *int   `json:"page_from,omitempty"`
-		PageTo            *int   `json:"page_to,omitempty"`
-		EvidenceSource    string `json:"evidence_source"`
+		Subject            string `json:"subject"`
+		TextbookBindingID  string `json:"textbook_binding_id"`
+		TextbookManifestID string `json:"textbook_manifest_id"`
+		Volume             string `json:"volume"`
+		UnitID             string `json:"unit_id"`
+		LessonID           string `json:"lesson_id,omitempty"`
+		PageFrom           *int   `json:"page_from,omitempty"`
+		PageTo             *int   `json:"page_to,omitempty"`
+		EvidenceSource     string `json:"evidence_source"`
 	} `json:"curriculum_progress"`
 	WeeklyPracticeSettings struct {
 		Timezone                     string `json:"timezone"`
 		TextbookConsolidationEnabled bool   `json:"textbook_consolidation_enabled"`
+		TextbookConsolidationTier    string `json:"textbook_consolidation_tier"`
 		ArithmeticWarmupEnabled      bool   `json:"arithmetic_warmup_enabled"`
 		ArithmeticMinutes            int    `json:"arithmetic_minutes"`
 	} `json:"weekly_practice_settings"`
@@ -76,28 +87,39 @@ func (h *handler) updateProfileBundle(w http.ResponseWriter, r *http.Request) {
 	if !decodeStrict(w, r, &req) {
 		return
 	}
+	var agentConfig *k12.ProfileBundleAgentConfig
+	if req.AgentConfig != nil {
+		agentConfig = &k12.ProfileBundleAgentConfig{
+			DisplayName: req.AgentConfig.DisplayName, Description: req.AgentConfig.Description,
+			SystemPrompt: req.AgentConfig.SystemPrompt, Provider: req.AgentConfig.Provider,
+			Model: req.AgentConfig.Model, Skills: req.AgentConfig.Skills,
+		}
+	}
 	result, err := h.rt.Deps.UpdateProfileBundle(r.Context(), usecase.UpdateProfileBundleRequest{
 		AgentName: req.AgentName, IdempotencyKey: req.IdempotencyKey,
-		ExpectedProfileRevision: req.ExpectedProfileRevision,
+		ExpectedProfileRevision:  req.ExpectedProfileRevision,
 		ExpectedProgressRevision: req.ExpectedProgressRevision,
 		ExpectedSettingsRevision: req.ExpectedSettingsRevision,
+		AgentConfig:              agentConfig,
 		Profile: k12.ChildProfile{
 			ChildName: req.Profile.ChildName, GradeTerm: req.Profile.GradeTerm,
 			SubjectTextbooks: req.Profile.SubjectTextbooks,
 		},
 		CurriculumProgress: usecase.CurriculumProgressInput{
-			Subject: req.CurriculumProgress.Subject,
-			TextbookBindingID: req.CurriculumProgress.TextbookBindingID,
-			Volume: req.CurriculumProgress.Volume, UnitID: req.CurriculumProgress.UnitID,
+			Subject:            req.CurriculumProgress.Subject,
+			TextbookBindingID:  req.CurriculumProgress.TextbookBindingID,
+			TextbookManifestID: req.CurriculumProgress.TextbookManifestID,
+			Volume:             req.CurriculumProgress.Volume, UnitID: req.CurriculumProgress.UnitID,
 			LessonID: req.CurriculumProgress.LessonID, PageFrom: req.CurriculumProgress.PageFrom,
-			PageTo: req.CurriculumProgress.PageTo,
+			PageTo:         req.CurriculumProgress.PageTo,
 			EvidenceSource: req.CurriculumProgress.EvidenceSource,
 		},
 		WeeklyPracticeSettings: usecase.WeeklyPracticeSettingsInput{
-			Timezone: req.WeeklyPracticeSettings.Timezone,
+			Timezone:                     req.WeeklyPracticeSettings.Timezone,
 			TextbookConsolidationEnabled: req.WeeklyPracticeSettings.TextbookConsolidationEnabled,
-			ArithmeticWarmupEnabled: req.WeeklyPracticeSettings.ArithmeticWarmupEnabled,
-			ArithmeticMinutes: req.WeeklyPracticeSettings.ArithmeticMinutes,
+			TextbookConsolidationTier:    req.WeeklyPracticeSettings.TextbookConsolidationTier,
+			ArithmeticWarmupEnabled:      req.WeeklyPracticeSettings.ArithmeticWarmupEnabled,
+			ArithmeticMinutes:            req.WeeklyPracticeSettings.ArithmeticMinutes,
 		},
 	})
 	if err != nil {
@@ -105,6 +127,21 @@ func (h *handler) updateProfileBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *handler) listTextbookBindingOptions(w http.ResponseWriter, r *http.Request) {
+	if h.rt.Records == nil {
+		writeErr(w, http.StatusInternalServerError, "records unavailable")
+		return
+	}
+	items, err := h.rt.Records.ListTextbookBindingOptions(
+		r.Context(), r.URL.Query().Get("agent"), r.URL.Query().Get("subject"),
+	)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 type weeklyPlanCommandRequest struct {
@@ -171,9 +208,21 @@ func (h *handler) getWeeklyPracticeSnapshot(w http.ResponseWriter, r *http.Reque
 }
 
 type weeklyExpectedRevisionRequest struct {
-	AgentName       string `json:"agent"`
-	ExpectedRevision int   `json:"expected_revision"`
-	IdempotencyKey  string `json:"idempotency_key"`
+	AgentName        string `json:"agent"`
+	ExpectedRevision int    `json:"expected_revision"`
+	IdempotencyKey   string `json:"idempotency_key"`
+}
+
+type weeklyManualTextbookRequest struct {
+	PlanRevision   int    `json:"plan_revision"`
+	ItemCount      int    `json:"item_count"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
+type weeklyManualArithmeticRequest struct {
+	PlanRevision   int    `json:"plan_revision"`
+	ItemCount      int    `json:"item_count"`
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 func (h *handler) prepareWeeklyPracticeOutput(w http.ResponseWriter, r *http.Request) {
@@ -239,6 +288,127 @@ func (h *handler) submitWeeklyPracticeAttempt(w http.ResponseWriter, r *http.Req
 		status = http.StatusOK
 	}
 	writeJSON(w, status, map[string]any{"attempt": attempt, "replayed": replay})
+}
+
+func (h *handler) createWeeklyArithmeticBatch(w http.ResponseWriter, r *http.Request) {
+	var req weeklyManualArithmeticRequest
+	if !decodeStrict(w, r, &req) {
+		return
+	}
+	agentName, err := h.resolveWeeklyPlanAgent(r)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
+		return
+	}
+	batch, replay, err := h.rt.Deps.CreateWeeklyArithmeticBatchWithItemCount(
+		r.Context(), agentName, r.PathValue("id"),
+		req.PlanRevision, req.ItemCount, req.IdempotencyKey)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+		return
+	}
+	status := http.StatusCreated
+	if replay {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, map[string]any{"batch": batch, "replayed": replay})
+}
+
+func (h *handler) prepareWeeklyTextbookTrack(w http.ResponseWriter, r *http.Request) {
+	var req weeklyManualTextbookRequest
+	if !decodeStrict(w, r, &req) {
+		return
+	}
+	agentName, err := h.resolveWeeklyPlanAgent(r)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
+		return
+	}
+	plan, replay, err := h.rt.Deps.PrepareWeeklyTextbookTrack(
+		r.Context(), agentName, r.PathValue("id"),
+		req.PlanRevision, req.ItemCount, req.IdempotencyKey)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+		return
+	}
+	status := http.StatusCreated
+	if replay {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, map[string]any{"plan": plan, "replayed": replay})
+}
+
+func (h *handler) resolveWeeklyPlanAgent(r *http.Request) (string, error) {
+	if h.rt.Records == nil {
+		return "", fmt.Errorf("records unavailable")
+	}
+	return h.rt.Records.ResolveWeeklyPracticePlanAgent(r.Context(), r.PathValue("id"))
+}
+
+func (h *handler) startWeeklyArithmeticBatch(w http.ResponseWriter, r *http.Request) {
+	var req weeklySendRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	batch, replay, err := h.rt.Deps.StartWeeklyArithmeticBatch(
+		r.Context(), req.AgentName, r.PathValue("id"), req.IdempotencyKey)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"batch": batch, "replayed": replay})
+}
+
+func (h *handler) retryWeeklyArithmeticBatch(w http.ResponseWriter, r *http.Request) {
+	var req weeklySendRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	batch, replay, err := h.rt.Deps.RetryWeeklyArithmeticBatch(
+		r.Context(), req.AgentName, r.PathValue("id"), req.IdempotencyKey)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"batch": batch, "replayed": replay})
+}
+
+func (h *handler) submitWeeklyArithmeticAttempt(w http.ResponseWriter, r *http.Request) {
+	var req weeklyAttemptRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	attempt, replay, err := h.rt.Deps.SubmitWeeklyArithmeticAttempt(
+		r.Context(), req.AgentName, r.PathValue("id"), req.ItemID,
+		req.StudentAnswer, req.IdempotencyKey)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	status := http.StatusCreated
+	if replay {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, map[string]any{"attempt": attempt, "replayed": replay})
+}
+
+func (h *handler) refreshWeeklyTextbookTrack(w http.ResponseWriter, r *http.Request) {
+	var req weeklyExpectedRevisionRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	plan, replay, created, err := h.rt.Deps.RefreshWeeklyTextbookTrack(
+		r.Context(), req.AgentName, r.PathValue("id"),
+		req.ExpectedRevision, req.IdempotencyKey)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
+		return
+	}
+	status := http.StatusOK
+	if created && !replay {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, map[string]any{"plan": plan, "replayed": replay})
 }
 
 func (h *handler) saveWeeklyPracticeToPracticeSet(w http.ResponseWriter, r *http.Request) {

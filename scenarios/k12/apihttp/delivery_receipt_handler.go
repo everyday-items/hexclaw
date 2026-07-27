@@ -10,8 +10,9 @@ import (
 )
 
 type tutoringTipsSendReq struct {
-	Agent           string `json:"agent"`
-	FinalArtifactID string `json:"final_artifact_id"`
+	Agent               string `json:"agent"`
+	FinalArtifactID     string `json:"final_artifact_id"`
+	FinalArtifactDigest string `json:"final_artifact_digest,omitempty"`
 }
 
 // sendTutoringTips sends only the canonical frozen grading final_artifact.
@@ -23,12 +24,13 @@ func (h *handler) sendTutoringTips(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Agent = strings.TrimSpace(req.Agent)
 	req.FinalArtifactID = strings.TrimSpace(req.FinalArtifactID)
+	req.FinalArtifactDigest = strings.TrimSpace(req.FinalArtifactDigest)
 	if req.Agent == "" || req.FinalArtifactID == "" {
 		writeErr(w, http.StatusBadRequest, "agent / final_artifact_id required")
 		return
 	}
-	batch, _, err := h.rt.Deps.PrepareAndSendGradingFinalArtifact(
-		r.Context(), req.Agent, req.FinalArtifactID,
+	batch, _, err := h.rt.Deps.PrepareAndSendGradingFinalArtifactExact(
+		r.Context(), req.Agent, req.FinalArtifactID, req.FinalArtifactDigest,
 	)
 	if err != nil {
 		writeDeliveryError(w, err)

@@ -35,6 +35,8 @@ type publicImageTaskDispatch struct {
 	DispatchID                string                `json:"dispatch_id"`
 	TaskIntent                k12.ImageTaskIntent   `json:"task_intent"`
 	Status                    k12.ImageTaskStatus   `json:"status"`
+	ProviderDisplayName       *string               `json:"provider_display_name"`
+	ModelID                   *string               `json:"model_id"`
 	Retryable                 bool                  `json:"retryable"`
 	IntentEvidence            []string              `json:"intent_evidence"`
 	IntentConfidence          float64               `json:"intent_confidence"`
@@ -63,12 +65,13 @@ type imageTaskProgressDTO struct {
 }
 
 type imageTaskHomeworkProjectionDTO struct {
-	Kind              string                  `json:"kind"`
-	Stage             string                  `json:"stage"`
-	ConfirmationState string                  `json:"confirmation_state"`
-	AnchorState       string                  `json:"anchor_state"`
-	Recognition       map[string]any          `json:"recognition,omitempty"`
-	Progressive       imageTaskProgressiveDTO `json:"progressive"`
+	Kind              string                    `json:"kind"`
+	Stage             string                    `json:"stage"`
+	ConfirmationState string                    `json:"confirmation_state"`
+	AnchorState       string                    `json:"anchor_state"`
+	Recognition       map[string]any            `json:"recognition,omitempty"`
+	Progressive       imageTaskProgressiveDTO   `json:"progressive"`
+	FinalArtifact     *k12.GradingFinalArtifact `json:"final_artifact,omitempty"`
 }
 
 type imageTaskProgressiveDTO struct {
@@ -182,10 +185,24 @@ func publicImageTaskProgressState(state string) string {
 	}
 }
 
+func optionalPublicImageTaskString(value string) *string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
 func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 	dispatch := view.Dispatch
+	frozenRoute := dispatch.RoutePolicySnapshot
+	if dispatch.RoutingProvenance == k12.ImageTaskRoutingParentSelected {
+		frozenRoute = dispatch.OperationRouteRequest
+	}
 	out := publicImageTaskDispatch{
 		DispatchID: dispatch.DispatchID, TaskIntent: dispatch.TaskIntent, Status: dispatch.Status,
+		ProviderDisplayName:    optionalPublicImageTaskString(frozenRoute.ProviderDisplayName),
+		ModelID:                optionalPublicImageTaskString(frozenRoute.ModelID),
 		Retryable:              dispatch.RetrySafe,
 		IntentEvidence:         nonNilStrings(dispatch.IntentEvidence),
 		IntentConfidence:       dispatch.IntentConfidence,
@@ -229,6 +246,7 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 			projection.ConfirmationState = view.HomeworkProjection.ConfirmationState
 			projection.AnchorState = view.HomeworkProjection.AnchorState
 			projection.Progressive = publicImageTaskProgressive(view.HomeworkProjection.Progressive)
+			projection.FinalArtifact = view.HomeworkProjection.FinalArtifact
 			projection.Recognition = map[string]any{
 				"subject": view.HomeworkProjection.Subject, "questions": questions,
 			}

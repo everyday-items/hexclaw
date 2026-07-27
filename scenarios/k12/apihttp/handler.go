@@ -130,6 +130,12 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("POST /mistakes/{record_id}/practice-generation", h.startPracticeGeneration)
 	mux.HandleFunc("GET /mistakes/{record_id}/practice-generation", h.getPracticeGeneration)
 	mux.HandleFunc("POST /mistakes/{record_id}/practice-generation/retry", h.retryPracticeGeneration)
+	mux.HandleFunc("POST /mistakes/{record_id}/practice-candidate-selection", h.openPracticeCandidateSelection)
+	mux.HandleFunc("POST /practice-candidate-selections/{id}/batches", h.generatePracticeCandidateBatch)
+	mux.HandleFunc("POST /practice-candidate-selections/{id}/commit", h.commitPracticeCandidateSelection)
+	mux.HandleFunc("POST /mistakes/{record_id}/suppress", h.suppressMistakeReview)
+	mux.HandleFunc("POST /mistakes/{record_id}/restore-review", h.restoreMistakeReview)
+	mux.HandleFunc("POST /mistakes/{record_id}/defer-this-week", h.deferMistakeThisWeek)
 	mux.HandleFunc("GET /review-queue", h.reviewQueue)
 	mux.HandleFunc("GET /insight-report", h.insightReport)
 	mux.HandleFunc("POST /mark-mastered", h.markMastered)
@@ -204,6 +210,7 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("GET /mistake-sheet", h.mistakeSheet)
 	mux.HandleFunc("GET /profile", h.getProfile)
 	mux.HandleFunc("PUT /profile", h.updateProfile)
+	mux.HandleFunc("GET /textbook-binding-options", h.listTextbookBindingOptions)
 	mux.HandleFunc("GET /curriculum-catalog", h.getCurriculumCatalog)
 	mux.HandleFunc("GET /curriculum-progress", h.getCurriculumProgress)
 	mux.HandleFunc("GET /weekly-practice/settings", h.getWeeklyPracticeSettings)
@@ -215,6 +222,12 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("POST /weekly-practice/plans/{id}/prepare-output", h.prepareWeeklyPracticeOutput)
 	mux.HandleFunc("POST /weekly-practice/snapshots/{id}/send", h.sendWeeklyPracticeSnapshot)
 	mux.HandleFunc("POST /weekly-practice/snapshots/{id}/attempts", h.submitWeeklyPracticeAttempt)
+	mux.HandleFunc("POST /weekly-practice/plans/{id}/arithmetic-batches", h.createWeeklyArithmeticBatch)
+	mux.HandleFunc("POST /weekly-practice/arithmetic-batches/{id}/start", h.startWeeklyArithmeticBatch)
+	mux.HandleFunc("POST /weekly-practice/arithmetic-batches/{id}/retry", h.retryWeeklyArithmeticBatch)
+	mux.HandleFunc("POST /weekly-practice/arithmetic-batches/{id}/attempts", h.submitWeeklyArithmeticAttempt)
+	mux.HandleFunc("POST /weekly-practice/plans/{id}/tracks/textbook_consolidation/refresh", h.refreshWeeklyTextbookTrack)
+	mux.HandleFunc("POST /weekly-practice/plans/{id}/tracks/textbook_consolidation/prepare", h.prepareWeeklyTextbookTrack)
 	mux.HandleFunc("POST /weekly-practice/plans/{id}/save-to-practice-set", h.saveWeeklyPracticeToPracticeSet)
 	mux.HandleFunc("POST /cold-start", h.coldStart)
 	// GET /study-time 已删除（架构设计 v0.5.0《明确不做》#6：不做学习时长与无证据投入指标）。
@@ -278,6 +291,7 @@ type mistakeDTO struct {
 	KnowledgePoint string `json:"knowledge_point"`
 	ErrorCause     string `json:"error_cause"`
 	Status         string `json:"status"`
+	ReviewState    string `json:"review_state,omitempty"`
 	Version        int    `json:"version"`
 	DueAt          *int64 `json:"due_at,omitempty"`
 	// 跨科复习队列用：subject=学科（数学/语文/英语），review_kind=再练方式（verify=验算链变式 / verbatim=原词重现字符比对）。
@@ -586,12 +600,34 @@ func (h *handler) mistakes(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
-	recs, err := h.rt.Records.ListByScope(r.Context(), agent, k12.CollectionMistakes, r.URL.Query().Get("status"))
+	requestedStatus := strings.TrimSpace(r.URL.Query().Get("status"))
+	legacyStatus := requestedStatus
+	if isMistakeReviewState(requestedStatus) || requestedStatus == "all" {
+		legacyStatus = ""
+	}
+	recs, err := h.rt.Records.ListByScope(
+		r.Context(), agent, k12.CollectionMistakes, legacyStatus,
+	)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": toMistakeDTOs(recs)})
+	reviewStates, err := h.rt.Records.ListMistakeReviewStates(r.Context(), agent)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	items := make([]mistakeDTO, 0, len(recs))
+	for _, record := range recs {
+		fields, _ := k12.ParseMistakeFields(record.Fields)
+		dto := mistakeDTOWithReview(record, fields, reviewStates[record.RecordID])
+		if isMistakeReviewState(requestedStatus) &&
+			dto.ReviewState != requestedStatus {
+			continue
+		}
+		items = append(items, dto)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 // deleteMistake DELETE /mistakes/{record_id}?agent=X —— 家长「删除这条错题」（UX-3 数据纠错）。
@@ -686,16 +722,25 @@ func (h *handler) reviewQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := make([]mistakeDTO, 0, len(items))
+	reviewStates, err := h.rt.Records.ListMistakeReviewStates(r.Context(), agent)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	for _, it := range items {
 		kind := "verify" // 数理化：验算链变式
 		if it.IsAccum() {
 			kind = "verbatim" // 语英字词：原词重现·字符比对
 		}
-		out = append(out, mistakeDTO{
+		dto := mistakeDTO{
 			RecordID: it.Record.RecordID, Question: it.Title(), KnowledgePoint: it.Point(),
 			ErrorCause: it.Point(), Status: it.Record.Status, Version: it.Record.Version,
 			DueAt: it.Record.DueAt, Subject: it.Subject(), ReviewKind: kind,
-		})
+		}
+		if review, ok := reviewStates[it.Record.RecordID]; ok {
+			dto.ReviewState = review.State
+		}
+		out = append(out, dto)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": out})
 }
@@ -1275,23 +1320,9 @@ type updateProfileReq struct {
 
 // updateProfile PUT /profile —— 建档 / 改档（升学改年级，校验 18 档）。
 func (h *handler) updateProfile(w http.ResponseWriter, r *http.Request) {
-	var req updateProfileReq
-	if !decode(w, r, &req) {
-		return
-	}
-	p, err := h.rt.Deps.UpdateProfile(r.Context(), req.Agent, k12.ChildProfile{
-		ChildName: req.ChildName, GradeTerm: req.GradeTerm, TextbookEdition: req.TextbookEdition,
-	})
-	if err != nil {
-		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
-		return
-	}
-	view, viewErr := h.rt.Deps.GetProfileWithRevision(r.Context(), req.Agent)
-	if viewErr != nil {
-		writeErr(w, httpStatusForK12Error(viewErr, http.StatusInternalServerError), viewErr.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, profileDTO{ChildName: p.ChildName, GradeTerm: p.GradeTerm, TextbookEdition: p.TextbookEdition, Revision: view.Revision})
+	w.Header().Set("Allow", http.MethodGet)
+	writeErr(w, http.StatusMethodNotAllowed,
+		"profile updates require /api/k12/profile-bundle")
 }
 
 // mistakeSheet GET /mistake-sheet?agent=X —— 生成本周错题卷（到期该练，只出题）。
@@ -1702,12 +1733,33 @@ func toMistakeDTOs(recs []*records.AgentRecord) []mistakeDTO {
 }
 
 func mistakeDTOFrom(r *records.AgentRecord, f k12.MistakeFields) mistakeDTO {
+	return mistakeDTOWithReview(r, f, k12.MistakeReviewState{})
+}
+
+func mistakeDTOWithReview(
+	r *records.AgentRecord,
+	f k12.MistakeFields,
+	review k12.MistakeReviewState,
+) mistakeDTO {
+	reviewState := review.State
+	if reviewState == "" {
+		switch r.Status {
+		case k12.StatusMastered:
+			reviewState = k12.MistakeReviewMastered
+		case k12.StatusArchived:
+			reviewState = k12.MistakeReviewSuppressed
+		default:
+			reviewState = k12.MistakeReviewScheduled
+		}
+	}
 	dto := mistakeDTO{
 		RecordID: r.RecordID, Question: f.Question, KnowledgePoint: f.KnowledgePoint,
 		ErrorCause: f.ErrorCause, Status: r.Status, Version: r.Version, DueAt: r.DueAt,
 		Subject: f.Subject, SpotCheckState: f.SpotCheckState,
+		ReviewState:       reviewState,
 		ParentConfirmedAt: f.ParentConfirmedAt,
-		Restorable:        k12.MistakeRestorable(r.Status, f),
+		Restorable: reviewState == k12.MistakeReviewSuppressed ||
+			k12.MistakeRestorable(r.Status, f),
 	}
 	if r.Status == k12.StatusArchived {
 		dto.ArchivedReason = f.ArchivedReason
@@ -1717,6 +1769,18 @@ func mistakeDTOFrom(r *records.AgentRecord, f k12.MistakeFields) mistakeDTO {
 		dto.RestoredAt = f.LastArchive.RestoredAt
 	}
 	return dto
+}
+
+func isMistakeReviewState(value string) bool {
+	switch value {
+	case k12.MistakeReviewScheduled,
+		k12.MistakeReviewDeferredThisWeek,
+		k12.MistakeReviewSuppressed,
+		k12.MistakeReviewMastered:
+		return true
+	default:
+		return false
+	}
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {

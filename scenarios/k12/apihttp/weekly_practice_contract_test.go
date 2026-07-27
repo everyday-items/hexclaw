@@ -73,7 +73,7 @@ func (weeklyAssessmentStub) AssessWeeklyPracticeAnswer(
 	return usecase.WeeklyPracticeAnswerAssessment{
 		AssessmentID: "assessment-" + req.Item.ItemID, Result: result,
 		VerificationEvidence: "system_verified:test-assessor",
-		Subject: "数学", KnowledgePoint: "整数计算",
+		Subject:              "数学", KnowledgePoint: "整数计算",
 	}, nil
 }
 
@@ -238,10 +238,12 @@ func TestWeeklyPracticeHTTPContract_K12Weekly016To023(t *testing.T) {
 	}
 	exactKeys(t, defaultSettings, "agent", "revision", "timezone",
 		"due_review_enabled", "textbook_consolidation_enabled",
+		"textbook_consolidation_tier",
 		"arithmetic_warmup_enabled", "arithmetic_minutes", "created_at", "updated_at")
 	if defaultSettings["revision"] != float64(0) ||
 		defaultSettings["due_review_enabled"] != true ||
 		defaultSettings["textbook_consolidation_enabled"] != false ||
+		defaultSettings["textbook_consolidation_tier"] != "standard" ||
 		defaultSettings["arithmetic_warmup_enabled"] != false ||
 		defaultSettings["arithmetic_minutes"] != float64(2) ||
 		defaultSettings["timezone"] != "Asia/Shanghai" {
@@ -299,7 +301,8 @@ func TestWeeklyPracticeHTTPContract_K12Weekly016To023(t *testing.T) {
 	exactKeys(t, plan, "plan_id", "agent", "revision", "iso_week_year",
 		"iso_week_number", "timezone", "week_start", "week_end",
 		"local_start_date", "local_end_date", "status", "settings_revision",
-		"curriculum_progress_revision", "tracks", "created_at", "updated_at")
+		"curriculum_progress_revision", "tracks", "manual_track_recommendations",
+		"created_at", "updated_at")
 	if len(plan["tracks"].([]any)) != 3 {
 		t.Fatalf("plan must expose exact three tracks: %v", plan["tracks"])
 	}
@@ -364,7 +367,7 @@ func TestWeeklyPracticeHTTPContract_K12Weekly016To023(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("snapshot GET status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	exactKeys(t, fetchedSnapshot, "snapshot_id", "plan_id", "plan_revision",
+	exactKeys(t, fetchedSnapshot, "snapshot_id", "artifact_id", "plan_id", "plan_revision",
 		"agent", "iso_week_year", "iso_week_number", "timezone", "week_start",
 		"week_end", "local_start_date", "local_end_date", "settings_revision",
 		"curriculum_progress_revision", "tracks", "render_version",
@@ -462,6 +465,7 @@ func TestWeeklyPracticeHTTPContract_K12Weekly016To023(t *testing.T) {
 	}
 	exactKeys(t, history, "items", "next_cursor")
 	exactKeys(t, history["items"].([]any)[0].(map[string]any), "snapshot_id",
-		"plan_id", "iso_week_year", "iso_week_number", "timezone",
-		"local_start_date", "local_end_date", "item_count", "archived_at")
+		"artifact_id", "plan_id", "iso_week_year", "iso_week_number", "timezone",
+		"local_start_date", "local_end_date", "item_count", "correct_count",
+		"wrong_count", "needs_review_count", "archived_at")
 }

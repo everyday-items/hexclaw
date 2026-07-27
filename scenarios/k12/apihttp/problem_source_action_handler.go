@@ -77,6 +77,7 @@ func (h *handler) problemSourceAction(w http.ResponseWriter, r *http.Request) {
 		r.Context(),
 		usecase.ProblemSourceActionCommand{
 			OwnerScope:            ownerScope,
+			TrustedAgentName:      problemSourceActionTrustedAgent(h.rt, ownerScope),
 			DispatchID:            dispatchID,
 			ProblemID:             problemID,
 			IdempotencyKey:        strings.TrimSpace(r.Header.Get("Idempotency-Key")),
@@ -98,6 +99,13 @@ func (h *handler) problemSourceAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func problemSourceActionTrustedAgent(rt Runtime, ownerScope string) string {
+	if strings.TrimSpace(rt.PrincipalMode) == "remote" {
+		return strings.TrimSpace(ownerScope)
+	}
+	return ""
 }
 
 func (h *handler) problemSourceActionOwnerScope(

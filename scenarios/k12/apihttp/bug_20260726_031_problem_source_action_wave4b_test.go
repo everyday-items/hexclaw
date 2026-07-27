@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
@@ -147,6 +149,30 @@ func TestBUG_20260726_031_ProblemSourceActionValidSkipReturnsReceiptAndSnapshot(
 	if assessmentCount != 0 {
 		t.Fatalf("skip must not create assessment/model side effects: %d", assessmentCount)
 	}
+	var mistakeCount, reviewCount, learningEventCount int
+	if err := seed.fixture.db.QueryRow(`
+		SELECT COUNT(*) FROM k12_mistakes WHERE agent_name='mingming'`,
+	).Scan(&mistakeCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.fixture.db.QueryRow(`
+		SELECT COUNT(*) FROM k12_mistakes
+		WHERE agent_name='mingming' AND due_at IS NOT NULL`,
+	).Scan(&reviewCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.fixture.db.QueryRow(`
+		SELECT COUNT(*) FROM outbox_events
+		WHERE agent_name='mingming' AND event_type='k12.mistake.recorded'`,
+	).Scan(&learningEventCount); err != nil {
+		t.Fatal(err)
+	}
+	if mistakeCount != 0 || reviewCount != 0 || learningEventCount != 0 {
+		t.Fatalf(
+			"skip polluted learning facts: mistakes=%d reviews=%d learning_events=%d",
+			mistakeCount, reviewCount, learningEventCount,
+		)
+	}
 }
 
 func TestBUG_20260726_031_ProblemSourceActionSameCommand100ConcurrentOneReceipt(t *testing.T) {
@@ -187,6 +213,67 @@ func TestBUG_20260726_031_ProblemSourceActionSameCommand100ConcurrentOneReceipt(
 	}
 }
 
+func TestBUG_20260726_031_ProblemSourceAction100DistinctCommandsHaveOneCASWinner(t *testing.T) {
+	seed := seedProblemSourceActionHTTP(t)
+	const requests = 100
+	type response struct {
+		code int
+		body map[string]any
+	}
+	results := make(chan response, requests)
+	var wg sync.WaitGroup
+	wg.Add(requests)
+	for i := 0; i < requests; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			rec, out := postProblemSourceAction(t, seed.fixture.handler,
+				seed.dispatchID, seed.problemID,
+				fmt.Sprintf("skip-cas-%03d", i), validSkipSourceActionBody)
+			results <- response{code: rec.Code, body: out}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	successes, conflicts := 0, 0
+	for result := range results {
+		switch result.code {
+		case http.StatusOK:
+			successes++
+		case http.StatusConflict:
+			conflicts++
+		default:
+			t.Fatalf("concurrent distinct skip = %d, want 200/409; body=%#v",
+				result.code, result.body)
+		}
+	}
+	if successes != 1 || conflicts != requests-1 {
+		t.Fatalf("CAS winners=%d conflicts=%d, want 1/%d",
+			successes, conflicts, requests-1)
+	}
+	var currentSkips, commandReceipts int
+	if err := seed.fixture.db.QueryRow(`
+		SELECT COUNT(*) FROM k12_problem_skip_receipts
+		WHERE agent_name='mingming' AND job_id=? AND problem_id=?
+		  AND current_disposition='current'`,
+		seed.jobID, seed.problemID,
+	).Scan(&currentSkips); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.fixture.db.QueryRow(`
+		SELECT COUNT(*) FROM k12_problem_source_action_receipts
+		WHERE agent_name='mingming' AND job_id=? AND problem_id=?`,
+		seed.jobID, seed.problemID,
+	).Scan(&commandReceipts); err != nil {
+		t.Fatal(err)
+	}
+	if currentSkips != 1 || commandReceipts != 1 {
+		t.Fatalf("CAS durable rows: current_skips=%d command_receipts=%d, want 1/1",
+			currentSkips, commandReceipts)
+	}
+}
+
 func TestBUG_20260726_031_ProblemSourceActionIdempotentReplayAndDigestConflict(t *testing.T) {
 	seed := seedProblemSourceActionHTTP(t)
 	firstRec, first := postProblemSourceAction(t, seed.fixture.handler,
@@ -214,11 +301,11 @@ func TestBUG_20260726_031_ProblemSourceActionIdempotentReplayAndDigestConflict(t
 func TestBUG_20260726_031_ProblemSourceActionRejectsStaleAndMismatchedScope(t *testing.T) {
 	seed := seedProblemSourceActionHTTP(t)
 	for _, tc := range []struct {
-		name      string
-		dispatch  string
-		problem   string
-		body      string
-		want      int
+		name     string
+		dispatch string
+		problem  string
+		body     string
+		want     int
 	}{
 		{
 			name: "stale structure", dispatch: seed.dispatchID, problem: seed.problemID,
@@ -250,6 +337,50 @@ func TestBUG_20260726_031_ProblemSourceActionRejectsStaleAndMismatchedScope(t *t
 				t.Fatalf("%s = %d, want %d; body=%#v", tc.name, rec.Code, tc.want, out)
 			}
 		})
+	}
+}
+
+func TestBUG_20260726_031_ProblemSourceActionUsesTrustedRemotePrincipal(t *testing.T) {
+	seed := seedProblemSourceActionHTTP(t)
+	remoteHandler := func(authenticatedOwner string) http.Handler {
+		return apihttp.NewHandler(apihttp.Runtime{
+			Records:       seed.fixture.coordinator.Records,
+			ImageTasks:    seed.fixture.coordinator,
+			PrincipalMode: "remote",
+			AuthenticatedOwnerScope: func(context.Context) (string, error) {
+				return authenticatedOwner, nil
+			},
+		})
+	}
+
+	rec, out := postProblemSourceAction(t, remoteHandler("gege"),
+		seed.dispatchID, seed.problemID, "cross-agent-skip", validSkipSourceActionBody)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-agent principal status=%d want 404 body=%#v", rec.Code, out)
+	}
+	var skipCount, commandCount int
+	if err := seed.fixture.db.QueryRow(`
+		SELECT COUNT(*) FROM k12_problem_skip_receipts
+		WHERE job_id=? AND problem_id=?`,
+		seed.jobID, seed.problemID,
+	).Scan(&skipCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.fixture.db.QueryRow(`
+		SELECT COUNT(*) FROM k12_problem_source_action_receipts
+		WHERE job_id=? AND problem_id=?`,
+		seed.jobID, seed.problemID,
+	).Scan(&commandCount); err != nil {
+		t.Fatal(err)
+	}
+	if skipCount != 0 || commandCount != 0 {
+		t.Fatalf("cross-agent principal wrote skip=%d command=%d", skipCount, commandCount)
+	}
+
+	rec, out = postProblemSourceAction(t, remoteHandler("mingming"),
+		seed.dispatchID, seed.problemID, "trusted-agent-skip", validSkipSourceActionBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("trusted remote principal status=%d want 200 body=%#v", rec.Code, out)
 	}
 }
 

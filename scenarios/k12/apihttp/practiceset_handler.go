@@ -434,13 +434,15 @@ func (h *handler) preparePracticePrintJob(w http.ResponseWriter, r *http.Request
 }
 
 type prepareGenericPrintReq struct {
-	Agent             string `json:"agent"`
-	IdempotencyKey    string `json:"idempotency_key"`
-	ArtifactID        string `json:"artifact_id,omitempty"`
-	SourceKind        string `json:"source_kind"`
-	SourceRef         string `json:"source_ref"`
-	Title             string `json:"title"`
-	CanonicalMarkdown string `json:"canonical_markdown"`
+	Agent               string `json:"agent"`
+	IdempotencyKey      string `json:"idempotency_key"`
+	ArtifactID          string `json:"artifact_id,omitempty"`
+	FinalArtifactID     string `json:"final_artifact_id,omitempty"`
+	FinalArtifactDigest string `json:"final_artifact_digest,omitempty"`
+	SourceKind          string `json:"source_kind"`
+	SourceRef           string `json:"source_ref"`
+	Title               string `json:"title"`
+	CanonicalMarkdown   string `json:"canonical_markdown"`
 }
 
 func printableArtifactDTO(v usecase.PrintableArtifactView) map[string]any {
@@ -459,11 +461,41 @@ func (h *handler) preparePrintableArtifact(w http.ResponseWriter, r *http.Reques
 	if !decode(w, r, &req) {
 		return
 	}
-	v, replay, err := h.rt.Deps.PreparePrintableArtifact(r.Context(),
-		usecase.PreparePrintableArtifactRequest{
-			AgentName: req.Agent, SourceKind: req.SourceKind, SourceRef: req.SourceRef,
-			Title: req.Title, CanonicalMarkdown: req.CanonicalMarkdown,
-		})
+	finalVariant := strings.TrimSpace(req.FinalArtifactID) != "" ||
+		strings.TrimSpace(req.FinalArtifactDigest) != ""
+	canonicalVariant := strings.TrimSpace(req.SourceKind) != "" ||
+		strings.TrimSpace(req.SourceRef) != "" ||
+		strings.TrimSpace(req.CanonicalMarkdown) != ""
+	if finalVariant == canonicalVariant {
+		writeErr(w, http.StatusBadRequest,
+			"final_artifact identity 与 canonical_markdown variant 必须且只能选择一个")
+		return
+	}
+	var (
+		v      usecase.PrintableArtifactView
+		replay bool
+		err    error
+	)
+	if finalVariant {
+		if strings.TrimSpace(req.Agent) == "" ||
+			strings.TrimSpace(req.FinalArtifactID) == "" ||
+			strings.TrimSpace(req.FinalArtifactDigest) == "" ||
+			strings.TrimSpace(req.Title) == "" {
+			writeErr(w, http.StatusBadRequest,
+				"agent / final_artifact_id / final_artifact_digest / title required")
+			return
+		}
+		v, replay, err = h.rt.Deps.PrepareGradingFinalArtifactPDFExact(
+			r.Context(), req.Agent, req.FinalArtifactID,
+			req.FinalArtifactDigest, req.Title,
+		)
+	} else {
+		v, replay, err = h.rt.Deps.PreparePrintableArtifact(r.Context(),
+			usecase.PreparePrintableArtifactRequest{
+				AgentName: req.Agent, SourceKind: req.SourceKind, SourceRef: req.SourceRef,
+				Title: req.Title, CanonicalMarkdown: req.CanonicalMarkdown,
+			})
+	}
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
 		return

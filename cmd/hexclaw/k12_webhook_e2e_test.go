@@ -161,16 +161,33 @@ func TestK12WebhookTextSubmissionUsesGradingJobApplicationCommand(t *testing.T) 
 	default:
 		t.Fatalf("confirmed text Job did not advance: %+v", confirmedView)
 	}
+	var receipts []k12.GradingAssessmentItem
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		job, err = runtime.Deps.GetGradingJob(context.Background(), "kid-agent", jobID)
-		if err == nil && job.Record.Status == k12.GradingStageCompleted {
+		if err == nil {
+			receipts, err = runtime.Deps.Records.ListGradingAssessmentItems(
+				context.Background(), "kid-agent", jobID,
+			)
+		}
+		if err == nil && len(receipts) == 1 &&
+			(job.Record.Status == k12.GradingStageProjecting ||
+				job.Record.Status == k12.GradingStageCompleted) {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if err != nil || job.Record.Status != k12.GradingStageCompleted {
-		t.Fatalf("text worker did not reach completed: job=%+v err=%v", job, err)
+	if err != nil || len(receipts) != 1 {
+		t.Fatalf("text worker did not persist one durable assessment: job=%+v receipts=%+v err=%v",
+			job, receipts, err)
+	}
+	receipt := receipts[0]
+	if receipt.ProblemID != problem.ProblemID ||
+		receipt.AttemptID != attempt.AttemptID ||
+		receipt.ConfirmedVersion != 1 ||
+		receipt.CurrentDisposition != k12.GradingAssessmentDispositionCurrent ||
+		receipt.ResultDigest == "" {
+		t.Fatalf("text worker persisted the wrong current assessment: %+v", receipt)
 	}
 	textResult, ok := grading.PhotoResult(jobID)
 	if !ok || strings.TrimSpace(textResult.Markdown) == "" || len(textResult.Items) != 1 {

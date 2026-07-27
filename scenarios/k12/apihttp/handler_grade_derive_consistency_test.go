@@ -12,11 +12,11 @@ import (
 
 func TestGradeDeriveConsistency_GradeEndpointDerivesFromProfile(t *testing.T) {
 	captured := ""
+	profiles := &memProfiles{m: map[string]k12.ChildProfile{
+		"mingming": {ChildName: "明明", GradeTerm: "五年级上"},
+	}}
 	h := newServerWithSolver(t, gradeCapturingExec{lastGrade: &captured},
-		assembly.WithProfiles(&memProfiles{m: map[string]k12.ChildProfile{}}))
-	if rec, _ := do(t, h, "PUT", "/profile", `{"agent":"mingming","child_name":"明明","grade_term":"五年级上"}`); rec.Code != http.StatusOK {
-		t.Fatalf("设档案应 200, got %d", rec.Code)
-	}
+		assembly.WithProfiles(profiles))
 	// POST /grade 不传 grade → solve 应携带档案年级（否则丢年级边界=超纲解法风险）。
 	if rec, _ := do(t, h, "POST", "/grade",
 		`{"agent":"mingming","problem":"3.8×3=?","student_answer":"10.4","knowledge_points":["小数乘法"]}`); rec.Code != http.StatusOK {

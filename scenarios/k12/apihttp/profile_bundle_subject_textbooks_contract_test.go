@@ -93,7 +93,7 @@ func TestProfileBundleRejectsNonCanonicalSubjectTextbooksWithoutWrites(t *testin
 	}
 }
 
-func TestProfileBundlePersistsCanonicalSubjectsAndLegacyPUTPatchesOnlyMath(t *testing.T) {
+func TestProfileBundlePersistsCanonicalSubjects(t *testing.T) {
 	h, deps, _ := newWeeklyContractServer(t)
 	rec, body := do(t, h, http.MethodPut, "/profile-bundle",
 		weeklyBundleBody("canonical-bundle", 0, 0, 0))
@@ -137,11 +137,87 @@ func TestProfileBundlePersistsCanonicalSubjectsAndLegacyPUTPatchesOnlyMath(t *te
 		}
 	}
 	assertMetadata("人教版")
+}
 
-	rec, _ = do(t, h, http.MethodPut, "/profile",
-		`{"agent":"mingming","child_name":"明明","grade_term":"五年级下","textbook_edition":"北师大版"}`)
+func TestBUG20260726034_LegacyProfilePUTAlwaysRejectedWithoutMutation(t *testing.T) {
+	h, deps, _ := newWeeklyContractServer(t)
+	rec, _ := do(t, h, http.MethodPut, "/profile-bundle",
+		weeklyBundleBody("bug-034-bundle", 0, 0, 0))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("legacy profile status=%d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("bundle status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	assertMetadata("北师大版")
+
+	type persistedState struct {
+		metadata string
+		profile  string
+		progress string
+		settings string
+	}
+	readState := func() persistedState {
+		t.Helper()
+		var metadata string
+		if err := deps.Records.DB().QueryRow(
+			`SELECT metadata FROM agents WHERE name='mingming'`).Scan(&metadata); err != nil {
+			t.Fatal(err)
+		}
+		profileRec, _ := do(t, h, http.MethodGet, "/profile?agent=mingming", "")
+		progressRec, _ := do(t, h, http.MethodGet,
+			"/curriculum-progress?agent=mingming&subject=math", "")
+		settingsRec, _ := do(t, h, http.MethodGet,
+			"/weekly-practice/settings?agent=mingming", "")
+		if profileRec.Code != http.StatusOK ||
+			progressRec.Code != http.StatusOK || settingsRec.Code != http.StatusOK {
+			t.Fatalf("GET compatibility status profile/progress/settings=%d/%d/%d",
+				profileRec.Code, progressRec.Code, settingsRec.Code)
+		}
+		return persistedState{
+			metadata: metadata,
+			profile:  profileRec.Body.String(),
+			progress: progressRec.Body.String(),
+			settings: settingsRec.Body.String(),
+		}
+	}
+	before := readState()
+	var beforeMeta map[string]string
+	if err := json.Unmarshal([]byte(before.metadata), &beforeMeta); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := beforeMeta["k12.subject_textbooks"]; exists {
+		t.Fatalf("forbidden metadata truth source exists: %v", beforeMeta)
+	}
+
+	requests := []string{
+		`{"agent":"mingming","child_name":"明明","grade_term":"五年级下","textbook_edition":"北师大版"}`,
+		`{"agent":"mingming","child_name":"明明同学","grade_term":"六年级上"}`,
+	}
+	for _, request := range requests {
+		rec, body := do(t, h, http.MethodPut, "/profile", request)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("BUG-20260726-034: PUT status=%d body=%s",
+				rec.Code, rec.Body.String())
+		}
+		if rec.Header().Get("Allow") != http.MethodGet {
+			t.Fatalf("BUG-20260726-034: Allow=%q want GET", rec.Header().Get("Allow"))
+		}
+		exactKeys(t, body, "error")
+		if body["error"] != "profile updates require /api/k12/profile-bundle" {
+			t.Fatalf("BUG-20260726-034: error body=%v", body)
+		}
+		after := readState()
+		if after != before {
+			t.Fatalf("BUG-20260726-034: rejected PUT mutated state: before=%+v after=%+v",
+				before, after)
+		}
+	}
+	profileRec, profile := do(t, h, http.MethodGet, "/profile?agent=mingming", "")
+	if profileRec.Code != http.StatusOK {
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET profile status=%d body=%s",
+				profileRec.Code, profileRec.Body.String())
+		}
+	}
+	if profile["child_name"] != "明明" || profile["grade_term"] != "五年级下" ||
+		profile["textbook_edition"] != "人教版" {
+		t.Fatalf("GET profile compatibility drifted: %v", profile)
+	}
 }

@@ -87,11 +87,17 @@ func (failingProfileStore) SaveProfile(context.Context, string, k12.ChildProfile
 	return errors.New("disk unavailable")
 }
 
-func TestUpdateProfile_InternalStorageFailureIs500(t *testing.T) {
+func TestUpdateProfile_LegacyRouteRejectedBeforeStorage(t *testing.T) {
 	h := apihttp.NewHandler(apihttp.Runtime{Deps: usecase.Deps{Profiles: failingProfileStore{}}})
 	rec, _ := do(t, h, http.MethodPut, "/profile", `{"agent":"mingming","grade_term":"五年级上"}`)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("profile storage failure status=%d want 500", rec.Code)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("legacy profile update status=%d want 405", rec.Code)
+	}
+	if got := rec.Header().Get("Allow"); got != http.MethodGet {
+		t.Fatalf("legacy profile update Allow=%q want GET", got)
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != `{"error":"profile updates require /api/k12/profile-bundle"}` {
+		t.Fatalf("legacy profile update body=%s", got)
 	}
 }
 
