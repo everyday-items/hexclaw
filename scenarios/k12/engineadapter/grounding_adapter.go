@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/knowledge"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
@@ -138,13 +139,18 @@ func (a *GroundingAdapter) FreezeGroundingSnapshot(
 	requested.LearnerID = strings.TrimSpace(requested.LearnerID)
 	requested.Subject = strings.TrimSpace(requested.Subject)
 	requested.TextbookBindingID = strings.TrimSpace(requested.TextbookBindingID)
+	requested.TextbookManifestID = strings.TrimSpace(requested.TextbookManifestID)
+	requested.DocumentID = strings.TrimSpace(requested.DocumentID)
 	requested.Edition = strings.TrimSpace(requested.Edition)
 	requested.Volume = strings.TrimSpace(requested.Volume)
+	requested.SegmentRefs = normalizeGroundingSegmentRefs(requested.SegmentRefs)
+	requested.PageRefs = cloneGroundingPageRefs(requested.PageRefs)
 	if requested.AgentName == "" || requested.LearnerID == "" || requested.Subject == "" {
 		return usecase.GroundingSnapshot{}, fmt.Errorf("grounding: agent / learner / subject required")
 	}
-	if requested.TextbookBindingID != "" && (requested.Edition == "" || requested.Volume == "") {
-		return usecase.GroundingSnapshot{}, fmt.Errorf("grounding: typed binding requires edition and volume")
+	if requested.TextbookBindingID != "" && !completeTypedGroundingScope(requested) {
+		return usecase.GroundingSnapshot{},
+			fmt.Errorf("grounding: typed binding scope is incomplete")
 	}
 	if revisions, ok := a.kb.(kbRevisionSnapshotter); ok {
 		revisionID, active, err := revisions.ActiveSemanticRevision(ctx)
@@ -170,6 +176,12 @@ func (a *GroundingAdapter) GroundSnapshot(
 		strings.TrimSpace(snapshot.Subject) == "" {
 		return "", false, fmt.Errorf("grounding: invalid frozen scope")
 	}
+	if strings.TrimSpace(snapshot.TextbookBindingID) == "" {
+		return "", false, nil
+	}
+	if !completeTypedGroundingScope(snapshot) {
+		return "", false, fmt.Errorf("grounding: incomplete frozen typed scope")
+	}
 	if pinned := strings.TrimSpace(snapshot.VectorRevisionID); pinned != "" {
 		revisions, ok := a.kb.(kbRevisionSnapshotter)
 		if !ok {
@@ -184,14 +196,6 @@ func (a *GroundingAdapter) GroundSnapshot(
 		}
 	}
 
-	var sources []string
-	if bindingID := strings.TrimSpace(snapshot.TextbookBindingID); bindingID != "" {
-		sources = []string{GroundingBindingSource(snapshot.LearnerID, snapshot.Subject, bindingID)}
-	} else {
-		// Explicit legacy compatibility. The projection does not label these
-		// hits as verified because there is no typed binding.
-		sources = []string{GroundingSubjectSource(snapshot.AgentName, snapshot.Subject)}
-	}
 	query := strings.Join(nonEmptyGroundingFacts(
 		snapshot.Edition,
 		snapshot.Volume,
@@ -199,7 +203,56 @@ func (a *GroundingAdapter) GroundSnapshot(
 		knowledgePoint,
 		"教材讲法",
 	), " ")
-	return a.groundBySourcesQuery(ctx, snapshot.AgentName, query, sources)
+	return a.groundByFilterQuery(ctx, snapshot.AgentName, query, knowledge.Filter{
+		DocumentGenerations: []knowledge.DocumentGenerationRef{{
+			DocumentID:         snapshot.DocumentID,
+			DocumentGeneration: snapshot.DocumentGeneration,
+		}},
+		ChunkIDs: append([]string(nil), snapshot.SegmentRefs...),
+	})
+}
+
+func completeTypedGroundingScope(snapshot usecase.GroundingSnapshot) bool {
+	return strings.TrimSpace(snapshot.TextbookBindingID) != "" &&
+		strings.TrimSpace(snapshot.TextbookManifestID) != "" &&
+		strings.TrimSpace(snapshot.DocumentID) != "" &&
+		snapshot.DocumentGeneration > 0 &&
+		strings.TrimSpace(snapshot.Edition) != "" &&
+		strings.TrimSpace(snapshot.Volume) != "" &&
+		len(normalizeGroundingSegmentRefs(snapshot.SegmentRefs)) > 0 &&
+		len(snapshot.PageRefs) > 0
+}
+
+func normalizeGroundingSegmentRefs(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func cloneGroundingPageRefs(
+	values []k12.TextbookGroundingPageRef,
+) []k12.TextbookGroundingPageRef {
+	out := make([]k12.TextbookGroundingPageRef, 0, len(values))
+	for _, value := range values {
+		value.SegmentRefs = normalizeGroundingSegmentRefs(value.SegmentRefs)
+		if value.LogicalPage < 1 || value.PDFPage < 1 ||
+			len(value.SegmentRefs) == 0 {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
 }
 
 func nonEmptyGroundingFacts(values ...string) []string {
@@ -218,13 +271,22 @@ func (a *GroundingAdapter) groundBySources(ctx context.Context, agentName, knowl
 }
 
 func (a *GroundingAdapter) groundBySourcesQuery(ctx context.Context, agentName, query string, sources []string) (string, bool, error) {
+	return a.groundByFilterQuery(
+		ctx, agentName, query, knowledge.Filter{Sources: sources},
+	)
+}
+
+func (a *GroundingAdapter) groundByFilterQuery(
+	ctx context.Context,
+	agentName, query string,
+	filter knowledge.Filter,
+) (string, bool, error) {
 	if a.kb == nil {
 		return "", false, nil
 	}
 	if strings.TrimSpace(agentName) == "" {
 		return "", false, fmt.Errorf("grounding: agentName 不可空")
 	}
-	filter := knowledge.Filter{Sources: sources}
 	if structured, ok := a.kb.(kbHitQuerier); ok {
 		_, hits, err := structured.QueryHitsWithFilter(ctx, query, a.topK, filter)
 		if err != nil {

@@ -13,10 +13,20 @@ func (d Deps) PrepareAndSendGradingFinalArtifact(
 	ctx context.Context,
 	agentName, finalArtifactID string,
 ) (k12.DeliveryBatch, bool, error) {
-	finalArtifact, err := d.Records.GetGradingFinalArtifact(
-		ctx,
-		strings.TrimSpace(agentName),
-		strings.TrimSpace(finalArtifactID),
+	return d.PrepareAndSendGradingFinalArtifactExact(
+		ctx, agentName, finalArtifactID, "",
+	)
+}
+
+// PrepareAndSendGradingFinalArtifactExact verifies the same immutable identity
+// used by print/export before creating or replaying a delivery batch.
+func (d Deps) PrepareAndSendGradingFinalArtifactExact(
+	ctx context.Context,
+	agentName, finalArtifactID, expectedDigest string,
+) (k12.DeliveryBatch, bool, error) {
+	finalArtifact, err := d.getExactGradingFinalArtifact(
+		ctx, strings.TrimSpace(agentName), strings.TrimSpace(finalArtifactID),
+		strings.TrimSpace(expectedDigest),
 	)
 	if err != nil {
 		return k12.DeliveryBatch{}, false, err

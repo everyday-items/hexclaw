@@ -78,9 +78,9 @@ func configureWeeklyBundle(
 			UnitID: "u1", EvidenceSource: "parent_confirmed",
 		},
 		WeeklyPracticeSettings: usecase.WeeklyPracticeSettingsInput{
-			Timezone: "Asia/Shanghai",
+			Timezone:                     "Asia/Shanghai",
 			TextbookConsolidationEnabled: enableSupplements,
-			ArithmeticWarmupEnabled: enableSupplements, ArithmeticMinutes: 2,
+			ArithmeticWarmupEnabled:      enableSupplements, ArithmeticMinutes: 2,
 		},
 	})
 	if err != nil {
@@ -215,13 +215,13 @@ func TestWeeklyEnsureReplayDoesNotInvokeCandidateProvider(t *testing.T) {
 	if _, _, err := d.EnsureWeeklyPracticePlan(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
-	if spy.calls != 2 {
-		t.Fatalf("first ensure calls=%d want two supplemental tracks", spy.calls)
+	if spy.calls != 1 {
+		t.Fatalf("first ensure calls=%d want only textbook consolidation", spy.calls)
 	}
 	if _, replay, err := d.EnsureWeeklyPracticePlan(context.Background(), req); err != nil || !replay {
 		t.Fatalf("ensure replay=%v err=%v", replay, err)
 	}
-	if spy.calls != 2 {
+	if spy.calls != 1 {
 		t.Fatalf("idempotent replay invoked provider again: calls=%d", spy.calls)
 	}
 }

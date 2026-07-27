@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/knowledge"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
@@ -34,13 +35,18 @@ func (k *groundingSnapshotKB) QueryWithFilter(
 	return "教材中的单位换算示例", nil
 }
 
-func TestGroundSnapshotPinsRevisionAndBindingSource(t *testing.T) {
+func TestGroundSnapshotPinsRevisionAndBindingDocumentScope(t *testing.T) {
 	ctx := context.Background()
 	kb := &groundingSnapshotKB{activeRevision: "revision-a"}
 	adapter := NewGroundingAdapter(kb)
 	requested := usecase.GroundingSnapshot{
 		AgentName: "小王的辅导助手", LearnerID: "learner-1", Subject: "数学",
 		TextbookBindingID: "binding-1", Edition: "人教版", Volume: "五年级下册",
+		TextbookManifestID: "manifest-1", DocumentID: "document-1",
+		DocumentGeneration: 3, SegmentRefs: []string{"segment-1"},
+		PageRefs: []k12.TextbookGroundingPageRef{{
+			LogicalPage: 1, PDFPage: 3, SegmentRefs: []string{"segment-1"},
+		}},
 	}
 	frozen, err := adapter.FreezeGroundingSnapshot(ctx, requested)
 	if err != nil {
@@ -63,13 +69,16 @@ func TestGroundSnapshotPinsRevisionAndBindingSource(t *testing.T) {
 	if err != nil || !found || text == "" {
 		t.Fatalf("ground frozen snapshot text=%q found=%v err=%v", text, found, err)
 	}
-	wantSource := GroundingBindingSource(
-		frozen.LearnerID,
-		frozen.Subject,
-		frozen.TextbookBindingID,
-	)
-	if len(kb.filter.Sources) != 1 || kb.filter.Sources[0] != wantSource {
-		t.Fatalf("binding filter=%v want [%q]", kb.filter.Sources, wantSource)
+	if len(kb.filter.Sources) != 0 {
+		t.Fatalf("typed binding used synthetic sources: %v", kb.filter.Sources)
+	}
+	if len(kb.filter.DocumentGenerations) != 1 ||
+		kb.filter.DocumentGenerations[0].DocumentID != "document-1" ||
+		kb.filter.DocumentGenerations[0].DocumentGeneration != 3 {
+		t.Fatalf("document-generation filter=%+v", kb.filter.DocumentGenerations)
+	}
+	if len(kb.filter.ChunkIDs) != 1 || kb.filter.ChunkIDs[0] != "segment-1" {
+		t.Fatalf("segment whitelist=%v", kb.filter.ChunkIDs)
 	}
 	for _, fact := range []string{"人教版", "五年级下册", "五年级下", "小数除法"} {
 		if !strings.Contains(kb.query, fact) {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -98,7 +99,29 @@ func (d Deps) ReviewQueue(ctx context.Context, agentName string) ([]ReviewItem, 
 	// 若同时留在普通到期队列，同一来源题会既作为抽查题、又作为普通复习题入卷，
 	// 破坏“最多混入两道且在途不重复”的产品不变量。
 	items := make([]ReviewItem, 0, len(mrecs)+len(arecs))
+	reviewStates, err := d.Records.ListMistakeReviewStates(ctx, agentName)
+	if err != nil {
+		return nil, fmt.Errorf("usecase: 取错题复习状态: %w", err)
+	}
+	location := time.UTC
+	if settings, settingsErr := d.Records.GetWeeklyPracticeSettings(
+		ctx, agentName,
+	); settingsErr == nil {
+		if loaded, loadErr := time.LoadLocation(settings.Timezone); loadErr == nil {
+			location = loaded
+		}
+	}
+	currentYear, currentWeek := time.Unix(now, 0).In(location).ISOWeek()
 	for _, r := range mrecs {
+		if review, ok := reviewStates[r.RecordID]; ok {
+			if review.State == k12.MistakeReviewSuppressed ||
+				review.State == k12.MistakeReviewMastered ||
+				(review.State == k12.MistakeReviewDeferredThisWeek &&
+					review.DeferredISOYear == currentYear &&
+					review.DeferredISOWeek == currentWeek) {
+				continue
+			}
+		}
 		f, _ := k12.ParseMistakeFields(r.Fields)
 		if f.SpotCheckState == k12.SpotCheckScheduled {
 			continue
@@ -300,7 +323,8 @@ func (d Deps) RestoreMistake(
 		ctx, recordID, restoredStatus, restoredDueAt,
 		string(raw), expectedVersion, agentName,
 	); err != nil {
-		if errors.Is(err, records.ErrVersionConflict) {
+		if errors.Is(err, records.ErrVersionConflict) ||
+			errors.Is(err, records.ErrIllegalTransition) {
 			latest, latestErr := d.Records.Get(ctx, recordID)
 			if latestErr == nil {
 				latestFields, parseErr := k12.ParseMistakeFields(latest.Fields)

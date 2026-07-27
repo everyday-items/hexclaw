@@ -143,20 +143,21 @@ type PracticeItem struct {
 	SourceProblemID        string `json:"source_problem_id,omitempty"` // 来源题；手工题可空
 	SourceMistakeSummary   string `json:"source_mistake_summary,omitempty"`
 	Subject                string `json:"subject"`
-	AddedVia               string `json:"added_via,omitempty"`             // 装篮来源（PRD §5.5），见 PracticeAddedVia*
-	GenerationStatus       string `json:"generation_status,omitempty"`     // queued/generating/validating/ready/failed
-	QuestionMarkdown       string `json:"question_markdown"`               // 规范题目，不含答案泄露
-	ExpectedAnswerMarkdown string `json:"expected_answer_markdown"`        // 规范答案，答案卷使用
-	VerificationStatus     string `json:"verification_status"`             // 见 §4.7，默认 pending
-	VerificationEvidence   string `json:"verification_evidence,omitempty"` // 验证方式（独立验算/字符比对/沙箱运行…）
-	BlockedReason          string `json:"blocked_reason,omitempty"`        // 非 verified 时的阻断原因
-	PaperSeq               int    `json:"paper_seq,omitempty"`             // 卷面题号（§4.13）：固化时按学科分组连续编号，只给入卷题；题级对齐锚点
-	Returned               bool   `json:"returned,omitempty"`              // 该题作答是否已回传（§3.8 部分回传）；补传合法幂等
-	PracticeProblemID      string `json:"practice_problem_id,omitempty"`   // 固化时铸造的独立 Problem（2026-07-18 #4c）：复批 Attempt 的归属对象；SourceProblemID 即 derived_from 来源链
-	GenerationJobID        string `json:"generation_job_id,omitempty"`     // 自定义组卷命令来源；普通装篮为空
-	VariantIndex           int    `json:"variant_index,omitempty"`         // 同一来源题内从 1 开始的变式序号
-	RequestedDifficulty    string `json:"requested_difficulty,omitempty"`  // same / easier / harder
-	ActualDifficulty       string `json:"actual_difficulty,omitempty"`     // 生成并验证后实际采用的难度
+	AddedVia               string `json:"added_via,omitempty"`               // 装篮来源（PRD §5.5），见 PracticeAddedVia*
+	GenerationStatus       string `json:"generation_status,omitempty"`       // queued/generating/validating/ready/failed
+	QuestionMarkdown       string `json:"question_markdown"`                 // 规范题目，不含答案泄露
+	ExpectedAnswerMarkdown string `json:"expected_answer_markdown"`          // 规范答案，答案卷使用
+	VerificationStatus     string `json:"verification_status"`               // 见 §4.7，默认 pending
+	VerificationEvidence   string `json:"verification_evidence,omitempty"`   // 验证方式（独立验算/字符比对/沙箱运行…）
+	BlockedReason          string `json:"blocked_reason,omitempty"`          // 非 verified 时的阻断原因
+	PaperSeq               int    `json:"paper_seq,omitempty"`               // 卷面题号（§4.13）：固化时按学科分组连续编号，只给入卷题；题级对齐锚点
+	Returned               bool   `json:"returned,omitempty"`                // 该题作答是否已回传（§3.8 部分回传）；补传合法幂等
+	PracticeProblemID      string `json:"practice_problem_id,omitempty"`     // 固化时铸造的独立 Problem（2026-07-18 #4c）：复批 Attempt 的归属对象；SourceProblemID 即 derived_from 来源链
+	GenerationJobID        string `json:"generation_job_id,omitempty"`       // 自定义组卷命令来源；普通装篮为空
+	VariantIndex           int    `json:"variant_index,omitempty"`           // 同一来源题内从 1 开始的变式序号
+	RequestedDifficulty    string `json:"requested_difficulty,omitempty"`    // same / easier / harder
+	ActualDifficulty       string `json:"actual_difficulty,omitempty"`       // 生成并验证后实际采用的难度
+	NormalizedContentHash  string `json:"normalized_content_hash,omitempty"` // 服务端规范化题目 Hash；目标练习集内唯一
 	// ResultCorrect 复批逐题结论（§3.8 第 3-4 条）：nil=尚无结论；部分回传允许多次复批，
 	// 每次覆盖已给结论的题、幂等；全部入卷题有结论后卷才转 graded。联动来源错题在用例层执行。
 	ResultCorrect  *bool  `json:"result_correct,omitempty"`

@@ -351,12 +351,30 @@ func gradingFinalArtifactPrintRequest(
 	title string,
 ) PreparePrintableArtifactRequest {
 	return PreparePrintableArtifactRequest{
-		AgentName: artifact.AgentName,
-		SourceKind: k12.PrintSourceGradingFinalArtifact,
-		SourceRef: "final_artifact:" + artifact.ArtifactID + ":" + artifact.ArtifactDigest,
-		Title: title,
+		AgentName:         artifact.AgentName,
+		SourceKind:        k12.PrintSourceGradingFinalArtifact,
+		SourceRef:         "final_artifact:" + artifact.ArtifactID + ":" + artifact.ArtifactDigest,
+		Title:             title,
 		CanonicalMarkdown: artifact.CanonicalMarkdown,
 	}
+}
+
+func (d Deps) getExactGradingFinalArtifact(
+	ctx context.Context,
+	agentName, finalArtifactID, expectedDigest string,
+) (k12.GradingFinalArtifact, error) {
+	finalArtifact, err := d.Records.GetGradingFinalArtifact(
+		ctx, strings.TrimSpace(agentName), strings.TrimSpace(finalArtifactID),
+	)
+	if err != nil {
+		return k12.GradingFinalArtifact{}, err
+	}
+	expectedDigest = strings.TrimSpace(expectedDigest)
+	if expectedDigest != "" && finalArtifact.ArtifactDigest != expectedDigest {
+		return k12.GradingFinalArtifact{},
+			fmt.Errorf("%w: final_artifact identity mismatch", ErrInvalidInput)
+	}
+	return finalArtifact, nil
 }
 
 // PrepareGradingFinalArtifactPDF reuses the canonical PDF renderer and reads
@@ -365,8 +383,19 @@ func (d Deps) PrepareGradingFinalArtifactPDF(
 	ctx context.Context,
 	agentName, finalArtifactID, title string,
 ) (PrintableArtifactView, bool, error) {
-	finalArtifact, err := d.Records.GetGradingFinalArtifact(
-		ctx, strings.TrimSpace(agentName), strings.TrimSpace(finalArtifactID),
+	return d.PrepareGradingFinalArtifactPDFExact(
+		ctx, agentName, finalArtifactID, "", title,
+	)
+}
+
+// PrepareGradingFinalArtifactPDFExact rejects a stale or cross-artifact
+// identity before deriving the shared immutable PDF.
+func (d Deps) PrepareGradingFinalArtifactPDFExact(
+	ctx context.Context,
+	agentName, finalArtifactID, expectedDigest, title string,
+) (PrintableArtifactView, bool, error) {
+	finalArtifact, err := d.getExactGradingFinalArtifact(
+		ctx, agentName, finalArtifactID, expectedDigest,
 	)
 	if err != nil {
 		return PrintableArtifactView{}, false, err
@@ -382,19 +411,19 @@ func (d Deps) PrepareGradingFinalArtifactPrint(
 	ctx context.Context,
 	agentName, finalArtifactID, title, idempotencyKey string,
 ) (GenericPrintView, bool, error) {
-	finalArtifact, err := d.Records.GetGradingFinalArtifact(
-		ctx, strings.TrimSpace(agentName), strings.TrimSpace(finalArtifactID),
+	finalArtifact, err := d.getExactGradingFinalArtifact(
+		ctx, agentName, finalArtifactID, "",
 	)
 	if err != nil {
 		return GenericPrintView{}, false, err
 	}
 	req := gradingFinalArtifactPrintRequest(finalArtifact, title)
 	return d.PrepareGenericPrint(ctx, PrepareGenericPrintRequest{
-		AgentName: req.AgentName,
-		IdempotencyKey: idempotencyKey,
-		SourceKind: req.SourceKind,
-		SourceRef: req.SourceRef,
-		Title: req.Title,
+		AgentName:         req.AgentName,
+		IdempotencyKey:    idempotencyKey,
+		SourceKind:        req.SourceKind,
+		SourceRef:         req.SourceRef,
+		Title:             req.Title,
 		CanonicalMarkdown: req.CanonicalMarkdown,
 	})
 }

@@ -1067,10 +1067,23 @@ func (o *GradingOrchestrator) runAssess(ctx context.Context, run *gradingRun, jo
 	if err != nil {
 		return GradingJobView{}, err
 	}
-	// ADR-K12-021 is an explicit one-way cutover. Legacy jobs keep the existing
-	// page-level invocation path; only a validated, frozen policy may write the
-	// V30 per-item ledger and receipts.
-	if job.Fields.BudgetSnapshot.IsFrozen() {
+	// ADR-K12-024 requires persisted text Problem/Attempt facts to reach the one
+	// page finalizer through durable per-item receipts. A zero budget snapshot
+	// remains an unfrozen legacy deadline policy; this cutover is intentionally
+	// limited to the typed text application path so historical photo deadline and
+	// cancellation semantics do not change without their own migration contract.
+	assessmentQuestions := RecognizedQuestionsForAssessment(run.questions)
+	hasDurableItemIdentity := len(assessmentQuestions) > 0
+	for _, question := range assessmentQuestions {
+		if strings.TrimSpace(question.ProblemID) == "" ||
+			strings.TrimSpace(question.AttemptID) == "" ||
+			question.ConfirmedVersion < 1 ||
+			strings.TrimSpace(question.InputDigest) == "" {
+			hasDurableItemIdentity = false
+			break
+		}
+	}
+	if job.Fields.BudgetSnapshot.IsFrozen() || (run.textOnly && hasDurableItemIdentity) {
 		return o.runAssessItems(ctx, run, job)
 	}
 	requestRaw, _ := json.Marshal(struct {

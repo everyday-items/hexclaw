@@ -24,13 +24,18 @@ type SubjectGrounding interface {
 // generation. A blank TextbookBindingID is an explicit legacy/text-only read
 // and must never be labelled as verified textbook evidence.
 type GroundingSnapshot struct {
-	AgentName         string
-	LearnerID         string
-	Subject           string
-	TextbookBindingID string
-	Edition           string
-	Volume            string
-	VectorRevisionID  string
+	AgentName          string
+	LearnerID          string
+	Subject            string
+	TextbookBindingID  string
+	TextbookManifestID string
+	DocumentID         string
+	DocumentGeneration int64
+	Edition             string
+	Volume              string
+	SegmentRefs         []string
+	PageRefs            []k12.TextbookGroundingPageRef
+	VectorRevisionID    string
 }
 
 // SnapshotGrounding is the canonical multi-query retrieval seam.

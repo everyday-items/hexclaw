@@ -10,6 +10,7 @@ import (
 
 type ProblemSourceActionCommand struct {
 	OwnerScope            string
+	TrustedAgentName      string
 	DispatchID            string
 	ProblemID             string
 	IdempotencyKey        string
@@ -39,6 +40,7 @@ func (c *ImageTaskCoordinator) CommitProblemSourceAction(
 		ctx,
 		k12storage.ProblemSourceActionCommand{
 			OwnerScope:            command.OwnerScope,
+			TrustedAgentName:      command.TrustedAgentName,
 			DispatchID:            command.DispatchID,
 			ProblemID:             command.ProblemID,
 			IdempotencyKey:        command.IdempotencyKey,

@@ -29,7 +29,6 @@ func (s *tutoringGroundingSnapshotSpy) FreezeGroundingSnapshot(
 ) (usecase.GroundingSnapshot, error) {
 	s.freezeCalls++
 	s.requested = requested
-	requested.TextbookBindingID = "binding-mingming-math-rj-5b"
 	requested.VectorRevisionID = s.active
 	return requested, nil
 }
@@ -46,6 +45,7 @@ func (s *tutoringGroundingSnapshotSpy) GroundSnapshot(
 
 func TestBuildTutoringTipsFreezesOneScopedKnowledgeSnapshot(t *testing.T) {
 	d := newDataDeps(t, "mingming")
+	seedBUG20260726008ActiveTextbookBinding(t, d)
 	if err := d.Records.PutProblemAttemptSnapshot(
 		context.Background(),
 		confirmedTipsFacts(1, "canonical"),
@@ -80,6 +80,7 @@ func TestBuildTutoringTipsFreezesOneScopedKnowledgeSnapshot(t *testing.T) {
 	if grounding.requested.AgentName != "mingming" ||
 		grounding.requested.LearnerID != "mingming" ||
 		grounding.requested.Subject != "数学" ||
+		grounding.requested.TextbookBindingID != "binding-math" ||
 		grounding.requested.Edition != "人教版" ||
 		grounding.requested.Volume != "下册" {
 		t.Fatalf("requested scope not derived once from server facts: %+v", grounding.requested)
@@ -88,7 +89,15 @@ func TestBuildTutoringTipsFreezesOneScopedKnowledgeSnapshot(t *testing.T) {
 		t.Fatalf("snapshot queries=%d want one per concept", len(grounding.queries))
 	}
 	for i, got := range grounding.queries {
-		if got.TextbookBindingID != "binding-mingming-math-rj-5b" ||
+		if got.TextbookBindingID != "binding-math" ||
+			got.TextbookManifestID != "manifest-math" ||
+			got.DocumentID != "doc-math" ||
+			got.DocumentGeneration != 1 ||
+			len(got.SegmentRefs) != 1 ||
+			got.SegmentRefs[0] != "segment-1" ||
+			len(got.PageRefs) != 1 ||
+			got.PageRefs[0].LogicalPage != 1 ||
+			got.PageRefs[0].PDFPage != 1 ||
 			got.VectorRevisionID != "revision-a" {
 			t.Fatalf("query[%d] crossed frozen binding/revision: %+v", i, got)
 		}

@@ -105,7 +105,7 @@ func (d Deps) BuildTutoringTipsSubject(ctx context.Context, agentName, gradingJo
 	if err != nil {
 		return TutoringTips{}, err
 	}
-	grounding := d.freezeTutoringGrounding(ctx, GroundingSnapshot{
+	groundingRequest := GroundingSnapshot{
 		AgentName: agentName,
 		// The durable profile is currently keyed by agent. This is an explicit
 		// transitional owner scope, not a fabricated independent learner ID.
@@ -113,7 +113,26 @@ func (d Deps) BuildTutoringTipsSubject(ctx context.Context, agentName, gradingJo
 		Subject:   subject,
 		Edition:   strings.TrimSpace(profile.TextbookEdition),
 		Volume:    textbookVolumeFromGradeTerm(grade),
-	})
+	}
+	if d.Records != nil && subject == "数学" {
+		if scope, found, resolveErr := d.Records.GetActiveTextbookGroundingScope(
+			ctx, agentName, "math",
+		); resolveErr == nil && found {
+			groundingRequest.TextbookBindingID = scope.TextbookBindingID
+			groundingRequest.TextbookManifestID = scope.TextbookManifestID
+			groundingRequest.DocumentID = scope.DocumentID
+			groundingRequest.DocumentGeneration = scope.DocumentGeneration
+			groundingRequest.Edition = scope.Edition
+			groundingRequest.Volume = scope.Volume
+			groundingRequest.SegmentRefs = append(
+				[]string(nil), scope.SegmentRefs...,
+			)
+			groundingRequest.PageRefs = append(
+				[]k12.TextbookGroundingPageRef(nil), scope.PageRefs...,
+			)
+		}
+	}
+	grounding := d.freezeTutoringGrounding(ctx, groundingRequest)
 
 	ctx, cancel := context.WithTimeout(ctx, tutoringTipsBuildBudget)
 	defer cancel()

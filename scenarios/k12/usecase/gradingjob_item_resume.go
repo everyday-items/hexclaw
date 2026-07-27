@@ -28,13 +28,15 @@ type DefinitiveProviderResponse interface {
 	ProviderResponseStatusCode() int
 }
 
-// runAssessItems is the ADR-K12-021 assessing cutover. It is only called for a
-// validated frozen budget snapshot. The stage-level ModelInvocation remains the
-// aggregate accounting/reconciliation anchor; every external solve/grade
-// operation additionally gets its own durable ledger entry, while each final
-// item and its local projection are committed atomically. Only the historical
-// Assessment/Mistake/Outbox projection path is excluded from this cutover -- the
-// aggregate invocation is deliberately complementary, not a competing write.
+// runAssessItems is the ADR-K12-021/024 assessing cutover. Frozen policies use
+// their measured concurrency; typed legacy jobs retain the historical
+// concurrency of two without manufacturing a frozen budget. The stage-level
+// ModelInvocation remains the aggregate accounting/reconciliation anchor; every
+// external solve/grade operation additionally gets its own durable ledger entry,
+// while each final item and its local projection are committed atomically. Only
+// the historical Assessment/Mistake/Outbox projection path is excluded from this
+// cutover -- the aggregate invocation is deliberately complementary, not a
+// competing write.
 func (o *GradingOrchestrator) runAssessItems(
 	ctx context.Context,
 	run *gradingRun,
@@ -154,10 +156,14 @@ func (o *GradingOrchestrator) runAssessItems(
 		return current, nil
 	}
 
+	itemConcurrency := job.Fields.BudgetSnapshot.ItemConcurrency
+	if itemConcurrency == 0 {
+		itemConcurrency = 2
+	}
 	result, assessErr := assessDeps.gradeFrozenHomeworkPhotoWithAssessor(
 		providerCtx,
 		run.req,
-		job.Fields.BudgetSnapshot.ItemConcurrency,
+		itemConcurrency,
 		func(itemCtx context.Context, req PhotoGradeRequest, mode PhotoMode, q RecognizedQuestion) (PhotoGradeItem, error) {
 			return o.assessDurablePhotoItem(itemCtx, assessDeps, job, req, mode, q)
 		},

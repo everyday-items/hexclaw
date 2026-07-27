@@ -29,11 +29,11 @@ type WeeklyCurriculumCatalogSource interface {
 }
 
 type WeeklyPracticeCandidateRequest struct {
-	AgentName       string
-	PlanSection     string
-	MaxItems        int
+	AgentName         string
+	PlanSection       string
+	MaxItems          int
 	ArithmeticMinutes int
-	Progress        k12.CurriculumProgress
+	Progress          k12.CurriculumProgress
 }
 
 type WeeklyPracticeCandidate struct {
@@ -51,18 +51,19 @@ type WeeklyPracticeCandidateSource interface {
 }
 
 type WeeklyPracticeAnswerRequest struct {
-	AgentName    string
-	SnapshotID  string
-	Item        k12.WeeklyPracticeItem
-	StudentAnswer string
+	AgentName        string
+	SnapshotID       string
+	Item             k12.WeeklyPracticeItem
+	StudentAnswer    string
+	VerifiedSolution string
 }
 
 type WeeklyPracticeAnswerAssessment struct {
-	AssessmentID        string
-	Result              string
-	VerificationEvidence string
-	Subject             string
-	KnowledgePoint      string
+	AssessmentID         string `json:"assessment_id"`
+	Result               string `json:"result"`
+	VerificationEvidence string `json:"verification_evidence"`
+	Subject              string `json:"subject"`
+	KnowledgePoint       string `json:"knowledge_point"`
 }
 
 type WeeklyPracticeAnswerAssessor interface {
@@ -70,32 +71,35 @@ type WeeklyPracticeAnswerAssessor interface {
 }
 
 type CurriculumProgressInput struct {
-	Subject           string
-	TextbookBindingID string
-	Volume            string
-	UnitID            string
-	LessonID          string
-	PageFrom          *int
-	PageTo            *int
-	EvidenceSource    string
+	Subject            string
+	TextbookBindingID  string
+	TextbookManifestID string
+	Volume             string
+	UnitID             string
+	LessonID           string
+	PageFrom           *int
+	PageTo             *int
+	EvidenceSource     string
 }
 
 type WeeklyPracticeSettingsInput struct {
 	Timezone                     string
 	TextbookConsolidationEnabled bool
+	TextbookConsolidationTier    string
 	ArithmeticWarmupEnabled      bool
 	ArithmeticMinutes            int
 }
 
 type UpdateProfileBundleRequest struct {
-	AgentName                 string
-	IdempotencyKey            string
-	ExpectedProfileRevision   int
-	ExpectedProgressRevision  int
-	ExpectedSettingsRevision  int
-	Profile                   k12.ChildProfile
-	CurriculumProgress        CurriculumProgressInput
-	WeeklyPracticeSettings    WeeklyPracticeSettingsInput
+	AgentName                string
+	IdempotencyKey           string
+	ExpectedProfileRevision  int
+	ExpectedProgressRevision int
+	ExpectedSettingsRevision int
+	AgentConfig              *k12.ProfileBundleAgentConfig
+	Profile                  k12.ChildProfile
+	CurriculumProgress       CurriculumProgressInput
+	WeeklyPracticeSettings   WeeklyPracticeSettingsInput
 }
 
 type profilePublisher interface {
@@ -118,7 +122,7 @@ func (d Deps) GetProfileWithRevision(ctx context.Context, agentName string) (k12
 		return k12.WeeklyProfile{
 			ChildName: p.ChildName, GradeTerm: p.GradeTerm,
 			SubjectTextbooks: p.SubjectTextbooks,
-			TextbookEdition: p.TextbookEdition, Revision: revision,
+			TextbookEdition:  p.TextbookEdition, Revision: revision,
 		}, nil
 	}
 	if d.Records != nil {
@@ -132,11 +136,20 @@ func (d Deps) GetWeeklyCurriculumCatalog(ctx context.Context, req WeeklyCurricul
 	req.Subject = strings.TrimSpace(req.Subject)
 	req.TextbookEdition = strings.TrimSpace(req.TextbookEdition)
 	req.Volume = strings.TrimSpace(req.Volume)
-	if req.AgentName == "" || req.Subject != "math" || req.TextbookEdition == "" || req.Volume == "" {
-		return k12.CurriculumCatalog{}, fmt.Errorf("%w: agent/subject=math/textbook_edition/volume required", ErrInvalidInput)
+	if req.AgentName == "" || req.Subject != "math" {
+		return k12.CurriculumCatalog{}, fmt.Errorf("%w: agent/subject=math required", ErrInvalidInput)
 	}
 	if d.Records == nil {
 		return k12.CurriculumCatalog{}, fmt.Errorf("%w: records unavailable", ErrCurriculumCatalogUnavailable)
+	}
+	if catalog, handled, err := d.Records.GetActiveTextbookCatalog(
+		ctx, req.AgentName, req.Subject,
+	); handled || err != nil {
+		return catalog, err
+	}
+	if req.TextbookEdition == "" || req.Volume == "" {
+		return k12.CurriculumCatalog{},
+			fmt.Errorf("%w: textbook_edition/volume required", ErrInvalidInput)
 	}
 	if _, err := d.Records.GetProfileState(ctx, req.AgentName); err != nil {
 		return k12.CurriculumCatalog{}, err
@@ -185,6 +198,34 @@ func (d Deps) GetWeeklyPracticeSettings(ctx context.Context, agentName string) (
 	return d.Records.GetWeeklyPracticeSettings(ctx, agentName)
 }
 
+var mandatoryK12ProfileSkills = [...]string{
+	"k12-pedagogy", "homework-checker", "math-tutor",
+	"grade-constraint", "k12_grade", "k12_review",
+}
+
+func normalizeK12ProfileSkills(input []string) []string {
+	result := make([]string, 0, len(input)+len(mandatoryK12ProfileSkills))
+	seen := make(map[string]struct{}, cap(result))
+	appendSkill := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, exists := seen[value]; exists {
+			return
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	for _, skill := range input {
+		appendSkill(skill)
+	}
+	for _, skill := range mandatoryK12ProfileSkills {
+		appendSkill(skill)
+	}
+	return result
+}
+
 func (d Deps) UpdateProfileBundle(ctx context.Context, req UpdateProfileBundleRequest) (k12.ProfileBundleResult, error) {
 	req.AgentName = strings.TrimSpace(req.AgentName)
 	req.IdempotencyKey = strings.TrimSpace(req.IdempotencyKey)
@@ -202,6 +243,20 @@ func (d Deps) UpdateProfileBundle(ctx context.Context, req UpdateProfileBundleRe
 	}
 	req.Profile.SubjectTextbooks = textbooks
 	req.Profile.TextbookEdition = textbooks.Math
+	if req.AgentConfig != nil {
+		req.AgentConfig.DisplayName = strings.TrimSpace(req.AgentConfig.DisplayName)
+		req.AgentConfig.Description = strings.TrimSpace(req.AgentConfig.Description)
+		req.AgentConfig.SystemPrompt = strings.TrimSpace(req.AgentConfig.SystemPrompt)
+		req.AgentConfig.Provider = strings.TrimSpace(req.AgentConfig.Provider)
+		req.AgentConfig.Model = strings.TrimSpace(req.AgentConfig.Model)
+		req.AgentConfig.Skills = normalizeK12ProfileSkills(req.AgentConfig.Skills)
+		if req.AgentConfig.DisplayName == "" || req.AgentConfig.Description == "" ||
+			req.AgentConfig.SystemPrompt == "" ||
+			(req.AgentConfig.Provider == "") != (req.AgentConfig.Model == "") {
+			return k12.ProfileBundleResult{},
+				fmt.Errorf("%w: invalid agent_config", ErrInvalidInput)
+		}
+	}
 	if err := k12.ValidateProfileGradeTerm(req.Profile.GradeTerm); err != nil {
 		return k12.ProfileBundleResult{}, fmt.Errorf("%w: %v", ErrInvalidInput, err)
 	}
@@ -209,10 +264,24 @@ func (d Deps) UpdateProfileBundle(ctx context.Context, req UpdateProfileBundleRe
 	if err != nil {
 		return k12.ProfileBundleResult{}, err
 	}
-	catalog, err := d.GetWeeklyCurriculumCatalog(ctx, WeeklyCurriculumCatalogRequest{
-		AgentName: req.AgentName, Subject: strings.TrimSpace(req.CurriculumProgress.Subject),
-		TextbookEdition: req.Profile.TextbookEdition, Volume: req.CurriculumProgress.Volume,
-	})
+	var catalog k12.CurriculumCatalog
+	req.CurriculumProgress.TextbookManifestID =
+		strings.TrimSpace(req.CurriculumProgress.TextbookManifestID)
+	if req.CurriculumProgress.TextbookManifestID != "" {
+		if strings.TrimSpace(req.CurriculumProgress.TextbookBindingID) != "" {
+			return k12.ProfileBundleResult{},
+				fmt.Errorf("%w: client must not submit textbook_binding_id", ErrInvalidInput)
+		}
+		catalog, err = d.Records.GetTextbookManifestCatalog(
+			ctx, req.AgentName, strings.TrimSpace(req.CurriculumProgress.Subject),
+			req.CurriculumProgress.TextbookManifestID,
+		)
+	} else {
+		catalog, err = d.GetWeeklyCurriculumCatalog(ctx, WeeklyCurriculumCatalogRequest{
+			AgentName: req.AgentName, Subject: strings.TrimSpace(req.CurriculumProgress.Subject),
+			TextbookEdition: req.Profile.TextbookEdition, Volume: req.CurriculumProgress.Volume,
+		})
+	}
 	if err != nil {
 		return k12.ProfileBundleResult{}, err
 	}
@@ -221,16 +290,17 @@ func (d Deps) UpdateProfileBundle(ctx context.Context, req UpdateProfileBundleRe
 		return k12.ProfileBundleResult{}, err
 	}
 	digest := digestValue(struct {
-		AgentName string
-		ExpectedProfileRevision int
+		AgentName                string
+		ExpectedProfileRevision  int
 		ExpectedProgressRevision int
 		ExpectedSettingsRevision int
-		Profile k12.ChildProfile
-		Progress CurriculumProgressInput
-		Settings WeeklyPracticeSettingsInput
+		AgentConfig              *k12.ProfileBundleAgentConfig
+		Profile                  k12.ChildProfile
+		Progress                 CurriculumProgressInput
+		Settings                 WeeklyPracticeSettingsInput
 	}{
 		req.AgentName, req.ExpectedProfileRevision, req.ExpectedProgressRevision,
-		req.ExpectedSettingsRevision, req.Profile, req.CurriculumProgress,
+		req.ExpectedSettingsRevision, req.AgentConfig, req.Profile, req.CurriculumProgress,
 		req.WeeklyPracticeSettings,
 	})
 	result, _, err := d.Records.UpdateProfileBundle(ctx, k12storage.ProfileBundleMutation{
@@ -238,7 +308,8 @@ func (d Deps) UpdateProfileBundle(ctx context.Context, req UpdateProfileBundleRe
 		RequestDigest: digest, ExpectedProfileRevision: req.ExpectedProfileRevision,
 		ExpectedProgressRevision: req.ExpectedProgressRevision,
 		ExpectedSettingsRevision: req.ExpectedSettingsRevision,
-		Profile: req.Profile, Progress: progress, Settings: settings, At: d.now(),
+		AgentConfig:              req.AgentConfig,
+		Profile:                  req.Profile, Progress: progress, Settings: settings, At: d.now(),
 	})
 	if err != nil {
 		return k12.ProfileBundleResult{}, err
@@ -251,28 +322,52 @@ func (d Deps) UpdateProfileBundle(ctx context.Context, req UpdateProfileBundleRe
 	return result, nil
 }
 
+func weeklyTextbookTierItemCount(tier string) (int, bool) {
+	switch tier {
+	case k12.WeeklyTextbookTierLess:
+		return 2, true
+	case k12.WeeklyTextbookTierStandard:
+		return 3, true
+	case k12.WeeklyTextbookTierMore:
+		return 4, true
+	default:
+		return 0, false
+	}
+}
+
 func normalizeWeeklySettings(agent string, in WeeklyPracticeSettingsInput) (k12.WeeklyPracticeSettings, error) {
 	in.Timezone = strings.TrimSpace(in.Timezone)
+	in.TextbookConsolidationTier = strings.TrimSpace(in.TextbookConsolidationTier)
+	if in.TextbookConsolidationTier == "" {
+		in.TextbookConsolidationTier = k12.WeeklyTextbookTierStandard
+	}
 	if in.Timezone == "" || in.ArithmeticMinutes < 1 || in.ArithmeticMinutes > 5 {
 		return k12.WeeklyPracticeSettings{}, fmt.Errorf("%w: timezone and arithmetic_minutes 1..5 required", ErrInvalidInput)
 	}
 	if _, err := time.LoadLocation(in.Timezone); err != nil {
 		return k12.WeeklyPracticeSettings{}, fmt.Errorf("%w: invalid timezone", ErrInvalidInput)
 	}
+	if _, ok := weeklyTextbookTierItemCount(in.TextbookConsolidationTier); !ok {
+		return k12.WeeklyPracticeSettings{}, fmt.Errorf("%w: textbook_consolidation_tier must be less, standard, or more", ErrInvalidInput)
+	}
 	return k12.WeeklyPracticeSettings{
 		AgentName: agent, Timezone: in.Timezone, DueReviewEnabled: true,
 		TextbookConsolidationEnabled: in.TextbookConsolidationEnabled,
-		ArithmeticWarmupEnabled: in.ArithmeticWarmupEnabled,
-		ArithmeticMinutes: in.ArithmeticMinutes,
+		TextbookConsolidationTier:    in.TextbookConsolidationTier,
+		ArithmeticWarmupEnabled:      in.ArithmeticWarmupEnabled,
+		ArithmeticMinutes:            in.ArithmeticMinutes,
 	}, nil
 }
 
 func resolveCurriculumProgress(agent string, in CurriculumProgressInput,
 	catalog k12.CurriculumCatalog, at int64) (k12.CurriculumProgress, error) {
 	if strings.TrimSpace(in.EvidenceSource) != "parent_confirmed" ||
-		strings.TrimSpace(in.TextbookBindingID) != catalog.TextbookBindingID ||
 		strings.TrimSpace(in.Volume) != catalog.Volume || strings.TrimSpace(in.UnitID) == "" {
 		return k12.CurriculumProgress{}, fmt.Errorf("%w: unverified curriculum progress", ErrInvalidInput)
+	}
+	manifestID := strings.TrimSpace(in.TextbookManifestID)
+	if manifestID == "" && strings.TrimSpace(in.TextbookBindingID) != catalog.TextbookBindingID {
+		return k12.CurriculumProgress{}, fmt.Errorf("%w: unverified textbook binding", ErrInvalidInput)
 	}
 	var unit *k12.CurriculumCatalogUnit
 	for i := range catalog.Units {
@@ -300,12 +395,13 @@ func resolveCurriculumProgress(agent string, in CurriculumProgressInput,
 	}
 	p := k12.CurriculumProgress{
 		ProgressID: "curr-" + shortDigest(agent+"\x00"+in.Subject),
-		AgentName: agent, Subject: in.Subject, TextbookBindingID: catalog.TextbookBindingID,
-		TextbookEdition: catalog.TextbookEdition, TextbookVersion: catalog.TextbookVersion,
+		AgentName:  agent, Subject: in.Subject, TextbookBindingID: catalog.TextbookBindingID,
+		TextbookManifestID: manifestID,
+		TextbookEdition:    catalog.TextbookEdition, TextbookVersion: catalog.TextbookVersion,
 		Title: catalog.Title, Volume: catalog.Volume, UnitID: unit.UnitID,
 		UnitTitle: unit.Title, LessonID: in.LessonID, LessonTitle: lessonTitle,
 		PageVerificationStatus: "not_requested",
-		SegmentRefs: []string{"unit:" + unit.UnitID}, EvidenceSource: "parent_confirmed",
+		SegmentRefs:            []string{"unit:" + unit.UnitID}, EvidenceSource: "parent_confirmed",
 		ConfirmedAt: at, CreatedAt: at, UpdatedAt: at,
 	}
 	if p.LessonID != "" {
@@ -373,13 +469,13 @@ func (d Deps) EnsureWeeklyPracticePlan(ctx context.Context,
 		return k12.WeeklyPracticePlan{}, false, err
 	}
 	sourceDigest := digestValue(struct {
-		Agent string
-		Year int
-		Week int
-		Timezone string
+		Agent            string
+		Year             int
+		Week             int
+		Timezone         string
 		SettingsRevision int
 		ProgressRevision int
-		Due k12.WeeklyPracticeTrack
+		Due              k12.WeeklyPracticeTrack
 	}{
 		req.AgentName, window.Year, window.Week, settings.Timezone, settings.Revision,
 		progressRevision(progress), dueTrack,
@@ -389,27 +485,28 @@ func (d Deps) EnsureWeeklyPracticePlan(ctx context.Context,
 		settings.Timezone, d.now()); replayErr != nil {
 		return k12.WeeklyPracticePlan{}, false, replayErr
 	} else if found {
-		return stored, true, nil
+		projected, projectErr := d.projectWeeklyArithmetic(ctx, stored)
+		return projected, true, projectErr
 	}
 	tracks := []k12.WeeklyPracticeTrack{dueTrack}
 	answerKeys := dueKeys
 	elapsed := len(dueTrack.Items) * 60
-	syncTrack, syncKeys, syncSeconds := d.weeklySupplementTrack(
+	syncItemCount, _ := weeklyTextbookTierItemCount(settings.TextbookConsolidationTier)
+	syncTrack, syncKeys, _ := d.weeklySupplementTrack(
 		ctx, req.AgentName, k12.WeeklySectionTextbookConsolidation,
-		settings.TextbookConsolidationEnabled, progress, 4, 0, max(0, 600-elapsed))
+		settings.TextbookConsolidationEnabled, progress, syncItemCount, 0, max(0, 600-elapsed))
 	tracks = append(tracks, syncTrack)
-	elapsed += syncSeconds
 	for key, value := range syncKeys {
 		answerKeys[key] = value
 	}
-	arithmeticTrack, arithmeticKeys, _ := d.weeklySupplementTrack(
-		ctx, req.AgentName, k12.WeeklySectionArithmeticWarmup,
-		settings.ArithmeticWarmupEnabled, progress, 100, settings.ArithmeticMinutes,
-		min(settings.ArithmeticMinutes*60, max(0, 600-elapsed)))
-	tracks = append(tracks, arithmeticTrack)
-	for key, value := range arithmeticKeys {
-		answerKeys[key] = value
+	arithmeticTrack := k12.WeeklyPracticeTrack{
+		PlanSection: k12.WeeklySectionArithmeticWarmup,
+		Status:      k12.WeeklyTrackDisabled, Items: []k12.WeeklyPracticeItem{},
 	}
+	if settings.ArithmeticWarmupEnabled {
+		arithmeticTrack.Status = k12.WeeklyTrackReady
+	}
+	tracks = append(tracks, arithmeticTrack)
 	at := d.now()
 	progressRev := optionalProgressRevision(progress)
 	plan := k12.WeeklyPracticePlan{
@@ -423,12 +520,29 @@ func (d Deps) EnsureWeeklyPracticePlan(ctx context.Context,
 		CurriculumProgressRevision: progressRev, Tracks: tracks,
 		CreatedAt: at, UpdatedAt: at, SourceDigest: sourceDigest, AnswerKeys: answerKeys,
 	}
-	return d.Records.UpsertWeeklyPracticePlan(ctx, plan, req.IdempotencyKey, sourceDigest)
+	stored, replay, err := d.Records.UpsertWeeklyPracticePlan(
+		ctx, plan, req.IdempotencyKey, sourceDigest)
+	if err != nil {
+		return k12.WeeklyPracticePlan{}, false, err
+	}
+	if settings.TextbookConsolidationEnabled && progress != nil {
+		checkpoint, _ := json.Marshal(WeeklyPracticeCandidateRequest{
+			AgentName:   req.AgentName,
+			PlanSection: k12.WeeklySectionTextbookConsolidation,
+			MaxItems:    syncItemCount, Progress: *progress,
+		})
+		if err := d.Records.PutWeeklyTrackCheckpoint(ctx, stored.AgentName,
+			stored.PlanID, stored.Revision, string(checkpoint), stored.CreatedAt); err != nil {
+			return k12.WeeklyPracticePlan{}, false, err
+		}
+	}
+	projected, err := d.projectWeeklyArithmetic(ctx, stored)
+	return projected, replay, err
 }
 
 type isoWeeklyWindow struct {
-	Year, Week int
-	Start, End int64
+	Year, Week           int
+	Start, End           int64
 	LocalStart, LocalEnd string
 }
 
@@ -458,18 +572,41 @@ func (d Deps) weeklyDueTrack(ctx context.Context, agent string) (k12.WeeklyPract
 		Items: []k12.WeeklyPracticeItem{},
 	}
 	keys := map[string]string{}
+	seenSourceRefs := map[string]struct{}{}
+	seenCanonicalProblems := map[string]struct{}{}
 	for _, due := range queue {
-		if due.Record == nil || due.Record.Collection != k12.CollectionMistakes || len(track.Items) >= 15 {
+		if due.Record == nil || due.Record.Collection != k12.CollectionMistakes {
 			continue
 		}
+		sourceRef := strings.TrimSpace(due.Record.RecordID)
+		if sourceRef == "" {
+			continue
+		}
+		if _, duplicate := seenSourceRefs[sourceRef]; duplicate {
+			continue
+		}
+		canonicalHash, _, err := k12.StablePracticeProblemHash(k12.PracticeCandidateProblem{
+			Subject: due.Subject(), QuestionMarkdown: due.Title(),
+		})
+		if err != nil {
+			return k12.WeeklyPracticeTrack{}, nil, err
+		}
+		if _, duplicate := seenCanonicalProblems[canonicalHash]; duplicate {
+			continue
+		}
+		if len(track.Items) >= 15 {
+			break
+		}
+		seenSourceRefs[sourceRef] = struct{}{}
+		seenCanonicalProblems[canonicalHash] = struct{}{}
 		itemID := "witem-" + shortDigest(k12.WeeklySectionDueReview+"\x00"+due.Record.RecordID)
 		item := k12.WeeklyPracticeItem{
 			ItemID: itemID, Position: len(track.Items) + 1,
 			PlanSection: k12.WeeklySectionDueReview, SourceKind: "mistake",
 			GenerationMethod: k12.WeeklyGenerationMethodOriginal,
-			SourceRef: due.Record.RecordID,
+			SourceRef:        due.Record.RecordID,
 			Verification: k12.WeeklyPracticeVerification{
-				Status: k12.WeeklyVerificationVerified,
+				Status:       k12.WeeklyVerificationVerified,
 				EvidenceRefs: []string{"mistake:" + due.Record.RecordID},
 			},
 			PromptMarkdown: due.Title(),
@@ -494,6 +631,11 @@ func (d Deps) weeklySupplementTrack(ctx context.Context, agent, section string,
 	if progress == nil || progress.Revision <= 0 || progress.EvidenceSource != "parent_confirmed" ||
 		d.WeeklyCandidates == nil {
 		track.Status = k12.WeeklyTrackFailed
+		if progress == nil || progress.Revision <= 0 || progress.EvidenceSource != "parent_confirmed" {
+			track.FailureMessage = "curriculum progress setup required"
+		} else {
+			track.FailureMessage = "weekly candidate generator unavailable"
+		}
 		return track, keys, 0
 	}
 	candidates, err := d.WeeklyCandidates.GenerateWeeklyPracticeCandidates(ctx,
@@ -503,6 +645,7 @@ func (d Deps) weeklySupplementTrack(ctx context.Context, agent, section string,
 		})
 	if err != nil {
 		track.Status = k12.WeeklyTrackFailed
+		track.FailureMessage = "weekly candidate generation failed"
 		return track, keys, 0
 	}
 	elapsed := 0
@@ -524,7 +667,7 @@ func (d Deps) weeklySupplementTrack(ctx context.Context, agent, section string,
 		itemID := "witem-" + shortDigest(section+"\x00"+candidate.SourceRef+
 			"\x00"+candidate.PromptMarkdown)
 		verification := k12.WeeklyPracticeVerification{
-			Status: k12.WeeklyVerificationVerified,
+			Status:       k12.WeeklyVerificationVerified,
 			EvidenceRefs: append([]string(nil), candidate.EvidenceRefs...),
 		}
 		if section == k12.WeeklySectionTextbookConsolidation {
@@ -546,6 +689,7 @@ func (d Deps) weeklySupplementTrack(ctx context.Context, agent, section string,
 	}
 	if len(track.Items) == 0 {
 		track.Status = k12.WeeklyTrackFailed
+		track.FailureMessage = "weekly candidate result empty"
 	} else {
 		track.Status = k12.WeeklyTrackReady
 	}
@@ -584,6 +728,10 @@ func (d Deps) GetCurrentWeeklyPracticePlan(ctx context.Context, agent string) (*
 	if errors.Is(err, records.ErrNotFound) {
 		return nil, nil
 	}
+	if err != nil {
+		return nil, err
+	}
+	plan, err = d.projectWeeklyArithmetic(ctx, plan)
 	return &plan, err
 }
 
@@ -630,6 +778,10 @@ func (d Deps) PrepareWeeklyPracticeOutput(ctx context.Context, agent, planID str
 	if err != nil {
 		return WeeklyPrepareOutputResult{}, err
 	}
+	plan, err = d.projectWeeklyArithmetic(ctx, plan)
+	if err != nil {
+		return WeeklyPrepareOutputResult{}, err
+	}
 	if plan.Revision != expectedRevision {
 		return WeeklyPrepareOutputResult{}, records.ErrVersionConflict
 	}
@@ -647,19 +799,19 @@ func (d Deps) PrepareWeeklyPracticeOutput(ctx context.Context, agent, planID str
 	} else {
 		snapshot = k12.WeeklyPracticeSnapshot{
 			SnapshotID: "wsnap-" + shortDigest(fmt.Sprintf("%s\x00%d", plan.PlanID, plan.Revision)),
-			PlanID: plan.PlanID, PlanRevision: plan.Revision, AgentName: plan.AgentName,
+			PlanID:     plan.PlanID, PlanRevision: plan.Revision, AgentName: plan.AgentName,
 			ISOWeekYear: plan.ISOWeekYear, ISOWeekNumber: plan.ISOWeekNumber,
 			Timezone: plan.Timezone, WeekStart: plan.WeekStart, WeekEnd: plan.WeekEnd,
 			LocalStartDate: plan.LocalStartDate, LocalEndDate: plan.LocalEndDate,
-			SettingsRevision: plan.SettingsRevision,
+			SettingsRevision:           plan.SettingsRevision,
 			CurriculumProgressRevision: plan.CurriculumProgressRevision,
-			Tracks: plan.Tracks, RenderVersion: "practice-paper-v1", CreatedAt: at,
+			Tracks:                     plan.Tracks, RenderVersion: "practice-paper-v1", CreatedAt: at,
 			AnswerKeys: plan.AnswerKeys,
 		}
 		snapshot.SnapshotDigest = digestValue(struct {
-			PlanID string
-			PlanRevision int
-			Tracks []k12.WeeklyPracticeTrack
+			PlanID        string
+			PlanRevision  int
+			Tracks        []k12.WeeklyPracticeTrack
 			RenderVersion string
 		}{snapshot.PlanID, snapshot.PlanRevision, snapshot.Tracks, snapshot.RenderVersion})
 	}
@@ -687,7 +839,7 @@ func (d Deps) PrepareWeeklyPracticeOutput(ctx context.Context, agent, planID str
 					Snapshot: snapshot,
 					Artifact: PrintableArtifactView{
 						Artifact: frozenArtifact,
-						Render: frozenRender,
+						Render:   frozenRender,
 					},
 					Replayed: true,
 				}, nil
@@ -712,7 +864,7 @@ func (d Deps) PrepareWeeklyPracticeOutput(ctx context.Context, agent, planID str
 		Snapshot: frozenSnapshot,
 		Artifact: PrintableArtifactView{
 			Artifact: frozenArtifact,
-			Render: frozenRender,
+			Render:   frozenRender,
 		},
 		Replayed: replay,
 	}, nil
@@ -727,10 +879,10 @@ func weeklySnapshotMarkdown(snapshot k12.WeeklyPracticeSnapshot) string {
 			}
 			items = append(items, k12.PracticeItem{
 				ItemID: item.ItemID, Subject: "数学", AddedVia: k12.PracticeAddedViaWeekly,
-				QuestionMarkdown: item.PromptMarkdown,
+				QuestionMarkdown:       item.PromptMarkdown,
 				ExpectedAnswerMarkdown: snapshot.AnswerKeys[item.ItemID],
-				VerificationStatus: "verified",
-				VerificationEvidence: strings.Join(item.Verification.EvidenceRefs, ","),
+				VerificationStatus:     "verified",
+				VerificationEvidence:   strings.Join(item.Verification.EvidenceRefs, ","),
 			})
 		}
 	}
@@ -777,82 +929,8 @@ func (d Deps) SendWeeklyPracticeSnapshot(ctx context.Context, agent, snapshotID,
 
 func (d Deps) SubmitWeeklyPracticeAttempt(ctx context.Context, agent, snapshotID,
 	itemID, studentAnswer, idempotencyKey string) (k12.WeeklyPracticeAttempt, bool, error) {
-	agent, snapshotID, itemID = strings.TrimSpace(agent), strings.TrimSpace(snapshotID), strings.TrimSpace(itemID)
-	studentAnswer, idempotencyKey = strings.TrimSpace(studentAnswer), strings.TrimSpace(idempotencyKey)
-	if agent == "" || snapshotID == "" || itemID == "" || studentAnswer == "" || idempotencyKey == "" {
-		return k12.WeeklyPracticeAttempt{}, false, fmt.Errorf("%w: complete attempt required", ErrInvalidInput)
-	}
-	snapshot, err := d.GetWeeklyPracticeSnapshot(ctx, agent, snapshotID)
-	if err != nil {
-		return k12.WeeklyPracticeAttempt{}, false, err
-	}
-	var item *k12.WeeklyPracticeItem
-	for i := range snapshot.Tracks {
-		for j := range snapshot.Tracks[i].Items {
-			if snapshot.Tracks[i].Items[j].ItemID == itemID {
-				item = &snapshot.Tracks[i].Items[j]
-				break
-			}
-		}
-	}
-	if item == nil {
-		return k12.WeeklyPracticeAttempt{}, false, records.ErrNotFound
-	}
-	requestDigest := digestValue(struct{ Snapshot, Item, Answer string }{snapshotID, itemID, studentAnswer})
-	assessment := WeeklyPracticeAnswerAssessment{
-		AssessmentID: "assessment-pending-" + shortDigest(requestDigest),
-		Result: k12.WeeklyAttemptNeedsReview, VerificationEvidence: "assessment_unavailable",
-	}
-	if d.WeeklyAssessment != nil {
-		if verified, assessErr := d.WeeklyAssessment.AssessWeeklyPracticeAnswer(ctx,
-			WeeklyPracticeAnswerRequest{
-				AgentName: agent, SnapshotID: snapshotID, Item: *item, StudentAnswer: studentAnswer,
-			}); assessErr == nil &&
-			(verified.Result == k12.WeeklyAttemptCorrect || verified.Result == k12.WeeklyAttemptWrong) &&
-			strings.TrimSpace(verified.AssessmentID) != "" &&
-			strings.TrimSpace(verified.VerificationEvidence) != "" {
-			assessment = verified
-		}
-	}
-	attempt := k12.WeeklyPracticeAttempt{
-		AttemptID: "wattempt-" + shortDigest(snapshotID+"\x00"+itemID+"\x00"+idempotencyKey),
-		SnapshotID: snapshotID, ItemID: itemID, AssessmentID: assessment.AssessmentID,
-		Result: assessment.Result, VerificationEvidence: assessment.VerificationEvidence,
-		CreatedAt: d.now(),
-	}
-	stored, replay, err := d.Records.PutWeeklyPracticeAttempt(ctx, agent, itemID,
-		idempotencyKey, requestDigest, attempt)
-	if err != nil || replay {
-		return stored, replay, err
-	}
-	switch {
-	case item.PlanSection == k12.WeeklySectionDueReview:
-		stored.ReviewScheduled = true
-		if stored.Result == k12.WeeklyAttemptCorrect {
-			rec, getErr := d.Records.Get(ctx, item.SourceRef)
-			if getErr != nil || rec.AgentName != agent || rec.Collection != k12.CollectionMistakes {
-				return k12.WeeklyPracticeAttempt{}, false, records.ErrNotFound
-			}
-			if err := d.MarkRetried(ctx, rec.RecordID, rec.Version); err != nil {
-				return k12.WeeklyPracticeAttempt{}, false, err
-			}
-		}
-	case stored.Result == k12.WeeklyAttemptWrong:
-		recorded, recordErr := d.RecordMistake(ctx, RecordMistakeRequest{
-			AgentName: agent, Subject: assessment.Subject,
-			SourceSession: "weekly-attempt:" + stored.AttemptID,
-			Problem: item.PromptMarkdown, StudentAnswer: studentAnswer,
-			KnowledgePoints: []string{assessment.KnowledgePoint},
-		})
-		if recordErr != nil {
-			return k12.WeeklyPracticeAttempt{}, false, recordErr
-		}
-		stored.MistakeRecordID, stored.ReviewScheduled = recorded.RecordID, true
-	}
-	if err := d.Records.UpdateWeeklyPracticeAttempt(ctx, agent, stored, d.now()); err != nil {
-		return k12.WeeklyPracticeAttempt{}, false, err
-	}
-	return stored, false, nil
+	return d.submitWeeklyPracticeAttemptDurable(
+		ctx, agent, snapshotID, itemID, studentAnswer, idempotencyKey)
 }
 
 func (d Deps) SaveWeeklyPracticeToPracticeSet(ctx context.Context, agent, planID string,
@@ -889,8 +967,8 @@ func (d Deps) SaveWeeklyPracticeToPracticeSet(ctx context.Context, agent, planID
 				ItemID: item.ItemID, SourceProblemID: sourceProblemID, Subject: "数学",
 				AddedVia: k12.PracticeAddedViaWeekly, QuestionMarkdown: item.PromptMarkdown,
 				ExpectedAnswerMarkdown: snapshot.AnswerKeys[item.ItemID],
-				VerificationStatus: "verified",
-				VerificationEvidence: strings.Join(item.Verification.EvidenceRefs, ","),
+				VerificationStatus:     "verified",
+				VerificationEvidence:   strings.Join(item.Verification.EvidenceRefs, ","),
 			})
 		}
 	}
@@ -905,12 +983,12 @@ func (d Deps) SaveWeeklyPracticeToPracticeSet(ctx context.Context, agent, planID
 	}
 	receipt := k12.WeeklyPracticeSaveReceipt{
 		SaveReceiptID: "wsave-" + shortDigest(fmt.Sprintf("%s\x00%d", planID, expectedRevision)),
-		PlanID: planID, PlanRevision: expectedRevision, SnapshotID: snapshot.SnapshotID,
+		PlanID:        planID, PlanRevision: expectedRevision, SnapshotID: snapshot.SnapshotID,
 		PracticeSetID: practiceSetID, CreatedAt: d.now(),
 	}
 	requestDigest := digestValue(struct {
 		Agent, Plan string
-		Revision int
+		Revision    int
 	}{agent, planID, expectedRevision})
 	return d.Records.PutWeeklyPracticeSave(ctx, agent, idempotencyKey, requestDigest, receipt)
 }

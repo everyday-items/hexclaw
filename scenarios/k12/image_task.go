@@ -90,15 +90,17 @@ func (e ImageTaskCreativeEntry) Validate() error {
 // writing OCR and work feedback each persist their own value; a retry never
 // re-resolves a mutable default route.
 type ImageTaskRouteSnapshot struct {
-	Provider        string `json:"provider"`
-	Model           string `json:"model"`
-	Route           string `json:"route"`
-	Capability      string `json:"capability"`
-	SelectionSource string `json:"selection_source"` // explicit / auto
-	PolicyVersion   string `json:"policy_version"`
-	PromptVersion   string `json:"prompt_version"`
-	TimeoutMS       int    `json:"timeout_ms,omitempty"`
-	FallbackPolicy  string `json:"fallback_policy,omitempty"`
+	Provider            string `json:"provider"`
+	ProviderDisplayName string `json:"provider_display_name,omitempty"`
+	Model               string `json:"model"`
+	ModelID             string `json:"model_id,omitempty"`
+	Route               string `json:"route"`
+	Capability          string `json:"capability"`
+	SelectionSource     string `json:"selection_source"` // explicit / auto
+	PolicyVersion       string `json:"policy_version"`
+	PromptVersion       string `json:"prompt_version"`
+	TimeoutMS           int    `json:"timeout_ms,omitempty"`
+	FallbackPolicy      string `json:"fallback_policy,omitempty"`
 }
 
 func NormalizeImageTaskRouteSnapshot(s ImageTaskRouteSnapshot) ImageTaskRouteSnapshot {

@@ -74,6 +74,7 @@ type imageTaskGradingParentWindowRetrier interface {
 }
 
 type ImageTaskRouteResolver func(k12.ImageTaskRouteSnapshot) (k12.ImageTaskRouteSnapshot, error)
+type ImageTaskRouteDisplayResolver func(k12.ImageTaskRouteSnapshot) (string, string)
 type ImageTaskAssetReader func(agentName, assetRef string) ([]byte, error)
 type ImageTaskGradeResolver func(context.Context, string) (string, error)
 
@@ -94,6 +95,7 @@ type ImageTaskCoordinator struct {
 	Grading               imageTaskGradingStarter
 	WorkFeedback          imageTaskWorkFeedbackGenerator
 	ResolveRoute          ImageTaskRouteResolver
+	ResolveRouteDisplay   ImageTaskRouteDisplayResolver
 	ResolveGrade          ImageTaskGradeResolver
 	ReadAsset             ImageTaskAssetReader
 	GradingBudgetSnapshot k12.GradingBudgetSnapshot
@@ -381,6 +383,13 @@ func (c *ImageTaskCoordinator) Create(
 	}
 	sourceDigest := imageBytesDigest(images)
 	if in.CreativeEntry != nil {
+		operationRouteRequest := in.RouteRequest
+		if c.ResolveRouteDisplay != nil {
+			// Parent-selected creative creation must not resolve an unexecuted
+			// vision route. Freeze only the configured display facts.
+			operationRouteRequest.ProviderDisplayName,
+				operationRouteRequest.ModelID = c.ResolveRouteDisplay(in.RouteRequest)
+		}
 		requestDigest := digestJSON(struct {
 			Agent, Learner, Source, Session, Message, SourceDigest string
 			Assets                                                 []string
@@ -388,7 +397,7 @@ func (c *ImageTaskCoordinator) Create(
 			CreativeEntry                                          *k12.ImageTaskCreativeEntry
 		}{
 			in.AgentName, in.LearnerID, in.SourceRef, in.SourceSessionID,
-			in.MessageIntent, sourceDigest, in.SourceAssetRefs, in.RouteRequest,
+			in.MessageIntent, sourceDigest, in.SourceAssetRefs, operationRouteRequest,
 			in.CreativeEntry,
 		})
 		now := c.now()
@@ -403,7 +412,7 @@ func (c *ImageTaskCoordinator) Create(
 			TargetObjectID:        c.id("creative_intake"),
 			RoutingProvenance:     k12.ImageTaskRoutingParentSelected,
 			CreativeEntry:         in.CreativeEntry,
-			OperationRouteRequest: in.RouteRequest,
+			OperationRouteRequest: operationRouteRequest,
 			IdempotencyKey:        idempotencyKey, RequestDigest: requestDigest,
 			AttemptGeneration:         in.AttemptGeneration,
 			AutomaticBudgetSeconds:    k12.ImageTaskAutomaticBudgetSeconds,
@@ -422,7 +431,9 @@ func (c *ImageTaskCoordinator) Create(
 	}
 	route, err := c.ResolveRoute(in.RouteRequest)
 	if err != nil {
-		return ImageTaskView{}, false, fmt.Errorf("%w: resolve image task route: %v", ErrInvalidInput, err)
+		return ImageTaskView{}, false, fmt.Errorf(
+			"%w: resolve image task route: %v", ErrInvalidInput, err,
+		)
 	}
 	route = k12.NormalizeImageTaskRouteSnapshot(route)
 	if route.TimeoutMS <= 0 {

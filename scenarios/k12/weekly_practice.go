@@ -7,7 +7,18 @@ const (
 
 	WeeklyTrackReady    = "ready"
 	WeeklyTrackDisabled = "disabled"
+	WeeklyTrackStale    = "stale"
 	WeeklyTrackFailed   = "failed"
+
+	WeeklyTextbookTierLess     = "less"
+	WeeklyTextbookTierStandard = "standard"
+	WeeklyTextbookTierMore     = "more"
+
+	WeeklyManualTrackAvailable       = "available"
+	WeeklyManualTrackSetupRequired   = "setup_required"
+	WeeklyManualTrackProcessing      = "processing"
+	WeeklyManualTrackFailedRetryable = "failed_retryable"
+	WeeklyManualTrackFailedTerminal  = "failed_terminal"
 
 	WeeklyPlanDraft         = "draft"
 	WeeklyPlanFrozen        = "frozen"
@@ -54,24 +65,25 @@ type CurriculumCatalogUnit struct {
 }
 
 type CurriculumCatalog struct {
-	AgentName        string                  `json:"agent"`
-	Subject          string                  `json:"subject"`
-	TextbookBindingID string                 `json:"textbook_binding_id"`
-	TextbookEdition  string                  `json:"textbook_edition"`
-	TextbookVersion  string                  `json:"textbook_version"`
-	Title            string                  `json:"title"`
-	Volume           string                  `json:"volume"`
-	PageMin          int                     `json:"page_min"`
-	PageMax          int                     `json:"page_max"`
-	Units            []CurriculumCatalogUnit `json:"units"`
+	AgentName         string                  `json:"agent"`
+	Subject           string                  `json:"subject"`
+	TextbookBindingID string                  `json:"textbook_binding_id"`
+	TextbookEdition   string                  `json:"textbook_edition"`
+	TextbookVersion   string                  `json:"textbook_version"`
+	Title             string                  `json:"title"`
+	Volume            string                  `json:"volume"`
+	PageMin           int                     `json:"page_min"`
+	PageMax           int                     `json:"page_max"`
+	Units             []CurriculumCatalogUnit `json:"units"`
 }
 
 type CurriculumProgress struct {
-	ProgressID            string   `json:"progress_id"`
+	ProgressID             string   `json:"progress_id"`
 	AgentName              string   `json:"agent"`
 	Subject                string   `json:"subject"`
 	Revision               int      `json:"revision"`
 	TextbookBindingID      string   `json:"textbook_binding_id"`
+	TextbookManifestID     string   `json:"textbook_manifest_id,omitempty"`
 	TextbookEdition        string   `json:"textbook_edition"`
 	TextbookVersion        string   `json:"textbook_version"`
 	Title                  string   `json:"title"`
@@ -93,22 +105,23 @@ type CurriculumProgress struct {
 }
 
 type WeeklyPracticeSettings struct {
-	AgentName                     string `json:"agent"`
-	Revision                      int    `json:"revision"`
-	Timezone                      string `json:"timezone"`
-	DueReviewEnabled              bool   `json:"due_review_enabled"`
-	TextbookConsolidationEnabled  bool   `json:"textbook_consolidation_enabled"`
-	ArithmeticWarmupEnabled       bool   `json:"arithmetic_warmup_enabled"`
-	ArithmeticMinutes             int    `json:"arithmetic_minutes"`
-	CreatedAt                     int64  `json:"created_at"`
-	UpdatedAt                     int64  `json:"updated_at"`
+	AgentName                    string `json:"agent"`
+	Revision                     int    `json:"revision"`
+	Timezone                     string `json:"timezone"`
+	DueReviewEnabled             bool   `json:"due_review_enabled"`
+	TextbookConsolidationEnabled bool   `json:"textbook_consolidation_enabled"`
+	TextbookConsolidationTier    string `json:"textbook_consolidation_tier"`
+	ArithmeticWarmupEnabled      bool   `json:"arithmetic_warmup_enabled"`
+	ArithmeticMinutes            int    `json:"arithmetic_minutes"`
+	CreatedAt                    int64  `json:"created_at"`
+	UpdatedAt                    int64  `json:"updated_at"`
 }
 
 func DefaultWeeklyPracticeSettings(agentName string) WeeklyPracticeSettings {
 	return WeeklyPracticeSettings{
 		AgentName: agentName, Timezone: "Asia/Shanghai", DueReviewEnabled: true,
 		TextbookConsolidationEnabled: false, ArithmeticWarmupEnabled: false,
-		ArithmeticMinutes: 2,
+		TextbookConsolidationTier: WeeklyTextbookTierStandard, ArithmeticMinutes: 2,
 	}
 }
 
@@ -127,21 +140,31 @@ type ProfileBundleProfile struct {
 	TextbookEdition  string           `json:"textbook_edition"`
 }
 
+type ProfileBundleAgentConfig struct {
+	DisplayName  string   `json:"display_name"`
+	Description  string   `json:"description"`
+	SystemPrompt string   `json:"system_prompt"`
+	Provider     string   `json:"provider"`
+	Model        string   `json:"model"`
+	Skills       []string `json:"skills"`
+}
+
 type ProfileBundleResult struct {
-	Profile                ProfileBundleProfile   `json:"profile"`
-	CurriculumProgress     CurriculumProgress     `json:"curriculum_progress"`
-	WeeklyPracticeSettings WeeklyPracticeSettings `json:"weekly_practice_settings"`
-	Replayed               bool                   `json:"replayed"`
+	AgentConfig            *ProfileBundleAgentConfig `json:"agent_config,omitempty"`
+	Profile                ProfileBundleProfile      `json:"profile"`
+	CurriculumProgress     CurriculumProgress        `json:"curriculum_progress"`
+	WeeklyPracticeSettings WeeklyPracticeSettings    `json:"weekly_practice_settings"`
+	Replayed               bool                      `json:"replayed"`
 }
 
 type WeeklyPracticeVerification struct {
-	Status                  string   `json:"status"`
-	EvidenceRefs            []string `json:"evidence_refs"`
-	TextbookBindingID       string   `json:"textbook_binding_id,omitempty"`
-	UnitID                  string   `json:"unit_id,omitempty"`
-	LessonID                string   `json:"lesson_id,omitempty"`
-	VerifiedPageFrom        *int     `json:"verified_page_from,omitempty"`
-	VerifiedPageTo          *int     `json:"verified_page_to,omitempty"`
+	Status            string   `json:"status"`
+	EvidenceRefs      []string `json:"evidence_refs"`
+	TextbookBindingID string   `json:"textbook_binding_id,omitempty"`
+	UnitID            string   `json:"unit_id,omitempty"`
+	LessonID          string   `json:"lesson_id,omitempty"`
+	VerifiedPageFrom  *int     `json:"verified_page_from,omitempty"`
+	VerifiedPageTo    *int     `json:"verified_page_to,omitempty"`
 }
 
 type WeeklyPracticeItem struct {
@@ -151,40 +174,56 @@ type WeeklyPracticeItem struct {
 	SourceKind       string                     `json:"source_kind"`
 	GenerationMethod string                     `json:"generation_method"`
 	SourceRef        string                     `json:"source_ref"`
-	Verification    WeeklyPracticeVerification `json:"verification"`
-	PromptMarkdown  string                     `json:"prompt_markdown"`
+	Verification     WeeklyPracticeVerification `json:"verification"`
+	PromptMarkdown   string                     `json:"prompt_markdown"`
 }
 
 type WeeklyPracticeTrack struct {
-	PlanSection    string               `json:"plan_section"`
-	Status         string               `json:"status"`
-	FailureMessage string               `json:"failure_message,omitempty"`
-	Items          []WeeklyPracticeItem `json:"items"`
+	PlanSection     string                 `json:"plan_section"`
+	Status          string                 `json:"status"`
+	FailureMessage  string                 `json:"failure_message,omitempty"`
+	Items           []WeeklyPracticeItem   `json:"items"`
+	ArithmeticBatch *WeeklyArithmeticBatch `json:"arithmetic_batch"`
+}
+
+type WeeklyManualTrackRecommendation struct {
+	Availability         string `json:"availability"`
+	SelectedItemCount    int    `json:"selected_item_count"`
+	RecommendedItemCount int    `json:"recommended_item_count"`
+	MinItemCount         int    `json:"min_item_count"`
+	MaxItemCount         int    `json:"max_item_count"`
+}
+
+type WeeklyManualTrackRecommendations struct {
+	TextbookConsolidation WeeklyManualTrackRecommendation `json:"textbook_consolidation"`
+	ArithmeticWarmup      WeeklyManualTrackRecommendation `json:"arithmetic_warmup"`
 }
 
 type WeeklyPracticePlan struct {
-	PlanID                     string                `json:"plan_id"`
-	AgentName                  string                `json:"agent"`
-	Revision                   int                   `json:"revision"`
-	ISOWeekYear                int                   `json:"iso_week_year"`
-	ISOWeekNumber              int                   `json:"iso_week_number"`
-	Timezone                   string                `json:"timezone"`
-	WeekStart                  int64                 `json:"week_start"`
-	WeekEnd                    int64                 `json:"week_end"`
-	LocalStartDate             string                `json:"local_start_date"`
-	LocalEndDate               string                `json:"local_end_date"`
-	Status                     string                `json:"status"`
-	SettingsRevision           int                   `json:"settings_revision"`
-	CurriculumProgressRevision *int                  `json:"curriculum_progress_revision,omitempty"`
-	Tracks                     []WeeklyPracticeTrack `json:"tracks"`
-	CreatedAt                  int64                 `json:"created_at"`
-	UpdatedAt                  int64                 `json:"updated_at"`
-	SourceDigest               string                `json:"-"`
-	AnswerKeys                 map[string]string     `json:"-"`
+	PlanID                     string                           `json:"plan_id"`
+	AgentName                  string                           `json:"agent"`
+	Revision                   int                              `json:"revision"`
+	ISOWeekYear                int                              `json:"iso_week_year"`
+	ISOWeekNumber              int                              `json:"iso_week_number"`
+	Timezone                   string                           `json:"timezone"`
+	WeekStart                  int64                            `json:"week_start"`
+	WeekEnd                    int64                            `json:"week_end"`
+	LocalStartDate             string                           `json:"local_start_date"`
+	LocalEndDate               string                           `json:"local_end_date"`
+	Status                     string                           `json:"status"`
+	SettingsRevision           int                              `json:"settings_revision"`
+	CurriculumProgressRevision *int                             `json:"curriculum_progress_revision"`
+	Tracks                     []WeeklyPracticeTrack            `json:"tracks"`
+	ManualTrackRecommendations WeeklyManualTrackRecommendations `json:"manual_track_recommendations"`
+	CreatedAt                  int64                            `json:"created_at"`
+	UpdatedAt                  int64                            `json:"updated_at"`
+	SourceDigest               string                           `json:"-"`
+	AnswerKeys                 map[string]string                `json:"-"`
 }
 
 type WeeklyPracticeSnapshot struct {
 	SnapshotID                 string                `json:"snapshot_id"`
+	ArtifactID                 string                `json:"artifact_id"`
 	PlanID                     string                `json:"plan_id"`
 	PlanRevision               int                   `json:"plan_revision"`
 	AgentName                  string                `json:"agent"`
@@ -205,23 +244,27 @@ type WeeklyPracticeSnapshot struct {
 }
 
 type WeeklyPracticeHistorySummary struct {
-	SnapshotID     string `json:"snapshot_id"`
-	PlanID         string `json:"plan_id"`
-	ISOWeekYear    int    `json:"iso_week_year"`
-	ISOWeekNumber  int    `json:"iso_week_number"`
-	Timezone       string `json:"timezone"`
-	LocalStartDate string `json:"local_start_date"`
-	LocalEndDate   string `json:"local_end_date"`
-	ItemCount      int    `json:"item_count"`
-	ArchivedAt     int64  `json:"archived_at"`
+	SnapshotID       string `json:"snapshot_id"`
+	ArtifactID       string `json:"artifact_id"`
+	PlanID           string `json:"plan_id"`
+	ISOWeekYear      int    `json:"iso_week_year"`
+	ISOWeekNumber    int    `json:"iso_week_number"`
+	Timezone         string `json:"timezone"`
+	LocalStartDate   string `json:"local_start_date"`
+	LocalEndDate     string `json:"local_end_date"`
+	ItemCount        int    `json:"item_count"`
+	CorrectCount     int    `json:"correct_count"`
+	WrongCount       int    `json:"wrong_count"`
+	NeedsReviewCount int    `json:"needs_review_count"`
+	ArchivedAt       int64  `json:"archived_at"`
 }
 
 type WeeklyPracticeAttempt struct {
-	AttemptID           string `json:"attempt_id"`
-	SnapshotID          string `json:"snapshot_id"`
-	ItemID              string `json:"item_id"`
-	AssessmentID        string `json:"assessment_id"`
-	Result              string `json:"result"`
+	AttemptID            string `json:"attempt_id"`
+	SnapshotID           string `json:"snapshot_id"`
+	ItemID               string `json:"item_id"`
+	AssessmentID         string `json:"assessment_id"`
+	Result               string `json:"result"`
 	VerificationEvidence string `json:"verification_evidence"`
 	MistakeRecordID      string `json:"mistake_record_id,omitempty"`
 	ReviewScheduled      bool   `json:"review_scheduled"`

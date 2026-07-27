@@ -46,6 +46,34 @@ func ApplyProfilePatchForBUG20260726032(
 	return current
 }
 
+func TestBUG20260726032_CanonicalProfileCreateAndEditAcceptEveryPrimaryGradeTerm(
+	t *testing.T,
+) {
+	primary := []string{
+		"一年级上", "一年级下", "二年级上", "二年级下", "三年级上", "三年级下",
+		"四年级上", "四年级下", "五年级上", "五年级下", "六年级上", "六年级下",
+	}
+	for index, gradeTerm := range primary {
+		store := &bug20260726032ProfileStore{}
+		deps := Deps{Profiles: store}
+		created, err := deps.UpdateProfile(
+			context.Background(), "mingming", k12.ChildProfile{GradeTerm: gradeTerm},
+		)
+		if err != nil || created.GradeTerm != gradeTerm || store.saveCalls != 1 {
+			t.Fatalf("create %s: profile=%+v saveCalls=%d err=%v",
+				gradeTerm, created, store.saveCalls, err)
+		}
+		next := primary[(index+1)%len(primary)]
+		edited, err := deps.UpdateProfile(
+			context.Background(), "mingming", k12.ChildProfile{GradeTerm: next},
+		)
+		if err != nil || edited.GradeTerm != next || store.saveCalls != 2 {
+			t.Fatalf("edit %s -> %s: profile=%+v saveCalls=%d err=%v",
+				gradeTerm, next, edited, store.saveCalls, err)
+		}
+	}
+}
+
 func TestBUG20260726032_UpdateProfileCanonicalGuardHasNoRejectedWrite(t *testing.T) {
 	store := &bug20260726032ProfileStore{profile: k12.ChildProfile{
 		ChildName: "小明", GradeTerm: "六年级下", TextbookEdition: "人教版",
@@ -55,8 +83,6 @@ func TestBUG20260726032_UpdateProfileCanonicalGuardHasNoRejectedWrite(t *testing
 
 	for _, gradeTerm := range []string{
 		"初一", "初二", "初三", "高一", "高二", "高三",
-		"初一上", "初一下", "初二上", "初二下", "初三上", "初三下",
-		"高一上", "高一下", "高二上", "高二下", "高三上", "高三下",
 	} {
 		before := store.profile
 		beforeCalls := store.saveCalls

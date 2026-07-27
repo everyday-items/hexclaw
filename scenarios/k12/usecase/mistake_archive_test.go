@@ -300,9 +300,9 @@ func TestRestoreMistake_ConcurrentSameCommandIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := make(chan struct{})
-	errs := make(chan error, 2)
+	errs := make(chan error, 32)
 	var wg sync.WaitGroup
-	for range 2 {
+	for range 32 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

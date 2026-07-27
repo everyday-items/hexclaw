@@ -226,6 +226,7 @@ func WireInto(ctx context.Context, reg *scenario.Registry, db *sql.DB, solveSkil
 		Solver:              solveAdapter,
 		Grader:              solveAdapter,
 		VerifiedGrader:      solveAdapter,
+		WeeklyAssessment:    usecase.NewVerifiedSolutionWeeklyAssessor(solveAdapter),
 		TutoringTipsReview:  solveAdapter,
 		ParentTeachingGuide: solveAdapter,
 		Records:             store,
