@@ -126,12 +126,29 @@ type Filter struct {
 	CreatedAfter time.Time
 	// CreatedBefore 仅保留所属文档创建时间 <= 该时刻的 chunk（零值=不限）。
 	CreatedBefore time.Time
+	// DocumentGenerations is an exact paired whitelist. A document ID and its
+	// immutable generation must match in the same pair; independent IN lists
+	// would permit cross-product generation leaks.
+	DocumentGenerations []DocumentGenerationRef
+	// ChunkIDs is an exact chunk/segment whitelist. It is applied together with
+	// DocumentGenerations before scoring/topK, never as an application-side
+	// post-filter.
+	ChunkIDs []string
+}
+
+// DocumentGenerationRef identifies one immutable Knowledge document
+// generation. It is deliberately a pair rather than parallel slices.
+type DocumentGenerationRef struct {
+	DocumentID         string
+	DocumentGeneration int64
 }
 
 // IsZero 报告该 filter 是否无任何约束（等价于全量检索）。
 func (f Filter) IsZero() bool {
 	return len(nonEmptyStrings(f.Sources)) == 0 &&
 		len(nonEmptyStrings(f.SourceTypes)) == 0 &&
+		len(normalizeDocumentGenerations(f.DocumentGenerations)) == 0 &&
+		len(nonEmptyStrings(f.ChunkIDs)) == 0 &&
 		f.CreatedAfter.IsZero() && f.CreatedBefore.IsZero()
 }
 
@@ -140,7 +157,30 @@ func (f Filter) IsZero() bool {
 func (f Filter) normalize() Filter {
 	f.Sources = nonEmptyStrings(f.Sources)
 	f.SourceTypes = nonEmptyStrings(f.SourceTypes)
+	f.DocumentGenerations = normalizeDocumentGenerations(f.DocumentGenerations)
+	f.ChunkIDs = nonEmptyStrings(f.ChunkIDs)
 	return f
+}
+
+func normalizeDocumentGenerations(in []DocumentGenerationRef) []DocumentGenerationRef {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]DocumentGenerationRef, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, ref := range in {
+		ref.DocumentID = strings.TrimSpace(ref.DocumentID)
+		if ref.DocumentID == "" || ref.DocumentGeneration < 1 {
+			continue
+		}
+		key := ref.DocumentID + "\x00" + strconv.FormatInt(ref.DocumentGeneration, 10)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, ref)
+	}
+	return out
 }
 
 // hasDateBound 报告是否设置了任一日期边界。

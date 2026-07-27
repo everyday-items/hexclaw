@@ -181,6 +181,13 @@ func (r *SQLiteSemanticIndexRepository) CreateIngestDocument(
 	if err != nil {
 		return CreateDocumentResult{}, err
 	}
+	if err := r.reconcileDocumentIngestLifecycleTx(ctx, tx, KnowledgeJob{
+		JobID: jobID, Kind: KnowledgeJobIngest, OwnerID: ownerID,
+		CorpusUID: state.corpusUID, DocumentID: documentID,
+		DocumentGeneration: generation,
+	}, time.UnixMilli(nowMillis)); err != nil {
+		return CreateDocumentResult{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return CreateDocumentResult{}, err
 	}
@@ -325,6 +332,13 @@ func (r *SQLiteSemanticIndexRepository) retryIngestDocumentOnce(
 		result.VectorIndexState = VectorIndexPending
 	default:
 		return CreateDocumentResult{}, ErrDocumentRetryNotAllowed
+	}
+	if err := r.reconcileDocumentIngestLifecycleTx(ctx, tx, KnowledgeJob{
+		JobID: jobID, Kind: KnowledgeJobIngest, OwnerID: ownerID,
+		CorpusUID: policy.corpusUID, DocumentID: documentID,
+		DocumentGeneration: generation,
+	}, time.UnixMilli(nowMillis)); err != nil {
+		return CreateDocumentResult{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return CreateDocumentResult{}, err
@@ -881,6 +895,9 @@ func (r *SQLiteSemanticIndexRepository) SetIngestPageTotal(
 	}
 	if rows, _ := res.RowsAffected(); rows != 1 {
 		return ErrJobFenced
+	}
+	if err := r.reconcileDocumentIngestLifecycleTx(ctx, tx, job, now); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

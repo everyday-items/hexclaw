@@ -1010,6 +1010,40 @@ type UpdateAgentRequest struct {
 	Metadata     *map[string]string `json:"metadata"`
 }
 
+var k12ProfileOwnedMetadataKeys = [...]string{
+	"k12.child_name",
+	"k12.grade_term",
+	"k12.textbook_edition",
+	"k12.textbook_edition.math",
+	"k12.textbook_edition.chinese",
+	"k12.textbook_edition.english",
+	"k12.textbook_edition.science",
+	"k12.textbook_edition.information_technology",
+	"k12.textbook_edition.art",
+}
+
+func k12ProfileFieldsTouched(existing *router.AgentConfig, req UpdateAgentRequest) bool {
+	if existing == nil || existing.Metadata["scenario"] != "k12-tutor" {
+		return false
+	}
+	if req.DisplayName != nil || req.Description != nil || req.SystemPrompt != nil ||
+		req.Provider != nil || req.Model != nil || req.Skills != nil {
+		return true
+	}
+	if req.Metadata == nil {
+		return false
+	}
+	next := *req.Metadata
+	for _, key := range k12ProfileOwnedMetadataKeys {
+		before, beforeOK := existing.Metadata[key]
+		after, afterOK := next[key]
+		if beforeOK != afterOK || before != after {
+			return true
+		}
+	}
+	return false
+}
+
 // validateAgentTemperature 温度合法域 [0,2]（nil=未设不校验）。
 func validateAgentTemperature(t *float64) error {
 	if t != nil && (*t < 0 || *t > 2) {
@@ -1206,6 +1240,12 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	existing, ok := s.agentRouter.GetAgent(name)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "agent \"" + name + "\" 未注册"})
+		return
+	}
+	if k12ProfileFieldsTouched(existing, req) {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "K12 profile fields require /api/k12/profile-bundle",
+		})
 		return
 	}
 	cfg := *existing

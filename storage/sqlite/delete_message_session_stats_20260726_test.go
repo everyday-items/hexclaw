@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/storage"
+	"github.com/hexagon-codes/hexclaw/storage/migrate"
 )
 
 // BUG-20260726-001: deleting messages used to remove only the message rows.
@@ -76,7 +77,10 @@ func TestBUG20260726001_V43RepairsHistoricalSessionStatsOnUpgrade(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Init(ctx); err != nil {
+	// Build a genuine V42 database. Deleting migration ledger rows from a V57
+	// schema would leave later physical columns in place and replay V47 against
+	// an impossible database state instead of exercising the V43 repair.
+	if err := migrate.Run(ctx, store.DB(), migrate.All[:42]); err != nil {
 		t.Fatal(err)
 	}
 	const sessionID = "historical-drift"
@@ -100,10 +104,6 @@ func TestBUG20260726001_V43RepairsHistoricalSessionStatsOnUpgrade(t *testing.T) 
 			total_completion_tokens=888,
 			last_message_preview='已不存在的历史消息'
 		WHERE id=?`, sessionID); err != nil {
-		t.Fatal(err)
-	}
-	// Simulate a real database whose latest applied migration is V42.
-	if _, err := store.DB().ExecContext(ctx, `DELETE FROM schema_migrations WHERE version >= 43`); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {

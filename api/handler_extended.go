@@ -536,15 +536,17 @@ type WorkflowData struct {
 
 // WorkflowRun 工作流执行记录
 type WorkflowRun struct {
-	ID             string                         `json:"id"`
-	WorkflowID     string                         `json:"workflow_id"`
-	Status         string                         `json:"status"`
-	Input          string                         `json:"input,omitempty"`
-	Output         string                         `json:"output,omitempty"`
-	MessageContent *messagecontent.MessageContent `json:"message_content,omitempty"`
-	RenderManifest *messagecontent.RenderManifest `json:"render_manifest,omitempty"`
-	Error          string                         `json:"error,omitempty"`
-	NodeResults    []WorkflowNodeRun              `json:"node_results,omitempty"`
+	ID                  string                         `json:"id"`
+	WorkflowID          string                         `json:"workflow_id"`
+	Status              string                         `json:"status"`
+	ProviderDisplayName *string                        `json:"provider_display_name"`
+	ModelID             *string                        `json:"model_id"`
+	Input               string                         `json:"input,omitempty"`
+	Output              string                         `json:"output,omitempty"`
+	MessageContent      *messagecontent.MessageContent `json:"message_content,omitempty"`
+	RenderManifest      *messagecontent.RenderManifest `json:"render_manifest,omitempty"`
+	Error               string                         `json:"error,omitempty"`
+	NodeResults         []WorkflowNodeRun              `json:"node_results,omitempty"`
 	// TriggerKey is the stable webhook binding/event identity. PriorRunID links
 	// safe checkpoint continuations without changing the webhook Receipt/event.
 	TriggerKey string    `json:"trigger_key,omitempty"`
@@ -552,6 +554,88 @@ type WorkflowRun struct {
 	RetrySafe  bool      `json:"retry_safe,omitempty"`
 	StartedAt  time.Time `json:"started_at"`
 	FinishedAt time.Time `json:"finished_at,omitempty"`
+}
+
+func (s *Server) newWorkflowRun(wf *WorkflowData, input string, prior *WorkflowRun) *WorkflowRun {
+	providerDisplayName, modelID := s.freezeWorkflowRouteSnapshot(wf)
+	if prior != nil && (prior.ProviderDisplayName != nil || prior.ModelID != nil) {
+		providerDisplayName = cloneWorkflowRouteFact(prior.ProviderDisplayName)
+		modelID = cloneWorkflowRouteFact(prior.ModelID)
+	}
+	return &WorkflowRun{
+		ID:                  "run-" + idgen.ShortID(),
+		WorkflowID:          wf.ID,
+		Status:              "running",
+		ProviderDisplayName: providerDisplayName,
+		ModelID:             modelID,
+		Input:               input,
+		StartedAt:           time.Now(),
+	}
+}
+
+func (s *Server) freezeWorkflowRouteSnapshot(wf *WorkflowData) (*string, *string) {
+	requestedProvider, requestedModel, modelBoundary := workflowRouteRequest(wf)
+	if !modelBoundary {
+		return nil, nil
+	}
+
+	llmCfg := s.persistedLLMConfig()
+	providerKey := requestedProvider
+	if providerKey == "" {
+		providerKey = strings.TrimSpace(llmCfg.Default)
+	}
+
+	providerDisplayName := providerKey
+	if resolvedKey, ok := findLLMProviderKey(llmCfg, providerKey); ok {
+		provider := llmCfg.Providers[resolvedKey]
+		providerDisplayName = firstNonEmpty(strings.TrimSpace(provider.DisplayName), resolvedKey)
+		if requestedModel == "" {
+			requestedModel = strings.TrimSpace(provider.Model)
+		}
+	}
+
+	return newWorkflowRouteFact(providerDisplayName), newWorkflowRouteFact(requestedModel)
+}
+
+func workflowRouteRequest(wf *WorkflowData) (provider, model string, modelBoundary bool) {
+	if wf == nil {
+		return "", "", false
+	}
+	for _, raw := range wf.Nodes {
+		node, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(stringAny(node["type"]))) {
+		case "agent", "handoff", "agent_handoff", "parallel", "fanout":
+		default:
+			continue
+		}
+
+		data, _ := node["data"].(map[string]any)
+		if len(data) == 0 {
+			data, _ = node["config"].(map[string]any)
+		}
+		return strings.TrimSpace(stringAny(data["provider"])),
+			strings.TrimSpace(stringAny(data["model"])), true
+	}
+	return "", "", false
+}
+
+func newWorkflowRouteFact(value string) *string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func cloneWorkflowRouteFact(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 // WorkflowStore 工作流存储（内存 + JSON 文件持久化）
@@ -777,13 +861,7 @@ func (s *Server) handleRunWorkflow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	run := &WorkflowRun{
-		ID:         "run-" + idgen.ShortID(),
-		WorkflowID: wf.ID,
-		Status:     "running",
-		Input:      req.Input,
-		StartedAt:  time.Now(),
-	}
+	run := s.newWorkflowRun(wf, req.Input, nil)
 	s.workflowStore.mu.Lock()
 	s.workflowStore.addRun(run)
 	s.workflowStore.mu.Unlock()
@@ -849,13 +927,7 @@ func (s *Server) handleResumeWorkflowRun(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	run := &WorkflowRun{
-		ID:         "run-" + idgen.ShortID(),
-		WorkflowID: wf.ID,
-		Status:     "running",
-		Input:      priorInput,
-		StartedAt:  time.Now(),
-	}
+	run := s.newWorkflowRun(wf, priorInput, prior)
 	s.workflowStore.mu.Lock()
 	s.workflowStore.addRun(run)
 	s.workflowStore.mu.Unlock()
@@ -916,12 +988,7 @@ func (s *Server) RunWorkflowByID(id, userID string) (string, error) {
 		return "", fmt.Errorf("工作流不存在: %s", id)
 	}
 	logger.Info("[workflow] agent 触发运行", "workflow_id", id, "name", wf.Name, "user", userID)
-	run := &WorkflowRun{
-		ID:         "run-" + idgen.ShortID(),
-		WorkflowID: wf.ID,
-		Status:     "running",
-		StartedAt:  time.Now(),
-	}
+	run := s.newWorkflowRun(wf, "", nil)
 	s.workflowStore.mu.Lock()
 	s.workflowStore.addRun(run)
 	s.workflowStore.mu.Unlock()
@@ -1021,10 +1088,9 @@ func (s *Server) RunK12WorkflowFromWebhookDispatch(
 	if prior != nil {
 		priorID = prior.ID
 	}
-	run := &WorkflowRun{
-		ID: "run-" + idgen.ShortID(), WorkflowID: wf.ID, Status: "running",
-		Input: input, TriggerKey: triggerKey, PriorRunID: priorID, StartedAt: time.Now(),
-	}
+	run := s.newWorkflowRun(wf, input, prior)
+	run.TriggerKey = triggerKey
+	run.PriorRunID = priorID
 	s.workflowStore.addRun(run)
 	s.workflowStore.mu.Unlock()
 

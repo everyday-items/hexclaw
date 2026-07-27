@@ -23,16 +23,70 @@ import (
 type SQLiteSemanticIndexRepository struct {
 	db                *sql.DB
 	ingestBlobStore   *localIngestBlobStore
+	ingestObserver    DocumentIngestLifecycleObserver
 	runningJobCancels *runningJobCancelRegistry
 }
 
 var _ SemanticIndexRepository = (*SQLiteSemanticIndexRepository)(nil)
+
+// DocumentIngestLifecycleEvent identifies one immutable Knowledge document
+// generation. Scenario observers must derive every projection from facts
+// visible through Tx; the event never carries caller-authored catalog data.
+type DocumentIngestLifecycleEvent struct {
+	OwnerID           string
+	CorpusUID         string
+	DocumentID        string
+	DocumentGeneration int64
+	At                time.Time
+}
+
+// DocumentIngestLifecycleObserver runs inside the same SQLite transaction as
+// the Knowledge lifecycle transition. Implementations must be idempotent and
+// must not perform network I/O.
+type DocumentIngestLifecycleObserver interface {
+	ReconcileDocumentIngestLifecycle(
+		context.Context,
+		*sql.Tx,
+		DocumentIngestLifecycleEvent,
+	) error
+}
 
 func NewSQLiteSemanticIndexRepository(db *sql.DB) *SQLiteSemanticIndexRepository {
 	return &SQLiteSemanticIndexRepository{
 		db:                db,
 		runningJobCancels: newRunningJobCancelRegistry(),
 	}
+}
+
+// SetDocumentIngestLifecycleObserver installs the scenario projection seam.
+// Composition roots must call it before workers start.
+func (r *SQLiteSemanticIndexRepository) SetDocumentIngestLifecycleObserver(
+	observer DocumentIngestLifecycleObserver,
+) {
+	r.ingestObserver = observer
+}
+
+func (r *SQLiteSemanticIndexRepository) reconcileDocumentIngestLifecycleTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	job KnowledgeJob,
+	at time.Time,
+) error {
+	if r.ingestObserver == nil || job.Kind != KnowledgeJobIngest ||
+		strings.TrimSpace(job.DocumentID) == "" || job.DocumentGeneration < 1 {
+		return nil
+	}
+	return r.ingestObserver.ReconcileDocumentIngestLifecycle(
+		ctx,
+		tx,
+		DocumentIngestLifecycleEvent{
+			OwnerID:             job.OwnerID,
+			CorpusUID:           job.CorpusUID,
+			DocumentID:          job.DocumentID,
+			DocumentGeneration: job.DocumentGeneration,
+			At:                  at.UTC(),
+		},
+	)
 }
 
 func (r *SQLiteSemanticIndexRepository) registerRunningJobCancel(
@@ -1686,6 +1740,9 @@ func (r *SQLiteSemanticIndexRepository) failJob(
 			return KnowledgeJob{}, fmt.Errorf("knowledge: persist structured job failure: %w", err)
 		}
 	}
+	if err := r.reconcileDocumentIngestLifecycleTx(ctx, tx, job, now); err != nil {
+		return KnowledgeJob{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return KnowledgeJob{}, err
 	}
@@ -2360,10 +2417,11 @@ func (r *SQLiteSemanticIndexRepository) prepareDocumentGC(
 	var tombstoned int
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1 FROM kb_documents d
-		JOIN kb_semantic_document_bindings b ON b.document_id=d.id
+		LEFT JOIN kb_semantic_document_bindings b
+		  ON b.document_id=d.id AND b.owner_id=? AND b.corpus_uid=d.corpus_uid
 		WHERE d.id=? AND d.corpus_uid=? AND d.deleted=1
-		  AND b.owner_id=? AND b.corpus_uid=? AND b.lifecycle_state='tombstoned'
-	)`, documentID, job.CorpusUID, job.OwnerID, job.CorpusUID).Scan(&tombstoned); err != nil {
+		  AND (b.document_id IS NULL OR b.lifecycle_state='tombstoned')
+	)`, job.OwnerID, documentID, job.CorpusUID).Scan(&tombstoned); err != nil {
 		return documentGCPlan{}, err
 	}
 	if tombstoned == 0 {

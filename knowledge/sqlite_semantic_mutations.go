@@ -202,20 +202,49 @@ func (s *sqliteSemanticMutationScope) documentDeletedTx(
 		s.ownerID, state.corpusUID, documentID).Scan(&previousGeneration); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			var deleted int
-			var lifecycle string
-			tombstoneErr := tx.QueryRowContext(ctx, `SELECT d.deleted,b.lifecycle_state
-				FROM kb_documents d JOIN kb_semantic_document_bindings b
-				  ON b.document_id=d.id AND b.corpus_uid=d.corpus_uid
-				WHERE b.owner_id=? AND b.corpus_uid=? AND b.document_id=?`,
-				s.ownerID, state.corpusUID, documentID).Scan(&deleted, &lifecycle)
-			if errors.Is(tombstoneErr, sql.ErrNoRows) {
+			var lifecycle sql.NullString
+			rootErr := tx.QueryRowContext(ctx, `SELECT d.deleted,b.lifecycle_state
+				FROM kb_documents d LEFT JOIN kb_semantic_document_bindings b
+				  ON b.document_id=d.id AND b.owner_id=? AND b.corpus_uid=d.corpus_uid
+				WHERE d.id=? AND d.corpus_uid=?`,
+				s.ownerID, documentID, state.corpusUID).Scan(&deleted, &lifecycle)
+			if errors.Is(rootErr, sql.ErrNoRows) {
+				var exists int
+				if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+					SELECT 1 FROM kb_documents WHERE id=?
+				)`, documentID).Scan(&exists); err != nil {
+					return err
+				}
+				if exists != 0 {
+					return ErrSemanticIndexNotFound
+				}
+				return nil
+			}
+			if rootErr != nil {
+				return rootErr
+			}
+			if lifecycle.Valid {
+				if deleted != 1 || lifecycle.String != "tombstoned" {
+					return ErrSemanticIndexNotFound
+				}
+				return queueDocumentGCTx(ctx, tx, s.ownerID, state.corpusUID, documentID, now)
+			}
+			if deleted != 0 && deleted != 1 {
 				return ErrSemanticIndexNotFound
 			}
-			if tombstoneErr != nil {
-				return tombstoneErr
+			if deleted == 0 {
+				res, updateErr := tx.ExecContext(ctx, `UPDATE kb_documents SET deleted=1,updated_at=?
+					WHERE id=? AND corpus_uid=? AND deleted=0`,
+					time.UnixMilli(now).UTC(), documentID, state.corpusUID)
+				if updateErr != nil {
+					return updateErr
+				}
+				if affected, _ := res.RowsAffected(); affected != 1 {
+					return ErrSemanticIndexNotFound
+				}
 			}
-			if deleted != 1 || lifecycle != "tombstoned" {
-				return ErrSemanticIndexNotFound
+			if err := fenceDocumentJobsTx(ctx, tx, state.corpusUID, documentID, now); err != nil {
+				return err
 			}
 			return queueDocumentGCTx(ctx, tx, s.ownerID, state.corpusUID, documentID, now)
 		}

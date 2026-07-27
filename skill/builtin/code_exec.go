@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"os"
 	"path/filepath"
@@ -76,18 +77,21 @@ type codeExecInputFile struct {
 }
 
 type codeExecRun struct {
-	ID           string
-	Base         string
-	Root         string
-	Workspace    string
-	Scratch      string
-	ArtifactDir  string
-	LogDir       string
-	CacheDir     string
-	ProjectRoot  string
-	ManifestPath string
-	GoRuntime    bool
-	Config       sandbox.Config
+	ID            string
+	Base          string
+	Root          string
+	Workspace     string
+	Scratch       string
+	ArtifactDir   string
+	LogDir        string
+	CacheDir      string
+	ProjectRoot   string
+	ManifestPath  string
+	GoRuntime     bool
+	GoWorkPath    string
+	GoVendored    bool
+	StagedProject bool
+	Config        sandbox.Config
 }
 
 type codeExecArtifact struct {
@@ -425,6 +429,7 @@ func prepareCodeExecRun(cfg sandbox.Config, req codeExecRequest, broker *FileAcc
 	if cfg.Workspace == "" {
 		return codeExecRun{}, fmt.Errorf("sandbox workspace is required")
 	}
+	cfg = ensureCodeExecConfigDefaults(cfg)
 	base := filepath.Clean(cfg.Workspace)
 	if err := os.MkdirAll(base, 0755); err != nil {
 		return codeExecRun{}, fmt.Errorf("create sandbox base workspace: %w", err)
@@ -433,21 +438,16 @@ func prepareCodeExecRun(cfg sandbox.Config, req codeExecRequest, broker *FileAcc
 	root := filepath.Join(base, "runs", runID)
 	workspace := filepath.Join(root, "work")
 	scratch := workspace
-	projectRoot := ""
+	hostProjectRoot := ""
 
 	if req.Mode == "project" {
 		var err error
-		projectRoot, err = resolveProjectRoot(req.ProjectRoot)
+		hostProjectRoot, err = resolveProjectRoot(req.ProjectRoot)
 		if err != nil {
 			return codeExecRun{}, err
 		}
-		if runtime.GOOS == "darwin" {
-			workspace = projectRoot
-			scratch = filepath.Join(codeExecScratchBase(), "hexclaw-sandbox-runs", runID)
-		} else {
-			scratch = filepath.Join(codeExecScratchBase(), "hexclaw-sandbox-runs", runID)
-			workspace = scratch
-		}
+		scratch = filepath.Join(resolveRealPath(codeExecScratchBase()), "hexclaw-sandbox-runs", runID)
+		workspace = scratch
 	}
 
 	run := codeExecRun{
@@ -459,9 +459,8 @@ func prepareCodeExecRun(cfg sandbox.Config, req codeExecRequest, broker *FileAcc
 		ArtifactDir:  filepath.Join(scratch, "artifacts"),
 		LogDir:       filepath.Join(root, "logs"),
 		CacheDir:     filepath.Join(scratch, "cache"),
-		ProjectRoot:  projectRoot,
 		ManifestPath: filepath.Join(root, "manifest.json"),
-		GoRuntime:    codeExecMayNeedGoRuntime(req, projectRoot),
+		GoRuntime:    codeExecMayNeedGoRuntime(req, hostProjectRoot),
 		Config:       cfg,
 	}
 	for _, dir := range []string{run.Root, run.Scratch, run.ArtifactDir, run.LogDir, run.CacheDir} {
@@ -469,24 +468,830 @@ func prepareCodeExecRun(cfg sandbox.Config, req codeExecRequest, broker *FileAcc
 			return codeExecRun{}, fmt.Errorf("create run dir %s: %w", dir, err)
 		}
 	}
+	if req.Mode == "project" {
+		stagedRoot := filepath.Join(run.Scratch, "project-workspace")
+		stagedProjectRoot, stagedGoWork, vendored, err := stageCodeExecProject(
+			hostProjectRoot,
+			stagedRoot,
+			run.GoRuntime,
+			broker,
+			cfg,
+		)
+		if err != nil {
+			return codeExecRun{}, err
+		}
+		run.ProjectRoot = stagedProjectRoot
+		run.GoWorkPath = stagedGoWork
+		run.GoVendored = vendored
+		run.StagedProject = true
+		if run.GoRuntime {
+			// Project Go commands are hermetic even when the global code-exec
+			// setting permits network access. Their dependency closure was
+			// already materialized outside the child sandbox.
+			run.Config.Network = false
+		}
+	}
 
 	run.Config.Workspace = run.Workspace
 	if req.Timeout > 0 {
 		run.Config.Timeout = req.Timeout
 	}
-	run.Config = ensureCodeExecConfigDefaults(run.Config)
 	run.Config.ReadablePaths = append([]string(nil), cfg.ReadablePaths...)
-	if req.Mode == "project" {
-		if filepath.Clean(run.Workspace) != filepath.Clean(projectRoot) {
-			run.Config.ReadablePaths = append(run.Config.ReadablePaths, projectRoot)
-		}
-		run.Config.ReadablePaths = append(run.Config.ReadablePaths, projectReadablePaths(projectRoot, broker)...)
-	}
 	if run.GoRuntime {
-		run.Config.ReadablePaths = append(run.Config.ReadablePaths, goRuntimeReadablePaths()...)
+		if run.StagedProject {
+			if goroot := runtime.GOROOT(); goroot != "" {
+				run.Config.ReadablePaths = append(run.Config.ReadablePaths, goroot)
+			}
+		} else {
+			run.Config.ReadablePaths = append(run.Config.ReadablePaths, goRuntimeReadablePaths()...)
+		}
 	}
 	run.Config.ReadablePaths = compactCleanPaths(run.Config.ReadablePaths)
 	return run, nil
+}
+
+type codeExecGoModuleRef struct {
+	Path    string
+	Version string
+}
+
+type codeExecGoReplace struct {
+	Old codeExecGoModuleRef
+	New codeExecGoModuleRef
+}
+
+type codeExecGoWorkUse struct {
+	DiskPath string
+}
+
+type codeExecGoWorkEdit struct {
+	Use     []codeExecGoWorkUse
+	Replace []codeExecGoReplace
+}
+
+type codeExecGoModEdit struct {
+	Replace []codeExecGoReplace
+}
+
+type codeExecStageModule struct {
+	Source string
+	Dest   string
+	Mod    codeExecGoModEdit
+}
+
+type codeExecStageCopyBudget struct {
+	Used int64
+	Max  int64
+}
+
+func (b *codeExecStageCopyBudget) Add(size int64) error {
+	if size < 0 {
+		return fmt.Errorf("project dependency closure: negative staged file size")
+	}
+	if b.Max > 0 && size > b.Max-b.Used {
+		return fmt.Errorf("project dependency closure exceeds max workspace bytes: %d", b.Max)
+	}
+	b.Used += size
+	return nil
+}
+
+func stageCodeExecProject(
+	hostProjectRoot string,
+	stageRoot string,
+	goRuntime bool,
+	broker *FileAccessBroker,
+	cfg sandbox.Config,
+) (string, string, bool, error) {
+	hostProjectRoot = resolveRealPath(hostProjectRoot)
+	if codeExecStagePathDenied(hostProjectRoot, cfg.DeniedPaths) {
+		return "", "", false, fmt.Errorf("project dependency closure: project root is denied")
+	}
+	if err := os.MkdirAll(stageRoot, 0755); err != nil {
+		return "", "", false, fmt.Errorf("project dependency closure: create staged root: %w", err)
+	}
+	stageTemp := filepath.Join(stageRoot, ".go-tmp")
+	if err := os.MkdirAll(stageTemp, 0755); err != nil {
+		return "", "", false, fmt.Errorf("project dependency closure: create staging temp: %w", err)
+	}
+	defer os.RemoveAll(stageTemp)
+
+	if !goRuntime {
+		dest := filepath.Join(stageRoot, "project")
+		budget := &codeExecStageCopyBudget{Max: cfg.MaxWorkspaceBytes}
+		if err := copyCodeExecStageTree(hostProjectRoot, dest, cfg.DeniedPaths, budget); err != nil {
+			return "", "", false, err
+		}
+		return dest, "", false, nil
+	}
+
+	hostGoWork, err := discoverCodeExecHostGoWork(hostProjectRoot)
+	if err != nil {
+		return "", "", false, err
+	}
+	if hostGoWork != "" && broker != nil {
+		if err := authorizeCodeExecPath(broker, cfg.Workspace, hostGoWork); err != nil {
+			return "", "", false, fmt.Errorf("project dependency closure: go.work authorization: %w", err)
+		}
+	}
+	hostModCache := hostGoModCachePath()
+	goStage := newCodeExecGoStageRunner(cfg, stageRoot, hostModCache, stageTemp)
+	var workEdit codeExecGoWorkEdit
+	if hostGoWork != "" {
+		workEdit, err = readCodeExecGoWorkEdit(hostGoWork, goStage)
+		if err != nil {
+			return "", "", false, err
+		}
+	}
+
+	var sources []string
+	sourceIndex := map[string]int{}
+	addSource := func(raw string) (string, error) {
+		source, err := resolveCodeExecStageSource("", raw)
+		if err != nil {
+			return "", err
+		}
+		if codeExecStagePathDenied(source, cfg.DeniedPaths) {
+			return "", fmt.Errorf("project dependency closure: local module is denied: %s", filepath.Base(source))
+		}
+		if broker != nil {
+			if err := authorizeCodeExecPath(broker, cfg.Workspace, source); err != nil {
+				return "", fmt.Errorf("project dependency closure: local module authorization: %w", err)
+			}
+		}
+		if _, ok := sourceIndex[source]; !ok {
+			sourceIndex[source] = len(sources)
+			sources = append(sources, source)
+		}
+		return source, nil
+	}
+
+	workDir := ""
+	if hostGoWork != "" {
+		workDir = filepath.Dir(hostGoWork)
+		for _, use := range workEdit.Use {
+			source, err := resolveCodeExecStageSource(workDir, use.DiskPath)
+			if err != nil {
+				return "", "", false, err
+			}
+			if _, err := addSource(source); err != nil {
+				return "", "", false, err
+			}
+		}
+		for _, replace := range workEdit.Replace {
+			if source, local, err := codeExecLocalReplacementSource(workDir, replace); err != nil {
+				return "", "", false, err
+			} else if local {
+				if _, err := addSource(source); err != nil {
+					return "", "", false, err
+				}
+			}
+		}
+	}
+
+	commandSource := ""
+	for _, source := range sources {
+		if pathWithinResolved(source, hostProjectRoot) &&
+			(commandSource == "" || len(source) > len(commandSource)) {
+			commandSource = source
+		}
+	}
+	if commandSource == "" {
+		commandSource, err = addSource(hostProjectRoot)
+		if err != nil {
+			return "", "", false, err
+		}
+	}
+
+	moduleEdits := map[string]codeExecGoModEdit{}
+	for i := 0; i < len(sources); i++ {
+		source := sources[i]
+		modFile := filepath.Join(source, "go.mod")
+		if !fileExists(modFile) {
+			continue
+		}
+		modEdit, err := readCodeExecGoModEdit(modFile, goStage)
+		if err != nil {
+			return "", "", false, err
+		}
+		moduleEdits[source] = modEdit
+		for _, replace := range modEdit.Replace {
+			dependency, local, err := codeExecLocalReplacementSource(source, replace)
+			if err != nil {
+				return "", "", false, err
+			}
+			if local {
+				if _, err := addSource(dependency); err != nil {
+					return "", "", false, err
+				}
+			}
+		}
+	}
+
+	destBySource := make(map[string]string, len(sources))
+	modules := make([]codeExecStageModule, 0, len(sources))
+	for _, source := range sources {
+		dest := filepath.Join(stageRoot, "modules", codeExecStagedModuleDirName(source))
+		if source == commandSource {
+			dest = filepath.Join(stageRoot, "project")
+		}
+		destBySource[source] = dest
+		modules = append(modules, codeExecStageModule{
+			Source: source,
+			Dest:   dest,
+			Mod:    moduleEdits[source],
+		})
+	}
+
+	budget := &codeExecStageCopyBudget{Max: cfg.MaxWorkspaceBytes}
+	for _, module := range modules {
+		if err := copyCodeExecStageTree(module.Source, module.Dest, cfg.DeniedPaths, budget); err != nil {
+			return "", "", false, err
+		}
+	}
+
+	commandRel, err := filepath.Rel(commandSource, hostProjectRoot)
+	if err != nil || commandRel == ".." || strings.HasPrefix(commandRel, ".."+string(filepath.Separator)) {
+		return "", "", false, fmt.Errorf("project dependency closure: project root escaped command module")
+	}
+	stagedProjectRoot := filepath.Join(destBySource[commandSource], commandRel)
+	if !pathWithinResolved(stageRoot, stagedProjectRoot) {
+		return "", "", false, fmt.Errorf("project dependency closure: staged project root escaped run")
+	}
+
+	for _, module := range modules {
+		if err := rewriteCodeExecStagedGoMod(module, destBySource, goStage); err != nil {
+			return "", "", false, err
+		}
+	}
+
+	stagedGoWork := ""
+	if hostGoWork != "" {
+		stagedGoWork = filepath.Join(stageRoot, "go.work")
+		if err := writeCodeExecStagedGoWork(
+			hostGoWork,
+			stagedGoWork,
+			workEdit,
+			destBySource,
+			goStage,
+		); err != nil {
+			return "", "", false, err
+		}
+	}
+
+	vendored, err := vendorCodeExecStagedGoProject(
+		stageRoot,
+		stagedProjectRoot,
+		stagedGoWork,
+		goStage,
+	)
+	if err != nil {
+		return "", "", false, err
+	}
+	if err := ensureCodeExecStagedMetadataHasNoHostPaths(
+		stageRoot,
+		stagedGoWork,
+		modules,
+		append(append([]string(nil), sources...), workDir),
+	); err != nil {
+		return "", "", false, err
+	}
+	if size, err := dirSize(stageRoot); err != nil {
+		return "", "", false, fmt.Errorf("project dependency closure: measure staged workspace: %w", err)
+	} else if cfg.MaxWorkspaceBytes > 0 && size > cfg.MaxWorkspaceBytes {
+		return "", "", false, fmt.Errorf(
+			"project dependency closure exceeds max workspace bytes after vendoring: %d > %d",
+			size,
+			cfg.MaxWorkspaceBytes,
+		)
+	}
+	return stagedProjectRoot, stagedGoWork, vendored, nil
+}
+
+func discoverCodeExecHostGoWork(projectRoot string) (string, error) {
+	if configured := strings.TrimSpace(os.Getenv("GOWORK")); configured != "" {
+		if strings.EqualFold(configured, "off") {
+			return "", nil
+		}
+		if !filepath.IsAbs(configured) {
+			return "", fmt.Errorf("project dependency closure: GOWORK must be absolute or off")
+		}
+		info, err := os.Stat(configured)
+		if err != nil {
+			return "", fmt.Errorf("project dependency closure: stat GOWORK: %w", err)
+		}
+		if info.IsDir() {
+			return "", fmt.Errorf("project dependency closure: GOWORK is a directory")
+		}
+		return resolveRealPath(configured), nil
+	}
+	for dir := filepath.Clean(projectRoot); ; dir = filepath.Dir(dir) {
+		workFile := filepath.Join(dir, "go.work")
+		if fileExists(workFile) {
+			return resolveRealPath(workFile), nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", nil
+		}
+	}
+}
+
+func readCodeExecGoWorkEdit(path string, runner *codeExecGoStageRunner) (codeExecGoWorkEdit, error) {
+	out, err := runner.Run(
+		filepath.Dir(path),
+		"off",
+		"work", "edit", "-json", path,
+	)
+	if err != nil {
+		return codeExecGoWorkEdit{}, err
+	}
+	var edit codeExecGoWorkEdit
+	if err := json.Unmarshal(out, &edit); err != nil {
+		return codeExecGoWorkEdit{}, fmt.Errorf("project dependency closure: decode go.work: %w", err)
+	}
+	return edit, nil
+}
+
+func readCodeExecGoModEdit(path string, runner *codeExecGoStageRunner) (codeExecGoModEdit, error) {
+	out, err := runner.Run(
+		filepath.Dir(path),
+		"off",
+		"mod", "edit", "-json", path,
+	)
+	if err != nil {
+		return codeExecGoModEdit{}, err
+	}
+	var edit codeExecGoModEdit
+	if err := json.Unmarshal(out, &edit); err != nil {
+		return codeExecGoModEdit{}, fmt.Errorf("project dependency closure: decode go.mod: %w", err)
+	}
+	return edit, nil
+}
+
+func resolveCodeExecStageSource(base, raw string) (string, error) {
+	path := strings.TrimSpace(raw)
+	if path == "" {
+		return "", fmt.Errorf("project dependency closure: empty local module path")
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(base, filepath.FromSlash(path))
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("project dependency closure: stat local module: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("project dependency closure: local module is not a directory")
+	}
+	return resolveRealPath(path), nil
+}
+
+func codeExecLocalReplacementSource(base string, replace codeExecGoReplace) (string, bool, error) {
+	if strings.TrimSpace(replace.New.Path) == "" || strings.TrimSpace(replace.New.Version) != "" {
+		return "", false, nil
+	}
+	source, err := resolveCodeExecStageSource(base, replace.New.Path)
+	if err != nil {
+		return "", false, err
+	}
+	return source, true, nil
+}
+
+func rewriteCodeExecStagedGoMod(
+	module codeExecStageModule,
+	destBySource map[string]string,
+	runner *codeExecGoStageRunner,
+) error {
+	modFile := filepath.Join(module.Dest, "go.mod")
+	if !fileExists(modFile) || len(module.Mod.Replace) == 0 {
+		return nil
+	}
+	args := []string{"mod", "edit"}
+	for _, replace := range module.Mod.Replace {
+		source, local, err := codeExecLocalReplacementSource(module.Source, replace)
+		if err != nil {
+			return err
+		}
+		if !local {
+			continue
+		}
+		dest, ok := destBySource[source]
+		if !ok {
+			return fmt.Errorf("project dependency closure: local replace target was not staged")
+		}
+		rel, err := filepath.Rel(module.Dest, dest)
+		if err != nil {
+			return fmt.Errorf("project dependency closure: rewrite local replace: %w", err)
+		}
+		args = append(args, "-replace="+codeExecGoModuleRefText(replace.Old)+"="+codeExecGoRelativePath(rel))
+	}
+	if len(args) == 2 {
+		return nil
+	}
+	args = append(args, modFile)
+	_, err := runner.Run(module.Dest, "off", args...)
+	return err
+}
+
+func writeCodeExecStagedGoWork(
+	hostPath string,
+	stagedPath string,
+	edit codeExecGoWorkEdit,
+	destBySource map[string]string,
+	runner *codeExecGoStageRunner,
+) error {
+	data, err := os.ReadFile(hostPath)
+	if err != nil {
+		return fmt.Errorf("project dependency closure: read go.work: %w", err)
+	}
+	if err := os.WriteFile(stagedPath, data, 0644); err != nil {
+		return fmt.Errorf("project dependency closure: write staged go.work: %w", err)
+	}
+	if sum, err := os.ReadFile(hostPath + ".sum"); err == nil {
+		if err := os.WriteFile(stagedPath+".sum", sum, 0644); err != nil {
+			return fmt.Errorf("project dependency closure: write staged go.work.sum: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("project dependency closure: read go.work.sum: %w", err)
+	}
+
+	hostDir := filepath.Dir(hostPath)
+	stageDir := filepath.Dir(stagedPath)
+	args := []string{"work", "edit"}
+	for _, use := range edit.Use {
+		args = append(args, "-dropuse="+use.DiskPath)
+	}
+	for _, use := range edit.Use {
+		source, err := resolveCodeExecStageSource(hostDir, use.DiskPath)
+		if err != nil {
+			return err
+		}
+		dest, ok := destBySource[source]
+		if !ok {
+			return fmt.Errorf("project dependency closure: go.work use target was not staged")
+		}
+		rel, err := filepath.Rel(stageDir, dest)
+		if err != nil {
+			return fmt.Errorf("project dependency closure: rewrite go.work use: %w", err)
+		}
+		args = append(args, "-use="+codeExecGoRelativePath(rel))
+	}
+	for _, replace := range edit.Replace {
+		source, local, err := codeExecLocalReplacementSource(hostDir, replace)
+		if err != nil {
+			return err
+		}
+		if !local {
+			continue
+		}
+		dest, ok := destBySource[source]
+		if !ok {
+			return fmt.Errorf("project dependency closure: go.work replace target was not staged")
+		}
+		rel, err := filepath.Rel(stageDir, dest)
+		if err != nil {
+			return fmt.Errorf("project dependency closure: rewrite go.work replace: %w", err)
+		}
+		old := codeExecGoModuleRefText(replace.Old)
+		args = append(args, "-dropreplace="+old, "-replace="+old+"="+codeExecGoRelativePath(rel))
+	}
+	args = append(args, stagedPath)
+	_, err = runner.Run(stageDir, "off", args...)
+	return err
+}
+
+func vendorCodeExecStagedGoProject(
+	stageRoot string,
+	projectRoot string,
+	goWorkPath string,
+	runner *codeExecGoStageRunner,
+) (bool, error) {
+	var (
+		dir    string
+		gowork string
+		args   []string
+		vendor string
+	)
+	if goWorkPath != "" {
+		dir = stageRoot
+		gowork = goWorkPath
+		args = []string{"work", "vendor"}
+		vendor = filepath.Join(stageRoot, "vendor")
+	} else if fileExists(filepath.Join(projectRoot, "go.mod")) {
+		dir = projectRoot
+		gowork = "off"
+		args = []string{"mod", "vendor"}
+		vendor = filepath.Join(projectRoot, "vendor")
+	} else {
+		return false, nil
+	}
+	if _, err := runner.Run(dir, gowork, args...); err != nil {
+		return false, err
+	}
+	return fileExists(vendor), nil
+}
+
+type codeExecGoStageRunner struct {
+	Config       sandbox.Config
+	Workspace    string
+	HostModCache string
+	TempDir      string
+}
+
+func newCodeExecGoStageRunner(
+	cfg sandbox.Config,
+	workspace string,
+	hostModCache string,
+	tempDir string,
+) *codeExecGoStageRunner {
+	return &codeExecGoStageRunner{
+		Config:       cfg,
+		Workspace:    workspace,
+		HostModCache: hostModCache,
+		TempDir:      tempDir,
+	}
+}
+
+func (r *codeExecGoStageRunner) Run(dir string, gowork string, args ...string) ([]byte, error) {
+	for _, path := range []string{
+		r.TempDir,
+		filepath.Join(r.TempDir, "go-build"),
+		filepath.Join(r.TempDir, "home"),
+	} {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			return nil, fmt.Errorf("project dependency closure: create Go staging directory: %w", err)
+		}
+	}
+
+	stageCfg := ensureCodeExecConfigDefaults(r.Config)
+	stageCfg.Workspace = r.Workspace
+	stageCfg.Network = false
+	stageCfg.ReadablePaths = []string{dir}
+	if r.HostModCache != "" && fileExists(r.HostModCache) {
+		stageCfg.ReadablePaths = append(stageCfg.ReadablePaths, r.HostModCache)
+	}
+	if goroot := runtime.GOROOT(); goroot != "" {
+		stageCfg.ReadablePaths = append(stageCfg.ReadablePaths, goroot)
+	}
+	stageCfg.ReadablePaths = compactCleanPaths(stageCfg.ReadablePaths)
+	if stageCfg.MaxOutputBytes < 4*1024*1024 {
+		stageCfg.MaxOutputBytes = 4 * 1024 * 1024
+	}
+	if stageCfg.MaxStderrBytes < 256*1024 {
+		stageCfg.MaxStderrBytes = 256 * 1024
+	}
+	sb, err := sandbox.New(stageCfg)
+	if err != nil {
+		return nil, fmt.Errorf("project dependency closure: create Go staging sandbox: %w", err)
+	}
+
+	exports := map[string]string{
+		"GOCACHE":     filepath.Join(r.TempDir, "go-build"),
+		"GOENV":       "off",
+		"GOFLAGS":     "",
+		"GONOPROXY":   "",
+		"GONOSUMDB":   "",
+		"GOPROXY":     "off",
+		"GOSUMDB":     "off",
+		"GOTOOLCHAIN": "local",
+		"GOWORK":      gowork,
+		"HOME":        filepath.Join(r.TempDir, "home"),
+		"TMP":         r.TempDir,
+		"TEMP":        r.TempDir,
+		"TMPDIR":      r.TempDir,
+	}
+	if r.HostModCache != "" {
+		exports["GOMODCACHE"] = r.HostModCache
+	}
+	stageRun := codeExecRun{
+		ID:          "dependency_closure",
+		Workspace:   r.Workspace,
+		Scratch:     r.Workspace,
+		ArtifactDir: filepath.Join(r.Workspace, "artifacts"),
+		CacheDir:    r.TempDir,
+		ProjectRoot: dir,
+		Config:      stageCfg,
+	}
+	command := append([]string{"go"}, args...)
+	var result *sandbox.ExecResult
+	if runtime.GOOS == "windows" {
+		result, err = runWindowsSandboxCommand(context.Background(), sb, stageRun, command, exports)
+	} else {
+		result, err = runPosixSandboxCommandInDir(context.Background(), sb, dir, command, exports)
+	}
+	if err != nil {
+		return nil, codeExecGoStageError(args, result, err)
+	}
+	if result == nil {
+		return nil, fmt.Errorf("project dependency closure: go %s returned no result", strings.Join(args, " "))
+	}
+	if result.ExitCode != 0 {
+		return nil, codeExecGoStageError(args, result, fmt.Errorf("exit status %d", result.ExitCode))
+	}
+	return []byte(result.Stdout), nil
+}
+
+func codeExecGoStageError(args []string, result *sandbox.ExecResult, cause error) error {
+	var diagnostic string
+	if result != nil {
+		diagnostic = strings.TrimSpace(strings.TrimSpace(result.Stdout) + "\n" + strings.TrimSpace(result.Stderr))
+	}
+	if len(diagnostic) > 4096 {
+		diagnostic = diagnostic[:4096] + "...[truncated]"
+	}
+	if diagnostic == "" {
+		return fmt.Errorf("project dependency closure: go %s: %w", strings.Join(args, " "), cause)
+	}
+	return fmt.Errorf(
+		"project dependency closure: go %s: %w: %s",
+		strings.Join(args, " "),
+		cause,
+		diagnostic,
+	)
+}
+
+func copyCodeExecStageTree(
+	sourceRoot string,
+	destRoot string,
+	deniedPaths []string,
+	budget *codeExecStageCopyBudget,
+) error {
+	sourceRoot = resolveRealPath(sourceRoot)
+	if codeExecStagePathDenied(sourceRoot, deniedPaths) {
+		return fmt.Errorf("project dependency closure: source root is denied")
+	}
+	skipDirs := map[string]bool{".git": true, ".hg": true, ".svn": true, "vendor": true}
+	return filepath.WalkDir(sourceRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("project dependency closure: walk source: %w", walkErr)
+		}
+		if path != sourceRoot && codeExecStagePathDenied(path, deniedPaths) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if path != sourceRoot && entry.IsDir() && skipDirs[entry.Name()] {
+			return filepath.SkipDir
+		}
+		rel, err := filepath.Rel(sourceRoot, path)
+		if err != nil {
+			return fmt.Errorf("project dependency closure: relative source path: %w", err)
+		}
+		dest := filepath.Join(destRoot, rel)
+		info, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("project dependency closure: stat source: %w", err)
+		}
+		switch {
+		case info.IsDir():
+			mode := info.Mode().Perm() | 0700
+			if err := os.MkdirAll(dest, mode); err != nil {
+				return fmt.Errorf("project dependency closure: create staged directory: %w", err)
+			}
+			return nil
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				return fmt.Errorf("project dependency closure: resolve symlink: %w", err)
+			}
+			if !pathWithinResolved(sourceRoot, target) {
+				return fmt.Errorf("project dependency closure: symlink escapes staged module")
+			}
+			if codeExecStagePathDenied(target, deniedPaths) {
+				return nil
+			}
+			targetRel, err := filepath.Rel(sourceRoot, target)
+			if err != nil {
+				return fmt.Errorf("project dependency closure: relative symlink target: %w", err)
+			}
+			stagedTarget := filepath.Join(destRoot, targetRel)
+			linkTarget, err := filepath.Rel(filepath.Dir(dest), stagedTarget)
+			if err != nil {
+				return fmt.Errorf("project dependency closure: staged symlink target: %w", err)
+			}
+			if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+				return fmt.Errorf("project dependency closure: create staged symlink dir: %w", err)
+			}
+			if err := os.Symlink(linkTarget, dest); err != nil {
+				return fmt.Errorf("project dependency closure: create staged symlink: %w", err)
+			}
+			return nil
+		case info.Mode().IsRegular():
+			if err := budget.Add(info.Size()); err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+				return fmt.Errorf("project dependency closure: create staged file dir: %w", err)
+			}
+			return copyCodeExecStageFile(path, dest, info.Mode().Perm()|0200)
+		default:
+			return fmt.Errorf("project dependency closure: unsupported source file type: %s", filepath.Base(path))
+		}
+	})
+}
+
+func copyCodeExecStageFile(source, dest string, mode os.FileMode) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return fmt.Errorf("project dependency closure: open source file: %w", err)
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return fmt.Errorf("project dependency closure: create staged file: %w", err)
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return fmt.Errorf("project dependency closure: copy staged file: %w", copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("project dependency closure: close staged file: %w", closeErr)
+	}
+	return nil
+}
+
+func codeExecStagePathDenied(path string, deniedPaths []string) bool {
+	for _, denied := range deniedPaths {
+		if strings.TrimSpace(denied) != "" && pathWithinResolved(denied, path) {
+			return true
+		}
+	}
+	return false
+}
+
+func codeExecStagedModuleDirName(source string) string {
+	base := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == '-', r == '_', r == '.':
+			return r
+		default:
+			return '-'
+		}
+	}, filepath.Base(source))
+	if strings.Trim(base, "-.") == "" {
+		base = "module"
+	}
+	sum := sha256.Sum256([]byte(source))
+	return fmt.Sprintf("%s-%x", base, sum[:6])
+}
+
+func codeExecGoModuleRefText(ref codeExecGoModuleRef) string {
+	if strings.TrimSpace(ref.Version) == "" {
+		return ref.Path
+	}
+	return ref.Path + "@" + ref.Version
+}
+
+func codeExecGoRelativePath(path string) string {
+	path = filepath.ToSlash(filepath.Clean(path))
+	if path == "." || strings.HasPrefix(path, ".") {
+		return path
+	}
+	return "./" + path
+}
+
+func ensureCodeExecStagedMetadataHasNoHostPaths(
+	stageRoot string,
+	goWorkPath string,
+	modules []codeExecStageModule,
+	hostPaths []string,
+) error {
+	var metadataFiles []string
+	if goWorkPath != "" {
+		metadataFiles = append(metadataFiles, goWorkPath)
+	}
+	for _, module := range modules {
+		if modFile := filepath.Join(module.Dest, "go.mod"); fileExists(modFile) {
+			metadataFiles = append(metadataFiles, modFile)
+		}
+	}
+	if vendorManifest := filepath.Join(stageRoot, "vendor", "modules.txt"); fileExists(vendorManifest) {
+		metadataFiles = append(metadataFiles, vendorManifest)
+	}
+	for _, metadataFile := range metadataFiles {
+		data, err := os.ReadFile(metadataFile)
+		if err != nil {
+			return fmt.Errorf("project dependency closure: inspect staged metadata: %w", err)
+		}
+		for _, hostPath := range hostPaths {
+			hostPath = strings.TrimSpace(hostPath)
+			if hostPath == "" || hostPath == string(filepath.Separator) {
+				continue
+			}
+			if strings.Contains(string(data), hostPath) {
+				return fmt.Errorf("project dependency closure: staged metadata retained a host absolute path")
+			}
+		}
+	}
+	return nil
 }
 
 func prepareCodeExecCommand(req codeExecRequest, run codeExecRun) ([]string, error) {
@@ -679,20 +1484,25 @@ func codeExecEnv(run codeExecRun) map[string]string {
 		"PIP_CACHE_DIR":        filepath.Join(run.CacheDir, "pip"),
 		"PYTHONPYCACHEPREFIX":  filepath.Join(run.CacheDir, "pycache"),
 		"npm_config_cache":     filepath.Join(run.CacheDir, "npm"),
-		// GOWORK=off 显式关 Go workspace 模式：沙箱内 go 命令绝不加载宿主 go.work（hermeticity）。
-		// 仅 `unset GOWORK` 不够——go 会沿目录树自动发现 go.work 进 workspace 模式、进而想写宿主
-		// go.work.sum（沙箱只读拒绝→失败）。=off 才真正隔离（对非 go 运行无害）。
-		"GOWORK": "off",
+		"GOWORK":               "off",
+	}
+	if run.GoWorkPath != "" {
+		exports["GOWORK"] = run.GoWorkPath
 	}
 	if run.Config.Network {
 		exports["GOMODCACHE"] = filepath.Join(run.CacheDir, "gomod")
 	} else if run.GoRuntime {
-		if gomod := hostGoModCachePath(); gomod != "" {
+		if run.StagedProject {
+			exports["GOMODCACHE"] = filepath.Join(run.CacheDir, "gomod")
+		} else if gomod := hostGoModCachePath(); gomod != "" {
 			exports["GOMODCACHE"] = gomod
 		}
 		exports["GOPROXY"] = "off"
 		exports["GOSUMDB"] = "off"
 		exports["GOTOOLCHAIN"] = "local"
+	}
+	if run.GoVendored {
+		exports["GOFLAGS"] = "-mod=vendor"
 	}
 	return exports
 }
@@ -709,15 +1519,14 @@ var codeExecWritableEnvKeys = []string{
 	"GOMODCACHE",
 }
 
-// codeExecUnsetEnvKeys 需从沙箱环境剥除的宿主变量。GOWORK 不在此列——它改为显式
-// `export GOWORK=off`（见 exports base），因为 `unset GOWORK` 后 go 仍会自动发现宿主 go.work、
-// 破坏 hermeticity 并触发对宿主 go.work.sum 的越界写（沙箱拒→失败）。
+// codeExecUnsetEnvKeys 需从沙箱环境剥除的宿主变量。GOWORK 由 codeExecEnv 确定为
+// staged go.work 或 off，绝不继承宿主值。
 var codeExecUnsetEnvKeys = []string{}
 
 func ensureCodeExecEnvDirs(run codeExecRun, exports map[string]string) error {
 	seen := map[string]bool{}
 	for _, key := range codeExecWritableEnvKeys {
-		if key == "GOMODCACHE" && run.GoRuntime && !run.Config.Network {
+		if key == "GOMODCACHE" && run.GoRuntime && !run.Config.Network && !run.StagedProject {
 			continue
 		}
 		dir := strings.TrimSpace(exports[key])

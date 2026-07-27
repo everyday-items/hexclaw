@@ -74,6 +74,8 @@ type Selector struct {
 const defaultProviderCooldown = 2 * time.Minute
 
 var (
+	// ErrNoProvider means routing cannot proceed because no LLM provider is configured.
+	ErrNoProvider = errors.New("没有可用的 LLM Provider")
 	// ErrNoCapableModel means the configured default provider has no exact
 	// model declaration satisfying a required capability set.
 	ErrNoCapableModel = errors.New("no model satisfies required capabilities")
@@ -103,7 +105,13 @@ type CapabilityRoute struct {
 func New(cfg config.LLMConfig) (*Selector, error) {
 	providers, activeCfg, defaultP := buildSelectorState(cfg)
 	if len(providers) == 0 {
-		return nil, fmt.Errorf("没有可用的 LLM Provider，请检查 API Key 配置")
+		return &Selector{
+			providers:      providers,
+			cfg:            activeCfg,
+			defaultP:       defaultP,
+			unhealthyUntil: make(map[string]time.Time),
+			now:            time.Now,
+		}, fmt.Errorf("%w，请检查 API Key 配置", ErrNoProvider)
 	}
 	// 校验 default 名字
 	if _, ok := providers[defaultP]; !ok {
@@ -638,10 +646,13 @@ func (r *Selector) ResolveRouteForCapabilities(
 	required ...string,
 ) (CapabilityRoute, error) {
 	if r == nil {
-		return CapabilityRoute{}, fmt.Errorf("%w: LLM router is not initialized", ErrNoCapableModel)
+		return CapabilityRoute{}, ErrNoProvider
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if len(r.providers) == 0 {
+		return CapabilityRoute{}, ErrNoProvider
+	}
 
 	providerName = strings.TrimSpace(providerName)
 	model = strings.TrimSpace(model)
@@ -719,11 +730,14 @@ func (r *Selector) ResolveRouteForCapabilities(
 //   - "quality-first": 优先选择高质量 Provider（Claude > OpenAI > Gemini > DeepSeek > Qwen）
 //   - "latency-first": 优先选择低延迟 Provider（Ollama > DeepSeek > OpenAI > Claude）
 func (r *Selector) Route(_ context.Context) (hexagon.Provider, string, error) {
+	if r == nil {
+		return nil, "", ErrNoProvider
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	if len(r.providers) == 0 {
-		return nil, "", fmt.Errorf("没有可用的 LLM Provider")
+		return nil, "", ErrNoProvider
 	}
 
 	// 如果路由未启用或策略为空/default，直接返回默认 Provider
@@ -885,8 +899,14 @@ func (r *Selector) selectByPriority(priorities map[string]int) string {
 // 当指定的 Provider 不可用时，返回第一个可用的其他 Provider。
 // 支持排除多个 Provider（用于级联降级场景）。
 func (r *Selector) Fallback(exclude ...string) (hexagon.Provider, string, error) {
+	if r == nil {
+		return nil, "", ErrNoProvider
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if len(r.providers) == 0 {
+		return nil, "", ErrNoProvider
+	}
 
 	name := r.fallbackNameLocked(exclude)
 	if name != "" {

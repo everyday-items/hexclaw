@@ -426,10 +426,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		logger.Info("[egress] 云出网判定", "purpose", req.Purpose, "data_class", req.DataClass,
 			"audit_id", req.AuditID, "allow_cloud", decision.AllowCloud, "reason", decision.Reason)
 	}}
+	if router != nil {
+		router.SetEgressPolicy(cloudEgress)
+	}
 	if err != nil {
 		fmt.Printf("  ✗ LLM         跳过 (%v)\n", err)
 	} else {
-		router.SetEgressPolicy(cloudEgress)
 		fmt.Printf("  ✓ LLM         %v\n", router.Providers())
 	}
 
@@ -2214,6 +2216,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		if k12rt, k12err := k12assembly.WireInto(ctx, scenarioReg, store.DB(), k12Solve, k12Opts...); k12err != nil {
 			logger.Error("装配 K12 场景包失败", "error", k12err)
 		} else {
+			if kbSemanticRuntime != nil {
+				kbSemanticRuntime.Repository.SetDocumentIngestLifecycleObserver(
+					k12engineadapter.NewTextbookManifestLifecycleAdapter(
+						k12rt.Records,
+					),
+				)
+			}
 			// Freeze the validated release policy at composition. Every subsequent
 			// CreateGradingJob copies this value; retries only read the Job snapshot.
 			k12rt.Deps.GradingBudgetSnapshot = k12GradingBudgetSnapshotFromConfig(cfg.K12.GradingBudget)
@@ -2322,14 +2331,37 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					if selectionSource == "" {
 						selectionSource = "auto"
 					}
+					providerDisplayName := ""
+					if providerConfig, ok := router.ActiveConfig().Providers[resolved.Provider]; ok {
+						providerDisplayName = providerConfig.DisplayName
+					}
 					return k12.ImageTaskRouteSnapshot{
-						Provider: resolved.Provider, Model: resolved.Model,
+						Provider: resolved.Provider, ProviderDisplayName: providerDisplayName,
+						Model: resolved.Model, ModelID: resolved.Model,
 						Route: resolved.Route, Capability: resolved.Capability,
 						SelectionSource: selectionSource,
 						PolicyVersion:   "image-task-routing-v1",
 						PromptVersion:   "image-task-classifier-v1",
 						TimeoutMS:       resolved.TimeoutMS,
 					}, nil
+				},
+				ResolveRouteDisplay: func(
+					requested k12.ImageTaskRouteSnapshot,
+				) (string, string) {
+					active := router.ActiveConfig()
+					providerName := strings.TrimSpace(requested.Provider)
+					if providerName == "" {
+						providerName = strings.TrimSpace(active.Default)
+					}
+					providerConfig, ok := active.Providers[providerName]
+					if !ok {
+						return "", ""
+					}
+					modelID := strings.TrimSpace(requested.Model)
+					if modelID == "" {
+						modelID = strings.TrimSpace(providerConfig.Model)
+					}
+					return providerConfig.DisplayName, modelID
 				},
 			}
 			if webhookMgr != nil {

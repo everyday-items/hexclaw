@@ -610,7 +610,7 @@ func TestCodeExecSkill_Execute_PythonCrawlerNetworkPolicy(t *testing.T) {
 	}
 }
 
-func TestCodeExecSkill_Execute_ProjectGoCommand(t *testing.T) {
+func TestBUG20260727001_CodeExecProjectGoCommandUsesSelfContainedStagedWorkspace(t *testing.T) {
 	requireCodeExecSandbox(t)
 	wd, err := os.Getwd()
 	if err != nil {
@@ -636,6 +636,149 @@ func TestCodeExecSkill_Execute_ProjectGoCommand(t *testing.T) {
 	}
 	if !strings.Contains(result.Content, "PASS") && !strings.Contains(result.Content, "ok  \tgithub.com/hexagon-codes/hexclaw/skill/builtin") {
 		t.Fatalf("go project command did not pass:\n%s", result.Content)
+	}
+}
+
+func TestBUG20260727001_CodeExecProjectStagesLocalUseAndReplaceClosure(t *testing.T) {
+	hostWorkspace := t.TempDir()
+	appDir := filepath.Join(hostWorkspace, "app")
+	toolkitDir := filepath.Join(hostWorkspace, "toolkit")
+	schemaDir := filepath.Join(hostWorkspace, "schema")
+	for _, dir := range []string{appDir, toolkitDir, schemaDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(path, content string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(hostWorkspace, "go.work"), "go 1.24\n\nuse (\n\t./app\n\t./toolkit\n)\n")
+	write(filepath.Join(schemaDir, "go.mod"), "module example.com/schema\n\ngo 1.24\n")
+	write(filepath.Join(schemaDir, "schema.go"), `package schema
+
+type Node struct {
+	AnyOf []string
+	OneOf []string
+	AllOf []string
+	Not   *Node
+}
+`)
+	write(filepath.Join(toolkitDir, "go.mod"), "module example.com/toolkit\n\ngo 1.24\n")
+	write(filepath.Join(toolkitDir, "toolkit.go"), "package toolkit\n\nfunc Marker() string { return \"STAGED_TOOLKIT_OK\" }\n")
+	write(filepath.Join(appDir, "go.mod"), `module example.com/app
+
+go 1.24
+
+require (
+	example.com/schema v0.0.0
+)
+
+replace example.com/schema => ../schema
+`)
+	write(filepath.Join(appDir, "app_test.go"), `package app
+
+import (
+	"testing"
+
+	"example.com/schema"
+	"example.com/toolkit"
+)
+
+func TestClosure(t *testing.T) {
+	node := schema.Node{
+		AnyOf: []string{"a"},
+		OneOf: []string{"b"},
+		AllOf: []string{"c"},
+		Not:   &schema.Node{},
+	}
+	if len(node.AnyOf) != 1 || len(node.OneOf) != 1 || len(node.AllOf) != 1 || node.Not == nil {
+		t.Fatal("schema composition fields were downgraded")
+	}
+	if toolkit.Marker() != "STAGED_TOOLKIT_OK" {
+		t.Fatal(toolkit.Marker())
+	}
+}
+`)
+
+	s := newTestCodeExecSkill(t)
+	result, err := s.Execute(context.Background(), map[string]any{
+		"mode":         "project",
+		"project_root": appDir,
+		"command":      []any{"go", "test", "./...", "-count=1"},
+	})
+	if err != nil {
+		t.Fatalf("execute staged project: %v", err)
+	}
+	if !strings.Contains(result.Content, "ok  \texample.com/app") {
+		t.Fatalf("local use/replace project did not pass:\n%s", result.Content)
+	}
+	report, ok := result.Data.(codeExecReport)
+	if !ok {
+		t.Fatalf("result data = %T, want codeExecReport", result.Data)
+	}
+	stagedWorkspace := report.Paths["workspace"]
+	stagedProject := report.Paths["project_root"]
+	if !pathWithinResolved(stagedWorkspace, stagedProject) {
+		t.Fatalf("project_root %q is outside staged workspace %q", stagedProject, stagedWorkspace)
+	}
+	hostWorkspace = resolveRealPath(hostWorkspace)
+	for _, key := range []string{"cwd", "project_root"} {
+		if strings.Contains(report.Paths[key], hostWorkspace) {
+			t.Fatalf("%s leaked host path: %s", key, report.Paths[key])
+		}
+	}
+	stageRoot := filepath.Dir(stagedProject)
+	for _, metadata := range []string{
+		filepath.Join(stageRoot, "go.work"),
+		filepath.Join(stagedProject, "go.mod"),
+		filepath.Join(stageRoot, "vendor", "modules.txt"),
+	} {
+		data, err := os.ReadFile(metadata)
+		if err != nil {
+			t.Fatalf("read staged metadata %s: %v", metadata, err)
+		}
+		if strings.Contains(string(data), hostWorkspace) {
+			t.Fatalf("staged metadata retained host path %q:\n%s", hostWorkspace, data)
+		}
+	}
+}
+
+func TestBUG20260727001_CodeExecProjectMissingLocalReplaceFailsBeforeCommand(t *testing.T) {
+	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, "go.mod"), []byte(`module example.com/app
+
+go 1.24
+
+require example.com/missing v0.0.0
+
+replace example.com/missing => ../missing
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	finalSandboxCalls := 0
+	s := NewCodeExecSkill(&mockSandbox{}, sandbox.Config{
+		Workspace: t.TempDir(),
+		Timeout:   30,
+		Network:   true,
+	})
+	s.sandboxFactory = func(sandbox.Config) (sandbox.Sandbox, error) {
+		finalSandboxCalls++
+		return &mockSandbox{}, nil
+	}
+	_, err := s.Execute(context.Background(), map[string]any{
+		"mode":         "project",
+		"project_root": project,
+		"command":      []any{"go", "test", "./...", "-count=1"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "project dependency closure") {
+		t.Fatalf("missing local replace must fail with dependency closure error, got %v", err)
+	}
+	if finalSandboxCalls != 0 {
+		t.Fatalf("project command sandbox started %d times, want 0", finalSandboxCalls)
 	}
 }
 
@@ -752,7 +895,7 @@ func TestCodeExecSkill_Execute_NetworkPolicyPropagatesToRunSandbox(t *testing.T)
 	}
 }
 
-func TestCodeExecSkill_Execute_OfflineGoCommandUsesHostModuleCache(t *testing.T) {
+func TestCodeExecSkill_Execute_OfflineProjectGoCommandUsesStagedModuleCache(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("this test inspects POSIX shell wrapper exports")
 	}
@@ -761,16 +904,18 @@ func TestCodeExecSkill_Execute_OfflineGoCommandUsesHostModuleCache(t *testing.T)
 		t.Fatal(err)
 	}
 	t.Setenv("GOMODCACHE", hostModCache)
-	expectedModCache := hostModCache
+	expectedHostModCache := hostModCache
 	if real, err := filepath.EvalSymlinks(hostModCache); err == nil {
-		expectedModCache = real
+		expectedHostModCache = real
 	}
 
 	var script string
 	var readable []string
+	var runWorkspace string
 	s := NewCodeExecSkill(&mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30, Network: false})
 	s.sandboxFactory = func(cfg sandbox.Config) (sandbox.Sandbox, error) {
 		readable = append([]string(nil), cfg.ReadablePaths...)
+		runWorkspace = cfg.Workspace
 		return &mockSandbox{execFn: func(_ context.Context, _ string, args []string) (*sandbox.ExecResult, error) {
 			if len(args) >= 2 {
 				script = args[1]
@@ -779,23 +924,30 @@ func TestCodeExecSkill_Execute_OfflineGoCommandUsesHostModuleCache(t *testing.T)
 		}}, nil
 	}
 
+	hostProject := t.TempDir()
 	if _, err := s.Execute(context.Background(), map[string]any{
 		"mode":         "project",
-		"project_root": t.TempDir(),
+		"project_root": hostProject,
 		"command":      []any{"go", "env", "GOMODCACHE"},
 	}); err != nil {
 		t.Fatalf("offline go execute: %v", err)
 	}
-	if !strings.Contains(script, "GOMODCACHE=") || !strings.Contains(script, expectedModCache) {
-		t.Fatalf("offline go execution did not export host GOMODCACHE %q:\n%s", expectedModCache, script)
+	expectedStagedModCache := filepath.Join(runWorkspace, "cache", "gomod")
+	if !strings.Contains(script, "GOMODCACHE=") || !strings.Contains(script, expectedStagedModCache) {
+		t.Fatalf("offline project Go execution did not export staged GOMODCACHE %q:\n%s", expectedStagedModCache, script)
 	}
-	for _, want := range []string{"GOPROXY='off'", "GOSUMDB='off'", "GOTOOLCHAIN='local'"} {
+	for _, forbidden := range []string{expectedHostModCache, resolveRealPath(hostProject)} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("offline project Go execution leaked host path %q:\n%s", forbidden, script)
+		}
+	}
+	for _, want := range []string{"GOWORK='off'", "GOPROXY='off'", "GOSUMDB='off'", "GOTOOLCHAIN='local'"} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("offline go execution missing %s:\n%s", want, script)
 		}
 	}
-	if !slices.Contains(readable, expectedModCache) {
-		t.Fatalf("offline go sandbox readable paths missing host module cache %q: %v", expectedModCache, readable)
+	if slices.Contains(readable, expectedHostModCache) {
+		t.Fatalf("offline project Go sandbox exposed host module cache %q: %v", expectedHostModCache, readable)
 	}
 }
 

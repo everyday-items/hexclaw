@@ -278,7 +278,7 @@ func (s *SQLiteRevisionSemanticSearcher) ftsTextSearch(
 	topK int,
 	filter Filter,
 ) ([]*SearchResult, error) {
-	clause, filterArgs := buildFilterClause(filter, "d")
+	clause, filterArgs := buildRevisionFilterClause(filter, "d", "b", "c")
 	needDate := filter.hasDateBound()
 	query := `SELECT c.id,c.doc_id,d.title,d.source,d.source_type,d.chunk_count,
 		c.content,c.chunk_index,c.created_at,COALESCE(c.page_start,0),COALESCE(c.page_end,0),
@@ -354,7 +354,7 @@ func (s *SQLiteRevisionSemanticSearcher) likeTextSearch(
 	topK int,
 	filter Filter,
 ) ([]*SearchResult, error) {
-	clause, filterArgs := buildFilterClause(filter, "d")
+	clause, filterArgs := buildRevisionFilterClause(filter, "d", "b", "c")
 	needDate := filter.hasDateBound()
 	var query strings.Builder
 	query.WriteString(`SELECT c.id,c.doc_id,d.title,d.source,d.source_type,d.chunk_count,
@@ -447,7 +447,7 @@ func (s *SQLiteRevisionSemanticSearcher) searchActiveVectors(
 	topK int,
 	filter Filter,
 ) ([]*SearchResult, error) {
-	clause, filterArgs := buildFilterClause(filter, "d")
+	clause, filterArgs := buildRevisionFilterClause(filter, "d", "b", "c")
 	query := `SELECT v.chunk_id,v.document_id,v.chunk_index,v.embedding,
 		d.title,d.source,d.source_type,d.chunk_count,c.content,c.created_at,
 		COALESCE(c.page_start,0),COALESCE(c.page_end,0),c.source_digest,

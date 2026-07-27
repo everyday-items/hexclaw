@@ -99,6 +99,36 @@ func buildFilterClause(f Filter, docAlias string) (string, []any) {
 	return strings.Join(clauses, " AND "), args
 }
 
+// buildRevisionFilterClause extends the shared document metadata clause with
+// an exact document-generation pair predicate. The caller must pass the
+// semantic binding alias so the predicate is applied by SQL before LIMIT/topK.
+func buildRevisionFilterClause(
+	f Filter,
+	docAlias, bindingAlias, chunkAlias string,
+) (string, []any) {
+	f = f.normalize()
+	clause, args := buildFilterClause(f, docAlias)
+	var clauses []string
+	if clause != "" {
+		clauses = append(clauses, clause)
+	}
+	if len(f.DocumentGenerations) > 0 {
+		pairs := make([]string, 0, len(f.DocumentGenerations))
+		for _, ref := range f.DocumentGenerations {
+			pairs = append(pairs,
+				"("+docAlias+".id=? AND "+bindingAlias+".content_generation=?)")
+			args = append(args, ref.DocumentID, ref.DocumentGeneration)
+		}
+		clauses = append(clauses, "("+strings.Join(pairs, " OR ")+")")
+	}
+	if len(f.ChunkIDs) > 0 {
+		placeholders, chunkArgs := inPlaceholders(f.ChunkIDs)
+		clauses = append(clauses, chunkAlias+".id IN ("+placeholders+")")
+		args = append(args, chunkArgs...)
+	}
+	return strings.Join(clauses, " AND "), args
+}
+
 // inPlaceholders 为字符串多值生成 "?,?,?" 占位串与对应参数。
 func inPlaceholders(vals []string) (string, []any) {
 	ph := make([]string, len(vals))
@@ -533,8 +563,10 @@ func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK
 	//   - 源/源类型：下推 SQL（JOIN kb_documents + IN，纯字符串相等，跨时区无歧义）；
 	//   - 日期：取 d.created_at 在 Go 层按真实 time.Time 比较（见 Filter.matchesDate）。
 	// 无任何过滤时走原快路径（不 JOIN，零回归）。
-	clause, fargs := buildFilterClause(filter, "d")
+	filter = filter.normalize()
+	clause, fargs := buildRevisionFilterClause(filter, "d", "b", "c")
 	scopeClause, scopeArgs := s.semanticScopeClause("d")
+	needGeneration := len(filter.DocumentGenerations) > 0
 	needDate := filter.hasDateBound()
 	var query string
 	var args []any
@@ -547,6 +579,9 @@ func (s *SQLiteStore) VectorSearch(ctx context.Context, queryVec []float32, topK
 			sel += ", d.created_at"
 		}
 		query = "SELECT " + sel + " FROM kb_chunks c JOIN kb_documents d ON d.id = c.doc_id WHERE c.embedding IS NOT NULL AND d.deleted=0"
+		if needGeneration {
+			query = "SELECT " + sel + " FROM kb_chunks c JOIN kb_documents d ON d.id = c.doc_id JOIN kb_semantic_document_bindings b ON b.document_id=d.id AND b.lifecycle_state='active' WHERE c.embedding IS NOT NULL AND d.deleted=0"
+		}
 		if clause != "" {
 			query += " AND " + clause
 			args = append(args, fargs...)
@@ -664,8 +699,10 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int, fi
 	// 元数据过滤生效于 LIMIT/截断之前：源/源类型下推 SQL（JOIN kb_documents + IN）；
 	// 日期取 d.created_at 在 Go 层按真实时刻比较。带日期过滤时不能用 SQL LIMIT（否则日期
 	// 匹配项可能因 bm25 排序落在 LIMIT 之外被漏召回），改为按 score 顺序扫描、Go 过滤后取 topK。
-	clause, fargs := buildFilterClause(filter, "d")
+	filter = filter.normalize()
+	clause, fargs := buildRevisionFilterClause(filter, "d", "b", "c")
 	scopeClause, scopeArgs := s.semanticScopeClause("d")
+	needGeneration := len(filter.DocumentGenerations) > 0
 	needDate := filter.hasDateBound()
 
 	sel := "f.chunk_id, f.content, bm25(kb_chunks_fts) as score"
@@ -678,6 +715,10 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int, fi
 	from := `kb_chunks_fts f
 		 JOIN kb_chunks c ON c.id = f.chunk_id
 		 JOIN kb_documents d ON d.id = c.doc_id`
+	if needGeneration {
+		from += ` JOIN kb_semantic_document_bindings b
+		 ON b.document_id=d.id AND b.lifecycle_state='active'`
+	}
 	where := "d.deleted=0 AND kb_chunks_fts MATCH ?"
 	args := []any{ftsQuery}
 	if clause != "" {
@@ -795,8 +836,10 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 	var query strings.Builder
 	var args []any
 
-	clause, fargs := buildFilterClause(filter, "d")
+	filter = filter.normalize()
+	clause, fargs := buildRevisionFilterClause(filter, "d", "b", "c")
 	scopeClause, scopeArgs := s.semanticScopeClause("d")
+	needGeneration := len(filter.DocumentGenerations) > 0
 	needDate := filter.hasDateBound()
 
 	// Fix 15: 不查询 embedding 列，文本降级搜索无需加载向量 BLOB。
@@ -810,6 +853,20 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 		query.WriteString(", d.created_at")
 	}
 	query.WriteString(" FROM kb_chunks c JOIN kb_documents d ON d.id = c.doc_id WHERE d.deleted=0 AND (")
+	if needGeneration {
+		query.Reset()
+		query.WriteString(`SELECT c.id, c.doc_id, c.content, c.chunk_index, c.created_at,
+			COALESCE(c.page_start,0),COALESCE(c.page_end,0),c.source_digest,
+			COALESCE(c.source_offset_start,0),COALESCE(c.source_offset_end,0)`)
+		if needDate {
+			query.WriteString(", d.created_at")
+		}
+		query.WriteString(` FROM kb_chunks c
+			JOIN kb_documents d ON d.id=c.doc_id
+			JOIN kb_semantic_document_bindings b
+			  ON b.document_id=d.id AND b.lifecycle_state='active'
+			WHERE d.deleted=0 AND (`)
+	}
 	for i, kw := range keywords {
 		if i > 0 {
 			query.WriteString(" OR ")
