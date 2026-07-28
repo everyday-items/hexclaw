@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 )
@@ -376,6 +378,9 @@ func TestBeforeAfterComparison_Module(t *testing.T) {
 // ═══════════════════════════════════════════════════════════
 
 func TestRealAPI_GLMz1_SystemTest(t *testing.T) {
+	if os.Getenv("HEXCLAW_REAL_API_TEST") != "1" {
+		t.Skip("real API test requires HEXCLAW_REAL_API_TEST=1")
+	}
 	if testing.Short() {
 		t.Skip("跳过系统测试（-short 模式）")
 	}
@@ -404,6 +409,9 @@ func TestRealAPI_GLMz1_SystemTest(t *testing.T) {
 }
 
 func TestRealAPI_Qwen35_SystemTest(t *testing.T) {
+	if os.Getenv("HEXCLAW_REAL_API_TEST") != "1" {
+		t.Skip("real API test requires HEXCLAW_REAL_API_TEST=1")
+	}
 	if testing.Short() {
 		t.Skip("跳过系统测试（-short 模式）")
 	}
@@ -432,7 +440,7 @@ func callChatAPI(message, model, provider string) (*chatAPIResponse, error) {
 	body := fmt.Sprintf(`{"message":"%s","user_id":"test-system","model":"%s","provider":"%s"}`,
 		message, model, provider)
 
-	httpResp, err := http.Post("http://localhost:16060/api/v1/chat", "application/json", strings.NewReader(body))
+	httpResp, err := (&http.Client{Timeout: 30 * time.Second}).Post("http://localhost:16060/api/v1/chat", "application/json", strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}

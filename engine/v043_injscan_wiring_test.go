@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/hexagon"
+	mockllm "github.com/hexagon-codes/hexagon/testing/mock"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
@@ -29,10 +31,11 @@ func newScanWiringEngine(t *testing.T) *ReActEngine {
 	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
 		"test": {APIKey: "sk-test", Model: "test-model"},
 	}
-	router, err := llmrouter.New(cfg.LLM)
-	if err != nil {
-		t.Fatalf("router: %v", err)
-	}
+	cfg.LLM.Default = "test"
+	cfg.LLM.Routing.Strategy = "default"
+	router := llmrouter.NewWithProviders(cfg.LLM, map[string]hexagon.Provider{
+		"test": mockllm.NewLLMProvider("test"),
+	})
 	eng := NewReActEngine(cfg, router, store, skill.NewRegistry())
 	if err := eng.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
