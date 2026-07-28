@@ -646,7 +646,9 @@ func (s *Server) handleSearchKnowledge(w http.ResponseWriter, r *http.Request) {
 		CreatedBefore: createdBefore,
 	}
 
-	results, err := s.kb.SearchWithFilter(r.Context(), req.Query, topK, filter)
+	results, receipts, err := s.kb.SearchWithFilterReceipt(
+		r.Context(), req.Query, topK, filter,
+	)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "搜索失败: " + err.Error(),
@@ -656,8 +658,9 @@ func (s *Server) handleSearchKnowledge(w http.ResponseWriter, r *http.Request) {
 
 	// Fix 16: 只返回 "results"（复数），移除冗余的 "result" 字段
 	writeJSON(w, http.StatusOK, map[string]any{
-		"results": results,
-		"total":   len(results),
+		"results":        results,
+		"total":          len(results),
+		"query_receipts": receipts,
 	})
 }
 

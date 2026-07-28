@@ -33,11 +33,11 @@ var _ SemanticIndexRepository = (*SQLiteSemanticIndexRepository)(nil)
 // generation. Scenario observers must derive every projection from facts
 // visible through Tx; the event never carries caller-authored catalog data.
 type DocumentIngestLifecycleEvent struct {
-	OwnerID           string
-	CorpusUID         string
-	DocumentID        string
+	OwnerID            string
+	CorpusUID          string
+	DocumentID         string
 	DocumentGeneration int64
-	At                time.Time
+	At                 time.Time
 }
 
 // DocumentIngestLifecycleObserver runs inside the same SQLite transaction as
@@ -80,11 +80,11 @@ func (r *SQLiteSemanticIndexRepository) reconcileDocumentIngestLifecycleTx(
 		ctx,
 		tx,
 		DocumentIngestLifecycleEvent{
-			OwnerID:             job.OwnerID,
-			CorpusUID:           job.CorpusUID,
-			DocumentID:          job.DocumentID,
+			OwnerID:            job.OwnerID,
+			CorpusUID:          job.CorpusUID,
+			DocumentID:         job.DocumentID,
 			DocumentGeneration: job.DocumentGeneration,
-			At:                  at.UTC(),
+			At:                 at.UTC(),
 		},
 	)
 }
@@ -229,7 +229,7 @@ func (r *SQLiteSemanticIndexRepository) loadRevisionProjection(
 	var publishState string
 	err := r.db.QueryRowContext(ctx, `SELECT r.revision_id,r.publish_state,r.expected_chunks,r.embedded_chunks,
 		s.resolved_profile_id,s.model_name,s.provider_id,s.provider_name,s.provider_location,
-		s.dimension,s.availability
+		s.dimension,s.availability,s.profile_config_hash
 		FROM kb_index_revisions r
 		JOIN kb_embedding_profile_snapshots s ON s.profile_snapshot_id=r.profile_snapshot_id
 		WHERE r.corpus_uid=? AND r.revision_id=?`, corpusUID, revisionID).Scan(
@@ -237,6 +237,7 @@ func (r *SQLiteSemanticIndexRepository) loadRevisionProjection(
 		&projection.Profile.ProfileID, &projection.Profile.ModelName,
 		&projection.Profile.ProviderID, &projection.Profile.ProviderName,
 		&location, &projection.Profile.Dimension, &availability,
+		&projection.ProfileConfigHash,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return EmbeddingRevisionProjection{}, ErrSemanticIndexNotFound

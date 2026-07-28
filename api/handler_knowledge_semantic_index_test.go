@@ -176,7 +176,8 @@ func TestSemanticIndexPolicyHTTPContract(t *testing.T) {
 			PolicyVersion: 7,
 			Selection:     knowledge.EmbeddingSelection{Kind: knowledge.EmbeddingSelectionKind("auto")},
 			ActiveRevision: &knowledge.EmbeddingRevisionProjection{
-				RevisionID: "rev-a", State: knowledge.VectorIndexState("ready"), Profile: profile,
+				RevisionID: "rev-a", State: knowledge.VectorIndexState("ready"),
+				ProfileConfigHash: "profile-hash-a", Profile: profile,
 			},
 			IndexingActivity: knowledge.IndexingActivity{
 				State: knowledge.IndexingActivityState("building"), ProcessingDocuments: 1,
@@ -214,6 +215,9 @@ func TestSemanticIndexPolicyHTTPContract(t *testing.T) {
 	active := payload["active_revision"].(map[string]any)
 	if active["profile"].(map[string]any)["model_name"] != "text-embedding-3-small" {
 		t.Fatalf("active revision must carry immutable nested profile: %+v", active)
+	}
+	if active["profile_config_hash"] != "profile-hash-a" {
+		t.Fatalf("active revision must carry immutable profile hash: %+v", active)
 	}
 	activity := payload["indexing_activity"].(map[string]any)
 	if activity["chunks_done"] != float64(135) || activity["chunks_total"] != float64(225) {

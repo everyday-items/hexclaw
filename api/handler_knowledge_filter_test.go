@@ -17,6 +17,39 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+type k12ReleaseReceiptSearcher struct{}
+
+func (k12ReleaseReceiptSearcher) Search(
+	context.Context, string, int, knowledge.Filter,
+) ([]*knowledge.SearchResult, bool, error) {
+	return nil, false, nil
+}
+
+func (k12ReleaseReceiptSearcher) SearchWithReceipt(
+	_ context.Context, query string, _ int, _ knowledge.Filter,
+) ([]*knowledge.SearchResult, bool, *knowledge.QueryEmbeddingReceipt, error) {
+	return []*knowledge.SearchResult{{
+			Chunk: &knowledge.Chunk{
+				ID: "A-c0", DocID: "A", DocTitle: "A", Source: "upload:a.pdf",
+				Content: "shared widget content", PageStart: 7, PageEnd: 7,
+				CitationDigest: "chunk-content-hash-a",
+			},
+			VectorScore: 0.99,
+		}}, true, &knowledge.QueryEmbeddingReceipt{
+			Operation: "query_embedding", Status: "succeeded",
+			ProviderID: "ollama", Model: "qwen3-embedding:8b",
+			ProfileID:         "ollama:qwen3-embedding:8b",
+			ProfileConfigHash: "qwen-profile-hash", Dimension: 4096,
+			RevisionID: "revision-a", QueryDigest: "sha256:query",
+		}, nil
+}
+
+func (k12ReleaseReceiptSearcher) TextSearch(
+	context.Context, string, int, knowledge.Filter,
+) ([]*knowledge.SearchResult, error) {
+	return nil, nil
+}
+
 // /api/v1/knowledge/search 端点应把 source_types / sources / 日期过滤透传到检索层，
 // 在 topK 截断前生效。这里直接灌库（绕开 splitter），构造 Server 调处理器验证端到端。
 func TestHandleSearchKnowledge_MetadataFilter(t *testing.T) {
@@ -103,5 +136,43 @@ func TestHandleSearchKnowledge_MetadataFilter(t *testing.T) {
 	srv.handleSearchKnowledge(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("非法日期应 400，得 %d", w.Code)
+	}
+
+	cfg := knowledge.DefaultHybridConfig()
+	cfg.ExpandEnabled = false
+	cfg.RerankEnabled = false
+	cfg.UseRRF = false
+	receiptManager := knowledge.NewManager(
+		store, store, nil,
+		knowledge.WithHybridConfig(cfg),
+		knowledge.WithRevisionSemanticSearcher(k12ReleaseReceiptSearcher{}),
+	)
+	receiptServer := NewServer(config.DefaultConfig(), nil, nil, nil)
+	receiptServer.SetKnowledgeBase(receiptManager)
+	req = httptest.NewRequest(
+		http.MethodPost, "/api/v1/knowledge/search",
+		strings.NewReader(`{"query":"frozen textbook oracle","top_k":1}`),
+	)
+	w = httptest.NewRecorder()
+	receiptServer.handleSearchKnowledge(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("receipt search status=%d body=%s", w.Code, w.Body.String())
+	}
+	var receiptPayload struct {
+		Results  []knowledge.SearchHit             `json:"results"`
+		Receipts []knowledge.QueryEmbeddingReceipt `json:"query_receipts"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &receiptPayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(receiptPayload.Results) != 1 ||
+		receiptPayload.Results[0].DocID != "A" ||
+		receiptPayload.Results[0].PageStart != 7 ||
+		receiptPayload.Results[0].ChunkID != "A-c0" ||
+		receiptPayload.Results[0].CitationDigest != "chunk-content-hash-a" ||
+		len(receiptPayload.Receipts) != 1 ||
+		receiptPayload.Receipts[0].Model != "qwen3-embedding:8b" ||
+		receiptPayload.Receipts[0].Operation != "query_embedding" {
+		t.Fatalf("C09 receipt response drift: %+v", receiptPayload)
 	}
 }

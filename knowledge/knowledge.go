@@ -78,6 +78,7 @@ type Chunk struct {
 	CreatedAt         time.Time `json:"created_at"`
 	PageStart         int       `json:"page_start,omitempty"`
 	PageEnd           int       `json:"page_end,omitempty"`
+	CitationDigest    string    `json:"citation_digest,omitempty"`
 	SourceDigest      string    `json:"source_digest,omitempty"`
 	SourceOffsetStart int64     `json:"source_offset_start,omitempty"`
 	SourceOffsetEnd   int64     `json:"source_offset_end,omitempty"`
@@ -97,6 +98,7 @@ type SearchHit struct {
 	Metadata          map[string]any `json:"metadata,omitempty"`
 	PageStart         int            `json:"page_start,omitempty"`
 	PageEnd           int            `json:"page_end,omitempty"`
+	CitationDigest    string         `json:"citation_digest,omitempty"`
 	SourceDigest      string         `json:"source_digest,omitempty"`
 	SourceOffsetStart int64          `json:"source_offset_start,omitempty"`
 	SourceOffsetEnd   int64          `json:"source_offset_end,omitempty"`
@@ -872,11 +874,26 @@ func (m *Manager) Search(ctx context.Context, query string, topK int) ([]SearchH
 // SearchWithFilter 在元数据过滤约束下检索（按 source / source_type / 创建日期下推到存储层）。
 // 过滤在打分与 topK 截断之前生效，确保不会因截断漏召回匹配文档。
 func (m *Manager) SearchWithFilter(ctx context.Context, query string, topK int, filter Filter) ([]SearchHit, error) {
-	selected, err := m.searchResults(ctx, query, topK, filter)
+	selected, _, err := m.searchResultsMode(ctx, query, topK, filter, false)
 	if err != nil {
 		return nil, err
 	}
 	return hitsFromResults(selected), nil
+}
+
+// SearchWithFilterReceipt returns only receipts for revision-bound query
+// embeddings that actually completed. Text fallback never fabricates one.
+func (m *Manager) SearchWithFilterReceipt(
+	ctx context.Context,
+	query string,
+	topK int,
+	filter Filter,
+) ([]SearchHit, []QueryEmbeddingReceipt, error) {
+	selected, receipts, err := m.searchResultsMode(ctx, query, topK, filter, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	return hitsFromResults(selected), receipts, nil
 }
 
 // hitsFromResults 把内部检索结果映射为对外的 SearchHit。
@@ -896,6 +913,7 @@ func hitsFromResults(selected []*SearchResult) []SearchHit {
 			Metadata:          chunkMetadata(r.Chunk),
 			PageStart:         r.Chunk.PageStart,
 			PageEnd:           r.Chunk.PageEnd,
+			CitationDigest:    r.Chunk.CitationDigest,
 			SourceDigest:      r.Chunk.SourceDigest,
 			SourceOffsetStart: r.Chunk.SourceOffsetStart,
 			SourceOffsetEnd:   r.Chunk.SourceOffsetEnd,
@@ -962,7 +980,7 @@ func (m *Manager) ActiveSemanticRevision(ctx context.Context) (string, bool, err
 }
 
 func (m *Manager) QueryWithFilter(ctx context.Context, query string, topK int, filter Filter) (string, error) {
-	selected, err := m.searchResultsMode(ctx, query, topK, filter, true)
+	selected, _, err := m.searchResultsMode(ctx, query, topK, filter, true)
 	if err != nil {
 		return "", err
 	}
@@ -973,7 +991,7 @@ func (m *Manager) QueryWithFilter(ctx context.Context, query string, topK int, f
 // 面向 UI/领域适配器的调用方必须消费 SearchHit.Content，不能把给 LLM 的注入信封
 // （“参考 N / 相关度 / 请基于…”）当成面向用户的正文。
 func (m *Manager) QueryHitsWithFilter(ctx context.Context, query string, topK int, filter Filter) (string, []SearchHit, error) {
-	selected, err := m.searchResultsMode(ctx, query, topK, filter, true)
+	selected, _, err := m.searchResultsMode(ctx, query, topK, filter, true)
 	if err != nil {
 		return "", nil, err
 	}
@@ -987,7 +1005,7 @@ func (m *Manager) QueryHitsWithFilter(ctx context.Context, query string, topK in
 // 命中集与 Query 注入的上下文**同源同判据**（同一次 searchResultsMode strict 检索），
 // 保证「标签显示的命中数」== 「真正端给模型的命中数」，不产生二次检索的漂移。
 func (m *Manager) QueryHits(ctx context.Context, query string, topK int) (string, []SearchHit, error) {
-	selected, err := m.searchResultsMode(ctx, query, topK, Filter{}, true)
+	selected, _, err := m.searchResultsMode(ctx, query, topK, Filter{}, true)
 	if err != nil {
 		return "", nil, err
 	}
@@ -996,7 +1014,8 @@ func (m *Manager) QueryHits(ctx context.Context, query string, topK int) (string
 }
 
 func (m *Manager) searchResults(ctx context.Context, query string, topK int, filter Filter) ([]*SearchResult, error) {
-	return m.searchResultsMode(ctx, query, topK, filter, false)
+	results, _, err := m.searchResultsMode(ctx, query, topK, filter, false)
+	return results, err
 }
 
 // searchResultsMode 是检索全链路的实现。strictFloor 区分两种召回语义：
@@ -1005,14 +1024,20 @@ func (m *Manager) searchResults(ctx context.Context, query string, topK int, fil
 //   - true（聊天自动注入 Query/QueryWithFilter）：fail-closed——仅 VectorScore 过地板
 //     的候选保留，清空即空，宁缺勿滥（BM25 分是结果集内 min-max 归一，最佳垃圾恒为
 //     1.0，不能当跨查询可比的相关性用）。
-func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int, filter Filter, strictFloor bool) ([]*SearchResult, error) {
+func (m *Manager) searchResultsMode(
+	ctx context.Context,
+	query string,
+	topK int,
+	filter Filter,
+	strictFloor bool,
+) ([]*SearchResult, []QueryEmbeddingReceipt, error) {
 	if topK <= 0 {
 		topK = 3
 	}
 	if corpus, ok := m.repo.(SearchableCorpus); ok {
 		hasDocuments, err := corpus.HasSearchableDocuments(ctx)
 		if err == nil && !hasDocuments {
-			return nil, nil
+			return nil, nil, nil
 		}
 	}
 	cfg := m.cfg()
@@ -1045,6 +1070,7 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 	// 2. 宽召回：每个 query 各取一路向量 + 一路 BM25，记录各排序列表喂给 RRF（#6 over-retrieve）
 	resultMap := make(map[string]*SearchResult)
 	var rankedLists []rankedList
+	receipts := make([]QueryEmbeddingReceipt, 0)
 	// vectorRouteRan：查询时向量路是否真实跑通。嵌入/向量搜索失败（如 embedding 服务
 	// 不可用）时无语义证据可要求，严格地板退回宽召回语义，避免降级态下 RAG 全盲。
 	vectorRouteRan := false
@@ -1060,7 +1086,21 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 				timeout = executionProfile.QueryTimeout
 			}
 			rctx, rcancel := context.WithTimeout(ragEmbedContext(ctx), timeout)
-			vres, ran, vErr := m.revisionSearcher.Search(rctx, q, candidateK, filter)
+			var (
+				vres    []*SearchResult
+				ran     bool
+				receipt *QueryEmbeddingReceipt
+				vErr    error
+			)
+			if source, ok := m.revisionSearcher.(RevisionSemanticReceiptSearcher); ok {
+				vres, ran, receipt, vErr = source.SearchWithReceipt(
+					rctx, q, candidateK, filter,
+				)
+			} else {
+				vres, ran, vErr = m.revisionSearcher.Search(
+					rctx, q, candidateK, filter,
+				)
+			}
 			rcancel()
 			if vErr != nil {
 				if !errors.Is(vErr, ErrEmbeddingUnavailable) {
@@ -1069,6 +1109,9 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 			} else if ran {
 				rankedLists = append(rankedLists, mergeRanked(resultMap, vres, true))
 				vectorRouteRan = true
+				if receipt != nil {
+					receipts = append(receipts, *receipt)
+				}
 			}
 		} else if legacyEmbeddingReady {
 			// 查询向量化预算（BUG-20260703 同构防护，对齐 engine 记忆召回）：检索是增强，
@@ -1112,7 +1155,7 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 	}
 
 	if len(resultMap) == 0 {
-		return nil, nil
+		return nil, receipts, nil
 	}
 
 	// 3. 融合评分（#9 RRF 或加权和回退）+ 时间衰减
@@ -1124,7 +1167,7 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 	// 「最佳垃圾恒 1.0」不构成相关性证据（真机取证：天气 query 注入《Go面试题》，相关度 0-2%
 	// 照样端给模型+前端命中卡）。「避免降级态 RAG 全盲」只属于显式检索（Search*）语义。
 	if strictFloor && !vectorRouteRan {
-		return nil, nil
+		return nil, receipts, nil
 	}
 	candidates = m.applyMinScoreWithProfile(
 		candidates, strictFloor, vectorRouteRan, executionProfile, hasExecutionProfile,
@@ -1139,9 +1182,9 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 		if topK > 0 && len(candidates) > topK {
 			candidates = candidates[:topK]
 		}
-		return candidates, nil
+		return candidates, receipts, nil
 	}
-	return m.rerankTopK(ctx, query, candidates, topK), nil
+	return m.rerankTopK(ctx, query, candidates, topK), receipts, nil
 }
 
 // rankedList 是一路检索的有序候选（带模态：向量 / 文本），用于分数加权 RRF。

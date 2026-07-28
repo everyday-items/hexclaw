@@ -2,7 +2,9 @@ package knowledge
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -53,6 +55,31 @@ type ProfileEmbeddingExecutorRegistry interface {
 type RevisionSemanticSearcher interface {
 	Search(ctx context.Context, query string, topK int, filter Filter) (results []*SearchResult, routeRan bool, err error)
 	TextSearch(ctx context.Context, query string, topK int, filter Filter) ([]*SearchResult, error)
+}
+
+// RevisionSemanticReceiptSearcher is the optional evidence-bearing extension
+// used by release gates. A receipt exists only after one real query embedding
+// and its revision-bound vector scan both succeed.
+type RevisionSemanticReceiptSearcher interface {
+	SearchWithReceipt(
+		ctx context.Context,
+		query string,
+		topK int,
+		filter Filter,
+	) (results []*SearchResult, routeRan bool, receipt *QueryEmbeddingReceipt, err error)
+}
+
+type QueryEmbeddingReceipt struct {
+	Operation         string `json:"operation"`
+	Status            string `json:"status"`
+	ProviderID        string `json:"provider_id"`
+	ProviderName      string `json:"provider_name,omitempty"`
+	Model             string `json:"model"`
+	ProfileID         string `json:"profile_id"`
+	ProfileConfigHash string `json:"profile_config_hash"`
+	Dimension         int    `json:"dimension"`
+	RevisionID        string `json:"revision_id"`
+	QueryDigest       string `json:"query_digest"`
 }
 
 // RevisionSemanticReadiness is an optional cheap control-plane probe used by
@@ -193,23 +220,33 @@ func (s *SQLiteRevisionSemanticSearcher) Search(
 	topK int,
 	filter Filter,
 ) ([]*SearchResult, bool, error) {
+	results, routeRan, _, err := s.SearchWithReceipt(ctx, query, topK, filter)
+	return results, routeRan, err
+}
+
+func (s *SQLiteRevisionSemanticSearcher) SearchWithReceipt(
+	ctx context.Context,
+	query string,
+	topK int,
+	filter Filter,
+) ([]*SearchResult, bool, *QueryEmbeddingReceipt, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
-		return nil, false, nil
+		return nil, false, nil, nil
 	}
 	if topK <= 0 {
 		topK = 3
 	}
 	plan, active, err := s.loadActivePlan(ctx)
 	if err != nil || !active {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	executor, err := s.registry.ExecutorForProfile(ctx, plan.profile)
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	if readiness, ok := executor.(ProfileEmbeddingExecutorReadiness); ok && !readiness.EmbeddingReady(ctx) {
-		return nil, false, ErrEmbeddingUnavailable
+		return nil, false, nil, ErrEmbeddingUnavailable
 	}
 	var permit *resourcegov.Permit
 	if s.governor != nil {
@@ -217,7 +254,7 @@ func (s *SQLiteRevisionSemanticSearcher) Search(
 			ctx, resourcegov.ResourceAccelerator, resourcegov.PriorityInteractive,
 		)
 		if err != nil {
-			return nil, false, err
+			return nil, false, nil, err
 		}
 	}
 	vectors, err := executor.EmbedForPurpose(ctx, EmbeddingPurposeQuery, []string{query})
@@ -225,20 +262,32 @@ func (s *SQLiteRevisionSemanticSearcher) Search(
 		permit.Release()
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	if len(vectors) != 1 || len(vectors[0]) != plan.profile.Profile.Dimension {
-		return nil, false, fmt.Errorf("%w: query vectors=%d dimension=%d want=%d",
+		return nil, false, nil, fmt.Errorf("%w: query vectors=%d dimension=%d want=%d",
 			ErrInvalidEmbeddingResult, len(vectors), firstVectorDimension(vectors), plan.profile.Profile.Dimension)
 	}
 	if !embeddingVectorIsFinite(vectors[0]) {
-		return nil, false, fmt.Errorf("%w: query vector contains non-finite value", ErrInvalidEmbeddingResult)
+		return nil, false, nil, fmt.Errorf("%w: query vector contains non-finite value", ErrInvalidEmbeddingResult)
 	}
 	results, err := s.searchActiveVectors(ctx, plan, vectors[0], topK, filter)
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
-	return results, true, nil
+	sum := sha256.Sum256([]byte(query))
+	return results, true, &QueryEmbeddingReceipt{
+		Operation:         "query_embedding",
+		Status:            "succeeded",
+		ProviderID:        plan.profile.Profile.ProviderID,
+		ProviderName:      plan.profile.Profile.ProviderName,
+		Model:             plan.profile.Profile.ModelName,
+		ProfileID:         plan.profile.Profile.ProfileID,
+		ProfileConfigHash: plan.profile.ProfileConfigHash,
+		Dimension:         plan.profile.Profile.Dimension,
+		RevisionID:        plan.revision,
+		QueryDigest:       "sha256:" + hex.EncodeToString(sum[:]),
+	}, nil
 }
 
 // TextSearch keeps the lexical fallback inside the same authenticated corpus
@@ -466,7 +515,7 @@ func (s *SQLiteRevisionSemanticSearcher) searchActiveVectors(
 	filter Filter,
 ) ([]*SearchResult, error) {
 	clause, filterArgs := buildRevisionFilterClause(filter, "d", "b", "c")
-	query := `SELECT v.chunk_id,v.document_id,v.chunk_index,v.embedding,
+	query := `SELECT v.chunk_id,v.document_id,v.chunk_index,v.embedding,v.chunk_content_hash,
 		d.title,d.source,d.source_type,d.chunk_count,c.content,c.created_at,
 		COALESCE(c.page_start,0),COALESCE(c.page_end,0),c.source_digest,
 		COALESCE(c.source_offset_start,0),COALESCE(c.source_offset_end,0),d.created_at
@@ -507,6 +556,7 @@ func (s *SQLiteRevisionSemanticSearcher) searchActiveVectors(
 		var documentCreatedAt time.Time
 		if err := rows.Scan(
 			&chunk.ID, &chunk.DocID, &chunk.Index, &blob,
+			&chunk.CitationDigest,
 			&chunk.DocTitle, &chunk.Source, &chunk.SourceType,
 			&chunk.ChunkCount, &chunk.Content, &chunk.CreatedAt,
 			&chunk.PageStart, &chunk.PageEnd, &chunk.SourceDigest,

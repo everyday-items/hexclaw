@@ -293,7 +293,9 @@ func TestRevisionSemanticSearchUsesOnlyActiveSnapshotAndNeverLegacyVectors(t *te
 		"profile-b": b,
 	}}
 	searcher := NewSQLiteRevisionSemanticSearcher(h.db, "owner-1", "default", registry)
-	results, routeRan, err := searcher.Search(h.ctx, "private query", 5, Filter{})
+	results, routeRan, receipt, err := searcher.SearchWithReceipt(
+		h.ctx, "private query", 5, Filter{},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,6 +304,22 @@ func TestRevisionSemanticSearchUsesOnlyActiveSnapshotAndNeverLegacyVectors(t *te
 	}
 	if len(results) != 1 || results[0].Chunk.ID != "active-doc-chunk-0" {
 		t.Fatalf("revision search results = %+v, want only active revision vector", results)
+	}
+	if results[0].Chunk.CitationDigest != "content-hash-active-doc" {
+		t.Fatalf("citation digest=%q, want persisted revision chunk hash",
+			results[0].Chunk.CitationDigest)
+	}
+	if receipt == nil ||
+		receipt.Operation != "query_embedding" ||
+		receipt.Status != "succeeded" ||
+		receipt.ProviderID != "ollama" ||
+		receipt.Model != "bge-m3" ||
+		receipt.ProfileID != "profile-a" ||
+		receipt.ProfileConfigHash != "hash-a" ||
+		receipt.Dimension != 3 ||
+		receipt.RevisionID != *boot.ActiveRevisionID ||
+		receipt.QueryDigest == "" {
+		t.Fatalf("query receipt does not bind active revision execution: %+v", receipt)
 	}
 	if a.calls != 1 || b.calls != 0 {
 		t.Fatalf("executor calls: active A=%d staged B=%d, want 1/0", a.calls, b.calls)

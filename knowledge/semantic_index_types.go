@@ -172,12 +172,13 @@ const (
 // EmbeddingRevisionProjection matches the approved desktop contract. JobID is
 // the cancellable root job identifier and is never synthesized from RevisionID.
 type EmbeddingRevisionProjection struct {
-	RevisionID  string           `json:"revision_id"`
-	State       VectorIndexState `json:"state"`
-	Profile     EmbeddingProfile `json:"profile"`
-	ChunksDone  *int64           `json:"chunks_done,omitempty"`
-	ChunksTotal *int64           `json:"chunks_total,omitempty"`
-	JobID       *string          `json:"job_id,omitempty"`
+	RevisionID        string           `json:"revision_id"`
+	State             VectorIndexState `json:"state"`
+	ProfileConfigHash string           `json:"profile_config_hash"`
+	Profile           EmbeddingProfile `json:"profile"`
+	ChunksDone        *int64           `json:"chunks_done,omitempty"`
+	ChunksTotal       *int64           `json:"chunks_total,omitempty"`
+	JobID             *string          `json:"job_id,omitempty"`
 }
 
 type IndexingActivityState string
@@ -264,31 +265,31 @@ const (
 // KnowledgeJob is durable worker state. Ownership and lease details are kept
 // out of JSON while remaining available to trusted in-process workers.
 type KnowledgeJob struct {
-	JobID              string            `json:"job_id"`
-	ParentJobID        string            `json:"parent_job_id,omitempty"`
-	Kind               KnowledgeJobKind  `json:"kind"`
-	OwnerID            string            `json:"-"`
-	CorpusUID          string            `json:"-"`
-	DocumentID         string            `json:"document_id,omitempty"`
-	DocumentGeneration int64             `json:"-"`
-	TargetRevisionID   string            `json:"target_revision_id,omitempty"`
-	State              KnowledgeJobState `json:"state"`
-	Stage              JobStage          `json:"stage"`
-	PagesDone          *int64            `json:"pages_done"`
-	PagesTotal         *int64            `json:"pages_total"`
-	ChunksDone         *int64            `json:"chunks_done"`
-	ChunksTotal        *int64            `json:"chunks_total"`
-	Attempt            int               `json:"attempt"`
-	NextAttemptAt      *time.Time        `json:"next_attempt_at,omitempty"`
-	CancelRequested    bool              `json:"cancel_requested"`
-	LeaseOwner         string            `json:"-"`
-	LeaseEpoch         int64             `json:"-"`
-	LeaseExpiresAt     *time.Time        `json:"-"`
-	HeartbeatAt        *time.Time        `json:"-"`
-	LastError          string            `json:"last_error,omitempty"`
+	JobID              string               `json:"job_id"`
+	ParentJobID        string               `json:"parent_job_id,omitempty"`
+	Kind               KnowledgeJobKind     `json:"kind"`
+	OwnerID            string               `json:"-"`
+	CorpusUID          string               `json:"-"`
+	DocumentID         string               `json:"document_id,omitempty"`
+	DocumentGeneration int64                `json:"-"`
+	TargetRevisionID   string               `json:"target_revision_id,omitempty"`
+	State              KnowledgeJobState    `json:"state"`
+	Stage              JobStage             `json:"stage"`
+	PagesDone          *int64               `json:"pages_done"`
+	PagesTotal         *int64               `json:"pages_total"`
+	ChunksDone         *int64               `json:"chunks_done"`
+	ChunksTotal        *int64               `json:"chunks_total"`
+	Attempt            int                  `json:"attempt"`
+	NextAttemptAt      *time.Time           `json:"next_attempt_at,omitempty"`
+	CancelRequested    bool                 `json:"cancel_requested"`
+	LeaseOwner         string               `json:"-"`
+	LeaseEpoch         int64                `json:"-"`
+	LeaseExpiresAt     *time.Time           `json:"-"`
+	HeartbeatAt        *time.Time           `json:"-"`
+	LastError          string               `json:"last_error,omitempty"`
 	Failure            *KnowledgeJobFailure `json:"failure,omitempty"`
-	CreatedAt          time.Time         `json:"created_at"`
-	UpdatedAt          time.Time         `json:"updated_at"`
+	CreatedAt          time.Time            `json:"created_at"`
+	UpdatedAt          time.Time            `json:"updated_at"`
 }
 
 type JobLease struct {
