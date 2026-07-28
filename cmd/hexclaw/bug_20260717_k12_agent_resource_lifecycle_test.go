@@ -19,7 +19,7 @@ func TestBug20260717_K12AgentCleanupDetachesAndCanRestoreCronJobs(t *testing.T) 
 		}
 	}
 
-	rollback, err := cleaner.DetachAgentResources(ctx, agentrouter.AgentConfig{
+	detached, err := cleaner.DetachAgentResources(ctx, agentrouter.AgentConfig{
 		Name:     "kid-agent",
 		Metadata: map[string]string{"scenario": "k12-tutor"},
 	})
@@ -33,10 +33,10 @@ func TestBug20260717_K12AgentCleanupDetachesAndCanRestoreCronJobs(t *testing.T) 
 	if len(jobs) != 0 {
 		t.Fatalf("K12 agent deletion left %d cron jobs", len(jobs))
 	}
-	if rollback == nil {
+	if detached.Rollback == nil {
 		t.Fatal("cleanup must return compensation callback")
 	}
-	if err := rollback(ctx); err != nil {
+	if err := detached.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
 	jobs, err = cleaner.sched.ListJobs(ctx, "k12")
@@ -56,14 +56,14 @@ func TestBug20260717_NonK12AgentCleanupDoesNotTouchJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rollback, err := cleaner.DetachAgentResources(ctx, agentrouter.AgentConfig{
+	detached, err := cleaner.DetachAgentResources(ctx, agentrouter.AgentConfig{
 		Name:     "general-agent",
 		Metadata: map[string]string{"scenario": "general"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rollback != nil {
+	if detached.Rollback != nil || detached.Commit != nil {
 		t.Fatal("non-K12 cleanup should be a no-op")
 	}
 	jobs, err := cleaner.sched.ListJobs(ctx, "k12")

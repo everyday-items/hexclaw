@@ -14,20 +14,26 @@ import (
 type recordingAgentResourceCleaner struct {
 	cleaned  []string
 	restored []string
+	committed []string
 	err      error
 }
 
 func (c *recordingAgentResourceCleaner) DetachAgentResources(
 	_ context.Context,
 	agent agentrouter.AgentConfig,
-) (func(context.Context) error, error) {
+) (AgentResourceDetach, error) {
 	c.cleaned = append(c.cleaned, agent.Name)
 	if c.err != nil {
-		return nil, c.err
+		return AgentResourceDetach{}, c.err
 	}
-	return func(context.Context) error {
-		c.restored = append(c.restored, agent.Name)
-		return nil
+	return AgentResourceDetach{
+		Commit: func() {
+			c.committed = append(c.committed, agent.Name)
+		},
+		Rollback: func(context.Context) error {
+			c.restored = append(c.restored, agent.Name)
+			return nil
+		},
 	}, nil
 }
 
@@ -57,6 +63,9 @@ func TestBug20260717_UnregisterAgentDetachesOwnedResources(t *testing.T) {
 	}
 	if len(cleaner.restored) != 0 {
 		t.Fatalf("successful deletion must not roll resources back: %+v", cleaner.restored)
+	}
+	if len(cleaner.committed) != 1 || cleaner.committed[0] != "kid" {
+		t.Fatalf("successful deletion did not commit staged resources: %+v", cleaner.committed)
 	}
 }
 
@@ -102,6 +111,9 @@ func TestBug20260717_UnregisterPersistenceFailureRollsResourcesBack(t *testing.T
 	}
 	if len(cleaner.cleaned) != 1 || len(cleaner.restored) != 1 {
 		t.Fatalf("cleanup saga did not compensate: cleaned=%v restored=%v", cleaner.cleaned, cleaner.restored)
+	}
+	if len(cleaner.committed) != 0 {
+		t.Fatalf("failed deletion committed staged resources: %+v", cleaner.committed)
 	}
 	if _, ok := dispatcher.GetAgent("kid"); !ok {
 		t.Fatal("persistence failure must keep the agent registered")

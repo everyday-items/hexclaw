@@ -59,20 +59,32 @@ type imageTaskGradingStub struct {
 	starts                int
 	async                 int
 	cancels               int
+	jobID                 string
+	startErr              error
 	input                 StartPhotoGradingInput
 	parentRetryAllowed    bool
 	parentRetryAttemptID  string
 	parentRetryDeadlineAt int64
 }
 
+func (s *imageTaskGradingStub) resolvedJobID() string {
+	if s.jobID != "" {
+		return s.jobID
+	}
+	return "internal-grading-job"
+}
+
 func (s *imageTaskGradingStub) StartPhotoGradingJob(_ context.Context, in StartPhotoGradingInput) (GradingJobView, bool, error) {
 	s.starts++
 	s.input = in
-	return GradingJobView{Record: &records.AgentRecord{RecordID: "internal-grading-job"}}, true, nil
+	if s.startErr != nil {
+		return GradingJobView{}, false, s.startErr
+	}
+	return GradingJobView{Record: &records.AgentRecord{RecordID: s.resolvedJobID()}}, true, nil
 }
 
 func (s *imageTaskGradingStub) StartAsync(jobID string) bool {
-	if jobID == "internal-grading-job" {
+	if jobID == s.resolvedJobID() {
 		s.async++
 	}
 	return true
@@ -87,7 +99,7 @@ func (s *imageTaskGradingStub) ConfirmPhotoGradingJob(
 func (s *imageTaskGradingStub) CancelImageTaskHomework(
 	_ context.Context, agentName, jobID string,
 ) error {
-	if agentName != "mingming" || jobID != "internal-grading-job" {
+	if agentName != "mingming" || jobID != s.resolvedJobID() {
 		return errors.New("unexpected cancellation scope")
 	}
 	s.cancels++
@@ -106,7 +118,7 @@ func (s *imageTaskGradingStub) RetryPhotoGradingJobWithParentAutomaticWindow(
 	jobID, parentAutomaticAttemptID string,
 	parentAutomaticDeadlineAt int64,
 ) (GradingJobView, bool, error) {
-	if jobID != "internal-grading-job" {
+	if jobID != s.resolvedJobID() {
 		return GradingJobView{}, false, errors.New("unexpected grading retry job")
 	}
 	s.parentRetryAttemptID = parentAutomaticAttemptID
@@ -246,6 +258,7 @@ func newImageTaskCoordinatorForTest(t *testing.T, classifier *imageTaskClassifie
 				"dispatch":             "dispatch-1",
 				"classification":       "classification-1",
 				"writing_ocr":          "writing-ocr-1",
+				"solve_preflight":      "solve-preflight-1",
 				"classification_retry": "classification-2",
 				"writing_ocr_retry":    "writing-ocr-2",
 			}[kind]
@@ -634,6 +647,57 @@ func TestImageTaskCoordinatorShutdownCancelsAndSealsWorkers(t *testing.T) {
 	}
 }
 
+func TestImageTaskCoordinatorQuiesceAgentCancelsSentWorkerWithoutGlobalSeal(t *testing.T) {
+	classifier := &imageTaskClassifierStub{
+		block:   make(chan struct{}),
+		entered: make(chan struct{}, 1),
+	}
+	coordinator, _ := newImageTaskCoordinatorForTest(t, classifier)
+	input := testCreateImageTaskInput()
+	input.RouteRequest.TimeoutMS = 5_000
+	prepared, _, err := coordinator.Create(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !coordinator.StartAsync("mingming", prepared.Dispatch.DispatchID) {
+		t.Fatal("worker was not scheduled")
+	}
+	select {
+	case <-classifier.entered:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not reach sent boundary")
+	}
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	resume, err := coordinator.QuiesceAgent(drainCtx, "mingming")
+	if err != nil {
+		t.Fatalf("quiesce target agent: %v", err)
+	}
+	invocation, err := coordinator.Records.GetImageTaskInvocation(
+		context.Background(),
+		"mingming",
+		prepared.Dispatch.ClassificationInvocationID,
+	)
+	if err != nil ||
+		invocation.Status != k12.ImageTaskInvocationOutcomeUnknown ||
+		invocation.RetrySafe {
+		t.Fatalf("agent cancellation was not parked safely: invocation=%+v err=%v",
+			invocation, err)
+	}
+	if coordinator.StartAsync("mingming", prepared.Dispatch.DispatchID) {
+		t.Fatal("quiesced Agent accepted a new worker")
+	}
+	resume()
+	resume()
+	if !coordinator.StartAsync("mingming", prepared.Dispatch.DispatchID) {
+		t.Fatal("idempotent resume left the coordinator globally sealed")
+	}
+	if err := coordinator.Wait(drainCtx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestImageTaskCoordinatorProviderTimeoutAndAmbiguousTransportNeverBlindRetry(t *testing.T) {
 	t.Run("deadline", func(t *testing.T) {
 		classifier := &imageTaskClassifierStub{block: make(chan struct{})}
@@ -783,6 +847,22 @@ func TestImageTaskCoordinatorRoutesHomeworkToInternalGradingWithoutLeakingModelC
 		Confidence:     0.99,
 	}}
 	coordinator, grading := newImageTaskCoordinatorForTest(t, classifier)
+	feedbackDeps := coordinator.WorkFeedback.(*Deps)
+	persistedJob, created, err := feedbackDeps.CreateGradingJob(
+		context.Background(), "mingming", "session-receipt",
+		CreateGradingJobInput{
+			SubmissionID: "submission-receipt", SourceKind: "test",
+			SourceKey: "image-task-receipt", ConfirmedVersion: 0,
+			ModelSnapshot: k12.GradingModelSnapshot{
+				Provider: "hexclaw-gpt", Model: "gpt-5.6-sol",
+				Route: "hexclaw-gpt/gpt-5.6-sol", Capability: "vision",
+			},
+		},
+	)
+	if err != nil || !created {
+		t.Fatalf("persist grading job fixture: created=%v err=%v", created, err)
+	}
+	grading.jobID = persistedJob.Record.RecordID
 
 	view, created, err := createAndRunImageTask(t, coordinator, testCreateImageTaskInput())
 	if err != nil || !created {
@@ -802,19 +882,58 @@ func TestImageTaskCoordinatorRoutesHomeworkToInternalGradingWithoutLeakingModelC
 	submission, err := coordinator.Records.GetHomeworkSubmission(
 		context.Background(), "mingming", view.Dispatch.TargetObjectID,
 	)
-	if err != nil || submission.GradingJobID != "internal-grading-job" {
+	if err != nil || submission.GradingJobID != grading.jobID {
 		t.Fatalf("internal binding missing: submission=%+v err=%v", submission, err)
 	}
 	jobID, err := coordinator.ResolveTutoringTipsGradingJob(
 		context.Background(), "mingming", view.Dispatch.DispatchID,
 	)
-	if err != nil || jobID != "internal-grading-job" {
+	if err != nil || jobID != grading.jobID {
 		t.Fatalf("dispatch did not resolve internal tutoring facts: job=%q err=%v", jobID, err)
 	}
 	if _, err := coordinator.ResolveTutoringTipsGradingJob(
 		context.Background(), "other", view.Dispatch.DispatchID,
 	); err == nil {
 		t.Fatal("cross-owner tutoring dispatch lookup must fail closed")
+	}
+	invocation, _, err := coordinator.Records.PrepareModelInvocation(
+		context.Background(),
+		k12.ModelInvocation{
+			InvocationID: "solve-invocation-1", AgentName: "mingming",
+			JobID: grading.jobID, Stage: "solve",
+			RequestDigest: "sha256:solve-request", Attempt: 1,
+			RouteSnapshot: k12.GradingModelSnapshot{
+				Provider: "hexclaw-gpt", Model: "gpt-5.6-sol",
+				Route: "hexclaw-gpt/gpt-5.6-sol", Capability: "vision",
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invocation, err = coordinator.Records.MarkModelInvocationSent(
+		context.Background(), "mingming", invocation.InvocationID, "provider-key",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Records.MarkModelInvocationSucceeded(
+		context.Background(), "mingming", invocation.InvocationID,
+		"sha256:terminal-answer", "external-request-1",
+	); err != nil {
+		t.Fatal(err)
+	}
+	result, err := coordinator.Result(context.Background(), "mingming", view.Dispatch.DispatchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.OperationReceipts) != 1 ||
+		result.OperationReceipts[0].Operation != "solve" ||
+		result.OperationReceipts[0].Provider != "hexclaw-gpt" ||
+		result.OperationReceipts[0].Model != "gpt-5.6-sol" ||
+		result.OperationReceipts[0].Status != "succeeded" ||
+		result.OperationReceipts[0].ResultDigest != "sha256:terminal-answer" {
+		t.Fatalf("solve receipt not projected from durable grading ledger: %+v", result.OperationReceipts)
 	}
 }
 

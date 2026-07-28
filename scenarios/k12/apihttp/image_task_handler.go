@@ -575,9 +575,12 @@ func (h *handler) getImageTaskResult(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"dispatch_id": result.Dispatch.DispatchID,
-		"task_intent": result.Dispatch.TaskIntent,
-		"status":      result.Dispatch.Status,
-		"result":      projection,
+		"dispatch_id":        result.Dispatch.DispatchID,
+		"task_intent":        result.Dispatch.TaskIntent,
+		"status":             result.Dispatch.Status,
+		"source_digest":      result.Dispatch.SourceDigest,
+		"source_attachments": result.SourceAttachments,
+		"operation_receipts": result.OperationReceipts,
+		"result":             projection,
 	})
 }

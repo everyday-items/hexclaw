@@ -2,8 +2,10 @@ package apihttp_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -75,11 +77,11 @@ func (s *imageTaskClassifierHTTPStub) ClassifyImageTask(
 }
 
 type imageTaskHTTPFixture struct {
-	handler     http.Handler
-	classifier  *imageTaskClassifierHTTPStub
-	ocr         *imageTaskHTTPWritingOCRStub
-	coordinator *usecase.ImageTaskCoordinator
-	assetID     string
+	handler       http.Handler
+	classifier    *imageTaskClassifierHTTPStub
+	ocr           *imageTaskHTTPWritingOCRStub
+	coordinator   *usecase.ImageTaskCoordinator
+	assetID       string
 	feedbackCalls *atomic.Int32
 	db            *sql.DB
 }
@@ -122,10 +124,24 @@ type imageTaskCreateContract struct {
 }
 
 type imageTaskResultContract struct {
-	DispatchID string              `json:"dispatch_id"`
-	TaskIntent k12.ImageTaskIntent `json:"task_intent"`
-	Status     k12.ImageTaskStatus `json:"status"`
-	Result     *struct {
+	DispatchID        string              `json:"dispatch_id"`
+	TaskIntent        k12.ImageTaskIntent `json:"task_intent"`
+	Status            k12.ImageTaskStatus `json:"status"`
+	SourceDigest      string              `json:"source_digest"`
+	SourceAttachments []struct {
+		Digest    string `json:"digest"`
+		SizeBytes int    `json:"size_bytes"`
+	} `json:"source_attachments"`
+	OperationReceipts []struct {
+		InvocationID string `json:"invocation_id"`
+		Operation    string `json:"operation"`
+		Provider     string `json:"provider"`
+		Model        string `json:"model"`
+		Status       string `json:"status"`
+		Attempt      int    `json:"attempt"`
+		ResultDigest string `json:"result_digest"`
+	} `json:"operation_receipts"`
+	Result *struct {
 		Kind    k12.ImageTaskIntent `json:"kind"`
 		Payload struct {
 			Intake struct {
@@ -134,7 +150,7 @@ type imageTaskResultContract struct {
 			} `json:"intake"`
 			Work     *imageTaskCreativeWorkContract `json:"work,omitempty"`
 			Feedback *struct {
-				GenerationID      string           `json:"generation_id"`
+				GenerationID       string           `json:"generation_id"`
 				StructuredFeedback k12.WorkFeedback `json:"structured_feedback"`
 				ProjectionMarkdown string           `json:"projection_markdown"`
 			} `json:"feedback,omitempty"`
@@ -381,6 +397,8 @@ func TestImageTaskPublicSurfaceExactSetAndNoInternalLeak(t *testing.T) {
 	}
 	if result.DispatchID != dispatchID ||
 		result.TaskIntent != k12.ImageTaskIntentArtwork ||
+		result.SourceDigest == "" ||
+		len(result.SourceAttachments) != 1 ||
 		result.Result == nil ||
 		result.Result.Kind != k12.ImageTaskIntentArtwork ||
 		result.Result.Payload.Intake.IntakeID == "" ||
@@ -394,12 +412,48 @@ func TestImageTaskPublicSurfaceExactSetAndNoInternalLeak(t *testing.T) {
 			result.Result.Payload.Feedback.ProjectionMarkdown {
 		t.Fatalf("result wire contract drift: %#v", result)
 	}
+	rawImage, err := base64.StdEncoding.DecodeString(
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2n1cAAAAASUVORK5CYII=",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageDigest := sha256.Sum256(rawImage)
+	if result.SourceAttachments[0].Digest != "sha256:"+hex.EncodeToString(imageDigest[:]) ||
+		result.SourceAttachments[0].SizeBytes != len(rawImage) {
+		t.Fatalf("source attachment receipt drift: %#v", result.SourceAttachments)
+	}
+	var feedbackReceipt *struct {
+		InvocationID string `json:"invocation_id"`
+		Operation    string `json:"operation"`
+		Provider     string `json:"provider"`
+		Model        string `json:"model"`
+		Status       string `json:"status"`
+		Attempt      int    `json:"attempt"`
+		ResultDigest string `json:"result_digest"`
+	}
+	for index := range result.OperationReceipts {
+		if result.OperationReceipts[index].Operation == "work_feedback" {
+			feedbackReceipt = &result.OperationReceipts[index]
+			break
+		}
+	}
+	if feedbackReceipt == nil ||
+		feedbackReceipt.Provider != "hexclaw-gpt" ||
+		feedbackReceipt.Model != "gpt-5.6-sol" ||
+		feedbackReceipt.Status != "succeeded" ||
+		feedbackReceipt.Attempt != 1 ||
+		feedbackReceipt.InvocationID == "" ||
+		feedbackReceipt.ResultDigest == "" {
+		t.Fatalf("work feedback provider receipt drift: %#v", result.OperationReceipts)
+	}
 	var rawResult map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &rawResult); err != nil {
 		t.Fatal(err)
 	}
 	assertJSONExactKeys(t, rawResult,
-		"dispatch_id", "result", "status", "task_intent")
+		"dispatch_id", "operation_receipts", "result", "source_attachments",
+		"source_digest", "status", "task_intent")
 	rawProjection := rawResult["result"].(map[string]any)
 	assertJSONExactKeys(t, rawProjection, "kind", "payload")
 	rawPayload := rawProjection["payload"].(map[string]any)

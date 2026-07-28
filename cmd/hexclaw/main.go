@@ -2302,9 +2302,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				Deps: &k12rt.Deps, Records: k12rt.Records, BaseContext: ctx,
 			}
 			imageTaskAdapter := k12engineadapter.NewImageTaskAdapter(visionFn)
-			k12ImageTasks = &k12usecase.ImageTaskCoordinator{
-				Records: k12rt.Records, Classifier: imageTaskAdapter,
-				WritingOCR: imageTaskAdapter, Grading: k12GradingOrch,
+				k12ImageTasks = &k12usecase.ImageTaskCoordinator{
+					Records: k12rt.Records, Classifier: imageTaskAdapter,
+					WritingOCR: imageTaskAdapter, Grading: k12GradingOrch,
 				WorkFeedback:          &k12rt.Deps,
 				BaseContext:           ctx,
 				GradingBudgetSnapshot: k12rt.Deps.GradingBudgetSnapshot,
@@ -2361,10 +2361,14 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					if modelID == "" {
 						modelID = strings.TrimSpace(providerConfig.Model)
 					}
-					return providerConfig.DisplayName, modelID
-				},
-			}
-			if webhookMgr != nil {
+						return providerConfig.DisplayName, modelID
+					},
+				}
+				srv.SetAgentResourceCleaner(k12CronRegistrar{
+					sched: scheduler, router: agentRouter, webhookMgr: webhookMgr,
+					imageTasks: k12ImageTasks, workFeedback: k12WorkFeedback,
+				})
+				if webhookMgr != nil {
 				// DD-019: K12 Webhook is a TriggerAdapter into the same application
 				// commands as Desktop/IM/Workflow; it never falls back to the generic
 				// webhook-system prompt path.
@@ -3192,6 +3196,42 @@ type k12CronRegistrar struct {
 	sched      *cron.Scheduler
 	router     *agentrouter.Dispatcher
 	webhookMgr *webhook.Manager
+	imageTasks k12AgentWorkerQuiescer
+	workFeedback k12AgentWorkerQuiescer
+}
+
+type k12AgentWorkerQuiescer interface {
+	QuiesceAgent(context.Context, string) (func(), error)
+}
+
+func quiesceK12AgentWorkers(
+	ctx context.Context,
+	agentName string,
+	workers ...k12AgentWorkerQuiescer,
+) (func(), error) {
+	releases := make([]func(), 0, len(workers))
+	releaseAll := func() {
+		for i := len(releases) - 1; i >= 0; i-- {
+			releases[i]()
+		}
+	}
+	for _, worker := range workers {
+		if worker == nil {
+			continue
+		}
+		release, err := worker.QuiesceAgent(ctx, agentName)
+		if release != nil {
+			releases = append(releases, release)
+		}
+		if err != nil {
+			releaseAll()
+			return nil, err
+		}
+	}
+	var once sync.Once
+	return func() {
+		once.Do(releaseAll)
+	}, nil
 }
 
 // classifiedSolveExecutor is the composition boundary between K12 profile data
@@ -3436,9 +3476,9 @@ func (r k12CronRegistrar) ReclaimStale(ctx context.Context, agentName string, ke
 func (r k12CronRegistrar) DetachAgentResources(
 	ctx context.Context,
 	agent agentrouter.AgentConfig,
-) (func(context.Context) error, error) {
+) (api.AgentResourceDetach, error) {
 	if agent.Metadata["scenario"] != "k12-tutor" {
-		return nil, nil
+		return api.AgentResourceDetach{}, nil
 	}
 
 	// 0) Webhook TriggerAdapter 必须最先失效，关闭 Agent 删除窗口内的新入站。
@@ -3447,74 +3487,95 @@ func (r k12CronRegistrar) DetachAgentResources(
 		var err error
 		restoreWebhooks, err = r.webhookMgr.DetachK12BindingsByAgent(ctx, agent.Name)
 		if err != nil {
-			return nil, fmt.Errorf("停用 K12 Webhook binding: %w", err)
+			return api.AgentResourceDetach{}, fmt.Errorf("停用 K12 Webhook binding: %w", err)
 		}
 	}
 
-	// 1) 作品资产：删前快照（saga 补偿载体），再抹除本机文件与目录。
-	assetSnap, err := assetstore.SnapshotAgent(agent.Name)
+	// 1) Fence and drain both canonical Agent worker owners before any durable
+	// record or out-of-band asset can disappear underneath a provider receipt.
+	resumeWorkers, err := quiesceK12AgentWorkers(
+		ctx, agent.Name, r.imageTasks, r.workFeedback,
+	)
 	if err != nil {
 		if restoreWebhooks != nil {
 			_ = restoreWebhooks(context.WithoutCancel(ctx))
 		}
-		return nil, fmt.Errorf("快照 K12 作品资产: %w", err)
+		return api.AgentResourceDetach{}, fmt.Errorf("停止 K12 Agent 异步任务: %w", err)
 	}
-	if _, err := assetstore.DeleteAgent(agent.Name); err != nil {
+
+	// 2) 作品资产：删前快照（saga 补偿载体），再抹除本机文件与目录。
+	assetSnap, err := assetstore.SnapshotAgent(agent.Name)
+	if err != nil {
+		resumeWorkers()
 		if restoreWebhooks != nil {
 			_ = restoreWebhooks(context.WithoutCancel(ctx))
 		}
-		return nil, fmt.Errorf("清理 K12 作品资产: %w", err)
+		return api.AgentResourceDetach{}, fmt.Errorf("快照 K12 作品资产: %w", err)
+	}
+	if _, err := assetstore.DeleteAgent(agent.Name); err != nil {
+		resumeWorkers()
+		if restoreWebhooks != nil {
+			_ = restoreWebhooks(context.WithoutCancel(ctx))
+		}
+		return api.AgentResourceDetach{}, fmt.Errorf("清理 K12 作品资产: %w", err)
 	}
 
-	// 2) 定时任务：摘除稳定 source-key 家族（可空调度器时跳过）。
+	// 3) 定时任务：摘除稳定 source-key 家族（可空调度器时跳过）。
 	var detached []*cron.Job
 	if r.sched != nil {
 		detached, err = r.sched.RemoveJobsBySourceKeyPrefix(ctx, agent.Name+"/")
-		if err != nil {
-			// cron 摘除失败：先回填已删资产，避免半清理残缺。
-			if rErr := assetSnap.Restore(); rErr != nil {
-				return nil, fmt.Errorf("清理 K12 定时任务失败(%v)；资产回滚亦失败: %w", err, rErr)
+			if err != nil {
+				// cron 摘除失败：先回填已删资产，避免半清理残缺。
+				if rErr := assetSnap.Restore(); rErr != nil {
+					resumeWorkers()
+					return api.AgentResourceDetach{}, fmt.Errorf("清理 K12 定时任务失败(%v)；资产回滚亦失败: %w", err, rErr)
+				}
+				if restoreWebhooks != nil {
+					if rErr := restoreWebhooks(context.WithoutCancel(ctx)); rErr != nil {
+						resumeWorkers()
+						return api.AgentResourceDetach{}, fmt.Errorf("清理 K12 定时任务失败(%v)；Webhook 回滚亦失败: %w", err, rErr)
+					}
+				}
+				resumeWorkers()
+				return api.AgentResourceDetach{}, fmt.Errorf("清理 K12 定时任务: %w", err)
 			}
-			if restoreWebhooks != nil {
-				if rErr := restoreWebhooks(context.WithoutCancel(ctx)); rErr != nil {
-					return nil, fmt.Errorf("清理 K12 定时任务失败(%v)；Webhook 回滚亦失败: %w", err, rErr)
+		}
+
+	return api.AgentResourceDetach{
+		Commit: resumeWorkers,
+		Rollback: func(rollbackCtx context.Context) error {
+			defer resumeWorkers()
+			for _, job := range detached {
+				if job == nil || job.Spec == nil {
+					return fmt.Errorf("恢复 K12 定时任务失败: job spec 缺失")
+				}
+				_, err := r.sched.UpsertJobFromScript(rollbackCtx, cron.AddJobRequest{
+					Name:       job.Name,
+					Schedule:   job.Schedule,
+					Prompt:     job.SourcePrompt,
+					UserID:     job.UserID,
+					Platform:   job.Platform,
+					ChatID:     job.ChatID,
+					TZ:         job.TZ,
+					Deliver:    job.Deliver,
+					SourceKey:  job.SourceKey,
+					TimeoutSec: job.Spec.TimeoutSec,
+					Paused:     job.Status == cron.StatusPaused,
+				}, job.Spec.Runtime, job.Spec.Script)
+				if err != nil {
+					return fmt.Errorf("恢复 K12 定时任务 %s: %w", job.ID, err)
 				}
 			}
-			return nil, fmt.Errorf("清理 K12 定时任务: %w", err)
-		}
-	}
-
-	return func(rollbackCtx context.Context) error {
-		for _, job := range detached {
-			if job == nil || job.Spec == nil {
-				return fmt.Errorf("恢复 K12 定时任务失败: job spec 缺失")
+			if err := assetSnap.Restore(); err != nil {
+				return fmt.Errorf("恢复 K12 作品资产: %w", err)
 			}
-			_, err := r.sched.UpsertJobFromScript(rollbackCtx, cron.AddJobRequest{
-				Name:       job.Name,
-				Schedule:   job.Schedule,
-				Prompt:     job.SourcePrompt,
-				UserID:     job.UserID,
-				Platform:   job.Platform,
-				ChatID:     job.ChatID,
-				TZ:         job.TZ,
-				Deliver:    job.Deliver,
-				SourceKey:  job.SourceKey,
-				TimeoutSec: job.Spec.TimeoutSec,
-				Paused:     job.Status == cron.StatusPaused,
-			}, job.Spec.Runtime, job.Spec.Script)
-			if err != nil {
-				return fmt.Errorf("恢复 K12 定时任务 %s: %w", job.ID, err)
+			if restoreWebhooks != nil {
+				if err := restoreWebhooks(rollbackCtx); err != nil {
+					return fmt.Errorf("恢复 K12 Webhook binding: %w", err)
+				}
 			}
-		}
-		if err := assetSnap.Restore(); err != nil {
-			return fmt.Errorf("恢复 K12 作品资产: %w", err)
-		}
-		if restoreWebhooks != nil {
-			if err := restoreWebhooks(rollbackCtx); err != nil {
-				return fmt.Errorf("恢复 K12 Webhook binding: %w", err)
-			}
-		}
-		return nil
+			return nil
+		},
 	}, nil
 }
 

@@ -78,7 +78,7 @@ func TestBug20260718_DeleteAgentPurgesAssetsRecordsBindings(t *testing.T) {
 	cleaner := k12CronRegistrar{sched: sched}
 
 	// —— 摘除阶段：DetachAgentResources 必须抹除资产（RED：修复前只摘 cron）——
-	rollback, err := cleaner.DetachAgentResources(ctx, agentrouter.AgentConfig{
+	detached, err := cleaner.DetachAgentResources(ctx, agentrouter.AgentConfig{
 		Name:     agent,
 		Metadata: map[string]string{"scenario": "k12-tutor"},
 	})
@@ -90,10 +90,10 @@ func TestBug20260718_DeleteAgentPurgesAssetsRecordsBindings(t *testing.T) {
 	}
 
 	// —— 注销 saga 回滚：持久化删除失败时资产必须原样恢复 ——
-	if rollback == nil {
+	if detached.Rollback == nil {
 		t.Fatal("k12 agent 清理必须返回补偿回调")
 	}
-	if err := rollback(ctx); err != nil {
+	if err := detached.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if entries, _ := os.ReadDir(filepath.Join(root, agent)); len(entries) != 1 {

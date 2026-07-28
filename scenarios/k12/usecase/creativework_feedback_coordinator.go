@@ -23,7 +23,7 @@ type CreativeWorkFeedbackCoordinator struct {
 	workerMu    sync.Mutex
 	runCtx      context.Context
 	runCancel   context.CancelCauseFunc
-	active      map[string]bool
+	agentWorkers agentWorkerFenceRegistry
 	workerCount int
 	workerIdle  chan struct{}
 	sealed      bool
@@ -75,30 +75,32 @@ func (c *CreativeWorkFeedbackCoordinator) StartAsync(
 	key := agentName + "\x00" + generationID
 	c.workerMu.Lock()
 	c.initWorkerRuntimeLocked()
-	if c.sealed || c.active[key] {
+	if c.sealed {
 		c.workerMu.Unlock()
 		return false
 	}
-	if c.active == nil {
-		c.active = map[string]bool{}
+	runCtx, finishWorker, accepted := c.agentWorkers.start(
+		c.runCtx, agentName, key,
+	)
+	if !accepted {
+		c.workerMu.Unlock()
+		return false
 	}
-	c.active[key] = true
 	if c.workerCount == 0 {
 		c.workerIdle = make(chan struct{})
 	}
 	c.workerCount++
-	runCtx := c.runCtx
 	c.workerMu.Unlock()
 
 	go func() {
 		defer func() {
 			c.workerMu.Lock()
-			delete(c.active, key)
 			c.workerCount--
 			if c.workerCount == 0 {
 				close(c.workerIdle)
 			}
 			c.workerMu.Unlock()
+			finishWorker()
 		}()
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -120,6 +122,19 @@ func (c *CreativeWorkFeedbackCoordinator) StartAsync(
 		}
 	}()
 	return true
+}
+
+// QuiesceAgent fences new local feedback workers for one Agent, cancels and
+// drains workers already owned by this coordinator, and returns an idempotent
+// resume callback for the enclosing Agent-deletion saga.
+func (c *CreativeWorkFeedbackCoordinator) QuiesceAgent(
+	ctx context.Context,
+	agentName string,
+) (func(), error) {
+	if c == nil {
+		return func() {}, nil
+	}
+	return c.agentWorkers.quiesceAgent(ctx, agentName)
 }
 
 func (c *CreativeWorkFeedbackCoordinator) Run(

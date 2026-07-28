@@ -1358,7 +1358,7 @@ func (s *Server) handleUnregisterAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var rollbackResources func(context.Context) error
+	var detachedResources AgentResourceDetach
 	var persistErr error
 	var resourceErr error
 	err := s.agentRouter.UnregisterPersisted(name, func(name, nextDefault string, wasDefault bool) error {
@@ -1367,7 +1367,7 @@ func (s *Server) handleUnregisterAgent(w http.ResponseWriter, r *http.Request) {
 		// delete race: a provisioner that validates through the same dispatcher
 		// cannot recreate schedules between cleanup and Agent removal.
 		if s.agentResources != nil {
-			rollbackResources, resourceErr = s.agentResources.DetachAgentResources(r.Context(), *agent)
+			detachedResources, resourceErr = s.agentResources.DetachAgentResources(r.Context(), *agent)
 			if resourceErr != nil {
 				return fmt.Errorf("清理 Agent 归属资源失败: %w", resourceErr)
 			}
@@ -1390,11 +1390,11 @@ func (s *Server) handleUnregisterAgent(w http.ResponseWriter, r *http.Request) {
 		return persistErr
 	})
 	if err != nil {
-		if rollbackResources != nil {
+		if detachedResources.Rollback != nil {
 			// The request can already be canceled by the time persistence
 			// reports an error. Compensation must still get a chance to restore
 			// the resources staged above.
-			if rollbackErr := rollbackResources(context.WithoutCancel(r.Context())); rollbackErr != nil {
+			if rollbackErr := detachedResources.Rollback(context.WithoutCancel(r.Context())); rollbackErr != nil {
 				logger.Error("Agent 注销资源回滚失败", "agent", name, "error", rollbackErr)
 				err = fmt.Errorf("%w; 归属资源回滚失败: %v", err, rollbackErr)
 			}
@@ -1407,6 +1407,9 @@ func (s *Server) handleUnregisterAgent(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		}
 		return
+	}
+	if detachedResources.Commit != nil {
+		detachedResources.Commit()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Agent 已注销"})
 }

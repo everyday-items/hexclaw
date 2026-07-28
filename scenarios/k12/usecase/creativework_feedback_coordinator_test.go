@@ -18,6 +18,126 @@ func currentFeedbackRoute() k12.ImageTaskRouteSnapshot {
 	}
 }
 
+type cancelAwareWorkFeedbackSolver struct {
+	entered  chan struct{}
+	returned chan struct{}
+}
+
+func (s *cancelAwareWorkFeedbackSolver) Solve(
+	context.Context, string, string, string,
+) (usecase.SolveResult, error) {
+	return usecase.SolveResult{}, nil
+}
+
+func (s *cancelAwareWorkFeedbackSolver) GenerateWorkFeedback(
+	ctx context.Context,
+	_ usecase.WorkFeedbackRequest,
+) (usecase.WorkFeedbackOutput, error) {
+	close(s.entered)
+	<-ctx.Done()
+	close(s.returned)
+	return usecase.WorkFeedbackOutput{}, ctx.Err()
+}
+
+func TestCreativeWorkFeedbackCoordinatorQuiesceAgentTerminalizesSentInvocation(t *testing.T) {
+	d := newDataDeps(t, "xiaoming", "xiaohong")
+	blocked := &cancelAwareWorkFeedbackSolver{
+		entered: make(chan struct{}), returned: make(chan struct{}),
+	}
+	d.Solver = blocked
+	workID, generationID, created, err := d.CreateCurrentTextWork(
+		context.Background(), "xiaoming", "桂花落在青石板上。", "save-work-delete-race",
+	)
+	if err != nil || !created {
+		t.Fatalf("create current work: created=%v err=%v", created, err)
+	}
+	coordinator := &usecase.CreativeWorkFeedbackCoordinator{
+		Deps: &d, Records: d.Records, BaseContext: context.Background(),
+	}
+	if !coordinator.StartAsync("xiaoming", generationID) {
+		t.Fatal("target worker was not scheduled")
+	}
+	select {
+	case <-blocked.entered:
+	case <-time.After(time.Second):
+		t.Fatal("target provider did not reach sent boundary")
+	}
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	resume, err := coordinator.QuiesceAgent(drainCtx, "xiaoming")
+	if err != nil {
+		t.Fatalf("quiesce target agent: %v", err)
+	}
+	select {
+	case <-blocked.returned:
+	default:
+		t.Fatal("quiesce returned before provider cancellation completed")
+	}
+	generation, err := d.Records.GetWorkFeedbackGeneration(
+		context.Background(), "xiaoming", generationID,
+	)
+	if err != nil || generation.Status != k12.WorkFeedbackFailed {
+		t.Fatalf("generation did not become terminal failed: %+v err=%v", generation, err)
+	}
+	invocation, err := d.Records.GetLatestWorkFeedbackInvocation(
+		context.Background(),
+		"xiaoming",
+		workID,
+		"work:"+workID+":version:"+generationID+":feedback",
+	)
+	if err != nil ||
+		invocation.Status != k12.ImageTaskInvocationOutcomeUnknown ||
+		invocation.RetrySafe {
+		t.Fatalf("sent invocation did not park outcome_unknown: %+v err=%v", invocation, err)
+	}
+
+	targetWorkID, targetGenerationID, _, err := d.CreateCurrentTextWork(
+		context.Background(), "xiaoming", "雨点敲在窗台上。", "save-work-fenced",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherGenerationID, _, err := d.CreateCurrentTextWork(
+		context.Background(), "xiaohong", "风吹动了银杏叶。", "save-work-other-agent",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Solver = &fakeWorkFeedbackSolver{
+		feedback: "细节清楚；家长可以追问声音；下次补一处触觉细节。",
+	}
+	resumeAgain, err := coordinator.QuiesceAgent(drainCtx, "xiaoming")
+	if err != nil {
+		t.Fatalf("repeated quiesce: %v", err)
+	}
+	resumeAgain()
+	if coordinator.StartAsync("xiaoming", targetGenerationID) {
+		t.Fatal("repeated quiesce release reopened the original Agent fence")
+	}
+	if !coordinator.StartAsync("xiaohong", otherGenerationID) {
+		t.Fatal("target Agent fence blocked an unrelated Agent")
+	}
+	if err := coordinator.Wait(drainCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	resume()
+	resume()
+	if !coordinator.StartAsync("xiaoming", targetGenerationID) {
+		t.Fatal("idempotent resume did not reopen the target Agent")
+	}
+	if err := coordinator.Wait(drainCtx); err != nil {
+		t.Fatal(err)
+	}
+	target, err := d.GetCreativeWork(context.Background(), "xiaoming", targetWorkID)
+	if err != nil ||
+		target.GenerationState.Latest == nil ||
+		target.GenerationState.Latest.Status != k12.WorkFeedbackSucceeded {
+		t.Fatalf("resumed target Agent did not complete new work: %+v err=%v", target, err)
+	}
+}
+
 func TestCreativeWorkFeedbackCoordinatorAutomaticallyCompletesInitialGeneration(t *testing.T) {
 	d := newDataDeps(t)
 	solver := &fakeWorkFeedbackSolver{

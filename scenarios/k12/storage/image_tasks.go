@@ -71,6 +71,10 @@ func validateImageTaskInvocation(inv k12.ImageTaskInvocation) error {
 		if inv.DispatchID != "" || inv.IntakeID != "" || inv.WorkRecordID == "" {
 			return fmt.Errorf("work feedback invocation owner 非法")
 		}
+	case k12.ImageTaskOperationSolve:
+		if inv.DispatchID == "" || inv.IntakeID != "" || inv.WorkRecordID != "" {
+			return fmt.Errorf("solve invocation owner 非法")
+		}
 	default:
 		return fmt.Errorf("image task invocation operation 非法: %q", inv.Operation)
 	}
@@ -1654,6 +1658,183 @@ func (s *Store) GetLatestWorkFeedbackInvocation(
 	return getImageTaskInvocation(ctx, s.db, agentName, invocationID)
 }
 
+func (s *Store) GetLatestHomeworkSolveInvocation(
+	ctx context.Context,
+	agentName, dispatchID string,
+) (k12.ImageTaskInvocation, error) {
+	return getLatestImageTaskInvocation(
+		ctx,
+		s.db,
+		agentName,
+		k12.ImageTaskOperationSolve,
+		dispatchID,
+		"",
+	)
+}
+
+// FailHomeworkSolvePreflight atomically records a deterministic failure before
+// any grading job or provider call exists and converges both owning aggregates.
+// Replays reuse the same operation_key/attempt receipt.
+func (s *Store) FailHomeworkSolvePreflight(
+	ctx context.Context,
+	invocation k12.ImageTaskInvocation,
+	failureKind string,
+) (k12.ImageTaskInvocation, error) {
+	failureKind = strings.TrimSpace(failureKind)
+	if invocation.Operation != k12.ImageTaskOperationSolve || failureKind == "" {
+		return invocation, ErrImageTaskInvalidState
+	}
+	if err := validateImageTaskInvocation(invocation); err != nil {
+		return invocation, err
+	}
+	if err := ensureAgentRegistered(ctx, s.db, invocation.AgentName); err != nil {
+		return invocation, err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return invocation, err
+	}
+	defer tx.Rollback()
+
+	dispatch, err := getImageTaskDispatch(
+		ctx,
+		tx,
+		invocation.AgentName,
+		invocation.DispatchID,
+		"",
+	)
+	if err != nil {
+		return invocation, err
+	}
+	if dispatch.TargetObjectType != k12.ImageTaskTargetHomeworkSubmission ||
+		strings.TrimSpace(dispatch.TargetObjectID) == "" ||
+		(dispatch.Status != k12.ImageTaskStatusRouted &&
+			dispatch.Status != k12.ImageTaskStatusFailed) {
+		return invocation, ErrImageTaskInvalidState
+	}
+	submission, err := getHomeworkSubmission(
+		ctx,
+		tx,
+		invocation.AgentName,
+		dispatch.TargetObjectID,
+	)
+	if err != nil {
+		return invocation, err
+	}
+	if submission.DispatchID != dispatch.DispatchID ||
+		submission.GradingJobID != "" ||
+		(submission.Status != k12.HomeworkSubmissionReceived &&
+			submission.Status != k12.HomeworkSubmissionFailed) {
+		return invocation, ErrImageTaskInvalidState
+	}
+
+	now := nowUnix()
+	if invocation.CreatedAt == 0 {
+		invocation.CreatedAt = now
+	}
+	invocation.UpdatedAt = now
+	invocation.FinishedAt = now
+	invocation.DeadlineAt = dispatch.AutomaticDeadlineAt
+	routeJSON, err := jsonString(invocation.RouteSnapshot)
+	if err != nil {
+		return invocation, err
+	}
+	res, err := tx.ExecContext(ctx, `INSERT INTO k12_image_task_invocations
+        (invocation_id,agent_name,dispatch_id,intake_id,work_record_id,operation,operation_key,
+         request_digest,route_snapshot_json,status,attempt,provider_request_key,result_digest,
+         result_json,error_kind,retry_safe,started_at,finished_at,created_at,updated_at,deadline_at)
+        VALUES(?,?,?,NULL,NULL,?,?,?,?,'failed',?,'','','',?,1,0,?,?,?,?)
+        ON CONFLICT(agent_name,operation_key,attempt) DO NOTHING`,
+		invocation.InvocationID,
+		invocation.AgentName,
+		invocation.DispatchID,
+		invocation.Operation,
+		invocation.OperationKey,
+		invocation.RequestDigest,
+		routeJSON,
+		invocation.Attempt,
+		failureKind,
+		invocation.FinishedAt,
+		invocation.CreatedAt,
+		invocation.UpdatedAt,
+		invocation.DeadlineAt,
+	)
+	if err != nil {
+		return invocation, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		existing, getErr := getLatestImageTaskInvocation(
+			ctx,
+			tx,
+			invocation.AgentName,
+			k12.ImageTaskOperationSolve,
+			invocation.DispatchID,
+			"",
+		)
+		if getErr != nil {
+			return invocation, getErr
+		}
+		if existing.OperationKey != invocation.OperationKey ||
+			existing.Attempt != invocation.Attempt ||
+			existing.RequestDigest != invocation.RequestDigest ||
+			existing.RouteSnapshot != invocation.RouteSnapshot ||
+			existing.Status != k12.ImageTaskInvocationFailed ||
+			existing.ErrorKind != failureKind {
+			return invocation, ErrImageTaskConflict
+		}
+		invocation = existing
+	} else {
+		invocation.Status = k12.ImageTaskInvocationFailed
+		invocation.ErrorKind = failureKind
+		invocation.RetrySafe = true
+	}
+
+	if dispatch.Status == k12.ImageTaskStatusRouted {
+		res, err = tx.ExecContext(ctx, `UPDATE k12_image_task_dispatches
+            SET status='failed',failure_kind=?,retry_safe=1,version=version+1,updated_at=?
+            WHERE agent_name=? AND dispatch_id=? AND version=? AND status='routed'`,
+			failureKind,
+			now,
+			invocation.AgentName,
+			invocation.DispatchID,
+			dispatch.Version,
+		)
+		if err != nil {
+			return invocation, err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return invocation, ErrImageTaskVersionConflict
+		}
+	}
+	if submission.Status == k12.HomeworkSubmissionReceived {
+		res, err = tx.ExecContext(ctx, `UPDATE k12_homework_submissions
+            SET status='failed',version=version+1,updated_at=?
+            WHERE agent_name=? AND submission_id=? AND version=?
+              AND status='received' AND grading_job_id=''`,
+			now,
+			invocation.AgentName,
+			submission.SubmissionID,
+			submission.Version,
+		)
+		if err != nil {
+			return invocation, err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return invocation, ErrImageTaskVersionConflict
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return invocation, err
+	}
+	return getImageTaskInvocation(
+		ctx,
+		s.db,
+		invocation.AgentName,
+		invocation.InvocationID,
+	)
+}
+
 func (s *Store) CompleteWorkFeedbackInvocation(
 	ctx context.Context,
 	agentName, invocationID, resultDigest, resultJSON string,
@@ -2361,6 +2542,11 @@ func (s *Store) resolveImageTaskInvocationDeadline(
             WHERE d.agent_name=? AND i.agent_name=? AND i.promoted_work_id=?
             ORDER BY i.updated_at DESC LIMIT 1`,
 			invocation.AgentName, invocation.AgentName, invocation.WorkRecordID)
+	case k12.ImageTaskOperationSolve:
+		row = s.db.QueryRowContext(ctx, `SELECT automatic_deadline_at
+            FROM k12_image_task_dispatches
+            WHERE agent_name=? AND dispatch_id=?`,
+			invocation.AgentName, invocation.DispatchID)
 	default:
 		return 0, false, ErrImageTaskInvalidState
 	}
@@ -2398,6 +2584,8 @@ func imageTaskInvocationBelongsToDispatch(
             WHERE agent_name=? AND promoted_work_id=? AND dispatch_id=?`,
 			agentName, invocation.WorkRecordID, dispatchID).Scan(&n)
 		return n == 1, err
+	case k12.ImageTaskOperationSolve:
+		return invocation.DispatchID == dispatchID, nil
 	default:
 		return false, ErrImageTaskInvalidState
 	}

@@ -152,15 +152,22 @@ type Server struct {
 	serviceLifecycleCtx         context.Context
 }
 
+// AgentResourceDetach is the staged half of Agent resource deletion. Commit is
+// invoked only after router/store removal succeeds; Rollback compensates the
+// staged resources when durable deletion fails. Both callbacks must be
+// idempotent.
+type AgentResourceDetach struct {
+	Commit   func()
+	Rollback func(context.Context) error
+}
+
 // AgentResourceCleaner stages cleanup of resources owned by an Agent before
-// the Agent itself is durably removed. The rollback callback is invoked when
-// the subsequent router/store deletion fails, preventing a half-deleted
-// profile from silently losing its schedules or other owned resources.
+// the Agent itself is durably removed.
 type AgentResourceCleaner interface {
 	DetachAgentResources(
 		ctx context.Context,
 		agent router.AgentConfig,
-	) (rollback func(context.Context) error, err error)
+	) (AgentResourceDetach, error)
 }
 
 // NewServer 创建 API 服务器

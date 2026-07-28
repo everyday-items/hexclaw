@@ -639,6 +639,7 @@ const (
 	ImageTaskOperationClassification ImageTaskOperation = "classification"
 	ImageTaskOperationWritingOCR     ImageTaskOperation = "writing_ocr"
 	ImageTaskOperationWorkFeedback   ImageTaskOperation = "work_feedback"
+	ImageTaskOperationSolve          ImageTaskOperation = "solve"
 )
 
 type ImageTaskInvocation struct {

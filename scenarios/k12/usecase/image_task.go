@@ -104,7 +104,7 @@ type ImageTaskCoordinator struct {
 	BaseContext           context.Context
 
 	workerMu    sync.Mutex
-	active      map[string]bool
+	agentWorkers agentWorkerFenceRegistry
 	sealed      bool
 	workerCount int
 	workerIdle  chan struct{}
@@ -136,6 +136,7 @@ type ImageTaskView struct {
 	CreativeWork               *CreativeWorkView
 	CreativeFeedback           string
 	ActiveInvocationDeadlineAt int64
+	solveInvocation            *k12.ImageTaskInvocation
 	feedbackInvocation         *k12.ImageTaskInvocation
 }
 
@@ -188,11 +189,28 @@ type imageTaskGradingCanceller interface {
 type ImageTaskResult struct {
 	Kind                string
 	Dispatch            k12.ImageTaskDispatch
+	SourceAttachments   []ImageTaskSourceAttachmentReceipt
+	OperationReceipts   []ImageTaskOperationReceipt
 	Photo               *PhotoGradeResult
 	Creative            *k12.CreativeWorkIntake
 	CreativeDisplayName string
 	CreativeWork        *CreativeWorkView
 	FinalArtifact       *k12.GradingFinalArtifact `json:"final_artifact,omitempty"`
+}
+
+type ImageTaskSourceAttachmentReceipt struct {
+	Digest    string `json:"digest"`
+	SizeBytes int    `json:"size_bytes"`
+}
+
+type ImageTaskOperationReceipt struct {
+	InvocationID string `json:"invocation_id"`
+	Operation    string `json:"operation"`
+	Provider     string `json:"provider"`
+	Model        string `json:"model"`
+	Status       string `json:"status"`
+	Attempt      int    `json:"attempt"`
+	ResultDigest string `json:"result_digest"`
 }
 
 type imageTaskPhotoResultReader interface {
@@ -675,29 +693,27 @@ func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
 		c.workerMu.Unlock()
 		return false
 	}
-	if c.active == nil {
-		c.active = map[string]bool{}
-	}
-	if c.active[key] {
+	runCtx, finishWorker, accepted := c.agentWorkers.start(
+		c.runCtx, agentName, key,
+	)
+	if !accepted {
 		c.workerMu.Unlock()
 		return false
 	}
-	c.active[key] = true
 	if c.workerCount == 0 {
 		c.workerIdle = make(chan struct{})
 	}
 	c.workerCount++
-	runCtx := c.runCtx
 	c.workerMu.Unlock()
 	go func() {
 		defer func() {
 			c.workerMu.Lock()
-			delete(c.active, key)
 			c.workerCount--
 			if c.workerCount == 0 {
 				close(c.workerIdle)
 			}
 			c.workerMu.Unlock()
+			finishWorker()
 		}()
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -711,6 +727,18 @@ func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
 		}
 	}()
 	return true
+}
+
+// QuiesceAgent fences, cancels and drains one Agent's ImageTask workers without
+// sealing the process-wide coordinator or disturbing unrelated Agents.
+func (c *ImageTaskCoordinator) QuiesceAgent(
+	ctx context.Context,
+	agentName string,
+) (func(), error) {
+	if c == nil {
+		return func() {}, nil
+	}
+	return c.agentWorkers.quiesceAgent(ctx, agentName)
 }
 
 func (c *ImageTaskCoordinator) initWorkerRuntimeLocked() {
@@ -1139,6 +1167,24 @@ func (c *ImageTaskCoordinator) projectTarget(
 			view.HomeworkProjection = &projection
 		}
 	}
+	if view.Homework != nil && view.Homework.GradingJobID == "" {
+		invocation, invocationErr := c.Records.GetLatestHomeworkSolveInvocation(
+			ctx,
+			dispatch.AgentName,
+			dispatch.DispatchID,
+		)
+		switch {
+		case invocationErr == nil:
+			view.solveInvocation = &invocation
+			if invocation.Status == k12.ImageTaskInvocationPrepared ||
+				invocation.Status == k12.ImageTaskInvocationSent {
+				view.ActiveInvocationDeadlineAt = invocation.DeadlineAt
+			}
+		case errors.Is(invocationErr, k12storage.ErrImageTaskNotFound):
+		case invocationErr != nil:
+			return ImageTaskView{}, invocationErr
+		}
+	}
 	if view.Creative != nil && view.Creative.PromotedWorkID != "" {
 		record, getErr := c.Records.Get(ctx, view.Creative.PromotedWorkID)
 		if getErr != nil {
@@ -1166,7 +1212,7 @@ func (c *ImageTaskCoordinator) projectTarget(
 		}
 		view.CreativeWork = &work
 		view.CreativeFeedback = creativeFeedbackProjectionState(work)
-		if view.CreativeFeedback != "feedback_ready" && len(fields.Versions) > 0 {
+		if len(fields.Versions) > 0 {
 			version := fields.Versions[len(fields.Versions)-1]
 			operationKey := "work:" + record.RecordID + ":version:" +
 				version.VersionID + ":feedback"
@@ -1175,7 +1221,9 @@ func (c *ImageTaskCoordinator) projectTarget(
 			)
 			switch {
 			case invocationErr == nil:
-				view.CreativeFeedback = publicCreativeFeedbackInvocationState(invocation)
+				if view.CreativeFeedback != "feedback_ready" {
+					view.CreativeFeedback = publicCreativeFeedbackInvocationState(invocation)
+				}
 				view.feedbackInvocation = &invocation
 				if invocation.Status == k12.ImageTaskInvocationPrepared ||
 					invocation.Status == k12.ImageTaskInvocationSent {
@@ -1324,6 +1372,17 @@ func (c *ImageTaskCoordinator) continueTarget(
 			ParentAutomaticDeadlineAt: view.Dispatch.AutomaticDeadlineAt,
 		})
 		if err != nil {
+			if errors.Is(err, ErrInvalidInput) {
+				if persistErr := c.failHomeworkSolvePreflight(
+					context.WithoutCancel(ctx),
+					view.Dispatch,
+				); persistErr != nil {
+					return view, errors.Join(
+						err,
+						fmt.Errorf("persist homework solve preflight failure: %w", persistErr),
+					)
+				}
+			}
 			return view, err
 		}
 		if job.Record == nil || strings.TrimSpace(job.Record.RecordID) == "" {
@@ -1468,6 +1527,41 @@ func (c *ImageTaskCoordinator) continueTarget(
 	return view, nil
 }
 
+func (c *ImageTaskCoordinator) failHomeworkSolvePreflight(
+	ctx context.Context,
+	dispatch k12.ImageTaskDispatch,
+) error {
+	now := c.now()
+	_, err := c.Records.FailHomeworkSolvePreflight(
+		ctx,
+		k12.ImageTaskInvocation{
+			InvocationID:  c.id("solve_preflight"),
+			AgentName:     dispatch.AgentName,
+			DispatchID:    dispatch.DispatchID,
+			Operation:     k12.ImageTaskOperationSolve,
+			OperationKey:  "dispatch:" + dispatch.DispatchID + ":solve-preflight",
+			RequestDigest: digestJSON(struct {
+				DispatchID    string
+				RequestDigest string
+				SourceDigest  string
+				Route         string
+			}{
+				DispatchID:    dispatch.DispatchID,
+				RequestDigest: dispatch.RequestDigest,
+				SourceDigest:  dispatch.SourceDigest,
+				Route:         dispatch.RoutePolicySnapshot.Route,
+			}),
+			RouteSnapshot: dispatch.RoutePolicySnapshot,
+			Status:        k12.ImageTaskInvocationPrepared,
+			Attempt:       1,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+		"grading_budget_policy_invalid",
+	)
+	return err
+}
+
 func photoTaskIntentFromDispatch(intent k12.ImageTaskIntent) PhotoTaskIntent {
 	if intent == k12.ImageTaskIntentBlankWorksheet {
 		return PhotoTaskBlankWorksheet
@@ -1589,9 +1683,27 @@ func (c *ImageTaskCoordinator) Result(
 	if err != nil {
 		return ImageTaskResult{}, err
 	}
+	sourceAttachments, err := c.sourceAttachmentReceipts(view.Dispatch)
+	if err != nil {
+		return ImageTaskResult{}, err
+	}
 	result := ImageTaskResult{
 		Kind: "pending", Dispatch: view.Dispatch, Creative: view.Creative,
 		CreativeDisplayName: view.CreativeDisplayName, CreativeWork: view.CreativeWork,
+		SourceAttachments: sourceAttachments,
+		OperationReceipts: make([]ImageTaskOperationReceipt, 0),
+	}
+	if view.solveInvocation != nil {
+		result.OperationReceipts = append(
+			result.OperationReceipts,
+			imageTaskInvocationReceipt(*view.solveInvocation),
+		)
+	}
+	if view.feedbackInvocation != nil {
+		result.OperationReceipts = append(
+			result.OperationReceipts,
+			imageTaskInvocationReceipt(*view.feedbackInvocation),
+		)
 	}
 	if view.Dispatch.Status == k12.ImageTaskStatusAwaitingConfirmation ||
 		(view.Creative != nil && view.Creative.Status == k12.CreativeWorkIntakeAwaitingConfirmation) {
@@ -1605,6 +1717,18 @@ func (c *ImageTaskCoordinator) Result(
 		return result, nil
 	}
 	if view.Homework != nil && view.Homework.GradingJobID != "" {
+		invocations, listErr := c.Records.ListModelInvocations(
+			ctx, agentName, view.Homework.GradingJobID,
+		)
+		if listErr != nil {
+			return ImageTaskResult{}, listErr
+		}
+		for _, invocation := range invocations {
+			result.OperationReceipts = append(
+				result.OperationReceipts,
+				modelInvocationReceipt(invocation),
+			)
+		}
 		finalArtifact, finalArtifactErr := c.Records.GetGradingFinalArtifactByJob(
 			ctx, agentName, view.Homework.GradingJobID,
 		)
@@ -1625,6 +1749,49 @@ func (c *ImageTaskCoordinator) Result(
 		}
 	}
 	return result, nil
+}
+
+func (c *ImageTaskCoordinator) sourceAttachmentReceipts(
+	dispatch k12.ImageTaskDispatch,
+) ([]ImageTaskSourceAttachmentReceipt, error) {
+	images, err := c.readDispatchImages(dispatch)
+	if err != nil {
+		return nil, err
+	}
+	receipts := make([]ImageTaskSourceAttachmentReceipt, 0, len(images))
+	for _, image := range images {
+		sum := sha256.Sum256(image)
+		receipts = append(receipts, ImageTaskSourceAttachmentReceipt{
+			Digest: "sha256:" + hex.EncodeToString(sum[:]), SizeBytes: len(image),
+		})
+	}
+	return receipts, nil
+}
+
+func imageTaskInvocationReceipt(
+	invocation k12.ImageTaskInvocation,
+) ImageTaskOperationReceipt {
+	return ImageTaskOperationReceipt{
+		InvocationID: invocation.InvocationID,
+		Operation:    string(invocation.Operation),
+		Provider:     invocation.RouteSnapshot.Provider,
+		Model:        invocation.RouteSnapshot.Model,
+		Status:       string(invocation.Status),
+		Attempt:      invocation.Attempt,
+		ResultDigest: invocation.ResultDigest,
+	}
+}
+
+func modelInvocationReceipt(invocation k12.ModelInvocation) ImageTaskOperationReceipt {
+	return ImageTaskOperationReceipt{
+		InvocationID: invocation.InvocationID,
+		Operation:    invocation.Stage,
+		Provider:     invocation.RouteSnapshot.Provider,
+		Model:        invocation.RouteSnapshot.Model,
+		Status:       string(invocation.Status),
+		Attempt:      invocation.Attempt,
+		ResultDigest: invocation.ResultDigest,
+	}
 }
 
 // ResolveTutoringTipsGradingJob is an internal server-side bridge. Public
