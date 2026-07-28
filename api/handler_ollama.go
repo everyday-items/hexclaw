@@ -305,6 +305,10 @@ func (s *Server) handleOllamaUnload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body) // drain
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		writeJSON(w, resp.StatusCode, map[string]string{"error": "Ollama 卸载失败"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "unloaded"})
 }
 
@@ -419,6 +423,50 @@ func ollamaModelBase(name string) string {
 	return normalized
 }
 
+func canonicalOllamaModelTag(name string) string {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	if strings.LastIndex(normalized, ":") <= strings.LastIndex(normalized, "/") {
+		return normalized + ":latest"
+	}
+	return normalized
+}
+
+func (s *Server) ollamaModelAbsent(r *http.Request, name string) (bool, error) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, s.ollamaEndpoint("/api/tags"), nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := s.ollamaHTTPClient(10*time.Second, 10*time.Second).Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		io.Copy(io.Discard, resp.Body)
+		return false, fmt.Errorf("Ollama tags status %d", resp.StatusCode)
+	}
+	var payload struct {
+		Models []struct {
+			Name  string `json:"name"`
+			Model string `json:"model"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return false, err
+	}
+	target := canonicalOllamaModelTag(name)
+	for _, model := range payload.Models {
+		candidate := model.Name
+		if candidate == "" {
+			candidate = model.Model
+		}
+		if canonicalOllamaModelTag(candidate) == target {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // disableEmbeddingAutoInstallForDeletedModel 记住用户的删除意图。
 // 否则当前知识库嵌入模型会在下次 sidecar 启动时被静默重新下载。
 func (s *Server) disableEmbeddingAutoInstallForDeletedModel(name string) error {
@@ -429,7 +477,10 @@ func (s *Server) disableEmbeddingAutoInstallForDeletedModel(name string) error {
 
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
-	if s.cfg == nil || s.cfg.Knowledge.Embedding.DisableAutoInstall {
+	if s.cfg == nil {
+		return fmt.Errorf("配置未初始化")
+	}
+	if s.cfg.Knowledge.Embedding.DisableAutoInstall {
 		return nil
 	}
 
@@ -452,25 +503,33 @@ func (s *Server) handleOllamaDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "model name required"})
 		return
 	}
+	if err := s.disableEmbeddingAutoInstallForDeletedModel(name); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "关闭模型自动重装失败: " + err.Error(),
+		})
+		return
+	}
 	delBody, _ := json.Marshal(map[string]string{"model": name})
 	req2, _ := http.NewRequestWithContext(r.Context(), "DELETE", s.ollamaEndpoint("/api/delete"), bytes.NewReader(delBody))
 	req2.Header.Set("Content-Type", "application/json")
 	client := s.ollamaHTTPClient(10*time.Second, 10*time.Second)
 	resp, err := client.Do(req2)
 	if err != nil {
+		if absent, reconcileErr := s.ollamaModelAbsent(r, name); reconcileErr == nil && absent {
+			writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+			return
+		}
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("删除失败: %v", err)})
 		return
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		if absent, reconcileErr := s.ollamaModelAbsent(r, name); reconcileErr == nil && absent {
+			writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+			return
+		}
 		writeJSON(w, resp.StatusCode, map[string]string{"error": "Ollama 删除失败"})
-		return
-	}
-	if err := s.disableEmbeddingAutoInstallForDeletedModel(name); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"error": "模型已删除，但关闭自动重装失败: " + err.Error(),
-		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
