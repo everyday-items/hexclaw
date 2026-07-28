@@ -62,6 +62,13 @@ type RevisionSemanticReadiness interface {
 	HasActiveRevision(ctx context.Context) (bool, error)
 }
 
+// RevisionSemanticExecutionProfiler resolves model-scoped retrieval policy
+// from the active immutable revision. Manager treats it as optional so legacy
+// and test searchers retain the existing global defaults.
+type RevisionSemanticExecutionProfiler interface {
+	EmbeddingExecutionProfile(context.Context) (EmbeddingExecutionProfile, bool, error)
+}
+
 // SQLiteRevisionSemanticSearcher embeds the query with the active revision's
 // snapshot and scans only vectors belonging to that same revision/vector
 // space. It intentionally never reads kb_chunks.embedding.
@@ -167,6 +174,17 @@ func (s *SQLiteRevisionSemanticSearcher) ActiveRevisionID(ctx context.Context) (
 		return "", active, err
 	}
 	return plan.revision, true, nil
+}
+
+func (s *SQLiteRevisionSemanticSearcher) EmbeddingExecutionProfile(
+	ctx context.Context,
+) (EmbeddingExecutionProfile, bool, error) {
+	plan, active, err := s.loadActivePlan(ctx)
+	if err != nil || !active {
+		return EmbeddingExecutionProfile{}, false, err
+	}
+	profile, ok := EmbeddingExecutionProfileForModel(plan.profile.Profile.ModelName)
+	return profile, ok, nil
 }
 
 func (s *SQLiteRevisionSemanticSearcher) Search(

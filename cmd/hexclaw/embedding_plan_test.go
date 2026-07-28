@@ -40,7 +40,7 @@ func TestBug20260717_EmbeddingAutoConfigKeepsUnavailableOllamaAsStandby(t *testi
 	}
 
 	plan := resolveKnowledgeEmbeddingPlan(context.Background(), cfg)
-	if plan.Provider != "Ollama (本地)" || plan.Model != "nomic-embed-text" {
+	if plan.Provider != "Ollama (本地)" || plan.Model != "qwen3-embedding:8b" {
 		t.Fatalf("standby plan = %#v", plan)
 	}
 	if plan.Ready || plan.ServiceAvailable {
@@ -218,6 +218,8 @@ func TestKnowledgeEmbeddingDimensionUsesTheSelectedVectorSpace(t *testing.T) {
 		model string
 		want  int
 	}{
+		{model: "qwen3-embedding:8b", want: 4096},
+		{model: "qwen3-embedding:latest", want: 4096},
 		{model: "nomic-embed-text", want: 768},
 		{model: "nomic-embed-text:latest", want: 768},
 		{model: "mxbai-embed-large", want: 1024},

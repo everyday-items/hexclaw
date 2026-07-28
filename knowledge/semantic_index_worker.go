@@ -258,6 +258,12 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 	}
 	done, total := initial.EmbeddedChunks, initial.ExpectedChunks
 	var cursor *RevisionChunkCursor
+	batchSize := w.config.BatchSize
+	executionProfile, profileScoped := EmbeddingExecutionProfileForModel(plan.Snapshot.Profile.ModelName)
+	if profileScoped && executionProfile.BatchMaxCount > 0 &&
+		batchSize > executionProfile.BatchMaxCount {
+		batchSize = executionProfile.BatchMaxCount
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -265,7 +271,7 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 		if err := w.renewLease(ctx, lease); err != nil {
 			return err
 		}
-		inputs, err := w.repository.ListRevisionChunkInputs(ctx, *lease, w.now(), cursor, w.config.BatchSize)
+		inputs, err := w.repository.ListRevisionChunkInputs(ctx, *lease, w.now(), cursor, batchSize)
 		if err != nil {
 			return err
 		}
@@ -278,6 +284,9 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 			if texts[i] == "" {
 				return fmt.Errorf("%w: empty chunk %q", ErrInvalidEmbeddingResult, input.ChunkID)
 			}
+			if profileScoped {
+				texts[i] = clampRunes(texts[i], executionProfile.MaxInputRunes)
+			}
 		}
 		manifestInput := makeEmbeddingBatchManifest(job.JobID, plan, inputs, texts)
 		manifest, err := w.repository.CreateEmbeddingBatchManifest(ctx, *lease, w.now(), manifestInput)
@@ -286,7 +295,11 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 		}
 		embeddingTimeout := w.config.EmbeddingTimeout
 		if embeddingTimeout <= 0 {
-			embeddingTimeout = documentEmbeddingBudget(len(texts))
+			if profileScoped {
+				embeddingTimeout = executionProfile.BatchTimeout
+			} else {
+				embeddingTimeout = documentEmbeddingBudget(len(texts))
+			}
 		}
 		// Use the repository-returned manifest as the authority: a durable store
 		// may resume or canonicalize an existing batch identity after restart.

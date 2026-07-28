@@ -431,8 +431,11 @@ func TestKBDocRecall_Real(t *testing.T) {
 
 	// 本地 Ollama（免密钥，真实模型）— 纯向量层
 	ollamaBase := kbdocEnvOr("HEX_E2E_OLLAMA_BASE", "http://localhost:11434/v1")
-	t.Run("ollama_nomic_embed", func(t *testing.T) {
-		kbdocRunRecall(t, fx, kbdocRealEmbedder(ollamaBase, "", kbdocEnvOr("HEX_E2E_OLLAMA_EMBED", "nomic-embed-text"), 768), nil)
+	t.Run("ollama_qwen3_embedding_8b", func(t *testing.T) {
+		model := kbdocEnvOr("HEX_E2E_OLLAMA_EMBED", "qwen3-embedding:8b")
+		kbdocRunRecall(t, fx, kbdocRealEmbedder(
+			ollamaBase, "", model, kbdocRealOllamaEmbeddingDimension(t, model),
+		), nil)
 	})
 
 	// 硅基流动多模型矩阵（需 HEX_E2E_SF_KEY）
@@ -462,6 +465,21 @@ func TestKBDocRecall_Real(t *testing.T) {
 }
 
 // ── helpers ──
+
+func kbdocRealOllamaEmbeddingDimension(t *testing.T, model string) int {
+	t.Helper()
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "qwen3-embedding:8b":
+		return 4096
+	case "nomic-embed-text", "nomic-embed-text:latest", "nomic-embed-text:v1.5":
+		return 768
+	case "mxbai-embed-large", "mxbai-embed-large:latest", "bge-m3", "bge-m3:latest":
+		return 1024
+	default:
+		t.Fatalf("Ollama embedding model %q has no trusted exact test dimension", model)
+		return 0
+	}
+}
 
 func kbdocHasTitle(fx []kbdocFixture, title string) bool {
 	for _, f := range fx {

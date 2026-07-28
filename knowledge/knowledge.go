@@ -1048,13 +1048,18 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 	// vectorRouteRan：查询时向量路是否真实跑通。嵌入/向量搜索失败（如 embedding 服务
 	// 不可用）时无语义证据可要求，严格地板退回宽召回语义，避免降级态下 RAG 全盲。
 	vectorRouteRan := false
+	executionProfile, hasExecutionProfile := m.revisionExecutionProfile(ctx)
 
 	for _, q := range queries {
 		if m.revisionSearcher != nil {
 			// Query embedding and vector scan are one revision-bound operation:
 			// both use the immutable active profile snapshot. No fallback to the
 			// legacy embedder is allowed when no active revision exists.
-			rctx, rcancel := context.WithTimeout(ragEmbedContext(ctx), queryEmbedTimeout)
+			timeout := queryEmbedTimeout
+			if hasExecutionProfile && executionProfile.QueryTimeout > 0 {
+				timeout = executionProfile.QueryTimeout
+			}
+			rctx, rcancel := context.WithTimeout(ragEmbedContext(ctx), timeout)
 			vres, ran, vErr := m.revisionSearcher.Search(rctx, q, candidateK, filter)
 			rcancel()
 			if vErr != nil {
@@ -1121,7 +1126,9 @@ func (m *Manager) searchResultsMode(ctx context.Context, query string, topK int,
 	if strictFloor && !vectorRouteRan {
 		return nil, nil
 	}
-	candidates = m.applyMinScore(candidates, strictFloor, vectorRouteRan)
+	candidates = m.applyMinScoreWithProfile(
+		candidates, strictFloor, vectorRouteRan, executionProfile, hasExecutionProfile,
+	)
 
 	// 5. 宽召回 → 重排 → 收窄（#6）；无 LLM/关闭时回退 MMR 多样性选取
 	// A configured revision runtime with no active revision is deliberately
@@ -1236,7 +1243,21 @@ func (m *Manager) fuse(resultMap map[string]*SearchResult, rankedLists []rankedL
 //
 // 两种模式下，MinScore=0 或本轮向量路未真实运行时均不施加地板。
 func (m *Manager) applyMinScore(candidates []*SearchResult, strict, vectorRouteRan bool) []*SearchResult {
+	return m.applyMinScoreWithProfile(
+		candidates, strict, vectorRouteRan, EmbeddingExecutionProfile{}, false,
+	)
+}
+
+func (m *Manager) applyMinScoreWithProfile(
+	candidates []*SearchResult,
+	strict, vectorRouteRan bool,
+	profile EmbeddingExecutionProfile,
+	hasProfile bool,
+) []*SearchResult {
 	minScore := m.cfg().MinScore
+	if strict && hasProfile && profile.AutoInjectionMinScore > 0 {
+		minScore = profile.AutoInjectionMinScore
+	}
 	if minScore <= 0 || !vectorRouteRan {
 		return candidates
 	}
@@ -1252,7 +1273,57 @@ func (m *Manager) applyMinScore(candidates []*SearchResult, strict, vectorRouteR
 		}
 		return candidates // 放宽回退：避免地板把结果清空
 	}
+	if strict && hasProfile && profile.AutoInjectionMaxResults > 0 &&
+		len(kept) > profile.AutoInjectionMaxResults {
+		sort.SliceStable(kept, func(i, j int) bool {
+			if kept[i].VectorScore != kept[j].VectorScore {
+				return kept[i].VectorScore > kept[j].VectorScore
+			}
+			return kept[i].Chunk.ID < kept[j].Chunk.ID
+		})
+		kept = kept[:profile.AutoInjectionMaxResults]
+	}
 	return kept
+}
+
+func (m *Manager) revisionExecutionProfile(
+	ctx context.Context,
+) (EmbeddingExecutionProfile, bool) {
+	if m == nil || m.revisionSearcher == nil {
+		return EmbeddingExecutionProfile{}, false
+	}
+	if profiler, ok := m.revisionSearcher.(RevisionSemanticExecutionProfiler); ok {
+		profile, active, err := profiler.EmbeddingExecutionProfile(ctx)
+		if err == nil && active {
+			return profile, true
+		}
+	}
+
+	// Compatibility with deliberately small searcher doubles and external
+	// implementations: all three facts must be present before the scoped
+	// policy is accepted.
+	timeoutProvider, hasTimeout := m.revisionSearcher.(interface {
+		QueryEmbeddingTimeout() time.Duration
+	})
+	scoreProvider, hasScore := m.revisionSearcher.(interface {
+		AutoInjectionMinScore() float64
+	})
+	maxProvider, hasMax := m.revisionSearcher.(interface {
+		AutoInjectionMaxResults() int
+	})
+	if !hasTimeout || !hasScore || !hasMax {
+		return EmbeddingExecutionProfile{}, false
+	}
+	profile := EmbeddingExecutionProfile{
+		QueryTimeout:            timeoutProvider.QueryEmbeddingTimeout(),
+		AutoInjectionMinScore:   scoreProvider.AutoInjectionMinScore(),
+		AutoInjectionMaxResults: maxProvider.AutoInjectionMaxResults(),
+	}
+	if profile.QueryTimeout <= 0 || profile.AutoInjectionMinScore <= 0 ||
+		profile.AutoInjectionMaxResults <= 0 {
+		return EmbeddingExecutionProfile{}, false
+	}
+	return profile, true
 }
 
 // rerankTopK 宽召回 → 重排 → 收窄（#6）。

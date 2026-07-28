@@ -245,6 +245,11 @@ func knowledgeEmbeddingProfileSnapshotForEntry(
 ) (knowledge.EmbeddingProfileSnapshot, error) {
 	providerID := strings.TrimSpace(entry.ProviderID)
 	model := strings.TrimSpace(entry.ModelName)
+	maxInputRunes := knowledge.DefaultEmbedMaxRunes
+	if profile, ok := knowledge.EmbeddingExecutionProfileForModel(model); ok {
+		entry.Dimension = profile.Dimension
+		maxInputRunes = profile.MaxInputRunes
+	}
 	protocol := strings.TrimSpace(entry.Protocol)
 	if protocol == "" {
 		protocol = knowledgeEmbeddingProtocolOpenAI
@@ -275,7 +280,7 @@ func knowledgeEmbeddingProfileSnapshotForEntry(
 	documentTransformHash := knowledgeEmbeddingDocumentTransformHash(
 		knowledgeEmbeddingDocumentTransformEpoch,
 		entry.DocumentPrefix,
-		knowledge.DefaultEmbedMaxRunes,
+		maxInputRunes,
 	)
 	configHash, err := knowledgeEmbeddingExecutorContractHash(knowledgeEmbeddingExecutorContract{
 		ContractVersion:    knowledgeEmbeddingExecutorContractVersion,
@@ -283,7 +288,7 @@ func knowledgeEmbeddingProfileSnapshotForEntry(
 		DocumentPrefix:     entry.DocumentPrefix,
 		EndpointIdentity:   endpoint,
 		ExactModelID:       model,
-		MaxInputRunes:      knowledge.DefaultEmbedMaxRunes,
+		MaxInputRunes:      maxInputRunes,
 		Normalization:      normalization,
 		Protocol:           protocol,
 		ProviderInstanceID: providerID,
@@ -460,6 +465,9 @@ func knowledgeEmbeddingDocumentTransformHash(transformEpoch, documentPrefix stri
 // that form part of one immutable vector space. Nomic's task prefixes are
 // defaults, not runtime guesses, so they must participate in snapshot hashes.
 func knowledgeEmbeddingPrefixes(cfg *config.Config, model string) (string, string) {
+	if profile, ok := knowledge.EmbeddingExecutionProfileForModel(model); ok {
+		return profile.QueryPrefix, profile.DocumentPrefix
+	}
 	queryPrefix, documentPrefix := "", ""
 	if cfg != nil {
 		queryPrefix = cfg.Knowledge.Embedding.QueryPrefix
@@ -664,8 +672,12 @@ func newKnowledgeEmbeddingExecutorRegistryFromEntries(
 		if _, exists := registry.executors[hash]; exists {
 			continue
 		}
+		embedder := entry.Embedder
+		if profile, ok := knowledge.EmbeddingExecutionProfileForModel(entry.Snapshot.Profile.ModelName); ok {
+			embedder = knowledge.NewTruncatingEmbedder(embedder, profile.MaxInputRunes)
+		}
 		registry.executors[hash] = knowledgeEmbeddingExecutorState{
-			snapshot: entry.Snapshot, embedder: entry.Embedder,
+			snapshot: entry.Snapshot, embedder: embedder,
 			readiness:   entry.Readiness,
 			queryPrefix: entry.QueryPrefix, documentPrefix: entry.DocumentPrefix,
 		}

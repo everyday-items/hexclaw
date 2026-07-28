@@ -287,8 +287,9 @@ func TestRAGReal_CoreRetrieval(t *testing.T) {
 	}
 
 	ollamaBase := envOr("HEX_E2E_OLLAMA_BASE", "http://localhost:11434/v1")
-	t.Run("ollama_nomic_embed", func(t *testing.T) {
-		run(t, realEmbedder(ollamaBase, "", envOr("HEX_E2E_OLLAMA_EMBED", "nomic-embed-text"), 768))
+	t.Run("ollama_qwen3_embedding_8b", func(t *testing.T) {
+		model := envOr("HEX_E2E_OLLAMA_EMBED", "qwen3-embedding:8b")
+		run(t, realEmbedder(ollamaBase, "", model, realOllamaEmbeddingDimension(t, model)))
 	})
 	if base, key, _ := envProvider("GLM"); key != "" {
 		if em := os.Getenv("HEX_E2E_GLM_EMBED"); em != "" {
@@ -313,7 +314,11 @@ func TestRAGReal_FullPipeline(t *testing.T) {
 	}
 	httpc := &http.Client{Timeout: 240 * time.Second}
 	ollamaBase := envOr("HEX_E2E_OLLAMA_BASE", "http://localhost:11434/v1")
-	nomic := realEmbedder(ollamaBase, "", envOr("HEX_E2E_OLLAMA_EMBED", "nomic-embed-text"), 768)
+	localEmbeddingModel := envOr("HEX_E2E_OLLAMA_EMBED", "qwen3-embedding:8b")
+	localEmbedding := realEmbedder(
+		ollamaBase, "", localEmbeddingModel,
+		realOllamaEmbeddingDimension(t, localEmbeddingModel),
+	)
 	qc := e2eQueries[0] // 只跑第一条，控时
 
 	run := func(t *testing.T, embedder hexagon.VectorEmbedder, llm RerankLLM) {
@@ -354,7 +359,7 @@ func TestRAGReal_FullPipeline(t *testing.T) {
 	// 本地 qwen 仅在 HEX_E2E_RUN_OLLAMA_CHAT=1 时跑（本机 9B 常冷启动超时，默认不跑免浪费时间）
 	if os.Getenv("HEX_E2E_RUN_OLLAMA_CHAT") == "1" {
 		t.Run("ollama_qwen", func(t *testing.T) {
-			run(t, nomic, &httpChatLLM{base: ollamaBase, model: envOr("HEX_E2E_OLLAMA_CHAT", "qwen3.5:9b"), client: httpc})
+			run(t, localEmbedding, &httpChatLLM{base: ollamaBase, model: envOr("HEX_E2E_OLLAMA_CHAT", "qwen3.5:9b"), client: httpc})
 		})
 	}
 	if base, key, model := envProvider("SF"); key != "" {
@@ -397,6 +402,21 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func realOllamaEmbeddingDimension(t *testing.T, model string) int {
+	t.Helper()
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "qwen3-embedding:8b":
+		return 4096
+	case "nomic-embed-text", "nomic-embed-text:latest", "nomic-embed-text:v1.5":
+		return 768
+	case "mxbai-embed-large", "mxbai-embed-large:latest", "bge-m3", "bge-m3:latest":
+		return 1024
+	default:
+		t.Fatalf("Ollama embedding model %q has no trusted exact test dimension", model)
+		return 0
+	}
 }
 
 func envProvider(name string) (base, key, model string) {

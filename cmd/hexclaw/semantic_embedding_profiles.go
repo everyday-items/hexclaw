@@ -337,10 +337,12 @@ func knowledgeEmbeddingModelCandidates(ctx context.Context, cfg *config.Config) 
 		}
 	}
 
-	// Legacy local Nomic was configured outside model_specs. Keep that exact,
-	// trusted contract during migration; no analogous cloud inference exists.
+	// Legacy trusted local embeddings may be configured outside model_specs.
+	// Keep their exact built-in dimension contract during migration; no
+	// analogous cloud inference exists.
 	legacyPlan := resolveKnowledgeEmbeddingPlan(ctx, cfg)
-	if legacyPlan.Ollama && strings.Contains(strings.ToLower(legacyPlan.Model), "nomic-embed-text") {
+	if legacyPlan.Ollama && knowledgeEmbeddingDimension(legacyPlan.Model) > 0 &&
+		knowledge.IsEmbeddingModelName(legacyPlan.Model) {
 		if provider, ok := cfg.LLM.Providers[legacyPlan.Provider]; ok {
 			add(knowledgeEmbeddingModelCandidate{
 				providerKey: legacyPlan.Provider, provider: provider, model: legacyPlan.Model,

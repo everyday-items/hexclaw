@@ -22,6 +22,7 @@ type knowledgeEmbeddingPlan struct {
 }
 
 const defaultKnowledgeOllamaEmbeddingBaseURL = "http://localhost:11434/v1"
+const defaultKnowledgeOllamaEmbeddingModel = "qwen3-embedding:8b"
 const knowledgeOllamaEmbeddingDummyAPIKey = "ollama"
 
 // knowledgeEmbeddingEffectiveBaseURL keeps discovery, provider construction,
@@ -94,6 +95,9 @@ func knowledgeEmbeddingDimension(model string) int {
 		return 2048
 	case "nomic-embed-text", "nomic-embed-text:latest", "nomic-embed-text:v1.5":
 		return 768
+	case "qwen3-embedding", "qwen3-embedding:latest", "qwen3-embedding:8b",
+		"qwen3-embedding:8b-q4_k_m":
+		return 4096
 	case "mxbai-embed-large", "mxbai-embed-large:latest",
 		"baai/bge-m3", "baai/bge-m3:latest", "bge-m3", "bge-m3:latest":
 		return 1024
@@ -168,7 +172,7 @@ func resolveKnowledgeEmbeddingPlan(ctx context.Context, cfg *config.Config) know
 			if requestedModel == "" {
 				requestedModel = detected
 				if requestedModel == "" {
-					requestedModel = "nomic-embed-text"
+					requestedModel = defaultKnowledgeOllamaEmbeddingModel
 				}
 			}
 			return knowledgeEmbeddingPlan{
@@ -215,7 +219,7 @@ func resolveKnowledgeEmbeddingPlan(ctx context.Context, cfg *config.Config) know
 			model = detected
 		}
 		if model == "" {
-			model = "nomic-embed-text"
+			model = defaultKnowledgeOllamaEmbeddingModel
 		}
 		plan := knowledgeEmbeddingPlan{
 			Provider:         name,

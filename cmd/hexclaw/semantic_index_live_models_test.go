@@ -21,11 +21,13 @@ import (
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/knowledge"
+	"github.com/hexagon-codes/hexclaw/storage/migrate"
 )
 
 const (
-	semanticLiveModelsGate        = "HEX_SEMANTIC_LIVE_MODELS"
-	semanticLiveLocalCapacityGate = "HEX_SEMANTIC_LIVE_LOCAL_CAPACITY"
+	semanticLiveModelsGate         = "HEX_SEMANTIC_LIVE_MODELS"
+	semanticLiveLocalCapacityGate  = "HEX_SEMANTIC_LIVE_LOCAL_CAPACITY"
+	semanticLiveLocalRetrievalGate = "HEX_SEMANTIC_LIVE_LOCAL_RETRIEVAL"
 
 	semanticLiveLocalProviderEnv = "HEX_SEMANTIC_LIVE_LOCAL_PROVIDER"
 	semanticLiveLocalBaseURLEnv  = "HEX_SEMANTIC_LIVE_LOCAL_BASE_URL"
@@ -35,16 +37,14 @@ const (
 	semanticLiveCloudBaseURLEnv  = "HEX_SEMANTIC_LIVE_CLOUD_BASE_URL"
 	semanticLiveCloudModelsEnv   = "HEX_SEMANTIC_LIVE_CLOUD_EMBEDDING_MODELS"
 
-	semanticLiveDefaultLocalModel    = "nomic-embed-text:latest"
+	semanticLiveDefaultLocalModel    = "qwen3-embedding:8b"
 	semanticLiveDefaultCloudProvider = "OpenRouter"
 	semanticLiveDefaultCloudBaseURL  = "https://openrouter.ai/api/v1"
 	semanticLiveLaneTimeout          = 90 * time.Second
 
-	semanticLiveLocalCapacityBatchSize   = 64
-	semanticLiveLocalCapacityBatchCount  = 2
-	semanticLiveLocalCapacityDimension   = 768
-	semanticLiveLocalCapacityTimeout     = 150 * time.Second
-	semanticLiveLocalCapacityBatchBudget = 60 * time.Second
+	semanticLiveLocalCapacityBatchCount = 2
+	semanticLiveLocalCapacityTimeout    = 270 * time.Second
+	semanticLiveLocalRetrievalTimeout   = 5 * time.Minute
 )
 
 var semanticLiveDefaultCloudModels = []string{
@@ -113,11 +113,222 @@ func TestSemanticIndexLiveLocalCapacity(t *testing.T) {
 	semanticLiveRunLocalCapacity(t)
 }
 
+// TestSemanticIndexLiveLocalRevisionRetrieval is the real production-path
+// closure gate for BUG-20260728-012. Unlike the legacy RAG real harness, it
+// builds and publishes an immutable revision before querying through
+// Manager + SQLiteRevisionSemanticSearcher. The test uses only a temporary
+// SQLite database and a preinstalled loopback Ollama model; it never loads the
+// saved desktop config, pulls/deletes a model, calls chat, or writes user data.
+func TestSemanticIndexLiveLocalRevisionRetrieval(t *testing.T) {
+	if strings.TrimSpace(os.Getenv(semanticLiveLocalRetrievalGate)) != "1" {
+		t.Skip("set HEX_SEMANTIC_LIVE_LOCAL_RETRIEVAL=1 to run the real local revision-scoped retrieval gate")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), semanticLiveLocalRetrievalTimeout)
+	defer cancel()
+
+	// Force the isolated loopback plan even if another live test selected a
+	// provider by name. The base URL and exact model remain explicitly
+	// overridable through the existing local-only live-test variables.
+	t.Setenv(semanticLiveLocalProviderEnv, "")
+	laneCfg, plan, provider := semanticLiveLocalPlan(t, ctx, config.DefaultConfig())
+	if plan.Model != "qwen3-embedding:8b" || !plan.Ollama {
+		t.Fatalf("revision retrieval resolved provider=%q model=%q ollama=%t, want local qwen3-embedding:8b",
+			plan.Provider, plan.Model, plan.Ollama)
+	}
+
+	counter := &semanticLiveEmbeddingCounter{}
+	bundle := buildKnowledgeEmbeddingRuntimeProfiles(
+		ctx, laneCfg, &egress.Policy{}, newKnowledgeSemanticRuntimeGate(),
+		withKnowledgeEmbeddingHTTPClientObserver(func(providerKey, model string, client *http.Client) {
+			if providerKey == plan.Provider && model == plan.Model {
+				counter.next = client.Transport
+				client.Transport = counter
+			}
+		}),
+	)
+
+	db, _ := newKnowledgeSemanticRuntimeTestDB(t)
+	// The shared semantic-runtime helper intentionally stops at v23 for unit
+	// tests. Revision search also consumes the production Knowledge provenance
+	// schema introduced by the v24/v26/v27/v28 chain and v46. Apply those exact
+	// migrations without the unrelated K12 migrations whose base tables do not
+	// belong to this isolated Knowledge-only database.
+	if err := migrate.Run(ctx, db, []migrate.Migration{
+		migrate.KnowledgeIngestV24,
+		migrate.KnowledgeIngestGenerationsV26,
+		migrate.KnowledgeDocumentScopeV27,
+		migrate.KnowledgeIngestCheckpointV28,
+		migrate.KnowledgeIngestExecutionV46,
+	}); err != nil {
+		t.Fatalf("apply production Knowledge migrations to isolated test database: %v", err)
+	}
+	fixtures := []struct {
+		id      string
+		title   string
+		content string
+	}{
+		{
+			id:      "bug012-live-photosynthesis",
+			title:   "植物怎样制造养分",
+			content: "绿色植物通过叶绿素吸收太阳光，把二氧化碳和水转化为有机物，并释放氧气。",
+		},
+		{
+			id:      "bug012-live-goroutine",
+			title:   "Go 并发",
+			content: "Go 语言使用 goroutine 执行并发任务，并通过 channel 在协程之间传递消息。",
+		},
+		{
+			id:      "bug012-live-canal",
+			title:   "京杭大运河",
+			content: "京杭大运河贯通中国南北，历史上承担粮食运输和区域交流的重要功能。",
+		},
+	}
+	for i, fixture := range fixtures {
+		if _, err := db.ExecContext(ctx, `INSERT INTO kb_documents
+			(id,title,content,source,chunk_count,status,deleted,error_message,source_type)
+			VALUES(?,?,?,?,1,'indexed',0,'','manual')`,
+			fixture.id, fixture.title, fixture.content, "bug012-live"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO kb_chunks
+			(id,doc_id,content,chunk_index,embedding)
+			VALUES(?,?,?,?,NULL)`,
+			fmt.Sprintf("%s-chunk-%d", fixture.id, i), fixture.id, fixture.content, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runtime, err := setupKnowledgeSemanticIndex(
+		ctx, db, bundle.Resolver, bundle.Registry, "bug012-live-revision-worker",
+	)
+	if err != nil {
+		t.Fatalf("setup production semantic runtime: %v", err)
+	}
+	before, err := runtime.Service.GetPolicy(ctx, knowledgeDesktopOwnerID, knowledgeDefaultCorpusID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.ActiveRevision != nil || before.DesiredRevision == nil {
+		t.Fatalf("pre-worker policy active=%+v desired=%+v, want staged revision only",
+			before.ActiveRevision, before.DesiredRevision)
+	}
+
+	indexStarted := time.Now()
+	processed, err := runtime.Worker.RunOnce(ctx)
+	indexElapsed := time.Since(indexStarted)
+	if err != nil || !processed {
+		t.Fatalf("production revision worker processed=%t elapsed=%v err=%v",
+			processed, indexElapsed, err)
+	}
+
+	after, err := runtime.Service.GetPolicy(ctx, knowledgeDesktopOwnerID, knowledgeDefaultCorpusID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ActiveRevision == nil || after.DesiredRevision != nil ||
+		after.ActiveRevision.State != knowledge.VectorIndexReady ||
+		after.ActiveRevision.Profile.ModelName != plan.Model ||
+		after.ActiveRevision.Profile.Dimension != 4096 ||
+		after.ActiveRevision.Profile.Location != knowledge.ProviderLocationLocal {
+		t.Fatalf("published policy active=%+v desired=%+v, want ready local Qwen 4096 revision",
+			after.ActiveRevision, after.DesiredRevision)
+	}
+
+	var vectorCount, minDimension, maxDimension, revisionCount, profileHashCount int
+	var minModel, maxModel string
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*), MIN(dimension), MAX(dimension),
+			COUNT(DISTINCT revision_id), COUNT(DISTINCT profile_config_hash),
+			MIN(model_name), MAX(model_name)
+			FROM kb_revision_vectors WHERE revision_id=?`,
+		after.ActiveRevision.RevisionID,
+	).Scan(
+		&vectorCount, &minDimension, &maxDimension,
+		&revisionCount, &profileHashCount, &minModel, &maxModel,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if vectorCount != len(fixtures) || minDimension != 4096 || maxDimension != 4096 ||
+		revisionCount != 1 || profileHashCount != 1 ||
+		minModel != plan.Model || maxModel != plan.Model {
+		t.Fatalf("revision vectors count=%d dimension=%d..%d revisions=%d hashes=%d models=%q..%q",
+			vectorCount, minDimension, maxDimension, revisionCount, profileHashCount, minModel, maxModel)
+	}
+
+	store := knowledge.NewSQLiteStore(db)
+	hybrid := knowledge.DefaultHybridConfig()
+	hybrid.ExpandEnabled = false
+	hybrid.RerankEnabled = false
+	hybrid.UseRRF = false
+	manager := knowledge.NewManager(
+		store, store, nil,
+		knowledge.WithHybridConfig(hybrid),
+		knowledge.WithRevisionSemanticSearcher(runtime.Searcher),
+	)
+
+	queryStarted := time.Now()
+	_, hits, err := manager.QueryHits(ctx, "植物怎样利用阳光制造养分并释放氧气？", 3)
+	queryElapsed := time.Since(queryStarted)
+	if err != nil {
+		t.Fatalf("production revision-scoped QueryHits elapsed=%v: %v", queryElapsed, err)
+	}
+	if len(hits) != 1 || hits[0].DocID != fixtures[0].id {
+		t.Fatalf("production revision-scoped hits=%+v, want strict Top-1 %q", hits, fixtures[0].id)
+	}
+
+	records := counter.snapshot()
+	documentRequests, documentInputs, queryRequests := 0, 0, 0
+	for _, record := range records {
+		if record.model != plan.Model || record.httpStatus != http.StatusOK {
+			t.Fatalf("embedding record model=%q status=%d, want %q/200",
+				record.model, record.httpStatus, plan.Model)
+		}
+		if len(record.inputValues) == 1 &&
+			strings.HasPrefix(record.inputValues[0], bug20260728QwenQueryPrefix) {
+			queryRequests++
+			if !record.hasDeadline ||
+				record.deadlineRemaining < 55*time.Second ||
+				record.deadlineRemaining > 60*time.Second {
+				t.Fatalf("query request deadline=%v, want production profile about 60s",
+					record.deadlineRemaining)
+			}
+			continue
+		}
+		documentRequests++
+		documentInputs += len(record.inputValues)
+		if !record.hasDeadline ||
+			record.deadlineRemaining < 115*time.Second ||
+			record.deadlineRemaining > 120*time.Second {
+			t.Fatalf("document request deadline=%v, want production profile about 120s",
+				record.deadlineRemaining)
+		}
+		for _, input := range record.inputValues {
+			if strings.HasPrefix(input, bug20260728QwenQueryPrefix) {
+				t.Fatal("document embedding unexpectedly received the Qwen query instruction")
+			}
+		}
+	}
+	if documentRequests != 2 || documentInputs != len(fixtures) || queryRequests != 1 {
+		t.Fatalf("embedding route documents=%d requests/%d inputs queries=%d, want 2/3/1; records=%+v",
+			documentRequests, documentInputs, queryRequests, records)
+	}
+	if got := counter.chatRequests.Load(); got != 0 {
+		t.Fatalf("chat requests=%d, want zero", got)
+	}
+
+	t.Logf(
+		"BUG012 real production revision retrieval passed: provider=%q model=%q revision=%q vectors=%d dimension=4096 index_elapsed=%v query_elapsed=%v top1_doc=%q top1_score=%.4f embedding_requests=%d chat_requests=0 http_statuses=%v",
+		plan.Provider, plan.Model, after.ActiveRevision.RevisionID, vectorCount,
+		indexElapsed, queryElapsed, hits[0].DocID, hits[0].Score, len(records), counter.statuses(),
+	)
+	_ = provider // Provider is resolved only from the isolated in-memory local plan.
+}
+
 // semanticLiveRunLocalCapacity closes the gap between a three-input smoke and
-// the production worker's default 64-chunk rebuild batch. The repository is an
+// the production worker's calibrated local-Qwen batch. The repository is an
 // in-memory protocol fake: the real user database and saved configuration are
 // never mutated. The resolver, registry, purpose transforms, guarded provider
-// transport, Nomic model, and SemanticIndexWorker are all production objects.
+// transport, selected embedding model, and SemanticIndexWorker are all production objects.
 func semanticLiveRunLocalCapacity(t *testing.T) {
 	t.Helper()
 
@@ -126,17 +337,21 @@ func semanticLiveRunLocalCapacity(t *testing.T) {
 		t.Fatal("load saved HexClaw configuration failed (details withheld to protect credentials)")
 	}
 	// This aggregate harness budget permits startup plus two sequential worker
-	// calls. EmbeddingTimeout remains zero below, so every individual provider
-	// call still uses the worker's documentEmbeddingBudget(64), currently 60s.
+	// calls at the calibrated model-scoped budget.
 	ctx, cancel := context.WithTimeout(context.Background(), semanticLiveLocalCapacityTimeout)
 	defer cancel()
 
 	laneCfg, plan, provider := semanticLiveLocalPlan(t, ctx, cfg)
-	if dimension := knowledgeEmbeddingDimension(plan.Model); dimension != semanticLiveLocalCapacityDimension {
-		t.Fatalf("local capacity model dimension=%d, want %d", dimension, semanticLiveLocalCapacityDimension)
+	expectedDimension := knowledgeEmbeddingDimension(plan.Model)
+	if expectedDimension <= 0 {
+		t.Fatalf("local capacity model %q has no trusted exact embedding dimension", plan.Model)
 	}
 	if _, err := newKnowledgeEmbeddingProviderHTTPClient(plan, provider); err != nil {
 		t.Fatalf("provider %q production embedding transport rejected its endpoint: %v", plan.Provider, err)
+	}
+	executionProfile, ok := knowledge.EmbeddingExecutionProfileForModel(plan.Model)
+	if !ok {
+		t.Fatalf("local capacity model %q has no calibrated execution profile", plan.Model)
 	}
 
 	counter := &semanticLiveEmbeddingCounter{}
@@ -160,7 +375,7 @@ func semanticLiveRunLocalCapacity(t *testing.T) {
 	if profile.ProviderName != plan.Provider || profile.ModelName != plan.Model ||
 		profile.Location != knowledge.ProviderLocationLocal ||
 		profile.Availability != knowledge.ProfileAvailabilityInstalled ||
-		profile.Dimension != semanticLiveLocalCapacityDimension || profile.Capability != "embedding" {
+		profile.Dimension != expectedDimension || profile.Capability != "embedding" {
 		t.Fatalf(
 			"local capacity catalog mismatch: provider=%q model=%q location=%q availability=%q dimension=%d capability=%q",
 			profile.ProviderName, profile.ModelName, profile.Location, profile.Availability,
@@ -179,20 +394,23 @@ func semanticLiveRunLocalCapacity(t *testing.T) {
 	}
 
 	inputs := semanticLiveCapacityInputs(
-		semanticLiveLocalCapacityBatchSize * semanticLiveLocalCapacityBatchCount,
+		executionProfile.BatchMaxCount * semanticLiveLocalCapacityBatchCount,
 	)
-	repository := newSemanticLiveCapacityRepository(snapshot, inputs)
+	repository := newSemanticLiveCapacityRepository(
+		snapshot, inputs, expectedDimension, executionProfile.BatchMaxCount,
+	)
 	worker := knowledge.NewSemanticIndexWorker(
 		repository,
 		bundle.Registry,
 		knowledge.SemanticIndexWorkerConfig{
-			OwnerID:       knowledgeDesktopOwnerID,
-			CorpusID:      knowledgeDefaultCorpusID,
-			WorkerID:      "semantic-live-local-capacity-worker",
-			BatchSize:     semanticLiveLocalCapacityBatchSize,
+			OwnerID:  knowledgeDesktopOwnerID,
+			CorpusID: knowledgeDefaultCorpusID,
+			WorkerID: "semantic-live-local-capacity-worker",
+			// Deliberately larger than the calibrated limit: the worker must
+			// shape this request from the immutable model profile.
+			BatchSize:     64,
 			LeaseDuration: 5 * time.Minute,
-			// Zero deliberately exercises documentEmbeddingBudget(batch size),
-			// exactly as the production worker default does.
+			// Zero deliberately exercises the model-scoped production budget.
 			EmbeddingTimeout: 0,
 		},
 	)
@@ -213,7 +431,7 @@ func semanticLiveRunLocalCapacity(t *testing.T) {
 		t.Fatalf(
 			"local capacity durable boundary: commit_sizes=%v embedded=%d completed=%v, want [%d %d]/%d/true",
 			commitSizes, embedded, completed,
-			semanticLiveLocalCapacityBatchSize, semanticLiveLocalCapacityBatchSize, len(inputs),
+			executionProfile.BatchMaxCount, executionProfile.BatchMaxCount, len(inputs),
 		)
 	}
 
@@ -230,10 +448,10 @@ func semanticLiveRunLocalCapacity(t *testing.T) {
 				i, i-1,
 			)
 		}
-		if record.model != plan.Model || record.inputs != semanticLiveLocalCapacityBatchSize {
+		if record.model != plan.Model || record.inputs != executionProfile.BatchMaxCount {
 			t.Fatalf(
 				"local capacity request[%d]: model=%q inputs=%d, want %q/%d",
-				i, record.model, record.inputs, plan.Model, semanticLiveLocalCapacityBatchSize,
+				i, record.model, record.inputs, plan.Model, executionProfile.BatchMaxCount,
 			)
 		}
 		if record.httpStatus != http.StatusOK {
@@ -243,11 +461,11 @@ func semanticLiveRunLocalCapacity(t *testing.T) {
 			t.Fatalf("local capacity request[%d] did not record a positive latency", i)
 		}
 		if !record.hasDeadline ||
-			record.deadlineRemaining < semanticLiveLocalCapacityBatchBudget-time.Second ||
-			record.deadlineRemaining > semanticLiveLocalCapacityBatchBudget+time.Second {
+			record.deadlineRemaining < executionProfile.BatchTimeout-time.Second ||
+			record.deadlineRemaining > executionProfile.BatchTimeout+time.Second {
 			t.Fatalf(
-				"local capacity request[%d] deadline budget=%s present=%v, want worker documentEmbeddingBudget(64)=%s±1s",
-				i, record.deadlineRemaining, record.hasDeadline, semanticLiveLocalCapacityBatchBudget,
+				"local capacity request[%d] deadline budget=%s present=%v, want calibrated profile budget=%s±1s",
+				i, record.deadlineRemaining, record.hasDeadline, executionProfile.BatchTimeout,
 			)
 		}
 		latencies = append(latencies, record.duration.Round(time.Millisecond))
@@ -259,8 +477,8 @@ func semanticLiveRunLocalCapacity(t *testing.T) {
 	}
 	t.Logf(
 		"semantic local capacity passed: provider=%q model=%q batches=%d batch_size=%d vectors=%d dimension=%d embedding_requests=%d chat_requests=%d latencies=%v request_deadline_budgets=%v http_statuses=%v",
-		plan.Provider, plan.Model, len(records), semanticLiveLocalCapacityBatchSize,
-		embedded, semanticLiveLocalCapacityDimension, len(records), chatRequests,
+		plan.Provider, plan.Model, len(records), executionProfile.BatchMaxCount,
+		embedded, expectedDimension, len(records), chatRequests,
 		latencies, deadlineBudgets, counter.statuses(),
 	)
 }
@@ -319,11 +537,15 @@ type semanticLiveCapacityRepository struct {
 	commitSizes []int
 	embedded    int64
 	completed   bool
+	dimension   int
+	batchSize   int
 }
 
 func newSemanticLiveCapacityRepository(
 	snapshot knowledge.EmbeddingProfileSnapshot,
 	inputs []knowledge.RevisionChunkInput,
+	dimension int,
+	batchSize int,
 ) *semanticLiveCapacityRepository {
 	now := time.Now().UTC()
 	expiresAt := now.Add(5 * time.Minute)
@@ -341,8 +563,10 @@ func newSemanticLiveCapacityRepository(
 			RevisionID: "capacity-revision", PolicyVersion: 1, ContentVersion: 1,
 			Snapshot: snapshot,
 		},
-		inputs:   append([]knowledge.RevisionChunkInput(nil), inputs...),
-		inFlight: make(map[string]struct{}),
+		inputs:    append([]knowledge.RevisionChunkInput(nil), inputs...),
+		inFlight:  make(map[string]struct{}),
+		dimension: dimension,
+		batchSize: batchSize,
 	}
 }
 
@@ -383,8 +607,8 @@ func (r *semanticLiveCapacityRepository) ListRevisionChunkInputs(
 	after *knowledge.RevisionChunkCursor,
 	limit int,
 ) ([]knowledge.RevisionChunkInput, error) {
-	if limit != semanticLiveLocalCapacityBatchSize {
-		return nil, fmt.Errorf("capacity worker batch size=%d, want %d", limit, semanticLiveLocalCapacityBatchSize)
+	if limit != r.batchSize {
+		return nil, fmt.Errorf("capacity worker batch size=%d, want %d", limit, r.batchSize)
 	}
 	start := 0
 	if after != nil {
@@ -411,9 +635,9 @@ func (r *semanticLiveCapacityRepository) CreateEmbeddingBatchManifest(
 ) (knowledge.EmbeddingBatchManifest, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(manifest.Chunks) != semanticLiveLocalCapacityBatchSize {
+	if len(manifest.Chunks) != r.batchSize {
 		return knowledge.EmbeddingBatchManifest{}, fmt.Errorf(
-			"capacity manifest chunks=%d, want %d", len(manifest.Chunks), semanticLiveLocalCapacityBatchSize,
+			"capacity manifest chunks=%d, want %d", len(manifest.Chunks), r.batchSize,
 		)
 	}
 	r.batchNumber++
@@ -463,17 +687,17 @@ func (r *semanticLiveCapacityRepository) CommitEmbeddingBatch(
 		return fmt.Errorf("capacity batch %q committed before begin", commit.BatchID)
 	}
 	delete(r.inFlight, commit.BatchID)
-	if len(commit.Vectors) != semanticLiveLocalCapacityBatchSize {
+	if len(commit.Vectors) != r.batchSize {
 		return fmt.Errorf(
 			"capacity batch %q vectors=%d, want %d",
-			commit.BatchID, len(commit.Vectors), semanticLiveLocalCapacityBatchSize,
+			commit.BatchID, len(commit.Vectors), r.batchSize,
 		)
 	}
 	for i, vector := range commit.Vectors {
-		if len(vector.Values) != semanticLiveLocalCapacityDimension {
+		if len(vector.Values) != r.dimension {
 			return fmt.Errorf(
 				"capacity batch %q vector[%d] dimension=%d, want %d",
-				commit.BatchID, i, len(vector.Values), semanticLiveLocalCapacityDimension,
+				commit.BatchID, i, len(vector.Values), r.dimension,
 			)
 		}
 		var squaredNorm float64
@@ -673,7 +897,7 @@ func semanticLiveLocalPlan(
 	provider.ModelSpecs = []config.LLMProviderModelSpec{{
 		ID: model, Capabilities: []string{config.LLMModelCapabilityEmbedding},
 		Embedding: &config.LLMEmbeddingModelSpec{
-			Protocol: config.LLMEmbeddingProtocolOllama, Dimension: 768, Normalization: "l2",
+			Protocol: config.LLMEmbeddingProtocolOllama, Dimension: knowledgeEmbeddingDimension(model), Normalization: "l2",
 		},
 	}}
 	cfg.LLM.Providers = map[string]config.LLMProviderConfig{plan.Provider: provider}
@@ -850,6 +1074,7 @@ type semanticLiveEmbeddingCounter struct {
 type semanticLiveEmbeddingRequest struct {
 	model             string
 	inputs            int
+	inputValues       []string
 	httpStatus        int
 	startedAt         time.Time
 	finishedAt        time.Time
@@ -883,6 +1108,7 @@ func (t *semanticLiveEmbeddingCounter) RoundTrip(req *http.Request) (*http.Respo
 					var inputs []string
 					if json.Unmarshal(payload.Input, &inputs) == nil {
 						record.inputs = len(inputs)
+						record.inputValues = append([]string(nil), inputs...)
 					}
 				}
 			}
