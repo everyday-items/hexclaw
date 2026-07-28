@@ -2,13 +2,16 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hexagon-codes/hexagon"
@@ -16,6 +19,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
+	"github.com/hexagon-codes/hexclaw/storage"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
@@ -49,6 +53,7 @@ type LLMProviderConfigResponse struct {
 	Enabled               *bool                                `json:"enabled,omitempty"`
 	KeepAlive             string                               `json:"keep_alive,omitempty"`
 	NumCtx                int                                  `json:"num_ctx,omitempty"`
+	ProbeReceipt          *LLMProviderProbeReceiptResponse     `json:"probe_receipt,omitempty"`
 }
 
 // LLMConfigUpdateRequest PUT /api/v1/config/llm 请求
@@ -83,6 +88,7 @@ type LLMProviderConfigUpdateItem struct {
 }
 
 type llmConnectionTestProvider struct {
+	ProviderInstanceID   string                              `json:"provider_instance_id,omitempty"`
 	Type                 string                              `json:"type"`
 	BaseURL              string                              `json:"base_url"`
 	APIKey               string                              `json:"api_key"`
@@ -96,11 +102,26 @@ type LLMConnectionTestRequest struct {
 }
 
 type LLMConnectionTestResponse struct {
-	OK        bool   `json:"ok"`
-	Message   string `json:"message"`
-	Provider  string `json:"provider,omitempty"`
-	Model     string `json:"model,omitempty"`
-	LatencyMS int64  `json:"latency_ms,omitempty"`
+	OK             bool   `json:"ok"`
+	Message        string `json:"message"`
+	Provider       string `json:"provider,omitempty"`
+	Model          string `json:"model,omitempty"`
+	LatencyMS      int64  `json:"latency_ms,omitempty"`
+	Persisted      bool   `json:"persisted"`
+	TestedAt       int64  `json:"tested_at"`
+	ProbeStartedAt int64  `json:"probe_started_at"`
+}
+
+// LLMProviderProbeReceiptResponse is the non-secret projection of the latest
+// explicit test fact. It represents a historical receipt, not live monitoring.
+type LLMProviderProbeReceiptResponse struct {
+	ProviderInstanceID string `json:"provider_instance_id"`
+	Outcome            string `json:"outcome"`
+	TestedAt           int64  `json:"tested_at"`
+	ProbeStartedAt     int64  `json:"probe_started_at"`
+	LatencyMS          int64  `json:"latency_ms"`
+	Locality           string `json:"locality"`
+	Message            string `json:"message"`
 }
 
 type completionProvider interface {
@@ -302,6 +323,255 @@ var llmTestProviderFactory = func(cfg llmConnectionTestProvider) completionProvi
 	})
 }
 
+const maxProviderProbeReceiptMessageRunes = 512
+
+var providerProbeStartedAtClock atomic.Int64
+
+type providerProbePersistenceCandidate struct {
+	providerInstanceID string
+	configFingerprint  string
+	locality           string
+	descriptor         llmConnectionTestProvider
+}
+
+type providerProbeFingerprintPayload struct {
+	ProviderType         string `json:"provider_type"`
+	BaseURL              string `json:"base_url"`
+	APIKeyRevision       string `json:"api_key_revision"`
+	Model                string `json:"model"`
+	Locality             string `json:"locality"`
+	PrivateNetworkHost   string `json:"private_network_host"`
+	PrivateNetworkAccess bool   `json:"private_network_access"`
+}
+
+func nextProviderProbeStartedAt() int64 {
+	now := time.Now().UnixMilli()
+	for {
+		previous := providerProbeStartedAtClock.Load()
+		next := now
+		if next <= previous {
+			next = previous + 1
+		}
+		if providerProbeStartedAtClock.CompareAndSwap(previous, next) {
+			return next
+		}
+	}
+}
+
+func normalizeProviderProbeBaseURL(raw string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return trimmed
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	return strings.TrimRight(parsed.String(), "/")
+}
+
+func normalizeProviderProbeLocality(locality string) string {
+	normalized := strings.ToLower(strings.TrimSpace(locality))
+	if normalized == "" {
+		return config.ProviderLocalityAuto
+	}
+	return normalized
+}
+
+func normalizeProviderProbePrivateHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+}
+
+func providerProbeConfigFingerprint(
+	providerType string,
+	provider config.LLMProviderConfig,
+) string {
+	apiKeyRevision := sha256.Sum256([]byte(provider.APIKey))
+	privateHost := ""
+	if provider.PrivateNetworkAccess.Allowed {
+		privateHost = normalizeProviderProbePrivateHost(provider.PrivateNetworkAccess.Host)
+	}
+	payload := providerProbeFingerprintPayload{
+		ProviderType:         strings.ToLower(strings.TrimSpace(providerType)),
+		BaseURL:              normalizeProviderProbeBaseURL(provider.BaseURL),
+		APIKeyRevision:       fmt.Sprintf("%x", apiKeyRevision),
+		Model:                strings.TrimSpace(provider.Model),
+		Locality:             normalizeProviderProbeLocality(provider.Locality),
+		PrivateNetworkHost:   privateHost,
+		PrivateNetworkAccess: provider.PrivateNetworkAccess.Allowed,
+	}
+	canonical, _ := json.Marshal(payload)
+	digest := sha256.Sum256(canonical)
+	return fmt.Sprintf("%x", digest)
+}
+
+func resolvedProviderProbeLocality(
+	providerType string,
+	provider config.LLMProviderConfig,
+) string {
+	switch normalizeProviderProbeLocality(provider.Locality) {
+	case config.ProviderLocalityLocal:
+		return config.ProviderLocalityLocal
+	case config.ProviderLocalityCloud:
+		return config.ProviderLocalityCloud
+	}
+	if config.IsLocalLLMProviderNamed(providerType, provider) {
+		return config.ProviderLocalityLocal
+	}
+	return config.ProviderLocalityCloud
+}
+
+func sanitizeProviderProbeMessage(message string, secrets ...string) string {
+	sanitized := strings.TrimSpace(message)
+	for _, secret := range secrets {
+		if secret = strings.TrimSpace(secret); secret != "" {
+			sanitized = strings.ReplaceAll(sanitized, secret, "[REDACTED]")
+		}
+	}
+	runes := []rune(sanitized)
+	if len(runes) > maxProviderProbeReceiptMessageRunes {
+		sanitized = string(runes[:maxProviderProbeReceiptMessageRunes]) + "…"
+	}
+	return sanitized
+}
+
+func canonicalProviderProbeType(
+	providerKey string,
+	provider config.LLMProviderConfig,
+) string {
+	if compatible := strings.ToLower(strings.TrimSpace(provider.Compatible)); compatible != "" {
+		return compatible
+	}
+	normalizedKey := strings.ToLower(strings.TrimSpace(providerKey))
+	switch {
+	case strings.Contains(normalizedKey, "ollama"):
+		return "ollama"
+	case strings.Contains(normalizedKey, "anthropic"):
+		return "anthropic"
+	case strings.Contains(normalizedKey, "openai"):
+		return "openai"
+	default:
+		return normalizedKey
+	}
+}
+
+func (s *Server) providerProbePersistenceCandidate(
+	req llmConnectionTestProvider,
+) (providerProbePersistenceCandidate, bool) {
+	providerInstanceID := strings.TrimSpace(req.ProviderInstanceID)
+	if providerInstanceID == "" {
+		return providerProbePersistenceCandidate{}, false
+	}
+	llmCfg := s.persistedLLMConfig()
+	for providerKey, saved := range llmCfg.Providers {
+		effectiveProviderID := config.EffectiveProviderInstanceID(providerKey, saved)
+		if effectiveProviderID == "" || effectiveProviderID != providerInstanceID {
+			continue
+		}
+		providerType := canonicalProviderProbeType(providerKey, saved)
+		savedFingerprint := providerProbeConfigFingerprint(providerType, saved)
+		return providerProbePersistenceCandidate{
+			providerInstanceID: providerInstanceID,
+			configFingerprint:  savedFingerprint,
+			locality:           resolvedProviderProbeLocality(providerType, saved),
+			descriptor: llmConnectionTestProvider{
+				ProviderInstanceID:   providerInstanceID,
+				Type:                 providerType,
+				BaseURL:              strings.TrimSpace(saved.BaseURL),
+				APIKey:               saved.APIKey,
+				Model:                strings.TrimSpace(saved.Model),
+				Locality:             saved.Locality,
+				PrivateNetworkAccess: saved.PrivateNetworkAccess,
+			},
+		}, true
+	}
+	return providerProbePersistenceCandidate{}, false
+}
+
+func (s *Server) providerProbeCandidateStillCurrent(
+	candidate providerProbePersistenceCandidate,
+) bool {
+	llmCfg := s.persistedLLMConfig()
+	for providerKey, saved := range llmCfg.Providers {
+		if config.EffectiveProviderInstanceID(providerKey, saved) != candidate.providerInstanceID {
+			continue
+		}
+		providerType := canonicalProviderProbeType(providerKey, saved)
+		return providerProbeConfigFingerprint(providerType, saved) ==
+			candidate.configFingerprint
+	}
+	return false
+}
+
+func providerProbeReceiptResponse(
+	receipt *storage.ProviderProbeReceipt,
+) *LLMProviderProbeReceiptResponse {
+	if receipt == nil {
+		return nil
+	}
+	return &LLMProviderProbeReceiptResponse{
+		ProviderInstanceID: receipt.ProviderInstanceID,
+		Outcome:            receipt.Outcome,
+		TestedAt:           receipt.TestedAt,
+		ProbeStartedAt:     receipt.ProbeStartedAt,
+		LatencyMS:          receipt.LatencyMS,
+		Locality:           receipt.Locality,
+		Message:            receipt.Message,
+	}
+}
+
+func (s *Server) matchingProviderProbeReceipt(
+	ctx context.Context,
+	providerType string,
+	provider config.LLMProviderConfig,
+) *LLMProviderProbeReceiptResponse {
+	providerInstanceID := config.EffectiveProviderInstanceID(providerType, provider)
+	if providerInstanceID == "" {
+		return nil
+	}
+	receiptStore, ok := s.store.(storage.ProviderProbeReceiptStore)
+	if !ok {
+		return nil
+	}
+	receipt, err := receiptStore.GetProviderProbeReceipt(ctx, providerInstanceID)
+	if err != nil {
+		logger.Warn("读取 LLM Provider 测试回执失败",
+			"provider_instance_id", providerInstanceID,
+			"error", err)
+		return nil
+	}
+	if receipt == nil ||
+		receipt.ConfigFingerprint != providerProbeConfigFingerprint(
+			canonicalProviderProbeType(providerType, provider),
+			provider,
+		) {
+		return nil
+	}
+	return providerProbeReceiptResponse(receipt)
+}
+
+func (s *Server) persistProviderProbeReceipt(
+	ctx context.Context,
+	candidate providerProbePersistenceCandidate,
+	receipt *storage.ProviderProbeReceipt,
+) bool {
+	if !s.providerProbeCandidateStillCurrent(candidate) {
+		return false
+	}
+	receiptStore, ok := s.store.(storage.ProviderProbeReceiptStore)
+	if !ok {
+		return false
+	}
+	persisted, err := receiptStore.SaveProviderProbeReceipt(ctx, receipt)
+	if err != nil {
+		logger.Warn("持久化 LLM Provider 测试回执失败",
+			"provider_instance_id", candidate.providerInstanceID,
+			"error", err)
+		return false
+	}
+	return persisted
+}
+
 // handleGetLLMConfig GET /api/v1/config/llm
 //
 // 返回当前 LLM 配置，API Key 脱敏显示。
@@ -311,7 +581,7 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	providers := make(map[string]LLMProviderConfigResponse, len(llmCfg.Providers))
 	for name, p := range llmCfg.Providers {
 		modelSpecsMode, modelSpecs := config.NormalizeProviderModelSpecs(p)
-		providers[name] = LLMProviderConfigResponse{
+		response := LLMProviderConfigResponse{
 			ProviderInstanceID:    config.EffectiveProviderInstanceID(name, p),
 			DisplayName:           p.DisplayName,
 			APIKey:                config.MaskAPIKey(p.APIKey),
@@ -331,6 +601,8 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 			KeepAlive:             p.KeepAlive,
 			NumCtx:                p.NumCtx,
 		}
+		response.ProbeReceipt = s.matchingProviderProbeReceipt(r.Context(), name, p)
+		providers[name] = response
 	}
 
 	writeJSON(w, http.StatusOK, LLMConfigResponse{
@@ -593,7 +865,8 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 
 // handleTestLLMConfig POST /api/v1/config/llm/test
 //
-// 只测试单个 provider 配置是否可连通，不会持久化。
+// 测试单个 provider 配置是否可连通。带稳定 provider_instance_id 且候选配置
+// 与服务端保存配置完全匹配时，持久化最新显式测试回执；旧请求继续保持无状态。
 func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 	var req LLMConnectionTestRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
@@ -603,10 +876,17 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	providerType := strings.TrimSpace(req.Provider.Type)
-	model := strings.TrimSpace(req.Provider.Model)
-	apiKey := strings.TrimSpace(req.Provider.APIKey)
-	baseURL := strings.TrimSpace(req.Provider.BaseURL)
+	probeDescriptor := req.Provider
+	persistenceCandidate, canPersist := s.providerProbePersistenceCandidate(req.Provider)
+	if canPersist {
+		probeDescriptor = persistenceCandidate.descriptor
+	}
+
+	providerType := strings.TrimSpace(probeDescriptor.Type)
+	model := strings.TrimSpace(probeDescriptor.Model)
+	apiKey := strings.TrimSpace(probeDescriptor.APIKey)
+	baseURL := strings.TrimSpace(probeDescriptor.BaseURL)
+	probeStartedAt := nextProviderProbeStartedAt()
 	if providerType == "" || model == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "provider.type、provider.model 不能为空",
@@ -627,7 +907,7 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if err := config.ValidateProviderEndpointAccess(baseURL, req.Provider.PrivateNetworkAccess); err != nil {
+	if err := config.ValidateProviderEndpointAccess(baseURL, probeDescriptor.PrivateNetworkAccess); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -637,8 +917,8 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 		BaseURL:              baseURL,
 		APIKey:               apiKey,
 		Model:                model,
-		Locality:             req.Provider.Locality,
-		PrivateNetworkAccess: req.Provider.PrivateNetworkAccess,
+		Locality:             probeDescriptor.Locality,
+		PrivateNetworkAccess: probeDescriptor.PrivateNetworkAccess,
 	})
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
@@ -653,24 +933,71 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 		MaxTokens: 8,
 	})
 	latency := time.Since(start).Milliseconds()
+	testedAt := time.Now().UnixMilli()
 
 	if err != nil {
+		message := sanitizeProviderProbeMessage(
+			"连接测试失败: "+err.Error(),
+			req.Provider.APIKey,
+			apiKey,
+		)
+		persisted := false
+		if canPersist {
+			persisted = s.persistProviderProbeReceipt(
+				r.Context(),
+				persistenceCandidate,
+				&storage.ProviderProbeReceipt{
+					ProviderInstanceID: persistenceCandidate.providerInstanceID,
+					ConfigFingerprint:  persistenceCandidate.configFingerprint,
+					Outcome:            "failed",
+					TestedAt:           testedAt,
+					ProbeStartedAt:     probeStartedAt,
+					LatencyMS:          latency,
+					Locality:           persistenceCandidate.locality,
+					Message:            message,
+				},
+			)
+		}
 		writeJSON(w, http.StatusOK, LLMConnectionTestResponse{
-			OK:        false,
-			Message:   "连接测试失败: " + err.Error(),
-			Provider:  providerType,
-			Model:     model,
-			LatencyMS: latency,
+			OK:             false,
+			Message:        message,
+			Provider:       providerType,
+			Model:          model,
+			LatencyMS:      latency,
+			Persisted:      persisted,
+			TestedAt:       testedAt,
+			ProbeStartedAt: probeStartedAt,
 		})
 		return
 	}
 
+	message := "连接测试通过"
+	persisted := false
+	if canPersist {
+		persisted = s.persistProviderProbeReceipt(
+			r.Context(),
+			persistenceCandidate,
+			&storage.ProviderProbeReceipt{
+				ProviderInstanceID: persistenceCandidate.providerInstanceID,
+				ConfigFingerprint:  persistenceCandidate.configFingerprint,
+				Outcome:            "passed",
+				TestedAt:           testedAt,
+				ProbeStartedAt:     probeStartedAt,
+				LatencyMS:          latency,
+				Locality:           persistenceCandidate.locality,
+				Message:            message,
+			},
+		)
+	}
 	writeJSON(w, http.StatusOK, LLMConnectionTestResponse{
-		OK:        true,
-		Message:   "连接测试通过",
-		Provider:  providerType,
-		Model:     model,
-		LatencyMS: latency,
+		OK:             true,
+		Message:        message,
+		Provider:       providerType,
+		Model:          model,
+		LatencyMS:      latency,
+		Persisted:      persisted,
+		TestedAt:       testedAt,
+		ProbeStartedAt: probeStartedAt,
 	})
 }
 
