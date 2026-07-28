@@ -10,12 +10,17 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/hexagon-codes/hexclaw/records"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
 var (
-	ErrProblemSourceActionNotFound = errors.New("problem source action scope not found")
-	ErrProblemSourceActionConflict = errors.New("problem source action conflict")
+	ErrProblemSourceActionNotFound          = errors.New("problem source action scope not found")
+	ErrProblemSourceActionConflict          = errors.New("problem source action conflict")
+	ErrGradingProgressiveProjectionConflict = errors.New(
+		"grading progressive projection conflicts with final artifact",
+	)
 )
 
 type ProblemSourceActionCommand struct {
@@ -41,6 +46,11 @@ type ProblemSourceProgressiveSnapshot struct {
 	SnapshotRevision int                              `json:"snapshot_revision"`
 	ProblemProgress  []ProblemSourceProgress          `json:"problem_progress"`
 	Coverage         ProblemSourceProgressiveCoverage `json:"coverage"`
+}
+
+type GradingProgressiveProjection struct {
+	ProgressiveSnapshot ProblemSourceProgressiveSnapshot
+	FinalArtifact       *k12.GradingFinalArtifact
 }
 
 type ProblemSourceProgress struct {
@@ -177,16 +187,19 @@ func lockAndResolveProblemSourceActionScope(
 
 	var scope problemSourceActionScope
 	err = tx.QueryRowContext(ctx, `
-		SELECT d.agent_name,s.submission_id,s.grading_job_id,
+		SELECT d.agent_name,j.submission_id,s.grading_job_id,
 		       sm.input_revision,ss.structure_version
 		FROM k12_image_task_dispatches d
 		JOIN k12_homework_submissions s
 		  ON s.agent_name=d.agent_name
 		 AND s.dispatch_id=d.dispatch_id
 		 AND s.submission_id=d.target_object_id
+		JOIN k12_grading_jobs j
+		  ON j.agent_name=s.agent_name
+		 AND j.record_id=s.grading_job_id
 		JOIN k12_problems p
-		  ON p.agent_name=d.agent_name
-		 AND p.submission_id=s.submission_id
+		  ON p.agent_name=j.agent_name
+		 AND p.submission_id=j.submission_id
 		 AND p.problem_id=?
 		JOIN k12_problem_structure_snapshots ss
 		  ON ss.agent_name=p.agent_name
@@ -749,10 +762,10 @@ func commitProblemInputChange(
 
 func buildProblemSourceProgressiveSnapshot(
 	ctx context.Context,
-	tx *sql.Tx,
+	q dbQueryer,
 	scope problemSourceActionScope,
 ) (ProblemSourceProgressiveSnapshot, error) {
-	rows, err := tx.QueryContext(ctx, `
+	rows, err := q.QueryContext(ctx, `
 		SELECT p.problem_id,sm.input_revision
 		FROM k12_problem_structure_snapshots ss
 		JOIN k12_problem_structure_members sm
@@ -806,7 +819,7 @@ func buildProblemSourceProgressiveSnapshot(
 			CurrentDisposition: "current",
 		}
 		var assessmentStatus string
-		err := tx.QueryRowContext(ctx, `
+		err := q.QueryRowContext(ctx, `
 			SELECT status,input_revision,published_revision,current_disposition
 			FROM k12_grading_assessment_items
 			WHERE agent_name=? AND job_id=? AND problem_id=?
@@ -825,7 +838,7 @@ func buildProblemSourceProgressiveSnapshot(
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return ProblemSourceProgressiveSnapshot{}, err
 		} else {
-			err = tx.QueryRowContext(ctx, `
+			err = q.QueryRowContext(ctx, `
 				SELECT input_revision,published_revision,current_disposition
 				FROM k12_problem_skip_receipts
 				WHERE agent_name=? AND job_id=? AND problem_id=?
@@ -844,7 +857,7 @@ func buildProblemSourceProgressiveSnapshot(
 				return ProblemSourceProgressiveSnapshot{}, err
 			} else {
 				var commandRevision int
-				if err := tx.QueryRowContext(ctx, `
+				if err := q.QueryRowContext(ctx, `
 						SELECT COALESCE(MAX(result_input_revision),0)
 						FROM k12_problem_source_action_receipts
 						WHERE agent_name=? AND job_id=? AND problem_id=?
@@ -881,6 +894,123 @@ func buildProblemSourceProgressiveSnapshot(
 		snapshot.Coverage.Status = "in_progress"
 	}
 	return snapshot, nil
+}
+
+func validateGradingProgressiveProjection(
+	snapshot ProblemSourceProgressiveSnapshot,
+	artifact *k12.GradingFinalArtifact,
+) error {
+	coverage := snapshot.Coverage
+	if len(snapshot.ProblemProgress) != coverage.Total ||
+		coverage.Published+coverage.Skipped+coverage.Awaiting+coverage.Failed != coverage.Total {
+		return ErrGradingProgressiveProjectionConflict
+	}
+	if artifact == nil {
+		return nil
+	}
+	if snapshot.StructureVersion != artifact.StructureVersion ||
+		coverage.Total != artifact.TotalCount ||
+		coverage.Published != artifact.PublishedCount ||
+		coverage.Skipped != artifact.SkippedCount ||
+		coverage.Awaiting != 0 ||
+		coverage.Failed != 0 ||
+		coverage.Status != "complete" {
+		return ErrGradingProgressiveProjectionConflict
+	}
+	return nil
+}
+
+// GetGradingProgressiveProjection reads the current structure, per-problem
+// assessment/skip receipts and optional final artifact in one read
+// transaction. Both the public ImageTask GET and source-action commands use
+// the same snapshot builder; neither may derive progress from the artifact.
+func (s *Store) GetGradingProgressiveProjection(
+	ctx context.Context,
+	agentName, jobID string,
+) (GradingProgressiveProjection, error) {
+	agentName = strings.TrimSpace(agentName)
+	jobID = strings.TrimSpace(jobID)
+	if agentName == "" || jobID == "" {
+		return GradingProgressiveProjection{}, records.ErrNotFound
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return GradingProgressiveProjection{}, err
+	}
+	defer tx.Rollback()
+
+	var submissionID string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT submission_id
+		FROM k12_grading_jobs
+		WHERE agent_name=? AND record_id=?`,
+		agentName,
+		jobID,
+	).Scan(&submissionID); errors.Is(err, sql.ErrNoRows) {
+		return GradingProgressiveProjection{}, records.ErrNotFound
+	} else if err != nil {
+		return GradingProgressiveProjection{}, err
+	}
+
+	var structureVersion int
+	structureErr := tx.QueryRowContext(ctx, `
+		SELECT structure_version
+		FROM k12_problem_structure_snapshots
+		WHERE agent_name=? AND submission_id=? AND current_disposition='current'
+		ORDER BY structure_version DESC
+		LIMIT 1`,
+		agentName,
+		submissionID,
+	).Scan(&structureVersion)
+	if structureErr != nil && !errors.Is(structureErr, sql.ErrNoRows) {
+		return GradingProgressiveProjection{}, structureErr
+	}
+
+	var artifact *k12.GradingFinalArtifact
+	storedArtifact, artifactErr := getGradingFinalArtifactByJobVia(
+		ctx,
+		tx,
+		agentName,
+		jobID,
+	)
+	if artifactErr == nil {
+		artifact = &storedArtifact
+	} else if !errors.Is(artifactErr, records.ErrNotFound) {
+		return GradingProgressiveProjection{}, artifactErr
+	}
+	if errors.Is(structureErr, sql.ErrNoRows) {
+		if artifact != nil {
+			return GradingProgressiveProjection{}, ErrGradingProgressiveProjectionConflict
+		}
+		if err := tx.Commit(); err != nil {
+			return GradingProgressiveProjection{}, err
+		}
+		return GradingProgressiveProjection{}, nil
+	}
+
+	snapshot, err := buildProblemSourceProgressiveSnapshot(
+		ctx,
+		tx,
+		problemSourceActionScope{
+			AgentName:        agentName,
+			SubmissionID:     submissionID,
+			JobID:            jobID,
+			StructureVersion: structureVersion,
+		},
+	)
+	if err != nil {
+		return GradingProgressiveProjection{}, err
+	}
+	if err := validateGradingProgressiveProjection(snapshot, artifact); err != nil {
+		return GradingProgressiveProjection{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return GradingProgressiveProjection{}, err
+	}
+	return GradingProgressiveProjection{
+		ProgressiveSnapshot: snapshot,
+		FinalArtifact:       artifact,
+	}, nil
 }
 
 // CommitProblemSourceAction resolves the agent only from the durable dispatch

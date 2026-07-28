@@ -2,11 +2,7 @@ package usecase
 
 import (
 	"context"
-	"errors"
 	"strings"
-
-	"github.com/hexagon-codes/hexclaw/records"
-	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
 // ImageTaskHomeworkProjection is an owner-scoped, read-only projection. It
@@ -33,21 +29,21 @@ func (o *GradingOrchestrator) ImageTaskHomeworkProjection(
 			subject = value
 		}
 	}
-	var finalArtifact *k12.GradingFinalArtifact
-	artifact, artifactErr := o.deps.Records.GetGradingFinalArtifactByJob(
+	durableProjection, err := o.deps.Records.GetGradingProgressiveProjection(
 		ctx, agentName, jobID,
 	)
-	if artifactErr == nil {
-		finalArtifact = &artifact
-	} else if !errors.Is(artifactErr, records.ErrNotFound) {
-		return ImageTaskHomeworkProjection{}, artifactErr
+	if err != nil {
+		return ImageTaskHomeworkProjection{}, err
 	}
 	return ImageTaskHomeworkProjection{
 		Stage: job.Record.Status, Retryable: job.Fields.Retryable,
 		ConfirmationState: job.Fields.ConfirmationState,
-		AnchorState: job.Fields.AnchorState, Subject: subject,
+		AnchorState:       job.Fields.AnchorState, Subject: subject,
 		Questions: cloneRecognizedQuestions(questions),
-		FinalArtifact: finalArtifact,
+		Progressive: imageTaskProgressiveSnapshotFromStorage(
+			durableProjection.ProgressiveSnapshot,
+		),
+		FinalArtifact: durableProjection.FinalArtifact,
 	}, nil
 }
 
