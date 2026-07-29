@@ -487,15 +487,28 @@ func (s *Store) ListSessions(ctx context.Context, userID string, limit, offset i
 
 // DeleteSession 软删除会话（标记 status=-1）
 func (s *Store) DeleteSession(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM remembered_permission_grants WHERE resolved_session_id = ?`, id,
+	); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx,
 		`UPDATE sessions SET status = -1, updated_at = ? WHERE id = ?`,
 		time.Now(), id,
-	)
-	if err == nil {
-		s.invalidateSearchCache()
-		s.invalidateForkCache()
+	); err != nil {
+		return err
 	}
-	return err
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.invalidateSearchCache()
+	s.invalidateForkCache()
+	return nil
 }
 
 // CleanupOldSessions 删除超过指定天数未活跃的会话及其消息

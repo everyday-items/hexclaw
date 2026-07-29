@@ -13,6 +13,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/messagecontent"
 )
 
@@ -77,8 +78,14 @@ type MessageRecord struct {
 	Meta             string                         `json:"meta"` // 扩展元数据 (tool_calls, reasoning_content 等)
 	// Attachments 图片等附件的完整 JSON（base64），独立列、不受 metadata 64KB 截断（BUG-20260626）。
 	// json:"-"：不单独下发前端；读取时由 scanMessage 合并进 Metadata，保持前端读 metadata.attachments 的既有契约。
-	Attachments string    `json:"-"`
-	CreatedAt   time.Time `json:"created_at"`
+	Attachments         string                          `json:"-"`
+	CreatedAt           time.Time                       `json:"created_at"`
+	AssistantMessageID  string                          `json:"assistant_message_id,omitempty"`
+	BackendMessageID    string                          `json:"backend_message_id,omitempty"`
+	MessageID           string                          `json:"message_id,omitempty"`
+	ReasoningDisclosure adapter.ReasoningDisclosure     `json:"reasoning_disclosure"`
+	RuntimeEvents       []adapter.SequencedRuntimeEvent `json:"runtime_events"`
+	LastSequence        uint64                          `json:"last_sequence"`
 }
 
 // SearchResult 消息搜索结果

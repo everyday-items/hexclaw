@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -81,6 +82,100 @@ func TestSessionCRUD(t *testing.T) {
 	list, _ = store.ListSessions(ctx, "user-001", 10, 0)
 	if len(list) != 0 {
 		t.Errorf("删除后仍有 %d 个会话", len(list))
+	}
+}
+
+// REG-TOOL-APPROVAL-REUSE-001 / REG-TOOL-APPROVAL-LIFECYCLE-001
+func TestRememberedGrantV63ExactKeySurvivesReopenAndSessionDeleteCleansIt(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "remembered-grants.db")
+	store, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("init store: %v", err)
+	}
+
+	if err := store.CreateSession(ctx, &storage.Session{
+		ID: "session-grant-1", UserID: "owner-1", Platform: "web", Title: "grant lifecycle",
+	}); err != nil {
+		t.Fatalf("create owning session: %v", err)
+	}
+
+	rows, err := store.db.QueryContext(ctx, `PRAGMA table_info(remembered_permission_grants)`)
+	if err != nil {
+		t.Fatalf("read remembered grant schema: %v", err)
+	}
+	var primaryKey []string
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			_ = rows.Close()
+			t.Fatalf("scan remembered grant schema: %v", err)
+		}
+		if pk > 0 {
+			for len(primaryKey) < pk {
+				primaryKey = append(primaryKey, "")
+			}
+			primaryKey[pk-1] = name
+		}
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("close remembered grant schema rows: %v", err)
+	}
+	wantKey := []string{"owner_id", "resolved_session_id", "canonical_tool_name", "security_scope_digest"}
+	if !reflect.DeepEqual(primaryKey, wantKey) {
+		t.Fatalf("remembered grant primary key = %v, want exact %v", primaryKey, wantKey)
+	}
+
+	if _, err := store.db.ExecContext(ctx, `
+		INSERT INTO remembered_permission_grants (
+			owner_id, resolved_session_id, canonical_tool_name, security_scope_digest
+		) VALUES (?, ?, ?, ?)`,
+		"owner-1", "session-grant-1", "file_edit",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	); err != nil {
+		t.Fatalf("insert remembered grant: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store before restart: %v", err)
+	}
+
+	reopened, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if err := reopened.Init(ctx); err != nil {
+		t.Fatalf("init reopened store: %v", err)
+	}
+	var count int
+	if err := reopened.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM remembered_permission_grants
+		WHERE owner_id = ? AND resolved_session_id = ?
+		  AND canonical_tool_name = ? AND security_scope_digest = ?`,
+		"owner-1", "session-grant-1", "file_edit",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	).Scan(&count); err != nil {
+		t.Fatalf("lookup remembered grant after reopen: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("remembered grant count after reopen = %d, want 1", count)
+	}
+
+	if err := reopened.DeleteSession(ctx, "session-grant-1"); err != nil {
+		t.Fatalf("delete owning session: %v", err)
+	}
+	if err := reopened.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM remembered_permission_grants
+		WHERE resolved_session_id = ?`, "session-grant-1").Scan(&count); err != nil {
+		t.Fatalf("count grants after session delete: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("remembered grants after session delete = %d, want 0", count)
 	}
 }
 
