@@ -64,6 +64,9 @@ type GradingModelSnapshot struct {
 	Capability string `json:"capability,omitempty"`
 	TimeoutMS  int    `json:"timeout_ms,omitempty"`
 	Fallback   string `json:"fallback,omitempty"`
+	// RecognizingRequestPolicy is a stage-scoped control-plane snapshot. Its
+	// presence does not authorize locating or any other operation to inherit it.
+	RecognizingRequestPolicy ModelRequestPolicySnapshot `json:"recognizing_request_policy,omitzero"`
 }
 
 // NormalizeGradingModelSnapshot freezes a stable route identity for old
@@ -73,6 +76,9 @@ func NormalizeGradingModelSnapshot(snapshot GradingModelSnapshot) GradingModelSn
 	snapshot.Provider = strings.TrimSpace(snapshot.Provider)
 	snapshot.Model = strings.TrimSpace(snapshot.Model)
 	snapshot.Route = strings.TrimSpace(snapshot.Route)
+	snapshot.RecognizingRequestPolicy = NormalizeModelRequestPolicySnapshot(
+		snapshot.RecognizingRequestPolicy,
+	)
 	if snapshot.Route == "" && snapshot.Provider != "" && snapshot.Model != "" {
 		snapshot.Route = snapshot.Provider + "/" + snapshot.Model
 	}

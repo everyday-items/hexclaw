@@ -109,8 +109,9 @@ func ValidateHexbakProblemAttempts(bak *Hexbak) error {
 }
 
 // migrateHexbakProblemAttempts rewrites only owner-scoped identity. V19 IDs are
-// intentionally stable: photo SubmissionID is a SHA-1 content check used during
-// restart, while Problem/Attempt composite keys already include agent_name.
+// intentionally stable: photo SubmissionID embeds an image digest used during
+// restart (legacy photo-sha1 or source-scoped photo-v2), while Problem/Attempt
+// composite keys already include agent_name.
 func migrateHexbakProblemAttempts(
 	source []k12.ProblemAttemptSnapshot,
 	targetAgent string,

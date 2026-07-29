@@ -26,8 +26,9 @@ import (
 
 const (
 	fixtureNamespace             = "k12-current-bug-live-state-v1"
-	fixtureFailureRetryable      = "fixture_failed_retryable"
-	fixtureFailureOutcomeUnknown = "fixture_outcome_unknown"
+	fixtureScenario              = "k12-tutor"
+	FixtureFailureRetryable      = "fixture_failed_retryable"
+	FixtureFailureOutcomeUnknown = "fixture_outcome_unknown"
 
 	metadataNamespace      = "hexclaw.test.fixture_namespace"
 	metadataOwnership      = "hexclaw.test.fixture_ownership"
@@ -184,6 +185,40 @@ func fixtureAgentName(ownership string) string {
 	return "k12-live-fx-" + sha256String(ownership)[:20]
 }
 
+// VerifiedManifestRunID binds a persisted fixture manifest back to the exact
+// Builder run recorded on its owning Agent. It intentionally derives the
+// ownership and agent name again instead of trusting either persisted copy.
+func VerifiedManifestRunID(
+	manifest Manifest,
+	agent router.AgentConfig,
+) (string, bool) {
+	runID := agent.Metadata[metadataRunID]
+	leaseExpiresAt, err := strconv.ParseInt(
+		agent.Metadata[metadataLeaseExpiresAt],
+		10,
+		64,
+	)
+	if err != nil ||
+		runID == "" ||
+		strings.TrimSpace(runID) != runID ||
+		manifest.LeaseExpiresAt <= 0 {
+		return "", false
+	}
+	expectedOwnership := "own_" + sha256String(
+		fixtureNamespace + "|" + runID,
+	)[:32]
+	matches := agent.Name == manifest.AgentName &&
+		manifest.AgentName == fixtureAgentName(expectedOwnership) &&
+		manifest.Ownership == expectedOwnership &&
+		agent.Metadata[metadataNamespace] == fixtureNamespace &&
+		agent.Metadata[metadataOwnership] == expectedOwnership &&
+		leaseExpiresAt == manifest.LeaseExpiresAt
+	if !matches {
+		return "", false
+	}
+	return runID, true
+}
+
 type guardedClassifier struct {
 	calls *BoundaryCounter
 }
@@ -264,6 +299,7 @@ func (b *Builder) Create(
 	agent := options.AgentConfig
 	agent.Name = agentName
 	agent.Metadata = copyMetadata(agent.Metadata)
+	agent.Metadata["scenario"] = fixtureScenario
 	agent.Metadata[metadataNamespace] = fixtureNamespace
 	agent.Metadata[metadataOwnership] = ownership
 	agent.Metadata[metadataRunID] = options.RunID
@@ -343,7 +379,7 @@ func (b *Builder) Create(
 	}
 	if err := b.Records.FailImageTaskInvocation(
 		ctx, agentName, retryable.Dispatch.ClassificationInvocationID,
-		fixtureFailureRetryable, false, true,
+		FixtureFailureRetryable, false, true,
 	); err != nil {
 		return Manifest{}, fmt.Errorf("livetestfixture: park retryable task: %w", err)
 	}
@@ -368,7 +404,7 @@ func (b *Builder) Create(
 	}
 	if err := b.Records.FailImageTaskInvocation(
 		ctx, agentName, unknown.Dispatch.ClassificationInvocationID,
-		fixtureFailureOutcomeUnknown, true, false,
+		FixtureFailureOutcomeUnknown, true, false,
 	); err != nil {
 		return Manifest{}, fmt.Errorf("livetestfixture: park outcome-unknown task: %w", err)
 	}
@@ -415,7 +451,7 @@ func (b *Builder) verifyManifest(ctx context.Context, manifest Manifest) error {
 		return err
 	}
 	if unknown.Status != k12.ImageTaskStatusFailed || unknown.RetrySafe ||
-		unknown.FailureKind != fixtureFailureOutcomeUnknown {
+		unknown.FailureKind != FixtureFailureOutcomeUnknown {
 		return errors.New("livetestfixture: outcome-unknown fixture state mismatch")
 	}
 	return nil

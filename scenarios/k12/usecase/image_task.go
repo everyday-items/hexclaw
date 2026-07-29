@@ -103,13 +103,13 @@ type ImageTaskCoordinator struct {
 	NewID                 func(kind string) string
 	BaseContext           context.Context
 
-	workerMu    sync.Mutex
+	workerMu     sync.Mutex
 	agentWorkers agentWorkerFenceRegistry
-	sealed      bool
-	workerCount int
-	workerIdle  chan struct{}
-	runCtx      context.Context
-	runCancel   context.CancelFunc
+	sealed       bool
+	workerCount  int
+	workerIdle   chan struct{}
+	runCtx       context.Context
+	runCancel    context.CancelFunc
 }
 
 var ErrImageTaskCoordinatorShutdown = errors.New("image task coordinator is shut down")
@@ -204,13 +204,15 @@ type ImageTaskSourceAttachmentReceipt struct {
 }
 
 type ImageTaskOperationReceipt struct {
-	InvocationID string `json:"invocation_id"`
-	Operation    string `json:"operation"`
-	Provider     string `json:"provider"`
-	Model        string `json:"model"`
-	Status       string `json:"status"`
-	Attempt      int    `json:"attempt"`
-	ResultDigest string `json:"result_digest"`
+	InvocationID        string                          `json:"invocation_id"`
+	Operation           string                          `json:"operation"`
+	Provider            string                          `json:"provider"`
+	Model               string                          `json:"model"`
+	Status              string                          `json:"status"`
+	Attempt             int                             `json:"attempt"`
+	ResultDigest        string                          `json:"result_digest"`
+	RequestPolicyDigest string                          `json:"request_policy_digest,omitempty"`
+	RequestPolicy       *k12.ModelRequestPolicySnapshot `json:"request_policy,omitempty"`
 }
 
 type imageTaskPhotoResultReader interface {
@@ -1540,11 +1542,11 @@ func (c *ImageTaskCoordinator) failHomeworkSolvePreflight(
 	_, err := c.Records.FailHomeworkSolvePreflight(
 		ctx,
 		k12.ImageTaskInvocation{
-			InvocationID:  c.id("solve_preflight"),
-			AgentName:     dispatch.AgentName,
-			DispatchID:    dispatch.DispatchID,
-			Operation:     k12.ImageTaskOperationSolve,
-			OperationKey:  "dispatch:" + dispatch.DispatchID + ":solve-preflight",
+			InvocationID: c.id("solve_preflight"),
+			AgentName:    dispatch.AgentName,
+			DispatchID:   dispatch.DispatchID,
+			Operation:    k12.ImageTaskOperationSolve,
+			OperationKey: "dispatch:" + dispatch.DispatchID + ":solve-preflight",
 			RequestDigest: digestJSON(struct {
 				DispatchID    string
 				RequestDigest string
@@ -1788,7 +1790,7 @@ func imageTaskInvocationReceipt(
 }
 
 func modelInvocationReceipt(invocation k12.ModelInvocation) ImageTaskOperationReceipt {
-	return ImageTaskOperationReceipt{
+	receipt := ImageTaskOperationReceipt{
 		InvocationID: invocation.InvocationID,
 		Operation:    invocation.Stage,
 		Provider:     invocation.RouteSnapshot.Provider,
@@ -1797,6 +1799,12 @@ func modelInvocationReceipt(invocation k12.ModelInvocation) ImageTaskOperationRe
 		Attempt:      invocation.Attempt,
 		ResultDigest: invocation.ResultDigest,
 	}
+	policy := k12.NormalizeModelRequestPolicySnapshot(invocation.RequestPolicySnapshot)
+	if !policy.IsZero() {
+		receipt.RequestPolicyDigest = policy.Digest()
+		receipt.RequestPolicy = &policy
+	}
+	return receipt
 }
 
 // ResolveTutoringTipsGradingJob is an internal server-side bridge. Public

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/hexagon-codes/hexclaw/config"
@@ -29,13 +30,17 @@ func resolveK12GradingModelSnapshot(
 	if err != nil {
 		return k12.GradingModelSnapshot{}, err
 	}
-	return k12.GradingModelSnapshot{
+	snapshot := k12.GradingModelSnapshot{
 		Provider:   route.ProviderName,
 		Model:      route.Model,
 		Route:      route.ProviderName + "/" + route.Model,
 		Capability: config.LLMModelCapabilityVision,
 		TimeoutMS:  int(k12.GradingStageBudgetSeconds(k12.GradingStageRecognizing) * 1000),
-	}, nil
+	}
+	if snapshot.Model == k12.RecognizingPolicyModel {
+		snapshot.RecognizingRequestPolicy = k12.ApprovedRecognizingRequestPolicy()
+	}
+	return k12.NormalizeGradingModelSnapshot(snapshot), nil
 }
 
 // resolveK12PracticeModelSnapshot freezes the exact text-capable route used by
@@ -64,4 +69,29 @@ func resolveK12PracticeModelSnapshot(
 		Capability: config.LLMModelCapabilityText,
 		TimeoutMS:  60_000,
 	}, nil
+}
+
+// k12VisionRequestMetadata translates the typed, stage-scoped semantic policy
+// into ai-core metadata. The Provider adapter, not HexClaw, owns the final wire
+// dialect (`reasoning_effort=none` for gpt-5.6-sol).
+func k12VisionRequestMetadata(ctx context.Context) (map[string]any, error) {
+	policy, marked := k12.GradingModelRequestPolicyFromContext(ctx)
+	if !marked {
+		return nil, nil
+	}
+	snapshot, frozen := k12.GradingModelSnapshotFromContext(ctx)
+	if !frozen {
+		return nil, fmt.Errorf("K12 recognizing request policy has no frozen route")
+	}
+	if err := k12.ValidateModelInvocationRequestPolicy(
+		k12.GradingStageRecognizing,
+		snapshot,
+		policy,
+	); err != nil {
+		return nil, err
+	}
+	if !policy.IsApprovedRecognizing() {
+		return nil, fmt.Errorf("K12 recognizing request policy is not approved")
+	}
+	return map[string]any{"thinking": policy.Thinking}, nil
 }

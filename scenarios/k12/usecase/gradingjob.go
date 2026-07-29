@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -45,6 +46,23 @@ type CreateGradingJobInput struct {
 	MaterializesProblemAttempts bool
 }
 
+func validateGradingSourceIdentity(sourceKind, sourceKey string) error {
+	if strings.TrimSpace(sourceKind) == "" || strings.TrimSpace(sourceKey) == "" {
+		return fmt.Errorf(
+			"%w: source_kind/source_key 不可空（统一幂等键，§4.10）",
+			ErrInvalidInput,
+		)
+	}
+	if strings.ContainsRune(sourceKind, '|') ||
+		strings.IndexFunc(sourceKind, unicode.IsControl) >= 0 {
+		return fmt.Errorf(
+			"%w: source_kind 含幂等 wire 保留分隔符或控制字符",
+			ErrInvalidInput,
+		)
+	}
+	return nil
+}
+
 // AdvanceGradingStage 的 outcome 枚举。
 const (
 	GradingOutcomeOK      = "ok"              // 当前阶段成功完成：写检查点、推进后继阶段
@@ -73,8 +91,8 @@ func (d Deps) CreateGradingJob(ctx context.Context, agentName, sourceSession str
 	if strings.TrimSpace(in.SubmissionID) == "" {
 		return GradingJobView{}, false, fmt.Errorf("%w: submission_id 不可空", ErrInvalidInput)
 	}
-	if strings.TrimSpace(in.SourceKind) == "" || strings.TrimSpace(in.SourceKey) == "" {
-		return GradingJobView{}, false, fmt.Errorf("%w: source_kind/source_key 不可空（统一幂等键，§4.10）", ErrInvalidInput)
+	if err := validateGradingSourceIdentity(in.SourceKind, in.SourceKey); err != nil {
+		return GradingJobView{}, false, err
 	}
 	if in.ConfirmedVersion < 0 {
 		return GradingJobView{}, false, fmt.Errorf("%w: confirmed_version 不可为负", ErrInvalidInput)
@@ -92,6 +110,13 @@ func (d Deps) CreateGradingJob(ctx context.Context, agentName, sourceSession str
 		)
 	}
 	in.ModelSnapshot = k12.NormalizeGradingModelSnapshot(in.ModelSnapshot)
+	if err := k12.ValidateGradingRecognizingRequestPolicy(in.ModelSnapshot); err != nil {
+		return GradingJobView{}, false, fmt.Errorf(
+			"%w: invalid recognizing request policy: %v",
+			ErrInvalidInput,
+			err,
+		)
+	}
 	budgetSnapshot := in.BudgetSnapshot
 	if !budgetSnapshot.IsFrozen() {
 		if err := budgetSnapshot.Validate(); err != nil {
@@ -152,9 +177,7 @@ func (d Deps) putGradingJob(ctx context.Context, agentName, sourceSession string
 		}
 		storedRoute := k12.NormalizeGradingModelSnapshot(v.Fields.ModelSnapshot)
 		requestedRoute := k12.NormalizeGradingModelSnapshot(f.ModelSnapshot)
-		if storedRoute.Provider != requestedRoute.Provider ||
-			storedRoute.Model != requestedRoute.Model ||
-			storedRoute.Route != requestedRoute.Route {
+		if storedRoute != requestedRoute {
 			return GradingJobView{}, false, fmt.Errorf(
 				"%w: idempotency key %q is already bound to model route %q, requested %q",
 				ErrInvalidInput,

@@ -11,6 +11,18 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
 )
 
+type freshSharedPageRecognizer struct{}
+
+func (freshSharedPageRecognizer) Recognize(
+	context.Context,
+	[]byte,
+) ([]RecognizedQuestion, error) {
+	return []RecognizedQuestion{{
+		RawTranscription: "7+8=?", CanonicalMarkdown: "7+8=?",
+		AnswerState: AnswerStateBlank, Subject: "数学",
+	}}, nil
+}
+
 func TestPhotoGradingPersistsOwnerScopedPageAssetAndBackupExactSet(t *testing.T) {
 	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
 	d, store := newPipeline(t, fakeSolver{}, fakeGrader{}, nil)
@@ -57,8 +69,11 @@ func TestPhotoGradingPersistsOwnerScopedPageAssetAndBackupExactSet(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(bak.ProblemAttempts) != 1 || len(bak.Assets) != 1 ||
+	if len(bak.ProblemAttempts) != 2 || len(bak.Assets) != 1 ||
 		bak.ProblemAttempts[0].Problems[0].PageAssetID != bak.Assets[0].AssetID ||
+		bak.ProblemAttempts[1].Problems[0].PageAssetID != bak.Assets[0].AssetID ||
+		bak.ProblemAttempts[0].Problems[0].SubmissionID ==
+			bak.ProblemAttempts[1].Problems[0].SubmissionID ||
 		bak.Assets[0].AssetID != firstAssetID {
 		t.Fatalf("backup page exact-set invalid: problems=%+v assets=%+v", bak.ProblemAttempts, bak.Assets)
 	}
@@ -130,6 +145,91 @@ func TestPhotoGradingPageAssetFailureAndProblemWriteFailureNeverReportSuccess(t 
 			t.Fatalf("typed failure leaked facts: %v", err)
 		}
 	})
+}
+
+func TestPhotoGradingSameImageConcurrentTypedFailureCannotDeleteSuccessfulSharedAsset(t *testing.T) {
+	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
+	d, store := newPipeline(t, fakeSolver{}, fakeGrader{}, nil)
+	d.PageAssets = assetstore.PageStore{}
+	d.Recognizer = freshSharedPageRecognizer{}
+	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshotResolver))
+	ctx := context.Background()
+	image := []byte("\x89PNG\r\n\x1a\nconcurrent-shared-page")
+
+	start := func(sourceKey string) GradingJobView {
+		t.Helper()
+		job, created, err := o.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
+			Photo: PhotoGradeRequest{
+				AgentName: "mingming", Grade: "五年级上",
+				SourceSession: sourceKey, Image: image,
+			},
+			SourceKind: "desktop",
+			SourceKey:  sourceKey,
+		})
+		if err != nil || !created {
+			t.Fatalf("start %s: created=%v err=%v", sourceKey, created, err)
+		}
+		return job
+	}
+	failingJob := start("concurrent-failing-source")
+	successfulJob := start("concurrent-successful-source")
+
+	if _, err := store.DB().Exec(fmt.Sprintf(`CREATE TRIGGER reject_one_submission_problem
+		BEFORE INSERT ON k12_problems
+		WHEN NEW.submission_id = '%s'
+		BEGIN SELECT RAISE(ABORT, 'injected one-submission failure'); END`,
+		failingJob.Fields.SubmissionID,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	type runResult struct {
+		jobID string
+		err   error
+	}
+	results := make(chan runResult, 2)
+	for _, job := range []GradingJobView{failingJob, successfulJob} {
+		job := job
+		go func() {
+			_, err := o.RunGradingJob(ctx, job.Record.RecordID)
+			results <- runResult{jobID: job.Record.RecordID, err: err}
+		}()
+	}
+	got := map[string]error{}
+	for range 2 {
+		result := <-results
+		got[result.jobID] = result.err
+	}
+	if got[failingJob.Record.RecordID] == nil {
+		t.Fatal("injected typed failure unexpectedly succeeded")
+	}
+	if got[successfulJob.Record.RecordID] != nil {
+		t.Fatalf("independent same-image submission failed: %v", got[successfulJob.Record.RecordID])
+	}
+	if _, err := store.GetProblemAttemptSnapshot(
+		ctx,
+		"mingming",
+		failingJob.Fields.SubmissionID,
+	); !errors.Is(err, records.ErrNotFound) {
+		t.Fatalf("failed submission leaked typed facts: %v", err)
+	}
+	successFacts, err := store.GetProblemAttemptSnapshot(
+		ctx,
+		"mingming",
+		successfulJob.Fields.SubmissionID,
+	)
+	if err != nil || len(successFacts.Problems) != 1 {
+		t.Fatalf("successful submission facts missing: %+v err=%v", successFacts, err)
+	}
+	assetID := successFacts.Problems[0].PageAssetID
+	if _, err := assetstore.PathFromID(assetID); err != nil {
+		t.Fatalf("failed submission compensation deleted successful shared asset %q: %v", assetID, err)
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if len(o.pageAssetLocks) != 0 {
+		t.Fatalf("concurrent page-asset commands leaked keyed locks: %d", len(o.pageAssetLocks))
+	}
 }
 
 func TestHexbakV5AllowsSignedVirtualPageIdentityWithoutFabricatingBlob(t *testing.T) {

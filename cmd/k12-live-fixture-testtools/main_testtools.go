@@ -125,7 +125,9 @@ func execute(
 		stderr = io.Discard
 	}
 	if len(args) == 0 {
-		return errors.New("expected start, cleanup, or scavenge")
+		return errors.New(
+			"expected start, cleanup, scavenge, or partial-ledger-evidence-diagnostic",
+		)
 	}
 	switch args[0] {
 	case "start":
@@ -146,8 +148,17 @@ func execute(
 			return err
 		}
 		return executeScavenge(ctx, options, stdout)
+	case "partial-ledger-evidence-diagnostic":
+		options, err := parsePartialLedgerEvidenceDiagnosticOptions(args[1:], stderr)
+		if err != nil {
+			return err
+		}
+		return executePartialLedgerEvidenceDiagnostic(ctx, options, stdout)
 	default:
-		return errors.New("unknown command; expected start, cleanup, or scavenge")
+		return errors.New(
+			"unknown command; expected start, cleanup, scavenge, or " +
+				"partial-ledger-evidence-diagnostic",
+		)
 	}
 }
 
@@ -586,6 +597,10 @@ func readManifest(path string) (manifestFile, error) {
 	if err != nil {
 		return manifestFile{}, errors.New("cannot read fixture manifest")
 	}
+	return decodeManifest(raw)
+}
+
+func decodeManifest(raw []byte) (manifestFile, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	var manifest manifestFile

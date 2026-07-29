@@ -135,7 +135,7 @@ func TestBuilderCreatesExactDurableStatesWithoutExternalCallsAndCleansIdempotent
 		t.Fatalf("outcome-unknown dispatch: %v", err)
 	}
 	if unknown.Status != k12.ImageTaskStatusFailed || unknown.RetrySafe ||
-		unknown.FailureKind != fixtureFailureOutcomeUnknown {
+		unknown.FailureKind != FixtureFailureOutcomeUnknown {
 		t.Fatalf("outcome-unknown state drift: %+v", unknown)
 	}
 	if got := h.calls.Snapshot(); got != (BoundarySnapshot{}) {
@@ -144,6 +144,9 @@ func TestBuilderCreatesExactDurableStatesWithoutExternalCallsAndCleansIdempotent
 	agent, ok := findAgent(t, h.agents, manifest.AgentName)
 	if !ok || agent.Metadata[metadataOwnership] != manifest.Ownership {
 		t.Fatalf("fixture ownership missing: agent=%+v found=%v", agent, ok)
+	}
+	if got := agent.Metadata["scenario"]; got != "k12-tutor" {
+		t.Fatalf("fixture K12 scenario identity = %q, want k12-tutor", got)
 	}
 
 	cleaned, err := builder.Cleanup(context.Background(), manifest)

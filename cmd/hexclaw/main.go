@@ -1861,10 +1861,15 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				mime = "image/png"
 			}
 			dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
+			requestMetadata, policyErr := k12VisionRequestMetadata(ctx)
+			if policyErr != nil {
+				return "", policyErr
+			}
 			// 不设 MaxTokens：各家视觉模型上限差异大（glm-4v-flash 硬顶 1024，设 4096 即 400），
 			// 任何硬编码都会在某家翻车/截断；取消与 deadline 统一由入口请求负责。
 			resp, cErr := provider.Complete(k12NonIdempotentLLMContext(ctx), hexagon.CompletionRequest{
-				Model: visionModel,
+				Model:    visionModel,
+				Metadata: requestMetadata,
 				Messages: []hexagon.Message{{
 					Role: hexagon.RoleUser,
 					MultiContent: []llm.ContentPart{

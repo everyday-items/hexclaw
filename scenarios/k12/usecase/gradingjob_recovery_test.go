@@ -358,11 +358,10 @@ func TestGradingRecovery_OutcomeUnknownWithoutDurableResultStaysParkedWithoutRes
 	}
 }
 
-// A Problem/Attempt snapshot is keyed by the content-derived SubmissionID and can
-// therefore predate this Job (for example, the same photo was previously run on
-// another route). It is not proof that this Job's ambiguous invocation succeeded.
-// Recovery may only reconcile recognition from a Job-scoped immutable receipt.
-func TestGradingRecovery_OutcomeUnknownRejectsStaleSamePhotoSnapshotFromAnotherJob(t *testing.T) {
+// A Problem/Attempt snapshot can predate the latest invocation of the same Job. It
+// is not proof that this Job's ambiguous invocation succeeded. Recovery may only
+// reconcile recognition from a Job-scoped immutable receipt.
+func TestGradingRecovery_OutcomeUnknownRejectsStaleSnapshotWithoutInvocationReceipt(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	rec := &recoveryOutcomeUnknownRecognizer{}
@@ -399,7 +398,7 @@ func TestGradingRecovery_OutcomeUnknownRejectsStaleSamePhotoSnapshotFromAnotherJ
 		t.Fatal(err)
 	}
 	if err := d.Records.PutProblemAttemptSnapshot(ctx, stale); err != nil {
-		t.Fatalf("seed stale same-photo snapshot: %v", err)
+		t.Fatalf("seed stale snapshot: %v", err)
 	}
 
 	o2 := newRecoverableOrchestrator(t, d, dir)
@@ -411,7 +410,7 @@ func TestGradingRecovery_OutcomeUnknownRejectsStaleSamePhotoSnapshotFromAnotherJ
 		t.Fatal(err)
 	}
 	if got.Record.Status != k12.GradingStageOutcomeUnknown {
-		t.Fatalf("stale same-photo snapshot reconciled another Job: stage=%s", got.Record.Status)
+		t.Fatalf("stale snapshot reconciled without invocation receipt: stage=%s", got.Record.Status)
 	}
 	if rec.calls != 1 {
 		t.Fatalf("recovery resent ambiguous recognition: calls=%d", rec.calls)

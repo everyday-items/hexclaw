@@ -180,6 +180,13 @@ func TestConfirmPhotoGradingJob_ConflictingOCRRequiresExplicitItemConfirmationAn
 	if got.ConfirmedVersion != 1 || got.InputDigest == "" || got.AttemptID == "" || got.PageAssetID == "" {
 		t.Fatalf("confirmed attempt facts incomplete: %#v", got)
 	}
+	if got.ProblemID != qs[0].ProblemID {
+		t.Fatalf(
+			"confirmed version changed stable problem identity: got=%s want=%s",
+			got.ProblemID,
+			qs[0].ProblemID,
+		)
+	}
 
 	// 投递后的运行时清理不得删除 raw/canonical 审计事实；原图临时载体应被回收。
 	o.ReleaseGradingRun(jobID)

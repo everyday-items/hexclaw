@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,7 @@ import (
 
 var (
 	ErrModelInvocationRequiresReconciliation = errors.New("model invocation requires reconciliation")
+	ErrModelRequestPolicyInvalid             = errors.New("model request policy invalid")
 	ErrGradingOrchestratorShutdown           = errors.New("grading orchestrator is shut down")
 )
 
@@ -70,7 +72,8 @@ type GradingOrchestrator struct {
 	workerCount     int           // mu 下维护，覆盖 grading + anchor + recovery
 	workerIdle      chan struct{} // workerCount 归零时关闭；新一轮 0→1 时替换
 	// pageAssetLocks serializes the file+V19 compensated command by owner and
-	// SubmissionID, so two same-photo Jobs cannot race one failure cleanup against
+	// image content digest. Distinct source-scoped submissions can still share one
+	// page asset, so two same-photo Jobs must not race one failure cleanup against
 	// another successful reference.
 	pageAssetLocks map[string]*pageAssetLockEntry
 }
@@ -96,8 +99,8 @@ func (o *GradingOrchestrator) jobLock(jobID string) *sync.Mutex {
 	return l
 }
 
-func (o *GradingOrchestrator) acquirePageAssetLock(agentName, submissionID string) func() {
-	key := agentName + "\x00" + submissionID
+func (o *GradingOrchestrator) acquirePageAssetLock(agentName, imageDigest string) func() {
+	key := agentName + "\x00" + imageDigest
 	o.mu.Lock()
 	if o.pageAssetLocks == nil {
 		o.pageAssetLocks = map[string]*pageAssetLockEntry{}
@@ -192,6 +195,9 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 	if len(in.Photo.Image) == 0 {
 		return GradingJobView{}, false, fmt.Errorf("%w: Image 不可空", ErrInvalidInput)
 	}
+	if err := validateGradingSourceIdentity(in.SourceKind, in.SourceKey); err != nil {
+		return GradingJobView{}, false, err
+	}
 	if strings.TrimSpace(in.SourceKind) == "image_task" {
 		if in.BudgetSnapshot.PolicyVersion <= 0 {
 			return GradingJobView{}, false, fmt.Errorf(
@@ -214,8 +220,11 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 			)
 		}
 	}
-	sum := sha1.Sum(in.Photo.Image)
-	submissionID := "photo-" + hex.EncodeToString(sum[:])
+	submissionID := scopedPhotoSubmissionID(
+		in.Photo.Image,
+		in.SourceKind,
+		in.SourceKey,
+	)
 	v, found, err := o.deps.findGradingJobByIdempotency(
 		ctx, in.Photo.AgentName, in.SourceKind, in.SourceKey, 0,
 	)
@@ -224,7 +233,21 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 	}
 	created := false
 	if found {
-		if v.Fields.SubmissionID != submissionID {
+		if policyErr := k12.ValidateGradingRecognizingRequestPolicy(
+			v.Fields.ModelSnapshot,
+		); policyErr != nil {
+			return GradingJobView{}, false, fmt.Errorf(
+				"%w: stored grading model request policy is invalid: %v",
+				ErrInvalidInput,
+				policyErr,
+			)
+		}
+		if !photoSubmissionMatchesRequest(
+			v.Fields.SubmissionID,
+			in.Photo.Image,
+			in.SourceKind,
+			in.SourceKey,
+		) {
 			return GradingJobView{}, false, fmt.Errorf(
 				"%w: idempotency key %q is already bound to submission %q, requested %q",
 				ErrInvalidInput, v.Fields.IdempotencyKey, v.Fields.SubmissionID, submissionID,
@@ -276,9 +299,17 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 		if snap.Provider == "" || snap.Model == "" {
 			return GradingJobView{}, false, fmt.Errorf("%w: grading model snapshot 缺少 provider/model", ErrInvalidInput)
 		}
+		if policyErr := k12.ValidateGradingRecognizingRequestPolicy(snap); policyErr != nil {
+			return GradingJobView{}, false, fmt.Errorf(
+				"%w: invalid recognizing request policy: %v",
+				ErrInvalidInput,
+				policyErr,
+			)
+		}
 		v, created, err = o.deps.CreateGradingJob(ctx, in.Photo.AgentName, in.Photo.SourceSession, CreateGradingJobInput{
-			// Submission 聚合未落库（§6.9 类型化存储待接线）：以原图内容摘要为提交标识，
-			// 同图重投可追溯到同一 submission。
+			// Submission 聚合未落库（§6.9 类型化存储待接线）：新任务以图片摘要和
+			// canonical source command 的组合摘要为提交标识。同一来源命令重放稳定
+			// 命中；不同来源即使图片字节相同也必须隔离 Problem/Attempt 事实域。
 			SubmissionID:                submissionID,
 			SourceKind:                  in.SourceKind,
 			SourceKey:                   in.SourceKey,
@@ -600,8 +631,32 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 	if err != nil {
 		return GradingJobView{}, err
 	}
-	invocation, err := o.beginModelInvocation(ctx, job, k12.GradingStageRecognizing,
-		modelInvocationDigest([]byte(k12.GradingStageRecognizing), run.req.Image))
+	policy := k12.NormalizeModelRequestPolicySnapshot(
+		job.Fields.ModelSnapshot.RecognizingRequestPolicy,
+	)
+	if policyErr := k12.ValidateModelInvocationRequestPolicy(
+		k12.GradingStageRecognizing,
+		job.Fields.ModelSnapshot,
+		policy,
+	); policyErr != nil {
+		return o.failModelInvocationBeforeSend(
+			ctx,
+			run,
+			jobID,
+			fmt.Errorf("%w: %v", ErrModelRequestPolicyInvalid, policyErr),
+		)
+	}
+	invocation, err := o.beginModelInvocationWithPolicy(
+		ctx,
+		job,
+		k12.GradingStageRecognizing,
+		recognizingInvocationDigest(
+			run.req.Image,
+			job.Fields.ModelSnapshot,
+			policy,
+		),
+		policy,
+	)
 	if err != nil {
 		if invocation.InvocationID == "" {
 			return o.failModelInvocationBeforeSend(ctx, run, jobID, err)
@@ -624,6 +679,12 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 	// recovered jobs all honor the same absolute cutoff. context.WithDeadline
 	// also preserves an earlier caller/process deadline.
 	providerCtx, cancelProvider := gradingStageContext(ctx, job.Fields.Deadline)
+	if !invocation.RequestPolicySnapshot.IsZero() {
+		providerCtx = k12.WithGradingModelRequestPolicy(
+			providerCtx,
+			invocation.RequestPolicySnapshot,
+		)
+	}
 	unregisterProvider := o.registerGradingModelCall(jobID, cancelProvider)
 	if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), run.agentName, jobID); readErr != nil {
 		cancelProvider()
@@ -835,8 +896,8 @@ func (o *GradingOrchestrator) expireParentAutomaticStageBeforeSend(
 // persistRecognizedPhotoFacts is the compensated local command that promotes a
 // source image and its typed recognition together. The file store cannot join a
 // SQLite transaction, so a newly-created blob is removed if the atomic V19 write
-// fails. Same-submission calls are serialized to keep that cleanup race-free in
-// the single-process execution model.
+// fails. Same-owner/content calls are serialized even across distinct submission
+// scopes to keep that cleanup race-free in the single-process execution model.
 func (o *GradingOrchestrator) persistRecognizedPhotoFacts(
 	ctx context.Context,
 	run *gradingRun,
@@ -847,7 +908,7 @@ func (o *GradingOrchestrator) persistRecognizedPhotoFacts(
 		// Production assembly always injects PageAssets.
 		return o.persistProblemAttemptFacts(ctx, run.agentName, submissionID, run.questions)
 	}
-	release := o.acquirePageAssetLock(run.agentName, submissionID)
+	release := o.acquirePageAssetLock(run.agentName, photoImageDigest(run.req.Image))
 	defer release()
 
 	assetID, created, err := o.deps.PageAssets.Ensure(run.agentName, run.req.Image)
@@ -1322,6 +1383,10 @@ func (o *GradingOrchestrator) failModelInvocationBeforeSend(
 		kind = "invocation_identity_conflict"
 		retryable = false
 	}
+	if errors.Is(cause, ErrModelRequestPolicyInvalid) {
+		kind = "invocation_policy_invalid"
+		retryable = false
+	}
 	v, err := o.deps.AdvanceGradingStage(ctx, run.agentName, jobID, AdvanceGradingInput{
 		Outcome: GradingOutcomeFailed, FailureKind: kind, Retryable: retryable,
 	})
@@ -1418,6 +1483,62 @@ func shortSHA1(b []byte) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+const photoSubmissionV2Prefix = "photo-v2-"
+
+func photoImageDigest(image []byte) string {
+	sum := sha1.Sum(image)
+	return hex.EncodeToString(sum[:])
+}
+
+func legacyPhotoSubmissionID(image []byte) string {
+	return "photo-" + photoImageDigest(image)
+}
+
+// scopedPhotoSubmissionID separates the immutable domain identity of a user
+// submission from the image content digest. Source kind/key are already the
+// canonical idempotency command identity, while the embedded image digest
+// remains available for crash-recovery integrity checks.
+func scopedPhotoSubmissionID(image []byte, sourceKind, sourceKey string) string {
+	sourceHash := sha256.New()
+	var frame [8]byte
+	binary.BigEndian.PutUint64(frame[:], uint64(len(sourceKind)))
+	_, _ = sourceHash.Write(frame[:])
+	_, _ = sourceHash.Write([]byte(sourceKind))
+	binary.BigEndian.PutUint64(frame[:], uint64(len(sourceKey)))
+	_, _ = sourceHash.Write(frame[:])
+	_, _ = sourceHash.Write([]byte(sourceKey))
+	return photoSubmissionV2Prefix +
+		photoImageDigest(image) + "-" +
+		hex.EncodeToString(sourceHash.Sum(nil))
+}
+
+func photoSubmissionMatchesRequest(
+	submissionID string,
+	image []byte,
+	sourceKind, sourceKey string,
+) bool {
+	// Accept the legacy content-only identity when an existing idempotency key is
+	// replayed after upgrade. New tasks always use the source-scoped v2 identity.
+	return submissionID == legacyPhotoSubmissionID(image) ||
+		submissionID == scopedPhotoSubmissionID(image, sourceKind, sourceKey)
+}
+
+func photoSubmissionMatchesImage(submissionID string, image []byte) bool {
+	if submissionID == legacyPhotoSubmissionID(image) {
+		return true
+	}
+	prefix := photoSubmissionV2Prefix + photoImageDigest(image) + "-"
+	if !strings.HasPrefix(submissionID, prefix) {
+		return false
+	}
+	sourceDigest := strings.TrimPrefix(submissionID, prefix)
+	if len(sourceDigest) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(sourceDigest)
+	return err == nil
+}
+
 func modelInvocationDigest(parts ...[]byte) string {
 	h := sha256.New()
 	for _, part := range parts {
@@ -1425,6 +1546,24 @@ func modelInvocationDigest(parts ...[]byte) string {
 		_, _ = h.Write(part)
 	}
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+func recognizingInvocationDigest(
+	image []byte,
+	route k12.GradingModelSnapshot,
+	policy k12.ModelRequestPolicySnapshot,
+) string {
+	route = k12.NormalizeGradingModelSnapshot(route)
+	policy = k12.NormalizeModelRequestPolicySnapshot(policy)
+	routeJSON, _ := json.Marshal(route)
+	policyJSON, _ := json.Marshal(policy)
+	return modelInvocationDigest(
+		[]byte("k12-recognizing-request-v1"),
+		[]byte(k12.GradingStageRecognizing),
+		image,
+		routeJSON,
+		policyJSON,
+	)
 }
 
 func modelInvocationResultDigest(value any) string {
@@ -1441,11 +1580,29 @@ func invocationOutcomeUnknown(err error) bool {
 }
 
 func (o *GradingOrchestrator) beginModelInvocation(ctx context.Context, job GradingJobView, stage, requestDigest string) (k12.ModelInvocation, error) {
+	return o.beginModelInvocationWithPolicy(
+		ctx,
+		job,
+		stage,
+		requestDigest,
+		k12.ModelRequestPolicySnapshot{},
+	)
+}
+
+func (o *GradingOrchestrator) beginModelInvocationWithPolicy(
+	ctx context.Context,
+	job GradingJobView,
+	stage, requestDigest string,
+	policy k12.ModelRequestPolicySnapshot,
+) (k12.ModelInvocation, error) {
 	invocation, _, err := o.deps.Records.PrepareModelInvocation(ctx, k12.ModelInvocation{
 		InvocationID: "modelinv-" + idgen.ShortID(), AgentName: job.Record.AgentName,
 		JobID: job.Record.RecordID, Stage: stage, RequestDigest: requestDigest,
-		RouteSnapshot: job.Fields.ModelSnapshot, Attempt: job.Fields.AttemptCount + 1,
-		CreatedAt: o.deps.now(), UpdatedAt: o.deps.now(),
+		RouteSnapshot:         job.Fields.ModelSnapshot,
+		RequestPolicySnapshot: k12.NormalizeModelRequestPolicySnapshot(policy),
+		Attempt:               job.Fields.AttemptCount + 1,
+		CreatedAt:             o.deps.now(),
+		UpdatedAt:             o.deps.now(),
 	})
 	if err != nil {
 		return k12.ModelInvocation{}, err

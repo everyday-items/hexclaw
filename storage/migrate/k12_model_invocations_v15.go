@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS k12_model_invocations (
     provider TEXT NOT NULL,
     model TEXT NOT NULL,
     route_snapshot_json TEXT NOT NULL,
+    request_policy_snapshot_json TEXT NOT NULL DEFAULT '',
     provider_idempotency_key TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL CHECK(status IN ('prepared','sent','succeeded','failed','outcome_unknown','reconciled')),
     attempt INTEGER NOT NULL CHECK(attempt >= 1),

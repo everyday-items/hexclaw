@@ -15,17 +15,19 @@ import (
 var ErrModelInvocationConflict = errors.New("model invocation immutable identity conflict")
 
 const modelInvocationColumns = `invocation_id,agent_name,job_id,stage,request_digest,
-    provider,model,route_snapshot_json,provider_idempotency_key,status,attempt,
+    provider,model,route_snapshot_json,request_policy_snapshot_json,
+    provider_idempotency_key,status,attempt,
     result_digest,external_request_id,failure_kind,created_at,updated_at`
 
 func scanModelInvocation(row rowScanner) (k12.ModelInvocation, error) {
 	var invocation k12.ModelInvocation
-	var routeJSON, status string
+	var routeJSON, requestPolicyJSON, status string
 	err := row.Scan(&invocation.InvocationID, &invocation.AgentName, &invocation.JobID,
 		&invocation.Stage, &invocation.RequestDigest, &invocation.RouteSnapshot.Provider,
-		&invocation.RouteSnapshot.Model, &routeJSON, &invocation.ProviderIdempotencyKey,
-		&status, &invocation.Attempt, &invocation.ResultDigest, &invocation.ExternalRequestID,
-		&invocation.FailureKind, &invocation.CreatedAt, &invocation.UpdatedAt)
+		&invocation.RouteSnapshot.Model, &routeJSON, &requestPolicyJSON,
+		&invocation.ProviderIdempotencyKey, &status, &invocation.Attempt,
+		&invocation.ResultDigest, &invocation.ExternalRequestID, &invocation.FailureKind,
+		&invocation.CreatedAt, &invocation.UpdatedAt)
 	if err != nil {
 		return k12.ModelInvocation{}, err
 	}
@@ -33,6 +35,20 @@ func scanModelInvocation(row rowScanner) (k12.ModelInvocation, error) {
 		return k12.ModelInvocation{}, fmt.Errorf("k12storage: parse model invocation route snapshot: %w", err)
 	}
 	invocation.RouteSnapshot = k12.NormalizeGradingModelSnapshot(invocation.RouteSnapshot)
+	if strings.TrimSpace(requestPolicyJSON) != "" {
+		if err := json.Unmarshal(
+			[]byte(requestPolicyJSON),
+			&invocation.RequestPolicySnapshot,
+		); err != nil {
+			return k12.ModelInvocation{}, fmt.Errorf(
+				"k12storage: parse model invocation request policy snapshot: %w",
+				err,
+			)
+		}
+	}
+	invocation.RequestPolicySnapshot = k12.NormalizeModelRequestPolicySnapshot(
+		invocation.RequestPolicySnapshot,
+	)
 	invocation.Status = k12.ModelInvocationStatus(status)
 	return invocation, nil
 }
@@ -47,10 +63,20 @@ func validateModelInvocation(invocation *k12.ModelInvocation) error {
 	invocation.Stage = strings.TrimSpace(invocation.Stage)
 	invocation.RequestDigest = strings.TrimSpace(invocation.RequestDigest)
 	invocation.RouteSnapshot = k12.NormalizeGradingModelSnapshot(invocation.RouteSnapshot)
+	invocation.RequestPolicySnapshot = k12.NormalizeModelRequestPolicySnapshot(
+		invocation.RequestPolicySnapshot,
+	)
 	if invocation.InvocationID == "" || invocation.AgentName == "" || invocation.JobID == "" ||
 		invocation.Stage == "" || invocation.RequestDigest == "" || invocation.Attempt < 1 ||
 		invocation.RouteSnapshot.Provider == "" || invocation.RouteSnapshot.Model == "" || invocation.RouteSnapshot.Route == "" {
 		return fmt.Errorf("k12storage: model invocation missing id/owner/job/stage/digest/route/attempt")
+	}
+	if err := k12.ValidateModelInvocationRequestPolicy(
+		invocation.Stage,
+		invocation.RouteSnapshot,
+		invocation.RequestPolicySnapshot,
+	); err != nil {
+		return fmt.Errorf("k12storage: invalid model invocation request policy: %w", err)
 	}
 	return nil
 }
@@ -74,12 +100,21 @@ func (s *Store) PrepareModelInvocation(ctx context.Context, invocation k12.Model
 	if err != nil {
 		return k12.ModelInvocation{}, false, err
 	}
+	requestPolicyJSON := ""
+	if !invocation.RequestPolicySnapshot.IsZero() {
+		raw, marshalErr := json.Marshal(invocation.RequestPolicySnapshot)
+		if marshalErr != nil {
+			return k12.ModelInvocation{}, false, marshalErr
+		}
+		requestPolicyJSON = string(raw)
+	}
 	res, err := s.db.ExecContext(ctx, `INSERT INTO k12_model_invocations (`+modelInvocationColumns+`)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id,stage,attempt) DO NOTHING`,
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id,stage,attempt) DO NOTHING`,
 		invocation.InvocationID, invocation.AgentName, invocation.JobID, invocation.Stage,
 		invocation.RequestDigest, invocation.RouteSnapshot.Provider, invocation.RouteSnapshot.Model,
-		string(routeJSON), invocation.ProviderIdempotencyKey, invocation.Status, invocation.Attempt,
-		"", "", "", invocation.CreatedAt, invocation.UpdatedAt)
+		string(routeJSON), requestPolicyJSON, invocation.ProviderIdempotencyKey,
+		invocation.Status, invocation.Attempt, "", "", "", invocation.CreatedAt,
+		invocation.UpdatedAt)
 	if err != nil {
 		return k12.ModelInvocation{}, false, fmt.Errorf("k12storage: prepare model invocation: %w", err)
 	}
@@ -89,9 +124,8 @@ func (s *Store) PrepareModelInvocation(ctx context.Context, invocation k12.Model
 		return k12.ModelInvocation{}, false, err
 	}
 	if stored.AgentName != invocation.AgentName || stored.RequestDigest != invocation.RequestDigest ||
-		stored.RouteSnapshot.Provider != invocation.RouteSnapshot.Provider ||
-		stored.RouteSnapshot.Model != invocation.RouteSnapshot.Model ||
-		stored.RouteSnapshot.Route != invocation.RouteSnapshot.Route {
+		stored.RouteSnapshot != invocation.RouteSnapshot ||
+		stored.RequestPolicySnapshot != invocation.RequestPolicySnapshot {
 		return k12.ModelInvocation{}, false, fmt.Errorf("%w: job=%s stage=%s attempt=%d", ErrModelInvocationConflict,
 			invocation.JobID, invocation.Stage, invocation.Attempt)
 	}

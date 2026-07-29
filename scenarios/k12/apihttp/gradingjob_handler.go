@@ -86,7 +86,8 @@ type createGradingJobReq struct {
 	// ImageBase64 桌面拍照批改入口（§3.4 入口自编排收敛）：携带作业原图即创建照片批改 Job
 	// 并异步启动编排器推进（推进到 awaiting_confirmation 停点，前端轮询 GET）。
 	// 图片载体 = base64 / data URL（decodeRequiredImage）；原图不入 records Fields JSON，
-	// 由编排器落本地文件 + SubmissionID(photo-sha1) 内容校验（§6.15 设计申报）。
+	// 由编排器落本地文件 + source-scoped SubmissionID 中的图片摘要做内容校验；
+	// 旧 photo-sha1 任务仍可恢复（§6.15 设计申报）。
 	ImageBase64 string `json:"image_base64,omitempty"`
 	Subject     string `json:"subject,omitempty"`
 	Grade       string `json:"grade,omitempty"`

@@ -2,8 +2,6 @@ package usecase
 
 import (
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -22,7 +20,8 @@ import (
 //     真实产物（原图/识别题目/锚点结论/批改结果）落本地文件——崩溃恢复据此回放，
 //     不重复调用模型（§6.7 规则 3 / K12-INV-021）。
 //     图片载体设计申报：submission 原图不入 records 的 Fields JSON（base64 过大），
-//     以本地文件承载；SubmissionID = "photo-"+sha1(原图) 兼作内容校验（加载时必验）。
+//     以本地文件承载；新 SubmissionID 同时包含图片摘要和 canonical source command
+//     摘要，旧 "photo-"+sha1(原图) 仍可加载；两种格式恢复时都校验图片内容。
 //   - 异步执行模型：StartAsync 用与请求解耦的进程级 context + 有界并发信号量 + panic recover
 //     推进任务（任务 goroutine 不挂 HTTP 请求 context，请求结束不误杀在途批改）。
 //   - 崩溃恢复扫描：RecoverGradingJobs 列非终态 Job，从落盘运行时重建 run；
@@ -794,16 +793,35 @@ func (o *GradingOrchestrator) reconcileDurableGradingOutcome(
 
 	switch job.Fields.FailedStage {
 	case k12.GradingStageRecognizing:
-		wantRequestDigest := modelInvocationDigest(
-			[]byte(k12.GradingStageRecognizing), run.req.Image,
+		wantPolicy := k12.NormalizeModelRequestPolicySnapshot(
+			job.Fields.ModelSnapshot.RecognizingRequestPolicy,
+		)
+		if err := k12.ValidateModelInvocationRequestPolicy(
+			k12.GradingStageRecognizing,
+			job.Fields.ModelSnapshot,
+			invocation.RequestPolicySnapshot,
+		); err != nil {
+			return false, GradingJobView{}, fmt.Errorf(
+				"recognition invocation request policy drift: %w",
+				err,
+			)
+		}
+		if invocation.RequestPolicySnapshot != wantPolicy {
+			return false, GradingJobView{}, fmt.Errorf(
+				"recognition invocation request policy drift",
+			)
+		}
+		wantRequestDigest := recognizingInvocationDigest(
+			run.req.Image,
+			job.Fields.ModelSnapshot,
+			wantPolicy,
 		)
 		if invocation.RequestDigest != wantRequestDigest {
 			return false, GradingJobView{}, fmt.Errorf("recognition invocation request digest drift")
 		}
-		// SubmissionID is content-derived and shared by separate same-photo Jobs.
-		// A generic Problem/Attempt snapshot can therefore be stale evidence from
-		// another route/attempt. Only this Job's append-only recognition receipt
-		// can prove which result belongs to the ambiguous invocation.
+		// A source-scoped Problem/Attempt snapshot can still contain facts from an
+		// earlier invocation of this Job. Only this Job's append-only recognition
+		// receipt proves which result belongs to the ambiguous invocation.
 		receipt, ok := o.readRecognitionReceipt(job.Record.RecordID)
 		if !ok || receipt.AgentName != run.agentName ||
 			receipt.InvocationID != invocation.InvocationID {
@@ -1218,10 +1236,15 @@ func (o *GradingOrchestrator) ensureRun(ctx context.Context, jobID string) (*gra
 		if err != nil {
 			return nil, fmt.Errorf("usecase: 批改任务 %s 原图不可读: %w", jobID, err)
 		}
-		// 内容校验：SubmissionID = photo-sha1(原图)，防落盘文件被替换/半写。
-		sum := sha1.Sum(image)
-		if want := "photo-" + hex.EncodeToString(sum[:]); v.Fields.SubmissionID != want {
-			return nil, fmt.Errorf("usecase: 批改任务 %s 原图校验失败（submission=%s 实测=%s）", jobID, v.Fields.SubmissionID, want)
+		// 内容校验：兼容 legacy photo-sha1 与 source-scoped photo-v2；两者都把
+		// 原图摘要冻结进 SubmissionID，防落盘文件被替换或半写。
+		if !photoSubmissionMatchesImage(v.Fields.SubmissionID, image) {
+			return nil, fmt.Errorf(
+				"usecase: 批改任务 %s 原图校验失败（submission=%s 实测摘要=%s）",
+				jobID,
+				v.Fields.SubmissionID,
+				photoImageDigest(image),
+			)
 		}
 	}
 	run := &gradingRun{
