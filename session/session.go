@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hexagon-codes/hexagon"
@@ -149,6 +150,7 @@ func (m *Manager) SaveAssistantMessageRecord(ctx context.Context, sessionID, con
 
 // AssistantMeta 助手消息的完整元数据。
 type AssistantMeta struct {
+	MessageID        string
 	Reasoning        string
 	ThinkingDuration int
 	Provider         string
@@ -164,7 +166,10 @@ type AssistantMeta struct {
 	// ReplyMetadata carries structured UI metadata that must survive reload.
 	// SaveAssistantReply applies its own allowlist; callers may pass the live
 	// reply map without persisting routing, credentials, or internal flags.
-	ReplyMetadata map[string]string
+	ReplyMetadata       map[string]string
+	ReasoningDisclosure adapter.ReasoningDisclosure
+	RuntimeEvents       []adapter.SequencedRuntimeEvent
+	LastSequence        uint64
 }
 
 var replySafeAssistantMetadataKeys = map[string]struct{}{
@@ -199,7 +204,14 @@ func (m *Manager) SaveAssistantMessageFull(ctx context.Context, sessionID, conte
 // 所有元数据（reasoning、duration、provider、model、agent）一次性写入 meta 字段。
 func (m *Manager) SaveAssistantReply(ctx context.Context, sessionID, content string, am AssistantMeta) (*storage.MessageRecord, error) {
 	metaMap := map[string]any{}
-	if am.Reasoning != "" {
+	disclosure := am.ReasoningDisclosure
+	if disclosure.Visibility == "" {
+		disclosure = ReasoningDisclosureFromContext(ctx)
+	}
+	if disclosure.Visibility == "" {
+		disclosure.Visibility = adapter.ReasoningNotExposed
+	}
+	if am.Reasoning != "" && disclosure.Visibility == adapter.ReasoningVisible {
 		metaMap["reasoning"] = am.Reasoning
 	}
 	if am.ThinkingDuration > 0 {
@@ -228,14 +240,29 @@ func (m *Manager) SaveAssistantReply(ctx context.Context, sessionID, content str
 			metaMap[key] = value
 		}
 	}
+	messageID := am.MessageID
+	if messageID == "" {
+		messageID = assistantMessageIDFromContext(ctx)
+	}
+	if messageID != "" {
+		metaMap["assistant_message_id"] = messageID
+		metaMap["backend_message_id"] = messageID
+		metaMap["message_id"] = messageID
+		metaMap["reasoning_disclosure"] = disclosure
+		metaMap["runtime_events"] = append([]adapter.SequencedRuntimeEvent(nil), am.RuntimeEvents...)
+		metaMap["last_sequence"] = am.LastSequence
+	}
 	meta := "{}"
 	if len(metaMap) > 0 {
 		if b, err := json.Marshal(metaMap); err == nil {
 			meta = string(b)
 		}
 	}
+	if messageID == "" {
+		messageID = "msg-" + idgen.ShortID()
+	}
 	msg := &storage.MessageRecord{
-		ID:        "msg-" + idgen.ShortID(),
+		ID:        messageID,
 		SessionID: sessionID,
 		Role:      "assistant",
 		Content:   content,
@@ -247,6 +274,85 @@ func (m *Manager) SaveAssistantReply(ctx context.Context, sessionID, content str
 		return nil, err
 	}
 	return msg, nil
+}
+
+type assistantMessageIDContextKey struct{}
+type reasoningDisclosureContextKey struct{}
+
+type reasoningDisclosureState struct {
+	mu         sync.Mutex
+	disclosure adapter.ReasoningDisclosure
+}
+
+func WithAssistantMessageID(ctx context.Context, messageID string) context.Context {
+	return context.WithValue(ctx, assistantMessageIDContextKey{}, messageID)
+}
+
+func WithReasoningDisclosureState(ctx context.Context) context.Context {
+	return context.WithValue(ctx, reasoningDisclosureContextKey{}, &reasoningDisclosureState{
+		disclosure: adapter.ReasoningDisclosure{Visibility: adapter.ReasoningNotExposed},
+	})
+}
+
+func RecordReasoningDisclosure(ctx context.Context, disclosure adapter.ReasoningDisclosure) {
+	if disclosure.Visibility != adapter.ReasoningVisible || ctx == nil {
+		return
+	}
+	state, _ := ctx.Value(reasoningDisclosureContextKey{}).(*reasoningDisclosureState)
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	state.disclosure = disclosure
+	state.mu.Unlock()
+}
+
+func ReasoningDisclosureFromContext(ctx context.Context) adapter.ReasoningDisclosure {
+	if ctx == nil {
+		return adapter.ReasoningDisclosure{Visibility: adapter.ReasoningNotExposed}
+	}
+	state, _ := ctx.Value(reasoningDisclosureContextKey{}).(*reasoningDisclosureState)
+	if state == nil {
+		return adapter.ReasoningDisclosure{Visibility: adapter.ReasoningNotExposed}
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.disclosure
+}
+
+func assistantMessageIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	messageID, _ := ctx.Value(assistantMessageIDContextKey{}).(string)
+	return messageID
+}
+
+func (m *Manager) PersistAssistantRuntimeSnapshot(
+	ctx context.Context,
+	messageID string,
+	snapshot adapter.RuntimeSnapshot,
+) error {
+	record, err := m.store.GetMessage(ctx, messageID)
+	if err != nil {
+		return err
+	}
+	meta := map[string]any{}
+	if record.Metadata != "" {
+		_ = json.Unmarshal([]byte(record.Metadata), &meta)
+	}
+	meta["assistant_message_id"] = messageID
+	meta["backend_message_id"] = messageID
+	meta["message_id"] = messageID
+	meta["reasoning_disclosure"] = snapshot.ReasoningDisclosure
+	meta["runtime_events"] = snapshot.RuntimeEvents
+	meta["last_sequence"] = snapshot.LastSequence
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	record.Metadata = string(raw)
+	return m.saveMessage(ctx, record)
 }
 
 // saveMessage 持久化一条消息，并对 SQLite 写写冲突（SQLITE_BUSY/517）做有限退避重试。

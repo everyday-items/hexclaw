@@ -48,6 +48,13 @@ func TestRegistry_StartAppendComplete(t *testing.T) {
 		Content:   "hello",
 		Reasoning: "think",
 		Metadata:  map[string]string{"k": "v"},
+		ReasoningDisclosure: adapter.ReasoningDisclosure{
+			Visibility: adapter.ReasoningVisible,
+			Source:     "ollama",
+			Dialect:    "message.thinking",
+			Provider:   "ollama",
+			Model:      "test-model",
+		},
 	})
 	if s2 == nil || s2.Status != StatusStreaming {
 		t.Fatalf("append 后应 streaming, 实际 %+v", s2)

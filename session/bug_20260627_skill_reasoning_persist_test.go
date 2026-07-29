@@ -94,6 +94,13 @@ func TestSaveAssistantReply_ReasoningSurvivesReload_BUG20260627(t *testing.T) {
 		ThinkingDuration: 21,
 		Provider:         "siliconflow",
 		Model:            "Qwen3",
+		ReasoningDisclosure: adapter.ReasoningDisclosure{
+			Visibility: adapter.ReasoningVisible,
+			Source:     "openai_compatible",
+			Dialect:    "delta.reasoning_content",
+			Provider:   "siliconflow",
+			Model:      "Qwen3",
+		},
 	}); err != nil {
 		t.Fatalf("save assistant: %v", err)
 	}

@@ -678,12 +678,17 @@ func (c *ImageTaskCoordinator) expireImageTaskGapIfDue(
 // checkpoint. It is deliberately separate from Create: POST acceptance returns
 // the dispatch identity before any classifier/OCR/feedback provider call.
 func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
-	if c == nil {
+	if c == nil || c.Records == nil {
 		return false
 	}
 	agentName = strings.TrimSpace(agentName)
 	dispatchID = strings.TrimSpace(dispatchID)
 	if agentName == "" || dispatchID == "" {
+		return false
+	}
+	if _, err := c.Records.GetImageTaskDispatch(
+		context.Background(), agentName, dispatchID,
+	); err != nil {
 		return false
 	}
 	key := agentName + "\x00" + dispatchID

@@ -698,6 +698,53 @@ func TestImageTaskCoordinatorQuiesceAgentCancelsSentWorkerWithoutGlobalSeal(t *t
 	}
 }
 
+func TestImageTaskCoordinatorStartAsyncRejectsCascadedDispatchAfterAgentDelete(t *testing.T) {
+	classifier := &imageTaskClassifierStub{
+		result: ImageTaskClassification{
+			Intent: k12.ImageTaskIntentArtwork, IntentEvidence: []string{"drawing"},
+			Confidence: 1,
+		},
+	}
+	coordinator, _ := newImageTaskCoordinatorForTest(t, classifier)
+	prepared, _, err := coordinator.Create(
+		context.Background(), testCreateImageTaskInput(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	resume, err := coordinator.QuiesceAgent(drainCtx, "mingming")
+	if err != nil {
+		t.Fatalf("quiesce target Agent: %v", err)
+	}
+	if _, err := coordinator.Records.DB().ExecContext(
+		context.Background(),
+		`DELETE FROM agents WHERE name=?`,
+		"mingming",
+	); err != nil {
+		t.Fatalf("delete target Agent and cascade dispatch: %v", err)
+	}
+	if _, err := coordinator.Records.GetImageTaskDispatch(
+		context.Background(), "mingming", prepared.Dispatch.DispatchID,
+	); !errors.Is(err, k12storage.ErrImageTaskNotFound) {
+		t.Fatalf("dispatch survived Agent cascade: %v", err)
+	}
+	resume()
+
+	accepted := coordinator.StartAsync("mingming", prepared.Dispatch.DispatchID)
+	if err := coordinator.Wait(drainCtx); err != nil {
+		t.Fatal(err)
+	}
+	if accepted {
+		t.Fatal("deleted Agent dispatch registered a transient worker")
+	}
+	if classifier.calls != 0 {
+		t.Fatalf("deleted Agent dispatch reached Provider %d times", classifier.calls)
+	}
+}
+
 func TestImageTaskCoordinatorProviderTimeoutAndAmbiguousTransportNeverBlindRetry(t *testing.T) {
 	t.Run("deadline", func(t *testing.T) {
 		classifier := &imageTaskClassifierStub{block: make(chan struct{})}
