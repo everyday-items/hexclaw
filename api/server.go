@@ -1074,8 +1074,14 @@ type ChatResponse struct {
 	ToolCalls      []adapter.ToolCall             `json:"tool_calls,omitempty"`      // 工具调用记录
 	Blocks         []adapter.Block                `json:"blocks,omitempty"`          // 有序内容块（多步交错按序渲染）
 	// U9：结构化 RAG/记忆命中（非空时前端渲染「知识库命中」「记忆命中」标签+详情）。
-	KnowledgeHits []adapter.KnowledgeHit `json:"knowledge_hits,omitempty"`
-	MemoryHits    []adapter.MemoryHit    `json:"memory_hits,omitempty"`
+	KnowledgeHits       []adapter.KnowledgeHit          `json:"knowledge_hits,omitempty"`
+	MemoryHits          []adapter.MemoryHit             `json:"memory_hits,omitempty"`
+	AssistantMessageID  string                          `json:"assistant_message_id,omitempty"`
+	BackendMessageID    string                          `json:"backend_message_id,omitempty"`
+	MessageID           string                          `json:"message_id,omitempty"`
+	LastSequence        uint64                          `json:"last_sequence,omitempty"`
+	ReasoningDisclosure adapter.ReasoningDisclosure     `json:"reasoning_disclosure"`
+	RuntimeEvents       []adapter.SequencedRuntimeEvent `json:"runtime_events,omitempty"`
 }
 
 // handleChat 同步聊天端点
@@ -1264,6 +1270,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		var blocks []adapter.Block
 		var knowledgeHits []adapter.KnowledgeHit
 		var memoryHits []adapter.MemoryHit
+		var assistantMessageID string
+		var backendMessageID string
+		var messageID string
+		var lastSequence uint64
+		var reasoningDisclosure adapter.ReasoningDisclosure
+		var runtimeEvents []adapter.SequencedRuntimeEvent
 		for chunk := range chunks {
 			if chunk.Error != nil {
 				trace.L(ctx).Error("处理失败", "err", chunk.Error)
@@ -1273,6 +1285,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			content.WriteString(chunk.Content)
+			assistantMessageID = chunk.AssistantMessageID
+			backendMessageID = chunk.BackendMessageID
+			messageID = chunk.MessageID
+			lastSequence = chunk.Sequence
+			reasoningDisclosure = chunk.ReasoningDisclosure
+			if chunk.RuntimeEvent != nil {
+				runtimeEvents = append(runtimeEvents, adapter.SequencedRuntimeEvent{
+					Sequence: chunk.Sequence,
+					Event:    *chunk.RuntimeEvent,
+				})
+			}
 			if chunk.Done {
 				metadata = chunk.Metadata
 				usage = chunk.Usage
@@ -1287,13 +1310,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// 覆盖 <think>/<thinking>/<reasoning> 三种标签、任意位置（含中间嵌入）、多段、未闭合残段
 		finalContent := engine.StripAllThinking(content.String())
 		reply = &adapter.Reply{
-			Content:       finalContent,
-			Metadata:      metadata,
-			Usage:         usage,
-			ToolCalls:     toolCalls,
-			Blocks:        blocks,
-			KnowledgeHits: knowledgeHits,
-			MemoryHits:    memoryHits,
+			Content:             finalContent,
+			Metadata:            metadata,
+			Usage:               usage,
+			ToolCalls:           toolCalls,
+			Blocks:              blocks,
+			KnowledgeHits:       knowledgeHits,
+			MemoryHits:          memoryHits,
+			AssistantMessageID:  assistantMessageID,
+			BackendMessageID:    backendMessageID,
+			MessageID:           messageID,
+			LastSequence:        lastSequence,
+			ReasoningDisclosure: reasoningDisclosure,
+			RuntimeEvents:       runtimeEvents,
 		}
 	} else {
 		var err error
@@ -1315,16 +1344,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		canonical = canonicalChatContent(reply.Content, reply.Metadata)
 	}
 	writeJSON(w, http.StatusOK, ChatResponse{
-		Reply:          reply.Content,
-		MessageContent: canonical,
-		RenderManifest: reply.RenderManifest,
-		SessionID:      msg.SessionID,
-		Metadata:       reply.Metadata,
-		Usage:          reply.Usage,
-		ToolCalls:      reply.ToolCalls,
-		Blocks:         reply.Blocks,
-		KnowledgeHits:  reply.KnowledgeHits,
-		MemoryHits:     reply.MemoryHits,
+		Reply:              reply.Content,
+		MessageContent:     canonical,
+		RenderManifest:     reply.RenderManifest,
+		SessionID:          msg.SessionID,
+		Metadata:           reply.Metadata,
+		Usage:              reply.Usage,
+		ToolCalls:          reply.ToolCalls,
+		Blocks:             reply.Blocks,
+		KnowledgeHits:      reply.KnowledgeHits,
+		MemoryHits:         reply.MemoryHits,
+		AssistantMessageID: reply.Metadata["assistant_message_id"],
+		BackendMessageID:   reply.Metadata["backend_message_id"],
+		MessageID:          reply.Metadata["message_id"],
 	})
 }
 
@@ -1397,8 +1429,14 @@ func (s *Server) handleChatSSE(
 			hadError = true
 			trace.L(ctx).Error("[SSE] chunk 错误", "err", chunk.Error, "chunks_so_far", chunkCount)
 			errPayload, _ := json.Marshal(map[string]any{
-				"error": upstreamerr.PublicMessage(chunk.Error, "error"),
-				"done":  true,
+				"error":                upstreamerr.PublicMessage(chunk.Error, "error"),
+				"done":                 true,
+				"assistant_message_id": chunk.AssistantMessageID,
+				"backend_message_id":   chunk.BackendMessageID,
+				"message_id":           chunk.MessageID,
+				"sequence":             chunk.Sequence,
+				"reasoning_disclosure": chunk.ReasoningDisclosure,
+				"runtime_event":        chunk.RuntimeEvent,
 			})
 			_ = writer.WriteData(string(errPayload))
 			return

@@ -581,7 +581,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// v0.4.3 §11.10 统一安全闸：PermissionPolicy 为单一权限闸（GA 默认 ON）。无人值守
 	// 来源没有交互审批人，因此按 security.autonomy profile + 显式矩阵决定是否自动放行；
 	// ActionDeny 仍优先，矩阵未命中则 fail-closed。
-	permHub := engine.NewPermissionHub(60 * time.Second)
+	permHub := engine.NewPermissionHubWithRememberedGrantStore(60*time.Second, store)
 
 	// 6.1.0 自动化权限治理数据面：权限决策审计日志 + 任务级授权。
 	// 初始化失败只降级（闸照常工作，少审计/grant），不阻断启动。
@@ -2302,9 +2302,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				Deps: &k12rt.Deps, Records: k12rt.Records, BaseContext: ctx,
 			}
 			imageTaskAdapter := k12engineadapter.NewImageTaskAdapter(visionFn)
-				k12ImageTasks = &k12usecase.ImageTaskCoordinator{
-					Records: k12rt.Records, Classifier: imageTaskAdapter,
-					WritingOCR: imageTaskAdapter, Grading: k12GradingOrch,
+			k12ImageTasks = &k12usecase.ImageTaskCoordinator{
+				Records: k12rt.Records, Classifier: imageTaskAdapter,
+				WritingOCR: imageTaskAdapter, Grading: k12GradingOrch,
 				WorkFeedback:          &k12rt.Deps,
 				BaseContext:           ctx,
 				GradingBudgetSnapshot: k12rt.Deps.GradingBudgetSnapshot,
@@ -2361,14 +2361,14 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					if modelID == "" {
 						modelID = strings.TrimSpace(providerConfig.Model)
 					}
-						return providerConfig.DisplayName, modelID
-					},
-				}
-				srv.SetAgentResourceCleaner(k12CronRegistrar{
-					sched: scheduler, router: agentRouter, webhookMgr: webhookMgr,
-					imageTasks: k12ImageTasks, workFeedback: k12WorkFeedback,
-				})
-				if webhookMgr != nil {
+					return providerConfig.DisplayName, modelID
+				},
+			}
+			srv.SetAgentResourceCleaner(k12CronRegistrar{
+				sched: scheduler, router: agentRouter, webhookMgr: webhookMgr,
+				imageTasks: k12ImageTasks, workFeedback: k12WorkFeedback,
+			})
+			if webhookMgr != nil {
 				// DD-019: K12 Webhook is a TriggerAdapter into the same application
 				// commands as Desktop/IM/Workflow; it never falls back to the generic
 				// webhook-system prompt path.
@@ -2895,11 +2895,12 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			srv.SetStreamStateProvider(wa)
 
 			// 接通工具审批: WebAdapter ↔ PermissionHub
-			wa.SetApprovalResponseHandler(func(reqID string, approved, remember bool) {
-				permHub.HandleResponse(engine.PermissionResponse{
-					RequestID: reqID,
-					Approved:  approved,
-					Remember:  remember,
+			wa.SetApprovalDecisionHandler(func(resp webadapter.ApprovalResponseData) string {
+				return permHub.HandleResponseResult(engine.PermissionResponse{
+					RequestID: resp.RequestID, InvocationID: resp.InvocationID,
+					ArgumentsDigest: resp.ArgumentsDigest, SecurityScopeDigest: resp.SecurityScopeDigest,
+					IdempotencyKey: resp.IdempotencyKey,
+					Approved:       resp.Approved, Remember: resp.Remember,
 				})
 			})
 			permHub.SetSender(&webPermissionBridge{wa: wa})
@@ -3155,11 +3156,10 @@ type webPermissionBridge struct {
 
 func (b *webPermissionBridge) SendPermissionRequest(ctx context.Context, sessionID string, req *engine.PermissionRequest) error {
 	return b.wa.SendPermissionRequest(ctx, sessionID, &webadapter.PermissionRequestData{
-		ID:        req.ID,
-		ToolName:  req.ToolName,
-		Arguments: req.Arguments,
-		Risk:      req.Risk,
-		Reason:    req.Reason,
+		ID: req.ID, OwnerID: req.OwnerID, InvocationID: req.InvocationID,
+		ToolName: req.ToolName, Arguments: req.Arguments,
+		ArgumentsDigest: req.ArgumentsDigest, SecurityScopeDigest: req.SecurityScopeDigest,
+		DeadlineAt: req.DeadlineAt, Risk: req.Risk, Reason: req.Reason,
 	})
 }
 
@@ -3193,10 +3193,10 @@ func (a unattendedRiskAdapter) AssessLowRisk(ctx context.Context, action, payloa
 // k12CronRegistrar 把平台 cron.Scheduler 包成 K12 的 CronRegistrar 缝（AP-1：K12 不 import cron）。
 // 用 AddJobFromScript 直接喂 K12 产的确定性 Starlark 脚本，跳过 LLM 编译。
 type k12CronRegistrar struct {
-	sched      *cron.Scheduler
-	router     *agentrouter.Dispatcher
-	webhookMgr *webhook.Manager
-	imageTasks k12AgentWorkerQuiescer
+	sched        *cron.Scheduler
+	router       *agentrouter.Dispatcher
+	webhookMgr   *webhook.Manager
+	imageTasks   k12AgentWorkerQuiescer
 	workFeedback k12AgentWorkerQuiescer
 }
 
@@ -3524,22 +3524,22 @@ func (r k12CronRegistrar) DetachAgentResources(
 	var detached []*cron.Job
 	if r.sched != nil {
 		detached, err = r.sched.RemoveJobsBySourceKeyPrefix(ctx, agent.Name+"/")
-			if err != nil {
-				// cron 摘除失败：先回填已删资产，避免半清理残缺。
-				if rErr := assetSnap.Restore(); rErr != nil {
-					resumeWorkers()
-					return api.AgentResourceDetach{}, fmt.Errorf("清理 K12 定时任务失败(%v)；资产回滚亦失败: %w", err, rErr)
-				}
-				if restoreWebhooks != nil {
-					if rErr := restoreWebhooks(context.WithoutCancel(ctx)); rErr != nil {
-						resumeWorkers()
-						return api.AgentResourceDetach{}, fmt.Errorf("清理 K12 定时任务失败(%v)；Webhook 回滚亦失败: %w", err, rErr)
-					}
-				}
+		if err != nil {
+			// cron 摘除失败：先回填已删资产，避免半清理残缺。
+			if rErr := assetSnap.Restore(); rErr != nil {
 				resumeWorkers()
-				return api.AgentResourceDetach{}, fmt.Errorf("清理 K12 定时任务: %w", err)
+				return api.AgentResourceDetach{}, fmt.Errorf("清理 K12 定时任务失败(%v)；资产回滚亦失败: %w", err, rErr)
 			}
+			if restoreWebhooks != nil {
+				if rErr := restoreWebhooks(context.WithoutCancel(ctx)); rErr != nil {
+					resumeWorkers()
+					return api.AgentResourceDetach{}, fmt.Errorf("清理 K12 定时任务失败(%v)；Webhook 回滚亦失败: %w", err, rErr)
+				}
+			}
+			resumeWorkers()
+			return api.AgentResourceDetach{}, fmt.Errorf("清理 K12 定时任务: %w", err)
 		}
+	}
 
 	return api.AgentResourceDetach{
 		Commit: resumeWorkers,

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/messagecontent"
 	"github.com/hexagon-codes/hexclaw/storage"
 )
@@ -50,6 +51,7 @@ func canonicalRenderProjection(producer messagecontent.ProducerKind, locale, mar
 
 func hydrateMessageContents(messages []*storage.MessageRecord) {
 	for _, message := range messages {
+		hydrateMessageRuntimeWire(message)
 		if message == nil || strings.TrimSpace(message.Content) == "" {
 			continue
 		}
@@ -72,6 +74,46 @@ func hydrateMessageContents(messages []*storage.MessageRecord) {
 			)
 		}
 	}
+}
+
+func hydrateMessageRuntimeWire(message *storage.MessageRecord) {
+	if message == nil || message.Role != "assistant" {
+		return
+	}
+	var runtimeMeta struct {
+		AssistantMessageID  string                          `json:"assistant_message_id"`
+		BackendMessageID    string                          `json:"backend_message_id"`
+		MessageID           string                          `json:"message_id"`
+		ReasoningDisclosure adapter.ReasoningDisclosure     `json:"reasoning_disclosure"`
+		RuntimeEvents       []adapter.SequencedRuntimeEvent `json:"runtime_events"`
+		LastSequence        uint64                          `json:"last_sequence"`
+	}
+	raw := message.Metadata
+	if raw == "" || raw == "{}" {
+		raw = message.Meta
+	}
+	_ = json.Unmarshal([]byte(raw), &runtimeMeta)
+	message.AssistantMessageID = runtimeMeta.AssistantMessageID
+	if message.AssistantMessageID == "" {
+		message.AssistantMessageID = message.ID
+	}
+	message.BackendMessageID = runtimeMeta.BackendMessageID
+	if message.BackendMessageID == "" {
+		message.BackendMessageID = message.AssistantMessageID
+	}
+	message.MessageID = runtimeMeta.MessageID
+	if message.MessageID == "" {
+		message.MessageID = message.AssistantMessageID
+	}
+	message.ReasoningDisclosure = runtimeMeta.ReasoningDisclosure
+	if message.ReasoningDisclosure.Visibility == "" {
+		message.ReasoningDisclosure.Visibility = adapter.ReasoningNotExposed
+	}
+	message.RuntimeEvents = runtimeMeta.RuntimeEvents
+	if message.RuntimeEvents == nil {
+		message.RuntimeEvents = []adapter.SequencedRuntimeEvent{}
+	}
+	message.LastSequence = runtimeMeta.LastSequence
 }
 
 func mergeStringMetadata(target map[string]string, raw string) {
