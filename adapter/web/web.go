@@ -41,6 +41,9 @@ type WebAdapter struct {
 	disconnectGrace    time.Duration
 	streams            *streamstate.Registry
 	onApprovalResponse func(requestID string, approved, remember bool) // callback for tool approval
+	onApprovalDecision func(ApprovalResponseData) string
+	approvalACKMu      sync.Mutex
+	approvalACKs       sync.Map // idempotency key -> approvalACKRecord
 }
 
 type requestSubscribers struct {
@@ -160,13 +163,37 @@ func (a *WebAdapter) SetApprovalResponseHandler(fn func(requestID string, approv
 	a.onApprovalResponse = fn
 }
 
+// ApprovalResponseData carries one immutable approval decision identity.
+type ApprovalResponseData struct {
+	RequestID           string
+	DecisionID          string
+	InvocationID        string
+	Decision            string
+	IdempotencyKey      string
+	ArgumentsDigest     string
+	SecurityScopeDigest string
+	Approved            bool
+	Remember            bool
+}
+
+// SetApprovalDecisionHandler installs the durable coordinator callback used
+// before a terminal ACK is emitted.
+func (a *WebAdapter) SetApprovalDecisionHandler(fn func(ApprovalResponseData) string) {
+	a.onApprovalDecision = fn
+}
+
 // PermissionRequestData is the data needed to send a tool approval request.
 type PermissionRequestData struct {
-	ID        string
-	ToolName  string
-	Arguments map[string]any
-	Risk      string
-	Reason    string
+	ID                  string
+	OwnerID             string
+	InvocationID        string
+	ToolName            string
+	Arguments           map[string]any
+	ArgumentsDigest     string
+	SecurityScopeDigest string
+	DeadlineAt          time.Time
+	Risk                string
+	Reason              string
 }
 
 // SendPermissionRequest sends a tool approval request to the frontend via WebSocket.
@@ -195,14 +222,26 @@ func (a *WebAdapter) SendPermissionRequest(ctx context.Context, sessionID string
 
 func permissionRequestMessage(sessionID string, data *PermissionRequestData) wsMessage {
 	return wsMessage{
-		Type:      "tool_approval_request",
-		SessionID: sessionID,
-		RequestID: data.ID,
-		Content:   data.Reason,
+		Type:                "tool_approval_request",
+		SessionID:           sessionID,
+		RequestID:           data.ID,
+		OwnerID:             data.OwnerID,
+		Content:             data.Reason,
+		Arguments:           data.Arguments,
+		InvocationID:        data.InvocationID,
+		ToolName:            data.ToolName,
+		ArgumentsDigest:     data.ArgumentsDigest,
+		SecurityScopeDigest: data.SecurityScopeDigest,
+		DeadlineAt:          data.DeadlineAt.Format(time.RFC3339Nano),
 		Metadata: map[string]string{
-			"request_id": data.ID,
-			"tool_name":  data.ToolName,
-			"risk":       data.Risk,
+			"request_id":            data.ID,
+			"approval_request_id":   data.ID,
+			"invocation_id":         data.InvocationID,
+			"tool_name":             data.ToolName,
+			"risk":                  data.Risk,
+			"arguments_digest":      data.ArgumentsDigest,
+			"security_scope_digest": data.SecurityScopeDigest,
+			"deadline_at":           data.DeadlineAt.Format(time.RFC3339Nano),
 		},
 	}
 }
@@ -297,15 +336,22 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 	for chunk := range chunks {
 		if chunk.Error != nil {
 			if requestID != "" && a.streams != nil {
+				a.streams.Append(requestID, chunk)
 				a.streams.Fail(requestID, chunk.Error)
 			}
 			errMsg := wsMessage{
 				Type: "error",
 				// 与启动失败路径(web.go streamHandler err)及 SSE/HTTP 一致：净化上游错误，
 				// 不把 provider 原始 JSON / 内部前缀灌进聊天气泡。
-				Content:   upstreamerr.PublicMessage(chunk.Error, "error"),
-				SessionID: sessionID,
-				RequestID: requestID,
+				Content:             upstreamerr.PublicMessage(chunk.Error, "error"),
+				SessionID:           sessionID,
+				RequestID:           requestID,
+				AssistantMessageID:  chunk.AssistantMessageID,
+				BackendMessageID:    chunk.BackendMessageID,
+				MessageID:           chunk.MessageID,
+				Sequence:            chunk.Sequence,
+				ReasoningDisclosure: chunk.ReasoningDisclosure,
+				RuntimeEvent:        chunk.RuntimeEvent,
 			}
 			_ = a.sendToTargets(ctx, chatID, requestID, errMsg)
 			return chunk.Error
@@ -324,18 +370,24 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 		}
 
 		msg := wsMessage{
-			Type:          "chunk",
-			Content:       chunk.Content,
-			Reasoning:     chunk.Reasoning,
-			Done:          chunk.Done,
-			SessionID:     sessionID,
-			RequestID:     requestID,
-			Metadata:      chunk.Metadata,
-			Usage:         chunk.Usage,
-			ToolCalls:     chunk.ToolCalls,
-			Blocks:        chunk.Blocks,
-			KnowledgeHits: chunk.KnowledgeHits, // U9
-			MemoryHits:    chunk.MemoryHits,
+			Type:                "chunk",
+			Content:             chunk.Content,
+			Reasoning:           chunk.Reasoning,
+			Done:                chunk.Done,
+			SessionID:           sessionID,
+			RequestID:           requestID,
+			Metadata:            chunk.Metadata,
+			Usage:               chunk.Usage,
+			ToolCalls:           chunk.ToolCalls,
+			Blocks:              chunk.Blocks,
+			KnowledgeHits:       chunk.KnowledgeHits, // U9
+			MemoryHits:          chunk.MemoryHits,
+			AssistantMessageID:  chunk.AssistantMessageID,
+			BackendMessageID:    chunk.BackendMessageID,
+			MessageID:           chunk.MessageID,
+			Sequence:            chunk.Sequence,
+			ReasoningDisclosure: chunk.ReasoningDisclosure,
+			RuntimeEvent:        chunk.RuntimeEvent,
 		}
 		if chunk.Done {
 			msg.MessageContent = chunk.MessageContent
@@ -441,13 +493,28 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = wsjson.Write(r.Context(), conn, snapshotToMessage(snapshot))
 			continue
-		case "tool_approval_response":
-			if a.onApprovalResponse != nil {
-				reqID := incoming.Metadata["request_id"]
-				approved := incoming.Content == "approved"
-				remember := incoming.Content == "approved_remember"
-				a.onApprovalResponse(reqID, approved || remember, remember)
+		case "tool_approval_response", "tool_permission_response":
+			reqID := incoming.Metadata["approval_request_id"]
+			if reqID == "" {
+				reqID = incoming.Metadata["request_id"]
 			}
+			if reqID == "" {
+				reqID = incoming.RequestID
+			}
+			decision := incoming.Metadata["decision"]
+			decisionID := incoming.DecisionID
+			if decisionID == "" {
+				decisionID = incoming.Metadata["decision_id"]
+			}
+			idempotencyKey := incoming.Metadata["idempotency_key"]
+			data := ApprovalResponseData{
+				RequestID: reqID, DecisionID: decisionID,
+				InvocationID: incoming.Metadata["invocation_id"],
+				Decision:     decision, IdempotencyKey: idempotencyKey,
+				ArgumentsDigest:     incoming.Metadata["arguments_digest"],
+				SecurityScopeDigest: incoming.Metadata["security_scope_digest"],
+			}
+			_ = wsjson.Write(r.Context(), conn, a.approvalACK(data))
 			continue
 		}
 
@@ -666,17 +733,24 @@ func snapshotToMessage(snapshot *streamstate.Snapshot) wsMessage {
 		return wsMessage{Type: "error", Content: "stream not found"}
 	}
 	return wsMessage{
-		Type:           "stream_snapshot",
-		Content:        snapshot.Content,
-		MessageContent: canonicalReplyContent(snapshot.Content, snapshot.Metadata),
-		Reasoning:      snapshot.Reasoning,
-		SessionID:      snapshot.SessionID,
-		RequestID:      snapshot.RequestID,
-		Done:           snapshot.Done,
-		Metadata:       snapshot.Metadata,
-		Usage:          snapshot.Usage,
-		ToolCalls:      snapshot.ToolCalls,
-		Blocks:         snapshot.Blocks,
+		Type:                "stream_snapshot",
+		Content:             snapshot.Content,
+		MessageContent:      canonicalReplyContent(snapshot.Content, snapshot.Metadata),
+		Reasoning:           snapshot.Reasoning,
+		SessionID:           snapshot.SessionID,
+		RequestID:           snapshot.RequestID,
+		Done:                snapshot.Done,
+		Metadata:            snapshot.Metadata,
+		Usage:               snapshot.Usage,
+		ToolCalls:           snapshot.ToolCalls,
+		Blocks:              snapshot.Blocks,
+		AssistantMessageID:  snapshot.AssistantMessageID,
+		BackendMessageID:    snapshot.BackendMessageID,
+		MessageID:           snapshot.MessageID,
+		Sequence:            snapshot.LastSequence,
+		RuntimeEvents:       snapshot.RuntimeEvents,
+		LastSequence:        snapshot.LastSequence,
+		ReasoningDisclosure: snapshot.ReasoningDisclosure,
 	}
 }
 
@@ -726,28 +800,158 @@ func (a *WebAdapter) getConn(chatID string) (*websocket.Conn, bool) {
 
 // wsMessage WebSocket 消息格式。
 type wsMessage struct {
-	Type           string                         `json:"type"` // message / reply / chunk / error / resume / stream_snapshot
-	Content        string                         `json:"content"`
-	MessageContent *messagecontent.MessageContent `json:"message_content,omitempty"`
-	RenderManifest *messagecontent.RenderManifest `json:"render_manifest,omitempty"`
-	Reasoning      string                         `json:"reasoning,omitempty"`
-	SessionID      string                         `json:"session_id,omitempty"`
-	RequestID      string                         `json:"request_id,omitempty"`
-	UserID         string                         `json:"user_id,omitempty"`
-	Provider       string                         `json:"provider,omitempty"`
-	Model          string                         `json:"model,omitempty"`
-	Role           string                         `json:"role,omitempty"`
-	Temperature    *float64                       `json:"temperature,omitempty"`
-	MaxTokens      *int                           `json:"max_tokens,omitempty"`
-	Done           bool                           `json:"done,omitempty"`
-	Metadata       map[string]string              `json:"metadata,omitempty"`
-	Usage          *adapter.Usage                 `json:"usage,omitempty"`
-	ToolCalls      []adapter.ToolCall             `json:"tool_calls,omitempty"`
-	Blocks         []adapter.Block                `json:"blocks,omitempty"`
-	Attachments    []adapter.Attachment           `json:"attachments,omitempty"`
+	Type                string                         `json:"type"` // message / reply / chunk / error / resume / stream_snapshot
+	Content             string                         `json:"content"`
+	MessageContent      *messagecontent.MessageContent `json:"message_content,omitempty"`
+	RenderManifest      *messagecontent.RenderManifest `json:"render_manifest,omitempty"`
+	Reasoning           string                         `json:"reasoning,omitempty"`
+	SessionID           string                         `json:"session_id,omitempty"`
+	RequestID           string                         `json:"request_id,omitempty"`
+	DecisionID          string                         `json:"decision_id,omitempty"`
+	Status              string                         `json:"status,omitempty"`
+	OwnerID             string                         `json:"owner_id,omitempty"`
+	ToolName            string                         `json:"tool_name,omitempty"`
+	UserID              string                         `json:"user_id,omitempty"`
+	Provider            string                         `json:"provider,omitempty"`
+	Model               string                         `json:"model,omitempty"`
+	Role                string                         `json:"role,omitempty"`
+	Temperature         *float64                       `json:"temperature,omitempty"`
+	MaxTokens           *int                           `json:"max_tokens,omitempty"`
+	Done                bool                           `json:"done,omitempty"`
+	Metadata            map[string]string              `json:"metadata,omitempty"`
+	Arguments           map[string]any                 `json:"arguments,omitempty"`
+	InvocationID        string                         `json:"invocation_id,omitempty"`
+	ArgumentsDigest     string                         `json:"arguments_digest,omitempty"`
+	SecurityScopeDigest string                         `json:"security_scope_digest,omitempty"`
+	DeadlineAt          string                         `json:"deadline_at,omitempty"`
+	Usage               *adapter.Usage                 `json:"usage,omitempty"`
+	ToolCalls           []adapter.ToolCall             `json:"tool_calls,omitempty"`
+	Blocks              []adapter.Block                `json:"blocks,omitempty"`
+	Attachments         []adapter.Attachment           `json:"attachments,omitempty"`
 	// U9：结构化 RAG/记忆命中（随 done chunk / reply 回传前端渲染命中标签+详情）。
-	KnowledgeHits []adapter.KnowledgeHit `json:"knowledge_hits,omitempty"`
-	MemoryHits    []adapter.MemoryHit    `json:"memory_hits,omitempty"`
+	KnowledgeHits       []adapter.KnowledgeHit          `json:"knowledge_hits,omitempty"`
+	MemoryHits          []adapter.MemoryHit             `json:"memory_hits,omitempty"`
+	AssistantMessageID  string                          `json:"assistant_message_id,omitempty"`
+	BackendMessageID    string                          `json:"backend_message_id,omitempty"`
+	MessageID           string                          `json:"message_id,omitempty"`
+	Sequence            uint64                          `json:"sequence,omitempty"`
+	ReasoningDisclosure adapter.ReasoningDisclosure     `json:"reasoning_disclosure"`
+	RuntimeEvent        *adapter.RuntimeEvent           `json:"runtime_event,omitempty"`
+	RuntimeEvents       []adapter.SequencedRuntimeEvent `json:"runtime_events,omitempty"`
+	LastSequence        uint64                          `json:"last_sequence,omitempty"`
+}
+
+type approvalACKRecord struct {
+	fingerprint string
+	ack         wsMessage
+}
+
+func (a *WebAdapter) approvalACK(data ApprovalResponseData) wsMessage {
+	a.approvalACKMu.Lock()
+	defer a.approvalACKMu.Unlock()
+
+	approved, remember, valid := approvalDecisionFlags(data.Decision)
+	if !valid {
+		return rejectedApprovalACK(data, data.IdempotencyKey, "invalid_decision")
+	}
+	if strings.TrimSpace(data.IdempotencyKey) == "" {
+		return rejectedApprovalACK(data, "", "missing_idempotency_key")
+	}
+	data.Approved = approved
+	data.Remember = remember
+	key := data.IdempotencyKey
+	fingerprint := strings.Join([]string{
+		data.RequestID, data.InvocationID, data.Decision,
+		data.ArgumentsDigest, data.SecurityScopeDigest,
+	}, "\x00")
+	if existing, ok := a.approvalACKs.Load(key); ok {
+		record := existing.(approvalACKRecord)
+		if record.fingerprint == fingerprint {
+			ack := record.ack
+			if ack.Status == "accepted" {
+				ack.Status = "already_accepted"
+			}
+			return ack
+		}
+		return rejectedApprovalACK(data, key, "idempotency_conflict")
+	}
+
+	terminalResult := "accepted"
+	if a.onApprovalDecision != nil {
+		terminalResult = a.onApprovalDecision(data)
+	} else if a.onApprovalResponse != nil {
+		a.onApprovalResponse(data.RequestID, data.Approved, data.Remember)
+	}
+	ack := wsMessage{
+		Type:       "tool_approval_ack",
+		RequestID:  data.RequestID,
+		DecisionID: data.DecisionID,
+		Status:     approvalACKStatus(terminalResult),
+		Metadata: map[string]string{
+			"approval_request_id":   data.RequestID,
+			"decision_id":           data.DecisionID,
+			"invocation_id":         data.InvocationID,
+			"decision":              data.Decision,
+			"idempotency_key":       key,
+			"arguments_digest":      data.ArgumentsDigest,
+			"security_scope_digest": data.SecurityScopeDigest,
+			"terminal_result":       terminalResult,
+		},
+	}
+	actual, loaded := a.approvalACKs.LoadOrStore(key, approvalACKRecord{fingerprint: fingerprint, ack: ack})
+	if loaded {
+		record := actual.(approvalACKRecord)
+		if record.fingerprint == fingerprint {
+			duplicate := record.ack
+			if duplicate.Status == "accepted" {
+				duplicate.Status = "already_accepted"
+			}
+			return duplicate
+		}
+		return rejectedApprovalACK(data, key, "idempotency_conflict")
+	}
+	return ack
+}
+
+func approvalDecisionFlags(decision string) (approved, remember, valid bool) {
+	switch decision {
+	case "approved_once":
+		return true, false, true
+	case "approved_remember":
+		return true, true, true
+	case "denied":
+		return false, false, true
+	default:
+		return false, false, false
+	}
+}
+
+func approvalACKStatus(terminalResult string) string {
+	switch terminalResult {
+	case "not_pending":
+		return "expired"
+	case "identity_mismatch", "store_error", "idempotency_conflict":
+		return "rejected"
+	default:
+		return "accepted"
+	}
+}
+
+func rejectedApprovalACK(data ApprovalResponseData, key, terminalResult string) wsMessage {
+	return wsMessage{
+		Type:       "tool_approval_ack",
+		RequestID:  data.RequestID,
+		DecisionID: data.DecisionID,
+		Status:     "rejected",
+		Metadata: map[string]string{
+			"approval_request_id": data.RequestID,
+			"decision_id":         data.DecisionID,
+			"invocation_id":       data.InvocationID,
+			"decision":            data.Decision,
+			"idempotency_key":     key,
+			"terminal_result":     terminalResult,
+		},
+	}
 }
 
 // MarshalJSON 自定义序列化（省略空字段）。

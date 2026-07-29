@@ -161,8 +161,14 @@ type Reply struct {
 	// 桌面端 / IM 适配器按 Type 渲染按钮 / 选项 / 审批 / 卡片。
 	Interactive *InteractivePayload
 	// U9：本轮 RAG/记忆检索命中（结构化，非空时前端渲染命中标签+详情）。
-	KnowledgeHits []KnowledgeHit `json:"knowledge_hits,omitempty"`
-	MemoryHits    []MemoryHit    `json:"memory_hits,omitempty"`
+	KnowledgeHits       []KnowledgeHit `json:"knowledge_hits,omitempty"`
+	MemoryHits          []MemoryHit    `json:"memory_hits,omitempty"`
+	AssistantMessageID  string
+	BackendMessageID    string
+	MessageID           string
+	LastSequence        uint64
+	ReasoningDisclosure ReasoningDisclosure
+	RuntimeEvents       []SequencedRuntimeEvent
 }
 
 // ReplyChunk 流式回复片段
@@ -184,8 +190,14 @@ type ReplyChunk struct {
 	// Interactive 结构化交互载荷（仅在 Done=true 时填充；与 Reply.Interactive 同语义）。
 	Interactive *InteractivePayload `json:"interactive,omitempty"`
 	// U9：本轮 RAG/记忆检索命中（仅在 Done=true 时填充；非空时前端渲染命中标签+详情）。
-	KnowledgeHits []KnowledgeHit `json:"knowledge_hits,omitempty"`
-	MemoryHits    []MemoryHit    `json:"memory_hits,omitempty"`
+	KnowledgeHits       []KnowledgeHit      `json:"knowledge_hits,omitempty"`
+	MemoryHits          []MemoryHit         `json:"memory_hits,omitempty"`
+	AssistantMessageID  string              `json:"assistant_message_id,omitempty"`
+	BackendMessageID    string              `json:"backend_message_id,omitempty"`
+	MessageID           string              `json:"message_id,omitempty"`
+	Sequence            uint64              `json:"sequence,omitempty"`
+	ReasoningDisclosure ReasoningDisclosure `json:"reasoning_disclosure"`
+	RuntimeEvent        *RuntimeEvent       `json:"runtime_event,omitempty"`
 }
 
 // MessageHandler 消息处理回调（同步模式）
