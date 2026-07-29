@@ -2,6 +2,10 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -9,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/toolkit/lang/mapx"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
 	"github.com/hexagon-codes/toolkit/util/idgen"
@@ -17,18 +22,27 @@ import (
 
 // PermissionRequest is sent to the frontend for user approval.
 type PermissionRequest struct {
-	ID        string         `json:"id"`
-	ToolName  string         `json:"tool_name"`
-	Arguments map[string]any `json:"arguments"`
-	Risk      string         `json:"risk"` // "safe" | "sensitive" | "dangerous"
-	Reason    string         `json:"reason"`
+	ID                  string         `json:"id"`
+	OwnerID             string         `json:"owner_id"`
+	InvocationID        string         `json:"invocation_id"`
+	ToolName            string         `json:"tool_name"`
+	Arguments           map[string]any `json:"arguments"`
+	ArgumentsDigest     string         `json:"arguments_digest"`
+	SecurityScopeDigest string         `json:"security_scope_digest"`
+	DeadlineAt          time.Time      `json:"deadline_at"`
+	Risk                string         `json:"risk"` // "safe" | "sensitive" | "dangerous"
+	Reason              string         `json:"reason"`
 }
 
 // PermissionResponse is the user's decision.
 type PermissionResponse struct {
-	RequestID string `json:"request_id"`
-	Approved  bool   `json:"approved"`
-	Remember  bool   `json:"remember"` // "always allow this tool" for session
+	RequestID           string `json:"request_id"`
+	InvocationID        string `json:"invocation_id"`
+	ArgumentsDigest     string `json:"arguments_digest"`
+	SecurityScopeDigest string `json:"security_scope_digest"`
+	IdempotencyKey      string `json:"idempotency_key"`
+	Approved            bool   `json:"approved"`
+	Remember            bool   `json:"remember"` // "always allow this tool" for session
 }
 
 // PermissionSender pushes approval requests to the frontend.
@@ -37,24 +51,53 @@ type PermissionSender interface {
 	SendPermissionRequest(ctx context.Context, sessionID string, req *PermissionRequest) error
 }
 
+// RememberedGrantStore is the narrow persistence boundary for remembered
+// approvals. It intentionally does not widen storage.Store.
+type RememberedGrantStore interface {
+	HasRememberedGrant(ctx context.Context, ownerID, resolvedSessionID, canonicalToolName, securityScopeDigest string) (bool, error)
+	RememberGrant(ctx context.Context, ownerID, resolvedSessionID, canonicalToolName, securityScopeDigest string) error
+	DeleteRememberedGrants(ctx context.Context, resolvedSessionID string) error
+}
+
+type rememberedGrantKey struct {
+	ownerID             string
+	resolvedSessionID   string
+	canonicalToolName   string
+	securityScopeDigest string
+}
+
+type pendingApproval struct {
+	response chan PermissionResponse
+	request  *PermissionRequest
+	key      rememberedGrantKey
+}
+
 // PermissionHub manages pending approval requests and their responses.
 type PermissionHub struct {
-	mu      sync.Mutex
-	pending map[string]chan PermissionResponse // requestID → response channel
-	allowed map[string]map[string]bool         // sessionID → set of always-allowed tool names
-	sender  PermissionSender
-	timeout time.Duration
+	mu         sync.Mutex
+	pending    map[string]*pendingApproval
+	remembered map[rememberedGrantKey]bool
+	sender     PermissionSender
+	timeout    time.Duration
+	grants     RememberedGrantStore
 }
 
 // NewPermissionHub creates a permission hub.
 func NewPermissionHub(timeout time.Duration) *PermissionHub {
+	return NewPermissionHubWithRememberedGrantStore(timeout, nil)
+}
+
+// NewPermissionHubWithRememberedGrantStore creates a permission hub backed by
+// the supplied durable remembered-grant store.
+func NewPermissionHubWithRememberedGrantStore(timeout time.Duration, grants RememberedGrantStore) *PermissionHub {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
 	return &PermissionHub{
-		pending: make(map[string]chan PermissionResponse),
-		allowed: make(map[string]map[string]bool),
-		timeout: timeout,
+		pending:    make(map[string]*pendingApproval),
+		remembered: make(map[rememberedGrantKey]bool),
+		timeout:    timeout,
+		grants:     grants,
 	}
 }
 
@@ -69,19 +112,41 @@ func (h *PermissionHub) SetSender(s PermissionSender) {
 // Should be called when a session is deleted or user disconnects.
 func (h *PermissionHub) ClearSession(sessionID string) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	delete(h.allowed, sessionID)
+	for key := range h.remembered {
+		if key.resolvedSessionID == sessionID {
+			delete(h.remembered, key)
+		}
+	}
+	grants := h.grants
+	h.mu.Unlock()
+	if grants != nil {
+		if err := grants.DeleteRememberedGrants(context.Background(), sessionID); err != nil {
+			logger.Error("[permission] clear remembered grants", "session_id", sessionID, "error", err)
+		}
+	}
 }
 
 // RequestApproval sends an approval request and blocks until the user responds or timeout.
 func (h *PermissionHub) RequestApproval(ctx context.Context, sessionID string, req *PermissionRequest) (bool, error) {
-	// Check if this tool is already allowed for this session
-	h.mu.Lock()
-	if tools, ok := h.allowed[sessionID]; ok && tools[req.ToolName] {
-		h.mu.Unlock()
+	if req == nil {
+		return false, errors.New("permission request is nil")
+	}
+	key, err := preparePermissionRequest(ctx, sessionID, req, h.timeout)
+	if err != nil {
+		return false, err
+	}
+	allowed, err := h.hasRememberedGrant(ctx, key)
+	if err != nil {
+		return false, fmt.Errorf("lookup remembered permission grant: %w", err)
+	}
+	if allowed {
 		return true, nil
 	}
 
+	requestCtx, cancel := context.WithDeadline(ctx, req.DeadlineAt)
+	defer cancel()
+
+	h.mu.Lock()
 	if h.sender == nil {
 		h.mu.Unlock()
 		// No frontend connected — use default policy (deny)
@@ -90,12 +155,12 @@ func (h *PermissionHub) RequestApproval(ctx context.Context, sessionID string, r
 	}
 
 	ch := make(chan PermissionResponse, 1)
-	h.pending[req.ID] = ch
+	h.pending[req.ID] = &pendingApproval{response: ch, request: req, key: key}
 	sender := h.sender
 	h.mu.Unlock()
 
 	// Send request to frontend
-	if err := sender.SendPermissionRequest(ctx, sessionID, req); err != nil {
+	if err := sender.SendPermissionRequest(requestCtx, sessionID, req); err != nil {
 		h.mu.Lock()
 		delete(h.pending, req.ID)
 		h.mu.Unlock()
@@ -105,40 +170,116 @@ func (h *PermissionHub) RequestApproval(ctx context.Context, sessionID string, r
 	// Wait for response
 	select {
 	case resp := <-ch:
-		if resp.Remember && resp.Approved {
-			h.mu.Lock()
-			if h.allowed[sessionID] == nil {
-				h.allowed[sessionID] = make(map[string]bool)
-			}
-			h.allowed[sessionID][req.ToolName] = true
-			h.mu.Unlock()
-		}
 		return resp.Approved, nil
-	case <-time.After(h.timeout):
+	case <-requestCtx.Done():
 		h.mu.Lock()
 		delete(h.pending, req.ID)
 		h.mu.Unlock()
-		return false, fmt.Errorf("permission request timed out after %v", h.timeout)
-	case <-ctx.Done():
-		h.mu.Lock()
-		delete(h.pending, req.ID)
-		h.mu.Unlock()
-		return false, ctx.Err()
+		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+			return false, fmt.Errorf("permission request timed out after %v", h.timeout)
+		}
+		return false, requestCtx.Err()
 	}
 }
 
 // HandleResponse is called when the frontend sends back an approval decision.
 func (h *PermissionHub) HandleResponse(resp PermissionResponse) {
+	h.HandleResponseResult(resp)
+}
+
+// HandleResponseResult persists a remembered decision before releasing the
+// waiting invocation and returns the terminal result used by transport ACKs.
+func (h *PermissionHub) HandleResponseResult(resp PermissionResponse) string {
 	h.mu.Lock()
-	ch, ok := h.pending[resp.RequestID]
-	if ok {
+	pending, ok := h.pending[resp.RequestID]
+	h.mu.Unlock()
+	if !ok {
+		return "not_pending"
+	}
+	if (resp.InvocationID != "" && resp.InvocationID != pending.request.InvocationID) ||
+		(resp.ArgumentsDigest != "" && resp.ArgumentsDigest != pending.request.ArgumentsDigest) ||
+		(resp.SecurityScopeDigest != "" && resp.SecurityScopeDigest != pending.request.SecurityScopeDigest) {
+		return "identity_mismatch"
+	}
+
+	terminalResult := "denied"
+	if resp.Approved {
+		terminalResult = "approved_once"
+	}
+	if resp.Approved && resp.Remember {
+		if err := h.rememberGrant(context.Background(), pending.key); err != nil {
+			logger.Error("[permission] persist remembered grant", "request_id", resp.RequestID, "error", err)
+			resp.Approved = false
+			resp.Remember = false
+			terminalResult = "store_error"
+		} else {
+			terminalResult = "approved_remember"
+		}
+	}
+
+	h.mu.Lock()
+	current, ok := h.pending[resp.RequestID]
+	if ok && current == pending {
 		delete(h.pending, resp.RequestID)
 	}
 	h.mu.Unlock()
-
 	if ok {
-		ch <- resp
+		pending.response <- resp
 	}
+	return terminalResult
+}
+
+func preparePermissionRequest(ctx context.Context, sessionID string, req *PermissionRequest, timeout time.Duration) (rememberedGrantKey, error) {
+	raw, err := json.Marshal(req.Arguments)
+	if err != nil {
+		return rememberedGrantKey{}, fmt.Errorf("canonicalize permission arguments: %w", err)
+	}
+	var frozen map[string]any
+	if len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &frozen); err != nil {
+			return rememberedGrantKey{}, fmt.Errorf("freeze permission arguments: %w", err)
+		}
+	}
+	digestBytes := sha256.Sum256(raw)
+	digest := hex.EncodeToString(digestBytes[:])
+	req.ToolName = strings.ToLower(strings.TrimSpace(req.ToolName))
+	req.Arguments = frozen
+	req.ArgumentsDigest = digest
+	req.SecurityScopeDigest = digest
+	req.OwnerID = skill.AuthenticatedUserID(ctx)
+	if req.InvocationID == "" {
+		req.InvocationID = req.ID
+	}
+	deadline := time.Now().Add(timeout)
+	if existing, ok := ctx.Deadline(); ok && existing.Before(deadline) {
+		deadline = existing
+	}
+	req.DeadlineAt = deadline.UTC()
+	return rememberedGrantKey{
+		ownerID:             req.OwnerID,
+		resolvedSessionID:   sessionID,
+		canonicalToolName:   req.ToolName,
+		securityScopeDigest: req.SecurityScopeDigest,
+	}, nil
+}
+
+func (h *PermissionHub) hasRememberedGrant(ctx context.Context, key rememberedGrantKey) (bool, error) {
+	if h.grants != nil {
+		return h.grants.HasRememberedGrant(ctx, key.ownerID, key.resolvedSessionID, key.canonicalToolName, key.securityScopeDigest)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.remembered[key], nil
+}
+
+func (h *PermissionHub) rememberGrant(ctx context.Context, key rememberedGrantKey) error {
+	if h.grants != nil {
+		return h.grants.RememberGrant(ctx, key.ownerID, key.resolvedSessionID, key.canonicalToolName, key.securityScopeDigest)
+	}
+	h.mu.Lock()
+	h.remembered[key] = true
+	h.mu.Unlock()
+	return nil
 }
 
 // PermissionHook is a BeforeToolHook that asks for user approval on sensitive/dangerous tools.

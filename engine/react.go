@@ -400,21 +400,21 @@ var thinkingOnCompletionTimeout = 90 * time.Second
 // 引擎在内部为每个请求创建临时 Agent 实例，
 // 注入会话上下文和可用工具。
 type ReActEngine struct {
-	mu           sync.RWMutex
-	cfg          *config.Config
-	router       *llmrouter.Selector
-	agentRouter  *agentrouter.Dispatcher // 多 Agent 路由器（可为 nil）
+	mu                      sync.RWMutex
+	cfg                     *config.Config
+	router                  *llmrouter.Selector
+	agentRouter             *agentrouter.Dispatcher // 多 Agent 路由器（可为 nil）
 	agentSystemPromptPolicy AgentSystemPromptPolicy
-	sessions     *session.Manager
-	skills       *skill.DefaultRegistry
-	store        storage.Store
-	cache        *cache.SemanticCache
-	kb           *knowledge.Manager   // 知识库管理器（可为 nil）
-	compactor    *session.Compactor   // 上下文压缩器
-	fileMem      *memory.FileMemory   // 文件记忆系统（可为 nil）
-	vectorMem    *memory.VectorMemory // 向量语义记忆（可为 nil）
-	memEmbedder  MemoryEmbedder       // 长期记忆召回的向量化器（可为 nil → 纯 BM25 降级）
-	activeRecall *ActiveRecall        // G②：回复前主动会话深召回（可为 nil → 不跑）
+	sessions                *session.Manager
+	skills                  *skill.DefaultRegistry
+	store                   storage.Store
+	cache                   *cache.SemanticCache
+	kb                      *knowledge.Manager   // 知识库管理器（可为 nil）
+	compactor               *session.Compactor   // 上下文压缩器
+	fileMem                 *memory.FileMemory   // 文件记忆系统（可为 nil）
+	vectorMem               *memory.VectorMemory // 向量语义记忆（可为 nil）
+	memEmbedder             MemoryEmbedder       // 长期记忆召回的向量化器（可为 nil → 纯 BM25 降级）
+	activeRecall            *ActiveRecall        // G②：回复前主动会话深召回（可为 nil → 不跑）
 	// 记忆向量化熔断（BUG-20260703③，lock-free）：连续失败达阈值开闸，冷却期内纯 BM25。
 	memEmbedFailStreak atomic.Int32
 	memEmbedOpenUntil  atomic.Int64    // UnixNano；0=闸门关闭
@@ -1742,6 +1742,66 @@ func isKnownTextOnlyModel(providerName, modelName string) bool {
 //
 // 对于快速路径（Skill/缓存命中）降级为单 chunk 输出。
 func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (<-chan *adapter.ReplyChunk, error) {
+	if msg == nil {
+		return e.processStream(ctx, msg)
+	}
+	if msg.Metadata == nil {
+		msg.Metadata = make(map[string]string)
+	}
+	assistantMessageID := "msg-" + idgen.ShortID()
+	msg.Metadata["assistant_message_id"] = assistantMessageID
+	ctx = session.WithAssistantMessageID(ctx, assistantMessageID)
+	ctx = session.WithReasoningDisclosureState(ctx)
+	raw, err := e.processStream(ctx, msg)
+	if err != nil {
+		return nil, err
+	}
+	wire := adapter.NewRuntimeWire(
+		assistantMessageID,
+		adapter.ReasoningDisclosure{Visibility: adapter.ReasoningNotExposed},
+	)
+	out := make(chan *adapter.ReplyChunk, 16)
+	go func() {
+		defer close(out)
+		var content strings.Builder
+		for chunk := range raw {
+			decorated := wire.Decorate(chunk)
+			content.WriteString(decorated.Content)
+			if decorated.Done && e.sessions != nil {
+				saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				persistErr := e.sessions.PersistAssistantRuntimeSnapshot(
+					saveCtx,
+					assistantMessageID,
+					wire.Snapshot(),
+				)
+				if errors.Is(persistErr, storage.ErrNotFound) &&
+					decorated.Error == nil &&
+					msg.SessionID != "" {
+					snapshot := wire.Snapshot()
+					_, persistErr = e.sessions.SaveAssistantReply(
+						saveCtx,
+						msg.SessionID,
+						content.String(),
+						session.AssistantMeta{
+							MessageID:           assistantMessageID,
+							ReasoningDisclosure: snapshot.ReasoningDisclosure,
+							RuntimeEvents:       snapshot.RuntimeEvents,
+							LastSequence:        snapshot.LastSequence,
+						},
+					)
+				}
+				if persistErr != nil {
+					trace.L(ctx).Warn("持久化助手 runtime snapshot 失败", "message_id", assistantMessageID)
+				}
+				cancel()
+			}
+			out <- decorated
+		}
+	}()
+	return out, nil
+}
+
+func (e *ReActEngine) processStream(ctx context.Context, msg *adapter.Message) (<-chan *adapter.ReplyChunk, error) {
 	if err := validateIncomingMessage(msg); err != nil {
 		return nil, err
 	}
@@ -2058,7 +2118,14 @@ func (e *ReActEngine) processStreamRuntime(
 ) (<-chan *adapter.ReplyChunk, error) {
 	ch := make(chan *adapter.ReplyChunk, 16)
 	started := make(chan error, 1)
-	sink := &replyChunkRuntimeSink{ch: ch, started: started}
+	sink := &replyChunkRuntimeSink{
+		ch:      ch,
+		started: started,
+		route: adapter.FrozenReasoningRoute{
+			Provider: selection.providerName,
+			Model:    selection.modelName,
+		},
+	}
 	go func() {
 		defer close(ch)
 		if sessionUnlock != nil {
@@ -2098,6 +2165,11 @@ func (e *ReActEngine) processStreamRuntime(
 		if len(tools) > 0 {
 			req.Tools = tools
 		}
+		allowedToolNames := make([]string, 0, len(req.Tools))
+		for _, tool := range req.Tools {
+			allowedToolNames = append(allowedToolNames, tool.Function.Name)
+		}
+		sink.allowedToolNames = adapter.RuntimeToolNameAllowlist(allowedToolNames...)
 		applyPerTurnRequestPolicy(ctx, &req, selection.modelName, e.visionRoutingStrategy(), msg, history)
 		e.applyLocalNumCtxCap(&req, isLocal) // 本地 Ollama：按配置钳 num_ctx，防 KV 撑爆内存（BUG-20260712）
 		if shouldInjectNoThink(isLocal, len(req.Tools) > 0, msg.Metadata["thinking"], selection.modelName) {
@@ -2318,12 +2390,61 @@ type replyChunkRuntimeSink struct {
 	// reasoning 计时（BUG-20260703 B3）：runtime 流式路径的思考时长在此采样，
 	// finalize 时经 thinkingDuration() 透出+落库。与 legacy 流式路径同语义：
 	// 首个 reasoning 增量起表，其后首个 content 增量停表。
-	reasoningStart time.Time
-	reasoningEnd   time.Time
+	reasoningStart   time.Time
+	reasoningEnd     time.Time
+	allowedToolNames map[string]struct{}
+	failedToolCalls  map[string]struct{}
+	route            adapter.FrozenReasoningRoute
 }
 
 func (s *replyChunkRuntimeSink) Emit(ctx context.Context, event hruntime.Event) error {
-	if event.Type != hruntime.EventLLMChunk || event.Chunk == nil {
+	switch event.Type {
+	case hruntime.EventToolCallStarted, hruntime.EventToolCallCompleted, hruntime.EventToolCallFailed:
+		if event.ToolCall == nil {
+			return nil
+		}
+		if s.failedToolCalls == nil {
+			s.failedToolCalls = make(map[string]struct{})
+		}
+		if event.Type == hruntime.EventToolCallCompleted {
+			if _, failed := s.failedToolCalls[event.ToolCall.ID]; failed {
+				return nil
+			}
+		}
+		kind := adapter.RuntimeEventToolStarted
+		if event.Type == hruntime.EventToolCallCompleted {
+			kind = adapter.RuntimeEventToolCompleted
+		} else if event.Type == hruntime.EventToolCallFailed {
+			kind = adapter.RuntimeEventToolFailed
+			s.failedToolCalls[event.ToolCall.ID] = struct{}{}
+		}
+		runtimeEvent, ok := adapter.NewToolRuntimeEvent(
+			kind,
+			event.ToolCall.ID,
+			event.ToolCall.Name,
+			s.allowedToolNames,
+		)
+		if !ok {
+			return nil
+		}
+		runtimeEvent.EventID = fmt.Sprintf(
+			"tool:%s:%s:%d",
+			event.ToolCall.ID,
+			kind,
+			event.Sequence,
+		)
+		s.notifyStarted(nil)
+		select {
+		case s.ch <- &adapter.ReplyChunk{RuntimeEvent: runtimeEvent}:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	case hruntime.EventLLMChunk:
+	default:
+		return nil
+	}
+	if event.Chunk == nil {
 		return nil
 	}
 	if event.Chunk.Content == "" && event.Chunk.Reasoning == "" {
@@ -2339,8 +2460,19 @@ func (s *replyChunkRuntimeSink) Emit(ctx context.Context, event hruntime.Event) 
 		}
 	}
 	s.notifyStarted(nil)
+	disclosure := normalizeProviderReasoningDisclosure(
+		event.Chunk,
+		s.route.Provider,
+		s.route.Model,
+	)
+	session.RecordReasoningDisclosure(ctx, disclosure)
+	chunk := &adapter.ReplyChunk{
+		Content:             event.Chunk.Content,
+		Reasoning:           publicReasoning(event.Chunk.Reasoning, disclosure),
+		ReasoningDisclosure: disclosure,
+	}
 	select {
-	case s.ch <- &adapter.ReplyChunk{Content: event.Chunk.Content, Reasoning: event.Chunk.Reasoning}:
+	case s.ch <- chunk:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -2475,7 +2607,7 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 	} else {
 		thinkingDuration = 0
 	}
-	markReasoningPresentation(msgMeta, reasoning)
+	markReasoningDisclosure(msgMeta, session.ReasoningDisclosureFromContext(ctx))
 
 	assistantMessageID := ""
 	if record, err := e.sessions.SaveAssistantReply(saveCtx, sessionID, content, session.AssistantMeta{
@@ -2825,9 +2957,15 @@ func (e *ReActEngine) pipeStream(
 			reasoningEndTime = time.Now()
 		}
 		fullContent.WriteString(chunk.Content)
+		disclosure := normalizeProviderReasoningDisclosure(chunk, providerName, modelName)
+		session.RecordReasoningDisclosure(ctx, disclosure)
 
 		select {
-		case ch <- &adapter.ReplyChunk{Content: chunk.Content, Reasoning: chunk.Reasoning}:
+		case ch <- &adapter.ReplyChunk{
+			Content:             chunk.Content,
+			Reasoning:           publicReasoning(chunk.Reasoning, disclosure),
+			ReasoningDisclosure: disclosure,
+		}:
 		case <-ctx.Done():
 			ch <- &adapter.ReplyChunk{Error: ctx.Err(), Done: true}
 			return
@@ -2920,7 +3058,7 @@ func (e *ReActEngine) pipeStream(
 		}
 		thinkingDuration = int(end.Sub(reasoningStartTime).Seconds())
 	}
-	markReasoningPresentation(msgMeta, reasoning)
+	markReasoningDisclosure(msgMeta, session.ReasoningDisclosureFromContext(ctx))
 	if record, err := e.sessions.SaveAssistantReply(saveCtx, sessionID, content, session.AssistantMeta{
 		Reasoning:        reasoning,
 		ThinkingDuration: thinkingDuration,
@@ -3049,8 +3187,14 @@ func (e *ReActEngine) pipeStreamWithTools(
 			reasoningEndTime2 = time.Now()
 		}
 		fullContent.WriteString(chunk.Content)
+		disclosure := normalizeProviderReasoningDisclosure(chunk, providerName, modelName)
+		session.RecordReasoningDisclosure(ctx, disclosure)
 		select {
-		case ch <- &adapter.ReplyChunk{Content: chunk.Content, Reasoning: chunk.Reasoning}:
+		case ch <- &adapter.ReplyChunk{
+			Content:             chunk.Content,
+			Reasoning:           publicReasoning(chunk.Reasoning, disclosure),
+			ReasoningDisclosure: disclosure,
+		}:
 		case <-ctx.Done():
 			ch <- &adapter.ReplyChunk{Error: ctx.Err(), Done: true}
 			return
@@ -3138,7 +3282,7 @@ func (e *ReActEngine) pipeStreamWithTools(
 		}
 		thinkingDuration2 = int(end.Sub(reasoningStartTime2).Seconds())
 	}
-	markReasoningPresentation(msgMeta, reasoning)
+	markReasoningDisclosure(msgMeta, session.ReasoningDisclosureFromContext(ctx))
 	if record, err := e.sessions.SaveAssistantReply(saveCtx, sessionID, content, session.AssistantMeta{
 		Reasoning:        reasoning,
 		ThinkingDuration: thinkingDuration2,
@@ -4103,7 +4247,14 @@ func buildReplyMetadata(metadata map[string]string, providerName, modelName, ass
 // observe. A reasoning model may use hidden reasoning tokens without exposing
 // a summary; in that case we report not_exposed instead of fabricating a chain
 // of thought. The fields are persisted and returned on the final wire chunk.
-func markReasoningPresentation(metadata map[string]string, reasoning string) {
+func markReasoningPresentation(metadata map[string]string, _ string) {
+	markReasoningDisclosure(
+		metadata,
+		adapter.ReasoningDisclosure{Visibility: adapter.ReasoningNotExposed},
+	)
+}
+
+func markReasoningDisclosure(metadata map[string]string, disclosure adapter.ReasoningDisclosure) {
 	if metadata == nil {
 		return
 	}
@@ -4111,14 +4262,14 @@ func markReasoningPresentation(metadata map[string]string, reasoning string) {
 	switch mode {
 	case "on":
 		metadata["thinking"] = "on"
-		if strings.TrimSpace(reasoning) != "" {
+		if disclosure.Visibility == adapter.ReasoningVisible {
 			metadata["reasoning_visibility"] = "visible"
 		} else {
 			metadata["reasoning_visibility"] = "not_exposed"
 		}
 	case "off":
 		metadata["thinking"] = "off"
-		if strings.TrimSpace(reasoning) != "" {
+		if disclosure.Visibility == adapter.ReasoningVisible {
 			metadata["reasoning_visibility"] = "visible"
 		} else {
 			metadata["reasoning_visibility"] = "disabled"
@@ -4127,6 +4278,38 @@ func markReasoningPresentation(metadata map[string]string, reasoning string) {
 		delete(metadata, "thinking")
 		delete(metadata, "reasoning_visibility")
 	}
+}
+
+func normalizeProviderReasoningDisclosure(
+	chunk *llm.StreamChunk,
+	providerName, modelName string,
+) adapter.ReasoningDisclosure {
+	if chunk == nil || chunk.ReasoningDisclosure == nil {
+		return adapter.ReasoningDisclosure{Visibility: adapter.ReasoningNotExposed}
+	}
+	disclosure := chunk.ReasoningDisclosure
+	return adapter.NormalizeReasoningDisclosure(
+		adapter.ReasoningDisclosure{
+			Visibility: adapter.ReasoningVisibility(disclosure.Visibility),
+			Source:     disclosure.Source,
+			Dialect:    disclosure.Dialect,
+			Provider:   disclosure.Provider,
+			Model:      disclosure.Model,
+		},
+		adapter.FrozenReasoningRoute{Provider: providerName, Model: modelName},
+		map[string]struct{}{
+			"openai_compatible/delta.reasoning":         {},
+			"openai_compatible/delta.reasoning_content": {},
+			"ollama/message.thinking":                   {},
+		},
+	)
+}
+
+func publicReasoning(reasoning string, disclosure adapter.ReasoningDisclosure) string {
+	if disclosure.Visibility != adapter.ReasoningVisible {
+		return ""
+	}
+	return reasoning
 }
 
 func withAssistantMessageID(metadata map[string]string, assistantMessageID string) map[string]string {

@@ -170,10 +170,9 @@ func (e *ToolExecutor) isBuiltinSkillName(name string) bool {
 func (e *ToolExecutor) executeWithHooks(ctx context.Context, call *ToolCallInfo, exec func(context.Context) (string, error)) (string, error) {
 	v2 := featureflag.Enabled(ctx, FlagToolLifecycleV2)
 
-	beforeHooks := e.beforeHooks
+	beforeHooks := sortBeforeHooks(e.beforeHooks)
 	afterHooks := e.afterHooks
 	if v2 {
-		beforeHooks = sortBeforeHooks(beforeHooks)
 		afterHooks = sortAfterHooks(afterHooks)
 	}
 

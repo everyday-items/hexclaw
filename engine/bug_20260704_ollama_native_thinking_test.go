@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/ai-core/streamx"
 	"github.com/hexagon-codes/hexagon"
 	mockllm "github.com/hexagon-codes/hexagon/testing/mock"
 	"github.com/hexagon-codes/hexclaw/adapter"
@@ -41,7 +42,15 @@ func (p *reasoningStreamProvider) Stream(ctx context.Context, req llm.Completion
 	sse := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"我先想一下这道题的思路…\"}}]}\n\n" +
 		"data: {\"choices\":[{\"delta\":{\"content\":\"最终答案：42\"}}]}\n\n" +
 		"data: [DONE]\n\n"
-	return llm.NewStream(strings.NewReader(sse), llm.StreamOpenAIFormat), nil
+	stream := llm.NewStream(strings.NewReader(sse), llm.StreamOpenAIFormat)
+	stream.SetParser(&streamx.OpenAIParser{
+		ReasoningEvidence: streamx.ReasoningDisclosureEvidence{
+			ExplicitlyPublic: true,
+			Provider:         p.name,
+			Model:            req.Model,
+		},
+	})
+	return stream, nil
 }
 
 func (p *reasoningStreamProvider) Models() []llm.ModelInfo {

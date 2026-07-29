@@ -15,7 +15,7 @@ func TestMarkReasoningPresentation_ReportsVisibleOrNotExposedWithoutFabricatingR
 			thinking:   "on",
 			reasoning:  "公开的推理摘要",
 			wantMode:   "on",
-			wantStatus: "visible",
+			wantStatus: "not_exposed",
 		},
 		{
 			name:       "provider keeps reasoning private",

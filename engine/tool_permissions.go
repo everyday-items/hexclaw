@@ -122,6 +122,9 @@ func NewToolPermissionHook(perms *ToolPermissions) *ToolPermissionHook {
 	return &ToolPermissionHook{perms: perms}
 }
 
+// Priority makes the static allow/deny gate run before interactive approval.
+func (h *ToolPermissionHook) Priority() int { return 1 }
+
 func (h *ToolPermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo) error {
 	sessionID, _ := ctx.Value(ctxKeySessionID).(string)
 	return h.perms.Check(call.Name, sessionID)
