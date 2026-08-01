@@ -123,48 +123,61 @@ func (d Deps) createWeeklyArithmeticBatch(
 	if err != nil || replay {
 		return batch, replay, err
 	}
-	d.finishWeeklyArithmeticGeneration(ctx, batch)
+	if err := d.finishWeeklyArithmeticGeneration(ctx, batch); err != nil {
+		return batch, false, fmt.Errorf("finish weekly arithmetic generation: %w", err)
+	}
 	return batch, false, nil
 }
 
 func (d Deps) finishWeeklyArithmeticGeneration(
 	ctx context.Context,
 	batch k12.WeeklyArithmeticBatch,
-) {
+) error {
 	var request WeeklyPracticeCandidateRequest
 	if err := json.Unmarshal([]byte(batch.GenerationCheckpoint), &request); err != nil {
-		_ = d.Records.FinishWeeklyArithmeticGeneration(ctx, batch.AgentName,
+		if err := d.Records.FinishWeeklyArithmeticGeneration(ctx, batch.AgentName,
 			batch.BatchID, k12.WeeklyArithmeticFailedTerminal, nil, nil, "",
-			"invalid generation checkpoint", d.now())
-		return
+			"invalid generation checkpoint", d.now()); err != nil {
+			return err
+		}
+		return nil
 	}
 	if d.WeeklyCandidates == nil {
-		_ = d.Records.FinishWeeklyArithmeticGeneration(ctx, batch.AgentName,
+		if err := d.Records.FinishWeeklyArithmeticGeneration(ctx, batch.AgentName,
 			batch.BatchID, k12.WeeklyArithmeticFailedRetryable, nil, nil, "",
-			"arithmetic generator unavailable", d.now())
-		return
+			"arithmetic generator unavailable", d.now()); err != nil {
+			return err
+		}
+		return nil
 	}
 	candidates, err := d.WeeklyCandidates.GenerateWeeklyPracticeCandidates(ctx, request)
 	if err != nil {
-		_ = d.Records.FinishWeeklyArithmeticGeneration(ctx, batch.AgentName,
+		if finishErr := d.Records.FinishWeeklyArithmeticGeneration(ctx, batch.AgentName,
 			batch.BatchID, k12.WeeklyArithmeticFailedRetryable, nil, nil, "",
-			err.Error(), d.now())
-		return
+			err.Error(), d.now()); finishErr != nil {
+			return finishErr
+		}
+		return nil
 	}
 	items, keys, valid := weeklyArithmeticItems(request, candidates)
 	if !valid {
-		_ = d.Records.FinishWeeklyArithmeticGeneration(ctx, batch.AgentName,
+		if err := d.Records.FinishWeeklyArithmeticGeneration(ctx, batch.AgentName,
 			batch.BatchID, k12.WeeklyArithmeticFailedTerminal, nil, nil, "",
-			"invalid arithmetic generation result", d.now())
-		return
+			"invalid arithmetic generation result", d.now()); err != nil {
+			return err
+		}
+		return nil
 	}
 	contentDigest := digestValue(struct {
 		Items []k12.WeeklyPracticeItem
 		Keys  map[string]string
 	}{items, keys})
-	_ = d.Records.FinishWeeklyArithmeticGeneration(ctx, batch.AgentName,
+	if err := d.Records.FinishWeeklyArithmeticGeneration(ctx, batch.AgentName,
 		batch.BatchID, k12.WeeklyArithmeticReady, items, keys,
-		contentDigest, "", d.now())
+		contentDigest, "", d.now()); err != nil {
+		return err
+	}
+	return nil
 }
 
 func weeklyArithmeticItems(
@@ -230,7 +243,9 @@ func (d Deps) RetryWeeklyArithmeticBatch(
 	if err != nil || replay {
 		return batch, replay, err
 	}
-	d.finishWeeklyArithmeticGeneration(ctx, batch)
+	if err := d.finishWeeklyArithmeticGeneration(ctx, batch); err != nil {
+		return batch, false, fmt.Errorf("finish weekly arithmetic generation: %w", err)
+	}
 	return batch, false, nil
 }
 
