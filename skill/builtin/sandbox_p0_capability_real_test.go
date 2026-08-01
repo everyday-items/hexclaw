@@ -165,7 +165,7 @@ func TestSandboxP0_RealModelToolUseMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create sandbox: %v", err)
 	}
-	codeExec := NewCodeExecSkill(sb, sandbox.Config{
+	codeExec := newConfiguredTestCodeExecSkill(t, sb, sandbox.Config{
 		Workspace:     ws,
 		Timeout:       30,
 		Network:       false,
@@ -342,7 +342,7 @@ func TestSandboxP0_RealModelPythonShellTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create sandbox: %v", err)
 	}
-	codeExec := NewCodeExecSkill(sb, sandbox.Config{
+	codeExec := newConfiguredTestCodeExecSkill(t, sb, sandbox.Config{
 		Workspace: ws,
 		Timeout:   45,
 		Network:   false,
@@ -439,7 +439,7 @@ func TestSandboxP0_RealModelPythonCrawler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create sandbox: %v", err)
 	}
-	codeExec := NewCodeExecSkill(sb, sandbox.Config{
+	codeExec := newConfiguredTestCodeExecSkill(t, sb, sandbox.Config{
 		Workspace: ws,
 		Timeout:   45,
 		Network:   true,

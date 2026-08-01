@@ -93,7 +93,7 @@ func TestBug20260702_BuildReport_CapabilitiesReflectLimits(t *testing.T) {
 // RED（旧代码）：ErrFilesystemContainmentUnavailable 被吞成通用失败（无明确文案）；
 // GREEN：Execute 给出明确可读的降级/拒绝执行错误，且标注文件系统降级。
 func TestBug20260702_Execute_FilesystemContainmentUnavailable(t *testing.T) {
-	s := NewCodeExecSkill(nil, sandbox.Config{Workspace: t.TempDir(), Timeout: 30})
+	s := newConfiguredTestCodeExecSkill(t, nil, sandbox.Config{Workspace: t.TempDir(), Timeout: 30})
 	s.sandboxFactory = func(cfg sandbox.Config) (sandbox.Sandbox, error) {
 		return &mockSandbox{execFn: func(context.Context, string, []string) (*sandbox.ExecResult, error) {
 			return nil, fmt.Errorf("linux backend select: %w", sandbox.ErrFilesystemContainmentUnavailable)
@@ -121,7 +121,7 @@ func TestBug20260702_Execute_FilesystemContainmentUnavailable(t *testing.T) {
 
 // GREEN：ErrStorageLimitExceeded 归类为「产物超限」（resource_limited），而非后端不可用。
 func TestBug20260702_Execute_StorageLimitExceededClassified(t *testing.T) {
-	s := NewCodeExecSkill(nil, sandbox.Config{Workspace: t.TempDir(), Timeout: 30})
+	s := newConfiguredTestCodeExecSkill(t, nil, sandbox.Config{Workspace: t.TempDir(), Timeout: 30})
 	s.sandboxFactory = func(cfg sandbox.Config) (sandbox.Sandbox, error) {
 		return &mockSandbox{execFn: func(context.Context, string, []string) (*sandbox.ExecResult, error) {
 			return &sandbox.ExecResult{ExitCode: 0, Limits: sandbox.LimitReport{

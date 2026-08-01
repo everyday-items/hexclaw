@@ -42,7 +42,18 @@ func newTestCodeExecSkill(t *testing.T) *CodeExecSkill {
 	}
 	sb := &mockSandbox{}
 	cfg := sandbox.Config{Workspace: t.TempDir(), Timeout: 30, Network: true}
-	return NewCodeExecSkill(sb, cfg)
+	return newConfiguredTestCodeExecSkill(t, sb, cfg)
+}
+
+func newConfiguredTestCodeExecSkill(
+	t *testing.T,
+	sb sandbox.Sandbox,
+	cfg sandbox.Config,
+) *CodeExecSkill {
+	t.Helper()
+	s := NewCodeExecSkill(sb, cfg)
+	s.scratchBase = filepath.Join(cfg.Workspace, "project-scratch")
+	return s
 }
 
 var (
@@ -505,7 +516,7 @@ func TestCodeExecSkill_PosixWrapperDoesNotMkdirInsideSandbox(t *testing.T) {
 		t.Skip("POSIX shell wrapper only")
 	}
 	var script string
-	s := NewCodeExecSkill(&mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30})
+	s := newConfiguredTestCodeExecSkill(t, &mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30})
 	s.sandboxFactory = func(sandbox.Config) (sandbox.Sandbox, error) {
 		return &mockSandbox{execFn: func(_ context.Context, cmd string, args []string) (*sandbox.ExecResult, error) {
 			if cmd != "sh" {
@@ -579,7 +590,7 @@ func TestCodeExecSkill_Execute_PythonCrawlerNetworkPolicy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create sandbox network=%v: %v", network, err)
 		}
-		s := NewCodeExecSkill(sb, cfg)
+		s := newConfiguredTestCodeExecSkill(t, sb, cfg)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		result, err := s.Execute(ctx, map[string]any{
@@ -617,7 +628,7 @@ func TestBUG20260727001_CodeExecProjectGoCommandUsesSelfContainedStagedWorkspace
 		t.Fatal(err)
 	}
 	root := nearestProjectRoot(wd)
-	s := NewCodeExecSkill(&mockSandbox{}, sandbox.Config{
+	s := newConfiguredTestCodeExecSkill(t, &mockSandbox{}, sandbox.Config{
 		Workspace: t.TempDir(),
 		// 沙箱 per-run 冷 GOCACHE：嵌套 go test 每次全量编译整条 go.work 链，空载 ~18s、
 		// 并行全量回归下实测 60s 会被挤爆（2026-07-03 负载 flaky 取证）。180s 留足余量，
@@ -640,6 +651,7 @@ func TestBUG20260727001_CodeExecProjectGoCommandUsesSelfContainedStagedWorkspace
 }
 
 func TestBUG20260727001_CodeExecProjectStagesLocalUseAndReplaceClosure(t *testing.T) {
+	t.Setenv("GOWORK", "")
 	hostWorkspace := t.TempDir()
 	appDir := filepath.Join(hostWorkspace, "app")
 	toolkitDir := filepath.Join(hostWorkspace, "toolkit")
@@ -674,9 +686,11 @@ go 1.24
 
 require (
 	example.com/schema v0.0.0
+	example.com/toolkit v0.0.0
 )
 
 replace example.com/schema => ../schema
+replace example.com/toolkit => ../toolkit
 `)
 	write(filepath.Join(appDir, "app_test.go"), `package app
 
@@ -760,7 +774,7 @@ replace example.com/missing => ../missing
 	}
 
 	finalSandboxCalls := 0
-	s := NewCodeExecSkill(&mockSandbox{}, sandbox.Config{
+	s := newConfiguredTestCodeExecSkill(t, &mockSandbox{}, sandbox.Config{
 		Workspace: t.TempDir(),
 		Timeout:   30,
 		Network:   true,
@@ -788,7 +802,7 @@ func TestCodeExecSkill_Execute_OutputTruncation(t *testing.T) {
 	// 直接字段赋值：sandbox.Config 的限额字段由 go.work 链接的 toolkit 保证存在，
 	// 不再走反射设置（旧版曾用反射 + 版本 skip 兜底）。
 	cfg := sandbox.Config{Workspace: t.TempDir(), Timeout: 30, MaxOutputBytes: 32, MaxStderrBytes: 32}
-	s := NewCodeExecSkill(sb, cfg)
+	s := newConfiguredTestCodeExecSkill(t, sb, cfg)
 	result, err := s.Execute(context.Background(), map[string]any{
 		"language": "python",
 		"code":     "print('A' * 200)",
@@ -821,7 +835,7 @@ func TestCodeExecSkill_Execute_Timeout(t *testing.T) {
 	requireCodeExecSandbox(t)
 	sb := &mockSandbox{}
 	cfg := sandbox.Config{Workspace: t.TempDir(), Timeout: 1, MaxOutputBytes: 1024, MaxStderrBytes: 1024}
-	s := NewCodeExecSkill(sb, cfg)
+	s := newConfiguredTestCodeExecSkill(t, sb, cfg)
 	result, err := s.Execute(context.Background(), map[string]any{
 		"language": "python",
 		"code":     "import time\ntime.sleep(5)",
@@ -842,7 +856,7 @@ func TestCodeExecSkill_Execute_NetworkPolicyPropagatesToRunSandbox(t *testing.T)
 	var networks []bool
 	var scripts []string
 
-	s := NewCodeExecSkill(&mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30, Network: false})
+	s := newConfiguredTestCodeExecSkill(t, &mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30, Network: false})
 	s.sandboxFactory = func(cfg sandbox.Config) (sandbox.Sandbox, error) {
 		mu.Lock()
 		networks = append(networks, cfg.Network)
@@ -912,7 +926,7 @@ func TestCodeExecSkill_Execute_OfflineProjectGoCommandUsesStagedModuleCache(t *t
 	var script string
 	var readable []string
 	var runWorkspace string
-	s := NewCodeExecSkill(&mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30, Network: false})
+	s := newConfiguredTestCodeExecSkill(t, &mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30, Network: false})
 	s.sandboxFactory = func(cfg sandbox.Config) (sandbox.Sandbox, error) {
 		readable = append([]string(nil), cfg.ReadablePaths...)
 		runWorkspace = cfg.Workspace
@@ -960,7 +974,7 @@ func TestCodeExecSkill_Execute_NetworkPolicyControlsDependencyInstall(t *testing
 		var mu sync.Mutex
 		var scripts []string
 		calls := 0
-		s := NewCodeExecSkill(&mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30, Network: network})
+		s := newConfiguredTestCodeExecSkill(t, &mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30, Network: network})
 		s.sandboxFactory = func(sandbox.Config) (sandbox.Sandbox, error) {
 			return &mockSandbox{execFn: func(_ context.Context, _ string, args []string) (*sandbox.ExecResult, error) {
 				mu.Lock()
@@ -1038,7 +1052,7 @@ func TestCodeExecSkill_UpdateNetwork_Toggle(t *testing.T) {
 	ws := t.TempDir()
 	sb := &mockSandbox{}
 	cfg := sandbox.Config{Workspace: ws, Timeout: 30, Network: true}
-	s := NewCodeExecSkill(sb, cfg)
+	s := newConfiguredTestCodeExecSkill(t, sb, cfg)
 
 	if !s.NetworkEnabled() {
 		t.Fatal("should start with network enabled")
@@ -1067,7 +1081,7 @@ func TestCodeExecSkill_UpdateNetwork_FailureKeepsPreviousState(t *testing.T) {
 	ws := t.TempDir()
 	sb := &mockSandbox{}
 	cfg := sandbox.Config{Workspace: ws, Timeout: 30, Network: true}
-	s := NewCodeExecSkill(sb, cfg)
+	s := newConfiguredTestCodeExecSkill(t, sb, cfg)
 
 	s.cfg.Workspace = ""
 
@@ -1084,7 +1098,7 @@ func TestCodeExecSkill_ConcurrentSafety(t *testing.T) {
 	ws := t.TempDir()
 	sb := &mockSandbox{}
 	cfg := sandbox.Config{Workspace: ws, Timeout: 30, Network: true}
-	s := NewCodeExecSkill(sb, cfg)
+	s := newConfiguredTestCodeExecSkill(t, sb, cfg)
 	s.sandboxFactory = func(sandbox.Config) (sandbox.Sandbox, error) {
 		return &mockSandbox{execFn: func(context.Context, string, []string) (*sandbox.ExecResult, error) {
 			return &sandbox.ExecResult{Stdout: "1\n", ExitCode: 0}, nil

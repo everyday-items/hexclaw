@@ -35,6 +35,9 @@ type CodeExecSkill struct {
 	sb             sandbox.Sandbox
 	cfg            sandbox.Config // 保留配置以支持热更新
 	sandboxFactory func(sandbox.Config) (sandbox.Sandbox, error)
+	// scratchBase is instance-scoped so tests can keep project staging inside
+	// testing.T's lifetime. Empty preserves the production /tmp default.
+	scratchBase string
 	// fileAccess 集中裁决触达宿主机文件系统的 code_exec 请求：mode=file 的入口文件、
 	// mode=project 的项目根（及要放行的父目录）在读取/授予前必须落在 broker 的 allow-list
 	// 内，否则一律拒绝执行（fail-closed）。nil 时不额外裁决（仅限未接线的嵌入/测试场景）。
@@ -253,13 +256,13 @@ func (s *CodeExecSkill) Execute(ctx context.Context, args map[string]any) (*skil
 		return nil, err
 	}
 
-	cfg, factory := s.snapshot()
+	cfg, factory, scratchBase := s.snapshot()
 	broker := s.broker()
 	// P0 收口：mode=file/project 触达宿主机的路径在读取/授予前必须过集中裁决（fail-closed）。
 	if err := authorizeCodeExecHostPaths(broker, cfg.Workspace, req); err != nil {
 		return nil, err
 	}
-	run, err := prepareCodeExecRun(cfg, req, broker)
+	run, err := prepareCodeExecRun(cfg, req, broker, scratchBase)
 	if err != nil {
 		return nil, err
 	}
@@ -307,7 +310,7 @@ func (s *CodeExecSkill) Execute(ctx context.Context, args map[string]any) (*skil
 	}, nil
 }
 
-func (s *CodeExecSkill) snapshot() (sandbox.Config, func(sandbox.Config) (sandbox.Sandbox, error)) {
+func (s *CodeExecSkill) snapshot() (sandbox.Config, func(sandbox.Config) (sandbox.Sandbox, error), string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	cfg := s.cfg
@@ -316,7 +319,7 @@ func (s *CodeExecSkill) snapshot() (sandbox.Config, func(sandbox.Config) (sandbo
 	if factory == nil {
 		factory = sandbox.New
 	}
-	return cfg, factory
+	return cfg, factory, s.scratchBase
 }
 
 func (s *CodeExecSkill) buildSandboxLocked(cfg sandbox.Config) (sandbox.Sandbox, error) {
@@ -425,7 +428,12 @@ func isPythonCommand(name string) bool {
 	return base == "python" || base == "python3"
 }
 
-func prepareCodeExecRun(cfg sandbox.Config, req codeExecRequest, broker *FileAccessBroker) (codeExecRun, error) {
+func prepareCodeExecRun(
+	cfg sandbox.Config,
+	req codeExecRequest,
+	broker *FileAccessBroker,
+	scratchBase string,
+) (codeExecRun, error) {
 	if cfg.Workspace == "" {
 		return codeExecRun{}, fmt.Errorf("sandbox workspace is required")
 	}
@@ -446,7 +454,10 @@ func prepareCodeExecRun(cfg sandbox.Config, req codeExecRequest, broker *FileAcc
 		if err != nil {
 			return codeExecRun{}, err
 		}
-		scratch = filepath.Join(resolveRealPath(codeExecScratchBase()), "hexclaw-sandbox-runs", runID)
+		if strings.TrimSpace(scratchBase) == "" {
+			scratchBase = codeExecScratchBase()
+		}
+		scratch = filepath.Join(resolveRealPath(scratchBase), "hexclaw-sandbox-runs", runID)
 		workspace = scratch
 	}
 
