@@ -100,13 +100,18 @@ func TestModelInvocationLedgerReconcilesDurableSuccessWithoutResend(t *testing.T
 		t.Fatalf("create grading job: %v", err)
 	}
 	ctx := context.Background()
+	policy := k12.ApprovedRecognizingRequestPolicy()
 	prepared, _, err := store.PrepareModelInvocation(ctx, k12.ModelInvocation{
 		InvocationID: "inv-reconcile-success", AgentName: "mingming", JobID: job.RecordID,
 		Stage: k12.GradingStageRecognizing, RequestDigest: "sha256:request",
 		RouteSnapshot: k12.GradingModelSnapshot{
-			Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", Route: "hexclaw-gpt/gpt-5.6-sol",
+			Provider:                 "hexclaw-gpt",
+			Model:                    k12.RecognizingPolicyModel,
+			Route:                    "hexclaw-gpt/" + k12.RecognizingPolicyModel,
+			RecognizingRequestPolicy: policy,
 		},
-		Attempt: 1, CreatedAt: 300, UpdatedAt: 300,
+		RequestPolicySnapshot: policy,
+		Attempt:               1, CreatedAt: 300, UpdatedAt: 300,
 	})
 	if err != nil {
 		t.Fatalf("prepare invocation: %v", err)

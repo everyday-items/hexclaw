@@ -89,9 +89,11 @@ func TestDenseWorksheetCoreRecognitionUsesFiveSegmentsPlusPrintedInventory(t *te
 	if calls.Load() != wantCalls {
 		t.Fatalf("dense worksheet core calls=%d want=%d", calls.Load(), wantCalls)
 	}
-	if maxInFlight.Load() != wantCalls {
-		t.Fatalf("five segments plus printed inventory should run in one latency wave, max concurrency=%d want=%d",
-			maxInFlight.Load(), wantCalls)
+	if maxInFlight.Load() != 1 {
+		t.Fatalf(
+			"five segments plus printed inventory must remain serial independent of governor config, max concurrency=%d want=1",
+			maxInFlight.Load(),
+		)
 	}
 	if len(questions) != len(denseWorksheetRanges) {
 		t.Fatalf("dense worksheet questions=%d want=%d: %#v", len(questions), len(denseWorksheetRanges), questions)
@@ -329,7 +331,7 @@ func TestSmallImageUsesOneCoreCall(t *testing.T) {
 	}
 }
 
-func TestDenseWorksheetRetriesOnlyTransientFailedSegments(t *testing.T) {
+func TestDenseWorksheetTransientFailedSegmentIsNotRetried(t *testing.T) {
 	var calls atomic.Int32
 	var segmentCalls [5]atomic.Int32
 	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
@@ -351,35 +353,30 @@ func TestDenseWorksheetRetriesOnlyTransientFailedSegments(t *testing.T) {
 			segment, segment+1,
 		), nil
 	}
-	questions, err := newDenseSegmentTestRecognizer(vision).Recognize(
+	_, err := newDenseSegmentTestRecognizer(vision).Recognize(
 		context.Background(),
 		denseWorksheetTestImage(t, 1000, 1800),
 	)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		t.Fatal("expected the first transient physical failure to stop the fallback")
 	}
-	if calls.Load() != 7 {
-		t.Fatalf("only the failed segment should be retried after six base units, calls=%d want=7", calls.Load())
+	if calls.Load() != 3 {
+		t.Fatalf("serial fallback must stop at segment 3, calls=%d want=3", calls.Load())
 	}
 	for i := range segmentCalls {
-		want := int32(1)
-		if i == 2 {
-			want = 2
+		want := int32(0)
+		if i <= 2 {
+			want = 1
 		}
 		if got := segmentCalls[i].Load(); got != want {
 			t.Fatalf("segment %d calls=%d want=%d", i+1, got, want)
 		}
 	}
-	if len(questions) != len(denseWorksheetRanges) {
-		t.Fatalf("questions=%d want=%d: %#v", len(questions), len(denseWorksheetRanges), questions)
-	}
 }
 
-func TestDenseWorksheetTransientRetryWaveCapsConcurrency(t *testing.T) {
+func TestDenseWorksheetMultipleTransientFailuresDoNotStartSecondWave(t *testing.T) {
 	var calls atomic.Int32
 	var segmentCalls [5]atomic.Int32
-	var retryInFlight atomic.Int32
-	var maxRetryInFlight atomic.Int32
 	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
 		calls.Add(1)
 		segment := denseWorksheetPromptSegment(t, prompt)
@@ -394,30 +391,25 @@ func TestDenseWorksheetTransientRetryWaveCapsConcurrency(t *testing.T) {
 				Status:     "503 Service Unavailable",
 			}
 		}
-		if attempt == 2 {
-			current := retryInFlight.Add(1)
-			defer retryInFlight.Add(-1)
-			for {
-				previous := maxRetryInFlight.Load()
-				if current <= previous || maxRetryInFlight.CompareAndSwap(previous, current) {
-					break
-				}
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
 		return `[]`, nil
 	}
 	if _, err := newDenseSegmentTestRecognizer(vision).Recognize(
 		context.Background(),
 		denseWorksheetTestImage(t, 1000, 1800),
-	); err != nil {
-		t.Fatal(err)
+	); err == nil {
+		t.Fatal("expected the first-wave transient failures to stop fallback")
 	}
-	if calls.Load() != 9 {
-		t.Fatalf("six base calls plus three failed-segment retries expected, calls=%d", calls.Load())
+	if calls.Load() != 2 {
+		t.Fatalf("serial fallback must stop at segment 2, calls=%d want=2", calls.Load())
 	}
-	if got := maxRetryInFlight.Load(); got != denseWorksheetRetryMaxConcurrency {
-		t.Fatalf("retry wave concurrency=%d want=%d", got, denseWorksheetRetryMaxConcurrency)
+	for i := range segmentCalls {
+		want := int32(0)
+		if i <= 1 {
+			want = 1
+		}
+		if got := segmentCalls[i].Load(); got != want {
+			t.Fatalf("segment %d calls=%d want=%d", i+1, got, want)
+		}
 	}
 }
 
@@ -443,13 +435,13 @@ func TestDenseWorksheetPermanentProviderFailureIsNotRetried(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected provider error")
 	}
-	if calls.Load() != 6 || failedSegmentCalls.Load() != 1 {
+	if calls.Load() != 3 || failedSegmentCalls.Load() != 1 {
 		t.Fatalf("permanent failure must not be retried, calls=%d failed_segment_calls=%d",
 			calls.Load(), failedSegmentCalls.Load())
 	}
 }
 
-func TestDenseWorksheetTransientFailureStopsAfterOneRetry(t *testing.T) {
+func TestDenseWorksheetTransientFailureStopsWithoutRetry(t *testing.T) {
 	var calls atomic.Int32
 	var failedSegmentCalls atomic.Int32
 	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
@@ -469,10 +461,10 @@ func TestDenseWorksheetTransientFailureStopsAfterOneRetry(t *testing.T) {
 		denseWorksheetTestImage(t, 1000, 1800),
 	)
 	if err == nil {
-		t.Fatal("expected provider error after bounded retry")
+		t.Fatal("expected provider error without retry")
 	}
-	if calls.Load() != 7 || failedSegmentCalls.Load() != 2 {
-		t.Fatalf("transient failure must get exactly one segment retry, calls=%d failed_segment_calls=%d",
+	if calls.Load() != 3 || failedSegmentCalls.Load() != 1 {
+		t.Fatalf("transient failure must not retry, calls=%d failed_segment_calls=%d",
 			calls.Load(), failedSegmentCalls.Load())
 	}
 	var providerErr *llm.ProviderError
@@ -501,52 +493,9 @@ func TestDenseWorksheetParseFailureIsNotRetried(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected parse error")
 	}
-	if calls.Load() != 6 || failedSegmentCalls.Load() != 1 {
+	if calls.Load() != 3 || failedSegmentCalls.Load() != 1 {
 		t.Fatalf("model contract/parse errors must not be retried, calls=%d failed_segment_calls=%d",
 			calls.Load(), failedSegmentCalls.Load())
-	}
-}
-
-func TestIsTransientVisionError(t *testing.T) {
-	for _, status := range []int{
-		http.StatusRequestTimeout,
-		http.StatusTooEarly,
-		http.StatusTooManyRequests,
-		http.StatusInternalServerError,
-		http.StatusBadGateway,
-		http.StatusServiceUnavailable,
-		http.StatusGatewayTimeout,
-	} {
-		err := &llm.ProviderError{Provider: "openai", StatusCode: status, Status: http.StatusText(status)}
-		if !isTransientVisionError(context.Background(), err) {
-			t.Errorf("status %d should be transient", status)
-		}
-	}
-	for _, status := range []int{
-		http.StatusBadRequest,
-		http.StatusUnauthorized,
-		http.StatusForbidden,
-		http.StatusNotFound,
-		http.StatusUnprocessableEntity,
-	} {
-		err := &llm.ProviderError{Provider: "openai", StatusCode: status, Status: http.StatusText(status)}
-		if isTransientVisionError(context.Background(), err) {
-			t.Errorf("status %d must not be transient", status)
-		}
-	}
-	if isTransientVisionError(context.Background(), context.Canceled) {
-		t.Error("user cancellation must not be retried")
-	}
-	if !isTransientVisionError(context.Background(), context.DeadlineExceeded) {
-		t.Error("an upstream child deadline with a live parent context should be retryable")
-	}
-	expired, cancel := context.WithCancel(context.Background())
-	cancel()
-	if isTransientVisionError(expired, context.DeadlineExceeded) {
-		t.Error("an expired parent context must not be retried")
-	}
-	if isTransientVisionError(context.Background(), errors.New("solver computed 500 items")) {
-		t.Error("an unrelated number must not be classified as an HTTP 500")
 	}
 }
 

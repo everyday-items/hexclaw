@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
 	mockllm "github.com/hexagon-codes/hexagon/testing/mock"
 	"github.com/hexagon-codes/hexclaw/config"
@@ -107,15 +110,21 @@ func TestBug20260730VisionMetadataRequiresTypedRecognizingMarker(t *testing.T) {
 		RecognizingRequestPolicy: k12.ApprovedRecognizingRequestPolicy(),
 	}
 	routeOnly := k12.WithGradingModelSnapshot(context.Background(), snapshot)
-	if metadata, err := k12VisionRequestMetadata(routeOnly); err != nil || metadata != nil {
-		t.Fatalf("snapshot-only locating/classification metadata=%v err=%v, want nil", metadata, err)
+	if metadata, scope, err := k12VisionRequestMetadata(routeOnly); err != nil ||
+		metadata != nil || scope != "" {
+		t.Fatalf(
+			"snapshot-only locating/classification metadata=%v scope=%q err=%v, want zero",
+			metadata,
+			scope,
+			err,
+		)
 	}
 
 	recognizing := k12.WithGradingModelRequestPolicy(
 		routeOnly,
 		k12.ApprovedRecognizingRequestPolicy(),
 	)
-	metadata, err := k12VisionRequestMetadata(recognizing)
+	metadata, scope, err := k12VisionRequestMetadata(recognizing)
 	if err != nil {
 		t.Fatalf("recognizing metadata: %v", err)
 	}
@@ -125,12 +134,40 @@ func TestBug20260730VisionMetadataRequiresTypedRecognizingMarker(t *testing.T) {
 	if _, leaked := metadata["reasoning_effort"]; leaked {
 		t.Fatalf("HexClaw must not construct provider wire policy: %v", metadata)
 	}
+	if scope != llm.ReasoningPolicyScopeStructuredVisionRecognition {
+		t.Fatalf("recognizing scope=%q, want structured vision recognition", scope)
+	}
 
 	mutated := k12.ApprovedRecognizingRequestPolicy()
 	mutated.Thinking = "on"
-	if metadata, err := k12VisionRequestMetadata(
+	if metadata, scope, err := k12VisionRequestMetadata(
 		k12.WithGradingModelRequestPolicy(routeOnly, mutated),
-	); err == nil || metadata != nil {
-		t.Fatalf("mutated policy metadata=%v err=%v, want fail closed", metadata, err)
+	); err == nil || metadata != nil || scope != "" {
+		t.Fatalf(
+			"mutated policy metadata=%v scope=%q err=%v, want fail closed",
+			metadata,
+			scope,
+			err,
+		)
+	}
+}
+
+// REG-DD-036-PHYSICAL-SEND-ROOT-001: the production composition root must
+// delegate prepared→sent to ai-core's actual shared HTTP transport boundary.
+// Adapter-level tests alone cannot prove that the installed service enables
+// this option.
+func TestBug20260730ProductionRecognizerUsesProviderTransportSendBoundary(
+	t *testing.T,
+) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const required = "k12engineadapter.WithRecognizerProviderTransportSendBoundary()"
+	if got := strings.Count(string(source), required); got != 1 {
+		t.Fatalf(
+			"production recognizer transport-boundary wiring count=%d, want exactly 1",
+			got,
+		)
 	}
 }

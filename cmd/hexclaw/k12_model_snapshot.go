@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -72,26 +73,31 @@ func resolveK12PracticeModelSnapshot(
 }
 
 // k12VisionRequestMetadata translates the typed, stage-scoped semantic policy
-// into ai-core metadata. The Provider adapter, not HexClaw, owns the final wire
-// dialect (`reasoning_effort=none` for gpt-5.6-sol).
-func k12VisionRequestMetadata(ctx context.Context) (map[string]any, error) {
+// into ai-core metadata plus the typed adapter inference scope. The Provider
+// adapter, not HexClaw, owns the final wire dialect
+// (`reasoning_effort=none` for gpt-5.6-sol).
+func k12VisionRequestMetadata(
+	ctx context.Context,
+) (map[string]any, llm.ReasoningPolicyScope, error) {
 	policy, marked := k12.GradingModelRequestPolicyFromContext(ctx)
 	if !marked {
-		return nil, nil
+		return nil, "", nil
 	}
 	snapshot, frozen := k12.GradingModelSnapshotFromContext(ctx)
 	if !frozen {
-		return nil, fmt.Errorf("K12 recognizing request policy has no frozen route")
+		return nil, "", fmt.Errorf("K12 recognizing request policy has no frozen route")
 	}
 	if err := k12.ValidateModelInvocationRequestPolicy(
 		k12.GradingStageRecognizing,
 		snapshot,
 		policy,
 	); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if !policy.IsApprovedRecognizing() {
-		return nil, fmt.Errorf("K12 recognizing request policy is not approved")
+		return nil, "", fmt.Errorf("K12 recognizing request policy is not approved")
 	}
-	return map[string]any{"thinking": policy.Thinking}, nil
+	return map[string]any{"thinking": policy.Thinking},
+		llm.ReasoningPolicyScopeStructuredVisionRecognition,
+		nil
 }

@@ -300,7 +300,11 @@ func TestGradingExpiredParentPreservesSentInvocationAsOutcomeUnknown(t *testing.
 		t.Fatal(err)
 	}
 	run := o.lookup(jobID)
-	requestDigest := modelInvocationDigest([]byte(k12.GradingStageRecognizing), run.req.Image)
+	requestDigest := recognizingInvocationDigest(
+		run.req.Image,
+		view.Fields.ModelSnapshot,
+		k12.ModelRequestPolicySnapshot{},
+	)
 	invocation, _, err := d.Records.PrepareModelInvocation(context.Background(), k12.ModelInvocation{
 		InvocationID: "modelinv-sent-parent-expiry", AgentName: "mingming",
 		JobID: jobID, Stage: k12.GradingStageRecognizing, RequestDigest: requestDigest,

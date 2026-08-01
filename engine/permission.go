@@ -528,6 +528,16 @@ func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo)
 	// （未注入策略的调用方）才退化到 classifyRisk 黑名单兜底。
 	if h.policy != nil {
 		dec := h.policy.Evaluate(call)
+		// Retrieved document content is a data-plane input, never an authority
+		// source. Explicit static deny remains first; every other policy outcome
+		// is narrowed by the evidence-aware gate before allow/matrix/solve paths.
+		if dec.Action != ActionDeny && hasUntrustedKnowledgeEvidence(ctx) {
+			risk := dec.Risk
+			if risk == "" || risk == "safe" {
+				risk = "sensitive"
+			}
+			return h.authorizeUntrustedEvidenceTool(ctx, call, risk)
+		}
 		switch dec.Action {
 		case ActionAllow:
 			return h.gateUnattendedConnectorTool(ctx, call)
@@ -558,10 +568,46 @@ func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo)
 
 	// Legacy path: hardcoded dangerous/sensitive lists
 	risk := h.classifyRisk(call.Name)
+	if hasUntrustedKnowledgeEvidence(ctx) {
+		if risk == "safe" {
+			risk = "sensitive"
+		}
+		return h.authorizeUntrustedEvidenceTool(ctx, call, risk)
+	}
 	if risk == "safe" {
 		return h.gateUnattendedConnectorTool(ctx, call)
 	}
 	return h.requestApproval(ctx, call, risk,
+		fmt.Sprintf("Agent wants to execute %s(%s)", call.Name, summarizeArgs(call.Arguments)))
+}
+
+// authorizeUntrustedEvidenceTool is the authority firewall between retrieved
+// document data and tool execution. Interactive requests use the existing
+// approval source of truth. Unattended requests deliberately ignore the
+// global autonomy matrix and legacy broad task grants; only an evidence-aware
+// grant bound to owner/task/tool/argument scope can authorize them.
+func (h *PermissionHook) authorizeUntrustedEvidenceTool(ctx context.Context, call *ToolCallInfo, risk string) error {
+	if src := systemDispatchSource(ctx); src != "" {
+		taskRef := systemDispatchTaskRef(ctx)
+		scopeDigest, err := untrustedEvidenceSecurityScopeDigest(call.Arguments)
+		if err != nil {
+			h.recordDecision(ctx, call.Name, "deny", "policy", "RAG 证据作用域无法规范化")
+			return fmt.Errorf("tool %q blocked for untrusted evidence: canonicalize security scope: %w", call.Name, err)
+		}
+		checker, ok := h.taskGrants.(UntrustedEvidenceTaskGrantChecker)
+		ownerID := skill.AuthenticatedUserID(ctx)
+		toolName := canonicalEvidenceToolName(call.Name)
+		if ok && ownerID != "" && taskRef != "" && checker.GrantAllowsUntrustedEvidence(ownerID, src, taskRef, toolName, scopeDigest) {
+			logger.Info("[permission] tainted tool approved by exact evidence-aware task grant",
+				"tool_name", toolName, "source", src, "task_ref", taskRef)
+			h.recordDecision(ctx, toolName, "allow", "task_grant", "命中 RAG 证据专用 owner/task/scope 授权")
+			return nil
+		}
+		h.recordDecision(ctx, toolName, "deny", "policy", "不可信 RAG 证据禁止全局矩阵或宽泛 grant 提权")
+		return fmt.Errorf("tool %q blocked for untrusted evidence in unattended %s dispatch: an exact owner/task/tool/security-scope grant is required", toolName, src)
+	}
+
+	return h.requestInteractiveApproval(ctx, call, risk,
 		fmt.Sprintf("Agent wants to execute %s(%s)", call.Name, summarizeArgs(call.Arguments)))
 }
 
@@ -644,6 +690,10 @@ func (h *PermissionHook) requestApproval(ctx context.Context, call *ToolCallInfo
 			call.Name, src, policy.Profile(), src)
 	}
 
+	return h.requestInteractiveApproval(ctx, call, risk, reason)
+}
+
+func (h *PermissionHook) requestInteractiveApproval(ctx context.Context, call *ToolCallInfo, risk, reason string) error {
 	sessionID, _ := ctx.Value(ctxKeySessionID).(string)
 	if sessionID == "" {
 		if risk == "dangerous" {
@@ -662,6 +712,9 @@ func (h *PermissionHook) requestApproval(ctx context.Context, call *ToolCallInfo
 		Reason:    reason,
 	}
 
+	if h.hub == nil {
+		return fmt.Errorf("tool %q requires approval but no approval coordinator is configured", call.Name)
+	}
 	approved, err := h.hub.RequestApproval(ctx, sessionID, req)
 	if err != nil {
 		logger.Error("[permission] approval error for", "name", call.Name, "error", err)

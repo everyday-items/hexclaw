@@ -646,33 +646,111 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 			fmt.Errorf("%w: %v", ErrModelRequestPolicyInvalid, policyErr),
 		)
 	}
-	invocation, err := o.beginModelInvocationWithPolicy(
-		ctx,
-		job,
-		k12.GradingStageRecognizing,
-		recognizingInvocationDigest(
-			run.req.Image,
-			job.Fields.ModelSnapshot,
+	var invocation k12.ModelInvocation
+	if policy.IsZero() {
+		invocation, err = o.beginModelInvocationWithPolicy(
+			ctx,
+			job,
+			k12.GradingStageRecognizing,
+			recognizingInvocationDigest(
+				run.req.Image,
+				job.Fields.ModelSnapshot,
+				policy,
+			),
 			policy,
-		),
-		policy,
-	)
+		)
+	} else {
+		invocation, err = o.beginRecognizingModelInvocationWithPolicy(
+			ctx,
+			job,
+			run.req.Image,
+			recognizingInvocationDigest(
+				run.req.Image,
+				job.Fields.ModelSnapshot,
+				policy,
+			),
+			policy,
+		)
+	}
 	if err != nil {
 		if invocation.InvocationID == "" {
 			return o.failModelInvocationBeforeSend(ctx, run, jobID, err)
 		}
-		if recovered, v, recoverErr := o.recoverRecognizeInvocation(ctx, run, jobID, invocation); recovered {
-			return v, recoverErr
+		if errors.Is(err, ErrRecognitionPhysicalCallObservedInFlight) {
+			current, readErr := o.deps.GetGradingJob(
+				context.WithoutCancel(ctx),
+				run.agentName,
+				jobID,
+			)
+			if readErr != nil {
+				return current, errors.Join(err, readErr)
+			}
+			return current, err
 		}
-		if invocation.Status == k12.ModelInvocationSent {
-			invocation, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx),
-				run.agentName, invocation.InvocationID, "recovered_after_send")
+		if handled, settled, settleErr :=
+			o.settleConclusiveRecognitionRecovery(
+				ctx,
+				run,
+				job,
+				invocation,
+			); handled {
+			return settled, errors.Join(err, settleErr)
+		} else if settleErr != nil {
+			err = errors.Join(err, settleErr)
 		}
-		unknown, advanceErr := o.markGradingOutcomeUnknown(ctx, run, jobID, "invocation_reconciliation_required")
-		if advanceErr != nil {
-			return unknown, advanceErr
+		resumePrepared, resumeErr :=
+			o.preparedWholePageRecognitionCanResume(
+				context.WithoutCancel(ctx),
+				invocation,
+				run.req.Image,
+			)
+		if resumeErr != nil {
+			err = errors.Join(err, resumeErr)
 		}
-		return unknown, err
+		if !resumePrepared {
+			if recovered, v, recoverErr := o.recoverRecognizeInvocation(
+				ctx,
+				run,
+				jobID,
+				invocation,
+			); recovered {
+				return v, recoverErr
+			}
+			if invocation.Status == k12.ModelInvocationSent {
+				invocation, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(
+					context.WithoutCancel(ctx),
+					run.agentName,
+					invocation.InvocationID,
+					"recovered_after_send",
+				)
+			}
+			unknown, advanceErr := o.markGradingOutcomeUnknown(
+				ctx,
+				run,
+				jobID,
+				"invocation_reconciliation_required",
+			)
+			if advanceErr != nil {
+				return unknown, advanceErr
+			}
+			return unknown, err
+		}
+	}
+	// An exact prepared whole-page child is restart-safe only while the frozen
+	// stage deadline is still live. The atomic initial publication path can
+	// replay that parent+child pair without returning an error, so enforce the
+	// same conclusive recovery gate before entering the Provider on both the
+	// error and successful replay paths.
+	if handled, settled, settleErr :=
+		o.settleConclusiveRecognitionRecovery(
+			ctx,
+			run,
+			job,
+			invocation,
+		); handled {
+		return settled, settleErr
+	} else if settleErr != nil {
+		return GradingJobView{}, settleErr
 	}
 	// Fields.Deadline is the durable budget for the current automatic stage.
 	// Derive the provider call from it so synchronous runs, async workers, and
@@ -685,6 +763,14 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 			invocation.RequestPolicySnapshot,
 		)
 	}
+	physicalExecutor := newDurableRecognitionPhysicalCallExecutor(
+		o,
+		invocation,
+	)
+	providerCtx = k12.WithRecognitionPhysicalCallExecutor(
+		providerCtx,
+		physicalExecutor,
+	)
 	unregisterProvider := o.registerGradingModelCall(jobID, cancelProvider)
 	if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), run.agentName, jobID); readErr != nil {
 		cancelProvider()
@@ -701,7 +787,77 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 	cancelProvider()
 	unregisterProvider()
 	if err != nil {
-		if sentProviderOutcomeUnknown(err, nil) {
+		if errors.Is(err, ErrRecognitionPhysicalCallObservedInFlight) {
+			// Another worker owns the exact same durable child and may already
+			// be inside the Provider request. This worker is a passive observer:
+			// it must not project its local no-send result onto the shared
+			// parent invocation or Job.
+			current, readErr := o.deps.GetGradingJob(
+				context.WithoutCancel(ctx),
+				run.agentName,
+				jobID,
+			)
+			if readErr != nil {
+				return current, errors.Join(err, readErr)
+			}
+			return current, err
+		}
+		beforePhysicalSend := errors.Is(
+			err,
+			ErrRecognitionPhysicalCallBeforeSend,
+		)
+		if !invocation.RequestPolicySnapshot.IsZero() &&
+			physicalExecutor.localCallEntries.Load() == 0 {
+			definiteNoSend, observedOtherWorker, inspectErr :=
+				o.settleRecognitionFailureBeforeLocalPhysicalCall(
+					context.WithoutCancel(ctx),
+					invocation,
+					run.req.Image,
+				)
+			if inspectErr != nil {
+				current, readErr := o.deps.GetGradingJob(
+					context.WithoutCancel(ctx),
+					run.agentName,
+					jobID,
+				)
+				return current, errors.Join(err, inspectErr, readErr)
+			}
+			if observedOtherWorker {
+				current, readErr := o.deps.GetGradingJob(
+					context.WithoutCancel(ctx),
+					run.agentName,
+					jobID,
+				)
+				return current, errors.Join(
+					err,
+					ErrRecognitionPhysicalCallObservedInFlight,
+					readErr,
+				)
+			}
+			beforePhysicalSend = definiteNoSend
+		}
+		if !beforePhysicalSend &&
+			!invocation.RequestPolicySnapshot.IsZero() {
+			physicalStarted, inspectErr :=
+				o.recognitionPhysicalCallStarted(
+					context.WithoutCancel(ctx),
+					invocation,
+				)
+			if inspectErr == nil && !physicalStarted {
+				// Under the approved DD-036 policy every provider request must
+				// cross a durable child prepared→sent boundary first. Therefore
+				// an exact zero-child set proves this failure happened before
+				// any request could have reached the provider.
+				beforePhysicalSend = true
+			}
+		}
+		protocolInvalid := errors.Is(
+			err,
+			k12.ErrRecognitionProtocolInvalid,
+		)
+		if !beforePhysicalSend &&
+			!protocolInvalid &&
+			sentProviderOutcomeUnknown(err, nil) {
 			_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(context.WithoutCancel(ctx), run.agentName, invocation.InvocationID, "provider_outcome_unknown")
 			if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), run.agentName, jobID); readErr == nil && current.Record.Status == k12.GradingStageCancelled {
 				return current, nil
@@ -712,22 +868,56 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 			}
 			return v, err
 		}
-		if _, ledgerErr := o.deps.Records.MarkModelInvocationFailed(context.WithoutCancel(ctx), run.agentName, invocation.InvocationID, "recognize_failed"); ledgerErr != nil {
+		failureKind := "recognize_failed"
+		if beforePhysicalSend {
+			failureKind = "physical_invocation_prepare_failed"
+		}
+		if _, ledgerErr := o.deps.Records.MarkModelInvocationFailed(
+			context.WithoutCancel(ctx),
+			run.agentName,
+			invocation.InvocationID,
+			failureKind,
+		); ledgerErr != nil {
 			v, aerr := o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run, jobID, "invocation_ledger_write_failed")
 			if aerr != nil {
 				return v, aerr
 			}
 			return v, ledgerErr
 		}
-		v, aerr := o.deps.AdvanceGradingStage(ctx, run.agentName, jobID, AdvanceGradingInput{
-			Outcome:     GradingOutcomeFailed,
-			FailureKind: "recognize_failed",
-			Retryable:   gradingErrRetryable(err),
-		})
+		v, aerr := o.deps.AdvanceGradingStage(
+			context.WithoutCancel(ctx),
+			run.agentName,
+			jobID,
+			AdvanceGradingInput{
+				Outcome:     GradingOutcomeFailed,
+				FailureKind: failureKind,
+				Retryable:   gradingErrRetryable(err),
+			},
+		)
 		if aerr != nil {
 			return v, aerr
 		}
 		return v, err
+	}
+	_, physicalErr := o.recognitionPhysicalSuccessSet(
+		context.WithoutCancel(ctx),
+		invocation,
+		run.req.Image,
+	)
+	if physicalErr != nil {
+		_, ledgerErr := o.deps.Records.MarkModelInvocationOutcomeUnknown(
+			context.WithoutCancel(ctx),
+			run.agentName,
+			invocation.InvocationID,
+			"physical_receipt_invalid",
+		)
+		v, advanceErr := o.markGradingOutcomeUnknown(
+			context.WithoutCancel(ctx),
+			run,
+			jobID,
+			"physical_receipt_invalid",
+		)
+		return v, errors.Join(physicalErr, ledgerErr, advanceErr)
 	}
 	if len(questions) == 0 {
 		_, _ = o.deps.Records.MarkModelInvocationSucceeded(context.WithoutCancel(ctx), run.agentName,
@@ -1620,9 +1810,161 @@ func (o *GradingOrchestrator) beginModelInvocationWithPolicy(
 	}
 }
 
+// beginRecognizingModelInvocationWithPolicy publishes the initial physical
+// authorization before exposing the stage parent as sent. A prepared parent is
+// safe to observe without a child; a sent parent is not.
+func (o *GradingOrchestrator) beginRecognizingModelInvocationWithPolicy(
+	ctx context.Context,
+	job GradingJobView,
+	image []byte,
+	requestDigest string,
+	policy k12.ModelRequestPolicySnapshot,
+) (k12.ModelInvocation, error) {
+	parent, _, err := o.deps.Records.PrepareModelInvocation(
+		ctx,
+		k12.ModelInvocation{
+			InvocationID:  "modelinv-" + idgen.ShortID(),
+			AgentName:     job.Record.AgentName,
+			JobID:         job.Record.RecordID,
+			Stage:         k12.GradingStageRecognizing,
+			RequestDigest: requestDigest,
+			RouteSnapshot: job.Fields.ModelSnapshot,
+			RequestPolicySnapshot: k12.NormalizeModelRequestPolicySnapshot(
+				policy,
+			),
+			Attempt:   job.Fields.AttemptCount + 1,
+			CreatedAt: o.deps.now(),
+			UpdatedAt: o.deps.now(),
+		},
+	)
+	if err != nil {
+		return k12.ModelInvocation{}, err
+	}
+	call := k12.RecognitionPhysicalCall{
+		Unit:  k12.RecognitionPhysicalUnitWholePage,
+		Image: image,
+	}
+	childDigest, err := recognizingPhysicalInvocationDigest(parent, call)
+	if err != nil {
+		return parent, fmt.Errorf(
+			"%w: build initial whole-page digest: %v",
+			ErrRecognitionPhysicalCallBeforeSend,
+			err,
+		)
+	}
+	published, child, _, err :=
+		o.deps.Records.PrepareRecognizingInvocationWithInitialWholePage(
+			ctx,
+			parent,
+			k12.ModelPhysicalInvocation{
+				PhysicalInvocationID: stableRecognitionPhysicalInvocationID(
+					parent.InvocationID,
+					call.Unit,
+				),
+				ParentInvocationID:    parent.InvocationID,
+				AgentName:             parent.AgentName,
+				JobID:                 parent.JobID,
+				Stage:                 parent.Stage,
+				PhysicalUnit:          call.Unit,
+				RequestDigest:         childDigest,
+				RouteSnapshot:         parent.RouteSnapshot,
+				RequestPolicySnapshot: parent.RequestPolicySnapshot,
+				Attempt:               1,
+				CreatedAt:             o.deps.now(),
+				UpdatedAt:             o.deps.now(),
+			},
+		)
+	if err != nil {
+		return parent, fmt.Errorf(
+			"%w: publish initial whole-page child: %v",
+			ErrRecognitionPhysicalCallBeforeSend,
+			err,
+		)
+	}
+	if published.Status == k12.ModelInvocationSent &&
+		child.Status == k12.ModelInvocationPrepared {
+		return published, nil
+	}
+	passiveObserver, inspectErr :=
+		o.recognitionPhysicalChildIsPassiveObserver(
+			context.WithoutCancel(ctx),
+			published,
+			child,
+			call,
+		)
+	if inspectErr != nil {
+		return published, inspectErr
+	}
+	if passiveObserver {
+		return published, recognitionPhysicalObservedInFlightError(child)
+	}
+	return published, fmt.Errorf(
+		"%w: invocation=%s status=%s whole_page=%s",
+		ErrModelInvocationRequiresReconciliation,
+		published.InvocationID,
+		published.Status,
+		child.Status,
+	)
+}
+
 func (o *GradingOrchestrator) recoverRecognizeInvocation(ctx context.Context, run *gradingRun, jobID string, invocation k12.ModelInvocation) (bool, GradingJobView, error) {
 	if (invocation.Status != k12.ModelInvocationSent && invocation.Status != k12.ModelInvocationSucceeded) || len(run.questions) == 0 {
 		return false, GradingJobView{}, nil
+	}
+	physicalChildren, physicalErr := o.recognitionPhysicalSuccessSet(
+		context.WithoutCancel(ctx),
+		invocation,
+		run.req.Image,
+	)
+	if physicalErr != nil {
+		var ledgerErr error
+		if invocation.Status == k12.ModelInvocationSent {
+			_, ledgerErr = o.deps.Records.MarkModelInvocationOutcomeUnknown(
+				context.WithoutCancel(ctx),
+				run.agentName,
+				invocation.InvocationID,
+				"physical_receipt_invalid",
+			)
+		}
+		v, advanceErr := o.markGradingOutcomeUnknown(
+			context.WithoutCancel(ctx),
+			run,
+			jobID,
+			"physical_receipt_invalid",
+		)
+		return true, v, errors.Join(physicalErr, ledgerErr, advanceErr)
+	}
+	if !invocation.RequestPolicySnapshot.IsZero() {
+		receipt, ok := o.readRecognitionReceipt(jobID)
+		if !ok ||
+			receipt.AgentName != run.agentName ||
+			receipt.InvocationID != invocation.InvocationID ||
+			!sameRecognitionPhysicalReceiptSet(
+				receipt.PhysicalInvocations,
+				recognitionPhysicalReceiptSet(physicalChildren),
+			) {
+			var ledgerErr error
+			if invocation.Status == k12.ModelInvocationSent {
+				_, ledgerErr =
+					o.deps.Records.MarkModelInvocationOutcomeUnknown(
+						context.WithoutCancel(ctx),
+						run.agentName,
+						invocation.InvocationID,
+						"recognition_receipt_invalid",
+					)
+			}
+			v, advanceErr := o.markGradingOutcomeUnknown(
+				context.WithoutCancel(ctx),
+				run,
+				jobID,
+				"recognition_receipt_invalid",
+			)
+			return true, v, errors.Join(
+				ErrModelInvocationRequiresReconciliation,
+				ledgerErr,
+				advanceErr,
+			)
+		}
 	}
 	digest := modelInvocationResultDigest(run.questions)
 	if invocation.Status == k12.ModelInvocationSucceeded && invocation.ResultDigest != digest {

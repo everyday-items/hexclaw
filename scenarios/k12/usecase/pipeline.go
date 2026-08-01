@@ -71,6 +71,11 @@ type Deps struct {
 	// Records K12 类型化 canonical store（§6.9 k12_* 表 + Transactional Outbox；
 	// ADR-K12-013 一次切换：K12 collection 不再写 agent_records）。
 	Records *k12storage.Store
+	// TextbookOwnerID is trusted composition state for background/read paths
+	// that cannot accept an HTTP-authenticated principal directly. Desktop wires
+	// its single local owner; remote deployments must provide the authenticated
+	// owner per request instead of using a client-supplied agent name.
+	TextbookOwnerID string
 	// GradingBudgetSnapshot is release evidence frozen by composition. Zero is
 	// the explicit legacy gate; a positive policy is copied into every new Job
 	// and never reread from mutable configuration during retries.

@@ -895,14 +895,18 @@ func TestImageTaskCoordinatorRoutesHomeworkToInternalGradingWithoutLeakingModelC
 	}}
 	coordinator, grading := newImageTaskCoordinatorForTest(t, classifier)
 	feedbackDeps := coordinator.WorkFeedback.(*Deps)
+	policy := k12.ApprovedRecognizingRequestPolicy()
 	persistedJob, created, err := feedbackDeps.CreateGradingJob(
 		context.Background(), "mingming", "session-receipt",
 		CreateGradingJobInput{
 			SubmissionID: "submission-receipt", SourceKind: "test",
 			SourceKey: "image-task-receipt", ConfirmedVersion: 0,
 			ModelSnapshot: k12.GradingModelSnapshot{
-				Provider: "hexclaw-gpt", Model: "gpt-5.6-sol",
-				Route: "hexclaw-gpt/gpt-5.6-sol", Capability: "vision",
+				Provider:                 "hexclaw-gpt",
+				Model:                    k12.RecognizingPolicyModel,
+				Route:                    "hexclaw-gpt/" + k12.RecognizingPolicyModel,
+				Capability:               "vision",
+				RecognizingRequestPolicy: policy,
 			},
 		},
 	)

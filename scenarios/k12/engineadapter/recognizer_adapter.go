@@ -1,26 +1,18 @@
 package engineadapter
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"image"
-	"image/color"
-	"image/draw"
-	"math"
-	"net/http"
 	"regexp"
 	"slices"
 	"strings"
-	"sync"
-	"time"
 	"unicode"
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/resourcegov"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
@@ -33,8 +25,9 @@ type VisionFunc func(ctx context.Context, image []byte, prompt string) (string, 
 
 // RecognizerAdapter 用视觉模型把作业照片识别成结构化题目。
 type RecognizerAdapter struct {
-	vision   VisionFunc
-	governor *resourcegov.Governor
+	vision                        VisionFunc
+	governor                      *resourcegov.Governor
+	providerTransportSendBoundary bool
 }
 
 type RecognizerOption func(*RecognizerAdapter)
@@ -43,6 +36,16 @@ type RecognizerOption func(*RecognizerAdapter)
 // page fan-out still competes with Knowledge OCR through this same governor.
 func WithRecognizerResourceGovernor(governor *resourcegov.Governor) RecognizerOption {
 	return func(adapter *RecognizerAdapter) { adapter.governor = governor }
+}
+
+// WithRecognizerProviderTransportSendBoundary makes ai-core's shared HTTP
+// transport the authoritative prepared→sent boundary for DD-036 recognition.
+// It is enabled by the production composition root; lightweight adapter tests
+// and legacy callers retain their eager in-process boundary.
+func WithRecognizerProviderTransportSendBoundary() RecognizerOption {
+	return func(adapter *RecognizerAdapter) {
+		adapter.providerTransportSendBoundary = true
+	}
 }
 
 // NewRecognizerAdapter 创建 adapter。
@@ -56,18 +59,77 @@ func NewRecognizerAdapter(v VisionFunc, options ...RecognizerOption) *Recognizer
 	return adapter
 }
 
-func (a *RecognizerAdapter) callVision(ctx context.Context, image []byte, prompt string) (string, error) {
+func (a *RecognizerAdapter) withVisionPermit(
+	ctx context.Context,
+	call func() (string, error),
+) (string, error) {
 	if a.governor == nil {
-		raw, err := a.vision(ctx, image, prompt)
-		return raw, providerResponseError(err)
+		return call()
 	}
-	permit, err := a.governor.Acquire(ctx, resourcegov.ResourceVLM, resourcegov.PriorityInteractive)
+	permit, err := a.governor.Acquire(
+		ctx,
+		resourcegov.ResourceVLM,
+		resourcegov.PriorityInteractive,
+	)
 	if err != nil {
 		return "", err
 	}
 	defer permit.Release()
-	raw, err := a.vision(ctx, image, prompt)
-	return raw, providerResponseError(err)
+	return call()
+}
+
+func (a *RecognizerAdapter) callVision(
+	ctx context.Context,
+	image []byte,
+	prompt string,
+) (string, error) {
+	return a.withVisionPermit(ctx, func() (string, error) {
+		raw, err := a.vision(ctx, image, prompt)
+		return raw, providerResponseError(err)
+	})
+}
+
+func (a *RecognizerAdapter) callRecognitionVision(
+	ctx context.Context,
+	unit k12.RecognitionPhysicalUnit,
+	image []byte,
+	prompt string,
+) (k12.RecognitionPhysicalCallResult, error) {
+	if a.governor != nil {
+		permit, err := a.governor.Acquire(
+			ctx,
+			resourcegov.ResourceVLM,
+			resourcegov.PriorityInteractive,
+		)
+		if err != nil {
+			return k12.RecognitionPhysicalCallResult{}, err
+		}
+		defer permit.Release()
+	}
+	physicalCtx := ctx
+	if a.providerTransportSendBoundary {
+		physicalCtx = k12.WithRecognitionPhysicalTransportSendBoundary(
+			physicalCtx,
+			func(
+				bindCtx context.Context,
+				hook k12.RecognitionPhysicalBeforeSendHook,
+			) context.Context {
+				return llm.WithBeforeSendHookForAction(
+					bindCtx,
+					"complete",
+					llm.BeforeSendHook(hook),
+				)
+			},
+		)
+	}
+	return k12.ExecuteRecognitionPhysicalCall(
+		physicalCtx,
+		k12.RecognitionPhysicalCall{Unit: unit, Image: image},
+		func(sendCtx context.Context) (string, error) {
+			raw, callErr := a.vision(sendCtx, image, prompt)
+			return raw, providerResponseError(callErr)
+		},
+	)
 }
 
 func (a *RecognizerAdapter) splitWorksheet(
@@ -240,13 +302,30 @@ func (a *RecognizerAdapter) Recognize(ctx context.Context, image []byte) ([]usec
 		return nil, fmt.Errorf("recognizer: 图片预处理被取消: %w", err)
 	}
 	if dense {
-		raw, visionErr := a.callVision(ctx, image, recognizePrompt)
+		whole, visionErr := a.callRecognitionVision(
+			ctx,
+			k12.RecognitionPhysicalUnitWholePage,
+			image,
+			recognizePrompt,
+		)
 		if visionErr != nil {
 			return nil, fmt.Errorf("recognizer: 视觉模型调用失败: %w", visionErr)
 		}
-		questions, parseErr := parseRecognizedQuestions(raw)
+		questions, parseErr := parseRecognizedQuestions(whole.Payload)
+		if parseErr == nil {
+			parseErr = validateRecognitionProtocolResult(questions)
+		}
 		if parseErr == nil {
 			return questions, nil
+		}
+		if authorizeErr := k12.AuthorizeRecognitionPhysicalFallback(
+			ctx,
+			whole,
+		); authorizeErr != nil {
+			return nil, fmt.Errorf(
+				"recognizer: 持久化整页协议失败授权: %w",
+				authorizeErr,
+			)
 		}
 		logger.WarnContext(ctx, "[k12识题] 整页结构化结果校验失败，进入有界分片补救",
 			"error", parseErr,
@@ -257,21 +336,49 @@ func (a *RecognizerAdapter) Recognize(ctx context.Context, image []byte) ([]usec
 		})
 		return a.recognizeSegments(ctx, segments)
 	}
-	raw, err := a.callVision(ctx, image, recognizePrompt)
+	whole, err := a.callRecognitionVision(
+		ctx,
+		k12.RecognitionPhysicalUnitWholePage,
+		image,
+		recognizePrompt,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("recognizer: 视觉模型调用失败: %w", err)
 	}
-	return parseRecognizedQuestions(raw)
+	questions, err := parseRecognizedQuestions(whole.Payload)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateRecognitionProtocolResult(questions); err != nil {
+		return nil, err
+	}
+	return questions, nil
 }
 
 func parseRecognizedQuestions(raw string) ([]usecase.RecognizedQuestion, error) {
 	var dtos []recognizedDTO
 	if err := json.Unmarshal([]byte(sanitizeModelJSON(extractJSON(raw))), &dtos); err != nil {
-		return nil, fmt.Errorf("recognizer: 解析识题结果失败: %w", err)
+		return nil, fmt.Errorf(
+			"%w: recognizer: 解析识题结果失败",
+			k12.ErrRecognitionProtocolInvalid,
+		)
+	}
+	if dtos == nil {
+		return nil, fmt.Errorf(
+			"%w: recognizer: 识题结果必须是 JSON 数组",
+			k12.ErrRecognitionProtocolInvalid,
+		)
 	}
 	out := make([]usecase.RecognizedQuestion, 0, len(dtos))
-	for _, d := range dtos {
+	for index, d := range dtos {
 		rawQuestion := d.Question
+		if strings.TrimSpace(rawQuestion) == "" {
+			return nil, fmt.Errorf(
+				"%w: recognizer: 识题结果第 %d 项缺少 question",
+				k12.ErrRecognitionProtocolInvalid,
+				index+1,
+			)
+		}
 		question := strings.TrimSpace(adapter.NormalizeMathText(rawQuestion))
 		if question == "" || sectionHeading.MatchString(question) || likelyCroppedFragment(question) {
 			continue
@@ -301,14 +408,46 @@ func parseRecognizedQuestions(raw string) ([]usecase.RecognizedQuestion, error) 
 	return mergeRecognizedQuestions(nil, out), nil
 }
 
+func validateRecognitionProtocolResult(
+	questions []usecase.RecognizedQuestion,
+) error {
+	if _, err := usecase.NormalizeRecognizedProblems(
+		"recognition-protocol-validation",
+		questions,
+	); err != nil {
+		return fmt.Errorf(
+			"%w: recognizer: 识题结果结构无效: %v",
+			k12.ErrRecognitionProtocolInvalid,
+			err,
+		)
+	}
+	return nil
+}
+
 func parsePrintedQuestionInventory(raw string) ([]usecase.RecognizedQuestion, error) {
 	var dtos []recognizedDTO
 	if err := json.Unmarshal([]byte(sanitizeModelJSON(extractJSON(raw))), &dtos); err != nil {
-		return nil, fmt.Errorf("recognizer: 解析印刷题清单失败: %w", err)
+		return nil, fmt.Errorf(
+			"%w: recognizer: 解析印刷题清单失败",
+			k12.ErrRecognitionProtocolInvalid,
+		)
+	}
+	if dtos == nil {
+		return nil, fmt.Errorf(
+			"%w: recognizer: 印刷题清单必须是 JSON 数组",
+			k12.ErrRecognitionProtocolInvalid,
+		)
 	}
 	out := make([]usecase.RecognizedQuestion, 0, len(dtos))
-	for _, dto := range dtos {
+	for index, dto := range dtos {
 		rawQuestion := dto.Question
+		if strings.TrimSpace(rawQuestion) == "" {
+			return nil, fmt.Errorf(
+				"%w: recognizer: 印刷题清单第 %d 项缺少 question",
+				k12.ErrRecognitionProtocolInvalid,
+				index+1,
+			)
+		}
 		question := strings.TrimSpace(adapter.NormalizeMathText(rawQuestion))
 		if question == "" || sectionHeading.MatchString(question) || likelyCroppedFragment(question) {
 			continue
@@ -368,81 +507,38 @@ type worksheetSegment struct {
 }
 
 type segmentRecognitionResult struct {
-	questions            []usecase.RecognizedQuestion
-	err                  error
-	retryableVisionError bool
+	questions []usecase.RecognizedQuestion
+	err       error
 }
 
 const (
-	denseWorksheetSegmentCount           = 5
-	denseWorksheetSemanticBlockFraction  = 0.12
-	denseWorksheetSegmentOverlapFraction = 0.14
+	denseWorksheetSegmentCount           = k12.DenseWorksheetSegmentCount
+	denseWorksheetSemanticBlockFraction  = k12.DenseWorksheetSemanticBlockFraction
+	denseWorksheetSegmentOverlapFraction = k12.DenseWorksheetSegmentOverlapFraction
 )
 
 // denseWorksheetRanges 由“固定调用数 + 最大语义块高度”推导，而不是针对某张试卷手写坐标。
 // 相邻裁片重叠必须大于一个典型多行题块，才能保证任意 12% 高的题目/作答区域至少完整落入
 // 一个分片；额外 2% 是透视、拍照倾斜和模型 edge-fragment 判定的安全余量。
-var denseWorksheetRanges = buildDenseWorksheetRanges()
+var denseWorksheetRanges = k12.DenseWorksheetRanges()
 
 func buildDenseWorksheetRanges() [denseWorksheetSegmentCount][2]float64 {
-	var ranges [denseWorksheetSegmentCount][2]float64
-	span := (1 + float64(denseWorksheetSegmentCount-1)*denseWorksheetSegmentOverlapFraction) /
-		float64(denseWorksheetSegmentCount)
-	step := span - denseWorksheetSegmentOverlapFraction
-	for i := range ranges {
-		start := float64(i) * step
-		end := start + span
-		if i == len(ranges)-1 {
-			end = 1
-		}
-		ranges[i] = [2]float64{start, end}
-	}
-	return ranges
+	return k12.DenseWorksheetRanges()
 }
-
-const (
-	// ai-core 的 HTTP transport 已在单次 vision 调用内部做短退避重试。这里再等一小段时间，
-	// 让五分片首波的并发压力先完全释放，再对失败分支做一次批次级恢复。
-	denseWorksheetRetryDelay          = 750 * time.Millisecond
-	denseWorksheetRetryMaxConcurrency = 2
-)
 
 // splitDenseWorksheetImage 仅处理尺寸足够、明显纵向的作业图。5 段间保留 4%~6% 重叠，
 // 让跨分界线的题至少在一个分片内完整出现；合并阶段按题干去重。
 func splitDenseWorksheetImage(raw []byte) ([]worksheetSegment, bool) {
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
-	if err != nil {
+	inputs, ok := k12.DenseWorksheetFallbackPhysicalInputs(raw)
+	if !ok || k12.ValidateDenseWorksheetFallbackPhysicalInputs(inputs) != nil {
 		return nil, false
 	}
-	legacyTall := cfg.Height >= 1600 && cfg.Height*5 >= cfg.Width*6
-	lowResolutionWorksheet := cfg.Height >= 1200 && cfg.Width >= 800 && cfg.Height*3 >= cfg.Width*4
-	if !legacyTall && !lowResolutionWorksheet {
-		return nil, false
-	}
-	src, _, err := image.Decode(bytes.NewReader(raw))
-	if err != nil {
-		return nil, false
-	}
-	bounds := src.Bounds()
-	segments := make([]worksheetSegment, 0, len(denseWorksheetRanges))
-	for i, r := range denseWorksheetRanges {
-		y0 := bounds.Min.Y + int(math.Floor(float64(bounds.Dy())*r[0]))
-		y1 := bounds.Min.Y + int(math.Ceil(float64(bounds.Dy())*r[1]))
-		if y1 > bounds.Max.Y {
-			y1 = bounds.Max.Y
-		}
-		if y1 <= y0 {
-			return nil, false
-		}
-		dst := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), y1-y0))
-		draw.Draw(dst, dst.Bounds(), &image.Uniform{C: color.White}, image.Point{}, draw.Src)
-		draw.Draw(dst, dst.Bounds(), src, image.Pt(bounds.Min.X, y0), draw.Over)
-		encoded, err := encodePNG(dst, fmt.Sprintf("dense worksheet segment %d", i+1))
-		if err != nil {
-			return nil, false
-		}
+	segments := make([]worksheetSegment, 0, denseWorksheetSegmentCount)
+	for index, input := range inputs[:denseWorksheetSegmentCount] {
 		segments = append(segments, worksheetSegment{
-			image: encoded, index: i + 1, total: len(denseWorksheetRanges),
+			image: input.Image,
+			index: index + 1,
+			total: denseWorksheetSegmentCount,
 		})
 	}
 	return segments, true
@@ -450,51 +546,14 @@ func splitDenseWorksheetImage(raw []byte) ([]worksheetSegment, bool) {
 
 func (a *RecognizerAdapter) recognizeSegments(ctx context.Context, segments []worksheetSegment) ([]usecase.RecognizedQuestion, error) {
 	results := make([]segmentRecognitionResult, len(segments))
-	initialIndexes := make([]int, len(segments))
-	for i := range initialIndexes {
-		initialIndexes[i] = i
-	}
-	a.recognizeSegmentWave(ctx, segments, initialIndexes, len(initialIndexes), results)
-
-	retryIndexes := make([]int, 0, len(segments))
-	for i, result := range results {
-		if result.err == nil {
-			continue
-		}
-		if !result.retryableVisionError {
-			return nil, fmt.Errorf("recognizer: %w", result.err)
-		}
-		retryIndexes = append(retryIndexes, i)
-	}
-	if len(retryIndexes) > 0 {
-		retryUnits := make([]string, 0, len(retryIndexes))
-		for _, i := range retryIndexes {
-			if segments[i].printedInventory {
-				retryUnits = append(retryUnits, "printed_inventory")
-			} else {
-				retryUnits = append(retryUnits, fmt.Sprintf("segment_%d", segments[i].index))
-			}
-		}
-		logger.WarnContext(ctx, "[k12识题] 密集卷识别单元瞬时失败，进入有界第二波重试",
-			"units", retryUnits,
-			"delay", denseWorksheetRetryDelay,
-			"max_concurrency", denseWorksheetRetryMaxConcurrency,
-		)
-		if err := waitDenseWorksheetRetry(ctx, denseWorksheetRetryDelay); err != nil {
-			return nil, fmt.Errorf("recognizer: 分片重试已取消: %w", err)
-		}
-		a.recognizeSegmentWave(
-			ctx,
-			segments,
-			retryIndexes,
-			denseWorksheetRetryMaxConcurrency,
-			results,
-		)
-	}
-
-	for _, result := range results {
-		if result.err != nil {
-			return nil, fmt.Errorf("recognizer: %w", result.err)
+	// The bounded protocol fallback is deliberately serial even when the
+	// process governor is configured above one. Each unit is an initial
+	// physical request with attempt=1; the first failure terminates the plan
+	// and never starts later units or a second wave.
+	for i := range segments {
+		results[i] = a.recognizeSegment(ctx, segments[i])
+		if results[i].err != nil {
+			return nil, fmt.Errorf("recognizer: %w", results[i].err)
 		}
 	}
 
@@ -522,40 +581,10 @@ func (a *RecognizerAdapter) recognizeSegments(ctx context.Context, segments []wo
 	if inventoryIndex >= 0 {
 		merged = reconcilePrintedQuestionInventory(merged, results[inventoryIndex].questions)
 	}
+	if err := validateRecognitionProtocolResult(merged); err != nil {
+		return nil, err
+	}
 	return merged, nil
-}
-
-func (a *RecognizerAdapter) recognizeSegmentWave(
-	ctx context.Context,
-	segments []worksheetSegment,
-	indexes []int,
-	maxConcurrency int,
-	results []segmentRecognitionResult,
-) {
-	if len(indexes) == 0 {
-		return
-	}
-	if maxConcurrency <= 0 || maxConcurrency > len(indexes) {
-		maxConcurrency = len(indexes)
-	}
-	semaphore := make(chan struct{}, maxConcurrency)
-	var wg sync.WaitGroup
-	for _, i := range indexes {
-		i := i
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
-			case <-ctx.Done():
-				results[i] = segmentRecognitionResult{err: ctx.Err()}
-				return
-			}
-			results[i] = a.recognizeSegment(ctx, segments[i])
-		}()
-	}
-	wg.Wait()
 }
 
 func (a *RecognizerAdapter) recognizeSegment(ctx context.Context, segment worksheetSegment) segmentRecognitionResult {
@@ -563,14 +592,18 @@ func (a *RecognizerAdapter) recognizeSegment(ctx context.Context, segment worksh
 		return segmentRecognitionResult{err: err}
 	}
 	if segment.printedInventory {
-		raw, err := a.callVision(ctx, segment.image, printedQuestionInventoryPrompt)
+		result, err := a.callRecognitionVision(
+			ctx,
+			k12.RecognitionPhysicalUnitPrintedInventory,
+			segment.image,
+			printedQuestionInventoryPrompt,
+		)
 		if err != nil {
 			return segmentRecognitionResult{
-				err:                  fmt.Errorf("整页印刷题清单视觉模型调用失败: %w", err),
-				retryableVisionError: isTransientVisionError(ctx, err),
+				err: fmt.Errorf("整页印刷题清单视觉模型调用失败: %w", err),
 			}
 		}
-		questions, err := parsePrintedQuestionInventory(raw)
+		questions, err := parsePrintedQuestionInventory(result.Payload)
 		if err != nil {
 			return segmentRecognitionResult{err: fmt.Errorf("整页印刷题清单: %w", err)}
 		}
@@ -579,58 +612,25 @@ func (a *RecognizerAdapter) recognizeSegment(ctx context.Context, segment worksh
 	prompt := fmt.Sprintf(`%s
 
 这是原作业图片的纵向分片 %d/%d。只识别在本分片内题干完整可见的题目；紧贴上/下边缘且被截断的残题必须忽略，重叠区域的完整题照常输出。JSON 必须紧凑输出，不要缩进。`, recognizePrompt, segment.index, segment.total)
-	raw, err := a.callVision(ctx, segment.image, prompt)
-	if err != nil {
+	unit, ok := k12.RecognitionPhysicalSegmentUnit(segment.index)
+	if !ok {
 		return segmentRecognitionResult{
-			err:                  fmt.Errorf("分片 %d/%d 视觉模型调用失败: %w", segment.index, segment.total, err),
-			retryableVisionError: isTransientVisionError(ctx, err),
+			err: fmt.Errorf("分片 %d/%d 物理调用标识无效", segment.index, segment.total),
 		}
 	}
-	questions, err := parseRecognizedQuestions(raw)
+	result, err := a.callRecognitionVision(ctx, unit, segment.image, prompt)
+	if err != nil {
+		return segmentRecognitionResult{
+			err: fmt.Errorf("分片 %d/%d 视觉模型调用失败: %w", segment.index, segment.total, err),
+		}
+	}
+	questions, err := parseRecognizedQuestions(result.Payload)
 	if err != nil {
 		return segmentRecognitionResult{
 			err: fmt.Errorf("分片 %d/%d: %w", segment.index, segment.total, err),
 		}
 	}
 	return segmentRecognitionResult{questions: questions}
-}
-
-func isTransientVisionError(ctx context.Context, err error) bool {
-	if err == nil || ctx != nil && ctx.Err() != nil || errors.Is(err, context.Canceled) {
-		return false
-	}
-	var providerErr *llm.ProviderError
-	if errors.As(err, &providerErr) && providerErr.StatusCode != 0 {
-		switch providerErr.StatusCode {
-		case http.StatusRequestTimeout,
-			http.StatusTooEarly,
-			http.StatusTooManyRequests,
-			http.StatusInternalServerError,
-			http.StatusBadGateway,
-			http.StatusServiceUnavailable,
-			http.StatusGatewayTimeout:
-			return true
-		default:
-			return false
-		}
-	}
-	switch llm.ClassifyError(err, 0, "") {
-	case llm.FailRateLimit, llm.FailProviderDown:
-		return true
-	default:
-		return false
-	}
-}
-
-func waitDenseWorksheetRetry(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 const adjacentSegmentConsensusMinQuestions = 2

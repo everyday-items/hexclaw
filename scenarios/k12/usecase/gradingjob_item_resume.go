@@ -790,6 +790,11 @@ func definitiveProviderResponse(err error) bool {
 // prove whether the upstream executed the request. Only a typed provider
 // response makes the failure definitive enough for an ordinary retry policy.
 func sentProviderOutcomeUnknown(callErr, ctxErr error) bool {
+	if definitiveProviderResponse(callErr) {
+		// A verifiable upstream response remains definitive even when the local
+		// deadline/cancellation becomes observable at the same boundary.
+		return false
+	}
 	if invocationOutcomeUnknown(callErr) || invocationOutcomeUnknown(ctxErr) {
 		return true
 	}

@@ -205,6 +205,8 @@ type ImageTaskSourceAttachmentReceipt struct {
 
 type ImageTaskOperationReceipt struct {
 	InvocationID        string                          `json:"invocation_id"`
+	ParentInvocationID  string                          `json:"parent_invocation_id,omitempty"`
+	PhysicalUnit        string                          `json:"physical_unit,omitempty"`
 	Operation           string                          `json:"operation"`
 	Provider            string                          `json:"provider"`
 	Model               string                          `json:"model"`
@@ -1736,6 +1738,20 @@ func (c *ImageTaskCoordinator) Result(
 				modelInvocationReceipt(invocation),
 			)
 		}
+		physicalInvocations, listPhysicalErr := c.Records.ListModelPhysicalInvocations(
+			ctx,
+			agentName,
+			view.Homework.GradingJobID,
+		)
+		if listPhysicalErr != nil {
+			return ImageTaskResult{}, listPhysicalErr
+		}
+		for _, invocation := range physicalInvocations {
+			result.OperationReceipts = append(
+				result.OperationReceipts,
+				modelPhysicalInvocationReceipt(invocation),
+			)
+		}
 		finalArtifact, finalArtifactErr := c.Records.GetGradingFinalArtifactByJob(
 			ctx, agentName, view.Homework.GradingJobID,
 		)
@@ -1800,6 +1816,30 @@ func modelInvocationReceipt(invocation k12.ModelInvocation) ImageTaskOperationRe
 		ResultDigest: invocation.ResultDigest,
 	}
 	policy := k12.NormalizeModelRequestPolicySnapshot(invocation.RequestPolicySnapshot)
+	if !policy.IsZero() {
+		receipt.RequestPolicyDigest = policy.Digest()
+		receipt.RequestPolicy = &policy
+	}
+	return receipt
+}
+
+func modelPhysicalInvocationReceipt(
+	invocation k12.ModelPhysicalInvocation,
+) ImageTaskOperationReceipt {
+	receipt := ImageTaskOperationReceipt{
+		InvocationID:       invocation.PhysicalInvocationID,
+		ParentInvocationID: invocation.ParentInvocationID,
+		PhysicalUnit:       string(invocation.PhysicalUnit),
+		Operation:          invocation.Stage,
+		Provider:           invocation.RouteSnapshot.Provider,
+		Model:              invocation.RouteSnapshot.Model,
+		Status:             string(invocation.Status),
+		Attempt:            invocation.Attempt,
+		ResultDigest:       invocation.ResultDigest,
+	}
+	policy := k12.NormalizeModelRequestPolicySnapshot(
+		invocation.RequestPolicySnapshot,
+	)
 	if !policy.IsZero() {
 		receipt.RequestPolicyDigest = policy.Digest()
 		receipt.RequestPolicy = &policy

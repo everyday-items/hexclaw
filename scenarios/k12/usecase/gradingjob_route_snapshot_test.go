@@ -175,8 +175,12 @@ func TestGradingSucceededInvocationBeforeCheckpointIsNotBlindlyReplayed(t *testi
 	}
 	invocation, _, err := d.Records.PrepareModelInvocation(context.Background(), k12.ModelInvocation{
 		InvocationID: "inv-crash-gap", AgentName: "mingming", JobID: v.Record.RecordID,
-		Stage:         k12.GradingStageRecognizing,
-		RequestDigest: modelInvocationDigest([]byte(k12.GradingStageRecognizing), orchestratorPhotoRequest().Image),
+		Stage: k12.GradingStageRecognizing,
+		RequestDigest: recognizingInvocationDigest(
+			orchestratorPhotoRequest().Image,
+			snapshot,
+			k12.ModelRequestPolicySnapshot{},
+		),
 		RouteSnapshot: snapshot, Attempt: 1, CreatedAt: 100, UpdatedAt: 100,
 	})
 	if err != nil {
@@ -211,8 +215,12 @@ func TestGradingInvocationIdentityConflictBeforeSendFailsTerminalInsteadOfOutcom
 		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
 		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil)
 	d.Recognizer = recognizer
+	policy := k12.ApprovedRecognizingRequestPolicy()
 	currentRoute := k12.GradingModelSnapshot{
-		Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", Route: "hexclaw-gpt/gpt-5.6-sol",
+		Provider:                 "hexclaw-gpt",
+		Model:                    k12.RecognizingPolicyModel,
+		Route:                    "hexclaw-gpt/" + k12.RecognizingPolicyModel,
+		RecognizingRequestPolicy: policy,
 	}
 	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, func(k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
 		return currentRoute, nil
@@ -289,8 +297,12 @@ func TestGradingSucceededInvocationWithDurableArtifactRecoversCheckpointWithoutP
 	}
 	invocation, _, err := d.Records.PrepareModelInvocation(context.Background(), k12.ModelInvocation{
 		InvocationID: "inv-crash-with-artifact", AgentName: "mingming", JobID: v.Record.RecordID,
-		Stage:         k12.GradingStageRecognizing,
-		RequestDigest: modelInvocationDigest([]byte(k12.GradingStageRecognizing), orchestratorPhotoRequest().Image),
+		Stage: k12.GradingStageRecognizing,
+		RequestDigest: recognizingInvocationDigest(
+			orchestratorPhotoRequest().Image,
+			snapshot,
+			k12.ModelRequestPolicySnapshot{},
+		),
 		RouteSnapshot: snapshot, Attempt: 1, CreatedAt: 100, UpdatedAt: 100,
 	})
 	if err != nil {

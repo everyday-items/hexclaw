@@ -2,12 +2,46 @@ package engineadapter
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"testing"
 
+	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
+
+type recordingRecognitionPhysicalExecutor struct {
+	units []k12.RecognitionPhysicalUnit
+}
+
+func (e *recordingRecognitionPhysicalExecutor) ExecuteRecognitionPhysicalCall(
+	ctx context.Context,
+	call k12.RecognitionPhysicalCall,
+	send func(context.Context) (string, error),
+) (k12.RecognitionPhysicalCallResult, error) {
+	e.units = append(e.units, call.Unit)
+	payload, err := send(ctx)
+	return k12.RecognitionPhysicalCallResult{
+		Payload:      payload,
+		InvocationID: string(call.Unit),
+	}, err
+}
+
+func (e *recordingRecognitionPhysicalExecutor) AuthorizeRecognitionPhysicalFallback(
+	_ context.Context,
+	whole k12.RecognitionPhysicalCallResult,
+) error {
+	if whole.InvocationID != string(k12.RecognitionPhysicalUnitWholePage) {
+		return fmt.Errorf(
+			"fallback authorization whole invocation=%q",
+			whole.InvocationID,
+		)
+	}
+	return nil
+}
 
 func TestDenseWorksheet_ValidWholePageRecognitionUsesOnePhysicalRequest(t *testing.T) {
 	var calls atomic.Int32
@@ -50,5 +84,77 @@ func TestDenseWorksheet_ValidEmptyWholePageDoesNotTriggerSixRequestFanout(t *tes
 	}
 	if calls.Load() != 1 || len(questions) != 0 {
 		t.Fatalf("valid blank page requests=%d questions=%d, want 1/0", calls.Load(), len(questions))
+	}
+}
+
+func TestDenseWorksheet_ProtocolFallbackIsOrderedAndStopsAtFirstPhysicalFailure(t *testing.T) {
+	trace := make([]string, 0, 7)
+	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
+		unit := "whole_page"
+		for i := 1; i <= len(denseWorksheetRanges); i++ {
+			if strings.Contains(prompt, fmt.Sprintf("纵向分片 %d/%d", i, len(denseWorksheetRanges))) {
+				unit = fmt.Sprintf("segment_%d", i)
+				break
+			}
+		}
+		if strings.Contains(prompt, "整页印刷题清单") {
+			unit = "printed_inventory"
+		}
+		trace = append(trace, unit)
+		switch unit {
+		case "whole_page":
+			return `not-json`, nil
+		case "segment_3":
+			return "", &llm.ProviderError{
+				Provider:   "openai",
+				StatusCode: http.StatusBadGateway,
+				Status:     "502 Bad Gateway",
+			}
+		default:
+			return `[]`, nil
+		}
+	}
+
+	_, err := NewRecognizerAdapter(vision).Recognize(
+		context.Background(),
+		denseWorksheetTestImage(t, 1000, 1800),
+	)
+	if err == nil {
+		t.Fatal("expected physical segment failure")
+	}
+	want := []string{"whole_page", "segment_1", "segment_2", "segment_3"}
+	if strings.Join(trace, ",") != strings.Join(want, ",") {
+		t.Fatalf("physical call trace=%v want=%v", trace, want)
+	}
+}
+
+func TestDenseWorksheet_ProtocolFallbackEmitsExplicitPhysicalUnits(t *testing.T) {
+	executor := &recordingRecognitionPhysicalExecutor{}
+	ctx := k12.WithRecognitionPhysicalCallExecutor(context.Background(), executor)
+	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
+		if strings.Contains(prompt, "纵向分片") ||
+			strings.Contains(prompt, "整页印刷题清单") {
+			return `[]`, nil
+		}
+		return `not-json`, nil
+	}
+
+	if _, err := NewRecognizerAdapter(vision).Recognize(
+		ctx,
+		denseWorksheetTestImage(t, 1000, 1800),
+	); err != nil {
+		t.Fatal(err)
+	}
+	want := []k12.RecognitionPhysicalUnit{
+		k12.RecognitionPhysicalUnitWholePage,
+		k12.RecognitionPhysicalUnitSegment1,
+		k12.RecognitionPhysicalUnitSegment2,
+		k12.RecognitionPhysicalUnitSegment3,
+		k12.RecognitionPhysicalUnitSegment4,
+		k12.RecognitionPhysicalUnitSegment5,
+		k12.RecognitionPhysicalUnitPrintedInventory,
+	}
+	if fmt.Sprint(executor.units) != fmt.Sprint(want) {
+		t.Fatalf("typed physical units=%v want=%v", executor.units, want)
 	}
 }

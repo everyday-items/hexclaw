@@ -298,14 +298,22 @@ func NormalizeRecognizedProblems(scope string, questions []RecognizedQuestion) (
 			question.ProblemID = stableProblemID(scope, i, question)
 			if modelRef != "" {
 				if _, duplicate := modelParentRefs[modelRef]; duplicate {
-					return nil, fmt.Errorf("%w: ambiguous compound parent reference %q", ErrInvalidInput, modelRef)
+					return nil, fmt.Errorf(
+						"%w: compound parent problem index %d has ambiguous problem_id",
+						ErrInvalidInput,
+						i,
+					)
 				}
 				modelParentRefs[modelRef] = question.ProblemID
 			}
 		case ProblemKindSubproblem:
 			// Resolve after every compound parent has been assigned a server ID.
 		default:
-			return nil, fmt.Errorf("%w: unsupported problem_kind %q", ErrInvalidInput, question.ProblemKind)
+			return nil, fmt.Errorf(
+				"%w: problem index %d has unsupported problem_kind",
+				ErrInvalidInput,
+				i,
+			)
 		}
 		out[i] = question
 	}
@@ -315,7 +323,11 @@ func NormalizeRecognizedProblems(scope string, questions []RecognizedQuestion) (
 		}
 		parentID, ok := modelParentRefs[parentRefs[i]]
 		if parentRefs[i] == "" || !ok {
-			return nil, fmt.Errorf("%w: subproblem index %d has dangling parent reference %q", ErrInvalidInput, i, parentRefs[i])
+			return nil, fmt.Errorf(
+				"%w: subproblem index %d has dangling parent_problem_id",
+				ErrInvalidInput,
+				i,
+			)
 		}
 		out[i].ParentProblemID = parentID
 		out[i].SubproblemNo = strings.TrimSpace(out[i].SubproblemNo)
@@ -415,12 +427,20 @@ func validateNormalizedRecognizedProblems(out []RecognizedQuestion) error {
 	ids := make(map[string]struct{}, len(out))
 	parents := make(map[string]struct{})
 	parentPages := make(map[string]string)
-	for _, question := range out {
+	for index, question := range out {
 		if strings.TrimSpace(question.ProblemID) == "" {
-			return fmt.Errorf("%w: normalized problem_id 不可空", ErrInvalidInput)
+			return fmt.Errorf(
+				"%w: normalized problem index %d requires problem_id",
+				ErrInvalidInput,
+				index,
+			)
 		}
 		if _, duplicate := ids[question.ProblemID]; duplicate {
-			return fmt.Errorf("%w: duplicate problem_id %q", ErrInvalidInput, question.ProblemID)
+			return fmt.Errorf(
+				"%w: normalized problem index %d has duplicate problem_id",
+				ErrInvalidInput,
+				index,
+			)
 		}
 		ids[question.ProblemID] = struct{}{}
 		if question.ProblemKind == ProblemKindCompoundParent {
@@ -436,38 +456,70 @@ func validateNormalizedRecognizedProblems(out []RecognizedQuestion) error {
 		switch q.ProblemKind {
 		case ProblemKindStandalone:
 			if q.ParentProblemID != "" || q.SubproblemNo != "" {
-				return fmt.Errorf("%w: standalone problem %q cannot have parent/subproblem_no", ErrInvalidInput, q.ProblemID)
+				return fmt.Errorf(
+					"%w: standalone problem index %d cannot have parent_problem_id/subproblem_no",
+					ErrInvalidInput,
+					i,
+				)
 			}
 		case ProblemKindCompoundParent:
 			if q.ParentProblemID != "" || q.SubproblemNo != "" || q.AnswerState != AnswerStateBlank || q.AttemptID != "" || q.InputDigest != "" {
-				return fmt.Errorf("%w: compound parent %q cannot own answer/parent/subproblem_no", ErrInvalidInput, q.ProblemID)
+				return fmt.Errorf(
+					"%w: compound parent problem index %d cannot own answer/parent_problem_id/subproblem_no",
+					ErrInvalidInput,
+					i,
+				)
 			}
 		case ProblemKindSubproblem:
 			if _, ok := parents[q.ParentProblemID]; !ok || strings.TrimSpace(q.SubproblemNo) == "" {
-				return fmt.Errorf("%w: subproblem %q needs an existing compound parent and subproblem_no", ErrInvalidInput, q.ProblemID)
+				return fmt.Errorf(
+					"%w: subproblem index %d needs an existing compound parent_problem_id and subproblem_no",
+					ErrInvalidInput,
+					i,
+				)
 			}
 			q.SubproblemNo = strings.TrimSpace(q.SubproblemNo)
 			if subproblemNos[q.ParentProblemID] == nil {
 				subproblemNos[q.ParentProblemID] = map[string]struct{}{}
 			}
 			if _, duplicate := subproblemNos[q.ParentProblemID][q.SubproblemNo]; duplicate {
-				return fmt.Errorf("%w: duplicate subproblem_no %q under parent %q", ErrInvalidInput, q.SubproblemNo, q.ParentProblemID)
+				return fmt.Errorf(
+					"%w: subproblem index %d has duplicate subproblem_no under parent_problem_id",
+					ErrInvalidInput,
+					i,
+				)
 			}
 			subproblemNos[q.ParentProblemID][q.SubproblemNo] = struct{}{}
 		default:
-			return fmt.Errorf("%w: unsupported problem_kind %q", ErrInvalidInput, q.ProblemKind)
+			return fmt.Errorf(
+				"%w: normalized problem index %d has unsupported problem_kind",
+				ErrInvalidInput,
+				i,
+			)
 		}
 		if q.ProblemKind != ProblemKindCompoundParent {
 			if q.AttemptID == "" {
-				return fmt.Errorf("%w: answerable problem %q needs attempt_id", ErrInvalidInput, q.ProblemID)
+				return fmt.Errorf(
+					"%w: answerable problem index %d needs attempt_id",
+					ErrInvalidInput,
+					i,
+				)
 			}
 			if _, duplicate := attemptIDs[q.AttemptID]; duplicate {
-				return fmt.Errorf("%w: duplicate attempt_id %q", ErrInvalidInput, q.AttemptID)
+				return fmt.Errorf(
+					"%w: answerable problem index %d has duplicate attempt_id",
+					ErrInvalidInput,
+					i,
+				)
 			}
 			attemptIDs[q.AttemptID] = struct{}{}
 		}
 		if q.ProblemKind == ProblemKindSubproblem && q.PageAssetID != parentPages[q.ParentProblemID] {
-			return fmt.Errorf("%w: subproblem %q and parent must share page_asset_id", ErrInvalidInput, q.ProblemID)
+			return fmt.Errorf(
+				"%w: subproblem index %d and parent must share page_asset_id",
+				ErrInvalidInput,
+				i,
+			)
 		}
 	}
 	return nil
@@ -581,15 +633,15 @@ func FreezeRecognizedQuestionInputDigests(questions []RecognizedQuestion, gradin
 			stem = strings.TrimSpace(parents[q.ParentProblemID]) + "\n\n" + strings.TrimSpace(stem)
 		}
 		payload := struct {
-			ProblemKind ProblemKind `json:"problem_kind"`
-			Stem        string      `json:"stem_markdown"`
-			Answer      string      `json:"answer_markdown"`
-			AnswerState AnswerState `json:"answer_state"`
-			Subject     string      `json:"subject"`
-			Subproblem  string      `json:"subproblem_no,omitempty"`
-			SourceNumberPath []string `json:"source_number_path,omitempty"`
-			DisplayLabel string       `json:"display_label,omitempty"`
-			Context     string      `json:"context,omitempty"`
+			ProblemKind      ProblemKind `json:"problem_kind"`
+			Stem             string      `json:"stem_markdown"`
+			Answer           string      `json:"answer_markdown"`
+			AnswerState      AnswerState `json:"answer_state"`
+			Subject          string      `json:"subject"`
+			Subproblem       string      `json:"subproblem_no,omitempty"`
+			SourceNumberPath []string    `json:"source_number_path,omitempty"`
+			DisplayLabel     string      `json:"display_label,omitempty"`
+			Context          string      `json:"context,omitempty"`
 		}{
 			q.ProblemKind, stem, q.AnswerCanonicalMarkdown, q.AnswerState, q.Subject,
 			q.SubproblemNo, append([]string(nil), q.SourceNumberPath...), q.DisplayLabel,
@@ -630,8 +682,8 @@ func RecognizedQuestionsProblemAttemptSnapshot(agentName, submissionID string, q
 			PageAssetID: question.PageAssetID, Ordinal: index, ProblemKind: string(question.ProblemKind),
 			ParentProblemID: question.ParentProblemID, SubproblemNo: question.SubproblemNo,
 			SourceNumberPath: append([]string(nil), question.SourceNumberPath...),
-			DisplayLabel: question.DisplayLabel,
-			Subject: question.Subject, StemRaw: question.RawTranscription,
+			DisplayLabel:     question.DisplayLabel,
+			Subject:          question.Subject, StemRaw: question.RawTranscription,
 			StemMarkdown: question.CanonicalMarkdown, ConceptIDs: append([]string(nil), question.KnowledgePoints...),
 			TranscriptionConfidence: question.RecognitionConfidence,
 			ConfirmationRequired:    question.ConfirmationRequired, ConfirmationReasons: reasons,
@@ -686,8 +738,8 @@ func RecognizedQuestionsFromProblemAttemptSnapshot(snapshot k12.ProblemAttemptSn
 			ProblemID: problem.ProblemID, ProblemKind: ProblemKind(problem.ProblemKind),
 			ParentProblemID: problem.ParentProblemID, SubproblemNo: problem.SubproblemNo,
 			SourceNumberPath: append([]string(nil), problem.SourceNumberPath...),
-			DisplayLabel: problem.DisplayLabel,
-			PageAssetID: problem.PageAssetID, RawTranscription: problem.StemRaw,
+			DisplayLabel:     problem.DisplayLabel,
+			PageAssetID:      problem.PageAssetID, RawTranscription: problem.StemRaw,
 			CanonicalMarkdown: problem.StemMarkdown, CanonicalVersion: problem.CanonicalVersion,
 			KnowledgePoints: append([]string(nil), problem.ConceptIDs...), Subject: problem.Subject,
 			RecognitionConfidence: problem.TranscriptionConfidence,

@@ -1861,15 +1861,16 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				mime = "image/png"
 			}
 			dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
-			requestMetadata, policyErr := k12VisionRequestMetadata(ctx)
+			requestMetadata, reasoningPolicyScope, policyErr := k12VisionRequestMetadata(ctx)
 			if policyErr != nil {
 				return "", policyErr
 			}
 			// 不设 MaxTokens：各家视觉模型上限差异大（glm-4v-flash 硬顶 1024，设 4096 即 400），
 			// 任何硬编码都会在某家翻车/截断；取消与 deadline 统一由入口请求负责。
 			resp, cErr := provider.Complete(k12NonIdempotentLLMContext(ctx), hexagon.CompletionRequest{
-				Model:    visionModel,
-				Metadata: requestMetadata,
+				Model:                visionModel,
+				Metadata:             requestMetadata,
+				ReasoningPolicyScope: reasoningPolicyScope,
 				Messages: []hexagon.Message{{
 					Role: hexagon.RoleUser,
 					MultiContent: []llm.ContentPart{
@@ -1891,6 +1892,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		recognizerAdapter := k12engineadapter.NewRecognizerAdapter(
 			visionFn,
 			k12engineadapter.WithRecognizerResourceGovernor(processResources),
+			k12engineadapter.WithRecognizerProviderTransportSendBoundary(),
 		)
 		k12Opts := []k12assembly.Option{
 			k12assembly.WithRecognizer(recognizerAdapter),
@@ -2944,12 +2946,22 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 监听退出信号，优雅关闭
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	var semanticWorkerDone chan struct{}
+	var catalogWorkerDone chan struct{}
 	if kbSemanticRuntime != nil {
 		semanticWorkerDone = make(chan struct{})
 		go func() {
 			defer close(semanticWorkerDone)
 			runKnowledgeSemanticIndexWorker(embeddingLifecycleCtx, kbSemanticRuntime.Worker, 500*time.Millisecond, func(workerErr error) {
 				logger.Warn("[knowledge] 语义索引任务执行失败", "error", workerErr)
+			})
+		}()
+	}
+	if k12Runtime != nil && k12Runtime.CatalogWorker != nil {
+		catalogWorkerDone = make(chan struct{})
+		go func() {
+			defer close(catalogWorkerDone)
+			runK12TextbookCatalogWorker(embeddingLifecycleCtx, k12Runtime.CatalogWorker, 500*time.Millisecond, func(workerErr error) {
+				logger.Warn("[k12] 教材目录任务执行失败", "error", workerErr)
 			})
 		}()
 	}
@@ -2965,6 +2977,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			case <-semanticWorkerDone:
 			case <-time.After(6 * time.Second):
 				logger.Warn("[knowledge] 等待语义索引 Worker 异常路径退出超时")
+			}
+		}
+		if catalogWorkerDone != nil {
+			select {
+			case <-catalogWorkerDone:
+			case <-time.After(6 * time.Second):
+				logger.Warn("[k12] 等待教材目录 Worker 异常路径退出超时")
 			}
 		}
 	}()
@@ -3124,6 +3143,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		case <-semanticWorkerDone:
 		case <-shutdownCtx.Done():
 			logger.Warn("[knowledge] 等待语义索引 Worker 退出超时")
+		}
+	}
+	if catalogWorkerDone != nil {
+		select {
+		case <-catalogWorkerDone:
+		case <-shutdownCtx.Done():
+			logger.Warn("[k12] 等待教材目录 Worker 退出超时")
 		}
 	}
 	if embeddingInstallDone != nil {

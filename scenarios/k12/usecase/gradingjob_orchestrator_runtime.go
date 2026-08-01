@@ -819,12 +819,29 @@ func (o *GradingOrchestrator) reconcileDurableGradingOutcome(
 		if invocation.RequestDigest != wantRequestDigest {
 			return false, GradingJobView{}, fmt.Errorf("recognition invocation request digest drift")
 		}
+		physicalChildren, physicalErr := o.recognitionPhysicalSuccessSet(
+			ctx,
+			*invocation,
+			run.req.Image,
+		)
+		if physicalErr != nil {
+			// A local recognition result file cannot prove that the ambiguous
+			// provider operation completed. Reconciliation is eligible only
+			// when the exact approved 1-or-7 physical child set is durable and
+			// every child is terminal succeeded; otherwise keep the same Job
+			// parked without resending.
+			return false, GradingJobView{}, nil
+		}
 		// A source-scoped Problem/Attempt snapshot can still contain facts from an
 		// earlier invocation of this Job. Only this Job's append-only recognition
 		// receipt proves which result belongs to the ambiguous invocation.
 		receipt, ok := o.readRecognitionReceipt(job.Record.RecordID)
 		if !ok || receipt.AgentName != run.agentName ||
-			receipt.InvocationID != invocation.InvocationID {
+			receipt.InvocationID != invocation.InvocationID ||
+			!sameRecognitionPhysicalReceiptSet(
+				receipt.PhysicalInvocations,
+				recognitionPhysicalReceiptSet(physicalChildren),
+			) {
 			return false, GradingJobView{}, nil
 		}
 		questions := cloneRecognizedQuestions(receipt.Questions)
@@ -1143,12 +1160,20 @@ type gradingRecognitionAuditFile struct {
 }
 
 type gradingRecognitionReceiptFile struct {
-	JobID           string               `json:"job_id"`
-	InvocationID    string               `json:"invocation_id"`
-	AgentName       string               `json:"agent_name"`
-	CanonicalDigest string               `json:"canonical_digest"`
-	Questions       []RecognizedQuestion `json:"questions"`
-	CreatedAt       int64                `json:"created_at"`
+	JobID               string                              `json:"job_id"`
+	InvocationID        string                              `json:"invocation_id"`
+	AgentName           string                              `json:"agent_name"`
+	CanonicalDigest     string                              `json:"canonical_digest"`
+	Questions           []RecognizedQuestion                `json:"questions"`
+	PhysicalInvocations []gradingRecognitionPhysicalReceipt `json:"physical_invocations,omitempty"`
+	CreatedAt           int64                               `json:"created_at"`
+}
+
+type gradingRecognitionPhysicalReceipt struct {
+	PhysicalInvocationID string                      `json:"physical_invocation_id"`
+	PhysicalUnit         k12.RecognitionPhysicalUnit `json:"physical_unit"`
+	RequestDigest        string                      `json:"request_digest"`
+	ResultDigest         string                      `json:"result_digest"`
 }
 
 func (o *GradingOrchestrator) runPath(jobID string, file string) string {
@@ -1282,12 +1307,39 @@ func (o *GradingOrchestrator) persistRecognitionReceipt(jobID, invocationID stri
 		strings.TrimSpace(invocationID) == "" || len(run.questions) == 0 {
 		return nil
 	}
+	var physicalReceipts []gradingRecognitionPhysicalReceipt
+	if o.deps.Records != nil {
+		parent, err := o.deps.Records.GetModelInvocation(
+			context.Background(),
+			run.agentName,
+			invocationID,
+		)
+		if err != nil {
+			return fmt.Errorf("读取识别调用以绑定物理回执: %w", err)
+		}
+		if !parent.RequestPolicySnapshot.IsZero() {
+			children, err := o.recognitionPhysicalSuccessSet(
+				context.Background(),
+				parent,
+				run.req.Image,
+			)
+			if err != nil {
+				return fmt.Errorf("识别结果回执缺少完整物理调用证据: %w", err)
+			}
+			physicalReceipts = recognitionPhysicalReceiptSet(children)
+		}
+	}
 	path := o.recognitionReceiptPath(jobID)
 	if _, err := os.Stat(path); err == nil {
 		existing, ok := o.readRecognitionReceipt(jobID)
 		wantDigest := CanonicalRecognizedQuestionsDigest(run.questions)
 		if !ok || existing.InvocationID != invocationID ||
-			existing.AgentName != run.agentName || existing.CanonicalDigest != wantDigest {
+			existing.AgentName != run.agentName ||
+			existing.CanonicalDigest != wantDigest ||
+			!sameRecognitionPhysicalReceiptSet(
+				existing.PhysicalInvocations,
+				physicalReceipts,
+			) {
 			return fmt.Errorf("识别结果回执与当前 Job 调用事实冲突")
 		}
 		return nil
@@ -1299,8 +1351,10 @@ func (o *GradingOrchestrator) persistRecognitionReceipt(jobID, invocationID stri
 	}
 	receipt := gradingRecognitionReceiptFile{
 		JobID: jobID, InvocationID: invocationID, AgentName: run.agentName,
-		CanonicalDigest: CanonicalRecognizedQuestionsDigest(run.questions),
-		Questions:       cloneRecognizedQuestions(run.questions), CreatedAt: time.Now().Unix(),
+		CanonicalDigest:     CanonicalRecognizedQuestionsDigest(run.questions),
+		Questions:           cloneRecognizedQuestions(run.questions),
+		PhysicalInvocations: physicalReceipts,
+		CreatedAt:           time.Now().Unix(),
 	}
 	raw, err := json.Marshal(receipt)
 	if err != nil {
@@ -1310,6 +1364,43 @@ func (o *GradingOrchestrator) persistRecognitionReceipt(jobID, invocationID stri
 		return fmt.Errorf("写识别结果回执: %w", err)
 	}
 	return nil
+}
+
+func recognitionPhysicalReceiptSet(
+	children []k12.ModelPhysicalInvocation,
+) []gradingRecognitionPhysicalReceipt {
+	if len(children) == 0 {
+		return nil
+	}
+	out := make(
+		[]gradingRecognitionPhysicalReceipt,
+		0,
+		len(children),
+	)
+	for _, child := range children {
+		out = append(out, gradingRecognitionPhysicalReceipt{
+			PhysicalInvocationID: child.PhysicalInvocationID,
+			PhysicalUnit:         child.PhysicalUnit,
+			RequestDigest:        child.RequestDigest,
+			ResultDigest:         child.ResultDigest,
+		})
+	}
+	return out
+}
+
+func sameRecognitionPhysicalReceiptSet(
+	left []gradingRecognitionPhysicalReceipt,
+	right []gradingRecognitionPhysicalReceipt,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (o *GradingOrchestrator) readRecognitionReceipt(jobID string) (gradingRecognitionReceiptFile, bool) {
@@ -1325,6 +1416,14 @@ func (o *GradingOrchestrator) readRecognitionReceipt(jobID string) (gradingRecog
 		strings.TrimSpace(receipt.InvocationID) == "" || len(receipt.Questions) == 0 ||
 		receipt.CanonicalDigest != CanonicalRecognizedQuestionsDigest(receipt.Questions) {
 		return gradingRecognitionReceiptFile{}, false
+	}
+	for _, physical := range receipt.PhysicalInvocations {
+		if strings.TrimSpace(physical.PhysicalInvocationID) == "" ||
+			!physical.PhysicalUnit.Valid() ||
+			!validModelInvocationDigest(physical.RequestDigest) ||
+			!validModelInvocationDigest(physical.ResultDigest) {
+			return gradingRecognitionReceiptFile{}, false
+		}
 	}
 	return receipt, true
 }

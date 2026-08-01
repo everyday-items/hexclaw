@@ -391,8 +391,12 @@ func TestStartPhotoGradingJobRejectsIdempotencySnapshotConflict(t *testing.T) {
 			return k12.NormalizeGradingModelSnapshot(requested), nil
 		},
 	))
+	policy := k12.ApprovedRecognizingRequestPolicy()
 	firstSnapshot := k12.GradingModelSnapshot{
-		Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", Capability: "vision",
+		Provider:                 "hexclaw-gpt",
+		Model:                    k12.RecognizingPolicyModel,
+		Capability:               "vision",
+		RecognizingRequestPolicy: policy,
 	}
 	first, created, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "same-key",
@@ -429,8 +433,13 @@ func TestStartPhotoGradingJobSameRouteReplayKeepsFrozenSnapshotMetadata(t *testi
 			return k12.NormalizeGradingModelSnapshot(requested), nil
 		},
 	))
+	policy := k12.ApprovedRecognizingRequestPolicy()
 	firstSnapshot := k12.GradingModelSnapshot{
-		Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", Capability: "vision", TimeoutMS: 30_000,
+		Provider:                 "hexclaw-gpt",
+		Model:                    k12.RecognizingPolicyModel,
+		Capability:               "vision",
+		TimeoutMS:                30_000,
+		RecognizingRequestPolicy: policy,
 	}
 	first, created, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "same-route-replay",
@@ -443,7 +452,11 @@ func TestStartPhotoGradingJobSameRouteReplayKeepsFrozenSnapshotMetadata(t *testi
 	replayed, created, err := o.StartPhotoGradingJob(context.Background(), StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "same-route-replay",
 		ModelSnapshot: k12.GradingModelSnapshot{
-			Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", Capability: "vision", TimeoutMS: 60_000,
+			Provider:                 "hexclaw-gpt",
+			Model:                    k12.RecognizingPolicyModel,
+			Capability:               "vision",
+			TimeoutMS:                60_000,
+			RecognizingRequestPolicy: policy,
 		},
 	})
 	if err != nil || created || replayed.Record.RecordID != first.Record.RecordID {
