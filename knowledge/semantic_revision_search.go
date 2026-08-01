@@ -17,9 +17,15 @@ import (
 	"github.com/hexagon-codes/hexclaw/resourcegov"
 )
 
-// ErrInvalidEmbeddingResult rejects a provider response that cannot belong to
-// the immutable target vector space.
-var ErrInvalidEmbeddingResult = errors.New("knowledge: invalid embedding result")
+var (
+	// ErrInvalidEmbeddingResult rejects a provider response that cannot belong to
+	// the immutable target vector space.
+	ErrInvalidEmbeddingResult = errors.New("knowledge: invalid embedding result")
+	// ErrRetrievalPlanUnavailable rejects a caller-pinned revision when the
+	// configured semantic route cannot freeze or execute that exact revision.
+	// A pinned request must never fall back to the mutable active pointer.
+	ErrRetrievalPlanUnavailable = errors.New("knowledge: pinned retrieval plan unavailable")
+)
 
 type EmbeddingPurpose string
 
@@ -67,6 +73,34 @@ type RevisionSemanticReceiptSearcher interface {
 		topK int,
 		filter Filter,
 	) (results []*SearchResult, routeRan bool, receipt *QueryEmbeddingReceipt, err error)
+}
+
+// revisionSemanticPlanner is the request-scoped immutable retrieval boundary.
+// It deliberately remains package-private so legacy/external implementations of
+// RevisionSemanticSearcher keep compiling. Manager requires this extension only
+// for explicitly pinned revision requests; ordinary reads retain the legacy
+// compatibility path.
+type revisionSemanticPlanner interface {
+	FreezeRetrievalPlan(
+		ctx context.Context,
+		expectedRevisionID string,
+	) (activeRevisionSearchPlan, bool, error)
+	RetrievalPlanReady(ctx context.Context, plan activeRevisionSearchPlan) (bool, error)
+	ValidateRetrievalPlan(ctx context.Context, plan activeRevisionSearchPlan) error
+	SearchWithPlanReceipt(
+		ctx context.Context,
+		plan activeRevisionSearchPlan,
+		query string,
+		topK int,
+		filter Filter,
+	) (results []*SearchResult, routeRan bool, receipt *QueryEmbeddingReceipt, err error)
+	TextSearchWithPlan(
+		ctx context.Context,
+		plan activeRevisionSearchPlan,
+		query string,
+		topK int,
+		filter Filter,
+	) ([]*SearchResult, error)
 }
 
 type QueryEmbeddingReceipt struct {
@@ -131,29 +165,46 @@ func NewSQLiteRevisionSemanticSearcher(
 }
 
 type activeRevisionSearchPlan struct {
-	corpusUID string
-	revision  string
-	profile   EmbeddingProfileSnapshot
+	corpusUID        string
+	revision         string
+	explicitRevision bool
+	contentVersion   int64
+	profile          EmbeddingProfileSnapshot
 }
 
 func (s *SQLiteRevisionSemanticSearcher) loadActivePlan(ctx context.Context) (activeRevisionSearchPlan, bool, error) {
+	return s.loadRetrievalPlan(ctx, "")
+}
+
+func (s *SQLiteRevisionSemanticSearcher) loadRetrievalPlan(
+	ctx context.Context,
+	expectedRevisionID string,
+) (activeRevisionSearchPlan, bool, error) {
 	if s.db == nil || s.registry == nil || strings.TrimSpace(s.ownerID) == "" || strings.TrimSpace(s.corpusID) == "" {
 		return activeRevisionSearchPlan{}, false, fmt.Errorf("knowledge: invalid revision semantic search configuration")
 	}
+	expectedRevisionID = strings.TrimSpace(expectedRevisionID)
 	var plan activeRevisionSearchPlan
 	var location, availability string
-	err := s.db.QueryRowContext(ctx, `SELECT c.corpus_uid,r.revision_id,
+	query := `SELECT c.corpus_uid,c.content_version,r.revision_id,
 		s.profile_snapshot_id,s.resolved_profile_id,s.provider_id,s.provider_name,
 		s.provider_location,s.model_name,s.dimension,s.normalization,
 		s.chunk_config_hash,s.profile_config_hash,s.availability
 		FROM kb_semantic_corpora c
-		JOIN kb_index_revisions r
-		  ON r.corpus_uid=c.corpus_uid AND r.revision_id=c.active_revision_id
+		JOIN kb_index_revisions r ON r.corpus_uid=c.corpus_uid
 		JOIN kb_embedding_profile_snapshots s
-		  ON s.corpus_uid=r.corpus_uid AND s.profile_snapshot_id=r.profile_snapshot_id
-		WHERE c.owner_id=? AND c.corpus_alias=? AND r.publish_state='active'`,
-		s.ownerID, s.corpusID).Scan(
-		&plan.corpusUID, &plan.revision,
+		  ON s.corpus_uid=r.corpus_uid AND s.profile_snapshot_id=r.profile_snapshot_id `
+	args := []any{s.ownerID, s.corpusID}
+	if expectedRevisionID == "" {
+		query += `WHERE c.owner_id=? AND c.corpus_alias=?
+		  AND r.revision_id=c.active_revision_id AND r.publish_state='active'`
+	} else {
+		query += `WHERE c.owner_id=? AND c.corpus_alias=? AND r.revision_id=?
+		  AND r.publish_state IN ('active','superseded')`
+		args = append(args, expectedRevisionID)
+	}
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(
+		&plan.corpusUID, &plan.contentVersion, &plan.revision,
 		&plan.profile.SnapshotID, &plan.profile.Profile.ProfileID,
 		&plan.profile.Profile.ProviderID, &plan.profile.Profile.ProviderName,
 		&location, &plan.profile.Profile.ModelName, &plan.profile.Profile.Dimension,
@@ -161,6 +212,11 @@ func (s *SQLiteRevisionSemanticSearcher) loadActivePlan(ctx context.Context) (ac
 		&plan.profile.ProfileConfigHash, &availability,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
+		if expectedRevisionID != "" {
+			return activeRevisionSearchPlan{}, false, fmt.Errorf(
+				"%w: revision %q", ErrRetrievalPlanUnavailable, expectedRevisionID,
+			)
+		}
 		return activeRevisionSearchPlan{}, false, nil
 	}
 	if err != nil {
@@ -169,16 +225,29 @@ func (s *SQLiteRevisionSemanticSearcher) loadActivePlan(ctx context.Context) (ac
 	plan.profile.Profile.Location = ProviderLocation(location)
 	plan.profile.Profile.Availability = ProfileAvailability(availability)
 	plan.profile.Profile.Capability = "embedding"
+	plan.explicitRevision = expectedRevisionID != ""
 	if err := plan.profile.Validate(); err != nil {
 		return activeRevisionSearchPlan{}, false, err
 	}
 	return plan, true, nil
 }
 
-func (s *SQLiteRevisionSemanticSearcher) HasActiveRevision(ctx context.Context) (bool, error) {
-	plan, active, err := s.loadActivePlan(ctx)
-	if err != nil || !active {
-		return active, err
+// FreezeRetrievalPlan resolves the active revision once, or validates an exact
+// caller-pinned active/superseded revision. The returned value contains no
+// mutable pointers and is reused for every expanded query in one Manager call.
+func (s *SQLiteRevisionSemanticSearcher) FreezeRetrievalPlan(
+	ctx context.Context,
+	expectedRevisionID string,
+) (activeRevisionSearchPlan, bool, error) {
+	return s.loadRetrievalPlan(ctx, expectedRevisionID)
+}
+
+func (s *SQLiteRevisionSemanticSearcher) RetrievalPlanReady(
+	ctx context.Context,
+	plan activeRevisionSearchPlan,
+) (bool, error) {
+	if err := validateActiveRevisionSearchPlan(plan); err != nil {
+		return false, err
 	}
 	executor, err := s.registry.ExecutorForProfile(ctx, plan.profile)
 	if errors.Is(err, ErrProfileUnavailable) || errors.Is(err, ErrEmbeddingUnavailable) {
@@ -191,6 +260,68 @@ func (s *SQLiteRevisionSemanticSearcher) HasActiveRevision(ctx context.Context) 
 		return readiness.EmbeddingReady(ctx), nil
 	}
 	return true, nil
+}
+
+// ValidateRetrievalPlan closes the request-level TOCTOU window for mutable
+// corpus membership. content_version is monotonic, so any document add,
+// replacement or tombstone observed during a multi-query request is detected
+// before results are returned. Publishing a successor revision alone is
+// allowed: the frozen revision remains replayable as superseded.
+func (s *SQLiteRevisionSemanticSearcher) ValidateRetrievalPlan(
+	ctx context.Context,
+	plan activeRevisionSearchPlan,
+) error {
+	if err := validateActiveRevisionSearchPlan(plan); err != nil {
+		return err
+	}
+	var contentVersion int64
+	var publishState string
+	err := s.db.QueryRowContext(ctx, `SELECT c.content_version,r.publish_state
+		FROM kb_semantic_corpora c
+		JOIN kb_index_revisions r ON r.corpus_uid=c.corpus_uid
+		WHERE c.corpus_uid=? AND r.revision_id=?`,
+		plan.corpusUID,
+		plan.revision,
+	).Scan(&contentVersion, &publishState)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: frozen revision %q no longer exists",
+			ErrRetrievalPlanUnavailable, plan.revision)
+	}
+	if err != nil {
+		return fmt.Errorf("knowledge: validate frozen retrieval plan: %w", err)
+	}
+	if publishState != "active" && publishState != "superseded" {
+		return fmt.Errorf("%w: frozen revision %q state=%q",
+			ErrRetrievalPlanUnavailable, plan.revision, publishState)
+	}
+	if contentVersion != plan.contentVersion {
+		return fmt.Errorf(
+			"%w: corpus content version changed from %d to %d",
+			ErrRetrievalEvidenceConflict,
+			plan.contentVersion,
+			contentVersion,
+		)
+	}
+	return nil
+}
+
+func validateActiveRevisionSearchPlan(plan activeRevisionSearchPlan) error {
+	if strings.TrimSpace(plan.corpusUID) == "" || strings.TrimSpace(plan.revision) == "" ||
+		plan.contentVersion < 0 {
+		return ErrRetrievalPlanUnavailable
+	}
+	if err := plan.profile.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrRetrievalPlanUnavailable, err)
+	}
+	return nil
+}
+
+func (s *SQLiteRevisionSemanticSearcher) HasActiveRevision(ctx context.Context) (bool, error) {
+	plan, active, err := s.loadActivePlan(ctx)
+	if err != nil || !active {
+		return active, err
+	}
+	return s.RetrievalPlanReady(ctx, plan)
 }
 
 // ActiveRevisionID exposes only the control-plane identity needed to freeze a
@@ -230,6 +361,20 @@ func (s *SQLiteRevisionSemanticSearcher) SearchWithReceipt(
 	topK int,
 	filter Filter,
 ) ([]*SearchResult, bool, *QueryEmbeddingReceipt, error) {
+	plan, active, err := s.loadActivePlan(ctx)
+	if err != nil || !active {
+		return nil, false, nil, err
+	}
+	return s.SearchWithPlanReceipt(ctx, plan, query, topK, filter)
+}
+
+func (s *SQLiteRevisionSemanticSearcher) SearchWithPlanReceipt(
+	ctx context.Context,
+	plan activeRevisionSearchPlan,
+	query string,
+	topK int,
+	filter Filter,
+) ([]*SearchResult, bool, *QueryEmbeddingReceipt, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return nil, false, nil, nil
@@ -237,8 +382,7 @@ func (s *SQLiteRevisionSemanticSearcher) SearchWithReceipt(
 	if topK <= 0 {
 		topK = 3
 	}
-	plan, active, err := s.loadActivePlan(ctx)
-	if err != nil || !active {
+	if err := validateActiveRevisionSearchPlan(plan); err != nil {
 		return nil, false, nil, err
 	}
 	executor, err := s.registry.ExecutorForProfile(ctx, plan.profile)
@@ -310,11 +454,46 @@ func (s *SQLiteRevisionSemanticSearcher) TextSearch(
 	if err != nil {
 		return nil, err
 	}
-	results, err := s.ftsTextSearch(ctx, corpusUID, keywords, topK, filter)
+	return s.textSearchCorpus(ctx, corpusUID, "", keywords, topK, filter)
+}
+
+func (s *SQLiteRevisionSemanticSearcher) TextSearchWithPlan(
+	ctx context.Context,
+	plan activeRevisionSearchPlan,
+	query string,
+	topK int,
+	filter Filter,
+) ([]*SearchResult, error) {
+	if err := validateActiveRevisionSearchPlan(plan); err != nil {
+		return nil, err
+	}
+	keywords := splitter.SearchTokenize(query)
+	if len(keywords) == 0 {
+		return nil, nil
+	}
+	if topK <= 0 {
+		topK = 3
+	}
+	revisionID := ""
+	if plan.explicitRevision {
+		revisionID = plan.revision
+	}
+	return s.textSearchCorpus(ctx, plan.corpusUID, revisionID, keywords, topK, filter)
+}
+
+func (s *SQLiteRevisionSemanticSearcher) textSearchCorpus(
+	ctx context.Context,
+	corpusUID string,
+	revisionID string,
+	keywords []string,
+	topK int,
+	filter Filter,
+) ([]*SearchResult, error) {
+	results, err := s.ftsTextSearch(ctx, corpusUID, revisionID, keywords, topK, filter)
 	if err == nil && len(results) > 0 {
 		return results, nil
 	}
-	return s.likeTextSearch(ctx, corpusUID, keywords, topK, filter)
+	return s.likeTextSearch(ctx, corpusUID, revisionID, keywords, topK, filter)
 }
 
 func (s *SQLiteRevisionSemanticSearcher) resolveCorpusUID(ctx context.Context) (string, error) {
@@ -341,13 +520,14 @@ type scopedTextResult struct {
 func (s *SQLiteRevisionSemanticSearcher) ftsTextSearch(
 	ctx context.Context,
 	corpusUID string,
+	revisionID string,
 	keywords []string,
 	topK int,
 	filter Filter,
 ) ([]*SearchResult, error) {
 	clause, filterArgs := buildRevisionFilterClause(filter, "d", "b", "c")
 	needDate := filter.hasDateBound()
-	query := `SELECT c.id,c.doc_id,d.title,d.source,d.source_type,d.chunk_count,
+	query := `SELECT c.id,c.doc_id,b.content_generation,d.title,d.source,d.source_type,d.chunk_count,
 		c.content,c.chunk_index,c.created_at,COALESCE(c.page_start,0),COALESCE(c.page_end,0),
 		c.source_digest,COALESCE(c.source_offset_start,0),COALESCE(c.source_offset_end,0),
 		d.created_at,bm25(kb_chunks_fts)
@@ -355,9 +535,18 @@ func (s *SQLiteRevisionSemanticSearcher) ftsTextSearch(
 		JOIN kb_chunks c ON c.id=f.chunk_id
 		JOIN kb_documents d ON d.id=c.doc_id
 		JOIN kb_semantic_document_bindings b
-		  ON b.document_id=d.id AND b.corpus_uid=?
-		WHERE kb_chunks_fts MATCH ? AND b.lifecycle_state='active' AND d.deleted=0`
-	args := []any{corpusUID, strings.Join(keywords, " OR ")}
+		  ON b.document_id=d.id AND b.corpus_uid=?`
+	args := []any{corpusUID}
+	if revisionID != "" {
+		query += ` JOIN kb_revision_documents rd
+		  ON rd.corpus_uid=b.corpus_uid AND rd.revision_id=?
+		 AND rd.document_id=b.document_id
+		 AND rd.content_generation=b.content_generation
+		 AND rd.vector_state='ready' AND rd.visible_at IS NOT NULL`
+		args = append(args, revisionID)
+	}
+	query += ` WHERE kb_chunks_fts MATCH ? AND b.lifecycle_state='active' AND d.deleted=0`
+	args = append(args, strings.Join(keywords, " OR "))
 	query += " AND " + readyIngestSegmentVisibilitySQL("b", "c")
 	if clause != "" {
 		query += " AND " + clause
@@ -380,7 +569,8 @@ func (s *SQLiteRevisionSemanticSearcher) ftsTextSearch(
 		var documentCreatedAt time.Time
 		var bm25Score float64
 		if err := rows.Scan(
-			&chunk.ID, &chunk.DocID, &chunk.DocTitle, &chunk.Source,
+			&chunk.ID, &chunk.DocID, &chunk.DocumentGeneration,
+			&chunk.DocTitle, &chunk.Source,
 			&chunk.SourceType, &chunk.ChunkCount, &chunk.Content,
 			&chunk.Index, &chunk.CreatedAt, &chunk.PageStart, &chunk.PageEnd,
 			&chunk.SourceDigest, &chunk.SourceOffsetStart, &chunk.SourceOffsetEnd,
@@ -417,6 +607,7 @@ func (s *SQLiteRevisionSemanticSearcher) ftsTextSearch(
 func (s *SQLiteRevisionSemanticSearcher) likeTextSearch(
 	ctx context.Context,
 	corpusUID string,
+	revisionID string,
 	keywords []string,
 	topK int,
 	filter Filter,
@@ -424,15 +615,23 @@ func (s *SQLiteRevisionSemanticSearcher) likeTextSearch(
 	clause, filterArgs := buildRevisionFilterClause(filter, "d", "b", "c")
 	needDate := filter.hasDateBound()
 	var query strings.Builder
-	query.WriteString(`SELECT c.id,c.doc_id,d.title,d.source,d.source_type,d.chunk_count,
+	query.WriteString(`SELECT c.id,c.doc_id,b.content_generation,d.title,d.source,d.source_type,d.chunk_count,
 		c.content,c.chunk_index,c.created_at,COALESCE(c.page_start,0),COALESCE(c.page_end,0),
 		c.source_digest,COALESCE(c.source_offset_start,0),COALESCE(c.source_offset_end,0),d.created_at
 		FROM kb_chunks c
 		JOIN kb_documents d ON d.id=c.doc_id
 		JOIN kb_semantic_document_bindings b
-		  ON b.document_id=d.id AND b.corpus_uid=?
-		WHERE b.lifecycle_state='active' AND d.deleted=0 AND (`)
+		  ON b.document_id=d.id AND b.corpus_uid=?`)
 	args := []any{corpusUID}
+	if revisionID != "" {
+		query.WriteString(` JOIN kb_revision_documents rd
+		  ON rd.corpus_uid=b.corpus_uid AND rd.revision_id=?
+		 AND rd.document_id=b.document_id
+		 AND rd.content_generation=b.content_generation
+		 AND rd.vector_state='ready' AND rd.visible_at IS NOT NULL`)
+		args = append(args, revisionID)
+	}
+	query.WriteString(` WHERE b.lifecycle_state='active' AND d.deleted=0 AND (`)
 	for i, keyword := range keywords {
 		if i > 0 {
 			query.WriteString(" OR ")
@@ -463,7 +662,8 @@ func (s *SQLiteRevisionSemanticSearcher) likeTextSearch(
 		chunk := &Chunk{}
 		var documentCreatedAt time.Time
 		if err := rows.Scan(
-			&chunk.ID, &chunk.DocID, &chunk.DocTitle, &chunk.Source,
+			&chunk.ID, &chunk.DocID, &chunk.DocumentGeneration,
+			&chunk.DocTitle, &chunk.Source,
 			&chunk.SourceType, &chunk.ChunkCount, &chunk.Content,
 			&chunk.Index, &chunk.CreatedAt, &chunk.PageStart, &chunk.PageEnd,
 			&chunk.SourceDigest, &chunk.SourceOffsetStart, &chunk.SourceOffsetEnd,
@@ -515,7 +715,7 @@ func (s *SQLiteRevisionSemanticSearcher) searchActiveVectors(
 	filter Filter,
 ) ([]*SearchResult, error) {
 	clause, filterArgs := buildRevisionFilterClause(filter, "d", "b", "c")
-	query := `SELECT v.chunk_id,v.document_id,v.chunk_index,v.embedding,v.chunk_content_hash,
+	query := `SELECT v.chunk_id,v.document_id,v.content_generation,v.chunk_index,v.embedding,v.chunk_content_hash,
 		d.title,d.source,d.source_type,d.chunk_count,c.content,c.created_at,
 		COALESCE(c.page_start,0),COALESCE(c.page_end,0),c.source_digest,
 		COALESCE(c.source_offset_start,0),COALESCE(c.source_offset_end,0),d.created_at
@@ -555,7 +755,8 @@ func (s *SQLiteRevisionSemanticSearcher) searchActiveVectors(
 		var blob []byte
 		var documentCreatedAt time.Time
 		if err := rows.Scan(
-			&chunk.ID, &chunk.DocID, &chunk.Index, &blob,
+			&chunk.ID, &chunk.DocID, &chunk.DocumentGeneration,
+			&chunk.Index, &blob,
 			&chunk.CitationDigest,
 			&chunk.DocTitle, &chunk.Source, &chunk.SourceType,
 			&chunk.ChunkCount, &chunk.Content, &chunk.CreatedAt,
@@ -567,6 +768,7 @@ func (s *SQLiteRevisionSemanticSearcher) searchActiveVectors(
 		if needDate && !filter.matchesDate(documentCreatedAt) {
 			continue
 		}
+		chunk.SemanticRevisionID = plan.revision
 		chunk.Embedding = decodeFloat32Slice(blob)
 		if len(chunk.Embedding) != plan.profile.Profile.Dimension {
 			return nil, fmt.Errorf("%w: persisted chunk %q dimension=%d want=%d",

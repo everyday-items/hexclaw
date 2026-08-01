@@ -724,7 +724,7 @@ func (r *SQLiteSemanticIndexRepository) getIngestDocumentProjection(
 	var result KnowledgeDocumentProjection
 	var pageCount sql.NullInt64
 	var warningsJSON, textState string
-	query := `SELECT s.document_id,s.owner_id,c.corpus_alias,s.original_name,
+	query := `SELECT s.document_id,s.content_generation,s.owner_id,c.corpus_alias,s.original_name,
 		s.media_type,s.size_bytes,s.blob_sha256,s.agent_id,s.learner_id,s.subject,s.grade,
 		s.page_count,s.warnings_json,b.text_state
 		FROM kb_ingest_document_sources s
@@ -738,7 +738,7 @@ func (r *SQLiteSemanticIndexRepository) getIngestDocumentProjection(
 		args = append(args, ownerID, corpusID)
 	}
 	err := r.db.QueryRowContext(ctx, query, args...).Scan(
-		&result.DocumentID, &result.OwnerID, &result.CorpusID, &result.Filename,
+		&result.DocumentID, &result.DocumentGeneration, &result.OwnerID, &result.CorpusID, &result.Filename,
 		&result.MediaType, &result.SizeBytes, &result.SHA256, &result.AgentID,
 		&result.LearnerID, &result.Subject, &result.Grade, &pageCount, &warningsJSON, &textState,
 	)

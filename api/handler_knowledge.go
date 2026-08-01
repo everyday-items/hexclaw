@@ -505,6 +505,7 @@ func (s *Server) knowledgeDocumentDetail(
 	}
 	payload["id"] = projection.DocumentID
 	payload["document_id"] = projection.DocumentID
+	payload["document_generation"] = projection.DocumentGeneration
 	payload["owner_id"] = projection.OwnerID
 	payload["corpus_id"] = projection.CorpusID
 	payload["filename"] = projection.Filename

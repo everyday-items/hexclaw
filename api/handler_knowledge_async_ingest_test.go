@@ -258,7 +258,8 @@ func TestKnowledgeDocumentDetailPrefersAsyncProjectionAndKeepsLegacyContentCompa
 			},
 		},
 		projection: &knowledge.KnowledgeDocumentProjection{
-			DocumentID: "doc-async-detail", OwnerID: "desktop-user", CorpusID: "default",
+			DocumentID: "doc-async-detail", DocumentGeneration: 3,
+			OwnerID: "desktop-user", CorpusID: "default",
 			Filename: "六上数学.pdf", MediaType: "application/pdf", SizeBytes: 57_313_616,
 			SHA256: strings.Repeat("a", 64), AgentID: "tutor-a", LearnerID: "learner-a",
 			Subject: "数学", Grade: "六年级上", PageCount: &pageCount,
@@ -289,7 +290,8 @@ func TestKnowledgeDocumentDetailPrefersAsyncProjectionAndKeepsLegacyContentCompa
 	}
 	for key, want := range map[string]any{
 		"id": "doc-async-detail", "document_id": "doc-async-detail",
-		"content": "legacy-compatible extracted text", "status": "indexed",
+		"document_generation": float64(3),
+		"content":             "legacy-compatible extracted text", "status": "indexed",
 		"source_digest": strings.Repeat("a", 64), "sha256": strings.Repeat("a", 64),
 		"owner_id": "desktop-user", "corpus_id": "default", "agent_id": "tutor-a",
 		"learner_id": "learner-a", "subject": "数学", "grade": "六年级上",

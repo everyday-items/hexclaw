@@ -88,21 +88,22 @@ type PersistedIngestDocument struct {
 }
 
 type KnowledgeDocumentProjection struct {
-	DocumentID     string         `json:"document_id"`
-	OwnerID        string         `json:"owner_id"`
-	CorpusID       string         `json:"corpus_id"`
-	Filename       string         `json:"filename"`
-	MediaType      string         `json:"media_type"`
-	SizeBytes      int64          `json:"size_bytes"`
-	SHA256         string         `json:"sha256"`
-	AgentID        string         `json:"agent_id,omitempty"`
-	LearnerID      string         `json:"learner_id,omitempty"`
-	Subject        string         `json:"subject,omitempty"`
-	Grade          string         `json:"grade,omitempty"`
-	PageCount      *int64         `json:"page_count,omitempty"`
-	TextIndexState TextIndexState `json:"text_index_state"`
-	Warnings       []string       `json:"warnings"`
-	SourceSpans    []SourceSpan   `json:"source_spans,omitempty"`
+	DocumentID         string         `json:"document_id"`
+	DocumentGeneration int64          `json:"document_generation"`
+	OwnerID            string         `json:"owner_id"`
+	CorpusID           string         `json:"corpus_id"`
+	Filename           string         `json:"filename"`
+	MediaType          string         `json:"media_type"`
+	SizeBytes          int64          `json:"size_bytes"`
+	SHA256             string         `json:"sha256"`
+	AgentID            string         `json:"agent_id,omitempty"`
+	LearnerID          string         `json:"learner_id,omitempty"`
+	Subject            string         `json:"subject,omitempty"`
+	Grade              string         `json:"grade,omitempty"`
+	PageCount          *int64         `json:"page_count,omitempty"`
+	TextIndexState     TextIndexState `json:"text_index_state"`
+	Warnings           []string       `json:"warnings"`
+	SourceSpans        []SourceSpan   `json:"source_spans,omitempty"`
 }
 
 // SourceSpan is a durable coordinate back to the immutable uploaded source.

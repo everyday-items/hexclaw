@@ -39,6 +39,12 @@ import (
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
+// ErrRetrievalEvidenceConflict rejects a result set that cannot prove one
+// internally consistent source for a chunk or one revision for all expanded
+// query embeddings. Returning partial evidence would make citations
+// non-auditable, so callers must treat this as fail-closed.
+var ErrRetrievalEvidenceConflict = errors.New("knowledge: retrieval evidence conflict")
+
 // ─── Domain Model ───────────────────────────────────────
 
 // Document 文档
@@ -65,43 +71,47 @@ type Document struct {
 
 // Chunk 文档片段
 type Chunk struct {
-	ID                string    `json:"id"`
-	DocID             string    `json:"doc_id"`
-	DocTitle          string    `json:"doc_title"`
-	Source            string    `json:"source"`
-	SourceType        string    `json:"source_type,omitempty"` // 继承自所属文档（manual/upload/url/file/agent），供元数据过滤与展示
-	ChunkCount        int       `json:"chunk_count"`
-	Content           string    `json:"content"`
-	Index             int       `json:"index"`
-	Embedding         []float32 `json:"-"`
-	Score             float64   `json:"score"`
-	CreatedAt         time.Time `json:"created_at"`
-	PageStart         int       `json:"page_start,omitempty"`
-	PageEnd           int       `json:"page_end,omitempty"`
-	CitationDigest    string    `json:"citation_digest,omitempty"`
-	SourceDigest      string    `json:"source_digest,omitempty"`
-	SourceOffsetStart int64     `json:"source_offset_start,omitempty"`
-	SourceOffsetEnd   int64     `json:"source_offset_end,omitempty"`
+	ID                 string    `json:"id"`
+	DocID              string    `json:"doc_id"`
+	DocumentGeneration int64     `json:"document_generation,omitempty"`
+	SemanticRevisionID string    `json:"revision_id,omitempty"`
+	DocTitle           string    `json:"doc_title"`
+	Source             string    `json:"source"`
+	SourceType         string    `json:"source_type,omitempty"` // 继承自所属文档（manual/upload/url/file/agent），供元数据过滤与展示
+	ChunkCount         int       `json:"chunk_count"`
+	Content            string    `json:"content"`
+	Index              int       `json:"index"`
+	Embedding          []float32 `json:"-"`
+	Score              float64   `json:"score"`
+	CreatedAt          time.Time `json:"created_at"`
+	PageStart          int       `json:"page_start,omitempty"`
+	PageEnd            int       `json:"page_end,omitempty"`
+	CitationDigest     string    `json:"citation_digest,omitempty"`
+	SourceDigest       string    `json:"source_digest,omitempty"`
+	SourceOffsetStart  int64     `json:"source_offset_start,omitempty"`
+	SourceOffsetEnd    int64     `json:"source_offset_end,omitempty"`
 }
 
 // SearchHit 结构化知识库搜索结果（对外暴露）
 type SearchHit struct {
-	DocID             string         `json:"doc_id"`
-	DocTitle          string         `json:"doc_title"`
-	Source            string         `json:"source,omitempty"`
-	ChunkID           string         `json:"chunk_id"`
-	ChunkIndex        int            `json:"chunk_index"`
-	ChunkCount        int            `json:"chunk_count"`
-	Content           string         `json:"content"`
-	Score             float64        `json:"score"`
-	CreatedAt         time.Time      `json:"created_at,omitempty"`
-	Metadata          map[string]any `json:"metadata,omitempty"`
-	PageStart         int            `json:"page_start,omitempty"`
-	PageEnd           int            `json:"page_end,omitempty"`
-	CitationDigest    string         `json:"citation_digest,omitempty"`
-	SourceDigest      string         `json:"source_digest,omitempty"`
-	SourceOffsetStart int64          `json:"source_offset_start,omitempty"`
-	SourceOffsetEnd   int64          `json:"source_offset_end,omitempty"`
+	DocID              string         `json:"doc_id"`
+	DocumentGeneration int64          `json:"document_generation,omitempty"`
+	SemanticRevisionID string         `json:"revision_id,omitempty"`
+	DocTitle           string         `json:"doc_title"`
+	Source             string         `json:"source,omitempty"`
+	ChunkID            string         `json:"chunk_id"`
+	ChunkIndex         int            `json:"chunk_index"`
+	ChunkCount         int            `json:"chunk_count"`
+	Content            string         `json:"content"`
+	Score              float64        `json:"score"`
+	CreatedAt          time.Time      `json:"created_at,omitempty"`
+	Metadata           map[string]any `json:"metadata,omitempty"`
+	PageStart          int            `json:"page_start,omitempty"`
+	PageEnd            int            `json:"page_end,omitempty"`
+	CitationDigest     string         `json:"citation_digest,omitempty"`
+	SourceDigest       string         `json:"source_digest,omitempty"`
+	SourceOffsetStart  int64          `json:"source_offset_start,omitempty"`
+	SourceOffsetEnd    int64          `json:"source_offset_end,omitempty"`
 }
 
 // SearchResult 单条搜索结果（内部使用）
@@ -901,22 +911,24 @@ func hitsFromResults(selected []*SearchResult) []SearchHit {
 	hits := make([]SearchHit, 0, len(selected))
 	for _, r := range selected {
 		hits = append(hits, SearchHit{
-			DocID:             r.Chunk.DocID,
-			DocTitle:          r.Chunk.DocTitle,
-			Source:            r.Chunk.Source,
-			ChunkID:           r.Chunk.ID,
-			ChunkIndex:        r.Chunk.Index,
-			ChunkCount:        r.Chunk.ChunkCount,
-			Content:           r.Chunk.Content,
-			Score:             r.Chunk.Score,
-			CreatedAt:         r.Chunk.CreatedAt,
-			Metadata:          chunkMetadata(r.Chunk),
-			PageStart:         r.Chunk.PageStart,
-			PageEnd:           r.Chunk.PageEnd,
-			CitationDigest:    r.Chunk.CitationDigest,
-			SourceDigest:      r.Chunk.SourceDigest,
-			SourceOffsetStart: r.Chunk.SourceOffsetStart,
-			SourceOffsetEnd:   r.Chunk.SourceOffsetEnd,
+			DocID:              r.Chunk.DocID,
+			DocumentGeneration: r.Chunk.DocumentGeneration,
+			SemanticRevisionID: r.Chunk.SemanticRevisionID,
+			DocTitle:           r.Chunk.DocTitle,
+			Source:             r.Chunk.Source,
+			ChunkID:            r.Chunk.ID,
+			ChunkIndex:         r.Chunk.Index,
+			ChunkCount:         r.Chunk.ChunkCount,
+			Content:            r.Chunk.Content,
+			Score:              r.Chunk.Score,
+			CreatedAt:          r.Chunk.CreatedAt,
+			Metadata:           chunkMetadata(r.Chunk),
+			PageStart:          r.Chunk.PageStart,
+			PageEnd:            r.Chunk.PageEnd,
+			CitationDigest:     r.Chunk.CitationDigest,
+			SourceDigest:       r.Chunk.SourceDigest,
+			SourceOffsetStart:  r.Chunk.SourceOffsetStart,
+			SourceOffsetEnd:    r.Chunk.SourceOffsetEnd,
 		})
 	}
 	return hits
@@ -925,7 +937,13 @@ func hitsFromResults(selected []*SearchResult) []SearchHit {
 // chunkMetadata 暴露 chunk 的可过滤/可展示元数据（source_type、创建时间），
 // 让上层（API/UI/agent）能按维度筛选与回显。无可用字段时返回 nil（保持 JSON 干净）。
 func chunkMetadata(c *Chunk) map[string]any {
-	md := make(map[string]any, 7)
+	md := make(map[string]any, 9)
+	if c.DocumentGeneration > 0 {
+		md["document_generation"] = c.DocumentGeneration
+	}
+	if c.SemanticRevisionID != "" {
+		md["revision_id"] = c.SemanticRevisionID
+	}
 	if c.SourceType != "" {
 		md["source_type"] = c.SourceType
 	}
@@ -999,6 +1017,35 @@ func (m *Manager) QueryHitsWithFilter(ctx context.Context, query string, topK in
 	return formatSearchHits(hits), hits, nil
 }
 
+// QueryHitsWithFilterAtRevision executes every expanded query against one
+// caller-pinned immutable semantic revision. A searcher that cannot freeze and
+// execute the exact revision is rejected; it never falls back to a mutable
+// active pointer. Receipts expose the revision-bound query embeddings used by
+// the result for audit/replay.
+func (m *Manager) QueryHitsWithFilterAtRevision(
+	ctx context.Context,
+	expectedRevisionID string,
+	query string,
+	topK int,
+	filter Filter,
+) (string, []SearchHit, []QueryEmbeddingReceipt, error) {
+	expectedRevisionID = strings.TrimSpace(expectedRevisionID)
+	if expectedRevisionID == "" {
+		return "", nil, nil, fmt.Errorf(
+			"%w: expected revision is empty",
+			ErrRetrievalPlanUnavailable,
+		)
+	}
+	selected, receipts, err := m.searchResultsModeAtRevision(
+		ctx, query, topK, filter, true, expectedRevisionID,
+	)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	hits := hitsFromResults(selected)
+	return formatSearchHits(hits), hits, receipts, nil
+}
+
 // QueryHits 同 Query（fail-closed 严格地板），但同时返回格式化上下文与结构化命中列表。
 //
 // U9：引擎自动 RAG 注入点需要「注入了什么」的结构化命中回传前端渲染命中标签+详情。
@@ -1031,8 +1078,54 @@ func (m *Manager) searchResultsMode(
 	filter Filter,
 	strictFloor bool,
 ) ([]*SearchResult, []QueryEmbeddingReceipt, error) {
+	return m.searchResultsModeAtRevision(ctx, query, topK, filter, strictFloor, "")
+}
+
+func (m *Manager) searchResultsModeAtRevision(
+	ctx context.Context,
+	query string,
+	topK int,
+	filter Filter,
+	strictFloor bool,
+	expectedRevisionID string,
+) ([]*SearchResult, []QueryEmbeddingReceipt, error) {
+	// Freeze caller-owned slice fields before query expansion or any provider
+	// callback can run. Every text/vector lane in this request must consume the
+	// same normalized document-generation and chunk whitelist.
+	filter = filter.normalize()
 	if topK <= 0 {
 		topK = 3
+	}
+	expectedRevisionID = strings.TrimSpace(expectedRevisionID)
+	var (
+		planner    revisionSemanticPlanner
+		plan       activeRevisionSearchPlan
+		planActive bool
+	)
+	if m.revisionSearcher != nil {
+		planner, _ = m.revisionSearcher.(revisionSemanticPlanner)
+	}
+	if expectedRevisionID != "" && planner == nil {
+		return nil, nil, fmt.Errorf(
+			"%w: semantic searcher cannot pin revision %q",
+			ErrRetrievalPlanUnavailable,
+			expectedRevisionID,
+		)
+	}
+	if planner != nil {
+		var err error
+		plan, planActive, err = planner.FreezeRetrievalPlan(ctx, expectedRevisionID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if expectedRevisionID != "" &&
+			(!planActive || strings.TrimSpace(plan.revision) != expectedRevisionID) {
+			return nil, nil, fmt.Errorf(
+				"%w: expected revision %q",
+				ErrRetrievalPlanUnavailable,
+				expectedRevisionID,
+			)
+		}
 	}
 	if corpus, ok := m.repo.(SearchableCorpus); ok {
 		hasDocuments, err := corpus.HasSearchableDocuments(ctx)
@@ -1051,14 +1144,25 @@ func (m *Manager) searchResultsMode(
 
 	// 1. 查询扩展（#8 HyDE + multi-query）。向量能力待机时直接走原始 query
 	// 的 FTS 路径：自动注入没有语义证据本就 fail-closed，调用辅助 LLM 只会平添延迟。
-	revisionEmbeddingReady := m.revisionSearcher != nil
-	if readiness, ok := m.revisionSearcher.(RevisionSemanticReadiness); ok {
+	revisionEmbeddingReady := false
+	if planner != nil {
+		if planActive {
+			ready, readyErr := planner.RetrievalPlanReady(ctx, plan)
+			if readyErr != nil {
+				logger.Warn("[knowledge] frozen revision readiness 探测失败，跳过查询扩展", "error", readyErr)
+			} else {
+				revisionEmbeddingReady = ready
+			}
+		}
+	} else if readiness, ok := m.revisionSearcher.(RevisionSemanticReadiness); ok {
 		ready, readyErr := readiness.HasActiveRevision(ctx)
 		if readyErr != nil {
 			logger.Warn("[knowledge] active revision readiness 探测失败，跳过查询扩展", "error", readyErr)
 			ready = false
 		}
 		revisionEmbeddingReady = ready
+	} else {
+		revisionEmbeddingReady = m.revisionSearcher != nil
 	}
 	legacyEmbeddingReady := m.revisionSearcher == nil && m.embedder != nil && EmbeddingReady(ctx, m.embedder)
 	embeddingReady := revisionEmbeddingReady || legacyEmbeddingReady
@@ -1074,10 +1178,52 @@ func (m *Manager) searchResultsMode(
 	// vectorRouteRan：查询时向量路是否真实跑通。嵌入/向量搜索失败（如 embedding 服务
 	// 不可用）时无语义证据可要求，严格地板退回宽召回语义，避免降级态下 RAG 全盲。
 	vectorRouteRan := false
-	executionProfile, hasExecutionProfile := m.revisionExecutionProfile(ctx)
+	var executionProfile EmbeddingExecutionProfile
+	var hasExecutionProfile bool
+	if planActive {
+		executionProfile, hasExecutionProfile = EmbeddingExecutionProfileForModel(
+			plan.profile.Profile.ModelName,
+		)
+	} else if planner == nil {
+		executionProfile, hasExecutionProfile = m.revisionExecutionProfile(ctx)
+	}
+	receiptRevisionID := ""
+	if planActive {
+		receiptRevisionID = plan.revision
+	}
 
 	for _, q := range queries {
-		if m.revisionSearcher != nil {
+		if planner != nil && planActive {
+			// The plan was resolved once before query expansion and is reused for
+			// every vector scan. An active-revision CAS during this loop cannot
+			// move later queries onto another vector space.
+			timeout := queryEmbedTimeout
+			if hasExecutionProfile && executionProfile.QueryTimeout > 0 {
+				timeout = executionProfile.QueryTimeout
+			}
+			rctx, rcancel := context.WithTimeout(ragEmbedContext(ctx), timeout)
+			vres, ran, receipt, vErr := planner.SearchWithPlanReceipt(
+				rctx, plan, q, candidateK, filter,
+			)
+			rcancel()
+			if vErr != nil {
+				if !errors.Is(vErr, ErrEmbeddingUnavailable) {
+					logger.Error("[knowledge] frozen revision 向量搜索失败", "error", vErr)
+				}
+			} else if ran {
+				if err := appendQueryEmbeddingReceipt(
+					&receipts, &receiptRevisionID, receipt,
+				); err != nil {
+					return nil, nil, err
+				}
+				list, err := mergeRanked(resultMap, vres, true)
+				if err != nil {
+					return nil, nil, err
+				}
+				rankedLists = append(rankedLists, list)
+				vectorRouteRan = true
+			}
+		} else if planner == nil && m.revisionSearcher != nil {
 			// Query embedding and vector scan are one revision-bound operation:
 			// both use the immutable active profile snapshot. No fallback to the
 			// legacy embedder is allowed when no active revision exists.
@@ -1107,11 +1253,19 @@ func (m *Manager) searchResultsMode(
 					logger.Error("[knowledge] active revision 向量搜索失败", "error", vErr)
 				}
 			} else if ran {
-				rankedLists = append(rankedLists, mergeRanked(resultMap, vres, true))
-				vectorRouteRan = true
 				if receipt != nil {
-					receipts = append(receipts, *receipt)
+					if err := appendQueryEmbeddingReceipt(
+						&receipts, &receiptRevisionID, receipt,
+					); err != nil {
+						return nil, nil, err
+					}
 				}
+				list, err := mergeRanked(resultMap, vres, true)
+				if err != nil {
+					return nil, nil, err
+				}
+				rankedLists = append(rankedLists, list)
+				vectorRouteRan = true
 			}
 		} else if legacyEmbeddingReady {
 			// 查询向量化预算（BUG-20260703 同构防护，对齐 engine 记忆召回）：检索是增强，
@@ -1135,14 +1289,20 @@ func (m *Manager) searchResultsMode(
 				if vErr != nil {
 					logger.Error("[knowledge] 向量搜索失败", "error", vErr)
 				} else {
-					rankedLists = append(rankedLists, mergeRanked(resultMap, vres, true))
+					list, mergeErr := mergeRanked(resultMap, vres, true)
+					if mergeErr != nil {
+						return nil, nil, mergeErr
+					}
+					rankedLists = append(rankedLists, list)
 					vectorRouteRan = true
 				}
 			}
 		}
 		var tres []*SearchResult
 		var tErr error
-		if m.revisionSearcher != nil {
+		if planner != nil && planActive {
+			tres, tErr = planner.TextSearchWithPlan(ctx, plan, q, candidateK, filter)
+		} else if m.revisionSearcher != nil {
 			tres, tErr = m.revisionSearcher.TextSearch(ctx, q, candidateK, filter)
 		} else {
 			tres, tErr = m.searcher.TextSearch(ctx, q, candidateK, filter)
@@ -1150,7 +1310,16 @@ func (m *Manager) searchResultsMode(
 		if tErr != nil {
 			logger.Error("[knowledge] 关键词搜索失败", "error", tErr)
 		} else {
-			rankedLists = append(rankedLists, mergeRanked(resultMap, tres, false))
+			list, mergeErr := mergeRanked(resultMap, tres, false)
+			if mergeErr != nil {
+				return nil, nil, mergeErr
+			}
+			rankedLists = append(rankedLists, list)
+		}
+	}
+	if planner != nil && planActive {
+		if err := planner.ValidateRetrievalPlan(ctx, plan); err != nil {
+			return nil, nil, err
 		}
 	}
 
@@ -1195,22 +1364,26 @@ type rankedList struct {
 
 // mergeRanked 把一路搜索结果并入 resultMap（按 chunkID 去重，向量/文本分各取较大），
 // 返回该路的有序候选列表（带模态，喂给 RRF 融合）。isVector 决定合并哪类分数。
-func mergeRanked(resultMap map[string]*SearchResult, results []*SearchResult, isVector bool) rankedList {
+func mergeRanked(
+	resultMap map[string]*SearchResult,
+	results []*SearchResult,
+	isVector bool,
+) (rankedList, error) {
 	ids := make([]string, 0, len(results))
 	for _, r := range results {
+		if r == nil || r.Chunk == nil || strings.TrimSpace(r.Chunk.ID) == "" {
+			return rankedList{}, fmt.Errorf(
+				"%w: search result has no chunk identity",
+				ErrRetrievalEvidenceConflict,
+			)
+		}
 		cur, ok := resultMap[r.Chunk.ID]
 		if !ok {
 			resultMap[r.Chunk.ID] = r
 			cur = r
 		} else {
-			if cur.Chunk.Content == "" && r.Chunk.Content != "" {
-				cur.Chunk.Content = r.Chunk.Content
-			}
-			if len(cur.Chunk.Embedding) == 0 && len(r.Chunk.Embedding) > 0 {
-				cur.Chunk.Embedding = r.Chunk.Embedding
-			}
-			if cur.Chunk.CreatedAt.IsZero() && !r.Chunk.CreatedAt.IsZero() {
-				cur.Chunk.CreatedAt = r.Chunk.CreatedAt
+			if err := mergeChunkProvenance(cur.Chunk, r.Chunk); err != nil {
+				return rankedList{}, err
 			}
 		}
 		if isVector {
@@ -1222,7 +1395,137 @@ func mergeRanked(resultMap map[string]*SearchResult, results []*SearchResult, is
 		}
 		ids = append(ids, r.Chunk.ID)
 	}
-	return rankedList{ids: ids, isVector: isVector}
+	return rankedList{ids: ids, isVector: isVector}, nil
+}
+
+func appendQueryEmbeddingReceipt(
+	receipts *[]QueryEmbeddingReceipt,
+	expectedRevisionID *string,
+	receipt *QueryEmbeddingReceipt,
+) error {
+	if receipt == nil {
+		return fmt.Errorf(
+			"%w: revision-bound vector route returned no receipt",
+			ErrRetrievalEvidenceConflict,
+		)
+	}
+	revisionID := strings.TrimSpace(receipt.RevisionID)
+	if revisionID == "" {
+		return fmt.Errorf(
+			"%w: query embedding receipt has no revision",
+			ErrRetrievalEvidenceConflict,
+		)
+	}
+	if *expectedRevisionID == "" {
+		*expectedRevisionID = revisionID
+	} else if revisionID != *expectedRevisionID {
+		return fmt.Errorf(
+			"%w: query embedding revisions %q and %q differ",
+			ErrRetrievalEvidenceConflict,
+			*expectedRevisionID,
+			revisionID,
+		)
+	}
+	*receipts = append(*receipts, *receipt)
+	return nil
+}
+
+func mergeChunkProvenance(current, incoming *Chunk) error {
+	if current == nil || incoming == nil || current.ID != incoming.ID {
+		return fmt.Errorf(
+			"%w: cannot merge different chunk identities",
+			ErrRetrievalEvidenceConflict,
+		)
+	}
+	if conflictingNonEmpty(current.DocID, incoming.DocID) ||
+		conflictingPositiveInt64(current.DocumentGeneration, incoming.DocumentGeneration) ||
+		conflictingNonEmpty(current.SemanticRevisionID, incoming.SemanticRevisionID) ||
+		conflictingNonEmpty(current.Source, incoming.Source) ||
+		conflictingNonEmpty(current.SourceType, incoming.SourceType) ||
+		conflictingNonEmpty(current.Content, incoming.Content) ||
+		conflictingNonEmpty(current.CitationDigest, incoming.CitationDigest) ||
+		conflictingNonEmpty(current.SourceDigest, incoming.SourceDigest) ||
+		conflictingPageRange(current, incoming) ||
+		conflictingSourceOffsets(current, incoming) {
+		return fmt.Errorf(
+			"%w: chunk %q has inconsistent provenance",
+			ErrRetrievalEvidenceConflict,
+			current.ID,
+		)
+	}
+	fillMissingChunkProvenance(current, incoming)
+	return nil
+}
+
+func conflictingNonEmpty(left, right string) bool {
+	return left != "" && right != "" && left != right
+}
+
+func conflictingPositiveInt64(left, right int64) bool {
+	return left > 0 && right > 0 && left != right
+}
+
+func conflictingPageRange(left, right *Chunk) bool {
+	leftSet := left.PageStart > 0 || left.PageEnd > 0
+	rightSet := right.PageStart > 0 || right.PageEnd > 0
+	return leftSet && rightSet &&
+		(left.PageStart != right.PageStart || left.PageEnd != right.PageEnd)
+}
+
+func conflictingSourceOffsets(left, right *Chunk) bool {
+	leftSet := left.SourceOffsetEnd > left.SourceOffsetStart
+	rightSet := right.SourceOffsetEnd > right.SourceOffsetStart
+	return leftSet && rightSet &&
+		(left.SourceOffsetStart != right.SourceOffsetStart ||
+			left.SourceOffsetEnd != right.SourceOffsetEnd)
+}
+
+func fillMissingChunkProvenance(current, incoming *Chunk) {
+	if current.DocID == "" {
+		current.DocID = incoming.DocID
+	}
+	if current.DocumentGeneration == 0 {
+		current.DocumentGeneration = incoming.DocumentGeneration
+	}
+	if current.SemanticRevisionID == "" {
+		current.SemanticRevisionID = incoming.SemanticRevisionID
+	}
+	if current.DocTitle == "" {
+		current.DocTitle = incoming.DocTitle
+	}
+	if current.Source == "" {
+		current.Source = incoming.Source
+	}
+	if current.SourceType == "" {
+		current.SourceType = incoming.SourceType
+	}
+	if current.ChunkCount == 0 {
+		current.ChunkCount = incoming.ChunkCount
+	}
+	if current.Content == "" {
+		current.Content = incoming.Content
+	}
+	if len(current.Embedding) == 0 && len(incoming.Embedding) > 0 {
+		current.Embedding = incoming.Embedding
+	}
+	if current.CreatedAt.IsZero() && !incoming.CreatedAt.IsZero() {
+		current.CreatedAt = incoming.CreatedAt
+	}
+	if current.PageStart == 0 && current.PageEnd == 0 {
+		current.PageStart = incoming.PageStart
+		current.PageEnd = incoming.PageEnd
+	}
+	if current.CitationDigest == "" {
+		current.CitationDigest = incoming.CitationDigest
+	}
+	if current.SourceDigest == "" {
+		current.SourceDigest = incoming.SourceDigest
+	}
+	if current.SourceOffsetEnd <= current.SourceOffsetStart &&
+		incoming.SourceOffsetEnd > incoming.SourceOffsetStart {
+		current.SourceOffsetStart = incoming.SourceOffsetStart
+		current.SourceOffsetEnd = incoming.SourceOffsetEnd
+	}
 }
 
 // fuse 用「分数加权 RRF」（#9/#11，默认）或朴素加权和（回退）给候选打分，并施加时间衰减。
