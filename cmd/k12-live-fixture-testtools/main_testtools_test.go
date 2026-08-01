@@ -13,10 +13,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
@@ -53,6 +55,9 @@ func newIsolatedCLIStore(t *testing.T) (profile, storePath, manifestPath string)
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(storePath, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return profile, storePath, filepath.Join(profile, "fixture-manifest.json")
@@ -405,6 +410,209 @@ func TestCLIGoRunProvidesDesktopRunnerHandoffAgainstDiskStore(t *testing.T) {
 		}
 	}
 	assertDispatchesGone(t, storePath, manifest)
+}
+
+// K12-LIVE-ISOLATED-CONFIG-001: an authorized real-model lane must never run
+// from the caller's production profile.  The test fixture is synthetic: it
+// exercises preparation only and cannot call a model or IM platform.
+func TestPrepareProfileBuildsPrivateExactModelConfigWithoutPlatformCarryover(t *testing.T) {
+	profile, storePath, _ := newIsolatedCLIStore(t)
+	sourceDir := t.TempDir()
+	sourcePath := filepath.Join(sourceDir, "source.yaml")
+	candidatePolicyPath := filepath.Join(sourceDir, "candidate-policy.json")
+
+	trueValue := true
+	source := config.DefaultConfig()
+	source.LLM.Default = "hexclaw-gpt"
+	source.LLM.Providers = map[string]config.LLMProviderConfig{
+		"hexclaw-gpt": {
+			APIKey:      "test-key-must-not-leak",
+			BaseURL:     "https://test.invalid/v1",
+			Model:       "gpt-5.6-sol",
+			Models:      []string{"gpt-5.6-sol"},
+			DisplayName: "HexClaw-GPT",
+			Enabled:     &trueValue,
+		},
+		"other-provider": {APIKey: "must-not-survive", Model: "other-model"},
+	}
+	if err := config.Save(source, sourcePath); err != nil {
+		t.Fatal(err)
+	}
+	policy := []byte(`{"policy_version":1,"queued_seconds":600,"normalizing_seconds":600,"recognizing_seconds":600,"locating_seconds":600,"rendering_seconds":600,"projecting_seconds":600,"assessing_buckets":[{"max_problems":1,"seconds":600},{"max_problems":8,"seconds":600},{"max_problems":16,"seconds":600},{"max_problems":32,"seconds":600}],"item_concurrency":1}`)
+	if err := os.WriteFile(candidatePolicyPath, policy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, err := executeCLI([]string{
+		"prepare-profile",
+		"--source-config", sourcePath,
+		"--profile", profile,
+		"--store", storePath,
+		"--port", "16129",
+		"--candidate-policy", candidatePolicyPath,
+	})
+	if err != nil {
+		t.Fatalf("prepare profile: %v\\nstderr=%s", err, stderr)
+	}
+	for _, forbidden := range []string{"test-key-must-not-leak", "test.invalid", "must-not-survive"} {
+		if strings.Contains(stdout+stderr, forbidden) {
+			t.Fatalf("prepare receipt leaked %q: %s%s", forbidden, stdout, stderr)
+		}
+	}
+
+	preparedPath := filepath.Join(profile, ".hexclaw", "hexclaw.yaml")
+	preparedInfo, err := os.Stat(preparedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := preparedInfo.Mode().Perm(); got != 0o600 {
+		t.Fatalf("prepared config mode=%#o, want 0600", got)
+	}
+	prepared, err := config.Load(preparedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedStore, err := filepath.EvalSymlinks(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.Server.Host != "127.0.0.1" || prepared.Server.Port != 16129 ||
+		prepared.Storage.SQLite.Path != resolvedStore {
+		t.Fatalf("prepared runtime drift: server=%s:%d store=%s", prepared.Server.Host, prepared.Server.Port, prepared.Storage.SQLite.Path)
+	}
+	if prepared.LLM.Default != "hexclaw-gpt" || len(prepared.LLM.Providers) != 1 ||
+		prepared.LLM.Providers["hexclaw-gpt"].Model != "gpt-5.6-sol" {
+		t.Fatalf("prepared model exact-set drift: %+v", prepared.LLM)
+	}
+	if len(prepared.Platforms.Dingtalk) != 0 || len(prepared.Platforms.Feishu) != 0 ||
+		prepared.Heartbeat.Enabled || prepared.Cron.Enabled {
+		t.Fatalf("prepared profile retained external platform/background settings: %+v", prepared.Platforms)
+	}
+	if prepared.K12.GradingBudget.IsZero() || prepared.K12.GradingBudget.PolicyVersion != 1 {
+		t.Fatalf("candidate policy was not preserved: %+v", prepared.K12.GradingBudget)
+	}
+}
+
+// K12-LIVE-ISOLATED-CONFIG-001: preparation fails before it can create or
+// replace an isolated configuration when caller-owned inputs are unsafe or do
+// not describe the one authorized provider/model.
+func TestPrepareProfileFailsClosedForUnsafeInputsAndExistingTarget(t *testing.T) {
+	newInputs := func(t *testing.T, model string) (string, string) {
+		t.Helper()
+		dir := t.TempDir()
+		sourcePath := filepath.Join(dir, "source.yaml")
+		candidatePolicyPath := filepath.Join(dir, "candidate-policy.json")
+		enabled := true
+		source := config.DefaultConfig()
+		source.LLM.Default = "hexclaw-gpt"
+		source.LLM.Providers = map[string]config.LLMProviderConfig{
+			"hexclaw-gpt": {
+				APIKey:  "test-key-must-not-leak",
+				BaseURL: "https://test.invalid/v1",
+				Model:   model, Models: []string{model},
+				DisplayName: "HexClaw-GPT", Enabled: &enabled,
+			},
+		}
+		if err := config.Save(source, sourcePath); err != nil {
+			t.Fatal(err)
+		}
+		policy := []byte(`{"policy_version":1,"queued_seconds":600,"normalizing_seconds":600,"recognizing_seconds":600,"locating_seconds":600,"rendering_seconds":600,"projecting_seconds":600,"assessing_buckets":[{"max_problems":1,"seconds":600},{"max_problems":8,"seconds":600},{"max_problems":16,"seconds":600},{"max_problems":32,"seconds":600}],"item_concurrency":1}`)
+		if err := os.WriteFile(candidatePolicyPath, policy, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return sourcePath, candidatePolicyPath
+	}
+
+	run := func(t *testing.T, profile, storePath, sourcePath, candidatePolicyPath string, port int) {
+		t.Helper()
+		before := fileSHA256(t, storePath)
+		stdout, stderr, err := executeCLI([]string{
+			"prepare-profile",
+			"--source-config", sourcePath,
+			"--profile", profile,
+			"--store", storePath,
+			"--port", strconv.Itoa(port),
+			"--candidate-policy", candidatePolicyPath,
+		})
+		if err == nil {
+			t.Fatalf("unsafe preparation unexpectedly succeeded: stdout=%s stderr=%s", stdout, stderr)
+		}
+		if strings.Contains(stdout+stderr, "test-key-must-not-leak") {
+			t.Fatalf("failure output leaked source credential: %s%s", stdout, stderr)
+		}
+		if got := fileSHA256(t, storePath); got != before {
+			t.Fatalf("preparation changed isolated store: before=%s after=%s", before, got)
+		}
+	}
+
+	t.Run("unsafe source mode", func(t *testing.T) {
+		profile, storePath, _ := newIsolatedCLIStore(t)
+		sourcePath, policyPath := newInputs(t, "gpt-5.6-sol")
+		if err := os.Chmod(sourcePath, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run(t, profile, storePath, sourcePath, policyPath, 16129)
+		if _, err := os.Stat(filepath.Join(profile, ".hexclaw", "hexclaw.yaml")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("unsafe source created target config: %v", err)
+		}
+	})
+
+	t.Run("unsafe candidate policy mode", func(t *testing.T) {
+		profile, storePath, _ := newIsolatedCLIStore(t)
+		sourcePath, policyPath := newInputs(t, "gpt-5.6-sol")
+		if err := os.Chmod(policyPath, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run(t, profile, storePath, sourcePath, policyPath, 16129)
+	})
+
+	t.Run("wrong provider model", func(t *testing.T) {
+		profile, storePath, _ := newIsolatedCLIStore(t)
+		sourcePath, policyPath := newInputs(t, "gpt-5.6")
+		run(t, profile, storePath, sourcePath, policyPath, 16129)
+	})
+
+	t.Run("reserved UI port", func(t *testing.T) {
+		profile, storePath, _ := newIsolatedCLIStore(t)
+		sourcePath, policyPath := newInputs(t, "gpt-5.6-sol")
+		run(t, profile, storePath, sourcePath, policyPath, 16060)
+	})
+
+	t.Run("profile and store permissions", func(t *testing.T) {
+		t.Run("profile", func(t *testing.T) {
+			profile, storePath, _ := newIsolatedCLIStore(t)
+			sourcePath, policyPath := newInputs(t, "gpt-5.6-sol")
+			if err := os.Chmod(profile, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			run(t, profile, storePath, sourcePath, policyPath, 16129)
+		})
+		t.Run("store", func(t *testing.T) {
+			profile, storePath, _ := newIsolatedCLIStore(t)
+			sourcePath, policyPath := newInputs(t, "gpt-5.6-sol")
+			if err := os.Chmod(storePath, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			run(t, profile, storePath, sourcePath, policyPath, 16129)
+		})
+	})
+
+	t.Run("existing target is never overwritten", func(t *testing.T) {
+		profile, storePath, _ := newIsolatedCLIStore(t)
+		sourcePath, policyPath := newInputs(t, "gpt-5.6-sol")
+		target := filepath.Join(profile, ".hexclaw", "hexclaw.yaml")
+		if err := os.WriteFile(target, []byte("do-not-overwrite"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		run(t, profile, storePath, sourcePath, policyPath, 16129)
+		contents, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(contents) != "do-not-overwrite" {
+			t.Fatalf("existing isolated config was overwritten: %q", contents)
+		}
+	})
 }
 
 func sortStrings(values []string) {

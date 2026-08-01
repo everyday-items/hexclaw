@@ -92,6 +92,15 @@ type cleanupOptions struct {
 	manifest string
 }
 
+// prepareProfileOptions deliberately has no default policy, source profile, or
+// network endpoint. A caller must supply every real-boundary input explicitly.
+type prepareProfileOptions struct {
+	commonOptions
+	sourceConfig    string
+	candidatePolicy string
+	port            int
+}
+
 type resolvedCommon struct {
 	profile string
 	store   string
@@ -126,10 +135,16 @@ func execute(
 	}
 	if len(args) == 0 {
 		return errors.New(
-			"expected start, cleanup, scavenge, or partial-ledger-evidence-diagnostic",
+			"expected prepare-profile, start, cleanup, scavenge, or partial-ledger-evidence-diagnostic",
 		)
 	}
 	switch args[0] {
+	case "prepare-profile":
+		options, err := parsePrepareProfileOptions(args[1:], stderr)
+		if err != nil {
+			return err
+		}
+		return executePrepareProfile(options, stdout)
 	case "start":
 		options, err := parseStartOptions(args[1:], stderr)
 		if err != nil {
@@ -156,10 +171,33 @@ func execute(
 		return executePartialLedgerEvidenceDiagnostic(ctx, options, stdout)
 	default:
 		return errors.New(
-			"unknown command; expected start, cleanup, scavenge, or " +
+			"unknown command; expected prepare-profile, start, cleanup, scavenge, or " +
 				"partial-ledger-evidence-diagnostic",
 		)
 	}
+}
+
+func parsePrepareProfileOptions(args []string, stderr io.Writer) (prepareProfileOptions, error) {
+	var options prepareProfileOptions
+	flags := flag.NewFlagSet("prepare-profile", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	flags.StringVar(&options.sourceConfig, "source-config", "", "caller-owned 0600 source config")
+	flags.StringVar(&options.profile, "profile", "", "new isolated /tmp profile")
+	flags.StringVar(&options.store, "store", "", "existing isolated SQLite store")
+	flags.StringVar(&options.candidatePolicy, "candidate-policy", "", "caller-owned 0600 candidate policy JSON")
+	flags.IntVar(&options.port, "port", 0, "isolated loopback Sidecar port")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
+		return prepareProfileOptions{}, errors.New("invalid prepare-profile arguments")
+	}
+	if strings.TrimSpace(options.sourceConfig) == "" ||
+		strings.TrimSpace(options.candidatePolicy) == "" ||
+		options.port < 1024 || options.port > 65535 ||
+		options.port == 16060 || options.port == 18080 {
+		return prepareProfileOptions{}, errors.New(
+			"prepare-profile requires source config, candidate policy, and an isolated port",
+		)
+	}
+	return options, nil
 }
 
 func parseStartOptions(args []string, stderr io.Writer) (startOptions, error) {
@@ -356,8 +394,8 @@ func resolveCommon(options commonOptions) (resolvedCommon, error) {
 	if err != nil || !profileInfo.IsDir() {
 		return resolvedCommon{}, errors.New("isolated profile must be an existing directory")
 	}
-	if profileInfo.Mode().Perm()&0o077 != 0 {
-		return resolvedCommon{}, errors.New("isolated profile permissions are too broad")
+	if profileInfo.Mode().Perm() != 0o700 {
+		return resolvedCommon{}, errors.New("isolated profile permissions must be 0700")
 	}
 	if !strictDescendant(tempRoot, profile) {
 		return resolvedCommon{}, errors.New("isolated profile must be below /tmp")
@@ -370,6 +408,9 @@ func resolveCommon(options commonOptions) (resolvedCommon, error) {
 	storeInfo, err := os.Stat(store)
 	if err != nil || !storeInfo.Mode().IsRegular() {
 		return resolvedCommon{}, errors.New("isolated store must be an existing regular file")
+	}
+	if storeInfo.Mode().Perm() != 0o600 {
+		return resolvedCommon{}, errors.New("isolated store permissions must be 0600")
 	}
 	if !strictDescendant(profile, store) {
 		return resolvedCommon{}, errors.New("isolated store must be inside profile")
