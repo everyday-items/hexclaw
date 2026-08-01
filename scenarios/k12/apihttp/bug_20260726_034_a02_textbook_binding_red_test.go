@@ -85,6 +85,16 @@ func seedBUG20260726034A02Manifest(
 		t.Fatalf("seed manifest %s: %v", manifestID, err)
 	}
 	if state == "ready_for_confirmation" {
+		if _, err := db.Exec(`INSERT INTO k12_textbook_page_mappings
+			(mapping_id,manifest_id,logical_page,pdf_page,evidence_page,
+			 evidence_offset_start,evidence_offset_end,evidence_digest,method,
+			 verification_state,document_id,document_generation,source_digest,
+			 created_at,updated_at)
+			VALUES(?,?,1,1,1,0,1,?,'printed_anchor','verified',?,?,?,1,1)`,
+			"manifest-page-proof-"+manifestID, manifestID, strings.Repeat("c", 64),
+			documentID, generation, strings.Repeat("a", 64)); err != nil {
+			t.Fatalf("seed manifest page proof %s: %v", manifestID, err)
+		}
 		if _, err := db.Exec(`INSERT INTO k12_textbook_manifest_segments
 			(segment_id,manifest_id,logical_page,segment_ref,pdf_page,document_id,
 			 document_generation,source_digest,created_at,updated_at)
@@ -184,12 +194,12 @@ func TestBUG20260726034A02_BindingOptionsExactStatesAndDefaultModelFailure(t *te
 	fixtures := []struct {
 		id, owner, doc, state, failure string
 	}{
-		{"manifest-waiting", "mingming", "doc-waiting", "waiting_ingest", ""},
-		{"manifest-extracting", "mingming", "doc-extracting", "extracting", ""},
-		{"manifest-ready", "mingming", "doc-ready", "ready_for_confirmation", ""},
-		{"manifest-no-model", "mingming", "doc-no-model", "failed_retryable", "默认模型未配置"},
-		{"manifest-terminal", "mingming", "doc-terminal", "failed_terminal", "识别失败"},
-		{"manifest-stale", "mingming", "doc-stale", "stale", "源已失效"},
+		{"manifest-waiting", "desktop-user", "doc-waiting", "waiting_ingest", ""},
+		{"manifest-extracting", "desktop-user", "doc-extracting", "extracting", ""},
+		{"manifest-ready", "desktop-user", "doc-ready", "ready_for_confirmation", ""},
+		{"manifest-no-model", "desktop-user", "doc-no-model", "failed_retryable", "默认模型未配置"},
+		{"manifest-terminal", "desktop-user", "doc-terminal", "failed_terminal", "识别失败"},
+		{"manifest-stale", "desktop-user", "doc-stale", "stale", "源已失效"},
 		{"manifest-other", "other", "doc-other", "ready_for_confirmation", ""},
 	}
 	for _, fixture := range fixtures {
@@ -240,7 +250,7 @@ func TestBUG20260726034A02_ProfileBundleCreatesServerBindingAtomically(t *testin
 	h, deps, _ := newWeeklyContractServer(t)
 	db := deps.Records.DB()
 	seedBUG20260726034A02Manifest(
-		t, db, "manifest-ready", "mingming", "doc-ready", 1,
+		t, db, "manifest-ready", "desktop-user", "doc-ready", 1,
 		"ready_for_confirmation", "",
 	)
 	rec, body := do(t, h, http.MethodPut, "/profile-bundle",
@@ -269,7 +279,7 @@ func TestBUG20260726034A02_ProfileBundleCreatesServerBindingAtomically(t *testin
 	); err != nil {
 		t.Fatal(err)
 	}
-	if ownerID != "mingming" || agentName != "mingming" ||
+	if ownerID != "desktop-user" || agentName != "mingming" ||
 		manifestID != "manifest-ready" || documentID != "doc-ready" ||
 		generation != 1 || status != "active" {
 		t.Fatalf("server-derived binding drifted: %s/%s/%s/%s/%d/%s",
@@ -304,7 +314,7 @@ func TestBUG20260726034A02_ProfileBundleFailureRollsBackFourAggregates(t *testin
 	h, deps, _ := newWeeklyContractServer(t)
 	db := deps.Records.DB()
 	seedBUG20260726034A02Manifest(
-		t, db, "manifest-not-ready", "mingming", "doc-not-ready", 1,
+		t, db, "manifest-not-ready", "desktop-user", "doc-not-ready", 1,
 		"failed_retryable", "默认模型未配置",
 	)
 	before := snapshotBUG20260726034A02AtomicState(t, db)
@@ -325,11 +335,11 @@ func TestBUG20260726034A02_ProfileBundleConcurrentCASHasOneWinner(t *testing.T) 
 	h, deps, _ := newWeeklyContractServer(t)
 	db := deps.Records.DB()
 	seedBUG20260726034A02Manifest(
-		t, db, "manifest-a", "mingming", "doc-a", 1,
+		t, db, "manifest-a", "desktop-user", "doc-a", 1,
 		"ready_for_confirmation", "",
 	)
 	seedBUG20260726034A02Manifest(
-		t, db, "manifest-b", "mingming", "doc-b", 1,
+		t, db, "manifest-b", "desktop-user", "doc-b", 1,
 		"ready_for_confirmation", "",
 	)
 	const workers = 16
@@ -387,7 +397,7 @@ func TestBUG20260726034A02_ProfileBundleConcurrentCASHasOneWinner(t *testing.T) 
 	}
 	var active int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM k12_textbook_bindings
-		WHERE owner_id='mingming' AND agent_name='mingming' AND subject='math'
+		WHERE owner_id='desktop-user' AND agent_name='mingming' AND subject='math'
 		  AND status='active'`).Scan(&active); err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +415,7 @@ func TestBUG20260726034A02_TombstoneAndNewGenerationInvalidateBinding(t *testing
 	h, deps, _ := newWeeklyContractServer(t)
 	db := deps.Records.DB()
 	seedBUG20260726034A02Manifest(
-		t, db, "manifest-v1", "mingming", "doc-generation", 1,
+		t, db, "manifest-v1", "desktop-user", "doc-generation", 1,
 		"ready_for_confirmation", "",
 	)
 	rec, body := do(t, h, http.MethodPut, "/profile-bundle",
@@ -417,7 +427,7 @@ func TestBUG20260726034A02_TombstoneAndNewGenerationInvalidateBinding(t *testing
 	if _, err := db.Exec(`UPDATE kb_semantic_document_bindings
 		SET lifecycle_state='tombstoned',text_state='failed',deleted_at=2,
 		    version=version+1,updated_at=2
-		WHERE owner_id='mingming' AND document_id='doc-generation'
+		WHERE owner_id='desktop-user' AND document_id='doc-generation'
 		  AND content_generation=1`); err != nil {
 		t.Fatal(err)
 	}
@@ -439,17 +449,17 @@ func TestBUG20260726034A02_TombstoneAndNewGenerationInvalidateBinding(t *testing
 
 	if _, err := db.Exec(`INSERT INTO kb_semantic_document_generations
 		(owner_id,corpus_uid,document_id,content_generation,created_at)
-		VALUES('mingming','corpus-mingming','doc-generation',2,2)`); err != nil {
+		VALUES('desktop-user','corpus-desktop-user','doc-generation',2,2)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`UPDATE kb_semantic_document_bindings
 		SET content_generation=2,lifecycle_state='active',text_state='ready',
 		    deleted_at=NULL,version=version+1,updated_at=3
-		WHERE owner_id='mingming' AND document_id='doc-generation'`); err != nil {
+		WHERE owner_id='desktop-user' AND document_id='doc-generation'`); err != nil {
 		t.Fatal(err)
 	}
 	seedBUG20260726034A02Manifest(
-		t, db, "manifest-v2", "mingming", "doc-generation", 2,
+		t, db, "manifest-v2", "desktop-user", "doc-generation", 2,
 		"ready_for_confirmation", "",
 	)
 	rec, options := do(t, h, http.MethodGet,

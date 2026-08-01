@@ -26,7 +26,6 @@ type textbookManifestDocumentRef struct {
 
 type textbookManifestFacts struct {
 	knowledgeOwnerID string
-	manifestOwnerID  string
 	corpusUID        string
 	documentID       string
 	generation       int64
@@ -44,6 +43,8 @@ type textbookManifestFacts struct {
 	failureCode      string
 	actionCode       string
 	deleted          bool
+	catalogJobState  string
+	catalogJobError  string
 }
 
 type textbookManifestSegment struct {
@@ -102,7 +103,7 @@ func reconcileTextbookManifestCandidates(
 		LEFT JOIN kb_ingest_document_sources s
 		  ON s.document_id=b.document_id
 		 AND s.content_generation=b.content_generation
-		WHERE (b.owner_id=? OR s.agent_id=?)
+		WHERE b.owner_id=?
 		  AND (
 		    lower(COALESCE(s.extension,''))='.pdf'
 		    OR lower(COALESCE(s.media_type,''))='application/pdf'
@@ -116,7 +117,7 @@ func reconcileTextbookManifestCandidates(
 		    )
 		  )
 		ORDER BY b.document_id,b.content_generation`,
-		ownerID, ownerID, ownerID)
+		ownerID, ownerID)
 	if err != nil {
 		return fmt.Errorf("k12storage: list textbook manifest candidates: %w", err)
 	}
@@ -174,7 +175,7 @@ func reconcileTextbookManifestDocumentTx(
 		loadExistingTextbookManifestTx(
 			ctx,
 			tx,
-			facts.manifestOwnerID,
+			facts.knowledgeOwnerID,
 			documentID,
 			generation,
 		)
@@ -212,7 +213,7 @@ func reconcileTextbookManifestDocumentTx(
 	manifestID := existingID
 	if manifestID == "" {
 		manifestID = textbookManifestID(
-			facts.manifestOwnerID,
+			facts.knowledgeOwnerID,
 			documentID,
 			generation,
 		)
@@ -224,7 +225,7 @@ func reconcileTextbookManifestDocumentTx(
 		VALUES(?,?,?,?,?,'math',?,'waiting_ingest',0,'','pending','pending',NULL,NULL,?,?)
 		ON CONFLICT(owner_id,document_id,document_generation,subject) DO NOTHING`,
 		manifestID,
-		facts.manifestOwnerID,
+		facts.knowledgeOwnerID,
 		documentID,
 		generation,
 		facts.title,
@@ -241,7 +242,7 @@ func reconcileTextbookManifestDocumentTx(
 		WHERE owner_id=? AND document_id=? AND subject='math'
 		  AND document_generation<>? AND state<>'stale'`,
 		at,
-		facts.manifestOwnerID,
+		facts.knowledgeOwnerID,
 		documentID,
 		generation,
 	); err != nil {
@@ -252,52 +253,46 @@ func reconcileTextbookManifestDocumentTx(
 		WHERE owner_id=? AND document_id=? AND status='active'
 		  AND document_generation<>?`,
 		at,
-		facts.manifestOwnerID,
+		facts.knowledgeOwnerID,
 		documentID,
 		generation,
 	); err != nil {
 		return fmt.Errorf("k12storage: invalidate replaced textbook bindings: %w", err)
 	}
 
-	segments := make([]textbookManifestSegment, 0)
+	segmentCount := 0
 	if facts.lifecycleState == "active" && !facts.deleted &&
 		facts.textState == "ready" {
-		segments, err = loadTextbookManifestSegmentsTx(
-			ctx,
-			tx,
-			documentID,
-			facts.sourceDigest,
-		)
+		segmentCount, err = loadVerifiedTextbookSegmentCountTx(ctx, tx, manifestID)
 		if err != nil {
 			return err
 		}
-		for _, segment := range segments {
-			for page := segment.pageStart; page <= segment.pageEnd; page++ {
-				segmentID := textbookManifestSegmentID(manifestID, page, segment.ref)
-				if _, err := tx.ExecContext(ctx, `INSERT INTO k12_textbook_manifest_segments
-					(segment_id,manifest_id,logical_page,segment_ref,pdf_page,document_id,
-					 document_generation,source_digest,created_at,updated_at)
-					VALUES(?,?,?,?,?,?,?,?,?,?)
-					ON CONFLICT(manifest_id,logical_page,segment_ref) DO NOTHING`,
-					segmentID,
-					manifestID,
-					page,
-					segment.ref,
-					page,
-					documentID,
-					generation,
-					facts.sourceDigest,
-					at,
-					at,
-				); err != nil {
-					return fmt.Errorf("k12storage: create textbook manifest segment: %w", err)
-				}
+		if segmentCount == 0 && catalog.Valid &&
+			strings.TrimSpace(catalog.String) != "" {
+			if err := clearUnverifiedTextbookCatalogArtifactsTx(
+				ctx, tx, manifestID, at,
+			); err != nil {
+				return err
+			}
+			catalog = sql.NullString{}
+		}
+		if !catalog.Valid || strings.TrimSpace(catalog.String) == "" ||
+			segmentCount == 0 {
+			err = enqueueTextbookCatalogJobTx(ctx, tx, manifestID, facts, at)
+			if err != nil {
+				return err
 			}
 		}
 	}
+	if err := tx.QueryRowContext(ctx, `SELECT state,last_error
+		FROM k12_textbook_catalog_jobs WHERE manifest_id=?`, manifestID).Scan(
+		&facts.catalogJobState, &facts.catalogJobError,
+	); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 
 	state, retryable, failureMessage :=
-		projectTextbookManifestState(facts, catalog.Valid, len(segments))
+		projectTextbookManifestState(facts, catalog.Valid, segmentCount)
 	textState := projectTextbookTextIndexState(facts)
 	vectorState, err := projectTextbookVectorIndexStateTx(
 		ctx,
@@ -336,7 +331,7 @@ func loadTextbookManifestFactsTx(
 	var facts textbookManifestFacts
 	var deleted int
 	err := tx.QueryRowContext(ctx, `SELECT b.owner_id,b.corpus_uid,b.lifecycle_state,b.text_state,
-		d.title,d.source,d.status,d.deleted,COALESCE(s.agent_id,''),
+		d.title,d.source,d.status,d.deleted,
 		COALESCE(s.extension,''),COALESCE(s.media_type,''),COALESCE(s.blob_sha256,'')
 		FROM kb_semantic_document_bindings b
 		JOIN kb_documents d ON d.id=b.document_id
@@ -356,7 +351,6 @@ func loadTextbookManifestFactsTx(
 		&facts.source,
 		&facts.documentStatus,
 		&deleted,
-		&facts.manifestOwnerID,
 		&facts.extension,
 		&facts.mediaType,
 		&facts.sourceDigest,
@@ -366,9 +360,6 @@ func loadTextbookManifestFactsTx(
 	}
 	if err != nil {
 		return textbookManifestFacts{}, false, err
-	}
-	if strings.TrimSpace(facts.manifestOwnerID) == "" {
-		facts.manifestOwnerID = facts.knowledgeOwnerID
 	}
 	facts.documentID = documentID
 	facts.generation = generation
@@ -499,6 +490,22 @@ func projectTextbookManifestState(
 	case "ready":
 		if hasCatalog && segmentCount > 0 {
 			return "ready_for_confirmation", false, ""
+		}
+		switch facts.catalogJobState {
+		case "failed_terminal":
+			message := strings.TrimSpace(facts.catalogJobError)
+			if message == "" {
+				message = "识别失败"
+			}
+			return "failed_terminal", false, message
+		case "failed_retryable":
+			message := strings.TrimSpace(facts.catalogJobError)
+			if message == "" {
+				message = "识别失败"
+			}
+			return "failed_retryable", true, message
+		case "cancelled":
+			return "stale", false, ""
 		}
 		return "extracting", false, ""
 	case "building":

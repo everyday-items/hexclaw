@@ -26,6 +26,7 @@ var inv012Dirs = []string{".", "usecase", "storage"}
 // inv012AllowedImportPrefixes 非标准库 import 白名单（前缀精确到包，避免 "scenarios/k12"
 // 误放行 "scenarios/k12/engineadapter" 这类反向依赖）。
 var inv012AllowedImportPrefixes = []string{
+	"github.com/hexagon-codes/hexclaw/internal/sqliteutil", // 存储层完整 SQLite 事务的 BUSY/BUSY_SNAPSHOT 有界重试
 	"github.com/hexagon-codes/hexclaw/records",
 	"github.com/hexagon-codes/hexclaw/scenario",
 	"github.com/hexagon-codes/hexclaw/scenarios/k12",            // 领域根包（usecase/storage 引用）

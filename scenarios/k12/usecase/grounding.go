@@ -31,11 +31,12 @@ type GroundingSnapshot struct {
 	TextbookManifestID string
 	DocumentID         string
 	DocumentGeneration int64
-	Edition             string
-	Volume              string
-	SegmentRefs         []string
-	PageRefs            []k12.TextbookGroundingPageRef
-	VectorRevisionID    string
+	SourceDigest       string
+	Edition            string
+	Volume             string
+	SegmentRefs        []string
+	PageRefs           []k12.TextbookGroundingPageRef
+	VectorRevisionID   string
 }
 
 // SnapshotGrounding is the canonical multi-query retrieval seam.

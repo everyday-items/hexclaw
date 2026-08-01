@@ -31,6 +31,7 @@ func newDataDeps(t *testing.T, agents ...string) usecase.Deps {
 	}
 	return usecase.Deps{
 		Records: k12storage.NewStore(db, reg.Records), Constraint: cur,
+		TextbookOwnerID: "desktop-user",
 		Now: func() int64 { return 1000 },
 		WorkFeedbackRoute: func(
 			context.Context,

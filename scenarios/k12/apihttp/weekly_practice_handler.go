@@ -11,9 +11,16 @@ import (
 )
 
 func (h *handler) getCurriculumCatalog(w http.ResponseWriter, r *http.Request) {
+	scope, err := h.textbookScope(
+		r.Context(), r.URL.Query().Get("agent"), r.URL.Query().Get("subject"),
+	)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
 	catalog, err := h.rt.Deps.GetWeeklyCurriculumCatalog(r.Context(),
 		usecase.WeeklyCurriculumCatalogRequest{
-			AgentName: r.URL.Query().Get("agent"), Subject: r.URL.Query().Get("subject"),
+			OwnerID: scope.OwnerID, AgentName: scope.AgentName, Subject: scope.Subject,
 			TextbookEdition: r.URL.Query().Get("textbook_edition"),
 			Volume:          r.URL.Query().Get("volume"),
 		})
@@ -95,8 +102,15 @@ func (h *handler) updateProfileBundle(w http.ResponseWriter, r *http.Request) {
 			Model: req.AgentConfig.Model, Skills: req.AgentConfig.Skills,
 		}
 	}
+	scope, err := h.textbookScope(
+		r.Context(), req.AgentName, req.CurriculumProgress.Subject,
+	)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
 	result, err := h.rt.Deps.UpdateProfileBundle(r.Context(), usecase.UpdateProfileBundleRequest{
-		AgentName: req.AgentName, IdempotencyKey: req.IdempotencyKey,
+		OwnerID: scope.OwnerID, AgentName: scope.AgentName, IdempotencyKey: req.IdempotencyKey,
 		ExpectedProfileRevision:  req.ExpectedProfileRevision,
 		ExpectedProgressRevision: req.ExpectedProgressRevision,
 		ExpectedSettingsRevision: req.ExpectedSettingsRevision,
@@ -134,9 +148,14 @@ func (h *handler) listTextbookBindingOptions(w http.ResponseWriter, r *http.Requ
 		writeErr(w, http.StatusInternalServerError, "records unavailable")
 		return
 	}
-	items, err := h.rt.Records.ListTextbookBindingOptions(
+	scope, err := h.textbookScope(
 		r.Context(), r.URL.Query().Get("agent"), r.URL.Query().Get("subject"),
 	)
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	items, err := h.rt.Records.ListTextbookBindingOptions(r.Context(), scope)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return

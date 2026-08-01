@@ -14,6 +14,7 @@ import (
 )
 
 type ProfileBundleMutation struct {
+	OwnerID                  string
 	AgentName                string
 	IdempotencyKey           string
 	RequestDigest            string
@@ -173,7 +174,8 @@ func (s *Store) GetWeeklyPracticeSettings(ctx context.Context, agentName string)
 }
 
 func (s *Store) UpdateProfileBundle(ctx context.Context, in ProfileBundleMutation) (k12.ProfileBundleResult, bool, error) {
-	if strings.TrimSpace(in.AgentName) == "" || strings.TrimSpace(in.IdempotencyKey) == "" ||
+	if strings.TrimSpace(in.OwnerID) == "" || strings.TrimSpace(in.AgentName) == "" ||
+		strings.TrimSpace(in.IdempotencyKey) == "" ||
 		strings.TrimSpace(in.RequestDigest) == "" || in.At <= 0 {
 		return k12.ProfileBundleResult{}, false, fmt.Errorf("k12storage: incomplete profile bundle")
 	}
@@ -233,7 +235,9 @@ func (s *Store) UpdateProfileBundle(ctx context.Context, in ProfileBundleMutatio
 	}
 	if strings.TrimSpace(in.Progress.TextbookManifestID) != "" {
 		bindingID, bindErr := activateTextbookBindingTx(
-			ctx, tx, in.AgentName, in.Profile, in.Progress, in.At,
+			ctx, tx, TextbookScope{
+				OwnerID: in.OwnerID, AgentName: in.AgentName, Subject: in.Progress.Subject,
+			}, in.Profile, in.Progress, in.At,
 		)
 		if bindErr != nil {
 			return k12.ProfileBundleResult{}, false, bindErr

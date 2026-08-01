@@ -10,6 +10,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -33,7 +34,10 @@ type K12 struct {
 	// Outbox 单进程投递器（§6.15）：composition root 调 Outbox.Start(ctx) 启动
 	// （nudge 即时 + 轮询兜底 + 启动补投 pending）。学情信号消费者已注册。
 	Outbox *k12storage.Dispatcher
-	Deps   usecase.Deps
+	// CatalogWorker consumes the restart-durable textbook catalog queue using
+	// only persisted Knowledge checkpoints and exact source spans.
+	CatalogWorker *usecase.TextbookCatalogWorker
+	Deps          usecase.Deps
 }
 
 // Option 装配可选项（注入 Insights/Grounding 等 adapter）。
@@ -230,6 +234,7 @@ func WireInto(ctx context.Context, reg *scenario.Registry, db *sql.DB, solveSkil
 		TutoringTipsReview:  solveAdapter,
 		ParentTeachingGuide: solveAdapter,
 		Records:             store,
+		TextbookOwnerID:     "desktop-user",
 		PageAssets:          assetstore.PageStore{},
 		Constraint:          constraint,
 	}
@@ -239,5 +244,18 @@ func WireInto(ctx context.Context, reg *scenario.Registry, db *sql.DB, solveSkil
 	// Outbox 投递器 + 学情信号消费者（§6.9：投影失败不撤销域写，重试只补投影）。
 	// 消费者持 Deps.Insights（opts 应用后再建，确保拿到注入的 adapter）。
 	outbox := k12storage.NewDispatcher(store, usecase.InsightsConsumer{Insights: deps.Insights})
-	return &K12{Registry: reg, Manifest: man, Receipt: receipt, Records: store, Outbox: outbox, Deps: deps}, nil
+	catalogWorker := usecase.NewTextbookCatalogWorker(
+		store,
+		usecase.TextbookCatalogCheckpointExtractor{},
+		usecase.TextbookCatalogWorkerConfig{
+			WorkerID: "k12-catalog-worker", Lease: 30 * time.Second,
+			HeartbeatInterval: 10 * time.Second, ExtractTimeout: 2 * time.Minute,
+			MaxAttempts: 4, RetryBase: 2 * time.Second, RetryMax: time.Minute,
+			RecoveryBatch: 32,
+		},
+	)
+	return &K12{
+		Registry: reg, Manifest: man, Receipt: receipt, Records: store,
+		Outbox: outbox, CatalogWorker: catalogWorker, Deps: deps,
+	}, nil
 }

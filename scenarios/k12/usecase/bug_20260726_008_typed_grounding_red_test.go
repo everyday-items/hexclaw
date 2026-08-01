@@ -45,33 +45,46 @@ func seedBUG20260726008ActiveTextbookBinding(t *testing.T, d usecase.Deps) {
 	db := d.Records.DB()
 	digest := strings.Repeat("a", 64)
 	catalogDigest := strings.Repeat("b", 64)
-	catalog := `{"subject":"math","textbook_edition":"人教版","textbook_version":"2022","title":"义务教育教科书·数学五年级下册","volume":"下册","page_min":1,"page_max":100,"units":[{"unit_id":"u1","title":"第一单元","page_from":1,"page_to":20,"lessons":[]}],"page_refs":[{"logical_page":1,"pdf_page":1,"segment_refs":["segment-1"]}]}`
+	catalog := `{"subject":"math","textbook_edition":"人教版","textbook_version":"2022","title":"义务教育教科书·数学五年级下册","volume":"下册","page_min":1,"page_max":1,"units":[{"unit_id":"u1","title":"第一单元","page_from":1,"page_to":1,"lessons":[]}],"page_refs":[{"logical_page":1,"pdf_page":1,"segment_refs":["segment-1"]}]}`
 	statements := []struct {
 		query string
 		args  []any
 	}{
 		{`INSERT INTO kb_semantic_corpora
 			(corpus_uid,owner_id,corpus_alias,kind,content_version,created_at,updated_at)
-			VALUES('corpus-mingming','mingming','default','general',1,1,1)`, nil},
+			VALUES('corpus-desktop','desktop-user','default','general',1,1,1)`, nil},
 		{`INSERT INTO kb_documents
 			(id,title,content,source,deleted,corpus_uid,created_at,updated_at)
 			VALUES('doc-math','义务教育教科书·数学五年级下册.pdf','教材正文',
-			'upload:math.pdf',0,'corpus-mingming',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`, nil},
+			'upload:math.pdf',0,'corpus-desktop',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`, nil},
+		{`INSERT INTO kb_chunks
+			(id,doc_id,content,chunk_index,created_at,page_start,page_end,
+			 source_digest,source_offset_start,source_offset_end)
+			VALUES('segment-1','doc-math','教材正文',0,CURRENT_TIMESTAMP,1,1,?,0,?)`,
+			[]any{digest, len("教材正文")}},
 		{`INSERT INTO kb_semantic_document_generations
 			(owner_id,corpus_uid,document_id,content_generation,created_at)
-			VALUES('mingming','corpus-mingming','doc-math',1,1)`, nil},
+			VALUES('desktop-user','corpus-desktop','doc-math',1,1)`, nil},
 		{`INSERT INTO kb_semantic_document_bindings
 			(document_id,owner_id,corpus_uid,content_generation,lifecycle_state,
 			 text_state,version,created_at,updated_at)
-			VALUES('doc-math','mingming','corpus-mingming',1,'active','ready',1,1,1)`, nil},
+			VALUES('doc-math','desktop-user','corpus-desktop',1,'active','ready',1,1,1)`, nil},
 		{`INSERT INTO k12_textbook_manifests
 			(manifest_id,owner_id,document_id,document_generation,document_title,
 			 subject,source_digest,state,retryable,failure_message,text_index_state,
 			 vector_index_state,catalog_json,catalog_digest,created_at,updated_at)
-			VALUES('manifest-math','mingming','doc-math',1,
+			VALUES('manifest-math','desktop-user','doc-math',1,
 			'义务教育教科书·数学五年级下册.pdf','math',?,
 			'ready_for_confirmation',0,'','ready','ready',?,?,1,1)`,
 			[]any{digest, catalog, catalogDigest}},
+		{`INSERT INTO k12_textbook_page_mappings
+			(mapping_id,manifest_id,logical_page,pdf_page,evidence_page,
+			 evidence_offset_start,evidence_offset_end,evidence_digest,method,
+			 verification_state,document_id,document_generation,source_digest,
+			 created_at,updated_at)
+			VALUES('manifest-page-proof-1','manifest-math',1,1,1,0,1,?,
+			'printed_anchor','verified','doc-math',1,?,1,1)`,
+			[]any{strings.Repeat("c", 64), digest}},
 		{`INSERT INTO k12_textbook_manifest_segments
 			(segment_id,manifest_id,logical_page,segment_ref,pdf_page,document_id,
 			 document_generation,source_digest,created_at,updated_at)
@@ -80,7 +93,7 @@ func seedBUG20260726008ActiveTextbookBinding(t *testing.T, d usecase.Deps) {
 		{`INSERT INTO k12_textbook_bindings
 			(textbook_binding_id,owner_id,agent_name,subject,textbook_manifest_id,
 			 document_id,document_generation,status,created_at,updated_at)
-			VALUES('binding-math','mingming','mingming','math','manifest-math',
+			VALUES('binding-math','desktop-user','mingming','math','manifest-math',
 			'doc-math',1,'active',1,1)`, nil},
 	}
 	for _, statement := range statements {
@@ -115,7 +128,8 @@ func TestBUG20260726008_TutoringTipsFreezesDurableActiveBindingBeforeKnowledgeQu
 	if spy.freezeCalls != 1 {
 		t.Fatalf("BUG-20260726-008: freeze calls=%d want 1", spy.freezeCalls)
 	}
-	if spy.requested.TextbookBindingID != "binding-math" {
+	if spy.requested.TextbookBindingID != "binding-math" ||
+		spy.requested.SourceDigest != strings.Repeat("a", 64) {
 		t.Fatalf("BUG-20260726-008 RED: durable active binding was not resolved before freeze: %+v", spy.requested)
 	}
 }

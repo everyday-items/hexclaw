@@ -111,25 +111,7 @@ func problemSourceActionTrustedAgent(rt Runtime, ownerScope string) string {
 func (h *handler) problemSourceActionOwnerScope(
 	ctx context.Context,
 ) (string, error) {
-	switch strings.TrimSpace(h.rt.PrincipalMode) {
-	case "local_loopback":
-		ownerScope := strings.TrimSpace(h.rt.OwnerScope)
-		if ownerScope == "" {
-			return "", errors.New("local owner scope missing")
-		}
-		return ownerScope, nil
-	case "remote":
-		if h.rt.AuthenticatedOwnerScope == nil {
-			return "", errors.New("remote principal resolver missing")
-		}
-		ownerScope, err := h.rt.AuthenticatedOwnerScope(ctx)
-		if err != nil || strings.TrimSpace(ownerScope) == "" {
-			return "", errors.New("authenticated owner scope missing")
-		}
-		return strings.TrimSpace(ownerScope), nil
-	default:
-		return "", errors.New("unsupported principal mode")
-	}
+	return h.ownerScope(ctx)
 }
 
 func validateProblemSourceActionPayload(w http.ResponseWriter, req problemSourceActionRequest) bool {

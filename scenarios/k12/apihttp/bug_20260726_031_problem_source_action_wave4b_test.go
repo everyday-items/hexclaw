@@ -35,6 +35,7 @@ func seedProblemSourceActionHTTP(t *testing.T) problemSourceActionSeed {
 	)
 
 	deps := usecase.Deps{Records: fixture.coordinator.Records}
+	policy := k12.ApprovedRecognizingRequestPolicy()
 	job, _, err := deps.CreateGradingJob(ctx, "mingming", "session-source-action",
 		usecase.CreateGradingJobInput{
 			SubmissionID:     submissionID,
@@ -42,9 +43,10 @@ func seedProblemSourceActionHTTP(t *testing.T) problemSourceActionSeed {
 			SourceKey:        "source-action",
 			ConfirmedVersion: 1,
 			ModelSnapshot: k12.GradingModelSnapshot{
-				Provider: "hexclaw-gpt",
-				Model:    "gpt-5.6-sol",
-				Route:    "hexclaw-gpt/gpt-5.6-sol",
+				Provider:                 "hexclaw-gpt",
+				Model:                    k12.RecognizingPolicyModel,
+				Route:                    "hexclaw-gpt/" + k12.RecognizingPolicyModel,
+				RecognizingRequestPolicy: policy,
 			},
 		})
 	if err != nil {

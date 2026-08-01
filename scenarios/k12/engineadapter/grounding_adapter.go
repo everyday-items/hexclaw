@@ -2,7 +2,9 @@ package engineadapter
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -19,6 +21,19 @@ type kbQuerier interface {
 
 type kbHitQuerier interface {
 	QueryHitsWithFilter(ctx context.Context, query string, topK int, filter knowledge.Filter) (string, []knowledge.SearchHit, error)
+}
+
+// kbPinnedHitQuerier is the only legal K12 transport for a snapshot that has
+// already frozen a vector revision. It must execute against that immutable
+// plan, rather than re-reading the mutable active revision.
+type kbPinnedHitQuerier interface {
+	QueryHitsWithFilterAtRevision(
+		ctx context.Context,
+		revisionID string,
+		query string,
+		topK int,
+		filter knowledge.Filter,
+	) (string, []knowledge.SearchHit, []knowledge.QueryEmbeddingReceipt, error)
 }
 
 type kbWriter interface {
@@ -135,37 +150,41 @@ func (a *GroundingAdapter) FreezeGroundingSnapshot(
 	ctx context.Context,
 	requested usecase.GroundingSnapshot,
 ) (usecase.GroundingSnapshot, error) {
+	// The revision is server-owned evidence. Never preserve a value supplied by
+	// the caller, including when the active revision lookup fails.
+	requested.VectorRevisionID = ""
 	requested.AgentName = strings.TrimSpace(requested.AgentName)
 	requested.LearnerID = strings.TrimSpace(requested.LearnerID)
 	requested.Subject = strings.TrimSpace(requested.Subject)
-	requested.TextbookBindingID = strings.TrimSpace(requested.TextbookBindingID)
-	requested.TextbookManifestID = strings.TrimSpace(requested.TextbookManifestID)
-	requested.DocumentID = strings.TrimSpace(requested.DocumentID)
-	requested.Edition = strings.TrimSpace(requested.Edition)
-	requested.Volume = strings.TrimSpace(requested.Volume)
-	requested.SegmentRefs = normalizeGroundingSegmentRefs(requested.SegmentRefs)
-	requested.PageRefs = cloneGroundingPageRefs(requested.PageRefs)
 	if requested.AgentName == "" || requested.LearnerID == "" || requested.Subject == "" {
 		return usecase.GroundingSnapshot{}, fmt.Errorf("grounding: agent / learner / subject required")
 	}
-	if requested.TextbookBindingID != "" && !completeTypedGroundingScope(requested) {
-		return usecase.GroundingSnapshot{},
-			fmt.Errorf("grounding: typed binding scope is incomplete")
+	requested.SegmentRefs = append([]string(nil), requested.SegmentRefs...)
+	requested.PageRefs = cloneGroundingPageRefs(requested.PageRefs)
+	if requested.TextbookBindingID == "" {
+		return requested, nil
 	}
-	if revisions, ok := a.kb.(kbRevisionSnapshotter); ok {
-		revisionID, active, err := revisions.ActiveSemanticRevision(ctx)
-		if err != nil {
-			return usecase.GroundingSnapshot{}, fmt.Errorf("grounding: freeze vector revision: %w", err)
-		}
-		if active {
-			requested.VectorRevisionID = strings.TrimSpace(revisionID)
-		}
+	if err := validateTypedGroundingSnapshot(requested, false); err != nil {
+		return usecase.GroundingSnapshot{}, fmt.Errorf("grounding: invalid typed binding scope: %w", err)
 	}
+	revisions, ok := a.kb.(kbRevisionSnapshotter)
+	if !ok {
+		return usecase.GroundingSnapshot{}, fmt.Errorf("grounding: active vector revision unavailable")
+	}
+	revisionID, active, err := revisions.ActiveSemanticRevision(ctx)
+	if err != nil {
+		return usecase.GroundingSnapshot{}, fmt.Errorf("grounding: freeze vector revision: %w", err)
+	}
+	if !active || revisionID == "" || revisionID != strings.TrimSpace(revisionID) {
+		return usecase.GroundingSnapshot{}, fmt.Errorf("grounding: active vector revision unavailable")
+	}
+	requested.VectorRevisionID = revisionID
 	return requested, nil
 }
 
 // GroundSnapshot consumes only the previously frozen scope. A pinned vector
-// revision must still be current or the query fails closed.
+// revision is replayed through the immutable Knowledge plan; it must never be
+// converted into a mutable active-pointer pre-check plus legacy query.
 func (a *GroundingAdapter) GroundSnapshot(
 	ctx context.Context,
 	snapshot usecase.GroundingSnapshot,
@@ -176,26 +195,12 @@ func (a *GroundingAdapter) GroundSnapshot(
 		strings.TrimSpace(snapshot.Subject) == "" {
 		return "", false, fmt.Errorf("grounding: invalid frozen scope")
 	}
-	if strings.TrimSpace(snapshot.TextbookBindingID) == "" {
+	if snapshot.TextbookBindingID == "" {
 		return "", false, nil
 	}
-	if !completeTypedGroundingScope(snapshot) {
-		return "", false, fmt.Errorf("grounding: incomplete frozen typed scope")
+	if err := validateTypedGroundingSnapshot(snapshot, true); err != nil {
+		return "", false, fmt.Errorf("grounding: invalid frozen typed scope: %w", err)
 	}
-	if pinned := strings.TrimSpace(snapshot.VectorRevisionID); pinned != "" {
-		revisions, ok := a.kb.(kbRevisionSnapshotter)
-		if !ok {
-			return "", false, fmt.Errorf("grounding: pinned vector revision cannot be verified")
-		}
-		current, active, err := revisions.ActiveSemanticRevision(ctx)
-		if err != nil {
-			return "", false, fmt.Errorf("grounding: verify vector revision: %w", err)
-		}
-		if !active || strings.TrimSpace(current) != pinned {
-			return "", false, fmt.Errorf("grounding: frozen vector revision changed")
-		}
-	}
-
 	query := strings.Join(nonEmptyGroundingFacts(
 		snapshot.Edition,
 		snapshot.Volume,
@@ -203,56 +208,180 @@ func (a *GroundingAdapter) GroundSnapshot(
 		knowledgePoint,
 		"教材讲法",
 	), " ")
-	return a.groundByFilterQuery(ctx, snapshot.AgentName, query, knowledge.Filter{
+	filter := knowledge.Filter{
 		DocumentGenerations: []knowledge.DocumentGenerationRef{{
 			DocumentID:         snapshot.DocumentID,
 			DocumentGeneration: snapshot.DocumentGeneration,
 		}},
 		ChunkIDs: append([]string(nil), snapshot.SegmentRefs...),
-	})
-}
-
-func completeTypedGroundingScope(snapshot usecase.GroundingSnapshot) bool {
-	return strings.TrimSpace(snapshot.TextbookBindingID) != "" &&
-		strings.TrimSpace(snapshot.TextbookManifestID) != "" &&
-		strings.TrimSpace(snapshot.DocumentID) != "" &&
-		snapshot.DocumentGeneration > 0 &&
-		strings.TrimSpace(snapshot.Edition) != "" &&
-		strings.TrimSpace(snapshot.Volume) != "" &&
-		len(normalizeGroundingSegmentRefs(snapshot.SegmentRefs)) > 0 &&
-		len(snapshot.PageRefs) > 0
-}
-
-func normalizeGroundingSegmentRefs(values []string) []string {
-	out := make([]string, 0, len(values))
-	seen := make(map[string]struct{}, len(values))
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			continue
-		}
-		if _, duplicate := seen[value]; duplicate {
-			continue
-		}
-		seen[value] = struct{}{}
-		out = append(out, value)
 	}
-	return out
+	pinnedQuerier, ok := a.kb.(kbPinnedHitQuerier)
+	if !ok {
+		return "", false, fmt.Errorf("grounding: pinned retrieval plan unavailable")
+	}
+	pinned := snapshot.VectorRevisionID
+	_, hits, receipts, err := pinnedQuerier.QueryHitsWithFilterAtRevision(
+		ctx, pinned, query, a.topK, filter,
+	)
+	if err != nil {
+		return "", false, fmt.Errorf("grounding: pinned retrieval: %w", err)
+	}
+	if err := validateGroundingReceipts(receipts, pinned, query); err != nil {
+		return "", false, err
+	}
+	return groundingTextFromVerifiedHits(snapshot, hits)
+}
+
+func validateTypedGroundingSnapshot(
+	snapshot usecase.GroundingSnapshot,
+	requireRevision bool,
+) error {
+	err := k12.ValidateTextbookGroundingScope(k12.TextbookGroundingScope{
+		TextbookBindingID:  snapshot.TextbookBindingID,
+		TextbookManifestID: snapshot.TextbookManifestID,
+		DocumentID:         snapshot.DocumentID,
+		DocumentGeneration: snapshot.DocumentGeneration,
+		SourceDigest:       snapshot.SourceDigest,
+		Edition:            snapshot.Edition,
+		Volume:             snapshot.Volume,
+		SegmentRefs:        snapshot.SegmentRefs,
+		PageRefs:           snapshot.PageRefs,
+	})
+	if err != nil {
+		return err
+	}
+	if requireRevision && (snapshot.VectorRevisionID == "" ||
+		snapshot.VectorRevisionID != strings.TrimSpace(snapshot.VectorRevisionID)) {
+		return fmt.Errorf("missing frozen vector revision")
+	}
+	return nil
 }
 
 func cloneGroundingPageRefs(
 	values []k12.TextbookGroundingPageRef,
 ) []k12.TextbookGroundingPageRef {
-	out := make([]k12.TextbookGroundingPageRef, 0, len(values))
-	for _, value := range values {
-		value.SegmentRefs = normalizeGroundingSegmentRefs(value.SegmentRefs)
-		if value.LogicalPage < 1 || value.PDFPage < 1 ||
-			len(value.SegmentRefs) == 0 {
-			continue
-		}
-		out = append(out, value)
+	out := make([]k12.TextbookGroundingPageRef, len(values))
+	for index, value := range values {
+		out[index] = value
+		out[index].SegmentRefs = append([]string(nil), value.SegmentRefs...)
 	}
 	return out
+}
+
+type groundingReceiptProfile struct {
+	providerID        string
+	model             string
+	profileID         string
+	profileConfigHash string
+	dimension         int
+}
+
+func validateGroundingReceipts(
+	receipts []knowledge.QueryEmbeddingReceipt,
+	revisionID, query string,
+) error {
+	if len(receipts) == 0 {
+		return fmt.Errorf("grounding: pinned query has no embedding receipt")
+	}
+	wantQueryDigest := "sha256:" + sha256Hex(query)
+	originalQueryBound := false
+	var frozenProfile groundingReceiptProfile
+	for index, receipt := range receipts {
+		if receipt.Operation != "query_embedding" || receipt.Status != "succeeded" ||
+			receipt.RevisionID != revisionID ||
+			receipt.ProviderID == "" || receipt.ProviderID != strings.TrimSpace(receipt.ProviderID) ||
+			receipt.Model == "" || receipt.Model != strings.TrimSpace(receipt.Model) ||
+			receipt.ProfileID == "" || receipt.ProfileID != strings.TrimSpace(receipt.ProfileID) ||
+			receipt.ProfileConfigHash == "" ||
+			receipt.ProfileConfigHash != strings.TrimSpace(receipt.ProfileConfigHash) ||
+			receipt.Dimension <= 0 || !validPrefixedSHA256(receipt.QueryDigest) {
+			return fmt.Errorf("grounding: invalid pinned query receipt %d", index)
+		}
+		if receipt.QueryDigest == wantQueryDigest {
+			originalQueryBound = true
+		}
+		profile := groundingReceiptProfile{
+			providerID: receipt.ProviderID, model: receipt.Model,
+			profileID: receipt.ProfileID, profileConfigHash: receipt.ProfileConfigHash,
+			dimension: receipt.Dimension,
+		}
+		if index == 0 {
+			frozenProfile = profile
+		} else if profile != frozenProfile {
+			return fmt.Errorf("grounding: pinned query receipts crossed embedding profiles")
+		}
+	}
+	if !originalQueryBound {
+		return fmt.Errorf("grounding: pinned receipts do not bind the requested query")
+	}
+	return nil
+}
+
+func groundingTextFromVerifiedHits(
+	snapshot usecase.GroundingSnapshot,
+	hits []knowledge.SearchHit,
+) (string, bool, error) {
+	type pageRange struct{ from, to int }
+	allowedChunks := make(map[string]pageRange, len(snapshot.SegmentRefs))
+	for _, pageRef := range snapshot.PageRefs {
+		for _, segmentRef := range pageRef.SegmentRefs {
+			span, exists := allowedChunks[segmentRef]
+			if !exists {
+				allowedChunks[segmentRef] = pageRange{from: pageRef.PDFPage, to: pageRef.PDFPage}
+				continue
+			}
+			if pageRef.PDFPage < span.from {
+				span.from = pageRef.PDFPage
+			}
+			if pageRef.PDFPage > span.to {
+				span.to = pageRef.PDFPage
+			}
+			allowedChunks[segmentRef] = span
+		}
+	}
+
+	parts := make([]string, 0, len(hits))
+	seenHits := make(map[string]struct{}, len(hits))
+	for index, hit := range hits {
+		content := strings.TrimSpace(hit.Content)
+		if content == "" {
+			continue
+		}
+		span, allowed := allowedChunks[hit.ChunkID]
+		_, duplicate := seenHits[hit.ChunkID]
+		if hit.DocID != snapshot.DocumentID ||
+			hit.DocumentGeneration != snapshot.DocumentGeneration ||
+			hit.SemanticRevisionID != snapshot.VectorRevisionID ||
+			hit.SourceDigest != snapshot.SourceDigest ||
+			!allowed || duplicate ||
+			hit.PageStart != span.from || hit.PageEnd != span.to ||
+			hit.SourceOffsetStart < 0 || hit.SourceOffsetEnd <= hit.SourceOffsetStart ||
+			!validSHA256(hit.CitationDigest) ||
+			hit.CitationDigest != sha256Hex(hit.Content) {
+			return "", false, fmt.Errorf("grounding: invalid pinned evidence hit %d", index)
+		}
+		seenHits[hit.ChunkID] = struct{}{}
+		parts = append(parts, content)
+	}
+	text := strings.Join(parts, "\n\n")
+	return text, text != "", nil
+}
+
+func validPrefixedSHA256(value string) bool {
+	return strings.HasPrefix(value, "sha256:") && validSHA256(strings.TrimPrefix(value, "sha256:"))
+}
+
+func validSHA256(value string) bool {
+	if len(value) != sha256.Size*2 || value != strings.ToLower(value) {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
+}
+
+func sha256Hex(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
 
 func nonEmptyGroundingFacts(values ...string) []string {
@@ -292,14 +421,7 @@ func (a *GroundingAdapter) groundByFilterQuery(
 		if err != nil {
 			return "", false, err
 		}
-		parts := make([]string, 0, len(hits))
-		for _, hit := range hits {
-			if content := strings.TrimSpace(hit.Content); content != "" {
-				parts = append(parts, content)
-			}
-		}
-		text := strings.Join(parts, "\n\n")
-		return text, text != "", nil
+		return groundingTextFromHits(hits)
 	}
 	text, err := a.kb.QueryWithFilter(ctx, query, a.topK, filter)
 	if err != nil {
@@ -307,6 +429,17 @@ func (a *GroundingAdapter) groundByFilterQuery(
 	}
 	text = stripRetrievalEnvelope(text)
 	return text, text != "", nil // fail-closed：空串 = 未命中，调用方降级 LLM
+}
+
+func groundingTextFromHits(hits []knowledge.SearchHit) (string, bool, error) {
+	parts := make([]string, 0, len(hits))
+	for _, hit := range hits {
+		if content := strings.TrimSpace(hit.Content); content != "" {
+			parts = append(parts, content)
+		}
+	}
+	text := strings.Join(parts, "\n\n")
+	return text, text != "", nil
 }
 
 // stripRetrievalEnvelope 仅服务于未实现 QueryHitsWithFilter 的旧/第三方 kbQuerier。

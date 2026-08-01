@@ -2,6 +2,7 @@ package usecase_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -81,6 +82,7 @@ func TestBuildTutoringTipsFreezesOneScopedKnowledgeSnapshot(t *testing.T) {
 		grounding.requested.LearnerID != "mingming" ||
 		grounding.requested.Subject != "数学" ||
 		grounding.requested.TextbookBindingID != "binding-math" ||
+		grounding.requested.SourceDigest != strings.Repeat("a", 64) ||
 		grounding.requested.Edition != "人教版" ||
 		grounding.requested.Volume != "下册" {
 		t.Fatalf("requested scope not derived once from server facts: %+v", grounding.requested)
@@ -93,6 +95,7 @@ func TestBuildTutoringTipsFreezesOneScopedKnowledgeSnapshot(t *testing.T) {
 			got.TextbookManifestID != "manifest-math" ||
 			got.DocumentID != "doc-math" ||
 			got.DocumentGeneration != 1 ||
+			got.SourceDigest != strings.Repeat("a", 64) ||
 			len(got.SegmentRefs) != 1 ||
 			got.SegmentRefs[0] != "segment-1" ||
 			len(got.PageRefs) != 1 ||

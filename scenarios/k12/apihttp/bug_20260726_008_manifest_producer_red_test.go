@@ -18,7 +18,7 @@ func TestBUG20260726008_NewKnowledgePDFProducesManifestWithoutMigrationOrManualS
 	seedBUG20260726034A02KnowledgePDF(
 		t,
 		db,
-		"mingming",
+		"desktop-user",
 		"doc-new-ingested-textbook",
 		1,
 	)
@@ -57,9 +57,9 @@ func TestBUG20260726008_NewKnowledgePDFProducesManifestWithoutMigrationOrManualS
 			if got := countBUG20260726034A02Rows(
 				t,
 				db,
-				"k12_textbook_manifest_segments",
-			); got != 1 {
-				t.Fatalf("manifest segment rows=%d want 1", got)
+					"k12_textbook_manifest_segments",
+				); got != 0 {
+					t.Fatalf("unverified manifest segment rows=%d want 0", got)
 			}
 			if got := countBUG20260726034A02Rows(
 				t,
@@ -101,7 +101,7 @@ func TestBUG20260726008_DefaultVisionModelFailureIsExplicitAndRetryable(
 	seedBUG20260726034A02KnowledgePDF(
 		t,
 		db,
-		"mingming",
+		"desktop-user",
 		"doc-default-model-missing",
 		1,
 	)
@@ -112,7 +112,7 @@ func TestBUG20260726008_DefaultVisionModelFailureIsExplicitAndRetryable(
 	}
 	if _, err := db.Exec(`UPDATE kb_semantic_document_bindings
 		SET text_state='failed'
-		WHERE owner_id='mingming' AND document_id='doc-default-model-missing'
+		WHERE owner_id='desktop-user' AND document_id='doc-default-model-missing'
 		  AND content_generation=1`); err != nil {
 		t.Fatal(err)
 	}
@@ -121,8 +121,8 @@ func TestBUG20260726008_DefaultVisionModelFailureIsExplicitAndRetryable(
 		 document_generation,target_revision_id,idempotency_key,state,stage,
 		 attempt,cancel_requested,lease_owner,lease_epoch,last_error,created_at,
 		 updated_at,finished_at)
-		VALUES('job-default-model-missing',NULL,'ingest','mingming',
-		 'corpus-mingming','doc-default-model-missing',1,NULL,
+		VALUES('job-default-model-missing',NULL,'ingest','desktop-user',
+			 'corpus-desktop-user','doc-default-model-missing',1,NULL,
 		 'default-model-missing','failed','extracting',1,0,'',1,
 		 'vision model required',1,2,2)`); err != nil {
 		t.Fatal(err)

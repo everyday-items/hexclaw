@@ -103,6 +103,10 @@ type Runtime struct {
 	// deliberately prevents this endpoint from treating request headers as
 	// identity.
 	AuthenticatedOwnerScope func(context.Context) (string, error)
+	// AuthorizeAgentScope is mandatory in remote mode for textbook operations.
+	// It validates that the authenticated owner may address the requested K12
+	// agent; local Desktop still validates the registered agent in storage.
+	AuthorizeAgentScope func(context.Context, string, string) error
 }
 
 // NewHandler 返回 K12 的 HTTP 子路由（Go 1.22+ method+path 路由）。
@@ -935,6 +939,11 @@ func (h *handler) tutoringTips(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "agent / dispatch_id required")
 		return
 	}
+	textbookScope, err := h.textbookScope(r.Context(), req.Agent, "math")
+	if err != nil {
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
 	if h.rt.ImageTasks == nil {
 		writeErr(w, http.StatusServiceUnavailable, "image task facade unavailable")
 		return
@@ -946,7 +955,9 @@ func (h *handler) tutoringTips(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
 		return
 	}
-	tips, err := h.rt.Deps.BuildTutoringTips(r.Context(), req.Agent, gradingJobID)
+	tips, err := h.rt.Deps.BuildTutoringTipsForOwner(
+		r.Context(), textbookScope.OwnerID, textbookScope.AgentName, gradingJobID,
+	)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return

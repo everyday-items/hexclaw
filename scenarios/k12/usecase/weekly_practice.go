@@ -18,6 +18,7 @@ import (
 var ErrCurriculumCatalogUnavailable = errors.New("curriculum catalog unavailable")
 
 type WeeklyCurriculumCatalogRequest struct {
+	OwnerID         string
 	AgentName       string
 	Subject         string
 	TextbookEdition string
@@ -91,6 +92,7 @@ type WeeklyPracticeSettingsInput struct {
 }
 
 type UpdateProfileBundleRequest struct {
+	OwnerID                  string
 	AgentName                string
 	IdempotencyKey           string
 	ExpectedProfileRevision  int
@@ -132,18 +134,21 @@ func (d Deps) GetProfileWithRevision(ctx context.Context, agentName string) (k12
 }
 
 func (d Deps) GetWeeklyCurriculumCatalog(ctx context.Context, req WeeklyCurriculumCatalogRequest) (k12.CurriculumCatalog, error) {
+	req.OwnerID = strings.TrimSpace(req.OwnerID)
 	req.AgentName = strings.TrimSpace(req.AgentName)
 	req.Subject = strings.TrimSpace(req.Subject)
 	req.TextbookEdition = strings.TrimSpace(req.TextbookEdition)
 	req.Volume = strings.TrimSpace(req.Volume)
-	if req.AgentName == "" || req.Subject != "math" {
-		return k12.CurriculumCatalog{}, fmt.Errorf("%w: agent/subject=math required", ErrInvalidInput)
+	if req.OwnerID == "" || req.AgentName == "" || req.Subject != "math" {
+		return k12.CurriculumCatalog{}, fmt.Errorf("%w: owner/agent/subject=math required", ErrInvalidInput)
 	}
 	if d.Records == nil {
 		return k12.CurriculumCatalog{}, fmt.Errorf("%w: records unavailable", ErrCurriculumCatalogUnavailable)
 	}
 	if catalog, handled, err := d.Records.GetActiveTextbookCatalog(
-		ctx, req.AgentName, req.Subject,
+		ctx, k12storage.TextbookScope{
+			OwnerID: req.OwnerID, AgentName: req.AgentName, Subject: req.Subject,
+		},
 	); handled || err != nil {
 		return catalog, err
 	}
@@ -227,9 +232,10 @@ func normalizeK12ProfileSkills(input []string) []string {
 }
 
 func (d Deps) UpdateProfileBundle(ctx context.Context, req UpdateProfileBundleRequest) (k12.ProfileBundleResult, error) {
+	req.OwnerID = strings.TrimSpace(req.OwnerID)
 	req.AgentName = strings.TrimSpace(req.AgentName)
 	req.IdempotencyKey = strings.TrimSpace(req.IdempotencyKey)
-	if req.AgentName == "" || req.IdempotencyKey == "" ||
+	if req.OwnerID == "" || req.AgentName == "" || req.IdempotencyKey == "" ||
 		req.ExpectedProfileRevision < 0 || req.ExpectedProgressRevision < 0 ||
 		req.ExpectedSettingsRevision < 0 {
 		return k12.ProfileBundleResult{}, fmt.Errorf("%w: invalid profile bundle command", ErrInvalidInput)
@@ -273,12 +279,15 @@ func (d Deps) UpdateProfileBundle(ctx context.Context, req UpdateProfileBundleRe
 				fmt.Errorf("%w: client must not submit textbook_binding_id", ErrInvalidInput)
 		}
 		catalog, err = d.Records.GetTextbookManifestCatalog(
-			ctx, req.AgentName, strings.TrimSpace(req.CurriculumProgress.Subject),
-			req.CurriculumProgress.TextbookManifestID,
+			ctx, k12storage.TextbookScope{
+				OwnerID: req.OwnerID, AgentName: req.AgentName,
+				Subject: strings.TrimSpace(req.CurriculumProgress.Subject),
+			}, req.CurriculumProgress.TextbookManifestID,
 		)
 	} else {
 		catalog, err = d.GetWeeklyCurriculumCatalog(ctx, WeeklyCurriculumCatalogRequest{
-			AgentName: req.AgentName, Subject: strings.TrimSpace(req.CurriculumProgress.Subject),
+			OwnerID: req.OwnerID, AgentName: req.AgentName,
+			Subject:         strings.TrimSpace(req.CurriculumProgress.Subject),
 			TextbookEdition: req.Profile.TextbookEdition, Volume: req.CurriculumProgress.Volume,
 		})
 	}
@@ -290,6 +299,7 @@ func (d Deps) UpdateProfileBundle(ctx context.Context, req UpdateProfileBundleRe
 		return k12.ProfileBundleResult{}, err
 	}
 	digest := digestValue(struct {
+		OwnerID                  string
 		AgentName                string
 		ExpectedProfileRevision  int
 		ExpectedProgressRevision int
@@ -299,12 +309,12 @@ func (d Deps) UpdateProfileBundle(ctx context.Context, req UpdateProfileBundleRe
 		Progress                 CurriculumProgressInput
 		Settings                 WeeklyPracticeSettingsInput
 	}{
-		req.AgentName, req.ExpectedProfileRevision, req.ExpectedProgressRevision,
+		req.OwnerID, req.AgentName, req.ExpectedProfileRevision, req.ExpectedProgressRevision,
 		req.ExpectedSettingsRevision, req.AgentConfig, req.Profile, req.CurriculumProgress,
 		req.WeeklyPracticeSettings,
 	})
 	result, _, err := d.Records.UpdateProfileBundle(ctx, k12storage.ProfileBundleMutation{
-		AgentName: req.AgentName, IdempotencyKey: req.IdempotencyKey,
+		OwnerID: req.OwnerID, AgentName: req.AgentName, IdempotencyKey: req.IdempotencyKey,
 		RequestDigest: digest, ExpectedProfileRevision: req.ExpectedProfileRevision,
 		ExpectedProgressRevision: req.ExpectedProgressRevision,
 		ExpectedSettingsRevision: req.ExpectedSettingsRevision,

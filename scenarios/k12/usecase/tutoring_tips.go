@@ -10,6 +10,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 )
 
 const (
@@ -54,6 +55,20 @@ var tutoringTipsBuildBudget = 90 * time.Second
 // BuildTutoringTips resolves every content fact from an owner-scoped confirmed
 // GradingJob. The client cannot supply grade, subject, concepts, or problems.
 func (d Deps) BuildTutoringTips(ctx context.Context, agentName, gradingJobID string) (TutoringTips, error) {
+	return d.BuildTutoringTipsSubject(ctx, agentName, gradingJobID)
+}
+
+// BuildTutoringTipsForOwner carries the authenticated/composition-owned
+// Knowledge principal into the textbook grounding lookup without treating the
+// tutor agent name as an authorization identity.
+func (d Deps) BuildTutoringTipsForOwner(
+	ctx context.Context,
+	ownerID, agentName, gradingJobID string,
+) (TutoringTips, error) {
+	d.TextbookOwnerID = strings.TrimSpace(ownerID)
+	if d.TextbookOwnerID == "" {
+		return TutoringTips{}, fmt.Errorf("%w: textbook owner required", ErrInvalidInput)
+	}
 	return d.BuildTutoringTipsSubject(ctx, agentName, gradingJobID)
 }
 
@@ -116,12 +131,15 @@ func (d Deps) BuildTutoringTipsSubject(ctx context.Context, agentName, gradingJo
 	}
 	if d.Records != nil && subject == "数学" {
 		if scope, found, resolveErr := d.Records.GetActiveTextbookGroundingScope(
-			ctx, agentName, "math",
+			ctx, k12storage.TextbookScope{
+				OwnerID: d.TextbookOwnerID, AgentName: agentName, Subject: "math",
+			},
 		); resolveErr == nil && found {
 			groundingRequest.TextbookBindingID = scope.TextbookBindingID
 			groundingRequest.TextbookManifestID = scope.TextbookManifestID
 			groundingRequest.DocumentID = scope.DocumentID
 			groundingRequest.DocumentGeneration = scope.DocumentGeneration
+			groundingRequest.SourceDigest = scope.SourceDigest
 			groundingRequest.Edition = scope.Edition
 			groundingRequest.Volume = scope.Volume
 			groundingRequest.SegmentRefs = append(

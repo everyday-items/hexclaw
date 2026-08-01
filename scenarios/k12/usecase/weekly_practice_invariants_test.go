@@ -63,7 +63,7 @@ func configureWeeklyBundle(
 	t.Helper()
 	d.WeeklyCurriculum = weeklyInvariantCatalog{}
 	_, err := d.UpdateProfileBundle(context.Background(), usecase.UpdateProfileBundleRequest{
-		AgentName: "xiaoming", IdempotencyKey: "profile-bundle",
+		OwnerID: "desktop-user", AgentName: "xiaoming", IdempotencyKey: "profile-bundle",
 		ExpectedProfileRevision: 0, ExpectedProgressRevision: 0,
 		ExpectedSettingsRevision: 0,
 		Profile: k12.ChildProfile{
