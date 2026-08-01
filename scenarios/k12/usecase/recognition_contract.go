@@ -279,6 +279,10 @@ func NormalizeRecognizedProblems(scope string, questions []RecognizedQuestion) (
 		question.AttemptID = ""
 		question.ConfirmedVersion = 0
 		question.InputDigest = ""
+		// System ordering is a server-derived display fact. Never persist a
+		// response-local/model-supplied ordinal as if it were worksheet evidence.
+		question.SystemSectionOrdinal = 0
+		question.SystemDisplayLabel = ""
 		if question.PageAssetID == "" {
 			question.PageAssetID = pageAssetID
 		}
@@ -337,6 +341,7 @@ func NormalizeRecognizedProblems(scope string, questions []RecognizedQuestion) (
 		out[i].ProblemID = stableProblemID(scope, i, out[i])
 		out[i].AttemptID = stableRecognitionID("attempt", scope+"\x00"+out[i].ProblemID)
 	}
+	out = deriveSystemSectionOrder(out)
 	if err := validateNormalizedRecognizedProblems(out); err != nil {
 		return nil, err
 	}
@@ -350,6 +355,14 @@ func validateRecognitionEvidence(index int, question RecognizedQuestion) error {
 	for _, token := range question.SourceNumberPath {
 		if strings.TrimSpace(token) == "" {
 			return fmt.Errorf("%w: problem index %d source_number_path 含空 token", ErrInvalidInput, index)
+		}
+	}
+	if (len(question.SourceSectionPath) == 0) != (strings.TrimSpace(question.SourceSectionLabel) == "") {
+		return fmt.Errorf("%w: problem index %d source_section_path/source_section_label 必须同时存在或同时为空", ErrInvalidInput, index)
+	}
+	for _, token := range question.SourceSectionPath {
+		if strings.TrimSpace(token) == "" {
+			return fmt.Errorf("%w: problem index %d source_section_path 含空 token", ErrInvalidInput, index)
 		}
 	}
 	if question.RecognitionConfidence != nil &&
@@ -522,6 +535,52 @@ func validateNormalizedRecognizedProblems(out []RecognizedQuestion) error {
 			)
 		}
 	}
+	if err := validateSourceSectionAndSystemOrder(out); err != nil {
+		return err
+	}
+	return nil
+}
+
+// deriveSystemSectionOrder creates a display-only ordinal only for answerable
+// items that have a printed section heading but no printed child number. It
+// always discards any caller-provided system value.
+func deriveSystemSectionOrder(questions []RecognizedQuestion) []RecognizedQuestion {
+	out := cloneRecognizedQuestions(questions)
+	counters := make(map[string]int)
+	for i := range out {
+		q := &out[i]
+		q.SystemSectionOrdinal = 0
+		q.SystemDisplayLabel = ""
+		if q.ProblemKind == ProblemKindCompoundParent || len(q.SourceNumberPath) != 0 || len(q.SourceSectionPath) == 0 {
+			continue
+		}
+		key := strings.Join(q.SourceSectionPath, "\x00")
+		counters[key]++
+		q.SystemSectionOrdinal = counters[key]
+		q.SystemDisplayLabel = fmt.Sprintf("第 %d 题（系统序号）", q.SystemSectionOrdinal)
+	}
+	return out
+}
+
+func validateSourceSectionAndSystemOrder(questions []RecognizedQuestion) error {
+	sectionLabels := make(map[string]string)
+	for index, question := range questions {
+		if len(question.SourceSectionPath) == 0 {
+			continue
+		}
+		key := strings.Join(question.SourceSectionPath, "\x00")
+		if prior, exists := sectionLabels[key]; exists && prior != question.SourceSectionLabel {
+			return fmt.Errorf("%w: normalized problem index %d source_section_label conflicts with identical source_section_path", ErrInvalidInput, index)
+		}
+		sectionLabels[key] = question.SourceSectionLabel
+	}
+	expected := deriveSystemSectionOrder(questions)
+	for index := range questions {
+		if questions[index].SystemSectionOrdinal != expected[index].SystemSectionOrdinal ||
+			questions[index].SystemDisplayLabel != expected[index].SystemDisplayLabel {
+			return fmt.Errorf("%w: normalized problem index %d system section order must be server-derived", ErrInvalidInput, index)
+		}
+	}
 	return nil
 }
 
@@ -579,18 +638,22 @@ func RecognizedQuestionsForAssessment(questions []RecognizedQuestion) []Recogniz
 // 修正命令的字段排列均不参与，避免同一 canonical 因表面载荷不同产生不同结论身份。
 func CanonicalRecognizedQuestionsDigest(questions []RecognizedQuestion) string {
 	type digestItem struct {
-		ProblemID        string      `json:"problem_id"`
-		ProblemKind      ProblemKind `json:"problem_kind"`
-		ParentProblemID  string      `json:"parent_problem_id,omitempty"`
-		SubproblemNo     string      `json:"subproblem_no,omitempty"`
-		SourceNumberPath []string    `json:"source_number_path,omitempty"`
-		DisplayLabel     string      `json:"display_label,omitempty"`
-		Question         string      `json:"canonical_markdown"`
-		Answer           string      `json:"answer_canonical_markdown,omitempty"`
-		AnswerState      AnswerState `json:"answer_state"`
-		Subject          string      `json:"subject"`
-		CanonicalVersion int         `json:"canonical_version"`
-		ConfirmedVersion int         `json:"confirmed_version"`
+		ProblemID            string      `json:"problem_id"`
+		ProblemKind          ProblemKind `json:"problem_kind"`
+		ParentProblemID      string      `json:"parent_problem_id,omitempty"`
+		SubproblemNo         string      `json:"subproblem_no,omitempty"`
+		SourceNumberPath     []string    `json:"source_number_path,omitempty"`
+		DisplayLabel         string      `json:"display_label,omitempty"`
+		SourceSectionPath    []string    `json:"source_section_path,omitempty"`
+		SourceSectionLabel   string      `json:"source_section_label,omitempty"`
+		SystemSectionOrdinal int         `json:"system_section_ordinal,omitempty"`
+		SystemDisplayLabel   string      `json:"system_display_label,omitempty"`
+		Question             string      `json:"canonical_markdown"`
+		Answer               string      `json:"answer_canonical_markdown,omitempty"`
+		AnswerState          AnswerState `json:"answer_state"`
+		Subject              string      `json:"subject"`
+		CanonicalVersion     int         `json:"canonical_version"`
+		ConfirmedVersion     int         `json:"confirmed_version"`
 	}
 	items := make([]digestItem, 0, len(questions))
 	for _, q := range questions {
@@ -598,7 +661,9 @@ func CanonicalRecognizedQuestionsDigest(questions []RecognizedQuestion) string {
 		items = append(items, digestItem{
 			ProblemID: q.ProblemID, ProblemKind: q.ProblemKind, ParentProblemID: q.ParentProblemID,
 			SubproblemNo: q.SubproblemNo, SourceNumberPath: append([]string(nil), q.SourceNumberPath...),
-			DisplayLabel: q.DisplayLabel, Question: q.CanonicalMarkdown,
+			DisplayLabel: q.DisplayLabel, SourceSectionPath: append([]string(nil), q.SourceSectionPath...),
+			SourceSectionLabel: q.SourceSectionLabel, SystemSectionOrdinal: q.SystemSectionOrdinal,
+			SystemDisplayLabel: q.SystemDisplayLabel, Question: q.CanonicalMarkdown,
 			Answer: q.AnswerCanonicalMarkdown, AnswerState: q.AnswerState, Subject: q.Subject,
 			CanonicalVersion: q.CanonicalVersion, ConfirmedVersion: q.ConfirmedVersion,
 		})
@@ -633,18 +698,24 @@ func FreezeRecognizedQuestionInputDigests(questions []RecognizedQuestion, gradin
 			stem = strings.TrimSpace(parents[q.ParentProblemID]) + "\n\n" + strings.TrimSpace(stem)
 		}
 		payload := struct {
-			ProblemKind      ProblemKind `json:"problem_kind"`
-			Stem             string      `json:"stem_markdown"`
-			Answer           string      `json:"answer_markdown"`
-			AnswerState      AnswerState `json:"answer_state"`
-			Subject          string      `json:"subject"`
-			Subproblem       string      `json:"subproblem_no,omitempty"`
-			SourceNumberPath []string    `json:"source_number_path,omitempty"`
-			DisplayLabel     string      `json:"display_label,omitempty"`
-			Context          string      `json:"context,omitempty"`
+			ProblemKind          ProblemKind `json:"problem_kind"`
+			Stem                 string      `json:"stem_markdown"`
+			Answer               string      `json:"answer_markdown"`
+			AnswerState          AnswerState `json:"answer_state"`
+			Subject              string      `json:"subject"`
+			Subproblem           string      `json:"subproblem_no,omitempty"`
+			SourceNumberPath     []string    `json:"source_number_path,omitempty"`
+			DisplayLabel         string      `json:"display_label,omitempty"`
+			SourceSectionPath    []string    `json:"source_section_path,omitempty"`
+			SourceSectionLabel   string      `json:"source_section_label,omitempty"`
+			SystemSectionOrdinal int         `json:"system_section_ordinal,omitempty"`
+			SystemDisplayLabel   string      `json:"system_display_label,omitempty"`
+			Context              string      `json:"context,omitempty"`
 		}{
 			q.ProblemKind, stem, q.AnswerCanonicalMarkdown, q.AnswerState, q.Subject,
 			q.SubproblemNo, append([]string(nil), q.SourceNumberPath...), q.DisplayLabel,
+			append([]string(nil), q.SourceSectionPath...), q.SourceSectionLabel,
+			q.SystemSectionOrdinal, q.SystemDisplayLabel,
 			contextValue,
 		}
 		raw, _ := json.Marshal(payload)
@@ -681,9 +752,13 @@ func RecognizedQuestionsProblemAttemptSnapshot(agentName, submissionID string, q
 			ProblemID: question.ProblemID, AgentName: agentName, SubmissionID: submissionID,
 			PageAssetID: question.PageAssetID, Ordinal: index, ProblemKind: string(question.ProblemKind),
 			ParentProblemID: question.ParentProblemID, SubproblemNo: question.SubproblemNo,
-			SourceNumberPath: append([]string(nil), question.SourceNumberPath...),
-			DisplayLabel:     question.DisplayLabel,
-			Subject:          question.Subject, StemRaw: question.RawTranscription,
+			SourceNumberPath:     append([]string(nil), question.SourceNumberPath...),
+			DisplayLabel:         question.DisplayLabel,
+			SourceSectionPath:    append([]string(nil), question.SourceSectionPath...),
+			SourceSectionLabel:   question.SourceSectionLabel,
+			SystemSectionOrdinal: question.SystemSectionOrdinal,
+			SystemDisplayLabel:   question.SystemDisplayLabel,
+			Subject:              question.Subject, StemRaw: question.RawTranscription,
 			StemMarkdown: question.CanonicalMarkdown, ConceptIDs: append([]string(nil), question.KnowledgePoints...),
 			TranscriptionConfidence: question.RecognitionConfidence,
 			ConfirmationRequired:    question.ConfirmationRequired, ConfirmationReasons: reasons,
@@ -737,9 +812,13 @@ func RecognizedQuestionsFromProblemAttemptSnapshot(snapshot k12.ProblemAttemptSn
 		question := RecognizedQuestion{
 			ProblemID: problem.ProblemID, ProblemKind: ProblemKind(problem.ProblemKind),
 			ParentProblemID: problem.ParentProblemID, SubproblemNo: problem.SubproblemNo,
-			SourceNumberPath: append([]string(nil), problem.SourceNumberPath...),
-			DisplayLabel:     problem.DisplayLabel,
-			PageAssetID:      problem.PageAssetID, RawTranscription: problem.StemRaw,
+			SourceNumberPath:     append([]string(nil), problem.SourceNumberPath...),
+			DisplayLabel:         problem.DisplayLabel,
+			SourceSectionPath:    append([]string(nil), problem.SourceSectionPath...),
+			SourceSectionLabel:   problem.SourceSectionLabel,
+			SystemSectionOrdinal: problem.SystemSectionOrdinal,
+			SystemDisplayLabel:   problem.SystemDisplayLabel,
+			PageAssetID:          problem.PageAssetID, RawTranscription: problem.StemRaw,
 			CanonicalMarkdown: problem.StemMarkdown, CanonicalVersion: problem.CanonicalVersion,
 			KnowledgePoints: append([]string(nil), problem.ConceptIDs...), Subject: problem.Subject,
 			RecognitionConfidence: problem.TranscriptionConfidence,

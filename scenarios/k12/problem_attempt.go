@@ -19,6 +19,10 @@ type Problem struct {
 	SubproblemNo            string   `json:"subproblem_no,omitempty"`
 	SourceNumberPath        []string `json:"source_number_path,omitempty"`
 	DisplayLabel            string   `json:"display_label,omitempty"`
+	SourceSectionPath       []string `json:"source_section_path,omitempty"`
+	SourceSectionLabel      string   `json:"source_section_label,omitempty"`
+	SystemSectionOrdinal    int      `json:"system_section_ordinal,omitempty"`
+	SystemDisplayLabel      string   `json:"system_display_label,omitempty"`
 	Subject                 string   `json:"subject,omitempty"`
 	StemRaw                 string   `json:"stem_raw"`
 	StemMarkdown            string   `json:"stem_markdown"`

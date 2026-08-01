@@ -239,6 +239,74 @@ func TestBUG20260726_D_SourceNumberPathSurvivesCanonicalDigestAndDurableRoundTri
 	}
 }
 
+func TestDD041_UnnumberedSectionItemsReceiveOnlyServerDerivedSystemOrder(t *testing.T) {
+	questions, err := NormalizeRecognizedProblems("submission-dd041", []RecognizedQuestion{
+		{
+			ProblemKind:        ProblemKindStandalone,
+			SourceSectionPath:  []string{"一"},
+			SourceSectionLabel: "一、直接写得数",
+			Question:           "4÷0.5=",
+			Subject:            "数学",
+			AnswerState:        AnswerStatePresent,
+			StudentAnswer:      "8",
+		},
+		{
+			ProblemKind:        ProblemKindStandalone,
+			SourceSectionPath:  []string{"一"},
+			SourceSectionLabel: "一、直接写得数",
+			Question:           "10×0.01=",
+			Subject:            "数学",
+			AnswerState:        AnswerStatePresent,
+			StudentAnswer:      "0.1",
+		},
+		{
+			ProblemKind:        ProblemKindStandalone,
+			SourceNumberPath:  []string{"三", "1"},
+			DisplayLabel:      "三、1",
+			SourceSectionPath: []string{"三"},
+			SourceSectionLabel: "三、列式计算",
+			Question:          "3/8 是 24",
+			Subject:           "数学",
+			AnswerState:       AnswerStateBlank,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, want := range []struct {
+		sourcePath []string
+		sectionPath []string
+		sectionLabel string
+		systemOrdinal int
+		systemLabel string
+	}{
+		{nil, []string{"一"}, "一、直接写得数", 1, "第 1 题（系统序号）"},
+		{nil, []string{"一"}, "一、直接写得数", 2, "第 2 题（系统序号）"},
+		{[]string{"三", "1"}, []string{"三"}, "三、列式计算", 0, ""},
+	} {
+		got := questions[index]
+		if !reflect.DeepEqual(got.SourceNumberPath, want.sourcePath) ||
+			!reflect.DeepEqual(got.SourceSectionPath, want.sectionPath) ||
+			got.SourceSectionLabel != want.sectionLabel ||
+			got.SystemSectionOrdinal != want.systemOrdinal ||
+			got.SystemDisplayLabel != want.systemLabel {
+			t.Fatalf("DD-041 facts at %d = %#v, want source=%#v section=%#v/%q system=%d/%q", index, got, want.sourcePath, want.sectionPath, want.sectionLabel, want.systemOrdinal, want.systemLabel)
+		}
+	}
+
+	snapshot, err := RecognizedQuestionsProblemAttemptSnapshot("mingming", "submission-dd041", questions, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := RecognizedQuestionsFromProblemAttemptSnapshot(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(restored, questions) {
+		t.Fatalf("DD-041 durable round-trip changed source/system facts:\n got=%#v\nwant=%#v", restored, questions)
+	}
+}
+
 func TestNormalizeRecognizedProblems_CompoundParentAndStableChildren(t *testing.T) {
 	input := []RecognizedQuestion{
 		{ProblemID: "model-parent", ProblemKind: ProblemKindCompoundParent, Question: "阅读材料并回答", Subject: "语文"},

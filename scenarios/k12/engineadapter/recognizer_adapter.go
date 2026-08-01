@@ -152,10 +152,12 @@ func (a *RecognizerAdapter) splitWorksheet(
 var _ usecase.Recognizer = (*RecognizerAdapter)(nil)
 
 const recognizePrompt = `识别这张作业图片里的所有题目，并逐题回收孩子的手写作答事实、判定题目学科。严格输出 JSON 数组，每个元素形如：
-{"problem_id":"仅用于本次 JSON 内父子关联的临时引用","problem_kind":"standalone","parent_problem_id":"","subproblem_no":"","source_number_path":["三","1"],"display_label":"三、1","question":"逐字原始转写","canonical_markdown":"规范 Markdown/LaTeX","subject":"数学","knowledge_points":["知识点1"],"answer_state":"present","student_answer":"孩子实际写下且能可靠辨认的原始作答","answer_canonical_markdown":"规范 Markdown/LaTeX","recognition_confidence":0.98,"ocr_signals":[]}
+{"problem_id":"仅用于本次 JSON 内父子关联的临时引用","problem_kind":"standalone","parent_problem_id":"","subproblem_no":"","source_number_path":["三","1"],"display_label":"三、1","source_section_path":["三"],"source_section_label":"三、列式计算","question":"逐字原始转写","canonical_markdown":"规范 Markdown/LaTeX","subject":"数学","knowledge_points":["知识点1"],"answer_state":"present","student_answer":"孩子实际写下且能可靠辨认的原始作答","answer_canonical_markdown":"规范 Markdown/LaTeX","recognition_confidence":0.98,"ocr_signals":[]}
 关键规则：
-- 每个独立作答的小题必须对应一个 JSON 元素：即使多个口算、填空或选择小题横排在同一行，也要逐小题拆开，不能合并成一个大题/整行元素；章节标题不能当作题目，但章节原题号必须作为下属题目的 source_number_path 上级 token 保留。
-- 章节标题不是题目，不得把标题单独输出为 standalone；标题下每个有可见子题号的可作答小题必须输出完整层级，例如“一、计算题”下的第 1、2 题必须分别为 ["一","1"] / "一、1" 与 ["一","2"] / "一、2"。子题必须输出完整层级，不得只输出子题的局部序号，也不得用空题号代替标题下可见子题号。
+- 每个独立作答的小题必须对应一个 JSON 元素：即使多个口算、填空或选择小题横排在同一行，也要逐小题拆开，不能合并成一个大题/整行元素；章节标题不是题目，不得把标题单独输出为 standalone。
+- 每个题都要回收所属可见章节标题：source_section_path 只放标题编号层级、source_section_label 抄录完整可见标题，例如 ["一"] / "一、计算题"；没有可见章节标题则两个字段同时为空。
+- 标题下每个有可见子题号的可作答小题必须输出完整 source_number_path 与 display_label，例如“一、计算题”下的第 1、2 题分别为 ["一","1"] / "一、1" 与 ["一","2"] / "一、2"。子题必须输出完整层级，不得只输出子题的局部序号，不得用空题号代替标题下可见子题号。
+- 如果小题本身没有可见印刷题号，source_number_path 与 display_label 必须同时为空；保留其 source_section_*，不得按位置补号，也不得输出任何“系统序号”字段。
 - source_number_path 必须逐层保留原卷实际可见题号字符，例如大题“三”下第“1”题输出 ["三","1"]；display_label 必须按原卷层级输出“三、1”。原卷没有题号时两者分别输出 [] 和 ""，禁止按识别顺序自造连续题号。不得让两个独立作答小题复用同一个非空 source_number_path，也不得让两个独立作答小题复用同一个非空 display_label；无法辨认子题号时不得编造。
 - problem_id 只是在本次 JSON 内供 parent_problem_id 引用的临时标签，不是持久 ID；不要输出 attempt_id、input_digest、confirmed_version 等系统字段。
 - 复合题公共材料只输出一次 problem_kind=compound_parent（不得带孩子作答）；每个小题输出 problem_kind=subproblem、parent_problem_id 精确指向本次 JSON 内父题的 problem_id、subproblem_no 为稳定小题号。普通题用 standalone。
@@ -174,13 +176,14 @@ const recognizePrompt = `识别这张作业图片里的所有题目，并逐题�
 const printedQuestionInventoryPrompt = `这是“整页印刷题清单”识别，不是批改，也不要读取或推测学生答案。
 请按页面从上到下、同一行从左到右，逐小题准确抄录所有印刷体题干；横排口算必须逐题拆开，章节标题不能算题目。
 关键规则：
-- 章节标题不是题目；标题下每个有可见子题号的可作答小题必须输出完整 source_number_path 与 display_label，例如“一、计算题”下的第 1 题为 ["一","1"] / "一、1"。不得只输出子题的局部序号，不得用空题号代替标题下可见子题号，也不得按位置自行补号。
+- 章节标题不是题目；每个题回收所属可见 source_section_path/source_section_label。标题下每个有可见子题号的可作答小题必须输出完整 source_number_path 与 display_label，例如“一、计算题”下的第 1 题为 ["一","1"] / "一、1"。不得只输出子题的局部序号，不得用空题号代替标题下可见子题号。
+- 小题本身没有可见印刷题号时，source_number_path/display_label 必须同时为空，仍保留其 source_section_*；不得按位置自行补号，也不得输出系统序号。
 - question 只允许包含印刷体原题，忽略铅笔、黑笔、涂改和手写等号右侧内容；
 - 分数的分子、分母和横线必须完整保留；看见 5/7−1/5 不能漏成 5−1/5；
 - 小数点、运算符、单位、括号和题号必须按图抄录，不能用数学常识改写；
 - subject 只能取 数学 / 语文 / 英语 / 物理 / 化学，无法判断时留空；
 - knowledge_points 只填写从印刷题干可确定的知识点。
-严格只输出紧凑 JSON 数组，每个对象仅含 source_number_path、display_label、question、subject、knowledge_points，不要输出 student_answer、answer_state、bbox 或解释。`
+严格只输出紧凑 JSON 数组，每个对象仅含 source_number_path、display_label、source_section_path、source_section_label、question、subject、knowledge_points，不要输出 student_answer、answer_state、bbox、system_section_ordinal、system_display_label 或解释。`
 
 // recognizedDTO 解析视觉模型 JSON 用（带 json tag）。
 type recognizedDTO struct {
@@ -190,6 +193,8 @@ type recognizedDTO struct {
 	SubproblemNo                 string   `json:"subproblem_no"`
 	SourceNumberPath             []string `json:"source_number_path"`
 	DisplayLabel                 string   `json:"display_label"`
+	SourceSectionPath            []string `json:"source_section_path"`
+	SourceSectionLabel           string   `json:"source_section_label"`
 	Question                     string   `json:"question"`
 	CanonicalMarkdown            string   `json:"canonical_markdown"`
 	Subject                      string   `json:"subject"`
@@ -398,6 +403,7 @@ func parseRecognizedQuestions(raw string) ([]usecase.RecognizedQuestion, error) 
 			ProblemID: d.ProblemID, ProblemKind: usecase.ProblemKind(d.ProblemKind),
 			ParentProblemID: d.ParentProblemID, SubproblemNo: d.SubproblemNo,
 			SourceNumberPath: append([]string(nil), d.SourceNumberPath...), DisplayLabel: d.DisplayLabel,
+			SourceSectionPath: append([]string(nil), d.SourceSectionPath...), SourceSectionLabel: d.SourceSectionLabel,
 			Question: question, RawTranscription: rawQuestion, CanonicalMarkdown: canonicalQuestion,
 			KnowledgePoints: d.KnowledgePoints, AnswerState: answerState,
 			StudentAnswer: studentAnswer, AnswerRawTranscription: d.StudentAnswer,
@@ -426,18 +432,10 @@ func validateRecognitionProtocolResult(
 	}
 	seenPaths := make(map[string]int, len(normalized))
 	seenLabels := make(map[string]int, len(normalized))
-	hasNumberedEvidence := false
-	hasUnnumberedEvidence := false
 	for index, question := range normalized {
 		if len(question.SourceNumberPath) == 0 {
-			// A wholly unnumbered source is legitimate. Mixed whole-page
-			// evidence, though, cannot prove whether a child number beneath a
-			// detected heading was missed, so DD-036 must re-read it rather than
-			// freezing an ordinal-derived guess.
-			hasUnnumberedEvidence = true
 			continue
 		}
-		hasNumberedEvidence = true
 		path, marshalErr := json.Marshal(question.SourceNumberPath)
 		if marshalErr != nil {
 			return fmt.Errorf(
@@ -466,12 +464,6 @@ func validateRecognitionProtocolResult(
 			)
 		}
 		seenLabels[label] = index
-	}
-	if hasNumberedEvidence && hasUnnumberedEvidence {
-		return fmt.Errorf(
-			"%w: recognizer: 识题结果混合有题号与无题号事实，无法冻结来源层级",
-			k12.ErrRecognitionProtocolInvalid,
-		)
 	}
 	return nil
 }
@@ -512,6 +504,7 @@ func parsePrintedQuestionInventory(raw string) ([]usecase.RecognizedQuestion, er
 			ProblemID: dto.ProblemID, ProblemKind: usecase.ProblemKind(dto.ProblemKind),
 			ParentProblemID: dto.ParentProblemID, SubproblemNo: dto.SubproblemNo,
 			SourceNumberPath: append([]string(nil), dto.SourceNumberPath...), DisplayLabel: dto.DisplayLabel,
+			SourceSectionPath: append([]string(nil), dto.SourceSectionPath...), SourceSectionLabel: dto.SourceSectionLabel,
 			Question: question, RawTranscription: rawQuestion, CanonicalMarkdown: canonicalQuestion,
 			KnowledgePoints: dto.KnowledgePoints,
 			AnswerState:     usecase.AnswerStateBlank,
@@ -909,6 +902,15 @@ func mergePrintedInventoryObservation(
 		merged.SourceNumberPath = append([]string(nil), inventory.SourceNumberPath...)
 		merged.DisplayLabel = inventory.DisplayLabel
 	}
+	// Section evidence has the same source-only rule as a printed number. The
+	// independent inventory may fill it only for an exact normalized stem; it
+	// never derives a section from crop order or a nearby heading.
+	if missingSourceSectionEvidence(observed) &&
+		completeSourceSectionEvidence(inventory) &&
+		recognizedQuestionKey(observed.Question) == recognizedQuestionKey(inventory.Question) {
+		merged.SourceSectionPath = append([]string(nil), inventory.SourceSectionPath...)
+		merged.SourceSectionLabel = inventory.SourceSectionLabel
+	}
 	observedKey := normalizeArithmeticQuestion(recognizedQuestionKey(observed.Question))
 	inventoryKey := normalizeArithmeticQuestion(recognizedQuestionKey(inventory.Question))
 	_, observedContainsHandwrittenRHS := equationVariantAnswer(
@@ -950,6 +952,22 @@ func completeSourceNumberEvidence(question usecase.RecognizedQuestion) bool {
 		return false
 	}
 	for _, token := range question.SourceNumberPath {
+		if strings.TrimSpace(token) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func missingSourceSectionEvidence(question usecase.RecognizedQuestion) bool {
+	return len(question.SourceSectionPath) == 0 && strings.TrimSpace(question.SourceSectionLabel) == ""
+}
+
+func completeSourceSectionEvidence(question usecase.RecognizedQuestion) bool {
+	if len(question.SourceSectionPath) == 0 || strings.TrimSpace(question.SourceSectionLabel) == "" {
+		return false
+	}
+	for _, token := range question.SourceSectionPath {
 		if strings.TrimSpace(token) == "" {
 			return false
 		}

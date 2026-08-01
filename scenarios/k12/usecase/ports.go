@@ -119,14 +119,22 @@ const (
 type RecognizedQuestion struct {
 	// ProblemID 是一次 Submission 内稳定的问题标识。复合题的公共题干与每个可作答小题
 	// 都有独立 ID；锚点、确认版本与 Assessment 只能引用可作答题自己的 ID。
-	ProblemID       string      `json:"problem_id,omitempty"`
-	ProblemKind     ProblemKind `json:"problem_kind,omitempty"`
-	ParentProblemID string      `json:"parent_problem_id,omitempty"`
-	SubproblemNo    string      `json:"subproblem_no,omitempty"`
-	SourceNumberPath []string   `json:"source_number_path,omitempty"`
-	DisplayLabel     string     `json:"display_label,omitempty"`
-	PageAssetID     string      `json:"page_asset_id,omitempty"`
-	AttemptID       string      `json:"attempt_id,omitempty"`
+	ProblemID        string      `json:"problem_id,omitempty"`
+	ProblemKind      ProblemKind `json:"problem_kind,omitempty"`
+	ParentProblemID  string      `json:"parent_problem_id,omitempty"`
+	SubproblemNo     string      `json:"subproblem_no,omitempty"`
+	SourceNumberPath []string    `json:"source_number_path,omitempty"`
+	DisplayLabel     string      `json:"display_label,omitempty"`
+	// SourceSection* is the printed section heading exactly as visible on the
+	// worksheet. A heading is a source fact, never an answerable problem itself.
+	SourceSectionPath  []string `json:"source_section_path,omitempty"`
+	SourceSectionLabel string   `json:"source_section_label,omitempty"`
+	// System* is server-derived only for an unnumbered answerable item within a
+	// printed section. It must never be attributed to the source worksheet.
+	SystemSectionOrdinal int    `json:"system_section_ordinal,omitempty"`
+	SystemDisplayLabel   string `json:"system_display_label,omitempty"`
+	PageAssetID          string `json:"page_asset_id,omitempty"`
+	AttemptID            string `json:"attempt_id,omitempty"`
 
 	// OCR 原始转写与 canonical Markdown/LaTeX 是两份独立事实。Raw* 一经识别不得被
 	// 家长修正或增强模型覆盖；canonical 可在显式确认时形成新版本。
@@ -179,6 +187,12 @@ func normalizeRecognizedQuestionFacts(q RecognizedQuestion) RecognizedQuestion {
 		q.SourceNumberPath[i] = strings.TrimSpace(q.SourceNumberPath[i])
 	}
 	q.DisplayLabel = strings.TrimSpace(q.DisplayLabel)
+	q.SourceSectionPath = append([]string(nil), q.SourceSectionPath...)
+	for i := range q.SourceSectionPath {
+		q.SourceSectionPath[i] = strings.TrimSpace(q.SourceSectionPath[i])
+	}
+	q.SourceSectionLabel = strings.TrimSpace(q.SourceSectionLabel)
+	q.SystemDisplayLabel = strings.TrimSpace(q.SystemDisplayLabel)
 	if q.RawTranscription == "" {
 		q.RawTranscription = legacyQuestion
 	}
