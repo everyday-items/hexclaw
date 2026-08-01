@@ -19,6 +19,7 @@ package cron
 import (
 	"context"
 	"database/sql"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -163,6 +164,9 @@ func TestBug20260704_CompilePromptMandatesSelfDescribingErrors(t *testing.T) {
 // --- 端到端：采集模板打真实百度热搜（网络门禁） ---
 
 func TestBug20260704_BaiduCollectTemplate_LiveTop20(t *testing.T) {
+	if os.Getenv("HEX_LIVE_BAIDU_COLLECT_E2E") != "1" {
+		t.Skip("需要当前执行轮的真实公网授权；设置 HEX_LIVE_BAIDU_COLLECT_E2E=1 后才运行真实百度 E2E")
+	}
 	if testing.Short() {
 		t.Skip("-short：跳过真实网络 E2E")
 	}

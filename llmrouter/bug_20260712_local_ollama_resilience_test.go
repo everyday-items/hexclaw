@@ -12,6 +12,7 @@ import (
 // 硬崩「provider 不存在」。已有本地 provider 则尊重配置不覆盖；Ollama 未运行则不注册。
 
 func TestBuildSelector_AutoRegistersLocalOllamaWhenRunning(t *testing.T) {
+	t.Setenv("HEXCLAW_TEST_ALLOW_AUTO_LOCAL_OLLAMA", "1")
 	prev := localOllamaReachable
 	localOllamaReachable = func() bool { return true }
 	defer func() { localOllamaReachable = prev }()

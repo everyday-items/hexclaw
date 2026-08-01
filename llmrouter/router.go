@@ -15,10 +15,12 @@ package llmrouter
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -368,6 +370,17 @@ var localOllamaReachable = func() bool {
 	return true
 }
 
+// autoLocalOllamaRegistrationAllowed prevents ordinary Go tests from silently
+// turning a configured fake/remote provider into a real localhost model call.
+// Production binaries preserve the resilience behavior; a test can exercise the
+// branch only with an explicit fake-probe opt-in.
+func autoLocalOllamaRegistrationAllowed() bool {
+	if flag.Lookup("test.paniconexit0") == nil {
+		return true
+	}
+	return os.Getenv("HEXCLAW_TEST_ALLOW_AUTO_LOCAL_OLLAMA") == "1"
+}
+
 // hasLocalProvider 判断配置里是否已有任一本地 provider（指向回环端点）。
 func hasLocalProvider(providers map[string]config.LLMProviderConfig) bool {
 	for name, pc := range providers {
@@ -406,7 +419,7 @@ func buildSelectorState(cfg config.LLMConfig) (map[string]hexagon.Provider, conf
 	// 测试或误操作抹掉），自动注册默认「Ollama (本地)」。让本地模型「配置漂移也不丢」，绑定本地
 	// 模型的 agent 不再因缺 provider 硬崩（BUG-20260712）。已有本地 provider 则尊重配置不覆盖。
 	// 仅**补充**已有配置（len>0）：空配置=「未配置 LLM」语义不变（不凭空造 LLM，保 nil-router 契约）。
-	if len(providerNames) > 0 && !hasLocalProvider(activeCfg.Providers) && localOllamaReachable() {
+	if autoLocalOllamaRegistrationAllowed() && len(providerNames) > 0 && !hasLocalProvider(activeCfg.Providers) && localOllamaReachable() {
 		enabled := true
 		activeCfg.Providers[localOllamaProviderName] = config.LLMProviderConfig{
 			BaseURL: localOllamaBaseURL,
