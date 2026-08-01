@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/hexagon-codes/hexagon/rag/splitter"
@@ -12,7 +13,10 @@ import (
 
 func setupTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("sqlite", ":memory:")
+	// :memory: 为每个 SQLite 连接创建独立数据库；并发检索会从 sql.DB 池取到没有
+	// schema 的连接，导致 race 测试把真实查询错误误判为通过。测试专用文件既隔离
+	// 用例，也允许池内多个连接看见同一份 schema/数据。
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "knowledge-test.db"))
 	if err != nil {
 		t.Fatalf("打开测试数据库失败: %v", err)
 	}

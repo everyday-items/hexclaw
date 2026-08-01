@@ -596,6 +596,7 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("DELETE /api/v1/knowledge/documents/{id}", s.handleDeleteDocument)
 		mux.HandleFunc("POST /api/v1/knowledge/documents/{id}/reindex", s.handleReindexDocument)
 		mux.HandleFunc("POST /api/v1/knowledge/search", s.handleSearchKnowledge)
+		mux.HandleFunc("GET /api/v1/knowledge/metrics", s.handleKnowledgeRetrievalMetrics)
 		mux.HandleFunc("GET /api/v1/knowledge/config", s.handleGetKnowledgeConfig)
 		mux.HandleFunc("GET /api/v1/knowledge/embedding-status", s.handleKnowledgeEmbeddingStatus)
 		mux.HandleFunc("PUT /api/v1/knowledge/config", s.handlePutKnowledgeConfig)

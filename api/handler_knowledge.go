@@ -624,10 +624,22 @@ func (s *Server) handleSearchKnowledge(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if !knowledge.SearchQueryWithinBudget(req.Query) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("query 长度不能超过 %d 个字符", knowledge.MaxSearchQueryRunes),
+		})
+		return
+	}
 
 	topK := req.TopK
 	if topK <= 0 {
-		topK = 3
+		topK = knowledge.DefaultSearchTopK
+	}
+	if topK > knowledge.MaxSearchTopK {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("top_k 不能超过 %d", knowledge.MaxSearchTopK),
+		})
+		return
 	}
 
 	createdAfter, err := knowledge.ParseFilterDate(req.CreatedAfter)
@@ -663,6 +675,17 @@ func (s *Server) handleSearchKnowledge(w http.ResponseWriter, r *http.Request) {
 		"total":          len(results),
 		"query_receipts": receipts,
 	})
+}
+
+// handleKnowledgeRetrievalMetrics exposes aggregate, query-content-free local
+// diagnostics for FTS/LIKE fallback and vector lane latency. It is intentionally
+// read-only and inherits the existing local management API protection.
+func (s *Server) handleKnowledgeRetrievalMetrics(w http.ResponseWriter, _ *http.Request) {
+	if s.kb == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "知识库未启用"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.kb.RetrievalMetricsSnapshot())
 }
 
 // ── 检索质量参数（检索参数面板）─────────────────────────────────────────────
@@ -707,9 +730,9 @@ func (s *Server) handleGetKnowledgeConfig(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// handlePutKnowledgeConfig 全量替换检索质量参数：校验 → 即时热替换 Manager → 落 yaml。
+// handlePutKnowledgeConfig 全量替换检索质量参数：校验 → 落 yaml → 即时热替换 Manager。
 //
-// 校验失败（min_score∉[0,1] / candidate_k<=0）一律 400，且不改动运行时配置。
+// 校验或持久化失败时不改动运行时配置，避免「本次 500、运行态已变、重启后回退」的配置漂移。
 // 响应回带新生效配置 + rerank_model_restart_required（rerank_model 变更需重启才生效）。
 func (s *Server) handlePutKnowledgeConfig(w http.ResponseWriter, r *http.Request) {
 	if s.kb == nil {
@@ -729,17 +752,26 @@ func (s *Server) handlePutKnowledgeConfig(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "candidate_k 必须大于 0"})
 		return
 	}
+	if req.CandidateK > knowledge.MaxCandidateK {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("candidate_k 不能超过 %d", knowledge.MaxCandidateK),
+		})
+		return
+	}
 	req.RerankModel = strings.TrimSpace(req.RerankModel)
+	// Keep the runtime snapshot, persisted YAML and other whole-config writers
+	// in one serializable transaction. cfgMu is the existing process-wide guard
+	// for read-copy-save-apply configuration updates.
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
 
-	// 即时热替换 Manager 的运行时参数（在当前活配置基础上覆盖面板字段，保留嵌入前缀等非面板项）。
+	// 先构造候选运行时配置（保留嵌入前缀等非面板项），但在 YAML 原子写成功前绝不发布。
 	hc := s.kb.GetHybridConfig()
 	hc.RerankEnabled = req.Rerank
 	hc.ExpandEnabled = req.QueryExpand
 	hc.ContextualEnabled = req.Contextual
 	hc.MinScore = req.MinScore
 	hc.CandidateK = req.CandidateK
-	s.kb.SetHybridConfig(hc)
-
 	// 落 yaml 持久化；rerank_model 是否变化决定“需重启”提示。
 	restartRequired := false
 	if s.cfgWriter != nil {
@@ -758,6 +790,8 @@ func (s *Server) handlePutKnowledgeConfig(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
+	// YAML 已成功原子落盘后才发布运行态，二者从此点起保持同一版本语义。
+	s.kb.SetHybridConfig(hc)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"rerank":                        req.Rerank,

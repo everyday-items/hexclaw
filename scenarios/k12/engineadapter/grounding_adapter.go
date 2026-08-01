@@ -190,6 +190,7 @@ func (a *GroundingAdapter) GroundSnapshot(
 	snapshot usecase.GroundingSnapshot,
 	knowledgePoint, grade string,
 ) (string, bool, error) {
+	ctx = knowledge.WithRetrievalFreshnessPolicy(ctx, knowledge.RetrievalFreshnessEvergreen)
 	if strings.TrimSpace(snapshot.AgentName) == "" ||
 		strings.TrimSpace(snapshot.LearnerID) == "" ||
 		strings.TrimSpace(snapshot.Subject) == "" {
@@ -410,6 +411,9 @@ func (a *GroundingAdapter) groundByFilterQuery(
 	agentName, query string,
 	filter knowledge.Filter,
 ) (string, bool, error) {
+	// 教材版本是常青事实，文档上传时间不是相关性信号；仅关闭本请求的 freshness
+	// 降权，仍保留原有 source/filter、revision pinning 与证据校验边界。
+	ctx = knowledge.WithRetrievalFreshnessPolicy(ctx, knowledge.RetrievalFreshnessEvergreen)
 	if a.kb == nil {
 		return "", false, nil
 	}

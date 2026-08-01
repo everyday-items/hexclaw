@@ -57,12 +57,19 @@ func TestManager_SetHybridConfig_RaceWithSearch(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
+	queryErrors := make(chan error, 1)
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 30; j++ {
-				_, _ = mgr.Query(ctx, "运行时调参", 3)
+				if _, err := mgr.Query(ctx, "运行时调参", 3); err != nil {
+					select {
+					case queryErrors <- err:
+					default:
+					}
+					return
+				}
 			}
 		}()
 	}
@@ -80,4 +87,9 @@ func TestManager_SetHybridConfig_RaceWithSearch(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+	select {
+	case err := <-queryErrors:
+		t.Fatalf("并发检索不应隐藏查询错误: %v", err)
+	default:
+	}
 }

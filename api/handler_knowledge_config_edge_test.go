@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/knowledge"
@@ -39,6 +40,50 @@ func putKBConfig(t *testing.T, srv *Server, body string) *httptest.ResponseRecor
 	w := httptest.NewRecorder()
 	srv.handlePutKnowledgeConfig(w, req)
 	return w
+}
+
+// PUT 的「读运行态 → 落盘 → 发布运行态」必须是一整个配置事务。否则两个请求可以各自
+// 读取旧快照，后写请求先落 YAML、前写请求后发布内存，留下 YAML/运行态两个版本。
+func TestKnowledgeConfig_PUTWaitsForConfigTransactionMutex(t *testing.T) {
+	srv, mgr := newKBConfigServer(t)
+	srv.SetCfgWriter(config.NewWriter(filepath.Join(t.TempDir(), "hexclaw.yaml")))
+	before := mgr.GetHybridConfig()
+
+	// 在真实的全局配置事务锁被占用时，PUT 必须停在锁前，不能提前写 YAML 或热替换 Manager。
+	srv.cfgMu.Lock()
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- putKBConfig(t, srv, `{"rerank":false,"query_expand":true,"contextual":true,"min_score":0.19,"candidate_k":19,"rerank_model":""}`)
+	}()
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case w := <-done:
+			srv.cfgMu.Unlock()
+			t.Fatalf("配置事务锁持有时 PUT 不得完成，status=%d", w.Code)
+		case <-ticker.C:
+			got := mgr.GetHybridConfig()
+			if got.MinScore != before.MinScore || got.CandidateK != before.CandidateK {
+				srv.cfgMu.Unlock()
+				t.Fatalf("配置事务锁持有时运行态不得变化: before=%+v got=%+v", before, got)
+			}
+		case <-deadline.C:
+			srv.cfgMu.Unlock()
+			w := <-done
+			if w.Code != http.StatusOK {
+				t.Fatalf("释放配置事务锁后 PUT 应成功，status=%d body=%s", w.Code, w.Body.String())
+			}
+			got := mgr.GetHybridConfig()
+			if got.MinScore != 0.19 || got.CandidateK != 19 {
+				t.Fatalf("释放锁后运行态未发布请求配置: %+v", got)
+			}
+			return
+		}
+	}
 }
 
 // PUT 只动面板 6 字段，绝不波及 Manager 活配置里的其余检索参数（嵌入前缀 / RRFK /
@@ -80,7 +125,7 @@ func TestKnowledgeConfig_Validation_Boundaries(t *testing.T) {
 	ok := []string{
 		`{"min_score":0,"candidate_k":1}`,     // 下界
 		`{"min_score":1,"candidate_k":1}`,     // 上界
-		`{"min_score":0.5,"candidate_k":999}`, // 大候选池
+		`{"min_score":0.5,"candidate_k":100}`, // Desktop 预设上界
 	}
 	for _, b := range ok {
 		if w := putKBConfig(t, srv, b); w.Code != http.StatusOK {
@@ -92,12 +137,39 @@ func TestKnowledgeConfig_Validation_Boundaries(t *testing.T) {
 		`{"min_score":-0.0001,"candidate_k":10}`, // 越下界
 		`{"min_score":0.5,"candidate_k":0}`,      // 非正
 		`{"min_score":0.5,"candidate_k":-3}`,     // 负
+		`{"min_score":0.5,"candidate_k":101}`,    // 资源预算越界
 		`{"min_score":0.5,"candidate_k":`,        // 坏 JSON
 	}
 	for _, b := range bad {
 		if w := putKBConfig(t, srv, b); w.Code != http.StatusBadRequest {
 			t.Fatalf("非法 %s 应 400，得 %d", b, w.Code)
 		}
+	}
+}
+
+// 写 YAML 失败时必须保持旧运行态。否则请求已返回 500，当前进程却已切到新参数，
+// 重启后又回退到旧 YAML，形成无法审计的配置漂移。
+func TestKnowledgeConfig_PersistFailureKeepsRuntimeConfig(t *testing.T) {
+	custom := knowledge.DefaultHybridConfig()
+	custom.RerankEnabled = true
+	custom.ExpandEnabled = true
+	custom.ContextualEnabled = true
+	custom.MinScore = 0.85
+	custom.CandidateK = 50
+	srv, mgr := newKBConfigServer(t, knowledge.WithHybridConfig(custom))
+	// 不创建父目录，确保 Writer 的原子临时文件创建失败。
+	srv.SetCfgWriter(config.NewWriter(filepath.Join(t.TempDir(), "missing", "hexclaw.yaml")))
+
+	w := putKBConfig(t, srv, `{"rerank":false,"query_expand":false,"contextual":false,"min_score":0.2,"candidate_k":20,"rerank_model":"reranker-x"}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("持久化失败应返回 500，得 %d body=%s", w.Code, w.Body.String())
+	}
+	got := mgr.GetHybridConfig()
+	if got.RerankEnabled != custom.RerankEnabled ||
+		got.ExpandEnabled != custom.ExpandEnabled ||
+		got.ContextualEnabled != custom.ContextualEnabled ||
+		got.MinScore != custom.MinScore || got.CandidateK != custom.CandidateK {
+		t.Fatalf("持久化失败不应污染运行态: got=%+v want=%+v", got, custom)
 	}
 }
 

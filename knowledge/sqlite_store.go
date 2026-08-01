@@ -735,9 +735,11 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int, fi
 		args = append(args, topK)
 	}
 
+	ftsStarted := time.Now()
 	rows, err := s.db.QueryContext(ctx, sqlQuery, args...)
 	if err != nil {
 		// FTS5 查询失败（可能是特殊字符），降级到 LIKE 搜索
+		observeRetrievalLane(ctx, RetrievalLaneFTS, time.Since(ftsStarted), 0, err, true)
 		return s.fallbackTextSearch(ctx, keywords, topK, filter)
 	}
 	defer rows.Close()
@@ -759,6 +761,7 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int, fi
 		var createdAt time.Time
 		if needDate {
 			if err := rows.Scan(&r.chunkID, &r.content, &r.score, &createdAt); err != nil {
+				observeRetrievalLane(ctx, RetrievalLaneFTS, time.Since(ftsStarted), 0, err, false)
 				return nil, err
 			}
 			// 日期过滤在 Go 层（rows 已按 score 排序，过滤后取前 topK 即最相关者）。
@@ -766,6 +769,7 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int, fi
 				continue
 			}
 		} else if err := rows.Scan(&r.chunkID, &r.content, &r.score); err != nil {
+			observeRetrievalLane(ctx, RetrievalLaneFTS, time.Since(ftsStarted), 0, err, false)
 			return nil, err
 		}
 		// BM25 返回负数，绝对值越大越相关
@@ -782,6 +786,7 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int, fi
 		}
 	}
 	if err := rows.Err(); err != nil {
+		observeRetrievalLane(ctx, RetrievalLaneFTS, time.Since(ftsStarted), 0, err, false)
 		return nil, err
 	}
 
@@ -825,14 +830,17 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int, fi
 
 	// FTS5 返回空时降级到 LIKE 搜索（解决中文 tokenizer 不匹配的问题）
 	if len(results) == 0 {
+		observeRetrievalLane(ctx, RetrievalLaneFTS, time.Since(ftsStarted), 0, nil, true)
 		return s.fallbackTextSearch(ctx, keywords, topK, filter)
 	}
+	observeRetrievalLane(ctx, RetrievalLaneFTS, time.Since(ftsStarted), len(results), nil, false)
 	return results, nil
 }
 
 // fallbackTextSearch FTS5 不可用或结果为空时的降级搜索（LIKE 匹配）。
 // 与主路径一致地把元数据过滤下推到 LIMIT 之前（JOIN kb_documents）。
 func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string, topK int, filter Filter) ([]*SearchResult, error) {
+	likeStarted := time.Now()
 	var query strings.Builder
 	var args []any
 
@@ -893,6 +901,7 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 
 	rows, err := s.db.QueryContext(ctx, query.String(), args...)
 	if err != nil {
+		observeRetrievalLane(ctx, RetrievalLaneLike, time.Since(likeStarted), 0, err, false)
 		return nil, err
 	}
 	defer rows.Close()
@@ -936,7 +945,9 @@ func (s *SQLiteStore) fallbackTextSearch(ctx context.Context, keywords []string,
 		}
 	}
 
-	return results, rows.Err()
+	err = rows.Err()
+	observeRetrievalLane(ctx, RetrievalLaneLike, time.Since(likeStarted), len(results), err, false)
+	return results, err
 }
 
 // getChunksByIDs 批量获取 chunk 信息（避免 N+1 查询）

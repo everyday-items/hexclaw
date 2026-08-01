@@ -375,6 +375,10 @@ type Manager struct {
 	// auxBreaker RAG 辅助 LLM（查询扩展 / LLM 重排）的预算熔断状态（BUG-20260704）；
 	// 跨检索共享，慢 provider 连续超预算即开闸冷却，期间纯确定性检索。零值可用。
 	auxBreaker auxLLMBreaker
+
+	// retrievalMetrics 是不含查询内容的进程内聚合指标。每个请求经 context 将它传递到
+	// FTS/LIKE 与向量 lane，既能量化中文 LIKE 降级，也不泄露教材内容。
+	retrievalMetrics retrievalMetricsCollector
 }
 
 // retrievalLLM 返回带预算+熔断的辅助 LLM，用于聊天关键路径上的查询扩展 / LLM 重排
@@ -406,7 +410,10 @@ type ManagerOption func(*Manager)
 
 // WithHybridConfig 设置混合检索配置
 func WithHybridConfig(cfg HybridConfig) ManagerOption {
-	return func(m *Manager) { m.config.Store(&cfg) }
+	return func(m *Manager) {
+		cfg = normalizeHybridConfigBudget(cfg)
+		m.config.Store(&cfg)
+	}
 }
 
 // cfg 取当前混合检索配置的快照（无锁原子读，并发检索安全）。
@@ -420,7 +427,10 @@ func (m *Manager) GetHybridConfig() HybridConfig { return m.cfg() }
 // 即时生效的读路径参数：rerank/query-expand/contextual 开关、min_score、candidate_k、
 // 融合权重、时间衰减等。注意：专用 cross-encoder 重排器（rerank_model 对应的 reranker）
 // 在 NewManager 时一次性注入，更换 rerank_model 需重建 Manager（重启 sidecar）才生效。
-func (m *Manager) SetHybridConfig(c HybridConfig) { m.config.Store(&c) }
+func (m *Manager) SetHybridConfig(c HybridConfig) {
+	c = normalizeHybridConfigBudget(c)
+	m.config.Store(&c)
+}
 
 // WithSplitter 设置文本分块器（hexagon hexagon.Splitter）
 func WithSplitter(s hexagon.Splitter) ManagerOption {
@@ -1089,13 +1099,15 @@ func (m *Manager) searchResultsModeAtRevision(
 	strictFloor bool,
 	expectedRevisionID string,
 ) ([]*SearchResult, []QueryEmbeddingReceipt, error) {
+	if !SearchQueryWithinBudget(query) {
+		return nil, nil, ErrSearchQueryBudgetExceeded
+	}
+	ctx = withRetrievalMetrics(ctx, &m.retrievalMetrics)
 	// Freeze caller-owned slice fields before query expansion or any provider
 	// callback can run. Every text/vector lane in this request must consume the
 	// same normalized document-generation and chunk whitelist.
 	filter = filter.normalize()
-	if topK <= 0 {
-		topK = 3
-	}
+	topK = normalizeSearchTopK(topK)
 	expectedRevisionID = strings.TrimSpace(expectedRevisionID)
 	var (
 		planner    revisionSemanticPlanner
@@ -1134,13 +1146,7 @@ func (m *Manager) searchResultsModeAtRevision(
 		}
 	}
 	cfg := m.cfg()
-	candidateK := cfg.CandidateK
-	if candidateK <= 0 {
-		candidateK = 50
-	}
-	if candidateK < topK*3 {
-		candidateK = topK * 3 // 至少留够 rerank 收窄空间
-	}
+	candidateK := effectiveCandidateK(cfg.CandidateK, topK)
 
 	// 1. 查询扩展（#8 HyDE + multi-query）。向量能力待机时直接走原始 query
 	// 的 FTS 路径：自动注入没有语义证据本就 fail-closed，调用辅助 LLM 只会平添延迟。
@@ -1202,10 +1208,12 @@ func (m *Manager) searchResultsModeAtRevision(
 				timeout = executionProfile.QueryTimeout
 			}
 			rctx, rcancel := context.WithTimeout(ragEmbedContext(ctx), timeout)
+			vectorStarted := time.Now()
 			vres, ran, receipt, vErr := planner.SearchWithPlanReceipt(
 				rctx, plan, q, candidateK, filter,
 			)
 			rcancel()
+			observeRetrievalLane(ctx, RetrievalLaneVector, time.Since(vectorStarted), len(vres), vErr, false)
 			if vErr != nil {
 				if !errors.Is(vErr, ErrEmbeddingUnavailable) {
 					logger.Error("[knowledge] frozen revision 向量搜索失败", "error", vErr)
@@ -1232,6 +1240,7 @@ func (m *Manager) searchResultsModeAtRevision(
 				timeout = executionProfile.QueryTimeout
 			}
 			rctx, rcancel := context.WithTimeout(ragEmbedContext(ctx), timeout)
+			vectorStarted := time.Now()
 			var (
 				vres    []*SearchResult
 				ran     bool
@@ -1248,6 +1257,7 @@ func (m *Manager) searchResultsModeAtRevision(
 				)
 			}
 			rcancel()
+			observeRetrievalLane(ctx, RetrievalLaneVector, time.Since(vectorStarted), len(vres), vErr, false)
 			if vErr != nil {
 				if !errors.Is(vErr, ErrEmbeddingUnavailable) {
 					logger.Error("[knowledge] active revision 向量搜索失败", "error", vErr)
@@ -1270,6 +1280,7 @@ func (m *Manager) searchResultsModeAtRevision(
 		} else if legacyEmbeddingReady {
 			// 查询向量化预算（BUG-20260703 同构防护，对齐 engine 记忆召回）：检索是增强，
 			// 不继承整请求 ctx 的漫长余量——慢 embedding 端点超预算即掐断，本轮走纯 BM25。
+			vectorStarted := time.Now()
 			ectx, ecancel := context.WithTimeout(ragEmbedContext(ctx), queryEmbedTimeout)
 			permit, err := m.acquireResource(ectx, resourcegov.ResourceAccelerator, resourcegov.PriorityInteractive)
 			var qv [][]float32
@@ -1281,11 +1292,13 @@ func (m *Manager) searchResultsModeAtRevision(
 			}
 			ecancel()
 			if err != nil {
+				observeRetrievalLane(ctx, RetrievalLaneVector, time.Since(vectorStarted), 0, err, false)
 				if !errors.Is(err, ErrEmbeddingUnavailable) {
 					logger.Error("[knowledge] 查询向量嵌入失败", "error", err)
 				}
 			} else if len(qv) > 0 {
 				vres, vErr := m.searcher.VectorSearch(ctx, qv[0], candidateK, filter)
+				observeRetrievalLane(ctx, RetrievalLaneVector, time.Since(vectorStarted), len(vres), vErr, false)
 				if vErr != nil {
 					logger.Error("[knowledge] 向量搜索失败", "error", vErr)
 				} else {
@@ -1296,6 +1309,8 @@ func (m *Manager) searchResultsModeAtRevision(
 					rankedLists = append(rankedLists, list)
 					vectorRouteRan = true
 				}
+			} else {
+				observeRetrievalLane(ctx, RetrievalLaneVector, time.Since(vectorStarted), 0, nil, false)
 			}
 		}
 		var tres []*SearchResult
@@ -1328,7 +1343,12 @@ func (m *Manager) searchResultsModeAtRevision(
 	}
 
 	// 3. 融合评分（#9 RRF 或加权和回退）+ 时间衰减
-	candidates := m.fuse(resultMap, rankedLists, vectorRouteRan)
+	candidates := m.fuse(
+		resultMap,
+		rankedLists,
+		vectorRouteRan,
+		RetrievalFreshnessPolicyFromContext(ctx),
+	)
 
 	// 4. 相关度地板（#3）：宽召回模式带放宽回退；注入模式 fail-closed（B8）。
 	// BUG-20260712-I：降级态（embedder 未配置 / Embed 失败超时 → 向量路未跑通）不再把
@@ -1535,7 +1555,12 @@ func fillMissingChunkProvenance(current, incoming *Chunk) {
 // TextScore)加权 rank 贡献：score(d) = Σ_list w_list · normScore(d,list) / (k + rank)。
 // 这样弱命中（低 normScore）的 rank 红利被同比缩小，而真正的精确命中（高 BM25 分）仍保留
 // 满权 —— 既根治虚假命中带偏，又不损失精确术语匹配能力。
-func (m *Manager) fuse(resultMap map[string]*SearchResult, rankedLists []rankedList, vectorRouteRan bool) []*SearchResult {
+func (m *Manager) fuse(
+	resultMap map[string]*SearchResult,
+	rankedLists []rankedList,
+	vectorRouteRan bool,
+	freshness RetrievalFreshnessPolicy,
+) []*SearchResult {
 	cfg := m.cfg()
 	candidates := make([]*SearchResult, 0, len(resultMap))
 	if cfg.UseRRF && len(rankedLists) > 0 {
@@ -1566,12 +1591,12 @@ func (m *Manager) fuse(resultMap map[string]*SearchResult, rankedLists []rankedL
 			}
 		}
 		for id, r := range resultMap {
-			r.Chunk.Score = m.applyTimeDecay(fused[id], r.Chunk.CreatedAt)
+			r.Chunk.Score = m.applyTimeDecayWithPolicy(fused[id], r.Chunk.CreatedAt, freshness)
 			candidates = append(candidates, r)
 		}
 	} else {
 		for _, r := range resultMap {
-			r.Chunk.Score = m.hybridScoreMode(r, vectorRouteRan)
+			r.Chunk.Score = m.hybridScoreModeWithFreshness(r, vectorRouteRan, freshness)
 			candidates = append(candidates, r)
 		}
 	}
@@ -1678,10 +1703,7 @@ func (m *Manager) rerankTopK(ctx context.Context, query string, candidates []*Se
 	cfg := m.cfg()
 	sortByScore(candidates)
 	pool := candidates
-	maxRerank := cfg.CandidateK
-	if maxRerank <= 0 {
-		maxRerank = 50
-	}
+	maxRerank := effectiveCandidateK(cfg.CandidateK, normalizeSearchTopK(topK))
 	if len(pool) > maxRerank {
 		pool = pool[:maxRerank]
 	}
@@ -2187,6 +2209,14 @@ func (m *Manager) hybridScore(r *SearchResult) float64 {
 }
 
 func (m *Manager) hybridScoreMode(r *SearchResult, vectorRouteRan bool) float64 {
+	return m.hybridScoreModeWithFreshness(r, vectorRouteRan, RetrievalFreshnessDefault)
+}
+
+func (m *Manager) hybridScoreModeWithFreshness(
+	r *SearchResult,
+	vectorRouteRan bool,
+	freshness RetrievalFreshnessPolicy,
+) float64 {
 	cfg := m.cfg()
 	vectorWeight := cfg.VectorWeight
 	textWeight := cfg.TextWeight
@@ -2195,13 +2225,24 @@ func (m *Manager) hybridScoreMode(r *SearchResult, vectorRouteRan bool) float64 
 		textWeight = 1.0
 	}
 	score := vectorWeight*r.VectorScore + textWeight*r.TextScore
-	return m.applyTimeDecay(score, r.Chunk.CreatedAt)
+	return m.applyTimeDecayWithPolicy(score, r.Chunk.CreatedAt, freshness)
 }
 
 // applyTimeDecay 对分数施加指数时间衰减（半衰期 TimeDecayDays 天）。
 // 仅对有有效时间戳的 chunk 衰减；CreatedAt 零值时跳过，
 // 否则 time.Since(零值) 会把分数衰减到 0、导致无时间戳 chunk 永不召回。
 func (m *Manager) applyTimeDecay(score float64, createdAt time.Time) float64 {
+	return m.applyTimeDecayWithPolicy(score, createdAt, RetrievalFreshnessDefault)
+}
+
+func (m *Manager) applyTimeDecayWithPolicy(
+	score float64,
+	createdAt time.Time,
+	policy RetrievalFreshnessPolicy,
+) float64 {
+	if policy == RetrievalFreshnessEvergreen {
+		return score
+	}
 	if days := m.cfg().TimeDecayDays; days > 0 && !createdAt.IsZero() {
 		age := time.Since(createdAt).Hours() / 24
 		lambda := math.Ln2 / float64(days)

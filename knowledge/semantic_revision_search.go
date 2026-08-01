@@ -489,11 +489,17 @@ func (s *SQLiteRevisionSemanticSearcher) textSearchCorpus(
 	topK int,
 	filter Filter,
 ) ([]*SearchResult, error) {
+	ftsStarted := time.Now()
 	results, err := s.ftsTextSearch(ctx, corpusUID, revisionID, keywords, topK, filter)
 	if err == nil && len(results) > 0 {
+		observeRetrievalLane(ctx, RetrievalLaneFTS, time.Since(ftsStarted), len(results), nil, false)
 		return results, nil
 	}
-	return s.likeTextSearch(ctx, corpusUID, revisionID, keywords, topK, filter)
+	observeRetrievalLane(ctx, RetrievalLaneFTS, time.Since(ftsStarted), len(results), err, true)
+	likeStarted := time.Now()
+	results, err = s.likeTextSearch(ctx, corpusUID, revisionID, keywords, topK, filter)
+	observeRetrievalLane(ctx, RetrievalLaneLike, time.Since(likeStarted), len(results), err, false)
+	return results, err
 }
 
 func (s *SQLiteRevisionSemanticSearcher) resolveCorpusUID(ctx context.Context) (string, error) {
