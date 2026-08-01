@@ -155,7 +155,8 @@ const recognizePrompt = `识别这张作业图片里的所有题目，并逐题�
 {"problem_id":"仅用于本次 JSON 内父子关联的临时引用","problem_kind":"standalone","parent_problem_id":"","subproblem_no":"","source_number_path":["三","1"],"display_label":"三、1","question":"逐字原始转写","canonical_markdown":"规范 Markdown/LaTeX","subject":"数学","knowledge_points":["知识点1"],"answer_state":"present","student_answer":"孩子实际写下且能可靠辨认的原始作答","answer_canonical_markdown":"规范 Markdown/LaTeX","recognition_confidence":0.98,"ocr_signals":[]}
 关键规则：
 - 每个独立作答的小题必须对应一个 JSON 元素：即使多个口算、填空或选择小题横排在同一行，也要逐小题拆开，不能合并成一个大题/整行元素；章节标题不能当作题目，但章节原题号必须作为下属题目的 source_number_path 上级 token 保留。
-- source_number_path 必须逐层保留原卷实际可见题号字符，例如大题“三”下第“1”题输出 ["三","1"]；display_label 必须按原卷层级输出“三、1”。原卷没有题号时两者分别输出 [] 和 ""，禁止按识别顺序自造连续题号。
+- 章节标题不是题目，不得把标题单独输出为 standalone；标题下每个有可见子题号的可作答小题必须输出完整层级，例如“一、计算题”下的第 1、2 题必须分别为 ["一","1"] / "一、1" 与 ["一","2"] / "一、2"。子题必须输出完整层级，不得只输出子题的局部序号，也不得用空题号代替标题下可见子题号。
+- source_number_path 必须逐层保留原卷实际可见题号字符，例如大题“三”下第“1”题输出 ["三","1"]；display_label 必须按原卷层级输出“三、1”。原卷没有题号时两者分别输出 [] 和 ""，禁止按识别顺序自造连续题号。不得让两个独立作答小题复用同一个非空 source_number_path，也不得让两个独立作答小题复用同一个非空 display_label；无法辨认子题号时不得编造。
 - problem_id 只是在本次 JSON 内供 parent_problem_id 引用的临时标签，不是持久 ID；不要输出 attempt_id、input_digest、confirmed_version 等系统字段。
 - 复合题公共材料只输出一次 problem_kind=compound_parent（不得带孩子作答）；每个小题输出 problem_kind=subproblem、parent_problem_id 精确指向本次 JSON 内父题的 problem_id、subproblem_no 为稳定小题号。普通题用 standalone。
 - question/student_answer 必须逐字保留视觉原始转写；canonical_markdown/answer_canonical_markdown 独立输出可渲染 Markdown/LaTeX，不得用规范形覆盖原始转写。
@@ -173,6 +174,7 @@ const recognizePrompt = `识别这张作业图片里的所有题目，并逐题�
 const printedQuestionInventoryPrompt = `这是“整页印刷题清单”识别，不是批改，也不要读取或推测学生答案。
 请按页面从上到下、同一行从左到右，逐小题准确抄录所有印刷体题干；横排口算必须逐题拆开，章节标题不能算题目。
 关键规则：
+- 章节标题不是题目；标题下每个有可见子题号的可作答小题必须输出完整 source_number_path 与 display_label，例如“一、计算题”下的第 1 题为 ["一","1"] / "一、1"。不得只输出子题的局部序号，不得用空题号代替标题下可见子题号，也不得按位置自行补号。
 - question 只允许包含印刷体原题，忽略铅笔、黑笔、涂改和手写等号右侧内容；
 - 分数的分子、分母和横线必须完整保留；看见 5/7−1/5 不能漏成 5−1/5；
 - 小数点、运算符、单位、括号和题号必须按图抄录，不能用数学常识改写；
@@ -411,14 +413,64 @@ func parseRecognizedQuestions(raw string) ([]usecase.RecognizedQuestion, error) 
 func validateRecognitionProtocolResult(
 	questions []usecase.RecognizedQuestion,
 ) error {
-	if _, err := usecase.NormalizeRecognizedProblems(
+	normalized, err := usecase.NormalizeRecognizedProblems(
 		"recognition-protocol-validation",
 		questions,
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf(
 			"%w: recognizer: 识题结果结构无效: %v",
 			k12.ErrRecognitionProtocolInvalid,
 			err,
+		)
+	}
+	seenPaths := make(map[string]int, len(normalized))
+	seenLabels := make(map[string]int, len(normalized))
+	hasNumberedEvidence := false
+	hasUnnumberedEvidence := false
+	for index, question := range normalized {
+		if len(question.SourceNumberPath) == 0 {
+			// A wholly unnumbered source is legitimate. Mixed whole-page
+			// evidence, though, cannot prove whether a child number beneath a
+			// detected heading was missed, so DD-036 must re-read it rather than
+			// freezing an ordinal-derived guess.
+			hasUnnumberedEvidence = true
+			continue
+		}
+		hasNumberedEvidence = true
+		path, marshalErr := json.Marshal(question.SourceNumberPath)
+		if marshalErr != nil {
+			return fmt.Errorf(
+				"%w: recognizer: 识题题号无法编码",
+				k12.ErrRecognitionProtocolInvalid,
+			)
+		}
+		pathKey := string(path)
+		if first, duplicate := seenPaths[pathKey]; duplicate {
+			return fmt.Errorf(
+				"%w: recognizer: 识题结果第 %d 项与第 %d 项重复原卷题号层级",
+				k12.ErrRecognitionProtocolInvalid,
+				index+1,
+				first+1,
+			)
+		}
+		seenPaths[pathKey] = index
+
+		label := strings.TrimSpace(question.DisplayLabel)
+		if first, duplicate := seenLabels[label]; duplicate {
+			return fmt.Errorf(
+				"%w: recognizer: 识题结果第 %d 项与第 %d 项重复原卷展示题号",
+				k12.ErrRecognitionProtocolInvalid,
+				index+1,
+				first+1,
+			)
+		}
+		seenLabels[label] = index
+	}
+	if hasNumberedEvidence && hasUnnumberedEvidence {
+		return fmt.Errorf(
+			"%w: recognizer: 识题结果混合有题号与无题号事实，无法冻结来源层级",
+			k12.ErrRecognitionProtocolInvalid,
 		)
 	}
 	return nil
@@ -847,6 +899,16 @@ func mergePrintedInventoryObservation(
 	observed = usecase.NormalizeRecognizedQuestion(observed)
 	inventory = usecase.NormalizeRecognizedQuestion(inventory)
 	merged := mergeObservationMetadata(observed, inventory)
+	// The print-only pass is an independent full-page source-number witness.
+	// It may complete a completely blank source-number fact only after the
+	// exact normalized printed stem matches. It never derives a number from
+	// list position, an approximate stem, or an incomplete inventory value.
+	if missingSourceNumberEvidence(observed) &&
+		completeSourceNumberEvidence(inventory) &&
+		recognizedQuestionKey(observed.Question) == recognizedQuestionKey(inventory.Question) {
+		merged.SourceNumberPath = append([]string(nil), inventory.SourceNumberPath...)
+		merged.DisplayLabel = inventory.DisplayLabel
+	}
 	observedKey := normalizeArithmeticQuestion(recognizedQuestionKey(observed.Question))
 	inventoryKey := normalizeArithmeticQuestion(recognizedQuestionKey(inventory.Question))
 	_, observedContainsHandwrittenRHS := equationVariantAnswer(
@@ -877,6 +939,22 @@ func mergePrintedInventoryObservation(
 		merged.StudentAnswer = ""
 	}
 	return usecase.NormalizeRecognizedQuestion(merged)
+}
+
+func missingSourceNumberEvidence(question usecase.RecognizedQuestion) bool {
+	return len(question.SourceNumberPath) == 0 && strings.TrimSpace(question.DisplayLabel) == ""
+}
+
+func completeSourceNumberEvidence(question usecase.RecognizedQuestion) bool {
+	if len(question.SourceNumberPath) == 0 || strings.TrimSpace(question.DisplayLabel) == "" {
+		return false
+	}
+	for _, token := range question.SourceNumberPath {
+		if strings.TrimSpace(token) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func mergeRecognizedQuestions(primary, recovery []usecase.RecognizedQuestion) []usecase.RecognizedQuestion {

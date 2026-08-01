@@ -358,6 +358,39 @@ func TestRecognizePrompt_AsksForStudentAnswerNoFabricate(t *testing.T) {
 	}
 }
 
+// TestRecognizePrompt_RequiresUniqueVisibleSourceNumberEvidence keeps the
+// live C02 failure from being silently reintroduced: two independently
+// answerable questions cannot reuse the same nonempty original-number path or
+// rendered label. The model must either return the visible child number or
+// leave an actually unnumbered question unnumbered; ordinal synthesis is not
+// allowed.
+func TestRecognizePrompt_RequiresUniqueVisibleSourceNumberEvidence(t *testing.T) {
+	for _, required := range []string{
+		"不得让两个独立作答小题复用同一个非空 source_number_path",
+		"不得让两个独立作答小题复用同一个非空 display_label",
+		"无法辨认子题号时不得编造",
+		"章节标题不是题目，不得把标题单独输出为 standalone",
+		"子题必须输出完整层级",
+	} {
+		if !contains(recognizePrompt, required) {
+			t.Errorf("识题 prompt 缺原卷题号唯一性约束 %q", required)
+		}
+	}
+}
+
+func TestPrintedQuestionInventoryPrompt_RequiresCompleteHierarchicalNumberEvidence(t *testing.T) {
+	for _, required := range []string{
+		"章节标题不是题目",
+		"完整 source_number_path",
+		"不得只输出子题的局部序号",
+		"不得用空题号代替标题下可见子题号",
+	} {
+		if !contains(printedQuestionInventoryPrompt, required) {
+			t.Errorf("印刷题清单 prompt 缺完整题号约束 %q", required)
+		}
+	}
+}
+
 // TestRecognize_AutoDetectsSubject Polish-2：识题自动判定学科（家长不必手选）。
 // 视觉模型逐题回填 subject（白名单 5 科），越界/未知归零，供前端预填学科下拉。
 func TestRecognize_AutoDetectsSubject(t *testing.T) {

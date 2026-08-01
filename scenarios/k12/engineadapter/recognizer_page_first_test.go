@@ -158,3 +158,69 @@ func TestDenseWorksheet_ProtocolFallbackEmitsExplicitPhysicalUnits(t *testing.T)
 		t.Fatalf("typed physical units=%v want=%v", executor.units, want)
 	}
 }
+
+func TestDenseWorksheet_DuplicateSourceNumberProtocolUsesBoundedFallback(t *testing.T) {
+	executor := &recordingRecognitionPhysicalExecutor{}
+	ctx := k12.WithRecognitionPhysicalCallExecutor(context.Background(), executor)
+	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
+		if strings.Contains(prompt, "纵向分片") || strings.Contains(prompt, "整页印刷题清单") {
+			return `[]`, nil
+		}
+		return `[
+			{"problem_kind":"standalone","source_number_path":["一"],"display_label":"一","question":"4÷0.5=","subject":"数学"},
+			{"problem_kind":"standalone","source_number_path":["一"],"display_label":"一","question":"10×0.01=","subject":"数学"}
+		]`, nil
+	}
+
+	if _, err := NewRecognizerAdapter(vision).Recognize(
+		ctx,
+		denseWorksheetTestImage(t, 1000, 1800),
+	); err != nil {
+		t.Fatal(err)
+	}
+	want := []k12.RecognitionPhysicalUnit{
+		k12.RecognitionPhysicalUnitWholePage,
+		k12.RecognitionPhysicalUnitSegment1,
+		k12.RecognitionPhysicalUnitSegment2,
+		k12.RecognitionPhysicalUnitSegment3,
+		k12.RecognitionPhysicalUnitSegment4,
+		k12.RecognitionPhysicalUnitSegment5,
+		k12.RecognitionPhysicalUnitPrintedInventory,
+	}
+	if fmt.Sprint(executor.units) != fmt.Sprint(want) {
+		t.Fatalf("duplicate-number fallback units=%v want=%v", executor.units, want)
+	}
+}
+
+func TestDenseWorksheet_PartialSourceNumberProtocolUsesBoundedFallback(t *testing.T) {
+	executor := &recordingRecognitionPhysicalExecutor{}
+	ctx := k12.WithRecognitionPhysicalCallExecutor(context.Background(), executor)
+	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
+		if strings.Contains(prompt, "纵向分片") || strings.Contains(prompt, "整页印刷题清单") {
+			return `[]`, nil
+		}
+		return `[
+			{"problem_kind":"standalone","source_number_path":["一"],"display_label":"一","question":"4÷0.5=","subject":"数学"},
+			{"problem_kind":"standalone","source_number_path":[],"display_label":"","question":"10×0.01=","subject":"数学"}
+		]`, nil
+	}
+
+	if _, err := NewRecognizerAdapter(vision).Recognize(
+		ctx,
+		denseWorksheetTestImage(t, 1000, 1800),
+	); err != nil {
+		t.Fatal(err)
+	}
+	want := []k12.RecognitionPhysicalUnit{
+		k12.RecognitionPhysicalUnitWholePage,
+		k12.RecognitionPhysicalUnitSegment1,
+		k12.RecognitionPhysicalUnitSegment2,
+		k12.RecognitionPhysicalUnitSegment3,
+		k12.RecognitionPhysicalUnitSegment4,
+		k12.RecognitionPhysicalUnitSegment5,
+		k12.RecognitionPhysicalUnitPrintedInventory,
+	}
+	if fmt.Sprint(executor.units) != fmt.Sprint(want) {
+		t.Fatalf("partial-number fallback units=%v want=%v", executor.units, want)
+	}
+}
