@@ -29,10 +29,11 @@ var inv012AllowedImportPrefixes = []string{
 	"github.com/hexagon-codes/hexclaw/internal/sqliteutil", // 存储层完整 SQLite 事务的 BUSY/BUSY_SNAPSHOT 有界重试
 	"github.com/hexagon-codes/hexclaw/records",
 	"github.com/hexagon-codes/hexclaw/scenario",
-	"github.com/hexagon-codes/hexclaw/scenarios/k12",            // 领域根包（usecase/storage 引用）
-	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore", // 用例层资产缝
-	"github.com/hexagon-codes/hexclaw/scenarios/k12/storage",    // 用例层 → 存储层
-	"github.com/hexagon-codes/toolkit/util/idgen",               // 存储层 ID 生成
+	"github.com/hexagon-codes/hexclaw/scenarios/k12",              // 领域根包（usecase/storage 引用）
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore",   // 用例层资产缝
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/storage",      // 用例层 → 存储层
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/viewcontract", // BUG-20260802-022：仅标准库的 frozen wire schema leaf
+	"github.com/hexagon-codes/toolkit/util/idgen",                 // 存储层 ID 生成
 }
 
 // inv012ForbiddenSubstrings 已知违规包的显式黑名单（防御纵深：白名单万一被误扩时，
@@ -98,5 +99,46 @@ func TestINV012_DomainLayersDoNotImportIMPlatformTypes(t *testing.T) {
 	}
 	if checkedFiles == 0 {
 		t.Fatal("守卫失效：一个生产 .go 文件都没扫到（目录布局变了？）")
+	}
+}
+
+func TestINV012ViewContractIsExactDependencyFreeSchemaLeaf(t *testing.T) {
+	const viewContract = "github.com/hexagon-codes/hexclaw/scenarios/k12/viewcontract"
+	if !inv012Allowed(viewContract) {
+		t.Fatalf("K12-INV-012 schema leaf %q must be explicitly allowlisted", viewContract)
+	}
+	if inv012Allowed(viewContract + "/nested") {
+		t.Fatalf("K12-INV-012 viewcontract allowlist must not allow subpackages")
+	}
+
+	fset := token.NewFileSet()
+	entries, err := os.ReadDir("viewcontract")
+	if err != nil {
+		t.Fatalf("read viewcontract: %v", err)
+	}
+	checkedFiles := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		path := filepath.Join("viewcontract", name)
+		file, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		checkedFiles++
+		for _, imp := range file.Imports {
+			val, err := strconv.Unquote(imp.Path.Value)
+			if err != nil {
+				t.Fatalf("%s: invalid import %s", path, imp.Path.Value)
+			}
+			if !inv012IsStdlib(val) {
+				t.Errorf("K12-INV-012 viewcontract must remain a standard-library-only schema leaf: %s → %q", path, val)
+			}
+		}
+	}
+	if checkedFiles == 0 {
+		t.Fatal("K12-INV-012 viewcontract leaf has no production Go file")
 	}
 }

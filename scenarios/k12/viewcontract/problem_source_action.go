@@ -67,6 +67,16 @@ var problemSourceStatuses = map[string]struct{}{
 	"untrusted":       {},
 }
 
+var problemSourceTerminalStatuses = map[string]bool{
+	"correct":        true,
+	"wrong":          true,
+	"unanswered":     true,
+	"answer_unclear": true,
+	"blank_solved":   true,
+	"out_of_scope":   true,
+	"untrusted":      true,
+}
+
 func (v ProblemSourceActionResponse) Validate() error {
 	if strings.TrimSpace(v.CommandReceiptID) == "" ||
 		strings.TrimSpace(v.DispatchID) == "" ||
@@ -109,6 +119,7 @@ func (v ProblemSourceActionResponse) Validate() error {
 		return fmt.Errorf("problem source action response has invalid coverage status %q", coverage.Status)
 	}
 	seen := make(map[string]struct{}, len(snapshot.ProblemProgress))
+	var published, skipped, awaiting int
 	for _, problem := range snapshot.ProblemProgress {
 		problemID := strings.TrimSpace(problem.ProblemID)
 		if problemID == "" || problem.InputRevision < 1 || problem.PublishedRevision < 0 ||
@@ -122,10 +133,25 @@ func (v ProblemSourceActionResponse) Validate() error {
 			return fmt.Errorf("problem source action response repeats problem %q", problemID)
 		}
 		seen[problemID] = struct{}{}
+		switch {
+		case problem.Status == "skipped":
+			skipped++
+		case problem.Status == "awaiting_source" || problem.Status == "processing":
+			awaiting++
+		case problemSourceTerminalStatuses[problem.Status]:
+			published++
+		}
 		if problem.InputRevision > snapshot.SnapshotRevision ||
 			problem.PublishedRevision > snapshot.SnapshotRevision {
 			return fmt.Errorf("problem source action response problem revision exceeds snapshot")
 		}
+	}
+	if _, ok := seen[strings.TrimSpace(v.ProblemID)]; !ok {
+		return fmt.Errorf("problem source action response omits command problem")
+	}
+	if coverage.Published != published || coverage.Skipped != skipped ||
+		coverage.Awaiting != awaiting || coverage.Failed != 0 {
+		return fmt.Errorf("problem source action response coverage does not match problem states")
 	}
 	return nil
 }

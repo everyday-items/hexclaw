@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -23,6 +26,55 @@ func requireProblemSourceActionObjectKeys(
 	sort.Strings(want)
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("object keys=%v, want exact-set %v; object=%#v", got, want, value)
+	}
+}
+
+func canonicalProblemSourceActionExample(t *testing.T) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(
+		"..", "..", "..", "api", "view_contracts", "k12-image-task.v1.schema.json",
+	))
+	if err != nil {
+		t.Fatalf("read canonical ImageTask schema: %v", err)
+	}
+	var schema struct {
+		Definitions map[string]struct {
+			Examples []map[string]any `json:"examples"`
+		} `json:"$defs"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("decode canonical ImageTask schema: %v", err)
+	}
+	examples := schema.Definitions["problemSourceActionResponse"].Examples
+	if len(examples) != 1 {
+		t.Fatalf("source-action canonical examples=%d, want exactly 1", len(examples))
+	}
+	return examples[0]
+}
+
+func requireCanonicalProblemSourceActionProducerFixture(
+	t *testing.T,
+	response map[string]any,
+) {
+	t.Helper()
+	example := canonicalProblemSourceActionExample(t)
+	for _, field := range []string{"command_receipt_id", "dispatch_id", "problem_id"} {
+		example[field] = response[field]
+	}
+	exampleSnapshot := example["progressive_snapshot"].(map[string]any)
+	responseSnapshot := response["progressive_snapshot"].(map[string]any)
+	exampleProblems := exampleSnapshot["problem_progress"].([]any)
+	responseProblems := responseSnapshot["problem_progress"].([]any)
+	exampleProblems[0].(map[string]any)["problem_id"] =
+		responseProblems[0].(map[string]any)["problem_id"]
+	if !reflect.DeepEqual(example, response) {
+		want, _ := json.Marshal(example)
+		got, _ := json.Marshal(response)
+		t.Fatalf(
+			"Go producer drifted from canonical source-action schema fixture:\ngot=%s\nwant=%s",
+			got,
+			want,
+		)
 	}
 }
 
@@ -206,6 +258,9 @@ func TestBUG_20260802_022_ProblemSourceActionRawWireIsFrozenExactAndReplayStable
 					coverage["failed"].(float64) != coverage["total"].(float64) {
 				t.Fatalf("coverage counters do not close: %#v", coverage)
 			}
+			if test.action == "skip" {
+				requireCanonicalProblemSourceActionProducerFixture(t, response)
+			}
 
 			var storedJSON string
 			if err := seed.fixture.db.QueryRow(`
@@ -221,6 +276,87 @@ func TestBUG_20260802_022_ProblemSourceActionRawWireIsFrozenExactAndReplayStable
 					"HTTP body must be the transaction-frozen receipt bytes:\nhttp=%q\nstored=%q",
 					strings.TrimSpace(first.Body.String()),
 					storedJSON,
+				)
+			}
+		})
+	}
+}
+
+func TestBUG_20260802_022_TamperedFrozenProblemSourceActionReplayFailsClosed(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(response map[string]any)
+	}{
+		{
+			name: "command receipt identity mismatch",
+			mutate: func(response map[string]any) {
+				response["command_receipt_id"] = "another-valid-command-receipt"
+			},
+		},
+		{
+			name: "receipt identity mismatch",
+			mutate: func(response map[string]any) {
+				response["dispatch_id"] = "another-valid-dispatch"
+			},
+		},
+		{
+			name: "coverage contradicts problem status",
+			mutate: func(response map[string]any) {
+				snapshot := response["progressive_snapshot"].(map[string]any)
+				coverage := snapshot["coverage"].(map[string]any)
+				coverage["published"] = float64(1)
+				coverage["skipped"] = float64(0)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			seed := seedProblemSourceActionHTTP(t)
+			key := "bug-20260802-022-tamper-" + strings.ReplaceAll(test.name, " ", "-")
+			first, _ := postProblemSourceAction(
+				t,
+				seed.fixture.handler,
+				seed.dispatchID,
+				seed.problemID,
+				key,
+				validSkipSourceActionBody,
+			)
+			if first.Code != http.StatusOK {
+				t.Fatalf("initial source action=%d, want 200; body=%s", first.Code, first.Body.String())
+			}
+			var response map[string]any
+			if err := json.Unmarshal(first.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode initial source-action response: %v", err)
+			}
+			test.mutate(response)
+			tampered, err := json.Marshal(response)
+			if err != nil {
+				t.Fatalf("encode tampered source-action response: %v", err)
+			}
+			if _, err := seed.fixture.db.Exec(`
+				UPDATE k12_problem_source_action_receipts
+				SET response_json=?
+				WHERE idempotency_key=?`,
+				string(tampered),
+				key,
+			); err != nil {
+				t.Fatalf("tamper frozen source-action response: %v", err)
+			}
+
+			replay, _ := postProblemSourceAction(
+				t,
+				seed.fixture.handler,
+				seed.dispatchID,
+				seed.problemID,
+				key,
+				validSkipSourceActionBody,
+			)
+			if replay.Code != http.StatusInternalServerError {
+				t.Fatalf(
+					"tampered frozen replay=%d, want fail-closed 500; body=%s",
+					replay.Code,
+					replay.Body.String(),
 				)
 			}
 		})

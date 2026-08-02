@@ -216,13 +216,25 @@ func replayProblemSourceAction(
 	requestDigest string,
 ) (ProblemSourceActionResult, bool, error) {
 	var storedDigest, responseJSON string
+	var commandReceiptID, dispatchID, problemID, action string
+	var structureVersion, resultInputRevision int
 	err := tx.QueryRowContext(ctx, `
-		SELECT request_digest,response_json
+		SELECT request_digest,response_json,command_receipt_id,dispatch_id,problem_id,action,
+		       structure_version,result_input_revision
 		FROM k12_problem_source_action_receipts
 		WHERE owner_scope=? AND idempotency_key=?`,
 		ownerScope,
 		idempotencyKey,
-	).Scan(&storedDigest, &responseJSON)
+	).Scan(
+		&storedDigest,
+		&responseJSON,
+		&commandReceiptID,
+		&dispatchID,
+		&problemID,
+		&action,
+		&structureVersion,
+		&resultInputRevision,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ProblemSourceActionResult{}, false, nil
 	}
@@ -238,6 +250,14 @@ func replayProblemSourceAction(
 	result, err := viewcontract.ParseFrozenProblemSourceActionResponse([]byte(responseJSON))
 	if err != nil {
 		return ProblemSourceActionResult{}, false, err
+	}
+	if result.CommandReceiptID != commandReceiptID ||
+		result.DispatchID != dispatchID || result.ProblemID != problemID ||
+		result.Action != action || result.StructureVersion != structureVersion ||
+		result.InputRevision != resultInputRevision {
+		return ProblemSourceActionResult{}, false, fmt.Errorf(
+			"frozen problem source action response identity does not match receipt",
+		)
 	}
 	return result, true, nil
 }
