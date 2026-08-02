@@ -8,13 +8,22 @@
 package release
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/hexagon-codes/hexclaw/featureflag"
 )
 
 // CheckTestsPass 跑 `go test -count=1 -race ./...` 检查所有单元测试通过。
@@ -138,16 +147,120 @@ func CheckChangelogCurrent(repoRoot, expectedVersion, changelogFile string) Func
 	}
 }
 
-// CheckTestsCoverage 跑覆盖率校验（占位实现，CI 注入真实 go test -coverprofile + go tool cover -func 解析）。
+// CheckTestsCoverage runs the same statement-coverage calculation used by Go's
+// cover profile. The profile is created outside the repository and removed on
+// return so the release gate cannot accidentally validate a stale artifact.
 func CheckTestsCoverage(repoRoot string, minPercent float64) FuncCheck {
-	_ = repoRoot
 	return FuncCheck{
 		N:    "tests-coverage",
 		Desc: fmt.Sprintf("覆盖率 ≥ %.0f%%", minPercent),
-		Fn: func(_ context.Context) Result {
-			return Result{Status: StatusSkip, Message: "tests-coverage check 由 CI 注入实际逻辑"}
+		Fn: func(ctx context.Context) Result {
+			if minPercent < 0 || minPercent > 100 {
+				return Result{
+					Status:  StatusFail,
+					Message: "覆盖率阈值配置非法",
+					Detail:  "minPercent must be between 0 and 100",
+				}
+			}
+
+			profile, err := os.CreateTemp("", "hexclaw-cover-*.out")
+			if err != nil {
+				return Result{Status: StatusFail, Message: "创建覆盖率报告失败", Detail: err.Error()}
+			}
+			profilePath := profile.Name()
+			if err := profile.Close(); err != nil {
+				_ = os.Remove(profilePath)
+				return Result{Status: StatusFail, Message: "创建覆盖率报告失败", Detail: err.Error()}
+			}
+			defer os.Remove(profilePath)
+
+			cmd := exec.CommandContext(ctx, "go", "test", "-count=1", "-covermode=atomic", "-coverprofile="+profilePath, "./...")
+			cmd.Dir = repoRoot
+			cmd.Env = overrideEnvironment(os.Environ(), "GOWORK", "off")
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			stdout, err := cmd.Output()
+			if err != nil {
+				return Result{
+					Status:  StatusFail,
+					Message: "覆盖率测试失败",
+					Detail:  truncate(string(stdout)+"\n"+stderr.String(), 4000),
+				}
+			}
+
+			file, err := os.Open(profilePath)
+			if err != nil {
+				return Result{Status: StatusFail, Message: "读取覆盖率报告失败", Detail: err.Error()}
+			}
+			covered, total, err := parseGoCoverageProfile(file)
+			closeErr := file.Close()
+			if err != nil {
+				return Result{Status: StatusFail, Message: "覆盖率报告非法", Detail: err.Error()}
+			}
+			if closeErr != nil {
+				return Result{Status: StatusFail, Message: "关闭覆盖率报告失败", Detail: closeErr.Error()}
+			}
+			percent := 100 * float64(covered) / float64(total)
+			detail := fmt.Sprintf("statement_coverage=%.2f%% threshold=%.2f%% covered=%d total=%d", percent, minPercent, covered, total)
+			if percent+1e-9 < minPercent {
+				return Result{Status: StatusFail, Message: "测试覆盖率低于阈值", Detail: detail}
+			}
+			return Result{Status: StatusPass, Message: "测试覆盖率达到阈值", Detail: detail}
 		},
 	}
+}
+
+func parseGoCoverageProfile(r io.Reader) (covered, total uint64, err error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 4<<20)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if lineNo == 1 {
+			if !strings.HasPrefix(line, "mode: ") {
+				return 0, 0, fmt.Errorf("line 1: missing coverage mode")
+			}
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 3 {
+			return 0, 0, fmt.Errorf("line %d: malformed coverage row", lineNo)
+		}
+		statements, parseErr := strconv.ParseUint(fields[1], 10, 64)
+		if parseErr != nil || statements == 0 {
+			return 0, 0, fmt.Errorf("line %d: invalid statement count", lineNo)
+		}
+		count, parseErr := strconv.ParseUint(fields[2], 10, 64)
+		if parseErr != nil {
+			return 0, 0, fmt.Errorf("line %d: invalid execution count", lineNo)
+		}
+		if ^uint64(0)-total < statements {
+			return 0, 0, fmt.Errorf("line %d: statement count overflow", lineNo)
+		}
+		total += statements
+		if count > 0 {
+			covered += statements
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, 0, fmt.Errorf("scan coverage profile: %w", err)
+	}
+	if lineNo == 0 || total == 0 {
+		return 0, 0, fmt.Errorf("coverage profile contains no statements")
+	}
+	return covered, total, nil
+}
+
+func overrideEnvironment(environ []string, key, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(environ)+1)
+	for _, entry := range environ {
+		if !strings.HasPrefix(entry, prefix) {
+			out = append(out, entry)
+		}
+	}
+	return append(out, prefix+value)
 }
 
 // CheckSignaturesValid 占位：签名校验由项目 CI 注入。
@@ -167,11 +280,14 @@ func CheckSignaturesValid(verifyFn func(context.Context) error) FuncCheck {
 	}
 }
 
-// CheckMigrationReady 占位：迁移可双向校验由 CI 注入。
+// CheckMigrationReady executes the repository-specific migration readiness
+// proof. HexClaw uses forward-only numbered SQLite migrations: the release
+// proof is clean installation, persisted-ledger reopen, and database integrity,
+// rather than an unsafe claim that every DDL change has a destructive down path.
 func CheckMigrationReady(verifyFn func(context.Context) error) FuncCheck {
 	return FuncCheck{
 		N:    "migration-ready",
-		Desc: "迁移脚本支持 forward + rollback",
+		Desc: "迁移通过 clean-install、reopen 与 integrity 验证",
 		Fn: func(ctx context.Context) Result {
 			if verifyFn == nil {
 				return Result{Status: StatusSkip, Message: "未注入迁移校验"}
@@ -179,7 +295,7 @@ func CheckMigrationReady(verifyFn func(context.Context) error) FuncCheck {
 			if err := verifyFn(ctx); err != nil {
 				return Result{Status: StatusFail, Message: "迁移校验失败", Detail: err.Error()}
 			}
-			return Result{Status: StatusPass, Message: "迁移可双向"}
+			return Result{Status: StatusPass, Message: "迁移安装、重启与完整性验证通过"}
 		},
 	}
 }
@@ -201,47 +317,262 @@ func CheckConfigValidated(verifyFn func(context.Context) error) FuncCheck {
 	}
 }
 
-// CheckSBOMFresh 校验 SBOM 文件存在且 mtime 在 maxAgeDays 之内。
+const maxSBOMSize = 64 << 20
+
+// CheckSBOMFresh 校验 SBOM 满足受支持的 CycloneDX/SPDX JSON 基础身份合同，且文档内
+// generation timestamp 在 maxAgeDays 之内。完整标准合规仍应由发布流水线使用官方
+// JSON Schema validator 证明；本检查不把浅层 JSON 解码冒充完整 schema validation。
+// 文件 mtime 不是可信的生成证据：
+// checkout、copy 或 touch 都能刷新它，却不会刷新组件清单。
 func CheckSBOMFresh(repoRoot, sbomFile string, maxAgeDays int) FuncCheck {
 	return FuncCheck{
 		N:    "sbom-fresh",
-		Desc: fmt.Sprintf("%s mtime 在 %d 天内", sbomFile, maxAgeDays),
+		Desc: fmt.Sprintf("%s 有受支持的 SBOM 身份合同且生成时间在 %d 天内", sbomFile, maxAgeDays),
 		Fn: func(_ context.Context) Result {
 			path := filepath.Join(repoRoot, sbomFile)
-			info, err := os.Stat(path)
+			info, err := os.Lstat(path)
 			if err != nil {
 				return Result{Status: StatusFail, Message: "SBOM 文件缺失", Detail: err.Error()}
 			}
-			// 简化：用 size > 0 + 不超 N 天判 fresh
-			if info.Size() == 0 {
-				return Result{Status: StatusFail, Message: "SBOM 文件为空"}
+			if !info.Mode().IsRegular() {
+				return Result{Status: StatusFail, Message: "SBOM 文件类型非法", Detail: info.Mode().String()}
 			}
-			return Result{Status: StatusPass, Message: "SBOM 存在"}
+			file, err := os.Open(path)
+			if err != nil {
+				return Result{Status: StatusFail, Message: "SBOM 文件读取失败", Detail: err.Error()}
+			}
+			defer file.Close()
+			openedInfo, err := file.Stat()
+			if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+				detail := "file identity changed while opening"
+				if err != nil {
+					detail = err.Error()
+				}
+				return Result{Status: StatusFail, Message: "SBOM 文件身份非法", Detail: detail}
+			}
+			if openedInfo.Size() <= 0 || openedInfo.Size() > maxSBOMSize {
+				return Result{
+					Status:  StatusFail,
+					Message: "SBOM 文件大小非法",
+					Detail:  fmt.Sprintf("size=%d allowed=1..%d", openedInfo.Size(), maxSBOMSize),
+				}
+			}
+			data, err := io.ReadAll(io.LimitReader(file, maxSBOMSize+1))
+			if err != nil {
+				return Result{Status: StatusFail, Message: "SBOM 文件读取失败", Detail: err.Error()}
+			}
+			if len(data) > maxSBOMSize {
+				return Result{Status: StatusFail, Message: "SBOM 文件大小非法"}
+			}
+
+			format, generatedAt, err := parseSBOMDocument(data)
+			if err != nil {
+				return Result{Status: StatusFail, Message: "SBOM 格式非法", Detail: err.Error()}
+			}
+			if maxAgeDays <= 0 {
+				return Result{Status: StatusFail, Message: "SBOM 新鲜度配置非法", Detail: "maxAgeDays must be positive"}
+			}
+			now := time.Now().UTC()
+			if generatedAt.After(now.Add(5 * time.Minute)) {
+				return Result{Status: StatusFail, Message: "SBOM 生成时间在未来", Detail: generatedAt.Format(time.RFC3339)}
+			}
+			maxAge := time.Duration(maxAgeDays) * 24 * time.Hour
+			if now.Sub(generatedAt) > maxAge {
+				return Result{
+					Status:  StatusFail,
+					Message: "SBOM 已过期",
+					Detail:  fmt.Sprintf("format=%s generated_at=%s max_age=%s", format, generatedAt.Format(time.RFC3339), maxAge),
+				}
+			}
+			return Result{
+				Status:  StatusPass,
+				Message: "SBOM 基础身份与生成时间有效",
+				Detail:  fmt.Sprintf("format=%s generated_at=%s", format, generatedAt.Format(time.RFC3339)),
+			}
 		},
 	}
 }
 
-// CheckFlagStageAudit 校验所有 alpha flag 在审计白名单内。
-func CheckFlagStageAudit(allRegistered, expectedAlphaFlags []string) FuncCheck {
+func parseSBOMDocument(data []byte) (string, time.Time, error) {
+	var doc struct {
+		BOMFormat    string `json:"bomFormat"`
+		SpecVersion  string `json:"specVersion"`
+		SerialNumber string `json:"serialNumber"`
+		Version      int    `json:"version"`
+		Metadata     *struct {
+			Timestamp string `json:"timestamp"`
+		} `json:"metadata"`
+		Components json.RawMessage `json:"components"`
+
+		SPDXVersion       string `json:"spdxVersion"`
+		SPDXID            string `json:"SPDXID"`
+		DataLicense       string `json:"dataLicense"`
+		Name              string `json:"name"`
+		DocumentNamespace string `json:"documentNamespace"`
+		CreationInfo      *struct {
+			Created  string   `json:"created"`
+			Creators []string `json:"creators"`
+		} `json:"creationInfo"`
+		Packages json.RawMessage `json:"packages"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return "", time.Time{}, fmt.Errorf("decode JSON: %w", err)
+	}
+
+	cycloneDX := doc.BOMFormat != ""
+	spdx := doc.SPDXVersion != ""
+	if cycloneDX == spdx {
+		return "", time.Time{}, fmt.Errorf("document must identify exactly one of CycloneDX or SPDX")
+	}
+
+	if cycloneDX {
+		if doc.BOMFormat != "CycloneDX" {
+			return "", time.Time{}, fmt.Errorf("invalid CycloneDX bomFormat")
+		}
+		if !supportedCycloneDXVersion(doc.SpecVersion) {
+			return "", time.Time{}, fmt.Errorf("unsupported CycloneDX specVersion %q", doc.SpecVersion)
+		}
+		if !strings.HasPrefix(doc.SerialNumber, "urn:uuid:") || doc.Version < 1 {
+			return "", time.Time{}, fmt.Errorf("CycloneDX serialNumber/version missing")
+		}
+		if doc.Metadata == nil || strings.TrimSpace(doc.Metadata.Timestamp) == "" {
+			return "", time.Time{}, fmt.Errorf("CycloneDX metadata.timestamp missing")
+		}
+		if err := requireNonEmptyJSONArray(doc.Components, "CycloneDX components"); err != nil {
+			return "", time.Time{}, err
+		}
+		generatedAt, err := time.Parse(time.RFC3339, doc.Metadata.Timestamp)
+		if err != nil {
+			return "", time.Time{}, fmt.Errorf("CycloneDX metadata.timestamp: %w", err)
+		}
+		return "CycloneDX " + doc.SpecVersion, generatedAt.UTC(), nil
+	}
+
+	if !supportedSPDXVersion(doc.SPDXVersion) {
+		return "", time.Time{}, fmt.Errorf("unsupported SPDX version %q", doc.SPDXVersion)
+	}
+	if doc.SPDXID != "SPDXRef-DOCUMENT" || doc.DataLicense != "CC0-1.0" {
+		return "", time.Time{}, fmt.Errorf("invalid SPDX document identity/license")
+	}
+	if strings.TrimSpace(doc.Name) == "" || strings.TrimSpace(doc.DocumentNamespace) == "" {
+		return "", time.Time{}, fmt.Errorf("SPDX name/documentNamespace missing")
+	}
+	if doc.CreationInfo == nil || strings.TrimSpace(doc.CreationInfo.Created) == "" || len(doc.CreationInfo.Creators) == 0 {
+		return "", time.Time{}, fmt.Errorf("SPDX creationInfo missing")
+	}
+	if err := requireNonEmptyJSONArray(doc.Packages, "SPDX packages"); err != nil {
+		return "", time.Time{}, err
+	}
+	generatedAt, err := time.Parse(time.RFC3339, doc.CreationInfo.Created)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("SPDX creationInfo.created: %w", err)
+	}
+	return doc.SPDXVersion, generatedAt.UTC(), nil
+}
+
+func supportedCycloneDXVersion(version string) bool {
+	switch version {
+	case "1.4", "1.5", "1.6", "1.7":
+		return true
+	default:
+		return false
+	}
+}
+
+func supportedSPDXVersion(version string) bool {
+	switch version {
+	case "SPDX-2.2", "SPDX-2.3":
+		return true
+	default:
+		return false
+	}
+}
+
+func requireNonEmptyJSONArray(raw json.RawMessage, field string) error {
+	var entries []json.RawMessage
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return fmt.Errorf("%s must be an array", field)
+	}
+	if err := json.Unmarshal(raw, &entries); err != nil || entries == nil {
+		return fmt.Errorf("%s must be an array", field)
+	}
+	if len(entries) == 0 {
+		return fmt.Errorf("%s must not be empty", field)
+	}
+	return nil
+}
+
+var (
+	flagNamePattern = regexp.MustCompile(`^[a-z0-9]+(?:[._-][a-z0-9]+)*$`)
+	semverPattern   = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
+)
+
+// CheckFlagStageAudit 校验 flag 元数据及所有 alpha flag 的显式审计白名单。
+// 白名单必须与已注册的 alpha flag 集合完全一致；任何漂移都阻断发版。
+func CheckFlagStageAudit(allRegistered []featureflag.Flag, reviewedAlphaFlags []string) FuncCheck {
 	return FuncCheck{
 		N:    "flag-stage-audit",
 		Desc: "所有 alpha flag 已 review 升级目标",
 		Fn: func(_ context.Context) Result {
-			expected := map[string]bool{}
-			for _, f := range expectedAlphaFlags {
-				expected[f] = true
-			}
-			var unaudited []string
-			for _, f := range allRegistered {
-				if !expected[f] {
-					unaudited = append(unaudited, f)
+			registered := make(map[string]featureflag.Flag, len(allRegistered))
+			alpha := make(map[string]struct{})
+			var issues []string
+			for i, f := range allRegistered {
+				name := strings.TrimSpace(f.Name)
+				if name == "" || name != f.Name || !flagNamePattern.MatchString(name) {
+					issues = append(issues, fmt.Sprintf("registered flag[%d] has invalid name %q", i, f.Name))
+				}
+				if _, exists := registered[f.Name]; exists {
+					issues = append(issues, fmt.Sprintf("registered flag %q is duplicated", f.Name))
+				} else {
+					registered[f.Name] = f
+				}
+				if strings.TrimSpace(f.Description) == "" {
+					issues = append(issues, fmt.Sprintf("registered flag %q has empty description", f.Name))
+				}
+				if !semverPattern.MatchString(f.SinceVersion) {
+					issues = append(issues, fmt.Sprintf("registered flag %q has invalid since version %q", f.Name, f.SinceVersion))
+				}
+				switch f.Stage {
+				case featureflag.StageAlpha:
+					alpha[f.Name] = struct{}{}
+				case featureflag.StageBeta, featureflag.StageGA, featureflag.StageDeprecated:
+				default:
+					issues = append(issues, fmt.Sprintf("registered flag %q has invalid stage %d", f.Name, f.Stage))
 				}
 			}
-			if len(unaudited) > 0 {
+
+			reviewed := make(map[string]struct{}, len(reviewedAlphaFlags))
+			for i, name := range reviewedAlphaFlags {
+				if strings.TrimSpace(name) == "" || strings.TrimSpace(name) != name {
+					issues = append(issues, fmt.Sprintf("reviewed alpha flag[%d] has invalid name %q", i, name))
+				}
+				if _, exists := reviewed[name]; exists {
+					issues = append(issues, fmt.Sprintf("reviewed alpha flag %q is duplicated", name))
+					continue
+				}
+				reviewed[name] = struct{}{}
+				registeredFlag, exists := registered[name]
+				if !exists {
+					issues = append(issues, fmt.Sprintf("reviewed alpha flag %q is not registered", name))
+					continue
+				}
+				if registeredFlag.Stage != featureflag.StageAlpha {
+					issues = append(issues, fmt.Sprintf("reviewed flag %q is %s, not alpha", name, registeredFlag.Stage))
+				}
+			}
+			for name := range alpha {
+				if _, exists := reviewed[name]; !exists {
+					issues = append(issues, fmt.Sprintf("alpha flag %q is not reviewed", name))
+				}
+			}
+
+			if len(issues) > 0 {
+				sort.Strings(issues)
 				return Result{
-					Status:  StatusWarn,
-					Message: fmt.Sprintf("%d 个 flag 不在审计白名单内", len(unaudited)),
-					Detail:  strings.Join(unaudited, ", "),
+					Status:  StatusFail,
+					Message: fmt.Sprintf("feature flag stage audit failed with %d issue(s)", len(issues)),
+					Detail:  strings.Join(issues, "; "),
 				}
 			}
 			return Result{Status: StatusPass, Message: "所有 alpha flag 已审计"}
@@ -252,14 +583,16 @@ func CheckFlagStageAudit(allRegistered, expectedAlphaFlags []string) FuncCheck {
 // BuildDefault10WithReal 把 Default10 中的占位 check 替换为真实实现。
 //
 // 调用方传入 repoRoot + expectedVersion + 关键版本文件名，返回的 []Check
-// 可直接传给 Gate.Run。其它 6 项（tests-coverage / signatures / migration / config /
-// sbom / flag-stage-audit）的工厂函数（CheckXxx）也已提供，调用方可按需注入。
+// 可直接传给 Gate.Run。其它 5 项（signatures / migration / config / sbom /
+// flag-stage-audit）的工厂函数（CheckXxx）也已提供，调用方按发布环境注入。
 func BuildDefault10WithReal(repoRoot, expectedVersion string, versionFiles []string) []Check {
 	checks := Default10()
 	for i := range checks {
 		switch checks[i].Name() {
 		case "tests-pass":
 			checks[i] = CheckTestsPass(repoRoot)
+		case "tests-coverage":
+			checks[i] = CheckTestsCoverage(repoRoot, 70)
 		case "lint-clean":
 			checks[i] = CheckLintClean(repoRoot)
 		case "version-bump":

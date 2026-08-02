@@ -1,10 +1,11 @@
 package config
 
 import (
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 
 	"github.com/hexagon-codes/hexclaw/secret"
@@ -162,47 +163,148 @@ func (w *Writer) readConfig() (*Config, error) {
 func (w *Writer) writeConfig(cfg *Config) error {
 	// 写盘前把 MCP env 凭证静态加密（无 box 时 no-op，保持明文）。
 	EncryptMCPEnv(cfg.MCP.Servers, w.box)
-	data, err := yaml.Marshal(cfg)
+	data, err := marshalConfigForPersistence(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	return atomicWriteFile(w.path, data, 0644)
+	// The config may contain legacy inline provider/MCP credentials. Keep the
+	// entire file owner-only even when newer entries use opaque credential refs.
+	return ReconcileCommittedWrite(atomicWriteFile(w.path, data, 0o600))
 }
 
-// atomicWriteFile 原子写入文件：先写 temp 再 rename，防止 crash 导致配置损坏
+type atomicWriteOps struct {
+	syncTemp   func(*os.File) error
+	replace    func(oldPath, newPath string) error
+	syncParent func(dir string) error
+}
+
+// PostCommitDurabilityError means the target path was replaced successfully,
+// but syncing the parent directory failed. The new bytes are visible to this
+// process; their survival across an immediate machine crash is not guaranteed.
+//
+// Callers must not treat this like a pre-commit failure and blindly write an
+// older snapshot back. ReconcileCommittedWrite accepts the outcome only when
+// the target was read back and its digest matches the intended bytes.
+type PostCommitDurabilityError struct {
+	Path           string
+	Cause          error
+	expectedSHA256 string
+	observedSHA256 string
+	readbackErr    error
+}
+
+func (e *PostCommitDurabilityError) Error() string {
+	if e == nil {
+		return "post-commit durability error"
+	}
+	if e.readbackErr != nil {
+		return fmt.Sprintf("target replaced but parent directory sync failed: %v (readback failed: %v)", e.Cause, e.readbackErr)
+	}
+	if !e.ReadbackVerified() {
+		return fmt.Sprintf("target replaced but parent directory sync failed: %v (readback digest mismatch)", e.Cause)
+	}
+	return fmt.Sprintf("target replaced and read back, but parent directory sync failed: %v", e.Cause)
+}
+
+func (e *PostCommitDurabilityError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func (e *PostCommitDurabilityError) ReadbackVerified() bool {
+	return e != nil && e.readbackErr == nil && e.expectedSHA256 != "" && e.expectedSHA256 == e.observedSHA256
+}
+
+func (e *PostCommitDurabilityError) ExpectedSHA256() string {
+	if e == nil {
+		return ""
+	}
+	return e.expectedSHA256
+}
+
+func (e *PostCommitDurabilityError) ObservedSHA256() string {
+	if e == nil {
+		return ""
+	}
+	return e.observedSHA256
+}
+
+// ReconcileCommittedWrite converts only a verified post-commit durability
+// outcome into success. Ordinary failures and unverified outcomes are retained.
+func ReconcileCommittedWrite(err error) error {
+	if err == nil {
+		return nil
+	}
+	var committed *PostCommitDurabilityError
+	if errors.As(err, &committed) && committed.ReadbackVerified() {
+		return nil
+	}
+	return err
+}
+
+// atomicWriteFile 原子且持久地写入文件。临时文件和目标文件位于同一目录，
+// 因此 replace 始终发生在同一文件系统内。
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	return atomicWriteFileWithOps(path, data, perm, atomicWriteOps{
+		syncTemp:   (*os.File).Sync,
+		replace:    replaceFile,
+		syncParent: syncParentDirectory,
+	})
+}
+
+func atomicWriteFileWithOps(path string, data []byte, perm os.FileMode, ops atomicWriteOps) error {
 	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
 	tmp, err := os.CreateTemp(dir, ".hexclaw-cfg-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
 	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 
+	// Apply metadata before Sync so the same durability boundary covers both
+	// the bytes and the requested mode.
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
+		_ = tmp.Close()
 		return fmt.Errorf("write temp file: %w", err)
 	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
+	if err := ops.syncTemp(tmp); err != nil {
+		_ = tmp.Close()
 		return fmt.Errorf("sync temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
 		return fmt.Errorf("close temp file: %w", err)
 	}
-	if err := os.Chmod(tmpPath, perm); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("chmod temp file: %w", err)
-	}
-	// Windows: os.Rename fails if target exists; remove first
-	if runtime.GOOS == "windows" {
-		os.Remove(path)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
+	if err := ops.replace(tmpPath, path); err != nil {
 		return fmt.Errorf("rename temp to target: %w", err)
+	}
+	committed = true
+	if err := ops.syncParent(dir); err != nil {
+		outcome := &PostCommitDurabilityError{
+			Path:           path,
+			Cause:          err,
+			expectedSHA256: fmt.Sprintf("sha256:%x", sha256.Sum256(data)),
+		}
+		readback, readErr := os.ReadFile(path)
+		if readErr != nil {
+			outcome.readbackErr = readErr
+		} else {
+			outcome.observedSHA256 = fmt.Sprintf("sha256:%x", sha256.Sum256(readback))
+		}
+		return outcome
 	}
 	return nil
 }

@@ -288,7 +288,7 @@ func executeStart(
 				Model:       options.model,
 				Metadata: map[string]string{
 					"k12.child_name": options.learner,
-					"k12.grade_term": "grade5_2",
+					"k12.grade_term": "五年级下",
 				},
 			},
 		})

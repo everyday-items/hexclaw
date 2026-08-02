@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -52,6 +53,14 @@ func (c *Config) Validate() error {
 			Value:   c.Server.Host,
 			Rule:    "非法主机名格式",
 			Suggest: "用 127.0.0.1 / localhost / 0.0.0.0",
+		})
+	}
+	if strings.TrimSpace(c.Server.Host) != "" && !isLoopbackListenerHost(c.Server.Host) && strings.TrimSpace(c.Server.APIToken) == "" {
+		errs = append(errs, &ValidationError{
+			Field:   "server.api_token",
+			Value:   "<empty>",
+			Rule:    "监听非 loopback 地址时必须配置 API token",
+			Suggest: "配置高熵 server.api_token，或把 server.host 改为 127.0.0.1",
 		})
 	}
 	if !isValidAutonomyProfile(c.Security.Autonomy.Profile) {
@@ -306,6 +315,15 @@ func (c *Config) Validate() error {
 		return errs
 	}
 	return nil
+}
+
+func isLoopbackListenerHost(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // isValidTTSProvider 检查 TTS provider 取值是否合法。

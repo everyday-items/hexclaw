@@ -141,6 +141,7 @@ server:
   host: "0.0.0.0"
   port: 8080
   mode: "development"
+  api_token: "test-capability"
 llm:
   default: "openai"
   providers:

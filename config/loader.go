@@ -129,15 +129,34 @@ func Save(cfg *Config, configFile string) error {
 		configFile = filepath.Join(dir, "hexclaw.yaml")
 	}
 
-	data, err := yaml.Marshal(cfg)
+	data, err := marshalConfigForPersistence(cfg)
 	if err != nil {
 		return fmt.Errorf("序列化配置失败: %w", err)
 	}
 
-	if err := atomicWriteFile(configFile, data, 0600); err != nil {
+	if err := ReconcileCommittedWrite(atomicWriteFile(configFile, data, 0600)); err != nil {
 		return fmt.Errorf("写入配置文件失败: %w", err)
 	}
 	return nil
+}
+
+// marshalConfigForPersistence strips process-local credentials while leaving
+// the live Config untouched. Transaction snapshots deliberately do not use
+// this helper because runtime appliers need the hydrated secret.
+func marshalConfigForPersistence(cfg *Config) ([]byte, error) {
+	if cfg == nil {
+		return yaml.Marshal(cfg)
+	}
+	persisted := *cfg
+	persisted.LLM = cfg.LLM
+	persisted.LLM.Providers = make(map[string]LLMProviderConfig, len(cfg.LLM.Providers))
+	for name, provider := range cfg.LLM.Providers {
+		if strings.TrimSpace(provider.CredentialRef) != "" {
+			provider.APIKey = ""
+		}
+		persisted.LLM.Providers[name] = provider
+	}
+	return yaml.Marshal(&persisted)
 }
 
 // MaskAPIKey 对 API Key 脱敏显示

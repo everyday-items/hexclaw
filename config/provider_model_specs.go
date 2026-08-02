@@ -96,6 +96,34 @@ func ValidateProviderInstanceID(id string) error {
 	return nil
 }
 
+const (
+	providerCredentialRefPrefix = "llm_provider/"
+	providerCredentialRefSuffix = "/api_key"
+)
+
+// ProviderAPIKeyCredentialRef returns the only credential namespace accepted
+// for an LLM provider. Editable map keys, display names, URLs, and caller-owned
+// service/account strings never participate in vault identity.
+func ProviderAPIKeyCredentialRef(providerInstanceID string) (string, error) {
+	if err := ValidateProviderInstanceID(providerInstanceID); err != nil {
+		return "", err
+	}
+	return providerCredentialRefPrefix + providerInstanceID + providerCredentialRefSuffix, nil
+}
+
+// ValidateProviderAPIKeyCredentialRef verifies both syntax and exact binding
+// to the expected stable provider identity.
+func ValidateProviderAPIKeyCredentialRef(ref, providerInstanceID string) error {
+	want, err := ProviderAPIKeyCredentialRef(providerInstanceID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(ref) != want {
+		return fmt.Errorf("credential_ref must equal the provider api_key vault identity")
+	}
+	return nil
+}
+
 // EffectiveProviderInstanceID returns the persisted identity when available.
 // Legacy configs receive a deterministic, versioned SHA-256 fallback derived
 // only from the normalized provider map key. GET and runtime must use this same

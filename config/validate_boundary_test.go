@@ -104,6 +104,11 @@ func TestValidate_HostFormats(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := validBase()
 			c.Server.Host = tt.host
+			// This test isolates hostname syntax. Remote listeners independently
+			// require authentication under the server trust-boundary contract.
+			if tt.host != "" && !isLoopbackListenerHost(tt.host) {
+				c.Server.APIToken = "test-capability"
+			}
 			err := c.Validate()
 			if tt.wantErr && err == nil {
 				t.Fatalf("host %q should be rejected", tt.host)
@@ -372,12 +377,13 @@ func TestDefaultConfig_RemainingFields(t *testing.T) {
 	if c.Storage.Driver != "sqlite" {
 		t.Errorf("Storage.Driver = %q, want sqlite", c.Storage.Driver)
 	}
-	// CodeExec policy defaults are function-first.
+	// Approval retains its legacy policy semantics. Network access is
+	// deny-by-default and requires an explicit grant.
 	if c.Skill.Builtin.CodeExecPolicy.CodeExecRequiresApproval() {
 		t.Error("default code_exec policy should not require approval")
 	}
-	if !c.Skill.Builtin.CodeExecPolicy.CodeExecNetworkAllowed() {
-		t.Error("default code_exec policy should allow network")
+	if c.Skill.Builtin.CodeExecPolicy.CodeExecNetworkAllowed() {
+		t.Error("default code_exec policy should deny network")
 	}
 }
 

@@ -12,7 +12,7 @@
 //	4. docs-current      — README / CHANGELOG 包含本版本说明
 //	5. version-bump      — go.mod / package.json 等版本号已更新
 //	6. signatures-valid  — 关键二进制 / 包已签名
-//	7. migration-ready   — DB / config 迁移脚本可双向（forward + rollback）
+//	7. migration-ready   — DB migration clean-install/reopen/integrity 验证
 //	8. config-validated  — 默认 config 通过 validator
 //	9. sbom-fresh        — Software Bill of Materials 已重新生成
 //	10. flag-stage-audit — 所有 alpha flag 在交付前都 review 过 stage 升级
@@ -188,7 +188,7 @@ func Default10() []Check {
 		{"docs-current", "README / CHANGELOG 已包含本版本说明"},
 		{"version-bump", "go.mod / package.json 等版本号已更新"},
 		{"signatures-valid", "关键二进制 / 包已签名（macOS notarize / sigstore）"},
-		{"migration-ready", "DB / config 迁移脚本可双向（forward + rollback）"},
+		{"migration-ready", "DB migration 通过 clean-install、reopen 与 integrity 验证"},
 		{"config-validated", "默认 config 通过 Validator + DryRun"},
 		{"sbom-fresh", "Software Bill of Materials 已重新生成"},
 		{"flag-stage-audit", "所有 alpha flag 已 review 升级目标"},

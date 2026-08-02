@@ -342,17 +342,32 @@ type ServerConfig struct {
 
 // LLMConfig LLM 配置
 type LLMConfig struct {
-	Default   string                       `yaml:"default"`   // 默认 Provider 名称
-	Providers map[string]LLMProviderConfig `yaml:"providers"` // Provider 列表
-	Routing   LLMRoutingConfig             `yaml:"routing"`   // 智能路由
-	Cache     LLMCacheConfig               `yaml:"cache"`     // 语义缓存
-	Tools     LLMToolsConfig               `yaml:"tools"`     // 工具注入（全局）
+	Default             string                              `yaml:"default"`                              // 默认 Provider 名称
+	Providers           map[string]LLMProviderConfig        `yaml:"providers"`                            // Provider 列表
+	Routing             LLMRoutingConfig                    `yaml:"routing"`                              // 智能路由
+	Cache               LLMCacheConfig                      `yaml:"cache"`                                // 语义缓存
+	Tools               LLMToolsConfig                      `yaml:"tools"`                                // 工具注入（全局）
+	ConfigRevision      uint64                              `yaml:"config_revision,omitempty"`            // 每次成功配置提交单调递增
+	LastMutationReceipt *LLMConfigMutationReceipt           `yaml:"last_mutation_receipt,omitempty"`      // 最近一次幂等提交的非秘密证明
+	MutationReceipts    map[string]LLMConfigMutationReceipt `yaml:"mutation_receipts,omitempty" json:"-"` // request_id -> durable idempotency proof; older successful mutations remain replayable
 	// ReasoningProvider/Model 解题/批改等「多步文本推理 + 工具验证」任务专用的强文本模型
 	// （BUG-20260712-#1）。视觉默认模型（如 glm-4v-flash）擅长看图却不擅长多步数学推理与写
 	// 验证代码，会把错答案判成 unverifiable 漏判。配上强文本模型（如 智谱/glm-4.5）后，solve
 	// 源的 solver/verifier 子 Agent 走它；空=沿用默认路由（不改变现状，无回归）。
 	ReasoningProvider string `yaml:"reasoning_provider,omitempty" json:"reasoning_provider,omitempty"`
 	ReasoningModel    string `yaml:"reasoning_model,omitempty" json:"reasoning_model,omitempty"`
+}
+
+// LLMConfigMutationReceipt is a durable, non-secret proof for an idempotent LLM
+// config mutation. The keyed ledger lets the native coordinator resolve a lost
+// HTTP response after later commits or restart without replaying a credential
+// transition or guessing whether the original write committed.
+type LLMConfigMutationReceipt struct {
+	RequestID     string `yaml:"request_id" json:"request_id"`
+	RequestDigest string `yaml:"request_digest" json:"request_digest"`
+	ConfigDigest  string `yaml:"config_digest" json:"config_digest"`
+	Revision      uint64 `yaml:"revision" json:"revision"`
+	CommittedAt   int64  `yaml:"committed_at" json:"committed_at"`
 }
 
 // strongTextProviderTokens 已知擅长多步文本推理的云端 provider 名 token（reasoning 兜底优先序）。
@@ -414,6 +429,7 @@ type LLMToolsConfig struct {
 type LLMProviderConfig struct {
 	ProviderInstanceID string                 `yaml:"provider_instance_id,omitempty" json:"provider_instance_id,omitempty"` // 稳定内部身份，不随名称/Key/端点变化
 	DisplayName        string                 `yaml:"display_name,omitempty" json:"display_name,omitempty"`                 // 用户配置的展示名；不参与 Provider 路由
+	CredentialRef      string                 `yaml:"credential_ref,omitempty" json:"credential_ref,omitempty"`             // OS vault 中的非敏感稳定引用；存在时 APIKey 仅为进程内 hydrated secret
 	APIKey             string                 `yaml:"api_key"`                                                              // API Key
 	BaseURL            string                 `yaml:"base_url"`                                                             // 自定义 API 端点（支持中转/私有部署）
 	Model              string                 `yaml:"model"`                                                                // 当前选中的文本模型；可空
@@ -838,26 +854,27 @@ type BuiltinConfig struct {
 
 // CodeExecPolicyConfig 代码执行审批与沙箱策略
 //
-// RequireApproval 为 true 时，code_exec 工具被分类为 "dangerous"，
-// 每次执行前需要用户确认。设为 false 表示信任沙箱隔离，跳过审批。
-// 默认值为 false（功能优先）。
+// RequireApproval 只控制旧版 classifyRisk 兼容路径。统一声明式权限策略是
+// 最终裁决者；当前 DefaultBaselinePolicy 无论该字段取值如何都要求 code_exec
+// 审批，避免配置回退路径意外降权。默认值为 false 仅保留旧配置语义。
 //
-// Network 控制沙箱是否允许网络访问。默认 true 以支持抓取网页、调用 API 等场景。
+// Network 控制沙箱是否允许网络访问。零值和默认配置均为 false；联网执行必须由
+// 用户显式授予，避免代码执行在没有可审计授权的情况下外连或搬运数据。
 type CodeExecPolicyConfig struct {
 	RequireApproval *bool `yaml:"require_approval"` // nil 视为 false（功能优先）
-	Network         *bool `yaml:"network"`          // nil 视为 true（允许网络）
+	Network         *bool `yaml:"network"`          // nil 视为 false（deny-by-default）
 }
 
 // CodeExecNetworkAllowed 返回沙箱是否允许网络访问
 func (c CodeExecPolicyConfig) CodeExecNetworkAllowed() bool {
 	if c.Network == nil {
-		return true
+		return false
 	}
 	return *c.Network
 }
 
-// CodeExecRequiresApproval 返回 code_exec 是否需要用户审批
-// nil（未设置）视为 false，功能优先。
+// CodeExecRequiresApproval 返回旧版 classifyRisk 路径的 code_exec 开关。
+// nil（未设置）视为 false；声明式权限策略仍可强制要求审批。
 func (c CodeExecPolicyConfig) CodeExecRequiresApproval() bool {
 	if c.RequireApproval == nil {
 		return false

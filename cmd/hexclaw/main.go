@@ -315,6 +315,27 @@ func newProcessResourceGovernor(cfg config.ResourceGovernorConfig) (*resourcegov
 	})
 }
 
+func runtimeConfigPath(configFile string) (string, error) {
+	if configFile != "" {
+		return configFile, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user home for config writer: %w", err)
+	}
+	return filepath.Join(home, ".hexclaw", "hexclaw.yaml"), nil
+}
+
+func newRuntimeConfigWriter(configFile string, box *secret.Box) (*config.Writer, error) {
+	path, err := runtimeConfigPath(configFile)
+	if err != nil {
+		return nil, err
+	}
+	writer := config.NewWriter(path)
+	writer.SetSecretBox(box)
+	return writer, nil
+}
+
 func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, desktopMode bool) error {
 	// 1. 加载配置
 	cfg, err := config.Load(configFile)
@@ -483,6 +504,16 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// 解密持久化的 MCP env（重启后从 yaml 读到 enc:v1:…），供下方 mcpMgr 连接使用。
 	config.DecryptMCPEnv(cfg.MCP.Servers, secretBox)
 
+	// Existing HTTP MCP mutations must persist to the exact file loaded by this
+	// serve process. A custom --config path must never be redirected into
+	// ~/.hexclaw/hexclaw.yaml.
+	var cfgWriter *config.Writer
+	if writer, writerErr := newRuntimeConfigWriter(configFile, secretBox); writerErr != nil {
+		logger.Warn("[config] 配置写入器不可用", "error", writerErr)
+	} else {
+		cfgWriter = writer
+	}
+
 	// 4.6 连接 MCP Server（即使无预配 Server 也初始化 Manager，支持动态添加）
 	var mcpMgr *hexmcp.Manager
 	if cfg.MCP.Enabled {
@@ -581,7 +612,16 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	// v0.4.3 §11.10 统一安全闸：PermissionPolicy 为单一权限闸（GA 默认 ON）。无人值守
 	// 来源没有交互审批人，因此按 security.autonomy profile + 显式矩阵决定是否自动放行；
 	// ActionDeny 仍优先，矩阵未命中则 fail-closed。
-	permHub := engine.NewPermissionHubWithRememberedGrantStore(60*time.Second, store)
+	var permissionHubOptions []engine.PermissionHubOption
+	if secretBox != nil {
+		permissionHubOptions = append(permissionHubOptions, engine.WithApprovalEnvelopeBox(secretBox))
+	}
+	permHub, err := engine.NewDurablePermissionHub(
+		ctx, 60*time.Second, store, permissionHubOptions...,
+	)
+	if err != nil {
+		return fmt.Errorf("初始化工具审批 authority 失败: %w", err)
+	}
 
 	// 6.1.0 自动化权限治理数据面：权限决策审计日志 + 任务级授权。
 	// 初始化失败只降级（闸照常工作，少审计/grant），不阻断启动。
@@ -1180,6 +1220,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	// 8. 启动 HTTP 服务
 	srv := api.NewServer(cfg, eng, gw, store)
+	sidecarCapabilityToken, err := sidecarCapabilityTokenFromEnv()
+	if err != nil {
+		return err
+	}
+	if sidecarCapabilityToken != "" {
+		srv.SetSidecarCapabilityToken(sidecarCapabilityToken)
+	}
 	if kbSemanticRuntime != nil {
 		srv.SetSemanticIndexService(kbSemanticRuntime.Service)
 		srv.SetSemanticRuntimeInvalidator(kbSemanticRuntime.Revoke)
@@ -1560,10 +1607,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	if mcpMgr != nil {
 		srv.SetMCPManager(mcpMgr)
 	}
-	// MCP 动态添加持久化 (P0 修复: HTTP API 添加的 MCP server 也要持久化)
-	if home, err := os.UserHomeDir(); err == nil {
-		cfgWriter := config.NewWriter(filepath.Join(home, ".hexclaw", "hexclaw.yaml"))
-		cfgWriter.SetSecretBox(secretBox) // MCP env 凭证静态加密落盘（保险箱接管 MCP 凭证）
+	// MCP 动态添加持久化：HTTP API 复用启动期解析出的同一 writer。
+	if cfgWriter != nil {
 		srv.SetCfgWriter(cfgWriter)
 	}
 	if mp != nil {
@@ -2892,6 +2937,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		if err := wa.Start(ctx, messageHandler); err != nil {
 			fmt.Printf("  ✗ Adapter     Web 启动失败: %v\n", err)
 		} else {
+			wa.SetAttachmentResolver(srv.ResolveStagedAttachments)
 			wa.SetStreamHandler(func(ctx context.Context, msg *adapter.Message) (<-chan *adapter.ReplyChunk, error) {
 				if err := gw.Check(ctx, msg); err != nil {
 					return nil, fmt.Errorf("安全检查未通过: %w", err)
@@ -2902,13 +2948,38 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			srv.SetStreamStateProvider(wa)
 
 			// 接通工具审批: WebAdapter ↔ PermissionHub
-			wa.SetApprovalDecisionHandler(func(resp webadapter.ApprovalResponseData) string {
-				return permHub.HandleResponseResult(engine.PermissionResponse{
-					RequestID: resp.RequestID, InvocationID: resp.InvocationID,
+			wa.SetDurableApprovalDecisionHandler(func(resp webadapter.ApprovalResponseData) webadapter.ApprovalDecisionReceipt {
+				receipt := permHub.HandleResponseReceipt(engine.PermissionResponse{
+					RequestID: resp.RequestID, OwnerID: resp.OwnerID, SessionID: resp.SessionID,
+					InvocationID: resp.InvocationID, DecisionID: resp.DecisionID, Decision: resp.Decision,
 					ArgumentsDigest: resp.ArgumentsDigest, SecurityScopeDigest: resp.SecurityScopeDigest,
-					IdempotencyKey: resp.IdempotencyKey,
-					Approved:       resp.Approved, Remember: resp.Remember,
+					ScopeSchemaVersion: resp.ScopeSchemaVersion, IdempotencyKey: resp.IdempotencyKey,
+					Approved: resp.Approved, Remember: resp.Remember,
 				})
+				return webadapter.ApprovalDecisionReceipt{
+					RequestID: receipt.RequestID, InvocationID: receipt.InvocationID,
+					OwnerID: receipt.OwnerID, SessionID: receipt.ResolvedSessionID,
+					DecisionID: receipt.DecisionID, Decision: receipt.Decision,
+					IdempotencyKey:  receipt.IdempotencyKey,
+					ArgumentsDigest: receipt.ArgumentsDigest, SecurityScopeDigest: receipt.SecurityScopeDigest,
+					ScopeSchemaVersion: receipt.ScopeSchemaVersion,
+					TerminalResult:     receipt.TerminalResult, ACKStatus: receipt.ACKStatus,
+					Replayed: receipt.Replayed,
+				}
+			})
+			wa.SetPendingApprovalReplayHandler(func(_ context.Context, ownerID, sessionID string) []*webadapter.PermissionRequestData {
+				pending := permHub.PendingApprovals(ownerID, sessionID)
+				out := make([]*webadapter.PermissionRequestData, 0, len(pending))
+				for _, req := range pending {
+					out = append(out, &webadapter.PermissionRequestData{
+						ID: req.ID, OwnerID: req.OwnerID, InvocationID: req.InvocationID,
+						ToolName: req.ToolName, Arguments: req.Arguments,
+						ArgumentsDigest: req.ArgumentsDigest, SecurityScopeDigest: req.SecurityScopeDigest,
+						ScopeSchemaVersion: req.ScopeSchemaVersion,
+						DeadlineAt:         req.DeadlineAt, Risk: req.Risk, Reason: req.Reason,
+					})
+				}
+				return out
 			})
 			permHub.SetSender(&webPermissionBridge{wa: wa})
 			fmt.Println("  ✓ Permission  WebSocket 审批已接通")
@@ -3190,7 +3261,8 @@ func (b *webPermissionBridge) SendPermissionRequest(ctx context.Context, session
 		ID: req.ID, OwnerID: req.OwnerID, InvocationID: req.InvocationID,
 		ToolName: req.ToolName, Arguments: req.Arguments,
 		ArgumentsDigest: req.ArgumentsDigest, SecurityScopeDigest: req.SecurityScopeDigest,
-		DeadlineAt: req.DeadlineAt, Risk: req.Risk, Reason: req.Reason,
+		ScopeSchemaVersion: req.ScopeSchemaVersion,
+		DeadlineAt:         req.DeadlineAt, Risk: req.Risk, Reason: req.Reason,
 	})
 }
 

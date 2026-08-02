@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
@@ -241,6 +242,49 @@ func TestCLIStartWritesOnlyOpaqueAtomicManifestAndCleanupIsIdempotent(t *testing
 		}
 	}
 	assertDispatchesGone(t, storePath, manifest)
+}
+
+func TestBUG20260802CLIStartPersistsPublicK12ProfileGradeTerm(t *testing.T) {
+	profile, storePath, manifestPath := newIsolatedCLIStore(t)
+	_, stderr, err := executeCLI(startArguments(
+		profile, storePath, manifestPath, "run-public-grade-term", 30*time.Minute,
+	))
+	if err != nil {
+		t.Fatalf("start: %v\\nstderr=%s", err, stderr)
+	}
+	t.Cleanup(func() {
+		_, _, _ = executeCLI([]string{
+			"cleanup",
+			"--profile", profile,
+			"--store", storePath,
+			"--manifest", manifestPath,
+		})
+	})
+
+	manifest, _ := readDecodedManifest(t, manifestPath)
+	store, err := sqlitestore.New(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	agents, _, err := router.NewSQLiteStore(store.DB()).LoadAgents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, agent := range agents {
+		if agent.Name != manifest.AgentName {
+			continue
+		}
+		gradeTerm := agent.Metadata["k12.grade_term"]
+		if gradeTerm != "五年级下" {
+			t.Fatalf("fixture k12.grade_term=%q, want public profile value 五年级下", gradeTerm)
+		}
+		if !k12.ValidProfileGradeTerm(gradeTerm) {
+			t.Fatalf("fixture k12.grade_term=%q is not a valid public profile grade", gradeTerm)
+		}
+		return
+	}
+	t.Fatal("fixture agent was not persisted")
 }
 
 func TestCLIFailsClosedBeforeStoreOpenForUnsafePathLockAndManifest(t *testing.T) {

@@ -20,12 +20,17 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/eval"
 	"github.com/hexagon-codes/hexclaw/featureflag"
+	_ "github.com/hexagon-codes/hexclaw/featureflag/production"
 	"github.com/hexagon-codes/hexclaw/release"
+	"github.com/hexagon-codes/hexclaw/storage/migrate"
+	storagesqlite "github.com/hexagon-codes/hexclaw/storage/sqlite"
 )
 
 func main() {
@@ -33,6 +38,8 @@ func main() {
 		repoRoot     = flag.String("repo", ".", "仓库根目录（用于版本一致检查）")
 		version      = flag.String("version", "", "期望发版版本（必填，如 0.5.0-beta）")
 		versionFiles = flag.String("version-files", "package.json", "逗号分隔的版本文件列表（在仓库根目录下相对路径）")
+		sbomFile     = flag.String("sbom-file", "sbom.cdx.json", "CycloneDX/SPDX JSON SBOM（相对仓库根目录）")
+		sbomMaxAge   = flag.Int("sbom-max-age-days", 7, "SBOM 文档生成时间允许的最大天数")
 		canaryDryRun = flag.Bool("canary-dry-run", true, "canary 阶段做 dry-run（不真发布）")
 		failFast     = flag.Bool("fail-fast", true, "Gate 阶段任一 FAIL 立即返回")
 	)
@@ -48,14 +55,23 @@ func main() {
 
 	// ============== Phase 1: 静态门禁 ==============
 	fmt.Printf("=== Phase 1: release.Gate (Default10WithReal) ===\n")
+	checks, err := buildReleaseChecks(*repoRoot, *version, files, *sbomFile, *sbomMaxAge)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Gate configuration failed: %v\n", err)
+		os.Exit(2)
+	}
 	gate := &release.Gate{
-		Checks:   release.BuildDefault10WithReal(*repoRoot, *version, files),
+		Checks:   checks,
 		FailFast: *failFast,
 	}
 	rep, err := gate.Run(ctx)
 	printGateReport(rep)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Gate failed: %v\n", err)
+		os.Exit(1)
+	}
+	if err := requireCompleteReleaseGate(rep); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Gate incomplete: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Println("✅ Gate passed")
@@ -83,6 +99,179 @@ func main() {
 	fmt.Println("✅ Canary dry-run completed")
 
 	fmt.Println("\n🎉 verify-release 全部 3 阶段通过；可以发版。")
+}
+
+func buildReleaseChecks(repoRoot, version string, versionFiles []string, sbomFile string, sbomMaxAgeDays int) ([]release.Check, error) {
+	checks := release.BuildDefault10WithReal(repoRoot, version, versionFiles)
+	replacements := []release.Check{
+		release.CheckConfigValidated(func(ctx context.Context) error {
+			return (config.BuiltinValidator{}).DryRun(ctx, config.DefaultConfig())
+		}),
+		release.CheckMigrationReady(verifySQLiteMigrations),
+		release.CheckSBOMFresh(repoRoot, sbomFile, sbomMaxAgeDays),
+		release.CheckFlagStageAudit(featureflag.Registered(), []string{eval.FlagEvalFrameworkV1}),
+	}
+	var err error
+	for _, replacement := range replacements {
+		checks, err = replaceReleaseCheck(checks, replacement)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return checks, nil
+}
+
+func verifySQLiteMigrations(ctx context.Context) error {
+	if len(migrate.All) == 0 {
+		return errors.New("migration registry is empty")
+	}
+	for i, migration := range migrate.All {
+		want := i + 1
+		if migration.Version != want {
+			return fmt.Errorf("migration registry is not contiguous at index %d: got v%d want v%d", i, migration.Version, want)
+		}
+		if strings.TrimSpace(migration.Description) == "" {
+			return fmt.Errorf("migration v%d has no description", migration.Version)
+		}
+	}
+
+	dir, err := os.MkdirTemp("", "hexclaw-migration-gate-*")
+	if err != nil {
+		return fmt.Errorf("create migration sandbox: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	dbPath := filepath.Join(dir, "migration-readiness.db")
+
+	// First boot proves a clean install; the second boot proves the persisted
+	// ledger is restart-safe and does not replay already committed migrations.
+	if err := verifySQLiteMigrationBoot(ctx, dbPath); err != nil {
+		return fmt.Errorf("fresh install: %w", err)
+	}
+	if err := verifySQLiteMigrationBoot(ctx, dbPath); err != nil {
+		return fmt.Errorf("reopen: %w", err)
+	}
+	return nil
+}
+
+func verifySQLiteMigrationBoot(ctx context.Context, dbPath string) error {
+	store, err := storagesqlite.New(dbPath)
+	if err != nil {
+		return fmt.Errorf("open SQLite: %w", err)
+	}
+	defer store.Close()
+	if err := store.Init(ctx); err != nil {
+		return err
+	}
+
+	var count, minVersion, maxVersion int
+	if err := store.DB().QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(MIN(version), 0), COALESCE(MAX(version), 0)
+		FROM schema_migrations`).Scan(&count, &minVersion, &maxVersion); err != nil {
+		return fmt.Errorf("read migration ledger: %w", err)
+	}
+	if count != len(migrate.All) || minVersion != 1 || maxVersion != migrate.All[len(migrate.All)-1].Version {
+		return fmt.Errorf("migration ledger mismatch: count=%d/%d range=v%d..v%d", count, len(migrate.All), minVersion, maxVersion)
+	}
+	for _, migration := range migrate.All {
+		var description string
+		if err := store.DB().QueryRowContext(ctx,
+			"SELECT description FROM schema_migrations WHERE version = ?", migration.Version,
+		).Scan(&description); err != nil {
+			return fmt.Errorf("read migration v%d ledger: %w", migration.Version, err)
+		}
+		if description != migration.Description {
+			return fmt.Errorf("migration v%d description mismatch", migration.Version)
+		}
+	}
+
+	quickRows, err := store.DB().QueryContext(ctx, "PRAGMA quick_check")
+	if err != nil {
+		return fmt.Errorf("SQLite quick_check: %w", err)
+	}
+	for quickRows.Next() {
+		var result string
+		if err := quickRows.Scan(&result); err != nil {
+			quickRows.Close()
+			return fmt.Errorf("scan SQLite quick_check: %w", err)
+		}
+		if result != "ok" {
+			quickRows.Close()
+			return fmt.Errorf("SQLite quick_check failed: %s", result)
+		}
+	}
+	if err := quickRows.Err(); err != nil {
+		quickRows.Close()
+		return fmt.Errorf("SQLite quick_check iteration: %w", err)
+	}
+	if err := quickRows.Close(); err != nil {
+		return fmt.Errorf("close SQLite quick_check: %w", err)
+	}
+
+	foreignKeyRows, err := store.DB().QueryContext(ctx, "PRAGMA foreign_key_check")
+	if err != nil {
+		return fmt.Errorf("SQLite foreign_key_check: %w", err)
+	}
+	if foreignKeyRows.Next() {
+		foreignKeyRows.Close()
+		return errors.New("SQLite foreign_key_check reported a violation")
+	}
+	if err := foreignKeyRows.Err(); err != nil {
+		foreignKeyRows.Close()
+		return fmt.Errorf("SQLite foreign_key_check iteration: %w", err)
+	}
+	if err := foreignKeyRows.Close(); err != nil {
+		return fmt.Errorf("close SQLite foreign_key_check: %w", err)
+	}
+	return nil
+}
+
+func replaceReleaseCheck(checks []release.Check, replacement release.Check) ([]release.Check, error) {
+	if replacement == nil || strings.TrimSpace(replacement.Name()) == "" {
+		return nil, fmt.Errorf("replacement check is nil or unnamed")
+	}
+	out := append([]release.Check(nil), checks...)
+	replaced := 0
+	for i, check := range out {
+		if check != nil && check.Name() == replacement.Name() {
+			out[i] = replacement
+			replaced++
+		}
+	}
+	if replaced != 1 {
+		return nil, fmt.Errorf("check %q replacement count=%d, want 1", replacement.Name(), replaced)
+	}
+	return out, nil
+}
+
+func requireCompleteReleaseGate(report *release.Report) error {
+	if report == nil {
+		return fmt.Errorf("release gate report is nil")
+	}
+	counts := make(map[string]int, len(report.Results))
+	var skipped []string
+	for _, result := range report.Results {
+		counts[result.Name]++
+		if result.Result.Status == release.StatusSkip {
+			skipped = append(skipped, result.Name)
+		}
+	}
+	var invalidCardinality []string
+	for _, required := range release.Default10() {
+		if count := counts[required.Name()]; count != 1 {
+			invalidCardinality = append(invalidCardinality, fmt.Sprintf("%s(count=%d)", required.Name(), count))
+		}
+	}
+	if len(invalidCardinality) > 0 || len(skipped) > 0 {
+		parts := make([]string, 0, 2)
+		if len(invalidCardinality) > 0 {
+			parts = append(parts, "missing/duplicated required checks: "+strings.Join(invalidCardinality, ", "))
+		}
+		if len(skipped) > 0 {
+			parts = append(parts, fmt.Sprintf("%d required checks are not implemented: %s", len(skipped), strings.Join(skipped, ", ")))
+		}
+		return errors.New(strings.Join(parts, "; "))
+	}
+	return nil
 }
 
 // canaryDryRunFlow 在 dry-run=true 时只验证 stage 推进逻辑（用 0 dwell + 永远健康

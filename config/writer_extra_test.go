@@ -168,8 +168,8 @@ func TestCodeExecPolicy_NilDefaultsAreFunctional(t *testing.T) {
 	if p.CodeExecRequiresApproval() {
 		t.Error("nil RequireApproval should default to false (function-first)")
 	}
-	if !p.CodeExecNetworkAllowed() {
-		t.Error("nil Network should default to true (network allowed)")
+	if p.CodeExecNetworkAllowed() {
+		t.Error("nil Network should default to false (network denied)")
 	}
 }
 

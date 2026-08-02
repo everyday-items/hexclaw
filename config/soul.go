@@ -52,5 +52,5 @@ func WriteSoul(soul string) error {
 		return err
 	}
 	// 原子写（临时文件 + rename）：避免聊天热路径 ReadSoul 读到半截内容（消除 TOCTOU）。
-	return atomicWriteFile(path, []byte(soul+"\n"), 0o644)
+	return ReconcileCommittedWrite(atomicWriteFile(path, []byte(soul+"\n"), 0o644))
 }
