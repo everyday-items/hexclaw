@@ -11,6 +11,7 @@ import (
 	"io"
 	"mime"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -1057,22 +1058,28 @@ func (r *codeExecGoStageRunner) Run(dir string, gowork string, args ...string) (
 	}
 
 	exports := map[string]string{
-		"GOCACHE":     filepath.Join(r.TempDir, "go-build"),
-		"GOENV":       "off",
-		"GOFLAGS":     "",
-		"GONOPROXY":   "",
-		"GONOSUMDB":   "",
-		"GOPROXY":     "off",
-		"GOSUMDB":     "off",
-		"GOTOOLCHAIN": "local",
-		"GOWORK":      gowork,
-		"HOME":        filepath.Join(r.TempDir, "home"),
-		"TMP":         r.TempDir,
-		"TEMP":        r.TempDir,
-		"TMPDIR":      r.TempDir,
+		"APPDATA":         filepath.Join(r.TempDir, "home", "AppData", "Roaming"),
+		"GOCACHE":         filepath.Join(r.TempDir, "go-build"),
+		"GOENV":           "off",
+		"GOFLAGS":         "",
+		"GONOPROXY":       "",
+		"GONOSUMDB":       "",
+		"GOPROXY":         "off",
+		"GOSUMDB":         "off",
+		"GOTOOLCHAIN":     "local",
+		"GOWORK":          gowork,
+		"HOME":            filepath.Join(r.TempDir, "home"),
+		"LOCALAPPDATA":    filepath.Join(r.TempDir, "home", "AppData", "Local"),
+		"TMP":             r.TempDir,
+		"TEMP":            r.TempDir,
+		"TMPDIR":          r.TempDir,
+		"XDG_CONFIG_HOME": filepath.Join(r.TempDir, "home", ".config"),
 	}
 	if r.HostModCache != "" {
 		exports["GOMODCACHE"] = r.HostModCache
+	}
+	if err := ensureCodeExecGoTelemetryOff(exports); err != nil {
+		return nil, fmt.Errorf("project dependency closure: %w", err)
 	}
 	stageRun := codeExecRun{
 		ID:          "dependency_closure",
@@ -1488,6 +1495,10 @@ func codeExecEnv(run codeExecRun) map[string]string {
 		"HEXCLAW_RUN_ID":       run.ID,
 		"HEXCLAW_WORKSPACE":    run.Scratch,
 		"HEXCLAW_ARTIFACT_DIR": run.ArtifactDir,
+		"HOME":                 run.Scratch,
+		"XDG_CONFIG_HOME":      filepath.Join(run.Scratch, ".config"),
+		"APPDATA":              filepath.Join(run.Scratch, "AppData", "Roaming"),
+		"LOCALAPPDATA":         filepath.Join(run.Scratch, "AppData", "Local"),
 		"TMPDIR":               filepath.Join(run.Scratch, "tmp"),
 		"TMP":                  filepath.Join(run.Scratch, "tmp"),
 		"TEMP":                 filepath.Join(run.Scratch, "tmp"),
@@ -1528,11 +1539,10 @@ var codeExecWritableEnvKeys = []string{
 	"PYTHONPYCACHEPREFIX",
 	"npm_config_cache",
 	"GOMODCACHE",
+	"XDG_CONFIG_HOME",
+	"APPDATA",
+	"LOCALAPPDATA",
 }
-
-// codeExecUnsetEnvKeys 需从沙箱环境剥除的宿主变量。GOWORK 由 codeExecEnv 确定为
-// staged go.work 或 off，绝不继承宿主值。
-var codeExecUnsetEnvKeys = []string{}
 
 func ensureCodeExecEnvDirs(run codeExecRun, exports map[string]string) error {
 	seen := map[string]bool{}
@@ -1549,6 +1559,39 @@ func ensureCodeExecEnvDirs(run codeExecRun, exports map[string]string) error {
 			return fmt.Errorf("create %s dir %s: %w", key, dir, err)
 		}
 	}
+	return ensureCodeExecGoTelemetryOff(exports)
+}
+
+// Go's GOTELEMETRY value is intentionally non-settable through the process
+// environment. A fresh isolated HOME therefore defaults to local collection
+// and may spawn a telemetry child that needs host devices such as /dev/null.
+// Materialize the documented per-user mode file in the isolated config root
+// before sandbox entry so Go workloads remain deterministic and offline.
+func ensureCodeExecGoTelemetryOff(exports map[string]string) error {
+	home := strings.TrimSpace(exports["HOME"])
+	var configRoot string
+	switch runtime.GOOS {
+	case "darwin":
+		configRoot = filepath.Join(home, "Library", "Application Support")
+	case "windows":
+		configRoot = strings.TrimSpace(exports["APPDATA"])
+	default:
+		configRoot = strings.TrimSpace(exports["XDG_CONFIG_HOME"])
+		if configRoot == "" && home != "" {
+			configRoot = filepath.Join(home, ".config")
+		}
+	}
+	if configRoot == "" {
+		return errors.New("create Go telemetry policy: isolated config root is empty")
+	}
+	modePath := filepath.Join(configRoot, "go", "telemetry", "mode")
+	if err := os.MkdirAll(filepath.Dir(modePath), 0700); err != nil {
+		return fmt.Errorf("create Go telemetry policy directory: %w", err)
+	}
+	mode := "off " + time.Now().UTC().Format("2006-01-02")
+	if err := os.WriteFile(modePath, []byte(mode), 0600); err != nil {
+		return fmt.Errorf("write Go telemetry policy: %w", err)
+	}
 	return nil
 }
 
@@ -1558,43 +1601,88 @@ func runPosixSandboxCommand(ctx context.Context, sb sandbox.Sandbox, command []s
 
 func runPosixSandboxCommandInDir(ctx context.Context, sb sandbox.Sandbox, projectRoot string, command []string, exports map[string]string) (*sandbox.ExecResult, error) {
 	var script strings.Builder
-	for _, k := range codeExecUnsetEnvKeys {
-		script.WriteString("unset ")
-		script.WriteString(k)
-		script.WriteString("\n")
-	}
-	keys := make([]string, 0, len(exports))
-	for k := range exports {
+	cleanEnv := codeExecCleanEnvironment(projectRoot, exports)
+	keys := make([]string, 0, len(cleanEnv))
+	for k := range cleanEnv {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	for _, k := range keys {
-		script.WriteString("export ")
-		script.WriteString(k)
-		script.WriteString("=")
-		script.WriteString(shellQuote(exports[k]))
-		script.WriteString("\n")
-	}
 	if projectRoot != "" {
 		script.WriteString("cd ")
 		script.WriteString(shellQuote(projectRoot))
 		script.WriteString("\n")
 	}
-	script.WriteString("exec ")
+	// The sandbox interface does not expose an Env field, and individual backend
+	// filters can never enumerate every provider/token variable. Clear the entire
+	// inherited environment immediately before the payload and pass back only the
+	// runtime allow-list plus per-run values.
+	script.WriteString("exec /usr/bin/env -i")
+	for _, k := range keys {
+		script.WriteString(" ")
+		script.WriteString(shellQuote(k + "=" + cleanEnv[k]))
+	}
+	script.WriteString(" ")
 	script.WriteString(shellJoin(command))
 	return sb.Exec(ctx, "sh", []string{"-c", script.String()})
+}
+
+func codeExecCleanEnvironment(projectRoot string, exports map[string]string) map[string]string {
+	home := strings.TrimSpace(projectRoot)
+	if home == "" {
+		home = string(os.PathSeparator) + "nonexistent"
+	}
+	clean := map[string]string{
+		"GOENV":   "off",
+		"HOME":    home,
+		"LANG":    "C.UTF-8",
+		"LC_ALL":  "C.UTF-8",
+		"LOGNAME": "hexclaw",
+		"PATH":    codeExecRuntimePath(),
+		"PWD":     home,
+		"USER":    "hexclaw",
+	}
+	for key, value := range exports {
+		clean[key] = value
+	}
+	return clean
+}
+
+func codeExecRuntimePath() string {
+	dirs := []string{
+		"/opt/homebrew/bin",
+		"/usr/local/bin",
+		"/usr/local/go/bin",
+		"/usr/bin",
+		"/bin",
+		"/usr/sbin",
+		"/sbin",
+	}
+	if goroot := strings.TrimSpace(runtime.GOROOT()); goroot != "" {
+		dirs = append(dirs, filepath.Join(goroot, "bin"))
+	}
+	// Preserve explicitly supported runtimes installed in version-manager
+	// directories without inheriting the host's broad PATH verbatim.
+	for _, runtimeName := range []string{"python3", "python", "node", "npm", "npx", "go"} {
+		if path, err := exec.LookPath(runtimeName); err == nil && filepath.IsAbs(path) {
+			dirs = append(dirs, filepath.Dir(path))
+		}
+	}
+	return strings.Join(compactCleanPaths(dirs), string(os.PathListSeparator))
 }
 
 func runWindowsSandboxCommand(ctx context.Context, sb sandbox.Sandbox, run codeExecRun, command []string, exports map[string]string) (*sandbox.ExecResult, error) {
 	var script strings.Builder
 	script.WriteString("@echo off\r\n")
-	for _, k := range codeExecUnsetEnvKeys {
-		script.WriteString("set \"")
-		script.WriteString(k)
-		script.WriteString("=\"\r\n")
+	// Snapshot and clear every inherited variable before invoking the payload.
+	// /d on the outer cmd disables AutoRun hooks; the loop removes unknown future
+	// credential names as well as today's known provider variables.
+	script.WriteString("for /f \"delims==\" %%i in ('set') do set \"%%i=\"\r\n")
+	cleanEnv := codeExecCleanEnvironment(run.ProjectRoot, exports)
+	if systemRoot := strings.TrimSpace(os.Getenv("SystemRoot")); systemRoot != "" {
+		cleanEnv["SystemRoot"] = systemRoot
 	}
-	keys := make([]string, 0, len(exports))
-	for k := range exports {
+	keys := make([]string, 0, len(cleanEnv))
+	for k := range cleanEnv {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
@@ -1602,7 +1690,7 @@ func runWindowsSandboxCommand(ctx context.Context, sb sandbox.Sandbox, run codeE
 		script.WriteString("set \"")
 		script.WriteString(k)
 		script.WriteString("=")
-		script.WriteString(strings.ReplaceAll(exports[k], `"`, `\"`))
+		script.WriteString(strings.ReplaceAll(cleanEnv[k], `"`, `\"`))
 		script.WriteString("\"\r\n")
 	}
 	if run.ProjectRoot != "" {

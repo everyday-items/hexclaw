@@ -108,20 +108,31 @@ func newMCPInstallCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			validated, err := validateMCPInstallEntry(meta)
+			if err != nil {
+				return fmt.Errorf("MCP server %q failed pinned artifact validation: %w", name, err)
+			}
 
 			home, _ := os.UserHomeDir()
 			cfgPath := filepath.Join(home, ".hexclaw", "hexclaw.yaml")
 			w := config.NewWriter(cfgPath)
 
-			if err := w.AppendMCPServer(meta.Name, "stdio", meta.Command, meta.Args, nil, ""); err != nil {
+			if err := w.AppendMCPServer(validated.Name(), "stdio", validated.Command(), validated.Args(), nil, ""); err != nil {
 				return err
 			}
 
-			fmt.Printf("Installed MCP server '%s' (%s)\n", meta.Name, meta.Description)
+			fmt.Printf("Installed MCP server '%s' (%s)\n", validated.Name(), validated.Description())
 			fmt.Println("Restart hexclaw to activate, or use the API to add at runtime.")
 			return nil
 		},
 	}
+}
+
+func validateMCPInstallEntry(meta *hub.McpServerMeta) (hub.ValidatedMCPServer, error) {
+	if meta == nil {
+		return hub.ValidatedMCPServer{}, fmt.Errorf("catalog entry is nil")
+	}
+	return hub.ValidatePinnedMCPServer(*meta)
 }
 
 func newMCPRemoveCmd() *cobra.Command {

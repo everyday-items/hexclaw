@@ -14,13 +14,25 @@ import (
 
 // McpInstallerSkill allows the LLM to search, install, remove, and list MCP servers from Hub.
 type McpInstallerSkill struct {
-	mcpHub    *hub.McpHub
+	mcpHub    mcpCatalog
 	mcpMgr    *mcp.Manager
 	cfgWriter *config.Writer
 }
 
+// mcpCatalog keeps the installer on the narrow read boundary it consumes.
+// Hub admission validates remote/cache snapshots first; the installer repeats
+// pinned-artifact validation as defense in depth at the execution boundary.
+type mcpCatalog interface {
+	Search(string) []hub.McpServerMeta
+	Get(string) (*hub.McpServerMeta, error)
+}
+
 // NewMcpInstallerSkill creates a new McpInstallerSkill.
 func NewMcpInstallerSkill(mcpHub *hub.McpHub, mcpMgr *mcp.Manager, cfgWriter *config.Writer) *McpInstallerSkill {
+	return newMcpInstallerSkill(mcpHub, mcpMgr, cfgWriter)
+}
+
+func newMcpInstallerSkill(mcpHub mcpCatalog, mcpMgr *mcp.Manager, cfgWriter *config.Writer) *McpInstallerSkill {
 	return &McpInstallerSkill{
 		mcpHub:    mcpHub,
 		mcpMgr:    mcpMgr,
@@ -70,14 +82,15 @@ func (m *McpInstallerSkill) Execute(ctx context.Context, args map[string]any) (*
 		if err != nil {
 			return nil, fmt.Errorf("MCP server '%s' not found in Hub: %w", keyword, err)
 		}
-		if strings.TrimSpace(entry.Command) == "" {
-			return nil, fmt.Errorf("MCP server '%s' has empty command", keyword)
+		validated, err := hub.ValidatePinnedMCPServer(*entry)
+		if err != nil {
+			return nil, fmt.Errorf("MCP server '%s' failed pinned artifact validation: %w", keyword, err)
 		}
 		cfg := mcp.ServerConfig{
-			Name:      entry.Name,
+			Name:      validated.Name(),
 			Transport: "stdio",
-			Command:   entry.Command,
-			Args:      entry.Args,
+			Command:   validated.Command(),
+			Args:      validated.Args(),
 			Enabled:   true,
 		}
 		if err := m.mcpMgr.AddServer(ctx, cfg); err != nil {
@@ -85,18 +98,18 @@ func (m *McpInstallerSkill) Execute(ctx context.Context, args map[string]any) (*
 		}
 		// Persist to config file so it survives restart
 		if m.cfgWriter != nil {
-			if err := m.cfgWriter.AppendMCPServer(entry.Name, "stdio", entry.Command, entry.Args, nil, ""); err != nil {
+			if err := m.cfgWriter.AppendMCPServer(validated.Name(), "stdio", validated.Command(), validated.Args(), nil, ""); err != nil {
 				// Non-fatal: server is running but won't persist
 				return &skill.Result{
-					Content: fmt.Sprintf("MCP server '%s' installed (running), but failed to persist config: %v. Will be lost on restart.", entry.Name, err),
+					Content: fmt.Sprintf("MCP server '%s' installed (running), but failed to persist config: %v. Will be lost on restart.", validated.Name(), err),
 				}, nil
 			}
 		}
-		desc := entry.Description
-		if entry.ConfigHint != "" {
-			desc += fmt.Sprintf("\nNote: %s", entry.ConfigHint)
+		desc := validated.Description()
+		if validated.ConfigHint() != "" {
+			desc += fmt.Sprintf("\nNote: %s", validated.ConfigHint())
 		}
-		return &skill.Result{Content: fmt.Sprintf("MCP server '%s' installed and running. %s", entry.Name, desc)}, nil
+		return &skill.Result{Content: fmt.Sprintf("MCP server '%s' installed and running. %s", validated.Name(), desc)}, nil
 
 	case "remove":
 		if keyword == "" {

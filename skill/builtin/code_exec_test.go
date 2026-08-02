@@ -717,7 +717,14 @@ func TestClosure(t *testing.T) {
 }
 `)
 
-	s := newTestCodeExecSkill(t)
+	// This case verifies closure staging, not the runtime timeout policy. The
+	// nested project has a per-run cold GOCACHE and can exceed the generic 30s
+	// test helper budget when package tests run concurrently.
+	s := newConfiguredTestCodeExecSkill(t, &mockSandbox{}, sandbox.Config{
+		Workspace: t.TempDir(),
+		Timeout:   180,
+		Network:   true,
+	})
 	result, err := s.Execute(context.Background(), map[string]any{
 		"mode":         "project",
 		"project_root": appDir,
@@ -727,6 +734,14 @@ func TestClosure(t *testing.T) {
 		t.Fatalf("execute staged project: %v", err)
 	}
 	if !strings.Contains(result.Content, "ok  \texample.com/app") {
+		if report, ok := result.Data.(codeExecReport); ok {
+			goWorkPath := filepath.Join(filepath.Dir(report.Paths["project_root"]), "go.work")
+			if data, readErr := os.ReadFile(goWorkPath); readErr == nil {
+				t.Logf("staged go.work at %s:\n%s", goWorkPath, data)
+			} else {
+				t.Logf("read staged go.work %s: %v", goWorkPath, readErr)
+			}
+		}
 		t.Fatalf("local use/replace project did not pass:\n%s", result.Content)
 	}
 	report, ok := result.Data.(codeExecReport)
@@ -955,7 +970,7 @@ func TestCodeExecSkill_Execute_OfflineProjectGoCommandUsesStagedModuleCache(t *t
 			t.Fatalf("offline project Go execution leaked host path %q:\n%s", forbidden, script)
 		}
 	}
-	for _, want := range []string{"GOWORK='off'", "GOPROXY='off'", "GOSUMDB='off'", "GOTOOLCHAIN='local'"} {
+	for _, want := range []string{"'GOWORK=off'", "'GOPROXY=off'", "'GOSUMDB=off'", "'GOTOOLCHAIN=local'"} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("offline go execution missing %s:\n%s", want, script)
 		}

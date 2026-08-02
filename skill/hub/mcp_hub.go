@@ -8,17 +8,20 @@ import (
 
 // McpServerMeta MCP 服务器元数据（CLI `hexclaw mcp` 与 agentic 安装技能消费的投影类型）。
 type McpServerMeta struct {
-	Name        string            `json:"name"`
-	DisplayName string            `json:"display_name"`
-	Description string            `json:"description"`
-	Category    string            `json:"category"`
-	Command     string            `json:"command"`
-	Args        []string          `json:"args"`
-	Env         map[string]string `json:"env,omitempty"` // stdio 凭证注入（MYSQL_HOST / MDB_MCP_CONNECTION_STRING 等）
-	ConfigHint  string            `json:"config_hint,omitempty"`
-	Source      string            `json:"source,omitempty"`
-	Downloads   int               `json:"downloads"`
-	Rating      float64           `json:"rating"`
+	Name             string            `json:"name"`
+	DisplayName      string            `json:"display_name"`
+	Description      string            `json:"description"`
+	Category         string            `json:"category"`
+	Command          string            `json:"command"`
+	Args             []string          `json:"args"`
+	Env              map[string]string `json:"env,omitempty"` // stdio 凭证注入（MYSQL_HOST / MDB_MCP_CONNECTION_STRING 等）
+	ConfigHint       string            `json:"config_hint,omitempty"`
+	Source           string            `json:"source,omitempty"`
+	Status           string            `json:"status,omitempty"`
+	QuarantineReason string            `json:"quarantine_reason,omitempty"`
+	Artifact         *MCPArtifact      `json:"artifact,omitempty"`
+	Downloads        int               `json:"downloads"`
+	Rating           float64           `json:"rating"`
 }
 
 // McpHub 是统一市场 Hub 的「MCP 类型门面」：所有抓取 / 离线 / 缓存逻辑都收敛在 Hub
@@ -96,16 +99,27 @@ func (h *McpHub) Count() int {
 // skillMetaToMcp 把统一 catalog 的 SkillMeta 投影成 McpServerMeta（字段全集对齐，无损）。
 func skillMetaToMcp(s SkillMeta) McpServerMeta {
 	return McpServerMeta{
-		Name:        s.Name,
-		DisplayName: s.DisplayName,
-		Description: s.Description,
-		Category:    s.Category,
-		Command:     s.Command,
-		Args:        s.Args,
-		Env:         s.Env,
-		ConfigHint:  s.ConfigHint,
-		Source:      s.Source,
-		Downloads:   s.Downloads,
-		Rating:      s.Rating,
+		Name:             s.Name,
+		DisplayName:      s.DisplayName,
+		Description:      s.Description,
+		Category:         s.Category,
+		Command:          s.Command,
+		Args:             s.Args,
+		Env:              s.Env,
+		ConfigHint:       s.ConfigHint,
+		Source:           s.Source,
+		Status:           s.Status,
+		QuarantineReason: s.QuarantineReason,
+		Artifact:         cloneMCPArtifact(s.Artifact),
+		Downloads:        s.Downloads,
+		Rating:           s.Rating,
 	}
+}
+
+func cloneMCPArtifact(in *MCPArtifact) *MCPArtifact {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
 }

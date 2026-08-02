@@ -2,6 +2,8 @@ package hub
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -13,6 +15,13 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/internal/testutil/httpmock"
 )
+
+func testSkillMetaWithIntegrity(meta SkillMeta, content string) SkillMeta {
+	digest := sha256.Sum256([]byte(content))
+	meta.SHA256 = hex.EncodeToString(digest[:])
+	meta.Size = int64(len(content))
+	return meta
+}
 
 func TestHubRefreshAndSearch(t *testing.T) {
 	catalog := Catalog{
@@ -31,6 +40,10 @@ func TestHubRefreshAndSearch(t *testing.T) {
 		Branch:  "main",
 	}, t.TempDir())
 	h.client = httpmock.NewClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if filepath.Base(r.URL.Path) == "mcp-registry.json" {
+			_, _ = w.Write([]byte(`{"version":"1.0","servers":[]}`))
+			return
+		}
 		_ = json.NewEncoder(w).Encode(catalog)
 	}))
 	if err := h.Refresh(context.Background()); err != nil {
@@ -92,7 +105,7 @@ func TestHubInstallAndUninstall(t *testing.T) {
 	}))
 	h.catalog = &Catalog{
 		Skills: []SkillMeta{
-			{Name: "test-skill", URL: "https://clawhub.test/repo/skills/test-skill.md"},
+			testSkillMetaWithIntegrity(SkillMeta{Name: "test-skill", URL: "https://clawhub.test/repo/skills/test-skill.md"}, skillContent),
 		},
 	}
 
@@ -135,7 +148,7 @@ func TestHubContent(t *testing.T) {
 	}))
 	h.catalog = &Catalog{
 		Skills: []SkillMeta{
-			{Name: "test-skill", URL: "https://clawhub.test/repo/skills/test-skill.md"},
+			testSkillMetaWithIntegrity(SkillMeta{Name: "test-skill", URL: "https://clawhub.test/repo/skills/test-skill.md"}, skillContent),
 		},
 	}
 
@@ -169,7 +182,7 @@ func TestHubContentMatchesInstall(t *testing.T) {
 	}))
 	h.catalog = &Catalog{
 		Skills: []SkillMeta{
-			{Name: "diff-skill", URL: "https://clawhub.test/repo/skills/diff-skill.md"},
+			testSkillMetaWithIntegrity(SkillMeta{Name: "diff-skill", URL: "https://clawhub.test/repo/skills/diff-skill.md"}, skillContent),
 		},
 	}
 
@@ -250,6 +263,9 @@ func TestHubRefreshFromLocalRepo(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repoDir, "index.json"), []byte(catalog), 0o644); err != nil {
 		t.Fatalf("写入本地 index.json 失败: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(repoDir, "mcp-registry.json"), []byte(`{"version":"1.0.0","servers":[]}`), 0o644); err != nil {
+		t.Fatalf("写入本地 mcp-registry.json 失败: %v", err)
+	}
 
 	h := New(HubConfig{
 		RepoURL: "file://" + repoDir,
@@ -287,7 +303,7 @@ func TestHubInstallFromLocalRepo(t *testing.T) {
 	}, skillsDir)
 	h.catalog = &Catalog{
 		Skills: []SkillMeta{
-			{Name: "lawyer"},
+			testSkillMetaWithIntegrity(SkillMeta{Name: "lawyer"}, skillContent),
 		},
 	}
 

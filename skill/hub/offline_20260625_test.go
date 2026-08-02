@@ -57,7 +57,7 @@ func TestHub_DiskCache_RoundTrip(t *testing.T) {
 	writeFile(t, filepath.Join(repoDir, "index.json"),
 		`{"version":"t","updated_at":"2030-01-01T00:00:00Z","skills":[{"name":"cache-sentinel-skill","description":"d","category":"c"}]}`)
 	writeFile(t, filepath.Join(repoDir, "mcp-registry.json"),
-		`{"version":"t","servers":[{"name":"cache-sentinel-mcp","command":"npx","args":["-y","x"],"env":{"K":""}}]}`)
+		`{"version":"t","servers":[{"name":"cache-sentinel-mcp","status":"pinned","command":"npx","args":["-y","x@1.2.3"],"env":{"K":""},"artifact":{"ecosystem":"npm","package":"x","version":"1.2.3","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","source_registry":"https://registry.npmjs.org"}}]}`)
 
 	// Hub A：从本地仓库成功拉取 → 应写磁盘缓存。
 	a := New(HubConfig{Enabled: true, RepoURL: repoDir}, "")
