@@ -517,6 +517,47 @@ func (s *Store) ListImageTaskDispatchesForRecovery(
 	return out, nil
 }
 
+// ListImageTaskDispatchesForSession is the read-only renderer recovery
+// projection source. Unlike ListImageTaskDispatchesForRecovery (which is a
+// worker queue), it includes terminal and parent-waiting dispatches because a
+// restarted renderer must recover the durable visible fact without restarting
+// execution. The caller authenticates the outer owner and authorizes the agent;
+// this query enforces the remaining stable agent+source-session scope.
+func (s *Store) ListImageTaskDispatchesForSession(
+	ctx context.Context,
+	agentName, sourceSessionID string,
+) ([]k12.ImageTaskDispatch, error) {
+	agentName = strings.TrimSpace(agentName)
+	sourceSessionID = strings.TrimSpace(sourceSessionID)
+	if agentName == "" || sourceSessionID == "" {
+		return nil, ErrImageTaskNotFound
+	}
+	rows, err := s.db.QueryContext(
+		ctx,
+		imageTaskDispatchSelect+
+			` WHERE agent_name=? AND source_session_id=?
+			  ORDER BY created_at,dispatch_id`,
+		agentName,
+		sourceSessionID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list image task session projection: %w", err)
+	}
+	defer rows.Close()
+	dispatches := make([]k12.ImageTaskDispatch, 0)
+	for rows.Next() {
+		dispatch, scanErr := scanImageTaskDispatch(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		dispatches = append(dispatches, dispatch)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return dispatches, nil
+}
+
 func (s *Store) GetImageTaskInvocation(
 	ctx context.Context,
 	agentName, invocationID string,

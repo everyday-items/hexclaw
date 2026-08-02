@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/records"
@@ -19,6 +20,7 @@ var ErrProblemAttemptConflict = errors.New("problem/attempt immutable fact confl
 
 const problemColumns = `problem_id,agent_name,submission_id,page_asset_id,ordinal,
     problem_kind,parent_problem_id,subproblem_no,source_number_path_json,display_label,
+    source_section_path_json,source_section_label,system_section_ordinal,system_display_label,
     subject,stem_raw,stem_markdown,
     concept_ids_json,transcription_confidence,confirmation_required,
     confirmation_reasons_json,canonical_version,created_at,updated_at`
@@ -44,6 +46,31 @@ func normalizeProblem(problem k12.Problem, at int64) (k12.Problem, error) {
 	problem.DisplayLabel = strings.TrimSpace(problem.DisplayLabel)
 	if (len(problem.SourceNumberPath) == 0) != (problem.DisplayLabel == "") {
 		return k12.Problem{}, fmt.Errorf("k12storage: source_number_path/display_label 必须同时存在或同时为空")
+	}
+	problem.SourceSectionPath = append([]string(nil), problem.SourceSectionPath...)
+	for i := range problem.SourceSectionPath {
+		problem.SourceSectionPath[i] = strings.TrimSpace(problem.SourceSectionPath[i])
+		if problem.SourceSectionPath[i] == "" {
+			return k12.Problem{}, fmt.Errorf("k12storage: source_section_path 含空 token")
+		}
+	}
+	problem.SourceSectionLabel = strings.TrimSpace(problem.SourceSectionLabel)
+	if (len(problem.SourceSectionPath) == 0) != (problem.SourceSectionLabel == "") {
+		return k12.Problem{}, fmt.Errorf("k12storage: source_section_path/source_section_label 必须同时存在或同时为空")
+	}
+	problem.SystemDisplayLabel = strings.TrimSpace(problem.SystemDisplayLabel)
+	if problem.SystemSectionOrdinal < 0 {
+		return k12.Problem{}, fmt.Errorf("k12storage: system_section_ordinal 不可为负数")
+	}
+	if problem.SystemSectionOrdinal == 0 {
+		if problem.SystemDisplayLabel != "" {
+			return k12.Problem{}, fmt.Errorf("k12storage: 无 system_section_ordinal 不可携带 system_display_label")
+		}
+	} else {
+		if len(problem.SourceNumberPath) != 0 || len(problem.SourceSectionPath) == 0 ||
+			problem.SystemDisplayLabel != fmt.Sprintf("第 %d 题（系统序号）", problem.SystemSectionOrdinal) {
+			return k12.Problem{}, fmt.Errorf("k12storage: system order 必须是无原卷题号且有来源分区的显式服务端标签")
+		}
 	}
 	problem.Subject = strings.TrimSpace(problem.Subject)
 	problem.StemMarkdown = strings.TrimSpace(problem.StemMarkdown)
@@ -128,6 +155,46 @@ func validAttemptBBox(box k12.AttemptBBox) bool {
 		box.X+box.W <= 1.0000001 && box.Y+box.H <= 1.0000001
 }
 
+// validateDurableSystemSectionOrder keeps imported/restored snapshots subject to
+// the same server-owned derivation as live recognition.  A system ordinal is not
+// a caller-owned label: it is exactly the source-order position among unnumbered
+// answerable items in one visible source section.
+func validateDurableSystemSectionOrder(problems []k12.Problem) error {
+	ordered := append([]k12.Problem(nil), problems...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Ordinal != ordered[j].Ordinal {
+			return ordered[i].Ordinal < ordered[j].Ordinal
+		}
+		return ordered[i].ProblemID < ordered[j].ProblemID
+	})
+	sectionLabels := make(map[string]string)
+	sectionCounts := make(map[string]int)
+	for _, problem := range ordered {
+		sectionKey := strings.Join(problem.SourceSectionPath, "\x00")
+		if sectionKey != "" {
+			if prior, exists := sectionLabels[sectionKey]; exists && prior != problem.SourceSectionLabel {
+				return fmt.Errorf("k12storage: 同一 source_section_path 不可对应不同 source_section_label")
+			}
+			sectionLabels[sectionKey] = problem.SourceSectionLabel
+		}
+		needsSystemOrder := problem.ProblemKind != k12.ProblemKindCompoundParent &&
+			len(problem.SourceSectionPath) != 0 && len(problem.SourceNumberPath) == 0
+		if !needsSystemOrder {
+			if problem.SystemSectionOrdinal != 0 || problem.SystemDisplayLabel != "" {
+				return fmt.Errorf("k12storage: 非无印刷题号的可作答题不可携带 system order")
+			}
+			continue
+		}
+		expected := sectionCounts[sectionKey] + 1
+		if problem.SystemSectionOrdinal != expected ||
+			problem.SystemDisplayLabel != fmt.Sprintf("第 %d 题（系统序号）", expected) {
+			return fmt.Errorf("k12storage: system order 必须按来源分区和原卷顺序由服务端精确派生")
+		}
+		sectionCounts[sectionKey] = expected
+	}
+	return nil
+}
+
 func normalizeProblemAttemptSnapshot(snapshot k12.ProblemAttemptSnapshot, at int64) (k12.ProblemAttemptSnapshot, error) {
 	if len(snapshot.Problems) == 0 {
 		return k12.ProblemAttemptSnapshot{}, fmt.Errorf("k12storage: ProblemAttemptSnapshot 不可为空")
@@ -180,6 +247,9 @@ func normalizeProblemAttemptSnapshot(snapshot k12.ProblemAttemptSnapshot, at int
 			return k12.ProblemAttemptSnapshot{}, fmt.Errorf("k12storage: parent %q 下 subproblem_no %q 重复", parent.ProblemID, problem.SubproblemNo)
 		}
 		childNos[parent.ProblemID][problem.SubproblemNo] = struct{}{}
+	}
+	if err := validateDurableSystemSectionOrder(out.Problems); err != nil {
+		return k12.ProblemAttemptSnapshot{}, err
 	}
 	attemptIDs := make(map[string]struct{}, len(snapshot.Attempts))
 	attemptByProblem := make(map[string]struct{}, len(snapshot.Attempts))
@@ -492,15 +562,18 @@ func putProblemTx(ctx context.Context, tx *sql.Tx, problem k12.Problem) error {
 	conceptsJSON, _ := json.Marshal(problem.ConceptIDs)
 	reasonsJSON, _ := json.Marshal(problem.ConfirmationReasons)
 	sourceNumberPathJSON, _ := json.Marshal(problem.SourceNumberPath)
+	sourceSectionPathJSON, _ := json.Marshal(problem.SourceSectionPath)
 	var confidence any
 	if problem.TranscriptionConfidence != nil {
 		confidence = *problem.TranscriptionConfidence
 	}
 	res, err := tx.ExecContext(ctx, `INSERT INTO k12_problems (`+problemColumns+`)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent_name,problem_id) DO NOTHING`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent_name,problem_id) DO NOTHING`,
 		problem.ProblemID, problem.AgentName, problem.SubmissionID, problem.PageAssetID, problem.Ordinal,
 		problem.ProblemKind, nullableString(problem.ParentProblemID), problem.SubproblemNo,
-		string(sourceNumberPathJSON), problem.DisplayLabel, problem.Subject,
+		string(sourceNumberPathJSON), problem.DisplayLabel,
+		string(sourceSectionPathJSON), problem.SourceSectionLabel,
+		problem.SystemSectionOrdinal, problem.SystemDisplayLabel, problem.Subject,
 		problem.StemRaw, problem.StemMarkdown, string(conceptsJSON), confidence, boolInt(problem.ConfirmationRequired),
 		string(reasonsJSON), problem.CanonicalVersion, problem.CreatedAt, problem.UpdatedAt)
 	if err != nil {
@@ -519,6 +592,10 @@ func putProblemTx(ctx context.Context, tx *sql.Tx, problem k12.Problem) error {
 		existing.ParentProblemID != problem.ParentProblemID || existing.SubproblemNo != problem.SubproblemNo ||
 		!reflect.DeepEqual(existing.SourceNumberPath, problem.SourceNumberPath) ||
 		existing.DisplayLabel != problem.DisplayLabel ||
+		!reflect.DeepEqual(existing.SourceSectionPath, problem.SourceSectionPath) ||
+		existing.SourceSectionLabel != problem.SourceSectionLabel ||
+		existing.SystemSectionOrdinal != problem.SystemSectionOrdinal ||
+		existing.SystemDisplayLabel != problem.SystemDisplayLabel ||
 		existing.StemRaw != problem.StemRaw {
 		return fmt.Errorf("%w: Problem %s raw/structure", ErrProblemAttemptConflict, problem.ProblemID)
 	}
@@ -671,12 +748,14 @@ func (s *Store) GetProblemAttemptSnapshot(ctx context.Context, agentName, submis
 func scanProblem(row rowScanner) (k12.Problem, error) {
 	var problem k12.Problem
 	var parent sql.NullString
-	var sourceNumberPathJSON, conceptsJSON, reasonsJSON string
+	var sourceNumberPathJSON, sourceSectionPathJSON, conceptsJSON, reasonsJSON string
 	var confidence sql.NullFloat64
 	var confirmationRequired int
 	err := row.Scan(&problem.ProblemID, &problem.AgentName, &problem.SubmissionID,
 		&problem.PageAssetID, &problem.Ordinal, &problem.ProblemKind, &parent,
 		&problem.SubproblemNo, &sourceNumberPathJSON, &problem.DisplayLabel,
+		&sourceSectionPathJSON, &problem.SourceSectionLabel,
+		&problem.SystemSectionOrdinal, &problem.SystemDisplayLabel,
 		&problem.Subject, &problem.StemRaw, &problem.StemMarkdown,
 		&conceptsJSON, &confidence, &confirmationRequired, &reasonsJSON,
 		&problem.CanonicalVersion, &problem.CreatedAt, &problem.UpdatedAt)
@@ -686,6 +765,9 @@ func scanProblem(row rowScanner) (k12.Problem, error) {
 	problem.ParentProblemID = parent.String
 	if err := json.Unmarshal([]byte(sourceNumberPathJSON), &problem.SourceNumberPath); err != nil {
 		return k12.Problem{}, fmt.Errorf("decode source_number_path_json: %w", err)
+	}
+	if err := json.Unmarshal([]byte(sourceSectionPathJSON), &problem.SourceSectionPath); err != nil {
+		return k12.Problem{}, fmt.Errorf("decode source_section_path_json: %w", err)
 	}
 	problem.ConfirmationRequired = confirmationRequired != 0
 	if confidence.Valid {

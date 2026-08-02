@@ -3,6 +3,8 @@ package usecase
 import (
 	"strings"
 	"testing"
+
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
 func numberedQuestion(label, question string) RecognizedQuestion {
@@ -65,6 +67,33 @@ func TestPhotoGradeMarkdownPreservesExactSourceLabelsWithoutGlobalRenumbering(t 
 	for _, synthetic := range []string{"### 1. ", "### 2. "} {
 		if strings.Contains(blank, synthetic) {
 			t.Errorf("blank worksheet projection invented global heading %q:\n%s", synthetic, blank)
+		}
+	}
+}
+
+func TestDD041_PhotoGradeAndFinalProjectionKeepSectionAndMarkedSystemOrderSeparate(t *testing.T) {
+	question := RecognizedQuestion{
+		SourceSectionPath:    []string{"一"},
+		SourceSectionLabel:   "一、直接写得数",
+		SystemSectionOrdinal: 1,
+		SystemDisplayLabel:   "第 1 题（系统序号）",
+		Question:             "4÷0.5=",
+	}
+	graded := photoGradeMarkdown(PhotoGradeResult{
+		Mode:  PhotoModeGrade,
+		Items: []PhotoGradeItem{{Recognized: question, Status: PhotoCorrect}},
+	})
+	final := renderCanonicalGradingFinal([]gradingFinalEntry{{
+		question:   question,
+		assessment: &k12.GradingAssessmentItem{Status: k12.GradingAssessmentCorrect, ResultJSON: `{}`},
+	}}, nil)
+	for name, projection := range map[string]string{"photo": graded, "final": final} {
+		if !strings.Contains(projection, "一、直接写得数") ||
+			!strings.Contains(projection, "第 1 题（系统序号）") {
+			t.Fatalf("DD-041 %s projection lost section/system distinction:\n%s", name, projection)
+		}
+		if strings.Contains(projection, "一、1") {
+			t.Fatalf("DD-041 %s projection forged an original child number:\n%s", name, projection)
 		}
 	}
 }

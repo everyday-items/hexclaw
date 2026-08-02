@@ -39,7 +39,8 @@ func (o *GradingOrchestrator) ImageTaskHomeworkProjection(
 		Stage: job.Record.Status, Retryable: job.Fields.Retryable,
 		ConfirmationState: job.Fields.ConfirmationState,
 		AnchorState:       job.Fields.AnchorState, Subject: subject,
-		Questions: cloneRecognizedQuestions(questions),
+		retryFailureKind: job.Fields.FailureKind,
+		Questions:        cloneRecognizedQuestions(questions),
 		Progressive: imageTaskProgressiveSnapshotFromStorage(
 			durableProjection.ProgressiveSnapshot,
 		),

@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -224,6 +225,148 @@ func TestGradingParentAutomaticBudgetPausesForConfirmationAndResumesRemaining(t 
 		view.Fields.Deadline != now+70 {
 		t.Fatalf("confirmation did not resume frozen parent budget: stage=%s fields=%+v",
 			view.Record.Status, view.Fields)
+	}
+}
+
+func TestBUG20260802ImageTaskAssessingReservationUsesFrozenProblemBucket(t *testing.T) {
+	const now = int64(7_000)
+	budget := k12.GradingBudgetSnapshot{
+		PolicyVersion: 1,
+		StageSeconds: k12.GradingStageBudgets{
+			Queued: 60, Normalizing: 60, Recognizing: 60,
+			Locating: 60, Rendering: 60, Projecting: 60,
+		},
+		AssessingBuckets: []k12.GradingAssessingBudgetBucket{
+			{MaxProblems: 1, Seconds: 90},
+			{MaxProblems: 8, Seconds: 180},
+			{MaxProblems: 16, Seconds: 600},
+			{MaxProblems: 32, Seconds: 900},
+		},
+		ItemConcurrency: 1,
+	}
+	for _, test := range []struct {
+		name                string
+		problems            int
+		seconds             int64
+		confirmBeforeAnchor bool
+	}{
+		{name: "one", problems: 1, seconds: 90},
+		{name: "eight", problems: 8, seconds: 180},
+		{name: "sixteen", problems: 16, seconds: 600},
+		{name: "thirty_two", problems: 32, seconds: 900},
+		{name: "sixteen_confirmed_before_anchor", problems: 16, seconds: 600, confirmBeforeAnchor: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			d, _ := newPipeline(t,
+				fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+				fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
+			)
+			d.Now = func() int64 { return now }
+			d.GradingBudgetSnapshot = budget
+			ctx := context.Background()
+			view, created, err := d.CreateGradingJob(ctx, "mingming", "session", CreateGradingJobInput{
+				SubmissionID:                "budget-parent-" + test.name,
+				SourceKind:                  "image_task",
+				SourceKey:                   "dispatch-budget-parent-" + test.name,
+				ModelSnapshot:               orchestratorSnapshot(),
+				ParentAutomaticAttemptID:    "dispatch-budget-parent-" + test.name + ":7000",
+				ParentAutomaticDeadlineAt:   now + k12.ImageTaskAutomaticBudgetSeconds,
+				MaterializesProblemAttempts: true,
+			})
+			if err != nil || !created {
+				t.Fatalf("create: created=%v err=%v", created, err)
+			}
+			for _, stage := range []string{
+				k12.GradingStageNormalizing,
+				k12.GradingStageRecognizing,
+				k12.GradingStageAwaitingConfirmation,
+			} {
+				view, err = d.AdvanceGradingStage(ctx, "mingming", view.Record.RecordID,
+					AdvanceGradingInput{Outcome: GradingOutcomeOK, ArtifactDigest: stage})
+				if err != nil || view.Record.Status != stage {
+					t.Fatalf("advance to %s: got=%s err=%v", stage, view.Record.Status, err)
+				}
+			}
+			questions := make([]RecognizedQuestion, test.problems)
+			for i := range questions {
+				questions[i] = RecognizedQuestion{
+					Question: fmt.Sprintf("q-%d", i+1), Subject: "数学",
+					AnswerState: AnswerStatePresent, StudentAnswer: "1",
+				}
+			}
+			questions, err = NormalizeRecognizedProblems(view.Fields.SubmissionID, questions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range questions {
+				questions[i].ConfirmedVersion = 1
+			}
+			questions = FreezeRecognizedQuestionInputDigests(questions, "五年级下")
+			typed, err := RecognizedQuestionsProblemAttemptSnapshot(
+				"mingming", view.Fields.SubmissionID, questions, now,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := d.Records.PutProblemAttemptSnapshot(ctx, typed); err != nil {
+				t.Fatal(err)
+			}
+			anchor := func() {
+				t.Helper()
+				var anchorErr error
+				view, anchorErr = d.AdvanceGradingStage(ctx, "mingming", view.Record.RecordID,
+					AdvanceGradingInput{Outcome: GradingOutcomeAnchor, AnchorState: k12.GradingAnchorLocated, ArtifactDigest: "located"},
+				)
+				if anchorErr != nil {
+					t.Fatal(anchorErr)
+				}
+			}
+			confirm := func() {
+				t.Helper()
+				var confirmErr error
+				view, confirmErr = d.ConfirmGradingJob(ctx, "mingming", view.Record.RecordID, nil)
+				if confirmErr != nil {
+					t.Fatal(confirmErr)
+				}
+			}
+			if test.confirmBeforeAnchor {
+				confirm()
+				if view.Record.Status != k12.GradingStageAwaitingConfirmation {
+					t.Fatalf("confirmation before anchor stage=%s, want awaiting_confirmation", view.Record.Status)
+				}
+				anchor()
+			} else {
+				anchor()
+				confirm()
+			}
+			if view.Record.Status != k12.GradingStageAssessing {
+				t.Fatalf("confirmation/anchor join stage=%s", view.Record.Status)
+			}
+			view, err = d.GetGradingJob(ctx, "mingming", view.Record.RecordID)
+			if err != nil {
+				t.Fatalf("reload durable job: %v", err)
+			}
+			wantDeadline := now + test.seconds
+			if view.Fields.ParentAutomaticRemainingSeconds != test.seconds ||
+				view.Fields.ParentAutomaticDeadlineAt != wantDeadline ||
+				view.Fields.Deadline != wantDeadline {
+				t.Fatalf("assessing window=%d/%d deadline=%d, want remaining/deadline=%d/%d",
+					view.Fields.ParentAutomaticRemainingSeconds,
+					view.Fields.ParentAutomaticDeadlineAt,
+					view.Fields.Deadline,
+					test.seconds,
+					wantDeadline,
+				)
+			}
+			stageCtx, cancelStage := gradingStageContext(ctx, view.Fields.Deadline)
+			callCtx, cancelCall := gradingIndependentCallContext(stageCtx, int((20*time.Minute)/time.Millisecond))
+			gotDeadline, ok := callCtx.Deadline()
+			cancelCall()
+			cancelStage()
+			if !ok || !gotDeadline.Equal(time.Unix(wantDeadline, 0)) {
+				t.Fatalf("physical call deadline=%v ok=%v, want=%v", gotDeadline, ok, time.Unix(wantDeadline, 0))
+			}
+		})
 	}
 }
 

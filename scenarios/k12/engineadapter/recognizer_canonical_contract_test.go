@@ -95,11 +95,9 @@ func TestBUG20260726_D_RecognizerPreservesSourceNumberPathAndDisplayLabel(t *tes
 	}
 }
 
-// REG-SOURCE-NUMBER-UNIQUE-20260801-001: a syntactically valid model array
-// cannot erase child-number evidence by assigning one heading label to several
-// independently answerable questions. This must be a protocol failure so the
-// existing bounded DD-036 fallback, rather than ordinal invention, decides
-// whether a more faithful recognition is available.
+// REG-SOURCE-NUMBER-UNIQUE-20260801-001: source numbers remain strict source
+// facts. DD-041 adds a separately marked server ordinal for truly unnumbered
+// items; it does not make duplicated printed source evidence acceptable.
 func TestRecognitionProtocolRejectsDuplicateNonEmptySourceNumberEvidence(t *testing.T) {
 	for _, testCase := range []struct {
 		name string
@@ -117,13 +115,6 @@ func TestRecognitionProtocolRejectsDuplicateNonEmptySourceNumberEvidence(t *test
 			raw: `[
 				{"problem_kind":"standalone","source_number_path":["一","1"],"display_label":"一、1","question":"4÷0.5=","subject":"数学"},
 				{"problem_kind":"standalone","source_number_path":["一","2"],"display_label":"一、1","question":"10×0.01=","subject":"数学"}
-			]`,
-		},
-		{
-			name: "partial source-number evidence",
-			raw: `[
-				{"problem_kind":"standalone","source_number_path":["一"],"display_label":"一","question":"4÷0.5=","subject":"数学"},
-				{"problem_kind":"standalone","source_number_path":[],"display_label":"","question":"10×0.01=","subject":"数学"}
 			]`,
 		},
 	} {
@@ -148,5 +139,16 @@ func TestRecognitionProtocolRejectsDuplicateNonEmptySourceNumberEvidence(t *test
 	}
 	if err := validateRecognitionProtocolResult(questions); err != nil {
 		t.Fatalf("legitimate unnumbered questions were rejected: %v", err)
+	}
+
+	mixed, err := parseRecognizedQuestions(`[
+		{"problem_kind":"standalone","source_number_path":["三","1"],"display_label":"三、1","source_section_path":["三"],"source_section_label":"三、列式计算","question":"4÷0.5=","subject":"数学"},
+		{"problem_kind":"standalone","source_number_path":[],"display_label":"","source_section_path":["一"],"source_section_label":"一、直接写得数","question":"10×0.01=","subject":"数学"}
+	]`)
+	if err != nil {
+		t.Fatalf("parse legitimate mixed source facts: %v", err)
+	}
+	if err := validateRecognitionProtocolResult(mixed); err != nil {
+		t.Fatalf("DD-041 legitimate mixed source facts were rejected: %v", err)
 	}
 }

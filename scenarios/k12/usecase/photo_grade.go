@@ -525,15 +525,16 @@ func photoAnnotationHasTrustedBBox(mark PhotoAnnotation) bool {
 }
 
 func photoQuestionSourceLabel(question RecognizedQuestion) string {
-	return strings.TrimSpace(question.DisplayLabel)
+	return RecognizedQuestionSourceDisplayLabel(question)
 }
 
 func photoQuestionStem(question RecognizedQuestion) string {
 	stem := strings.TrimSpace(question.Question)
-	if photoQuestionSourceLabel(question) == "" || stem == "" {
+	printedLabel := strings.TrimSpace(question.DisplayLabel)
+	if printedLabel == "" || stem == "" {
 		return stem
 	}
-	candidates := []string{photoQuestionSourceLabel(question)}
+	candidates := []string{printedLabel}
 	if count := len(question.SourceNumberPath); count > 0 {
 		candidates = append(candidates, strings.TrimSpace(question.SourceNumberPath[count-1]))
 	}

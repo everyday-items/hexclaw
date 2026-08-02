@@ -330,7 +330,7 @@ func renderCanonicalGradingFinal(
 	var out strings.Builder
 	out.WriteString("# 作业批改结果\n\n")
 	for _, entry := range entries {
-		label := strings.TrimSpace(entry.question.DisplayLabel)
+		label := RecognizedQuestionSourceDisplayLabel(entry.question)
 		if label == "" {
 			label = strings.TrimSpace(entry.question.ProblemID)
 		}

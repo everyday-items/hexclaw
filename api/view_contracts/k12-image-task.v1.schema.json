@@ -1,0 +1,242 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hexclaw.net/contracts/k12-image-task.v1.schema.json",
+  "title": "K12ImageTaskV1",
+  "oneOf": [
+    { "$ref": "#/$defs/createResponse" },
+    { "$ref": "#/$defs/dispatchResponse" },
+    { "$ref": "#/$defs/resultResponse" },
+    { "$ref": "#/$defs/problemSourceActionResponse" }
+  ],
+  "$defs": {
+    "progress": {
+      "type": "object",
+      "required": ["operation", "state"],
+      "properties": {
+        "operation": { "type": "string", "minLength": 1 },
+        "state": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "target": {
+      "type": "object",
+      "required": ["type", "id"],
+      "properties": {
+        "type": { "enum": ["homework_submission", "creative_work_intake"] },
+        "id": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "dispatch": {
+      "type": "object",
+      "required": [
+        "dispatch_id",
+        "task_intent",
+        "status",
+        "intent_evidence",
+        "intent_confidence",
+        "confirmation_candidates",
+        "progress",
+        "version",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "dispatch_id": { "type": "string", "minLength": 1 },
+        "task_intent": { "enum": ["completed_homework", "blank_worksheet", "writing", "artwork", "unknown"] },
+        "status": { "enum": ["routing", "awaiting_confirmation", "routed", "failed", "cancelled"] },
+        "provider_display_name": { "type": ["string", "null"] },
+        "model_id": { "type": ["string", "null"] },
+        "retryable": { "type": "boolean" },
+        "intent_evidence": { "type": "array", "items": { "type": "string" } },
+        "intent_confidence": { "type": "number" },
+        "confirmation_candidates": { "type": "array", "items": { "type": "string" } },
+        "target": { "$ref": "#/$defs/target" },
+        "progress": { "$ref": "#/$defs/progress" },
+        "target_projection": { "type": "object" },
+        "version": { "type": "integer" },
+        "created_at": { "type": "integer" },
+        "updated_at": { "type": "integer" },
+        "automatic_budget_seconds": { "type": "integer" },
+        "automatic_started_at": { "type": "integer" },
+        "automatic_deadline_at": { "type": "integer" },
+        "automatic_remaining_seconds": { "type": "integer" },
+        "operation_deadline_at": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "createResponse": {
+      "type": "object",
+      "required": ["created", "dispatch"],
+      "properties": {
+        "created": { "type": "boolean" },
+        "dispatch": { "$ref": "#/$defs/dispatch" }
+      },
+      "additionalProperties": false
+    },
+    "dispatchResponse": {
+      "type": "object",
+      "required": ["dispatch"],
+      "properties": { "dispatch": { "$ref": "#/$defs/dispatch" } },
+      "additionalProperties": false
+    },
+    "resultResponse": {
+      "type": "object",
+      "required": ["dispatch_id", "task_intent", "status", "result"],
+      "properties": {
+        "dispatch_id": { "type": "string", "minLength": 1 },
+        "task_intent": { "enum": ["completed_homework", "blank_worksheet", "writing", "artwork", "unknown"] },
+        "status": { "enum": ["routing", "awaiting_confirmation", "routed", "failed", "cancelled"] },
+        "result": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["kind", "payload"],
+              "properties": {
+                "kind": { "enum": ["completed_homework", "blank_worksheet", "writing", "artwork"] },
+                "payload": { "type": "object" }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "source_digest": { "type": "string", "minLength": 1 },
+        "source_attachments": { "type": "array", "items": { "type": "object" } },
+        "operation_receipts": { "type": "array", "items": { "type": "object" } }
+      },
+      "additionalProperties": false
+    },
+    "problemSourceAction": {
+      "enum": ["correct_text", "select_region", "retake", "skip", "resume"]
+    },
+    "problemSourceProgress": {
+      "type": "object",
+      "required": [
+        "problem_id",
+        "status",
+        "input_revision",
+        "published_revision",
+        "current_disposition"
+      ],
+      "properties": {
+        "problem_id": { "type": "string", "minLength": 1 },
+        "status": {
+          "enum": [
+            "awaiting_source",
+            "processing",
+            "skipped",
+            "correct",
+            "wrong",
+            "unanswered",
+            "answer_unclear",
+            "blank_solved",
+            "out_of_scope",
+            "untrusted"
+          ]
+        },
+        "input_revision": { "type": "integer", "minimum": 1 },
+        "published_revision": { "type": "integer", "minimum": 0 },
+        "current_disposition": { "const": "current" }
+      },
+      "additionalProperties": false
+    },
+    "problemSourceCoverage": {
+      "type": "object",
+      "required": [
+        "total",
+        "published",
+        "skipped",
+        "awaiting",
+        "failed",
+        "status",
+        "projection_revision"
+      ],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "published": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "awaiting": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "status": { "enum": ["empty", "in_progress", "complete"] },
+        "projection_revision": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "problemSourceProgressiveSnapshot": {
+      "type": "object",
+      "required": [
+        "structure_version",
+        "snapshot_revision",
+        "problem_progress",
+        "coverage"
+      ],
+      "properties": {
+        "structure_version": { "type": "integer", "minimum": 1 },
+        "snapshot_revision": { "type": "integer", "minimum": 0 },
+        "problem_progress": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/problemSourceProgress" }
+        },
+        "coverage": { "$ref": "#/$defs/problemSourceCoverage" }
+      },
+      "additionalProperties": false
+    },
+    "problemSourceActionResponse": {
+      "type": "object",
+      "required": [
+        "command_receipt_id",
+        "dispatch_id",
+        "problem_id",
+        "action",
+        "structure_version",
+        "input_revision",
+        "progressive_snapshot"
+      ],
+      "properties": {
+        "command_receipt_id": { "type": "string", "minLength": 1 },
+        "dispatch_id": { "type": "string", "minLength": 1 },
+        "problem_id": { "type": "string", "minLength": 1 },
+        "action": { "$ref": "#/$defs/problemSourceAction" },
+        "structure_version": { "type": "integer", "minimum": 1 },
+        "input_revision": { "type": "integer", "minimum": 1 },
+        "progressive_snapshot": {
+          "$ref": "#/$defs/problemSourceProgressiveSnapshot"
+        }
+      },
+      "additionalProperties": false,
+      "examples": [
+        {
+          "command_receipt_id": "source-action-receipt-contract-1",
+          "dispatch_id": "dispatch-source-action",
+          "problem_id": "problem-source-action",
+          "action": "skip",
+          "structure_version": 1,
+          "input_revision": 1,
+          "progressive_snapshot": {
+            "structure_version": 1,
+            "snapshot_revision": 1,
+            "problem_progress": [
+              {
+                "problem_id": "problem-source-action",
+                "status": "skipped",
+                "input_revision": 1,
+                "published_revision": 1,
+                "current_disposition": "current"
+              }
+            ],
+            "coverage": {
+              "total": 1,
+              "published": 0,
+              "skipped": 1,
+              "awaiting": 0,
+              "failed": 0,
+              "status": "complete",
+              "projection_revision": 1
+            }
+          }
+        }
+      ]
+    }
+  }
+}

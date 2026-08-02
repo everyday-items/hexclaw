@@ -192,7 +192,7 @@ func TestDenseWorksheet_DuplicateSourceNumberProtocolUsesBoundedFallback(t *test
 	}
 }
 
-func TestDenseWorksheet_PartialSourceNumberProtocolUsesBoundedFallback(t *testing.T) {
+func TestDenseWorksheet_MixedPrintedAndSectionSystemFactsStayOnWholePage(t *testing.T) {
 	executor := &recordingRecognitionPhysicalExecutor{}
 	ctx := k12.WithRecognitionPhysicalCallExecutor(context.Background(), executor)
 	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {
@@ -200,8 +200,8 @@ func TestDenseWorksheet_PartialSourceNumberProtocolUsesBoundedFallback(t *testin
 			return `[]`, nil
 		}
 		return `[
-			{"problem_kind":"standalone","source_number_path":["一"],"display_label":"一","question":"4÷0.5=","subject":"数学"},
-			{"problem_kind":"standalone","source_number_path":[],"display_label":"","question":"10×0.01=","subject":"数学"}
+			{"problem_kind":"standalone","source_number_path":["三","1"],"display_label":"三、1","source_section_path":["三"],"source_section_label":"三、列式计算","question":"4÷0.5=","subject":"数学"},
+			{"problem_kind":"standalone","source_number_path":[],"display_label":"","source_section_path":["一"],"source_section_label":"一、直接写得数","question":"10×0.01=","subject":"数学"}
 		]`, nil
 	}
 
@@ -211,16 +211,8 @@ func TestDenseWorksheet_PartialSourceNumberProtocolUsesBoundedFallback(t *testin
 	); err != nil {
 		t.Fatal(err)
 	}
-	want := []k12.RecognitionPhysicalUnit{
-		k12.RecognitionPhysicalUnitWholePage,
-		k12.RecognitionPhysicalUnitSegment1,
-		k12.RecognitionPhysicalUnitSegment2,
-		k12.RecognitionPhysicalUnitSegment3,
-		k12.RecognitionPhysicalUnitSegment4,
-		k12.RecognitionPhysicalUnitSegment5,
-		k12.RecognitionPhysicalUnitPrintedInventory,
-	}
+	want := []k12.RecognitionPhysicalUnit{k12.RecognitionPhysicalUnitWholePage}
 	if fmt.Sprint(executor.units) != fmt.Sprint(want) {
-		t.Fatalf("partial-number fallback units=%v want=%v", executor.units, want)
+		t.Fatalf("mixed-source whole-page units=%v want=%v", executor.units, want)
 	}
 }

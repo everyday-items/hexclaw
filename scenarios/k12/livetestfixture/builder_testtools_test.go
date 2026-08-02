@@ -76,7 +76,7 @@ func fixtureOptions(runID string, lease time.Duration) CreateOptions {
 			Model:       "gpt-5.6-sol",
 			Metadata: map[string]string{
 				"k12.child_name": "LIVE child",
-				"k12.grade_term": "grade5_2",
+				"k12.grade_term": "五年级下",
 			},
 		},
 	}

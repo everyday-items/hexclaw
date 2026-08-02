@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/viewcontract"
 )
 
 type ProblemSourceActionCommand struct {
@@ -20,11 +21,7 @@ type ProblemSourceActionCommand struct {
 	Payload               json.RawMessage
 }
 
-type ProblemSourceActionResult struct {
-	CommandReceiptID    string                       `json:"command_receipt_id"`
-	InputRevision       int                          `json:"input_revision"`
-	ProgressiveSnapshot ImageTaskProgressiveSnapshot `json:"progressive_snapshot"`
-}
+type ProblemSourceActionResult = viewcontract.FrozenProblemSourceActionResponse
 
 func imageTaskProgressiveSnapshotFromStorage(
 	stored k12storage.ProblemSourceProgressiveSnapshot,
@@ -82,11 +79,5 @@ func (c *ImageTaskCoordinator) CommitProblemSourceAction(
 	if err != nil {
 		return ProblemSourceActionResult{}, err
 	}
-	return ProblemSourceActionResult{
-		CommandReceiptID: stored.CommandReceiptID,
-		InputRevision:    stored.InputRevision,
-		ProgressiveSnapshot: imageTaskProgressiveSnapshotFromStorage(
-			stored.ProgressiveSnapshot,
-		),
-	}, nil
+	return stored, nil
 }

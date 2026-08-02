@@ -149,6 +149,10 @@ type ImageTaskHomeworkProjection struct {
 	Questions         []RecognizedQuestion
 	Progressive       ImageTaskProgressiveSnapshot
 	FinalArtifact     *k12.GradingFinalArtifact `json:"final_artifact,omitempty"`
+	// retryFailureKind is an internal retry-router fact. It must never be
+	// serialized by the public ImageTask projection, but lets the facade keep
+	// interactive deadline retries on their specialized parent-window path.
+	retryFailureKind string
 }
 
 type ImageTaskProgressiveSnapshot struct {
@@ -1761,6 +1765,9 @@ func (c *ImageTaskCoordinator) Result(
 		} else if !errors.Is(finalArtifactErr, records.ErrNotFound) {
 			return ImageTaskResult{}, finalArtifactErr
 		}
+		if result.FinalArtifact == nil {
+			return result, nil
+		}
 		reader, ok := c.Grading.(imageTaskPhotoResultReader)
 		if !ok {
 			return result, nil
@@ -2051,47 +2058,80 @@ func (c *ImageTaskCoordinator) Retry(
 	}
 	if current.Homework != nil &&
 		strings.TrimSpace(current.Homework.GradingJobID) != "" {
-		retrier, ok := c.Grading.(imageTaskGradingParentWindowRetrier)
-		if !ok {
-			return current, k12storage.ErrImageTaskInvalidState
-		}
-		allowed, preflightErr := retrier.CanRetryPhotoGradingWithParentAutomaticWindow(
-			ctx,
-			current.Homework.GradingJobID,
-		)
-		if preflightErr != nil {
-			return current, preflightErr
-		}
-		if !allowed {
-			return current, k12storage.ErrImageTaskInvalidState
-		}
-		restarted, restartErr := c.Records.RestartImageTaskAutomaticWindow(
-			ctx,
-			agentName,
-			dispatchID,
-			expectedVersion,
-			c.now(),
-		)
-		if restartErr != nil {
-			return current, restartErr
-		}
-		parentAttemptID := fmt.Sprintf(
-			"%s:%d",
-			restarted.DispatchID,
-			restarted.AutomaticStartedAt,
-		)
-		if _, started, retryErr := retrier.RetryPhotoGradingJobWithParentAutomaticWindow(
-			ctx,
-			current.Homework.GradingJobID,
-			parentAttemptID,
-			restarted.AutomaticDeadlineAt,
-		); retryErr != nil || !started {
-			if retryErr == nil {
-				retryErr = k12storage.ErrImageTaskInvalidState
+		projection := current.HomeworkProjection
+		genericRetryable := projection != nil &&
+			projection.Stage == k12.GradingStageFailedRetryable &&
+			projection.Retryable
+		requiresParentWindow := projection != nil &&
+			projection.retryFailureKind == gradingFailureInteractiveDeadlineExceeded
+		parentWindowOnly := projection == nil ||
+			projection.retryFailureKind == "" ||
+			requiresParentWindow
+		if parentWindowOnly {
+			retrier, ok := c.Grading.(imageTaskGradingParentWindowRetrier)
+			if !ok {
+				if !genericRetryable {
+					return current, k12storage.ErrImageTaskInvalidState
+				}
+			} else {
+				allowed, preflightErr := retrier.CanRetryPhotoGradingWithParentAutomaticWindow(
+					ctx,
+					current.Homework.GradingJobID,
+				)
+				if preflightErr != nil {
+					return current, preflightErr
+				}
+				if allowed {
+					restarted, restartErr := c.Records.RestartImageTaskAutomaticWindow(
+						ctx,
+						agentName,
+						dispatchID,
+						expectedVersion,
+						c.now(),
+					)
+					if restartErr != nil {
+						return current, restartErr
+					}
+					parentAttemptID := fmt.Sprintf(
+						"%s:%d",
+						restarted.DispatchID,
+						restarted.AutomaticStartedAt,
+					)
+					if _, started, retryErr := retrier.RetryPhotoGradingJobWithParentAutomaticWindow(
+						ctx,
+						current.Homework.GradingJobID,
+						parentAttemptID,
+						restarted.AutomaticDeadlineAt,
+					); retryErr != nil || !started {
+						if retryErr == nil {
+							retryErr = k12storage.ErrImageTaskInvalidState
+						}
+						return current, retryErr
+					}
+					return c.projectTarget(ctx, restarted)
+				}
+				if requiresParentWindow {
+					return current, k12storage.ErrImageTaskInvalidState
+				}
 			}
+		}
+		if !genericRetryable {
+			return current, k12storage.ErrImageTaskInvalidState
+		}
+		var runtime PhotoGradingJobRuntimeRetrier
+		if candidate, ok := c.Grading.(PhotoGradingJobRuntimeRetrier); ok {
+			runtime = candidate
+		}
+		if _, retryErr := RetryPhotoGradingJobWithDurableFallback(
+			ctx,
+			Deps{Records: c.Records, Now: c.Now},
+			runtime,
+			agentName,
+			current.Homework.GradingJobID,
+		); retryErr != nil {
 			return current, retryErr
 		}
-		return c.projectTarget(ctx, restarted)
+		return c.projectTarget(ctx, original)
 	}
 	if current.Creative != nil &&
 		current.Creative.Status == k12.CreativeWorkIntakePromoted {

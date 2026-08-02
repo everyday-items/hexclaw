@@ -439,18 +439,17 @@ func (h *handler) retryGradingJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
 		return
 	}
+	var runtime usecase.PhotoGradingJobRuntimeRetrier
 	if h.rt.Grading != nil {
-		v, ok, err := h.rt.Grading.RetryPhotoGradingJob(r.Context(), jobID)
-		if ok {
-			if err != nil {
-				writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
-				return
-			}
-			writeGradingJob(w, v)
-			return
-		}
+		runtime = h.rt.Grading
 	}
-	v, err := h.rt.Deps.RetryGradingJob(r.Context(), req.Agent, jobID)
+	v, err := usecase.RetryPhotoGradingJobWithDurableFallback(
+		r.Context(),
+		h.rt.Deps,
+		runtime,
+		req.Agent,
+		jobID,
+	)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return

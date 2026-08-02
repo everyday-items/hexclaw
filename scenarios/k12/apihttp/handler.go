@@ -190,6 +190,7 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("POST /practice-sets/{id}/cancel", h.cancelPracticeSet)
 	// Sole public image exact-set. GradingJob/OCR remain internal aggregates.
 	mux.HandleFunc("POST /image-tasks", h.createImageTask)
+	mux.HandleFunc("GET /image-tasks/recoverable", h.listRecoverableImageTasks)
 	mux.HandleFunc("GET /image-tasks/{id}", h.getImageTask)
 	mux.HandleFunc("POST /image-tasks/{id}/confirm", h.confirmImageTask)
 	mux.HandleFunc("POST /image-tasks/{id}/retry", h.retryImageTask)
@@ -354,14 +355,18 @@ type bboxDTO struct {
 }
 
 type recognizedQuestionDTO struct {
-	ProblemID        string              `json:"problem_id"`
-	ProblemKind      usecase.ProblemKind `json:"problem_kind"`
-	ParentProblemID  string              `json:"parent_problem_id,omitempty"`
-	SubproblemNo     string              `json:"subproblem_no,omitempty"`
-	SourceNumberPath []string            `json:"source_number_path"`
-	DisplayLabel     string              `json:"display_label"`
-	PageAssetID      string              `json:"page_asset_id"`
-	AttemptID        string              `json:"attempt_id,omitempty"`
+	ProblemID            string              `json:"problem_id"`
+	ProblemKind          usecase.ProblemKind `json:"problem_kind"`
+	ParentProblemID      string              `json:"parent_problem_id,omitempty"`
+	SubproblemNo         string              `json:"subproblem_no,omitempty"`
+	SourceNumberPath     []string            `json:"source_number_path"`
+	DisplayLabel         string              `json:"display_label"`
+	SourceSectionPath    []string            `json:"source_section_path"`
+	SourceSectionLabel   string              `json:"source_section_label"`
+	SystemSectionOrdinal int                 `json:"system_section_ordinal"`
+	SystemDisplayLabel   string              `json:"system_display_label"`
+	PageAssetID          string              `json:"page_asset_id"`
+	AttemptID            string              `json:"attempt_id,omitempty"`
 	// Question 是当前 surface 的安全展示投影；raw/canonical 双事实同时返回供确认 UI
 	// 对照。canonical_valid=false 时 Question 必须回退为可复制 raw，绝不返回空白。
 	Question          string   `json:"question"`
@@ -394,9 +399,13 @@ func recognizedQuestionToDTO(question usecase.RecognizedQuestion, includeBBox bo
 	dto := recognizedQuestionDTO{
 		ProblemID: question.ProblemID, ProblemKind: question.ProblemKind,
 		ParentProblemID: question.ParentProblemID, SubproblemNo: question.SubproblemNo,
-		SourceNumberPath: append([]string{}, question.SourceNumberPath...),
-		DisplayLabel:     question.DisplayLabel,
-		PageAssetID:      question.PageAssetID, AttemptID: question.AttemptID,
+		SourceNumberPath:     append([]string{}, question.SourceNumberPath...),
+		DisplayLabel:         question.DisplayLabel,
+		SourceSectionPath:    append([]string{}, question.SourceSectionPath...),
+		SourceSectionLabel:   question.SourceSectionLabel,
+		SystemSectionOrdinal: question.SystemSectionOrdinal,
+		SystemDisplayLabel:   question.SystemDisplayLabel,
+		PageAssetID:          question.PageAssetID, AttemptID: question.AttemptID,
 		Question:         usecase.RecognizedQuestionDisplayText(question),
 		RawTranscription: question.RawTranscription, CanonicalMarkdown: question.CanonicalMarkdown,
 		CanonicalValid:          usecase.CanonicalMarkdownValid(question.CanonicalMarkdown),

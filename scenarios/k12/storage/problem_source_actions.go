@@ -12,6 +12,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/viewcontract"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
@@ -35,41 +36,18 @@ type ProblemSourceActionCommand struct {
 	Payload               json.RawMessage
 }
 
-type ProblemSourceActionResult struct {
-	CommandReceiptID    string                           `json:"command_receipt_id"`
-	InputRevision       int                              `json:"input_revision"`
-	ProgressiveSnapshot ProblemSourceProgressiveSnapshot `json:"progressive_snapshot"`
-}
+type ProblemSourceActionResult = viewcontract.FrozenProblemSourceActionResponse
 
-type ProblemSourceProgressiveSnapshot struct {
-	StructureVersion int                              `json:"structure_version"`
-	SnapshotRevision int                              `json:"snapshot_revision"`
-	ProblemProgress  []ProblemSourceProgress          `json:"problem_progress"`
-	Coverage         ProblemSourceProgressiveCoverage `json:"coverage"`
-}
+type ProblemSourceProgressiveSnapshot = viewcontract.ProblemSourceProgressiveSnapshot
 
 type GradingProgressiveProjection struct {
 	ProgressiveSnapshot ProblemSourceProgressiveSnapshot
 	FinalArtifact       *k12.GradingFinalArtifact
 }
 
-type ProblemSourceProgress struct {
-	ProblemID          string `json:"problem_id"`
-	Status             string `json:"status"`
-	InputRevision      int    `json:"input_revision"`
-	PublishedRevision  int    `json:"published_revision"`
-	CurrentDisposition string `json:"current_disposition"`
-}
+type ProblemSourceProgress = viewcontract.ProblemSourceProgress
 
-type ProblemSourceProgressiveCoverage struct {
-	Total              int    `json:"total"`
-	Published          int    `json:"published"`
-	Skipped            int    `json:"skipped"`
-	Awaiting           int    `json:"awaiting"`
-	Failed             int    `json:"failed"`
-	Status             string `json:"status"`
-	ProjectionRevision int    `json:"projection_revision"`
-}
+type ProblemSourceProgressiveCoverage = viewcontract.ProblemSourceProgressiveCoverage
 
 type problemSourceActionScope struct {
 	AgentName        string
@@ -257,8 +235,8 @@ func replayProblemSourceAction(
 			ErrProblemSourceActionConflict,
 		)
 	}
-	var result ProblemSourceActionResult
-	if err := json.Unmarshal([]byte(responseJSON), &result); err != nil {
+	result, err := viewcontract.ParseFrozenProblemSourceActionResponse([]byte(responseJSON))
+	if err != nil {
 		return ProblemSourceActionResult{}, false, err
 	}
 	return result, true, nil
@@ -766,7 +744,7 @@ func buildProblemSourceProgressiveSnapshot(
 	scope problemSourceActionScope,
 ) (ProblemSourceProgressiveSnapshot, error) {
 	rows, err := q.QueryContext(ctx, `
-		SELECT p.problem_id,sm.input_revision
+		SELECT p.problem_id,sm.input_revision,p.confirmation_required
 		FROM k12_problem_structure_snapshots ss
 		JOIN k12_problem_structure_members sm
 		  ON sm.agent_name=ss.agent_name
@@ -790,11 +768,16 @@ func buildProblemSourceProgressiveSnapshot(
 	type problemHead struct {
 		problemID       string
 		attemptRevision int
+		needsResolution bool
 	}
 	heads := make([]problemHead, 0)
 	for rows.Next() {
 		var head problemHead
-		if err := rows.Scan(&head.problemID, &head.attemptRevision); err != nil {
+		if err := rows.Scan(
+			&head.problemID,
+			&head.attemptRevision,
+			&head.needsResolution,
+		); err != nil {
 			rows.Close()
 			return ProblemSourceProgressiveSnapshot{}, err
 		}
@@ -812,9 +795,13 @@ func buildProblemSourceProgressiveSnapshot(
 		ProblemProgress:  make([]ProblemSourceProgress, 0, len(heads)),
 	}
 	for _, head := range heads {
+		status := "processing"
+		if head.needsResolution {
+			status = "awaiting_source"
+		}
 		progress := ProblemSourceProgress{
 			ProblemID:          head.problemID,
-			Status:             "awaiting_source",
+			Status:             status,
 			InputRevision:      head.attemptRevision,
 			CurrentDisposition: "current",
 		}
@@ -1137,12 +1124,17 @@ func (s *Store) CommitProblemSourceAction(
 	if err != nil {
 		return ProblemSourceActionResult{}, err
 	}
-	result := ProblemSourceActionResult{
-		CommandReceiptID:    commandReceiptID,
-		InputRevision:       resultRevision,
-		ProgressiveSnapshot: snapshot,
-	}
-	responseJSON, err := json.Marshal(result)
+	result, err := viewcontract.FreezeProblemSourceActionResponse(
+		viewcontract.ProblemSourceActionResponse{
+			CommandReceiptID:    commandReceiptID,
+			DispatchID:          command.DispatchID,
+			ProblemID:           command.ProblemID,
+			Action:              command.Action,
+			StructureVersion:    scope.StructureVersion,
+			InputRevision:       resultRevision,
+			ProgressiveSnapshot: snapshot,
+		},
+	)
 	if err != nil {
 		return ProblemSourceActionResult{}, err
 	}
@@ -1150,7 +1142,7 @@ func (s *Store) CommitProblemSourceAction(
 		UPDATE k12_problem_source_action_receipts
 		SET response_json=?,updated_at=?
 		WHERE command_receipt_id=?`,
-		string(responseJSON),
+		string(result.JSON),
 		now,
 		commandReceiptID,
 	); err != nil {

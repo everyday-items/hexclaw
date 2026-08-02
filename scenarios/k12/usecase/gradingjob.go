@@ -745,6 +745,7 @@ func (d Deps) setGradingDeadline(ctx context.Context, agentName string, f *k12.G
 		}
 		return fmt.Errorf("%w: no grading budget for stage=%s problems=%d", ErrInvalidInput, next, problemCount)
 	}
+	reserveImageTaskAssessingParentAutomaticWindow(f, now, next, budget)
 	f.Deadline = now + budget
 	if strings.TrimSpace(f.ParentAutomaticAttemptID) != "" {
 		if f.ParentAutomaticDeadlineAt <= 0 {
@@ -754,6 +755,27 @@ func (d Deps) setGradingDeadline(ctx context.Context, agentName string, f *k12.G
 		}
 	}
 	return nil
+}
+
+// reserveImageTaskAssessingParentAutomaticWindow starts the durable child
+// automatic window at the only boundary where the exact Problem/Attempt count
+// is known: confirmed image-task assessment.  The ingress 300-second window
+// remains authoritative through recognizing/locating; after confirmation a
+// frozen policy's selected assessing bucket is the shared ceiling for the Job
+// deadline, physical calls, and before-send expiry checks.
+func reserveImageTaskAssessingParentAutomaticWindow(
+	f *k12.GradingJobFields,
+	now int64,
+	next string,
+	assessingBudget int64,
+) {
+	if f == nil || next != k12.GradingStageAssessing ||
+		f.SourceKind != "image_task" || !f.BudgetSnapshot.IsFrozen() ||
+		strings.TrimSpace(f.ParentAutomaticAttemptID) == "" || assessingBudget <= 0 {
+		return
+	}
+	f.ParentAutomaticRemainingSeconds = assessingBudget
+	f.ParentAutomaticDeadlineAt = now + assessingBudget
 }
 
 func pauseParentAutomaticWindow(f *k12.GradingJobFields, now int64) {

@@ -62,6 +62,7 @@ func TestKnowledgeAcceptedUploadImmediateListKeepsVectorPending(t *testing.T) {
 		migrate.KnowledgeIngestGenerationsV26,
 		migrate.KnowledgeDocumentScopeV27,
 		migrate.KnowledgeIngestCheckpointV28,
+		migrate.KnowledgeUploadOperationsV71,
 	}); err != nil {
 		t.Fatal(err)
 	}

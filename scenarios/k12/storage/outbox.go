@@ -51,6 +51,13 @@ type OutboxEvent struct {
 	UpdatedAt      int64  `json:"updated_at"`
 }
 
+// pendingEventCursor is the stable ordering key used while a dispatcher walks
+// the pending events that were visible at the beginning of one processing run.
+type pendingEventCursor struct {
+	CreatedAt int64
+	EventID   string
+}
+
 // MistakeRecordedPayload k12.mistake.recorded 的 payload v1。
 type MistakeRecordedPayload struct {
 	RecordID       string `json:"record_id"`
@@ -157,6 +164,65 @@ func PendingEvents(ctx context.Context, db *sql.DB, limit int) ([]OutboxEvent, e
 		out = append(out, ev)
 	}
 	return out, rows.Err()
+}
+
+// pendingEventHorizon freezes membership for one dispatcher run. outbox_events
+// is append-only, so rows appended after this query receive a larger rowid and
+// are intentionally left for the next run.
+func pendingEventHorizon(ctx context.Context, db *sql.DB) (int64, bool, error) {
+	var horizon sql.NullInt64
+	if err := db.QueryRowContext(ctx,
+		`SELECT MAX(rowid) FROM outbox_events WHERE status = ?`, OutboxPending,
+	).Scan(&horizon); err != nil {
+		return 0, false, fmt.Errorf("k12storage: 冻结 outbox 水位: %w", err)
+	}
+	return horizon.Int64, horizon.Valid, nil
+}
+
+// pendingEventsPage advances by the public outbox ordering key instead of
+// repeatedly querying the first page. Failed rows therefore remain retryable
+// for a later run without being retried again in this run.
+func pendingEventsPage(ctx context.Context, db *sql.DB, horizon int64,
+	after *pendingEventCursor, limit int,
+) ([]OutboxEvent, error) {
+	const selectColumns = `SELECT event_id, agent_name, aggregate_id, event_type,
+        payload_version, payload_json, status, attempts, last_error, created_at, updated_at
+        FROM outbox_events`
+
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if after == nil {
+		rows, err = db.QueryContext(ctx, selectColumns+`
+            WHERE status = ? AND rowid <= ?
+            ORDER BY created_at, event_id LIMIT ?`, OutboxPending, horizon, limit)
+	} else {
+		rows, err = db.QueryContext(ctx, selectColumns+`
+            WHERE status = ? AND rowid <= ?
+              AND (created_at > ? OR (created_at = ? AND event_id > ?))
+            ORDER BY created_at, event_id LIMIT ?`, OutboxPending, horizon,
+			after.CreatedAt, after.CreatedAt, after.EventID, limit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("k12storage: 分页读 outbox: %w", err)
+	}
+	defer rows.Close()
+
+	var out []OutboxEvent
+	for rows.Next() {
+		var ev OutboxEvent
+		if err := rows.Scan(&ev.EventID, &ev.AgentName, &ev.AggregateID, &ev.EventType,
+			&ev.PayloadVersion, &ev.Payload, &ev.Status, &ev.Attempts, &ev.LastError,
+			&ev.CreatedAt, &ev.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("k12storage: 扫描 outbox 事件: %w", err)
+		}
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("k12storage: 遍历 outbox 事件: %w", err)
+	}
+	return out, nil
 }
 
 // DeadEvents dead-letter 取证（§6.15：可在 UI/日志中取证，不静默丢弃）。

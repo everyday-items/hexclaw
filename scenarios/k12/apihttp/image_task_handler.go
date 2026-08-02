@@ -1,11 +1,14 @@
 package apihttp
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/viewcontract"
 )
 
 type imageTaskRouteRequest struct {
@@ -74,30 +77,11 @@ type imageTaskHomeworkProjectionDTO struct {
 	FinalArtifact     *k12.GradingFinalArtifact `json:"final_artifact,omitempty"`
 }
 
-type imageTaskProgressiveDTO struct {
-	StructureVersion int                             `json:"structure_version"`
-	SnapshotRevision int                             `json:"snapshot_revision"`
-	ProblemProgress  []imageTaskProblemProgressDTO   `json:"problem_progress"`
-	Coverage         imageTaskProgressiveCoverageDTO `json:"coverage"`
-}
+type imageTaskProgressiveDTO = viewcontract.ProblemSourceProgressiveSnapshot
 
-type imageTaskProblemProgressDTO struct {
-	ProblemID          string `json:"problem_id"`
-	Status             string `json:"status"`
-	InputRevision      int    `json:"input_revision"`
-	PublishedRevision  int    `json:"published_revision"`
-	CurrentDisposition string `json:"current_disposition"`
-}
+type imageTaskProblemProgressDTO = viewcontract.ProblemSourceProgress
 
-type imageTaskProgressiveCoverageDTO struct {
-	Total              int    `json:"total"`
-	Published          int    `json:"published"`
-	Skipped            int    `json:"skipped"`
-	Awaiting           int    `json:"awaiting"`
-	Failed             int    `json:"failed"`
-	Status             string `json:"status"`
-	ProjectionRevision int    `json:"projection_revision"`
-}
+type imageTaskProgressiveCoverageDTO = viewcontract.ProblemSourceProgressiveCoverage
 
 func publicImageTaskProgressive(
 	snapshot usecase.ImageTaskProgressiveSnapshot,
@@ -367,6 +351,99 @@ func (h *handler) createImageTask(w http.ResponseWriter, r *http.Request) {
 
 func imageTaskAgent(r *http.Request) string {
 	return strings.TrimSpace(r.URL.Query().Get("agent"))
+}
+
+type recoverableImageTask struct {
+	DispatchID        string              `json:"dispatch_id"`
+	SourceSessionID   string              `json:"source_session_id"`
+	SourceMessageID   string              `json:"source_message_id"`
+	AttemptGeneration int                 `json:"attempt_generation"`
+	Version           int                 `json:"version"`
+	Stage             string              `json:"stage"`
+	Status            k12.ImageTaskStatus `json:"status"`
+	ProjectionReady   bool                `json:"projection_ready"`
+	Terminal          bool                `json:"terminal"`
+}
+
+func imageTaskProjectionTerminal(dispatch publicImageTaskDispatch) bool {
+	switch dispatch.Status {
+	case k12.ImageTaskStatusCancelled:
+		return true
+	case k12.ImageTaskStatusFailed:
+		return !dispatch.Retryable
+	}
+	switch strings.TrimSpace(dispatch.Progress.State) {
+	case "completed", "cancelled", "failed_terminal", "feedback_ready":
+		return true
+	default:
+		return false
+	}
+}
+
+// listRecoverableImageTasks exposes the Sidecar-owned renderer restart
+// projection. It is intentionally separate from the automatic worker recovery
+// queue: this query includes terminal/waiting visible facts and never invokes
+// StartAsync or Run.
+func (h *handler) listRecoverableImageTasks(w http.ResponseWriter, r *http.Request) {
+	if h.rt.ImageTasks == nil || h.rt.Records == nil {
+		writeErr(w, http.StatusServiceUnavailable, "image task recovery unavailable")
+		return
+	}
+	agent := imageTaskAgent(r)
+	if agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	sessionID := strings.TrimSpace(r.URL.Query().Get("session"))
+	if sessionID == "" {
+		writeErr(w, http.StatusBadRequest, "session required")
+		return
+	}
+	ownerID, err := h.ownerScope(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "authenticated image task principal required")
+		return
+	}
+	if strings.TrimSpace(h.rt.PrincipalMode) == "remote" {
+		if h.rt.AuthorizeAgentScope == nil {
+			writeErr(w, http.StatusUnauthorized, "authenticated image task principal required")
+			return
+		}
+		if err := h.rt.AuthorizeAgentScope(r.Context(), ownerID, agent); err != nil {
+			// Do not reveal whether the agent or owner exists.
+			writeErr(w, http.StatusNotFound, "image task projection not found")
+			return
+		}
+	}
+	dispatches, err := h.rt.Records.ListImageTaskDispatchesForSession(
+		r.Context(), agent, sessionID,
+	)
+	if err != nil {
+		if errors.Is(err, k12storage.ErrImageTaskNotFound) {
+			writeErr(w, http.StatusNotFound, "image task projection not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	items := make([]recoverableImageTask, 0, len(dispatches))
+	for _, dispatch := range dispatches {
+		view, getErr := h.rt.ImageTasks.Get(r.Context(), agent, dispatch.DispatchID)
+		if getErr != nil {
+			writeErr(w, httpStatusForK12Error(getErr, http.StatusInternalServerError), getErr.Error())
+			return
+		}
+		projection := publicImageTask(view)
+		authoritative := view.Dispatch
+		items = append(items, recoverableImageTask{
+			DispatchID: authoritative.DispatchID, SourceSessionID: authoritative.SourceSessionID,
+			SourceMessageID: authoritative.SourceRef, AttemptGeneration: authoritative.AttemptGeneration,
+			Version: authoritative.Version, Stage: projection.Progress.State, Status: authoritative.Status,
+			ProjectionReady: authoritative.Status != k12.ImageTaskStatusRouting,
+			Terminal:        imageTaskProjectionTerminal(projection),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 func (h *handler) getImageTask(w http.ResponseWriter, r *http.Request) {

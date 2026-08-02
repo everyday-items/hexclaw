@@ -16,15 +16,19 @@ import (
 )
 
 type problemStructureMember struct {
-	ProblemID         string   `json:"problem_id"`
-	Ordinal           int      `json:"ordinal"`
-	ProblemKind       string   `json:"problem_kind"`
-	ParentProblemID   string   `json:"parent_problem_id"`
-	SubproblemNo      string   `json:"subproblem_no"`
-	SourceNumberPath  []string `json:"source_number_path"`
-	DisplayLabel      string   `json:"display_label"`
-	DependencyGroupID string   `json:"dependency_group_id"`
-	InputRevision     int      `json:"-"`
+	ProblemID            string   `json:"problem_id"`
+	Ordinal              int      `json:"ordinal"`
+	ProblemKind          string   `json:"problem_kind"`
+	ParentProblemID      string   `json:"parent_problem_id"`
+	SubproblemNo         string   `json:"subproblem_no"`
+	SourceNumberPath     []string `json:"source_number_path"`
+	DisplayLabel         string   `json:"display_label"`
+	SourceSectionPath    []string `json:"source_section_path"`
+	SourceSectionLabel   string   `json:"source_section_label"`
+	SystemSectionOrdinal int      `json:"system_section_ordinal"`
+	SystemDisplayLabel   string   `json:"system_display_label"`
+	DependencyGroupID    string   `json:"dependency_group_id"`
+	InputRevision        int      `json:"-"`
 }
 
 type currentProblemStructure struct {
@@ -59,15 +63,19 @@ func problemStructureFacts(
 			revision = 1
 		}
 		members = append(members, problemStructureMember{
-			ProblemID:         problem.ProblemID,
-			Ordinal:           problem.Ordinal,
-			ProblemKind:       problem.ProblemKind,
-			ParentProblemID:   problem.ParentProblemID,
-			SubproblemNo:      problem.SubproblemNo,
-			SourceNumberPath:  append([]string(nil), problem.SourceNumberPath...),
-			DisplayLabel:      problem.DisplayLabel,
-			DependencyGroupID: dependencyGroupID(problem),
-			InputRevision:     revision,
+			ProblemID:            problem.ProblemID,
+			Ordinal:              problem.Ordinal,
+			ProblemKind:          problem.ProblemKind,
+			ParentProblemID:      problem.ParentProblemID,
+			SubproblemNo:         problem.SubproblemNo,
+			SourceNumberPath:     append([]string(nil), problem.SourceNumberPath...),
+			DisplayLabel:         problem.DisplayLabel,
+			SourceSectionPath:    append([]string(nil), problem.SourceSectionPath...),
+			SourceSectionLabel:   problem.SourceSectionLabel,
+			SystemSectionOrdinal: problem.SystemSectionOrdinal,
+			SystemDisplayLabel:   problem.SystemDisplayLabel,
+			DependencyGroupID:    dependencyGroupID(problem),
+			InputRevision:        revision,
 		})
 	}
 	sort.Slice(members, func(i, j int) bool {
@@ -104,7 +112,9 @@ func getCurrentProblemStructureTx(
 	}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT problem_id,ordinal,problem_kind,parent_problem_id,subproblem_no,
-		       source_number_path_json,display_label,dependency_group_id,
+		       source_number_path_json,display_label,
+		       source_section_path_json,source_section_label,system_section_ordinal,system_display_label,
+		       dependency_group_id,
 		       input_revision
 		FROM k12_problem_structure_members
 		WHERE agent_name=? AND submission_id=? AND structure_version=?
@@ -120,7 +130,7 @@ func getCurrentProblemStructureTx(
 	current.Members = map[string]problemStructureMember{}
 	for rows.Next() {
 		var member problemStructureMember
-		var sourcePathJSON string
+		var sourcePathJSON, sourceSectionPathJSON string
 		if err := rows.Scan(
 			&member.ProblemID,
 			&member.Ordinal,
@@ -129,12 +139,19 @@ func getCurrentProblemStructureTx(
 			&member.SubproblemNo,
 			&sourcePathJSON,
 			&member.DisplayLabel,
+			&sourceSectionPathJSON,
+			&member.SourceSectionLabel,
+			&member.SystemSectionOrdinal,
+			&member.SystemDisplayLabel,
 			&member.DependencyGroupID,
 			&member.InputRevision,
 		); err != nil {
 			return currentProblemStructure{}, err
 		}
 		if err := json.Unmarshal([]byte(sourcePathJSON), &member.SourceNumberPath); err != nil {
+			return currentProblemStructure{}, err
+		}
+		if err := json.Unmarshal([]byte(sourceSectionPathJSON), &member.SourceSectionPath); err != nil {
 			return currentProblemStructure{}, err
 		}
 		current.Members[member.ProblemID] = member
@@ -177,13 +194,19 @@ func insertProblemStructureVersionTx(
 		if err != nil {
 			return err
 		}
+		sourceSectionPathJSON, err := json.Marshal(member.SourceSectionPath)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO k12_problem_structure_members (
 				agent_name,submission_id,structure_version,problem_id,ordinal,
 				problem_kind,parent_problem_id,subproblem_no,
-				source_number_path_json,display_label,dependency_group_id,
+				source_number_path_json,display_label,
+				source_section_path_json,source_section_label,system_section_ordinal,system_display_label,
+				dependency_group_id,
 				input_revision
-			) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			agentName,
 			submissionID,
 			version,
@@ -194,6 +217,10 @@ func insertProblemStructureVersionTx(
 			member.SubproblemNo,
 			string(sourcePathJSON),
 			member.DisplayLabel,
+			string(sourceSectionPathJSON),
+			member.SourceSectionLabel,
+			member.SystemSectionOrdinal,
+			member.SystemDisplayLabel,
 			member.DependencyGroupID,
 			member.InputRevision,
 		); err != nil {

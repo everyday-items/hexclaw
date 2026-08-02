@@ -176,6 +176,26 @@ func NormalizeRecognizedQuestion(q RecognizedQuestion) RecognizedQuestion {
 	return q
 }
 
+// RecognizedQuestionSourceDisplayLabel is the single human-readable source
+// projection. It keeps the printed section, printed child number and any
+// server-derived order visibly distinct: the latter is never returned as a
+// worksheet number.
+func RecognizedQuestionSourceDisplayLabel(q RecognizedQuestion) string {
+	section := strings.TrimSpace(q.SourceSectionLabel)
+	item := strings.TrimSpace(q.DisplayLabel)
+	if item == "" {
+		item = strings.TrimSpace(q.SystemDisplayLabel)
+	}
+	switch {
+	case section != "" && item != "":
+		return section + " · " + item
+	case section != "":
+		return section
+	default:
+		return item
+	}
+}
+
 // normalizeRecognizedQuestionFacts 只收敛事实投影，不执行风险策略；与
 // EvaluateOCRConfirmationRisk 分层，避免风险计算递归调用 Normalize。
 func normalizeRecognizedQuestionFacts(q RecognizedQuestion) RecognizedQuestion {
@@ -193,6 +213,10 @@ func normalizeRecognizedQuestionFacts(q RecognizedQuestion) RecognizedQuestion {
 	}
 	q.SourceSectionLabel = strings.TrimSpace(q.SourceSectionLabel)
 	q.SystemDisplayLabel = strings.TrimSpace(q.SystemDisplayLabel)
+	if sourceNumberOnlyRepeatsSectionHeading(q) {
+		q.SourceNumberPath = nil
+		q.DisplayLabel = ""
+	}
 	if q.RawTranscription == "" {
 		q.RawTranscription = legacyQuestion
 	}
@@ -230,6 +254,28 @@ func normalizeRecognizedQuestionFacts(q RecognizedQuestion) RecognizedQuestion {
 		q.BBox = nil
 	}
 	return q
+}
+
+// sourceNumberOnlyRepeatsSectionHeading recognizes the one deterministic
+// heading-only shape allowed by DD-041. It never derives a source number: it
+// only removes a model value that is already proven to duplicate the same
+// visible section heading. A real C02 returned 四/五 in this exact shape for
+// unnumbered items under 四、应用题 / 五、思维题.
+func sourceNumberOnlyRepeatsSectionHeading(q RecognizedQuestion) bool {
+	if len(q.SourceNumberPath) == 0 ||
+		len(q.SourceNumberPath) != len(q.SourceSectionPath) ||
+		q.DisplayLabel == "" || q.SourceSectionLabel == "" {
+		return false
+	}
+	for index, token := range q.SourceNumberPath {
+		if token != q.SourceSectionPath[index] {
+			return false
+		}
+	}
+	if q.DisplayLabel != strings.Join(q.SourceNumberPath, "、") {
+		return false
+	}
+	return strings.HasPrefix(q.SourceSectionLabel, q.DisplayLabel+"、")
 }
 
 // Recognizer 拍题识别 port（adapter = OCR + 云端 vision，出网走 egress 白名单）。

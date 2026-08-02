@@ -22,6 +22,8 @@ const DispatcherMaxAttempts = 5
 // DispatcherPollInterval 轮询兜底间隔（写路径另有即时 nudge）。
 const DispatcherPollInterval = 5 * time.Second
 
+const dispatcherBatchSize = 100
+
 // Dispatcher 单进程 Outbox 投递器（§6.15）：顺序消费 pending 事件，
 // 逐消费者投递并以 event_id 去重；全部消费者成功 → delivered；
 // 失败累计 attempts，达上限 → dead（可取证，不静默丢弃）。
@@ -30,13 +32,25 @@ type Dispatcher struct {
 	consumers []Consumer
 	nudge     chan struct{}
 
-	mu      sync.Mutex // 串行化 ProcessPending（顺序消费保证）
-	started bool
+	startMu     sync.Mutex
+	processGate chan struct{} // 可取消的串行门闩，保证 ProcessPending 顺序消费
+	started     bool
+}
+
+func newDispatcher(db *sql.DB, consumers ...Consumer) *Dispatcher {
+	d := &Dispatcher{
+		db:          db,
+		consumers:   consumers,
+		nudge:       make(chan struct{}, 1),
+		processGate: make(chan struct{}, 1),
+	}
+	d.processGate <- struct{}{}
+	return d
 }
 
 // NewDispatcher 创建投递器并绑定 store 的追加通知（写提交后立即醒来）。
 func NewDispatcher(store *Store, consumers ...Consumer) *Dispatcher {
-	d := &Dispatcher{db: store.DB(), consumers: consumers, nudge: make(chan struct{}, 1)}
+	d := newDispatcher(store.DB(), consumers...)
 	store.SetOutboxNotifier(d.Nudge)
 	return d
 }
@@ -44,7 +58,7 @@ func NewDispatcher(store *Store, consumers ...Consumer) *Dispatcher {
 // NewSyncDispatcher 创建**同步**投递器：域写提交后在调用方 goroutine 内立即消费
 // （测试/简单接线用——投递时序确定，不需 Start）。at-least-once 与去重语义不变。
 func NewSyncDispatcher(store *Store, consumers ...Consumer) *Dispatcher {
-	d := &Dispatcher{db: store.DB(), consumers: consumers, nudge: make(chan struct{}, 1)}
+	d := newDispatcher(store.DB(), consumers...)
 	store.SetOutboxNotifier(func() { _ = d.ProcessPending(context.Background()) })
 	return d
 }
@@ -59,13 +73,13 @@ func (d *Dispatcher) Nudge() {
 
 // Start 启动后台投递循环（nudge 即时 + 周期兜底轮询）。ctx 结束即停。
 func (d *Dispatcher) Start(ctx context.Context) {
-	d.mu.Lock()
+	d.startMu.Lock()
 	if d.started {
-		d.mu.Unlock()
+		d.startMu.Unlock()
 		return
 	}
 	d.started = true
-	d.mu.Unlock()
+	d.startMu.Unlock()
 	go func() {
 		ticker := time.NewTicker(DispatcherPollInterval)
 		defer ticker.Stop()
@@ -83,12 +97,30 @@ func (d *Dispatcher) Start(ctx context.Context) {
 	}()
 }
 
-// ProcessPending 同步消费当前全部 pending 事件（测试与启动补投也走此入口）。
+// ProcessPending 同步消费调用开始时可见的全部 pending 事件（测试与启动补投也走此入口）。
+// 同一次调用中每条事件至多尝试一次；调用期间新增事件留给下一次调用。
 func (d *Dispatcher) ProcessPending(ctx context.Context) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-d.processGate:
+	}
+	defer func() { d.processGate <- struct{}{} }()
+
+	horizon, ok, err := pendingEventHorizon(ctx, d.db)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+
+	var after *pendingEventCursor
 	for {
-		events, err := PendingEvents(ctx, d.db, 100)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		events, err := pendingEventsPage(ctx, d.db, horizon, after, dispatcherBatchSize)
 		if err != nil {
 			return err
 		}
@@ -96,13 +128,18 @@ func (d *Dispatcher) ProcessPending(ctx context.Context) error {
 			return nil
 		}
 		for _, ev := range events {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if err := d.deliverOne(ctx, ev); err != nil {
 				return err
 			}
 		}
-		if len(events) < 100 {
+		if len(events) < dispatcherBatchSize {
 			return nil
 		}
+		last := events[len(events)-1]
+		after = &pendingEventCursor{CreatedAt: last.CreatedAt, EventID: last.EventID}
 	}
 }
 

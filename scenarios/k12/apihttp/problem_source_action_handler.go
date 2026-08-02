@@ -11,6 +11,7 @@ import (
 
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/viewcontract"
 )
 
 type problemSourceActionRequest struct {
@@ -98,7 +99,24 @@ func (h *handler) problemSourceAction(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeJSON(w, http.StatusOK, result)
+	response := viewcontract.ProblemSourceActionResponse(result.ProblemSourceActionResponse)
+	if response.DispatchID != dispatchID || response.ProblemID != problemID ||
+		response.Action != req.Action || response.StructureVersion != req.StructureVersion {
+		writeErr(w, http.StatusInternalServerError, "problem source action response identity mismatch")
+		return
+	}
+	writeFrozenProblemSourceActionJSON(w, result.JSON)
+}
+
+func writeFrozenProblemSourceActionJSON(w http.ResponseWriter, raw json.RawMessage) {
+	if _, err := viewcontract.ParseFrozenProblemSourceActionResponse(raw); err != nil {
+		writeErr(w, http.StatusInternalServerError, "invalid frozen problem source action response")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
+	_, _ = w.Write([]byte{'\n'})
 }
 
 func problemSourceActionTrustedAgent(rt Runtime, ownerScope string) string {

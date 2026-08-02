@@ -324,12 +324,15 @@ func gradingIndependentCallContext(
 	timeoutMS int,
 ) (context.Context, context.CancelFunc) {
 	base := context.WithoutCancel(parent)
+	// The caller supplies the durable stage context. Its deadline is the single
+	// budget authority for nested assessing operations; TimeoutMS may carry the
+	// DD-036 recognizing limit and must not introduce a shorter hidden cap here.
+	if parentDeadline, ok := parent.Deadline(); ok {
+		return context.WithDeadline(base, parentDeadline)
+	}
 	timeout := 3 * time.Minute
 	if timeoutMS > 0 {
 		timeout = time.Duration(timeoutMS) * time.Millisecond
-	}
-	if parentDeadline, ok := parent.Deadline(); ok && time.Until(parentDeadline) < timeout {
-		return context.WithDeadline(base, parentDeadline)
 	}
 	return context.WithTimeout(base, timeout)
 }

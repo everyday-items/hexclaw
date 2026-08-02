@@ -27,6 +27,8 @@ func problemAttemptFixture(agent, submission string) k12.ProblemAttemptSnapshot 
 				ProblemID: "child-1", AgentName: agent, SubmissionID: submission,
 				PageAssetID: "page-1", Ordinal: 1, ProblemKind: k12.ProblemKindSubproblem,
 				ParentProblemID: "parent-1", SubproblemNo: "1", Subject: "数学",
+				SourceSectionPath: []string{"一"}, SourceSectionLabel: "一、读图回答",
+				SystemSectionOrdinal: 1, SystemDisplayLabel: "第 1 题（系统序号）",
 				StemRaw: "第一天有多少人？", StemMarkdown: "第一天有多少人？",
 				ConceptIDs: []string{"读图"}, TranscriptionConfidence: confidence(0.86),
 				ConfirmationRequired: true, ConfirmationReasons: []string{"low_confidence"},
@@ -36,6 +38,8 @@ func problemAttemptFixture(agent, submission string) k12.ProblemAttemptSnapshot 
 				ProblemID: "child-2", AgentName: agent, SubmissionID: submission,
 				PageAssetID: "page-1", Ordinal: 2, ProblemKind: k12.ProblemKindSubproblem,
 				ParentProblemID: "parent-1", SubproblemNo: "2", Subject: "数学",
+				SourceNumberPath: []string{"一", "2"}, DisplayLabel: "一、2",
+				SourceSectionPath: []string{"一"}, SourceSectionLabel: "一、读图回答",
 				StemRaw: "第二天有多少人？", StemMarkdown: "第二天有多少人？",
 				ConceptIDs: []string{"读图"}, TranscriptionConfidence: confidence(0.99),
 				CanonicalVersion: 1, CreatedAt: 100, UpdatedAt: 100,
@@ -88,6 +92,15 @@ func TestProblemAttemptSnapshot_RoundTripVersionsAndSiblingIsolation(t *testing.
 	if len(got.Problems) != 3 || got.Problems[0].ProblemID != "parent-1" || got.Problems[1].ProblemID != "child-1" {
 		t.Fatalf("problem ordering/shape lost: %+v", got.Problems)
 	}
+	if first := got.Problems[1]; first.SourceSectionLabel != "一、读图回答" ||
+		len(first.SourceSectionPath) != 1 || first.SourceSectionPath[0] != "一" ||
+		first.SystemSectionOrdinal != 1 || first.SystemDisplayLabel != "第 1 题（系统序号）" {
+		t.Fatalf("DD-041 system/source section facts lost: %+v", first)
+	}
+	if second := got.Problems[2]; second.DisplayLabel != "一、2" ||
+		second.SystemSectionOrdinal != 0 || second.SystemDisplayLabel != "" {
+		t.Fatalf("DD-041 printed source fact drift: %+v", second)
+	}
 	byAttempt := map[string]k12.Attempt{}
 	for _, attempt := range got.Attempts {
 		byAttempt[attempt.AttemptID] = attempt
@@ -107,6 +120,42 @@ func TestProblemAttemptSnapshot_RoundTripVersionsAndSiblingIsolation(t *testing.
 	invalid.Problems[1].CanonicalVersion = 3
 	if err := store.PutProblemAttemptSnapshot(ctx, invalid); !errors.Is(err, k12storage.ErrProblemAttemptConflict) {
 		t.Fatalf("raw rewrite must fail closed, got %v", err)
+	}
+}
+
+func TestProblemAttemptSnapshot_RejectsForgedSystemOrder(t *testing.T) {
+	store, db := setup(t)
+	if _, err := db.ExecContext(context.Background(), migrate.K12ProblemAttemptsDDL); err != nil {
+		t.Fatalf("problem/attempt ddl: %v", err)
+	}
+	for _, mutate := range []struct {
+		name  string
+		apply func(*k12.ProblemAttemptSnapshot)
+	}{
+		{
+			name: "section ordinal skips the server-derived first item",
+			apply: func(snapshot *k12.ProblemAttemptSnapshot) {
+				snapshot.Problems[1].SystemSectionOrdinal = 2
+				snapshot.Problems[1].SystemDisplayLabel = "第 2 题（系统序号）"
+			},
+		},
+		{
+			name: "compound parent cannot receive a system item ordinal",
+			apply: func(snapshot *k12.ProblemAttemptSnapshot) {
+				snapshot.Problems[0].SourceSectionPath = []string{"一"}
+				snapshot.Problems[0].SourceSectionLabel = "一、读图回答"
+				snapshot.Problems[0].SystemSectionOrdinal = 1
+				snapshot.Problems[0].SystemDisplayLabel = "第 1 题（系统序号）"
+			},
+		},
+	} {
+		t.Run(mutate.name, func(t *testing.T) {
+			snapshot := problemAttemptFixture("mingming", "submission-"+t.Name())
+			mutate.apply(&snapshot)
+			if err := store.PutProblemAttemptSnapshot(context.Background(), snapshot); err == nil {
+				t.Fatal("forged system order must fail closed")
+			}
+		})
 	}
 }
 

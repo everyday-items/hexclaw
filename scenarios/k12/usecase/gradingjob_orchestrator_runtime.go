@@ -502,6 +502,32 @@ func (o *GradingOrchestrator) confirmRegisteredGradingJob(
 	return v, true, nil
 }
 
+// PhotoGradingJobRuntimeRetrier is the process-local half of the shared
+// retry command. A false handled result means the durable Job state machine
+// must be used instead (for example after a sidecar restart).
+type PhotoGradingJobRuntimeRetrier interface {
+	RetryPhotoGradingJob(context.Context, string) (GradingJobView, bool, error)
+}
+
+// RetryPhotoGradingJobWithDurableFallback keeps every public parent-facing
+// retry on one contract: reuse a live runtime when available, otherwise retry
+// the same durable Job from its checkpoint. Callers must already have applied
+// their state-specific authorization; this helper never creates a Job or
+// retries an outcome-unknown invocation.
+func RetryPhotoGradingJobWithDurableFallback(
+	ctx context.Context,
+	deps Deps,
+	runtime PhotoGradingJobRuntimeRetrier,
+	agentName, jobID string,
+) (GradingJobView, error) {
+	if runtime != nil {
+		if view, handled, err := runtime.RetryPhotoGradingJob(ctx, jobID); handled {
+			return view, err
+		}
+	}
+	return deps.RetryGradingJob(ctx, agentName, jobID)
+}
+
 // RetryPhotoGradingJob 安全重试（桌面入口）：回 queued 后**异步**从检查点续跑。
 // ok=false 表示无在途运行时，调用方回退纯状态机重试。
 func (o *GradingOrchestrator) RetryPhotoGradingJob(ctx context.Context, jobID string) (GradingJobView, bool, error) {
