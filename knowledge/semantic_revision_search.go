@@ -536,8 +536,8 @@ func (s *SQLiteRevisionSemanticSearcher) ftsTextSearch(
 	query := `SELECT c.id,c.doc_id,b.content_generation,d.title,d.source,d.source_type,d.chunk_count,
 		c.content,c.chunk_index,c.created_at,COALESCE(c.page_start,0),COALESCE(c.page_end,0),
 		c.source_digest,COALESCE(c.source_offset_start,0),COALESCE(c.source_offset_end,0),
-		d.created_at,bm25(kb_chunks_fts)
-		FROM kb_chunks_fts f
+		d.created_at,bm25(kb_chunks_fts_v2)
+		FROM kb_chunks_fts_v2 f
 		JOIN kb_chunks c ON c.id=f.chunk_id
 		JOIN kb_documents d ON d.id=c.doc_id
 		JOIN kb_semantic_document_bindings b
@@ -551,14 +551,14 @@ func (s *SQLiteRevisionSemanticSearcher) ftsTextSearch(
 		 AND rd.vector_state='ready' AND rd.visible_at IS NOT NULL`
 		args = append(args, revisionID)
 	}
-	query += ` WHERE kb_chunks_fts MATCH ? AND b.lifecycle_state='active' AND d.deleted=0`
-	args = append(args, strings.Join(keywords, " OR "))
+	query += ` WHERE kb_chunks_fts_v2 MATCH ? AND b.lifecycle_state='active' AND d.deleted=0`
+	args = append(args, cjkFTSQuery(keywords))
 	query += " AND " + readyIngestSegmentVisibilitySQL("b", "c")
 	if clause != "" {
 		query += " AND " + clause
 		args = append(args, filterArgs...)
 	}
-	query += " ORDER BY bm25(kb_chunks_fts)"
+	query += " ORDER BY bm25(kb_chunks_fts_v2)"
 	if !needDate {
 		query += " LIMIT ?"
 		args = append(args, topK)

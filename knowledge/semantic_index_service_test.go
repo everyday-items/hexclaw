@@ -113,6 +113,7 @@ func semanticIndexTestMigrations() []migrate.Migration {
 		migrate.KnowledgeDocumentScopeV27,
 		migrate.KnowledgeIngestCheckpointV28,
 		migrate.KnowledgeIngestExecutionV46,
+		migrate.KnowledgeUploadOperationsV71,
 	}
 }
 

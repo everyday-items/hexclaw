@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hexagon-codes/hexagon/rag/splitter"
@@ -23,7 +25,7 @@ import (
 // 存储结构：
 //   - kb_documents: 文档元信息
 //   - kb_chunks: 文档片段 + 向量嵌入（BLOB）
-//   - kb_chunks_fts: FTS5 全文索引虚拟表
+//   - kb_chunks_fts_v2: 预分词的 CJK bigram FTS5 索引
 //
 // 向量存储采用 float32 序列化为 BLOB 的方式，
 // 余弦相似度在 Go 层计算。对于个人知识库规模（< 10万 chunk），
@@ -31,7 +33,13 @@ import (
 type SQLiteStore struct {
 	db                *sql.DB
 	semanticMutations *sqliteSemanticMutationScope
+	// SQLite permits one physical writer. Serialize this store's multi-table
+	// document transactions; RetryOnBusy remains the bounded fallback for
+	// writers using another store or process.
+	writeMu sync.Mutex
 }
+
+const cjkFTSIndexVersion = 2
 
 type SQLiteStoreOption func(*SQLiteStore)
 
@@ -207,6 +215,39 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 			content,
 			chunk_id UNINDEXED
 		)`,
+		// v2 separates immutable raw content from retrieval tokens. SQLite's
+		// built-in unicode61 tokenizer treats a contiguous Chinese sentence as
+		// one token; indexing deterministic CJK bigrams makes Chinese BM25 a real
+		// FTS lane instead of an accidental LIKE full scan.
+		`CREATE VIRTUAL TABLE IF NOT EXISTS kb_chunks_fts_v2 USING fts5(
+			tokens,
+			chunk_id UNINDEXED
+		)`,
+		`CREATE TABLE IF NOT EXISTS kb_search_index_metadata (
+			index_name TEXT PRIMARY KEY,
+			version INTEGER NOT NULL,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TRIGGER IF NOT EXISTS kb_chunks_cjk_fts_v2_dirty_insert
+			AFTER INSERT ON kb_chunks BEGIN
+				DELETE FROM kb_search_index_metadata WHERE index_name='chunks_cjk_fts';
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS kb_chunks_cjk_fts_v2_dirty_update
+			AFTER UPDATE OF id, doc_id, content ON kb_chunks
+			WHEN OLD.id IS NOT NEW.id OR OLD.doc_id IS NOT NEW.doc_id OR OLD.content IS NOT NEW.content
+			BEGIN
+				DELETE FROM kb_search_index_metadata WHERE index_name='chunks_cjk_fts';
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS kb_chunks_cjk_fts_v2_dirty_delete
+			AFTER DELETE ON kb_chunks BEGIN
+				DELETE FROM kb_search_index_metadata WHERE index_name='chunks_cjk_fts';
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS kb_documents_cjk_fts_v2_dirty_lifecycle
+			AFTER UPDATE OF deleted ON kb_documents
+			WHEN OLD.deleted IS NOT NEW.deleted
+			BEGIN
+				DELETE FROM kb_search_index_metadata WHERE index_name='chunks_cjk_fts';
+			END`,
 	}
 
 	for _, q := range queries {
@@ -239,17 +280,187 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 	); err != nil {
 		logger.Error("[knowledge] 清理孤儿 FTS5 记录失败", "error", err)
 	}
+	if err := s.ensureCJKFTSIndex(ctx); err != nil {
+		return fmt.Errorf("初始化 CJK FTS5 v2 索引失败: %w", err)
+	}
 
 	return nil
 }
 
+// ensureCJKFTSIndex upgrades an existing corpus in one bounded-memory SQLite
+// transaction. The version marker is committed only after every active chunk
+// has been indexed, so a crash leaves the old marker and the next startup
+// deterministically rebuilds instead of serving a partially published index.
+func (s *SQLiteStore) ensureCJKFTSIndex(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var version int
+	versionErr := tx.QueryRowContext(ctx,
+		`SELECT version FROM kb_search_index_metadata WHERE index_name='chunks_cjk_fts'`,
+	).Scan(&version)
+	if versionErr != nil && versionErr != sql.ErrNoRows {
+		return versionErr
+	}
+	var indexedCount, distinctIndexedCount, activeCount int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*),COUNT(DISTINCT chunk_id) FROM kb_chunks_fts_v2`,
+	).Scan(&indexedCount, &distinctIndexedCount); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM kb_chunks c
+		JOIN kb_documents d ON d.id=c.doc_id
+		WHERE d.deleted=0`).Scan(&activeCount); err != nil {
+		return err
+	}
+	if version == cjkFTSIndexVersion &&
+		indexedCount == activeCount && distinctIndexedCount == activeCount {
+		var identityDrift int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT CASE WHEN EXISTS (
+				SELECT 1 FROM kb_chunks_fts_v2 f
+				LEFT JOIN kb_chunks c ON c.id=f.chunk_id
+				LEFT JOIN kb_documents d ON d.id=c.doc_id
+				WHERE c.id IS NULL OR d.id IS NULL OR d.deleted<>0
+				LIMIT 1
+			)
+			THEN 1 ELSE 0 END`).Scan(&identityDrift); err != nil {
+			return err
+		}
+		// The FTS ids form a distinct subset of the active chunk ids. Equal set
+		// cardinality therefore proves exact membership without an O(N²) reverse
+		// join against the UNINDEXED FTS column.
+		if identityDrift == 0 {
+			return tx.Commit()
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM kb_chunks_fts_v2`); err != nil {
+		return err
+	}
+	const batchSize int64 = 256
+	var afterRowID int64
+	for {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT c.rowid,c.id,c.content
+			FROM kb_chunks c
+			JOIN kb_documents d ON d.id=c.doc_id
+			WHERE d.deleted=0 AND c.rowid>?
+			ORDER BY c.rowid
+			LIMIT ?`, afterRowID, batchSize)
+		if err != nil {
+			return err
+		}
+		type indexRecord struct {
+			rowID   int64
+			chunkID string
+			content string
+		}
+		batch := make([]indexRecord, 0, batchSize)
+		for rows.Next() {
+			var record indexRecord
+			if err := rows.Scan(&record.rowID, &record.chunkID, &record.content); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			batch = append(batch, record)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for _, record := range batch {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO kb_chunks_fts_v2(tokens,chunk_id) VALUES(?,?)`,
+				cjkFTSIndexText(record.content), record.chunkID,
+			); err != nil {
+				return err
+			}
+		}
+		afterRowID = batch[len(batch)-1].rowID
+	}
+	if err := markCJKFTSCurrentTx(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func markCJKFTSCurrentTx(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO kb_search_index_metadata(index_name,version,updated_at)
+		VALUES('chunks_cjk_fts',?,CURRENT_TIMESTAMP)
+		ON CONFLICT(index_name) DO UPDATE SET
+		  version=excluded.version,updated_at=excluded.updated_at`, cjkFTSIndexVersion)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func cjkFTSProjectionCurrentTx(ctx context.Context, tx *sql.Tx) (bool, error) {
+	var version int
+	err := tx.QueryRowContext(ctx, `SELECT version FROM kb_search_index_metadata
+		WHERE index_name='chunks_cjk_fts'`).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return version == cjkFTSIndexVersion, nil
+}
+
+func restoreCJKFTSCurrentTx(ctx context.Context, tx *sql.Tx, wasCurrent bool) error {
+	if !wasCurrent {
+		return nil
+	}
+	return markCJKFTSCurrentTx(ctx, tx)
+}
+
+func cjkFTSIndexText(content string) string {
+	return strings.Join(splitter.SearchTokenize(content), " ")
+}
+
+func cjkFTSQuery(tokens []string) string {
+	quoted := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		if token == "" {
+			continue
+		}
+		quoted = append(quoted, `"`+strings.ReplaceAll(token, `"`, `""`)+`"`)
+	}
+	return strings.Join(quoted, " OR ")
+}
+
 // Add 添加文档及其 chunk（含向量和 FTS5 索引）
 func (s *SQLiteStore) Add(ctx context.Context, doc *Document, chunks []*Chunk) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return sqliteutil.RetryOnBusy(ctx, func() error {
+		return s.addOnce(ctx, doc, chunks)
+	})
+}
+
+func (s *SQLiteStore) addOnce(ctx context.Context, doc *Document, chunks []*Chunk) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	projectionWasCurrent, err := cjkFTSProjectionCurrentTx(ctx, tx)
+	if err != nil {
+		return err
+	}
 
 	// A scoped document owns its corpus before any binding/job row is created;
 	// this makes the database uniqueness boundary authoritative even between
@@ -318,11 +529,20 @@ func (s *SQLiteStore) Add(ctx context.Context, doc *Document, chunks []*Chunk) e
 		); err != nil {
 			return fmt.Errorf("fts5 索引插入失败: %w", err)
 		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO kb_chunks_fts_v2 (tokens, chunk_id) VALUES (?, ?)`,
+			cjkFTSIndexText(chunk.Content), chunk.ID,
+		); err != nil {
+			return fmt.Errorf("CJK fts5 v2 索引插入失败: %w", err)
+		}
 	}
 	if s.semanticMutations != nil {
 		if err := s.semanticMutations.documentAddedTx(ctx, tx, doc, chunks); err != nil {
 			return fmt.Errorf("更新语义索引任务失败: %w", err)
 		}
+	}
+	if err := restoreCJKFTSCurrentTx(ctx, tx, projectionWasCurrent); err != nil {
+		return fmt.Errorf("发布 CJK fts5 v2 版本失败: %w", err)
 	}
 
 	return tx.Commit()
@@ -330,11 +550,23 @@ func (s *SQLiteStore) Add(ctx context.Context, doc *Document, chunks []*Chunk) e
 
 // Replace 使用同一文档 ID 重建索引
 func (s *SQLiteStore) Replace(ctx context.Context, doc *Document, chunks []*Chunk) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return sqliteutil.RetryOnBusy(ctx, func() error {
+		return s.replaceOnce(ctx, doc, chunks)
+	})
+}
+
+func (s *SQLiteStore) replaceOnce(ctx context.Context, doc *Document, chunks []*Chunk) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	projectionWasCurrent, err := cjkFTSProjectionCurrentTx(ctx, tx)
+	if err != nil {
+		return err
+	}
 
 	var scopeUID string
 	if s.semanticMutations != nil {
@@ -351,6 +583,12 @@ func (s *SQLiteStore) Replace(ctx context.Context, doc *Document, chunks []*Chun
 		doc.ID,
 	); err != nil {
 		return fmt.Errorf("fts5 索引删除失败: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM kb_chunks_fts_v2 WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE doc_id = ?)`,
+		doc.ID,
+	); err != nil {
+		return fmt.Errorf("CJK fts5 v2 索引删除失败: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM kb_chunks WHERE doc_id = ?`, doc.ID); err != nil {
 		return fmt.Errorf("删除旧 chunk 失败: %w", err)
@@ -396,11 +634,20 @@ func (s *SQLiteStore) Replace(ctx context.Context, doc *Document, chunks []*Chun
 		); err != nil {
 			return fmt.Errorf("重建 fts5 索引失败: %w", err)
 		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO kb_chunks_fts_v2 (tokens, chunk_id) VALUES (?, ?)`,
+			cjkFTSIndexText(chunk.Content), chunk.ID,
+		); err != nil {
+			return fmt.Errorf("重建 CJK fts5 v2 索引失败: %w", err)
+		}
 	}
 	if s.semanticMutations != nil {
 		if err := s.semanticMutations.documentReplacedTx(ctx, tx, doc, chunks); err != nil {
 			return fmt.Errorf("更新语义索引任务失败: %w", err)
 		}
+	}
+	if err := restoreCJKFTSCurrentTx(ctx, tx, projectionWasCurrent); err != nil {
+		return fmt.Errorf("发布 CJK fts5 v2 版本失败: %w", err)
 	}
 
 	return tx.Commit()
@@ -408,11 +655,23 @@ func (s *SQLiteStore) Replace(ctx context.Context, doc *Document, chunks []*Chun
 
 // Delete 删除文档及其 chunk + FTS5 索引
 func (s *SQLiteStore) Delete(ctx context.Context, docID string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return sqliteutil.RetryOnBusy(ctx, func() error {
+		return s.deleteOnce(ctx, docID)
+	})
+}
+
+func (s *SQLiteStore) deleteOnce(ctx context.Context, docID string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	projectionWasCurrent, err := cjkFTSProjectionCurrentTx(ctx, tx)
+	if err != nil {
+		return err
+	}
 
 	// 删除 FTS5 索引中的对应记录
 	if _, err := tx.ExecContext(ctx,
@@ -421,10 +680,19 @@ func (s *SQLiteStore) Delete(ctx context.Context, docID string) error {
 	); err != nil {
 		return fmt.Errorf("fts5 索引删除失败: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM kb_chunks_fts_v2 WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE doc_id = ?)`,
+		docID,
+	); err != nil {
+		return fmt.Errorf("CJK fts5 v2 索引删除失败: %w", err)
+	}
 
 	if s.semanticMutations != nil {
 		if err := s.semanticMutations.documentDeletedTx(ctx, tx, docID); err != nil {
 			return fmt.Errorf("更新语义索引删除状态失败: %w", err)
+		}
+		if err := restoreCJKFTSCurrentTx(ctx, tx, projectionWasCurrent); err != nil {
+			return fmt.Errorf("发布 CJK fts5 v2 版本失败: %w", err)
 		}
 		return tx.Commit()
 	}
@@ -435,6 +703,9 @@ func (s *SQLiteStore) Delete(ctx context.Context, docID string) error {
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM kb_documents WHERE id = ?`, docID); err != nil {
 		return err
+	}
+	if err := restoreCJKFTSCurrentTx(ctx, tx, projectionWasCurrent); err != nil {
+		return fmt.Errorf("发布 CJK fts5 v2 版本失败: %w", err)
 	}
 
 	return tx.Commit()
@@ -693,8 +964,12 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int, fi
 		return nil, nil
 	}
 
-	// FTS5 查询语法：用 OR 连接多个关键词
-	ftsQuery := strings.Join(keywords, " OR ")
+	// Quote each token before composing the OR expression. Token text is data,
+	// never FTS syntax; this also avoids punctuation-driven parser failures.
+	ftsQuery := cjkFTSQuery(keywords)
+	if ftsQuery == "" {
+		return nil, nil
+	}
 
 	// 元数据过滤生效于 LIMIT/截断之前：源/源类型下推 SQL（JOIN kb_documents + IN）；
 	// 日期取 d.created_at 在 Go 层按真实时刻比较。带日期过滤时不能用 SQL LIMIT（否则日期
@@ -705,21 +980,21 @@ func (s *SQLiteStore) TextSearch(ctx context.Context, query string, topK int, fi
 	needGeneration := len(filter.DocumentGenerations) > 0
 	needDate := filter.hasDateBound()
 
-	sel := "f.chunk_id, f.content, bm25(kb_chunks_fts) as score"
+	sel := "f.chunk_id, c.content, bm25(kb_chunks_fts_v2) as score"
 	if needDate {
 		sel += ", d.created_at"
 	}
 	// Always join the document tombstone boundary. Semantic deletes retain
 	// immutable chunks for revision history; neither FTS nor LIKE fallback may
 	// surface those chunks after d.deleted becomes true.
-	from := `kb_chunks_fts f
+	from := `kb_chunks_fts_v2 f
 		 JOIN kb_chunks c ON c.id = f.chunk_id
 		 JOIN kb_documents d ON d.id = c.doc_id`
 	if needGeneration {
 		from += ` JOIN kb_semantic_document_bindings b
 		 ON b.document_id=d.id AND b.lifecycle_state='active'`
 	}
-	where := "d.deleted=0 AND kb_chunks_fts MATCH ?"
+	where := "d.deleted=0 AND kb_chunks_fts_v2 MATCH ?"
 	args := []any{ftsQuery}
 	if clause != "" {
 		where += " AND " + clause

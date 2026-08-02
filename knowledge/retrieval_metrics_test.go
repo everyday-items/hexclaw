@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestRetrievalMetrics_RecordsFTSFallbackAndLaneLatency(t *testing.T) {
+func TestRetrievalMetrics_CJKFTSHitsWithoutLIKEFallback(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
 	store := NewSQLiteStore(db)
@@ -24,12 +24,11 @@ func TestRetrievalMetrics_RecordsFTSFallbackAndLaneLatency(t *testing.T) {
 	}
 
 	metrics := mgr.RetrievalMetricsSnapshot()
-	if metrics.FTS.Calls == 0 || metrics.FTS.Empty == 0 || metrics.FTS.Fallbacks == 0 ||
-		metrics.FTS.FallbackRate <= 0 || metrics.FTS.TotalLatencyMS <= 0 {
-		t.Fatalf("应记录 FTS 空命中及 LIKE 降级: %+v", metrics)
+	if metrics.FTS.Calls == 0 || metrics.FTS.Hits == 0 || metrics.FTS.Empty != 0 ||
+		metrics.FTS.Fallbacks != 0 || metrics.FTS.FallbackRate != 0 || metrics.FTS.TotalLatencyMS <= 0 {
+		t.Fatalf("中文 bigram 应直接命中 FTS，不得降级 LIKE: %+v", metrics)
 	}
-	if metrics.Like.Calls == 0 || metrics.Like.Hits == 0 || metrics.Like.HitRate <= 0 ||
-		metrics.Like.TotalLatencyMS <= 0 {
-		t.Fatalf("应记录 LIKE 命中和延迟: %+v", metrics)
+	if metrics.Like.Calls != 0 || metrics.Like.Hits != 0 || metrics.Like.Fallbacks != 0 {
+		t.Fatalf("中文 FTS 命中时 LIKE lane 必须为零调用: %+v", metrics)
 	}
 }

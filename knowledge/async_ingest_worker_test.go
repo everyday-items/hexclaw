@@ -197,7 +197,7 @@ func TestIngestJobSurvivesWorkerReconstructionAndPublishesTextAtomically(t *test
 		t.Fatalf("projection source spans=%+v", projection.SourceSpans)
 	}
 	var content, status string
-	var chunks, ftsRows int
+	var chunks, ftsRows, cjkFTSVersion int
 	if err := db.QueryRowContext(ctx, `SELECT content,status,chunk_count FROM kb_documents WHERE id=?`, accepted.DocumentID).
 		Scan(&content, &status, &chunks); err != nil {
 		t.Fatal(err)
@@ -205,8 +205,20 @@ func TestIngestJobSurvivesWorkerReconstructionAndPublishesTextAtomically(t *test
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM kb_chunks_fts WHERE kb_chunks_fts MATCH 'algebra'`).Scan(&ftsRows); err != nil {
 		t.Fatal(err)
 	}
-	if content != "restart durable algebra lesson" || status != "indexed" || chunks != 1 || ftsRows != 1 {
-		t.Fatalf("published content=%q status=%q chunks=%d fts=%d", content, status, chunks, ftsRows)
+	var cjkFTSRows int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM kb_chunks_fts_v2 WHERE kb_chunks_fts_v2 MATCH 'algebra'`,
+	).Scan(&cjkFTSRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT version FROM kb_search_index_metadata
+		WHERE index_name='chunks_cjk_fts'`).Scan(&cjkFTSVersion); err != nil {
+		t.Fatal(err)
+	}
+	if content != "restart durable algebra lesson" || status != "indexed" || chunks != 1 ||
+		ftsRows != 1 || cjkFTSRows != 1 || cjkFTSVersion != cjkFTSIndexVersion {
+		t.Fatalf("published content=%q status=%q chunks=%d fts=%d cjk_fts=%d cjk_version=%d",
+			content, status, chunks, ftsRows, cjkFTSRows, cjkFTSVersion)
 	}
 	for _, stage := range []JobStage{JobStageExtracting, JobStageChunking, JobStageTextIndexing} {
 		var checkpoints int

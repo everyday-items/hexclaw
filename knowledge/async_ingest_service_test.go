@@ -42,6 +42,7 @@ func newAsyncIngestHarness(t *testing.T) (*sql.DB, *SemanticIndexService, contex
 		migrate.KnowledgeDocumentScopeV27,
 		migrate.KnowledgeIngestCheckpointV28,
 		migrate.KnowledgeIngestExecutionV46,
+		migrate.KnowledgeUploadOperationsV71,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +164,7 @@ func TestCreateDocumentIdempotencyIsOwnerCorpusScopedAndPayloadBound(t *testing.
 	}
 }
 
-func TestCreateDocumentIdempotencyReplayBindsCorpusAndK12OwnerMetadata(t *testing.T) {
+func TestCreateDocumentIdempotencyReplayBindsK12MetadataAndAllowsCorpusScopedKeys(t *testing.T) {
 	db, service, ctx := newAsyncIngestHarness(t)
 	repository := NewSQLiteSemanticIndexRepository(db)
 	if _, err := repository.BindLegacyDefaultCorpus(ctx, "desktop-user", "second"); err != nil {
@@ -175,20 +176,24 @@ func TestCreateDocumentIdempotencyReplayBindsCorpusAndK12OwnerMetadata(t *testin
 		SizeBytes: int64(len(body)), AgentID: "tutor-a", LearnerID: "learner-a",
 		Subject: "数学", Grade: "六年级上",
 	}
-	create := func(corpus string, mutate func(*CreateDocumentInput)) error {
+	create := func(corpus string, mutate func(*CreateDocumentInput)) (CreateDocumentResult, error) {
 		input := base
 		input.Body = strings.NewReader(body)
 		if mutate != nil {
 			mutate(&input)
 		}
-		_, err := service.CreateDocument(ctx, "desktop-user", corpus, input)
-		return err
+		return service.CreateDocument(ctx, "desktop-user", corpus, input)
 	}
-	if err := create("default", nil); err != nil {
+	first, err := create("default", nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := create("default", nil); err != nil {
+	replayed, err := create("default", nil)
+	if err != nil {
 		t.Fatalf("exact replay failed: %v", err)
+	}
+	if replayed.DocumentID != first.DocumentID || replayed.JobID != first.JobID {
+		t.Fatalf("same-corpus replay diverged: first=%+v replayed=%+v", first, replayed)
 	}
 	for name, mutate := range map[string]func(*CreateDocumentInput){
 		"agent":   func(input *CreateDocumentInput) { input.AgentID = "tutor-b" },
@@ -197,13 +202,17 @@ func TestCreateDocumentIdempotencyReplayBindsCorpusAndK12OwnerMetadata(t *testin
 		"grade":   func(input *CreateDocumentInput) { input.Grade = "五年级下" },
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := create("default", mutate); !errors.Is(err, ErrIdempotencyConflict) {
+			if _, err := create("default", mutate); !errors.Is(err, ErrIdempotencyConflict) {
 				t.Fatalf("metadata mismatch error=%v, want ErrIdempotencyConflict", err)
 			}
 		})
 	}
-	if err := create("second", nil); !errors.Is(err, ErrIdempotencyConflict) {
-		t.Fatalf("corpus mismatch error=%v, want ErrIdempotencyConflict", err)
+	second, err := create("second", nil)
+	if err != nil {
+		t.Fatalf("same key in a different corpus must be independent: %v", err)
+	}
+	if second.DocumentID == first.DocumentID || second.JobID == first.JobID {
+		t.Fatalf("cross-corpus scoped key reused physical work: first=%+v second=%+v", first, second)
 	}
 	var referencedPath string
 	var sources, jobs int
@@ -218,8 +227,8 @@ func TestCreateDocumentIdempotencyReplayBindsCorpusAndK12OwnerMetadata(t *testin
 	}
 	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM kb_ingest_document_sources`).Scan(&sources)
 	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM kb_knowledge_jobs WHERE kind='ingest'`).Scan(&jobs)
-	if sources != 1 || jobs != 1 {
-		t.Fatalf("conflicting replays mutated durable rows: sources=%d jobs=%d", sources, jobs)
+	if sources != 2 || jobs != 2 {
+		t.Fatalf("corpus-scoped keys must create one durable item per corpus: sources=%d jobs=%d", sources, jobs)
 	}
 }
 

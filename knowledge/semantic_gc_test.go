@@ -42,6 +42,7 @@ func TestKnowledgeJobGCRemovesTombstonedDocumentResidue(t *testing.T) {
 		"documents":          `SELECT COUNT(*) FROM kb_documents WHERE id='doc-1'`,
 		"chunks":             `SELECT COUNT(*) FROM kb_chunks WHERE doc_id='doc-1'`,
 		"fts":                `SELECT COUNT(*) FROM kb_chunks_fts WHERE chunk_id IN ('chunk-a','chunk-b')`,
+		"cjk_fts_v2":         `SELECT COUNT(*) FROM kb_chunks_fts_v2 WHERE chunk_id IN ('chunk-a','chunk-b')`,
 		"bindings":           `SELECT COUNT(*) FROM kb_semantic_document_bindings WHERE document_id='doc-1'`,
 		"generations":        `SELECT COUNT(*) FROM kb_semantic_document_generations WHERE document_id='doc-1'`,
 		"revision_documents": `SELECT COUNT(*) FROM kb_revision_documents WHERE document_id='doc-1'`,
@@ -59,6 +60,14 @@ func TestKnowledgeJobGCRemovesTombstonedDocumentResidue(t *testing.T) {
 		if count != 0 {
 			t.Errorf("GC left %s residue=%d", table, count)
 		}
+	}
+	var cjkFTSVersion int
+	if err := h.db.QueryRowContext(h.ctx, `SELECT version FROM kb_search_index_metadata
+		WHERE index_name='chunks_cjk_fts'`).Scan(&cjkFTSVersion); err != nil {
+		t.Fatalf("GC did not publish CJK FTS v2 version: %v", err)
+	}
+	if cjkFTSVersion != cjkFTSIndexVersion {
+		t.Fatalf("GC CJK FTS version=%d want %d", cjkFTSVersion, cjkFTSIndexVersion)
 	}
 
 	// A fresh repository/store over the same durable DB must not resurrect any

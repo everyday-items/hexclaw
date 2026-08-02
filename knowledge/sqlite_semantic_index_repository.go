@@ -1158,6 +1158,39 @@ func (r *SQLiteSemanticIndexRepository) GetJobForCorpus(
 	return job, err
 }
 
+func (r *SQLiteSemanticIndexRepository) ListRecoverableIngestJobsForCorpus(
+	ctx context.Context, ownerID, corpusID string,
+) ([]KnowledgeJob, error) {
+	if err := validateSemanticScope(ownerID, corpusID); err != nil {
+		return nil, ErrSemanticIndexNotFound
+	}
+	rows, err := r.db.QueryContext(ctx, semanticJobSelect+`
+		WHERE owner_id=? AND corpus_uid=(
+			SELECT c.corpus_uid FROM kb_semantic_corpora c
+			WHERE c.owner_id=? AND c.corpus_alias=?
+		) AND kind=? AND state IN (?,?,?,?)
+		ORDER BY updated_at DESC,job_id DESC`,
+		ownerID, ownerID, corpusID, KnowledgeJobIngest,
+		KnowledgeJobQueued, KnowledgeJobRunning, KnowledgeJobRetryWait, KnowledgeJobFailed,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	jobs := make([]KnowledgeJob, 0)
+	for rows.Next() {
+		job, scanErr := scanSemanticJobValue(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return jobs, nil
+}
+
 func (r *SQLiteSemanticIndexRepository) getRevisionJob(
 	ctx context.Context,
 	corpusUID, revisionID string,
@@ -1174,6 +1207,14 @@ const semanticJobSelect = `SELECT job_id,COALESCE(parent_job_id,''),kind,owner_i
 	FROM kb_knowledge_jobs`
 
 func scanSemanticJob(row *sql.Row) (KnowledgeJob, error) {
+	return scanSemanticJobValue(row)
+}
+
+type semanticJobScanner interface {
+	Scan(...any) error
+}
+
+func scanSemanticJobValue(row semanticJobScanner) (KnowledgeJob, error) {
 	var job KnowledgeJob
 	var pagesDone, pagesTotal, chunksDone, chunksTotal sql.NullInt64
 	var nextAttempt, leaseExpires, heartbeat sql.NullInt64
@@ -2374,6 +2415,10 @@ func (r *SQLiteSemanticIndexRepository) prepareDocumentGC(
 		return documentGCPlan{}, err
 	}
 	defer tx.Rollback()
+	projectionWasCurrent, err := cjkFTSProjectionCurrentTx(ctx, tx)
+	if err != nil {
+		return documentGCPlan{}, err
+	}
 	job, err := loadLiveJob(ctx, tx, lease, now)
 	if err != nil {
 		return documentGCPlan{}, err
@@ -2503,6 +2548,10 @@ func (r *SQLiteSemanticIndexRepository) prepareDocumentGC(
 		WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE doc_id=?)`, documentID); err != nil {
 		return documentGCPlan{}, err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM kb_chunks_fts_v2
+		WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE doc_id=?)`, documentID); err != nil {
+		return documentGCPlan{}, err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM kb_chunks WHERE doc_id=?`, documentID); err != nil {
 		return documentGCPlan{}, err
 	}
@@ -2514,6 +2563,9 @@ func (r *SQLiteSemanticIndexRepository) prepareDocumentGC(
 	if _, err := tx.ExecContext(ctx, `DELETE FROM kb_documents
 		WHERE id=? AND corpus_uid=? AND deleted=1`, documentID, job.CorpusUID); err != nil {
 		return documentGCPlan{}, err
+	}
+	if err := restoreCJKFTSCurrentTx(ctx, tx, projectionWasCurrent); err != nil {
+		return documentGCPlan{}, fmt.Errorf("knowledge: publish CJK FTS v2 version: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return documentGCPlan{}, err

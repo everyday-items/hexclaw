@@ -39,6 +39,10 @@ func (r *SQLiteSemanticIndexRepository) CreateIngestDocument(
 		return CreateDocumentResult{}, err
 	}
 	defer tx.Rollback()
+	projectionWasCurrent, err := cjkFTSProjectionCurrentTx(ctx, tx)
+	if err != nil {
+		return CreateDocumentResult{}, err
+	}
 	state, err := loadSemanticPolicyState(ctx, tx, ownerID, corpusID)
 	if err != nil {
 		return CreateDocumentResult{}, err
@@ -48,6 +52,13 @@ func (r *SQLiteSemanticIndexRepository) CreateIngestDocument(
 	); findErr != nil {
 		return CreateDocumentResult{}, findErr
 	} else if found {
+		if err := bindUploadOperationTx(
+			ctx, tx, ownerID, state.corpusUID, input.UploadOperationID,
+			existing.DocumentID, existing.JobID, blob.SHA256, blob.SizeBytes, semanticNowMillis(),
+		); err != nil {
+			return CreateDocumentResult{}, err
+		}
+		existing.OperationID = strings.TrimSpace(input.UploadOperationID)
 		if err := tx.Commit(); err != nil {
 			return CreateDocumentResult{}, err
 		}
@@ -100,6 +111,11 @@ func (r *SQLiteSemanticIndexRepository) CreateIngestDocument(
 			`DELETE FROM kb_chunks_fts WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE doc_id=?)`,
 			documentID); err != nil {
 			return CreateDocumentResult{}, fmt.Errorf("knowledge: clear revived ingest FTS: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM kb_chunks_fts_v2 WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE doc_id=?)`,
+			documentID); err != nil {
+			return CreateDocumentResult{}, fmt.Errorf("knowledge: clear revived ingest CJK FTS v2: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM kb_chunks WHERE doc_id=?`, documentID); err != nil {
 			return CreateDocumentResult{}, fmt.Errorf("knowledge: clear revived ingest chunks: %w", err)
@@ -188,11 +204,21 @@ func (r *SQLiteSemanticIndexRepository) CreateIngestDocument(
 	}, time.UnixMilli(nowMillis)); err != nil {
 		return CreateDocumentResult{}, err
 	}
+	if err := restoreCJKFTSCurrentTx(ctx, tx, projectionWasCurrent); err != nil {
+		return CreateDocumentResult{}, fmt.Errorf("knowledge: publish CJK FTS v2 version: %w", err)
+	}
+	if err := bindUploadOperationTx(
+		ctx, tx, ownerID, state.corpusUID, input.UploadOperationID,
+		documentID, jobID, blob.SHA256, blob.SizeBytes, nowMillis,
+	); err != nil {
+		return CreateDocumentResult{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return CreateDocumentResult{}, err
 	}
 	return CreateDocumentResult{
-		DocumentID: documentID, JobID: jobID, TextIndexState: TextIndexPending,
+		OperationID: strings.TrimSpace(input.UploadOperationID),
+		DocumentID:  documentID, JobID: jobID, TextIndexState: TextIndexPending,
 		VectorIndexState: vectorState,
 	}, nil
 }
@@ -563,9 +589,10 @@ func lookupIngestReplayTx(
 		JOIN kb_ingest_document_sources s
 		  ON s.document_id=j.document_id AND s.content_generation=j.document_generation
 		JOIN kb_semantic_document_bindings b ON b.document_id=j.document_id
-		WHERE j.owner_id=? AND j.kind='ingest' AND j.idempotency_key=?
+		WHERE j.owner_id=? AND j.corpus_uid=?
+		  AND j.kind='ingest' AND j.idempotency_key=?
 		ORDER BY j.created_at,j.job_id LIMIT 1`,
-		ownerID, strings.TrimSpace(input.IdempotencyKey)).Scan(
+		ownerID, state.corpusUID, strings.TrimSpace(input.IdempotencyKey)).Scan(
 		&jobID, &documentID, &corpusUID, &existingDigest, &existingName, &existingMedia,
 		&agentID, &learnerID, &subject, &grade, &textState,
 	)
@@ -1111,6 +1138,10 @@ func (r *SQLiteSemanticIndexRepository) CompleteIngestDocument(
 		return err
 	}
 	defer tx.Rollback()
+	projectionWasCurrent, err := cjkFTSProjectionCurrentTx(ctx, tx)
+	if err != nil {
+		return err
+	}
 	job, err := loadLiveJob(ctx, tx, lease, now)
 	if err != nil {
 		return err
@@ -1224,6 +1255,10 @@ func (r *SQLiteSemanticIndexRepository) CompleteIngestDocument(
 			chunk.Content, chunk.ID); err != nil {
 			return fmt.Errorf("knowledge: publish ingest FTS: %w", err)
 		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO kb_chunks_fts_v2(tokens,chunk_id) VALUES(?,?)`,
+			cjkFTSIndexText(chunk.Content), chunk.ID); err != nil {
+			return fmt.Errorf("knowledge: publish ingest CJK FTS v2: %w", err)
+		}
 	}
 	res, err = tx.ExecContext(ctx, `UPDATE kb_semantic_document_bindings
 		SET text_state='ready',version=version+1,updated_at=?
@@ -1329,6 +1364,9 @@ func (r *SQLiteSemanticIndexRepository) CompleteIngestDocument(
 	}
 	if rows, _ := res.RowsAffected(); rows != 1 {
 		return ErrJobFenced
+	}
+	if err := restoreCJKFTSCurrentTx(ctx, tx, projectionWasCurrent); err != nil {
+		return fmt.Errorf("knowledge: publish CJK FTS v2 version: %w", err)
 	}
 	return tx.Commit()
 }

@@ -43,10 +43,10 @@ type corpusScopedSemanticJobRepository interface {
 // Worker-specific lease/checkpoint methods intentionally remain on the concrete
 // repository rather than leaking into this API-facing surface.
 type SemanticIndexService struct {
-	repository SemanticIndexRepository
-	resolver   EmbeddingProfileResolver
-	ingestRepo DocumentIngestRepository
-	blobStore  *localIngestBlobStore
+	repository          SemanticIndexRepository
+	resolver            EmbeddingProfileResolver
+	ingestRepo          DocumentIngestRepository
+	blobStore           *localIngestBlobStore
 	visionRouteResolver VisionRouteSnapshotResolver
 }
 
@@ -90,6 +90,13 @@ func (s *SemanticIndexService) ConfigureDocumentIngest(root string) error {
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if reconciler, ok := s.ingestRepo.(uploadOperationStartupReconciler); ok {
+		if err := reconciler.CancelOrphanedReceivingUploadOperations(
+			cleanupCtx, time.Now().UTC(),
+		); err != nil {
+			return err
+		}
+	}
 	referenced, err := s.ingestRepo.ListIngestBlobPaths(cleanupCtx)
 	if err != nil {
 		return err
@@ -114,34 +121,108 @@ func (s *SemanticIndexService) CreateDocument(
 	if s.ingestRepo == nil || s.blobStore == nil {
 		return CreateDocumentResult{}, ErrDocumentIngestUnavailable
 	}
+	uploads, ok := s.ingestRepo.(uploadOperationRepository)
+	if !ok {
+		return CreateDocumentResult{}, ErrDocumentIngestUnavailable
+	}
 	visionRoute, err := s.freezeVisionRoute(ctx)
 	if err != nil {
 		return CreateDocumentResult{}, err
 	}
 	input.VisionRoute = visionRoute
-	blob, release, err := s.blobStore.Persist(ctx, ownerID, corpusID, input)
+	operation, created, err := uploads.BeginUploadOperation(ctx, ownerID, corpusID, input)
 	if err != nil {
 		return CreateDocumentResult{}, err
+	}
+	if !created && operation.DocumentID == "" && operation.JobID == "" {
+		if operation.Terminal {
+			return CreateDocumentResult{}, ErrDocumentRetryRequiresReupload
+		}
+		// The request that inserted the receiving intent is the only request
+		// allowed to consume bytes and bind/terminate it. A concurrent replay
+		// must fail before reading its body; otherwise its cancellation or read
+		// failure could fence the healthy creator's shared operation row.
+		return CreateDocumentResult{}, ErrIdempotencyConflict
+	}
+	input.UploadOperationID = operation.OperationID
+	blob, release, err := s.blobStore.Persist(ctx, ownerID, corpusID, input)
+	if err != nil {
+		return CreateDocumentResult{}, errors.Join(err,
+			s.markUploadOperationTerminal(ownerID, corpusID, operation.OperationID, err))
 	}
 	defer release()
 	input.SizeBytes = blob.SizeBytes
 	result, createErr := s.ingestRepo.CreateIngestDocument(ctx, ownerID, corpusID, input, blob)
 	if createErr == nil {
+		result.OperationID = operation.OperationID
 		return result, nil
 	}
+	operationErr := s.markUploadOperationTerminal(
+		ownerID, corpusID, operation.OperationID, createErr,
+	)
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelCleanup()
 	referenced, referenceErr := s.ingestRepo.IsIngestBlobPathReferenced(cleanupCtx, blob.StoragePath)
 	if referenceErr != nil {
-		return CreateDocumentResult{}, errors.Join(createErr,
+		return CreateDocumentResult{}, errors.Join(createErr, operationErr,
 			fmt.Errorf("knowledge: verify rejected ingest object reference: %w", referenceErr))
 	}
 	if !referenced {
 		if removeErr := s.blobStore.RemoveManagedObject(blob.StoragePath); removeErr != nil {
-			return CreateDocumentResult{}, errors.Join(createErr, removeErr)
+			return CreateDocumentResult{}, errors.Join(createErr, operationErr, removeErr)
 		}
 	}
-	return CreateDocumentResult{}, createErr
+	return CreateDocumentResult{}, errors.Join(createErr, operationErr)
+}
+
+func (s *SemanticIndexService) markUploadOperationTerminal(
+	ownerID, corpusID, operationID string,
+	cause error,
+) error {
+	uploads, ok := s.ingestRepo.(uploadOperationRepository)
+	if !ok || operationID == "" {
+		return nil
+	}
+	state := UploadOperationFailed
+	errorCode := "upload_failed"
+	if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		state = UploadOperationCancelled
+		errorCode = "upload_cancelled"
+	}
+	markCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := uploads.MarkUploadOperationFailed(
+		markCtx, ownerID, corpusID, operationID, state, errorCode,
+	); err != nil {
+		return fmt.Errorf("knowledge: persist upload terminal projection: %w", err)
+	}
+	return nil
+}
+
+// ListUploadOperationsForCorpus is a side-effect-free renderer recovery read.
+// It never queues, retries, or otherwise mutates a physical ingest job.
+func (s *SemanticIndexService) ListUploadOperationsForCorpus(
+	ctx context.Context,
+	ownerID, corpusID string,
+) ([]UploadOperationProjection, error) {
+	uploads, ok := s.ingestRepo.(uploadOperationRepository)
+	if !ok {
+		return nil, ErrDocumentIngestUnavailable
+	}
+	return uploads.ListUploadOperationsForCorpus(ctx, ownerID, corpusID)
+}
+
+// MarkUploadResponseDelivered advances only the transport acknowledgement
+// boundary. The worker job remains independently durable and authoritative.
+func (s *SemanticIndexService) MarkUploadResponseDelivered(
+	ctx context.Context,
+	ownerID, corpusID, operationID string,
+) error {
+	uploads, ok := s.ingestRepo.(uploadOperationRepository)
+	if !ok {
+		return ErrDocumentIngestUnavailable
+	}
+	return uploads.MarkUploadResponseDelivered(ctx, ownerID, corpusID, operationID)
 }
 
 // RetryDocument creates a new durable job for a failed document generation.
@@ -198,6 +279,20 @@ func (s *SemanticIndexService) GetIngestDocumentProjectionForCorpus(
 		return KnowledgeDocumentProjection{}, ErrSemanticIndexNotFound
 	}
 	return repository.GetIngestDocumentProjectionForCorpus(ctx, ownerID, corpusID, documentID)
+}
+
+// ListRecoverableIngestJobsForCorpus exposes only renderer-recoverable root
+// ingest jobs. Lease/checkpoint internals remain repository-private.
+func (s *SemanticIndexService) ListRecoverableIngestJobsForCorpus(
+	ctx context.Context, ownerID, corpusID string,
+) ([]KnowledgeJob, error) {
+	repository, ok := s.ingestRepo.(interface {
+		ListRecoverableIngestJobsForCorpus(context.Context, string, string) ([]KnowledgeJob, error)
+	})
+	if !ok {
+		return nil, ErrDocumentIngestUnavailable
+	}
+	return repository.ListRecoverableIngestJobsForCorpus(ctx, ownerID, corpusID)
 }
 
 // GetPolicy is read-only. Corpus creation and initial auto scheduling require

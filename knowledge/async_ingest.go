@@ -51,13 +51,56 @@ type CreateDocumentInput struct {
 	Subject        string
 	Grade          string
 	VisionRoute    *VisionRouteSnapshot
+
+	// UploadOperationID is assigned by SemanticIndexService before bytes are
+	// persisted. It is an internal command correlation identity, not a caller-
+	// controlled field.
+	UploadOperationID string
 }
 
 type CreateDocumentResult struct {
+	OperationID      string           `json:"operation_id"`
 	DocumentID       string           `json:"document_id"`
 	JobID            string           `json:"job_id"`
 	TextIndexState   TextIndexState   `json:"text_index_state"`
 	VectorIndexState VectorIndexState `json:"vector_index_state"`
+}
+
+// UploadOperationState is the complete renderer-visible lifecycle of one
+// accepted upload intent. The pre-job states are durable facts owned by the
+// upload ledger; once bound, the asynchronous job is authoritative.
+type UploadOperationState string
+
+const (
+	UploadOperationReceiving       UploadOperationState = "receiving"
+	UploadOperationPendingResponse UploadOperationState = "pending_response"
+	UploadOperationQueued          UploadOperationState = "queued"
+	UploadOperationRunning         UploadOperationState = "running"
+	UploadOperationRetryWait       UploadOperationState = "retry_wait"
+	UploadOperationSucceeded       UploadOperationState = "succeeded"
+	UploadOperationFailed          UploadOperationState = "failed"
+	UploadOperationCancelled       UploadOperationState = "cancelled"
+)
+
+// UploadOperationProjection is the read-only durable recovery contract. Owner
+// and corpus UID remain private so transport adapters cannot accidentally
+// expose authorization scope or use them as caller-provided routing fields.
+type UploadOperationProjection struct {
+	OperationID   string               `json:"operation_id"`
+	OwnerID       string               `json:"-"`
+	CorpusID      string               `json:"corpus_id"`
+	DocumentID    string               `json:"document_id,omitempty"`
+	JobID         string               `json:"job_id,omitempty"`
+	DisplayName   string               `json:"display_name"`
+	MediaType     string               `json:"media_type"`
+	SizeBytes     int64                `json:"size_bytes"`
+	ContentDigest string               `json:"content_digest,omitempty"`
+	State         UploadOperationState `json:"state"`
+	Stage         string               `json:"stage"`
+	Terminal      bool                 `json:"terminal"`
+	Error         string               `json:"error,omitempty"`
+	CreatedAt     time.Time            `json:"created_at"`
+	UpdatedAt     time.Time            `json:"updated_at"`
 }
 
 type IngestBlob struct {
