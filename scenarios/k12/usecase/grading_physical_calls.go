@@ -26,7 +26,9 @@ type GradingPhysicalCallResult struct {
 	InvocationID string
 }
 
-type gradingPhysicalCallExecutor interface {
+// GradingPhysicalCallExecutor is the shared durable boundary that authorizes
+// exactly one physical solve/verify/grade send for a K12 grading item.
+type GradingPhysicalCallExecutor interface {
 	ExecuteGradingPhysicalCall(
 		context.Context,
 		GradingPhysicalCallSpec,
@@ -38,7 +40,17 @@ type gradingPhysicalCallContextKey struct{}
 
 func withGradingPhysicalCallExecutor(
 	ctx context.Context,
-	executor gradingPhysicalCallExecutor,
+	executor GradingPhysicalCallExecutor,
+) context.Context {
+	return WithGradingPhysicalCallExecutor(ctx, executor)
+}
+
+// WithGradingPhysicalCallExecutor binds the canonical durable physical-call
+// executor to a request context. Engine adapters use the same fact to retain a
+// frozen assessing deadline; they must not manufacture a second executor.
+func WithGradingPhysicalCallExecutor(
+	ctx context.Context,
+	executor GradingPhysicalCallExecutor,
 ) context.Context {
 	return context.WithValue(ctx, gradingPhysicalCallContextKey{}, executor)
 }
@@ -47,7 +59,7 @@ func HasGradingPhysicalCallExecutor(ctx context.Context) bool {
 	if ctx == nil {
 		return false
 	}
-	executor, ok := ctx.Value(gradingPhysicalCallContextKey{}).(gradingPhysicalCallExecutor)
+	executor, ok := ctx.Value(gradingPhysicalCallContextKey{}).(GradingPhysicalCallExecutor)
 	return ok && executor != nil
 }
 
@@ -57,7 +69,7 @@ func ExecuteGradingPhysicalCall(
 	send func(context.Context) (string, error),
 ) (GradingPhysicalCallResult, error) {
 	if ctx != nil {
-		if executor, ok := ctx.Value(gradingPhysicalCallContextKey{}).(gradingPhysicalCallExecutor); ok &&
+		if executor, ok := ctx.Value(gradingPhysicalCallContextKey{}).(GradingPhysicalCallExecutor); ok &&
 			executor != nil {
 			return executor.ExecuteGradingPhysicalCall(ctx, spec, send)
 		}

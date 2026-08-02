@@ -2074,8 +2074,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			if grade != "" {
 				task += "\n（只使用" + grade + "已经学过的概念和方法。）"
 			}
-			cctx := egress.WithRequest(ctx, egress.PurposeGeneralChat,
-				"k12-parent-teaching-guide", egress.ClassGeneral)
+			cctx := k12ParentTeachingGuideRequestContext(ctx)
 			temp := 0.2
 			resp, err := provider.Complete(k12NonIdempotentLLMContext(cctx), hexagon.CompletionRequest{
 				Model: model,
@@ -3369,8 +3368,34 @@ func (e classifiedSolveExecutor) GradeVerified(ctx context.Context, problem, ver
 }
 
 func (e classifiedSolveExecutor) classify(ctx context.Context) context.Context {
-	return egress.WithRequest(ctx, egress.PurposeSolveVerify, "",
+	ctx = egress.WithRequest(ctx, egress.PurposeSolveVerify, "",
 		egress.ClassGeneral, egress.ClassSensitiveProfile)
+	return withK12StageResponseHeaderDeadline(ctx)
+}
+
+// withK12StageResponseHeaderDeadline carries the already-authoritative
+// per-stage context deadline into the guarded remote provider transport. It is
+// intentionally a request-local hint: the context deadline itself remains the
+// ultimate cap, and ordinary K12 calls without a durable deadline keep the
+// provider transport's default response-header guard.
+func withK12StageResponseHeaderDeadline(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return ctx
+	}
+	return egress.WithProviderRequestResponseHeaderTimeout(ctx, time.Until(deadline))
+}
+
+// k12ParentTeachingGuideRequestContext is deliberately separate from
+// classifiedSolveExecutor because the guide uses its dedicated generator
+// closure. It must nevertheless consume the exact same frozen stage deadline.
+func k12ParentTeachingGuideRequestContext(ctx context.Context) context.Context {
+	ctx = egress.WithRequest(ctx, egress.PurposeGeneralChat,
+		"k12-parent-teaching-guide", egress.ClassGeneral)
+	return withK12StageResponseHeaderDeadline(ctx)
 }
 
 func (r k12CronRegistrar) Register(ctx context.Context, kind string, spec k12usecase.CronSpec, platform, chatID, userID string) (string, error) {

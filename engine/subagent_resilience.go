@@ -85,7 +85,7 @@ func runSubAgentWithRetry(ctx context.Context, execFn SubAgentExecFunc, spec Sub
 	var lastRes SubAgentResult
 	// 尝试次数 = 1（首发）+ len(backoff)（重试）。
 	for attempt := 0; attempt <= len(subAgentRetryBackoff); attempt++ {
-		tryCtx, cancel := context.WithTimeout(ctx, perTry)
+		tryCtx, cancel := newSubAgentAttemptContext(ctx, perTry)
 		res, err := executeSubAgentCall(tryCtx, execFn, spec)
 		cancel()
 		if err == nil && strings.TrimSpace(res.Output) == "" {

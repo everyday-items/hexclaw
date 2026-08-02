@@ -6,10 +6,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 type contextKey struct{}
 type providerClientRequestKeyContextKey struct{}
+type providerRequestResponseHeaderTimeoutContextKey struct{}
 
 // WithProviderClientRequestKey binds a durable upstream request identity to
 // this request only. Provider transports may map it to an idempotency contract;
@@ -34,6 +36,42 @@ func ProviderClientRequestKeyFromContext(ctx context.Context) (string, bool) {
 	key, ok := ctx.Value(providerClientRequestKeyContextKey{}).(string)
 	key = strings.TrimSpace(key)
 	return key, ok && key != ""
+}
+
+// WithProviderRequestResponseHeaderTimeout binds a request-local upper bound
+// for the provider transport's response-header guard. A request deadline always
+// wins, and an already-bound stricter value is retained. This never changes a
+// shared client's transport configuration.
+func WithProviderRequestResponseHeaderTimeout(ctx context.Context, timeout time.Duration) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout <= 0 {
+		return ctx
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ctx
+		}
+		if timeout > remaining {
+			timeout = remaining
+		}
+	}
+	if existing, ok := ProviderRequestResponseHeaderTimeoutFromContext(ctx); ok && existing < timeout {
+		timeout = existing
+	}
+	return context.WithValue(ctx, providerRequestResponseHeaderTimeoutContextKey{}, timeout)
+}
+
+// ProviderRequestResponseHeaderTimeoutFromContext returns the request-local
+// response-header budget, if one was explicitly bound by the caller.
+func ProviderRequestResponseHeaderTimeoutFromContext(ctx context.Context) (time.Duration, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	timeout, ok := ctx.Value(providerRequestResponseHeaderTimeoutContextKey{}).(time.Duration)
+	return timeout, ok && timeout > 0
 }
 
 // requestEnvelope is mutable on purpose: a request acquires data classes while

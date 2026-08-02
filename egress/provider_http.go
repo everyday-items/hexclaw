@@ -284,7 +284,26 @@ func (t *providerOriginTransport) RoundTrip(req *http.Request) (*http.Response, 
 		clone.Header.Set("Idempotency-Key", key)
 		req = clone
 	}
-	return t.transport.RoundTrip(req)
+	transport := t.transport
+	if timeout, ok := ProviderRequestResponseHeaderTimeoutFromContext(req.Context()); ok {
+		if deadline, hasDeadline := req.Context().Deadline(); hasDeadline {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return nil, req.Context().Err()
+			}
+			if timeout > remaining {
+				timeout = remaining
+			}
+		}
+		if timeout > transport.ResponseHeaderTimeout {
+			// http.Transport is shared by every provider request. Clone it for the
+			// current durable stage only, otherwise a long K12 call could silently
+			// weaken the default guard for unrelated provider traffic.
+			transport = transport.Clone()
+			transport.ResponseHeaderTimeout = timeout
+		}
+	}
+	return transport.RoundTrip(req)
 }
 
 func providerEmbeddingRequest(req *http.Request) bool {

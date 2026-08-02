@@ -105,6 +105,12 @@ func (a *SolveAdapter) withGradingPhysicalCallInterceptor(ctx context.Context) c
 	if !usecase.HasGradingPhysicalCallExecutor(ctx) {
 		return ctx
 	}
+	// Only the durable K12 item path explicitly selects its frozen stage
+	// deadline as the authority. Ordinary engine callers retain their existing
+	// 3m/5m anti-hang guards even when they happen to carry a deadline.
+	if _, hasDeadline := ctx.Deadline(); hasDeadline {
+		ctx = engine.WithAuthoritativeCallerDeadline(ctx)
+	}
 	return engine.WithSubAgentCallInterceptor(ctx, engine.SubAgentCallInterceptorFunc(
 		func(
 			callCtx context.Context,

@@ -243,7 +243,7 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 	skipVerify := auto && complexity == complexityTrivial && !gradingMode // 批改需先得正确答案，不跳校验
 
 	// P2 防卡死：整次 solve 套总墙钟（solver 采样/多法 + verifier）。
-	runCtx, cancel := context.WithTimeout(ctx, orchestrateMaxWall)
+	runCtx, cancel := newSubAgentAttemptContext(ctx, orchestrateMaxWall)
 	defer cancel()
 
 	solveRunID := "solve-" + idgen.NanoID()
@@ -398,7 +398,7 @@ func (o *SolveSkill) GradeVerified(ctx context.Context, problem, verifiedSolutio
 		}
 	}
 
-	runCtx, cancel := context.WithTimeout(ctx, orchestrateMaxWall)
+	runCtx, cancel := newSubAgentAttemptContext(ctx, orchestrateMaxWall)
 	defer cancel()
 	runID := "grade-verified-" + idgen.NanoID()
 	o.registry.Start(&SubAgentRunRecord{
