@@ -14,7 +14,7 @@ func TestPermissionHook_DangerousToolBlocked(t *testing.T) {
 	hook := NewPermissionHook(hub)
 	// No sender → dangerous tools auto-denied
 
-	ctx := context.WithValue(context.Background(), ctxKeySessionID, "test-sess")
+	ctx := context.WithValue(permissionTestContext(context.Background()), ctxKeySessionID, "test-sess")
 
 	// shell is classified as dangerous
 	err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "shell", Source: "skill"})
@@ -35,16 +35,13 @@ func TestPermissionHook_ApprovalFlow(t *testing.T) {
 	hub.SetSender(sender)
 	hook := NewPermissionHook(hub)
 
-	ctx := context.WithValue(context.Background(), ctxKeySessionID, "test-sess")
+	ctx := context.WithValue(permissionTestContext(context.Background()), ctxKeySessionID, "test-sess")
 
 	// Simulate async user approval
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		if sender.getLastReq() != nil {
-			hub.HandleResponse(PermissionResponse{
-				RequestID: sender.getLastReq().ID,
-				Approved:  true,
-			})
+		if req := sender.getLastReq(); req != nil {
+			hub.HandleResponse(exactPermissionTestResponse(req, "test-sess", true, false))
 		}
 	}()
 
@@ -60,15 +57,12 @@ func TestPermissionHook_DenialFlow(t *testing.T) {
 	hub.SetSender(sender)
 	hook := NewPermissionHook(hub)
 
-	ctx := context.WithValue(context.Background(), ctxKeySessionID, "test-sess")
+	ctx := context.WithValue(permissionTestContext(context.Background()), ctxKeySessionID, "test-sess")
 
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		if sender.getLastReq() != nil {
-			hub.HandleResponse(PermissionResponse{
-				RequestID: sender.getLastReq().ID,
-				Approved:  false,
-			})
+		if req := sender.getLastReq(); req != nil {
+			hub.HandleResponse(exactPermissionTestResponse(req, "test-sess", false, false))
 		}
 	}()
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -157,8 +158,13 @@ func TestKnowledgeConfig_PersistFailureKeepsRuntimeConfig(t *testing.T) {
 	custom.MinScore = 0.85
 	custom.CandidateK = 50
 	srv, mgr := newKBConfigServer(t, knowledge.WithHybridConfig(custom))
-	// 不创建父目录，确保 Writer 的原子临时文件创建失败。
-	srv.SetCfgWriter(config.NewWriter(filepath.Join(t.TempDir(), "missing", "hexclaw.yaml")))
+	// 用普通文件占据父目录位置，稳定制造 MkdirAll 失败。Writer 现在会按生产
+	// 语义主动创建缺失目录，因此“目录不存在”本身已不再是持久化失败条件。
+	blockedParent := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedParent, []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv.SetCfgWriter(config.NewWriter(filepath.Join(blockedParent, "hexclaw.yaml")))
 
 	w := putKBConfig(t, srv, `{"rerank":false,"query_expand":false,"contextual":false,"min_score":0.2,"candidate_k":20,"rerank_model":"reranker-x"}`)
 	if w.Code != http.StatusInternalServerError {

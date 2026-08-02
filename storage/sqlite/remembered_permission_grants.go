@@ -1,6 +1,10 @@
 package sqlite
 
-import "context"
+import (
+	"context"
+
+	"github.com/hexagon-codes/hexclaw/storage"
+)
 
 func (s *Store) HasRememberedGrant(
 	ctx context.Context,
@@ -12,8 +16,10 @@ func (s *Store) HasRememberedGrant(
 			SELECT 1 FROM remembered_permission_grants
 			WHERE owner_id = ? AND resolved_session_id = ?
 			  AND canonical_tool_name = ? AND security_scope_digest = ?
+			  AND active = 1 AND schema_version = ?
 		)`,
 		ownerID, resolvedSessionID, canonicalToolName, securityScopeDigest,
+		storage.CurrentToolApprovalScopeSchemaVersion,
 	).Scan(&exists)
 	return exists == 1, err
 }
@@ -22,22 +28,14 @@ func (s *Store) RememberGrant(
 	ctx context.Context,
 	ownerID, resolvedSessionID, canonicalToolName, securityScopeDigest string,
 ) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO remembered_permission_grants (
-			owner_id, resolved_session_id, canonical_tool_name, security_scope_digest
-		) VALUES (?, ?, ?, ?)
-		ON CONFLICT (
-			owner_id, resolved_session_id, canonical_tool_name, security_scope_digest
-		) DO NOTHING`,
-		ownerID, resolvedSessionID, canonicalToolName, securityScopeDigest,
-	)
-	return err
+	// Production SQLite grants may only be minted by DecideToolApproval, where
+	// request identity, decision, release intent and ACK share one transaction.
+	// Keep this method solely to satisfy the legacy narrow interface used by
+	// non-durable in-memory test stores; fail closed for SQLite.
+	_, _, _, _, _ = ctx, ownerID, resolvedSessionID, canonicalToolName, securityScopeDigest
+	return storage.ErrToolApprovalDecisionRequired
 }
 
 func (s *Store) DeleteRememberedGrants(ctx context.Context, resolvedSessionID string) error {
-	_, err := s.db.ExecContext(ctx,
-		`DELETE FROM remembered_permission_grants WHERE resolved_session_id = ?`,
-		resolvedSessionID,
-	)
-	return err
+	return s.RevokeSessionToolApprovals(ctx, resolvedSessionID, "session_authority_cleared")
 }

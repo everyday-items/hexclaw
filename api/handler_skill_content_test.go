@@ -2,6 +2,9 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -89,11 +92,34 @@ func newClawHubContentServer(t *testing.T) *Server {
 	if err := os.WriteFile(filepath.Join(repoDir, "skills", "demo.md"), []byte(md), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	index := `{"version":"1.0","skills":[` +
-		`{"name":"demo","description":"a hub skill","type":"skill"},` +
-		`{"name":"some-mcp","description":"an mcp entry","type":"mcp"}` +
-		`]}`
-	if err := os.WriteFile(filepath.Join(repoDir, "index.json"), []byte(index), 0o644); err != nil {
+	digest := sha256.Sum256([]byte(md))
+	index, err := json.Marshal(map[string]any{
+		"version": "1.0",
+		"skills": []map[string]any{
+			{"name": "demo", "description": "a hub skill", "type": "skill", "size": len(md), "sha256": hex.EncodeToString(digest[:])},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "index.json"), index, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := json.Marshal(map[string]any{
+		"version": "1.0",
+		"servers": []map[string]any{
+			{
+				"name":              "some-mcp",
+				"description":       "an mcp entry",
+				"status":            "quarantined",
+				"quarantine_reason": "content endpoint fixture",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "mcp-registry.json"), registry, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	h := hub.New(hub.HubConfig{RepoURL: "file://" + repoDir, Branch: "main"}, t.TempDir())

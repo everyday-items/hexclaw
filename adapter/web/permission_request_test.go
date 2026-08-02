@@ -11,9 +11,9 @@ import (
 	"nhooyr.io/websocket/wsjson"
 )
 
-func TestWebAdapter_SendPermissionRequestBroadcastsWhenSessionBindingMissing(t *testing.T) {
+func TestWebAdapter_SendPermissionRequestFailsClosedWhenSessionBindingMissing(t *testing.T) {
 	a := New()
-	conn, ctx, _ := dialWebAdapter(t, a)
+	_, ctx, _ := dialWebAdapter(t, a)
 	waitForWebAdapterConnections(t, a, 1)
 
 	err := a.SendPermissionRequest(ctx, "sess-missing-binding", &PermissionRequestData{
@@ -22,25 +22,8 @@ func TestWebAdapter_SendPermissionRequestBroadcastsWhenSessionBindingMissing(t *
 		Risk:     "high",
 		Reason:   "execute code",
 	})
-	if err != nil {
-		t.Fatalf("SendPermissionRequest returned error: %v", err)
-	}
-
-	var frame wsMessage
-	if err := wsjson.Read(ctx, conn, &frame); err != nil {
-		t.Fatalf("read approval frame failed: %v", err)
-	}
-	if frame.Type != "tool_approval_request" {
-		t.Fatalf("frame type = %q, want tool_approval_request", frame.Type)
-	}
-	if frame.SessionID != "sess-missing-binding" {
-		t.Fatalf("session_id = %q, want sess-missing-binding", frame.SessionID)
-	}
-	if frame.RequestID != "approval-1" {
-		t.Fatalf("request_id = %q, want approval-1", frame.RequestID)
-	}
-	if frame.Metadata["tool_name"] != "code_exec" {
-		t.Fatalf("tool_name = %q, want code_exec", frame.Metadata["tool_name"])
+	if err == nil {
+		t.Fatal("missing session binding must fail closed instead of broadcasting approval")
 	}
 }
 
@@ -61,6 +44,7 @@ func TestPermissionRequestMessagePreservesFrozenArgumentsAndScopeIdentity(t *tes
 	setPermissionRequestDataField(t, data, "InvocationID", "invocation-wire-1")
 	setPermissionRequestDataField(t, data, "ArgumentsDigest", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	setPermissionRequestDataField(t, data, "SecurityScopeDigest", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	setPermissionRequestDataField(t, data, "ScopeSchemaVersion", 1)
 	setPermissionRequestDataField(t, data, "DeadlineAt", time.Unix(1_800_000_000, 0).UTC())
 
 	raw, err := json.Marshal(permissionRequestMessage("session-wire-1", data))
@@ -83,6 +67,9 @@ func TestPermissionRequestMessagePreservesFrozenArgumentsAndScopeIdentity(t *tes
 	assertWireString(t, payload, "tool_name", "file_edit")
 	assertWireString(t, payload, "arguments_digest", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	assertWireString(t, payload, "security_scope_digest", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	if got := payload["scope_schema_version"]; got != float64(1) {
+		t.Errorf("wire scope_schema_version = %#v, want 1", got)
+	}
 	if deadline, ok := payload["deadline_at"].(string); !ok || deadline == "" {
 		t.Errorf("wire deadline_at = %#v, want non-empty backend timestamp", payload["deadline_at"])
 	}
@@ -92,11 +79,14 @@ func TestPermissionRequestMessagePreservesFrozenArgumentsAndScopeIdentity(t *tes
 func TestWebAdapter_ToolApprovalResponseReturnsIdempotentACK(t *testing.T) {
 	a := New()
 	conn, ctx, _ := dialWebAdapter(t, a)
+	waitForWebAdapterConnections(t, a, 1)
+	chatID := onlyWebAdapterChatID(t, a)
 	a.SetApprovalResponseHandler(func(_ string, _, _ bool) {})
 
 	response := wsMessage{
-		Type:    "tool_approval_response",
-		Content: "approved_remember",
+		Type:       "tool_approval_response",
+		Content:    "approved_remember",
+		DecisionID: "decision-ack-1",
 		Metadata: map[string]string{
 			"request_id":            "approval-ack-1",
 			"approval_request_id":   "approval-ack-1",
@@ -107,6 +97,10 @@ func TestWebAdapter_ToolApprovalResponseReturnsIdempotentACK(t *testing.T) {
 			"security_scope_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		},
 	}
+	seedApprovalTransportBinding(a, "approval-ack-1", "desktop-user", "session-ack-1", chatID,
+		"invocation-ack-1",
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 
 	first := writeApprovalResponseAndReadACK(t, ctx, conn, response)
 	second := writeApprovalResponseAndReadACK(t, ctx, conn, response)
@@ -139,11 +133,14 @@ func TestWebAdapter_ToolApprovalResponseReturnsIdempotentACK(t *testing.T) {
 
 // Cross-repository contract: hexclaw-desktop sends a stable decision_id on
 // the owning request socket and waits for top-level ACK correlation/status.
-func TestWebAdapter_DesktopApprovalDecisionWireCompatibility(t *testing.T) {
+func TestWebAdapter_DesktopApprovalDecisionOwningSocketWireCompatibility(t *testing.T) {
 	a := New()
 	firstConn, ctx, _ := dialWebAdapter(t, a)
+	waitForWebAdapterConnections(t, a, 1)
+	firstChatID := onlyWebAdapterChatID(t, a)
 	secondConn, _, _ := dialWebAdapter(t, a)
 	waitForWebAdapterConnections(t, a, 2)
+	_ = secondConn
 
 	callbacks := 0
 	a.SetApprovalDecisionHandler(func(data ApprovalResponseData) string {
@@ -177,9 +174,13 @@ func TestWebAdapter_DesktopApprovalDecisionWireCompatibility(t *testing.T) {
 			"security_scope_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		},
 	}
+	seedApprovalTransportBinding(a, "approval-desktop-1", "desktop-user", "session-desktop-1", firstChatID,
+		"invocation-desktop-1",
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 
 	first := writeRawApprovalResponseAndReadACK(t, ctx, firstConn, response)
-	second := writeRawApprovalResponseAndReadACK(t, ctx, secondConn, response)
+	second := writeRawApprovalResponseAndReadACK(t, ctx, firstConn, response)
 	for key, want := range map[string]string{
 		"type":        "tool_approval_ack",
 		"request_id":  "approval-desktop-1",
@@ -212,18 +213,22 @@ func TestWebAdapter_DesktopApprovalDecisionWireCompatibility(t *testing.T) {
 			"request_id":  tc.requestID,
 			"decision_id": tc.decisionID,
 			"metadata": map[string]string{
-				"request_id":      tc.requestID,
-				"decision_id":     tc.decisionID,
-				"invocation_id":   "invocation-" + tc.requestID,
-				"decision":        "approved_once",
-				"idempotency_key": "idempotency-" + tc.requestID,
+				"request_id":            tc.requestID,
+				"decision_id":           tc.decisionID,
+				"invocation_id":         "invocation-" + tc.requestID,
+				"decision":              "approved_once",
+				"idempotency_key":       "idempotency-" + tc.requestID,
+				"arguments_digest":      "args-" + tc.requestID,
+				"security_scope_digest": "scope-" + tc.requestID,
 			},
 		}
+		seedApprovalTransportBinding(a, tc.requestID, "desktop-user", "session-"+tc.requestID, firstChatID,
+			"invocation-"+tc.requestID, "args-"+tc.requestID, "scope-"+tc.requestID)
 		ack := writeRawApprovalResponseAndReadACK(t, ctx, firstConn, terminalResponse)
 		if got := ack["status"]; got != tc.wantStatus {
 			t.Errorf("%s ACK status = %#v, want %s", tc.requestID, got, tc.wantStatus)
 		}
-		duplicate := writeRawApprovalResponseAndReadACK(t, ctx, secondConn, terminalResponse)
+		duplicate := writeRawApprovalResponseAndReadACK(t, ctx, firstConn, terminalResponse)
 		if got := duplicate["status"]; got != tc.wantStatus {
 			t.Errorf("duplicate %s ACK status = %#v, want stable %s", tc.requestID, got, tc.wantStatus)
 		}
@@ -231,6 +236,27 @@ func TestWebAdapter_DesktopApprovalDecisionWireCompatibility(t *testing.T) {
 	if callbacks != 3 {
 		t.Errorf("durable decision callback count = %d, want 3 with reconnect duplicate invoked once", callbacks)
 	}
+}
+
+func onlyWebAdapterChatID(t *testing.T, a *WebAdapter) string {
+	t.Helper()
+	var ids []string
+	a.conns.Range(func(key, _ any) bool {
+		ids = append(ids, key.(string))
+		return true
+	})
+	if len(ids) != 1 {
+		t.Fatalf("active WebSocket ids=%v, want exactly one", ids)
+	}
+	return ids[0]
+}
+
+func seedApprovalTransportBinding(a *WebAdapter, requestID, ownerID, sessionID, chatID, invocationID, argsDigest, scopeDigest string) {
+	a.approvalBindings.Store(requestID, approvalTransportBinding{
+		requestID: requestID, ownerID: ownerID, sessionID: sessionID, chatID: chatID,
+		invocationID: invocationID, argumentsDigest: argsDigest, securityScopeDigest: scopeDigest,
+		scopeSchemaVersion: 1, expiresAt: time.Now().Add(time.Minute),
+	})
 }
 
 // REG-TOOL-APPROVAL-TRANSPORT-001
@@ -274,11 +300,9 @@ func TestWebAdapter_RejectsLegacyDecisionAndMissingIdempotencyKey(t *testing.T) 
 	if callbacks != 0 {
 		t.Fatalf("invalid response reached approval coordinator %d time(s), want 0", callbacks)
 	}
-	cached := 0
-	a.approvalACKs.Range(func(_, _ any) bool {
-		cached++
-		return true
-	})
+	a.approvalACKMu.Lock()
+	cached := len(a.approvalACKs)
+	a.approvalACKMu.Unlock()
 	if cached != 0 {
 		t.Fatalf("invalid responses populated %d ACK cache record(s), want 0", cached)
 	}

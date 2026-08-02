@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -58,7 +60,31 @@ func writeLocalHubCatalog(t *testing.T, repoDir string, indexJSON string, mcpReg
 	if err := os.MkdirAll(filepath.Join(repoDir, "skills"), 0o755); err != nil {
 		t.Fatalf("创建本地 hub skills 目录失败: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(repoDir, "index.json"), []byte(indexJSON), 0o644); err != nil {
+	var index map[string]any
+	if err := json.Unmarshal([]byte(indexJSON), &index); err != nil {
+		t.Fatalf("解析本地 hub index.json 夹具失败: %v", err)
+	}
+	if skills, ok := index["skills"].([]any); ok {
+		for _, item := range skills {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := entry["name"].(string)
+			content, exists := skillFiles[name]
+			if !exists {
+				continue
+			}
+			digest := sha256.Sum256([]byte(content))
+			entry["size"] = len(content)
+			entry["sha256"] = hex.EncodeToString(digest[:])
+		}
+	}
+	indexBytes, err := json.Marshal(index)
+	if err != nil {
+		t.Fatalf("编码本地 hub index.json 夹具失败: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "index.json"), indexBytes, 0o644); err != nil {
 		t.Fatalf("写入本地 hub index.json 失败: %v", err)
 	}
 	if mcpRegistryJSON == "" {
@@ -337,7 +363,7 @@ func TestHandleInstallSkill_ClawHubMCPEntry_DoesNotFallbackToMarkdownSkillInstal
 		t,
 		repoDir,
 		`{"version":"1.0.0","updated_at":"2026-04-08T00:00:00Z","skills":[]}`,
-		`{"servers":[{"name":"filesystem","display_name":"Filesystem","description":"Read local files","category":"automation","type":"mcp","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem"],"downloads":1,"rating":4.8}]}`,
+		`{"servers":[{"name":"filesystem","display_name":"Filesystem","description":"Read local files","category":"automation","type":"mcp","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem@2026.7.10"],"status":"pinned","artifact":{"ecosystem":"npm","package":"@modelcontextprotocol/server-filesystem","version":"2026.7.10","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","source_registry":"https://registry.npmjs.org"},"downloads":1,"rating":4.8}]}`,
 		nil,
 	)
 

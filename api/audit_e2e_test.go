@@ -417,12 +417,12 @@ func TestE2E_CORS_UntrustedOrigin_NoACAO(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 闭环 9：鉴权中间件——非 loopback 的写操作（无 Token 配置）→ 403
+// 闭环 9：鉴权中间件——非 loopback 的写操作（无 Token 配置）→ 401
 // （用 srv.routes() + 伪造非 loopback RemoteAddr，验证 auth 中间件闭环；
 //  httptest.NewServer 的连接固定来自 127.0.0.1 会触发 loopback 放行，无法测此路径）
 // ─────────────────────────────────────────────────────────────────────────────
 
-func TestE2E_Auth_NonLoopbackWrite_NoToken_403(t *testing.T) {
+func TestE2E_Auth_NonLoopbackWrite_NoToken_401(t *testing.T) {
 	srv := NewServer(config.DefaultConfig(), &mockEngine{reply: &adapter.Reply{Content: "ok"}}, nil, nil)
 
 	// PUT /api/v1/config/llm 属于受保护写操作（非 chat / 非 webhook）
@@ -433,8 +433,8 @@ func TestE2E_Auth_NonLoopbackWrite_NoToken_403(t *testing.T) {
 
 	srv.routes().ServeHTTP(w, req)
 
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("未配置 Token 的非本机写操作状态码 = %d, 期望 403, body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("未配置 Token 的非本机写操作状态码 = %d, 期望 401, body=%s", w.Code, w.Body.String())
 	}
 }
 
@@ -483,9 +483,10 @@ func TestE2E_Auth_NonLoopbackWrite_WithToken_ValidHeader_PassesAuth(t *testing.T
 	}
 }
 
-// chat 端点豁免鉴权：非 loopback 也能打 chat（POST 但 path == /api/v1/chat）
-func TestE2E_Auth_ChatExemptFromAuth_NonLoopback(t *testing.T) {
-	srv := NewServer(config.DefaultConfig(), &mockEngine{reply: &adapter.Reply{Content: "ok"}}, nil, nil)
+// chat 与全部受保护 API 共用同一认证边界。
+func TestE2E_Auth_ChatRequiresAuth_NonLoopback(t *testing.T) {
+	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
+	srv := NewServer(config.DefaultConfig(), eng, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", strings.NewReader(`{"message":"hi","user_id":"u1"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -494,8 +495,11 @@ func TestE2E_Auth_ChatExemptFromAuth_NonLoopback(t *testing.T) {
 
 	srv.routes().ServeHTTP(w, req)
 
-	if w.Code == http.StatusUnauthorized || w.Code == http.StatusForbidden {
-		t.Fatalf("chat 端点应豁免鉴权, 实际状态码 = %d, body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("chat 端点缺失 capability 应返回 401, 实际状态码 = %d, body=%s", w.Code, w.Body.String())
+	}
+	if eng.calls != 0 {
+		t.Fatalf("未认证 remote chat 不得到达 engine, calls=%d", eng.calls)
 	}
 }
 

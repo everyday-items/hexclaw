@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/knowledge"
@@ -24,10 +25,19 @@ type documentIngestHTTPStub struct {
 	t                 *testing.T
 	consumedBytes     int64
 	createCallCount   int
+	ackCallCount      int
 	ownerID           string
 	corpusID          string
 	projection        *knowledge.KnowledgeDocumentProjection
 	vectorProjections map[string]knowledge.DocumentVectorProjection
+	createStarted     chan struct{}
+}
+
+func (s *documentIngestHTTPStub) MarkUploadResponseDelivered(
+	context.Context, string, string, string,
+) error {
+	s.ackCallCount++
+	return nil
 }
 
 func (s *documentIngestHTTPStub) ListDocumentVectorProjections(
@@ -66,6 +76,9 @@ func (s *documentIngestHTTPStub) CreateDocument(
 	input knowledge.CreateDocumentInput,
 ) (knowledge.CreateDocumentResult, error) {
 	s.createCallCount++
+	if s.createStarted != nil {
+		close(s.createStarted)
+	}
 	s.ownerID, s.corpusID = ownerID, corpusID
 	if input.IdempotencyKey != "six-upper-fixture" || input.Filename != "六上数学.pdf" ||
 		input.MediaType != "application/pdf" || input.Subject != "数学" || input.Grade != "六年级上" {
@@ -77,9 +90,87 @@ func (s *documentIngestHTTPStub) CreateDocument(
 	}
 	s.consumedBytes = consumed
 	return knowledge.CreateDocumentResult{
-		DocumentID: "doc-async", JobID: "job-async",
+		OperationID: "upload-async", DocumentID: "doc-async", JobID: "job-async",
 		TextIndexState: knowledge.TextIndexPending, VectorIndexState: knowledge.VectorIndexPending,
 	}, nil
+}
+
+func TestKnowledgeMultipartPersistsUploadIntentBeforeReadingFileBytes(t *testing.T) {
+	stub := &documentIngestHTTPStub{t: t, createStarted: make(chan struct{})}
+	srv := NewServer(config.DefaultConfig(), nil, nil, nil)
+	srv.SetSemanticIndexService(stub)
+
+	reader, writer := io.Pipe()
+	multipartWriter := multipart.NewWriter(writer)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/knowledge/documents", reader)
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+	req.Header.Set("Idempotency-Key", "six-upper-fixture")
+	rec := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		defer close(handlerDone)
+		srv.handleCreateKnowledgeDocument(rec, req)
+	}()
+
+	for key, value := range map[string]string{
+		"corpus_id": "default", "subject": "数学", "grade": "六年级上",
+	} {
+		if err := multipartWriter.WriteField(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	part, err := multipartWriter.CreateFormFile("file", "六上数学.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	intentBeforeBytes := false
+	select {
+	case <-stub.createStarted:
+		intentBeforeBytes = true
+	case <-time.After(500 * time.Millisecond):
+	}
+	if _, err := io.WriteString(part, "%PDF-1.6\ndurable bytes"); err != nil {
+		t.Fatal(err)
+	}
+	if err := multipartWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload handler did not finish")
+	}
+	if !intentBeforeBytes {
+		t.Fatal("CreateDocument/UploadIntent was not entered until after the multipart file body completed")
+	}
+	if rec.Code != http.StatusAccepted || stub.consumedBytes == 0 {
+		t.Fatalf("status=%d bytes=%d body=%s", rec.Code, stub.consumedBytes, rec.Body.String())
+	}
+}
+
+func TestKnowledgeMultipartRejectsKnownOversizeRequestBeforeParsingOrQueueing(t *testing.T) {
+	stub := &documentIngestHTTPStub{t: t}
+	srv := NewServer(config.DefaultConfig(), nil, nil, nil)
+	srv.SetSemanticIndexService(stub)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/knowledge/documents", strings.NewReader("must not be read"))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=known-size")
+	req.Header.Set("Idempotency-Key", "six-upper-fixture")
+	req.ContentLength = knowledge.MaxKnowledgeDocumentBytes + (2 << 20) + 1
+	rec := httptest.NewRecorder()
+
+	srv.handleCreateKnowledgeDocument(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("known oversize request status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if stub.createCallCount != 0 {
+		t.Fatalf("known oversize request queued %d document(s)", stub.createCallCount)
+	}
 }
 
 func TestKnowledgeDocumentsMultipartAcceptsFrozen57313616BytesAs202AndRetiresOldRoute(t *testing.T) {
@@ -163,7 +254,8 @@ func TestKnowledgeDocumentsMultipartAcceptsFrozen57313616BytesAs202AndRetiresOld
 		t.Fatal(err)
 	}
 	if resp.StatusCode != http.StatusAccepted || payload.DocumentID != "doc-async" ||
-		payload.JobID != "job-async" || stub.consumedBytes != size || stub.createCallCount != 1 ||
+		payload.JobID != "job-async" || payload.OperationID != "upload-async" ||
+		stub.consumedBytes != size || stub.createCallCount != 1 || stub.ackCallCount != 0 ||
 		stub.ownerID != "desktop-user" || stub.corpusID != "default" {
 		t.Fatalf("status=%d payload=%+v bytes=%d calls=%d", resp.StatusCode, payload,
 			stub.consumedBytes, stub.createCallCount)

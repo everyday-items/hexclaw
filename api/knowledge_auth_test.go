@@ -39,10 +39,7 @@ func TestKnowledgeEndpointsUseManagementAuthWithoutBreakingLoopbackDesktop(t *te
 				req.RemoteAddr = "203.0.113.42:54321"
 				rec := httptest.NewRecorder()
 				guarded.ServeHTTP(rec, req)
-				want := http.StatusForbidden
-				if withToken {
-					want = http.StatusUnauthorized
-				}
+				want := http.StatusUnauthorized
 				if rec.Code != want || reached {
 					t.Fatalf("%s %s remote status=%d reached=%v want=%d", endpoint.method, endpoint.path, rec.Code, reached, want)
 				}

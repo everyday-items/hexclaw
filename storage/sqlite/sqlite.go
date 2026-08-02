@@ -97,7 +97,8 @@ func New(dbPath string) (*Store, error) {
 	// modernc.org/sqlite 只认 _pragma=NAME(VALUE) 形式，原 DSN 的 _journal_mode=WAL / _busy_timeout=5000 是无效参数（历史 bug：
 	// WAL 从未生效，所以启动恢复时出现 data.db-journal 且主线程被 rollback 阻塞 4 分钟）。
 	dsn := dbPath +
-		"?_pragma=journal_mode(WAL)" +
+		"?_txlock=immediate" +
+		"&_pragma=journal_mode(WAL)" +
 		"&_pragma=busy_timeout(5000)" +
 		"&_pragma=foreign_keys(1)" +
 		"&_pragma=synchronous(NORMAL)" +
@@ -492,8 +493,8 @@ func (s *Store) DeleteSession(ctx context.Context, id string) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM remembered_permission_grants WHERE resolved_session_id = ?`, id,
+	if err := fenceAndRevokeSessionToolAuthority(
+		ctx, tx, id, "session_deleted", time.Now().UTC(),
 	); err != nil {
 		return err
 	}

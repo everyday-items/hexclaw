@@ -11,6 +11,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/storage"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 )
@@ -22,6 +23,12 @@ const maxSessionTitleRunes = 200
 // --- 会话管理 API ---
 
 func sessionUserIDFromRequest(r *http.Request) string {
+	// Authentication middleware stamps an unforgeable principal in context.
+	// Query/body user_id remain a legacy direct-handler test/embedding fallback
+	// only; authenticated HTTP traffic must never be allowed to switch owners.
+	if userID := strings.TrimSpace(skill.AuthenticatedUserID(r.Context())); userID != "" {
+		return userID
+	}
 	// 优先从 query parameter 读取，其次从请求体 JSON 读取
 	userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
 	if userID != "" {
@@ -32,6 +39,9 @@ func sessionUserIDFromRequest(r *http.Request) string {
 
 // sessionUserIDFromRequestOrBody 从 query 或 body 中提取 user_id
 func sessionUserIDFromRequestOrBody(r *http.Request, bodyUserID string) string {
+	if userID := strings.TrimSpace(skill.AuthenticatedUserID(r.Context())); userID != "" {
+		return userID
+	}
 	userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
 	if userID != "" {
 		return userID
@@ -509,10 +519,7 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 		query = string([]rune(query)[:200])
 	}
 
-	userID := r.URL.Query().Get("user_id")
-	if userID == "" {
-		userID = "api-user"
-	}
+	userID := sessionUserIDFromRequest(r)
 
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
@@ -571,10 +578,7 @@ func (s *Server) handleForkSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := req.UserID
-	if userID == "" {
-		userID = "api-user"
-	}
+	userID := sessionUserIDFromRequestOrBody(r, req.UserID)
 	if _, err := s.getOwnedSession(r, sessionID, userID); err != nil {
 		writeSessionLookupError(w, err)
 		return

@@ -405,37 +405,32 @@ func TestServer_ChatPlatformResolution(t *testing.T) {
 		body         string
 		origin       string
 		wantPlatform adapter.Platform
-		wantCode     int
 	}{
 		{
-			name:         "默认API平台",
+			name:         "默认 API principal",
 			body:         `{"message":"你好","user_id":"api-user"}`,
 			wantPlatform: adapter.PlatformAPI,
-			wantCode:     http.StatusOK,
 		},
 		{
-			name:         "显式desktop平台",
+			name:         "忽略 body desktop claim",
 			body:         `{"message":"你好","platform":"desktop","user_id":"u1"}`,
-			wantPlatform: adapter.PlatformDesktop,
-			wantCode:     http.StatusOK,
+			wantPlatform: adapter.PlatformAPI,
 		},
 		{
-			name:         "tauri origin自动识别desktop",
+			name:         "忽略未经认证的 Tauri origin claim",
 			body:         `{"message":"你好"}`,
 			origin:       "tauri://localhost",
-			wantPlatform: adapter.PlatformDesktop,
-			wantCode:     http.StatusOK,
+			wantPlatform: adapter.PlatformAPI,
 		},
 		{
-			name:         "桌面兼容用户ID自动识别desktop",
+			name:         "忽略 desktop user claim",
 			body:         `{"message":"你好","user_id":"desktop-user"}`,
-			wantPlatform: adapter.PlatformDesktop,
-			wantCode:     http.StatusOK,
+			wantPlatform: adapter.PlatformAPI,
 		},
 		{
-			name:     "拒绝不支持的平台",
-			body:     `{"message":"你好","platform":"telegram"}`,
-			wantCode: http.StatusBadRequest,
+			name:         "未知 platform claim 不携带权限",
+			body:         `{"message":"你好","platform":"telegram"}`,
+			wantPlatform: adapter.PlatformAPI,
 		},
 	}
 
@@ -459,14 +454,8 @@ func TestServer_ChatPlatformResolution(t *testing.T) {
 
 			srv.handleChat(w, req)
 
-			if w.Code != tt.wantCode {
-				t.Fatalf("期望 %d，实际 %d, body: %s", tt.wantCode, w.Code, w.Body.String())
-			}
-			if tt.wantCode != http.StatusOK {
-				if eng.calls != 0 {
-					t.Fatalf("失败请求不应调用引擎，实际调用 %d 次", eng.calls)
-				}
-				return
+			if w.Code != http.StatusOK {
+				t.Fatalf("期望 %d，实际 %d, body: %s", http.StatusOK, w.Code, w.Body.String())
 			}
 			if eng.lastMsg == nil || eng.lastMsg.Platform != tt.wantPlatform {
 				t.Fatalf("平台不匹配: %#v", eng.lastMsg)

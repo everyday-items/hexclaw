@@ -12,6 +12,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
+	"github.com/hexagon-codes/hexclaw/skill/hub"
 )
 
 // BUG-20260627（BUG-20260626 链路续审）：MCP 市场「点击安装没反应/装不上」的第二条成因——
@@ -36,7 +37,25 @@ func TestBug20260627_HubMCPInstall_ColdInstallNotHardFail(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/api/v1/skills/install", nil)
 	w := httptest.NewRecorder()
-	srv.installMCPFromClawHubEntry(w, req, "filesystem", "npx", []string{"-y", "@modelcontextprotocol/server-filesystem"}, "需配置目录")
+	entry, err := hub.ValidatePinnedMCPServer(hub.MCPServerMetaFromSkill(hub.SkillMeta{
+		Name:       "filesystem",
+		Type:       "mcp",
+		Command:    "npx",
+		Args:       []string{"-y", "@modelcontextprotocol/server-filesystem@2026.7.10"},
+		ConfigHint: "需配置目录",
+		Status:     "pinned",
+		Artifact: &hub.MCPArtifact{
+			Ecosystem:      "npm",
+			Package:        "@modelcontextprotocol/server-filesystem",
+			Version:        "2026.7.10",
+			Integrity:      "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+			SourceRegistry: "https://registry.npmjs.org",
+		},
+	}))
+	if err != nil {
+		t.Fatalf("validate pinned test entry: %v", err)
+	}
+	srv.installMCPFromClawHubEntry(w, req, entry)
 
 	// ① 冷装即时连接失败不应硬失败（旧 strict AddServer → 400）。
 	if w.Code != http.StatusOK {

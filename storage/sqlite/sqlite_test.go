@@ -86,7 +86,7 @@ func TestSessionCRUD(t *testing.T) {
 }
 
 // REG-TOOL-APPROVAL-REUSE-001 / REG-TOOL-APPROVAL-LIFECYCLE-001
-func TestRememberedGrantV63ExactKeySurvivesReopenAndSessionDeleteCleansIt(t *testing.T) {
+func TestRememberedGrantV63ExactKeySurvivesReopenAndSessionDeleteRevokesIt(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "remembered-grants.db")
 	store, err := New(dbPath)
@@ -171,11 +171,20 @@ func TestRememberedGrantV63ExactKeySurvivesReopenAndSessionDeleteCleansIt(t *tes
 	}
 	if err := reopened.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM remembered_permission_grants
-		WHERE resolved_session_id = ?`, "session-grant-1").Scan(&count); err != nil {
-		t.Fatalf("count grants after session delete: %v", err)
+		WHERE resolved_session_id = ? AND active = 1`, "session-grant-1").Scan(&count); err != nil {
+		t.Fatalf("count active grants after session delete: %v", err)
 	}
 	if count != 0 {
-		t.Fatalf("remembered grants after session delete = %d, want 0", count)
+		t.Fatalf("active remembered grants after session delete = %d, want 0", count)
+	}
+	var revokedReason string
+	if err := reopened.db.QueryRowContext(ctx, `
+		SELECT revoked_reason FROM remembered_permission_grants
+		WHERE resolved_session_id = ?`, "session-grant-1").Scan(&revokedReason); err != nil {
+		t.Fatalf("read revoked grant audit after session delete: %v", err)
+	}
+	if revokedReason != "session_deleted" {
+		t.Fatalf("revoked grant reason = %q, want session_deleted", revokedReason)
 	}
 }
 

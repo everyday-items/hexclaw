@@ -42,11 +42,12 @@ const (
 //
 // 当前引擎仅消费图片附件，其余类型会在入口校验阶段被拒绝。
 type Attachment struct {
-	Type string `json:"type"`           // 当前仅支持 "image"
-	Name string `json:"name"`           // 文件名
-	Mime string `json:"mime"`           // MIME 类型 (image/png, application/pdf, ...)
-	Data string `json:"data,omitempty"` // base64 编码的文件内容
-	URL  string `json:"url,omitempty"`  // 文件 URL（与 Data 二选一）
+	ID   string `json:"attachment_id,omitempty"` // Sidecar staging 中的 owner-bound opaque ID
+	Type string `json:"type"`                    // 当前仅支持 "image"
+	Name string `json:"name"`                    // 文件名
+	Mime string `json:"mime"`                    // MIME 类型 (image/png, application/pdf, ...)
+	Data string `json:"data,omitempty"`          // base64 编码的文件内容
+	URL  string `json:"url,omitempty"`           // 文件 URL（与 Data 二选一）
 }
 
 // Message 统一消息模型

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/knowledge"
+	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
@@ -18,7 +19,17 @@ const (
 	knowledgeDefaultCorpusID    = "default"
 )
 
-func knowledgePrincipalID(*http.Request) string { return knowledgeDesktopPrincipalID }
+func knowledgePrincipalID(r *http.Request) string {
+	if r != nil {
+		if ownerID := strings.TrimSpace(skill.AuthenticatedUserID(r.Context())); ownerID != "" {
+			return ownerID
+		}
+	}
+	// Legacy direct-handler/embedded callers are desktop-local. Production HTTP
+	// always passes through apiAuthMiddleware and therefore uses the principal
+	// above; query/body user_id is intentionally never consulted.
+	return knowledgeDesktopPrincipalID
+}
 
 func requireSupportedKnowledgeCorpus(w http.ResponseWriter, corpusID string) bool {
 	if corpusID == knowledgeDefaultCorpusID {
@@ -62,6 +73,16 @@ type KnowledgeDocumentRetryAPI interface {
 // to Manager.GetDocument without implementing this interface.
 type KnowledgeDocumentProjectionAPI interface {
 	GetIngestDocumentProjectionForCorpus(context.Context, string, string, string) (knowledge.KnowledgeDocumentProjection, error)
+}
+
+type KnowledgeOperationProjectionAPI interface {
+	ListUploadOperationsForCorpus(
+		context.Context, string, string,
+	) ([]knowledge.UploadOperationProjection, error)
+}
+
+type KnowledgeUploadResponseAcknowledger interface {
+	MarkUploadResponseDelivered(context.Context, string, string, string) error
 }
 
 // KnowledgeDocumentVectorProjectionAPI enriches list/detail rows with the

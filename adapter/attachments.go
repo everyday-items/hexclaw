@@ -24,6 +24,12 @@ func ValidateAttachments(attachments []Attachment) error {
 		return fmt.Errorf("一次最多上传 %d 个文件哦，当前选了 %d 个", MaxAttachments, len(attachments))
 	}
 	for _, attachment := range attachments {
+		if strings.TrimSpace(attachment.ID) != "" {
+			if attachment.Type != "" || attachment.Name != "" || attachment.Mime != "" || attachment.Data != "" || attachment.URL != "" {
+				return fmt.Errorf("attachment_id 不能与客户端附件元数据或内容同时提交")
+			}
+			continue
+		}
 		if attachment.URL == "" && attachment.Data == "" {
 			return fmt.Errorf("文件 %s 内容为空，请重新选择", nameOrDefault(attachment.Name))
 		}

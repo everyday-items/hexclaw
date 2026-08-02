@@ -74,11 +74,11 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 			// flag OFF 退化到直接 Execute（与 v0.3 行为一致）。
 			if featureflag.Enabled(ctx, skill.FlagSkillPipelineV1) {
 				return e.executeWithHooks(ctx, call, func(ctx context.Context) (string, error) {
-					return e.runSkillViaPipeline(ctx, skillName, args)
+					return e.runSkillViaPipeline(ctx, skillName, call.Arguments)
 				})
 			}
 			return e.executeWithHooks(ctx, call, func(ctx context.Context) (string, error) {
-				result, err := s.Execute(ctx, args)
+				result, err := s.Execute(ctx, call.Arguments)
 				if err != nil {
 					return "", err
 				}
@@ -98,7 +98,7 @@ func (e *ToolExecutor) Execute(ctx context.Context, toolName string, args map[st
 	if e.mcpMgr != nil {
 		call.Source = "mcp"
 		return e.executeWithHooks(ctx, call, func(ctx context.Context) (string, error) {
-			result, owner, err := e.mcpMgr.CallToolWithOwner(ctx, toolName, args)
+			result, owner, err := e.mcpMgr.CallToolWithOwner(ctx, toolName, call.Arguments)
 			call.ServerName = owner
 			return result, err
 		})

@@ -158,8 +158,8 @@ func TestApiAuth_PathBypass(t *testing.T) {
 		expect int
 	}{
 		{"GET", "/api/v1/logs", "", http.StatusUnauthorized}, // 日志 API 需认证
-		{"GET", "/api/v1/sessions", "", http.StatusOK},
-		{"POST", "/api/v1/chat", "", http.StatusOK},
+		{"GET", "/api/v1/sessions", "", http.StatusUnauthorized},
+		{"POST", "/api/v1/chat", "", http.StatusUnauthorized},
 		{"POST", "/api/v1/webhooks/github", "", http.StatusOK},
 		{"POST", "/api/v1/webhooks", "", http.StatusUnauthorized},
 		{"POST", "/api/v1/cron/jobs", "", http.StatusUnauthorized},
@@ -313,8 +313,8 @@ func TestApiAuth_NoToken_LocalhostAllowed(t *testing.T) {
 	req.RemoteAddr = "10.0.0.1:9999"
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusForbidden {
-		t.Errorf("remote: status=%d, want 403", w.Code)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("remote: status=%d, want 401", w.Code)
 	}
 }
 

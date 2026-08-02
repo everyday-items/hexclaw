@@ -208,7 +208,7 @@ func TestK12WebhookAPIDoesNotAddPublicManagementRoutes(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(tc.method, tc.path, nil)
 		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusMethodNotAllowed && rec.Code != http.StatusNotFound {
+		if rec.Code != http.StatusUnauthorized && rec.Code != http.StatusMethodNotAllowed && rec.Code != http.StatusNotFound {
 			t.Fatalf("unexpected public route %s %s => %d", tc.method, tc.path, rec.Code)
 		}
 	}

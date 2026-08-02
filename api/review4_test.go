@@ -124,11 +124,9 @@ func TestLogCollector_Query_OffsetNegative(t *testing.T) {
 	_ = entries
 }
 
-// ── 4. isLogsAPI 匹配范围过宽 ──
+// ── 4. 全部 API v1 路径统一 deny-by-default ──
 
-func TestApiAuth_IsLogsAPI_MatchesTooMuch(t *testing.T) {
-	// isLogsAPI := strings.HasPrefix(path, "/api/v1/logs")
-	// 这也匹配 /api/v1/login, /api/v1/logout 等路径
+func TestApiAuth_AllAPIV1PathsRequireAuthentication(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Server.APIToken = "secret"
 	s := &Server{cfg: cfg, logCollector: NewLogCollector(10)}
@@ -138,27 +136,17 @@ func TestApiAuth_IsLogsAPI_MatchesTooMuch(t *testing.T) {
 	})
 	handler := s.apiAuthMiddleware(inner)
 
-	// 这些路径不应被 isLogsAPI 误匹配
-	for _, path := range []string{"/api/v1/login", "/api/v1/logout", "/api/v1/logstash"} {
-		req := httptest.NewRequest("GET", path, nil)
-		req.RemoteAddr = "evil.com:1234"
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, req)
-
-		if w.Code == http.StatusUnauthorized {
-			t.Errorf("path %q should NOT be matched by isLogsAPI, got 401", path)
-		}
-	}
-
-	// 但 /api/v1/logs 和 /api/v1/logs/* 应被保护
-	for _, path := range []string{"/api/v1/logs", "/api/v1/logs/stats", "/api/v1/logs/stream"} {
+	for _, path := range []string{
+		"/api/v1/login", "/api/v1/logout", "/api/v1/logstash",
+		"/api/v1/logs", "/api/v1/logs/stats", "/api/v1/logs/stream",
+	} {
 		req := httptest.NewRequest("GET", path, nil)
 		req.RemoteAddr = "evil.com:1234"
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, req)
 
 		if w.Code != http.StatusUnauthorized {
-			t.Errorf("path %q should be protected, got %d", path, w.Code)
+			t.Errorf("path %q should be protected by the API-wide guard, got %d", path, w.Code)
 		}
 	}
 }

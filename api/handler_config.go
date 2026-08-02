@@ -37,6 +37,8 @@ type LLMConfigResponse struct {
 type LLMProviderConfigResponse struct {
 	ProviderInstanceID    string                               `json:"provider_instance_id"`
 	DisplayName           string                               `json:"display_name,omitempty"`
+	CredentialRef         string                               `json:"credential_ref,omitempty"`
+	CredentialPresent     bool                                 `json:"credential_present"`
 	APIKey                string                               `json:"api_key"`
 	BaseURL               string                               `json:"base_url"`
 	Model                 string                               `json:"model"`
@@ -70,7 +72,8 @@ type LLMConfigUpdateRequest struct {
 type LLMProviderConfigUpdateItem struct {
 	ProviderInstanceID    string                              `json:"provider_instance_id,omitempty"`
 	DisplayName           string                              `json:"display_name,omitempty"`
-	APIKey                string                              `json:"api_key"`
+	APIKey                string                              `json:"api_key,omitempty"` // legacy only; mutually exclusive with api_key_mutation
+	APIKeyMutation        *APIKeyMutation                     `json:"api_key_mutation,omitempty"`
 	BaseURL               string                              `json:"base_url"`
 	Model                 string                              `json:"model"`
 	Models                []string                            `json:"models,omitempty"`
@@ -584,6 +587,8 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 		response := LLMProviderConfigResponse{
 			ProviderInstanceID:    config.EffectiveProviderInstanceID(name, p),
 			DisplayName:           p.DisplayName,
+			CredentialRef:         p.CredentialRef,
+			CredentialPresent:     strings.TrimSpace(p.APIKey) != "",
 			APIKey:                config.MaskAPIKey(p.APIKey),
 			BaseURL:               p.BaseURL,
 			Model:                 p.Model,
@@ -627,6 +632,33 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	mutationProof, err := newLLMConfigMutationProof(req, r.Header.Get("Idempotency-Key"))
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errLLMConfigMutationIDRequired) {
+			status = http.StatusPreconditionRequired
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+
+	// cfgMu also serializes idempotency replay checks with commit. Otherwise two
+	// concurrent requests using the same key could both observe the prior
+	// revision and apply the credential transition twice.
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	oldLLM := s.cfg.LLM
+	if replay, replayErr := replayLLMConfigMutation(oldLLM, mutationProof); replayErr != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(replayErr, errLLMConfigMutationConflict) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, map[string]string{"error": replayErr.Error()})
+		return
+	} else if replay != nil {
+		writeJSON(w, http.StatusOK, replay)
+		return
+	}
 
 	// keep_alive 边界校验（C4）：非法值此前原样存盘 + 原样经 llmrouter 下发，直到 Ollama
 	// 首次聊天才 400。非事务路径（flag OFF）完全跳过 Config.Validate，故在此显式兜底。
@@ -657,30 +689,19 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// cfgMu 串行 read-copy-save-apply（GO-7）：与其它配置写 handler 的浅拷贝读/
-	// 字段写同址竞争 + lost-update。
-	s.cfgMu.Lock()
-	defer s.cfgMu.Unlock()
-
-	oldLLM := s.cfg.LLM
 	nextLLM := oldLLM
+	credentialRefsToForget := make(map[string]struct{})
+	forgetSupersededCredentials := func() {
+		for ref := range credentialRefsToForget {
+			s.credentialResolver.Delete(ref)
+		}
+	}
 
 	// 更新 Providers
 	if req.Providers != nil {
 		newProviders := make(map[string]config.LLMProviderConfig, len(req.Providers))
 		for name, p := range req.Providers {
 			old, oldExists := oldLLM.Providers[name]
-			apiKey := p.APIKey
-			// 脱敏值 → 保留原有 Key
-			if config.IsMaskedKey(apiKey) {
-				if !oldExists {
-					writeJSON(w, http.StatusBadRequest, map[string]string{
-						"error": fmt.Sprintf("provider %q 的脱敏 API Key 没有可保留的旧配置", name),
-					})
-					return
-				}
-				apiKey = old.APIKey
-			}
 			providerInstanceID, err := resolveProviderInstanceID(name, old, oldExists, p.ProviderInstanceID)
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -688,10 +709,61 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 				})
 				return
 			}
+			credentialOld, credentialOldExists := old, oldExists
+			if !credentialOldExists {
+				for oldName, candidate := range oldLLM.Providers {
+					if config.EffectiveProviderInstanceID(oldName, candidate) == providerInstanceID {
+						credentialOld, credentialOldExists = candidate, true
+						break
+					}
+				}
+			}
+			apiKey := p.APIKey
+			credentialRef := ""
+			if p.APIKeyMutation != nil {
+				if strings.TrimSpace(p.APIKey) != "" {
+					writeJSON(w, http.StatusBadRequest, map[string]string{
+						"error": fmt.Sprintf("provider %q 的 api_key 与 api_key_mutation 不能同时提交", name),
+					})
+					return
+				}
+				apiKey, credentialRef, err = resolveProviderAPIKeyMutation(
+					r.Context(), providerInstanceID, credentialOld, credentialOldExists,
+					p.APIKeyMutation, s.credentialResolver,
+				)
+				if err != nil {
+					payload := map[string]string{
+						"error": fmt.Sprintf("provider %q 的 api_key_mutation 非法: %v", name, err),
+					}
+					if errors.Is(err, errCredentialRefNotHydrated) {
+						payload["code"] = "credential_ref_not_hydrated"
+					}
+					writeJSON(w, http.StatusUnprocessableEntity, payload)
+					return
+				}
+			} else {
+				// Legacy API remains decode-compatible during the Desktop migration.
+				// A masked value preserves both runtime secret and vault reference;
+				// plaintext/empty values explicitly return to the legacy inline mode.
+				if config.IsMaskedKey(apiKey) {
+					if !credentialOldExists {
+						writeJSON(w, http.StatusBadRequest, map[string]string{
+							"error": fmt.Sprintf("provider %q 的脱敏 API Key 没有可保留的旧配置", name),
+						})
+						return
+					}
+					apiKey = credentialOld.APIKey
+					credentialRef = credentialOld.CredentialRef
+				}
+			}
+			if credentialOld.CredentialRef != "" && credentialOld.CredentialRef != credentialRef {
+				credentialRefsToForget[credentialOld.CredentialRef] = struct{}{}
+			}
 			modelSpecsMode, modelSpecs := resolveProviderModelSpecs(old, oldExists, p)
 			candidate := config.LLMProviderConfig{
 				ProviderInstanceID:    providerInstanceID,
 				DisplayName:           p.DisplayName,
+				CredentialRef:         credentialRef,
 				APIKey:                apiKey,
 				BaseURL:               p.BaseURL,
 				Model:                 p.Model,
@@ -721,6 +793,25 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+		// The request replaces the provider map as a whole. Compute the
+		// old-to-next credential-ref difference as well as per-row mutations so
+		// removing a provider cannot leave its native secret resident in the
+		// process resolver. Deletion is still deferred until the config/runtime
+		// transaction has committed successfully.
+		nextCredentialRefs := make(map[string]struct{}, len(newProviders))
+		for _, provider := range newProviders {
+			if provider.CredentialRef != "" {
+				nextCredentialRefs[provider.CredentialRef] = struct{}{}
+			}
+		}
+		for _, provider := range oldLLM.Providers {
+			if provider.CredentialRef == "" {
+				continue
+			}
+			if _, retained := nextCredentialRefs[provider.CredentialRef]; !retained {
+				credentialRefsToForget[provider.CredentialRef] = struct{}{}
+			}
+		}
 		nextLLM.Providers = newProviders
 	}
 
@@ -746,6 +837,11 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+	}
+	mutationResponse, err := finalizeLLMConfigMutation(oldLLM, &nextLLM, mutationProof)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "LLM 配置提交证明生成失败"})
+		return
 	}
 
 	nextCfg := *s.cfg
@@ -806,7 +902,8 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 				s.reloadGenServices()
 			}
 			logger.Info("LLM 配置已通过事务热加载生效")
-			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			forgetSupersededCredentials()
+			writeJSON(w, http.StatusOK, mutationResponse)
 			return
 		}
 		// beginErr 非 nil（flag OFF / 已有事务） → 降级到老路径
@@ -858,9 +955,8 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	logger.Info("LLM 配置已更新、持久化并热生效")
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status": "ok",
-	})
+	forgetSupersededCredentials()
+	writeJSON(w, http.StatusOK, mutationResponse)
 }
 
 // handleTestLLMConfig POST /api/v1/config/llm/test

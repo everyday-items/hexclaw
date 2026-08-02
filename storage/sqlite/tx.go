@@ -101,6 +101,11 @@ func (s *txStore) ListSessions(ctx context.Context, userID string, limit, offset
 }
 
 func (s *txStore) DeleteSession(ctx context.Context, id string) error {
+	if err := fenceAndRevokeSessionToolAuthority(
+		ctx, s.tx, id, "session_deleted", time.Now().UTC(),
+	); err != nil {
+		return err
+	}
 	_, err := s.tx.ExecContext(ctx,
 		`UPDATE sessions SET status = -1, updated_at = ? WHERE id = ?`,
 		time.Now(), id,

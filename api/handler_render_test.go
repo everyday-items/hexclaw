@@ -64,8 +64,8 @@ func TestRenderRoute_NotMountedWithoutService(t *testing.T) {
 	if rec.Code >= 200 && rec.Code < 300 {
 		t.Errorf("/api/v1/render should not be reachable when renderSvc nil, got 2xx %d", rec.Code)
 	}
-	if rec.Code != http.StatusNotFound && rec.Code != http.StatusForbidden && rec.Code != http.StatusMethodNotAllowed {
-		t.Errorf("expected 404/403/405 when renderSvc nil, got %d", rec.Code)
+	if rec.Code != http.StatusUnauthorized && rec.Code != http.StatusNotFound && rec.Code != http.StatusForbidden && rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected deny-default 401/403/404/405 when renderSvc nil, got %d", rec.Code)
 	}
 }
 

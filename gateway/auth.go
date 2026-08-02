@@ -7,6 +7,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/toolkit/crypto/sign"
 )
 
@@ -40,7 +41,16 @@ func (l *AuthLayer) Name() string { return "auth" }
 //   - 允许匿名模式：直接通过
 //   - 平台消息（有 UserID）：视为已认证
 //   - API 消息：校验 auth_token（预配置列表 或 HMAC-SHA256 签名验证）
-func (l *AuthLayer) Check(_ context.Context, msg *adapter.Message) error {
+func (l *AuthLayer) Check(ctx context.Context, msg *adapter.Message) error {
+	if principal := skill.AuthenticatedUserID(ctx); principal != "" {
+		if msg == nil || msg.UserID != principal {
+			return &GatewayError{
+				Layer: "auth", Code: "principal_mismatch",
+				Message: "请求身份与已认证主体不一致",
+			}
+		}
+		return nil
+	}
 	// 允许匿名访问（仅 API 平台）
 	if l.cfg.AllowAnonymous && msg.Platform == adapter.PlatformAPI {
 		return nil

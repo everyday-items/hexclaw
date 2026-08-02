@@ -3,12 +3,14 @@ package web
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/skill"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 )
@@ -57,7 +59,9 @@ func TestWebAdapter_StreamChunkErrorIsSanitized(t *testing.T) {
 
 func dialWebAdapter(t *testing.T, a *WebAdapter) (*websocket.Conn, context.Context, context.CancelFunc) {
 	t.Helper()
-	srv := httptest.NewServer(a.Handler())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a.Handler().ServeHTTP(w, r.WithContext(skill.WithAuthenticatedUser(r.Context(), "desktop-user")))
+	}))
 	t.Cleanup(srv.Close)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -171,7 +175,7 @@ func TestWebAdapter_ResumeStreamSendsSnapshotAndContinuesStreaming(t *testing.T)
 		t.Fatalf("read stream snapshot failed: %v", err)
 	}
 	if snapshot.Type != "stream_snapshot" {
-		t.Fatalf("snapshot type = %q, want stream_snapshot", snapshot.Type)
+		t.Fatalf("snapshot type = %q content=%q, want stream_snapshot", snapshot.Type, snapshot.Content)
 	}
 	if snapshot.Content != "第一个片段" {
 		t.Fatalf("snapshot content = %q", snapshot.Content)
@@ -280,7 +284,7 @@ func TestBug20260717_ResumeWithinGraceKeepsStreamAlive(t *testing.T) {
 		t.Fatal(err)
 	}
 	if snapshot.Type != "stream_snapshot" {
-		t.Fatalf("resume frame type = %q", snapshot.Type)
+		t.Fatalf("resume frame type = %q content=%q", snapshot.Type, snapshot.Content)
 	}
 
 	time.Sleep(a.disconnectGrace + 50*time.Millisecond)

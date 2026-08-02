@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
 	"github.com/hexagon-codes/hexclaw/messagecontent"
+	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/streamstate"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"nhooyr.io/websocket"
@@ -30,25 +33,51 @@ import (
 // 管理 WebSocket 连接，将 Web 消息转换为统一格式。
 // 每个 WebSocket 连接分配唯一 chatID；每个流式请求分配唯一 requestID。
 type WebAdapter struct {
-	handler            adapter.MessageHandler
-	streamHandler      adapter.StreamMessageHandler
-	conns              sync.Map // chatID → *websocket.Conn
-	sessionConns       sync.Map // sessionID → chatID (for permission requests)
-	sessionRequests    sync.Map // sessionID → requestID
-	requestConns       sync.Map // requestID → *requestSubscribers
-	cancelFuncs        sync.Map // requestID → context.CancelFunc
-	disconnectTimers   sync.Map // requestID → *time.Timer
-	disconnectGrace    time.Duration
-	streams            *streamstate.Registry
-	onApprovalResponse func(requestID string, approved, remember bool) // callback for tool approval
-	onApprovalDecision func(ApprovalResponseData) string
-	approvalACKMu      sync.Mutex
-	approvalACKs       sync.Map // idempotency key -> approvalACKRecord
+	handler                   adapter.MessageHandler
+	streamHandler             adapter.StreamMessageHandler
+	attachmentResolver        func(context.Context, string, []adapter.Attachment) ([]adapter.Attachment, error)
+	conns                     sync.Map // chatID → *websocket.Conn
+	connectionOwners          sync.Map // chatID → authenticated ownerID
+	sessionConns              sync.Map // sessionID → sessionConnectionBinding
+	sessionRequests           sync.Map // sessionID → requestID
+	requestOwners             sync.Map // requestID → authenticated ownerID
+	requestConns              sync.Map // requestID → *requestSubscribers
+	cancelFuncs               sync.Map // requestID → context.CancelFunc
+	disconnectTimers          sync.Map // requestID → *time.Timer
+	disconnectGrace           time.Duration
+	streams                   *streamstate.Registry
+	onApprovalResponse        func(requestID string, approved, remember bool) // callback for tool approval
+	onApprovalDecision        func(ApprovalResponseData) string
+	onDurableApprovalDecision func(ApprovalResponseData) ApprovalDecisionReceipt
+	pendingApprovalReplay     func(context.Context, string, string) []*PermissionRequestData
+	approvalBindings          sync.Map // requestID -> approvalTransportBinding
+	approvalACKMu             sync.Mutex
+	approvalACKs              map[string]approvalACKRecord // bounded idempotency key -> terminal ACK
+	approvalACKLimit          int
+	approvalACKTTL            time.Duration
+	approvalACKSeq            uint64
 }
 
 type requestSubscribers struct {
 	mu      sync.RWMutex
 	chatIDs map[string]struct{}
+}
+
+type sessionConnectionBinding struct {
+	chatID  string
+	ownerID string
+}
+
+type approvalTransportBinding struct {
+	requestID           string
+	ownerID             string
+	sessionID           string
+	chatID              string
+	invocationID        string
+	argumentsDigest     string
+	securityScopeDigest string
+	scopeSchemaVersion  int
+	expiresAt           time.Time
 }
 
 func newRequestSubscribers() *requestSubscribers {
@@ -98,11 +127,23 @@ func (a *WebAdapter) SetStreamHandler(h adapter.StreamMessageHandler) {
 	a.streamHandler = h
 }
 
+// SetAttachmentResolver installs the Sidecar-owned staging resolver. WebSocket
+// frames carry only opaque attachment IDs; metadata and bytes are recovered
+// under the authenticated principal before they reach the engine.
+func (a *WebAdapter) SetAttachmentResolver(
+	resolver func(context.Context, string, []adapter.Attachment) ([]adapter.Attachment, error),
+) {
+	a.attachmentResolver = resolver
+}
+
 // New 创建 Web 适配器。
 func New() *WebAdapter {
 	return &WebAdapter{
-		streams:         streamstate.NewRegistry(2 * time.Minute),
-		disconnectGrace: 5 * time.Second,
+		streams:          streamstate.NewRegistry(2 * time.Minute),
+		disconnectGrace:  5 * time.Second,
+		approvalACKs:     make(map[string]approvalACKRecord),
+		approvalACKLimit: 1024,
+		approvalACKTTL:   5 * time.Minute,
 	}
 }
 
@@ -138,8 +179,28 @@ func (a *WebAdapter) Stop(_ context.Context) error {
 		a.conns.Delete(key)
 		return true
 	})
+	for _, state := range []*sync.Map{
+		&a.connectionOwners,
+		&a.sessionConns,
+		&a.sessionRequests,
+		&a.requestOwners,
+		&a.requestConns,
+		&a.approvalBindings,
+	} {
+		clearSyncMap(state)
+	}
+	a.approvalACKMu.Lock()
+	a.approvalACKs = make(map[string]approvalACKRecord)
+	a.approvalACKMu.Unlock()
 	slog.Info("Web 适配器已停止")
 	return nil
+}
+
+func clearSyncMap(state *sync.Map) {
+	state.Range(func(key, _ any) bool {
+		state.Delete(key)
+		return true
+	})
 }
 
 // ListActiveStreams 返回指定用户当前仍在进行中的流式请求。
@@ -166,20 +227,59 @@ func (a *WebAdapter) SetApprovalResponseHandler(fn func(requestID string, approv
 // ApprovalResponseData carries one immutable approval decision identity.
 type ApprovalResponseData struct {
 	RequestID           string
+	OwnerID             string
+	SessionID           string
 	DecisionID          string
 	InvocationID        string
 	Decision            string
 	IdempotencyKey      string
 	ArgumentsDigest     string
 	SecurityScopeDigest string
+	ScopeSchemaVersion  int
 	Approved            bool
 	Remember            bool
+	responderChatID     string
 }
 
 // SetApprovalDecisionHandler installs the durable coordinator callback used
 // before a terminal ACK is emitted.
 func (a *WebAdapter) SetApprovalDecisionHandler(fn func(ApprovalResponseData) string) {
 	a.onApprovalDecision = fn
+}
+
+// ApprovalDecisionReceipt is the transport-safe projection of the backend's
+// durable ACK record. WebAdapter validates and serializes it but never decides
+// authorization from its own maps or caches.
+type ApprovalDecisionReceipt struct {
+	RequestID           string
+	InvocationID        string
+	OwnerID             string
+	SessionID           string
+	DecisionID          string
+	Decision            string
+	IdempotencyKey      string
+	ArgumentsDigest     string
+	SecurityScopeDigest string
+	ScopeSchemaVersion  int
+	TerminalResult      string
+	ACKStatus           string
+	Replayed            bool
+}
+
+// SetDurableApprovalDecisionHandler installs the sole production approval
+// authority. The legacy string callback remains only for non-durable adapters.
+func (a *WebAdapter) SetDurableApprovalDecisionHandler(
+	fn func(ApprovalResponseData) ApprovalDecisionReceipt,
+) {
+	a.onDurableApprovalDecision = fn
+}
+
+// SetPendingApprovalReplayHandler installs the backend pending projection used
+// when an authenticated session moves to a new physical WebSocket.
+func (a *WebAdapter) SetPendingApprovalReplayHandler(
+	fn func(context.Context, string, string) []*PermissionRequestData,
+) {
+	a.pendingApprovalReplay = fn
 }
 
 // PermissionRequestData is the data needed to send a tool approval request.
@@ -191,6 +291,7 @@ type PermissionRequestData struct {
 	Arguments           map[string]any
 	ArgumentsDigest     string
 	SecurityScopeDigest string
+	ScopeSchemaVersion  int
 	DeadlineAt          time.Time
 	Risk                string
 	Reason              string
@@ -202,22 +303,45 @@ func (a *WebAdapter) SendPermissionRequest(ctx context.Context, sessionID string
 		return errors.New("permission request data is nil")
 	}
 	msg := permissionRequestMessage(sessionID, data)
-	chatID, ok := a.sessionConns.Load(sessionID)
+	value, ok := a.sessionConns.Load(sessionID)
 	if !ok {
-		return a.broadcastPermissionRequest(ctx, msg, "", fmt.Errorf("no WebSocket connection for session %s", sessionID))
+		return fmt.Errorf("no WebSocket connection for session %s", sessionID)
 	}
-	chatIDStr, ok := chatID.(string)
-	if !ok || chatIDStr == "" {
-		return a.broadcastPermissionRequest(ctx, msg, "", fmt.Errorf("invalid WebSocket connection binding for session %s", sessionID))
+	binding, ok := value.(sessionConnectionBinding)
+	if !ok || binding.chatID == "" || binding.ownerID == "" {
+		return fmt.Errorf("invalid WebSocket connection binding for session %s", sessionID)
 	}
-	conn, ok := a.getConn(chatIDStr)
+	if data.OwnerID == "" || data.OwnerID != binding.ownerID {
+		return fmt.Errorf("approval owner does not own session %s", sessionID)
+	}
+	transportBinding := approvalTransportBinding{
+		requestID: data.ID, ownerID: data.OwnerID, sessionID: sessionID, chatID: binding.chatID,
+		invocationID: data.InvocationID, argumentsDigest: data.ArgumentsDigest,
+		securityScopeDigest: data.SecurityScopeDigest, scopeSchemaVersion: data.ScopeSchemaVersion,
+		expiresAt: data.DeadlineAt,
+	}
+	if !transportBinding.valid() {
+		return errors.New("approval request has incomplete transport identity")
+	}
+	if existing, loaded := a.approvalBindings.LoadOrStore(data.ID, transportBinding); loaded && existing != transportBinding {
+		return fmt.Errorf("approval request %s already has a different transport binding", data.ID)
+	}
+	conn, ok := a.getConn(binding.chatID)
 	if !ok {
-		return a.broadcastPermissionRequest(ctx, msg, chatIDStr, fmt.Errorf("WebSocket connection %s disconnected", chatIDStr))
+		a.approvalBindings.Delete(data.ID)
+		return fmt.Errorf("WebSocket connection %s disconnected", binding.chatID)
 	}
 	if err := wsjson.Write(ctx, conn, msg); err != nil {
-		return a.broadcastPermissionRequest(ctx, msg, chatIDStr, err)
+		a.approvalBindings.Delete(data.ID)
+		return err
 	}
 	return nil
+}
+
+func (b approvalTransportBinding) valid() bool {
+	return b.requestID != "" && b.ownerID != "" && b.sessionID != "" && b.chatID != "" &&
+		b.invocationID != "" && b.argumentsDigest != "" && b.securityScopeDigest != "" &&
+		b.scopeSchemaVersion > 0 && !b.expiresAt.IsZero() && time.Now().Before(b.expiresAt)
 }
 
 func permissionRequestMessage(sessionID string, data *PermissionRequestData) wsMessage {
@@ -232,6 +356,7 @@ func permissionRequestMessage(sessionID string, data *PermissionRequestData) wsM
 		ToolName:            data.ToolName,
 		ArgumentsDigest:     data.ArgumentsDigest,
 		SecurityScopeDigest: data.SecurityScopeDigest,
+		ScopeSchemaVersion:  data.ScopeSchemaVersion,
 		DeadlineAt:          data.DeadlineAt.Format(time.RFC3339Nano),
 		Metadata: map[string]string{
 			"request_id":            data.ID,
@@ -241,45 +366,10 @@ func permissionRequestMessage(sessionID string, data *PermissionRequestData) wsM
 			"risk":                  data.Risk,
 			"arguments_digest":      data.ArgumentsDigest,
 			"security_scope_digest": data.SecurityScopeDigest,
+			"scope_schema_version":  fmt.Sprintf("%d", data.ScopeSchemaVersion),
 			"deadline_at":           data.DeadlineAt.Format(time.RFC3339Nano),
 		},
 	}
-}
-
-func (a *WebAdapter) broadcastPermissionRequest(ctx context.Context, msg wsMessage, excludeChatID string, routeErr error) error {
-	sent := 0
-	var firstErr error
-	a.conns.Range(func(key, value any) bool {
-		chatID, _ := key.(string)
-		if chatID == excludeChatID {
-			return true
-		}
-		conn, ok := value.(*websocket.Conn)
-		if !ok {
-			return true
-		}
-		if err := wsjson.Write(ctx, conn, msg); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			return true
-		}
-		sent++
-		return true
-	})
-	if sent > 0 {
-		if routeErr != nil {
-			slog.Warn("审批请求使用 WebSocket 广播兜底", "session_id", msg.SessionID, "request_id", msg.RequestID, "err", routeErr)
-		}
-		return nil
-	}
-	if firstErr != nil {
-		return firstErr
-	}
-	if routeErr != nil {
-		return routeErr
-	}
-	return fmt.Errorf("no active WebSocket connections for session %s", msg.SessionID)
 }
 
 // Broadcast 向所有活跃 WebSocket 连接广播消息。
@@ -327,7 +417,9 @@ func (a *WebAdapter) SendStream(ctx context.Context, chatID string, chunks <-cha
 
 func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, requestID string, chunks <-chan *adapter.ReplyChunk) error {
 	if sessionID != "" {
-		a.sessionConns.Store(sessionID, chatID)
+		if owner, ok := a.connectionOwners.Load(chatID); ok {
+			a.bindSession(sessionID, chatID, owner.(string))
+		}
 		a.sessionRequests.Store(sessionID, requestID)
 	}
 	chunkCount := 0
@@ -404,7 +496,9 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 			}
 		}
 		if msg.SessionID != "" {
-			a.sessionConns.Store(msg.SessionID, chatID)
+			if owner, ok := a.connectionOwners.Load(chatID); ok {
+				a.bindSession(msg.SessionID, chatID, owner.(string))
+			}
 			a.sessionRequests.Store(msg.SessionID, requestID)
 		}
 		if err := a.sendToTargets(ctx, chatID, requestID, msg); err != nil {
@@ -417,8 +511,17 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 
 // handleWS 处理 WebSocket 连接。
 func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
+	ownerID := strings.TrimSpace(skill.AuthenticatedUserID(r.Context()))
+	if ownerID == "" {
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return
+	}
+	if !isAllowedWebSocketOrigin(r.Header.Get("Origin")) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true,
+		OriginPatterns: []string{"localhost", "tauri.localhost", "127.0.0.1"},
 	})
 	if err != nil {
 		slog.Error("WebSocket 握手失败", "err", err)
@@ -429,11 +532,14 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	chatID := "ws-" + idgen.ShortID()
 	a.conns.Store(chatID, conn)
+	a.connectionOwners.Store(chatID, ownerID)
 	defer func() {
 		a.conns.Delete(chatID)
+		a.connectionOwners.Delete(chatID)
+		a.deleteApprovalBindingsForChat(chatID)
 		a.removeChatID(chatID)
 		a.sessionConns.Range(func(key, value any) bool {
-			if value.(string) == chatID {
+			if binding, ok := value.(sessionConnectionBinding); ok && binding.chatID == chatID {
 				a.sessionConns.Delete(key)
 			}
 			return true
@@ -456,13 +562,13 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			continue
 		case "cancel":
 			requestID := stringsTrim(incoming.RequestID)
-			if requestID == "" && incoming.SessionID != "" {
+			if requestID == "" && incoming.SessionID != "" && a.sessionOwnedBy(incoming.SessionID, ownerID) {
 				if bound, ok := a.sessionRequests.Load(incoming.SessionID); ok {
 					requestID = bound.(string)
 				}
 			}
 			slog.Info("WebSocket cancel", "session", incoming.SessionID, "request_id", requestID)
-			if requestID != "" {
+			if requestID != "" && a.requestOwnedBy(requestID, ownerID) {
 				a.stopDisconnectTimer(requestID)
 				if cancelFn, ok := a.cancelFuncs.LoadAndDelete(requestID); ok {
 					cancelFn.(context.CancelFunc)()
@@ -473,11 +579,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		case "resume":
-			userID := incoming.UserID
-			if userID == "" {
-				userID = "web-user"
-			}
-			snapshot, ok := a.GetStreamSnapshot(userID, incoming.RequestID)
+			snapshot, ok := a.GetStreamSnapshot(ownerID, incoming.RequestID)
 			if !ok {
 				_ = wsjson.Write(r.Context(), conn, wsMessage{
 					Type:      "error",
@@ -488,7 +590,10 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			if !snapshot.Done {
 				a.addSubscriber(snapshot.RequestID, chatID)
-				a.sessionConns.Store(snapshot.SessionID, chatID)
+				if snapshot.SessionID != "" && !a.bindSession(snapshot.SessionID, chatID, ownerID) {
+					_ = wsjson.Write(r.Context(), conn, wsMessage{Type: "error", Content: "session ownership mismatch"})
+					continue
+				}
 				a.sessionRequests.Store(snapshot.SessionID, snapshot.RequestID)
 			}
 			_ = wsjson.Write(r.Context(), conn, snapshotToMessage(snapshot))
@@ -507,12 +612,18 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 				decisionID = incoming.Metadata["decision_id"]
 			}
 			idempotencyKey := incoming.Metadata["idempotency_key"]
+			scopeSchemaVersion := incoming.ScopeSchemaVersion
+			if scopeSchemaVersion == 0 {
+				scopeSchemaVersion, _ = strconv.Atoi(incoming.Metadata["scope_schema_version"])
+			}
 			data := ApprovalResponseData{
-				RequestID: reqID, DecisionID: decisionID,
+				RequestID: reqID, OwnerID: ownerID, DecisionID: decisionID,
 				InvocationID: incoming.Metadata["invocation_id"],
 				Decision:     decision, IdempotencyKey: idempotencyKey,
 				ArgumentsDigest:     incoming.Metadata["arguments_digest"],
 				SecurityScopeDigest: incoming.Metadata["security_scope_digest"],
+				ScopeSchemaVersion:  scopeSchemaVersion,
+				responderChatID:     chatID,
 			}
 			_ = wsjson.Write(r.Context(), conn, a.approvalACK(data))
 			continue
@@ -526,25 +637,48 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			_ = wsjson.Write(r.Context(), conn, wsMessage{Type: "error", Content: err.Error()})
 			continue
 		}
+		if hasStagedAttachmentReference(incoming.Attachments) {
+			if a.attachmentResolver == nil {
+				_ = wsjson.Write(r.Context(), conn, wsMessage{Type: "error", Content: "attachment staging unavailable"})
+				continue
+			}
+			resolved, err := a.attachmentResolver(r.Context(), ownerID, incoming.Attachments)
+			if err != nil {
+				_ = wsjson.Write(r.Context(), conn, wsMessage{Type: "error", Content: "attachment is unavailable"})
+				continue
+			}
+			incoming.Attachments = resolved
+			if err := adapter.ValidateAttachments(incoming.Attachments); err != nil {
+				_ = wsjson.Write(r.Context(), conn, wsMessage{Type: "error", Content: "attachment is invalid"})
+				continue
+			}
+		}
 		if incoming.RequestID == "" {
 			incoming.RequestID = "req-" + idgen.ShortID()
 		}
 
-		msg, err := buildAdapterMessage(chatID, incoming)
+		msg, err := buildAdapterMessage(chatID, ownerID, incoming)
 		if err != nil {
 			_ = wsjson.Write(r.Context(), conn, wsMessage{Type: "error", Content: err.Error()})
 			continue
 		}
 		msg.InstanceID = a.Name()
 		if incoming.SessionID != "" {
-			a.sessionConns.Store(incoming.SessionID, chatID)
+			if !a.bindSession(incoming.SessionID, chatID, ownerID) {
+				_ = wsjson.Write(r.Context(), conn, wsMessage{Type: "error", Content: "session ownership mismatch"})
+				continue
+			}
 			a.sessionRequests.Store(incoming.SessionID, incoming.RequestID)
+		}
+		if existing, loaded := a.requestOwners.LoadOrStore(incoming.RequestID, ownerID); loaded && existing != ownerID {
+			_ = wsjson.Write(r.Context(), conn, wsMessage{Type: "error", Content: "request ownership mismatch"})
+			continue
 		}
 
 		logger := trace.NewRequest(msg.UserID, msg.SessionID).With("source", "chat", "provider", incoming.Provider, "model", incoming.Model, "request_id", incoming.RequestID)
 
 		go func(incoming wsMessage, msg *adapter.Message) {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			ctx, cancel := context.WithTimeout(skill.WithAuthenticatedUser(context.Background(), ownerID), 10*time.Minute)
 			defer cancel()
 			if incoming.RequestID != "" {
 				a.cancelFuncs.Store(incoming.RequestID, cancel)
@@ -628,6 +762,27 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func hasStagedAttachmentReference(attachments []adapter.Attachment) bool {
+	for _, attachment := range attachments {
+		if strings.TrimSpace(attachment.ID) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *WebAdapter) deleteApprovalBindingsForChat(chatID string) {
+	if chatID == "" {
+		return
+	}
+	a.approvalBindings.Range(func(key, value any) bool {
+		if binding, ok := value.(approvalTransportBinding); ok && binding.chatID == chatID {
+			a.approvalBindings.Delete(key)
+		}
+		return true
+	})
+}
+
 func (a *WebAdapter) addSubscriber(requestID, chatID string) {
 	if requestID == "" || chatID == "" {
 		return
@@ -695,12 +850,64 @@ func (a *WebAdapter) scheduleDisconnectCancel(requestID string, subs *requestSub
 func (a *WebAdapter) finishRequest(requestID, sessionID string) {
 	a.stopDisconnectTimer(requestID)
 	a.requestConns.Delete(requestID)
+	a.requestOwners.Delete(requestID)
 	if sessionID == "" {
 		return
 	}
 	if current, ok := a.sessionRequests.Load(sessionID); ok && current == requestID {
 		a.sessionRequests.Delete(sessionID)
 	}
+}
+
+func (a *WebAdapter) bindSession(sessionID, chatID, ownerID string) bool {
+	if sessionID == "" || chatID == "" || ownerID == "" {
+		return false
+	}
+	next := sessionConnectionBinding{chatID: chatID, ownerID: ownerID}
+	changed := true
+	if current, loaded := a.sessionConns.LoadOrStore(sessionID, next); loaded {
+		binding, ok := current.(sessionConnectionBinding)
+		if !ok || binding.ownerID != ownerID {
+			return false
+		}
+		changed = binding.chatID != chatID
+		a.sessionConns.Store(sessionID, next)
+	}
+	if changed {
+		a.replayPendingApprovals(ownerID, sessionID)
+	}
+	return true
+}
+
+func (a *WebAdapter) replayPendingApprovals(ownerID, sessionID string) {
+	if a.pendingApprovalReplay == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, request := range a.pendingApprovalReplay(ctx, ownerID, sessionID) {
+		if request == nil || request.OwnerID != ownerID {
+			continue
+		}
+		if err := a.SendPermissionRequest(ctx, sessionID, request); err != nil {
+			slog.Warn("tool approval reconnect replay failed",
+				"request_id", request.ID, "session_id", sessionID, "error", err)
+		}
+	}
+}
+
+func (a *WebAdapter) sessionOwnedBy(sessionID, ownerID string) bool {
+	value, ok := a.sessionConns.Load(sessionID)
+	if !ok {
+		return false
+	}
+	binding, ok := value.(sessionConnectionBinding)
+	return ok && binding.ownerID == ownerID
+}
+
+func (a *WebAdapter) requestOwnedBy(requestID, ownerID string) bool {
+	value, ok := a.requestOwners.Load(requestID)
+	return ok && value == ownerID
 }
 
 func (a *WebAdapter) sendToTargets(ctx context.Context, chatID, requestID string, msg wsMessage) error {
@@ -823,6 +1030,7 @@ type wsMessage struct {
 	InvocationID        string                         `json:"invocation_id,omitempty"`
 	ArgumentsDigest     string                         `json:"arguments_digest,omitempty"`
 	SecurityScopeDigest string                         `json:"security_scope_digest,omitempty"`
+	ScopeSchemaVersion  int                            `json:"scope_schema_version,omitempty"`
 	DeadlineAt          string                         `json:"deadline_at,omitempty"`
 	Usage               *adapter.Usage                 `json:"usage,omitempty"`
 	ToolCalls           []adapter.ToolCall             `json:"tool_calls,omitempty"`
@@ -844,12 +1052,13 @@ type wsMessage struct {
 type approvalACKRecord struct {
 	fingerprint string
 	ack         wsMessage
+	ownerID     string
+	chatID      string
+	expiresAt   time.Time
+	sequence    uint64
 }
 
 func (a *WebAdapter) approvalACK(data ApprovalResponseData) wsMessage {
-	a.approvalACKMu.Lock()
-	defer a.approvalACKMu.Unlock()
-
 	approved, remember, valid := approvalDecisionFlags(data.Decision)
 	if !valid {
 		return rejectedApprovalACK(data, data.IdempotencyKey, "invalid_decision")
@@ -857,16 +1066,77 @@ func (a *WebAdapter) approvalACK(data ApprovalResponseData) wsMessage {
 	if strings.TrimSpace(data.IdempotencyKey) == "" {
 		return rejectedApprovalACK(data, "", "missing_idempotency_key")
 	}
+	if strings.TrimSpace(data.RequestID) == "" || strings.TrimSpace(data.DecisionID) == "" ||
+		strings.TrimSpace(data.OwnerID) == "" || strings.TrimSpace(data.responderChatID) == "" ||
+		strings.TrimSpace(data.InvocationID) == "" || strings.TrimSpace(data.ArgumentsDigest) == "" ||
+		strings.TrimSpace(data.SecurityScopeDigest) == "" {
+		return rejectedApprovalACK(data, data.IdempotencyKey, "identity_mismatch")
+	}
 	data.Approved = approved
 	data.Remember = remember
 	key := data.IdempotencyKey
 	fingerprint := strings.Join([]string{
-		data.RequestID, data.InvocationID, data.Decision,
-		data.ArgumentsDigest, data.SecurityScopeDigest,
+		data.RequestID, data.DecisionID, data.InvocationID, data.Decision,
+		data.ArgumentsDigest, data.SecurityScopeDigest, strconv.Itoa(data.ScopeSchemaVersion),
 	}, "\x00")
-	if existing, ok := a.approvalACKs.Load(key); ok {
-		record := existing.(approvalACKRecord)
+	now := time.Now()
+	if a.onDurableApprovalDecision == nil {
+		a.approvalACKMu.Lock()
+		a.pruneApprovalACKsLocked(now)
+		if record, cached := a.approvalACKs[key]; cached {
+			a.approvalACKMu.Unlock()
+			if record.fingerprint == fingerprint {
+				if record.ownerID != data.OwnerID || record.chatID != data.responderChatID {
+					return rejectedApprovalACK(data, key, "identity_mismatch")
+				}
+				ack := record.ack
+				if ack.Status == "accepted" {
+					ack.Status = "already_accepted"
+				}
+				return ack
+			}
+			return rejectedApprovalACK(data, key, "idempotency_conflict")
+		}
+		a.approvalACKMu.Unlock()
+	}
+	value, ok := a.approvalBindings.Load(data.RequestID)
+	if ok {
+		binding, bindingOK := value.(approvalTransportBinding)
+		if data.ScopeSchemaVersion == 0 && bindingOK {
+			data.ScopeSchemaVersion = binding.scopeSchemaVersion
+		}
+		if !bindingOK || !binding.valid() || now.After(binding.expiresAt) || binding.ownerID != data.OwnerID ||
+			binding.chatID != data.responderChatID || binding.invocationID != data.InvocationID ||
+			binding.argumentsDigest != data.ArgumentsDigest || binding.securityScopeDigest != data.SecurityScopeDigest ||
+			binding.scopeSchemaVersion != data.ScopeSchemaVersion {
+			return rejectedApprovalACK(data, key, "identity_mismatch")
+		}
+		data.SessionID = binding.sessionID
+	} else if a.onDurableApprovalDecision == nil {
+		return rejectedApprovalACK(data, key, "identity_mismatch")
+	}
+
+	if a.onDurableApprovalDecision != nil {
+		receipt := a.onDurableApprovalDecision(data)
+		if !durableApprovalReceiptMatches(data, receipt) {
+			return rejectedApprovalACK(data, key, "identity_mismatch")
+		}
+		ack := durableApprovalACK(receipt)
+		a.cacheApprovalACK(key, fingerprint, data, ack, now)
+		if receipt.TerminalResult != "identity_mismatch" {
+			a.approvalBindings.Delete(data.RequestID)
+		}
+		return ack
+	}
+
+	a.approvalACKMu.Lock()
+	defer a.approvalACKMu.Unlock()
+	a.pruneApprovalACKsLocked(now)
+	if record, cached := a.approvalACKs[key]; cached {
 		if record.fingerprint == fingerprint {
+			if record.ownerID != data.OwnerID || record.chatID != data.responderChatID {
+				return rejectedApprovalACK(data, key, "identity_mismatch")
+			}
 			ack := record.ack
 			if ack.Status == "accepted" {
 				ack.Status = "already_accepted"
@@ -895,22 +1165,111 @@ func (a *WebAdapter) approvalACK(data ApprovalResponseData) wsMessage {
 			"idempotency_key":       key,
 			"arguments_digest":      data.ArgumentsDigest,
 			"security_scope_digest": data.SecurityScopeDigest,
+			"scope_schema_version":  strconv.Itoa(data.ScopeSchemaVersion),
 			"terminal_result":       terminalResult,
 		},
 	}
-	actual, loaded := a.approvalACKs.LoadOrStore(key, approvalACKRecord{fingerprint: fingerprint, ack: ack})
-	if loaded {
-		record := actual.(approvalACKRecord)
-		if record.fingerprint == fingerprint {
-			duplicate := record.ack
-			if duplicate.Status == "accepted" {
-				duplicate.Status = "already_accepted"
-			}
-			return duplicate
-		}
-		return rejectedApprovalACK(data, key, "idempotency_conflict")
+	a.approvalACKSeq++
+	a.approvalACKs[key] = approvalACKRecord{
+		fingerprint: fingerprint, ack: ack, ownerID: data.OwnerID, chatID: data.responderChatID,
+		expiresAt: now.Add(a.effectiveApprovalACKTTLLocked()), sequence: a.approvalACKSeq,
+	}
+	a.enforceApprovalACKBoundLocked()
+	if terminalResult != "identity_mismatch" {
+		a.approvalBindings.Delete(data.RequestID)
 	}
 	return ack
+}
+
+func durableApprovalReceiptMatches(data ApprovalResponseData, receipt ApprovalDecisionReceipt) bool {
+	if receipt.RequestID != data.RequestID || receipt.InvocationID != data.InvocationID ||
+		receipt.OwnerID != data.OwnerID || strings.TrimSpace(receipt.SessionID) == "" ||
+		receipt.Decision != data.Decision || receipt.IdempotencyKey != data.IdempotencyKey ||
+		receipt.ArgumentsDigest != data.ArgumentsDigest || receipt.SecurityScopeDigest != data.SecurityScopeDigest ||
+		receipt.ScopeSchemaVersion <= 0 ||
+		(data.ScopeSchemaVersion > 0 && receipt.ScopeSchemaVersion != data.ScopeSchemaVersion) ||
+		strings.TrimSpace(receipt.DecisionID) == "" || strings.TrimSpace(receipt.TerminalResult) == "" {
+		return false
+	}
+	switch receipt.ACKStatus {
+	case "accepted", "expired", "rejected":
+		return true
+	default:
+		return false
+	}
+}
+
+func durableApprovalACK(receipt ApprovalDecisionReceipt) wsMessage {
+	return wsMessage{
+		Type:       "tool_approval_ack",
+		RequestID:  receipt.RequestID,
+		DecisionID: receipt.DecisionID,
+		Status:     receipt.ACKStatus,
+		Metadata: map[string]string{
+			"approval_request_id":   receipt.RequestID,
+			"decision_id":           receipt.DecisionID,
+			"invocation_id":         receipt.InvocationID,
+			"decision":              receipt.Decision,
+			"idempotency_key":       receipt.IdempotencyKey,
+			"arguments_digest":      receipt.ArgumentsDigest,
+			"security_scope_digest": receipt.SecurityScopeDigest,
+			"scope_schema_version":  strconv.Itoa(receipt.ScopeSchemaVersion),
+			"terminal_result":       receipt.TerminalResult,
+		},
+	}
+}
+
+func (a *WebAdapter) cacheApprovalACK(
+	key, fingerprint string, data ApprovalResponseData, ack wsMessage, now time.Time,
+) {
+	a.approvalACKMu.Lock()
+	defer a.approvalACKMu.Unlock()
+	a.pruneApprovalACKsLocked(now)
+	a.approvalACKSeq++
+	a.approvalACKs[key] = approvalACKRecord{
+		fingerprint: fingerprint, ack: ack, ownerID: data.OwnerID, chatID: data.responderChatID,
+		expiresAt: now.Add(a.effectiveApprovalACKTTLLocked()), sequence: a.approvalACKSeq,
+	}
+	a.enforceApprovalACKBoundLocked()
+}
+
+func (a *WebAdapter) effectiveApprovalACKTTLLocked() time.Duration {
+	if a.approvalACKTTL <= 0 {
+		return 5 * time.Minute
+	}
+	return a.approvalACKTTL
+}
+
+func (a *WebAdapter) effectiveApprovalACKLimitLocked() int {
+	if a.approvalACKLimit <= 0 {
+		return 1024
+	}
+	return a.approvalACKLimit
+}
+
+func (a *WebAdapter) pruneApprovalACKsLocked(now time.Time) {
+	if a.approvalACKs == nil {
+		a.approvalACKs = make(map[string]approvalACKRecord)
+	}
+	for key, record := range a.approvalACKs {
+		if !record.expiresAt.IsZero() && !now.Before(record.expiresAt) {
+			delete(a.approvalACKs, key)
+		}
+	}
+}
+
+func (a *WebAdapter) enforceApprovalACKBoundLocked() {
+	limit := a.effectiveApprovalACKLimitLocked()
+	for len(a.approvalACKs) > limit {
+		var oldestKey string
+		var oldestSeq uint64
+		for key, record := range a.approvalACKs {
+			if oldestKey == "" || record.sequence < oldestSeq {
+				oldestKey, oldestSeq = key, record.sequence
+			}
+		}
+		delete(a.approvalACKs, oldestKey)
+	}
 }
 
 func approvalDecisionFlags(decision string) (approved, remember, valid bool) {
@@ -960,10 +1319,10 @@ func (m wsMessage) MarshalJSON() ([]byte, error) {
 	return json.Marshal((Alias)(m))
 }
 
-func buildAdapterMessage(chatID string, incoming wsMessage) (*adapter.Message, error) {
-	userID := incoming.UserID
+func buildAdapterMessage(chatID, authenticatedOwnerID string, incoming wsMessage) (*adapter.Message, error) {
+	userID := strings.TrimSpace(authenticatedOwnerID)
 	if userID == "" {
-		userID = "web-user"
+		return nil, errors.New("authenticated WebSocket owner is required")
 	}
 	metadata := make(map[string]string, len(incoming.Metadata)+4)
 	for k, v := range incoming.Metadata {
@@ -1000,4 +1359,29 @@ func buildAdapterMessage(chatID string, incoming wsMessage) (*adapter.Message, e
 		Timestamp:   time.Now(),
 		Metadata:    metadata,
 	}, nil
+}
+
+func isAllowedWebSocketOrigin(origin string) bool {
+	origin = strings.TrimSpace(origin)
+	if origin == "" {
+		// Native WebSocket clients do not send Origin. Authentication remains
+		// mandatory, so the browser-CSRF boundary is not weakened.
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	switch strings.ToLower(u.Scheme) {
+	case "tauri":
+		return host == "localhost" && u.Port() == ""
+	case "http":
+		if host == "tauri.localhost" {
+			return u.Port() == ""
+		}
+		return host == "localhost" || host == "127.0.0.1" || host == "::1"
+	default:
+		return false
+	}
 }

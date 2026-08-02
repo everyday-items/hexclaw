@@ -18,8 +18,116 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/knowledge"
+	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
+
+// KnowledgeOperationProjection is the renderer-safe restart view. Durable
+// document state remains authoritative in the Sidecar; browser storage is not
+// an execution ledger.
+type KnowledgeOperationProjection struct {
+	OperationID   string                         `json:"operation_id"`
+	JobID         string                         `json:"job_id"`
+	DocumentID    string                         `json:"document_id"`
+	Title         string                         `json:"title"`
+	DisplayName   string                         `json:"display_name"`
+	ContentDigest string                         `json:"content_digest,omitempty"`
+	State         knowledge.UploadOperationState `json:"state"`
+	Stage         string                         `json:"stage"`
+	Terminal      bool                           `json:"terminal"`
+	Error         string                         `json:"error,omitempty"`
+	CreatedAt     time.Time                      `json:"created_at"`
+	UpdatedAt     time.Time                      `json:"updated_at"`
+}
+
+// handleKnowledgeOperations GET /api/v1/knowledge/operations returns the
+// recoverable projection from durable knowledge rows. The worker/job tables
+// remain internal and are correlated by document_id through existing job APIs.
+func (s *Server) handleKnowledgeOperations(w http.ResponseWriter, r *http.Request) {
+	ownerID := strings.TrimSpace(skill.AuthenticatedUserID(r.Context()))
+	if ownerID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error": "authenticated principal is required",
+			"code":  "knowledge_principal_required",
+		})
+		return
+	}
+	service, ok := s.semanticIndex.(KnowledgeOperationProjectionAPI)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "knowledge recovery unavailable"})
+		return
+	}
+	corpusID := strings.TrimSpace(r.URL.Query().Get("corpus_id"))
+	if corpusID == "" {
+		corpusID = knowledgeDefaultCorpusID
+	}
+	if !requireSupportedKnowledgeCorpus(w, corpusID) {
+		return
+	}
+	projected, err := service.ListUploadOperationsForCorpus(r.Context(), ownerID, corpusID)
+	if err != nil {
+		writeSemanticIndexError(w, err)
+		return
+	}
+	operations := make([]KnowledgeOperationProjection, 0, len(projected))
+	for _, operation := range projected {
+		operations = append(operations, KnowledgeOperationProjection{
+			OperationID:   operation.OperationID,
+			JobID:         operation.JobID,
+			DocumentID:    operation.DocumentID,
+			Title:         operation.DisplayName,
+			DisplayName:   operation.DisplayName,
+			ContentDigest: operation.ContentDigest,
+			State:         operation.State,
+			Stage:         operation.Stage,
+			Terminal:      operation.Terminal,
+			Error:         operation.Error,
+			CreatedAt:     operation.CreatedAt,
+			UpdatedAt:     operation.UpdatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"operations": operations})
+}
+
+// handleAcknowledgeKnowledgeOperation is the explicit client-receipt boundary.
+// Writing an HTTP response cannot prove that a client received it, so the
+// upload handler deliberately does not advance pending_response itself.
+func (s *Server) handleAcknowledgeKnowledgeOperation(w http.ResponseWriter, r *http.Request) {
+	ownerID := strings.TrimSpace(skill.AuthenticatedUserID(r.Context()))
+	if ownerID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error": "authenticated principal is required",
+			"code":  "knowledge_principal_required",
+		})
+		return
+	}
+	service, ok := s.semanticIndex.(KnowledgeUploadResponseAcknowledger)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "knowledge recovery acknowledgement unavailable",
+		})
+		return
+	}
+	operationID := strings.TrimSpace(r.PathValue("operation_id"))
+	if operationID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "operation_id is required"})
+		return
+	}
+	corpusID := strings.TrimSpace(r.URL.Query().Get("corpus_id"))
+	if corpusID == "" {
+		corpusID = knowledgeDefaultCorpusID
+	}
+	if !requireSupportedKnowledgeCorpus(w, corpusID) {
+		return
+	}
+	if err := service.MarkUploadResponseDelivered(
+		r.Context(), ownerID, corpusID, operationID,
+	); err != nil {
+		writeSemanticIndexError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
 
 // knowledgeUploadProcessTimeout 限定上传文档「解析(pdftotext/VLM)+向量嵌入」处理阶段的
 // 最长耗时。扫描件/超大 PDF 的提取或嵌入可能长时间无产出，无界等待会让前端字节传完后
@@ -94,39 +202,14 @@ func (s *Server) handleAddDocument(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCreateKnowledgeDocument is the canonical asynchronous upload path.
-// ParseMultipartForm is configured with only 1 MiB memory, so large sources
-// stream through an OS temp file before the application service fsyncs them
-// into its content-addressed store. Parsing/OCR/chunking never runs here.
+// The multipart stream is parsed incrementally. As soon as the file headers
+// are available, CreateDocument persists the UploadIntent before its Body is
+// read; the source then streams exactly once into the content-addressed store.
+// Parsing/OCR/chunking never runs in this request.
 func (s *Server) handleCreateKnowledgeDocument(w http.ResponseWriter, r *http.Request) {
 	service, ok := s.semanticIndex.(KnowledgeDocumentIngestAPI)
 	if !ok {
 		writeDocumentIngestError(w, knowledge.ErrDocumentIngestUnavailable)
-		return
-	}
-	const multipartOverhead = 2 << 20
-	r.Body = http.MaxBytesReader(w, r.Body, knowledge.MaxKnowledgeDocumentBytes+multipartOverhead)
-	if err := r.ParseMultipartForm(1 << 20); err != nil {
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
-			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
-				"error": "文件过大，最大允许 200MB",
-			})
-			return
-		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "解析上传失败: " + err.Error()})
-		return
-	}
-	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
-	}
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "未找到上传文件"})
-		return
-	}
-	defer file.Close()
-	if header.Size > knowledge.MaxKnowledgeDocumentBytes {
-		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "文件过大，最大允许 200MB"})
 		return
 	}
 	idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
@@ -134,39 +217,122 @@ func (s *Server) handleCreateKnowledgeDocument(w http.ResponseWriter, r *http.Re
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
 		return
 	}
-	corpusID := strings.TrimSpace(r.FormValue("corpus_id"))
-	if corpusID == "" {
-		corpusID = strings.TrimSpace(r.URL.Query().Get("corpus_id"))
-	}
-	if corpusID == "" {
-		corpusID = knowledgeDefaultCorpusID
-	}
-	if !requireSupportedKnowledgeCorpus(w, corpusID) {
+	const multipartOverhead int64 = 2 << 20
+	maxRequestBytes := knowledge.MaxKnowledgeDocumentBytes + multipartOverhead
+	if r.ContentLength > maxRequestBytes {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
+			"error": "文件过大，最大允许 200MB",
+		})
 		return
 	}
-	mediaType := strings.TrimSpace(header.Header.Get("Content-Type"))
-	if mediaType == "" || mediaType == "application/octet-stream" {
-		if inferred := mime.TypeByExtension(strings.ToLower(filepath.Ext(header.Filename))); inferred != "" {
-			mediaType = inferred
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	multipartReader, err := r.MultipartReader()
+	if err != nil {
+		writeKnowledgeMultipartParseError(w, err)
+		return
+	}
+
+	const (
+		maxMultipartParts      = 16
+		maxMultipartFieldBytes = 64 << 10
+	)
+	fields := make(map[string]string, 5)
+	for partNumber := 1; partNumber <= maxMultipartParts; partNumber++ {
+		part, partErr := multipartReader.NextPart()
+		if errors.Is(partErr, io.EOF) {
+			break
+		}
+		if partErr != nil {
+			writeKnowledgeMultipartParseError(w, partErr)
+			return
+		}
+		fieldName := strings.TrimSpace(part.FormName())
+		if fieldName != "file" {
+			value, readErr := io.ReadAll(io.LimitReader(part, maxMultipartFieldBytes+1))
+			_ = part.Close()
+			if readErr != nil {
+				writeKnowledgeMultipartParseError(w, readErr)
+				return
+			}
+			if len(value) > maxMultipartFieldBytes {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "multipart field too large"})
+				return
+			}
+			switch fieldName {
+			case "corpus_id", "agent_id", "learner_id", "subject", "grade":
+				if _, exists := fields[fieldName]; !exists {
+					fields[fieldName] = string(value)
+				}
+			}
+			continue
+		}
+
+		filename := strings.TrimSpace(part.FileName())
+		corpusID := strings.TrimSpace(fields["corpus_id"])
+		if corpusID == "" {
+			corpusID = strings.TrimSpace(r.URL.Query().Get("corpus_id"))
+		}
+		if corpusID == "" {
+			corpusID = knowledgeDefaultCorpusID
+		}
+		if !requireSupportedKnowledgeCorpus(w, corpusID) {
+			return
+		}
+		mediaType := strings.TrimSpace(part.Header.Get("Content-Type"))
+		if mediaType == "" || mediaType == "application/octet-stream" {
+			if inferred := mime.TypeByExtension(strings.ToLower(filepath.Ext(filename))); inferred != "" {
+				mediaType = inferred
+			}
+		}
+		result, createErr := service.CreateDocument(r.Context(), knowledgePrincipalID(r), corpusID,
+			knowledge.CreateDocumentInput{
+				IdempotencyKey: idempotencyKey,
+				Filename:       filename,
+				MediaType:      mediaType,
+				// multipart.Part does not expose a trustworthy per-part length.
+				// Zero means unknown; Persist enforces the hard byte limit and
+				// replaces it with the measured, digest-bound size before bind.
+				SizeBytes: 0,
+				Body:      &knowledgeMultipartFileReader{reader: part},
+				AgentID:   strings.TrimSpace(fields["agent_id"]),
+				LearnerID: strings.TrimSpace(fields["learner_id"]),
+				Subject:   strings.TrimSpace(fields["subject"]),
+				Grade:     strings.TrimSpace(fields["grade"]),
+			})
+		if createErr != nil {
+			writeDocumentIngestError(w, createErr)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, result)
+		return
+	}
+	writeJSON(w, http.StatusBadRequest, map[string]string{"error": "未找到上传文件"})
+}
+
+type knowledgeMultipartFileReader struct {
+	reader io.Reader
+}
+
+func (r *knowledgeMultipartFileReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			return n, knowledge.ErrDocumentTooLarge
 		}
 	}
-	result, err := service.CreateDocument(r.Context(), knowledgePrincipalID(r), corpusID,
-		knowledge.CreateDocumentInput{
-			IdempotencyKey: idempotencyKey,
-			Filename:       header.Filename,
-			MediaType:      mediaType,
-			SizeBytes:      header.Size,
-			Body:           file,
-			AgentID:        strings.TrimSpace(r.FormValue("agent_id")),
-			LearnerID:      strings.TrimSpace(r.FormValue("learner_id")),
-			Subject:        strings.TrimSpace(r.FormValue("subject")),
-			Grade:          strings.TrimSpace(r.FormValue("grade")),
+	return n, err
+}
+
+func writeKnowledgeMultipartParseError(w http.ResponseWriter, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
+			"error": "文件过大，最大允许 200MB",
 		})
-	if err != nil {
-		writeDocumentIngestError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, result)
+	writeJSON(w, http.StatusBadRequest, map[string]string{"error": "解析上传失败: " + err.Error()})
 }
 
 func writeDocumentIngestError(w http.ResponseWriter, err error) {
@@ -818,3 +984,5 @@ func knowledgeDocResponse(doc *knowledge.Document) knowledgeDocumentResponse {
 		Warnings:     []string{},
 	}
 }
+
+// Route contract: GET /api/v1/knowledge/operations is the durable renderer recovery projection.

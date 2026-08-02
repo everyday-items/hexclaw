@@ -64,6 +64,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/messagecontent"
 	"github.com/hexagon-codes/hexclaw/render"
 	"github.com/hexagon-codes/hexclaw/router"
+	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/skill/hub"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
 	"github.com/hexagon-codes/hexclaw/storage"
@@ -118,6 +119,9 @@ type Server struct {
 	desktopSvc                *desktop.Service             // 桌面集成服务（可选）
 	cfgWriter                 *config.Writer               // 配置文件写入器（MCP 持久化用）
 	wsHandler                 http.Handler                 // WebSocket Handler（可选）
+	sidecarCapabilityToken    string                       // Desktop 每次启动注入的 loopback-only capability（可选）
+	credentialResolver        *inMemoryCredentialResolver  // native-vault refs -> process-local hydrated secrets
+	attachmentStaging         *attachmentStagingStore      // owner-bound ephemeral binary receipts
 	extraMounts               []mountedHandler             // 场景包子路由（前缀 → handler，AP-1：平台不认识场景内容）
 	streamStates              streamstate.Provider         // 流式 in-flight 状态（可选）
 	logCollector              *LogCollector                // 日志收集器
@@ -187,14 +191,16 @@ func NewServer(cfg *config.Config, eng engine.Engine, gw gateway.Gateway, store 
 	}
 
 	return &Server{
-		cfg:           cfg,
-		engine:        eng,
-		gateway:       gw,
-		store:         store,
-		logCollector:  collector,
-		workflowStore: NewWorkflowStore(),
-		teamStore:     NewTeamStore(defaultDataDir()),
-		ollamaBaseURL: defaultOllamaBaseURL,
+		cfg:                cfg,
+		engine:             eng,
+		gateway:            gw,
+		store:              store,
+		logCollector:       collector,
+		workflowStore:      NewWorkflowStore(),
+		teamStore:          NewTeamStore(defaultDataDir()),
+		ollamaBaseURL:      defaultOllamaBaseURL,
+		credentialResolver: newInMemoryCredentialResolver(),
+		attachmentStaging:  newAttachmentStagingStore(),
 	}
 }
 
@@ -211,6 +217,13 @@ func defaultDataDir() string {
 // 挂载到 /ws 路径，供 Web UI 使用。
 func (s *Server) SetWebSocketHandler(h http.Handler) {
 	s.wsHandler = h
+}
+
+// SetSidecarCapabilityToken installs the per-start Desktop capability. When
+// configured, anonymous loopback access is disabled and HTTP/WebSocket clients
+// must present this value as a Bearer token. The token is never persisted.
+func (s *Server) SetSidecarCapabilityToken(token string) {
+	s.sidecarCapabilityToken = strings.TrimSpace(token)
 }
 
 // SetStreamStateProvider 设置流式 in-flight 状态提供器。
@@ -582,6 +595,12 @@ func (s *Server) routes() http.Handler {
 
 	// API v1
 	mux.HandleFunc("POST /api/v1/chat", s.handleChat)
+	mux.HandleFunc("POST /api/v1/attachments", s.handleStageAttachment)
+	// Native-only internal API. apiAuthMiddleware requires an exact loopback
+	// sidecar capability and rejects the general API token for this namespace.
+	mux.HandleFunc("POST /api/internal/desktop/credentials/hydrate", s.handleHydrateDesktopCredentials)
+	mux.HandleFunc("POST /api/internal/desktop/credentials/dehydrate", s.handleDehydrateDesktopCredentials)
+	mux.HandleFunc("POST /api/internal/desktop/provider-credentials/reserve", s.handleReserveProviderCredentialIdentity)
 
 	// 文档渲染 API（markdown → docx/pdf/epub/odt/rtf/txt/html/md）
 	if s.renderSvc != nil {
@@ -604,6 +623,8 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("GET /api/v1/knowledge/documents", emptyList("documents"))
 	}
 	if s.semanticIndex != nil {
+		mux.HandleFunc("GET /api/v1/knowledge/operations", s.handleKnowledgeOperations)
+		mux.HandleFunc("POST /api/v1/knowledge/operations/{operation_id}/ack", s.handleAcknowledgeKnowledgeOperation)
 		mux.HandleFunc("POST /api/v1/knowledge/documents/{id}/retry", s.handleRetryKnowledgeDocument)
 		mux.HandleFunc("GET /api/v1/knowledge/corpora/{corpus_id}/embedding-policy", s.handleGetKnowledgeEmbeddingPolicy)
 		mux.HandleFunc("POST /api/v1/knowledge/corpora/{corpus_id}/embedding-policy:apply", s.handleApplyKnowledgeEmbeddingPolicy)
@@ -1022,7 +1043,7 @@ func (s *Server) StopWithDrain(ctx context.Context, drain func()) error {
 	}
 	if s.server == nil {
 		runDrain()
-		return nil
+		return s.attachmentStaging.Close()
 	}
 	if drain != nil {
 		s.server.RegisterOnShutdown(runDrain)
@@ -1031,7 +1052,7 @@ func (s *Server) StopWithDrain(ctx context.Context, drain func()) error {
 	// RegisterOnShutdown callbacks run asynchronously. Ensure the caller never
 	// observes StopWithDrain returning before its runtime cancellation ran.
 	runDrain()
-	return err
+	return errors.Join(err, s.attachmentStaging.Close())
 }
 
 // handleHealth 健康检查端点
@@ -1108,6 +1129,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// Resolve opaque staging IDs under the authenticated principal before any
+	// attachment metadata reaches validation or the engine. The request cannot
+	// provide filename, MIME, digest, or bytes for an ID reference.
+	principal := httpPrincipalFromRequest(r)
+	resolvedAttachments, err := s.ResolveStagedAttachments(r.Context(), principal.userID, req.Attachments)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "attachment is unavailable"})
+		return
+	}
+	req.Attachments = resolvedAttachments
 
 	if !adapter.HasMessageInput(req.Message, req.Attachments) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -1145,15 +1176,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 构建统一消息
-	userID := req.UserID
-	if userID == "" {
-		if platform == adapter.PlatformDesktop {
-			userID = defaultDesktopUserID
-		} else {
-			userID = "api-user" // API 调用的默认用户
-		}
-	}
+	// HTTP identity is derived exclusively by apiAuthMiddleware. Client body
+	// platform/user_id fields remain decode-compatible but carry no authority.
+	userID := principal.userID
 
 	msg := &adapter.Message{
 		ID:          "msg-" + idgen.ShortID(),
@@ -1480,21 +1505,33 @@ func (s *Server) handleChatSSE(
 
 const defaultDesktopUserID = "desktop-user"
 
-func resolveChatPlatform(req ChatRequest, r *http.Request) (adapter.Platform, error) {
-	if raw := strings.ToLower(strings.TrimSpace(req.Platform)); raw != "" {
-		switch adapter.Platform(raw) {
-		case adapter.PlatformAPI, adapter.PlatformDesktop:
-			return adapter.Platform(raw), nil
-		default:
-			return "", fmt.Errorf("platform 仅支持 api 或 desktop")
+type authenticatedHTTPPrincipal struct {
+	userID   string
+	platform adapter.Platform
+}
+
+type authenticatedHTTPPrincipalKey struct{}
+
+func withAuthenticatedHTTPPrincipal(r *http.Request, principal authenticatedHTTPPrincipal) *http.Request {
+	ctx := context.WithValue(r.Context(), authenticatedHTTPPrincipalKey{}, principal)
+	ctx = skill.WithAuthenticatedUser(ctx, principal.userID)
+	return r.WithContext(ctx)
+}
+
+func httpPrincipalFromRequest(r *http.Request) authenticatedHTTPPrincipal {
+	if r != nil {
+		if principal, ok := r.Context().Value(authenticatedHTTPPrincipalKey{}).(authenticatedHTTPPrincipal); ok &&
+			principal.userID != "" {
+			return principal
 		}
 	}
+	// Direct handler calls in embedded/tests do not cross the HTTP auth
+	// middleware. They are API calls and never inherit client identity claims.
+	return authenticatedHTTPPrincipal{userID: "api-user", platform: adapter.PlatformAPI}
+}
 
-	if isDesktopOrigin(r.Header.Get("Origin")) || strings.TrimSpace(req.UserID) == defaultDesktopUserID {
-		return adapter.PlatformDesktop, nil
-	}
-
-	return adapter.PlatformAPI, nil
+func resolveChatPlatform(_ ChatRequest, r *http.Request) (adapter.Platform, error) {
+	return httpPrincipalFromRequest(r).platform, nil
 }
 
 // corsMiddleware 处理跨域请求
@@ -1574,70 +1611,98 @@ func (s *Server) isMountedScenarioPath(path string) bool {
 
 func (s *Server) apiAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 认证规则：
-		// 1. 所有写操作（POST/PUT/DELETE）需认证，除 /api/v1/chat 和 webhook 接收
-		// 2. 日志 API（GET /api/v1/logs*）需认证（可能含敏感信息）
-		// 3. 所有 localhost 请求始终放行，兼容桌面客户端 sidecar / 本机管理
 		path := r.URL.Path
-		// PATCH 也是写操作（如 PATCH /webhooks/{name} 启停 webhook = 开关自动化派发闸门）。
-		// 漏了 PATCH 会让它绕过 Bearer 校验（非回环 + 配了 APIToken 时可无凭证操作）。
-		isWriteOp := r.Method == http.MethodPost || r.Method == http.MethodPut ||
-			r.Method == http.MethodPatch || r.Method == http.MethodDelete
-		isWebhookReceiver := (r.Method == http.MethodPost && strings.HasPrefix(path, "/api/v1/webhooks/") && path != "/api/v1/webhooks") ||
-			((r.Method == http.MethodGet || r.Method == http.MethodPost) &&
-				strings.HasPrefix(path, "/api/v1/platforms/hooks/"))
-		isLogsAPI := path == "/api/v1/logs" || strings.HasPrefix(path, "/api/v1/logs/")
-		isDesktopAPI := strings.HasPrefix(path, "/api/v1/desktop/")
-		isKnowledgeAPI := path == "/api/v1/knowledge" || strings.HasPrefix(path, "/api/v1/knowledge/")
-		// The collection GET is the K12 binding/Receipt management plane. It
-		// exposes child-scoped metadata and therefore must not inherit the broad
-		// read-only exemption used by public status endpoints.
-		isWebhookManagement := path == "/api/v1/webhooks"
-		// 场景包挂载路径（/api/k12/ 等）**读写都需鉴权**——否则落在 /api/v1 前缀守卫之外，
-		// 非回环部署下 grade/restore/provision/bind-im（写）与 backup/export/profile/mistakes（读，
-		// 含孩子 PII 与全量 .hexbak 导出）会无凭证可达。读端点尤其敏感（整份错题/档案导出）。
-		// loopback 仍在下方放行（桌面 sidecar + cron 自身 http_get 到本机端点不受影响）。
-		//
-		// BUG-4：守护前缀集从挂载注册表 extraMounts 派生，而非硬编码 `/api/k12/`——否则未来
-		// 新场景包挂到 `/api/<其他>/` 会重现 AP-184 绕过鉴权。任何 Mount 进来的场景子路由
-		// （注册为 prefix+"/"）自动纳入守卫。
-		isScenarioAPI := s.isMountedScenarioPath(path)
-		needsAuth := isDesktopAPI || isLogsAPI || isKnowledgeAPI || isScenarioAPI || isWebhookManagement ||
-			(isWriteOp && strings.HasPrefix(path, "/api/v1/") && path != "/api/v1/chat" && !isWebhookReceiver)
-
+		if isPublicAPIRequest(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		internalDesktop := strings.HasPrefix(path, "/api/internal/desktop/")
+		needsAuth := strings.HasPrefix(path, "/api/v1/") || internalDesktop || path == "/ws" || s.isMountedScenarioPath(path)
 		if !needsAuth {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		if isLoopbackRequest(r) {
-			next.ServeHTTP(w, r)
+		if internalDesktop {
+			if isLoopbackRequest(r) && s.sidecarCapabilityToken != "" && tokenMatchesBearer(r, s.sidecarCapabilityToken) {
+				next.ServeHTTP(w, withAuthenticatedHTTPPrincipal(r, authenticatedHTTPPrincipal{
+					userID: defaultDesktopUserID, platform: adapter.PlatformDesktop,
+				}))
+				return
+			}
+			writeJSON(w, http.StatusUnauthorized, map[string]string{
+				"error": "native sidecar capability required",
+			})
 			return
 		}
 
-		token := s.cfg.Server.APIToken
-		if token != "" {
-			// 配置了 Token：验证 Authorization header（constant-time 防时序攻击）
-			auth := r.Header.Get("Authorization")
-			expected := "Bearer " + token
-			if subtle.ConstantTimeCompare([]byte(auth), []byte(expected)) != 1 {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{
-					"error": "未授权：需要有效的 API Token",
-				})
-				return
-			}
-		} else {
-			// 未配置 Token：仅允许 localhost
-			if !isLoopbackRequest(r) {
-				writeJSON(w, http.StatusForbidden, map[string]string{
-					"error": "未配置 API Token，仅允许本地访问管理端点",
-				})
-				return
-			}
+		if tokenMatchesBearer(r, s.cfg.Server.APIToken) {
+			next.ServeHTTP(w, withAuthenticatedHTTPPrincipal(r, authenticatedHTTPPrincipal{
+				userID: "api-user", platform: adapter.PlatformAPI,
+			}))
+			return
+		}
+		if isLoopbackRequest(r) && tokenMatchesBearer(r, s.sidecarCapabilityToken) {
+			next.ServeHTTP(w, withAuthenticatedHTTPPrincipal(r, authenticatedHTTPPrincipal{
+				userID: defaultDesktopUserID, platform: adapter.PlatformDesktop,
+			}))
+			return
+		}
+		// Compatibility transition: old Desktop builds have no token transport.
+		// The fallback is loopback-only and disappears automatically as soon as a
+		// per-start capability is configured. It is never available remotely.
+		if isLoopbackRequest(r) && s.sidecarCapabilityToken == "" {
+			next.ServeHTTP(w, withAuthenticatedHTTPPrincipal(r, authenticatedHTTPPrincipal{
+				userID: defaultDesktopUserID, platform: adapter.PlatformDesktop,
+			}))
+			return
 		}
 
-		next.ServeHTTP(w, r)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error": "未授权：需要有效的 capability token",
+		})
 	})
+}
+
+func tokenMatchesBearer(r *http.Request, token string) bool {
+	if r == nil || token == "" {
+		return false
+	}
+	expected := "Bearer " + token
+	return subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(expected)) == 1
+}
+
+func isPublicAPIRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	path := r.URL.Path
+	if r.Method == http.MethodOptions || (r.Method == http.MethodGet && path == "/health") ||
+		(r.Method == http.MethodGet && path == "/api/v1/version") {
+		return true
+	}
+	if r.Method == http.MethodPost && hasExactPathSegments(path, "/api/v1/webhooks/", 1) {
+		return true
+	}
+	return (r.Method == http.MethodGet || r.Method == http.MethodPost) &&
+		hasExactPathSegments(path, "/api/v1/platforms/hooks/", 2)
+}
+
+func hasExactPathSegments(path, prefix string, count int) bool {
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(path, prefix)
+	parts := strings.Split(rest, "/")
+	if len(parts) != count {
+		return false
+	}
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // writeJSON 写入 JSON 响应

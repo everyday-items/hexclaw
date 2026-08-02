@@ -24,6 +24,7 @@ import (
 	hexmcp "github.com/hexagon-codes/hexclaw/mcp"
 	"github.com/hexagon-codes/hexclaw/memory"
 	"github.com/hexagon-codes/hexclaw/router"
+	"github.com/hexagon-codes/hexclaw/skill/hub"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
@@ -633,7 +634,14 @@ func (s *Server) installSkillFromClawHub(w http.ResponseWriter, r *http.Request,
 	}
 	metaType := strings.ToLower(strings.TrimSpace(meta.Type))
 	if metaType == "mcp" {
-		s.installMCPFromClawHubEntry(w, r, skillName, meta.Command, meta.Args, meta.ConfigHint)
+		entry, err := hub.ValidatePinnedMCPServer(hub.MCPServerMetaFromSkill(meta))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "MCP 市场条目未通过供应链校验: " + err.Error(),
+			})
+			return
+		}
+		s.installMCPFromClawHubEntry(w, r, entry)
 		return
 	}
 	if err := s.skillHub.Install(r.Context(), skillName); err != nil {
@@ -652,51 +660,36 @@ func (s *Server) installSkillFromClawHub(w http.ResponseWriter, r *http.Request,
 	})
 }
 
-func (s *Server) findClawHubEntry(skillName string) (meta struct {
-	Type       string
-	Command    string
-	Args       []string
-	ConfigHint string
-}, ok bool) {
+func (s *Server) findClawHubEntry(skillName string) (hub.SkillMeta, bool) {
 	if s.skillHub == nil {
-		return meta, false
+		return hub.SkillMeta{}, false
 	}
 	catalog := s.skillHub.GetCatalog()
 	if catalog == nil {
-		return meta, false
+		return hub.SkillMeta{}, false
 	}
 	for _, entry := range catalog.Skills {
 		if entry.Name != skillName {
 			continue
 		}
-		meta.Type = entry.Type
-		meta.Command = entry.Command
-		meta.Args = entry.Args
-		meta.ConfigHint = entry.ConfigHint
-		return meta, true
+		return entry, true
 	}
-	return meta, false
+	return hub.SkillMeta{}, false
 }
 
-func (s *Server) installMCPFromClawHubEntry(w http.ResponseWriter, r *http.Request, name, command string, args []string, configHint string) {
+func (s *Server) installMCPFromClawHubEntry(w http.ResponseWriter, r *http.Request, entry hub.ValidatedMCPServer) {
 	if s.mcpMgr == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-			"error": "MCP 模块未启用，无法安装 MCP 市场条目: " + name,
-		})
-		return
-	}
-	if err := validateMCPCommand(command, args); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "MCP 市场条目配置无效: " + err.Error(),
+			"error": "MCP 模块未启用，无法安装 MCP 市场条目: " + entry.Name(),
 		})
 		return
 	}
 
 	cfg := hexmcp.ServerConfig{
-		Name:      name,
+		Name:      entry.Name(),
 		Transport: "stdio",
-		Command:   command,
-		Args:      args,
+		Command:   entry.Command(),
+		Args:      entry.Args(),
 		Enabled:   true,
 	}
 
@@ -709,14 +702,14 @@ func (s *Server) installMCPFromClawHubEntry(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		// 仅不可恢复错误（name 空 / Manager 已关闭）走 400；即时连接失败属可恢复，不会到这。
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": fmt.Sprintf("MCP Server %q 添加失败: %v", name, err),
+			"error": fmt.Sprintf("MCP Server %q 添加失败: %v", entry.Name(), err),
 		})
 		return
 	}
 	// 无论是否已连上都持久化——未连上者重启后仍由 reconnectLoop 自动拉起。
 	if s.cfgWriter != nil {
-		if err := s.cfgWriter.AppendMCPServer(name, cfg.Transport, cfg.Command, cfg.Args, cfg.Env, cfg.Endpoint); err != nil {
-			logger.Error("MCP Server", "name", name, "添加成功但持久化失败", err)
+		if err := s.cfgWriter.AppendMCPServer(entry.Name(), cfg.Transport, cfg.Command, cfg.Args, cfg.Env, cfg.Endpoint); err != nil {
+			logger.Error("MCP Server", "name", entry.Name(), "添加成功但持久化失败", err)
 		}
 	}
 	msg := "MCP 条目已从 ClawHub 安装并已连接"
@@ -724,12 +717,13 @@ func (s *Server) installMCPFromClawHubEntry(w http.ResponseWriter, r *http.Reque
 		msg = "MCP 条目已从 ClawHub 安装，正在后台连接（首次需下载组件）"
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name":               name,
+		"name":               entry.Name(),
 		"type":               "mcp",
 		"message":            msg,
 		"requires_restart":   false,
 		"runtime_registered": connected,
-		"config_hint":        configHint,
+		"config_hint":        entry.ConfigHint(),
+		"artifact":           entry.Artifact(),
 	})
 }
 

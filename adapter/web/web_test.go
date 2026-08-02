@@ -286,7 +286,7 @@ func TestBuildAdapterMessagePreservesRequestIDAndExplicitModelRouting(t *testing
 		},
 	}
 
-	msg, err := buildAdapterMessage("chat-1", incoming)
+	msg, err := buildAdapterMessage("chat-1", "owner-1", incoming)
 	if err != nil {
 		t.Fatalf("buildAdapterMessage: %v", err)
 	}
@@ -325,7 +325,7 @@ func TestBuildAdapterMessageStripsForgedDispatchKeys(t *testing.T) {
 		},
 	}
 
-	msg, err := buildAdapterMessage("chat-1", incoming)
+	msg, err := buildAdapterMessage("chat-1", "owner-1", incoming)
 	if err != nil {
 		t.Fatalf("buildAdapterMessage: %v", err)
 	}
@@ -358,7 +358,7 @@ func TestBuildAdapterMessagePreservesValidatedSamplingOverrides(t *testing.T) {
 		},
 	}
 
-	msg, err := buildAdapterMessage("chat-1", incoming)
+	msg, err := buildAdapterMessage("chat-1", "owner-1", incoming)
 	if err != nil {
 		t.Fatalf("buildAdapterMessage: %v", err)
 	}
@@ -378,14 +378,14 @@ func TestBuildAdapterMessagePreservesValidatedSamplingOverrides(t *testing.T) {
 
 func TestBuildAdapterMessageRejectsInvalidSamplingOverrides(t *testing.T) {
 	temperature, maxTokens := 2.1, 0
-	if _, err := buildAdapterMessage("chat-1", wsMessage{
+	if _, err := buildAdapterMessage("chat-1", "owner-1", wsMessage{
 		Type:        "message",
 		Content:     "你好",
 		Temperature: &temperature,
 	}); err == nil {
 		t.Fatal("越界 temperature 应被拒绝")
 	}
-	if _, err := buildAdapterMessage("chat-1", wsMessage{
+	if _, err := buildAdapterMessage("chat-1", "owner-1", wsMessage{
 		Type:      "message",
 		Content:   "你好",
 		MaxTokens: &maxTokens,
@@ -393,7 +393,7 @@ func TestBuildAdapterMessageRejectsInvalidSamplingOverrides(t *testing.T) {
 		t.Fatal("max_tokens=0 应被拒绝")
 	}
 	excessive := 1_000_001
-	if _, err := buildAdapterMessage("chat-1", wsMessage{
+	if _, err := buildAdapterMessage("chat-1", "owner-1", wsMessage{
 		Type:      "message",
 		Content:   "你好",
 		MaxTokens: &excessive,
