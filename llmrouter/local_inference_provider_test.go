@@ -125,8 +125,10 @@ func TestLocalInferenceProviderCompleteSharesCoordinatorAndHonorsParentDeadline(
 
 func TestLocalInferenceProviderStreamHoldsPermitUntilClose(t *testing.T) {
 	coordinator, governor := newLocalInferenceProviderTestCoordinator(t)
+	reader, writer := io.Pipe()
+	t.Cleanup(func() { _ = writer.Close() })
 	next := &localInferenceProviderDouble{stream: func(context.Context, llm.CompletionRequest) (*llm.Stream, error) {
-		return streamx.NewStream(strings.NewReader("data: [DONE]\n"), streamx.OpenAIFormat), nil
+		return streamx.NewStream(reader, streamx.OpenAIFormat), nil
 	}}
 	provider := &localInferenceProvider{
 		next: next, coordinator: coordinator, defaultModel: "qwen3.5:9b",
@@ -139,6 +141,7 @@ func TestLocalInferenceProviderStreamHoldsPermitUntilClose(t *testing.T) {
 	if got := governor.Snapshot().Resources[resourcegov.ResourceLocalInference].InUse; got != 1 {
 		t.Fatalf("permit released when Stream returned: in_use=%d", got)
 	}
+	stream.Start()
 	if err := stream.Close(); err != nil {
 		t.Fatal(err)
 	}
