@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -9,6 +10,38 @@ import (
 	"github.com/hexagon-codes/hexclaw/knowledge"
 	"github.com/hexagon-codes/hexclaw/localinfer"
 )
+
+type sharedEmbeddingCacheOrderDouble struct {
+	calls int
+}
+
+func (e *sharedEmbeddingCacheOrderDouble) Embed(
+	_ context.Context,
+	texts []string,
+) ([][]float32, error) {
+	e.calls++
+	if len(texts) == 1 && texts[0] == "force-provider-failure" {
+		return nil, errors.New("provider failure canary")
+	}
+	vectors := make([][]float32, len(texts))
+	for i := range vectors {
+		vectors[i] = []float32{1, 0, 0}
+	}
+	return vectors, nil
+}
+
+func (e *sharedEmbeddingCacheOrderDouble) EmbedOne(
+	ctx context.Context,
+	text string,
+) ([]float32, error) {
+	vectors, err := e.Embed(ctx, []string{text})
+	if err != nil {
+		return nil, err
+	}
+	return vectors[0], nil
+}
+
+func (*sharedEmbeddingCacheOrderDouble) Dimension() int { return 3 }
 
 type commandEmbeddingExecutionRecorder struct {
 	calls []commandEmbeddingExecutionCall
@@ -99,6 +132,34 @@ func TestWrapKnowledgeEmbeddingExecutionProfileKeepsGenericFallback(t *testing.T
 	}
 	if got := commandEmbeddingBatchSizes(recorder.calls); len(got) != 1 || got[0] != 3 {
 		t.Fatalf("generic provider call shape=%v, want one batch of three", got)
+	}
+}
+
+func TestAssembleKnowledgeSharedEmbedderKeepsCacheOutsideReadiness(t *testing.T) {
+	raw := &sharedEmbeddingCacheOrderDouble{}
+	embedder := assembleKnowledgeSharedEmbedder(
+		raw,
+		"qwen3-embedding:8b",
+		true,
+		true,
+		nil,
+		true,
+		func(context.Context) bool { return false },
+	)
+	if _, err := embedder.Embed(context.Background(), []string{"cached-input"}); err != nil {
+		t.Fatalf("prime cache: %v", err)
+	}
+	if _, err := embedder.Embed(context.Background(), []string{"force-provider-failure"}); err == nil {
+		t.Fatal("provider failure did not close readiness gate")
+	}
+	if knowledge.EmbeddingReady(context.Background(), embedder) {
+		t.Fatal("outer shared embedder erased unavailable provider readiness")
+	}
+	if _, err := embedder.Embed(context.Background(), []string{"cached-input"}); err != nil {
+		t.Fatalf("cache hit was blocked by unavailable readiness: %v", err)
+	}
+	if raw.calls != 2 {
+		t.Fatalf("raw provider calls=%d, want prime+failed miss only", raw.calls)
 	}
 }
 

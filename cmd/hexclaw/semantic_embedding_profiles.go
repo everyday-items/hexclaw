@@ -245,7 +245,7 @@ func buildKnowledgeEmbeddingRuntimeProfiles(
 					guarded = readiness
 				}
 				embedder = wrapKnowledgeEmbeddingExecutionProfile(
-					hexagon.NewCachedEmbedder(guarded), candidate.model,
+					knowledge.NewCapabilityPreservingCachedEmbedder(guarded), candidate.model,
 				)
 				if candidate.local && build.localInference != nil {
 					embedder = localinfer.MarkProviderBoundEmbedder(embedder)

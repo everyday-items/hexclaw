@@ -811,35 +811,23 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					// miss requires an explicit RAG purpose/data classification.
 					guardedEmbedder = egress.NewCloudEmbedder(emb, cloudEgress)
 				}
-				// Cache sits inside the readiness gate: standby requests do not
-				// touch the endpoint; once ready, cached results remain fast.
-				var runtimeEmbedder hexagon.VectorEmbedder = hexagon.NewCachedEmbedder(guardedEmbedder)
-				if kbEmbedLocal && localInference != nil {
-					guardedEmbedder = localinfer.NewCoordinatedEmbedder(
-						guardedEmbedder, localInference, localinfer.OperationQueryEmbedding,
-					)
-					runtimeEmbedder = hexagon.NewCachedEmbedder(guardedEmbedder)
-				}
+				var readinessProbe func(context.Context) bool
 				if kbEmbedNativeOllama {
 					baseURL := kbEmbedBaseURL
 					model := kbEmbedModel
 					// Ollama 不可用/模型未安装时，缓存 miss 直接快速降级；周期实探使
 					// 一键安装或稍后启动 Ollama 后无需重启即可激活向量检索。
-					runtimeEmbedder = knowledge.NewReadinessGatedEmbedder(
-						runtimeEmbedder,
-						func(probeCtx context.Context) bool {
-							return knowledge.OllamaModelInstalled(probeCtx, baseURL, model)
-						},
-						kbEmbedReady,
-						5*time.Second,
-					)
+					readinessProbe = func(probeCtx context.Context) bool {
+						return knowledge.OllamaModelInstalled(probeCtx, baseURL, model)
+					}
 				}
-				// #5 截断闸：入 embedding API 前按 rune 截断超长文本，
-				//    防单条超长输入触发模型 token 超限错误/超量计费。
-				sharedEmbedder = wrapKnowledgeEmbeddingExecutionProfile(runtimeEmbedder, embModel)
-				if kbEmbedLocal && localInference != nil {
-					sharedEmbedder = localinfer.MarkProviderBoundEmbedder(sharedEmbedder)
-				}
+				// 精确模型应用校准后的截断、批量和物理调用预算；未知兼容
+				// 模型保留通用截断闸。cache 在 readiness/admission 外层，命中
+				// 不探活也不占本地物理槽位。
+				sharedEmbedder = assembleKnowledgeSharedEmbedder(
+					guardedEmbedder, embModel, kbEmbedLocal, kbEmbedNativeOllama,
+					localInference, kbEmbedReady, readinessProbe,
+				)
 				if kbEmbedReady {
 					logger.Info("[knowledge] embedding 已就绪", "provider", embProviderName, "model", embModel)
 				} else {
@@ -1350,7 +1338,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 	srv.SetKnowledgeEmbeddingInfo(api.KnowledgeEmbeddingInfo{
 		Enabled: cfg.Knowledge.Enabled, Provider: kbEmbedProvider, Model: kbEmbedModel,
-		BaseURL: kbEmbedBaseURL, Local: kbEmbedLocal,
+		BaseURL: kbEmbedBaseURL, Local: knowledgeEmbeddingLegacyAPILocal(kbEmbedNativeOllama),
 	})
 	// 嵌入模型首启静默预置（BUG-20260712-B1 三态机制：成功=用户零感知；失败=知识库页
 	// 浮手动重试横幅；可经 knowledge.embedding.disable_auto_install 关闭——计费网络逃生口）。

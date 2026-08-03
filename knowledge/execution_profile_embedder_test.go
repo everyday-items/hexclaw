@@ -130,3 +130,15 @@ func TestExecutionProfileEmbedderUsesQueryBudgetAndHonorsShorterParent(t *testin
 		t.Fatal("profile wrapper erased wrapped readiness=false")
 	}
 }
+
+func TestExecutionProfileEmbedderPreservesProviderBoundAdmissionCapability(t *testing.T) {
+	profile, ok := EmbeddingExecutionProfileForModel("qwen3-embedding:8b")
+	if !ok {
+		t.Fatal("qwen profile missing")
+	}
+	inner := &providerBoundFakeEmbedder{fakeEmbedder: &fakeEmbedder{dim: 3}}
+	embedder := NewExecutionProfileEmbedder(inner, profile)
+	if !hasProviderBoundEmbeddingAdmission(embedder) {
+		t.Fatal("execution profile erased provider-bound admission capability")
+	}
+}

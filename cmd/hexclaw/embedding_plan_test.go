@@ -157,29 +157,31 @@ func TestKnowledgeEmbeddingPlanAcceptsDeclaredLocalCompatibleProviderWithoutAPIK
 	}
 }
 
-func TestKnowledgeEmbeddingRuntimeProviderSeparatesLocalityFromNativeOllama(t *testing.T) {
+func TestKnowledgeEmbeddingRuntimeAssemblySeparatesLocalAdmissionFromNativeManagement(t *testing.T) {
 	tests := []struct {
-		name              string
-		providerName      string
-		provider          config.LLMProviderConfig
-		plan              knowledgeEmbeddingPlan
-		wantLocal         bool
-		wantNativeOllama  bool
-		wantCredentialsOK bool
+		name                 string
+		providerName         string
+		provider             config.LLMProviderConfig
+		plan                 knowledgeEmbeddingPlan
+		wantLocalCoordinator bool
+		wantNativeManagement bool
+		wantLegacyAPILocal   bool
+		wantCredentialsOK    bool
 	}{
 		{
 			name: "declared local compatible without key", providerName: "Private Embeddings",
 			provider: config.LLMProviderConfig{
 				BaseURL: "http://127.0.0.1:18080/v1", Locality: config.ProviderLocalityLocal,
 			},
-			plan:      knowledgeEmbeddingPlan{Provider: "Private Embeddings"},
-			wantLocal: true, wantCredentialsOK: true,
+			plan:                 knowledgeEmbeddingPlan{Provider: "Private Embeddings"},
+			wantLocalCoordinator: true, wantCredentialsOK: true,
 		},
 		{
 			name: "native ollama", providerName: "Ollama",
-			provider:  config.LLMProviderConfig{Locality: config.ProviderLocalityLocal},
-			plan:      knowledgeEmbeddingPlan{Provider: "Ollama", Ollama: true},
-			wantLocal: true, wantNativeOllama: true, wantCredentialsOK: true,
+			provider:             config.LLMProviderConfig{Locality: config.ProviderLocalityLocal},
+			plan:                 knowledgeEmbeddingPlan{Provider: "Ollama", Ollama: true},
+			wantLocalCoordinator: true, wantNativeManagement: true,
+			wantLegacyAPILocal: true, wantCredentialsOK: true,
 		},
 		{
 			name: "cloud with key", providerName: "Cloud",
@@ -201,10 +203,16 @@ func TestKnowledgeEmbeddingRuntimeProviderSeparatesLocalityFromNativeOllama(t *t
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := classifyKnowledgeEmbeddingRuntimeProvider(tt.providerName, tt.provider, tt.plan)
-			if got.local != tt.wantLocal || got.nativeOllama != tt.wantNativeOllama ||
+			legacyAPILocal := knowledgeEmbeddingLegacyAPILocal(got.nativeOllama)
+			if got.local != tt.wantLocalCoordinator ||
+				got.nativeOllama != tt.wantNativeManagement ||
+				legacyAPILocal != tt.wantLegacyAPILocal ||
 				got.credentialsReady != tt.wantCredentialsOK {
-				t.Fatalf("runtime classification = %#v, want local=%v native=%v credentials=%v",
-					got, tt.wantLocal, tt.wantNativeOllama, tt.wantCredentialsOK)
+				t.Fatalf(
+					"runtime classification = %#v legacy_api_local=%v, want coordinator=%v native_management=%v legacy_api_local=%v credentials=%v",
+					got, legacyAPILocal, tt.wantLocalCoordinator, tt.wantNativeManagement,
+					tt.wantLegacyAPILocal, tt.wantCredentialsOK,
+				)
 			}
 		})
 	}

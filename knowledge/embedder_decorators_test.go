@@ -28,6 +28,10 @@ func (f *fakeEmbedder) EmbedOne(_ context.Context, text string) ([]float32, erro
 
 func (f *fakeEmbedder) Dimension() int { return f.dim }
 
+type providerBoundFakeEmbedder struct{ *fakeEmbedder }
+
+func (*providerBoundFakeEmbedder) LocalInferenceAdmissionAtProviderBoundary() bool { return true }
+
 func TestTruncatingEmbedder_TruncatesByRunes(t *testing.T) {
 	fake := &fakeEmbedder{dim: 3}
 	emb := NewTruncatingEmbedder(fake, 5)
@@ -70,5 +74,14 @@ func TestTruncatingEmbedder_EmbedOneTruncates(t *testing.T) {
 	}
 	if len([]rune(fake.lastTexts[0])) != 4 {
 		t.Fatalf("EmbedOne should truncate to 4 runes, got %d", len([]rune(fake.lastTexts[0])))
+	}
+}
+
+func TestTruncatingEmbedderPreservesProviderBoundAdmissionCapability(t *testing.T) {
+	embedder := NewTruncatingEmbedder(&providerBoundFakeEmbedder{
+		fakeEmbedder: &fakeEmbedder{dim: 3},
+	}, 4)
+	if !hasProviderBoundEmbeddingAdmission(embedder) {
+		t.Fatal("outer truncation erased provider-bound admission capability")
 	}
 }

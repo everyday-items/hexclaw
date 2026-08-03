@@ -112,6 +112,13 @@ func (e *ExecutionProfileEmbedder) Ready(ctx context.Context) bool {
 	return EmbeddingReady(ctx, e.inner)
 }
 
+// LocalInferenceAdmissionAtProviderBoundary preserves the optional admission
+// capability when this model-shaping decorator is composed outside a
+// provider-bound cache chain.
+func (e *ExecutionProfileEmbedder) LocalInferenceAdmissionAtProviderBoundary() bool {
+	return e != nil && hasProviderBoundEmbeddingAdmission(e.inner)
+}
+
 func (e *ExecutionProfileEmbedder) timeoutFor(ctx context.Context) time.Duration {
 	switch localinfer.OperationFromContext(ctx, localinfer.OperationQueryEmbedding) {
 	case localinfer.OperationDocumentEmbedding, localinfer.OperationWarmup:

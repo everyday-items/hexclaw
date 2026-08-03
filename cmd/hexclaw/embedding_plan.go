@@ -51,6 +51,14 @@ func classifyKnowledgeEmbeddingRuntimeProvider(
 	}
 }
 
+// knowledgeEmbeddingLegacyAPILocal preserves the existing external contract:
+// KnowledgeEmbeddingInfo.Local historically means “native Ollama model can be
+// probed/managed”, not general provider locality. Keep it native-only until a
+// separately approved API/UI contract can expose both concepts.
+func knowledgeEmbeddingLegacyAPILocal(nativeOllama bool) bool {
+	return nativeOllama
+}
+
 // knowledgeEmbeddingEffectiveBaseURL keeps discovery, provider construction,
 // readiness probes and native model management on the same endpoint. The
 // endpoint-less legacy Ollama entry means the built-in localhost service; an
@@ -217,8 +225,8 @@ func resolveKnowledgeEmbeddingPlan(ctx context.Context, cfg *config.Config) know
 				ServiceAvailable: available,
 			}
 		}
-		// Cloud/custom embedding is an explicit paid capability. A provider name
-		// alone is insufficient evidence that text-embedding-3-small exists.
+		// Compatible embeddings require an explicit model and endpoint contract.
+		// Cloud routes additionally require a key; declared-local routes do not.
 		plan := knowledgeEmbeddingPlan{
 			Provider: requestedProvider,
 			Model:    requestedModel,

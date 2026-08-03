@@ -57,6 +57,14 @@ func (e *TruncatingEmbedder) Ready(ctx context.Context) bool {
 	return EmbeddingReady(ctx, e.inner)
 }
 
+// LocalInferenceAdmissionAtProviderBoundary preserves the structural marker
+// through this transparent decorator. Without it, semantic registry wrapping
+// can make cache-backed local executors look unbound and trigger a second,
+// outer admission even when the eventual call is a cache hit.
+func (e *TruncatingEmbedder) LocalInferenceAdmissionAtProviderBoundary() bool {
+	return e != nil && hasProviderBoundEmbeddingAdmission(e.inner)
+}
+
 // clampRunes 把 s 截断到最多 max 个 rune（按 rune 切，保证不切坏多字节字符）。
 func clampRunes(s string, max int) string {
 	if max <= 0 {
