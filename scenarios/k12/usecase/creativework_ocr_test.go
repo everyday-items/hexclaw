@@ -35,14 +35,7 @@ func (f *fakeWritingOCR) RecognizeWriting(_ context.Context, image []byte) (stri
 func creativeWorkOCRAsset(t *testing.T, agent string) string {
 	t.Helper()
 	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
-	// 1x1 PNG; assetstore validates the real image magic before OCR can run.
-	raw := []byte{
-		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-		0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
-		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-		0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
-		0xde,
-	}
+	raw := validPNGFixture(t, "creative-work-ocr-"+agent)
 	id, err := assetstore.Save(agent, raw)
 	if err != nil {
 		t.Fatal(err)

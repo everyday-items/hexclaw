@@ -87,6 +87,101 @@ func validateImageTaskInvocation(inv k12.ImageTaskInvocation) error {
 	return nil
 }
 
+func bindImageTaskOwnerScope(
+	ctx context.Context,
+	tx *sql.Tx,
+	dispatch k12.ImageTaskDispatch,
+) error {
+	ownerScope := strings.TrimSpace(dispatch.OwnerScope)
+	if ownerScope == "" {
+		// Legacy callers remain readable while every production PageAsset-backed
+		// ingress supplies an authenticated owner scope.
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO k12_image_task_owner_scopes(dispatch_id,owner_scope,agent_name,created_at)
+VALUES(?,?,?,?)
+ON CONFLICT(dispatch_id) DO NOTHING`,
+		dispatch.DispatchID,
+		ownerScope,
+		dispatch.AgentName,
+		dispatch.CreatedAt,
+	); err != nil {
+		return fmt.Errorf("bind image task owner scope: %w", err)
+	}
+	var storedOwner, storedAgent string
+	if err := tx.QueryRowContext(ctx, `
+SELECT owner_scope,agent_name
+FROM k12_image_task_owner_scopes
+WHERE dispatch_id=?`, dispatch.DispatchID).Scan(&storedOwner, &storedAgent); err != nil {
+		return fmt.Errorf("read image task owner scope: %w", err)
+	}
+	if storedOwner != ownerScope || storedAgent != dispatch.AgentName {
+		return fmt.Errorf(
+			"%w: dispatch owner scope already bound",
+			ErrImageTaskConflict,
+		)
+	}
+	return nil
+}
+
+func validateImageTaskOwnerScopeReplay(
+	ctx context.Context,
+	tx *sql.Tx,
+	stored k12.ImageTaskDispatch,
+	incomingOwnerScope string,
+) error {
+	incomingOwnerScope = strings.TrimSpace(incomingOwnerScope)
+	var storedOwnerScope, storedAgent string
+	err := tx.QueryRowContext(ctx, `
+SELECT owner_scope,agent_name
+FROM k12_image_task_owner_scopes
+WHERE dispatch_id=?`, stored.DispatchID).Scan(&storedOwnerScope, &storedAgent)
+	if errors.Is(err, sql.ErrNoRows) {
+		if incomingOwnerScope == "" {
+			return nil
+		}
+		return fmt.Errorf(
+			"%w: stored dispatch has no immutable owner scope",
+			ErrImageTaskConflict,
+		)
+	}
+	if err != nil {
+		return fmt.Errorf("read image task replay owner scope: %w", err)
+	}
+	if incomingOwnerScope == "" || storedOwnerScope != incomingOwnerScope ||
+		storedAgent != stored.AgentName {
+		return fmt.Errorf(
+			"%w: image task idempotency replay crossed owner scope",
+			ErrImageTaskConflict,
+		)
+	}
+	return nil
+}
+
+// GetImageTaskOwnerScope returns the immutable authenticated owner frozen at
+// dispatch creation. A missing row is not guessed from agent_name.
+func (s *Store) GetImageTaskOwnerScope(
+	ctx context.Context,
+	agentName, dispatchID string,
+) (string, error) {
+	var ownerScope string
+	err := s.db.QueryRowContext(ctx, `
+SELECT owner_scope
+FROM k12_image_task_owner_scopes
+WHERE dispatch_id=? AND agent_name=?`,
+		strings.TrimSpace(dispatchID),
+		strings.TrimSpace(agentName),
+	).Scan(&ownerScope)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrImageTaskNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("get image task owner scope: %w", err)
+	}
+	return ownerScope, nil
+}
+
 // PrepareImageTaskDispatch atomically persists the routing root and its
 // classification invocation before any provider request can escape.
 func (s *Store) PrepareImageTaskDispatch(
@@ -205,6 +300,11 @@ func (s *Store) PrepareImageTaskDispatch(
 		if existingInvocation != stored.ClassificationInvocationID {
 			return k12.ImageTaskDispatch{}, false, fmt.Errorf("%w: classification invocation drift", ErrImageTaskConflict)
 		}
+		if err := validateImageTaskOwnerScopeReplay(
+			ctx, tx, stored, dispatch.OwnerScope,
+		); err != nil {
+			return k12.ImageTaskDispatch{}, false, err
+		}
 		if err := tx.Commit(); err != nil {
 			return k12.ImageTaskDispatch{}, false, err
 		}
@@ -223,6 +323,9 @@ func (s *Store) PrepareImageTaskDispatch(
 		invocation.FinishedAt, invocation.CreatedAt, invocation.UpdatedAt,
 		invocation.DeadlineAt); err != nil {
 		return k12.ImageTaskDispatch{}, false, fmt.Errorf("prepare classification invocation: %w", err)
+	}
+	if err := bindImageTaskOwnerScope(ctx, tx, dispatch); err != nil {
+		return k12.ImageTaskDispatch{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return k12.ImageTaskDispatch{}, false, err
@@ -326,6 +429,11 @@ func (s *Store) PrepareParentSelectedCreativeDispatch(
 			return k12.ImageTaskDispatch{}, nil, false,
 				fmt.Errorf("%w: manual idempotency key bound to another input", ErrImageTaskConflict)
 		}
+		if err := validateImageTaskOwnerScopeReplay(
+			ctx, tx, stored, dispatch.OwnerScope,
+		); err != nil {
+			return k12.ImageTaskDispatch{}, nil, false, err
+		}
 		target, getErr := getImageTaskRouteTarget(ctx, tx, stored)
 		if getErr != nil {
 			return k12.ImageTaskDispatch{}, nil, false, getErr
@@ -371,6 +479,9 @@ func (s *Store) PrepareParentSelectedCreativeDispatch(
 		target.CreativeIntake.IntakeID != dispatch.TargetObjectID {
 		return k12.ImageTaskDispatch{}, nil, false,
 			fmt.Errorf("%w: manual creative target drift", ErrImageTaskConflict)
+	}
+	if err := bindImageTaskOwnerScope(ctx, tx, dispatch); err != nil {
+		return k12.ImageTaskDispatch{}, nil, false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return k12.ImageTaskDispatch{}, nil, false, err
@@ -542,6 +653,54 @@ func (s *Store) ListImageTaskDispatchesForSession(
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list image task session projection: %w", err)
+	}
+	defer rows.Close()
+	dispatches := make([]k12.ImageTaskDispatch, 0)
+	for rows.Next() {
+		dispatch, scanErr := scanImageTaskDispatch(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		dispatches = append(dispatches, dispatch)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return dispatches, nil
+}
+
+// ListImageTaskDispatchesForOwnerSession is the remote renderer recovery
+// projection. The immutable dispatch owner is part of the SQL predicate so an
+// Agent transfer cannot expose a previous owner's history and a legacy row
+// without a frozen owner is never guessed from the Agent's current binding.
+func (s *Store) ListImageTaskDispatchesForOwnerSession(
+	ctx context.Context,
+	ownerScope, agentName, sourceSessionID string,
+) ([]k12.ImageTaskDispatch, error) {
+	ownerScope = strings.TrimSpace(ownerScope)
+	agentName = strings.TrimSpace(agentName)
+	sourceSessionID = strings.TrimSpace(sourceSessionID)
+	if ownerScope == "" || agentName == "" || sourceSessionID == "" {
+		return nil, ErrImageTaskNotFound
+	}
+	rows, err := s.db.QueryContext(
+		ctx,
+		imageTaskDispatchSelect+
+			` WHERE agent_name=? AND source_session_id=?
+			    AND EXISTS (
+			        SELECT 1
+			        FROM k12_image_task_owner_scopes AS owner_binding
+			        WHERE owner_binding.dispatch_id=k12_image_task_dispatches.dispatch_id
+			          AND owner_binding.agent_name=k12_image_task_dispatches.agent_name
+			          AND owner_binding.owner_scope=?
+			    )
+			  ORDER BY created_at,dispatch_id`,
+		agentName,
+		sourceSessionID,
+		ownerScope,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list owner-scoped image task session projection: %w", err)
 	}
 	defer rows.Close()
 	dispatches := make([]k12.ImageTaskDispatch, 0)

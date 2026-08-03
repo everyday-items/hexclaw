@@ -200,7 +200,7 @@ func newImageTaskHTTPFixture(t *testing.T) imageTaskHTTPFixture {
 		t.Fatal(err)
 	}
 	raw, err := base64.StdEncoding.DecodeString(
-		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2n1cAAAAASUVORK5CYII=",
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -413,7 +413,7 @@ func TestImageTaskPublicSurfaceExactSetAndNoInternalLeak(t *testing.T) {
 		t.Fatalf("result wire contract drift: %#v", result)
 	}
 	rawImage, err := base64.StdEncoding.DecodeString(
-		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2n1cAAAAASUVORK5CYII=",
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
 	)
 	if err != nil {
 		t.Fatal(err)

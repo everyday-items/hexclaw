@@ -74,11 +74,56 @@ func (h *handler) problemSourceAction(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "image task coordinator unavailable")
 		return
 	}
+	if h.rt.Records == nil {
+		writeErr(w, http.StatusServiceUnavailable, "image task records unavailable")
+		return
+	}
+	durableScope, err := h.rt.Records.GetProblemSourceActionAssetScope(
+		r.Context(),
+		dispatchID,
+		problemID,
+	)
+	if err != nil {
+		if errors.Is(err, k12storage.ErrProblemSourceActionNotFound) {
+			writeErr(w, http.StatusNotFound, "problem source action scope not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if strings.TrimSpace(h.rt.PrincipalMode) == "remote" {
+		durableOwnerScope, scopeErr := h.rt.Records.GetImageTaskOwnerScope(
+			r.Context(),
+			durableScope.AgentName,
+			dispatchID,
+		)
+		if scopeErr != nil {
+			if errors.Is(scopeErr, k12storage.ErrImageTaskNotFound) {
+				writeErr(w, http.StatusNotFound, "problem source action scope not found")
+				return
+			}
+			writeErr(w, http.StatusInternalServerError, scopeErr.Error())
+			return
+		}
+		if durableOwnerScope != ownerScope {
+			// Cross-owner objects are existence-hidden and never reach the
+			// owner-to-Agent command authorizer.
+			writeErr(w, http.StatusNotFound, "problem source action scope not found")
+			return
+		}
+		if h.rt.AuthorizeAgentScope == nil ||
+			h.rt.AuthorizeAgentScope(r.Context(), ownerScope, durableScope.AgentName) != nil {
+			// The durable owner is already proven. A command-capability denial is
+			// therefore 403 without exposing any target content.
+			writeErr(w, http.StatusForbidden, "problem source action forbidden")
+			return
+		}
+	}
 	result, err := h.rt.ImageTasks.CommitProblemSourceAction(
 		r.Context(),
 		usecase.ProblemSourceActionCommand{
 			OwnerScope:            ownerScope,
-			TrustedAgentName:      problemSourceActionTrustedAgent(h.rt, ownerScope),
+			TrustedAgentName:      durableScope.AgentName,
 			DispatchID:            dispatchID,
 			ProblemID:             problemID,
 			IdempotencyKey:        strings.TrimSpace(r.Header.Get("Idempotency-Key")),
@@ -90,6 +135,10 @@ func (h *handler) problemSourceAction(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		switch {
+		case errors.Is(err, usecase.ErrProblemSourceActionAssetNotFound):
+			writeErr(w, http.StatusNotFound, "problem source action PageAsset not found")
+		case errors.Is(err, usecase.ErrProblemSourceActionInvalid):
+			writeErr(w, http.StatusUnprocessableEntity, err.Error())
 		case errors.Is(err, k12storage.ErrProblemSourceActionNotFound):
 			writeErr(w, http.StatusNotFound, err.Error())
 		case errors.Is(err, k12storage.ErrProblemSourceActionConflict):
@@ -117,13 +166,6 @@ func writeFrozenProblemSourceActionJSON(w http.ResponseWriter, raw json.RawMessa
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(raw)
 	_, _ = w.Write([]byte{'\n'})
-}
-
-func problemSourceActionTrustedAgent(rt Runtime, ownerScope string) string {
-	if strings.TrimSpace(rt.PrincipalMode) == "remote" {
-		return strings.TrimSpace(ownerScope)
-	}
-	return ""
 }
 
 func (h *handler) problemSourceActionOwnerScope(
@@ -178,17 +220,17 @@ func validateProblemSourceActionPayload(w http.ResponseWriter, req problemSource
 
 func decodeProblemSourceActionPayload(w http.ResponseWriter, raw json.RawMessage, dst any) bool {
 	if len(bytes.TrimSpace(raw)) == 0 {
-		writeErr(w, http.StatusUnprocessableEntity, "action payload required")
+		writeErr(w, http.StatusBadRequest, "action payload required")
 		return false
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
-		writeErr(w, http.StatusUnprocessableEntity, "invalid action payload: "+err.Error())
+		writeErr(w, http.StatusBadRequest, "invalid action payload: "+err.Error())
 		return false
 	}
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
-		writeErr(w, http.StatusUnprocessableEntity, "action payload must contain exactly one JSON value")
+		writeErr(w, http.StatusBadRequest, "action payload must contain exactly one JSON value")
 		return false
 	}
 	return true

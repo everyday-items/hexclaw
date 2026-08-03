@@ -10,6 +10,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/records"
 	k12 "github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
@@ -22,6 +23,28 @@ type fakeK12ImageTaskFacade struct {
 	getCalls     int
 	confirmCalls int
 	result       k12usecase.ImageTaskResult
+}
+
+func (f *fakeK12ImageTaskFacade) PersistPageAsset(
+	_ context.Context,
+	ownerScope, agentName string,
+	data []byte,
+) (k12usecase.ReadyPageAsset, error) {
+	f.events = append(f.events, "persist")
+	inspection, err := assetstore.Inspect(agentName, data)
+	if err != nil {
+		return k12usecase.ReadyPageAsset{}, err
+	}
+	if _, err := assetstore.Save(agentName, data); err != nil {
+		return k12usecase.ReadyPageAsset{}, err
+	}
+	return k12usecase.ReadyPageAsset{
+		Metadata: k12storage.PageAssetMetadata{
+			OwnerScope: ownerScope, AgentName: agentName,
+			PageAssetID: inspection.AssetID,
+		},
+		Data: append([]byte(nil), data...),
+	}, nil
 }
 
 func (f *fakeK12ImageTaskFacade) Create(
@@ -117,13 +140,14 @@ func TestMaybeHandleK12DingtalkPhoto_RoutesOnlyThroughImageTaskFacade(t *testing
 	if err != nil || !handled {
 		t.Fatalf("ImageTask 路径应接管: handled=%v err=%v", handled, err)
 	}
-	if got := strings.Join(facade.events, ","); got != "create,start,get,confirm,result" {
+	if got := strings.Join(facade.events, ","); got != "persist,create,start,get,confirm,result" {
 		t.Fatalf("入口必须先固化 dispatch，再启动并只经统一门面推进: %s", got)
 	}
 	in := facade.createInput
 	if in.SourceKind != k12.ImageTaskSourceIM || in.SourceRef != "msg-1" ||
 		in.SourceSessionID != "family-group" || in.AgentName != "child-tutor" ||
-		in.LearnerID != "child-tutor" || in.AttemptGeneration != 1 {
+		in.LearnerID != "child-tutor" || in.AttemptGeneration != 1 ||
+		in.OwnerScope != k12usecase.DefaultLocalOwnerScope {
 		t.Fatalf("ImageTask 来源/幂等身份丢失: %+v", in)
 	}
 	if len(in.SourceAssetRefs) != 1 {

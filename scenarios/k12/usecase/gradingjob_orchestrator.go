@@ -99,6 +99,21 @@ func (o *GradingOrchestrator) jobLock(jobID string) *sync.Mutex {
 	return l
 }
 
+// withProblemSourceActionJobFence linearizes a source-changing command with
+// the canonical grading runner and the source reprocess worker. All three use
+// the same per-Job mutex, so a command cannot commit a new immutable V72 head
+// after runAssessItems passed its pending-source gate but before/during a
+// provider operation in this process.
+func (o *GradingOrchestrator) withProblemSourceActionJobFence(
+	jobID string,
+	command func() error,
+) error {
+	l := o.jobLock(strings.TrimSpace(jobID))
+	l.Lock()
+	defer l.Unlock()
+	return command()
+}
+
 func (o *GradingOrchestrator) acquirePageAssetLock(agentName, imageDigest string) func() {
 	key := agentName + "\x00" + imageDigest
 	o.mu.Lock()
@@ -753,10 +768,10 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 		return GradingJobView{}, settleErr
 	}
 	// Fields.Deadline is the durable budget for the current automatic stage.
-	// Derive the provider call from it so synchronous runs, async workers, and
-	// recovered jobs all honor the same absolute cutoff. context.WithDeadline
-	// also preserves an earlier caller/process deadline.
-	providerCtx, cancelProvider := gradingStageContext(ctx, job.Fields.Deadline)
+	// The provider call must use that persisted cutoff rather than a shorter
+	// transient request context; durableGradingStageContext still binds the
+	// returned cancel to the process lifecycle and public Job cancellation.
+	providerCtx, cancelProvider := o.durableGradingStageContext(ctx, job.Fields.Deadline)
 	if !invocation.RequestPolicySnapshot.IsZero() {
 		providerCtx = k12.WithGradingModelRequestPolicy(
 			providerCtx,
@@ -884,6 +899,20 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 			}
 			return v, ledgerErr
 		}
+		// A public Job cancellation owns the Job terminal state even when the
+		// queued physical child has only just converged to a definite no-send
+		// failure. Do not race that persisted cancellation with a failed-stage
+		// transition; retain the settled parent/child facts and return the
+		// canonical cancellation to the synchronous caller.
+		if current, readErr := o.deps.GetGradingJob(
+			context.WithoutCancel(ctx),
+			run.agentName,
+			jobID,
+		); readErr != nil {
+			return current, errors.Join(err, readErr)
+		} else if current.Record != nil && current.Record.Status == k12.GradingStageCancelled {
+			return current, context.Canceled
+		}
 		v, aerr := o.deps.AdvanceGradingStage(
 			context.WithoutCancel(ctx),
 			run.agentName,
@@ -1007,10 +1036,34 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 }
 
 func gradingStageContext(parent context.Context, deadline int64) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
 	if deadline <= 0 {
 		return context.WithCancel(parent)
 	}
-	return context.WithDeadline(parent, time.Unix(deadline, 0))
+	// A GradingJob deadline is a durable stage fact. The caller can be a short
+	// lived HTTP/IM request or result poll; retain its values but do not let that
+	// transient cancellation/deadline shorten an already persisted stage window.
+	return context.WithDeadline(context.WithoutCancel(parent), time.Unix(deadline, 0))
+}
+
+// durableGradingStageContext restores the orchestrator lifecycle cancellation
+// that gradingStageContext intentionally detaches from transient callers. The
+// same returned cancel is registered for explicit public Job cancellation.
+func (o *GradingOrchestrator) durableGradingStageContext(parent context.Context, deadline int64) (context.Context, context.CancelFunc) {
+	stageCtx, cancelStage := gradingStageContext(parent, deadline)
+	if deadline <= 0 {
+		return stageCtx, cancelStage
+	}
+	stopLifecycleCancel := context.AfterFunc(o.gradingBaseContext(), cancelStage)
+	var once sync.Once
+	return stageCtx, func() {
+		once.Do(func() {
+			stopLifecycleCancel()
+			cancelStage()
+		})
+	}
 }
 
 func gradingStageMayStartPhysicalWork(stage string) bool {
@@ -1385,7 +1438,7 @@ func (o *GradingOrchestrator) runAssess(ctx context.Context, run *gradingRun, jo
 		assessDeps.PhotoAnnotator = recorder
 	}
 
-	providerCtx, cancelProvider := gradingStageContext(ctx, job.Fields.Deadline)
+	providerCtx, cancelProvider := o.durableGradingStageContext(ctx, job.Fields.Deadline)
 	unregisterProvider := o.registerGradingModelCall(jobID, cancelProvider)
 	if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), run.agentName, jobID); readErr != nil {
 		cancelProvider()
@@ -1632,6 +1685,10 @@ func cloneRecognizedQuestions(questions []RecognizedQuestion) []RecognizedQuesti
 		if question.BBox != nil {
 			box := *question.BBox
 			out[i].BBox = &box
+		}
+		if question.SourceRegion != nil {
+			region := *question.SourceRegion
+			out[i].SourceRegion = &region
 		}
 	}
 	return out

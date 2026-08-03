@@ -179,7 +179,11 @@ func (c FactCandidate) ParentAuthored() bool {
 }
 
 type ImageTaskDispatch struct {
-	DispatchID       string              `json:"dispatch_id"`
+	DispatchID string `json:"dispatch_id"`
+	// OwnerScope is the authenticated account boundary frozen by the ingress
+	// adapter. It is stored in the V72 owner-scope ledger rather than exposed in
+	// public task projections.
+	OwnerScope       string              `json:"-"`
 	AgentName        string              `json:"agent_name"`
 	LearnerID        string              `json:"learner_id"`
 	SourceKind       ImageTaskSourceKind `json:"source_kind"`
@@ -215,6 +219,16 @@ type ImageTaskDispatch struct {
 	Version                     int                        `json:"version"`
 	CreatedAt                   int64                      `json:"created_at"`
 	UpdatedAt                   int64                      `json:"updated_at"`
+}
+
+// SourcePixelRegion is a rectangle in the PageAsset's verified, orientation-
+// normalized source-pixel coordinate system. It is deliberately distinct from
+// the normalized answer BBox used for annotation.
+type SourcePixelRegion struct {
+	X      int `json:"x"`
+	Y      int `json:"y"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
 }
 
 const ImageTaskAutomaticBudgetSeconds = 300

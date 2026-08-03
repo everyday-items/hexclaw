@@ -318,7 +318,14 @@ func newDD036CrossLayerHarness(
 		snapshot: snapshot,
 		mode:     mode,
 	}
-	frozenNow := time.Now().Unix()
+	now := time.Now()
+	frozenNow := now.Unix()
+	if mode == dd036CrossLayerTimeout || mode == dd036CrossLayerCancel {
+		// These cases must observe the durable stage deadline rather than a
+		// transient caller context. Freeze a legitimate nearly-expired stage so
+		// the terminal outcome is exercised in seconds, not by sleeping 120s.
+		frozenNow = now.Add(-114 * time.Second).Unix()
+	}
 	deps := usecase.Deps{
 		Recognizer: NewRecognizerAdapter(probe.vision, options...),
 		Records:    store,
@@ -585,7 +592,6 @@ func TestDD036GradingOrchestratorRecognizerAdapterDurablePhysicalCalls(t *testin
 			)
 			if testCase.useCallerTimeout {
 				runCtx, cancelRun = context.WithTimeout(context.Background(), 5*time.Second)
-				expectedDeadline, _ = runCtx.Deadline()
 			} else if testCase.useCallerCancel {
 				runCtx, cancelRun = context.WithCancel(context.Background())
 				harness.probe.cancelRun = cancelRun
@@ -788,7 +794,7 @@ func TestDD036GradingOrchestratorRecognizerAdapterDurablePhysicalCalls(t *testin
 // CPU split permit proves that no provider request escaped. The already-sent
 // stage parent must therefore converge to a definite failure, never to
 // outcome_unknown, and no physical child may exist.
-func TestDD036RecognizerGovernorCancellationBeforePhysicalSendIsDefinite(t *testing.T) {
+func TestDD036RecognizerGovernorPublicJobCancellationBeforePhysicalSendIsDefinite(t *testing.T) {
 	store, constraint := newDD036CrossLayerStore(t)
 	governor, err := resourcegov.New(resourcegov.DefaultConfig())
 	if err != nil {
@@ -829,8 +835,6 @@ func TestDD036RecognizerGovernorCancellationBeforePhysicalSendIsDefinite(t *test
 		0,
 	)
 
-	runCtx, cancelRun := context.WithCancel(context.Background())
-	defer cancelRun()
 	type runResult struct {
 		view usecase.GradingJobView
 		err  error
@@ -838,7 +842,7 @@ func TestDD036RecognizerGovernorCancellationBeforePhysicalSendIsDefinite(t *test
 	done := make(chan runResult, 1)
 	go func() {
 		view, runErr := harness.orchestrator.RunGradingJob(
-			runCtx,
+			context.Background(),
 			job.Record.RecordID,
 		)
 		done <- runResult{view: view, err: runErr}
@@ -860,7 +864,20 @@ func TestDD036RecognizerGovernorCancellationBeforePhysicalSendIsDefinite(t *test
 		}
 		time.Sleep(time.Millisecond)
 	}
-	cancelRun()
+	cancelled, handled, cancelErr := harness.orchestrator.CancelPhotoGradingJob(
+		context.Background(),
+		"mingming",
+		job.Record.RecordID,
+	)
+	if cancelErr != nil || !handled || cancelled.Record == nil ||
+		cancelled.Record.Status != k12.GradingStageCancelled {
+		t.Fatalf(
+			"public cancel handled=%v err=%v view=%+v; want persisted cancelled job",
+			handled,
+			cancelErr,
+			cancelled,
+		)
+	}
 
 	var result runResult
 	select {
@@ -871,11 +888,9 @@ func TestDD036RecognizerGovernorCancellationBeforePhysicalSendIsDefinite(t *test
 	if !errors.Is(result.err, context.Canceled) {
 		t.Fatalf("RunGradingJob error=%v want context cancellation", result.err)
 	}
-	if result.view.Record == nil ||
-		(result.view.Record.Status != k12.GradingStageFailedRetryable &&
-			result.view.Record.Status != k12.GradingStageFailedTerminal) {
+	if result.view.Record == nil || result.view.Record.Status != k12.GradingStageCancelled {
 		t.Fatalf(
-			"zero-send governor cancellation job=%+v err=%v; want definite failed, never outcome_unknown",
+			"zero-send governor public cancellation job=%+v err=%v; want cancelled",
 			result.view,
 			result.err,
 		)

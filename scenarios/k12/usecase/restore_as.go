@@ -11,6 +11,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 )
 
 const (
@@ -171,8 +172,9 @@ func MigrateHexbakOwner(source *Hexbak, targetAgent string) (*Hexbak, error) {
 		return nil, err
 	}
 	migrated.Assets = assets
+	assetMapping := creativeWorkOCRAssetMapping(source, migrated)
 	migrated.ProblemAttempts, err = migrateHexbakProblemAttempts(
-		source.ProblemAttempts, targetAgent, creativeWorkOCRAssetMapping(source, migrated),
+		source.ProblemAttempts, targetAgent, assetMapping,
 	)
 	if err != nil {
 		return nil, err
@@ -182,10 +184,24 @@ func MigrateHexbakOwner(source *Hexbak, targetAgent string) (*Hexbak, error) {
 		return nil, err
 	}
 	migrated.CreativeWorkOCR, err = migrateCreativeWorkOCREvidence(
-		sourceOCR, targetAgent, creativeWorkOCRAssetMapping(source, migrated), jobIDs,
+		sourceOCR, targetAgent, assetMapping, jobIDs,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if source.ProblemSource != nil {
+		problemSource, migrateErr := k12storage.MigrateProblemSourceArchiveV6Owner(
+			source.AgentName, targetAgent, *source.ProblemSource, assetMapping,
+		)
+		if migrateErr != nil {
+			if errors.Is(migrateErr, k12storage.ErrProblemSourceArchiveLiveWork) {
+				return nil, fmt.Errorf("%w: %v", ErrHexbakProblemSourceLiveWork, migrateErr)
+			}
+			return nil, fmt.Errorf("%w: restore-as: %v", ErrHexbakProblemSource, migrateErr)
+		}
+		migrated.ProblemSource = &problemSource
+	} else {
+		migrated.ProblemSource = nil
 	}
 	if err := SealHexbak(migrated); err != nil {
 		return nil, err
@@ -251,7 +267,20 @@ func cloneHexbak(bak *Hexbak) *Hexbak {
 	}
 	out.CreativeWorkOCR = append([]k12.CreativeWorkOCRArchiveEvidence(nil), bak.CreativeWorkOCR...)
 	out.ProblemAttempts = cloneProblemAttemptSnapshots(bak.ProblemAttempts)
+	if bak.ProblemSource != nil {
+		cloned := k12storageCloneProblemSourceArchive(*bak.ProblemSource)
+		out.ProblemSource = &cloned
+	}
 	return &out
+}
+
+func k12storageCloneProblemSourceArchive(
+	source k12storage.ProblemSourceArchiveV6,
+) k12storage.ProblemSourceArchiveV6 {
+	raw, _ := json.Marshal(source)
+	var out k12storage.ProblemSourceArchiveV6
+	_ = json.Unmarshal(raw, &out)
+	return out
 }
 
 func validateArchivedProfile(bak *Hexbak) error {

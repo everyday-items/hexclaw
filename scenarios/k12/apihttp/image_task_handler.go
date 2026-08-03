@@ -8,7 +8,6 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
-	"github.com/hexagon-codes/hexclaw/scenarios/k12/viewcontract"
 )
 
 type imageTaskRouteRequest struct {
@@ -77,11 +76,34 @@ type imageTaskHomeworkProjectionDTO struct {
 	FinalArtifact     *k12.GradingFinalArtifact `json:"final_artifact,omitempty"`
 }
 
-type imageTaskProgressiveDTO = viewcontract.ProblemSourceProgressiveSnapshot
+// imageTaskProgressiveDTO intentionally exposes only the ImageTask progress
+// contract. Source-action snapshots carry a separate, all-or-nothing source
+// fact exact-set; reusing that DTO here serializes source_region:null even
+// when this projection has no source facts at all.
+type imageTaskProgressiveDTO struct {
+	StructureVersion int                             `json:"structure_version"`
+	SnapshotRevision int                             `json:"snapshot_revision"`
+	ProblemProgress  []imageTaskProblemProgressDTO   `json:"problem_progress"`
+	Coverage         imageTaskProgressiveCoverageDTO `json:"coverage"`
+}
 
-type imageTaskProblemProgressDTO = viewcontract.ProblemSourceProgress
+type imageTaskProblemProgressDTO struct {
+	ProblemID          string `json:"problem_id"`
+	Status             string `json:"status"`
+	InputRevision      int    `json:"input_revision"`
+	PublishedRevision  int    `json:"published_revision"`
+	CurrentDisposition string `json:"current_disposition"`
+}
 
-type imageTaskProgressiveCoverageDTO = viewcontract.ProblemSourceProgressiveCoverage
+type imageTaskProgressiveCoverageDTO struct {
+	Total              int    `json:"total"`
+	Published          int    `json:"published"`
+	Skipped            int    `json:"skipped"`
+	Awaiting           int    `json:"awaiting"`
+	Failed             int    `json:"failed"`
+	Status             string `json:"status"`
+	ProjectionRevision int    `json:"projection_revision"`
+}
 
 func publicImageTaskProgressive(
 	snapshot usecase.ImageTaskProgressiveSnapshot,
@@ -322,8 +344,17 @@ func (h *handler) createImageTask(w http.ResponseWriter, r *http.Request) {
 	if !decodeStrict(w, r, &req) {
 		return
 	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	if req.Agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	ownerScope, ok := h.authorizeImageTaskAgent(w, r, req.Agent)
+	if !ok {
+		return
+	}
 	input := usecase.CreateImageTaskInput{
-		AgentName: req.Agent, LearnerID: req.Agent,
+		OwnerScope: ownerScope, AgentName: req.Agent, LearnerID: req.Agent,
 		SourceKind: req.SourceKind, SourceRef: req.SourceRef,
 		SourceSessionID: req.SourceSession, SourceAssetRefs: req.SourceAssetRefs,
 		MessageIntent: req.MessageIntent, AttemptGeneration: req.AttemptGeneration,
@@ -351,6 +382,56 @@ func (h *handler) createImageTask(w http.ResponseWriter, r *http.Request) {
 
 func imageTaskAgent(r *http.Request) string {
 	return strings.TrimSpace(r.URL.Query().Get("agent"))
+}
+
+func (h *handler) authorizeImageTaskAgent(
+	w http.ResponseWriter,
+	r *http.Request,
+	agentName string,
+) (string, bool) {
+	ownerScope, err := h.authorizedAgentOwnerScope(r.Context(), agentName)
+	if errors.Is(err, errAgentScopeNotFound) {
+		writeErr(w, http.StatusNotFound, "image task projection not found")
+		return "", false
+	}
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "authenticated image task principal required")
+		return "", false
+	}
+	return ownerScope, true
+}
+
+func (h *handler) authorizeImageTaskDispatch(
+	w http.ResponseWriter,
+	r *http.Request,
+	agentName, dispatchID string,
+) (string, bool) {
+	ownerScope, ok := h.authorizeImageTaskAgent(w, r, agentName)
+	if !ok {
+		return "", false
+	}
+	if strings.TrimSpace(h.rt.PrincipalMode) != "remote" {
+		return ownerScope, true
+	}
+	if h.rt.Records == nil {
+		writeErr(w, http.StatusServiceUnavailable, "image task owner scope unavailable")
+		return "", false
+	}
+	durableOwner, err := h.rt.Records.GetImageTaskOwnerScope(
+		r.Context(), agentName, strings.TrimSpace(dispatchID),
+	)
+	if errors.Is(err, k12storage.ErrImageTaskNotFound) ||
+		(err == nil && durableOwner != ownerScope) {
+		// Do not reveal whether the dispatch exists, belongs to a previous
+		// owner, or predates immutable owner binding.
+		writeErr(w, http.StatusNotFound, "image task projection not found")
+		return "", false
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return "", false
+	}
+	return ownerScope, true
 }
 
 type recoverableImageTask struct {
@@ -399,25 +480,21 @@ func (h *handler) listRecoverableImageTasks(w http.ResponseWriter, r *http.Reque
 		writeErr(w, http.StatusBadRequest, "session required")
 		return
 	}
-	ownerID, err := h.ownerScope(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusUnauthorized, "authenticated image task principal required")
+	ownerScope, ok := h.authorizeImageTaskAgent(w, r, agent)
+	if !ok {
 		return
 	}
+	var dispatches []k12.ImageTaskDispatch
+	var err error
 	if strings.TrimSpace(h.rt.PrincipalMode) == "remote" {
-		if h.rt.AuthorizeAgentScope == nil {
-			writeErr(w, http.StatusUnauthorized, "authenticated image task principal required")
-			return
-		}
-		if err := h.rt.AuthorizeAgentScope(r.Context(), ownerID, agent); err != nil {
-			// Do not reveal whether the agent or owner exists.
-			writeErr(w, http.StatusNotFound, "image task projection not found")
-			return
-		}
+		dispatches, err = h.rt.Records.ListImageTaskDispatchesForOwnerSession(
+			r.Context(), ownerScope, agent, sessionID,
+		)
+	} else {
+		dispatches, err = h.rt.Records.ListImageTaskDispatchesForSession(
+			r.Context(), agent, sessionID,
+		)
 	}
-	dispatches, err := h.rt.Records.ListImageTaskDispatchesForSession(
-		r.Context(), agent, sessionID,
-	)
 	if err != nil {
 		if errors.Is(err, k12storage.ErrImageTaskNotFound) {
 			writeErr(w, http.StatusNotFound, "image task projection not found")
@@ -456,6 +533,11 @@ func (h *handler) getImageTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
+	if _, ok := h.authorizeImageTaskDispatch(
+		w, r, agent, r.PathValue("id"),
+	); !ok {
+		return
+	}
 	view, err := h.rt.ImageTasks.Get(r.Context(), agent, r.PathValue("id"))
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
@@ -492,6 +574,16 @@ func (h *handler) confirmImageTask(w http.ResponseWriter, r *http.Request) {
 	}
 	var req confirmImageTaskReq
 	if !decodeStrict(w, r, &req) {
+		return
+	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	if req.Agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	if _, ok := h.authorizeImageTaskDispatch(
+		w, r, req.Agent, r.PathValue("id"),
+	); !ok {
 		return
 	}
 	input := usecase.ConfirmImageTaskInput{
@@ -572,6 +664,16 @@ func (h *handler) retryImageTask(w http.ResponseWriter, r *http.Request) {
 	if !decodeStrict(w, r, &req) {
 		return
 	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	if req.Agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	if _, ok := h.authorizeImageTaskDispatch(
+		w, r, req.Agent, r.PathValue("id"),
+	); !ok {
+		return
+	}
 	view, err := h.rt.ImageTasks.Retry(r.Context(), req.Agent, r.PathValue("id"), req.Version)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusConflict), err.Error())
@@ -587,6 +689,16 @@ func (h *handler) cancelImageTask(w http.ResponseWriter, r *http.Request) {
 	}
 	var req imageTaskVersionReq
 	if !decodeStrict(w, r, &req) {
+		return
+	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	if req.Agent == "" {
+		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	if _, ok := h.authorizeImageTaskDispatch(
+		w, r, req.Agent, r.PathValue("id"),
+	); !ok {
 		return
 	}
 	view, err := h.rt.ImageTasks.Cancel(r.Context(), req.Agent, r.PathValue("id"), req.Version)
@@ -605,6 +717,11 @@ func (h *handler) getImageTaskResult(w http.ResponseWriter, r *http.Request) {
 	agent := imageTaskAgent(r)
 	if agent == "" {
 		writeErr(w, http.StatusBadRequest, "agent required")
+		return
+	}
+	if _, ok := h.authorizeImageTaskDispatch(
+		w, r, agent, r.PathValue("id"),
+	); !ok {
 		return
 	}
 	result, err := h.rt.ImageTasks.Result(r.Context(), agent, r.PathValue("id"))

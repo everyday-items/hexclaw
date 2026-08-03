@@ -35,6 +35,14 @@ func (o *GradingOrchestrator) finalizeGradingPage(
 	} else if !errors.Is(err, records.ErrNotFound) {
 		return k12.GradingFinalArtifact{}, err
 	}
+	finalizationGeneration, err := o.deps.Records.GetGradingFinalizationGeneration(
+		ctx,
+		job.Record.AgentName,
+		job.Record.RecordID,
+	)
+	if err != nil {
+		return k12.GradingFinalArtifact{}, err
+	}
 	if err := o.requireTerminalGradingOperations(
 		ctx, job.Record.AgentName, job.Record.RecordID,
 	); err != nil {
@@ -187,7 +195,11 @@ func (o *GradingOrchestrator) finalizeGradingPage(
 		SummaryInvocationID:       summaryInvocationID,
 	}
 	artifact.ArtifactDigest = gradingFinalArtifactDigest(artifact)
-	stored, _, err := o.deps.Records.CommitGradingFinalArtifact(ctx, artifact)
+	stored, _, err := o.deps.Records.CommitGradingFinalArtifact(
+		ctx,
+		artifact,
+		finalizationGeneration,
+	)
 	if err != nil {
 		return k12.GradingFinalArtifact{}, err
 	}
@@ -260,17 +272,55 @@ func (o *GradingOrchestrator) buildFinalTutoringTips(
 	if attempt < 1 {
 		attempt = 1
 	}
+	requestDigest := modelInvocationDigest(
+		[]byte(fmt.Sprintf("structure:%d", structureVersion)),
+		orderedDigestsJSON,
+	)
+	if problemSourceReconciliationOnly(ctx) {
+		if o == nil || o.deps.Records == nil {
+			return TutoringTips{}, "", fmt.Errorf(
+				"%w: reconciliation-only processing has no durable page summary invocation",
+				ErrModelInvocationRequiresReconciliation,
+			)
+		}
+		invocation, err := o.deps.Records.GetModelInvocationByAttempt(
+			ctx,
+			job.Record.AgentName,
+			job.Record.RecordID,
+			k12.GradingStageProjecting,
+			attempt,
+		)
+		if err != nil {
+			return TutoringTips{}, "", fmt.Errorf(
+				"%w: reconciliation-only page summary lookup failed: %v",
+				ErrModelInvocationRequiresReconciliation,
+				err,
+			)
+		}
+		if invocation.RequestDigest != requestDigest ||
+			invocation.RouteSnapshot != job.Fields.ModelSnapshot ||
+			!invocation.RequestPolicySnapshot.IsZero() ||
+			invocation.Status != k12.ModelInvocationSucceeded {
+			return TutoringTips{}, "", fmt.Errorf(
+				"%w: reconciliation-only page summary invocation %s is not the exact durable success",
+				ErrModelInvocationRequiresReconciliation,
+				invocation.InvocationID,
+			)
+		}
+		tips, recoverErr := recoverFinalTutoringTips(job, invocation)
+		if recoverErr != nil {
+			return TutoringTips{}, "", recoverErr
+		}
+		return tips, invocation.InvocationID, nil
+	}
 	invocation, _, err := o.deps.Records.PrepareModelInvocation(
 		ctx,
 		k12.ModelInvocation{
-			InvocationID: "modelinv-" + idgen.ShortID(),
-			AgentName:    job.Record.AgentName,
-			JobID:        job.Record.RecordID,
-			Stage:        k12.GradingStageProjecting,
-			RequestDigest: modelInvocationDigest(
-				[]byte(fmt.Sprintf("structure:%d", structureVersion)),
-				orderedDigestsJSON,
-			),
+			InvocationID:  "modelinv-" + idgen.ShortID(),
+			AgentName:     job.Record.AgentName,
+			JobID:         job.Record.RecordID,
+			Stage:         k12.GradingStageProjecting,
+			RequestDigest: requestDigest,
 			RouteSnapshot: job.Fields.ModelSnapshot,
 			Attempt:       attempt,
 			CreatedAt:     o.deps.now(),
@@ -280,7 +330,22 @@ func (o *GradingOrchestrator) buildFinalTutoringTips(
 	if err != nil {
 		return TutoringTips{}, "", err
 	}
-	if invocation.Status != k12.ModelInvocationPrepared {
+	switch invocation.Status {
+	case k12.ModelInvocationSucceeded:
+		tips, recoverErr := recoverFinalTutoringTips(job, invocation)
+		if recoverErr != nil {
+			return TutoringTips{}, "", recoverErr
+		}
+		return tips, invocation.InvocationID, nil
+	case k12.ModelInvocationPrepared:
+		if invocation.ResultDigest != "" || invocation.ResultJSON != "" {
+			return TutoringTips{}, "", fmt.Errorf(
+				"%w: prepared page summary invocation %s carries result state",
+				ErrModelInvocationRequiresReconciliation,
+				invocation.InvocationID,
+			)
+		}
+	default:
 		return TutoringTips{}, "", fmt.Errorf(
 			"%w: page summary invocation %s is %s without a final artifact",
 			ErrModelInvocationRequiresReconciliation,
@@ -311,16 +376,102 @@ func (o *GradingOrchestrator) buildFinalTutoringTips(
 		}
 		return TutoringTips{}, "", err
 	}
-	if _, err := o.deps.Records.MarkModelInvocationSucceeded(
+	resultJSON, err := json.Marshal(tips)
+	if err != nil {
+		return TutoringTips{}, "", fmt.Errorf(
+			"usecase: encode successful page summary result: %w",
+			err,
+		)
+	}
+	if _, err := o.deps.Records.MarkModelInvocationSucceededWithResult(
 		context.WithoutCancel(ctx),
 		invocation.AgentName,
 		invocation.InvocationID,
-		modelInvocationResultDigest(tips),
+		modelInvocationDigest(resultJSON),
+		string(resultJSON),
 		"",
 	); err != nil {
 		return TutoringTips{}, "", err
 	}
 	return tips, invocation.InvocationID, nil
+}
+
+func recoverFinalTutoringTips(
+	job GradingJobView,
+	invocation k12.ModelInvocation,
+) (TutoringTips, error) {
+	fail := func(reason string) (TutoringTips, error) {
+		return TutoringTips{}, fmt.Errorf(
+			"%w: page summary invocation %s %s",
+			ErrModelInvocationRequiresReconciliation,
+			invocation.InvocationID,
+			reason,
+		)
+	}
+	if strings.TrimSpace(invocation.ResultJSON) == "" ||
+		!json.Valid([]byte(invocation.ResultJSON)) {
+		return fail("has no valid durable result payload")
+	}
+	if strings.TrimSpace(invocation.ResultDigest) == "" ||
+		invocation.ResultDigest != modelInvocationDigest([]byte(invocation.ResultJSON)) {
+		return fail("result digest does not match its durable payload")
+	}
+
+	var tips TutoringTips
+	decoder := json.NewDecoder(bytes.NewReader([]byte(invocation.ResultJSON)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&tips); err != nil {
+		return fail("durable result payload does not match the tutoring-tips contract")
+	}
+	if err := validateRecoveredFinalTutoringTips(job, tips); err != nil {
+		return fail(err.Error())
+	}
+	return tips, nil
+}
+
+func validateRecoveredFinalTutoringTips(
+	job GradingJobView,
+	tips TutoringTips,
+) error {
+	if tips.GradingJobID != job.Record.RecordID ||
+		tips.SubmissionID != job.Fields.SubmissionID {
+		return fmt.Errorf("durable result identity does not match the grading job")
+	}
+	if strings.TrimSpace(tips.Grade) == "" ||
+		strings.TrimSpace(tips.Subject) == "" ||
+		len(tips.KnowledgePoints) == 0 {
+		return fmt.Errorf("durable result omits required tutoring facts")
+	}
+	for _, knowledgePoint := range tips.KnowledgePoints {
+		if strings.TrimSpace(knowledgePoint) == "" {
+			return fmt.Errorf("durable result contains an empty knowledge point")
+		}
+	}
+	if len(tips.Sections) != 3 {
+		return fmt.Errorf("durable result must contain exactly three sections")
+	}
+	for _, section := range tips.Sections {
+		if strings.TrimSpace(section.Title) == "" ||
+			strings.TrimSpace(section.Content) == "" ||
+			strings.TrimSpace(section.SourceLabel) == "" {
+			return fmt.Errorf("durable result contains an incomplete section")
+		}
+	}
+	if strings.TrimSpace(tips.Sections[0].Title) != "这页在练什么" ||
+		(tips.Sections[0].SourceLabel != TutoringTipsSourceTextbook &&
+			tips.Sections[0].SourceLabel != TutoringTipsSourceAI) {
+		return fmt.Errorf("durable result overview section contract changed")
+	}
+	attentionTitle := strings.TrimSpace(tips.Sections[1].Title)
+	if attentionTitle == "要留意" || !strings.HasSuffix(attentionTitle, "要留意") ||
+		tips.Sections[1].SourceLabel != TutoringTipsSourceLearningEvidence {
+		return fmt.Errorf("durable result learning-evidence section contract changed")
+	}
+	if strings.TrimSpace(tips.Sections[2].Title) != "每道题怎么带（不直接给答案）" ||
+		tips.Sections[2].SourceLabel != TutoringTipsSourceAI {
+		return fmt.Errorf("durable result per-problem section contract changed")
+	}
+	return nil
 }
 
 func renderCanonicalGradingFinal(

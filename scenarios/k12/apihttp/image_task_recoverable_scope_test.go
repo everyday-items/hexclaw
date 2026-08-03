@@ -69,7 +69,7 @@ func TestRecoverableImageTasksRequireOwnerAgentSessionAndNeverDispatchWork(t *te
 	create := func(session, message string, generation int) usecase.ImageTaskView {
 		t.Helper()
 		view, created, err := fixture.coordinator.Create(context.Background(), usecase.CreateImageTaskInput{
-			AgentName: "mingming", LearnerID: "mingming",
+			OwnerScope: "owner-a", AgentName: "mingming", LearnerID: "mingming",
 			SourceKind: k12.ImageTaskSourceDesktop, SourceRef: message,
 			SourceSessionID: session, SourceAssetRefs: []string{fixture.assetID},
 			AttemptGeneration: generation,
@@ -181,6 +181,189 @@ func TestRecoverableImageTasksRequireOwnerAgentSessionAndNeverDispatchWork(t *te
 	}
 	if authorizeCalls == 0 {
 		t.Fatal("owner-to-agent authorization was bypassed")
+	}
+}
+
+func TestRemoteImageTaskCommandsAndQueriesAllEnforceOwnerAgentBindingBeforeMutation(t *testing.T) {
+	fixture := newImageTaskHTTPFixture(t)
+	seed, created, err := fixture.coordinator.Create(
+		context.Background(),
+		usecase.CreateImageTaskInput{
+			OwnerScope: "owner-a", AgentName: "mingming", LearnerID: "mingming",
+			SourceKind: k12.ImageTaskSourceDesktop, SourceRef: "scope-seed",
+			SourceSessionID: "scope-session", SourceAssetRefs: []string{fixture.assetID},
+			AttemptGeneration: 1,
+			RouteRequest: k12.ImageTaskRouteSnapshot{
+				Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", SelectionSource: "explicit",
+			},
+		},
+	)
+	if err != nil || !created {
+		t.Fatalf("seed image task: created=%v err=%v", created, err)
+	}
+	denied := apihttp.NewHandler(apihttp.Runtime{
+		Records: fixture.coordinator.Records, ImageTasks: fixture.coordinator,
+		PrincipalMode: "remote",
+		AuthenticatedOwnerScope: func(context.Context) (string, error) {
+			return "attacker", nil
+		},
+		AuthorizeAgentScope: func(context.Context, string, string) error {
+			return errors.New("scope not found")
+		},
+	})
+	missingAuthorizer := apihttp.NewHandler(apihttp.Runtime{
+		Records: fixture.coordinator.Records, ImageTasks: fixture.coordinator,
+		PrincipalMode: "remote",
+		AuthenticatedOwnerScope: func(context.Context) (string, error) {
+			return "owner-a", nil
+		},
+	})
+	unauthenticated := apihttp.NewHandler(apihttp.Runtime{
+		Records: fixture.coordinator.Records, ImageTasks: fixture.coordinator,
+		PrincipalMode: "remote",
+		AuthenticatedOwnerScope: func(context.Context) (string, error) {
+			return "", errors.New("missing principal")
+		},
+		AuthorizeAgentScope: func(context.Context, string, string) error { return nil },
+	})
+
+	var beforeDispatches, beforeInvocations int
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM k12_image_task_dispatches`).Scan(&beforeDispatches); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM k12_image_task_invocations`).Scan(&beforeInvocations); err != nil {
+		t.Fatal(err)
+	}
+	createBody := createImageTaskBody(fixture.assetID, "attacker-create")
+	versionBody := `{"agent":"mingming","version":1}`
+	for _, handler := range []struct {
+		name string
+		h    http.Handler
+		want int
+	}{
+		{name: "denied", h: denied, want: http.StatusNotFound},
+		{name: "missing authorizer", h: missingAuthorizer, want: http.StatusNotFound},
+		{name: "missing principal", h: unauthenticated, want: http.StatusUnauthorized},
+	} {
+		t.Run(handler.name, func(t *testing.T) {
+			for _, request := range []struct {
+				method string
+				path   string
+				body   string
+			}{
+				{http.MethodPost, "/image-tasks", createBody},
+				{http.MethodGet, "/image-tasks/" + seed.Dispatch.DispatchID + "?agent=mingming", ""},
+				{http.MethodGet, "/image-tasks/" + seed.Dispatch.DispatchID + "/result?agent=mingming", ""},
+				{http.MethodPost, "/image-tasks/" + seed.Dispatch.DispatchID + "/confirm", versionBody},
+				{http.MethodPost, "/image-tasks/" + seed.Dispatch.DispatchID + "/retry", versionBody},
+				{http.MethodPost, "/image-tasks/" + seed.Dispatch.DispatchID + "/cancel", versionBody},
+			} {
+				rec, _ := do(t, handler.h, request.method, request.path, request.body)
+				if rec.Code != handler.want {
+					t.Fatalf("%s %s status=%d want=%d body=%s", request.method, request.path, rec.Code, handler.want, rec.Body.String())
+				}
+			}
+		})
+	}
+	var afterDispatches, afterInvocations int
+	_ = fixture.db.QueryRow(`SELECT COUNT(*) FROM k12_image_task_dispatches`).Scan(&afterDispatches)
+	_ = fixture.db.QueryRow(`SELECT COUNT(*) FROM k12_image_task_invocations`).Scan(&afterInvocations)
+	if afterDispatches != beforeDispatches || afterInvocations != beforeInvocations {
+		t.Fatalf("unauthorized image task request mutated ledgers: dispatch=%d->%d invocation=%d->%d",
+			beforeDispatches, afterDispatches, beforeInvocations, afterInvocations)
+	}
+}
+
+func TestRemoteImageTaskDispatchScopeIsFrozenAcrossAgentTransfer(t *testing.T) {
+	fixture := newImageTaskHTTPFixture(t)
+	create := func(ownerScope, sourceRef string) usecase.ImageTaskView {
+		t.Helper()
+		view, created, err := fixture.coordinator.Create(
+			context.Background(),
+			usecase.CreateImageTaskInput{
+				OwnerScope: ownerScope, AgentName: "mingming", LearnerID: "mingming",
+				SourceKind: k12.ImageTaskSourceDesktop, SourceRef: sourceRef,
+				SourceSessionID: "transferred-session", SourceAssetRefs: []string{fixture.assetID},
+				AttemptGeneration: 1,
+				RouteRequest: k12.ImageTaskRouteSnapshot{
+					Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", SelectionSource: "explicit",
+				},
+			},
+		)
+		if err != nil || !created {
+			t.Fatalf("seed image task: owner=%q created=%v err=%v", ownerScope, created, err)
+		}
+		return view
+	}
+	ownerA := create("owner-a", "owner-a-history")
+	ownerB := create("owner-b", "owner-b-current")
+	legacy := create("", "legacy-without-frozen-owner")
+
+	// Simulate an Agent transfer: owner-b is now allowed to address the Agent,
+	// but that current grant must not confer access to owner-a's historical
+	// dispatch or to a legacy dispatch whose immutable owner cannot be proven.
+	handler := apihttp.NewHandler(apihttp.Runtime{
+		Records: fixture.coordinator.Records, ImageTasks: fixture.coordinator,
+		PrincipalMode: "remote",
+		AuthenticatedOwnerScope: func(context.Context) (string, error) {
+			return "owner-b", nil
+		},
+		AuthorizeAgentScope: func(context.Context, string, string) error { return nil },
+	})
+
+	var beforeDispatches, beforeInvocations int
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM k12_image_task_dispatches`).Scan(&beforeDispatches); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM k12_image_task_invocations`).Scan(&beforeInvocations); err != nil {
+		t.Fatal(err)
+	}
+	versionBody := `{"agent":"mingming","version":1}`
+	for _, dispatchID := range []string{ownerA.Dispatch.DispatchID, legacy.Dispatch.DispatchID} {
+		for _, request := range []struct {
+			method string
+			path   string
+			body   string
+		}{
+			{http.MethodGet, "/image-tasks/" + dispatchID + "?agent=mingming", ""},
+			{http.MethodGet, "/image-tasks/" + dispatchID + "/result?agent=mingming", ""},
+			{http.MethodPost, "/image-tasks/" + dispatchID + "/confirm", versionBody},
+			{http.MethodPost, "/image-tasks/" + dispatchID + "/retry", versionBody},
+			{http.MethodPost, "/image-tasks/" + dispatchID + "/cancel", versionBody},
+		} {
+			rec, _ := do(t, handler, request.method, request.path, request.body)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("%s %s status=%d want=404 body=%s", request.method, request.path, rec.Code, rec.Body.String())
+			}
+		}
+	}
+
+	rec, body := do(t, handler, http.MethodGet,
+		"/image-tasks/recoverable?agent=mingming&session=transferred-session", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recover projection status=%d body=%#v", rec.Code, body)
+	}
+	var payload struct {
+		Items []recoverableImageTaskContract `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Items) != 1 || payload.Items[0].DispatchID != ownerB.Dispatch.DispatchID {
+		t.Fatalf("owner-scoped recovery leaked historical dispatches: %+v", payload.Items)
+	}
+	rec, _ = do(t, handler, http.MethodGet,
+		"/image-tasks/"+ownerB.Dispatch.DispatchID+"?agent=mingming", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("current owner's dispatch status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var afterDispatches, afterInvocations int
+	_ = fixture.db.QueryRow(`SELECT COUNT(*) FROM k12_image_task_dispatches`).Scan(&afterDispatches)
+	_ = fixture.db.QueryRow(`SELECT COUNT(*) FROM k12_image_task_invocations`).Scan(&afterInvocations)
+	if afterDispatches != beforeDispatches || afterInvocations != beforeInvocations {
+		t.Fatalf("cross-owner requests mutated ledgers: dispatch=%d->%d invocation=%d->%d",
+			beforeDispatches, afterDispatches, beforeInvocations, afterInvocations)
 	}
 }
 

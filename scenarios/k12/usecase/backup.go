@@ -10,13 +10,15 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 )
 
 // HexbakVersion 备份格式版本（嵌入归档头，支撑演进）。
 // v3 为 DD-025 restore-as 增加不可变 archive_id；v4 把作品已确认 OCR
 // canonical evidence 纳入 checksum；v5 纳入 V19 Problem/Attempt canonical
-// ledger 与其 page asset。v2/v3/v4 校验字节契约继续兼容。
-const HexbakVersion = 5
+// ledger 与其 page asset；v6 纳入 V50/V51/V72/V73 source-action durability
+// closure。v2-v5 校验字节契约继续兼容。
+const HexbakVersion = 6
 
 // ErrChecksumMismatch 恢复时校验和不符（归档损坏或载荷不一致）。
 var ErrChecksumMismatch = errors.New("hexbak checksum mismatch")
@@ -40,6 +42,10 @@ type Hexbak struct {
 	// ProblemAttempts v5 起覆盖所有 V19 canonical submission。SubmissionID、
 	// ProblemID、AttemptID 保持稳定；page_asset_id 引用的原图进入 Assets exact-set。
 	ProblemAttempts []k12.ProblemAttemptSnapshot `json:"problem_attempts,omitempty"`
+	// ProblemSource v6 起覆盖 source-action 的不可变输入头、收据、PageAsset
+	// metadata、可恢复队列与 V73 typed/physical lineage。原始 provider payload
+	// 不进入该投影；所有引用的 PageAsset bytes 仍通过 Assets 单一机制打包。
+	ProblemSource *k12storage.ProblemSourceArchiveV6 `json:"problem_source,omitempty"`
 	// Profile 孩子档案（T2.6 全量导出 PRD §3.12.4-1：不止 records，还含档案）。可空（老归档/无档案）。
 	// 注：学情记忆 + 实例配置的导出需跨子系统新 port（Insights 目前只写不可导），属后续。
 	Profile  *k12.ChildProfile `json:"profile,omitempty"`
@@ -75,6 +81,13 @@ func (d Deps) Backup(ctx context.Context, agentName string) (*Hexbak, error) {
 		return nil, fmt.Errorf("usecase: 打包 Problem/Attempt ledger: %w", err)
 	}
 	bak.ProblemAttempts = problemAttempts
+	problemSource, err := d.Records.ExportProblemSourceArchiveV6(ctx, agentName)
+	if err != nil {
+		return nil, fmt.Errorf("usecase: 打包 source-action durability closure: %w", err)
+	}
+	if !problemSourceArchiveEmpty(problemSource) {
+		bak.ProblemSource = &problemSource
+	}
 	recordAssets, err := PackHexbakAssets(agentName, recs)
 	if err != nil {
 		return nil, fmt.Errorf("usecase: 打包档案资产: %w", err)
@@ -83,7 +96,11 @@ func (d Deps) Backup(ctx context.Context, agentName string) (*Hexbak, error) {
 	if err != nil {
 		return nil, fmt.Errorf("usecase: 打包 Problem 页面资产: %w", err)
 	}
-	bak.Assets, err = MergeHexbakAssets(recordAssets, problemAssets)
+	problemSourceAssets, err := PackHexbakProblemSourceAssets(agentName, bak.ProblemSource)
+	if err != nil {
+		return nil, fmt.Errorf("usecase: 打包 source-action PageAsset: %w", err)
+	}
+	bak.Assets, err = MergeHexbakAssets(recordAssets, problemAssets, problemSourceAssets)
 	if err != nil {
 		return nil, fmt.Errorf("usecase: 合并档案资产: %w", err)
 	}
@@ -142,7 +159,8 @@ func (d Deps) Restore(ctx context.Context, bak *Hexbak) (int, error) {
 		// the archive), fail closed unless records + profile share one durability
 		// boundary; compensation cannot close a process-crash window.
 		if d.ArchiveRestorer == nil && (d.Profiles != nil || restoreBak.Profile != nil ||
-			len(restoreBak.CreativeWorkOCR) > 0 || len(restoreBak.ProblemAttempts) > 0) {
+			len(restoreBak.CreativeWorkOCR) > 0 || len(restoreBak.ProblemAttempts) > 0 ||
+			restoreBak.ProblemSource != nil) {
 			return 0, fmt.Errorf("%w: 未配置 records/profile 原子恢复能力", ErrInvalidInput)
 		}
 		if d.ArchiveRestorer != nil {
@@ -153,7 +171,8 @@ func (d Deps) Restore(ctx context.Context, bak *Hexbak) (int, error) {
 					}
 					return len(restoreBak.Records), nil
 				}
-				if len(restoreBak.Assets) > 0 || len(restoreBak.CreativeWorkOCR) > 0 || len(restoreBak.ProblemAttempts) > 0 {
+				if len(restoreBak.Assets) > 0 || len(restoreBak.CreativeWorkOCR) > 0 ||
+					len(restoreBak.ProblemAttempts) > 0 || restoreBak.ProblemSource != nil {
 					return 0, fmt.Errorf("%w: 未配置 v%d 内容文件/OCR/Problem-Attempt 原子恢复能力", ErrInvalidInput, restoreBak.Version)
 				}
 			}
@@ -208,7 +227,7 @@ func checksumHexbak(bak *Hexbak) (string, error) {
 			Profile         *k12.ChildProfile                    `json:"profile,omitempty"`
 		}{bak.Version, bak.ArchiveID, bak.AgentName, bak.ExportedAt, bak.Records,
 			bak.Assets, bak.CreativeWorkOCR, bak.Profile}
-	} else {
+	} else if bak.Version == 5 {
 		payload = struct {
 			Version         int                                  `json:"version"`
 			ArchiveID       string                               `json:"archive_id"`
@@ -221,6 +240,20 @@ func checksumHexbak(bak *Hexbak) (string, error) {
 			Profile         *k12.ChildProfile                    `json:"profile,omitempty"`
 		}{bak.Version, bak.ArchiveID, bak.AgentName, bak.ExportedAt, bak.Records,
 			bak.Assets, bak.CreativeWorkOCR, bak.ProblemAttempts, bak.Profile}
+	} else {
+		payload = struct {
+			Version         int                                  `json:"version"`
+			ArchiveID       string                               `json:"archive_id"`
+			AgentName       string                               `json:"agent_name"`
+			ExportedAt      int64                                `json:"exported_at"`
+			Records         []*records.AgentRecord               `json:"records"`
+			Assets          []HexbakAsset                        `json:"assets,omitempty"`
+			CreativeWorkOCR []k12.CreativeWorkOCRArchiveEvidence `json:"creative_work_ocr,omitempty"`
+			ProblemAttempts []k12.ProblemAttemptSnapshot         `json:"problem_attempts,omitempty"`
+			ProblemSource   *k12storage.ProblemSourceArchiveV6   `json:"problem_source,omitempty"`
+			Profile         *k12.ChildProfile                    `json:"profile,omitempty"`
+		}{bak.Version, bak.ArchiveID, bak.AgentName, bak.ExportedAt, bak.Records,
+			bak.Assets, bak.CreativeWorkOCR, bak.ProblemAttempts, bak.ProblemSource, bak.Profile}
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -261,7 +294,7 @@ func SealHexbak(bak *Hexbak) error {
 				Profile         *k12.ChildProfile                    `json:"profile,omitempty"`
 			}{bak.Version, bak.AgentName, bak.ExportedAt, bak.Records, bak.Assets,
 				bak.CreativeWorkOCR, bak.Profile}
-		} else {
+		} else if bak.Version == 5 {
 			seed = struct {
 				Version         int                                  `json:"version"`
 				AgentName       string                               `json:"agent_name"`
@@ -273,6 +306,19 @@ func SealHexbak(bak *Hexbak) error {
 				Profile         *k12.ChildProfile                    `json:"profile,omitempty"`
 			}{bak.Version, bak.AgentName, bak.ExportedAt, bak.Records, bak.Assets,
 				bak.CreativeWorkOCR, bak.ProblemAttempts, bak.Profile}
+		} else {
+			seed = struct {
+				Version         int                                  `json:"version"`
+				AgentName       string                               `json:"agent_name"`
+				ExportedAt      int64                                `json:"exported_at"`
+				Records         []*records.AgentRecord               `json:"records"`
+				Assets          []HexbakAsset                        `json:"assets,omitempty"`
+				CreativeWorkOCR []k12.CreativeWorkOCRArchiveEvidence `json:"creative_work_ocr,omitempty"`
+				ProblemAttempts []k12.ProblemAttemptSnapshot         `json:"problem_attempts,omitempty"`
+				ProblemSource   *k12storage.ProblemSourceArchiveV6   `json:"problem_source,omitempty"`
+				Profile         *k12.ChildProfile                    `json:"profile,omitempty"`
+			}{bak.Version, bak.AgentName, bak.ExportedAt, bak.Records, bak.Assets,
+				bak.CreativeWorkOCR, bak.ProblemAttempts, bak.ProblemSource, bak.Profile}
 		}
 		b, err := json.Marshal(seed)
 		if err != nil {
@@ -328,6 +374,9 @@ func VerifyHexbak(bak *Hexbak) error {
 		return err
 	}
 	if err := ValidateHexbakProblemAttempts(bak); err != nil {
+		return err
+	}
+	if err := ValidateHexbakProblemSource(bak); err != nil {
 		return err
 	}
 	return nil

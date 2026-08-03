@@ -348,6 +348,13 @@ func (s *Store) PutProblemAttemptSnapshot(ctx context.Context, snapshot k12.Prob
 		return fmt.Errorf("k12storage: 开启 Problem/Attempt 事务: %w", err)
 	}
 	defer tx.Rollback()
+	if err := alignProblemAttemptReplayWithCurrentLegacyHeadsTx(
+		ctx,
+		tx,
+		&normalized,
+	); err != nil {
+		return fmt.Errorf("k12storage: align Problem/Attempt structure replay: %w", err)
+	}
 
 	// Parents are inserted first so the self-referencing FK is valid even when the
 	// recognizer returned children before their shared stem.
@@ -374,8 +381,500 @@ func (s *Store) PutProblemAttemptSnapshot(ctx context.Context, snapshot k12.Prob
 	); err != nil {
 		return fmt.Errorf("k12storage: freeze Problem structure snapshot: %w", err)
 	}
+	if err := syncProblemInputRevisionHeadsTx(ctx, tx, normalized, nowUnix()); err != nil {
+		return fmt.Errorf("k12storage: freeze immutable Problem input heads: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("k12storage: 提交 Problem/Attempt 事务: %w", err)
+	}
+	return nil
+}
+
+// alignProblemAttemptReplayWithCurrentLegacyHeadsTx recognizes only the
+// server-created revision barrier produced when an otherwise stable Problem is
+// carried into a new authoritative structure version. The caller may replay
+// the original recognition snapshot, whose Attempt still names the pre-barrier
+// revision; accepting that exact replay is safe only while the current V72 head
+// is legacy_unverified and every immutable/canonical fact still matches.
+// Command-origin heads are deliberately excluded so stale OCR snapshots can
+// never overwrite a parent correction, crop, retake, or resume.
+func alignProblemAttemptReplayWithCurrentLegacyHeadsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	snapshot *k12.ProblemAttemptSnapshot,
+) error {
+	if snapshot == nil || len(snapshot.Problems) == 0 {
+		return nil
+	}
+	agentName := snapshot.Problems[0].AgentName
+	submissionID := snapshot.Problems[0].SubmissionID
+	_, digest, err := problemStructureFacts(*snapshot)
+	if err != nil {
+		return err
+	}
+	current, err := getCurrentProblemStructureTx(
+		ctx,
+		tx,
+		agentName,
+		submissionID,
+	)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && current.Digest != digest) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	problems := make(map[string]k12.Problem, len(snapshot.Problems))
+	for _, problem := range snapshot.Problems {
+		problems[problem.ProblemID] = problem
+	}
+	for index := range snapshot.Attempts {
+		attempt := &snapshot.Attempts[index]
+		member, ok := current.Members[attempt.ProblemID]
+		if !ok || attempt.ConfirmedVersion < 1 ||
+			attempt.ConfirmedVersion >= member.InputRevision {
+			continue
+		}
+		problem, ok := problems[attempt.ProblemID]
+		if !ok {
+			return fmt.Errorf("problem %s is missing for replayed attempt", attempt.ProblemID)
+		}
+		bboxJSON := ""
+		if attempt.BBox != nil {
+			bboxJSON = mustJSON(attempt.BBox)
+		}
+		var pageAssetID, sourceRegionJSON, stemRaw, answerRaw string
+		var answerBBoxJSON, questionMarkdown, answerMarkdown string
+		var inputDigest, originKind string
+		var originReceipt sql.NullString
+		err := tx.QueryRowContext(ctx, `
+			SELECT page_asset_id,COALESCE(source_region_json,''),stem_raw,answer_raw,
+			       answer_bbox_json,question_canonical_markdown,
+			       answer_canonical_markdown,input_digest,
+			       origin_command_receipt_id,origin_kind
+			FROM k12_problem_input_revisions
+			WHERE agent_name=? AND submission_id=? AND structure_version=?
+			  AND problem_id=? AND input_revision=?
+			  AND current_disposition='current'`,
+			agentName,
+			submissionID,
+			current.Version,
+			attempt.ProblemID,
+			member.InputRevision,
+		).Scan(
+			&pageAssetID,
+			&sourceRegionJSON,
+			&stemRaw,
+			&answerRaw,
+			&answerBBoxJSON,
+			&questionMarkdown,
+			&answerMarkdown,
+			&inputDigest,
+			&originReceipt,
+			&originKind,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			// Older V72 writers may have left precisely this missing-head shape.
+			// syncProblemInputRevisionHeadsTx repairs it later in this transaction.
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if originKind != "legacy_unverified" || originReceipt.Valid ||
+			sourceRegionJSON != "" || pageAssetID != problem.PageAssetID ||
+			stemRaw != problem.StemRaw || answerRaw != attempt.AnswerRaw ||
+			answerBBoxJSON != bboxJSON || questionMarkdown != problem.StemMarkdown ||
+			answerMarkdown != attempt.AnswerMarkdown || inputDigest != attempt.InputDigest {
+			// Leave the incoming lower version untouched. putAttemptTx will reject
+			// it as an ordinary immutable-fact regression.
+			continue
+		}
+		attempt.ConfirmedVersion = member.InputRevision
+	}
+	return nil
+}
+
+type legacyProblemInputHead struct {
+	pageAssetID      string
+	sourceRegionJSON sql.NullString
+	stemRaw          string
+	answerRaw        string
+	inputDigest      string
+	disposition      string
+	originReceipt    sql.NullString
+	originKind       string
+}
+
+// appendConfirmedProblemInputAfterLegacyTx converges a pre-fix synthetic head
+// without rewriting it. The synthetic row remains immutable audit evidence and
+// is superseded by a new server-owned revision that exactly binds V19 Attempt
+// and V51 member state. Existing durable decisions make that convergence
+// ambiguous, so they fail closed rather than being silently invalidated.
+func appendConfirmedProblemInputAfterLegacyTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	agentName, submissionID string,
+	structureVersion, legacyRevision int,
+	problem k12.Problem,
+	attempt k12.Attempt,
+	legacy legacyProblemInputHead,
+	bboxJSON string,
+	now int64,
+) error {
+	durableRevision, err := currentDurableProblemInputRevisionTx(
+		ctx,
+		tx,
+		agentName,
+		problem.ProblemID,
+	)
+	if err != nil {
+		return err
+	}
+	if durableRevision >= legacyRevision {
+		return fmt.Errorf(
+			"%w: legacy input revision %s/v%d already has durable decision v%d",
+			ErrProblemAttemptConflict,
+			problem.ProblemID,
+			legacyRevision,
+			durableRevision,
+		)
+	}
+
+	nextRevision := legacyRevision + 1
+	result, err := tx.ExecContext(ctx, `
+		UPDATE k12_problem_input_revisions
+		SET current_disposition='superseded',updated_at=MAX(updated_at,?)
+		WHERE agent_name=? AND submission_id=? AND structure_version=?
+		  AND problem_id=? AND input_revision=?
+		  AND current_disposition='current'
+		  AND input_digest=? AND origin_kind='legacy_unverified'
+		  AND origin_command_receipt_id IS NULL AND source_region_json IS NULL`,
+		now,
+		agentName,
+		submissionID,
+		structureVersion,
+		problem.ProblemID,
+		legacyRevision,
+		legacy.inputDigest,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if rows != 1 {
+		return fmt.Errorf(
+			"%w: legacy input revision %s/v%d CAS lost",
+			ErrProblemAttemptConflict,
+			problem.ProblemID,
+			legacyRevision,
+		)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO k12_problem_input_revisions (
+			agent_name,submission_id,structure_version,problem_id,input_revision,
+			page_asset_id,source_region_json,stem_raw,answer_raw,answer_bbox_json,
+			question_canonical_markdown,answer_canonical_markdown,input_digest,
+			current_disposition,origin_command_receipt_id,origin_kind,
+			created_at,updated_at
+		) VALUES (?,?,?,?,?,?,NULL,?,?,?,?,?,?,'current',NULL,'legacy_unverified',?,?)`,
+		agentName,
+		submissionID,
+		structureVersion,
+		problem.ProblemID,
+		nextRevision,
+		problem.PageAssetID,
+		problem.StemRaw,
+		attempt.AnswerRaw,
+		bboxJSON,
+		problem.StemMarkdown,
+		attempt.AnswerMarkdown,
+		attempt.InputDigest,
+		now,
+		now,
+	); err != nil {
+		return err
+	}
+
+	memberResult, err := tx.ExecContext(ctx, `
+		UPDATE k12_problem_structure_members
+		SET input_revision=?
+		WHERE agent_name=? AND submission_id=? AND structure_version=?
+		  AND problem_id=? AND input_revision=?`,
+		nextRevision,
+		agentName,
+		submissionID,
+		structureVersion,
+		problem.ProblemID,
+		legacyRevision,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, rowsErr := memberResult.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if rows != 1 {
+		return fmt.Errorf(
+			"%w: structure input revision %s/v%d CAS lost",
+			ErrProblemAttemptConflict,
+			problem.ProblemID,
+			legacyRevision,
+		)
+	}
+
+	attemptResult, err := tx.ExecContext(ctx, `
+		UPDATE k12_attempts
+		SET confirmed_version=?,updated_at=MAX(updated_at,?)
+		WHERE agent_name=? AND submission_id=? AND attempt_id=? AND problem_id=?
+		  AND confirmed_version=? AND input_digest=?`,
+		nextRevision,
+		now,
+		agentName,
+		submissionID,
+		attempt.AttemptID,
+		attempt.ProblemID,
+		attempt.ConfirmedVersion,
+		attempt.InputDigest,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, rowsErr := attemptResult.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if rows != 1 {
+		return fmt.Errorf(
+			"%w: Attempt %s legacy revision barrier CAS lost",
+			ErrProblemAttemptConflict,
+			attempt.AttemptID,
+		)
+	}
+	return nil
+}
+
+// syncProblemInputRevisionHeadsTx keeps V72's append-only confirmed-input
+// ledger in the same transaction as the canonical Problem/Attempt and
+// structure snapshot. A v0 Attempt is recognition output awaiting confirmation,
+// not immutable confirmed evidence, so it deliberately has no V72 head.
+func syncProblemInputRevisionHeadsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	snapshot k12.ProblemAttemptSnapshot,
+	now int64,
+) error {
+	if len(snapshot.Problems) == 0 {
+		return nil
+	}
+	agentName := snapshot.Problems[0].AgentName
+	submissionID := snapshot.Problems[0].SubmissionID
+	var structureVersion int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT structure_version
+		FROM k12_problem_structure_snapshots
+		WHERE agent_name=? AND submission_id=? AND current_disposition='current'
+		ORDER BY structure_version DESC LIMIT 1`,
+		agentName,
+		submissionID,
+	).Scan(&structureVersion); err != nil {
+		return err
+	}
+	problems := make(map[string]k12.Problem, len(snapshot.Problems))
+	for _, problem := range snapshot.Problems {
+		problems[problem.ProblemID] = problem
+	}
+	for _, attempt := range snapshot.Attempts {
+		problem, ok := problems[attempt.ProblemID]
+		if !ok {
+			return fmt.Errorf("problem %s missing for attempt %s", attempt.ProblemID, attempt.AttemptID)
+		}
+		if attempt.ConfirmedVersion < 1 {
+			continue
+		}
+		inputRevision := attempt.ConfirmedVersion
+		if err := tx.QueryRowContext(ctx, `
+			SELECT input_revision
+			FROM k12_problem_structure_members
+			WHERE agent_name=? AND submission_id=? AND structure_version=?
+			  AND problem_id=?`,
+			agentName,
+			submissionID,
+			structureVersion,
+			attempt.ProblemID,
+		).Scan(&inputRevision); err != nil {
+			return err
+		}
+		if inputRevision < 1 {
+			inputRevision = 1
+		}
+		if inputRevision < attempt.ConfirmedVersion {
+			return fmt.Errorf(
+				"structure input revision %d is behind attempt %s revision %d",
+				inputRevision,
+				attempt.AttemptID,
+				attempt.ConfirmedVersion,
+			)
+		}
+		inputDigest := attempt.InputDigest
+		if inputDigest == "" {
+			return fmt.Errorf("%w: confirmed Attempt %s has no input digest",
+				ErrProblemAttemptConflict, attempt.AttemptID)
+		}
+		bboxJSON := ""
+		if attempt.BBox != nil {
+			raw, err := json.Marshal(attempt.BBox)
+			if err != nil {
+				return err
+			}
+			bboxJSON = string(raw)
+		}
+
+		var existing legacyProblemInputHead
+		err := tx.QueryRowContext(ctx, `
+			SELECT page_asset_id,source_region_json,stem_raw,answer_raw,input_digest,
+			       current_disposition,origin_command_receipt_id,origin_kind
+			FROM k12_problem_input_revisions
+			WHERE agent_name=? AND submission_id=? AND structure_version=?
+			  AND problem_id=? AND input_revision=?`,
+			agentName,
+			submissionID,
+			structureVersion,
+			problem.ProblemID,
+			inputRevision,
+		).Scan(
+			&existing.pageAssetID,
+			&existing.sourceRegionJSON,
+			&existing.stemRaw,
+			&existing.answerRaw,
+			&existing.inputDigest,
+			&existing.disposition,
+			&existing.originReceipt,
+			&existing.originKind,
+		)
+		if err == nil {
+			if existing.disposition != "current" {
+				return fmt.Errorf("%w: input revision %s/v%d is not current",
+					ErrProblemAttemptConflict, problem.ProblemID, inputRevision)
+			}
+			legacyDigest := problemSourceInputDigest(
+				"legacy",
+				problem.ProblemID,
+				inputRevision,
+			)
+			isSyntheticPlaceholder := existing.originKind == "legacy_unverified" &&
+				!existing.originReceipt.Valid && !existing.sourceRegionJSON.Valid &&
+				(existing.inputDigest == "" || existing.inputDigest == legacyDigest)
+			if isSyntheticPlaceholder && existing.inputDigest != inputDigest {
+				if existing.pageAssetID != problem.PageAssetID ||
+					existing.stemRaw != problem.StemRaw ||
+					existing.answerRaw != attempt.AnswerRaw {
+					return fmt.Errorf(
+						"%w: legacy input revision %s/v%d raw identity drifted",
+						ErrProblemAttemptConflict,
+						problem.ProblemID,
+						inputRevision,
+					)
+				}
+				if err := appendConfirmedProblemInputAfterLegacyTx(
+					ctx,
+					tx,
+					agentName,
+					submissionID,
+					structureVersion,
+					inputRevision,
+					problem,
+					attempt,
+					existing,
+					bboxJSON,
+					now,
+				); err != nil {
+					return err
+				}
+				continue
+			}
+			if existing.inputDigest != inputDigest {
+				return fmt.Errorf(
+					"%w: input revision %s/v%d digest %q != %q",
+					ErrProblemAttemptConflict,
+					problem.ProblemID,
+					inputRevision,
+					existing.inputDigest,
+					inputDigest,
+				)
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		} else {
+			result, err := tx.ExecContext(ctx, `
+				UPDATE k12_problem_input_revisions
+				SET current_disposition='superseded',updated_at=?
+				WHERE agent_name=? AND submission_id=? AND structure_version=?
+				  AND problem_id=? AND current_disposition='current'
+				  AND input_revision<?`,
+				now,
+				agentName,
+				submissionID,
+				structureVersion,
+				problem.ProblemID,
+				inputRevision,
+			)
+			if err != nil {
+				return err
+			}
+			if rows, rowsErr := result.RowsAffected(); rowsErr != nil {
+				return rowsErr
+			} else if rows > 1 {
+				return fmt.Errorf("multiple current input heads for problem %s", problem.ProblemID)
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO k12_problem_input_revisions (
+					agent_name,submission_id,structure_version,problem_id,input_revision,
+					page_asset_id,source_region_json,stem_raw,answer_raw,answer_bbox_json,
+					question_canonical_markdown,answer_canonical_markdown,input_digest,
+					current_disposition,origin_command_receipt_id,origin_kind,
+					created_at,updated_at
+				) VALUES (?,?,?,?,?,?,NULL,?,?,?,?,?,?,'current',NULL,'legacy_unverified',?,?)`,
+				agentName,
+				submissionID,
+				structureVersion,
+				problem.ProblemID,
+				inputRevision,
+				problem.PageAssetID,
+				problem.StemRaw,
+				attempt.AnswerRaw,
+				bboxJSON,
+				problem.StemMarkdown,
+				attempt.AnswerMarkdown,
+				inputDigest,
+				now,
+				now,
+			); err != nil {
+				return err
+			}
+		}
+		if attempt.ConfirmedVersion >= 1 && inputRevision > attempt.ConfirmedVersion {
+			result, err := tx.ExecContext(ctx, `
+				UPDATE k12_attempts
+				SET confirmed_version=?,input_digest=?,updated_at=MAX(updated_at,?)
+				WHERE agent_name=? AND attempt_id=? AND problem_id=?
+				  AND confirmed_version=?`,
+				inputRevision,
+				inputDigest,
+				attempt.UpdatedAt,
+				agentName,
+				attempt.AttemptID,
+				attempt.ProblemID,
+				attempt.ConfirmedVersion,
+			)
+			if err != nil {
+				return err
+			}
+			if rows, rowsErr := result.RowsAffected(); rowsErr != nil {
+				return rowsErr
+			} else if rows != 1 {
+				return fmt.Errorf("attempt %s structure revision barrier CAS lost", attempt.AttemptID)
+			}
+		}
 	}
 	return nil
 }

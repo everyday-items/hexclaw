@@ -5,8 +5,9 @@
 //   - 落盘 <root>/<agent>/<sha256>.<ext>，root 默认 ~/.hexclaw/assets（本机存储，
 //     契合 §3.12 隐私承诺「照片仅保存在本机」的桌面直传路径）；HEXCLAW_ASSET_ROOT 可覆盖（测试）。
 //   - 内容寻址（sha256）防重复：同字节重复上传幂等返回同一 id，不落重复文件。
-//   - 魔数校验：http.DetectContentType 必须探出 image/*（png/jpeg/gif/webp 白名单），
-//     伪造扩展名/文本/PDF 一律拒绝；大小上限 10MB。
+//   - 内容校验：http.DetectContentType 与实际 decoder 格式必须一致（png/jpeg/gif/webp
+//     白名单），且图片须可完整解码；伪造扩展名/文本/PDF/畸形图片一律拒绝；上限
+//     10MB / 30MP。
 //   - 归属隔离：路径含 agent（多孩硬边界），读取按 agent 圈定；文件名白名单
 //     ^[0-9a-f]{64}\.(png|jpg|gif|webp)$ 杜绝路径穿越。
 //   - Asset ID 自描述：asset://<agent>/<sha256>.<ext>——消费方（美术点评视觉链）可离线
@@ -16,29 +17,81 @@
 package assetstore
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	_ "golang.org/x/image/webp"
 )
 
 // MaxAssetBytes 单张作品照片大小上限（10MB）。
 const MaxAssetBytes = 10 << 20
 
+// MaxAssetPixels 单张作品照片解码后的像素上限（30MP）。先读配置并检查上限，再完整
+// 解码，避免小体积压缩图片触发不受控的内存分配。
+const MaxAssetPixels int64 = 30_000_000
+
 // IDPrefix 资产 ID 前缀；与 data:（内联）/本地路径两种既有载体互斥可辨。
 const IDPrefix = "asset://"
 
-// extByMIME 图片魔数白名单 → 落盘扩展名。DetectContentType 只认这些常见图片格式，
-// 探不出的（如 HEIC）诚实拒绝——宁窄而真。
-var extByMIME = map[string]string{
-	"image/png":  "png",
-	"image/jpeg": "jpg",
-	"image/gif":  "gif",
-	"image/webp": "webp",
+var (
+	// ErrInvalidAssetInput identifies caller-controlled identity or empty-input
+	// validation failures. Transports may map this class to HTTP 400.
+	ErrInvalidAssetInput = errors.New("invalid asset input")
+	// ErrAssetTooLarge identifies encoded-byte or decoded-pixel safety limits.
+	ErrAssetTooLarge = errors.New("asset exceeds safety limit")
+	// ErrUnsupportedAssetMediaType identifies bytes that are not a supported,
+	// internally consistent image.
+	ErrUnsupportedAssetMediaType = errors.New("unsupported asset media type")
+)
+
+type classifiedAssetError struct {
+	class   error
+	message string
+}
+
+func (e classifiedAssetError) Error() string { return e.message }
+func (e classifiedAssetError) Unwrap() error { return e.class }
+
+func newClassifiedAssetError(class error, format string, args ...any) error {
+	return classifiedAssetError{class: class, message: fmt.Sprintf(format, args...)}
+}
+
+type acceptedImageFormat struct {
+	extension     string
+	decoderFormat string
+}
+
+// acceptedImageFormats 是 Inspect/Describe/Ensure/Save 共用的唯一格式白名单。
+// DetectContentType 只认这些常见图片格式，探不出的（如 HEIC）诚实拒绝——宁窄而真。
+var acceptedImageFormats = map[string]acceptedImageFormat{
+	"image/png":  {extension: "png", decoderFormat: "png"},
+	"image/jpeg": {extension: "jpg", decoderFormat: "jpeg"},
+	"image/gif":  {extension: "gif", decoderFormat: "gif"},
+	"image/webp": {extension: "webp", decoderFormat: "webp"},
+}
+
+// AssetInspection 是一份不落盘的、由实际图片字节推导出的内容身份与解码元数据。
+// 所有字段均不可由调用方提供，避免 MIME、扩展名、摘要和尺寸之间出现分叉。
+type AssetInspection struct {
+	AssetID     string
+	MediaType   string
+	Extension   string
+	SHA256      string
+	SizeBytes   int64
+	PixelWidth  int
+	PixelHeight int
 }
 
 // PageStore adapts the package's content-addressed file operations to the K12
@@ -69,21 +122,21 @@ func Root() string {
 // validAgent 校验 agent 名可安全作为目录段（拒绝空/穿越/分隔符/控制字符）。
 func validAgent(agent string) error {
 	if strings.TrimSpace(agent) == "" {
-		return fmt.Errorf("assetstore: agent 不可空")
+		return newClassifiedAssetError(ErrInvalidAssetInput, "assetstore: agent 不可空")
 	}
 	if agent == "." || agent == ".." || strings.ContainsAny(agent, `/\`) {
-		return fmt.Errorf("assetstore: agent 名含非法路径字符")
+		return newClassifiedAssetError(ErrInvalidAssetInput, "assetstore: agent 名含非法路径字符")
 	}
 	for _, r := range agent {
 		if r < 0x20 || r == 0x7f {
-			return fmt.Errorf("assetstore: agent 名含控制字符")
+			return newClassifiedAssetError(ErrInvalidAssetInput, "assetstore: agent 名含控制字符")
 		}
 	}
 	return nil
 }
 
 // Save 校验并落盘一张作品照片，返回自描述资产 ID（asset://<agent>/<sha256>.<ext>）。
-// 魔数非 image/* 白名单、超 10MB、agent 不安全一律报错；同内容幂等。
+// 格式非白名单、无法完整解码、超 10MB/30MP、agent 不安全一律报错；同内容幂等。
 func Save(agent string, data []byte) (string, error) {
 	id, _, err := Ensure(agent, data)
 	return id, err
@@ -92,30 +145,104 @@ func Save(agent string, data []byte) (string, error) {
 // Describe 只校验资产内容并计算其内容寻址身份，不写文件。它是 .hexbak v3
 // manifest 校验与 restore-as 预检的单一真相源。
 func Describe(agent string, data []byte) (id, mime, digest string, err error) {
-	if err := validAgent(agent); err != nil {
+	inspection, err := Inspect(agent, data)
+	if err != nil {
 		return "", "", "", err
 	}
+	return inspection.AssetID, inspection.MediaType, inspection.SHA256, nil
+}
+
+// Inspect 校验完整图片并返回内容身份、真实格式、字节大小和解码像素尺寸，不写文件。
+// 校验顺序刻意固定为：字节上限 → 魔数白名单 → DecodeConfig/像素上限 → 完整解码。
+// 因而 Save 接受的格式和安全边界与本函数完全一致。
+func Inspect(agent string, data []byte) (AssetInspection, error) {
+	if err := validAgent(agent); err != nil {
+		return AssetInspection{}, err
+	}
 	if len(data) == 0 {
-		return "", "", "", fmt.Errorf("assetstore: 图片内容为空")
+		return AssetInspection{}, newClassifiedAssetError(ErrInvalidAssetInput, "assetstore: 图片内容为空")
 	}
 	if len(data) > MaxAssetBytes {
-		return "", "", "", fmt.Errorf("assetstore: 图片超过大小上限（%dMB）", MaxAssetBytes>>20)
+		return AssetInspection{}, newClassifiedAssetError(ErrAssetTooLarge, "assetstore: 图片超过大小上限（%dMB）", MaxAssetBytes>>20)
 	}
-	mime = http.DetectContentType(data)
-	ext, ok := extByMIME[mime]
+	mediaType := http.DetectContentType(data)
+	format, ok := acceptedImageFormats[mediaType]
 	if !ok {
-		return "", "", "", fmt.Errorf("assetstore: 只接受图片文件（png/jpeg/gif/webp），探测到 %s", mime)
+		return AssetInspection{}, newClassifiedAssetError(ErrUnsupportedAssetMediaType, "assetstore: 只接受图片文件（png/jpeg/gif/webp），探测到 %s", mediaType)
 	}
+
+	config, decodedFormat, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return AssetInspection{}, newClassifiedAssetError(ErrUnsupportedAssetMediaType, "assetstore: 图片头无法解码: %v", err)
+	}
+	if decodedFormat != format.decoderFormat {
+		return AssetInspection{}, newClassifiedAssetError(ErrUnsupportedAssetMediaType, "assetstore: 图片魔数与解码格式不一致（%s/%s）", mediaType, decodedFormat)
+	}
+	if err := validatePixelDimensions(config.Width, config.Height); err != nil {
+		return AssetInspection{}, err
+	}
+
+	decoded, fullyDecodedFormat, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return AssetInspection{}, newClassifiedAssetError(ErrUnsupportedAssetMediaType, "assetstore: 图片内容无法完整解码: %v", err)
+	}
+	if fullyDecodedFormat != format.decoderFormat {
+		return AssetInspection{}, newClassifiedAssetError(ErrUnsupportedAssetMediaType, "assetstore: 图片完整解码格式不一致（%s/%s）", decodedFormat, fullyDecodedFormat)
+	}
+	bounds := decoded.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	if err := validatePixelDimensions(width, height); err != nil {
+		return AssetInspection{}, err
+	}
+	if width != config.Width || height != config.Height {
+		return AssetInspection{}, newClassifiedAssetError(ErrUnsupportedAssetMediaType, "assetstore: 图片头与完整解码尺寸不一致（%dx%d/%dx%d）", config.Width, config.Height, width, height)
+	}
+
 	sum := sha256.Sum256(data)
-	digest = hex.EncodeToString(sum[:])
-	file := digest + "." + ext
-	return IDPrefix + agent + "/" + file, mime, digest, nil
+	digest := hex.EncodeToString(sum[:])
+	file := digest + "." + format.extension
+	return AssetInspection{
+		AssetID:     IDPrefix + agent + "/" + file,
+		MediaType:   mediaType,
+		Extension:   format.extension,
+		SHA256:      digest,
+		SizeBytes:   int64(len(data)),
+		PixelWidth:  width,
+		PixelHeight: height,
+	}, nil
+}
+
+func validatePixelDimensions(width, height int) error {
+	if width <= 0 || height <= 0 {
+		return newClassifiedAssetError(ErrUnsupportedAssetMediaType, "assetstore: 图片像素尺寸必须为正数（%dx%d）", width, height)
+	}
+	if int64(width) > MaxAssetPixels || int64(height) > MaxAssetPixels/int64(width) {
+		return newClassifiedAssetError(ErrAssetTooLarge, "assetstore: 图片超过像素上限（%dMP）", MaxAssetPixels/1_000_000)
+	}
+	return nil
+}
+
+type publishDurability struct {
+	syncFile func(*os.File) error
+	syncDir  func(string) error
 }
 
 // Ensure 将内容寻址资产写入 agent 作用域，并返回本次是否新建了最终文件。
 // 最终路径以 hard-link 从同目录临时文件原子发布；并发命中同一内容时只有一个调用
-// 返回 created=true，其余调用验证现存字节后幂等复用。
+// 返回 created=true，其余调用验证现存字节后幂等复用。成功返回前同时保证文件内容与
+// 父目录项均已 fsync，使上层只有在 durable asset ready 后才能提交数据库 ready 状态。
 func Ensure(agent string, data []byte) (id string, created bool, err error) {
+	return ensureWithDurability(agent, data, publishDurability{
+		syncFile: syncAssetFile,
+		syncDir:  syncParentDirectory,
+	})
+}
+
+func ensureWithDurability(
+	agent string,
+	data []byte,
+	durability publishDurability,
+) (id string, created bool, err error) {
 	id, _, digest, err := Describe(agent, data)
 	if err != nil {
 		return "", false, err
@@ -133,6 +260,9 @@ func Ensure(agent string, data []byte) (id string, created bool, err error) {
 		if err := verifyExistingContent(path, digest); err != nil {
 			return "", false, err
 		}
+		if err := durability.syncDir(dir); err != nil {
+			return "", false, fmt.Errorf("assetstore: 同步资产目录: %w", err)
+		}
 		return id, false, nil
 	} else if !os.IsNotExist(err) {
 		return "", false, fmt.Errorf("assetstore: 检查目标资产: %w", err)
@@ -143,10 +273,18 @@ func Ensure(agent string, data []byte) (id string, created bool, err error) {
 		return "", false, fmt.Errorf("assetstore: 写盘: %w", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() {
+		if tmpName != "" {
+			_ = os.Remove(tmpName)
+		}
+	}()
 	if _, werr := tmp.Write(data); werr != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return "", false, fmt.Errorf("assetstore: 写盘: %w", werr)
+	}
+	if serr := durability.syncFile(tmp); serr != nil {
+		_ = tmp.Close()
+		return "", false, fmt.Errorf("assetstore: 同步临时资产: %w", serr)
 	}
 	if cerr := tmp.Close(); cerr != nil {
 		return "", false, fmt.Errorf("assetstore: 写盘: %w", cerr)
@@ -156,11 +294,50 @@ func Ensure(agent string, data []byte) (id string, created bool, err error) {
 			if err := verifyExistingContent(path, digest); err != nil {
 				return "", false, err
 			}
+			if err := removePublishedTemp(&tmpName); err != nil {
+				return "", false, err
+			}
+			if err := durability.syncDir(dir); err != nil {
+				return "", false, fmt.Errorf("assetstore: 同步资产目录: %w", err)
+			}
 			return id, false, nil
 		}
 		return "", false, fmt.Errorf("assetstore: 落盘: %w", lerr)
 	}
+	if err := removePublishedTemp(&tmpName); err != nil {
+		return "", false, err
+	}
+	if err := durability.syncDir(dir); err != nil {
+		return "", false, fmt.Errorf("assetstore: 同步资产目录: %w", err)
+	}
 	return id, true, nil
+}
+
+func removePublishedTemp(tmpName *string) error {
+	if err := os.Remove(*tmpName); err != nil {
+		return fmt.Errorf("assetstore: 清理发布临时文件: %w", err)
+	}
+	*tmpName = ""
+	return nil
+}
+
+func syncAssetFile(file *os.File) error {
+	return file.Sync()
+}
+
+// syncParentDirectory deliberately propagates every open/sync/close error. We do not guess that
+// an errno means "unsupported": the caller must not advance durable state without proof that the
+// current platform persisted the directory entry. macOS/Linux support this operation directly.
+func syncParentDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	return dir.Close()
 }
 
 func verifyExistingContent(path, wantDigest string) error {

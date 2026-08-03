@@ -16,7 +16,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
 // assetUploadReq base64 JSON 上传体（IM/脚本客户端友好；桌面端走 multipart）。
@@ -36,7 +39,14 @@ func (h *handler) uploadAsset(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.HasPrefix(ct, "multipart/form-data"):
 		if err := r.ParseMultipartForm(assetstore.MaxAssetBytes + 1<<20); err != nil {
-			writeAssetErr(w, err)
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeAssetErr(w, err)
+			} else {
+				// Multipart syntax is wholly caller-controlled and safe to report
+				// as the existing 400 contract; it is not a repository failure.
+				writeErr(w, http.StatusBadRequest, err.Error())
+			}
 			return
 		}
 		if agent == "" {
@@ -73,16 +83,29 @@ func (h *handler) uploadAsset(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
+	ownerScope, err := h.authorizedAgentOwnerScope(r.Context(), agent)
+	if err != nil {
+		writeAssetScopeErr(w, err)
+		return
+	}
 	if len(data) > assetstore.MaxAssetBytes {
 		writeErr(w, http.StatusRequestEntityTooLarge, "图片超过大小上限（10MB）")
 		return
 	}
-	id, err := assetstore.Save(agent, data)
+	repository := h.pageAssetGateway()
+	if repository == nil {
+		writeErr(w, http.StatusServiceUnavailable, "PageAsset repository unavailable")
+		return
+	}
+	ready, err := repository.Persist(r.Context(), ownerScope, agent, data)
 	if err != nil {
 		writeAssetErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"asset_id": id, "size": len(data)})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"asset_id": ready.Metadata.PageAssetID,
+		"size":     ready.Metadata.SizeBytes,
+	})
 }
 
 // getAsset GET /assets/{file}?agent= —— 回图。归属隔离：agent 必带且只在其目录下解析。
@@ -92,29 +115,78 @@ func (h *handler) getAsset(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
-	data, mime, err := assetstore.Read(agent, r.PathValue("file"))
+	ownerScope, err := h.authorizedAgentOwnerScope(r.Context(), agent)
 	if err != nil {
-		// 不区分「不存在 / 越权 / 非法名」——一律 404，防资产枚举探测。
+		writeAssetScopeErr(w, err)
+		return
+	}
+	repository := h.pageAssetGateway()
+	if repository == nil {
+		writeErr(w, http.StatusServiceUnavailable, "PageAsset repository unavailable")
+		return
+	}
+	ready, err := repository.OpenReady(
+		r.Context(),
+		ownerScope,
+		agent,
+		assetstore.IDPrefix+agent+"/"+r.PathValue("file"),
+	)
+	if err != nil {
+		// Only owner-scoped absence is hidden as 404. Integrity drift and storage
+		// failures are server faults; disguising them as absence prevents repair
+		// and makes availability telemetry dishonest.
+		if errors.Is(err, records.ErrScopeNotFound) ||
+			errors.Is(err, k12storage.ErrPageAssetNotFound) {
+			writeErr(w, http.StatusNotFound, "资产不存在")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "资产服务暂时不可用")
+		return
+	}
+	w.Header().Set("Content-Type", ready.Metadata.MediaType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(ready.Data)))
+	w.Header().Set("Cache-Control", "private, max-age=86400, immutable") // 内容寻址：同名即同内容
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(ready.Data)
+}
+
+func (h *handler) pageAssetGateway() usecase.PageAssetGateway {
+	if h.rt.PageAssets != nil {
+		return h.rt.PageAssets
+	}
+	if h.rt.Records == nil {
+		return nil
+	}
+	return &usecase.PageAssetRepository{Records: h.rt.Records}
+}
+
+func writeAssetScopeErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, errAgentScopeNotFound) {
 		writeErr(w, http.StatusNotFound, "资产不存在")
 		return
 	}
-	w.Header().Set("Content-Type", mime)
-	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	w.Header().Set("Cache-Control", "private, max-age=86400, immutable") // 内容寻址：同名即同内容
-	w.WriteHeader(http.StatusOK)
-	w.Write(data)
+	writeErr(w, http.StatusUnauthorized, "authenticated asset principal required")
 }
 
-// writeAssetErr 资产错误 → HTTP 状态：魔数不符 415、超限 413、其余按输入错 400。
+// writeAssetErr maps typed domain errors to stable public responses. Unknown
+// errors are infrastructure failures and must never expose paths/SQL/details.
 func writeAssetErr(w http.ResponseWriter, err error) {
-	msg := err.Error()
 	var maxErr *http.MaxBytesError
 	switch {
-	case errors.As(err, &maxErr), strings.Contains(msg, "大小上限"):
+	case errors.Is(err, records.ErrScopeNotFound),
+		errors.Is(err, k12storage.ErrPageAssetNotFound):
+		writeErr(w, http.StatusNotFound, "资产不存在")
+	case errors.Is(err, k12storage.ErrPageAssetConflict):
+		writeErr(w, http.StatusConflict, "资产状态冲突")
+	case errors.As(err, &maxErr):
 		writeErr(w, http.StatusRequestEntityTooLarge, "图片超过大小上限（10MB）")
-	case strings.Contains(msg, "只接受图片"), strings.Contains(msg, "不是图片"):
-		writeErr(w, http.StatusUnsupportedMediaType, msg)
+	case errors.Is(err, assetstore.ErrAssetTooLarge):
+		writeErr(w, http.StatusRequestEntityTooLarge, err.Error())
+	case errors.Is(err, assetstore.ErrUnsupportedAssetMediaType):
+		writeErr(w, http.StatusUnsupportedMediaType, err.Error())
+	case errors.Is(err, assetstore.ErrInvalidAssetInput):
+		writeErr(w, http.StatusBadRequest, err.Error())
 	default:
-		writeErr(w, http.StatusBadRequest, msg)
+		writeErr(w, http.StatusInternalServerError, "资产服务暂时不可用")
 	}
 }

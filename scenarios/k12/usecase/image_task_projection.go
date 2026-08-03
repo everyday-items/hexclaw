@@ -17,6 +17,30 @@ func (o *GradingOrchestrator) ImageTaskHomeworkProjection(
 		return ImageTaskHomeworkProjection{}, err
 	}
 	questions, _ := o.RecognizedQuestionsForOwner(ctx, agentName, jobID)
+	currentInputs, err := o.deps.Records.ListCurrentProblemInputRevisions(
+		ctx,
+		agentName,
+		job.Fields.SubmissionID,
+	)
+	if err != nil {
+		return ImageTaskHomeworkProjection{}, err
+	}
+	for index := range questions {
+		current, ok := currentInputs[questions[index].ProblemID]
+		if !ok {
+			continue
+		}
+		questions[index].PageAssetID = current.PageAssetID
+		questions[index].SourceWidth = current.SourceWidth
+		questions[index].SourceHeight = current.SourceHeight
+		questions[index].SourceRegion = current.SourceRegion
+		questions[index].RawTranscription = current.StemRaw
+		questions[index].AnswerRawTranscription = current.AnswerRaw
+		questions[index].CanonicalMarkdown = current.QuestionCanonicalMarkdown
+		questions[index].AnswerCanonicalMarkdown = current.AnswerCanonicalMarkdown
+		questions[index].InputDigest = current.InputDigest
+		questions[index].CanonicalVersion = current.InputRevision
+	}
 	subject := ""
 	counts := map[string]int{}
 	for _, question := range questions {

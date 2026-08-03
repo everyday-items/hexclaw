@@ -33,7 +33,7 @@ func TestPhotoGradingPersistsOwnerScopedPageAssetAndBackupExactSet(t *testing.T)
 	}}}
 	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshotResolver))
 	ctx := context.Background()
-	image := []byte("\x89PNG\r\n\x1a\ncanonical-homework-page")
+	image := validPNGFixture(t, "canonical-homework-page")
 
 	var firstAssetID string
 	for i, owner := range []string{"mingming", "mingming", "eval-agent"} {
@@ -123,7 +123,7 @@ func TestPhotoGradingPageAssetFailureAndProblemWriteFailureNeverReportSuccess(t 
 			t.Fatal(err)
 		}
 		o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshotResolver))
-		image := []byte("\x89PNG\r\n\x1a\ncompensated-page")
+		image := validPNGFixture(t, "compensated-page")
 		assetID, _, _, err := assetstore.Describe("mingming", image)
 		if err != nil {
 			t.Fatal(err)
@@ -154,7 +154,7 @@ func TestPhotoGradingSameImageConcurrentTypedFailureCannotDeleteSuccessfulShared
 	d.Recognizer = freshSharedPageRecognizer{}
 	o := trackGradingOrchestrator(t, NewGradingOrchestrator(d, orchestratorSnapshotResolver))
 	ctx := context.Background()
-	image := []byte("\x89PNG\r\n\x1a\nconcurrent-shared-page")
+	image := validPNGFixture(t, "concurrent-shared-page")
 
 	start := func(sourceKey string) GradingJobView {
 		t.Helper()

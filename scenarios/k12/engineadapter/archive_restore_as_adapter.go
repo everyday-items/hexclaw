@@ -68,6 +68,12 @@ func (a *ArchiveRestoreAdapter) RestoreArchiveAs(
 			if err != nil {
 				return fmt.Errorf("snapshot target Problem/Attempt ledger: %w", err)
 			}
+			preProblemSource, err := a.records.ExportProblemSourceArchiveV6Tx(
+				ctx, tx, plan.TargetAgent,
+			)
+			if err != nil {
+				return fmt.Errorf("snapshot target problem-source closure: %w", err)
+			}
 			profile := k12.ProfileFromMeta(updated.Metadata)
 			var snapshotProfile *k12.ChildProfile
 			if profile != (k12.ChildProfile{}) {
@@ -78,6 +84,9 @@ func (a *ArchiveRestoreAdapter) RestoreArchiveAs(
 				ExportedAt: plan.RequestedAt, Records: preRecords, Profile: snapshotProfile,
 				ProblemAttempts: preProblemAttempts,
 			}
+			if !preProblemSource.IsEmpty() {
+				snapshot.ProblemSource = &preProblemSource
+			}
 			recordAssets, err := usecase.PackHexbakAssets(plan.TargetAgent, preRecords)
 			if err != nil {
 				return fmt.Errorf("pack pre-restore snapshot assets: %w", err)
@@ -86,7 +95,15 @@ func (a *ArchiveRestoreAdapter) RestoreArchiveAs(
 			if err != nil {
 				return fmt.Errorf("pack pre-restore snapshot Problem page assets: %w", err)
 			}
-			snapshot.Assets, err = usecase.MergeHexbakAssets(recordAssets, problemAssets)
+			problemSourceAssets, err := usecase.PackHexbakProblemSourceAssets(
+				plan.TargetAgent, snapshot.ProblemSource,
+			)
+			if err != nil {
+				return fmt.Errorf("pack pre-restore snapshot source PageAssets: %w", err)
+			}
+			snapshot.Assets, err = usecase.MergeHexbakAssets(
+				recordAssets, problemAssets, problemSourceAssets,
+			)
 			if err != nil {
 				return fmt.Errorf("merge pre-restore snapshot assets: %w", err)
 			}
@@ -150,6 +167,13 @@ func (a *ArchiveRestoreAdapter) RestoreArchiveAs(
 				ctx, tx, plan.TargetAgent, migrated.ProblemAttempts,
 			); err != nil {
 				return fmt.Errorf("merge owner-rewritten Problem/Attempt ledger: %w", err)
+			}
+			if migrated.ProblemSource != nil {
+				if err := a.records.ImportProblemSourceArchiveV6Tx(
+					ctx, tx, plan.TargetAgent, *migrated.ProblemSource,
+				); err != nil {
+					return fmt.Errorf("merge owner-rewritten problem-source closure: %w", err)
+				}
 			}
 			updated.Metadata = k12.ReplaceProfileInMeta(updated.Metadata, migrated.Profile)
 			if err := a.agents.SaveAgentTx(ctx, tx, updated); err != nil {
@@ -276,6 +300,17 @@ func (a *ArchiveRestoreAdapter) RollbackRestoreAs(
 			if err != nil {
 				return rollbackFailure(fmt.Errorf("snapshot current Problem/Attempt state: %w", err), nil)
 			}
+			beforeProblemSource, err := a.records.ExportProblemSourceArchiveV6Tx(
+				ctx, tx, req.TargetAgent,
+			)
+			if err != nil {
+				return rollbackFailure(fmt.Errorf("snapshot current problem-source state: %w", err), nil)
+			}
+			if err := a.records.DeleteProblemSourceArchiveV6Tx(
+				ctx, tx, req.TargetAgent,
+			); err != nil {
+				return rollbackFailure(fmt.Errorf("remove migrated problem-source closure: %w", err), nil)
+			}
 			if err := a.records.ReplaceAgentRecordsTx(ctx, tx, req.TargetAgent, current.Snapshot.Records); err != nil {
 				return rollbackFailure(fmt.Errorf("restore pre-migration records: %w", err), nil)
 			}
@@ -283,6 +318,24 @@ func (a *ArchiveRestoreAdapter) RollbackRestoreAs(
 				ctx, tx, req.TargetAgent, current.Snapshot.ProblemAttempts,
 			); err != nil {
 				return rollbackFailure(fmt.Errorf("restore pre-migration Problem/Attempt ledger: %w", err), nil)
+			}
+			if current.Snapshot.ProblemSource != nil {
+				if err := a.records.ImportProblemSourceArchiveV6Tx(
+					ctx, tx, req.TargetAgent, *current.Snapshot.ProblemSource,
+				); err != nil {
+					return rollbackFailure(fmt.Errorf("restore pre-migration problem-source closure: %w", err), nil)
+				}
+			}
+			createdPageAssetIDs := make([]string, 0, len(assetMigrations))
+			for _, item := range assetMigrations {
+				if item.CreatedNew {
+					createdPageAssetIDs = append(createdPageAssetIDs, item.TargetAssetID)
+				}
+			}
+			if err := a.records.DeleteUnreferencedProblemSourcePageAssetsTx(
+				ctx, tx, req.TargetAgent, createdPageAssetIDs,
+			); err != nil {
+				return rollbackFailure(fmt.Errorf("remove migration-created PageAsset metadata: %w", err), nil)
 			}
 			if err := a.records.ImportCreativeWorkOCREvidenceTx(
 				ctx, tx, req.TargetAgent, current.Snapshot.CreativeWorkOCR,
@@ -304,13 +357,15 @@ func (a *ArchiveRestoreAdapter) RollbackRestoreAs(
 			}
 			at := time.Now().Unix()
 			beforeJSON, _ := json.Marshal(struct {
-				Records         []*records.AgentRecord       `json:"records"`
-				ProblemAttempts []k12.ProblemAttemptSnapshot `json:"problem_attempts"`
-			}{before, beforeProblemAttempts})
+				Records         []*records.AgentRecord            `json:"records"`
+				ProblemAttempts []k12.ProblemAttemptSnapshot      `json:"problem_attempts"`
+				ProblemSource   k12storage.ProblemSourceArchiveV6 `json:"problem_source"`
+			}{before, beforeProblemAttempts, beforeProblemSource})
 			afterJSON, _ := json.Marshal(struct {
-				Records         []*records.AgentRecord       `json:"records"`
-				ProblemAttempts []k12.ProblemAttemptSnapshot `json:"problem_attempts"`
-			}{current.Snapshot.Records, current.Snapshot.ProblemAttempts})
+				Records         []*records.AgentRecord             `json:"records"`
+				ProblemAttempts []k12.ProblemAttemptSnapshot       `json:"problem_attempts"`
+				ProblemSource   *k12storage.ProblemSourceArchiveV6 `json:"problem_source,omitempty"`
+			}{current.Snapshot.Records, current.Snapshot.ProblemAttempts, current.Snapshot.ProblemSource})
 			var ordinal int
 			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(ordinal),0)+1 FROM k12_restore_journal WHERE migration_id=?`, req.MigrationID).Scan(&ordinal); err != nil {
 				return rollbackFailure(fmt.Errorf("next rollback journal ordinal: %w", err), nil)
@@ -655,6 +710,14 @@ func appendRestoreAsJournal(
 		after, _ := json.Marshal(migrated.ProblemAttempts)
 		entries = append(entries, entry{
 			"rewrite_owner", "problem_attempt_ledger", plan.TargetAgent, string(before), string(after),
+		})
+	}
+	if migrated.ProblemSource != nil || plan.OriginalArchive.ProblemSource != nil {
+		before, _ := json.Marshal(plan.OriginalArchive.ProblemSource)
+		after, _ := json.Marshal(migrated.ProblemSource)
+		entries = append(entries, entry{
+			"rewrite_owner", "problem_source_ledger", plan.TargetAgent,
+			string(before), string(after),
 		})
 	}
 	beforeProfile, _ := json.Marshal(snapshot.Profile)

@@ -108,13 +108,11 @@ func (d Deps) BuildTutoringTipsSubject(ctx context.Context, agentName, gradingJo
 		return TutoringTips{}, fmt.Errorf("%w: durable profile child_name required", ErrInvalidInput)
 	}
 
-	snapshot, err := d.Records.GetProblemAttemptSnapshot(ctx, agentName, job.Fields.SubmissionID)
+	questions, err := d.loadCurrentConfirmedQuestions(
+		ctx, agentName, job.Fields.SubmissionID,
+	)
 	if err != nil {
 		return TutoringTips{}, fmt.Errorf("usecase: derive tutoring tips facts: %w", err)
-	}
-	questions, err := RecognizedQuestionsFromProblemAttemptSnapshot(snapshot)
-	if err != nil {
-		return TutoringTips{}, err
 	}
 	problems, subject, knowledgePoints, err := validateTutoringTipsFacts(questions, grade)
 	if err != nil {

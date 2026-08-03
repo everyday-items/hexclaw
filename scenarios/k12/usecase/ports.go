@@ -131,10 +131,13 @@ type RecognizedQuestion struct {
 	SourceSectionLabel string   `json:"source_section_label,omitempty"`
 	// System* is server-derived only for an unnumbered answerable item within a
 	// printed section. It must never be attributed to the source worksheet.
-	SystemSectionOrdinal int    `json:"system_section_ordinal,omitempty"`
-	SystemDisplayLabel   string `json:"system_display_label,omitempty"`
-	PageAssetID          string `json:"page_asset_id,omitempty"`
-	AttemptID            string `json:"attempt_id,omitempty"`
+	SystemSectionOrdinal int                    `json:"system_section_ordinal,omitempty"`
+	SystemDisplayLabel   string                 `json:"system_display_label,omitempty"`
+	PageAssetID          string                 `json:"page_asset_id,omitempty"`
+	SourceWidth          int                    `json:"source_width,omitempty"`
+	SourceHeight         int                    `json:"source_height,omitempty"`
+	SourceRegion         *k12.SourcePixelRegion `json:"source_region,omitempty"`
+	AttemptID            string                 `json:"attempt_id,omitempty"`
 
 	// OCR 原始转写与 canonical Markdown/LaTeX 是两份独立事实。Raw* 一经识别不得被
 	// 家长修正或增强模型覆盖；canonical 可在显式确认时形成新版本。

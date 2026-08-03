@@ -201,6 +201,12 @@ func (e *durableGradingPhysicalCallExecutor) ExecuteGradingPhysicalCall(
 				ErrModelInvocationRequiresReconciliation, matching.InvocationID, matching.Status)
 		}
 	}
+	if problemSourceReconciliationOnly(ctx) {
+		return zero, gradingPhysicalNoRetryError{cause: fmt.Errorf(
+			"%w: reconciliation-only processing cannot create or send a grading invocation",
+			ErrModelInvocationRequiresReconciliation,
+		)}
+	}
 
 	var invocation k12.GradingItemInvocation
 	if matching != nil {

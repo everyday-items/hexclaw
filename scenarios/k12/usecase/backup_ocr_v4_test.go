@@ -14,9 +14,9 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
 )
 
-func TestHexbakCurrentVersionIsV5ForProblemAttemptAndConfirmedCreativeWorkOCREvidence(t *testing.T) {
-	if HexbakVersion != 5 {
-		t.Fatalf("HexbakVersion=%d want 5 so Problem/Attempt and confirmed OCR are checksum-covered", HexbakVersion)
+func TestHexbakCurrentVersionIsV6ForProblemSourceProblemAttemptAndConfirmedCreativeWorkOCREvidence(t *testing.T) {
+	if HexbakVersion != 6 {
+		t.Fatalf("HexbakVersion=%d want 6 so source-action, Problem/Attempt and confirmed OCR evidence are checksum-covered", HexbakVersion)
 	}
 }
 
@@ -96,7 +96,7 @@ func TestMigrateHexbakOwnerUpgradesV3InlineOCREvidenceAndRewritesResolvableJobRe
 	if err != nil {
 		t.Fatal(err)
 	}
-	if migrated.Version != 5 || len(migrated.CreativeWorkOCR) != 1 {
+	if migrated.Version != 6 || len(migrated.CreativeWorkOCR) != 1 {
 		t.Fatalf("migrated v3 archive=%+v want one current-version confirmed OCR evidence", migrated)
 	}
 	fields, err := k12.ParseCreativeWorkFields(migrated.Records[0].Fields)
@@ -134,7 +134,7 @@ func TestBackupV4PacksOnlyConfirmedOCREvidenceReferencedByCreativeWork(t *testin
 	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
 	d, store := newPipeline(t, fakeSolver{}, fakeGrader{}, nil)
 	ctx := context.Background()
-	image := []byte("\x89PNG\r\n\x1a\nbackup-ocr-v4")
+	image := validPNGFixture(t, "backup-ocr-v4")
 	assetID, err := assetstore.Save("mingming", image)
 	if err != nil {
 		t.Fatal(err)
@@ -204,7 +204,7 @@ func TestBackupV4PacksOnlyConfirmedOCREvidenceReferencedByCreativeWork(t *testin
 
 func v4CreativeWorkOCRArchive(t *testing.T, agent string) *Hexbak {
 	t.Helper()
-	image := []byte("\x89PNG\r\n\x1a\ncreative-work-ocr-v4")
+	image := validPNGFixture(t, "creative-work-ocr-v4")
 	assetID, mime, sourceDigest, err := assetstore.Describe(agent, image)
 	if err != nil {
 		t.Fatal(err)

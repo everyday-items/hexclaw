@@ -2,7 +2,9 @@ package k12storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,7 +19,7 @@ var ErrModelInvocationConflict = errors.New("model invocation immutable identity
 const modelInvocationColumns = `invocation_id,agent_name,job_id,stage,request_digest,
     provider,model,route_snapshot_json,request_policy_snapshot_json,
     provider_idempotency_key,status,attempt,
-    result_digest,external_request_id,failure_kind,created_at,updated_at`
+    result_digest,result_json,external_request_id,failure_kind,created_at,updated_at`
 
 func scanModelInvocation(row rowScanner) (k12.ModelInvocation, error) {
 	var invocation k12.ModelInvocation
@@ -26,7 +28,8 @@ func scanModelInvocation(row rowScanner) (k12.ModelInvocation, error) {
 		&invocation.Stage, &invocation.RequestDigest, &invocation.RouteSnapshot.Provider,
 		&invocation.RouteSnapshot.Model, &routeJSON, &requestPolicyJSON,
 		&invocation.ProviderIdempotencyKey, &status, &invocation.Attempt,
-		&invocation.ResultDigest, &invocation.ExternalRequestID, &invocation.FailureKind,
+		&invocation.ResultDigest, &invocation.ResultJSON,
+		&invocation.ExternalRequestID, &invocation.FailureKind,
 		&invocation.CreatedAt, &invocation.UpdatedAt)
 	if err != nil {
 		return k12.ModelInvocation{}, err
@@ -109,11 +112,11 @@ func (s *Store) PrepareModelInvocation(ctx context.Context, invocation k12.Model
 		requestPolicyJSON = string(raw)
 	}
 	res, err := s.db.ExecContext(ctx, `INSERT INTO k12_model_invocations (`+modelInvocationColumns+`)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id,stage,attempt) DO NOTHING`,
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id,stage,attempt) DO NOTHING`,
 		invocation.InvocationID, invocation.AgentName, invocation.JobID, invocation.Stage,
 		invocation.RequestDigest, invocation.RouteSnapshot.Provider, invocation.RouteSnapshot.Model,
 		string(routeJSON), requestPolicyJSON, invocation.ProviderIdempotencyKey,
-		invocation.Status, invocation.Attempt, "", "", "", invocation.CreatedAt,
+		invocation.Status, invocation.Attempt, "", "", "", "", invocation.CreatedAt,
 		invocation.UpdatedAt)
 	if err != nil {
 		return k12.ModelInvocation{}, false, fmt.Errorf("k12storage: prepare model invocation: %w", err)
@@ -139,6 +142,40 @@ func (s *Store) getModelInvocationByAttempt(ctx context.Context, jobID, stage st
 		return k12.ModelInvocation{}, records.ErrNotFound
 	}
 	return invocation, err
+}
+
+// GetModelInvocationByAttempt is the read-only stable-operation lookup used by
+// reconciliation paths. Unlike PrepareModelInvocation it can never create a
+// ledger row or authorize an external send.
+func (s *Store) GetModelInvocationByAttempt(
+	ctx context.Context,
+	agentName, jobID, stage string,
+	attempt int,
+) (k12.ModelInvocation, error) {
+	agentName = strings.TrimSpace(agentName)
+	jobID = strings.TrimSpace(jobID)
+	stage = strings.TrimSpace(stage)
+	if agentName == "" || jobID == "" || stage == "" || attempt < 1 {
+		return k12.ModelInvocation{}, records.ErrNotFound
+	}
+	invocation, err := scanModelInvocation(s.db.QueryRowContext(ctx, `SELECT `+modelInvocationColumns+`
+		FROM k12_model_invocations
+		WHERE agent_name=? AND job_id=? AND stage=? AND attempt=?`,
+		agentName,
+		jobID,
+		stage,
+		attempt,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return k12.ModelInvocation{}, records.ErrNotFound
+	}
+	if err != nil {
+		return k12.ModelInvocation{}, fmt.Errorf(
+			"k12storage: get model invocation by attempt: %w",
+			err,
+		)
+	}
+	return invocation, nil
 }
 
 func (s *Store) GetModelInvocation(ctx context.Context, agentName, invocationID string) (k12.ModelInvocation, error) {
@@ -224,6 +261,93 @@ func (s *Store) MarkModelInvocationSucceeded(ctx context.Context, agentName, inv
 	}
 	return s.transitionModelInvocation(ctx, agentName, invocationID,
 		[]k12.ModelInvocationStatus{k12.ModelInvocationSent}, k12.ModelInvocationSucceeded, "", resultDigest, externalRequestID, "")
+}
+
+func modelInvocationResultPayloadDigest(resultJSON string) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(resultJSON))
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+// MarkModelInvocationSucceededWithResult atomically binds the exact provider
+// result bytes to the successful invocation transition. The payload is an
+// immutable crash-recovery fact: only a byte-for-byte replay of all result
+// identity fields is accepted after success.
+func (s *Store) MarkModelInvocationSucceededWithResult(
+	ctx context.Context,
+	agentName, invocationID, resultDigest, resultJSON, externalRequestID string,
+) (k12.ModelInvocation, error) {
+	agentName = strings.TrimSpace(agentName)
+	invocationID = strings.TrimSpace(invocationID)
+	resultDigest = strings.TrimSpace(resultDigest)
+	externalRequestID = strings.TrimSpace(externalRequestID)
+	if agentName == "" || invocationID == "" {
+		return k12.ModelInvocation{}, fmt.Errorf(
+			"k12storage: successful model invocation requires agent and invocation id",
+		)
+	}
+	if strings.TrimSpace(resultJSON) == "" || !json.Valid([]byte(resultJSON)) {
+		return k12.ModelInvocation{}, fmt.Errorf(
+			"k12storage: successful model invocation requires non-empty valid result_json",
+		)
+	}
+	expectedDigest := modelInvocationResultPayloadDigest(resultJSON)
+	if resultDigest == "" || resultDigest != expectedDigest {
+		return k12.ModelInvocation{}, fmt.Errorf(
+			"%w: invocation %s result digest does not match result_json",
+			ErrModelInvocationConflict,
+			invocationID,
+		)
+	}
+
+	res, err := s.db.ExecContext(ctx, `UPDATE k12_model_invocations SET
+        status=?,result_digest=?,result_json=?,external_request_id=?,
+        failure_kind='',updated_at=?
+        WHERE invocation_id=? AND agent_name=? AND status=?`,
+		k12.ModelInvocationSucceeded,
+		resultDigest,
+		resultJSON,
+		externalRequestID,
+		nowUnix(),
+		invocationID,
+		agentName,
+		k12.ModelInvocationSent,
+	)
+	if err != nil {
+		return k12.ModelInvocation{}, fmt.Errorf(
+			"k12storage: persist successful model invocation result: %w",
+			err,
+		)
+	}
+	updated, err := res.RowsAffected()
+	if err != nil {
+		return k12.ModelInvocation{}, err
+	}
+	stored, err := s.GetModelInvocation(ctx, agentName, invocationID)
+	if err != nil {
+		return k12.ModelInvocation{}, err
+	}
+	if updated == 0 && stored.Status != k12.ModelInvocationSucceeded {
+		return k12.ModelInvocation{}, fmt.Errorf(
+			"%w: invocation %s status %s -> %s",
+			records.ErrIllegalTransition,
+			invocationID,
+			stored.Status,
+			k12.ModelInvocationSucceeded,
+		)
+	}
+	if stored.Status != k12.ModelInvocationSucceeded ||
+		stored.ResultDigest != resultDigest ||
+		stored.ResultJSON != resultJSON ||
+		stored.ExternalRequestID != externalRequestID {
+		return k12.ModelInvocation{}, fmt.Errorf(
+			"%w: invocation %s successful result identity changed",
+			ErrModelInvocationConflict,
+			invocationID,
+		)
+	}
+	return stored, nil
 }
 
 func (s *Store) MarkModelInvocationFailed(ctx context.Context, agentName, invocationID, failureKind string) (k12.ModelInvocation, error) {

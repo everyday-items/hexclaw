@@ -129,6 +129,89 @@ func TestImageTaskPrepareIsIdempotentAndRouteImmutable(t *testing.T) {
 	}
 }
 
+func TestImageTaskPrepareIdempotencyLoserBindsStoredDispatchOwnerScope(t *testing.T) {
+	store, _ := setup(t)
+	ctx := context.Background()
+	dispatch := testImageTaskDispatch()
+	dispatch.OwnerScope = "owner-a"
+	invocation := k12.ImageTaskInvocation{
+		InvocationID: "invocation-classify-1", AgentName: "mingming",
+		DispatchID: "dispatch-1", Operation: k12.ImageTaskOperationClassification,
+		OperationKey:  "dispatch:dispatch-1:classification",
+		RequestDigest: "sha256:classify-request", RouteSnapshot: testImageRoute(),
+		Status: k12.ImageTaskInvocationPrepared, Attempt: 1,
+		CreatedAt: 100, UpdatedAt: 100,
+	}
+	winner, created, err := store.PrepareImageTaskDispatch(ctx, dispatch, invocation)
+	if err != nil || !created {
+		t.Fatalf("prepare winner=%+v created=%v err=%v", winner, created, err)
+	}
+
+	loser := dispatch
+	loser.DispatchID = "dispatch-concurrent-loser"
+	loser.ClassificationInvocationID = "invocation-concurrent-loser"
+	loserInvocation := invocation
+	loserInvocation.DispatchID = loser.DispatchID
+	loserInvocation.InvocationID = loser.ClassificationInvocationID
+	loserInvocation.OperationKey = "dispatch:" + loser.DispatchID + ":classification"
+	replay, created, err := store.PrepareImageTaskDispatch(ctx, loser, loserInvocation)
+	if err != nil || created || replay.DispatchID != winner.DispatchID {
+		t.Fatalf("idempotency loser replay=%+v created=%v err=%v", replay, created, err)
+	}
+	owner, err := store.GetImageTaskOwnerScope(ctx, "mingming", winner.DispatchID)
+	if err != nil || owner != "owner-a" {
+		t.Fatalf("winner owner scope=%q err=%v", owner, err)
+	}
+	if _, err := store.GetImageTaskOwnerScope(ctx, "mingming", loser.DispatchID); !errors.Is(err, k12storage.ErrImageTaskNotFound) {
+		t.Fatalf("loser dispatch unexpectedly received an owner binding: %v", err)
+	}
+	otherOwner := loser
+	otherOwner.DispatchID = "dispatch-other-owner-loser"
+	otherOwner.OwnerScope = "owner-b"
+	otherOwner.ClassificationInvocationID = "invocation-other-owner-loser"
+	otherInvocation := loserInvocation
+	otherInvocation.DispatchID = otherOwner.DispatchID
+	otherInvocation.InvocationID = otherOwner.ClassificationInvocationID
+	otherInvocation.OperationKey = "dispatch:" + otherOwner.DispatchID + ":classification"
+	if _, _, err := store.PrepareImageTaskDispatch(
+		ctx, otherOwner, otherInvocation,
+	); !errors.Is(err, k12storage.ErrImageTaskConflict) {
+		t.Fatalf("cross-owner idempotency replay err=%v, want conflict", err)
+	}
+}
+
+func TestParentSelectedPrepareIdempotencyLoserBindsStoredDispatchOwnerScope(t *testing.T) {
+	store, _ := setup(t)
+	ctx := context.Background()
+	dispatch := testImageTaskDispatch()
+	dispatch.OwnerScope = "owner-a"
+	dispatch.TaskIntent = k12.ImageTaskIntentArtwork
+	dispatch.IntentEvidence = []string{"parent_selected:artwork"}
+	dispatch.IntentConfidence = 1
+	dispatch.Status = k12.ImageTaskStatusRouted
+	dispatch.RoutingProvenance = k12.ImageTaskRoutingParentSelected
+	dispatch.ClassificationRouteSnapshot = k12.ImageTaskRouteSnapshot{}
+	dispatch.ClassificationInvocationID = ""
+	dispatch.CreativeEntry = &k12.ImageTaskCreativeEntry{
+		Kind: k12.CreativeWorkEntryNewWork, TaskIntent: k12.ImageTaskIntentArtwork,
+	}
+	winner, winnerIntake, created, err := store.PrepareParentSelectedCreativeDispatch(ctx, dispatch)
+	if err != nil || !created || winnerIntake == nil {
+		t.Fatalf("prepare manual winner=%+v intake=%+v created=%v err=%v", winner, winnerIntake, created, err)
+	}
+	loser := dispatch
+	loser.DispatchID = "dispatch-manual-concurrent-loser"
+	replay, replayIntake, created, err := store.PrepareParentSelectedCreativeDispatch(ctx, loser)
+	if err != nil || created || replay.DispatchID != winner.DispatchID ||
+		replayIntake == nil || replayIntake.IntakeID != winnerIntake.IntakeID {
+		t.Fatalf("manual idempotency loser replay=%+v intake=%+v created=%v err=%v", replay, replayIntake, created, err)
+	}
+	owner, err := store.GetImageTaskOwnerScope(ctx, "mingming", winner.DispatchID)
+	if err != nil || owner != "owner-a" {
+		t.Fatalf("manual winner owner scope=%q err=%v", owner, err)
+	}
+}
+
 func TestConfirmImageTaskIntentCreatesCandidateTargetWithoutRewritingClassificationReceipt(t *testing.T) {
 	store, _ := setup(t)
 	ctx := context.Background()

@@ -148,13 +148,16 @@ type K12Receipt struct {
 // copied exclusively from K12Binding; payload owner claims are rejected before
 // this value can be constructed.
 type K12Dispatch struct {
-	ReceiptID string          `json:"receipt_id"`
-	BindingID string          `json:"binding_id"`
-	EventID   string          `json:"event_id"`
-	EventType K12EventType    `json:"event_type"`
-	AgentID   string          `json:"agent_id"`
-	LearnerID string          `json:"learner_id"`
-	Payload   json.RawMessage `json:"payload"`
+	ReceiptID string `json:"receipt_id"`
+	BindingID string `json:"binding_id"`
+	// OwnerScope is copied only from the authenticated server-side binding.
+	// Payloads cannot choose or override it.
+	OwnerScope string          `json:"owner_scope"`
+	EventID    string          `json:"event_id"`
+	EventType  K12EventType    `json:"event_type"`
+	AgentID    string          `json:"agent_id"`
+	LearnerID  string          `json:"learner_id"`
+	Payload    json.RawMessage `json:"payload"`
 }
 
 type K12DispatchResult struct {
@@ -1204,7 +1207,8 @@ func (m *Manager) acceptK12Locked(ctx context.Context, binding k12BindingRow, en
 	}
 	dispatch := K12Dispatch{
 		ReceiptID: receipt.ReceiptID, BindingID: binding.BindingID,
-		EventID: envelope.EventID, EventType: envelope.EventType,
+		OwnerScope: binding.CreatedBy,
+		EventID:    envelope.EventID, EventType: envelope.EventType,
 		AgentID: binding.AgentID, LearnerID: binding.LearnerID,
 		Payload: append(json.RawMessage(nil), envelope.Payload...),
 	}

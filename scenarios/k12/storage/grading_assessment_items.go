@@ -447,8 +447,15 @@ func validateGradingAssessmentInputBinding(ctx context.Context, q dbQueryer,
 		return fmt.Errorf("k12storage: validate assessment input binding: %w", err)
 	}
 	if confirmedVersion != item.ConfirmedVersion || inputDigest != item.InputDigest {
-		return fmt.Errorf("%w: attempt=%s frozen input changed",
-			ErrGradingAssessmentItemConflict, item.AttemptID)
+		return fmt.Errorf(
+			"%w: attempt=%s frozen input changed (confirmed_version=%d want=%d input_digest=%q want=%q)",
+			ErrGradingAssessmentItemConflict,
+			item.AttemptID,
+			confirmedVersion,
+			item.ConfirmedVersion,
+			inputDigest,
+			item.InputDigest,
+		)
 	}
 	return nil
 }

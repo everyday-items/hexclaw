@@ -12,7 +12,6 @@ import (
 	"github.com/hexagon-codes/hexclaw/messagecontent"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	k12 "github.com/hexagon-codes/hexclaw/scenarios/k12"
-	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
 	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
@@ -25,6 +24,7 @@ const k12IMImageTaskWaitTimeout = 125 * time.Second
 // dispatch before any model call; adapters cannot fall back to GradingJob or a
 // provider function after that boundary.
 type k12ImageTaskFacade interface {
+	PersistPageAsset(context.Context, string, string, []byte) (k12usecase.ReadyPageAsset, error)
 	Create(context.Context, k12usecase.CreateImageTaskInput) (k12usecase.ImageTaskView, bool, error)
 	StartAsync(agentName, dispatchID string) bool
 	Get(context.Context, string, string) (k12usecase.ImageTaskView, error)
@@ -55,17 +55,24 @@ func maybeHandleK12DingtalkPhoto(
 	if err != nil {
 		return nil, true, err
 	}
-	assetRef, err := assetstore.Save(routed.AgentName, raw)
+	readyAsset, err := imageTasks.PersistPageAsset(
+		ctx,
+		k12usecase.DefaultLocalOwnerScope,
+		routed.AgentName,
+		raw,
+	)
 	if err != nil {
 		return nil, true, fmt.Errorf("K12 钉钉图片入库: %w", err)
 	}
+	assetRef := readyAsset.Metadata.PageAssetID
 	sourceRef := strings.TrimSpace(msg.ID)
 	sourceSession := k12PhotoSourceSession(msg)
 	if sourceRef == "" {
 		sourceRef = sourceSession
 	}
 	view, created, err := imageTasks.Create(ctx, k12usecase.CreateImageTaskInput{
-		AgentName: routed.AgentName, LearnerID: routed.AgentName,
+		OwnerScope: k12usecase.DefaultLocalOwnerScope,
+		AgentName:  routed.AgentName, LearnerID: routed.AgentName,
 		SourceKind: k12.ImageTaskSourceIM, SourceRef: sourceRef,
 		SourceSessionID: sourceSession, SourceAssetRefs: []string{assetRef},
 		MessageIntent: strings.TrimSpace(msg.Content), AttemptGeneration: 1,

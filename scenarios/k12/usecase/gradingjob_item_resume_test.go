@@ -441,6 +441,112 @@ func TestGradingOrchestratorItemResume_RejectsUnconfirmedAttemptBeforeAnyModelCa
 	}
 }
 
+func TestGradingItemInvocationStartsNewAttemptForNewImmutableInputWithoutResendingExactRequest(t *testing.T) {
+	solver := &itemResumeSolver{calls: map[string]int{}}
+	grader := &itemResumeGrader{calls: map[string]int{}}
+	o := newItemResumeOrchestrator(t, t.TempDir(), []RecognizedQuestion{{
+		Question: "q1", Subject: "数学", StudentAnswer: "1", AnswerState: AnswerStatePresent,
+	}}, solver, grader)
+	jobID := runItemResumeJobToAssessing(t, o, "item-invocation-new-input")
+	run, job := confirmItemResumeJobWithoutRun(t, o, jobID)
+	question := run.questions[0]
+	if question.ProblemID == "" || question.AttemptID == "" {
+		t.Fatalf("missing durable item identity: %+v", question)
+	}
+
+	physicalCalls := 0
+	firstRequest := map[string]any{"input_digest": question.InputDigest, "value": "first"}
+	first, _, err := executeGradingItemOperation(
+		context.Background(), o, job, question,
+		k12.GradingItemOperationSolve, firstRequest,
+		func(context.Context) (string, error) {
+			physicalCalls++
+			return "first-result", nil
+		},
+	)
+	if err != nil || first != "first-result" || physicalCalls != 1 {
+		t.Fatalf("first immutable request: result=%q calls=%d err=%v", first, physicalCalls, err)
+	}
+
+	changed := question
+	changed.InputDigest = "sha256:new-current-input-revision"
+	secondRequest := map[string]any{"input_digest": changed.InputDigest, "value": "second"}
+	second, secondInvocationID, err := executeGradingItemOperation(
+		context.Background(), o, job, changed,
+		k12.GradingItemOperationSolve, secondRequest,
+		func(context.Context) (string, error) {
+			physicalCalls++
+			return "second-result", nil
+		},
+	)
+	if err != nil || second != "second-result" || physicalCalls != 2 {
+		t.Fatalf("new input request: result=%q invocation=%q calls=%d err=%v",
+			second, secondInvocationID, physicalCalls, err)
+	}
+
+	replayed, replayInvocationID, err := executeGradingItemOperation(
+		context.Background(), o, job, changed,
+		k12.GradingItemOperationSolve, secondRequest,
+		func(context.Context) (string, error) {
+			physicalCalls++
+			return "must-not-run", nil
+		},
+	)
+	if err != nil || replayed != "second-result" ||
+		replayInvocationID != secondInvocationID || physicalCalls != 2 {
+		t.Fatalf("exact request replay: result=%q invocation=%q calls=%d err=%v",
+			replayed, replayInvocationID, physicalCalls, err)
+	}
+	invocations, err := o.deps.Records.ListGradingItemInvocations(
+		context.Background(), job.Record.AgentName, job.Record.RecordID,
+	)
+	if err != nil || len(invocations) != 2 ||
+		invocations[0].OperationAttempt != 1 || invocations[1].OperationAttempt != 2 {
+		t.Fatalf("immutable invocation attempts=%+v err=%v", invocations, err)
+	}
+}
+
+// REG-P0: reconciliation may consume a previously succeeded invocation, but
+// it must never prepare, claim, or send a missing generic grading operation.
+// This protects compositions whose provider adapter cannot expose the finer
+// per-subagent physical-call interceptor.
+func TestGradingItemInvocationReconciliationOnlyNeverCreatesOrSendsMissingOperation(t *testing.T) {
+	solver := &itemResumeSolver{calls: map[string]int{}}
+	grader := &itemResumeGrader{calls: map[string]int{}}
+	o := newItemResumeOrchestrator(t, t.TempDir(), []RecognizedQuestion{{
+		Question: "q1", Subject: "数学", StudentAnswer: "1", AnswerState: AnswerStatePresent,
+	}}, solver, grader)
+	jobID := runItemResumeJobToAssessing(t, o, "item-invocation-reconcile-no-send")
+	run, job := confirmItemResumeJobWithoutRun(t, o, jobID)
+	question := run.questions[0]
+
+	physicalCalls := 0
+	_, invocationID, err := executeGradingItemOperation(
+		withProblemSourceReconciliationOnly(context.Background()),
+		o,
+		job,
+		question,
+		k12.GradingItemOperationSolve,
+		map[string]any{"input_digest": question.InputDigest, "value": "missing"},
+		func(context.Context) (string, error) {
+			physicalCalls++
+			return "must-not-send", nil
+		},
+	)
+	if !errors.Is(err, ErrModelInvocationRequiresReconciliation) {
+		t.Fatalf("reconciliation-only err=%v, want reconciliation required", err)
+	}
+	if invocationID != "" || physicalCalls != 0 {
+		t.Fatalf("reconciliation-only invocation=%q physical_calls=%d, want no durable creation/send", invocationID, physicalCalls)
+	}
+	invocations, listErr := o.deps.Records.ListGradingItemInvocations(
+		context.Background(), job.Record.AgentName, job.Record.RecordID,
+	)
+	if listErr != nil || len(invocations) != 0 {
+		t.Fatalf("reconciliation-only durable invocations=%+v err=%v, want none", invocations, listErr)
+	}
+}
+
 func TestGradingOrchestratorItemResume_WrongProjectionFactsSurviveCrashAndDedupe(t *testing.T) {
 	runDir := t.TempDir()
 	solver := &itemResumeSolver{calls: map[string]int{}}

@@ -128,7 +128,8 @@ func (a k12WebhookApplication) startSubmission(ctx context.Context, event webhoo
 			learnerID = event.AgentID
 		}
 		task, created, err := a.imageTasks.Create(ctx, k12usecase.CreateImageTaskInput{
-			AgentName: event.AgentID, LearnerID: learnerID,
+			OwnerScope: event.OwnerScope,
+			AgentName:  event.AgentID, LearnerID: learnerID,
 			SourceKind: k12.ImageTaskSourceAPI, SourceRef: event.EventID,
 			SourceSessionID: sourceSession, SourceAssetRefs: []string{assetID},
 			MessageIntent: strings.TrimSpace(payload.Text), AttemptGeneration: 1,

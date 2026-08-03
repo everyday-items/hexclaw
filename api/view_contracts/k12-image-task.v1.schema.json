@@ -110,6 +110,17 @@
     "problemSourceAction": {
       "enum": ["correct_text", "select_region", "retake", "skip", "resume"]
     },
+    "sourcePixelRegion": {
+      "type": "object",
+      "required": ["x", "y", "width", "height"],
+      "properties": {
+        "x": { "type": "integer", "minimum": 0 },
+        "y": { "type": "integer", "minimum": 0 },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
     "problemSourceProgress": {
       "type": "object",
       "required": [
@@ -137,7 +148,16 @@
         },
         "input_revision": { "type": "integer", "minimum": 1 },
         "published_revision": { "type": "integer", "minimum": 0 },
-        "current_disposition": { "const": "current" }
+        "current_disposition": { "const": "current" },
+        "page_asset_id": { "type": "string", "minLength": 1 },
+        "source_width": { "type": "integer", "minimum": 1 },
+        "source_height": { "type": "integer", "minimum": 1 },
+        "source_region": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/sourcePixelRegion" }
+          ]
+        }
       },
       "additionalProperties": false
     },
@@ -222,7 +242,11 @@
                 "status": "skipped",
                 "input_revision": 1,
                 "published_revision": 1,
-                "current_disposition": "current"
+                "current_disposition": "current",
+                "page_asset_id": "asset://mingming/431ced6916a2a21a156e38701afe55bbd7f88969fbbfc56d7fe099d47f265460.png",
+                "source_width": 1,
+                "source_height": 1,
+                "source_region": null
               }
             ],
             "coverage": {

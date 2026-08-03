@@ -724,7 +724,7 @@ func (s *Store) prepareRecognizingInvocationWithInitialWholePageOnce(
 			ctx,
 			`INSERT INTO k12_model_invocations (`+
 				modelInvocationColumns+
-				`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+				`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                  ON CONFLICT(job_id,stage,attempt) DO NOTHING`,
 			parent.InvocationID,
 			parent.AgentName,
@@ -738,6 +738,7 @@ func (s *Store) prepareRecognizingInvocationWithInitialWholePageOnce(
 			parent.ProviderIdempotencyKey,
 			parent.Status,
 			parent.Attempt,
+			"",
 			"",
 			"",
 			"",

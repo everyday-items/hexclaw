@@ -135,10 +135,11 @@ func TestGradingOrchestratorRecognizeUsesPersistedDeadlineAndDrainsOnExpiry(t *t
 	}
 }
 
-func TestGradingOrchestratorRecognizePreservesEarlierParentDeadline(t *testing.T) {
+func TestGradingOrchestratorRecognizeOutranksTransientParentDeadline(t *testing.T) {
 	recognizer := &recognizingDeadlineCapture{seen: make(chan recognizingDeadlineObservation, 1)}
 	o := newParallelAnchorOrchestrator(t, recognizer, nil)
-	o.deps.Now = func() int64 { return time.Now().Unix() }
+	now := time.Now().Unix()
+	o.deps.Now = func() int64 { return now }
 	jobID := startOrchestratorJob(t, o, "msg-recognize-parent-deadline").Record.RecordID
 
 	parentDeadline := time.Now().Add(5 * time.Second)
@@ -148,9 +149,10 @@ func TestGradingOrchestratorRecognizePreservesEarlierParentDeadline(t *testing.T
 		t.Fatalf("RunGradingJob: %v", err)
 	}
 	observed := <-recognizer.seen
-	if !observed.ok || !observed.deadline.Equal(parentDeadline) {
-		t.Fatalf("recognizer deadline=%v ok=%v, want earlier parent deadline=%v",
-			observed.deadline, observed.ok, parentDeadline)
+	wantDeadline := time.Unix(now+k12.GradingStageBudgetSeconds(k12.GradingStageRecognizing), 0)
+	if !observed.ok || !observed.deadline.Equal(wantDeadline) {
+		t.Fatalf("recognizer deadline=%v ok=%v, want persisted deadline=%v instead of transient parent deadline=%v",
+			observed.deadline, observed.ok, wantDeadline, parentDeadline)
 	}
 }
 

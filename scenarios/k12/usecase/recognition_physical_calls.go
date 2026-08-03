@@ -76,6 +76,12 @@ func (e *durableRecognitionPhysicalCallExecutor) ExecuteRecognitionPhysicalCall(
 			ErrRecognitionPhysicalCallBeforeSend,
 		)
 	}
+	if problemSourceReconciliationOnly(ctx) {
+		return zero, recognitionPhysicalNoRetryError{cause: fmt.Errorf(
+			"%w: reconciliation-only processing cannot create or send a recognition invocation",
+			ErrModelInvocationRequiresReconciliation,
+		)}
+	}
 
 	requestDigest, err := recognizingPhysicalInvocationDigest(e.parent, call)
 	if err != nil {

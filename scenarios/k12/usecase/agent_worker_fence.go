@@ -9,7 +9,9 @@ import (
 
 var errAgentWorkerQuiesced = fmt.Errorf("K12 Agent worker quiesced")
 
-type agentWorkerFence struct{}
+type agentWorkerFence struct {
+	refs int
+}
 
 type agentWorkerRegistration struct {
 	agentName string
@@ -90,11 +92,11 @@ func (r *agentWorkerFenceRegistry) quiesceAgent(
 		r.fences = map[string]*agentWorkerFence{}
 	}
 	fence := r.fences[agentName]
-	ownsFence := fence == nil
-	if ownsFence {
+	if fence == nil {
 		fence = &agentWorkerFence{}
 		r.fences[agentName] = fence
 	}
+	fence.refs++
 	workers := make([]*agentWorkerRegistration, 0)
 	for _, worker := range r.workers {
 		if worker.agentName == agentName {
@@ -106,11 +108,11 @@ func (r *agentWorkerFenceRegistry) quiesceAgent(
 	var resumeOnce sync.Once
 	resume := func() {
 		resumeOnce.Do(func() {
-			if !ownsFence {
-				return
-			}
 			r.mu.Lock()
-			if r.fences[agentName] == fence {
+			if r.fences[agentName] == fence && fence.refs > 0 {
+				fence.refs--
+			}
+			if r.fences[agentName] == fence && fence.refs == 0 {
 				delete(r.fences, agentName)
 			}
 			r.mu.Unlock()

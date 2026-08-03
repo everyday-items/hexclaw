@@ -15,8 +15,11 @@ import (
 )
 
 var (
-	ErrGradingItemInvocationFailed = errors.New("grading item invocation failed")
-	ErrGradingAssessmentExactSet   = errors.New("grading assessment exact set is incomplete")
+	ErrGradingItemInvocationFailed     = errors.New("grading item invocation failed")
+	ErrGradingAssessmentExactSet       = errors.New("grading assessment exact set is incomplete")
+	ErrGradingSourceRecognitionPending = errors.New(
+		"grading source recognition result is pending",
+	)
 )
 
 // DefinitiveProviderResponse is the adapter-boundary error contract for an
@@ -42,6 +45,22 @@ func (o *GradingOrchestrator) runAssessItems(
 	run *gradingRun,
 	job GradingJobView,
 ) (GradingJobView, error) {
+	pendingSourceRecognition, err := o.deps.Records.HasPendingCurrentProblemSourceRecognition(
+		ctx,
+		job.Record.AgentName,
+		job.Record.RecordID,
+	)
+	if err != nil {
+		return job, err
+	}
+	if pendingSourceRecognition {
+		// The process-local runtime still carries the pre-command OCR text until
+		// the source worker commits V73 and refreshes it under the same Job lock.
+		// Park at assessing before even preparing the aggregate invocation: a
+		// failed receipt CAS after provider sends is too late and causes duplicate
+		// physical calls on the new immutable revision.
+		return job, ErrGradingSourceRecognitionPending
+	}
 	if err := job.Fields.BudgetSnapshot.Validate(); err != nil {
 		v, advanceErr := o.deps.AdvanceGradingStage(ctx, run.agentName, job.Record.RecordID, AdvanceGradingInput{
 			Outcome: GradingOutcomeFailed, FailureKind: "invalid_frozen_budget", Retryable: false,
@@ -140,7 +159,7 @@ func (o *GradingOrchestrator) runAssessItems(
 		assessDeps.PhotoAnnotator = recorder
 	}
 
-	providerCtx, cancelProvider := gradingStageContext(ctx, job.Fields.Deadline)
+	providerCtx, cancelProvider := o.durableGradingStageContext(ctx, job.Fields.Deadline)
 	unregisterProvider := o.registerGradingModelCall(job.Record.RecordID, cancelProvider)
 	if current, err := o.deps.GetGradingJob(context.WithoutCancel(ctx), run.agentName, job.Record.RecordID); err != nil {
 		cancelProvider()
@@ -634,25 +653,39 @@ func executeGradingItemOperation[T any](
 		return zero, "", err
 	}
 	requestDigest := modelInvocationResultDigest(request)
-	currentAttempt := job.Fields.AttemptCount + 1
+	jobOperationAttempt := job.Fields.AttemptCount + 1
+	currentAttempt := jobOperationAttempt
 	invocations, err := o.deps.Records.ListGradingItemInvocations(ctx, qAgent(job, q), job.Record.RecordID)
 	if err != nil {
 		return zero, "", err
 	}
 	var latest *k12.GradingItemInvocation
+	maxOperationAttempt := 0
 	for i := range invocations {
 		candidate := &invocations[i]
 		if candidate.ProblemID != q.ProblemID || candidate.Operation != operation {
 			continue
 		}
+		if candidate.OperationAttempt > maxOperationAttempt {
+			maxOperationAttempt = candidate.OperationAttempt
+		}
+		if candidate.RequestDigest != requestDigest {
+			continue
+		}
+		// The same request digest must never be rebound to a different item or
+		// route. A different digest, however, is a legitimate immutable input
+		// revision and receives a new operation attempt below.
+		if err := validateGradingItemInvocationIdentity(*candidate, job, q, requestDigest); err != nil {
+			return zero, candidate.InvocationID, err
+		}
 		if latest == nil || candidate.OperationAttempt > latest.OperationAttempt {
 			latest = candidate
 		}
 	}
+	if next := maxOperationAttempt + 1; next > currentAttempt {
+		currentAttempt = next
+	}
 	if latest != nil {
-		if err := validateGradingItemInvocationIdentity(*latest, job, q, requestDigest); err != nil {
-			return zero, latest.InvocationID, err
-		}
 		switch latest.Status {
 		case k12.ModelInvocationSucceeded:
 			if latest.ResultDigest != modelInvocationDigest([]byte(latest.ResultJSON)) {
@@ -669,7 +702,7 @@ func executeGradingItemOperation[T any](
 			// The durable before-send point exists, but no external request can have
 			// escaped yet. Sending this exact frozen request is safe.
 		case k12.ModelInvocationFailed:
-			if currentAttempt <= latest.OperationAttempt {
+			if jobOperationAttempt <= latest.OperationAttempt {
 				return zero, latest.InvocationID, fmt.Errorf("%w: invocation=%s class=%s code=%s",
 					ErrGradingItemInvocationFailed, latest.InvocationID, latest.FailureClass, latest.FailureCode)
 			}
@@ -681,6 +714,13 @@ func executeGradingItemOperation[T any](
 			return zero, latest.InvocationID, fmt.Errorf("%w: invocation=%s unexpected status=%s",
 				ErrModelInvocationRequiresReconciliation, latest.InvocationID, latest.Status)
 		}
+	}
+	if problemSourceReconciliationOnly(ctx) {
+		return zero, "", fmt.Errorf(
+			"%w: reconciliation-only processing cannot create or send grading operation %s",
+			ErrModelInvocationRequiresReconciliation,
+			operation,
+		)
 	}
 
 	var invocation k12.GradingItemInvocation

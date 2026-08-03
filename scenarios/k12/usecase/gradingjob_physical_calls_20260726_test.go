@@ -457,3 +457,42 @@ func TestGrading20260726_UnknownPhysicalCallBlocksRepeatPOSTWithoutFakeQuery(t *
 		t.Fatalf("unknown ledger=%+v err=%v", rows, err)
 	}
 }
+
+func TestGrading20260726_ReconciliationOnlyNeverCreatesOrSendsMissingPhysicalCall(
+	t *testing.T,
+) {
+	o := newItemResumeOrchestrator(
+		t,
+		t.TempDir(),
+		[]RecognizedQuestion{{
+			Question: "q1", Subject: "数学", StudentAnswer: "1", AnswerState: AnswerStatePresent,
+		}},
+		&itemResumeSolver{calls: map[string]int{}},
+		&itemResumeGrader{calls: map[string]int{}},
+	)
+	jobID := runItemResumeJobToAssessing(t, o, "physical-reconciliation-only")
+	run, job := confirmItemResumeJobWithoutRun(t, o, jobID)
+	executor := newDurableGradingPhysicalCallExecutor(o, job, run.questions[0])
+	ctx := withProblemSourceReconciliationOnly(context.Background())
+	ctx = withGradingPhysicalCallExecutor(ctx, executor)
+	posts := 0
+	_, err := ExecuteGradingPhysicalCall(ctx, GradingPhysicalCallSpec{
+		Operation:     k12.GradingItemOperationSolveGenerate,
+		RequestDigest: "sha256:reconciliation-only-missing",
+	}, func(context.Context) (string, error) {
+		posts++
+		return `{"solution":"must-not-send"}`, nil
+	})
+	if !errors.Is(err, ErrModelInvocationRequiresReconciliation) {
+		t.Fatalf("reconciliation-only missing physical call err=%v", err)
+	}
+	if posts != 0 {
+		t.Fatalf("reconciliation-only provider POSTs=%d, want 0", posts)
+	}
+	rows, listErr := o.deps.Records.ListGradingItemInvocations(
+		context.Background(), "mingming", jobID,
+	)
+	if listErr != nil || len(rows) != 0 {
+		t.Fatalf("reconciliation-only created physical rows=%+v err=%v", rows, listErr)
+	}
+}

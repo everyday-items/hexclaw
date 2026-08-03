@@ -80,6 +80,10 @@ type Runtime struct {
 	// ImageTasks is the sole public image command/query facade. Internal
 	// GradingJob and OCR resources are never addressed by clients.
 	ImageTasks *usecase.ImageTaskCoordinator
+	// PageAssets is the owner-scoped durable image boundary shared by HTTP and
+	// image-task/source-action use cases. When omitted, the handler composes the
+	// production repository from Records; there is no raw-filesystem fallback.
+	PageAssets usecase.PageAssetGateway
 	// WorkFeedback owns direct-text CreativeWork feedback workers. Image-backed
 	// works remain under ImageTasks; both coordinators share durable generation
 	// checkpoints but recover disjoint roots.
@@ -116,7 +120,7 @@ func NewHandler(rt Runtime) http.Handler {
 	}
 	if rt.PrincipalMode == "local_loopback" &&
 		strings.TrimSpace(rt.OwnerScope) == "" {
-		rt.OwnerScope = "desktop-user"
+		rt.OwnerScope = usecase.DefaultLocalOwnerScope
 	}
 	mux := http.NewServeMux()
 	h := &handler{rt: rt}
@@ -355,18 +359,21 @@ type bboxDTO struct {
 }
 
 type recognizedQuestionDTO struct {
-	ProblemID            string              `json:"problem_id"`
-	ProblemKind          usecase.ProblemKind `json:"problem_kind"`
-	ParentProblemID      string              `json:"parent_problem_id,omitempty"`
-	SubproblemNo         string              `json:"subproblem_no,omitempty"`
-	SourceNumberPath     []string            `json:"source_number_path"`
-	DisplayLabel         string              `json:"display_label"`
-	SourceSectionPath    []string            `json:"source_section_path"`
-	SourceSectionLabel   string              `json:"source_section_label"`
-	SystemSectionOrdinal int                 `json:"system_section_ordinal"`
-	SystemDisplayLabel   string              `json:"system_display_label"`
-	PageAssetID          string              `json:"page_asset_id"`
-	AttemptID            string              `json:"attempt_id,omitempty"`
+	ProblemID            string                 `json:"problem_id"`
+	ProblemKind          usecase.ProblemKind    `json:"problem_kind"`
+	ParentProblemID      string                 `json:"parent_problem_id,omitempty"`
+	SubproblemNo         string                 `json:"subproblem_no,omitempty"`
+	SourceNumberPath     []string               `json:"source_number_path"`
+	DisplayLabel         string                 `json:"display_label"`
+	SourceSectionPath    []string               `json:"source_section_path"`
+	SourceSectionLabel   string                 `json:"source_section_label"`
+	SystemSectionOrdinal int                    `json:"system_section_ordinal"`
+	SystemDisplayLabel   string                 `json:"system_display_label"`
+	PageAssetID          string                 `json:"page_asset_id"`
+	SourceWidth          int                    `json:"source_width,omitempty"`
+	SourceHeight         int                    `json:"source_height,omitempty"`
+	SourceRegion         *k12.SourcePixelRegion `json:"source_region,omitempty"`
+	AttemptID            string                 `json:"attempt_id,omitempty"`
 	// Question 是当前 surface 的安全展示投影；raw/canonical 双事实同时返回供确认 UI
 	// 对照。canonical_valid=false 时 Question 必须回退为可复制 raw，绝不返回空白。
 	Question          string   `json:"question"`
@@ -405,9 +412,13 @@ func recognizedQuestionToDTO(question usecase.RecognizedQuestion, includeBBox bo
 		SourceSectionLabel:   question.SourceSectionLabel,
 		SystemSectionOrdinal: question.SystemSectionOrdinal,
 		SystemDisplayLabel:   question.SystemDisplayLabel,
-		PageAssetID:          question.PageAssetID, AttemptID: question.AttemptID,
-		Question:         usecase.RecognizedQuestionDisplayText(question),
-		RawTranscription: question.RawTranscription, CanonicalMarkdown: question.CanonicalMarkdown,
+		PageAssetID:          question.PageAssetID,
+		SourceWidth:          question.SourceWidth,
+		SourceHeight:         question.SourceHeight,
+		SourceRegion:         question.SourceRegion,
+		AttemptID:            question.AttemptID,
+		Question:             usecase.RecognizedQuestionDisplayText(question),
+		RawTranscription:     question.RawTranscription, CanonicalMarkdown: question.CanonicalMarkdown,
 		CanonicalValid:          usecase.CanonicalMarkdownValid(question.CanonicalMarkdown),
 		CanonicalVersion:        question.CanonicalVersion,
 		KnowledgePoints:         append([]string{}, question.KnowledgePoints...),

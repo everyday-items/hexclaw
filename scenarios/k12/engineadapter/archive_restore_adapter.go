@@ -68,6 +68,13 @@ func (a *ArchiveRestoreAdapter) RestoreHexbak(ctx context.Context, bak *usecase.
 			); err != nil {
 				return fmt.Errorf("merge Problem/Attempt ledger: %w", err)
 			}
+			if bak.ProblemSource != nil {
+				if err := a.records.ImportProblemSourceArchiveV6Tx(
+					ctx, tx, bak.AgentName, *bak.ProblemSource,
+				); err != nil {
+					return fmt.Errorf("merge problem-source durability closure: %w", err)
+				}
+			}
 			if err := a.agents.SaveAgentTx(ctx, tx, updated); err != nil {
 				return fmt.Errorf("replace hexbak profile metadata: %w", err)
 			}

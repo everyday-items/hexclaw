@@ -9,15 +9,38 @@ package apihttp_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
+
+type assetGatewayErrorStub struct {
+	persistErr error
+	openErr    error
+}
+
+func (s assetGatewayErrorStub) Persist(
+	context.Context, string, string, []byte,
+) (usecase.ReadyPageAsset, error) {
+	return usecase.ReadyPageAsset{}, s.persistErr
+}
+
+func (s assetGatewayErrorStub) OpenReady(
+	context.Context, string, string, string,
+) (usecase.ReadyPageAsset, error) {
+	return usecase.ReadyPageAsset{}, s.openErr
+}
 
 const tinyPNGB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 
@@ -128,5 +151,147 @@ func TestAssetHTTP_TraversalRejected(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/assets/..%2fsecret.png?agent=mingming", nil))
 	if rec.Code == http.StatusOK {
 		t.Fatalf("穿越文件名不得 200, got %d", rec.Code)
+	}
+}
+
+func TestPROG026G_AssetHTTPBindsAuthenticatedOwnerAgentAndReadyMetadata(t *testing.T) {
+	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
+	fixture := newImageTaskHTTPFixture(t)
+	remoteHandler := func(
+		owner string,
+		authorize func(context.Context, string, string) error,
+	) http.Handler {
+		return apihttp.NewHandler(apihttp.Runtime{
+			Records:       fixture.coordinator.Records,
+			PrincipalMode: "remote",
+			AuthenticatedOwnerScope: func(context.Context) (string, error) {
+				return owner, nil
+			},
+			AuthorizeAgentScope: authorize,
+		})
+	}
+	authorizeGuardian := func(_ context.Context, owner, agent string) error {
+		if owner != "guardian-1" || agent != "mingming" {
+			return fmt.Errorf("unexpected scope %q -> %q", owner, agent)
+		}
+		return nil
+	}
+
+	upload := postMultipartAsset(
+		t,
+		remoteHandler("guardian-1", authorizeGuardian),
+		"mingming",
+		"page.png",
+		tinyPNGBytes(t),
+	)
+	if upload.Code != http.StatusOK {
+		t.Fatalf("authorized PageAsset upload=%d body=%s", upload.Code, upload.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(upload.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	assetID, _ := body["asset_id"].(string)
+	var ownerScope, agentName, state, mediaType, orientation string
+	var width, height int
+	if err := fixture.db.QueryRow(`
+		SELECT owner_scope,agent_name,storage_state,media_type,
+		       orientation_policy,pixel_width,pixel_height
+		FROM k12_page_assets
+		WHERE owner_scope='guardian-1' AND page_asset_id=?`,
+		assetID,
+	).Scan(
+		&ownerScope,
+		&agentName,
+		&state,
+		&mediaType,
+		&orientation,
+		&width,
+		&height,
+	); err != nil {
+		t.Fatalf("ready PageAsset metadata missing: %v", err)
+	}
+	if ownerScope != "guardian-1" || agentName != "mingming" ||
+		state != "ready" || mediaType != "image/png" || orientation != "verified" ||
+		width != 1 || height != 1 {
+		t.Fatalf(
+			"PageAsset metadata drift: owner=%q agent=%q state=%q mime=%q orientation=%q dims=%dx%d",
+			ownerScope,
+			agentName,
+			state,
+			mediaType,
+			orientation,
+			width,
+			height,
+		)
+	}
+
+	file := assetID[strings.LastIndex(assetID, "/")+1:]
+	get := httptest.NewRecorder()
+	remoteHandler("guardian-1", authorizeGuardian).ServeHTTP(
+		get,
+		httptest.NewRequest("GET", "/assets/"+file+"?agent=mingming", nil),
+	)
+	if get.Code != http.StatusOK || !bytes.Equal(get.Body.Bytes(), tinyPNGBytes(t)) {
+		t.Fatalf("owner-scoped ready PageAsset GET=%d", get.Code)
+	}
+
+	deny := func(context.Context, string, string) error { return fmt.Errorf("denied") }
+	for name, handler := range map[string]http.Handler{
+		"denied owner":       remoteHandler("attacker", deny),
+		"missing authorizer": remoteHandler("guardian-1", nil),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := postMultipartAsset(t, handler, "mingming", "page.png", tinyPNGBytes(t))
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("unauthorized upload=%d want 404 body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestPROG026G_AssetHTTPHidesExistenceButSurfacesIntegrityAndInfrastructureAsServerErrors(t *testing.T) {
+	fixture := newImageTaskHTTPFixture(t)
+	newHandler := func(gateway usecase.PageAssetGateway) http.Handler {
+		return apihttp.NewHandler(apihttp.Runtime{
+			Records: fixture.coordinator.Records, PageAssets: gateway,
+		})
+	}
+	const internalDetail = "sqlite disk I/O failure /Users/private/database.db"
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "owner scoped absence", err: k12storage.ErrPageAssetNotFound, want: http.StatusNotFound},
+		{name: "ready bytes integrity drift", err: usecase.ErrPageAssetIntegrity, want: http.StatusInternalServerError},
+		{name: "storage infrastructure", err: errors.New(internalDetail), want: http.StatusInternalServerError},
+	} {
+		t.Run("get "+tc.name, func(t *testing.T) {
+			handler := newHandler(assetGatewayErrorStub{openErr: tc.err})
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(
+				http.MethodGet,
+				"/assets/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png?agent=mingming",
+				nil,
+			))
+			if rec.Code != tc.want {
+				t.Fatalf("status=%d want=%d body=%s", rec.Code, tc.want, rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), internalDetail) ||
+				strings.Contains(rec.Body.String(), "/Users/private") {
+				t.Fatalf("GET leaked internal error: %s", rec.Body.String())
+			}
+		})
+	}
+
+	handler := newHandler(assetGatewayErrorStub{persistErr: errors.New(internalDetail)})
+	rec := postMultipartAsset(t, handler, "mingming", "page.png", tinyPNGBytes(t))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("upload infrastructure status=%d want=500 body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), internalDetail) ||
+		strings.Contains(rec.Body.String(), "/Users/private") {
+		t.Fatalf("upload leaked internal error: %s", rec.Body.String())
 	}
 }

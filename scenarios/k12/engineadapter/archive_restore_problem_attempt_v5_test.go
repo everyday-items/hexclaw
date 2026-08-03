@@ -55,7 +55,7 @@ func TestArchiveRestoreAsV5MigratesStableProblemAttemptIDsAndRollbackIsExact(t *
 	registerRestoreTarget(t, f)
 	ctx := context.Background()
 
-	preImage := []byte("\x89PNG\r\n\x1a\ntarget-pre-page")
+	preImage := validPNGFixture(t, "target-pre-page")
 	preAssetID, err := assetstore.Save("target-child", preImage)
 	if err != nil {
 		t.Fatal(err)
@@ -134,7 +134,7 @@ func TestArchiveRestoreAsSourceStillInDatabaseFailsClosedWithoutPartialV19Writes
 	registerRestoreTarget(t, f)
 	ctx := context.Background()
 
-	page := []byte("\x89PNG\r\n\x1a\nsource-live-page")
+	page := validPNGFixture(t, "source-live-page")
 	pageID, err := assetstore.Save("mingming", page)
 	if err != nil {
 		t.Fatal(err)
@@ -151,7 +151,7 @@ func TestArchiveRestoreAsSourceStillInDatabaseFailsClosedWithoutPartialV19Writes
 		t.Fatal(err)
 	}
 
-	targetPage := []byte("\x89PNG\r\n\x1a\ntarget-before-conflict")
+	targetPage := validPNGFixture(t, "target-before-conflict")
 	targetPageID, err := assetstore.Save("target-child", targetPage)
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +190,7 @@ func TestArchiveRestoreAsV5JournalFailureRollsBackProblemAttemptAndPageAsset(t *
 	registerRestoreTarget(t, f)
 	ctx := context.Background()
 
-	preImage := []byte("\x89PNG\r\n\x1a\npre-journal-failure")
+	preImage := validPNGFixture(t, "pre-journal-failure")
 	preAssetID, err := assetstore.Save("target-child", preImage)
 	if err != nil {
 		t.Fatal(err)
@@ -237,7 +237,7 @@ func TestArchiveRestoreAsV5JournalFailureRollsBackProblemAttemptAndPageAsset(t *
 
 func problemAttemptArchiveForAdapter(t *testing.T, agent, prefix string) (*usecase.Hexbak, []byte) {
 	t.Helper()
-	image := []byte("\x89PNG\r\n\x1a\narchive-page-" + prefix)
+	image := validPNGFixture(t, "archive-page-"+prefix)
 	assetID, mime, digest, err := assetstore.Describe(agent, image)
 	if err != nil {
 		t.Fatal(err)

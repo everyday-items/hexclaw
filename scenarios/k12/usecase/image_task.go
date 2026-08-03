@@ -90,6 +90,7 @@ type imageTaskWorkFeedbackGenerator interface {
 
 type ImageTaskCoordinator struct {
 	Records               *k12storage.Store
+	PageAssets            PageAssetGateway
 	Classifier            ImageTaskClassifier
 	WritingOCR            ImageTaskWritingOCR
 	Grading               imageTaskGradingStarter
@@ -98,6 +99,7 @@ type ImageTaskCoordinator struct {
 	ResolveRouteDisplay   ImageTaskRouteDisplayResolver
 	ResolveGrade          ImageTaskGradeResolver
 	ReadAsset             ImageTaskAssetReader
+	SourceReprocess       *ProblemSourceReprocessWorker
 	GradingBudgetSnapshot k12.GradingBudgetSnapshot
 	Now                   func() int64
 	NewID                 func(kind string) string
@@ -115,6 +117,7 @@ type ImageTaskCoordinator struct {
 var ErrImageTaskCoordinatorShutdown = errors.New("image task coordinator is shut down")
 
 type CreateImageTaskInput struct {
+	OwnerScope        string
 	AgentName         string
 	LearnerID         string
 	SourceKind        k12.ImageTaskSourceKind
@@ -292,6 +295,7 @@ func (c *ImageTaskCoordinator) validate() error {
 }
 
 func normalizeCreateImageTaskInput(in CreateImageTaskInput) (CreateImageTaskInput, error) {
+	in.OwnerScope = strings.TrimSpace(in.OwnerScope)
 	in.AgentName = strings.TrimSpace(in.AgentName)
 	in.LearnerID = strings.TrimSpace(in.LearnerID)
 	in.SourceRef = strings.TrimSpace(in.SourceRef)
@@ -362,6 +366,12 @@ func (c *ImageTaskCoordinator) Create(
 	if in.CreativeEntry == nil && (c.Classifier == nil || c.ResolveRoute == nil) {
 		return ImageTaskView{}, false, fmt.Errorf("usecase: image task classifier/route resolver 未配置")
 	}
+	if c.PageAssets != nil && in.OwnerScope == "" {
+		return ImageTaskView{}, false, fmt.Errorf(
+			"%w: authenticated PageAsset owner scope is required",
+			ErrInvalidInput,
+		)
+	}
 	for index, ref := range in.SourceAssetRefs {
 		owner, _, parseErr := assetstore.Parse(ref)
 		if parseErr != nil || owner != in.AgentName {
@@ -387,25 +397,30 @@ func (c *ImageTaskCoordinator) Create(
 			!sameCreateImageTaskRouteRequest(existing, in) {
 			return ImageTaskView{}, false, k12storage.ErrImageTaskConflict
 		}
+		if c.PageAssets != nil {
+			ownerScope, ownerErr := c.Records.GetImageTaskOwnerScope(
+				ctx,
+				existing.AgentName,
+				existing.DispatchID,
+			)
+			if ownerErr != nil || ownerScope != in.OwnerScope {
+				return ImageTaskView{}, false, k12storage.ErrImageTaskConflict
+			}
+		}
 		view, err := c.projectTarget(ctx, existing)
 		return view, false, err
 	}
 	if !errors.Is(lookupErr, k12storage.ErrImageTaskNotFound) {
 		return ImageTaskView{}, false, lookupErr
 	}
-	reader := c.ReadAsset
-	if reader == nil {
-		reader = defaultImageTaskAssetReader
-	}
-	images := make([][]byte, len(in.SourceAssetRefs))
-	for index, ref := range in.SourceAssetRefs {
-		images[index], err = reader(in.AgentName, ref)
-		if err != nil {
-			return ImageTaskView{}, false, err
-		}
-		if len(images[index]) == 0 {
-			return ImageTaskView{}, false, fmt.Errorf("%w: source asset %d 是空图片", ErrInvalidInput, index)
-		}
+	images, err := c.readSourceImages(
+		ctx,
+		in.OwnerScope,
+		in.AgentName,
+		in.SourceAssetRefs,
+	)
+	if err != nil {
+		return ImageTaskView{}, false, err
 	}
 	sourceDigest := imageBytesDigest(images)
 	if in.CreativeEntry != nil {
@@ -428,7 +443,8 @@ func (c *ImageTaskCoordinator) Create(
 		})
 		now := c.now()
 		dispatch := k12.ImageTaskDispatch{
-			DispatchID: c.id("dispatch"), AgentName: in.AgentName, LearnerID: in.LearnerID,
+			DispatchID: c.id("dispatch"), OwnerScope: in.OwnerScope,
+			AgentName: in.AgentName, LearnerID: in.LearnerID,
 			SourceKind: in.SourceKind, SourceRef: in.SourceRef, SourceSessionID: in.SourceSessionID,
 			SourceAssetRefs: append([]string(nil), in.SourceAssetRefs...), SourceDigest: sourceDigest,
 			MessageIntent: in.MessageIntent, TaskIntent: in.CreativeEntry.TaskIntent,
@@ -481,7 +497,8 @@ func (c *ImageTaskCoordinator) Create(
 	dispatchID := c.id("dispatch")
 	invocationID := c.id("classification")
 	dispatch := k12.ImageTaskDispatch{
-		DispatchID: dispatchID, AgentName: in.AgentName, LearnerID: in.LearnerID,
+		DispatchID: dispatchID, OwnerScope: in.OwnerScope,
+		AgentName: in.AgentName, LearnerID: in.LearnerID,
 		SourceKind: in.SourceKind, SourceRef: in.SourceRef, SourceSessionID: in.SourceSessionID,
 		SourceAssetRefs: append([]string(nil), in.SourceAssetRefs...), SourceDigest: sourceDigest,
 		MessageIntent: in.MessageIntent, TaskIntent: k12.ImageTaskIntentUnknown,
@@ -751,7 +768,31 @@ func (c *ImageTaskCoordinator) QuiesceAgent(
 	if c == nil {
 		return func() {}, nil
 	}
-	return c.agentWorkers.quiesceAgent(ctx, agentName)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sourceResume := func() {}
+	if c.SourceReprocess != nil {
+		var err error
+		sourceResume, err = c.SourceReprocess.Quiesce(ctx)
+		if err != nil {
+			sourceResume()
+			return func() {}, err
+		}
+	}
+	agentResume, err := c.agentWorkers.quiesceAgent(ctx, agentName)
+	if err != nil {
+		agentResume()
+		sourceResume()
+		return func() {}, err
+	}
+	var resumeOnce sync.Once
+	return func() {
+		resumeOnce.Do(func() {
+			agentResume()
+			sourceResume()
+		})
+	}, nil
 }
 
 func (c *ImageTaskCoordinator) initWorkerRuntimeLocked() {
@@ -782,6 +823,9 @@ func (c *ImageTaskCoordinator) Wait(ctx context.Context) error {
 	c.workerMu.Unlock()
 	select {
 	case <-done:
+		if c.SourceReprocess != nil {
+			return c.SourceReprocess.Wait(ctx)
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -806,11 +850,15 @@ func (c *ImageTaskCoordinator) Shutdown(ctx context.Context) error {
 	if cancel != nil {
 		cancel()
 	}
+	var sourceReprocessErr error
+	if c.SourceReprocess != nil {
+		sourceReprocessErr = c.SourceReprocess.Shutdown(ctx)
+	}
 	select {
 	case <-done:
-		return nil
+		return sourceReprocessErr
 	case <-ctx.Done():
-		return ctx.Err()
+		return errors.Join(sourceReprocessErr, ctx.Err())
 	}
 }
 
@@ -1016,7 +1064,7 @@ func (c *ImageTaskCoordinator) Run(
 		); yes || expireErr != nil {
 			return expired, expireErr
 		}
-		images, readErr := c.readDispatchImages(dispatch)
+		images, readErr := c.readDispatchImages(ctx, dispatch)
 		if readErr != nil {
 			return view, readErr
 		}
@@ -1100,7 +1148,7 @@ func (c *ImageTaskCoordinator) Run(
 				view.Creative.Status == k12.CreativeWorkIntakePreparing)
 		var images [][]byte
 		if needsImages {
-			images, err = c.readDispatchImages(dispatch)
+			images, err = c.readDispatchImages(ctx, dispatch)
 			if err != nil {
 				return view, err
 			}
@@ -1518,7 +1566,7 @@ func (c *ImageTaskCoordinator) continueTarget(
 		// File IO stays outside the promotion transaction. Re-read immediately
 		// before the CAS so deleted/replaced content-addressed evidence cannot be
 		// promoted from an earlier in-memory copy.
-		if _, err := c.readDispatchImages(view.Dispatch); err != nil {
+		if _, err := c.readDispatchImages(ctx, view.Dispatch); err != nil {
 			return view, err
 		}
 		workID, _, err := c.Records.PromoteCreativeWorkIntake(
@@ -1696,7 +1744,7 @@ func (c *ImageTaskCoordinator) Result(
 	if err != nil {
 		return ImageTaskResult{}, err
 	}
-	sourceAttachments, err := c.sourceAttachmentReceipts(view.Dispatch)
+	sourceAttachments, err := c.sourceAttachmentReceipts(ctx, view.Dispatch)
 	if err != nil {
 		return ImageTaskResult{}, err
 	}
@@ -1782,9 +1830,10 @@ func (c *ImageTaskCoordinator) Result(
 }
 
 func (c *ImageTaskCoordinator) sourceAttachmentReceipts(
+	ctx context.Context,
 	dispatch k12.ImageTaskDispatch,
 ) ([]ImageTaskSourceAttachmentReceipt, error) {
-	images, err := c.readDispatchImages(dispatch)
+	images, err := c.readDispatchImages(ctx, dispatch)
 	if err != nil {
 		return nil, err
 	}
@@ -1876,27 +1925,79 @@ func (c *ImageTaskCoordinator) ResolveTutoringTipsGradingJob(
 	return view.Homework.GradingJobID, nil
 }
 
-func (c *ImageTaskCoordinator) readDispatchImages(
-	dispatch k12.ImageTaskDispatch,
+func (c *ImageTaskCoordinator) readSourceImages(
+	ctx context.Context,
+	ownerScope, agentName string,
+	assetRefs []string,
 ) ([][]byte, error) {
+	images := make([][]byte, len(assetRefs))
+	if c.PageAssets != nil {
+		for index, ref := range assetRefs {
+			ready, err := c.PageAssets.OpenReady(
+				ctx,
+				ownerScope,
+				agentName,
+				ref,
+			)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"%w: PageAsset %d is not ready in authenticated scope: %v",
+					ErrInvalidInput,
+					index,
+					err,
+				)
+			}
+			images[index] = ready.Data
+		}
+		return images, nil
+	}
 	reader := c.ReadAsset
 	if reader == nil {
 		reader = defaultImageTaskAssetReader
 	}
-	images := make([][]byte, len(dispatch.SourceAssetRefs))
-	for index, ref := range dispatch.SourceAssetRefs {
-		owner, _, parseErr := assetstore.Parse(ref)
-		if parseErr != nil || owner != dispatch.AgentName {
-			return nil, fmt.Errorf("%w: retry source asset owner mismatch", ErrInvalidInput)
-		}
+	for index, ref := range assetRefs {
 		var err error
-		images[index], err = reader(dispatch.AgentName, ref)
+		images[index], err = reader(agentName, ref)
 		if err != nil {
 			return nil, err
 		}
 		if len(images[index]) == 0 {
-			return nil, fmt.Errorf("%w: retry source image %d empty", ErrInvalidInput, index)
+			return nil, fmt.Errorf("%w: source image %d empty", ErrInvalidInput, index)
 		}
+	}
+	return images, nil
+}
+
+func (c *ImageTaskCoordinator) readDispatchImages(
+	ctx context.Context,
+	dispatch k12.ImageTaskDispatch,
+) ([][]byte, error) {
+	ownerScope := ""
+	if c.PageAssets != nil {
+		var err error
+		ownerScope, err = c.Records.GetImageTaskOwnerScope(
+			ctx,
+			dispatch.AgentName,
+			dispatch.DispatchID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("%w: durable image task owner scope missing", ErrInvalidInput)
+		}
+	}
+	for _, ref := range dispatch.SourceAssetRefs {
+		owner, _, parseErr := assetstore.Parse(ref)
+		if parseErr != nil || owner != dispatch.AgentName {
+			return nil, fmt.Errorf("%w: retry source asset owner mismatch", ErrInvalidInput)
+		}
+	}
+	images, err := c.readSourceImages(
+		ctx,
+		ownerScope,
+		dispatch.AgentName,
+		dispatch.SourceAssetRefs,
+	)
+	if err != nil {
+		return nil, err
 	}
 	if digest := imageBytesDigest(images); digest != dispatch.SourceDigest {
 		return nil, fmt.Errorf(
@@ -1905,6 +2006,25 @@ func (c *ImageTaskCoordinator) readDispatchImages(
 		)
 	}
 	return images, nil
+}
+
+// PersistPageAsset is the sole image-ingress persistence seam for non-HTTP
+// adapters such as IM. It cannot fall back to assetstore.Save because that
+// would create bytes without an owner-scoped ready ledger.
+func (c *ImageTaskCoordinator) PersistPageAsset(
+	ctx context.Context,
+	ownerScope, agentName string,
+	data []byte,
+) (ReadyPageAsset, error) {
+	if c == nil || c.PageAssets == nil {
+		return ReadyPageAsset{}, errors.New("usecase: PageAsset repository not configured")
+	}
+	return c.PageAssets.Persist(
+		ctx,
+		strings.TrimSpace(ownerScope),
+		strings.TrimSpace(agentName),
+		data,
+	)
 }
 
 func (c *ImageTaskCoordinator) Confirm(
@@ -1926,7 +2046,7 @@ func (c *ImageTaskCoordinator) Confirm(
 			len(input.QuestionCorrections) != 0 {
 			return ImageTaskView{}, fmt.Errorf("%w: intent confirmation cannot mix target command", ErrInvalidInput)
 		}
-		images, err := c.readDispatchImages(dispatch)
+		images, err := c.readDispatchImages(ctx, dispatch)
 		if err != nil {
 			return ImageTaskView{}, err
 		}
@@ -1983,7 +2103,7 @@ func (c *ImageTaskCoordinator) Confirm(
 		if view.Creative.Status != k12.CreativeWorkIntakeAwaitingConfirmation {
 			return view, k12storage.ErrImageTaskInvalidState
 		}
-		images, err := c.readDispatchImages(dispatch)
+		images, err := c.readDispatchImages(ctx, dispatch)
 		if err != nil {
 			return view, err
 		}
@@ -2191,14 +2311,14 @@ func (c *ImageTaskCoordinator) Retry(
 			(current.Creative != nil &&
 				current.Creative.WorkType == k12.WorkTypeWriting &&
 				current.Creative.Status == k12.CreativeWorkIntakePreparing) {
-			images, err = c.readDispatchImages(restarted)
+			images, err = c.readDispatchImages(ctx, restarted)
 			if err != nil {
 				return current, err
 			}
 		}
 		return c.continueTarget(ctx, current, images)
 	}
-	images, err := c.readDispatchImages(original)
+	images, err := c.readDispatchImages(ctx, original)
 	if err != nil {
 		return ImageTaskView{}, err
 	}

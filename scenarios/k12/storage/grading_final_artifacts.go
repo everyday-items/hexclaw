@@ -120,6 +120,76 @@ func (s *Store) GetGradingFinalArtifactByJob(
 	return getGradingFinalArtifactByJobVia(ctx, s.db, agentName, jobID)
 }
 
+// GetCurrentGradingFinalArtifactByJob returns the immutable artifact only when
+// it is fenced to the Job's current aggregate generation. Missing and stale
+// artifacts are intentionally indistinguishable to callers: neither is safe
+// evidence that a completed source-work replay may converge successfully.
+func (s *Store) GetCurrentGradingFinalArtifactByJob(
+	ctx context.Context,
+	agentName string,
+	jobID string,
+) (k12.GradingFinalArtifact, error) {
+	agentName = strings.TrimSpace(agentName)
+	jobID = strings.TrimSpace(jobID)
+	if agentName == "" || jobID == "" {
+		return k12.GradingFinalArtifact{}, records.ErrNotFound
+	}
+	artifact, err := scanGradingFinalArtifact(s.db.QueryRowContext(ctx, `
+		SELECT `+gradingFinalArtifactColumns+`
+		FROM k12_grading_final_artifacts
+		WHERE agent_name=? AND job_id=?
+		  AND finalization_generation=(
+			SELECT finalization_generation
+			FROM k12_grading_jobs
+			WHERE agent_name=? AND record_id=?
+		  )`,
+		agentName,
+		jobID,
+		agentName,
+		jobID,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return k12.GradingFinalArtifact{}, records.ErrNotFound
+	}
+	if err != nil {
+		return k12.GradingFinalArtifact{}, fmt.Errorf(
+			"k12storage: get current grading final artifact by job: %w",
+			err,
+		)
+	}
+	return artifact, nil
+}
+
+// GetGradingFinalizationGeneration snapshots the durable aggregate generation
+// that a finalizer must present when it commits the immutable artifact. Source
+// actions advance this value in their own state-transition transaction.
+func (s *Store) GetGradingFinalizationGeneration(
+	ctx context.Context,
+	agentName string,
+	jobID string,
+) (int64, error) {
+	agentName = strings.TrimSpace(agentName)
+	jobID = strings.TrimSpace(jobID)
+	if agentName == "" || jobID == "" {
+		return 0, records.ErrNotFound
+	}
+	var generation int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT finalization_generation
+		FROM k12_grading_jobs
+		WHERE agent_name=? AND record_id=?`,
+		agentName,
+		jobID,
+	).Scan(&generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, records.ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("k12storage: get grading finalization generation: %w", err)
+	}
+	return generation, nil
+}
+
 func normalizeGradingFinalArtifact(
 	artifact k12.GradingFinalArtifact,
 ) k12.GradingFinalArtifact {
@@ -172,7 +242,15 @@ func sameGradingFinalArtifactContent(
 func (s *Store) CommitGradingFinalArtifact(
 	ctx context.Context,
 	artifact k12.GradingFinalArtifact,
+	expectedGeneration int64,
 ) (stored k12.GradingFinalArtifact, replay bool, err error) {
+	if expectedGeneration < 0 {
+		return k12.GradingFinalArtifact{}, false, fmt.Errorf(
+			"%w: invalid expected finalization generation %d",
+			ErrGradingFinalArtifactConflict,
+			expectedGeneration,
+		)
+	}
 	artifact = normalizeGradingFinalArtifact(artifact)
 	if err := artifact.Validate(); err != nil {
 		return k12.GradingFinalArtifact{}, false, fmt.Errorf(
@@ -192,9 +270,40 @@ func (s *Store) CommitGradingFinalArtifact(
 		)
 	}
 	defer tx.Rollback()
+	// This no-op CAS is intentionally the first statement in the artifact write
+	// transaction. It acquires SQLite's writer lock before checking the
+	// generation, serializing with CommitProblemSourceAction. Whichever writer
+	// loses observes either the advanced generation or the immutable artifact.
+	fence, err := tx.ExecContext(ctx, `
+		UPDATE k12_grading_jobs
+		SET finalization_generation=finalization_generation
+		WHERE agent_name=? AND record_id=? AND finalization_generation=?`,
+		artifact.AgentName,
+		artifact.JobID,
+		expectedGeneration,
+	)
+	if err != nil {
+		return k12.GradingFinalArtifact{}, false, fmt.Errorf(
+			"k12storage: fence grading final artifact generation: %w",
+			err,
+		)
+	}
+	fenced, err := fence.RowsAffected()
+	if err != nil {
+		return k12.GradingFinalArtifact{}, false, err
+	}
+	if fenced != 1 {
+		return k12.GradingFinalArtifact{}, false, fmt.Errorf(
+			"%w: job %s finalization generation advanced from %d",
+			ErrGradingFinalArtifactConflict,
+			artifact.JobID,
+			expectedGeneration,
+		)
+	}
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO k12_grading_final_artifacts (`+gradingFinalArtifactColumns+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO k12_grading_final_artifacts (`+gradingFinalArtifactColumns+`,
+			finalization_generation)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT DO NOTHING`,
 		artifact.ArtifactID,
 		artifact.AgentName,
@@ -210,6 +319,7 @@ func (s *Store) CommitGradingFinalArtifact(
 		artifact.SummaryInvocationID,
 		artifact.CreatedAt,
 		artifact.UpdatedAt,
+		expectedGeneration,
 	)
 	if err != nil {
 		return k12.GradingFinalArtifact{}, false, fmt.Errorf(
@@ -234,6 +344,28 @@ func (s *Store) CommitGradingFinalArtifact(
 			"%w: job %s already has a different canonical artifact",
 			ErrGradingFinalArtifactConflict,
 			artifact.JobID,
+		)
+	}
+	var storedGeneration int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT finalization_generation
+		FROM k12_grading_final_artifacts
+		WHERE agent_name=? AND job_id=?`,
+		artifact.AgentName,
+		artifact.JobID,
+	).Scan(&storedGeneration); err != nil {
+		return k12.GradingFinalArtifact{}, false, fmt.Errorf(
+			"k12storage: get grading final artifact generation: %w",
+			err,
+		)
+	}
+	if storedGeneration != expectedGeneration {
+		return k12.GradingFinalArtifact{}, false, fmt.Errorf(
+			"%w: job %s artifact generation=%d expected=%d",
+			ErrGradingFinalArtifactConflict,
+			artifact.JobID,
+			storedGeneration,
+			expectedGeneration,
 		)
 	}
 	affected, err := result.RowsAffected()

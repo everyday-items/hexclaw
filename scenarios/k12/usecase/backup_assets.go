@@ -178,6 +178,14 @@ func referencedHexbakArchiveAssetIDs(bak *Hexbak) ([]string, error) {
 			seen[id] = struct{}{}
 		}
 	}
+	if bak.Version >= 6 && bak.ProblemSource != nil {
+		for _, asset := range bak.ProblemSource.PageAssets {
+			if asset.AgentName != bak.AgentName {
+				return nil, fmt.Errorf("%w: source PageAsset owner/header mismatch", ErrHexbakAssetManifest)
+			}
+			seen[asset.PageAssetID] = struct{}{}
+		}
+	}
 	out := make([]string, 0, len(seen))
 	for id := range seen {
 		out = append(out, id)

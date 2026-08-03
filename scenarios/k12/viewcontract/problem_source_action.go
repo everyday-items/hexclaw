@@ -29,11 +29,26 @@ type ProblemSourceProgressiveSnapshot struct {
 }
 
 type ProblemSourceProgress struct {
-	ProblemID          string `json:"problem_id"`
-	Status             string `json:"status"`
-	InputRevision      int    `json:"input_revision"`
-	PublishedRevision  int    `json:"published_revision"`
-	CurrentDisposition string `json:"current_disposition"`
+	ProblemID          string             `json:"problem_id"`
+	Status             string             `json:"status"`
+	InputRevision      int                `json:"input_revision"`
+	PublishedRevision  int                `json:"published_revision"`
+	CurrentDisposition string             `json:"current_disposition"`
+	PageAssetID        string             `json:"page_asset_id,omitempty"`
+	SourceWidth        int                `json:"source_width,omitempty"`
+	SourceHeight       int                `json:"source_height,omitempty"`
+	SourceRegion       *SourcePixelRegion `json:"source_region"`
+}
+
+// SourcePixelRegion is the source-pixel rectangle serialized in the frozen
+// source-action wire. It intentionally lives in this schema leaf instead of
+// importing the K12 domain package, whose equivalent value is converted at
+// the storage boundary.
+type SourcePixelRegion struct {
+	X      int `json:"x"`
+	Y      int `json:"y"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
 }
 
 type ProblemSourceProgressiveCoverage struct {
@@ -93,7 +108,15 @@ func (v ProblemSourceActionResponse) Validate() error {
 	if snapshot.StructureVersion != v.StructureVersion ||
 		snapshot.SnapshotRevision < v.InputRevision ||
 		snapshot.Coverage.ProjectionRevision != snapshot.SnapshotRevision {
-		return fmt.Errorf("problem source action response has inconsistent revisions")
+		return fmt.Errorf(
+			"problem source action response has inconsistent revisions: "+
+				"structure=%d snapshot_structure=%d input=%d snapshot=%d projection=%d",
+			v.StructureVersion,
+			snapshot.StructureVersion,
+			v.InputRevision,
+			snapshot.SnapshotRevision,
+			snapshot.Coverage.ProjectionRevision,
+		)
 	}
 	coverage := snapshot.Coverage
 	if coverage.Total < 0 || coverage.Published < 0 || coverage.Skipped < 0 ||
@@ -131,6 +154,20 @@ func (v ProblemSourceActionResponse) Validate() error {
 		}
 		if _, ok := seen[problemID]; ok {
 			return fmt.Errorf("problem source action response repeats problem %q", problemID)
+		}
+		hasSourceFacts := problem.PageAssetID != "" ||
+			problem.SourceWidth != 0 || problem.SourceHeight != 0 || problem.SourceRegion != nil
+		if hasSourceFacts {
+			if strings.TrimSpace(problem.PageAssetID) == "" ||
+				problem.SourceWidth < 1 || problem.SourceHeight < 1 {
+				return fmt.Errorf("problem source action response has incomplete PageAsset facts")
+			}
+			if region := problem.SourceRegion; region != nil &&
+				(region.X < 0 || region.Y < 0 || region.Width < 1 || region.Height < 1 ||
+					region.X > problem.SourceWidth-region.Width ||
+					region.Y > problem.SourceHeight-region.Height) {
+				return fmt.Errorf("problem source action response has invalid source region")
+			}
 		}
 		seen[problemID] = struct{}{}
 		switch {

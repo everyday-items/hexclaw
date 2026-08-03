@@ -163,6 +163,7 @@ func TestBUG20260802ImageTaskResultReadsPhotoOnlyAfterDurableFinalArtifact(t *te
 			CreatedAt:                 1000,
 			UpdatedAt:                 1000,
 		},
+		0,
 	)
 	if err != nil || replay {
 		t.Fatalf("commit durable final artifact: replay=%v err=%v", replay, err)

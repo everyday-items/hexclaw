@@ -276,6 +276,32 @@ func TestBUG_20260726_031_StructureChangeCreatesIsolatedAuthoritativeVersion(t *
 		t.Fatalf("v2 stable problem input revision=%d, want a new monotonic head above v1 revision 2",
 			v2InputRevision)
 	}
+	var v2LedgerRevision, v2AttemptRevision int
+	if err := seed.fixture.db.QueryRow(`
+		SELECT input_revision
+		FROM k12_problem_input_revisions
+		WHERE agent_name='mingming' AND submission_id='submission-source-action'
+		  AND structure_version=2 AND problem_id=?
+		  AND current_disposition='current'`,
+		seed.problemID,
+	).Scan(&v2LedgerRevision); err != nil {
+		t.Fatalf("read v2 immutable input head: %v", err)
+	}
+	if err := seed.fixture.db.QueryRow(`
+		SELECT confirmed_version
+		FROM k12_attempts
+		WHERE agent_name='mingming' AND attempt_id='attempt-source-action'`,
+	).Scan(&v2AttemptRevision); err != nil {
+		t.Fatalf("read v2 Attempt revision: %v", err)
+	}
+	if v2LedgerRevision != v2InputRevision || v2AttemptRevision != v2InputRevision {
+		t.Fatalf(
+			"v2 revision barrier drift: structure=%d input_head=%d attempt=%d",
+			v2InputRevision,
+			v2LedgerRevision,
+			v2AttemptRevision,
+		)
+	}
 	fresh, freshBody := postProblemSourceAction(
 		t,
 		seed.fixture.handler,
@@ -290,5 +316,48 @@ func TestBUG_20260726_031_StructureChangeCreatesIsolatedAuthoritativeVersion(t *
 	if fresh.Code != http.StatusOK {
 		t.Fatalf("new structure must start without old revision pollution: status=%d body=%#v",
 			fresh.Code, freshBody)
+	}
+	resumed, resumedBody := postProblemSourceAction(
+		t,
+		seed.fixture.handler,
+		seed.dispatchID,
+		seed.problemID,
+		"structure-current-v2-resume",
+		fmt.Sprintf(
+			`{"action":"resume","structure_version":2,"expected_input_revision":%d,"payload":{}}`,
+			v2InputRevision,
+		),
+	)
+	if resumed.Code != http.StatusOK {
+		t.Fatalf(
+			"new structure resume must advance the aligned input head: status=%d body=%#v",
+			resumed.Code,
+			resumedBody,
+		)
+	}
+	if err := seed.fixture.coordinator.Records.PutProblemAttemptSnapshot(
+		ctx,
+		changed,
+	); !errors.Is(err, k12storage.ErrProblemAttemptConflict) {
+		t.Fatalf("stale OCR snapshot after command-origin head err=%v, want immutable conflict", err)
+	}
+	var commandHeadRevision int
+	var commandHeadOrigin string
+	if err := seed.fixture.db.QueryRow(`
+		SELECT input_revision,origin_kind
+		FROM k12_problem_input_revisions
+		WHERE agent_name='mingming' AND submission_id='submission-source-action'
+		  AND structure_version=2 AND problem_id=?
+		  AND current_disposition='current'`,
+		seed.problemID,
+	).Scan(&commandHeadRevision, &commandHeadOrigin); err != nil {
+		t.Fatalf("read command-origin v2 input head: %v", err)
+	}
+	if commandHeadRevision != v2InputRevision+1 || commandHeadOrigin != "command" {
+		t.Fatalf(
+			"stale OCR replay changed command head: revision=%d origin=%q",
+			commandHeadRevision,
+			commandHeadOrigin,
+		)
 	}
 }

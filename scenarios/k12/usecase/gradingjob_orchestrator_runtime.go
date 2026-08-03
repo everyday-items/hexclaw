@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -261,8 +262,14 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 				defer func() { <-o.sem }()
 				view, err := o.RunGradingJob(o.gradingBaseContext(), jobID)
 				if err != nil {
-					// 阶段失败已由状态机安全落 failed_retryable/failed_terminal；此处仅取证。
-					slog.Warn("K12 批改任务异步推进结束于错误（状态机已落库对应失败态）", "job", jobID, "err", err)
+					if errors.Is(err, ErrGradingSourceRecognitionPending) {
+						// Source worker owns the V73 transition. This is a durable
+						// scheduling stop, not a failed model attempt and not a retry.
+						slog.Info("K12 批改任务等待 V73 来源识别结果，保持 assessing", "job", jobID)
+					} else {
+						// 阶段失败已由状态机安全落 failed_retryable/failed_terminal；此处仅取证。
+						slog.Warn("K12 批改任务异步推进结束于错误（状态机已落库对应失败态）", "job", jobID, "err", err)
+					}
 				}
 				if view.Record != nil && view.Record.Status == k12.GradingStageOutcomeUnknown {
 					run := o.lookup(jobID)

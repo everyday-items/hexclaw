@@ -494,6 +494,76 @@ func TestImageTaskCoordinatorRejectsNonOwnerAssetBeforeClassifierCall(t *testing
 	}
 }
 
+func TestImageTaskCoordinatorRequiresOwnerScopedReadyPageAssetAcrossCreateAndRecovery(t *testing.T) {
+	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
+	ctx := context.Background()
+	classifier := &imageTaskClassifierStub{result: ImageTaskClassification{
+		Intent: k12.ImageTaskIntentArtwork, IntentEvidence: []string{"drawing"}, Confidence: 1,
+	}}
+	coordinator, _ := newImageTaskCoordinatorForTest(t, classifier)
+	repository := &PageAssetRepository{Records: coordinator.Records}
+	coordinator.PageAssets = repository
+	coordinator.ReadAsset = func(string, string) ([]byte, error) {
+		t.Fatal("PageAsset-backed coordinator must never use the raw asset reader")
+		return nil, nil
+	}
+
+	raw := validPNGFixture(t, "image-task-ready-ledger")
+	assetID, err := assetstore.Save("mingming", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := testCreateImageTaskInput()
+	input.OwnerScope = "guardian-1"
+	input.SourceAssetRefs = []string{assetID}
+	if _, _, err := coordinator.Create(ctx, input); err == nil {
+		t.Fatal("raw content-addressed bytes without a ready PageAsset ledger were accepted")
+	}
+	if classifier.calls != 0 {
+		t.Fatalf("provider called before PageAsset readiness: %d", classifier.calls)
+	}
+
+	ready, err := repository.Persist(ctx, input.OwnerScope, input.AgentName, raw)
+	if err != nil || ready.Metadata.PageAssetID != assetID {
+		t.Fatalf("persist ready PageAsset: ready=%+v err=%v", ready.Metadata, err)
+	}
+	prepared, created, err := coordinator.Create(ctx, input)
+	if err != nil || !created {
+		t.Fatalf("create from ready PageAsset: view=%+v created=%v err=%v", prepared, created, err)
+	}
+	ownerScope, err := coordinator.Records.GetImageTaskOwnerScope(
+		ctx,
+		input.AgentName,
+		prepared.Dispatch.DispatchID,
+	)
+	if err != nil || ownerScope != input.OwnerScope {
+		t.Fatalf("durable dispatch owner scope=%q err=%v", ownerScope, err)
+	}
+
+	wrongOwner := input
+	wrongOwner.OwnerScope = "guardian-2"
+	if _, _, err := coordinator.Create(ctx, wrongOwner); !errors.Is(err, k12storage.ErrImageTaskConflict) {
+		t.Fatalf("idempotent dispatch replay crossed owner scope: %v", err)
+	}
+	if removed, err := assetstore.Remove(input.AgentName, assetID); err != nil || !removed {
+		t.Fatalf("remove ready PageAsset bytes: removed=%v err=%v", removed, err)
+	}
+	if _, err := coordinator.Run(ctx, input.AgentName, prepared.Dispatch.DispatchID); err == nil {
+		t.Fatal("recovery accepted a ready ledger whose immutable bytes disappeared")
+	}
+	if classifier.calls != 0 {
+		t.Fatalf("provider called after PageAsset integrity failure: %d", classifier.calls)
+	}
+	if _, err := coordinator.Records.GetReadyPageAsset(
+		ctx,
+		input.OwnerScope,
+		input.AgentName,
+		assetID,
+	); !errors.Is(err, k12storage.ErrPageAssetNotFound) {
+		t.Fatalf("corrupt PageAsset remained consumer-visible: %v", err)
+	}
+}
+
 func TestImageTaskCoordinatorCreateReturnsDurableIdentityBeforeProviderAndDuplicateSchedulesOnce(t *testing.T) {
 	release := make(chan struct{})
 	classifier := &imageTaskClassifierStub{
@@ -1182,7 +1252,7 @@ func TestImageTaskCoordinatorAutoReplayDoesNotResolveChangedDefault(t *testing.T
 
 func TestImageTaskCoordinatorResumeRejectsDeletedOrReplacedContentAddressedAssetBeforeProvider(t *testing.T) {
 	raw, err := base64.StdEncoding.DecodeString(
-		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2n1cAAAAASUVORK5CYII=",
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
 	)
 	if err != nil {
 		t.Fatal(err)

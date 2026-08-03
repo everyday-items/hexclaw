@@ -13,7 +13,7 @@ import (
 
 func TestBackupV3PacksReferencedAssetContentAndMigrateRewritesEveryNestedAssetOwner(t *testing.T) {
 	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
-	image := []byte("\x89PNG\r\n\x1a\nhexbak-v3-asset")
+	image := validPNGFixture(t, "hexbak-v3-asset")
 	sourceAssetID, err := assetstore.Save("mingming", image)
 	if err != nil {
 		t.Fatal(err)
@@ -144,7 +144,7 @@ func TestRestoreAsRejectsV2AssetReferenceBecauseContentWasNotSignedOrPacked(t *t
 
 func archiveWithPackedAsset(t *testing.T, agent string) *Hexbak {
 	t.Helper()
-	image := []byte("\x89PNG\r\n\x1a\nrestore-as-packed")
+	image := validPNGFixture(t, "restore-as-packed")
 	id, mime, digest, err := assetstore.Describe(agent, image)
 	if err != nil {
 		t.Fatal(err)

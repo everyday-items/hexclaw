@@ -54,6 +54,56 @@ func TestImageTaskPhotoGrading_ClearFormattedOCRAutoFreezesAndCompletes(t *testi
 			t.Fatalf("clear formatted fact was not auto-frozen: %#v", question)
 		}
 	}
+	job, err := d.GetGradingJob(ctx, "mingming", jobID)
+	if err != nil {
+		t.Fatalf("load auto-confirmed job: %v", err)
+	}
+	facts, err := d.Records.GetProblemAttemptSnapshot(
+		ctx,
+		"mingming",
+		job.Fields.SubmissionID,
+	)
+	if err != nil {
+		t.Fatalf("load auto-confirmed typed facts: %v", err)
+	}
+	currentInputs, err := d.Records.ListCurrentProblemInputRevisions(
+		ctx,
+		"mingming",
+		job.Fields.SubmissionID,
+	)
+	if err != nil {
+		t.Fatalf("load auto-confirmed immutable heads: %v", err)
+	}
+	if len(currentInputs) != len(facts.Attempts) {
+		t.Fatalf("auto-confirmed head coverage=%d Attempts=%d",
+			len(currentInputs), len(facts.Attempts))
+	}
+	for _, attempt := range facts.Attempts {
+		head, ok := currentInputs[attempt.ProblemID]
+		if !ok || head.InputRevision != attempt.ConfirmedVersion ||
+			head.InputDigest != attempt.InputDigest || attempt.ConfirmedVersion < 1 ||
+			attempt.InputDigest == "" {
+			t.Fatalf("auto-confirmed V72/Attempt drift for %s: head=%+v Attempt=%+v",
+				attempt.ProblemID, head, attempt)
+		}
+	}
+	loaded, err := d.loadCurrentConfirmedQuestions(
+		ctx,
+		"mingming",
+		job.Fields.SubmissionID,
+	)
+	if err != nil || len(loaded) != len(facts.Attempts) {
+		t.Fatalf("load-current confirmation coverage=%d want=%d err=%v",
+			len(loaded), len(facts.Attempts), err)
+	}
+	for _, question := range loaded {
+		head, ok := currentInputs[question.ProblemID]
+		if !ok || question.ConfirmedVersion != head.InputRevision ||
+			question.InputDigest != head.InputDigest {
+			t.Fatalf("load-current overlaid mismatched confirmation for %s: question=%+v head=%+v",
+				question.ProblemID, question, head)
+		}
+	}
 	result, ok := o.PhotoResult(jobID)
 	if !ok || len(result.Items) != 2 {
 		t.Fatalf("program-verified grading did not run after auto-freeze: %#v", result)
@@ -97,6 +147,38 @@ func TestImageTaskPhotoGrading_MissingConfidenceRequiresConfirmation(t *testing.
 	}
 	if !hasLowConfidence {
 		t.Fatalf("missing confidence must expose low_confidence: %#v", questions[0].ConfirmationReasons)
+	}
+	job, err := d.GetGradingJob(ctx, "mingming", jobID)
+	if err != nil {
+		t.Fatalf("load pending confirmation job: %v", err)
+	}
+	currentInputs, err := d.Records.ListCurrentProblemInputRevisions(
+		ctx,
+		"mingming",
+		job.Fields.SubmissionID,
+	)
+	if err != nil {
+		t.Fatalf("list pending immutable input heads: %v", err)
+	}
+	if len(currentInputs) != 0 {
+		t.Fatalf("unconfirmed questions acquired immutable input heads: %+v", currentInputs)
+	}
+	if current, loadErr := d.loadCurrentConfirmedQuestions(
+		ctx,
+		"mingming",
+		job.Fields.SubmissionID,
+	); !errors.Is(loadErr, ErrInvalidInput) || current != nil {
+		t.Fatalf("load-current overlaid unconfirmed facts as confirmed: questions=%+v err=%v",
+			current, loadErr)
+	}
+	projection, err := o.ImageTaskHomeworkProjection(ctx, "mingming", jobID)
+	if err != nil {
+		t.Fatalf("read pending progressive projection: %v", err)
+	}
+	if len(projection.Questions) != 1 ||
+		projection.Questions[0].ConfirmedVersion != 0 ||
+		projection.Questions[0].InputDigest != "" {
+		t.Fatalf("progressive projection fabricated confirmation: %+v", projection.Questions)
 	}
 }
 

@@ -118,7 +118,7 @@ func TestBUG_20260802_022_ProblemSourceActionRawWireIsFrozenExactAndReplayStable
 				"payload":{}
 			}`,
 			wantInputRevision: 2,
-			wantProblemStatus: "awaiting_source",
+			wantProblemStatus: "processing",
 			prepare: func(t *testing.T, seed problemSourceActionSeed) {
 				rec, out := postProblemSourceAction(
 					t,
@@ -226,7 +226,20 @@ func TestBUG_20260802_022_ProblemSourceActionRawWireIsFrozenExactAndReplayStable
 				"input_revision",
 				"published_revision",
 				"current_disposition",
+				"page_asset_id",
+				"source_width",
+				"source_height",
+				"source_region",
 			)
+			if problem["page_asset_id"] != seed.fixture.assetID ||
+				problem["source_width"] != float64(1) ||
+				problem["source_height"] != float64(1) ||
+				problem["source_region"] != nil {
+				t.Fatalf(
+					"problem progress must expose current PageAsset source facts: %#v",
+					problem,
+				)
+			}
 			if problem["status"] != test.wantProblemStatus {
 				t.Fatalf(
 					"%s problem status=%v, want %q; problem=%#v",

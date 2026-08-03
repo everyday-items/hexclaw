@@ -228,7 +228,7 @@ func TestArchiveRestoreAsRollbackPreservesTargetOperationalAndUnreferencedOCRJob
 	f := newArchiveRestoreFixture(t)
 	ctx := context.Background()
 	registerRestoreTarget(t, f)
-	image := []byte("\x89PNG\r\n\x1a\ntarget-operational-ocr")
+	image := validPNGFixture(t, "target-operational-ocr")
 	assetID, err := assetstore.Save("target-child", image)
 	if err != nil {
 		t.Fatal(err)
@@ -295,7 +295,7 @@ func (archiveOCRFeedbackSolver) GenerateWorkFeedback(context.Context, usecase.Wo
 
 func archiveForRestoreAsWithWritingOCR(t *testing.T, agent string) (*usecase.Hexbak, []byte) {
 	t.Helper()
-	image := []byte("\x89PNG\r\n\x1a\nrestore-as-writing-ocr")
+	image := validPNGFixture(t, "restore-as-writing-ocr")
 	assetID, mime, sourceDigest, err := assetstore.Describe(agent, image)
 	if err != nil {
 		t.Fatal(err)

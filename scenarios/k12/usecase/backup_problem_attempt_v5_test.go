@@ -15,7 +15,7 @@ func TestBackupV5PacksProblemAttemptLedgerAndPageAssetExactSet(t *testing.T) {
 	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
 	d, store := newPipeline(t, fakeSolver{}, fakeGrader{}, nil)
 	ctx := context.Background()
-	image := []byte("\x89PNG\r\n\x1a\nproblem-attempt-v5")
+	image := validPNGFixture(t, "problem-attempt-v5")
 	assetID, err := assetstore.Save("mingming", image)
 	if err != nil {
 		t.Fatal(err)
@@ -29,7 +29,7 @@ func TestBackupV5PacksProblemAttemptLedgerAndPageAssetExactSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bak.Version != 5 || len(bak.ProblemAttempts) != 1 || len(bak.Assets) != 1 {
+	if bak.Version != 6 || len(bak.ProblemAttempts) != 1 || len(bak.Assets) != 1 {
 		t.Fatalf("backup scope incomplete: version=%d problem_attempts=%d assets=%d", bak.Version, len(bak.ProblemAttempts), len(bak.Assets))
 	}
 	if bak.ProblemAttempts[0].Problems[0].PageAssetID != assetID || bak.Assets[0].AssetID != assetID {
@@ -53,7 +53,7 @@ func TestBackupV5PacksProblemAttemptLedgerAndPageAssetExactSet(t *testing.T) {
 		{name: "cross owner", mutate: func(b *Hexbak) { b.ProblemAttempts[0].Attempts[0].AgentName = "other-child" }},
 		{name: "unpacked page", mutate: func(b *Hexbak) { b.Assets = nil }},
 		{name: "extra unreferenced asset", mutate: func(b *Hexbak) {
-			extraImage := []byte("\x89PNG\r\n\x1a\nextra-v5")
+			extraImage := validPNGFixture(t, "extra-v5")
 			id, mime, digest, describeErr := assetstore.Describe("mingming", extraImage)
 			if describeErr != nil {
 				t.Fatal(describeErr)
@@ -100,7 +100,7 @@ func TestMigrateHexbakOwnerKeepsStableProblemAttemptIDsAndRewritesOnlyOwnerAndPa
 	if err != nil {
 		t.Fatal(err)
 	}
-	if migrated.Version != 5 || len(migrated.ProblemAttempts) != 1 || len(migrated.Assets) != 1 {
+	if migrated.Version != 6 || len(migrated.ProblemAttempts) != 1 || len(migrated.Assets) != 1 {
 		t.Fatalf("migrated archive incomplete: %+v", migrated)
 	}
 	got := migrated.ProblemAttempts[0]
@@ -130,7 +130,7 @@ func TestMigrateHexbakOwnerKeepsStableProblemAttemptIDsAndRewritesOnlyOwnerAndPa
 
 func v5ProblemAttemptArchive(t *testing.T, agent string) (*Hexbak, []byte) {
 	t.Helper()
-	image := []byte("\x89PNG\r\n\x1a\nproblem-attempt-v5-archive")
+	image := validPNGFixture(t, "problem-attempt-v5-archive")
 	assetID, mime, digest, err := assetstore.Describe(agent, image)
 	if err != nil {
 		t.Fatal(err)

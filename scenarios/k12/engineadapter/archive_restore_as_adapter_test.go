@@ -316,7 +316,7 @@ func archiveForRestoreAs(t *testing.T, version int) *usecase.Hexbak {
 
 func archiveForRestoreAsWithAsset(t *testing.T) (*usecase.Hexbak, []byte) {
 	t.Helper()
-	image := []byte("\x89PNG\r\n\x1a\nrestore-as-adapter-asset")
+	image := validPNGFixture(t, "restore-as-adapter-asset")
 	id, mime, digest, err := assetstore.Describe("mingming", image)
 	if err != nil {
 		t.Fatal(err)

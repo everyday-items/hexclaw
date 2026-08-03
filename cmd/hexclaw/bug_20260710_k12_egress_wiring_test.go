@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/egress"
+	k12engineadapter "github.com/hexagon-codes/hexclaw/scenarios/k12/engineadapter"
 	"github.com/hexagon-codes/hexclaw/skill"
 )
 
@@ -12,6 +13,14 @@ type countingSolveExecutor struct {
 	calls         int
 	verifiedCalls int
 	ctx           context.Context
+}
+
+type interceptingCountingSolveExecutor struct {
+	countingSolveExecutor
+}
+
+func (*interceptingCountingSolveExecutor) SupportsSubAgentCallInterceptor() bool {
+	return true
 }
 
 func (e *countingSolveExecutor) GradeVerified(ctx context.Context, _, _, _ string) (*skill.Result, error) {
@@ -41,6 +50,18 @@ func TestBUG20260714_K12ClassifiedSolveForwardsVerifiedGradeFastPath(t *testing.
 	got, _ := egress.RequestsFromContext(next.ctx)
 	if len(got) != 2 || got[0].DataClass != egress.ClassGeneral || got[1].DataClass != egress.ClassSensitiveProfile {
 		t.Fatalf("verified grade 出网标签错误: %+v", got)
+	}
+}
+
+// REG-P0: the production classification wrapper must preserve the capability
+// method used by SolveAdapter to select the durable per-physical-call ledger.
+// Erasing it silently falls back to the generic whole-operation sender.
+func TestBUG20260803_K12ClassifiedSolveForwardsPhysicalCallCapability(t *testing.T) {
+	next := &interceptingCountingSolveExecutor{}
+	exec := classifiedSolveExecutor{next: next}
+	adapter := k12engineadapter.NewSolveAdapter(exec)
+	if !adapter.UsesGradingPhysicalCalls() {
+		t.Fatal("production SolveAdapter lost the wrapped physical-call interceptor capability")
 	}
 }
 

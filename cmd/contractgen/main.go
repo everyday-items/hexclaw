@@ -19,11 +19,17 @@ func main() {
 	flag.Parse()
 
 	raw, err := os.ReadFile(*schemaPath)
-	if err != nil { fatal(err) }
+	if err != nil {
+		fatal(err)
+	}
 	var schema any
-	if err := json.Unmarshal(raw, &schema); err != nil { fatal(fmt.Errorf("decode schema: %w", err)) }
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		fatal(fmt.Errorf("decode schema: %w", err))
+	}
 	canonical, err := json.MarshalIndent(schema, "", "  ")
-	if err != nil { fatal(err) }
+	if err != nil {
+		fatal(err)
+	}
 	generated := render(canonical)
 	if *check {
 		current, readErr := os.ReadFile(*outPath)
@@ -32,8 +38,12 @@ func main() {
 		}
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(*outPath), 0o755); err != nil { fatal(err) }
-	if err := os.WriteFile(*outPath, generated, 0o644); err != nil { fatal(err) }
+	if err := os.MkdirAll(filepath.Dir(*outPath), 0o755); err != nil {
+		fatal(err)
+	}
+	if err := os.WriteFile(*outPath, generated, 0o644); err != nil {
+		fatal(err)
+	}
 }
 
 func fatal(err error) {
@@ -74,6 +84,10 @@ export interface K12ImageTaskProblemSourceProgressWire {
   input_revision: number
   published_revision: number
   current_disposition: 'current'
+  page_asset_id?: string
+  source_width?: number
+  source_height?: number
+  source_region?: { x: number; y: number; width: number; height: number } | null
 }
 export interface K12ImageTaskProblemSourceCoverageWire {
   total: number

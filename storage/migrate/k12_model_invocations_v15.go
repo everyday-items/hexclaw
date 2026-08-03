@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS k12_model_invocations (
     status TEXT NOT NULL CHECK(status IN ('prepared','sent','succeeded','failed','outcome_unknown','reconciled')),
     attempt INTEGER NOT NULL CHECK(attempt >= 1),
     result_digest TEXT NOT NULL DEFAULT '',
+    result_json TEXT NOT NULL DEFAULT ''
+        CHECK(result_json='' OR json_valid(result_json)),
     external_request_id TEXT NOT NULL DEFAULT '',
     failure_kind TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,

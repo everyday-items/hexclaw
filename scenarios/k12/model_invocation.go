@@ -26,6 +26,7 @@ type ModelInvocation struct {
 	Status                 ModelInvocationStatus      `json:"status"`
 	Attempt                int                        `json:"attempt"`
 	ResultDigest           string                     `json:"result_digest,omitempty"`
+	ResultJSON             string                     `json:"result_json,omitempty"`
 	ExternalRequestID      string                     `json:"external_request_id,omitempty"`
 	FailureKind            string                     `json:"failure_kind,omitempty"`
 	CreatedAt              int64                      `json:"created_at"`

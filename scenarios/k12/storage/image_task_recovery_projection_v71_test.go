@@ -111,3 +111,46 @@ func TestImageTaskRecoveryProjectionIsAgentSessionScopedAndStableAfterReopen(t *
 		t.Fatalf("read projection caused side effects: dispatches=%d invocations=%d", dispatches, invocations)
 	}
 }
+
+func TestImageTaskRecoveryProjectionIsFrozenOwnerScoped(t *testing.T) {
+	store, _ := setup(t)
+	seed := func(dispatchID, invocationID, ownerScope string) {
+		t.Helper()
+		dispatch := testImageTaskDispatch()
+		dispatch.DispatchID = dispatchID
+		dispatch.ClassificationInvocationID = invocationID
+		dispatch.AgentName = "mingming"
+		dispatch.LearnerID = "mingming"
+		dispatch.OwnerScope = ownerScope
+		dispatch.SourceSessionID = "shared-session"
+		dispatch.SourceRef = dispatchID
+		dispatch.SourceAssetRefs = []string{"asset://mingming/" + dispatchID + ".png"}
+		dispatch.SourceDigest = "sha256:" + dispatchID
+		dispatch.IdempotencyKey = "mingming:" + dispatchID
+		dispatch.RequestDigest = "sha256:request:" + dispatchID
+		invocation := k12.ImageTaskInvocation{
+			InvocationID: invocationID, AgentName: "mingming", DispatchID: dispatchID,
+			Operation:     k12.ImageTaskOperationClassification,
+			OperationKey:  "dispatch:" + dispatchID + ":classification",
+			RequestDigest: "sha256:invocation:" + dispatchID,
+			RouteSnapshot: testImageRoute(), Status: k12.ImageTaskInvocationPrepared,
+			Attempt: 1, CreatedAt: 100, UpdatedAt: 100,
+		}
+		if _, _, err := store.PrepareImageTaskDispatch(context.Background(), dispatch, invocation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed("dispatch-owner-a", "invocation-owner-a", "owner-a")
+	seed("dispatch-owner-b", "invocation-owner-b", "owner-b")
+	seed("dispatch-legacy", "invocation-legacy", "")
+
+	got, err := store.ListImageTaskDispatchesForOwnerSession(
+		context.Background(), "owner-b", "mingming", "shared-session",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].DispatchID != "dispatch-owner-b" {
+		t.Fatalf("frozen owner projection=%+v, want only owner-b dispatch", got)
+	}
+}
