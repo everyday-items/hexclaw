@@ -27,10 +27,17 @@ type DocumentExtractResponse struct {
 //
 // 注：.xlsx/.xls 由前端 SheetJS 解析（唯一能解老 .xls 且更强），不走本端点。
 func (s *Server) handleExtractDocument(w http.ResponseWriter, r *http.Request) {
-	const maxUpload = 100 << 20 // 100MB
-	if err := r.ParseMultipartForm(maxUpload); err != nil {
+	const (
+		maxUpload          = maxChatFileBytes
+		maxMultipartMemory = 8 << 20
+	)
+	r.Body = http.MaxBytesReader(w, r.Body, maxUpload+(1<<20))
+	if err := r.ParseMultipartForm(maxMultipartMemory); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "解析上传失败: " + err.Error()})
 		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
 	}
 	file, header, err := r.FormFile("file")
 	if err != nil {

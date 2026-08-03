@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type readinessGateEmbedder struct {
@@ -84,5 +85,22 @@ func TestBug20260717_ReadinessGateOpensAfterEndpointFailure(t *testing.T) {
 	}
 	if calls := inner.calls.Load(); calls != 1 {
 		t.Fatalf("open gate must suppress repeated endpoint calls, got %d", calls)
+	}
+}
+
+func TestReadinessGateCallerDeadlineDoesNotPoisonInstalledModel(t *testing.T) {
+	inner := &readinessGateEmbedder{err: context.DeadlineExceeded}
+	gated := NewReadinessGatedEmbedder(
+		inner, func(context.Context) bool { return true }, true, time.Minute,
+	)
+	if _, err := gated.Embed(context.Background(), []string{"queued query"}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Embed error=%v", err)
+	}
+	inner.err = nil
+	if _, err := gated.Embed(context.Background(), []string{"next query"}); err != nil {
+		t.Fatalf("caller deadline poisoned installed-model readiness: %v", err)
+	}
+	if got := inner.calls.Load(); got != 2 {
+		t.Fatalf("inner calls=%d, want 2", got)
 	}
 }

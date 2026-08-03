@@ -1151,6 +1151,8 @@ func (e *ReActEngine) completeWithTools(
 			Mode: string(ResolveMode(msg.Metadata["agent_mode"], msg.Content)),
 		})
 		tools = stripCronRecursiveTools(msg, tools) // 功能优先：cron/webhook/workflow 不再剥离工具
+		tools = stripSpawnRecursiveTools(msg, tools)
+		tools = applyInheritedToolPolicy(msg, tools)
 		tools = e.ensureSystemDispatchToolFloor(tools, msg)
 		tools = e.ensureMountedSkillTools(tools, msg.Metadata)                // bug#2：显式挂载技能的工具强制前置，保证不被 maxTools 截断
 		tools = e.filterInternalRetrievalToolsForPersona(tools, msg.Metadata) // BUG-20260704：挂载 persona 时剥离内部检索工具，防模型主动拉回旧内容压过人设

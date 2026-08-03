@@ -63,9 +63,8 @@ func sr(id string, vScore, tScore float64) *SearchResult {
 	}
 }
 
-// rpFakeLLM 记录被调用的 prompt，用于断言 rerank / query-expand 是否真的走了 LLM。
-// LLMReranker 会并发逐文档打分（goroutine 并行调用 Complete），故 calls 必须加锁，
-// 否则 `go test -race` 会在并发 append 上报数据竞争。
+// rpFakeLLM 记录查询扩展发出的 prompt。multi-query 与 HyDE 会并发调用 Complete，
+// 故 calls 必须加锁，否则 `go test -race` 会在并发 append 上报数据竞争。
 type rpFakeLLM struct {
 	reply string
 	mu    sync.Mutex
@@ -175,25 +174,26 @@ func TestSearch_MinScoreFloor_RelaxedFallbackWhenEmpty(t *testing.T) {
 	}
 }
 
-// ─── #6 LLM 重排 ───────────────────────────────────────
+// ─── #6 专用重排与 MMR 降级 ──────────────────────────────
 
-// 启用 rerank + 注入 LLM 时，检索应真的调用 LLM；LLM 异常/不可解析时优雅降级仍返回结果。
-func TestSearch_Rerank_InvokesLLMAndDegradesGracefully(t *testing.T) {
+// 启用 rerank 但未注入专用 cross-encoder 时，聊天 LLM 不得被隐式复用为重排器；
+// 排序应确定性降级到 MMR。
+func TestSearch_RerankWithoutDedicatedExecutorNeverInvokesChatLLM(t *testing.T) {
 	searcher := &rpFakeSearcher{
 		vec:  []*SearchResult{sr("A", 0.9, 0), sr("B", 0.8, 0), sr("C", 0.7, 0)},
 		text: []*SearchResult{sr("A", 0, 0.6)},
 	}
 	cfg := baseCfg()
 	cfg.RerankEnabled = true
-	llm := &rpFakeLLM{reply: ""} // 空回复 → reranker 无法解析 → 应降级而非崩溃
+	llm := &rpFakeLLM{reply: ""}
 	mgr := newRetrievalMgr(t, searcher, cfg, llm)
 
 	hits, err := mgr.Search(context.Background(), "q", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if llm.callCount() == 0 {
-		t.Fatal("rerank 启用时应调用 LLM，但 LLM 未被调用")
+	if llm.callCount() != 0 {
+		t.Fatalf("未配专用 reranker 时不得调用聊天 LLM，calls=%d", llm.callCount())
 	}
 	if len(hits) == 0 || len(hits) > 2 {
 		t.Fatalf("降级后仍应返回 1~2 条结果，got %d", len(hits))
@@ -223,8 +223,9 @@ func TestSearch_QueryExpand_InvokesLLM(t *testing.T) {
 
 // ─── 降级：无 LLM ──────────────────────────────────────
 
-// 不注入 LLM 时，rerank / expand 自动关闭，纯 RRF + 地板路径仍正常工作。
-func TestSearch_NoLLM_DegradesToRRFOnly(t *testing.T) {
+// 不注入 LLM 时，query-expand 自动关闭，重排在无专用 executor 时走 MMR；
+// RRF + 地板路径仍正常工作。
+func TestSearch_NoLLMDegradesToHybridRetrievalAndMMR(t *testing.T) {
 	searcher := &rpFakeSearcher{
 		vec:  []*SearchResult{sr("A", 0.9, 0), sr("B", 0.7, 0)},
 		text: []*SearchResult{sr("A", 0, 0.5)},

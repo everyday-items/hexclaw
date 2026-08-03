@@ -14,15 +14,11 @@ import (
 )
 
 // 专用 cross-encoder 重排（SiliconFlow /rerank, BAAI/bge-reranker-v2-m3）真机验证：
-// 1) 检索质量（含跨语种应被精排到 rank-1）；2) 延迟（应远快于 LLM 重排的 ~100s）。
+// 1) 检索质量（含跨语种应被精排到 rank-1）；2) 独立低延迟重排预算。
+// 聊天生成模型不参与文档重排。
 func TestRAGReal_CrossEncoderReranker(t *testing.T) {
 	emb := requireE2E(t)
-	base, key := sfBaseKey(t)
-	rerankBase := strings.TrimSuffix(strings.TrimSuffix(base, "/"), "/v1")
-	rr := reranker.NewCohereReranker(key,
-		reranker.WithCohereBaseURL(rerankBase),
-		reranker.WithCohereModel(envOr("HEX_E2E_SF_RERANK", "BAAI/bge-reranker-v2-m3")),
-		reranker.WithCohereTopK(50))
+	rr := sfDedicatedReranker(t, 50)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
@@ -39,7 +35,7 @@ func TestRAGReal_CrossEncoderReranker(t *testing.T) {
 		splitter.WithMarkdownChunkOverlap(80), splitter.WithHeadersToSplit([]string{"#", "##", "###"}))
 	cfg := DefaultHybridConfig()
 	cfg.ExpandEnabled, cfg.ContextualEnabled = false, false // 重排开；隔离纯检索+重排
-	// 注入专用 cross-encoder（无 LLM → 走 cross-encoder 而非 LLM 重排）
+	// 显式注入专用 cross-encoder；聊天 LLM 与该职责无关。
 	mgr := NewManager(store, store, emb, WithSplitter(sp), WithHybridConfig(cfg), WithDocReranker(rr))
 	if err := IngestGolden(ctx, mgr); err != nil {
 		t.Fatalf("ingest: %v", err)
@@ -61,12 +57,24 @@ func TestRAGReal_CrossEncoderReranker(t *testing.T) {
 			t.Errorf("cross-encoder 应把跨语种召回进 top-3，got rank=%d", c.Rank)
 		}
 	}
-	t.Logf("  ✓ cross-encoder 重排：单查询延迟=%v（vs LLM 重排 ~100s）", lat.Round(time.Millisecond))
+	t.Logf("  ✓ cross-encoder 重排：单查询延迟=%v", lat.Round(time.Millisecond))
 	t.Logf("  ✓ recall@1=%.2f recall@3=%.2f MRR=%.3f  非top1:%v", rep.RecallAt1, rep.RecallAtK, rep.MRR, missesOf(rep))
 	if rep.RecallAtK < 0.9 {
 		t.Errorf("cross-encoder recall@3=%.2f < 0.9", rep.RecallAtK)
 	}
 	if lat > 15*time.Second {
-		t.Errorf("cross-encoder 单查询延迟 %v 偏高（预期 << LLM 重排）", lat)
+		t.Errorf("cross-encoder 单查询延迟 %v 超过 15s 护栏", lat)
 	}
+}
+
+// sfDedicatedReranker 构造测试环境明确配置的 SiliconFlow cross-encoder。
+// 它不会回退或伪装成聊天 LLM；凭证/端点缺失由 sfBaseKey 统一 skip。
+func sfDedicatedReranker(t *testing.T, topK int) reranker.Reranker {
+	t.Helper()
+	base, key := sfBaseKey(t)
+	rerankBase := strings.TrimSuffix(strings.TrimSuffix(base, "/"), "/v1")
+	return reranker.NewCohereReranker(key,
+		reranker.WithCohereBaseURL(rerankBase),
+		reranker.WithCohereModel(envOr("HEX_E2E_SF_RERANK", "BAAI/bge-reranker-v2-m3")),
+		reranker.WithCohereTopK(topK))
 }

@@ -9,7 +9,7 @@
 //
 //  1. QueryRewriter      — 把用户原 query 改写成更适合检索的形式（同义词 / 拆分）
 //  2. Retriever          — 调 Manager.Search 返回候选 chunks
-//  3. Reranker           — 用更精细的 scorer（cross-encoder / LLM）重排
+//  3. Reranker           — 显式注入独立低延迟 scorer（如 cross-encoder）重排
 //  4. ContextBuilder     — 把 chunks 拼成 prompt 用 context（含分隔符 / 引用 ID）
 //  5. Answerer           — 把 context 喂给 LLM 生成最终答案；可空（让调用方自己组 prompt）
 //
@@ -36,10 +36,10 @@ func init() {
 		Name:    FlagRAGPipelineV1,
 		Default: true,
 		// 说明（去除旧版"看似启用实则空转"的假象）：
-		// 默认检索全链路（查询扩展 → 宽召回 → RRF 融合 → 相关度地板 → LLM 重排）
+		// 默认检索全链路（查询扩展 → 宽召回 → RRF 融合 → 相关度地板 → 专用重排或 MMR）
 		// 已无条件落在 Manager.searchResults，与本 flag 无关、始终生效。
 		// 本 flag 仅控制可选的「可组合 Pipeline 编排门面」(Pipeline.RunRAG)，默认开启。
-		Description:  "Composable RAG pipeline façade (Pipeline.RunRAG), enabled by default. The default retrieval path (query-expansion → wide recall → RRF → min-score floor → LLM rerank) always runs in Manager.searchResults regardless of this flag.",
+		Description:  "Composable RAG pipeline façade (Pipeline.RunRAG), enabled by default. The default retrieval path (query-expansion → wide recall → RRF → min-score floor → dedicated reranker or MMR fallback) always runs in Manager.searchResults regardless of this flag.",
 		Stage:        featureflag.StageGA,
 		SinceVersion: "0.4.0",
 	})

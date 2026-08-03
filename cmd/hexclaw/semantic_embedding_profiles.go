@@ -12,6 +12,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/knowledge"
+	"github.com/hexagon-codes/hexclaw/localinfer"
 )
 
 const knowledgeEmbeddingProbeTimeout = 15 * time.Second
@@ -31,6 +32,7 @@ type knowledgeEmbeddingRuntimeProfileBuildConfig struct {
 	observeHTTPClient func(providerKey, model string, client *http.Client)
 	probeInterval     time.Duration
 	probeIntervalSet  bool
+	localInference    *localinfer.Coordinator
 }
 
 type knowledgeEmbeddingRuntimeProfileOption func(*knowledgeEmbeddingRuntimeProfileBuildConfig)
@@ -52,6 +54,14 @@ func withKnowledgeEmbeddingProbeInterval(interval time.Duration) knowledgeEmbedd
 	return func(build *knowledgeEmbeddingRuntimeProfileBuildConfig) {
 		build.probeInterval = interval
 		build.probeIntervalSet = true
+	}
+}
+
+func withKnowledgeEmbeddingLocalInferenceCoordinator(
+	coordinator *localinfer.Coordinator,
+) knowledgeEmbeddingRuntimeProfileOption {
+	return func(build *knowledgeEmbeddingRuntimeProfileBuildConfig) {
+		build.localInference = coordinator
 	}
 }
 
@@ -165,6 +175,10 @@ func buildKnowledgeEmbeddingRuntimeProfiles(
 						return nil
 					}
 					result = egress.NewCloudEmbedder(result, cloudPolicy)
+				} else if build.localInference != nil {
+					result = localinfer.NewCoordinatedEmbedder(
+						result, build.localInference, localinfer.OperationQueryEmbedding,
+					)
 				}
 				return result
 			}
@@ -218,7 +232,7 @@ func buildKnowledgeEmbeddingRuntimeProfiles(
 					readiness = knowledge.NewReadinessGatedEmbedder(
 						guarded,
 						func(probeCtx context.Context) bool {
-							return knowledgeEmbeddingAvailabilityExecutable(availabilityProbe(probeCtx))
+							return knowledgeEmbeddingHotReadinessAvailable(probeCtx, availabilityProbe)
 						},
 						knowledgeEmbeddingAvailabilityExecutable(entry.Availability),
 						probeInterval,
@@ -230,7 +244,12 @@ func buildKnowledgeEmbeddingRuntimeProfiles(
 					}
 					guarded = readiness
 				}
-				embedder = knowledge.NewTruncatingEmbedder(hexagon.NewCachedEmbedder(guarded), 0)
+				embedder = wrapKnowledgeEmbeddingExecutionProfile(
+					hexagon.NewCachedEmbedder(guarded), candidate.model,
+				)
+				if candidate.local && build.localInference != nil {
+					embedder = localinfer.MarkProviderBoundEmbedder(embedder)
+				}
 			}
 		}
 
@@ -256,6 +275,26 @@ func buildKnowledgeEmbeddingRuntimeProfiles(
 func knowledgeEmbeddingAvailabilityExecutable(availability knowledge.ProfileAvailability) bool {
 	return availability == knowledge.ProfileAvailabilityInstalled ||
 		availability == knowledge.ProfileAvailabilityConnected
+}
+
+// knowledgeEmbeddingHotReadinessAvailable prevents a stale readiness check
+// from inheriting an unbounded request context. A shorter caller deadline wins
+// through normal context propagation; a completed-but-expired probe fails
+// closed even if the provider returned a nominally executable state.
+func knowledgeEmbeddingHotReadinessAvailable(
+	ctx context.Context,
+	probe func(context.Context) knowledge.ProfileAvailability,
+) bool {
+	if probe == nil {
+		return false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, knowledgeEmbeddingProbeTimeout)
+	defer cancel()
+	availability := probe(probeCtx)
+	return probeCtx.Err() == nil && knowledgeEmbeddingAvailabilityExecutable(availability)
 }
 
 func knowledgeEmbeddingModelCandidates(ctx context.Context, cfg *config.Config) []knowledgeEmbeddingModelCandidate {
@@ -421,6 +460,8 @@ func knowledgeEmbeddingProbeVectorDimension(
 	}
 	if cloud {
 		ctx = egress.WithRequest(ctx, egress.PurposeProviderProbe, "", egress.ClassGeneral)
+	} else {
+		ctx = localinfer.WithOperation(ctx, localinfer.OperationProbe)
 	}
 	vectors, err := embedder.Embed(ctx, []string{knowledgeEmbeddingProbeText})
 	if err != nil || len(vectors) != 1 || len(vectors[0]) == 0 || len(vectors[0]) > 65536 {

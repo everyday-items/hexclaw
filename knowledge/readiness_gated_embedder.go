@@ -145,7 +145,7 @@ func (e *ReadinessGatedEmbedder) Embed(ctx context.Context, texts []string) ([][
 		return nil, ErrEmbeddingUnavailable
 	}
 	out, err := e.inner.Embed(ctx, texts)
-	if err != nil {
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		e.markUnavailable()
 	}
 	return out, err
@@ -156,7 +156,7 @@ func (e *ReadinessGatedEmbedder) EmbedOne(ctx context.Context, text string) ([]f
 		return nil, ErrEmbeddingUnavailable
 	}
 	out, err := e.inner.EmbedOne(ctx, text)
-	if err != nil {
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		e.markUnavailable()
 	}
 	return out, err

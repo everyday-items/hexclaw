@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	hrag "github.com/hexagon-codes/hexagon/rag"
 )
 
 type bug20260728QwenPolicySearcher struct {
@@ -97,6 +99,29 @@ func bug20260728Manager(searcher RevisionSemanticSearcher) *Manager {
 	)
 }
 
+type bug20260803QwenTop1Reranker struct {
+	calls    int
+	inputIDs []string
+}
+
+func (r *bug20260803QwenTop1Reranker) Name() string { return "qwen-top1-stage-order" }
+
+func (r *bug20260803QwenTop1Reranker) Rerank(
+	_ context.Context,
+	_ string,
+	docs []hrag.Document,
+) ([]hrag.Document, error) {
+	r.calls++
+	r.inputIDs = r.inputIDs[:0]
+	for _, doc := range docs {
+		r.inputIDs = append(r.inputIDs, doc.ID)
+	}
+	if len(docs) < 2 {
+		return docs, nil
+	}
+	return []hrag.Document{docs[1], docs[0]}, nil
+}
+
 func TestBug20260728QwenQueryBudgetAndTop1FloorAreProfileScoped(t *testing.T) {
 	globalBefore := DefaultHybridConfig().MinScore
 	if globalBefore != 0.85 {
@@ -130,6 +155,80 @@ func TestBug20260728QwenQueryBudgetAndTop1FloorAreProfileScoped(t *testing.T) {
 	}
 	if got := DefaultHybridConfig().MinScore; got != globalBefore {
 		t.Fatalf("Qwen query mutated global MinScore: before=%v after=%v", globalBefore, got)
+	}
+}
+
+func TestBug20260803QwenTop1CapAppliesAfterRerank(t *testing.T) {
+	qwen := &bug20260728QwenPolicySearcher{results: []*SearchResult{
+		bug20260728Result("vector-first", 0.70),
+		bug20260728Result("rerank-winner", 0.69),
+	}}
+	cfg := DefaultHybridConfig()
+	cfg.ExpandEnabled = false
+	cfg.RerankEnabled = true
+	cfg.UseRRF = false
+	rerank := &bug20260803QwenTop1Reranker{}
+	manager := NewManager(
+		semanticManagerRepo{},
+		leakingLegacySearcher{},
+		nil,
+		WithHybridConfig(cfg),
+		WithRevisionSemanticSearcher(qwen),
+		WithDocReranker(rerank),
+	)
+
+	_, hits, err := manager.QueryHits(context.Background(), "held-out query", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rerank.calls != 1 {
+		t.Fatalf("rerank calls=%d, want 1 before the Qwen Top-1 injection cap", rerank.calls)
+	}
+	if len(rerank.inputIDs) != 2 {
+		t.Fatalf("rerank candidates=%v, want both above-floor candidates", rerank.inputIDs)
+	}
+	if len(hits) != 1 || hits[0].DocID != "rerank-winner" {
+		t.Fatalf("Qwen auto-injection hits=%v, want reranked winner then Top-1 cap", hits)
+	}
+}
+
+func TestBug20260803QwenFloorAppliesBeforeRerank(t *testing.T) {
+	qwen := &bug20260728QwenPolicySearcher{results: []*SearchResult{
+		bug20260728Result("above-floor-a", 0.70),
+		bug20260728Result("above-floor-b", 0.69),
+		bug20260728Result("below-floor", 0.64),
+	}}
+	cfg := DefaultHybridConfig()
+	cfg.ExpandEnabled = false
+	cfg.RerankEnabled = true
+	cfg.UseRRF = false
+	rerank := &bug20260803QwenTop1Reranker{}
+	manager := NewManager(
+		semanticManagerRepo{},
+		leakingLegacySearcher{},
+		nil,
+		WithHybridConfig(cfg),
+		WithRevisionSemanticSearcher(qwen),
+		WithDocReranker(rerank),
+	)
+
+	_, hits, err := manager.QueryHits(context.Background(), "held-out query", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rerank.calls != 1 {
+		t.Fatalf("rerank calls=%d, want 1", rerank.calls)
+	}
+	if len(rerank.inputIDs) != 2 {
+		t.Fatalf("rerank candidates=%v, want only two above-floor candidates", rerank.inputIDs)
+	}
+	for _, id := range rerank.inputIDs {
+		if id == "below-floor-chunk" {
+			t.Fatalf("below-floor candidate reached reranker: %v", rerank.inputIDs)
+		}
+	}
+	if len(hits) != 1 {
+		t.Fatalf("Qwen auto-injection hits=%v, want final Top-1 cap", hits)
 	}
 }
 

@@ -11,16 +11,17 @@ import (
 
 // BUG-20260704：会话消息回复特别慢——根因在 RAG 检索的辅助 LLM 调用无预算。
 //
-// 真机取证：聊天用 SF(快)，但 KB 检索路径的 expandQueries（multi-query+HyDE）和
-// rerankTopK（LLM 重排）都经 router.Route(ctx) 路由到**默认 provider**（实机默认
-// = 本地 ollama qwen3.5:9b，单次补全实测 43s），且**无时间预算**、跑在聊天关键路径上。
-// 每条消息触发 3 次这样的调用 → 累计卡满客户端 180s 超时（[SSE]开始流式响应→Runtime
-// Stream 调用准备 间 180s 零日志，ctx canceled 收尾）。
+// 真机取证：聊天用 SF(快)，但 KB 检索路径的 expandQueries（并行 multi-query+HyDE）
+// 经 router.Route(ctx) 路由到**默认 provider**（实机默认=本地 ollama qwen3.5:9b，单次
+// 补全实测 43s），且此前**无时间预算**、跑在聊天关键路径上。辅助生成占住本地单槽后，
+// 主聊天只能排队，最终卡满客户端超时。
 //
-// 契约：RAG 辅助 LLM（查询扩展 / LLM 重排）是**增强**，绝不能把聊天关键路径拖过预算——
+// 契约：RAG 辅助 LLM（查询扩展 / contextual-ingest）是**增强**，绝不能把聊天关键路径拖过预算——
 //   ① 每次辅助 LLM 调用必须带时间预算（不继承整请求 ctx 的漫长余量）；
 //   ② 慢/失败时降级到确定性检索（向量+BM25+MMR），聊天照常出结果；
 //   ③ 连续慢/失败达阈值即熔断开闸，冷却期内直接跳过辅助 LLM（零延迟），不每条消息重付预算。
+//
+// 文档重排不复用该聊天 LLM；仅显式专用 cross-encoder 可以执行重排，无 executor 时走 MMR。
 //
 // 修复对齐同生态 engine 记忆召回熔断（[[project_session_2026_07_03_fullstack_review_graceful_exit]]），
 // provider 无关：无论辅助 LLM 路由到本地慢模型还是偶发慢的云端，都不阻塞聊天。
@@ -58,8 +59,8 @@ func (f *fakeAuxLLM) Complete(ctx context.Context, _ string) (string, error) {
 	}
 }
 
-// ragAuxMgr 构造一个 rerank+expand 全开、注入 fakeAuxLLM 的 Manager，并塞 ≥2 篇文档
-// （rerank 仅在候选池 >1 时触发）。embedder 用确定性 scriptedEmbedder。
+// ragAuxMgr 构造一个 expand 开启、rerank 未注入专用 executor 的 Manager，并塞 ≥2 篇文档
+// 以同时覆盖查询扩展和 MMR 降级。embedder 用确定性 scriptedEmbedder。
 func ragAuxMgr(t *testing.T, llm RerankLLM) *Manager {
 	t.Helper()
 	db := setupTestDB(t)
@@ -102,7 +103,7 @@ func TestRAGAuxLLM_BoundedCtx(t *testing.T) {
 	}
 
 	if f.calls.Load() == 0 {
-		t.Fatal("辅助 LLM 未被调用——脚手架未触发 expand/rerank，测试无效")
+		t.Fatal("辅助 LLM 未被调用——脚手架未触发 query-expand，测试无效")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -190,6 +191,6 @@ func TestRAGAuxLLM_FastModelStillInvoked(t *testing.T) {
 		t.Fatalf("search: %v", err)
 	}
 	if f.calls.Load() == 0 {
-		t.Fatal("健康快模型下辅助 LLM（expand/rerank）应照常调用——预算/熔断误伤了正常路径")
+		t.Fatal("健康快模型下 query-expand 辅助 LLM 应照常调用——预算/熔断误伤了正常路径")
 	}
 }

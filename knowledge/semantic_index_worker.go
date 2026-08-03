@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/localinfer"
 	"github.com/hexagon-codes/hexclaw/resourcegov"
 )
 
@@ -109,6 +110,7 @@ type SemanticIndexWorker struct {
 	registry        ProfileEmbeddingExecutorRegistry
 	ingestProcessor DocumentIngestProcessor
 	governor        *resourcegov.Governor
+	localInference  *localinfer.Coordinator
 	config          SemanticIndexWorkerConfig
 }
 
@@ -116,6 +118,10 @@ type SemanticIndexWorkerOption func(*SemanticIndexWorker)
 
 func WithSemanticWorkerResourceGovernor(governor *resourcegov.Governor) SemanticIndexWorkerOption {
 	return func(worker *SemanticIndexWorker) { worker.governor = governor }
+}
+
+func WithSemanticWorkerLocalInferenceCoordinator(coordinator *localinfer.Coordinator) SemanticIndexWorkerOption {
+	return func(worker *SemanticIndexWorker) { worker.localInference = coordinator }
 }
 
 func NewSemanticIndexWorker(
@@ -307,6 +313,7 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 		// that ignore it remain at-least-once.
 		vectors, providerBegan, err := w.invokeEmbeddingBatch(
 			ctx, lease, manifest, executor, texts, embeddingTimeout,
+			plan.Snapshot.Profile.Location == ProviderLocationLocal,
 		)
 		if err != nil {
 			if providerBegan && isEmbeddingBatchOutcomeUnknown(err) {
@@ -390,9 +397,39 @@ func (w *SemanticIndexWorker) invokeEmbeddingBatch(
 	executor ProfileEmbeddingExecutor,
 	texts []string,
 	timeout time.Duration,
+	local bool,
 ) (vectors [][]float32, providerBegan bool, err error) {
-	var permit *resourcegov.Permit
-	if w.governor != nil {
+	// Readiness may perform its own physical probe. Complete that call before
+	// creating the provider prelease, whose single borrow belongs exclusively to
+	// the real embedding request after the durable Begin boundary.
+	if readiness, ok := executor.(ProfileEmbeddingExecutorReadiness); ok {
+		readinessCtx := ctx
+		if local {
+			readinessCtx = localinfer.WithOperation(readinessCtx, localinfer.OperationProbe)
+		}
+		if !readiness.EmbeddingReady(readinessCtx) {
+			return nil, false, ErrEmbeddingUnavailable
+		}
+	}
+	var (
+		permit         *resourcegov.Permit
+		inferenceLease *localinfer.Lease
+	)
+	if w.localInference != nil && local {
+		ctx, inferenceLease, err = w.localInference.Acquire(
+			localinfer.WithOperation(ctx, localinfer.OperationDocumentEmbedding),
+			localinfer.OperationDocumentEmbedding,
+		)
+		if err != nil {
+			return nil, false, err
+		}
+		defer func() {
+			if len(vectors) > 0 {
+				inferenceLease.MarkFirstOutput()
+			}
+			inferenceLease.Finish(err)
+		}()
+	} else if w.localInference == nil && w.governor != nil && local {
 		permit, err = w.governor.Acquire(
 			ctx, resourcegov.ResourceAccelerator, resourcegov.PriorityBackground,
 		)
@@ -400,18 +437,20 @@ func (w *SemanticIndexWorker) invokeEmbeddingBatch(
 			return nil, false, err
 		}
 		defer permit.Release()
-		// Resource wait may consume most of a lease. Fence again before the
-		// durable provider boundary so a stale worker never starts a call.
-		if err = w.renewLease(ctx, lease); err != nil {
-			return nil, false, err
-		}
+	}
+	// Admission can consume most of a lease, while cloud calls intentionally
+	// bypass local admission. Both paths must refresh the same durable fence
+	// after manifest preparation and immediately before BeginEmbeddingBatch.
+	if err = w.renewLease(ctx, lease); err != nil {
+		return nil, false, err
 	}
 	if err = w.repository.BeginEmbeddingBatch(ctx, *lease, w.now(), manifest.BatchID); err != nil {
 		return nil, false, err
 	}
 	providerBegan = true
 	embedRequestCtx := withEmbeddingBatchClientRequestKey(
-		ragEmbedContext(ctx), manifest.ClientRequestKey,
+		localinfer.WithOperation(ragEmbedContext(ctx), localinfer.OperationDocumentEmbedding),
+		manifest.ClientRequestKey,
 	)
 	embedCtx, cancelEmbed := context.WithTimeout(embedRequestCtx, timeout)
 	defer cancelEmbed()

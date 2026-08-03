@@ -9,11 +9,12 @@ import (
 	"github.com/hexagon-codes/hexagon"
 )
 
-// BUG-20260704：本地聊天回复慢到 ~57s（直连 ollama 裸测 TTFT 仅 0.66s）。根因=KB 检索的辅助
-// LLM（查询扩展 / LLM 重排）经 router 路由到默认 provider（实机默认=本地 Ollama），而 ollama
+// BUG-20260704：本地聊天回复慢到 ~57s（直连 ollama 裸测 TTFT 仅 0.66s）。根因=KB 查询扩展的
+// 辅助 LLM 经 router 路由到默认 provider（实机默认=本地 Ollama），而 ollama
 // 常 `-np 1` 单槽——后台辅助调用与前台主聊天生成争抢同一槽，辅助即使客户端预算取消，服务端仍占
 // 槽跑完，主回复被迫排在其后造成头阻塞。契约：辅助 LLM 路由到**本地 provider** 时必须跳过
-// （退化确定性检索），绝不占用本地稀缺算力与前台竞争；云端 provider 照常。
+// （退化确定性检索），绝不占用本地稀缺算力与前台竞争；云端 provider 照常。文档重排不走该
+// 聊天 LLM 适配器，只接受显式专用 cross-encoder；未配置时使用 MMR。
 type recordingProvider struct{ called *bool }
 
 func (p *recordingProvider) Name() string { return "rec" }

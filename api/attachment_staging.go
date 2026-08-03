@@ -22,10 +22,11 @@ import (
 )
 
 const (
-	maxStagedAttachmentBytes      = 20 << 20
-	maxStagedAttachmentEntries    = 256
-	maxStagedAttachmentTotalBytes = 512 << 20
-	stagedAttachmentTTL           = 15 * time.Minute
+	maxChatFileBytes              int64 = 200 << 20
+	maxStagedAttachmentBytes            = maxChatFileBytes
+	maxStagedAttachmentEntries          = 256
+	maxStagedAttachmentTotalBytes       = 512 << 20
+	stagedAttachmentTTL                 = 15 * time.Minute
 )
 
 var (

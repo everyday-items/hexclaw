@@ -2,8 +2,11 @@ package knowledge
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/hexagon-codes/hexclaw/localinfer"
 )
 
 // RetrievalLane identifies a privacy-safe execution lane. Query text, document
@@ -31,9 +34,92 @@ type RetrievalLaneMetrics struct {
 }
 
 type RetrievalMetricsSnapshot struct {
-	Vector RetrievalLaneMetrics `json:"vector"`
-	FTS    RetrievalLaneMetrics `json:"fts"`
-	Like   RetrievalLaneMetrics `json:"like"`
+	Vector         RetrievalLaneMetrics       `json:"vector"`
+	FTS            RetrievalLaneMetrics       `json:"fts"`
+	Like           RetrievalLaneMetrics       `json:"like"`
+	Rerank         RerankMetrics              `json:"rerank"`
+	LocalInference localinfer.MetricsSnapshot `json:"local_inference"`
+}
+
+type RerankSkipReason string
+
+const (
+	RerankSkipDisabled        RerankSkipReason = "disabled"
+	RerankSkipInsufficient    RerankSkipReason = "insufficient_candidates"
+	RerankSkipNoExecutor      RerankSkipReason = "no_executor"
+	RerankSkipExecutionFailed RerankSkipReason = "execution_failed"
+	RerankSkipEmptyResult     RerankSkipReason = "empty_result"
+)
+
+var allRerankSkipReasons = [...]RerankSkipReason{
+	RerankSkipDisabled,
+	RerankSkipInsufficient,
+	RerankSkipNoExecutor,
+	RerankSkipExecutionFailed,
+	RerankSkipEmptyResult,
+}
+
+type RerankMetrics struct {
+	Configured uint64                      `json:"configured"`
+	Eligible   uint64                      `json:"eligible"`
+	Executed   uint64                      `json:"executed"`
+	Succeeded  uint64                      `json:"succeeded"`
+	Failed     uint64                      `json:"failed"`
+	Skipped    map[RerankSkipReason]uint64 `json:"skipped"`
+}
+
+type rerankMetricsCollector struct {
+	mu      sync.Mutex
+	metrics RerankMetrics
+}
+
+func (c *rerankMetricsCollector) observe(
+	configured, eligible, executed, succeeded bool,
+	reason RerankSkipReason,
+) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if configured {
+		c.metrics.Configured++
+	}
+	if eligible {
+		c.metrics.Eligible++
+	}
+	if executed {
+		c.metrics.Executed++
+	}
+	if succeeded {
+		c.metrics.Succeeded++
+	} else if executed {
+		c.metrics.Failed++
+	}
+	if reason != "" {
+		if c.metrics.Skipped == nil {
+			c.metrics.Skipped = make(map[RerankSkipReason]uint64, len(allRerankSkipReasons))
+		}
+		c.metrics.Skipped[reason]++
+	}
+}
+
+func (c *rerankMetricsCollector) snapshot() RerankMetrics {
+	result := RerankMetrics{Skipped: make(map[RerankSkipReason]uint64, len(allRerankSkipReasons))}
+	if c == nil {
+		return result
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result.Configured = c.metrics.Configured
+	result.Eligible = c.metrics.Eligible
+	result.Executed = c.metrics.Executed
+	result.Succeeded = c.metrics.Succeeded
+	result.Failed = c.metrics.Failed
+	for _, reason := range allRerankSkipReasons {
+		result.Skipped[reason] = c.metrics.Skipped[reason]
+	}
+	return result
 }
 
 type retrievalLaneCounter struct {
@@ -131,7 +217,16 @@ func (m *Manager) RetrievalMetricsSnapshot() RetrievalMetricsSnapshot {
 	if m == nil {
 		return RetrievalMetricsSnapshot{}
 	}
-	return m.retrievalMetrics.snapshot()
+	snapshot := m.retrievalMetrics.snapshot()
+	snapshot.Rerank = m.rerankMetrics.snapshot()
+	if m.localInference != nil {
+		snapshot.LocalInference = m.localInference.Snapshot()
+	} else {
+		snapshot.LocalInference = localinfer.MetricsSnapshot{
+			Operations: map[localinfer.Operation]localinfer.OperationMetrics{},
+		}
+	}
+	return snapshot
 }
 
 type retrievalMetricsContextKey struct{}

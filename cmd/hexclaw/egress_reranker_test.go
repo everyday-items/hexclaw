@@ -8,11 +8,125 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/hexagon/rag"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/egress"
+	"github.com/hexagon-codes/hexclaw/localinfer"
+	"github.com/hexagon-codes/hexclaw/resourcegov"
 )
+
+type coordinatedRerankerDouble struct{ calls int }
+
+func (*coordinatedRerankerDouble) Name() string { return "coordinated-reranker-double" }
+func (r *coordinatedRerankerDouble) Rerank(
+	_ context.Context,
+	_ string,
+	docs []rag.Document,
+) ([]rag.Document, error) {
+	r.calls++
+	return docs, nil
+}
+
+func TestCoordinateRerankerForProviderUsesSharedSlotOnlyForLocalRuntime(t *testing.T) {
+	governor, err := resourcegov.New(resourcegov.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(governor.Close)
+	coordinator := localinfer.New(governor)
+	hold, err := governor.Acquire(
+		context.Background(), resourcegov.ResourceLocalInference, resourcegov.PriorityInteractive,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	localNext := &coordinatedRerankerDouble{}
+	local := coordinateRerankerForProvider(localNext, "private-rerank", config.LLMProviderConfig{
+		BaseURL: "http://127.0.0.1:8088/v1", Locality: config.ProviderLocalityLocal,
+	}, coordinator)
+	localCtx, cancelLocal := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelLocal()
+	if _, err := local.Rerank(localCtx, "q", []rag.Document{{ID: "a"}}); err == nil {
+		t.Fatal("local reranker bypassed occupied local inference slot")
+	}
+	if localNext.calls != 0 {
+		t.Fatalf("local physical reranker calls=%d while queued", localNext.calls)
+	}
+
+	cloudNext := &coordinatedRerankerDouble{}
+	cloud := coordinateRerankerForProvider(cloudNext, "cloud-rerank", config.LLMProviderConfig{
+		BaseURL: "https://rerank.example.com/v1", Locality: config.ProviderLocalityCloud,
+	}, coordinator)
+	if _, err := cloud.Rerank(context.Background(), "q", []rag.Document{{ID: "a"}}); err != nil {
+		t.Fatal(err)
+	}
+	if cloudNext.calls != 1 {
+		t.Fatalf("cloud reranker calls=%d, want 1", cloudNext.calls)
+	}
+	hold.Release()
+
+	if got := coordinator.Snapshot().Operations[localinfer.OperationRerank]; got.Attempts != 1 || got.Cancelled != 1 {
+		t.Fatalf("local rerank admission metrics=%+v", got)
+	}
+}
+
+func TestGuardedLocalRerankerRejectsBeforeAdmission(t *testing.T) {
+	governor, err := resourcegov.New(resourcegov.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(governor.Close)
+	coordinator := localinfer.New(governor)
+	next := &coordinatedRerankerDouble{}
+	guardErr := errors.New("policy rejected canary")
+	reranker := guardedDocReranker{
+		next: coordinateRerankerForProvider(next, "private-rerank", config.LLMProviderConfig{
+			BaseURL: "http://127.0.0.1:8088/v1", Locality: config.ProviderLocalityLocal,
+		}, coordinator),
+		guard: func(context.Context) error { return guardErr },
+	}
+	if _, err := reranker.Rerank(context.Background(), "q", []rag.Document{{ID: "a"}}); !errors.Is(err, guardErr) {
+		t.Fatalf("guard error=%v, want %v", err, guardErr)
+	}
+	if next.calls != 0 {
+		t.Fatalf("guard rejection reached physical reranker: calls=%d", next.calls)
+	}
+	if got := coordinator.Snapshot().Operations[localinfer.OperationRerank].Attempts; got != 0 {
+		t.Fatalf("guard rejection acquired local slot: attempts=%d", got)
+	}
+}
+
+func TestCoordinatedLocalRerankerBudgetIncludesQueueWait(t *testing.T) {
+	governor, err := resourcegov.New(resourcegov.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(governor.Close)
+	hold, err := governor.Acquire(
+		context.Background(), resourcegov.ResourceLocalInference, resourcegov.PriorityInteractive,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hold.Release()
+	next := &coordinatedRerankerDouble{}
+	reranker := coordinatedDocReranker{
+		next: next, coordinator: localinfer.New(governor), timeout: 20 * time.Millisecond,
+	}
+	started := time.Now()
+	if _, err := reranker.Rerank(context.Background(), "q", []rag.Document{{ID: "a"}}); err == nil {
+		t.Fatal("queued local reranker ignored total budget")
+	}
+	if elapsed := time.Since(started); elapsed < 10*time.Millisecond || elapsed > 250*time.Millisecond {
+		t.Fatalf("queued local reranker elapsed=%s, want injected ~20ms budget", elapsed)
+	}
+	if next.calls != 0 {
+		t.Fatalf("timed-out queue reached physical reranker: calls=%d", next.calls)
+	}
+}
 
 func TestSafeCohereRerankerUsesGuardedOriginAndMapsScores(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {

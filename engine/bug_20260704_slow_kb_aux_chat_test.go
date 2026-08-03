@@ -20,12 +20,13 @@ import (
 	sqlitestore "github.com/hexagon-codes/hexclaw/storage/sqlite"
 )
 
-// BUG-20260704 引擎层集成：模拟真实用户请求，验证 KB 辅助 LLM（查询扩展/LLM 重排）
+// BUG-20260704 引擎层集成：模拟真实用户请求，验证 KB 查询扩展辅助 LLM
 // 慢时，聊天关键路径（eng.Process / eng.ProcessStream）不被拖垮。
 //
-// 真机现象：主聊天走 SF（快，"思考 4s"），但每条消息的 KB 检索把 expand/rerank 路由到
+// 真机现象：主聊天走 SF（快，"思考 4s"），但每条消息的 KB 检索把 query-expand 路由到
 // 本地 43s 慢模型（无预算）→ 模型开始生成前卡 180s。这里用**慢辅助 LLM + 快主 provider**
 // 复刻该场景，走真实 Process/ProcessStream 全链路断言修复生效。
+// 文档重排只接受显式专用 cross-encoder；本测试未注入 executor，因此确定性降级到 MMR。
 //
 // 与 knowledge 单元锁（bug_20260704_rag_aux_llm_budget_test.go）互补：单元证明 Manager
 // 层预算+熔断，本集成证明它在引擎注入点（react.go e.kb.Query）真实兜住聊天。
@@ -104,8 +105,8 @@ func (e *slowAuxEmbedder) lookup(t string) []float32 {
 	return []float32{0, 0, 0, 1} // 未知文本：与 query 基正交
 }
 
-// newEngineWithSlowAuxKB 构造 engine + KB（rerank+expand 开、注入 slowAuxLLM、含 2 篇
-// 与 query 对齐的文档以触发 rerank 池 >1），并用快主 provider。
+// newEngineWithSlowAuxKB 构造 engine + KB（expand 开、rerank 无专用 executor、注入
+// slowAuxLLM、含 2 篇与 query 对齐的文档以覆盖 MMR 候选池），并用快主 provider。
 func newEngineWithSlowAuxKB(t *testing.T, provider hexagon.Provider, aux knowledge.RerankLLM) *ReActEngine {
 	t.Helper()
 	dir := t.TempDir()
@@ -180,7 +181,7 @@ func TestSlowKBAux_R1_ProcessNotBlocked(t *testing.T) {
 	if el >= 15*time.Second {
 		t.Fatalf("辅助 LLM 慢时 Process 耗时 %v ≥ 15s——聊天关键路径被拖垮", el)
 	}
-	t.Logf("R1 Process elapsed=%v（并行 expand 两路 2.5s 预算超时→阈值2 开闸→rerank 跳过 + 快主回复）", el)
+	t.Logf("R1 Process elapsed=%v（并行 expand 两路 2.5s 预算超时→阈值2 开闸→MMR 降级 + 快主回复）", el)
 }
 
 // R2（多轮·熔断）：连续多条消息，辅助 LLM 持续慢 → 熔断开闸，后续消息不再打辅助 LLM，

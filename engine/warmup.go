@@ -18,6 +18,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/egress"
+	"github.com/hexagon-codes/hexclaw/localinfer"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
@@ -69,6 +70,7 @@ func (h *WarmupHandle) finish(err error) {
 // 返回 warmed=false 表示默认路由非本地、按设计跳过（云端无预热需求）。
 func (e *ReActEngine) WarmupLocalDefaultModel(ctx context.Context) (warmed bool, err error) {
 	ctx = egress.WithRequest(ctx, egress.PurposeGeneralChat, "warmup", egress.ClassGeneral)
+	ctx = localinfer.WithOperation(ctx, localinfer.OperationWarmup)
 	// 与日常提问同构的普通中文短句：工具渐进召回（CollectFiltered 按 query）对无关键词
 	// 文本返回基础工具集——与多数真实首问相同，前缀才能命中。
 	msg := &adapter.Message{
@@ -129,6 +131,7 @@ func (e *ReActEngine) WarmupLocalDefaultModel(ctx context.Context) (warmed bool,
 	if cerr != nil {
 		return true, cerr
 	}
+	defer stream.Close()
 	for range stream.Chunks() {
 		// 排空至流结束（num_predict=1，产出即止）
 	}

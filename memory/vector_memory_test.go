@@ -3,10 +3,82 @@ package memory
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/ai-core/store/vector"
 	"github.com/hexagon-codes/hexclaw/egress"
+	"github.com/hexagon-codes/hexclaw/localinfer"
 )
+
+type vectorMemoryOperationCaptureEmbedder struct {
+	operation     localinfer.Operation
+	deadline      time.Time
+	deadlineOK    bool
+	embedOneCalls int
+}
+
+func (*vectorMemoryOperationCaptureEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+	return [][]float32{{1, 0, 0}}, nil
+}
+
+func (e *vectorMemoryOperationCaptureEmbedder) EmbedOne(ctx context.Context, _ string) ([]float32, error) {
+	e.embedOneCalls++
+	e.operation = localinfer.OperationFromContext(ctx, localinfer.Operation("missing"))
+	e.deadline, e.deadlineOK = ctx.Deadline()
+	return []float32{1, 0, 0}, nil
+}
+
+func (*vectorMemoryOperationCaptureEmbedder) Dimension() int { return 3 }
+
+func TestVectorMemoryEmbedOneCarriesPurposeSpecificOperationAndParentDeadline(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation localinfer.Operation
+		invoke    func(context.Context, *VectorMemory) error
+	}{
+		{
+			name:      "save is document embedding",
+			operation: localinfer.OperationDocumentEmbedding,
+			invoke: func(ctx context.Context, vm *VectorMemory) error {
+				return vm.Save(ctx, "remember this", nil)
+			},
+		},
+		{
+			name:      "search is query embedding",
+			operation: localinfer.OperationQueryEmbedding,
+			invoke: func(ctx context.Context, vm *VectorMemory) error {
+				_, err := vm.Search(ctx, "recall this", 1)
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := vector.NewMemoryStore(3)
+			embedder := &vectorMemoryOperationCaptureEmbedder{}
+			vm := NewVectorMemory(store, embedder, VectorMemoryConfig{MinScore: 0.1})
+			t.Cleanup(func() { _ = vm.Close() })
+			parentDeadline := time.Now().Add(time.Hour)
+			ctx, cancel := context.WithDeadline(context.Background(), parentDeadline)
+			t.Cleanup(cancel)
+
+			if err := test.invoke(ctx, vm); err != nil {
+				t.Fatal(err)
+			}
+			if embedder.embedOneCalls != 1 {
+				t.Fatalf("EmbedOne calls=%d, want 1", embedder.embedOneCalls)
+			}
+			if embedder.operation != test.operation {
+				t.Fatalf("operation=%q, want %q", embedder.operation, test.operation)
+			}
+			if !embedder.deadlineOK || !embedder.deadline.Equal(parentDeadline) {
+				t.Fatalf("deadline=(%v,%v), want parent deadline %v",
+					embedder.deadline, embedder.deadlineOK, parentDeadline)
+			}
+		})
+	}
+}
 
 func TestVectorMemory_SaveAndSearch(t *testing.T) {
 	// 使用 hexagon 的内存向量存储

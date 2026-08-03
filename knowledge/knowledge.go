@@ -34,6 +34,7 @@ import (
 	hrag "github.com/hexagon-codes/hexagon/rag"
 	ragquery "github.com/hexagon-codes/hexagon/rag/query"
 	"github.com/hexagon-codes/hexagon/rag/reranker"
+	"github.com/hexagon-codes/hexclaw/localinfer"
 	"github.com/hexagon-codes/hexclaw/resourcegov"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"github.com/hexagon-codes/toolkit/util/logger"
@@ -251,10 +252,10 @@ func nonEmptyStrings(in []string) []string {
 type HybridConfig struct {
 	VectorWeight  float64 // 向量搜索权重，默认 0.7（仅 UseRRF=false 的加权和回退路径用）
 	TextWeight    float64 // 关键词搜索权重，默认 0.3（同上）
-	MMRLambda     float64 // MMR 多样性参数 (0=最多样, 1=最相关)，默认 0.7（无 LLM 重排时的兜底排序）
+	MMRLambda     float64 // MMR 多样性参数 (0=最多样, 1=最相关)，默认 0.7（无专用 reranker 时的兜底排序）
 	TimeDecayDays int     // 时间衰减半衰期（天），默认 30，0=不衰减
 
-	// ── best-practice 检索参数（RRF 融合 + LLM 重排 + 查询扩展 + 相关度地板）──
+	// ── best-practice 检索参数（RRF 融合 + 专用重排 + 查询扩展 + 相关度地板）──
 	// MinScore 向量相关度地板（作用于余弦归一分 (cos+1)/2 ∈ [0,1]），默认 0.85；0=关。
 	// 0.85 为真机标定值（BUG-20260712-O，nomic-embed-text 中文实测）：无关对归一分
 	// 0.754~0.820（旧默认 0.55=cos 0.1 形同虚设，天气 query 曾放行《Go面试题》），
@@ -263,7 +264,7 @@ type HybridConfig struct {
 	CandidateK    int     // 宽召回候选池大小（rerank 前 over-retrieve），默认 50
 	RRFK          float64 // RRF 融合常数 k，默认 60（业界标准，Cormack et al. SIGIR 2009）
 	UseRRF        bool    // true=用 RRF 融合替代朴素加权和（量纲不可比），默认 true
-	RerankEnabled bool    // true=启用 LLM 重排（需 WithLLM 注入），默认 true
+	RerankEnabled bool    // true=尝试专用重排（需 WithDocReranker）；无 executor 时使用 MMR，默认 true
 	ExpandEnabled bool    // true=启用 HyDE + multi-query 查询扩展（需 WithLLM 注入），默认 true
 
 	ContextualEnabled bool // true=入库时给 chunk 前置文档级上下文（Anthropic Contextual Retrieval），默认 true
@@ -359,10 +360,20 @@ type Manager struct {
 	// 不能与 active revision 向量混用。
 	revisionSearcher RevisionSemanticSearcher
 	splitter         hexagon.Splitter  // hexagon 文本分块器
-	llm              RerankLLM         // 查询扩展 / contextual-ingest / LLM 兜底重排用的 LLM（可为 nil → 自动降级）
-	reranker         reranker.Reranker // 专用文档重排器（如 cross-encoder via /rerank）；nil 时退回 LLM 重排
+	llm              RerankLLM         // 查询扩展 / contextual-ingest 用的辅助 LLM（可为 nil → 自动降级）
+	reranker         reranker.Reranker // 专用文档重排器（如 cross-encoder via /rerank）；nil 时 MMR 降级
 	captioner        Captioner         // 图像转写器（VLM caption）；nil 时 AddImageDocument 优雅报错（见 multimodal.go）
 	resourceGovernor *resourcegov.Governor
+	localInference   *localinfer.Coordinator
+	// embeddingLocationConfigured distinguishes an explicitly remote legacy
+	// embedder (which must bypass local admission) from old call sites that did
+	// not declare locality and retain conservative accelerator admission.
+	embeddingLocationConfigured bool
+	embeddingLocation           ProviderLocation
+	// legacyEmbeddingProfile is an exact-model execution policy for the
+	// Manager-owned bare-vector fallback. Revision searchers carry their own
+	// immutable profile and never consult this field.
+	legacyEmbeddingProfile *EmbeddingExecutionProfile
 
 	// config 混合检索配置。atomic.Pointer 使其可在运行时被 SetHybridConfig 原子热替换
 	// （检索参数面板 PUT /knowledge/config），而读路径（searchResults 等）在并发检索时
@@ -372,18 +383,18 @@ type Manager struct {
 	// snapshotRetention 每个快照系列保留的最大文档数（IngestSnapshot 用）；0=不限。
 	snapshotRetention int
 
-	// auxBreaker RAG 辅助 LLM（查询扩展 / LLM 重排）的预算熔断状态（BUG-20260704）；
+	// auxBreaker RAG 辅助 LLM（查询扩展 / contextual-ingest）的预算熔断状态（BUG-20260704）；
 	// 跨检索共享，慢 provider 连续超预算即开闸冷却，期间纯确定性检索。零值可用。
 	auxBreaker auxLLMBreaker
 
 	// retrievalMetrics 是不含查询内容的进程内聚合指标。每个请求经 context 将它传递到
 	// FTS/LIKE 与向量 lane，既能量化中文 LIKE 降级，也不泄露教材内容。
 	retrievalMetrics retrievalMetricsCollector
+	rerankMetrics    rerankMetricsCollector
 }
 
-// retrievalLLM 返回带预算+熔断的辅助 LLM，用于聊天关键路径上的查询扩展 / LLM 重排
-// （BUG-20260704）；m.llm 为 nil 时返回 nil（调用方自动降级）。与原始 m.llm 区分：
-// 后者仍供离线 contextual-ingest 用（非关键路径，可容忍慢），不加预算。
+// retrievalLLM 返回带预算+熔断的辅助 LLM，用于查询扩展 / contextual-ingest
+// （BUG-20260704）；m.llm 为 nil 时返回 nil（调用方自动降级）。
 func (m *Manager) retrievalLLM() RerankLLM {
 	if m.llm == nil {
 		return nil
@@ -391,8 +402,9 @@ func (m *Manager) retrievalLLM() RerankLLM {
 	return &budgetedRerankLLM{inner: m.llm, breaker: &m.auxBreaker}
 }
 
-// RerankLLM 是重排 / 查询扩展 / contextual-ingest 所需的最小 LLM 能力面（单 prompt 补全）。
-// 与 hexagon rag/reranker、rag/query 的 LLMProvider 接口同形，可直接复用同一适配器。
+// RerankLLM 是为兼容历史 API 保留名称的单 prompt 补全能力面。Manager 仅将它用于查询扩展
+// 与 contextual-ingest；文档重排必须通过 WithDocReranker 注入专用 reranker。
+// 忠实性离线评测也可复用该接口作为 LLM judge。
 type RerankLLM interface {
 	Complete(ctx context.Context, prompt string) (string, error)
 }
@@ -450,14 +462,48 @@ func WithResourceGovernor(governor *resourcegov.Governor) ManagerOption {
 	return func(m *Manager) { m.resourceGovernor = governor }
 }
 
-// WithLLM 注入重排 / 查询扩展 / contextual-ingest 所用的 LLM（通常复用 Agent 的 LLM router）。
-// 不注入时，rerank / query-expand / contextual 自动降级关闭（省成本，安全）。
+// WithLocalInferenceCoordinator replaces only legacy embedding admission with
+// the shared local-model boundary. Other Manager resources (VLM/CPU/SQLite)
+// continue to use WithResourceGovernor.
+func WithLocalInferenceCoordinator(coordinator *localinfer.Coordinator) ManagerOption {
+	return func(m *Manager) { m.localInference = coordinator }
+}
+
+// WithEmbeddingProviderLocation declares where the Manager-owned legacy
+// embedder physically executes. Cloud embedders never consume the local model
+// slot; local embedders use the coordinator when enabled and the legacy
+// governor when the feature flag is rolled back.
+func WithEmbeddingProviderLocation(location ProviderLocation) ManagerOption {
+	return func(m *Manager) {
+		if location != ProviderLocationLocal && location != ProviderLocationCloud {
+			return
+		}
+		m.embeddingLocationConfigured = true
+		m.embeddingLocation = location
+	}
+}
+
+// WithLegacyEmbeddingModel preserves an exact model's execution policy when
+// the revision runtime is unavailable or not installed. Unknown models retain
+// the existing generic Manager budgets; family-name guesses are forbidden.
+func WithLegacyEmbeddingModel(model string) ManagerOption {
+	return func(m *Manager) {
+		profile, ok := EmbeddingExecutionProfileForModel(model)
+		if !ok {
+			return
+		}
+		m.legacyEmbeddingProfile = &profile
+	}
+}
+
+// WithLLM 注入查询扩展 / contextual-ingest 所用的辅助 LLM（通常复用 Agent 的 LLM router）。
+// 不注入时这些增强自动降级；文档重排独立使用 WithDocReranker，缺失时使用 MMR。
 func WithLLM(llm RerankLLM) ManagerOption {
 	return func(m *Manager) { m.llm = llm }
 }
 
 // WithDocReranker 注入专用文档重排器（如 cross-encoder via /rerank 接口）。
-// 优先于 LLM-as-reranker——更快、更省、质量同级或更好。未注入则退回 LLM 重排。
+// 未注入时使用确定性 MMR；聊天模型不作为隐式重排器。
 func WithDocReranker(r reranker.Reranker) ManagerOption {
 	return func(m *Manager) { m.reranker = r }
 }
@@ -503,6 +549,55 @@ func (m *Manager) acquireResource(
 		return nil, nil
 	}
 	return m.resourceGovernor.Acquire(ctx, resource, priority)
+}
+
+func (m *Manager) acquireEmbedding(
+	ctx context.Context,
+	operation localinfer.Operation,
+	legacyPriority resourcegov.Priority,
+) (context.Context, *localinfer.Lease, *resourcegov.Permit, error) {
+	ctx = localinfer.WithOperation(ctx, operation)
+	if m != nil && m.embeddingLocationConfigured && m.embeddingLocation == ProviderLocationCloud {
+		return ctx, nil, nil, nil
+	}
+	if m != nil && hasProviderBoundEmbeddingAdmission(m.embedder) {
+		return ctx, nil, nil, nil
+	}
+	if m != nil && m.localInference != nil {
+		leaseCtx, lease, err := m.localInference.Acquire(ctx, operation)
+		return leaseCtx, lease, nil, err
+	}
+	permit, err := m.acquireResource(ctx, resourcegov.ResourceAccelerator, legacyPriority)
+	return ctx, nil, permit, err
+}
+
+type providerBoundEmbeddingAdmission interface {
+	LocalInferenceAdmissionAtProviderBoundary() bool
+}
+
+func hasProviderBoundEmbeddingAdmission(value any) bool {
+	marker, ok := value.(providerBoundEmbeddingAdmission)
+	return ok && marker.LocalInferenceAdmissionAtProviderBoundary()
+}
+
+func invokeEmbeddingWithAdmission(
+	ctx context.Context,
+	lease *localinfer.Lease,
+	permit *resourcegov.Permit,
+	invoke func(context.Context) ([][]float32, error),
+) (vectors [][]float32, err error) {
+	if permit != nil {
+		defer permit.Release()
+	}
+	if lease != nil {
+		defer func() {
+			if len(vectors) > 0 {
+				lease.MarkFirstOutput()
+			}
+			lease.Finish(err)
+		}()
+	}
+	return invoke(ctx)
 }
 
 // ─── Command Methods (写路径) ───────────────────────────
@@ -979,9 +1074,9 @@ func chunkMetadata(c *Chunk) map[string]any {
 
 // Query 混合检索知识库，返回格式化的 LLM 上下文。
 //
-// 检索全链路（查询扩展 → 宽召回 → RRF 融合 → 相关度地板 → LLM 重排）
+// 检索全链路（查询扩展 → 宽召回 → RRF 融合 → 相关度地板 → 专用重排或 MMR）
 // 统一落在 Manager.searchResults，无 feature-flag 门控、默认即最佳实践配置；
-// 缺 LLM 时自动降级（跳过 rerank / query-expand），缺 embedder 时退化纯关键词。
+// 缺辅助 LLM 时仅跳过 query-expand；无专用 reranker 时使用 MMR；缺 embedder 时退化纯关键词。
 func (m *Manager) Query(ctx context.Context, query string, topK int) (string, error) {
 	return m.QueryWithFilter(ctx, query, topK, Filter{})
 }
@@ -1192,7 +1287,20 @@ func (m *Manager) searchResultsModeAtRevision(
 		)
 	} else if planner == nil {
 		executionProfile, hasExecutionProfile = m.revisionExecutionProfile(ctx)
+		if !hasExecutionProfile && m.revisionSearcher == nil && m.legacyEmbeddingProfile != nil {
+			executionProfile = *m.legacyEmbeddingProfile
+			hasExecutionProfile = true
+		}
 	}
+	// All expanded queries consume one retrieval-stage budget. Creating a fresh
+	// model deadline per variant would turn five deterministic expansions into a
+	// silent 5x synchronous timeout.
+	vectorTimeout := queryEmbedTimeout
+	if hasExecutionProfile && executionProfile.QueryTimeout > 0 {
+		vectorTimeout = executionProfile.QueryTimeout
+	}
+	vectorCtx, cancelVectorStage := context.WithTimeout(ragEmbedContext(ctx), vectorTimeout)
+	defer cancelVectorStage()
 	receiptRevisionID := ""
 	if planActive {
 		receiptRevisionID = plan.revision
@@ -1203,16 +1311,10 @@ func (m *Manager) searchResultsModeAtRevision(
 			// The plan was resolved once before query expansion and is reused for
 			// every vector scan. An active-revision CAS during this loop cannot
 			// move later queries onto another vector space.
-			timeout := queryEmbedTimeout
-			if hasExecutionProfile && executionProfile.QueryTimeout > 0 {
-				timeout = executionProfile.QueryTimeout
-			}
-			rctx, rcancel := context.WithTimeout(ragEmbedContext(ctx), timeout)
 			vectorStarted := time.Now()
 			vres, ran, receipt, vErr := planner.SearchWithPlanReceipt(
-				rctx, plan, q, candidateK, filter,
+				vectorCtx, plan, q, candidateK, filter,
 			)
-			rcancel()
 			observeRetrievalLane(ctx, RetrievalLaneVector, time.Since(vectorStarted), len(vres), vErr, false)
 			if vErr != nil {
 				if !errors.Is(vErr, ErrEmbeddingUnavailable) {
@@ -1235,11 +1337,6 @@ func (m *Manager) searchResultsModeAtRevision(
 			// Query embedding and vector scan are one revision-bound operation:
 			// both use the immutable active profile snapshot. No fallback to the
 			// legacy embedder is allowed when no active revision exists.
-			timeout := queryEmbedTimeout
-			if hasExecutionProfile && executionProfile.QueryTimeout > 0 {
-				timeout = executionProfile.QueryTimeout
-			}
-			rctx, rcancel := context.WithTimeout(ragEmbedContext(ctx), timeout)
 			vectorStarted := time.Now()
 			var (
 				vres    []*SearchResult
@@ -1249,14 +1346,13 @@ func (m *Manager) searchResultsModeAtRevision(
 			)
 			if source, ok := m.revisionSearcher.(RevisionSemanticReceiptSearcher); ok {
 				vres, ran, receipt, vErr = source.SearchWithReceipt(
-					rctx, q, candidateK, filter,
+					vectorCtx, q, candidateK, filter,
 				)
 			} else {
 				vres, ran, vErr = m.revisionSearcher.Search(
-					rctx, q, candidateK, filter,
+					vectorCtx, q, candidateK, filter,
 				)
 			}
-			rcancel()
 			observeRetrievalLane(ctx, RetrievalLaneVector, time.Since(vectorStarted), len(vres), vErr, false)
 			if vErr != nil {
 				if !errors.Is(vErr, ErrEmbeddingUnavailable) {
@@ -1281,16 +1377,23 @@ func (m *Manager) searchResultsModeAtRevision(
 			// 查询向量化预算（BUG-20260703 同构防护，对齐 engine 记忆召回）：检索是增强，
 			// 不继承整请求 ctx 的漫长余量——慢 embedding 端点超预算即掐断，本轮走纯 BM25。
 			vectorStarted := time.Now()
-			ectx, ecancel := context.WithTimeout(ragEmbedContext(ctx), queryEmbedTimeout)
-			permit, err := m.acquireResource(ectx, resourcegov.ResourceAccelerator, resourcegov.PriorityInteractive)
+			ectx := vectorCtx
+			ectx, inferenceLease, permit, err := m.acquireEmbedding(
+				ectx, localinfer.OperationQueryEmbedding, resourcegov.PriorityQuery,
+			)
 			var qv [][]float32
 			if err == nil {
-				qv, err = m.embedder.Embed(ectx, []string{cfg.EmbedQueryPrefix + q})
+				qv, err = invokeEmbeddingWithAdmission(
+					ectx, inferenceLease, permit,
+					func(callCtx context.Context) ([][]float32, error) {
+						inputs := []string{cfg.EmbedQueryPrefix + q}
+						if hasExecutionProfile {
+							return NewExecutionProfileEmbedder(m.embedder, executionProfile).Embed(callCtx, inputs)
+						}
+						return m.embedder.Embed(callCtx, inputs)
+					},
+				)
 			}
-			if permit != nil {
-				permit.Release()
-			}
-			ecancel()
 			if err != nil {
 				observeRetrievalLane(ctx, RetrievalLaneVector, time.Since(vectorStarted), 0, err, false)
 				if !errors.Is(err, ErrEmbeddingUnavailable) {
@@ -1362,7 +1465,7 @@ func (m *Manager) searchResultsModeAtRevision(
 		candidates, strictFloor, vectorRouteRan, executionProfile, hasExecutionProfile,
 	)
 
-	// 5. 宽召回 → 重排 → 收窄（#6）；无 LLM/关闭时回退 MMR 多样性选取
+	// 5. 宽召回 → 重排 → 收窄（#6）；无专用 executor / 关闭时回退 MMR 多样性选取
 	// A configured revision runtime with no active revision is deliberately
 	// text-only/standby. Keep this entire retrieval deterministic: scoped FTS
 	// remains usable, but neither auxiliary LLM nor a dedicated reranker may run.
@@ -1373,7 +1476,18 @@ func (m *Manager) searchResultsModeAtRevision(
 		}
 		return candidates, receipts, nil
 	}
-	return m.rerankTopK(ctx, query, candidates, topK), receipts, nil
+	// AutoInjectionMaxResults is a publication cap, not a candidate-generation
+	// cap. Keep every above-floor candidate available to the reranker/MMR, then
+	// ask that final selection stage for at most the calibrated injection count.
+	// Applying this cap inside applyMinScoreWithProfile makes a Top-1 profile
+	// structurally unable to rerank because rerankTopK correctly skips pools with
+	// fewer than two candidates.
+	finalTopK := topK
+	if strictFloor && hasExecutionProfile && executionProfile.AutoInjectionMaxResults > 0 &&
+		finalTopK > executionProfile.AutoInjectionMaxResults {
+		finalTopK = executionProfile.AutoInjectionMaxResults
+	}
+	return m.rerankTopK(ctx, query, candidates, finalTopK), receipts, nil
 }
 
 // rankedList 是一路检索的有序候选（带模态：向量 / 文本），用于分数加权 RRF。
@@ -1644,16 +1758,6 @@ func (m *Manager) applyMinScoreWithProfile(
 		}
 		return candidates // 放宽回退：避免地板把结果清空
 	}
-	if strict && hasProfile && profile.AutoInjectionMaxResults > 0 &&
-		len(kept) > profile.AutoInjectionMaxResults {
-		sort.SliceStable(kept, func(i, j int) bool {
-			if kept[i].VectorScore != kept[j].VectorScore {
-				return kept[i].VectorScore > kept[j].VectorScore
-			}
-			return kept[i].Chunk.ID < kept[j].Chunk.ID
-		})
-		kept = kept[:profile.AutoInjectionMaxResults]
-	}
 	return kept
 }
 
@@ -1698,7 +1802,7 @@ func (m *Manager) revisionExecutionProfile(
 }
 
 // rerankTopK 宽召回 → 重排 → 收窄（#6）。
-// 先按融合分降序限定 rerank 输入规模；启用且有 LLM 时走 LLM 重排，否则回退 MMR 多样性。
+// 先按融合分降序限定输入规模；仅显式专用 executor 执行重排，否则回退 MMR 多样性。
 func (m *Manager) rerankTopK(ctx context.Context, query string, candidates []*SearchResult, topK int) []*SearchResult {
 	cfg := m.cfg()
 	sortByScore(candidates)
@@ -1708,30 +1812,39 @@ func (m *Manager) rerankTopK(ctx context.Context, query string, candidates []*Se
 		pool = pool[:maxRerank]
 	}
 
-	if cfg.RerankEnabled && len(pool) > 1 {
-		if rr := m.resolveReranker(topK); rr != nil {
-			if ordered, err := m.rerankWith(ctx, rr, query, pool, topK); err != nil {
-				logger.Warn("[knowledge] 重排失败，回退融合分排序", "reranker", rr.Name(), "error", err)
-			} else if len(ordered) > 0 {
-				return ordered
-			}
-		}
+	if !cfg.RerankEnabled {
+		m.rerankMetrics.observe(false, false, false, false, RerankSkipDisabled)
+		return m.mmrSelect(pool, topK)
+	}
+	if len(pool) <= 1 {
+		m.rerankMetrics.observe(true, false, false, false, RerankSkipInsufficient)
+		return m.mmrSelect(pool, topK)
+	}
+	rr := m.resolveReranker(topK)
+	if rr == nil {
+		m.rerankMetrics.observe(true, true, false, false, RerankSkipNoExecutor)
+		return m.mmrSelect(pool, topK)
+	}
+	ordered, err := m.rerankWith(ctx, rr, query, pool, topK)
+	if err != nil {
+		m.rerankMetrics.observe(true, true, true, false, RerankSkipExecutionFailed)
+		logger.Warn("[knowledge] 重排失败，回退融合分排序", "reranker", rr.Name(), "error", err)
+	} else if len(ordered) == 0 {
+		m.rerankMetrics.observe(true, true, true, false, RerankSkipEmptyResult)
+	} else {
+		m.rerankMetrics.observe(true, true, true, true, "")
+		return ordered
 	}
 	// 回退：MMR 多样性选取（无重排器时仍保留多样性，避免近重复 chunk 占满 topK）
 	return m.mmrSelect(pool, topK)
 }
 
-// resolveReranker 选重排器：专用 cross-encoder（WithDocReranker 注入）优先——更快更省更准；
-// 否则 LLM-as-reranker（复用 chat 模型）；都没有则 nil（退回 MMR）。
+// resolveReranker only accepts an explicitly injected dedicated executor.
+// Reusing the chat model creates head-of-line blocking on local single-slot
+// runtimes and unpredictable cloud cost, so absence deterministically falls
+// back to MMR instead of LLM-as-reranker.
 func (m *Manager) resolveReranker(topK int) reranker.Reranker {
-	if m.reranker != nil {
-		return m.reranker
-	}
-	if m.llm != nil {
-		// BUG-20260704：LLM 重排走带预算+熔断的 retrievalLLM，慢 provider 不阻塞聊天关键路径。
-		return reranker.NewLLMReranker(m.retrievalLLM(), reranker.WithLLMRerankerTopK(topK))
-	}
-	return nil
+	return m.reranker
 }
 
 // rerankWith 用给定重排器对候选精排，按返回顺序映射回 SearchResult 并截到 topK。
@@ -1781,7 +1894,7 @@ func (m *Manager) expandQueries(ctx context.Context, query string) []string {
 
 	// 优化（BUG-20260704 续）：multi-query 与 HyDE 是相互独立的查询变换，并行跑——
 	// 健康路径省一半墙钟（原串行 2×LLM），慢 provider 下两路预算超时并发发生（而非串行叠加），
-	// 更快触发熔断（阈值 2）让后续 rerank 直接跳过。结果按固定顺序 add，输出确定。
+	// 更快触发熔断（阈值 2）让后续辅助生成直接跳过。结果按固定顺序 add，输出确定。
 	var (
 		wg         sync.WaitGroup
 		mqVariants []string
@@ -2020,6 +2133,11 @@ func (m *Manager) buildChunksWithEmbedder(
 
 	var embeddings [][]float32
 	if embedder != nil && len(chunkTexts) > 0 {
+		var legacyProfile *EmbeddingExecutionProfile
+		if m.legacyEmbeddingProfile != nil {
+			profile := *m.legacyEmbeddingProfile
+			legacyProfile = &profile
+		}
 		// #12 文档侧前缀只作用于 embedding 输入；Chunk.Content（FTS/展示）仍用原文。
 		embedTexts := chunkTexts
 		if docPrefix := m.cfg().EmbedDocPrefix; docPrefix != "" {
@@ -2032,19 +2150,28 @@ func (m *Manager) buildChunksWithEmbedder(
 		// 文档批量 Embed 若无独立预算会吞掉上传请求完整的 5 分钟总超时。预算按实际
 		// 批次数增长：百页教材常有 200+ chunks，固定 60 秒只够第一批，后续超时会让
 		// 批处理层连同已完成结果一起丢弃，最终静默变成 0 向量。超时后仍保留 FTS。
-		embedCtx, cancel := context.WithTimeout(ragEmbedContext(ctx), documentEmbeddingBudget(len(embedTexts)))
-		permit, acquireErr := m.acquireResource(
+		embeddingBudget := documentEmbeddingBudget(len(embedTexts))
+		if legacyProfile != nil {
+			embeddingBudget = profiledDocumentEmbeddingBudget(len(embedTexts), *legacyProfile)
+		}
+		embedCtx, cancel := context.WithTimeout(ragEmbedContext(ctx), embeddingBudget)
+		embedCtx, inferenceLease, permit, acquireErr := m.acquireEmbedding(
 			embedCtx,
-			resourcegov.ResourceAccelerator,
+			localinfer.OperationDocumentEmbedding,
 			resourcegov.PriorityFromContext(ctx, resourcegov.PriorityInteractive),
 		)
 		if acquireErr != nil {
 			err = acquireErr
 		} else {
-			embeddings, err = embedder.Embed(embedCtx, embedTexts)
-		}
-		if permit != nil {
-			permit.Release()
+			embeddings, err = invokeEmbeddingWithAdmission(
+				embedCtx, inferenceLease, permit,
+				func(callCtx context.Context) ([][]float32, error) {
+					if legacyProfile != nil {
+						return NewExecutionProfileEmbedder(embedder, *legacyProfile).Embed(callCtx, embedTexts)
+					}
+					return embedder.Embed(callCtx, embedTexts)
+				},
+			)
 		}
 		cancel()
 		if err != nil {
@@ -2108,6 +2235,21 @@ func documentEmbeddingBudget(chunkCount int) time.Duration {
 		batches = 1
 	}
 	budget := time.Duration(batches) * documentEmbeddingTimeout
+	if budget > maxDocumentEmbeddingTimeout {
+		return maxDocumentEmbeddingTimeout
+	}
+	return budget
+}
+
+func profiledDocumentEmbeddingBudget(
+	inputCount int,
+	profile EmbeddingExecutionProfile,
+) time.Duration {
+	if inputCount < 1 || profile.BatchMaxCount <= 0 || profile.BatchTimeout <= 0 {
+		return documentEmbeddingBudget(inputCount)
+	}
+	batches := (inputCount + profile.BatchMaxCount - 1) / profile.BatchMaxCount
+	budget := time.Duration(batches) * profile.BatchTimeout
 	if budget > maxDocumentEmbeddingTimeout {
 		return maxDocumentEmbeddingTimeout
 	}

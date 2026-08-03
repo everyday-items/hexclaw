@@ -149,6 +149,7 @@ func TestVerifyReleaseLinksEveryProductionFlagOwner(t *testing.T) {
 		"config.tx.hotload.v1",
 		"eval.framework.v1",
 		"interactive.render.v1",
+		"local.inference.coordinator.v1",
 		"mcp.lifecycle.v2",
 		"model.gateway.v1",
 		"plugin.extension.v1",

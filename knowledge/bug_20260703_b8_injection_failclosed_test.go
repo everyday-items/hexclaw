@@ -112,7 +112,7 @@ func TestBug20260703_B8_InjectionDropsWeakNoiseAlongsideStrongHit(t *testing.T) 
 	}
 }
 
-// b8Mgr 构建带默认地板（0.55）的 Manager，配置与生产默认对齐（RRF + MMR，无 LLM/重排）。
+// b8Mgr 构建带默认地板（0.85）的 Manager，配置与生产默认对齐（RRF + MMR，无辅助 LLM/专用重排器）。
 func b8Mgr(t *testing.T, emb *scriptedEmbedder) *Manager {
 	t.Helper()
 	db := setupTestDB(t)
@@ -123,7 +123,7 @@ func b8Mgr(t *testing.T, emb *scriptedEmbedder) *Manager {
 	}
 	cfg := HybridConfig{
 		VectorWeight: 0.7, TextWeight: 0.3, MMRLambda: 0.7, TimeDecayDays: 0,
-		MinScore: 0.55, CandidateK: 50, RRFK: 60, UseRRF: true,
+		MinScore: 0.85, CandidateK: 50, RRFK: 60, UseRRF: true,
 	}
 	return NewManager(store, store, emb, WithSplitter(testSplitter()), WithHybridConfig(cfg))
 }

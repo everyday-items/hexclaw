@@ -306,8 +306,9 @@ func TestRAGReal_CoreRetrieval(t *testing.T) {
 	}
 }
 
-// TestRAGReal_FullPipeline：完整管线全开（HyDE+multi-query+rerank+contextual）+ 真 chat LLM 会话落地，
-// 每个 chat provider 只跑 1 query（控时），证明各阶段在真模型上能端到端跑通。
+// TestRAGReal_FullPipeline：查询扩展（HyDE+multi-query）+ contextual + 混合检索/MMR +
+// 真 chat LLM 会话落地。此测试不配置专用 reranker，并明确验证 rerank 开关不会把聊天
+// LLM 当成 executor；真实 cross-encoder 链路由 TestRAGReal_CrossEncoderReranker 覆盖。
 func TestRAGReal_FullPipeline(t *testing.T) {
 	if os.Getenv("HEX_RAG_E2E") != "1" {
 		t.Skip("real-model E2E：设 HEX_RAG_E2E=1 运行")
@@ -332,7 +333,7 @@ func TestRAGReal_FullPipeline(t *testing.T) {
 		if vv, err := embedder.Embed(ctx, []string{"探针"}); err != nil || len(vv) == 0 || len(vv[0]) == 0 {
 			t.Skipf("embedder 不可用，跳过：%v", err)
 		}
-		mgr := newRealManager(t, DefaultHybridConfig(), embedder, llm) // 全开
+		mgr := newRealManager(t, DefaultHybridConfig(), embedder, llm)
 		ingestCorpus(t, ctx, mgr)
 
 		hits, err := mgr.Search(ctx, qc.q, 3)
@@ -341,6 +342,10 @@ func TestRAGReal_FullPipeline(t *testing.T) {
 		}
 		if len(hits) == 0 || hits[0].DocTitle != qc.wantTitle {
 			t.Fatalf("full-pipeline 检索错位：%v", titles(hits))
+		}
+		rerankMetrics := mgr.RetrievalMetricsSnapshot().Rerank
+		if rerankMetrics.Configured == 0 || rerankMetrics.Executed != 0 {
+			t.Fatalf("未配置专用 executor 时必须 MMR 降级且不得调用聊天 LLM 重排，metrics=%+v", rerankMetrics)
 		}
 		t.Logf("  ✓ 完整管线检索 %q → top=%q", clip(qc.q, 28), hits[0].DocTitle)
 

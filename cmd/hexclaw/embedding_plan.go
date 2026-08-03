@@ -24,6 +24,32 @@ type knowledgeEmbeddingPlan struct {
 const defaultKnowledgeOllamaEmbeddingBaseURL = "http://localhost:11434/v1"
 const defaultKnowledgeOllamaEmbeddingModel = "qwen3-embedding:8b"
 const knowledgeOllamaEmbeddingDummyAPIKey = "ollama"
+const knowledgeLocalEmbeddingDummyAPIKey = "local"
+
+type knowledgeEmbeddingRuntimeProvider struct {
+	local            bool
+	nativeOllama     bool
+	credentialsReady bool
+}
+
+// classifyKnowledgeEmbeddingRuntimeProvider keeps provider locality separate
+// from the much narrower native-Ollama management capability. Locality is the
+// authoritative deployment declaration; native Ollama additionally requires a
+// resolver-attested native endpoint. Declared-local OpenAI-compatible servers
+// therefore receive local admission/warmup without gaining tags or pull access.
+func classifyKnowledgeEmbeddingRuntimeProvider(
+	name string,
+	provider config.LLMProviderConfig,
+	plan knowledgeEmbeddingPlan,
+) knowledgeEmbeddingRuntimeProvider {
+	local := config.IsLocalLLMProviderNamed(name, provider)
+	nativeOllama := local && plan.Ollama
+	return knowledgeEmbeddingRuntimeProvider{
+		local:            local,
+		nativeOllama:     nativeOllama,
+		credentialsReady: nativeOllama || local || strings.TrimSpace(provider.APIKey) != "",
+	}
+}
 
 // knowledgeEmbeddingEffectiveBaseURL keeps discovery, provider construction,
 // readiness probes and native model management on the same endpoint. The
@@ -52,6 +78,13 @@ func knowledgeEmbeddingProviderAPIKey(
 ) string {
 	if plan.Ollama {
 		return knowledgeOllamaEmbeddingDummyAPIKey
+	}
+	if strings.TrimSpace(provider.APIKey) == "" &&
+		classifyKnowledgeEmbeddingRuntimeProvider(plan.Provider, provider, plan).local {
+		// ai-core treats an empty key as permission to read OPENAI_API_KEY from
+		// the process environment. Use a non-secret local sentinel so an ambient
+		// cloud credential can never be forwarded to a local compatible server.
+		return knowledgeLocalEmbeddingDummyAPIKey
 	}
 	return provider.APIKey
 }
@@ -190,7 +223,8 @@ func resolveKnowledgeEmbeddingPlan(ctx context.Context, cfg *config.Config) know
 			Provider: requestedProvider,
 			Model:    requestedModel,
 		}
-		configured := requestedModel != "" && provider.APIKey != "" &&
+		runtimeProvider := classifyKnowledgeEmbeddingRuntimeProvider(requestedProvider, provider, plan)
+		configured := requestedModel != "" && runtimeProvider.credentialsReady &&
 			validateKnowledgeEmbeddingEndpoint(plan, provider) == nil
 		plan.Configured = configured
 		plan.Ready = configured

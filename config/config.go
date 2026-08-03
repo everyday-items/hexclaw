@@ -305,10 +305,10 @@ type KnowledgeConfig struct {
 	MMRLambda     float64 `yaml:"mmr_lambda"`      // MMR 多样性参数（0=最多样, 1=最相关），默认 0.7
 	TimeDecayDays int     `yaml:"time_decay_days"` // 时间衰减半衰期（天），默认 30，0=不衰减
 	Rerank        bool    `yaml:"rerank"`          // 重排总开关，默认 true
-	RerankModel   string  `yaml:"rerank_model"`    // 专用 cross-encoder 重排模型（如 BAAI/bge-reranker-v2-m3）；空=LLM 重排，SiliconFlow 自动启用
+	RerankModel   string  `yaml:"rerank_model"`    // 专用 cross-encoder 模型；空=未显式指定（SiliconFlow 可自动选择），最终无专用 executor 时使用 MMR
 	QueryExpand   bool    `yaml:"query_expand"`    // HyDE + multi-query 查询扩展开关（需已配 LLM），默认 true
 	Contextual    bool    `yaml:"contextual"`      // 入库 Contextual Retrieval（chunk 前置文档级上下文），默认 true
-	MinScore      float64 `yaml:"min_score"`       // 向量相关度地板 [0,1]，默认 0.55，0=关
+	MinScore      float64 `yaml:"min_score"`       // 向量相关度地板 [0,1]，默认 0.85，0=关
 	CandidateK    int     `yaml:"candidate_k"`     // 宽召回候选池大小（rerank 前），默认 50
 	// SnapshotRetention 每个定时任务「快照系列」(source + 基础标题) 保留的最大文档数，
 	// 超出后台裁剪最旧的，防止 @hourly 采集器无限累积。默认 100，0=不限。

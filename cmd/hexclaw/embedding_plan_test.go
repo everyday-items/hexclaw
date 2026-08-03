@@ -134,6 +134,82 @@ func TestKnowledgeEmbeddingPlanRequiresExplicitEndpointForCustomOrLocalCompatibl
 	}
 }
 
+func TestKnowledgeEmbeddingPlanAcceptsDeclaredLocalCompatibleProviderWithoutAPIKey(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Knowledge.Embedding.Provider = "Private Embeddings"
+	cfg.Knowledge.Embedding.Model = "qwen3-embedding:8b"
+	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
+		"Private Embeddings": {
+			BaseURL:  "http://127.0.0.1:18080/v1",
+			Locality: config.ProviderLocalityLocal,
+		},
+	}
+
+	plan := resolveKnowledgeEmbeddingPlan(context.Background(), cfg)
+	if !plan.Configured || !plan.Ready || !plan.ServiceAvailable || plan.Ollama {
+		t.Fatalf("declared-local compatible embedding plan = %#v, want executable non-native local", plan)
+	}
+	runtime := classifyKnowledgeEmbeddingRuntimeProvider(
+		plan.Provider, cfg.LLM.Providers[plan.Provider], plan,
+	)
+	if !runtime.local || runtime.nativeOllama || !runtime.credentialsReady {
+		t.Fatalf("declared-local runtime classification = %#v", runtime)
+	}
+}
+
+func TestKnowledgeEmbeddingRuntimeProviderSeparatesLocalityFromNativeOllama(t *testing.T) {
+	tests := []struct {
+		name              string
+		providerName      string
+		provider          config.LLMProviderConfig
+		plan              knowledgeEmbeddingPlan
+		wantLocal         bool
+		wantNativeOllama  bool
+		wantCredentialsOK bool
+	}{
+		{
+			name: "declared local compatible without key", providerName: "Private Embeddings",
+			provider: config.LLMProviderConfig{
+				BaseURL: "http://127.0.0.1:18080/v1", Locality: config.ProviderLocalityLocal,
+			},
+			plan:      knowledgeEmbeddingPlan{Provider: "Private Embeddings"},
+			wantLocal: true, wantCredentialsOK: true,
+		},
+		{
+			name: "native ollama", providerName: "Ollama",
+			provider:  config.LLMProviderConfig{Locality: config.ProviderLocalityLocal},
+			plan:      knowledgeEmbeddingPlan{Provider: "Ollama", Ollama: true},
+			wantLocal: true, wantNativeOllama: true, wantCredentialsOK: true,
+		},
+		{
+			name: "cloud with key", providerName: "Cloud",
+			provider: config.LLMProviderConfig{
+				APIKey: "cloud-secret", BaseURL: "https://embedding.example.test/v1",
+				Locality: config.ProviderLocalityCloud,
+			},
+			plan:              knowledgeEmbeddingPlan{Provider: "Cloud"},
+			wantCredentialsOK: true,
+		},
+		{
+			name: "cloud cannot inherit inconsistent native bit", providerName: "Ollama Cloud",
+			provider: config.LLMProviderConfig{
+				BaseURL: "https://ollama.example.test/v1", Locality: config.ProviderLocalityCloud,
+			},
+			plan: knowledgeEmbeddingPlan{Provider: "Ollama Cloud", Ollama: true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyKnowledgeEmbeddingRuntimeProvider(tt.providerName, tt.provider, tt.plan)
+			if got.local != tt.wantLocal || got.nativeOllama != tt.wantNativeOllama ||
+				got.credentialsReady != tt.wantCredentialsOK {
+				t.Fatalf("runtime classification = %#v, want local=%v native=%v credentials=%v",
+					got, tt.wantLocal, tt.wantNativeOllama, tt.wantCredentialsOK)
+			}
+		})
+	}
+}
+
 func TestKnowledgeEmbeddingPlanNeverTreatsOllamaCloudAsLocal(t *testing.T) {
 	provider := config.LLMProviderConfig{
 		APIKey:   "sk-test",
@@ -333,10 +409,20 @@ func TestKnowledgeEmbeddingProviderAPIKeyNeverUsesConfiguredSecretForNativeOllam
 			name: "cloud keeps configured secret", plan: knowledgeEmbeddingPlan{},
 			apiKey: "cloud-provider-secret", expected: "cloud-provider-secret",
 		},
+		{
+			name:     "declared local empty secret does not inherit ambient cloud key",
+			plan:     knowledgeEmbeddingPlan{Provider: "Private Embeddings"},
+			expected: "local",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			provider := config.LLMProviderConfig{APIKey: tt.apiKey}
+			if tt.name == "declared local empty secret does not inherit ambient cloud key" {
+				provider.Locality = config.ProviderLocalityLocal
+				provider.BaseURL = "http://127.0.0.1:18080/v1"
+			}
 			got := knowledgeEmbeddingProviderAPIKey(
-				tt.plan, config.LLMProviderConfig{APIKey: tt.apiKey},
+				tt.plan, provider,
 			)
 			if got != tt.expected {
 				t.Fatalf("embedding provider API key = %q, want %q", got, tt.expected)

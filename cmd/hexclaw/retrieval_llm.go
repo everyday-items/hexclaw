@@ -15,13 +15,14 @@ type retrievalRouter interface {
 }
 
 // errRetrievalAuxSkippedLocal 表示 RAG 辅助 LLM 因路由到本地 provider 而被跳过。
-// 调用方（multi-query / HyDE / LLM 重排）据此优雅降级到确定性检索（向量+BM25+MMR）。
+// multi-query / HyDE 据此退回原始查询；contextual-ingest 保留确定性标题/章节定位。
 var errRetrievalAuxSkippedLocal = errors.New("knowledge: 辅助 LLM 跳过——路由到本地单槽 provider（避让前台主聊天）")
 
-// newRetrievalRerankLLM 构造 KB 检索的辅助 LLM（查询扩展 / LLM 重排），复用 Agent 的 LLM router。
+// newRetrievalRerankLLM 构造 KB 的辅助 LLM（查询扩展 / contextual-ingest），复用 Agent 的
+// LLM router。函数名为兼容历史调用保留；文档重排只接受独立的专用 reranker。
 //
-// ★前台/后台资源隔离（BUG-20260704）：查询扩展与 LLM 重排是**后台检索增强**，绝不能与**前台
-// 主聊天生成**争抢同一稀缺算力。本地部署模型（如 Ollama，常 `-np 1` 单槽）尤甚——辅助调用即使
+// ★前台/后台资源隔离（BUG-20260704）：查询扩展与 contextual 生成是辅助增强，绝不能与前台
+// 主聊天生成争抢同一稀缺算力。本地部署模型（如 Ollama，常 `-np 1` 单槽）尤甚——辅助调用即使
 // 客户端预算取消，服务端仍占槽跑完，主回复被迫排在其后（实测本地 TTFT 0.66s→57s 头阻塞）。
 // 故辅助 LLM 一旦路由到**本地 provider** 直接跳过，退化为确定性检索；云端 provider 有并行、
 // 无自争用，照常启用。与 rag_aux_llm.go 的预算+熔断是同一「增强绝不阻塞主路径」纪律的互补一环。

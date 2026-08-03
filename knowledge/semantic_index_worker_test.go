@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/localinfer"
 	"github.com/hexagon-codes/hexclaw/resourcegov"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
 	_ "modernc.org/sqlite"
@@ -99,6 +100,54 @@ func (e *contextBlockingWorkerExecutor) EmbedForPurpose(
 	return nil, ctx.Err()
 }
 
+type readinessWorkerExecutor struct {
+	coordinator    *localinfer.Coordinator
+	ready          bool
+	readinessCalls int
+	embedAttempts  int
+	embedCalls     int
+	probeErr       error
+}
+
+func (e *readinessWorkerExecutor) EmbeddingReady(ctx context.Context) bool {
+	e.readinessCalls++
+	if e.ready || e.coordinator == nil {
+		return e.ready
+	}
+	operation := localinfer.OperationFromContext(ctx, localinfer.OperationProbe)
+	_, lease, err := e.coordinator.Acquire(localinfer.WithOperation(ctx, operation), operation)
+	if err != nil {
+		e.probeErr = err
+		return false
+	}
+	lease.Finish(nil)
+	e.ready = true
+	return true
+}
+
+func (e *readinessWorkerExecutor) EmbedForPurpose(
+	ctx context.Context,
+	_ EmbeddingPurpose,
+	texts []string,
+) (vectors [][]float32, err error) {
+	e.embedAttempts++
+	if !e.EmbeddingReady(ctx) {
+		return nil, ErrEmbeddingUnavailable
+	}
+	e.embedCalls++
+	operation := localinfer.OperationFromContext(ctx, localinfer.OperationDocumentEmbedding)
+	_, lease, err := e.coordinator.Acquire(localinfer.WithOperation(ctx, operation), operation)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { lease.Finish(err) }()
+	vectors = make([][]float32, len(texts))
+	for i := range vectors {
+		vectors[i] = []float32{1, 0, 0}
+	}
+	return vectors, nil
+}
+
 type workerExecutorRegistry struct {
 	executors map[string]ProfileEmbeddingExecutor
 }
@@ -120,6 +169,71 @@ type workerHarness struct {
 	db      *sql.DB
 	repo    *SQLiteSemanticIndexRepository
 	service *SemanticIndexService
+}
+
+// workerPostManifestRenewRepository proves the provider-side durable fence:
+// after a manifest is prepared, every local or cloud provider invocation must
+// renew the job lease before it marks that manifest in-flight.
+type workerPostManifestRenewRepository struct {
+	SemanticIndexWorkerRepository
+	forceCloud           bool
+	beginCalls           int
+	manifestPrepared     bool
+	renewedAfterManifest bool
+}
+
+func (r *workerPostManifestRenewRepository) LoadJobExecutionPlan(
+	ctx context.Context,
+	lease JobLease,
+	now time.Time,
+) (JobExecutionPlan, error) {
+	plan, err := r.SemanticIndexWorkerRepository.LoadJobExecutionPlan(ctx, lease, now)
+	if err == nil && r.forceCloud {
+		plan.Snapshot.Profile.Location = ProviderLocationCloud
+		plan.Snapshot.Profile.Availability = ProfileAvailabilityConnected
+	}
+	return plan, err
+}
+
+func (r *workerPostManifestRenewRepository) CreateEmbeddingBatchManifest(
+	ctx context.Context,
+	lease JobLease,
+	now time.Time,
+	manifest EmbeddingBatchManifest,
+) (EmbeddingBatchManifest, error) {
+	created, err := r.SemanticIndexWorkerRepository.CreateEmbeddingBatchManifest(ctx, lease, now, manifest)
+	if err == nil {
+		r.manifestPrepared = true
+		r.renewedAfterManifest = false
+	}
+	return created, err
+}
+
+func (r *workerPostManifestRenewRepository) RenewJobLease(
+	ctx context.Context,
+	lease JobLease,
+	now time.Time,
+	leaseDuration time.Duration,
+) (JobLease, error) {
+	renewer := r.SemanticIndexWorkerRepository.(semanticIndexLeaseRenewer)
+	renewed, err := renewer.RenewJobLease(ctx, lease, now, leaseDuration)
+	if err == nil && r.manifestPrepared {
+		r.renewedAfterManifest = true
+	}
+	return renewed, err
+}
+
+func (r *workerPostManifestRenewRepository) BeginEmbeddingBatch(
+	ctx context.Context,
+	lease JobLease,
+	now time.Time,
+	batchID string,
+) error {
+	r.beginCalls++
+	if r.manifestPrepared && !r.renewedAfterManifest {
+		return errors.New("provider boundary crossed without post-manifest lease renewal")
+	}
+	return r.SemanticIndexWorkerRepository.BeginEmbeddingBatch(ctx, lease, now, batchID)
 }
 
 func newWorkerHarness(t *testing.T, chunks ...string) *workerHarness {
@@ -568,6 +682,108 @@ func TestSemanticIndexWorkerCancellationWhileQueuedDoesNotBeginProviderInvocatio
 	metric := governor.Snapshot().Resources[resourcegov.ResourceAccelerator]
 	if metric.InUse != 0 || metric.QueuedBackground != 0 {
 		t.Fatalf("accelerator permit leaked after cancellation: %+v", metric)
+	}
+}
+
+func TestSemanticIndexWorkerRejectsUnavailableExecutorBeforeLocalAdmissionAndDurableBegin(t *testing.T) {
+	h := newWorkerHarness(t, "offline local chunk")
+	now := time.Unix(1_800_209_250, 0).UTC()
+	governor, err := resourcegov.New(resourcegov.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(governor.Close)
+	coordinator := localinfer.New(governor)
+	repository := &workerPostManifestRenewRepository{SemanticIndexWorkerRepository: h.repo}
+	executor := &readinessWorkerExecutor{ready: false}
+	worker := NewSemanticIndexWorker(repository, &workerExecutorRegistry{
+		executors: map[string]ProfileEmbeddingExecutor{"profile-a": executor},
+	}, workerConfig(&now, "worker-readiness-offline", 1),
+		WithSemanticWorkerLocalInferenceCoordinator(coordinator))
+
+	processed, runErr := worker.RunOnce(h.ctx)
+	if !processed || !errors.Is(runErr, ErrEmbeddingUnavailable) {
+		t.Fatalf("offline RunOnce: processed=%v err=%v, want ErrEmbeddingUnavailable", processed, runErr)
+	}
+	if executor.readinessCalls != 1 || executor.embedAttempts != 0 {
+		t.Fatalf("offline executor calls: readiness=%d embed=%d, want 1/0",
+			executor.readinessCalls, executor.embedAttempts)
+	}
+	if repository.beginCalls != 0 {
+		t.Fatalf("offline executor crossed durable BeginEmbeddingBatch: calls=%d", repository.beginCalls)
+	}
+	metric := coordinator.Snapshot().Operations[localinfer.OperationDocumentEmbedding]
+	if metric.Attempts != 0 || metric.Admitted != 0 {
+		t.Fatalf("offline executor acquired document embedding capacity: %+v", metric)
+	}
+}
+
+func TestSemanticIndexWorkerReadinessProbeDoesNotConsumeProviderPrelease(t *testing.T) {
+	h := newWorkerHarness(t, "probe then embed")
+	now := time.Unix(1_800_209_375, 0).UTC()
+	governor, err := resourcegov.New(resourcegov.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(governor.Close)
+	coordinator := localinfer.New(governor)
+	repository := &workerPostManifestRenewRepository{SemanticIndexWorkerRepository: h.repo}
+	executor := &readinessWorkerExecutor{coordinator: coordinator}
+	worker := NewSemanticIndexWorker(repository, &workerExecutorRegistry{
+		executors: map[string]ProfileEmbeddingExecutor{"profile-a": executor},
+	}, workerConfig(&now, "worker-readiness-probe", 1),
+		WithSemanticWorkerLocalInferenceCoordinator(coordinator))
+
+	processed, runErr := worker.RunOnce(h.ctx)
+	if runErr != nil || !processed {
+		t.Fatalf("probe-before-prelease RunOnce: processed=%v err=%v probe_err=%v",
+			processed, runErr, executor.probeErr)
+	}
+	if executor.readinessCalls != 2 || executor.embedAttempts != 1 || executor.embedCalls != 1 {
+		t.Fatalf("probe/embed calls: readiness=%d attempts=%d physical=%d, want 2/1/1",
+			executor.readinessCalls, executor.embedAttempts, executor.embedCalls)
+	}
+	if repository.beginCalls != 1 || !repository.renewedAfterManifest {
+		t.Fatalf("durable provider fence: begin=%d renewed_after_manifest=%v, want 1/true",
+			repository.beginCalls, repository.renewedAfterManifest)
+	}
+	snapshot := coordinator.Snapshot().Operations
+	if probe := snapshot[localinfer.OperationProbe]; probe.Attempts != 1 || probe.Admitted != 1 || probe.Completed != 1 {
+		t.Fatalf("readiness probe admission=%+v, want one independent completed call", probe)
+	}
+	if embed := snapshot[localinfer.OperationDocumentEmbedding]; embed.Attempts != 1 || embed.Admitted != 1 || embed.Completed != 1 {
+		t.Fatalf("document embedding admission=%+v, want one completed owner/prelease", embed)
+	}
+}
+
+func TestSemanticIndexWorkerCloudBatchRenewsLeaseAfterOptionalAdmission(t *testing.T) {
+	h := newWorkerHarness(t, "cloud chunk")
+	now := time.Unix(1_800_209_500, 0).UTC()
+	governor, err := resourcegov.New(resourcegov.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(governor.Close)
+	coordinator := localinfer.New(governor)
+	repository := &workerPostManifestRenewRepository{
+		SemanticIndexWorkerRepository: h.repo,
+		forceCloud:                    true,
+	}
+	executor := &scriptedWorkerExecutor{dimension: 3}
+	worker := NewSemanticIndexWorker(repository, &workerExecutorRegistry{
+		executors: map[string]ProfileEmbeddingExecutor{"profile-a": executor},
+	}, workerConfig(&now, "worker-cloud-renew-fence", 1),
+		WithSemanticWorkerLocalInferenceCoordinator(coordinator))
+
+	processed, runErr := worker.RunOnce(h.ctx)
+	if runErr != nil || !processed {
+		t.Fatalf("cloud RunOnce crossed durable fence: processed=%v err=%v", processed, runErr)
+	}
+	if executor.calls != 1 {
+		t.Fatalf("cloud provider calls=%d, want 1", executor.calls)
+	}
+	if got := coordinator.Snapshot().Operations[localinfer.OperationDocumentEmbedding].Attempts; got != 0 {
+		t.Fatalf("cloud document embedding acquired local slot: attempts=%d", got)
 	}
 }
 

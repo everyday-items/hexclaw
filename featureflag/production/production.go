@@ -9,6 +9,7 @@ import (
 	_ "github.com/hexagon-codes/hexclaw/engine"
 	_ "github.com/hexagon-codes/hexclaw/eval"
 	_ "github.com/hexagon-codes/hexclaw/knowledge"
+	_ "github.com/hexagon-codes/hexclaw/localinfer"
 	_ "github.com/hexagon-codes/hexclaw/mcp"
 	_ "github.com/hexagon-codes/hexclaw/plugin"
 	_ "github.com/hexagon-codes/hexclaw/skill"

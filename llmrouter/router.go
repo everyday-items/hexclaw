@@ -32,6 +32,7 @@ import (
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/egress"
+	"github.com/hexagon-codes/hexclaw/localinfer"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
@@ -71,6 +72,7 @@ type Selector struct {
 	unhealthyUntil map[string]time.Time        // 运行时短期熔断，避免刚失败的 provider 立即被再次选中
 	now            func() time.Time
 	egressPolicy   *egress.Policy // nil only for explicitly unguarded/test selectors
+	localInference *localinfer.Coordinator
 }
 
 const defaultProviderCooldown = 2 * time.Minute
@@ -194,6 +196,19 @@ func (r *Selector) SetEgressPolicy(policy *egress.Policy) {
 	r.mu.Unlock()
 }
 
+// SetLocalInferenceCoordinator installs the single process-scoped admission
+// boundary used by every local provider returned by this selector. The
+// coordinator survives Reload because it is runtime infrastructure, not
+// provider configuration.
+func (r *Selector) SetLocalInferenceCoordinator(coordinator *localinfer.Coordinator) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.localInference = coordinator
+	r.mu.Unlock()
+}
+
 type cloudEgressProvider struct {
 	next   hexagon.Provider
 	policy *egress.Policy
@@ -231,6 +246,12 @@ func (r *Selector) providerLocked(name string) hexagon.Provider {
 		p = &cloudEgressProvider{next: p, policy: r.egressPolicy}
 	}
 	if providerConfig, configured := r.cfg.Providers[name]; configured {
+		if r.localInference != nil && r.isLocalProviderName(name) {
+			p = &localInferenceProvider{
+				next: p, coordinator: r.localInference,
+				defaultModel: providerConfig.Model, budgetForModel: localChatBudget,
+			}
+		}
 		// This wrapper is the final completion/stream boundary shared by Chat,
 		// Agents, QuickChat, channels and capability probes. UI filtering is not
 		// a security boundary: a stale session or direct API caller must still be

@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/hexclaw/localinfer"
 	"github.com/hexagon-codes/hexclaw/resourcegov"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
 	_ "modernc.org/sqlite"
@@ -61,6 +63,32 @@ func (e *semanticExecutor) embed(texts []string) ([][]float32, error) {
 type semanticExecutorRegistry struct {
 	executors map[string]*semanticExecutor
 	profiles  []string
+}
+
+type providerBoundSemanticExecutor struct{ embedder hexagon.VectorEmbedder }
+
+func (e providerBoundSemanticExecutor) EmbedForPurpose(
+	ctx context.Context,
+	_ EmbeddingPurpose,
+	texts []string,
+) ([][]float32, error) {
+	return e.embedder.Embed(ctx, texts)
+}
+
+func (e providerBoundSemanticExecutor) LocalInferenceAdmissionAtProviderBoundary() bool {
+	marker, ok := e.embedder.(interface {
+		LocalInferenceAdmissionAtProviderBoundary() bool
+	})
+	return ok && marker.LocalInferenceAdmissionAtProviderBoundary()
+}
+
+type providerBoundSemanticRegistry struct{ executor ProfileEmbeddingExecutor }
+
+func (r providerBoundSemanticRegistry) ExecutorForProfile(
+	context.Context,
+	EmbeddingProfileSnapshot,
+) (ProfileEmbeddingExecutor, error) {
+	return r.executor, nil
 }
 
 type revisionSearchResolver struct {
@@ -390,6 +418,71 @@ func TestRevisionSemanticQueryUsesInteractiveAcceleratorPermit(t *testing.T) {
 	}
 	if !reflect.DeepEqual(executor.purposes, []EmbeddingPurpose{EmbeddingPurposeQuery}) {
 		t.Fatalf("query purpose=%v", executor.purposes)
+	}
+}
+
+func TestRevisionSemanticProviderBoundAdmissionDoesNotBlockCacheHit(t *testing.T) {
+	h := newRevisionSearchHarness(t)
+	boot, err := h.service.EnsureDefaultPolicy(h.ctx, "owner-1", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var corpusUID string
+	if err := h.db.QueryRowContext(h.ctx, `SELECT corpus_uid FROM kb_semantic_corpora
+		WHERE owner_id='owner-1' AND corpus_alias='default'`).Scan(&corpusUID); err != nil {
+		t.Fatal(err)
+	}
+	h.addLegacyDocument("cached-doc", "cached semantic evidence", nil)
+	h.bindDocument("owner-1", corpusUID, "cached-doc")
+	h.seedVisibleRevisionVector(*boot.ActiveRevisionID, corpusUID, "cached-doc", []float32{1, 0, 0})
+
+	governor, err := resourcegov.New(resourcegov.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(governor.Close)
+	coordinator := localinfer.New(governor)
+	raw := &countingLegacyEmbedder{}
+	providerBound := localinfer.MarkProviderBoundEmbedder(hexagon.NewCachedEmbedder(
+		localinfer.NewCoordinatedEmbedder(raw, coordinator, localinfer.OperationQueryEmbedding),
+	))
+	executor := providerBoundSemanticExecutor{embedder: providerBound}
+	searcher := NewSQLiteRevisionSemanticSearcher(
+		h.db, "owner-1", "default",
+		providerBoundSemanticRegistry{executor: executor},
+		WithRevisionSearchLocalInferenceCoordinator(coordinator),
+	)
+	if results, ran, searchErr := searcher.Search(h.ctx, "cached query", 3, Filter{}); searchErr != nil || !ran || len(results) != 1 {
+		t.Fatalf("prime provider-bound cache: results=%+v ran=%v err=%v", results, ran, searchErr)
+	}
+	if raw.calls != 1 {
+		t.Fatalf("cache prime raw calls=%d, want 1", raw.calls)
+	}
+	hold, err := governor.Acquire(h.ctx, resourcegov.ResourceLocalInference, resourcegov.PriorityInteractive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hold.Release()
+	ctx, cancel := context.WithTimeout(h.ctx, 100*time.Millisecond)
+	defer cancel()
+	results, ran, searchErr := searcher.Search(ctx, "cached query", 3, Filter{})
+	if searchErr != nil || !ran || len(results) != 1 {
+		t.Fatalf("provider-bound cache hit blocked by local slot: results=%+v ran=%v err=%v", results, ran, searchErr)
+	}
+	if raw.calls != 1 {
+		t.Fatalf("cache hit reached raw provider: calls=%d", raw.calls)
+	}
+	if got := coordinator.Snapshot().Operations[localinfer.OperationQueryEmbedding].Attempts; got != 1 {
+		t.Fatalf("cache hit acquired local slot: attempts=%d, want prime-only 1", got)
+	}
+
+	missCtx, cancelMiss := context.WithTimeout(h.ctx, 20*time.Millisecond)
+	defer cancelMiss()
+	if _, _, missErr := searcher.Search(missCtx, "uncached query", 3, Filter{}); missErr == nil {
+		t.Fatal("cache miss bypassed provider-bound local admission")
+	}
+	if raw.calls != 1 {
+		t.Fatalf("queued cache miss reached raw provider: calls=%d", raw.calls)
 	}
 }
 

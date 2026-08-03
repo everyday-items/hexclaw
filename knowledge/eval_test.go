@@ -2,6 +2,7 @@ package knowledge
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -52,6 +53,47 @@ func TestRunEval_Metrics(t *testing.T) {
 	}
 	if rep.Cases[2].Rank != 0 {
 		t.Errorf("c 未命中 rank 应为 0，got %d", rep.Cases[2].Rank)
+	}
+}
+
+func TestKnowledgeConfigEvalFixturesMatchCurrentRetrievalContract(t *testing.T) {
+	tests := []struct {
+		name string
+		docs []EvalDoc
+	}{
+		{name: "golden", docs: GoldenCorpus()},
+		{name: "scenario", docs: func() []EvalDoc {
+			docs := make([]EvalDoc, 0, len(scenarioCorpus))
+			for _, doc := range scenarioCorpus {
+				docs = append(docs, EvalDoc{Title: doc.title, Content: doc.content})
+			}
+			return docs
+		}()},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var configDoc string
+			for _, doc := range tc.docs {
+				if doc.Title == "HexClaw 知识库检索配置" {
+					configDoc = doc.Content
+					break
+				}
+			}
+			if configDoc == "" {
+				t.Fatal("missing HexClaw knowledge retrieval config fixture")
+			}
+			for _, want := range []string{"默认 0.85", "专用 cross-encoder", "无专用 executor 时使用 MMR"} {
+				if !strings.Contains(configDoc, want) {
+					t.Errorf("fixture does not describe %q: %q", want, configDoc)
+				}
+			}
+			for _, stale := range []string{"默认 0.55", "LLM 重排"} {
+				if strings.Contains(configDoc, stale) {
+					t.Errorf("fixture still describes obsolete %q contract: %q", stale, configDoc)
+				}
+			}
+		})
 	}
 }
 

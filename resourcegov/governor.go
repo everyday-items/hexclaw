@@ -23,15 +23,21 @@ var (
 type Resource string
 
 const (
-	ResourceVLM         Resource = "vlm_ocr"
-	ResourceAccelerator Resource = "embedding_accelerator"
+	ResourceVLM Resource = "vlm_ocr"
+	// ResourceLocalInference is the conservative process-wide pool shared by
+	// local chat, embedding, rerank, probe, and warmup calls. Keep the wire value
+	// stable for existing diagnostics/configuration consumers.
+	ResourceLocalInference Resource = "embedding_accelerator"
+	// ResourceAccelerator is retained as a source-compatible alias for callers
+	// that have not yet migrated to the broader local-inference semantics.
+	ResourceAccelerator          = ResourceLocalInference
 	ResourceCPUHeavy    Resource = "cpu_heavy"
 	ResourceSQLiteWrite Resource = "sqlite_write"
 )
 
 var allResources = [...]Resource{
 	ResourceVLM,
-	ResourceAccelerator,
+	ResourceLocalInference,
 	ResourceCPUHeavy,
 	ResourceSQLiteWrite,
 }
@@ -40,9 +46,18 @@ var allResources = [...]Resource{
 type Priority uint8
 
 const (
-	PriorityBackground Priority = iota + 1
-	PriorityInteractive
+	// Preserve the original exported numeric values for source/wire
+	// compatibility. Scheduling order is defined explicitly by queue selection,
+	// never by comparing these numbers.
+	PriorityBackground  Priority = 1
+	PriorityInteractive Priority = 2
+	PriorityRerank      Priority = 3
+	PriorityQuery       Priority = 4
 )
+
+func validPriority(priority Priority) bool {
+	return priority >= PriorityBackground && priority <= PriorityQuery
+}
 
 type priorityContextKey struct{}
 
@@ -53,7 +68,7 @@ func WithPriority(ctx context.Context, priority Priority) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if priority != PriorityInteractive && priority != PriorityBackground {
+	if !validPriority(priority) {
 		return ctx
 	}
 	return context.WithValue(ctx, priorityContextKey{}, priority)
@@ -61,8 +76,7 @@ func WithPriority(ctx context.Context, priority Priority) context.Context {
 
 func PriorityFromContext(ctx context.Context, fallback Priority) Priority {
 	if ctx != nil {
-		if priority, ok := ctx.Value(priorityContextKey{}).(Priority); ok &&
-			(priority == PriorityInteractive || priority == PriorityBackground) {
+		if priority, ok := ctx.Value(priorityContextKey{}).(Priority); ok && validPriority(priority) {
 			return priority
 		}
 	}
@@ -73,8 +87,12 @@ func (p Priority) String() string {
 	switch p {
 	case PriorityBackground:
 		return "background"
+	case PriorityRerank:
+		return "rerank"
 	case PriorityInteractive:
 		return "interactive"
+	case PriorityQuery:
+		return "query"
 	default:
 		return fmt.Sprintf("priority(%d)", p)
 	}
@@ -119,7 +137,9 @@ type resourceState struct {
 	capacity int
 	inUse    int
 
+	query       []*waiter
 	interactive []*waiter
+	rerank      []*waiter
 	background  []*waiter
 	// interactiveBurst counts grants that overtook a waiting background job.
 	interactiveBurst int
@@ -194,7 +214,7 @@ func (g *Governor) Acquire(ctx context.Context, resource Resource, priority Prio
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if priority != PriorityInteractive && priority != PriorityBackground {
+	if !validPriority(priority) {
 		return nil, ErrInvalidPriority
 	}
 
@@ -209,11 +229,8 @@ func (g *Governor) Acquire(ctx context.Context, resource Resource, priority Prio
 		return nil, ErrClosed
 	}
 	w := &waiter{priority: priority, queuedAt: g.now(), ready: make(chan struct{})}
-	if priority == PriorityInteractive {
-		state.interactive = append(state.interactive, w)
-	} else {
-		state.background = append(state.background, w)
-	}
+	queue := state.queueForPriority(priority)
+	*queue = append(*queue, w)
 	g.dispatchLocked(state)
 	if w.granted {
 		g.mu.Unlock()
@@ -298,14 +315,14 @@ func (g *Governor) dispatchLocked(state *resourceState) {
 }
 
 func (g *Governor) nextWaiterLocked(state *resourceState) *waiter {
-	hasInteractive := len(state.interactive) > 0
+	hasForeground := len(state.query) > 0 || len(state.interactive) > 0 || len(state.rerank) > 0
 	hasBackground := len(state.background) > 0
-	if !hasInteractive && !hasBackground {
+	if !hasForeground && !hasBackground {
 		state.interactiveBurst = 0
 		return nil
 	}
 
-	chooseBackground := hasBackground && (!hasInteractive ||
+	chooseBackground := hasBackground && (!hasForeground ||
 		g.now().Sub(state.background[0].queuedAt) >= g.backgroundAging ||
 		state.interactiveBurst >= g.maxInteractiveBurst)
 	if chooseBackground {
@@ -314,8 +331,17 @@ func (g *Governor) nextWaiterLocked(state *resourceState) *waiter {
 		state.interactiveBurst = 0
 		return w
 	}
-	w := state.interactive[0]
-	state.interactive = state.interactive[1:]
+	var w *waiter
+	switch {
+	case len(state.query) > 0:
+		w, state.query = state.query[0], state.query[1:]
+	case len(state.interactive) > 0:
+		w, state.interactive = state.interactive[0], state.interactive[1:]
+	case len(state.rerank) > 0:
+		w, state.rerank = state.rerank[0], state.rerank[1:]
+	default:
+		w, state.background = state.background[0], state.background[1:]
+	}
 	if hasBackground {
 		state.interactiveBurst++
 	} else {
@@ -325,10 +351,7 @@ func (g *Governor) nextWaiterLocked(state *resourceState) *waiter {
 }
 
 func removeWaiter(state *resourceState, target *waiter) bool {
-	queue := &state.background
-	if target.priority == PriorityInteractive {
-		queue = &state.interactive
-	}
+	queue := state.queueForPriority(target.priority)
 	for i, candidate := range *queue {
 		if candidate != target {
 			continue
@@ -344,6 +367,19 @@ func removeWaiter(state *resourceState, target *waiter) bool {
 	return false
 }
 
+func (state *resourceState) queueForPriority(priority Priority) *[]*waiter {
+	switch priority {
+	case PriorityQuery:
+		return &state.query
+	case PriorityInteractive:
+		return &state.interactive
+	case PriorityRerank:
+		return &state.rerank
+	default:
+		return &state.background
+	}
+}
+
 // ResourceMetrics is a read-only point-in-time copy. No payload text, model
 // input, document name, or other user content is retained by the governor.
 type ResourceMetrics struct {
@@ -357,6 +393,7 @@ type ResourceMetrics struct {
 	WaitTotal          time.Duration
 	WaitMax            time.Duration
 	OldestQueuedWait   time.Duration
+	QueuedByPriority   map[Priority]int
 }
 
 type MetricsSnapshot struct {
@@ -378,12 +415,19 @@ func (g *Governor) Snapshot() MetricsSnapshot {
 	for resource, state := range g.states {
 		metric := ResourceMetrics{
 			Capacity: state.capacity, InUse: state.inUse,
-			QueuedInteractive: len(state.interactive), QueuedBackground: len(state.background),
-			AcquireCount: state.acquireCount, WaitCount: state.waitCount,
+			QueuedInteractive: len(state.query) + len(state.interactive),
+			QueuedBackground:  len(state.rerank) + len(state.background),
+			AcquireCount:      state.acquireCount, WaitCount: state.waitCount,
 			CancelledWaitCount: state.cancelledWaitCount,
 			WaitTotal:          state.waitTotal, WaitMax: state.waitMax,
+			QueuedByPriority: map[Priority]int{
+				PriorityQuery:       len(state.query),
+				PriorityInteractive: len(state.interactive),
+				PriorityRerank:      len(state.rerank),
+				PriorityBackground:  len(state.background),
+			},
 		}
-		for _, queue := range [][]*waiter{state.interactive, state.background} {
+		for _, queue := range [][]*waiter{state.query, state.interactive, state.rerank, state.background} {
 			if len(queue) == 0 {
 				continue
 			}
@@ -410,13 +454,15 @@ func (g *Governor) Close() {
 	}
 	g.closed = true
 	for _, state := range g.states {
-		for _, queue := range [][]*waiter{state.interactive, state.background} {
+		for _, queue := range [][]*waiter{state.query, state.interactive, state.rerank, state.background} {
 			for _, w := range queue {
 				w.err = ErrClosed
 				close(w.ready)
 			}
 		}
+		state.query = nil
 		state.interactive = nil
+		state.rerank = nil
 		state.background = nil
 		state.interactiveBurst = 0
 	}

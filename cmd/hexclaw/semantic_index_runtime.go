@@ -23,6 +23,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/knowledge"
+	"github.com/hexagon-codes/hexclaw/localinfer"
 	"github.com/hexagon-codes/hexclaw/resourcegov"
 )
 
@@ -727,6 +728,16 @@ type knowledgePurposeEmbedder struct {
 	runtimeGate    *knowledgeSemanticRuntimeGate
 }
 
+func (e *knowledgePurposeEmbedder) LocalInferenceAdmissionAtProviderBoundary() bool {
+	if e == nil || e.embedder == nil {
+		return false
+	}
+	marker, ok := e.embedder.(interface {
+		LocalInferenceAdmissionAtProviderBoundary() bool
+	})
+	return ok && marker.LocalInferenceAdmissionAtProviderBoundary()
+}
+
 func (e *knowledgePurposeEmbedder) EmbeddingReady(ctx context.Context) bool {
 	if e == nil || e.embedder == nil {
 		return false
@@ -761,8 +772,10 @@ func (e *knowledgePurposeEmbedder) EmbedForPurpose(
 	switch purpose {
 	case knowledge.EmbeddingPurposeQuery:
 		prefix = e.queryPrefix
+		callCtx = localinfer.WithOperation(callCtx, localinfer.OperationQueryEmbedding)
 	case knowledge.EmbeddingPurposeDocument:
 		prefix = e.documentPrefix
+		callCtx = localinfer.WithOperation(callCtx, localinfer.OperationDocumentEmbedding)
 	default:
 		return nil, fmt.Errorf("%w: unknown embedding purpose %q", knowledge.ErrInvalidEmbeddingProfile, purpose)
 	}
@@ -1248,8 +1261,9 @@ type knowledgeSemanticIndexRuntime struct {
 }
 
 type knowledgeSemanticRuntimeAssembly struct {
-	gate     *knowledgeSemanticRuntimeGate
-	governor *resourcegov.Governor
+	gate           *knowledgeSemanticRuntimeGate
+	governor       *resourcegov.Governor
+	localInference *localinfer.Coordinator
 }
 
 type knowledgeSemanticRuntimeOption func(*knowledgeSemanticRuntimeAssembly)
@@ -1260,6 +1274,12 @@ func withKnowledgeSemanticRuntimeGate(gate *knowledgeSemanticRuntimeGate) knowle
 
 func withKnowledgeSemanticResourceGovernor(governor *resourcegov.Governor) knowledgeSemanticRuntimeOption {
 	return func(assembly *knowledgeSemanticRuntimeAssembly) { assembly.governor = governor }
+}
+
+func withKnowledgeSemanticLocalInferenceCoordinator(
+	coordinator *localinfer.Coordinator,
+) knowledgeSemanticRuntimeOption {
+	return func(assembly *knowledgeSemanticRuntimeAssembly) { assembly.localInference = coordinator }
 }
 
 func (r *knowledgeSemanticIndexRuntime) Revoke(ctx context.Context) error {
@@ -1316,15 +1336,27 @@ func setupKnowledgeSemanticIndex(
 		return nil, fmt.Errorf("knowledge: bind desktop corpus: %w", err)
 	}
 	service := knowledge.NewSemanticIndexService(repository, resolver)
+	searchOptions := []knowledge.RevisionSearchOption{}
+	workerOptions := []knowledge.SemanticIndexWorkerOption{}
+	if assembly.localInference != nil {
+		searchOptions = append(searchOptions,
+			knowledge.WithRevisionSearchLocalInferenceCoordinator(assembly.localInference))
+		workerOptions = append(workerOptions,
+			knowledge.WithSemanticWorkerLocalInferenceCoordinator(assembly.localInference))
+	} else {
+		searchOptions = append(searchOptions,
+			knowledge.WithRevisionSearchResourceGovernor(assembly.governor))
+		workerOptions = append(workerOptions,
+			knowledge.WithSemanticWorkerResourceGovernor(assembly.governor))
+	}
 	searcher := knowledge.NewSQLiteRevisionSemanticSearcher(
-		db, knowledgeDesktopOwnerID, knowledgeDefaultCorpusID, registry,
-		knowledge.WithRevisionSearchResourceGovernor(assembly.governor),
+		db, knowledgeDesktopOwnerID, knowledgeDefaultCorpusID, registry, searchOptions...,
 	)
 	worker := knowledge.NewSemanticIndexWorker(repository, registry, knowledge.SemanticIndexWorkerConfig{
 		OwnerID: knowledgeDesktopOwnerID, CorpusID: knowledgeDefaultCorpusID,
 		WorkerID: workerID, BatchSize: 64, LeaseDuration: 5 * time.Minute,
 		RetryDelay: 30 * time.Second,
-	}, knowledge.WithSemanticWorkerResourceGovernor(assembly.governor))
+	}, workerOptions...)
 	runtime := &knowledgeSemanticIndexRuntime{
 		Repository: repository, Service: service, Searcher: searcher, Worker: worker,
 		Gate: selectKnowledgeSemanticRuntimeGate([]*knowledgeSemanticRuntimeGate{assembly.gate}),

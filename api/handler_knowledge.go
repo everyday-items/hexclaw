@@ -863,7 +863,7 @@ func (s *Server) handleKnowledgeRetrievalMetrics(w http.ResponseWriter, _ *http.
 // KnowledgeConfigPayload 检索质量参数的读写载体（GET 响应 / PUT 请求同形）。
 type KnowledgeConfigPayload struct {
 	Rerank      bool    `json:"rerank"`       // 重排总开关
-	RerankModel string  `json:"rerank_model"` // 专用 cross-encoder 重排模型（空=LLM 重排 / 自动）
+	RerankModel string  `json:"rerank_model"` // 专用 cross-encoder 模型；空=未显式指定，仅自动配置成功时启用，否则使用 MMR
 	QueryExpand bool    `json:"query_expand"` // HyDE + multi-query 查询扩展
 	Contextual  bool    `json:"contextual"`   // 入库 Contextual Retrieval
 	MinScore    float64 `json:"min_score"`    // 向量相关度地板 [0,1]，0=关

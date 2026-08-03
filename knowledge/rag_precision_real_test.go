@@ -12,10 +12,11 @@ import (
 //   - retrieval（rerank 关）：此路用 MMR 多样性兜底排序（rerankTopK 在无重排器时退 mmrSelect），
 //     MMRLambda=0.7 会**主动牺牲精确率换多样性**——故 top-3 会掺入不相关簇，precision@3 偏低，
 //     这是设计使然，不是 bug。此路只测量+记录（宽松灾难floor），作为"为何需要重排"的证据。
-//   - with_rerank（生产默认）：cross-encoder 精排按纯相关度排序 → 干扰被挤出 top-3。这是硬护栏。
+//   - with_dedicated_reranker：显式配置的真实 cross-encoder 按纯相关度排序，干扰被挤出
+//     top-3。这是专用重排能力的硬护栏；聊天 LLM 不参与该链路。
 //
-// 即「生产默认（重排开）保证 top-3 纯净」是被锁的不变量，对齐 TestRAGReal_Scenarios_CrossLingual 的
-// 「断言生产默认、记录无重排路」范式。
+// 即「专用 executor 真实执行后保证 top-3 纯净」是被锁的不变量；仅打开 rerank 开关但
+// 未配置 executor 时是 MMR 降级，不得冒充此测试的 cross-encoder 证据。
 //
 //	HEX_RAG_E2E=1 HEX_E2E_SF_* go test ./knowledge/ -run TestRAGReal_Precision -v
 func TestRAGReal_Precision(t *testing.T) {
@@ -57,13 +58,12 @@ func TestRAGReal_Precision(t *testing.T) {
 		}
 	})
 
-	// ② 生产默认（cross-encoder 重排）：top-3 应基本纯净——硬护栏。
-	t.Run("with_rerank", func(t *testing.T) {
-		llm := sfChatLLM(t)
+	// ② 显式专用 cross-encoder：top-3 应基本纯净——硬护栏。
+	t.Run("with_dedicated_reranker", func(t *testing.T) {
 		cfg := DefaultHybridConfig()
 		cfg.ExpandEnabled, cfg.ContextualEnabled = false, false
 		cfg.RerankEnabled = true
-		mgr := newRealManager(t, cfg, emb, llm)
+		mgr := newRerankMgr(t, cfg, emb, sfDedicatedReranker(t, cfg.CandidateK))
 		ingest(mgr)
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 		defer cancel()
@@ -72,8 +72,12 @@ func TestRAGReal_Precision(t *testing.T) {
 			t.Fatal(err)
 		}
 		logRep("rerank", rep)
+		metrics := mgr.RetrievalMetricsSnapshot().Rerank
+		if metrics.Executed == 0 || metrics.Succeeded == 0 {
+			t.Fatalf("专用 cross-encoder 未真实执行成功，metrics=%+v", metrics)
+		}
 		if rep.MeanPrecK < 0.67 {
-			t.Errorf("生产默认（重排）mean precision@3=%.2f < 0.67（近义干扰污染过重）", rep.MeanPrecK)
+			t.Errorf("专用 cross-encoder mean precision@3=%.2f < 0.67（近义干扰污染过重）", rep.MeanPrecK)
 		}
 	})
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/hexagon-codes/hexagon/rag/reranker"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/egress"
+	"github.com/hexagon-codes/hexclaw/localinfer"
 )
 
 const (
@@ -36,6 +37,7 @@ type safeCohereReranker struct {
 	apiKey   string
 	model    string
 	topK     int
+	timeout  time.Duration
 }
 
 type safeCohereRerankRequest struct {
@@ -85,6 +87,7 @@ func newSafeCohereReranker(
 	}
 	return &safeCohereReranker{
 		client: client, endpoint: parsed.String(), apiKey: apiKey, model: model, topK: topK,
+		timeout: cohereRerankTimeout,
 	}, nil
 }
 
@@ -118,11 +121,12 @@ func (r *safeCohereReranker) Rerank(
 	if err != nil {
 		return nil, fmt.Errorf("marshal reranker request: %w", err)
 	}
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, cohereRerankTimeout)
-		defer cancel()
+	timeout := r.timeout
+	if timeout <= 0 {
+		timeout = cohereRerankTimeout
 	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("create reranker request: %w", err)
@@ -189,6 +193,62 @@ func truncateRunes(value string, limit int) string {
 type guardedDocReranker struct {
 	next  reranker.Reranker
 	guard func(context.Context) error
+}
+
+type coordinatedDocReranker struct {
+	next        reranker.Reranker
+	coordinator *localinfer.Coordinator
+	timeout     time.Duration
+}
+
+func (r coordinatedDocReranker) Name() string {
+	if r.next == nil {
+		return "local-inference-reranker"
+	}
+	return r.next.Name()
+}
+
+func (r coordinatedDocReranker) Rerank(
+	ctx context.Context,
+	query string,
+	docs []rag.Document,
+) (result []rag.Document, err error) {
+	if r.next == nil || r.coordinator == nil {
+		return nil, fmt.Errorf("local reranker admission is not configured")
+	}
+	timeout := r.timeout
+	if timeout <= 0 {
+		timeout = cohereRerankTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	callCtx, lease, err := r.coordinator.Acquire(
+		localinfer.WithOperation(ctx, localinfer.OperationRerank),
+		localinfer.OperationRerank,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { lease.Finish(err) }()
+	result, err = r.next.Rerank(callCtx, query, docs)
+	if len(result) > 0 {
+		lease.MarkFirstOutput()
+	}
+	return result, err
+}
+
+func coordinateRerankerForProvider(
+	next reranker.Reranker,
+	providerName string,
+	provider config.LLMProviderConfig,
+	coordinator *localinfer.Coordinator,
+) reranker.Reranker {
+	if next == nil || coordinator == nil || !isLocalEmbeddingProvider(providerName, provider) {
+		return next
+	}
+	return coordinatedDocReranker{
+		next: next, coordinator: coordinator, timeout: cohereRerankTimeout,
+	}
 }
 
 func (r guardedDocReranker) Name() string {

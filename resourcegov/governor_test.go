@@ -36,6 +36,30 @@ func waitQueued(t *testing.T, governor *Governor, resource Resource, interactive
 		interactive, background, governor.Snapshot().Resources[resource])
 }
 
+func TestPriorityFromContextPreservesEveryValidLane(t *testing.T) {
+	for _, priority := range []Priority{
+		PriorityBackground,
+		PriorityRerank,
+		PriorityInteractive,
+		PriorityQuery,
+	} {
+		priority := priority
+		t.Run(priority.String(), func(t *testing.T) {
+			ctx := WithPriority(context.Background(), priority)
+			if got := PriorityFromContext(ctx, PriorityBackground); got != priority {
+				t.Fatalf("PriorityFromContext()=%s, want %s", got, priority)
+			}
+		})
+	}
+}
+
+func TestPriorityNumericCompatibility(t *testing.T) {
+	if PriorityBackground != 1 || PriorityInteractive != 2 || PriorityRerank != 3 || PriorityQuery != 4 {
+		t.Fatalf("priority values changed: background=%d interactive=%d rerank=%d query=%d",
+			PriorityBackground, PriorityInteractive, PriorityRerank, PriorityQuery)
+	}
+}
+
 func TestGovernorSharesOneVLMPeakAcrossGradingAndKnowledge(t *testing.T) {
 	governor, err := New(testConfig())
 	if err != nil {

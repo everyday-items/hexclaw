@@ -10,6 +10,7 @@ import (
 
 	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/egress"
+	"github.com/hexagon-codes/hexclaw/localinfer"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
@@ -68,7 +69,10 @@ func (vm *VectorMemory) Save(ctx context.Context, content string, metadata map[s
 	}
 
 	// 在锁外执行 HTTP 调用（embedding 可能耗时数秒）
-	embedding, err := vm.embedder.EmbedOne(vectorMemoryEgressContext(ctx), content)
+	embedCtx := localinfer.WithOperation(
+		vectorMemoryEgressContext(ctx), localinfer.OperationDocumentEmbedding,
+	)
+	embedding, err := vm.embedder.EmbedOne(embedCtx, content)
 	if err != nil {
 		return fmt.Errorf("生成向量失败: %w", err)
 	}
@@ -110,7 +114,10 @@ func (vm *VectorMemory) Search(ctx context.Context, query string, topK int) ([]V
 	}
 
 	// 在锁外执行 HTTP 调用（embedding 可能耗时数秒）
-	queryEmbedding, err := vm.embedder.EmbedOne(vectorMemoryEgressContext(ctx), query)
+	embedCtx := localinfer.WithOperation(
+		vectorMemoryEgressContext(ctx), localinfer.OperationQueryEmbedding,
+	)
+	queryEmbedding, err := vm.embedder.EmbedOne(embedCtx, query)
 	if err != nil {
 		return nil, fmt.Errorf("生成查询向量失败: %w", err)
 	}

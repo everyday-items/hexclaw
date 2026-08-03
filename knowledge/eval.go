@@ -121,7 +121,8 @@ func GoldenCorpus() []EvalDoc {
 		{"Go 并发模型", "Go 以 CSP（通信顺序进程）为基础设计并发。goroutine 是运行时调度的轻量级执行单元，启动成本极低。" +
 			"goroutine 之间通过 channel 传递数据，遵循以通信共享内存的原则；select 可在多个 channel 上多路复用；sync.Mutex 提供互斥。"},
 		{"HexClaw 知识库检索配置", "HexClaw 知识库的检索参数：candidate_k 控制重排前的宽召回候选池大小，默认 50；" +
-			"min_score 是向量相关度地板，默认 0.55；rerank 开关控制是否启用 LLM 重排；query_expand 控制 HyDE 与 multi-query；" +
+			"min_score 是向量相关度地板，默认 0.85；rerank 开关控制是否尝试专用 cross-encoder 重排，无专用 executor 时使用 MMR；" +
+			"query_expand 控制 HyDE 与 multi-query；" +
 			"contextual 控制入库时是否给 chunk 生成文档级上下文。"},
 		{"京杭大运河", "京杭大运河始建于春秋，隋朝贯通，北起北京南到杭州，沟通海河、黄河、淮河、长江、钱塘江五大水系，全长约一千八百公里。"},
 		{"Vector Database Indexing", "Vector databases use approximate nearest neighbor (ANN) search to retrieve the closest embeddings to a query. " +

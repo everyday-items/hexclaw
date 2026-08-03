@@ -14,6 +14,7 @@ import (
 
 	"github.com/hexagon-codes/hexagon/rag/splitter"
 	"github.com/hexagon-codes/hexclaw/internal/sqliteutil"
+	"github.com/hexagon-codes/hexclaw/localinfer"
 	"github.com/hexagon-codes/hexclaw/resourcegov"
 )
 
@@ -134,17 +135,22 @@ type RevisionSemanticExecutionProfiler interface {
 // snapshot and scans only vectors belonging to that same revision/vector
 // space. It intentionally never reads kb_chunks.embedding.
 type SQLiteRevisionSemanticSearcher struct {
-	db       *sql.DB
-	ownerID  string
-	corpusID string
-	registry ProfileEmbeddingExecutorRegistry
-	governor *resourcegov.Governor
+	db             *sql.DB
+	ownerID        string
+	corpusID       string
+	registry       ProfileEmbeddingExecutorRegistry
+	governor       *resourcegov.Governor
+	localInference *localinfer.Coordinator
 }
 
 type RevisionSearchOption func(*SQLiteRevisionSemanticSearcher)
 
 func WithRevisionSearchResourceGovernor(governor *resourcegov.Governor) RevisionSearchOption {
 	return func(searcher *SQLiteRevisionSemanticSearcher) { searcher.governor = governor }
+}
+
+func WithRevisionSearchLocalInferenceCoordinator(coordinator *localinfer.Coordinator) RevisionSearchOption {
+	return func(searcher *SQLiteRevisionSemanticSearcher) { searcher.localInference = coordinator }
 }
 
 func NewSQLiteRevisionSemanticSearcher(
@@ -375,6 +381,11 @@ func (s *SQLiteRevisionSemanticSearcher) SearchWithPlanReceipt(
 	topK int,
 	filter Filter,
 ) ([]*SearchResult, bool, *QueryEmbeddingReceipt, error) {
+	if profile, ok := EmbeddingExecutionProfileForModel(plan.profile.Profile.ModelName); ok && profile.QueryTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, profile.QueryTimeout)
+		defer cancel()
+	}
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return nil, false, nil, nil
@@ -392,19 +403,35 @@ func (s *SQLiteRevisionSemanticSearcher) SearchWithPlanReceipt(
 	if readiness, ok := executor.(ProfileEmbeddingExecutorReadiness); ok && !readiness.EmbeddingReady(ctx) {
 		return nil, false, nil, ErrEmbeddingUnavailable
 	}
-	var permit *resourcegov.Permit
-	if s.governor != nil {
+	var (
+		permit         *resourcegov.Permit
+		inferenceLease *localinfer.Lease
+	)
+	if s.localInference != nil && plan.profile.Profile.Location == ProviderLocationLocal &&
+		!hasProviderBoundEmbeddingAdmission(executor) {
+		ctx, inferenceLease, err = s.localInference.Acquire(
+			localinfer.WithOperation(ctx, localinfer.OperationQueryEmbedding),
+			localinfer.OperationQueryEmbedding,
+		)
+		if err != nil {
+			return nil, false, nil, err
+		}
+	} else if s.localInference == nil && s.governor != nil &&
+		plan.profile.Profile.Location == ProviderLocationLocal {
 		permit, err = s.governor.Acquire(
-			ctx, resourcegov.ResourceAccelerator, resourcegov.PriorityInteractive,
+			ctx, resourcegov.ResourceAccelerator, resourcegov.PriorityQuery,
 		)
 		if err != nil {
 			return nil, false, nil, err
 		}
 	}
-	vectors, err := executor.EmbedForPurpose(ctx, EmbeddingPurposeQuery, []string{query})
-	if permit != nil {
-		permit.Release()
-	}
+	ctx = localinfer.WithOperation(ctx, localinfer.OperationQueryEmbedding)
+	vectors, err := invokeEmbeddingWithAdmission(
+		ctx, inferenceLease, permit,
+		func(callCtx context.Context) ([][]float32, error) {
+			return executor.EmbedForPurpose(callCtx, EmbeddingPurposeQuery, []string{query})
+		},
+	)
 	if err != nil {
 		return nil, false, nil, err
 	}

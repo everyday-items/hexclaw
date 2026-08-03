@@ -184,7 +184,8 @@ func TestRAGReal_Functions(t *testing.T) {
 	})
 }
 
-// ③ 更多 chat 模型：完整管线(rerank+contextual) + 会话 grounded + 无答案忠实性。
+// ③ 更多 chat 模型：混合检索/MMR + 会话 grounded + 无答案忠实性。
+// 本矩阵不配置专用 reranker；chat 模型只负责回答，不参与文档重排。
 func TestRAGReal_ChatModelMatrix(t *testing.T) {
 	emb := requireE2E(t)
 	base, key := sfBaseKey(t)
@@ -201,7 +202,7 @@ func TestRAGReal_ChatModelMatrix(t *testing.T) {
 			}
 
 			cfg := DefaultHybridConfig()
-			// 控时：本矩阵聚焦各 chat 模型的「重排 + 会话 + 忠实性」；
+			// 控时：本矩阵聚焦各 chat 模型的「会话 + 忠实性」；
 			// contextual 入库已在 TestRAGReal_Functions 覆盖，这里关掉以省每模型 ~160s。
 			cfg.ExpandEnabled, cfg.ContextualEnabled = false, false
 			mgr := newRealManager(t, cfg, emb, llm)
@@ -209,10 +210,14 @@ func TestRAGReal_ChatModelMatrix(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// 跨语种 + 完整管线（融合修复 + 重排都应 nail）
+			// 跨语种 + 混合检索/MMR；无专用 executor，不得把 chat LLM 用作重排器。
 			hits, _ := mgr.Search(ctx, "How do plants use sunlight to produce food and release oxygen?", 3)
 			if len(hits) == 0 || hits[0].DocTitle != "光合作用" {
 				t.Errorf("[%s] 跨语种完整管线检索错位：%v", model, titles(hits))
+			}
+			rerankMetrics := mgr.RetrievalMetricsSnapshot().Rerank
+			if rerankMetrics.Configured == 0 || rerankMetrics.Executed != 0 {
+				t.Fatalf("[%s] chat-only 矩阵不得执行文档重排，metrics=%+v", model, rerankMetrics)
 			}
 
 			// 会话 grounded
