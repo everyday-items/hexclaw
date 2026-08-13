@@ -575,7 +575,7 @@ type WorkflowRun struct {
 }
 
 func (s *Server) newWorkflowRun(wf *WorkflowData, input string, prior *WorkflowRun) *WorkflowRun {
-	providerDisplayName, modelID := s.freezeWorkflowRouteSnapshot(wf)
+	var providerDisplayName, modelID *string
 	if prior != nil && (prior.ProviderDisplayName != nil || prior.ModelID != nil) {
 		providerDisplayName = cloneWorkflowRouteFact(prior.ProviderDisplayName)
 		modelID = cloneWorkflowRouteFact(prior.ModelID)
@@ -591,12 +591,9 @@ func (s *Server) newWorkflowRun(wf *WorkflowData, input string, prior *WorkflowR
 	}
 }
 
-func (s *Server) freezeWorkflowRouteSnapshot(wf *WorkflowData) (*string, *string) {
-	requestedProvider, requestedModel, modelBoundary := workflowRouteRequest(wf)
-	if !modelBoundary {
-		return nil, nil
-	}
-
+// freezeWorkflowRouteSnapshot 仅在 Agent 即将进入引擎调用边界时解析并冻结路由事实。
+// 不能在 Run 创建时从工作流定义预填，否则解析/DAG 失败等零模型调用终态会伪造路由。
+func (s *Server) freezeWorkflowRouteSnapshot(requestedProvider, requestedModel string) (*string, *string) {
 	llmCfg := s.persistedLLMConfig()
 	providerKey := requestedProvider
 	if providerKey == "" {
@@ -613,31 +610,6 @@ func (s *Server) freezeWorkflowRouteSnapshot(wf *WorkflowData) (*string, *string
 	}
 
 	return newWorkflowRouteFact(providerDisplayName), newWorkflowRouteFact(requestedModel)
-}
-
-func workflowRouteRequest(wf *WorkflowData) (provider, model string, modelBoundary bool) {
-	if wf == nil {
-		return "", "", false
-	}
-	for _, raw := range wf.Nodes {
-		node, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		switch strings.ToLower(strings.TrimSpace(stringAny(node["type"]))) {
-		case "agent", "handoff", "agent_handoff", "parallel", "fanout":
-		default:
-			continue
-		}
-
-		data, _ := node["data"].(map[string]any)
-		if len(data) == 0 {
-			data, _ = node["config"].(map[string]any)
-		}
-		return strings.TrimSpace(stringAny(data["provider"])),
-			strings.TrimSpace(stringAny(data["model"])), true
-	}
-	return "", "", false
 }
 
 func newWorkflowRouteFact(value string) *string {

@@ -88,6 +88,14 @@ type workflowExecutor struct {
 
 	mu       sync.Mutex
 	nodeRuns map[string]*WorkflowNodeRun
+	run      *WorkflowRun
+
+	// routeSnapshotCaptured 表示本次运行已经到达真实 Agent 调用边界。
+	// 并行节点可能乱序抵达，因此用 workflow 声明顺序稳定选择首个实际调用的路由。
+	routeSnapshotCaptured  bool
+	routeSnapshotNodeOrder int
+	// routeSnapshotAuthoritative 表示该快照已经被引擎回复确认，而不只是调用前候选。
+	routeSnapshotAuthoritative bool
 
 	// resumed：续接（Ph5）已完成节点的缓存输出（nodeID→output）。执行时这些节点跳过重跑，
 	// 直接复用上次结果，只重算失败/未达的节点——对齐 OpenClaw 续接语义。
@@ -96,14 +104,15 @@ type workflowExecutor struct {
 
 func newWorkflowExecutor(s *Server, wf *WorkflowData, req RunWorkflowRequest) *workflowExecutor {
 	return &workflowExecutor{
-		server:   s,
-		wf:       wf,
-		req:      req,
-		nodes:    make(map[string]*workflowNode),
-		incoming: make(map[string][]string),
-		outgoing: make(map[string][]string),
-		order:    make(map[string]int),
-		nodeRuns: make(map[string]*WorkflowNodeRun),
+		server:                 s,
+		wf:                     wf,
+		req:                    req,
+		nodes:                  make(map[string]*workflowNode),
+		incoming:               make(map[string][]string),
+		outgoing:               make(map[string][]string),
+		order:                  make(map[string]int),
+		nodeRuns:               make(map[string]*WorkflowNodeRun),
+		routeSnapshotNodeOrder: -1,
 	}
 }
 
@@ -114,6 +123,12 @@ func (e *workflowExecutor) withResumed(resumed map[string]string) *workflowExecu
 }
 
 func (e *workflowExecutor) execute(ctx context.Context, run *WorkflowRun) *WorkflowRun {
+	e.run = run
+	if run != nil && (run.ProviderDisplayName != nil || run.ModelID != nil) {
+		// 续接继承上一次真实调用的历史快照，绝不按当前配置重算。
+		e.routeSnapshotCaptured = true
+		e.routeSnapshotAuthoritative = true
+	}
 	if err := e.parse(); err != nil {
 		return e.failedRun(run, err)
 	}
@@ -439,6 +454,7 @@ func (e *workflowExecutor) executeAgent(ctx context.Context, node *workflowNode,
 	if strings.TrimSpace(metadata["locale"]) == "" {
 		metadata["locale"] = "und"
 	}
+	e.freezeRunRouteAtModelBoundary(node)
 
 	reply, err := e.server.engine.Process(ctx, (&agentrouterMessageAdapter{
 		UserID:     firstNonEmpty(e.req.UserID, "workflow-"+e.wf.ID),
@@ -454,7 +470,74 @@ func (e *workflowExecutor) executeAgent(ctx context.Context, node *workflowNode,
 	if reply == nil {
 		return "", nil
 	}
+	e.freezeRunRouteFromEngineReply(node, reply)
 	return reply.Content, nil
+}
+
+// freezeRunRouteAtModelBoundary 把首次实际进入 Agent 引擎调用边界的路由落到唯一 run 真相源。
+// DAG/解析等前置失败不会触达本方法，因此其 DTO 保持显式 null；resume 则沿用已有历史快照。
+func (e *workflowExecutor) freezeRunRouteAtModelBoundary(node *workflowNode) {
+	if node == nil {
+		return
+	}
+	e.recordRunRouteSnapshot(
+		node,
+		strings.TrimSpace(stringValue(node.Data["provider"])),
+		strings.TrimSpace(stringValue(node.Data["model"])),
+		false,
+	)
+}
+
+// freezeRunRouteFromEngineReply 以引擎确认的 provider/model 覆盖同一调用边界的候选值。
+// 引擎可能在实际运行时完成路由或回退，不能把请求节点配置误当成物理调用事实。
+func (e *workflowExecutor) freezeRunRouteFromEngineReply(node *workflowNode, reply *adapter.Reply) {
+	if node == nil || reply == nil || reply.Metadata == nil {
+		return
+	}
+	provider := strings.TrimSpace(reply.Metadata["provider"])
+	model := strings.TrimSpace(reply.Metadata["model"])
+	if provider == "" && model == "" {
+		return
+	}
+	e.recordRunRouteSnapshot(
+		node,
+		firstNonEmpty(provider, strings.TrimSpace(stringValue(node.Data["provider"]))),
+		firstNonEmpty(model, strings.TrimSpace(stringValue(node.Data["model"]))),
+		true,
+	)
+}
+
+func (e *workflowExecutor) recordRunRouteSnapshot(node *workflowNode, requestedProvider, requestedModel string, authoritative bool) {
+	if e.server == nil || e.server.workflowStore == nil || e.run == nil || node == nil {
+		return
+	}
+
+	providerDisplayName, modelID := e.server.freezeWorkflowRouteSnapshot(
+		requestedProvider,
+		requestedModel,
+	)
+	candidateOrder := e.order[node.ID]
+
+	e.server.workflowStore.mu.Lock()
+	defer e.server.workflowStore.mu.Unlock()
+	if e.routeSnapshotCaptured && e.routeSnapshotNodeOrder < 0 {
+		return
+	}
+	if e.routeSnapshotCaptured && e.routeSnapshotNodeOrder < candidateOrder {
+		return
+	}
+	if e.routeSnapshotCaptured && e.routeSnapshotNodeOrder == candidateOrder &&
+		(e.routeSnapshotAuthoritative || !authoritative) {
+		return
+	}
+
+	e.run.ProviderDisplayName = providerDisplayName
+	e.run.ModelID = modelID
+	e.routeSnapshotCaptured = true
+	e.routeSnapshotNodeOrder = candidateOrder
+	e.routeSnapshotAuthoritative = authoritative
+	// 在物理调用开始时立即持久化，崩溃/重启不能把已发生的调用退化为无路由事实。
+	e.server.workflowStore.persistRuns()
 }
 
 // maxWorkflowParallel 限制单个 parallel 节点并发跑的角色 Agent 数（与 orchestrate 一致）。
