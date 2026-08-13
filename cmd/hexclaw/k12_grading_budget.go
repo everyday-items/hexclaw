@@ -18,7 +18,8 @@ func k12GradingBudgetSnapshotFromConfig(cfg config.K12GradingBudgetConfig) k12.G
 		}
 	}
 	return k12.GradingBudgetSnapshot{
-		PolicyVersion: cfg.PolicyVersion,
+		PolicyVersion:          cfg.PolicyVersion,
+		RecognitionPlanVersion: cfg.RecognitionPlanVersion,
 		StageSeconds: k12.GradingStageBudgets{
 			Queued: cfg.QueuedSeconds, Normalizing: cfg.NormalizingSeconds,
 			Recognizing: cfg.RecognizingSeconds, Locating: cfg.LocatingSeconds,
@@ -26,5 +27,14 @@ func k12GradingBudgetSnapshotFromConfig(cfg config.K12GradingBudgetConfig) k12.G
 		},
 		AssessingBuckets: buckets,
 		ItemConcurrency:  cfg.ItemConcurrency,
+		RecognizingBuckets: k12.RecognitionLayoutBudgetBucketsV2{
+			UpTo1ProblemMillis:   cfg.RecognizingBuckets.UpTo1ProblemMillis,
+			UpTo8ProblemsMillis:  cfg.RecognizingBuckets.UpTo8ProblemsMillis,
+			UpTo16ProblemsMillis: cfg.RecognizingBuckets.UpTo16ProblemsMillis,
+			UpTo32ProblemsMillis: cfg.RecognizingBuckets.UpTo32ProblemsMillis,
+		},
+		PhysicalCallCapMillis: cfg.PhysicalCallCapMillis,
+		WorkerHardCap:         cfg.WorkerHardCap,
+		EffectiveConcurrency:  cfg.EffectiveConcurrency,
 	}
 }

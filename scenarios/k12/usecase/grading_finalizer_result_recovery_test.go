@@ -4,11 +4,68 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 )
+
+func TestBuildFinalTutoringTipsSettlesProjectionWhenReviewIgnoresBudget(t *testing.T) {
+	fixture := prepareFinalSummaryCrashFixture(t)
+	generator := newProjectingDeadlineIgnoringTipsGenerator()
+	fixture.orchestrator.deps.TutoringTipsReview = generator
+	t.Cleanup(generator.unblock)
+
+	oldBudget := tutoringTipsBuildBudget
+	tutoringTipsBuildBudget = time.Second
+	t.Cleanup(func() { tutoringTipsBuildBudget = oldBudget })
+	releaseDelay := 2 * tutoringTipsBuildBudget
+	go func() {
+		time.Sleep(releaseDelay)
+		generator.unblock()
+	}()
+
+	job := fixture.job
+	job.Fields.AttemptCount = 1 // 保留夹具中已发送的尝试，再触发一次新的逻辑尝试。
+	orderedDigestsJSON, err := json.Marshal([]string{"sha256:summary-result-crash-assessment"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	tips, invocationID, err := fixture.orchestrator.buildFinalTutoringTips(
+		context.Background(),
+		job,
+		1,
+		orderedDigestsJSON,
+	)
+	if err != nil {
+		t.Fatalf("bounded final tutoring tips: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 1500*time.Millisecond {
+		t.Fatalf("logical projecting invocation remained blocked for %s", elapsed)
+	}
+	if invocationID == "" || strings.Contains(tips.Sections[0].Content, "late provider text") {
+		t.Fatalf("late page-summary result leaked: invocation=%q tips=%+v", invocationID, tips)
+	}
+	if calls := generator.callCount(); calls != 1 {
+		t.Fatalf("deadline-insensitive page-summary calls=%d want 1", calls)
+	}
+	invocation, err := fixture.orchestrator.deps.Records.GetModelInvocationByAttempt(
+		context.Background(),
+		job.Record.AgentName,
+		job.Record.RecordID,
+		k12.GradingStageProjecting,
+		2,
+	)
+	if err != nil {
+		t.Fatalf("load bounded projecting invocation: %v", err)
+	}
+	if invocation.Status != k12.ModelInvocationSucceeded {
+		t.Fatalf("bounded projecting invocation status=%s want succeeded", invocation.Status)
+	}
+}
 
 type finalSummaryCrashFixture struct {
 	orchestrator *GradingOrchestrator

@@ -563,18 +563,7 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 	if skipped {
 		return item, nil
 	}
-	switch {
-	case graded.OutOfScope:
-		item.Status = PhotoOutOfScope
-	case !photoEvidenceTrusted(graded.Evidence):
-		item.Status, item.Warning = PhotoUntrusted, "验算证据不足，暂不在图片上判对错"
-	case graded.Outcome.Verdict == VerdictAgree:
-		item.Status = PhotoCorrect
-	case graded.Outcome.Verdict == VerdictDisagree:
-		item.Status = PhotoWrong
-	default:
-		item.Status, item.Warning = PhotoUntrusted, "批改判定无二元结论，暂不在图片上判对错"
-	}
+	item.Status, item.Warning = photoAssessmentStatus(graded)
 	effects := k12storage.GradingAssessmentEffects{}
 	if job.Fields.SourceKind != PracticeReturnGradingSourceKind {
 		var effectsErr error
@@ -584,7 +573,7 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 		}
 	}
 	parentGuideInvocationID := ""
-	if item.Status == PhotoWrong {
+	if item.Status == PhotoWrong || item.Status == PhotoCorrectWithProcessIssue {
 		guideRequest := parentTeachingGuideRequest(gradeReq, solved, graded.Outcome)
 		rawGuide, invocationID, guideErr := executeGradingItemOperation(ctx, o, job, q,
 			k12.GradingItemOperationParentGuide,
@@ -890,6 +879,7 @@ func commitGradingAssessmentItem(
 	}
 	if parentGuideInvocationID != "" &&
 		item.Status != PhotoWrong &&
+		item.Status != PhotoCorrectWithProcessIssue &&
 		item.Status != PhotoBlankSolved {
 		return item, fmt.Errorf(
 			"%w: parent guide cannot attach to status %s",
@@ -957,6 +947,8 @@ func gradingAssessmentStatus(status PhotoItemStatus) (k12.GradingAssessmentStatu
 	switch status {
 	case PhotoCorrect:
 		return k12.GradingAssessmentCorrect, nil
+	case PhotoCorrectWithProcessIssue:
+		return k12.GradingAssessmentProcessIssue, nil
 	case PhotoWrong:
 		return k12.GradingAssessmentWrong, nil
 	case PhotoUnanswered:
@@ -1062,7 +1054,7 @@ func validateGradingAssessmentTerminalItem(
 		)
 	}
 	switch receipt.Status {
-	case k12.GradingAssessmentWrong, k12.GradingAssessmentBlankSolved:
+	case k12.GradingAssessmentWrong, k12.GradingAssessmentProcessIssue, k12.GradingAssessmentBlankSolved:
 		if item.ParentGuide == nil {
 			return fmt.Errorf(
 				"%w: problem=%s status=%s requires a complete parent guide",

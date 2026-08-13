@@ -94,7 +94,7 @@ func TestProfileBundleRejectsNonCanonicalSubjectTextbooksWithoutWrites(t *testin
 }
 
 func TestProfileBundlePersistsCanonicalSubjects(t *testing.T) {
-	h, deps, _ := newWeeklyContractServer(t)
+	h, deps, _ := newWeeklyBundleContractServer(t)
 	rec, body := do(t, h, http.MethodPut, "/profile-bundle",
 		weeklyBundleBody("canonical-bundle", 0, 0, 0))
 	if rec.Code != http.StatusOK {
@@ -140,7 +140,7 @@ func TestProfileBundlePersistsCanonicalSubjects(t *testing.T) {
 }
 
 func TestBUG20260726034_LegacyProfilePUTAlwaysRejectedWithoutMutation(t *testing.T) {
-	h, deps, _ := newWeeklyContractServer(t)
+	h, deps, _ := newWeeklyBundleContractServer(t)
 	rec, _ := do(t, h, http.MethodPut, "/profile-bundle",
 		weeklyBundleBody("bug-034-bundle", 0, 0, 0))
 	if rec.Code != http.StatusOK {

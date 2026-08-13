@@ -6,13 +6,22 @@ import (
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/records"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
 type tutoringTipsSendReq struct {
-	Agent               string `json:"agent"`
-	FinalArtifactID     string `json:"final_artifact_id"`
-	FinalArtifactDigest string `json:"final_artifact_digest,omitempty"`
+	Agent               string                      `json:"agent"`
+	FinalArtifactID     string                      `json:"final_artifact_id"`
+	FinalArtifactDigest string                      `json:"final_artifact_digest,omitempty"`
+	ExpectedBinding     *expectedDeliveryBindingReq `json:"expected_binding,omitempty"`
+}
+
+type expectedDeliveryBindingReq struct {
+	BindingID  string `json:"binding_id"`
+	Platform   string `json:"platform"`
+	InstanceID string `json:"instance_id"`
+	ChatID     string `json:"chat_id"`
 }
 
 // sendTutoringTips sends only the canonical frozen grading final_artifact.
@@ -29,9 +38,25 @@ func (h *handler) sendTutoringTips(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "agent / final_artifact_id required")
 		return
 	}
-	batch, _, err := h.rt.Deps.PrepareAndSendGradingFinalArtifactExact(
-		r.Context(), req.Agent, req.FinalArtifactID, req.FinalArtifactDigest,
+	var (
+		batch k12.DeliveryBatch
+		err   error
 	)
+	if req.ExpectedBinding == nil {
+		batch, _, err = h.rt.Deps.PrepareAndSendGradingFinalArtifactExact(
+			r.Context(), req.Agent, req.FinalArtifactID, req.FinalArtifactDigest,
+		)
+	} else {
+		expected := usecase.ExpectedDeliveryBinding{
+			BindingID:  req.ExpectedBinding.BindingID,
+			Platform:   req.ExpectedBinding.Platform,
+			InstanceID: req.ExpectedBinding.InstanceID,
+			ChatID:     req.ExpectedBinding.ChatID,
+		}
+		batch, _, err = h.rt.Deps.PrepareAndSendGradingFinalArtifactForExpectedBindingExact(
+			r.Context(), req.Agent, req.FinalArtifactID, req.FinalArtifactDigest, expected,
+		)
+	}
 	if err != nil {
 		writeDeliveryError(w, err)
 		return
@@ -137,6 +162,8 @@ func (h *handler) queryDeliveryReceipt(w http.ResponseWriter, r *http.Request) {
 
 func writeDeliveryError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, usecase.ErrDeliveryBindingSnapshotConflict):
+		writeErr(w, http.StatusConflict, "binding_snapshot_conflict")
 	case errors.Is(err, usecase.ErrDeliveryUnavailable):
 		writeErr(w, http.StatusNotImplemented, "发送到手机还没有开通，请先在连接设置里完成私聊绑定")
 	case errors.Is(err, usecase.ErrNoActiveDirectBindings):

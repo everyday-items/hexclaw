@@ -67,7 +67,7 @@ func TestBUG20260726034A03FormalAssemblyProvidesAssessorOrFailsClosed(t *testing
 }
 
 func TestBUG20260726034A03MissingAssessorFailsClosedWithoutPseudoAttempt(t *testing.T) {
-	setupHandler, deps, _ := newWeeklyContractServer(t)
+	setupHandler, deps, _ := newWeeklyBundleContractServer(t)
 	path, body, snapshotID := prepareA03Snapshot(t, setupHandler)
 	deps.WeeklyAssessment = nil
 	h := apihttp.NewHandler(apihttp.Runtime{Records: deps.Records, Deps: deps})
@@ -102,11 +102,11 @@ func (a *a03SlowWrongAssessor) AssessWeeklyPracticeAnswer(
 	a.calls.Add(1)
 	time.Sleep(75 * time.Millisecond)
 	return usecase.WeeklyPracticeAnswerAssessment{
-		AssessmentID:        "assessment-a03-" + req.Item.ItemID,
-		Result:              k12.WeeklyAttemptWrong,
+		AssessmentID:         "assessment-a03-" + req.Item.ItemID,
+		Result:               k12.WeeklyAttemptWrong,
 		VerificationEvidence: "system_verified:a03",
-		Subject:             "数学",
-		KnowledgePoint:      "整数计算",
+		Subject:              "数学",
+		KnowledgePoint:       "整数计算",
 	}, nil
 }
 
@@ -117,7 +117,7 @@ type a03HTTPResult struct {
 }
 
 func TestBUG20260726034A03ConcurrentReplayAndRestartUseOneAssessmentAndEffect(t *testing.T) {
-	setupHandler, deps, _ := newWeeklyContractServer(t)
+	setupHandler, deps, _ := newWeeklyBundleContractServer(t)
 	path, body, snapshotID := prepareA03Snapshot(t, setupHandler)
 	assessor := &a03SlowWrongAssessor{}
 	deps.WeeklyAssessment = assessor

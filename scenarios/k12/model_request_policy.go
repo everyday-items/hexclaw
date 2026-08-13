@@ -10,6 +10,8 @@ import (
 )
 
 const (
+	// RecognizingRequestPolicyVersion 控制共享的 DD-036 线上协议策略。
+	// 它有意与 recognition_plan_version V1/V2 保持独立。
 	RecognizingRequestPolicyVersion = "dd036-recognizing-v1"
 	RecognizingPolicyModel          = "gpt-5.6-sol"
 )

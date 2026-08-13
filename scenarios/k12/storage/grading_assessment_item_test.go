@@ -245,6 +245,9 @@ func TestCommitGradingAssessmentItemEffectFailureRollsBackReceiptAndCASMutation(
 	job, attempt := seedItemLedgerFacts(t, store, "assessment-rollback")
 	solveID, gradeID := successfulAssessmentInvocations(t, store, job.RecordID, attempt)
 	receipt := assessmentReceipt(job.RecordID, attempt, solveID, gradeID)
+	receipt.Status = k12.GradingAssessmentCorrect
+	receipt.ResultJSON = `{"status":"correct"}`
+	receipt.ResultDigest = "sha256:correct-cas-rollback"
 
 	existing := newMistake(t, "mingming", "session-1", "2+2=?")
 	if _, err := store.Put(context.Background(), existing); err != nil {

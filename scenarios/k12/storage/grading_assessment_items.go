@@ -104,6 +104,30 @@ func validateGradingAssessmentEffects(effects GradingAssessmentEffects) error {
 	return nil
 }
 
+func validateGradingAssessmentEffectsForStatus(
+	status k12.GradingAssessmentStatus,
+	effects GradingAssessmentEffects,
+) error {
+	if err := validateGradingAssessmentEffects(effects); err != nil {
+		return err
+	}
+	switch status {
+	case k12.GradingAssessmentWrong:
+		if effects.Review != nil {
+			return fmt.Errorf("k12storage: wrong assessment cannot advance review state")
+		}
+	case k12.GradingAssessmentCorrect:
+		if effects.Mistake != nil {
+			return fmt.Errorf("k12storage: correct assessment cannot create a mistake")
+		}
+	default:
+		if effects.Mistake != nil || effects.Review != nil {
+			return fmt.Errorf("k12storage: assessment status %s cannot project mistake/review effects", status)
+		}
+	}
+	return nil
+}
+
 func (s *Store) validateAssessmentInvocationRef(ctx context.Context, item k12.GradingAssessmentItem,
 	invocationID string, operations ...k12.GradingItemOperation,
 ) error {
@@ -206,11 +230,11 @@ func validateCurrentAssessmentStructureVersionTx(
 func (s *Store) CommitGradingAssessmentItem(ctx context.Context, item k12.GradingAssessmentItem,
 	effects GradingAssessmentEffects,
 ) (k12.GradingAssessmentItem, bool, error) {
-	var err error
-	item, err = normalizeGradingAssessmentRevision(item)
-	if err != nil {
-		return k12.GradingAssessmentItem{}, false, err
+	normalizedItem, normalizeErr := normalizeGradingAssessmentRevision(item)
+	if normalizeErr != nil {
+		return k12.GradingAssessmentItem{}, false, normalizeErr
 	}
+	item = normalizedItem
 	if err := item.Validate(); err != nil {
 		return k12.GradingAssessmentItem{}, false, fmt.Errorf("k12storage: %w", err)
 	}
@@ -218,7 +242,7 @@ func (s *Store) CommitGradingAssessmentItem(ctx context.Context, item k12.Gradin
 		return k12.GradingAssessmentItem{}, false,
 			fmt.Errorf("k12storage: grading assessment projection facts are storage-owned")
 	}
-	if err := validateGradingAssessmentEffects(effects); err != nil {
+	if err := validateGradingAssessmentEffectsForStatus(item.Status, effects); err != nil {
 		return k12.GradingAssessmentItem{}, false, err
 	}
 	if err := ensureAgentRegistered(ctx, s.db, item.AgentName); err != nil {
@@ -252,11 +276,12 @@ func (s *Store) CommitGradingAssessmentItem(ctx context.Context, item k12.Gradin
 	}
 	item.UpdatedAt = item.CreatedAt
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return k12.GradingAssessmentItem{}, false, fmt.Errorf("k12storage: begin grading assessment transaction: %w", err)
+	tx, beginErr := s.db.BeginTx(ctx, nil)
+	if beginErr != nil {
+		return k12.GradingAssessmentItem{}, false, fmt.Errorf("k12storage: begin grading assessment transaction: %w", beginErr)
 	}
-	defer tx.Rollback()
+	// 提交成功或主路径失败后，回滚仅用于释放事务；主路径错误保持原样。
+	defer func() { _ = tx.Rollback() }()
 	var solveID, gradeID, parentGuideID any
 	if item.SolveInvocationID != "" {
 		solveID = item.SolveInvocationID
@@ -285,7 +310,7 @@ func (s *Store) CommitGradingAssessmentItem(ctx context.Context, item k12.Gradin
 	}
 
 	var currentSkipRevision int
-	err = tx.QueryRowContext(ctx, `SELECT input_revision
+	skipErr := tx.QueryRowContext(ctx, `SELECT input_revision
 		FROM k12_problem_skip_receipts
 		WHERE agent_name=? AND job_id=? AND problem_id=?
 		  AND structure_version=? AND current_disposition='current'
@@ -293,12 +318,12 @@ func (s *Store) CommitGradingAssessmentItem(ctx context.Context, item k12.Gradin
 		item.AgentName, item.JobID, item.ProblemID, item.StructureVersion,
 	).Scan(&currentSkipRevision)
 	switch {
-	case err == nil && currentSkipRevision >= item.InputRevision:
+	case skipErr == nil && currentSkipRevision >= item.InputRevision:
 		return k12.GradingAssessmentItem{}, false, fmt.Errorf(
 			"%w: current skip revision %d blocks assessment revision %d",
 			ErrGradingAssessmentItemConflict, currentSkipRevision, item.InputRevision,
 		)
-	case err == nil:
+	case skipErr == nil:
 		result, updateErr := tx.ExecContext(ctx, `UPDATE k12_problem_skip_receipts
 			SET current_disposition=?,superseded_at=?,updated_at=?
 			WHERE agent_name=? AND job_id=? AND problem_id=?
@@ -320,16 +345,16 @@ func (s *Store) CommitGradingAssessmentItem(ctx context.Context, item k12.Gradin
 				ErrGradingAssessmentItemConflict,
 			)
 		}
-	case errors.Is(err, sql.ErrNoRows):
+	case errors.Is(skipErr, sql.ErrNoRows):
 		// No parent skip decision competes with this assessment revision.
 	default:
-		return k12.GradingAssessmentItem{}, false, err
+		return k12.GradingAssessmentItem{}, false, skipErr
 	}
 
-	stored, err := getGradingAssessmentItemRevisionVia(
+	stored, lookupErr := getGradingAssessmentItemRevisionVia(
 		ctx, tx, item.AgentName, item.JobID, item.ProblemID, item.InputRevision,
 	)
-	if err == nil {
+	if lookupErr == nil {
 		if !sameGradingAssessmentReceipt(stored, item) {
 			return k12.GradingAssessmentItem{}, false, fmt.Errorf("%w: job=%s problem=%s revision=%d",
 				ErrGradingAssessmentItemConflict, item.JobID, item.ProblemID, item.InputRevision)
@@ -340,8 +365,8 @@ func (s *Store) CommitGradingAssessmentItem(ctx context.Context, item k12.Gradin
 		}
 		return stored, false, nil
 	}
-	if !errors.Is(err, records.ErrNotFound) {
-		return k12.GradingAssessmentItem{}, false, err
+	if !errors.Is(lookupErr, records.ErrNotFound) {
+		return k12.GradingAssessmentItem{}, false, lookupErr
 	}
 
 	var maxInputRevision, maxPublishedRevision sql.NullInt64
@@ -365,7 +390,7 @@ func (s *Store) CommitGradingAssessmentItem(ctx context.Context, item k12.Gradin
 		return k12.GradingAssessmentItem{}, false, err
 	}
 
-	res, err := tx.ExecContext(ctx, `INSERT INTO k12_grading_assessment_items (`+gradingAssessmentItemColumns+`)
+	res, insertErr := tx.ExecContext(ctx, `INSERT INTO k12_grading_assessment_items (`+gradingAssessmentItemColumns+`)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(job_id,problem_id,input_revision) DO NOTHING`,
 		item.AgentName, item.JobID, item.ProblemID, item.AttemptID, item.ConfirmedVersion,
@@ -373,8 +398,8 @@ func (s *Store) CommitGradingAssessmentItem(ctx context.Context, item k12.Gradin
 		item.InputDigest, item.Status, item.ResultJSON, item.ResultDigest, solveID, gradeID, parentGuideID,
 		item.ProjectionRecordID, boolInt(item.ProjectionCreated), item.ProjectionStatus,
 		item.CreatedAt, item.UpdatedAt)
-	if err != nil {
-		return k12.GradingAssessmentItem{}, false, fmt.Errorf("k12storage: insert grading assessment receipt: %w", err)
+	if insertErr != nil {
+		return k12.GradingAssessmentItem{}, false, fmt.Errorf("k12storage: insert grading assessment receipt: %w", insertErr)
 	}
 	inserted, _ := res.RowsAffected()
 	if inserted == 0 {
@@ -395,32 +420,33 @@ func (s *Store) CommitGradingAssessmentItem(ctx context.Context, item k12.Gradin
 	}
 
 	emitted := false
+	var effectErr error
 	if effects.Mistake != nil {
-		item.ProjectionRecordID, item.ProjectionCreated, emitted, err =
+		item.ProjectionRecordID, item.ProjectionCreated, emitted, effectErr =
 			s.commitAssessmentMistakeTx(ctx, tx, item.AgentName, *effects.Mistake,
 				gradingAssessmentEventID(item, "mistake_recorded"))
-		if err == nil {
+		if effectErr == nil {
 			var projectionResult sql.Result
-			projectionResult, err = tx.ExecContext(ctx, `UPDATE k12_grading_assessment_items
+			projectionResult, effectErr = tx.ExecContext(ctx, `UPDATE k12_grading_assessment_items
 				SET projection_record_id=?,projection_created=?
 				WHERE agent_name=? AND job_id=? AND problem_id=? AND input_revision=?`,
 				item.ProjectionRecordID, boolInt(item.ProjectionCreated),
 				item.AgentName, item.JobID, item.ProblemID, item.InputRevision)
-			if err != nil {
-				err = fmt.Errorf("k12storage: persist grading assessment projection: %w", err)
+			if effectErr != nil {
+				effectErr = fmt.Errorf("k12storage: persist grading assessment projection: %w", effectErr)
 			} else if updated, _ := projectionResult.RowsAffected(); updated != 1 {
-				err = fmt.Errorf("k12storage: persist grading assessment projection updated %d rows", updated)
+				effectErr = fmt.Errorf("k12storage: persist grading assessment projection updated %d rows", updated)
 			}
 		}
 	} else if effects.Review != nil {
-		err = s.commitAssessmentReviewTx(ctx, tx, item.AgentName, *effects.Review)
+		effectErr = s.commitAssessmentReviewTx(ctx, tx, item.AgentName, *effects.Review)
 	}
-	if err != nil {
-		return k12.GradingAssessmentItem{}, false, err
+	if effectErr != nil {
+		return k12.GradingAssessmentItem{}, false, effectErr
 	}
-	assessmentEmitted, err := appendGradingAssessmentCommittedEvent(ctx, tx, item)
-	if err != nil {
-		return k12.GradingAssessmentItem{}, false, err
+	assessmentEmitted, eventErr := appendGradingAssessmentCommittedEvent(ctx, tx, item)
+	if eventErr != nil {
+		return k12.GradingAssessmentItem{}, false, eventErr
 	}
 	emitted = emitted || assessmentEmitted
 	if err := tx.Commit(); err != nil {
@@ -480,14 +506,14 @@ func appendGradingAssessmentCommittedEvent(ctx context.Context, ex dbHandle,
 func (s *Store) commitAssessmentMistakeTx(ctx context.Context, tx *sql.Tx, agentName string,
 	effect GradingMistakeEffect, eventID string,
 ) (string, bool, bool, error) {
-	record, err := k12.NewMistakeRecord(agentName, effect.SourceSession, effect.Fields)
-	if err != nil {
-		return "", false, false, err
+	record, recordErr := k12.NewMistakeRecord(agentName, effect.SourceSession, effect.Fields)
+	if recordErr != nil {
+		return "", false, false, recordErr
 	}
 	record.DueAt = effect.DueAt
-	schema, err := s.registry.Get(record.Collection)
-	if err != nil {
-		return "", false, false, err
+	schema, schemaErr := s.registry.Get(record.Collection)
+	if schemaErr != nil {
+		return "", false, false, schemaErr
 	}
 	if schema.ValidateFields != nil {
 		if err := schema.ValidateFields(record.Fields); err != nil {
@@ -502,9 +528,9 @@ func (s *Store) commitAssessmentMistakeTx(ctx context.Context, tx *sql.Tx, agent
 	now := nowUnix()
 	record.CreatedAt, record.UpdatedAt, record.Version = now, now, 0
 	mp := mistakeMapper{}
-	domainVals, err := mp.encode(record.Fields)
-	if err != nil {
-		return "", false, false, err
+	domainVals, encodeErr := mp.encode(record.Fields)
+	if encodeErr != nil {
+		return "", false, false, encodeErr
 	}
 	q := fmt.Sprintf(`INSERT INTO %s (%s, %s) VALUES (%s)
         ON CONFLICT(agent_name,dedupe_key) DO NOTHING`, mp.table(), baseCols,
@@ -512,9 +538,9 @@ func (s *Store) commitAssessmentMistakeTx(ctx context.Context, tx *sql.Tx, agent
 	args := append([]any{record.RecordID, record.AgentName, record.SchemaVersion, record.Status,
 		record.DedupeKey, record.Tags, record.DueAt, record.SourceSession, record.Version,
 		record.CreatedAt, record.UpdatedAt}, domainVals...)
-	res, err := tx.ExecContext(ctx, q, args...)
-	if err != nil {
-		return "", false, false, fmt.Errorf("k12storage: grading assessment mistake insert: %w", err)
+	res, insertErr := tx.ExecContext(ctx, q, args...)
+	if insertErr != nil {
+		return "", false, false, fmt.Errorf("k12storage: grading assessment mistake insert: %w", insertErr)
 	}
 	created, _ := res.RowsAffected()
 	if created == 0 {
@@ -523,9 +549,9 @@ func (s *Store) commitAssessmentMistakeTx(ctx context.Context, tx *sql.Tx, agent
 			return "", false, false, fmt.Errorf("k12storage: grading assessment mistake dedupe lookup: %w", err)
 		}
 	}
-	emitted, err := appendMistakeRecordedEvent(ctx, tx, record, created > 0, eventID)
-	if err != nil {
-		return "", false, false, err
+	emitted, eventErr := appendMistakeRecordedEvent(ctx, tx, record, created > 0, eventID)
+	if eventErr != nil {
+		return "", false, false, eventErr
 	}
 	return record.RecordID, created > 0, emitted, nil
 }
@@ -533,10 +559,10 @@ func (s *Store) commitAssessmentMistakeTx(ctx context.Context, tx *sql.Tx, agent
 func (s *Store) commitAssessmentReviewTx(ctx context.Context, tx *sql.Tx, agentName string,
 	effect GradingReviewEffect,
 ) error {
-	rows, err := s.queryRecordsVia(ctx, tx, mistakeMapper{},
+	rows, queryErr := s.queryRecordsVia(ctx, tx, mistakeMapper{},
 		`WHERE agent_name=? AND record_id=?`, agentName, effect.RecordID)
-	if err != nil {
-		return err
+	if queryErr != nil {
+		return queryErr
 	}
 	if len(rows) == 0 {
 		return records.ErrNotFound
@@ -545,9 +571,9 @@ func (s *Store) commitAssessmentReviewTx(ctx context.Context, tx *sql.Tx, agentN
 	if current.Version != effect.ExpectedVersion {
 		return records.ErrVersionConflict
 	}
-	schema, err := s.registry.Get(k12.CollectionMistakes)
-	if err != nil {
-		return err
+	schema, schemaErr := s.registry.Get(k12.CollectionMistakes)
+	if schemaErr != nil {
+		return schemaErr
 	}
 	if !schemaHasStatus(schema, effect.NewStatus) {
 		return records.ErrInvalidStatus
@@ -555,16 +581,16 @@ func (s *Store) commitAssessmentReviewTx(ctx context.Context, tx *sql.Tx, agentN
 	if !schemaCanTransition(schema, current.Status, effect.NewStatus) {
 		return records.ErrIllegalTransition
 	}
-	raw, err := json.Marshal(effect.Fields)
-	if err != nil {
-		return err
+	raw, marshalErr := json.Marshal(effect.Fields)
+	if marshalErr != nil {
+		return marshalErr
 	}
 	if err := schema.ValidateFields(string(raw)); err != nil {
 		return fmt.Errorf("%w: 记录集 %q: %v", records.ErrInvalidFields, k12.CollectionMistakes, err)
 	}
-	values, err := (mistakeMapper{}).encode(string(raw))
-	if err != nil {
-		return err
+	values, encodeErr := (mistakeMapper{}).encode(string(raw))
+	if encodeErr != nil {
+		return encodeErr
 	}
 	assignments := make([]string, 0, len((mistakeMapper{}).domainCols()))
 	for _, col := range (mistakeMapper{}).domainCols() {
@@ -572,11 +598,11 @@ func (s *Store) commitAssessmentReviewTx(ctx context.Context, tx *sql.Tx, agentN
 	}
 	args := append([]any{effect.NewStatus, effect.DueAt}, values...)
 	args = append(args, nowUnix(), effect.RecordID, agentName, effect.ExpectedVersion)
-	res, err := tx.ExecContext(ctx, `UPDATE k12_mistakes SET status=?,due_at=?,`+
+	res, updateErr := tx.ExecContext(ctx, `UPDATE k12_mistakes SET status=?,due_at=?,`+
 		strings.Join(assignments, ",")+`,version=version+1,updated_at=?
         WHERE record_id=? AND agent_name=? AND version=?`, args...)
-	if err != nil {
-		return fmt.Errorf("k12storage: grading assessment review update: %w", err)
+	if updateErr != nil {
+		return fmt.Errorf("k12storage: grading assessment review update: %w", updateErr)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return records.ErrVersionConflict
@@ -636,7 +662,8 @@ func (s *Store) ListGradingAssessmentItems(ctx context.Context, agentName, jobID
 	if err != nil {
 		return nil, fmt.Errorf("k12storage: list grading assessment items: %w", err)
 	}
-	defer rows.Close()
+	// 遍历失败时保留主路径错误，延迟关闭仅用于释放游标。
+	defer func() { _ = rows.Close() }()
 	out := make([]k12.GradingAssessmentItem, 0)
 	for rows.Next() {
 		item, scanErr := scanGradingAssessmentItem(rows)
@@ -645,5 +672,11 @@ func (s *Store) ListGradingAssessmentItems(ctx context.Context, agentName, jobID
 		}
 		out = append(out, item)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("k12storage: close grading assessment items: %w", err)
+	}
+	return out, nil
 }

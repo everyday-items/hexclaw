@@ -152,6 +152,73 @@ func TestDenseWorksheetPrintedInventoryRepairsQuestionWhenEverySegmentElidesFrac
 	}
 }
 
+func TestREGK12LegacyFallbackFraction20260809001InventoryCollapsesOnlyWitnessedFractionVariant(t *testing.T) {
+	corrupted := usecase.RecognizedQuestion{
+		Question:      "5−1/5=",
+		AnswerState:   usecase.AnswerStatePresent,
+		StudentAnswer: "24/5",
+		Subject:       "数学",
+	}
+	exact := usecase.RecognizedQuestion{
+		Question:      "5/7−1/5=",
+		AnswerState:   usecase.AnswerStatePresent,
+		StudentAnswer: "18/35",
+		Subject:       "数学",
+	}
+	independent := usecase.RecognizedQuestion{
+		Question:      "8/9−1/5=",
+		AnswerState:   usecase.AnswerStatePresent,
+		StudentAnswer: "31/45",
+		Subject:       "数学",
+	}
+	inventory := []usecase.RecognizedQuestion{
+		{Question: "5/7−1/5=", Subject: "数学"},
+		{Question: "8/9−1/5=", Subject: "数学"},
+	}
+
+	for _, tc := range []struct {
+		name     string
+		observed []usecase.RecognizedQuestion
+	}{
+		{
+			name:     "corrupted_segment_precedes_exact_segment",
+			observed: []usecase.RecognizedQuestion{corrupted, exact, independent},
+		},
+		{
+			name:     "exact_segment_precedes_corrupted_segment",
+			observed: []usecase.RecognizedQuestion{exact, corrupted, independent},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := reconcilePrintedQuestionInventory(tc.observed, inventory)
+			if len(got) != 2 {
+				t.Fatalf("inventory-witnessed variant was not collapsed: got=%#v", got)
+			}
+
+			var exactQuestion, independentQuestion *usecase.RecognizedQuestion
+			for index := range got {
+				switch recognizedQuestionKey(got[index].Question) {
+				case recognizedQuestionKey(exact.Question):
+					exactQuestion = &got[index]
+				case recognizedQuestionKey(independent.Question):
+					independentQuestion = &got[index]
+				case recognizedQuestionKey(corrupted.Question):
+					t.Fatalf("corrupted denominator-elided variant survived: %#v", got[index])
+				}
+			}
+			if exactQuestion == nil {
+				t.Fatalf("complete printed fraction question is missing: %#v", got)
+			}
+			if exactQuestion.AnswerState != usecase.AnswerStatePresent || exactQuestion.StudentAnswer != exact.StudentAnswer {
+				t.Fatalf("corrupted observation replaced exact answer evidence: %#v", *exactQuestion)
+			}
+			if independentQuestion == nil || independentQuestion.StudentAnswer != independent.StudentAnswer {
+				t.Fatalf("similar independent fraction question was merged: %#v", got)
+			}
+		})
+	}
+}
+
 func TestDenseWorksheetOverlapDeduplicatesCanonicalMathGlyphs(t *testing.T) {
 	var calls atomic.Int32
 	vision := func(_ context.Context, _ []byte, prompt string) (string, error) {

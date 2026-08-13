@@ -57,22 +57,40 @@ type K12AssessingBudgetBucketConfig struct {
 	Seconds     int64 `yaml:"seconds"`
 }
 
+type K12RecognizingBudgetBucketsConfig struct {
+	UpTo1ProblemMillis   int64 `yaml:"up_to_1_problem_millis"`
+	UpTo8ProblemsMillis  int64 `yaml:"up_to_8_problems_millis"`
+	UpTo16ProblemsMillis int64 `yaml:"up_to_16_problems_millis"`
+	UpTo32ProblemsMillis int64 `yaml:"up_to_32_problems_millis"`
+}
+
+func (c K12RecognizingBudgetBucketsConfig) IsZero() bool {
+	return c == (K12RecognizingBudgetBucketsConfig{})
+}
+
 type K12GradingBudgetConfig struct {
-	PolicyVersion      int                              `yaml:"policy_version"`
-	QueuedSeconds      int64                            `yaml:"queued_seconds"`
-	NormalizingSeconds int64                            `yaml:"normalizing_seconds"`
-	RecognizingSeconds int64                            `yaml:"recognizing_seconds"`
-	LocatingSeconds    int64                            `yaml:"locating_seconds"`
-	RenderingSeconds   int64                            `yaml:"rendering_seconds"`
-	ProjectingSeconds  int64                            `yaml:"projecting_seconds"`
-	AssessingBuckets   []K12AssessingBudgetBucketConfig `yaml:"assessing_buckets"`
-	ItemConcurrency    int                              `yaml:"item_concurrency"`
+	PolicyVersion          int                               `yaml:"policy_version"`
+	QueuedSeconds          int64                             `yaml:"queued_seconds"`
+	NormalizingSeconds     int64                             `yaml:"normalizing_seconds"`
+	RecognizingSeconds     int64                             `yaml:"recognizing_seconds"`
+	LocatingSeconds        int64                             `yaml:"locating_seconds"`
+	RenderingSeconds       int64                             `yaml:"rendering_seconds"`
+	ProjectingSeconds      int64                             `yaml:"projecting_seconds"`
+	AssessingBuckets       []K12AssessingBudgetBucketConfig  `yaml:"assessing_buckets"`
+	ItemConcurrency        int                               `yaml:"item_concurrency"`
+	RecognitionPlanVersion int                               `yaml:"recognition_plan_version"`
+	RecognizingBuckets     K12RecognizingBudgetBucketsConfig `yaml:"recognizing_buckets,omitempty"`
+	PhysicalCallCapMillis  int64                             `yaml:"physical_call_cap_millis,omitempty"`
+	WorkerHardCap          int                               `yaml:"worker_hard_cap,omitempty"`
+	EffectiveConcurrency   int                               `yaml:"effective_concurrency,omitempty"`
 }
 
 func (c K12GradingBudgetConfig) IsZero() bool {
 	return c.PolicyVersion == 0 && c.QueuedSeconds == 0 && c.NormalizingSeconds == 0 &&
 		c.RecognizingSeconds == 0 && c.LocatingSeconds == 0 && c.RenderingSeconds == 0 &&
-		c.ProjectingSeconds == 0 && len(c.AssessingBuckets) == 0 && c.ItemConcurrency == 0
+		c.ProjectingSeconds == 0 && len(c.AssessingBuckets) == 0 && c.ItemConcurrency == 0 &&
+		c.RecognitionPlanVersion == 0 && c.RecognizingBuckets.IsZero() &&
+		c.PhysicalCallCapMillis == 0 && c.WorkerHardCap == 0 && c.EffectiveConcurrency == 0
 }
 
 // ResourceGovernorConfig bounds process-wide expensive resources shared by

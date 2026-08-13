@@ -248,7 +248,7 @@ func TestSolve_Triage_ExplicitParamDisablesTriage(t *testing.T) {
 func TestSolve_Grading_Correct(t *testing.T) {
 	se := &solveExec{
 		verifierOut: "VERDICT: AGREE\nCOMPUTED: 42",
-		graderOut:   "CORRECT: yes\nGUIDANCE: 思路清晰，继续保持。",
+		graderOut:   "CORRECT: yes\nFINAL_ANSWER_CORRECT: yes\nGUIDANCE: 思路清晰，继续保持。",
 	}
 	o := NewSolveSkill(se.fn, nil)
 	res, err := o.Execute(context.Background(), map[string]any{
@@ -269,7 +269,7 @@ func TestSolve_Grading_Correct(t *testing.T) {
 func TestSolve_Grading_WrongFindsStep(t *testing.T) {
 	se := &solveExec{
 		verifierOut: "VERDICT: AGREE\nCOMPUTED: 42",
-		graderOut:   "CORRECT: no\nWRONG_STEP: 第2步把 6×7 当成 6+7 了\nMISCONCEPTION: 把乘法当成加法\nGUIDANCE: 再看看“每盒7支”应该用哪种运算？",
+		graderOut:   "CORRECT: no\nFINAL_ANSWER_CORRECT: no\nWRONG_STEP: 第2步把 6×7 当成 6+7 了\nMISCONCEPTION: 把乘法当成加法\nGUIDANCE: 再看看“每盒7支”应该用哪种运算？",
 	}
 	o := NewSolveSkill(se.fn, nil)
 	res, _ := o.Execute(context.Background(), map[string]any{
@@ -303,7 +303,7 @@ func TestSolve_Verifier_ValidateRetryOnBadFormat(t *testing.T) {
 func TestSolve_Grader_ValidateRetryOnBadFormat(t *testing.T) {
 	se := &solveExec{
 		verifierOut: "VERDICT: AGREE\nCOMPUTED: 42",
-		graderOuts:  []string{"你写得不错呀，再想想哦", "CORRECT: no\nWRONG_STEP: 第2步\nMISCONCEPTION: 乘法当加法\nGUIDANCE: 再看看"},
+		graderOuts:  []string{"你写得不错呀，再想想哦", "CORRECT: no\nFINAL_ANSWER_CORRECT: no\nWRONG_STEP: 第2步\nMISCONCEPTION: 乘法当加法\nGUIDANCE: 再看看"},
 	}
 	o := NewSolveSkill(se.fn, nil)
 	res, _ := o.Execute(context.Background(), map[string]any{

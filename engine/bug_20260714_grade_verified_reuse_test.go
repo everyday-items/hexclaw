@@ -11,7 +11,7 @@ func TestBUG20260714_GradeVerifiedRunsOnlyGrader(t *testing.T) {
 	var agents []string
 	exec := func(_ context.Context, spec SubAgentSpec) (SubAgentResult, error) {
 		agents = append(agents, spec.Agent)
-		return SubAgentResult{Output: "CORRECT: yes\nWRONG_STEP:\nMISCONCEPTION:\nGUIDANCE: 很好"}, nil
+		return SubAgentResult{Output: "CORRECT: yes\nFINAL_ANSWER_CORRECT: yes\nWRONG_STEP:\nMISCONCEPTION:\nGUIDANCE: 很好"}, nil
 	}
 	s := NewSolveSkill(exec, NewSubAgentRegistry(""))
 	res, err := s.GradeVerified(context.Background(), "每支笔3.8元，买3支一共多少钱？", "解：3.8×3=11.4\n答案：11.4", "11.4")
@@ -147,7 +147,7 @@ func TestBUG20260714_GradeVerifiedDoesNotOverrideConflictingVerifiedAnswer(t *te
 		if spec.Agent != graderAgentName {
 			t.Fatalf("unexpected agent %q", spec.Agent)
 		}
-		return SubAgentResult{Output: "CORRECT: no\nWRONG_STEP: 答案不一致\nMISCONCEPTION: 数量关系\nGUIDANCE: 复核题目"}, nil
+		return SubAgentResult{Output: "CORRECT: no\nFINAL_ANSWER_CORRECT: no\nWRONG_STEP: 答案不一致\nMISCONCEPTION: 数量关系\nGUIDANCE: 复核题目"}, nil
 	}, NewSubAgentRegistry(""))
 	problem := "一个周长是300米的长方形鱼塘，长是宽的2倍。如果每平方米产鱼2.25千克，一共产鱼多少千克？"
 	res, err := s.GradeVerified(context.Background(), problem, "答案：999千克", "答：11250千克")

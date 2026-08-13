@@ -4,17 +4,20 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
 type tutoringGroundingSnapshotSpy struct {
-	freezeCalls int
-	legacyCalls int
-	active      string
-	requested   usecase.GroundingSnapshot
-	queries     []usecase.GroundingSnapshot
+	freezeCalls       int
+	legacyCalls       int
+	active            string
+	requested         usecase.GroundingSnapshot
+	queries           []usecase.GroundingSnapshot
+	freezeDeadline    time.Time
+	freezeHasDeadline bool
 }
 
 func (s *tutoringGroundingSnapshotSpy) Ground(
@@ -25,13 +28,47 @@ func (s *tutoringGroundingSnapshotSpy) Ground(
 }
 
 func (s *tutoringGroundingSnapshotSpy) FreezeGroundingSnapshot(
-	_ context.Context,
+	ctx context.Context,
 	requested usecase.GroundingSnapshot,
 ) (usecase.GroundingSnapshot, error) {
 	s.freezeCalls++
+	s.freezeDeadline, s.freezeHasDeadline = ctx.Deadline()
 	s.requested = requested
 	requested.VectorRevisionID = s.active
 	return requested, nil
+}
+
+// K12-PROJECTING-FROZEN-ROUTE-001：页面摘要预算必须从快照控制面调用开始时
+// 就对其施加约束，而不是等该调用返回后才启动。
+func TestBuildTutoringTipsBoundsSnapshotGroundingBeforeFreeze(t *testing.T) {
+	d := newDataDeps(t, "mingming")
+	seedBUG20260726008ActiveTextbookBinding(t, d)
+	if err := d.Records.PutProblemAttemptSnapshot(
+		context.Background(),
+		confirmedTipsFacts(1, "canonical"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	job := driveTipsJobToAssessing(t, d)
+	grounding := &tutoringGroundingSnapshotSpy{active: "revision-a"}
+	d.Grounding = grounding
+	d.Profiles = &memProfileStore{m: map[string]k12.ChildProfile{
+		"mingming": {
+			ChildName:       "小明",
+			GradeTerm:       "五年级下",
+			TextbookEdition: "人教版",
+		},
+	}}
+
+	if _, err := d.BuildTutoringTips(context.Background(), "mingming", job.Record.RecordID); err != nil {
+		t.Fatal(err)
+	}
+	if !grounding.freezeHasDeadline {
+		t.Fatal("FreezeGroundingSnapshot must receive the bounded page-summary context")
+	}
+	if remaining := time.Until(grounding.freezeDeadline); remaining < 70*time.Second || remaining > 90*time.Second {
+		t.Fatalf("snapshot grounding deadline remaining=%s, want the 90-second page-summary budget", remaining)
+	}
 }
 
 func (s *tutoringGroundingSnapshotSpy) GroundSnapshot(

@@ -98,7 +98,8 @@ func TestGradingRecoveryInteractiveDeadlineFailureStaysParked(t *testing.T) {
 
 func gradingParentFrozenBudget() k12.GradingBudgetSnapshot {
 	return k12.GradingBudgetSnapshot{
-		PolicyVersion: 1,
+		PolicyVersion:          1,
+		RecognitionPlanVersion: k12.RecognitionPlanVersionV1,
 		StageSeconds: k12.GradingStageBudgets{
 			Queued: 60, Normalizing: 60, Recognizing: 120,
 			Locating: 60, Rendering: 60, Projecting: 60,
@@ -231,7 +232,8 @@ func TestGradingParentAutomaticBudgetPausesForConfirmationAndResumesRemaining(t 
 func TestBUG20260802ImageTaskAssessingReservationUsesFrozenProblemBucket(t *testing.T) {
 	const now = int64(7_000)
 	budget := k12.GradingBudgetSnapshot{
-		PolicyVersion: 1,
+		PolicyVersion:          1,
+		RecognitionPlanVersion: k12.RecognitionPlanVersionV1,
 		StageSeconds: k12.GradingStageBudgets{
 			Queued: 60, Normalizing: 60, Recognizing: 60,
 			Locating: 60, Rendering: 60, Projecting: 60,

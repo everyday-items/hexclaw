@@ -192,7 +192,8 @@ func freezeItemResumeBudget(t *testing.T, o *GradingOrchestrator, jobID string) 
 		t.Fatalf("get job before freezing budget: %v", err)
 	}
 	view.Fields.BudgetSnapshot = k12.GradingBudgetSnapshot{
-		PolicyVersion: 1,
+		PolicyVersion:          1,
+		RecognitionPlanVersion: k12.RecognitionPlanVersionV1,
 		StageSeconds: k12.GradingStageBudgets{
 			Queued: 60, Normalizing: 60, Recognizing: 120,
 			Locating: 60, Rendering: 60, Projecting: 60,

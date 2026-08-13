@@ -44,6 +44,9 @@ type CreateGradingJobInput struct {
 	// can leave confirmation, the caller will persist typed Problem/Attempt facts.
 	// Frozen policies reject generic placeholder Jobs that have no such path.
 	MaterializesProblemAttempts bool
+	// trustedRecognitionPolicy 仅由服务端持有的创建边界注入，该边界已为新 Job
+	// 选定方案。直接调用 CreateGradingJob 时继续沿用既有的全局策略行为。
+	trustedRecognitionPolicy *k12.GradingBudgetSnapshot
 }
 
 func validateGradingSourceIdentity(sourceKind, sourceKey string) error {
@@ -97,6 +100,24 @@ func (d Deps) CreateGradingJob(ctx context.Context, agentName, sourceSession str
 	if in.ConfirmedVersion < 0 {
 		return GradingJobView{}, false, fmt.Errorf("%w: confirmed_version 不可为负", ErrInvalidInput)
 	}
+	// 幂等重放会先读取已经冻结的 Job，再查询可变创建策略。
+	// 后续发布策略变更只影响新的幂等键。
+	if existing, found, err := d.findGradingJobByIdempotency(
+		ctx, agentName, in.SourceKind, in.SourceKey, in.ConfirmedVersion,
+	); err != nil {
+		return GradingJobView{}, false, err
+	} else if found {
+		if existing.Fields.SubmissionID != in.SubmissionID {
+			return GradingJobView{}, false, fmt.Errorf(
+				"%w: idempotency key %q is already bound to submission %q, requested %q",
+				ErrInvalidInput,
+				existing.Fields.IdempotencyKey,
+				existing.Fields.SubmissionID,
+				in.SubmissionID,
+			)
+		}
+		return existing, false, nil
+	}
 	in.ParentAutomaticAttemptID = strings.TrimSpace(in.ParentAutomaticAttemptID)
 	if in.ParentAutomaticAttemptID == "" {
 		if in.ParentAutomaticDeadlineAt != 0 {
@@ -123,6 +144,19 @@ func (d Deps) CreateGradingJob(ctx context.Context, agentName, sourceSession str
 			return GradingJobView{}, false, fmt.Errorf("%w: invalid grading budget snapshot: %v", ErrInvalidInput, err)
 		}
 		budgetSnapshot = d.GradingBudgetSnapshot
+	}
+	if budgetSnapshot.IsFrozen() {
+		trustedPolicy := d.GradingBudgetSnapshot
+		if in.trustedRecognitionPolicy != nil {
+			trustedPolicy = *in.trustedRecognitionPolicy
+		}
+		if !trustedPolicy.IsFrozen() {
+			return GradingJobView{}, false, fmt.Errorf(
+				"%w: frozen grading job requires a trusted recognition creation policy",
+				ErrInvalidInput,
+			)
+		}
+		budgetSnapshot = budgetSnapshot.WithRecognitionPolicyFrom(trustedPolicy)
 	}
 	if err := budgetSnapshot.Validate(); err != nil {
 		return GradingJobView{}, false, fmt.Errorf("%w: invalid grading budget snapshot: %v", ErrInvalidInput, err)

@@ -149,13 +149,19 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 	// lastVisionSHA 记录最近一次真正送进视觉请求的图片字节 SHA-256——用于断言真实
 	// FX-ART-001 / FX-WRITING-001 原图确实到达模型（§13.2 的 E1 证据），而非探针在别处替换。
 	var lastVisionSHA string
+	var visionCallCount int
 	visionFn := func(visionCtx context.Context, imageBytes []byte, prompt string) (string, error) {
 		provider := router.Default()
 		if provider == nil {
 			return "", fmt.Errorf("没有可用的默认 LLM Provider")
 		}
 		lastVisionSHA = fmt.Sprintf("%x", sha256.Sum256(imageBytes))
-		visionModel := router.ProviderModel(router.DefaultName())
+		visionCallCount++
+		providerName := router.DefaultName()
+		visionModel := router.ProviderModel(providerName)
+		if providerName != "hexclaw-gpt" || visionModel != "gpt-5.6-sol" {
+			return "", fmt.Errorf("unexpected real route provider=%q model=%q", providerName, visionModel)
+		}
 		mime := http.DetectContentType(imageBytes)
 		if !strings.HasPrefix(mime, "image/") {
 			mime = "image/png"
@@ -221,6 +227,11 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("wire K12 runtime: error_type=%T", err)
+	}
+	runtime.Deps.WorkFeedbackRoute = func(
+		_ context.Context, workType string,
+	) (k12.ImageTaskRouteSnapshot, error) {
+		return resolveK12WorkFeedbackRoute(router, workType)
 	}
 
 	t.Run("写作点评_真机", func(t *testing.T) {
@@ -363,10 +374,32 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 		if strings.TrimSpace(last.Feedback) == "" {
 			t.Fatal("美术点评不得为空")
 		}
-		// 入库成功即 INV-011 已通过；再显式断言不含打分/等第口径（双保险取证）。
+		structured := last.StructuredFeedback
+		if structured == nil || len(structured.Observations) == 0 || len(structured.Suggestions) == 0 ||
+			strings.TrimSpace(structured.Limitations) == "" || len(structured.EvidenceRefs) == 0 {
+			t.Fatalf("Art feedback must produce the complete canonical schema: structured=%v", structured != nil)
+		}
+		// canonical limitations 会明确说明「不评分、不排名」，因此禁则扫描只覆盖模型
+		// 生成并结构化后的观察与建议；原始模型正文已经由生产 INV-011 拦截器校验。
+		var substantive strings.Builder
+		for _, observation := range structured.Observations {
+			substantive.WriteString(observation.Evidence)
+			substantive.WriteByte('\n')
+		}
+		for _, suggestion := range structured.Suggestions {
+			substantive.WriteString(suggestion)
+			substantive.WriteByte('\n')
+		}
+		feedbackBody := substantive.String()
+		// 入库成功即 INV-011 已通过；再显式断言实质点评不含打分/等第/延期口径。
 		for _, banned := range []string{"打分", "评分", "等第", "甲等", "排名", "名次"} {
-			if strings.Contains(last.Feedback, banned) {
+			if strings.Contains(feedbackBody, banned) {
 				t.Fatalf("美术点评命中禁用口径 %q：feedback_chars=%d", banned, len([]rune(last.Feedback)))
+			}
+		}
+		for _, deferred := range []string{"在继续点评前", "等孩子讲完后", "再给完整点评", "再继续点评", "暂不点评"} {
+			if strings.Contains(feedbackBody, deferred) {
+				t.Fatalf("Art feedback still defers complete feedback with %q", deferred)
 			}
 		}
 		if !strings.HasSuffix(last.FeedbackSkill, "/disk") {
@@ -388,6 +421,9 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 					len(artFeatures), len([]rune(last.Feedback)))
 			}
 			t.Logf("REAL_ART_FEEDBACK_ANCHORED: FX-ART SHA 进入请求✓ 命中可见证据 %d/%d", hit, len(artFeatures))
+		}
+		if visionCallCount != 1 {
+			t.Fatalf("The first real art-feedback generation must call the Provider exactly once; got %d", visionCallCount)
 		}
 		t.Logf("ART_FEEDBACK_OK: real=%v elapsed=%s chars=%d feedback_skill=%s",
 			realArt, time.Since(started).Round(time.Millisecond), len([]rune(last.Feedback)), last.FeedbackSkill)

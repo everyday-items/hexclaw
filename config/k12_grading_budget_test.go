@@ -9,8 +9,9 @@ import (
 
 func validK12GradingBudgetConfig() K12GradingBudgetConfig {
 	return K12GradingBudgetConfig{
-		PolicyVersion: 1,
-		QueuedSeconds: 60, NormalizingSeconds: 60, RecognizingSeconds: 120,
+		PolicyVersion:          1,
+		RecognitionPlanVersion: 1,
+		QueuedSeconds:          60, NormalizingSeconds: 60, RecognizingSeconds: 120,
 		LocatingSeconds: 60, RenderingSeconds: 60, ProjectingSeconds: 60,
 		AssessingBuckets: []K12AssessingBudgetBucketConfig{
 			{MaxProblems: 1, Seconds: 90},
@@ -46,6 +47,28 @@ func TestValidateK12GradingBudgetRequiresCompleteMeasuredPolicy(t *testing.T) {
 	}
 }
 
+func TestValidateK12GradingBudgetReleaseKeepsV2EffectiveConcurrencyAtOne(t *testing.T) {
+	cfg := DefaultConfig()
+	budget := validK12GradingBudgetConfig()
+	budget.RecognitionPlanVersion = 2
+	budget.RecognizingBuckets = K12RecognizingBudgetBucketsConfig{
+		UpTo1ProblemMillis: 30_001, UpTo8ProblemsMillis: 60_001,
+		UpTo16ProblemsMillis: 90_001, UpTo32ProblemsMillis: 120_001,
+	}
+	budget.RecognizingSeconds = 121
+	budget.PhysicalCallCapMillis = 120_000
+	budget.WorkerHardCap = 2
+	budget.EffectiveConcurrency = 1
+	cfg.K12.GradingBudget = budget
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("complete release v2 policy should validate: %v", err)
+	}
+	cfg.K12.GradingBudget.EffectiveConcurrency = 2
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "effective_concurrency") {
+		t.Fatalf("release effective=2 without approved calibration must fail exact field: %v", err)
+	}
+}
+
 func TestK12GradingBudgetYAMLRoundTripPreservesFrozenEvidence(t *testing.T) {
 	want := Config{K12: K12Config{GradingBudget: validK12GradingBudgetConfig()}}
 	raw, err := yaml.Marshal(want)
@@ -57,6 +80,7 @@ func TestK12GradingBudgetYAMLRoundTripPreservesFrozenEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.K12.GradingBudget.PolicyVersion != 1 ||
+		got.K12.GradingBudget.RecognitionPlanVersion != 1 ||
 		len(got.K12.GradingBudget.AssessingBuckets) != 4 ||
 		got.K12.GradingBudget.ItemConcurrency != 2 {
 		t.Fatalf("budget policy lost on YAML round trip: %+v", got.K12.GradingBudget)

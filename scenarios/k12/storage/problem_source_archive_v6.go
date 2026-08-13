@@ -22,8 +22,8 @@ import (
 // durability closure for V50/V51/V72/V73 source actions. It deliberately
 // carries only the dispatch/model control-plane rows referenced by that
 // closure. Raw physical result_content never crosses the archive boundary;
-// the sole allowed result_json is the strictly decoded typed page-summary
-// projection needed to finish a post-provider/pre-artifact crash locally.
+// 唯一允许的 result_json 是严格解码后的类型化 page-summary，以及在
+// Provider 调用后、产物生成前崩溃时用于本地收尾的 finalized V2 候选投影。
 type ProblemSourceArchiveV6 struct {
 	PageAssets                 []ProblemSourceArchivePageAsset                 `json:"page_assets,omitempty"`
 	Dispatches                 []k12.ImageTaskDispatch                         `json:"dispatches,omitempty"`
@@ -41,6 +41,7 @@ type ProblemSourceArchiveV6 struct {
 	RecognitionResults         []ProblemSourceArchiveRecognitionResult         `json:"recognition_results,omitempty"`
 	RecognitionItems           []ProblemSourceArchiveRecognitionItem           `json:"recognition_items,omitempty"`
 	RecognitionPhysicalResults []ProblemSourceArchiveRecognitionPhysicalResult `json:"recognition_physical_results,omitempty"`
+	RecognitionLayoutsV2       []ProblemSourceArchiveRecognitionLayoutV2       `json:"recognition_layouts_v2,omitempty"`
 }
 
 // IsEmpty reports whether the archive carries no source-action durability
@@ -54,7 +55,7 @@ func (a ProblemSourceArchiveV6) IsEmpty() bool {
 		len(a.InputRevisions) == 0 && len(a.ReprocessJobs) == 0 &&
 		len(a.ModelInvocations) == 0 && len(a.ModelPhysicalInvocations) == 0 &&
 		len(a.RecognitionResults) == 0 && len(a.RecognitionItems) == 0 &&
-		len(a.RecognitionPhysicalResults) == 0
+		len(a.RecognitionPhysicalResults) == 0 && len(a.RecognitionLayoutsV2) == 0
 }
 
 // ProblemSourceArchiveFinalizationGeneration freezes the aggregate CAS
@@ -269,13 +270,76 @@ type ProblemSourceArchiveRecognitionItem struct {
 }
 
 type ProblemSourceArchiveRecognitionPhysicalResult struct {
-	WorkID               string `json:"work_id"`
-	Ordinal              int    `json:"ordinal"`
-	ParentInvocationID   string `json:"parent_invocation_id"`
-	PhysicalInvocationID string `json:"physical_invocation_id"`
-	PhysicalUnit         string `json:"physical_unit"`
-	ResultDigest         string `json:"result_digest"`
-	CreatedAt            int64  `json:"created_at"`
+	WorkID                  string `json:"work_id"`
+	Ordinal                 int    `json:"ordinal"`
+	ParentInvocationID      string `json:"parent_invocation_id"`
+	PhysicalInvocationID    string `json:"physical_invocation_id"`
+	PhysicalUnit            string `json:"physical_unit"`
+	RecognitionPlanVersion  int    `json:"recognition_plan_version"`
+	PlanDigest              string `json:"plan_digest"`
+	CandidateExactSetDigest string `json:"candidate_exact_set_digest"`
+	ResultDigest            string `json:"result_digest"`
+	CreatedAt               int64  `json:"created_at"`
+}
+
+func validateProblemSourceArchiveRecognitionPhysicalFacts(
+	ref ProblemSourceArchiveRecognitionPhysicalResult,
+) error {
+	if ref.PlanDigest != strings.TrimSpace(ref.PlanDigest) ||
+		ref.CandidateExactSetDigest != strings.TrimSpace(ref.CandidateExactSetDigest) {
+		return fmt.Errorf("source recognition physical plan facts are not canonical")
+	}
+	unit := k12.RecognitionPhysicalUnit(ref.PhysicalUnit)
+	switch effectiveProblemSourceRecognitionPlanVersion(ref.RecognitionPlanVersion) {
+	case k12.RecognitionPlanVersionV1:
+		if !legacyRecognitionPhysicalUnit(unit) || ref.PlanDigest != "" ||
+			ref.CandidateExactSetDigest != "" {
+			return fmt.Errorf("source recognition v1 physical plan facts drifted")
+		}
+	case k12.RecognitionPlanVersionV2:
+		manifest := unit == k12.RecognitionPhysicalUnitWholePage &&
+			ref.CandidateExactSetDigest == ""
+		plannedChild := layoutRecognitionPhysicalUnit(unit) &&
+			ref.CandidateExactSetDigest != ""
+		if ref.PlanDigest == "" || (!manifest && !plannedChild) {
+			return fmt.Errorf("source recognition v2 physical plan facts drifted")
+		}
+	default:
+		return fmt.Errorf(
+			"source recognition physical plan version %d is unsupported",
+			ref.RecognitionPlanVersion,
+		)
+	}
+	return nil
+}
+
+func hydrateProblemSourceArchiveRecognitionPhysicalFacts(
+	input *ProblemSourceRecognitionResult,
+	workID string,
+	all []ProblemSourceArchiveRecognitionPhysicalResult,
+) error {
+	if input == nil {
+		return fmt.Errorf("nil source recognition input")
+	}
+	byID := make(map[string]ProblemSourceArchiveRecognitionPhysicalResult)
+	for _, ref := range all {
+		if ref.WorkID == workID {
+			byID[ref.PhysicalInvocationID] = ref
+		}
+	}
+	for index := range input.PhysicalResults {
+		ref, ok := byID[input.PhysicalResults[index].PhysicalInvocationID]
+		if !ok {
+			return fmt.Errorf(
+				"physical invocation %q is missing plan facts",
+				input.PhysicalResults[index].PhysicalInvocationID,
+			)
+		}
+		input.PhysicalResults[index].RecognitionPlanVersion = ref.RecognitionPlanVersion
+		input.PhysicalResults[index].PlanDigest = ref.PlanDigest
+		input.PhysicalResults[index].CandidateExactSetDigest = ref.CandidateExactSetDigest
+	}
+	return nil
 }
 
 func archivePageAsset(asset PageAssetMetadata) ProblemSourceArchivePageAsset {
@@ -737,7 +801,8 @@ func exportProblemSourceRecognitionArchive(ctx context.Context, q dbQueryer, age
 	if err := rowsDone(rows); err != nil {
 		return err
 	}
-	rows, err = q.QueryContext(ctx, `SELECT p.work_id,p.ordinal,p.parent_invocation_id,p.physical_invocation_id,p.physical_unit,p.result_digest,p.created_at
+	rows, err = q.QueryContext(ctx, `SELECT p.work_id,p.ordinal,p.parent_invocation_id,p.physical_invocation_id,p.physical_unit,p.result_digest,p.created_at,
+		p.recognition_plan_version,p.plan_digest,p.candidate_exact_set_digest
 		FROM k12_problem_source_recognition_physical_results p JOIN k12_problem_source_recognition_results r ON r.work_id=p.work_id
 		WHERE r.agent_name=? ORDER BY p.work_id,p.ordinal`, agentName)
 	if err != nil {
@@ -745,8 +810,15 @@ func exportProblemSourceRecognitionArchive(ctx context.Context, q dbQueryer, age
 	}
 	physicalIDs := map[string]struct{}{}
 	for rows.Next() {
-		var v ProblemSourceArchiveRecognitionPhysicalResult
-		if err := rows.Scan(&v.WorkID, &v.Ordinal, &v.ParentInvocationID, &v.PhysicalInvocationID, &v.PhysicalUnit, &v.ResultDigest, &v.CreatedAt); err != nil {
+		var (
+			v           ProblemSourceArchiveRecognitionPhysicalResult
+			planVersion string
+		)
+		if scanErr := rows.Scan(&v.WorkID, &v.Ordinal, &v.ParentInvocationID, &v.PhysicalInvocationID, &v.PhysicalUnit, &v.ResultDigest, &v.CreatedAt, &planVersion, &v.PlanDigest, &v.CandidateExactSetDigest); scanErr != nil {
+			return errors.Join(scanErr, rows.Close())
+		}
+		v.RecognitionPlanVersion, err = parseProblemSourceRecognitionPlanVersion(planVersion)
+		if err != nil {
 			rows.Close()
 			return err
 		}
@@ -755,6 +827,22 @@ func exportProblemSourceRecognitionArchive(ctx context.Context, q dbQueryer, age
 	}
 	if err := rowsDone(rows); err != nil {
 		return err
+	}
+	layoutParentIDs, layoutPhysicalIDs, err :=
+		exportProblemSourceArchiveRecognitionLayoutsV2(
+			ctx,
+			q,
+			agentName,
+			out,
+		)
+	if err != nil {
+		return err
+	}
+	for id := range layoutParentIDs {
+		parentIDs[id] = struct{}{}
+	}
+	for id := range layoutPhysicalIDs {
+		physicalIDs[id] = struct{}{}
 	}
 	parents := make([]string, 0, len(parentIDs))
 	for id := range parentIDs {
@@ -1595,6 +1683,9 @@ func ValidateProblemSourceArchiveV6(agentName string, archive ProblemSourceArchi
 			strings.TrimSpace(v.PhysicalInvocationID) == "" {
 			return fmt.Errorf("source recognition physical lineage mismatch")
 		}
+		if factsErr := validateProblemSourceArchiveRecognitionPhysicalFacts(v); factsErr != nil {
+			return factsErr
+		}
 		ordinalKey := fmt.Sprintf("%s\x00%d", v.WorkID, v.Ordinal)
 		if _, duplicate := physicalOrdinals[ordinalKey]; duplicate {
 			return fmt.Errorf("duplicate source recognition physical ordinal")
@@ -1605,6 +1696,12 @@ func ValidateProblemSourceArchiveV6(agentName string, archive ProblemSourceArchi
 		physicalOrdinals[ordinalKey] = struct{}{}
 		physicalResults[v.PhysicalInvocationID] = v
 		physicalCounts[v.WorkID]++
+		if physicalCounts[v.WorkID] > problemSourceRecognitionPhysicalResultLimit {
+			return fmt.Errorf(
+				"source recognition physical count exceeds proven limit %d",
+				problemSourceRecognitionPhysicalResultLimit,
+			)
+		}
 	}
 	authoritativeSubmissions, err := problemSourceArchiveAuthoritativeJobSubmissions(archive)
 	if err != nil {
@@ -1613,6 +1710,16 @@ func ValidateProblemSourceArchiveV6(agentName string, archive ProblemSourceArchi
 	recognitionParents := make(map[string]struct{}, len(results))
 	for _, result := range results {
 		recognitionParents[result.ParentInvocationID] = struct{}{}
+	}
+	layoutParents := make(map[string]struct{}, len(archive.RecognitionLayoutsV2))
+	layoutPhysicalIDs, err := problemSourceArchiveRecognitionLayoutPhysicalIDsV2(
+		archive.RecognitionLayoutsV2,
+	)
+	if err != nil {
+		return err
+	}
+	for _, layout := range archive.RecognitionLayoutsV2 {
+		layoutParents[layout.Plan.ParentInvocationID] = struct{}{}
 	}
 	parents := map[string]k12.ModelInvocation{}
 	for _, v := range archive.ModelInvocations {
@@ -1647,7 +1754,9 @@ func ValidateProblemSourceArchiveV6(agentName string, archive ProblemSourceArchi
 		}
 		switch v.Stage {
 		case "recognizing":
-			if _, ok := recognitionParents[v.InvocationID]; !ok {
+			_, resultParent := recognitionParents[v.InvocationID]
+			_, layoutParent := layoutParents[v.InvocationID]
+			if !resultParent && !layoutParent {
 				return fmt.Errorf("unreferenced source recognition model invocation")
 			}
 		case k12.GradingStageProjecting:
@@ -1685,9 +1794,21 @@ func ValidateProblemSourceArchiveV6(agentName string, archive ProblemSourceArchi
 			return fmt.Errorf("duplicate physical invocation %q", v.PhysicalInvocationID)
 		}
 		physicalInvocations[v.PhysicalInvocationID] = v
-		if _, ok := physicalResults[v.PhysicalInvocationID]; !ok {
+		_, resultPhysical := physicalResults[v.PhysicalInvocationID]
+		_, layoutPhysical := layoutPhysicalIDs[v.PhysicalInvocationID]
+		if !resultPhysical && !layoutPhysical {
 			return fmt.Errorf("unreferenced physical invocation")
 		}
+	}
+	if err := validateProblemSourceArchiveRecognitionLayoutsV2(
+		agentName,
+		archive.RecognitionLayoutsV2,
+		works,
+		results,
+		parents,
+		physicalInvocations,
+	); err != nil {
+		return err
 	}
 	for id, v := range results {
 		var affected []string
@@ -1751,6 +1872,13 @@ func ValidateProblemSourceArchiveV6(agentName string, archive ProblemSourceArchi
 		if err != nil {
 			return fmt.Errorf("source recognition typed result invalid: %w", err)
 		}
+		if hydrateErr := hydrateProblemSourceArchiveRecognitionPhysicalFacts(
+			&input,
+			v.WorkID,
+			archive.RecognitionPhysicalResults,
+		); hydrateErr != nil {
+			return fmt.Errorf("source recognition typed physical result invalid: %w", hydrateErr)
+		}
 		_, aggregateDigest, err := normalizeProblemSourceRecognitionResult(input)
 		if err != nil {
 			return fmt.Errorf("source recognition aggregate result invalid: %w", err)
@@ -1801,6 +1929,11 @@ func ValidateProblemSourceArchiveV6(agentName string, archive ProblemSourceArchi
 			if physical.ParentInvocationID != v.ParentInvocationID ||
 				physical.JobID != v.JobID || physical.Stage != "recognizing" ||
 				physical.Attempt != 1 || string(physical.PhysicalUnit) != ref.PhysicalUnit ||
+				physical.Status != k12.ModelInvocationSucceeded ||
+				effectiveProblemSourceRecognitionPlanVersion(physical.RecognitionPlanVersion) !=
+					effectiveProblemSourceRecognitionPlanVersion(ref.RecognitionPlanVersion) ||
+				physical.PlanDigest != ref.PlanDigest ||
+				physical.CandidateExactSetDigest != ref.CandidateExactSetDigest ||
 				physical.ResultDigest != ref.ResultDigest {
 				return fmt.Errorf("source recognition physical invocation lineage mismatch")
 			}
@@ -1972,6 +2105,12 @@ func NormalizeProblemSourceArchiveV6ForRestore(source ProblemSourceArchiveV6) Pr
 	for _, v := range out.RecognitionResults {
 		hasResult[v.WorkID] = struct{}{}
 	}
+	hasFinalizedLayout := map[string]struct{}{}
+	finalizedLayoutParents := map[string]struct{}{}
+	for _, v := range out.RecognitionLayoutsV2 {
+		hasFinalizedLayout[v.WorkID] = struct{}{}
+		finalizedLayoutParents[v.Plan.ParentInvocationID] = struct{}{}
+	}
 	for i := range out.ReprocessJobs {
 		v := &out.ReprocessJobs[i]
 		// Process-local reconciliation leases never survive a restore. Epoch and
@@ -1983,7 +2122,9 @@ func NormalizeProblemSourceArchiveV6ForRestore(source ProblemSourceArchiveV6) Pr
 			v.LeaseOwner = ""
 			v.LeaseExpiresAtMilli = 0
 			v.NextAttemptAtMilli = 0
-			if _, ok := hasResult[v.WorkID]; ok {
+			_, committed := hasResult[v.WorkID]
+			_, finalized := hasFinalizedLayout[v.WorkID]
+			if committed || finalized {
 				v.Status = ProblemSourceReprocessQueued
 				v.FailureCode = ""
 				v.FailureDetail = ""
@@ -2001,8 +2142,12 @@ func NormalizeProblemSourceArchiveV6ForRestore(source ProblemSourceArchiveV6) Pr
 		// exact typed result bytes and digest survived V75. Keep that terminal
 		// state so a crash before final-artifact commit can finish locally without
 		// another provider call. Every payload-less/ambiguous call is parked.
-		if v.Stage != k12.GradingStageProjecting ||
-			v.Status != k12.ModelInvocationSucceeded || v.ResultJSON == "" {
+		_, finalizedRecognition := finalizedLayoutParents[v.InvocationID]
+		keepProjectingResult := v.Stage == k12.GradingStageProjecting &&
+			v.Status == k12.ModelInvocationSucceeded && v.ResultJSON != ""
+		keepFinalizedRecognition := v.Stage == k12.GradingStageRecognizing &&
+			v.Status == k12.ModelInvocationSucceeded && finalizedRecognition
+		if !keepProjectingResult && !keepFinalizedRecognition {
 			v.Status = k12.ModelInvocationReconciled
 		}
 		v.ProviderIdempotencyKey = ""
@@ -2011,9 +2156,22 @@ func NormalizeProblemSourceArchiveV6ForRestore(source ProblemSourceArchiveV6) Pr
 	}
 	for i := range out.ModelPhysicalInvocations {
 		v := &out.ModelPhysicalInvocations[i]
-		v.Status = k12.ModelInvocationReconciled
+		if v.RecognitionPlanVersion == 0 {
+			v.RecognitionPlanVersion = k12.RecognitionPlanVersionV1
+		}
+		// 识别结果只能引用真实成功的子调用。保留该终态证据，以便 V76 绑定触发器校验
+		// 恢复后的投影；只有未被引用且结果不明确的调用才会被停放。
+		if v.Status != k12.ModelInvocationSucceeded {
+			v.Status = k12.ModelInvocationReconciled
+		}
 		v.ExternalRequestID = ""
 		v.FailureKind = ""
+	}
+	for i := range out.RecognitionPhysicalResults {
+		if out.RecognitionPhysicalResults[i].RecognitionPlanVersion == 0 {
+			out.RecognitionPhysicalResults[i].RecognitionPlanVersion =
+				k12.RecognitionPlanVersionV1
+		}
 	}
 	return out
 }
@@ -2274,9 +2432,16 @@ func (s *Store) insertProblemSourceArchiveV6(ctx context.Context, tx *sql.Tx, a 
 	for _, v := range a.ModelPhysicalInvocations {
 		route, _ := json.Marshal(v.RouteSnapshot)
 		policy, _ := json.Marshal(v.RequestPolicySnapshot)
-		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO k12_model_physical_invocations(physical_invocation_id,parent_invocation_id,agent_name,job_id,stage,physical_unit,request_digest,route_snapshot_json,request_policy_snapshot_json,status,attempt,result_digest,result_content,external_request_id,failure_kind,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?)`, v.PhysicalInvocationID, v.ParentInvocationID, v.AgentName, v.JobID, v.Stage, v.PhysicalUnit, v.RequestDigest, string(route), string(policy), v.Status, v.Attempt, v.ResultDigest, v.ExternalRequestID, v.FailureKind, v.CreatedAt, v.UpdatedAt); err != nil {
+		planVersion, err := recognitionPlanVersionSQL(v.RecognitionPlanVersion)
+		if err != nil {
 			return err
 		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO k12_model_physical_invocations(physical_invocation_id,parent_invocation_id,agent_name,job_id,stage,physical_unit,request_digest,route_snapshot_json,request_policy_snapshot_json,status,attempt,result_digest,result_content,external_request_id,failure_kind,created_at,updated_at,recognition_plan_version,plan_digest,candidate_exact_set_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)`, v.PhysicalInvocationID, v.ParentInvocationID, v.AgentName, v.JobID, v.Stage, v.PhysicalUnit, v.RequestDigest, string(route), string(policy), v.Status, v.Attempt, v.ResultDigest, v.ExternalRequestID, v.FailureKind, v.CreatedAt, v.UpdatedAt, planVersion, v.PlanDigest, v.CandidateExactSetDigest); err != nil {
+			return err
+		}
+	}
+	if err := insertProblemSourceArchiveRecognitionLayoutsV2(ctx, tx, a.RecognitionLayoutsV2); err != nil {
+		return err
 	}
 	for _, v := range a.ReprocessJobs {
 		affected, _ := json.Marshal(v.AffectedProblemIDs)
@@ -2290,7 +2455,11 @@ func (s *Store) insertProblemSourceArchiveV6(ctx context.Context, tx *sql.Tx, a 
 		}
 	}
 	for _, v := range a.RecognitionPhysicalResults {
-		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO k12_problem_source_recognition_physical_results(work_id,ordinal,parent_invocation_id,physical_invocation_id,physical_unit,result_digest,created_at) VALUES(?,?,?,?,?,?,?)`, v.WorkID, v.Ordinal, v.ParentInvocationID, v.PhysicalInvocationID, v.PhysicalUnit, v.ResultDigest, v.CreatedAt); err != nil {
+		planVersion, err := recognitionPlanVersionSQL(v.RecognitionPlanVersion)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO k12_problem_source_recognition_physical_results(work_id,ordinal,parent_invocation_id,physical_invocation_id,physical_unit,result_digest,created_at,recognition_plan_version,plan_digest,candidate_exact_set_digest) VALUES(?,?,?,?,?,?,?,?,?,?)`, v.WorkID, v.Ordinal, v.ParentInvocationID, v.PhysicalInvocationID, v.PhysicalUnit, v.ResultDigest, v.CreatedAt, planVersion, v.PlanDigest, v.CandidateExactSetDigest); err != nil {
 			return err
 		}
 	}
@@ -2451,6 +2620,11 @@ func ensureProblemSourceArchiveSubset(want, got ProblemSourceArchiveV6) error {
 		return err
 	}
 	if err := archiveSliceSubset("physical model invocation", want.ModelPhysicalInvocations, got.ModelPhysicalInvocations, func(v k12.ModelPhysicalInvocation) string { return v.PhysicalInvocationID }); err != nil {
+		return err
+	}
+	if err := archiveSliceSubset("recognition layout v2", want.RecognitionLayoutsV2, got.RecognitionLayoutsV2, func(v ProblemSourceArchiveRecognitionLayoutV2) string {
+		return v.WorkID + "/" + v.Plan.PlanID
+	}); err != nil {
 		return err
 	}
 	if err := archiveSliceSubset("recognition result", want.RecognitionResults, got.RecognitionResults, func(v ProblemSourceArchiveRecognitionResult) string { return v.WorkID }); err != nil {

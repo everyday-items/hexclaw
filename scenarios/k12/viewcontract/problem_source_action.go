@@ -70,26 +70,28 @@ type FrozenProblemSourceActionResponse struct {
 }
 
 var problemSourceStatuses = map[string]struct{}{
-	"awaiting_source": {},
-	"processing":      {},
-	"skipped":         {},
-	"correct":         {},
-	"wrong":           {},
-	"unanswered":      {},
-	"answer_unclear":  {},
-	"blank_solved":    {},
-	"out_of_scope":    {},
-	"untrusted":       {},
+	"awaiting_source":            {},
+	"processing":                 {},
+	"skipped":                    {},
+	"correct":                    {},
+	"correct_with_process_issue": {},
+	"wrong":                      {},
+	"unanswered":                 {},
+	"answer_unclear":             {},
+	"blank_solved":               {},
+	"out_of_scope":               {},
+	"untrusted":                  {},
 }
 
 var problemSourceTerminalStatuses = map[string]bool{
-	"correct":        true,
-	"wrong":          true,
-	"unanswered":     true,
-	"answer_unclear": true,
-	"blank_solved":   true,
-	"out_of_scope":   true,
-	"untrusted":      true,
+	"correct":                    true,
+	"correct_with_process_issue": true,
+	"wrong":                      true,
+	"unanswered":                 true,
+	"answer_unclear":             true,
+	"blank_solved":               true,
+	"out_of_scope":               true,
+	"untrusted":                  true,
 }
 
 func (v ProblemSourceActionResponse) Validate() error {

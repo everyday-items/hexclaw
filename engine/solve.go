@@ -330,15 +330,16 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 			Content: formatGrading(studentAnswer, groundTruth, assess) + encodeSubAgentReports(reports),
 			// 结构化批改结果同步进 Metadata，供上层 adapter 免解析文本消费（场景用例层）。
 			Metadata: map[string]string{
-				"solve_run_id":        solveRunID,
-				"solve_mode":          "grading",
-				"solve_verdict":       verdictString(verdict),
-				"solve_evidence":      evidenceKind(numericGrounded),
-				"grade_correct":       strconv.FormatBool(assess.correct),
-				"grade_wrong_step":    assess.wrongStep,
-				"grade_misconception": assess.misconception,
-				"grade_guidance":      assess.guidance,
-				"grade_ground_truth":  groundTruth,
+				"solve_run_id":               solveRunID,
+				"solve_mode":                 "grading",
+				"solve_verdict":              verdictString(verdict),
+				"solve_evidence":             evidenceKind(numericGrounded),
+				"grade_correct":              strconv.FormatBool(assess.correct),
+				"grade_final_answer_correct": strconv.FormatBool(assess.finalAnswerCorrect),
+				"grade_wrong_step":           assess.wrongStep,
+				"grade_misconception":        assess.misconception,
+				"grade_guidance":             assess.guidance,
+				"grade_ground_truth":         groundTruth,
 			},
 		}, nil
 	}
@@ -377,7 +378,8 @@ func (o *SolveSkill) GradeVerified(ctx context.Context, problem, verifiedSolutio
 		verifiedValue, verifiedOK := arithmeticAnswerValue(groundTruth)
 		if verifiedOK && verifiedValue == computed {
 			if studentValue, arithmeticAnswer := arithmeticAnswerValue(studentAnswer); arithmeticAnswer {
-				assess := deterministicGradeAssessment(studentValue == computed, false)
+				finalAnswerCorrect := studentValue == computed
+				assess := deterministicGradeAssessment(finalAnswerCorrect, finalAnswerCorrect, false)
 				return deterministicGradeResult(studentAnswer, computed, "grading_deterministic_arithmetic", assess), nil
 			}
 		}
@@ -390,7 +392,12 @@ func (o *SolveSkill) GradeVerified(ctx context.Context, problem, verifiedSolutio
 			if student, studentOK := parseAnswerQuantity(studentAnswer); studentOK {
 				workValid, conclusive := validateStudentArithmeticWork(studentAnswer)
 				if conclusive {
-					assess := deterministicGradeAssessment(quantitiesEqual(student, expected) && workValid, !workValid)
+					finalAnswerCorrect := quantitiesEqual(student, expected)
+					assess := deterministicGradeAssessment(
+						finalAnswerCorrect && workValid,
+						finalAnswerCorrect,
+						!workValid,
+					)
 					groundTruthWithUnit := solution.value + solution.unit
 					return deterministicGradeResult(studentAnswer, groundTruthWithUnit, "grading_deterministic_elementary_word", assess), nil
 				}
@@ -416,19 +423,20 @@ func (o *SolveSkill) GradeVerified(ctx context.Context, problem, verifiedSolutio
 			{Agent: graderAgentName, Status: subAgentStatusOK},
 		}),
 		Metadata: map[string]string{
-			"solve_run_id":        runID,
-			"solve_mode":          "grading_verified_reuse",
-			"grade_correct":       strconv.FormatBool(assess.correct),
-			"grade_wrong_step":    assess.wrongStep,
-			"grade_misconception": assess.misconception,
-			"grade_guidance":      assess.guidance,
-			"grade_ground_truth":  groundTruth,
+			"solve_run_id":               runID,
+			"solve_mode":                 "grading_verified_reuse",
+			"grade_correct":              strconv.FormatBool(assess.correct),
+			"grade_final_answer_correct": strconv.FormatBool(assess.finalAnswerCorrect),
+			"grade_wrong_step":           assess.wrongStep,
+			"grade_misconception":        assess.misconception,
+			"grade_guidance":             assess.guidance,
+			"grade_ground_truth":         groundTruth,
 		},
 	}, nil
 }
 
-func deterministicGradeAssessment(correct, wrongWork bool) gradeAssessment {
-	assess := gradeAssessment{correct: correct}
+func deterministicGradeAssessment(correct, finalAnswerCorrect, wrongWork bool) gradeAssessment {
+	assess := gradeAssessment{correct: correct, finalAnswerCorrect: finalAnswerCorrect}
 	if correct {
 		return assess
 	}
@@ -446,13 +454,14 @@ func deterministicGradeResult(studentAnswer, groundTruth, mode string, assess gr
 	return &skill.Result{
 		Content: formatGrading(studentAnswer, groundTruth, assess),
 		Metadata: map[string]string{
-			"solve_mode":          mode,
-			"solve_evidence":      "numeric_exec",
-			"grade_correct":       strconv.FormatBool(assess.correct),
-			"grade_wrong_step":    assess.wrongStep,
-			"grade_misconception": assess.misconception,
-			"grade_guidance":      assess.guidance,
-			"grade_ground_truth":  groundTruth,
+			"solve_mode":                 mode,
+			"solve_evidence":             "numeric_exec",
+			"grade_correct":              strconv.FormatBool(assess.correct),
+			"grade_final_answer_correct": strconv.FormatBool(assess.finalAnswerCorrect),
+			"grade_wrong_step":           assess.wrongStep,
+			"grade_misconception":        assess.misconception,
+			"grade_guidance":             assess.guidance,
+			"grade_ground_truth":         groundTruth,
 		},
 	}
 }
@@ -579,25 +588,30 @@ func verdictParseable(out string) bool {
 		strings.Contains(up, "UNVERIFIABLE") || strings.Contains(up, "OUT_OF_SCOPE") || strings.Contains(up, "OUT OF SCOPE")
 }
 
-// gradingParseable 报告 grader 输出是否含 CORRECT 行。
-func gradingParseable(out string) bool { return gradeCorrectRe.MatchString(out) }
+// gradingParseable 报告 grader 输出是否同时含完整作答与最终答案两条独立判定。
+func gradingParseable(out string) bool {
+	return gradeCorrectRe.MatchString(out) && gradeFinalAnswerCorrectRe.MatchString(out)
+}
 
 // gradeAssessment 是 grader 对学生答案的批改结论。
 type gradeAssessment struct {
-	correct       bool
-	wrongStep     string
-	misconception string
-	guidance      string
+	correct            bool
+	finalAnswerCorrect bool
+	wrongStep          string
+	misconception      string
+	guidance           string
 }
 
 // grade 派一个 grader 子 Agent 对比学生答案与正确解。解析失败 → 回退按答案文本直接比对。
 func (o *SolveSkill) grade(ctx context.Context, problem, solution, groundTruth, studentAnswer string) gradeAssessment {
 	if o.executeFunc == nil || ctx.Err() != nil {
-		return gradeAssessment{correct: normalizeAnswer(studentAnswer) == normalizeAnswer(groundTruth)}
+		correct := normalizeAnswer(studentAnswer) == normalizeAnswer(groundTruth)
+		return gradeAssessment{correct: correct, finalAnswerCorrect: correct}
 	}
 	out := o.runValidated(ctx, graderSpec(problem, solution, groundTruth, studentAnswer), gradingParseable)
 	if strings.TrimSpace(out) == "" {
-		return gradeAssessment{correct: normalizeAnswer(studentAnswer) == normalizeAnswer(groundTruth)}
+		correct := normalizeAnswer(studentAnswer) == normalizeAnswer(groundTruth)
+		return gradeAssessment{correct: correct, finalAnswerCorrect: correct}
 	}
 	return parseGrading(out, studentAnswer, groundTruth)
 }
@@ -616,23 +630,32 @@ func graderSpec(problem, solution, groundTruth, studentAnswer string) SubAgentSp
 }
 
 func buildGraderPrompt(problem, solution, groundTruth, studentAnswer string) string {
-	return fmt.Sprintf(`你是一位老师在批改作业。请判断学生是否答对；若答错，找出他**第一个**出错的步骤、背后的误区，并给一句**引导性**提示——不要把完整正确步骤全抄给他，留点余地让他自己改对。可用 code_exec 核对学生的算术。
+	return fmt.Sprintf(`You are a teacher grading homework. Judge separately whether the complete work is fully correct and whether the final answer is correct. If the work contains an error, identify the **first** incorrect step, the underlying misconception, and give one **guiding** hint. Do not copy the full correct solution; leave room for the student to correct it. You may use code_exec to verify arithmetic.
 
-题目：%s
-参考解法：%s
-正确答案：%s
-学生的答案：%s
+Problem: %s
+Reference solution: %s
+Correct answer: %s
+Student answer: %s
 
-数学一律用 Unicode 符号（×÷√≤≥、分数 a/b、平方 x²、下标 H₂O、单位 cm³），**禁止 LaTeX**（不要 \times \frac \text{} ^{} $…$）。
-严格按以下格式输出（四行）：
-CORRECT: yes 或 no
-WRONG_STEP: <若错，第一个出错的步骤；答对则留空>
-MISCONCEPTION: <若错，背后的误区；答对则留空>
-GUIDANCE: <一句引导或鼓励>`, problem, solution, groundTruth, studentAnswer)
+Use Unicode mathematical symbols throughout (×÷√≤≥, fractions such as a/b, powers such as x², subscripts such as H₂O, and units such as cm³). **Do not use LaTeX** (including \times, \frac, \text{}, ^{}, or $…$).
+Decision rules:
+- CORRECT is yes only when the final answer and every explicitly written step are correct.
+- FINAL_ANSWER_CORRECT judges only whether the final result, including required units, matches the correct answer, regardless of intermediate work.
+- If the final answer is correct but the work contains a clear process error, output CORRECT: no and FINAL_ANSWER_CORRECT: yes, and provide the first incorrect step and misconception.
+
+Output exactly five lines in the following format:
+CORRECT: yes or no
+FINAL_ANSWER_CORRECT: yes or no
+WRONG_STEP: <the first incorrect step, or empty when fully correct>
+MISCONCEPTION: <the underlying misconception, or empty when fully correct>
+GUIDANCE: <one guiding or encouraging sentence>`, problem, solution, groundTruth, studentAnswer)
 }
 
 var (
-	gradeCorrectRe = regexp.MustCompile(`(?im)CORRECT\s*[:：]\s*(yes|no|对|错|正确|错误|true|false)`)
+	gradeCorrectRe            = regexp.MustCompile(`(?im)^[ \t]*CORRECT[ \t]*[:：][ \t]*(yes|no|对|错|正确|错误|true|false)[ \t]*$`)
+	gradeFinalAnswerCorrectRe = regexp.MustCompile(
+		`(?im)^[ \t]*FINAL_ANSWER_CORRECT[ \t]*[:：][ \t]*(yes|no|对|错|正确|错误|true|false)[ \t]*$`,
+	)
 	// 标签值必须限制在同一行。这里不能用 \s*：它会吞掉换行，使空 WRONG_STEP
 	// 错把下一行 `MISCONCEPTION:` 当值，随后又把 GUIDANCE 当成 misconception。
 	gradeStepRe   = regexp.MustCompile(`(?im)^\s*WRONG_STEP[ \t]*[:：][ \t]*(.*)$`)
@@ -650,6 +673,22 @@ func parseGrading(out, studentAnswer, groundTruth string) gradeAssessment {
 		}
 	} else {
 		a.correct = normalizeAnswer(studentAnswer) == normalizeAnswer(groundTruth)
+	}
+	// 老模型若遗漏新字段，最终答案事实只退回整体判定；结构校验会先触发一次
+	// fresh-context 重试。新 engine 无论如何都会向 adapter 写出显式 true/false。
+	a.finalAnswerCorrect = a.correct
+	if m := gradeFinalAnswerCorrectRe.FindStringSubmatch(out); len(m) > 1 {
+		switch strings.ToLower(m[1]) {
+		case "yes", "对", "正确", "true":
+			a.finalAnswerCorrect = true
+		default:
+			a.finalAnswerCorrect = false
+		}
+	}
+	// “完整作答正确但最终答案错误”在逻辑上不可能；遇到模型自相矛盾时
+	// 保留最终答案事实并把整体判定降为错误，绝不放行成全对。
+	if a.correct && !a.finalAnswerCorrect {
+		a.correct = false
 	}
 	if m := gradeStepRe.FindStringSubmatch(out); len(m) > 1 {
 		a.wrongStep = strings.TrimSpace(m[1])
@@ -676,6 +715,18 @@ func formatGrading(studentAnswer, groundTruth string, a gradeAssessment) string 
 			s += "\n> " + a.guidance
 		}
 		return s + "\n"
+	}
+	if a.finalAnswerCorrect {
+		var b strings.Builder
+		fmt.Fprintf(&b, "The final answer is correct (reference answer: %q), but the work needs correction.\n\n", groundTruth)
+		if a.wrongStep != "" {
+			fmt.Fprintf(&b, "> ⚠️ Process issue: %s\n", a.wrongStep)
+		}
+		if a.misconception != "" {
+			fmt.Fprintf(&b, "> Cause: %s\n", a.misconception)
+		}
+		fmt.Fprintf(&b, "> 💡 Hint: %s\n", fallbackStr(a.guidance, "Return to the step with the process issue, check it step by step, and write it again."))
+		return b.String()
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "你的答案是「%s」，正确答案是「%s」。\n\n", studentAnswer, groundTruth)

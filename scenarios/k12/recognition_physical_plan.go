@@ -16,6 +16,32 @@ const (
 	DenseWorksheetSegmentOverlapFraction = 0.14
 )
 
+type RecognitionPageClass string
+
+const (
+	RecognitionPageOrdinary RecognitionPageClass = "ordinary"
+	RecognitionPageDense    RecognitionPageClass = "dense"
+)
+
+// ClassifyRecognitionPage 是新 Job 选择识别计划以及旧版 V1 准备受限密集页
+// 回退时共用的唯一确定性几何判定。无效或不支持的图像字节仍沿用历史非密集页
+// 分类；下游图像处理仍负责最终拒绝不可用输入。
+func ClassifyRecognitionPage(raw []byte) RecognitionPageClass {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return RecognitionPageOrdinary
+	}
+	legacyTall := cfg.Height >= 1600 && cfg.Height*5 >= cfg.Width*6
+	lowResolutionWorksheet :=
+		cfg.Height >= 1200 &&
+			cfg.Width >= 800 &&
+			cfg.Height*3 >= cfg.Width*4
+	if legacyTall || lowResolutionWorksheet {
+		return RecognitionPageDense
+	}
+	return RecognitionPageOrdinary
+}
+
 // DenseWorksheetPhysicalInput is one deterministic image input from the
 // approved whole-page protocol fallback. Keeping this constructor in the K12
 // domain lets both the Provider adapter and durable reconciliation rebuild the
@@ -48,16 +74,7 @@ func DenseWorksheetRanges() [DenseWorksheetSegmentCount][2]float64 {
 func DenseWorksheetFallbackPhysicalInputs(
 	raw []byte,
 ) ([]DenseWorksheetPhysicalInput, bool) {
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
-	if err != nil {
-		return nil, false
-	}
-	legacyTall := cfg.Height >= 1600 && cfg.Height*5 >= cfg.Width*6
-	lowResolutionWorksheet :=
-		cfg.Height >= 1200 &&
-			cfg.Width >= 800 &&
-			cfg.Height*3 >= cfg.Width*4
-	if !legacyTall && !lowResolutionWorksheet {
+	if ClassifyRecognitionPage(raw) != RecognitionPageDense {
 		return nil, false
 	}
 	src, _, err := image.Decode(bytes.NewReader(raw))

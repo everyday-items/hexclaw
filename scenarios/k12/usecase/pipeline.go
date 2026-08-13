@@ -402,12 +402,13 @@ func (d Deps) projectGradeResult(ctx context.Context, req GradeRequest, res Grad
 	// 判定统一 Verdict 五值（§4.5）：agree（答对）→ 若同题已在错题本则推进状态
 	//    （对同题批改为对 → retried，PRD §3.4.4-2 / §5.3.1）。
 	//    best-effort：推进失败绝不让批改失败（批改结论独立于记录副作用，PRD §3.4.6）。
-	if res.Outcome.Verdict == VerdictAgree {
+	assessmentStatus := res.Outcome.AssessmentStatus()
+	if assessmentStatus == k12.GradingAssessmentCorrect {
 		d.advanceMistakeOnCorrect(ctx, req)
 		return res, nil
 	}
 	// 非二元结论（unverifiable 等）：不判对错，也不得自动进错题本（§4.5「可自动进错题」仅 incorrect）。
-	if res.Outcome.Verdict != VerdictDisagree {
+	if assessmentStatus != k12.GradingAssessmentWrong {
 		return res, nil
 	}
 
@@ -449,8 +450,8 @@ func (d Deps) gradingAssessmentEffects(
 	req GradeRequest,
 	res GradeResult,
 ) (k12storage.GradingAssessmentEffects, error) {
-	switch res.Outcome.Verdict {
-	case VerdictDisagree:
+	switch res.Outcome.AssessmentStatus() {
+	case k12.GradingAssessmentWrong:
 		due := d.now() + FirstReviewInterval
 		return k12storage.GradingAssessmentEffects{Mistake: &k12storage.GradingMistakeEffect{
 			SourceSession: req.SourceSession,
@@ -465,7 +466,7 @@ func (d Deps) gradingAssessmentEffects(
 				EntrySource:     k12.MistakeEntryPhoto,
 			},
 		}}, nil
-	case VerdictAgree:
+	case k12.GradingAssessmentCorrect:
 		if d.Records == nil || strings.TrimSpace(req.Problem) == "" {
 			return k12storage.GradingAssessmentEffects{}, nil
 		}

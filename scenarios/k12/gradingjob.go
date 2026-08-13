@@ -375,6 +375,19 @@ func ParseGradingJobFields(fieldsJSON string) (GradingJobFields, error) {
 	if err := json.Unmarshal([]byte(fieldsJSON), &f); err != nil {
 		return GradingJobFields{}, err
 	}
+	var persisted struct {
+		BudgetSnapshot json.RawMessage `json:"budget_snapshot"`
+	}
+	if err := json.Unmarshal([]byte(fieldsJSON), &persisted); err != nil {
+		return GradingJobFields{}, err
+	}
+	if len(persisted.BudgetSnapshot) > 0 && string(persisted.BudgetSnapshot) != "null" {
+		budget, err := ParseStoredGradingBudgetSnapshot(persisted.BudgetSnapshot)
+		if err != nil {
+			return GradingJobFields{}, fmt.Errorf("parse budget_snapshot: %w", err)
+		}
+		f.BudgetSnapshot = budget
+	}
 	f.ModelSnapshot = NormalizeGradingModelSnapshot(f.ModelSnapshot)
 	return f, nil
 }

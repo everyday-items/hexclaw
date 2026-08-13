@@ -186,6 +186,50 @@ func (c *Config) Validate() error {
 				Rule: "按顺序完整提供 max_problems=1/8/16/32 且 seconds>0", Suggest: "缺任一真实样本桶时保持未冻结",
 			})
 		}
+		switch gradingBudget.RecognitionPlanVersion {
+		case 1:
+			if !gradingBudget.RecognizingBuckets.IsZero() ||
+				gradingBudget.PhysicalCallCapMillis != 0 || gradingBudget.WorkerHardCap != 0 ||
+				gradingBudget.EffectiveConcurrency != 0 {
+				errs = append(errs, &ValidationError{
+					Field: "k12.grading_budget.recognition_plan_version", Value: "1",
+					Rule: "v1 must not include v2 recognizing parameters", Suggest: "Remove recognizing_buckets/cap/worker/concurrency",
+				})
+			}
+		case 2:
+			b := gradingBudget.RecognizingBuckets
+			if b.UpTo1ProblemMillis <= 0 || b.UpTo8ProblemsMillis <= 0 ||
+				b.UpTo16ProblemsMillis <= 0 || b.UpTo32ProblemsMillis <= 0 {
+				errs = append(errs, &ValidationError{
+					Field: "k12.grading_budget.recognizing_buckets", Value: fmt.Sprintf("%+v", b),
+					Rule: "v2 must provide positive 1/8/16/32-millisecond buckets", Suggest: "Use measured values from the same route",
+				})
+			}
+			if gradingBudget.PhysicalCallCapMillis != 120000 || gradingBudget.WorkerHardCap != 2 {
+				errs = append(errs, &ValidationError{
+					Field: "k12.grading_budget.recognition_plan_version", Value: "2",
+					Rule: "v2 requires physical_call_cap_millis=120000 and worker_hard_cap=2", Suggest: "Use the approved fixed limits",
+				})
+			}
+			if gradingBudget.EffectiveConcurrency != 1 {
+				errs = append(errs, &ValidationError{
+					Field: "k12.grading_budget.effective_concurrency", Value: fmt.Sprintf("%d", gradingBudget.EffectiveConcurrency),
+					Rule: "The current release configuration requires a value of 1", Suggest: "effective=2 requires approved measurements for all four buckets",
+				})
+			}
+			wantRecognizingSeconds := (b.UpTo32ProblemsMillis + 999) / 1000
+			if b.UpTo32ProblemsMillis > 0 && gradingBudget.RecognizingSeconds != wantRecognizingSeconds {
+				errs = append(errs, &ValidationError{
+					Field: "k12.grading_budget.recognizing_seconds", Value: fmt.Sprintf("%d", gradingBudget.RecognizingSeconds),
+					Rule: "v2 must equal ceil(up_to_32_problem_millis/1000)", Suggest: "Use the same 32-problem initial window for manifest and batch",
+				})
+			}
+		default:
+			errs = append(errs, &ValidationError{
+				Field: "k12.grading_budget.recognition_plan_version", Value: fmt.Sprintf("%d", gradingBudget.RecognitionPlanVersion),
+				Rule: "The frozen policy must explicitly be 1 or 2", Suggest: "Use 1 for ordinary mode or 2 for the approved dense v2 mode",
+			})
+		}
 	}
 
 	// 3. Router：配置了静态 Agents 时，DefaultAgent（若指定）必须在列表中

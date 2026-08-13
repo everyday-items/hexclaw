@@ -89,7 +89,9 @@ type startOptions struct {
 
 type cleanupOptions struct {
 	commonOptions
-	manifest string
+	manifest      string
+	claim         string
+	claimProvided bool
 }
 
 // prepareProfileOptions deliberately has no default policy, source profile, or
@@ -135,7 +137,8 @@ func execute(
 	}
 	if len(args) == 0 {
 		return errors.New(
-			"expected prepare-profile, start, cleanup, scavenge, or partial-ledger-evidence-diagnostic",
+			"expected prepare-profile, start, cleanup, scavenge, partial-ledger-evidence-diagnostic, " +
+				"or recognition-v2-finalization-evidence",
 		)
 	}
 	switch args[0] {
@@ -169,10 +172,16 @@ func execute(
 			return err
 		}
 		return executePartialLedgerEvidenceDiagnostic(ctx, options, stdout)
+	case "recognition-v2-finalization-evidence":
+		options, err := parseRecognitionV2EvidenceOptions(args[1:], stderr)
+		if err != nil {
+			return err
+		}
+		return executeRecognitionV2FinalizationEvidence(ctx, options, stdout)
 	default:
 		return errors.New(
 			"unknown command; expected prepare-profile, start, cleanup, scavenge, or " +
-				"partial-ledger-evidence-diagnostic",
+				"partial-ledger-evidence-diagnostic, or recognition-v2-finalization-evidence",
 		)
 	}
 }
@@ -233,11 +242,20 @@ func parseCleanupOptions(args []string, stderr io.Writer) (cleanupOptions, error
 	flags.StringVar(&options.profile, "profile", "", "isolated /tmp profile")
 	flags.StringVar(&options.store, "store", "", "existing isolated SQLite store")
 	flags.StringVar(&options.manifest, "manifest", "", "existing manifest path")
+	flags.StringVar(&options.claim, "claim", "", "optional 0600 recognition V2 target claim")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return cleanupOptions{}, errors.New("invalid cleanup arguments")
 	}
+	flags.Visit(func(value *flag.Flag) {
+		if value.Name == "claim" {
+			options.claimProvided = true
+		}
+	})
 	if strings.TrimSpace(options.manifest) == "" {
 		return cleanupOptions{}, errors.New("cleanup requires manifest")
+	}
+	if options.claimProvided && strings.TrimSpace(options.claim) == "" {
+		return cleanupOptions{}, errors.New("cleanup claim path is empty")
 	}
 	return options, nil
 }
@@ -321,6 +339,9 @@ func executeCleanup(
 		return err
 	}
 	return withProfileLock(resolved.profile, func() error {
+		if options.claimProvided {
+			return executeClaimAwareCleanup(ctx, resolved, options, stdout)
+		}
 		manifestPath, err := resolveExistingManifest(resolved.profile, options.manifest)
 		if err != nil {
 			return err
@@ -555,30 +576,40 @@ func openBuilder(
 	ctx context.Context,
 	storePath string,
 ) (*livetestfixture.Builder, func(), error) {
-	store, err := sqlitestore.New(storePath)
+	builder, store, err := openBuilderWithStore(ctx, storePath)
 	if err != nil {
 		return nil, func() {}, err
 	}
-	closeStore := func() { _ = store.Close() }
+	return builder, func() { _ = store.Close() }, nil
+}
+
+func openBuilderWithStore(
+	ctx context.Context,
+	storePath string,
+) (*livetestfixture.Builder, *sqlitestore.Store, error) {
+	store, err := sqlitestore.New(storePath)
+	if err != nil {
+		return nil, nil, err
+	}
 	if err := store.Init(ctx); err != nil {
-		closeStore()
-		return nil, func() {}, err
+		_ = store.Close()
+		return nil, nil, err
 	}
 	agents := router.NewSQLiteStore(store.DB())
 	if err := agents.Init(ctx); err != nil {
-		closeStore()
-		return nil, func() {}, err
+		_ = store.Close()
+		return nil, nil, err
 	}
 	registry := scenario.NewRegistry()
 	if err := registry.Assemble(k12.Pack(k12.NewCurriculumStub())); err != nil {
-		closeStore()
-		return nil, func() {}, err
+		_ = store.Close()
+		return nil, nil, err
 	}
 	return &livetestfixture.Builder{
 		Agents:  agents,
 		Records: k12storage.NewStore(store.DB(), registry.Records),
 		Calls:   &livetestfixture.BoundaryCounter{},
-	}, closeStore, nil
+	}, store, nil
 }
 
 func writeManifestAtomic(path string, manifest manifestFile) (err error) {
@@ -619,7 +650,10 @@ func writeManifestAtomic(path string, manifest manifestFile) (err error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return errors.New("manifest target cannot be inspected")
 	}
-	if err := os.Rename(staging, path); err != nil {
+	if err := publishManifestNoReplace(staging, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return errors.New("manifest target already exists")
+		}
 		return errors.New("cannot publish fixture manifest")
 	}
 	directory, err := os.Open(parent)
@@ -631,6 +665,13 @@ func writeManifestAtomic(path string, manifest manifestFile) (err error) {
 		return errors.New("cannot sync manifest directory")
 	}
 	return nil
+}
+
+func publishManifestNoReplace(staging, target string) error {
+	if err := os.Link(staging, target); err != nil {
+		return err
+	}
+	return os.Remove(staging)
 }
 
 func readManifest(path string) (manifestFile, error) {

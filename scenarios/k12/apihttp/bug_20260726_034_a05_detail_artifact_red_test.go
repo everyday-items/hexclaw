@@ -20,7 +20,7 @@ func prepareArchivedWeeklyArtifact(
 	t *testing.T,
 ) (*a05RequestLedger, string, string) {
 	t.Helper()
-	h, _, clock := newWeeklyContractServer(t)
+	h, _, clock := newWeeklyBundleContractServer(t)
 	ledger := &a05RequestLedger{next: h}
 	if rec, _ := do(t, ledger, http.MethodPut, "/profile-bundle",
 		weeklyBundleBody("a05-artifact-bundle", 0, 0, 0)); rec.Code != http.StatusOK {
@@ -50,8 +50,7 @@ func prepareArchivedWeeklyArtifact(
 	}
 	clock.now += 8 * 86400
 	if rec, _ := do(t, ledger, http.MethodPost, "/weekly-practice/plans",
-		`{"agent":"mingming","idempotency_key":"a05-artifact-next-week"}`);
-		rec.Code != http.StatusCreated {
+		`{"agent":"mingming","idempotency_key":"a05-artifact-next-week"}`); rec.Code != http.StatusCreated {
 		t.Fatalf("archive trigger status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	return ledger, snapshotID, artifactID

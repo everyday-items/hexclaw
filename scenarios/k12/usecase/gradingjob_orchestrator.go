@@ -301,6 +301,21 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 			)
 		}
 	} else {
+		var trustedRecognitionPolicy *k12.GradingBudgetSnapshot
+		if o.deps.GradingBudgetSnapshot.IsFrozen() {
+			selected, selectErr := trustedPhotoRecognitionCreationPolicy(
+				o.deps.GradingBudgetSnapshot,
+				in.Photo.Image,
+			)
+			if selectErr != nil {
+				return GradingJobView{}, false, fmt.Errorf(
+					"%w: select trusted photo recognition policy: %v",
+					ErrInvalidInput,
+					selectErr,
+				)
+			}
+			trustedRecognitionPolicy = &selected
+		}
 		snap := in.ModelSnapshot
 		if o.snapshotFn != nil {
 			snap, err = o.snapshotFn(snap)
@@ -333,6 +348,7 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 			ParentAutomaticDeadlineAt:   in.ParentAutomaticDeadlineAt,
 			BudgetSnapshot:              in.BudgetSnapshot,
 			MaterializesProblemAttempts: true,
+			trustedRecognitionPolicy:    trustedRecognitionPolicy,
 		})
 		if err != nil {
 			return GradingJobView{}, false, err
@@ -350,6 +366,40 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 		return GradingJobView{}, false, fmt.Errorf("usecase: 固化批改任务运行时: %w", err)
 	}
 	return v, created, nil
+}
+
+func trustedPhotoRecognitionCreationPolicy(
+	trusted k12.GradingBudgetSnapshot,
+	image []byte,
+) (k12.GradingBudgetSnapshot, error) {
+	if err := trusted.Validate(); err != nil {
+		return k12.GradingBudgetSnapshot{}, err
+	}
+	switch trusted.RecognitionPlanVersion {
+	case k12.RecognitionPlanVersionV1:
+		return trusted, nil
+	case k12.RecognitionPlanVersionV2:
+		if k12.ClassifyRecognitionPage(image) == k12.RecognitionPageDense {
+			return trusted, nil
+		}
+		selected := trusted
+		selected.RecognitionPlanVersion = k12.RecognitionPlanVersionV1
+		selected.StageSeconds.Recognizing =
+			(selected.PhysicalCallCapMillis + 999) / 1000
+		selected.RecognizingBuckets = k12.RecognitionLayoutBudgetBucketsV2{}
+		selected.PhysicalCallCapMillis = 0
+		selected.WorkerHardCap = 0
+		selected.EffectiveConcurrency = 0
+		if err := selected.Validate(); err != nil {
+			return k12.GradingBudgetSnapshot{}, err
+		}
+		return selected, nil
+	default:
+		return k12.GradingBudgetSnapshot{}, fmt.Errorf(
+			"unknown recognition plan version %d",
+			trusted.RecognitionPlanVersion,
+		)
+	}
 }
 
 // RunGradingJob 按 Job 当前 stage 顺序推进，直到停点（awaiting_confirmation 等确认命令）、
@@ -661,6 +711,27 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 			fmt.Errorf("%w: %v", ErrModelRequestPolicyInvalid, policyErr),
 		)
 	}
+	recognitionPlanVersion, planVersionErr :=
+		frozenRecognitionPlanVersion(job.Fields.BudgetSnapshot)
+	if planVersionErr != nil {
+		return o.failModelInvocationBeforeSend(
+			ctx,
+			run,
+			jobID,
+			planVersionErr,
+		)
+	}
+	if recognitionPlanVersion == k12.RecognitionPlanVersionV2 && policy.IsZero() {
+		return o.failModelInvocationBeforeSend(
+			ctx,
+			run,
+			jobID,
+			fmt.Errorf(
+				"%w: recognition plan v2 requires the frozen recognizing request policy",
+				ErrModelRequestPolicyInvalid,
+			),
+		)
+	}
 	var invocation k12.ModelInvocation
 	if policy.IsZero() {
 		invocation, err = o.beginModelInvocationWithPolicy(
@@ -777,6 +848,30 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 			providerCtx,
 			invocation.RequestPolicySnapshot,
 		)
+	}
+	if recognitionPlanVersion == k12.RecognitionPlanVersionV2 {
+		runtime, runtimeErr := o.loadInitialRecognitionLayoutRuntimeV2(
+			context.WithoutCancel(ctx),
+			job,
+			invocation,
+			run.req.Image,
+		)
+		if runtimeErr != nil {
+			cancelProvider()
+			return GradingJobView{}, runtimeErr
+		}
+		providerCtx = k12.WithRecognitionLayoutPlanV2(
+			providerCtx,
+			runtime.HeaderDigest,
+		)
+		if runtime.Status == "succeeded" {
+			// 最终化是持久化精确集合的提交。如果进程在将其投影到父 Job 前退出，
+			// 则通过显式的只读重放标记进入适配器。适配器必须在任何图像拆分或
+			// Provider 边界之前解码已有回执。
+			providerCtx = k12.WithRecognitionLayoutFinalizationReplayV2(
+				providerCtx,
+			)
+		}
 	}
 	physicalExecutor := newDurableRecognitionPhysicalCallExecutor(
 		o,
@@ -1877,6 +1972,20 @@ func (o *GradingOrchestrator) beginRecognizingModelInvocationWithPolicy(
 	requestDigest string,
 	policy k12.ModelRequestPolicySnapshot,
 ) (k12.ModelInvocation, error) {
+	recognitionPlanVersion, err :=
+		frozenRecognitionPlanVersion(job.Fields.BudgetSnapshot)
+	if err != nil {
+		return k12.ModelInvocation{}, err
+	}
+	if recognitionPlanVersion == k12.RecognitionPlanVersionV2 {
+		return o.beginRecognizingLayoutModelInvocationV2(
+			ctx,
+			job,
+			image,
+			requestDigest,
+			policy,
+		)
+	}
 	parent, _, err := o.deps.Records.PrepareModelInvocation(
 		ctx,
 		k12.ModelInvocation{
@@ -1961,6 +2070,144 @@ func (o *GradingOrchestrator) beginRecognizingModelInvocationWithPolicy(
 		published.InvocationID,
 		published.Status,
 		child.Status,
+	)
+}
+
+func frozenRecognitionPlanVersion(
+	snapshot k12.GradingBudgetSnapshot,
+) (int, error) {
+	if !snapshot.IsFrozen() {
+		if err := snapshot.Validate(); err != nil {
+			return 0, fmt.Errorf(
+				"%w: invalid legacy grading budget snapshot: %v",
+				ErrModelRequestPolicyInvalid,
+				err,
+			)
+		}
+		return k12.RecognitionPlanVersionV1, nil
+	}
+	if err := snapshot.Validate(); err != nil {
+		return 0, fmt.Errorf(
+			"%w: invalid frozen recognition plan: %v",
+			ErrModelRequestPolicyInvalid,
+			err,
+		)
+	}
+	switch snapshot.RecognitionPlanVersion {
+	case k12.RecognitionPlanVersionV1, k12.RecognitionPlanVersionV2:
+		return snapshot.RecognitionPlanVersion, nil
+	default:
+		return 0, fmt.Errorf(
+			"%w: unknown frozen recognition plan version %d",
+			ErrModelRequestPolicyInvalid,
+			snapshot.RecognitionPlanVersion,
+		)
+	}
+}
+
+func (o *GradingOrchestrator) beginRecognizingLayoutModelInvocationV2(
+	ctx context.Context,
+	job GradingJobView,
+	image []byte,
+	requestDigest string,
+	policy k12.ModelRequestPolicySnapshot,
+) (k12.ModelInvocation, error) {
+	canonicalPage, err := k12.CanonicalizeRecognitionPageV2(image)
+	if err != nil {
+		return k12.ModelInvocation{}, fmt.Errorf(
+			"%w: canonicalize recognition page v2: %v",
+			ErrRecognitionPhysicalCallBeforeSend,
+			err,
+		)
+	}
+	parent, _, err := o.deps.Records.PrepareModelInvocation(
+		ctx,
+		k12.ModelInvocation{
+			InvocationID:  "modelinv-" + idgen.ShortID(),
+			AgentName:     job.Record.AgentName,
+			JobID:         job.Record.RecordID,
+			Stage:         k12.GradingStageRecognizing,
+			RequestDigest: requestDigest,
+			RouteSnapshot: job.Fields.ModelSnapshot,
+			RequestPolicySnapshot: k12.NormalizeModelRequestPolicySnapshot(
+				policy,
+			),
+			Attempt:   job.Fields.AttemptCount + 1,
+			CreatedAt: o.deps.now(),
+			UpdatedAt: o.deps.now(),
+		},
+	)
+	if err != nil {
+		return k12.ModelInvocation{}, err
+	}
+	stageStartedAt, err := recognitionLayoutStageStartedAtV2(job, parent)
+	if err != nil {
+		return parent, err
+	}
+	return o.publishInitialRecognitionLayoutV2(
+		ctx,
+		parent,
+		canonicalPage,
+		initialRecognitionLayoutContractV2{
+			Budget:                   job.Fields.BudgetSnapshot,
+			StageStartedAtUnixMillis: stageStartedAt,
+		},
+	)
+}
+
+func recognitionLayoutStageStartedAtV2(
+	job GradingJobView,
+	parent k12.ModelInvocation,
+) (int64, error) {
+	budgetMillis := job.Fields.BudgetSnapshot.RecognizingBuckets.
+		UpTo32ProblemsMillis
+	budgetSeconds := (budgetMillis + 999) / 1000
+	stageStartedAtSeconds := job.Fields.Deadline - budgetSeconds
+	if budgetMillis <= 0 || budgetSeconds <= 0 ||
+		job.Fields.Deadline <= 0 || stageStartedAtSeconds <= 0 ||
+		parent.CreatedAt < stageStartedAtSeconds ||
+		parent.CreatedAt > stageStartedAtSeconds+1 {
+		return 0, fmt.Errorf(
+			"%w: recognizing job deadline is not the trusted v2 32-problem ceiling",
+			ErrModelRequestPolicyInvalid,
+		)
+	}
+	return stageStartedAtSeconds * 1000, nil
+}
+
+func stableRecognitionLayoutPlanIDV2(parentInvocationID string) string {
+	sum := sha256.Sum256([]byte(
+		"k12-recognition-layout-plan-v2\x00" + parentInvocationID,
+	))
+	return "layoutplan-" + hex.EncodeToString(sum[:16])
+}
+
+func (o *GradingOrchestrator) loadInitialRecognitionLayoutRuntimeV2(
+	ctx context.Context,
+	job GradingJobView,
+	parent k12.ModelInvocation,
+	image []byte,
+) (k12.RecognitionLayoutPlanRuntimeV2, error) {
+	canonicalPage, err := k12.CanonicalizeRecognitionPageV2(image)
+	if err != nil {
+		return k12.RecognitionLayoutPlanRuntimeV2{}, fmt.Errorf(
+			"%w: canonicalize recognition page v2: %v",
+			ErrRecognitionPhysicalCallBeforeSend,
+			err,
+		)
+	}
+	stageStartedAt, err := recognitionLayoutStageStartedAtV2(job, parent)
+	if err != nil {
+		return k12.RecognitionLayoutPlanRuntimeV2{}, err
+	}
+	return o.loadInitialRecognitionLayoutRuntimeForParentV2(
+		ctx,
+		parent,
+		canonicalPage,
+		initialRecognitionLayoutContractV2{
+			Budget:                   job.Fields.BudgetSnapshot,
+			StageStartedAtUnixMillis: stageStartedAt,
+		},
 	)
 }
 

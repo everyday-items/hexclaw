@@ -9,7 +9,7 @@ import (
 )
 
 func TestBUG20260726034A05ArchivedHistorySummaryCountsAssessmentResults(t *testing.T) {
-	h, _, clock := newWeeklyContractServer(t)
+	h, _, clock := newWeeklyBundleContractServer(t)
 	if rec, _ := do(t, h, http.MethodPut, "/profile-bundle",
 		weeklyBundleBody("a05-bundle", 0, 0, 0)); rec.Code != http.StatusOK {
 		t.Fatalf("profile-bundle status=%d body=%s", rec.Code, rec.Body.String())

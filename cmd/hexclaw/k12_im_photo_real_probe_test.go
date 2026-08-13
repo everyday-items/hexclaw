@@ -27,20 +27,21 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/hexagon-codes/ai-core/llm"
-	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/ai-core/transport"
+	"github.com/hexagon-codes/toolkit/os/sandbox"
+	"github.com/hexagon-codes/toolkit/util/idgen"
+
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
 	k12engineadapter "github.com/hexagon-codes/hexclaw/scenarios/k12/engineadapter"
 	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/skill/builtin"
 	sqlitestore "github.com/hexagon-codes/hexclaw/storage/sqlite"
-	"github.com/hexagon-codes/toolkit/os/sandbox"
-	"github.com/hexagon-codes/toolkit/util/idgen"
 )
 
 const k12AnsweredFixtureSHA256 = "78cf3a1b5c52e12ca17ca13aa71c7a9439baed244e88b438aa2f1f70cd782fb5"
@@ -72,6 +73,10 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build real provider router: error_type=%T", err)
 	}
+	gradingSnapshot, err := resolveK12GradingModelSnapshot(realRouter, k12.GradingModelSnapshot{})
+	if err != nil {
+		t.Fatalf("freeze real photo probe route: error_type=%T", err)
+	}
 
 	ctx := context.Background()
 	store, err := sqlitestore.New(filepath.Join(t.TempDir(), "k12-photo-probe.db"))
@@ -87,7 +92,11 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	}
 
 	skills := skill.NewRegistry()
-	sandboxCfg := sandbox.Config{Workspace: t.TempDir(), Timeout: 30}
+	sandboxCfg := sandbox.Config{
+		Workspace:            t.TempDir(),
+		Timeout:              30,
+		RequiredCapabilities: sandbox.UntrustedCodeIsolationCapabilities,
+	}
 	sb, err := sandbox.New(sandboxCfg)
 	if err != nil {
 		t.Fatalf("create code sandbox: error_type=%T", err)
@@ -125,31 +134,40 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	var visionCalls atomic.Int32
 	vision := func(visionCtx context.Context, image []byte, prompt string) (string, error) {
 		call := visionCalls.Add(1)
-		provider, model, routeErr := react.RouteForVision(visionCtx)
-		if routeErr != nil {
-			return "", routeErr
+		provider, found := realRouter.Get(gradingSnapshot.Provider)
+		if !found || provider == nil {
+			return "", fmt.Errorf("frozen photo probe provider unavailable")
 		}
-		mime := http.DetectContentType(image)
-		if !strings.HasPrefix(strings.ToLower(mime), "image/") {
-			mime = "image/jpeg"
-		}
-		dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
-		t.Logf("vision call: call=%d provider=%q model=%q bytes=%d", call, provider.Name(), model, len(image))
-		resp, completeErr := provider.Complete(visionCtx, hexagon.CompletionRequest{
-			Model: model,
-			Messages: []llm.Message{{
-				Role: llm.RoleUser,
-				MultiContent: []llm.ContentPart{
-					llm.NewTextPart(prompt),
-					llm.NewImageURLPart(dataURL, "high"),
-				},
-			}},
-		})
+		visionCtx, cancel := context.WithTimeout(
+			visionCtx,
+			time.Duration(gradingSnapshot.TimeoutMS)*time.Millisecond,
+		)
+		defer cancel()
+		visionCtx = k12.WithGradingModelSnapshot(visionCtx, gradingSnapshot)
+		visionCtx = k12.WithGradingModelRequestPolicy(
+			visionCtx,
+			gradingSnapshot.RecognizingRequestPolicy,
+		)
+		t.Logf("vision call: call=%d provider=%q model=%q bytes=%d", call, provider.Name(), gradingSnapshot.Model, len(image))
+		content, completeErr := completeK12VisionRequest(
+			visionCtx,
+			provider,
+			gradingSnapshot.Model,
+			image,
+			prompt,
+		)
 		if completeErr != nil {
-			t.Logf("vision provider error_type=%T", completeErr)
+			var providerErr *transport.ProviderError
+			if errors.As(completeErr, &providerErr) {
+				t.Logf("vision provider failure: status_code=%d action=%q elapsed=%s retry_after=%s request_id_present=%t",
+					providerErr.StatusCode, providerErr.Action, providerErr.Elapsed.Round(time.Millisecond),
+					providerErr.RetryAfter.Round(time.Millisecond), providerErr.RequestID != "")
+			} else {
+				t.Logf("vision provider error_type=%T", completeErr)
+			}
 			return "", fmt.Errorf("photo probe provider completion failed: %T", completeErr)
 		}
-		return resp.Content, nil
+		return content, nil
 	}
 
 	recognizer := k12engineadapter.NewRecognizerAdapter(vision)
@@ -296,9 +314,10 @@ func assertKnownAnsweredWorksheetSemantics(t *testing.T, result k12usecase.Photo
 				expectedIndex+1, len(result.Items))
 		}
 		if item.Status != want.status {
-			t.Fatalf("question index=%d status=%s want=%s answer_chars=%d warning_chars=%d",
+			t.Fatalf("question index=%d status=%s want=%s answer_chars=%d warning_chars=%d knowledge_points=%q out_of_scope_kp=%q curriculum_unmapped=%q",
 				expectedIndex+1, item.Status, want.status, len([]rune(item.Recognized.StudentAnswer)),
-				len([]rune(item.Warning)))
+				len([]rune(item.Warning)), item.Recognized.KnowledgePoints, item.Grade.OutOfScopeKP,
+				item.Grade.CurriculumUnmapped)
 		}
 		if want.status != k12usecase.PhotoUnanswered && item.Recognized.BBox == nil {
 			t.Fatalf("answered question index=%d has no verified image anchor", expectedIndex+1)
@@ -437,11 +456,48 @@ func classifyK12PhotoProbeFailure(err error) string {
 		strings.Contains(message, "duplicate attempt_id") ||
 		strings.Contains(message, "must share page_asset_id"):
 		return "recognition_identity_invalid"
-	case strings.Contains(message, "视觉模型调用失败") ||
+	case strings.Contains(message, "vision model call failed") ||
+		strings.Contains(message, "视觉模型调用失败") ||
 		strings.Contains(message, "photo probe provider completion failed"):
 		return "vision_provider"
 	case strings.Contains(message, "作答坐标") || strings.Contains(message, "anchor"):
 		return "answer_anchor"
+	case errors.Is(err, k12.ErrRecognitionProtocolInvalid) &&
+		strings.Contains(message, "source_number_path/display_label"):
+		return "recognition_source_number_pair_invalid"
+	case errors.Is(err, k12.ErrRecognitionProtocolInvalid) &&
+		strings.Contains(message, "source_section_path/source_section_label"):
+		return "recognition_source_section_pair_invalid"
+	case errors.Is(err, k12.ErrRecognitionProtocolInvalid) &&
+		strings.Contains(message, "recognition_confidence"):
+		return "recognition_confidence_invalid"
+	case errors.Is(err, k12.ErrRecognitionProtocolInvalid) &&
+		strings.Contains(message, "unsupported problem_kind"):
+		return "recognition_problem_kind_invalid"
+	case errors.Is(err, k12.ErrRecognitionProtocolInvalid) &&
+		strings.Contains(message, "dangling parent_problem_id"):
+		return "recognition_parent_reference_dangling"
+	case errors.Is(err, k12.ErrRecognitionProtocolInvalid) &&
+		strings.Contains(message, "ambiguous problem_id"):
+		return "recognition_parent_reference_ambiguous"
+	case errors.Is(err, k12.ErrRecognitionProtocolInvalid) &&
+		strings.Contains(message, "cannot own answer/parent/subproblem_no"):
+		return "recognition_compound_parent_invalid"
+	case errors.Is(err, k12.ErrRecognitionProtocolInvalid) &&
+		strings.Contains(message, "cannot have parent/subproblem_no"):
+		return "recognition_standalone_invalid"
+	case errors.Is(err, k12.ErrRecognitionProtocolInvalid) &&
+		strings.Contains(message, "needs subproblem_no"):
+		return "recognition_subproblem_number_missing"
+	case errors.Is(err, k12.ErrRecognitionProtocolInvalid) &&
+		strings.Contains(message, "结构无效"):
+		return "recognition_structure_invalid"
+	case errors.Is(err, k12.ErrRecognitionProtocolInvalid) &&
+		(strings.Contains(message, "重复原卷题号层级") ||
+			strings.Contains(message, "重复原卷展示题号")):
+		return "recognition_source_number_duplicate"
+	case errors.Is(err, k12.ErrRecognitionProtocolInvalid):
+		return "recognition_protocol"
 	default:
 		return "unknown"
 	}
@@ -485,8 +541,13 @@ func TestClassifyK12PhotoProbeFailure_SanitizesKnownCauses(t *testing.T) {
 		{name: "recognition protocol", err: fmt.Errorf("recognizer: 解析识题结果失败"), want: "recognition_protocol"},
 		{name: "duplicate identity", err: fmt.Errorf("invalid input: duplicate problem_id"), want: "recognition_identity_invalid"},
 		{name: "standalone identity", err: fmt.Errorf("standalone problem cannot have parent/subproblem_no"), want: "recognition_identity_invalid"},
-		{name: "vision provider", err: fmt.Errorf("recognizer: 视觉模型调用失败"), want: "vision_provider"},
+		{name: "vision provider", err: fmt.Errorf("recognizer: vision model call failed"), want: "vision_provider"},
 		{name: "anchor", err: fmt.Errorf("usecase: 作答坐标核验失败"), want: "answer_anchor"},
+		{name: "wrapped protocol source pair", err: fmt.Errorf("recognizer: 识题结果结构无效: source_number_path/display_label 必须同时存在: %w", k12.ErrRecognitionProtocolInvalid), want: "recognition_source_number_pair_invalid"},
+		{name: "wrapped protocol dangling parent", err: fmt.Errorf("recognizer: 识题结果结构无效: subproblem has dangling parent_problem_id: %w", k12.ErrRecognitionProtocolInvalid), want: "recognition_parent_reference_dangling"},
+		{name: "wrapped protocol structure", err: fmt.Errorf("recognizer: 识题结果结构无效: %w", k12.ErrRecognitionProtocolInvalid), want: "recognition_structure_invalid"},
+		{name: "wrapped protocol duplicate source number", err: fmt.Errorf("recognizer: 识题结果第 2 项与第 1 项重复原卷展示题号: %w", k12.ErrRecognitionProtocolInvalid), want: "recognition_source_number_duplicate"},
+		{name: "wrapped protocol generic", err: fmt.Errorf("recognizer: 识题协议失败: %w", k12.ErrRecognitionProtocolInvalid), want: "recognition_protocol"},
 		{name: "unknown does not echo detail", err: fmt.Errorf("private upstream detail must stay hidden"), want: "unknown"},
 	}
 	for _, test := range tests {

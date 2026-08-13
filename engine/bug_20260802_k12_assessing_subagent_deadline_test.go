@@ -92,7 +92,7 @@ func TestBUG20260802K12DeadlineSurvivesSolveAndVerifiedGradeWallGuards(t *testin
 		case verifierAgentName:
 			return SubAgentResult{Output: "VERDICT: AGREE\nCOMPUTED: 42"}, nil
 		case graderAgentName:
-			return SubAgentResult{Output: "CORRECT: yes\nGUIDANCE: 继续保持"}, nil
+			return SubAgentResult{Output: "CORRECT: yes\nFINAL_ANSWER_CORRECT: yes\nGUIDANCE: 继续保持"}, nil
 		default:
 			return SubAgentResult{}, errors.New("unexpected subagent")
 		}

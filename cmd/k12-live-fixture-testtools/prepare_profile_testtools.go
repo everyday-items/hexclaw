@@ -30,19 +30,21 @@ var candidatePolicyFields = []string{
 	"policy_version",
 	"projecting_seconds",
 	"queued_seconds",
+	"recognition_plan_version",
 	"recognizing_seconds",
 	"rendering_seconds",
 }
 
 type candidatePolicyWire struct {
-	PolicyVersion      int   `json:"policy_version"`
-	QueuedSeconds      int64 `json:"queued_seconds"`
-	NormalizingSeconds int64 `json:"normalizing_seconds"`
-	RecognizingSeconds int64 `json:"recognizing_seconds"`
-	LocatingSeconds    int64 `json:"locating_seconds"`
-	RenderingSeconds   int64 `json:"rendering_seconds"`
-	ProjectingSeconds  int64 `json:"projecting_seconds"`
-	AssessingBuckets   []struct {
+	PolicyVersion          int   `json:"policy_version"`
+	QueuedSeconds          int64 `json:"queued_seconds"`
+	NormalizingSeconds     int64 `json:"normalizing_seconds"`
+	RecognizingSeconds     int64 `json:"recognizing_seconds"`
+	LocatingSeconds        int64 `json:"locating_seconds"`
+	RenderingSeconds       int64 `json:"rendering_seconds"`
+	ProjectingSeconds      int64 `json:"projecting_seconds"`
+	RecognitionPlanVersion int   `json:"recognition_plan_version"`
+	AssessingBuckets       []struct {
 		MaxProblems int   `json:"max_problems"`
 		Seconds     int64 `json:"seconds"`
 	} `json:"assessing_buckets"`
@@ -96,14 +98,15 @@ func parseCandidatePolicy(path string) (config.K12GradingBudgetConfig, error) {
 		return config.K12GradingBudgetConfig{}, errors.New("candidate policy has trailing data")
 	}
 	budget := config.K12GradingBudgetConfig{
-		PolicyVersion:      wire.PolicyVersion,
-		QueuedSeconds:      wire.QueuedSeconds,
-		NormalizingSeconds: wire.NormalizingSeconds,
-		RecognizingSeconds: wire.RecognizingSeconds,
-		LocatingSeconds:    wire.LocatingSeconds,
-		RenderingSeconds:   wire.RenderingSeconds,
-		ProjectingSeconds:  wire.ProjectingSeconds,
-		ItemConcurrency:    wire.ItemConcurrency,
+		PolicyVersion:          wire.PolicyVersion,
+		QueuedSeconds:          wire.QueuedSeconds,
+		NormalizingSeconds:     wire.NormalizingSeconds,
+		RecognizingSeconds:     wire.RecognizingSeconds,
+		LocatingSeconds:        wire.LocatingSeconds,
+		RenderingSeconds:       wire.RenderingSeconds,
+		ProjectingSeconds:      wire.ProjectingSeconds,
+		RecognitionPlanVersion: wire.RecognitionPlanVersion,
+		ItemConcurrency:        wire.ItemConcurrency,
 	}
 	for _, bucket := range wire.AssessingBuckets {
 		budget.AssessingBuckets = append(budget.AssessingBuckets, config.K12AssessingBudgetBucketConfig{

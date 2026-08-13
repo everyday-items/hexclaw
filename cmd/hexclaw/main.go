@@ -1914,7 +1914,6 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	{
 		// 识题视觉闭包：作业图片 → 云端 vision 文本（mirror knowledge captioner），出网前过 EgressPolicy。
 		visionFn := func(ctx context.Context, image []byte, prompt string) (string, error) {
-			ctx = egress.WithRequest(ctx, egress.PurposeVisionOCR, "", egress.ClassSensitiveMedia)
 			if router == nil {
 				return "", fmt.Errorf("未配置视觉模型")
 			}
@@ -1947,32 +1946,9 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			// 排查用：打印识题实际选中的 provider/model + egress 用途，一眼定位路由/出网问题。
 			logger.Info("[k12识题] 视觉模型已路由", "provider", provider.Name(), "model", visionModel,
 				"image_bytes", len(image), "egress", "vision_ocr[sensitive_media]")
-			// mime 按魔数探测（BUG-20260712-T2：此前硬编码 png，jpeg 图打错标）。
-			// 调用只继承整条请求的 context：不在视觉适配层再叠加任意秒数的局部超时，
-			// 避免核心识题、异步锚定和 IM 链路各自维护一套会漂移的“魔法阈值”。
-			mime := http.DetectContentType(image)
-			if !strings.HasPrefix(mime, "image/") {
-				mime = "image/png"
-			}
-			dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
-			requestMetadata, reasoningPolicyScope, policyErr := k12VisionRequestMetadata(ctx)
-			if policyErr != nil {
-				return "", policyErr
-			}
 			// 不设 MaxTokens：各家视觉模型上限差异大（glm-4v-flash 硬顶 1024，设 4096 即 400），
 			// 任何硬编码都会在某家翻车/截断；取消与 deadline 统一由入口请求负责。
-			resp, cErr := provider.Complete(k12NonIdempotentLLMContext(ctx), hexagon.CompletionRequest{
-				Model:                visionModel,
-				Metadata:             requestMetadata,
-				ReasoningPolicyScope: reasoningPolicyScope,
-				Messages: []hexagon.Message{{
-					Role: hexagon.RoleUser,
-					MultiContent: []llm.ContentPart{
-						llm.NewTextPart(prompt),
-						llm.NewImageURLPart(dataURL, "high"),
-					},
-				}},
-			})
+			content, cErr := completeK12VisionRequest(ctx, provider, visionModel, image, prompt)
 			if cErr != nil {
 				logger.Warn("[k12识题] 视觉模型调用失败", "provider", provider.Name(), "model", visionModel, "err", cErr.Error())
 				if errors.Is(cErr, llmrouter.ErrModelCapabilityMismatch) {
@@ -1980,7 +1956,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				}
 				return "", cErr
 			}
-			return resp.Content, nil
+			return content, nil
 		}
 
 		recognizerAdapter := k12engineadapter.NewRecognizerAdapter(
@@ -2071,9 +2047,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			return resp.Content, nil
 		}
 		tutoringTipsReviewGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
-			provider := router.Default()
-			if provider == nil {
-				return "", fmt.Errorf("k12 辅导要点: 没有可用的默认 LLM Provider")
+			provider, model, err := resolveK12FrozenTextCompletionRoute(
+				ctx, router, "K12 tutoring tips",
+			)
+			if err != nil {
+				return "", err
 			}
 			task := prompt
 			if subject != "" {
@@ -2087,6 +2065,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			defer ccancel()
 			temp := 0.2
 			resp, err := provider.Complete(k12NonIdempotentLLMContext(cctx), hexagon.CompletionRequest{
+				Model: model,
 				Messages: []hexagon.Message{
 					{Role: hexagon.RoleSystem, Content: "你是中小学家长辅导助手。针对给定年级和知识点，直接生成一段120字以内的知识点回顾：核心概念、一个常见卡点、一句家长引导话术。不要出题，不要给练习答案，不要声称引用教材原文。数学使用 Unicode 符号，禁止 LaTeX。"},
 					{Role: hexagon.RoleUser, Content: task},
@@ -2100,21 +2079,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			return resp.Content, nil
 		}
 		parentTeachingGuideGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
-			provider := router.Default()
-			model := ""
-			if snapshot, pinned := k12.GradingModelSnapshotFromContext(ctx); pinned {
-				var found bool
-				provider, found = router.Get(snapshot.Provider)
-				if !found || provider == nil {
-					return "", fmt.Errorf("K12 GradingJob 冻结 provider %q 不可用，拒绝跨路由 fallback", snapshot.Provider)
-				}
-				model = snapshot.Model
-				if err := k12.ValidateGradingModelRoute(ctx, snapshot.Provider, model); err != nil {
-					return "", err
-				}
-			}
-			if provider == nil {
-				return "", fmt.Errorf("k12 家长辅导指南: 没有可用的 LLM Provider")
+			provider, model, err := resolveK12FrozenTextCompletionRoute(
+				ctx, router, "K12 parent tutoring guide",
+			)
+			if err != nil {
+				return "", err
 			}
 			task := prompt
 			if subject != "" {
@@ -2173,23 +2142,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			return resp.Content, nil
 		}
 		workFeedbackGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
-			provider := router.Default()
-			model := ""
-			if snapshot, pinned := k12.GradingModelSnapshotFromContext(ctx); pinned {
-				var found bool
-				provider, found = router.Get(snapshot.Provider)
-				if !found || provider == nil {
-					return "", fmt.Errorf("K12 作品点评冻结 provider %q 不可用，拒绝跨路由 fallback", snapshot.Provider)
-				}
-				model = snapshot.Model
-				if err := k12.ValidateGradingModelRoute(
-					ctx, snapshot.Provider, model,
-				); err != nil {
-					return "", err
-				}
-			}
-			if provider == nil {
-				return "", fmt.Errorf("k12 作品点评: 没有可用的默认 LLM Provider")
+			provider, model, err := resolveK12FrozenTextCompletionRoute(
+				ctx, router, "K12 work feedback",
+			)
+			if err != nil {
+				return "", err
 			}
 			// 美术观察式点评走独立的视觉闭包（workFeedbackVisionFn，原图随请求发多模态）；
 			// 本纯文本闭包只服务写作。防路由漂移的守卫：美术误入纯文本通道时诚实报错，
@@ -2380,23 +2337,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			k12rt.Deps.WorkFeedbackRoute = func(
 				_ context.Context, workType string,
 			) (k12.ImageTaskRouteSnapshot, error) {
-				capabilities := []string{config.LLMModelCapabilityText}
-				promptVersion := "writing-feedback-v1"
-				if workType == k12.WorkTypeArt {
-					capabilities = append(capabilities, config.LLMModelCapabilityVision)
-					promptVersion = "art-feedback-v1"
-				}
-				route, routeErr := router.ResolveRouteForCapabilities("", "", capabilities...)
-				if routeErr != nil {
-					return k12.ImageTaskRouteSnapshot{}, routeErr
-				}
-				return k12.ImageTaskRouteSnapshot{
-					Provider: route.ProviderName, Model: route.Model,
-					Route:           route.ProviderName + "/" + route.Model,
-					Capability:      strings.Join(capabilities, "+"),
-					SelectionSource: "auto", PolicyVersion: "work-feedback-routing-v1",
-					PromptVersion: promptVersion,
-				}, nil
+				return resolveK12WorkFeedbackRoute(router, workType)
 			}
 			k12WorkFeedback = &k12usecase.CreativeWorkFeedbackCoordinator{
 				Deps: &k12rt.Deps, Records: k12rt.Records, BaseContext: ctx,

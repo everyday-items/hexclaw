@@ -17,7 +17,7 @@ func captureSolveEgress(t *testing.T, ctx context.Context, args map[string]any) 
 		case verifierAgentName:
 			return SubAgentResult{Output: "VERDICT: AGREE\nCOMPUTED: 42\n说明：一致"}, nil
 		case graderAgentName:
-			return SubAgentResult{Output: "CORRECT: false\nWRONG_STEP: first\nMISCONCEPTION: arithmetic\nGUIDANCE: retry"}, nil
+			return SubAgentResult{Output: "CORRECT: false\nFINAL_ANSWER_CORRECT: false\nWRONG_STEP: first\nMISCONCEPTION: arithmetic\nGUIDANCE: retry"}, nil
 		default:
 			return SubAgentResult{Output: "步骤：6×7=42\n答案：42"}, nil
 		}

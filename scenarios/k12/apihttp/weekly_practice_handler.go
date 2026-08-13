@@ -1,7 +1,11 @@
 package apihttp
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -32,13 +36,27 @@ func (h *handler) getCurriculumCatalog(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) getCurriculumProgress(w http.ResponseWriter, r *http.Request) {
-	progress, err := h.rt.Deps.GetCurriculumProgress(
-		r.Context(), r.URL.Query().Get("agent"), r.URL.Query().Get("subject"))
+	scope, err := h.textbookScope(
+		r.Context(), r.URL.Query().Get("agent"), r.URL.Query().Get("subject"),
+	)
+	if err != nil {
+		if errors.Is(err, errAgentScopeNotFound) {
+			writeErr(w, http.StatusNotFound, errAgentScopeNotFound.Error())
+			return
+		}
+		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	progress, revision, err := h.rt.Deps.GetCurriculumProgressState(
+		r.Context(), scope.AgentName, scope.Subject)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"progress": progress})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"progress": progress,
+		"revision": revision,
+	})
 }
 
 func (h *handler) getWeeklyPracticeSettings(w http.ResponseWriter, r *http.Request) {
@@ -69,17 +87,7 @@ type profileBundleRequest struct {
 		GradeTerm        string               `json:"grade_term"`
 		SubjectTextbooks k12.SubjectTextbooks `json:"subject_textbooks"`
 	} `json:"profile"`
-	CurriculumProgress struct {
-		Subject            string `json:"subject"`
-		TextbookBindingID  string `json:"textbook_binding_id"`
-		TextbookManifestID string `json:"textbook_manifest_id"`
-		Volume             string `json:"volume"`
-		UnitID             string `json:"unit_id"`
-		LessonID           string `json:"lesson_id,omitempty"`
-		PageFrom           *int   `json:"page_from,omitempty"`
-		PageTo             *int   `json:"page_to,omitempty"`
-		EvidenceSource     string `json:"evidence_source"`
-	} `json:"curriculum_progress"`
+	CurriculumProgress     json.RawMessage `json:"curriculum_progress"`
 	WeeklyPracticeSettings struct {
 		Timezone                     string `json:"timezone"`
 		TextbookConsolidationEnabled bool   `json:"textbook_consolidation_enabled"`
@@ -89,9 +97,50 @@ type profileBundleRequest struct {
 	} `json:"weekly_practice_settings"`
 }
 
+type profileBundleCurriculumProgressRequest struct {
+	Subject            string `json:"subject"`
+	TextbookManifestID string `json:"textbook_manifest_id"`
+	Volume             string `json:"volume"`
+	UnitID             string `json:"unit_id"`
+	LessonID           string `json:"lesson_id,omitempty"`
+	PageFrom           *int   `json:"page_from,omitempty"`
+	PageTo             *int   `json:"page_to,omitempty"`
+	EvidenceSource     string `json:"evidence_source"`
+}
+
+func decodeProfileBundleCurriculumProgress(
+	raw json.RawMessage,
+) (*profileBundleCurriculumProgressRequest, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("curriculum_progress is required")
+	}
+	raw = bytes.TrimSpace(raw)
+	if bytes.Equal(raw, []byte("null")) {
+		return nil, nil
+	}
+	var progress profileBundleCurriculumProgressRequest
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&progress); err != nil {
+		return nil, fmt.Errorf("invalid curriculum_progress: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("curriculum_progress must contain exactly one JSON value")
+	}
+	if strings.TrimSpace(progress.TextbookManifestID) == "" {
+		return nil, fmt.Errorf("textbook_manifest_id is required")
+	}
+	return &progress, nil
+}
+
 func (h *handler) updateProfileBundle(w http.ResponseWriter, r *http.Request) {
 	var req profileBundleRequest
 	if !decodeStrict(w, r, &req) {
+		return
+	}
+	progressRequest, err := decodeProfileBundleCurriculumProgress(req.CurriculumProgress)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var agentConfig *k12.ProfileBundleAgentConfig
@@ -102,12 +151,27 @@ func (h *handler) updateProfileBundle(w http.ResponseWriter, r *http.Request) {
 			Model: req.AgentConfig.Model, Skills: req.AgentConfig.Skills,
 		}
 	}
-	scope, err := h.textbookScope(
-		r.Context(), req.AgentName, req.CurriculumProgress.Subject,
-	)
+	progressSubject := "math"
+	if progressRequest != nil {
+		progressSubject = progressRequest.Subject
+	}
+	scope, err := h.textbookScope(r.Context(), req.AgentName, progressSubject)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
 		return
+	}
+	progressInput := usecase.CurriculumProgressInput{}
+	if progressRequest != nil {
+		progressInput = usecase.CurriculumProgressInput{
+			Subject:            progressRequest.Subject,
+			TextbookManifestID: progressRequest.TextbookManifestID,
+			Volume:             progressRequest.Volume,
+			UnitID:             progressRequest.UnitID,
+			LessonID:           progressRequest.LessonID,
+			PageFrom:           progressRequest.PageFrom,
+			PageTo:             progressRequest.PageTo,
+			EvidenceSource:     progressRequest.EvidenceSource,
+		}
 	}
 	result, err := h.rt.Deps.UpdateProfileBundle(r.Context(), usecase.UpdateProfileBundleRequest{
 		OwnerID: scope.OwnerID, AgentName: scope.AgentName, IdempotencyKey: req.IdempotencyKey,
@@ -119,15 +183,8 @@ func (h *handler) updateProfileBundle(w http.ResponseWriter, r *http.Request) {
 			ChildName: req.Profile.ChildName, GradeTerm: req.Profile.GradeTerm,
 			SubjectTextbooks: req.Profile.SubjectTextbooks,
 		},
-		CurriculumProgress: usecase.CurriculumProgressInput{
-			Subject:            req.CurriculumProgress.Subject,
-			TextbookBindingID:  req.CurriculumProgress.TextbookBindingID,
-			TextbookManifestID: req.CurriculumProgress.TextbookManifestID,
-			Volume:             req.CurriculumProgress.Volume, UnitID: req.CurriculumProgress.UnitID,
-			LessonID: req.CurriculumProgress.LessonID, PageFrom: req.CurriculumProgress.PageFrom,
-			PageTo:         req.CurriculumProgress.PageTo,
-			EvidenceSource: req.CurriculumProgress.EvidenceSource,
-		},
+		CurriculumProgress:      progressInput,
+		ClearCurriculumProgress: progressRequest == nil,
 		WeeklyPracticeSettings: usecase.WeeklyPracticeSettingsInput{
 			Timezone:                     req.WeeklyPracticeSettings.Timezone,
 			TextbookConsolidationEnabled: req.WeeklyPracticeSettings.TextbookConsolidationEnabled,

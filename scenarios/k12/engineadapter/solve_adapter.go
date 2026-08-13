@@ -307,6 +307,18 @@ func gradeOutcomeFromResult(res *skill.Result, err error) (usecase.GradeOutcome,
 	if err != nil {
 		return usecase.GradeOutcome{}, fmt.Errorf("solve adapter: invalid grade_correct %q: %w", raw, err)
 	}
+	var finalAnswerCorrect *bool
+	if rawFinal, exists := m["grade_final_answer_correct"]; exists {
+		parsedFinal, parseErr := strconv.ParseBool(rawFinal)
+		if parseErr != nil {
+			return usecase.GradeOutcome{}, fmt.Errorf(
+				"solve adapter: invalid grade_final_answer_correct %q: %w",
+				rawFinal,
+				parseErr,
+			)
+		}
+		finalAnswerCorrect = &parsedFinal
+	}
 	// 判定统一 Verdict 五值（§4.5 布尔删除）：engine 侧 grade_correct 布尔在 adapter 边界
 	// 一次性收敛为 agree/disagree，领域层不再出现布尔判定。
 	verdict := usecase.VerdictDisagree
@@ -314,7 +326,8 @@ func gradeOutcomeFromResult(res *skill.Result, err error) (usecase.GradeOutcome,
 		verdict = usecase.VerdictAgree
 	}
 	return usecase.GradeOutcome{
-		Verdict: verdict,
+		Verdict:            verdict,
+		FinalAnswerCorrect: finalAnswerCorrect,
 		// 错步/错因也可能含模型 LaTeX（\times/\frac/\(…\)）——桌面直接展示，统一归一为 Unicode。
 		// 口径裁决（K12-INV-019 终局对账 2026-07-18，存储规范形）：批改产物**入库前**在本
 		// adapter 边界 Normalize 为 Unicode 规范形态是正确口径——存储即规范形，下游 IM/导出/

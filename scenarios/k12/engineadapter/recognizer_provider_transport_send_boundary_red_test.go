@@ -324,7 +324,7 @@ func TestDD036RecognizerProviderTransportObservesChildSentBeforeRoundTrip(
 				body := fmt.Sprintf(
 					`{"id":"dd036-http-request","model":%q,"choices":[{"index":0,"message":{"role":"assistant","content":%q},"finish_reason":"stop"}]}`,
 					k12.RecognizingPolicyModel,
-					dd036CrossLayerQuestionJSON,
+					dd036CrossLayerWholePageEnvelopeJSON,
 				)
 				return &http.Response{
 					StatusCode: http.StatusOK,

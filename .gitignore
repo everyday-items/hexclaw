@@ -43,6 +43,7 @@ vendor/
 Thumbs.db
 /hexclaw
 /hexclaw-sidecar
+/k12-live-fixture-testtools
 /verify-release
 /.codex-write-check
 .planning/

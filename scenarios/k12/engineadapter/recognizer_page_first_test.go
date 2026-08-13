@@ -50,10 +50,16 @@ func TestDenseWorksheet_ValidWholePageRecognitionUsesOnePhysicalRequest(t *testi
 		if strings.Contains(prompt, "纵向分片") || strings.Contains(prompt, "整页印刷题清单") {
 			t.Fatalf("valid whole-page result must not fan out: %.120s", prompt)
 		}
-		return `[
-			{"question":"1/8+1/4=","subject":"数学","answer_state":"present","student_answer":"3/8","recognition_confidence":0.99},
-			{"question":"3.25+0.75=","subject":"数学","answer_state":"blank","student_answer":"","recognition_confidence":0.98}
-		]`, nil
+		return `{
+			"questions":[
+				{"question":"1/8+1/4=","subject":"数学","answer_state":"present","student_answer":"3/8","recognition_confidence":0.99},
+				{"question":"3.25+0.75=","subject":"数学","answer_state":"blank","student_answer":"","recognition_confidence":0.98}
+			],
+			"printed_inventory":[
+				{"source_number_path":[],"display_label":"","question":"1/8+1/4="},
+				{"source_number_path":[],"display_label":"","question":"3.25+0.75="}
+			]
+		}`, nil
 	}
 
 	questions, err := NewRecognizerAdapter(vision).Recognize(
@@ -74,7 +80,7 @@ func TestDenseWorksheet_ValidEmptyWholePageDoesNotTriggerSixRequestFanout(t *tes
 	var calls atomic.Int32
 	vision := func(context.Context, []byte, string) (string, error) {
 		calls.Add(1)
-		return `[]`, nil
+		return `{"questions":[],"printed_inventory":[]}`, nil
 	}
 	questions, err := NewRecognizerAdapter(vision).Recognize(
 		context.Background(), denseWorksheetTestImage(t, 1000, 1800),
@@ -166,10 +172,16 @@ func TestDenseWorksheet_DuplicateSourceNumberProtocolUsesBoundedFallback(t *test
 		if strings.Contains(prompt, "纵向分片") || strings.Contains(prompt, "整页印刷题清单") {
 			return `[]`, nil
 		}
-		return `[
-			{"problem_kind":"standalone","source_number_path":["一"],"display_label":"一","question":"4÷0.5=","subject":"数学"},
-			{"problem_kind":"standalone","source_number_path":["一"],"display_label":"一","question":"10×0.01=","subject":"数学"}
-		]`, nil
+		return `{
+			"questions":[
+				{"problem_kind":"standalone","source_number_path":["一"],"display_label":"一","question":"4÷0.5=","subject":"数学"},
+				{"problem_kind":"standalone","source_number_path":["一"],"display_label":"一","question":"10×0.01=","subject":"数学"}
+			],
+			"printed_inventory":[
+				{"source_number_path":["一"],"display_label":"一","question":"4÷0.5="},
+				{"source_number_path":["一"],"display_label":"一","question":"10×0.01="}
+			]
+		}`, nil
 	}
 
 	if _, err := NewRecognizerAdapter(vision).Recognize(
@@ -199,10 +211,16 @@ func TestDenseWorksheet_MixedPrintedAndSectionSystemFactsStayOnWholePage(t *test
 		if strings.Contains(prompt, "纵向分片") || strings.Contains(prompt, "整页印刷题清单") {
 			return `[]`, nil
 		}
-		return `[
-			{"problem_kind":"standalone","source_number_path":["三","1"],"display_label":"三、1","source_section_path":["三"],"source_section_label":"三、列式计算","question":"4÷0.5=","subject":"数学"},
-			{"problem_kind":"standalone","source_number_path":[],"display_label":"","source_section_path":["一"],"source_section_label":"一、直接写得数","question":"10×0.01=","subject":"数学"}
-		]`, nil
+		return `{
+			"questions":[
+				{"problem_kind":"standalone","source_number_path":["三","1"],"display_label":"三、1","source_section_path":["三"],"source_section_label":"三、列式计算","question":"4÷0.5=","subject":"数学"},
+				{"problem_kind":"standalone","source_number_path":[],"display_label":"","source_section_path":["一"],"source_section_label":"一、直接写得数","question":"10×0.01=","subject":"数学"}
+			],
+			"printed_inventory":[
+				{"source_number_path":["三","1"],"display_label":"三、1","question":"4÷0.5="},
+				{"source_number_path":[],"display_label":"","question":"10×0.01="}
+			]
+		}`, nil
 	}
 
 	if _, err := NewRecognizerAdapter(vision).Recognize(

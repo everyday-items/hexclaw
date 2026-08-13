@@ -32,15 +32,15 @@ func TestProblemSourceArchiveV6RoundTripPreservesCurrentSourceTypedFactsAndRecov
 		t.Fatalf("commit V73 source result: created=%v err=%v", created, err)
 	}
 	freezeProblemSourceArchiveReceipt(t, sourceDB, committed)
-	if _, err := sourceDB.Exec(`UPDATE k12_problem_source_reprocess_jobs
+	if _, updateWorkErr := sourceDB.ExecContext(t.Context(), `UPDATE k12_problem_source_reprocess_jobs
 		SET reconciliation_epoch=7,reconciliation_attempt_count=2
-		WHERE work_id=?`, recognitionWork); err != nil {
-		t.Fatal(err)
+		WHERE work_id=?`, recognitionWork); updateWorkErr != nil {
+		t.Fatal(updateWorkErr)
 	}
-	if _, err := sourceDB.Exec(`UPDATE k12_grading_jobs
+	if _, updateGradingErr := sourceDB.ExecContext(t.Context(), `UPDATE k12_grading_jobs
 		SET finalization_generation=4 WHERE agent_name=? AND record_id=?`,
-		"mingming", recognitionJob); err != nil {
-		t.Fatal(err)
+		"mingming", recognitionJob); updateGradingErr != nil {
+		t.Fatal(updateGradingErr)
 	}
 	finalArtifact, replay, err := sourceStore.CommitGradingFinalArtifact(
 		ctx,
@@ -69,6 +69,33 @@ func TestProblemSourceArchiveV6RoundTripPreservesCurrentSourceTypedFactsAndRecov
 		len(archive.RecognitionResults) != 1 || len(archive.RecognitionItems) != 2 ||
 		len(archive.RecognitionPhysicalResults) != 2 {
 		t.Fatalf("v6 source exact-set incomplete: %+v", archive)
+	}
+	for _, ref := range archive.RecognitionPhysicalResults {
+		if ref.RecognitionPlanVersion != k12.RecognitionPlanVersionV1 ||
+			ref.PlanDigest != "" || ref.CandidateExactSetDigest != "" {
+			t.Fatalf("v1 archive physical facts drifted: %+v", ref)
+		}
+	}
+	normalizedArchive := k12storage.NormalizeProblemSourceArchiveV6ForRestore(archive)
+	for _, physical := range normalizedArchive.ModelPhysicalInvocations {
+		if physical.Status != k12.ModelInvocationSucceeded {
+			t.Fatalf("restore normalization lost succeeded child evidence: %+v", physical)
+		}
+	}
+	legacyArchive := cloneProblemSourceArchiveV6ForTest(t, archive)
+	for index := range legacyArchive.RecognitionPhysicalResults {
+		legacyArchive.RecognitionPhysicalResults[index].RecognitionPlanVersion = 0
+	}
+	for index := range legacyArchive.ModelPhysicalInvocations {
+		legacyArchive.ModelPhysicalInvocations[index].RecognitionPlanVersion = 0
+	}
+	if validationErr := k12storage.ValidateProblemSourceArchiveV6("mingming", legacyArchive); validationErr != nil {
+		t.Fatalf("pre-v76 archive without plan fields must remain v1-compatible: %v", validationErr)
+	}
+	driftedArchive := cloneProblemSourceArchiveV6ForTest(t, archive)
+	driftedArchive.RecognitionPhysicalResults[0].PlanDigest = "sha256:" + strings.Repeat("f", 64)
+	if validationErr := k12storage.ValidateProblemSourceArchiveV6("mingming", driftedArchive); validationErr == nil {
+		t.Fatal("archive plan-field drift must fail closed")
 	}
 	if generation := archive.FinalizationGenerations[0]; generation.AgentName != "mingming" || generation.JobID != recognitionJob ||
 		generation.Generation != 4 || generation.Artifact == nil ||
@@ -101,17 +128,17 @@ func TestProblemSourceArchiveV6RoundTripPreservesCurrentSourceTypedFactsAndRecov
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	if err := targetStore.ImportProblemSourceArchiveV6Tx(ctx, tx, "mingming", archive); err != nil {
-		t.Fatalf("import v6 source chain: %v", err)
+	if importErr := targetStore.ImportProblemSourceArchiveV6Tx(ctx, tx, "mingming", archive); importErr != nil {
+		t.Fatalf("import v6 source chain: %v", importErr)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	var restoredGeneration int64
-	if err := targetDB.QueryRowContext(ctx, `SELECT finalization_generation
+	if queryErr := targetDB.QueryRowContext(ctx, `SELECT finalization_generation
 		FROM k12_grading_jobs WHERE agent_name=? AND record_id=?`,
-		"mingming", recognitionJob).Scan(&restoredGeneration); err != nil {
-		t.Fatal(err)
+		"mingming", recognitionJob).Scan(&restoredGeneration); queryErr != nil {
+		t.Fatal(queryErr)
 	}
 	if restoredGeneration != 4 {
 		t.Fatalf("restored finalization generation=%d want 4", restoredGeneration)
@@ -208,6 +235,80 @@ func TestProblemSourceArchiveV6RoundTripPreservesCurrentSourceTypedFactsAndRecov
 	}
 	if string(archive.ActionReceipts[0].ResponseJSON) != frozenResponse {
 		t.Fatalf("frozen receipt replay bytes drifted: got=%s want=%s", frozenResponse, archive.ActionReceipts[0].ResponseJSON)
+	}
+}
+
+func TestProblemSourceArchiveV6RoundTripPreservesV2PhysicalPlanEvidence(t *testing.T) {
+	ctx := context.Background()
+	sourceStore, sourceDB := setup(t)
+	lease := seedProblemSourceRecognitionFixture(t, sourceStore, sourceDB, recognitionWork)
+	seedProblemSourceArchiveHomeworkParent(t, sourceDB)
+	result := validProblemSourceRecognitionResult()
+	result.PhysicalResults = recognitionV2PhysicalRefs(3)
+	seedRecognitionV2PhysicalChildren(t, sourceDB, result)
+	parentDigest, err := k12storage.ProblemSourceRecognitionTypedResultDigest(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, execErr := sourceDB.ExecContext(t.Context(), `UPDATE k12_model_invocations SET result_digest=? WHERE invocation_id=?`,
+		parentDigest, result.ParentInvocationID); execErr != nil {
+		t.Fatal(execErr)
+	}
+	commit, created, err := sourceStore.CommitProblemSourceRecognitionResult(ctx, lease, result)
+	if err != nil || !created {
+		t.Fatalf("commit v2 source result: created=%v err=%v", created, err)
+	}
+	freezeProblemSourceArchiveReceipt(t, sourceDB, commit)
+
+	archive, err := sourceStore.ExportProblemSourceArchiveV6(ctx, "mingming")
+	if err != nil {
+		t.Fatalf("export v2 source archive: %v", err)
+	}
+	if len(archive.RecognitionPhysicalResults) != len(result.PhysicalResults) ||
+		len(archive.ModelPhysicalInvocations) != len(result.PhysicalResults) {
+		t.Fatalf("v2 archive physical exact-set incomplete: %+v", archive.RecognitionPhysicalResults)
+	}
+	for index, ref := range archive.RecognitionPhysicalResults {
+		want := result.PhysicalResults[index]
+		if ref.PhysicalInvocationID != want.PhysicalInvocationID ||
+			ref.PhysicalUnit != want.PhysicalUnit ||
+			ref.RecognitionPlanVersion != want.RecognitionPlanVersion ||
+			ref.PlanDigest != want.PlanDigest ||
+			ref.CandidateExactSetDigest != want.CandidateExactSetDigest ||
+			ref.ResultDigest != want.ResultDigest {
+			t.Fatalf("v2 archive physical[%d] drifted: got=%+v want=%+v", index, ref, want)
+		}
+	}
+	drifted := cloneProblemSourceArchiveV6ForTest(t, archive)
+	drifted.RecognitionPhysicalResults[1].PlanDigest =
+		"sha256:" + strings.Repeat("9", 64)
+	if validationErr := k12storage.ValidateProblemSourceArchiveV6("mingming", drifted); validationErr == nil {
+		t.Fatal("v2 archive plan digest drift must fail closed")
+	}
+
+	targetStore, targetDB := setup(t)
+	seedProblemSourceArchiveTargetParents(t, targetDB)
+	tx, err := targetDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if importErr := targetStore.ImportProblemSourceArchiveV6Tx(ctx, tx, "mingming", archive); importErr != nil {
+		_ = tx.Rollback()
+		t.Fatalf("import v2 source archive: %v", importErr)
+	}
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
+	}
+	loaded, err := targetStore.GetProblemSourceRecognitionResultByWork(
+		ctx,
+		recognitionOwner,
+		recognitionWork,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(loaded.PhysicalResults, result.PhysicalResults) {
+		t.Fatalf("restored v2 plan evidence drifted: got=%+v want=%+v", loaded.PhysicalResults, result.PhysicalResults)
 	}
 }
 
@@ -514,10 +615,10 @@ func TestProblemSourceArchiveV6RoundTripPreservesTypedSucceededSummaryPayload(t 
 		t.Fatalf("commit V73 source result: created=%v err=%v", created, err)
 	}
 	freezeProblemSourceArchiveReceipt(t, sourceDB, commit)
-	if _, err := sourceDB.Exec(`UPDATE k12_problem_source_reprocess_jobs
+	if _, updateWorkErr := sourceDB.ExecContext(t.Context(), `UPDATE k12_problem_source_reprocess_jobs
 		SET status='succeeded',lease_owner='',lease_expires_at=0,updated_at=101
-		WHERE work_id=?`, recognitionWork); err != nil {
-		t.Fatal(err)
+		WHERE work_id=?`, recognitionWork); updateWorkErr != nil {
+		t.Fatal(updateWorkErr)
 	}
 
 	const summaryInvocationID = "summary-result-before-artifact"
@@ -526,7 +627,7 @@ func TestProblemSourceArchiveV6RoundTripPreservesTypedSucceededSummaryPayload(t 
 		recognitionSubmission,
 	)
 	resultDigest := modelResultPayloadDigest(resultJSON)
-	if _, err := sourceDB.Exec(`INSERT INTO k12_model_invocations (
+	if _, insertErr := sourceDB.ExecContext(t.Context(), `INSERT INTO k12_model_invocations (
 		invocation_id,agent_name,job_id,stage,request_digest,provider,model,
 		route_snapshot_json,request_policy_snapshot_json,provider_idempotency_key,
 		status,attempt,result_digest,result_json,external_request_id,failure_kind,
@@ -537,8 +638,8 @@ func TestProblemSourceArchiveV6RoundTripPreservesTypedSucceededSummaryPayload(t 
 		`{"provider":"openai","model":"gpt-5.6-sol","route":"cloud"}`, `{}`,
 		"summary-provider-key", k12.ModelInvocationSucceeded, 1,
 		resultDigest, resultJSON, "summary-provider-request", "", 101, 101,
-	); err != nil {
-		t.Fatal(err)
+	); insertErr != nil {
+		t.Fatal(insertErr)
 	}
 
 	archive, err := sourceStore.ExportProblemSourceArchiveV6(ctx, "mingming")
@@ -598,9 +699,9 @@ func TestProblemSourceArchiveV6RoundTripPreservesTypedSucceededSummaryPayload(t 
 					test.mutate(&candidate.ModelInvocations[index])
 				}
 			}
-			err := k12storage.ValidateProblemSourceArchiveV6("mingming", candidate)
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("unsafe summary payload accepted: err=%v want substring %q", err, test.want)
+			validationErr := k12storage.ValidateProblemSourceArchiveV6("mingming", candidate)
+			if validationErr == nil || !strings.Contains(validationErr.Error(), test.want) {
+				t.Fatalf("unsafe summary payload accepted: err=%v want substring %q", validationErr, test.want)
 			}
 		})
 	}
@@ -611,13 +712,13 @@ func TestProblemSourceArchiveV6RoundTripPreservesTypedSucceededSummaryPayload(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := targetStore.ImportProblemSourceArchiveV6Tx(
+	if importErr := targetStore.ImportProblemSourceArchiveV6Tx(
 		ctx, tx, "mingming", archive,
-	); err != nil {
-		t.Fatalf("restore typed summary payload: %v", err)
+	); importErr != nil {
+		t.Fatalf("restore typed summary payload: %v", importErr)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	restarted := k12storage.NewStore(targetDB, nil)
 	restored, err := restarted.GetModelInvocation(
@@ -670,7 +771,7 @@ func cloneProblemSourceArchiveV6ForTest(
 func seedProblemSourceArchiveExtraReferencedAsset(t *testing.T, db *sql.DB) {
 	t.Helper()
 	extraAssetID := "asset://mingming/" + repeatHex("e", 64) + ".png"
-	if _, err := db.Exec(`INSERT INTO k12_page_assets (
+	if _, err := db.ExecContext(t.Context(), `INSERT INTO k12_page_assets (
 		owner_scope,page_asset_id,agent_name,content_digest,media_type,size_bytes,
 		pixel_width,pixel_height,orientation_policy,orientation_policy_version,
 		transform_chain_json,storage_state,ready_at,last_error,created_at,updated_at
@@ -695,7 +796,7 @@ func seedProblemSourceArchiveExtraReferencedAsset(t *testing.T, db *sql.DB) {
 		t.Fatalf("seed dispatch-only PageAsset: %v", err)
 	}
 	refs := `["asset://mingming/` + repeatHex("b", 64) + `.png","` + extraAssetID + `"]`
-	if _, err := db.Exec(`UPDATE k12_homework_submissions
+	if _, err := db.ExecContext(t.Context(), `UPDATE k12_homework_submissions
 		SET source_asset_refs_json=? WHERE submission_id=?`, refs, recognitionSubmission); err != nil {
 		t.Fatalf("attach homework-only PageAsset: %v", err)
 	}
@@ -713,10 +814,10 @@ func TestProblemSourceArchiveV6RestoreAsRewritesTerminalV73DigestLineage(t *test
 		t.Fatalf("commit V73 source result: created=%v err=%v", created, err)
 	}
 	freezeProblemSourceArchiveReceipt(t, db, commit)
-	if _, err := db.Exec(`UPDATE k12_problem_source_reprocess_jobs
+	if _, updateWorkErr := db.ExecContext(t.Context(), `UPDATE k12_problem_source_reprocess_jobs
 		SET status='succeeded',lease_owner='',lease_expires_at=0,updated_at=101
-		WHERE work_id=?`, recognitionWork); err != nil {
-		t.Fatal(err)
+		WHERE work_id=?`, recognitionWork); updateWorkErr != nil {
+		t.Fatal(updateWorkErr)
 	}
 	source, err := store.ExportProblemSourceArchiveV6(ctx, "mingming")
 	if err != nil {
@@ -793,8 +894,8 @@ func TestProblemSourceArchiveV6RestoreAsRewritesTerminalV73DigestLineage(t *test
 	if err != nil {
 		t.Fatalf("migrate terminal V73 archive: %v", err)
 	}
-	if err := k12storage.ValidateProblemSourceArchiveV6("target-tutor", migrated); err != nil {
-		t.Fatalf("migrated V73 closure invalid: %v", err)
+	if validationErr := k12storage.ValidateProblemSourceArchiveV6("target-tutor", migrated); validationErr != nil {
+		t.Fatalf("migrated V73 closure invalid: %v", validationErr)
 	}
 	if migrated.ReprocessJobs[0].WorkID == sourceWorkID ||
 		migrated.ActionReceipts[0].CommandReceiptID == sourceReceiptID ||
@@ -857,13 +958,13 @@ func TestProblemSourceArchiveV6RestoreAsRewritesTerminalV73DigestLineage(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := targetStore.ImportProblemSourceArchiveV6Tx(
+	if importErr := targetStore.ImportProblemSourceArchiveV6Tx(
 		ctx, tx, "target-tutor", migrated,
-	); err != nil {
-		t.Fatalf("import migrated terminal V73 archive: %v", err)
+	); importErr != nil {
+		t.Fatalf("import migrated terminal V73 archive: %v", importErr)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	facts, err := targetStore.ListCurrentProblemSourceRecognitionFacts(
 		ctx, "target-tutor", recognitionSubmission,
@@ -878,8 +979,7 @@ func TestProblemSourceArchiveV6RestoreAsRewritesTerminalV73DigestLineage(t *test
 	restoredArtifact, err := targetStore.GetGradingFinalArtifactByJob(
 		ctx, "target-tutor", recognitionJob,
 	)
-	if err != nil || migratedArtifact == nil ||
-		!reflect.DeepEqual(restoredArtifact, *migratedArtifact) {
+	if err != nil || !reflect.DeepEqual(restoredArtifact, *migratedArtifact) {
 		t.Fatalf("migrated final artifact is not restart-readable: got=%+v want=%+v err=%v", restoredArtifact, migratedArtifact, err)
 	}
 	restoredSummary, err := targetStore.GetModelInvocation(
@@ -932,15 +1032,15 @@ func TestProblemSourceArchiveV6OutcomeUnknownPreservesReconciliationAuditAndNeve
 		t.Fatalf("commit V73 source result: created=%v err=%v", created, err)
 	}
 	freezeProblemSourceArchiveReceipt(t, sourceDB, commit)
-	if _, err := sourceDB.Exec(`UPDATE k12_problem_source_reprocess_jobs SET
+	if _, updateWorkErr := sourceDB.ExecContext(t.Context(), `UPDATE k12_problem_source_reprocess_jobs SET
 		status='outcome_unknown',lease_owner='',lease_expires_at=0,next_attempt_at=0,
 		reconciliation_owner='reconciler-v6',reconciliation_epoch=5,
 		reconciliation_expires_at=900,reconciliation_attempt_count=3,
 		next_reconcile_at=0,failure_code='provider_outcome_unknown',
 		failure_detail='bounded evidence',updated_at=101 WHERE work_id=?`,
 		recognitionWork,
-	); err != nil {
-		t.Fatal(err)
+	); updateWorkErr != nil {
+		t.Fatal(updateWorkErr)
 	}
 	leased, err := sourceStore.ExportProblemSourceArchiveV6(ctx, "mingming")
 	if err != nil {
@@ -954,15 +1054,15 @@ func TestProblemSourceArchiveV6OutcomeUnknownPreservesReconciliationAuditAndNeve
 		leasedWork.NextReconcileAtMilli != 0 {
 		t.Fatalf("active reconciliation lease was not archived: %+v", leasedWork)
 	}
-	if _, err := k12storage.MigrateProblemSourceArchiveV6Owner(
+	if _, migrationErr := k12storage.MigrateProblemSourceArchiveV6Owner(
 		"mingming", "target-tutor", leased, map[string]string{},
-	); !errors.Is(err, k12storage.ErrProblemSourceArchiveLiveWork) {
-		t.Fatalf("restore-as accepted outcome_unknown work: %v", err)
+	); !errors.Is(migrationErr, k12storage.ErrProblemSourceArchiveLiveWork) {
+		t.Fatalf("restore-as accepted outcome_unknown work: %v", migrationErr)
 	}
-	if _, err := sourceDB.Exec(`UPDATE k12_problem_source_reprocess_jobs SET
+	if _, updateScheduleErr := sourceDB.ExecContext(t.Context(), `UPDATE k12_problem_source_reprocess_jobs SET
 		reconciliation_owner='',reconciliation_expires_at=0,next_reconcile_at=888,
-		updated_at=102 WHERE work_id=?`, recognitionWork); err != nil {
-		t.Fatal(err)
+		updated_at=102 WHERE work_id=?`, recognitionWork); updateScheduleErr != nil {
+		t.Fatal(updateScheduleErr)
 	}
 	scheduled, err := sourceStore.ExportProblemSourceArchiveV6(ctx, "mingming")
 	if err != nil {
@@ -975,13 +1075,13 @@ func TestProblemSourceArchiveV6OutcomeUnknownPreservesReconciliationAuditAndNeve
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := targetStore.ImportProblemSourceArchiveV6Tx(
+	if importErr := targetStore.ImportProblemSourceArchiveV6Tx(
 		ctx, tx, "mingming", scheduled,
-	); err != nil {
-		t.Fatalf("import outcome_unknown source closure: %v", err)
+	); importErr != nil {
+		t.Fatalf("import outcome_unknown source closure: %v", importErr)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	restored, err := targetStore.GetProblemSourceReprocessJob(
 		ctx, recognitionOwner, recognitionWork,
@@ -1032,7 +1132,7 @@ func TestProblemSourceArchiveV6RejectsFinalArtifactGenerationDrift(t *testing.T)
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE k12_grading_jobs
+	if _, err := db.ExecContext(t.Context(), `UPDATE k12_grading_jobs
 		SET finalization_generation=1 WHERE agent_name=? AND record_id=?`,
 		"mingming", recognitionJob); err != nil {
 		t.Fatal(err)
@@ -1044,7 +1144,7 @@ func TestProblemSourceArchiveV6RejectsFinalArtifactGenerationDrift(t *testing.T)
 
 func seedProblemSourceArchiveHomeworkParent(t *testing.T, db *sql.DB) {
 	t.Helper()
-	if _, err := db.Exec(`INSERT INTO k12_homework_submissions (
+	if _, err := db.ExecContext(t.Context(), `INSERT INTO k12_homework_submissions (
 		submission_id,dispatch_id,agent_name,learner_id,source_kind,source_ref,
 		source_asset_refs_json,task_intent,status,grading_job_id,idempotency_key,
 		version,created_at,updated_at
@@ -1066,7 +1166,7 @@ func seedProblemSourceArchiveHomeworkParent(t *testing.T, db *sql.DB) {
 	); err != nil {
 		t.Fatalf("seed homework parent: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO k12_image_task_owner_scopes
+	if _, err := db.ExecContext(t.Context(), `INSERT INTO k12_image_task_owner_scopes
 		(dispatch_id,owner_scope,agent_name,created_at) VALUES(?,?,?,?)`,
 		recognitionDispatch,
 		recognitionOwner,
@@ -1091,10 +1191,10 @@ func seedProblemSourceArchiveTargetParentsForAgent(
 	assetID string,
 ) {
 	t.Helper()
-	if _, err := db.Exec(`INSERT OR IGNORE INTO agents(name) VALUES(?)`, agentName); err != nil {
+	if _, err := db.ExecContext(t.Context(), `INSERT OR IGNORE INTO agents(name) VALUES(?)`, agentName); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO k12_grading_jobs (
+	if _, err := db.ExecContext(t.Context(), `INSERT INTO k12_grading_jobs (
 		record_id,agent_name,status,submission_id,source_kind,idempotency_key,
 		dedupe_key,created_at,updated_at
 	) VALUES (?,?,?,?,?,?,?,?,?)`,
@@ -1110,7 +1210,7 @@ func seedProblemSourceArchiveTargetParentsForAgent(
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO k12_problems (
+	if _, err := db.ExecContext(t.Context(), `INSERT INTO k12_problems (
 		problem_id,agent_name,submission_id,page_asset_id,ordinal,problem_kind,
 		parent_problem_id,subproblem_no,subject,stem_raw,stem_markdown,concept_ids_json,
 		transcription_confidence,confirmation_required,confirmation_reasons_json,
@@ -1161,7 +1261,7 @@ func freezeProblemSourceArchiveReceipt(
 	if !json.Valid(response.JSON) {
 		t.Fatal("frozen response is not JSON")
 	}
-	if _, err := db.Exec(`UPDATE k12_problem_source_action_receipts
+	if _, err := db.ExecContext(t.Context(), `UPDATE k12_problem_source_action_receipts
 		SET response_json=? WHERE command_receipt_id=?`, response.JSON, recognitionReceipt); err != nil {
 		t.Fatal(err)
 	}

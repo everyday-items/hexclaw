@@ -72,17 +72,18 @@ func newA06Server(
 	candidates usecase.WeeklyPracticeCandidateSource,
 ) (http.Handler, usecase.Deps, *weeklyClock) {
 	t.Helper()
+	ctx := t.Context()
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
 	db.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = db.Close() })
-	if err := migrate.Run(context.Background(), db, migrate.All); err != nil {
-		t.Fatal(err)
+	if migrateErr := migrate.Run(ctx, db, migrate.All); migrateErr != nil {
+		t.Fatal(migrateErr)
 	}
-	if _, err := db.Exec(`INSERT INTO agents(name) VALUES('mingming'),('other')`); err != nil {
-		t.Fatal(err)
+	if _, execErr := db.ExecContext(ctx, `INSERT INTO agents(name) VALUES('mingming'),('other')`); execErr != nil {
+		t.Fatal(execErr)
 	}
 	delivery := &httpReceiptTransport{send: []usecase.DeliveryTransportAck{{
 		Status: k12.DeliveryDelivered, ExternalMessageID: "a06-message-1",
@@ -102,6 +103,10 @@ func newA06Server(
 	rt.Deps.WeeklyCurriculum = weeklyCatalogStub{}
 	rt.Deps.WeeklyCandidates = candidates
 	rt.Deps.WeeklyAssessment = weeklyAssessmentStub{}
+	seedBUG20260726034A02Manifest(
+		t, db, weeklyBundleManifestID, "desktop-user", "doc-weekly-contract",
+		1, "ready_for_confirmation", "",
+	)
 	return apihttp.NewHandler(apihttp.Runtime{
 		Views: rt.Registry.Views, Records: rt.Records, Deps: rt.Deps,
 	}), rt.Deps, clock
@@ -171,7 +176,7 @@ func a06CurrentPlan(t *testing.T, h http.Handler) map[string]any {
 }
 
 func TestBUG20260726034A06TrackDTOArithmeticBatchNullable(t *testing.T) {
-	h, _, _ := newWeeklyContractServer(t)
+	h, _, _ := newWeeklyBundleContractServer(t)
 	plan := a06CreatePlan(t, h, "a06-track")
 	for _, raw := range plan["tracks"].([]any) {
 		track := raw.(map[string]any)
@@ -191,7 +196,7 @@ func TestBUG20260726034A06TrackDTOArithmeticBatchNullable(t *testing.T) {
 }
 
 func TestBUG20260726034A06CreateCommandExactIdempotency(t *testing.T) {
-	h, _, _ := newWeeklyContractServer(t)
+	h, _, _ := newWeeklyBundleContractServer(t)
 	plan := a06CreatePlan(t, h, "a06-create")
 	planID := plan["plan_id"].(string)
 	revision := int(plan["revision"].(float64))
@@ -232,7 +237,8 @@ func TestBUG20260726034A06CreateCommandExactIdempotency(t *testing.T) {
 }
 
 func TestBUG20260726034A06StartAttemptAndLastItemCompleteAtomically(t *testing.T) {
-	h, deps, _ := newWeeklyContractServer(t)
+	ctx := t.Context()
+	h, deps, _ := newWeeklyBundleContractServer(t)
 	plan := a06CreatePlan(t, h, "a06-attempt")
 	planID := plan["plan_id"].(string)
 	revision := int(plan["revision"].(float64))
@@ -284,7 +290,7 @@ func TestBUG20260726034A06StartAttemptAndLastItemCompleteAtomically(t *testing.T
 		t.Fatalf("last attempt completed a different batch: %v", completed)
 	}
 	var attemptRows int
-	if err := deps.Records.DB().QueryRow(`SELECT COUNT(*) FROM k12_weekly_arithmetic_attempts
+	if err := deps.Records.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM k12_weekly_arithmetic_attempts
 		WHERE batch_id=? AND item_id=?`, batchID, itemID).Scan(&attemptRows); err != nil {
 		t.Fatalf("count durable arithmetic attempts: %v", err)
 	}
@@ -386,16 +392,43 @@ func TestBUG20260726034A06TerminalBatchRejectsRetry(t *testing.T) {
 }
 
 func TestBUG20260726034A06StaleTextbookRefreshChangesOnlySyncTrack(t *testing.T) {
-	h, deps, _ := newWeeklyContractServer(t)
+	ctx := t.Context()
+	h, deps, _ := newWeeklyBundleContractServer(t)
 	plan := a06CreatePlan(t, h, "a06-stale")
 	planID := plan["plan_id"].(string)
 	revision := int(plan["revision"].(float64))
 	dueBefore := a06Track(t, plan, k12.WeeklySectionDueReview)
 	arithmeticBefore := a06Track(t, plan, k12.WeeklySectionArithmeticWarmup)
-	if _, err := deps.Records.DB().Exec(`UPDATE k12_curriculum_progress
+	tx, err := deps.Records.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progressResult, err := tx.ExecContext(ctx, `UPDATE k12_curriculum_progress
 		SET revision=revision+1,updated_at=updated_at+1
-		WHERE agent_name='mingming' AND subject='math'`); err != nil {
+		WHERE agent_name='mingming' AND subject='math'`)
+	if err != nil {
+		_ = tx.Rollback()
 		t.Fatalf("advance persisted progress revision: %v", err)
+	}
+	progressRows, err := progressResult.RowsAffected()
+	if err != nil || progressRows != 1 {
+		_ = tx.Rollback()
+		t.Fatalf("advance persisted progress rows=%d err=%v want 1", progressRows, err)
+	}
+	headResult, err := tx.ExecContext(ctx, `UPDATE k12_curriculum_progress_revisions
+		SET revision=revision+1,updated_at=updated_at+1
+		WHERE agent_name='mingming' AND subject='math'`)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("advance persisted progress lifecycle revision: %v", err)
+	}
+	headRows, err := headResult.RowsAffected()
+	if err != nil || headRows != 1 {
+		_ = tx.Rollback()
+		t.Fatalf("advance progress lifecycle rows=%d err=%v want 1", headRows, err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
 	}
 	stalePlan := a06CurrentPlan(t, h)
 	if a06Track(t, stalePlan, k12.WeeklySectionTextbookConsolidation)["status"] !=

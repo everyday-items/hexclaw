@@ -40,10 +40,17 @@ const ProblemSourceRecognitionMappingStableExactSet ProblemSourceRecognitionMapp
 // the terminal child ledger; raw provider payload remains solely in
 // k12_model_physical_invocations.result_content.
 type ProblemSourceRecognitionPhysicalResultRef struct {
-	PhysicalInvocationID string `json:"physical_invocation_id"`
-	PhysicalUnit         string `json:"physical_unit"`
-	ResultDigest         string `json:"result_digest"`
+	PhysicalInvocationID    string `json:"physical_invocation_id"`
+	PhysicalUnit            string `json:"physical_unit"`
+	RecognitionPlanVersion  int    `json:"recognition_plan_version,omitempty"`
+	PlanDigest              string `json:"plan_digest,omitempty"`
+	CandidateExactSetDigest string `json:"candidate_exact_set_digest,omitempty"`
+	ResultDigest            string `json:"result_digest"`
 }
+
+// 单个 V2 页面最多可证明一个 manifest、八个四目标 primary batch 和
+// 三十二个单候选修复：1 + 8 + 32 = 41。
+const problemSourceRecognitionPhysicalResultLimit = 41
 
 // ProblemSourceRecognitionResult is the worker-supplied normalized result.
 // Source image metadata is intentionally absent: Commit derives it from the
@@ -341,10 +348,12 @@ func normalizeProblemSourceRecognitionResult(
 			ErrProblemSourceRecognitionInvalid,
 		)
 	}
-	if len(input.PhysicalResults) == 0 || len(input.PhysicalResults) > 32 {
+	if len(input.PhysicalResults) == 0 ||
+		len(input.PhysicalResults) > problemSourceRecognitionPhysicalResultLimit {
 		return normalizedProblemSourceRecognitionResult{}, "", fmt.Errorf(
-			"%w: one to 32 physical recognition results are required",
+			"%w: one to %d physical recognition results are required",
 			ErrProblemSourceRecognitionInvalid,
+			problemSourceRecognitionPhysicalResultLimit,
 		)
 	}
 	normalized.PhysicalResults = make(
@@ -354,9 +363,12 @@ func normalizeProblemSourceRecognitionResult(
 	physicalIDs := make(map[string]struct{}, len(input.PhysicalResults))
 	for index, raw := range input.PhysicalResults {
 		ref := ProblemSourceRecognitionPhysicalResultRef{
-			PhysicalInvocationID: strings.TrimSpace(raw.PhysicalInvocationID),
-			PhysicalUnit:         strings.ToLower(strings.TrimSpace(raw.PhysicalUnit)),
-			ResultDigest:         strings.TrimSpace(raw.ResultDigest),
+			PhysicalInvocationID:    strings.TrimSpace(raw.PhysicalInvocationID),
+			PhysicalUnit:            strings.ToLower(strings.TrimSpace(raw.PhysicalUnit)),
+			RecognitionPlanVersion:  raw.RecognitionPlanVersion,
+			PlanDigest:              strings.TrimSpace(raw.PlanDigest),
+			CandidateExactSetDigest: strings.TrimSpace(raw.CandidateExactSetDigest),
+			ResultDigest:            strings.TrimSpace(raw.ResultDigest),
 		}
 		if ref.PhysicalInvocationID == "" || len(ref.PhysicalInvocationID) > 512 ||
 			ref.ResultDigest == "" || len(ref.ResultDigest) > 512 {
@@ -365,15 +377,41 @@ func normalizeProblemSourceRecognitionResult(
 				ErrProblemSourceRecognitionInvalid,
 			)
 		}
-		switch ref.PhysicalUnit {
-		case "whole_page", "segment_1", "segment_2", "segment_3", "segment_4",
-			"segment_5", "printed_inventory":
+		effectiveVersion := effectiveProblemSourceRecognitionPlanVersion(
+			ref.RecognitionPlanVersion,
+		)
+		switch effectiveVersion {
+		case k12.RecognitionPlanVersionV1:
+			if !legacyRecognitionPhysicalUnit(k12.RecognitionPhysicalUnit(ref.PhysicalUnit)) ||
+				ref.PlanDigest != "" || ref.CandidateExactSetDigest != "" {
+				return normalizedProblemSourceRecognitionResult{}, "", fmt.Errorf(
+					"%w: v1 physical invocation %s carries non-v1 plan facts",
+					ErrProblemSourceRecognitionInvalid,
+					ref.PhysicalInvocationID,
+				)
+			}
+			// 逐字节保留历史 V1 聚合摘要。调用方传零值或显式传一均表示 V1，
+			// 但规范 V1 JSON 会省略新引入的计划事实。
+			ref.RecognitionPlanVersion = 0
+		case k12.RecognitionPlanVersionV2:
+			unit := k12.RecognitionPhysicalUnit(ref.PhysicalUnit)
+			validManifest := unit == k12.RecognitionPhysicalUnitWholePage &&
+				ref.CandidateExactSetDigest == ""
+			validPlannedChild := layoutRecognitionPhysicalUnit(unit) &&
+				ref.CandidateExactSetDigest != ""
+			if ref.PlanDigest == "" || (!validManifest && !validPlannedChild) {
+				return normalizedProblemSourceRecognitionResult{}, "", fmt.Errorf(
+					"%w: v2 physical invocation %s has invalid plan/unit facts",
+					ErrProblemSourceRecognitionInvalid,
+					ref.PhysicalInvocationID,
+				)
+			}
 		default:
 			return normalizedProblemSourceRecognitionResult{}, "", fmt.Errorf(
-				"%w: physical invocation %s has invalid unit %q",
+				"%w: physical invocation %s has invalid plan version %d",
 				ErrProblemSourceRecognitionInvalid,
 				ref.PhysicalInvocationID,
-				ref.PhysicalUnit,
+				ref.RecognitionPlanVersion,
 			)
 		}
 		if _, duplicate := physicalIDs[ref.PhysicalInvocationID]; duplicate {
@@ -591,7 +629,7 @@ func getProblemSourceRecognitionResultVia(
 ) (ProblemSourceRecognitionCommit, error) {
 	var commit ProblemSourceRecognitionCommit
 	var mappingState, affectedJSON string
-	err := queryer.QueryRowContext(ctx, `
+	rowErr := queryer.QueryRowContext(ctx, `
 		SELECT work_id,command_receipt_id,owner_scope,agent_name,submission_id,
 		       dispatch_id,job_id,path_problem_id,parent_invocation_id,
 		       parent_request_digest,
@@ -624,13 +662,13 @@ func getProblemSourceRecognitionResultVia(
 		&affectedJSON,
 		&commit.CreatedAt,
 	)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(rowErr, sql.ErrNoRows) {
 		return ProblemSourceRecognitionCommit{}, ErrProblemSourceRecognitionNotFound
 	}
-	if err != nil {
+	if rowErr != nil {
 		return ProblemSourceRecognitionCommit{}, fmt.Errorf(
 			"read problem source recognition result: %w",
-			err,
+			rowErr,
 		)
 	}
 	commit.MappingState = ProblemSourceRecognitionMappingState(mappingState)
@@ -652,34 +690,47 @@ func getProblemSourceRecognitionResultVia(
 		)
 	}
 
-	physicalRows, err := queryer.QueryContext(ctx, `
-		SELECT physical_invocation_id,physical_unit,result_digest
+	physicalRows, physicalQueryErr := queryer.QueryContext(ctx, `
+		SELECT physical_invocation_id,physical_unit,result_digest,
+		       recognition_plan_version,plan_digest,candidate_exact_set_digest
 		FROM k12_problem_source_recognition_physical_results
 		WHERE work_id=? AND parent_invocation_id=?
 		ORDER BY ordinal`,
 		workID,
 		commit.ParentInvocationID,
 	)
-	if err != nil {
+	if physicalQueryErr != nil {
 		return ProblemSourceRecognitionCommit{}, fmt.Errorf(
 			"read problem source recognition physical lineage: %w",
-			err,
+			physicalQueryErr,
 		)
 	}
 	for physicalRows.Next() {
-		var ref ProblemSourceRecognitionPhysicalResultRef
+		var (
+			ref         ProblemSourceRecognitionPhysicalResultRef
+			planVersion string
+		)
 		if err := physicalRows.Scan(
 			&ref.PhysicalInvocationID,
 			&ref.PhysicalUnit,
 			&ref.ResultDigest,
+			&planVersion,
+			&ref.PlanDigest,
+			&ref.CandidateExactSetDigest,
 		); err != nil {
-			physicalRows.Close()
+			_ = physicalRows.Close()
 			return ProblemSourceRecognitionCommit{}, err
 		}
+		parsedPlanVersion, parseErr := parseProblemSourceRecognitionPlanVersion(planVersion)
+		if parseErr != nil {
+			_ = physicalRows.Close()
+			return ProblemSourceRecognitionCommit{}, parseErr
+		}
+		ref.RecognitionPlanVersion = parsedPlanVersion
 		commit.PhysicalResults = append(commit.PhysicalResults, ref)
 	}
 	if err := physicalRows.Err(); err != nil {
-		physicalRows.Close()
+		_ = physicalRows.Close()
 		return ProblemSourceRecognitionCommit{}, err
 	}
 	if err := physicalRows.Close(); err != nil {
@@ -692,7 +743,7 @@ func getProblemSourceRecognitionResultVia(
 		)
 	}
 
-	itemRows, err := queryer.QueryContext(ctx, `
+	itemRows, itemQueryErr := queryer.QueryContext(ctx, `
 		SELECT ordinal,problem_id,result_input_revision,input_digest,
 		       page_asset_id,source_region_json,source_content_digest,
 		       source_media_type,source_size_bytes,source_pixel_width,
@@ -709,10 +760,10 @@ func getProblemSourceRecognitionResultVia(
 		workID,
 		ownerScope,
 	)
-	if err != nil {
+	if itemQueryErr != nil {
 		return ProblemSourceRecognitionCommit{}, fmt.Errorf(
 			"read problem source recognition items: %w",
-			err,
+			itemQueryErr,
 		)
 	}
 	for itemRows.Next() {
@@ -758,13 +809,13 @@ func getProblemSourceRecognitionResultVia(
 			&confirmationRequired,
 			&confirmationReasonsJSON,
 		); err != nil {
-			itemRows.Close()
+			_ = itemRows.Close()
 			return ProblemSourceRecognitionCommit{}, err
 		}
 		fact.Source.OrientationPolicy = PageAssetOrientationPolicy(orientationPolicy)
 		fact.Source.TransformChainJSON = append(json.RawMessage(nil), transformJSON...)
 		if !json.Valid(fact.Source.TransformChainJSON) {
-			itemRows.Close()
+			_ = itemRows.Close()
 			return ProblemSourceRecognitionCommit{}, fmt.Errorf(
 				"%w: stored source transform chain is invalid",
 				ErrProblemSourceRecognitionInvalid,
@@ -773,7 +824,7 @@ func getProblemSourceRecognitionResultVia(
 		if sourceRegion.Valid {
 			var region k12.SourcePixelRegion
 			if err := json.Unmarshal([]byte(sourceRegion.String), &region); err != nil {
-				itemRows.Close()
+				_ = itemRows.Close()
 				return ProblemSourceRecognitionCommit{}, fmt.Errorf(
 					"%w: stored source region is invalid",
 					ErrProblemSourceRecognitionInvalid,
@@ -784,7 +835,7 @@ func getProblemSourceRecognitionResultVia(
 		if answerBBoxJSON != "" {
 			var bbox k12.AttemptBBox
 			if err := json.Unmarshal([]byte(answerBBoxJSON), &bbox); err != nil {
-				itemRows.Close()
+				_ = itemRows.Close()
 				return ProblemSourceRecognitionCommit{}, fmt.Errorf(
 					"%w: stored answer bbox is invalid",
 					ErrProblemSourceRecognitionInvalid,
@@ -796,7 +847,7 @@ func getProblemSourceRecognitionResultVia(
 			var value float64
 			if _, err := fmt.Sscan(confidence.String, &value); err != nil ||
 				math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > 1 {
-				itemRows.Close()
+				_ = itemRows.Close()
 				return ProblemSourceRecognitionCommit{}, fmt.Errorf(
 					"%w: stored recognition confidence is invalid",
 					ErrProblemSourceRecognitionInvalid,
@@ -804,41 +855,42 @@ func getProblemSourceRecognitionResultVia(
 			}
 			fact.RecognitionConfidence = &value
 		}
-		if fact.KnowledgePoints, err = decodeRecognitionStringArray(
+		var decodeErr error
+		if fact.KnowledgePoints, decodeErr = decodeRecognitionStringArray(
 			"knowledge_points", knowledgeJSON,
-		); err != nil {
-			itemRows.Close()
-			return ProblemSourceRecognitionCommit{}, err
+		); decodeErr != nil {
+			_ = itemRows.Close()
+			return ProblemSourceRecognitionCommit{}, decodeErr
 		}
-		if fact.OCRSignals, err = decodeRecognitionStringArray(
+		if fact.OCRSignals, decodeErr = decodeRecognitionStringArray(
 			"ocr_signals", signalsJSON,
-		); err != nil {
-			itemRows.Close()
-			return ProblemSourceRecognitionCommit{}, err
+		); decodeErr != nil {
+			_ = itemRows.Close()
+			return ProblemSourceRecognitionCommit{}, decodeErr
 		}
-		if fact.EvidenceTranscriptions, err = decodeRecognitionStringArray(
+		if fact.EvidenceTranscriptions, decodeErr = decodeRecognitionStringArray(
 			"evidence_transcriptions", evidenceJSON,
-		); err != nil {
-			itemRows.Close()
-			return ProblemSourceRecognitionCommit{}, err
+		); decodeErr != nil {
+			_ = itemRows.Close()
+			return ProblemSourceRecognitionCommit{}, decodeErr
 		}
-		if fact.AnswerEvidenceTranscriptions, err = decodeRecognitionStringArray(
+		if fact.AnswerEvidenceTranscriptions, decodeErr = decodeRecognitionStringArray(
 			"answer_evidence_transcriptions", answerEvidenceJSON,
-		); err != nil {
-			itemRows.Close()
-			return ProblemSourceRecognitionCommit{}, err
+		); decodeErr != nil {
+			_ = itemRows.Close()
+			return ProblemSourceRecognitionCommit{}, decodeErr
 		}
-		if fact.ConfirmationReasons, err = decodeRecognitionStringArray(
+		if fact.ConfirmationReasons, decodeErr = decodeRecognitionStringArray(
 			"confirmation_reasons", confirmationReasonsJSON,
-		); err != nil {
-			itemRows.Close()
-			return ProblemSourceRecognitionCommit{}, err
+		); decodeErr != nil {
+			_ = itemRows.Close()
+			return ProblemSourceRecognitionCommit{}, decodeErr
 		}
 		fact.ConfirmationRequired = confirmationRequired == 1
 		commit.Items = append(commit.Items, fact)
 	}
 	if err := itemRows.Err(); err != nil {
-		itemRows.Close()
+		_ = itemRows.Close()
 		return ProblemSourceRecognitionCommit{}, err
 	}
 	if err := itemRows.Close(); err != nil {
@@ -864,7 +916,7 @@ func getProblemSourceRecognitionResultVia(
 	for index := range commit.Items {
 		typedItems[index] = commit.Items[index].ProblemSourceRecognitionItem
 	}
-	_, rebuiltDigest, err := normalizeProblemSourceRecognitionResult(
+	_, rebuiltDigest, rebuildErr := normalizeProblemSourceRecognitionResult(
 		ProblemSourceRecognitionResult{
 			MappingState:       commit.MappingState,
 			ParentInvocationID: commit.ParentInvocationID,
@@ -872,7 +924,7 @@ func getProblemSourceRecognitionResultVia(
 			Items:              typedItems,
 		},
 	)
-	if err != nil || rebuiltDigest != commit.ResultDigest {
+	if rebuildErr != nil || rebuiltDigest != commit.ResultDigest {
 		return ProblemSourceRecognitionCommit{}, fmt.Errorf(
 			"%w: stored typed recognition content does not match aggregate digest",
 			ErrProblemSourceRecognitionInvalid,
@@ -903,17 +955,18 @@ func (s *Store) GetProblemSourceRecognitionResultByWork(
 			ErrProblemSourceRecognitionInvalid,
 		)
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
+	tx, beginErr := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if beginErr != nil {
 		return ProblemSourceRecognitionCommit{}, fmt.Errorf(
 			"begin problem source recognition read snapshot: %w",
-			err,
+			beginErr,
 		)
 	}
-	defer tx.Rollback()
-	commit, err := getProblemSourceRecognitionResultVia(ctx, tx, ownerScope, workID)
-	if err != nil {
-		return ProblemSourceRecognitionCommit{}, err
+	// 提交成功或主路径失败后，回滚仅用于释放事务；主路径错误保持原样。
+	defer func() { _ = tx.Rollback() }()
+	commit, lookupErr := getProblemSourceRecognitionResultVia(ctx, tx, ownerScope, workID)
+	if lookupErr != nil {
+		return ProblemSourceRecognitionCommit{}, lookupErr
 	}
 	if err := tx.Commit(); err != nil {
 		return ProblemSourceRecognitionCommit{}, fmt.Errorf(
@@ -995,24 +1048,46 @@ func equalProblemSourceRecognitionIDs(left, right []string) bool {
 	return true
 }
 
+func effectiveProblemSourceRecognitionPlanVersion(version int) int {
+	if version == 0 {
+		return k12.RecognitionPlanVersionV1
+	}
+	return version
+}
+
+func parseProblemSourceRecognitionPlanVersion(raw string) (int, error) {
+	switch strings.TrimSpace(raw) {
+	case "v1":
+		return k12.RecognitionPlanVersionV1, nil
+	case "v2":
+		return k12.RecognitionPlanVersionV2, nil
+	default:
+		return 0, fmt.Errorf(
+			"%w: invalid stored recognition plan version %q",
+			ErrProblemSourceRecognitionInvalid,
+			raw,
+		)
+	}
+}
+
 func validateProblemSourceRecognitionLineage(
 	ctx context.Context,
 	tx *sql.Tx,
 	job ProblemSourceReprocessJob,
 	normalized normalizedProblemSourceRecognitionResult,
 ) (int, []ProblemSourceRecognitionPhysicalResultRef, error) {
-	parent, err := scanModelInvocation(tx.QueryRowContext(ctx, `SELECT `+
+	parent, parentErr := scanModelInvocation(tx.QueryRowContext(ctx, `SELECT `+
 		modelInvocationColumns+`
 		FROM k12_model_invocations
 		WHERE invocation_id=?`, normalized.ParentInvocationID))
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+	if parentErr != nil {
+		if errors.Is(parentErr, sql.ErrNoRows) {
 			return 0, nil, fmt.Errorf(
 				"%w: source recognition parent invocation does not exist",
 				ErrProblemSourceRecognitionConflict,
 			)
 		}
-		return 0, nil, err
+		return 0, nil, parentErr
 	}
 	terminalSuccess := parent.Status == k12.ModelInvocationSucceeded ||
 		(parent.Status == k12.ModelInvocationReconciled &&
@@ -1026,13 +1101,13 @@ func validateProblemSourceRecognitionLineage(
 			ErrProblemSourceRecognitionConflict,
 		)
 	}
-	wantParentRequestDigest, err := ProblemSourceRecognitionParentRequestDigest(
+	wantParentRequestDigest, requestDigestErr := ProblemSourceRecognitionParentRequestDigest(
 		job,
 		parent.RouteSnapshot,
 		parent.RequestPolicySnapshot,
 	)
-	if err != nil {
-		return 0, nil, err
+	if requestDigestErr != nil {
+		return 0, nil, requestDigestErr
 	}
 	if parent.RequestDigest != wantParentRequestDigest {
 		return 0, nil, fmt.Errorf(
@@ -1040,9 +1115,9 @@ func validateProblemSourceRecognitionLineage(
 			ErrProblemSourceRecognitionConflict,
 		)
 	}
-	typedResultDigest, err := problemSourceRecognitionTypedDigestFromNormalized(normalized)
-	if err != nil {
-		return 0, nil, err
+	typedResultDigest, typedDigestErr := problemSourceRecognitionTypedDigestFromNormalized(normalized)
+	if typedDigestErr != nil {
+		return 0, nil, typedDigestErr
 	}
 	if parent.ResultDigest != typedResultDigest {
 		return 0, nil, fmt.Errorf(
@@ -1067,24 +1142,26 @@ func validateProblemSourceRecognitionLineage(
 		)
 	}
 
-	rows, err := tx.QueryContext(ctx, `
+	rows, queryErr := tx.QueryContext(ctx, `
 		SELECT physical_invocation_id,parent_invocation_id,agent_name,job_id,
-		       stage,physical_unit,status,attempt,result_digest
+		       stage,physical_unit,status,attempt,result_digest,
+		       recognition_plan_version,plan_digest,candidate_exact_set_digest
 		FROM k12_model_physical_invocations
 		WHERE parent_invocation_id=?
 		ORDER BY physical_invocation_id`,
 		normalized.ParentInvocationID,
 	)
-	if err != nil {
-		return 0, nil, err
+	if queryErr != nil {
+		return 0, nil, queryErr
 	}
-	defer rows.Close()
+	// 遍历失败时保留主路径错误，延迟关闭仅用于释放游标。
+	defer func() { _ = rows.Close() }()
 	verified := make([]ProblemSourceRecognitionPhysicalResultRef, 0, len(normalized.PhysicalResults))
 	for rows.Next() {
 		var (
-			ref                                       ProblemSourceRecognitionPhysicalResultRef
-			parentID, agentName, jobID, stage, status string
-			attempt                                   int
+			ref                                                    ProblemSourceRecognitionPhysicalResultRef
+			parentID, agentName, jobID, stage, status, planVersion string
+			attempt                                                int
 		)
 		if err := rows.Scan(
 			&ref.PhysicalInvocationID,
@@ -1096,9 +1173,17 @@ func validateProblemSourceRecognitionLineage(
 			&status,
 			&attempt,
 			&ref.ResultDigest,
+			&planVersion,
+			&ref.PlanDigest,
+			&ref.CandidateExactSetDigest,
 		); err != nil {
 			return 0, nil, err
 		}
+		parsedPlanVersion, parseErr := parseProblemSourceRecognitionPlanVersion(planVersion)
+		if parseErr != nil {
+			return 0, nil, parseErr
+		}
+		ref.RecognitionPlanVersion = parsedPlanVersion
 		if parentID != normalized.ParentInvocationID || agentName != job.AgentName ||
 			jobID != job.JobID || stage != "recognizing" || attempt != 1 {
 			return 0, nil, fmt.Errorf(
@@ -1123,6 +1208,9 @@ func validateProblemSourceRecognitionLineage(
 	if err := rows.Err(); err != nil {
 		return 0, nil, err
 	}
+	if err := rows.Close(); err != nil {
+		return 0, nil, err
+	}
 	if len(verified) != len(normalized.PhysicalResults) {
 		return 0, nil, fmt.Errorf(
 			"%w: physical recognition lineage is not the exact succeeded set",
@@ -1133,6 +1221,10 @@ func validateProblemSourceRecognitionLineage(
 		provided := normalized.PhysicalResults[index]
 		if verified[index].PhysicalInvocationID != provided.PhysicalInvocationID ||
 			verified[index].PhysicalUnit != provided.PhysicalUnit ||
+			verified[index].RecognitionPlanVersion !=
+				effectiveProblemSourceRecognitionPlanVersion(provided.RecognitionPlanVersion) ||
+			verified[index].PlanDigest != provided.PlanDigest ||
+			verified[index].CandidateExactSetDigest != provided.CandidateExactSetDigest ||
 			verified[index].ResultDigest != provided.ResultDigest {
 			return 0, nil, fmt.Errorf(
 				"%w: physical recognition identity/digest mismatch",
@@ -1342,7 +1434,8 @@ func validateProblemSourceRecognitionStructure(
 	if err != nil {
 		return "", nil, err
 	}
-	defer rows.Close()
+	// 遍历失败时保留主路径错误，延迟关闭仅用于释放游标。
+	defer func() { _ = rows.Close() }()
 	members := make([]problemSourceRecognitionMember, 0, len(job.AffectedProblemIDs))
 	for rows.Next() {
 		var member problemSourceRecognitionMember
@@ -1352,6 +1445,9 @@ func validateProblemSourceRecognitionStructure(
 		members = append(members, member)
 	}
 	if err := rows.Err(); err != nil {
+		return "", nil, err
+	}
+	if err := rows.Close(); err != nil {
 		return "", nil, err
 	}
 	if len(members) != len(job.AffectedProblemIDs) || len(members) != len(result.Items) {
@@ -1574,55 +1670,57 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 			ErrProblemSourceRecognitionInvalid,
 		)
 	}
-	lease, err := normalizeProblemSourceReprocessLease(lease)
-	if err != nil {
-		return ProblemSourceRecognitionCommit{}, false, err
+	normalizedLease, leaseErr := normalizeProblemSourceReprocessLease(lease)
+	if leaseErr != nil {
+		return ProblemSourceRecognitionCommit{}, false, leaseErr
 	}
-	normalized, resultDigest, err := normalizeProblemSourceRecognitionResult(input)
-	if err != nil {
-		return ProblemSourceRecognitionCommit{}, false, err
+	lease = normalizedLease
+	normalized, resultDigest, normalizeErr := normalizeProblemSourceRecognitionResult(input)
+	if normalizeErr != nil {
+		return ProblemSourceRecognitionCommit{}, false, normalizeErr
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
+	tx, beginErr := s.db.BeginTx(ctx, nil)
+	if beginErr != nil {
 		return ProblemSourceRecognitionCommit{}, false, fmt.Errorf(
 			"begin problem source recognition commit: %w",
-			err,
+			beginErr,
 		)
 	}
-	defer tx.Rollback()
+	// 提交成功或主路径失败后，回滚仅用于释放事务；主路径错误保持原样。
+	defer func() { _ = tx.Rollback() }()
 
 	// Make the first transaction statement a real write to the target row.
 	// SQLite therefore serializes competing commit/replay attempts before any
 	// mutable-head read, avoiding deferred read->write upgrade races.
-	reserved, err := tx.ExecContext(ctx, `
+	reserved, reserveErr := tx.ExecContext(ctx, `
 		UPDATE k12_problem_source_reprocess_jobs
 		SET updated_at=updated_at
 		WHERE work_id=?`,
 		lease.WorkID,
 	)
-	if err != nil {
+	if reserveErr != nil {
 		return ProblemSourceRecognitionCommit{}, false, fmt.Errorf(
 			"reserve problem source recognition work: %w",
-			err,
+			reserveErr,
 		)
 	}
-	reservedRows, err := reserved.RowsAffected()
-	if err != nil {
-		return ProblemSourceRecognitionCommit{}, false, err
+	reservedRows, reservedRowsErr := reserved.RowsAffected()
+	if reservedRowsErr != nil {
+		return ProblemSourceRecognitionCommit{}, false, reservedRowsErr
 	}
 	if reservedRows != 1 {
 		return ProblemSourceRecognitionCommit{}, false, ErrProblemSourceReprocessFenced
 	}
-	job, err := scanProblemSourceReprocessJob(tx.QueryRowContext(ctx, `SELECT `+
+	job, jobErr := scanProblemSourceReprocessJob(tx.QueryRowContext(ctx, `SELECT `+
 		problemSourceReprocessColumns+`
 		FROM k12_problem_source_reprocess_jobs
 		WHERE work_id=?`, lease.WorkID))
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+	if jobErr != nil {
+		if errors.Is(jobErr, sql.ErrNoRows) {
 			return ProblemSourceRecognitionCommit{}, false, ErrProblemSourceReprocessFenced
 		}
-		return ProblemSourceRecognitionCommit{}, false, err
+		return ProblemSourceRecognitionCommit{}, false, jobErr
 	}
 	if job.Status != ProblemSourceReprocessRunning ||
 		job.LeaseOwner != lease.LeaseOwner || job.LeaseEpoch != lease.LeaseEpoch ||
@@ -1652,42 +1750,42 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 				ErrProblemSourceRecognitionConflict,
 			)
 		}
-		replay, err := getProblemSourceRecognitionResultVia(
+		replay, replayErr := getProblemSourceRecognitionResultVia(
 			ctx,
 			tx,
 			job.OwnerScope,
 			job.WorkID,
 		)
-		if err != nil {
-			return ProblemSourceRecognitionCommit{}, false, err
+		if replayErr != nil {
+			return ProblemSourceRecognitionCommit{}, false, replayErr
 		}
 		return replay, false, nil
 	case !errors.Is(existingErr, sql.ErrNoRows):
 		return ProblemSourceRecognitionCommit{}, false, existingErr
 	}
 
-	receipt, _, err := loadProblemSourceRecognitionReceipt(ctx, tx, job)
-	if err != nil {
-		return ProblemSourceRecognitionCommit{}, false, err
+	receipt, _, receiptErr := loadProblemSourceRecognitionReceipt(ctx, tx, job)
+	if receiptErr != nil {
+		return ProblemSourceRecognitionCommit{}, false, receiptErr
 	}
-	structureDigest, _, err := validateProblemSourceRecognitionStructure(
+	structureDigest, _, structureErr := validateProblemSourceRecognitionStructure(
 		ctx,
 		tx,
 		job,
 		receipt,
 		normalized,
 	)
-	if err != nil {
-		return ProblemSourceRecognitionCommit{}, false, err
+	if structureErr != nil {
+		return ProblemSourceRecognitionCommit{}, false, structureErr
 	}
-	parentAttempt, physicalResults, err := validateProblemSourceRecognitionLineage(
+	parentAttempt, physicalResults, lineageErr := validateProblemSourceRecognitionLineage(
 		ctx,
 		tx,
 		job,
 		normalized,
 	)
-	if err != nil {
-		return ProblemSourceRecognitionCommit{}, false, err
+	if lineageErr != nil {
+		return ProblemSourceRecognitionCommit{}, false, lineageErr
 	}
 	var parentRequestDigest string
 	if err := tx.QueryRowContext(ctx, `
@@ -1696,7 +1794,7 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 	).Scan(&parentRequestDigest); err != nil {
 		return ProblemSourceRecognitionCommit{}, false, err
 	}
-	prepared, err := prepareProblemSourceRecognitionFacts(
+	prepared, prepareErr := prepareProblemSourceRecognitionFacts(
 		ctx,
 		tx,
 		job,
@@ -1704,8 +1802,8 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 		normalized,
 		resultDigest,
 	)
-	if err != nil {
-		return ProblemSourceRecognitionCommit{}, false, err
+	if prepareErr != nil {
+		return ProblemSourceRecognitionCommit{}, false, prepareErr
 	}
 	createdAt := nowUnix()
 	if createdAt <= 0 {
@@ -1714,9 +1812,9 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 			ErrProblemSourceRecognitionInvalid,
 		)
 	}
-	affectedJSON, err := recognitionJSON(job.AffectedProblemIDs)
-	if err != nil {
-		return ProblemSourceRecognitionCommit{}, false, err
+	affectedJSON, affectedErr := recognitionJSON(job.AffectedProblemIDs)
+	if affectedErr != nil {
+		return ProblemSourceRecognitionCommit{}, false, affectedErr
 	}
 	resultRevision := job.InputRevision + 1
 	if _, err := tx.ExecContext(ctx, `
@@ -1755,11 +1853,16 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 		)
 	}
 	for ordinal, ref := range physicalResults {
+		planVersion, planVersionErr := recognitionPlanVersionSQL(ref.RecognitionPlanVersion)
+		if planVersionErr != nil {
+			return ProblemSourceRecognitionCommit{}, false, planVersionErr
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO k12_problem_source_recognition_physical_results (
 				work_id,ordinal,parent_invocation_id,physical_invocation_id,
-				physical_unit,result_digest,created_at
-			) VALUES (?,?,?,?,?,?,?)`,
+				physical_unit,result_digest,created_at,recognition_plan_version,
+				plan_digest,candidate_exact_set_digest
+			) VALUES (?,?,?,?,?,?,?,?,?,?)`,
 			job.WorkID,
 			ordinal,
 			normalized.ParentInvocationID,
@@ -1767,6 +1870,9 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 			ref.PhysicalUnit,
 			ref.ResultDigest,
 			createdAt,
+			planVersion,
+			ref.PlanDigest,
+			ref.CandidateExactSetDigest,
 		); err != nil {
 			return ProblemSourceRecognitionCommit{}, false, fmt.Errorf(
 				"insert problem source recognition physical lineage: %w",
@@ -1802,9 +1908,10 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 	for ordinal, fact := range prepared {
 		bboxJSON := ""
 		if fact.Item.AnswerBBox != nil {
-			bboxJSON, err = recognitionJSON(fact.Item.AnswerBBox)
-			if err != nil {
-				return ProblemSourceRecognitionCommit{}, false, err
+			var bboxErr error
+			bboxJSON, bboxErr = recognitionJSON(fact.Item.AnswerBBox)
+			if bboxErr != nil {
+				return ProblemSourceRecognitionCommit{}, false, bboxErr
 			}
 		}
 		knowledgeJSON, _ := recognitionJSON(fact.Item.KnowledgePoints)
@@ -1813,7 +1920,7 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 		answerEvidenceJSON, _ := recognitionJSON(fact.Item.AnswerEvidenceTranscriptions)
 		confirmationReasonsJSON, _ := recognitionJSON(fact.Item.ConfirmationReasons)
 
-		superseded, err := tx.ExecContext(ctx, `
+		superseded, supersedeErr := tx.ExecContext(ctx, `
 			UPDATE k12_problem_input_revisions
 			SET current_disposition='superseded',updated_at=?
 			WHERE agent_name=? AND submission_id=? AND structure_version=?
@@ -1826,11 +1933,11 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 			fact.Item.ProblemID,
 			job.InputRevision,
 		)
-		if err != nil {
-			return ProblemSourceRecognitionCommit{}, false, err
+		if supersedeErr != nil {
+			return ProblemSourceRecognitionCommit{}, false, supersedeErr
 		}
-		rows, err := superseded.RowsAffected()
-		if err != nil || rows != 1 {
+		affectedRows, affectedRowsErr := superseded.RowsAffected()
+		if affectedRowsErr != nil || affectedRows != 1 {
 			return ProblemSourceRecognitionCommit{}, false, fmt.Errorf(
 				"%w: input revision CAS lost for problem %s",
 				ErrProblemSourceRecognitionConflict,
@@ -1867,7 +1974,7 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 				err,
 			)
 		}
-		memberUpdated, err := tx.ExecContext(ctx, `
+		memberUpdated, memberUpdateErr := tx.ExecContext(ctx, `
 			UPDATE k12_problem_structure_members
 			SET input_revision=?
 			WHERE agent_name=? AND submission_id=? AND structure_version=?
@@ -1879,18 +1986,18 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 			fact.Item.ProblemID,
 			job.InputRevision,
 		)
-		if err != nil {
-			return ProblemSourceRecognitionCommit{}, false, err
+		if memberUpdateErr != nil {
+			return ProblemSourceRecognitionCommit{}, false, memberUpdateErr
 		}
-		rows, err = memberUpdated.RowsAffected()
-		if err != nil || rows != 1 {
+		affectedRows, affectedRowsErr = memberUpdated.RowsAffected()
+		if affectedRowsErr != nil || affectedRows != 1 {
 			return ProblemSourceRecognitionCommit{}, false, fmt.Errorf(
 				"%w: structure member CAS lost for problem %s",
 				ErrProblemSourceRecognitionConflict,
 				fact.Item.ProblemID,
 			)
 		}
-		attemptUpdated, err := tx.ExecContext(ctx, `
+		attemptUpdated, attemptUpdateErr := tx.ExecContext(ctx, `
 			UPDATE k12_attempts
 			SET confirmed_version=?,input_digest=?,updated_at=?
 			WHERE agent_name=? AND submission_id=? AND problem_id=?
@@ -1908,11 +2015,11 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 				job.InputRevision,
 			),
 		)
-		if err != nil {
-			return ProblemSourceRecognitionCommit{}, false, err
+		if attemptUpdateErr != nil {
+			return ProblemSourceRecognitionCommit{}, false, attemptUpdateErr
 		}
-		rows, err = attemptUpdated.RowsAffected()
-		if err != nil || rows != 1 {
+		affectedRows, affectedRowsErr = attemptUpdated.RowsAffected()
+		if affectedRowsErr != nil || affectedRows != 1 {
 			return ProblemSourceRecognitionCommit{}, false, fmt.Errorf(
 				"%w: attempt input CAS lost for problem %s",
 				ErrProblemSourceRecognitionConflict,
@@ -1986,7 +2093,7 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 	// The lease must still be live at publication time. A long transaction may
 	// have crossed its deadline even though no competing owner could write while
 	// SQLite held the reservation.
-	finalFence, err := tx.ExecContext(ctx, `
+	finalFence, fenceErr := tx.ExecContext(ctx, `
 		UPDATE k12_problem_source_reprocess_jobs
 		SET updated_at=updated_at
 		WHERE work_id=? AND status='running' AND lease_owner=? AND lease_epoch=?
@@ -1996,11 +2103,11 @@ func (s *Store) CommitProblemSourceRecognitionResult(
 		lease.LeaseEpoch,
 		time.Now().UTC().UnixMilli(),
 	)
-	if err != nil {
-		return ProblemSourceRecognitionCommit{}, false, err
+	if fenceErr != nil {
+		return ProblemSourceRecognitionCommit{}, false, fenceErr
 	}
-	rows, err := finalFence.RowsAffected()
-	if err != nil || rows != 1 {
+	fenceRows, fenceRowsErr := finalFence.RowsAffected()
+	if fenceRowsErr != nil || fenceRows != 1 {
 		return ProblemSourceRecognitionCommit{}, false, ErrProblemSourceReprocessFenced
 	}
 	if err := tx.Commit(); err != nil {
@@ -2037,12 +2144,13 @@ func (s *Store) ListCurrentProblemSourceRecognitionFacts(
 			ErrProblemSourceRecognitionInvalid,
 		)
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return nil, fmt.Errorf("begin current V73 recognition snapshot: %w", err)
+	tx, beginErr := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if beginErr != nil {
+		return nil, fmt.Errorf("begin current V73 recognition snapshot: %w", beginErr)
 	}
-	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `
+	// 提交成功或主路径失败后，回滚仅用于释放事务；主路径错误保持原样。
+	defer func() { _ = tx.Rollback() }()
+	rows, queryErr := tx.QueryContext(ctx, `
 		SELECT i.problem_id,r.owner_scope,r.work_id
 		FROM k12_problem_source_recognition_items i
 		JOIN k12_problem_source_recognition_results r
@@ -2071,8 +2179,8 @@ func (s *Store) ListCurrentProblemSourceRecognitionFacts(
 		agentName,
 		submissionID,
 	)
-	if err != nil {
-		return nil, fmt.Errorf("list current V73 recognition identities: %w", err)
+	if queryErr != nil {
+		return nil, fmt.Errorf("list current V73 recognition identities: %w", queryErr)
 	}
 	type currentRecognitionWork struct {
 		ownerScope string
@@ -2085,11 +2193,11 @@ func (s *Store) ListCurrentProblemSourceRecognitionFacts(
 	for rows.Next() {
 		var problemID, ownerScope, workID string
 		if err := rows.Scan(&problemID, &ownerScope, &workID); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return nil, err
 		}
 		if _, duplicate := seenProblems[problemID]; duplicate {
-			rows.Close()
+			_ = rows.Close()
 			return nil, fmt.Errorf(
 				"%w: multiple V73 facts claim current problem %s",
 				ErrProblemSourceRecognitionInvalid,
@@ -2106,7 +2214,7 @@ func (s *Store) ListCurrentProblemSourceRecognitionFacts(
 				workID:     workID,
 			})
 		} else if works[index].ownerScope != ownerScope {
-			rows.Close()
+			_ = rows.Close()
 			return nil, fmt.Errorf(
 				"%w: V73 work owner drifted",
 				ErrProblemSourceRecognitionInvalid,
@@ -2115,7 +2223,7 @@ func (s *Store) ListCurrentProblemSourceRecognitionFacts(
 		works[index].problemIDs = append(works[index].problemIDs, problemID)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		_ = rows.Close()
 		return nil, fmt.Errorf("iterate current V73 recognition identities: %w", err)
 	}
 	if err := rows.Close(); err != nil {

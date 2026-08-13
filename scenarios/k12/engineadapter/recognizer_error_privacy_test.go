@@ -225,18 +225,18 @@ func TestDenseWorksheetFallbackLogDoesNotLeakInvalidWholePageControlValue(
 			name:        "invalid model control value",
 			canary:      "DD036-PRIVATE-DENSE-KIND-9a624d",
 			stableField: "problem_kind",
-			payload: `[{
+			payload: `{"questions":[{
 				"problem_id":"model-problem-dense",
 				"problem_kind":"DD036-PRIVATE-DENSE-KIND-9a624d",
 				"question":"2+2=",
 				"answer_state":"present",
 				"student_answer":"4"
-			}]`,
+			}],"printed_inventory":[{"source_number_path":[],"display_label":"","question":"2+2="}]}`,
 		},
 		{
 			name:            "syntax mismatch",
 			canary:          "DD036-PRIVATE-DENSE-SYNTAX-1027bf",
-			stableField:     "解析识题结果失败",
+			stableField:     "failed to parse whole-page self-inventory result",
 			forbiddenDetail: "unexpected end of JSON input",
 			payload:         `[{"question":"DD036-PRIVATE-DENSE-SYNTAX-1027bf"`,
 		},
@@ -245,7 +245,7 @@ func TestDenseWorksheetFallbackLogDoesNotLeakInvalidWholePageControlValue(
 			canary:          "DD036-PRIVATE-DENSE-TYPE-f9d34e",
 			stableField:     "解析识题结果失败",
 			forbiddenDetail: "cannot unmarshal object",
-			payload:         `[{"question":"DD036-PRIVATE-DENSE-TYPE-f9d34e","recognition_confidence":{"private":1}}]`,
+			payload:         `{"questions":[{"question":"DD036-PRIVATE-DENSE-TYPE-f9d34e","recognition_confidence":{"private":1}}],"printed_inventory":[{"source_number_path":[],"display_label":"","question":"DD036-PRIVATE-DENSE-TYPE-f9d34e"}]}`,
 		},
 	}
 
@@ -278,7 +278,7 @@ func TestDenseWorksheetFallbackLogDoesNotLeakInvalidWholePageControlValue(
 			}
 
 			logText := captured.String()
-			if !strings.Contains(logText, "整页结构化结果校验失败") {
+			if !strings.Contains(logText, "Whole-page structured-result validation failed") {
 				t.Fatalf("dense protocol fallback warning was not observable: %s", logText)
 			}
 			if strings.Contains(logText, test.canary) {

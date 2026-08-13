@@ -101,6 +101,7 @@ type UpdateProfileBundleRequest struct {
 	AgentConfig              *k12.ProfileBundleAgentConfig
 	Profile                  k12.ChildProfile
 	CurriculumProgress       CurriculumProgressInput
+	ClearCurriculumProgress  bool
 	WeeklyPracticeSettings   WeeklyPracticeSettingsInput
 }
 
@@ -180,20 +181,22 @@ func (d Deps) GetWeeklyCurriculumCatalog(ctx context.Context, req WeeklyCurricul
 }
 
 func (d Deps) GetCurriculumProgress(ctx context.Context, agentName, subject string) (*k12.CurriculumProgress, error) {
+	progress, _, err := d.GetCurriculumProgressState(ctx, agentName, subject)
+	return progress, err
+}
+
+func (d Deps) GetCurriculumProgressState(
+	ctx context.Context,
+	agentName, subject string,
+) (*k12.CurriculumProgress, int, error) {
 	if strings.TrimSpace(agentName) == "" || strings.TrimSpace(subject) != "math" {
-		return nil, fmt.Errorf("%w: agent and subject=math required", ErrInvalidInput)
+		return nil, 0, fmt.Errorf("%w: agent and subject=math required", ErrInvalidInput)
 	}
-	progress, err := d.Records.GetCurriculumProgress(ctx, agentName, subject)
-	if errors.Is(err, records.ErrNotFound) {
-		if _, ownerErr := d.Records.GetProfileState(ctx, agentName); ownerErr != nil {
-			return nil, ownerErr
-		}
-		return nil, nil
-	}
+	progress, revision, err := d.Records.GetCurriculumProgressState(ctx, agentName, subject)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return &progress, nil
+	return progress, revision, nil
 }
 
 func (d Deps) GetWeeklyPracticeSettings(ctx context.Context, agentName string) (k12.WeeklyPracticeSettings, error) {
@@ -270,35 +273,41 @@ func (d Deps) UpdateProfileBundle(ctx context.Context, req UpdateProfileBundleRe
 	if err != nil {
 		return k12.ProfileBundleResult{}, err
 	}
-	var catalog k12.CurriculumCatalog
-	req.CurriculumProgress.TextbookManifestID =
-		strings.TrimSpace(req.CurriculumProgress.TextbookManifestID)
-	if req.CurriculumProgress.TextbookManifestID != "" {
-		if strings.TrimSpace(req.CurriculumProgress.TextbookBindingID) != "" {
-			return k12.ProfileBundleResult{},
-				fmt.Errorf("%w: client must not submit textbook_binding_id", ErrInvalidInput)
-		}
-		catalog, err = d.Records.GetTextbookManifestCatalog(
-			ctx, k12storage.TextbookScope{
+	var progress *k12.CurriculumProgress
+	if !req.ClearCurriculumProgress {
+		var catalog k12.CurriculumCatalog
+		req.CurriculumProgress.TextbookManifestID =
+			strings.TrimSpace(req.CurriculumProgress.TextbookManifestID)
+		if req.CurriculumProgress.TextbookManifestID != "" {
+			if strings.TrimSpace(req.CurriculumProgress.TextbookBindingID) != "" {
+				return k12.ProfileBundleResult{},
+					fmt.Errorf("%w: client must not submit textbook_binding_id", ErrInvalidInput)
+			}
+			catalog, err = d.Records.GetTextbookManifestCatalog(
+				ctx, k12storage.TextbookScope{
+					OwnerID: req.OwnerID, AgentName: req.AgentName,
+					Subject: strings.TrimSpace(req.CurriculumProgress.Subject),
+				}, req.CurriculumProgress.TextbookManifestID,
+			)
+		} else {
+			catalog, err = d.GetWeeklyCurriculumCatalog(ctx, WeeklyCurriculumCatalogRequest{
 				OwnerID: req.OwnerID, AgentName: req.AgentName,
-				Subject: strings.TrimSpace(req.CurriculumProgress.Subject),
-			}, req.CurriculumProgress.TextbookManifestID,
+				Subject:         strings.TrimSpace(req.CurriculumProgress.Subject),
+				TextbookEdition: req.Profile.TextbookEdition, Volume: req.CurriculumProgress.Volume,
+			})
+		}
+		if err != nil {
+			return k12.ProfileBundleResult{}, err
+		}
+		resolved, resolveErr := resolveCurriculumProgress(
+			req.AgentName, req.CurriculumProgress, catalog, d.now(),
 		)
-	} else {
-		catalog, err = d.GetWeeklyCurriculumCatalog(ctx, WeeklyCurriculumCatalogRequest{
-			OwnerID: req.OwnerID, AgentName: req.AgentName,
-			Subject:         strings.TrimSpace(req.CurriculumProgress.Subject),
-			TextbookEdition: req.Profile.TextbookEdition, Volume: req.CurriculumProgress.Volume,
-		})
+		if resolveErr != nil {
+			return k12.ProfileBundleResult{}, resolveErr
+		}
+		progress = &resolved
 	}
-	if err != nil {
-		return k12.ProfileBundleResult{}, err
-	}
-	progress, err := resolveCurriculumProgress(req.AgentName, req.CurriculumProgress, catalog, d.now())
-	if err != nil {
-		return k12.ProfileBundleResult{}, err
-	}
-	digest := digestValue(struct {
+	requestIdentity := struct {
 		OwnerID                  string
 		AgentName                string
 		ExpectedProfileRevision  int
@@ -312,14 +321,39 @@ func (d Deps) UpdateProfileBundle(ctx context.Context, req UpdateProfileBundleRe
 		req.OwnerID, req.AgentName, req.ExpectedProfileRevision, req.ExpectedProgressRevision,
 		req.ExpectedSettingsRevision, req.AgentConfig, req.Profile, req.CurriculumProgress,
 		req.WeeklyPracticeSettings,
-	})
+	}
+	var digest string
+	if req.ClearCurriculumProgress {
+		digest = digestValue(struct {
+			OwnerID                  string
+			AgentName                string
+			ExpectedProfileRevision  int
+			ExpectedProgressRevision int
+			ExpectedSettingsRevision int
+			AgentConfig              *k12.ProfileBundleAgentConfig
+			Profile                  k12.ChildProfile
+			Progress                 *CurriculumProgressInput
+			Settings                 WeeklyPracticeSettingsInput
+		}{
+			req.OwnerID, req.AgentName, req.ExpectedProfileRevision,
+			req.ExpectedProgressRevision, req.ExpectedSettingsRevision,
+			req.AgentConfig, req.Profile, nil, req.WeeklyPracticeSettings,
+		})
+	} else {
+		// 非空请求沿用既有摘要字节，避免升级破坏历史幂等命令。
+		digest = digestValue(requestIdentity)
+	}
 	result, _, err := d.Records.UpdateProfileBundle(ctx, k12storage.ProfileBundleMutation{
 		OwnerID: req.OwnerID, AgentName: req.AgentName, IdempotencyKey: req.IdempotencyKey,
 		RequestDigest: digest, ExpectedProfileRevision: req.ExpectedProfileRevision,
 		ExpectedProgressRevision: req.ExpectedProgressRevision,
 		ExpectedSettingsRevision: req.ExpectedSettingsRevision,
 		AgentConfig:              req.AgentConfig,
-		Profile:                  req.Profile, Progress: progress, Settings: settings, At: d.now(),
+		Profile:                  req.Profile,
+		ProgressSubject:          "math",
+		Progress:                 progress,
+		Settings:                 settings,
+		At:                       d.now(),
 	})
 	if err != nil {
 		return k12.ProfileBundleResult{}, err
@@ -470,7 +504,9 @@ func (d Deps) EnsureWeeklyPracticePlan(ctx context.Context,
 		window.Year, window.Week, settings.Timezone, d.now()); err != nil {
 		return k12.WeeklyPracticePlan{}, false, err
 	}
-	progress, err := d.GetCurriculumProgress(ctx, req.AgentName, "math")
+	progress, progressLifecycleRevision, err := d.GetCurriculumProgressState(
+		ctx, req.AgentName, "math",
+	)
 	if err != nil {
 		return k12.WeeklyPracticePlan{}, false, err
 	}
@@ -488,7 +524,7 @@ func (d Deps) EnsureWeeklyPracticePlan(ctx context.Context,
 		Due              k12.WeeklyPracticeTrack
 	}{
 		req.AgentName, window.Year, window.Week, settings.Timezone, settings.Revision,
-		progressRevision(progress), dueTrack,
+		progressLifecycleRevision, dueTrack,
 	})
 	if stored, found, replayErr := d.Records.ReplayWeeklyPracticePlan(ctx,
 		req.AgentName, req.IdempotencyKey, sourceDigest, window.Year, window.Week,
@@ -518,7 +554,7 @@ func (d Deps) EnsureWeeklyPracticePlan(ctx context.Context,
 	}
 	tracks = append(tracks, arithmeticTrack)
 	at := d.now()
-	progressRev := optionalProgressRevision(progress)
+	progressRev := optionalProgressLifecycleRevision(progressLifecycleRevision)
 	plan := k12.WeeklyPracticePlan{
 		PlanID: "wplan-" + shortDigest(fmt.Sprintf("%s\x00%d\x00%d\x00%s",
 			req.AgentName, window.Year, window.Week, settings.Timezone)),
@@ -706,18 +742,11 @@ func (d Deps) weeklySupplementTrack(ctx context.Context, agent, section string,
 	return track, keys, elapsed
 }
 
-func progressRevision(p *k12.CurriculumProgress) int {
-	if p == nil {
-		return 0
-	}
-	return p.Revision
-}
-
-func optionalProgressRevision(p *k12.CurriculumProgress) *int {
-	if p == nil {
+func optionalProgressLifecycleRevision(revision int) *int {
+	if revision == 0 {
 		return nil
 	}
-	n := p.Revision
+	n := revision
 	return &n
 }
 
@@ -788,7 +817,9 @@ func (d Deps) PrepareWeeklyPracticeOutput(ctx context.Context, agent, planID str
 	if err != nil {
 		return WeeklyPrepareOutputResult{}, err
 	}
-	plan, err = d.projectWeeklyArithmetic(ctx, plan)
+	plan, expectedLifecycleRevision, err := d.projectWeeklyArithmeticAtLifecycle(
+		ctx, plan,
+	)
 	if err != nil {
 		return WeeklyPrepareOutputResult{}, err
 	}
@@ -866,7 +897,9 @@ func (d Deps) PrepareWeeklyPracticeOutput(ctx context.Context, agent, planID str
 		return WeeklyPrepareOutputResult{}, err
 	}
 	frozenSnapshot, frozenArtifact, frozenRender, replay, err :=
-		d.Records.FreezeWeeklyPracticeOutput(ctx, snapshot, artifact, render)
+		d.Records.FreezeWeeklyPracticeOutput(
+			ctx, plan, expectedLifecycleRevision, snapshot, artifact, render,
+		)
 	if err != nil {
 		return WeeklyPrepareOutputResult{}, err
 	}

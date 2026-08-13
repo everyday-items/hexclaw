@@ -78,6 +78,10 @@ func newManualTrackContractServer(
 	rt.Deps.WeeklyCurriculum = weeklyCatalogStub{}
 	rt.Deps.WeeklyCandidates = candidates
 	rt.Deps.WeeklyAssessment = weeklyAssessmentStub{}
+	seedBUG20260726034A02Manifest(
+		t, db, weeklyBundleManifestID, "desktop-user", "doc-weekly-contract",
+		1, "ready_for_confirmation", "",
+	)
 	return apihttp.NewHandler(apihttp.Runtime{
 		Views: rt.Registry.Views, Records: rt.Records, Deps: rt.Deps,
 	}), candidates

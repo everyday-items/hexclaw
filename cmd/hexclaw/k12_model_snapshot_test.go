@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 
 	"github.com/hexagon-codes/hexagon"
@@ -9,6 +10,67 @@ import (
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
+
+// K12-PROJECTING-FROZEN-ROUTE-001：即使可变的路由默认值不同，页面摘要回调也会
+// 继承已确认的 GradingJob 路由。
+func TestResolveK12FrozenTextCompletionRouteUsesSnapshotOverDefault(t *testing.T) {
+	defaultProvider := mockllm.NewLLMProvider("fallback")
+	frozenProvider := mockllm.NewLLMProvider("hexclaw-gpt")
+	router := llmrouter.NewWithProviders(config.LLMConfig{
+		Default: "fallback",
+		Providers: map[string]config.LLMProviderConfig{
+			"fallback": {
+				Model: "fallback-model", Models: []string{"fallback-model"},
+			},
+			"hexclaw-gpt": {
+				Model: "gpt-5.6-sol", Models: []string{"gpt-5.6-sol"},
+			},
+		},
+	}, map[string]hexagon.Provider{
+		"fallback":    defaultProvider,
+		"hexclaw-gpt": frozenProvider,
+	})
+
+	frozenCtx := k12.WithGradingModelSnapshot(context.Background(), k12.GradingModelSnapshot{
+		Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", Route: "hexclaw-gpt/gpt-5.6-sol",
+	})
+	provider, model, err := resolveK12FrozenTextCompletionRoute(
+		frozenCtx, router, "k12 辅导要点",
+	)
+	if err != nil {
+		t.Fatalf("resolve frozen route: %v", err)
+	}
+	if provider.Name() != "hexclaw-gpt" || model != "gpt-5.6-sol" {
+		t.Fatalf("frozen page-summary route=%s/%s, want hexclaw-gpt/gpt-5.6-sol", provider.Name(), model)
+	}
+
+	provider, model, err = resolveK12FrozenTextCompletionRoute(
+		context.Background(), router, "k12 辅导要点",
+	)
+	if err != nil {
+		t.Fatalf("resolve default route: %v", err)
+	}
+	if provider.Name() != "fallback" || model != "" {
+		t.Fatalf("non-grading default route=%s/%q, want fallback/empty model", provider.Name(), model)
+	}
+}
+
+func TestResolveK12FrozenTextCompletionRouteFailsBeforeMissingProvider(t *testing.T) {
+	router := llmrouter.NewWithProviders(config.LLMConfig{
+		Default: "fallback",
+		Providers: map[string]config.LLMProviderConfig{
+			"fallback": {Model: "fallback-model", Models: []string{"fallback-model"}},
+		},
+	}, map[string]hexagon.Provider{
+		"fallback": mockllm.NewLLMProvider("fallback"),
+	})
+	ctx := k12.WithGradingModelSnapshot(context.Background(), k12.GradingModelSnapshot{
+		Provider: "missing", Model: "gpt-5.6-sol", Route: "missing/gpt-5.6-sol",
+	})
+	if _, _, err := resolveK12FrozenTextCompletionRoute(ctx, router, "k12 辅导要点"); err == nil {
+		t.Fatal("missing frozen provider must fail closed before any default fallback")
+	}
+}
 
 func TestResolveK12GradingModelSnapshotHonorsExplicitSessionModel(t *testing.T) {
 	cfg := config.LLMConfig{

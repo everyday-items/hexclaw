@@ -83,6 +83,8 @@ func (d Deps) BuildTutoringTipsSubject(ctx context.Context, agentName, gradingJo
 	if d.Records == nil {
 		return TutoringTips{}, fmt.Errorf("usecase: canonical K12 store unavailable")
 	}
+	ctx, cancel := context.WithTimeout(ctx, tutoringTipsBuildBudget)
+	defer cancel()
 
 	job, err := d.GetGradingJob(ctx, agentName, gradingJobID)
 	if err != nil {
@@ -149,9 +151,6 @@ func (d Deps) BuildTutoringTipsSubject(ctx context.Context, agentName, gradingJo
 		}
 	}
 	grounding := d.freezeTutoringGrounding(ctx, groundingRequest)
-
-	ctx, cancel := context.WithTimeout(ctx, tutoringTipsBuildBudget)
-	defer cancel()
 	history, err := d.mistakesFor(ctx, agentName, knowledgePoints)
 	if err != nil {
 		return TutoringTips{}, err
@@ -295,6 +294,10 @@ func (d Deps) tutoringTipsOverviewWithGrounding(ctx context.Context, grounding t
 	var content strings.Builder
 	verifiedGroundedCount := 0
 	for _, concept := range concepts {
+		if ctx.Err() != nil {
+			fmt.Fprintf(&content, "### %s\n\nNo reliable explanation was generated this time. Please check it against the current textbook.\n\n", concept)
+			continue
+		}
 		if d.Grounding != nil {
 			if evidence, found, err := d.groundTutoringConcept(ctx, grounding, subject, concept, grade); err == nil && found {
 				teaching := groundedTutoringTipsMarkdown(ctx, d.TutoringTipsReview, subject, concept, grade, evidence)
@@ -305,13 +308,19 @@ func (d Deps) tutoringTipsOverviewWithGrounding(ctx context.Context, grounding t
 				continue
 			}
 		}
+		if ctx.Err() != nil {
+			fmt.Fprintf(&content, "### %s\n\nNo reliable explanation was generated this time. Please check it against the current textbook.\n\n", concept)
+			continue
+		}
 		if d.TutoringTipsReview != nil {
-			if text, err := d.TutoringTipsReview.GenerateTutoringTipsReview(ctx, subject, concept, grade); err == nil && strings.TrimSpace(text) != "" {
+			if text, err := awaitTutoringTipsCall(ctx, func() (string, error) {
+				return d.TutoringTipsReview.GenerateTutoringTipsReview(ctx, subject, concept, grade)
+			}); err == nil && strings.TrimSpace(text) != "" {
 				fmt.Fprintf(&content, "### %s\n\n%s\n\n", concept, strings.TrimSpace(text))
 				continue
 			}
 		}
-		fmt.Fprintf(&content, "### %s\n\n本次未生成可靠讲解，请结合当前教材核对。\n\n", concept)
+		fmt.Fprintf(&content, "### %s\n\nNo reliable explanation was generated this time. Please check it against the current textbook.\n\n", concept)
 	}
 	label := TutoringTipsSourceTextbook
 	if verifiedGroundedCount != len(concepts) {
@@ -320,12 +329,56 @@ func (d Deps) tutoringTipsOverviewWithGrounding(ctx context.Context, grounding t
 	return TutoringTipsSection{Title: "这页在练什么", Content: strings.TrimSpace(content.String()), SourceLabel: label}
 }
 
+type tutoringTipsCallResult[T any] struct {
+	value T
+	err   error
+}
+
+const tutoringTipsCallCapacity = 8
+
+var tutoringTipsCallGate = make(chan struct{}, tutoringTipsCallCapacity)
+
+// awaitTutoringTipsCall 确保即使端口实现不响应 ctx.Done()，页面摘要预算仍具权威性。
+// 全局门禁使过期调用最多占用固定容量，避免不返回的端口持续遗留后台 work。
+func awaitTutoringTipsCall[T any](ctx context.Context, call func() (T, error)) (T, error) {
+	var zero T
+	if err := ctx.Err(); err != nil {
+		return zero, err
+	}
+	select {
+	case tutoringTipsCallGate <- struct{}{}:
+	case <-ctx.Done():
+		return zero, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		<-tutoringTipsCallGate
+		return zero, err
+	}
+	result := make(chan tutoringTipsCallResult[T], 1)
+	go func() {
+		defer func() { <-tutoringTipsCallGate }()
+		value, err := call()
+		result <- tutoringTipsCallResult[T]{value: value, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return zero, ctx.Err()
+	case completed := <-result:
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
+		return completed.value, completed.err
+	}
+}
+
 func groundedTutoringTipsMarkdown(ctx context.Context, generator TutoringTipsReviewGenerator,
 	subject, concept, grade, evidence string,
 ) string {
 	evidence = strings.TrimSpace(evidence)
 	if grounded, ok := generator.(GroundedTutoringTipsReviewGenerator); ok {
-		if text, err := grounded.GenerateGroundedTutoringTipsReview(ctx, subject, concept, grade, evidence); err == nil && strings.TrimSpace(text) != "" {
+		if text, err := awaitTutoringTipsCall(ctx, func() (string, error) {
+			return grounded.GenerateGroundedTutoringTipsReview(ctx, subject, concept, grade, evidence)
+		}); err == nil && strings.TrimSpace(text) != "" {
 			return strings.TrimSpace(text)
 		}
 	}
@@ -344,13 +397,25 @@ func (d Deps) groundTutoringConcept(
 	grounding tutoringGroundingContext,
 	subject, concept, grade string,
 ) (string, bool, error) {
-	if grounding.snapshotter != nil {
-		return grounding.snapshotter.GroundSnapshot(ctx, grounding.snapshot, concept, grade)
-	}
-	if !grounding.legacyPermitted {
+	if grounding.snapshotter == nil && !grounding.legacyPermitted {
 		return "", false, nil
 	}
-	return d.groundForSubject(ctx, grounding.snapshot.AgentName, subject, concept, grade)
+	type result struct {
+		evidence string
+		found    bool
+	}
+	grounded, err := awaitTutoringTipsCall(ctx, func() (result, error) {
+		if grounding.snapshotter != nil {
+			evidence, found, groundErr := grounding.snapshotter.GroundSnapshot(ctx, grounding.snapshot, concept, grade)
+			return result{evidence: evidence, found: found}, groundErr
+		}
+		evidence, found, groundErr := d.groundForSubject(ctx, grounding.snapshot.AgentName, subject, concept, grade)
+		return result{evidence: evidence, found: found}, groundErr
+	})
+	if err != nil {
+		return "", false, err
+	}
+	return grounded.evidence, grounded.found, nil
 }
 
 func tutoringTipsLearningEvidence(childName string, history []ReviewItem) TutoringTipsSection {

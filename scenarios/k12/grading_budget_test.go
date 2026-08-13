@@ -4,7 +4,8 @@ import "testing"
 
 func frozenBudgetFixture() GradingBudgetSnapshot {
 	return GradingBudgetSnapshot{
-		PolicyVersion: 1,
+		PolicyVersion:          1,
+		RecognitionPlanVersion: RecognitionPlanVersionV1,
 		StageSeconds: GradingStageBudgets{
 			Queued: 60, Normalizing: 60, Recognizing: 120,
 			Locating: 60, Rendering: 60, Projecting: 60,
@@ -56,6 +57,33 @@ func TestGradingBudgetSnapshotRequiresMeasuredOneEightSixteenThirtyTwoBuckets(t 
 	if err := badStage.Validate(); err == nil {
 		t.Fatal("frozen policy with a zero automatic-stage budget must be rejected")
 	}
+	missingPlan := frozenBudgetFixture()
+	missingPlan.RecognitionPlanVersion = 0
+	if err := missingPlan.Validate(); err == nil {
+		t.Fatal("new frozen policy without an explicit recognition plan must fail closed")
+	}
+	v1WithV2Parameters := frozenBudgetFixture()
+	v1WithV2Parameters.PhysicalCallCapMillis = 120_000
+	if err := v1WithV2Parameters.Validate(); err == nil {
+		t.Fatal("recognition plan v1 must not carry v2 parameters")
+	}
+	v2 := frozenBudgetFixture()
+	v2.RecognitionPlanVersion = RecognitionPlanVersionV2
+	v2.RecognizingBuckets = RecognitionLayoutBudgetBucketsV2{
+		UpTo1ProblemMillis: 1_001, UpTo8ProblemsMillis: 2_001,
+		UpTo16ProblemsMillis: 3_001, UpTo32ProblemsMillis: 4_001,
+	}
+	v2.StageSeconds.Recognizing = 5
+	v2.PhysicalCallCapMillis = 120_000
+	v2.WorkerHardCap = 2
+	v2.EffectiveConcurrency = 2
+	if err := v2.Validate(); err != nil {
+		t.Fatalf("domain tests may exercise complete v2 effective=2 policy: %v", err)
+	}
+	v2.RecognizingBuckets.UpTo16ProblemsMillis = 0
+	if err := v2.Validate(); err == nil {
+		t.Fatal("incomplete v2 recognizing buckets must fail closed")
+	}
 }
 
 func TestGradingBudgetSnapshotSelectsFrozenStageAndQuestionBucket(t *testing.T) {
@@ -84,5 +112,20 @@ func TestGradingBudgetSnapshotSelectsFrozenStageAndQuestionBucket(t *testing.T) 
 	}
 	if _, ok := snapshot.StageBudgetSeconds(GradingStageAwaitingConfirmation, 0); ok {
 		t.Fatal("human wait state must have no automatic budget")
+	}
+}
+
+func TestREGK12RecognitionPlanVersion20260808001CopiesSelectedRecognizingSeconds(t *testing.T) {
+	caller := frozenBudgetFixture()
+	caller.StageSeconds.Recognizing = 777
+
+	selectedOrdinary := frozenBudgetFixture()
+	selectedOrdinary.StageSeconds.Recognizing = 120
+	got := caller.WithRecognitionPolicyFrom(selectedOrdinary)
+	if got.RecognitionPlanVersion != RecognitionPlanVersionV1 ||
+		got.StageSeconds.Recognizing != 120 ||
+		!got.RecognizingBuckets.IsZero() || got.PhysicalCallCapMillis != 0 ||
+		got.WorkerHardCap != 0 || got.EffectiveConcurrency != 0 {
+		t.Fatalf("ordinary selected recognition policy was not copied exactly: %+v", got)
 	}
 }

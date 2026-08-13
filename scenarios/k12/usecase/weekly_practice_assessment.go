@@ -38,10 +38,10 @@ func (a verifiedSolutionWeeklyAssessor) AssessWeeklyPracticeAnswer(
 		return WeeklyPracticeAnswerAssessment{}, err
 	}
 	result := k12.WeeklyAttemptNeedsReview
-	switch outcome.Verdict {
-	case VerdictAgree:
+	switch outcome.AssessmentStatus() {
+	case k12.GradingAssessmentCorrect:
 		result = k12.WeeklyAttemptCorrect
-	case VerdictDisagree:
+	case k12.GradingAssessmentWrong:
 		result = k12.WeeklyAttemptWrong
 	}
 	binding := digestValue(struct {
@@ -134,11 +134,11 @@ func (d Deps) submitWeeklyPracticeAttemptDurable(
 		return attempt, true, getErr
 	}
 	attempt := k12.WeeklyPracticeAttempt{
-		AttemptID:           "wattempt-" + shortDigest(snapshotID+"\x00"+itemID+"\x00"+idempotencyKey),
-		SnapshotID:          snapshotID,
-		ItemID:              itemID,
-		AssessmentID:        assessment.AssessmentID,
-		Result:              assessment.Result,
+		AttemptID:            "wattempt-" + shortDigest(snapshotID+"\x00"+itemID+"\x00"+idempotencyKey),
+		SnapshotID:           snapshotID,
+		ItemID:               itemID,
+		AssessmentID:         assessment.AssessmentID,
+		Result:               assessment.Result,
 		VerificationEvidence: assessment.VerificationEvidence,
 		CreatedAt:            command.CreatedAt,
 	}
@@ -326,7 +326,7 @@ func (d Deps) weeklyPracticeAssessmentEffects(
 		DueAt:         &due,
 		Fields: k12.MistakeFields{
 			GradeTerm: d.creationGradeTerm(ctx, agent, ""),
-			Subject: subject, Question: item.PromptMarkdown,
+			Subject:   subject, Question: item.PromptMarkdown,
 			KnowledgePoint: knowledgePoint, ErrorCause: "其他",
 			WrongProcess: studentAnswer, CanonicalAnswer: verifiedSolution,
 			EntrySource: k12.MistakeEntryVerified,

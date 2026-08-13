@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
@@ -51,6 +52,45 @@ func (o *GradingOrchestrator) prepareProblemSourceRecognitionParent(
 			"usecase: source recognition needs a claimed queue attempt and image",
 		)
 	}
+	recognitionPlanVersion, err := frozenRecognitionPlanVersion(
+		job.Fields.BudgetSnapshot,
+	)
+	if err != nil {
+		return k12.ModelInvocation{}, err
+	}
+	route := k12.NormalizeGradingModelSnapshot(job.Fields.ModelSnapshot)
+	policy := k12.NormalizeModelRequestPolicySnapshot(
+		route.RecognizingRequestPolicy,
+	)
+	if recognitionPlanVersion == k12.RecognitionPlanVersionV2 &&
+		policy.IsZero() {
+		return k12.ModelInvocation{}, fmt.Errorf(
+			"%w: source recognition plan v2 requires the frozen recognizing request policy",
+			ErrModelRequestPolicyInvalid,
+		)
+	}
+	requestDigest, err := problemSourceRecognitionParentDigest(
+		work,
+		route,
+		policy,
+	)
+	if err != nil {
+		return k12.ModelInvocation{}, fmt.Errorf(
+			"usecase: bind source recognition parent to immutable work: %w",
+			err,
+		)
+	}
+	var canonicalPage k12.CanonicalRecognitionPageV2
+	if recognitionPlanVersion == k12.RecognitionPlanVersionV2 {
+		canonicalPage, err = k12.CanonicalizeRecognitionPageV2(image)
+		if err != nil {
+			return k12.ModelInvocation{}, fmt.Errorf(
+				"%w: canonicalize source recognition page v2: %v",
+				ErrRecognitionPhysicalCallBeforeSend,
+				err,
+			)
+		}
+	}
 	invocations, err := o.deps.Records.ListModelInvocations(
 		ctx, work.AgentName, work.JobID,
 	)
@@ -68,6 +108,7 @@ func (o *GradingOrchestrator) prepareProblemSourceRecognitionParent(
 	}
 	maxRecognizingAttempt := 0
 	var current *k12.ModelInvocation
+	var recoveredFinalized *k12.ModelInvocation
 	for index := range invocations {
 		invocation := invocations[index]
 		if invocation.Stage != k12.GradingStageRecognizing {
@@ -78,6 +119,39 @@ func (o *GradingOrchestrator) prepareProblemSourceRecognitionParent(
 		}
 		if _, belongsToWork := expectedSourceIDs[invocation.InvocationID]; !belongsToWork {
 			continue
+		}
+		if recognitionPlanVersion == k12.RecognitionPlanVersionV2 &&
+			invocation.Status == k12.ModelInvocationSucceeded {
+			recoverable, recoverErr :=
+				o.problemSourceRecognitionFinalizedAttemptCanRecover(
+					ctx,
+					invocation,
+					requestDigest,
+					route,
+					policy,
+					canonicalPage,
+					job.Fields.BudgetSnapshot,
+					image,
+				)
+			if recoverErr != nil {
+				return invocation, recoverErr
+			}
+			if recoverable {
+				if recoveredFinalized != nil &&
+					recoveredFinalized.InvocationID != invocation.InvocationID {
+					return invocation, errors.Join(
+						ErrModelInvocationRequiresReconciliation,
+						fmt.Errorf(
+							"multiple finalized source recognition attempts remain recoverable: %s and %s",
+							recoveredFinalized.InvocationID,
+							invocation.InvocationID,
+						),
+					)
+				}
+				copyInvocation := invocation
+				recoveredFinalized = &copyInvocation
+				continue
+			}
 		}
 		if invocation.InvocationID == currentID {
 			copyInvocation := invocation
@@ -90,7 +164,21 @@ func (o *GradingOrchestrator) prepareProblemSourceRecognitionParent(
 			return invocation, err
 		}
 	}
-	if current != nil {
+	if recoveredFinalized != nil {
+		if current != nil {
+			return *recoveredFinalized, errors.Join(
+				ErrModelInvocationRequiresReconciliation,
+				fmt.Errorf(
+					"finalized source recognition %s has a concurrent successor %s",
+					recoveredFinalized.InvocationID,
+					current.InvocationID,
+				),
+			)
+		}
+		return *recoveredFinalized, nil
+	}
+	if current != nil &&
+		recognitionPlanVersion == k12.RecognitionPlanVersionV1 {
 		if err := o.problemSourceRecognitionCurrentAttemptCanEnterProvider(
 			ctx, *current,
 		); err != nil {
@@ -98,24 +186,9 @@ func (o *GradingOrchestrator) prepareProblemSourceRecognitionParent(
 		}
 	}
 
-	route := k12.NormalizeGradingModelSnapshot(job.Fields.ModelSnapshot)
-	policy := k12.NormalizeModelRequestPolicySnapshot(
-		route.RecognizingRequestPolicy,
-	)
 	attempt := maxRecognizingAttempt + 1
 	if current != nil {
 		attempt = current.Attempt
-	}
-	requestDigest, err := problemSourceRecognitionParentDigest(
-		work,
-		route,
-		policy,
-	)
-	if err != nil {
-		return k12.ModelInvocation{}, fmt.Errorf(
-			"usecase: bind source recognition parent to immutable work: %w",
-			err,
-		)
 	}
 	parent := k12.ModelInvocation{
 		InvocationID:          currentID,
@@ -128,6 +201,22 @@ func (o *GradingOrchestrator) prepareProblemSourceRecognitionParent(
 		Attempt:               attempt,
 		CreatedAt:             o.deps.now(),
 		UpdatedAt:             o.deps.now(),
+	}
+	if recognitionPlanVersion == k12.RecognitionPlanVersionV2 {
+		if current != nil {
+			parent.Status = current.Status
+			parent.CreatedAt = current.CreatedAt
+			parent.UpdatedAt = current.UpdatedAt
+		}
+		return o.publishInitialRecognitionLayoutV2(
+			ctx,
+			parent,
+			canonicalPage,
+			initialRecognitionLayoutContractV2{
+				Budget:                   job.Fields.BudgetSnapshot,
+				StageStartedAtUnixMillis: parent.CreatedAt * 1000,
+			},
+		)
 	}
 	call := k12.RecognitionPhysicalCall{
 		Unit: k12.RecognitionPhysicalUnitWholePage, Image: image,
@@ -178,6 +267,72 @@ func (o *GradingOrchestrator) prepareProblemSourceRecognitionParent(
 	return published, nil
 }
 
+func (o *GradingOrchestrator) problemSourceRecognitionFinalizedAttemptCanRecover(
+	ctx context.Context,
+	parent k12.ModelInvocation,
+	requestDigest string,
+	route k12.GradingModelSnapshot,
+	policy k12.ModelRequestPolicySnapshot,
+	canonicalPage k12.CanonicalRecognitionPageV2,
+	budget k12.GradingBudgetSnapshot,
+	image []byte,
+) (bool, error) {
+	if parent.Status != k12.ModelInvocationSucceeded {
+		return false, nil
+	}
+	if parent.RequestDigest != requestDigest ||
+		parent.RouteSnapshot != route ||
+		parent.RequestPolicySnapshot != policy ||
+		!validModelInvocationDigest(parent.ResultDigest) {
+		return false, errors.Join(
+			ErrModelInvocationRequiresReconciliation,
+			fmt.Errorf(
+				"finalized source recognition parent %s drifted from the immutable source action",
+				parent.InvocationID,
+			),
+		)
+	}
+	if _, err := o.loadInitialRecognitionLayoutRuntimeForParentV2(
+		context.WithoutCancel(ctx),
+		parent,
+		canonicalPage,
+		initialRecognitionLayoutContractV2{
+			Budget:                   budget,
+			StageStartedAtUnixMillis: parent.CreatedAt * 1000,
+		},
+	); err != nil {
+		return false, err
+	}
+	classification, err := o.classifyRecognitionPhysicalExactSet(
+		context.WithoutCancel(ctx),
+		parent,
+	)
+	if err != nil {
+		return false, err
+	}
+	if classification.State != recognitionPhysicalExactSetFinalizedSuccess {
+		return false, errors.Join(
+			ErrModelInvocationRequiresReconciliation,
+			fmt.Errorf(
+				"succeeded source recognition parent %s has physical exact-set state %d",
+				parent.InvocationID,
+				classification.State,
+			),
+		)
+	}
+	if _, err := o.recognitionPhysicalSuccessSet(
+		context.WithoutCancel(ctx),
+		parent,
+		image,
+	); err != nil {
+		return false, errors.Join(
+			ErrModelInvocationRequiresReconciliation,
+			err,
+		)
+	}
+	return true, nil
+}
+
 func (o *GradingOrchestrator) problemSourceRecognitionAttemptAllowsSuccessor(
 	ctx context.Context,
 	parent k12.ModelInvocation,
@@ -193,31 +348,21 @@ func (o *GradingOrchestrator) problemSourceRecognitionAttemptAllowsSuccessor(
 			),
 		)
 	}
-	children, err := o.problemSourceRecognitionChildren(ctx, parent)
+	classification, err := o.classifyRecognitionPhysicalExactSet(ctx, parent)
 	if err != nil {
-		return err
+		return errors.Join(ErrModelInvocationRequiresReconciliation, err)
 	}
-	if len(children) == 0 {
-		return errors.Join(
-			ErrModelInvocationRequiresReconciliation,
-			fmt.Errorf("prior source recognition parent has no physical evidence"),
-		)
+	if classification.State == recognitionPhysicalExactSetDefinitiveFailure {
+		return nil
 	}
-	for _, child := range children {
-		if child.Status != k12.ModelInvocationFailed ||
-			strings.TrimSpace(child.FailureKind) == "" ||
-			strings.TrimSpace(child.ResultDigest) != "" {
-			return errors.Join(
-				ErrModelInvocationRequiresReconciliation,
-				fmt.Errorf(
-					"prior source recognition child %s remains %s",
-					child.PhysicalInvocationID,
-					child.Status,
-				),
-			)
-		}
-	}
-	return nil
+	return errors.Join(
+		ErrModelInvocationRequiresReconciliation,
+		fmt.Errorf(
+			"prior source recognition parent %s has physical exact-set state %d",
+			parent.InvocationID,
+			classification.State,
+		),
+	)
 }
 
 func (o *GradingOrchestrator) problemSourceRecognitionCurrentAttemptCanEnterProvider(
@@ -237,16 +382,15 @@ func (o *GradingOrchestrator) problemSourceRecognitionCurrentAttemptCanEnterProv
 		return nil
 	}
 	if parent.Status == k12.ModelInvocationSent && len(children) > 0 {
-		allDefinitiveFailures := true
-		for _, child := range children {
-			if child.Status != k12.ModelInvocationFailed ||
-				strings.TrimSpace(child.FailureKind) == "" ||
-				strings.TrimSpace(child.ResultDigest) != "" {
-				allDefinitiveFailures = false
-				break
-			}
+		classification, classifyErr :=
+			o.classifyRecognitionPhysicalExactSet(ctx, parent)
+		if classifyErr != nil {
+			return errors.Join(
+				ErrModelInvocationRequiresReconciliation,
+				classifyErr,
+			)
 		}
-		if allDefinitiveFailures {
+		if classification.State == recognitionPhysicalExactSetDefinitiveFailure {
 			stored, markErr := o.deps.Records.MarkModelInvocationFailed(
 				context.WithoutCancel(ctx),
 				parent.AgentName,
@@ -310,12 +454,14 @@ func (o *GradingOrchestrator) settleProblemSourceRecognitionError(
 			err,
 		)
 	}
-	if len(children) == 1 &&
-		children[0].Status == k12.ModelInvocationPrepared {
+	for index := range children {
+		if children[index].Status != k12.ModelInvocationPrepared {
+			continue
+		}
 		closed, closeErr := o.deps.Records.MarkModelPhysicalInvocationNotSent(
 			context.WithoutCancel(ctx),
 			parent.AgentName,
-			children[0].PhysicalInvocationID,
+			children[index].PhysicalInvocationID,
 		)
 		if closeErr != nil {
 			return errors.Join(
@@ -324,18 +470,20 @@ func (o *GradingOrchestrator) settleProblemSourceRecognitionError(
 				closeErr,
 			)
 		}
-		children[0] = closed
+		children[index] = closed
 	}
-	allDefinitiveFailures := len(children) > 0
-	for _, child := range children {
-		if child.Status != k12.ModelInvocationFailed ||
-			strings.TrimSpace(child.FailureKind) == "" ||
-			strings.TrimSpace(child.ResultDigest) != "" {
-			allDefinitiveFailures = false
-			break
-		}
+	classification, err := o.classifyRecognitionPhysicalExactSet(
+		context.WithoutCancel(ctx),
+		parent,
+	)
+	if err != nil {
+		return errors.Join(
+			cause,
+			ErrModelInvocationRequiresReconciliation,
+			err,
+		)
 	}
-	if !allDefinitiveFailures {
+	if classification.State != recognitionPhysicalExactSetDefinitiveFailure {
 		return errors.Join(
 			cause,
 			ErrModelInvocationRequiresReconciliation,
@@ -368,9 +516,65 @@ func (o *GradingOrchestrator) executeProblemSourceRecognition(
 	if err != nil {
 		return problemSourceRecognitionExecution{}, err
 	}
+	recognitionPlanVersion, err := frozenRecognitionPlanVersion(
+		job.Fields.BudgetSnapshot,
+	)
+	if err != nil {
+		return problemSourceRecognitionExecution{}, err
+	}
+	providerCtx := ctx
+	cancelProvider := func() {}
+	if recognitionPlanVersion == k12.RecognitionPlanVersionV2 {
+		canonicalPage, canonicalErr := k12.CanonicalizeRecognitionPageV2(image)
+		if canonicalErr != nil {
+			return problemSourceRecognitionExecution{}, fmt.Errorf(
+				"%w: canonicalize source recognition page v2: %v",
+				ErrRecognitionPhysicalCallBeforeSend,
+				canonicalErr,
+			)
+		}
+		runtime, runtimeErr :=
+			o.loadInitialRecognitionLayoutRuntimeForParentV2(
+				context.WithoutCancel(ctx),
+				parent,
+				canonicalPage,
+				initialRecognitionLayoutContractV2{
+					Budget: job.Fields.BudgetSnapshot,
+					StageStartedAtUnixMillis: parent.CreatedAt *
+						1000,
+				},
+			)
+		if runtimeErr != nil {
+			return problemSourceRecognitionExecution{}, runtimeErr
+		}
+		providerCtx, cancelProvider = context.WithDeadline(
+			ctx,
+			time.UnixMilli(
+				runtime.Header.StageStartedAtUnixMillis+
+					runtime.Header.BudgetBuckets.UpTo32ProblemsMillis,
+			),
+		)
+		providerCtx = k12.WithRecognitionLayoutPlanV2(
+			providerCtx,
+			runtime.HeaderDigest,
+		)
+		if runtime.Status == "succeeded" {
+			providerCtx = k12.WithRecognitionLayoutFinalizationReplayV2(
+				providerCtx,
+			)
+		}
+	}
+	defer cancelProvider()
+	if !parent.RequestPolicySnapshot.IsZero() {
+		providerCtx = k12.WithGradingModelRequestPolicy(
+			providerCtx,
+			parent.RequestPolicySnapshot,
+		)
+	}
 	executor := newDurableRecognitionPhysicalCallExecutor(o, parent)
-	providerCtx := k12.WithRecognitionPhysicalCallExecutor(ctx, executor)
+	providerCtx = k12.WithRecognitionPhysicalCallExecutor(providerCtx, executor)
 	recognized, err := o.deps.RecognizeHomework(providerCtx, image)
+	cancelProvider()
 	if err != nil {
 		return problemSourceRecognitionExecution{},
 			o.settleProblemSourceRecognitionError(ctx, parent, err)
@@ -390,13 +594,17 @@ func (o *GradingOrchestrator) executeProblemSourceRecognition(
 		len(physical),
 	)
 	for _, child := range physical {
-		refs = append(refs,
-			k12storage.ProblemSourceRecognitionPhysicalResultRef{
-				PhysicalInvocationID: child.PhysicalInvocationID,
-				PhysicalUnit:         string(child.PhysicalUnit),
-				ResultDigest:         child.ResultDigest,
-			},
-		)
+		ref := k12storage.ProblemSourceRecognitionPhysicalResultRef{
+			PhysicalInvocationID: child.PhysicalInvocationID,
+			PhysicalUnit:         string(child.PhysicalUnit),
+			ResultDigest:         child.ResultDigest,
+		}
+		if child.RecognitionPlanVersion == k12.RecognitionPlanVersionV2 {
+			ref.RecognitionPlanVersion = child.RecognitionPlanVersion
+			ref.PlanDigest = child.PlanDigest
+			ref.CandidateExactSetDigest = child.CandidateExactSetDigest
+		}
+		refs = append(refs, ref)
 	}
 	return problemSourceRecognitionExecution{
 		Parent: parent, PhysicalResults: refs,

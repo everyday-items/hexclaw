@@ -138,6 +138,7 @@
             "processing",
             "skipped",
             "correct",
+            "correct_with_process_issue",
             "wrong",
             "unanswered",
             "answer_unclear",

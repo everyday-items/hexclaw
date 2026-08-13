@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -58,6 +59,12 @@ func TestCommitProblemSourceRecognitionResultAppendsTypedRevisionWithoutOverwrit
 		got[0] != recognitionChildOne || got[1] != recognitionChildTwo {
 		t.Fatalf("committed affected exact-set=%v", got)
 	}
+	for _, ref := range committed.PhysicalResults {
+		if ref.RecognitionPlanVersion != k12.RecognitionPlanVersionV1 ||
+			ref.PlanDigest != "" || ref.CandidateExactSetDigest != "" {
+			t.Fatalf("legacy zero-value input did not normalize to v1: %+v", ref)
+		}
+	}
 	if item := committed.Items[0]; item.ProblemID != recognitionChildOne ||
 		item.InputRevision != 3 || item.Source.PageAssetID == "" ||
 		item.Source.ContentDigest != strings.Repeat("b", 64) ||
@@ -87,6 +94,7 @@ func TestCommitProblemSourceRecognitionResultAppendsTypedRevisionWithoutOverwrit
 	}
 	if rebuilt.ResultDigest != committed.ResultDigest || len(rebuilt.Items) != 2 ||
 		len(rebuilt.PhysicalResults) != 2 ||
+		rebuilt.PhysicalResults[0].RecognitionPlanVersion != k12.RecognitionPlanVersionV1 ||
 		rebuilt.PhysicalResults[0].ResultDigest != strings.Repeat("c", 64) ||
 		rebuilt.Items[0].StemRaw != result.Items[0].StemRaw ||
 		rebuilt.Items[1].AnswerState != "blank" {
@@ -120,6 +128,70 @@ func TestCommitProblemSourceRecognitionResultAppendsTypedRevisionWithoutOverwrit
 		WHERE work_id=? AND problem_id=?`, recognitionWork, recognitionChildOne); err == nil {
 		t.Fatal("immutable recognition fact accepted an UPDATE")
 	}
+}
+
+func TestProblemSourceRecognitionResultV2PersistsExactPhysicalEvidenceAndCapsAt41(t *testing.T) {
+	t.Run("one manifest plus eight batches plus thirty-two repairs is the exact ceiling", func(t *testing.T) {
+		result := validProblemSourceRecognitionResult()
+		result.PhysicalResults = recognitionV2PhysicalRefs(41)
+		if _, err := k12storage.ProblemSourceRecognitionTypedResultDigest(result); err != nil {
+			t.Fatalf("41 physical results must remain representable: %v", err)
+		}
+		result.PhysicalResults = recognitionV2PhysicalRefs(42)
+		if _, err := k12storage.ProblemSourceRecognitionTypedResultDigest(result); err == nil || !errors.Is(err, k12storage.ErrProblemSourceRecognitionInvalid) {
+			t.Fatalf("42 physical results err=%v, want invalid", err)
+		}
+	})
+
+	t.Run("commit and restart bind every v2 child fact", func(t *testing.T) {
+		ctx := context.Background()
+		store, db := setup(t)
+		lease := seedProblemSourceRecognitionFixture(t, store, db, recognitionWork)
+		result := validProblemSourceRecognitionResult()
+		result.PhysicalResults = recognitionV2PhysicalRefs(3)
+		seedRecognitionV2PhysicalChildren(t, db, result)
+
+		drifted := result
+		drifted.PhysicalResults = append(
+			[]k12storage.ProblemSourceRecognitionPhysicalResultRef(nil),
+			result.PhysicalResults...,
+		)
+		drifted.PhysicalResults[1].CandidateExactSetDigest = "sha256:" + strings.Repeat("f", 64)
+		driftDigest, err := k12storage.ProblemSourceRecognitionTypedResultDigest(drifted)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, execErr := db.ExecContext(t.Context(), `UPDATE k12_model_invocations SET result_digest=? WHERE invocation_id=?`,
+			driftDigest, result.ParentInvocationID); execErr != nil {
+			t.Fatal(execErr)
+		}
+		if _, _, commitErr := store.CommitProblemSourceRecognitionResult(ctx, lease, drifted); commitErr == nil || !errors.Is(commitErr, k12storage.ErrProblemSourceRecognitionConflict) {
+			t.Fatalf("drifted exact-set digest err=%v, want lineage conflict", commitErr)
+		}
+
+		parentDigest, err := k12storage.ProblemSourceRecognitionTypedResultDigest(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, execErr := db.ExecContext(t.Context(), `UPDATE k12_model_invocations SET result_digest=? WHERE invocation_id=?`,
+			parentDigest, result.ParentInvocationID); execErr != nil {
+			t.Fatal(execErr)
+		}
+		commit, created, err := store.CommitProblemSourceRecognitionResult(ctx, lease, result)
+		if err != nil || !created {
+			t.Fatalf("commit v2 physical evidence: created=%v err=%v", created, err)
+		}
+		if !reflect.DeepEqual(commit.PhysicalResults, result.PhysicalResults) {
+			t.Fatalf("committed v2 evidence drifted: got=%+v want=%+v", commit.PhysicalResults, result.PhysicalResults)
+		}
+		loaded, err := store.GetProblemSourceRecognitionResultByWork(ctx, recognitionOwner, recognitionWork)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(loaded.PhysicalResults, result.PhysicalResults) {
+			t.Fatalf("restart v2 evidence drifted: got=%+v want=%+v", loaded.PhysicalResults, result.PhysicalResults)
+		}
+	})
 }
 
 func TestListCurrentProblemSourceRecognitionFactsExcludesInputDigestDrift(t *testing.T) {
@@ -519,6 +591,71 @@ func validProblemSourceRecognitionResult() k12storage.ProblemSourceRecognitionRe
 				ConfirmationReasons:       nil,
 			},
 		},
+	}
+}
+
+func recognitionV2PhysicalRefs(count int) []k12storage.ProblemSourceRecognitionPhysicalResultRef {
+	refs := make([]k12storage.ProblemSourceRecognitionPhysicalResultRef, 0, count)
+	if count == 0 {
+		return refs
+	}
+	planDigest := "sha256:" + strings.Repeat("a", 64)
+	exactSetDigest := "sha256:" + strings.Repeat("b", 64)
+	refs = append(refs, k12storage.ProblemSourceRecognitionPhysicalResultRef{
+		PhysicalInvocationID:   "recognition-v2-00-manifest",
+		PhysicalUnit:           "whole_page",
+		RecognitionPlanVersion: k12.RecognitionPlanVersionV2,
+		PlanDigest:             planDigest,
+		ResultDigest:           strings.Repeat("1", 64),
+	})
+	for ordinal := 1; len(refs) < count && ordinal <= 8; ordinal++ {
+		refs = append(refs, k12storage.ProblemSourceRecognitionPhysicalResultRef{
+			PhysicalInvocationID:    fmt.Sprintf("recognition-v2-01-batch-%02d", ordinal),
+			PhysicalUnit:            fmt.Sprintf("layout_batch_%04d", ordinal),
+			RecognitionPlanVersion:  k12.RecognitionPlanVersionV2,
+			PlanDigest:              planDigest,
+			CandidateExactSetDigest: exactSetDigest,
+			ResultDigest:            strings.Repeat(fmt.Sprintf("%x", ordinal%16), 64),
+		})
+	}
+	for ordinal := 1; len(refs) < count; ordinal++ {
+		refs = append(refs, k12storage.ProblemSourceRecognitionPhysicalResultRef{
+			PhysicalInvocationID:    fmt.Sprintf("recognition-v2-02-repair-%02d", ordinal),
+			PhysicalUnit:            fmt.Sprintf("layout_repair_%04d", ordinal),
+			RecognitionPlanVersion:  k12.RecognitionPlanVersionV2,
+			PlanDigest:              planDigest,
+			CandidateExactSetDigest: exactSetDigest,
+			ResultDigest:            strings.Repeat(fmt.Sprintf("%x", (ordinal+8)%16), 64),
+		})
+	}
+	return refs
+}
+
+func seedRecognitionV2PhysicalChildren(
+	t *testing.T,
+	db *sql.DB,
+	result k12storage.ProblemSourceRecognitionResult,
+) {
+	t.Helper()
+	if _, err := db.ExecContext(t.Context(), `DELETE FROM k12_model_physical_invocations WHERE parent_invocation_id=?`,
+		result.ParentInvocationID); err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range result.PhysicalResults {
+		if _, err := db.ExecContext(t.Context(), `INSERT INTO k12_model_physical_invocations (
+			physical_invocation_id,parent_invocation_id,agent_name,job_id,stage,physical_unit,
+			request_digest,route_snapshot_json,request_policy_snapshot_json,status,attempt,
+			result_digest,result_content,external_request_id,failure_kind,created_at,updated_at,
+			recognition_plan_version,plan_digest,candidate_exact_set_digest
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			ref.PhysicalInvocationID, result.ParentInvocationID, "mingming", recognitionJob,
+			"recognizing", ref.PhysicalUnit, "sha256:"+strings.Repeat("e", 64),
+			`{"provider":"openai","model":"gpt-5.6-sol","route":"cloud"}`, `{}`,
+			"succeeded", 1, ref.ResultDigest, `{}`, "", "", 100, 100, "v2",
+			ref.PlanDigest, ref.CandidateExactSetDigest,
+		); err != nil {
+			t.Fatalf("seed v2 physical child %s: %v", ref.PhysicalInvocationID, err)
+		}
 	}
 }
 

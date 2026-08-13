@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/hexagon-codes/ai-core/llm"
+
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -70,6 +71,38 @@ func resolveK12PracticeModelSnapshot(
 		Capability: config.LLMModelCapabilityText,
 		TimeoutMS:  60_000,
 	}, nil
+}
+
+// resolveK12FrozenTextCompletionRoute 是 K12 文本回调的数据平面唯一解析器，
+// 这些回调可能从已确认的 GradingJob 中运行。冻结的 Job 路由具有权威性；
+// 只有不带该上下文的调用方才保留原有的配置默认行为。
+func resolveK12FrozenTextCompletionRoute(
+	ctx context.Context,
+	router *llmrouter.Selector,
+	operation string,
+) (llm.Provider, string, error) {
+	if router == nil {
+		return nil, "", fmt.Errorf("%s: LLM router is not initialized", operation)
+	}
+	if snapshot, pinned := k12.GradingModelSnapshotFromContext(ctx); pinned {
+		provider, found := router.Get(snapshot.Provider)
+		if !found || provider == nil {
+			return nil, "", fmt.Errorf(
+				"K12 GradingJob frozen provider %q is unavailable; cross-route fallback is refused",
+				snapshot.Provider,
+			)
+		}
+		if err := k12.ValidateGradingModelRoute(ctx, snapshot.Provider, snapshot.Model); err != nil {
+			return nil, "", err
+		}
+		return provider, snapshot.Model, nil
+	}
+
+	provider := router.Default()
+	if provider == nil {
+		return nil, "", fmt.Errorf("%s: no default LLM provider is available", operation)
+	}
+	return provider, "", nil
 }
 
 // k12VisionRequestMetadata translates the typed, stage-scoped semantic policy

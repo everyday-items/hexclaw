@@ -43,16 +43,16 @@ func (o *GradingOrchestrator) finalizeGradingPage(
 	if err != nil {
 		return k12.GradingFinalArtifact{}, err
 	}
-	if err := o.requireTerminalGradingOperations(
-		ctx, job.Record.AgentName, job.Record.RecordID,
-	); err != nil {
-		return k12.GradingFinalArtifact{}, err
-	}
 	assessments, err := o.deps.Records.ListGradingAssessmentItems(
 		ctx, job.Record.AgentName, job.Record.RecordID,
 	)
 	if err != nil {
 		return k12.GradingFinalArtifact{}, err
+	}
+	if terminalErr := o.requireTerminalGradingOperations(
+		ctx, job.Record.AgentName, job.Record.RecordID, assessments,
+	); terminalErr != nil {
+		return k12.GradingFinalArtifact{}, terminalErr
 	}
 	skips, err := o.deps.Records.ListCurrentProblemSkipReceipts(
 		ctx, job.Record.AgentName, job.Record.RecordID,
@@ -209,10 +209,19 @@ func (o *GradingOrchestrator) finalizeGradingPage(
 func (o *GradingOrchestrator) requireTerminalGradingOperations(
 	ctx context.Context,
 	agentName, jobID string,
+	assessments []k12.GradingAssessmentItem,
 ) error {
 	invocations, err := o.deps.Records.ListGradingItemInvocations(ctx, agentName, jobID)
 	if err != nil {
 		return err
+	}
+	invocationByID := make(map[string]k12.GradingItemInvocation, len(invocations))
+	for _, invocation := range invocations {
+		invocationByID[invocation.InvocationID] = invocation
+	}
+	assessmentByProblem := make(map[string]k12.GradingAssessmentItem, len(assessments))
+	for _, assessment := range assessments {
+		assessmentByProblem[assessment.ProblemID] = assessment
 	}
 	type logicalOperation struct {
 		problemID     string
@@ -233,6 +242,13 @@ func (o *GradingOrchestrator) requireTerminalGradingOperations(
 	for _, invocation := range latest {
 		switch invocation.Status {
 		case k12.ModelInvocationSucceeded, k12.ModelInvocationReconciled:
+		case k12.ModelInvocationFailed, k12.ModelInvocationOutcomeUnknown:
+			if gradingOperationSupersededByCurrentAssessment(
+				invocation, assessmentByProblem[invocation.ProblemID], invocationByID,
+			) {
+				continue
+			}
+			fallthrough
 		default:
 			return fmt.Errorf(
 				"%w: problem %s operation %s remains %s",
@@ -244,6 +260,41 @@ func (o *GradingOrchestrator) requireTerminalGradingOperations(
 		}
 	}
 	return nil
+}
+
+func gradingOperationSupersededByCurrentAssessment(
+	invocation k12.GradingItemInvocation,
+	assessment k12.GradingAssessmentItem,
+	invocationByID map[string]k12.GradingItemInvocation,
+) bool {
+	if assessment.CurrentDisposition != k12.GradingAssessmentDispositionCurrent ||
+		assessment.AgentName != invocation.AgentName ||
+		assessment.JobID != invocation.JobID ||
+		assessment.ProblemID != invocation.ProblemID ||
+		assessment.AttemptID != invocation.AttemptID {
+		return false
+	}
+	referenceID := ""
+	switch invocation.Operation {
+	case k12.GradingItemOperationSolve,
+		k12.GradingItemOperationSolveGenerate,
+		k12.GradingItemOperationSolveVerify:
+		referenceID = assessment.SolveInvocationID
+	case k12.GradingItemOperationGrade:
+		referenceID = assessment.GradeInvocationID
+	case k12.GradingItemOperationParentGuide:
+		referenceID = assessment.ParentGuideInvocationID
+	}
+	reference, ok := invocationByID[referenceID]
+	return ok &&
+		reference.InvocationID != invocation.InvocationID &&
+		reference.AgentName == invocation.AgentName &&
+		reference.JobID == invocation.JobID &&
+		reference.ProblemID == invocation.ProblemID &&
+		reference.AttemptID == invocation.AttemptID &&
+		reference.Operation == invocation.Operation &&
+		reference.OperationAttempt > invocation.OperationAttempt &&
+		reference.Status == k12.ModelInvocationSucceeded
 }
 
 func mergeFinalStructureVersion(current, candidate int) (int, error) {
@@ -480,6 +531,32 @@ func renderCanonicalGradingFinal(
 ) string {
 	var out strings.Builder
 	out.WriteString("# 作业批改结果\n\n")
+	correctCount, processIssueCount, wrongCount := 0, 0, 0
+	for _, entry := range entries {
+		if entry.assessment == nil {
+			continue
+		}
+		switch entry.assessment.Status {
+		case k12.GradingAssessmentCorrect:
+			correctCount++
+		case k12.GradingAssessmentProcessIssue:
+			processIssueCount++
+		case k12.GradingAssessmentWrong:
+			wrongCount++
+		}
+	}
+	if processIssueCount > 0 {
+		out.WriteString("## Grading summary\n\n")
+		fmt.Fprintf(
+			&out,
+			"This run determined **%d** questions: **%d correct / %d with process issues / %d requiring correction**.\n\n"+
+				"> A process issue has a correct final answer and is not recorded as wrong.\n\n",
+			correctCount+processIssueCount+wrongCount,
+			correctCount,
+			processIssueCount,
+			wrongCount,
+		)
+	}
 	for _, entry := range entries {
 		label := RecognizedQuestionSourceDisplayLabel(entry.question)
 		if label == "" {
@@ -496,9 +573,14 @@ func renderCanonicalGradingFinal(
 			out.WriteString("**已跳过 · 未判断对错**\n\n")
 			continue
 		}
-		out.WriteString("**批改状态：** `")
-		out.WriteString(string(entry.assessment.Status))
-		out.WriteString("`\n\n")
+		if entry.assessment.Status == k12.GradingAssessmentProcessIssue {
+			out.WriteString("**Grading status:** ⚠ Process issue (final answer correct; not recorded as wrong) · `correct_with_process_issue`\n\n")
+			writeCanonicalProcessIssueDetails(&out, entry.assessment.ResultJSON)
+		} else {
+			out.WriteString("**Grading status:** `")
+			out.WriteString(string(entry.assessment.Status))
+			out.WriteString("`\n\n")
+		}
 		var indented bytes.Buffer
 		if json.Indent(&indented, []byte(entry.assessment.ResultJSON), "", "  ") == nil {
 			out.WriteString("```json\n")
@@ -522,6 +604,28 @@ func renderCanonicalGradingFinal(
 		}
 	}
 	return strings.TrimSpace(out.String())
+}
+
+func writeCanonicalProcessIssueDetails(out *strings.Builder, resultJSON string) {
+	var item PhotoGradeItem
+	if json.Unmarshal([]byte(resultJSON), &item) != nil || item.Status != PhotoCorrectWithProcessIssue {
+		return
+	}
+	if wrongStep := strings.TrimSpace(item.Grade.Outcome.WrongStep); wrongStep != "" {
+		out.WriteString("**Process note:** ")
+		out.WriteString(photoInline(wrongStep, 300))
+		out.WriteString("\n\n")
+	}
+	if cause := strings.TrimSpace(item.Grade.Outcome.ErrorCause); cause != "" {
+		out.WriteString("**Cause:** ")
+		out.WriteString(photoInline(cause, 300))
+		out.WriteString("\n\n")
+	}
+	if item.ParentGuide != nil {
+		out.WriteString("### How the parent can explain it\n\n")
+		writeParentTeachingGuideMarkdown(out, *item.ParentGuide)
+		out.WriteString("\n\n")
+	}
 }
 
 func gradingFinalArtifactDigest(artifact k12.GradingFinalArtifact) string {

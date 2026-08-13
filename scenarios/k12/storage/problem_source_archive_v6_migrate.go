@@ -295,7 +295,9 @@ func MigrateProblemSourceArchiveV6Owner(
 			"physical-request", targetAgent,
 			oldRequestDigest+"\x00"+item.ParentInvocationID+"\x00"+item.PhysicalInvocationID,
 		)
-		item.Status = k12.ModelInvocationReconciled
+		if item.Status != k12.ModelInvocationSucceeded {
+			item.Status = k12.ModelInvocationReconciled
+		}
 		item.ExternalRequestID = ""
 		item.FailureKind = ""
 	}

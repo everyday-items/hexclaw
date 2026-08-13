@@ -29,7 +29,7 @@ func a01BundleBody(t *testing.T, key string) string {
 }
 
 func TestBUG20260726034A01ProfileBundlePersistsAgentConfigAndReplaysAtomically(t *testing.T) {
-	h, deps, _ := newWeeklyContractServer(t)
+	h, deps, _ := newWeeklyBundleContractServer(t)
 	body := a01BundleBody(t, "a01-success")
 	rec, out := do(t, h, http.MethodPut, "/profile-bundle", body)
 	if rec.Code != http.StatusOK {
@@ -89,7 +89,7 @@ func TestBUG20260726034A01ProfileBundlePersistsAgentConfigAndReplaysAtomically(t
 }
 
 func TestBUG20260726034A01ProfileBundleFailureRollsBackAgentAndK12State(t *testing.T) {
-	h, deps, _ := newWeeklyContractServer(t)
+	h, deps, _ := newWeeklyBundleContractServer(t)
 	db := deps.Records.DB()
 	if _, err := db.Exec(`UPDATE agents SET display_name='旧名称',
 		description='旧描述',system_prompt='旧人设',provider='',model='',skills='["old-skill"]'

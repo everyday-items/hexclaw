@@ -30,16 +30,18 @@ type workFeedbackGenerationDTO struct {
 }
 
 type creativeWorkDTO struct {
-	WorkID          string                     `json:"work_id"`
-	WorkType        string                     `json:"work_type"`
-	DisplayName     string                     `json:"display_name"`
-	WorkTitle       string                     `json:"work_title,omitempty"`
-	ContentMarkdown string                     `json:"content_markdown,omitempty"`
-	SourceAssetID   string                     `json:"source_asset_id,omitempty"`
-	RowVersion      int                        `json:"row_version"`
-	InitialFeedback *workFeedbackGenerationDTO `json:"initial_feedback,omitempty"`
-	LatestFeedback  *workFeedbackGenerationDTO `json:"latest_feedback,omitempty"`
-	DeliveryBatchID string                     `json:"delivery_batch_id,omitempty"`
+	WorkID             string                     `json:"work_id"`
+	WorkType           string                     `json:"work_type"`
+	DisplayName        string                     `json:"display_name"`
+	WorkTitle          string                     `json:"work_title,omitempty"`
+	ContentMarkdown    string                     `json:"content_markdown,omitempty"`
+	SourceAssetID      string                     `json:"source_asset_id,omitempty"`
+	RowVersion         int                        `json:"row_version"`
+	InitialFeedback    *workFeedbackGenerationDTO `json:"initial_feedback,omitempty"`
+	LatestFeedback     *workFeedbackGenerationDTO `json:"latest_feedback,omitempty"`
+	DeliveryBatchID    string                     `json:"delivery_batch_id,omitempty"`
+	CreatedAt          int64                      `json:"created_at"`
+	LatestGenerationAt *int64                     `json:"latest_generation_at"`
 }
 
 func feedbackGenerationDTO(
@@ -100,13 +102,23 @@ func toCreativeWorkDTO(v usecase.CreativeWorkView) creativeWorkDTO {
 	if workTitle == "" {
 		workTitle = v.Fields.WorkTitle
 	}
+	var latestGenerationAt *int64
+	if latest := v.GenerationState.Latest; latest != nil && latest.Status == k12.WorkFeedbackSucceeded {
+		completedAt := latest.UpdatedAt
+		latestGenerationAt = &completedAt
+	} else if initial := v.GenerationState.Initial; initial != nil && initial.Status == k12.WorkFeedbackSucceeded {
+		completedAt := initial.UpdatedAt
+		latestGenerationAt = &completedAt
+	}
 	return creativeWorkDTO{
 		WorkID: v.Record.RecordID, WorkType: v.Fields.WorkType,
 		DisplayName: displayName, WorkTitle: workTitle,
 		ContentMarkdown: source.ContentMarkdown, SourceAssetID: source.SourceAssetID,
-		RowVersion:      v.GenerationState.RowVersion,
-		InitialFeedback: feedbackGenerationDTO(v.GenerationState.Initial),
-		LatestFeedback:  feedbackGenerationDTO(v.GenerationState.Latest),
+		RowVersion:         v.GenerationState.RowVersion,
+		InitialFeedback:    feedbackGenerationDTO(v.GenerationState.Initial),
+		LatestFeedback:     feedbackGenerationDTO(v.GenerationState.Latest),
+		CreatedAt:          v.Record.CreatedAt,
+		LatestGenerationAt: latestGenerationAt,
 	}
 }
 

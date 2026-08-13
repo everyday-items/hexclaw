@@ -23,6 +23,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
+	basestorage "github.com/hexagon-codes/hexclaw/storage"
 	sqlitestore "github.com/hexagon-codes/hexclaw/storage/sqlite"
 )
 
@@ -244,6 +245,349 @@ func TestCLIStartWritesOnlyOpaqueAtomicManifestAndCleanupIsIdempotent(t *testing
 	assertDispatchesGone(t, storePath, manifest)
 }
 
+// K12-LIVE-RECOGNITION-PLAN-V2-EVIDENCE-20260809-001：导出已停止的识别回执后，
+// 清理操作必须先停用声明中精确指定的来源会话，再拆除独立持有的测试夹具。
+func TestK12LiveRecognitionPlanV2ClaimAwareCleanupRetiresSourceSessionAndIsIdempotent(t *testing.T) {
+	fixture := newRecognitionV2EvidenceFixture(t, true)
+	seedRecognitionV2ClaimSourceSession(t, fixture)
+
+	cleanupArgs := []string{
+		"cleanup",
+		"--profile", fixture.profile,
+		"--store", fixture.storePath,
+		"--manifest", fixture.manifestPath,
+		"--claim", fixture.claimPath,
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		stdout, stderr, err := executeCLI(cleanupArgs)
+		if err != nil {
+			t.Fatalf("claim-aware cleanup attempt %d: %v\nstderr=%s", attempt, err, stderr)
+		}
+		for _, opaque := range []string{
+			fixture.targetAgent,
+			fixture.dispatchID,
+			fixture.sessionID,
+			fixture.submissionID,
+			fixture.jobID,
+			fixture.parentID,
+		} {
+			if strings.Contains(stdout+stderr, opaque) {
+				t.Fatalf("claim-aware cleanup output leaked opaque identity on attempt %d", attempt)
+			}
+		}
+	}
+
+	assertSourceSessionStatus(t, fixture.storePath, fixture.sessionID, -1)
+	assertDispatchesGone(t, fixture.storePath, fixture.manifest)
+}
+
+func TestK12LiveRecognitionPlanV2ClaimAwareCleanupRejectsUntrustedAuthorityWithoutWrites(t *testing.T) {
+	tests := []struct {
+		name     string
+		finalize bool
+		mutate   func(*testing.T, recognitionV2EvidenceFixture)
+	}{
+		{
+			name:     "claim mismatch",
+			finalize: true,
+			mutate: func(t *testing.T, fixture recognitionV2EvidenceFixture) {
+				writeRecognitionV2EvidenceClaim(
+					t,
+					fixture,
+					fixture.targetAgent,
+					"different-session",
+					fixture.sourceDigest,
+				)
+			},
+		},
+		{
+			name:     "non-finalized V2 plan",
+			finalize: false,
+			mutate:   func(*testing.T, recognitionV2EvidenceFixture) {},
+		},
+		{
+			name:     "legacy V1 physical child",
+			finalize: true,
+			mutate: func(t *testing.T, fixture recognitionV2EvidenceFixture) {
+				mutateRecognitionV2EvidenceStore(
+					t,
+					fixture.storePath,
+					`INSERT INTO k12_model_physical_invocations (
+						physical_invocation_id,parent_invocation_id,agent_name,job_id,stage,
+						physical_unit,request_digest,route_snapshot_json,request_policy_snapshot_json,
+						status,attempt,result_digest,result_content,external_request_id,failure_kind,
+						created_at,updated_at,recognition_plan_version,plan_digest,
+						candidate_exact_set_digest
+					) SELECT ?,parent_invocation_id,agent_name,job_id,stage,
+						'segment_1','sha256:v1-private',route_snapshot_json,
+						request_policy_snapshot_json,status,attempt,result_digest,result_content,
+						external_request_id,failure_kind,created_at,updated_at,'v1','',''
+					FROM k12_model_physical_invocations WHERE physical_invocation_id=?`,
+					"v1-cleanup-child-private",
+					fixture.physicalIDs[0],
+				)
+			},
+		},
+		{
+			name:     "multiple recognizing parents",
+			finalize: true,
+			mutate: func(t *testing.T, fixture recognitionV2EvidenceFixture) {
+				mutateRecognitionV2EvidenceStore(
+					t,
+					fixture.storePath,
+					`INSERT INTO k12_model_invocations (
+						invocation_id,agent_name,job_id,stage,request_digest,provider,model,
+						route_snapshot_json,request_policy_snapshot_json,provider_idempotency_key,
+						status,attempt,result_digest,result_json,external_request_id,failure_kind,
+						created_at,updated_at
+					) SELECT ?,agent_name,job_id,stage,request_digest,provider,model,
+						route_snapshot_json,request_policy_snapshot_json,provider_idempotency_key,
+						status,2,result_digest,result_json,external_request_id,failure_kind,
+						created_at,updated_at
+					FROM k12_model_invocations WHERE invocation_id=?`,
+					"second-cleanup-parent-private",
+					fixture.parentID,
+				)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRecognitionV2EvidenceFixture(t, test.finalize)
+			seedRecognitionV2ClaimSourceSession(t, fixture)
+			test.mutate(t, fixture)
+
+			stdout, stderr, err := executeCLI([]string{
+				"cleanup",
+				"--profile", fixture.profile,
+				"--store", fixture.storePath,
+				"--manifest", fixture.manifestPath,
+				"--claim", fixture.claimPath,
+			})
+			if err == nil {
+				t.Fatalf("untrusted claim authority unexpectedly cleaned state: %s", stdout)
+			}
+			if stdout != "" {
+				t.Fatalf("failed claim-aware cleanup emitted a receipt: %s", stdout)
+			}
+			assertSourceSessionStatus(t, fixture.storePath, fixture.sessionID, 1)
+			assertFixtureSurvives(t, fixture)
+			combined := stdout + stderr + err.Error()
+			for _, opaque := range []string{
+				fixture.targetAgent,
+				fixture.dispatchID,
+				fixture.sessionID,
+				fixture.submissionID,
+				fixture.jobID,
+				fixture.parentID,
+			} {
+				if strings.Contains(combined, opaque) {
+					t.Fatalf("failed claim-aware cleanup leaked an opaque identity")
+				}
+			}
+		})
+	}
+}
+
+func TestK12LiveRecognitionPlanV2ClaimAwareCleanupUsesOneOpenedClaimSnapshot(t *testing.T) {
+	fixture := newRecognitionV2EvidenceFixture(t, true)
+	seedRecognitionV2ClaimSourceSession(t, fixture)
+	replacementPath := filepath.Join(fixture.profile, "replacement-cleanup-claim.json")
+	if err := os.WriteFile(replacementPath, []byte(`{"schema_version":999}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	openedPath := filepath.Join(fixture.profile, "opened-cleanup-claim.json")
+	previousHook := recognitionV2PrivateSnapshotOpenedHook
+	recognitionV2PrivateSnapshotOpenedHook = func(path string) {
+		if path != fixture.claimPath {
+			return
+		}
+		if err := os.Rename(path, openedPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(replacementPath, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { recognitionV2PrivateSnapshotOpenedHook = previousHook })
+
+	if stdout, stderr, err := executeCLI([]string{
+		"cleanup",
+		"--profile", fixture.profile,
+		"--store", fixture.storePath,
+		"--manifest", fixture.manifestPath,
+		"--claim", fixture.claimPath,
+	}); err != nil {
+		t.Fatalf("cleanup followed a replaced claim path: %v\nstdout=%s\nstderr=%s", err, stdout, stderr)
+	}
+	assertSourceSessionStatus(t, fixture.storePath, fixture.sessionID, -1)
+	assertDispatchesGone(t, fixture.storePath, fixture.manifest)
+}
+
+func TestK12LiveRecognitionPlanV2ClaimAwareCleanupRejectsIncompletePriorCleanup(t *testing.T) {
+	fixture := newRecognitionV2EvidenceFixture(t, true)
+	seedRecognitionV2ClaimSourceSession(t, fixture)
+	store, err := sqlitestore.New(fixture.storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.DB().SetMaxOpenConns(1)
+	if _, err := store.DB().ExecContext(context.Background(), `PRAGMA foreign_keys=OFF`); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(
+		context.Background(),
+		`UPDATE sessions SET status=-1 WHERE id=?`,
+		fixture.sessionID,
+	); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(
+		context.Background(),
+		`DELETE FROM agents WHERE name=?`,
+		fixture.manifest.AgentName,
+	); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(fixture.storePath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertFixtureDispatchCount(t, fixture, 2)
+
+	stdout, _, err := executeCLI([]string{
+		"cleanup",
+		"--profile", fixture.profile,
+		"--store", fixture.storePath,
+		"--manifest", fixture.manifestPath,
+		"--claim", fixture.claimPath,
+	})
+	if err == nil {
+		t.Fatalf("incomplete prior cleanup unexpectedly passed: %s", stdout)
+	}
+	if stdout != "" {
+		t.Fatalf("incomplete prior cleanup emitted a receipt: %s", stdout)
+	}
+	assertSourceSessionStatus(t, fixture.storePath, fixture.sessionID, -1)
+	assertFixtureDispatchCount(t, fixture, 2)
+}
+
+func seedRecognitionV2ClaimSourceSession(t *testing.T, fixture recognitionV2EvidenceFixture) {
+	t.Helper()
+	store, err := sqlitestore.New(fixture.storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Init(context.Background()); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.CreateSession(context.Background(), &basestorage.Session{
+		ID:       fixture.sessionID,
+		UserID:   "private-user",
+		Platform: "desktop",
+		Title:    "private source session",
+	}); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(fixture.storePath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertSourceSessionStatus(t *testing.T, storePath, sessionID string, want int) {
+	t.Helper()
+	store, err := sqlitestore.New(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	var got int
+	if err := store.DB().QueryRowContext(
+		context.Background(),
+		`SELECT status FROM sessions WHERE id=?`,
+		sessionID,
+	).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("source session status=%d, want %d", got, want)
+	}
+}
+
+func assertFixtureSurvives(t *testing.T, fixture recognitionV2EvidenceFixture) {
+	t.Helper()
+	store, err := sqlitestore.New(fixture.storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	registry := scenario.NewRegistry()
+	if err := registry.Assemble(k12.Pack(k12.NewCurriculumStub())); err != nil {
+		t.Fatal(err)
+	}
+	records := k12storage.NewStore(store.DB(), registry.Records)
+	for _, dispatchID := range []string{
+		fixture.manifest.RetryableDispatchID,
+		fixture.manifest.OutcomeUnknownDispatchID,
+	} {
+		if _, err := records.GetImageTaskDispatch(
+			context.Background(),
+			fixture.manifest.AgentName,
+			dispatchID,
+		); err != nil {
+			t.Fatalf("fixture dispatch was changed by rejected cleanup: %v", err)
+		}
+	}
+	var agentCount int
+	if err := store.DB().QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM agents WHERE name=?`,
+		fixture.manifest.AgentName,
+	).Scan(&agentCount); err != nil {
+		t.Fatal(err)
+	}
+	if agentCount != 1 {
+		t.Fatalf("fixture agent count=%d after rejected cleanup, want 1", agentCount)
+	}
+}
+
+func assertFixtureDispatchCount(
+	t *testing.T,
+	fixture recognitionV2EvidenceFixture,
+	want int,
+) {
+	t.Helper()
+	store, err := sqlitestore.New(fixture.storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	var got int
+	if err := store.DB().QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM k12_image_task_dispatches
+		 WHERE agent_name=? AND dispatch_id IN (?,?)`,
+		fixture.manifest.AgentName,
+		fixture.manifest.RetryableDispatchID,
+		fixture.manifest.OutcomeUnknownDispatchID,
+	).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("fixture dispatch count=%d, want %d", got, want)
+	}
+}
+
 func TestBUG20260802CLIStartPersistsPublicK12ProfileGradeTerm(t *testing.T) {
 	profile, storePath, manifestPath := newIsolatedCLIStore(t)
 	_, stderr, err := executeCLI(startArguments(
@@ -285,6 +629,55 @@ func TestBUG20260802CLIStartPersistsPublicK12ProfileGradeTerm(t *testing.T) {
 		return
 	}
 	t.Fatal("fixture agent was not persisted")
+}
+
+func TestPublishManifestNoReplace(t *testing.T) {
+	t.Run("publishes a complete staging file when target is absent", func(t *testing.T) {
+		dir := t.TempDir()
+		staging := filepath.Join(dir, ".fixture-manifest-staging")
+		target := filepath.Join(dir, "fixture-manifest.json")
+		want := []byte(`{"schema_version":1}`)
+		if err := os.WriteFile(staging, want, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := publishManifestNoReplace(staging, target); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+		got, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("published bytes=%q, want %q", got, want)
+		}
+		if _, err := os.Lstat(staging); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("staging file survived publish: %v", err)
+		}
+	})
+
+	t.Run("does not overwrite a target created after the preflight check", func(t *testing.T) {
+		dir := t.TempDir()
+		staging := filepath.Join(dir, ".fixture-manifest-staging")
+		target := filepath.Join(dir, "fixture-manifest.json")
+		if err := os.WriteFile(staging, []byte("new manifest"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte("caller-owned"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := publishManifestNoReplace(staging, target); err == nil {
+			t.Fatal("publish unexpectedly replaced a concurrently created target")
+		}
+		got, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != "caller-owned" {
+			t.Fatalf("target bytes=%q, want caller-owned", got)
+		}
+	})
 }
 
 func TestCLIFailsClosedBeforeStoreOpenForUnsafePathLockAndManifest(t *testing.T) {
@@ -482,7 +875,7 @@ func TestPrepareProfileBuildsPrivateExactModelConfigWithoutPlatformCarryover(t *
 	if err := config.Save(source, sourcePath); err != nil {
 		t.Fatal(err)
 	}
-	policy := []byte(`{"policy_version":1,"queued_seconds":600,"normalizing_seconds":600,"recognizing_seconds":600,"locating_seconds":600,"rendering_seconds":600,"projecting_seconds":600,"assessing_buckets":[{"max_problems":1,"seconds":600},{"max_problems":8,"seconds":600},{"max_problems":16,"seconds":600},{"max_problems":32,"seconds":600}],"item_concurrency":1}`)
+	policy := []byte(`{"policy_version":1,"queued_seconds":600,"normalizing_seconds":600,"recognizing_seconds":600,"locating_seconds":600,"rendering_seconds":600,"projecting_seconds":600,"recognition_plan_version":1,"assessing_buckets":[{"max_problems":1,"seconds":600},{"max_problems":8,"seconds":600},{"max_problems":16,"seconds":600},{"max_problems":32,"seconds":600}],"item_concurrency":1}`)
 	if err := os.WriteFile(candidatePolicyPath, policy, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -560,7 +953,7 @@ func TestPrepareProfileFailsClosedForUnsafeInputsAndExistingTarget(t *testing.T)
 		if err := config.Save(source, sourcePath); err != nil {
 			t.Fatal(err)
 		}
-		policy := []byte(`{"policy_version":1,"queued_seconds":600,"normalizing_seconds":600,"recognizing_seconds":600,"locating_seconds":600,"rendering_seconds":600,"projecting_seconds":600,"assessing_buckets":[{"max_problems":1,"seconds":600},{"max_problems":8,"seconds":600},{"max_problems":16,"seconds":600},{"max_problems":32,"seconds":600}],"item_concurrency":1}`)
+		policy := []byte(`{"policy_version":1,"queued_seconds":600,"normalizing_seconds":600,"recognizing_seconds":600,"locating_seconds":600,"rendering_seconds":600,"projecting_seconds":600,"recognition_plan_version":1,"assessing_buckets":[{"max_problems":1,"seconds":600},{"max_problems":8,"seconds":600},{"max_problems":16,"seconds":600},{"max_problems":32,"seconds":600}],"item_concurrency":1}`)
 		if err := os.WriteFile(candidatePolicyPath, policy, 0o600); err != nil {
 			t.Fatal(err)
 		}

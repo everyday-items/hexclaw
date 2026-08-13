@@ -104,7 +104,8 @@ func newOrchestrator(t *testing.T, rec Recognizer, anchorer AnswerAnchorer, anno
 
 func orchestratorTestBudget() k12.GradingBudgetSnapshot {
 	return k12.GradingBudgetSnapshot{
-		PolicyVersion: 1,
+		PolicyVersion:          1,
+		RecognitionPlanVersion: k12.RecognitionPlanVersionV1,
 		StageSeconds: k12.GradingStageBudgets{
 			Queued: 60, Normalizing: 60, Recognizing: 120,
 			Locating: 60, Rendering: 60, Projecting: 60,

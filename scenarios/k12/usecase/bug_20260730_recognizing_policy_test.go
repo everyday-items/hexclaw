@@ -40,7 +40,7 @@ func (r *dd036PolicyRecognizer) Recognize(
 		return nil, ErrInvalidInput
 	}
 	requestPolicy, ok := k12.GradingModelRequestPolicyFromContext(ctx)
-	if !ok || requestPolicy != k12.ApprovedRecognizingRequestPolicy() {
+	if !ok || !requestPolicy.IsApprovedRecognizing() {
 		return nil, ErrInvalidInput
 	}
 	raw, err := json.Marshal(snapshot)

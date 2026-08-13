@@ -74,6 +74,7 @@ type GradingAssessmentStatus string
 
 const (
 	GradingAssessmentCorrect       GradingAssessmentStatus = "correct"
+	GradingAssessmentProcessIssue  GradingAssessmentStatus = "correct_with_process_issue"
 	GradingAssessmentWrong         GradingAssessmentStatus = "wrong"
 	GradingAssessmentUnanswered    GradingAssessmentStatus = "unanswered"
 	GradingAssessmentAnswerUnclear GradingAssessmentStatus = "answer_unclear"
@@ -84,7 +85,7 @@ const (
 
 func (s GradingAssessmentStatus) Valid() bool {
 	switch s {
-	case GradingAssessmentCorrect, GradingAssessmentWrong, GradingAssessmentUnanswered,
+	case GradingAssessmentCorrect, GradingAssessmentProcessIssue, GradingAssessmentWrong, GradingAssessmentUnanswered,
 		GradingAssessmentAnswerUnclear, GradingAssessmentBlankSolved,
 		GradingAssessmentOutOfScope, GradingAssessmentUntrusted:
 		return true
@@ -150,7 +151,7 @@ func (v *GradingAssessmentItem) Validate() error {
 		return fmt.Errorf("grading assessment item missing owner/job/problem/attempt/version/digest/result/status")
 	}
 	switch v.Status {
-	case GradingAssessmentCorrect, GradingAssessmentWrong, GradingAssessmentUntrusted:
+	case GradingAssessmentCorrect, GradingAssessmentProcessIssue, GradingAssessmentWrong, GradingAssessmentUntrusted:
 		if v.SolveInvocationID == "" || v.GradeInvocationID == "" {
 			return fmt.Errorf("grading assessment %s requires solve and grade invocations", v.Status)
 		}
@@ -169,6 +170,7 @@ func (v *GradingAssessmentItem) Validate() error {
 	}
 	if v.ParentGuideInvocationID != "" &&
 		v.Status != GradingAssessmentWrong &&
+		v.Status != GradingAssessmentProcessIssue &&
 		v.Status != GradingAssessmentBlankSolved {
 		return fmt.Errorf("grading assessment %s must not claim a parent guide invocation", v.Status)
 	}
@@ -185,7 +187,7 @@ func (v GradingAssessmentItem) ValidateTerminalParentGuideReference() error {
 		return fmt.Errorf("%w: %v", ErrGradingAssessmentTerminalInvariant, err)
 	}
 	switch v.Status {
-	case GradingAssessmentWrong, GradingAssessmentBlankSolved:
+	case GradingAssessmentWrong, GradingAssessmentProcessIssue, GradingAssessmentBlankSolved:
 		if v.ParentGuideInvocationID == "" {
 			return fmt.Errorf(
 				"%w: grading assessment %s requires a succeeded parent guide reference",

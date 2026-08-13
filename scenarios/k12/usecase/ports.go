@@ -31,6 +31,21 @@ var ErrDeliveryQueryUnavailable = errors.New("delivery receipt cannot be queried
 // the TutorAgent currently has no active one-to-one IM binding.
 var ErrNoActiveDirectBindings = errors.New("no active direct delivery bindings")
 
+// ErrDeliveryBindingSnapshotConflict 表示乐观预期绑定前置条件不再匹配服务端持有的
+// 完整直连绑定快照。调用方必须重新解析应用绑定；失败命令不得创建投递账本记录，
+// 也不得触达提供方。
+var ErrDeliveryBindingSnapshotConflict = errors.New("delivery binding snapshot conflict")
+
+// ExpectedDeliveryBinding 是应用绑定投递命令接受的四字段乐观前置条件。
+// 它绝不选择接收方：服务端仍会解析权威的完整直连绑定集合，只在冻结批次前
+// 使用此值拒绝漂移。
+type ExpectedDeliveryBinding struct {
+	BindingID  string
+	Platform   string
+	InstanceID string
+	ChatID     string
+}
+
 // ResolvedDeliveryTarget is the immutable binding identity and normalized
 // direct target captured during a server-side binding-resolution pass.
 type ResolvedDeliveryTarget struct {
@@ -310,7 +325,19 @@ type AnswerAnchorer interface {
 type PhotoAnnotation struct {
 	BBox           BBox
 	QuestionNumber int
-	Correct        bool
+	// Status 是当前的类型化事实。Correct 仅为早于非二元批注标记的旧调用方保留。
+	Status  PhotoItemStatus
+	Correct bool
+}
+
+func (a PhotoAnnotation) EffectiveStatus() PhotoItemStatus {
+	if a.Status != "" {
+		return a.Status
+	}
+	if a.Correct {
+		return PhotoCorrect
+	}
+	return PhotoWrong
 }
 
 // RenderedPhoto 是平台无关的批改图产物。
@@ -319,7 +346,7 @@ type RenderedPhoto struct {
 	MIME string
 }
 
-// PhotoAnnotator 在原图上确定性绘制勾/叉。实现只负责像素合成，不参与识题和判分。
+// PhotoAnnotator 在原图上确定性绘制勾/叉/过程警示。实现只负责像素合成，不参与识题和判分。
 type PhotoAnnotator interface {
 	Annotate(ctx context.Context, image []byte, marks []PhotoAnnotation) (RenderedPhoto, error)
 }
@@ -374,10 +401,38 @@ type CauseSummarizer interface {
 // agree=答对、disagree=答错（仅 disagree 自动入错题本，§4.5「可自动进错题」列）；
 // 其余值（unverifiable/out_of_scope/verbatim）表示无二元结论，不判对错、不自动入错题。
 type GradeOutcome struct {
-	Verdict        Verdict
-	WrongStep      string
-	ErrorCause     string
-	KnowledgePoint string
+	Verdict Verdict
+	// FinalAnswerCorrect 是显式三态事实。nil 会逐字节保留旧回执；
+	// 当前批改器会写入 true/false。
+	FinalAnswerCorrect *bool `json:",omitempty"`
+	WrongStep          string
+	ErrorCause         string
+	KnowledgePoint     string
+}
+
+// AssessmentStatus 是从批改证据到持久化评估词汇的唯一映射。
+// 只有首个错误步骤及其原因均明确时，最终答案正确才会成为过程问题；
+// 否则标记为不可信，而不是猜测结论。
+func (o GradeOutcome) AssessmentStatus() k12.GradingAssessmentStatus {
+	switch o.Verdict {
+	case VerdictAgree:
+		if o.FinalAnswerCorrect != nil && !*o.FinalAnswerCorrect {
+			return k12.GradingAssessmentUntrusted
+		}
+		return k12.GradingAssessmentCorrect
+	case VerdictDisagree:
+		if o.FinalAnswerCorrect != nil && *o.FinalAnswerCorrect {
+			if strings.TrimSpace(o.WrongStep) != "" && strings.TrimSpace(o.ErrorCause) != "" {
+				return k12.GradingAssessmentProcessIssue
+			}
+			return k12.GradingAssessmentUntrusted
+		}
+		return k12.GradingAssessmentWrong
+	case VerdictOutOfScope:
+		return k12.GradingAssessmentOutOfScope
+	default:
+		return k12.GradingAssessmentUntrusted
+	}
 }
 
 // Grader 批改 port（adapter = engine/solve 的 grader 模式）。

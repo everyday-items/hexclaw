@@ -34,6 +34,7 @@ var inv012AllowedImportPrefixes = []string{
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/storage",      // 用例层 → 存储层
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/viewcontract", // BUG-20260802-022：仅标准库的 frozen wire schema leaf
 	"github.com/hexagon-codes/toolkit/util/idgen",                 // 存储层 ID 生成
+	"golang.org/x/image/webp",                                     // 领域层规范化页面需要注册 WebP 解码器
 }
 
 // inv012ForbiddenSubstrings 已知违规包的显式黑名单（防御纵深：白名单万一被误扩时，

@@ -510,7 +510,10 @@ func (creativeWorkMapper) attachChildren(ctx context.Context, q dbQueryer, recor
 
 type gradingJobMapper struct{}
 
-const gradingJobBudgetEnvelopeVersion = 1
+const (
+	gradingJobBudgetEnvelopeVersionV1 = 1
+	gradingJobBudgetEnvelopeVersion   = 2
+)
 
 // gradingJobBudgetEnvelope extends the existing JSON budget cell without a
 // schema migration. Legacy rows contain a bare GradingBudgetSnapshot; rows
@@ -522,6 +525,14 @@ type gradingJobBudgetEnvelope struct {
 	ParentAutomaticAttemptID        string                    `json:"parent_automatic_attempt_id"`
 	ParentAutomaticDeadlineAt       int64                     `json:"parent_automatic_deadline_at"`
 	ParentAutomaticRemainingSeconds int64                     `json:"parent_automatic_remaining_seconds"`
+}
+
+type gradingJobBudgetEnvelopeWire struct {
+	Version                         int             `json:"grading_job_budget_envelope_version"`
+	BudgetSnapshot                  json.RawMessage `json:"budget_snapshot"`
+	ParentAutomaticAttemptID        string          `json:"parent_automatic_attempt_id"`
+	ParentAutomaticDeadlineAt       int64           `json:"parent_automatic_deadline_at"`
+	ParentAutomaticRemainingSeconds int64           `json:"parent_automatic_remaining_seconds"`
 }
 
 func (gradingJobMapper) collection() string { return k12.CollectionGradingJob }
@@ -596,21 +607,34 @@ func (gradingJobMapper) newScan() ([]any, func() (string, error)) {
 				return "", fmt.Errorf("k12storage: inspect budget_snapshot: %w", err)
 			}
 			if discriminator.Version == 0 {
-				if err := json.Unmarshal([]byte(budgetJSON), &f.BudgetSnapshot); err != nil {
+				budget, err := k12.ParseStoredGradingBudgetSnapshot([]byte(budgetJSON))
+				if err != nil {
 					return "", fmt.Errorf("k12storage: unmarshal budget_snapshot: %w", err)
 				}
+				f.BudgetSnapshot = budget
 			} else {
-				if discriminator.Version != gradingJobBudgetEnvelopeVersion {
+				if discriminator.Version != gradingJobBudgetEnvelopeVersionV1 &&
+					discriminator.Version != gradingJobBudgetEnvelopeVersion {
 					return "", fmt.Errorf(
 						"k12storage: unsupported grading budget envelope version %d",
 						discriminator.Version,
 					)
 				}
-				var envelope gradingJobBudgetEnvelope
+				var envelope gradingJobBudgetEnvelopeWire
 				if err := json.Unmarshal([]byte(budgetJSON), &envelope); err != nil {
 					return "", fmt.Errorf("k12storage: unmarshal grading budget envelope: %w", err)
 				}
-				f.BudgetSnapshot = envelope.BudgetSnapshot
+				if discriminator.Version == gradingJobBudgetEnvelopeVersionV1 {
+					budget, err := k12.ParseStoredGradingBudgetSnapshot(envelope.BudgetSnapshot)
+					if err != nil {
+						return "", fmt.Errorf("k12storage: restore legacy grading budget envelope: %w", err)
+					}
+					f.BudgetSnapshot = budget
+				} else {
+					if err := json.Unmarshal(envelope.BudgetSnapshot, &f.BudgetSnapshot); err != nil {
+						return "", fmt.Errorf("k12storage: unmarshal grading budget envelope v2: %w", err)
+					}
+				}
 				f.ParentAutomaticAttemptID = envelope.ParentAutomaticAttemptID
 				f.ParentAutomaticDeadlineAt = envelope.ParentAutomaticDeadlineAt
 				f.ParentAutomaticRemainingSeconds = envelope.ParentAutomaticRemainingSeconds

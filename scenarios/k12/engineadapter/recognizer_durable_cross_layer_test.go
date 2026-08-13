@@ -50,6 +50,27 @@ const dd036CrossLayerQuestionJSON = `[
 	}
 ]`
 
+const dd036CrossLayerWholePageEnvelopeJSON = `{
+	"questions":[
+		{
+			"question":"1+1=",
+			"subject":"数学",
+			"answer_state":"blank",
+			"student_answer":"",
+			"recognition_confidence":0.99
+		}
+	],
+	"printed_inventory":[
+		{
+			"source_number_path":[],
+			"display_label":"",
+			"question":"1+1="
+		}
+	]
+}`
+
+const dd036CrossLayerWholePageEmptyEnvelopeJSON = `{"questions":[],"printed_inventory":[]}`
+
 type dd036CrossLayerVisionProbe struct {
 	store            *k12storage.Store
 	jobID            string
@@ -155,9 +176,9 @@ func (p *dd036CrossLayerVisionProbe) vision(
 
 	switch p.mode {
 	case dd036CrossLayerWholeValid:
-		return dd036CrossLayerQuestionJSON, nil
+		return dd036CrossLayerWholePageEnvelopeJSON, nil
 	case dd036CrossLayerWholeValidEmpty:
-		return `[]`, nil
+		return dd036CrossLayerWholePageEmptyEnvelopeJSON, nil
 	case dd036CrossLayerProtocolFallback:
 		if unit == k12.RecognitionPhysicalUnitWholePage {
 			return "not-json", nil
@@ -176,17 +197,20 @@ func (p *dd036CrossLayerVisionProbe) vision(
 		return `[]`, nil
 	case dd036CrossLayerDanglingChild:
 		if unit == k12.RecognitionPhysicalUnitWholePage {
-			return `[{
-				"problem_id":"dangling-child",
-				"problem_kind":"subproblem",
-				"parent_problem_id":"missing-parent",
-				"subproblem_no":"1",
-				"question":"1+1=",
-				"subject":"数学",
-				"answer_state":"blank",
-				"student_answer":"",
-				"recognition_confidence":0.99
-			}]`, nil
+			return `{
+				"questions":[{
+					"problem_id":"dangling-child",
+					"problem_kind":"subproblem",
+					"parent_problem_id":"missing-parent",
+					"subproblem_no":"1",
+					"question":"1+1=",
+					"subject":"数学",
+					"answer_state":"blank",
+					"student_answer":"",
+					"recognition_confidence":0.99
+				}],
+				"printed_inventory":[{"source_number_path":[],"display_label":"","question":"1+1="}]
+			}`, nil
 		}
 		if unit == k12.RecognitionPhysicalUnitSegment1 {
 			return dd036CrossLayerQuestionJSON, nil
@@ -214,15 +238,16 @@ func (p *dd036CrossLayerVisionProbe) vision(
 	case dd036CrossLayerTransportFailure:
 		return "", io.ErrUnexpectedEOF
 	case dd036CrossLayerTimeout:
-		<-ctx.Done()
-		return "", ctx.Err()
+		return "", context.DeadlineExceeded
 	case dd036CrossLayerCancel:
 		if p.cancelRun == nil {
 			return "", fmt.Errorf("cancel callback is not configured")
 		}
 		p.cancelRun()
-		<-ctx.Done()
-		return "", ctx.Err()
+		if err := ctx.Err(); err != nil {
+			p.addInvariantError("provider context was canceled by transient caller: %v", err)
+		}
+		return "", context.Canceled
 	default:
 		return "", fmt.Errorf("unsupported cross-layer mode %q", p.mode)
 	}
@@ -318,14 +343,7 @@ func newDD036CrossLayerHarness(
 		snapshot: snapshot,
 		mode:     mode,
 	}
-	now := time.Now()
-	frozenNow := now.Unix()
-	if mode == dd036CrossLayerTimeout || mode == dd036CrossLayerCancel {
-		// These cases must observe the durable stage deadline rather than a
-		// transient caller context. Freeze a legitimate nearly-expired stage so
-		// the terminal outcome is exercised in seconds, not by sleeping 120s.
-		frozenNow = now.Add(-114 * time.Second).Unix()
-	}
+	frozenNow := time.Now().Unix()
 	deps := usecase.Deps{
 		Recognizer: NewRecognizerAdapter(probe.vision, options...),
 		Records:    store,
@@ -591,7 +609,7 @@ func TestDD036GradingOrchestratorRecognizerAdapterDurablePhysicalCalls(t *testin
 				0,
 			)
 			if testCase.useCallerTimeout {
-				runCtx, cancelRun = context.WithTimeout(context.Background(), 5*time.Second)
+				runCtx, cancelRun = context.WithTimeout(context.Background(), time.Minute)
 			} else if testCase.useCallerCancel {
 				runCtx, cancelRun = context.WithCancel(context.Background())
 				harness.probe.cancelRun = cancelRun

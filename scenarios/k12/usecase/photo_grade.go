@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf8"
+
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
 // PhotoMode 是整页图片的单一分流结果：有任一真实作答就是批改卷；整页无作答才是空白解题卷。
@@ -55,14 +57,15 @@ const (
 type PhotoItemStatus string
 
 const (
-	PhotoCorrect       PhotoItemStatus = "correct"
-	PhotoWrong         PhotoItemStatus = "wrong"
-	PhotoUnanswered    PhotoItemStatus = "unanswered"
-	PhotoAnswerUnclear PhotoItemStatus = "answer_unclear"
-	PhotoBlankSolved   PhotoItemStatus = "blank_solved"
-	PhotoOutOfScope    PhotoItemStatus = "out_of_scope"
-	PhotoUntrusted     PhotoItemStatus = "untrusted"
-	PhotoFailed        PhotoItemStatus = "failed"
+	PhotoCorrect                 PhotoItemStatus = "correct"
+	PhotoCorrectWithProcessIssue PhotoItemStatus = "correct_with_process_issue"
+	PhotoWrong                   PhotoItemStatus = "wrong"
+	PhotoUnanswered              PhotoItemStatus = "unanswered"
+	PhotoAnswerUnclear           PhotoItemStatus = "answer_unclear"
+	PhotoBlankSolved             PhotoItemStatus = "blank_solved"
+	PhotoOutOfScope              PhotoItemStatus = "out_of_scope"
+	PhotoUntrusted               PhotoItemStatus = "untrusted"
+	PhotoFailed                  PhotoItemStatus = "failed"
 )
 
 type PhotoGradeRequest struct {
@@ -339,18 +342,7 @@ func (d Deps) assessPhotoItem(
 		if err != nil {
 			return item, err
 		}
-		switch {
-		case graded.OutOfScope:
-			item.Status = PhotoOutOfScope
-		case !photoEvidenceTrusted(graded.Evidence):
-			item.Status, item.Warning = PhotoUntrusted, "验算证据不足，暂不在图片上判对错"
-		case graded.Outcome.Verdict == VerdictAgree:
-			item.Status = PhotoCorrect
-		case graded.Outcome.Verdict == VerdictDisagree:
-			item.Status = PhotoWrong
-		default:
-			item.Status, item.Warning = PhotoUntrusted, "批改判定无二元结论，暂不在图片上判对错"
-		}
+		item.Status, item.Warning = photoAssessmentStatus(graded)
 		return item, nil
 	}
 
@@ -395,7 +387,7 @@ func photoTaskSemantics(mode PhotoMode) (PhotoTaskIntent, PhotoResultSurface) {
 
 func photoItemResultKind(status PhotoItemStatus) PhotoItemResultKind {
 	switch status {
-	case PhotoCorrect, PhotoWrong:
+	case PhotoCorrect, PhotoCorrectWithProcessIssue, PhotoWrong:
 		return PhotoItemAssessment
 	case PhotoBlankSolved:
 		return PhotoItemParentTeachingGuide
@@ -407,6 +399,27 @@ func photoItemResultKind(status PhotoItemStatus) PhotoItemResultKind {
 		return PhotoItemOutOfScope
 	default:
 		return PhotoItemFailed
+	}
+}
+
+func photoAssessmentStatus(graded GradeResult) (PhotoItemStatus, string) {
+	switch {
+	case graded.OutOfScope:
+		return PhotoOutOfScope, ""
+	case !photoEvidenceTrusted(graded.Evidence):
+		return PhotoUntrusted, "Verification evidence is insufficient; no correct/incorrect mark is shown on the image"
+	}
+	switch graded.Outcome.AssessmentStatus() {
+	case k12.GradingAssessmentCorrect:
+		return PhotoCorrect, ""
+	case k12.GradingAssessmentProcessIssue:
+		return PhotoCorrectWithProcessIssue, ""
+	case k12.GradingAssessmentWrong:
+		return PhotoWrong, ""
+	case k12.GradingAssessmentOutOfScope:
+		return PhotoOutOfScope, ""
+	default:
+		return PhotoUntrusted, "Grading evidence is insufficient or conflicting, so no correct/incorrect mark is shown on the image"
 	}
 }
 
@@ -475,10 +488,14 @@ func trustedPhotoMarks(items []PhotoGradeItem) []PhotoAnnotation {
 func photoAnnotations(items []PhotoGradeItem) []PhotoAnnotation {
 	marks := make([]PhotoAnnotation, 0, len(items))
 	for i, item := range items {
-		if item.Status != PhotoCorrect && item.Status != PhotoWrong {
+		if item.Status != PhotoCorrect && item.Status != PhotoCorrectWithProcessIssue && item.Status != PhotoWrong {
 			continue
 		}
-		mark := PhotoAnnotation{QuestionNumber: i + 1, Correct: item.Status == PhotoCorrect}
+		mark := PhotoAnnotation{
+			QuestionNumber: i + 1,
+			Status:         item.Status,
+			Correct:        item.Status == PhotoCorrect,
+		}
 		if anchor := item.Recognized.BBox; anchor != nil {
 			mark.BBox = *anchor
 		}
@@ -601,11 +618,13 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 		return strings.TrimSpace(b.String())
 	}
 
-	correct, wrong, unanswered, unclear, pending := 0, 0, 0, 0, 0
+	correct, processIssue, wrong, unanswered, unclear, pending := 0, 0, 0, 0, 0, 0
 	for _, item := range result.Items {
 		switch item.Status {
 		case PhotoCorrect:
 			correct++
+		case PhotoCorrectWithProcessIssue:
+			processIssue++
 		case PhotoWrong:
 			wrong++
 		case PhotoUnanswered:
@@ -617,7 +636,11 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 		}
 	}
 	b.WriteString("## 📊 作业批改完成\n\n")
-	fmt.Fprintf(&b, "- 共识别 **%d** 题\n- 正确 **%d** 题，需订正 **%d** 题", len(result.Items), correct, wrong)
+	fmt.Fprintf(&b, "- **%d** questions recognized\n- **%d** correct", len(result.Items), correct)
+	if processIssue > 0 {
+		fmt.Fprintf(&b, ", **%d** with process issues", processIssue)
+	}
+	fmt.Fprintf(&b, ", **%d** requiring correction", wrong)
 	if unanswered > 0 {
 		fmt.Fprintf(&b, "，未作答 **%d** 题", unanswered)
 	}
@@ -631,7 +654,7 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 	if result.ImageWarning != "" {
 		fmt.Fprintf(&b, "> ℹ️ %s。\n\n", result.ImageWarning)
 	}
-	determined := correct + wrong
+	determined := correct + processIssue + wrong
 	annotated := 0
 	if result.AnnotatedImage != nil && len(result.AnnotatedImage.Data) > 0 {
 		annotated = len(trustedPhotoMarks(result.Items))
@@ -656,6 +679,30 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 				photoQuestionHeading(item.Recognized, 180), photoInline(item.Recognized.StudentAnswer, 180))
 		}
 		b.WriteString("\n")
+	}
+	if processIssue > 0 {
+		fmt.Fprintf(&b, "### ⚠️ Process issues (%d)\n\n", processIssue)
+		b.WriteString("> The final answer is correct. Only process issues supported by clear evidence are shown below, and they are not recorded as wrong.\n\n")
+		for _, item := range result.Items {
+			if item.Status != PhotoCorrectWithProcessIssue {
+				continue
+			}
+			fmt.Fprintf(&b, "#### %s\n\n", photoQuestionReference(item.Recognized))
+			fmt.Fprintf(&b, "- **Question:** %s\n- **Your answer:** %s",
+				photoInline(photoQuestionStem(item.Recognized), 240),
+				photoInline(item.Recognized.StudentAnswer, 300))
+			if item.Grade.Outcome.WrongStep != "" {
+				fmt.Fprintf(&b, "\n- **Process note:** %s", photoInline(item.Grade.Outcome.WrongStep, 300))
+			}
+			if item.Grade.Outcome.ErrorCause != "" {
+				fmt.Fprintf(&b, "\n- **Cause:** %s", photoInline(item.Grade.Outcome.ErrorCause, 300))
+			}
+			if item.ParentGuide != nil {
+				b.WriteString("\n\n##### How the parent can explain it\n\n")
+				writeParentTeachingGuideMarkdown(&b, *item.ParentGuide)
+			}
+			b.WriteString("\n\n")
+		}
 	}
 	if wrong > 0 {
 		fmt.Fprintf(&b, "### ❌ 需要订正（%d）\n\n", wrong)

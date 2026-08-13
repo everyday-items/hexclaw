@@ -277,15 +277,17 @@ type gradeResp struct {
 	// Verdict 判定五值（§4.5 布尔 correct 删除，§6.14 授权破坏性契约变更）：
 	// 批改路径 = 批改判定（agree=答对 / disagree=答错）；解题分叉与超纲 = 验算/超纲结论。
 	// 徽章强弱仍由 badge/evidence_type（验算证据）承载，与批改判定解耦。
-	Verdict       string `json:"verdict"`
-	EvidenceType  string `json:"evidence_type"`
-	Badge         string `json:"badge"`
-	WrongStep     string `json:"wrong_step,omitempty"`
-	ErrorCause    string `json:"error_cause,omitempty"`
-	OutOfScope    bool   `json:"out_of_scope"`
-	OutOfScopeKP  string `json:"out_of_scope_kp,omitempty"`
-	RecordCreated bool   `json:"record_created"`
-	RecordID      string `json:"record_id,omitempty"`
+	Verdict            string `json:"verdict"`
+	AssessmentStatus   string `json:"assessment_status,omitempty"`
+	FinalAnswerCorrect *bool  `json:"final_answer_correct,omitempty"`
+	EvidenceType       string `json:"evidence_type"`
+	Badge              string `json:"badge"`
+	WrongStep          string `json:"wrong_step,omitempty"`
+	ErrorCause         string `json:"error_cause,omitempty"`
+	OutOfScope         bool   `json:"out_of_scope"`
+	OutOfScopeKP       string `json:"out_of_scope_kp,omitempty"`
+	RecordCreated      bool   `json:"record_created"`
+	RecordID           string `json:"record_id,omitempty"`
 	// CurriculumUnmapped 词表外知识点（fail-visible，PRD §5.2.4 / bug 2026-07-18）：
 	// 超纲硬拦截对这些 KP 不生效，前端须显性提示「不在课标映射内」。
 	CurriculumUnmapped []string `json:"curriculum_unmapped,omitempty"`
@@ -522,11 +524,16 @@ func (h *handler) grade(w http.ResponseWriter, r *http.Request) {
 // 沿用验算/超纲 verdict（Evidence.Verdict），不伪造二元结论。
 func gradeRespFromResult(res usecase.GradeResult) gradeResp {
 	verdict := res.Outcome.Verdict
+	assessmentStatus := ""
+	if verdict != "" {
+		assessmentStatus = string(res.Outcome.AssessmentStatus())
+	}
 	if verdict == "" {
 		verdict = res.Evidence.Verdict
 	}
 	return gradeResp{
 		Solution: res.Solution, Verdict: string(verdict),
+		AssessmentStatus: assessmentStatus, FinalAnswerCorrect: res.Outcome.FinalAnswerCorrect,
 		EvidenceType: string(res.Evidence.EvidenceType), Badge: res.Evidence.Badge(),
 		WrongStep: res.Outcome.WrongStep, ErrorCause: res.Outcome.ErrorCause,
 		OutOfScope: res.OutOfScope, OutOfScopeKP: res.OutOfScopeKP,

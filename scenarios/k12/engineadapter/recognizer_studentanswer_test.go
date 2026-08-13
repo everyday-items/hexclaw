@@ -64,6 +64,7 @@ func TestRecognize_FiltersSectionHeadingAndDeduplicatesNumberedQuestion(t *testi
 	vision := func(context.Context, []byte, string) (string, error) {
 		return `[{"question":"四、应用题","subject":"数学","student_answer":""},` +
 			`{"question":"二、计算下面各题，能简算","subject":"数学","student_answer":"8.7×17.4"},` +
+			`{"question":"选择合适的数填空","subject":"数学","student_answer":"19/20"},` +
 			`{"question":"-2","subject":"数学","student_answer":""},` +
 			`{"question":"8的1/4是多少？","subject":"数学","student_answer":"2"},` +
 			`{"question":"2、8的1/4是多少？","subject":"数学","student_answer":"2","bbox":{"x":0.1,"y":0.2,"w":0.2,"h":0.1}},` +

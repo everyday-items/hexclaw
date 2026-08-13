@@ -19,7 +19,7 @@ const (
 	maxRenderedPhotoBytes       = 18 << 20 // leave headroom under DingTalk's 20MB media limit
 )
 
-// PhotoAnnotator 使用标准库在原图答案旁画矢量勾/叉。没有可靠坐标的结论只保留在
+// PhotoAnnotator 使用标准库在原图答案旁画矢量勾/叉/过程警示。没有可靠坐标的结论只保留在
 // Markdown 明细中：既不猜测作答位置，也不改变原图尺寸追加题号栏。
 type PhotoAnnotator struct{}
 
@@ -52,12 +52,12 @@ func (*PhotoAnnotator) Annotate(ctx context.Context, raw []byte, marks []usecase
 		if err := ctx.Err(); err != nil {
 			return usecase.RenderedPhoto{}, err
 		}
-		drawVerdictGlyph(
+		drawAssessmentGlyph(
 			dst,
 			placement.cx,
 			placement.cy,
 			placement.radius,
-			placement.correct,
+			placement.status,
 			placement.stroke,
 			placement.base,
 		)
@@ -147,13 +147,13 @@ func resizePhotoNearest(src *image.RGBA, width, height int) *image.RGBA {
 }
 
 type photoMarkPlacement struct {
-	cx      int
-	cy      int
-	radius  int
-	stroke  int
-	correct bool
-	base    color.RGBA
-	bounds  image.Rectangle
+	cx     int
+	cy     int
+	radius int
+	stroke int
+	status usecase.PhotoItemStatus
+	base   color.RGBA
+	bounds image.Rectangle
 }
 
 func layoutPhotoMarks(bounds image.Rectangle, marks []usecase.PhotoAnnotation) []photoMarkPlacement {
@@ -197,13 +197,21 @@ func basePhotoMarkPlacement(bounds image.Rectangle, mark usecase.PhotoAnnotation
 		return photoMarkPlacement{}, false
 	}
 	stroke := maxInt(3, minInt(12, minInt(w, h)/240))
-	base := color.RGBA{R: 239, G: 68, B: 68, A: 255}
-	if mark.Correct {
+	status := mark.EffectiveStatus()
+	var base color.RGBA
+	switch status {
+	case usecase.PhotoCorrect:
 		base = color.RGBA{R: 22, G: 163, B: 74, A: 255}
+	case usecase.PhotoCorrectWithProcessIssue:
+		base = color.RGBA{R: 165, G: 107, B: 214, A: 255}
+	case usecase.PhotoWrong:
+		base = color.RGBA{R: 239, G: 68, B: 68, A: 255}
+	default:
+		return photoMarkPlacement{}, false
 	}
 
 	// 独立锚定阶段返回的是通过本地几何与墨迹门禁的紧作答框，不再是带题干上下文的粗定位块。
-	// 因此勾叉直接放在答案框右缘、纵向上部 40% 的书写带附近；只画紧凑笔画，
+	// 因此标记直接放在答案框右缘、纵向上部 40% 的书写带附近；只画紧凑笔画，
 	// 不以大色块或矩形覆盖孩子原笔迹。靠近页边时再向内夹紧。
 	radius := minInt(42, maxInt(18, minInt(w, h)/45))
 	cx := x1
@@ -215,7 +223,7 @@ func basePhotoMarkPlacement(bounds image.Rectangle, mark usecase.PhotoAnnotation
 	}
 	placement := photoMarkPlacement{
 		cx: cx, cy: cy, radius: radius, stroke: stroke,
-		correct: mark.Correct, base: base,
+		status: status, base: base,
 	}
 	placement.bounds = verdictGlyphBounds(placement)
 	return placement, true
@@ -277,12 +285,20 @@ func clampPhotoMarkPlacement(bounds image.Rectangle, placement photoMarkPlacemen
 func verdictGlyphBounds(placement photoMarkPlacement) image.Rectangle {
 	pad := (placement.stroke+4)/2 + 2
 	radius := placement.radius
-	if placement.correct {
+	switch placement.status {
+	case usecase.PhotoCorrect:
 		return image.Rect(
 			placement.cx-radius*3/4-pad,
 			placement.cy-radius*2/3-pad,
 			placement.cx+radius+pad+1,
 			placement.cy+radius/2+pad+1,
+		)
+	case usecase.PhotoCorrectWithProcessIssue:
+		return image.Rect(
+			placement.cx-radius*3/4-pad,
+			placement.cy-radius*3/4-pad,
+			placement.cx+radius*3/4+pad+1,
+			placement.cy+radius*2/3+pad+1,
 		)
 	}
 	return image.Rect(
@@ -304,18 +320,32 @@ func photoMarkOverlapArea(candidate image.Rectangle, occupied []image.Rectangle)
 	return area
 }
 
-func drawVerdictGlyph(dst *image.RGBA, cx, cy, radius int, correct bool, stroke int, base color.RGBA) {
-	// 对标常见作业批注：直接画绿色 ✓ / 红色 ✕，不套圆形徽章。白色底描只沿着
+func drawAssessmentGlyph(
+	dst *image.RGBA,
+	cx, cy, radius int,
+	status usecase.PhotoItemStatus,
+	stroke int,
+	base color.RGBA,
+) {
+	// 对标常见作业批注：直接画绿色 ✓ / 红色 ✕ / 紫色 ⚠，不套圆形徽章。白色底描只沿着
 	// 笔画本身走一遍，保证压在印刷线或铅笔字上仍清楚，但不盖住周围答案。
 	underlay := color.RGBA{255, 255, 255, 255}
 	draw := func(x0, y0, x1, y1 int) {
 		drawThickLine(dst, x0, y0, x1, y1, underlay, stroke+4)
 		drawThickLine(dst, x0, y0, x1, y1, base, stroke)
 	}
-	if correct {
+	switch status {
+	case usecase.PhotoCorrect:
 		draw(cx-radius*3/4, cy, cx-radius/4, cy+radius/2)
 		draw(cx-radius/4, cy+radius/2, cx+radius, cy-radius*2/3)
-	} else {
+	case usecase.PhotoCorrectWithProcessIssue:
+		// 三角轮廓 + 惊叹号是确定性警示图形；它与红色错题叉完全分离。
+		draw(cx, cy-radius*3/4, cx-radius*3/4, cy+radius*2/3)
+		draw(cx-radius*3/4, cy+radius*2/3, cx+radius*3/4, cy+radius*2/3)
+		draw(cx+radius*3/4, cy+radius*2/3, cx, cy-radius*3/4)
+		draw(cx, cy-radius/3, cx, cy+radius/5)
+		draw(cx, cy+radius*7/16, cx, cy+radius*7/16)
+	case usecase.PhotoWrong:
 		draw(cx-radius*2/3, cy-radius*2/3, cx+radius*2/3, cy+radius*2/3)
 		draw(cx+radius*2/3, cy-radius*2/3, cx-radius*2/3, cy+radius*2/3)
 	}

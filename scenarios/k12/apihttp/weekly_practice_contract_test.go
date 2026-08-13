@@ -118,6 +118,20 @@ func newWeeklyContractServer(
 	}), rt.Deps, clock
 }
 
+const weeklyBundleManifestID = "manifest-weekly-contract"
+
+func newWeeklyBundleContractServer(
+	t *testing.T,
+) (http.Handler, usecase.Deps, *weeklyClock) {
+	t.Helper()
+	h, deps, clock := newWeeklyContractServer(t)
+	seedBUG20260726034A02Manifest(
+		t, deps.Records.DB(), weeklyBundleManifestID, "desktop-user",
+		"doc-weekly-contract", 1, "ready_for_confirmation", "",
+	)
+	return h, deps, clock
+}
+
 func exactKeys(t *testing.T, got map[string]any, want ...string) {
 	t.Helper()
 	actual := make([]string, 0, len(got))
@@ -152,12 +166,12 @@ func weeklyBundleBody(key string, profileRevision, progressRevision, settingsRev
 		},
 		"curriculum_progress":{
 			"subject":"math",
-			"textbook_binding_id":"binding-rjb-5b",
+			"textbook_manifest_id":%q,
 			"volume":"下册",
 			"unit_id":"u1",
 			"lesson_id":"l1",
-			"page_from":12,
-			"page_to":15,
+			"page_from":1,
+			"page_to":10,
 			"evidence_source":"parent_confirmed"
 		},
 		"weekly_practice_settings":{
@@ -166,7 +180,7 @@ func weeklyBundleBody(key string, profileRevision, progressRevision, settingsRev
 			"arithmetic_warmup_enabled":true,
 			"arithmetic_minutes":2
 		}
-	}`, key, profileRevision, progressRevision, settingsRevision)
+	}`, key, profileRevision, progressRevision, settingsRevision, weeklyBundleManifestID)
 }
 
 func seedWeeklyDueMistake(t *testing.T, deps usecase.Deps) {
@@ -210,7 +224,7 @@ func trackItem(
 }
 
 func TestWeeklyPracticeHTTPContract_K12Weekly016To023(t *testing.T) {
-	h, deps, clock := newWeeklyContractServer(t)
+	h, deps, clock := newWeeklyBundleContractServer(t)
 
 	rec, catalog := do(t, h, http.MethodGet,
 		"/curriculum-catalog?agent=mingming&subject=math&textbook_edition=%E4%BA%BA%E6%95%99%E7%89%88&volume=%E4%B8%8B%E5%86%8C", "")
@@ -227,10 +241,11 @@ func TestWeeklyPracticeHTTPContract_K12Weekly016To023(t *testing.T) {
 
 	rec, progressEnvelope := do(t, h, http.MethodGet,
 		"/curriculum-progress?agent=other&subject=math", "")
-	if rec.Code != http.StatusOK || progressEnvelope["progress"] != nil {
+	if rec.Code != http.StatusOK || progressEnvelope["progress"] != nil ||
+		progressEnvelope["revision"] != float64(0) {
 		t.Fatalf("unset progress must be 200 null: status=%d body=%v", rec.Code, progressEnvelope)
 	}
-	exactKeys(t, progressEnvelope, "progress")
+	exactKeys(t, progressEnvelope, "progress", "revision")
 	rec, defaultSettings := do(t, h, http.MethodGet,
 		"/weekly-practice/settings?agent=other", "")
 	if rec.Code != http.StatusOK {
@@ -285,6 +300,7 @@ func TestWeeklyPracticeHTTPContract_K12Weekly016To023(t *testing.T) {
 		"/weekly-practice/settings?agent=mingming", "")
 	if profile["revision"] != float64(1) ||
 		persistedProgress["progress"].(map[string]any)["revision"] != float64(1) ||
+		persistedProgress["revision"] != float64(1) ||
 		persistedSettings["revision"] != float64(1) {
 		t.Fatalf("failed CAS made a partial write: profile=%v progress=%v settings=%v",
 			profile, persistedProgress, persistedSettings)

@@ -125,7 +125,7 @@ func TestSolveLinearEquation_FastPathOnlyInAutoNonGradingMode(t *testing.T) {
 				case verifierAgentName:
 					return SubAgentResult{Output: "VERDICT: AGREE\nCOMPUTED: 0.01\n说明：一致。"}, nil
 				case graderAgentName:
-					return SubAgentResult{Output: "CORRECT: true\nWRONG_STEP:\nMISCONCEPTION:\nGUIDANCE: 继续保持。"}, nil
+					return SubAgentResult{Output: "CORRECT: true\nFINAL_ANSWER_CORRECT: true\nWRONG_STEP:\nMISCONCEPTION:\nGUIDANCE: 继续保持。"}, nil
 				default:
 					return SubAgentResult{}, nil
 				}

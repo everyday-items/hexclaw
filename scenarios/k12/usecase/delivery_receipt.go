@@ -159,7 +159,7 @@ func (d Deps) PrepareAndSendTextBatch(
 	ctx context.Context,
 	agentName, objectKind, objectID, content string,
 ) (k12.DeliveryBatch, bool, error) {
-	return d.prepareAndSendTextBatch(ctx, agentName, objectKind, objectID, content, nil)
+	return d.prepareAndSendTextBatch(ctx, agentName, objectKind, objectID, content, nil, nil)
 }
 
 func (d Deps) prepareAndSendTextBatchWithTargets(
@@ -170,13 +170,90 @@ func (d Deps) prepareAndSendTextBatchWithTargets(
 	if len(targets) == 0 {
 		return k12.DeliveryBatch{}, false, ErrNoActiveDirectBindings
 	}
-	return d.prepareAndSendTextBatch(ctx, agentName, objectKind, objectID, content, targets)
+	return d.prepareAndSendTextBatch(ctx, agentName, objectKind, objectID, content, targets, nil)
+}
+
+func normalizeExpectedDeliveryBinding(
+	expected ExpectedDeliveryBinding,
+) (ExpectedDeliveryBinding, error) {
+	expected.BindingID = strings.TrimSpace(expected.BindingID)
+	expected.Platform = strings.ToLower(strings.TrimSpace(expected.Platform))
+	expected.InstanceID = strings.TrimSpace(expected.InstanceID)
+	expected.ChatID = strings.TrimSpace(expected.ChatID)
+	if expected.BindingID == "" || expected.Platform == "" ||
+		expected.InstanceID == "" || expected.ChatID == "" {
+		return ExpectedDeliveryBinding{}, fmt.Errorf(
+			"%w: expected binding requires binding_id/platform/instance_id/chat_id",
+			ErrInvalidInput,
+		)
+	}
+	return expected, nil
+}
+
+func expectedDeliveryBindingMatchesTarget(
+	expected ExpectedDeliveryBinding,
+	target ResolvedDeliveryTarget,
+) bool {
+	return expected.BindingID == target.BindingID &&
+		expected.Platform == target.Target.Platform &&
+		expected.InstanceID == target.Target.InstanceID &&
+		expected.ChatID == target.Target.ChatID
+}
+
+func expectedDeliveryBindingMatchesBatch(
+	expected ExpectedDeliveryBinding,
+	batch k12.DeliveryBatch,
+) bool {
+	if len(batch.Receipts) != 1 {
+		return false
+	}
+	receipt := batch.Receipts[0]
+	return expected.BindingID == receipt.BindingID &&
+		expected.Platform == receipt.Target.Platform &&
+		expected.InstanceID == receipt.Target.InstanceID &&
+		expected.ChatID == receipt.Target.ChatID
+}
+
+func (d Deps) replayExpectedDeliveryBatch(
+	ctx context.Context,
+	expected ExpectedDeliveryBinding,
+	batch k12.DeliveryBatch,
+) (k12.DeliveryBatch, error) {
+	if !expectedDeliveryBindingMatchesBatch(expected, batch) {
+		return k12.DeliveryBatch{}, ErrDeliveryBindingSnapshotConflict
+	}
+	receipt := batch.Receipts[0]
+	if receipt.Status != k12.DeliverySending &&
+		receipt.Status != k12.DeliveryOutcomeUnknown {
+		return batch, nil
+	}
+	// QueryDeliveryBatch 是现有的只查询收敛状态机。即使提供方仍无法证明
+	// 已进入终态，它也绝不会调用 SendPrepared，并会保留已冻结的回执和对象标识。
+	return d.QueryDeliveryBatch(ctx, batch.AgentName, batch.BatchID)
+}
+
+// prepareAndSendTextBatchWithExpectedBinding 执行应用绑定的单例 CAS，
+// 但不会把客户端期望值当作目标选择依据。首次创建时解析服务端持有的完整集合；
+// 重放时只与已经冻结的单例回执比较，绝不查询可变规则。
+func (d Deps) prepareAndSendTextBatchWithExpectedBinding(
+	ctx context.Context,
+	agentName, objectKind, objectID, content string,
+	expected ExpectedDeliveryBinding,
+) (k12.DeliveryBatch, bool, error) {
+	normalized, err := normalizeExpectedDeliveryBinding(expected)
+	if err != nil {
+		return k12.DeliveryBatch{}, false, err
+	}
+	return d.prepareAndSendTextBatch(
+		ctx, agentName, objectKind, objectID, content, nil, &normalized,
+	)
 }
 
 func (d Deps) prepareAndSendTextBatch(
 	ctx context.Context,
 	agentName, objectKind, objectID, content string,
 	targets []ResolvedDeliveryTarget,
+	expected *ExpectedDeliveryBinding,
 ) (k12.DeliveryBatch, bool, error) {
 	agentName = strings.TrimSpace(agentName)
 	objectKind = strings.TrimSpace(objectKind)
@@ -192,10 +269,28 @@ func (d Deps) prepareAndSendTextBatch(
 	dedupeKey := deliveryBatchDedupeKey(agentName, objectKind, objectID, contentDigest)
 	existing, err := d.Records.GetDeliveryBatchByDedupe(ctx, agentName, dedupeKey)
 	if err == nil {
+		if expected != nil {
+			replayed, replayErr := d.replayExpectedDeliveryBatch(ctx, *expected, existing)
+			return replayed, false, replayErr
+		}
 		return existing, false, nil
 	}
 	if !errors.Is(err, records.ErrNotFound) {
 		return k12.DeliveryBatch{}, false, err
+	}
+	if expected != nil {
+		resolved, resolveErr := d.ResolveDeliveryTargets(ctx, agentName)
+		if errors.Is(resolveErr, ErrNoActiveDirectBindings) {
+			return k12.DeliveryBatch{}, false, ErrDeliveryBindingSnapshotConflict
+		}
+		if resolveErr != nil {
+			return k12.DeliveryBatch{}, false, resolveErr
+		}
+		if len(resolved) != 1 || !expectedDeliveryBindingMatchesTarget(*expected, resolved[0]) {
+			return k12.DeliveryBatch{}, false, ErrDeliveryBindingSnapshotConflict
+		}
+		// 冻结服务端权威解析流程返回的目标，而不是根据客户端字段重建目标。
+		targets = resolved
 	}
 	batch, err := d.buildPreparedTextBatch(
 		ctx, agentName, objectKind, objectID, content, targets,
@@ -204,8 +299,15 @@ func (d Deps) prepareAndSendTextBatch(
 		return k12.DeliveryBatch{}, false, err
 	}
 	batch, created, err := d.Records.PrepareDeliveryBatch(ctx, batch)
-	if err != nil || !created {
+	if err != nil {
 		return batch, created, err
+	}
+	if !created {
+		if expected != nil {
+			replayed, replayErr := d.replayExpectedDeliveryBatch(ctx, *expected, batch)
+			return replayed, false, replayErr
+		}
+		return batch, false, nil
 	}
 	batch, err = d.sendDeliveryBatch(ctx, batch)
 	return batch, true, err

@@ -75,10 +75,11 @@ func TestRealAnswerAnchoring(t *testing.T) {
 	if err != nil {
 		t.Fatalf("real bbox recognition failed: error_type=%T", err)
 	}
-	coreCallCount := int32(len(denseWorksheetRanges) + 1)
-	if calls.Load() != coreCallCount {
-		t.Fatalf("dense core recognition calls=%d want=%d (5 segments + printed inventory)",
-			calls.Load(), coreCallCount)
+	wholePageCallCount := int32(1)
+	fallbackCallCount := int32(len(denseWorksheetRanges) + 2)
+	if calls.Load() != wholePageCallCount && calls.Load() != fallbackCallCount {
+		t.Fatalf("dense core recognition calls=%d want=%d (whole page) or %d (whole page + 5 segments + printed inventory)",
+			calls.Load(), wholePageCallCount, fallbackCallCount)
 	}
 	present, unclear := 0, 0
 	seenQuestions := make(map[string]int, len(questions))
@@ -100,6 +101,9 @@ func TestRealAnswerAnchoring(t *testing.T) {
 		}
 		t.Logf("core[%d] state=%s question_chars=%d answer_chars=%d", i+1, question.AnswerState,
 			len([]rune(question.Question)), len([]rune(question.StudentAnswer)))
+		if os.Getenv("HEXCLAW_REAL_BBOX_DIAGNOSTIC") == "1" {
+			t.Logf("core[%d] question=%q", i+1, question.Question)
+		}
 	}
 	answerCandidates := present + unclear
 	if len(questions) != 16 || answerCandidates != 15 {
@@ -129,6 +133,10 @@ func TestRealAnswerAnchoring(t *testing.T) {
 			t.Fatalf("real answered worksheet lost or corrupted expected question index=%d: questions=%d",
 				expectedIndex+1, len(questions))
 		}
+	}
+	if os.Getenv("HEXCLAW_REAL_BBOX_RECOGNITION_ONLY") == "1" {
+		t.Logf("recognition-only questions=%d calls=%d elapsed=%s", len(questions), calls.Load(), time.Since(startedAt).Round(time.Millisecond))
+		return
 	}
 
 	anchored, err := adapter.AnchorAnswers(ctx, imageBytes, questions)

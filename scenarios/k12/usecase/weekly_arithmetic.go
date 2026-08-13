@@ -17,6 +17,21 @@ func (d Deps) projectWeeklyArithmetic(
 	ctx context.Context,
 	plan k12.WeeklyPracticePlan,
 ) (k12.WeeklyPracticePlan, error) {
+	projected, _, err := d.projectWeeklyArithmeticAtLifecycle(ctx, plan)
+	return projected, err
+}
+
+func (d Deps) projectWeeklyArithmeticAtLifecycle(
+	ctx context.Context,
+	plan k12.WeeklyPracticePlan,
+) (k12.WeeklyPracticePlan, *int, error) {
+	if plan.AnswerKeys != nil {
+		answerKeys := make(map[string]string, len(plan.AnswerKeys))
+		for itemID, answer := range plan.AnswerKeys {
+			answerKeys[itemID] = answer
+		}
+		plan.AnswerKeys = answerKeys
+	}
 	for index := range plan.Tracks {
 		track := &plan.Tracks[index]
 		track.ArithmeticBatch = nil
@@ -30,7 +45,7 @@ func (d Deps) projectWeeklyArithmetic(
 			continue
 		}
 		if err != nil {
-			return k12.WeeklyPracticePlan{}, err
+			return k12.WeeklyPracticePlan{}, nil, err
 		}
 		track.ArithmeticBatch = &batch
 		switch batch.State {
@@ -45,23 +60,47 @@ func (d Deps) projectWeeklyArithmetic(
 			track.FailureMessage = batch.FailureMessage
 		}
 	}
+	var lifecycleRevision *int
 	if plan.Status == k12.WeeklyPlanDraft {
-		progress, err := d.GetCurriculumProgress(ctx, plan.AgentName, "math")
+		_, progressRevision, err := d.GetCurriculumProgressState(
+			ctx, plan.AgentName, "math",
+		)
 		if err != nil {
-			return k12.WeeklyPracticePlan{}, err
+			return k12.WeeklyPracticePlan{}, nil, err
 		}
-		if progress != nil && plan.CurriculumProgressRevision != nil &&
-			progress.Revision > *plan.CurriculumProgressRevision {
+		lifecycleRevision = &progressRevision
+		if plan.CurriculumProgressRevision != nil &&
+			progressRevision > *plan.CurriculumProgressRevision {
 			for index := range plan.Tracks {
-				if plan.Tracks[index].PlanSection ==
+				track := &plan.Tracks[index]
+				if track.PlanSection ==
 					k12.WeeklySectionTextbookConsolidation &&
-					plan.Tracks[index].Status != k12.WeeklyTrackDisabled {
-					plan.Tracks[index].Status = k12.WeeklyTrackStale
+					track.Status != k12.WeeklyTrackDisabled {
+					track.Status = k12.WeeklyTrackStale
+					for _, item := range track.Items {
+						delete(plan.AnswerKeys, item.ItemID)
+					}
+					track.Items = []k12.WeeklyPracticeItem{}
 				}
 			}
 		}
 	}
-	return d.projectWeeklyManualRecommendations(ctx, plan)
+	projected, err := d.projectWeeklyManualRecommendations(ctx, plan)
+	if err != nil {
+		return k12.WeeklyPracticePlan{}, nil, err
+	}
+	itemIDs := make(map[string]struct{})
+	for _, track := range projected.Tracks {
+		for _, item := range track.Items {
+			itemIDs[item.ItemID] = struct{}{}
+		}
+	}
+	for itemID := range projected.AnswerKeys {
+		if _, exists := itemIDs[itemID]; !exists {
+			delete(projected.AnswerKeys, itemID)
+		}
+	}
+	return projected, lifecycleRevision, nil
 }
 
 func (d Deps) CreateWeeklyArithmeticBatch(

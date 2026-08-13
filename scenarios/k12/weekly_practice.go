@@ -152,7 +152,7 @@ type ProfileBundleAgentConfig struct {
 type ProfileBundleResult struct {
 	AgentConfig            *ProfileBundleAgentConfig `json:"agent_config,omitempty"`
 	Profile                ProfileBundleProfile      `json:"profile"`
-	CurriculumProgress     CurriculumProgress        `json:"curriculum_progress"`
+	CurriculumProgress     *CurriculumProgress       `json:"curriculum_progress"`
 	WeeklyPracticeSettings WeeklyPracticeSettings    `json:"weekly_practice_settings"`
 	Replayed               bool                      `json:"replayed"`
 }
