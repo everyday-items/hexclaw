@@ -95,7 +95,7 @@ func TestBug20260702_BuildReport_CapabilitiesReflectLimits(t *testing.T) {
 func TestBug20260702_Execute_FilesystemContainmentUnavailable(t *testing.T) {
 	s := newConfiguredTestCodeExecSkill(t, nil, sandbox.Config{Workspace: t.TempDir(), Timeout: 30})
 	s.sandboxFactory = func(cfg sandbox.Config) (sandbox.Sandbox, error) {
-		return &mockSandbox{execFn: func(context.Context, string, []string) (*sandbox.ExecResult, error) {
+		return &mockSandbox{execFn: func(context.Context, sandbox.Command) (*sandbox.ExecResult, error) {
 			return nil, fmt.Errorf("linux backend select: %w", sandbox.ErrFilesystemContainmentUnavailable)
 		}}, nil
 	}
@@ -123,7 +123,7 @@ func TestBug20260702_Execute_FilesystemContainmentUnavailable(t *testing.T) {
 func TestBug20260702_Execute_StorageLimitExceededClassified(t *testing.T) {
 	s := newConfiguredTestCodeExecSkill(t, nil, sandbox.Config{Workspace: t.TempDir(), Timeout: 30})
 	s.sandboxFactory = func(cfg sandbox.Config) (sandbox.Sandbox, error) {
-		return &mockSandbox{execFn: func(context.Context, string, []string) (*sandbox.ExecResult, error) {
+		return &mockSandbox{execFn: func(context.Context, sandbox.Command) (*sandbox.ExecResult, error) {
 			return &sandbox.ExecResult{ExitCode: 0, Limits: sandbox.LimitReport{
 				Memory: sandbox.LimitStatusEnforced, Processes: sandbox.LimitStatusEnforced,
 				Storage: sandbox.LimitStatusEnforced, Output: sandbox.LimitStatusEnforced,

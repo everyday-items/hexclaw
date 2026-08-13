@@ -18,7 +18,7 @@ import (
 // mockSandbox implements sandbox.Sandbox for testing.
 type mockSandbox struct {
 	execCodeFn func(ctx context.Context, lang, code string) (*sandbox.ExecResult, error)
-	execFn     func(ctx context.Context, cmd string, args []string) (*sandbox.ExecResult, error)
+	execFn     func(ctx context.Context, command sandbox.Command) (*sandbox.ExecResult, error)
 }
 
 func (m *mockSandbox) ExecCode(ctx context.Context, lang, code string) (*sandbox.ExecResult, error) {
@@ -30,7 +30,7 @@ func (m *mockSandbox) ExecCode(ctx context.Context, lang, code string) (*sandbox
 
 func (m *mockSandbox) Exec(ctx context.Context, command sandbox.Command) (*sandbox.ExecResult, error) {
 	if m.execFn != nil {
-		return m.execFn(ctx, command.Path, command.Args)
+		return m.execFn(ctx, command)
 	}
 	return &sandbox.ExecResult{ExitCode: 0}, nil
 }
@@ -527,15 +527,12 @@ func TestCodeExecSkill_PosixWrapperDoesNotMkdirInsideSandbox(t *testing.T) {
 	var script string
 	s := newConfiguredTestCodeExecSkill(t, &mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30})
 	s.sandboxFactory = func(sandbox.Config) (sandbox.Sandbox, error) {
-		return &mockSandbox{execFn: func(_ context.Context, cmd string, args []string) (*sandbox.ExecResult, error) {
-			// toolkit v0.3.0 的 Command.Path 必须为绝对路径（不做 PATH 查找），
-			// posix 包装统一使用 /bin/sh。
-			if cmd != "/bin/sh" {
-				t.Fatalf("cmd = %q, want /bin/sh", cmd)
+		return &mockSandbox{execFn: func(_ context.Context, command sandbox.Command) (*sandbox.ExecResult, error) {
+			// 直绑执行：命令为规范绝对路径的运行时（无 sh -c 包装）。
+			if !filepath.IsAbs(command.Path) || filepath.Base(command.Path) == "sh" {
+				t.Fatalf("structured command path = %q, want absolute runtime executable", command.Path)
 			}
-			if len(args) >= 2 {
-				script = args[1]
-			}
+			script = strings.Join(command.Args, " ")
 			return &sandbox.ExecResult{Stdout: "PY_OK\n", ExitCode: 0}, nil
 		}}, nil
 	}
@@ -887,11 +884,9 @@ func TestCodeExecSkill_Execute_NetworkPolicyPropagatesToRunSandbox(t *testing.T)
 		mu.Lock()
 		networks = append(networks, bool(cfg.Network))
 		mu.Unlock()
-		return &mockSandbox{execFn: func(_ context.Context, _ string, args []string) (*sandbox.ExecResult, error) {
+		return &mockSandbox{execFn: func(_ context.Context, command sandbox.Command) (*sandbox.ExecResult, error) {
 			mu.Lock()
-			if len(args) >= 2 {
-				scripts = append(scripts, args[1])
-			}
+			scripts = append(scripts, strings.Join(command.Env, "\n"))
 			mu.Unlock()
 			return &sandbox.ExecResult{Stdout: "ok", ExitCode: 0}, nil
 		}}, nil
@@ -956,10 +951,8 @@ func TestCodeExecSkill_Execute_OfflineProjectGoCommandUsesStagedModuleCache(t *t
 	s.sandboxFactory = func(cfg sandbox.Config) (sandbox.Sandbox, error) {
 		readable = append([]string(nil), cfg.ReadablePaths...)
 		runWorkspace = cfg.Workspace
-		return &mockSandbox{execFn: func(_ context.Context, _ string, args []string) (*sandbox.ExecResult, error) {
-			if len(args) >= 2 {
-				script = args[1]
-			}
+		return &mockSandbox{execFn: func(_ context.Context, command sandbox.Command) (*sandbox.ExecResult, error) {
+			script = strings.Join(command.Env, "\n")
 			return &sandbox.ExecResult{Stdout: "ok", ExitCode: 0}, nil
 		}}, nil
 	}
@@ -981,7 +974,7 @@ func TestCodeExecSkill_Execute_OfflineProjectGoCommandUsesStagedModuleCache(t *t
 			t.Fatalf("offline project Go execution leaked host path %q:\n%s", forbidden, script)
 		}
 	}
-	for _, want := range []string{"'GOWORK=off'", "'GOPROXY=off'", "'GOSUMDB=off'", "'GOTOOLCHAIN=local'"} {
+	for _, want := range []string{"GOWORK=off", "GOPROXY=off", "GOSUMDB=off", "GOTOOLCHAIN=local"} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("offline go execution missing %s:\n%s", want, script)
 		}
@@ -1002,17 +995,15 @@ func TestCodeExecSkill_Execute_NetworkPolicyControlsDependencyInstall(t *testing
 		calls := 0
 		s := newConfiguredTestCodeExecSkill(t, &mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30, Network: sandbox.NetworkMode(network)})
 		s.sandboxFactory = func(sandbox.Config) (sandbox.Sandbox, error) {
-			return &mockSandbox{execFn: func(_ context.Context, _ string, args []string) (*sandbox.ExecResult, error) {
+			return &mockSandbox{execFn: func(_ context.Context, command sandbox.Command) (*sandbox.ExecResult, error) {
 				mu.Lock()
 				defer mu.Unlock()
 				calls++
-				if len(args) >= 2 {
-					scripts = append(scripts, args[1])
-				}
+				scripts = append(scripts, strings.Join(command.Args, " "))
 				switch {
 				case calls == 1:
 					return &sandbox.ExecResult{Stderr: "ModuleNotFoundError: No module named 'pandas'", ExitCode: 1}, nil
-				case calls == 2 && strings.Contains(args[1], "python3 -m pip install pandas"):
+				case calls == 2 && strings.Contains(strings.Join(command.Args, " "), "python3 -m pip install pandas"):
 					return &sandbox.ExecResult{Stdout: "installed", ExitCode: 0}, nil
 				default:
 					return &sandbox.ExecResult{Stdout: "P0_DEP_OK", ExitCode: 0}, nil
@@ -1126,7 +1117,7 @@ func TestCodeExecSkill_ConcurrentSafety(t *testing.T) {
 	cfg := sandbox.Config{Workspace: ws, Timeout: 30, Network: true}
 	s := newConfiguredTestCodeExecSkill(t, sb, cfg)
 	s.sandboxFactory = func(sandbox.Config) (sandbox.Sandbox, error) {
-		return &mockSandbox{execFn: func(context.Context, string, []string) (*sandbox.ExecResult, error) {
+		return &mockSandbox{execFn: func(context.Context, sandbox.Command) (*sandbox.ExecResult, error) {
 			return &sandbox.ExecResult{Stdout: "1\n", ExitCode: 0}, nil
 		}}, nil
 	}

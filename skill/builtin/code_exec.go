@@ -1510,7 +1510,7 @@ func runSandboxCommand(ctx context.Context, sb sandbox.Sandbox, run codeExecRun,
 	if runtime.GOOS == "windows" {
 		return runWindowsSandboxCommand(ctx, sb, run, command, exports)
 	}
-	return runPosixSandboxCommandInDir(ctx, sb, run.ProjectRoot, command, exports)
+	return runStructuredSandboxCommand(ctx, sb, run.ProjectRoot, command, exports)
 }
 
 func codeExecEnv(run codeExecRun) map[string]string {
@@ -1619,36 +1619,11 @@ func ensureCodeExecGoTelemetryOff(exports map[string]string) error {
 }
 
 func runPosixSandboxCommand(ctx context.Context, sb sandbox.Sandbox, command []string, exports map[string]string) (*sandbox.ExecResult, error) {
-	return runPosixSandboxCommandInDir(ctx, sb, "", command, exports)
+	return runStructuredSandboxCommand(ctx, sb, "", command, exports)
 }
 
 func runPosixSandboxCommandInDir(ctx context.Context, sb sandbox.Sandbox, projectRoot string, command []string, exports map[string]string) (*sandbox.ExecResult, error) {
-	var script strings.Builder
-	cleanEnv := codeExecCleanEnvironment(projectRoot, exports)
-	keys := make([]string, 0, len(cleanEnv))
-	for k := range cleanEnv {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	if projectRoot != "" {
-		script.WriteString("cd ")
-		script.WriteString(shellQuote(projectRoot))
-		script.WriteString("\n")
-	}
-	// The sandbox interface does not expose an Env field, and individual backend
-	// filters can never enumerate every provider/token variable. Clear the entire
-	// inherited environment immediately before the payload and pass back only the
-	// runtime allow-list plus per-run values.
-	script.WriteString("exec /usr/bin/env -i")
-	for _, k := range keys {
-		script.WriteString(" ")
-		script.WriteString(shellQuote(k + "=" + cleanEnv[k]))
-	}
-	script.WriteString(" ")
-	script.WriteString(shellJoin(command))
-	// toolkit v0.3.0 的 Command.Path 必须为绝对路径（不再做 PATH 查找，
-	// PATH 解析仅用于脚本 shebang 解释器），故直接用 /bin/sh。
-	return sb.Exec(ctx, sandbox.Command{Path: "/bin/sh", Args: []string{"-c", script.String()}})
+	return runStructuredSandboxCommand(ctx, sb, projectRoot, command, exports)
 }
 
 func codeExecCleanEnvironment(projectRoot string, exports map[string]string) map[string]string {
@@ -1668,6 +1643,11 @@ func codeExecCleanEnvironment(projectRoot string, exports map[string]string) map
 	}
 	for key, value := range exports {
 		clean[key] = value
+	}
+	if runtime.GOOS == "windows" {
+		if systemRoot := strings.TrimSpace(os.Getenv("SystemRoot")); systemRoot != "" {
+			clean["SystemRoot"] = systemRoot
+		}
 	}
 	return clean
 }
@@ -2811,4 +2791,215 @@ func isSafePackageName(pkg string) bool {
 		return false
 	}
 	return true
+}
+
+type codeExecRegularFileIdentity struct {
+	Info   os.FileInfo
+	SHA256 string
+}
+
+var errCodeExecFileIdentityUnavailable = errors.New("opened file identity is unavailable")
+
+var errCodeExecSandboxClose = errors.New("code execution sandbox close failed")
+
+type codeExecPlatformIdentity struct {
+	Volume           uint64
+	FileIDHigh       uint64
+	FileIDLow        uint64
+	Links            uint64
+	ChangeTimeSec    int64
+	ChangeTimeNsec   int64
+	ChangeTimeKnown  bool
+	NoFollowVerified bool
+}
+
+type codeExecOpenedFileSnapshot struct {
+	Info     os.FileInfo
+	Platform codeExecPlatformIdentity
+}
+
+func snapshotCodeExecOpenedFile(file *os.File) (codeExecOpenedFileSnapshot, error) {
+	if file == nil {
+		return codeExecOpenedFileSnapshot{}, errCodeExecFileIdentityUnavailable
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return codeExecOpenedFileSnapshot{}, err
+	}
+	identity, err := codeExecPlatformFileIdentity(file, info)
+	if err != nil || identity.Links == 0 || !identity.ChangeTimeKnown || !identity.NoFollowVerified {
+		return codeExecOpenedFileSnapshot{}, errCodeExecFileIdentityUnavailable
+	}
+	return codeExecOpenedFileSnapshot{Info: info, Platform: identity}, nil
+}
+
+func sameCodeExecOpenedFileSnapshot(before, current codeExecOpenedFileSnapshot) bool {
+	return sameCodeExecFileSnapshot(before.Info, current.Info) && before.Platform == current.Platform
+}
+
+func sameCodeExecOpenedFileObject(before, current codeExecOpenedFileSnapshot) bool {
+	return before.Info != nil && current.Info != nil && os.SameFile(before.Info, current.Info) &&
+		before.Platform.Volume == current.Platform.Volume &&
+		before.Platform.FileIDHigh == current.Platform.FileIDHigh &&
+		before.Platform.FileIDLow == current.Platform.FileIDLow
+}
+
+func codeExecPathMatchesOpenedSnapshot(pathInfo os.FileInfo, opened codeExecOpenedFileSnapshot) bool {
+	if !sameCodeExecFileSnapshot(pathInfo, opened.Info) {
+		return false
+	}
+	pathIdentity, available := codeExecPlatformPathIdentity(pathInfo)
+	return !available || pathIdentity == opened.Platform
+}
+
+func inspectCodeExecRegularFileNoFollow(path string, requireExecutable bool) (codeExecRegularFileIdentity, error) {
+	path = filepath.Clean(path)
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return codeExecRegularFileIdentity{}, err
+	}
+	defer root.Close()
+	name := filepath.Base(path)
+	before, err := root.Lstat(name)
+	if err != nil {
+		return codeExecRegularFileIdentity{}, err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+		return codeExecRegularFileIdentity{}, errors.New("file is not regular")
+	}
+	if requireExecutable && runtime.GOOS != "windows" && before.Mode().Perm()&0111 == 0 {
+		return codeExecRegularFileIdentity{}, errors.New("file is not executable")
+	}
+	file, err := openCodeExecRegularFileNoFollow(root, name)
+	if err != nil {
+		return codeExecRegularFileIdentity{}, err
+	}
+	defer file.Close()
+	opened, err := snapshotCodeExecOpenedFile(file)
+	if err != nil || !opened.Info.Mode().IsRegular() || !codeExecPathMatchesOpenedSnapshot(before, opened) ||
+		opened.Platform.Links != 1 {
+		return codeExecRegularFileIdentity{}, errors.New("file changed while opening")
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return codeExecRegularFileIdentity{}, err
+	}
+	after, err := snapshotCodeExecOpenedFile(file)
+	postPath, pathErr := root.Lstat(name)
+	if err != nil || pathErr != nil || !sameCodeExecOpenedFileSnapshot(opened, after) ||
+		!codeExecPathMatchesOpenedSnapshot(postPath, after) || postPath.Mode()&os.ModeSymlink != 0 ||
+		after.Platform.Links != 1 {
+		return codeExecRegularFileIdentity{}, errors.New("file changed while hashing")
+	}
+	return codeExecRegularFileIdentity{Info: postPath, SHA256: hex.EncodeToString(hash.Sum(nil))}, nil
+}
+
+func codeExecCanonicalRuntimeExecutable(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	canonical, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	canonical = filepath.Clean(canonical)
+	if _, err := inspectCodeExecRegularFileNoFollow(canonical, true); err != nil {
+		return "", err
+	}
+	return canonical, nil
+}
+
+// sameCodeExecFileSnapshot 比较一次路径快照，阻止同一 inode 在打开前被增长、截断或改权。
+func sameCodeExecFileSnapshot(before, current os.FileInfo) bool {
+	if before == nil || current == nil || !os.SameFile(before, current) ||
+		before.Size() != current.Size() || before.Mode() != current.Mode() ||
+		!before.ModTime().Equal(current.ModTime()) {
+		return false
+	}
+	beforeIdentity, beforeAvailable := codeExecPlatformPathIdentity(before)
+	currentIdentity, currentAvailable := codeExecPlatformPathIdentity(current)
+	return !beforeAvailable && !currentAvailable ||
+		beforeAvailable && currentAvailable && beforeIdentity == currentIdentity
+}
+
+func runStructuredSandboxCommand(
+	ctx context.Context,
+	sb sandbox.Sandbox,
+	workingDir string,
+	command []string,
+	exports map[string]string,
+) (*sandbox.ExecResult, error) {
+	if len(command) == 0 || strings.TrimSpace(command[0]) == "" {
+		return nil, errors.New("structured sandbox command path is required")
+	}
+	environment := codeExecSortedCompleteEnvironment(workingDir, exports)
+	commandPath, err := resolveCodeExecStructuredCommandPath(command[0], workingDir, environment)
+	if err != nil {
+		return nil, err
+	}
+	return sb.Exec(ctx, sandbox.Command{
+		Path: commandPath,
+		Args: append([]string(nil), command[1:]...),
+		Dir:  workingDir,
+		Env:  environment,
+	})
+}
+
+// resolveCodeExecStructuredCommandPath 在进入 Sandbox 前把命令冻结为规范绝对路径。
+// 查找只使用 CodeExec 构造的完整安全环境，绝不读取调用进程的任意 PATH。
+func resolveCodeExecStructuredCommandPath(commandPath, workingDir string, environment []string) (string, error) {
+	if commandPath == "" || commandPath != strings.TrimSpace(commandPath) || strings.IndexByte(commandPath, 0) >= 0 {
+		return "", errors.New("structured sandbox command path is invalid")
+	}
+	if filepath.IsAbs(commandPath) {
+		return codeExecCanonicalRuntimeExecutable(commandPath)
+	}
+	if strings.ContainsAny(commandPath, `/\`) {
+		return codeExecCanonicalRuntimeExecutable(filepath.Join(workingDir, commandPath))
+	}
+	searchPath := codeExecEnvironmentValue(environment, "PATH")
+	for _, directory := range filepath.SplitList(searchPath) {
+		if !filepath.IsAbs(directory) {
+			continue
+		}
+		for _, name := range codeExecCommandFileNames(commandPath) {
+			resolved, err := codeExecCanonicalRuntimeExecutable(filepath.Join(directory, name))
+			if err == nil {
+				return resolved, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("resolve structured sandbox command %q: executable was not found", commandPath)
+}
+
+func codeExecEnvironmentValue(environment []string, name string) string {
+	prefix := name + "="
+	for _, item := range environment {
+		if strings.HasPrefix(item, prefix) {
+			return strings.TrimPrefix(item, prefix)
+		}
+	}
+	return ""
+}
+
+func codeExecCommandFileNames(name string) []string {
+	if runtime.GOOS == "windows" && filepath.Ext(name) == "" {
+		return []string{name + ".exe", name}
+	}
+	return []string{name}
+}
+
+func codeExecSortedCompleteEnvironment(projectRoot string, exports map[string]string) []string {
+	cleanEnv := codeExecCleanEnvironment(projectRoot, exports)
+	keys := make([]string, 0, len(cleanEnv))
+	for key := range cleanEnv {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	environment := make([]string, 0, len(keys))
+	for _, key := range keys {
+		environment = append(environment, key+"="+cleanEnv[key])
+	}
+	return environment
 }
