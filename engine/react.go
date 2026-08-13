@@ -1770,39 +1770,48 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	go func() {
 		defer close(out)
 		var content strings.Builder
+		var terminal *adapter.ReplyChunk
 		for chunk := range raw {
 			decorated := wire.Decorate(chunk)
 			content.WriteString(decorated.Content)
-			if decorated.Done && e.sessions != nil {
-				saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-				persistErr := e.sessions.PersistAssistantRuntimeSnapshot(
-					saveCtx,
-					assistantMessageID,
-					wire.Snapshot(),
-				)
-				if errors.Is(persistErr, storage.ErrNotFound) &&
-					decorated.Error == nil &&
-					msg.SessionID != "" {
-					snapshot := wire.Snapshot()
-					_, persistErr = e.sessions.SaveAssistantReply(
-						saveCtx,
-						msg.SessionID,
-						content.String(),
-						session.AssistantMeta{
-							MessageID:           assistantMessageID,
-							ReasoningDisclosure: snapshot.ReasoningDisclosure,
-							RuntimeEvents:       snapshot.RuntimeEvents,
-							LastSequence:        snapshot.LastSequence,
-						},
-					)
-				}
-				if persistErr != nil {
-					trace.L(ctx).Warn("持久化助手 runtime snapshot 失败", "message_id", assistantMessageID)
-				}
-				cancel()
+			if decorated.Done {
+				terminal = decorated
+				continue
 			}
 			out <- decorated
 		}
+		if terminal == nil {
+			return
+		}
+		if e.sessions != nil {
+			saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			snapshot := wire.Snapshot()
+			persistErr := e.sessions.PersistAssistantRuntimeSnapshot(
+				saveCtx,
+				assistantMessageID,
+				snapshot,
+			)
+			if errors.Is(persistErr, storage.ErrNotFound) &&
+				terminal.Error == nil &&
+				msg.SessionID != "" {
+				_, persistErr = e.sessions.SaveAssistantReply(
+					saveCtx,
+					msg.SessionID,
+					content.String(),
+					session.AssistantMeta{
+						MessageID:           assistantMessageID,
+						ReasoningDisclosure: snapshot.ReasoningDisclosure,
+						RuntimeEvents:       snapshot.RuntimeEvents,
+						LastSequence:        snapshot.LastSequence,
+					},
+				)
+			}
+			if persistErr != nil {
+				trace.L(ctx).Warn("Failed to persist assistant runtime snapshot", "message_id", assistantMessageID, "err", persistErr)
+			}
+			cancel()
+		}
+		out <- terminal
 	}()
 	return out, nil
 }

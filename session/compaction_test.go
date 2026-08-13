@@ -75,6 +75,18 @@ func (s *mockStore) GetMessage(_ context.Context, id string) (*storage.MessageRe
 	return nil, storage.ErrNotFound
 }
 
+func (s *mockStore) UpdateMessageMetadata(_ context.Context, id, metadata string) error {
+	for _, msgs := range s.messages {
+		for _, msg := range msgs {
+			if msg.ID == id {
+				msg.Metadata = metadata
+				return nil
+			}
+		}
+	}
+	return storage.ErrNotFound
+}
+
 func (s *mockStore) CountMessages(_ context.Context, sessionID string) (int, error) {
 	return len(s.messages[sessionID]), nil
 }

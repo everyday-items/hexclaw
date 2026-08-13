@@ -77,6 +77,64 @@ func TestSaveAssistantReply_RuntimeWireSurvivesReloadWithPreallocatedID(t *testi
 	t.Fatal("assistant message not found")
 }
 
+func TestPersistAssistantRuntimeSnapshotUpdatesExistingMessageInPlace(t *testing.T) {
+	mgr, store := newTestManager(t)
+	ctx := context.Background()
+	sess, err := mgr.GetOrCreate(ctx, &adapter.Message{
+		Platform: adapter.PlatformWeb,
+		UserID:   "runtime-wire-update-user",
+		Content:  "seed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const messageID = "msg-runtime-update"
+	if _, saveErr := mgr.SaveAssistantReply(ctx, sess.ID, "answer", AssistantMeta{
+		MessageID: messageID,
+		Provider:  "hexclaw-gpt",
+		Model:     "gpt-5.6-sol",
+	}); saveErr != nil {
+		t.Fatal(saveErr)
+	}
+	snapshot := adapter.RuntimeSnapshot{
+		AssistantMessageID:  messageID,
+		BackendMessageID:    messageID,
+		MessageID:           messageID,
+		ReasoningDisclosure: adapter.ReasoningDisclosure{Visibility: adapter.ReasoningNotExposed},
+		RuntimeEvents: []adapter.SequencedRuntimeEvent{{
+			Sequence: 2,
+			Event: adapter.RuntimeEvent{
+				Version:        1,
+				EventID:        "terminal:completed",
+				Kind:           adapter.RuntimeEventTerminal,
+				TerminalStatus: adapter.RuntimeTerminalCompleted,
+			},
+		}},
+		LastSequence: 2,
+	}
+	if persistErr := mgr.PersistAssistantRuntimeSnapshot(ctx, messageID, snapshot); persistErr != nil {
+		t.Fatalf("persist runtime snapshot: %v", persistErr)
+	}
+
+	record, err := store.GetMessage(ctx, messageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(record.Metadata), &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta["provider"] != "hexclaw-gpt" || meta["model"] != "gpt-5.6-sol" {
+		t.Fatalf("existing metadata was not preserved: %s", record.Metadata)
+	}
+	if got, _ := meta["last_sequence"].(float64); got != 2 {
+		t.Fatalf("last_sequence=%v, want 2", meta["last_sequence"])
+	}
+	if count, err := store.CountMessages(ctx, sess.ID); err != nil || count != 1 {
+		t.Fatalf("message count=%d err=%v, want one in-place record", count, err)
+	}
+}
+
 func TestSaveAssistantReplyPersistsReasoningOnlyWhenExplicitlyVisible(t *testing.T) {
 	mgr, store := newTestManager(t)
 	ctx := context.Background()

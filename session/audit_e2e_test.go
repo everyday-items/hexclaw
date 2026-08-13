@@ -154,6 +154,11 @@ func (s *serializedStore) SaveMessage(ctx context.Context, msg *storage.MessageR
 	defer s.mu.Unlock()
 	return s.Store.SaveMessage(ctx, msg)
 }
+func (s *serializedStore) UpdateMessageMetadata(ctx context.Context, id, metadata string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Store.UpdateMessageMetadata(ctx, id, metadata)
+}
 func (s *serializedStore) CreateSession(ctx context.Context, sess *storage.Session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

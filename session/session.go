@@ -351,8 +351,7 @@ func (m *Manager) PersistAssistantRuntimeSnapshot(
 	if err != nil {
 		return err
 	}
-	record.Metadata = string(raw)
-	return m.saveMessage(ctx, record)
+	return m.store.UpdateMessageMetadata(ctx, messageID, string(raw))
 }
 
 // saveMessage 持久化一条消息，并对 SQLite 写写冲突（SQLITE_BUSY/517）做有限退避重试。

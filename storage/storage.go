@@ -154,6 +154,9 @@ type Store interface {
 	// GetMessage 获取单条消息
 	GetMessage(ctx context.Context, id string) (*MessageRecord, error)
 
+	// UpdateMessageMetadata 原位更新已有消息的结构化 metadata，不创建第二条消息。
+	UpdateMessageMetadata(ctx context.Context, id, metadata string) error
+
 	// DeleteMessage 删除单条消息
 	DeleteMessage(ctx context.Context, id string) error
 

@@ -154,6 +154,24 @@ func (s *txStore) GetMessage(ctx context.Context, id string) (*storage.MessageRe
 	return msg, nil
 }
 
+func (s *txStore) UpdateMessageMetadata(ctx context.Context, id, metadata string) error {
+	if metadata == "" {
+		metadata = "{}"
+	}
+	result, err := s.tx.ExecContext(ctx, `UPDATE messages SET metadata = ? WHERE id = ?`, metadata, id)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
 func (s *txStore) DeleteMessage(ctx context.Context, id string) error {
 	_, err := s.tx.ExecContext(ctx, `DELETE FROM messages WHERE id = ?`, id)
 	return err

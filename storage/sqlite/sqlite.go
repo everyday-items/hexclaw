@@ -625,6 +625,33 @@ func (s *Store) GetMessage(ctx context.Context, id string) (*storage.MessageReco
 	return msg, nil
 }
 
+// UpdateMessageMetadata 原位更新已有消息的 metadata。
+// runtime terminal snapshot 是后续写入，不得经 SaveMessage 重插同一 ID。
+func (s *Store) UpdateMessageMetadata(ctx context.Context, id, metadata string) error {
+	if metadata == "" {
+		metadata = "{}"
+	}
+	if err := s.withMessageMutation(ctx, func() error {
+		result, err := s.db.ExecContext(ctx, `UPDATE messages SET metadata = ? WHERE id = ?`, metadata, id)
+		if err != nil {
+			return err
+		}
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rowsAffected == 0 {
+			return storage.ErrNotFound
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	s.invalidateSearchCache()
+	s.invalidateForkCache()
+	return nil
+}
+
 // DeleteMessage 删除单条消息
 func (s *Store) DeleteMessage(ctx context.Context, id string) error {
 	err := s.withMessageMutation(ctx, func() error {
