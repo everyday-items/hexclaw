@@ -155,6 +155,11 @@ func (s *CodeExecSkill) UpdateNetwork(enabled bool) error {
 	}
 	nextCfg := s.cfg
 	nextCfg.Network = sandbox.NetworkMode(enabled)
+	// toolkit v0.3.0 要求非空能力契约：重建沙箱前同样补全默认配置（与运行路径
+	// ensureCodeExecConfigDefaults 一致），否则 sandbox.New 以 invalid required
+	// capability contract 拒绝启动（fail closed）。该补全幂等，不会重置
+	// DeniedPaths 合并等既有配置。
+	nextCfg = ensureCodeExecConfigDefaults(nextCfg)
 	newSb, err := s.buildSandboxLocked(nextCfg)
 	if err != nil {
 		return fmt.Errorf("rebuild sandbox failed: %w", err)
@@ -270,6 +275,24 @@ func (s *CodeExecSkill) Execute(ctx context.Context, args map[string]any) (*skil
 	sb, err := factory(run.Config)
 	if err != nil {
 		return nil, fmt.Errorf("create sandbox run %s failed: %w", run.ID, err)
+	}
+	// toolkit v0.3.0 能力契约：Exec 前 fail-closed 校验 RequiredCapabilities 必须被
+	// 后端证明。darwin 无法下调 memory rlimit、且各平台后端（含 linux）均不提供
+	// CapabilityStorage，hexclaw 默认请求的 memory/storage 能力会让每次执行直接
+	// 失败（v0.3.0 适配回归）。这里按后端实际能力集收敛：后端无法证明的限额维度
+	// 归零（零值=未请求，后端不设上限）并从 RequiredCapabilities 移除对应位；
+	// 平台能强制的维度保持强制，缺失维度由 LimitReport 如实上报（not_requested）。
+	if reporter, ok := sb.(sandbox.CapabilityReporter); ok {
+		if available, capErr := reporter.Capabilities(ctx); capErr == nil {
+			if aligned, changed := downgradeLimitsToCapabilities(run.Config, available); changed {
+				_ = sb.Close()
+				run.Config = aligned
+				sb, err = factory(run.Config)
+				if err != nil {
+					return nil, fmt.Errorf("create sandbox run %s (capability-aligned) failed: %w", run.ID, err)
+				}
+			}
+		}
 	}
 
 	command, err := prepareCodeExecCommand(req, run)
@@ -1623,7 +1646,9 @@ func runPosixSandboxCommandInDir(ctx context.Context, sb sandbox.Sandbox, projec
 	}
 	script.WriteString(" ")
 	script.WriteString(shellJoin(command))
-	return sb.Exec(ctx, sandbox.Command{Path: "sh", Args: []string{"-c", script.String()}})
+	// toolkit v0.3.0 的 Command.Path 必须为绝对路径（不再做 PATH 查找，
+	// PATH 解析仅用于脚本 shebang 解释器），故直接用 /bin/sh。
+	return sb.Exec(ctx, sandbox.Command{Path: "/bin/sh", Args: []string{"-c", script.String()}})
 }
 
 func codeExecCleanEnvironment(projectRoot string, exports map[string]string) map[string]string {
@@ -1710,7 +1735,13 @@ func runWindowsSandboxCommand(ctx context.Context, sb sandbox.Sandbox, run codeE
 			fmt.Fprintf(os.Stderr, "code_exec: remove windows command wrapper %q: %v\n", wrapperPath, err)
 		}
 	}()
-	return sb.Exec(ctx, sandbox.Command{Path: "cmd", Args: []string{"/d", "/s", "/c", wrapperName}})
+	// toolkit v0.3.0 的 Command.Path 必须为绝对路径，经 ComSpec（系统 cmd 的绝对
+	// 路径环境变量）解析，缺失时回退到标准安装位置。
+	cmdPath := os.Getenv("ComSpec")
+	if cmdPath == "" {
+		cmdPath = `C:\Windows\System32\cmd.exe`
+	}
+	return sb.Exec(ctx, sandbox.Command{Path: cmdPath, Args: []string{"/d", "/s", "/c", wrapperName}})
 }
 
 func buildCodeExecReport(req codeExecRequest, run codeExecRun, command []string, result *sandbox.ExecResult, execErr error, missingDeps []string) codeExecReport {
@@ -2453,6 +2484,37 @@ func ensureCodeExecConfigDefaults(cfg sandbox.Config) sandbox.Config {
 	// 保留调用方自定义的 DeniedPaths。
 	cfg.DeniedPaths = mergeDeniedPaths(cfg.DeniedPaths, defaultSandboxDeniedPaths())
 	return cfg
+}
+
+// downgradeLimitsToCapabilities 按后端实际可证明的能力集收敛沙箱限额配置。
+//
+// toolkit v0.3.0 在 Exec 前 fail-closed 校验 RequiredCapabilities 必须被后端证明
+// （ErrRequiredCapabilitiesUnavailable），否则拒绝执行。对后端无法证明的限额维度：
+//   - 对应限额归零（toolkit 语义：零值=未请求，后端不设置上限）
+//   - 同步从 RequiredCapabilities 移除对应能力位，保持能力契约自洽
+//
+// 返回 (收敛后的配置, 是否发生变化)。基础隔离能力（Filesystem/Network/
+// ProcessContainment/Output）不参与收敛——那是 code_exec 的底线，缺失应保持
+// fail-closed 而非静默降级。mock 等不实现 CapabilityReporter 的后端由调用方跳过本函数。
+func downgradeLimitsToCapabilities(cfg sandbox.Config, available sandbox.CapabilitySet) (sandbox.Config, bool) {
+	changed := false
+	if cfg.MaxMemoryBytes > 0 && available&sandbox.CapabilityMemory == 0 {
+		cfg.MaxMemoryBytes = 0
+		cfg.RequiredCapabilities &^= sandbox.CapabilityMemory
+		changed = true
+	}
+	if (cfg.MaxWorkspaceBytes > 0 || cfg.MaxArtifactBytes > 0) && available&sandbox.CapabilityStorage == 0 {
+		cfg.MaxWorkspaceBytes = 0
+		cfg.MaxArtifactBytes = 0
+		cfg.RequiredCapabilities &^= sandbox.CapabilityStorage
+		changed = true
+	}
+	if cfg.MaxProcesses > 0 && available&sandbox.CapabilityProcesses == 0 {
+		cfg.MaxProcesses = 0
+		cfg.RequiredCapabilities &^= sandbox.CapabilityProcesses
+		changed = true
+	}
+	return cfg, changed
 }
 
 // defaultSandboxDeniedPaths 返回 code_exec 沙箱默认应遮蔽的 secrets 路径集合。

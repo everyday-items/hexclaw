@@ -294,13 +294,15 @@ func (a *DiscordAdapter) connectLoop(ctx context.Context) {
 // reconnectDelay 计算第 attempt 次重连前的退避时长。
 //
 // W3-3：复用 toolkit/util/retry 的指数退避算法（1s 起步、2 倍增长、封顶
-// reconnectMaxDelay），attempt 从 0 开始。
+// reconnectMaxDelay），attempt 从 0 开始。toolkit v0.3.0 的 ExponentialBackoff
+// 采用一基重试序号（非正序号返回 0），故映射为 attempt+1 保持原语义：
+// 第 0 次重连 1s、第 1 次 2s、第 2 次 4s。
 func (a *DiscordAdapter) reconnectDelay(attempt int) time.Duration {
 	cfg := retry.DefaultConfig()
 	cfg.Delay = reconnectBaseDelay
 	cfg.MaxDelay = reconnectMaxDelay
 	cfg.Multiplier = 2
-	return retry.ExponentialBackoff(attempt, cfg)
+	return retry.ExponentialBackoff(attempt+1, cfg)
 }
 
 // connect 建立 Gateway 连接并处理事件

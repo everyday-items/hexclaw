@@ -523,8 +523,10 @@ func TestCodeExecSkill_PosixWrapperDoesNotMkdirInsideSandbox(t *testing.T) {
 	s := newConfiguredTestCodeExecSkill(t, &mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30})
 	s.sandboxFactory = func(sandbox.Config) (sandbox.Sandbox, error) {
 		return &mockSandbox{execFn: func(_ context.Context, cmd string, args []string) (*sandbox.ExecResult, error) {
-			if cmd != "sh" {
-				t.Fatalf("cmd = %q, want sh", cmd)
+			// toolkit v0.3.0 的 Command.Path 必须为绝对路径（不做 PATH 查找），
+			// posix 包装统一使用 /bin/sh。
+			if cmd != "/bin/sh" {
+				t.Fatalf("cmd = %q, want /bin/sh", cmd)
 			}
 			if len(args) >= 2 {
 				script = args[1]

@@ -144,7 +144,7 @@ func RegisterAdvanced(registry *skill.DefaultRegistry, cfg config.BuiltinConfig,
 			// sidecar）——那是 SSRF 与权限自提升面（GO-1/GO-2）。
 			ReadablePaths: deps.SandboxReadablePaths,
 		}
-		sb, err := sandbox.New(sbCfg)
+		sb, err := sandbox.New(ensureCodeExecConfigDefaults(sbCfg))
 		if err != nil {
 			logger.Error("沙箱初始化失败，CodeExecSkill 不可用", "error", err)
 		} else {

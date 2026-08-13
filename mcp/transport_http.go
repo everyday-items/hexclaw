@@ -296,10 +296,12 @@ func (t *HTTPTransport) streamSSE(body io.Reader, handler func(json.RawMessage))
 				// 一并返回，无需额外 flush。
 				return nil
 			}
-			if errors.Is(err, sse.ErrMaxBytesExceeded) {
-				// 以 %w 包装 toolkit 的 sentinel，复用其超限身份：
-				// 调用方可 errors.Is(err, sse.ErrMaxBytesExceeded) 精确判定，
-				// 无需依赖字符串子串；文案保留 "exceeded maximum size" 语义，
+			if errors.Is(err, sse.ErrMaxBytesExceeded) || errors.Is(err, sse.ErrMaxEventBytesExceeded) || errors.Is(err, sse.ErrMaxLineBytesExceeded) {
+				// 以 %w 包装 toolkit 的哨兵错误，复用其超限身份：调用方可
+				// errors.Is(err, sse.ErrMaxBytesExceeded) 精确判定，无需依赖字符串子串。
+				// toolkit v0.3.0 的 Reader 按 单行/单事件/累计 三层字节上限返回不同哨兵
+				// （ErrMaxLineBytesExceeded / ErrMaxEventBytesExceeded / ErrMaxBytesExceeded），
+				// 统一归类为 over-size 错误包装；文案保留 "exceeded maximum size" 语义，
 				// 与本包既有错误契约（characterization 测试钉死）一致。
 				return fmt.Errorf("SSE stream exceeded maximum size of %d bytes: %w", maxTotalSSEBytes, err)
 			}
