@@ -293,8 +293,9 @@ func (s *Server) applyHydratedCredentials(ctx context.Context) error {
 	changed := false
 	for name, provider := range oldLLM.Providers {
 		if ref := strings.TrimSpace(provider.CredentialRef); ref != "" {
-			secret, _ := s.credentialResolver.Resolve(ref)
-			if provider.APIKey != secret {
+			// credential_ref 是原生请求链路使用的稳定标识，而不是与 YAML 竞争的数据源。
+			// 重启后 resolver 未命中属于预期情况，绝不能清空 owner 持久化在 YAML 中的 API key。
+			if secret, ok := s.credentialResolver.Resolve(ref); ok && provider.APIKey != secret {
 				provider.APIKey = secret
 				changed = true
 			}

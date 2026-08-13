@@ -429,7 +429,7 @@ type LLMToolsConfig struct {
 type LLMProviderConfig struct {
 	ProviderInstanceID string                 `yaml:"provider_instance_id,omitempty" json:"provider_instance_id,omitempty"` // 稳定内部身份，不随名称/Key/端点变化
 	DisplayName        string                 `yaml:"display_name,omitempty" json:"display_name,omitempty"`                 // 用户配置的展示名；不参与 Provider 路由
-	CredentialRef      string                 `yaml:"credential_ref,omitempty" json:"credential_ref,omitempty"`             // OS vault 中的非敏感稳定引用；存在时 APIKey 仅为进程内 hydrated secret
+	CredentialRef      string                 `yaml:"credential_ref,omitempty" json:"credential_ref,omitempty"`             // 原生协调器使用的稳定引用；不得覆盖 owner YAML 中持久化的 APIKey
 	APIKey             string                 `yaml:"api_key"`                                                              // API Key
 	BaseURL            string                 `yaml:"base_url"`                                                             // 自定义 API 端点（支持中转/私有部署）
 	Model              string                 `yaml:"model"`                                                                // 当前选中的文本模型；可空

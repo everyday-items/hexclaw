@@ -743,7 +743,7 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 				}
 			} else {
 				// Legacy API remains decode-compatible during the Desktop migration.
-				// A masked value preserves both runtime secret and vault reference;
+				// 掩码值会同时保留已加载的 YAML 密钥与稳定引用；
 				// plaintext/empty values explicitly return to the legacy inline mode.
 				if config.IsMaskedKey(apiKey) {
 					if !credentialOldExists {

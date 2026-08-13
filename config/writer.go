@@ -161,14 +161,17 @@ func (w *Writer) readConfig() (*Config, error) {
 }
 
 func (w *Writer) writeConfig(cfg *Config) error {
+	if err := ensureOwnerOnlyDefaultConfigParent(w.path); err != nil {
+		return err
+	}
 	// 写盘前把 MCP env 凭证静态加密（无 box 时 no-op，保持明文）。
 	EncryptMCPEnv(cfg.MCP.Servers, w.box)
 	data, err := marshalConfigForPersistence(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	// The config may contain legacy inline provider/MCP credentials. Keep the
-	// entire file owner-only even when newer entries use opaque credential refs.
+	// 仅所有者可访问的 YAML 中可能包含 Provider Key 和 MCP 凭据。
+	// 所有写入路径都必须确保整个文件仅所有者可访问。
 	return ReconcileCommittedWrite(atomicWriteFile(w.path, data, 0o600))
 }
 

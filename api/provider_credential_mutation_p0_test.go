@@ -54,7 +54,7 @@ func TestProviderCredentialMutationP0_ResolveModes(t *testing.T) {
 	}
 }
 
-func TestProviderCredentialMutationP0_TypedReplacePersistsOnlyRef(t *testing.T) {
+func TestProviderCredentialMutationP0_TypedReplacePersistsOwnerOnlyYAMLKey(t *testing.T) {
 	configHome := t.TempDir()
 	t.Setenv("HOME", configHome)
 	enabled := true
@@ -72,7 +72,8 @@ func TestProviderCredentialMutationP0_TypedReplacePersistsOnlyRef(t *testing.T) 
 	}
 	engine := &mockEngine{activeLLM: cfg.LLM}
 	srv := NewServer(cfg, engine, nil, nil)
-	if err := srv.credentialResolver.Hydrate(map[string]string{credentialTestRef: "sk-native-runtime-only"}); err != nil {
+	const persistedKey = "sk-native-yaml-persisted"
+	if err := srv.credentialResolver.Hydrate(map[string]string{credentialTestRef: persistedKey}); err != nil {
 		t.Fatal(err)
 	}
 	body := `{"default":"custom","providers":{"custom":{` +
@@ -89,15 +90,60 @@ func TestProviderCredentialMutationP0_TypedReplacePersistsOnlyRef(t *testing.T) 
 		t.Fatalf("typed replace status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	provider := srv.cfg.LLM.Providers["custom"]
-	if provider.APIKey != "sk-native-runtime-only" || provider.CredentialRef != credentialTestRef {
+	if provider.APIKey != persistedKey || provider.CredentialRef != credentialTestRef {
 		t.Fatalf("runtime provider key/ref=%q/%q", provider.APIKey, provider.CredentialRef)
 	}
-	raw, err := os.ReadFile(filepath.Join(configHome, ".hexclaw", "hexclaw.yaml"))
+	configDirectory := filepath.Join(configHome, ".hexclaw")
+	configPath := filepath.Join(configDirectory, "hexclaw.yaml")
+	raw, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "sk-native-runtime-only") || !strings.Contains(string(raw), credentialTestRef) {
-		t.Fatalf("persisted config leaked secret or lost ref:\n%s", raw)
+	if !strings.Contains(string(raw), persistedKey) || !strings.Contains(string(raw), credentialTestRef) {
+		t.Fatal("persisted config did not retain the provider key and stable reference")
+	}
+	fileInfo, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("config file permission=%#o, want 0600", fileInfo.Mode().Perm())
+	}
+	directoryInfo, err := os.Stat(configDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if directoryInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("config directory permission=%#o, want 0700", directoryInfo.Mode().Perm())
+	}
+}
+
+func TestProviderCredentialMutationP0_UnhydratedRefDoesNotClearPersistedYAMLKey(t *testing.T) {
+	enabled := true
+	cfg := config.DefaultConfig()
+	cfg.LLM.Default = "custom"
+	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
+		"custom": {
+			ProviderInstanceID: credentialTestProviderID,
+			CredentialRef:      credentialTestRef,
+			APIKey:             "sk-persisted-yaml-key",
+			BaseURL:            "https://api.example.test/v1",
+			Model:              "chat",
+			Models:             []string{"chat"},
+			Enabled:            &enabled,
+		},
+	}
+	engine := &mockEngine{activeLLM: cfg.LLM}
+	srv := NewServer(cfg, engine, nil, nil)
+
+	if err := srv.applyHydratedCredentials(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.cfg.LLM.Providers["custom"].APIKey; got != "sk-persisted-yaml-key" {
+		t.Fatal("an unresolved credential_ref cleared the persisted provider key")
+	}
+	if engine.reloadCalls != 0 {
+		t.Fatalf("unresolved credential_ref unexpectedly reloaded runtime %d times", engine.reloadCalls)
 	}
 }
 
@@ -237,8 +283,8 @@ func TestProviderCredentialMutationP0_CommitReceiptReplaysAcrossRestartAndConfli
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(persisted), "sk-new-runtime-only") || !strings.Contains(string(persisted), requestID) {
-		t.Fatalf("durable receipt leaked secret or was not persisted:\n%s", persisted)
+	if !strings.Contains(string(persisted), "sk-new-runtime-only") || !strings.Contains(string(persisted), requestID) {
+		t.Fatal("durable config did not retain the provider key and commit receipt")
 	}
 	restartedCfg, err := config.Load(persistedPath)
 	if err != nil {

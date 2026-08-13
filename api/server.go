@@ -120,7 +120,7 @@ type Server struct {
 	cfgWriter                 *config.Writer               // 配置文件写入器（MCP 持久化用）
 	wsHandler                 http.Handler                 // WebSocket Handler（可选）
 	sidecarCapabilityToken    string                       // Desktop 每次启动注入的 loopback-only capability（可选）
-	credentialResolver        *inMemoryCredentialResolver  // native-vault refs -> process-local hydrated secrets
+	credentialResolver        *inMemoryCredentialResolver  // 原生协调器引用 -> 进程内更新候选
 	attachmentStaging         *attachmentStagingStore      // owner-bound ephemeral binary receipts
 	extraMounts               []mountedHandler             // 场景包子路由（前缀 → handler，AP-1：平台不认识场景内容）
 	streamStates              streamstate.Provider         // 流式 in-flight 状态（可选）

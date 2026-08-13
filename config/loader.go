@@ -20,6 +20,39 @@ func configDir() (string, error) {
 	return filepath.Join(home, ".hexclaw"), nil
 }
 
+// ensureOwnerOnlyConfigDir 在需要时创建默认配置目录，并在每次持久化写入时
+// 修复目录权限。MkdirAll 无法收紧已有目录的权限，因此手动创建的 ~/.hexclaw
+// 可能会被其他本地账户读取。
+func ensureOwnerOnlyConfigDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("inspect config directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("config directory must be a non-symlink directory: %s", dir)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("restrict config directory permissions: %w", err)
+	}
+	return nil
+}
+
+// ensureOwnerOnlyDefaultConfigParent 仅对标准用户配置应用仅所有者可访问的目录规则。
+// 使用显式 --config 路径的调用方保留其自行选择的目录语义。
+func ensureOwnerOnlyDefaultConfigParent(configFile string) error {
+	dir, err := configDir()
+	if err != nil {
+		return nil
+	}
+	if filepath.Clean(configFile) != filepath.Join(dir, "hexclaw.yaml") {
+		return nil
+	}
+	return ensureOwnerOnlyConfigDir(dir)
+}
+
 // Load 加载配置
 //
 // 加载顺序：
@@ -94,9 +127,9 @@ func Init() (string, error) {
 		return "", err
 	}
 
-	// 创建目录
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", fmt.Errorf("创建配置目录失败: %w", err)
+	// 创建目录，并在目录早于本版本时修复其权限。
+	if err := ensureOwnerOnlyConfigDir(dir); err != nil {
+		return "", err
 	}
 
 	cfgPath := filepath.Join(dir, "hexclaw.yaml")
@@ -123,10 +156,10 @@ func Save(cfg *Config, configFile string) error {
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			return fmt.Errorf("创建配置目录失败: %w", err)
-		}
 		configFile = filepath.Join(dir, "hexclaw.yaml")
+	}
+	if err := ensureOwnerOnlyDefaultConfigParent(configFile); err != nil {
+		return err
 	}
 
 	data, err := marshalConfigForPersistence(cfg)
@@ -140,23 +173,11 @@ func Save(cfg *Config, configFile string) error {
 	return nil
 }
 
-// marshalConfigForPersistence strips process-local credentials while leaving
-// the live Config untouched. Transaction snapshots deliberately do not use
-// this helper because runtime appliers need the hydrated secret.
+// marshalConfigForPersistence 是持久化 YAML 的唯一序列化路径。
+// Provider API Key 及其稳定的 credential_ref 均属于仅所有者可访问的配置契约，
+// 因此此处不得丢弃任一字段。
 func marshalConfigForPersistence(cfg *Config) ([]byte, error) {
-	if cfg == nil {
-		return yaml.Marshal(cfg)
-	}
-	persisted := *cfg
-	persisted.LLM = cfg.LLM
-	persisted.LLM.Providers = make(map[string]LLMProviderConfig, len(cfg.LLM.Providers))
-	for name, provider := range cfg.LLM.Providers {
-		if strings.TrimSpace(provider.CredentialRef) != "" {
-			provider.APIKey = ""
-		}
-		persisted.LLM.Providers[name] = provider
-	}
-	return yaml.Marshal(&persisted)
+	return yaml.Marshal(cfg)
 }
 
 // MaskAPIKey 对 API Key 脱敏显示
