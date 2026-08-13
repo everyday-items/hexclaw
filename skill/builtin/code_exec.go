@@ -2529,7 +2529,7 @@ func defaultSandboxDeniedPaths() []string {
 		return nil
 	}
 	appDir := filepath.Join(home, ".hexclaw")
-	return []string{
+	paths := []string{
 		filepath.Join(home, ".ssh"),
 		filepath.Join(home, ".aws"),
 		filepath.Join(home, ".config", "gcloud"),
@@ -2539,6 +2539,15 @@ func defaultSandboxDeniedPaths() []string {
 		filepath.Join(appDir, "hexclaw.yaml"),
 		filepath.Join(appDir, "data.db"),
 	}
+	// toolkit v0.3.0 的 DeniedPaths 必须在载荷启动前真实存在（fail-closed）；
+	// 过滤掉本机不存在的凭据目录，避免空跑环境（如 CI）因缺失路径拒绝执行。
+	existing := paths[:0]
+	for _, p := range paths {
+		if _, statErr := os.Lstat(p); statErr == nil {
+			existing = append(existing, p)
+		}
+	}
+	return existing
 }
 
 // mergeDeniedPaths 合并两组 deny 路径并去重（保留出现顺序）。
