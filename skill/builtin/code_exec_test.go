@@ -507,6 +507,11 @@ func TestCodeExecSkill_PreparesEnvDirsOutsideSandbox(t *testing.T) {
 func TestCodeExecSkill_GoRuntimeReadablePathsIncludeSumDB(t *testing.T) {
 	gopath := filepath.Join(t.TempDir(), "gopath")
 	t.Setenv("GOPATH", gopath)
+	// toolkit v0.3.0 的 ReadablePaths 必须真实存在（fail-closed），
+	// goRuntimeReadablePaths 会过滤不存在的宿主路径，测试先落地缓存目录。
+	if err := os.MkdirAll(filepath.Join(gopath, "pkg", "sumdb"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	paths := goRuntimeReadablePaths()
 	want := filepath.Join(gopath, "pkg", "sumdb")
