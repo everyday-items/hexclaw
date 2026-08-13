@@ -93,11 +93,14 @@ import (
 	"github.com/hexagon-codes/hexclaw/webhook"
 )
 
-// 版本信息，通过 -ldflags 注入
+const sidecarVersionIdentityAnnotation = "hexclaw.internal/sidecar-version-identity"
+
+// 版本信息通过 -ldflags 注入；桌面打包身份用于在不执行目标文件时校验产物版本。
 var (
-	version = "v0.5.0-beta"
-	commit  = "none"
-	date    = "unknown"
+	version                = "v0.5.0-beta"
+	commit                 = "none"
+	date                   = "unknown"
+	sidecarVersionIdentity = "hexclaw-sidecar-version=development;"
 )
 
 func main() {
@@ -184,8 +187,9 @@ func newInitCmd() *cobra.Command {
 // newVersionCmd 创建 version 子命令
 func newVersionCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "version",
-		Short: "显示版本信息",
+		Use:         "version",
+		Short:       "Show version information",
+		Annotations: map[string]string{sidecarVersionIdentityAnnotation: sidecarVersionIdentity},
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Printf("HexClaw %s\n", version)
 			fmt.Printf("  Commit: %s\n", commit)
