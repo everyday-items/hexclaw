@@ -23,7 +23,7 @@ func (e *ReActEngine) SuggestSessionTitle(ctx context.Context, messages []*stora
 
 	modelName := e.getProviderModel(providerName, map[string]string{"thinking": "off"})
 	if modelName != "" {
-		provider = &modelOverrideProvider{inner: provider, model: modelName}
+		provider = wrapModelOverrideProvider(provider, modelName)
 	}
 
 	title, err := session.SuggestTitle(ctx, provider, messages)

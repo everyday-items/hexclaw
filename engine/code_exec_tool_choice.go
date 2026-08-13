@@ -20,7 +20,10 @@ func wrapCodeExecToolChoiceProvider(provider hexagon.Provider, userContent strin
 	if provider == nil || !shouldForceCodeExecTool(userContent) {
 		return provider
 	}
-	return &codeExecToolChoiceProvider{provider: provider, userContent: userContent}
+	return preserveContextTokenCounter(
+		&codeExecToolChoiceProvider{provider: provider, userContent: userContent},
+		provider,
+	)
 }
 
 func (p *codeExecToolChoiceProvider) Name() string {

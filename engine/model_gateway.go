@@ -86,7 +86,7 @@ func ObserveMiddleware(recorder CallRecorder) ProviderMiddleware {
 		return func(next hexagon.Provider) hexagon.Provider { return next }
 	}
 	return func(next hexagon.Provider) hexagon.Provider {
-		return &observeProvider{inner: next, recorder: recorder}
+		return preserveContextTokenCounter(&observeProvider{inner: next, recorder: recorder}, next)
 	}
 }
 
@@ -148,7 +148,7 @@ func RateLimitMiddleware(maxRequests int, windowDuration time.Duration) Provider
 		window:      windowDuration,
 	}
 	return func(next hexagon.Provider) hexagon.Provider {
-		return &rateLimitProvider{inner: next, rl: rl}
+		return preserveContextTokenCounter(&rateLimitProvider{inner: next, rl: rl}, next)
 	}
 }
 
@@ -222,7 +222,7 @@ func PromptRewriteMiddleware(fn PromptRewriteFunc) ProviderMiddleware {
 		return func(next hexagon.Provider) hexagon.Provider { return next }
 	}
 	return func(next hexagon.Provider) hexagon.Provider {
-		return &promptRewriteProvider{inner: next, fn: fn}
+		return preserveContextTokenCounter(&promptRewriteProvider{inner: next, fn: fn}, next)
 	}
 }
 

@@ -1265,13 +1265,13 @@ func (e *ReActEngine) completeWithTools(
 			if !e.shouldBoundThinkingCompletion(name, model, req) {
 				return p
 			}
-			return &thinkingBoundProvider{
+			return preserveContextTokenCounter(&thinkingBoundProvider{
 				engine:       e,
 				provider:     p,
 				providerName: name,
 				modelName:    model,
 				tracker:      thinkingTracker,
-			}
+			}, p)
 		},
 	}
 	middleware := []hruntime.Middleware{
@@ -4011,10 +4011,10 @@ func wrapVisionImageLimitProvider(p hexagon.Provider, modelName string) hexagon.
 	if p == nil {
 		return p
 	}
-	if _, already := p.(*visionImageLimitProvider); already {
+	if _, already := unwrapContextTokenCounterProvider(p).(*visionImageLimitProvider); already {
 		return p
 	}
-	return &visionImageLimitProvider{inner: p, model: modelName}
+	return preserveContextTokenCounter(&visionImageLimitProvider{inner: p, model: modelName}, p)
 }
 
 func applyModelThinkingDefaults(req *hexagon.CompletionRequest, modelName, userContent string) {
@@ -4512,7 +4512,7 @@ func (e *ReActEngine) resolveLLMSelection(ctx context.Context, msg *adapter.Mess
 
 	modelName := e.getProviderModel(providerName, msg.Metadata)
 	if modelName != "" {
-		provider = &modelOverrideProvider{inner: provider, model: modelName}
+		provider = wrapModelOverrideProvider(provider, modelName)
 	}
 
 	return llmSelection{
@@ -4551,7 +4551,7 @@ func (e *ReActEngine) reasoningSelectionForSolve(msg *adapter.Message) (llmSelec
 		model = router.ProviderModel(prov)
 	}
 	if model != "" {
-		provider = &modelOverrideProvider{inner: provider, model: model}
+		provider = wrapModelOverrideProvider(provider, model)
 	}
 	return llmSelection{
 		provider:     provider,

@@ -243,22 +243,25 @@ func (r *Selector) providerLocked(name string) hexagon.Provider {
 		return p
 	}
 	if r.egressPolicy != nil && !r.isLocalProviderName(name) {
-		p = &cloudEgressProvider{next: p, policy: r.egressPolicy}
+		inner := p
+		p = preserveContextTokenCounter(&cloudEgressProvider{next: inner, policy: r.egressPolicy}, inner)
 	}
 	if providerConfig, configured := r.cfg.Providers[name]; configured {
 		if r.localInference != nil && r.isLocalProviderName(name) {
-			p = &localInferenceProvider{
-				next: p, coordinator: r.localInference,
+			inner := p
+			p = preserveContextTokenCounter(&localInferenceProvider{
+				next: inner, coordinator: r.localInference,
 				defaultModel: providerConfig.Model, budgetForModel: localChatBudget,
-			}
+			}, inner)
 		}
 		// This wrapper is the final completion/stream boundary shared by Chat,
 		// Agents, QuickChat, channels and capability probes. UI filtering is not
 		// a security boundary: a stale session or direct API caller must still be
 		// unable to send embedding-only/unclassified IDs to chat transports.
-		p = &completionCapabilityProvider{
-			next: p, providerName: name, providerConfig: providerConfig,
-		}
+		inner := p
+		p = preserveContextTokenCounter(&completionCapabilityProvider{
+			next: inner, providerName: name, providerConfig: providerConfig,
+		}, inner)
 	}
 	return p
 }
