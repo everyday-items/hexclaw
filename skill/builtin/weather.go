@@ -25,7 +25,7 @@ type WeatherSkill struct {
 
 func NewWeatherSkill() *WeatherSkill {
 	return &WeatherSkill{
-		client: httpx.RawClient(httpx.WithRawTimeout(10 * time.Second)),
+		client: httpx.MustNewRawClient(httpx.WithRawTimeout(10 * time.Second)),
 	}
 }
 

@@ -68,7 +68,7 @@ func New(cfg Config) *WhatsAppAdapter {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	a := &WhatsAppAdapter{
 		config:       cfg,
-		client:       httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
+		client:       httpx.MustNewRawClient(httpx.WithRawTimeout(30 * time.Second)),
 		workerCtx:    workerCtx,
 		workerCancel: workerCancel,
 	}

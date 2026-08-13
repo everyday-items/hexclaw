@@ -54,7 +54,7 @@ type FeishuAdapter struct {
 func New(cfg config.FeishuConfig) *FeishuAdapter {
 	a := &FeishuAdapter{
 		cfg:    cfg,
-		client: httpx.RawClient(httpx.WithRawTimeout(10 * time.Second)),
+		client: httpx.MustNewRawClient(httpx.WithRawTimeout(10 * time.Second)),
 	}
 	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformFeishu, a.sendReplyNow)
 	return a

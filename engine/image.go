@@ -98,7 +98,7 @@ func generateImage(ctx context.Context, svc *mediaimg.Service, model, prompt str
 }
 
 // imageHTTPClient 图片下载专用 HTTP client（复用连接池）
-var imageHTTPClient = httpx.RawClient(httpx.WithRawTimeout(60 * time.Second))
+var imageHTTPClient = httpx.MustNewRawClient(httpx.WithRawTimeout(60 * time.Second))
 
 // downloadAsDataURI 下载图片并转为 base64 data URI
 func downloadAsDataURI(ctx context.Context, url string) (string, error) {

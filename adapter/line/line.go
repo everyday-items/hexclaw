@@ -56,7 +56,7 @@ func New(cfg Config) *LineAdapter {
 	}
 	a := &LineAdapter{
 		config: cfg,
-		client: httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
+		client: httpx.MustNewRawClient(httpx.WithRawTimeout(30 * time.Second)),
 	}
 	a.queue = adapter.NewPlatformSendQueue(PlatformLINE, a.sendReplyNow)
 	return a

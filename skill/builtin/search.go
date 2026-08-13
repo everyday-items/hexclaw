@@ -25,7 +25,7 @@ type SearchSkill struct {
 // NewSearchSkill 创建搜索 Skill
 func NewSearchSkill() *SearchSkill {
 	return &SearchSkill{
-		client: httpx.RawClient(httpx.WithRawTimeout(10 * time.Second)),
+		client: httpx.MustNewRawClient(httpx.WithRawTimeout(10 * time.Second)),
 	}
 }
 

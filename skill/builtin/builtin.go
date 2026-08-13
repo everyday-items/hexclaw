@@ -136,13 +136,12 @@ func RegisterAdvanced(registry *skill.DefaultRegistry, cfg config.BuiltinConfig,
 		sbCfg := sandbox.Config{
 			Workspace: ws,
 			Timeout:   30,
-			Network:   cfg.CodeExecPolicy.CodeExecNetworkAllowed(),
+			Network:   sandbox.NetworkMode(cfg.CodeExecPolicy.CodeExecNetworkAllowed()),
+			// 注：toolkit v0.3.0 移除了 DenyLoopback 配置项（Network 仅支持 disabled/host
+			// 两种明确语义，回环拦截下沉到平台后端能力实现），此处不再显式设置。
 			// 允许外网但禁止本机回环：无人值守 agent 的 code_exec 需要抓网页/调 API，
 			// 但绝不该经 loopback 打本机管理端口（API server 自提权 / Ollama / 其它
-			// sidecar）——那是 SSRF 与权限自提升面（GO-1/GO-2）。darwin 经 seatbelt
-			// 强制；linux 目前 Network=true 不隔离 net namespace，回环仍可达（能力缺口）。
-			DenyLoopback: true,
-			// 用户经数据连接器授权的本地目录 → 沙箱只读放行，否则 code_exec 读不到（BUG-20260626）。
+			// sidecar）——那是 SSRF 与权限自提升面（GO-1/GO-2）。
 			ReadablePaths: deps.SandboxReadablePaths,
 		}
 		sb, err := sandbox.New(sbCfg)

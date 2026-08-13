@@ -28,7 +28,7 @@ type BrowserSkill struct {
 // NewBrowserSkill 创建浏览器技能
 func NewBrowserSkill() *BrowserSkill {
 	return &BrowserSkill{
-		client: httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
+		client: httpx.MustNewRawClient(httpx.WithRawTimeout(30 * time.Second)),
 	}
 }
 

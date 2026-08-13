@@ -56,7 +56,7 @@ func New(cfg config.TelegramConfig) *TelegramAdapter {
 	handlerCtx, handlerCancel := context.WithCancel(context.Background())
 	a := &TelegramAdapter{
 		cfg:           cfg,
-		client:        httpx.RawClient(httpx.WithRawTimeout(40 * time.Second)),
+		client:        httpx.MustNewRawClient(httpx.WithRawTimeout(40 * time.Second)),
 		stopCh:        make(chan struct{}),
 		handlerCtx:    handlerCtx,
 		handlerCancel: handlerCancel,

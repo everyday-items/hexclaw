@@ -59,7 +59,7 @@ func NewHTTPTransport(endpoint string, opts ...HTTPOption) *HTTPTransport {
 		endpoint: strings.TrimRight(endpoint, "/"),
 		// 复用 toolkit httpx：带 ResponseHeaderTimeout（默认 120s）防服务端连上不发数据挂死，
 		// 且不设整体 Timeout 以兼容 Streamable HTTP 长流；取代裸 http.DefaultClient（无任何超时）。
-		httpClient: httpx.RawClient(),
+		httpClient: httpx.MustNewRawClient(),
 		headers:    make(map[string]string),
 	}
 	for _, opt := range opts {
@@ -280,10 +280,13 @@ const maxTotalSSEBytes = 100 * 1024 * 1024 // 100 MB total SSE stream limit
 // JSON-RPC 层语义（error 传播、仅 result != nil 才回调、空/非法 data 静默忽略）
 // 不属于通用 SSE 能力，保留在本函数内：Reader 只负责把每个事件的 data 还原出来。
 func (t *HTTPTransport) streamSSE(body io.Reader, handler func(json.RawMessage)) error {
-	reader := sse.NewReaderWithOptions(body,
+	reader, err := sse.NewReaderWithOptions(body,
 		sse.WithMaxTotalBytes(maxTotalSSEBytes), // 100MB 总流量上限，防 DoS
 		sse.WithStrictDataPrefix(),              // 仅接受规范 "data: " 前缀
 	)
+	if err != nil {
+		return fmt.Errorf("create SSE reader: %w", err)
+	}
 
 	for {
 		event, err := reader.Read()

@@ -47,10 +47,10 @@ func NewRateLimitLayer(cfg config.RateLimitConfig) *RateLimitLayer {
 func (l *RateLimitLayer) newUserWindows() *userWindows {
 	uw := &userWindows{}
 	if l.cfg.RequestsPerMinute > 0 {
-		uw.minute = rate.NewSlidingWindow(l.cfg.RequestsPerMinute, time.Minute)
+		uw.minute = rate.MustNewSlidingWindow(l.cfg.RequestsPerMinute, time.Minute)
 	}
 	if l.cfg.RequestsPerHour > 0 {
-		uw.hour = rate.NewSlidingWindow(l.cfg.RequestsPerHour, time.Hour)
+		uw.hour = rate.MustNewSlidingWindow(l.cfg.RequestsPerHour, time.Hour)
 	}
 	return uw
 }

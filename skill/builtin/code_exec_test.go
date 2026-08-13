@@ -28,11 +28,15 @@ func (m *mockSandbox) ExecCode(ctx context.Context, lang, code string) (*sandbox
 	return &sandbox.ExecResult{Stdout: "mock output", ExitCode: 0}, nil
 }
 
-func (m *mockSandbox) Exec(ctx context.Context, cmd string, args []string) (*sandbox.ExecResult, error) {
+func (m *mockSandbox) Exec(ctx context.Context, command sandbox.Command) (*sandbox.ExecResult, error) {
 	if m.execFn != nil {
-		return m.execFn(ctx, cmd, args)
+		return m.execFn(ctx, command.Path, command.Args)
 	}
 	return &sandbox.ExecResult{ExitCode: 0}, nil
+}
+
+func (m *mockSandbox) Close() error {
+	return nil
 }
 
 func newTestCodeExecSkill(t *testing.T) *CodeExecSkill {
@@ -94,7 +98,7 @@ func requireCodeExecSandbox(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		res, err := sb.Exec(ctx, "sh", []string{"-c", "true"})
+		res, err := sb.Exec(ctx, sandbox.Command{Path: "sh", Args: []string{"-c", "true"}})
 		if err != nil {
 			codeExecSandboxProbeErr = err
 			return
@@ -585,7 +589,7 @@ func TestCodeExecSkill_Execute_PythonCrawlerNetworkPolicy(t *testing.T) {
 	run := func(t *testing.T, network bool) string {
 		t.Helper()
 		ws := t.TempDir()
-		cfg := sandbox.Config{Workspace: ws, Timeout: 20, Network: network}
+		cfg := sandbox.Config{Workspace: ws, Timeout: 20, Network: sandbox.NetworkMode(network)}
 		sb, err := sandbox.New(cfg)
 		if err != nil {
 			t.Fatalf("create sandbox network=%v: %v", network, err)
@@ -874,7 +878,7 @@ func TestCodeExecSkill_Execute_NetworkPolicyPropagatesToRunSandbox(t *testing.T)
 	s := newConfiguredTestCodeExecSkill(t, &mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30, Network: false})
 	s.sandboxFactory = func(cfg sandbox.Config) (sandbox.Sandbox, error) {
 		mu.Lock()
-		networks = append(networks, cfg.Network)
+		networks = append(networks, bool(cfg.Network))
 		mu.Unlock()
 		return &mockSandbox{execFn: func(_ context.Context, _ string, args []string) (*sandbox.ExecResult, error) {
 			mu.Lock()
@@ -989,7 +993,7 @@ func TestCodeExecSkill_Execute_NetworkPolicyControlsDependencyInstall(t *testing
 		var mu sync.Mutex
 		var scripts []string
 		calls := 0
-		s := newConfiguredTestCodeExecSkill(t, &mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30, Network: network})
+		s := newConfiguredTestCodeExecSkill(t, &mockSandbox{}, sandbox.Config{Workspace: t.TempDir(), Timeout: 30, Network: sandbox.NetworkMode(network)})
 		s.sandboxFactory = func(sandbox.Config) (sandbox.Sandbox, error) {
 			return &mockSandbox{execFn: func(_ context.Context, _ string, args []string) (*sandbox.ExecResult, error) {
 				mu.Lock()

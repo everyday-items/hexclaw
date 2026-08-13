@@ -85,7 +85,7 @@ func New(cfg config.DiscordConfig) *DiscordAdapter {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	a := &DiscordAdapter{
 		cfg:          cfg,
-		client:       httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
+		client:       httpx.MustNewRawClient(httpx.WithRawTimeout(30 * time.Second)),
 		workerCtx:    workerCtx,
 		workerCancel: workerCancel,
 	}

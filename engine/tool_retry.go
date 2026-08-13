@@ -74,7 +74,8 @@ func (w *ToolRetryWrapper) Execute(
 		retry.Delay(time.Second),
 		retry.MaxDelay(8*time.Second),
 		retry.Multiplier(2.0),
-		retry.RetryIf(isTransientError),
+		retry.DelayType(retry.ExponentialBackoff),
+		retry.If(isTransientError),
 		retry.OnRetry(func(n int, err error) {
 			logger.Info("[retry]", "toolName", toolName, "value", n+1, "value", maxRetries+1, "error", err)
 		}),

@@ -58,7 +58,7 @@ type SlackAdapter struct {
 func New(cfg config.SlackConfig) *SlackAdapter {
 	a := &SlackAdapter{
 		cfg:    cfg,
-		client: httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
+		client: httpx.MustNewRawClient(httpx.WithRawTimeout(30 * time.Second)),
 	}
 	a.queue = adapter.NewPlatformSendQueue(adapter.PlatformSlack, a.sendReplyNow)
 	return a

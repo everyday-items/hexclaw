@@ -632,7 +632,11 @@ func (s *Server) handleOllamaPull(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming not supported"})
 		return
 	}
-	writer := sse.NewWriter(w)
+	writer, err := sse.NewWriter(w)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("SSE writer: %v", err)})
+		return
+	}
 
 	// Ollama 的 /api/pull 是流式 JSON（每行一个 JSON 对象），逐行透传为 SSE data 事件。
 	scanner := bufio.NewScanner(pullResp.Body)

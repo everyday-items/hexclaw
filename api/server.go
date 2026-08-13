@@ -1425,7 +1425,14 @@ func (s *Server) handleChatSSE(
 
 	// sse.NewWriter sets the text/event-stream headers; the immediate Flush
 	// commits a 200 and opens the stream before the first chunk arrives.
-	writer := sse.NewWriter(w)
+	writer, err := sse.NewWriter(w)
+	if err != nil {
+		trace.L(ctx).Error("[SSE] NewWriter 失败", "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "server does not support streaming",
+		})
+		return
+	}
 	writer.Flush()
 
 	trace.L(ctx).Info("[SSE] 开始流式响应", "session", msg.SessionID, "user", msg.UserID)

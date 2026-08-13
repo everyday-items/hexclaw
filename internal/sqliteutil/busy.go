@@ -50,7 +50,8 @@ func busyRetryOptions() []retry.Option {
 		retry.Delay(10 * time.Millisecond),
 		retry.MaxDelay(200 * time.Millisecond),
 		retry.Multiplier(2.0),
-		retry.RetryIf(IsBusyError),
+		retry.DelayType(retry.ExponentialBackoff),
+		retry.If(IsBusyError),
 	}
 }
 

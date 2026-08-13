@@ -125,7 +125,7 @@ func fetchToDataURL(ctx context.Context, rawURL string, client *http.Client, max
 	// SSRF 前置闸门：在发起任何连接前校验目标 URL，拒绝私网/回环/云元数据端点
 	// （169.254.169.254 等），并抵御 DNS rebinding（RU-13）。此前注释谎称"经 SSRF
 	// 闸门"但实际未接入，用户 markdown 里的图片 URL 可直连内网/元数据窃取凭据。
-	if err := ssrf.ValidateURL(rawURL); err != nil {
+	if err := ssrf.ValidateURL(ctx, rawURL); err != nil {
 		return "", &RenderError{Code: CodeInvalidInput, Detail: fmt.Sprintf("SSRF check failed for %s: %v", rawURL, err)}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -210,7 +210,7 @@ func clientWithSafeRedirects(client *http.Client) (*http.Client, error) {
 		if req != nil && req.URL != nil {
 			target = req.URL.String()
 		}
-		if err := ssrf.ValidateURL(target); err != nil {
+		if err := ssrf.ValidateURL(req.Context(), target); err != nil {
 			return fmt.Errorf("SSRF check failed for redirect %s: %w", target, err)
 		}
 		if len(via) >= 5 {

@@ -150,11 +150,11 @@ func NewCodeExecSkill(sb sandbox.Sandbox, cfg sandbox.Config) *CodeExecSkill {
 func (s *CodeExecSkill) UpdateNetwork(enabled bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cfg.Network == enabled {
+	if bool(s.cfg.Network) == enabled {
 		return nil // 没变化
 	}
 	nextCfg := s.cfg
-	nextCfg.Network = enabled
+	nextCfg.Network = sandbox.NetworkMode(enabled)
 	newSb, err := s.buildSandboxLocked(nextCfg)
 	if err != nil {
 		return fmt.Errorf("rebuild sandbox failed: %w", err)
@@ -168,7 +168,7 @@ func (s *CodeExecSkill) UpdateNetwork(enabled bool) error {
 func (s *CodeExecSkill) NetworkEnabled() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.cfg.Network
+	return bool(s.cfg.Network)
 }
 
 // UpdateReadablePaths hot-updates extra read-only host paths granted to code_exec.
@@ -279,7 +279,7 @@ func (s *CodeExecSkill) Execute(ctx context.Context, args map[string]any) (*skil
 
 	result, execErr := runSandboxCommand(ctx, sb, run, command)
 	missingDeps := detectMissingPackages(req.Language, execText(result, execErr))
-	if run.Config.Network && result != nil && result.ExitCode != 0 && len(missingDeps) > 0 {
+	if bool(run.Config.Network) && result != nil && result.ExitCode != 0 && len(missingDeps) > 0 {
 		if installCmd := buildInstallCommand(req.Language, missingDeps); installCmd != "" {
 			installResult, installErr := runSandboxCommand(ctx, sb, run, []string{"sh", "-c", installCmd})
 			if installErr == nil && installResult != nil && installResult.ExitCode == 0 {
@@ -1511,7 +1511,7 @@ func codeExecEnv(run codeExecRun) map[string]string {
 	if run.GoWorkPath != "" {
 		exports["GOWORK"] = run.GoWorkPath
 	}
-	if run.Config.Network {
+	if bool(run.Config.Network) {
 		exports["GOMODCACHE"] = filepath.Join(run.CacheDir, "gomod")
 	} else if run.GoRuntime {
 		if run.StagedProject {
@@ -1547,7 +1547,7 @@ var codeExecWritableEnvKeys = []string{
 func ensureCodeExecEnvDirs(run codeExecRun, exports map[string]string) error {
 	seen := map[string]bool{}
 	for _, key := range codeExecWritableEnvKeys {
-		if key == "GOMODCACHE" && run.GoRuntime && !run.Config.Network && !run.StagedProject {
+		if key == "GOMODCACHE" && run.GoRuntime && !bool(run.Config.Network) && !run.StagedProject {
 			continue
 		}
 		dir := strings.TrimSpace(exports[key])
@@ -1623,7 +1623,7 @@ func runPosixSandboxCommandInDir(ctx context.Context, sb sandbox.Sandbox, projec
 	}
 	script.WriteString(" ")
 	script.WriteString(shellJoin(command))
-	return sb.Exec(ctx, "sh", []string{"-c", script.String()})
+	return sb.Exec(ctx, sandbox.Command{Path: "sh", Args: []string{"-c", script.String()}})
 }
 
 func codeExecCleanEnvironment(projectRoot string, exports map[string]string) map[string]string {
@@ -1710,7 +1710,7 @@ func runWindowsSandboxCommand(ctx context.Context, sb sandbox.Sandbox, run codeE
 			fmt.Fprintf(os.Stderr, "code_exec: remove windows command wrapper %q: %v\n", wrapperPath, err)
 		}
 	}()
-	return sb.Exec(ctx, "cmd", []string{"/d", "/s", "/c", wrapperName})
+	return sb.Exec(ctx, sandbox.Command{Path: "cmd", Args: []string{"/d", "/s", "/c", wrapperName}})
 }
 
 func buildCodeExecReport(req codeExecRequest, run codeExecRun, command []string, result *sandbox.ExecResult, execErr error, missingDeps []string) codeExecReport {
@@ -2433,6 +2433,20 @@ func ensureCodeExecConfigDefaults(cfg sandbox.Config) sandbox.Config {
 	}
 	if cfg.MaxProcesses <= 0 {
 		cfg.MaxProcesses = 64
+	}
+	// toolkit v0.3.0 要求非空能力契约：不可信代码从 UntrustedCodeIsolationCapabilities
+	// 起步，配置了正值资源限额时必须追加对应能力，否则后端拒绝启动（fail closed）。
+	if cfg.RequiredCapabilities == 0 {
+		cfg.RequiredCapabilities = sandbox.UntrustedCodeIsolationCapabilities
+		if cfg.MaxMemoryBytes > 0 {
+			cfg.RequiredCapabilities |= sandbox.CapabilityMemory
+		}
+		if cfg.MaxProcesses > 0 {
+			cfg.RequiredCapabilities |= sandbox.CapabilityProcesses
+		}
+		if cfg.MaxWorkspaceBytes > 0 || cfg.MaxArtifactBytes > 0 {
+			cfg.RequiredCapabilities |= sandbox.CapabilityStorage
+		}
 	}
 	// 默认遮蔽宿主机 secrets：即使 project 模式把 $HOME 当 workspace 放行，这些路径
 	// 仍被沙箱 deny 规则（darwin deny-after-allow / linux 掩蔽）优先遮蔽。合并而非覆盖，

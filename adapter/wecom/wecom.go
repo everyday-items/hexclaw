@@ -72,7 +72,7 @@ type WecomAdapter struct {
 func New(cfg config.WecomConfig) *WecomAdapter {
 	a := &WecomAdapter{
 		cfg:    cfg,
-		client: httpx.RawClient(httpx.WithRawTimeout(10 * time.Second)),
+		client: httpx.MustNewRawClient(httpx.WithRawTimeout(10 * time.Second)),
 	}
 	// 解码 EncodingAESKey（Base64 + 补 "="）
 	if cfg.AESKey != "" {

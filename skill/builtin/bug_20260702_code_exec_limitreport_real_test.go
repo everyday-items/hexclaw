@@ -53,26 +53,26 @@ func TestBug20260702_BuildReport_CapabilitiesReflectLimits(t *testing.T) {
 			repA.MaxMemoryBytes, repA.MaxProcesses, repA.MaxWorkspaceBytes)
 	}
 
-	// 场景 B：文件系统弱隔离（linux unshare 兜底）——fail_closed 应据实为 false 并标降级。
+	// 场景 B：文件系统隔离不可用（toolkit v0.3.0 移除 Weak 状态，降级由 Unsupported 表达）——fail_closed 应据实为 false 并标降级。
 	weakFS := &sandbox.ExecResult{ExitCode: 0, Limits: sandbox.LimitReport{
 		Memory:     sandbox.LimitStatusEnforced,
 		Processes:  sandbox.LimitStatusEnforced,
 		Storage:    sandbox.LimitStatusEnforced,
 		Output:     sandbox.LimitStatusEnforced,
-		Filesystem: sandbox.LimitStatusWeak,
+		Filesystem: sandbox.LimitStatusUnsupported,
 	}}
 	repB := buildCodeExecReport(req, run, []string{"python3", "x.py"}, weakFS, nil, nil)
 	if got := repB.Capabilities["fail_closed"]; got != false {
-		t.Errorf("B: 文件系统 weak 时 fail_closed 应如实为 false（不再谎报 true），得 %v", got)
+		t.Errorf("B: 文件系统 unsupported 时 fail_closed 应如实为 false（不再谎报 true），得 %v", got)
 	}
-	if got := repB.Capabilities["filesystem_isolation"]; got != "weak" {
-		t.Errorf("B: filesystem_isolation 应为 weak，得 %v", got)
+	if got := repB.Capabilities["filesystem_isolation"]; got != "unsupported" {
+		t.Errorf("B: filesystem_isolation 应为 unsupported，得 %v", got)
 	}
 	if !repB.FilesystemDegraded {
-		t.Errorf("B: 文件系统 weak 应标降级")
+		t.Errorf("B: 文件系统 unsupported 应标降级")
 	}
-	if repB.FilesystemIsolation != "weak" {
-		t.Errorf("B: FilesystemIsolation 应为 weak，得 %q", repB.FilesystemIsolation)
+	if repB.FilesystemIsolation != "unsupported" {
+		t.Errorf("B: FilesystemIsolation 应为 unsupported，得 %q", repB.FilesystemIsolation)
 	}
 
 	// 场景 C：全维 enforced（linux bwrap / windows）——两个汇总位都为 true。

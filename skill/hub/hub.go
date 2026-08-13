@@ -161,7 +161,7 @@ func New(cfg HubConfig, skillsDir string) *Hub {
 
 	return &Hub{
 		cfg:       cfg,
-		client:    httpx.RawClient(httpx.WithRawTimeout(30 * time.Second)),
+		client:    httpx.MustNewRawClient(httpx.WithRawTimeout(30 * time.Second)),
 		skillsDir: skillsDir,
 	}
 }

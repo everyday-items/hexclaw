@@ -75,7 +75,7 @@ type WechatAdapter struct {
 func New(cfg config.WechatConfig) *WechatAdapter {
 	a := &WechatAdapter{
 		cfg:    cfg,
-		client: httpx.RawClient(httpx.WithRawTimeout(10 * time.Second)),
+		client: httpx.MustNewRawClient(httpx.WithRawTimeout(10 * time.Second)),
 	}
 	// 安全模式：解码 EncodingAESKey（43 字符 Base64，需补 "=" 后再解码为 32 字节 AES-256 Key）。
 	if cfg.AESKey != "" {

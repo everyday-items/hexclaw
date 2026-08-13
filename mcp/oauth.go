@@ -25,7 +25,7 @@ import (
 
 // oauthHTTPClient 复用 toolkit httpx：带 ResponseHeaderTimeout 防"连上但不发数据"挂死，
 // 取代裸 http.DefaultClient（无任何超时）。OAuth token 交换是短请求，30s 首字节超时足够。
-var oauthHTTPClient = httpx.RawClient(httpx.WithResponseHeaderTimeout(30 * time.Second))
+var oauthHTTPClient = httpx.MustNewRawClient(httpx.WithResponseHeaderTimeout(30 * time.Second))
 
 // OAuthConfig holds OAuth 2.0 configuration for an MCP server.
 type OAuthConfig struct {

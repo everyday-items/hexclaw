@@ -67,7 +67,7 @@ func New(cfg Config) *MatrixAdapter {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	a := &MatrixAdapter{
 		config:       cfg,
-		client:       httpx.RawClient(httpx.WithRawTimeout(time.Duration(cfg.SyncTimeout+10) * time.Second)),
+		client:       httpx.MustNewRawClient(httpx.WithRawTimeout(time.Duration(cfg.SyncTimeout+10) * time.Second)),
 		stopCh:       make(chan struct{}),
 		workerCtx:    workerCtx,
 		workerCancel: workerCancel,
