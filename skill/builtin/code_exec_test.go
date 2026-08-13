@@ -591,7 +591,7 @@ func TestCodeExecSkill_Execute_PythonCrawlerNetworkPolicy(t *testing.T) {
 	run := func(t *testing.T, network bool) string {
 		t.Helper()
 		ws := t.TempDir()
-		cfg := sandbox.Config{Workspace: ws, Timeout: 20, Network: sandbox.NetworkMode(network)}
+		cfg := ensureCodeExecConfigDefaults(sandbox.Config{Workspace: ws, Timeout: 20, Network: sandbox.NetworkMode(network)})
 		sb, err := sandbox.New(cfg)
 		if err != nil {
 			t.Fatalf("create sandbox network=%v: %v", network, err)

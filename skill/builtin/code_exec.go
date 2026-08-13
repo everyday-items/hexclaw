@@ -2255,7 +2255,15 @@ func goRuntimeReadablePaths() []string {
 			filepath.Join(home, "Library", "Caches", "go-build"),
 		)
 	}
-	return paths
+	// toolkit v0.3.0 的 ReadablePaths 必须在载荷启动前真实存在（fail-closed）；
+	// 过滤平台不匹配的路径（如 Linux 上不存在的 macOS 风格 Library/Caches/go-build）。
+	existing := paths[:0]
+	for _, p := range paths {
+		if _, statErr := os.Stat(p); statErr == nil {
+			existing = append(existing, p)
+		}
+	}
+	return existing
 }
 
 func hostGoModCachePath() string {
