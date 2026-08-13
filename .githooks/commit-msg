@@ -1,0 +1,23 @@
+#!/bin/sh
+
+set -eu
+
+expected_identity='hexclaw <hexclaw.dev@gmail.com>'
+author_identity=$(git var GIT_AUTHOR_IDENT)
+committer_identity=$(git var GIT_COMMITTER_IDENT)
+
+case "$author_identity" in
+  "$expected_identity "*) ;;
+  *)
+    printf '%s\n' "Commit rejected: author must be $expected_identity." >&2
+    exit 1
+    ;;
+esac
+
+case "$committer_identity" in
+  "$expected_identity "*) ;;
+  *)
+    printf '%s\n' "Commit rejected: committer must be $expected_identity." >&2
+    exit 1
+    ;;
+esac
