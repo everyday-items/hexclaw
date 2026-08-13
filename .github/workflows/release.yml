@@ -32,13 +32,9 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Configure private modules
-        run: |
-          git config --global url."https://${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/".insteadOf "https://github.com/"
-
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.25"
+          go-version: "1.25.13"
           cache-dependency-path: go.sum
         env:
           GOPRIVATE: github.com/hexagon-codes/*
@@ -120,10 +116,6 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag || github.ref_name }}
             type=raw,value=latest
 
-      - name: Prepare build secrets
-        run: |
-          echo "machine github.com login x-access-token password ${{ secrets.PRIVATE_REPO_TOKEN }}" > /tmp/.netrc
-
       - name: Extract version metadata
         id: version
         run: |
@@ -143,7 +135,5 @@ jobs:
             VERSION=${{ steps.version.outputs.version }}
             COMMIT=${{ steps.version.outputs.commit }}
             DATE=${{ steps.version.outputs.date }}
-          secrets: |
-            netrc=/tmp/.netrc
           cache-from: type=gha
           cache-to: type=gha,mode=max

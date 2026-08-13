@@ -207,10 +207,14 @@ func clientWithSafeRedirects(client *http.Client) (*http.Client, error) {
 	callerCheckRedirect := client.CheckRedirect
 	cloned.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		target := ""
+		var redirectCtx context.Context
 		if req != nil && req.URL != nil {
 			target = req.URL.String()
 		}
-		if err := ssrf.ValidateURL(req.Context(), target); err != nil {
+		if req != nil {
+			redirectCtx = req.Context()
+		}
+		if err := ssrf.ValidateURL(redirectCtx, target); err != nil {
 			return fmt.Errorf("SSRF check failed for redirect %s: %w", target, err)
 		}
 		if len(via) >= 5 {

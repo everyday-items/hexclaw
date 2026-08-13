@@ -64,10 +64,15 @@ func New(cfg Config) *MatrixAdapter {
 	if cfg.SyncTimeout == 0 {
 		cfg.SyncTimeout = 30
 	}
+	clientTimeout := time.Duration(cfg.SyncTimeout+10) * time.Second
+	var clientOptions []httpx.RawOption
+	if clientTimeout > 0 {
+		clientOptions = append(clientOptions, httpx.WithRawTimeout(clientTimeout))
+	}
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	a := &MatrixAdapter{
 		config:       cfg,
-		client:       httpx.MustNewRawClient(httpx.WithRawTimeout(time.Duration(cfg.SyncTimeout+10) * time.Second)),
+		client:       httpx.MustNewRawClient(clientOptions...),
 		stopCh:       make(chan struct{}),
 		workerCtx:    workerCtx,
 		workerCancel: workerCancel,

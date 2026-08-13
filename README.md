@@ -236,7 +236,7 @@ skills:
   auto_load: true
   hub:
     repo_url: https://github.com/hexagon-codes/hexclaw-hub
-    branch: v0.0.6
+    branch: v0.0.7
 
 heartbeat:
   enabled: true
@@ -575,7 +575,7 @@ hexclaw/
 | GET | `/api/v1/clawhub/search` | ClawHub 技能搜索（支持 `q` / `category`） |
 | GET | `/api/v1/clawhub/skills/{name}/content` | 安装前预览 ClawHub 技能内容 |
 
-默认技能目录仓库：`https://github.com/hexagon-codes/hexclaw-hub` 的 `v0.0.6` 标签（`index.json` + `skills/*.md`）。
+默认技能目录仓库：`https://github.com/hexagon-codes/hexclaw-hub` 的 `v0.0.7` 标签（`index.json` + `skills/*.md`）。
 安装或卸载 Markdown 技能后，会自动同步运行时技能注册表；通常无需重启 sidecar。
 
 ### Agent 路由
@@ -708,7 +708,7 @@ hexclaw/
 
 | 工具 | 版本要求 |
 |------|---------|
-| Go | >= 1.25.7 |
+| Go | >= 1.25.13 |
 | golangci-lint | 最新版（可选） |
 
 ### Make 命令
@@ -753,10 +753,10 @@ go run ./cmd/verify-release -repo . -version 0.5.0-beta \
 
 | 组件 | 技术 |
 |------|------|
-| 语言 | Go 1.25.7+ 兼容基线（发版工具链 1.25.12） |
-| Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.5.9 |
-| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.2.4 |
-| 工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) v0.2.6 |
+| 语言 | Go 1.25.13+ |
+| Agent 框架 | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.5.13 |
+| AI 基础库 | [ai-core](https://github.com/hexagon-codes/ai-core) v0.2.10 |
+| 工具库 | [toolkit](https://github.com/hexagon-codes/toolkit) v0.3.4 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | 配置 | YAML + 环境变量 |
 | 存储 | SQLite (modernc.org/sqlite) |
@@ -798,9 +798,9 @@ chore: 构建/工具链
 
 | 项目 | 说明 | 仓库 |
 |------|------|------|
-| **Hexagon** | Go AI Agent 框架 (核心引擎) v0.5.9 | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.2.4 | [ai-core](https://github.com/hexagon-codes/ai-core) |
-| **toolkit** | Go 通用工具库 v0.2.6 | [toolkit](https://github.com/hexagon-codes/toolkit) |
+| **Hexagon** | Go AI Agent 框架 (核心引擎) v0.5.13 | [hexagon](https://github.com/hexagon-codes/hexagon) |
+| **ai-core** | AI 基础能力库 (LLM/Tool/Memory) v0.2.10 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **toolkit** | Go 通用工具库 v0.3.4 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI 观测面板 (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
 | **hexclaw-desktop** | HexClaw 桌面客户端 (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
 | **hexclaw-ui** | HexClaw Web 前端 (Vue 3) | [hexclaw-ui](https://github.com/hexagon-codes/hexclaw-ui) |

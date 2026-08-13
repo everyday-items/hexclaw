@@ -71,6 +71,14 @@ func (c *Config) Validate() error {
 			Suggest: "功能优先默认用 function_first；需要显式全开放用 full_access",
 		})
 	}
+	if c.Skill.Builtin.CodeExecPolicy.CodeExecNetworkAllowed() {
+		errs = append(errs, &ValidationError{
+			Field:   "skill.builtin.code_exec_policy.network",
+			Value:   "true",
+			Rule:    "code execution host network is unsupported because destination filtering is unavailable",
+			Suggest: "Set skill.builtin.code_exec_policy.network to false",
+		})
+	}
 
 	// 2. Budget：时间格式要可解析
 	if c.Budget.MaxDuration != "" {

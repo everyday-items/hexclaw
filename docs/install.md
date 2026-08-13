@@ -19,7 +19,7 @@
 | 项目 | 最低要求 | 推荐 |
 |------|---------|------|
 | 操作系统 | Linux / macOS / Windows | Linux (Ubuntu 22.04+) |
-| Go | >= 1.25.7 | 最新稳定版 |
+| Go | >= 1.25.13 | 最新稳定版 |
 | 内存 | 128 MB | 512 MB+ |
 | 磁盘 | 100 MB | 1 GB+（含知识库数据） |
 | 网络 | 可访问 LLM API | 低延迟连接 |
@@ -116,14 +116,14 @@ hexclaw init
 
 ### 技能市场（hexclaw-hub）
 
-桌面端「技能市场」从在线目录拉取 `index.json` 与 `skills/*.md`。默认仓库为 **`hexagon-codes/hexclaw-hub`** 的 **`v0.0.6`** 标签。自建镜像时可覆盖：
+桌面端「技能市场」从在线目录拉取 `index.json` 与 `skills/*.md`。默认仓库为 **`hexagon-codes/hexclaw-hub`** 的 **`v0.0.7`** 标签。自建镜像时可覆盖：
 
 ```yaml
 skills:
   enabled: true
   hub:
     repo_url: https://github.com/hexagon-codes/hexclaw-hub
-    branch: v0.0.6
+    branch: v0.0.7
 ```
 
 安装或卸载 Markdown 技能后，引擎会**自动同步**运行时技能注册表，一般**无需重启** sidecar。

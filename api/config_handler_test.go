@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -92,7 +93,7 @@ func TestHandleUpdateFullConfig_SaveFailureReturnsError(t *testing.T) {
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusInternalServerError, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "配置保存失败") {
+	if !strings.Contains(w.Body.String(), "Failed to save configuration") {
 		t.Fatalf("body = %s, want persistence failure message", w.Body.String())
 	}
 	if s.cfg.Security.Auth.Enabled != true {
@@ -106,7 +107,7 @@ func TestHandleUpdateFullConfig_SaveFailureReturnsError(t *testing.T) {
 	}
 }
 
-func TestHandleUpdateFullConfig_SandboxUpdateFailureRollsBackPersistedConfig(t *testing.T) {
+func TestHandleUpdateFullConfig_SandboxPrepareFailureDoesNotPersistConfig(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	s := &Server{
@@ -114,11 +115,14 @@ func TestHandleUpdateFullConfig_SandboxUpdateFailureRollsBackPersistedConfig(t *
 		logCollector: NewLogCollector(10),
 	}
 	s.cfg.Security.Auth.Enabled = true
-	s.cfg.Skill.Builtin.CodeExecPolicy.Network = boolPtr(true)
-	s.SetSandboxCallbacks(func(bool) error {
-		return os.ErrPermission
-	}, func() bool {
-		return true
+	s.cfg.Skill.Builtin.CodeExecPolicy.Network = boolPtr(false)
+	s.SetSandboxPolicyRuntime(SandboxPolicyRuntime{
+		Prepare: func(context.Context, SandboxPolicy) (SandboxPolicyCandidate, error) {
+			return SandboxPolicyCandidate{}, os.ErrPermission
+		},
+		Snapshot: func() SandboxPolicy {
+			return SandboxPolicy{NetworkEnabled: false}
+		},
 	})
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/config", strings.NewReader(`{"security":{"gateway_enabled":false},"sandbox":{"network_enabled":false}}`))
@@ -129,21 +133,21 @@ func TestHandleUpdateFullConfig_SandboxUpdateFailureRollsBackPersistedConfig(t *
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusInternalServerError, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "配置已回滚") {
-		t.Fatalf("body = %s, want rollback message", w.Body.String())
+	if !strings.Contains(w.Body.String(), "Sandbox policy validation failed") {
+		t.Fatalf("body = %s, want validation failure message", w.Body.String())
 	}
 	if s.cfg.Security.Auth.Enabled != true {
 		t.Fatalf("auth enabled = %v, want true", s.cfg.Security.Auth.Enabled)
 	}
-	if s.cfg.Skill.Builtin.CodeExecPolicy.CodeExecNetworkAllowed() != true {
-		t.Fatalf("network = %v, want true", s.cfg.Skill.Builtin.CodeExecPolicy.CodeExecNetworkAllowed())
+	if s.cfg.Skill.Builtin.CodeExecPolicy.CodeExecNetworkAllowed() {
+		t.Fatalf("network = %v, want false", s.cfg.Skill.Builtin.CodeExecPolicy.CodeExecNetworkAllowed())
 	}
 }
 
 func TestHandleUpdateFullConfig_SuccessAppliesSecurityFields(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
-	runtimeNetworkEnabled := true
+	runtimeNetworkEnabled := false
 	s := &Server{
 		cfg:          config.DefaultConfig(),
 		logCollector: NewLogCollector(10),
@@ -151,12 +155,16 @@ func TestHandleUpdateFullConfig_SuccessAppliesSecurityFields(t *testing.T) {
 	s.cfg.Security.Auth.Enabled = true
 	s.cfg.Security.ContentFilter.Enabled = true
 	s.cfg.Security.Cost.BudgetPerUser = 10
-	s.cfg.Skill.Builtin.CodeExecPolicy.Network = boolPtr(true)
-	s.SetSandboxCallbacks(func(enabled bool) error {
-		runtimeNetworkEnabled = enabled
-		return nil
-	}, func() bool {
-		return runtimeNetworkEnabled
+	s.cfg.Skill.Builtin.CodeExecPolicy.Network = boolPtr(false)
+	s.SetSandboxPolicyRuntime(SandboxPolicyRuntime{
+		Prepare: func(_ context.Context, policy SandboxPolicy) (SandboxPolicyCandidate, error) {
+			return NewSandboxPolicyCandidate(func() {
+				runtimeNetworkEnabled = policy.NetworkEnabled
+			}, func() {}), nil
+		},
+		Snapshot: func() SandboxPolicy {
+			return SandboxPolicy{NetworkEnabled: runtimeNetworkEnabled}
+		},
 	})
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/config", strings.NewReader(`{"security":{"gateway_enabled":false,"content_filter":false,"max_tokens_per_request":42},"sandbox":{"network_enabled":false}}`))

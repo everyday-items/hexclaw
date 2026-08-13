@@ -252,7 +252,7 @@ type SkillsConfig struct {
 // SkillsHubConfig 在线技能市场 Git 源
 type SkillsHubConfig struct {
 	RepoURL string `yaml:"repo_url"` // 默认 github.com/hexagon-codes/hexclaw-hub
-	Branch  string `yaml:"branch"`   // 默认 v0.0.1
+	Branch  string `yaml:"branch"`   // 默认 v0.0.7
 }
 
 // FileMemoryConfig 文件记忆配置
@@ -858,14 +858,14 @@ type BuiltinConfig struct {
 // 最终裁决者；当前 DefaultBaselinePolicy 无论该字段取值如何都要求 code_exec
 // 审批，避免配置回退路径意外降权。默认值为 false 仅保留旧配置语义。
 //
-// Network 控制沙箱是否允许网络访问。零值和默认配置均为 false；联网执行必须由
-// 用户显式授予，避免代码执行在没有可审计授权的情况下外连或搬运数据。
+// Network 为旧配置保留序列化兼容。零值和默认配置均为 false；在工具包尚未提供
+// 目的地址过滤前，true 会被配置校验拒绝，不能授予宿主网络视图。
 type CodeExecPolicyConfig struct {
 	RequireApproval *bool `yaml:"require_approval"` // nil 视为 false（功能优先）
 	Network         *bool `yaml:"network"`          // nil 视为 false（deny-by-default）
 }
 
-// CodeExecNetworkAllowed 返回沙箱是否允许网络访问
+// CodeExecNetworkAllowed 返回配置是否请求宿主网络；true 仍须由校验层拒绝。
 func (c CodeExecPolicyConfig) CodeExecNetworkAllowed() bool {
 	if c.Network == nil {
 		return false

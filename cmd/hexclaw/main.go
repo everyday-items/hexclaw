@@ -1385,21 +1385,26 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		}
 	}
 
-	// 8.0.1 接入沙箱网络热更新 (Bug2 修复)
+	// 沙箱网络与只读路径通过同一个候选事务发布，禁止拆分热更新形成半提交。
 	if skillDeps.CodeExecSkill != nil {
-		srv.SetSandboxCallbacks(skillDeps.CodeExecSkill.UpdateNetwork, skillDeps.CodeExecSkill.NetworkEnabled)
-	}
-	if skillDeps.CodeExecSkill != nil || skillDeps.FileAccess != nil {
-		srv.SetSandboxAllowedPathsCallback(func(paths []string) error {
-			if skillDeps.CodeExecSkill != nil {
-				if err := skillDeps.CodeExecSkill.UpdateReadablePaths(paths); err != nil {
-					return err
+		srv.SetSandboxPolicyRuntime(api.SandboxPolicyRuntime{
+			Prepare: func(ctx context.Context, policy api.SandboxPolicy) (api.SandboxPolicyCandidate, error) {
+				candidate, err := skillDeps.CodeExecSkill.PrepareSandboxPolicy(ctx, builtin.SandboxPolicy{
+					NetworkEnabled: policy.NetworkEnabled,
+					ReadablePaths:  append([]string(nil), policy.ReadablePaths...),
+				})
+				if err != nil {
+					return api.SandboxPolicyCandidate{}, err
 				}
-			}
-			if skillDeps.FileAccess != nil {
-				skillDeps.FileAccess.UpdateAllowedPaths(paths)
-			}
-			return nil
+				return api.NewSandboxPolicyCandidate(candidate.Commit, candidate.Discard), nil
+			},
+			Snapshot: func() api.SandboxPolicy {
+				policy := skillDeps.CodeExecSkill.SandboxPolicy()
+				return api.SandboxPolicy{
+					NetworkEnabled: policy.NetworkEnabled,
+					ReadablePaths:  append([]string(nil), policy.ReadablePaths...),
+				}
+			},
 		})
 	}
 	lc := srv.LogCollector()

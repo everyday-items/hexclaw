@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -45,9 +46,15 @@ func TestPutConfigHotUpdatesSandboxAllowedPaths(t *testing.T) {
 		logCollector: NewLogCollector(10),
 	}
 	var runtimePaths []string
-	s.SetSandboxAllowedPathsCallback(func(paths []string) error {
-		runtimePaths = append([]string(nil), paths...)
-		return nil
+	s.SetSandboxPolicyRuntime(SandboxPolicyRuntime{
+		Prepare: func(_ context.Context, policy SandboxPolicy) (SandboxPolicyCandidate, error) {
+			return NewSandboxPolicyCandidate(func() {
+				runtimePaths = append([]string(nil), policy.ReadablePaths...)
+			}, func() {}), nil
+		},
+		Snapshot: func() SandboxPolicy {
+			return SandboxPolicy{ReadablePaths: append([]string(nil), runtimePaths...)}
+		},
 	})
 
 	body := `{"sandbox":{"allowed_paths":["/Users/hexagon/work"]}}`
@@ -63,15 +70,20 @@ func TestPutConfigHotUpdatesSandboxAllowedPaths(t *testing.T) {
 	}
 }
 
-func TestPutConfigAllowedPathsUpdateFailureRollsBack(t *testing.T) {
+func TestPutConfigAllowedPathsPrepareFailurePreservesState(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	s := &Server{
 		cfg:          config.DefaultConfig(),
 		logCollector: NewLogCollector(10),
 	}
 	s.cfg.Skill.Sandbox.Filesystem.AllowedPaths = []string{"/old/path"}
-	s.SetSandboxAllowedPathsCallback(func([]string) error {
-		return errors.New("runtime update failed")
+	s.SetSandboxPolicyRuntime(SandboxPolicyRuntime{
+		Prepare: func(context.Context, SandboxPolicy) (SandboxPolicyCandidate, error) {
+			return SandboxPolicyCandidate{}, errors.New("runtime update failed")
+		},
+		Snapshot: func() SandboxPolicy {
+			return SandboxPolicy{ReadablePaths: []string{"/old/path"}}
+		},
 	})
 
 	body := `{"sandbox":{"allowed_paths":["/new/path"]}}`

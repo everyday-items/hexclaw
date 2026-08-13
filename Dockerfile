@@ -3,7 +3,7 @@
 # 阶段 1: 编译 Go 二进制
 # 阶段 2: 最小运行时镜像
 
-FROM golang:1.25-alpine AS builder
+FROM golang:1.25.13-alpine AS builder
 
 RUN apk add --no-cache git
 
@@ -16,7 +16,7 @@ ARG DATE=unknown
 
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN --mount=type=secret,id=netrc,target=/root/.netrc go mod download
+RUN go mod download
 
 COPY . .
 RUN CGO_ENABLED=0 go build \

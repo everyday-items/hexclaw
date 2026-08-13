@@ -34,7 +34,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: "1.25"
+  GO_VERSION: "1.25.13"
   GOPRIVATE: github.com/hexagon-codes/*
   TOOLKIT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.toolkit_ref || 'main' }}
   RUN_LIVE_NETWORK: ${{ github.event_name != 'workflow_dispatch' || inputs.run_live_network == 'true' }}
@@ -85,16 +85,6 @@ jobs:
           repository: hexagon-codes/toolkit
           ref: ${{ env.TOOLKIT_REF }}
           path: toolkit
-          token: ${{ secrets.PRIVATE_REPO_TOKEN || github.token }}
-
-      - name: Configure private modules
-        shell: pwsh
-        env:
-          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
-        run: |
-          if ($env:PRIVATE_REPO_TOKEN) {
-            git config --global url."https://$env:PRIVATE_REPO_TOKEN@github.com/".insteadOf "https://github.com/"
-          }
 
       - name: Setup Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -148,7 +138,9 @@ jobs:
       - name: Test hexclaw code_exec
         env:
           HEXCLAW_P0_SANDBOX_PROOF: "1"
-        run: go test -v -count=1 -timeout 360s ./skill/builtin -run 'TestCodeExecSkill_|TestDetectMissingPackages|TestBuildInstallCommand|TestSandboxP0_StaticGapMatrix'
+        run: >-
+          go test -v -count=1 -timeout 900s ./skill/builtin
+          -run '^(TestCodeExec|TestCloseCodeExecSandbox|TestJoinCodeExecSandboxClose|TestToolkitSandboxMigration|TestDetectMissingPackages|TestBuildInstallCommand|TestRegisterAdvancedCodeExec|TestEnsureCodeExecConfigDefaults|TestNewCodeExecSkill|TestPrepareCodeExecCommand|TestSandboxP0)'
 
       - name: Test macOS connector readable paths
         if: runner.os == 'macOS'

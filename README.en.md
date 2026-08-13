@@ -237,7 +237,7 @@ skills:
   auto_load: true
   hub:
     repo_url: https://github.com/hexagon-codes/hexclaw-hub
-    branch: v0.0.6
+    branch: v0.0.7
 
 heartbeat:
   enabled: true
@@ -577,7 +577,7 @@ The unified entrypoint `POST /api/v1/cronjob` dispatches on the request body's `
 | GET | `/api/v1/clawhub/search` | ClawHub skill search with `q` / `category` filters |
 | GET | `/api/v1/clawhub/skills/{name}/content` | Preview ClawHub skill content before installing |
 
-Default skill catalog repo: `https://github.com/hexagon-codes/hexclaw-hub` tag `v0.0.6` (`index.json` + `skills/*.md`).
+Default skill catalog repo: `https://github.com/hexagon-codes/hexclaw-hub` tag `v0.0.7` (`index.json` + `skills/*.md`).
 Installing or uninstalling Markdown skills automatically syncs the runtime skill registry; a sidecar restart is usually unnecessary.
 
 ### Agent Routing
@@ -710,7 +710,7 @@ Scenario packs are mounted through `srv.Mount` under `/api/<scenario>` and inher
 
 | Tool | Version |
 |------|---------|
-| Go | >= 1.25.7 |
+| Go | >= 1.25.13 |
 | golangci-lint | Latest (optional) |
 
 ### Make Commands
@@ -755,10 +755,10 @@ go run ./cmd/verify-release -repo . -version 0.5.0-beta \
 
 | Component | Technology |
 |-----------|-----------|
-| Language | Go 1.25.7+ compatibility baseline (1.25.12 release toolchain) |
-| Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.5.9 |
-| AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.2.4 |
-| Utility Library | [toolkit](https://github.com/hexagon-codes/toolkit) v0.2.6 |
+| Language | Go 1.25.13+ |
+| Agent Framework | [Hexagon](https://github.com/hexagon-codes/hexagon) v0.5.13 |
+| AI Core Library | [ai-core](https://github.com/hexagon-codes/ai-core) v0.2.10 |
+| Utility Library | [toolkit](https://github.com/hexagon-codes/toolkit) v0.3.4 |
 | CLI | [Cobra](https://github.com/spf13/cobra) |
 | Configuration | YAML + environment variables |
 | Storage | SQLite (modernc.org/sqlite) |
@@ -800,9 +800,9 @@ chore: build/toolchain updates
 
 | Project | Description | Repository |
 |---------|-------------|------------|
-| **Hexagon** | Go AI Agent framework (core engine) v0.5.9 | [hexagon](https://github.com/hexagon-codes/hexagon) |
-| **ai-core** | AI core library (LLM/Tool/Memory) v0.2.4 | [ai-core](https://github.com/hexagon-codes/ai-core) |
-| **toolkit** | Go utility library v0.2.6 | [toolkit](https://github.com/hexagon-codes/toolkit) |
+| **Hexagon** | Go AI Agent framework (core engine) v0.5.13 | [hexagon](https://github.com/hexagon-codes/hexagon) |
+| **ai-core** | AI core library (LLM/Tool/Memory) v0.2.10 | [ai-core](https://github.com/hexagon-codes/ai-core) |
+| **toolkit** | Go utility library v0.3.4 | [toolkit](https://github.com/hexagon-codes/toolkit) |
 | **hexagon-ui** | Hexagon Dev UI dashboard (Vue 3) | [hexagon-ui](https://github.com/hexagon-codes/hexagon-ui) |
 | **hexclaw-desktop** | HexClaw desktop client (Tauri + Vue 3) | [hexclaw-desktop](https://github.com/hexagon-codes/hexclaw-desktop) |
 | **hexclaw-ui** | HexClaw web frontend (Vue 3) | [hexclaw-ui](https://github.com/hexagon-codes/hexclaw-ui) |

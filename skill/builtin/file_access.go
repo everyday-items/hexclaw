@@ -23,16 +23,31 @@ type FileAccessBroker struct {
 	allowedDirs []string
 }
 
-func NewFileAccessBroker(paths []string) *FileAccessBroker {
-	b := &FileAccessBroker{}
-	b.UpdateAllowedPaths(paths)
-	return b
+type fileAccessPolicy struct {
+	allowedDirs []string
 }
 
-func (b *FileAccessBroker) UpdateAllowedPaths(paths []string) {
+func NewFileAccessBroker(paths []string) *FileAccessBroker {
+	return newFileAccessBrokerFromPolicy(prepareFileAccessPolicy(paths))
+}
+
+// prepareFileAccessPolicy 在事务 Prepare 阶段完成规范化和路径解析。
+func prepareFileAccessPolicy(paths []string) fileAccessPolicy {
+	return fileAccessPolicy{allowedDirs: normalizeAllowedPaths(paths)}
+}
+
+func newFileAccessBrokerFromPolicy(policy fileAccessPolicy) *FileAccessBroker {
+	return &FileAccessBroker{allowedDirs: policy.allowedDirs}
+}
+
+// commitFileAccessPolicy 只交换已经准备完成的不可变策略，不执行文件系统探测。
+func (b *FileAccessBroker) commitFileAccessPolicy(policy fileAccessPolicy) {
+	if b == nil {
+		return
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.allowedDirs = normalizeAllowedPaths(paths)
+	b.allowedDirs = policy.allowedDirs
 }
 
 func (b *FileAccessBroker) AllowedDirectories() []string {

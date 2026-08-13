@@ -208,3 +208,43 @@ func TestFetchToDataURLRejectsUnguardedCustomTransport(t *testing.T) {
 		t.Fatalf("unguarded transport was invoked %d times", calls)
 	}
 }
+
+func TestFetchToDataURLUsesCallerContextForInitialSSRFValidation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	transportCalls := 0
+	client := &http.Client{Transport: redirectRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		transportCalls++
+		return imageResponse(req), nil
+	})}
+
+	_, err := fetchToDataURL(ctx, "https://context-propagation.invalid/image.png", client, 1<<20)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "cancel") {
+		t.Fatalf("initial SSRF validation did not preserve the caller cancellation: %v", err)
+	}
+	if transportCalls != 0 {
+		t.Fatalf("transport was called after caller cancellation: %d", transportCalls)
+	}
+}
+
+func TestRedirectValidationUsesRedirectRequestContext(t *testing.T) {
+	client, err := clientWithSafeRedirects(&http.Client{Transport: redirectRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return imageResponse(req), nil
+	})})
+	if err != nil {
+		t.Fatalf("clientWithSafeRedirects() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://context-propagation.invalid/redirect.png", nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", err)
+	}
+
+	err = client.CheckRedirect(request, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("redirect SSRF validation error = %v, want context.Canceled", err)
+	}
+}

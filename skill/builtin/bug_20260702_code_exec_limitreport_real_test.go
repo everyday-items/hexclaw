@@ -28,11 +28,12 @@ func TestBug20260702_BuildReport_CapabilitiesReflectLimits(t *testing.T) {
 
 	// 场景 A：darwin 式——内存不支持、文件系统仍强隔离。
 	degraded := &sandbox.ExecResult{ExitCode: 0, Limits: sandbox.LimitReport{
-		Memory:     sandbox.LimitStatusUnsupported,
-		Processes:  sandbox.LimitStatusEnforced,
-		Storage:    sandbox.LimitStatusEnforced,
-		Output:     sandbox.LimitStatusEnforced,
-		Filesystem: sandbox.LimitStatusEnforced,
+		Memory:             sandbox.LimitStatusUnsupported,
+		Processes:          sandbox.LimitStatusEnforced,
+		ProcessContainment: sandbox.LimitStatusUnsupported,
+		Storage:            sandbox.LimitStatusEnforced,
+		Output:             sandbox.LimitStatusEnforced,
+		Filesystem:         sandbox.LimitStatusEnforced,
 	}}
 	repA := buildCodeExecReport(req, run, []string{"python3", "x.py"}, degraded, nil, nil)
 	if got := repA.Capabilities["resource_limits"]; got != false {
@@ -53,40 +54,49 @@ func TestBug20260702_BuildReport_CapabilitiesReflectLimits(t *testing.T) {
 			repA.MaxMemoryBytes, repA.MaxProcesses, repA.MaxWorkspaceBytes)
 	}
 
-	// 场景 B：文件系统隔离不可用（toolkit v0.3.0 移除 Weak 状态，降级由 Unsupported 表达）——fail_closed 应据实为 false 并标降级。
-	weakFS := &sandbox.ExecResult{ExitCode: 0, Limits: sandbox.LimitReport{
-		Memory:     sandbox.LimitStatusEnforced,
-		Processes:  sandbox.LimitStatusEnforced,
-		Storage:    sandbox.LimitStatusEnforced,
-		Output:     sandbox.LimitStatusEnforced,
-		Filesystem: sandbox.LimitStatusUnsupported,
+	if got := repA.Capabilities["process_containment"]; got != false {
+		t.Errorf("A: process_containment must be false when ProcessContainment is unsupported, got %v", got)
+	}
+
+	// 场景 B：文件系统隔离不可用时，fail_closed 应据实为 false 并标降级。
+	unsupportedFS := &sandbox.ExecResult{ExitCode: 0, Limits: sandbox.LimitReport{
+		Memory:             sandbox.LimitStatusEnforced,
+		Processes:          sandbox.LimitStatusEnforced,
+		ProcessContainment: sandbox.LimitStatusUnsupported,
+		Storage:            sandbox.LimitStatusEnforced,
+		Output:             sandbox.LimitStatusEnforced,
+		Filesystem:         sandbox.LimitStatusUnsupported,
 	}}
-	repB := buildCodeExecReport(req, run, []string{"python3", "x.py"}, weakFS, nil, nil)
+	repB := buildCodeExecReport(req, run, []string{"python3", "x.py"}, unsupportedFS, nil, nil)
 	if got := repB.Capabilities["fail_closed"]; got != false {
-		t.Errorf("B: 文件系统 unsupported 时 fail_closed 应如实为 false（不再谎报 true），得 %v", got)
+		t.Errorf("B: fail_closed must be false when filesystem isolation is unsupported, got %v", got)
 	}
 	if got := repB.Capabilities["filesystem_isolation"]; got != "unsupported" {
-		t.Errorf("B: filesystem_isolation 应为 unsupported，得 %v", got)
+		t.Errorf("B: filesystem_isolation must be unsupported, got %v", got)
 	}
 	if !repB.FilesystemDegraded {
-		t.Errorf("B: 文件系统 unsupported 应标降级")
+		t.Errorf("B: unsupported filesystem isolation must be marked degraded")
 	}
 	if repB.FilesystemIsolation != "unsupported" {
-		t.Errorf("B: FilesystemIsolation 应为 unsupported，得 %q", repB.FilesystemIsolation)
+		t.Errorf("B: FilesystemIsolation must be unsupported, got %q", repB.FilesystemIsolation)
 	}
 
 	// 场景 C：全维 enforced（linux bwrap / windows）——两个汇总位都为 true。
 	allEnforced := &sandbox.ExecResult{ExitCode: 0, Limits: sandbox.LimitReport{
-		Memory:     sandbox.LimitStatusEnforced,
-		Processes:  sandbox.LimitStatusEnforced,
-		Storage:    sandbox.LimitStatusEnforced,
-		Output:     sandbox.LimitStatusEnforced,
-		Filesystem: sandbox.LimitStatusEnforced,
+		Memory:             sandbox.LimitStatusEnforced,
+		Processes:          sandbox.LimitStatusEnforced,
+		ProcessContainment: sandbox.LimitStatusEnforced,
+		Storage:            sandbox.LimitStatusEnforced,
+		Output:             sandbox.LimitStatusEnforced,
+		Filesystem:         sandbox.LimitStatusEnforced,
 	}}
 	repC := buildCodeExecReport(req, run, nil, allEnforced, nil, nil)
 	if repC.Capabilities["resource_limits"] != true || repC.Capabilities["fail_closed"] != true {
 		t.Errorf("C: 全维 enforced 时两汇总位应都为 true，得 rl=%v fc=%v",
 			repC.Capabilities["resource_limits"], repC.Capabilities["fail_closed"])
+	}
+	if repC.Capabilities["process_containment"] != true {
+		t.Errorf("C: process_containment must be true when ProcessContainment is enforced, got %v", repC.Capabilities["process_containment"])
 	}
 }
 
@@ -111,7 +121,7 @@ func TestBug20260702_Execute_FilesystemContainmentUnavailable(t *testing.T) {
 	if !ok {
 		t.Fatalf("Data 应为 codeExecReport，得 %T", res.Data)
 	}
-	if !strings.Contains(rep.Error, "强文件系统隔离") {
+	if !strings.Contains(rep.Error, "Strong filesystem isolation is unavailable") {
 		t.Errorf("错误应明确指向文件系统隔离缺失，得 %q", rep.Error)
 	}
 	if !rep.FilesystemDegraded {
@@ -146,7 +156,7 @@ func TestBug20260702_Execute_StorageLimitExceededClassified(t *testing.T) {
 	if !rep.WorkspaceLimited {
 		t.Errorf("存储超限应置 WorkspaceLimited")
 	}
-	if !strings.Contains(rep.Error, "存储限额") {
+	if !strings.Contains(rep.Error, "storage limit") {
 		t.Errorf("错误应指向存储限额，得 %q", rep.Error)
 	}
 }

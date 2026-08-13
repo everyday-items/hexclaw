@@ -225,15 +225,22 @@ func (s *Server) handleMCPStatus(w http.ResponseWriter, r *http.Request) {
 // ─── Config: GET /api/v1/config ──
 
 func (s *Server) handleGetFullConfig(w http.ResponseWriter, r *http.Request) {
-	llmCfg := s.persistedLLMConfig()
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+
+	llmCfg := cloneLLMConfigSnapshot(s.cfg.LLM)
 	providers := make(map[string]any, len(llmCfg.Providers))
 	for name, p := range llmCfg.Providers {
 		providers[name] = fullConfigProviderStatus(name, p)
 	}
-	// sandbox 网络状态：优先读运行时真值，回退到配置
-	sandboxNetworkEnabled := s.cfg.Skill.Builtin.CodeExecPolicy.CodeExecNetworkAllowed()
-	if s.sandboxNetworkEnabled != nil {
-		sandboxNetworkEnabled = s.sandboxNetworkEnabled()
+	// 沙箱策略必须来自同一次运行时代际快照，避免网络与路径跨代组合。
+	sandboxPolicy := SandboxPolicy{
+		NetworkEnabled: s.cfg.Skill.Builtin.CodeExecPolicy.CodeExecNetworkAllowed(),
+		ReadablePaths:  append([]string(nil), s.cfg.Skill.Sandbox.Filesystem.AllowedPaths...),
+	}
+	if s.sandboxPolicyRuntime.Snapshot != nil {
+		sandboxPolicy = s.sandboxPolicyRuntime.Snapshot()
+		sandboxPolicy.ReadablePaths = append([]string(nil), sandboxPolicy.ReadablePaths...)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -253,8 +260,8 @@ func (s *Server) handleGetFullConfig(w http.ResponseWriter, r *http.Request) {
 			"rate_limit_rpm":      s.cfg.Security.RateLimit.RequestsPerMinute,
 		},
 		"sandbox": map[string]any{
-			"network_enabled": sandboxNetworkEnabled,
-			"allowed_paths":   s.cfg.Skill.Sandbox.Filesystem.AllowedPaths,
+			"network_enabled": sandboxPolicy.NetworkEnabled,
+			"allowed_paths":   sandboxPolicy.ReadablePaths,
 		},
 	})
 }
@@ -327,7 +334,7 @@ func (s *Server) handleUpdateFullConfig(w http.ResponseWriter, r *http.Request) 
 		} `json:"sandbox"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "无效的请求体"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
 		return
 	}
 
@@ -356,69 +363,80 @@ func (s *Server) handleUpdateFullConfig(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	sandboxChanged := false
-	var newNetworkEnabled bool
-	allowedPathsChanged := false
-	var newAllowedPaths []string
+	currentSandboxPolicy := SandboxPolicy{
+		NetworkEnabled: s.cfg.Skill.Builtin.CodeExecPolicy.CodeExecNetworkAllowed(),
+		ReadablePaths:  append([]string(nil), s.cfg.Skill.Sandbox.Filesystem.AllowedPaths...),
+	}
+	if s.sandboxPolicyRuntime.Snapshot != nil {
+		currentSandboxPolicy = s.sandboxPolicyRuntime.Snapshot()
+		currentSandboxPolicy.ReadablePaths = append([]string(nil), currentSandboxPolicy.ReadablePaths...)
+	}
+	nextSandboxPolicy := currentSandboxPolicy
+	sandboxPolicyChanged := false
 	if sb := body.Sandbox; sb != nil {
 		if sb.NetworkEnabled != nil {
-			nextCfg.Skill.Builtin.CodeExecPolicy.Network = sb.NetworkEnabled
-			sandboxChanged = true
-			newNetworkEnabled = *sb.NetworkEnabled
+			if *sb.NetworkEnabled {
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": "Code execution host network is unsupported because destination filtering is unavailable",
+				})
+				return
+			}
+			nextSandboxPolicy.NetworkEnabled = *sb.NetworkEnabled
+			sandboxPolicyChanged = true
 		}
 		if sb.AllowedPaths != nil {
-			// 授权目录白名单：下次沙箱构建（sidecar 启动）即放行只读。指针非 nil 时整体替换，空数组 = 清空。
-			nextCfg.Skill.Sandbox.Filesystem.AllowedPaths = *sb.AllowedPaths
-			allowedPathsChanged = true
-			newAllowedPaths = append([]string(nil), (*sb.AllowedPaths)...)
+			// 指针非 nil 时整体替换；空数组表示清空全部授权目录。
+			nextSandboxPolicy.ReadablePaths = append([]string(nil), (*sb.AllowedPaths)...)
+			sandboxPolicyChanged = true
 		}
 	}
 
-	// 先持久化，失败则什么都不变（runtime + 磁盘一致）
+	var candidate SandboxPolicyCandidate
+	if sandboxPolicyChanged {
+		networkEnabled := nextSandboxPolicy.NetworkEnabled
+		nextCfg.Skill.Builtin.CodeExecPolicy.Network = &networkEnabled
+		nextCfg.Skill.Sandbox.Filesystem.AllowedPaths = append(
+			[]string(nil), nextSandboxPolicy.ReadablePaths...,
+		)
+		if s.sandboxPolicyRuntime.Prepare != nil {
+			var err error
+			candidate, err = s.sandboxPolicyRuntime.Prepare(r.Context(), SandboxPolicy{
+				NetworkEnabled: nextSandboxPolicy.NetworkEnabled,
+				ReadablePaths:  append([]string(nil), nextSandboxPolicy.ReadablePaths...),
+			})
+			if err != nil || !candidate.valid() {
+				if err == nil {
+					err = errors.New("sandbox policy runtime returned an invalid candidate")
+				}
+				logger.Error("Sandbox policy candidate validation failed", "error", err)
+				writeJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": "Sandbox policy validation failed",
+				})
+				return
+			}
+			defer candidate.Discard()
+		} else if s.sandboxPolicyRuntime.Snapshot != nil {
+			logger.Error("Sandbox policy runtime is missing the Prepare callback")
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Sandbox policy validation failed",
+			})
+			return
+		}
+	}
+
+	// 候选验证完成后先原子落盘；Commit 只做不可失败的运行时代际交换。
 	if err := config.Save(&nextCfg, ""); err != nil {
-		logger.Error("配置持久化失败", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "配置保存失败: " + err.Error()})
+		logger.Error("Failed to persist configuration", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to save configuration"})
 		return
 	}
-
-	if allowedPathsChanged && s.onSandboxAllowedPathsUpdate != nil {
-		if err := s.onSandboxAllowedPathsUpdate(newAllowedPaths); err != nil {
-			logger.Error("沙箱文件授权路径热更新失败", "error", err)
-			if rollbackErr := config.Save(s.cfg, ""); rollbackErr != nil {
-				logger.Error("沙箱文件授权路径热更新失败，且配置回滚失败", "error", rollbackErr)
-				writeJSON(w, http.StatusInternalServerError, map[string]string{
-					"error": "沙箱文件授权路径热更新失败，且配置回滚失败: " + rollbackErr.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]string{
-				"error": "沙箱文件授权路径热更新失败，配置已回滚: " + err.Error(),
-			})
-			return
-		}
+	if candidate.valid() {
+		candidate.Commit()
 	}
 
-	// 沙箱网络热更新；失败时回滚刚刚持久化的新配置，保持 runtime/内存/磁盘一致
-	if sandboxChanged && s.onSandboxNetworkUpdate != nil {
-		if err := s.onSandboxNetworkUpdate(newNetworkEnabled); err != nil {
-			logger.Error("沙箱网络策略热更新失败", "error", err)
-			if rollbackErr := config.Save(s.cfg, ""); rollbackErr != nil {
-				logger.Error("沙箱网络策略热更新失败，且配置回滚失败", "error", rollbackErr)
-				writeJSON(w, http.StatusInternalServerError, map[string]string{
-					"error": "沙箱网络热更新失败，且配置回滚失败: " + rollbackErr.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]string{
-				"error": "沙箱网络热更新失败，配置已回滚: " + err.Error(),
-			})
-			return
-		}
-	}
-
-	// 直到磁盘与 runtime 都成功后，才提交内存配置
+	// 运行时代际发布后再暴露内存配置；cfgMu 使并发读写只观察完整提交。
 	*s.cfg = nextCfg
-	writeJSON(w, http.StatusOK, map[string]string{"message": "配置已更新（LLM 配置请使用 PUT /api/v1/config/llm）"})
+	writeJSON(w, http.StatusOK, map[string]string{"message": "Configuration updated"})
 }
 
 // ─── Models: GET /api/v1/models ──

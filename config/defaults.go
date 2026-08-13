@@ -82,7 +82,7 @@ func DefaultConfig() *Config {
 				FileOps:   true,  // 受限于 workspace，默认开启
 				CodeExecPolicy: CodeExecPolicyConfig{
 					RequireApproval: boolPtr(false), // 仅旧 classifier；baseline policy 仍强制审批
-					Network:         boolPtr(false), // 默认离线；联网执行必须显式授权
+					Network:         boolPtr(false), // 默认离线；当前不接受宿主网络视图
 				},
 			},
 		},

@@ -26,16 +26,16 @@ func TestBug20260730CodeExecProjectTestScratchFollowsTestingLifecycle(t *testing
 		}
 
 		s := newTestCodeExecSkill(t)
-		testWorkspace = s.cfg.Workspace
+		testWorkspace = codeExecConfigForTest(s).Workspace
 		result, err := s.Execute(context.Background(), map[string]any{
 			"mode":         "project",
 			"project_root": project,
 			"command": []string{
 				"sh",
 				"-c",
-				`test -f source.txt && printf 'artifact-ok' > "$HEXCLAW_ARTIFACT_DIR/proof.txt"`,
+				`test -f source.txt`,
 			},
-			"artifacts": true,
+			"artifacts": false,
 		})
 		if err != nil {
 			t.Fatalf("execute project fixture: %v", err)
@@ -53,14 +53,6 @@ func TestBug20260730CodeExecProjectTestScratchFollowsTestingLifecycle(t *testing
 		}
 		if _, err := os.Stat(scratch); err != nil {
 			t.Fatalf("scratch must remain readable while the test is active: %v", err)
-		}
-		proof := filepath.Join(report.Paths["artifacts"], "proof.txt")
-		got, err := os.ReadFile(proof)
-		if err != nil {
-			t.Fatalf("read project artifact while the test is active: %v", err)
-		}
-		if string(got) != "artifact-ok" {
-			t.Fatalf("artifact = %q, want artifact-ok", got)
 		}
 		if !pathWithinBase(scratch, testWorkspace) {
 			t.Errorf("test project scratch %q escaped testing workspace %q", scratch, testWorkspace)

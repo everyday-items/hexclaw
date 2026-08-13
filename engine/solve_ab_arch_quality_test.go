@@ -354,7 +354,11 @@ func newRealEngineExec(t *testing.T) (SubAgentExecFunc, string) {
 	}
 
 	skills := skill.NewRegistry()
-	sbCfg := sandbox.Config{Workspace: t.TempDir(), Timeout: 30}
+	sbCfg := sandbox.Config{
+		Workspace:            t.TempDir(),
+		Timeout:              30,
+		RequiredCapabilities: sandbox.UntrustedCodeIsolationCapabilities,
+	}
 	sb, err := sandbox.New(sbCfg)
 	if err != nil {
 		t.Fatalf("建 sandbox 失败：%v", err)

@@ -31,6 +31,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hexagon-codes/toolkit/net/httpx"
+
 	"github.com/hexagon-codes/hexclaw/adapter"
 )
 
@@ -75,6 +77,16 @@ func TestNew_DefaultsAndNameFallback(t *testing.T) {
 				t.Error("queue 不应为 nil")
 			}
 		})
+	}
+}
+
+func TestNew_NegativeClientTimeoutDoesNotPanic(t *testing.T) {
+	a := New(Config{SyncTimeout: -11})
+	if a.config.SyncTimeout != -11 {
+		t.Fatalf("SyncTimeout = %d, want -11 preserved", a.config.SyncTimeout)
+	}
+	if a.client.Timeout != httpx.DefaultRawClientTimeout {
+		t.Fatalf("client.Timeout = %v, want safe default %v", a.client.Timeout, httpx.DefaultRawClientTimeout)
 	}
 }
 

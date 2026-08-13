@@ -109,22 +109,6 @@ func TestBug20260702_AuthorizedProjectRootStillExecutes(t *testing.T) {
 
 // 默认 DeniedPaths 必须遮蔽关键 secrets 路径（旧代码为空 → FAIL）。
 func TestBug20260702_DefaultSandboxDeniedPathsCoverSecrets(t *testing.T) {
-	// toolkit v0.3.0 的 DeniedPaths 必须真实存在（fail-closed），默认列表只保留
-	// 本机存在的凭据路径；用 fake home 构造齐全的目录再断言覆盖完整性。
-	fakeHome := t.TempDir()
-	for _, p := range []string{".ssh", ".aws", ".config/gcloud", ".gnupg"} {
-		if err := os.MkdirAll(filepath.Join(fakeHome, p), 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// master.key 是文件而非目录。
-	if err := os.MkdirAll(filepath.Join(fakeHome, ".hexclaw"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(fakeHome, ".hexclaw", "master.key"), []byte("k"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("HOME", fakeHome)
 	cfg := ensureCodeExecConfigDefaults(sandbox.Config{Workspace: t.TempDir()})
 	home, err := os.UserHomeDir()
 	if err != nil || strings.TrimSpace(home) == "" {

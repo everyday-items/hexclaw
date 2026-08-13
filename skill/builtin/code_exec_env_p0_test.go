@@ -12,15 +12,16 @@ import (
 	"github.com/hexagon-codes/toolkit/os/sandbox"
 )
 
-// inheritingProcessSandbox deliberately behaves like an unsafe host executor:
-// it inherits the parent environment. The code_exec wrapper must still provide
-// a clean environment to its payload instead of relying on every sandbox
-// backend to know every possible credential variable.
 type inheritingProcessSandbox struct{}
 
-func (inheritingProcessSandbox) Exec(ctx context.Context, command string, args []string) (*sandbox.ExecResult, error) {
-	cmd := exec.CommandContext(ctx, command, args...)
-	cmd.Env = os.Environ()
+func (inheritingProcessSandbox) Close() error {
+	return nil
+}
+
+func (inheritingProcessSandbox) Exec(ctx context.Context, command sandbox.Command) (*sandbox.ExecResult, error) {
+	cmd := exec.CommandContext(ctx, command.Path, command.Args...)
+	cmd.Dir = command.Dir
+	cmd.Env = append([]string(nil), command.Env...)
 	out, err := cmd.CombinedOutput()
 	exitCode := 0
 	if err != nil {
@@ -31,13 +32,9 @@ func (inheritingProcessSandbox) Exec(ctx context.Context, command string, args [
 	return &sandbox.ExecResult{Stdout: string(out), ExitCode: exitCode}, err
 }
 
-func (inheritingProcessSandbox) ExecCode(context.Context, string, string) (*sandbox.ExecResult, error) {
-	panic("unexpected ExecCode call")
-}
-
 func TestCodeExecSecurityP0_PosixPayloadGetsCleanEnvironment(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("POSIX wrapper contract")
+		t.Skip("POSIX structured command contract")
 	}
 	t.Setenv("HEXCLAW_TEST_HOST_SECRET", "must-not-leak")
 
@@ -49,7 +46,7 @@ func TestCodeExecSecurityP0_PosixPayloadGetsCleanEnvironment(t *testing.T) {
 		map[string]string{"HEXCLAW_RUN_ID": "run_clean_env"},
 	)
 	if err != nil {
-		t.Fatalf("run wrapper: %v; output=%q", err, result.Stdout)
+		t.Fatalf("run structured command: %v; output=%q", err, result.Stdout)
 	}
 	if strings.Contains(result.Stdout, "must-not-leak") {
 		t.Fatalf("host credential environment leaked into payload: %q", result.Stdout)

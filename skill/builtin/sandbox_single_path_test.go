@@ -40,7 +40,7 @@ func TestSingleSandboxPath_NoBareExecOutsideDeprecated(t *testing.T) {
 		}
 	}
 	if len(violations) > 0 {
-		t.Errorf("裸 exec 绕过沙箱——须改走 toolkit/os/sandbox（sb.Exec/sb.ExecCode，见 code_exec.go）:\n%s",
+		t.Errorf("Bare exec bypasses the sandbox; use toolkit/os/sandbox sb.Exec through code_exec.go:\n%s",
 			strings.Join(violations, "\n"))
 	}
 }

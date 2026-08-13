@@ -81,7 +81,7 @@ type Server struct {
 	// cfgMu 串行化 s.cfg 的 read-copy-save-apply 写路径（GO-7/BUG-20260703）：
 	// 各配置写 handler 都做「整结构浅拷贝→落盘→回写」，无锁时既有同址读写
 	// 竞争（拷贝读 vs 字段写），也有 lost-update（旧副本落盘抹掉他人变更）。
-	cfgMu              sync.Mutex
+	cfgMu              sync.RWMutex
 	engine             engine.Engine
 	gateway            gateway.Gateway
 	store              storage.Store                 // 数据存储层
@@ -142,18 +142,71 @@ type Server struct {
 	autonomyDecisions *autonomy.DecisionStore // 权限决策审计日志（持久化）
 	autonomyGrants    *autonomy.GrantStore    // 任务级授权存储
 	autonomyCfgPath   string                  // Profile 持久化目标配置文件（空 = 默认）
-	// 沙箱网络热更新回调（由 main.go 注入）
-	onSandboxNetworkUpdate      func(enabled bool) error
-	onSandboxAllowedPathsUpdate func(paths []string) error
-	sandboxNetworkEnabled       func() bool
-	server                      *http.Server
-	statsMu                     sync.Mutex
-	statsCache                  statsResponse
-	statsJSON                   []byte
-	statsCacheAt                time.Time
-	ollamaBaseURL               string
-	onOllamaModelInstalled      func(context.Context, string)
-	serviceLifecycleCtx         context.Context
+	// sandboxPolicyRuntime 以完整策略候选串行提交网络与只读路径，避免运行态半更新。
+	sandboxPolicyRuntime   SandboxPolicyRuntime
+	server                 *http.Server
+	statsMu                sync.Mutex
+	statsCache             statsResponse
+	statsJSON              []byte
+	statsCacheAt           time.Time
+	ollamaBaseURL          string
+	onOllamaModelInstalled func(context.Context, string)
+	serviceLifecycleCtx    context.Context
+}
+
+// SandboxPolicy 是一次原子发布的完整沙箱运行策略。
+type SandboxPolicy struct {
+	NetworkEnabled bool
+	ReadablePaths  []string
+}
+
+// SandboxPolicyCandidate 表示已经完成构建和验证、但尚未发布的运行时策略。
+// Commit 与 Discard 互斥且幂等；Commit 不执行任何可能失败的工作。
+type SandboxPolicyCandidate struct {
+	state *sandboxPolicyCandidateState
+}
+
+type sandboxPolicyCandidateState struct {
+	once    sync.Once
+	commit  func()
+	discard func()
+}
+
+// NewSandboxPolicyCandidate 创建只允许完成一次的策略候选。
+func NewSandboxPolicyCandidate(commit, discard func()) SandboxPolicyCandidate {
+	if commit == nil || discard == nil {
+		return SandboxPolicyCandidate{}
+	}
+	return SandboxPolicyCandidate{state: &sandboxPolicyCandidateState{
+		commit:  commit,
+		discard: discard,
+	}}
+}
+
+// Commit 原子发布候选；候选已经完成后重复调用不会产生效果。
+func (c SandboxPolicyCandidate) Commit() {
+	if c.state == nil {
+		return
+	}
+	c.state.once.Do(c.state.commit)
+}
+
+// Discard 放弃候选并释放其写事务；候选已经完成后重复调用不会产生效果。
+func (c SandboxPolicyCandidate) Discard() {
+	if c.state == nil {
+		return
+	}
+	c.state.once.Do(c.state.discard)
+}
+
+func (c SandboxPolicyCandidate) valid() bool {
+	return c.state != nil
+}
+
+// SandboxPolicyRuntime 提供完整策略的候选事务与单代际快照。
+type SandboxPolicyRuntime struct {
+	Prepare  func(context.Context, SandboxPolicy) (SandboxPolicyCandidate, error)
+	Snapshot func() SandboxPolicy
 }
 
 // AgentResourceDetach is the staged half of Agent resource deletion. Commit is
@@ -500,14 +553,9 @@ func (s *Server) handleGeneratedFile(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
 }
 
-// SetSandboxCallbacks 注入沙箱网络热更新回调
-func (s *Server) SetSandboxCallbacks(updater func(bool) error, getter func() bool) {
-	s.onSandboxNetworkUpdate = updater
-	s.sandboxNetworkEnabled = getter
-}
-
-func (s *Server) SetSandboxAllowedPathsCallback(updater func([]string) error) {
-	s.onSandboxAllowedPathsUpdate = updater
+// SetSandboxPolicyRuntime 注入沙箱完整策略的原子运行时边界。
+func (s *Server) SetSandboxPolicyRuntime(runtime SandboxPolicyRuntime) {
+	s.sandboxPolicyRuntime = runtime
 }
 
 // LogCollector 返回日志收集器，供外部模块写入日志
@@ -1425,14 +1473,7 @@ func (s *Server) handleChatSSE(
 
 	// sse.NewWriter sets the text/event-stream headers; the immediate Flush
 	// commits a 200 and opens the stream before the first chunk arrives.
-	writer, err := sse.NewWriter(w)
-	if err != nil {
-		trace.L(ctx).Error("[SSE] NewWriter 失败", "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"error": "server does not support streaming",
-		})
-		return
-	}
+	writer := sse.MustNewWriter(w)
 	writer.Flush()
 
 	trace.L(ctx).Info("[SSE] 开始流式响应", "session", msg.SessionID, "user", msg.UserID)

@@ -128,7 +128,10 @@ func RegisterAdvanced(registry *skill.DefaultRegistry, cfg config.BuiltinConfig,
 		deps.FileAccess = broker
 	}
 
-	if cfg.CodeExec {
+	if cfg.CodeExec && cfg.CodeExecPolicy.CodeExecNetworkAllowed() {
+		logger.Error("CodeExecSkill is unavailable because host-network destination filtering is unsupported",
+			"error", errCodeExecHostNetworkUnsupported)
+	} else if cfg.CodeExec {
 		ws := deps.Workspace
 		if ws == "" {
 			ws = defaultWorkspace()
@@ -136,15 +139,12 @@ func RegisterAdvanced(registry *skill.DefaultRegistry, cfg config.BuiltinConfig,
 		sbCfg := sandbox.Config{
 			Workspace: ws,
 			Timeout:   30,
-			Network:   sandbox.NetworkMode(cfg.CodeExecPolicy.CodeExecNetworkAllowed()),
-			// 注：toolkit v0.3.0 移除了 DenyLoopback 配置项（Network 仅支持 disabled/host
-			// 两种明确语义，回环拦截下沉到平台后端能力实现），此处不再显式设置。
-			// 允许外网但禁止本机回环：无人值守 agent 的 code_exec 需要抓网页/调 API，
-			// 但绝不该经 loopback 打本机管理端口（API server 自提权 / Ollama / 其它
-			// sidecar）——那是 SSRF 与权限自提升面（GO-1/GO-2）。
+			Network:   sandbox.NetworkDisabled,
+			// 用户经数据连接器授权的本地目录 → 沙箱只读放行，否则 code_exec 读不到（BUG-20260626）。
 			ReadablePaths: deps.SandboxReadablePaths,
 		}
-		sb, err := sandbox.New(ensureCodeExecConfigDefaults(sbCfg))
+		sbCfg = withCodeExecRequiredCapabilities(sbCfg)
+		sb, err := sandbox.New(sbCfg)
 		if err != nil {
 			logger.Error("沙箱初始化失败，CodeExecSkill 不可用", "error", err)
 		} else {

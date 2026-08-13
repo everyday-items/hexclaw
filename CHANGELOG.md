@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Changed
+- 根模块依赖基线更新为 hexagon **v0.5.13**、ai-core **v0.2.10**、toolkit **v0.3.4**、`golang.org/x/net` **v0.55.0** 与 Go **1.25.13**；固定使用已发布版本，`GOWORK=off go mod tidy -diff` 与全仓编译型回归不再依赖本地 workspace。hexagon v0.5.13 修复 `testing/record` 对可取消 Token 计数能力的遮蔽；Go 补丁版本与 `x/net` 升级修复安全扫描确认的可达漏洞。HexClaw 当前运行链不直接导入 hexagon 的该测试工具包。
+
 ## [0.5.0-beta] - 2026-07-13
 > 家长辅导场景包正式落地，打通作业图片识题、批改、错题、复习和定时投递闭环；同时加固本地/云端模型路由、知识召回、IM 送达与沙箱执行。
 

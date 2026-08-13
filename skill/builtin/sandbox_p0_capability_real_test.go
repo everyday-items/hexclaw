@@ -26,6 +26,7 @@ func TestSandboxP0_StaticGapMatrix(t *testing.T) {
 	}
 
 	root := sandboxP0RepoRoot(t)
+	toolkitRoot := sandboxP0ToolkitRoot(t, root)
 	read := func(rel string) string {
 		t.Helper()
 		b, err := os.ReadFile(filepath.Join(root, rel))
@@ -34,12 +35,20 @@ func TestSandboxP0_StaticGapMatrix(t *testing.T) {
 		}
 		return string(b)
 	}
+	readToolkit := func(rel string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(toolkitRoot, rel))
+		if err != nil {
+			t.Fatalf("read toolkit/%s: %v", rel, err)
+		}
+		return string(b)
+	}
 
 	codeExec := read("skill/builtin/code_exec.go")
-	sandboxAPI := read("../toolkit/os/sandbox/sandbox.go")
-	execPosix := read("../toolkit/os/sandbox/exec_posix.go")
-	linux := read("../toolkit/os/sandbox/sandbox_linux.go")
-	windows := read("../toolkit/os/sandbox/sandbox_windows.go")
+	sandboxAPI := readToolkit("os/sandbox/sandbox.go")
+	execPosix := readToolkit("os/sandbox/exec_posix.go")
+	linux := readToolkit("os/sandbox/sandbox_linux.go")
+	windows := readToolkit("os/sandbox/sandbox_windows.go")
 
 	checks := []struct {
 		id        string
@@ -57,7 +66,7 @@ func TestSandboxP0_StaticGapMatrix(t *testing.T) {
 			id:        "P0-2",
 			name:      "Go project runner",
 			supported: strings.Contains(codeExec, `"go", "test"`) || strings.Contains(codeExec, "go test") || strings.Contains(codeExec, "RunnerModeProject"),
-			evidence:  "current Go path is single-file ExecCode/go run, not a project runner",
+			evidence:  "the Go path must support safe project run and test contracts through structured sandbox commands",
 		},
 		{
 			id:        "P0-3",
@@ -125,6 +134,50 @@ func TestSandboxP0_StaticGapMatrix(t *testing.T) {
 	}
 }
 
+func sandboxP0ToolkitRoot(t *testing.T, repoRoot string) string {
+	t.Helper()
+	for _, candidate := range []string{
+		filepath.Join(repoRoot, "toolkit"),
+		filepath.Join(filepath.Dir(repoRoot), "toolkit"),
+	} {
+		if info, err := os.Stat(filepath.Join(candidate, "go.mod")); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	t.Fatal("toolkit source tree is required for the P0 sandbox proof")
+	return ""
+}
+
+func TestSandboxP0ToolkitRootSupportsWorkflowAndSiblingLayouts(t *testing.T) {
+	root := t.TempDir()
+	repoRoot := filepath.Join(root, "hexclaw")
+	if err := os.MkdirAll(repoRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	sibling := filepath.Join(root, "toolkit")
+	if err := os.MkdirAll(sibling, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sibling, "go.mod"), []byte("module example.com/toolkit\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := sandboxP0ToolkitRoot(t, repoRoot); got != sibling {
+		t.Fatalf("sibling toolkit root = %q, want %q", got, sibling)
+	}
+
+	workflow := filepath.Join(repoRoot, "toolkit")
+	if err := os.MkdirAll(workflow, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workflow, "go.mod"), []byte("module example.com/toolkit\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := sandboxP0ToolkitRoot(t, repoRoot); got != workflow {
+		t.Fatalf("workflow toolkit root = %q, want %q", got, workflow)
+	}
+}
+
 // TestSandboxP0_RealModelToolUseMatrix spends real tokens and uses the configured
 // SiliconFlow models to drive the current production code_exec tool definition.
 // It distinguishes model tool-use failures from sandbox/runtime capability gaps.
@@ -157,10 +210,11 @@ func TestSandboxP0_RealModelToolUseMatrix(t *testing.T) {
 	sandboxP0WriteFile(t, filepath.Join(ws, "node", "hello.js"), "console.log('P0_NODE_FILE_OK')\n")
 
 	sb, err := sandbox.New(sandbox.Config{
-		Workspace:     ws,
-		Timeout:       30,
-		Network:       false,
-		ReadablePaths: []string{root},
+		Workspace:            ws,
+		Timeout:              30,
+		Network:              sandbox.NetworkDisabled,
+		ReadablePaths:        []string{root},
+		RequiredCapabilities: sandbox.UntrustedCodeIsolationCapabilities,
 	})
 	if err != nil {
 		t.Fatalf("create sandbox: %v", err)
@@ -335,9 +389,10 @@ func TestSandboxP0_RealModelPythonShellTasks(t *testing.T) {
 
 	ws := t.TempDir()
 	sb, err := sandbox.New(sandbox.Config{
-		Workspace: ws,
-		Timeout:   45,
-		Network:   false,
+		Workspace:            ws,
+		Timeout:              45,
+		Network:              sandbox.NetworkDisabled,
+		RequiredCapabilities: sandbox.UntrustedCodeIsolationCapabilities,
 	})
 	if err != nil {
 		t.Fatalf("create sandbox: %v", err)
@@ -408,9 +463,9 @@ PY_ARTIFACT_OK backlog=1 lin=89 guo=13`,
 	}
 }
 
-func TestSandboxP0_RealModelPythonCrawler(t *testing.T) {
-	if os.Getenv("HEXCLAW_P0_SANDBOX_REALMODEL") != "1" || os.Getenv("HEXCLAW_CODE_EXEC_LIVE_NETWORK") != "1" {
-		t.Skip("set HEXCLAW_P0_SANDBOX_REALMODEL=1 and HEXCLAW_CODE_EXEC_LIVE_NETWORK=1 to run real-model Python crawler validation")
+func TestSandboxP0_RealModelPythonCrawlerHostNetworkRejected(t *testing.T) {
+	if os.Getenv("HEXCLAW_P0_SANDBOX_REALMODEL") != "1" {
+		t.Skip("set HEXCLAW_P0_SANDBOX_REALMODEL=1 to run real-model Python crawler rejection validation")
 	}
 
 	cfg, err := config.Load(os.Getenv("HEXCLAW_REAL_LLM_CONFIG"))
@@ -432,9 +487,10 @@ func TestSandboxP0_RealModelPythonCrawler(t *testing.T) {
 
 	ws := t.TempDir()
 	sb, err := sandbox.New(sandbox.Config{
-		Workspace: ws,
-		Timeout:   45,
-		Network:   true,
+		Workspace:            ws,
+		Timeout:              45,
+		Network:              sandbox.NetworkDisabled,
+		RequiredCapabilities: sandbox.UntrustedCodeIsolationCapabilities,
 	})
 	if err != nil {
 		t.Fatalf("create sandbox: %v", err)
@@ -442,7 +498,7 @@ func TestSandboxP0_RealModelPythonCrawler(t *testing.T) {
 	codeExec := newConfiguredTestCodeExecSkill(t, sb, sandbox.Config{
 		Workspace: ws,
 		Timeout:   45,
-		Network:   true,
+		Network:   sandbox.NetworkHost,
 	})
 	prompt := `请调用 code_exec 一次，自己写并运行 Python 网络爬虫脚本，不要直接给结论。
 要求：
@@ -469,11 +525,12 @@ PY_CRAWL_OK title=<title> hrefs=<数量> bytes=<字节数>`
 			if err := sandboxP0RequirePythonShellArgs(call.Args, call.ArgsJSON); err != nil {
 				t.Fatalf("model did not write/run Python crawler code: %v\nargs:\n%s\nresult:\n%s", err, call.ArgsJSON, sandboxP0Trunc(call.Result, 1200))
 			}
-			t.Logf("real-model Python crawler output:\n%s", sandboxP0Trunc(call.Result, 1200))
-			for _, want := range []string{"PY_CRAWL_OK", "title=Example Domain", "hrefs=", "bytes="} {
-				if !strings.Contains(call.Result, want) {
-					t.Fatalf("missing %q in Python crawler result\nargs:\n%s\nresult:\n%s", want, call.ArgsJSON, sandboxP0Trunc(call.Result, 1200))
-				}
+			t.Logf("real-model Python crawler rejection:\n%s", sandboxP0Trunc(call.Result, 1200))
+			if !strings.Contains(call.Result, "tool_error: "+errCodeExecHostNetworkUnsupported.Error()) {
+				t.Fatalf("crawler host network was not rejected\nargs:\n%s\nresult:\n%s", call.ArgsJSON, sandboxP0Trunc(call.Result, 1200))
+			}
+			if strings.Contains(call.Result, "PY_CRAWL_OK") {
+				t.Fatalf("rejected crawler reported success\nargs:\n%s\nresult:\n%s", call.ArgsJSON, sandboxP0Trunc(call.Result, 1200))
 			}
 		})
 	}

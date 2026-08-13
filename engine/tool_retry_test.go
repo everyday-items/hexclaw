@@ -34,7 +34,9 @@ func TestToolRetry_TransientRetry(t *testing.T) {
 	w := NewToolRetryWrapper(cfg)
 
 	callCount := 0
+	attemptedAt := make([]time.Time, 0, 3)
 	result, err := w.Execute(context.Background(), "flaky", func(ctx context.Context) (string, error) {
+		attemptedAt = append(attemptedAt, time.Now())
 		callCount++
 		if callCount < 3 {
 			return "", fmt.Errorf("connection refused")
@@ -50,6 +52,9 @@ func TestToolRetry_TransientRetry(t *testing.T) {
 	}
 	if callCount != 3 {
 		t.Fatalf("expected 3 calls (1 + 2 retries), got %d", callCount)
+	}
+	if secondBackoff := attemptedAt[2].Sub(attemptedAt[1]); secondBackoff < 1800*time.Millisecond {
+		t.Fatalf("second retry backoff=%s, want exponential delay near 2s", secondBackoff)
 	}
 }
 

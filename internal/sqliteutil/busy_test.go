@@ -21,8 +21,8 @@ func TestRetryOnBusyExhaustsTheBoundedBudgetAndReturnsTheLastBusyError(t *testin
 	if attempts != 5 {
 		t.Fatalf("attempts=%d, want 5", attempts)
 	}
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
-		t.Fatalf("bounded retry took %s, want <=2s", elapsed)
+	if elapsed := time.Since(started); elapsed < 120*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("bounded exponential retry took %s, want 120ms..2s", elapsed)
 	}
 }
 

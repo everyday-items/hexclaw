@@ -1,8 +1,6 @@
 module github.com/hexagon-codes/hexclaw
 
-go 1.25.7
-
-toolchain go1.25.12
+go 1.25.13
 
 require (
 	github.com/alibabacloud-go/darabonba-openapi/v2 v2.0.12
@@ -10,9 +8,9 @@ require (
 	github.com/alibabacloud-go/tea v1.2.2
 	github.com/alibabacloud-go/tea-utils/v2 v2.0.8
 	github.com/gorilla/websocket v1.5.3
-	github.com/hexagon-codes/ai-core v0.2.5
-	github.com/hexagon-codes/hexagon v0.5.9
-	github.com/hexagon-codes/toolkit v0.2.6
+	github.com/hexagon-codes/ai-core v0.2.10
+	github.com/hexagon-codes/hexagon v0.5.13
+	github.com/hexagon-codes/toolkit v0.3.4
 	github.com/larksuite/oapi-sdk-go/v3 v3.5.3
 	github.com/line/line-bot-sdk-go/v8 v8.20.1
 	github.com/open-dingtalk/dingtalk-stream-sdk-go v0.9.1
@@ -20,9 +18,9 @@ require (
 	go.starlark.net v0.0.0-20260613233743-8ba36ccb83fb
 	go.uber.org/goleak v1.3.0
 	golang.org/x/image v0.44.0
-	golang.org/x/net v0.53.0
-	golang.org/x/sync v0.20.0
-	golang.org/x/sys v0.43.0
+	golang.org/x/net v0.55.0
+	golang.org/x/sync v0.21.0
+	golang.org/x/sys v0.45.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.52.0
 	nhooyr.io/websocket v1.8.17
@@ -45,7 +43,6 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/modelcontextprotocol/go-sdk v1.5.0 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
@@ -59,8 +56,9 @@ require (
 	github.com/tjfoc/gmsm v1.4.1 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
-	golang.org/x/crypto v0.50.0 // indirect
+	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
+	golang.org/x/time v0.8.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	modernc.org/libc v1.72.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
