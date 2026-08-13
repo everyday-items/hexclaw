@@ -982,9 +982,8 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("GET /api/v1/sessions/{id}/checkpoints", s.handleListCheckpoints)
 	}
 
-	// TODO: Tool Approval API (engine/tool_approval.go)
-	// ToolApprovalGate 需要 WebSocket 双向通信，已通过 WebAdapter ↔ PermissionHub 实现。
-	// 未来可添加 REST API 查询待审批请求列表或审批历史。
+	// 工具审批仅由 WebAdapter ↔ 持久化 PermissionHub 契约处理；
+	// 此处不挂载并行的 REST 审批路由。
 
 	// 桌面集成 API
 	if s.desktopSvc != nil {
