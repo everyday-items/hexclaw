@@ -268,6 +268,38 @@ func mustRecordDecision(t *testing.T, s *autonomy.DecisionStore, d autonomy.Deci
 	}
 }
 
+// BUG-20260801-003：创建授权时 owner 由服务端从可信上下文冻结（客户端不
+// 可伪造），可选的 security_scope_digest 透传并持久化；同一授权在重启
+// （重建 store 重新 reload）后仍能以精确证据授权链命中。
+func TestAutonomyGrantFreezesTrustedOwnerAndPersistsScopeDigest(t *testing.T) {
+	srv, grants, _, _ := newAutonomyTestServer(t)
+
+	rec, resp := doAutonomyJSON(t, srv, "POST", "/api/v1/autonomy/grants", map[string]any{
+		"task_ref":              "cron:job-1",
+		"source":                "cron",
+		"entries":               []string{"shell"},
+		"security_scope_digest": "scope-digest-abc",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("创建授权: %d %v", rec.Code, resp)
+	}
+	grant, _ := resp["grant"].(map[string]any)
+	if grant["owner_id"] != defaultDesktopUserID {
+		t.Fatalf("grant owner = %v, want frozen %q（客户端不可伪造）", grant["owner_id"], defaultDesktopUserID)
+	}
+	if grant["security_scope_digest"] != "scope-digest-abc" {
+		t.Fatalf("security_scope_digest 未透传: %v", grant["security_scope_digest"])
+	}
+
+	// 重启恢复：重新 Init 即从同一库 reload（等价进程重启后重建 store）。
+	if err := grants.Init(context.Background()); err != nil {
+		t.Fatalf("reload Init: %v", err)
+	}
+	if !grants.GrantAllowsUntrustedEvidence(defaultDesktopUserID, "cron", "cron:job-1", "shell", "scope-digest-abc") {
+		t.Fatal("重启后精确证据授权链必须仍可命中")
+	}
+}
+
 // summary 应把决策日志里的未解决阻断叠加到任务状态上（事实口径优先于预估）。
 func TestAutonomySummaryOverlaysPendingBlocks(t *testing.T) {
 	srv, _, decisions, _ := newAutonomyTestServer(t)

@@ -13,19 +13,28 @@ import (
 	"github.com/hexagon-codes/toolkit/util/logger"
 
 	"github.com/hexagon-codes/hexclaw/engine"
+	"github.com/hexagon-codes/hexclaw/skill"
 )
 
 // Grant 一条任务级授权：仅对指定任务（task_ref）放行 entries 描述的能力。
 // entries 复用矩阵条目语义：类别名（如 publish）、精确工具名
 // （如 github.issues.write_label）或 glob（如 publish_*）。
+//
+// OwnerID 在创建时由服务端从可信上下文冻结（不可由客户端指定），供
+// BUG-20260801-003 的精确证据授权链使用：无人值守 + 不可信 RAG 证据时，
+// 只有 owner/source/task/tool 全等且参数可审计的授权可放行工具。
+// SecurityScopeDigest 为可选参数级精确授权：非空时调用方参数 digest 必须
+// 与其一致；空 = 工具级授权（调用方参数仍须可规范化成非空 digest）。
 type Grant struct {
-	ID        string     `json:"id"`
-	TaskRef   string     `json:"task_ref"` // "cron:<id>" / "webhook:<id>" / "workflow:<id>"
-	Source    string     `json:"source"`   // 授权时的触发来源；空 = 不限来源
-	Entries   []string   `json:"entries"`
-	Note      string     `json:"note,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
-	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+	ID                  string     `json:"id"`
+	TaskRef             string     `json:"task_ref"` // "cron:<id>" / "webhook:<id>" / "workflow:<id>"
+	Source              string     `json:"source"`   // 授权时的触发来源；空 = 不限来源
+	Entries             []string   `json:"entries"`
+	OwnerID             string     `json:"owner_id,omitempty"`               // 创建时从可信 ctx 冻结，客户端不可伪造
+	SecurityScopeDigest string     `json:"security_scope_digest,omitempty"`  // 可选精确参数作用域；空 = 工具级授权
+	Note                string     `json:"note,omitempty"`
+	CreatedAt           time.Time  `json:"created_at"`
+	RevokedAt           *time.Time `json:"revoked_at,omitempty"`
 }
 
 // GrantStore 任务级授权存储（SQLite + 内存镜像）。
@@ -58,7 +67,48 @@ func (s *GrantStore) Init(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("初始化 autonomy_grants 表失败: %w", err)
 	}
+	// BUG-20260801-003：为既有库幂等补齐精确证据授权列（owner 冻结 + 可选
+	// 参数作用域）。新库已在上面 CREATE 之外的 ALTER 后同样具备两列。
+	for _, col := range []struct {
+		name string
+		ddl  string
+	}{
+		{name: "owner_id", ddl: "ALTER TABLE autonomy_grants ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''"},
+		{name: "security_scope_digest", ddl: "ALTER TABLE autonomy_grants ADD COLUMN security_scope_digest TEXT NOT NULL DEFAULT ''"},
+	} {
+		has, err := s.columnExists(ctx, col.name)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := s.db.ExecContext(ctx, col.ddl); err != nil {
+				return fmt.Errorf("补齐 autonomy_grants.%s 列失败: %w", col.name, err)
+			}
+		}
+	}
 	return s.reload(ctx)
+}
+
+// columnExists 检查指定列是否已存在（SQLite PRAGMA table_info）。
+func (s *GrantStore) columnExists(ctx context.Context, column string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(autonomy_grants)")
+	if err != nil {
+		return false, fmt.Errorf("读取 autonomy_grants 表结构失败: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, fmt.Errorf("读取 autonomy_grants 列失败: %w", err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // Create 新建授权并刷新镜像。
@@ -73,6 +123,8 @@ func (s *GrantStore) Create(ctx context.Context, g Grant) (Grant, error) {
 	}
 	g.Entries = entries
 	g.Source = strings.ToLower(strings.TrimSpace(g.Source))
+	// BUG-20260801-003：owner 只能来自可信上下文，客户端 body 不可伪造。
+	g.OwnerID = strings.TrimSpace(skill.AuthenticatedUserID(ctx))
 
 	// FS-6：Create 幂等——grant 落库后 resume/enable 失败时前端会重试建 grant，
 	// 无幂等会堆叠重复授权。相同活跃 (task_ref, source, entries集合) 直接返回既有那条。
@@ -92,8 +144,8 @@ func (s *GrantStore) Create(ctx context.Context, g Grant) (Grant, error) {
 		return Grant{}, fmt.Errorf("序列化 entries 失败: %w", err)
 	}
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO autonomy_grants (id, task_ref, source, entries, note, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		g.ID, g.TaskRef, g.Source, string(raw), g.Note, g.CreatedAt); err != nil {
+		`INSERT INTO autonomy_grants (id, task_ref, source, entries, owner_id, security_scope_digest, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		g.ID, g.TaskRef, g.Source, string(raw), g.OwnerID, g.SecurityScopeDigest, g.Note, g.CreatedAt); err != nil {
 		return Grant{}, fmt.Errorf("写入任务级授权失败: %w", err)
 	}
 	if err := s.reload(ctx); err != nil {
@@ -192,10 +244,46 @@ func (s *GrantStore) GrantAllows(source, taskRef, toolName string) bool {
 	return false
 }
 
+// GrantAllowsUntrustedEvidence 实现 engine.UntrustedEvidenceTaskGrantChecker：
+// 无人值守派发 + 不可信 RAG 证据时，只有 owner/source/task/tool 全等且参数可
+// 审计的精确授权可放行工具。语义比 GrantAllows 更严格：
+//   - 调用方必须提供非空的规范化参数 digest（参数不可审计一律拒绝）；
+//   - grant 的 owner 必须与调用方 owner 全等（客户端/矩阵/model 不能造 grant）；
+//   - grant 冻结了 security_scope_digest 时，调用方 digest 必须与其精确一致
+//     （参数级精确授权）；空 digest = 工具级授权，仅要求调用方参数可审计。
+//
+// 全局矩阵、宽泛旧 grant（无 owner）与普通任务级授权均不能通过本闸。
+func (s *GrantStore) GrantAllowsUntrustedEvidence(ownerID, source, taskRef, toolName, scopeDigest string) bool {
+	if s == nil || ownerID == "" || taskRef == "" || toolName == "" || scopeDigest == "" {
+		return false
+	}
+	source = strings.ToLower(strings.TrimSpace(source))
+	s.mu.RLock()
+	grants := s.active[taskRef]
+	s.mu.RUnlock()
+	for _, g := range grants {
+		if g.OwnerID == "" || g.OwnerID != ownerID {
+			continue
+		}
+		if g.Source != "" && g.Source != source {
+			continue
+		}
+		if g.SecurityScopeDigest != "" && g.SecurityScopeDigest != scopeDigest {
+			continue
+		}
+		for _, entry := range g.Entries {
+			if engine.SystemDispatchEntryAllowsTool(entry, toolName) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // reload 从库重建活跃授权镜像。
 func (s *GrantStore) reload(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, task_ref, source, entries, note, created_at FROM autonomy_grants WHERE revoked_at IS NULL`)
+		`SELECT id, task_ref, source, entries, owner_id, security_scope_digest, note, created_at FROM autonomy_grants WHERE revoked_at IS NULL`)
 	if err != nil {
 		return err
 	}
@@ -205,7 +293,7 @@ func (s *GrantStore) reload(ctx context.Context) error {
 	for rows.Next() {
 		var g Grant
 		var raw string
-		if err := rows.Scan(&g.ID, &g.TaskRef, &g.Source, &raw, &g.Note, &g.CreatedAt); err != nil {
+		if err := rows.Scan(&g.ID, &g.TaskRef, &g.Source, &raw, &g.OwnerID, &g.SecurityScopeDigest, &g.Note, &g.CreatedAt); err != nil {
 			return err
 		}
 		if err := json.Unmarshal([]byte(raw), &g.Entries); err != nil {
