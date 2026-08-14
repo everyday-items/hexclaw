@@ -1263,6 +1263,13 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	// 8. 启动 HTTP 服务
 	srv := api.NewServer(cfg, eng, gw, store)
+	// 会话删除后同步清理 PermissionHub 进程内 pending/remembered 状态
+	// （durable 撤销已由 Store.DeleteSession 事务内完成）。
+	srv.SetSessionDeletedHook(func(sessionID string) {
+		if err := permHub.ClearSession(sessionID); err != nil {
+			logger.Error("[permission] clear session state after delete", "session_id", sessionID, "error", err)
+		}
+	})
 	sidecarCapabilityToken, err := sidecarCapabilityTokenFromEnv()
 	if err != nil {
 		return err

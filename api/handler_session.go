@@ -142,6 +142,9 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if hook := s.sessionDeletedHook; hook != nil {
+		hook(id)
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "会话已删除"})
 }
 

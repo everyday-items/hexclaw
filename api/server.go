@@ -85,6 +85,9 @@ type Server struct {
 	engine             engine.Engine
 	gateway            gateway.Gateway
 	store              storage.Store                 // 数据存储层
+	// sessionDeletedHook 在会话删除成功（durable 撤销已提交）后回调，供
+	// PermissionHub 等进程内状态清理使用；hook 缺失或失败不改变删除结果。
+	sessionDeletedHook func(sessionID string)
 	kb                 *knowledge.Manager            // 知识库管理器（可选）
 	semanticIndex      SemanticIndexAPI              // corpus 级语义索引策略/持久 Job（可选）
 	webhookMgr         *webhook.Manager              // Webhook 管理器（可选）
@@ -233,7 +236,6 @@ type AgentResourceCleaner interface {
 // store 可为 nil，此时会话/搜索/分支 API 不可用。
 func NewServer(cfg *config.Config, eng engine.Engine, gw gateway.Gateway, store storage.Store) *Server {
 	collector := NewLogCollector(5000)
-
 	// 挂载日志文件持久化 (JSONL + 轮转)
 	sink, err := NewLogFileSink(LogFileSinkConfig{})
 	if err != nil {
@@ -255,6 +257,14 @@ func NewServer(cfg *config.Config, eng engine.Engine, gw gateway.Gateway, store 
 		credentialResolver: newInMemoryCredentialResolver(),
 		attachmentStaging:  newAttachmentStagingStore(),
 	}
+}
+
+// SetSessionDeletedHook 注册会话删除后的进程内清理回调（如 PermissionHub
+// 的 ClearSession）。durable 撤销由 Store.DeleteSession 事务内完成，hook 只
+// 负责清理进程内 pending/remembered 状态；hook 缺失或失败只记日志，不改变
+// 会话删除结果。
+func (s *Server) SetSessionDeletedHook(fn func(sessionID string)) {
+	s.sessionDeletedHook = fn
 }
 
 func defaultDataDir() string {
