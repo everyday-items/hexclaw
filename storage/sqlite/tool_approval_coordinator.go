@@ -638,3 +638,22 @@ func (s *Store) RevokeSessionToolApprovals(ctx context.Context, sessionID, reaso
 	}
 	return tx.Commit()
 }
+
+// RevokeToolGrants 按 owner + canonical tool 维度主动撤销 remembered grants
+// （工具禁用/策略收紧路径）。撤销后 grant 行置 active=0 并写入
+// revoked_at/revoked_reason，即使工具重新启用（schema_version 不变）也不会
+// 复活；重复撤销幂等。缺 owner 或 tool 时拒绝，避免误做全量撤销。
+func (s *Store) RevokeToolGrants(ctx context.Context, ownerID, canonicalToolName, reason string) error {
+	if strings.TrimSpace(ownerID) == "" || strings.TrimSpace(canonicalToolName) == "" {
+		return storage.ErrToolApprovalIdentityMismatch
+	}
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+UPDATE remembered_permission_grants
+SET active = 0,
+    revoked_at = COALESCE(revoked_at, ?),
+    revoked_reason = CASE WHEN revoked_reason = '' THEN ? ELSE revoked_reason END
+WHERE owner_id = ? AND canonical_tool_name = ? AND active = 1`,
+		now.UnixMilli(), reason, ownerID, canonicalToolName)
+	return err
+}

@@ -64,6 +64,10 @@ type RememberedGrantStore interface {
 	HasRememberedGrant(ctx context.Context, ownerID, resolvedSessionID, canonicalToolName, securityScopeDigest string) (bool, error)
 	RememberGrant(ctx context.Context, ownerID, resolvedSessionID, canonicalToolName, securityScopeDigest string) error
 	DeleteRememberedGrants(ctx context.Context, resolvedSessionID string) error
+	// RevokeToolGrants 按 owner + canonical tool 维度主动撤销 remembered grants
+	// （工具禁用/策略收紧路径）。撤销必须持久化（active=0 + revoked 证据），
+	// 重复撤销幂等；owner 或 tool 为空必须拒绝。
+	RevokeToolGrants(ctx context.Context, ownerID, canonicalToolName, reason string) error
 }
 
 // DurableToolApprovalStore is the backend authority boundary. The decision,
@@ -230,6 +234,42 @@ func (h *PermissionHub) ClearSession(sessionID string) error {
 	h.mu.Lock()
 	for key := range h.remembered {
 		if key.resolvedSessionID == sessionID {
+			delete(h.remembered, key)
+		}
+	}
+	h.mu.Unlock()
+	return nil
+}
+
+// RevokeToolGrant 按 owner + canonical tool 维度主动撤销 remembered grants
+// （工具禁用/策略收紧路径）。durable 撤销失败必须返回错误，不得伪装成功；
+// 进程内 remembered cache 同步清理，保证 cache 投影不复活；重复撤销幂等。
+func (h *PermissionHub) RevokeToolGrant(ctx context.Context, ownerID, canonicalToolName string) error {
+	if h.authorityErr != nil {
+		return fmt.Errorf("permission authority unavailable: %w", h.authorityErr)
+	}
+	if strings.TrimSpace(ownerID) == "" || strings.TrimSpace(canonicalToolName) == "" {
+		return errors.New("owner and canonical tool name are required")
+	}
+	h.mu.Lock()
+	grants := h.grants
+	approvals := h.approvals
+	h.mu.Unlock()
+	revoke := func() error {
+		if approvals != nil {
+			return approvals.RevokeToolGrants(ctx, ownerID, canonicalToolName, "tool_revoked")
+		}
+		if grants != nil {
+			return grants.RevokeToolGrants(ctx, ownerID, canonicalToolName, "tool_revoked")
+		}
+		return nil
+	}
+	if err := revoke(); err != nil {
+		return fmt.Errorf("revoke tool grants: %w", err)
+	}
+	h.mu.Lock()
+	for key := range h.remembered {
+		if key.ownerID == ownerID && key.canonicalToolName == canonicalToolName {
 			delete(h.remembered, key)
 		}
 	}
@@ -939,6 +979,9 @@ func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo)
 				reason = "policy denies execution"
 			}
 			h.recordDecision(ctx, call.Name, "deny", "policy", "显式 deny 规则 "+dec.MatchedRule)
+			// 策略收紧即撤销：deny 是显式的授权状态冲突信号，先撤销该 owner+tool
+			// 的 remembered grant 再拒绝，避免策略放宽后旧授权立即复活。
+			h.revokeRememberedToolGrant(ctx, call.Name)
 			return fmt.Errorf("tool %q blocked by policy %q: %s", call.Name, dec.MatchedRule, reason)
 		case ActionRequireApproval:
 			risk := dec.Risk
@@ -969,6 +1012,22 @@ func (h *PermissionHook) BeforeToolCall(ctx context.Context, call *ToolCallInfo)
 	}
 	return h.requestApproval(ctx, call, risk,
 		fmt.Sprintf("Agent wants to execute %s(%s)", call.Name, summarizeArgs(call.Arguments)))
+}
+
+// revokeRememberedToolGrant 在策略 deny 时同步撤销该 owner+tool 的 remembered
+// grant。撤销失败只记日志不阻断 deny（deny 本身就是安全结局），但 durable
+// 撤销必须在正常路径成功，否则策略放宽后 grant 会复活。
+func (h *PermissionHook) revokeRememberedToolGrant(ctx context.Context, toolName string) {
+	if h.hub == nil {
+		return
+	}
+	ownerID := skill.AuthenticatedUserID(ctx)
+	if ownerID == "" {
+		return
+	}
+	if err := h.hub.RevokeToolGrant(ctx, ownerID, strings.ToLower(strings.TrimSpace(toolName))); err != nil {
+		logger.Warn("[permission] revoke remembered grant after policy deny", "tool", toolName, "error", err)
+	}
 }
 
 // authorizeUntrustedEvidenceTool is the authority firewall between retrieved

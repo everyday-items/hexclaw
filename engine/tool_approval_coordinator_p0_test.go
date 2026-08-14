@@ -41,6 +41,10 @@ func (s *failingDurableApprovalAuthority) RevokeSessionToolApprovals(context.Con
 	return s.revokeErr
 }
 
+func (s *failingDurableApprovalAuthority) RevokeToolGrants(context.Context, string, string, string) error {
+	return s.revokeErr
+}
+
 func (s *failingDurableApprovalAuthority) HasRememberedGrant(context.Context, string, string, string, string) (bool, error) {
 	return false, nil
 }
