@@ -174,6 +174,13 @@ type WeeklyPracticeItem struct {
 	SourceKind       string                     `json:"source_kind"`
 	GenerationMethod string                     `json:"generation_method"`
 	SourceRef        string                     `json:"source_ref"`
+	// 学科与知识点（原型 app.html .kpill「数学·简易方程」）：到期复习来自错题
+	// subject/knowledge_point，补充轨道按候选来源填充，可空省略。
+	Subject          string                     `json:"subject,omitempty"`
+	KnowledgePoint   string                     `json:"knowledge_point,omitempty"`
+	// 掌握状态（架构设计-v0.5.0 §5.2 状态词表：待复习/已重做/证据已掌握/已归档；
+	// 原型 .stpill 投影）。错题本取记录持久状态，积累本无掌握语义留空。
+	MasteryStatus    string                     `json:"mastery_status,omitempty"`
 	Verification     WeeklyPracticeVerification `json:"verification"`
 	PromptMarkdown   string                     `json:"prompt_markdown"`
 }

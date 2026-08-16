@@ -655,6 +655,9 @@ func (d Deps) weeklyDueTrack(ctx context.Context, agent string) (k12.WeeklyPract
 			PlanSection: k12.WeeklySectionDueReview, SourceKind: "mistake",
 			GenerationMethod: k12.WeeklyGenerationMethodOriginal,
 			SourceRef:        due.Record.RecordID,
+			Subject:          due.Subject(),
+			KnowledgePoint:   due.Point(),
+			MasteryStatus:    due.Record.Status,
 			Verification: k12.WeeklyPracticeVerification{
 				Status:       k12.WeeklyVerificationVerified,
 				EvidenceRefs: []string{evidence},
