@@ -100,12 +100,27 @@ func TestREG_RAG_TaintedStaticDenyPrecedesApproval(t *testing.T) {
 	}
 }
 
-type exactEvidenceGrant struct{ allow bool }
+// exactEvidenceGrant 模拟真实 autonomy.GrantStore.GrantAllowsUntrustedEvidence
+// 的对账语义：owner/source/task/tool 全等、调用参数可审计（scopeDigest 非空）、
+// 冻结 scope 时须精确匹配。scope 为空 = 工具级授权。
+type exactEvidenceGrant struct {
+	allow bool
+	scope string // 空 = 工具级授权；非空 = 冻结的参数作用域
+}
 
 func (g exactEvidenceGrant) GrantAllows(string, string, string) bool { return true }
 func (g exactEvidenceGrant) GrantAllowsUntrustedEvidence(ownerID, source, taskRef, toolName, scopeDigest string) bool {
-	return g.allow && ownerID == "owner-1" && source == "cron" && taskRef == "cron:job-1" &&
-		toolName == "shell" && scopeDigest != ""
+	if !g.allow {
+		return false
+	}
+	if scopeDigest == "" {
+		return false
+	}
+	if g.scope != "" && g.scope != scopeDigest {
+		return false
+	}
+	return ownerID == "owner-1" && source == "cron" && taskRef == "cron:job-1" &&
+		toolName == "shell"
 }
 
 func TestREG_RAG_TaintedUnattendedMatrixCannotAutoApprove(t *testing.T) {
@@ -135,6 +150,77 @@ func TestREG_RAG_TaintedUnattendedRequiresExactScopedGrant(t *testing.T) {
 	ctx = withUntrustedKnowledgeEvidence(ctx)
 	if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "shell", Source: "skill", Arguments: map[string]any{"command": "true"}}); err != nil {
 		t.Fatalf("an exact persisted evidence-aware task grant may authorize the frozen scope: %v", err)
+	}
+}
+
+// TestREG_RAG_TaintedUnattendedScopedGrantRejectsMismatch 证明 PermissionHook
+// 在 tainted 无人值守路径上把 owner/scope 对账委托给证据专用接口：错 owner、
+// 错 source、错 task、错 tool 与冻结 scope 不匹配都不能放行。假对象语义与
+// 真实 autonomy.GrantStore.GrantAllowsUntrustedEvidence 一致：空 scope 的
+// grant 是工具级授权（调用参数可审计即放行），冻结 scope 的 grant 必须
+// 精确匹配。
+func TestREG_RAG_TaintedUnattendedScopedGrantRejectsMismatch(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		grant  exactEvidenceGrant
+		owner  string
+		source string
+		task   string
+		tool   string
+		args   map[string]any
+	}{
+		{name: "wrong-owner", grant: exactEvidenceGrant{allow: true}, owner: "owner-2", source: "cron", task: "cron:job-1", tool: "shell", args: map[string]any{"command": "true"}},
+		{name: "wrong-source", grant: exactEvidenceGrant{allow: true}, owner: "owner-1", source: "webhook", task: "cron:job-1", tool: "shell", args: map[string]any{"command": "true"}},
+		{name: "wrong-task", grant: exactEvidenceGrant{allow: true}, owner: "owner-1", source: "cron", task: "cron:other", tool: "shell", args: map[string]any{"command": "true"}},
+		{name: "wrong-tool", grant: exactEvidenceGrant{allow: true}, owner: "owner-1", source: "cron", task: "cron:job-1", tool: "code_exec", args: map[string]any{"command": "true"}},
+		{name: "scope-mismatch", grant: exactEvidenceGrant{allow: true, scope: "grant-scope-abc"}, owner: "owner-1", source: "cron", task: "cron:job-1", tool: "shell", args: map[string]any{"command": "true"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hook := NewPermissionHook(NewPermissionHub(0),
+				WithPolicy(DefaultBaselinePolicy()),
+				WithSystemDispatchPolicy(FullAccessSystemDispatchPolicy()),
+				WithTaskGrants(tc.grant),
+			)
+			ctx := skill.WithAuthenticatedUser(context.Background(), tc.owner)
+			ctx = withSystemDispatch(ctx, tc.source)
+			ctx = skill.WithSystemDispatchTask(ctx, tc.task)
+			ctx = withUntrustedKnowledgeEvidence(ctx)
+			if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: tc.tool, Source: "skill", Arguments: tc.args}); err == nil {
+				t.Fatalf("tainted %s must fail closed: %+v", tc.name, tc.grant)
+			}
+		})
+	}
+}
+
+// TestREG_RAG_TaintedUnattendedScopedGrantAllowsExactScope 证明冻结 scope 的
+// 精确 grant 只在参数 digest 一致时放行（工具级空 scope grant 也在参数可
+// 审计时放行）。
+func TestREG_RAG_TaintedUnattendedScopedGrantAllowsExactScope(t *testing.T) {
+	exact, err := untrustedEvidenceSecurityScopeDigest(map[string]any{"command": "true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name  string
+		grant exactEvidenceGrant
+	}{
+		{name: "exact-scope-grant", grant: exactEvidenceGrant{allow: true, scope: exact}},
+		{name: "tool-level-grant", grant: exactEvidenceGrant{allow: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hook := NewPermissionHook(NewPermissionHub(0),
+				WithPolicy(DefaultBaselinePolicy()),
+				WithSystemDispatchPolicy(FullAccessSystemDispatchPolicy()),
+				WithTaskGrants(tc.grant),
+			)
+			ctx := skill.WithAuthenticatedUser(context.Background(), "owner-1")
+			ctx = withSystemDispatch(ctx, "cron")
+			ctx = skill.WithSystemDispatchTask(ctx, "cron:job-1")
+			ctx = withUntrustedKnowledgeEvidence(ctx)
+			if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "shell", Source: "skill", Arguments: map[string]any{"command": "true"}}); err != nil {
+				t.Fatalf("%s must allow the auditable frozen scope: %v", tc.name, err)
+			}
+		})
 	}
 }
 
