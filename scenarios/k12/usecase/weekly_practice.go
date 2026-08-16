@@ -646,6 +646,10 @@ func (d Deps) weeklyDueTrack(ctx context.Context, agent string) (k12.WeeklyPract
 		seenSourceRefs[sourceRef] = struct{}{}
 		seenCanonicalProblems[canonicalHash] = struct{}{}
 		itemID := "witem-" + shortDigest(k12.WeeklySectionDueReview+"\x00"+due.Record.RecordID)
+		evidence := strings.TrimSpace(due.Point())
+		if evidence == "" {
+			evidence = "原错题事实"
+		}
 		item := k12.WeeklyPracticeItem{
 			ItemID: itemID, Position: len(track.Items) + 1,
 			PlanSection: k12.WeeklySectionDueReview, SourceKind: "mistake",
@@ -653,7 +657,7 @@ func (d Deps) weeklyDueTrack(ctx context.Context, agent string) (k12.WeeklyPract
 			SourceRef:        due.Record.RecordID,
 			Verification: k12.WeeklyPracticeVerification{
 				Status:       k12.WeeklyVerificationVerified,
-				EvidenceRefs: []string{"mistake:" + due.Record.RecordID},
+				EvidenceRefs: []string{evidence},
 			},
 			PromptMarkdown: due.Title(),
 		}

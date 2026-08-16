@@ -2,6 +2,7 @@ package usecase_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -95,6 +96,40 @@ func TestBUG20260727005DueMistakeProjectsIntoCurrentDraftIdempotently(t *testing
 	if replayed.PlanID != updated.PlanID || replayed.Revision != updated.Revision ||
 		len(weeklyDueProjectionItems(replayed)) != len(weeklyDueProjectionItems(updated)) {
 		t.Fatalf("idempotent ensure mutated plan: first=%+v replay=%+v", updated, replayed)
+	}
+}
+
+func TestBUG20260815001DueReviewEvidenceIsReadableNotInternalID(t *testing.T) {
+	// BUG-20260815-001 ②：到期复习依据必须是可读文案（知识点或「原错题事实」），
+	// 不得把内部 RecordID 以 mistake:<id> 形式泄漏到 UI。
+	d := newDataDeps(t, "xiaoming")
+	clock := &mutableWeeklyClock{now: 1785081600}
+	d.Now = func() int64 { return clock.now }
+	configureWeeklyBundle(t, &d, false)
+	mistakeID := seedWeeklyProjectionMistake(
+		t, d, "readable-evidence", "9 + 6 = ?", "15", clock.now-1,
+	)
+	plan, _, err := d.EnsureWeeklyPracticePlan(context.Background(),
+		usecase.EnsureWeeklyPracticePlanRequest{
+			AgentName: "xiaoming", IdempotencyKey: "projection-readable-evidence",
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, ok := weeklyProjectionItemBySource(plan, mistakeID)
+	if !ok {
+		t.Fatalf("due mistake %s was not projected into current draft", mistakeID)
+	}
+	for _, ref := range item.Verification.EvidenceRefs {
+		if strings.Contains(ref, "mistake:") {
+			t.Fatalf("evidence leaked internal record id: %q", ref)
+		}
+		if strings.TrimSpace(ref) == "" {
+			t.Fatalf("evidence must be a readable non-empty label")
+		}
+	}
+	if len(item.Verification.EvidenceRefs) == 0 {
+		t.Fatalf("evidence must not be empty")
 	}
 }
 
