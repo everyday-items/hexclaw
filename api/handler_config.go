@@ -40,6 +40,7 @@ type LLMProviderConfigResponse struct {
 	CredentialRef         string                               `json:"credential_ref,omitempty"`
 	CredentialPresent     bool                                 `json:"credential_present"`
 	APIKey                string                               `json:"api_key"`
+	APIKeyLength          int                                  `json:"api_key_length,omitempty"`
 	BaseURL               string                               `json:"base_url"`
 	Model                 string                               `json:"model"`
 	Models                []string                             `json:"models"`
@@ -590,6 +591,7 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 			CredentialRef:         p.CredentialRef,
 			CredentialPresent:     strings.TrimSpace(p.APIKey) != "",
 			APIKey:                config.MaskAPIKey(p.APIKey),
+			APIKeyLength:          len(p.APIKey),
 			BaseURL:               p.BaseURL,
 			Model:                 p.Model,
 			Models:                p.Models,

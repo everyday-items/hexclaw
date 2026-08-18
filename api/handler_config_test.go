@@ -519,6 +519,9 @@ func TestHandleUpdateLLMConfig_SemanticReloadFailureRollsBackEveryConfigTruthAnd
 			if masked != config.MaskAPIKey("sk-original-secret") {
 				t.Fatalf("GET masked key=%q, want original secret projection", masked)
 			}
+			if got := visible.Providers["cloud-a"].APIKeyLength; got != len("sk-original-secret") {
+				t.Fatalf("GET api_key_length=%d, want %d（等长掩码元数据，仅长度不含 Key 内容）", got, len("sk-original-secret"))
+			}
 
 			retryBody, err := json.Marshal(LLMConfigUpdateRequest{
 				Default: "cloud-a",
