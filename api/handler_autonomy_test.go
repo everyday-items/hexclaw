@@ -17,6 +17,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/autonomy"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/engine"
+	"github.com/hexagon-codes/hexclaw/skill"
 )
 
 func newAutonomyTestServer(t *testing.T) (*Server, *autonomy.GrantStore, *autonomy.DecisionStore, string) {
@@ -124,6 +125,26 @@ func TestAutonomyProfileFullAccessHotSwapsAtRuntime(t *testing.T) {
 	raw, err := os.ReadFile(cfgPath)
 	if err != nil || !bytes.Contains(raw, []byte("full_access")) {
 		t.Fatalf("full_access 未持久化到配置文件: %v", err)
+	}
+}
+
+func TestAutonomyProfileFullAccessHotSwapSuppressesInteractiveApproval(t *testing.T) {
+	srv, grants, decisions, cfgPath := newAutonomyTestServer(t)
+	hook := engine.NewPermissionHook(engine.NewPermissionHub(0),
+		engine.WithPolicy(engine.DefaultBaselinePolicy()),
+		engine.WithSystemDispatchPolicy(engine.DefaultSystemDispatchPolicy()),
+		engine.WithTaskGrants(grants),
+	)
+	srv.SetAutonomy(hook, decisions, grants, cfgPath)
+
+	rec, resp := doAutonomyJSON(t, srv, "PUT", "/api/v1/autonomy/profile", map[string]string{"profile": "full_access"})
+	if rec.Code != http.StatusOK || resp["profile"] != "full_access" {
+		t.Fatalf("full_access 应运行时可切并返回 200，得到 %d %v", rec.Code, resp)
+	}
+
+	ctx := skill.WithAuthenticatedUser(context.Background(), "interactive-owner")
+	if err := srv.autonomyHook.BeforeToolCall(ctx, &engine.ToolCallInfo{Name: "browser", Source: "skill"}); err != nil {
+		t.Fatalf("设置 API 热更新后交互 browser 不应再要求审批: %v", err)
 	}
 }
 

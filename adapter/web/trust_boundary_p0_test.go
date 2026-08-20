@@ -193,12 +193,18 @@ func TestWebTrustBoundaryP0_ApprovalResponseBoundToOwningSocketAndPrincipal(t *t
 		t.Fatalf("read approval request: %v", err)
 	}
 	response := wsMessage{
-		Type: "tool_approval_response", RequestID: request.ID, DecisionID: "decision-owner-1",
+		Type: "tool_approval_response", RequestID: request.ID, OwnerID: "owner-1",
+		SessionID: "session-1", InvocationID: request.InvocationID,
+		ArgumentsDigest: request.ArgumentsDigest, SecurityScopeDigest: request.SecurityScopeDigest,
+		ScopeSchemaVersion: request.ScopeSchemaVersion, DeadlineAt: request.DeadlineAt.Format(time.RFC3339Nano),
+		DecisionID: "decision-owner-1", Decision: "approved_once", IdempotencyKey: "idempotency-owner-1",
 		Metadata: map[string]string{
 			"approval_request_id": request.ID, "request_id": request.ID,
+			"owner_id": "owner-1", "session_id": "session-1",
 			"decision_id": "decision-owner-1", "invocation_id": request.InvocationID,
 			"decision": "approved_once", "idempotency_key": "idempotency-owner-1",
 			"arguments_digest": request.ArgumentsDigest, "security_scope_digest": request.SecurityScopeDigest,
+			"scope_schema_version": "1", "deadline_at": request.DeadlineAt.Format(time.RFC3339Nano),
 		},
 	}
 	wrongACK := writeApprovalResponseAndReadACK(t, otherCtx, otherConn, response)

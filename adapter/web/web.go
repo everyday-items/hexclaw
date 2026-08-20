@@ -49,6 +49,7 @@ type WebAdapter struct {
 	onApprovalResponse        func(requestID string, approved, remember bool) // callback for tool approval
 	onApprovalDecision        func(ApprovalResponseData) string
 	onDurableApprovalDecision func(ApprovalResponseData) ApprovalDecisionReceipt
+	onApprovalReconciliation  func(context.Context, ApprovalReconciliationData) (ApprovalReconciliationResult, error)
 	pendingApprovalReplay     func(context.Context, string, string) []*PermissionRequestData
 	approvalBindings          sync.Map // requestID -> approvalTransportBinding
 	approvalACKMu             sync.Mutex
@@ -236,6 +237,7 @@ type ApprovalResponseData struct {
 	ArgumentsDigest     string
 	SecurityScopeDigest string
 	ScopeSchemaVersion  int
+	DeadlineAt          time.Time
 	Approved            bool
 	Remember            bool
 	responderChatID     string
@@ -261,6 +263,7 @@ type ApprovalDecisionReceipt struct {
 	ArgumentsDigest     string
 	SecurityScopeDigest string
 	ScopeSchemaVersion  int
+	DeadlineAt          time.Time
 	TerminalResult      string
 	ACKStatus           string
 	Replayed            bool
@@ -272,6 +275,32 @@ func (a *WebAdapter) SetDurableApprovalDecisionHandler(
 	fn func(ApprovalResponseData) ApprovalDecisionReceipt,
 ) {
 	a.onDurableApprovalDecision = fn
+}
+
+// ApprovalReconciliationData 是 Desktop 重连时针对一张仍可见审批卡提交的完整身份。
+type ApprovalReconciliationData struct {
+	RequestID           string
+	OwnerID             string
+	SessionID           string
+	InvocationID        string
+	ArgumentsDigest     string
+	SecurityScopeDigest string
+	ScopeSchemaVersion  int
+	DeadlineAt          time.Time
+	responderChatID     string
+}
+
+// ApprovalReconciliationResult 只允许返回一个 durable 回执或一个仍 pending 的原始请求。
+type ApprovalReconciliationResult struct {
+	Request *PermissionRequestData
+	Receipt *ApprovalDecisionReceipt
+}
+
+// SetApprovalReconciliationHandler 安装逐张审批卡的 durable 回执查询。
+func (a *WebAdapter) SetApprovalReconciliationHandler(
+	fn func(context.Context, ApprovalReconciliationData) (ApprovalReconciliationResult, error),
+) {
+	a.onApprovalReconciliation = fn
 }
 
 // SetPendingApprovalReplayHandler installs the backend pending projection used
@@ -295,6 +324,19 @@ type PermissionRequestData struct {
 	DeadlineAt          time.Time
 	Risk                string
 	Reason              string
+}
+
+// PermissionTerminalData 是后端 durable expired/fenced 终态的传输投影。
+type PermissionTerminalData struct {
+	RequestID           string
+	SessionID           string
+	OwnerID             string
+	InvocationID        string
+	ArgumentsDigest     string
+	SecurityScopeDigest string
+	ScopeSchemaVersion  int
+	DeadlineAt          time.Time
+	TerminalResult      string
 }
 
 // SendPermissionRequest sends a tool approval request to the frontend via WebSocket.
@@ -372,6 +414,66 @@ func permissionRequestMessage(sessionID string, data *PermissionRequestData) wsM
 	}
 }
 
+// SendPermissionTerminal 将 durable 终态只发送给该会话当前绑定的连接。
+func (a *WebAdapter) SendPermissionTerminal(ctx context.Context, data *PermissionTerminalData) error {
+	if data == nil {
+		return errors.New("permission terminal data is nil")
+	}
+	if strings.TrimSpace(data.RequestID) == "" || strings.TrimSpace(data.SessionID) == "" ||
+		strings.TrimSpace(data.OwnerID) == "" || strings.TrimSpace(data.InvocationID) == "" ||
+		strings.TrimSpace(data.ArgumentsDigest) == "" || strings.TrimSpace(data.SecurityScopeDigest) == "" ||
+		data.ScopeSchemaVersion <= 0 || data.DeadlineAt.IsZero() ||
+		(data.TerminalResult != "expired" && data.TerminalResult != "fenced") {
+		return errors.New("permission terminal has incomplete identity")
+	}
+	value, ok := a.sessionConns.Load(data.SessionID)
+	if !ok {
+		return fmt.Errorf("no WebSocket connection for session %s", data.SessionID)
+	}
+	binding, ok := value.(sessionConnectionBinding)
+	if !ok || binding.chatID == "" || binding.ownerID == "" {
+		return fmt.Errorf("invalid WebSocket connection binding for session %s", data.SessionID)
+	}
+	if binding.ownerID != data.OwnerID {
+		return fmt.Errorf("approval owner does not own session %s", data.SessionID)
+	}
+	// Durable 终态已撤销响应资格，不能让 deadline 尚未来临的 fenced 请求继续提交决策。
+	a.approvalBindings.Delete(data.RequestID)
+	conn, ok := a.getConn(binding.chatID)
+	if !ok {
+		return fmt.Errorf("WebSocket connection %s disconnected", binding.chatID)
+	}
+	return wsjson.Write(ctx, conn, permissionTerminalMessage(data))
+}
+
+func permissionTerminalMessage(data *PermissionTerminalData) wsMessage {
+	deadline := data.DeadlineAt.Format(time.RFC3339Nano)
+	return wsMessage{
+		Type:                "tool_approval_terminal",
+		RequestID:           data.RequestID,
+		SessionID:           data.SessionID,
+		OwnerID:             data.OwnerID,
+		InvocationID:        data.InvocationID,
+		ArgumentsDigest:     data.ArgumentsDigest,
+		SecurityScopeDigest: data.SecurityScopeDigest,
+		ScopeSchemaVersion:  data.ScopeSchemaVersion,
+		DeadlineAt:          deadline,
+		TerminalResult:      data.TerminalResult,
+		Metadata: map[string]string{
+			"request_id":            data.RequestID,
+			"approval_request_id":   data.RequestID,
+			"session_id":            data.SessionID,
+			"owner_id":              data.OwnerID,
+			"invocation_id":         data.InvocationID,
+			"arguments_digest":      data.ArgumentsDigest,
+			"security_scope_digest": data.SecurityScopeDigest,
+			"scope_schema_version":  strconv.Itoa(data.ScopeSchemaVersion),
+			"deadline_at":           deadline,
+			"terminal_result":       data.TerminalResult,
+		},
+	}
+}
+
 // Broadcast 向所有活跃 WebSocket 连接广播消息。
 func (a *WebAdapter) Broadcast(msgType, content string, metadata map[string]string) {
 	msg := wsMessage{
@@ -402,7 +504,7 @@ func (a *WebAdapter) Send(ctx context.Context, chatID string, reply *adapter.Rep
 	if canonical == nil {
 		canonical = canonicalReplyContent(reply.Content, reply.Metadata)
 	}
-	msg := wsMessage{Type: "reply", Content: reply.Content, MessageContent: canonical, RenderManifest: reply.RenderManifest, Metadata: reply.Metadata, KnowledgeHits: reply.KnowledgeHits, MemoryHits: reply.MemoryHits} // U9
+	msg := wsMessage{Type: "reply", Content: reply.Content, MessageContent: canonical, RenderManifest: reply.RenderManifest, Metadata: reply.Metadata, KnowledgeHits: reply.KnowledgeHits, MemoryHits: reply.MemoryHits, ReasoningReceipt: normalizedReasoningReceipt(reply.ReasoningReceipt)} // U9
 	if reply.Metadata != nil {
 		msg.SessionID = reply.Metadata["session_id"]
 		msg.RequestID = reply.Metadata["request_id"]
@@ -443,6 +545,7 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 				MessageID:           chunk.MessageID,
 				Sequence:            chunk.Sequence,
 				ReasoningDisclosure: chunk.ReasoningDisclosure,
+				ReasoningReceipt:    normalizedReasoningReceipt(chunk.ReasoningReceipt),
 				RuntimeEvent:        chunk.RuntimeEvent,
 			}
 			_ = a.sendToTargets(ctx, chatID, requestID, errMsg)
@@ -479,6 +582,7 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 			MessageID:           chunk.MessageID,
 			Sequence:            chunk.Sequence,
 			ReasoningDisclosure: chunk.ReasoningDisclosure,
+			ReasoningReceipt:    normalizedReasoningReceipt(chunk.ReasoningReceipt),
 			RuntimeEvent:        chunk.RuntimeEvent,
 		}
 		if chunk.Done {
@@ -598,32 +702,43 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = wsjson.Write(r.Context(), conn, snapshotToMessage(snapshot))
 			continue
+		case "tool_approval_reconcile":
+			data, err := approvalReconciliationDataFromMessage(incoming, ownerID, chatID)
+			if err != nil {
+				_ = wsjson.Write(r.Context(), conn, wsMessage{
+					Type: "error", Content: "permission reconciliation rejected", RequestID: incoming.RequestID,
+				})
+				continue
+			}
+			if a.onApprovalReconciliation == nil {
+				_ = wsjson.Write(r.Context(), conn, wsMessage{
+					Type: "error", Content: "permission reconciliation unavailable", RequestID: data.RequestID,
+				})
+				continue
+			}
+			result, err := a.onApprovalReconciliation(r.Context(), data)
+			if err != nil {
+				slog.Warn("tool approval reconciliation failed", "request_id", data.RequestID, "error", err)
+				_ = wsjson.Write(r.Context(), conn, wsMessage{
+					Type: "error", Content: "permission reconciliation rejected", RequestID: data.RequestID,
+				})
+				continue
+			}
+			if err := a.sendApprovalReconciliation(r.Context(), data, result); err != nil {
+				slog.Warn("tool approval reconciliation response failed", "request_id", data.RequestID, "error", err)
+				_ = wsjson.Write(r.Context(), conn, wsMessage{
+					Type: "error", Content: "permission reconciliation rejected", RequestID: data.RequestID,
+				})
+			}
+			continue
 		case "tool_approval_response", "tool_permission_response":
-			reqID := incoming.Metadata["approval_request_id"]
-			if reqID == "" {
-				reqID = incoming.Metadata["request_id"]
-			}
-			if reqID == "" {
-				reqID = incoming.RequestID
-			}
-			decision := incoming.Metadata["decision"]
-			decisionID := incoming.DecisionID
-			if decisionID == "" {
-				decisionID = incoming.Metadata["decision_id"]
-			}
-			idempotencyKey := incoming.Metadata["idempotency_key"]
-			scopeSchemaVersion := incoming.ScopeSchemaVersion
-			if scopeSchemaVersion == 0 {
-				scopeSchemaVersion, _ = strconv.Atoi(incoming.Metadata["scope_schema_version"])
-			}
-			data := ApprovalResponseData{
-				RequestID: reqID, OwnerID: ownerID, DecisionID: decisionID,
-				InvocationID: incoming.Metadata["invocation_id"],
-				Decision:     decision, IdempotencyKey: idempotencyKey,
-				ArgumentsDigest:     incoming.Metadata["arguments_digest"],
-				SecurityScopeDigest: incoming.Metadata["security_scope_digest"],
-				ScopeSchemaVersion:  scopeSchemaVersion,
-				responderChatID:     chatID,
+			data, err := approvalResponseDataFromMessage(incoming, ownerID, chatID)
+			if err != nil {
+				_ = wsjson.Write(r.Context(), conn, rejectedApprovalACK(
+					ApprovalResponseData{RequestID: incoming.RequestID, OwnerID: ownerID, responderChatID: chatID},
+					"", "identity_mismatch",
+				))
+				continue
 			}
 			_ = wsjson.Write(r.Context(), conn, a.approvalACK(data))
 			continue
@@ -859,6 +974,249 @@ func (a *WebAdapter) finishRequest(requestID, sessionID string) {
 	}
 }
 
+func approvalReconciliationDataFromMessage(
+	incoming wsMessage, authenticatedOwnerID, chatID string,
+) (ApprovalReconciliationData, error) {
+	requestID, err := reconciliationWireString(
+		incoming.RequestID, incoming.Metadata, "approval_request_id", "request_id",
+	)
+	if err != nil {
+		return ApprovalReconciliationData{}, err
+	}
+	ownerID, err := reconciliationWireString(incoming.OwnerID, incoming.Metadata, "owner_id")
+	if err != nil || ownerID != authenticatedOwnerID {
+		return ApprovalReconciliationData{}, errors.New("approval reconciliation owner mismatch")
+	}
+	sessionID, err := reconciliationWireString(incoming.SessionID, incoming.Metadata, "session_id")
+	if err != nil {
+		return ApprovalReconciliationData{}, err
+	}
+	invocationID, err := reconciliationWireString(incoming.InvocationID, incoming.Metadata, "invocation_id")
+	if err != nil {
+		return ApprovalReconciliationData{}, err
+	}
+	argumentsDigest, err := reconciliationWireString(incoming.ArgumentsDigest, incoming.Metadata, "arguments_digest")
+	if err != nil {
+		return ApprovalReconciliationData{}, err
+	}
+	securityScopeDigest, err := reconciliationWireString(
+		incoming.SecurityScopeDigest, incoming.Metadata, "security_scope_digest",
+	)
+	if err != nil {
+		return ApprovalReconciliationData{}, err
+	}
+	scopeSchemaVersion, err := reconciliationScopeSchemaVersion(
+		incoming.ScopeSchemaVersion, incoming.Metadata,
+	)
+	if err != nil {
+		return ApprovalReconciliationData{}, err
+	}
+	deadlineAt, err := reconciliationDeadline(incoming.DeadlineAt, incoming.Metadata)
+	if err != nil {
+		return ApprovalReconciliationData{}, err
+	}
+	return ApprovalReconciliationData{
+		RequestID: requestID, OwnerID: ownerID, SessionID: sessionID,
+		InvocationID: invocationID, ArgumentsDigest: argumentsDigest,
+		SecurityScopeDigest: securityScopeDigest, ScopeSchemaVersion: scopeSchemaVersion,
+		DeadlineAt: deadlineAt, responderChatID: chatID,
+	}, nil
+}
+
+func approvalResponseDataFromMessage(
+	incoming wsMessage, authenticatedOwnerID, chatID string,
+) (ApprovalResponseData, error) {
+	requestID, err := reconciliationWireString(
+		incoming.RequestID, incoming.Metadata, "approval_request_id", "request_id",
+	)
+	if err != nil {
+		return ApprovalResponseData{}, err
+	}
+	ownerID, err := reconciliationWireString(incoming.OwnerID, incoming.Metadata, "owner_id")
+	if err != nil || ownerID != authenticatedOwnerID {
+		return ApprovalResponseData{}, errors.New("approval response owner mismatch")
+	}
+	sessionID, err := reconciliationWireString(incoming.SessionID, incoming.Metadata, "session_id")
+	if err != nil {
+		return ApprovalResponseData{}, err
+	}
+	invocationID, err := reconciliationWireString(incoming.InvocationID, incoming.Metadata, "invocation_id")
+	if err != nil {
+		return ApprovalResponseData{}, err
+	}
+	argumentsDigest, err := reconciliationWireString(incoming.ArgumentsDigest, incoming.Metadata, "arguments_digest")
+	if err != nil {
+		return ApprovalResponseData{}, err
+	}
+	securityScopeDigest, err := reconciliationWireString(
+		incoming.SecurityScopeDigest, incoming.Metadata, "security_scope_digest",
+	)
+	if err != nil {
+		return ApprovalResponseData{}, err
+	}
+	scopeSchemaVersion, err := reconciliationScopeSchemaVersion(
+		incoming.ScopeSchemaVersion, incoming.Metadata,
+	)
+	if err != nil {
+		return ApprovalResponseData{}, err
+	}
+	deadlineAt, err := reconciliationDeadline(incoming.DeadlineAt, incoming.Metadata)
+	if err != nil {
+		return ApprovalResponseData{}, err
+	}
+	decisionID, err := reconciliationWireString(incoming.DecisionID, incoming.Metadata, "decision_id")
+	if err != nil {
+		return ApprovalResponseData{}, err
+	}
+	decision, err := reconciliationWireString(incoming.Decision, incoming.Metadata, "decision")
+	if err != nil {
+		return ApprovalResponseData{}, err
+	}
+	idempotencyKey, err := reconciliationWireString(incoming.IdempotencyKey, incoming.Metadata, "idempotency_key")
+	if err != nil {
+		return ApprovalResponseData{}, err
+	}
+	return ApprovalResponseData{
+		RequestID: requestID, OwnerID: ownerID, SessionID: sessionID,
+		DecisionID: decisionID, InvocationID: invocationID, Decision: decision,
+		IdempotencyKey: idempotencyKey, ArgumentsDigest: argumentsDigest,
+		SecurityScopeDigest: securityScopeDigest, ScopeSchemaVersion: scopeSchemaVersion,
+		DeadlineAt: deadlineAt, responderChatID: chatID,
+	}, nil
+}
+
+func reconciliationWireString(topLevel string, metadata map[string]string, metadataKeys ...string) (string, error) {
+	value := strings.TrimSpace(topLevel)
+	for _, key := range metadataKeys {
+		candidate := strings.TrimSpace(metadata[key])
+		if candidate == "" {
+			continue
+		}
+		if value != "" && value != candidate {
+			return "", errors.New("approval reconciliation identity mismatch")
+		}
+		value = candidate
+	}
+	if value == "" {
+		return "", errors.New("approval reconciliation identity is incomplete")
+	}
+	return value, nil
+}
+
+func reconciliationScopeSchemaVersion(topLevel int, metadata map[string]string) (int, error) {
+	value := topLevel
+	if raw := strings.TrimSpace(metadata["scope_schema_version"]); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 || (value > 0 && value != parsed) {
+			return 0, errors.New("approval reconciliation identity mismatch")
+		}
+		value = parsed
+	}
+	if value <= 0 {
+		return 0, errors.New("approval reconciliation identity is incomplete")
+	}
+	return value, nil
+}
+
+func reconciliationDeadline(topLevel string, metadata map[string]string) (time.Time, error) {
+	raw, err := reconciliationWireString(topLevel, metadata, "deadline_at")
+	if err != nil {
+		return time.Time{}, err
+	}
+	deadlineAt, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil || deadlineAt.IsZero() {
+		return time.Time{}, errors.New("approval reconciliation deadline is invalid")
+	}
+	return deadlineAt, nil
+}
+
+func (a *WebAdapter) sendApprovalReconciliation(
+	ctx context.Context, data ApprovalReconciliationData, result ApprovalReconciliationResult,
+) error {
+	if !approvalReconciliationResultMatches(data, result) {
+		return errors.New("approval reconciliation result is invalid")
+	}
+	// 先由 durable 回执验证 owner/session，再更新当前连接；此路径不触发内存 pending 批量重放。
+	if !a.bindSessionForApprovalReconciliation(data.SessionID, data.responderChatID, data.OwnerID) {
+		return errors.New("approval reconciliation session ownership mismatch")
+	}
+	if result.Request != nil {
+		return a.SendPermissionRequest(ctx, data.SessionID, result.Request)
+	}
+	receipt := result.Receipt
+	switch receipt.TerminalResult {
+	case "expired", "fenced":
+		return a.SendPermissionTerminal(ctx, &PermissionTerminalData{
+			RequestID: receipt.RequestID, SessionID: receipt.SessionID, OwnerID: receipt.OwnerID,
+			InvocationID: receipt.InvocationID, ArgumentsDigest: receipt.ArgumentsDigest,
+			SecurityScopeDigest: receipt.SecurityScopeDigest, ScopeSchemaVersion: receipt.ScopeSchemaVersion,
+			DeadlineAt: receipt.DeadlineAt, TerminalResult: receipt.TerminalResult,
+		})
+	case "approved_once", "approved_remember", "denied":
+		return a.writeApprovalReconciliation(ctx, data, durableApprovalReconciliationACK(*receipt))
+	default:
+		return errors.New("approval reconciliation result is unsupported")
+	}
+}
+
+func approvalReconciliationResultMatches(data ApprovalReconciliationData, result ApprovalReconciliationResult) bool {
+	if (result.Request == nil) == (result.Receipt == nil) {
+		return false
+	}
+	if result.Request != nil {
+		request := result.Request
+		return request.ID == data.RequestID && request.OwnerID == data.OwnerID &&
+			request.InvocationID == data.InvocationID && request.ArgumentsDigest == data.ArgumentsDigest &&
+			request.SecurityScopeDigest == data.SecurityScopeDigest &&
+			request.ScopeSchemaVersion == data.ScopeSchemaVersion && request.DeadlineAt.Equal(data.DeadlineAt)
+	}
+	receipt := result.Receipt
+	if receipt.RequestID != data.RequestID || receipt.OwnerID != data.OwnerID || receipt.SessionID != data.SessionID ||
+		receipt.InvocationID != data.InvocationID || receipt.ArgumentsDigest != data.ArgumentsDigest ||
+		receipt.SecurityScopeDigest != data.SecurityScopeDigest || receipt.ScopeSchemaVersion != data.ScopeSchemaVersion ||
+		!receipt.DeadlineAt.Equal(data.DeadlineAt) {
+		return false
+	}
+	switch receipt.TerminalResult {
+	case "expired", "fenced":
+		return true
+	case "approved_once", "approved_remember", "denied":
+		return receipt.ACKStatus == "accepted" && receipt.Decision == receipt.TerminalResult &&
+			strings.TrimSpace(receipt.DecisionID) != "" && strings.TrimSpace(receipt.IdempotencyKey) != ""
+	default:
+		return false
+	}
+}
+
+func (a *WebAdapter) bindSessionForApprovalReconciliation(sessionID, chatID, ownerID string) bool {
+	if sessionID == "" || chatID == "" || ownerID == "" {
+		return false
+	}
+	next := sessionConnectionBinding{chatID: chatID, ownerID: ownerID}
+	if current, loaded := a.sessionConns.LoadOrStore(sessionID, next); loaded {
+		binding, ok := current.(sessionConnectionBinding)
+		if !ok || binding.ownerID != ownerID {
+			return false
+		}
+		a.sessionConns.Store(sessionID, next)
+	}
+	return true
+}
+
+func (a *WebAdapter) writeApprovalReconciliation(
+	ctx context.Context, data ApprovalReconciliationData, message wsMessage,
+) error {
+	value, ok := a.sessionConns.Load(data.SessionID)
+	if !ok {
+		return errors.New("approval reconciliation session is not bound")
+	}
+	binding, ok := value.(sessionConnectionBinding)
+	if !ok || binding.ownerID != data.OwnerID || binding.chatID == "" {
+		return errors.New("approval reconciliation session ownership mismatch")
+	}
+	return a.writeMessage(ctx, binding.chatID, message)
+}
+
 func (a *WebAdapter) bindSession(sessionID, chatID, ownerID string) bool {
 	if sessionID == "" || chatID == "" || ownerID == "" {
 		return false
@@ -1015,6 +1373,8 @@ type wsMessage struct {
 	SessionID           string                         `json:"session_id,omitempty"`
 	RequestID           string                         `json:"request_id,omitempty"`
 	DecisionID          string                         `json:"decision_id,omitempty"`
+	Decision            string                         `json:"decision,omitempty"`
+	IdempotencyKey      string                         `json:"idempotency_key,omitempty"`
 	Status              string                         `json:"status,omitempty"`
 	OwnerID             string                         `json:"owner_id,omitempty"`
 	ToolName            string                         `json:"tool_name,omitempty"`
@@ -1032,6 +1392,7 @@ type wsMessage struct {
 	SecurityScopeDigest string                         `json:"security_scope_digest,omitempty"`
 	ScopeSchemaVersion  int                            `json:"scope_schema_version,omitempty"`
 	DeadlineAt          string                         `json:"deadline_at,omitempty"`
+	TerminalResult      string                         `json:"terminal_result,omitempty"`
 	Usage               *adapter.Usage                 `json:"usage,omitempty"`
 	ToolCalls           []adapter.ToolCall             `json:"tool_calls,omitempty"`
 	Blocks              []adapter.Block                `json:"blocks,omitempty"`
@@ -1044,9 +1405,18 @@ type wsMessage struct {
 	MessageID           string                          `json:"message_id,omitempty"`
 	Sequence            uint64                          `json:"sequence,omitempty"`
 	ReasoningDisclosure adapter.ReasoningDisclosure     `json:"reasoning_disclosure"`
+	ReasoningReceipt    *adapter.ReasoningReceipt       `json:"reasoning_receipt,omitempty"`
 	RuntimeEvent        *adapter.RuntimeEvent           `json:"runtime_event,omitempty"`
 	RuntimeEvents       []adapter.SequencedRuntimeEvent `json:"runtime_events,omitempty"`
 	LastSequence        uint64                          `json:"last_sequence,omitempty"`
+}
+
+func normalizedReasoningReceipt(receipt *adapter.ReasoningReceipt) *adapter.ReasoningReceipt {
+	if receipt == nil {
+		return nil
+	}
+	normalized := adapter.NormalizeReasoningReceipt(receipt)
+	return &normalized
 }
 
 type approvalACKRecord struct {
@@ -1068,16 +1438,18 @@ func (a *WebAdapter) approvalACK(data ApprovalResponseData) wsMessage {
 	}
 	if strings.TrimSpace(data.RequestID) == "" || strings.TrimSpace(data.DecisionID) == "" ||
 		strings.TrimSpace(data.OwnerID) == "" || strings.TrimSpace(data.responderChatID) == "" ||
-		strings.TrimSpace(data.InvocationID) == "" || strings.TrimSpace(data.ArgumentsDigest) == "" ||
-		strings.TrimSpace(data.SecurityScopeDigest) == "" {
+		strings.TrimSpace(data.SessionID) == "" || strings.TrimSpace(data.InvocationID) == "" ||
+		strings.TrimSpace(data.ArgumentsDigest) == "" || strings.TrimSpace(data.SecurityScopeDigest) == "" ||
+		data.ScopeSchemaVersion <= 0 || data.DeadlineAt.IsZero() {
 		return rejectedApprovalACK(data, data.IdempotencyKey, "identity_mismatch")
 	}
 	data.Approved = approved
 	data.Remember = remember
 	key := data.IdempotencyKey
 	fingerprint := strings.Join([]string{
-		data.RequestID, data.DecisionID, data.InvocationID, data.Decision,
+		data.RequestID, data.SessionID, data.DecisionID, data.InvocationID, data.Decision,
 		data.ArgumentsDigest, data.SecurityScopeDigest, strconv.Itoa(data.ScopeSchemaVersion),
+		data.DeadlineAt.UTC().Format(time.RFC3339Nano),
 	}, "\x00")
 	now := time.Now()
 	if a.onDurableApprovalDecision == nil {
@@ -1102,16 +1474,13 @@ func (a *WebAdapter) approvalACK(data ApprovalResponseData) wsMessage {
 	value, ok := a.approvalBindings.Load(data.RequestID)
 	if ok {
 		binding, bindingOK := value.(approvalTransportBinding)
-		if data.ScopeSchemaVersion == 0 && bindingOK {
-			data.ScopeSchemaVersion = binding.scopeSchemaVersion
-		}
 		if !bindingOK || !binding.valid() || now.After(binding.expiresAt) || binding.ownerID != data.OwnerID ||
-			binding.chatID != data.responderChatID || binding.invocationID != data.InvocationID ||
+			binding.sessionID != data.SessionID || binding.chatID != data.responderChatID ||
+			binding.invocationID != data.InvocationID ||
 			binding.argumentsDigest != data.ArgumentsDigest || binding.securityScopeDigest != data.SecurityScopeDigest ||
-			binding.scopeSchemaVersion != data.ScopeSchemaVersion {
+			binding.scopeSchemaVersion != data.ScopeSchemaVersion || !binding.expiresAt.Equal(data.DeadlineAt) {
 			return rejectedApprovalACK(data, key, "identity_mismatch")
 		}
-		data.SessionID = binding.sessionID
 	} else if a.onDurableApprovalDecision == nil {
 		return rejectedApprovalACK(data, key, "identity_mismatch")
 	}
@@ -1153,12 +1522,24 @@ func (a *WebAdapter) approvalACK(data ApprovalResponseData) wsMessage {
 		a.onApprovalResponse(data.RequestID, data.Approved, data.Remember)
 	}
 	ack := wsMessage{
-		Type:       "tool_approval_ack",
-		RequestID:  data.RequestID,
-		DecisionID: data.DecisionID,
-		Status:     approvalACKStatus(terminalResult),
+		Type:                "tool_approval_ack",
+		RequestID:           data.RequestID,
+		SessionID:           data.SessionID,
+		OwnerID:             data.OwnerID,
+		DecisionID:          data.DecisionID,
+		Decision:            data.Decision,
+		IdempotencyKey:      key,
+		InvocationID:        data.InvocationID,
+		ArgumentsDigest:     data.ArgumentsDigest,
+		SecurityScopeDigest: data.SecurityScopeDigest,
+		ScopeSchemaVersion:  data.ScopeSchemaVersion,
+		DeadlineAt:          data.DeadlineAt.Format(time.RFC3339Nano),
+		Status:              approvalACKStatus(terminalResult),
 		Metadata: map[string]string{
 			"approval_request_id":   data.RequestID,
+			"request_id":            data.RequestID,
+			"session_id":            data.SessionID,
+			"owner_id":              data.OwnerID,
 			"decision_id":           data.DecisionID,
 			"invocation_id":         data.InvocationID,
 			"decision":              data.Decision,
@@ -1166,6 +1547,7 @@ func (a *WebAdapter) approvalACK(data ApprovalResponseData) wsMessage {
 			"arguments_digest":      data.ArgumentsDigest,
 			"security_scope_digest": data.SecurityScopeDigest,
 			"scope_schema_version":  strconv.Itoa(data.ScopeSchemaVersion),
+			"deadline_at":           data.DeadlineAt.Format(time.RFC3339Nano),
 			"terminal_result":       terminalResult,
 		},
 	}
@@ -1183,11 +1565,10 @@ func (a *WebAdapter) approvalACK(data ApprovalResponseData) wsMessage {
 
 func durableApprovalReceiptMatches(data ApprovalResponseData, receipt ApprovalDecisionReceipt) bool {
 	if receipt.RequestID != data.RequestID || receipt.InvocationID != data.InvocationID ||
-		receipt.OwnerID != data.OwnerID || strings.TrimSpace(receipt.SessionID) == "" ||
+		receipt.OwnerID != data.OwnerID || receipt.SessionID != data.SessionID ||
 		receipt.Decision != data.Decision || receipt.IdempotencyKey != data.IdempotencyKey ||
 		receipt.ArgumentsDigest != data.ArgumentsDigest || receipt.SecurityScopeDigest != data.SecurityScopeDigest ||
-		receipt.ScopeSchemaVersion <= 0 ||
-		(data.ScopeSchemaVersion > 0 && receipt.ScopeSchemaVersion != data.ScopeSchemaVersion) ||
+		receipt.ScopeSchemaVersion != data.ScopeSchemaVersion || !receipt.DeadlineAt.Equal(data.DeadlineAt) ||
 		strings.TrimSpace(receipt.DecisionID) == "" || strings.TrimSpace(receipt.TerminalResult) == "" {
 		return false
 	}
@@ -1200,23 +1581,51 @@ func durableApprovalReceiptMatches(data ApprovalResponseData, receipt ApprovalDe
 }
 
 func durableApprovalACK(receipt ApprovalDecisionReceipt) wsMessage {
-	return wsMessage{
-		Type:       "tool_approval_ack",
-		RequestID:  receipt.RequestID,
-		DecisionID: receipt.DecisionID,
-		Status:     receipt.ACKStatus,
-		Metadata: map[string]string{
-			"approval_request_id":   receipt.RequestID,
-			"decision_id":           receipt.DecisionID,
-			"invocation_id":         receipt.InvocationID,
-			"decision":              receipt.Decision,
-			"idempotency_key":       receipt.IdempotencyKey,
-			"arguments_digest":      receipt.ArgumentsDigest,
-			"security_scope_digest": receipt.SecurityScopeDigest,
-			"scope_schema_version":  strconv.Itoa(receipt.ScopeSchemaVersion),
-			"terminal_result":       receipt.TerminalResult,
-		},
+	deadlineAt := ""
+	if !receipt.DeadlineAt.IsZero() {
+		deadlineAt = receipt.DeadlineAt.Format(time.RFC3339Nano)
 	}
+	metadata := map[string]string{
+		"approval_request_id":   receipt.RequestID,
+		"request_id":            receipt.RequestID,
+		"session_id":            receipt.SessionID,
+		"owner_id":              receipt.OwnerID,
+		"decision_id":           receipt.DecisionID,
+		"invocation_id":         receipt.InvocationID,
+		"decision":              receipt.Decision,
+		"idempotency_key":       receipt.IdempotencyKey,
+		"arguments_digest":      receipt.ArgumentsDigest,
+		"security_scope_digest": receipt.SecurityScopeDigest,
+		"scope_schema_version":  strconv.Itoa(receipt.ScopeSchemaVersion),
+		"terminal_result":       receipt.TerminalResult,
+	}
+	if deadlineAt != "" {
+		metadata["deadline_at"] = deadlineAt
+	}
+	return wsMessage{
+		Type:                "tool_approval_ack",
+		RequestID:           receipt.RequestID,
+		SessionID:           receipt.SessionID,
+		OwnerID:             receipt.OwnerID,
+		DecisionID:          receipt.DecisionID,
+		Decision:            receipt.Decision,
+		IdempotencyKey:      receipt.IdempotencyKey,
+		InvocationID:        receipt.InvocationID,
+		ArgumentsDigest:     receipt.ArgumentsDigest,
+		SecurityScopeDigest: receipt.SecurityScopeDigest,
+		ScopeSchemaVersion:  receipt.ScopeSchemaVersion,
+		DeadlineAt:          deadlineAt,
+		Status:              receipt.ACKStatus,
+		Metadata:            metadata,
+	}
+}
+
+func durableApprovalReconciliationACK(receipt ApprovalDecisionReceipt) wsMessage {
+	ack := durableApprovalACK(receipt)
+	if receipt.Replayed && ack.Status == "accepted" {
+		ack.Status = "already_accepted"
+	}
+	return ack
 }
 
 func (a *WebAdapter) cacheApprovalACK(
@@ -1297,19 +1706,42 @@ func approvalACKStatus(terminalResult string) string {
 }
 
 func rejectedApprovalACK(data ApprovalResponseData, key, terminalResult string) wsMessage {
+	deadlineAt := ""
+	if !data.DeadlineAt.IsZero() {
+		deadlineAt = data.DeadlineAt.Format(time.RFC3339Nano)
+	}
+	metadata := map[string]string{
+		"approval_request_id":   data.RequestID,
+		"request_id":            data.RequestID,
+		"session_id":            data.SessionID,
+		"owner_id":              data.OwnerID,
+		"decision_id":           data.DecisionID,
+		"invocation_id":         data.InvocationID,
+		"decision":              data.Decision,
+		"idempotency_key":       key,
+		"arguments_digest":      data.ArgumentsDigest,
+		"security_scope_digest": data.SecurityScopeDigest,
+		"scope_schema_version":  strconv.Itoa(data.ScopeSchemaVersion),
+		"terminal_result":       terminalResult,
+	}
+	if deadlineAt != "" {
+		metadata["deadline_at"] = deadlineAt
+	}
 	return wsMessage{
-		Type:       "tool_approval_ack",
-		RequestID:  data.RequestID,
-		DecisionID: data.DecisionID,
-		Status:     "rejected",
-		Metadata: map[string]string{
-			"approval_request_id": data.RequestID,
-			"decision_id":         data.DecisionID,
-			"invocation_id":       data.InvocationID,
-			"decision":            data.Decision,
-			"idempotency_key":     key,
-			"terminal_result":     terminalResult,
-		},
+		Type:                "tool_approval_ack",
+		RequestID:           data.RequestID,
+		SessionID:           data.SessionID,
+		OwnerID:             data.OwnerID,
+		DecisionID:          data.DecisionID,
+		Decision:            data.Decision,
+		IdempotencyKey:      key,
+		InvocationID:        data.InvocationID,
+		ArgumentsDigest:     data.ArgumentsDigest,
+		SecurityScopeDigest: data.SecurityScopeDigest,
+		ScopeSchemaVersion:  data.ScopeSchemaVersion,
+		DeadlineAt:          deadlineAt,
+		Status:              "rejected",
+		Metadata:            metadata,
 	}
 }
 

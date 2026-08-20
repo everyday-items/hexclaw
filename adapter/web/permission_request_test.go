@@ -83,24 +83,32 @@ func TestWebAdapter_ToolApprovalResponseReturnsIdempotentACK(t *testing.T) {
 	chatID := onlyWebAdapterChatID(t, a)
 	a.SetApprovalResponseHandler(func(_ string, _, _ bool) {})
 
-	response := wsMessage{
-		Type:       "tool_approval_response",
-		Content:    "approved_remember",
-		DecisionID: "decision-ack-1",
-		Metadata: map[string]string{
-			"request_id":            "approval-ack-1",
-			"approval_request_id":   "approval-ack-1",
-			"invocation_id":         "invocation-ack-1",
-			"decision":              "approved_remember",
-			"idempotency_key":       "decision-key-1",
-			"arguments_digest":      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			"security_scope_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		},
-	}
-	seedApprovalTransportBinding(a, "approval-ack-1", "desktop-user", "session-ack-1", chatID,
+	deadline := seedApprovalTransportBinding(a, "approval-ack-1", "desktop-user", "session-ack-1", chatID,
 		"invocation-ack-1",
 		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	response := wsMessage{
+		Type: "tool_approval_response", RequestID: "approval-ack-1", OwnerID: "desktop-user",
+		SessionID: "session-ack-1", InvocationID: "invocation-ack-1",
+		ArgumentsDigest:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		SecurityScopeDigest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		ScopeSchemaVersion:  1, DeadlineAt: deadline.Format(time.RFC3339Nano),
+		DecisionID: "decision-ack-1", Decision: "approved_remember", IdempotencyKey: "decision-key-1",
+		Metadata: map[string]string{
+			"request_id":            "approval-ack-1",
+			"approval_request_id":   "approval-ack-1",
+			"owner_id":              "desktop-user",
+			"session_id":            "session-ack-1",
+			"invocation_id":         "invocation-ack-1",
+			"decision":              "approved_remember",
+			"decision_id":           "decision-ack-1",
+			"idempotency_key":       "decision-key-1",
+			"arguments_digest":      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			"security_scope_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			"scope_schema_version":  "1",
+			"deadline_at":           deadline.Format(time.RFC3339Nano),
+		},
+	}
 
 	first := writeApprovalResponseAndReadACK(t, ctx, conn, response)
 	second := writeApprovalResponseAndReadACK(t, ctx, conn, response)
@@ -159,25 +167,38 @@ func TestWebAdapter_DesktopApprovalDecisionOwningSocketWireCompatibility(t *test
 		return "approved_remember"
 	})
 
+	deadline := seedApprovalTransportBinding(a, "approval-desktop-1", "desktop-user", "session-desktop-1", firstChatID,
+		"invocation-desktop-1",
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 	response := map[string]any{
-		"type":        "tool_approval_response",
-		"content":     "approved_remember",
-		"request_id":  "approval-desktop-1",
-		"decision_id": "decision-desktop-1",
+		"type":                  "tool_approval_response",
+		"content":               "approved_remember",
+		"request_id":            "approval-desktop-1",
+		"owner_id":              "desktop-user",
+		"session_id":            "session-desktop-1",
+		"invocation_id":         "invocation-desktop-1",
+		"arguments_digest":      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"security_scope_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		"scope_schema_version":  1,
+		"deadline_at":           deadline.Format(time.RFC3339Nano),
+		"decision_id":           "decision-desktop-1",
+		"decision":              "approved_remember",
+		"idempotency_key":       "idempotency-desktop-1",
 		"metadata": map[string]string{
 			"request_id":            "approval-desktop-1",
+			"owner_id":              "desktop-user",
+			"session_id":            "session-desktop-1",
 			"decision_id":           "decision-desktop-1",
 			"invocation_id":         "invocation-desktop-1",
 			"decision":              "approved_remember",
 			"idempotency_key":       "idempotency-desktop-1",
 			"arguments_digest":      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			"security_scope_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			"scope_schema_version":  "1",
+			"deadline_at":           deadline.Format(time.RFC3339Nano),
 		},
 	}
-	seedApprovalTransportBinding(a, "approval-desktop-1", "desktop-user", "session-desktop-1", firstChatID,
-		"invocation-desktop-1",
-		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 
 	first := writeRawApprovalResponseAndReadACK(t, ctx, firstConn, response)
 	second := writeRawApprovalResponseAndReadACK(t, ctx, firstConn, response)
@@ -207,23 +228,36 @@ func TestWebAdapter_DesktopApprovalDecisionOwningSocketWireCompatibility(t *test
 		{"approval-expired-1", "decision-expired-1", "expired"},
 		{"approval-rejected-1", "decision-rejected-1", "rejected"},
 	} {
+		deadline := seedApprovalTransportBinding(a, tc.requestID, "desktop-user", "session-"+tc.requestID, firstChatID,
+			"invocation-"+tc.requestID, "args-"+tc.requestID, "scope-"+tc.requestID)
 		terminalResponse := map[string]any{
-			"type":        "tool_permission_response",
-			"content":     "approved_once",
-			"request_id":  tc.requestID,
-			"decision_id": tc.decisionID,
+			"type":                  "tool_permission_response",
+			"content":               "approved_once",
+			"request_id":            tc.requestID,
+			"owner_id":              "desktop-user",
+			"session_id":            "session-" + tc.requestID,
+			"invocation_id":         "invocation-" + tc.requestID,
+			"arguments_digest":      "args-" + tc.requestID,
+			"security_scope_digest": "scope-" + tc.requestID,
+			"scope_schema_version":  1,
+			"deadline_at":           deadline.Format(time.RFC3339Nano),
+			"decision_id":           tc.decisionID,
+			"decision":              "approved_once",
+			"idempotency_key":       "idempotency-" + tc.requestID,
 			"metadata": map[string]string{
 				"request_id":            tc.requestID,
+				"owner_id":              "desktop-user",
+				"session_id":            "session-" + tc.requestID,
 				"decision_id":           tc.decisionID,
 				"invocation_id":         "invocation-" + tc.requestID,
 				"decision":              "approved_once",
 				"idempotency_key":       "idempotency-" + tc.requestID,
 				"arguments_digest":      "args-" + tc.requestID,
 				"security_scope_digest": "scope-" + tc.requestID,
+				"scope_schema_version":  "1",
+				"deadline_at":           deadline.Format(time.RFC3339Nano),
 			},
 		}
-		seedApprovalTransportBinding(a, tc.requestID, "desktop-user", "session-"+tc.requestID, firstChatID,
-			"invocation-"+tc.requestID, "args-"+tc.requestID, "scope-"+tc.requestID)
 		ack := writeRawApprovalResponseAndReadACK(t, ctx, firstConn, terminalResponse)
 		if got := ack["status"]; got != tc.wantStatus {
 			t.Errorf("%s ACK status = %#v, want %s", tc.requestID, got, tc.wantStatus)
@@ -251,12 +285,14 @@ func onlyWebAdapterChatID(t *testing.T, a *WebAdapter) string {
 	return ids[0]
 }
 
-func seedApprovalTransportBinding(a *WebAdapter, requestID, ownerID, sessionID, chatID, invocationID, argsDigest, scopeDigest string) {
+func seedApprovalTransportBinding(a *WebAdapter, requestID, ownerID, sessionID, chatID, invocationID, argsDigest, scopeDigest string) time.Time {
+	deadline := time.Now().UTC().Add(time.Minute)
 	a.approvalBindings.Store(requestID, approvalTransportBinding{
 		requestID: requestID, ownerID: ownerID, sessionID: sessionID, chatID: chatID,
 		invocationID: invocationID, argumentsDigest: argsDigest, securityScopeDigest: scopeDigest,
-		scopeSchemaVersion: 1, expiresAt: time.Now().Add(time.Minute),
+		scopeSchemaVersion: 1, expiresAt: deadline,
 	})
+	return deadline
 }
 
 // REG-TOOL-APPROVAL-TRANSPORT-001

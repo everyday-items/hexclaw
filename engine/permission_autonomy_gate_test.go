@@ -180,6 +180,181 @@ func TestSetSystemDispatchPolicyHotSwap(t *testing.T) {
 	}
 }
 
+func interactiveAutonomyContext() context.Context {
+	ctx := skill.WithAuthenticatedUser(context.Background(), "interactive-owner")
+	return context.WithValue(ctx, ctxKeySessionID, "interactive-session")
+}
+
+func newInteractiveAutonomyProfileHook(profile string) (*PermissionHook, *scriptedPermissionSender) {
+	hub := NewPermissionHub(0)
+	sender := &scriptedPermissionSender{hub: hub}
+	hub.SetSender(sender)
+	return NewPermissionHook(hub,
+		WithPolicy(DefaultBaselinePolicy()),
+		WithSystemDispatchPolicy(NewSystemDispatchPolicyFromConfig(config.AutonomyConfig{Profile: profile})),
+	), sender
+}
+
+func TestFullAccessInteractiveApprovalToolsNeverCreateApprovalRequest(t *testing.T) {
+	for _, toolName := range []string{
+		"browser", "code_exec", "shell", "code", "file_edit", "create_skill",
+		"manage_skill", "manage_mcp_server", "patch_skill", "manage_skill_pending",
+		"send_message", "app_heal", "media_generate", "publish_wechat",
+	} {
+		t.Run(toolName, func(t *testing.T) {
+			hook, sender := newInteractiveAutonomyProfileHook(SystemDispatchProfileFullAccess)
+			err := hook.BeforeToolCall(interactiveAutonomyContext(), &ToolCallInfo{Name: toolName, Source: "skill"})
+			if err != nil {
+				t.Fatalf("full_access 交互工具不应要求审批: %v", err)
+			}
+			if got := sender.callCount(); got != 0 {
+				t.Fatalf("full_access 不得创建审批请求，得到 %d 次", got)
+			}
+		})
+	}
+}
+
+func TestFunctionFirstInteractiveBasicToolsNeverCreateApprovalRequest(t *testing.T) {
+	for _, toolName := range []string{"browser", "code_exec"} {
+		t.Run(toolName, func(t *testing.T) {
+			hook, sender := newInteractiveAutonomyProfileHook(SystemDispatchProfileFunctionFirst)
+			err := hook.BeforeToolCall(interactiveAutonomyContext(), &ToolCallInfo{Name: toolName, Source: "skill"})
+			if err != nil {
+				t.Fatalf("function_first 的基础工具不应要求审批: %v", err)
+			}
+			if got := sender.callCount(); got != 0 {
+				t.Fatalf("function_first 的基础工具不得创建审批请求，得到 %d 次", got)
+			}
+		})
+	}
+
+	hook, sender := newInteractiveAutonomyProfileHook(SystemDispatchProfileFunctionFirst)
+	if err := hook.BeforeToolCall(interactiveAutonomyContext(), &ToolCallInfo{Name: "shell", Source: "skill"}); err == nil {
+		t.Fatal("function_first 不应自动放行 shell")
+	}
+	if got := sender.callCount(); got != 1 {
+		t.Fatalf("function_first 的 shell 应创建一次审批请求，得到 %d 次", got)
+	}
+}
+
+func TestStrictInteractiveBasicToolsStillRequireApproval(t *testing.T) {
+	for _, toolName := range []string{"browser", "code_exec"} {
+		t.Run(toolName, func(t *testing.T) {
+			hook, sender := newInteractiveAutonomyProfileHook(SystemDispatchProfileStrict)
+			if err := hook.BeforeToolCall(interactiveAutonomyContext(), &ToolCallInfo{Name: toolName, Source: "skill"}); err == nil {
+				t.Fatalf("strict 的 %s 不应自动放行", toolName)
+			}
+			if got := sender.callCount(); got != 1 {
+				t.Fatalf("strict 的 %s 应创建一次审批请求，得到 %d 次", toolName, got)
+			}
+		})
+	}
+}
+
+func TestFullAccessStaticDenyStillSkipsApprovalRequest(t *testing.T) {
+	hub := NewPermissionHub(0)
+	sender := &scriptedPermissionSender{hub: hub}
+	hub.SetSender(sender)
+	hook := NewPermissionHook(hub,
+		WithPolicy(NewPermissionPolicy(ActionAllow, PolicyRule{
+			Name: "deny-browser", ToolPattern: "browser", Action: ActionDeny, Reason: "blocked statically",
+		})),
+		WithSystemDispatchPolicy(FullAccessSystemDispatchPolicy()),
+	)
+	if err := hook.BeforeToolCall(interactiveAutonomyContext(), &ToolCallInfo{Name: "browser", Source: "skill"}); err == nil {
+		t.Fatal("static deny 不得被 full_access 绕过")
+	}
+	if got := sender.callCount(); got != 0 {
+		t.Fatalf("static deny 不得创建审批请求，得到 %d 次", got)
+	}
+}
+
+// TestInteractiveAutonomyProfilesGateExecutorBoundary 走真实 ToolExecutor hook 链，
+// 但用 no-op 闭包代替浏览器、代码执行和宿主命令，避免任何外部副作用。
+func TestInteractiveAutonomyProfilesGateExecutorBoundary(t *testing.T) {
+	staticDenyPolicy := NewPermissionPolicy(ActionAllow, PolicyRule{
+		Name: "deny-browser", ToolPattern: "browser", Action: ActionDeny, Reason: "blocked statically",
+	})
+	tests := []struct {
+		name          string
+		profile       string
+		toolName      string
+		policy        *PermissionPolicy
+		wantExecute   int
+		wantApprovals int
+		wantBlocked   bool
+	}{
+		{
+			name: "full_access trusted interactive shell executes once without approval", profile: SystemDispatchProfileFullAccess,
+			toolName: "shell", wantExecute: 1, wantApprovals: 0,
+		},
+		{
+			name: "function_first browser executes once without approval", profile: SystemDispatchProfileFunctionFirst,
+			toolName: "browser", wantExecute: 1, wantApprovals: 0,
+		},
+		{
+			name: "function_first code_exec executes once without approval", profile: SystemDispatchProfileFunctionFirst,
+			toolName: "code_exec", wantExecute: 1, wantApprovals: 0,
+		},
+		{
+			name: "strict browser remains pending approval", profile: SystemDispatchProfileStrict,
+			toolName: "browser", wantExecute: 0, wantApprovals: 1, wantBlocked: true,
+		},
+		{
+			name: "strict code_exec remains pending approval", profile: SystemDispatchProfileStrict,
+			toolName: "code_exec", wantExecute: 0, wantApprovals: 1, wantBlocked: true,
+		},
+		{
+			name: "static deny blocks before approval or execution", profile: SystemDispatchProfileFullAccess,
+			toolName: "browser", policy: staticDenyPolicy, wantExecute: 0, wantApprovals: 0, wantBlocked: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hook, sender := newInteractiveAutonomyProfileHook(tt.profile)
+			if tt.policy != nil {
+				hub := NewPermissionHub(0)
+				sender = &scriptedPermissionSender{hub: hub}
+				hub.SetSender(sender)
+				hook = NewPermissionHook(hub,
+					WithPolicy(tt.policy),
+					WithSystemDispatchPolicy(NewSystemDispatchPolicyFromConfig(config.AutonomyConfig{Profile: tt.profile})),
+				)
+			}
+
+			executor := NewToolExecutor(nil, nil)
+			executor.AddHook(hook)
+			executed := 0
+			result, err := executor.executeWithHooks(interactiveAutonomyContext(), &ToolCallInfo{
+				Name: tt.toolName, Source: "skill",
+			}, func(context.Context) (string, error) {
+				executed++
+				return "no-op", nil
+			})
+			if tt.wantBlocked {
+				if err == nil {
+					t.Fatal("工具调用应在执行边界被拦下")
+				}
+			} else if err != nil {
+				t.Fatalf("工具调用不应被拦下: %v", err)
+			}
+			if result != "" && tt.wantBlocked {
+				t.Fatalf("被拦下的工具不应返回执行结果，得到 %q", result)
+			}
+			if result != "no-op" && !tt.wantBlocked {
+				t.Fatalf("no-op executor result = %q, want %q", result, "no-op")
+			}
+			if executed != tt.wantExecute {
+				t.Fatalf("executor calls = %d, want %d", executed, tt.wantExecute)
+			}
+			if got := sender.callCount(); got != tt.wantApprovals {
+				t.Fatalf("approval sender calls = %d, want %d", got, tt.wantApprovals)
+			}
+		})
+	}
+}
+
 func TestInteractiveDecisionsNotRecorded(t *testing.T) {
 	rec := &captureRecorder{}
 	hook := newAutonomyGateHook(&fakeGrants{}, rec)

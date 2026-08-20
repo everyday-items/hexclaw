@@ -88,6 +88,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/skill/builtin"
 	"github.com/hexagon-codes/hexclaw/skill/marketplace"
+	"github.com/hexagon-codes/hexclaw/storage"
 	"github.com/hexagon-codes/hexclaw/storage/scenarioinstall"
 	sqlitestore "github.com/hexagon-codes/hexclaw/storage/sqlite"
 	"github.com/hexagon-codes/hexclaw/webhook"
@@ -1495,6 +1496,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			compiler := cron.NewLLMCompiler(resolver)
 			scriptExec := cron.NewScriptExecutor()
 			scheduler = cron.NewScheduler(store.DB(), compiler, scriptExec)
+			scheduler.SetLoopbackCapabilityToken(sidecarCapabilityToken)
 			if err := scheduler.Init(ctx); err != nil {
 				scheduler = nil
 				fmt.Printf("  ✗ Cron        Init 失败 (%v)\n", err)
@@ -2964,16 +2966,21 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					ScopeSchemaVersion: resp.ScopeSchemaVersion, IdempotencyKey: resp.IdempotencyKey,
 					Approved: resp.Approved, Remember: resp.Remember,
 				})
-				return webadapter.ApprovalDecisionReceipt{
-					RequestID: receipt.RequestID, InvocationID: receipt.InvocationID,
-					OwnerID: receipt.OwnerID, SessionID: receipt.ResolvedSessionID,
-					DecisionID: receipt.DecisionID, Decision: receipt.Decision,
-					IdempotencyKey:  receipt.IdempotencyKey,
-					ArgumentsDigest: receipt.ArgumentsDigest, SecurityScopeDigest: receipt.SecurityScopeDigest,
-					ScopeSchemaVersion: receipt.ScopeSchemaVersion,
-					TerminalResult:     receipt.TerminalResult, ACKStatus: receipt.ACKStatus,
-					Replayed: receipt.Replayed,
+				return *webApprovalDecisionReceipt(receipt)
+			})
+			wa.SetApprovalReconciliationHandler(func(
+				ctx context.Context, data webadapter.ApprovalReconciliationData,
+			) (webadapter.ApprovalReconciliationResult, error) {
+				result, err := permHub.ReconcileApprovalReceipt(ctx, engine.PermissionReceiptReconciliation{
+					RequestID: data.RequestID, OwnerID: data.OwnerID, SessionID: data.SessionID,
+					InvocationID: data.InvocationID, ArgumentsDigest: data.ArgumentsDigest,
+					SecurityScopeDigest: data.SecurityScopeDigest, ScopeSchemaVersion: data.ScopeSchemaVersion,
+					DeadlineAt: data.DeadlineAt,
+				})
+				if err != nil {
+					return webadapter.ApprovalReconciliationResult{}, err
 				}
+				return webPermissionReconciliationResult(result), nil
 			})
 			wa.SetPendingApprovalReplayHandler(func(_ context.Context, ownerID, sessionID string) []*webadapter.PermissionRequestData {
 				pending := permHub.PendingApprovals(ownerID, sessionID)
@@ -3300,6 +3307,61 @@ func (b *webPermissionBridge) SendPermissionRequest(ctx context.Context, session
 		ScopeSchemaVersion: req.ScopeSchemaVersion,
 		DeadlineAt:         req.DeadlineAt, Risk: req.Risk, Reason: req.Reason,
 	})
+}
+
+func (b *webPermissionBridge) SendPermissionTerminal(ctx context.Context, terminal *engine.PermissionTerminal) error {
+	return b.wa.SendPermissionTerminal(ctx, webPermissionTerminalData(terminal))
+}
+
+func webPermissionTerminalData(terminal *engine.PermissionTerminal) *webadapter.PermissionTerminalData {
+	if terminal == nil {
+		return nil
+	}
+	return &webadapter.PermissionTerminalData{
+		RequestID: terminal.RequestID, SessionID: terminal.SessionID,
+		OwnerID: terminal.OwnerID, InvocationID: terminal.InvocationID,
+		ArgumentsDigest: terminal.ArgumentsDigest, SecurityScopeDigest: terminal.SecurityScopeDigest,
+		ScopeSchemaVersion: terminal.ScopeSchemaVersion, DeadlineAt: terminal.DeadlineAt,
+		TerminalResult: terminal.TerminalResult,
+	}
+}
+
+func webPermissionReconciliationResult(
+	result *engine.PermissionReceiptReconciliationResult,
+) webadapter.ApprovalReconciliationResult {
+	if result == nil {
+		return webadapter.ApprovalReconciliationResult{}
+	}
+	converted := webadapter.ApprovalReconciliationResult{}
+	if result.Request != nil {
+		converted.Request = &webadapter.PermissionRequestData{
+			ID: result.Request.ID, OwnerID: result.Request.OwnerID, InvocationID: result.Request.InvocationID,
+			ToolName: result.Request.ToolName, Arguments: result.Request.Arguments,
+			ArgumentsDigest: result.Request.ArgumentsDigest, SecurityScopeDigest: result.Request.SecurityScopeDigest,
+			ScopeSchemaVersion: result.Request.ScopeSchemaVersion, DeadlineAt: result.Request.DeadlineAt,
+			Risk: result.Request.Risk, Reason: result.Request.Reason,
+		}
+	}
+	if result.Receipt != nil {
+		converted.Receipt = webApprovalDecisionReceipt(result.Receipt)
+	}
+	return converted
+}
+
+func webApprovalDecisionReceipt(receipt *storage.ToolApprovalReceipt) *webadapter.ApprovalDecisionReceipt {
+	if receipt == nil {
+		return nil
+	}
+	return &webadapter.ApprovalDecisionReceipt{
+		RequestID: receipt.RequestID, InvocationID: receipt.InvocationID,
+		OwnerID: receipt.OwnerID, SessionID: receipt.ResolvedSessionID,
+		DecisionID: receipt.DecisionID, Decision: receipt.Decision,
+		IdempotencyKey:  receipt.IdempotencyKey,
+		ArgumentsDigest: receipt.ArgumentsDigest, SecurityScopeDigest: receipt.SecurityScopeDigest,
+		ScopeSchemaVersion: receipt.ScopeSchemaVersion, DeadlineAt: receipt.DeadlineAt,
+		TerminalResult: receipt.TerminalResult, ACKStatus: receipt.ACKStatus,
+		Replayed: receipt.Replayed,
+	}
 }
 
 // clipText 截断字符串到至多 max 个 rune，超出补省略号；用于通知正文摘要。

@@ -12,6 +12,7 @@ import (
 
 func TestDurableApprovalHandlerOwnsACKReplayWithoutTransportBinding(t *testing.T) {
 	a := New()
+	deadline := time.Now().UTC().Add(time.Minute)
 	var calls atomic.Int32
 	a.SetDurableApprovalDecisionHandler(func(data ApprovalResponseData) ApprovalDecisionReceipt {
 		calls.Add(1)
@@ -21,13 +22,14 @@ func TestDurableApprovalHandlerOwnsACKReplayWithoutTransportBinding(t *testing.T
 			DecisionID: "decision-original", Decision: data.Decision,
 			IdempotencyKey:  data.IdempotencyKey,
 			ArgumentsDigest: data.ArgumentsDigest, SecurityScopeDigest: data.SecurityScopeDigest,
-			ScopeSchemaVersion: data.ScopeSchemaVersion,
-			TerminalResult:     "approved_once", ACKStatus: "accepted",
+			ScopeSchemaVersion: data.ScopeSchemaVersion, DeadlineAt: data.DeadlineAt,
+			TerminalResult: "approved_once", ACKStatus: "accepted",
 			Replayed: calls.Load() > 1,
 		}
 	})
 	response := ApprovalResponseData{
 		RequestID: "approval-restart", OwnerID: "owner-durable",
+		SessionID: "session-durable", DeadlineAt: deadline,
 		DecisionID: "decision-transport-retry", InvocationID: "invocation-restart",
 		Decision: "approved_once", IdempotencyKey: "idem-restart",
 		ArgumentsDigest: "args-restart", SecurityScopeDigest: "scope-restart",
@@ -49,6 +51,7 @@ func TestDurableApprovalHandlerOwnsACKReplayWithoutTransportBinding(t *testing.T
 
 func TestDurableApprovalHandlerRejectsCoordinatorIdentityDrift(t *testing.T) {
 	a := New()
+	deadline := time.Now().UTC().Add(time.Minute)
 	a.SetDurableApprovalDecisionHandler(func(data ApprovalResponseData) ApprovalDecisionReceipt {
 		return ApprovalDecisionReceipt{
 			RequestID: data.RequestID, InvocationID: "different-invocation",
@@ -56,12 +59,13 @@ func TestDurableApprovalHandlerRejectsCoordinatorIdentityDrift(t *testing.T) {
 			DecisionID: data.DecisionID, Decision: data.Decision,
 			IdempotencyKey:  data.IdempotencyKey,
 			ArgumentsDigest: data.ArgumentsDigest, SecurityScopeDigest: data.SecurityScopeDigest,
-			ScopeSchemaVersion: data.ScopeSchemaVersion,
-			TerminalResult:     "approved_once", ACKStatus: "accepted",
+			ScopeSchemaVersion: data.ScopeSchemaVersion, DeadlineAt: data.DeadlineAt,
+			TerminalResult: "approved_once", ACKStatus: "accepted",
 		}
 	})
 	ack := a.approvalACK(ApprovalResponseData{
 		RequestID: "approval-drift", OwnerID: "owner-durable", DecisionID: "decision-drift",
+		SessionID: "session-durable", DeadlineAt: deadline,
 		InvocationID: "invocation-drift", Decision: "approved_once", IdempotencyKey: "idem-drift",
 		ArgumentsDigest: "args-drift", SecurityScopeDigest: "scope-drift", ScopeSchemaVersion: 1,
 		responderChatID: "socket-drift",

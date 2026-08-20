@@ -89,6 +89,25 @@ func TestREG_RAG_TaintedInteractiveReusesApprovalCoordinator(t *testing.T) {
 	}
 }
 
+func TestREG_RAG_TaintedFullAccessBlocksWithoutApproval(t *testing.T) {
+	hub := NewPermissionHub(0)
+	sender := &scriptedPermissionSender{hub: hub}
+	hub.SetSender(sender)
+	hook := NewPermissionHook(hub,
+		WithPolicy(DefaultBaselinePolicy()),
+		WithSystemDispatchPolicy(FullAccessSystemDispatchPolicy()),
+	)
+	ctx := skill.WithAuthenticatedUser(context.Background(), "owner-1")
+	ctx = context.WithValue(ctx, ctxKeySessionID, "session-1")
+	ctx = withUntrustedKnowledgeEvidence(ctx)
+	if err := hook.BeforeToolCall(ctx, &ToolCallInfo{Name: "browser", Source: "skill"}); err == nil {
+		t.Fatal("不可信证据不得被 full_access 自动放行")
+	}
+	if got := sender.callCount(); got != 0 {
+		t.Fatalf("不可信证据的 direct block 不得创建审批请求，得到 %d 次", got)
+	}
+}
+
 func TestREG_RAG_TaintedStaticDenyPrecedesApproval(t *testing.T) {
 	policy := NewPermissionPolicy(ActionAllow, PolicyRule{
 		Name: "deny-probe", ToolPattern: "rag_authority_probe", Action: ActionDeny, Reason: "blocked statically",

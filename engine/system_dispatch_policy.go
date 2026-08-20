@@ -109,11 +109,8 @@ func SystemDispatchEntryAllowsTool(entry, toolName string) bool {
 	return systemDispatchEntryAllows(entry, toolName)
 }
 
-// SystemDispatchPolicy is the unattended automation auto-approval matrix.
-//
-// It answers only one question: when a non-interactive source hits a tool that
-// would otherwise require approval, may this source auto-approve it? Explicit
-// PermissionPolicy ActionDeny still wins before this policy is consulted.
+// SystemDispatchPolicy 保存有效权限档位及无人值守自动放行矩阵。
+// 显式 PermissionPolicy ActionDeny 始终先于该策略生效。
 type SystemDispatchPolicy struct {
 	profile string
 	matrix  map[string][]string
@@ -199,6 +196,28 @@ func (p *SystemDispatchPolicy) Allows(source, toolName string) bool {
 	}
 	for _, entry := range p.matrix[source] {
 		if systemDispatchEntryAllows(entry, toolName) {
+			return true
+		}
+	}
+	return false
+}
+
+// AllowsInteractiveTool 判断当前权限档位是否可让交互调用跳过审批。
+// 全功能放行所有原本需审批的可信工具；功能优先只放行浏览网页和沙箱执行。
+func (p *SystemDispatchPolicy) AllowsInteractiveTool(toolName string) bool {
+	if p == nil {
+		p = DefaultSystemDispatchPolicy()
+	}
+	toolName = strings.TrimSpace(toolName)
+	if toolName == "" {
+		return false
+	}
+	switch p.Profile() {
+	case SystemDispatchProfileFullAccess:
+		return true
+	case SystemDispatchProfileFunctionFirst:
+		switch SystemDispatchToolCategory(toolName) {
+		case "browser", "exec_sandboxed":
 			return true
 		}
 	}
