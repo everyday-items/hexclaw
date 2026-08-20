@@ -17,7 +17,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"net/http"
 	"os/exec"
 	"runtime"
@@ -80,7 +79,7 @@ func NewService(version string) *Service {
 
 // SetNotifyCallback 设置通知回调
 //
-// 桌面客户端可注册回调，在新通知到达时触发系统通知。
+// 桌面客户端可注册回调，把新通知实时推送到应用内通知中心。
 func (s *Service) SetNotifyCallback(fn func(n Notification)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -94,7 +93,7 @@ func (s *Service) Notify(title, body string, notifyType NotificationType) {
 
 // NotifySource 发送带来源标识的桌面通知。
 //
-// 将通知添加到队列，触发回调（如果设置，用于实时推送到前端），并尝试系统通知。
+// 将通知添加到队列并触发回调（如果设置，用于实时推送到前端）。
 // source 供桌面端映射图标/深链（如 "cron" / "im"），不影响后端行为。
 func (s *Service) NotifySource(title, body string, notifyType NotificationType, source string) {
 	n := Notification{
@@ -119,8 +118,6 @@ func (s *Service) NotifySource(title, body string, notifyType NotificationType, 
 		callback(n)
 	}
 
-	// 尝试系统通知
-	sendSystemNotification(title, body)
 }
 
 // Notifications 获取最近的通知列表
@@ -297,30 +294,4 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
-}
-
-// sendSystemNotification 发送系统级通知
-//
-// macOS 使用 osascript，Linux 使用 notify-send。
-func sendSystemNotification(title, body string) {
-	var cmd *exec.Cmd
-
-	switch runtime.GOOS {
-	case "darwin":
-		// 转义 AppleScript 双引号和反斜杠，防止命令注入
-		safeBody := strings.ReplaceAll(strings.ReplaceAll(body, `\`, `\\`), `"`, `\"`)
-		safeTitle := strings.ReplaceAll(strings.ReplaceAll(title, `\`, `\\`), `"`, `\"`)
-		script := fmt.Sprintf(`display notification "%s" with title "%s"`, safeBody, safeTitle)
-		cmd = exec.Command("osascript", "-e", script)
-	case "linux":
-		cmd = exec.Command("notify-send", title, body)
-	default:
-		return // Windows 等平台暂不支持系统通知
-	}
-
-	if err := cmd.Start(); err != nil {
-		logger.Error("error", "error", err)
-		return
-	}
-	go cmd.Wait()
 }
