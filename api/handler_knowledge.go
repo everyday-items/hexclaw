@@ -753,13 +753,28 @@ func (s *Server) handleReindexDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"status":      doc.Status,
 		"message":     "文档已重新索引",
 		"id":          doc.ID,
 		"chunk_count": doc.ChunkCount,
 		"updated_at":  doc.UpdatedAt,
-	})
+	}
+	if projectionService, ok := s.semanticIndex.(KnowledgeDocumentVectorProjectionAPI); ok {
+		projections, projectionErr := projectionService.ListDocumentVectorProjections(
+			r.Context(), knowledgePrincipalID(r), knowledgeDefaultCorpusID,
+		)
+		if projectionErr == nil {
+			if projection, found := projections[doc.ID]; found && strings.TrimSpace(projection.JobID) != "" {
+				applyKnowledgeDocumentVectorPayload(payload, projection)
+				payload["job_id"] = projection.JobID
+				payload["job_state"] = projection.JobState
+				writeJSON(w, http.StatusAccepted, payload)
+				return
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 // SearchKnowledgeRequest 知识库搜索请求
