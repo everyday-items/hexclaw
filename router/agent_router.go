@@ -22,23 +22,26 @@ package router
 
 import (
 	"fmt"
-	"github.com/hexagon-codes/toolkit/util/logger"
 	"strings"
 	"sync"
+
+	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 // AgentConfig Agent 配置
 //
 // 定义一个 Agent 实例的完整配置。
 type AgentConfig struct {
-	Name         string   `json:"name" yaml:"name"`                   // Agent 名称（唯一标识）
-	DisplayName  string   `json:"display_name" yaml:"display_name"`   // 显示名称
-	Description  string   `json:"description" yaml:"description"`     // Agent 描述
-	Model        string   `json:"model" yaml:"model"`                 // 使用的 LLM 模型
-	Provider     string   `json:"provider" yaml:"provider"`           // 使用的 LLM Provider
-	SystemPrompt string   `json:"system_prompt" yaml:"system_prompt"` // 系统提示词
-	Skills       []string `json:"skills" yaml:"skills"`               // 启用的技能列表
-	MaxTokens    int      `json:"max_tokens" yaml:"max_tokens"`       // 最大 token 数（0=未设，跟随模型默认）
+	Name            string                  `json:"name" yaml:"name"`                         // Agent 名称（唯一标识）
+	DisplayName     string                  `json:"display_name" yaml:"display_name"`         // 显示名称
+	Description     string                  `json:"description" yaml:"description"`           // Agent 描述
+	Model           string                  `json:"model" yaml:"model"`                       // 使用的 LLM 模型
+	Provider        string                  `json:"provider" yaml:"provider"`                 // 使用的 LLM Provider
+	SystemPrompt    string                  `json:"system_prompt" yaml:"system_prompt"`       // 系统提示词
+	Skills          []string                `json:"skills" yaml:"skills"`                     // 启用的技能列表
+	MaxTokens       int                     `json:"max_tokens" yaml:"max_tokens"`             // 最大 token 数（0=未设，跟随模型默认）
+	ReasoningPolicy *config.ReasoningPolicy `json:"reasoning_policy" yaml:"reasoning_policy"` // 思考策略；nil 兼容为 inherit
 	// Temperature 温度参数（BUG-20260703 P2-4 指针化）：nil=未设跟随模型默认，
 	// 显式 0=确定性采样——float64 零值无法表达这一区分（旧 `>0` 判定把 0 当未设）。
 	Temperature *float64          `json:"temperature,omitempty" yaml:"temperature,omitempty"`
@@ -120,6 +123,9 @@ func (r *Dispatcher) RegisterPersisted(cfg AgentConfig, persist func(*AgentConfi
 	if strings.TrimSpace(cfg.Name) == "" {
 		// BUG-20260703 C1：纯空白名（"   "/tab/换行）也须拒，否则被存成空白主键。
 		return fmt.Errorf("agent 名称不能为空")
+	}
+	if err := normalizeAgentReasoningPolicy(&cfg); err != nil {
+		return err
 	}
 
 	r.mu.Lock()
@@ -376,6 +382,10 @@ func (r *Dispatcher) LoadAll(agents []AgentConfig, defaultAgent string, rules []
 	r.agents = make(map[string]*AgentConfig, len(agents))
 	for i := range agents {
 		a := cloneAgentConfig(agents[i])
+		if a.ReasoningPolicy == nil {
+			policy := config.ReasoningPolicy{Mode: config.ReasoningPolicyModeInherit}
+			a.ReasoningPolicy = &policy
+		}
 		r.agents[a.Name] = &a
 	}
 	r.rules = append([]Rule(nil), rules...)
@@ -545,6 +555,9 @@ func (r *Dispatcher) UpdateAgent(cfg AgentConfig) error {
 		// BUG-20260703 C1：纯空白名（"   "/tab/换行）也须拒，否则被存成空白主键。
 		return fmt.Errorf("agent 名称不能为空")
 	}
+	if err := normalizeAgentReasoningPolicy(&cfg); err != nil {
+		return err
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -572,7 +585,26 @@ func cloneAgentConfig(cfg AgentConfig) AgentConfig {
 		temperature := *cfg.Temperature
 		cloned.Temperature = &temperature
 	}
+	if cfg.ReasoningPolicy != nil {
+		policy := *cfg.ReasoningPolicy
+		cloned.ReasoningPolicy = &policy
+	}
 	return cloned
+}
+
+func normalizeAgentReasoningPolicy(cfg *AgentConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("agent config is nil")
+	}
+	policy := config.ReasoningPolicy{Mode: config.ReasoningPolicyModeInherit}
+	if cfg.ReasoningPolicy != nil {
+		policy = *cfg.ReasoningPolicy
+	}
+	if err := policy.Validate(true); err != nil {
+		return fmt.Errorf("invalid agent reasoning_policy: %w", err)
+	}
+	cfg.ReasoningPolicy = &policy
+	return nil
 }
 
 // UpdateAgentPersisted serializes a persisted read-modify-write with all
@@ -608,6 +640,9 @@ func (r *Dispatcher) UpdateAgentPersisted(
 	}
 	if updated.Name != name {
 		return fmt.Errorf("agent persisted update 不允许改名: %q -> %q", name, updated.Name)
+	}
+	if err := normalizeAgentReasoningPolicy(&updated); err != nil {
+		return err
 	}
 	updated = cloneAgentConfig(updated)
 	if persist != nil {

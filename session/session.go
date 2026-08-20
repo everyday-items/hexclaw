@@ -153,6 +153,8 @@ type AssistantMeta struct {
 	MessageID        string
 	Reasoning        string
 	ThinkingDuration int
+	// ReasoningReceipt 是助手消息冻结的推理执行回执，必须与 runtime snapshot 一起持久化。
+	ReasoningReceipt *adapter.ReasoningReceipt
 	Provider         string
 	Model            string
 	AgentName        string
@@ -249,6 +251,9 @@ func (m *Manager) SaveAssistantReply(ctx context.Context, sessionID, content str
 		metaMap["backend_message_id"] = messageID
 		metaMap["message_id"] = messageID
 		metaMap["reasoning_disclosure"] = disclosure
+		if am.ReasoningReceipt != nil {
+			metaMap["reasoning_receipt"] = adapter.NormalizeReasoningReceipt(am.ReasoningReceipt)
+		}
 		metaMap["runtime_events"] = append([]adapter.SequencedRuntimeEvent(nil), am.RuntimeEvents...)
 		metaMap["last_sequence"] = am.LastSequence
 	}
@@ -344,7 +349,17 @@ func (m *Manager) PersistAssistantRuntimeSnapshot(
 	meta["assistant_message_id"] = messageID
 	meta["backend_message_id"] = messageID
 	meta["message_id"] = messageID
-	meta["reasoning_disclosure"] = snapshot.ReasoningDisclosure
+	disclosure := snapshot.ReasoningDisclosure
+	if disclosure.Visibility != adapter.ReasoningVisible {
+		disclosure = adapter.ReasoningDisclosure{Visibility: adapter.ReasoningNotExposed}
+		delete(meta, "reasoning")
+	} else if snapshot.Reasoning != "" {
+		meta["reasoning"] = snapshot.Reasoning
+	} else {
+		delete(meta, "reasoning")
+	}
+	meta["reasoning_disclosure"] = disclosure
+	meta["reasoning_receipt"] = adapter.NormalizeReasoningReceipt(&snapshot.ReasoningReceipt)
 	meta["runtime_events"] = snapshot.RuntimeEvents
 	meta["last_sequence"] = snapshot.LastSequence
 	raw, err := json.Marshal(meta)

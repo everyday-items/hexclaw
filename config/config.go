@@ -11,6 +11,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -360,20 +361,216 @@ type ServerConfig struct {
 
 // LLMConfig LLM 配置
 type LLMConfig struct {
-	Default             string                              `yaml:"default"`                              // 默认 Provider 名称
-	Providers           map[string]LLMProviderConfig        `yaml:"providers"`                            // Provider 列表
-	Routing             LLMRoutingConfig                    `yaml:"routing"`                              // 智能路由
-	Cache               LLMCacheConfig                      `yaml:"cache"`                                // 语义缓存
-	Tools               LLMToolsConfig                      `yaml:"tools"`                                // 工具注入（全局）
-	ConfigRevision      uint64                              `yaml:"config_revision,omitempty"`            // 每次成功配置提交单调递增
-	LastMutationReceipt *LLMConfigMutationReceipt           `yaml:"last_mutation_receipt,omitempty"`      // 最近一次幂等提交的非秘密证明
-	MutationReceipts    map[string]LLMConfigMutationReceipt `yaml:"mutation_receipts,omitempty" json:"-"` // request_id -> durable idempotency proof; older successful mutations remain replayable
+	Default                string                              `yaml:"default"`                                                  // 默认 Provider 名称
+	DefaultReasoningPolicy ReasoningPolicy                     `yaml:"default_reasoning_policy" json:"default_reasoning_policy"` // 全局默认思考策略
+	Providers              map[string]LLMProviderConfig        `yaml:"providers"`                                                // Provider 列表
+	Routing                LLMRoutingConfig                    `yaml:"routing"`                                                  // 智能路由
+	Cache                  LLMCacheConfig                      `yaml:"cache"`                                                    // 语义缓存
+	Tools                  LLMToolsConfig                      `yaml:"tools"`                                                    // 工具注入（全局）
+	ConfigRevision         uint64                              `yaml:"config_revision,omitempty"`                                // 每次成功配置提交单调递增
+	LastMutationReceipt    *LLMConfigMutationReceipt           `yaml:"last_mutation_receipt,omitempty"`                          // 最近一次幂等提交的非秘密证明
+	MutationReceipts       map[string]LLMConfigMutationReceipt `yaml:"mutation_receipts,omitempty" json:"-"`                     // request_id -> durable idempotency proof; older successful mutations remain replayable
 	// ReasoningProvider/Model 解题/批改等「多步文本推理 + 工具验证」任务专用的强文本模型
 	// （BUG-20260712-#1）。视觉默认模型（如 glm-4v-flash）擅长看图却不擅长多步数学推理与写
 	// 验证代码，会把错答案判成 unverifiable 漏判。配上强文本模型（如 智谱/glm-4.5）后，solve
 	// 源的 solver/verifier 子 Agent 走它；空=沿用默认路由（不改变现状，无回归）。
 	ReasoningProvider string `yaml:"reasoning_provider,omitempty" json:"reasoning_provider,omitempty"`
 	ReasoningModel    string `yaml:"reasoning_model,omitempty" json:"reasoning_model,omitempty"`
+}
+
+// MarshalYAML 在持久化边界阻止全局策略写入 Agent 专属 inherit 或非法组合。
+func (c LLMConfig) MarshalYAML() (any, error) {
+	if err := c.DefaultReasoningPolicy.Validate(false); err != nil {
+		return nil, fmt.Errorf("invalid llm.default_reasoning_policy: %w", err)
+	}
+	type wire LLMConfig
+	return wire(c), nil
+}
+
+// ReasoningPolicyMode 定义持久化思考策略的选择模式。
+type ReasoningPolicyMode string
+
+const (
+	// ReasoningPolicyModeAuto 使用模型原生或运行时自动选择。空值在内存中等价于 auto，
+	// 让旧配置缺少 default_reasoning_policy 时自然得到向后兼容默认值。
+	ReasoningPolicyModeAuto    ReasoningPolicyMode = ""
+	ReasoningPolicyModeInherit ReasoningPolicyMode = "inherit"
+	ReasoningPolicyModeOn      ReasoningPolicyMode = "on"
+	ReasoningPolicyModeOff     ReasoningPolicyMode = "off"
+	ReasoningPolicyModeEffort  ReasoningPolicyMode = "effort"
+)
+
+// ReasoningEffort 是 reasoning_effort 方言可选择的标准强度。
+type ReasoningEffort string
+
+const (
+	ReasoningEffortLow    ReasoningEffort = "low"
+	ReasoningEffortMedium ReasoningEffort = "medium"
+	ReasoningEffortHigh   ReasoningEffort = "high"
+	ReasoningEffortXHigh  ReasoningEffort = "xhigh"
+	ReasoningEffortMax    ReasoningEffort = "max"
+)
+
+// ReasoningPolicy 是全局与 Agent 共享的类型化思考策略合同。
+// Effort 仅在 Mode=effort 时存在；Agent 可使用 inherit，全局策略不可使用。
+type ReasoningPolicy struct {
+	Mode   ReasoningPolicyMode `yaml:"mode" json:"mode"`
+	Effort ReasoningEffort     `yaml:"effort,omitempty" json:"effort,omitempty"`
+}
+
+func (m ReasoningPolicyMode) wireValue() string {
+	if m == ReasoningPolicyModeAuto || m == ReasoningPolicyMode("auto") {
+		return "auto"
+	}
+	return string(m)
+}
+
+func (m ReasoningPolicyMode) String() string {
+	return m.wireValue()
+}
+
+// MarshalJSON 保证 auto 的内存零值仍以显式 typed wire 输出。
+func (m ReasoningPolicyMode) MarshalJSON() ([]byte, error) {
+	if !m.valid() {
+		return nil, fmt.Errorf("invalid reasoning policy mode %q", string(m))
+	}
+	return json.Marshal(m.wireValue())
+}
+
+// UnmarshalJSON 只接受合同声明的 mode exact-set。
+func (m *ReasoningPolicyMode) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("reasoning policy mode must be a string: %w", err)
+	}
+	parsed, err := parseReasoningPolicyMode(value)
+	if err != nil {
+		return err
+	}
+	*m = parsed
+	return nil
+}
+
+// MarshalYAML 保证持久化配置总是写出显式 auto。
+func (m ReasoningPolicyMode) MarshalYAML() (any, error) {
+	if !m.valid() {
+		return nil, fmt.Errorf("invalid reasoning policy mode %q", string(m))
+	}
+	return m.wireValue(), nil
+}
+
+// UnmarshalYAML 只接受合同声明的 mode exact-set。
+func (m *ReasoningPolicyMode) UnmarshalYAML(node *yaml.Node) error {
+	var value string
+	if err := node.Decode(&value); err != nil {
+		return fmt.Errorf("reasoning policy mode must be a string: %w", err)
+	}
+	parsed, err := parseReasoningPolicyMode(value)
+	if err != nil {
+		return err
+	}
+	*m = parsed
+	return nil
+}
+
+func parseReasoningPolicyMode(value string) (ReasoningPolicyMode, error) {
+	switch value {
+	case "auto":
+		return ReasoningPolicyModeAuto, nil
+	case "inherit":
+		return ReasoningPolicyModeInherit, nil
+	case "on":
+		return ReasoningPolicyModeOn, nil
+	case "off":
+		return ReasoningPolicyModeOff, nil
+	case "effort":
+		return ReasoningPolicyModeEffort, nil
+	default:
+		return "", fmt.Errorf("invalid reasoning policy mode %q", value)
+	}
+}
+
+func (m ReasoningPolicyMode) valid() bool {
+	switch m {
+	case ReasoningPolicyModeAuto, ReasoningPolicyMode("auto"), ReasoningPolicyModeInherit, ReasoningPolicyModeOn,
+		ReasoningPolicyModeOff, ReasoningPolicyModeEffort:
+		return true
+	default:
+		return false
+	}
+}
+
+// UnmarshalJSON 只接受合同声明的 effort exact-set。
+func (e *ReasoningEffort) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("reasoning effort must be a string: %w", err)
+	}
+	parsed := ReasoningEffort(value)
+	if !parsed.valid() {
+		return fmt.Errorf("invalid reasoning effort %q", value)
+	}
+	*e = parsed
+	return nil
+}
+
+// UnmarshalYAML 只接受合同声明的 effort exact-set。
+func (e *ReasoningEffort) UnmarshalYAML(node *yaml.Node) error {
+	var value string
+	if err := node.Decode(&value); err != nil {
+		return fmt.Errorf("reasoning effort must be a string: %w", err)
+	}
+	parsed := ReasoningEffort(value)
+	if !parsed.valid() {
+		return fmt.Errorf("invalid reasoning effort %q", value)
+	}
+	*e = parsed
+	return nil
+}
+
+func (e ReasoningEffort) valid() bool {
+	switch e {
+	case ReasoningEffortLow, ReasoningEffortMedium, ReasoningEffortHigh,
+		ReasoningEffortXHigh, ReasoningEffortMax:
+		return true
+	default:
+		return false
+	}
+}
+
+// Validate 校验 mode/effort 组合；allowInherit 仅供 Agent 层开启。
+func (p ReasoningPolicy) Validate(allowInherit bool) error {
+	if !p.Mode.valid() {
+		return fmt.Errorf("invalid reasoning policy mode %q", string(p.Mode))
+	}
+	if p.Mode == ReasoningPolicyModeInherit && !allowInherit {
+		return fmt.Errorf("reasoning policy mode inherit is not allowed for global defaults")
+	}
+	if p.Mode == ReasoningPolicyModeEffort {
+		if !p.Effort.valid() {
+			return fmt.Errorf("reasoning policy mode effort requires one of low, medium, high, xhigh, or max")
+		}
+		return nil
+	}
+	if p.Effort != "" {
+		return fmt.Errorf("reasoning policy effort is only allowed when mode is effort")
+	}
+	return nil
+}
+
+// UnmarshalYAML 在全局配置边界拒绝 Agent 专属 inherit 与非法组合。
+func (p *ReasoningPolicy) UnmarshalYAML(node *yaml.Node) error {
+	type wire ReasoningPolicy
+	var decoded wire
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	candidate := ReasoningPolicy(decoded)
+	if err := candidate.Validate(false); err != nil {
+		return err
+	}
+	*p = candidate
+	return nil
 }
 
 // LLMConfigMutationReceipt is a durable, non-secret proof for an idempotent LLM
@@ -713,11 +910,11 @@ type SecurityConfig struct {
 	ToolPermissions    ToolPermissionsConfig `yaml:"tool_permissions"`
 }
 
-// AutonomyConfig controls non-interactive automation permissions.
+// AutonomyConfig 控制工具调用的权限档位。
 //
-// Profile sets the baseline matrix. SystemDispatch entries optionally override
-// a specific source with category names, exact tool names, glob patterns, or "*".
-// Supported profiles: function_first (default), balanced, strict, full_access.
+// Profile 决定交互调用与无人值守调用的审批基线；SystemDispatch entries 仅覆盖
+// 特定无人值守来源的矩阵，可使用类别名、精确工具名、glob 或 "*"。
+// 支持 function_first（默认）、balanced、strict、full_access。
 type AutonomyConfig struct {
 	Profile        string                       `yaml:"profile"`
 	SystemDispatch SystemDispatchAutonomyConfig `yaml:"system_dispatch,omitempty"`

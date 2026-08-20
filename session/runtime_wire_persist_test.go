@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
@@ -135,6 +136,56 @@ func TestPersistAssistantRuntimeSnapshotUpdatesExistingMessageInPlace(t *testing
 	}
 }
 
+func TestPersistAssistantRuntimeSnapshotPreservesReasoningReceiptForReload(t *testing.T) {
+	mgr, store := newTestManager(t)
+	ctx := context.Background()
+	sess, err := mgr.GetOrCreate(ctx, &adapter.Message{
+		Platform: adapter.PlatformWeb,
+		UserID:   "runtime-wire-receipt-user",
+		Content:  "seed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const messageID = "msg-runtime-receipt"
+	if _, saveErr := mgr.SaveAssistantReply(ctx, sess.ID, "answer", AssistantMeta{
+		MessageID: messageID,
+		Provider:  "hexclaw-gpt",
+		Model:     "gpt-5.6-luna",
+	}); saveErr != nil {
+		t.Fatalf("save assistant reply: %v", saveErr)
+	}
+	want := adapter.ReasoningReceipt{
+		Version:            adapter.ReasoningReceiptVersion,
+		ReasoningRequest:   adapter.ReasoningRequestOn,
+		ReasoningSupport:   adapter.ReasoningSupportSupported,
+		ReasoningExecution: adapter.ReasoningExecutionApplied,
+	}
+	if persistErr := mgr.PersistAssistantRuntimeSnapshot(ctx, messageID, adapter.RuntimeSnapshot{
+		AssistantMessageID:  messageID,
+		BackendMessageID:    messageID,
+		MessageID:           messageID,
+		ReasoningReceipt:    want,
+		ReasoningDisclosure: adapter.ReasoningDisclosure{Visibility: adapter.ReasoningNotExposed},
+	}); persistErr != nil {
+		t.Fatalf("persist runtime snapshot: %v", persistErr)
+	}
+
+	record, err := store.GetMessage(ctx, messageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta struct {
+		ReasoningReceipt adapter.ReasoningReceipt `json:"reasoning_receipt"`
+	}
+	if err := json.Unmarshal([]byte(record.Metadata), &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta.ReasoningReceipt != want {
+		t.Fatalf("reloaded reasoning receipt = %+v, want %+v", meta.ReasoningReceipt, want)
+	}
+}
+
 func TestSaveAssistantReplyPersistsReasoningOnlyWhenExplicitlyVisible(t *testing.T) {
 	mgr, store := newTestManager(t)
 	ctx := context.Background()
@@ -187,5 +238,99 @@ func TestSaveAssistantReplyPersistsReasoningOnlyWhenExplicitlyVisible(t *testing
 				t.Fatalf("visible reasoning not persisted: %s", message.Metadata)
 			}
 		}
+	}
+}
+
+func TestPersistAssistantRuntimeSnapshotAccumulatesOnlyFrozenVisibleReasoning(t *testing.T) {
+	mgr, store := newTestManager(t)
+	ctx := context.Background()
+	sess, err := mgr.GetOrCreate(ctx, &adapter.Message{
+		Platform: adapter.PlatformWeb,
+		UserID:   "runtime-public-reasoning-user",
+		Content:  "seed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const messageID = "msg-runtime-public-reasoning"
+	const provider = "ollama-instance-a"
+	const model = "qwen3.5:9b"
+	if _, err := mgr.SaveAssistantReply(ctx, sess.ID, "answer", AssistantMeta{
+		MessageID: messageID,
+		Provider:  provider,
+		Model:     model,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	wire := adapter.NewRuntimeWire(messageID, adapter.ReasoningDisclosure{
+		Visibility: adapter.ReasoningNotExposed,
+		Provider:   provider,
+		Model:      model,
+	})
+	for _, reasoning := range []string{"**公开", "摘要**"} {
+		chunk := wire.Decorate(&adapter.ReplyChunk{
+			Reasoning: reasoning,
+			ReasoningDisclosure: adapter.ReasoningDisclosure{
+				Visibility: adapter.ReasoningVisible,
+				Source:     "ollama.message.thinking",
+				Dialect:    "ollama_chat_think",
+				Provider:   provider,
+				Model:      model,
+			},
+		})
+		if chunk.Reasoning != reasoning {
+			t.Fatalf("trusted reasoning chunk = %q, want %q", chunk.Reasoning, reasoning)
+		}
+	}
+	if err := mgr.PersistAssistantRuntimeSnapshot(ctx, messageID, wire.Snapshot()); err != nil {
+		t.Fatalf("persist trusted runtime snapshot: %v", err)
+	}
+	record, err := store.GetMessage(ctx, messageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(record.Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata["reasoning"] != "**公开摘要**" {
+		t.Fatalf("reloaded public reasoning = %#v, want accumulated public summary", metadata["reasoning"])
+	}
+
+	private := wire.Decorate(&adapter.ReplyChunk{
+		Reasoning: "PRIVATE_CHAIN_OF_THOUGHT_MUST_NOT_PERSIST",
+		ReasoningDisclosure: adapter.ReasoningDisclosure{
+			Visibility: adapter.ReasoningVisible,
+			Source:     "ollama.message.thinking",
+			Dialect:    "ollama_chat_think",
+			Provider:   "ollama-instance-b",
+			Model:      model,
+		},
+	})
+	if private.Reasoning != "" {
+		t.Fatalf("mismatched reasoning leaked: %q", private.Reasoning)
+	}
+	if snapshot := wire.Snapshot(); snapshot.Reasoning != "" ||
+		snapshot.ReasoningDisclosure.Visibility != adapter.ReasoningNotExposed {
+		t.Fatalf("mismatch did not clear runtime reasoning: %+v", snapshot)
+	}
+
+	if err := mgr.PersistAssistantRuntimeSnapshot(ctx, messageID, wire.Snapshot()); err != nil {
+		t.Fatalf("persist runtime snapshot: %v", err)
+	}
+	record, err = store.GetMessage(ctx, messageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata = map[string]any{}
+	if err := json.Unmarshal([]byte(record.Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if _, persisted := metadata["reasoning"]; persisted {
+		t.Fatalf("mismatched reasoning left a persisted public summary: %s", record.Metadata)
+	}
+	if got := string(record.Metadata); strings.Contains(got, "PRIVATE_CHAIN_OF_THOUGHT_MUST_NOT_PERSIST") {
+		t.Fatalf("private reasoning persisted: %s", record.Metadata)
 	}
 }

@@ -274,11 +274,16 @@ type completionCapabilityProvider struct {
 
 func (p *completionCapabilityProvider) Name() string { return p.next.Name() }
 
-func (p *completionCapabilityProvider) validate(req llm.CompletionRequest) error {
+func (p *completionCapabilityProvider) requestModel(req llm.CompletionRequest) string {
 	model := strings.TrimSpace(req.Model)
 	if model == "" {
 		model = strings.TrimSpace(p.providerConfig.Model)
 	}
+	return model
+}
+
+func (p *completionCapabilityProvider) validate(req llm.CompletionRequest) error {
+	model := p.requestModel(req)
 	required := []string{config.LLMModelCapabilityText}
 	if completionRequestContainsImage(req) {
 		required = append(required, config.LLMModelCapabilityVision)
@@ -295,11 +300,78 @@ func (p *completionCapabilityProvider) validate(req llm.CompletionRequest) error
 	return nil
 }
 
+func (p *completionCapabilityProvider) applyReasoningCapability(req *llm.CompletionRequest) error {
+	if req == nil || req.Metadata == nil {
+		return nil
+	}
+	if _, requested := req.Metadata["thinking"]; !requested {
+		return nil
+	}
+	metadata := make(map[string]any, len(req.Metadata)+1)
+	for key, value := range req.Metadata {
+		metadata[key] = value
+	}
+	req.Metadata = metadata
+
+	support, control := config.ModelReasoningControl(p.providerConfig, p.requestModel(*req))
+	capability := llm.ReasoningCapability{Support: llm.ReasoningSupport(support)}
+	if control != nil {
+		capability.Dialect = llm.ReasoningDialect(control.Dialect)
+		capability.OnValue = control.On
+		capability.OffValue = control.Off
+	}
+	req.Metadata[llm.ReasoningCapabilityMetadataKey] = capability
+	plan, _, err := llm.PlanReasoningFromMetadata(
+		req.Metadata,
+		p.requestModel(*req),
+		p.providerConfig.BaseURL,
+	)
+	if err != nil {
+		llm.PublishReasoningReceipt(req.Metadata, plan.Receipt)
+		return err
+	}
+	if plan.Receipt.Enabled {
+		if err := applyConfiguredThinkingEffort(control, req.Metadata, &capability); err != nil {
+			return fmt.Errorf("provider %q model %q: %w", p.providerName, p.requestModel(*req), err)
+		}
+		req.Metadata[llm.ReasoningCapabilityMetadataKey] = capability
+	}
+	return nil
+}
+
+func applyConfiguredThinkingEffort(
+	control *config.LLMReasoningControlSpec,
+	metadata map[string]any,
+	capability *llm.ReasoningCapability,
+) error {
+	if control == nil || capability == nil || control.Dialect != config.LLMReasoningDialectEffort {
+		return nil
+	}
+	raw, requested := metadata["thinking_effort"]
+	if !requested {
+		return nil
+	}
+	effort, ok := raw.(string)
+	if !ok || effort == "" || effort != strings.TrimSpace(effort) {
+		return fmt.Errorf("thinking_effort must be an exact allowed string")
+	}
+	for _, allowed := range control.AllowedEfforts {
+		if effort == allowed {
+			capability.OnValue = effort
+			return nil
+		}
+	}
+	return fmt.Errorf("thinking_effort %q is not allowed", effort)
+}
+
 func (p *completionCapabilityProvider) Complete(
 	ctx context.Context,
 	req llm.CompletionRequest,
 ) (*llm.CompletionResponse, error) {
 	if err := p.validate(req); err != nil {
+		return nil, err
+	}
+	if err := p.applyReasoningCapability(&req); err != nil {
 		return nil, err
 	}
 	return p.next.Complete(ctx, req)
@@ -310,6 +382,9 @@ func (p *completionCapabilityProvider) Stream(
 	req llm.CompletionRequest,
 ) (*llm.Stream, error) {
 	if err := p.validate(req); err != nil {
+		return nil, err
+	}
+	if err := p.applyReasoningCapability(&req); err != nil {
 		return nil, err
 	}
 	return p.next.Stream(ctx, req)

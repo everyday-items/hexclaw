@@ -26,6 +26,17 @@ var ReservedDispatchMetadataKeys = []string{
 	// 被 skill.WithRoutedAgent 采纳，绕过 agent 存在性校验跨孩子写记录（R1 High）。
 	"routed_agent",
 	"route_source",
+	// 推理回执及其证据只能由后端生成，客户端仅可通过既有 thinking 请求键表达意图。
+	"reasoning_receipt",
+	"reasoning_request",
+	"reasoning_support",
+	"reasoning_execution",
+	"reasoning_evidence",
+	"reasoning_sent",
+	"reasoning_accepted",
+	"reasoning_observed",
+	"reasoning_provider",
+	"reasoning_model",
 }
 
 // StripReservedDispatchMetadata 从不可信客户端 metadata 中剥除保留派发键。

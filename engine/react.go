@@ -16,6 +16,7 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/ai-core/llm/cache"
+	"github.com/hexagon-codes/ai-core/llm/ollama"
 	mediaimg "github.com/hexagon-codes/ai-core/media/image"
 	mediavid "github.com/hexagon-codes/ai-core/media/video"
 	"github.com/hexagon-codes/ai-core/template"
@@ -1749,7 +1750,7 @@ func isKnownTextOnlyModel(providerName, modelName string) bool {
 // 对于快速路径（Skill/缓存命中）降级为单 chunk 输出。
 func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (<-chan *adapter.ReplyChunk, error) {
 	if msg == nil {
-		return e.processStream(ctx, msg)
+		return e.processStream(ctx, msg, nil)
 	}
 	if msg.Metadata == nil {
 		msg.Metadata = make(map[string]string)
@@ -1758,13 +1759,18 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	msg.Metadata["assistant_message_id"] = assistantMessageID
 	ctx = session.WithAssistantMessageID(ctx, assistantMessageID)
 	ctx = session.WithReasoningDisclosureState(ctx)
-	raw, err := e.processStream(ctx, msg)
+	route := adapter.FrozenReasoningRoute{}
+	raw, err := e.processStream(ctx, msg, &route)
 	if err != nil {
 		return nil, err
 	}
 	wire := adapter.NewRuntimeWire(
 		assistantMessageID,
-		adapter.ReasoningDisclosure{Visibility: adapter.ReasoningNotExposed},
+		adapter.ReasoningDisclosure{
+			Visibility: adapter.ReasoningNotExposed,
+			Provider:   route.Provider,
+			Model:      route.Model,
+		},
 	)
 	out := make(chan *adapter.ReplyChunk, 16)
 	go func() {
@@ -1801,6 +1807,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 					session.AssistantMeta{
 						MessageID:           assistantMessageID,
 						ReasoningDisclosure: snapshot.ReasoningDisclosure,
+						ReasoningReceipt:    &snapshot.ReasoningReceipt,
 						RuntimeEvents:       snapshot.RuntimeEvents,
 						LastSequence:        snapshot.LastSequence,
 					},
@@ -1816,7 +1823,11 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	return out, nil
 }
 
-func (e *ReActEngine) processStream(ctx context.Context, msg *adapter.Message) (<-chan *adapter.ReplyChunk, error) {
+func (e *ReActEngine) processStream(
+	ctx context.Context,
+	msg *adapter.Message,
+	route *adapter.FrozenReasoningRoute,
+) (<-chan *adapter.ReplyChunk, error) {
 	if err := validateIncomingMessage(msg); err != nil {
 		return nil, err
 	}
@@ -1922,6 +1933,12 @@ func (e *ReActEngine) processStream(ctx context.Context, msg *adapter.Message) (
 	selection, err := e.resolveLLMSelection(ctx, msg)
 	if err != nil {
 		return nil, fmt.Errorf("llm 路由失败: %w", err)
+	}
+	if route != nil {
+		*route = adapter.FrozenReasoningRoute{
+			Provider: selection.providerName,
+			Model:    selection.modelName,
+		}
 	}
 	if err := e.prepareAgentSystemPromptPolicy(ctx, msg); err != nil {
 		return nil, err
@@ -2260,6 +2277,8 @@ func (e *ReActEngine) processStreamRuntime(
 		streamCtx := withToolReplyMetaSink(ctx)
 		// BUG-20260710-H1：流式路径同样盖已路由 Agent（与非流式 completeWithTools 对称）。
 		streamCtx = skill.WithRoutedAgent(streamCtx, strings.TrimSpace(msg.Metadata["routed_agent"]))
+		ollama.InjectTrustedReasoningDisclosureEvidence(&req, selection.providerName, selection.modelName)
+		sink.bindReasoningEvidenceObserver(&req)
 		result, err := runner.Stream(streamCtx, hruntime.Request{
 			ID:           messageRequestID(msg),
 			Messages:     req.Messages,
@@ -2301,6 +2320,9 @@ func (e *ReActEngine) processStreamRuntime(
 				req.Tools = tools
 			}
 			applyPerTurnRequestPolicy(streamCtx, &req, fbModel, e.visionRoutingStrategy(), msg, history)
+			sink.setReasoningRoute(fbName, fbModel)
+			ollama.InjectTrustedReasoningDisclosureEvidence(&req, fbName, fbModel)
+			sink.bindReasoningEvidenceObserver(&req)
 			result, err = runner.Stream(streamCtx, hruntime.Request{
 				ID:           messageRequestID(msg),
 				Messages:     req.Messages,
@@ -2408,11 +2430,14 @@ type replyChunkRuntimeSink struct {
 	// reasoning 计时（BUG-20260703 B3）：runtime 流式路径的思考时长在此采样，
 	// finalize 时经 thinkingDuration() 透出+落库。与 legacy 流式路径同语义：
 	// 首个 reasoning 增量起表，其后首个 content 增量停表。
-	reasoningStart   time.Time
-	reasoningEnd     time.Time
-	allowedToolNames map[string]struct{}
-	failedToolCalls  map[string]struct{}
-	route            adapter.FrozenReasoningRoute
+	reasoningStart       time.Time
+	reasoningEnd         time.Time
+	allowedToolNames     map[string]struct{}
+	failedToolCalls      map[string]struct{}
+	route                adapter.FrozenReasoningRoute
+	reasoningEvidenceMu  sync.Mutex
+	lastReasoningReceipt llm.ReasoningReceipt
+	hasReasoningReceipt  bool
 }
 
 func (s *replyChunkRuntimeSink) Emit(ctx context.Context, event hruntime.Event) error {
@@ -4061,6 +4086,7 @@ func buildLLMCacheInput(msg *adapter.Message) string {
 		value string
 	}{
 		{key: "thinking", value: msg.Metadata["thinking"]},
+		{key: "thinking_effort", value: msg.Metadata["thinking_effort"]},
 		{key: "memory", value: msg.Metadata["memory"]},
 		{key: "role", value: msg.Metadata["role"]},
 		{key: "agent_prompt", value: msg.Metadata["agent_prompt"]},
@@ -4203,7 +4229,7 @@ func injectDirectAnswerNoThink(messages []hexagon.Message) {
 }
 
 func copyProviderMetadata(req *hexagon.CompletionRequest, metadata map[string]string) {
-	for _, key := range []string{"thinking", "memory"} {
+	for _, key := range []string{"thinking", "thinking_effort", "memory"} {
 		if value := strings.TrimSpace(metadata[key]); value != "" {
 			if req.Metadata == nil {
 				req.Metadata = make(map[string]any, 2)

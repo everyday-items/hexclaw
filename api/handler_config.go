@@ -25,12 +25,13 @@ import (
 
 // LLMConfigResponse GET /api/v1/config/llm 响应
 type LLMConfigResponse struct {
-	Default           string                               `json:"default"`
-	Providers         map[string]LLMProviderConfigResponse `json:"providers"`
-	Routing           config.LLMRoutingConfig              `json:"routing"`
-	Cache             config.LLMCacheConfig                `json:"cache"`
-	ReasoningProvider string                               `json:"reasoning_provider,omitempty"`
-	ReasoningModel    string                               `json:"reasoning_model,omitempty"`
+	Default                string                               `json:"default"`
+	DefaultReasoningPolicy config.ReasoningPolicy               `json:"default_reasoning_policy"`
+	Providers              map[string]LLMProviderConfigResponse `json:"providers"`
+	Routing                config.LLMRoutingConfig              `json:"routing"`
+	Cache                  config.LLMCacheConfig                `json:"cache"`
+	ReasoningProvider      string                               `json:"reasoning_provider,omitempty"`
+	ReasoningModel         string                               `json:"reasoning_model,omitempty"`
 }
 
 // LLMProviderConfigResponse 脱敏后的 Provider 配置
@@ -61,12 +62,13 @@ type LLMProviderConfigResponse struct {
 
 // LLMConfigUpdateRequest PUT /api/v1/config/llm 请求
 type LLMConfigUpdateRequest struct {
-	Default           string                                 `json:"default"`
-	Providers         map[string]LLMProviderConfigUpdateItem `json:"providers"`
-	Routing           *config.LLMRoutingConfig               `json:"routing,omitempty"`
-	Cache             *config.LLMCacheConfig                 `json:"cache,omitempty"`
-	ReasoningProvider *string                                `json:"reasoning_provider,omitempty"`
-	ReasoningModel    *string                                `json:"reasoning_model,omitempty"`
+	Default                string                                 `json:"default"`
+	DefaultReasoningPolicy *config.ReasoningPolicy                `json:"default_reasoning_policy,omitempty"`
+	Providers              map[string]LLMProviderConfigUpdateItem `json:"providers"`
+	Routing                *config.LLMRoutingConfig               `json:"routing,omitempty"`
+	Cache                  *config.LLMCacheConfig                 `json:"cache,omitempty"`
+	ReasoningProvider      *string                                `json:"reasoning_provider,omitempty"`
+	ReasoningModel         *string                                `json:"reasoning_model,omitempty"`
 }
 
 // LLMProviderConfigUpdateItem 更新请求中的 Provider 项
@@ -613,12 +615,13 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, LLMConfigResponse{
-		Default:           llmCfg.Default,
-		Providers:         providers,
-		Routing:           llmCfg.Routing,
-		Cache:             llmCfg.Cache,
-		ReasoningProvider: llmCfg.ReasoningProvider,
-		ReasoningModel:    llmCfg.ReasoningModel,
+		Default:                llmCfg.Default,
+		DefaultReasoningPolicy: llmCfg.DefaultReasoningPolicy,
+		Providers:              providers,
+		Routing:                llmCfg.Routing,
+		Cache:                  llmCfg.Cache,
+		ReasoningProvider:      llmCfg.ReasoningProvider,
+		ReasoningModel:         llmCfg.ReasoningModel,
 	})
 }
 
@@ -633,6 +636,12 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 			"error": "请求格式错误: " + err.Error(),
 		})
 		return
+	}
+	if req.DefaultReasoningPolicy != nil {
+		if err := req.DefaultReasoningPolicy.Validate(false); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
 	}
 	mutationProof, err := newLLMConfigMutationProof(req, r.Header.Get("Idempotency-Key"))
 	if err != nil {
@@ -827,6 +836,9 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 
 	if req.Cache != nil {
 		nextLLM.Cache = *req.Cache
+	}
+	if req.DefaultReasoningPolicy != nil {
+		nextLLM.DefaultReasoningPolicy = *req.DefaultReasoningPolicy
 	}
 	if err := reconcileReasoningSelection(oldLLM, &nextLLM, req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})

@@ -21,6 +21,15 @@ const (
 	LLMModelCapabilityVideoGeneration = "video_generation"
 	LLMModelCapabilityEmbedding       = "embedding"
 
+	LLMReasoningSupportSupported   = "supported"
+	LLMReasoningSupportUnsupported = "unsupported"
+	LLMReasoningSupportUnknown     = "unknown"
+
+	LLMReasoningDialectEffort         = "reasoning_effort"
+	LLMReasoningDialectEnableThinking = "enable_thinking"
+	LLMReasoningDialectThink          = "think"
+	LLMReasoningDialectThinking       = "thinking"
+
 	LLMEmbeddingProtocolOpenAI = "openai_embeddings"
 	LLMEmbeddingProtocolOllama = "ollama_embeddings"
 
@@ -43,6 +52,14 @@ var validLLMModelCapabilities = map[string]struct{}{
 	LLMModelCapabilityEmbedding:       {},
 }
 
+var validLLMReasoningEfforts = map[string]struct{}{
+	"low":    {},
+	"medium": {},
+	"high":   {},
+	"xhigh":  {},
+	"max":    {},
+}
+
 // LLMEmbeddingModelSpec is the immutable vector contract declared by one
 // provider model. Runtime availability and credentials are deliberately not
 // part of this persisted contract.
@@ -52,15 +69,25 @@ type LLMEmbeddingModelSpec struct {
 	Normalization string `yaml:"normalization,omitempty" json:"normalization,omitempty"`
 }
 
+// LLMReasoningControlSpec 保存精确模型的上游推理开关映射。
+type LLMReasoningControlSpec struct {
+	Dialect        string   `yaml:"dialect" json:"dialect"`
+	On             any      `yaml:"on" json:"on"`
+	Off            any      `yaml:"off" json:"off"`
+	AllowedEfforts []string `yaml:"allowed_efforts,omitempty" json:"allowed_efforts,omitempty"`
+}
+
 // LLMProviderModelSpec declares capabilities for one exact model ID.
 // Capabilities intentionally has no omitempty tag: explicit [] means
 // unclassified and must survive YAML/JSON round-trips.
 type LLMProviderModelSpec struct {
-	ID           string                 `yaml:"id" json:"id"`
-	DisplayName  string                 `yaml:"display_name,omitempty" json:"display_name,omitempty"`
-	IsCustom     bool                   `yaml:"is_custom,omitempty" json:"is_custom,omitempty"`
-	Capabilities []string               `yaml:"capabilities" json:"capabilities"`
-	Embedding    *LLMEmbeddingModelSpec `yaml:"embedding,omitempty" json:"embedding,omitempty"`
+	ID               string                   `yaml:"id" json:"id"`
+	DisplayName      string                   `yaml:"display_name,omitempty" json:"display_name,omitempty"`
+	IsCustom         bool                     `yaml:"is_custom,omitempty" json:"is_custom,omitempty"`
+	Capabilities     []string                 `yaml:"capabilities" json:"capabilities"`
+	ReasoningSupport string                   `yaml:"reasoning_support,omitempty" json:"reasoning_support,omitempty"`
+	ReasoningControl *LLMReasoningControlSpec `yaml:"reasoning_control,omitempty" json:"reasoning_control,omitempty"`
+	Embedding        *LLMEmbeddingModelSpec   `yaml:"embedding,omitempty" json:"embedding,omitempty"`
 }
 
 // NewProviderInstanceID creates a stable opaque provider identity. It contains
@@ -144,9 +171,10 @@ func MigrateOpenRouterEmbeddingModelSpec(modelID string) (LLMProviderModelSpec, 
 	switch modelID {
 	case OpenRouterNemotronEmbedFreeModelID, OpenRouterVLLEmbedFreeModelID:
 		return LLMProviderModelSpec{
-			ID:           modelID,
-			DisplayName:  modelID,
-			Capabilities: []string{LLMModelCapabilityEmbedding},
+			ID:               modelID,
+			DisplayName:      modelID,
+			Capabilities:     []string{LLMModelCapabilityEmbedding},
+			ReasoningSupport: LLMReasoningSupportUnknown,
 			Embedding: &LLMEmbeddingModelSpec{
 				Protocol:      LLMEmbeddingProtocolOpenAI,
 				Dimension:     2048,
@@ -177,10 +205,12 @@ func NormalizeProviderModelSpecs(provider LLMProviderConfig) (string, []LLMProvi
 					catalogSpec.DisplayName = spec.DisplayName
 				}
 				catalogSpec.IsCustom = spec.IsCustom
+				catalogSpec.ReasoningSupport = LLMReasoningSupportUnknown
+				catalogSpec.ReasoningControl = nil
 				specs[i] = catalogSpec
 				continue
 			}
-			specs[i] = cloneProviderModelSpec(spec)
+			specs[i] = normalizeProviderModelReasoning(cloneProviderModelSpec(spec))
 			if spec.Capabilities == nil {
 				specs[i].Capabilities = []string{LLMModelCapabilityText}
 			}
@@ -210,9 +240,10 @@ func NormalizeProviderModelSpecs(provider LLMProviderConfig) (string, []LLMProvi
 			continue
 		}
 		specs = append(specs, LLMProviderModelSpec{
-			ID:           modelID,
-			DisplayName:  modelID,
-			Capabilities: []string{LLMModelCapabilityText},
+			ID:               modelID,
+			DisplayName:      modelID,
+			Capabilities:     []string{LLMModelCapabilityText},
+			ReasoningSupport: LLMReasoningSupportUnknown,
 		})
 	}
 	return mode, specs
@@ -222,6 +253,32 @@ func NormalizeProviderModelSpecs(provider LLMProviderConfig) (string, []LLMProvi
 // infers from the provider name or arbitrary model-ID substrings.
 func ModelHasCapability(provider LLMProviderConfig, modelID, capability string) bool {
 	return ModelHasCapabilities(provider, modelID, capability)
+}
+
+// ModelReasoningSupport 只返回精确 model spec 中声明的三态能力，缺失或非法值均失败关闭。
+func ModelReasoningSupport(provider LLMProviderConfig, modelID string) string {
+	support, _ := ModelReasoningControl(provider, modelID)
+	return support
+}
+
+// ModelReasoningControl 返回精确模型归一化后的能力和独立控制映射。
+func ModelReasoningControl(provider LLMProviderConfig, modelID string) (string, *LLMReasoningControlSpec) {
+	if strings.TrimSpace(modelID) == "" {
+		return LLMReasoningSupportUnknown, nil
+	}
+	_, specs := NormalizeProviderModelSpecs(provider)
+	for _, spec := range specs {
+		if spec.ID != modelID {
+			continue
+		}
+		switch spec.ReasoningSupport {
+		case LLMReasoningSupportSupported, LLMReasoningSupportUnsupported, LLMReasoningSupportUnknown:
+			return spec.ReasoningSupport, cloneReasoningControl(spec.ReasoningControl)
+		default:
+			return LLMReasoningSupportUnknown, nil
+		}
+	}
+	return LLMReasoningSupportUnknown, nil
 }
 
 // ModelHasCapabilities checks one exact model against all required normalized
@@ -302,7 +359,15 @@ func ValidateProviderModelSpecs(provider LLMProviderConfig) error {
 		modelIDs[modelID] = struct{}{}
 	}
 
-	mode, specs := NormalizeProviderModelSpecs(provider)
+	mode := providerModelSpecsMode(provider)
+	if mode == LLMModelSpecsModeExplicit {
+		for i, spec := range provider.ModelSpecs {
+			if err := validateReasoningDeclaration(spec); err != nil {
+				return fmt.Errorf("model_specs[%d]: %w", i, err)
+			}
+		}
+	}
+	_, specs := NormalizeProviderModelSpecs(provider)
 	seenSpecs := make(map[string]struct{}, len(specs))
 	for i, spec := range specs {
 		if strings.TrimSpace(spec.ID) == "" || spec.ID != strings.TrimSpace(spec.ID) {
@@ -312,6 +377,11 @@ func ValidateProviderModelSpecs(provider LLMProviderConfig) error {
 			return fmt.Errorf("model_specs[%d].id=%q 重复", i, spec.ID)
 		}
 		seenSpecs[spec.ID] = struct{}{}
+		switch spec.ReasoningSupport {
+		case LLMReasoningSupportSupported, LLMReasoningSupportUnsupported, LLMReasoningSupportUnknown:
+		default:
+			return fmt.Errorf("model_specs[%d].reasoning_support=%q is invalid", i, spec.ReasoningSupport)
+		}
 		if mode == LLMModelSpecsModeExplicit {
 			if _, exists := modelIDs[spec.ID]; !exists {
 				return fmt.Errorf("model_specs[%d].id=%q 不在 models 中", i, spec.ID)
@@ -356,6 +426,144 @@ func ValidateProviderModelSpecs(provider LLMProviderConfig) error {
 	return nil
 }
 
+// normalizeReasoningSupport 只处理旧配置缺省值，不从 provider 或 model 名称推断能力。
+func normalizeReasoningSupport(support string) string {
+	if support == "" {
+		return LLMReasoningSupportUnknown
+	}
+	return support
+}
+
+func normalizeProviderModelReasoning(spec LLMProviderModelSpec) LLMProviderModelSpec {
+	spec.ReasoningSupport = normalizeReasoningSupport(spec.ReasoningSupport)
+	switch spec.ReasoningSupport {
+	case LLMReasoningSupportSupported:
+		if !validReasoningControl(spec.ReasoningControl) {
+			spec.ReasoningSupport = LLMReasoningSupportUnknown
+			spec.ReasoningControl = nil
+		}
+	case LLMReasoningSupportUnsupported, LLMReasoningSupportUnknown:
+		if spec.ReasoningControl != nil {
+			spec.ReasoningSupport = LLMReasoningSupportUnknown
+			spec.ReasoningControl = nil
+		}
+	default:
+		spec.ReasoningSupport = LLMReasoningSupportUnknown
+		spec.ReasoningControl = nil
+	}
+	return spec
+}
+
+func validateReasoningDeclaration(spec LLMProviderModelSpec) error {
+	support := normalizeReasoningSupport(spec.ReasoningSupport)
+	switch support {
+	case LLMReasoningSupportSupported:
+		if err := validateReasoningControl(spec.ReasoningControl); err != nil {
+			return fmt.Errorf("reasoning_support=supported requires a complete reasoning_control: %w", err)
+		}
+	case LLMReasoningSupportUnsupported, LLMReasoningSupportUnknown:
+		if spec.ReasoningControl != nil {
+			return fmt.Errorf("reasoning_support=%s must not declare reasoning_control", support)
+		}
+	default:
+		return fmt.Errorf("reasoning_support=%q is invalid", spec.ReasoningSupport)
+	}
+	return nil
+}
+
+func validReasoningControl(control *LLMReasoningControlSpec) bool {
+	return validateReasoningControl(control) == nil
+}
+
+func validateReasoningControl(control *LLMReasoningControlSpec) error {
+	if control == nil || control.On == nil || control.Off == nil {
+		return fmt.Errorf("reasoning_control is incomplete")
+	}
+	switch control.Dialect {
+	case LLMReasoningDialectEffort:
+		return validateReasoningAllowedEfforts(control)
+	case LLMReasoningDialectEnableThinking,
+		LLMReasoningDialectThink,
+		LLMReasoningDialectThinking:
+		if control.AllowedEfforts != nil {
+			return fmt.Errorf("reasoning_control.allowed_efforts is only valid for reasoning_effort")
+		}
+		return nil
+	default:
+		return fmt.Errorf("reasoning_control.dialect=%q is invalid", control.Dialect)
+	}
+}
+
+func validateReasoningAllowedEfforts(control *LLMReasoningControlSpec) error {
+	if control.AllowedEfforts == nil {
+		return nil
+	}
+	if len(control.AllowedEfforts) == 0 {
+		return fmt.Errorf("reasoning_control.allowed_efforts must not be empty")
+	}
+	seen := make(map[string]struct{}, len(control.AllowedEfforts))
+	for _, effort := range control.AllowedEfforts {
+		if _, valid := validLLMReasoningEfforts[effort]; !valid {
+			return fmt.Errorf("reasoning_control.allowed_efforts contains invalid value %q", effort)
+		}
+		if _, duplicate := seen[effort]; duplicate {
+			return fmt.Errorf("reasoning_control.allowed_efforts contains duplicate value %q", effort)
+		}
+		seen[effort] = struct{}{}
+	}
+	on, ok := control.On.(string)
+	if !ok {
+		return fmt.Errorf("reasoning_control.on must be a string when allowed_efforts is declared")
+	}
+	if _, allowed := seen[on]; !allowed {
+		return fmt.Errorf("reasoning_control.on=%q is not in allowed_efforts", on)
+	}
+	return nil
+}
+
+func cloneReasoningControl(control *LLMReasoningControlSpec) *LLMReasoningControlSpec {
+	if control == nil {
+		return nil
+	}
+	cloned := &LLMReasoningControlSpec{
+		Dialect: control.Dialect,
+		On:      cloneReasoningValue(control.On),
+		Off:     cloneReasoningValue(control.Off),
+	}
+	if control.AllowedEfforts != nil {
+		cloned.AllowedEfforts = append([]string(nil), control.AllowedEfforts...)
+		if len(control.AllowedEfforts) == 0 {
+			cloned.AllowedEfforts = make([]string, 0)
+		}
+	}
+	return cloned
+}
+
+func cloneReasoningValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(typed))
+		for key, item := range typed {
+			cloned[key] = cloneReasoningValue(item)
+		}
+		return cloned
+	case map[any]any:
+		cloned := make(map[any]any, len(typed))
+		for key, item := range typed {
+			cloned[key] = cloneReasoningValue(item)
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(typed))
+		for i, item := range typed {
+			cloned[i] = cloneReasoningValue(item)
+		}
+		return cloned
+	default:
+		return value
+	}
+}
+
 func providerModelSpecsMode(provider LLMProviderConfig) string {
 	if provider.ModelSpecsMode == LLMModelSpecsModeExplicit {
 		return LLMModelSpecsModeExplicit
@@ -378,5 +586,6 @@ func cloneProviderModelSpec(spec LLMProviderModelSpec) LLMProviderModelSpec {
 		embedding := *spec.Embedding
 		copy.Embedding = &embedding
 	}
+	copy.ReasoningControl = cloneReasoningControl(spec.ReasoningControl)
 	return copy
 }

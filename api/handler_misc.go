@@ -958,14 +958,15 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 
 // RegisterAgentRequest 注册/更新 Agent 请求
 type RegisterAgentRequest struct {
-	Name         string   `json:"name"`
-	DisplayName  string   `json:"display_name"`
-	Description  string   `json:"description"`
-	Model        string   `json:"model"`
-	Provider     string   `json:"provider"`
-	SystemPrompt string   `json:"system_prompt"`
-	Skills       []string `json:"skills"`
-	MaxTokens    int      `json:"max_tokens"`
+	Name            string                  `json:"name"`
+	DisplayName     string                  `json:"display_name"`
+	Description     string                  `json:"description"`
+	Model           string                  `json:"model"`
+	Provider        string                  `json:"provider"`
+	SystemPrompt    string                  `json:"system_prompt"`
+	Skills          []string                `json:"skills"`
+	MaxTokens       int                     `json:"max_tokens"`
+	ReasoningPolicy *config.ReasoningPolicy `json:"reasoning_policy"`
 	// Temperature 指针语义（BUG-20260703 P2-4）：缺席=未设跟随模型默认，显式 0=确定性采样。
 	Temperature *float64          `json:"temperature"`
 	Metadata    map[string]string `json:"metadata"`
@@ -993,15 +994,16 @@ func (o *OptionalFloat) UnmarshalJSON(data []byte) error {
 }
 
 type UpdateAgentRequest struct {
-	DisplayName  *string            `json:"display_name"`
-	Description  *string            `json:"description"`
-	Model        *string            `json:"model"`
-	Provider     *string            `json:"provider"`
-	SystemPrompt *string            `json:"system_prompt"`
-	Skills       *[]string          `json:"skills"`
-	MaxTokens    *int               `json:"max_tokens"`
-	Temperature  OptionalFloat      `json:"temperature"`
-	Metadata     *map[string]string `json:"metadata"`
+	DisplayName     *string                 `json:"display_name"`
+	Description     *string                 `json:"description"`
+	Model           *string                 `json:"model"`
+	Provider        *string                 `json:"provider"`
+	SystemPrompt    *string                 `json:"system_prompt"`
+	Skills          *[]string               `json:"skills"`
+	MaxTokens       *int                    `json:"max_tokens"`
+	ReasoningPolicy *config.ReasoningPolicy `json:"reasoning_policy"`
+	Temperature     OptionalFloat           `json:"temperature"`
+	Metadata        *map[string]string      `json:"metadata"`
 }
 
 var k12ProfileOwnedMetadataKeys = [...]string{
@@ -1043,6 +1045,23 @@ func validateAgentTemperature(t *float64) error {
 	if t != nil && (*t < 0 || *t > 2) {
 		return fmt.Errorf("temperature 必须在 [0,2] 区间")
 	}
+	return nil
+}
+
+func normalizeAPIReasoningPolicy(policy **config.ReasoningPolicy) error {
+	if policy == nil {
+		return fmt.Errorf("reasoning_policy destination is nil")
+	}
+	if *policy == nil {
+		inherit := config.ReasoningPolicy{Mode: config.ReasoningPolicyModeInherit}
+		*policy = &inherit
+		return nil
+	}
+	candidate := **policy
+	if err := candidate.Validate(true); err != nil {
+		return err
+	}
+	*policy = &candidate
 	return nil
 }
 
@@ -1178,16 +1197,21 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := router.AgentConfig{
-		Name:         req.Name,
-		DisplayName:  req.DisplayName,
-		Description:  req.Description,
-		Model:        req.Model,
-		Provider:     req.Provider,
-		SystemPrompt: req.SystemPrompt,
-		Skills:       req.Skills,
-		MaxTokens:    req.MaxTokens,
-		Temperature:  req.Temperature,
-		Metadata:     req.Metadata,
+		Name:            req.Name,
+		DisplayName:     req.DisplayName,
+		Description:     req.Description,
+		Model:           req.Model,
+		Provider:        req.Provider,
+		SystemPrompt:    req.SystemPrompt,
+		Skills:          req.Skills,
+		MaxTokens:       req.MaxTokens,
+		ReasoningPolicy: req.ReasoningPolicy,
+		Temperature:     req.Temperature,
+		Metadata:        req.Metadata,
+	}
+	if err := normalizeAPIReasoningPolicy(&cfg.ReasoningPolicy); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
 	}
 
 	if err := s.validateAgentMetadataCapabilities(cfg.Metadata); err != nil {
@@ -1265,6 +1289,13 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	if req.MaxTokens != nil {
 		cfg.MaxTokens = *req.MaxTokens
 	}
+	if req.ReasoningPolicy != nil {
+		cfg.ReasoningPolicy = req.ReasoningPolicy
+		if err := normalizeAPIReasoningPolicy(&cfg.ReasoningPolicy); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+	}
 	if req.Temperature.Present {
 		// 三态：null=清除回「未设」（Value=nil），数值=设置（BUG-20260703 P2-4）
 		if err := validateAgentTemperature(req.Temperature.Value); err != nil {
@@ -1313,6 +1344,9 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.MaxTokens != nil {
 			current.MaxTokens = cfg.MaxTokens
+		}
+		if req.ReasoningPolicy != nil {
+			current.ReasoningPolicy = cfg.ReasoningPolicy
 		}
 		if req.Temperature.Present {
 			current.Temperature = cfg.Temperature

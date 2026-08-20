@@ -61,6 +61,7 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 			skills       TEXT NOT NULL DEFAULT '[]',
 			max_tokens   INTEGER NOT NULL DEFAULT 0,
 			temperature  REAL,
+			reasoning_policy TEXT NOT NULL DEFAULT '{"mode":"inherit"}',
 			metadata     TEXT NOT NULL DEFAULT '{}',
 			is_default   INTEGER NOT NULL DEFAULT 0,
 			created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -98,6 +99,7 @@ func (s *SQLiteStore) Init(ctx context.Context) error {
 func (s *SQLiteStore) runMigrations(ctx context.Context) {
 	stmts := []string{
 		`ALTER TABLE agent_rules ADD COLUMN instance_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE agents ADD COLUMN reasoning_policy TEXT NOT NULL DEFAULT '{"mode":"inherit"}'`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -164,15 +166,18 @@ func (s *SQLiteStore) migrateAgentsTemperatureNullable(ctx context.Context) {
 			skills       TEXT NOT NULL DEFAULT '[]',
 			max_tokens   INTEGER NOT NULL DEFAULT 0,
 			temperature  REAL,
+			reasoning_policy TEXT NOT NULL DEFAULT '{"mode":"inherit"}',
 			metadata     TEXT NOT NULL DEFAULT '{}',
 			is_default   INTEGER NOT NULL DEFAULT 0,
 			created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`INSERT INTO agents_mig_tempnull
+			(name, display_name, description, model, provider, system_prompt, skills,
+			 max_tokens, temperature, reasoning_policy, metadata, is_default, created_at, updated_at)
 		 SELECT name, display_name, description, model, provider, system_prompt, skills,
 		        max_tokens, CASE WHEN temperature = 0 THEN NULL ELSE temperature END,
-		        metadata, is_default, created_at, updated_at
+		        reasoning_policy, metadata, is_default, created_at, updated_at
 		 FROM agents`,
 		`DROP TABLE agents`,
 		`ALTER TABLE agents_mig_tempnull RENAME TO agents`,
@@ -192,7 +197,7 @@ func (s *SQLiteStore) migrateAgentsTemperatureNullable(ctx context.Context) {
 func (s *SQLiteStore) LoadAgents(ctx context.Context) ([]AgentConfig, string, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT name, display_name, description, model, provider, system_prompt,
-		        skills, max_tokens, temperature, metadata, is_default
+		        skills, max_tokens, temperature, reasoning_policy, metadata, is_default
 		 FROM agents ORDER BY created_at`)
 	if err != nil {
 		return nil, "", err
@@ -203,18 +208,24 @@ func (s *SQLiteStore) LoadAgents(ctx context.Context) ([]AgentConfig, string, er
 	var defaultName string
 	for rows.Next() {
 		var a AgentConfig
-		var skillsJSON, metaJSON string
+		var skillsJSON, reasoningPolicyJSON, metaJSON string
 		var isDefault int
 		// temperature 可空（BUG-20260703 P2-4）：NULL=未设跟随模型默认，显式 0=确定性采样
 		var temperature sql.NullFloat64
 		if err := rows.Scan(&a.Name, &a.DisplayName, &a.Description, &a.Model,
 			&a.Provider, &a.SystemPrompt, &skillsJSON, &a.MaxTokens,
-			&temperature, &metaJSON, &isDefault); err != nil {
+			&temperature, &reasoningPolicyJSON, &metaJSON, &isDefault); err != nil {
 			return nil, "", err
 		}
 		if temperature.Valid {
 			v := temperature.Float64
 			a.Temperature = &v
+		}
+		if err := json.Unmarshal([]byte(reasoningPolicyJSON), &a.ReasoningPolicy); err != nil {
+			return nil, "", fmt.Errorf("decode agent %q reasoning_policy: %w", a.Name, err)
+		}
+		if err := normalizeAgentReasoningPolicy(&a); err != nil {
+			return nil, "", fmt.Errorf("load agent %q: %w", a.Name, err)
 		}
 		if err := json.Unmarshal([]byte(skillsJSON), &a.Skills); err != nil {
 			slog.Warn("failed to parse agent skills JSON", "agent", a.Name, "error", err)
@@ -235,6 +246,17 @@ type agentExecer interface {
 }
 
 func saveAgentVia(ctx context.Context, e agentExecer, a *AgentConfig) error {
+	if a == nil {
+		return fmt.Errorf("agent config is nil")
+	}
+	policy := AgentConfig{ReasoningPolicy: a.ReasoningPolicy}
+	if err := normalizeAgentReasoningPolicy(&policy); err != nil {
+		return err
+	}
+	reasoningPolicyJSON, err := json.Marshal(policy.ReasoningPolicy)
+	if err != nil {
+		return fmt.Errorf("encode agent reasoning_policy: %w", err)
+	}
 	skillsJSON, _ := json.Marshal(a.Skills)
 	if a.Skills == nil {
 		skillsJSON = []byte("[]")
@@ -244,18 +266,19 @@ func saveAgentVia(ctx context.Context, e agentExecer, a *AgentConfig) error {
 		metaJSON = []byte("{}")
 	}
 	now := time.Now()
-	_, err := e.ExecContext(ctx,
+	_, err = e.ExecContext(ctx,
 		`INSERT INTO agents (name, display_name, description, model, provider, system_prompt,
-		                     skills, max_tokens, temperature, metadata, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                     skills, max_tokens, temperature, reasoning_policy, metadata, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(name) DO UPDATE SET
 		    display_name=excluded.display_name, description=excluded.description,
 		    model=excluded.model, provider=excluded.provider,
 		    system_prompt=excluded.system_prompt, skills=excluded.skills,
 		    max_tokens=excluded.max_tokens, temperature=excluded.temperature,
-		    metadata=excluded.metadata, updated_at=excluded.updated_at`,
+		    reasoning_policy=excluded.reasoning_policy, metadata=excluded.metadata,
+		    updated_at=excluded.updated_at`,
 		a.Name, a.DisplayName, a.Description, a.Model, a.Provider, a.SystemPrompt,
-		string(skillsJSON), a.MaxTokens, a.Temperature, string(metaJSON), now, now,
+		string(skillsJSON), a.MaxTokens, a.Temperature, string(reasoningPolicyJSON), string(metaJSON), now, now,
 	)
 	return err
 }

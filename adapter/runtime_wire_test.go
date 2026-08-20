@@ -123,7 +123,11 @@ func TestRuntimeWireDropsNotExposedReasoningFromReplyChunkAndSSEJSON(t *testing.
 		t.Fatalf("SSE JSON leaked not_exposed reasoning: %s", raw)
 	}
 
-	public := NewRuntimeWire("msg-public", ReasoningDisclosure{Visibility: ReasoningNotExposed})
+	public := NewRuntimeWire("msg-public", ReasoningDisclosure{
+		Visibility: ReasoningNotExposed,
+		Provider:   "ollama",
+		Model:      "trusted-model",
+	})
 	visible := public.Decorate(&ReplyChunk{
 		Reasoning: "public provider summary",
 		ReasoningDisclosure: ReasoningDisclosure{

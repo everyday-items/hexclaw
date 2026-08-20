@@ -83,12 +83,15 @@ type SequencedRuntimeEvent struct {
 }
 
 type RuntimeSnapshot struct {
-	AssistantMessageID  string                  `json:"assistant_message_id"`
-	BackendMessageID    string                  `json:"backend_message_id"`
-	MessageID           string                  `json:"message_id"`
-	ReasoningDisclosure ReasoningDisclosure     `json:"reasoning_disclosure"`
-	RuntimeEvents       []SequencedRuntimeEvent `json:"runtime_events"`
-	LastSequence        uint64                  `json:"last_sequence"`
+	AssistantMessageID  string              `json:"assistant_message_id"`
+	BackendMessageID    string              `json:"backend_message_id"`
+	MessageID           string              `json:"message_id"`
+	ReasoningDisclosure ReasoningDisclosure `json:"reasoning_disclosure"`
+	// Reasoning 仅保存已由同一冻结路由证明可公开的增量摘要，供会话快照落库。
+	Reasoning        string                  `json:"-"`
+	ReasoningReceipt ReasoningReceipt        `json:"reasoning_receipt"`
+	RuntimeEvents    []SequencedRuntimeEvent `json:"runtime_events"`
+	LastSequence     uint64                  `json:"last_sequence"`
 }
 
 var safeRuntimeToolName = regexp.MustCompile(`^[A-Za-z0-9_.:-]+$`)
@@ -119,18 +122,49 @@ func NewToolRuntimeEvent(
 }
 
 type RuntimeWire struct {
-	mu         sync.Mutex
-	messageID  string
-	sequence   uint64
-	disclosure ReasoningDisclosure
-	events     []SequencedRuntimeEvent
+	mu              sync.Mutex
+	messageID       string
+	sequence        uint64
+	route           FrozenReasoningRoute
+	disclosure      ReasoningDisclosure
+	publicReasoning string
+	receipt         ReasoningReceipt
+	receiptSet      bool
+	events          []SequencedRuntimeEvent
 }
 
 func NewRuntimeWire(messageID string, disclosure ReasoningDisclosure) *RuntimeWire {
-	if disclosure.Visibility != ReasoningVisible {
-		disclosure = ReasoningDisclosure{Visibility: ReasoningNotExposed}
+	// 构造参数只冻结路由身份，不能自行把尚未收到的上游事实变成 visible。
+	route := FrozenReasoningRoute{Provider: disclosure.Provider, Model: disclosure.Model}
+	return &RuntimeWire{
+		messageID: messageID,
+		route:     route,
+		disclosure: ReasoningDisclosure{
+			Visibility: ReasoningNotExposed,
+			Provider:   route.Provider,
+			Model:      route.Model,
+		},
+		receipt: unknownReasoningReceipt(),
 	}
-	return &RuntimeWire{messageID: messageID, disclosure: disclosure}
+}
+
+func (w *RuntimeWire) hasTrustedVisibleDisclosure(disclosure ReasoningDisclosure) bool {
+	return disclosure.Visibility == ReasoningVisible &&
+		disclosure.Source != "" &&
+		disclosure.Dialect != "" &&
+		w.route.Provider != "" &&
+		w.route.Model != "" &&
+		disclosure.Provider == w.route.Provider &&
+		disclosure.Model == w.route.Model
+}
+
+func (w *RuntimeWire) clearPublicReasoning() {
+	w.publicReasoning = ""
+	w.disclosure = ReasoningDisclosure{
+		Visibility: ReasoningNotExposed,
+		Provider:   w.route.Provider,
+		Model:      w.route.Model,
+	}
 }
 
 func (w *RuntimeWire) Decorate(chunk *ReplyChunk) *ReplyChunk {
@@ -146,13 +180,42 @@ func (w *RuntimeWire) Decorate(chunk *ReplyChunk) *ReplyChunk {
 	copy.BackendMessageID = w.messageID
 	copy.MessageID = w.messageID
 	copy.Sequence = w.sequence
-	if copy.ReasoningDisclosure.Visibility == ReasoningVisible {
+	if w.hasTrustedVisibleDisclosure(copy.ReasoningDisclosure) {
 		w.disclosure = copy.ReasoningDisclosure
-	}
-	copy.ReasoningDisclosure = w.disclosure
-	if copy.ReasoningDisclosure.Visibility != ReasoningVisible {
+		if copy.Reasoning != "" {
+			w.publicReasoning += copy.Reasoning
+		}
+		copy.ReasoningDisclosure = w.disclosure
+	} else {
+		// 缺失、not_exposed 或与冻结 Provider/model 不一致的 reasoning 一律不出站。
+		if copy.Reasoning != "" || copy.ReasoningDisclosure.Visibility == ReasoningVisible {
+			w.clearPublicReasoning()
+		}
 		copy.Reasoning = ""
+		copy.ReasoningDisclosure = w.disclosure
 	}
+	if copy.ReasoningReceipt != nil {
+		if normalized := NormalizeReasoningReceipt(copy.ReasoningReceipt); copy.ReasoningReceipt.valid() {
+			if w.receiptSet {
+				w.receipt = mergeReasoningReceipt(w.receipt, normalized)
+			} else {
+				w.receipt = normalized
+				w.receiptSet = true
+			}
+		}
+	}
+	if copy.ReasoningEvidence != nil {
+		normalized := CollapseReasoningEvidence(*copy.ReasoningEvidence)
+		if w.receiptSet {
+			w.receipt = mergeReasoningReceipt(w.receipt, normalized)
+		} else {
+			w.receipt = normalized
+			w.receiptSet = true
+		}
+	}
+	receipt := w.receipt
+	copy.ReasoningReceipt = &receipt
+	copy.ReasoningEvidence = nil
 	if copy.Done && copy.RuntimeEvent == nil {
 		status := RuntimeTerminalCompleted
 		if copy.Error != nil {
@@ -189,6 +252,8 @@ func (w *RuntimeWire) Snapshot() RuntimeSnapshot {
 		BackendMessageID:    w.messageID,
 		MessageID:           w.messageID,
 		ReasoningDisclosure: w.disclosure,
+		Reasoning:           w.publicReasoning,
+		ReasoningReceipt:    w.receipt,
 		RuntimeEvents:       events,
 		LastSequence:        w.sequence,
 	}

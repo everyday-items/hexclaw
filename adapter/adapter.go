@@ -169,6 +169,8 @@ type Reply struct {
 	MessageID           string
 	LastSequence        uint64
 	ReasoningDisclosure ReasoningDisclosure
+	ReasoningReceipt    *ReasoningReceipt  `json:"reasoning_receipt,omitempty"`
+	ReasoningEvidence   *ReasoningEvidence `json:"-"`
 	RuntimeEvents       []SequencedRuntimeEvent
 }
 
@@ -198,6 +200,8 @@ type ReplyChunk struct {
 	MessageID           string              `json:"message_id,omitempty"`
 	Sequence            uint64              `json:"sequence,omitempty"`
 	ReasoningDisclosure ReasoningDisclosure `json:"reasoning_disclosure"`
+	ReasoningReceipt    *ReasoningReceipt   `json:"reasoning_receipt,omitempty"`
+	ReasoningEvidence   *ReasoningEvidence  `json:"-"`
 	RuntimeEvent        *RuntimeEvent       `json:"runtime_event,omitempty"`
 }
 
