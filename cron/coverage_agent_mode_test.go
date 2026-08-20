@@ -152,10 +152,20 @@ func TestMaybeSelfHeal_RecompilesAndQuota(t *testing.T) {
 	// agent job → early return (no script to recompile).
 	s.maybeSelfHeal(ctx, &Job{ID: "a", Spec: &JobSpec{Runtime: RuntimeAgent}}, &RunResult{})
 
-	// script job past the threshold → recompile + persist a 'healed' row.
-	job := &Job{ID: "h", Name: "heal job", SourcePrompt: "fetch x", Spec: &JobSpec{Runtime: RuntimeStarlark, Script: "old"}}
+	// script job past the threshold → recompile + persist a pending candidate.
+	job := &Job{
+		ID: "h", Name: "heal job", Type: JobTypeCron, Schedule: "@daily", UserID: "u1",
+		Status: StatusActive, SourcePrompt: "fetch x",
+		Spec: &JobSpec{Runtime: RuntimeStarlark, Script: "old"},
+	}
+	if err := s.AddJob(ctx, job); err != nil {
+		t.Fatalf("AddJob: %v", err)
+	}
 	seedFailures(t, s, "h", selfHealThreshold)
 	s.maybeSelfHeal(ctx, job, &RunResult{Error: "boom", Stderr: "trace"})
+	if handled := s.resolveSelfHealVerification(ctx, job, &RunResult{Status: "success"}); !handled {
+		t.Fatal("self-heal candidate verification should be handled")
+	}
 	var n int
 	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cron_job_runs WHERE job_id='h' AND status='healed'`).Scan(&n)
 	if n == 0 {

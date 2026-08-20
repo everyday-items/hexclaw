@@ -323,6 +323,13 @@ func (s *Scheduler) SetKBIngest(fn KBIngestFunc) {
 	}
 }
 
+// SetLoopbackCapabilityToken 为 Starlark 本机回环请求注入当前 Sidecar token。
+func (s *Scheduler) SetLoopbackCapabilityToken(token string) {
+	if eng, ok := s.engines[RuntimeStarlark].(*StarlarkEngine); ok {
+		eng.SetLoopbackCapabilityToken(token)
+	}
+}
+
 // engineFor resolves the script engine for a runtime, or nil for an unknown one.
 // Returning nil (rather than silently falling back to Starlark) lets executeJob
 // surface an explicit "no engine for runtime X" error instead of running, say, a
@@ -2124,6 +2131,7 @@ func (s *Scheduler) executeJob(job *Job) {
 	}
 
 	if result.Status == "success" {
+		s.resolveSelfHealVerification(dbCtx, job, result)
 		// §13.3(2) only_if_changed：产物与上次相同 → 跳过投递（执行已跑、取过数）。
 		// 否则按 deliver 目标投递（脚本与 agent 结果同走）。
 		if job.OnlyIfChanged && s.outputUnchangedForGeneration(job, result) {
@@ -2132,6 +2140,10 @@ func (s *Scheduler) executeJob(job *Job) {
 			s.deliverResult(job, result)
 		}
 	} else {
+		_, pendingHeal := s.selfHealPendingMarker(job)
+		if pendingHeal {
+			s.resolveSelfHealVerification(dbCtx, job, result)
+		}
 		// failure_deliver: route a failure summary to the job's dedicated
 		// failure channels; falls back to the existing throttled alert when unset.
 		// Additive to the existing alert/self-heal paths.
@@ -2140,7 +2152,7 @@ func (s *Scheduler) executeJob(job *Job) {
 			// Agent jobs have no script to recompile — alert on persistent failure
 			// instead of healing.
 			s.maybeAlertAgentFailure(dbCtx, job, result)
-		} else {
+		} else if !pendingHeal {
 			// Self-heal bridge: consecutive script failures past the threshold →
 			// recompile with the failure context (cooldown-window quota applies).
 			s.maybeSelfHeal(dbCtx, job, result)

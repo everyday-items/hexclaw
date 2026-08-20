@@ -148,7 +148,7 @@ func TestMaybeSelfHeal_RecompileAndCooldown(t *testing.T) {
 	defer db.Close()
 	ctx := context.Background()
 
-	healed := &JobSpec{Runtime: "python3", Script: "print('fixed')", TimeoutSec: 60}
+	healed := &JobSpec{Runtime: RuntimeStarlark, Script: "emit({\"status\": \"success\"})", TimeoutSec: 60}
 	c := &stubCompiler{ret: healed}
 	s := NewScheduler(db, c, NewScriptExecutor().WithWorkdir(t.TempDir()).WithVenvCache(t.TempDir()))
 	_ = s.Init(ctx)
@@ -176,23 +176,32 @@ func TestMaybeSelfHeal_RecompileAndCooldown(t *testing.T) {
 
 	s.maybeSelfHeal(ctx, job, &RunResult{Status: "error", Error: "boom", Stderr: "stderr-detail"})
 
-	if len(notices) != 1 || !strings.Contains(notices[0], "已自动修复") {
-		t.Errorf("自愈成功应推送通知: %v", notices)
+	if len(notices) != 1 || !strings.Contains(notices[0], "修复候选") {
+		t.Errorf("自愈候选应推送待验证通知: %v", notices)
 	}
-	// Review L6: a successful heal is not a warning.
-	if len(levels) != 1 || levels[0] != NotifyLevelSuccess {
-		t.Errorf("自愈成功通知应为 success 级别: %v", levels)
+	if len(levels) != 1 || levels[0] != NotifyLevelInfo {
+		t.Errorf("自愈候选通知应为 info 级别: %v", levels)
 	}
 
 	if !strings.Contains(c.last.Prompt, "自愈上下文") || !strings.Contains(c.last.Prompt, "stderr-detail") {
 		t.Errorf("重编译应携带失败上下文: %q", c.last.Prompt)
 	}
-	if got, _ := s.GetJob(ctx, job.ID); got.Spec.Script != "print('fixed')" {
+	if got, _ := s.GetJob(ctx, job.ID); got.Spec.Script != "emit({\"status\": \"success\"})" {
 		t.Errorf("内存 Spec 未更新: %q", got.Spec.Script)
 	}
 	history, _ := s.GetJobHistory(ctx, job.ID)
+	if history[0].Status != "heal_pending" {
+		t.Errorf("编译后应先写入 heal_pending 历史: %+v", history[0])
+	}
+
+	// 只有候选脚本完成一次真实执行后，才写入 healed。
+	s.executeJob(job)
+	history, _ = s.GetJobHistory(ctx, job.ID)
 	if history[0].Status != "healed" {
-		t.Errorf("应写入 healed 历史: %+v", history[0])
+		t.Errorf("真实执行成功后应写入 healed 历史: %+v", history[0])
+	}
+	if len(levels) != 2 || levels[1] != NotifyLevelSuccess || !strings.Contains(notices[1], "验证恢复") {
+		t.Errorf("真实验证成功应推送 success 通知: levels=%v notices=%v", levels, notices)
 	}
 
 	// Review M3: after a successful heal the failure window resets. A second
@@ -212,6 +221,7 @@ func TestMaybeSelfHeal_RecompileAndCooldown(t *testing.T) {
 	if !strings.Contains(c.last.Prompt, "boom-second") {
 		t.Errorf("窗口内第 2 次自愈应放行: %q", c.last.Prompt)
 	}
+	s.executeJob(job)
 
 	// 3 more fresh failures → third heal must be quota-blocked.
 	for i := 0; i < 3; i++ {

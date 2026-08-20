@@ -1,7 +1,7 @@
 package cron
 
 // BUG-20260611 (install-test finding #6): the self-heal bridge never fired in
-// production despite 4 consecutive failures — zero healed / heal_failed rows.
+// production despite 4 consecutive failures — zero heal_failed rows.
 //
 // Root cause: executeJob hands maybeSelfHeal its 10-second dbCtx (sized for
 // DB writes). The heal recompile derives its 2-minute timeout FROM that ctx,
@@ -13,7 +13,8 @@ package cron
 // this degraded branch.
 //
 // Contract: self-healing must run on its own context, independent of the
-// caller's DB-write deadline.
+// caller's DB-write deadline; a successful compile is only a candidate until
+// a later real execution verifies it.
 
 import (
 	"context"
@@ -80,7 +81,12 @@ func TestBug20260611_SelfHealSurvivesExpiredCallerCtx(t *testing.T) {
 		t.Fatalf("[BUG-20260611] heal recompile must not inherit the caller's expired ctx (compiled=%d)", comp.compiled)
 	}
 
-	// The healed history row must also survive the expired caller ctx.
+	// The candidate history row must also survive the expired caller ctx.
+	if handled := s.resolveSelfHealVerification(context.Background(), job, &RunResult{Status: "success"}); !handled {
+		t.Fatal("self-heal candidate verification should be handled")
+	}
+
+	// The verified healed history row must survive the expired caller ctx.
 	var healed int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM cron_job_runs WHERE job_id = ? AND status = 'healed'`, job.ID).Scan(&healed); err != nil {
 		t.Fatalf("query healed rows: %v", err)

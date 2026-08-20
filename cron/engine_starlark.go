@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/httpua"
@@ -29,11 +30,13 @@ import (
 // structural sandbox — the opposite of an AST denylist that must chase every new
 // escape.
 type StarlarkEngine struct {
-	client     *http.Client
-	maxBody    int64
-	stdoutTail int
-	kbIngest   KBIngestFunc
-	stateStore StateStore // §13.3(2) per-job 跨运行 KV，nil → state_get 返默认 / state_set 报错
+	client                  *http.Client
+	maxBody                 int64
+	stdoutTail              int
+	kbIngest                KBIngestFunc
+	stateStore              StateStore // §13.3(2) per-job 跨运行 KV，nil → state_get 返默认 / state_set 报错
+	capabilityMu            sync.RWMutex
+	loopbackCapabilityToken string
 }
 
 // KBIngestFunc persists a document into the local knowledge base in-process and
@@ -61,6 +64,19 @@ func NewStarlarkEngine() *StarlarkEngine {
 		maxBody:    starlarkMaxBody,
 		stdoutTail: 64 * 1024,
 	}
+}
+
+// SetLoopbackCapabilityToken 只在进程内保存本次 Sidecar 的回环鉴权 token。
+func (e *StarlarkEngine) SetLoopbackCapabilityToken(token string) {
+	e.capabilityMu.Lock()
+	e.loopbackCapabilityToken = strings.TrimSpace(token)
+	e.capabilityMu.Unlock()
+}
+
+func (e *StarlarkEngine) loopbackCapability() string {
+	e.capabilityMu.RLock()
+	defer e.capabilityMu.RUnlock()
+	return e.loopbackCapabilityToken
 }
 
 func (e *StarlarkEngine) Name() string    { return RuntimeStarlark }
@@ -362,6 +378,10 @@ func (e *StarlarkEngine) builtinHTTP(ctx context.Context, method string) func(*s
 				req.Header.Set(k, v)
 			}
 		}
+		// 回环鉴权由宿主覆盖脚本 header，token 不进入脚本或外部请求。
+		if token := e.loopbackCapability(); token != "" && isLoopbackURL(url) {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
 		resp, err := e.client.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", b.Name(), err)
@@ -372,6 +392,19 @@ func (e *StarlarkEngine) builtinHTTP(ctx context.Context, method string) func(*s
 		_ = out.SetKey(starlark.String("status"), starlark.MakeInt(resp.StatusCode))
 		_ = out.SetKey(starlark.String("body"), starlark.String(string(data)))
 		return out, nil
+	}
+}
+
+func isLoopbackURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return false
+	}
+	switch strings.ToLower(parsed.Hostname()) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
 	}
 }
 
