@@ -43,8 +43,13 @@ func (s *WeatherSkill) ToolDefinition() llm.ToolDefinition {
 	})
 }
 
+// trimWeatherTerminalQuestionMarks 移除天气自然问句末尾不参与意图或城市语义的问号。
+func trimWeatherTerminalQuestionMarks(input string) string {
+	return strings.TrimRight(strings.TrimSpace(input), "？?")
+}
+
 func (s *WeatherSkill) Match(content string) bool {
-	lower := strings.ToLower(strings.TrimSpace(content))
+	lower := strings.ToLower(trimWeatherTerminalQuestionMarks(content))
 
 	// 编程意图关键词 — 包含这些词时说明用户想写代码，不是查天气
 	codeIndicators := []string{
@@ -153,7 +158,8 @@ func (s *WeatherSkill) Execute(ctx context.Context, args map[string]any) (*skill
 }
 
 func extractCity(query string) string {
-	result := strings.TrimSpace(query)
+	query = trimWeatherTerminalQuestionMarks(query)
+	result := query
 	noiseWords := []string{
 		"查下", "查一下", "查询", "帮我查", "告诉我",
 		"今天", "明天", "后天", "现在", "最近", "未来", "7天", "七天",

@@ -330,6 +330,22 @@ func TestWeatherSkillMatch(t *testing.T) {
 	}
 }
 
+func TestWeatherSkillMatchIgnoresTerminalQuestionMarks(t *testing.T) {
+	s := NewWeatherSkill()
+
+	for _, input := range []string{
+		"杭州明天天气怎么样",
+		"杭州明天天气怎么样？",
+		"杭州明天天气怎么样?",
+	} {
+		t.Run(input, func(t *testing.T) {
+			if !s.Match(input) {
+				t.Fatalf("末尾问号不应让天气查询漏过快速路径：%q", input)
+			}
+		})
+	}
+}
+
 // TestExtractCity 测试城市名提取
 func TestExtractCity(t *testing.T) {
 	tests := []struct {
@@ -349,6 +365,28 @@ func TestExtractCity(t *testing.T) {
 			got := extractCity(tt.input)
 			if got != tt.want {
 				t.Errorf("extractCity(%q) = %q, 期望 %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractCityIgnoresTerminalQuestionMarks(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"杭州明天天气怎么样", "杭州"},
+		{"杭州明天天气怎么样？", "杭州"},
+		{"杭州明天天气怎么样?", "杭州"},
+		{"天气北京", "北京"},
+		{"天气北京？", "北京"},
+		{"天气北京?", "北京"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := extractCity(tt.input); got != tt.want {
+				t.Fatalf("extractCity(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
 	}
