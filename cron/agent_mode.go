@@ -118,6 +118,20 @@ func (s *Scheduler) notify(job *Job, level, title, body string) {
 
 const selfHealPendingStateKey = "__self_heal_pending__"
 
+type selfHealPendingState struct {
+	CandidateHash string `json:"candidate_hash"`
+	PreviousSpec  string `json:"previous_spec"`
+}
+
+func decodeSelfHealPendingState(marker string) selfHealPendingState {
+	state := selfHealPendingState{CandidateHash: strings.TrimSpace(marker)}
+	var decoded selfHealPendingState
+	if err := json.Unmarshal([]byte(marker), &decoded); err == nil && strings.TrimSpace(decoded.CandidateHash) != "" {
+		return decoded
+	}
+	return state
+}
+
 func (s *Scheduler) selfHealPendingMarker(job *Job) (string, bool) {
 	if job == nil {
 		return "", false
@@ -166,6 +180,45 @@ func (s *Scheduler) clearSelfHealPending(job *Job) {
 	s.agent.mu.Unlock()
 }
 
+func (s *Scheduler) rollbackSelfHealCandidate(ctx context.Context, job *Job, state selfHealPendingState) error {
+	if strings.TrimSpace(state.PreviousSpec) == "" || job == nil || job.Spec == nil {
+		return nil
+	}
+	currentJSON, err := json.Marshal(job.Spec)
+	if err != nil {
+		return fmt.Errorf("marshal current self-heal candidate: %w", err)
+	}
+	if state.CandidateHash == "" || hashString(string(currentJSON)) != state.CandidateHash {
+		return nil
+	}
+	var previous JobSpec
+	if err := json.Unmarshal([]byte(state.PreviousSpec), &previous); err != nil {
+		return fmt.Errorf("decode previous self-heal spec: %w", err)
+	}
+	if s.db != nil {
+		res, err := s.db.ExecContext(ctx,
+			`UPDATE cron_jobs SET spec_json = ? WHERE id = ? AND meta = ?`,
+			state.PreviousSpec, job.ID, serializeJobMeta(job))
+		if err != nil {
+			return fmt.Errorf("persist previous self-heal spec: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("self-heal rollback lost the current job generation")
+		}
+	}
+	s.mu.Lock()
+	if !s.currentJobGenerationLocked(job) {
+		s.mu.Unlock()
+		return fmt.Errorf("self-heal rollback lost the current job generation")
+	}
+	job.Spec = &previous
+	if current, ok := s.jobs[job.ID]; ok {
+		current.Spec = &previous
+	}
+	s.mu.Unlock()
+	return nil
+}
+
 // resolveSelfHealVerification 把候选脚本的下一次真实执行结果写入自愈状态。
 func (s *Scheduler) resolveSelfHealVerification(ctx context.Context, job *Job, result *RunResult) bool {
 	marker, pending := s.selfHealPendingMarker(job)
@@ -175,10 +228,11 @@ func (s *Scheduler) resolveSelfHealVerification(ctx context.Context, job *Job, r
 	if !s.jobGenerationCurrentFresh(job) {
 		return true
 	}
+	pendingState := decodeSelfHealPendingState(marker)
 	success := result != nil && result.Status == "success"
 	if success {
 		specJSON, err := json.Marshal(job.Spec)
-		if err != nil || hashString(string(specJSON)) != marker {
+		if err != nil || hashString(string(specJSON)) != pendingState.CandidateHash {
 			success = false
 			result = &RunResult{Status: "error", Error: "self-heal candidate was not persisted consistently"}
 		}
@@ -200,6 +254,11 @@ func (s *Scheduler) resolveSelfHealVerification(ctx context.Context, job *Job, r
 	} else if result != nil && strings.TrimSpace(result.Error) != "" {
 		errText += ": " + result.Error
 		body = fmt.Sprintf("「%s」自愈候选验证仍失败，请在自动化页面查看原因：%s", job.Name, clipForHeal(result.Error, 120))
+	}
+	if !success {
+		if err := s.rollbackSelfHealCandidate(ctx, job, pendingState); err != nil {
+			errText += "; rollback failed: " + err.Error()
+		}
 	}
 	persisted, err := s.persistHistoryForGeneration(ctx, job, status, resultText, errText, 0, now, "", "", 0, nil)
 	if err != nil || !persisted {
@@ -758,7 +817,21 @@ func (s *Scheduler) maybeSelfHeal(_ context.Context, job *Job, lastResult *RunRe
 		slog.Warn("[cron-heal] spec marshal failed", "source", "cron", "id", job.ID, "err", err.Error())
 		return
 	}
-	if err := s.setSelfHealPending(job, hashString(string(specJSON))); err != nil {
+	previousSpecJSON, err := json.Marshal(job.Spec)
+	if err != nil {
+		slog.Warn("[cron-heal] previous spec marshal failed", "source", "cron", "id", job.ID, "err", err.Error())
+		return
+	}
+	pendingState := selfHealPendingState{
+		CandidateHash: hashString(string(specJSON)),
+		PreviousSpec:  string(previousSpecJSON),
+	}
+	pendingMarker, err := json.Marshal(pendingState)
+	if err != nil {
+		slog.Warn("[cron-heal] pending marker marshal failed", "source", "cron", "id", job.ID, "err", err.Error())
+		return
+	}
+	if err := s.setSelfHealPending(job, string(pendingMarker)); err != nil {
 		slog.Warn("[cron-heal] pending marker persist failed", "source", "cron", "id", job.ID, "err", err.Error())
 		persisted, _ := s.persistHistoryForGeneration(ctx, job, "heal_failed", "", "self-heal candidate marker persist failed: "+err.Error(), 0, now, "", "", 0, nil)
 		if persisted && s.shouldNotifyHealFailure(job.ID) {

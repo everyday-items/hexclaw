@@ -62,3 +62,54 @@ func TestBug20260820_SelfHealRequiresVerifiedExecution(t *testing.T) {
 		t.Fatalf("successful verification should append healed, statuses=%v", statuses)
 	}
 }
+
+// RED: 候选真实执行失败时，不能把失败候选继续留在任务主配置中。
+func TestBug20260820_SelfHealFailureRollsBackCandidate(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	const originalScript = `emit({"status":"error", "error":"original failure"})`
+	compiler := &stubCompiler{ret: &JobSpec{
+		Runtime:    RuntimeStarlark,
+		Script:     `emit({"status":"error", "error":"candidate failure"})`,
+		TimeoutSec: 10,
+	}}
+	s := NewScheduler(db, compiler, NewScriptExecutor().WithWorkdir(t.TempDir()).WithVenvCache(t.TempDir()))
+	if err := s.Init(ctx); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	job := &Job{
+		Name:         "K12 回滚验证",
+		Type:         JobTypeCron,
+		Schedule:     "@daily",
+		UserID:       "u1",
+		Status:       StatusActive,
+		SourcePrompt: "每周汇总错题并投递到会话",
+		Spec:         &JobSpec{Runtime: RuntimeStarlark, Script: originalScript, TimeoutSec: 10},
+	}
+	if err := s.AddJob(ctx, job); err != nil {
+		t.Fatalf("AddJob: %v", err)
+	}
+	for i := 0; i < selfHealThreshold; i++ {
+		_ = s.persistHistory(ctx, job.ID, "error", "", "original failure", 10,
+			time.Now().Add(-time.Duration(selfHealThreshold-i)*time.Second), "", "", 1, nil)
+	}
+
+	s.maybeSelfHeal(ctx, job, &RunResult{Status: "error", Error: "original failure"})
+	s.executeJob(job)
+
+	got, ok := s.GetJob(ctx, job.ID)
+	if !ok {
+		t.Fatalf("GetJob: job not found")
+	}
+	if got.Spec == nil || got.Spec.Script != originalScript {
+		t.Fatalf("failed candidate must roll back to the original script, got=%q", got.Spec.Script)
+	}
+	history, err := s.GetJobHistory(ctx, job.ID)
+	if err != nil || len(history) == 0 {
+		t.Fatalf("history missing: err=%v history=%+v", err, history)
+	}
+	if history[0].Status != "heal_failed" || !strings.Contains(history[0].Error, "candidate failure") {
+		t.Fatalf("failed verification must record heal_failed with the candidate error: %+v", history[0])
+	}
+}
