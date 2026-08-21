@@ -528,6 +528,9 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 	reasoningCount := 0
 	var canonical strings.Builder
 	for chunk := range chunks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if chunk.Error != nil {
 			if requestID != "" && a.streams != nil {
 				a.streams.Append(requestID, chunk)
@@ -562,6 +565,9 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 		}
 		if requestID != "" && a.streams != nil {
 			a.streams.Append(requestID, chunk)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
 		msg := wsMessage{
@@ -604,6 +610,9 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 				a.bindSession(msg.SessionID, chatID, owner.(string))
 			}
 			a.sessionRequests.Store(msg.SessionID, requestID)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		if err := a.sendToTargets(ctx, chatID, requestID, msg); err != nil {
 			return err

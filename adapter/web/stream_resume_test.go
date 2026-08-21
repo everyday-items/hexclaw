@@ -133,6 +133,57 @@ func TestWebAdapter_StreamMessagesIncludeSessionAndRequestID(t *testing.T) {
 	}
 }
 
+func TestWebAdapter_CancelSuppressesLateStreamTerminal(t *testing.T) {
+	a := New()
+	chunks := make(chan *adapter.ReplyChunk, 2)
+	cancelObserved := make(chan struct{})
+	a.SetStreamHandler(func(ctx context.Context, _ *adapter.Message) (<-chan *adapter.ReplyChunk, error) {
+		go func() {
+			<-ctx.Done()
+			close(cancelObserved)
+		}()
+		return chunks, nil
+	})
+
+	conn, ctx, _ := dialWebAdapter(t, a)
+	if err := wsjson.Write(ctx, conn, wsMessage{
+		Type: "message", Content: "cancel late", SessionID: "sess-cancel-late", RequestID: "req-cancel-late", UserID: "desktop-user",
+	}); err != nil {
+		t.Fatalf("send ws message failed: %v", err)
+	}
+
+	chunks <- &adapter.ReplyChunk{Content: "首帧"}
+	var first wsMessage
+	if err := wsjson.Read(ctx, conn, &first); err != nil {
+		t.Fatalf("read first chunk failed: %v", err)
+	}
+	if first.Content != "首帧" || first.Done {
+		t.Fatalf("first chunk = %+v", first)
+	}
+
+	if err := wsjson.Write(ctx, conn, wsMessage{
+		Type: "cancel", SessionID: "sess-cancel-late", RequestID: "req-cancel-late", UserID: "desktop-user",
+	}); err != nil {
+		t.Fatalf("send cancel failed: %v", err)
+	}
+	select {
+	case <-cancelObserved:
+	case <-time.After(time.Second):
+		t.Fatal("stream handler context was not cancelled")
+	}
+
+	// 模拟 Provider 忽略取消并晚到 terminal；取消后的事实不得再次投影给 Desktop。
+	chunks <- &adapter.ReplyChunk{Content: "late success", Done: true}
+	close(chunks)
+
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancelRead()
+	var late wsMessage
+	if err := wsjson.Read(readCtx, conn, &late); err == nil {
+		t.Fatalf("late terminal was sent after cancel: %+v", late)
+	}
+}
+
 func TestWebAdapter_ResumeStreamSendsSnapshotAndContinuesStreaming(t *testing.T) {
 	a := New()
 	chunks := make(chan *adapter.ReplyChunk, 4)

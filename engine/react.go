@@ -2369,6 +2369,9 @@ func (e *ReActEngine) processStreamRuntime(
 			ch <- &adapter.ReplyChunk{Error: fmt.Errorf("runtime stream 未返回结果"), Done: true}
 			return
 		}
+		if ctx.Err() != nil {
+			return
+		}
 		sink.notifyStarted(nil)
 
 		providerName := selection.providerName
@@ -2395,6 +2398,9 @@ func (e *ReActEngine) processStreamRuntime(
 		// 克隆 msg.Metadata 作 msgMeta 并经 buildReplyMetadata 转发（record chip 等）。
 		applyToolReplyMeta(streamCtx, msg)
 		finalContent, streamTail, metadata, usage, toolCalls := e.finalizeRuntimeStreamResult(ctx, sessionID, msg, provider, req, result, providerName, modelName, cacheInput, maxTurnsHit, sink.thinkingDuration())
+		if ctx.Err() != nil {
+			return
+		}
 		if finalContent != "" && !sink.sentContent {
 			ch <- &adapter.ReplyChunk{Content: finalContent}
 		} else if streamTail != "" {
@@ -2560,6 +2566,9 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 	maxTurnsHit bool,
 	thinkingDuration int,
 ) (string, string, map[string]string, *adapter.Usage, []adapter.ToolCall) {
+	if ctx.Err() != nil {
+		return "", "", nil, nil, nil
+	}
 	msgMeta := cloneStringMap(msg.Metadata)
 	if sessionID != "" {
 		msgMeta["session_id"] = sessionID
@@ -3017,6 +3026,9 @@ func (e *ReActEngine) pipeStream(
 
 	// 获取最终结果（含 Usage 统计）
 	result := llmStream.Result()
+	if ctx.Err() != nil {
+		return
+	}
 
 	content := fullContent.String()
 	generatedContent := false
@@ -3245,6 +3257,9 @@ func (e *ReActEngine) pipeStreamWithTools(
 	}
 
 	result := llmStream.Result()
+	if ctx.Err() != nil {
+		return
+	}
 	content := fullContent.String()
 	generatedContent := false
 	// This path already executed the accumulated toolCalls from previous turns.

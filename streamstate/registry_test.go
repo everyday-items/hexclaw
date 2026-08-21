@@ -115,6 +115,10 @@ func TestRegistry_FailAndCancel(t *testing.T) {
 	if s2 == nil || s2.Status != StatusCancelled {
 		t.Fatalf("Cancel 后应 cancelled, 实际 %+v", s2)
 	}
+	late := r.Append("reqC", &adapter.ReplyChunk{Content: "late success", Done: true})
+	if late == nil || late.Status != StatusCancelled || late.Content != "" || late.Status == StatusCompleted {
+		t.Fatalf("取消后的晚到 chunk 改变了终态: %+v", late)
+	}
 
 	// 未知 requestID 应返回 nil
 	if r.Fail("nope", errors.New("x")) != nil {

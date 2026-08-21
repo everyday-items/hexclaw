@@ -119,6 +119,10 @@ func (r *Registry) Append(requestID string, chunk *adapter.ReplyChunk) *Snapshot
 	if !ok {
 		return nil
 	}
+	if item.Done && item.Status == StatusCancelled {
+		copy := cloneSnapshot(item)
+		return &copy
+	}
 	chunkMessageID, validIdentity := runtimeChunkMessageID(chunk)
 	if !validIdentity {
 		copy := cloneSnapshot(item)
