@@ -20,7 +20,8 @@ const (
 )
 
 // TestBUG20260728ProviderProbeReceipt_RealHexClawGPT 是显式启用的测试：
-// 它通过生产连接测试链路，仅将本地明确配置的 Provider 加载到进程内存中。
+// 它通过生产连接测试链路，仅将本地明确配置的 Provider 加载到进程内存中，
+// 并使用该 Provider 当前选中的模型。
 // 测试不会记录、序列化或写入凭据、端点及 Provider 标识。
 func TestBUG20260728ProviderProbeReceipt_RealHexClawGPT(t *testing.T) {
 	if strings.TrimSpace(os.Getenv(bug20260728LiveProviderProbeGate)) != "1" {
@@ -51,13 +52,14 @@ func TestBUG20260728ProviderProbeReceipt_RealHexClawGPT(t *testing.T) {
 	first := &Server{cfg: cfg, store: store}
 	probe := bug20260728RunLiveProviderProbe(t, first, providerInstanceID)
 	if ok, _ := probe["ok"].(bool); !ok {
-		t.Fatal("real HexClaw-GPT gpt-5.6-sol connection probe did not succeed")
+		t.Fatal("real HexClaw-GPT connection probe did not succeed")
 	}
 	if persisted, _ := probe["persisted"].(bool); !persisted {
 		t.Fatal("real provider probe did not persist its receipt")
 	}
-	if model, _ := probe["model"].(string); model != "gpt-5.6-sol" {
-		t.Fatalf("real provider probe model=%q, want gpt-5.6-sol", model)
+	expectedModel := strings.TrimSpace(provider.Model)
+	if model, _ := probe["model"].(string); model != expectedModel {
+		t.Fatalf("real provider probe model=%q, want configured model %q", model, expectedModel)
 	}
 	if testedAt, _ := probe["tested_at"].(float64); testedAt <= 0 {
 		t.Fatal("real provider probe response has no tested_at receipt timestamp")
@@ -81,7 +83,7 @@ func TestBUG20260728ProviderProbeReceipt_RealHexClawGPT(t *testing.T) {
 		t.Fatal("restored receipt has no tested_at timestamp")
 	}
 
-	t.Logf("REAL_PROVIDER_PROBE_PASS provider=HexClaw-GPT model=gpt-5.6-sol latency_ms=%.0f", probe["latency_ms"])
+	t.Logf("REAL_PROVIDER_PROBE_PASS provider=HexClaw-GPT model=%s latency_ms=%.0f", expectedModel, probe["latency_ms"])
 }
 
 func bug20260728DesktopConfigPath(t *testing.T) string {
@@ -101,17 +103,17 @@ func bug20260728FindLiveProvider(t *testing.T, cfg *config.Config) (string, stri
 	var providerKey, providerInstanceID string
 	for key, provider := range cfg.LLM.Providers {
 		if !strings.EqualFold(strings.TrimSpace(key), "hexclaw-gpt") ||
-			strings.TrimSpace(provider.Model) != "gpt-5.6-sol" {
+			strings.TrimSpace(provider.Model) == "" {
 			continue
 		}
 		if providerKey != "" {
-			t.Fatal("multiple local HexClaw-GPT gpt-5.6-sol providers are configured")
+			t.Fatal("multiple local HexClaw-GPT providers are configured")
 		}
 		providerKey = key
 		providerInstanceID = config.EffectiveProviderInstanceID(key, provider)
 	}
 	if providerKey == "" || providerInstanceID == "" {
-		t.Fatal("the required local HexClaw-GPT gpt-5.6-sol provider is not configured")
+		t.Fatal("the required local HexClaw-GPT provider with a selected model is not configured")
 	}
 	return providerKey, providerInstanceID
 }

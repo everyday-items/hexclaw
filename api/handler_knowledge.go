@@ -620,6 +620,18 @@ func (s *Server) handleGetDocument(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if vectorService, vectorOK := s.semanticIndex.(KnowledgeDocumentVectorProjectionAPI); vectorOK {
+		vectors, vectorErr := vectorService.ListDocumentVectorProjections(
+			r.Context(), knowledgePrincipalID(r), knowledgeDefaultCorpusID,
+		)
+		if vectorErr != nil && !errors.Is(vectorErr, knowledge.ErrSemanticIndexNotFound) {
+			writeSemanticIndexError(w, vectorErr)
+			return
+		}
+		if vector, found := vectors[doc.ID]; found {
+			applyKnowledgeDocumentVectorProjection(doc, vector)
+		}
+	}
 
 	writeJSON(w, http.StatusOK, doc)
 }

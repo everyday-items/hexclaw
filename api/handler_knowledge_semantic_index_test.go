@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/knowledge"
+	"github.com/hexagon-codes/hexclaw/skill"
 )
 
 type semanticIndexServiceStub struct {
@@ -348,5 +350,107 @@ func TestSemanticIndexValidationErrorsAreClientErrors(t *testing.T) {
 	}
 	if rec.Code != http.StatusNotFound || payload["code"] != "semantic_index_not_found" {
 		t.Fatalf("not-found contract status=%d payload=%v", rec.Code, payload)
+	}
+}
+
+func newAuthenticatedSemanticIndexApplyRequest(t *testing.T, corpusID, body string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequestWithContext(
+		skill.WithAuthenticatedUser(t.Context(), "authenticated-owner"),
+		http.MethodPost,
+		"/api/v1/knowledge/corpora/"+corpusID+"/embedding-policy:apply?user_id=forged-query-owner",
+		strings.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("corpus_id", corpusID)
+	return req
+}
+
+func TestSemanticIndexApplyUsesAuthenticatedOwnerAndRejectsForgedBodyUser(t *testing.T) {
+	var gotOwner, gotCorpus string
+	var gotVersion int64
+	var gotSelection knowledge.EmbeddingSelection
+	stub := &semanticIndexServiceStub{
+		applyFn: func(_ context.Context, ownerID, corpusID string, expectedVersion int64, selection knowledge.EmbeddingSelection) (knowledge.ApplyPolicyResult, error) {
+			gotOwner, gotCorpus = ownerID, corpusID
+			gotVersion, gotSelection = expectedVersion, selection
+			return knowledge.ApplyPolicyResult{}, nil
+		},
+	}
+	srv := NewServer(config.DefaultConfig(), nil, nil, nil)
+	srv.SetSemanticIndexService(stub)
+
+	rec := httptest.NewRecorder()
+	srv.handleApplyKnowledgeEmbeddingPolicy(rec, newAuthenticatedSemanticIndexApplyRequest(t, "default",
+		`{"expected_policy_version":17,"selection":{"kind":"profile","profile_id":"failed-explicit-profile"}}`))
+	if rec.Code != http.StatusOK || gotOwner != "authenticated-owner" || gotCorpus != "default" ||
+		gotVersion != 17 || gotSelection != (knowledge.EmbeddingSelection{Kind: knowledge.EmbeddingSelectionProfile, ProfileID: "failed-explicit-profile"}) {
+		t.Fatalf("valid apply status=%d owner=%q corpus=%q version=%d selection=%+v", rec.Code, gotOwner, gotCorpus, gotVersion, gotSelection)
+	}
+
+	rec = httptest.NewRecorder()
+	srv.handleApplyKnowledgeEmbeddingPolicy(rec, newAuthenticatedSemanticIndexApplyRequest(t, "default",
+		`{"expected_policy_version":17,"selection":{"kind":"profile","profile_id":"failed-explicit-profile"},"user_id":"forged-body-owner"}`))
+	var payload map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusBadRequest || stub.applyCalls != 1 || !strings.Contains(payload["error"], `unknown field "user_id"`) {
+		t.Fatalf("forged body status=%d payload=%v apply_calls=%d", rec.Code, payload, stub.applyCalls)
+	}
+}
+
+func TestSemanticIndexApplyRejectsNonDefaultCorpusBeforeService(t *testing.T) {
+	stub := &semanticIndexServiceStub{
+		applyFn: func(context.Context, string, string, int64, knowledge.EmbeddingSelection) (knowledge.ApplyPolicyResult, error) {
+			t.Fatal("unsupported corpus must not reach semantic-index service")
+			return knowledge.ApplyPolicyResult{}, nil
+		},
+	}
+	srv := NewServer(config.DefaultConfig(), nil, nil, nil)
+	srv.SetSemanticIndexService(stub)
+
+	rec := httptest.NewRecorder()
+	srv.handleApplyKnowledgeEmbeddingPolicy(rec, newAuthenticatedSemanticIndexApplyRequest(t, "non-default",
+		`{"expected_policy_version":17,"selection":{"kind":"disabled"}}`))
+	var payload map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusUnprocessableEntity || payload["code"] != "knowledge_scope_unsupported" || stub.applyCalls != 0 {
+		t.Fatalf("unsupported corpus status=%d payload=%v apply_calls=%d", rec.Code, payload, stub.applyCalls)
+	}
+}
+
+func TestSemanticIndexApplyExplicitProfileFailureIsScopedAndSanitized(t *testing.T) {
+	const internalError = "sqlite: private provider failure"
+	var gotOwner, gotCorpus string
+	var gotVersion int64
+	var gotSelection knowledge.EmbeddingSelection
+	stub := &semanticIndexServiceStub{
+		applyFn: func(_ context.Context, ownerID, corpusID string, expectedVersion int64, selection knowledge.EmbeddingSelection) (knowledge.ApplyPolicyResult, error) {
+			gotOwner, gotCorpus = ownerID, corpusID
+			gotVersion, gotSelection = expectedVersion, selection
+			return knowledge.ApplyPolicyResult{}, errors.New(internalError)
+		},
+	}
+	srv := NewServer(config.DefaultConfig(), nil, nil, nil)
+	srv.SetSemanticIndexService(stub)
+
+	rec := httptest.NewRecorder()
+	srv.handleApplyKnowledgeEmbeddingPolicy(rec, newAuthenticatedSemanticIndexApplyRequest(t, "default",
+		`{"expected_policy_version":23,"selection":{"kind":"profile","profile_id":"failed-explicit-profile"}}`))
+	rawBody := rec.Body.String()
+	var payload map[string]string
+	if err := json.NewDecoder(strings.NewReader(rawBody)).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusInternalServerError || payload["code"] != "semantic_index_internal" ||
+		payload["error"] != "semantic index temporarily unavailable" || strings.Contains(rawBody, internalError) {
+		t.Fatalf("failed explicit apply status=%d payload=%v", rec.Code, payload)
+	}
+	if gotOwner != "authenticated-owner" || gotCorpus != "default" || gotVersion != 23 ||
+		gotSelection != (knowledge.EmbeddingSelection{Kind: knowledge.EmbeddingSelectionProfile, ProfileID: "failed-explicit-profile"}) {
+		t.Fatalf("failed explicit apply args owner=%q corpus=%q version=%d selection=%+v", gotOwner, gotCorpus, gotVersion, gotSelection)
 	}
 }

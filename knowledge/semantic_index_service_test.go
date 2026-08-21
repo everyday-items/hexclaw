@@ -780,6 +780,165 @@ func TestSemanticIndexFailedDesiredCanBeExplicitlyCancelled(t *testing.T) {
 	}
 }
 
+func TestSemanticIndexFailedExplicitProfileApplyRestagesWithoutReplayingOutcomeUnknown(t *testing.T) {
+	h := newSemanticHarness(t)
+	boot, err := h.service.EnsureDefaultPolicy(h.ctx, "owner-1", "default")
+	if err != nil || boot.ActiveRevisionID == nil {
+		t.Fatalf("bootstrap active revision: result=%+v err=%v", boot, err)
+	}
+	if _, err := h.db.ExecContext(h.ctx, `INSERT INTO kb_documents(id,title,content,deleted)
+		VALUES('retry-explicit-profile-doc','Retry explicit profile','alpha',0)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.ExecContext(h.ctx, `INSERT INTO kb_chunks(id,doc_id,content,chunk_index,embedding)
+		VALUES('retry-explicit-profile-chunk','retry-explicit-profile-doc','alpha',0,NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.repo.BindLegacyDefaultCorpus(h.ctx, "owner-1", "default"); err != nil {
+		t.Fatalf("bind retry document: %v", err)
+	}
+
+	// 活跃 revision 的补偿任务与下面的 staged rebuild 无关，先清理以确保
+	// fake worker 确定性地领取 rebuild root。
+	var activeJobID string
+	if err := h.db.QueryRowContext(h.ctx, `SELECT job_id FROM kb_knowledge_jobs
+		WHERE kind='embed_document' AND document_id='retry-explicit-profile-doc' AND state='queued'`).Scan(&activeJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.CancelJob(h.ctx, "owner-1", activeJobID); err != nil {
+		t.Fatalf("clear active catch-up job: %v", err)
+	}
+
+	policy, err := h.service.GetPolicy(h.ctx, "owner-1", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := EmbeddingSelection{Kind: EmbeddingSelectionProfile, ProfileID: "profile-b"}
+	staged, err := h.service.ApplyPolicy(h.ctx, "owner-1", "default", policy.PolicyVersion, selection)
+	if err != nil || staged.JobID == nil || staged.DesiredRevisionID == nil ||
+		staged.Branch != ApplyPolicyStagedRebuild {
+		t.Fatalf("stage explicit profile rebuild: result=%+v err=%v", staged, err)
+	}
+
+	now := time.Unix(1_800_450_000, 0).UTC()
+	config := workerConfig(&now, "worker-outcome-unknown-before-restage", 1)
+	config.EmbeddingTimeout = 10 * time.Millisecond
+	oldWorker := NewSemanticIndexWorker(h.repo, &workerExecutorRegistry{executors: map[string]ProfileEmbeddingExecutor{
+		"profile-b": &contextBlockingWorkerExecutor{},
+	}}, config)
+	processed, runErr := oldWorker.RunOnce(h.ctx)
+	if !processed || !errors.Is(runErr, ErrEmbeddingBatchOutcomeUnknown) {
+		t.Fatalf("fake provider timeout must leave outcome unknown: processed=%v err=%v", processed, runErr)
+	}
+
+	type preservedBatch struct {
+		batchID, state, requestKey, lastError string
+		attempts                              int64
+	}
+	loadOldBatch := func() preservedBatch {
+		t.Helper()
+		var batch preservedBatch
+		if err := h.db.QueryRowContext(h.ctx, `SELECT batch_id,state,client_request_key,last_error,attempts
+			FROM kb_embedding_batch_manifests WHERE job_id=?`, *staged.JobID).Scan(
+			&batch.batchID, &batch.state, &batch.requestKey, &batch.lastError, &batch.attempts,
+		); err != nil {
+			t.Fatal(err)
+		}
+		return batch
+	}
+	type preservedJob struct {
+		state, targetRevisionID, lastError string
+		attempt                            int
+		cancelRequested                    bool
+	}
+	loadOldJob := func() preservedJob {
+		t.Helper()
+		job, err := h.service.GetJob(h.ctx, "owner-1", *staged.JobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return preservedJob{
+			state: string(job.State), targetRevisionID: job.TargetRevisionID, lastError: job.LastError,
+			attempt: job.Attempt, cancelRequested: job.CancelRequested,
+		}
+	}
+	oldBatch := loadOldBatch()
+	oldJob := loadOldJob()
+	if oldBatch.state != string(EmbeddingBatchOutcomeUnknown) || oldJob.state != string(KnowledgeJobFailed) ||
+		oldJob.targetRevisionID != *staged.DesiredRevisionID {
+		t.Fatalf("failed root did not preserve outcome-unknown audit state: batch=%+v job=%+v", oldBatch, oldJob)
+	}
+
+	// 终态旧 root 不可再次领取；在用户显式创建新 revision/job 前，旧 provider
+	// 请求绝不会被恢复。
+	processed, runErr = oldWorker.RunOnce(h.ctx)
+	if processed || runErr != nil {
+		t.Fatalf("old failed root was unexpectedly resumed: processed=%v err=%v", processed, runErr)
+	}
+	if got := loadOldBatch(); got != oldBatch {
+		t.Fatalf("old outcome-unknown manifest changed after worker revisit: got=%+v want=%+v", got, oldBatch)
+	}
+
+	failed, err := h.service.GetPolicy(h.ctx, "owner-1", "default")
+	if err != nil || failed.ActiveRevision == nil || failed.DesiredRevision == nil ||
+		failed.DesiredRevision.State != VectorIndexFailed || failed.Selection != selection {
+		t.Fatalf("failed explicit policy projection: projection=%+v err=%v", failed, err)
+	}
+	if failed.ActiveRevision.RevisionID != *boot.ActiveRevisionID ||
+		failed.DesiredRevision.RevisionID != *staged.DesiredRevisionID {
+		t.Fatalf("failure changed active/desired revision unexpectedly: projection=%+v", failed)
+	}
+
+	retried, err := h.service.ApplyPolicy(h.ctx, "owner-1", "default", failed.PolicyVersion, failed.Selection)
+	if err != nil || retried.Branch != ApplyPolicyStagedRebuild || retried.JobID == nil ||
+		retried.DesiredRevisionID == nil || *retried.JobID == *staged.JobID ||
+		*retried.DesiredRevisionID == *staged.DesiredRevisionID ||
+		retried.PolicyVersion != failed.PolicyVersion+1 {
+		t.Fatalf("same explicit profile did not create one fresh staged rebuild: result=%+v err=%v", retried, err)
+	}
+	var newRootJobs int
+	if err := h.db.QueryRowContext(h.ctx, `SELECT COUNT(*) FROM kb_knowledge_jobs
+		WHERE kind='rebuild_revision' AND parent_job_id IS NULL AND target_revision_id=?`,
+		*retried.DesiredRevisionID).Scan(&newRootJobs); err != nil {
+		t.Fatal(err)
+	}
+	if newRootJobs != 1 {
+		t.Fatalf("fresh desired revision has %d root jobs, want exactly one", newRootJobs)
+	}
+	newJob, err := h.service.GetJob(h.ctx, "owner-1", *retried.JobID)
+	if err != nil || newJob.State != KnowledgeJobQueued || newJob.TargetRevisionID != *retried.DesiredRevisionID {
+		t.Fatalf("fresh staged root job: job=%+v err=%v", newJob, err)
+	}
+	if got := loadOldBatch(); got != oldBatch {
+		t.Fatalf("explicit restage rewrote old outcome-unknown manifest: got=%+v want=%+v", got, oldBatch)
+	}
+	if got := loadOldJob(); got != oldJob {
+		t.Fatalf("explicit restage rewrote old failed root: got=%+v want=%+v", got, oldJob)
+	}
+
+	afterRetry, err := h.service.GetPolicy(h.ctx, "owner-1", "default")
+	if err != nil || afterRetry.ActiveRevision == nil || afterRetry.DesiredRevision == nil ||
+		afterRetry.ActiveRevision.RevisionID != *boot.ActiveRevisionID ||
+		afterRetry.DesiredRevision.RevisionID != *retried.DesiredRevisionID {
+		t.Fatalf("restage did not retain active while publishing fresh desired: projection=%+v err=%v", afterRetry, err)
+	}
+
+	reused, err := h.service.ApplyPolicy(h.ctx, "owner-1", "default", retried.PolicyVersion, failed.Selection)
+	if err != nil || reused.Branch != ApplyPolicyNoop || reused.JobID == nil ||
+		*reused.JobID != *retried.JobID || reused.DesiredRevisionID == nil ||
+		*reused.DesiredRevisionID != *retried.DesiredRevisionID || reused.PolicyVersion != retried.PolicyVersion {
+		t.Fatalf("repeat explicit profile apply did not reuse healthy staged job: result=%+v err=%v", reused, err)
+	}
+	if err := h.db.QueryRowContext(h.ctx, `SELECT COUNT(*) FROM kb_knowledge_jobs
+		WHERE kind='rebuild_revision' AND parent_job_id IS NULL AND target_revision_id=?`,
+		*retried.DesiredRevisionID).Scan(&newRootJobs); err != nil {
+		t.Fatal(err)
+	}
+	if newRootJobs != 1 {
+		t.Fatalf("repeat explicit profile apply created %d fresh root jobs, want one", newRootJobs)
+	}
+}
+
 func TestSemanticIndexCancelSupersedingDesiredRestoresLastPublishedPolicy(t *testing.T) {
 	for _, tt := range []struct {
 		name             string

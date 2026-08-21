@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hexagon-codes/hexagon/rag/splitter"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/knowledge"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
@@ -1439,6 +1440,84 @@ func TestSetupKnowledgeSemanticIndexBackfillsLegacyCorpusThroughWorker(t *testin
 	if after.ActiveRevision == nil || after.DesiredRevision != nil ||
 		after.ActiveRevision.State != knowledge.VectorIndexReady {
 		t.Fatalf("published projection = %+v", after)
+	}
+}
+
+func TestManualDocumentSemanticChildReachesSucceededWithRuntimeWorker(t *testing.T) {
+	db, ctx := newKnowledgeSemanticRuntimeTestDB(t)
+	cfg := config.DefaultConfig()
+	cfg.Knowledge.Embedding.Provider = "fixture"
+	cfg.Knowledge.Embedding.Model = "fixture-embedding"
+	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
+		"fixture": {APIKey: "fixture-key", BaseURL: "http://127.0.0.1:1/v1", Compatible: "openai"},
+	}
+	plan := knowledgeEmbeddingPlan{
+		Provider: "fixture", Model: "fixture-embedding", Configured: true,
+		Ready: true, ServiceAvailable: true,
+	}
+	resolver := newKnowledgeEmbeddingProfileResolver(cfg, plan, 3)
+	embedder := &recordingKnowledgeEmbedder{dimension: 3}
+	registry := newKnowledgeEmbeddingExecutorRegistry(resolver.snapshot, embedder, "", "")
+	runtime, err := setupKnowledgeSemanticIndex(ctx, db, resolver, registry, "worker-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := runtime.Service.GetPolicy(ctx, knowledgeDesktopOwnerID, knowledgeDefaultCorpusID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.ActiveRevision == nil || policy.DesiredRevision != nil {
+		t.Fatalf("initial manual-document policy = %+v, want active revision without staged rebuild", policy)
+	}
+
+	store := knowledge.NewSQLiteStore(db,
+		knowledge.WithSQLiteSemanticMutations(knowledgeDesktopOwnerID, knowledgeDefaultCorpusID))
+	manager := knowledge.NewManager(store, store, nil,
+		knowledge.WithSplitter(splitter.NewMarkdownSplitter(
+			splitter.WithMarkdownChunkSize(400),
+			splitter.WithMarkdownChunkOverlap(80),
+		)),
+	)
+	doc, err := manager.AddDocument(ctx, "Manual semantic document", "manual document body", "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	projections, err := runtime.Service.ListDocumentVectorProjections(
+		ctx, knowledgeDesktopOwnerID, knowledgeDefaultCorpusID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, ok := projections[doc.ID]
+	if !ok || projection.JobID == "" || projection.JobState != knowledge.KnowledgeJobQueued ||
+		projection.VectorIndexState != knowledge.VectorIndexPending {
+		t.Fatalf("manual document projection = %+v, want queued pending child job", projection)
+	}
+	queued, err := runtime.Service.GetJobForCorpus(
+		ctx, knowledgeDesktopOwnerID, knowledgeDefaultCorpusID, projection.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.Kind != knowledge.KnowledgeJobEmbedDocument || queued.DocumentID != doc.ID ||
+		queued.State != knowledge.KnowledgeJobQueued || queued.TargetRevisionID != policy.ActiveRevision.RevisionID {
+		t.Fatalf("queued manual semantic child = %+v", queued)
+	}
+
+	processed, err := runtime.Worker.RunOnce(ctx)
+	if err != nil || !processed {
+		t.Fatalf("manual semantic worker processed=%t err=%v", processed, err)
+	}
+	completed, err := runtime.Service.GetJobForCorpus(
+		ctx, knowledgeDesktopOwnerID, knowledgeDefaultCorpusID, projection.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.State != knowledge.KnowledgeJobSucceeded || completed.LastError != "" ||
+		completed.ChunksDone == nil || completed.ChunksTotal == nil ||
+		*completed.ChunksDone != 1 || *completed.ChunksTotal != 1 {
+		t.Fatalf("completed manual semantic child = %+v, want succeeded 1/1 without error", completed)
+	}
+	if len(embedder.inputs) == 0 {
+		t.Fatal("manual semantic child did not invoke the local fake embedding executor")
 	}
 }
 

@@ -24,7 +24,7 @@ import (
 const bug20260808InstalledAppExecutable = "HEXCLAW_INSTALLED_APP_EXECUTABLE"
 
 // TestBUG20260808YAMLProviderKeySurvivesRestart_RealHexClawGPT 通过 owner YAML 的
-// 隔离副本验证本机实际配置的 gpt-5.6-sol Provider，且不会记录端点、Provider 密钥或其摘要。
+// 隔离副本验证本机实际配置的 HexClaw-GPT Provider 当前模型，且不会记录端点、Provider 密钥或其摘要。
 func TestBUG20260808YAMLProviderKeySurvivesRestart_RealHexClawGPT(t *testing.T) {
 	if strings.TrimSpace(os.Getenv(bug20260728LiveProviderProbeGate)) != "1" {
 		t.Skip("set HEXCLAW_REAL_PROVIDER_PROBE=1 to run the real HexClaw-GPT persistence probe")
@@ -81,13 +81,14 @@ func TestBUG20260808YAMLProviderKeySurvivesRestart_RealHexClawGPT(t *testing.T) 
 	restarted := &Server{cfg: restartedConfig, store: store}
 	probe := bug20260728RunLiveProviderProbe(t, restarted, providerInstanceID)
 	if ok, _ := probe["ok"].(bool); !ok {
-		t.Fatal("real HexClaw-GPT gpt-5.6-sol probe did not succeed after YAML restart")
+		t.Fatal("real HexClaw-GPT probe did not succeed after YAML restart")
 	}
-	if model, _ := probe["model"].(string); model != "gpt-5.6-sol" {
-		t.Fatalf("real YAML persistence probe model=%q, want gpt-5.6-sol", model)
+	expectedModel := strings.TrimSpace(provider.Model)
+	if model, _ := probe["model"].(string); model != expectedModel {
+		t.Fatalf("real YAML persistence probe model=%q, want configured model %q", model, expectedModel)
 	}
 
-	t.Logf("REAL_YAML_PROVIDER_PERSISTENCE_PASS provider=HexClaw-GPT model=gpt-5.6-sol latency_ms=%.0f", probe["latency_ms"])
+	t.Logf("REAL_YAML_PROVIDER_PERSISTENCE_PASS provider=HexClaw-GPT model=%s latency_ms=%.0f", expectedModel, probe["latency_ms"])
 }
 
 // TestBUG20260808UnsignedInstalledAppPreservesOwnerYAML_RealHexClawGPT 使用同一份
@@ -204,10 +205,11 @@ func TestBUG20260808UnsignedInstalledAppPreservesOwnerYAML_RealHexClawGPT(t *tes
 	if ok, _ := probe["ok"].(bool); !ok {
 		t.Fatal("real HexClaw-GPT probe failed after installed App restart")
 	}
-	if model, _ := probe["model"].(string); model != "gpt-5.6-sol" {
-		t.Fatalf("installed-app YAML probe model=%q, want gpt-5.6-sol", model)
+	expectedModel := strings.TrimSpace(provider.Model)
+	if model, _ := probe["model"].(string); model != expectedModel {
+		t.Fatalf("installed-app YAML probe model=%q, want configured model %q", model, expectedModel)
 	}
-	t.Logf("REAL_UNSIGNED_INSTALLED_APP_YAML_PASS restarts=2 provider=HexClaw-GPT model=gpt-5.6-sol latency_ms=%.0f", probe["latency_ms"])
+	t.Logf("REAL_UNSIGNED_INSTALLED_APP_YAML_PASS restarts=2 provider=HexClaw-GPT model=%s latency_ms=%.0f", expectedModel, probe["latency_ms"])
 }
 
 func bug20260808FreeLoopbackPort(t *testing.T) int {

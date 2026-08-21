@@ -102,7 +102,21 @@ func TestReindexDocumentReturnsExistingVectorChildJobAsAccepted(t *testing.T) {
 		payload.VectorIndexState != knowledge.VectorIndexPending {
 		t.Fatalf("status=%d payload=%+v", rec.Code, payload)
 	}
-	if stub.calls != 1 || stub.ownerID != knowledgeDesktopPrincipalID || stub.corpusID != knowledgeDefaultCorpusID {
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/knowledge/documents/"+doc.ID, nil)
+	detailReq.SetPathValue("id", doc.ID)
+	detailRec := httptest.NewRecorder()
+	srv.handleGetDocument(detailRec, detailReq)
+	var detail knowledge.Document
+	if err := json.NewDecoder(detailRec.Body).Decode(&detail); err != nil {
+		t.Fatal(err)
+	}
+	if detailRec.Code != http.StatusOK || detail.ID != doc.ID ||
+		detail.VectorJobID != payload.JobID || detail.VectorJobState != payload.JobState ||
+		detail.VectorIndexState != payload.VectorIndexState {
+		t.Fatalf("detail status=%d payload=%+v", detailRec.Code, detail)
+	}
+	if stub.calls != 2 || stub.ownerID != knowledgeDesktopPrincipalID || stub.corpusID != knowledgeDefaultCorpusID {
 		t.Fatalf("projection scope/calls=%q/%q/%d", stub.ownerID, stub.corpusID, stub.calls)
 	}
 }
