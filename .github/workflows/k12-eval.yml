@@ -8,21 +8,38 @@ on:
   push:
     branches: [main, "feat/**"]
     paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - "go.work"
+      - "go.work.sum"
       - "scenarios/k12/**"
-      - "engine/solve.go"
       - ".github/workflows/k12-eval.yml"
   pull_request:
     paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - "go.work"
+      - "go.work.sum"
       - "scenarios/k12/**"
-      - "engine/solve.go"
+      - ".github/workflows/k12-eval.yml"
 
 permissions:
   contents: read
+
+concurrency:
+  group: k12-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOPRIVATE: github.com/hexagon-codes/*
 
 jobs:
   eval-gate:
     name: K12 Eval Gate
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     env:
       HAS_REAL_LLM_EVAL_KEY: ${{ secrets.HEXCLAW_LLM_EVAL_KEY != '' }}
     steps:
@@ -30,22 +47,17 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.25.13"
+          go-version-file: go.mod
           cache-dependency-path: go.sum
-        env:
-          GOPRIVATE: github.com/hexagon-codes/*
 
       # harness 门 + 阈值逻辑 + 学科/超纲/不代写维度完整性（确定性，每次卡）。
       - name: K12 eval harness gate
         run: go test -race -count=1 -run 'TestEvalGate|TestEvalCases_NonEmpty|TestRunEval|TestLooksLikeGhostwrite|TestSubjectEvalCases|TestK12EvalGate' ./scenarios/k12/usecase/
-        env:
-          GOPRIVATE: github.com/hexagon-codes/*
 
       # 真模型批改准确率 ≥90% 门：仅当配置了 LLM eval secret 才激活（否则内部自动 skip）。
       - name: K12 real-model accuracy gate (opt-in)
         if: ${{ env.HAS_REAL_LLM_EVAL_KEY == 'true' }}
         run: go test -count=1 -timeout 900s -run TestK12EvalGate_RealModel -v ./scenarios/k12/usecase/
         env:
-          GOPRIVATE: github.com/hexagon-codes/*
           HEXCLAW_REAL_LLM_EVAL: "1"
           HEXCLAW_REAL_LLM_KEY: ${{ secrets.HEXCLAW_LLM_EVAL_KEY }}

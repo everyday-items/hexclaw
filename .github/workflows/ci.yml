@@ -2,31 +2,53 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feat/**"]
   pull_request:
     branches: [main]
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOPRIVATE: github.com/hexagon-codes/*
+
 jobs:
-  test:
-    name: Test (Linux)
+  compile:
+    name: Compile (feature branch)
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/feat/') }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.25.13"
+          go-version-file: go.mod
           cache-dependency-path: go.sum
-        env:
-          GOPRIVATE: github.com/hexagon-codes/*
+
+      # 只构建测试二进制，不执行用例，尽早发现代码与依赖 API 不一致。
+      - name: Compile all packages
+        run: go test -run '^$' ./...
+
+  test:
+    name: Test (Linux)
+    if: ${{ github.event_name != 'push' || github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
 
       - name: Run tests
         run: go test -race -count=1 -coverprofile=coverage.out ./...
-        env:
-          GOPRIVATE: github.com/hexagon-codes/*
 
       - name: Upload coverage
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -36,26 +58,22 @@ jobs:
 
   test-windows:
     name: Test (Windows Sandbox)
+    if: ${{ github.event_name != 'push' || github.ref == 'refs/heads/main' }}
     runs-on: windows-2022
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.25.13"
+          go-version-file: go.mod
           cache-dependency-path: go.sum
-        env:
-          GOPRIVATE: github.com/hexagon-codes/*
 
       - name: Build all
         run: go build ./...
-        env:
-          GOPRIVATE: github.com/hexagon-codes/*
 
       - name: Run sandbox tests
         run: go test -v -count=1 -timeout 120s ./skill/sandbox/...
-        env:
-          GOPRIVATE: github.com/hexagon-codes/*
 
       # 核心套件大量断言 Unix 专属可观测值 (文件权限位 0600/0640/0755、HOME 与 ~ 展开、POSIX 路径),
       # 在 Windows 上非可移植 (产品代码可用, 是测试断言不跨平台), 重构前即非绿。降为提示性:
@@ -64,23 +82,19 @@ jobs:
       - name: Run core tests (advisory on Windows)
         continue-on-error: true
         run: go test -count=1 -timeout 300s ./engine/... ./config/... ./security/... ./mcp/... ./session/... ./skill/...
-        env:
-          GOPRIVATE: github.com/hexagon-codes/*
 
   test-macos:
     name: Test (macOS Sandbox)
+    if: ${{ github.event_name != 'push' || github.ref == 'refs/heads/main' }}
     runs-on: macos-14
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.25.13"
+          go-version-file: go.mod
           cache-dependency-path: go.sum
-        env:
-          GOPRIVATE: github.com/hexagon-codes/*
 
       - name: Run sandbox tests
         run: go test -v -count=1 -timeout 120s ./skill/sandbox/...
-        env:
-          GOPRIVATE: github.com/hexagon-codes/*
