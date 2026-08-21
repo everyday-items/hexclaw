@@ -1,6 +1,7 @@
 package usecase_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -15,6 +16,7 @@ import (
 // prepare 必须预占稳定 paper_no 和冻结同源卷面，但绝不能提前固化/清空待打印篮。
 func TestPracticePrintPrepareReservesFormalPaperWithoutFinalizing(t *testing.T) {
 	d := newDataDeps(t)
+	d.Renderer = &v45PDFRenderer{data: []byte("%PDF-1.7\npractice-frozen")}
 	ctx := context.Background()
 	id := seedPaperBasket(t, d, ctx, "xiaoming")
 
@@ -61,6 +63,53 @@ func TestPracticePrintPrepareReservesFormalPaperWithoutFinalizing(t *testing.T) 
 	}
 	if again.Job.PrintJobID != prepared.Job.PrintJobID || again.Job.PaperNo != prepared.Job.PaperNo || again.Job.SourceDigest != prepared.Job.SourceDigest {
 		t.Fatalf("prepare replay changed stable reservation: first=%+v replay=%+v", prepared.Job, again.Job)
+	}
+}
+
+func TestPracticePrintPaperFreezesCanonicalArtifact(t *testing.T) {
+	d := newDataDeps(t)
+	renderer := &v45PDFRenderer{data: []byte("%PDF-1.7\npractice-frozen")}
+	d.Renderer = renderer
+	ctx := context.Background()
+	id := seedPaperBasket(t, d, ctx, "xiaoming")
+
+	prepared, _, err := d.PreparePracticePrint(ctx, "xiaoming", id, "canonical-practice-print", k12.PaperKindQuestion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paper, err := d.RenderPracticePrintJobPaper(ctx, "xiaoming", prepared.Job.PrintJobID, k12.PaperKindQuestion)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	artifact, err := d.Records.GetPrintArtifact(ctx, "xiaoming", paper.ArtifactID)
+	if err != nil {
+		t.Fatalf("practice paper must persist its canonical artifact: %v", err)
+	}
+	if artifact.ArtifactID != prepared.Job.ArtifactID || artifact.CanonicalMarkdown != paper.Markdown {
+		t.Fatalf("canonical artifact drifted: artifact=%+v paper=%+v job=%+v", artifact, paper, prepared.Job)
+	}
+	render, err := d.Records.GetPrintArtifactRender(ctx, "xiaoming", paper.ArtifactID)
+	if err != nil {
+		t.Fatalf("practice paper must persist its frozen PDF: %v", err)
+	}
+	if !bytes.Equal(render.Payload, []byte("%PDF-1.7\npractice-frozen")) || render.ByteDigest == "" {
+		t.Fatalf("unexpected frozen PDF: %+v", render)
+	}
+	answer, err := d.RenderPracticePrintJobPaper(ctx, "xiaoming", prepared.Job.PrintJobID, k12.PaperKindAnswer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	answerArtifact, err := d.Records.GetPrintArtifact(ctx, "xiaoming", answer.ArtifactID)
+	if err != nil || answerArtifact.SourceKind != k12.PrintSourcePracticeAnswer || answerArtifact.CanonicalMarkdown != answer.Markdown {
+		t.Fatalf("answer artifact is not canonical: artifact=%+v paper=%+v err=%v", answerArtifact, answer, err)
+	}
+	again, err := d.RenderPracticePrintJobPaper(ctx, "xiaoming", prepared.Job.PrintJobID, k12.PaperKindQuestion)
+	if err != nil || again.ArtifactID != paper.ArtifactID || again.Markdown != paper.Markdown {
+		t.Fatalf("replayed paper drifted: first=%+v replay=%+v err=%v", paper, again, err)
+	}
+	if renderer.callCount() != 2 {
+		t.Fatalf("replayed canonical artifacts rendered %d times", renderer.callCount())
 	}
 }
 

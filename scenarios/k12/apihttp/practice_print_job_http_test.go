@@ -2,6 +2,7 @@ package apihttp_test
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -31,6 +32,18 @@ func TestPracticePrintJobHTTPContract(t *testing.T) {
 	rec, paper := do(t, h, http.MethodGet, "/print-jobs/"+jobID+"/paper?agent=mingming&kind=question", "")
 	if rec.Code != http.StatusOK || paper["paper_no"] != paperNo || paper["source_digest"] != job["source_digest"] {
 		t.Fatalf("print paper contract drifted: code=%d %#v", rec.Code, paper)
+	}
+	if paper["artifact_id"] != job["artifact_id"] {
+		t.Fatalf("practice paper artifact identity drifted: paper=%#v job=%#v", paper, job)
+	}
+	contentReq := httptest.NewRequest(http.MethodGet,
+		"/print-artifacts/"+paper["artifact_id"].(string)+"/content?agent=mingming", nil)
+	contentRec := httptest.NewRecorder()
+	h.ServeHTTP(contentRec, contentReq)
+	if contentRec.Code != http.StatusOK || contentRec.Header().Get("Content-Type") != "application/pdf" ||
+		!strings.HasPrefix(contentRec.Body.String(), "%PDF-") {
+		t.Fatalf("practice paper canonical PDF unavailable: status=%d headers=%v body=%q",
+			contentRec.Code, contentRec.Header(), contentRec.Body.String())
 	}
 
 	for _, event := range []struct {

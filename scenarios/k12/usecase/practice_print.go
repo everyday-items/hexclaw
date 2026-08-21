@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
@@ -146,6 +148,57 @@ func (d Deps) GetPracticePrint(ctx context.Context, agentName, jobID string) (Pr
 	return PracticePrintView{Job: job}, nil
 }
 
+// freezePracticePrintArtifact 在 PrintJob 预占卷面号后冻结精确 Markdown 快照。
+// 保留既有 qsheet/asheet 身份，使原生协调器继续复用现有 PDF 内容路由。
+func (d Deps) freezePracticePrintArtifact(ctx context.Context, job k12.PracticePrintJob,
+	fields k12.PracticeSetFields, kind string) (k12.PrintArtifact, k12.PrintArtifactRender, error) {
+	artifactID := job.QuestionArtifactID
+	sourceKind := k12.PrintSourcePracticeQuestion
+	if kind == k12.PaperKindAnswer {
+		artifactID = job.AnswerArtifactID
+		sourceKind = k12.PrintSourcePracticeAnswer
+	}
+	markdown := k12.RenderPaperMarkdown(fields, kind, k12.PaperMeta{
+		Term: fields.GradeTerm, Date: time.Unix(job.PreparedAt, 0), Preview: false,
+	})
+	artifact := buildPrintArtifact(PreparePrintableArtifactRequest{
+		AgentName:         job.AgentName,
+		SourceKind:        sourceKind,
+		SourceRef:         "practice-print-job:" + job.PrintJobID + ":" + kind,
+		Title:             fields.Title,
+		CanonicalMarkdown: markdown,
+	}, job.PreparedAt)
+	artifact.ArtifactID = artifactID
+	if strings.TrimSpace(artifact.ArtifactID) == "" {
+		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, fmt.Errorf("usecase: practice print artifact id is empty")
+	}
+
+	if frozen, getErr := d.Records.GetPrintArtifact(ctx, job.AgentName, artifact.ArtifactID); getErr == nil {
+		if !samePrintArtifact(frozen, artifact) {
+			return k12.PrintArtifact{}, k12.PrintArtifactRender{}, fmt.Errorf("usecase: practice print artifact id is bound to different content")
+		}
+		frozenRender, renderErr := d.Records.GetPrintArtifactRender(ctx, job.AgentName, artifact.ArtifactID)
+		if renderErr == nil {
+			return frozen, frozenRender, nil
+		}
+		if !errors.Is(renderErr, records.ErrNotFound) {
+			return k12.PrintArtifact{}, k12.PrintArtifactRender{}, fmt.Errorf("usecase: read frozen practice print PDF: %w", renderErr)
+		}
+	} else if !errors.Is(getErr, records.ErrNotFound) {
+		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, fmt.Errorf("usecase: read practice print artifact: %w", getErr)
+	}
+
+	render, err := d.renderPrintableArtifact(ctx, artifact)
+	if err != nil {
+		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, err
+	}
+	frozen, frozenRender, _, err := d.Records.FreezePrintArtifact(ctx, artifact, render)
+	if err != nil {
+		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, fmt.Errorf("usecase: freeze practice print artifact/PDF: %w", err)
+	}
+	return frozen, frozenRender, nil
+}
+
 func (d Deps) RenderPracticePrintJobPaper(ctx context.Context, agentName, jobID, kind string) (PracticePrintPaperView, error) {
 	if kind == "" {
 		kind = k12.PaperKindQuestion
@@ -161,22 +214,14 @@ func (d Deps) RenderPracticePrintJobPaper(ctx context.Context, agentName, jobID,
 	if err := json.Unmarshal([]byte(job.PreparedFieldsJSON), &fields); err != nil {
 		return PracticePrintPaperView{}, fmt.Errorf("usecase: 解析 PrintJob 卷源: %w", err)
 	}
-	term := ""
-	if d.Profiles != nil {
-		if profile, pErr := d.GetProfile(ctx, agentName); pErr == nil {
-			term = profile.GradeTerm
-		}
-	}
-	artifactID := job.QuestionArtifactID
-	if kind == k12.PaperKindAnswer {
-		artifactID = job.AnswerArtifactID
+	artifact, _, err := d.freezePracticePrintArtifact(ctx, job, fields, kind)
+	if err != nil {
+		return PracticePrintPaperView{}, fmt.Errorf("usecase: freeze practice print paper: %w", err)
 	}
 	return PracticePrintPaperView{
 		PrintJobID: job.PrintJobID, Kind: kind, Title: fields.Title, PaperNo: job.PaperNo,
-		SourceDigest: job.SourceDigest, ArtifactID: artifactID,
-		Markdown: k12.RenderPaperMarkdown(fields, kind, k12.PaperMeta{
-			Term: term, Date: time.Unix(job.PreparedAt, 0), Preview: false,
-		}),
+		SourceDigest: job.SourceDigest, ArtifactID: artifact.ArtifactID,
+		Markdown: artifact.CanonicalMarkdown,
 	}, nil
 }
 
