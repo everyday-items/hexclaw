@@ -2,9 +2,11 @@ package web
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 )
 
@@ -236,4 +238,134 @@ func TestWebAdapterOwnerSocketACKRequiresAndReturnsCompleteIdentity(t *testing.T
 	if calls != 1 {
 		t.Fatalf("incomplete owner-socket response reached durable handler %d times, want 1 total", calls)
 	}
+}
+
+// REG-TOOL-APPROVAL-RECONCILE-010：替换请求 socket 后，保存的决策必须以原始身份和幂等键得到 ACK。
+func TestWebAdapterReplacementSocketReplaysPendingApprovalThenAcceptsSavedDecisionIdentity(t *testing.T) {
+	a := New()
+	const (
+		requestID   = "approval-replacement-socket"
+		ownerID     = "desktop-user"
+		sessionID   = "session-replacement-socket"
+		invocation  = "invocation-replacement-socket"
+		argsDigest  = "arguments-replacement-socket"
+		scopeDigest = "scope-replacement-socket"
+		decisionID  = "decision-saved-before-reconnect"
+		idemKey     = "idempotency-saved-before-reconnect"
+	)
+	deadline := time.Now().UTC().Add(time.Minute)
+	var replayCalls atomic.Int32
+	a.SetPendingApprovalReplayHandler(func(_ context.Context, owner, session string) []*PermissionRequestData {
+		replayCalls.Add(1)
+		if owner != ownerID || session != sessionID {
+			t.Errorf("pending replay identity = (%q, %q), want (%q, %q)", owner, session, ownerID, sessionID)
+		}
+		return []*PermissionRequestData{{
+			ID: requestID, OwnerID: ownerID, InvocationID: invocation,
+			ToolName: "file_edit", Arguments: map[string]any{"path": "/workspace/reconnect.md"},
+			ArgumentsDigest: argsDigest, SecurityScopeDigest: scopeDigest,
+			ScopeSchemaVersion: 1, DeadlineAt: deadline, Risk: "sensitive", Reason: "replay pending approval",
+		}}
+	})
+	decisionRequests := make(chan ApprovalResponseData, 1)
+	a.SetDurableApprovalDecisionHandler(func(data ApprovalResponseData) ApprovalDecisionReceipt {
+		decisionRequests <- data
+		return ApprovalDecisionReceipt{
+			RequestID: data.RequestID, OwnerID: data.OwnerID, SessionID: data.SessionID,
+			InvocationID: data.InvocationID, ArgumentsDigest: data.ArgumentsDigest,
+			SecurityScopeDigest: data.SecurityScopeDigest, ScopeSchemaVersion: data.ScopeSchemaVersion,
+			DeadlineAt: data.DeadlineAt, DecisionID: data.DecisionID, Decision: data.Decision,
+			IdempotencyKey: data.IdempotencyKey, TerminalResult: "approved_remember", ACKStatus: "accepted",
+		}
+	})
+
+	firstConn, firstCtx, _ := dialWebAdapter(t, a)
+	waitForWebAdapterConnections(t, a, 1)
+	if !a.bindSession(sessionID, onlyWebAdapterChatID(t, a), ownerID) {
+		t.Fatal("bind initial request socket failed")
+	}
+	var initial wsMessage
+	if err := wsjson.Read(firstCtx, firstConn, &initial); err != nil {
+		t.Fatalf("read initial pending approval: %v", err)
+	}
+	if initial.Type != "tool_approval_request" || initial.RequestID != requestID ||
+		initial.SessionID != sessionID || initial.OwnerID != ownerID || initial.InvocationID != invocation ||
+		initial.ArgumentsDigest != argsDigest || initial.SecurityScopeDigest != scopeDigest ||
+		initial.ScopeSchemaVersion != 1 || initial.DeadlineAt != deadline.Format(time.RFC3339Nano) {
+		t.Fatalf("initial pending approval = %+v, want exact identity", initial)
+	}
+
+	if err := firstConn.Close(websocket.StatusNormalClosure, "request socket disconnected"); err != nil {
+		t.Fatalf("close initial request socket: %v", err)
+	}
+	waitForWebAdapterReplacementCleanup(t, a, requestID)
+
+	replacementConn, replacementCtx, _ := dialWebAdapter(t, a)
+	waitForWebAdapterConnections(t, a, 1)
+	if !a.bindSession(sessionID, onlyWebAdapterChatID(t, a), ownerID) {
+		t.Fatal("bind replacement request socket failed")
+	}
+	var replay wsMessage
+	if err := wsjson.Read(replacementCtx, replacementConn, &replay); err != nil {
+		t.Fatalf("read replacement pending approval replay: %v", err)
+	}
+	if replay.Type != "tool_approval_request" || replay.RequestID != requestID ||
+		replay.SessionID != sessionID || replay.OwnerID != ownerID || replay.InvocationID != invocation ||
+		replay.ArgumentsDigest != argsDigest || replay.SecurityScopeDigest != scopeDigest ||
+		replay.ScopeSchemaVersion != 1 || replay.DeadlineAt != deadline.Format(time.RFC3339Nano) {
+		t.Fatalf("replacement pending approval = %+v, want exact original identity", replay)
+	}
+	if replayCalls.Load() != 2 {
+		t.Fatalf("pending replay calls = %d, want initial plus replacement socket", replayCalls.Load())
+	}
+
+	response := wsMessage{
+		Type: "tool_approval_response", Content: "approved_remember",
+		RequestID: requestID, SessionID: sessionID, OwnerID: ownerID,
+		DecisionID: decisionID, InvocationID: invocation,
+		ArgumentsDigest: argsDigest, SecurityScopeDigest: scopeDigest,
+		ScopeSchemaVersion: 1, DeadlineAt: deadline.Format(time.RFC3339Nano),
+		Metadata: map[string]string{
+			"request_id": requestID, "session_id": sessionID, "owner_id": ownerID,
+			"decision_id": decisionID, "invocation_id": invocation,
+			"decision": "approved_remember", "idempotency_key": idemKey,
+			"arguments_digest": argsDigest, "security_scope_digest": scopeDigest,
+			"scope_schema_version": "1", "deadline_at": deadline.Format(time.RFC3339Nano),
+		},
+	}
+	ack := writeApprovalResponseAndReadACK(t, replacementCtx, replacementConn, response)
+	if ack.Type != "tool_approval_ack" || ack.Status != "accepted" ||
+		ack.RequestID != requestID || ack.SessionID != sessionID || ack.OwnerID != ownerID ||
+		ack.InvocationID != invocation || ack.ArgumentsDigest != argsDigest ||
+		ack.SecurityScopeDigest != scopeDigest || ack.ScopeSchemaVersion != 1 ||
+		ack.DeadlineAt != deadline.Format(time.RFC3339Nano) || ack.DecisionID != decisionID ||
+		ack.Decision != "approved_remember" || ack.IdempotencyKey != idemKey {
+		t.Fatalf("replacement ACK = %+v, want exact saved decision acknowledgement", ack)
+	}
+	select {
+	case data := <-decisionRequests:
+		if data.RequestID != requestID || data.SessionID != sessionID || data.OwnerID != ownerID ||
+			data.InvocationID != invocation || data.ArgumentsDigest != argsDigest ||
+			data.SecurityScopeDigest != scopeDigest || data.ScopeSchemaVersion != 1 ||
+			!data.DeadlineAt.Equal(deadline) || data.DecisionID != decisionID ||
+			data.Decision != "approved_remember" || data.IdempotencyKey != idemKey {
+			t.Fatalf("durable saved decision = %+v, want exact original identity and idempotency", data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement decision did not reach durable coordinator")
+	}
+}
+
+func waitForWebAdapterReplacementCleanup(t *testing.T, a *WebAdapter, requestID string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		_, bound := a.approvalBindings.Load(requestID)
+		if countWebAdapterConnections(a) == 0 && !bound {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_, bound := a.approvalBindings.Load(requestID)
+	t.Fatalf("replacement cleanup = connections:%d approval_binding:%t, want 0/false", countWebAdapterConnections(a), bound)
 }

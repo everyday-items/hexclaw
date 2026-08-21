@@ -100,6 +100,57 @@ func TestPermissionHubReconcileApprovalReceiptReturnsOnlyExactDurableTerminal(t 
 	}
 }
 
+// REG-TOOL-APPROVAL-RECONCILE-009：审批 deadline 后重连必须返回精确、已持久化的 expired 终态。
+func TestPermissionHubReconcileAfterApprovalDeadlineReturnsExactExpiredTerminal(t *testing.T) {
+	store := newDurableApprovalTestStore(
+		t, filepath.Join(t.TempDir(), "reconcile-after-deadline.db"),
+		"owner-reconcile-after-deadline", "session-reconcile-after-deadline",
+	)
+	defer store.Close()
+	hub := NewPermissionHubWithRememberedGrantStore(30*time.Millisecond, store)
+	sender := &terminalCapturePermissionSender{
+		terminal:        make(chan *PermissionTerminal, 1),
+		terminalContext: make(chan error, 1),
+	}
+	hub.SetSender(sender)
+	req := &PermissionRequest{
+		ID: "approval-reconcile-after-deadline", ToolName: "file_edit",
+		Arguments: map[string]any{"path": "/workspace/reconnect.md"}, Risk: "sensitive",
+	}
+
+	approved, err := hub.RequestApproval(
+		approvalOwnerContext("owner-reconcile-after-deadline", "session-reconcile-after-deadline"),
+		"session-reconcile-after-deadline", req,
+	)
+	if approved || err == nil {
+		t.Fatalf("expired approval = (%v, %v), want denied timeout", approved, err)
+	}
+	receipt, err := store.GetToolApprovalReceipt(context.Background(), req.ID)
+	if err != nil {
+		t.Fatalf("read durable expired receipt: %v", err)
+	}
+	terminal := receivePermissionTerminal(t, sender.terminal)
+	assertPermissionTerminalMatchesReceipt(t, terminal, receipt)
+	if receipt.TerminalResult != storage.ToolApprovalTerminalExpired {
+		t.Fatalf("durable terminal = %+v, want expired", receipt)
+	}
+	if contextErr := receivePermissionTerminalContext(t, sender.terminalContext); contextErr != nil {
+		t.Fatalf("terminal transport inherited expired request context: %v", contextErr)
+	}
+
+	result, err := hub.ReconcileApprovalReceipt(
+		context.Background(), reconciliationIdentity(req, "session-reconcile-after-deadline"),
+	)
+	if err != nil {
+		t.Fatalf("reconcile after deadline: %v", err)
+	}
+	if result == nil || result.Request != nil || result.Receipt == nil ||
+		result.Receipt.TerminalResult != storage.ToolApprovalTerminalExpired || !result.Receipt.Replayed ||
+		!toolApprovalReceiptMatchesReconciliation(result.Receipt, reconciliationIdentity(req, "session-reconcile-after-deadline")) {
+		t.Fatalf("reconciled expired terminal = %+v, want exact replayed durable expiry", result)
+	}
+}
+
 // REG-TOOL-APPROVAL-RECONCILE-003
 func TestPermissionHubReconcileApprovalReceiptReplaysOnlyLiveExactPendingRequest(t *testing.T) {
 	store := newDurableApprovalTestStore(

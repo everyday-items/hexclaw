@@ -271,12 +271,25 @@ func (h *PermissionHub) ClearSession(sessionID string) error {
 		}
 	}
 	h.mu.Lock()
+	pendingResponses := make([]chan PermissionResponse, 0)
+	for requestID, pending := range h.pending {
+		if pending.key.resolvedSessionID == sessionID {
+			delete(h.pending, requestID)
+			pendingResponses = append(pendingResponses, pending.response)
+		}
+	}
 	for key := range h.remembered {
 		if key.resolvedSessionID == sessionID {
 			delete(h.remembered, key)
 		}
 	}
 	h.mu.Unlock()
+	for _, response := range pendingResponses {
+		select {
+		case response <- PermissionResponse{}:
+		default:
+		}
+	}
 	return nil
 }
 
@@ -411,15 +424,16 @@ func (h *PermissionHub) RequestApproval(ctx context.Context, sessionID string, r
 		}
 		return true, nil
 	case <-requestCtx.Done():
+		requestErr := requestCtx.Err()
 		h.mu.Lock()
 		delete(h.pending, req.ID)
 		h.mu.Unlock()
 		if h.approvals != nil {
 			var receipt *storage.ToolApprovalReceipt
 			var durableErr error
-			if !time.Now().UTC().Before(req.DeadlineAt) {
+			if errors.Is(requestErr, context.DeadlineExceeded) {
 				receipt, durableErr = h.approvals.ExpireToolApproval(
-					context.Background(), req.ID, time.Now().UTC(),
+					context.Background(), req.ID, req.DeadlineAt,
 				)
 			} else {
 				receipt, durableErr = h.approvals.FenceToolApprovalRequest(
@@ -442,10 +456,10 @@ func (h *PermissionHub) RequestApproval(ctx context.Context, sessionID string, r
 				}
 			}
 		}
-		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+		if errors.Is(requestErr, context.DeadlineExceeded) {
 			return false, fmt.Errorf("permission request timed out after %v", h.timeout)
 		}
-		return false, requestCtx.Err()
+		return false, requestErr
 	}
 }
 

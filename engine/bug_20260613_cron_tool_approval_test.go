@@ -10,6 +10,7 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/config"
 )
 
 func TestBug20260613_CronDispatchAutoApprovesSensitiveTool(t *testing.T) {
@@ -36,12 +37,14 @@ func TestBug20260613_CronDispatchSandboxedExecOnly(t *testing.T) {
 	}
 }
 
-func TestBug20260613_NonCronSensitiveStillNeedsSession(t *testing.T) {
-	hook := NewPermissionHook(nil)
+func TestBug20260613_StrictNonCronSensitiveStillNeedsSession(t *testing.T) {
+	hook := NewPermissionHook(nil, WithSystemDispatchPolicy(NewSystemDispatchPolicyFromConfig(config.AutonomyConfig{
+		Profile: SystemDispatchProfileStrict,
+	})))
 
-	// No system-dispatch marker, no session → unchanged behavior: denied.
+	// strict 档位下，无系统调度标记、无会话时敏感工具必须拒绝。
 	if err := hook.BeforeToolCall(context.Background(), &ToolCallInfo{Name: "browser"}); err == nil {
-		t.Error("interactive sensitive tool without session must still be denied")
+		t.Error("strict interactive sensitive tool without session must be denied")
 	}
 }
 

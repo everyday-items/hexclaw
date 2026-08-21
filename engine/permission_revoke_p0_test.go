@@ -103,6 +103,72 @@ func TestPermissionHubRevokeToolGrantDurable(t *testing.T) {
 	}
 }
 
+// 删除会话后，已持久化 fence 的 live pending waiter 必须立即拒绝，不能继续等到 deadline。
+func TestPermissionHubClearSessionReleasesLivePendingWaiter(t *testing.T) {
+	const ownerID = "owner-clear-pending"
+	const sessionID = "session-clear-pending"
+	store := newDurableApprovalTestStore(t, filepath.Join(t.TempDir(), "clear-pending.db"), ownerID, sessionID)
+	t.Cleanup(func() { _ = store.Close() })
+	hub, err := NewDurablePermissionHub(context.Background(), 5*time.Second, store)
+	if err != nil {
+		t.Fatalf("new durable hub: %v", err)
+	}
+	observed := make(chan *PermissionRequest, 1)
+	hub.SetSender(&durableApprovalSender{t: t, hub: hub, store: store, requestObserved: observed})
+	result := make(chan struct {
+		allowed bool
+		err     error
+	}, 1)
+	go func() {
+		allowed, requestErr := hub.RequestApproval(
+			approvalOwnerContext(ownerID, sessionID),
+			sessionID,
+			&PermissionRequest{
+				ID: "clear-pending-1", ToolName: "browser", Risk: "sensitive",
+				Arguments: map[string]any{"fixture": "clear-pending"},
+			},
+		)
+		result <- struct {
+			allowed bool
+			err     error
+		}{allowed: allowed, err: requestErr}
+	}()
+
+	select {
+	case request := <-observed:
+		if request.ID != "clear-pending-1" {
+			t.Fatalf("pending request id = %q", request.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending approval was not sent")
+	}
+	if err := hub.ClearSession(sessionID); err != nil {
+		t.Fatalf("clear session: %v", err)
+	}
+	select {
+	case outcome := <-result:
+		if outcome.allowed || outcome.err != nil {
+			t.Fatalf("cleared pending request = (%v, %v), want (false, nil)", outcome.allowed, outcome.err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("ClearSession left the live pending waiter blocked")
+	}
+
+	receipt, err := store.GetToolApprovalReceipt(context.Background(), "clear-pending-1")
+	if err != nil {
+		t.Fatalf("read fenced receipt: %v", err)
+	}
+	if receipt.TerminalResult != storage.ToolApprovalTerminalFenced || receipt.ReleaseState != storage.ToolApprovalReleaseFenced {
+		t.Fatalf("cleared pending receipt = %+v, want fenced/fenced", receipt)
+	}
+	hub.mu.Lock()
+	_, stillPending := hub.pending["clear-pending-1"]
+	hub.mu.Unlock()
+	if stillPending {
+		t.Fatal("ClearSession retained the in-process pending waiter")
+	}
+}
+
 // in-memory 模式：RevokeToolGrant 必须同时清理进程内 remembered cache。
 func TestPermissionHubRevokeToolGrantClearsProcessCache(t *testing.T) {
 	grants := &memoryRememberedGrantStore{grants: map[string]bool{}}
