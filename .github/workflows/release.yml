@@ -34,7 +34,7 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.25.13"
+          go-version-file: go.mod
           cache-dependency-path: go.sum
         env:
           GOPRIVATE: github.com/hexagon-codes/*
