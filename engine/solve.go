@@ -559,7 +559,8 @@ func (o *SolveSkill) verifySolution(ctx context.Context, problem, solution, cand
 }
 
 // strictFormatReminder 在校验重试时附加，逼模型只吐固定格式。
-const strictFormatReminder = "\n\n⚠️ 上一次输出未按要求的固定格式。请**严格只**逐行输出上面要求的字段（每行一个），不要任何多余文字、解释、寒暄或代码围栏。"
+const strictFormatReminder = "\n\n⚠️ 上一次输出未按要求的固定格式。请**严格只**逐行输出上面要求的字段（每行一个），不要任何多余文字、解释、寒暄或代码围栏。" +
+	" If the requested format contains WRONG_STEP and MISCONCEPTION and your decision is CORRECT: no with FINAL_ANSWER_CORRECT: yes, both fields must contain concrete evidence from the student's work and must not be empty."
 
 // runValidated 跑结构化子 Agent 并按 ok() 校验其输出；首次解析失败 → 附加严格格式提醒、fresh 重派一次。
 // 对标 Hermes JSON-mode 的「校验 + 失败重提示」：让 verdict/批改在弱/本地模型上也能被稳定解析，
@@ -588,9 +589,18 @@ func verdictParseable(out string) bool {
 		strings.Contains(up, "UNVERIFIABLE") || strings.Contains(up, "OUT_OF_SCOPE") || strings.Contains(up, "OUT OF SCOPE")
 }
 
-// gradingParseable 报告 grader 输出是否同时含完整作答与最终答案两条独立判定。
+// gradingParseable 报告 grader 输出是否含完整的独立判定；最终答案正确但过程
+// 有误时，首个错步与错因也是形成该结论所必需的证据。
 func gradingParseable(out string) bool {
-	return gradeCorrectRe.MatchString(out) && gradeFinalAnswerCorrectRe.MatchString(out)
+	if !gradeCorrectRe.MatchString(out) || !gradeFinalAnswerCorrectRe.MatchString(out) {
+		return false
+	}
+	assessment := parseGrading(out, "", "")
+	if !assessment.correct && assessment.finalAnswerCorrect {
+		return strings.TrimSpace(assessment.wrongStep) != "" &&
+			strings.TrimSpace(assessment.misconception) != ""
+	}
+	return true
 }
 
 // gradeAssessment 是 grader 对学生答案的批改结论。

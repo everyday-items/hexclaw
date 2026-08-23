@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestREGK12CorrectWithProcessIssue20260809001EnginePreservesFinalAnswerFact(t *testing.T) {
@@ -82,6 +83,107 @@ func TestREGK12CorrectWithProcessIssue20260809001EnginePreservesFinalAnswerFact(
 		}
 		if got := result.Metadata["grade_final_answer_correct"]; got != "false" {
 			t.Fatalf("wrong final answer was misclassified: got=%q metadata=%#v", got, result.Metadata)
+		}
+	})
+}
+
+func TestREGBUGK12ProcessEvidenceComplete004Parseability(t *testing.T) {
+	complete := "CORRECT: no\nFINAL_ANSWER_CORRECT: yes\nWRONG_STEP: 42=18×2\nMISCONCEPTION: 等式两边不相等\nGUIDANCE: 分别重算两组和"
+	if !gradingParseable(complete) {
+		t.Fatal("complete process-issue response was rejected")
+	}
+	for name, response := range map[string]string{
+		"missing wrong step":    "CORRECT: no\nFINAL_ANSWER_CORRECT: yes\nWRONG_STEP:\nMISCONCEPTION: 等式两边不相等\nGUIDANCE: 分别重算两组和",
+		"missing misconception": "CORRECT: no\nFINAL_ANSWER_CORRECT: yes\nWRONG_STEP: 42=18×2\nMISCONCEPTION:\nGUIDANCE: 分别重算两组和",
+		"missing both":          "CORRECT: no\nFINAL_ANSWER_CORRECT: yes\nWRONG_STEP:\nMISCONCEPTION:\nGUIDANCE: 分别重算两组和",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if gradingParseable(response) {
+				t.Fatal("incomplete process-issue response bypassed fresh-context validation")
+			}
+		})
+	}
+	fullyCorrect := "CORRECT: yes\nFINAL_ANSWER_CORRECT: yes\nWRONG_STEP:\nMISCONCEPTION:\nGUIDANCE: 做得很好"
+	if !gradingParseable(fullyCorrect) {
+		t.Fatal("fully correct response unexpectedly requires process-error evidence")
+	}
+}
+
+func TestREGBUGK12ProcessEvidenceComplete004UsesSingleFreshContextRetry(t *testing.T) {
+	problem := "从六个数中划去一个数，使其中三个数的和为另外两个数和的2倍。"
+	verified := "划去29后，5+12+23=40，6+14=20，40=20×2。答案：29"
+	student := "划去29；5+23+14=42；6+12=18；42=18×2"
+
+	t.Run("complete retry is accepted", func(t *testing.T) {
+		calls := 0
+		var specs []SubAgentSpec
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		outerDeadline, _ := ctx.Deadline()
+		solver := NewSolveSkill(func(callCtx context.Context, spec SubAgentSpec) (SubAgentResult, error) {
+			calls++
+			specs = append(specs, spec)
+			callDeadline, hasDeadline := callCtx.Deadline()
+			if !hasDeadline || !callDeadline.Equal(outerDeadline) {
+				t.Fatalf("fresh-context retry replaced the caller deadline: got=%v want=%v",
+					callDeadline, outerDeadline)
+			}
+			if calls == 1 {
+				return SubAgentResult{Output: "CORRECT: no\nFINAL_ANSWER_CORRECT: yes\nWRONG_STEP:\nMISCONCEPTION:\nGUIDANCE: 重算两组和"}, nil
+			}
+			return SubAgentResult{Output: "CORRECT: no\nFINAL_ANSWER_CORRECT: yes\nWRONG_STEP: 5+23+14=42\nMISCONCEPTION: 加法计算错误\nGUIDANCE: 分别重算两组和"}, nil
+		}, NewSubAgentRegistry(""))
+		result, err := solver.GradeVerified(ctx, problem, verified, student)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(specs) != 2 || specs[1].RunID != specs[0].RunID+"-retry" ||
+			specs[1].Task != specs[0].Task+strictFormatReminder {
+			t.Fatalf("fresh-context retry identity drifted: specs=%#v", specs)
+		}
+		first, retry := specs[0], specs[1]
+		first.RunID, first.Task = "", ""
+		retry.RunID, retry.Task = "", ""
+		if !reflect.DeepEqual(first, retry) {
+			t.Fatalf("fresh-context retry changed route/tool semantics: first=%#v retry=%#v", first, retry)
+		}
+		if calls != 2 || result.Metadata["grade_final_answer_correct"] != "true" ||
+			result.Metadata["grade_wrong_step"] == "" || result.Metadata["grade_misconception"] == "" {
+			t.Fatalf("fresh-context retry did not preserve complete process evidence: calls=%d metadata=%#v",
+				calls, result.Metadata)
+		}
+	})
+
+	t.Run("incomplete retry stays untrusted without a third call", func(t *testing.T) {
+		calls := 0
+		solver := NewSolveSkill(func(context.Context, SubAgentSpec) (SubAgentResult, error) {
+			calls++
+			return SubAgentResult{Output: "CORRECT: no\nFINAL_ANSWER_CORRECT: yes\nWRONG_STEP:\nMISCONCEPTION:\nGUIDANCE: 重算两组和"}, nil
+		}, NewSubAgentRegistry(""))
+		result, err := solver.GradeVerified(context.Background(), problem, verified, student)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if calls != 2 || result.Metadata["grade_wrong_step"] != "" ||
+			result.Metadata["grade_misconception"] != "" {
+			t.Fatalf("incomplete retry invented process evidence: calls=%d metadata=%#v",
+				calls, result.Metadata)
+		}
+	})
+
+	t.Run("unprovable incomplete retry stays untrusted without a third call", func(t *testing.T) {
+		calls := 0
+		solver := NewSolveSkill(func(context.Context, SubAgentSpec) (SubAgentResult, error) {
+			calls++
+			return SubAgentResult{Output: "CORRECT: no\nFINAL_ANSWER_CORRECT: yes\nWRONG_STEP:\nMISCONCEPTION:\nGUIDANCE: 重算两组和"}, nil
+		}, NewSubAgentRegistry(""))
+		result, err := solver.GradeVerified(context.Background(), problem, verified, "划去29，分组过程看不清")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if calls != 2 || result.Metadata["grade_wrong_step"] != "" ||
+			result.Metadata["grade_misconception"] != "" {
+			t.Fatalf("无法程序证明的过程不得猜补: calls=%d metadata=%#v", calls, result.Metadata)
 		}
 	})
 }

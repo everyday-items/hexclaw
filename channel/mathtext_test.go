@@ -85,6 +85,15 @@ func TestLaTeXToUnicode_MixedTextOnlyTouchesFormula(t *testing.T) {
 	}
 }
 
+func TestREGBUGK12C02StandaloneVariable003_StandaloneMathIdentifier(t *testing.T) {
+	in := "设 $x$ 为边长，面积记为 $S$；价格仍写作 $5。"
+	want := "设 x 为边长，面积记为 S；价格仍写作 $5。"
+	got, changed := LaTeXToUnicode(in)
+	if got != want || !changed {
+		t.Fatalf("standalone math identifier projection: got=%q changed=%v want=%q", got, changed, want)
+	}
+}
+
 func TestLaTeXToUnicode_Idempotent(t *testing.T) {
 	inputs := []string{
 		`3 \times 4`, `\frac{\frac{1}{2}}{3}`, `$\pi r^2$`, `\sqrt{a+b}`,

@@ -48,10 +48,12 @@ var (
 	// closing-dollar 边界规则判断，不能靠拒绝所有数字公式规避。
 	readableMathHintRe = regexp.MustCompile(`[=+*/^×÷±≤≥≠≈√π-]`)
 	numericMathRe      = regexp.MustCompile(`^\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*$`)
-	supBracedRe        = regexp.MustCompile(`\^\{([-0-9n+=()]+)\}`)
-	supBareRe          = regexp.MustCompile(`\^(-?[0-9]+)`)
-	subBracedRe        = regexp.MustCompile(`_\{([-0-9+=()]+)\}`)
-	subBareRe          = regexp.MustCompile(`_([0-9]+)`)
+	// 单个 ASCII 字母位于成对美元定界符内时只能表达数学变量；货币仍由数字与闭合边界规则处理。
+	identifierMathRe = regexp.MustCompile(`^\s*[A-Za-z]\s*$`)
+	supBracedRe      = regexp.MustCompile(`\^\{([-0-9n+=()]+)\}`)
+	supBareRe        = regexp.MustCompile(`\^(-?[0-9]+)`)
+	subBracedRe      = regexp.MustCompile(`_\{([-0-9+=()]+)\}`)
+	subBareRe        = regexp.MustCompile(`_([0-9]+)`)
 	// 定界符外的 `_` 在词法上无法区分化学式与普通标识符。这里只找出候选，
 	// 再用已冻结的裸化学式白名单 fail-closed，避免把 PCI_2、OS_2 一类标识符改坏。
 	chemicalFormulaRe = regexp.MustCompile(`\b(?:[A-Z][a-z]?(?:_[0-9]+)?)+\b`)
@@ -357,7 +359,8 @@ func isASCIIWhitespace(value byte) bool {
 func isDollarMath(inner string) bool {
 	return latexHintRe.MatchString(inner) ||
 		readableMathHintRe.MatchString(inner) ||
-		numericMathRe.MatchString(inner)
+		numericMathRe.MatchString(inner) ||
+		identifierMathRe.MatchString(inner)
 }
 
 // convertMath 对一段文本做确定性 LaTeX→Unicode 转换。
