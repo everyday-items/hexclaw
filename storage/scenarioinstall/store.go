@@ -38,6 +38,18 @@ func (s *Store) RecordInstall(ctx context.Context, m *scenario.Manifest, r *scen
 	if err != nil {
 		return fmt.Errorf("scenarioinstall: 序列化收据: %w", err)
 	}
+	// 同版本同 manifest 的启动恢复是幂等操作，不能刷新持久收据时间戳或正文。
+	var existingVersion, existingStatus, existingManifest string
+	err = s.db.QueryRowContext(ctx, `
+SELECT version, status, manifest_json
+FROM scenario_installations
+WHERE scenario_id = ?`, m.ID).Scan(&existingVersion, &existingStatus, &existingManifest)
+	switch {
+	case err == nil && existingStatus == "installed" && existingVersion == m.Version && existingManifest == string(manifestJSON):
+		return nil
+	case err != nil && err != sql.ErrNoRows:
+		return fmt.Errorf("scenarioinstall: 读取既有安装记录 %s: %w", m.ID, err)
+	}
 	now := time.Now().Unix()
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO scenario_installations

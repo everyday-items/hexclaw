@@ -1690,8 +1690,12 @@ func (o *GradingOrchestrator) advanceOK(ctx context.Context, run *gradingRun, jo
 
 // failStage 当前自动阶段按可重试失败落库并返回原因（运行时落盘失败等本机 IO 类错误可重试）。
 func (o *GradingOrchestrator) failStage(ctx context.Context, run *gradingRun, jobID, kind string, cause error) (GradingJobView, error) {
+	retryable := !errors.Is(cause, k12.ErrModelCapabilityUnverified)
+	if !retryable {
+		kind = "model_capability_unverified"
+	}
 	v, aerr := o.deps.AdvanceGradingStage(ctx, run.agentName, jobID, AdvanceGradingInput{
-		Outcome: GradingOutcomeFailed, FailureKind: kind, Retryable: true,
+		Outcome: GradingOutcomeFailed, FailureKind: kind, Retryable: retryable,
 	})
 	if aerr != nil {
 		return v, aerr
@@ -1725,6 +1729,10 @@ func (o *GradingOrchestrator) failModelInvocationBeforeSend(
 		kind = "invocation_policy_invalid"
 		retryable = false
 	}
+	if errors.Is(cause, k12.ErrModelCapabilityUnverified) {
+		kind = "model_capability_unverified"
+		retryable = false
+	}
 	v, err := o.deps.AdvanceGradingStage(ctx, run.agentName, jobID, AdvanceGradingInput{
 		Outcome: GradingOutcomeFailed, FailureKind: kind, Retryable: retryable,
 	})
@@ -1737,7 +1745,7 @@ func (o *GradingOrchestrator) failModelInvocationBeforeSend(
 // gradingErrRetryable 失败可重试判定：输入类错误重跑必然同败；收到明确 HTTP
 // 响应时，仅 408/425/429 和 5xx 属瞬态。其余未类型化错误沿用既有可重试语义。
 func gradingErrRetryable(err error) bool {
-	if errors.Is(err, ErrInvalidInput) {
+	if errors.Is(err, ErrInvalidInput) || errors.Is(err, k12.ErrModelCapabilityUnverified) {
 		return false
 	}
 	if statusCode, definitive := definitiveProviderResponseStatus(err); definitive {

@@ -248,6 +248,20 @@ func applyDesktopOverrides(cfg *config.Config) {
 	cfg.Security.ContentFilter.Enabled = false      // 不按 harmful/illegal 拦内容
 }
 
+func effectiveVisionProviderInstanceID(name string, provider config.LLMProviderConfig) string {
+	return config.EffectiveProviderInstanceID(name, provider)
+}
+
+// wireToolApprovalSessionLifecycle 将会话删除绑定到当前进程唯一的 PermissionHub。
+// SQLite 在删除事务内撤销 durable authority；该 hook 只清理同一 Hub 的 waiter 与缓存。
+func wireToolApprovalSessionLifecycle(srv *api.Server, permHub *engine.PermissionHub) {
+	srv.SetSessionDeletedHook(func(sessionID string) {
+		if err := permHub.ClearSession(sessionID); err != nil {
+			logger.Error("[permission] clear session state after delete", "session_id", sessionID, "error", err)
+		}
+	})
+}
+
 const (
 	installedSemanticActivationAttempts   = 4
 	installedSemanticActivationRetryDelay = 500 * time.Millisecond
@@ -505,17 +519,20 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	}
 
 	// 4.55 静态加密保险箱（主密钥 ~/.hexclaw/master.key，load-or-create）。提前到 MCP 连接之前
-	// 创建：MCP server 的 env 凭证（DB 密码等）静态加密落盘，启动时须先解密再交给 mcpMgr 连接。
-	// 加载失败降级为明文（保持可用），仅告警；绝不记录密钥或明文凭据。box 后续复用于平台实例 / connector。
+	// 创建：MCP server 的 env/args 凭证静态加密落盘，启动时须先解密再交给 mcpMgr 连接。
+	// 加载失败直接停止，禁止任何 secret 进入明文或密文未解锁的运行时；box 后续复用于平台实例 / connector。
 	dataDir := filepath.Dir(cfg.Storage.SQLite.Path)
 	var secretBox *secret.Box
 	if box, berr := secret.LoadBox(dataDir); berr != nil {
-		logger.Warn("[secret] 加载主密钥失败，凭据将以明文存储", "err", berr.Error())
+		return fmt.Errorf("加载 MCP secret.Box failed closed: %w", berr)
 	} else {
 		secretBox = box
 	}
-	// 解密持久化的 MCP env（重启后从 yaml 读到 enc:v1:…），供下方 mcpMgr 连接使用。
-	config.DecryptMCPEnv(cfg.MCP.Servers, secretBox)
+	// 解密持久化的 MCP env/secret args（重启后从 yaml 读到 enc:v1:…），供下方
+	// mcpMgr 连接使用。Box 缺失或密文损坏时必须停止启动，不能把密文当参数交给子进程。
+	if err := config.DecryptMCPSecrets(cfg.MCP.Servers, secretBox); err != nil {
+		return fmt.Errorf("加载 MCP secret failed closed: %w", err)
+	}
 
 	// Existing HTTP MCP mutations must persist to the exact file loaded by this
 	// serve process. A custom --config path must never be redirected into
@@ -983,7 +1000,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 								}
 							}
 							return knowledge.VisionRouteSnapshot{
-								ProviderInstanceID:  providerConfig.ProviderInstanceID,
+								ProviderInstanceID:  effectiveVisionProviderInstanceID(providerName, providerConfig),
 								ProviderName:        providerName,
 								ProviderDisplayName: displayName,
 								Model:               providerConfig.Model,
@@ -1266,11 +1283,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	srv := api.NewServer(cfg, eng, gw, store)
 	// 会话删除后同步清理 PermissionHub 进程内 pending/remembered 状态
 	// （durable 撤销已由 Store.DeleteSession 事务内完成）。
-	srv.SetSessionDeletedHook(func(sessionID string) {
-		if err := permHub.ClearSession(sessionID); err != nil {
-			logger.Error("[permission] clear session state after delete", "session_id", sessionID, "error", err)
-		}
-	})
+	wireToolApprovalSessionLifecycle(srv, permHub)
 	sidecarCapabilityToken, err := sidecarCapabilityTokenFromEnv()
 	if err != nil {
 		return err
@@ -1577,14 +1590,15 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					if scheduler == nil {
 						return fmt.Errorf("webhook 绑定了 job %q 但调度器未就绪", event.JobID)
 					}
-					return scheduler.TriggerJob(ctx, event.JobID)
+					return scheduler.TriggerJobForOwner(ctx, event.JobID, event.UserID)
 				}
 				content := fmt.Sprintf("[Webhook: %s] %s\n\n指令: %s\n\nPayload 摘要: %s",
 					event.WebhookName, event.EventType, prompt, event.Summary)
 				_, err := eng.Process(ctx, &adapter.Message{
 					Platform: adapter.PlatformAPI,
-					UserID:   "webhook-system",
-					Content:  content,
+					// 所有者只来自数据库恢复的 Webhook 定义，不接受请求 payload 覆盖。
+					UserID:  event.UserID,
+					Content: content,
 					// webhook_id 供 engine 盖任务身份（task_ref=webhook:<id>）：
 					// 任务级 grant 求值与权限决策审计归因都依赖它。
 					Metadata: map[string]string{"source": "webhook", "webhook": event.WebhookName, "webhook_id": event.WebhookID},
@@ -1682,6 +1696,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	// 先从 DB 加载已持久化的 Agent 和规则
 	agents, defaultName, _ := agentStore.LoadAgents(ctx)
+	loadedAgentsFromStore := len(agents) > 0
 	rules, _ := agentStore.LoadRules(ctx)
 
 	// 如果 DB 为空，从配置文件种子数据初始化
@@ -1717,8 +1732,8 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 
 	agentRouter.LoadAll(agents, defaultName, rules)
 
-	// 配置种子写入 DB（幂等）
-	if len(agents) > 0 {
+	// 仅在持久化 Agent 为空时写入配置种子，避免启动恢复重写运行态元数据。
+	if shouldPersistRouterConfigSeed(loadedAgentsFromStore, len(agents)) {
 		_ = agentrouter.Sync(ctx, agentStore, agentRouter)
 	}
 
@@ -1807,6 +1822,10 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		engine.SetMaxSupervisorRounds(3)
 	}
 
+	// K12 的能力回执由 SQLite 控制面持久化；所有冻结任务在真实 Provider 边界复核它，
+	// 不把静态声明或旧任务快照当作可发送证据。
+	k12ModelCapabilityReceipts := storage.ModelCapabilityProbeReceiptStore(store)
+
 	// OrchestrateSkill + SpawnSkill 共享 executor: 通过 engine.Process 执行子任务。
 	// spec 携带 role/source/spawn_depth/工具继承/run_id/session，由 ApplySpecToMessage 落到 metadata。
 	agentExecFn := func(ctx context.Context, spec engine.SubAgentSpec) (engine.SubAgentResult, error) {
@@ -1821,6 +1840,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		// message routing disables the engine's normal cross-provider fallback;
 		// a settings change therefore affects only newly created Jobs.
 		if snapshot, ok := k12.GradingModelSnapshotFromContext(ctx); ok {
+			if err := validateK12FrozenModelCapabilityReceipt(
+				ctx, router, k12ModelCapabilityReceipts, snapshot, k12ProbeKindForSnapshot(snapshot),
+			); err != nil {
+				return engine.SubAgentResult{}, err
+			}
 			if msg.Metadata == nil {
 				msg.Metadata = map[string]string{}
 			}
@@ -1940,6 +1964,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				if err := k12.ValidateGradingModelRoute(ctx, snapshot.Provider, visionModel); err != nil {
 					return "", err
 				}
+				if err := validateK12FrozenModelCapabilityReceipt(
+					ctx, router, k12ModelCapabilityReceipts, snapshot, config.LLMModelCapabilityVision,
+				); err != nil {
+					return "", err
+				}
 			} else {
 				var rErr error
 				provider, visionModel, rErr = eng.RouteForVision(ctx)
@@ -2018,6 +2047,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			); err != nil {
 				return "", err
 			}
+			if err := validateK12FrozenModelCapabilityReceipt(
+				ctx, router, k12ModelCapabilityReceipts, snapshot, config.LLMModelCapabilityText,
+			); err != nil {
+				return "", err
+			}
 			task := prompt
 			if subject != "" {
 				task = "【学科：" + subject + "】" + task
@@ -2057,7 +2091,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		}
 		tutoringTipsReviewGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
 			provider, model, err := resolveK12FrozenTextCompletionRoute(
-				ctx, router, "K12 tutoring tips",
+				ctx, router, k12ModelCapabilityReceipts, "K12 tutoring tips",
 			)
 			if err != nil {
 				return "", err
@@ -2089,7 +2123,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		}
 		parentTeachingGuideGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
 			provider, model, err := resolveK12FrozenTextCompletionRoute(
-				ctx, router, "K12 parent tutoring guide",
+				ctx, router, k12ModelCapabilityReceipts, "K12 parent tutoring guide",
 			)
 			if err != nil {
 				return "", err
@@ -2122,9 +2156,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			return resp.Content, nil
 		}
 		causeSummaryGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
-			provider := router.Default()
-			if provider == nil {
-				return "", fmt.Errorf("k12 错因摘要: 没有可用的默认 LLM Provider")
+			provider, model, err := resolveK12FrozenTextCompletionRoute(
+				ctx, router, k12ModelCapabilityReceipts, "K12 cause summary",
+			)
+			if err != nil {
+				return "", err
 			}
 			task := prompt
 			if subject != "" {
@@ -2138,6 +2174,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			defer ccancel()
 			temp := 0.1
 			resp, err := provider.Complete(k12NonIdempotentLLMContext(cctx), hexagon.CompletionRequest{
+				Model: model,
 				Messages: []hexagon.Message{
 					{Role: hexagon.RoleSystem, Content: "你是中小学错题整理助手。根据题目和孩子的错误答案，仅归纳错因本身，20字以内；不要解题、不要出新题、不要复述题目、不要给答案。"},
 					{Role: hexagon.RoleUser, Content: task},
@@ -2152,7 +2189,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 		}
 		workFeedbackGenFn := func(ctx context.Context, subject, prompt, grade string) (string, error) {
 			provider, model, err := resolveK12FrozenTextCompletionRoute(
-				ctx, router, "K12 work feedback",
+				ctx, router, k12ModelCapabilityReceipts, "K12 work feedback",
 			)
 			if err != nil {
 				return "", err
@@ -2211,6 +2248,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				visionModel = snapshot.Model
 				if err := k12.ValidateGradingModelRoute(
 					ctx, snapshot.Provider, visionModel,
+				); err != nil {
+					return "", err
+				}
+				if err := validateK12FrozenModelCapabilityReceipt(
+					ctx, router, k12ModelCapabilityReceipts, snapshot, config.LLMModelCapabilityVision,
 				); err != nil {
 					return "", err
 				}
@@ -2325,13 +2367,17 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			// 统一 GradingJob 编排器（§6.7 单一应用服务）：桌面 HTTP 入口与钉钉 IM 入口共用；
 			// §6.15 异步执行模型（进程级 ctx + 有界并发 + panic 不逃逸）+ 阶段产物落盘恢复。
 			k12ModelSnapshot := func(requested k12.GradingModelSnapshot) (k12.GradingModelSnapshot, error) {
-				return resolveK12GradingModelSnapshot(router, requested)
+				return resolveK12GradingModelSnapshotWithCapabilityReceipt(
+					ctx, router, k12ModelCapabilityReceipts, requested,
+				)
 			}
 			k12rt.Deps.PracticeGenerationRoute = func(
-				_ context.Context,
+				requestCtx context.Context,
 				requested k12.GradingModelSnapshot,
 			) (k12.GradingModelSnapshot, error) {
-				return resolveK12PracticeModelSnapshot(router, requested)
+				return resolveK12PracticeModelSnapshotWithCapabilityReceipt(
+					requestCtx, router, k12ModelCapabilityReceipts, requested,
+				)
 			}
 			k12GradingOrch = k12usecase.NewGradingOrchestrator(k12rt.Deps, k12ModelSnapshot,
 				k12usecase.WithGradingRunDir(filepath.Join(dataDir, "k12", "grading-runs")),
@@ -2344,9 +2390,11 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 				Deps: &k12rt.Deps, Grading: k12GradingOrch, BaseContext: ctx,
 			}
 			k12rt.Deps.WorkFeedbackRoute = func(
-				_ context.Context, workType string,
+				requestCtx context.Context, workType string,
 			) (k12.ImageTaskRouteSnapshot, error) {
-				return resolveK12WorkFeedbackRoute(router, workType)
+				return resolveK12WorkFeedbackRouteWithCapabilityReceipt(
+					requestCtx, router, k12ModelCapabilityReceipts, workType,
+				)
 			}
 			k12WorkFeedback = &k12usecase.CreativeWorkFeedbackCoordinator{
 				Deps: &k12rt.Deps, Records: k12rt.Records, BaseContext: ctx,
@@ -2391,10 +2439,14 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 						Provider: resolved.Provider, ProviderDisplayName: providerDisplayName,
 						Model: resolved.Model, ModelID: resolved.Model,
 						Route: resolved.Route, Capability: resolved.Capability,
-						SelectionSource: selectionSource,
-						PolicyVersion:   "image-task-routing-v1",
-						PromptVersion:   "image-task-classifier-v1",
-						TimeoutMS:       resolved.TimeoutMS,
+						ProviderInstanceID:      resolved.ProviderInstanceID,
+						ConfigFingerprint:       resolved.ConfigFingerprint,
+						CapabilityReceiptDigest: resolved.CapabilityReceiptDigest,
+						ProbePolicyVersion:      resolved.ProbePolicyVersion,
+						SelectionSource:         selectionSource,
+						PolicyVersion:           "image-task-routing-v1",
+						PromptVersion:           "image-task-classifier-v1",
+						TimeoutMS:               resolved.TimeoutMS,
 					}, nil
 				},
 				ResolveRouteDisplay: func(

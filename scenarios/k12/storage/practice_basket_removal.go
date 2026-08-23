@@ -10,11 +10,8 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
-// RemovePracticeItemAndRetireGeneration removes one draft-basket item and,
-// when the item came from single-practice generation, retires the paired job
-// in the same SQLite transaction. This is the only legal removal path for a
-// generated placeholder/ready item: it prevents an in-flight worker from
-// recreating an item after the parent has removed it.
+// RemovePracticeItemAndRetireGeneration 在一个 SQLite 事务内移除草稿篮题目，
+// 同步退出逐题生成任务，或把已提交的积累默写推进为可再次加入状态。
 func (s *Store) RemovePracticeItemAndRetireGeneration(
 	ctx context.Context,
 	agentName, setRecordID, itemID, generationJobID, fieldsJSON string,
@@ -122,6 +119,13 @@ func (s *Store) RemovePracticeItemAndRetireGeneration(
 		if affected, _ := res.RowsAffected(); affected != 1 {
 			return fmt.Errorf("k12storage: 逐题 generation 未被唯一退出")
 		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE k12_accumulation_dictation_generations
+		SET status='re_add', practice_item_id='', failure_reason='', updated_at=?
+		WHERE agent_name=? AND practice_item_id=? AND status='committed'`,
+		now, agentName, itemID,
+	); err != nil {
+		return fmt.Errorf("k12storage: transition accumulation dictation to re-add: %w", err)
 	}
 	if err := mp.syncChildren(ctx, tx, setRecordID, fieldsJSON); err != nil {
 		return err

@@ -1215,7 +1215,7 @@ func (e *ReActEngine) completeWithTools(
 					if fbErr != nil || fbName == "" || tried[fbName] {
 						break
 					}
-					trace.L(ctx).Warn("Provider 降级", "from", providerName, "to", fbName, "err", err.Error(), "session", sessionID)
+					trace.L(ctx).Warn("Provider 降级", appendModelErrorLogFields([]any{"from", providerName, "to", fbName, "session", sessionID}, err)...)
 					providerName = fbName
 					modelName = e.getProviderModel(fbName, msg.Metadata)
 					provider = wrapVisionImageLimitProvider(fallbackP, modelName) // 反应式视觉兜底（无工具直连 failover 目标）
@@ -1237,7 +1237,7 @@ func (e *ReActEngine) completeWithTools(
 					return nil, fmt.Errorf("provider %s 调用失败: %w", providerName, err)
 				}
 				// 非显式且回退全失败：原始技术错误只进日志，返回翻译后的友好中文（不 %w 泄漏堆栈/状态码）。
-				trace.L(ctx).Warn("provider 无工具直连调用失败", "provider", providerName, "model", modelName, "err", err.Error(), "session", sessionID)
+				trace.L(ctx).Warn("provider 无工具直连调用失败", appendModelErrorLogFields([]any{"provider", providerName, "model", modelName, "session", sessionID}, err)...)
 				return nil, friendlyLLMError(err)
 			}
 		}
@@ -1325,7 +1325,7 @@ func (e *ReActEngine) completeWithTools(
 	// → 去掉 tools 重试一次，让对话正常出内容（降级而非把 404 硬失败甩给用户）。错误发生
 	// 在首个 provider 调用、尚未产出任何结果，去工具重试安全。
 	if err != nil && len(req.Tools) > 0 && isToolUnsupportedError(err) {
-		trace.L(ctx).Warn("模型不支持工具调用，去工具重试", "provider", providerName, "model", modelName, "err", err.Error(), "session", sessionID)
+		trace.L(ctx).Warn("模型不支持工具调用，去工具重试", appendModelErrorLogFields([]any{"provider", providerName, "model", modelName, "session", sessionID}, err)...)
 		result, err = runner.Run(ctx, hruntime.Request{
 			ID:           messageRequestID(msg),
 			Messages:     req.Messages,
@@ -1343,7 +1343,7 @@ func (e *ReActEngine) completeWithTools(
 	// friendlyLLMError。显式 pin 由 failoverAdvance 内部拒绝（尊重用户选择，不静默改派）。
 	for err != nil && isProviderUnavailableError(err) && selector.failoverAdvance(err) {
 		_, fbName, fbModel := selector.Current()
-		trace.L(ctx).Warn("Provider 回退重试", "to", fbName, "model", fbModel, "err", err.Error(), "session", sessionID)
+		trace.L(ctx).Warn("Provider 回退重试", appendModelErrorLogFields([]any{"to", fbName, "model", fbModel, "session", sessionID}, err)...)
 		// BUG-20260712：按目标 provider locality 重建 cloud-safe 请求（回退到云端时 buildTurnContext
 		// 不注入跨会话记忆 → 信封不含 ClassMemory → 不触发云 egress 拦截）。工具沿用原 tools 重新挂上，
 		// 别把 tools 丢了；重套 per-turn policy 以匹配新 model。ctx 链上的 sink/routedAgent 值保留。
@@ -1381,7 +1381,7 @@ func (e *ReActEngine) completeWithTools(
 	if err != nil && !maxTurnsHit {
 		// BUG-20260711-B：不把原始 500 / cmake / llama-server 堆栈甩给用户——原始 err 只进
 		// 日志，返回翻译后的友好中文（本地运行时缺组件 / 工具不支持兜底 / 限流 / 鉴权 / 超时）。
-		trace.L(ctx).Warn("runtime 工具循环失败", "provider", providerName, "model", modelName, "num_ctx", reqNumCtxField(req), "attachments", len(msg.Attachments), "egress", egressSummaryField(ctx), "err", err.Error(), "session", sessionID)
+		trace.L(ctx).Warn("runtime 工具循环失败", appendModelErrorLogFields([]any{"provider", providerName, "model", modelName, "num_ctx", reqNumCtxField(req), "attachments", len(msg.Attachments), "egress", egressSummaryField(ctx), "session", sessionID}, err)...)
 		return nil, friendlyLLMError(err)
 	}
 	if result == nil {
@@ -2293,7 +2293,7 @@ func (e *ReActEngine) processStreamRuntime(
 		// （降级而非把 404 硬失败甩给用户）。错误发生在 header/首个 provider 调用、还没 emit
 		// 任何内容，此处不 notify error、不往 ch 塞 error，重试安全。
 		if err != nil && len(req.Tools) > 0 && isToolUnsupportedError(err) {
-			trace.L(ctx).Warn("模型不支持工具调用，去工具重试（流式）", "provider", selection.providerName, "model", selection.modelName, "err", err.Error(), "session", sessionID)
+			trace.L(ctx).Warn("模型不支持工具调用，去工具重试（流式）", appendModelErrorLogFields([]any{"provider", selection.providerName, "model", selection.modelName, "session", sessionID}, err)...)
 			result, err = runner.Stream(streamCtx, hruntime.Request{
 				ID:           messageRequestID(msg),
 				Messages:     req.Messages,
@@ -2311,7 +2311,7 @@ func (e *ReActEngine) processStreamRuntime(
 		// error，回退安全；failoverAdvance 已熔断失败者并推进 current，Select 返回它。
 		for err != nil && isProviderUnavailableError(err) && selector.failoverAdvance(err) {
 			_, fbName, fbModel := selector.Current()
-			trace.L(ctx).Warn("Provider 回退重试（流式）", "to", fbName, "model", fbModel, "err", err.Error(), "session", sessionID)
+			trace.L(ctx).Warn("Provider 回退重试（流式）", appendModelErrorLogFields([]any{"to", fbName, "model", fbModel, "session", sessionID}, err)...)
 			// BUG-20260712：按目标 provider locality 重建 cloud-safe 请求（回退到云端时不注入跨会话
 			// 记忆 → 信封不含 ClassMemory → 不触发云 egress 拦截）。streamCtx 链上的 sink/routedAgent
 			// 值保留；工具沿用原 tools 重新挂上，别把 tools 丢了；重套 per-turn policy 匹配新 model。
@@ -2353,7 +2353,7 @@ func (e *ReActEngine) processStreamRuntime(
 		if err != nil && !maxTurnsHit {
 			// BUG-20260711-B：不把原始 500 / cmake / llama-server 堆栈甩给用户——原始 err 只
 			// 进日志，往客户端只发翻译后的友好中文。
-			trace.L(ctx).Warn("runtime stream 失败", "provider", selection.providerName, "model", selection.modelName, "num_ctx", reqNumCtxField(req), "attachments", len(msg.Attachments), "egress", egressSummaryField(ctx), "err", err.Error(), "session", sessionID)
+			trace.L(ctx).Warn("runtime stream 失败", appendModelErrorLogFields([]any{"provider", selection.providerName, "model", selection.modelName, "num_ctx", reqNumCtxField(req), "attachments", len(msg.Attachments), "egress", egressSummaryField(ctx), "session", sessionID}, err)...)
 			friendly := friendlyLLMError(err)
 			sink.notifyStarted(friendly)
 			ch <- &adapter.ReplyChunk{Error: friendly, Done: true}
@@ -2726,20 +2726,13 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 		}()
 	}
 
-	// 完整记录模型本次返回内容（无截断），便于在日志页核对模型究竟产出了什么。
+	// 只记录模型回复的诊断元数据；正文与推理内容由会话存储管理，不能进入日志。
 	logModelReply(ctx, "stream", sessionID, providerName, modelName, content, reasoning, len(result.ToolCalls), maxTurnsHit)
 
 	return content, streamTail, buildReplyMetadata(msgMeta, providerName, modelName, assistantMessageID), usage, runtimeToolCallsToAdapter(result.ToolCalls)
 }
 
-// maxLoggedReplyChars 是写入日志的模型输出上限（rune）。日志落在 5000 槽内存 ring buffer，
-// 不能无界——单条超大回复 × 5000 槽会撑爆内存（参考生态 373MB 累积事故）。16000 rune 对真实
-// 对话回复几乎都是全量展示；完整回复仍在会话持久化里，日志只作排查视图。
-const maxLoggedReplyChars = 16000
-
-// logModelReply 在回复完成时记一条带模型输出的日志，便于 LogsView 详情抽屉核对模型返回内容。
-// content/reasoning 以 maxLoggedReplyChars 设上限（复用 toolkit stringx，UTF-8 安全），既满足
-// 「看全模型输出」又不让内存日志无界膨胀。
+// logModelReply 在回复完成时只记录可用于关联与容量诊断的元数据。
 func logModelReply(ctx context.Context, path, sessionID, providerName, modelName, content, reasoning string, toolCalls int, maxTurnsHit bool) {
 	fields := []any{
 		"path", path,
@@ -2748,15 +2741,64 @@ func logModelReply(ctx context.Context, path, sessionID, providerName, modelName
 		"model", modelName,
 		"tool_calls", toolCalls,
 		"content_len", len(content),
-		"content", stringx.TruncateWithSuffix(content, maxLoggedReplyChars, "…(truncated)"),
 	}
 	if strings.TrimSpace(reasoning) != "" {
-		fields = append(fields, "reasoning", stringx.TruncateWithSuffix(reasoning, maxLoggedReplyChars, "…(truncated)"))
+		fields = append(fields, "reasoning_len", len(reasoning))
 	}
 	if maxTurnsHit {
 		fields = append(fields, "finish_reason", "max_turns")
 	}
 	trace.L(ctx).Info("模型回复完成", fields...)
+}
+
+// appendModelErrorLogFields 记录上游失败的分类信息，避免 ProviderError 的原始响应体进入任意 slog handler。
+func appendModelErrorLogFields(fields []any, err error) []any {
+	if err == nil {
+		return append(fields, "err", "")
+	}
+	var providerErr *llm.ProviderError
+	if errors.As(err, &providerErr) && providerErr != nil {
+		class := "provider_error"
+		if providerErr.StatusCode > 0 {
+			class = "provider_http_" + strconv.Itoa(providerErr.StatusCode)
+		} else if providerErr.Cause != nil {
+			class = "provider_transport"
+		}
+		fields = append(fields, "err", class)
+		if providerErr.Provider != "" {
+			fields = append(fields, "provider_name", providerErr.Provider)
+		}
+		if providerErr.Action != "" {
+			fields = append(fields, "provider_action", providerErr.Action)
+		}
+		if providerErr.StatusCode > 0 {
+			fields = append(fields, "provider_status_code", providerErr.StatusCode)
+		}
+		if providerErr.Status != "" {
+			fields = append(fields, "provider_status", providerErr.Status)
+		}
+		if providerErr.RequestID != "" {
+			fields = append(fields, "provider_request_id", providerErr.RequestID)
+		}
+		if providerErr.RetryAfter > 0 {
+			fields = append(fields, "provider_retry_after_ms", providerErr.RetryAfter.Milliseconds())
+		}
+		if providerErr.Body != "" {
+			fields = append(fields, "provider_body_len", len(providerErr.Body))
+		}
+		return fields
+	}
+	message := err.Error()
+	index := strings.LastIndex(strings.ToLower(message), "body:")
+	if index < 0 {
+		return append(fields, "err", message)
+	}
+	body := strings.TrimSpace(message[index+len("body:"):])
+	prefix := strings.TrimSpace(message[:index])
+	if prefix == "" {
+		prefix = "provider error"
+	}
+	return append(fields, "err", prefix+", body_redacted", "provider_body_len", len(body))
 }
 
 // processStreamToolLoop 多轮工具循环（后续版本启用）
@@ -3000,7 +3042,7 @@ func (e *ReActEngine) pipeStream(
 			}
 			fullReasoning.WriteString(chunk.Reasoning)
 			if !reasoningLogged {
-				trace.L(ctx).Info("首个 chunk", "type", "reasoning", "preview", chunk.Reasoning[:min(50, len(chunk.Reasoning))])
+				trace.L(ctx).Info("首个 chunk", "type", "reasoning", "reasoning_len", len(chunk.Reasoning))
 				reasoningLogged = true
 			}
 		}
@@ -3437,13 +3479,16 @@ func (e *ReActEngine) pipeStreamWithTools(
 //	   （真机取证：辅导会话问天气命中《Go面试题》）。待知识集支持按 agent 绑定后再开放；
 //	   显式 `@` 召唤知识不走此门，不受影响。
 //	② 超短输入（<4 rune：你好/ok/1+1）无检索意图 → 跳过整个 embed+检索往返（延迟优化）。
+//	③ 用户明确要求不查询、不检索或不引用知识资料 → 跳过自动注入；显式查询意图优先，
+//	   避免“不要猜，请查询知识库”被否定词误杀。
 //
 // 查无此人的 role 不在此拦（guardExplicitRoleExists 已 fail-loud，本门不越权）。
 func (e *ReActEngine) shouldAutoInjectKB(msg *adapter.Message) bool {
 	if msg == nil {
 		return false
 	}
-	if len([]rune(strings.TrimSpace(msg.Content))) < 4 {
+	content := strings.TrimSpace(msg.Content)
+	if len([]rune(content)) < 4 || explicitlyDeclinesKnowledgeRetrieval(content) {
 		return false
 	}
 	if msg.Metadata == nil {
@@ -3466,6 +3511,48 @@ func (e *ReActEngine) shouldAutoInjectKB(msg *adapter.Message) bool {
 		}
 	}
 	return true
+}
+
+func explicitlyDeclinesKnowledgeRetrieval(content string) bool {
+	content = strings.ToLower(strings.TrimSpace(content))
+	if content == "" {
+		return false
+	}
+
+	// 显式查询指令优先于同句中的一般否定，避免“不要猜”之类约束误杀检索。
+	for _, intent := range []string{
+		"请查询知识库", "请检索知识库", "请搜索知识库", "请查知识库",
+		"请根据知识库", "请依据知识库", "请引用知识库",
+		"请根据文档", "请依据文档", "请引用文档",
+		"请根据资料", "请依据资料", "请引用资料",
+		"please search the knowledge base", "please use the knowledge base",
+	} {
+		if strings.Contains(content, intent) {
+			return false
+		}
+	}
+
+	for _, intent := range []string{
+		"不要查询知识库", "不用查询知识库", "无需查询知识库", "不需要查询知识库", "别查询知识库",
+		"不要检索知识库", "不用检索知识库", "无需检索知识库", "不需要检索知识库", "别检索知识库",
+		"不要搜索知识库", "不用搜索知识库", "无需搜索知识库", "不需要搜索知识库", "别搜索知识库",
+		"不要使用知识库", "不用使用知识库", "无需使用知识库", "不需要使用知识库", "别使用知识库",
+		"不要引用知识库", "不用引用知识库", "无需引用知识库", "不需要引用知识库", "别引用知识库",
+		"不要查询任何资料", "不用查询任何资料", "无需查询任何资料", "不需要查询任何资料",
+		"不要检索任何资料", "不用检索任何资料", "无需检索任何资料", "不需要检索任何资料",
+		"不要引用知识资料", "不用引用知识资料", "无需引用知识资料", "不需要引用知识资料",
+		"不要查询或引用任何资料", "不用查询或引用任何资料", "无需查询或引用任何资料", "不需要查询或引用任何资料",
+		"不要检索或引用任何资料", "不用检索或引用任何资料", "无需检索或引用任何资料", "不需要检索或引用任何资料",
+		"不查询、不检索、不引用知识资料",
+		"do not search the knowledge base", "don't search the knowledge base",
+		"without searching the knowledge base", "do not use the knowledge base",
+		"don't use the knowledge base", "without using the knowledge base",
+	} {
+		if strings.Contains(content, intent) {
+			return true
+		}
+	}
+	return false
 }
 
 // guardExplicitRoleExists BUG-20260710：metadata.role 显式指定但既非内置工厂角色、也非注册 agent
@@ -3675,7 +3762,7 @@ func (e *ReActEngine) completeDirect(
 		if fbErr != nil {
 			return nil, fmt.Errorf("多模态补全失败且无可用备用: %w", err)
 		}
-		trace.L(ctx).Warn("Provider 多模态降级", "from", providerName, "to", fbName, "err", err, "session", sessionID)
+		trace.L(ctx).Warn("Provider 多模态降级", appendModelErrorLogFields([]any{"from", providerName, "to", fbName, "session", sessionID}, err)...)
 		resp, err = wrapVisionImageLimitProvider(fallbackP, e.getProviderModel(fbName, msg.Metadata)).Complete(ctx, req)
 		if err != nil {
 			return nil, fmt.Errorf("多模态补全失败（降级后）: %w", err)

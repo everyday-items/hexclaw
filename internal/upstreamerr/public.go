@@ -49,6 +49,10 @@ func PublicMessage(err error, fallback string) string {
 		return parsed
 	}
 
+	if index := strings.LastIndex(strings.ToLower(raw), "body:"); index >= 0 {
+		return strings.TrimRight(strings.TrimSpace(raw[:index]), ",; ")
+	}
+
 	return raw
 }
 

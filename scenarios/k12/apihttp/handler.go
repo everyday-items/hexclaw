@@ -316,7 +316,9 @@ type mistakeDTO struct {
 	ArchivedAt        int64  `json:"archived_at,omitempty"`
 	RestoredAt        int64  `json:"archive_restored_at,omitempty"`
 	// Restorable 是服务端按当前状态与合法快照计算的能力投影，不进入持久化或备份。
-	Restorable bool `json:"restorable"`
+	Restorable  bool   `json:"restorable"`
+	CreatedAt   int64  `json:"created_at,omitempty"`
+	EntrySource string `json:"entry_source,omitempty"`
 }
 
 type viewDescriptorDTO struct {
@@ -658,7 +660,7 @@ func (h *handler) mistakes(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, dto)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": len(recs)})
 }
 
 // deleteMistake DELETE /mistakes/{record_id}?agent=X —— 家长「删除这条错题」（UX-3 数据纠错）。
@@ -1245,30 +1247,47 @@ func (h *handler) rollbackRestoreAs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// export GET /export?agent=X&format=pdf|docx|md —— 错题本导出。
-// format=md 或 render 服务不可用 → 回退 Markdown JSON；pdf/docx → 渲染并流式返回二进制。
+// export GET /export?agent=X&format=pdf|docx|md —— 当前学期完整学习档案导出。
+// 三种格式消费同一个服务端 canonical Artifact；渲染失败只降级格式，不更换来源快照。
 func (h *handler) export(w http.ResponseWriter, r *http.Request) {
 	agent := r.URL.Query().Get("agent")
 	if agent == "" {
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
-	md, err := h.rt.Deps.ExportMistakesMarkdown(r.Context(), agent)
+	archive, err := h.rt.Deps.ExportLearningArchiveMarkdown(r.Context(), agent)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	markdownResponse := func(renderError string) map[string]any {
+		response := map[string]any{
+			"format": "markdown", "content": archive.CanonicalMarkdown,
+			"schema_version": archive.SchemaVersion, "scope": archive.Scope,
+			"as_of": archive.AsOf, "source_digest": archive.SourceDigest,
+			"object_counts": archive.ObjectCounts, "artifact_id": archive.ArtifactID,
+		}
+		if renderError != "" {
+			response["render_error"] = renderError
+		}
+		return response
+	}
 	format := r.URL.Query().Get("format")
 	if format == "" || format == "md" || h.rt.Deps.Renderer == nil {
-		writeJSON(w, http.StatusOK, map[string]string{"format": "markdown", "content": md})
+		writeJSON(w, http.StatusOK, markdownResponse(""))
 		return
 	}
-	data, contentType, err := h.rt.Deps.Renderer.Render(r.Context(), md, format)
+	data, contentType, err := h.rt.Deps.Renderer.Render(
+		r.Context(), archive.CanonicalMarkdown, format,
+	)
 	if err != nil {
-		// 渲染不可用/失败 → 优雅降级回 markdown（前端仍能拿到内容）
-		writeJSON(w, http.StatusOK, map[string]string{"format": "markdown", "content": md, "render_error": err.Error()})
+		writeJSON(w, http.StatusOK, markdownResponse(err.Error()))
 		return
 	}
+	countsJSON, _ := json.Marshal(archive.ObjectCounts)
+	w.Header().Set("X-HexClaw-Artifact-ID", archive.ArtifactID)
+	w.Header().Set("X-HexClaw-Source-Digest", archive.SourceDigest)
+	w.Header().Set("X-HexClaw-Object-Counts", string(countsJSON))
 	w.Header().Set("Content-Type", contentType)
 	// §4.13 文件名规范：导出（单孩）= {孩子称呼}_学习档案_{学期}.{ext}；
 	// 档案读不到（未接 Profiles / 未建档）回退现名 mistakes.{ext}。
@@ -1794,6 +1813,7 @@ func mistakeDTOWithReview(
 		RecordID: r.RecordID, Question: f.Question, KnowledgePoint: f.KnowledgePoint,
 		ErrorCause: f.ErrorCause, Status: r.Status, Version: r.Version, DueAt: r.DueAt,
 		Subject: f.Subject, SpotCheckState: f.SpotCheckState,
+		CreatedAt: r.CreatedAt, EntrySource: f.EntrySource,
 		ReviewState:       reviewState,
 		ParentConfirmedAt: f.ParentConfirmedAt,
 		Restorable: reviewState == k12.MistakeReviewSuppressed ||

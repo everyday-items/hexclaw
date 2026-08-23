@@ -24,13 +24,18 @@ func resolveK12WorkFeedbackRoute(
 	if err != nil {
 		return k12.ImageTaskRouteSnapshot{}, err
 	}
+	providerInstanceID, err := k12ProviderInstanceID(router, route.ProviderName)
+	if err != nil {
+		return k12.ImageTaskRouteSnapshot{}, err
+	}
 	return k12.ImageTaskRouteSnapshot{
-		Provider:        route.ProviderName,
-		Model:           route.Model,
-		Route:           route.ProviderName + "/" + route.Model,
-		Capability:      strings.Join(capabilities, "+"),
-		SelectionSource: "auto",
-		PolicyVersion:   "work-feedback-routing-v1",
-		PromptVersion:   promptVersion,
+		Provider:           route.ProviderName,
+		Model:              route.Model,
+		Route:              route.ProviderName + "/" + route.Model,
+		ProviderInstanceID: providerInstanceID,
+		Capability:         strings.Join(capabilities, "+"),
+		SelectionSource:    "auto",
+		PolicyVersion:      "work-feedback-routing-v1",
+		PromptVersion:      promptVersion,
 	}, nil
 }

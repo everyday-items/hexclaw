@@ -69,19 +69,13 @@ type ImageTaskCreativeEntry struct {
 
 func (e ImageTaskCreativeEntry) Validate() error {
 	if e.TaskIntent != ImageTaskIntentWriting && e.TaskIntent != ImageTaskIntentArtwork {
-		return fmt.Errorf("creative_entry task_intent 必须是 writing/artwork")
+		return fmt.Errorf("creative_entry task_intent must be writing or artwork")
 	}
-	switch e.Kind {
-	case CreativeWorkEntryNewWork:
-		if strings.TrimSpace(e.WorkID) != "" || strings.TrimSpace(e.BaseVersionID) != "" {
-			return fmt.Errorf("new_work 不得携带 work_id/base_version_id")
-		}
-	case CreativeWorkEntryRevision:
-		if strings.TrimSpace(e.WorkID) == "" || strings.TrimSpace(e.BaseVersionID) == "" {
-			return fmt.Errorf("revision 必须携带 work_id/base_version_id")
-		}
-	default:
-		return fmt.Errorf("creative_entry kind 非法: %q", e.Kind)
+	if e.Kind != CreativeWorkEntryNewWork {
+		return fmt.Errorf("creative_entry kind must be new_work")
+	}
+	if strings.TrimSpace(e.WorkID) != "" || strings.TrimSpace(e.BaseVersionID) != "" {
+		return fmt.Errorf("new_work must not include work_id or base_version_id")
 	}
 	return nil
 }
@@ -94,19 +88,31 @@ type ImageTaskRouteSnapshot struct {
 	ProviderDisplayName string `json:"provider_display_name,omitempty"`
 	Model               string `json:"model"`
 	ModelID             string `json:"model_id,omitempty"`
-	Route               string `json:"route"`
-	Capability          string `json:"capability"`
-	SelectionSource     string `json:"selection_source"` // explicit / auto
-	PolicyVersion       string `json:"policy_version"`
-	PromptVersion       string `json:"prompt_version"`
-	TimeoutMS           int    `json:"timeout_ms,omitempty"`
-	FallbackPolicy      string `json:"fallback_policy,omitempty"`
+	// ProviderInstanceID 冻结配置实体身份，避免展示名或路由键变化后误复用新配置。
+	ProviderInstanceID string `json:"provider_instance_id,omitempty"`
+	// ConfigFingerprint 绑定实际执行配置；静态声明能力仍由 Provider 配置独立表达。
+	ConfigFingerprint string `json:"config_fingerprint,omitempty"`
+	// CapabilityReceiptDigest 指向本次图片操作匹配的模型能力探测回执摘要。
+	CapabilityReceiptDigest string `json:"capability_receipt_digest,omitempty"`
+	// ProbePolicyVersion 冻结能力探测回执的探测策略版本。
+	ProbePolicyVersion string `json:"probe_policy_version,omitempty"`
+	Route              string `json:"route"`
+	Capability         string `json:"capability"`
+	SelectionSource    string `json:"selection_source"` // explicit / auto
+	PolicyVersion      string `json:"policy_version"`
+	PromptVersion      string `json:"prompt_version"`
+	TimeoutMS          int    `json:"timeout_ms,omitempty"`
+	FallbackPolicy     string `json:"fallback_policy,omitempty"`
 }
 
 func NormalizeImageTaskRouteSnapshot(s ImageTaskRouteSnapshot) ImageTaskRouteSnapshot {
 	s.Provider = strings.TrimSpace(s.Provider)
 	s.Model = strings.TrimSpace(s.Model)
 	s.Route = strings.TrimSpace(s.Route)
+	s.ProviderInstanceID = strings.TrimSpace(s.ProviderInstanceID)
+	s.ConfigFingerprint = strings.TrimSpace(s.ConfigFingerprint)
+	s.CapabilityReceiptDigest = strings.TrimSpace(s.CapabilityReceiptDigest)
+	s.ProbePolicyVersion = strings.TrimSpace(s.ProbePolicyVersion)
 	if s.Route == "" && s.Provider != "" && s.Model != "" {
 		s.Route = s.Provider + "/" + s.Model
 	}
@@ -115,6 +121,16 @@ func NormalizeImageTaskRouteSnapshot(s ImageTaskRouteSnapshot) ImageTaskRouteSna
 	s.PolicyVersion = strings.TrimSpace(s.PolicyVersion)
 	s.PromptVersion = strings.TrimSpace(s.PromptVersion)
 	return s
+}
+
+// HasFrozenCapabilityProbeEvidence 仅在全部绑定信息都存在时返回 true。旧记录和
+// 仅有部分升级字段的记录都不得被当作已经验证的模型能力。
+func (s ImageTaskRouteSnapshot) HasFrozenCapabilityProbeEvidence() bool {
+	s = NormalizeImageTaskRouteSnapshot(s)
+	return s.ProviderInstanceID != "" &&
+		s.ConfigFingerprint != "" &&
+		s.CapabilityReceiptDigest != "" &&
+		s.ProbePolicyVersion != ""
 }
 
 func (s ImageTaskRouteSnapshot) Validate() error {
@@ -375,7 +391,9 @@ type CreativeWorkCommitReceipt struct {
 	CommandDigest string `json:"command_digest"`
 	CommittedAt   int64  `json:"committed_at"`
 	WorkID        string `json:"work_id"`
-	VersionID     string `json:"version_id"`
+	GenerationID  string `json:"generation_id,omitempty"`
+	// VersionID 仅用于读取历史提交回执；当前写入只记录 GenerationID。
+	VersionID string `json:"version_id,omitempty"`
 }
 
 type CreativeWorkCommitCommand struct {
@@ -439,16 +457,18 @@ type CreativeWorkIntake struct {
 	Status                   CreativeWorkIntakeStatus           `json:"status"`
 	ConfirmationProvenance   CreativeWorkConfirmationProvenance `json:"confirmation_provenance,omitempty"`
 	PromotedWorkID           string                             `json:"promoted_work_id,omitempty"`
-	PromotedVersionID        string                             `json:"promoted_version_id,omitempty"`
-	CommitReceipt            *CreativeWorkCommitReceipt         `json:"commit_receipt,omitempty"`
-	IdempotencyKey           string                             `json:"idempotency_key"`
-	RequestDigest            string                             `json:"request_digest"`
-	AttemptGeneration        int                                `json:"attempt_generation"`
-	RetrySafe                bool                               `json:"retry_safe"`
-	FailureKind              string                             `json:"failure_kind,omitempty"`
-	Version                  int                                `json:"version"`
-	CreatedAt                int64                              `json:"created_at"`
-	UpdatedAt                int64                              `json:"updated_at"`
+	PromotedGenerationID     string                             `json:"promoted_generation_id,omitempty"`
+	// PromotedVersionID 仅用于读取历史接入记录；当前写入保持为空。
+	PromotedVersionID string                     `json:"promoted_version_id,omitempty"`
+	CommitReceipt     *CreativeWorkCommitReceipt `json:"commit_receipt,omitempty"`
+	IdempotencyKey    string                     `json:"idempotency_key"`
+	RequestDigest     string                     `json:"request_digest"`
+	AttemptGeneration int                        `json:"attempt_generation"`
+	RetrySafe         bool                       `json:"retry_safe"`
+	FailureKind       string                     `json:"failure_kind,omitempty"`
+	Version           int                        `json:"version"`
+	CreatedAt         int64                      `json:"created_at"`
+	UpdatedAt         int64                      `json:"updated_at"`
 }
 
 func (i CreativeWorkIntake) Validate() error {
@@ -491,8 +511,10 @@ func (i CreativeWorkIntake) Validate() error {
 			return fmt.Errorf("%s intake 不得携带 revision target", entryKind)
 		}
 	case CreativeWorkEntryRevision:
-		if strings.TrimSpace(i.TargetWorkID) == "" || strings.TrimSpace(i.BaseVersionID) == "" {
-			return fmt.Errorf("revision intake 缺少 target_work_id/base_version_id")
+		if i.Status != CreativeWorkIntakePromoted ||
+			strings.TrimSpace(i.TargetWorkID) == "" ||
+			strings.TrimSpace(i.BaseVersionID) == "" {
+			return fmt.Errorf("revision intake is read-only and cannot be committed")
 		}
 	default:
 		return fmt.Errorf("creative work intake entry_kind 非法: %q", i.EntryKind)
@@ -584,14 +606,16 @@ func (i CreativeWorkIntake) Validate() error {
 		}
 		if i.Status == CreativeWorkIntakePromoted &&
 			(strings.TrimSpace(i.PromotedWorkID) == "" ||
-				strings.TrimSpace(i.PromotedVersionID) == "") {
-			return fmt.Errorf("promoted intake 缺少 promoted work/version")
+				(strings.TrimSpace(i.PromotedGenerationID) == "" &&
+					strings.TrimSpace(i.PromotedVersionID) == "")) {
+			return fmt.Errorf("promoted intake is missing its work or generation identity")
 		}
 	default:
 		return fmt.Errorf("creative work intake status 非法: %q", i.Status)
 	}
 	if i.Status != CreativeWorkIntakePromoted &&
-		(i.PromotedWorkID != "" || i.PromotedVersionID != "" || i.CommitReceipt != nil) {
+		(i.PromotedWorkID != "" || i.PromotedGenerationID != "" ||
+			i.PromotedVersionID != "" || i.CommitReceipt != nil) {
 		return fmt.Errorf("非 promoted intake 不得持有 commit result")
 	}
 	if promotionPolicy == CreativeWorkPromotionAutomatic && i.CommitReceipt != nil {
@@ -600,7 +624,15 @@ func (i CreativeWorkIntake) Validate() error {
 	if i.CommitReceipt != nil {
 		if strings.TrimSpace(i.CommitReceipt.CommandDigest) == "" ||
 			i.CommitReceipt.CommittedAt == 0 ||
-			i.CommitReceipt.WorkID != i.PromotedWorkID ||
+			i.CommitReceipt.WorkID != i.PromotedWorkID {
+			return fmt.Errorf("creative work commit receipt is invalid")
+		}
+		if strings.TrimSpace(i.CommitReceipt.GenerationID) != "" {
+			if i.CommitReceipt.GenerationID != i.PromotedGenerationID ||
+				strings.TrimSpace(i.CommitReceipt.VersionID) != "" {
+				return fmt.Errorf("creative work commit receipt generation is invalid")
+			}
+		} else if strings.TrimSpace(i.CommitReceipt.VersionID) == "" ||
 			i.CommitReceipt.VersionID != i.PromotedVersionID {
 			return fmt.Errorf("creative work commit receipt 非法")
 		}

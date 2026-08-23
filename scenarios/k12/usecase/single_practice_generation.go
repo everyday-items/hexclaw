@@ -365,11 +365,7 @@ func (d Deps) singlePracticeView(
 		view.PracticeItemID = job.ResultItemIDs[0]
 	}
 	if job.RetiredAt != 0 {
-		if job.RetiredReason == "removed" {
-			view.State = SinglePracticeAvailable
-		} else {
-			view.State = SinglePracticeReAdd
-		}
+		view.State = SinglePracticeReAdd
 		return view, nil
 	}
 	switch job.Status {
@@ -564,6 +560,13 @@ func (d Deps) runSinglePracticeModelInvocation(
 
 	result, callErr := call()
 	if callErr != nil {
+		if errors.Is(callErr, k12.ErrModelCapabilityUnverified) {
+			_, ledgerErr := d.Records.MarkPracticeGenerationInvocationFailed(
+				context.WithoutCancel(ctx), job.AgentName,
+				invocation.InvocationID, "model_capability_unverified",
+			)
+			return zero, job, false, errors.Join(callErr, ledgerErr)
+		}
 		if definitiveProviderResponse(callErr) {
 			_, ledgerErr := d.Records.MarkPracticeGenerationInvocationFailed(
 				context.WithoutCancel(ctx), job.AgentName,

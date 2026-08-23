@@ -175,6 +175,11 @@ func DefaultConfig() *Config {
 		MCP: MCPConfig{
 			Enabled: true,
 		},
+		// 桌面端朗读使用无需凭据的 edge-tts；用户显式 voice 配置仍会覆盖该内存默认。
+		Voice: VoiceConfig{
+			Enabled: true,
+			TTS:     VoiceTTSConfig{Provider: "edge-tts"},
+		},
 		Budget: BudgetConfig{
 			MaxTokens:   500000,
 			MaxDuration: "30m",

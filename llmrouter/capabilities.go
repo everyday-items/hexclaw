@@ -15,6 +15,7 @@ package llmrouter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -116,7 +117,7 @@ func (s *CapabilityService) Probe(ctx context.Context, providerName, model strin
 	cap := probeProvider(ctx, p, providerName, model)
 	if s.store != nil {
 		if err := s.store.UpsertCapability(ctx, cap); err != nil {
-			trace.L(ctx).Warn("capability upsert 失败", "err", err, "provider", providerName, "model", model)
+			trace.L(ctx).Warn("capability upsert 失败", "err_class", "capability_store_error", "err_len", len(err.Error()), "provider", providerName, "model", model)
 		}
 	}
 	return cap, nil
@@ -169,43 +170,78 @@ func probeProvider(ctx context.Context, p hexagon.Provider, providerName, model 
 	resp, err := p.Complete(probeCtx, req)
 	if err != nil {
 		cap.ToolCall = ReliabilityBad
-		cap.ProbeError = fmt.Sprintf("Complete 失败: %v", err)
+		cap.ProbeError = probeCompleteFailure(err)
 		return cap
 	}
 
 	if len(resp.ToolCalls) == 0 {
 		cap.ToolCall = ReliabilityBad
-		cap.ProbeError = "模型未发起 tool_call（返回纯文本：" + truncate(resp.Content, 120) + ")"
+		cap.ProbeError = fmt.Sprintf("tool_call_absent response_len=%d", len(resp.Content))
 		return cap
 	}
 
 	call := resp.ToolCalls[0]
 	if call.Name != "echo" {
 		cap.ToolCall = ReliabilityPartial
-		cap.ProbeError = fmt.Sprintf("工具名错误: got=%q want=%q", call.Name, "echo")
+		cap.ProbeError = "tool_name_mismatch"
 		return cap
 	}
 
 	args, parseErr := parseToolArguments(call.Arguments)
 	if parseErr != nil {
 		cap.ToolCall = ReliabilityPartial
-		cap.ProbeError = fmt.Sprintf("参数无法解析: %v", parseErr)
+		cap.ProbeError = fmt.Sprintf("arguments_invalid arguments_len=%d", probeArgumentLength(call.Arguments))
 		return cap
 	}
 	text, ok := args["text"].(string)
 	if !ok {
 		cap.ToolCall = ReliabilityPartial
-		cap.ProbeError = fmt.Sprintf("参数 text 类型错误或缺失: %+v", args)
+		cap.ProbeError = fmt.Sprintf("argument_text_missing_or_non_string argument_fields=%d", len(args))
 		return cap
 	}
 	if text != "hello" {
 		cap.ToolCall = ReliabilityPartial
-		cap.ProbeError = fmt.Sprintf("参数 text 不匹配: got=%q want=%q", text, "hello")
+		cap.ProbeError = fmt.Sprintf("argument_text_mismatch text_len=%d", len(text))
 		return cap
 	}
 
 	cap.ToolCall = ReliabilityGood
 	return cap
+}
+
+// probeCompleteFailure 仅保留调用失败的稳定分类和原始响应体长度，不能把上游正文写入回执。
+func probeCompleteFailure(err error) string {
+	reason := llm.ClassifyError(err, 0, "").String()
+	var providerErr *llm.ProviderError
+	if errors.As(err, &providerErr) && providerErr != nil && providerErr.Body != "" {
+		return fmt.Sprintf("complete_%s body_len=%d", reason, len(providerErr.Body))
+	}
+	if err == nil {
+		return "complete_unknown error_len=0"
+	}
+	return fmt.Sprintf("complete_%s error_len=%d", reason, len(err.Error()))
+}
+
+func probeArgumentLength(arguments any) int {
+	switch value := arguments.(type) {
+	case string:
+		return len(value)
+	case []byte:
+		return len(value)
+	case map[string]any:
+		return len(value)
+	default:
+		return 0
+	}
+}
+
+func truncate(s string, n int) string {
+	// rune-safe 截断（委托 toolkit stringx.SubString），避免 byte-slice 切断 CJK 产生乱码（BUG-20260625 F-4）。
+	head := stringx.SubString(s, 0, n)
+	if head == s {
+		return s
+	}
+	return head + "..."
 }
 
 // parseToolArguments 兼容不同 Provider 返回的 Arguments 格式：
@@ -230,13 +266,4 @@ func parseToolArguments(raw any) (map[string]any, error) {
 	default:
 		return nil, fmt.Errorf("未知 Arguments 类型: %T", raw)
 	}
-}
-
-func truncate(s string, n int) string {
-	// rune-safe 截断（委托 toolkit stringx.SubString），避免 byte-slice 切断 CJK 产生乱码（BUG-20260625 F-4）。
-	head := stringx.SubString(s, 0, n)
-	if head == s {
-		return s
-	}
-	return head + "..."
 }

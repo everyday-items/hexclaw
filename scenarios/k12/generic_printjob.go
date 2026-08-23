@@ -1,20 +1,21 @@
 package k12
 
 const (
-	PrintSourceTutoringTips        = "tutoring_tips"
-	PrintSourceCreativeObservation = "creative_observation_card"
-	PrintSourcePracticeQuestion    = "practice_question"
-	PrintSourcePracticeAnswer      = "practice_answer"
-	PrintSourceGradingFinalArtifact = "grading_final_artifact"
+	PrintSourceTutoringTips           = "tutoring_tips"
+	PrintSourceCreativeObservation    = "creative_observation_card"
+	PrintSourcePracticeQuestion       = "practice_question"
+	PrintSourcePracticeAnswer         = "practice_answer"
+	PrintSourceGradingFinalArtifact   = "grading_final_artifact"
 	PrintSourceWeeklyPracticeSnapshot = "weekly_practice_snapshot"
-	MaxPrintAttempts               = 3
+	MaxPrintAttempts                  = 3
 )
 
 func GenericPrintSourceKindAllowed(kind string) bool {
 	switch kind {
 	case PrintSourceTutoringTips, PrintSourceCreativeObservation,
 		PrintSourcePracticeQuestion, PrintSourcePracticeAnswer,
-		PrintSourceGradingFinalArtifact, PrintSourceWeeklyPracticeSnapshot:
+		PrintSourceGradingFinalArtifact, PrintSourceWeeklyPracticeSnapshot,
+		PrintSourceLearningArchive:
 		return true
 	default:
 		return false

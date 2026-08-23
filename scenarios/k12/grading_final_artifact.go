@@ -11,8 +11,9 @@ type GradingFinalArtifactCoverageStatus string
 const (
 	GradingFinalArtifactStructureVersion = 1
 
-	GradingFinalArtifactCoverageComplete  GradingFinalArtifactCoverageStatus = "complete"
-	GradingFinalArtifactCoverageWithSkips GradingFinalArtifactCoverageStatus = "with_skips"
+	GradingFinalArtifactCoverageComplete        GradingFinalArtifactCoverageStatus = "complete"
+	GradingFinalArtifactCoverageWithSkips       GradingFinalArtifactCoverageStatus = "with_skips"
+	GradingFinalArtifactCoverageGeneralGuidance GradingFinalArtifactCoverageStatus = "general_guidance"
 )
 
 var ErrGradingFinalArtifactInvariant = errors.New("grading final artifact invariant violated")
@@ -21,20 +22,20 @@ var ErrGradingFinalArtifactInvariant = errors.New("grading final artifact invari
 // to print, export and formal delivery. OrderedCurrentDigestsJSON freezes the
 // exact current per-problem receipts used to build CanonicalMarkdown.
 type GradingFinalArtifact struct {
-	ArtifactID                   string                                     `json:"artifact_id"`
-	AgentName                    string                                     `json:"agent_name"`
-	JobID                        string                                     `json:"job_id"`
-	StructureVersion             int                                        `json:"structure_version"`
-	CoverageStatus               GradingFinalArtifactCoverageStatus         `json:"coverage_status"`
-	TotalCount                   int                                        `json:"total_count"`
-	PublishedCount               int                                        `json:"published_count"`
-	SkippedCount                 int                                        `json:"skipped_count"`
-	OrderedCurrentDigestsJSON    string                                     `json:"ordered_current_digests_json"`
-	CanonicalMarkdown            string                                     `json:"canonical_markdown"`
-	ArtifactDigest               string                                     `json:"artifact_digest"`
-	SummaryInvocationID          string                                     `json:"summary_invocation_id"`
-	CreatedAt                    int64                                      `json:"created_at"`
-	UpdatedAt                    int64                                      `json:"updated_at"`
+	ArtifactID                string                             `json:"artifact_id"`
+	AgentName                 string                             `json:"agent_name"`
+	JobID                     string                             `json:"job_id"`
+	StructureVersion          int                                `json:"structure_version"`
+	CoverageStatus            GradingFinalArtifactCoverageStatus `json:"coverage_status"`
+	TotalCount                int                                `json:"total_count"`
+	PublishedCount            int                                `json:"published_count"`
+	SkippedCount              int                                `json:"skipped_count"`
+	OrderedCurrentDigestsJSON string                             `json:"ordered_current_digests_json"`
+	CanonicalMarkdown         string                             `json:"canonical_markdown"`
+	ArtifactDigest            string                             `json:"artifact_digest"`
+	SummaryInvocationID       string                             `json:"summary_invocation_id"`
+	CreatedAt                 int64                              `json:"created_at"`
+	UpdatedAt                 int64                              `json:"updated_at"`
 }
 
 func (a GradingFinalArtifact) Validate() error {
@@ -60,6 +61,12 @@ func (a GradingFinalArtifact) Validate() error {
 		}
 	case GradingFinalArtifactCoverageWithSkips:
 		if a.SkippedCount == 0 || strings.TrimSpace(a.SummaryInvocationID) != "" {
+			return ErrGradingFinalArtifactInvariant
+		}
+	case GradingFinalArtifactCoverageGeneralGuidance:
+		if a.PublishedCount != a.TotalCount || a.SkippedCount != 0 ||
+			strings.TrimSpace(a.SummaryInvocationID) != "" ||
+			!strings.Contains(a.CanonicalMarkdown, "No verified textbook grounding is available.") {
 			return ErrGradingFinalArtifactInvariant
 		}
 	default:

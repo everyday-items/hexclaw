@@ -64,6 +64,80 @@ func (w *Writer) AppendMCPServer(name, transport, command string, args []string,
 	return w.writeConfig(cfg)
 }
 
+// UpsertMCPServer 写入一个已完成 secret metadata 归一化的 MCP server。
+// 同名项按一次读-改-写替换，供 Desktop 编辑现有连接时保留/清除 secret。
+func (w *Writer) UpsertMCPServer(server MCPServerConfig) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if server.Name == "" {
+		return fmt.Errorf("MCP server name cannot be empty")
+	}
+	// EncryptMCPSecrets 在写盘前会就地替换切片/映射值；复制输入避免把密文
+	// 泄漏回 handler 的运行时参数，运行时始终使用解密后的值。
+	server.Args = append([]string(nil), server.Args...)
+	if server.Env != nil {
+		server.Env = cloneMCPStringMapForWriter(server.Env)
+	}
+	if server.ArgsSecretRefs != nil {
+		server.ArgsSecretRefs = cloneMCPArgRefsForWriter(server.ArgsSecretRefs)
+	}
+	if server.EnvSecretRefs != nil {
+		server.EnvSecretRefs = cloneMCPStringMapForWriter(server.EnvSecretRefs)
+	}
+	cfg, err := w.readConfig()
+	if err != nil {
+		return err
+	}
+	found := false
+	for i := range cfg.MCP.Servers {
+		if cfg.MCP.Servers[i].Name != server.Name {
+			continue
+		}
+		cfg.MCP.Servers[i] = server
+		found = true
+		break
+	}
+	if !found {
+		cfg.MCP.Servers = append(cfg.MCP.Servers, server)
+	}
+	return w.writeConfig(cfg)
+}
+
+func cloneMCPStringMapForWriter(values map[string]string) map[string]string {
+	clone := make(map[string]string, len(values))
+	for key, value := range values {
+		clone[key] = value
+	}
+	return clone
+}
+
+func cloneMCPArgRefsForWriter(values map[int]string) map[int]string {
+	clone := make(map[int]string, len(values))
+	for index, ref := range values {
+		clone[index] = ref
+	}
+	return clone
+}
+
+// GetMCPServer 返回指定 server 的解密内存投影；调用方不得把结果写入日志或响应。
+func (w *Writer) GetMCPServer(name string) (*MCPServerConfig, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	cfg, err := w.readConfig()
+	if err != nil {
+		return nil, err
+	}
+	for i := range cfg.MCP.Servers {
+		if cfg.MCP.Servers[i].Name == name {
+			server := cfg.MCP.Servers[i]
+			return &server, nil
+		}
+	}
+	return nil, nil
+}
+
 // RemoveMCPServer 从配置文件移除 MCP server
 func (w *Writer) RemoveMCPServer(name string) error {
 	w.mu.Lock()
@@ -154,9 +228,11 @@ func (w *Writer) readConfig() (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	// 读改写一致性：把盘上密文 env 解回明文（无 box 时 no-op）。配合 writeConfig 的加密，
-	// 既不双重加密已有 server，也让本次新增的明文 env 在写回时统一加密。
-	DecryptMCPEnv(cfg.MCP.Servers, w.box)
+	// 读改写一致性：把盘上密文 env/secret args 解回明文。Box 缺失或密文损坏时
+	// 立即失败，禁止把密文交给 MCP 子进程或通过一次写回静默覆盖。
+	if err := DecryptMCPSecrets(cfg.MCP.Servers, w.box); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
@@ -164,8 +240,11 @@ func (w *Writer) writeConfig(cfg *Config) error {
 	if err := ensureOwnerOnlyDefaultConfigParent(w.path); err != nil {
 		return err
 	}
-	// 写盘前把 MCP env 凭证静态加密（无 box 时 no-op，保持明文）。
-	EncryptMCPEnv(cfg.MCP.Servers, w.box)
+	// 写盘前把 MCP env/secret args 静态加密。新 secret metadata 没有 Box 时
+	// fail-closed；无 metadata 的历史普通 MCP 配置保留兼容。
+	if err := EncryptMCPSecrets(cfg.MCP.Servers, w.box); err != nil {
+		return err
+	}
 	data, err := marshalConfigForPersistence(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)

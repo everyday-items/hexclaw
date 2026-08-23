@@ -20,11 +20,8 @@ func (s *Server) handleListWebhooks(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"webhooks": []any{}, "total": 0})
 		return
 	}
-	userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
+	userID := sessionUserIDFromRequest(r)
 	agentID := strings.TrimSpace(r.URL.Query().Get("agent_id"))
-	if userID == "" {
-		userID = "api-user"
-	}
 	// Receipt 查询复用冻结的 GET collection 路由，避免为 K12 另开第六条
 	// public surface。管理面仍按 binding.created_by 做 owner 校验。
 	if receiptID := strings.TrimSpace(r.URL.Query().Get("receipt_id")); receiptID != "" {
@@ -116,6 +113,8 @@ func (s *Server) handleRegisterWebhook(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// K12 与 generic Webhook 共用认证上下文中的可信所有者；仅无认证上下文时兼容直调参数。
+	req.UserID = sessionUserIDFromRequestOrBody(r, req.UserID)
 
 	if webhook.WebhookType(req.Type) == webhook.TypeK12 {
 		if req.Name == "" || req.AgentID == "" || req.LearnerID == "" || len(req.AllowedEvents) == 0 {
@@ -129,9 +128,6 @@ func (s *Server) handleRegisterWebhook(w http.ResponseWriter, r *http.Request) {
 		if s.webhookMgr == nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Webhook 未启用"})
 			return
-		}
-		if req.UserID == "" {
-			req.UserID = "api-user"
 		}
 		binding, oneTimeSecret, err := s.webhookMgr.CreateK12Binding(r.Context(), webhook.K12BindingInput{
 			Name: req.Name, AgentID: req.AgentID, LearnerID: req.LearnerID,
@@ -165,8 +161,27 @@ func (s *Server) handleRegisterWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.UserID == "" {
-		req.UserID = "api-user"
+	if req.JobID != "" {
+		if s.scheduler == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Cron scheduler unavailable"})
+			return
+		}
+		jobs, err := s.scheduler.ListJobs(r.Context(), req.UserID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to validate cron job"})
+			return
+		}
+		owned := false
+		for _, job := range jobs {
+			if job.ID == req.JobID {
+				owned = true
+				break
+			}
+		}
+		if !owned {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "Cron job not found"})
+			return
+		}
 	}
 
 	// Secret 未提供时服务端生成：验签是外部触发的第一道门，不应默认裸奔。
@@ -236,7 +251,7 @@ func (s *Server) handleUpdateWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("name")
-	userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
+	userID := sessionUserIDFromRequest(r)
 	agentID := strings.TrimSpace(r.URL.Query().Get("agent_id"))
 	var req UpdateWebhookRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
@@ -312,7 +327,7 @@ func (s *Server) handleUpdateWebhook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "enabled 必填"})
 		return
 	}
-	if err := s.webhookMgr.SetEnabled(r.Context(), name, *req.Enabled); err != nil {
+	if err := s.webhookMgr.SetEnabledForOwner(r.Context(), name, userID, *req.Enabled); err != nil {
 		// FS-10：不存在的 name 是 404（资源不存在），不是 500（服务端故障）。
 		if errors.Is(err, webhook.ErrWebhookNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "Webhook 不存在: " + name})
@@ -331,7 +346,7 @@ func (s *Server) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("name")
-	userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
+	userID := sessionUserIDFromRequest(r)
 	agentID := strings.TrimSpace(r.URL.Query().Get("agent_id"))
 	taskRef := ""
 	if binding, err := s.webhookMgr.GetK12Binding(r.Context(), name); err == nil {
@@ -355,15 +370,16 @@ func (s *Server) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "读取 K12 Webhook 失败"})
 		return
 	}
-	if wh, ok := s.webhookMgr.Get(name); ok {
-		taskRef = "webhook:" + wh.ID
-	}
-	if err := s.webhookMgr.Unregister(r.Context(), name); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"error": "删除 Webhook 失败: " + err.Error(),
-		})
+	webhookID, err := s.webhookMgr.UnregisterForOwner(r.Context(), name, userID)
+	if err != nil {
+		if errors.Is(err, webhook.ErrWebhookNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "Webhook not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to delete webhook"})
 		return
 	}
+	taskRef = "webhook:" + webhookID
 	// 授权生命周期跟随任务：删除即回收其全部任务级授权。
 	s.revokeTaskGrants(r.Context(), taskRef)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Webhook 已删除"})

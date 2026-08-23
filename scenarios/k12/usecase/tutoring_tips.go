@@ -32,10 +32,16 @@ type TutoringTipsSection struct {
 // not expose it because the current contract returns only knowledge_points and
 // the three sections.
 type TutoringTipsProblem struct {
-	ProblemID    string
-	StemMarkdown string
-	Subject      string
-	ConceptIDs   []string
+	ProblemID            string
+	StemMarkdown         string
+	Subject              string
+	ConceptIDs           []string
+	SourceNumberPath     []string
+	DisplayLabel         string
+	SourceSectionPath    []string
+	SourceSectionLabel   string
+	SystemSectionOrdinal int
+	SystemDisplayLabel   string
 }
 
 // TutoringTips is an ephemeral, read-only projection of one confirmed
@@ -237,7 +243,16 @@ func validateTutoringTipsFacts(questions []RecognizedQuestion, _ string) ([]Tuto
 			}
 		}
 		problems = append(problems, TutoringTipsProblem{
-			ProblemID: problemID, StemMarkdown: stem, Subject: subject, ConceptIDs: concepts,
+			ProblemID:            problemID,
+			StemMarkdown:         stem,
+			Subject:              subject,
+			ConceptIDs:           concepts,
+			SourceNumberPath:     append([]string(nil), question.SourceNumberPath...),
+			DisplayLabel:         strings.TrimSpace(question.DisplayLabel),
+			SourceSectionPath:    append([]string(nil), question.SourceSectionPath...),
+			SourceSectionLabel:   strings.TrimSpace(question.SourceSectionLabel),
+			SystemSectionOrdinal: question.SystemSectionOrdinal,
+			SystemDisplayLabel:   strings.TrimSpace(question.SystemDisplayLabel),
 		})
 	}
 	if len(problems) == 0 || len(knowledgePoints) == 0 {
@@ -445,8 +460,20 @@ func tutoringTipsLearningEvidence(childName string, history []ReviewItem) Tutori
 
 func tutoringTipsPerProblem(problems []TutoringTipsProblem) TutoringTipsSection {
 	var content strings.Builder
-	for index, problem := range problems {
-		fmt.Fprintf(&content, "### 第 %d 题 · %s\n\n", index+1, problem.ProblemID)
+	for _, problem := range problems {
+		label := RecognizedQuestionSourceDisplayLabel(RecognizedQuestion{
+			SourceSectionLabel: problem.SourceSectionLabel,
+			DisplayLabel:       problem.DisplayLabel,
+			SystemDisplayLabel: problem.SystemDisplayLabel,
+		})
+		if label == "" {
+			label = problem.ProblemID
+		}
+		if label == problem.ProblemID {
+			fmt.Fprintf(&content, "### %s\n\n", label)
+		} else {
+			fmt.Fprintf(&content, "### %s · %s\n\n", label, problem.ProblemID)
+		}
 		fmt.Fprintf(&content, "%s\n\n", problem.StemMarkdown)
 		content.WriteString("先请孩子用自己的话说清题目在问什么；再问他准备使用哪个已经学过的知识点、为什么；完成后请他自己检查步骤、符号和单位。\n\n")
 	}

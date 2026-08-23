@@ -20,6 +20,7 @@ import (
 	"github.com/hexagon-codes/hexagon/observe/trace"
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
+	"github.com/hexagon-codes/hexclaw/llmrouter"
 	"github.com/hexagon-codes/hexclaw/messagecontent"
 	"github.com/hexagon-codes/hexclaw/skill"
 	"github.com/hexagon-codes/hexclaw/streamstate"
@@ -551,6 +552,7 @@ func (a *WebAdapter) sendStreamWithIDs(ctx context.Context, chatID, sessionID, r
 				ReasoningReceipt:    normalizedReasoningReceipt(chunk.ReasoningReceipt),
 				RuntimeEvent:        chunk.RuntimeEvent,
 			}
+			attachLLMErrorTaxonomy(&errMsg, chunk.Error)
 			_ = a.sendToTargets(ctx, chatID, requestID, errMsg)
 			return chunk.Error
 		}
@@ -830,6 +832,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 						SessionID: msg.SessionID,
 						RequestID: incoming.RequestID,
 					}
+					attachLLMErrorTaxonomy(&errMsg, err)
 					_ = a.sendToTargets(ctx, chatID, incoming.RequestID, errMsg)
 					return
 				}
@@ -851,6 +854,7 @@ func (a *WebAdapter) handleWS(w http.ResponseWriter, r *http.Request) {
 					SessionID: msg.SessionID,
 					RequestID: incoming.RequestID,
 				}
+				attachLLMErrorTaxonomy(&errMsg, err)
 				_ = a.sendToTargets(ctx, chatID, "", errMsg)
 				return
 			}
@@ -1376,6 +1380,8 @@ func (a *WebAdapter) getConn(chatID string) (*websocket.Conn, bool) {
 type wsMessage struct {
 	Type                string                         `json:"type"` // message / reply / chunk / error / resume / stream_snapshot
 	Content             string                         `json:"content"`
+	Code                string                         `json:"code,omitempty"`
+	Retryable           *bool                          `json:"retryable,omitempty"`
 	MessageContent      *messagecontent.MessageContent `json:"message_content,omitempty"`
 	RenderManifest      *messagecontent.RenderManifest `json:"render_manifest,omitempty"`
 	Reasoning           string                         `json:"reasoning,omitempty"`
@@ -1418,6 +1424,20 @@ type wsMessage struct {
 	RuntimeEvent        *adapter.RuntimeEvent           `json:"runtime_event,omitempty"`
 	RuntimeEvents       []adapter.SequencedRuntimeEvent `json:"runtime_events,omitempty"`
 	LastSequence        uint64                          `json:"last_sequence,omitempty"`
+}
+
+// attachLLMErrorTaxonomy 仅为已识别的模型错误附加稳定机器码。
+func attachLLMErrorTaxonomy(msg *wsMessage, err error) {
+	if msg == nil {
+		return
+	}
+	classification, ok := llmrouter.ClassifyLLMError(err)
+	if !ok {
+		return
+	}
+	msg.Code = string(classification.Code)
+	retryable := classification.Retryable
+	msg.Retryable = &retryable
 }
 
 func normalizedReasoningReceipt(receipt *adapter.ReasoningReceipt) *adapter.ReasoningReceipt {

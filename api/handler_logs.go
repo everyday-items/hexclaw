@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/toolkit/util/idgen"
 	"nhooyr.io/websocket"
 )
@@ -124,13 +126,8 @@ func (c *LogCollector) AddTrace(level, source, message, traceID string, fields m
 }
 
 func (c *LogCollector) addEntry(level, source, message, traceID string, fields map[string]any) {
-	var clonedFields map[string]any
-	if len(fields) > 0 {
-		clonedFields = make(map[string]any, len(fields))
-		for k, v := range fields {
-			clonedFields[k] = v
-		}
-	}
+	message, _ = redactProviderErrorBody(message)
+	clonedFields := sanitizeLogFields(fields)
 
 	entry := LogEntry{
 		ID:        idgen.ShortID(),
@@ -183,6 +180,163 @@ func (c *LogCollector) addEntry(level, source, message, traceID string, fields m
 		}
 	}
 	c.subMu.RUnlock()
+}
+
+// modelPayloadLogFields 是不允许落入内存、文件或订阅日志的模型原文载荷字段。
+var modelPayloadLogFields = map[string]struct{}{
+	"content":         {},
+	"reasoning":       {},
+	"sample":          {},
+	"raw_head":        {},
+	"script_head":     {},
+	"preview":         {},
+	"body":            {},
+	"raw_body":        {},
+	"response_body":   {},
+	"request_preview": {},
+}
+
+// sanitizeLogFields 在写入 collector 前去除模型原文和 ProviderError 响应体，同时补足长度与请求诊断。
+func sanitizeLogFields(fields map[string]any) map[string]any {
+	if len(fields) == 0 {
+		return nil
+	}
+	cloned := make(map[string]any, len(fields))
+	provided := make(map[string]struct{}, len(fields))
+	for key := range fields {
+		provided[key] = struct{}{}
+	}
+	for key, value := range fields {
+		if isModelPayloadLogField(key) {
+			lengthKey := key + "_len"
+			if _, exists := provided[lengthKey]; !exists {
+				cloned[lengthKey] = logValueLength(value)
+			}
+			continue
+		}
+		if diagnostics, ok := providerErrorLogDiagnostics(value); ok {
+			cloned[key] = diagnostics.class
+			for diagnosticKey, diagnosticValue := range diagnostics.fields {
+				if _, exists := provided[diagnosticKey]; !exists {
+					cloned[diagnosticKey] = diagnosticValue
+				}
+			}
+			continue
+		}
+		sanitized, diagnostics := sanitizeLogValue(value)
+		cloned[key] = sanitized
+		for diagnosticKey, diagnosticValue := range diagnostics {
+			if _, exists := provided[diagnosticKey]; !exists {
+				cloned[diagnosticKey] = diagnosticValue
+			}
+		}
+	}
+	return cloned
+}
+
+func isModelPayloadLogField(key string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	if _, sensitive := modelPayloadLogFields[normalized]; sensitive {
+		return true
+	}
+	if separator := strings.LastIndex(normalized, "."); separator >= 0 {
+		_, sensitive := modelPayloadLogFields[normalized[separator+1:]]
+		return sensitive
+	}
+	return false
+}
+
+func logValueLength(value any) int {
+	switch typed := value.(type) {
+	case string:
+		return len(typed)
+	case []byte:
+		return len(typed)
+	default:
+		return 0
+	}
+}
+
+type providerErrorLogDiagnostic struct {
+	class  string
+	fields map[string]any
+}
+
+func providerErrorLogDiagnostics(value any) (providerErrorLogDiagnostic, bool) {
+	err, ok := value.(error)
+	if !ok {
+		return providerErrorLogDiagnostic{}, false
+	}
+	var providerErr *llm.ProviderError
+	if !errors.As(err, &providerErr) || providerErr == nil {
+		return providerErrorLogDiagnostic{}, false
+	}
+	fields := map[string]any{}
+	if providerErr.Provider != "" {
+		fields["provider_name"] = providerErr.Provider
+	}
+	if providerErr.Action != "" {
+		fields["provider_action"] = providerErr.Action
+	}
+	if providerErr.StatusCode > 0 {
+		fields["provider_status_code"] = providerErr.StatusCode
+	}
+	if providerErr.Status != "" {
+		fields["provider_status"] = providerErr.Status
+	}
+	if providerErr.RequestID != "" {
+		fields["provider_request_id"] = providerErr.RequestID
+	}
+	if providerErr.RetryAfter > 0 {
+		fields["provider_retry_after_ms"] = providerErr.RetryAfter.Milliseconds()
+	}
+	if providerErr.Body != "" {
+		fields["provider_body_len"] = len(providerErr.Body)
+	}
+	class := "provider_error"
+	if providerErr.StatusCode > 0 {
+		class = "provider_http_" + strconv.Itoa(providerErr.StatusCode)
+	}
+	return providerErrorLogDiagnostic{class: class, fields: fields}, true
+}
+
+func sanitizeLogValue(value any) (any, map[string]any) {
+	switch typed := value.(type) {
+	case error:
+		return redactProviderErrorBody(typed.Error())
+	case string:
+		return redactProviderErrorBody(typed)
+	case map[string]any:
+		return sanitizeLogFields(typed), nil
+	default:
+		return value, nil
+	}
+}
+
+func redactProviderErrorBody(value string) (string, map[string]any) {
+	index := strings.LastIndex(strings.ToLower(value), "body:")
+	if index < 0 {
+		return value, nil
+	}
+	body := strings.TrimSpace(value[index+len("body:"):])
+	if body == "" {
+		return value, nil
+	}
+	fields := map[string]any{"provider_body_len": len(body)}
+	var envelope map[string]any
+	if json.Unmarshal([]byte(body), &envelope) == nil {
+		if requestID, ok := envelope["request_id"].(string); ok && requestID != "" {
+			fields["provider_request_id"] = requestID
+		}
+		if requestID, ok := envelope["id"].(string); ok && requestID != "" {
+			fields["provider_request_id"] = requestID
+		}
+	}
+	prefix := strings.TrimSpace(value[:index])
+	if prefix == "" {
+		prefix = "provider error"
+	}
+	return prefix + ", body_redacted", fields
 }
 
 // Info 记录 info 日志

@@ -22,22 +22,26 @@ type APIError struct {
 // 标准错误码常量。新增时遵循：模块_错误类型 大写蛇形。
 const (
 	// 通用
-	CodeBadRequest     = "BAD_REQUEST"
-	CodeInternalError  = "INTERNAL_ERROR"
-	CodeNotFound       = "NOT_FOUND"
-	CodeUnauthorized   = "UNAUTHORIZED"
-	CodeRateLimited    = "RATE_LIMITED"
-	CodeServiceUnavail = "SERVICE_UNAVAILABLE"
+	CodeBadRequest       = "BAD_REQUEST"
+	CodeInternalError    = "INTERNAL_ERROR"
+	CodeNotFound         = "NOT_FOUND"
+	CodeUnauthorized     = "UNAUTHORIZED"
+	CodeRateLimited      = "RATE_LIMITED"
+	CodeServiceUnavail   = "SERVICE_UNAVAILABLE"
+	CodeLLMConfigStale   = "LLM_CONFIG_STALE"
+	CodeProbeConfigStale = "PROBE_CONFIG_STALE"
 
 	// Cron 模块
-	CodeCronDisabled       = "CRON_DISABLED"
-	CodeCronInvalidSched   = "CRON_INVALID_SCHEDULE"
-	CodeCronCompileFailed  = "CRON_COMPILE_FAILED"
-	CodeCronValidateFailed = "CRON_VALIDATE_FAILED"
-	CodeCronNotSupported   = "CRON_NOT_SUPPORTED"
-	CodeCronQuotaExceeded  = "CRON_QUOTA_EXCEEDED" // 用户活跃任务数超额
-	CodeCronJobNotFound    = "CRON_JOB_NOT_FOUND"
-	CodeCronUnknownAction  = "CRON_UNKNOWN_ACTION"
+	CodeCronDisabled            = "CRON_DISABLED"
+	CodeCronInvalidSched        = "CRON_INVALID_SCHEDULE"
+	CodeCronCompileFailed       = "CRON_COMPILE_FAILED"
+	CodeCronValidateFailed      = "CRON_VALIDATE_FAILED"
+	CodeCronNotSupported        = "CRON_NOT_SUPPORTED"
+	CodeCronQuotaExceeded       = "CRON_QUOTA_EXCEEDED" // 用户活跃任务数超额
+	CodeCronJobNotFound         = "CRON_JOB_NOT_FOUND"
+	CodeCronJobPaused           = "CRON_JOB_PAUSED"
+	CodeCronExecutorUnavailable = "CRON_EXECUTOR_UNAVAILABLE"
+	CodeCronUnknownAction       = "CRON_UNKNOWN_ACTION"
 )
 
 // writeAPIError 把 APIError 写回 HTTP 响应（同时填 LegacyEr 兼容旧前端）。

@@ -117,7 +117,7 @@ func (e *ReActEngine) autoExtractMemoryForRole(parentCtx context.Context, userTe
 		// 先选模型（路由本身不调 LLM，很快），再据 provider 本地性自适应抽取超时（修 AP-098）。
 		provider, providerName, err := e.selectLLMForMemory(base)
 		if err != nil {
-			trace.L(base).Warn("auto-memory: 无可用 LLM", "err", err)
+			trace.L(base).Warn("auto-memory: 无可用 LLM", appendModelErrorLogFields(nil, err)...)
 			return
 		}
 		isLocal := e.router.IsLocalProviderName(providerName)
@@ -155,7 +155,7 @@ func (e *ReActEngine) autoExtractMemoryForRole(parentCtx context.Context, userTe
 			Temperature: &temp,
 		})
 		if err != nil {
-			trace.L(ctx).Error("auto-memory: LLM 调用失败", "err", err, "provider", fc.ProviderName)
+			trace.L(ctx).Error("auto-memory: LLM 调用失败", appendModelErrorLogFields([]any{"provider", fc.ProviderName}, err)...)
 			return
 		}
 
@@ -173,7 +173,7 @@ func (e *ReActEngine) autoExtractMemoryForRole(parentCtx context.Context, userTe
 			return
 		}
 		trace.L(ctx).Info("auto-memory: 已自动记忆", "facts", saved,
-			"sample", stringx.TruncateWithSuffix(strings.ReplaceAll(result, "\n", " "), 80, "..."))
+			"result_len", len(result))
 
 		if e.onMemorySaved != nil {
 			e.onMemorySaved(result)

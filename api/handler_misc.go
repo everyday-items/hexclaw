@@ -199,6 +199,95 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 
 // --- MCP API ---
 
+// mcpServerSummary 是给 Desktop 的脱敏服务器投影。
+// command、args、env、endpoint 和凭据只属于 sidecar 内部运行配置，不得进入此响应。
+type mcpServerSummary struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Status      string `json:"status"`
+	Transport   string `json:"transport"`
+	ToolCount   int    `json:"tool_count"`
+}
+
+func mcpServerDescription(kind string) string {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "filesystem":
+		return "读取允许目录内的文件内容"
+	case "mysql", "postgres", "sqlite":
+		return "执行只读 SQL 查询"
+	case "redis":
+		return "读取 Redis 数据"
+	case "github":
+		return "读取 GitHub 仓库数据"
+	default:
+		return "MCP 工具服务器"
+	}
+}
+
+func mcpServerTransport(cfg config.MCPServerConfig) string {
+	transport := strings.ToLower(strings.TrimSpace(cfg.Transport))
+	switch transport {
+	case "stdio", "sse", "streamable":
+		return transport
+	case "":
+		if strings.TrimSpace(cfg.Endpoint) != "" {
+			return "sse"
+		}
+		if strings.TrimSpace(cfg.Command) != "" {
+			return "stdio"
+		}
+	}
+	return "unknown"
+}
+
+func (s *Server) rememberMCPServerConfig(server config.MCPServerConfig) {
+	if s.cfg == nil {
+		return
+	}
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	for i := range s.cfg.MCP.Servers {
+		if s.cfg.MCP.Servers[i].Name == server.Name {
+			s.cfg.MCP.Servers[i] = server
+			return
+		}
+	}
+	s.cfg.MCP.Servers = append(s.cfg.MCP.Servers, server)
+}
+
+func (s *Server) mcpServerSummaries() []mcpServerSummary {
+	if s.mcpMgr == nil {
+		return []mcpServerSummary{}
+	}
+
+	configured := make(map[string]config.MCPServerConfig)
+	if s.cfg != nil {
+		s.cfgMu.RLock()
+		for _, cfg := range s.cfg.MCP.Servers {
+			configured[cfg.Name] = cfg
+		}
+		s.cfgMu.RUnlock()
+	}
+
+	statuses := s.mcpMgr.ServerStatuses()
+	summaries := make([]mcpServerSummary, 0, len(statuses))
+	for _, status := range statuses {
+		cfg := configured[status.Name]
+		serverState := "disconnected"
+		if status.Connected {
+			serverState = "connected"
+		}
+		summaries = append(summaries, mcpServerSummary{
+			Name:        status.Name,
+			Description: mcpServerDescription(status.Kind),
+			Status:      serverState,
+			Transport:   mcpServerTransport(cfg),
+			ToolCount:   status.ToolCount,
+		})
+	}
+	return summaries
+}
+
 // handleListMCPTools 列出所有已发现的 MCP 工具
 func (s *Server) handleListMCPTools(w http.ResponseWriter, r *http.Request) {
 	if s.mcpMgr == nil {
@@ -215,15 +304,15 @@ func (s *Server) handleListMCPTools(w http.ResponseWriter, r *http.Request) {
 // handleListMCPServers 列出已连接的 MCP Server
 func (s *Server) handleListMCPServers(w http.ResponseWriter, r *http.Request) {
 	if s.mcpMgr == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"servers": []any{}, "total": 0})
+		writeJSON(w, http.StatusOK, map[string]any{"servers": []mcpServerSummary{}, "total": 0})
 		return
 	}
 	// 用「已配置」而非「已连接」作为列表事实源：市场一键安装后冷装尚未连上的 server 也要出现在
 	// UI 列表（状态另由 /mcp/status 显示未连接），不因未即时连上而消失（修复 BUG-20260626）。
-	names := s.mcpMgr.ConfiguredServerNames()
+	servers := s.mcpServerSummaries()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"servers": names,
-		"total":   len(names),
+		"servers": servers,
+		"total":   len(servers),
 	})
 }
 
@@ -236,12 +325,14 @@ const mcpAddImmediateConnectTimeout = 10 * time.Second
 // addMCPServerRequest 新增 MCP Server 请求。Env 为 stdio 子进程环境变量
 // （数据连接器走 MCP 的凭证注入：MySQL/Redis 等通过 env 配 MYSQL_HOST/PASSWORD 等）。
 type addMCPServerRequest struct {
-	Name      string            `json:"name"`
-	Command   string            `json:"command"`
-	Args      []string          `json:"args"`
-	Env       map[string]string `json:"env"`
-	Transport string            `json:"transport"`
-	Endpoint  string            `json:"endpoint"`
+	Name       string                 `json:"name"`
+	Command    string                 `json:"command"`
+	Args       []string               `json:"args"`
+	Env        map[string]string      `json:"env"`
+	Transport  string                 `json:"transport"`
+	Endpoint   string                 `json:"endpoint"`
+	SecretArgs []mcpSecretArgMutation `json:"secret_args"`
+	SecretEnv  []mcpSecretEnvMutation `json:"secret_env"`
 }
 
 func (s *Server) handleAddMCPServer(w http.ResponseWriter, r *http.Request) {
@@ -293,6 +384,43 @@ func (s *Server) handleAddMCPServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 连接器编辑请求只携带脱敏 projection；preserve 必须从 Sidecar 当前解密投影恢复，
+	// 然后在写盘前由 Writer 重新 Seal。没有 Writer/secret.Box 时禁止把 secret 交给运行时。
+	hasSecretMutations := len(req.SecretArgs) > 0 || len(req.SecretEnv) > 0
+	var persistedSecretConfig *config.MCPServerConfig
+	if hasSecretMutations {
+		if s.cfgWriter == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "MCP secret persistence is unavailable"})
+			return
+		}
+		current, err := s.cfgWriter.GetMCPServer(req.Name)
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "MCP secret persistence is unavailable"})
+			return
+		}
+		merged, err := mergeMCPSecretMutations(current, config.MCPServerConfig{
+			Name:      req.Name,
+			Transport: transport,
+			Command:   req.Command,
+			Args:      req.Args,
+			Env:       req.Env,
+			Endpoint:  req.Endpoint,
+			Enabled:   true,
+		}, req.SecretArgs, req.SecretEnv)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		// 先写入已归一化的密文配置，确保 secret.Box 失败时不会启动带未持久化凭据的 MCP。
+		if err := s.cfgWriter.UpsertMCPServer(merged); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "MCP secret persistence is unavailable"})
+			return
+		}
+		req.Args = merged.Args
+		req.Env = merged.Env
+		persistedSecretConfig = &merged
+	}
+
 	cfg := hexmcp.ServerConfig{
 		Name:      req.Name,
 		Transport: transport,
@@ -317,11 +445,28 @@ func (s *Server) handleAddMCPServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 持久化到配置文件：无论是否已连接都持久化——未连上者重启后仍由 reconnectLoop 自动拉起。
-	if s.cfgWriter != nil {
-		if err := s.cfgWriter.AppendMCPServer(req.Name, transport, req.Command, req.Args, req.Env, req.Endpoint); err != nil {
+	if s.cfgWriter != nil && persistedSecretConfig == nil {
+		if err := s.cfgWriter.UpsertMCPServer(config.MCPServerConfig{
+			Name:      req.Name,
+			Transport: transport,
+			Command:   req.Command,
+			Args:      req.Args,
+			Env:       req.Env,
+			Endpoint:  req.Endpoint,
+			Enabled:   true,
+		}); err != nil {
 			logger.Error("MCP Server", "name", req.Name, "添加成功但持久化失败", err)
 		}
 	}
+	s.rememberMCPServerConfig(config.MCPServerConfig{
+		Name:      req.Name,
+		Transport: transport,
+		Command:   req.Command,
+		Args:      req.Args,
+		Env:       req.Env,
+		Endpoint:  req.Endpoint,
+		Enabled:   true,
+	})
 	msg := fmt.Sprintf("MCP Server %q 已添加", req.Name)
 	if !connected {
 		msg = fmt.Sprintf("MCP Server %q 已添加，正在后台连接（首次需下载组件）", req.Name)

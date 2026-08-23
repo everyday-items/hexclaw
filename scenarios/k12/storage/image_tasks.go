@@ -1178,10 +1178,10 @@ func insertCreativeWorkIntake(ctx context.Context, tx *sql.Tx, intake k12.Creati
          source_digest,work_title_candidate_json,task_requirement_candidate_json,
          ocr_evidence_json,route_policy_snapshot_json,operation_invocations_json,status,
          confirmation_provenance,promoted_work_id,idempotency_key,request_digest,
-         attempt_generation,retry_safe,failure_kind,version,created_at,updated_at,
-         entry_kind,promotion_policy,target_work_id,base_version_id,promoted_version_id,
-         commit_receipt_json)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 attempt_generation,retry_safe,failure_kind,version,created_at,updated_at,
+		 entry_kind,promotion_policy,target_work_id,base_version_id,promoted_version_id,
+		 promoted_generation_id,commit_receipt_json)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		intake.IntakeID, intake.DispatchID, intake.AgentName, intake.LearnerID, intake.WorkType,
 		assetsJSON, intake.SourceDigest, titleJSON, taskJSON, ocrJSON, routeJSON,
 		invocationsJSON, intake.Status, intake.ConfirmationProvenance,
@@ -1189,7 +1189,7 @@ func insertCreativeWorkIntake(ctx context.Context, tx *sql.Tx, intake k12.Creati
 		intake.AttemptGeneration, boolInt(intake.RetrySafe), intake.FailureKind,
 		intake.Version, intake.CreatedAt, intake.UpdatedAt, intake.EntryKind,
 		intake.PromotionPolicy, intake.TargetWorkID, intake.BaseVersionID,
-		intake.PromotedVersionID, commitReceiptJSON)
+		intake.PromotedVersionID, intake.PromotedGenerationID, commitReceiptJSON)
 	if err != nil {
 		return fmt.Errorf("create CreativeWorkIntake: %w", err)
 	}
@@ -1261,7 +1261,8 @@ func getCreativeWorkIntake(
         operation_invocations_json,status,confirmation_provenance,promoted_work_id,
         idempotency_key,request_digest,attempt_generation,retry_safe,failure_kind,
         version,created_at,updated_at,entry_kind,promotion_policy,target_work_id,
-        base_version_id,promoted_version_id,commit_receipt_json FROM k12_creative_work_intakes
+		base_version_id,promoted_version_id,promoted_generation_id,
+		commit_receipt_json FROM k12_creative_work_intakes
         WHERE agent_name=? AND intake_id=?`, agentName, intakeID).
 		Scan(&i.IntakeID, &i.DispatchID, &i.AgentName, &i.LearnerID, &i.WorkType,
 			&assetsJSON, &i.SourceDigest, &titleJSON, &taskJSON, &ocrJSON, &routeJSON,
@@ -1269,7 +1270,7 @@ func getCreativeWorkIntake(
 			&i.IdempotencyKey, &i.RequestDigest, &i.AttemptGeneration, &retrySafe,
 			&i.FailureKind, &i.Version, &i.CreatedAt, &i.UpdatedAt, &i.EntryKind,
 			&i.PromotionPolicy, &i.TargetWorkID, &i.BaseVersionID,
-			&i.PromotedVersionID, &commitReceiptJSON)
+			&i.PromotedVersionID, &i.PromotedGenerationID, &commitReceiptJSON)
 	if err == sql.ErrNoRows {
 		return i, ErrImageTaskNotFound
 	}
@@ -1322,43 +1323,119 @@ func (s *Store) GetCreativeWorkIntake(
 	return getCreativeWorkIntake(ctx, s.db, agentName, intakeID)
 }
 
-func insertInitialCreativeFeedbackGeneration(
+// createCreativeWorkFromIntakeTx 在调用方已有事务中一次写入独立作品根、
+// 不可变原始证据和首轮点评 generation。它不提交事务，也不写 legacy version 子表。
+func (s *Store) createCreativeWorkFromIntakeTx(
 	ctx context.Context,
 	tx *sql.Tx,
-	agentName, workID, requestDigest string,
+	intake k12.CreativeWorkIntake,
+	sourceSession string,
+	fields k12.CreativeWorkFields,
+	contentMarkdown string,
+	requestDigest string,
 	now int64,
-) error {
-	source, err := legacyCreativeWorkSourceSnapshot(ctx, tx, agentName, workID)
+) (string, k12.WorkFeedbackGeneration, error) {
+	if len(fields.Versions) != 0 {
+		return "", k12.WorkFeedbackGeneration{}, fmt.Errorf(
+			"%w: current creative work must not contain legacy versions",
+			records.ErrInvalidFields,
+		)
+	}
+	fields.SourceIntakeID = intake.IntakeID
+	if profile, profileErr := readAgentProfileVia(ctx, tx, intake.AgentName); profileErr == nil && k12.ValidProfileGradeTerm(profile.GradeTerm) {
+		fields.GradeTerm = profile.GradeTerm
+	}
+	fields = k12.NormalizeCreativeWorkFields(fields)
+	rec, err := k12.NewCreativeWorkRecord(intake.AgentName, sourceSession, fields)
 	if err != nil {
-		return err
+		return "", k12.WorkFeedbackGeneration{}, err
+	}
+	schema, err := s.registry.Get(k12.CollectionCreativeWork)
+	if err != nil {
+		return "", k12.WorkFeedbackGeneration{}, err
+	}
+	if schema.ValidateFields != nil {
+		if err := schema.ValidateFields(rec.Fields); err != nil {
+			return "", k12.WorkFeedbackGeneration{}, fmt.Errorf(
+				"%w: invalid current creative work: %v",
+				records.ErrInvalidFields,
+				err,
+			)
+		}
+	}
+	rec.RecordID = idgen.NanoID()
+	rec.SchemaVersion = schema.Version
+	rec.DedupeKey = schema.DedupeKey(rec)
+	rec.Status = schema.InitialStatus
+	rec.Tags = "[]"
+	rec.Version, rec.CreatedAt, rec.UpdatedAt = 0, now, now
+	mapper := creativeWorkMapper{}
+	domainVals, err := mapper.encode(rec.Fields)
+	if err != nil {
+		return "", k12.WorkFeedbackGeneration{}, err
+	}
+	cols := mapper.domainCols()
+	query := fmt.Sprintf(`INSERT INTO %s (%s, %s) VALUES (%s)`,
+		mapper.table(), baseCols, strings.Join(cols, ", "), placeholders(11+len(cols)))
+	args := append([]any{
+		rec.RecordID, rec.AgentName, rec.SchemaVersion, rec.Status,
+		rec.DedupeKey, rec.Tags, rec.DueAt, rec.SourceSession, rec.Version,
+		rec.CreatedAt, rec.UpdatedAt,
+	}, domainVals...)
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return "", k12.WorkFeedbackGeneration{}, fmt.Errorf(
+			"create current creative work from intake: %w",
+			err,
+		)
+	}
+
+	source := k12.CreativeWorkSourceSnapshot{
+		WorkType:        fields.WorkType,
+		DisplayName:     fields.DisplayName,
+		WorkTitle:       fields.WorkTitle,
+		ContentMarkdown: strings.TrimSpace(contentMarkdown),
+		SourceAssetID:   intake.SourceAssetRefs[0],
+	}
+	if intake.WorkType == k12.WorkTypeWriting && intake.OCREvidence != nil {
+		source.ContentMarkdown = intake.OCREvidence.CanonicalContent
+		source.OCRRaw = intake.OCREvidence.Raw
+		source.OCRVersion = intake.OCREvidence.CanonicalVersion
+		source.OCRDigest = intake.OCREvidence.CanonicalDigest
+		source.ContentConfirmedAt = intake.OCREvidence.FrozenAt
+		if source.ContentConfirmedAt == 0 {
+			source.ContentConfirmedAt = now
+		}
 	}
 	sourceJSON, err := json.Marshal(source)
 	if err != nil {
-		return err
+		return "", k12.WorkFeedbackGeneration{}, err
 	}
 	generation := k12.WorkFeedbackGeneration{
-		GenerationID: idgen.NanoID(), WorkID: workID, AgentName: agentName,
-		GenerationNo: 1, CommandKey: "auto:" + workID,
+		GenerationID: idgen.NanoID(), WorkID: rec.RecordID, AgentName: rec.AgentName,
+		GenerationNo: 1, CommandKey: "auto:" + rec.RecordID,
 		RequestDigest: requestDigest, Status: k12.WorkFeedbackQueued,
 		FeedbackType: source.WorkType, Source: source,
 		CreatedAt: now, UpdatedAt: now,
 	}
 	if err := insertWorkFeedbackGeneration(ctx, tx, generation, string(sourceJSON)); err != nil {
-		return err
+		return "", k12.WorkFeedbackGeneration{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE k12_creative_works
-		SET initial_feedback_generation_id=?, feedback_state='queued',
-		    row_version=row_version+1
+	res, err := tx.ExecContext(ctx, `UPDATE k12_creative_works
+		SET initial_feedback_generation_id=?, feedback_state='queued'
 		WHERE record_id=? AND agent_name=? AND deleted_at IS NULL`,
-		generation.GenerationID, workID, agentName,
-	); err != nil {
-		return err
+		generation.GenerationID, rec.RecordID, rec.AgentName,
+	)
+	if err != nil {
+		return "", k12.WorkFeedbackGeneration{}, err
 	}
-	return nil
+	if affected, _ := res.RowsAffected(); affected != 1 {
+		return "", k12.WorkFeedbackGeneration{}, ErrImageTaskVersionConflict
+	}
+	return rec.RecordID, generation, nil
 }
 
-// PromoteCreativeWorkIntake creates the formal work and v1 and advances the
-// intake in one short transaction. A replay after commit returns the same work.
+// PromoteCreativeWorkIntake 在一个短事务内创建独立作品与首轮点评 generation，
+// 再推进 intake；提交后的重放返回同一组身份。
 func (s *Store) PromoteCreativeWorkIntake(
 	ctx context.Context,
 	agentName, intakeID string,
@@ -1410,79 +1487,28 @@ func (s *Store) PromoteCreativeWorkIntake(
 		candidate := *intake.TaskRequirementCandidate
 		provenance.TaskRequirement = &candidate
 	}
-	version := k12.CreativeWorkVersion{
-		VersionID:     "v1",
-		SourceAssetID: intake.SourceAssetRefs[0],
-	}
-	if intake.WorkType == k12.WorkTypeWriting && intake.OCREvidence != nil {
-		version.ContentMarkdown = intake.OCREvidence.CanonicalContent
-		version.OCRRaw = intake.OCREvidence.Raw
-		version.OCRVersion = intake.OCREvidence.CanonicalVersion
-		version.OCRConfirmedDigest = intake.OCREvidence.CanonicalDigest
-		version.ContentConfirmedAt = intake.OCREvidence.FrozenAt
-		if version.ContentConfirmedAt == 0 {
-			version.ContentConfirmedAt = nowUnix()
-		}
-	}
 	fields := k12.NormalizeCreativeWorkFields(k12.CreativeWorkFields{
 		WorkType: intake.WorkType, WorkTitle: title, TaskRequirement: task,
 		TitleTaskProvenance: provenance, SourceIntakeID: intake.IntakeID,
-		Versions: []k12.CreativeWorkVersion{version},
 	})
-	sourceSession := ""
 	dispatch, err := getImageTaskDispatch(ctx, tx, agentName, intake.DispatchID, "")
 	if err != nil {
 		return "", false, err
 	}
-	sourceSession = dispatch.SourceSessionID
-	rec, err := k12.NewCreativeWorkRecord(agentName, sourceSession, fields)
-	if err != nil {
-		return "", false, err
-	}
-	schema, err := s.registry.Get(k12.CollectionCreativeWork)
-	if err != nil {
-		return "", false, err
-	}
-	if schema.ValidateFields != nil {
-		if err := schema.ValidateFields(rec.Fields); err != nil {
-			return "", false, fmt.Errorf("%w: %v", records.ErrInvalidFields, err)
-		}
-	}
-	rec.RecordID = idgen.NanoID()
-	rec.SchemaVersion = schema.Version
-	rec.DedupeKey = schema.DedupeKey(rec)
-	rec.Status = schema.InitialStatus
-	rec.Tags = "[]"
 	now := nowUnix()
-	rec.Version, rec.CreatedAt, rec.UpdatedAt = 0, now, now
-	mapper := creativeWorkMapper{}
-	domainVals, err := mapper.encode(rec.Fields)
+	workID, generation, err := s.createCreativeWorkFromIntakeTx(
+		ctx, tx, intake, dispatch.SourceSessionID, fields, "", intake.RequestDigest, now,
+	)
 	if err != nil {
-		return "", false, err
-	}
-	cols := mapper.domainCols()
-	query := fmt.Sprintf(`INSERT INTO %s (%s, %s) VALUES (%s)`,
-		mapper.table(), baseCols, strings.Join(cols, ", "), placeholders(11+len(cols)))
-	args := append([]any{rec.RecordID, rec.AgentName, rec.SchemaVersion, rec.Status,
-		rec.DedupeKey, rec.Tags, rec.DueAt, rec.SourceSession, rec.Version,
-		rec.CreatedAt, rec.UpdatedAt}, domainVals...)
-	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
-		return "", false, fmt.Errorf("create promoted CreativeWork: %w", err)
-	}
-	if err := mapper.syncChildren(ctx, tx, rec.RecordID, rec.Fields); err != nil {
-		return "", false, err
-	}
-	if err := insertInitialCreativeFeedbackGeneration(
-		ctx, tx, agentName, rec.RecordID, intake.RequestDigest, now,
-	); err != nil {
 		return "", false, err
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE k12_creative_work_intakes
-        SET status='promoted',promoted_work_id=?,promoted_version_id='v1',
-            retry_safe=0,failure_kind='',
-            version=version+1,updated_at=?
-        WHERE agent_name=? AND intake_id=? AND status='ready' AND version=?`,
-		rec.RecordID, now, agentName, intakeID, expectedVersion)
+		SET status='promoted',promoted_work_id=?,promoted_generation_id=?,
+		    promoted_version_id='',
+		    retry_safe=0,failure_kind='',
+		    version=version+1,updated_at=?
+		WHERE agent_name=? AND intake_id=? AND status='ready' AND version=?`,
+		workID, generation.GenerationID, now, agentName, intakeID, expectedVersion)
 	if err != nil {
 		return "", false, err
 	}
@@ -1492,28 +1518,7 @@ func (s *Store) PromoteCreativeWorkIntake(
 	if err := tx.Commit(); err != nil {
 		return "", false, err
 	}
-	return rec.RecordID, true, nil
-}
-
-func creativeVersionFromIntake(
-	intake k12.CreativeWorkIntake,
-	versionID, contentMarkdown string,
-) k12.CreativeWorkVersion {
-	version := k12.CreativeWorkVersion{
-		VersionID: versionID, SourceAssetID: intake.SourceAssetRefs[0],
-		ContentMarkdown: strings.TrimSpace(contentMarkdown),
-	}
-	if intake.WorkType == k12.WorkTypeWriting && intake.OCREvidence != nil {
-		version.ContentMarkdown = intake.OCREvidence.CanonicalContent
-		version.OCRRaw = intake.OCREvidence.Raw
-		version.OCRVersion = intake.OCREvidence.CanonicalVersion
-		version.OCRConfirmedDigest = intake.OCREvidence.CanonicalDigest
-		version.ContentConfirmedAt = intake.OCREvidence.FrozenAt
-		if version.ContentConfirmedAt == 0 {
-			version.ContentConfirmedAt = nowUnix()
-		}
-	}
-	return version
+	return workID, true, nil
 }
 
 func applyManualCommitFacts(
@@ -1543,9 +1548,8 @@ func applyManualCommitFacts(
 	}
 }
 
-// CommitManualCreativeWorkIntake is the only explicit_commit promotion path.
-// New work creation, revision append, intake link and receipt are committed in
-// one transaction. A same-digest replay returns the prior receipt.
+// CommitManualCreativeWorkIntake 是 explicit_commit 的唯一提交路径；独立作品、
+// 首轮 generation、intake 关联和回执在同一事务提交，同摘要重放返回原回执。
 func (s *Store) CommitManualCreativeWorkIntake(
 	ctx context.Context,
 	agentName, intakeID string,
@@ -1598,132 +1602,44 @@ func (s *Store) CommitManualCreativeWorkIntake(
 			return intake, fmt.Errorf("%w: source asset owner mismatch", ErrImageTaskConflict)
 		}
 	}
-	now := nowUnix()
-	workID, promotedVersionID := "", ""
-	mapper := creativeWorkMapper{}
-
-	switch intake.EntryKind {
-	case k12.CreativeWorkEntryNewWork:
-		fields := k12.CreativeWorkFields{
-			WorkType: intake.WorkType, SourceIntakeID: intake.IntakeID,
-		}
-		applyManualCommitFacts(intake.IntakeID, command, &fields)
-		promotedVersionID = "v1"
-		fields.Versions = []k12.CreativeWorkVersion{
-			creativeVersionFromIntake(intake, promotedVersionID, command.ContentMarkdown),
-		}
-		fields = k12.NormalizeCreativeWorkFields(fields)
-		dispatch, getErr := getImageTaskDispatch(ctx, tx, agentName, intake.DispatchID, "")
-		if getErr != nil {
-			return intake, getErr
-		}
-		rec, newErr := k12.NewCreativeWorkRecord(agentName, dispatch.SourceSessionID, fields)
-		if newErr != nil {
-			return intake, newErr
-		}
-		schema, schemaErr := s.registry.Get(k12.CollectionCreativeWork)
-		if schemaErr != nil {
-			return intake, schemaErr
-		}
-		rec.RecordID = idgen.NanoID()
-		rec.SchemaVersion = schema.Version
-		rec.DedupeKey = schema.DedupeKey(rec)
-		rec.Status = schema.InitialStatus
-		rec.Tags = "[]"
-		rec.Version, rec.CreatedAt, rec.UpdatedAt = 0, now, now
-		domainVals, encodeErr := mapper.encode(rec.Fields)
-		if encodeErr != nil {
-			return intake, encodeErr
-		}
-		cols := mapper.domainCols()
-		query := fmt.Sprintf(`INSERT INTO %s (%s, %s) VALUES (%s)`,
-			mapper.table(), baseCols, strings.Join(cols, ", "), placeholders(11+len(cols)))
-		args := append([]any{rec.RecordID, rec.AgentName, rec.SchemaVersion, rec.Status,
-			rec.DedupeKey, rec.Tags, rec.DueAt, rec.SourceSession, rec.Version,
-			rec.CreatedAt, rec.UpdatedAt}, domainVals...)
-		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
-			return intake, fmt.Errorf("create manual CreativeWork: %w", err)
-		}
-		if err := mapper.syncChildren(ctx, tx, rec.RecordID, rec.Fields); err != nil {
-			return intake, err
-		}
-		if err := insertInitialCreativeFeedbackGeneration(
-			ctx, tx, agentName, rec.RecordID, command.CommandDigest, now,
-		); err != nil {
-			return intake, err
-		}
-		workID = rec.RecordID
-	case k12.CreativeWorkEntryRevision:
-		rec, getErr := s.getVia(ctx, tx, intake.TargetWorkID)
-		if getErr != nil || rec == nil || rec.AgentName != agentName ||
-			rec.Collection != k12.CollectionCreativeWork {
-			return intake, fmt.Errorf("%w: revision target not found for owner", ErrImageTaskConflict)
-		}
-		if rec.Status == k12.WorkStatusArchived {
-			return intake, fmt.Errorf("%w: archived work cannot be revised", ErrImageTaskInvalidState)
-		}
-		fields, parseErr := k12.ParseCreativeWorkFields(rec.Fields)
-		if parseErr != nil {
-			return intake, parseErr
-		}
-		if fields.WorkType != intake.WorkType || len(fields.Versions) == 0 ||
-			fields.Versions[len(fields.Versions)-1].VersionID != intake.BaseVersionID {
-			return intake, fmt.Errorf("%w: revision type/base version drift", ErrImageTaskVersionConflict)
-		}
-		applyManualCommitFacts(intake.IntakeID, command, &fields)
-		promotedVersionID = fmt.Sprintf("v%d", len(fields.Versions)+1)
-		fields.Versions = append(
-			fields.Versions,
-			creativeVersionFromIntake(intake, promotedVersionID, command.ContentMarkdown),
+	if intake.EntryKind != k12.CreativeWorkEntryNewWork {
+		return intake, fmt.Errorf(
+			"%w: only new_work creative intake can be committed",
+			ErrImageTaskInvalidState,
 		)
-		fields = k12.NormalizeCreativeWorkFields(fields)
-		fieldsJSON, marshalErr := jsonString(fields)
-		if marshalErr != nil {
-			return intake, marshalErr
-		}
-		domainVals, encodeErr := mapper.encode(fieldsJSON)
-		if encodeErr != nil {
-			return intake, encodeErr
-		}
-		set := []string{"status=?", "version=version+1", "updated_at=?"}
-		args := []any{k12.WorkStatusRevised, now}
-		for _, col := range mapper.domainCols() {
-			set = append(set, col+"=?")
-		}
-		args = append(args, domainVals...)
-		args = append(args, rec.RecordID, agentName, rec.Version)
-		res, updateErr := tx.ExecContext(ctx, fmt.Sprintf(
-			`UPDATE %s SET %s WHERE record_id=? AND agent_name=? AND version=?`,
-			mapper.table(), strings.Join(set, ","),
-		), args...)
-		if updateErr != nil {
-			return intake, updateErr
-		}
-		if n, _ := res.RowsAffected(); n != 1 {
-			return intake, ErrImageTaskVersionConflict
-		}
-		if err := mapper.syncChildren(ctx, tx, rec.RecordID, fieldsJSON); err != nil {
-			return intake, err
-		}
-		workID = rec.RecordID
-	default:
-		return intake, fmt.Errorf("%w: unsupported entry_kind", ErrImageTaskInvalidState)
+	}
+	fields := k12.CreativeWorkFields{
+		WorkType: intake.WorkType, SourceIntakeID: intake.IntakeID,
+	}
+	applyManualCommitFacts(intake.IntakeID, command, &fields)
+	dispatch, err := getImageTaskDispatch(ctx, tx, agentName, intake.DispatchID, "")
+	if err != nil {
+		return intake, err
+	}
+	now := nowUnix()
+	workID, generation, err := s.createCreativeWorkFromIntakeTx(
+		ctx, tx, intake, dispatch.SourceSessionID, fields,
+		command.ContentMarkdown, command.CommandDigest, now,
+	)
+	if err != nil {
+		return intake, err
 	}
 
 	receipt := k12.CreativeWorkCommitReceipt{
 		CommandDigest: command.CommandDigest, CommittedAt: now,
-		WorkID: workID, VersionID: promotedVersionID,
+		WorkID: workID, GenerationID: generation.GenerationID,
 	}
 	receiptJSON, err := jsonString(receipt)
 	if err != nil {
 		return intake, err
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE k12_creative_work_intakes
-        SET status='promoted',promoted_work_id=?,promoted_version_id=?,
-            commit_receipt_json=?,retry_safe=0,failure_kind='',
-            version=version+1,updated_at=?
-        WHERE agent_name=? AND intake_id=? AND status='ready' AND version=?`,
-		workID, promotedVersionID, receiptJSON, now,
+		SET status='promoted',promoted_work_id=?,promoted_generation_id=?,
+		    promoted_version_id='',
+		    commit_receipt_json=?,retry_safe=0,failure_kind='',
+		    version=version+1,updated_at=?
+		WHERE agent_name=? AND intake_id=? AND status='ready' AND version=?`,
+		workID, generation.GenerationID, receiptJSON, now,
 		agentName, intakeID, expectedVersion)
 	if err != nil {
 		return intake, err

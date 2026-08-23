@@ -269,9 +269,15 @@ func (d Deps) GenerateWorkFeedbackCommand(
 		if err != nil {
 			if invocation != nil {
 				unknown := sentProviderOutcomeUnknown(err, providerCtx.Err())
+				failureKind := "work_feedback_provider_failed"
+				retrySafe := !unknown
+				if errors.Is(err, k12.ErrModelCapabilityUnverified) {
+					failureKind = "model_capability_unverified"
+					retrySafe = false
+				}
 				_ = d.Records.FailWorkFeedbackInvocation(
 					context.WithoutCancel(ctx), agentName, invocation.InvocationID,
-					"work_feedback_provider_failed", unknown, !unknown,
+					failureKind, unknown, retrySafe,
 				)
 			}
 			_, _ = d.Records.FailWorkFeedbackGeneration(

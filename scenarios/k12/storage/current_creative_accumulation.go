@@ -1117,16 +1117,19 @@ ORDER BY created_at DESC, generation_id DESC LIMIT 1`, accumulationID, agentName
 			existing.SourceSnapshot != sourceSnapshot {
 			return k12.AccumulationDictationGeneration{}, false, ErrCurrentCommandConflict
 		}
-		if existing.Status == k12.DictationFailed {
+		if existing.Status == k12.DictationFailed ||
+			existing.Status == k12.DictationReAdd {
 			now := nowUnix()
 			if _, err := tx.ExecContext(ctx, `UPDATE k12_accumulation_dictation_generations
-				SET status='queued', failure_reason='', attempt=attempt+1, updated_at=?
-				WHERE generation_id=? AND agent_name=? AND status='failed'`,
-				now, existing.GenerationID, agentName,
+				SET status='queued', practice_item_id='', failure_reason='',
+				    attempt=attempt+1, updated_at=?
+				WHERE generation_id=? AND agent_name=? AND status=?`,
+				now, existing.GenerationID, agentName, existing.Status,
 			); err != nil {
 				return k12.AccumulationDictationGeneration{}, false, err
 			}
 			existing.Status = k12.DictationQueued
+			existing.PracticeItemID = ""
 			existing.FailureReason = ""
 			existing.Attempt++
 			existing.UpdatedAt = now

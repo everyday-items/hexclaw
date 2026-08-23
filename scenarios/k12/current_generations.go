@@ -61,6 +61,7 @@ const (
 	DictationValidating = "validating"
 	DictationCommitted  = "committed"
 	DictationFailed     = "failed"
+	DictationReAdd      = "re_add"
 )
 
 // AccumulationDictationGeneration is persisted before any question or

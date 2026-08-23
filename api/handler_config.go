@@ -18,6 +18,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/engine"
+	"github.com/hexagon-codes/hexclaw/internal/upstreamerr"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	"github.com/hexagon-codes/hexclaw/storage"
 	"github.com/hexagon-codes/toolkit/util/logger"
@@ -32,6 +33,9 @@ type LLMConfigResponse struct {
 	Cache                  config.LLMCacheConfig                `json:"cache"`
 	ReasoningProvider      string                               `json:"reasoning_provider,omitempty"`
 	ReasoningModel         string                               `json:"reasoning_model,omitempty"`
+	// ConfigRevision 和 ConfigDigest 仅用于可选的条件写入，不包含 API Key。
+	ConfigRevision uint64 `json:"config_revision"`
+	ConfigDigest   string `json:"config_digest"`
 }
 
 // LLMProviderConfigResponse 脱敏后的 Provider 配置
@@ -58,6 +62,8 @@ type LLMProviderConfigResponse struct {
 	KeepAlive             string                               `json:"keep_alive,omitempty"`
 	NumCtx                int                                  `json:"num_ctx,omitempty"`
 	ProbeReceipt          *LLMProviderProbeReceiptResponse     `json:"probe_receipt,omitempty"`
+	// EffectiveModels 是服务端只读投影；探测事实不会被 PUT 写回 YAML。
+	EffectiveModels []LLMEffectiveModelResponse `json:"effective_models,omitempty"`
 }
 
 // LLMConfigUpdateRequest PUT /api/v1/config/llm 请求
@@ -69,6 +75,28 @@ type LLMConfigUpdateRequest struct {
 	Cache                  *config.LLMCacheConfig                 `json:"cache,omitempty"`
 	ReasoningProvider      *string                                `json:"reasoning_provider,omitempty"`
 	ReasoningModel         *string                                `json:"reasoning_model,omitempty"`
+	// 两个字段同时提供时启用乐观并发控制；缺省保持旧客户端兼容。
+	ExpectedConfigRevision *uint64 `json:"expected_config_revision,omitempty"`
+	ExpectedConfigDigest   *string `json:"expected_config_digest,omitempty"`
+}
+
+// llmConfigStaleResponse 在条件写入未命中时返回当前非敏感版本快照。
+type llmConfigStaleResponse struct {
+	APIError
+	ConfigRevision uint64 `json:"config_revision"`
+	ConfigDigest   string `json:"config_digest"`
+}
+
+func writeLLMConfigStale(w http.ResponseWriter, llmCfg config.LLMConfig, digest string) {
+	writeJSON(w, http.StatusConflict, llmConfigStaleResponse{
+		APIError: APIError{
+			Code:     CodeLLMConfigStale,
+			Message:  "LLM configuration is stale",
+			LegacyEr: "LLM configuration is stale",
+		},
+		ConfigRevision: llmCfg.ConfigRevision,
+		ConfigDigest:   digest,
+	})
 }
 
 // LLMProviderConfigUpdateItem 更新请求中的 Provider 项
@@ -583,6 +611,12 @@ func (s *Server) persistProviderProbeReceipt(
 // 返回当前 LLM 配置，API Key 脱敏显示。
 func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	llmCfg := s.persistedLLMConfig()
+	configDigest, err := digestLLMConfig(llmCfg)
+	if err != nil {
+		logger.Error("计算 LLM 配置摘要失败", "error", err)
+		writeAPIError(w, http.StatusInternalServerError, CodeInternalError, "LLM configuration digest is unavailable")
+		return
+	}
 
 	providers := make(map[string]LLMProviderConfigResponse, len(llmCfg.Providers))
 	for name, p := range llmCfg.Providers {
@@ -611,6 +645,7 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 			NumCtx:                p.NumCtx,
 		}
 		response.ProbeReceipt = s.matchingProviderProbeReceipt(r.Context(), name, p)
+		response.EffectiveModels = s.effectiveModelsForProvider(r.Context(), name, p)
 		providers[name] = response
 	}
 
@@ -622,6 +657,8 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 		Cache:                  llmCfg.Cache,
 		ReasoningProvider:      llmCfg.ReasoningProvider,
 		ReasoningModel:         llmCfg.ReasoningModel,
+		ConfigRevision:         llmCfg.ConfigRevision,
+		ConfigDigest:           configDigest,
 	})
 }
 
@@ -669,6 +706,22 @@ func (s *Server) handleUpdateLLMConfig(w http.ResponseWriter, r *http.Request) {
 	} else if replay != nil {
 		writeJSON(w, http.StatusOK, replay)
 		return
+	}
+	if (req.ExpectedConfigRevision == nil) != (req.ExpectedConfigDigest == nil) {
+		writeAPIError(w, http.StatusBadRequest, CodeBadRequest, "expected_config_revision and expected_config_digest must be supplied together")
+		return
+	}
+	if req.ExpectedConfigRevision != nil {
+		currentDigest, digestErr := digestLLMConfig(oldLLM)
+		if digestErr != nil {
+			logger.Error("计算 LLM 配置摘要失败", "error", digestErr)
+			writeAPIError(w, http.StatusInternalServerError, CodeInternalError, "LLM configuration digest is unavailable")
+			return
+		}
+		if *req.ExpectedConfigRevision != oldLLM.ConfigRevision || *req.ExpectedConfigDigest != currentDigest {
+			writeLLMConfigStale(w, oldLLM, currentDigest)
+			return
+		}
 	}
 
 	// keep_alive 边界校验（C4）：非法值此前原样存盘 + 原样经 llmrouter 下发，直到 Ollama
@@ -1047,7 +1100,7 @@ func (s *Server) handleTestLLMConfig(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		message := sanitizeProviderProbeMessage(
-			"连接测试失败: "+err.Error(),
+			"连接测试失败: "+upstreamerr.PublicMessage(err, "Provider connection test failed"),
 			req.Provider.APIKey,
 			apiKey,
 		)

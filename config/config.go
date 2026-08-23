@@ -239,14 +239,20 @@ type MCPConfig struct {
 
 // MCPServerConfig 单个 MCP Server 配置
 type MCPServerConfig struct {
-	Name      string            `yaml:"name"`           // 名称标识
-	Transport string            `yaml:"transport"`      // 传输: stdio / sse / streamable
-	Command   string            `yaml:"command"`        // stdio 命令（如 npx, uvx）
-	Args      []string          `yaml:"args"`           // stdio 命令参数
-	Env       map[string]string `yaml:"env,omitempty"`  // stdio 进程环境变量（如 DB 凭证），重启后须保留
-	Endpoint  string            `yaml:"endpoint"`       // sse/streamable 端点 URL
-	Enabled   bool              `yaml:"enabled"`        // 是否启用，默认 true
-	Auth      *MCPAuthConfig    `yaml:"auth,omitempty"` // OAuth 配置（可选）
+	Name      string            `yaml:"name"`          // 名称标识
+	Transport string            `yaml:"transport"`     // 传输: stdio / sse / streamable
+	Command   string            `yaml:"command"`       // stdio 命令（如 npx, uvx）
+	Args      []string          `yaml:"args"`          // stdio 命令参数
+	Env       map[string]string `yaml:"env,omitempty"` // stdio 进程环境变量（如 DB 凭证），重启后须保留
+	// ArgsSecretRefs 标记 args 中需要由 secret.Box 静态加密的下标。
+	// 值是稳定的不透明引用，不是 secret 内容；运行时仍只向 MCP 子进程传递解密后的值。
+	ArgsSecretRefs map[int]string `yaml:"args_secret_refs,omitempty"`
+	// EnvSecretRefs 标记 env 中需要由 secret.Box 静态加密的键。
+	// 值是稳定的不透明引用，不是 secret 内容。
+	EnvSecretRefs map[string]string `yaml:"env_secret_refs,omitempty"`
+	Endpoint      string            `yaml:"endpoint"`       // sse/streamable 端点 URL
+	Enabled       bool              `yaml:"enabled"`        // 是否启用，默认 true
+	Auth          *MCPAuthConfig    `yaml:"auth,omitempty"` // OAuth 配置（可选）
 }
 
 // MCPAuthConfig MCP server OAuth 认证配置

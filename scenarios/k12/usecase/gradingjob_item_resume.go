@@ -819,6 +819,10 @@ func definitiveProviderResponse(err error) bool {
 // prove whether the upstream executed the request. Only a typed provider
 // response makes the failure definitive enough for an ordinary retry policy.
 func sentProviderOutcomeUnknown(callErr, ctxErr error) bool {
+	if errors.Is(callErr, k12.ErrModelCapabilityUnverified) {
+		// 配置/回执在发送前即可确定不匹配，绝不能被记录成上游执行结果未知。
+		return false
+	}
 	if definitiveProviderResponse(callErr) {
 		// A verifiable upstream response remains definitive even when the local
 		// deadline/cancellation becomes observable at the same boundary.

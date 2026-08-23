@@ -576,9 +576,16 @@ func sameImageTaskRouteRequest(
 
 func gradingSnapshotFromImageRoute(route k12.ImageTaskRouteSnapshot) k12.GradingModelSnapshot {
 	return k12.NormalizeGradingModelSnapshot(k12.GradingModelSnapshot{
-		Provider: route.Provider, Model: route.Model, Route: route.Route,
-		Capability: route.Capability, TimeoutMS: route.TimeoutMS,
-		Fallback: route.FallbackPolicy,
+		Provider:                route.Provider,
+		Model:                   route.Model,
+		Route:                   route.Route,
+		ProviderInstanceID:      route.ProviderInstanceID,
+		ConfigFingerprint:       route.ConfigFingerprint,
+		CapabilityReceiptDigest: route.CapabilityReceiptDigest,
+		ProbePolicyVersion:      route.ProbePolicyVersion,
+		Capability:              route.Capability,
+		TimeoutMS:               route.TimeoutMS,
+		Fallback:                route.FallbackPolicy,
 	})
 }
 
@@ -1102,12 +1109,17 @@ func (c *ImageTaskCoordinator) Run(
 		if classifyErr != nil {
 			unknown := sentProviderOutcomeUnknown(classifyErr, providerCtxErr)
 			failureKind := "classification_provider_failed"
+			retrySafe := !unknown
 			if unknown {
 				failureKind = "classification_outcome_unknown"
 			}
+			if errors.Is(classifyErr, k12.ErrModelCapabilityUnverified) {
+				failureKind = "model_capability_unverified"
+				retrySafe = false
+			}
 			_ = c.Records.FailImageTaskInvocation(
 				context.WithoutCancel(ctx), dispatch.AgentName, invocation.InvocationID,
-				failureKind, unknown, !unknown,
+				failureKind, unknown, retrySafe,
 			)
 			failed, _ := c.Get(context.WithoutCancel(ctx), dispatch.AgentName, dispatch.DispatchID)
 			return failed, fmt.Errorf("classify image task: %w", classifyErr)
@@ -1273,10 +1285,13 @@ func (c *ImageTaskCoordinator) projectTarget(
 		}
 		view.CreativeWork = &work
 		view.CreativeFeedback = creativeFeedbackProjectionState(work)
-		if len(fields.Versions) > 0 {
-			version := fields.Versions[len(fields.Versions)-1]
+		generation := generationState.Initial
+		if generationState.Latest != nil {
+			generation = generationState.Latest
+		}
+		if generation != nil {
 			operationKey := "work:" + record.RecordID + ":version:" +
-				version.VersionID + ":feedback"
+				generation.GenerationID + ":feedback"
 			invocation, invocationErr := c.Records.GetLatestWorkFeedbackInvocation(
 				ctx, dispatch.AgentName, record.RecordID, operationKey,
 			)
@@ -1338,6 +1353,9 @@ func imageTaskWorkFeedbackContext(
 	if err := snapshot.Validate(); err != nil {
 		return ctx
 	}
+	// 作品点评的文本/视觉回调同样走 Provider 边界；同时携带 Grading 快照，
+	// 让发送前能力回执校验与普通 ImageTask 调用使用同一冻结证据。
+	ctx = k12.WithGradingModelSnapshot(ctx, gradingSnapshotFromImageRoute(snapshot))
 	return withWorkFeedbackRouteSnapshot(ctx, snapshot)
 }
 
@@ -1675,12 +1693,17 @@ func (c *ImageTaskCoordinator) executeWritingOCR(
 	if err != nil {
 		unknown := sentProviderOutcomeUnknown(err, providerCtxErr)
 		failureKind := "writing_ocr_provider_failed"
+		retrySafe := !unknown
 		if unknown {
 			failureKind = "writing_ocr_outcome_unknown"
 		}
+		if errors.Is(err, k12.ErrModelCapabilityUnverified) {
+			failureKind = "model_capability_unverified"
+			retrySafe = false
+		}
 		_ = c.Records.FailImageTaskInvocation(
 			context.WithoutCancel(ctx), intake.AgentName, invocation.InvocationID,
-			failureKind, unknown, !unknown,
+			failureKind, unknown, retrySafe,
 		)
 		return intake, err
 	}
@@ -2364,9 +2387,15 @@ func (c *ImageTaskCoordinator) Retry(
 		cancelAutomatic()
 		if err != nil {
 			unknown := sentProviderOutcomeUnknown(err, providerCtxErr)
+			retrySafe := !unknown
+			failureKind := "classification_retry_failed"
+			if errors.Is(err, k12.ErrModelCapabilityUnverified) {
+				failureKind = "model_capability_unverified"
+				retrySafe = false
+			}
 			_ = c.Records.FailImageTaskInvocation(
 				context.WithoutCancel(ctx), agentName, invocation.InvocationID,
-				"classification_retry_failed", unknown, !unknown,
+				failureKind, unknown, retrySafe,
 			)
 			return ImageTaskView{}, err
 		}

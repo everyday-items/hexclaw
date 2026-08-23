@@ -9,6 +9,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/storage"
 )
 
 // resolveK12GradingModelSnapshot is the single control-plane selector shared
@@ -32,12 +33,17 @@ func resolveK12GradingModelSnapshot(
 	if err != nil {
 		return k12.GradingModelSnapshot{}, err
 	}
+	providerInstanceID, err := k12ProviderInstanceID(router, route.ProviderName)
+	if err != nil {
+		return k12.GradingModelSnapshot{}, err
+	}
 	snapshot := k12.GradingModelSnapshot{
-		Provider:   route.ProviderName,
-		Model:      route.Model,
-		Route:      route.ProviderName + "/" + route.Model,
-		Capability: config.LLMModelCapabilityVision,
-		TimeoutMS:  int(k12.GradingStageBudgetSeconds(k12.GradingStageRecognizing) * 1000),
+		Provider:           route.ProviderName,
+		Model:              route.Model,
+		Route:              route.ProviderName + "/" + route.Model,
+		ProviderInstanceID: providerInstanceID,
+		Capability:         config.LLMModelCapabilityVision,
+		TimeoutMS:          int(k12.GradingStageBudgetSeconds(k12.GradingStageRecognizing) * 1000),
 	}
 	if snapshot.Model == k12.RecognizingPolicyModel {
 		snapshot.RecognizingRequestPolicy = k12.ApprovedRecognizingRequestPolicy()
@@ -64,13 +70,27 @@ func resolveK12PracticeModelSnapshot(
 	if err != nil {
 		return k12.GradingModelSnapshot{}, err
 	}
+	providerInstanceID, err := k12ProviderInstanceID(router, route.ProviderName)
+	if err != nil {
+		return k12.GradingModelSnapshot{}, err
+	}
 	return k12.GradingModelSnapshot{
-		Provider:   route.ProviderName,
-		Model:      route.Model,
-		Route:      route.ProviderName + "/" + route.Model,
-		Capability: config.LLMModelCapabilityText,
-		TimeoutMS:  60_000,
+		Provider:           route.ProviderName,
+		Model:              route.Model,
+		Route:              route.ProviderName + "/" + route.Model,
+		ProviderInstanceID: providerInstanceID,
+		Capability:         config.LLMModelCapabilityText,
+		TimeoutMS:          60_000,
 	}, nil
+}
+
+// k12ProviderInstanceID 将路由名绑定到稳定的配置实体，而不使用可编辑的展示名。
+func k12ProviderInstanceID(router *llmrouter.Selector, providerName string) (string, error) {
+	providerConfig, configured := router.ProviderConfig(providerName)
+	if !configured {
+		return "", fmt.Errorf("K12 frozen provider %q has no active configuration", providerName)
+	}
+	return config.EffectiveProviderInstanceID(providerName, providerConfig), nil
 }
 
 // resolveK12FrozenTextCompletionRoute 是 K12 文本回调的数据平面唯一解析器，
@@ -79,6 +99,7 @@ func resolveK12PracticeModelSnapshot(
 func resolveK12FrozenTextCompletionRoute(
 	ctx context.Context,
 	router *llmrouter.Selector,
+	receipts storage.ModelCapabilityProbeReceiptStore,
 	operation string,
 ) (llm.Provider, string, error) {
 	if router == nil {
@@ -93,6 +114,11 @@ func resolveK12FrozenTextCompletionRoute(
 			)
 		}
 		if err := k12.ValidateGradingModelRoute(ctx, snapshot.Provider, snapshot.Model); err != nil {
+			return nil, "", err
+		}
+		if err := validateK12FrozenModelCapabilityReceipt(
+			ctx, router, receipts, snapshot, k12ProbeKindForSnapshot(snapshot),
+		); err != nil {
 			return nil, "", err
 		}
 		return provider, snapshot.Model, nil

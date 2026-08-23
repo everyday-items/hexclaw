@@ -128,9 +128,7 @@ func (s *Server) handleCronjobUnified(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, CodeBadRequest, "请求格式错误: "+humanizeError(err))
 		return
 	}
-	if req.UserID == "" {
-		req.UserID = "api-user"
-	}
+	req.UserID = sessionUserIDFromRequestOrBody(r, req.UserID)
 
 	// idempotency check（只对写操作生效）
 	if req.IdempotencyKey != "" && isMutationAction(req.Action) {
@@ -261,27 +259,60 @@ func (s *Server) cronActionUpdate(ctx context.Context, req *CronJobRequest) (*Cr
 	if req.JobID == "" {
 		return nil, http.StatusBadRequest, &cronErr{code: CodeBadRequest, msg: "job_id 必填"}
 	}
-	// 更新 = 原子替换：先删后建（共享 idempotency_key 保证幂等）
-	//
-	// Capture the original before removal: if the create side fails (compile
-	// error, agent frequency guard, quota, ...), the original job must be
-	// restored — otherwise update silently deletes the user's job (review M4).
-	var origCopy *cron.Job
-	if orig, ok := s.scheduler.GetJob(ctx, req.JobID); ok {
-		c := *orig
-		origCopy = &c
+	orig, status, err := s.cronJobForOwner(ctx, req.UserID, req.JobID)
+	if err != nil {
+		return nil, status, err
 	}
-	if err := s.scheduler.RemoveJob(ctx, req.JobID); err != nil {
-		return nil, http.StatusInternalServerError, &cronErr{code: CodeInternalError, msg: "更新前清理失败"}
+	if req.Draft == nil {
+		return nil, http.StatusBadRequest, &cronErr{code: CodeBadRequest, msg: "draft 必填"}
 	}
-	resp, status, err := s.cronActionCreate(ctx, req)
-	if err != nil && origCopy != nil {
-		if rerr := s.scheduler.AddJob(ctx, origCopy); rerr != nil {
-			slog.Error("[cron-update] failed to restore original job after create failure",
-				"source", "cron", "job_id", req.JobID, "err", rerr.Error())
+	d := req.Draft
+	if strings.TrimSpace(d.Name) == "" || strings.TrimSpace(d.Schedule) == "" || strings.TrimSpace(d.Prompt) == "" {
+		return nil, http.StatusBadRequest, &cronErr{code: CodeBadRequest, msg: "name、schedule、prompt 必填"}
+	}
+	used, err := s.activeCronJobCount(ctx, req.UserID)
+	if err != nil {
+		return nil, http.StatusInternalServerError, &cronErr{code: CodeInternalError, msg: "配额检查失败"}
+	}
+	usedAfterReplace := used
+	if orig.Status == cron.StatusActive {
+		usedAfterReplace--
+	}
+	if used >= CronQuotaPerUser && orig.Status != cron.StatusActive && !d.Paused {
+		return nil, http.StatusTooManyRequests, &cronErr{
+			code: CodeCronQuotaExceeded,
+			msg:  "活跃定时任务已达上限（" + cronItoa(CronQuotaPerUser) + " 个）—— 请删除旧任务后重试",
 		}
 	}
-	return resp, status, err
+
+	job, err := s.scheduler.ReplaceJobForOwner(ctx, req.JobID, req.UserID, cron.AddJobRequest{
+		Name:         d.Name,
+		Schedule:     d.Schedule,
+		Prompt:       d.Prompt,
+		UserID:       req.UserID,
+		Deliver:      d.Deliver,
+		ChatID:       d.ChatID,
+		TimeoutSec:   d.TimeoutSec,
+		Continuous:   d.Continuous,
+		Paused:       d.Paused,
+		LocalAPIBase: s.localAPIBase(),
+	}, d.Runtime, d.Script, nil)
+	if err != nil {
+		if errors.Is(err, cron.ErrCronJobNotFound) {
+			return nil, http.StatusNotFound, &cronErr{code: CodeBadRequest, msg: "Cron job not found"}
+		}
+		mappedStatus, code := classifyCronCreateError(err)
+		slog.Warn("[cron-update] unified failed", "source", "cron", "user", req.UserID,
+			"job_id", req.JobID, "stage", stageOfCreateError(err), "code", code, "err", err.Error())
+		return nil, mappedStatus, &cronErr{code: code, msg: humanizeError(err)}
+	}
+	slog.Info("[cron-update] unified done", "source", "cron", "user", req.UserID, "job_id", job.ID)
+	return &CronJobResponse{
+		Action: "update",
+		Job:    job,
+		Quota:  &quotaInfo{Used: usedAfterReplace + 1, Limit: CronQuotaPerUser},
+		OK:     true,
+	}, http.StatusOK, nil
 }
 
 func (s *Server) cronActionList(ctx context.Context, req *CronJobRequest) (*CronJobResponse, int, error) {
@@ -312,8 +343,9 @@ func (s *Server) cronActionPause(ctx context.Context, req *CronJobRequest) (*Cro
 	if req.JobID == "" {
 		return nil, http.StatusBadRequest, &cronErr{code: CodeBadRequest, msg: "job_id 必填"}
 	}
-	if err := s.scheduler.PauseJob(ctx, req.JobID); err != nil {
-		return nil, http.StatusInternalServerError, &cronErr{code: CodeInternalError, msg: humanizeError(err)}
+	if err := s.scheduler.PauseJobForOwner(ctx, req.JobID, req.UserID); err != nil {
+		status, mapped := classifyCronLifecycleError(err)
+		return nil, status, mapped
 	}
 	return &CronJobResponse{Action: "pause", OK: true}, http.StatusOK, nil
 }
@@ -322,8 +354,9 @@ func (s *Server) cronActionResume(ctx context.Context, req *CronJobRequest) (*Cr
 	if req.JobID == "" {
 		return nil, http.StatusBadRequest, &cronErr{code: CodeBadRequest, msg: "job_id 必填"}
 	}
-	if err := s.scheduler.ResumeJob(ctx, req.JobID); err != nil {
-		return nil, http.StatusInternalServerError, &cronErr{code: CodeInternalError, msg: humanizeError(err)}
+	if err := s.scheduler.ResumeJobForOwner(ctx, req.JobID, req.UserID); err != nil {
+		status, mapped := classifyCronLifecycleError(err)
+		return nil, status, mapped
 	}
 	return &CronJobResponse{Action: "resume", OK: true}, http.StatusOK, nil
 }
@@ -332,8 +365,9 @@ func (s *Server) cronActionRemove(ctx context.Context, req *CronJobRequest) (*Cr
 	if req.JobID == "" {
 		return nil, http.StatusBadRequest, &cronErr{code: CodeBadRequest, msg: "job_id 必填"}
 	}
-	if err := s.scheduler.RemoveJob(ctx, req.JobID); err != nil {
-		return nil, http.StatusInternalServerError, &cronErr{code: CodeInternalError, msg: humanizeError(err)}
+	if err := s.scheduler.RemoveJobForOwner(ctx, req.JobID, req.UserID); err != nil {
+		status, mapped := classifyCronLifecycleError(err)
+		return nil, status, mapped
 	}
 	// 授权生命周期跟随任务：删除即回收其全部任务级授权。
 	s.revokeTaskGrants(ctx, "cron:"+req.JobID)
@@ -344,10 +378,47 @@ func (s *Server) cronActionRun(ctx context.Context, req *CronJobRequest) (*CronJ
 	if req.JobID == "" {
 		return nil, http.StatusBadRequest, &cronErr{code: CodeBadRequest, msg: "job_id 必填"}
 	}
-	if err := s.scheduler.TriggerJob(ctx, req.JobID); err != nil {
-		return nil, http.StatusInternalServerError, &cronErr{code: CodeInternalError, msg: humanizeError(err)}
+	if err := s.scheduler.TriggerJobForOwner(ctx, req.JobID, req.UserID); err != nil {
+		status, mapped := classifyCronLifecycleError(err)
+		return nil, status, mapped
 	}
 	return &CronJobResponse{Action: "run", OK: true}, http.StatusOK, nil
+}
+
+func classifyCronLifecycleError(err error) (int, error) {
+	switch {
+	case errors.Is(err, cron.ErrCronJobNotFound):
+		return http.StatusNotFound, &cronErr{code: CodeCronJobNotFound, msg: cron.ErrCronJobNotFound.Error()}
+	case errors.Is(err, cron.ErrCronJobPaused):
+		return http.StatusConflict, &cronErr{code: CodeCronJobPaused, msg: cron.ErrCronJobPaused.Error()}
+	case errors.Is(err, cron.ErrCronExecutorUnavailable):
+		return http.StatusServiceUnavailable, &cronErr{
+			code: CodeCronExecutorUnavailable,
+			msg:  cron.ErrCronExecutorUnavailable.Error(),
+		}
+	default:
+		return http.StatusInternalServerError, &cronErr{code: CodeInternalError, msg: humanizeError(err)}
+	}
+}
+
+// cronJobForOwner 仅从可信 owner 的任务集合解析目标，统一隐藏跨 owner 与不存在的差异。
+func (s *Server) cronJobForOwner(ctx context.Context, ownerID, jobID string) (*cron.Job, int, error) {
+	jobs, err := s.scheduler.ListJobs(ctx, ownerID)
+	if err != nil {
+		return nil, http.StatusInternalServerError, &cronErr{
+			code: CodeInternalError,
+			msg:  "Failed to validate cron job",
+		}
+	}
+	for _, job := range jobs {
+		if job.ID == jobID {
+			return job, http.StatusOK, nil
+		}
+	}
+	return nil, http.StatusNotFound, &cronErr{
+		code: CodeBadRequest,
+		msg:  "Cron job not found",
+	}
 }
 
 // activeCronJobCount 当前用户活跃（非 paused）任务数。

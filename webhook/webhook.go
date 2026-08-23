@@ -41,6 +41,9 @@ var ErrWebhookNotFound = errors.New("webhook 不存在")
 // ErrWebhookExists 表示同名 webhook 已存在（handler 应转 409 Conflict，不外泄底层约束串）。
 var ErrWebhookExists = errors.New("webhook 名称已存在")
 
+// ErrWebhookOwnerRequired 表示通用 Webhook 缺少可信所有者。
+var ErrWebhookOwnerRequired = errors.New("webhook owner required")
+
 // WebhookType 预置 Webhook 类型
 type WebhookType string
 
@@ -70,6 +73,7 @@ type Webhook struct {
 type Event struct {
 	WebhookID   string         `json:"webhook_id"`
 	WebhookName string         `json:"webhook_name"`
+	UserID      string         `json:"user_id"` // Webhook 定义中持久化的可信所有者
 	Type        WebhookType    `json:"type"`
 	EventType   string         `json:"event_type"`       // 事件类型（如 push, pull_request）
 	Payload     map[string]any `json:"payload"`          // 原始 payload
@@ -152,6 +156,11 @@ func (m *Manager) SetHandler(handler EventHandler) {
 // 未启用端点照常验签并记录事件，但不派发 Agent（返回 423），先把 URL/Secret
 // 配到对端、跑通测试事件，完成授权后再显式启用。
 func (m *Manager) Register(ctx context.Context, wh *Webhook) error {
+	// 所有者是自动化授权与审计归属的可信边界，持久化前必须规范化并拒绝空值。
+	wh.UserID = strings.TrimSpace(wh.UserID)
+	if wh.UserID == "" {
+		return ErrWebhookOwnerRequired
+	}
 	if wh.ID == "" {
 		wh.ID = "wh-" + idgen.ShortID()
 	}
@@ -226,6 +235,42 @@ func (m *Manager) SetEnabled(ctx context.Context, name string, enabled bool) err
 	return nil
 }
 
+// SetEnabledForOwner 仅允许可信所有者修改 Webhook，归属不匹配与不存在使用相同错误。
+func (m *Manager) SetEnabledForOwner(ctx context.Context, name, ownerID string, enabled bool) error {
+	ownerID = strings.TrimSpace(ownerID)
+	if ownerID == "" {
+		return fmt.Errorf("%w: webhook %q", ErrWebhookNotFound, name)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	wh, ok := m.webhooks[name]
+	if !ok || wh.UserID != ownerID {
+		return fmt.Errorf("%w: webhook %q", ErrWebhookNotFound, name)
+	}
+
+	val := 0
+	if enabled {
+		val = 1
+	}
+	res, err := m.db.ExecContext(ctx,
+		`UPDATE webhooks SET enabled = ? WHERE name = ? AND user_id = ?`, val, name, ownerID)
+	if err != nil {
+		return fmt.Errorf("update webhook enabled state: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read updated webhook count: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("%w: webhook %q", ErrWebhookNotFound, name)
+	}
+
+	wh.Enabled = enabled
+	logger.Info("Webhook 启用状态已更新", "name", name, "enabled", enabled)
+	return nil
+}
+
 // Get 按名称取 Webhook（含未启用的）。
 func (m *Manager) Get(name string) (*Webhook, bool) {
 	m.mu.RLock()
@@ -245,6 +290,37 @@ func (m *Manager) Unregister(ctx context.Context, name string) error {
 	delete(m.webhooks, name)
 	m.mu.Unlock()
 	return nil
+}
+
+// UnregisterForOwner 仅删除可信所有者的 Webhook，并返回授权回收所需的 Webhook ID。
+func (m *Manager) UnregisterForOwner(ctx context.Context, name, ownerID string) (string, error) {
+	ownerID = strings.TrimSpace(ownerID)
+	if ownerID == "" {
+		return "", fmt.Errorf("%w: webhook %q", ErrWebhookNotFound, name)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	wh, ok := m.webhooks[name]
+	if !ok || wh.UserID != ownerID {
+		return "", fmt.Errorf("%w: webhook %q", ErrWebhookNotFound, name)
+	}
+
+	res, err := m.db.ExecContext(ctx,
+		`DELETE FROM webhooks WHERE name = ? AND user_id = ?`, name, ownerID)
+	if err != nil {
+		return "", fmt.Errorf("delete webhook: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return "", fmt.Errorf("read deleted webhook count: %w", err)
+	}
+	if affected == 0 {
+		return "", fmt.Errorf("%w: webhook %q", ErrWebhookNotFound, name)
+	}
+
+	delete(m.webhooks, name)
+	return wh.ID, nil
 }
 
 // List 列出所有 Webhook
@@ -475,6 +551,7 @@ func (m *Manager) parseEvent(wh *Webhook, r *http.Request, body []byte) (*Event,
 	event := &Event{
 		WebhookID:   wh.ID,
 		WebhookName: wh.Name,
+		UserID:      wh.UserID,
 		Type:        wh.Type,
 		ReceivedAt:  time.Now(),
 	}
@@ -570,6 +647,12 @@ func (m *Manager) loadWebhooks(ctx context.Context) error {
 		if err := rows.Scan(&wh.ID, &wh.Name, &wh.Type, &wh.Secret, &wh.Prompt,
 			&wh.UserID, &enabled, &lastEvent, &wh.EventCount, &wh.CreatedAt, &wh.JobID); err != nil {
 			return err
+		}
+		// 历史空 owner 记录不进入运行时路由；保留数据库原记录供后续显式处置。
+		wh.UserID = strings.TrimSpace(wh.UserID)
+		if wh.UserID == "" {
+			logger.Warn("Webhook skipped: persisted owner is empty", "id", wh.ID, "name", wh.Name)
+			continue
 		}
 		wh.Enabled = enabled == 1
 		wh.HasSecret = wh.Secret != ""

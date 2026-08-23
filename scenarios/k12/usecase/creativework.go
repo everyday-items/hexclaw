@@ -33,8 +33,8 @@ type CreativeWorkView struct {
 	GenerationState k12.CreativeWorkGenerationState
 }
 
-// CreateCurrentTextWork is the sole direct current create path. Image-bearing
-// writing and all artwork continue through the ImageTask facade.
+// CreateCurrentTextWork 是当前纯文字作品的唯一直接创建路径；带图片的写作和
+// 所有美术作品继续通过 ImageTask facade。
 func (d Deps) CreateCurrentTextWork(
 	ctx context.Context,
 	agentName, contentMarkdown, commandKey string,
@@ -47,7 +47,10 @@ func (d Deps) CreateCurrentTextWork(
 			"%w: agent/content_markdown/Idempotency-Key required", ErrInvalidInput,
 		)
 	}
-	fields := k12.CreativeWorkFields{WorkType: k12.WorkTypeWriting}
+	fields := k12.CreativeWorkFields{
+		WorkType:  k12.WorkTypeWriting,
+		GradeTerm: d.creationGradeTerm(ctx, agentName, ""),
+	}
 	rec, err := k12.NewCreativeWorkRecord(agentName, "", fields)
 	if err != nil {
 		return "", "", false, err
@@ -443,54 +446,31 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 	return structured
 }
 
-// SubmitRevision 提交修改稿形成新版本（feedback_ready → revised，PRD §3.10）。不代写：内容由孩子/家长提供。
-// §3.10（2026-07-18 裁决）：「修改稿必须来自真实上传（照片或粘贴文本）才形成新版本，
-// 禁止凭空 +1 版本」——content 与 asset 至少一项非空。
-func (d Deps) SubmitRevision(ctx context.Context, agentName, recordID, contentMarkdown, sourceAssetID string) (CreativeWorkView, error) {
-	return d.submitRevisionVersion(ctx, agentName, recordID, k12.CreativeWorkVersion{
-		ContentMarkdown: contentMarkdown,
-		SourceAssetID:   sourceAssetID,
-	})
+// SubmitRevision 只保留旧调用者的拒绝边界；当前作品每次保存都创建独立作品。
+func (d Deps) SubmitRevision(context.Context, string, string, string, string) (CreativeWorkView, error) {
+	return CreativeWorkView{}, fmt.Errorf(
+		"%w: creative work revisions are read-only; create a new work instead",
+		ErrInvalidInput,
+	)
 }
 
-// SubmitRevisionWithOCR is the writing-photo revision path. The client names
-// a confirmed snapshot, but the server rehydrates raw/canonical evidence from
-// the owner-scoped OCR ledger before persisting the version.
+// SubmitRevisionWithOCR 只保留旧调用者的拒绝边界，不再写入版本。
 func (d Deps) SubmitRevisionWithOCR(
-	ctx context.Context, agentName, recordID string, next k12.CreativeWorkVersion,
+	context.Context, string, string, k12.CreativeWorkVersion,
 ) (CreativeWorkView, error) {
-	return d.submitRevisionVersion(ctx, agentName, recordID, next)
+	return CreativeWorkView{}, fmt.Errorf(
+		"%w: creative work revisions are read-only; create a new work instead",
+		ErrInvalidInput,
+	)
 }
 
 func (d Deps) submitRevisionVersion(
-	ctx context.Context, agentName, recordID string, next k12.CreativeWorkVersion,
+	context.Context, string, string, k12.CreativeWorkVersion,
 ) (CreativeWorkView, error) {
-	contentMarkdown := next.ContentMarkdown
-	sourceAssetID := next.SourceAssetID
-	if strings.TrimSpace(contentMarkdown) == "" && strings.TrimSpace(sourceAssetID) == "" {
-		return CreativeWorkView{}, fmt.Errorf("%w: 修改稿必须来自真实上传（照片或粘贴文本），不能凭空形成新版本", ErrInvalidInput)
-	}
-	v, err := d.GetCreativeWork(ctx, agentName, recordID)
-	if err != nil {
-		return CreativeWorkView{}, err
-	}
-	if v.Record.Status != k12.WorkStatusFeedbackReady {
-		return CreativeWorkView{}, fmt.Errorf("usecase: 只有已点评作品可提交修改稿，当前 %s", v.Record.Status)
-	}
-	if v.Fields.WorkType == k12.WorkTypeWriting && strings.TrimSpace(next.SourceAssetID) != "" {
-		if err := d.hydrateConfirmedWritingVersion(ctx, agentName, &next); err != nil {
-			return CreativeWorkView{}, err
-		}
-	}
-	if err := validateWorkAssetOwner(agentName, next.SourceAssetID); err != nil {
-		return CreativeWorkView{}, err
-	}
-	next.VersionID = fmt.Sprintf("v%d", len(v.Fields.Versions)+1)
-	v.Fields.Versions = append(v.Fields.Versions, next)
-	if err := d.saveWorkFields(ctx, v, k12.WorkStatusRevised); err != nil {
-		return CreativeWorkView{}, err
-	}
-	return d.GetCreativeWork(ctx, agentName, recordID)
+	return CreativeWorkView{}, fmt.Errorf(
+		"%w: creative work revisions are read-only; create a new work instead",
+		ErrInvalidInput,
+	)
 }
 
 func (d Deps) saveWorkFields(ctx context.Context, v CreativeWorkView, newStatus string) error {

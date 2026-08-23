@@ -237,7 +237,7 @@ func (d Deps) GenerateCurrentDictationToBasket(
 		status, evidence = k12.PracticeItemVerified, "字符级比对（确定性默写判定，一字不差即正确）"
 	}
 	item := k12.PracticeItem{
-		ItemID:                 "dictation-" + generation.GenerationID,
+		ItemID:                 dictationPracticeItemID(generation),
 		Subject:                f.Subject,
 		AddedVia:               k12.PracticeAddedViaAccumulation,
 		QuestionMarkdown:       question,
@@ -277,6 +277,13 @@ func (d Deps) GenerateCurrentDictationToBasket(
 		return generation, basketID, added, err
 	}
 	return generation, basketID, added, nil
+}
+
+func dictationPracticeItemID(generation k12.AccumulationDictationGeneration) string {
+	if generation.Attempt <= 1 {
+		return "dictation-" + generation.GenerationID
+	}
+	return fmt.Sprintf("dictation-%s-attempt-%d", generation.GenerationID, generation.Attempt)
 }
 
 // blankFillClauses 古诗/长句补空（§3.9）：按标点逐句留 1～2 个关键字空（句末关键字挖空，

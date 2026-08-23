@@ -171,6 +171,9 @@ func (o *GradingOrchestrator) finalizeGradingPage(
 	var tips *TutoringTips
 	if skippedCount > 0 {
 		coverage = k12.GradingFinalArtifactCoverageWithSkips
+	} else if strings.TrimSpace(job.Fields.SourceKind) == "webhook" &&
+		!gradingFinalEntriesHaveTrustedConceptFacts(entries) {
+		coverage = k12.GradingFinalArtifactCoverageGeneralGuidance
 	} else {
 		generated, invocationID, summaryErr := o.buildFinalTutoringTips(
 			ctx, job, structureVersion, orderedJSON,
@@ -182,6 +185,11 @@ func (o *GradingOrchestrator) finalizeGradingPage(
 		summaryInvocationID = invocationID
 	}
 	canonicalMarkdown := renderCanonicalGradingFinal(entries, tips)
+	if coverage == k12.GradingFinalArtifactCoverageGeneralGuidance {
+		canonicalMarkdown += "\n\n# General guidance\n\n" +
+			"No verified textbook grounding is available. " +
+			"The item-level assessment and parent guidance above are general guidance and are not based on a textbook."
+	}
 	artifact := k12.GradingFinalArtifact{
 		AgentName:                 job.Record.AgentName,
 		JobID:                     job.Record.RecordID,
@@ -204,6 +212,19 @@ func (o *GradingOrchestrator) finalizeGradingPage(
 		return k12.GradingFinalArtifact{}, err
 	}
 	return stored, nil
+}
+
+// text webhook 不得把模型评估推断成已确认教材知识点；只有冻结 Problem
+// 自身携带的非空 concept facts 才允许进入完整 TutoringTips 摘要链。
+func gradingFinalEntriesHaveTrustedConceptFacts(entries []gradingFinalEntry) bool {
+	for _, entry := range entries {
+		for _, concept := range entry.question.KnowledgePoints {
+			if strings.TrimSpace(concept) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (o *GradingOrchestrator) requireTerminalGradingOperations(

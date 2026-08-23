@@ -293,23 +293,7 @@ func codeExecDirectGoCommandIndex(command []string) (int, error) {
 	if codeExecLiteralCommand(first, "go", "go.exe") {
 		return 0, nil
 	}
-	if !codeExecLiteralCommand(first, "env", "env.exe") {
-		return -1, errors.New("go execution accepts only structured direct go argv")
-	}
-	for index := 1; index < len(command); index++ {
-		arg := strings.TrimSpace(command[index])
-		if codeExecLiteralCommand(arg, "go", "go.exe") {
-			return index, nil
-		}
-		if !codeExecEnvironmentAssignment(arg) {
-			return -1, errors.New("go execution accepts only explicit environment assignments before direct go argv")
-		}
-		key, _, _ := strings.Cut(arg, "=")
-		if codeExecControlledEnvironmentKey(key) {
-			return -1, fmt.Errorf("go execution cannot override controlled environment key %s", key)
-		}
-	}
-	return -1, errors.New("go execution requires direct go argv after environment assignments")
+	return -1, errors.New("go execution accepts only structured direct go argv")
 }
 
 func codeExecLiteralCommand(value string, allowed ...string) bool {
@@ -6419,7 +6403,7 @@ func codeExecGoExecutionIntent(req codeExecRequest) (bool, error) {
 		return explicitGo, nil
 	}
 	first := strings.TrimSpace(req.Command[0])
-	directCandidate := codeExecLiteralCommand(first, "go", "go.exe", "env", "env.exe")
+	directCandidate := codeExecLiteralCommand(first, "go", "go.exe")
 	goPathCandidate := codeExecCommandBase(first) == "go" || codeExecCommandBase(first) == "go.exe"
 	if !explicitGo && !directCandidate && !goPathCandidate {
 		return false, nil

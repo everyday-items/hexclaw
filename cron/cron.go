@@ -28,6 +28,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -598,6 +599,23 @@ func (s *Scheduler) AddJobFromPromptWithProgress(
 	req AddJobRequest,
 	onProgress ProgressFunc,
 ) (*Job, error) {
+	job, err := s.buildJobFromPromptWithProgress(ctx, req, onProgress)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.AddJob(ctx, job); err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+// buildJobFromPromptWithProgress 只完成 Prompt 编译和 Job 构建，不写数据库或内存 map。
+// 替换流程必须在锁外完成这一步，避免编译期间阻塞调度器并确保失败不影响旧任务。
+func (s *Scheduler) buildJobFromPromptWithProgress(
+	ctx context.Context,
+	req AddJobRequest,
+	onProgress ProgressFunc,
+) (*Job, error) {
 	if s.compiler == nil {
 		return nil, fmt.Errorf("compiler 未注入 — 调度器初始化错")
 	}
@@ -640,9 +658,6 @@ func (s *Scheduler) AddJobFromPromptWithProgress(
 			Deliver:      req.Deliver,
 			Continuous:   req.Continuous,
 		}
-		if err := s.AddJob(ctx, job); err != nil {
-			return nil, err
-		}
 		return job, nil
 	}
 
@@ -679,9 +694,104 @@ func (s *Scheduler) AddJobFromPromptWithProgress(
 		Spec:         spec,
 		Deliver:      req.Deliver, // D4.2 多 deliver 桥接 — 持久化到 meta JSON 列
 	}
-	if err := s.AddJob(ctx, job); err != nil {
+	return job, nil
+}
+
+// ReplaceJobForOwner 在锁外构建新任务，在同一 scheduler 锁和数据库事务内完成
+// owner 校验、插入新任务和删除旧任务。构建或事务任一步失败都会回滚旧任务。
+// runtime/script 保留统一 update 对预编译脚本任务的既有支持。
+func (s *Scheduler) ReplaceJobForOwner(
+	ctx context.Context,
+	jobID, ownerID string,
+	req AddJobRequest,
+	runtime, script string,
+	onProgress ProgressFunc,
+) (*Job, error) {
+	if strings.TrimSpace(ownerID) == "" {
+		return nil, ErrCronJobNotFound
+	}
+	req.UserID = ownerID
+
+	var (
+		job *Job
+		err error
+	)
+	if strings.TrimSpace(script) != "" {
+		job, err = s.buildJobFromScript(req, runtime, script)
+	} else {
+		job, err = s.buildJobFromPromptWithProgress(ctx, req, onProgress)
+	}
+	if err != nil {
 		return nil, err
 	}
+	specJSON, metaJSON, err := prepareJobForPersistence(job)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin cron replacement transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var existingOwner string
+	err = tx.QueryRowContext(ctx,
+		`SELECT user_id FROM cron_jobs WHERE id = ?`, jobID,
+	).Scan(&existingOwner)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrCronJobNotFound
+		}
+		return nil, fmt.Errorf("load cron job for replacement: %w", err)
+	}
+	if existingOwner != ownerID {
+		return nil, ErrCronJobNotFound
+	}
+
+	insertResult, err := tx.ExecContext(ctx,
+		`INSERT INTO cron_jobs (id, name, type, schedule, spec_json, source_prompt, user_id, platform, chat_id, status, next_run_at, created_at, meta)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		job.ID, job.Name, job.Type, job.Schedule, specJSON, job.SourcePrompt,
+		job.UserID, job.Platform, job.ChatID, job.Status, job.NextRunAt, job.CreatedAt, metaJSON,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("insert cron replacement: %w", err)
+	}
+	inserted, err := insertResult.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("read inserted cron replacement row count: %w", err)
+	}
+	if inserted != 1 {
+		return nil, fmt.Errorf("insert cron replacement affected %d rows", inserted)
+	}
+
+	deleteResult, err := tx.ExecContext(ctx,
+		`DELETE FROM cron_jobs WHERE id = ? AND user_id = ?`, jobID, ownerID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("delete replaced cron job: %w", err)
+	}
+	deleted, err := deleteResult.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("read deleted cron job row count: %w", err)
+	}
+	if deleted == 0 {
+		return nil, ErrCronJobNotFound
+	}
+	if deleted != 1 {
+		return nil, fmt.Errorf("delete replaced cron job affected %d rows", deleted)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit cron replacement: %w", err)
+	}
+
+	delete(s.jobs, jobID)
+	s.jobs[job.ID] = job
+	s.pruneAgentState(jobID)
 	return job, nil
 }
 
@@ -1124,23 +1234,64 @@ func (s *Scheduler) ProvisionJobsFromScriptsAtomic(
 	return provisioned, reclaimed, nil
 }
 
-// RemoveJob 删除任务
+// RemoveJob 删除任务。保留内部可信调用方按全局 ID 删除的兼容行为。
 func (s *Scheduler) RemoveJob(ctx context.Context, jobID string) error {
-	// Keep the same lock→DB→map order as stable-key Upsert. The previous
-	// DB→lock order allowed this interleaving: delete old row, upsert replacement,
-	// then delete the replacement from memory.
-	s.mu.Lock()
-	_, err := s.db.ExecContext(ctx, `DELETE FROM cron_jobs WHERE id = ?`, jobID)
-	if err != nil {
-		s.mu.Unlock()
-		return err
+	return s.removeJob(ctx, jobID, "", false)
+}
+
+// RemoveJobForOwner 仅允许任务所属用户删除，并统一隐藏跨用户与不存在任务。
+func (s *Scheduler) RemoveJobForOwner(ctx context.Context, jobID, ownerID string) error {
+	if strings.TrimSpace(ownerID) == "" {
+		return ErrCronJobNotFound
 	}
+	return s.removeJob(ctx, jobID, ownerID, true)
+}
+
+func (s *Scheduler) removeJob(ctx context.Context, jobID, ownerID string, ownerScoped bool) error {
+	// 与稳定键 Upsert 共用 lock→transaction→map 顺序，所有权判断和删除由同一条
+	// SQL 完成，避免 handler 先查后删造成 TOCTOU。
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin cron remove transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	query := `DELETE FROM cron_jobs WHERE id = ?`
+	args := []any{jobID}
+	if ownerScoped {
+		query += ` AND user_id = ?`
+		args = append(args, ownerID)
+	}
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("remove cron job: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read removed cron row count: %w", err)
+	}
+	if affected == 0 {
+		if ownerScoped {
+			return ErrCronJobNotFound
+		}
+		// 旧 RemoveJob 对不存在任务返回成功，保持兼容。
+		return nil
+	}
+	if affected != 1 {
+		return fmt.Errorf("remove cron job affected %d rows", affected)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit cron remove transaction: %w", err)
+	}
+
 	delete(s.jobs, jobID)
 	// Drop heal-quota / notification bookkeeping so the maps cannot grow
 	// unboundedly across job churn (review L5). Keep it inside the lifecycle
 	// boundary so it cannot erase state initialized by a following upsert.
 	s.pruneAgentState(jobID)
-	s.mu.Unlock()
 	return nil
 }
 
@@ -1257,12 +1408,28 @@ func cloneJobSnapshot(job *Job) *Job {
 
 // PauseJob 暂停任务
 func (s *Scheduler) PauseJob(ctx context.Context, jobID string) error {
-	return s.updateJobStatus(ctx, jobID, StatusPaused)
+	return s.updateJobStatus(ctx, jobID, "", StatusPaused, false)
 }
 
 // ResumeJob 恢复任务
 func (s *Scheduler) ResumeJob(ctx context.Context, jobID string) error {
-	return s.updateJobStatus(ctx, jobID, StatusActive)
+	return s.updateJobStatus(ctx, jobID, "", StatusActive, false)
+}
+
+// PauseJobForOwner 仅允许任务所属用户暂停，并统一隐藏跨用户与不存在任务。
+func (s *Scheduler) PauseJobForOwner(ctx context.Context, jobID, ownerID string) error {
+	if strings.TrimSpace(ownerID) == "" {
+		return ErrCronJobNotFound
+	}
+	return s.updateJobStatus(ctx, jobID, ownerID, StatusPaused, true)
+}
+
+// ResumeJobForOwner 仅允许任务所属用户恢复；恢复时从持久层完整回载任务。
+func (s *Scheduler) ResumeJobForOwner(ctx context.Context, jobID, ownerID string) error {
+	if strings.TrimSpace(ownerID) == "" {
+		return ErrCronJobNotFound
+	}
+	return s.updateJobStatus(ctx, jobID, ownerID, StatusActive, true)
 }
 
 // ListJobs 列出所有任务
@@ -1477,32 +1644,81 @@ func (s *Scheduler) GetJob(_ context.Context, jobID string) (*Job, bool) {
 	return job, ok
 }
 
+var (
+	// ErrCronJobNotFound 对不存在与跨用户任务提供同一失败语义。
+	ErrCronJobNotFound = fmt.Errorf("cron job not found")
+	// ErrCronJobPaused 表示任务已暂停，必须恢复后才能运行。
+	ErrCronJobPaused = fmt.Errorf("cron job paused")
+	// ErrCronExecutorUnavailable 表示脚本任务执行器未配置。
+	ErrCronExecutorUnavailable = fmt.Errorf("cron executor unavailable")
+)
+
 // TriggerJob 手动触发任务执行（fire-and-forget，不等结果）。
 //
 // v2：不依赖 executor callback，直接 dispatch 到 executeJob，由 ScriptExecutor 跑沙箱。
-func (s *Scheduler) TriggerJob(_ context.Context, jobID string) error {
+func (s *Scheduler) TriggerJob(ctx context.Context, jobID string) error {
+	return s.triggerJob(ctx, jobID, "", false)
+}
+
+// TriggerJobForOwner 仅允许任务所属用户触发，并对不存在与跨用户任务返回相同错误。
+func (s *Scheduler) TriggerJobForOwner(ctx context.Context, jobID, ownerID string) error {
+	if strings.TrimSpace(ownerID) == "" {
+		return ErrCronJobNotFound
+	}
+	return s.triggerJob(ctx, jobID, ownerID, true)
+}
+
+func (s *Scheduler) triggerJob(ctx context.Context, jobID, ownerID string, ownerScoped bool) error {
 	s.mu.RLock()
 	job, ok := s.jobs[jobID]
-	s.mu.RUnlock()
-
-	if !ok {
+	var j Job
+	if ok {
+		if ownerScoped && job.UserID != ownerID {
+			s.mu.RUnlock()
+			return ErrCronJobNotFound
+		}
+		j = *job
+	} else if ownerScoped {
+		// paused job 重启后不在 active map；从持久层 owner-scoped 查询才能正确
+		// 区分 paused 与 not-found，同时不泄露其他 owner 的任务。
+		loaded, err := scanJobRow(s.db.QueryRowContext(ctx,
+			`SELECT id, name, type, schedule, spec_json, source_prompt, user_id, platform, chat_id, status,
+			 last_run_at, next_run_at, run_count, created_at, meta
+			 FROM cron_jobs WHERE id = ? AND user_id = ?`, jobID, ownerID))
+		if err != nil {
+			s.mu.RUnlock()
+			if err == sql.ErrNoRows {
+				return ErrCronJobNotFound
+			}
+			return fmt.Errorf("load cron job for trigger: %w", err)
+		}
+		j = *loaded
+	} else {
+		s.mu.RUnlock()
 		return fmt.Errorf("任务 %q 不存在", jobID)
 	}
+	// 所有权校验与任务快照必须处于同一读锁，避免校验后按同一 ID 读取到其他任务。
+	s.mu.RUnlock()
+
 	// 暂停态任务不接受手动 run / webhook TriggerJob —— 尊重「审批未决先冻结任务
 	// 意图，暂停期间根本不 dispatch」的设计（GO-6）。仅 checkAndExecute 的调度尊重
 	// StatusActive 是不够的：run/webhook 会绕过冻结，平白产生一次失败运行+pending 审计。
-	if job.Status == StatusPaused {
+	if j.Status == StatusPaused {
+		if ownerScoped {
+			return ErrCronJobPaused
+		}
 		return fmt.Errorf("任务 %q 已暂停，恢复（resume）后才能触发", jobID)
 	}
 	// Agent-mode jobs run via the injected AgentRunner, not the script executor,
 	// so only script-mode jobs need scriptExec — don't block a webhook-triggered
 	// agent job on it (an agent-only deployment may legitimately have no exec).
-	if s.scriptExec == nil && (job.Spec == nil || job.Spec.Runtime != RuntimeAgent) {
+	if s.scriptExec == nil && (j.Spec == nil || j.Spec.Runtime != RuntimeAgent) {
+		if ownerScoped {
+			return ErrCronExecutorUnavailable
+		}
 		return fmt.Errorf("脚本执行器未就绪")
 	}
 
-	// 复制一份避免并发修改（Spec 是 read-only pointer，共享安全）
-	j := *job
 	go s.executeJob(&j)
 	return nil
 }
@@ -2232,18 +2448,77 @@ func (s *Scheduler) loadJobs(ctx context.Context) error {
 	return rows.Err()
 }
 
-// updateJobStatus 更新任务状态
-func (s *Scheduler) updateJobStatus(ctx context.Context, jobID string, status JobStatus) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE cron_jobs SET status = ? WHERE id = ?`, status, jobID)
+// updateJobStatus 在同一锁和事务内读取、校验并更新任务状态。
+// Resume 必须使用持久层完整快照回载 s.jobs，因为 paused job 重启时不会被 loadJobs 加载。
+func (s *Scheduler) updateJobStatus(
+	ctx context.Context,
+	jobID, ownerID string,
+	status JobStatus,
+	ownerScoped bool,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin cron status transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	query := `SELECT id, name, type, schedule, spec_json, source_prompt, user_id, platform, chat_id, status,
+		last_run_at, next_run_at, run_count, created_at, meta
+		FROM cron_jobs WHERE id = ?`
+	args := []any{jobID}
+	if ownerScoped {
+		query += ` AND user_id = ?`
+		args = append(args, ownerID)
+	}
+	job, err := scanJobRow(tx.QueryRowContext(ctx, query, args...))
+	if err != nil {
+		if err == sql.ErrNoRows {
+			if ownerScoped {
+				return ErrCronJobNotFound
+			}
+			// 旧 PauseJob/ResumeJob 对不存在任务返回成功，保持兼容。
+			return nil
+		}
+		return fmt.Errorf("load cron job for status update: %w", err)
 	}
 
-	s.mu.Lock()
-	if job, ok := s.jobs[jobID]; ok {
-		job.Status = status
+	updateQuery := `UPDATE cron_jobs SET status = ? WHERE id = ?`
+	updateArgs := []any{status, jobID}
+	if ownerScoped {
+		updateQuery += ` AND user_id = ?`
+		updateArgs = append(updateArgs, ownerID)
 	}
-	s.mu.Unlock()
+	result, err := tx.ExecContext(ctx, updateQuery, updateArgs...)
+	if err != nil {
+		return fmt.Errorf("update cron job status: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read updated cron row count: %w", err)
+	}
+	if affected == 0 {
+		if ownerScoped {
+			return ErrCronJobNotFound
+		}
+		return nil
+	}
+	if affected != 1 {
+		return fmt.Errorf("update cron job status affected %d rows", affected)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit cron status transaction: %w", err)
+	}
+
+	job.Status = status
+	if status == StatusActive {
+		// Resume 总是用 durable snapshot 完整回载，修复重启后 paused job 不在 map。
+		s.jobs[jobID] = job
+	} else if _, ok := s.jobs[jobID]; ok {
+		s.jobs[jobID] = job
+	}
 	return nil
 }
 

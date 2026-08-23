@@ -422,6 +422,9 @@ func ParseLegacyWorkFeedbackJSON(raw []byte) (WorkFeedback, error) {
 
 // CreativeWorkFields 作品领域字段（PRD §5.5）。
 type CreativeWorkFields struct {
+	// GradeTerm 冻结作品创建时的孩子学期。V82 前的历史作品保持空值，
+	// 只读兼容时不得猜测回填到后来学期。
+	GradeTerm           string              `json:"grade_term,omitempty"`
 	WorkType            string              `json:"work_type"` // writing / art
 	DisplayName         string              `json:"display_name,omitempty"`
 	WorkTitle           string              `json:"work_title,omitempty"`
@@ -512,6 +515,9 @@ func validateCreativeWorkFields(fieldsJSON string) error {
 		return fmt.Errorf("作品字段非法 JSON: %w", err)
 	}
 	f = NormalizeCreativeWorkFields(f)
+	if f.GradeTerm != "" && !ValidProfileGradeTerm(f.GradeTerm) {
+		return fmt.Errorf("作品 grade_term 非法值 %q", f.GradeTerm)
+	}
 	if f.WorkType != WorkTypeWriting && f.WorkType != WorkTypeArt {
 		return fmt.Errorf("作品类型只允许 writing/art，got %q", f.WorkType)
 	}

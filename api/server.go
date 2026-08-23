@@ -39,6 +39,7 @@ import (
 
 	"github.com/hexagon-codes/toolkit/util/logger"
 
+	"github.com/hexagon-codes/ai-core/llm"
 	imagegen "github.com/hexagon-codes/ai-core/media/image"
 	videogen "github.com/hexagon-codes/ai-core/media/video"
 	"github.com/hexagon-codes/ai-core/media/voice"
@@ -81,10 +82,10 @@ type Server struct {
 	// cfgMu 串行化 s.cfg 的 read-copy-save-apply 写路径（GO-7/BUG-20260703）：
 	// 各配置写 handler 都做「整结构浅拷贝→落盘→回写」，无锁时既有同址读写
 	// 竞争（拷贝读 vs 字段写），也有 lost-update（旧副本落盘抹掉他人变更）。
-	cfgMu              sync.RWMutex
-	engine             engine.Engine
-	gateway            gateway.Gateway
-	store              storage.Store                 // 数据存储层
+	cfgMu   sync.RWMutex
+	engine  engine.Engine
+	gateway gateway.Gateway
+	store   storage.Store // 数据存储层
 	// sessionDeletedHook 在会话删除成功（durable 撤销已提交）后回调，供
 	// PermissionHub 等进程内状态清理使用；hook 缺失或失败不改变删除结果。
 	sessionDeletedHook func(sessionID string)
@@ -724,6 +725,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/config/llm", s.handleGetLLMConfig)
 	mux.HandleFunc("PUT /api/v1/config/llm", s.handleUpdateLLMConfig)
 	mux.HandleFunc("POST /api/v1/config/llm/test", s.handleTestLLMConfig)
+	mux.HandleFunc("POST /api/v1/config/llm/probe", s.handleProbeModelCapability)
 	mux.HandleFunc("POST /api/v1/config/llm/models", s.handleFetchProviderModels)
 	// 记忆行为配置（BUG-20260703 P2-2：auto_memory / 召回地板 / 主动召回 / 画像蒸馏）
 	mux.HandleFunc("GET /api/v1/config/memory", s.handleGetMemoryConfig)
@@ -1339,10 +1341,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if se, ok := s.engine.(streamEngine); ok {
 		chunks, err := se.ProcessStream(ctx, msg)
 		if err != nil {
-			trace.L(ctx).Error("处理失败", "err", err)
-			writeJSON(w, chatErrorStatus(req.Provider, err), map[string]string{
-				"error": upstreamerr.PublicMessage(err, "error"),
-			})
+			trace.L(ctx).Error("处理失败", chatLLMErrorTraceFields(err)...)
+			writeChatLLMError(w, chatErrorStatus(req.Provider, err), err)
 			return
 		}
 		// 消费流式 channel，收集完整回复
@@ -1361,10 +1361,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		var runtimeEvents []adapter.SequencedRuntimeEvent
 		for chunk := range chunks {
 			if chunk.Error != nil {
-				trace.L(ctx).Error("处理失败", "err", chunk.Error)
-				writeJSON(w, chatErrorStatus(req.Provider, chunk.Error), map[string]string{
-					"error": upstreamerr.PublicMessage(chunk.Error, "error"),
-				})
+				trace.L(ctx).Error("处理失败", chatLLMErrorTraceFields(chunk.Error)...)
+				writeChatLLMError(w, chatErrorStatus(req.Provider, chunk.Error), chunk.Error)
 				return
 			}
 			content.WriteString(chunk.Content)
@@ -1411,10 +1409,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		var err error
 		reply, err = s.engine.Process(ctx, msg)
 		if err != nil {
-			trace.L(ctx).Error("处理失败", "err", err)
-			writeJSON(w, chatErrorStatus(req.Provider, err), map[string]string{
-				"error": upstreamerr.PublicMessage(err, "error"),
-			})
+			trace.L(ctx).Error("处理失败", chatLLMErrorTraceFields(err)...)
+			writeChatLLMError(w, chatErrorStatus(req.Provider, err), err)
 			return
 		}
 	}
@@ -1444,11 +1440,41 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 }
 
 func chatErrorStatus(explicitProvider string, err error) int {
+	if classification, ok := llmrouter.ClassifyLLMError(err); ok {
+		return classification.HTTPStatus
+	}
 	var providerErr *engine.ProviderUnavailableError
 	if strings.TrimSpace(explicitProvider) != "" && errors.As(err, &providerErr) {
 		return http.StatusBadRequest
 	}
 	return http.StatusInternalServerError
+}
+
+// chatLLMErrorTraceFields 仅投影稳定诊断信息，避免 ProviderError 的 Error() 写入上游正文。
+func chatLLMErrorTraceFields(err error) []any {
+	fields := []any{"error_code", "UNCLASSIFIED"}
+	if classification, ok := llmrouter.ClassifyLLMError(err); ok {
+		fields = []any{
+			"error_code", string(classification.Code),
+			"retryable", classification.Retryable,
+		}
+	}
+
+	var providerErr *llm.ProviderError
+	if errors.As(err, &providerErr) && providerErr != nil {
+		fields = append(fields,
+			"provider_status_code", providerErr.StatusCode,
+			"provider_body_len", len(providerErr.Body),
+		)
+		if providerErr.RequestID != "" {
+			fields = append(fields, "provider_request_id", providerErr.RequestID)
+		}
+		return fields
+	}
+	if err != nil {
+		fields = append(fields, "error_len", len(err.Error()))
+	}
+	return fields
 }
 
 // handleChatSSE 处理 SSE 流式聊天请求（BUG-20260523-v2）。
@@ -1489,11 +1515,8 @@ func (s *Server) handleChatSSE(
 
 	chunks, err := se.ProcessStream(ctx, msg)
 	if err != nil {
-		trace.L(ctx).Error("[SSE] ProcessStream 启动失败", "err", err)
-		errPayload, _ := json.Marshal(map[string]any{
-			"error": upstreamerr.PublicMessage(err, "error"),
-			"done":  true,
-		})
+		trace.L(ctx).Error("[SSE] ProcessStream 启动失败", chatLLMErrorTraceFields(err)...)
+		errPayload, _ := json.Marshal(llmErrorPayload(err))
 		_ = writer.WriteData(string(errPayload))
 		return
 	}
@@ -1510,17 +1533,17 @@ func (s *Server) handleChatSSE(
 	for chunk := range chunks {
 		if chunk.Error != nil {
 			hadError = true
-			trace.L(ctx).Error("[SSE] chunk 错误", "err", chunk.Error, "chunks_so_far", chunkCount)
-			errPayload, _ := json.Marshal(map[string]any{
-				"error":                upstreamerr.PublicMessage(chunk.Error, "error"),
-				"done":                 true,
-				"assistant_message_id": chunk.AssistantMessageID,
-				"backend_message_id":   chunk.BackendMessageID,
-				"message_id":           chunk.MessageID,
-				"sequence":             chunk.Sequence,
-				"reasoning_disclosure": chunk.ReasoningDisclosure,
-				"runtime_event":        chunk.RuntimeEvent,
-			})
+			errFields := chatLLMErrorTraceFields(chunk.Error)
+			errFields = append(errFields, "chunks_so_far", chunkCount)
+			trace.L(ctx).Error("[SSE] chunk 错误", errFields...)
+			payloadFields := llmErrorPayload(chunk.Error)
+			payloadFields["assistant_message_id"] = chunk.AssistantMessageID
+			payloadFields["backend_message_id"] = chunk.BackendMessageID
+			payloadFields["message_id"] = chunk.MessageID
+			payloadFields["sequence"] = chunk.Sequence
+			payloadFields["reasoning_disclosure"] = chunk.ReasoningDisclosure
+			payloadFields["runtime_event"] = chunk.RuntimeEvent
+			errPayload, _ := json.Marshal(payloadFields)
 			_ = writer.WriteData(string(errPayload))
 			return
 		}

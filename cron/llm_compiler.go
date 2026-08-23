@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,7 +34,7 @@ type ProviderResolver func() (hexagon.Provider, string, error)
 //
 // 编译失败的语义：
 //   - LLM 错误 / 网络抖动 / 上下文超限 → 返回 error（用户重试）
-//   - LLM 产物解析失败 → 返回 error 并保留 LLM 原文，便于调试与改 prompt
+//   - LLM 产物解析失败 → 返回错误分类与产物长度，原文只保留在本次内存调用链
 //   - 校验失败（禁用调用 / 语法 / 输出契约）→ 返回 error
 //
 // 字段语义（2026-05-27 后）：
@@ -162,7 +164,7 @@ func (c *LLMCompiler) CompileWithProgress(
 		Req:      req,
 	})
 	if err != nil {
-		slog.Warn("[cron] 编译调用失败", "source", "cron", "model", model, "err", err.Error())
+		slog.Warn("[cron] 编译调用失败", "source", "cron", "model", model, "err", safeCompileLogError(err))
 		return nil, fmt.Errorf("LLM 编译失败: %w", err)
 	}
 	slog.Info("[cron] LLM 返回", "source", "cron", "model", model, "duration_ms", time.Since(startedAt).Milliseconds(), "tokens_in", resp.Usage.PromptTokens, "tokens_out", resp.Usage.CompletionTokens)
@@ -180,7 +182,7 @@ func (c *LLMCompiler) CompileWithProgress(
 		// instead of the JSON spec. Feed the malformed output back with a
 		// reformat instruction — the model already has the script, so the
 		// repair round is cheap and usually succeeds (BUG-20260611 finding #5).
-		slog.Warn("[cron] compile output parse failed, self-correction retry", "source", "cron", "model", model, "err", parseErr.Error(), "raw_head", clipForHeal(raw, 300))
+		slog.Warn("[cron] compile output parse failed, self-correction retry", "source", "cron", "model", model, "err", parseErr.Error(), "output_len", len(raw))
 		emit(StageCallingLLM, "输出格式异常，自动修正重试中…")
 		repairMessages := append(llm.NewMessages(sys, prompt),
 			llm.Message{Role: llm.RoleAssistant, Content: raw},
@@ -208,11 +210,11 @@ func (c *LLMCompiler) CompileWithProgress(
 				slog.Info("[cron] self-correction retry succeeded", "source", "cron", "model", model)
 				spec, parseErr, raw = repairSpec, nil, repairRaw
 			} else {
-				slog.Warn("[cron] self-correction retry still unparsable", "source", "cron", "model", model, "err", repairParseErr.Error(), "raw_head", clipForHeal(repairRaw, 300))
+				slog.Warn("[cron] self-correction retry still unparsable", "source", "cron", "model", model, "err", repairParseErr.Error(), "output_len", len(repairRaw))
 				parseErr, raw = repairParseErr, repairRaw
 			}
 		} else {
-			slog.Warn("[cron] self-correction retry call failed", "source", "cron", "model", model, "err", repairErr.Error())
+			slog.Warn("[cron] self-correction retry call failed", "source", "cron", "model", model, "err", safeCompileLogError(repairErr))
 		}
 		if parseErr != nil {
 			// Last resort: salvage the script from the (un-JSON-able) output so
@@ -222,7 +224,7 @@ func (c *LLMCompiler) CompileWithProgress(
 				slog.Info("[cron] compile output salvaged from fenced/broken JSON", "source", "cron", "model", model)
 				spec, parseErr = salvaged, nil
 			} else {
-				return nil, fmt.Errorf("解析编译输出失败（含一次自纠重试）: %w —— LLM 原文:\n%s", parseErr, raw)
+				return nil, compileOutputError("解析编译输出失败（含一次自纠重试）", parseErr, raw)
 			}
 		}
 	}
@@ -250,7 +252,7 @@ func (c *LLMCompiler) CompileWithProgress(
 		// continuation, wrong field). Feed the precise engine error back for ONE
 		// repair round before giving up; this recovers most slips that switching
 		// to a bigger model did not.
-		slog.Warn("[cron] script validation failed, self-correction retry", "source", "cron", "model", model, "err", verr.Error(), "script_head", clipForHeal(spec.Script, 200))
+		slog.Warn("[cron] script validation failed, self-correction retry", "source", "cron", "model", model, "err", verr.Error(), "script_len", len(spec.Script))
 		emit(StageCallingLLM, "脚本有小错，反馈给模型自动修正…")
 		fixMessages := append(llm.NewMessages(sys, prompt),
 			llm.Message{Role: llm.RoleAssistant, Content: raw},
@@ -273,7 +275,7 @@ func (c *LLMCompiler) CompileWithProgress(
 			},
 		})
 		if fixErr != nil {
-			return nil, fmt.Errorf("脚本校验失败: %w —— LLM 原文:\n%s", verr, raw)
+			return nil, compileOutputError("脚本校验失败", verr, raw)
 		}
 		tokensIn += fixResp.Usage.PromptTokens
 		tokensOut += fixResp.Usage.CompletionTokens
@@ -285,7 +287,7 @@ func (c *LLMCompiler) CompileWithProgress(
 			}
 		}
 		if fixParseErr != nil {
-			return nil, fmt.Errorf("脚本校验失败（自纠输出不可解析）: %w —— LLM 原文:\n%s", verr, fixRaw)
+			return nil, compileOutputError("脚本校验失败（自纠输出不可解析）", verr, fixRaw)
 		}
 		normalizeCompiledSpec(fixSpec)
 		if repaired, ok := repairCommonStarlarkValidationSlips(fixSpec.Script); ok {
@@ -298,7 +300,7 @@ func (c *LLMCompiler) CompileWithProgress(
 		}
 		if verr2 := validateCompiledScript(fixSpec); verr2 != nil {
 			slog.Warn("[cron] validation self-correction still invalid", "source", "cron", "model", model, "err", verr2.Error())
-			return nil, fmt.Errorf("脚本校验失败（含一次自纠）: %w —— LLM 原文:\n%s", verr2, fixRaw)
+			return nil, compileOutputError("脚本校验失败（含一次自纠）", verr2, fixRaw)
 		}
 		slog.Info("[cron] validation self-correction succeeded", "source", "cron", "model", model)
 		spec, raw = fixSpec, fixRaw
@@ -319,6 +321,30 @@ func compileLLMMetadata() map[string]any {
 		"thinking":        "off",
 		"enable_thinking": false,
 	}
+}
+
+// compileOutputError 保留错误分类与输出长度，避免模型生成内容经错误链进入日志或响应。
+func compileOutputError(prefix string, cause error, output string) error {
+	return fmt.Errorf("%s: %w (output_len=%d)", prefix, cause, len(output))
+}
+
+// safeCompileLogError 仅保留上游失败分类和状态，去除 ProviderError 中的原始响应体。
+func safeCompileLogError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var providerErr *llm.ProviderError
+	if errors.As(err, &providerErr) && providerErr != nil {
+		if providerErr.StatusCode > 0 {
+			return "provider_http_" + strconv.Itoa(providerErr.StatusCode)
+		}
+		return "provider_error"
+	}
+	message := err.Error()
+	if idx := strings.LastIndex(strings.ToLower(message), "body:"); idx >= 0 {
+		return strings.TrimSpace(message[:idx]) + ", body_redacted"
+	}
+	return message
 }
 
 func withCompileNoThinkDirective(systemPrompt string) string {

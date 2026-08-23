@@ -58,6 +58,15 @@ const GradingMaxStageAttempts = 3
 type GradingModelSnapshot struct {
 	Provider string `json:"provider"`
 	Model    string `json:"model"`
+	// ProviderInstanceID 冻结配置实体身份，避免 Provider 展示名或 map key 变化时
+	// 旧任务把新配置误认为同一路由。
+	ProviderInstanceID string `json:"provider_instance_id,omitempty"`
+	// ConfigFingerprint 绑定实际执行配置；它不能替代静态能力声明。
+	ConfigFingerprint string `json:"config_fingerprint,omitempty"`
+	// CapabilityReceiptDigest 指向创建时匹配的模型能力探测回执摘要。
+	CapabilityReceiptDigest string `json:"capability_receipt_digest,omitempty"`
+	// ProbePolicyVersion 冻结生成能力探测回执所用的探测策略版本。
+	ProbePolicyVersion string `json:"probe_policy_version,omitempty"`
 	// Route is the immutable provider/model routing identity captured when the
 	// Job is created. A retry reuses it even if global defaults change.
 	Route      string `json:"route"`
@@ -76,6 +85,10 @@ func NormalizeGradingModelSnapshot(snapshot GradingModelSnapshot) GradingModelSn
 	snapshot.Provider = strings.TrimSpace(snapshot.Provider)
 	snapshot.Model = strings.TrimSpace(snapshot.Model)
 	snapshot.Route = strings.TrimSpace(snapshot.Route)
+	snapshot.ProviderInstanceID = strings.TrimSpace(snapshot.ProviderInstanceID)
+	snapshot.ConfigFingerprint = strings.TrimSpace(snapshot.ConfigFingerprint)
+	snapshot.CapabilityReceiptDigest = strings.TrimSpace(snapshot.CapabilityReceiptDigest)
+	snapshot.ProbePolicyVersion = strings.TrimSpace(snapshot.ProbePolicyVersion)
 	snapshot.RecognizingRequestPolicy = NormalizeModelRequestPolicySnapshot(
 		snapshot.RecognizingRequestPolicy,
 	)
@@ -83,6 +96,16 @@ func NormalizeGradingModelSnapshot(snapshot GradingModelSnapshot) GradingModelSn
 		snapshot.Route = snapshot.Provider + "/" + snapshot.Model
 	}
 	return snapshot
+}
+
+// HasFrozenCapabilityProbeEvidence 仅在全部绑定信息都存在时返回 true。旧任务和
+// 渐进升级中的部分字段都不是已验证能力证据，调用方不得据此放宽发送前校验。
+func (snapshot GradingModelSnapshot) HasFrozenCapabilityProbeEvidence() bool {
+	snapshot = NormalizeGradingModelSnapshot(snapshot)
+	return snapshot.ProviderInstanceID != "" &&
+		snapshot.ConfigFingerprint != "" &&
+		snapshot.CapabilityReceiptDigest != "" &&
+		snapshot.ProbePolicyVersion != ""
 }
 
 type gradingModelSnapshotContextKey struct{}

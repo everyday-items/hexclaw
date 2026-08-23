@@ -26,10 +26,8 @@ type createImageTaskReq struct {
 	AttemptGeneration int                     `json:"attempt_generation"`
 	RouteRequest      imageTaskRouteRequest   `json:"route_request"`
 	CreativeEntry     *struct {
-		Kind          k12.CreativeWorkEntryKind `json:"kind"`
-		TaskIntent    k12.ImageTaskIntent       `json:"task_intent"`
-		WorkID        string                    `json:"work_id,omitempty"`
-		BaseVersionID string                    `json:"base_version_id,omitempty"`
+		Kind       k12.CreativeWorkEntryKind `json:"kind"`
+		TaskIntent k12.ImageTaskIntent       `json:"task_intent"`
 	} `json:"creative_entry,omitempty"`
 }
 
@@ -151,21 +149,21 @@ type imageTaskCreativeWorkDTO struct {
 }
 
 type imageTaskCreativeProjectionDTO struct {
-	Kind              string                          `json:"kind"`
-	IntakeID          string                          `json:"intake_id"`
-	WorkType          string                          `json:"work_type"`
-	Status            k12.CreativeWorkIntakeStatus    `json:"status"`
-	EntryKind         k12.CreativeWorkEntryKind       `json:"entry_kind,omitempty"`
-	PromotionPolicy   k12.CreativeWorkPromotionPolicy `json:"promotion_policy,omitempty"`
-	RoutingProvenance k12.ImageTaskRoutingProvenance  `json:"routing_provenance,omitempty"`
-	CommitRequired    *bool                           `json:"commit_required,omitempty"`
-	CommitState       string                          `json:"commit_state,omitempty"`
-	PromotedWorkID    string                          `json:"promoted_work_id,omitempty"`
-	PromotedVersionID string                          `json:"promoted_version_id,omitempty"`
-	CanonicalVersion  int                             `json:"canonical_version,omitempty"`
-	CanonicalContent  string                          `json:"canonical_content,omitempty"`
-	Conflicts         []imageTaskCreativeConflictDTO  `json:"conflicts,omitempty"`
-	Work              *imageTaskCreativeWorkDTO       `json:"work,omitempty"`
+	Kind                 string                          `json:"kind"`
+	IntakeID             string                          `json:"intake_id"`
+	WorkType             string                          `json:"work_type"`
+	Status               k12.CreativeWorkIntakeStatus    `json:"status"`
+	EntryKind            k12.CreativeWorkEntryKind       `json:"entry_kind,omitempty"`
+	PromotionPolicy      k12.CreativeWorkPromotionPolicy `json:"promotion_policy,omitempty"`
+	RoutingProvenance    k12.ImageTaskRoutingProvenance  `json:"routing_provenance,omitempty"`
+	CommitRequired       *bool                           `json:"commit_required,omitempty"`
+	CommitState          string                          `json:"commit_state,omitempty"`
+	PromotedWorkID       string                          `json:"promoted_work_id,omitempty"`
+	PromotedGenerationID string                          `json:"promoted_generation_id,omitempty"`
+	CanonicalVersion     int                             `json:"canonical_version,omitempty"`
+	CanonicalContent     string                          `json:"canonical_content,omitempty"`
+	Conflicts            []imageTaskCreativeConflictDTO  `json:"conflicts,omitempty"`
+	Work                 *imageTaskCreativeWorkDTO       `json:"work,omitempty"`
 }
 
 func nonNilStrings(values []string) []string {
@@ -274,9 +272,9 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 			Kind: "creative", IntakeID: view.Creative.IntakeID,
 			WorkType: view.Creative.WorkType, Status: view.Creative.Status,
 			EntryKind: entryKind, PromotionPolicy: promotionPolicy,
-			RoutingProvenance: dispatch.RoutingProvenance,
-			PromotedWorkID:    view.Creative.PromotedWorkID,
-			PromotedVersionID: view.Creative.PromotedVersionID,
+			RoutingProvenance:    dispatch.RoutingProvenance,
+			PromotedWorkID:       view.Creative.PromotedWorkID,
+			PromotedGenerationID: view.Creative.PromotedGenerationID,
 		}
 		if projection.RoutingProvenance == "" {
 			projection.RoutingProvenance = k12.ImageTaskRoutingModelClassified
@@ -366,7 +364,6 @@ func (h *handler) createImageTask(w http.ResponseWriter, r *http.Request) {
 	if req.CreativeEntry != nil {
 		input.CreativeEntry = &k12.ImageTaskCreativeEntry{
 			Kind: req.CreativeEntry.Kind, TaskIntent: req.CreativeEntry.TaskIntent,
-			WorkID: req.CreativeEntry.WorkID, BaseVersionID: req.CreativeEntry.BaseVersionID,
 		}
 	}
 	view, created, err := h.rt.ImageTasks.Create(r.Context(), input)

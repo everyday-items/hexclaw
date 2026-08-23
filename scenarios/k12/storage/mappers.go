@@ -375,7 +375,7 @@ type creativeWorkMapper struct{}
 func (creativeWorkMapper) collection() string { return k12.CollectionCreativeWork }
 func (creativeWorkMapper) table() string      { return "k12_creative_works" }
 func (creativeWorkMapper) domainCols() []string {
-	return []string{"work_type", "title", "task", "intent", "display_name", "work_title",
+	return []string{"grade_term", "work_type", "title", "task", "intent", "display_name", "work_title",
 		"task_requirement", "title_task_provenance_json", "source_intake_id"}
 }
 
@@ -388,14 +388,14 @@ func (creativeWorkMapper) encode(fieldsJSON string) ([]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("k12storage: marshal 作品标题/任务 provenance: %w", err)
 	}
-	return []any{f.WorkType, f.Title, f.Task, f.Intent, f.DisplayName, f.WorkTitle,
+	return []any{f.GradeTerm, f.WorkType, f.Title, f.Task, f.Intent, f.DisplayName, f.WorkTitle,
 		f.TaskRequirement, string(provenance), f.SourceIntakeID}, nil
 }
 
 func (creativeWorkMapper) newScan() ([]any, func() (string, error)) {
 	var f k12.CreativeWorkFields
 	var provenanceJSON string
-	dest := []any{&f.WorkType, &f.Title, &f.Task, &f.Intent, &f.DisplayName, &f.WorkTitle,
+	dest := []any{&f.GradeTerm, &f.WorkType, &f.Title, &f.Task, &f.Intent, &f.DisplayName, &f.WorkTitle,
 		&f.TaskRequirement, &provenanceJSON, &f.SourceIntakeID}
 	return dest, func() (string, error) {
 		if provenanceJSON != "" && provenanceJSON != "{}" {
