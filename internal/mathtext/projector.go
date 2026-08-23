@@ -38,6 +38,10 @@ var latexSymbols = map[string]string{
 var (
 	// latexCommandRe 反斜杠命令（全词：[a-zA-Z]+ 贪婪，\leq2 只取 leq、\fracture 取整词不误配 \frac）。
 	latexCommandRe = regexp.MustCompile(`\\([a-zA-Z]+)`)
+	// 模型或历史 JSON 正文可能把一个 TeX 命令保存成两个反斜杠。只在已证实的
+	// 数学定界符内部把「双反斜杠 + 命令/间距符」还原为一个反斜杠；真正的
+	// TeX 换行 `\\` 后不是命令 token，仍由布局归一化处理。
+	doubleEscapedMathTokenRe = regexp.MustCompile(`\\\\([a-zA-Z]+|[&,;:!])`)
 	// latexHintRe $…$ 内部的 LaTeX 特征：\命令 / ^指数 / _下标。
 	latexHintRe = regexp.MustCompile(`\\[a-zA-Z]|\^[{0-9-]|_[{0-9]`)
 	// 已经是纯文本运算式或完整纯数字的 $…$ 同样属于数学。是否为货币前缀由
@@ -66,6 +70,25 @@ var (
 type byteSpan struct {
 	start int
 	end   int
+}
+
+// WithoutProtectedMarkdown 返回排除围栏代码、行内代码与 URL 后的可见语义文本。
+// 分隔处写入换行，避免删除保护区后把两侧 `$` 或反斜杠命令错误拼成一个公式。
+// 渲染证据校验复用本函数，确保“投影器保护什么，泄漏检测器就忽略什么”。
+func WithoutProtectedMarkdown(s string) string {
+	spans := findProtectedSpans(s)
+	if len(spans) == 0 {
+		return s
+	}
+	var b strings.Builder
+	last := 0
+	for _, span := range spans {
+		b.WriteString(s[last:span.start])
+		b.WriteByte('\n')
+		last = span.end
+	}
+	b.WriteString(s[last:])
+	return b.String()
 }
 
 // ProjectReadable 把常见 LaTeX 写法确定性映射为可读数学文本，返回结果与是否改动。
@@ -341,6 +364,14 @@ func isDollarMath(inner string) bool {
 // math=true 表示已证实处于数学定界符内：未知命令剥反斜杠保留词干、裸下标 _2 也转换；
 // math=false（定界符外）只按精确词表转换，未知命令原样保留。
 func convertMath(s string, math bool) string {
+	if math {
+		s = doubleEscapedMathTokenRe.ReplaceAllStringFunc(s, func(token string) string {
+			if !isKnownDoubleEscapedMathToken(token[2:]) {
+				return token
+			}
+			return token[1:]
+		})
+	}
 	if math && (latexRowBreakRe.MatchString(s) || strings.Contains(s, "&")) {
 		s = normalizeMathLayout(s)
 	}
@@ -381,6 +412,24 @@ func convertMath(s string, math bool) string {
 		s = strings.ReplaceAll(s, `\&`, "&")
 	}
 	return s
+}
+
+func isKnownDoubleEscapedMathToken(name string) bool {
+	if len(name) == 1 && strings.ContainsRune("&,;:!", rune(name[0])) {
+		return true
+	}
+	if _, ok := latexSymbols[name]; ok {
+		return true
+	}
+	if name == "begin" || name == "end" || name == "circ" {
+		return true
+	}
+	for _, command := range structCmds {
+		if strings.TrimPrefix(command.name, `\`) == name {
+			return true
+		}
+	}
+	return false
 }
 
 func isSupportedBareChemicalFormula(formula string) bool {

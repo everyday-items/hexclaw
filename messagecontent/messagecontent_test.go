@@ -108,6 +108,32 @@ func TestBuildRenderManifestRejectsLeakedLaTeXSpacingCommand(t *testing.T) {
 	}
 }
 
+func TestBuildRenderManifestAllowsLiteralLaTeXInsideMarkdownCodeFence(t *testing.T) {
+	canonical := "## 解题步骤\n\n答案是 $\\frac{3}{4}$。\n\n```json\n{\"canonical_markdown\":\"$\\\\frac{3}{4}$\"}\n```"
+	content, err := New(ProducerK12, "zh-CN", canonical, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	projected := "## 解题步骤\n\n答案是 3/4。\n\n```json\n{\"canonical_markdown\":\"$\\\\frac{3}{4}$\"}\n```"
+	manifest, err := BuildManifest(content, RenderRequest{
+		Surface:         SurfaceChannel,
+		RendererVersion: "channel-markdown-readable-math-v1",
+		Capabilities: CapabilitySnapshot{
+			Markdown:    true,
+			TeXMath:     false,
+			UnicodeMath: true,
+		},
+		Parts:          []RenderPart{{Kind: PartMarkdown, Text: projected}},
+		FallbackReason: FallbackMathToReadableText,
+	})
+	if err != nil {
+		t.Fatalf("Markdown 代码围栏内的字面量 LaTeX 不应冒充正文泄漏: %v", err)
+	}
+	if manifest.Parts[0].Kind != PartMarkdown {
+		t.Fatalf("解题消息必须保持 Markdown part: %#v", manifest.Parts)
+	}
+}
+
 func TestManifestRejectsSourceMismatchAndEmptyProjection(t *testing.T) {
 	content, err := New(ProducerWebhook, "en", "**accepted**", nil)
 	if err != nil {

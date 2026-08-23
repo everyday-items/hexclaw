@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/cron"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
 // recordChannel 契约替身：记录经通道发出的消息。
@@ -233,6 +235,110 @@ func TestK12IMDelivererFreezesReceiptPayloadBeforeProviderSend(t *testing.T) {
 	})
 	if err != nil || queried.Status != k12.DeliveryDelivered || queried.ExternalMessageID != "pqk-24" || ding.queryCalls != 1 {
 		t.Fatalf("query must preserve provider evidence: ack=%+v calls=%d err=%v", queried, ding.queryCalls, err)
+	}
+}
+
+func TestK12FinalArtifactIMProjectionKeepsMarkdownAndOmitsInternalJSONEvidence(t *testing.T) {
+	d, dispatcher, reg := newDelivererFixture(t)
+	reg.Register(&recordChannel{name: "dingtalk"})
+	bindRule(t, dispatcher, "dingtalk", "bot-1", "mom-chat", "child-a")
+	d.MarkReady()
+
+	assessment, err := json.Marshal(k12usecase.PhotoGradeItem{
+		Recognized: k12usecase.RecognizedQuestion{
+			ProblemID: "internal-only", AttemptID: "attempt-1", InputDigest: "sha256:input-1",
+			ConfirmedVersion: 1, CanonicalMarkdown: "$\\\\frac{3}{4}$",
+		},
+		Status: k12usecase.PhotoCorrect,
+		Grade:  k12usecase.GradeResult{Solution: "3/4 × 8 = 6"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := "# 作业批改结果\n\n## 第 1 题\n\n$\\\\frac{3}{4} \\\\times 8 = 6$\n\n**Grading status:** `correct`\n\n```json\n" + string(assessment) + "\n```\n\n# 这份作业的辅导要点\n\n1. **先审题**\n2. 再验算"
+	prepared, err := d.PrepareText(context.Background(), "child-a", canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload channel.Message
+	if err := json.Unmarshal([]byte(prepared.PayloadJSON), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Content == nil || payload.Content.Markdown != canonical {
+		t.Fatal("冻结 canonical source 必须保持完整且可追溯")
+	}
+	if payload.RenderManifest == nil || len(payload.RenderManifest.Parts) != 1 ||
+		payload.RenderManifest.Parts[0].Kind != "markdown" {
+		t.Fatalf("钉钉解题消息必须保持 Markdown part: %#v", payload.RenderManifest)
+	}
+	for _, want := range []string{"# 作业批改结果", "## 第 1 题", "3/4 × 8 = 6", "1. **先审题**"} {
+		if !strings.Contains(payload.Text, want) {
+			t.Fatalf("Markdown 投影缺少 %q: %q", want, payload.Text)
+		}
+	}
+	for _, internal := range []string{"```json", "problem_id", "internal-only"} {
+		if strings.Contains(payload.Text, internal) {
+			t.Fatalf("内部评估 JSON 不得进入家长钉钉消息: %q", payload.Text)
+		}
+	}
+}
+
+func TestK12FinalArtifactIMProjectionKeepsActionableSolutionAndUserJSON(t *testing.T) {
+	d, dispatcher, reg := newDelivererFixture(t)
+	reg.Register(&recordChannel{name: "dingtalk"})
+	bindRule(t, dispatcher, "dingtalk", "bot-1", "mom-chat", "child-a")
+	d.MarkReady()
+
+	assessment, err := json.Marshal(k12usecase.PhotoGradeItem{
+		Recognized: k12usecase.RecognizedQuestion{
+			ProblemID: "problem-1", AttemptID: "attempt-1", InputDigest: "sha256:input-1",
+			ConfirmedVersion: 1, Question: "3/4 × 8 = ?", StudentAnswer: "5",
+		},
+		Status: k12usecase.PhotoWrong,
+		Grade: k12usecase.GradeResult{
+			Solution: "## 解答\n先算 3 ÷ 4，再乘 8，得到 6。\n\n## 答案\n6",
+			Outcome: k12usecase.GradeOutcome{
+				Verdict: k12usecase.VerdictDisagree, WrongStep: "把 3/4 当成了 3/8", ErrorCause: "分数含义理解错误",
+			},
+		},
+		ParentGuide: &k12usecase.ParentTeachingGuide{
+			Answer: "6", FullSolutionSteps: []string{"3/4 × 8 = 6"},
+			GradeLevelMethod: "先约分或先算 8 ÷ 4", LikelyMistakes: []string{"把分母也乘 8"},
+			ParentTeachingSequence: []string{"先让孩子说出四分之三的含义", "再让孩子独立计算"},
+			FollowUpQuestions:      []string{"怎样验算结果？"}, CheckingMethod: "用 6 ÷ 8 = 3/4 反向检查",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := "# 作业批改结果\n\n## 第 1 题\n\n题目给出的数据示例必须保留：\n\n```json\n{\"student_visible\":true}\n```\n\n**Grading status:** `wrong`\n\n```json\n" + string(assessment) + "\n```"
+	prepared, err := d.PrepareText(context.Background(), "child-a", canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload channel.Message
+	if err := json.Unmarshal([]byte(prepared.PayloadJSON), &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"```json\n{\"student_visible\":true}\n```",
+		"### 订正参考", "先算 3 ÷ 4，再乘 8，得到 6。",
+		"**第一个错步：** 把 3/4 当成了 3/8", "**错因：** 分数含义理解错误",
+		"### 家长怎么讲", "**答案：** 6", "**本年级方法：** 先约分或先算 8 ÷ 4",
+		"**易错点：**", "把分母也乘 8", "**家长怎么讲：**", "先让孩子说出四分之三的含义",
+		"**可以追问：**", "怎样验算结果？", "**怎么检查：** 用 6 ÷ 8 = 3/4 反向检查",
+	} {
+		if !strings.Contains(payload.Text, want) {
+			t.Fatalf("钉钉 Markdown 投影缺少用户可见内容 %q:\n%s", want, payload.Text)
+		}
+	}
+	for _, internal := range []string{"\"Recognized\"", "\"ParentGuide\"", "\"ResultKind\""} {
+		if strings.Contains(payload.Text, internal) {
+			t.Fatalf("内部评估字段不得进入钉钉消息 %q:\n%s", internal, payload.Text)
+		}
+	}
+	if payload.RenderManifest == nil || payload.RenderManifest.FallbackReason != "" {
+		t.Fatalf("无 LaTeX 的可见投影不得虚标数学降级: %#v", payload.RenderManifest)
 	}
 }
 

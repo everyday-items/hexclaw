@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/hexagon-codes/hexclaw/internal/mathtext"
 )
 
 const CurrentContentVersion = "1.0"
@@ -321,11 +323,13 @@ func (m RenderManifest) validateProjection(content MessageContent) error {
 			return fmt.Errorf("messagecontent: invalid render part kind %q", part.Kind)
 		}
 	}
-	if rawTeXPattern.MatchString(content.Markdown) && !m.CapabilitySnapshot.TeXMath {
+	canonicalVisible := mathtext.WithoutProtectedMarkdown(content.Markdown)
+	projectedVisible := mathtext.WithoutProtectedMarkdown(visible.String())
+	if rawTeXPattern.MatchString(canonicalVisible) && !m.CapabilitySnapshot.TeXMath {
 		if strings.TrimSpace(m.FallbackReason) == "" {
 			return errors.New("messagecontent: math fallback reason is required")
 		}
-		if rawTeXPattern.MatchString(visible.String()) {
+		if rawTeXPattern.MatchString(projectedVisible) {
 			return errors.New("messagecontent: raw LaTeX cannot be reported as a successful fallback")
 		}
 	}

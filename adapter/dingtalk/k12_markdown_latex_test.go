@@ -1,6 +1,7 @@
 package dingtalk
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -59,6 +60,28 @@ func TestK12DingTalkMarkdownLaTeXProjectionMatrix(t *testing.T) {
 				t.Fatalf("ValidateFor: %v", err)
 			}
 		})
+	}
+}
+
+func TestK12DingTalkDoubleEscapedSolutionUsesSampleMarkdown(t *testing.T) {
+	content := "## 解题步骤\n\n1. **列式**：$\\\\frac{3}{4} \\\\times 8 = 6$\n2. **验算**：$6 \\\\div 8 = \\\\frac{3}{4}$"
+	message := dingtalkMarkdownMessage(content)
+	if message.MsgKey != "sampleMarkdown" {
+		t.Fatalf("钉钉解题消息类型 = %q, want sampleMarkdown", message.MsgKey)
+	}
+	var payload struct {
+		Title string `json:"title"`
+		Text  string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(message.MsgParam), &payload); err != nil {
+		t.Fatalf("decode sampleMarkdown payload: %v", err)
+	}
+	want := "## 解题步骤\n\n1. **列式**：3/4 × 8 = 6\n2. **验算**：6 ÷ 8 = 3/4"
+	if payload.Text != want {
+		t.Fatalf("sampleMarkdown 正文投影错误:\n got  %q\n want %q", payload.Text, want)
+	}
+	if payload.Title != "解题步骤" {
+		t.Fatalf("sampleMarkdown 标题 = %q, want 解题步骤", payload.Title)
 	}
 }
 

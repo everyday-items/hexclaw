@@ -49,3 +49,28 @@ func TestDingTalkRejectsTamperedRenderEvidenceBeforeSend(t *testing.T) {
 		t.Fatal("invalid content must not reach the platform sender")
 	}
 }
+
+func TestNewCanonicalMarkdownMessageAcceptsReadableDoubleEscapedMathProjection(t *testing.T) {
+	canonical := "## 解题步骤\n\n- **列式**：$\\\\frac{3}{4} \\\\times 8 = 6$"
+	projected, changed := LaTeXToUnicode(canonical)
+	if !changed {
+		t.Fatal("双重转义数学必须触发可读投影")
+	}
+	msg, err := NewCanonicalMarkdownMessageWithAttachments(
+		messagecontent.ProducerK12,
+		"zh-CN",
+		canonical,
+		projected,
+		messagecontent.FallbackMathToReadableText,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewCanonicalMarkdownMessageWithAttachments: %v", err)
+	}
+	if len(msg.RenderManifest.Parts) != 1 || msg.RenderManifest.Parts[0].Kind != messagecontent.PartMarkdown {
+		t.Fatalf("钉钉解题消息必须保留 Markdown part: %#v", msg.RenderManifest.Parts)
+	}
+	if msg.Text != "## 解题步骤\n\n- **列式**：3/4 × 8 = 6" {
+		t.Fatalf("Markdown 数学投影不符合预期: %q", msg.Text)
+	}
+}

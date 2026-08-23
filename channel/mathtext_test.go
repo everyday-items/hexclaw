@@ -132,3 +132,27 @@ func TestLaTeXToUnicode_CodeAndURLUntouched(t *testing.T) {
 		}
 	}
 }
+
+func TestLaTeXToUnicode_DoubleEscapedMathKeepsMarkdownStructure(t *testing.T) {
+	in := "## 解题步骤\n\n1. **列式**：$\\\\frac{3}{4} \\\\times 8 = 6$\n2. **验算**：$6 \\\\div 8 = \\\\frac{3}{4}$"
+	want := "## 解题步骤\n\n1. **列式**：3/4 × 8 = 6\n2. **验算**：6 ÷ 8 = 3/4"
+	got, changed := LaTeXToUnicode(in)
+	if got != want {
+		t.Fatalf("双重转义数学只应降级公式并保留 Markdown:\n got  %q\n want %q", got, want)
+	}
+	if !changed {
+		t.Fatal("双重转义数学应报告 changed=true")
+	}
+}
+
+func TestLaTeXToUnicode_DoubleBackslashBeforeUnknownWordRemainsRowBreak(t *testing.T) {
+	in := "$a \\\\x + b = c$"
+	want := "a\nx + b = c"
+	got, changed := LaTeXToUnicode(in)
+	if got != want {
+		t.Fatalf("未知字母前的双反斜杠必须保持 TeX 换行语义:\n got  %q\n want %q", got, want)
+	}
+	if !changed {
+		t.Fatal("数学换行归一化应报告 changed=true")
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/records"
@@ -647,6 +648,86 @@ func writeCanonicalProcessIssueDetails(out *strings.Builder, resultJSON string) 
 		writeParentTeachingGuideMarkdown(out, *item.ParentGuide)
 		out.WriteString("\n\n")
 	}
+}
+
+// RenderCanonicalGradingAssessmentDetails 将最终产物中的受控评估对象投影为家长可读
+// Markdown。返回 ok=false 时调用方必须把原文视为普通用户内容，不得按内部证据删除。
+func RenderCanonicalGradingAssessmentDetails(resultJSON string) (string, PhotoItemStatus, bool) {
+	expectedKeys := map[string]struct{}{
+		"Grade": {}, "ParentGuide": {}, "Recognized": {}, "ResultKind": {},
+		"Solve": {}, "Status": {}, "Warning": {},
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal([]byte(resultJSON), &object) != nil || len(object) != len(expectedKeys) {
+		return "", "", false
+	}
+	for key := range object {
+		if _, ok := expectedKeys[key]; !ok {
+			return "", "", false
+		}
+	}
+
+	var item PhotoGradeItem
+	decoder := json.NewDecoder(strings.NewReader(resultJSON))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&item) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return "", "", false
+	}
+	if item.ResultKind != "" || item.Grade.RecordID != "" || item.Grade.RecordCreated ||
+		strings.TrimSpace(item.Recognized.ProblemID) == "" ||
+		strings.TrimSpace(item.Recognized.AttemptID) == "" ||
+		strings.TrimSpace(item.Recognized.InputDigest) == "" ||
+		item.Recognized.ConfirmedVersion < 1 {
+		return "", "", false
+	}
+
+	requiresGuide := false
+	switch item.Status {
+	case PhotoCorrect, PhotoUnanswered, PhotoAnswerUnclear, PhotoOutOfScope, PhotoUntrusted:
+	case PhotoCorrectWithProcessIssue:
+		requiresGuide = true
+		if strings.TrimSpace(item.Grade.Outcome.WrongStep) == "" ||
+			strings.TrimSpace(item.Grade.Outcome.ErrorCause) == "" {
+			return "", "", false
+		}
+	case PhotoWrong:
+		requiresGuide = true
+		if strings.TrimSpace(item.Grade.Solution) == "" {
+			return "", "", false
+		}
+	case PhotoBlankSolved:
+		requiresGuide = true
+	default:
+		return "", "", false
+	}
+	if requiresGuide {
+		if item.ParentGuide == nil || validateParentTeachingGuide(*item.ParentGuide) != nil {
+			return "", "", false
+		}
+	} else if item.ParentGuide != nil {
+		return "", "", false
+	}
+
+	var out strings.Builder
+	switch item.Status {
+	case PhotoWrong:
+		out.WriteString("### 订正参考\n\n")
+		out.WriteString(photoMarkdownQuote(item.Grade.Solution, 1000))
+		if wrongStep := strings.TrimSpace(item.Grade.Outcome.WrongStep); wrongStep != "" {
+			out.WriteString("\n\n**第一个错步：** ")
+			out.WriteString(photoInline(wrongStep, 300))
+		}
+		if cause := strings.TrimSpace(item.Grade.Outcome.ErrorCause); cause != "" {
+			out.WriteString("\n\n**错因：** ")
+			out.WriteString(photoInline(cause, 300))
+		}
+		out.WriteString("\n\n### 家长怎么讲\n\n")
+		writeParentTeachingGuideMarkdown(&out, *item.ParentGuide)
+	case PhotoBlankSolved:
+		out.WriteString("### 家长辅导指南\n\n")
+		writeParentTeachingGuideMarkdown(&out, *item.ParentGuide)
+	}
+	return strings.TrimSpace(out.String()), item.Status, true
 }
 
 func gradingFinalArtifactDigest(artifact k12.GradingFinalArtifact) string {

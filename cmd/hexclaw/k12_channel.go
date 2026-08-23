@@ -196,9 +196,12 @@ func (d *k12IMDeliverer) PrepareTextForTargets(
 		return nil, k12usecase.ErrNoActiveDirectBindings
 	}
 	canonical := content
-	projected := imLaTeXFallback(canonical, "k12_send_to_phone")
+	// 批改最终产物的 canonical Markdown 保留逐题内部评估 JSON 以供审计；家长侧
+	// 钉钉消息只投影可读的题目、状态与辅导正文，避免把内部 JSON 送入平台载荷。
+	visible := k12FinalArtifactIMMarkdown(canonical)
+	projected := imLaTeXFallback(visible, "k12_send_to_phone")
 	fallbackReason := ""
-	if projected != canonical {
+	if projected != visible {
 		fallbackReason = messagecontent.FallbackMathToReadableText
 	}
 	message, err := channel.NewCanonicalMarkdownMessageWithAttachments(
@@ -493,6 +496,81 @@ func imLaTeXFallback(text, outlet string) string {
 			"outlet", outlet)
 	}
 	return out
+}
+
+func k12FinalArtifactIMMarkdown(markdown string) string {
+	if !strings.HasPrefix(strings.TrimSpace(markdown), "# 作业批改结果") ||
+		!strings.Contains(markdown, "```json") {
+		return markdown
+	}
+	lines := strings.Split(markdown, "\n")
+	visible := make([]string, 0, len(lines))
+	assessmentStatus := k12usecase.PhotoItemStatus("")
+	replaced := false
+	for index := 0; index < len(lines); index++ {
+		line := lines[index]
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "# ") || strings.HasPrefix(trimmed, "## ") {
+			assessmentStatus = ""
+		}
+		if status, ok := k12FinalArtifactAssessmentStatus(trimmed); ok {
+			assessmentStatus = status
+			visible = append(visible, line)
+			continue
+		}
+		if assessmentStatus != "" && trimmed == "```json" {
+			closing := index + 1
+			for closing < len(lines) && strings.TrimSpace(lines[closing]) != "```" {
+				closing++
+			}
+			if closing == len(lines) {
+				return markdown
+			}
+			resultJSON := strings.Join(lines[index+1:closing], "\n")
+			details, status, ok := k12usecase.RenderCanonicalGradingAssessmentDetails(resultJSON)
+			if ok && status == assessmentStatus {
+				if details != "" {
+					visible = append(visible, "", details, "")
+				}
+				index = closing
+				replaced = true
+				continue
+			}
+		}
+		visible = append(visible, line)
+	}
+	if !replaced {
+		return markdown
+	}
+	return strings.TrimSpace(strings.Join(visible, "\n"))
+}
+
+func k12FinalArtifactAssessmentStatus(line string) (k12usecase.PhotoItemStatus, bool) {
+	if !strings.HasPrefix(line, "**Grading status:**") {
+		return "", false
+	}
+	start := strings.IndexByte(line, '`')
+	if start < 0 {
+		return "", false
+	}
+	end := strings.IndexByte(line[start+1:], '`')
+	if end < 0 {
+		return "", false
+	}
+	status := k12usecase.PhotoItemStatus(line[start+1 : start+1+end])
+	switch status {
+	case k12usecase.PhotoCorrect,
+		k12usecase.PhotoCorrectWithProcessIssue,
+		k12usecase.PhotoWrong,
+		k12usecase.PhotoUnanswered,
+		k12usecase.PhotoAnswerUnclear,
+		k12usecase.PhotoBlankSolved,
+		k12usecase.PhotoOutOfScope,
+		k12usecase.PhotoUntrusted:
+		return status, true
+	default:
+		return "", false
+	}
 }
 
 // adapterReplyFromChannelMessage 把 ChannelNeutralMessage（§6.10）投影为平台 adapter.Reply
