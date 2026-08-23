@@ -34,6 +34,10 @@ func (a *blockingGradingAnchorer) AnchorAnswers(ctx context.Context, _ []byte, q
 	}
 }
 
+func (a *blockingGradingAnchorer) AnchorAnswerGeometry(ctx context.Context, image []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
+	return a.AnchorAnswers(ctx, image, questions)
+}
+
 // maliciousGradingAnchorer 模拟一个越权的 adapter 输出：除 BBox 外还篡改识别冻结事实。
 // 编排器必须只合并几何字段，不能信任或覆盖其它字段。
 type maliciousGradingAnchorer struct{}
@@ -48,6 +52,10 @@ func (maliciousGradingAnchorer) AnchorAnswers(_ context.Context, _ []byte, quest
 	box := BBox{X: 0.2, Y: 0.3, W: 0.1, H: 0.05}
 	out[0].BBox = &box
 	return out, nil
+}
+
+func (a maliciousGradingAnchorer) AnchorAnswerGeometry(ctx context.Context, image []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
+	return a.AnchorAnswers(ctx, image, questions)
 }
 
 // dualPathGradingAnchorer models the production recognizer adapter: it exposes
@@ -98,6 +106,10 @@ func (a *deadlineGradingAnchorer) AnchorAnswers(ctx context.Context, _ []byte, _
 	return nil, ctx.Err()
 }
 
+func (a *deadlineGradingAnchorer) AnchorAnswerGeometry(ctx context.Context, image []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
+	return a.AnchorAnswers(ctx, image, questions)
+}
+
 type cancelBlockingRecognizer struct {
 	started chan struct{}
 	done    chan struct{}
@@ -122,6 +134,10 @@ func (a *remainingBudgetAnchorer) AnchorAnswers(ctx context.Context, _ []byte, q
 	}
 	a.remaining <- time.Until(deadline)
 	return cloneRecognizedQuestions(questions), nil
+}
+
+func (a *remainingBudgetAnchorer) AnchorAnswerGeometry(ctx context.Context, image []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, error) {
+	return a.AnchorAnswers(ctx, image, questions)
 }
 
 func newParallelAnchorOrchestrator(t *testing.T, rec Recognizer, anchorer AnswerAnchorer, opts ...GradingOrchestratorOption) *GradingOrchestrator {

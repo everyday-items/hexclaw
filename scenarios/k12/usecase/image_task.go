@@ -575,7 +575,7 @@ func sameImageTaskRouteRequest(
 }
 
 func gradingSnapshotFromImageRoute(route k12.ImageTaskRouteSnapshot) k12.GradingModelSnapshot {
-	return k12.NormalizeGradingModelSnapshot(k12.GradingModelSnapshot{
+	snapshot := k12.GradingModelSnapshot{
 		Provider:                route.Provider,
 		Model:                   route.Model,
 		Route:                   route.Route,
@@ -586,7 +586,11 @@ func gradingSnapshotFromImageRoute(route k12.ImageTaskRouteSnapshot) k12.Grading
 		Capability:              route.Capability,
 		TimeoutMS:               route.TimeoutMS,
 		Fallback:                route.FallbackPolicy,
-	})
+	}
+	if snapshot.Model == k12.RecognizingPolicyModel {
+		snapshot.RecognizingRequestPolicy = k12.ApprovedRecognizingRequestPolicy()
+	}
+	return k12.NormalizeGradingModelSnapshot(snapshot)
 }
 
 func imageTaskProviderContext(

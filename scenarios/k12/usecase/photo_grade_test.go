@@ -44,6 +44,14 @@ func (f *photoAnchorerFake) AnchorAnswers(
 	return out, nil
 }
 
+func (f *photoAnchorerFake) AnchorAnswerGeometry(
+	ctx context.Context,
+	image []byte,
+	questions []RecognizedQuestion,
+) ([]RecognizedQuestion, error) {
+	return f.AnchorAnswers(ctx, image, questions)
+}
+
 type photoAnnotatorFake struct {
 	mu    sync.Mutex
 	calls int

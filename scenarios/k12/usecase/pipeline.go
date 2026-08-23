@@ -152,10 +152,9 @@ func (d Deps) AnchorHomeworkAnswers(ctx context.Context, image []byte, questions
 	return normalizeAnswerAnchorOutput(anchored, normalized)
 }
 
-// gradingGeometryAnchorer is an internal capability, not a public two-stage
-// API. Production RecognizerAdapter implements it with one page-batch locator
-// request. Keeping it structural lets older/test anchorers fall back to the
-// full AnswerAnchorer contract without adding another assembly dependency.
+// gradingGeometryAnchorer 是内部能力，不属于公开的两阶段 API。
+// 生产 RecognizerAdapter 用一次整页定位请求实现；缺少该能力时必须显式降级，
+// 识题事实冻结后不得重新进入完整誊录路径。
 type gradingGeometryAnchorer interface {
 	AnchorAnswerGeometry(ctx context.Context, image []byte, questions []RecognizedQuestion) ([]RecognizedQuestion, error)
 }
@@ -174,7 +173,7 @@ func (d Deps) anchorHomeworkGeometry(ctx context.Context, image []byte, question
 	}
 	geometry, ok := d.AnswerAnchorer.(gradingGeometryAnchorer)
 	if !ok {
-		return d.AnchorHomeworkAnswers(ctx, image, normalized)
+		return nil, fmt.Errorf("usecase: answer anchorer does not support geometry-only anchoring")
 	}
 	anchored, err := geometry.AnchorAnswerGeometry(ctx, image, normalized)
 	if err != nil {
@@ -548,10 +547,18 @@ func sanitizeErrorCause(s string) string {
 
 // isSelfCheckLine 判断某行是否 verifier 的自查核对行（勾叉核对符，或以项目符号起头的「是否」自查问句）。
 func isSelfCheckLine(t string) bool {
-	for _, mark := range []string{"√", "✓", "✔", "✗", "×", "❌", "✅"} {
+	for _, mark := range []string{"√", "✓", "✔", "✗", "❌", "✅"} {
 		if strings.Contains(t, mark) {
 			return true
 		}
+	}
+	// 乘号也可以用作核对叉号，但只有独立成词时才是标记；
+	// 算式正文中的 18×2 必须保留。
+	fields := strings.Fields(t)
+	if strings.TrimSpace(t) == "×" ||
+		(len(fields) > 0 && fields[len(fields)-1] == "×" &&
+			(strings.HasPrefix(t, "-") || strings.HasPrefix(t, "•") || strings.HasPrefix(t, "*"))) {
+		return true
 	}
 	bullet := strings.HasPrefix(t, "-") || strings.HasPrefix(t, "•") || strings.HasPrefix(t, "*")
 	return bullet && strings.Contains(t, "是否")

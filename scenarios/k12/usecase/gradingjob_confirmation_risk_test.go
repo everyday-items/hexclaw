@@ -200,7 +200,9 @@ func TestConfirmPhotoGradingJob_ConflictingOCRRequiresExplicitItemConfirmationAn
 			`3/5+7/5=`,
 		},
 	}}}
-	d := recoveryDeps(t, rec, &photoAnchorerFake{boxes: map[int]BBox{0: {X: .2, Y: .3, W: .1, H: .05}}}, &photoAnnotatorFake{})
+	// 该用例验证风险确认，定位夹具必须使用与生产一致的纯几何能力，
+	// 不能依赖冻结识题后已禁止的完整誊录回退。
+	d := recoveryDeps(t, rec, &dualPathGradingAnchorer{}, &photoAnnotatorFake{})
 	o := newRecoverableOrchestrator(t, d, dir)
 	v, _, err := o.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "desktop", SourceKey: "risk-confirm",

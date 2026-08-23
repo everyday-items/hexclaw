@@ -177,9 +177,10 @@ func (d Deps) gradeHomeworkPhotoWithAssessorInput(
 	hasPresent, hasUnclear := photoAnswerCandidates(questions)
 	anchorVerified := false
 	if (hasPresent || hasUnclear) && d.AnswerAnchorer != nil {
-		anchored, anchorErr := d.AnchorHomeworkAnswers(ctx, req.Image, questions)
+		anchored, anchorErr := d.anchorHomeworkGeometry(ctx, req.Image, questions)
 		if anchorErr == nil {
-			questions = anchored
+			// 识题完成后题干和作答已冻结；锚点结果只能通过共享边界补充 BBox。
+			questions = mergeAnchorGeometry(questions, anchored)
 			anchorVerified = true
 		} else {
 			if hasPresent {
