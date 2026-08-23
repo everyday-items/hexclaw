@@ -322,6 +322,7 @@ func TestImageTaskPublicSurfaceExactSetAndNoInternalLeak(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("create image task: %d %#v", rec.Code, out)
 	}
+	writeK12ImageTaskWireFixture(t, "create.json", rec.Body.Bytes())
 	dispatch := out["dispatch"].(map[string]any)
 	dispatchID, _ := dispatch["dispatch_id"].(string)
 	if dispatchID == "" ||
@@ -344,6 +345,7 @@ func TestImageTaskPublicSurfaceExactSetAndNoInternalLeak(t *testing.T) {
 		progress, _ := dispatch["progress"].(map[string]any)
 		return progress["state"] == "feedback_ready"
 	})
+	writeK12ImageTaskWireFixture(t, "dispatch.json", rec.Body.Bytes())
 	var projected struct {
 		Dispatch imageTaskDispatchContract `json:"dispatch"`
 	}
@@ -391,6 +393,7 @@ func TestImageTaskPublicSurfaceExactSetAndNoInternalLeak(t *testing.T) {
 
 	rec, _ = do(t, fixture.handler, http.MethodGet,
 		"/image-tasks/"+dispatchID+"/result?agent=mingming", "")
+	writeK12ImageTaskWireFixture(t, "result.json", rec.Body.Bytes())
 	var result imageTaskResultContract
 	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
 		t.Fatalf("decode result contract: %v", err)
@@ -606,32 +609,80 @@ func TestImageTaskHTTPManualCreativeEntryAndCommitExactContract(t *testing.T) {
 		t.Fatalf("manual commit: %d %#v", rec.Code, out)
 	}
 	target = out["dispatch"].(map[string]any)["target_projection"].(map[string]any)
+	assertJSONExactKeys(t, target,
+		"commit_required", "commit_state", "entry_kind", "intake_id", "kind",
+		"promoted_generation_id", "promoted_work_id", "promotion_policy",
+		"routing_provenance", "status", "work", "work_type")
 	if target["status"] != "promoted" ||
 		target["commit_required"] != false ||
 		target["commit_state"] != "committed" ||
 		target["promoted_work_id"] == "" ||
-		target["promoted_version_id"] != "v1" {
+		target["promoted_generation_id"] == "" {
 		t.Fatalf("manual commit projection drift: %#v", target)
+	}
+	var versionCount int
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM k12_creative_work_versions
+		WHERE work_record_id=?`, target["promoted_work_id"]).Scan(&versionCount); err != nil {
+		t.Fatal(err)
+	}
+	if versionCount != 0 {
+		t.Fatalf("manual commit created %d legacy versions, want 0", versionCount)
 	}
 }
 
 func TestImageTaskHTTPRejectsMalformedCreativeUnionsBeforeSideEffects(t *testing.T) {
-	fixture := newImageTaskHTTPFixture(t)
-	malformedCreate := fmt.Sprintf(`{
-		"agent":"mingming","source_session":"session-1","source_kind":"desktop",
-		"source_ref":"manual-bad-revision","source_asset_refs":[%q],
-		"attempt_generation":1,
-		"route_request":{"provider":"hexclaw-gpt","model":"gpt-5.6-sol","selection_source":"explicit"},
-		"creative_entry":{"kind":"revision","task_intent":"artwork","work_id":"work-1"}
-	}`, fixture.assetID)
-	rec, _ := do(t, fixture.handler, http.MethodPost, "/image-tasks", malformedCreate)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("revision without base_version_id got %d, want 400", rec.Code)
-	}
-	if fixture.classifier.calls != 0 {
-		t.Fatalf("malformed manual union called classifier %d times", fixture.classifier.calls)
+	for _, test := range []struct {
+		name          string
+		creativeEntry string
+	}{
+		{name: "revision", creativeEntry: `{"kind":"revision","task_intent":"artwork","work_id":"work-1","base_version_id":"v1"}`},
+		{name: "new_work_with_work_id", creativeEntry: `{"kind":"new_work","task_intent":"artwork","work_id":"work-1"}`},
+		{name: "new_work_with_base_version_id", creativeEntry: `{"kind":"new_work","task_intent":"artwork","base_version_id":"v1"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newImageTaskHTTPFixture(t)
+			tables := []string{
+				"k12_image_task_dispatches", "k12_creative_work_intakes",
+				"k12_creative_works", "k12_creative_work_versions",
+				"k12_work_feedback_generations", "k12_image_task_invocations",
+				"outbox_events",
+			}
+			before := make(map[string]int, len(tables))
+			for _, table := range tables {
+				var count int
+				if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&count); err != nil {
+					t.Fatalf("count %s before malformed create: %v", table, err)
+				}
+				before[table] = count
+			}
+			malformedCreate := fmt.Sprintf(`{
+				"agent":"mingming","source_session":"session-1","source_kind":"desktop",
+				"source_ref":"manual-bad-%s","source_asset_refs":[%q],
+				"attempt_generation":1,
+				"route_request":{"provider":"hexclaw-gpt","model":"gpt-5.6-sol","selection_source":"explicit"},
+				"creative_entry":%s
+			}`, test.name, fixture.assetID, test.creativeEntry)
+			rec, _ := do(t, fixture.handler, http.MethodPost, "/image-tasks", malformedCreate)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("malformed creative_entry got %d, want 400", rec.Code)
+			}
+			if fixture.classifier.calls != 0 {
+				t.Fatalf("malformed manual union called classifier %d times", fixture.classifier.calls)
+			}
+			for _, table := range tables {
+				var after int
+				if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&after); err != nil {
+					t.Fatalf("count %s after malformed create: %v", table, err)
+				}
+				if after != before[table] {
+					t.Fatalf("malformed creative_entry changed %s rows: before=%d after=%d",
+						table, before[table], after)
+				}
+			}
+		})
 	}
 
+	fixture := newImageTaskHTTPFixture(t)
 	body := fmt.Sprintf(`{
 		"agent":"mingming","source_session":"session-1","source_kind":"desktop",
 		"source_ref":"manual-art-mixed","source_asset_refs":[%q],
@@ -645,7 +696,7 @@ func TestImageTaskHTTPRejectsMalformedCreativeUnionsBeforeSideEffects(t *testing
 		"agent":"mingming","version":%v,
 		"creative":{"action":"commit","canonical_version":1,"canonical_content":"mixed"}
 	}`, dispatch["version"])
-	rec, _ = do(t, fixture.handler, http.MethodPost,
+	rec, _ := do(t, fixture.handler, http.MethodPost,
 		"/image-tasks/"+dispatch["dispatch_id"].(string)+"/confirm", mixedConfirm)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("mixed commit/freeze_ocr got %d, want 400", rec.Code)

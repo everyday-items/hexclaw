@@ -306,3 +306,68 @@ func TestHandleUpdateLLMConfig_RejectsEmbeddingOnlySelectedModel(t *testing.T) {
 		t.Fatalf("invalid request mutated config model=%q", got)
 	}
 }
+
+func TestBUG20260723_023_CustomModelProvenanceSurvivesConfigRoundTrip(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	const providerID = "pvd_v1_00112233445566778899aabbccddeeff"
+	const modelID = "team-custom-chat"
+	cfg := config.DefaultConfig()
+	cfg.LLM.Default = "custom"
+	cfg.LLM.Providers = map[string]config.LLMProviderConfig{
+		"custom": {
+			ProviderInstanceID: providerID,
+			APIKey:             "sk-round-trip-secret",
+			BaseURL:            "https://models.example.test/v1",
+			Model:              modelID,
+			Models:             []string{modelID},
+			ModelSpecsMode:     config.LLMModelSpecsModeExplicit,
+			ModelSpecs: []config.LLMProviderModelSpec{{
+				ID:           modelID,
+				DisplayName:  "Team custom chat",
+				IsCustom:     true,
+				Capabilities: []string{config.LLMModelCapabilityText},
+			}},
+		},
+	}
+	srv := NewServer(cfg, &mockEngine{activeLLM: cfg.LLM}, nil, nil)
+
+	getBefore := httptest.NewRecorder()
+	srv.handleGetLLMConfig(getBefore, httptest.NewRequest(http.MethodGet, "/api/v1/config/llm", nil))
+	if getBefore.Code != http.StatusOK {
+		t.Fatalf("initial GET status=%d body=%s", getBefore.Code, getBefore.Body.String())
+	}
+	var before LLMConfigResponse
+	if err := json.Unmarshal(getBefore.Body.Bytes(), &before); err != nil {
+		t.Fatalf("decode initial GET: %v", err)
+	}
+	if len(before.Providers["custom"].ModelSpecs) != 1 || !before.Providers["custom"].ModelSpecs[0].IsCustom {
+		t.Fatalf("initial custom provenance=%+v", before.Providers["custom"].ModelSpecs)
+	}
+	if strings.Contains(getBefore.Body.String(), "sk-round-trip-secret") {
+		t.Fatalf("GET leaked API key: %s", getBefore.Body.String())
+	}
+
+	body, err := json.Marshal(before)
+	if err != nil {
+		t.Fatalf("encode GET response for round trip: %v", err)
+	}
+	put := httptest.NewRecorder()
+	srv.handleUpdateLLMConfig(put, httptest.NewRequest(http.MethodPut, "/api/v1/config/llm", strings.NewReader(string(body))))
+	if put.Code != http.StatusOK {
+		t.Fatalf("round-trip PUT status=%d body=%s", put.Code, put.Body.String())
+	}
+
+	getAfter := httptest.NewRecorder()
+	srv.handleGetLLMConfig(getAfter, httptest.NewRequest(http.MethodGet, "/api/v1/config/llm", nil))
+	if getAfter.Code != http.StatusOK {
+		t.Fatalf("round-trip GET status=%d body=%s", getAfter.Code, getAfter.Body.String())
+	}
+	var after LLMConfigResponse
+	if err := json.Unmarshal(getAfter.Body.Bytes(), &after); err != nil {
+		t.Fatalf("decode round-trip GET: %v", err)
+	}
+	modelSpecs := after.Providers["custom"].ModelSpecs
+	if len(modelSpecs) != 1 || modelSpecs[0].ID != modelID || !modelSpecs[0].IsCustom {
+		t.Fatalf("custom provenance lost after round trip: %+v", modelSpecs)
+	}
+}

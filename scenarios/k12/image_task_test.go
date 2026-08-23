@@ -179,16 +179,11 @@ func TestCreativeEntryStrictUnion(t *testing.T) {
 	if err := badNew.Validate(); err == nil {
 		t.Fatal("new_work carrying revision target accepted")
 	}
-	validRevision := ImageTaskCreativeEntry{
+	revision := ImageTaskCreativeEntry{
 		Kind: CreativeWorkEntryRevision, TaskIntent: ImageTaskIntentArtwork,
 		WorkID: "work-1", BaseVersionID: "v2",
 	}
-	if err := validRevision.Validate(); err != nil {
-		t.Fatalf("valid revision rejected: %v", err)
-	}
-	badRevision := validRevision
-	badRevision.BaseVersionID = ""
-	if err := badRevision.Validate(); err == nil {
-		t.Fatal("revision without base_version_id accepted")
+	if err := revision.Validate(); err == nil {
+		t.Fatal("current creative revision accepted")
 	}
 }

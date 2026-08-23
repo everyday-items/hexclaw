@@ -2,12 +2,14 @@ package usecase_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
-// TestCreativeWorkWritingLifecycle 语文写作：draft→feedback_ready→revised→再点评。
+// TestCreativeWorkWritingLifecycle 语文写作：draft→feedback_ready，修改稿拒绝后独立新建并再点评。
 func TestCreativeWorkWritingLifecycle(t *testing.T) {
 	d := newDataDeps(t)
 	ctx := context.Background()
@@ -40,24 +42,97 @@ func TestCreativeWorkWritingLifecycle(t *testing.T) {
 		t.Fatal("点评应写入最新版本")
 	}
 
-	rev, err := d.SubmitRevision(ctx, "xiaoming", id, "柳枝像绿色的丝带，风一吹就沙沙响。", "")
-	if err != nil {
-		t.Fatalf("提交修改稿: %v", err)
+	var rootsBefore, versionRowsBefore int
+	if err := d.Records.DB().QueryRow(`SELECT count(*) FROM k12_creative_works
+		WHERE agent_name='xiaoming'`).Scan(&rootsBefore); err != nil {
+		t.Fatal(err)
 	}
-	if rev.Record.Status != k12.WorkStatusRevised {
-		t.Fatalf("修改后应为 revised，got %s", rev.Record.Status)
+	if err := d.Records.DB().QueryRow(`SELECT count(*) FROM k12_creative_work_versions
+		WHERE work_record_id=?`, id).Scan(&versionRowsBefore); err != nil {
+		t.Fatal(err)
 	}
-	if len(rev.Fields.Versions) != 2 || rev.Fields.Versions[1].VersionID != "v2" {
-		t.Fatalf("应形成 v2，got %d 版", len(rev.Fields.Versions))
+	if rootsBefore != 1 || versionRowsBefore != 1 {
+		t.Fatalf("历史基线漂移: roots=%d version_rows=%d", rootsBefore, versionRowsBefore)
 	}
 
-	// revised 可再点评回 feedback_ready。
-	fb2 := generateCreativeWorkFeedbackForTest(t, &d, id, "加了听觉细节，更生动了；建议保留这个细节。")
-	if fb2.Record.Status != k12.WorkStatusFeedbackReady {
-		t.Fatalf("二次点评后应为 feedback_ready")
+	if _, err := d.SubmitRevision(
+		ctx, "xiaoming", id, "柳枝像绿色的丝带，风一吹就沙沙响。", "",
+	); !errors.Is(err, usecase.ErrInvalidInput) {
+		t.Fatalf("修改稿应在写入前拒绝: %v", err)
 	}
-	if fb2.Fields.Versions[1].Feedback == "" {
-		t.Fatal("二次点评应落在 v2")
+	unchanged, err := d.GetCreativeWork(ctx, "xiaoming", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Record.RecordID != fb.Record.RecordID ||
+		unchanged.Record.Status != fb.Record.Status ||
+		unchanged.Record.Version != fb.Record.Version ||
+		len(unchanged.Fields.Versions) != 1 ||
+		unchanged.Fields.Versions[0].VersionID != "v1" ||
+		unchanged.Fields.Versions[0].Feedback != fb.Fields.Versions[0].Feedback {
+		t.Fatalf("修改稿拒绝后改写了根作品或历史版本: before=%+v after=%+v", fb, unchanged)
+	}
+	var rootsAfterReject, versionRowsAfterReject int
+	if err := d.Records.DB().QueryRow(`SELECT count(*) FROM k12_creative_works
+		WHERE agent_name='xiaoming'`).Scan(&rootsAfterReject); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Records.DB().QueryRow(`SELECT count(*) FROM k12_creative_work_versions
+		WHERE work_record_id=?`, id).Scan(&versionRowsAfterReject); err != nil {
+		t.Fatal(err)
+	}
+	if rootsAfterReject != rootsBefore || versionRowsAfterReject != versionRowsBefore {
+		t.Fatalf("修改稿拒绝泄漏了写入: roots=%d/%d version_rows=%d/%d",
+			rootsAfterReject, rootsBefore, versionRowsAfterReject, versionRowsBefore)
+	}
+
+	newContent := "柳枝像绿色的丝带，风一吹就沙沙响。"
+	newID, generationID, created, err := d.CreateCurrentTextWork(
+		ctx, "xiaoming", newContent, "creative-lifecycle-independent-work",
+	)
+	if err != nil || !created || newID == "" || generationID == "" || newID == id {
+		t.Fatalf("独立新作品创建: id=%q old=%q generation=%q created=%v err=%v",
+			newID, id, generationID, created, err)
+	}
+	independent, err := d.GetCreativeWork(ctx, "xiaoming", newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(independent.Fields.Versions) != 0 ||
+		independent.GenerationState.Initial == nil ||
+		independent.GenerationState.Initial.GenerationID != generationID ||
+		independent.GenerationState.Initial.WorkID != newID ||
+		independent.GenerationState.Initial.Source.ContentMarkdown != newContent {
+		t.Fatalf("独立作品身份/冻结证据不一致: %+v", independent)
+	}
+	var rootsAfterCreate, oldVersionRows, newVersionRows int
+	if err := d.Records.DB().QueryRow(`SELECT count(*) FROM k12_creative_works
+		WHERE agent_name='xiaoming'`).Scan(&rootsAfterCreate); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Records.DB().QueryRow(`SELECT count(*) FROM k12_creative_work_versions
+		WHERE work_record_id=?`, id).Scan(&oldVersionRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Records.DB().QueryRow(`SELECT count(*) FROM k12_creative_work_versions
+		WHERE work_record_id=?`, newID).Scan(&newVersionRows); err != nil {
+		t.Fatal(err)
+	}
+	if rootsAfterCreate != rootsBefore+1 || oldVersionRows != versionRowsBefore || newVersionRows != 0 {
+		t.Fatalf("独立新建数量不变量失效: roots=%d old_versions=%d new_versions=%d",
+			rootsAfterCreate, oldVersionRows, newVersionRows)
+	}
+
+	// 独立新作品可从同一首轮 generation 完成点评。
+	fb2 := generateCreativeWorkFeedbackForTest(t, &d, newID, "加了听觉细节，更生动了；建议保留这个细节。")
+	if fb2.Record.Status != k12.WorkStatusFeedbackReady {
+		t.Fatalf("独立新作品点评后应为 feedback_ready")
+	}
+	if fb2.GenerationState.Initial == nil || fb2.GenerationState.Latest == nil ||
+		fb2.GenerationState.Initial.GenerationID != generationID ||
+		fb2.GenerationState.Latest.GenerationID != generationID ||
+		fb2.GenerationState.Latest.Feedback == nil {
+		t.Fatal("独立新作品点评应收敛在同一首轮 generation")
 	}
 }
 

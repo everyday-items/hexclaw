@@ -282,6 +282,43 @@ func TestToolApprovalV70LegacyRememberGrantCannotMintActiveAuthority(t *testing.
 	}
 }
 
+// REG-TOOL-APPROVAL-LIFECYCLE-SCOPE-SCHEMA-NA：scope schema 版本只随后端
+// 协议发布变化，没有运行时 mutation；任何非当前版本的 grant 都不得复用。
+func TestRememberedGrantLookupRejectsNonCurrentScopeSchema(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	createToolApprovalTestSession(t, store, "owner-schema", "session-schema")
+	req := newPendingToolApproval("owner-schema", "session-schema", "approval-schema", time.Now().Add(time.Minute))
+	created, err := store.CreateToolApprovalRequest(ctx, req)
+	if err != nil || !created {
+		t.Fatalf("create schema-bound approval = (%v, %v), want (true, nil)", created, err)
+	}
+	if _, err := store.DecideToolApproval(ctx, exactToolApprovalDecision(
+		req, storage.ToolApprovalDecisionApprovedRemember, "idem-schema", time.Now(),
+	)); err != nil {
+		t.Fatalf("mint current-schema grant: %v", err)
+	}
+
+	allowed, err := store.HasRememberedGrant(
+		ctx, req.OwnerID, req.ResolvedSessionID, req.CanonicalToolName, req.SecurityScopeDigest,
+	)
+	if err != nil || !allowed {
+		t.Fatalf("current-schema grant = (%v, %v), want active", allowed, err)
+	}
+	if _, err := store.db.ExecContext(ctx, `
+		UPDATE remembered_permission_grants SET schema_version = ? WHERE created_request_id = ?`,
+		storage.CurrentToolApprovalScopeSchemaVersion+1, req.RequestID,
+	); err != nil {
+		t.Fatalf("simulate non-current scope schema: %v", err)
+	}
+	allowed, err = store.HasRememberedGrant(
+		ctx, req.OwnerID, req.ResolvedSessionID, req.CanonicalToolName, req.SecurityScopeDigest,
+	)
+	if err != nil || allowed {
+		t.Fatalf("non-current-schema grant = (%v, %v), want inactive", allowed, err)
+	}
+}
+
 func TestToolApprovalV70ConcurrentDeadlineDecisionAndReleaseHaveOneTerminal(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

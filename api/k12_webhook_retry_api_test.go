@@ -71,7 +71,7 @@ func TestK12WebhookAPIRetriesOnlyPersistedSafeFailure(t *testing.T) {
 	srv.webhookMgr.SetK12Clock(func() time.Time { return now })
 	binding, secret, err := srv.webhookMgr.CreateK12Binding(context.Background(), webhook.K12BindingInput{
 		Name: "retry-api", AgentID: "kid-agent", LearnerID: "kid-learner",
-		AllowedEvents: []webhook.K12EventType{webhook.K12EventSubmissionRequested}, CreatedBy: "parent-1", Enabled: true,
+		AllowedEvents: []webhook.K12EventType{webhook.K12EventSubmissionRequested}, CreatedBy: defaultDesktopUserID, Enabled: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -108,11 +108,13 @@ func TestK12WebhookAPIRetriesOnlyPersistedSafeFailure(t *testing.T) {
 
 func TestK12WebhookAPIRetryOwnerAndOutcomeUnknownFailClosed(t *testing.T) {
 	srv := newWebhookTestServer(t)
+	const crossOwnerAPIToken = "k12-retry-cross-owner-token"
+	srv.cfg.Server.APIToken = crossOwnerAPIToken
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	srv.webhookMgr.SetK12Clock(func() time.Time { return now })
 	binding, secret, err := srv.webhookMgr.CreateK12Binding(context.Background(), webhook.K12BindingInput{
 		Name: "retry-unknown", AgentID: "kid-agent", LearnerID: "kid-learner",
-		AllowedEvents: []webhook.K12EventType{webhook.K12EventSubmissionRequested}, CreatedBy: "parent-1", Enabled: true,
+		AllowedEvents: []webhook.K12EventType{webhook.K12EventSubmissionRequested}, CreatedBy: defaultDesktopUserID, Enabled: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -133,8 +135,25 @@ func TestK12WebhookAPIRetryOwnerAndOutcomeUnknownFailClosed(t *testing.T) {
 	if status != http.StatusConflict {
 		t.Fatalf("outcome_unknown retry status=%d body=%s", status, raw)
 	}
-	status, raw = doK12WebhookAPI(t, ts.Client(), http.MethodPatch,
-		ts.URL+"/api/v1/webhooks/retry-unknown?user_id=other-parent&agent_id=kid-agent", body)
+	// API token 将该请求认证为 api-user，确保跨 owner 断言经过真实认证边界。
+	crossOwnerReq, err := http.NewRequest(http.MethodPatch,
+		ts.URL+"/api/v1/webhooks/retry-unknown?user_id=other-parent&agent_id=kid-agent",
+		bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("create cross-owner request: %v", err)
+	}
+	crossOwnerReq.Header.Set("Content-Type", "application/json")
+	crossOwnerReq.Header.Set("Authorization", "Bearer "+crossOwnerAPIToken)
+	crossOwnerResp, err := ts.Client().Do(crossOwnerReq)
+	if err != nil {
+		t.Fatalf("send cross-owner request: %v", err)
+	}
+	raw, err = io.ReadAll(crossOwnerResp.Body)
+	crossOwnerResp.Body.Close()
+	if err != nil {
+		t.Fatalf("read cross-owner response: %v", err)
+	}
+	status = crossOwnerResp.StatusCode
 	if status != http.StatusNotFound {
 		t.Fatalf("cross-owner retry status=%d body=%s", status, raw)
 	}

@@ -25,7 +25,13 @@ func TestK12CurriculumProgressRevisionV78RegistrationAndContract(t *testing.T) {
 		if _, err := db.ExecContext(t.Context(), `PRAGMA foreign_keys=ON`); err != nil {
 			t.Fatal(err)
 		}
-		if err := Run(context.Background(), db, All); err != nil {
+		throughV78 := make([]Migration, 0, len(All))
+		for _, candidate := range All {
+			if candidate.Version <= 78 {
+				throughV78 = append(throughV78, candidate)
+			}
+		}
+		if err := Run(context.Background(), db, throughV78); err != nil {
 			t.Fatalf("run fresh migration chain through V78: %v", err)
 		}
 

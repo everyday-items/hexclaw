@@ -94,3 +94,44 @@ func TestStore_UninstallUnknown(t *testing.T) {
 		t.Fatal("未安装场景的卸载记录应报错")
 	}
 }
+
+// 验证启动恢复不会重写未变化的安装收据。
+func TestStore_RecordInstallIsIdempotentForSameInstalledManifest(t *testing.T) {
+	db := newDB(t)
+	s := New(db)
+	ctx := context.Background()
+	m := sampleManifest()
+	first := &scenario.Receipt{
+		ScenarioID: "alpha", Version: "1.0.0", MountPath: "/api/alpha",
+		Resources:   []scenario.ResourceRef{{Kind: scenario.KindView, Name: "v", Key: "alpha@1.0.0/view:v"}},
+		InstalledAt: 42,
+	}
+	if err := s.RecordInstall(ctx, m, first); err != nil {
+		t.Fatalf("first RecordInstall: %v", err)
+	}
+	var beforeInstalledAt, beforeUpdatedAt int64
+	var beforeReceipt string
+	if err := db.QueryRow(`SELECT installed_at, updated_at, receipt_json FROM scenario_installations WHERE scenario_id='alpha'`).
+		Scan(&beforeInstalledAt, &beforeUpdatedAt, &beforeReceipt); err != nil {
+		t.Fatalf("read first receipt: %v", err)
+	}
+
+	second := &scenario.Receipt{
+		ScenarioID: "alpha", Version: "1.0.0", MountPath: "/api/alpha",
+		Resources:   []scenario.ResourceRef{{Kind: scenario.KindView, Name: "v", Key: "alpha@1.0.0/view:v"}},
+		InstalledAt: 99,
+	}
+	if err := s.RecordInstall(ctx, m, second); err != nil {
+		t.Fatalf("second RecordInstall: %v", err)
+	}
+	var afterInstalledAt, afterUpdatedAt int64
+	var afterReceipt string
+	if err := db.QueryRow(`SELECT installed_at, updated_at, receipt_json FROM scenario_installations WHERE scenario_id='alpha'`).
+		Scan(&afterInstalledAt, &afterUpdatedAt, &afterReceipt); err != nil {
+		t.Fatalf("read second receipt: %v", err)
+	}
+	if afterInstalledAt != beforeInstalledAt || afterUpdatedAt != beforeUpdatedAt || afterReceipt != beforeReceipt {
+		t.Fatalf("same installed manifest must not rewrite receipt: before=(%d,%d,%s) after=(%d,%d,%s)",
+			beforeInstalledAt, beforeUpdatedAt, beforeReceipt, afterInstalledAt, afterUpdatedAt, afterReceipt)
+	}
+}

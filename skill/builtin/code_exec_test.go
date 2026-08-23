@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1290,7 +1289,7 @@ func TestCodeExecNeedsGoRuntimeUsesExplicitMetadata(t *testing.T) {
 		{name: "absolute direct", request: codeExecRequest{Command: []string{"/usr/local/go/bin/go", "test", "./..."}}, want: false},
 		{name: "explicit Go command text", request: codeExecRequest{Language: "go", CommandText: "printf '%s\\n' 'literal; go test is data only'"}, want: false},
 		{name: "explicit Golang Bash", request: codeExecRequest{Language: "golang", Command: []string{"bash", "--norc", "-c", "go test ./..."}}, want: false},
-		{name: "explicit safe environment", request: codeExecRequest{Language: "go", Command: []string{"env", "LANG=C", "go", "test", "./..."}}, want: true},
+		{name: "explicit environment wrapper", request: codeExecRequest{Language: "go", Command: []string{"env", "LANG=C", "go", "test", "./..."}}, want: false},
 		{name: "explicit Go command prompt", request: codeExecRequest{Language: "go", Command: []string{"cmd.exe", "/D", "/S", "/C", "go test ./..."}}, want: false},
 		{name: "explicit Go PowerShell", request: codeExecRequest{Language: "go", Command: []string{"powershell", "-NoProfile", "-Command", "& { go test ./... }"}}, want: false},
 		{name: "wrapped shell without metadata", request: codeExecRequest{Command: []string{"sh", "-c", "go test ./..."}}, want: false},
@@ -1333,17 +1332,72 @@ func TestCodeExecGoModeRejectsUnstructuredExecutionPlans(t *testing.T) {
 	}
 }
 
-func TestCodeExecGoModeAllowsExplicitSafeEnvironmentAssignments(t *testing.T) {
+func TestCodeExecGoModeRejectsExplicitEnvironmentWrapper(t *testing.T) {
 	req := codeExecRequest{
 		Language: "go",
 		Command:  []string{"env", "LANG=C", "CUSTOM_BUILD_MARKER=verified", "go", "test", "./..."},
 	}
-	usesGo, err := codeExecRequestMayUseGo(req)
-	if err != nil {
-		t.Fatalf("validate direct Go argv: %v", err)
+	if usesGo, err := codeExecRequestMayUseGo(req); err == nil || usesGo ||
+		!strings.Contains(err.Error(), "structured direct go argv") {
+		t.Fatalf("environment wrapper result = (%v, %v), want direct-only rejection", usesGo, err)
 	}
-	if !usesGo {
-		t.Fatal("safe environment assignments did not select the Go execution plan")
+}
+
+func TestBUG20260727001_CodeExecProjectEnvWrapperIsRejectedForAllLanguageModes(t *testing.T) {
+	t.Setenv("GOWORK", "off")
+	project := t.TempDir()
+	writeCodeExecTestFile(t, filepath.Join(project, "go.mod"), "module example.com/app\n\ngo 1.24\n")
+
+	for _, language := range []string{"", "go", "golang"} {
+		name := language
+		if name == "" {
+			name = "missing"
+		}
+		t.Run(name, func(t *testing.T) {
+			stageCalls := 0
+			finalCalls := 0
+			s := newConfiguredTestCodeExecSkill(t, &mockSandbox{}, sandbox.Config{
+				Workspace: t.TempDir(),
+				Timeout:   30,
+				Network:   false,
+			})
+			s.projectStager = func(context.Context, string, string, codeExecExecutionPlan, *FileAccessBroker, sandbox.Config) (string, string, bool, error) {
+				stageCalls++
+				return "", "", false, errors.New("unexpected project staging")
+			}
+			s.sandboxFactory = func(sandbox.Config) (sandbox.Sandbox, error) {
+				finalCalls++
+				return &mockSandbox{}, nil
+			}
+			args := map[string]any{
+				"mode":         "project",
+				"project_root": project,
+				"command": []any{
+					"env",
+					"LANG=C",
+					"GOTOOLCHAIN=auto",
+					"GOPROXY=https://example.invalid",
+					"GOSUMDB=sum.example.invalid",
+					"GOFLAGS=-mod=mod",
+					"GOMODCACHE=/tmp/foreign-modcache",
+					"GOWORK=off",
+					"PATH=/tmp/foreign-toolchain",
+					"go",
+					"test",
+					"./...",
+				},
+			}
+			if language != "" {
+				args["language"] = language
+			}
+			_, err := s.Execute(context.Background(), args)
+			if err == nil || !strings.Contains(err.Error(), "structured direct go argv") {
+				t.Fatalf("environment wrapper error = %v, want direct-only contract rejection", err)
+			}
+			if stageCalls != 0 || finalCalls != 0 {
+				t.Fatalf("environment wrapper reached staging/final child: stage=%d final=%d", stageCalls, finalCalls)
+			}
+		})
 	}
 }
 
@@ -2631,7 +2685,7 @@ func TestCodeExecGoCacheCleanupRunsAfterPolicyRejection(t *testing.T) {
 		wantErr string
 	}{
 		{name: "go global C flag", command: []any{"go", "-C", ".", "test", "./..."}, wantErr: "does not accept global flags"},
-		{name: "unsupported subcommand", command: []any{"env", "LANG=C", "go", "env", "GOOS"}, wantErr: "accepts only run or test"},
+		{name: "unsupported subcommand", command: []any{"go", "env", "GOOS"}, wantErr: "accepts only run or test"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2828,11 +2882,10 @@ func TestCodeExecExecutionPlanUsesPinnedGoToolchain(t *testing.T) {
 	tests := []struct {
 		name       string
 		command    []string
-		wantEnv    map[string]string
 		wantGoTest bool
 	}{
 		{name: "direct", command: []string{"go", "test", "./..."}, wantGoTest: true},
-		{name: "safe environment", command: []string{"env", "LANG=C", "go", "test", "./..."}, wantEnv: map[string]string{"LANG": "C"}, wantGoTest: true},
+		{name: "direct executable", command: []string{"go.exe", "test", "./..."}, wantGoTest: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2846,8 +2899,8 @@ func TestCodeExecExecutionPlanUsesPinnedGoToolchain(t *testing.T) {
 			if plan.Command[0] != descriptor.Binary {
 				t.Fatalf("pinned command = %v, want Go binary %q", plan.Command, descriptor.Binary)
 			}
-			if !maps.Equal(plan.Environment, tt.wantEnv) {
-				t.Fatalf("pinned environment = %v, want %v", plan.Environment, tt.wantEnv)
+			if len(plan.Environment) != 0 {
+				t.Fatalf("pinned environment = %v, want empty", plan.Environment)
 			}
 			if plan.GoTest != tt.wantGoTest || !plan.GoRuntime || plan.Toolchain != descriptor {
 				t.Fatalf("execution plan = %#v", plan)

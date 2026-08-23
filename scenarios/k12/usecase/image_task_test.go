@@ -283,6 +283,42 @@ func testCreateImageTaskInput() CreateImageTaskInput {
 	}
 }
 
+func assertCurrentCreativeIntakePromotion(
+	t *testing.T,
+	coordinator *ImageTaskCoordinator,
+	intake *k12.CreativeWorkIntake,
+) (k12.CreativeWorkFields, k12.CreativeWorkGenerationState) {
+	t.Helper()
+	if intake == nil || intake.Status != k12.CreativeWorkIntakePromoted ||
+		strings.TrimSpace(intake.PromotedWorkID) == "" ||
+		strings.TrimSpace(intake.PromotedGenerationID) == "" ||
+		strings.TrimSpace(intake.PromotedVersionID) != "" {
+		t.Fatalf("current intake promotion identity drift: %+v", intake)
+	}
+	record, err := coordinator.Records.Get(context.Background(), intake.PromotedWorkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields, err := k12.ParseCreativeWorkFields(record.Fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fields.Versions) != 0 {
+		t.Fatalf("current intake wrote legacy versions: %+v", fields.Versions)
+	}
+	state, err := coordinator.Records.GetCreativeWorkGenerationState(
+		context.Background(), intake.AgentName, intake.PromotedWorkID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Initial == nil ||
+		state.Initial.GenerationID != intake.PromotedGenerationID {
+		t.Fatalf("promotion/generation identity drift: intake=%+v state=%+v", intake, state)
+	}
+	return fields, state
+}
+
 func TestManualArtworkSkipsClassificationAndWaitsForCommit(t *testing.T) {
 	coordinator, _ := newImageTaskCoordinatorForTest(t, nil)
 	coordinator.ResolveRoute = nil
@@ -324,11 +360,7 @@ func TestManualArtworkSkipsClassificationAndWaitsForCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if committed.Creative == nil ||
-		committed.Creative.Status != k12.CreativeWorkIntakePromoted ||
-		committed.Creative.PromotedVersionID != "v1" {
-		t.Fatalf("manual commit did not create exactly one v1: %+v", committed.Creative)
-	}
+	assertCurrentCreativeIntakePromotion(t, coordinator, committed.Creative)
 	completed, err := coordinator.Run(
 		context.Background(), input.AgentName, prepared.Dispatch.DispatchID,
 	)
@@ -340,7 +372,8 @@ func TestManualArtworkSkipsClassificationAndWaitsForCommit(t *testing.T) {
 	}
 	invocation, err := coordinator.Records.GetLatestWorkFeedbackInvocation(
 		context.Background(), input.AgentName, committed.Creative.PromotedWorkID,
-		"work:"+committed.Creative.PromotedWorkID+":version:v1:feedback",
+		"work:"+committed.Creative.PromotedWorkID+":version:"+
+			committed.Creative.PromotedGenerationID+":feedback",
 	)
 	if err != nil {
 		t.Fatalf("manual commit did not register automatic feedback: %v", err)
@@ -441,11 +474,10 @@ func TestManualWritingClearOCRStillWaitsForParentFreeze(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if committed.Creative == nil ||
-		committed.Creative.Status != k12.CreativeWorkIntakePromoted ||
-		committed.Creative.PromotedVersionID != "v1" {
+	if committed.Creative == nil {
 		t.Fatalf("commit did not promote frozen writing: %+v", committed.Creative)
 	}
+	assertCurrentCreativeIntakePromotion(t, coordinator, committed.Creative)
 }
 
 func createAndRunImageTask(
@@ -1113,6 +1145,7 @@ func TestImageTaskCoordinatorArtworkImmediatelyPromotesWithoutGradingJob(t *test
 		view.Creative.PromotedWorkID == "" {
 		t.Fatalf("artwork was not promoted: %+v", view)
 	}
+	assertCurrentCreativeIntakePromotion(t, coordinator, view.Creative)
 	if view.CreativeFeedback != "feedback_ready" ||
 		view.CreativeWork == nil ||
 		view.CreativeWork.Record.Status != k12.WorkStatusFeedbackReady {
@@ -1397,16 +1430,9 @@ func TestImageTaskCoordinatorWorkFeedbackRetryReusesFrozenRoute(t *testing.T) {
 			solver.routeCalls, solver.snapshots)
 	}
 	workID := failed.Creative.PromotedWorkID
-	work, getErr := coordinator.Records.Get(context.Background(), workID)
-	if getErr != nil {
-		t.Fatal(getErr)
-	}
-	fields, parseErr := k12.ParseCreativeWorkFields(work.Fields)
-	if parseErr != nil || len(fields.Versions) == 0 {
-		t.Fatalf("work projection missing: fields=%+v err=%v", fields, parseErr)
-	}
+	assertCurrentCreativeIntakePromotion(t, coordinator, failed.Creative)
 	operationKey := "work:" + workID + ":version:" +
-		fields.Versions[len(fields.Versions)-1].VersionID + ":feedback"
+		failed.Creative.PromotedGenerationID + ":feedback"
 	invocation, getErr := coordinator.Records.GetLatestWorkFeedbackInvocation(
 		context.Background(), "mingming", workID, operationKey,
 	)
@@ -1439,7 +1465,11 @@ func TestImageTaskCoordinatorWorkFeedbackRetryReusesFrozenRoute(t *testing.T) {
 	result, err := coordinator.Result(context.Background(), "mingming", "dispatch-1")
 	if err != nil || result.Kind != "creative" ||
 		result.CreativeWork == nil ||
-		result.CreativeWork.Fields.Versions[0].StructuredFeedback == nil {
+		len(result.CreativeWork.Fields.Versions) != 0 ||
+		result.CreativeWork.GenerationState.Latest == nil ||
+		result.CreativeWork.GenerationState.Latest.GenerationID !=
+			failed.Creative.PromotedGenerationID ||
+		result.CreativeWork.GenerationState.Latest.Feedback == nil {
 		t.Fatalf("creative result missing canonical feedback: result=%+v err=%v", result, err)
 	}
 }
@@ -1505,17 +1535,11 @@ func TestImageTaskCoordinatorWritingFreezesOCRAndPromotesWithoutPlaceholderFacts
 		view.Creative.PromotedWorkID == "" {
 		t.Fatalf("writing was not promoted: %+v", view)
 	}
-	work, err := coordinator.Records.Get(context.Background(), view.Creative.PromotedWorkID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fields, err := k12.ParseCreativeWorkFields(work.Fields)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fields, state := assertCurrentCreativeIntakePromotion(t, coordinator, view.Creative)
 	if fields.WorkTitle != "" || fields.TaskRequirement != "" ||
-		fields.DisplayName != "语文写作" || fields.Versions[0].ContentMarkdown != "我的好爸爸" {
-		t.Fatalf("placeholder or OCR drift: %+v", fields)
+		fields.DisplayName != "语文写作" || state.Initial == nil ||
+		state.Initial.Source.ContentMarkdown != "我的好爸爸" {
+		t.Fatalf("placeholder or OCR drift: fields=%+v state=%+v", fields, state)
 	}
 }
 

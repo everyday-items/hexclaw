@@ -8,10 +8,12 @@ package apihttp_test
 import (
 	"strings"
 	"testing"
+
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
 func TestINV019_ExportHTTPMarkdownPreservesCanonicalContent(t *testing.T) {
-	h := newFaithfulServer(t)
+	h := newFaithfulServer(t, k12.ChildProfile{ChildName: "明明", GradeTerm: "五年级上"})
 	rec, out := do(t, h, "POST", "/record-mistake",
 		`{"agent":"mingming","subject":"数学","grade":"五年级上",`+
 			`"problem":"花了 $5 买笔，找回 $2，共 3.8 × 3 = ? 元",`+

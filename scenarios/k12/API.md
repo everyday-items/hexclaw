@@ -124,10 +124,12 @@
 - 请求：`{"agent","child_name","knowledge_points":[],"fallback_grade","textbook"}`
 - 响应：`{"child_name","grade_term","textbook_edition","inferred":true,"created":true}`
 
-**`GET /api/k12/export?agent=X&format=md|pdf|docx`** — 错题本导出
-- `md`（或 render 服务未启用）→ `{"format":"markdown","content":"# 错题本…"}`
+**`GET /api/k12/export?agent=X&format=md|pdf|docx`** — 当前 Tutor / 当前学期的完整学习档案导出
+- 服务端在同一 SQLite read transaction 中读取并固定输出 `本周该练 → 全部错题 → 练习集 → 积累 → 作品` 五段；不从当前 Tab、旧 ReviewQueue 或 legacy 作品版本拼装。
+- `md`（或 render 服务未启用）→ `{"format":"markdown","content":"# 学习档案…","schema_version":"v1","scope":{"agent":"X","grade_term":"五年级下"},"as_of":0,"source_digest":"<sha256>","object_counts":{"weekly_review":0,"mistakes":0,"practice_sets":0,"accumulations":0,"creative_works":0},"artifact_id":"…"}`
 - `pdf`/`docx` → **二进制流**（`Content-Type` + `Content-Disposition: attachment`）
-- 渲染失败 → 降级 `{"format":"markdown","content":…,"render_error":…}`
+- 二进制响应通过 `X-HexClaw-Artifact-ID`、`X-HexClaw-Source-Digest` 与 `X-HexClaw-Object-Counts` 绑定同一 canonical Artifact；渲染失败降级为带相同 metadata 的 Markdown JSON，并追加 `render_error`。
+- 新作品创建时冻结 `grade_term`；导出只纳入与当前档案学期严格相等的五对象。legacy 空学期不按当前档案猜测回填。业务 Markdown/LaTeX 保持原字节，坏 JSON 或缺作品 current generation/source 时整次失败，不产出部分 Artifact。
 
 **`GET /api/k12/mistake-sheet?agent=X`** — 本周错题卷（Markdown，只出题）→ `{"format":"markdown","content"}`
 

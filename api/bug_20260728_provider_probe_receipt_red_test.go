@@ -241,6 +241,70 @@ func TestBUG20260728ProviderProbeReceipt_RestoresPassedAndFailedAfterServerRecre
 	}
 }
 
+func TestProviderProbeFailureResponseAndReceiptRedactRawUpstreamBody(t *testing.T) {
+	const rawBodySentinel = "private-upstream-payload"
+	const requestIDSentinel = "request-id-should-not-leak"
+
+	assertPublicProbeMessage := func(t *testing.T, value any, wantReason string) {
+		t.Helper()
+		message, ok := value.(string)
+		if !ok {
+			t.Fatalf("probe message type=%T, want string", value)
+		}
+		for _, forbidden := range []string{rawBodySentinel, requestIDSentinel, `"metadata"`, "body:"} {
+			if strings.Contains(message, forbidden) {
+				t.Fatalf("probe message contains raw upstream material")
+			}
+		}
+		if !strings.Contains(message, wantReason) {
+			t.Fatalf("probe message does not retain the public provider reason")
+		}
+	}
+
+	tests := []struct {
+		name       string
+		probeError string
+		wantReason string
+	}{
+		{
+			name:       "structured upstream body",
+			probeError: `openai api error: 429 Too Many Requests, body: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"` + rawBodySentinel + `","request_id":"` + requestIDSentinel + `"}}}`,
+			wantReason: "Provider returned error (code: 429)",
+		},
+		{
+			name:       "malformed upstream body",
+			probeError: `openai api error: 429 Too Many Requests, body: {"error":"` + rawBodySentinel + `","request_id":"` + requestIDSentinel,
+			wantReason: "openai api error: 429 Too Many Requests",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldFactory := llmTestProviderFactory
+			llmTestProviderFactory = func(llmConnectionTestProvider) completionProvider {
+				return &bug20260728ProbeProvider{err: errors.New(tt.probeError)}
+			}
+			defer func() { llmTestProviderFactory = oldFactory }()
+
+			store := bug20260728OpenStore(t)
+			cfg := bug20260728ProviderConfig()
+			first := NewServer(cfg, &mockEngine{}, nil, store)
+			payload := bug20260728RunProbe(t, first, true)
+			if payload["ok"] != false {
+				t.Fatalf("probe ok=%v, want false", payload["ok"])
+			}
+
+			assertPublicProbeMessage(t, payload["message"], tt.wantReason)
+			bug20260728AssertPersistedResponse(t, payload)
+
+			restarted := NewServer(cfg, &mockEngine{}, nil, store)
+			provider := bug20260728GetProvider(t, restarted)
+			receipt := bug20260728AssertReceipt(t, provider, "failed")
+			assertPublicProbeMessage(t, receipt["message"], tt.wantReason)
+		})
+	}
+}
+
 func TestBUG20260728ProviderProbeReceipt_DisplayNamePreservesButFingerprintChangesInvalidate(t *testing.T) {
 	oldFactory := llmTestProviderFactory
 	llmTestProviderFactory = func(llmConnectionTestProvider) completionProvider {

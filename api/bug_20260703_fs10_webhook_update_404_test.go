@@ -42,7 +42,7 @@ func newWebhookTestServer(t *testing.T) *Server {
 func TestBug20260703_UpdateWebhookUnknownNameReturns404(t *testing.T) {
 	srv := newWebhookTestServer(t)
 
-	req := httptest.NewRequest("PATCH", "/api/v1/webhooks/ghost", strings.NewReader(`{"enabled":true}`))
+	req := httptest.NewRequest("PATCH", "/api/v1/webhooks/ghost?user_id=u", strings.NewReader(`{"enabled":true}`))
 	req.SetPathValue("name", "ghost")
 	w := httptest.NewRecorder()
 	srv.handleUpdateWebhook(w, req)
@@ -59,7 +59,7 @@ func TestBug20260703_UpdateWebhookExistingNameReturns200(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
-	req := httptest.NewRequest("PATCH", "/api/v1/webhooks/real", strings.NewReader(`{"enabled":true}`))
+	req := httptest.NewRequest("PATCH", "/api/v1/webhooks/real?user_id=u", strings.NewReader(`{"enabled":true}`))
 	req.SetPathValue("name", "real")
 	w := httptest.NewRecorder()
 	srv.handleUpdateWebhook(w, req)

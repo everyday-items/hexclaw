@@ -52,7 +52,13 @@ func TestBUG20260728ProviderProbeReceipt_RealHexClawGPT(t *testing.T) {
 	first := &Server{cfg: cfg, store: store}
 	probe := bug20260728RunLiveProviderProbe(t, first, providerInstanceID)
 	if ok, _ := probe["ok"].(bool); !ok {
-		t.Fatal("real HexClaw-GPT connection probe did not succeed")
+		message, _ := probe["message"].(string)
+		t.Fatalf(
+			"real HexClaw-GPT connection probe did not succeed: failure_kind=%s persisted=%v latency_ms=%.0f",
+			bug20260728LiveProviderFailureKind(message),
+			probe["persisted"],
+			probe["latency_ms"],
+		)
 	}
 	if persisted, _ := probe["persisted"].(bool); !persisted {
 		t.Fatal("real provider probe did not persist its receipt")
@@ -84,6 +90,35 @@ func TestBUG20260728ProviderProbeReceipt_RealHexClawGPT(t *testing.T) {
 	}
 
 	t.Logf("REAL_PROVIDER_PROBE_PASS provider=HexClaw-GPT model=%s latency_ms=%.0f", expectedModel, probe["latency_ms"])
+}
+
+func bug20260728LiveProviderFailureKind(message string) string {
+	message = strings.ToLower(message)
+	for _, candidate := range []struct {
+		contains string
+		kind     string
+	}{
+		{contains: "401", kind: "unauthorized"},
+		{contains: "403", kind: "forbidden"},
+		{contains: "404", kind: "not_found"},
+		{contains: "408", kind: "request_timeout"},
+		{contains: "409", kind: "conflict"},
+		{contains: "429", kind: "rate_limited"},
+		{contains: "500", kind: "upstream_500"},
+		{contains: "502", kind: "upstream_502"},
+		{contains: "503", kind: "upstream_503"},
+		{contains: "504", kind: "upstream_504"},
+		{contains: "deadline exceeded", kind: "deadline_exceeded"},
+		{contains: "timeout", kind: "timeout"},
+		{contains: "connection refused", kind: "connection_refused"},
+		{contains: "no such host", kind: "dns_failure"},
+		{contains: "tls", kind: "tls_failure"},
+	} {
+		if strings.Contains(message, candidate.contains) {
+			return candidate.kind
+		}
+	}
+	return "provider_failure"
 }
 
 func bug20260728DesktopConfigPath(t *testing.T) string {

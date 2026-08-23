@@ -3,10 +3,12 @@ package apihttp_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
 	"github.com/hexagon-codes/hexclaw/skill"
@@ -34,7 +36,7 @@ func (faithfulSolveExec) Execute(_ context.Context, args map[string]any) (*skill
 	}}, nil
 }
 
-func newFaithfulServer(t *testing.T) http.Handler {
+func newFaithfulServer(t *testing.T, seededProfiles ...k12.ChildProfile) http.Handler {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -44,7 +46,17 @@ func newFaithfulServer(t *testing.T) http.Handler {
 	if err := migrate.Run(context.Background(), db, migrate.All); err != nil {
 		t.Fatal(err)
 	}
-	db.Exec(`INSERT INTO agents(name) VALUES('mingming')`)
+	metadata := "{}"
+	if len(seededProfiles) > 0 {
+		encoded, marshalErr := json.Marshal(k12.ApplyProfileToMeta(nil, seededProfiles[0]))
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		metadata = string(encoded)
+	}
+	if _, err := db.Exec(`INSERT INTO agents(name,metadata) VALUES('mingming',?)`, metadata); err != nil {
+		t.Fatal(err)
+	}
 	k, err := assembly.Wire(db, faithfulSolveExec{})
 	if err != nil {
 		t.Fatal(err)

@@ -621,7 +621,7 @@ func TestSinglePracticeGenerationCoordinator_RecoversQueuedJobAfterRestart(t *te
 	}
 }
 
-func TestSinglePracticeGeneration_RemoveCommittedItemRetiresJobAndReturnsAvailable(t *testing.T) {
+func TestSinglePracticeGeneration_RemoveCommittedItemRetiresJobAndReturnsReAdd(t *testing.T) {
 	d := newDataDeps(t)
 	generator := &singlePracticeGenerator{}
 	d.Solver = singlePracticeValidator{}
@@ -669,7 +669,7 @@ func TestSinglePracticeGeneration_RemoveCommittedItemRetiresJobAndReturnsAvailab
 	projected, err := d.GetSinglePracticeGeneration(
 		context.Background(), "xiaoming", sourceID,
 	)
-	if err != nil || projected.State != usecase.SinglePracticeAvailable {
+	if err != nil || projected.State != usecase.SinglePracticeReAdd {
 		t.Fatalf("removed generation projection=%+v err=%v", projected, err)
 	}
 	basket, err := d.GetPracticeSet(
@@ -720,7 +720,7 @@ func TestSinglePracticeGeneration_RemovePendingItemPreventsProviderCall(t *testi
 	projected, err := d.ProcessSinglePracticeGeneration(
 		context.Background(), "xiaoming", pending.GenerationJobID,
 	)
-	if err != nil || projected.State != usecase.SinglePracticeAvailable {
+	if err != nil || projected.State != usecase.SinglePracticeReAdd {
 		t.Fatalf("retired worker projection=%+v err=%v", projected, err)
 	}
 	if generator.calls != 0 || validator.calls != 0 {

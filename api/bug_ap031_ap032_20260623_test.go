@@ -11,6 +11,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/cron"
 	"github.com/hexagon-codes/hexclaw/webhook"
 
 	_ "modernc.org/sqlite"
@@ -24,6 +25,7 @@ func TestAP031_RegisterWebhook_PersistsJobID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
+	db.SetMaxOpenConns(1)
 	defer db.Close()
 
 	ctx := context.Background()
@@ -31,11 +33,29 @@ func TestAP031_RegisterWebhook_PersistsJobID(t *testing.T) {
 	if err := mgr.Init(ctx); err != nil {
 		t.Fatalf("mgr init: %v", err)
 	}
+	scheduler := cron.NewScheduler(db, nil, nil)
+	if err := scheduler.Init(ctx); err != nil {
+		t.Fatalf("scheduler init: %v", err)
+	}
+	if err := scheduler.AddJob(ctx, &cron.Job{
+		ID:       "job-42",
+		Name:     "AP-031 fixture",
+		Type:     cron.JobTypeCron,
+		Schedule: "@daily",
+		UserID:   "u1",
+		Spec: &cron.JobSpec{
+			Runtime: cron.RuntimeStarlark,
+			Script:  `emit("ok")`,
+		},
+	}); err != nil {
+		t.Fatalf("add same-owner job: %v", err)
+	}
 
 	cfg := config.DefaultConfig()
 	eng := &mockEngine{reply: &adapter.Reply{Content: "ok"}}
 	srv := NewServer(cfg, eng, nil, nil)
 	srv.webhookMgr = mgr
+	srv.SetCronScheduler(scheduler)
 
 	body := `{"name":"cronhook","type":"generic","prompt":"p","user_id":"u1","job_id":"job-42"}`
 	req := httptest.NewRequest("POST", "/api/v1/webhooks", strings.NewReader(body))

@@ -485,26 +485,72 @@ func TestGenerateWorkFeedback_OwnerIsolation(t *testing.T) {
 	}
 }
 
-// TestGenerateWorkFeedback_StatusGuard draft/revised 以外状态拒绝生成。
+// TestGenerateWorkFeedback_StatusGuard 旧生成入口受状态限制；修改稿入口只读拒绝，
+// 新 command key 通过当前命令入口追加新的点评 generation。
 func TestGenerateWorkFeedback_StatusGuard(t *testing.T) {
 	d := newDataDeps(t)
-	d.Solver = &fakeWorkFeedbackSolver{feedback: "好句：开头比喻；建议：结尾补细节。"}
+	gen := &fakeWorkFeedbackSolver{feedback: "好句：开头比喻；建议：结尾补细节。"}
+	d.Solver = gen
 	ctx := context.Background()
 	id := newWritingWork(t, d, "xiaoming")
 
 	if _, err := d.GenerateWorkFeedback(ctx, "xiaoming", id); err != nil {
 		t.Fatalf("draft 生成: %v", err)
 	}
-	// 已是 feedback_ready → 再生成应拒（需先提交修改稿）。
+	// 旧入口已是 feedback_ready 时不得隐式追加 generation。
 	if _, err := d.GenerateWorkFeedback(ctx, "xiaoming", id); err == nil {
 		t.Fatal("feedback_ready 状态不应可再次生成点评")
 	}
-	// revised 可再点评。
-	if _, err := d.SubmitRevision(ctx, "xiaoming", id, "柳枝像绿色的丝带，风一吹沙沙响。", ""); err != nil {
+	beforeRevision, err := d.GetCreativeWork(ctx, "xiaoming", id)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.GenerateWorkFeedback(ctx, "xiaoming", id); err != nil {
-		t.Fatalf("revised 应可再生成点评: %v", err)
+	if beforeRevision.GenerationState.Initial == nil || beforeRevision.GenerationState.Latest == nil {
+		t.Fatalf("首轮点评应建立初始/latest generation: %+v", beforeRevision.GenerationState)
+	}
+	beforeInitialID := beforeRevision.GenerationState.Initial.GenerationID
+	beforeLatestID := beforeRevision.GenerationState.Latest.GenerationID
+	beforeRowVersion := beforeRevision.GenerationState.RowVersion
+	beforeRecordVersion := beforeRevision.Record.Version
+	beforeVersionCount := len(beforeRevision.Fields.Versions)
+	beforeCalls := gen.calls
+
+	// 修改稿入口必须 fail-closed，拒绝后不得追加 generation/version。
+	if _, err := d.SubmitRevision(ctx, "xiaoming", id, "柳枝像绿色的丝带，风一吹沙沙响。", ""); err == nil {
+		t.Fatal("当前作品不应允许提交修改稿")
+	}
+	afterRevision, err := d.GetCreativeWork(ctx, "xiaoming", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterRevision.Fields.Versions) != beforeVersionCount ||
+		afterRevision.Record.Version != beforeRecordVersion ||
+		afterRevision.GenerationState.RowVersion != beforeRowVersion ||
+		afterRevision.GenerationState.Initial == nil ||
+		afterRevision.GenerationState.Initial.GenerationID != beforeInitialID ||
+		afterRevision.GenerationState.Latest == nil ||
+		afterRevision.GenerationState.Latest.GenerationID != beforeLatestID ||
+		gen.calls != beforeCalls {
+		t.Fatalf("修改稿拒绝后不得产生任何副作用: before=%+v after=%+v calls=%d->%d",
+			beforeRevision, afterRevision, beforeCalls, gen.calls)
+	}
+
+	const regenerateCommandKey = "feedback-status-guard-regenerate"
+	regenerated, err := d.GenerateWorkFeedbackCommand(
+		ctx, "xiaoming", id, regenerateCommandKey,
+	)
+	if err != nil {
+		t.Fatalf("新 command key 应可追加一轮点评: %v", err)
+	}
+	if regenerated.GenerationState.Initial == nil ||
+		regenerated.GenerationState.Initial.GenerationID != beforeInitialID ||
+		regenerated.GenerationState.Latest == nil ||
+		regenerated.GenerationState.Latest.GenerationID == beforeLatestID ||
+		regenerated.GenerationState.Latest.GenerationNo != 2 ||
+		regenerated.GenerationState.Latest.CommandKey != regenerateCommandKey ||
+		len(regenerated.Fields.Versions) != beforeVersionCount {
+		t.Fatalf("新 command key 应只追加 generation，不追加 legacy version: %+v",
+			regenerated)
 	}
 	// archived 拒。
 	id2 := newWritingWork(t, d, "xiaoming")

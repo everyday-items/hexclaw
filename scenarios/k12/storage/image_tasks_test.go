@@ -328,14 +328,16 @@ func TestImageTaskArtworkRoutesToIntakeThenPromotesExactlyOnce(t *testing.T) {
 		workID).Scan(&versions); err != nil {
 		t.Fatal(err)
 	}
-	if works != 1 || versions != 1 {
+	if works != 1 || versions != 0 {
 		t.Fatalf("atomic promotion works=%d versions=%d", works, versions)
 	}
 	intake, err := store.GetCreativeWorkIntake(ctx, "mingming", target.CreativeIntake.IntakeID)
-	if err != nil || intake.Status != k12.CreativeWorkIntakePromoted || intake.PromotedWorkID != workID {
+	if err != nil || intake.Status != k12.CreativeWorkIntakePromoted ||
+		intake.PromotedWorkID != workID || intake.PromotedGenerationID == "" ||
+		intake.PromotedVersionID != "" {
 		t.Fatalf("promoted intake=%+v err=%v", intake, err)
 	}
-	t.Run("BUG-20260726-C1 automatic promotion commits work v1 and initial queued generation together", func(t *testing.T) {
+	t.Run("BUG-20260724-012 automatic promotion commits current work and initial generation together", func(t *testing.T) {
 		record, err := store.Get(ctx, workID)
 		if err != nil {
 			t.Fatal(err)
@@ -344,8 +346,8 @@ func TestImageTaskArtworkRoutesToIntakeThenPromotesExactlyOnce(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(fields.Versions) != 1 || fields.Versions[0].VersionID != "v1" {
-			t.Fatalf("BUG-20260726-C1 promoted work versions=%+v, want exactly v1", fields.Versions)
+		if len(fields.Versions) != 0 {
+			t.Fatalf("BUG-20260724-012 promoted work versions=%+v, want no legacy versions", fields.Versions)
 		}
 		var generationCount int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM k12_work_feedback_generations
@@ -353,7 +355,7 @@ func TestImageTaskArtworkRoutesToIntakeThenPromotesExactlyOnce(t *testing.T) {
 			t.Fatal(err)
 		}
 		if generationCount != 1 {
-			t.Fatalf("BUG-20260726-C1 promotion returned with generations=%d, want 1 queued atomically", generationCount)
+			t.Fatalf("BUG-20260724-012 promotion returned with generations=%d, want 1 queued atomically", generationCount)
 		}
 		var generationID, status, initialID, feedbackState string
 		var generationNo int
@@ -368,9 +370,11 @@ func TestImageTaskArtworkRoutesToIntakeThenPromotesExactlyOnce(t *testing.T) {
 			t.Fatal(err)
 		}
 		if generationID == "" || generationNo != 1 || status != "queued" ||
-			initialID != generationID || feedbackState != "queued" {
-			t.Fatalf("BUG-20260726-C1 generation=%q no=%d status=%q initial=%q work_state=%q",
-				generationID, generationNo, status, initialID, feedbackState)
+			initialID != generationID || intake.PromotedGenerationID != generationID ||
+			feedbackState != "queued" {
+			t.Fatalf("BUG-20260724-012 generation=%q no=%d status=%q initial=%q intake=%q work_state=%q",
+				generationID, generationNo, status, initialID,
+				intake.PromotedGenerationID, feedbackState)
 		}
 	})
 }
@@ -502,13 +506,18 @@ func TestParentSelectedArtworkWaitsForExplicitCommitAndReplaysReceipt(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if committed.PromotedWorkID == "" || committed.PromotedVersionID != "v1" ||
+	if committed.PromotedWorkID == "" || committed.PromotedGenerationID == "" ||
+		committed.PromotedVersionID != "" ||
 		replayed.PromotedWorkID != committed.PromotedWorkID ||
+		replayed.PromotedGenerationID != committed.PromotedGenerationID ||
 		replayed.CommitReceipt == nil ||
-		replayed.CommitReceipt.CommandDigest != command.CommandDigest {
+		replayed.CommitReceipt.CommandDigest != command.CommandDigest ||
+		replayed.CommitReceipt.WorkID != committed.PromotedWorkID ||
+		replayed.CommitReceipt.GenerationID != committed.PromotedGenerationID ||
+		replayed.CommitReceipt.VersionID != "" {
 		t.Fatalf("explicit commit receipt/replay drift: first=%+v replay=%+v", committed, replayed)
 	}
-	t.Run("BUG-20260726-C2 manual commit returns work v1 and initial queued generation atomically", func(t *testing.T) {
+	t.Run("BUG-20260724-012 manual commit returns current work and initial generation atomically", func(t *testing.T) {
 		record, err := store.Get(ctx, committed.PromotedWorkID)
 		if err != nil {
 			t.Fatal(err)
@@ -517,8 +526,8 @@ func TestParentSelectedArtworkWaitsForExplicitCommitAndReplaysReceipt(t *testing
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(fields.Versions) != 1 || fields.Versions[0].VersionID != "v1" {
-			t.Fatalf("BUG-20260726-C2 committed work versions=%+v, want exactly v1", fields.Versions)
+		if len(fields.Versions) != 0 {
+			t.Fatalf("BUG-20260724-012 committed work versions=%+v, want no legacy versions", fields.Versions)
 		}
 		var works, generations int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM k12_creative_works
@@ -530,7 +539,7 @@ func TestParentSelectedArtworkWaitsForExplicitCommitAndReplaysReceipt(t *testing
 			t.Fatal(err)
 		}
 		if works != 1 || generations != 1 {
-			t.Fatalf("BUG-20260726-C2 replay left works=%d generations=%d, want 1/1", works, generations)
+			t.Fatalf("BUG-20260724-012 replay left works=%d generations=%d, want 1/1", works, generations)
 		}
 		var generationID, status, initialID, feedbackState string
 		var generationNo int
@@ -545,15 +554,17 @@ func TestParentSelectedArtworkWaitsForExplicitCommitAndReplaysReceipt(t *testing
 			t.Fatal(err)
 		}
 		if generationID == "" || generationNo != 1 || status != "queued" ||
-			initialID != generationID || feedbackState != "queued" {
-			t.Fatalf("BUG-20260726-C2 generation=%q no=%d status=%q initial=%q work_state=%q",
-				generationID, generationNo, status, initialID, feedbackState)
+			initialID != generationID || committed.PromotedGenerationID != generationID ||
+			feedbackState != "queued" {
+			t.Fatalf("BUG-20260724-012 generation=%q no=%d status=%q initial=%q intake=%q work_state=%q",
+				generationID, generationNo, status, initialID,
+				committed.PromotedGenerationID, feedbackState)
 		}
 	})
 }
 
-func TestParentSelectedRevisionValidatesLatestBaseAndAppendsOneVersion(t *testing.T) {
-	store, _ := setup(t)
+func TestParentSelectedRevisionIsRejectedBeforeCurrentWrites(t *testing.T) {
+	store, db := setup(t)
 	ctx := context.Background()
 	asset := "asset://mingming/" + strings.Repeat("a", 64) + ".png"
 	work, err := k12.NewCreativeWorkRecord("mingming", "session-1", k12.CreativeWorkFields{
@@ -568,9 +579,19 @@ func TestParentSelectedRevisionValidatesLatestBaseAndAppendsOneVersion(t *testin
 	if _, err := store.Put(ctx, work); err != nil {
 		t.Fatal(err)
 	}
+	legacy, err := store.Get(ctx, work.RecordID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyFields, err := k12.ParseCreativeWorkFields(legacy.Fields)
+	if err != nil || len(legacyFields.Versions) != 1 ||
+		legacyFields.Versions[0].VersionID != "v1" {
+		t.Fatalf("historical version is not readable: fields=%+v err=%v", legacyFields, err)
+	}
 
 	dispatch := testImageTaskDispatch()
 	dispatch.DispatchID = "dispatch-revision"
+	dispatch.OwnerScope = "owner-mingming"
 	dispatch.SourceRef = "revision-upload-1"
 	dispatch.IdempotencyKey = "desktop:revision-upload-1:g1"
 	dispatch.TaskIntent = k12.ImageTaskIntentArtwork
@@ -584,149 +605,32 @@ func TestParentSelectedRevisionValidatesLatestBaseAndAppendsOneVersion(t *testin
 		Kind: k12.CreativeWorkEntryRevision, TaskIntent: k12.ImageTaskIntentArtwork,
 		WorkID: work.RecordID, BaseVersionID: "v1",
 	}
-	_, intake, _, err := store.PrepareParentSelectedCreativeDispatch(ctx, dispatch)
+	stored, intake, created, err := store.PrepareParentSelectedCreativeDispatch(ctx, dispatch)
+	if err == nil || created || stored.DispatchID != "" || intake != nil {
+		t.Fatalf("revision write was not rejected: stored=%+v intake=%+v created=%v err=%v",
+			stored, intake, created, err)
+	}
+	for table, want := range map[string]int{
+		"k12_image_task_dispatches":   0,
+		"k12_creative_work_intakes":   0,
+		"k12_image_task_owner_scopes": 0,
+	} {
+		var got int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE dispatch_id=?`,
+			dispatch.DispatchID).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("revision rejection left %s rows=%d, want %d", table, got, want)
+		}
+	}
+	after, err := store.Get(ctx, work.RecordID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	concurrent := dispatch
-	concurrent.DispatchID = "dispatch-concurrent-revision"
-	concurrent.SourceRef = "revision-upload-concurrent"
-	concurrent.IdempotencyKey = "desktop:revision-upload-concurrent:g1"
-	_, concurrentIntake, _, err := store.PrepareParentSelectedCreativeDispatch(
-		ctx, concurrent,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	committed, err := store.CommitManualCreativeWorkIntake(
-		ctx, "mingming", intake.IntakeID, intake.Version,
-		k12.CreativeWorkCommitCommand{
-			CommandDigest:   "sha256:revision-commit",
-			ContentMarkdown: "家长对这版画作的修改说明",
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if committed.PromotedWorkID != work.RecordID ||
-		committed.PromotedVersionID != "v2" {
-		t.Fatalf("revision result drift: %+v", committed)
-	}
-	if _, err := store.CommitManualCreativeWorkIntake(
-		ctx, "mingming", concurrentIntake.IntakeID, concurrentIntake.Version,
-		k12.CreativeWorkCommitCommand{CommandDigest: "sha256:concurrent-revision"},
-	); !errors.Is(err, k12storage.ErrImageTaskVersionConflict) {
-		t.Fatalf("stale base accepted at commit: %v", err)
-	}
-	record, err := store.Get(ctx, work.RecordID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fields, err := k12.ParseCreativeWorkFields(record.Fields)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(fields.Versions) != 2 || fields.Versions[1].VersionID != "v2" ||
-		fields.Versions[1].ContentMarkdown != "家长对这版画作的修改说明" {
-		t.Fatalf("revision did not append exactly one version: %+v", fields.Versions)
-	}
-
-	stale := dispatch
-	stale.DispatchID = "dispatch-stale-revision"
-	stale.SourceRef = "revision-upload-stale"
-	stale.IdempotencyKey = "desktop:revision-upload-stale:g1"
-	stale.CreativeEntry = &k12.ImageTaskCreativeEntry{
-		Kind: k12.CreativeWorkEntryRevision, TaskIntent: k12.ImageTaskIntentArtwork,
-		WorkID: work.RecordID, BaseVersionID: "v1",
-	}
-	if _, _, _, err := store.PrepareParentSelectedCreativeDispatch(
-		ctx, stale,
-	); !errors.Is(err, k12storage.ErrImageTaskVersionConflict) {
-		t.Fatalf("stale revision base accepted: %v", err)
-	}
-
-	typeMismatch := dispatch
-	typeMismatch.DispatchID = "dispatch-type-mismatch"
-	typeMismatch.SourceRef = "revision-type-mismatch"
-	typeMismatch.IdempotencyKey = "desktop:revision-type-mismatch:g1"
-	typeMismatch.TaskIntent = k12.ImageTaskIntentWriting
-	typeMismatch.CreativeEntry = &k12.ImageTaskCreativeEntry{
-		Kind: k12.CreativeWorkEntryRevision, TaskIntent: k12.ImageTaskIntentWriting,
-		WorkID: work.RecordID, BaseVersionID: "v2",
-	}
-	if _, _, _, err := store.PrepareParentSelectedCreativeDispatch(
-		ctx, typeMismatch,
-	); !errors.Is(err, k12storage.ErrImageTaskVersionConflict) {
-		t.Fatalf("cross-type revision accepted: %v", err)
-	}
-
-	foreign, err := k12.NewCreativeWorkRecord("lele", "session-2", k12.CreativeWorkFields{
-		WorkType: k12.WorkTypeArt,
-		Versions: []k12.CreativeWorkVersion{{
-			VersionID:     "v1",
-			SourceAssetID: "asset://lele/" + strings.Repeat("b", 64) + ".png",
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.Put(ctx, foreign); err != nil {
-		t.Fatal(err)
-	}
-	crossOwner := dispatch
-	crossOwner.DispatchID = "dispatch-cross-owner"
-	crossOwner.SourceRef = "revision-cross-owner"
-	crossOwner.IdempotencyKey = "desktop:revision-cross-owner:g1"
-	crossOwner.CreativeEntry = &k12.ImageTaskCreativeEntry{
-		Kind: k12.CreativeWorkEntryRevision, TaskIntent: k12.ImageTaskIntentArtwork,
-		WorkID: foreign.RecordID, BaseVersionID: "v1",
-	}
-	if _, _, _, err := store.PrepareParentSelectedCreativeDispatch(
-		ctx, crossOwner,
-	); !errors.Is(err, k12storage.ErrImageTaskConflict) {
-		t.Fatalf("cross-owner revision accepted: %v", err)
-	}
-
-	current, err := store.Get(ctx, work.RecordID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pendingArchive := dispatch
-	pendingArchive.DispatchID = "dispatch-pending-archive"
-	pendingArchive.SourceRef = "revision-pending-archive"
-	pendingArchive.IdempotencyKey = "desktop:revision-pending-archive:g1"
-	pendingArchive.CreativeEntry = &k12.ImageTaskCreativeEntry{
-		Kind: k12.CreativeWorkEntryRevision, TaskIntent: k12.ImageTaskIntentArtwork,
-		WorkID: work.RecordID, BaseVersionID: "v2",
-	}
-	_, pendingArchiveIntake, _, err := store.PrepareParentSelectedCreativeDispatch(
-		ctx, pendingArchive,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.UpdateStatus(
-		ctx, work.RecordID, k12.WorkStatusArchived, nil, current.Version,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.CommitManualCreativeWorkIntake(
-		ctx, "mingming", pendingArchiveIntake.IntakeID, pendingArchiveIntake.Version,
-		k12.CreativeWorkCommitCommand{CommandDigest: "sha256:archived-after-intake"},
-	); !errors.Is(err, k12storage.ErrImageTaskInvalidState) {
-		t.Fatalf("revision commit ignored archived target: %v", err)
-	}
-	archived := dispatch
-	archived.DispatchID = "dispatch-archived"
-	archived.SourceRef = "revision-archived"
-	archived.IdempotencyKey = "desktop:revision-archived:g1"
-	archived.CreativeEntry = &k12.ImageTaskCreativeEntry{
-		Kind: k12.CreativeWorkEntryRevision, TaskIntent: k12.ImageTaskIntentArtwork,
-		WorkID: work.RecordID, BaseVersionID: "v2",
-	}
-	if _, _, _, err := store.PrepareParentSelectedCreativeDispatch(
-		ctx, archived,
-	); !errors.Is(err, k12storage.ErrImageTaskInvalidState) {
-		t.Fatalf("archived revision accepted: %v", err)
+	afterFields, err := k12.ParseCreativeWorkFields(after.Fields)
+	if err != nil || len(afterFields.Versions) != 1 ||
+		afterFields.Versions[0].VersionID != "v1" {
+		t.Fatalf("revision rejection rewrote historical work: fields=%+v err=%v", afterFields, err)
 	}
 }

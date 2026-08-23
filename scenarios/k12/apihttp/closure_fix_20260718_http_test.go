@@ -131,12 +131,7 @@ func (pdfRenderer) Render(_ context.Context, _, _ string) ([]byte, string, error
 }
 
 func TestHTTPExportFilenameFromProfile(t *testing.T) {
-	profiles := &memProfiles{m: map[string]k12.ChildProfile{
-		"mingming": {ChildName: "明明", GradeTerm: "五年级上"},
-	}}
-	h := newServerWithSolver(t, fakeSolveExec{},
-		assembly.WithProfiles(profiles),
-		assembly.WithRenderer(pdfRenderer{}))
+	h := newServer(t, k12.ChildProfile{ChildName: "明明", GradeTerm: "五年级上"})
 	req, _ := do(t, h, "GET", "/export?agent=mingming&format=pdf", "")
 	cd := req.Header().Get("Content-Disposition")
 	// §4.13 文件名：导出（单孩）= {孩子称呼}_学习档案_{学期}.{ext}。

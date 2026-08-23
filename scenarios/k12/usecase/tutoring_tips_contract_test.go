@@ -3,6 +3,7 @@ package usecase_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -64,6 +65,45 @@ func confirmedTipsFacts(version int, digest string) k12.ProblemAttemptSnapshot {
 		for i := range snapshot.Attempts {
 			snapshot.Attempts[i].InputDigest = byProblem[snapshot.Attempts[i].ProblemID]
 		}
+	}
+	return snapshot
+}
+
+func confirmedTipsSourceNumberFacts() k12.ProblemAttemptSnapshot {
+	snapshot := confirmedTipsFacts(1, "canonical")
+	sectionPath := []string{"三"}
+	sectionLabel := "三、应用题"
+	snapshot.Problems[0].SourceNumberPath = []string{"三", "1"}
+	snapshot.Problems[0].DisplayLabel = "三、1"
+	snapshot.Problems[0].SourceSectionPath = append([]string(nil), sectionPath...)
+	snapshot.Problems[0].SourceSectionLabel = sectionLabel
+	snapshot.Problems[1].SourceNumberPath = []string{"三", "3"}
+	snapshot.Problems[1].DisplayLabel = "三、3"
+	snapshot.Problems[1].SourceSectionPath = append([]string(nil), sectionPath...)
+	snapshot.Problems[1].SourceSectionLabel = sectionLabel
+	snapshot.Problems = append(snapshot.Problems, k12.Problem{
+		ProblemID: "problem-3", AgentName: "mingming", SubmissionID: "sub-1",
+		PageAssetID: "asset-1", Ordinal: 2, ProblemKind: k12.ProblemKindStandalone,
+		SourceSectionPath: sectionPath, SourceSectionLabel: sectionLabel,
+		SystemSectionOrdinal: 1, SystemDisplayLabel: "第 1 题（系统序号）",
+		Subject: "数学", StemRaw: "无印刷子题号的题目。", StemMarkdown: "无印刷子题号的题目。",
+		ConceptIDs: []string{"应用题"}, CanonicalVersion: 1, CreatedAt: 1000, UpdatedAt: 1000,
+	})
+	snapshot.Attempts = append(snapshot.Attempts, k12.Attempt{
+		AttemptID: "attempt-3", AgentName: "mingming", SubmissionID: "sub-1", ProblemID: "problem-3",
+		AnswerState: "blank", ConfirmedVersion: 1, CreatedAt: 1000, UpdatedAt: 1000,
+	})
+	questions, err := usecase.RecognizedQuestionsFromProblemAttemptSnapshot(snapshot)
+	if err != nil {
+		panic(err)
+	}
+	frozen := usecase.FreezeRecognizedQuestionInputDigests(questions, "五年级下")
+	byProblem := make(map[string]string, len(frozen))
+	for _, question := range frozen {
+		byProblem[question.ProblemID] = question.InputDigest
+	}
+	for i := range snapshot.Attempts {
+		snapshot.Attempts[i].InputDigest = byProblem[snapshot.Attempts[i].ProblemID]
 	}
 	return snapshot
 }
@@ -134,6 +174,70 @@ func TestBuildTutoringTipsUsesConfirmedServerFactsAndExactlyThreeSections(t *tes
 	for _, problemID := range []string{"problem-1", "problem-2"} {
 		if strings.Count(tips.Sections[2].Content, problemID) != 1 {
 			t.Fatalf("guidance must cover %s exactly once: %q", problemID, tips.Sections[2].Content)
+		}
+	}
+}
+
+func TestBuildTutoringTipsPreservesSourceNumbersWithoutSyntheticArrayLabels(t *testing.T) {
+	d := newDataDeps(t, "mingming")
+	if err := d.Records.PutProblemAttemptSnapshot(context.Background(), confirmedTipsSourceNumberFacts()); err != nil {
+		t.Fatal(err)
+	}
+	job := driveTipsJobToAssessing(t, d)
+	d.TutoringTipsReview = &tutoringTipsReviewSpy{}
+	d.Profiles = &memProfileStore{m: map[string]k12.ChildProfile{
+		"mingming": {ChildName: "小明", GradeTerm: "五年级下"},
+	}}
+
+	tips, err := d.BuildTutoringTips(context.Background(), "mingming", job.Record.RecordID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []struct {
+		problemID  string
+		path       []string
+		label      string
+		section    string
+		systemText string
+	}{
+		{problemID: "problem-1", path: []string{"三", "1"}, label: "三、1", section: "三、应用题"},
+		{problemID: "problem-2", path: []string{"三", "3"}, label: "三、3", section: "三、应用题"},
+		{problemID: "problem-3", section: "三、应用题", systemText: "第 1 题（系统序号）"},
+	}
+	if len(tips.Problems) != len(want) {
+		t.Fatalf("problem exact-set length=%d want %d: %+v", len(tips.Problems), len(want), tips.Problems)
+	}
+	for index, expected := range want {
+		problem := tips.Problems[index]
+		if problem.ProblemID != expected.problemID {
+			t.Fatalf("problem[%d].id=%q want %q", index, problem.ProblemID, expected.problemID)
+		}
+		if !reflect.DeepEqual(problem.SourceNumberPath, expected.path) {
+			t.Fatalf("problem[%d].source_number_path=%#v want %#v", index, problem.SourceNumberPath, expected.path)
+		}
+		if problem.DisplayLabel != expected.label {
+			t.Fatalf("problem[%d].display_label=%q want %q", index, problem.DisplayLabel, expected.label)
+		}
+		if problem.SourceSectionLabel != expected.section {
+			t.Fatalf("problem[%d].source_section_label=%q want %q", index, problem.SourceSectionLabel, expected.section)
+		}
+		if problem.SystemDisplayLabel != expected.systemText {
+			t.Fatalf("problem[%d].system_display_label=%q want %q", index, problem.SystemDisplayLabel, expected.systemText)
+		}
+	}
+	content := tips.Sections[2].Content
+	for _, expectedHeading := range []string{
+		"### 三、应用题 · 三、1 · problem-1",
+		"### 三、应用题 · 三、3 · problem-2",
+		"### 三、应用题 · 第 1 题（系统序号） · problem-3",
+	} {
+		if !strings.Contains(content, expectedHeading) {
+			t.Fatalf("per-problem guidance missing source heading %q: %q", expectedHeading, content)
+		}
+	}
+	for _, syntheticHeading := range []string{"### 第 1 题 ·", "### 第 2 题 ·", "### 第 3 题 ·"} {
+		if strings.Contains(content, syntheticHeading) {
+			t.Fatalf("per-problem guidance synthesized array heading %q: %q", syntheticHeading, content)
 		}
 	}
 }

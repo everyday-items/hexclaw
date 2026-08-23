@@ -6,9 +6,11 @@ import (
 
 	"github.com/hexagon-codes/hexagon"
 	mockllm "github.com/hexagon-codes/hexagon/testing/mock"
+	"github.com/hexagon-codes/hexclaw/api"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/storage"
 )
 
 // K12-PROJECTING-FROZEN-ROUTE-001：即使可变的路由默认值不同，页面摘要回调也会
@@ -16,26 +18,50 @@ import (
 func TestResolveK12FrozenTextCompletionRouteUsesSnapshotOverDefault(t *testing.T) {
 	defaultProvider := mockllm.NewLLMProvider("fallback")
 	frozenProvider := mockllm.NewLLMProvider("hexclaw-gpt")
+	frozenConfig := config.LLMProviderConfig{
+		ProviderInstanceID: "pvd_v1_00112233445566778899aabbccddeeff",
+		BaseURL:            "https://example.invalid/v1",
+		APIKey:             "test-key",
+		Model:              "gpt-5.6-sol",
+		Models:             []string{"gpt-5.6-sol"},
+		ModelSpecsMode:     config.LLMModelSpecsModeExplicit,
+		ModelSpecs: []config.LLMProviderModelSpec{{
+			ID: "gpt-5.6-sol", Capabilities: []string{
+				config.LLMModelCapabilityText,
+				config.LLMModelCapabilityVision,
+			},
+		}},
+	}
 	router := llmrouter.NewWithProviders(config.LLMConfig{
 		Default: "fallback",
 		Providers: map[string]config.LLMProviderConfig{
 			"fallback": {
 				Model: "fallback-model", Models: []string{"fallback-model"},
 			},
-			"hexclaw-gpt": {
-				Model: "gpt-5.6-sol", Models: []string{"gpt-5.6-sol"},
-			},
+			"hexclaw-gpt": frozenConfig,
 		},
 	}, map[string]hexagon.Provider{
 		"fallback":    defaultProvider,
 		"hexclaw-gpt": frozenProvider,
 	})
 
-	frozenCtx := k12.WithGradingModelSnapshot(context.Background(), k12.GradingModelSnapshot{
-		Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", Route: "hexclaw-gpt/gpt-5.6-sol",
-	})
+	fingerprint := api.ModelCapabilityProbeConfigFingerprint("hexclaw-gpt", frozenConfig, "gpt-5.6-sol")
+	receipts := &k12CapabilityReceiptStoreStub{receipt: &storage.ModelCapabilityProbeReceipt{
+		ProviderInstanceID: frozenConfig.ProviderInstanceID, ModelID: "gpt-5.6-sol", ProbeKind: "vision",
+		ConfigFingerprint: fingerprint, ProbePolicyVersion: api.ModelCapabilityProbePolicyVersion, Outcome: "passed",
+		TestedAt: 100, ProbeStartedAt: 99, LatencyMS: 12,
+	}}
+	frozenSnapshot, err := resolveK12GradingModelSnapshotWithCapabilityReceipt(
+		context.Background(), router, receipts, k12.GradingModelSnapshot{
+			Provider: "hexclaw-gpt", Model: "gpt-5.6-sol",
+		},
+	)
+	if err != nil {
+		t.Fatalf("resolve frozen snapshot: %v", err)
+	}
+	frozenCtx := k12.WithGradingModelSnapshot(context.Background(), frozenSnapshot)
 	provider, model, err := resolveK12FrozenTextCompletionRoute(
-		frozenCtx, router, "k12 辅导要点",
+		frozenCtx, router, receipts, "k12 辅导要点",
 	)
 	if err != nil {
 		t.Fatalf("resolve frozen route: %v", err)
@@ -45,7 +71,7 @@ func TestResolveK12FrozenTextCompletionRouteUsesSnapshotOverDefault(t *testing.T
 	}
 
 	provider, model, err = resolveK12FrozenTextCompletionRoute(
-		context.Background(), router, "k12 辅导要点",
+		context.Background(), router, receipts, "k12 辅导要点",
 	)
 	if err != nil {
 		t.Fatalf("resolve default route: %v", err)
@@ -67,7 +93,7 @@ func TestResolveK12FrozenTextCompletionRouteFailsBeforeMissingProvider(t *testin
 	ctx := k12.WithGradingModelSnapshot(context.Background(), k12.GradingModelSnapshot{
 		Provider: "missing", Model: "gpt-5.6-sol", Route: "missing/gpt-5.6-sol",
 	})
-	if _, _, err := resolveK12FrozenTextCompletionRoute(ctx, router, "k12 辅导要点"); err == nil {
+	if _, _, err := resolveK12FrozenTextCompletionRoute(ctx, router, nil, "k12 辅导要点"); err == nil {
 		t.Fatal("missing frozen provider must fail closed before any default fallback")
 	}
 }

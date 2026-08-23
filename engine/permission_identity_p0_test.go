@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -84,6 +85,53 @@ func TestPermissionIdentityP0_RequestWithoutAuthenticatedOwnerFailsClosed(t *tes
 	})
 	if err == nil || approved {
 		t.Fatalf("ownerless approval request approved=%v err=%v, want fail-closed error", approved, err)
+	}
+}
+
+// REG-TOOL-APPROVAL-LIFECYCLE-OWNER-NA：审批 owner 是认证用户，不能把 routed Agent
+// 的注销误当成 owner delete。当前产品没有用户删除操作，因此不接 Agent 注销生命周期。
+func TestToolApprovalOwnerIsAuthenticatedPrincipalNotRoutedAgent(t *testing.T) {
+	hub := NewPermissionHub(time.Second)
+	sender := &permissionIdentitySender{request: make(chan *PermissionRequest, 1)}
+	hub.SetSender(sender)
+	ctx, cancel := context.WithCancel(skill.WithRoutedAgent(
+		skill.WithAuthenticatedUser(context.Background(), "desktop-owner"),
+		"routed-agent",
+	))
+	defer cancel()
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := hub.RequestApproval(ctx, "session-owner-boundary", &PermissionRequest{
+			ID: "approval-owner-boundary", ToolName: "code_exec", Arguments: map[string]any{"code": "1+1"},
+		})
+		result <- err
+	}()
+
+	req := <-sender.request
+	if req.OwnerID != "desktop-owner" {
+		t.Fatalf("approval owner = %q, want authenticated principal desktop-owner", req.OwnerID)
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel pending approval error = %v, want context.Canceled", err)
+	}
+}
+
+// REG-TOOL-APPROVAL-LIFECYCLE-DISABLE-NA：当前 DisableForSession 只是进程内
+// session policy override，不是产品级工具禁用或 durable grant 撤销操作。
+func TestToolDisableForSessionIsTransientPolicyOnly(t *testing.T) {
+	perms := NewToolPermissions(nil, nil)
+	perms.DisableForSession("session-disabled", "code_exec")
+	if err := perms.Check("code_exec", "session-disabled"); err == nil {
+		t.Fatal("disabled session unexpectedly retained tool permission")
+	}
+	if err := perms.Check("code_exec", "other-session"); err != nil {
+		t.Fatalf("session-local disable leaked to another session: %v", err)
+	}
+	perms.ClearSession("session-disabled")
+	if err := perms.Check("code_exec", "session-disabled"); err != nil {
+		t.Fatalf("cleared transient disable remained active: %v", err)
 	}
 }
 

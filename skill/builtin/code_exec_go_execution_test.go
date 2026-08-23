@@ -200,11 +200,10 @@ func TestCodeExecGoCommandPolicyAcceptsOnlyRunAndTest(t *testing.T) {
 		},
 		{
 			name:        "test packages with translated flags",
-			command:     []string{"env", "LANG=C", "go", "test", "./...", "-run", "TestValue", "-count=2", "-v"},
+			command:     []string{"go", "test", "./...", "-run", "TestValue", "-count=2", "-v"},
 			kind:        codeExecGoCommandTest,
 			targets:     []string{"./..."},
 			testArgs:    []string{"-test.run=TestValue", "-test.count=2", "-test.v=true"},
-			environment: map[string]string{"LANG": "C"},
 		},
 	}
 
@@ -278,7 +277,7 @@ func TestCodeExecExecutionPlanBindsParsedGoCommand(t *testing.T) {
 			Binary: filepath.Join(t.TempDir(), "go"),
 			GOROOT: t.TempDir(),
 		},
-	}, []string{"env", "LANG=C", "go", "test", "./...", "-run", "TestValue"})
+	}, []string{"go", "test", "./...", "-run", "TestValue"})
 	if err != nil {
 		t.Fatalf("bindCodeExecExecutionPlanCommand returned error: %v", err)
 	}

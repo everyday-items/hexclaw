@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/engine"
 )
 
@@ -106,6 +107,26 @@ func TestHandleToolPermissions_EmptyRules(t *testing.T) {
 	// This could be a bug if the frontend expects an array
 	if rules == nil {
 		t.Log("BUG FOUND: 'rules' is null when both allow and deny are empty. Frontend may expect [].")
+	}
+}
+
+// REG-TOOL-APPROVAL-LIFECYCLE-MUTATION-NA：当前产品只公开读取工具权限，
+// 不存在显式 revoke 或 tool-disable 的 HTTP mutation；不得为生命周期门禁发明入口。
+func TestToolPermissionLifecycleMutationsAreNotPublicOperations(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	srv := NewServer(config.DefaultConfig(), nil, nil, nil)
+	srv.SetToolPermissions(engine.NewToolPermissions([]string{"search"}, []string{"code_exec"}))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tools/permissions", nil)
+	req.RemoteAddr = "127.0.0.1:18080"
+	rec := httptest.NewRecorder()
+	srv.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST tool permissions status = %d, want 405 read-only boundary", rec.Code)
+	}
+	if got := rec.Header().Get("Allow"); got != "GET, HEAD" {
+		t.Fatalf("POST tool permissions Allow = %q, want GET, HEAD", got)
 	}
 }
 

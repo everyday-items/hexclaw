@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/hexagon-codes/hexclaw/config"
 )
@@ -23,13 +24,37 @@ func invokeOllamaDeleteForAtomicityTest(t *testing.T, s *Server, model string) *
 }
 
 func TestBUG20260728_015_OllamaUnloadRejectsUpstreamNon2xxBeforeAnyDelete(t *testing.T) {
-	for _, upstreamStatus := range []int{http.StatusConflict, http.StatusServiceUnavailable} {
-		t.Run(http.StatusText(upstreamStatus), func(t *testing.T) {
+	tests := []struct {
+		name        string
+		upstreamCode int
+		disconnect  bool
+		timeout     bool
+		wantSuccess bool
+	}{
+		{name: "success", upstreamCode: http.StatusOK, wantSuccess: true},
+		{name: http.StatusText(http.StatusConflict), upstreamCode: http.StatusConflict},
+		{name: http.StatusText(http.StatusServiceUnavailable), upstreamCode: http.StatusServiceUnavailable},
+		{name: "disconnect", disconnect: true},
+		{name: "timeout", timeout: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			var deleteCalls atomic.Int64
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.Method == http.MethodPost && r.URL.Path == "/api/generate":
-					http.Error(w, "unload rejected", upstreamStatus)
+					if tt.disconnect {
+						panic(http.ErrAbortHandler)
+					}
+					if tt.timeout {
+						time.Sleep(11 * time.Second)
+						return
+					}
+					if tt.wantSuccess {
+						w.WriteHeader(http.StatusOK)
+						return
+					}
+					http.Error(w, "unload rejected", tt.upstreamCode)
 				case r.Method == http.MethodDelete && r.URL.Path == "/api/delete":
 					deleteCalls.Add(1)
 					w.WriteHeader(http.StatusOK)
@@ -49,16 +74,19 @@ func TestBUG20260728_015_OllamaUnloadRejectsUpstreamNon2xxBeforeAnyDelete(t *tes
 			)
 			s.handleOllamaUnload(w, req)
 
-			if w.Code < http.StatusBadRequest {
+			if tt.wantSuccess && (w.Code < http.StatusOK || w.Code >= http.StatusMultipleChoices) {
+				t.Fatalf("sidecar status=%d body=%s, want 2xx after Ollama unload success", w.Code, w.Body.String())
+			}
+			if !tt.wantSuccess && w.Code < http.StatusBadRequest {
 				t.Fatalf(
-					"sidecar status=%d body=%s, want non-2xx when Ollama unload returns %d",
+					"sidecar status=%d body=%s, want non-2xx when Ollama unload fails (%s)",
 					w.Code,
 					w.Body.String(),
-					upstreamStatus,
+					tt.name,
 				)
 			}
 			if got := deleteCalls.Load(); got != 0 {
-				t.Fatalf("Ollama /api/delete calls=%d, want 0 after failed unload", got)
+				t.Fatalf("Ollama /api/delete calls=%d, want 0 after unload result %s", got, tt.name)
 			}
 		})
 	}

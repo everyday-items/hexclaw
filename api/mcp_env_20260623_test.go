@@ -21,6 +21,17 @@ func TestAddMCPServerRequest_ParsesEnv(t *testing.T) {
 	}
 }
 
+func TestAddMCPServerRequest_ParsesSecretMutations(t *testing.T) {
+	body := `{"name":"postgres","command":"npx","args":["-y","server-postgres","postgresql://user@localhost/db"],"secret_args":[{"index":2,"mode":"preserve","credential_ref":"sidecar-connection:v1:connection-1:password"}]}`
+	var req addMCPServerRequest
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(req.SecretArgs) != 1 || req.SecretArgs[0].Mode != "preserve" || req.SecretArgs[0].Index != 2 {
+		t.Fatalf("secret mutation 未解析进请求: %#v", req.SecretArgs)
+	}
+}
+
 // ServerConfig 必须有 Env 字段且 connectServer 用它（编译期 + 字段存在性钉死）。
 func TestServerConfig_CarriesEnv(t *testing.T) {
 	cfg := hexmcp.ServerConfig{

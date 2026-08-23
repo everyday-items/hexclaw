@@ -3,11 +3,13 @@ package usecase_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
 type writingOCRResult struct {
@@ -244,17 +246,20 @@ func TestGenerateWritingFeedbackRejectsPhotoVersionWithoutConfirmedOCREvidence(t
 	}
 }
 
-func TestWritingPhotoRevisionAlsoRequiresConfirmedOCRSnapshot(t *testing.T) {
+func TestWritingPhotoRevisionEndpointsFailClosedWithoutVersionWrites(t *testing.T) {
 	d := newDataDeps(t)
 	ctx := context.Background()
 	workID := newWritingWork(t, d, "xiaoming")
-	generateCreativeWorkFeedbackForTest(t, &d, workID, "原稿切题；建议修改一处细节。")
+	before, err := d.GetCreativeWork(ctx, "xiaoming", workID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	assetID := creativeWorkOCRAsset(t, "xiaoming")
-	if _, err := d.SubmitRevision(ctx, "xiaoming", workID, "修改稿", assetID); err == nil {
-		t.Fatal("writing photo revision must not bypass OCR confirmation")
+	if _, err := d.SubmitRevision(ctx, "xiaoming", workID, "修改稿", assetID); !errors.Is(err, usecase.ErrInvalidInput) {
+		t.Fatalf("current revision endpoint must fail closed, err=%v", err)
 	}
 	d.CreativeWorkOCR = &fakeWritingOCR{results: []writingOCRResult{{raw: "修改稿 OCR 原文"}}}
-	job, err := d.CreateCreativeWorkOCR(ctx, "xiaoming", assetID, "revision-ocr")
+	job, err := d.CreateCreativeWorkOCR(ctx, "xiaoming", assetID, "independent-ocr")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,18 +267,21 @@ func TestWritingPhotoRevisionAlsoRequiresConfirmedOCRSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := d.SubmitRevisionWithOCR(ctx, "xiaoming", workID, k12.CreativeWorkVersion{
+	_, err = d.SubmitRevisionWithOCR(ctx, "xiaoming", workID, k12.CreativeWorkVersion{
 		SourceAssetID:      assetID,
 		ContentMarkdown:    confirmed.ConfirmedContent,
 		OCRJobID:           confirmed.JobID,
 		OCRVersion:         confirmed.ConfirmedVersion,
 		OCRConfirmedDigest: confirmed.ConfirmedDigest,
 	})
+	if !errors.Is(err, usecase.ErrInvalidInput) {
+		t.Fatalf("current OCR revision endpoint must fail closed, err=%v", err)
+	}
+	after, err := d.GetCreativeWork(ctx, "xiaoming", workID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	last := view.Fields.Versions[len(view.Fields.Versions)-1]
-	if last.OCRRaw != "修改稿 OCR 原文" || last.ContentMarkdown != "家长修正后的修改稿" {
-		t.Fatalf("revision snapshot not persisted: %#v", last)
+	if !reflect.DeepEqual(after.Fields.Versions, before.Fields.Versions) {
+		t.Fatalf("rejected revision endpoints must not write vN: before=%#v after=%#v", before.Fields.Versions, after.Fields.Versions)
 	}
 }

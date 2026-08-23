@@ -79,3 +79,28 @@ func TestBug20260712_KBGate_TinyChitchatSkipsRetrieval(t *testing.T) {
 		t.Fatal("正常短问题（≥4 rune）应照常检索")
 	}
 }
+
+func TestBug20260728_KBGate_ExplicitNoRetrievalSkipsEmbeddingWithoutKillingExplicitSearch(t *testing.T) {
+	e := gateEngine(t)
+	for _, q := range []string{
+		"不用检索知识库，只把下面这句话改写得更自然",
+		"不查询、不检索、不引用知识资料，直接回答一句问候",
+		"请只回答“今天也要轻松一点”，不要解释，也不要查询或引用任何资料。",
+		"Please reply directly without searching the knowledge base.",
+	} {
+		if e.shouldAutoInjectKB(gateMsg(q, nil)) {
+			t.Errorf("明确拒绝知识检索的请求仍触发自动注入: %q", q)
+		}
+	}
+
+	for _, q := range []string{
+		"不要猜，请查询知识库",
+		"不要凭空回答，请根据文档说明",
+		"如何关闭知识库检索功能？",
+		"公司年假制度是怎么规定的",
+	} {
+		if !e.shouldAutoInjectKB(gateMsg(q, nil)) {
+			t.Errorf("有效知识检索请求被否定词误杀: %q", q)
+		}
+	}
+}

@@ -174,6 +174,9 @@ func TestBUG_20260802_022_ProblemSourceActionRawWireIsFrozenExactAndReplayStable
 					replay.Body.Bytes(),
 				)
 			}
+			if test.name == "skip" {
+				writeK12ImageTaskWireFixture(t, "source-action.json", first.Body.Bytes())
+			}
 
 			var response map[string]any
 			if err := json.Unmarshal(first.Body.Bytes(), &response); err != nil {

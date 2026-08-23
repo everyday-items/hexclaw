@@ -30,6 +30,16 @@ func TestPublicMessage_ToleratesNumericCode(t *testing.T) {
 	}
 }
 
+func TestPublicMessage_StripsMalformedProviderBody(t *testing.T) {
+	got := PublicMessage(
+		errors.New(`openai api error: 429 Too Many Requests, body: {"error":"private-upstream-payload"`),
+		"Provider connection test failed",
+	)
+	if got != "openai api error: 429 Too Many Requests" {
+		t.Fatalf("expected public prefix without raw body")
+	}
+}
+
 func TestPublicMessage_PreservesNonProviderErrors(t *testing.T) {
 	err := errors.New("context deadline exceeded")
 

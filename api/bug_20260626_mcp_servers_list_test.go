@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"slices"
 	"strings"
 	"testing"
 
@@ -37,7 +36,15 @@ func TestBug20260626_ListMCPServers_IncludesColdInstalled(t *testing.T) {
 		t.Fatalf("AddServerBestEffort: %v", err)
 	}
 
-	srv := NewServer(config.DefaultConfig(), &mockEngine{reply: &adapter.Reply{Content: "ok"}}, nil, nil)
+	cfg := config.DefaultConfig()
+	cfg.MCP.Servers = []config.MCPServerConfig{{
+		Name:      "mysql",
+		Transport: "stdio",
+		Command:   "npx",
+		Args:      []string{"-y", "@benborla29/mcp-server-mysql"},
+		Enabled:   true,
+	}}
+	srv := NewServer(cfg, &mockEngine{reply: &adapter.Reply{Content: "ok"}}, nil, nil)
 	srv.mcpMgr = mgr
 
 	// ① GET /api/v1/mcp/servers → 列表必须含 mysql
@@ -48,13 +55,27 @@ func TestBug20260626_ListMCPServers_IncludesColdInstalled(t *testing.T) {
 		t.Fatalf("list status=%d body=%s", w.Code, w.Body.String())
 	}
 	var listResp struct {
-		Servers []string `json:"servers"`
-		Total   int      `json:"total"`
+		Servers []struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Transport   string `json:"transport"`
+			ToolCount   int    `json:"tool_count"`
+		} `json:"servers"`
+		Total int `json:"total"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &listResp); err != nil {
 		t.Fatalf("decode list: %v", err)
 	}
-	if !slices.Contains(listResp.Servers, "mysql") {
+	var mysqlSeen bool
+	for _, server := range listResp.Servers {
+		if server.Name == "mysql" {
+			mysqlSeen = true
+			if server.Description == "" || server.Transport == "unknown" {
+				t.Errorf("mysql projection must include description and transport, got=%+v", server)
+			}
+		}
+	}
+	if !mysqlSeen {
 		t.Fatalf("[BUG-20260626] GET /mcp/servers 必须含已安装的 mysql（冷装未连也要在列表），got=%v", listResp.Servers)
 	}
 
