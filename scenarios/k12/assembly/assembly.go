@@ -146,6 +146,15 @@ func WithParentTeachingGuideGenerator(fn engineadapter.ParentTeachingGuideGenera
 	}
 }
 
+// WithParentTeachingSkillLoader 让逐题家长讲法消费建档锁定的教学 Skill 正文。
+func WithParentTeachingSkillLoader(fn engineadapter.SkillContentLoader) Option {
+	return func(d *usecase.Deps) {
+		if sa, ok := d.Solver.(*engineadapter.SolveAdapter); ok && fn != nil {
+			sa.SetParentTeachingSkillLoader(fn)
+		}
+	}
+}
+
 // WithWorkFeedbackGenerator 注入作品证据化点评生成闭包（PRD §3.10 / INV-011）：
 // 写作好句摘出+一处具体建议、美术观察描述式，单次 reasoning，不走验算链。
 func WithWorkFeedbackGenerator(fn engineadapter.WorkFeedbackGenerateFunc) Option {

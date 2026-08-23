@@ -16,6 +16,7 @@ import (
 )
 
 type k12VisionRequestCaptureProvider struct {
+	name              string
 	request           llm.CompletionRequest
 	operationSafety   llm.OperationSafety
 	headerBudget      time.Duration
@@ -26,7 +27,12 @@ type k12VisionRequestCaptureProvider struct {
 	calls             int
 }
 
-func (p *k12VisionRequestCaptureProvider) Name() string { return "capture" }
+func (p *k12VisionRequestCaptureProvider) Name() string {
+	if p.name != "" {
+		return p.name
+	}
+	return "capture"
+}
 
 func (p *k12VisionRequestCaptureProvider) Complete(
 	ctx context.Context,
@@ -154,6 +160,20 @@ func TestBUG20260808K12VisionRequestBuilderPreservesTheProductionWireContract(t 
 	))
 	if err != nil || !reflect.DeepEqual(decoded, image) {
 		t.Fatalf("image payload mismatch: err=%v", err)
+	}
+}
+
+func TestK12VisionLogIdentitySeparatesFrozenRouteFromCompatibleAdapterName(t *testing.T) {
+	ctx := k12.WithGradingModelSnapshot(context.Background(), k12.GradingModelSnapshot{
+		Provider: "hexclaw-gpt",
+		Model:    "gpt-5.6-sol",
+	})
+	routeProvider, adapterProvider := k12ProviderLogIdentity(
+		ctx,
+		&k12VisionRequestCaptureProvider{name: "openai"},
+	)
+	if routeProvider != "hexclaw-gpt" || adapterProvider != "openai" {
+		t.Fatalf("log identity route=%q adapter=%q", routeProvider, adapterProvider)
 	}
 }
 

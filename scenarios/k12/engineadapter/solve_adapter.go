@@ -49,7 +49,10 @@ type SolveAdapter struct {
 	causeSummaryGen        CauseSummaryGenerateFunc       // 轻量错因摘要；nil 时留空由用户填写
 	tutoringTipsReviewGen  TutoringTipsReviewGenerateFunc // nil means an honest static degradation
 	parentTeachingGuideGen ParentTeachingGuideGenerateFunc
-	workFeedbackGen        WorkFeedbackGenerateFunc // 作品点评生成（work_feedback.go）；nil 时诚实报错
+	// parentTeachingSkillLoader 读取建档锁定的教学方法 Skill；盘上版本不可用时由
+	// parent_teaching_guide.go 降级到同版本内嵌快照。
+	parentTeachingSkillLoader SkillContentLoader
+	workFeedbackGen           WorkFeedbackGenerateFunc // 作品点评生成（work_feedback.go）；nil 时诚实报错
 	// workFeedbackVision 美术作品观察式点评的视觉闭包（work_feedback.go）：复用识题链的
 	// VisionFunc 原语（原图 bytes + 提示词 → 视觉模型文本）；nil 时美术点评诚实报错。
 	workFeedbackVision VisionFunc

@@ -93,6 +93,20 @@ func k12ProviderInstanceID(router *llmrouter.Selector, providerName string) (str
 	return config.EffectiveProviderInstanceID(providerName, providerConfig), nil
 }
 
+// k12ProviderLogIdentity 分开记录路由注册名与底层兼容适配器名，避免把
+// hexclaw-gpt 使用 OpenAI-compatible adapter 误读成跨 Provider 路由。
+func k12ProviderLogIdentity(ctx context.Context, provider llm.Provider) (routeProvider, adapterProvider string) {
+	if provider == nil {
+		return "", ""
+	}
+	adapterProvider = provider.Name()
+	routeProvider = adapterProvider
+	if snapshot, pinned := k12.GradingModelSnapshotFromContext(ctx); pinned {
+		routeProvider = snapshot.Provider
+	}
+	return routeProvider, adapterProvider
+}
+
 // resolveK12FrozenTextCompletionRoute 是 K12 文本回调的数据平面唯一解析器，
 // 这些回调可能从已确认的 GradingJob 中运行。冻结的 Job 路由具有权威性；
 // 只有不带该上下文的调用方才保留原有的配置默认行为。

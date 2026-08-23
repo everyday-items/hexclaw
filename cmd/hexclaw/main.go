@@ -1981,14 +1981,18 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 					return "", rErr
 				}
 			}
-			// 排查用：打印识题实际选中的 provider/model + egress 用途，一眼定位路由/出网问题。
-			logger.Info("[k12识题] 视觉模型已路由", "provider", provider.Name(), "model", visionModel,
+			// 路由注册名与兼容适配器名必须分开记录，避免把 hexclaw-gpt 的
+			// OpenAI-compatible adapter 误读成跨 Provider 路由。
+			routeProvider, adapterProvider := k12ProviderLogIdentity(ctx, provider)
+			logger.Info("[k12识题] 视觉模型已路由", "route_provider", routeProvider,
+				"adapter_provider", adapterProvider, "model", visionModel,
 				"image_bytes", len(image), "egress", "vision_ocr[sensitive_media]")
 			// 不设 MaxTokens：各家视觉模型上限差异大（glm-4v-flash 硬顶 1024，设 4096 即 400），
 			// 任何硬编码都会在某家翻车/截断；取消与 deadline 统一由入口请求负责。
 			content, cErr := completeK12VisionRequest(ctx, provider, visionModel, image, prompt)
 			if cErr != nil {
-				logger.Warn("[k12识题] 视觉模型调用失败", "provider", provider.Name(), "model", visionModel, "err", cErr.Error())
+				logger.Warn("[k12识题] 视觉模型调用失败", "route_provider", routeProvider,
+					"adapter_provider", adapterProvider, "model", visionModel, "err", cErr.Error())
 				if errors.Is(cErr, llmrouter.ErrModelCapabilityMismatch) {
 					return "", fmt.Errorf("%w: %v", k12usecase.ErrInvalidInput, cErr)
 				}
@@ -2315,6 +2319,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 			k12assembly.WithCauseSummaryGenerator(causeSummaryGenFn),
 			k12assembly.WithTutoringTipsReviewGenerator(tutoringTipsReviewGenFn),
 			k12assembly.WithParentTeachingGuideGenerator(parentTeachingGuideGenFn),
+			k12assembly.WithParentTeachingSkillLoader(k12SkillLoaderFn),
 			k12assembly.WithWorkFeedbackGenerator(workFeedbackGenFn),
 			k12assembly.WithWorkFeedbackVision(workFeedbackVisionFn),
 			k12assembly.WithWorkFeedbackSkillLoader(k12SkillLoaderFn),
