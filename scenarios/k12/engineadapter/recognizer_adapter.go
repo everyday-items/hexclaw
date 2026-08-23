@@ -178,6 +178,9 @@ const recognizePrompt = `识别这张作业图片里的所有题目，并逐题�
 - source_number_path 必须逐层保留原卷实际可见题号字符，例如大题“三”下第“1”题输出 ["三","1"]；display_label 必须按原卷层级输出“三、1”。原卷没有题号时两者分别输出 [] 和 ""，禁止按识别顺序自造连续题号。不得让两个独立作答小题复用同一个非空 source_number_path，也不得让两个独立作答小题复用同一个非空 display_label；无法辨认子题号时不得编造。
 - problem_id 只是在本次 JSON 内供 parent_problem_id 引用的临时标签，不是持久 ID；不要输出 attempt_id、input_digest、confirmed_version 等系统字段。
 - 复合题公共材料只输出一次 problem_kind=compound_parent（不得带孩子作答）；每个小题输出 problem_kind=subproblem、parent_problem_id 精确指向本次 JSON 内父题的 problem_id、subproblem_no 为稳定小题号。普通题用 standalone。
+- problem_kind=standalone 时 parent_problem_id 与 subproblem_no 必须同时是空字符串。
+- problem_kind=compound_parent 时 parent_problem_id 与 subproblem_no 必须同时是空字符串，answer_state 必须是 blank 且 student_answer 必须为空字符串。
+- problem_kind=subproblem 时 parent_problem_id 与 subproblem_no 必须同时非空，parent_problem_id 必须精确引用本次 JSON 内唯一对应的 compound_parent。
 - question/student_answer 必须逐字保留视觉原始转写；canonical_markdown/answer_canonical_markdown 独立输出可渲染 Markdown/LaTeX，不得用规范形覆盖原始转写。
 - recognition_confidence 是 0~1 置信度；ocr_signals 只可使用 fraction/decimal_point/negative_sign/unit/erasure/unclear_handwriting。高置信度也必须如实输出格式信号。
 - subject 逐题判定题目学科，只能取以下之一：数学 / 语文 / 英语 / 物理 / 化学；确实判不出学科时才留空字符串 ""。
@@ -203,6 +206,9 @@ Rules:
 - Preserve the exact visible source-number characters at every level. For example, question “1” under section “三” uses ["三","1"] and “三、1”. Without printed numbering, use [] and "". Two independent questions must not share the same non-empty source_number_path or display_label. Never invent an unreadable subquestion number.
 - problem_id is only a temporary label for parent_problem_id references within this JSON. Do not output system fields such as attempt_id, input_digest, or confirmed_version.
 - Emit shared material for a compound question once as problem_kind=compound_parent, without a student answer. Emit every independently answerable child as problem_kind=subproblem; parent_problem_id must exactly reference the parent problem_id in this JSON, and subproblem_no must be stable. Use standalone for ordinary questions.
+- For problem_kind=standalone, parent_problem_id and subproblem_no must both be empty strings.
+- For problem_kind=compound_parent, parent_problem_id and subproblem_no must both be empty strings, answer_state must be blank, and student_answer must be an empty string.
+- For problem_kind=subproblem, parent_problem_id and subproblem_no must both be non-empty, and parent_problem_id must exactly reference the one corresponding compound_parent in this JSON.
 - Preserve question and student_answer as verbatim visual transcriptions. Emit canonical_markdown and answer_canonical_markdown separately as renderable normalized forms; never overwrite the source transcription with a normalized form.
 - recognition_confidence is between 0 and 1. ocr_signals may contain only fraction, decimal_point, negative_sign, unit, erasure, or unclear_handwriting. Report formatting signals honestly even at high confidence.
 - Determine subject per question. It must be exactly one of 数学, 语文, 英语, 物理, 化学, or an empty string only when the subject truly cannot be determined.
@@ -215,10 +221,15 @@ Rules:
 const wholePageSelfInventoryPrompt = wholePageRecognitionPrompt + `
 
 This is whole-page recognition. The following whole-page completeness protocol takes precedence over the general top-level JSON-array format above:
-- Output exactly one JSON object with only the questions and printed_inventory fields: {"questions":[...],"printed_inventory":[...]}.
-- questions contains every item with answer facts, using the complete field protocol above for each item.
+- Output exactly one JSON object with only the printed_inventory and questions fields: {"printed_inventory":[...],"questions":[...]}.
+- First complete printed_inventory as the single source of printed-question identity before composing questions.
 - printed_inventory independently reviews every printed question on the same page from top to bottom and left to right within each row. Each item must contain exactly source_number_path, display_label, and question, for example {"source_number_path":[],"display_label":"","question":"4÷0.5="}. Never omit a field, even when empty.
 - printed_inventory reviews only the printed question text and visible source numbering. Without visible numbering, output [] / "". When numbering exists, the path and display label must appear together. Do not repeat source_section_path, source_section_label, subject, or knowledge_points, and do not include student_answer, answer_state, answer_canonical_markdown, bbox, or any system-generated sequence field.
+- Then build questions in the same order. For each corresponding item, copy source_number_path, display_label, and question character for character from printed_inventory. Do not transcribe the printed question a second time. Only add answer, subject, and knowledge facts using the complete field protocol above.
+- questions contains every item with answer facts and must preserve the complete coverage of printed_inventory.
+- Before returning JSON, compare every corresponding identity field byte for byte and correct questions from printed_inventory when any character differs. For example, if printed_inventory contains "question":"8的1/4的4/5是多少？", questions must contain exactly "question":"8的1/4的4/5是多少？"; never rewrite it as Chinese fraction words or another equivalent expression.
+- Before returning JSON, verify every problem_kind against these exact parent, subproblem, and answer-field combinations. Never clear an invalid field merely to make the response pass validation.
+- Ignore worksheet metadata fields such as title, date, name, and time, along with page labels, QR codes, decoration, section headings, and instructions such as "把下面每题的得数化简" or "计算下面各题，能简算的要简算". Their labels, blanks, and instruction text are not questions and must not appear in either array.
 - The two arrays must correspond item by item and provide complete coverage. List every horizontal arithmetic, fill-in-the-blank, and multiple-choice item separately. Do not substitute section headings for questions, omit or invent questions, or merge multiple questions.
 - The question field in printed_inventory copies only the printed question text and must not read or infer the student's answer.`
 
@@ -1933,6 +1944,9 @@ func parseRecognizedQuestions(raw string) ([]usecase.RecognizedQuestion, error) 
 			k12.ErrRecognitionProtocolInvalid,
 		)
 	}
+	if err := validateRawRecognizedProblemStructure(dtos); err != nil {
+		return nil, err
+	}
 	out := make([]usecase.RecognizedQuestion, 0, len(dtos))
 	for index, d := range dtos {
 		rawQuestion := d.Question
@@ -1974,6 +1988,46 @@ func parseRecognizedQuestions(raw string) ([]usecase.RecognizedQuestion, error) 
 	return mergeRecognizedQuestions(nil, out), nil
 }
 
+// validateRawRecognizedProblemStructure 在答案规范化前检查模型原始父子字段，
+// 防止 blank 等规范化规则把非法作答静默清空后绕过领域结构门。
+func validateRawRecognizedProblemStructure(dtos []recognizedDTO) error {
+	for index, dto := range dtos {
+		kind := usecase.ProblemKind(strings.ToLower(strings.TrimSpace(dto.ProblemKind)))
+		parentID := strings.TrimSpace(dto.ParentProblemID)
+		subproblemNo := strings.TrimSpace(dto.SubproblemNo)
+		switch kind {
+		case usecase.ProblemKindStandalone:
+			if parentID != "" || subproblemNo != "" {
+				return fmt.Errorf(
+					"%w: recognizer: result item %d has invalid standalone parent fields",
+					k12.ErrRecognitionProtocolInvalid,
+					index+1,
+				)
+			}
+		case usecase.ProblemKindCompoundParent:
+			rawState := strings.ToLower(strings.TrimSpace(dto.AnswerState))
+			if parentID != "" || subproblemNo != "" ||
+				strings.TrimSpace(dto.StudentAnswer) != "" ||
+				(rawState != "" && rawState != string(usecase.AnswerStateBlank)) {
+				return fmt.Errorf(
+					"%w: recognizer: result item %d has invalid compound parent fields",
+					k12.ErrRecognitionProtocolInvalid,
+					index+1,
+				)
+			}
+		case usecase.ProblemKindSubproblem:
+			if parentID == "" || subproblemNo == "" {
+				return fmt.Errorf(
+					"%w: recognizer: result item %d has incomplete subproblem fields",
+					k12.ErrRecognitionProtocolInvalid,
+					index+1,
+				)
+			}
+		}
+	}
+	return nil
+}
+
 // parseWholePageSelfInventory 仅在密集页面信封中两份独立生成的清单描述同一印刷题集合时
 // 接受结果。信封不匹配会被明确视为识题协议失败，使 Recognize 可以使用已授权的有界回退。
 func parseWholePageSelfInventory(raw string) ([]usecase.RecognizedQuestion, error) {
@@ -2011,6 +2065,7 @@ func parseWholePageSelfInventory(raw string) ([]usecase.RecognizedQuestion, erro
 	if err := validateWholePagePrintedInventoryFields(inventoryRaw); err != nil {
 		return nil, err
 	}
+	rawIdentitiesExact := wholePageRawIdentitiesExact(questionEntries, inventoryEntries)
 
 	questions, err := parseRecognizedQuestions(string(questionsRaw))
 	if err != nil {
@@ -2028,14 +2083,61 @@ func parseWholePageSelfInventory(raw string) ([]usecase.RecognizedQuestion, erro
 			k12.ErrRecognitionProtocolInvalid,
 		)
 	}
-	questions, err = reconcileWholePageSelfInventory(questions, inventory)
-	if err != nil {
-		return nil, err
+	if rawIdentitiesExact {
+		questions = bindWholePageExactPrintedIdentities(questions, inventory)
+	} else {
+		questions, err = reconcileWholePageSelfInventory(questions, inventory)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := validateRecognitionProtocolResult(questions); err != nil {
 		return nil, err
 	}
 	return questions, nil
+}
+
+type wholePageRawIdentity struct {
+	SourceNumberPath []string `json:"source_number_path"`
+	DisplayLabel     string   `json:"display_label"`
+	Question         string   `json:"question"`
+}
+
+// wholePageRawIdentitiesExact 在 canonical Markdown 投影前核对模型实际返回的原题身份。
+// canonical 只负责展示，不能把已经逐字一致的 question 改成另一道题后再触发分片回退。
+func wholePageRawIdentitiesExact(
+	questions,
+	inventory []json.RawMessage,
+) bool {
+	if len(questions) != len(inventory) || len(questions) == 0 {
+		return false
+	}
+	for index := range questions {
+		var observed, printed wholePageRawIdentity
+		if json.Unmarshal(questions[index], &observed) != nil ||
+			json.Unmarshal(inventory[index], &printed) != nil ||
+			!slices.Equal(observed.SourceNumberPath, printed.SourceNumberPath) ||
+			observed.DisplayLabel != printed.DisplayLabel ||
+			observed.Question != printed.Question {
+			return false
+		}
+	}
+	return true
+}
+
+func bindWholePageExactPrintedIdentities(
+	questions,
+	inventory []usecase.RecognizedQuestion,
+) []usecase.RecognizedQuestion {
+	out := append([]usecase.RecognizedQuestion(nil), questions...)
+	for index := range out {
+		printed := usecase.NormalizeRecognizedQuestion(inventory[index])
+		out[index].Question = printed.Question
+		out[index].RawTranscription = printed.RawTranscription
+		out[index].CanonicalMarkdown = printed.CanonicalMarkdown
+		out[index] = usecase.NormalizeRecognizedQuestion(out[index])
+	}
+	return out
 }
 
 func decodeJSONNonNilArray(raw json.RawMessage) ([]json.RawMessage, bool) {

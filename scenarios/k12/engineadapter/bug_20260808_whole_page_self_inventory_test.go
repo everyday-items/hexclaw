@@ -25,6 +25,184 @@ func TestBUG20260808_DenseWholePagePromptFreezesCompactPrintedInventory(t *testi
 	}
 }
 
+func TestREGBUGK12DenseV1Complete_PromptUsesPrintedInventoryAsSingleQuestionSource(t *testing.T) {
+	required := []string{
+		"First complete printed_inventory as the single source of printed-question identity",
+		"copy source_number_path, display_label, and question character for character",
+		"Do not transcribe the printed question a second time",
+		"Only add answer, subject, and knowledge facts",
+		"Before returning JSON, compare every corresponding identity field byte for byte",
+		`"question":"8的1/4的4/5是多少？"`,
+		"Ignore worksheet metadata fields such as title, date, name, and time",
+		`instructions such as "把下面每题的得数化简"`,
+		"instruction text are not questions and must not appear in either array",
+	}
+	for _, invariant := range required {
+		if !strings.Contains(wholePageSelfInventoryPrompt, invariant) {
+			t.Errorf("whole-page prompt is missing single-source invariant %q", invariant)
+		}
+	}
+}
+
+func TestREGBUGK12DenseV1Complete_PromptPresentsPrintedInventoryBeforeQuestions(t *testing.T) {
+	const envelope = `{"printed_inventory":[...],"questions":[...]}`
+	if !strings.Contains(wholePageSelfInventoryPrompt, envelope) {
+		t.Fatalf("whole-page prompt does not present the single-source array first: missing %s", envelope)
+	}
+	inventoryRule := strings.Index(wholePageSelfInventoryPrompt, "- printed_inventory independently reviews")
+	questionsRule := strings.Index(wholePageSelfInventoryPrompt, "- Then build questions in the same order")
+	if inventoryRule < 0 || questionsRule < 0 || inventoryRule > questionsRule {
+		t.Fatalf("whole-page prompt explains questions before its printed single source")
+	}
+}
+
+func TestREGBUGK12StandaloneParentFields006_PromptsFreezeExactKindFieldCombinations(t *testing.T) {
+	for _, invariant := range []string{
+		"problem_kind=standalone 时 parent_problem_id 与 subproblem_no 必须同时是空字符串",
+		"problem_kind=compound_parent 时 parent_problem_id 与 subproblem_no 必须同时是空字符串",
+		"problem_kind=subproblem 时 parent_problem_id 与 subproblem_no 必须同时非空",
+	} {
+		if !strings.Contains(recognizePrompt, invariant) {
+			t.Errorf("中文分片提示缺少父子字段互斥约束 %q", invariant)
+		}
+	}
+	for _, invariant := range []string{
+		"For problem_kind=standalone, parent_problem_id and subproblem_no must both be empty strings",
+		"For problem_kind=compound_parent, parent_problem_id and subproblem_no must both be empty strings",
+		"For problem_kind=subproblem, parent_problem_id and subproblem_no must both be non-empty",
+	} {
+		if !strings.Contains(wholePageSelfInventoryPrompt, invariant) {
+			t.Errorf("英文整页提示缺少父子字段互斥约束 %q", invariant)
+		}
+	}
+	if !strings.Contains(wholePageSelfInventoryPrompt,
+		"Before returning JSON, verify every problem_kind against these exact parent, subproblem, and answer-field combinations") {
+		t.Error("英文整页提示缺少返回前父子字段组合自检")
+	}
+}
+
+func TestREGBUGK12StandaloneParentFields006_ParserRejectsRawInvalidKindFieldCombinations(t *testing.T) {
+	valid := map[string]string{
+		"standalone": `[{
+			"problem_kind":"standalone","parent_problem_id":"","subproblem_no":"",
+			"question":"1+1=","answer_state":"present","student_answer":"2"
+		}]`,
+		"compound parent and subproblem": `[
+			{"problem_id":"parent-1","problem_kind":"compound_parent","parent_problem_id":"","subproblem_no":"","question":"阅读材料","answer_state":"blank","student_answer":""},
+			{"problem_kind":"subproblem","parent_problem_id":"parent-1","subproblem_no":"1","question":"第一问","answer_state":"present","student_answer":"答案"}
+		]`,
+	}
+	for name, payload := range valid {
+		t.Run("valid "+name, func(t *testing.T) {
+			questions, err := parseRecognizedQuestions(payload)
+			if err != nil {
+				t.Fatalf("合法父子字段组合被拒绝: %v", err)
+			}
+			if err := validateRecognitionProtocolResult(questions); err != nil {
+				t.Fatalf("合法父子字段组合未通过最终结构门: %v", err)
+			}
+		})
+	}
+
+	invalid := map[string]string{
+		"standalone parent": `[{
+			"problem_kind":"standalone","parent_problem_id":"parent-1","subproblem_no":"",
+			"question":"1+1=","answer_state":"present","student_answer":"2"
+		}]`,
+		"standalone subproblem": `[{
+			"problem_kind":"standalone","parent_problem_id":"","subproblem_no":"1",
+			"question":"1+1=","answer_state":"present","student_answer":"2"
+		}]`,
+		"compound parent reference": `[{
+			"problem_id":"parent-1","problem_kind":"compound_parent","parent_problem_id":"other","subproblem_no":"",
+			"question":"阅读材料","answer_state":"blank","student_answer":""
+		}]`,
+		"compound subproblem number": `[{
+			"problem_id":"parent-1","problem_kind":"compound_parent","parent_problem_id":"","subproblem_no":"1",
+			"question":"阅读材料","answer_state":"blank","student_answer":""
+		}]`,
+		"compound present answer": `[{
+			"problem_id":"parent-1","problem_kind":"compound_parent","parent_problem_id":"","subproblem_no":"",
+			"question":"阅读材料","answer_state":"present","student_answer":"孩子作答"
+		}]`,
+		"compound blank with raw answer": `[{
+			"problem_id":"parent-1","problem_kind":"compound_parent","parent_problem_id":"","subproblem_no":"",
+			"question":"阅读材料","answer_state":"blank","student_answer":"孩子作答"
+		}]`,
+		"subproblem missing parent": `[{
+			"problem_kind":"subproblem","parent_problem_id":"","subproblem_no":"1",
+			"question":"第一问","answer_state":"present","student_answer":"答案"
+		}]`,
+		"subproblem missing number": `[
+			{"problem_id":"parent-1","problem_kind":"compound_parent","parent_problem_id":"","subproblem_no":"","question":"阅读材料","answer_state":"blank","student_answer":""},
+			{"problem_kind":"subproblem","parent_problem_id":"parent-1","subproblem_no":"","question":"第一问","answer_state":"present","student_answer":"答案"}
+		]`,
+		"subproblem dangling parent": `[{
+			"problem_kind":"subproblem","parent_problem_id":"missing","subproblem_no":"1",
+			"question":"第一问","answer_state":"present","student_answer":"答案"
+		}]`,
+	}
+	for name, payload := range invalid {
+		t.Run("invalid "+name, func(t *testing.T) {
+			questions, err := parseRecognizedQuestions(payload)
+			if err == nil {
+				err = validateRecognitionProtocolResult(questions)
+			}
+			if !errors.Is(err, k12.ErrRecognitionProtocolInvalid) {
+				t.Fatalf("非法原始父子字段组合未 fail-closed: questions=%#v err=%v", questions, err)
+			}
+		})
+	}
+}
+
+func TestREGBUGK12DenseV1Complete_ParserRejectsIndependentFractionRetranscription(t *testing.T) {
+	payload := `{
+		"questions":[{
+			"source_number_path":["2"],
+			"display_label":"2",
+			"question":"2、8的四分之一的五分之四是多少？",
+			"subject":"数学",
+			"answer_state":"present",
+			"student_answer":"8/5"
+		}],
+		"printed_inventory":[{
+			"source_number_path":["2"],
+			"display_label":"2",
+			"question":"2、8的1/4的4/5是多少？"
+		}]
+	}`
+	if _, err := parseWholePageSelfInventory(payload); !errors.Is(err, k12.ErrRecognitionProtocolInvalid) {
+		t.Fatalf("independently retranscribed fraction question was accepted: %v", err)
+	}
+}
+
+func TestREGBUGK12DenseV1Complete_ExactRawIdentityIsNotOverwrittenByCanonicalMarkdown(t *testing.T) {
+	const sourceQuestion = "在下列六个数：5、6、12、14、23、29中划去数（ ）后，能使其中3个数的和为另外2个数和的2倍。"
+	payload := `{
+		"questions":[{
+			"source_number_path":[],
+			"display_label":"",
+			"question":"` + sourceQuestion + `",
+			"canonical_markdown":"在下列六个数中划去一个数后，使三个数之和等于另两个数之和的两倍。",
+			"subject":"数学",
+			"answer_state":"present",
+			"student_answer":"12"
+		}],
+		"printed_inventory":[{
+			"source_number_path":[],
+			"display_label":"",
+			"question":"` + sourceQuestion + `"
+		}]
+	}`
+	questions, err := parseWholePageSelfInventory(payload)
+	if err != nil {
+		t.Fatalf("byte-identical raw question identity was rejected after canonical projection: %v", err)
+	}
+	if len(questions) != 1 || questions[0].Question != sourceQuestion {
+		t.Fatalf("printed source identity was overwritten: %#v", questions)
+	}
+}
+
 func TestBUG20260808_DenseWholePageRejectsNonExactCompactInventoryFields(t *testing.T) {
 	tests := map[string]string{
 		"missing source number path": `{"display_label":"","question":"4÷0.5="}`,

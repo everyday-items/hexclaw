@@ -7,10 +7,11 @@ package main
 // 本探针只在显式授权真实模型时验证其下游能力。运行示例：
 //
 //   HEXCLAW_K12_PHOTO_PROBE=1 \
+//   HEXCLAW_K12_PHOTO_FIXTURE_ID=clear \
 //   HEXCLAW_K12_PHOTO_IMAGE=/tmp/hexclaw-k12-photo-probe.jpg \
 //   HEXCLAW_K12_PHOTO_OUTPUT=/tmp/hexclaw-k12-direct-reply.png \
 //   HEXCLAW_K12_PHOTO_MARKDOWN_OUTPUT=/tmp/hexclaw-k12-direct-reply.md \
-//   go test ./cmd/hexclaw -run TestK12DingtalkPhotoDirectRoute_RealModel_NoSend -v -count=1 -timeout 12m
+//   go test ./cmd/hexclaw -run TestK12DingtalkPhotoDirectRoute_RealModel_NoSend -v -count=1 -timeout 28m
 
 import (
 	"context"
@@ -35,6 +36,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
 	k12engineadapter "github.com/hexagon-codes/hexclaw/scenarios/k12/engineadapter"
@@ -43,8 +45,6 @@ import (
 	"github.com/hexagon-codes/hexclaw/skill/builtin"
 	sqlitestore "github.com/hexagon-codes/hexclaw/storage/sqlite"
 )
-
-const k12AnsweredFixtureSHA256 = "78cf3a1b5c52e12ca17ca13aa71c7a9439baed244e88b438aa2f1f70cd782fb5"
 
 func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	if os.Getenv("HEXCLAW_K12_PHOTO_PROBE") != "1" {
@@ -61,6 +61,10 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	if mime := http.DetectContentType(raw); !strings.HasPrefix(strings.ToLower(mime), "image/") {
 		t.Fatalf("probe input is not an image: mime=%q", mime)
 	}
+	fixtureID := strings.TrimSpace(os.Getenv("HEXCLAW_K12_PHOTO_FIXTURE_ID"))
+	if _, err := k12SelfInventoryFixtureFor(fixtureID, raw); err != nil {
+		t.Fatalf("validate real photo probe fixture: %v", err)
+	}
 
 	cfg, err := config.Load("")
 	if err != nil {
@@ -73,7 +77,14 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build real provider router: error_type=%T", err)
 	}
-	gradingSnapshot, err := resolveK12GradingModelSnapshot(realRouter, k12.GradingModelSnapshot{})
+	requestedRoute := k12.GradingModelSnapshot{
+		Provider: strings.TrimSpace(os.Getenv("HEXCLAW_REAL_LLM_PROVIDER")),
+		Model:    strings.TrimSpace(os.Getenv("HEXCLAW_REAL_LLM_MODEL")),
+	}
+	if (requestedRoute.Provider == "") != (requestedRoute.Model == "") {
+		t.Fatal("HEXCLAW_REAL_LLM_PROVIDER and HEXCLAW_REAL_LLM_MODEL must be set together")
+	}
+	gradingSnapshot, err := resolveK12GradingModelSnapshot(realRouter, requestedRoute)
 	if err != nil {
 		t.Fatalf("freeze real photo probe route: error_type=%T", err)
 	}
@@ -115,17 +126,21 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 
 	subagents := engine.NewSubAgentRegistry(filepath.Join(t.TempDir(), "subagent-runs.json"))
 	execSubagent := func(runCtx context.Context, spec engine.SubAgentSpec) (engine.SubAgentResult, error) {
-		msg := &adapter.Message{
-			ID:       "photo-probe-" + idgen.NanoID(),
-			Platform: adapter.PlatformAPI,
-			UserID:   "system",
-			Content:  spec.Task,
-			Metadata: map[string]string{},
+		msg, messageErr := newK12PhotoProbeSubagentMessage(spec, gradingSnapshot)
+		if messageErr != nil {
+			return engine.SubAgentResult{}, messageErr
 		}
-		engine.ApplySpecToMessage(msg, spec)
+		t.Logf("solve subagent route prepared: provider=%q model=%q", msg.Metadata["provider"], msg.Metadata["model"])
 		reply, processErr := react.Process(runCtx, msg)
 		if processErr != nil {
 			return engine.SubAgentResult{}, processErr
+		}
+		if routeErr := validateK12PhotoProbeSubagentReplyRoute(reply, gradingSnapshot); routeErr != nil {
+			return engine.SubAgentResult{}, routeErr
+		}
+		if processIssue, wrongStep, misconception, graderResponse := k12PhotoProbeGraderContract(reply.Content); graderResponse {
+			t.Logf("grader contract: retry=%t process_issue=%t wrong_step=%t misconception=%t",
+				strings.HasSuffix(spec.RunID, "-retry"), processIssue, wrongStep, misconception)
 		}
 		return engine.SubAgentResult{Output: reply.Content, SessionID: msg.SessionID}, nil
 	}
@@ -167,6 +182,9 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 			}
 			return "", fmt.Errorf("photo probe provider completion failed: %T", completeErr)
 		}
+		if call == 1 {
+			logK12ProviderResponseSafeDiagnostic(t, call, content, "5/7−1/5=")
+		}
 		return content, nil
 	}
 
@@ -193,7 +211,7 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	msg.Attachments[0].Data = base64.StdEncoding.EncodeToString(raw)
 
 	started := time.Now()
-	result, err = process(t.Context(), k12usecase.PhotoGradeRequest{
+	result, err = process(k12PhotoProbeRootContext(t.Context(), gradingSnapshot), k12usecase.PhotoGradeRequest{
 		AgentName: "child-tutor", Grade: "五年级下",
 		SourceSession: msg.SessionID, Image: raw,
 	})
@@ -214,19 +232,19 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 		if item.Status == k12usecase.PhotoCorrect || item.Status == k12usecase.PhotoWrong {
 			verifiedVerdicts++
 		}
-		t.Logf("item[%d] status=%s bbox=%t knowledge_points=%d out_of_scope=%t verdict=%s evidence=%s answer_chars=%d question_chars=%d warning_chars=%d",
+		t.Logf("item[%d] status=%s bbox=%t knowledge_points=%d out_of_scope=%t verdict=%s evidence=%s final_answer=%s answer_chars=%d question_chars=%d wrong_step_chars=%d error_cause_chars=%d warning_chars=%d",
 			i+1, item.Status, item.Recognized.BBox != nil, len(item.Recognized.KnowledgePoints),
 			strings.TrimSpace(item.Grade.OutOfScopeKP) != "", item.Grade.Evidence.Verdict,
-			item.Grade.Evidence.EvidenceType, len([]rune(item.Recognized.StudentAnswer)),
-			len([]rune(item.Recognized.Question)), len([]rune(item.Warning)))
+			item.Grade.Evidence.EvidenceType, k12PhotoProbeFinalAnswerFact(item.Grade.Outcome.FinalAnswerCorrect),
+			len([]rune(item.Recognized.StudentAnswer)), len([]rune(item.Recognized.Question)),
+			len([]rune(item.Grade.Outcome.WrongStep)), len([]rune(item.Grade.Outcome.ErrorCause)),
+			len([]rune(item.Warning)))
 	}
 	t.Logf("result: elapsed=%s mode=%s items=%d statuses=%v markdown_chars=%d annotated=%v attachments=%d",
 		time.Since(started).Round(time.Millisecond), result.Mode, len(result.Items), statusCounts,
 		len([]rune(reply.Content)), result.AnnotatedImage != nil, len(reply.Attachments))
-	inputSum := sha256.Sum256(raw)
-	if fmt.Sprintf("%x", inputSum) == k12AnsweredFixtureSHA256 {
-		assertKnownAnsweredWorksheetSemantics(t, result)
-	}
+	assertK12PhotoProbeFixtureSemantics(t, fixtureID, result)
+	assertK12PhotoProbeReplyProjection(t, result, reply)
 	if markdownOutput := strings.TrimSpace(os.Getenv("HEXCLAW_K12_PHOTO_MARKDOWN_OUTPUT")); markdownOutput != "" {
 		if err := writeK12PhotoProbeMarkdown(markdownOutput, reply.Content); err != nil {
 			t.Fatalf("write probe Markdown: error_type=%T", err)
@@ -270,7 +288,221 @@ func TestK12DingtalkPhotoDirectRoute_RealModel_NoSend(t *testing.T) {
 	t.Logf("ATTACHMENT_PRODUCED: mime=%q bytes=%d sha256=%x", att.Mime, len(decoded), sum[:8])
 }
 
-func assertKnownAnsweredWorksheetSemantics(t *testing.T, result k12usecase.PhotoGradeResult) {
+func k12PhotoProbeGraderContract(content string) (
+	processIssue bool,
+	wrongStep bool,
+	misconception bool,
+	graderResponse bool,
+) {
+	fields := make(map[string]string, 5)
+	for _, line := range strings.Split(content, "\n") {
+		key, value, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		fields[strings.ToUpper(strings.TrimSpace(key))] = strings.TrimSpace(value)
+	}
+	correct, hasCorrect := fields["CORRECT"]
+	finalAnswerCorrect, hasFinal := fields["FINAL_ANSWER_CORRECT"]
+	if !hasCorrect || !hasFinal {
+		return false, false, false, false
+	}
+	processIssue = strings.EqualFold(correct, "no") && strings.EqualFold(finalAnswerCorrect, "yes")
+	return processIssue,
+		strings.TrimSpace(fields["WRONG_STEP"]) != "",
+		strings.TrimSpace(fields["MISCONCEPTION"]) != "",
+		true
+}
+
+func k12PhotoProbeFinalAnswerFact(value *bool) string {
+	if value == nil {
+		return "unknown"
+	}
+	if *value {
+		return "true"
+	}
+	return "false"
+}
+
+func newK12PhotoProbeSubagentMessage(spec engine.SubAgentSpec, route k12.GradingModelSnapshot) (*adapter.Message, error) {
+	msg := &adapter.Message{
+		ID:       "photo-probe-" + idgen.NanoID(),
+		Platform: adapter.PlatformAPI,
+		UserID:   "system",
+		Content:  spec.Task,
+		Metadata: map[string]string{},
+	}
+	engine.ApplySpecToMessage(msg, spec)
+	return msg, pinK12PhotoProbeSubagentRoute(msg, route)
+}
+
+func pinK12PhotoProbeSubagentRoute(msg *adapter.Message, route k12.GradingModelSnapshot) error {
+	if msg == nil {
+		return fmt.Errorf("photo probe subagent message is nil")
+	}
+	provider := strings.TrimSpace(route.Provider)
+	model := strings.TrimSpace(route.Model)
+	if provider == "" || model == "" {
+		return fmt.Errorf("photo probe subagent route requires provider and model")
+	}
+	if msg.Metadata == nil {
+		msg.Metadata = map[string]string{}
+	}
+	msg.Metadata["provider"] = provider
+	msg.Metadata["model"] = model
+	return nil
+}
+
+func k12PhotoProbeRootContext(
+	ctx context.Context,
+	route k12.GradingModelSnapshot,
+) context.Context {
+	return k12.WithGradingModelSnapshot(ctx, route)
+}
+
+func validateK12PhotoProbeSubagentReplyRoute(
+	reply *adapter.Reply,
+	route k12.GradingModelSnapshot,
+) error {
+	if reply == nil {
+		return fmt.Errorf("photo probe subagent reply is nil")
+	}
+	provider := strings.TrimSpace(reply.Metadata["provider"])
+	model := strings.TrimSpace(reply.Metadata["model"])
+	if provider != strings.TrimSpace(route.Provider) || model != strings.TrimSpace(route.Model) {
+		return fmt.Errorf("photo probe subagent reply route drifted")
+	}
+	return nil
+}
+
+func TestK12PhotoProbeRootContextPinsFrozenRoute(t *testing.T) {
+	want := k12.GradingModelSnapshot{Provider: "hexclaw-gpt", Model: "gpt-5.6-sol"}
+	got, ok := k12.GradingModelSnapshotFromContext(
+		k12PhotoProbeRootContext(context.Background(), want),
+	)
+	if !ok || got.Provider != want.Provider || got.Model != want.Model {
+		t.Fatalf("photo probe root context route=%+v present=%t", got, ok)
+	}
+}
+
+func TestK12PhotoProbeSubagentReplyRequiresFrozenRoute(t *testing.T) {
+	route := k12.GradingModelSnapshot{Provider: "hexclaw-gpt", Model: "gpt-5.6-sol"}
+	if err := validateK12PhotoProbeSubagentReplyRoute(&adapter.Reply{Metadata: map[string]string{
+		"provider": route.Provider,
+		"model":    route.Model,
+	}}, route); err != nil {
+		t.Fatalf("matching subagent reply route rejected: %v", err)
+	}
+	if err := validateK12PhotoProbeSubagentReplyRoute(&adapter.Reply{Metadata: map[string]string{
+		"provider": route.Provider,
+		"model":    "gpt-5.6-luna",
+	}}, route); err == nil {
+		t.Fatal("drifted subagent reply route accepted")
+	}
+}
+
+func TestK12PhotoProbeSubagentMessagePinsFrozenRoute(t *testing.T) {
+	msg, err := newK12PhotoProbeSubagentMessage(
+		engine.SubAgentSpec{Agent: "verifier", Source: "solve", Task: "verify"},
+		k12.GradingModelSnapshot{Provider: "hexclaw-gpt", Model: "gpt-5.6-sol"},
+	)
+	if err != nil {
+		t.Fatalf("build photo probe subagent message: %v", err)
+	}
+	if msg.Metadata["provider"] != "hexclaw-gpt" || msg.Metadata["model"] != "gpt-5.6-sol" {
+		t.Fatalf("solve_verify route drifted: provider=%q model=%q", msg.Metadata["provider"], msg.Metadata["model"])
+	}
+}
+
+func assertK12PhotoProbeFixtureSemantics(
+	t *testing.T,
+	fixtureID string,
+	result k12usecase.PhotoGradeResult,
+) {
+	t.Helper()
+	switch strings.TrimSpace(fixtureID) {
+	case "clear":
+		assertKnownClearWorksheetSemantics(t, result)
+	case "messy":
+		assertKnownMessyWorksheetSemantics(t, result)
+	case "blank":
+		assertKnownBlankWorksheetSemantics(t, result)
+	default:
+		t.Fatalf("real photo probe fixture has no semantic oracle: fixture_id=%q", fixtureID)
+	}
+}
+
+func assertK12PhotoProbeReplyProjection(
+	t *testing.T,
+	result k12usecase.PhotoGradeResult,
+	reply *adapter.Reply,
+) {
+	t.Helper()
+	if reply == nil || reply.MessageContent == nil || reply.RenderManifest == nil {
+		t.Fatal("real photo reply lost canonical Markdown or RenderManifest")
+	}
+	if reply.MessageContent.Markdown != result.Markdown {
+		t.Fatal("real photo reply canonical Markdown drifted from PhotoGradeResult")
+	}
+	if err := reply.RenderManifest.ValidateFor(*reply.MessageContent); err != nil {
+		t.Fatalf("real photo reply RenderManifest is invalid: %v", err)
+	}
+	manifest := reply.RenderManifest
+	if !manifest.CapabilitySnapshot.Markdown || len(manifest.Parts) == 0 ||
+		manifest.Parts[0].Kind != messagecontent.PartMarkdown {
+		t.Fatalf("real photo reply is not a Markdown projection: parts=%d markdown=%t",
+			len(manifest.Parts), manifest.CapabilitySnapshot.Markdown)
+	}
+	if reply.Content != manifest.Parts[0].Text {
+		t.Fatal("real photo reply visible Markdown drifted from RenderManifest")
+	}
+	if strings.TrimSpace(reply.Content) == "批改结果渲染失败，请重试。" {
+		t.Fatal("real photo reply degraded to the generic render-error fallback")
+	}
+}
+
+func assertKnownClearWorksheetSemantics(t *testing.T, result k12usecase.PhotoGradeResult) {
+	t.Helper()
+	expected := []struct {
+		question string
+		status   k12usecase.PhotoItemStatus
+	}{
+		{"4÷0.5=", k12usecase.PhotoCorrect},
+		{"10×0.01=", k12usecase.PhotoCorrect},
+		{"4.7+2.3=", k12usecase.PhotoCorrect},
+		{"1.8×50=", k12usecase.PhotoCorrect},
+		{"3.25+0.75=", k12usecase.PhotoCorrect},
+		{"5/7−1/5=", k12usecase.PhotoCorrect},
+		{"7−5/7=", k12usecase.PhotoCorrect},
+		{"0.5+1/3=", k12usecase.PhotoCorrect},
+		{"4/5+2/5=", k12usecase.PhotoCorrect},
+		{"8.7×17.4−8.7×7.4", k12usecase.PhotoCorrect},
+		{"15.02−6.8−1.02", k12usecase.PhotoCorrect},
+		{"0.25+11/15+4/15+3/4", k12usecase.PhotoCorrect},
+		{"1、一个数的3/8是24，求这个数？", k12usecase.PhotoCorrect},
+		{"2、8的1/4的4/5是多少？", k12usecase.PhotoCorrect},
+		{"一个周长是300米的长方形鱼塘，长是宽的2倍。如果每平方米产鱼2.25千克，一共产鱼多少千克？", k12usecase.PhotoCorrectWithProcessIssue},
+		{"在下列六个数：5、6、12、14、23、29中划去数（ ）后，能使其中3个数的和为另外2个数和的2倍。", k12usecase.PhotoCorrectWithProcessIssue},
+	}
+	itemsByQuestion := assertK12PhotoProbeGradeShape(t, "clear", result, expected)
+	statusCounts := k12PhotoProbeStatusCounts(itemsByQuestion)
+	if statusCounts[k12usecase.PhotoCorrect] != 14 ||
+		statusCounts[k12usecase.PhotoCorrectWithProcessIssue] != 2 {
+		t.Fatalf("clear worksheet status totals=%v want correct=14 process_issue=2", statusCounts)
+	}
+	for _, index := range []int{14, 15} {
+		item := itemsByQuestion[canonicalK12PhotoProbeText(expected[index].question)]
+		if strings.TrimSpace(item.Grade.Outcome.WrongStep) == "" ||
+			strings.TrimSpace(item.Grade.Outcome.ErrorCause) == "" {
+			t.Fatalf("clear worksheet process issue index=%d lacks process evidence", index+1)
+		}
+	}
+	if result.AnnotatedImage == nil {
+		t.Fatal("clear worksheet has verified verdicts but no annotated image")
+	}
+}
+
+func assertKnownMessyWorksheetSemantics(t *testing.T, result k12usecase.PhotoGradeResult) {
 	t.Helper()
 	expected := []struct {
 		question string
@@ -349,6 +581,91 @@ func assertKnownAnsweredWorksheetSemantics(t *testing.T, result k12usecase.Photo
 	if result.AnnotatedImage == nil {
 		t.Fatal("known answered worksheet has verified verdicts but no annotated image")
 	}
+}
+
+func assertKnownBlankWorksheetSemantics(t *testing.T, result k12usecase.PhotoGradeResult) {
+	t.Helper()
+	if result.Mode != k12usecase.PhotoModeSolve ||
+		result.TaskIntent != k12usecase.PhotoTaskBlankWorksheet ||
+		result.ResultSurface != k12usecase.PhotoSurfaceParentTeachingGuide {
+		t.Fatalf("blank worksheet route drifted: mode=%s intent=%s surface=%s",
+			result.Mode, result.TaskIntent, result.ResultSurface)
+	}
+	if len(result.Items) < 24 || len(result.Items) > 28 {
+		t.Fatalf("blank worksheet items=%d want range=[24,28]", len(result.Items))
+	}
+	for index, item := range result.Items {
+		if item.Status != k12usecase.PhotoBlankSolved ||
+			item.ResultKind != k12usecase.PhotoItemParentTeachingGuide || item.ParentGuide == nil {
+			t.Fatalf("blank worksheet item=%d lacks a solved parent guide: status=%s kind=%s guide=%t",
+				index+1, item.Status, item.ResultKind, item.ParentGuide != nil)
+		}
+		guide := item.ParentGuide
+		if strings.TrimSpace(guide.Answer) == "" || len(guide.FullSolutionSteps) == 0 ||
+			strings.TrimSpace(guide.GradeLevelMethod) == "" || len(guide.LikelyMistakes) == 0 ||
+			len(guide.ParentTeachingSequence) == 0 || len(guide.FollowUpQuestions) == 0 ||
+			strings.TrimSpace(guide.CheckingMethod) == "" {
+			t.Fatalf("blank worksheet item=%d parent guide is incomplete", index+1)
+		}
+	}
+	if result.AnnotatedImage != nil {
+		t.Fatal("blank worksheet produced a fake correction image")
+	}
+	if !strings.Contains(result.Markdown, "## 家长辅导指南") ||
+		!strings.Contains(result.Markdown, "**家长怎么讲：**") {
+		t.Fatal("blank worksheet Markdown lacks the parent teaching guide")
+	}
+}
+
+func assertK12PhotoProbeGradeShape(
+	t *testing.T,
+	fixtureID string,
+	result k12usecase.PhotoGradeResult,
+	expected []struct {
+		question string
+		status   k12usecase.PhotoItemStatus
+	},
+) map[string]k12usecase.PhotoGradeItem {
+	t.Helper()
+	if result.Mode != k12usecase.PhotoModeGrade || len(result.Items) != len(expected) {
+		t.Fatalf("%s worksheet shape drift: mode=%s items=%d want=%d",
+			fixtureID, result.Mode, len(result.Items), len(expected))
+	}
+	itemsByQuestion := make(map[string]k12usecase.PhotoGradeItem, len(result.Items))
+	for itemIndex, item := range result.Items {
+		key := canonicalK12PhotoProbeText(item.Recognized.Question)
+		if _, duplicate := itemsByQuestion[key]; duplicate {
+			t.Fatalf("%s worksheet has duplicate question at item=%d", fixtureID, itemIndex+1)
+		}
+		itemsByQuestion[key] = item
+	}
+	for expectedIndex, want := range expected {
+		key := canonicalK12PhotoProbeText(want.question)
+		item, ok := itemsByQuestion[key]
+		if !ok {
+			t.Fatalf("%s worksheet lost/corrupted question index=%d: items=%d",
+				fixtureID, expectedIndex+1, len(result.Items))
+		}
+		if item.Status != want.status {
+			t.Fatalf("%s question index=%d status=%s want=%s answer_chars=%d warning_chars=%d",
+				fixtureID, expectedIndex+1, item.Status, want.status,
+				len([]rune(item.Recognized.StudentAnswer)), len([]rune(item.Warning)))
+		}
+		if item.Recognized.BBox == nil {
+			t.Fatalf("%s answered question index=%d has no verified image anchor", fixtureID, expectedIndex+1)
+		}
+	}
+	return itemsByQuestion
+}
+
+func k12PhotoProbeStatusCounts(
+	items map[string]k12usecase.PhotoGradeItem,
+) map[k12usecase.PhotoItemStatus]int {
+	counts := make(map[k12usecase.PhotoItemStatus]int)
+	for _, item := range items {
+		counts[item.Status]++
+	}
+	return counts
 }
 
 func canonicalK12PhotoProbeText(value string) string {

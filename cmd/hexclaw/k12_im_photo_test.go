@@ -31,6 +31,22 @@ func TestK12PhotoReply_AnsweredSheetReturnsAnnotatedPNG(t *testing.T) {
 	}
 }
 
+func TestREGBUGK12C02StandaloneVariable003_PhotoReplyKeepsMarkdownAndAttachment(t *testing.T) {
+	reply := k12PhotoReply(k12usecase.PhotoGradeResult{
+		Mode:     k12usecase.PhotoModeGrade,
+		Markdown: "## 作业批改\n\n设 $x$ 为边长，面积记为 $S$；价格仍写作 $5。",
+		AnnotatedImage: &k12usecase.RenderedPhoto{
+			Data: []byte("corrected image"), MIME: "image/png",
+		},
+	})
+	if reply.Content != "## 作业批改\n\n设 x 为边长，面积记为 S；价格仍写作 $5。" {
+		t.Fatalf("standalone variable reply projection=%q", reply.Content)
+	}
+	if len(reply.Attachments) != 1 {
+		t.Fatalf("standalone variable projection dropped annotated image: %#v", reply.Attachments)
+	}
+}
+
 func TestK12PhotoReply_BlankSheetReturnsMarkdownOnly(t *testing.T) {
 	reply := k12PhotoReply(k12usecase.PhotoGradeResult{
 		Mode: k12usecase.PhotoModeSolve, Markdown: "## 作业解题\n\n### 1. 4.5 × 2",
