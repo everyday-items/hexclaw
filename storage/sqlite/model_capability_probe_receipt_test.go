@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/storage"
+	"github.com/hexagon-codes/hexclaw/storage/migrate"
 )
 
 func TestModelCapabilityProbeReceiptMigrationDefinesCompositeIdentity(t *testing.T) {
@@ -72,12 +73,12 @@ func TestModelCapabilityProbeReceiptUpgradeAddsPolicyColumnAfterV83(t *testing.T
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
+	// 构造真实的 V82 前缀，确保随后执行的迁移拥有各自历史前置表；
+	// 再单独写入旧版 V83 表，以验证 V84 对缺列数据库的升级。
+	if err := migrate.Run(ctx, store.DB(), migrate.All[:82]); err != nil {
+		t.Fatalf("seed migration prefix through v82: %v", err)
+	}
 	if _, err := store.DB().ExecContext(ctx, `
-CREATE TABLE schema_migrations (
-    version INTEGER PRIMARY KEY,
-    description TEXT NOT NULL DEFAULT '',
-    applied_at INTEGER NOT NULL
-);
 INSERT INTO schema_migrations (version, description, applied_at) VALUES (83, 'legacy v83', 1);
 CREATE TABLE llm_model_capability_probe_receipts (
     provider_instance_id TEXT NOT NULL,
