@@ -3,10 +3,28 @@ package dingtalk
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
+
+	dtrobot "github.com/alibabacloud-go/dingtalk/robot_1_0"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 )
+
+func TestDingTalkBatchSendOTOQueryIdentityIsResponseOnly(t *testing.T) {
+	sendRequest := reflect.TypeOf(dtrobot.BatchSendOTORequest{})
+	for _, unsupported := range []string{"ProcessQueryKey", "OutTrackId"} {
+		if _, ok := sendRequest.FieldByName(unsupported); ok {
+			t.Fatalf("BatchSendOTO unexpectedly supports client supplied %s", unsupported)
+		}
+	}
+	if _, ok := reflect.TypeOf(dtrobot.BatchSendOTOResponseBody{}).FieldByName("ProcessQueryKey"); !ok {
+		t.Fatal("BatchSendOTO response no longer exposes ProcessQueryKey")
+	}
+	if _, ok := reflect.TypeOf(dtrobot.BatchOTOQueryRequest{}).FieldByName("ProcessQueryKey"); !ok {
+		t.Fatal("BatchOTOQuery request no longer requires ProcessQueryKey")
+	}
+}
 
 func TestSendWithReceiptPostSendContextFailuresAreOutcomeUnknown(t *testing.T) {
 	for _, stageErr := range []error{context.Canceled, context.DeadlineExceeded} {

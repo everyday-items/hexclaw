@@ -149,15 +149,16 @@ func TestBUG20260714_GroupWithoutConversationIDNeverLeaksToPrivateChat(t *testin
 }
 
 func TestUploadDingtalkImage_UsesMultipartMediaEndpoint(t *testing.T) {
-	var gotToken, gotType, gotName, gotBody string
+	var gotToken, gotQueryType, gotFormType, gotName, gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotToken = r.URL.Query().Get("access_token")
+		gotQueryType = r.URL.Query().Get("type")
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			t.Errorf("parse multipart: %v", err)
 			http.Error(w, "bad multipart", http.StatusBadRequest)
 			return
 		}
-		gotType = r.FormValue("type")
+		gotFormType = r.FormValue("type")
 		file, header, err := r.FormFile("media")
 		if err != nil {
 			t.Errorf("media part: %v", err)
@@ -179,8 +180,8 @@ func TestUploadDingtalkImage_UsesMultipartMediaEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mediaID != "@media-123" || gotToken != "secret-token" || gotType != "image" || gotName != "graded.png" || !bytes.Equal([]byte(gotBody), realPNG) {
-		t.Fatalf("unexpected multipart upload: media=%q token=%q type=%q name=%q body_bytes=%d", mediaID, gotToken, gotType, gotName, len(gotBody))
+	if mediaID != "@media-123" || gotToken != "secret-token" || gotQueryType != "image" || gotFormType != "image" || gotName != "graded.png" || !bytes.Equal([]byte(gotBody), realPNG) {
+		t.Fatalf("unexpected multipart upload: media=%q token=%q query_type=%q form_type=%q name=%q body_bytes=%d", mediaID, gotToken, gotQueryType, gotFormType, gotName, len(gotBody))
 	}
 }
 

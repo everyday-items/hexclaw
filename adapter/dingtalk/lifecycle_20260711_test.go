@@ -31,6 +31,7 @@ func TestDingtalkStopCancelsAndWaitsForMessageHandler(t *testing.T) {
 	}
 
 	data := &dtchatbot.BotCallbackDataModel{
+		MsgId:         "provider-msg-lifecycle-1",
 		SenderStaffId: "staff-1",
 		SenderNick:    "user",
 	}

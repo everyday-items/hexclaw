@@ -278,7 +278,7 @@ func TestHandleWebhookNoSignatureCheck(t *testing.T) {
 		return nil, nil
 	}
 
-	body := `{"text":{"content":"hello"},"senderStaffId":"user1","senderNick":"Test"}`
+	body := `{"msgId":"provider-msg-no-signature-2","text":{"content":"hello"},"senderStaffId":"user1","senderNick":"Test"}`
 	req := httptest.NewRequest("POST", "/dingtalk/webhook", strings.NewReader(body))
 
 	w := httptest.NewRecorder()
@@ -316,6 +316,7 @@ func TestHandleWebhookValidMessage(t *testing.T) {
 	}
 
 	event := dtEvent{
+		MsgID:          "provider-msg-webhook-1",
 		ConversationId: "conv-1",
 		SenderStaffId:  "user1",
 		SenderNick:     "TestUser",

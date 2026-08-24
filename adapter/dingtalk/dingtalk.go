@@ -36,18 +36,26 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	sign_ "github.com/hexagon-codes/toolkit/crypto/sign"
 	"github.com/hexagon-codes/toolkit/lang/stringx"
-	"github.com/hexagon-codes/toolkit/util/idgen"
 	"github.com/hexagon-codes/toolkit/util/logger"
 	"github.com/hexagon-codes/toolkit/util/retry"
 )
+
+// InboundPhotoAdmissionPort 在平台 ACK 之前接收已经下载完成的 direct 图片消息。
+// 返回 handled=true 表示消息已进入外部耐久队列，适配器不得再启动旧业务 handler。
+type InboundPhotoAdmissionPort interface {
+	AdmitInboundPhoto(context.Context, *adapter.Message) (handled bool, err error)
+}
 
 // DingtalkAdapter 钉钉 Bot 适配器
 type DingtalkAdapter struct {
 	cfg     config.DingtalkConfig
 	handler adapter.MessageHandler
 	queue   *adapter.SendQueue
+
+	inboundPhotoAdmission InboundPhotoAdmissionPort // mu 守护
 
 	mu          sync.RWMutex
 	accessToken string
@@ -76,8 +84,8 @@ type DingtalkAdapter struct {
 // defaultHandlerTimeout 是单条消息处理的默认总预算。
 const defaultHandlerTimeout = 2 * time.Minute
 
-// photoHandlerTimeout 给整页识题 + 多题批改留出真实预算。Stream 回调已经即时 ack，
-// 这里延长后台 worker 不会阻塞钉钉；用户会先收到带 ETA 的进度消息。
+// photoHandlerTimeout 给整页识题 + 多题批改留出真实预算。注入耐久接纳端口后，图片回调
+// 只同步等待下载与落盘；后续 worker 不阻塞钉钉，用户会先收到带 ETA 的进度消息。
 const photoHandlerTimeout = 10 * time.Minute
 
 // terminalNotifyTimeout 是终态用户通知（错误提示 / 占位撤回 / 最终答案）的兜底 ctx 预算。
@@ -151,6 +159,25 @@ func New(cfg config.DingtalkConfig) *DingtalkAdapter {
 	return a
 }
 
+// SetInboundPhotoAdmissionPort 注入 ACK 前的图片耐久接纳端口；nil 保持非 K12 消费者的原行为。
+func (a *DingtalkAdapter) SetInboundPhotoAdmissionPort(port InboundPhotoAdmissionPort) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.inboundPhotoAdmission = port
+	a.mu.Unlock()
+}
+
+func (a *DingtalkAdapter) currentInboundPhotoAdmissionPort() InboundPhotoAdmissionPort {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.inboundPhotoAdmission
+}
+
 // dingtalkThinkingFeedback 是「收到消息、正在处理」的占位提示。发送前先发它给用户即时反馈，
 // 最终答案输出后再撤回（recall），使占位不残留（BUG-20260704：不删除占位、改为答案就位后撤回）。
 const dingtalkThinkingFeedback = "⌨️ 已收到，正在思考…"
@@ -202,6 +229,10 @@ type dingtalkMediaOpenAPI interface {
 	UploadImage(ctx context.Context, accessToken string, attachment adapter.Attachment) (mediaID string, err error)
 }
 
+type dingtalkFileMediaOpenAPI interface {
+	UploadFile(ctx context.Context, accessToken string, attachment adapter.Attachment) (mediaID string, err error)
+}
+
 // dingtalkOutboundMessage 是钉钉出站消息的传输形态：MsgKey 选择消息类型
 // （sampleText / sampleMarkdown），MsgParam 为对应 JSON 载荷。消息类型策略在
 // 适配器层决定，接口只负责传输（可测缝，BUG-20260703 B7）。
@@ -242,6 +273,8 @@ const dingtalkMediaUploadURL = "https://oapi.dingtalk.com/media/upload"
 // copied into a multipart body.
 const dingtalkMaxOutboundImageBytes = 20 << 20
 
+const dingtalkMaxOutboundPDFBytes = 20 << 20
+
 type dingtalkMediaUploadResponse struct {
 	ErrCode int    `json:"errcode"`
 	ErrMsg  string `json:"errmsg"`
@@ -267,14 +300,15 @@ func uploadDingtalkImage(
 	if !adapter.IsImageAttachment(attachment) {
 		return "", fmt.Errorf("钉钉仅支持上传图片附件: %s", attachment.Name)
 	}
+	if err := validateDingTalkAttachmentName(attachment.Name); err != nil {
+		return "", err
+	}
 	encoded := strings.TrimSpace(attachment.Data)
 	if encoded == "" {
 		return "", errors.New("钉钉图片上传内容为空")
 	}
-	// Be tolerant of callers that pass a complete data URI even though the
-	// adapter contract normally stores only the base64 payload.
-	if comma := strings.IndexByte(encoded, ','); strings.HasPrefix(encoded, "data:") && comma >= 0 {
-		encoded = encoded[comma+1:]
+	if strings.HasPrefix(strings.ToLower(encoded), "data:") {
+		return "", errors.New("DingTalk image upload data URI sources are forbidden")
 	}
 	if base64.StdEncoding.DecodedLen(len(encoded)) > dingtalkMaxOutboundImageBytes {
 		return "", fmt.Errorf("钉钉回复图片超过 %dMB 上限", dingtalkMaxOutboundImageBytes>>20)
@@ -300,6 +334,7 @@ func uploadDingtalkImage(
 	}
 	query := u.Query()
 	query.Set("access_token", accessToken)
+	query.Set("type", "image")
 	u.RawQuery = query.Encode()
 
 	var body bytes.Buffer
@@ -324,11 +359,18 @@ func uploadDingtalkImage(
 		return "", fmt.Errorf("创建钉钉图片上传请求失败: %w", err)
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
-	resp, err := httpClient.Do(req)
+	uploadClient := *httpClient
+	uploadClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := uploadClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("上传钉钉图片失败: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusMultipleChoices && resp.StatusCode < http.StatusBadRequest {
+		return "", errors.New("DingTalk image media upload redirects are forbidden")
+	}
 
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
@@ -345,6 +387,113 @@ func uploadDingtalkImage(
 		return "", errors.New("钉钉图片上传成功但 media_id 为空")
 	}
 	return result.MediaID, nil
+}
+
+func uploadDingtalkPDFFile(
+	ctx context.Context,
+	httpClient *http.Client,
+	endpoint string,
+	accessToken string,
+	attachment adapter.Attachment,
+) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if httpClient == nil {
+		return "", errors.New("DingTalk file upload HTTP client is unavailable")
+	}
+	if strings.TrimSpace(accessToken) == "" {
+		return "", errors.New("DingTalk file upload access token is required")
+	}
+	raw, err := dingTalkAttachmentBytes(attachment)
+	if err != nil {
+		return "", err
+	}
+	if !isDingTalkPDFAttachment(attachment) || !bytes.HasPrefix(raw, []byte("%PDF-")) {
+		return "", errors.New("DingTalk file attachment must be a valid application/pdf document")
+	}
+	if len(raw) > dingtalkMaxOutboundPDFBytes {
+		return "", fmt.Errorf("DingTalk PDF attachment exceeds the %d MiB limit", dingtalkMaxOutboundPDFBytes>>20)
+	}
+
+	u, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Host == "" || u.User != nil || u.Fragment != "" {
+		return "", errors.New("DingTalk file upload endpoint must be a valid HTTPS URL")
+	}
+	query := u.Query()
+	query.Set("access_token", accessToken)
+	query.Set("type", "file")
+	u.RawQuery = query.Encode()
+
+	fileName := dingTalkPDFFileName(attachment)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("media", fileName)
+	if err != nil {
+		return "", fmt.Errorf("DingTalk file upload multipart creation failed: %w", err)
+	}
+	if _, err := part.Write(raw); err != nil {
+		return "", fmt.Errorf("DingTalk file upload multipart write failed: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return "", fmt.Errorf("DingTalk file upload multipart completion failed: %w", err)
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), &body)
+	if err != nil {
+		return "", fmt.Errorf("DingTalk file upload request creation failed: %w", err)
+	}
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	uploadClient := *httpClient
+	uploadClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	response, err := uploadClient.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("DingTalk file media upload failed: %w", err)
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("DingTalk file media upload response read failed: %w", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("DingTalk file media upload failed with HTTP %d", response.StatusCode)
+	}
+	var result dingtalkMediaUploadResponse
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		return "", fmt.Errorf("DingTalk file media upload response is invalid: %w", err)
+	}
+	if result.ErrCode != 0 {
+		return "", fmt.Errorf("DingTalk file media upload failed with errcode %d: %s", result.ErrCode, result.ErrMsg)
+	}
+	mediaID := strings.TrimSpace(result.MediaID)
+	if !validDingTalkFileMediaID(mediaID) {
+		return "", errors.New("DingTalk file media upload returned an invalid media ID")
+	}
+	return mediaID, nil
+}
+
+func dingtalkFileMessage(mediaID string, fileName string) dingtalkOutboundMessage {
+	payload, _ := json.Marshal(struct {
+		MediaID  string `json:"mediaId"`
+		FileName string `json:"fileName"`
+		FileType string `json:"fileType"`
+	}{MediaID: mediaID, FileName: fileName, FileType: "pdf"})
+	return dingtalkOutboundMessage{MsgKey: "sampleFile", MsgParam: string(payload)}
+}
+
+func dingTalkPDFFileName(attachment adapter.Attachment) string {
+	if strings.TrimSpace(attachment.Name) == "" {
+		return "document.pdf"
+	}
+	return safeDingTalkAttachmentName(attachment.Name)
+}
+
+func validDingTalkFileMediaID(mediaID string) bool {
+	trimmed := strings.TrimSpace(mediaID)
+	return strings.HasPrefix(trimmed, "@") && len(trimmed) <= 512 &&
+		!strings.ContainsAny(trimmed, "\r\n\t /\\:[]()")
 }
 
 func newOfficialDingtalkOpenAPI() (*officialDingtalkOpenAPI, error) {
@@ -429,6 +578,10 @@ func (c *officialDingtalkOpenAPI) RecallGroup(_ context.Context, accessToken, ro
 
 func (c *officialDingtalkOpenAPI) UploadImage(ctx context.Context, accessToken string, attachment adapter.Attachment) (string, error) {
 	return uploadDingtalkImage(ctx, c.http, c.mediaURL, accessToken, attachment)
+}
+
+func (c *officialDingtalkOpenAPI) UploadFile(ctx context.Context, accessToken string, attachment adapter.Attachment) (string, error) {
+	return uploadDingtalkPDFFile(ctx, c.http, c.mediaURL, accessToken, attachment)
 }
 
 func (a *DingtalkAdapter) apiClient() (dingtalkOpenAPI, error) {
@@ -733,10 +886,9 @@ func (a *DingtalkAdapter) Handler() http.Handler {
 
 // onChatBotMessage 是注册到官方 SDK 的机器人消息回调。
 //
-// 立即返回成功 ack（空串），消息处理异步进行：钉钉要求在限定时间内收到 ack，否则会重投；而
-// handleMessage 内含完整 LLM 往返（可达分钟级），绝不能在 ack 路径上同步阻塞。语义对齐飞书的
-// `go a.handleSDKMessage(...)` 即时返回。
-func (a *DingtalkAdapter) onChatBotMessage(_ context.Context, data *dtchatbot.BotCallbackDataModel) ([]byte, error) {
+// 普通消息在启动异步处理后立即返回成功 ACK（空串）。注入图片耐久接纳端口时，direct 图片只在
+// 下载和耐久接纳成功后 ACK；完整 LLM 往返仍由恢复型 worker 执行，绝不进入 ACK 同步路径。
+func (a *DingtalkAdapter) onChatBotMessage(ctx context.Context, data *dtchatbot.BotCallbackDataModel) ([]byte, error) {
 	if data == nil {
 		return []byte(""), nil
 	}
@@ -744,8 +896,12 @@ func (a *DingtalkAdapter) onChatBotMessage(_ context.Context, data *dtchatbot.Bo
 		logger.Info("DingTalk group message ignored because v0.5 supports direct messages only")
 		return []byte(""), nil
 	}
+	if strings.TrimSpace(data.MsgId) == "" {
+		return nil, errors.New("dingtalk inbound message is missing provider message id")
+	}
 
 	event := dtEvent{
+		MsgID:            data.MsgId,
 		ConversationId:   data.ConversationId,
 		ConversationType: data.ConversationType,
 		SenderStaffId:    data.SenderStaffId,
@@ -762,6 +918,13 @@ func (a *DingtalkAdapter) onChatBotMessage(_ context.Context, data *dtchatbot.Bo
 	}
 
 	if strings.TrimSpace(event.Text.Content) != "" || event.Content.DownloadCode != "" {
+		handled, err := a.admitInboundPhotoBeforeACK(ctx, &event)
+		if err != nil {
+			return nil, err
+		}
+		if handled {
+			return []byte(""), nil
+		}
 		if !a.runWorker(func(ctx context.Context) { a.handleMessageContext(ctx, event) }) {
 			return nil, fmt.Errorf("dingtalk adapter stopping")
 		}
@@ -803,9 +966,22 @@ func (a *DingtalkAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	if strings.TrimSpace(event.MsgID) == "" {
+		http.Error(w, "missing provider message id", http.StatusBadRequest)
+		return
+	}
 
 	// BUG-20260709：picture 消息正文为空但带 downloadCode，同样要进管道
 	if event.Text.Content != "" || event.Content.DownloadCode != "" {
+		handled, err := a.admitInboundPhotoBeforeACK(r.Context(), &event)
+		if err != nil {
+			http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if handled {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if !a.runWorker(func(ctx context.Context) { a.handleMessageContext(ctx, event) }) {
 			http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 			return
@@ -879,6 +1055,176 @@ func (a *DingtalkAdapter) SendWithReceipt(ctx context.Context, chatID string, re
 		return adapter.DeliveryAck{Status: adapter.DeliveryOutcomeUnknown}, fmt.Errorf("钉钉已受理发送但未返回 processQueryKey，结果待核实")
 	}
 	return adapter.DeliveryAck{ExternalMessageID: externalID, Status: adapter.DeliveryAccepted}, nil
+}
+
+// PrepareDeliveryPartResource 只准备单个媒体 part 的平台资源，不发送用户可见消息。
+func (a *DingtalkAdapter) PrepareDeliveryPartResource(ctx context.Context, part adapter.DeliveryPart) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateDingTalkDeliveryPartCanonicalEvidence(part, true); err != nil {
+		return "", err
+	}
+	switch part.Kind {
+	case messagecontent.PartMarkdown:
+		if part.Attachment != nil || strings.TrimSpace(part.PreparedResourceID) != "" || strings.TrimSpace(part.Text) == "" {
+			return "", errors.New("DingTalk markdown delivery part has an invalid shape")
+		}
+		return "", nil
+	case messagecontent.PartArtifact:
+		if strings.TrimSpace(part.Text) != "" || part.Attachment == nil || strings.TrimSpace(part.PreparedResourceID) != "" {
+			return "", errors.New("DingTalk artifact delivery part has an invalid shape")
+		}
+	default:
+		return "", fmt.Errorf("DingTalk delivery part kind %q is unsupported", part.Kind)
+	}
+
+	attachment := *part.Attachment
+	if err := validateDingTalkDeliveryPartAttachment(part, attachment, true); err != nil {
+		return "", err
+	}
+	token, err := a.getAccessToken(ctx)
+	if err != nil {
+		return "", fmt.Errorf("DingTalk delivery part access token failed: %w", err)
+	}
+	api, err := a.apiClient()
+	if err != nil {
+		return "", fmt.Errorf("DingTalk delivery part API initialization failed: %w", err)
+	}
+
+	var mediaID string
+	if isDingTalkPDFAttachment(attachment) {
+		fileAPI, ok := api.(dingtalkFileMediaOpenAPI)
+		if !ok {
+			return "", errors.New("DingTalk file media upload capability is unavailable")
+		}
+		mediaID, err = fileAPI.UploadFile(ctx, token, attachment)
+	} else {
+		imageAPI, ok := api.(dingtalkMediaOpenAPI)
+		if !ok {
+			return "", errors.New("DingTalk image media upload capability is unavailable")
+		}
+		mediaID, err = imageAPI.UploadImage(ctx, token, attachment)
+	}
+	if err != nil {
+		return "", fmt.Errorf("DingTalk delivery part media upload failed: %w", err)
+	}
+	if !validDingTalkFileMediaID(mediaID) {
+		return "", errors.New("DingTalk delivery part media upload returned an invalid media ID")
+	}
+	return strings.TrimSpace(mediaID), nil
+}
+
+// SendPreparedPartWithReceipt 只消费已经准备好的媒体引用，并返回钉钉 processQueryKey。
+func (a *DingtalkAdapter) SendPreparedPartWithReceipt(ctx context.Context, chatID string, part adapter.DeliveryPart) (adapter.DeliveryAck, error) {
+	failed := adapter.DeliveryAck{Status: adapter.DeliveryFailed}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if strings.TrimSpace(chatID) == "" {
+		return failed, errors.New("DingTalk delivery part chat ID is required")
+	}
+	if _, isGroup := parseGroupQueueTarget(chatID); isGroup {
+		return failed, errors.New("DingTalk delivery parts support direct messages only")
+	}
+	if err := validateDingTalkDeliveryPartCanonicalEvidence(part, true); err != nil {
+		return failed, err
+	}
+	message, err := dingTalkPreparedPartMessage(part)
+	if err != nil {
+		return failed, err
+	}
+	token, err := a.getAccessToken(ctx)
+	if err != nil {
+		return failed, fmt.Errorf("DingTalk delivery part access token failed: %w", err)
+	}
+	api, err := a.apiClient()
+	if err != nil {
+		return failed, fmt.Errorf("DingTalk delivery part API initialization failed: %w", err)
+	}
+
+	var externalID string
+	var providerSendStarted atomic.Bool
+	send := func(sendCtx context.Context, target string, _ *adapter.Reply) error {
+		if err := sendCtx.Err(); err != nil {
+			return err
+		}
+		providerSendStarted.Store(true)
+		var sendErr error
+		externalID, sendErr = api.SendOTO(sendCtx, token, a.cfg.RobotCode, target, message)
+		return sendErr
+	}
+	if a.queue == nil {
+		err = send(ctx, chatID, &adapter.Reply{})
+	} else {
+		err = a.queue.SendWith(ctx, chatID, &adapter.Reply{}, send)
+	}
+	if err != nil {
+		status := adapter.DeliveryFailed
+		if providerSendStarted.Load() &&
+			(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			status = adapter.DeliveryOutcomeUnknown
+		}
+		return adapter.DeliveryAck{Status: status}, err
+	}
+	if strings.TrimSpace(externalID) == "" {
+		return adapter.DeliveryAck{Status: adapter.DeliveryOutcomeUnknown}, errors.New("DingTalk accepted the delivery part without a processQueryKey")
+	}
+	return adapter.DeliveryAck{ExternalMessageID: externalID, Status: adapter.DeliveryAccepted}, nil
+}
+
+func validateDingTalkDeliveryPartAttachment(part adapter.DeliveryPart, attachment adapter.Attachment, requireBytes bool) error {
+	partMIME := strings.TrimSpace(part.MIME)
+	attachmentMIME := strings.TrimSpace(attachment.Mime)
+	if partMIME == "" || attachmentMIME == "" || !strings.EqualFold(partMIME, attachmentMIME) {
+		return errors.New("DingTalk artifact delivery part MIME does not match its attachment")
+	}
+	if !isDingTalkPDFAttachment(attachment) && !strings.HasPrefix(strings.ToLower(attachmentMIME), "image/") {
+		return errors.New("DingTalk artifact delivery part type is unsupported")
+	}
+	if err := validateDingTalkAttachmentName(attachment.Name); err != nil {
+		return err
+	}
+	if !requireBytes {
+		return nil
+	}
+	digest, _, err := dingTalkAttachmentIdentity(attachment)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(part.Digest) == "" || part.Digest != digest {
+		return errors.New("DingTalk artifact delivery part digest does not match its attachment bytes")
+	}
+	return nil
+}
+
+func dingTalkPreparedPartMessage(part adapter.DeliveryPart) (dingtalkOutboundMessage, error) {
+	switch part.Kind {
+	case messagecontent.PartMarkdown:
+		if part.Attachment != nil || strings.TrimSpace(part.PreparedResourceID) != "" || strings.TrimSpace(part.Text) == "" {
+			return dingtalkOutboundMessage{}, errors.New("DingTalk markdown delivery part has an invalid shape")
+		}
+		return dingtalkMarkdownMessage(part.Text), nil
+	case messagecontent.PartArtifact:
+		if strings.TrimSpace(part.Text) != "" || part.Attachment == nil || !validDingTalkFileMediaID(part.PreparedResourceID) {
+			return dingtalkOutboundMessage{}, errors.New("DingTalk artifact delivery part has an invalid shape")
+		}
+		attachment := *part.Attachment
+		if err := validateDingTalkDeliveryPartAttachment(part, attachment, false); err != nil {
+			return dingtalkOutboundMessage{}, err
+		}
+		mediaID := strings.TrimSpace(part.PreparedResourceID)
+		if isDingTalkPDFAttachment(attachment) {
+			return dingtalkFileMessage(mediaID, dingTalkPDFFileName(attachment)), nil
+		}
+		alt := strings.TrimSpace(attachment.Name)
+		if alt == "" {
+			alt = "image"
+		}
+		return dingtalkMarkdownMessage("![" + alt + "](" + mediaID + ")"), nil
+	default:
+		return dingtalkOutboundMessage{}, fmt.Errorf("DingTalk delivery part kind %q is unsupported", part.Kind)
+	}
 }
 
 func (a *DingtalkAdapter) QueryReceipt(ctx context.Context, externalMessageID string) (adapter.DeliveryAck, error) {
@@ -1049,16 +1395,46 @@ func safeDingTalkAttachmentName(name string) string {
 	return base
 }
 
-func validDingtalkImageReference(ref string) bool {
-	ref = strings.TrimSpace(ref)
-	if ref == "" || strings.ContainsAny(ref, "\r\n[]() \t") {
+func validateDingTalkAttachmentName(name string) error {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return nil
+	}
+	if safeDingTalkAttachmentName(trimmed) != trimmed {
+		return errors.New("DingTalk attachment name must not contain a path or URL")
+	}
+	if hasDingTalkAttachmentNameScheme(trimmed) {
+		return errors.New("DingTalk attachment name must not contain a URI scheme or drive prefix")
+	}
+	if strings.ContainsAny(trimmed, "\r\n[]()!`<>") {
+		return errors.New("DingTalk attachment name contains unsafe Markdown characters")
+	}
+	return nil
+}
+
+func hasDingTalkAttachmentNameScheme(name string) bool {
+	colon := strings.IndexByte(name, ':')
+	if colon <= 0 {
 		return false
 	}
-	if strings.HasPrefix(ref, "@") {
-		return len(ref) <= 512
+	for index := 0; index < colon; index++ {
+		char := name[index]
+		if index == 0 {
+			if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') {
+				return false
+			}
+			continue
+		}
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
+			(char < '0' || char > '9') && char != '+' && char != '-' && char != '.' {
+			return false
+		}
 	}
-	u, err := url.Parse(ref)
-	return err == nil && strings.EqualFold(u.Scheme, "https") && u.Host != ""
+	return true
+}
+
+func validDingtalkImageReference(ref string) bool {
+	return validDingTalkFileMediaID(ref)
 }
 
 // sendThinkingFeedback 发送「正在思考」占位并返回其 processQueryKey（供答案就位后撤回）。
@@ -1230,19 +1606,75 @@ func dingtalkMessageTitle(content string) string {
 // SendStream 流式发送（拼接后一次性发送）
 func (a *DingtalkAdapter) SendStream(ctx context.Context, chatID string, chunks <-chan *adapter.ReplyChunk) error {
 	var sb strings.Builder
+	var terminal *adapter.ReplyChunk
 	for chunk := range chunks {
 		if chunk.Error != nil {
 			return chunk.Error
 		}
 		sb.WriteString(chunk.Content)
+		if chunk.Done {
+			terminal = chunk
+		}
+	}
+	reply := &adapter.Reply{Content: adapter.StripThinking(sb.String())}
+	if terminal != nil {
+		reply.Metadata = terminal.Metadata
+		reply.MessageContent = terminal.MessageContent
+		reply.RenderManifest = terminal.RenderManifest
+		reply.ToolCalls = terminal.ToolCalls
 	}
 	// v0.4.0 E2：剥离 <think>/<thinking>/<reasoning> 防泄漏给终端用户
-	return a.Send(ctx, chatID, &adapter.Reply{Content: adapter.StripThinking(sb.String())})
+	return a.Send(ctx, chatID, reply)
 }
 
 // handleMessage 处理消息
 func (a *DingtalkAdapter) handleMessage(event dtEvent) {
 	a.handleMessageContext(context.Background(), event)
+}
+
+// admitInboundPhotoBeforeACK 只在注入耐久端口时接管 direct 图片：先下载一次并构造
+// canonical Message，再同步完成耐久接纳。未匹配消息保留预下载附件交给旧 worker。
+func (a *DingtalkAdapter) admitInboundPhotoBeforeACK(
+	ctx context.Context, event *dtEvent,
+) (bool, error) {
+	port := a.currentInboundPhotoAdmissionPort()
+	if port == nil || event == nil || event.MsgType != dtMsgTypePicture ||
+		strings.TrimSpace(event.Content.DownloadCode) == "" {
+		return false, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	attachment, err := a.downloadPictureAttachment(ctx, event.Content.DownloadCode)
+	if err != nil {
+		return false, fmt.Errorf("DingTalk inbound photo download before durable admission: %w", err)
+	}
+	event.Attachments = []adapter.Attachment{attachment}
+	handled, err := port.AdmitInboundPhoto(ctx, a.messageFromEvent(*event, event.Attachments))
+	if err != nil {
+		return false, fmt.Errorf("DingTalk inbound photo durable admission failed: %w", err)
+	}
+	return handled, nil
+}
+
+func (a *DingtalkAdapter) messageFromEvent(
+	event dtEvent, attachments []adapter.Attachment,
+) *adapter.Message {
+	return &adapter.Message{
+		ID:          event.MsgID,
+		Platform:    adapter.PlatformDingtalk,
+		InstanceID:  a.Name(),
+		ChatID:      event.SenderStaffId,
+		UserID:      event.SenderStaffId,
+		UserName:    event.SenderNick,
+		Content:     strings.TrimSpace(event.Text.Content),
+		Attachments: append([]adapter.Attachment(nil), attachments...),
+		Timestamp:   time.Now(),
+		Metadata: map[string]string{
+			"conversation_id":   event.ConversationId,
+			"conversation_type": event.ConversationType,
+		},
+	}
 }
 
 func (a *DingtalkAdapter) handleMessageContext(baseCtx context.Context, event dtEvent) {
@@ -1279,7 +1711,7 @@ func (a *DingtalkAdapter) handleMessageContext(baseCtx context.Context, event dt
 	// picture 消息（BUG-20260709）：downloadCode → 临时下载 URL → 图片字节 → image 附件，
 	// 与桌面/web 同走 BuildMultimodalUserMessage 多模态管道（无 vision 模型时引擎有友好拒绝）。
 	// 下载失败给用户明确提示，绝不静默丢弃。
-	var attachments []adapter.Attachment
+	attachments := append([]adapter.Attachment(nil), event.Attachments...)
 	if event.Content.DownloadCode != "" {
 		// BUG-20260710：钉钉的语音/视频/文件回调同样以 content.downloadCode 承载。
 		// 只有 msgtype=picture 才能走图片下载进多模态管道；其余类型硬贴 image 附件
@@ -1291,15 +1723,17 @@ func (a *DingtalkAdapter) handleMessageContext(baseCtx context.Context, event dt
 			_ = a.sendReplyToEvent(ntCtx, event, &adapter.Reply{Content: dingtalkUnsupportedMediaFeedback})
 			return
 		}
-		att, err := a.downloadPictureAttachment(ctx, event.Content.DownloadCode)
-		if err != nil {
-			logger.Error("钉钉: 下载图片消息失败", "error", err)
-			errCtx, errCancel := terminalNotifyCtx()
-			defer errCancel()
-			_ = a.sendReplyToEvent(errCtx, event, &adapter.Reply{Content: "⚠️ 图片获取失败，请重新发送一次。"})
-			return
+		if len(attachments) == 0 {
+			att, err := a.downloadPictureAttachment(ctx, event.Content.DownloadCode)
+			if err != nil {
+				logger.Error("钉钉: 下载图片消息失败", "error", err)
+				errCtx, errCancel := terminalNotifyCtx()
+				defer errCancel()
+				_ = a.sendReplyToEvent(errCtx, event, &adapter.Reply{Content: "⚠️ 图片获取失败，请重新发送一次。"})
+				return
+			}
+			attachments = append(attachments, att)
 		}
-		attachments = append(attachments, att)
 	}
 	if !adapter.HasMessageInput(content, attachments) {
 		return
@@ -1309,21 +1743,8 @@ func (a *DingtalkAdapter) handleMessageContext(baseCtx context.Context, event dt
 	if event.ConversationType == "2" && strings.TrimSpace(event.ConversationId) != "" {
 		chatID = event.ConversationId
 	}
-	msg := &adapter.Message{
-		ID:          "dt-" + idgen.ShortID(),
-		Platform:    adapter.PlatformDingtalk,
-		InstanceID:  a.Name(),
-		ChatID:      chatID,
-		UserID:      event.SenderStaffId,
-		UserName:    event.SenderNick,
-		Content:     content,
-		Attachments: attachments,
-		Timestamp:   time.Now(),
-		Metadata: map[string]string{
-			"conversation_id":   event.ConversationId,
-			"conversation_type": event.ConversationType,
-		},
-	}
+	msg := a.messageFromEvent(event, attachments)
+	msg.ChatID = chatID
 
 	// 普通文本在完成输入校验后发送原有思考占位；图片占位已在下载前发出。
 	if !thinkingSent {
@@ -1493,6 +1914,7 @@ func (a *DingtalkAdapter) Health(_ context.Context) error {
 
 // dtEvent 钉钉消息事件
 type dtEvent struct {
+	MsgID            string `json:"msgId"`
 	ConversationId   string `json:"conversationId"`
 	ConversationType string `json:"conversationType"`
 	SenderStaffId    string `json:"senderStaffId"`
@@ -1506,6 +1928,7 @@ type dtEvent struct {
 	Content struct {
 		DownloadCode string `json:"downloadCode"`
 	} `json:"content"`
+	Attachments []adapter.Attachment `json:"-"`
 }
 
 // marshalMarkdownContent 生成 sampleMarkdown 的 {"title","text"} 载荷

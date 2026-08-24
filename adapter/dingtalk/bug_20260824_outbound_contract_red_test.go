@@ -27,7 +27,7 @@ import (
 	sqlitestore "github.com/hexagon-codes/hexclaw/storage/sqlite"
 )
 
-func TestDingTalkImageURLCannotBypassMediaUpload(t *testing.T) {
+func TestDingTalkImageURLIsRejectedBeforeMediaUpload(t *testing.T) {
 	client := newTestAdapter()
 	client.queue = nil
 	fake := newFakeConversationOpenAPI()
@@ -44,22 +44,18 @@ func TestDingTalkImageURLCannotBypassMediaUpload(t *testing.T) {
 		}},
 	})
 
-	if err != nil {
-		t.Fatalf("发送带图片字节的 Markdown 回复: %v", err)
+	if err == nil {
+		t.Fatal("Attachment.URL 必须在媒体上传前 fail closed")
 	}
 	fake.mu.Lock()
 	uploads := append([]adapter.Attachment(nil), fake.uploads...)
 	fake.mu.Unlock()
-	// URL 只是内部附件元数据，不能冒充钉钉媒体引用并绕过真实上传。
-	if len(uploads) != 1 {
-		t.Fatalf("DingTalk UploadImage 调用次数=%d，期望 1", len(uploads))
+	if len(uploads) != 0 {
+		t.Fatalf("Attachment.URL 触发 DingTalk UploadImage: %d", len(uploads))
 	}
 	calls := fake.SendCalls()
-	if len(calls) != 1 {
-		t.Fatalf("SendOTO 调用次数=%d，期望 1", len(calls))
-	}
-	if strings.Contains(calls[0].Text, "https://internal.invalid/creative-work.png") {
-		t.Fatalf("Attachment.URL 绕过了 DingTalk UploadImage: %q", calls[0].Text)
+	if len(calls) != 0 {
+		t.Fatalf("Attachment.URL 触发 SendOTO: %#v", calls)
 	}
 }
 

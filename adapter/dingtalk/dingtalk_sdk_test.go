@@ -29,6 +29,7 @@ func TestOnChatBotMessage_MapsToAdapterMessage(t *testing.T) {
 	a.openAPI = newFakeDingtalkOpenAPI("tok")
 
 	data := &dtchatbot.BotCallbackDataModel{
+		MsgId:            "provider-msg-map-1",
 		ConversationId:   "conv-1",
 		ConversationType: "1",
 		SenderStaffId:    "staff-42",
@@ -79,7 +80,7 @@ func TestOnChatBotMessage_EmptyContent_Ignored(t *testing.T) {
 		return nil, nil
 	}
 
-	data := &dtchatbot.BotCallbackDataModel{SenderStaffId: "u1"}
+	data := &dtchatbot.BotCallbackDataModel{MsgId: "provider-msg-empty-1", SenderStaffId: "u1"}
 	data.Text.Content = "   "
 
 	ack, err := a.onChatBotMessage(context.Background(), data)

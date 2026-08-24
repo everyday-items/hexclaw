@@ -74,8 +74,8 @@ func ensureDingTalkRenderEvidence(reply *adapter.Reply) error {
 	}
 	parts = append(parts, messagecontent.RenderPart{Kind: messagecontent.PartMarkdown, Text: projected})
 	for _, attachment := range reply.Attachments {
-		if !adapter.IsImageAttachment(attachment) {
-			return errors.New("DingTalk only supports image attachments")
+		if !adapter.IsImageAttachment(attachment) && !isDingTalkPDFAttachment(attachment) {
+			return errors.New("DingTalk attachment type is unsupported")
 		}
 		digest, assetID, err := dingTalkAttachmentIdentity(attachment)
 		if err != nil {
@@ -155,8 +155,8 @@ func validateDingTalkAttachmentProjection(
 		return errors.New("dingtalk: render manifest artifact parts do not match reply attachments")
 	}
 	for i, attachment := range attachments {
-		if !adapter.IsImageAttachment(attachment) {
-			return errors.New("DingTalk only supports image attachments")
+		if !adapter.IsImageAttachment(attachment) && !isDingTalkPDFAttachment(attachment) {
+			return errors.New("DingTalk attachment type is unsupported")
 		}
 		digest, _, err := dingTalkAttachmentIdentity(attachment)
 		if err != nil {
@@ -179,21 +179,111 @@ func validateDingTalkAttachmentProjection(
 	return nil
 }
 
+func validateDingTalkDeliveryPartCanonicalEvidence(part adapter.DeliveryPart, requireBytes bool) error {
+	if part.MessageContent == nil || part.RenderManifest == nil {
+		return errors.New("DingTalk delivery part requires canonical content and render manifest")
+	}
+	if err := part.RenderManifest.ValidateFor(*part.MessageContent); err != nil {
+		return fmt.Errorf("DingTalk delivery part render evidence is invalid: %w", err)
+	}
+	if part.Ordinal < 1 || part.Ordinal > len(part.RenderManifest.Parts) {
+		return errors.New("DingTalk delivery part ordinal is out of range")
+	}
+	if !validDingTalkSHA256Digest(part.Digest) {
+		return errors.New("DingTalk delivery part digest is invalid")
+	}
+	selected := part.RenderManifest.Parts[part.Ordinal-1]
+	if selected.Kind != part.Kind {
+		return errors.New("DingTalk delivery part kind does not match render manifest")
+	}
+
+	switch part.Kind {
+	case messagecontent.PartMarkdown:
+		if part.Ordinal != 1 || part.MIME != "" || part.Attachment != nil {
+			return errors.New("DingTalk markdown delivery part has artifact fields")
+		}
+		if part.Text != selected.Text {
+			return errors.New("DingTalk markdown delivery part text does not match render manifest")
+		}
+		sum := sha256.Sum256([]byte(part.MessageContent.Markdown))
+		if part.Digest != "sha256:"+hex.EncodeToString(sum[:]) {
+			return errors.New("DingTalk markdown delivery part digest does not match canonical source")
+		}
+	case messagecontent.PartArtifact:
+		if part.Ordinal < 2 || part.Text != "" || part.Attachment == nil {
+			return errors.New("DingTalk artifact delivery part fields are incomplete")
+		}
+		attachmentIndex := part.Ordinal - 2
+		if attachmentIndex >= len(part.MessageContent.Attachments) {
+			return errors.New("DingTalk artifact delivery part has no canonical attachment")
+		}
+		attachment := *part.Attachment
+		ref := part.MessageContent.Attachments[attachmentIndex]
+		if part.MIME != attachment.Mime || ref.MIME != part.MIME || ref.Name != attachment.Name ||
+			ref.Digest != part.Digest || selected.ArtifactRef != ref.AssetID ||
+			selected.ArtifactDigest != part.Digest || selected.AltText != ref.AltText {
+			return errors.New("DingTalk artifact delivery part does not match canonical attachment")
+		}
+		if requireBytes {
+			digest, assetID, err := dingTalkAttachmentIdentity(attachment)
+			if err != nil {
+				return err
+			}
+			if digest != part.Digest || assetID != ref.AssetID {
+				return errors.New("DingTalk artifact delivery part bytes do not match canonical attachment")
+			}
+		}
+	default:
+		return fmt.Errorf("DingTalk delivery part kind %q is unsupported", part.Kind)
+	}
+	return nil
+}
+
+func validDingTalkSHA256Digest(value string) bool {
+	raw, ok := strings.CutPrefix(value, "sha256:")
+	decoded, err := hex.DecodeString(raw)
+	return ok && err == nil && len(decoded) == sha256.Size
+}
+
 func dingTalkAttachmentIdentity(attachment adapter.Attachment) (string, string, error) {
-	encoded := strings.TrimSpace(attachment.Data)
-	if comma := strings.IndexByte(encoded, ','); strings.HasPrefix(strings.ToLower(encoded), "data:") && comma >= 0 {
-		encoded = encoded[comma+1:]
-	}
-	if encoded == "" {
-		return "", "", errors.New("DingTalk image attachment bytes are required")
-	}
-	raw, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil || len(raw) == 0 {
-		return "", "", errors.New("DingTalk image attachment bytes are invalid")
+	raw, err := dingTalkAttachmentBytes(attachment)
+	if err != nil {
+		return "", "", err
 	}
 	sum := sha256.Sum256(raw)
 	hexDigest := hex.EncodeToString(sum[:])
 	return "sha256:" + hexDigest, "attachment:" + hexDigest, nil
+}
+
+func dingTalkAttachmentBytes(attachment adapter.Attachment) ([]byte, error) {
+	if !adapter.IsImageAttachment(attachment) && !isDingTalkPDFAttachment(attachment) {
+		return nil, errors.New("DingTalk attachment type is unsupported")
+	}
+	if strings.TrimSpace(attachment.URL) != "" {
+		return nil, errors.New("DingTalk attachment URL sources are forbidden")
+	}
+	if err := validateDingTalkAttachmentName(attachment.Name); err != nil {
+		return nil, err
+	}
+	encoded := strings.TrimSpace(attachment.Data)
+	if strings.HasPrefix(strings.ToLower(encoded), "data:") {
+		return nil, errors.New("DingTalk attachment data URI sources are forbidden")
+	}
+	if encoded == "" {
+		return nil, errors.New("DingTalk attachment bytes are required")
+	}
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(raw) == 0 {
+		return nil, errors.New("DingTalk attachment bytes are invalid")
+	}
+	if isDingTalkPDFAttachment(attachment) && !strings.HasPrefix(string(raw), "%PDF-") {
+		return nil, errors.New("DingTalk PDF attachment bytes have invalid magic")
+	}
+	return raw, nil
+}
+
+func isDingTalkPDFAttachment(attachment adapter.Attachment) bool {
+	return strings.EqualFold(strings.TrimSpace(attachment.Mime), "application/pdf")
 }
 
 func dingTalkCompatibleManifest(manifest messagecontent.RenderManifest) bool {

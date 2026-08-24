@@ -93,6 +93,134 @@ type Message struct {
 	Attachments []Attachment
 }
 
+// DeliveryPart 是一次外发只处理一个冻结 part 的通道中立载荷。
+// 完整 canonical 证据随每个 part 保留，但 Text 与 Attachment 只允许二选一。
+type DeliveryPart struct {
+	Kind               messagecontent.PartKind        `json:"kind"`
+	MIME               string                         `json:"mime,omitempty"`
+	Ordinal            int                            `json:"ordinal"`
+	Digest             string                         `json:"digest"`
+	Text               string                         `json:"text,omitempty"`
+	Attachment         *Attachment                    `json:"attachment,omitempty"`
+	MessageContent     *messagecontent.MessageContent `json:"message_content"`
+	RenderManifest     *messagecontent.RenderManifest `json:"render_manifest"`
+	PreparedResourceID string                         `json:"-"`
+}
+
+// DeliveryParts 把一份 canonical 消息冻结为 Markdown 在前、附件随后的一组单 part 载荷。
+func (m Message) DeliveryParts() ([]DeliveryPart, error) {
+	if err := m.Validate(); err != nil {
+		return nil, err
+	}
+	if m.Content == nil || m.RenderManifest == nil {
+		return nil, errors.New("channel: canonical delivery evidence is required")
+	}
+	if len(m.RenderManifest.Parts) != len(m.Attachments)+1 ||
+		m.RenderManifest.Parts[0].Kind != messagecontent.PartMarkdown {
+		return nil, errors.New("channel: delivery manifest must contain one markdown part followed by its artifacts")
+	}
+
+	content := *m.Content
+	content.Attachments = append([]messagecontent.AttachmentRef(nil), m.Content.Attachments...)
+	manifest := *m.RenderManifest
+	manifest.Parts = append([]messagecontent.RenderPart(nil), m.RenderManifest.Parts...)
+	markdownSum := sha256.Sum256([]byte(content.Markdown))
+	parts := make([]DeliveryPart, 0, len(manifest.Parts))
+	parts = append(parts, DeliveryPart{
+		Kind:           messagecontent.PartMarkdown,
+		Ordinal:        1,
+		Digest:         "sha256:" + hex.EncodeToString(markdownSum[:]),
+		Text:           manifest.Parts[0].Text,
+		MessageContent: &content,
+		RenderManifest: &manifest,
+	})
+	for i, attachment := range m.Attachments {
+		copyAttachment := Attachment{
+			Name: attachment.Name,
+			MIME: attachment.MIME,
+			Data: append([]byte(nil), attachment.Data...),
+		}
+		parts = append(parts, DeliveryPart{
+			Kind:           messagecontent.PartArtifact,
+			MIME:           attachment.MIME,
+			Ordinal:        i + 2,
+			Digest:         content.Attachments[i].Digest,
+			Attachment:     &copyAttachment,
+			MessageContent: &content,
+			RenderManifest: &manifest,
+		})
+	}
+	for i := range parts {
+		if err := parts[i].Validate(); err != nil {
+			return nil, fmt.Errorf("channel: delivery part %d is invalid: %w", i+1, err)
+		}
+	}
+	return parts, nil
+}
+
+// Validate 校验单 part 与完整 canonical source/manifest 的身份一致性。
+func (p DeliveryPart) Validate() error {
+	if p.MessageContent == nil || p.RenderManifest == nil {
+		return errors.New("channel: delivery part requires canonical content and render manifest")
+	}
+	if err := p.RenderManifest.ValidateFor(*p.MessageContent); err != nil {
+		return fmt.Errorf("channel: invalid delivery part render evidence: %w", err)
+	}
+	if p.Ordinal < 1 || p.Ordinal > len(p.RenderManifest.Parts) {
+		return errors.New("channel: delivery part ordinal is out of range")
+	}
+	if !validSHA256Digest(p.Digest) {
+		return errors.New("channel: delivery part digest is invalid")
+	}
+	selected := p.RenderManifest.Parts[p.Ordinal-1]
+	if selected.Kind != p.Kind {
+		return errors.New("channel: delivery part kind does not match render manifest")
+	}
+	switch p.Kind {
+	case messagecontent.PartMarkdown:
+		if p.Ordinal != 1 || p.MIME != "" || p.Attachment != nil || p.PreparedResourceID != "" {
+			return errors.New("channel: markdown delivery part has artifact fields")
+		}
+		if p.Text != selected.Text {
+			return errors.New("channel: markdown delivery part text does not match render manifest")
+		}
+		sum := sha256.Sum256([]byte(p.MessageContent.Markdown))
+		if p.Digest != "sha256:"+hex.EncodeToString(sum[:]) {
+			return errors.New("channel: markdown delivery part digest does not match canonical source")
+		}
+	case messagecontent.PartArtifact:
+		if p.Ordinal < 2 || p.Text != "" || p.Attachment == nil {
+			return errors.New("channel: artifact delivery part fields are incomplete")
+		}
+		if err := validateCanonicalAttachment(*p.Attachment); err != nil {
+			return err
+		}
+		attachmentIndex := p.Ordinal - 2
+		if attachmentIndex >= len(p.MessageContent.Attachments) {
+			return errors.New("channel: artifact delivery part has no canonical attachment")
+		}
+		ref := p.MessageContent.Attachments[attachmentIndex]
+		if p.MIME != p.Attachment.MIME || ref.MIME != p.MIME || ref.Name != p.Attachment.Name ||
+			ref.Digest != p.Digest || selected.ArtifactRef != ref.AssetID ||
+			selected.ArtifactDigest != p.Digest || selected.AltText != ref.AltText {
+			return errors.New("channel: artifact delivery part does not match canonical attachment")
+		}
+		sum := sha256.Sum256(p.Attachment.Data)
+		if p.Digest != "sha256:"+hex.EncodeToString(sum[:]) {
+			return errors.New("channel: artifact delivery part digest does not match bytes")
+		}
+	default:
+		return fmt.Errorf("channel: unsupported delivery part kind %q", p.Kind)
+	}
+	return nil
+}
+
+func validSHA256Digest(value string) bool {
+	raw, ok := strings.CutPrefix(value, "sha256:")
+	decoded, err := hex.DecodeString(raw)
+	return ok && err == nil && len(decoded) == sha256.Size
+}
+
 func NewCanonicalMessage(producer messagecontent.ProducerKind, locale, markdown, projectedText, fallbackReason string) (Message, error) {
 	return NewCanonicalMessageWithAttachments(producer, locale, markdown, projectedText, fallbackReason, nil)
 }
@@ -109,6 +237,9 @@ func newCanonicalMessage(producer messagecontent.ProducerKind, locale, markdown,
 	refs := make([]messagecontent.AttachmentRef, 0, len(attachments))
 	parts := []messagecontent.RenderPart{{Kind: partKind, Text: projectedText}}
 	for _, attachment := range attachments {
+		if err := validateCanonicalAttachment(attachment); err != nil {
+			return Message{}, err
+		}
 		sum := sha256.Sum256(attachment.Data)
 		digest := "sha256:" + hex.EncodeToString(sum[:])
 		ref := "inline:" + hex.EncodeToString(sum[:])
@@ -166,6 +297,9 @@ func (m Message) Validate() error {
 		return errors.New("channel: attachment projection does not match canonical references")
 	}
 	for i, attachment := range m.Attachments {
+		if err := validateCanonicalAttachment(attachment); err != nil {
+			return err
+		}
 		sum := sha256.Sum256(attachment.Data)
 		wantDigest := "sha256:" + hex.EncodeToString(sum[:])
 		ref := m.Content.Attachments[i]
@@ -184,6 +318,30 @@ func (m Message) Validate() error {
 		return errors.New("channel: visible text does not match render manifest parts")
 	}
 	return nil
+}
+
+func validateCanonicalAttachment(attachment Attachment) error {
+	name := strings.TrimSpace(attachment.Name)
+	if name == "" {
+		return errors.New("channel: attachment name is required")
+	}
+	lowerName := strings.ToLower(name)
+	for _, prefix := range []string{"asset:", "file:", "http:", "https:", "blob:", "data:"} {
+		if strings.HasPrefix(lowerName, prefix) {
+			return errors.New("channel: attachment name must not contain a URL or path")
+		}
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return errors.New("channel: attachment name must not contain a URL or path")
+	}
+	if len(attachment.Data) == 0 {
+		return errors.New("channel: attachment bytes are required")
+	}
+	mime := strings.ToLower(strings.TrimSpace(attachment.MIME))
+	if mime == "application/pdf" || (strings.HasPrefix(mime, "image/") && mime != "image/") {
+		return nil
+	}
+	return fmt.Errorf("channel: unsupported attachment MIME %q", attachment.MIME)
 }
 
 // Port 是通道端口（ChannelPort）。方法集从现状消费点提炼：
@@ -225,4 +383,11 @@ type ReceiptPort interface {
 	Port
 	SendMessageWithReceipt(ctx context.Context, to Target, msg Message) (DeliveryAck, error)
 	QueryReceipt(ctx context.Context, to Target, externalMessageID string) (DeliveryAck, error)
+}
+
+// PartReceiptPort 是逐 part 媒体准备与可核验外发的可选通道能力。
+type PartReceiptPort interface {
+	ReceiptPort
+	PrepareDeliveryPartResource(ctx context.Context, to Target, part DeliveryPart) (preparedResourceID string, err error)
+	SendPreparedPartWithReceipt(ctx context.Context, to Target, part DeliveryPart) (DeliveryAck, error)
 }

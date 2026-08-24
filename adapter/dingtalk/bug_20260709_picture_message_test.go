@@ -89,6 +89,7 @@ func TestBUG20260709_StreamPictureMessage_ReachesHandlerWithImageAttachment(t *t
 	a.handler = capturePictureHandler(ch)
 
 	_, err := a.onChatBotMessage(context.Background(), &dtchatbot.BotCallbackDataModel{
+		MsgId:            "provider-picture-stream-1",
 		ConversationId:   "cid-1",
 		ConversationType: "1",
 		SenderStaffId:    "staff-1",
@@ -120,7 +121,7 @@ func TestBUG20260709_WebhookPictureMessage_ReachesHandlerWithImageAttachment(t *
 	ch := make(chan *adapter.Message, 1)
 	a.handler = capturePictureHandler(ch)
 
-	body := `{"msgtype":"picture","content":{"downloadCode":"dl-code-2"},"senderStaffId":"staff-2","senderNick":"测试家长","conversationId":"cid-2","conversationType":"1"}`
+	body := `{"msgId":"provider-picture-webhook-1","msgtype":"picture","content":{"downloadCode":"dl-code-2"},"senderStaffId":"staff-2","senderNick":"测试家长","conversationId":"cid-2","conversationType":"1"}`
 	req := httptest.NewRequest(http.MethodPost, "/webhook/dingtalk", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	a.handleWebhook(rec, req)

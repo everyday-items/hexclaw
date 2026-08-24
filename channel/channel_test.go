@@ -8,12 +8,16 @@ package channel_test
 //   - 限绑语义（§3.12）归属通道层：同一私聊目标同一时间只绑一个 TutorAgent。
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/channel"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 )
 
 // fakePort 契约测试替身：记录发送调用。
@@ -122,6 +126,101 @@ func TestTarget_SendKeyInstanceFirst(t *testing.T) {
 	}
 	if k := (channel.Target{Platform: "dingtalk"}).SendKey(); k != "dingtalk" {
 		t.Fatalf("无实例 ID 应退回平台名, got %q", k)
+	}
+}
+
+func TestCanonicalAttachmentProjectionPreservesImageAndPDFArtifacts(t *testing.T) {
+	tests := []struct {
+		name string
+		file string
+		mime string
+		data []byte
+	}{
+		{
+			name: "image",
+			file: "creative-work.png",
+			mime: "image/png",
+			data: []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a},
+		},
+		{
+			name: "PDF",
+			file: "weekly-practice.pdf",
+			mime: "application/pdf",
+			data: []byte("%PDF-1.7\n%%EOF\n"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg, err := channel.NewCanonicalMarkdownMessageWithAttachments(
+				messagecontent.ProducerK12,
+				"zh-CN",
+				"## 学习资料",
+				"## 学习资料",
+				"",
+				[]channel.Attachment{{Name: tt.file, MIME: tt.mime, Data: tt.data}},
+			)
+			if err != nil {
+				t.Fatalf("构造 canonical attachment: %v", err)
+			}
+			if err := msg.Validate(); err != nil {
+				t.Fatalf("验证 canonical attachment: %v", err)
+			}
+			if len(msg.Attachments) != 1 || msg.Attachments[0].Name != tt.file ||
+				msg.Attachments[0].MIME != tt.mime || !bytes.Equal(msg.Attachments[0].Data, tt.data) {
+				t.Fatalf("通道附件 bytes/MIME/name 发生变化: %#v", msg.Attachments)
+			}
+			if msg.Content == nil || len(msg.Content.Attachments) != 1 {
+				t.Fatalf("canonical attachment ref 缺失: %#v", msg.Content)
+			}
+			sum := sha256.Sum256(tt.data)
+			wantDigest := "sha256:" + hex.EncodeToString(sum[:])
+			ref := msg.Content.Attachments[0]
+			if ref.Name != tt.file || ref.MIME != tt.mime || ref.Digest != wantDigest {
+				t.Fatalf("canonical attachment ref 与输入不一致: %#v", ref)
+			}
+			if msg.RenderManifest == nil || len(msg.RenderManifest.Parts) != 2 {
+				t.Fatalf("attachment manifest parts 不完整: %#v", msg.RenderManifest)
+			}
+			artifact := msg.RenderManifest.Parts[1]
+			if artifact.Kind != messagecontent.PartArtifact || artifact.ArtifactRef != ref.AssetID ||
+				artifact.ArtifactDigest != wantDigest || artifact.AltText != tt.file {
+				t.Fatalf("PartArtifact 与 canonical ref 不一致: %#v", artifact)
+			}
+		})
+	}
+}
+
+func TestCanonicalAttachmentProjectionRejectsUnsafeOrUnsupportedAttachments(t *testing.T) {
+	tests := []struct {
+		name       string
+		attachment channel.Attachment
+	}{
+		{name: "asset URL", attachment: channel.Attachment{Name: "asset://child/work.png", MIME: "image/png", Data: []byte("image")}},
+		{name: "file URL", attachment: channel.Attachment{Name: "file:///Users/private/work.png", MIME: "image/png", Data: []byte("image")}},
+		{name: "HTTPS URL", attachment: channel.Attachment{Name: "https://internal.invalid/work.png", MIME: "image/png", Data: []byte("image")}},
+		{name: "blob URL", attachment: channel.Attachment{Name: "blob:https://desktop.invalid/work", MIME: "image/png", Data: []byte("image")}},
+		{name: "data URL", attachment: channel.Attachment{Name: "data:image/png;base64,aW1hZ2U=", MIME: "image/png", Data: []byte("image")}},
+		{name: "relative path", attachment: channel.Attachment{Name: "private/work.png", MIME: "image/png", Data: []byte("image")}},
+		{name: "POSIX path", attachment: channel.Attachment{Name: "/Users/private/work.png", MIME: "image/png", Data: []byte("image")}},
+		{name: "Windows path", attachment: channel.Attachment{Name: `C:\Users\private\work.png`, MIME: "image/png", Data: []byte("image")}},
+		{name: "UNC path", attachment: channel.Attachment{Name: `\\server\share\work.png`, MIME: "image/png", Data: []byte("image")}},
+		{name: "unsupported MIME", attachment: channel.Attachment{Name: "archive.zip", MIME: "application/zip", Data: []byte("archive")}},
+		{name: "empty bytes", attachment: channel.Attachment{Name: "work.png", MIME: "image/png"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg, err := channel.NewCanonicalMarkdownMessageWithAttachments(
+				messagecontent.ProducerK12,
+				"zh-CN",
+				"## 学习资料",
+				"## 学习资料",
+				"",
+				[]channel.Attachment{tt.attachment},
+			)
+			if err == nil {
+				t.Fatalf("不安全附件必须在 canonical 冻结前失败: %#v", msg)
+			}
+		})
 	}
 }
 

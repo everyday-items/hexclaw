@@ -62,10 +62,11 @@ type HealthReport struct {
 }
 
 type Manager struct {
-	db                *sql.DB
-	handler           adapter.MessageHandler
-	buildAdapter      func(*Instance) (adapter.Adapter, error)
-	disabledProviders map[string]bool
+	db                            *sql.DB
+	handler                       adapter.MessageHandler
+	buildAdapter                  func(*Instance) (adapter.Adapter, error)
+	disabledProviders             map[string]bool
+	dingtalkInboundPhotoAdmission dingtalk.InboundPhotoAdmissionPort
 
 	// box 负责 config_json 的静态加密/解密。可为 nil（部分测试不注入）：
 	// 此时凭据按明文直存直读，全链路退化为旧行为，不 crash。
@@ -92,6 +93,16 @@ func (m *Manager) SetHandler(h adapter.MessageHandler) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.handler = h
+}
+
+// SetDingTalkInboundPhotoAdmissionPort 注入钉钉 ACK 前的耐久图片接纳端口。
+// Manager 只负责在适配器启动前完成装配，不参与图片业务状态机。
+func (m *Manager) SetDingTalkInboundPhotoAdmissionPort(
+	port dingtalk.InboundPhotoAdmissionPort,
+) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dingtalkInboundPhotoAdmission = port
 }
 
 // SetDisabledProviders prevents selected platform adapters from starting.
@@ -512,6 +523,7 @@ func (m *Manager) Start(ctx context.Context, name string) error {
 	handler := m.handler
 	buildAdapter := m.buildAdapter
 	disabled := m.disabledProviders[strings.ToLower(inst.Provider)]
+	dingtalkInboundPhotoAdmission := m.dingtalkInboundPhotoAdmission
 	m.mu.RUnlock()
 	if alreadyRunning || alreadyInbound {
 		return nil
@@ -532,6 +544,13 @@ func (m *Manager) Start(ctx context.Context, name string) error {
 	if err != nil {
 		_ = m.setStatus(ctx, name, StatusError, err.Error())
 		return err
+	}
+	if strings.EqualFold(inst.Provider, "dingtalk") {
+		if configurable, ok := adp.(interface {
+			SetInboundPhotoAdmissionPort(dingtalk.InboundPhotoAdmissionPort)
+		}); ok {
+			configurable.SetInboundPhotoAdmissionPort(dingtalkInboundPhotoAdmission)
+		}
 	}
 	wrapped := m.wrapHandler(inst, handler)
 
@@ -652,6 +671,37 @@ func (m *Manager) SendWithReceipt(ctx context.Context, target, chatID string, re
 		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("adapter %q does not support delivery receipts", adp.Name())
 	}
 	return receiptAdapter.SendWithReceipt(ctx, chatID, reply)
+}
+
+// PrepareDeliveryPartResource 按稳定实例定位平台适配器并准备一个媒体 part。
+// 该阶段不得发送可见消息；返回值由上层回执账本持久化后才能进入发送阶段。
+func (m *Manager) PrepareDeliveryPartResource(ctx context.Context, target string, part adapter.DeliveryPart) (string, error) {
+	adp := m.resolveRunningAdapter(target)
+	if adp == nil {
+		return "", fmt.Errorf("no running adapter for target %q", target)
+	}
+	partAdapter, ok := adp.(adapter.DeliveryPartAdapter)
+	if !ok {
+		return "", fmt.Errorf("adapter %q does not support delivery part preparation", adp.Name())
+	}
+	return partAdapter.PrepareDeliveryPartResource(ctx, part)
+}
+
+// SendPreparedPartWithReceipt 只发送一个已经冻结并完成媒体准备的 part。
+func (m *Manager) SendPreparedPartWithReceipt(
+	ctx context.Context,
+	target, chatID string,
+	part adapter.DeliveryPart,
+) (adapter.DeliveryAck, error) {
+	adp := m.resolveRunningAdapter(target)
+	if adp == nil {
+		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("no running adapter for target %q", target)
+	}
+	partAdapter, ok := adp.(adapter.DeliveryPartAdapter)
+	if !ok {
+		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("adapter %q does not support delivery part receipts", adp.Name())
+	}
+	return partAdapter.SendPreparedPartWithReceipt(ctx, chatID, part)
 }
 
 // QueryReceipt reconciles an accepted or outcome-unknown proactive message

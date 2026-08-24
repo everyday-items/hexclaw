@@ -3,7 +3,10 @@ package channel
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
+
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 )
 
 // SendFunc 平台发送函数：由 composition root 注入（cmd/hexclaw 包
@@ -13,6 +16,8 @@ type SendFunc func(ctx context.Context, to Target, msg Message) error
 
 type ReceiptSendFunc func(ctx context.Context, to Target, msg Message) (DeliveryAck, error)
 type ReceiptQueryFunc func(ctx context.Context, to Target, externalMessageID string) (DeliveryAck, error)
+type DeliveryPartPrepareFunc func(ctx context.Context, to Target, part DeliveryPart) (preparedResourceID string, err error)
+type DeliveryPartSendFunc func(ctx context.Context, to Target, part DeliveryPart) (DeliveryAck, error)
 
 // DingTalk 钉钉通道：v0.5.0 唯一真实通道（§3.12「当前真实测试优先钉钉」）。
 // 它是既有钉钉直连路径的收敛点——不新增行为，只把「经 instanceMgr.Send 直发」
@@ -25,6 +30,8 @@ type DingTalk struct {
 	send         SendFunc
 	receiptSend  ReceiptSendFunc
 	receiptQuery ReceiptQueryFunc
+	partPrepare  DeliveryPartPrepareFunc
+	partSend     DeliveryPartSendFunc
 }
 
 // NewDingTalk 建钉钉通道（sender 待回填）。
@@ -46,6 +53,14 @@ func (d *DingTalk) SetReceiptTransport(send ReceiptSendFunc, query ReceiptQueryF
 	d.mu.Lock()
 	d.receiptSend = send
 	d.receiptQuery = query
+	d.mu.Unlock()
+}
+
+// SetDeliveryPartTransport 回填逐 part 的媒体准备与可核验发送函数。
+func (d *DingTalk) SetDeliveryPartTransport(prepare DeliveryPartPrepareFunc, send DeliveryPartSendFunc) {
+	d.mu.Lock()
+	d.partPrepare = prepare
+	d.partSend = send
 	d.mu.Unlock()
 }
 
@@ -108,6 +123,57 @@ func (d *DingTalk) QueryReceipt(ctx context.Context, to Target, externalMessageI
 		return unknown, fmt.Errorf("钉钉通道投递回执查询函数未回填: %w", ErrNotReady)
 	}
 	ack, err := query(ctx, to, externalMessageID)
+	if ack.Target.Platform == "" {
+		ack.Target = to
+	}
+	return ack, err
+}
+
+func (d *DingTalk) PrepareDeliveryPartResource(ctx context.Context, to Target, part DeliveryPart) (string, error) {
+	if err := to.EnsureDirect(); err != nil {
+		return "", fmt.Errorf("DingTalk delivery parts support direct targets only: %w", err)
+	}
+	if err := part.Validate(); err != nil {
+		return "", err
+	}
+	if part.Kind != messagecontent.PartArtifact || strings.TrimSpace(part.PreparedResourceID) != "" {
+		return "", fmt.Errorf("DingTalk media preparation requires one unprepared artifact part")
+	}
+	d.mu.RLock()
+	prepare := d.partPrepare
+	d.mu.RUnlock()
+	if prepare == nil {
+		return "", fmt.Errorf("DingTalk delivery part preparation is unavailable: %w", ErrNotReady)
+	}
+	resourceID, err := prepare(ctx, to, part)
+	if err != nil {
+		return "", err
+	}
+	resourceID = strings.TrimSpace(resourceID)
+	if resourceID == "" {
+		return "", fmt.Errorf("DingTalk media preparation returned an empty resource id")
+	}
+	return resourceID, nil
+}
+
+func (d *DingTalk) SendPreparedPartWithReceipt(ctx context.Context, to Target, part DeliveryPart) (DeliveryAck, error) {
+	failed := DeliveryAck{Status: DeliveryFailed, Target: to}
+	if err := to.EnsureDirect(); err != nil {
+		return failed, fmt.Errorf("DingTalk delivery parts support direct targets only: %w", err)
+	}
+	if err := part.Validate(); err != nil {
+		return failed, err
+	}
+	if part.Kind == messagecontent.PartArtifact && strings.TrimSpace(part.PreparedResourceID) == "" {
+		return failed, fmt.Errorf("DingTalk artifact delivery part has no prepared resource")
+	}
+	d.mu.RLock()
+	send := d.partSend
+	d.mu.RUnlock()
+	if send == nil {
+		return failed, fmt.Errorf("DingTalk delivery part sender is unavailable: %w", ErrNotReady)
+	}
+	ack, err := send(ctx, to, part)
 	if ack.Target.Platform == "" {
 		ack.Target = to
 	}

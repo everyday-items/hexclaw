@@ -48,7 +48,7 @@ func TestHandleWebhookBodyLimit(t *testing.T) {
 func validDingtalkWebhookBodyOfSize(t *testing.T, size int) []byte {
 	t.Helper()
 
-	prefix := []byte(`{"padding":"`)
+	prefix := []byte(`{"msgId":"provider-msg-body-limit-1","padding":"`)
 	suffix := []byte(`"}`)
 	paddingSize := size - len(prefix) - len(suffix)
 	if paddingSize < 0 {

@@ -183,6 +183,8 @@ type ReplyChunk struct {
 	// MessageContent is present only on the terminal chunk and covers the
 	// complete canonical reply, never an individual streaming delta.
 	MessageContent *messagecontent.MessageContent `json:"message_content,omitempty"`
+	// RenderManifest 仅在终态片段携带，并与完整 MessageContent 成对出现。
+	RenderManifest *messagecontent.RenderManifest `json:"render_manifest,omitempty"`
 	Reasoning      string                         `json:"reasoning,omitempty"`  // 推理/思考过程（增量）
 	Done           bool                           `json:"done"`                 // 是否为最后一个片段
 	Error          error                          `json:"error,omitempty"`      // 出错时的错误信息
@@ -260,6 +262,20 @@ type DeliveryAck struct {
 	Status            DeliveryStatus `json:"status"`
 }
 
+// DeliveryPart 是一次平台外发只处理一个冻结 part 的适配器载荷。
+// PreparedResourceID 是平台媒体引用；内部账本可持久化，但不进入 canonical payload、公开 API 或日志。
+type DeliveryPart struct {
+	Kind               messagecontent.PartKind        `json:"kind"`
+	MIME               string                         `json:"mime,omitempty"`
+	Ordinal            int                            `json:"ordinal"`
+	Digest             string                         `json:"digest"`
+	Text               string                         `json:"text,omitempty"`
+	Attachment         *Attachment                    `json:"attachment,omitempty"`
+	MessageContent     *messagecontent.MessageContent `json:"message_content"`
+	RenderManifest     *messagecontent.RenderManifest `json:"render_manifest"`
+	PreparedResourceID string                         `json:"-"`
+}
+
 // DeliveryReceiptAdapter is an optional capability implemented by adapters
 // whose provider offers an external message ID and a status-query endpoint.
 // Callers must feature-detect this interface; basic Adapter.Send remains the
@@ -268,6 +284,14 @@ type DeliveryReceiptAdapter interface {
 	Adapter
 	SendWithReceipt(ctx context.Context, chatID string, reply *Reply) (DeliveryAck, error)
 	QueryReceipt(ctx context.Context, externalMessageID string) (DeliveryAck, error)
+}
+
+// DeliveryPartAdapter 是逐 part 媒体准备与可核验外发的可选能力。
+// 媒体准备不得发送可见消息；发送阶段只消费已准备的资源引用且不得再次上传。
+type DeliveryPartAdapter interface {
+	DeliveryReceiptAdapter
+	PrepareDeliveryPartResource(ctx context.Context, part DeliveryPart) (preparedResourceID string, err error)
+	SendPreparedPartWithReceipt(ctx context.Context, chatID string, part DeliveryPart) (DeliveryAck, error)
 }
 
 // WebhookAdapter 表示可挂载到统一 HTTP ingress 的适配器。
