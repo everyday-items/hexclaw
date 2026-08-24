@@ -9,7 +9,9 @@ package main
 //     平台通用直发（cron 是平台通用面，不因 K12 留缝停摆）。
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -235,6 +237,81 @@ func TestK12IMDelivererFreezesReceiptPayloadBeforeProviderSend(t *testing.T) {
 	})
 	if err != nil || queried.Status != k12.DeliveryDelivered || queried.ExternalMessageID != "pqk-24" || ding.queryCalls != 1 {
 		t.Fatalf("query must preserve provider evidence: ack=%+v calls=%d err=%v", queried, ding.queryCalls, err)
+	}
+}
+
+func TestK12IMDelivererCreativeImageBridgePreservesMarkdownAndBytes(t *testing.T) {
+	d := &k12IMDeliverer{}
+	canonical := "## 美术作品\n\n### 可见证据\n\n- 彩虹的七种颜色层次清楚。"
+	imageBytes := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02, 0x03}
+	prepared, err := d.PrepareMessageForTargets(context.Background(), k12usecase.DeliveryMessage{
+		Content: canonical,
+		Attachments: []k12usecase.DeliveryAttachment{{
+			Name: "美术作品.png",
+			MIME: "image/png",
+			Data: imageBytes,
+		}},
+	}, []k12usecase.ResolvedDeliveryTarget{{
+		BindingID: "agent-rule:creative-image",
+		Target: k12.DeliveryTarget{
+			Platform: "dingtalk", InstanceID: "bot-1", ChatID: "parent-1",
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared) != 1 {
+		t.Fatalf("应只冻结一个物理投递目标，got %d", len(prepared))
+	}
+
+	var message channel.Message
+	if err := json.Unmarshal([]byte(prepared[0].PayloadJSON), &message); err != nil {
+		t.Fatal(err)
+	}
+	if message.Text != canonical || message.Content == nil || message.Content.Markdown != canonical {
+		t.Fatalf("创作作品 Markdown 必须完整穿过冻结载荷: %#v", message.Content)
+	}
+	if message.RenderManifest == nil || !message.RenderManifest.CapabilitySnapshot.Markdown ||
+		!message.RenderManifest.CapabilitySnapshot.Attachments {
+		t.Fatalf("冻结载荷必须声明 Markdown 与附件能力: %#v", message.RenderManifest)
+	}
+	if len(message.Attachments) != 1 || message.Attachments[0].Name != "美术作品.png" ||
+		message.Attachments[0].MIME != "image/png" || !bytes.Equal(message.Attachments[0].Data, imageBytes) {
+		t.Fatalf("冻结载荷必须保留图片名称、MIME 与原始字节: %#v", message.Attachments)
+	}
+
+	reply := adapterReplyFromChannelMessage(message)
+	if reply == nil || reply.Content != canonical || reply.MessageContent == nil ||
+		reply.MessageContent.Markdown != canonical || reply.RenderManifest == nil {
+		t.Fatalf("adapter bridge 必须保留 Markdown 与渲染证据: %#v", reply)
+	}
+	if len(reply.Attachments) != 1 || reply.Attachments[0].Type != "image" ||
+		reply.Attachments[0].Name != "美术作品.png" || reply.Attachments[0].Mime != "image/png" ||
+		reply.Attachments[0].URL != "" {
+		t.Fatalf("adapter bridge 必须生成单一内联图片附件: %#v", reply.Attachments)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(reply.Attachments[0].Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded, imageBytes) {
+		t.Fatalf("adapter 图片附件字节发生变化: got %x want %x", decoded, imageBytes)
+	}
+
+	for _, candidate := range []struct {
+		name  string
+		value string
+	}{
+		{name: "冻结载荷", value: prepared[0].PayloadJSON},
+		{name: "通道正文", value: message.Text},
+		{name: "adapter 正文", value: reply.Content},
+		{name: "adapter 附件 URL", value: reply.Attachments[0].URL},
+	} {
+		for _, forbidden := range []string{"asset://", "file://", "/Users/", `C:\\`} {
+			if strings.Contains(candidate.value, forbidden) {
+				t.Fatalf("%s 不得暴露 asset URI 或本地路径 %q: %q", candidate.name, forbidden, candidate.value)
+			}
+		}
 	}
 }
 
