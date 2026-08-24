@@ -39,6 +39,12 @@ type corpusScopedSemanticJobRepository interface {
 	CancelJobForCorpus(ctx context.Context, ownerID, corpusID, jobID string) (KnowledgeJob, error)
 }
 
+type ingestOCRPageRouteReceiptRepository interface {
+	ListIngestOCRPageRouteReceipts(
+		context.Context, string, string, string,
+	) ([]OCRPageRouteReceipt, error)
+}
+
 // SemanticIndexService is the stable facade used by future HTTP handlers.
 // Worker-specific lease/checkpoint methods intentionally remain on the concrete
 // repository rather than leaking into this API-facing surface.
@@ -380,11 +386,19 @@ func (s *SemanticIndexService) ApplyPolicy(
 }
 
 func (s *SemanticIndexService) GetJob(ctx context.Context, ownerID, jobID string) (KnowledgeJob, error) {
-	return s.repository.GetJob(ctx, ownerID, jobID)
+	job, err := s.repository.GetJob(ctx, ownerID, jobID)
+	if err != nil {
+		return KnowledgeJob{}, err
+	}
+	return s.enrichJobOCRPageRouteReceipts(ctx, job)
 }
 
 func (s *SemanticIndexService) CancelJob(ctx context.Context, ownerID, jobID string) (KnowledgeJob, error) {
-	return s.repository.CancelJob(ctx, ownerID, jobID)
+	job, err := s.repository.CancelJob(ctx, ownerID, jobID)
+	if err != nil {
+		return KnowledgeJob{}, err
+	}
+	return s.enrichJobOCRPageRouteReceipts(ctx, job)
 }
 
 // GetJobForCorpus and CancelJobForCorpus are the HTTP-facing variants. Worker
@@ -397,7 +411,33 @@ func (s *SemanticIndexService) GetJobForCorpus(
 	if !ok {
 		return KnowledgeJob{}, ErrSemanticIndexNotFound
 	}
-	return repository.GetJobForCorpus(ctx, ownerID, corpusID, jobID)
+	job, err := repository.GetJobForCorpus(ctx, ownerID, corpusID, jobID)
+	if err != nil {
+		return KnowledgeJob{}, err
+	}
+	return s.enrichJobOCRPageRouteReceipts(ctx, job)
+}
+
+func (s *SemanticIndexService) enrichJobOCRPageRouteReceipts(
+	ctx context.Context,
+	job KnowledgeJob,
+) (KnowledgeJob, error) {
+	job.OCRPageReceipts = []OCRPageRouteReceipt{}
+	if job.Kind != KnowledgeJobIngest {
+		return job, nil
+	}
+	repository, ok := s.repository.(ingestOCRPageRouteReceiptRepository)
+	if !ok {
+		return job, nil
+	}
+	receipts, err := repository.ListIngestOCRPageRouteReceipts(
+		ctx, job.OwnerID, job.CorpusUID, job.JobID,
+	)
+	if err != nil {
+		return KnowledgeJob{}, err
+	}
+	job.OCRPageReceipts = receipts
+	return job, nil
 }
 
 func (s *SemanticIndexService) CancelJobForCorpus(
@@ -407,7 +447,11 @@ func (s *SemanticIndexService) CancelJobForCorpus(
 	if !ok {
 		return KnowledgeJob{}, ErrSemanticIndexNotFound
 	}
-	return repository.CancelJobForCorpus(ctx, ownerID, corpusID, jobID)
+	job, err := repository.CancelJobForCorpus(ctx, ownerID, corpusID, jobID)
+	if err != nil {
+		return KnowledgeJob{}, err
+	}
+	return s.enrichJobOCRPageRouteReceipts(ctx, job)
 }
 
 func (s *SemanticIndexService) resolve(

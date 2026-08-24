@@ -43,6 +43,7 @@ func newAsyncIngestHarness(t *testing.T) (*sql.DB, *SemanticIndexService, contex
 		migrate.KnowledgeIngestCheckpointV28,
 		migrate.KnowledgeIngestExecutionV46,
 		migrate.KnowledgeUploadOperationsV71,
+		migrate.KnowledgeOCRRouteReceiptsV87,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +52,11 @@ func newAsyncIngestHarness(t *testing.T) (*sql.DB, *SemanticIndexService, contex
 		t.Fatal(err)
 	}
 	service := NewSemanticIndexService(repository, &staticEmbeddingResolver{})
+	service.ConfigureVisionRouteResolver(VisionRouteSnapshotResolverFunc(
+		func(context.Context) (VisionRouteSnapshot, error) {
+			return testOCRVisionRoute(), nil
+		},
+	))
 	if err := service.ConfigureDocumentIngest(filepath.Join(t.TempDir(), "objects")); err != nil {
 		t.Fatal(err)
 	}

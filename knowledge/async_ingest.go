@@ -131,22 +131,23 @@ type PersistedIngestDocument struct {
 }
 
 type KnowledgeDocumentProjection struct {
-	DocumentID         string         `json:"document_id"`
-	DocumentGeneration int64          `json:"document_generation"`
-	OwnerID            string         `json:"owner_id"`
-	CorpusID           string         `json:"corpus_id"`
-	Filename           string         `json:"filename"`
-	MediaType          string         `json:"media_type"`
-	SizeBytes          int64          `json:"size_bytes"`
-	SHA256             string         `json:"sha256"`
-	AgentID            string         `json:"agent_id,omitempty"`
-	LearnerID          string         `json:"learner_id,omitempty"`
-	Subject            string         `json:"subject,omitempty"`
-	Grade              string         `json:"grade,omitempty"`
-	PageCount          *int64         `json:"page_count,omitempty"`
-	TextIndexState     TextIndexState `json:"text_index_state"`
-	Warnings           []string       `json:"warnings"`
-	SourceSpans        []SourceSpan   `json:"source_spans,omitempty"`
+	DocumentID         string                `json:"document_id"`
+	DocumentGeneration int64                 `json:"document_generation"`
+	OwnerID            string                `json:"owner_id"`
+	CorpusID           string                `json:"corpus_id"`
+	Filename           string                `json:"filename"`
+	MediaType          string                `json:"media_type"`
+	SizeBytes          int64                 `json:"size_bytes"`
+	SHA256             string                `json:"sha256"`
+	AgentID            string                `json:"agent_id,omitempty"`
+	LearnerID          string                `json:"learner_id,omitempty"`
+	Subject            string                `json:"subject,omitempty"`
+	Grade              string                `json:"grade,omitempty"`
+	PageCount          *int64                `json:"page_count,omitempty"`
+	TextIndexState     TextIndexState        `json:"text_index_state"`
+	Warnings           []string              `json:"warnings"`
+	SourceSpans        []SourceSpan          `json:"source_spans,omitempty"`
+	OCRPageReceipts    []OCRPageRouteReceipt `json:"ocr_page_route_receipts"`
 }
 
 // SourceSpan is a durable coordinate back to the immutable uploaded source.
@@ -174,6 +175,32 @@ type IngestPageCheckpoint struct {
 	ContentDigest     string
 	SourceOffsetStart int64
 	SourceOffsetEnd   int64
+	OCRRouteReceipt   *OCRRouteReceipt
+}
+
+// OCRRouteReceipt 是一次视觉转写调用返回的脱敏执行事实。
+// Provider/Model 来自实际冻结路由，Fake 必须由执行适配器如实返回。
+type OCRRouteReceipt struct {
+	Provider  string `json:"provider"`
+	Model     string `json:"model"`
+	Operation string `json:"operation"`
+	Status    string `json:"status"`
+	Fake      bool   `json:"fake"`
+}
+
+const (
+	OCRRouteOperationPDFPage = "knowledge_pdf_page_ocr"
+	OCRRouteStatusSucceeded  = "succeeded"
+)
+
+// OCRPageRouteReceipt 把执行事实绑定到不可变源页与转写内容摘要。
+// 公开投影不包含页面原文、图片字节、凭据或 Provider 外部请求 ID。
+type OCRPageRouteReceipt struct {
+	PageNumber    int    `json:"page_number"`
+	PagesTotal    int64  `json:"pages_total"`
+	SourceDigest  string `json:"source_digest"`
+	ContentDigest string `json:"content_digest"`
+	OCRRouteReceipt
 }
 
 // IngestPageProgress is the lease-fenced page protocol exposed to resumable

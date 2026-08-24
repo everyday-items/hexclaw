@@ -1237,7 +1237,7 @@ func (m *Manager) searchResultsModeAtRevision(
 	if corpus, ok := m.repo.(SearchableCorpus); ok {
 		hasDocuments, err := corpus.HasSearchableDocuments(ctx)
 		if err == nil && !hasDocuments {
-			return nil, nil, nil
+			return []*SearchResult{}, []QueryEmbeddingReceipt{}, nil
 		}
 	}
 	cfg := m.cfg()

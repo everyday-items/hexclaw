@@ -330,6 +330,55 @@ func TestSemanticIndexJobHTTPContractAndErrorMapping(t *testing.T) {
 	}
 }
 
+func TestKnowledgeJobHTTPPublishesSanitizedOCRPageReceipts(t *testing.T) {
+	receipt := knowledge.OCRPageRouteReceipt{
+		PageNumber: 1, PagesTotal: 1,
+		SourceDigest: strings.Repeat("a", 64), ContentDigest: strings.Repeat("b", 64),
+		OCRRouteReceipt: knowledge.OCRRouteReceipt{
+			Provider: "hexclaw-gpt", Model: "gpt-5.6-sol",
+			Operation: knowledge.OCRRouteOperationPDFPage,
+			Status:    knowledge.OCRRouteStatusSucceeded, Fake: false,
+		},
+	}
+	stub := &semanticIndexServiceStub{
+		getJobFn: func(context.Context, string, string) (knowledge.KnowledgeJob, error) {
+			return knowledge.KnowledgeJob{}, nil
+		},
+		getScopedJobFn: func(context.Context, string, string, string) (knowledge.KnowledgeJob, error) {
+			return knowledge.KnowledgeJob{
+				JobID: "job-ocr", Kind: knowledge.KnowledgeJobIngest,
+				OCRPageReceipts: []knowledge.OCRPageRouteReceipt{receipt},
+			}, nil
+		},
+	}
+	stub.cancelJobFn = stub.getJobFn
+	ts := newSemanticIndexHTTPServer(t, stub)
+	resp, err := http.Get(ts.URL + "/api/v1/knowledge/jobs/job-ocr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	receipts, ok := payload["ocr_page_route_receipts"].([]any)
+	if resp.StatusCode != http.StatusOK || !ok || len(receipts) != 1 {
+		t.Fatalf("status=%d OCR receipts=%v", resp.StatusCode, payload["ocr_page_route_receipts"])
+	}
+	got := receipts[0].(map[string]any)
+	if got["provider"] != receipt.Provider || got["model"] != receipt.Model ||
+		got["fake"] != false || got["source_digest"] != receipt.SourceDigest ||
+		got["content_digest"] != receipt.ContentDigest {
+		t.Fatalf("public job OCR receipt=%v", got)
+	}
+	for _, forbidden := range []string{"job_id", "provider_instance_id", "external_request_id", "content"} {
+		if _, found := got[forbidden]; found {
+			t.Fatalf("public job OCR receipt exposed %q: %v", forbidden, got)
+		}
+	}
+}
+
 func TestSemanticIndexValidationErrorsAreClientErrors(t *testing.T) {
 	for _, semanticErr := range []error{
 		knowledge.ErrInvalidSelection,

@@ -47,6 +47,7 @@ func (p *restartablePageProcessor) PrepareResumable(
 		checkpoint := IngestPageCheckpoint{
 			PageNumber: page, PagesTotal: total, SourceDigest: source.SHA256,
 			ExtractionMode: "ocr_vlm", Content: text,
+			OCRRouteReceipt: testOCRRouteReceipt(),
 		}
 		if err := progress.CommitPage(ctx, checkpoint); err != nil {
 			return PreparedIngestDocument{}, err
@@ -150,6 +151,7 @@ func TestIngestPageCheckpointRejectsStaleLease(t *testing.T) {
 	if err := repo.SaveIngestPageCheckpoint(ctx, oldJob.Lease(), now, IngestPageCheckpoint{
 		PageNumber: 1, PagesTotal: 2, SourceDigest: source.SHA256,
 		ExtractionMode: "ocr_vlm", Content: "first page",
+		OCRRouteReceipt: testOCRRouteReceipt(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -162,6 +164,7 @@ func TestIngestPageCheckpointRejectsStaleLease(t *testing.T) {
 	err = repo.SaveIngestPageCheckpoint(ctx, oldJob.Lease(), stealAt, IngestPageCheckpoint{
 		PageNumber: 2, PagesTotal: 2, SourceDigest: source.SHA256,
 		ExtractionMode: "ocr_vlm", Content: "stale second page",
+		OCRRouteReceipt: testOCRRouteReceipt(),
 	})
 	if !errors.Is(err, ErrJobFenced) {
 		t.Fatalf("stale checkpoint error=%v, want ErrJobFenced", err)

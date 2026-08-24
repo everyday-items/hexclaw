@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -174,5 +175,55 @@ func TestHandleSearchKnowledge_MetadataFilter(t *testing.T) {
 		receiptPayload.Receipts[0].Model != "qwen3-embedding:8b" ||
 		receiptPayload.Receipts[0].Operation != "query_embedding" {
 		t.Fatalf("C09 receipt response drift: %+v", receiptPayload)
+	}
+}
+
+func TestHandleSearchKnowledge_EmptyCorpusReturnsJSONArrays(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "kb.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	store := knowledge.NewSQLiteStore(db)
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	manager := knowledge.NewManager(store, store, nil)
+	server := NewServer(config.DefaultConfig(), nil, nil, nil)
+	server.SetKnowledgeBase(manager)
+	httpServer := httptest.NewServer(server.routes())
+	t.Cleanup(httpServer.Close)
+
+	response, err := http.Post(
+		httpServer.URL+"/api/v1/knowledge/search",
+		"application/json",
+		strings.NewReader(`{"query":"empty corpus query","top_k":3}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = response.Body.Close() })
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.StatusCode, body)
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, body)
+	}
+	for _, field := range []string{"results", "query_receipts"} {
+		raw, ok := payload[field]
+		if !ok {
+			t.Fatalf("response is missing %q: %s", field, body)
+		}
+		if got := strings.TrimSpace(string(raw)); got != "[]" {
+			t.Fatalf("%s must be JSON [], got %s: %s", field, got, body)
+		}
 	}
 }

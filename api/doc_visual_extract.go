@@ -450,7 +450,7 @@ func extractPDFForAsyncIngestWithProgress(
 		}
 		pagePlans = append(pagePlans, knowledge.IngestPagePlan{
 			PageNumber: page.PageNumber,
-			Mode: mode,
+			Mode:       mode,
 		})
 	}
 	segments, err := knowledge.PlanAdaptiveIngestSegments(pagePlans, limits.RenderBatchPages)
@@ -551,7 +551,9 @@ func extractPDFForAsyncIngestWithProgress(
 				break
 			}
 			pageCtx, cancelPage := context.WithTimeout(totalCtx, limits.PageTimeout)
-			caption, captionErr := kb.CaptionImage(pageCtx, renderedPage.Data, "image/png")
+			caption, captionErr := kb.CaptionImageWithRouteReceipt(
+				pageCtx, renderedPage.Data, "image/png",
+			)
 			cancelPage()
 			if captionErr != nil {
 				if ctx.Err() != nil {
@@ -560,11 +562,13 @@ func extractPDFForAsyncIngestWithProgress(
 				failed[page] = "OCR/VLM failed: " + captionErr.Error()
 				continue
 			}
-			result.Pages[page-1].Text = strings.TrimSpace(caption)
+			result.Pages[page-1].Text = caption.Content
 			if progress != nil {
+				receipt := caption.RouteReceipt
 				if err := progress.CommitPage(ctx, knowledge.IngestPageCheckpoint{
 					PageNumber: page, PagesTotal: int64(info.PageCount), SourceDigest: sourceDigest,
 					ExtractionMode: "ocr_vlm", Content: result.Pages[page-1].Text,
+					OCRRouteReceipt: &receipt,
 				}); err != nil {
 					return result, err
 				}

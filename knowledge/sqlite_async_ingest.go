@@ -750,8 +750,8 @@ func (r *SQLiteSemanticIndexRepository) getIngestDocumentProjection(
 	}
 	var result KnowledgeDocumentProjection
 	var pageCount sql.NullInt64
-	var warningsJSON, textState string
-	query := `SELECT s.document_id,s.content_generation,s.owner_id,c.corpus_alias,s.original_name,
+	var corpusUID, warningsJSON, textState string
+	query := `SELECT s.document_id,s.content_generation,s.owner_id,s.corpus_uid,c.corpus_alias,s.original_name,
 		s.media_type,s.size_bytes,s.blob_sha256,s.agent_id,s.learner_id,s.subject,s.grade,
 		s.page_count,s.warnings_json,b.text_state
 		FROM kb_ingest_document_sources s
@@ -765,7 +765,8 @@ func (r *SQLiteSemanticIndexRepository) getIngestDocumentProjection(
 		args = append(args, ownerID, corpusID)
 	}
 	err := r.db.QueryRowContext(ctx, query, args...).Scan(
-		&result.DocumentID, &result.DocumentGeneration, &result.OwnerID, &result.CorpusID, &result.Filename,
+		&result.DocumentID, &result.DocumentGeneration, &result.OwnerID, &corpusUID,
+		&result.CorpusID, &result.Filename,
 		&result.MediaType, &result.SizeBytes, &result.SHA256, &result.AgentID,
 		&result.LearnerID, &result.Subject, &result.Grade, &pageCount, &warningsJSON, &textState,
 	)
@@ -790,7 +791,86 @@ func (r *SQLiteSemanticIndexRepository) getIngestDocumentProjection(
 		return KnowledgeDocumentProjection{}, err
 	}
 	result.SourceSpans = spans
+	receipts, err := r.loadDocumentOCRPageRouteReceipts(
+		ctx, result.OwnerID, corpusUID, result.DocumentID, result.DocumentGeneration,
+	)
+	if err != nil {
+		return KnowledgeDocumentProjection{}, err
+	}
+	result.OCRPageReceipts = receipts
 	return result, nil
+}
+
+func (r *SQLiteSemanticIndexRepository) loadDocumentOCRPageRouteReceipts(
+	ctx context.Context,
+	ownerID, corpusUID, documentID string,
+	documentGeneration int64,
+) ([]OCRPageRouteReceipt, error) {
+	var jobID string
+	err := r.db.QueryRowContext(ctx, `SELECT job_id FROM kb_knowledge_jobs
+		WHERE owner_id=? AND corpus_uid=? AND document_id=? AND document_generation=?
+		  AND kind='ingest'
+		ORDER BY created_at DESC,job_id DESC LIMIT 1`, ownerID, corpusUID,
+		documentID, documentGeneration).Scan(&jobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return []OCRPageRouteReceipt{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r.loadOCRPageRouteReceipts(ctx, jobID)
+}
+
+func (r *SQLiteSemanticIndexRepository) loadOCRPageRouteReceipts(
+	ctx context.Context,
+	jobID string,
+) ([]OCRPageRouteReceipt, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT page_number,pages_total,provider,model,
+		operation,status,source_digest,content_digest,fake
+		FROM kb_ingest_page_route_receipts WHERE job_id=? ORDER BY page_number`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	receipts := []OCRPageRouteReceipt{}
+	for rows.Next() {
+		var receipt OCRPageRouteReceipt
+		var fake int
+		if err := rows.Scan(
+			&receipt.PageNumber, &receipt.PagesTotal, &receipt.Provider, &receipt.Model,
+			&receipt.Operation, &receipt.Status, &receipt.SourceDigest,
+			&receipt.ContentDigest, &fake,
+		); err != nil {
+			return nil, err
+		}
+		receipt.Fake = fake != 0
+		receipts = append(receipts, receipt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return receipts, nil
+}
+
+func (r *SQLiteSemanticIndexRepository) ListIngestOCRPageRouteReceipts(
+	ctx context.Context,
+	ownerID, corpusUID, jobID string,
+) ([]OCRPageRouteReceipt, error) {
+	if strings.TrimSpace(ownerID) == "" || strings.TrimSpace(corpusUID) == "" ||
+		strings.TrimSpace(jobID) == "" {
+		return nil, ErrSemanticIndexNotFound
+	}
+	var scopedJobID string
+	err := r.db.QueryRowContext(ctx, `SELECT job_id FROM kb_knowledge_jobs
+		WHERE owner_id=? AND corpus_uid=? AND job_id=? AND kind='ingest'`,
+		ownerID, corpusUID, jobID).Scan(&scopedJobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrSemanticIndexNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r.loadOCRPageRouteReceipts(ctx, scopedJobID)
 }
 
 func (r *SQLiteSemanticIndexRepository) loadDocumentSourceSpans(
@@ -960,10 +1040,15 @@ func (r *SQLiteSemanticIndexRepository) LoadIngestPageCheckpoints(
 	if err := validateIngestPageSource(ctx, tx, job, sourceDigest); err != nil {
 		return nil, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT page_number,pages_total,source_digest,
-		extraction_mode,content,content_digest,source_offset_start,source_offset_end
-		FROM kb_ingest_page_checkpoints
-		WHERE job_id=? AND source_digest=? AND pages_total=? ORDER BY page_number`,
+	rows, err := tx.QueryContext(ctx, `SELECT c.page_number,c.pages_total,c.source_digest,
+		c.extraction_mode,c.content,c.content_digest,c.source_offset_start,c.source_offset_end,
+		r.provider,r.model,r.operation,r.status,r.source_digest,r.content_digest,r.fake,
+		s.provider_name,s.model
+		FROM kb_ingest_page_checkpoints c
+		LEFT JOIN kb_ingest_page_route_receipts r
+		  ON r.job_id=c.job_id AND r.page_number=c.page_number
+		LEFT JOIN kb_ingest_execution_snapshots s ON s.job_id=c.job_id
+		WHERE c.job_id=? AND c.source_digest=? AND c.pages_total=? ORDER BY c.page_number`,
 		job.JobID, sourceDigest, pagesTotal)
 	if err != nil {
 		return nil, err
@@ -972,12 +1057,45 @@ func (r *SQLiteSemanticIndexRepository) LoadIngestPageCheckpoints(
 	checkpoints := []IngestPageCheckpoint{}
 	for rows.Next() {
 		var checkpoint IngestPageCheckpoint
+		var provider, model, operation, status, receiptSource, receiptContent sql.NullString
+		var frozenProvider, frozenModel sql.NullString
+		var fake sql.NullInt64
 		if err := rows.Scan(
 			&checkpoint.PageNumber, &checkpoint.PagesTotal, &checkpoint.SourceDigest,
 			&checkpoint.ExtractionMode, &checkpoint.Content, &checkpoint.ContentDigest,
 			&checkpoint.SourceOffsetStart, &checkpoint.SourceOffsetEnd,
+			&provider, &model, &operation, &status, &receiptSource, &receiptContent,
+			&fake, &frozenProvider, &frozenModel,
 		); err != nil {
 			return nil, err
+		}
+		if provider.Valid || model.Valid || operation.Valid || status.Valid ||
+			receiptSource.Valid || receiptContent.Valid || fake.Valid {
+			if !provider.Valid || !model.Valid || !operation.Valid || !status.Valid ||
+				!receiptSource.Valid || !receiptContent.Valid || !fake.Valid {
+				return nil, fmt.Errorf("%w: incomplete OCR page route receipt %d",
+					ErrInvalidDocumentUpload, checkpoint.PageNumber)
+			}
+			checkpoint.OCRRouteReceipt = &OCRRouteReceipt{
+				Provider: provider.String, Model: model.String, Operation: operation.String,
+				Status: status.String, Fake: fake.Int64 != 0,
+			}
+		}
+		if checkpoint.ExtractionMode == string(IngestSegmentVisual) &&
+			checkpoint.OCRRouteReceipt == nil {
+			return nil, fmt.Errorf("%w: missing OCR page route receipt %d",
+				ErrInvalidDocumentUpload, checkpoint.PageNumber)
+		}
+		if checkpoint.ExtractionMode == string(IngestSegmentVisual) {
+			if err := validateOCRRouteReceipt(*checkpoint.OCRRouteReceipt); err != nil ||
+				!frozenProvider.Valid || !frozenModel.Valid ||
+				checkpoint.OCRRouteReceipt.Provider != strings.TrimSpace(frozenProvider.String) ||
+				checkpoint.OCRRouteReceipt.Model != strings.TrimSpace(frozenModel.String) ||
+				receiptSource.String != checkpoint.SourceDigest ||
+				receiptContent.String != checkpoint.ContentDigest {
+				return nil, fmt.Errorf("%w: untrusted OCR page route receipt %d",
+					ErrInvalidDocumentUpload, checkpoint.PageNumber)
+			}
 		}
 		if ingestPageContentDigest(checkpoint.Content) != checkpoint.ContentDigest {
 			return nil, fmt.Errorf("%w: corrupt page checkpoint %d",
@@ -1005,6 +1123,10 @@ func (r *SQLiteSemanticIndexRepository) SaveIngestPageCheckpoint(
 	if err := validateIngestPageCheckpoint(checkpoint); err != nil {
 		return err
 	}
+	if checkpoint.OCRRouteReceipt != nil {
+		receipt := canonicalOCRRouteReceipt(*checkpoint.OCRRouteReceipt)
+		checkpoint.OCRRouteReceipt = &receipt
+	}
 	digest := ingestPageContentDigest(checkpoint.Content)
 	if checkpoint.ContentDigest != "" && checkpoint.ContentDigest != digest {
 		return fmt.Errorf("%w: page content digest mismatch", ErrInvalidDocumentUpload)
@@ -1028,6 +1150,13 @@ func (r *SQLiteSemanticIndexRepository) SaveIngestPageCheckpoint(
 	if err := validateIngestPageSource(ctx, tx, job, checkpoint.SourceDigest); err != nil {
 		return err
 	}
+	if checkpoint.OCRRouteReceipt != nil {
+		if err := validateOCRRouteReceiptSnapshotTx(
+			ctx, tx, job.JobID, *checkpoint.OCRRouteReceipt,
+		); err != nil {
+			return err
+		}
+	}
 	nowMillis := now.UTC().UnixMilli()
 	if _, err := tx.ExecContext(ctx, `INSERT INTO kb_ingest_page_checkpoints
 		(job_id,page_number,pages_total,source_digest,extraction_mode,content,content_digest,
@@ -1039,18 +1168,47 @@ func (r *SQLiteSemanticIndexRepository) SaveIngestPageCheckpoint(
 		nowMillis, nowMillis); err != nil {
 		return fmt.Errorf("knowledge: save page checkpoint: %w", err)
 	}
+	if checkpoint.OCRRouteReceipt != nil {
+		receipt := *checkpoint.OCRRouteReceipt
+		if _, err := tx.ExecContext(ctx, `INSERT INTO kb_ingest_page_route_receipts
+			(job_id,page_number,pages_total,provider,model,operation,status,source_digest,
+			 content_digest,fake,created_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id,page_number) DO NOTHING`,
+			job.JobID, checkpoint.PageNumber, checkpoint.PagesTotal, receipt.Provider,
+			receipt.Model, receipt.Operation, receipt.Status, checkpoint.SourceDigest,
+			checkpoint.ContentDigest, receipt.Fake, nowMillis); err != nil {
+			return fmt.Errorf("knowledge: save OCR page route receipt: %w", err)
+		}
+	}
 	var existing IngestPageCheckpoint
-	if err := tx.QueryRowContext(ctx, `SELECT page_number,pages_total,source_digest,
-		extraction_mode,content,content_digest,source_offset_start,source_offset_end
-		FROM kb_ingest_page_checkpoints WHERE job_id=? AND page_number=?`,
+	var provider, model, operation, status sql.NullString
+	var fake sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT c.page_number,c.pages_total,c.source_digest,
+		c.extraction_mode,c.content,c.content_digest,c.source_offset_start,c.source_offset_end,
+		r.provider,r.model,r.operation,r.status,r.fake
+		FROM kb_ingest_page_checkpoints c
+		LEFT JOIN kb_ingest_page_route_receipts r
+		  ON r.job_id=c.job_id AND r.page_number=c.page_number
+		WHERE c.job_id=? AND c.page_number=?`,
 		job.JobID, checkpoint.PageNumber).Scan(
 		&existing.PageNumber, &existing.PagesTotal, &existing.SourceDigest,
 		&existing.ExtractionMode, &existing.Content, &existing.ContentDigest,
 		&existing.SourceOffsetStart, &existing.SourceOffsetEnd,
+		&provider, &model, &operation, &status, &fake,
 	); err != nil {
 		return err
 	}
-	if existing != checkpoint {
+	if provider.Valid || model.Valid || operation.Valid || status.Valid || fake.Valid {
+		if !provider.Valid || !model.Valid || !operation.Valid || !status.Valid || !fake.Valid {
+			return fmt.Errorf("%w: incomplete OCR page route receipt %d",
+				ErrInvalidDocumentUpload, checkpoint.PageNumber)
+		}
+		existing.OCRRouteReceipt = &OCRRouteReceipt{
+			Provider: provider.String, Model: model.String, Operation: operation.String,
+			Status: status.String, Fake: fake.Int64 != 0,
+		}
+	}
+	if !equalIngestPageCheckpoints(existing, checkpoint) {
 		return fmt.Errorf("%w: conflicting immutable page checkpoint %d",
 			ErrInvalidDocumentUpload, checkpoint.PageNumber)
 	}
@@ -1087,11 +1245,76 @@ func validateIngestPageCheckpoint(checkpoint IngestPageCheckpoint) error {
 		return fmt.Errorf("%w: invalid page checkpoint", ErrInvalidDocumentUpload)
 	}
 	switch checkpoint.ExtractionMode {
-	case "text", "ocr_vlm", "image", "document":
+	case "ocr_vlm":
+		if checkpoint.OCRRouteReceipt == nil {
+			return fmt.Errorf("%w: OCR route receipt is required", ErrInvalidDocumentUpload)
+		}
+		if err := validateOCRRouteReceipt(*checkpoint.OCRRouteReceipt); err != nil {
+			return err
+		}
+		return nil
+	case "text", "image", "document":
+		if checkpoint.OCRRouteReceipt != nil {
+			return fmt.Errorf("%w: OCR route receipt is only valid for OCR pages",
+				ErrInvalidDocumentUpload)
+		}
 		return nil
 	default:
 		return fmt.Errorf("%w: invalid page extraction mode", ErrInvalidDocumentUpload)
 	}
+}
+
+func canonicalOCRRouteReceipt(receipt OCRRouteReceipt) OCRRouteReceipt {
+	receipt.Provider = strings.TrimSpace(receipt.Provider)
+	receipt.Model = strings.TrimSpace(receipt.Model)
+	receipt.Operation = strings.TrimSpace(receipt.Operation)
+	receipt.Status = strings.ToLower(strings.TrimSpace(receipt.Status))
+	return receipt
+}
+
+func validateOCRRouteReceipt(receipt OCRRouteReceipt) error {
+	receipt = canonicalOCRRouteReceipt(receipt)
+	if receipt.Provider == "" || receipt.Model == "" ||
+		receipt.Operation != OCRRouteOperationPDFPage ||
+		receipt.Status != OCRRouteStatusSucceeded {
+		return fmt.Errorf("%w: invalid OCR route receipt", ErrInvalidDocumentUpload)
+	}
+	return nil
+}
+
+func validateOCRRouteReceiptSnapshotTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	jobID string,
+	receipt OCRRouteReceipt,
+) error {
+	var provider, model string
+	err := tx.QueryRowContext(ctx, `SELECT provider_name,model
+		FROM kb_ingest_execution_snapshots WHERE job_id=?`, jobID).Scan(&provider, &model)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: missing frozen OCR route", ErrInvalidDocumentUpload)
+	}
+	if err != nil {
+		return err
+	}
+	receipt = canonicalOCRRouteReceipt(receipt)
+	if receipt.Provider != strings.TrimSpace(provider) || receipt.Model != strings.TrimSpace(model) {
+		return fmt.Errorf("%w: OCR route receipt does not match frozen route",
+			ErrInvalidDocumentUpload)
+	}
+	return nil
+}
+
+func equalIngestPageCheckpoints(left, right IngestPageCheckpoint) bool {
+	leftReceipt, rightReceipt := left.OCRRouteReceipt, right.OCRRouteReceipt
+	left.OCRRouteReceipt, right.OCRRouteReceipt = nil, nil
+	if left != right || (leftReceipt == nil) != (rightReceipt == nil) {
+		return false
+	}
+	if leftReceipt == nil {
+		return true
+	}
+	return canonicalOCRRouteReceipt(*leftReceipt) == canonicalOCRRouteReceipt(*rightReceipt)
 }
 
 func ingestPageContentDigest(content string) string {
@@ -1365,6 +1588,9 @@ func (r *SQLiteSemanticIndexRepository) CompleteIngestDocument(
 	if rows, _ := res.RowsAffected(); rows != 1 {
 		return ErrJobFenced
 	}
+	if err := r.reconcileDocumentIngestLifecycleTx(ctx, tx, job, now); err != nil {
+		return err
+	}
 	if err := restoreCJKFTSCurrentTx(ctx, tx, projectionWasCurrent); err != nil {
 		return fmt.Errorf("knowledge: publish CJK FTS v2 version: %w", err)
 	}
@@ -1383,8 +1609,15 @@ func validateCompletePDFPageCheckpointsTx(
 		return fmt.Errorf("%w: PDF page progress does not match completion %s/%d",
 			ErrInvalidDocumentUpload, formatJobPageProgress(job), pagesTotal)
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT page_number,pages_total,source_digest,content,content_digest
-		FROM kb_ingest_page_checkpoints WHERE job_id=? ORDER BY page_number`, job.JobID)
+	rows, err := tx.QueryContext(ctx, `SELECT c.page_number,c.pages_total,c.source_digest,
+		c.extraction_mode,c.content,c.content_digest,
+		r.provider,r.model,r.operation,r.status,r.source_digest,r.content_digest,r.fake,
+		s.provider_name,s.model
+		FROM kb_ingest_page_checkpoints c
+		LEFT JOIN kb_ingest_page_route_receipts r
+		  ON r.job_id=c.job_id AND r.page_number=c.page_number
+		LEFT JOIN kb_ingest_execution_snapshots s ON s.job_id=c.job_id
+		WHERE c.job_id=? ORDER BY c.page_number`, job.JobID)
 	if err != nil {
 		return err
 	}
@@ -1393,15 +1626,38 @@ func validateCompletePDFPageCheckpointsTx(
 	for rows.Next() {
 		var pageNumber int
 		var checkpointTotal int64
-		var checkpointDigest, content, contentDigest string
+		var checkpointDigest, extractionMode, content, contentDigest string
+		var provider, model, operation, status, receiptSource, receiptContent sql.NullString
+		var frozenProvider, frozenModel sql.NullString
+		var fake sql.NullInt64
 		if err := rows.Scan(
-			&pageNumber, &checkpointTotal, &checkpointDigest, &content, &contentDigest,
+			&pageNumber, &checkpointTotal, &checkpointDigest, &extractionMode,
+			&content, &contentDigest, &provider, &model, &operation, &status,
+			&receiptSource, &receiptContent, &fake, &frozenProvider, &frozenModel,
 		); err != nil {
 			return err
 		}
 		if pageNumber != expectedPage || checkpointTotal != pagesTotal ||
 			checkpointDigest != sourceDigest || ingestPageContentDigest(content) != contentDigest {
 			return fmt.Errorf("%w: invalid durable PDF page checkpoint %d",
+				ErrInvalidDocumentUpload, pageNumber)
+		}
+		if extractionMode == string(IngestSegmentVisual) {
+			if !provider.Valid || strings.TrimSpace(provider.String) == "" ||
+				!model.Valid || strings.TrimSpace(model.String) == "" ||
+				!operation.Valid || operation.String != OCRRouteOperationPDFPage ||
+				!status.Valid || status.String != OCRRouteStatusSucceeded ||
+				!receiptSource.Valid || receiptSource.String != checkpointDigest ||
+				!receiptContent.Valid || receiptContent.String != contentDigest ||
+				!frozenProvider.Valid || provider.String != strings.TrimSpace(frozenProvider.String) ||
+				!frozenModel.Valid || model.String != strings.TrimSpace(frozenModel.String) ||
+				!fake.Valid || fake.Int64 != 0 {
+				return fmt.Errorf("%w: missing trustworthy OCR page route receipt %d",
+					ErrInvalidDocumentUpload, pageNumber)
+			}
+		} else if provider.Valid || model.Valid || operation.Valid || status.Valid ||
+			receiptSource.Valid || receiptContent.Valid || fake.Valid {
+			return fmt.Errorf("%w: unexpected OCR route receipt for text page %d",
 				ErrInvalidDocumentUpload, pageNumber)
 		}
 		expectedPage++

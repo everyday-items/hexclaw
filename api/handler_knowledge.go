@@ -698,6 +698,7 @@ func (s *Server) knowledgeDocumentDetail(
 	payload["text_index_state"] = projection.TextIndexState
 	payload["warnings"] = projection.Warnings
 	payload["source_spans"] = projection.SourceSpans
+	payload["ocr_page_route_receipts"] = projection.OCRPageReceipts
 	if projection.PageCount != nil {
 		payload["page_count"] = *projection.PageCount
 		payload["pages_total"] = *projection.PageCount

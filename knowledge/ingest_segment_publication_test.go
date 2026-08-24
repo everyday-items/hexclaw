@@ -55,6 +55,7 @@ func TestIngestSegmentReadinessSurvivesRestartAndIdempotentReplay(t *testing.T) 
 	if err := repository.SaveIngestPageCheckpoint(ctx, job.Lease(), now, IngestPageCheckpoint{
 		PageNumber: 1, PagesTotal: 4, SourceDigest: source.SHA256,
 		ExtractionMode: "ocr_vlm", Content: "segment page one",
+		OCRRouteReceipt: testOCRRouteReceipt(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -62,6 +63,7 @@ func TestIngestSegmentReadinessSurvivesRestartAndIdempotentReplay(t *testing.T) 
 	if err := repository.SaveIngestPageCheckpoint(ctx, job.Lease(), now, IngestPageCheckpoint{
 		PageNumber: 2, PagesTotal: 4, SourceDigest: source.SHA256,
 		ExtractionMode: "ocr_vlm", Content: "segment page two",
+		OCRRouteReceipt: testOCRRouteReceipt(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +78,7 @@ func TestIngestSegmentReadinessSurvivesRestartAndIdempotentReplay(t *testing.T) 
 	if err := restarted.SaveIngestPageCheckpoint(ctx, job.Lease(), now, IngestPageCheckpoint{
 		PageNumber: 2, PagesTotal: 4, SourceDigest: source.SHA256,
 		ExtractionMode: "ocr_vlm", Content: "segment page two",
+		OCRRouteReceipt: testOCRRouteReceipt(),
 	}); err != nil {
 		t.Fatalf("restart checkpoint replay: %v", err)
 	}

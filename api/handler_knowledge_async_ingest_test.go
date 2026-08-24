@@ -360,6 +360,15 @@ func TestKnowledgeDocumentDetailPrefersAsyncProjectionAndKeepsLegacyContentCompa
 				PageStart: 12, PageEnd: 12, SourceDigest: strings.Repeat("a", 64),
 				SourceOffsetStart: 240, SourceOffsetEnd: 360,
 			}},
+			OCRPageReceipts: []knowledge.OCRPageRouteReceipt{{
+				PageNumber: 12, PagesTotal: 128,
+				SourceDigest: strings.Repeat("a", 64), ContentDigest: strings.Repeat("b", 64),
+				OCRRouteReceipt: knowledge.OCRRouteReceipt{
+					Provider: "hexclaw-gpt", Model: "gpt-5.6-sol",
+					Operation: knowledge.OCRRouteOperationPDFPage,
+					Status:    knowledge.OCRRouteStatusSucceeded, Fake: false,
+				},
+			}},
 		},
 	}
 	srv := NewServer(config.DefaultConfig(), nil, nil, nil)
@@ -403,6 +412,22 @@ func TestKnowledgeDocumentDetailPrefersAsyncProjectionAndKeepsLegacyContentCompa
 	spans, ok := payload["source_spans"].([]any)
 	if !ok || len(spans) != 1 {
 		t.Fatalf("source_spans=%v", payload["source_spans"])
+	}
+	receipts, ok := payload["ocr_page_route_receipts"].([]any)
+	if !ok || len(receipts) != 1 {
+		t.Fatalf("ocr_page_route_receipts=%v", payload["ocr_page_route_receipts"])
+	}
+	receipt, ok := receipts[0].(map[string]any)
+	if !ok || receipt["provider"] != "hexclaw-gpt" || receipt["model"] != "gpt-5.6-sol" ||
+		receipt["operation"] != knowledge.OCRRouteOperationPDFPage || receipt["status"] != "succeeded" ||
+		receipt["fake"] != false || receipt["source_digest"] != strings.Repeat("a", 64) ||
+		receipt["content_digest"] != strings.Repeat("b", 64) {
+		t.Fatalf("public OCR receipt=%v", receipt)
+	}
+	for _, forbidden := range []string{"job_id", "provider_instance_id", "external_request_id", "content"} {
+		if _, found := receipt[forbidden]; found {
+			t.Fatalf("public OCR receipt exposed %q: %v", forbidden, receipt)
+		}
 	}
 
 	listResp, err := http.Get(ts.URL + "/api/v1/knowledge/documents")

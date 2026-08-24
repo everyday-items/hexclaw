@@ -37,12 +37,51 @@ type Captioner interface {
 	Caption(ctx context.Context, image []byte, mime string) (string, error)
 }
 
+// CaptionResult 同时返回转写正文和该次模型调用的脱敏路由事实。
+type CaptionResult struct {
+	Content      string
+	RouteReceipt OCRRouteReceipt
+}
+
+// CaptionerWithReceipt 是教材逐页 OCR 使用的可审计能力面。
+// 普通图片描述仍可使用 Captioner；教材 OCR 不允许丢弃实际执行路由。
+type CaptionerWithReceipt interface {
+	Captioner
+	CaptionWithReceipt(ctx context.Context, image []byte, mime string) (CaptionResult, error)
+}
+
 // CaptionerFunc 把普通函数适配为 Captioner。
 type CaptionerFunc func(ctx context.Context, image []byte, mime string) (string, error)
 
 // Caption 实现 Captioner。
 func (f CaptionerFunc) Caption(ctx context.Context, image []byte, mime string) (string, error) {
 	return f(ctx, image, mime)
+}
+
+// CaptionerWithReceiptFunc 把返回执行回执的函数适配为 CaptionerWithReceipt。
+type CaptionerWithReceiptFunc func(
+	ctx context.Context,
+	image []byte,
+	mime string,
+) (CaptionResult, error)
+
+// CaptionWithReceipt 返回正文和实际执行回执。
+func (f CaptionerWithReceiptFunc) CaptionWithReceipt(
+	ctx context.Context,
+	image []byte,
+	mime string,
+) (CaptionResult, error) {
+	return f(ctx, image, mime)
+}
+
+// Caption 保持普通图片摄取接口兼容，并丢弃该路径不消费的回执投影。
+func (f CaptionerWithReceiptFunc) Caption(
+	ctx context.Context,
+	image []byte,
+	mime string,
+) (string, error) {
+	result, err := f.CaptionWithReceipt(ctx, image, mime)
+	return result.Content, err
 }
 
 // WithCaptioner 注入图像转写器（通常复用 chat router 的 vision 模型）。
@@ -87,6 +126,52 @@ func (m *Manager) CaptionImage(ctx context.Context, image []byte, mime string) (
 		return "", fmt.Errorf("图像转写结果为空，已跳过摄取")
 	}
 	return caption, nil
+}
+
+// CaptionImageWithRouteReceipt 为教材逐页 OCR 返回可持久化的实际路由事实。
+// 不具备回执能力的旧 Captioner 不能用于此路径，防止 ready 文档缺少审计证据。
+func (m *Manager) CaptionImageWithRouteReceipt(
+	ctx context.Context,
+	image []byte,
+	mime string,
+) (CaptionResult, error) {
+	if len(image) == 0 {
+		return CaptionResult{}, fmt.Errorf("%w: image content is empty", ErrInvalidDocumentUpload)
+	}
+	if m == nil || m.captioner == nil {
+		return CaptionResult{}, fmt.Errorf("%w: vision captioner is not configured",
+			ErrInvalidDocumentUpload)
+	}
+	captioner, ok := m.captioner.(CaptionerWithReceipt)
+	if !ok {
+		return CaptionResult{}, fmt.Errorf("%w: OCR captioner does not expose a route receipt",
+			ErrInvalidDocumentUpload)
+	}
+	permit, err := m.acquireResource(
+		ctx,
+		resourcegov.ResourceVLM,
+		resourcegov.PriorityFromContext(ctx, resourcegov.PriorityInteractive),
+	)
+	if err != nil {
+		return CaptionResult{}, err
+	}
+	if permit != nil {
+		defer permit.Release()
+	}
+	result, err := captioner.CaptionWithReceipt(ragEnrichContext(ctx), image, mime)
+	if err != nil {
+		return CaptionResult{}, fmt.Errorf("knowledge: OCR transcription failed: %w", err)
+	}
+	result.Content = strings.TrimSpace(result.Content)
+	if result.Content == "" {
+		return CaptionResult{}, fmt.Errorf("%w: OCR transcription is empty",
+			ErrInvalidDocumentUpload)
+	}
+	result.RouteReceipt = canonicalOCRRouteReceipt(result.RouteReceipt)
+	if err := validateOCRRouteReceipt(result.RouteReceipt); err != nil {
+		return CaptionResult{}, err
+	}
+	return result, nil
 }
 
 // AddImageDocument 把一张图像摄取进知识库（多模态：VLM caption → 文本 RAG）。

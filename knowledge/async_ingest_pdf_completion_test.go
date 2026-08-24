@@ -56,6 +56,7 @@ func TestCompletePDFIngestRequiresExactDurablePageCheckpointSet(t *testing.T) {
 				if err := repo.SaveIngestPageCheckpoint(ctx, job.Lease(), now, IngestPageCheckpoint{
 					PageNumber: page, PagesTotal: tt.manifestTotal, SourceDigest: source.SHA256,
 					ExtractionMode: "ocr_vlm", Content: fmt.Sprintf("page %d content", page),
+					OCRRouteReceipt: testOCRRouteReceipt(),
 				}); err != nil {
 					t.Fatal(err)
 				}

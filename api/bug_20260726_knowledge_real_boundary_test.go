@@ -110,6 +110,7 @@ func newBug20260726KnowledgeHarness(
 		migrate.KnowledgeIngestCheckpointV28,
 		migrate.KnowledgeIngestExecutionV46,
 		migrate.KnowledgeUploadOperationsV71,
+		migrate.KnowledgeOCRRouteReceiptsV87,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -142,23 +143,30 @@ func newBug20260726KnowledgeHarness(
 			splitter.WithMarkdownChunkSize(400),
 			splitter.WithMarkdownChunkOverlap(80),
 		)),
-		knowledge.WithCaptioner(knowledge.CaptionerFunc(func(
+		knowledge.WithCaptioner(knowledge.CaptionerWithReceiptFunc(func(
 			ctx context.Context,
 			image []byte,
 			mime string,
-		) (string, error) {
+		) (knowledge.CaptionResult, error) {
 			snapshot, ok := knowledge.VisionRouteSnapshotFromContext(ctx)
 			if !ok {
-				return "", errors.New("BUG-20260726-024: VLM call lost frozen route snapshot")
+				return knowledge.CaptionResult{}, errors.New("BUG-20260726-024: VLM call lost frozen route snapshot")
 			}
 			if len(image) == 0 || mime != "image/png" {
-				return "", fmt.Errorf("invalid local VLM input bytes=%d mime=%q", len(image), mime)
+				return knowledge.CaptionResult{}, fmt.Errorf("invalid local VLM input bytes=%d mime=%q", len(image), mime)
 			}
 			harness.captionMu.Lock()
 			harness.captionRoutes = append(harness.captionRoutes, snapshot)
 			call := len(harness.captionRoutes)
 			harness.captionMu.Unlock()
-			return fmt.Sprintf("local fake VLM page %d arithmetic lesson", call), nil
+			return knowledge.CaptionResult{
+				Content: fmt.Sprintf("local fake VLM page %d arithmetic lesson", call),
+				RouteReceipt: knowledge.OCRRouteReceipt{
+					Provider: snapshot.ProviderName, Model: snapshot.Model,
+					Operation: knowledge.OCRRouteOperationPDFPage,
+					Status:    knowledge.OCRRouteStatusSucceeded, Fake: true,
+				},
+			}, nil
 		})),
 	)
 	harness.http = newBug20260726KnowledgeHTTPServer(t, harness.manager, service)
@@ -359,8 +367,8 @@ func TestBUG20260726024RealPDFConsumesFrozenDefaultVisionRoute(t *testing.T) {
 		"text", "vision",
 	))
 	worked, err := bug20260726RunIngest(h)
-	if err != nil || !worked {
-		t.Fatalf("real PDF ingest worked=%v err=%v", worked, err)
+	if !worked || !errors.Is(err, knowledge.ErrInvalidDocumentUpload) {
+		t.Fatalf("fake OCR must fail closed before ready worked=%v err=%v", worked, err)
 	}
 
 	calls := h.captionRouteSnapshots()
@@ -382,11 +390,11 @@ func TestBUG20260726024RealPDFConsumesFrozenDefaultVisionRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job.State != knowledge.KnowledgeJobSucceeded || job.PagesDone == nil ||
+	if job.State != knowledge.KnowledgeJobFailed || job.PagesDone == nil ||
 		job.PagesTotal == nil || *job.PagesDone != 131 || *job.PagesTotal != 131 {
-		t.Fatalf("real PDF terminal job=%+v", job)
+		t.Fatalf("fake OCR terminal job=%+v", job)
 	}
-	var documents, sources, jobs, nonReadySegments int
+	var documents, sources, jobs, nonReadySegments, fakeReceipts, chunks int
 	if err := h.db.QueryRow(`SELECT COUNT(*) FROM kb_documents WHERE id=?`, accepted.DocumentID).
 		Scan(&documents); err != nil {
 		t.Fatal(err)
@@ -403,9 +411,20 @@ func TestBUG20260726024RealPDFConsumesFrozenDefaultVisionRoute(t *testing.T) {
 		WHERE document_id=? AND state<>'ready'`, accepted.DocumentID).Scan(&nonReadySegments); err != nil {
 		t.Fatal(err)
 	}
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM kb_ingest_page_route_receipts
+		WHERE job_id=? AND fake=1`, accepted.JobID).Scan(&fakeReceipts); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM kb_chunks WHERE doc_id=?`,
+		accepted.DocumentID).Scan(&chunks); err != nil {
+		t.Fatal(err)
+	}
 	if documents != 1 || sources != 1 || jobs != 1 || nonReadySegments != 0 {
 		t.Fatalf("real PDF duplicate/residue documents=%d sources=%d jobs=%d non_ready_segments=%d",
 			documents, sources, jobs, nonReadySegments)
+	}
+	if fakeReceipts != 7 || chunks != 0 {
+		t.Fatalf("fake OCR receipts/chunks=%d/%d, want 7/0 before ready", fakeReceipts, chunks)
 	}
 }
 

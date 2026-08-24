@@ -96,6 +96,7 @@ func TestBUG20260726024And025RealVisionProviderIngest(t *testing.T) {
 	defer cancel()
 	captioner := &bug20260726024025LiveCaptioner{
 		provider:     route.Provider,
+		providerName: route.ProviderName,
 		model:        route.Model,
 		wantPages:    wantPages,
 		pageByDigest: pageByDigest,
@@ -156,6 +157,7 @@ func TestBUG20260726024And025RealVisionProviderIngest(t *testing.T) {
 
 type bug20260726024025LiveCaptioner struct {
 	provider     hexagon.Provider
+	providerName string
 	model        string
 	wantPages    []int
 	pageByDigest map[[sha256.Size]byte]int
@@ -173,19 +175,28 @@ func (c *bug20260726024025LiveCaptioner) Caption(
 	image []byte,
 	mime string,
 ) (string, error) {
+	result, err := c.CaptionWithReceipt(ctx, image, mime)
+	return result.Content, err
+}
+
+func (c *bug20260726024025LiveCaptioner) CaptionWithReceipt(
+	ctx context.Context,
+	image []byte,
+	mime string,
+) (knowledge.CaptionResult, error) {
 	digest := sha256.Sum256(image)
 
 	c.mu.Lock()
 	if c.stopped {
 		c.mu.Unlock()
-		return "", errBug20260726024025LiveVisionStopped
+		return knowledge.CaptionResult{}, errBug20260726024025LiveVisionStopped
 	}
 	call := c.calls + 1
 	page := c.pageByDigest[digest]
 	if call > len(c.wantPages) || page == 0 || page != c.wantPages[call-1] {
 		c.stopLocked(call, page)
 		c.mu.Unlock()
-		return "", errBug20260726024025LiveVisionStopped
+		return knowledge.CaptionResult{}, errBug20260726024025LiveVisionStopped
 	}
 	c.calls = call
 	c.mu.Unlock()
@@ -200,7 +211,7 @@ func (c *bug20260726024025LiveCaptioner) Caption(
 		Messages: []hexagon.Message{{
 			Role: hexagon.RoleUser,
 			MultiContent: []llm.ContentPart{
-				llm.NewTextPart("请用中文客观、简洁地描述这张图片的主要内容（包含其中可见的文字），用于知识库检索。只输出描述本身。"),
+				llm.NewTextPart("请忠实转写本教材页面中所有可见文字、数学公式、题号、表格和图示标签，并保留原有层级结构。不得概括、解释、补全或推测，只输出转写结果。"),
 				llm.NewImageURLPart(dataURL, "auto"),
 			},
 		}},
@@ -209,9 +220,16 @@ func (c *bug20260726024025LiveCaptioner) Caption(
 		c.mu.Lock()
 		c.stopLocked(call, page)
 		c.mu.Unlock()
-		return "", errBug20260726024025LiveVisionStopped
+		return knowledge.CaptionResult{}, errBug20260726024025LiveVisionStopped
 	}
-	return response.Content, nil
+	return knowledge.CaptionResult{
+		Content: response.Content,
+		RouteReceipt: knowledge.OCRRouteReceipt{
+			Provider: c.providerName, Model: c.model,
+			Operation: knowledge.OCRRouteOperationPDFPage,
+			Status:    knowledge.OCRRouteStatusSucceeded, Fake: false,
+		},
+	}, nil
 }
 
 func (c *bug20260726024025LiveCaptioner) stopLocked(call, page int) {

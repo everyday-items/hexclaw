@@ -265,17 +265,17 @@ func TestKnowledgeAsyncProcessorResumeSkipsCompletedVLMPageCheckpoints(t *testin
 
 	calls := 0
 	failThirdOnce := true
-	manager := newAsyncProcessorTestManager(t, knowledge.CaptionerFunc(func(
+	manager := newAsyncProcessorTestManager(t, knowledge.CaptionerWithReceiptFunc(func(
 		_ context.Context,
 		_ []byte,
 		_ string,
-	) (string, error) {
+	) (knowledge.CaptionResult, error) {
 		calls++
 		if failThirdOnce && calls == 3 {
 			failThirdOnce = false
-			return "", errors.New("injected transient VLM failure")
+			return knowledge.CaptionResult{}, errors.New("injected transient VLM failure")
 		}
-		return fmt.Sprintf("第 %d 次 VLM 调用的正文", calls), nil
+		return testOCRCaptionResult(fmt.Sprintf("第 %d 次 VLM 调用的正文", calls)), nil
 	}))
 	source := writeAsyncProcessorPDF(t, buildImageOnlyTestPDF(t, 5))
 	processor, ok := NewKnowledgeDocumentIngestProcessor(manager).(knowledge.ResumableDocumentIngestProcessor)
@@ -300,6 +300,26 @@ func TestKnowledgeAsyncProcessorResumeSkipsCompletedVLMPageCheckpoints(t *testin
 	}
 	if prepared.PageCount != 5 || len(progress.pages) != 5 {
 		t.Fatalf("resumed page_count=%d checkpoints=%d", prepared.PageCount, len(progress.pages))
+	}
+	for page, checkpoint := range progress.pages {
+		if checkpoint.OCRRouteReceipt == nil || checkpoint.OCRRouteReceipt.Provider != "hexclaw-gpt" ||
+			checkpoint.OCRRouteReceipt.Model != "gpt-5.6-sol" ||
+			checkpoint.OCRRouteReceipt.Operation != knowledge.OCRRouteOperationPDFPage ||
+			checkpoint.OCRRouteReceipt.Status != knowledge.OCRRouteStatusSucceeded ||
+			!checkpoint.OCRRouteReceipt.Fake {
+			t.Fatalf("page %d checkpoint receipt=%+v", page, checkpoint.OCRRouteReceipt)
+		}
+	}
+}
+
+func testOCRCaptionResult(content string) knowledge.CaptionResult {
+	return knowledge.CaptionResult{
+		Content: content,
+		RouteReceipt: knowledge.OCRRouteReceipt{
+			Provider: "hexclaw-gpt", Model: "gpt-5.6-sol",
+			Operation: knowledge.OCRRouteOperationPDFPage,
+			Status:    knowledge.OCRRouteStatusSucceeded, Fake: true,
+		},
 	}
 }
 
@@ -702,6 +722,20 @@ func requirePopplerForAsyncPDFTest(t *testing.T) {
 
 func newAsyncProcessorTestManager(t *testing.T, captioner knowledge.Captioner) *knowledge.Manager {
 	t.Helper()
+	if _, ok := captioner.(knowledge.CaptionerWithReceipt); !ok {
+		legacy := captioner
+		captioner = knowledge.CaptionerWithReceiptFunc(func(
+			ctx context.Context,
+			image []byte,
+			mime string,
+		) (knowledge.CaptionResult, error) {
+			content, err := legacy.Caption(ctx, image, mime)
+			if err != nil {
+				return knowledge.CaptionResult{}, err
+			}
+			return testOCRCaptionResult(content), nil
+		})
+	}
 	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "processor-pdf.db"))
 	if err != nil {
 		t.Fatal(err)
