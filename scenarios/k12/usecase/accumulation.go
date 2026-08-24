@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/hexagon-codes/toolkit/util/idgen"
+
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
@@ -154,16 +156,69 @@ const (
 //
 // 积累本身无状态机：生成默写题不改积累状态（取用不污染闭环）；装篮幂等去重，家长可移除。
 func (d Deps) GenerateDictationToBasket(ctx context.Context, agentName, sourceSession, recordID string, fullDictation bool) (basketID string, added bool, err error) {
-	_, basketID, added, err = d.GenerateCurrentDictationToBasket(
+	generation, _, _, err := d.GenerateCurrentDictationToBasket(
 		ctx, agentName, sourceSession, recordID, fullDictation,
 		"dictation:"+strings.TrimSpace(recordID),
+	)
+	if err != nil {
+		return "", false, err
+	}
+	_, basketID, added, err = d.ProcessAccumulationPracticeGeneration(
+		ctx, agentName, generation.GenerationID,
 	)
 	return basketID, added, err
 }
 
-// GenerateCurrentDictationToBasket persists the generation checkpoint before
-// producing or validating a PracticeSetItem. A replay or failed retry always
-// resumes the same generation and frozen source snapshot.
+type accumulationPracticeRequestSnapshot struct {
+	AccumulationID string `json:"accumulation_id"`
+	SourceVersion  int    `json:"source_version"`
+	Content        string `json:"content"`
+	Subject        string `json:"subject"`
+	EntryType      string `json:"entry_type"`
+	FullDictation  bool   `json:"full_dictation"`
+	FormatPolicy   string `json:"format_policy"`
+	VerifierPolicy string `json:"verifier_policy"`
+	SourceSession  string `json:"source_session,omitempty"`
+	GradeTerm      string `json:"grade_term,omitempty"`
+}
+
+type accumulationPracticeOutput struct {
+	Subject              string `json:"subject"`
+	QuestionMarkdown     string `json:"question_markdown"`
+	ExpectedAnswer       string `json:"expected_answer_markdown"`
+	VerificationStatus   string `json:"verification_status"`
+	VerificationEvidence string `json:"verification_evidence"`
+}
+
+func accumulationPracticeRouteSnapshot() k12.GradingModelSnapshot {
+	return k12.GradingModelSnapshot{
+		Provider: "rule", Model: "dictation-format-v1",
+		Route: "rule/dictation-format-v1", Capability: "text",
+	}
+}
+
+func accumulationGenerationFromPracticeJob(
+	job k12.PracticeGenerationJob,
+) k12.AccumulationDictationGeneration {
+	status := job.Status
+	practiceItemID := ""
+	if job.RetiredAt != 0 {
+		status = k12.DictationReAdd
+	} else if job.Status == k12.PracticeGenerationCommitted && len(job.ResultItemIDs) == 1 {
+		practiceItemID = job.ResultItemIDs[0]
+	}
+	return k12.AccumulationDictationGeneration{
+		GenerationID: job.GenerationJobID, AccumulationID: job.SourceID,
+		AgentName: job.AgentName, CommandKey: job.IdempotencyKey,
+		RequestDigest: job.RequestDigest, Status: status,
+		SourceSnapshot: job.RequestSnapshot, PracticeItemID: practiceItemID,
+		FailureReason: job.FailureReason, Attempt: job.Attempt,
+		CreatedAt: job.CreatedAt, UpdatedAt: job.UpdatedAt,
+	}
+}
+
+// GenerateCurrentDictationToBasket 在生成或验证正式练习项前先持久化任务检查点。
+// 重放与失败重试始终恢复同一任务和冻结来源快照。
 func (d Deps) GenerateCurrentDictationToBasket(
 	ctx context.Context,
 	agentName, sourceSession, recordID string,
@@ -175,7 +230,11 @@ func (d Deps) GenerateCurrentDictationToBasket(
 	added bool,
 	err error,
 ) {
-	if agentName == "" || recordID == "" {
+	agentName = strings.TrimSpace(agentName)
+	sourceSession = strings.TrimSpace(sourceSession)
+	recordID = strings.TrimSpace(recordID)
+	commandKey = strings.TrimSpace(commandKey)
+	if agentName == "" || recordID == "" || commandKey == "" {
 		return generation, "", false, fmt.Errorf("%w: agentName / recordID 不可空", ErrInvalidInput)
 	}
 	rec, err := d.Records.Get(ctx, recordID)
@@ -185,105 +244,256 @@ func (d Deps) GenerateCurrentDictationToBasket(
 	if rec == nil || rec.AgentName != agentName || rec.Collection != k12.CollectionAccumulation {
 		return generation, "", false, fmt.Errorf("%w: 积累不存在或不属于该实例", records.ErrNotFound)
 	}
-	f, _ := k12.ParseAccumFields(rec.Fields)
+	f, err := k12.ParseAccumFields(rec.Fields)
+	if err != nil {
+		return generation, "", false, err
+	}
+	_, rowVersion, err := d.Records.GetAccumulationCurrentProjection(
+		ctx, agentName, recordID,
+	)
+	if err != nil {
+		return generation, "", false, err
+	}
 	content := strings.TrimSpace(f.Content)
-	sourceSnapshot, err := json.Marshal(struct {
-		Content        string `json:"content"`
-		Subject        string `json:"subject"`
-		EntryType      string `json:"entry_type"`
-		FullDictation  bool   `json:"full_dictation"`
-		FormatPolicy   string `json:"format_policy"`
-		VerifierPolicy string `json:"verifier_policy"`
-	}{
-		Content: content, Subject: f.Subject, EntryType: f.EntryType,
-		FullDictation: fullDictation, FormatPolicy: "dictation-format-v1",
+	snapshot := accumulationPracticeRequestSnapshot{
+		AccumulationID: recordID, SourceVersion: rowVersion,
+		Content: content, Subject: strings.TrimSpace(f.Subject),
+		EntryType: strings.TrimSpace(f.EntryType), FullDictation: fullDictation,
+		FormatPolicy:   "dictation-format-v1",
 		VerifierPolicy: "subject-verifier-gate-v1",
+		// 入口会话不属于稳定来源意图；列表与详情重放统一冻结积累自身的来源会话。
+		SourceSession: strings.TrimSpace(rec.SourceSession),
+		GradeTerm:     d.creationGradeTerm(ctx, agentName, ""),
+	}
+	sourceSnapshot, err := json.Marshal(snapshot)
+	if err != nil {
+		return generation, "", false, err
+	}
+	routeBytes, err := json.Marshal(accumulationPracticeRouteSnapshot())
+	if err != nil {
+		return generation, "", false, err
+	}
+	routeSnapshot := string(routeBytes)
+	requestDigest := singlePracticeDigest(string(sourceSnapshot), routeSnapshot)
+	persistedCommandKey := fmt.Sprintf("%s:v%d", commandKey, rowVersion)
+	if prior, getErr := d.Records.GetPracticeGenerationJob(
+		ctx, agentName, persistedCommandKey,
+	); getErr == nil {
+		if prior.Scope != "single" ||
+			prior.SourceKind != k12.PracticeGenerationSourceAccumulation ||
+			prior.SourceID != recordID || prior.SourceVersion != rowVersion ||
+			prior.RequestDigest != requestDigest ||
+			prior.RequestSnapshot != string(sourceSnapshot) ||
+			prior.RouteSnapshot != routeSnapshot {
+			return generation, "", false, fmt.Errorf(
+				"%w: idempotency key is bound to another accumulation request",
+				ErrInvalidInput,
+			)
+		}
+		if prior.Status == k12.PracticeGenerationFailed || prior.RetiredAt != 0 {
+			prior, err = d.Records.ReactivatePracticeGenerationJob(
+				ctx, agentName, prior.GenerationJobID,
+			)
+			if err != nil {
+				return generation, "", false, err
+			}
+		}
+		return accumulationGenerationFromPracticeJob(prior), prior.ResultSetID, false, nil
+	} else if !errors.Is(getErr, records.ErrNotFound) {
+		return generation, "", false, getErr
+	}
+	if latest, latestErr := d.Records.GetLatestPracticeGenerationBySource(
+		ctx, agentName, k12.PracticeGenerationSourceAccumulation,
+		recordID, rowVersion,
+	); latestErr == nil {
+		if latest.RequestDigest != requestDigest ||
+			latest.RequestSnapshot != string(sourceSnapshot) ||
+			latest.RouteSnapshot != routeSnapshot {
+			return generation, "", false, fmt.Errorf(
+				"%w: accumulation source is bound to another frozen request",
+				ErrInvalidInput,
+			)
+		}
+		if latest.Status == k12.PracticeGenerationFailed || latest.RetiredAt != 0 {
+			latest, err = d.Records.ReactivatePracticeGenerationJob(
+				ctx, agentName, latest.GenerationJobID,
+			)
+			if err != nil {
+				return generation, "", false, err
+			}
+		}
+		return accumulationGenerationFromPracticeJob(latest), latest.ResultSetID, false, nil
+	} else if !errors.Is(latestErr, records.ErrNotFound) {
+		return generation, "", false, latestErr
+	}
+	jobID := idgen.NanoID()
+	now := d.now()
+	job := k12.PracticeGenerationJob{
+		GenerationJobID: jobID, AgentName: agentName,
+		IdempotencyKey: persistedCommandKey, RequestDigest: requestDigest,
+		Scope: "single", SourceKind: k12.PracticeGenerationSourceAccumulation,
+		SourceID: recordID, SourceVersion: rowVersion,
+		VariantsPerSource: 1, Difficulty: "same", Total: "1",
+		Textbook: snapshot.FormatPolicy, Status: k12.PracticeGenerationQueued,
+		ResultItemIDs: []string{"dictation-" + jobID},
+		SourceSummary: content, RequestSnapshot: string(sourceSnapshot),
+		RouteSnapshot: routeSnapshot, CreatedAt: now, UpdatedAt: now,
+	}
+	accepted, _, err := d.Records.BeginPracticeGenerationJob(ctx, job)
+	if err != nil {
+		return generation, "", false, err
+	}
+	return accumulationGenerationFromPracticeJob(accepted), "", false, nil
+}
+
+func accumulationPracticeOutputFromSnapshot(
+	snapshot accumulationPracticeRequestSnapshot,
+) (accumulationPracticeOutput, error) {
+	content := strings.TrimSpace(snapshot.Content)
+	if content == "" {
+		return accumulationPracticeOutput{}, fmt.Errorf("%w: empty accumulation content", ErrInvalidInput)
+	}
+	runes := []rune(content)
+	if len(runes) > dictationMaxRunes {
+		return accumulationPracticeOutput{}, fmt.Errorf(
+			"%w: content is too long for dictation practice", ErrInvalidInput,
+		)
+	}
+	if !k12.SubjectVerifierGatePassed(snapshot.Subject) {
+		return accumulationPracticeOutput{}, fmt.Errorf(
+			"%w: subject does not support deterministic dictation verification",
+			ErrSolveFailed,
+		)
+	}
+	isPoem := snapshot.EntryType == "古诗" || snapshot.EntryType == "古诗积累"
+	question := "默写：" + content
+	if (isPoem && !snapshot.FullDictation) ||
+		(!isPoem && len(runes) > dictationFullTextMaxRunes) {
+		question = "补空默写：" + blankFillClauses(content)
+	}
+	return accumulationPracticeOutput{
+		Subject: snapshot.Subject, QuestionMarkdown: question,
+		ExpectedAnswer: content, VerificationStatus: k12.PracticeItemVerified,
+		VerificationEvidence: "字符级比对（确定性默写判定，一字不差即正确）",
+	}, nil
+}
+
+// ProcessAccumulationPracticeGeneration 由共享逐题协调器执行积累来源任务。
+// 待处理与失败阶段仅写任务检查点；就绪且已验证的练习项与完成收据原子提交。
+func (d Deps) ProcessAccumulationPracticeGeneration(
+	ctx context.Context,
+	agentName, generationJobID string,
+) (
+	generation k12.AccumulationDictationGeneration,
+	basketID string,
+	added bool,
+	err error,
+) {
+	job, err := d.Records.GetPracticeGenerationJobByID(
+		ctx, strings.TrimSpace(agentName), strings.TrimSpace(generationJobID),
+	)
+	if err != nil {
+		return generation, "", false, err
+	}
+	if job.Scope != "single" ||
+		job.SourceKind != k12.PracticeGenerationSourceAccumulation {
+		return generation, "", false, fmt.Errorf(
+			"%w: generation job is not an accumulation task", ErrInvalidInput,
+		)
+	}
+	if job.RetiredAt != 0 || job.Status == k12.PracticeGenerationCommitted ||
+		job.Status == k12.PracticeGenerationFailed {
+		return accumulationGenerationFromPracticeJob(job), job.ResultSetID, false, nil
+	}
+	var snapshot accumulationPracticeRequestSnapshot
+	if err := json.Unmarshal([]byte(job.RequestSnapshot), &snapshot); err != nil {
+		return generation, "", false, err
+	}
+	attempt := job.Attempt
+	if attempt < 1 {
+		attempt = 1
+	}
+	if job.Status == k12.PracticeGenerationQueued {
+		job, err = d.Records.AdvancePracticeGenerationJob(
+			ctx, job.AgentName, job.GenerationJobID,
+			k12.PracticeGenerationGenerating, attempt, "",
+		)
+		if err != nil {
+			return generation, "", false, err
+		}
+	}
+	output, outputErr := accumulationPracticeOutputFromSnapshot(snapshot)
+	if outputErr != nil {
+		failed, failErr := d.Records.AdvancePracticeGenerationJob(
+			context.WithoutCancel(ctx), job.AgentName, job.GenerationJobID,
+			k12.PracticeGenerationFailed, attempt, outputErr.Error(),
+		)
+		if failErr != nil {
+			return generation, "", false, errors.Join(outputErr, failErr)
+		}
+		return accumulationGenerationFromPracticeJob(failed), "", false, outputErr
+	}
+	outputJSON, err := json.Marshal(output)
+	if err != nil {
+		return generation, "", false, err
+	}
+	if job.Status == k12.PracticeGenerationGenerating {
+		job, err = d.Records.SaveSinglePracticeGenerationOutput(
+			context.WithoutCancel(ctx), job.AgentName, job.GenerationJobID,
+			attempt, string(outputJSON),
+		)
+		if err != nil {
+			return generation, "", false, err
+		}
+		job, err = d.Records.AdvancePracticeGenerationJob(
+			ctx, job.AgentName, job.GenerationJobID,
+			k12.PracticeGenerationValidating, attempt, "",
+		)
+		if err != nil {
+			return generation, "", false, err
+		}
+	}
+	if job.Status == k12.PracticeGenerationValidating {
+		job, err = d.Records.SaveSinglePracticeValidationOutput(
+			context.WithoutCancel(ctx), job.AgentName, job.GenerationJobID,
+			attempt, string(outputJSON),
+		)
+		if err != nil {
+			return generation, "", false, err
+		}
+	}
+	hash, _, err := k12.StablePracticeProblemHash(k12.PracticeCandidateProblem{
+		Subject: output.Subject, QuestionMarkdown: output.QuestionMarkdown,
+		ExpectedAnswerMarkdown: output.ExpectedAnswer,
 	})
 	if err != nil {
 		return generation, "", false, err
 	}
-	requestDigest := digestJSON(struct {
-		AccumulationID string `json:"accumulation_id"`
-		CommandKey     string `json:"command_key"`
-		SourceSnapshot string `json:"source_snapshot"`
-	}{recordID, strings.TrimSpace(commandKey), string(sourceSnapshot)})
-	generation, _, err = d.Records.PrepareAccumulationDictationGeneration(
-		ctx, agentName, recordID, strings.TrimSpace(commandKey),
-		requestDigest, string(sourceSnapshot),
-	)
-	if err != nil {
-		return generation, "", false, err
-	}
-	if generation.Status == k12.DictationCommitted {
-		return generation, "", false, nil
-	}
-	runes := []rune(content)
-	if len(runes) > dictationMaxRunes {
-		generation, _ = d.Records.FailAccumulationDictationGeneration(
-			context.WithoutCancel(ctx), agentName, generation.GenerationID,
-			"内容过长，不适合默写练习",
-		)
-		return generation, "", false, fmt.Errorf("%w: 内容过长，不适合默写练习", ErrInvalidInput)
-	}
-	isPoem := f.EntryType == "古诗" || f.EntryType == "古诗积累"
-	question := "默写：" + content // 全文默写（≤20 字单词/短句；或家长显式选择整首默写的古诗）
-	if isPoem && !fullDictation {
-		question = "补空默写：" + blankFillClauses(content) // 古诗默认补空式
-	} else if !isPoem && len(runes) > dictationFullTextMaxRunes {
-		question = "补空默写：" + blankFillClauses(content) // 20～100 字长句：补空，不整段抄题
-	}
-	status, evidence := k12.PracticeItemNeedsReview, ""
-	if k12.SubjectVerifierGatePassed(f.Subject) {
-		status, evidence = k12.PracticeItemVerified, "字符级比对（确定性默写判定，一字不差即正确）"
-	}
-	item := k12.PracticeItem{
-		ItemID:                 dictationPracticeItemID(generation),
-		Subject:                f.Subject,
+	ready := k12.PracticeItem{
+		ItemID: job.ResultItemIDs[0], Subject: output.Subject,
 		AddedVia:               k12.PracticeAddedViaAccumulation,
-		QuestionMarkdown:       question,
-		ExpectedAnswerMarkdown: content,
-		VerificationStatus:     status,
-		VerificationEvidence:   evidence,
+		GenerationStatus:       k12.PracticeItemGenerationReady,
+		QuestionMarkdown:       output.QuestionMarkdown,
+		ExpectedAnswerMarkdown: output.ExpectedAnswer,
+		VerificationStatus:     output.VerificationStatus,
+		VerificationEvidence:   output.VerificationEvidence,
+		GenerationJobID:        job.GenerationJobID,
+		NormalizedContentHash:  hash,
 	}
-	basketID, added, err = d.AddToBasket(ctx, agentName, sourceSession, item)
-	if err != nil {
-		generation, _ = d.Records.FailAccumulationDictationGeneration(
-			context.WithoutCancel(ctx), agentName, generation.GenerationID, err.Error(),
-		)
-		return generation, "", false, err
-	}
-	// AddToBasket may legitimately deduplicate against an existing identical
-	// item. Resolve the actual durable item id before committing the generation.
-	basket, err := d.GetPracticeSet(ctx, agentName, basketID)
-	if err != nil {
-		return generation, basketID, added, err
-	}
-	practiceItemID := ""
-	for _, candidate := range basket.Fields.Items {
-		if samePracticeItem(candidate, item) {
-			practiceItemID = candidate.ItemID
-			break
-		}
-	}
-	if practiceItemID == "" {
-		return generation, basketID, added, fmt.Errorf(
-			"usecase: 默写题加入练习集后无法解析 durable item",
-		)
-	}
-	generation, err = d.Records.CommitAccumulationDictationGeneration(
-		ctx, agentName, generation.GenerationID, practiceItemID,
+	stored, replay, err := d.commitSinglePracticeReadyItem(
+		ctx, job, snapshot.SourceSession, snapshot.GradeTerm,
+		k12.PracticeSourceMixed, ready,
 	)
 	if err != nil {
-		return generation, basketID, added, err
+		return generation, "", false, err
 	}
-	return generation, basketID, added, nil
-}
-
-func dictationPracticeItemID(generation k12.AccumulationDictationGeneration) string {
-	if generation.Attempt <= 1 {
-		return "dictation-" + generation.GenerationID
+	committed, err := d.Records.GetPracticeGenerationJobByID(
+		ctx, job.AgentName, job.GenerationJobID,
+	)
+	if err != nil {
+		return generation, "", false, err
 	}
-	return fmt.Sprintf("dictation-%s-attempt-%d", generation.GenerationID, generation.Attempt)
+	return accumulationGenerationFromPracticeJob(committed), stored.RecordID, !replay, nil
 }
 
 // blankFillClauses 古诗/长句补空（§3.9）：按标点逐句留 1～2 个关键字空（句末关键字挖空，
@@ -380,11 +590,16 @@ func (d Deps) accumItemFromRecord(
 		// V37 maps a legacy empty source to absent; keep the DTO empty/omitempty.
 		fields.Source = ""
 	}
-	generation, err := d.Records.GetLatestAccumulationDictationGeneration(
-		ctx, rec.AgentName, rec.RecordID,
+	var generation *k12.AccumulationDictationGeneration
+	job, jobErr := d.Records.GetLatestPracticeGenerationBySource(
+		ctx, rec.AgentName, k12.PracticeGenerationSourceAccumulation,
+		rec.RecordID, rowVersion,
 	)
-	if err != nil {
-		return AccumItem{}, err
+	if jobErr == nil {
+		projected := accumulationGenerationFromPracticeJob(job)
+		generation = &projected
+	} else if !errors.Is(jobErr, records.ErrNotFound) {
+		return AccumItem{}, jobErr
 	}
 	return AccumItem{
 		Record: rec, Fields: fields, RowVersion: rowVersion,

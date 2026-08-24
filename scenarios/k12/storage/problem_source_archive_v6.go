@@ -34,6 +34,7 @@ type ProblemSourceArchiveV6 struct {
 	DependencyGroups           []ProblemSourceArchiveDependencyGroup           `json:"dependency_groups,omitempty"`
 	ActionReceipts             []ProblemSourceArchiveActionReceipt             `json:"action_receipts,omitempty"`
 	FinalizationGenerations    []ProblemSourceArchiveFinalizationGeneration    `json:"finalization_generations,omitempty"`
+	FinalAnnotatedAssets       []ProblemSourceArchiveFinalAnnotatedAsset       `json:"final_annotated_assets,omitempty"`
 	InputRevisions             []ProblemSourceArchiveInputRevision             `json:"input_revisions,omitempty"`
 	ReprocessJobs              []ProblemSourceArchiveReprocessJob              `json:"reprocess_jobs,omitempty"`
 	ModelInvocations           []k12.ModelInvocation                           `json:"model_invocations,omitempty"`
@@ -52,6 +53,7 @@ func (a ProblemSourceArchiveV6) IsEmpty() bool {
 		len(a.StructureSnapshots) == 0 && len(a.StructureMembers) == 0 &&
 		len(a.DependencyGroups) == 0 && len(a.ActionReceipts) == 0 &&
 		len(a.FinalizationGenerations) == 0 &&
+		len(a.FinalAnnotatedAssets) == 0 &&
 		len(a.InputRevisions) == 0 && len(a.ReprocessJobs) == 0 &&
 		len(a.ModelInvocations) == 0 && len(a.ModelPhysicalInvocations) == 0 &&
 		len(a.RecognitionResults) == 0 && len(a.RecognitionItems) == 0 &&
@@ -67,6 +69,18 @@ type ProblemSourceArchiveFinalizationGeneration struct {
 	JobID      string                    `json:"job_id"`
 	Generation int64                     `json:"generation"`
 	Artifact   *k12.GradingFinalArtifact `json:"artifact,omitempty"`
+}
+
+// ProblemSourceArchiveFinalAnnotatedAsset 是 V89 一对一关系的归档事实。
+// 图片字节仍只由既有 PageAsset/assetstore 承载，不在归档内复制第二份内容。
+type ProblemSourceArchiveFinalAnnotatedAsset struct {
+	ArtifactID           string `json:"artifact_id"`
+	AgentName            string `json:"agent_name"`
+	OwnerScope           string `json:"owner_scope"`
+	AssetID              string `json:"asset_id"`
+	MIME                 string `json:"mime"`
+	Digest               string `json:"digest"`
+	OriginalSourceDigest string `json:"original_source_digest"`
 }
 
 type ProblemSourceArchivePageAsset struct {
@@ -610,7 +624,9 @@ func (s *Store) exportProblemSourceArchiveV6Via(ctx context.Context, q dbQueryer
 	if err := exportProblemSourceRecognitionArchive(ctx, q, agentName, &out, assetIDs); err != nil {
 		return out, err
 	}
-	if err := exportProblemSourceFinalizations(ctx, q, agentName, &out, jobIDs); err != nil {
+	if err := exportProblemSourceFinalizations(
+		ctx, q, agentName, &out, jobIDs, assetIDs,
+	); err != nil {
 		return out, err
 	}
 	assetList := make([]string, 0, len(assetIDs))
@@ -637,6 +653,7 @@ func exportProblemSourceFinalizations(
 	agentName string,
 	out *ProblemSourceArchiveV6,
 	jobIDs map[string]struct{},
+	assetIDs map[string]struct{},
 ) error {
 	jobs := make([]string, 0, len(jobIDs))
 	for jobID := range jobIDs {
@@ -675,6 +692,21 @@ func exportProblemSourceFinalizations(
 			}
 			artifactCopy := artifact
 			state.Artifact = &artifactCopy
+			if artifact.HasAnnotatedAsset() {
+				out.FinalAnnotatedAssets = append(
+					out.FinalAnnotatedAssets,
+					ProblemSourceArchiveFinalAnnotatedAsset{
+						ArtifactID:           artifact.ArtifactID,
+						AgentName:            artifact.AgentName,
+						OwnerScope:           artifact.AnnotatedAssetOwnerScope,
+						AssetID:              artifact.AnnotatedAssetID,
+						MIME:                 artifact.AnnotatedMIME,
+						Digest:               artifact.AnnotatedDigest,
+						OriginalSourceDigest: artifact.OriginalSourceDigest,
+					},
+				)
+				assetIDs[artifact.AnnotatedAssetID] = struct{}{}
+			}
 			if artifact.SummaryInvocationID != "" {
 				if _, exists := modelIDs[artifact.SummaryInvocationID]; !exists {
 					invocation, err := getModelInvocationByIDVia(ctx, q, artifact.SummaryInvocationID)
@@ -721,6 +753,9 @@ func exportProblemSourceFinalizations(
 	}
 	sort.Slice(out.ModelInvocations, func(i, j int) bool {
 		return out.ModelInvocations[i].InvocationID < out.ModelInvocations[j].InvocationID
+	})
+	sort.Slice(out.FinalAnnotatedAssets, func(i, j int) bool {
+		return out.FinalAnnotatedAssets[i].ArtifactID < out.FinalAnnotatedAssets[j].ArtifactID
 	})
 	return nil
 }
@@ -1290,6 +1325,51 @@ func ValidateProblemSourceArchiveV6(agentName string, archive ProblemSourceArchi
 		}
 		assets[v.PageAssetID] = v
 	}
+	annotatedAssets := make(
+		map[string]ProblemSourceArchiveFinalAnnotatedAsset,
+		len(archive.FinalAnnotatedAssets),
+	)
+	for _, relation := range archive.FinalAnnotatedAssets {
+		if relation.AgentName != agentName ||
+			relation.ArtifactID != strings.TrimSpace(relation.ArtifactID) ||
+			relation.ArtifactID == "" ||
+			relation.OwnerScope != strings.TrimSpace(relation.OwnerScope) ||
+			relation.OwnerScope == "" ||
+			relation.AssetID != strings.TrimSpace(relation.AssetID) ||
+			relation.AssetID == "" ||
+			relation.MIME != strings.TrimSpace(relation.MIME) ||
+			relation.Digest != strings.TrimSpace(relation.Digest) ||
+			relation.OriginalSourceDigest != strings.TrimSpace(relation.OriginalSourceDigest) {
+			return fmt.Errorf("problem-source final annotated asset scope/value mismatch")
+		}
+		if _, duplicate := annotatedAssets[relation.ArtifactID]; duplicate {
+			return fmt.Errorf(
+				"duplicate problem-source final annotated asset %q",
+				relation.ArtifactID,
+			)
+		}
+		asset, ok := assets[relation.AssetID]
+		if !ok || asset.AgentName != relation.AgentName ||
+			asset.OwnerScope != relation.OwnerScope ||
+			asset.MediaType != relation.MIME ||
+			asset.ContentDigest != relation.Digest {
+			return fmt.Errorf("problem-source final annotated PageAsset mismatch")
+		}
+		originalFound := false
+		for _, candidate := range assets {
+			if candidate.AgentName == relation.AgentName &&
+				candidate.OwnerScope == relation.OwnerScope &&
+				candidate.ContentDigest == relation.OriginalSourceDigest {
+				originalFound = true
+				break
+			}
+		}
+		if !originalFound {
+			return fmt.Errorf("problem-source final original PageAsset is missing")
+		}
+		referencedAssets[relation.AssetID] = struct{}{}
+		annotatedAssets[relation.ArtifactID] = relation
+	}
 	structureIndex, err := validateProblemSourceArchiveStructures(agentName, archive)
 	if err != nil {
 		return err
@@ -1419,6 +1499,7 @@ func ValidateProblemSourceArchiveV6(agentName string, archive ProblemSourceArchi
 	}
 	finalizations := map[string]ProblemSourceArchiveFinalizationGeneration{}
 	summaryInvocations := map[string]string{}
+	seenAnnotatedAssets := make(map[string]struct{}, len(annotatedAssets))
 	for _, v := range archive.FinalizationGenerations {
 		if v.AgentName != agentName || v.JobID == "" || v.Generation < 0 {
 			return fmt.Errorf("problem-source finalization generation scope/value mismatch")
@@ -1430,17 +1511,38 @@ func ValidateProblemSourceArchiveV6(agentName string, archive ProblemSourceArchi
 			return fmt.Errorf("unreferenced problem-source finalization job %q", v.JobID)
 		}
 		if v.Artifact != nil {
-			if err := v.Artifact.Validate(); err != nil {
+			artifact := *v.Artifact
+			relation, hasRelation := annotatedAssets[artifact.ArtifactID]
+			if hasRelation {
+				if (artifact.AnnotatedAssetOwnerScope != "" &&
+					artifact.AnnotatedAssetOwnerScope != relation.OwnerScope) ||
+					artifact.AnnotatedAssetID != relation.AssetID ||
+					artifact.AnnotatedMIME != relation.MIME ||
+					artifact.AnnotatedDigest != relation.Digest ||
+					artifact.OriginalSourceDigest != relation.OriginalSourceDigest {
+					return fmt.Errorf("problem-source final annotated artifact mismatch")
+				}
+				artifact.AnnotatedAssetOwnerScope = relation.OwnerScope
+				seenAnnotatedAssets[artifact.ArtifactID] = struct{}{}
+			} else if artifact.AnnotatedAssetOwnerScope != "" ||
+				artifact.AnnotatedAssetID != "" || artifact.AnnotatedMIME != "" ||
+				artifact.AnnotatedDigest != "" || artifact.OriginalSourceDigest != "" {
+				return fmt.Errorf("problem-source final annotated relation is missing")
+			}
+			if err := artifact.Validate(); err != nil {
 				return fmt.Errorf("problem-source final artifact invalid: %w", err)
 			}
-			if v.Artifact.AgentName != agentName || v.Artifact.JobID != v.JobID {
+			if artifact.AgentName != agentName || artifact.JobID != v.JobID {
 				return fmt.Errorf("problem-source final artifact scope mismatch")
 			}
-			if v.Artifact.SummaryInvocationID != "" {
-				summaryInvocations[v.Artifact.SummaryInvocationID] = v.JobID
+			if artifact.SummaryInvocationID != "" {
+				summaryInvocations[artifact.SummaryInvocationID] = v.JobID
 			}
 		}
 		finalizations[v.JobID] = v
+	}
+	if len(seenAnnotatedAssets) != len(annotatedAssets) {
+		return fmt.Errorf("problem-source final annotated relation exact-set mismatch")
 	}
 	if len(finalizations) != len(receiptJobs) {
 		return fmt.Errorf("problem-source finalization exact-set mismatch: jobs=%d generations=%d", len(receiptJobs), len(finalizations))
@@ -2180,7 +2282,32 @@ func cloneProblemSourceArchiveV6(source ProblemSourceArchiveV6) ProblemSourceArc
 	raw, _ := json.Marshal(source)
 	var out ProblemSourceArchiveV6
 	_ = json.Unmarshal(raw, &out)
+	hydrateProblemSourceArchiveFinalAnnotatedAssets(&out)
 	return out
+}
+
+// hydrateProblemSourceArchiveFinalAnnotatedAssets 只恢复不会进入 JSON 的
+// owner 校验字段；公开归档仍以显式一对一关系作为该事实的唯一载体。
+func hydrateProblemSourceArchiveFinalAnnotatedAssets(archive *ProblemSourceArchiveV6) {
+	if archive == nil {
+		return
+	}
+	byArtifact := make(
+		map[string]ProblemSourceArchiveFinalAnnotatedAsset,
+		len(archive.FinalAnnotatedAssets),
+	)
+	for _, relation := range archive.FinalAnnotatedAssets {
+		byArtifact[relation.ArtifactID] = relation
+	}
+	for index := range archive.FinalizationGenerations {
+		artifact := archive.FinalizationGenerations[index].Artifact
+		if artifact == nil {
+			continue
+		}
+		if relation, ok := byArtifact[artifact.ArtifactID]; ok {
+			artifact.AnnotatedAssetOwnerScope = relation.OwnerScope
+		}
+	}
 }
 
 // ImportProblemSourceArchiveV6Tx merges a verified archive inside the caller's
@@ -2336,10 +2463,12 @@ func (s *Store) DeleteUnreferencedProblemSourcePageAssetsTx(
 			(SELECT COUNT(*) FROM k12_image_task_dispatches d,json_each(d.source_asset_refs_json) r
 			 WHERE d.agent_name=? AND r.value=?) +
 			(SELECT COUNT(*) FROM k12_homework_submissions h,json_each(h.source_asset_refs_json) r
-			 WHERE h.agent_name=? AND r.value=?)`,
+			 WHERE h.agent_name=? AND r.value=?) +
+			(SELECT COUNT(*) FROM k12_grading_final_artifact_assets
+			 WHERE agent_name=? AND annotated_asset_id=?)`,
 			agentName, pageAssetID, agentName, pageAssetID,
 			agentName, pageAssetID, agentName, pageAssetID,
-			agentName, pageAssetID,
+			agentName, pageAssetID, agentName, pageAssetID,
 		).Scan(&references); err != nil {
 			return fmt.Errorf("count PageAsset references: %w", err)
 		}
@@ -2476,7 +2605,9 @@ func (s *Store) insertProblemSourceArchiveV6(ctx context.Context, tx *sql.Tx, a 
 			return err
 		}
 	}
-	if err := restoreProblemSourceFinalizationsTx(ctx, tx, a.FinalizationGenerations); err != nil {
+	if err := restoreProblemSourceFinalizationsTx(
+		ctx, tx, a.FinalizationGenerations, a.FinalAnnotatedAssets,
+	); err != nil {
 		return err
 	}
 	return nil
@@ -2486,7 +2617,15 @@ func restoreProblemSourceFinalizationsTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	states []ProblemSourceArchiveFinalizationGeneration,
+	annotatedAssets []ProblemSourceArchiveFinalAnnotatedAsset,
 ) error {
+	annotatedByArtifact := make(
+		map[string]ProblemSourceArchiveFinalAnnotatedAsset,
+		len(annotatedAssets),
+	)
+	for _, relation := range annotatedAssets {
+		annotatedByArtifact[relation.ArtifactID] = relation
+	}
 	for _, state := range states {
 		var currentGeneration int64
 		if err := tx.QueryRowContext(ctx, `SELECT finalization_generation
@@ -2560,6 +2699,22 @@ func restoreProblemSourceFinalizationsTx(
 		); err != nil {
 			return fmt.Errorf("restore source final artifact: %w", err)
 		}
+		if relation, ok := annotatedByArtifact[artifact.ArtifactID]; ok {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO k12_grading_final_artifact_assets(
+				artifact_id,agent_name,annotated_asset_owner_scope,
+				annotated_asset_id,annotated_mime,annotated_digest,original_source_digest
+			) VALUES(?,?,?,?,?,?,?)`,
+				relation.ArtifactID,
+				relation.AgentName,
+				relation.OwnerScope,
+				relation.AssetID,
+				relation.MIME,
+				relation.Digest,
+				relation.OriginalSourceDigest,
+			); err != nil {
+				return fmt.Errorf("restore source final annotated asset: %w", err)
+			}
+		}
 	}
 	return nil
 }
@@ -2606,6 +2761,14 @@ func ensureProblemSourceArchiveSubset(want, got ProblemSourceArchiveV6) error {
 		return err
 	}
 	if err := problemSourceFinalizationSubset(want.FinalizationGenerations, got.FinalizationGenerations); err != nil {
+		return err
+	}
+	if err := archiveSliceSubset(
+		"final annotated asset",
+		want.FinalAnnotatedAssets,
+		got.FinalAnnotatedAssets,
+		func(v ProblemSourceArchiveFinalAnnotatedAsset) string { return v.ArtifactID },
+	); err != nil {
 		return err
 	}
 	if err := archiveSliceSubset("input revision", want.InputRevisions, got.InputRevisions, func(v ProblemSourceArchiveInputRevision) string {

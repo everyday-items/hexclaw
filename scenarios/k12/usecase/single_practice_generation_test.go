@@ -186,7 +186,7 @@ func TestSinglePracticeGeneration_OneClickPersistsThenCommitsOnFrozenRoute(t *te
 	}
 }
 
-func TestSinglePracticeGeneration_FailureRetryReusesFrozenJobAndPlaceholder(t *testing.T) {
+func TestSinglePracticeGeneration_FailureRetryReusesFrozenJobWithoutPublicPlaceholder(t *testing.T) {
 	d := newDataDeps(t)
 	generator := &singlePracticeGenerator{fail: true}
 	d.Solver = singlePracticeValidator{}
@@ -266,9 +266,9 @@ func TestSinglePracticeGeneration_RecoversDurableGenerationOutputWithoutResend(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	job, err := d.Records.AdvanceSinglePracticeGeneration(
+	job, err := d.Records.AdvancePracticeGenerationJob(
 		context.Background(), "xiaoming", pending.GenerationJobID,
-		k12.PracticeGenerationGenerating, 1, k12.PracticeItem{}, "",
+		k12.PracticeGenerationGenerating, 1, "",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -354,9 +354,9 @@ func TestSinglePracticeGeneration_RecoversDurableValidationOutputWithoutResend(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	job, err := d.Records.AdvanceSinglePracticeGeneration(
+	job, err := d.Records.AdvancePracticeGenerationJob(
 		context.Background(), "xiaoming", pending.GenerationJobID,
-		k12.PracticeGenerationGenerating, 1, k12.PracticeItem{}, "",
+		k12.PracticeGenerationGenerating, 1, "",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -405,9 +405,9 @@ func TestSinglePracticeGeneration_RecoversDurableValidationOutputWithoutResend(t
 	); err != nil {
 		t.Fatal(err)
 	}
-	job, err = d.Records.AdvanceSinglePracticeGeneration(
+	job, err = d.Records.AdvancePracticeGenerationJob(
 		context.Background(), "xiaoming", job.GenerationJobID,
-		k12.PracticeGenerationValidating, 1, k12.PracticeItem{}, "",
+		k12.PracticeGenerationValidating, 1, "",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -490,9 +490,9 @@ func TestSinglePracticeGeneration_SentWithoutDurableOutputRequiresReconciliation
 	if err != nil {
 		t.Fatal(err)
 	}
-	job, err := d.Records.AdvanceSinglePracticeGeneration(
+	job, err := d.Records.AdvancePracticeGenerationJob(
 		context.Background(), "xiaoming", pending.GenerationJobID,
-		k12.PracticeGenerationGenerating, 1, k12.PracticeItem{}, "",
+		k12.PracticeGenerationGenerating, 1, "",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -624,7 +624,8 @@ func TestSinglePracticeGenerationCoordinator_RecoversQueuedJobAfterRestart(t *te
 func TestSinglePracticeGeneration_RemoveCommittedItemRetiresJobAndReturnsReAdd(t *testing.T) {
 	d := newDataDeps(t)
 	generator := &singlePracticeGenerator{}
-	d.Solver = singlePracticeValidator{}
+	validator := &countingSinglePracticeValidator{}
+	d.Solver = validator
 	d.PracticeVariant = generator
 	d.PracticeGenerationRoute = func(
 		_ context.Context,
@@ -683,48 +684,30 @@ func TestSinglePracticeGeneration_RemoveCommittedItemRetiresJobAndReturnsReAdd(t
 			t.Fatalf("removed practice item still present: %+v", item)
 		}
 	}
-}
 
-func TestSinglePracticeGeneration_RemovePendingItemPreventsProviderCall(t *testing.T) {
-	d := newDataDeps(t)
-	generator := &singlePracticeGenerator{}
-	validator := &countingSinglePracticeValidator{}
-	d.Solver = validator
-	d.PracticeVariant = generator
-	d.PracticeGenerationRoute = func(
-		_ context.Context,
-		_ k12.GradingModelSnapshot,
-	) (k12.GradingModelSnapshot, error) {
-		return k12.GradingModelSnapshot{
-			Provider: "provider-a", Model: "model-a",
-			Route: "provider-a/model-a", Capability: "text",
-		}, nil
-	}
-	sourceID := seedSinglePracticeMistake(t, d, "")
-	pending, err := d.StartSinglePracticeGeneration(
+	generatedCalls, validatedCalls := generator.calls, validator.calls
+	reactivated, err := d.StartSinglePracticeGeneration(
 		context.Background(), "xiaoming", sourceID,
-		singlePracticeRequest("single:"+sourceID+":remove-pending"),
+		singlePracticeRequest("single:"+sourceID+":re-add"),
 	)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || reactivated.State != usecase.SinglePracticePending ||
+		reactivated.GenerationJobID != joined.GenerationJobID ||
+		reactivated.PracticeItemID != joined.PracticeItemID {
+		t.Fatalf("re-add changed durable identity: joined=%+v reactivated=%+v err=%v",
+			joined, reactivated, err)
 	}
-	if pending.PracticeSetID == "" || pending.PracticeItemID == "" {
-		t.Fatalf("pending identity missing: %+v", pending)
-	}
-	if err = d.RemoveFromBasket(
-		context.Background(), "xiaoming",
-		pending.PracticeSetID, pending.PracticeItemID,
-	); err != nil {
-		t.Fatal(err)
-	}
-	projected, err := d.ProcessSinglePracticeGeneration(
-		context.Background(), "xiaoming", pending.GenerationJobID,
+	rejoined, err := d.ProcessSinglePracticeGeneration(
+		context.Background(), "xiaoming", reactivated.GenerationJobID,
 	)
-	if err != nil || projected.State != usecase.SinglePracticeReAdd {
-		t.Fatalf("retired worker projection=%+v err=%v", projected, err)
+	if err != nil || rejoined.State != usecase.SinglePracticeJoined ||
+		rejoined.GenerationJobID != joined.GenerationJobID ||
+		rejoined.PracticeSetID != joined.PracticeSetID ||
+		rejoined.PracticeItemID != joined.PracticeItemID {
+		t.Fatalf("re-add did not restore the same item: first=%+v second=%+v err=%v",
+			joined, rejoined, err)
 	}
-	if generator.calls != 0 || validator.calls != 0 {
-		t.Fatalf("retired generation called model: generator=%d validator=%d",
-			generator.calls, validator.calls)
+	if generator.calls != generatedCalls || validator.calls != validatedCalls {
+		t.Fatalf("re-add repeated model calls: generator=%d/%d validator=%d/%d",
+			generator.calls, generatedCalls, validator.calls, validatedCalls)
 	}
 }

@@ -47,13 +47,14 @@ type TutoringTipsProblem struct {
 // TutoringTips is an ephemeral, read-only projection of one confirmed
 // GradingJob. No additional table or mutable current-selection state exists.
 type TutoringTips struct {
-	GradingJobID    string
-	SubmissionID    string
-	Grade           string
-	Subject         string
-	KnowledgePoints []string              `json:"knowledge_points"`
-	Problems        []TutoringTipsProblem `json:"-"`
-	Sections        []TutoringTipsSection `json:"sections"`
+	GradingJobID              string
+	SubmissionID              string
+	Grade                     string
+	Subject                   string
+	KnowledgePoints           []string                   `json:"knowledge_points"`
+	Problems                  []TutoringTipsProblem      `json:"-"`
+	Sections                  []TutoringTipsSection      `json:"sections"`
+	GroundingEvidenceReceipts []GroundingEvidenceReceipt `json:"grounding_evidence_receipts"`
 }
 
 var tutoringTipsBuildBudget = 90 * time.Second
@@ -81,6 +82,14 @@ func (d Deps) BuildTutoringTipsForOwner(
 // BuildTutoringTipsSubject is the subject-aware canonical builder. Subject is
 // derived from the durable Problem exact-set rather than accepted as an input.
 func (d Deps) BuildTutoringTipsSubject(ctx context.Context, agentName, gradingJobID string) (TutoringTips, error) {
+	return d.buildTutoringTipsSubject(ctx, agentName, gradingJobID, nil)
+}
+
+func (d Deps) buildTutoringTipsSubject(
+	ctx context.Context,
+	agentName, gradingJobID string,
+	frozenGrounding *GroundingSnapshot,
+) (TutoringTips, error) {
 	agentName = strings.TrimSpace(agentName)
 	gradingJobID = strings.TrimSpace(gradingJobID)
 	if agentName == "" || gradingJobID == "" {
@@ -126,37 +135,13 @@ func (d Deps) BuildTutoringTipsSubject(ctx context.Context, agentName, gradingJo
 	if err != nil {
 		return TutoringTips{}, err
 	}
-	groundingRequest := GroundingSnapshot{
-		AgentName: agentName,
-		// The durable profile is currently keyed by agent. This is an explicit
-		// transitional owner scope, not a fabricated independent learner ID.
-		LearnerID: agentName,
-		Subject:   subject,
-		Edition:   strings.TrimSpace(profile.TextbookEdition),
-		Volume:    textbookVolumeFromGradeTerm(grade),
+	grounding, err := d.resolveTutoringGrounding(
+		ctx, agentName, subject, grade, profile, frozenGrounding,
+	)
+	if err != nil {
+		return TutoringTips{}, err
 	}
-	if d.Records != nil && subject == "数学" {
-		if scope, found, resolveErr := d.Records.GetActiveTextbookGroundingScope(
-			ctx, k12storage.TextbookScope{
-				OwnerID: d.TextbookOwnerID, AgentName: agentName, Subject: "math",
-			},
-		); resolveErr == nil && found {
-			groundingRequest.TextbookBindingID = scope.TextbookBindingID
-			groundingRequest.TextbookManifestID = scope.TextbookManifestID
-			groundingRequest.DocumentID = scope.DocumentID
-			groundingRequest.DocumentGeneration = scope.DocumentGeneration
-			groundingRequest.SourceDigest = scope.SourceDigest
-			groundingRequest.Edition = scope.Edition
-			groundingRequest.Volume = scope.Volume
-			groundingRequest.SegmentRefs = append(
-				[]string(nil), scope.SegmentRefs...,
-			)
-			groundingRequest.PageRefs = append(
-				[]k12.TextbookGroundingPageRef(nil), scope.PageRefs...,
-			)
-		}
-	}
-	grounding := d.freezeTutoringGrounding(ctx, groundingRequest)
+	grounding.receipts = new([]GroundingEvidenceReceipt)
 	history, err := d.mistakesFor(ctx, agentName, knowledgePoints)
 	if err != nil {
 		return TutoringTips{}, err
@@ -164,12 +149,14 @@ func (d Deps) BuildTutoringTipsSubject(ctx context.Context, agentName, gradingJo
 	tips := TutoringTips{
 		GradingJobID: gradingJobID, SubmissionID: job.Fields.SubmissionID,
 		Grade: grade, Subject: subject, KnowledgePoints: knowledgePoints, Problems: problems,
+		GroundingEvidenceReceipts: []GroundingEvidenceReceipt{},
 	}
 	tips.Sections = []TutoringTipsSection{
 		d.tutoringTipsOverviewWithGrounding(ctx, grounding, grade, subject, knowledgePoints),
 		tutoringTipsLearningEvidence(childName, history),
 		tutoringTipsPerProblem(problems),
 	}
+	tips.GroundingEvidenceReceipts = cloneGroundingEvidenceReceipts(*grounding.receipts)
 	return tips, nil
 }
 
@@ -265,6 +252,83 @@ type tutoringGroundingContext struct {
 	snapshot        GroundingSnapshot
 	snapshotter     SnapshotGrounding
 	legacyPermitted bool
+	required        bool
+	receipts        *[]GroundingEvidenceReceipt
+}
+
+func (d Deps) resolveTutoringGrounding(
+	ctx context.Context,
+	agentName, subject, grade string,
+	profile k12.ChildProfile,
+	frozenGrounding *GroundingSnapshot,
+) (tutoringGroundingContext, error) {
+	if frozenGrounding != nil {
+		snapshot := cloneGradingGroundingSnapshot(*frozenGrounding)
+		if err := validateGradingGroundingSnapshot(snapshot); err != nil {
+			return tutoringGroundingContext{}, err
+		}
+		if snapshot.AgentName != agentName || snapshot.LearnerID != agentName ||
+			snapshot.Subject != subject {
+			return tutoringGroundingContext{}, fmt.Errorf(
+				"%w: frozen textbook snapshot does not match the page summary",
+				ErrGradingGroundingUnavailable,
+			)
+		}
+		snapshotter, ok := d.Grounding.(SnapshotGrounding)
+		if !ok {
+			return tutoringGroundingContext{}, fmt.Errorf(
+				"%w: pinned grounding lookup is unavailable",
+				ErrGradingGroundingUnavailable,
+			)
+		}
+		if _, ok := snapshotter.(SnapshotGroundingEvidence); !ok {
+			return tutoringGroundingContext{}, fmt.Errorf(
+				"%w: pinned grounding evidence lookup is unavailable",
+				ErrGradingGroundingUnavailable,
+			)
+		}
+		return tutoringGroundingContext{
+			snapshot: snapshot, snapshotter: snapshotter, required: true,
+		}, nil
+	}
+
+	requested := GroundingSnapshot{
+		AgentName: agentName,
+		// 当前耐久档案以 agent 为键。这是明确的过渡期 owner 作用域，不能据此虚构
+		// 独立 learner ID。
+		LearnerID: agentName,
+		Subject:   subject,
+		Edition:   strings.TrimSpace(profile.TextbookEdition),
+		Volume:    textbookVolumeFromGradeTerm(grade),
+	}
+	required := false
+	if d.Records != nil && subject == "数学" && strings.TrimSpace(d.TextbookOwnerID) != "" {
+		textbookScope := k12storage.TextbookScope{
+			OwnerID: strings.TrimSpace(d.TextbookOwnerID), AgentName: agentName, Subject: "math",
+		}
+		scope, found, resolveErr := d.Records.GetActiveTextbookGroundingScope(ctx, textbookScope)
+		switch {
+		case resolveErr != nil:
+			required = true
+		case found:
+			required = true
+			requested.TextbookBindingID = scope.TextbookBindingID
+			requested.TextbookManifestID = scope.TextbookManifestID
+			requested.DocumentID = scope.DocumentID
+			requested.DocumentGeneration = scope.DocumentGeneration
+			requested.SourceDigest = scope.SourceDigest
+			requested.Edition = scope.Edition
+			requested.Volume = scope.Volume
+			requested.SegmentRefs = append([]string(nil), scope.SegmentRefs...)
+			requested.PageRefs = append([]k12.TextbookGroundingPageRef(nil), scope.PageRefs...)
+		default:
+			_, handled, catalogErr := d.Records.GetActiveTextbookCatalog(ctx, textbookScope)
+			required = catalogErr != nil || handled
+		}
+	}
+	grounding := d.freezeTutoringGrounding(ctx, requested)
+	grounding.required = required
+	return grounding, nil
 }
 
 func (d Deps) freezeTutoringGrounding(ctx context.Context, requested GroundingSnapshot) tutoringGroundingContext {
@@ -314,16 +378,30 @@ func (d Deps) tutoringTipsOverviewWithGrounding(ctx context.Context, grounding t
 			continue
 		}
 		if d.Grounding != nil {
-			if evidence, found, err := d.groundTutoringConcept(ctx, grounding, subject, concept, grade); err == nil && found {
-				teaching := groundedTutoringTipsMarkdown(ctx, d.TutoringTipsReview, subject, concept, grade, evidence)
+			if result, err := d.groundTutoringConcept(ctx, grounding, subject, concept, grade); err == nil && result.found {
+				verified := len(result.receipts) > 0
+				if grounding.required && !verified {
+					fmt.Fprintf(&content, "### %s\n\nNo reliable explanation was generated this time. Please check it against the current textbook.\n\n", concept)
+					continue
+				}
+				teaching := groundedTutoringTipsMarkdown(ctx, d.TutoringTipsReview, subject, concept, grade, result.text)
 				fmt.Fprintf(&content, "### %s\n\n%s\n\n", concept, teaching)
-				if grounding.snapshotter == nil || strings.TrimSpace(grounding.snapshot.TextbookBindingID) != "" {
+				if verified || (grounding.snapshotter == nil && grounding.receipts == nil) {
 					verifiedGroundedCount++
+				}
+				if verified && grounding.receipts != nil {
+					*grounding.receipts = appendUniqueGroundingEvidenceReceipts(
+						*grounding.receipts, result.receipts,
+					)
 				}
 				continue
 			}
 		}
 		if ctx.Err() != nil {
+			fmt.Fprintf(&content, "### %s\n\nNo reliable explanation was generated this time. Please check it against the current textbook.\n\n", concept)
+			continue
+		}
+		if grounding.required {
 			fmt.Fprintf(&content, "### %s\n\nNo reliable explanation was generated this time. Please check it against the current textbook.\n\n", concept)
 			continue
 		}
@@ -342,6 +420,29 @@ func (d Deps) tutoringTipsOverviewWithGrounding(ctx context.Context, grounding t
 		label = TutoringTipsSourceAI
 	}
 	return TutoringTipsSection{Title: "这页在练什么", Content: strings.TrimSpace(content.String()), SourceLabel: label}
+}
+
+type tutoringGroundingResult struct {
+	text     string
+	found    bool
+	receipts []GroundingEvidenceReceipt
+}
+
+func appendUniqueGroundingEvidenceReceipts(
+	current, incoming []GroundingEvidenceReceipt,
+) []GroundingEvidenceReceipt {
+	seen := make(map[GroundingEvidenceReceipt]struct{}, len(current)+len(incoming))
+	for _, receipt := range current {
+		seen[receipt] = struct{}{}
+	}
+	for _, receipt := range incoming {
+		if _, duplicate := seen[receipt]; duplicate {
+			continue
+		}
+		seen[receipt] = struct{}{}
+		current = append(current, receipt)
+	}
+	return current
 }
 
 type tutoringTipsCallResult[T any] struct {
@@ -411,26 +512,46 @@ func (d Deps) groundTutoringConcept(
 	ctx context.Context,
 	grounding tutoringGroundingContext,
 	subject, concept, grade string,
-) (string, bool, error) {
+) (tutoringGroundingResult, error) {
 	if grounding.snapshotter == nil && !grounding.legacyPermitted {
-		return "", false, nil
+		return tutoringGroundingResult{receipts: []GroundingEvidenceReceipt{}}, nil
 	}
 	type result struct {
-		evidence string
-		found    bool
+		grounding tutoringGroundingResult
 	}
 	grounded, err := awaitTutoringTipsCall(ctx, func() (result, error) {
 		if grounding.snapshotter != nil {
+			if evidenced, ok := grounding.snapshotter.(SnapshotGroundingEvidence); ok {
+				value, groundErr := evidenced.GroundSnapshotWithEvidence(
+					ctx, grounding.snapshot, concept, grade,
+				)
+				if groundErr != nil {
+					return result{}, groundErr
+				}
+				if validateErr := value.validate(grounding.snapshot); validateErr != nil {
+					return result{}, validateErr
+				}
+				return result{grounding: tutoringGroundingResult{
+					text: value.Text, found: value.Found,
+					receipts: cloneGroundingEvidenceReceipts(value.Receipts),
+				}}, nil
+			}
 			evidence, found, groundErr := grounding.snapshotter.GroundSnapshot(ctx, grounding.snapshot, concept, grade)
-			return result{evidence: evidence, found: found}, groundErr
+			return result{grounding: tutoringGroundingResult{
+				text: evidence, found: found,
+				receipts: []GroundingEvidenceReceipt{},
+			}}, groundErr
 		}
 		evidence, found, groundErr := d.groundForSubject(ctx, grounding.snapshot.AgentName, subject, concept, grade)
-		return result{evidence: evidence, found: found}, groundErr
+		return result{grounding: tutoringGroundingResult{
+			text: evidence, found: found,
+			receipts: []GroundingEvidenceReceipt{},
+		}}, groundErr
 	})
 	if err != nil {
-		return "", false, err
+		return tutoringGroundingResult{}, err
 	}
-	return grounded.evidence, grounded.found, nil
+	return grounded.grounding, nil
 }
 
 func tutoringTipsLearningEvidence(childName string, history []ReviewItem) TutoringTipsSection {

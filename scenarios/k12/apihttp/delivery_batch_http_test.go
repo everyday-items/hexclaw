@@ -72,22 +72,67 @@ func (f *httpBatchTransport) PrepareMessageForTargets(
 	if err != nil {
 		return nil, err
 	}
-	payload, err := json.Marshal(frozen)
-	if err != nil {
-		return nil, err
-	}
 	render, err := json.Marshal(frozen.RenderManifest)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]usecase.PreparedTextDelivery, 0, len(targets))
+	type frozenPartIdentity struct {
+		Kind    messagecontent.PartKind `json:"kind"`
+		MIME    string                  `json:"mime,omitempty"`
+		Ordinal int                     `json:"ordinal"`
+		Digest  string                  `json:"digest"`
+	}
+	type frozenPartPayload struct {
+		channel.Message
+		DeliveryPart frozenPartIdentity `json:"_delivery_part"`
+	}
+	digestBytes := func(value []byte) string {
+		sum := sha256.Sum256(value)
+		return fmt.Sprintf("sha256:%x", sum)
+	}
+	build := func(kind messagecontent.PartKind, mime string, ordinal int, digest string) (string, error) {
+		payload, marshalErr := json.Marshal(frozenPartPayload{
+			Message: frozen,
+			DeliveryPart: frozenPartIdentity{
+				Kind: kind, MIME: mime, Ordinal: ordinal, Digest: digest,
+			},
+		})
+		return string(payload), marshalErr
+	}
+	markdownDigest := digestBytes([]byte(strings.TrimSpace(message.Content)))
+	out := make([]usecase.PreparedTextDelivery, 0, len(targets)*(len(message.Attachments)+1))
 	for _, target := range targets {
+		payload, marshalErr := build(messagecontent.PartMarkdown, "", 1, markdownDigest)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
 		out = append(out, usecase.PreparedTextDelivery{
 			BindingID: target.BindingID, Target: target.Target,
+			PartKind: messagecontent.PartMarkdown, PartOrdinal: 1, PartDigest: markdownDigest,
 			PayloadJSON: string(payload), RenderJSON: string(render),
 		})
+		for i, attachment := range message.Attachments {
+			digest := digestBytes(attachment.Data)
+			payload, marshalErr = build(messagecontent.PartArtifact, attachment.MIME, i+2, digest)
+			if marshalErr != nil {
+				return nil, marshalErr
+			}
+			out = append(out, usecase.PreparedTextDelivery{
+				BindingID: target.BindingID, Target: target.Target,
+				PartKind: messagecontent.PartArtifact, PartMIME: attachment.MIME,
+				PartOrdinal: i + 2, PartDigest: digest,
+				PayloadJSON: payload, RenderJSON: string(render),
+			})
+		}
 	}
 	return out, nil
+}
+
+func (*httpBatchTransport) PrepareDeliveryPartResource(
+	_ context.Context,
+	receipt k12.DeliveryReceipt,
+) (string, error) {
+	return "http-resource:" + receipt.DeliveryID, nil
 }
 
 func newCreativeWorkDeliveryHTTPFixture(
@@ -186,6 +231,11 @@ func (f *httpBatchTransport) SendPrepared(
 	receipt k12.DeliveryReceipt,
 ) (usecase.DeliveryTransportAck, error) {
 	f.sends = append(f.sends, receipt)
+	if len(f.send) == 0 {
+		return usecase.DeliveryTransportAck{
+			Status: k12.DeliveryDelivered, ExternalMessageID: fmt.Sprintf("http-batch-%d", len(f.sends)),
+		}, nil
+	}
 	ack := f.send[0]
 	f.send = f.send[1:]
 	return ack, ack.Err
@@ -510,11 +560,12 @@ func TestCreativeWorkSendFreezesOriginalImageForEveryBoundTarget(t *testing.T) {
 				`{"agent":"mingming"}`,
 			)
 			children, _ := batch["receipts"].([]any)
-			if rec.Code != http.StatusOK || len(children) != len(httpBatchTargets()) ||
-				len(delivery.sends) != len(httpBatchTargets()) {
+			wantChildren := len(httpBatchTargets()) * 2
+			if rec.Code != http.StatusOK || len(children) != wantChildren ||
+				len(delivery.sends) != wantChildren {
 				t.Fatalf(
 					"all-bound creative send: status=%d batch=%v receipts=%d sends=%d want=%d",
-					rec.Code, batch, len(children), len(delivery.sends), len(httpBatchTargets()),
+					rec.Code, batch, len(children), len(delivery.sends), wantChildren,
 				)
 			}
 			if len(delivery.content) != 1 {
@@ -530,16 +581,30 @@ func TestCreativeWorkSendFreezesOriginalImageForEveryBoundTarget(t *testing.T) {
 			}
 
 			wantDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(original))
-			var firstPayload string
+			firstPayloadByPart := make(map[int]string, 2)
 			wantInstances := []string{"bot-a", "bot-b"}
 			for i, sent := range delivery.sends {
-				if sent.Target.InstanceID != wantInstances[i] {
-					t.Errorf("child %d target=%q want %q", i, sent.Target.InstanceID, wantInstances[i])
+				targetIndex := i / 2
+				partIndex := i % 2
+				if sent.Target.InstanceID != wantInstances[targetIndex] {
+					t.Errorf("child %d target=%q want %q", i, sent.Target.InstanceID, wantInstances[targetIndex])
 				}
-				if i == 0 {
-					firstPayload = sent.PayloadJSON
-				} else if sent.PayloadJSON != firstPayload {
-					t.Errorf("recipient %d payload differs from the first frozen payload", i)
+				wantKind := messagecontent.PartMarkdown
+				wantMIME := ""
+				if partIndex == 1 {
+					wantKind = messagecontent.PartArtifact
+					wantMIME = "image/png"
+				}
+				if sent.PartKind != wantKind || sent.PartMIME != wantMIME || sent.PartOrdinal != partIndex+1 {
+					t.Errorf("child %d part identity drift: %+v", i, sent)
+				}
+				if partIndex == 1 && sent.PreparedResourceID == "" {
+					t.Errorf("child %d artifact has no prepared provider resource", i)
+				}
+				if first, exists := firstPayloadByPart[partIndex]; !exists {
+					firstPayloadByPart[partIndex] = sent.PayloadJSON
+				} else if sent.PayloadJSON != first {
+					t.Errorf("target %d changed frozen part %d payload", targetIndex, partIndex+1)
 				}
 				if strings.Contains(sent.PayloadJSON, assetstore.IDPrefix) {
 					t.Errorf("recipient %d payload leaked asset://: %s", i, sent.PayloadJSON)
@@ -577,13 +642,16 @@ func TestCreativeWorkSendFreezesOriginalImageForEveryBoundTarget(t *testing.T) {
 					t.Errorf("recipient %d render manifest did not freeze markdown + original artifact: %#v", i, frozen.RenderManifest)
 				}
 			}
+			if firstPayloadByPart[0] == firstPayloadByPart[1] {
+				t.Error("markdown and artifact receipts must have independent payload identities")
+			}
 
 			replayRec, replay := do(
 				t, handler, http.MethodPost, "/creative-works/"+workID+"/send",
 				`{"agent":"mingming"}`,
 			)
 			if replayRec.Code != http.StatusOK || replay["batch_id"] != batch["batch_id"] ||
-				len(delivery.sends) != len(httpBatchTargets()) {
+				len(delivery.sends) != wantChildren {
 				t.Errorf(
 					"attachment replay changed batch or resent: status=%d first=%v replay=%v sends=%d",
 					replayRec.Code, batch["batch_id"], replay["batch_id"], len(delivery.sends),
@@ -700,13 +768,13 @@ func TestDeliveryBatchDigestIncludesAttachmentBytes(t *testing.T) {
 			first.BatchID, first.ContentDigest, second.BatchID, second.ContentDigest,
 		)
 	}
-	if len(delivery.sends) != 4 {
-		t.Fatalf("two distinct attachment payloads must send two children each, sends=%d", len(delivery.sends))
+	if len(delivery.sends) != 8 {
+		t.Fatalf("two attachment batches must send two parts to each of two targets, sends=%d", len(delivery.sends))
 	}
 	replayed, created, err := runtime.Deps.PrepareAndSendMessageBatch(
 		context.Background(), "mingming", "creative_work", "same-work", message("first-image"),
 	)
-	if err != nil || created || replayed.BatchID != first.BatchID || len(delivery.sends) != 4 {
+	if err != nil || created || replayed.BatchID != first.BatchID || len(delivery.sends) != 8 {
 		t.Fatalf(
 			"identical attachment replay changed batch or resent: created=%v batch=%s want=%s sends=%d err=%v",
 			created, replayed.BatchID, first.BatchID, len(delivery.sends), err,

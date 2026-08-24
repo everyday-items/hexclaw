@@ -961,8 +961,19 @@ func (d Deps) SendWeeklyPracticeSnapshot(ctx context.Context, agent, snapshotID,
 	} else if found {
 		return d.GetDeliveryBatch(ctx, agent, batchID)
 	}
-	batch, _, err := d.PrepareAndSendTextBatch(ctx, agent,
-		k12.PrintSourceWeeklyPracticeSnapshot, snapshotID, weeklySnapshotMarkdown(snapshot))
+	artifact, err := d.GetPrintableArtifactPDF(ctx, agent, snapshot.ArtifactID)
+	if err != nil {
+		return k12.DeliveryBatch{}, err
+	}
+	batch, _, err := d.PrepareAndSendMessageBatch(ctx, agent,
+		k12.PrintSourceWeeklyPracticeSnapshot, snapshotID, DeliveryMessage{
+			Content: artifact.Artifact.CanonicalMarkdown,
+			Attachments: []DeliveryAttachment{{
+				Name: artifact.Artifact.Title + ".pdf",
+				MIME: "application/pdf",
+				Data: artifact.Render.Payload,
+			}},
+		})
 	if err != nil {
 		return k12.DeliveryBatch{}, err
 	}

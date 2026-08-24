@@ -1,24 +1,28 @@
 package usecase
 
 import (
+	"bytes"
 	"context"
-	"strings"
+	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 )
 
-// blockingImageTaskPhotoResultGrading models the real coordinator seam that
-// holds its per-Job lock while a provider is in flight. Result must not touch
-// this optional process-local reader until a durable final artifact exists.
+// blockingImageTaskPhotoResultGrading 模拟真实协调器接缝：Provider 执行期间持有
+// 每个 Job 的锁，Result 不得访问这个可选的进程内读取器。
 type blockingImageTaskPhotoResultGrading struct {
 	imageTaskGradingStub
 
 	mu               sync.Mutex
 	photoResultCalls int
 	release          <-chan struct{}
+	projection       ImageTaskHomeworkProjection
 }
 
 func (s *blockingImageTaskPhotoResultGrading) ImageTaskHomeworkProjection(
@@ -26,6 +30,9 @@ func (s *blockingImageTaskPhotoResultGrading) ImageTaskHomeworkProjection(
 	string,
 	string,
 ) (ImageTaskHomeworkProjection, error) {
+	if s.projection.Stage != "" {
+		return s.projection, nil
+	}
 	return ImageTaskHomeworkProjection{
 		Stage: k12.GradingStageAssessing,
 	}, nil
@@ -103,11 +110,10 @@ func TestBUG20260802ImageTaskResultDoesNotWaitForInFlightPhotoResult(t *testing.
 	}
 }
 
-// K12-IMAGE-RESULT-LIVENESS-001: the durable final artifact is the explicit
-// boundary that authorizes the optional process-local projection. This
-// preserves the completed result contract while the non-terminal path remains
-// lock-free.
-func TestBUG20260802ImageTaskResultReadsPhotoOnlyAfterDurableFinalArtifact(t *testing.T) {
+// K12-IMAGE-RESULT-LIVENESS-001：完成态结果只读取最终产物冻结的不可变图片和
+// Markdown；即使任务完成，公开读取路径也不得访问进程内 PhotoResult。
+func TestBUG20260802ImageTaskResultReadsOnlyDurableFinalArtifact(t *testing.T) {
+	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
 	classifier := &imageTaskClassifierStub{result: ImageTaskClassification{
 		Intent:         k12.ImageTaskIntentCompletedHomework,
 		IntentEvidence: []string{"visible handwritten answers"},
@@ -145,38 +151,72 @@ func TestBUG20260802ImageTaskResultReadsPhotoOnlyAfterDurableFinalArtifact(t *te
 	if err != nil || !created {
 		t.Fatalf("create/run image task: created=%v err=%v", created, err)
 	}
+	repository := &PageAssetRepository{Records: coordinator.Records}
+	annotatedBytes := validPNGFixture(t, "image-task-final-result-liveness")
+	annotated, err := repository.Persist(
+		context.Background(), "guardian-result-liveness", "mingming", annotatedBytes,
+	)
+	if err != nil {
+		t.Fatalf("persist durable annotated PageAsset: %v", err)
+	}
 
+	artifact := k12.GradingFinalArtifact{
+		AgentName: "mingming", JobID: grading.resolvedJobID(),
+		StructureVersion: k12.GradingFinalArtifactStructureVersion,
+		CoverageStatus:   k12.GradingFinalArtifactCoverageComplete,
+		TotalCount:       1, PublishedCount: 1,
+		OrderedCurrentDigestsJSON: `["receipt-result-liveness"]`,
+		CanonicalMarkdown:         "# durable final grading result",
+		SummaryInvocationID:       "summary-result-liveness",
+		AnnotatedAssetOwnerScope:  "guardian-result-liveness",
+		AnnotatedAssetID:          annotated.Metadata.PageAssetID,
+		AnnotatedMIME:             annotated.Metadata.MediaType,
+		AnnotatedDigest:           annotated.Metadata.ContentDigest,
+		OriginalSourceDigest:      annotated.Metadata.ContentDigest,
+		CreatedAt:                 1000,
+		UpdatedAt:                 1000,
+	}
+	artifact.ArtifactDigest = k12.ComputeGradingFinalArtifactDigest(artifact)
 	_, replay, err := coordinator.Records.CommitGradingFinalArtifact(
 		context.Background(),
-		k12.GradingFinalArtifact{
-			ArtifactID:                "artifact-result-liveness",
-			AgentName:                 "mingming",
-			JobID:                     grading.resolvedJobID(),
-			StructureVersion:          k12.GradingFinalArtifactStructureVersion,
-			CoverageStatus:            k12.GradingFinalArtifactCoverageComplete,
-			TotalCount:                1,
-			PublishedCount:            1,
-			OrderedCurrentDigestsJSON: `["receipt-result-liveness"]`,
-			CanonicalMarkdown:         "# final grading result",
-			ArtifactDigest:            strings.Repeat("a", 64),
-			SummaryInvocationID:       "summary-result-liveness",
-			CreatedAt:                 1000,
-			UpdatedAt:                 1000,
-		},
+		artifact,
 		0,
 	)
 	if err != nil || replay {
 		t.Fatalf("commit durable final artifact: replay=%v err=%v", replay, err)
+	}
+	wantGroundingReceipts := []GroundingEvidenceReceipt{groundingRecoveryReceipt()}
+	grading.projection = ImageTaskHomeworkProjection{
+		Stage:                     k12.GradingStageCompleted,
+		GroundingEvidenceReceipts: wantGroundingReceipts,
 	}
 
 	got, err := coordinator.Result(context.Background(), "mingming", view.Dispatch.DispatchID)
 	if err != nil {
 		t.Fatalf("Result: %v", err)
 	}
-	if got.FinalArtifact == nil || got.Photo == nil || got.Photo.Markdown != "process-local photo result" {
-		t.Fatalf("durable final artifact must authorize the completed projection: %+v", got)
+	if got.FinalArtifact == nil || got.Photo == nil ||
+		got.Photo.Markdown != artifact.CanonicalMarkdown ||
+		got.Photo.AnnotatedImage == nil ||
+		got.Photo.AnnotatedImage.MIME != annotated.Metadata.MediaType ||
+		!bytes.Equal(got.Photo.AnnotatedImage.Data, annotatedBytes) {
+		t.Fatalf("completed result did not read the durable final artifact: %+v", got)
 	}
-	if grading.calls() != 1 {
-		t.Fatalf("completed Result must read PhotoResult exactly once: calls=%d", grading.calls())
+	if grading.calls() != 0 {
+		t.Fatalf("completed Result must not read process-local PhotoResult: calls=%d", grading.calls())
+	}
+	if !reflect.DeepEqual(got.GroundingEvidenceReceipts, wantGroundingReceipts) {
+		t.Fatalf("completed Result grounding receipts=%+v want %+v",
+			got.GroundingEvidenceReceipts, wantGroundingReceipts)
+	}
+	if removed, removeErr := assetstore.Remove(
+		"mingming", artifact.AnnotatedAssetID,
+	); removeErr != nil || !removed {
+		t.Fatalf("remove durable annotated bytes: removed=%v err=%v", removed, removeErr)
+	}
+	if _, err := coordinator.Result(
+		context.Background(), "mingming", view.Dispatch.DispatchID,
+	); !errors.Is(err, k12storage.ErrGradingFinalAnnotatedAssetUnavailable) {
+		t.Fatalf("completed Result must fail closed when annotated bytes are missing: %v", err)
 	}
 }

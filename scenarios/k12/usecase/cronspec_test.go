@@ -90,9 +90,8 @@ func TestDefaultCronSpecs_HasStableAgentKindKey(t *testing.T) {
 	}
 }
 
-// 每周复习两步脚本（§3.13 每周复习 · §3.8 装篮入口2）：先 POST fill-basket 自动装篮，
-// 再 GET mistake-sheet 投递错题卷；装篮失败**不阻断**错题卷投递（记 error 字段继续出卷）。
-func TestDefaultCronSpecs_WeeklyTwoStepFillThenSheet(t *testing.T) {
+// 每周整理只读取错题卷内容，不得隐式创建或更新练习集。
+func TestDefaultCronSpecs_WeeklySheetDoesNotWritePracticeSet(t *testing.T) {
 	var weekly *CronSpec
 	specs := DefaultCronSpecs("http://127.0.0.1:8787", "小明的辅导老师", nil)
 	for i := range specs {
@@ -104,27 +103,14 @@ func TestDefaultCronSpecs_WeeklyTwoStepFillThenSheet(t *testing.T) {
 		t.Fatal("默认任务集应含 weekly-sheet")
 	}
 	s := weekly.Script
-	iFill := strings.Index(s, "http_post('http://127.0.0.1:8787/api/k12/cron/fill-basket?agent=")
-	iSheet := strings.Index(s, "http_get('http://127.0.0.1:8787/api/k12/cron/mistake-sheet?agent=")
-	if iFill < 0 {
-		t.Fatalf("weekly 脚本应先 http_post fill-basket（自动装篮）:\n%s", s)
+	if strings.Contains(s, "fill-basket") || strings.Contains(s, "http_post(") {
+		t.Fatalf("weekly 脚本不得隐式写入练习集:\n%s", s)
 	}
-	if iSheet < 0 {
+	if !strings.Contains(s, "http_get('http://127.0.0.1:8787/api/k12/cron/mistake-sheet?agent=") {
 		t.Fatalf("weekly 脚本应 http_get mistake-sheet（错题卷投递）:\n%s", s)
-	}
-	if iFill > iSheet {
-		t.Errorf("装篮须在出卷之前（先装篮再投递）: fill@%d sheet@%d", iFill, iSheet)
-	}
-	// 装篮失败不阻断投递：fill 非 2xx 只记 error 字段，不 return error 中断。
-	if !strings.Contains(s, "fill_err") {
-		t.Errorf("weekly 脚本应把装篮失败记入 error 字段（不阻断出卷）:\n%s", s)
 	}
 	if !strings.Contains(s, "if not body:") {
 		t.Errorf("weekly 脚本应保留空 body 静默跳过分支:\n%s", s)
-	}
-	// 脚本注释引用权威条款。
-	if !strings.Contains(s, "§3.13") || !strings.Contains(s, "§3.8") {
-		t.Errorf("weekly 脚本注释应引用 §3.13 / §3.8 入口2:\n%s", s)
 	}
 }
 

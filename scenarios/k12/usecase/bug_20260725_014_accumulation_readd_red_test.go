@@ -30,6 +30,11 @@ func TestBUG20260725014AccumulationRemovedDictationReAddsExactlyOnce(t *testing.
 		ctx, "xiaoming", "session-1", accumulationID, false,
 		"dictation:"+accumulationID,
 	)
+	if err == nil {
+		first, basketID, added, err = d.ProcessAccumulationPracticeGeneration(
+			ctx, "xiaoming", first.GenerationID,
+		)
+	}
 	if err != nil || !added || first.Status != k12.DictationCommitted ||
 		first.PracticeItemID == "" {
 		t.Fatalf("first dictation commit: generation=%+v basket=%q added=%v err=%v",
@@ -72,24 +77,17 @@ func TestBUG20260725014AccumulationRemovedDictationReAddsExactlyOnce(t *testing.
 		t.Fatalf("removed generation projection=%+v, want re_add without active item",
 			projection.DictationGeneration)
 	}
-	queued, queuedCreated, err := d.Records.PrepareAccumulationDictationGeneration(
-		ctx, "xiaoming", accumulationID,
-		projection.DictationGeneration.CommandKey,
-		projection.DictationGeneration.RequestDigest,
-		projection.DictationGeneration.SourceSnapshot,
-	)
-	if err != nil || queuedCreated || queued.Status != k12.DictationQueued ||
-		queued.PracticeItemID != "" || queued.Attempt != first.Attempt+1 {
-		t.Fatalf("prepare re-add generation: created=%v generation=%+v err=%v",
-			queuedCreated, queued, err)
-	}
-
 	second, secondBasketID, added, err := d.GenerateCurrentDictationToBasket(
 		ctx, "xiaoming", "session-2", accumulationID, false,
 		"dictation:"+accumulationID,
 	)
+	if err == nil {
+		second, secondBasketID, added, err = d.ProcessAccumulationPracticeGeneration(
+			ctx, "xiaoming", second.GenerationID,
+		)
+	}
 	if err != nil || !added || second.Status != k12.DictationCommitted ||
-		second.PracticeItemID == "" || second.PracticeItemID == firstItemID ||
+		second.PracticeItemID != firstItemID ||
 		secondBasketID != basketID {
 		t.Fatalf("re-add dictation: first=%+v second=%+v basket=%q/%q added=%v err=%v",
 			first, second, basketID, secondBasketID, added, err)
@@ -100,7 +98,7 @@ func TestBUG20260725014AccumulationRemovedDictationReAddsExactlyOnce(t *testing.
 		ctx, "xiaoming", "session-3", accumulationID, false,
 		"dictation:"+accumulationID,
 	)
-	if err != nil || replayAdded || replayBasketID != "" ||
+	if err != nil || replayAdded || replayBasketID != basketID ||
 		replayed.GenerationID != second.GenerationID ||
 		replayed.PracticeItemID != secondItemID {
 		t.Fatalf("re-add replay diverged: replay=%+v basket=%q added=%v err=%v",
@@ -123,8 +121,8 @@ func TestBUG20260725014AccumulationRemovedDictationReAddsExactlyOnce(t *testing.
 			secondCount++
 		}
 	}
-	if firstCount != 0 || secondCount != 1 || accumulationCount != 1 {
-		t.Fatalf("basket accumulation exact-set old/new/all=%d/%d/%d, want 0/1/1",
+	if firstCount != 1 || secondCount != 1 || accumulationCount != 1 {
+		t.Fatalf("basket accumulation exact-set old/new/all=%d/%d/%d, want 1/1/1",
 			firstCount, secondCount, accumulationCount)
 	}
 	var oldChildren, newChildren int
@@ -136,7 +134,7 @@ func TestBUG20260725014AccumulationRemovedDictationReAddsExactlyOnce(t *testing.
 		WHERE set_record_id=? AND item_id=?`, basketID, secondItemID).Scan(&newChildren); err != nil {
 		t.Fatal(err)
 	}
-	if oldChildren != 0 || newChildren != 1 {
-		t.Fatalf("durable basket children old/new=%d/%d, want 0/1", oldChildren, newChildren)
+	if oldChildren != 1 || newChildren != 1 {
+		t.Fatalf("durable basket children old/new=%d/%d, want 1/1", oldChildren, newChildren)
 	}
 }

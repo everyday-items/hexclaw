@@ -12,16 +12,57 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
 )
 
 var ErrGradingFinalArtifactConflict = errors.New("grading final artifact conflict")
+
+var ErrGradingFinalAnnotatedAssetUnavailable = errors.New("grading final annotated asset unavailable")
 
 const gradingFinalArtifactColumns = `artifact_id,agent_name,job_id,structure_version,
 	coverage_status,total_count,published_count,skipped_count,
 	ordered_current_digests_json,canonical_markdown,artifact_digest,
 	summary_invocation_id,created_at,updated_at`
 
+const gradingFinalArtifactSelectColumns = `artifact.artifact_id,artifact.agent_name,
+	artifact.job_id,artifact.structure_version,artifact.coverage_status,
+	artifact.total_count,artifact.published_count,artifact.skipped_count,
+	artifact.ordered_current_digests_json,artifact.canonical_markdown,
+	artifact.artifact_digest,artifact.summary_invocation_id,
+	COALESCE(asset.annotated_asset_owner_scope,''),
+	COALESCE(asset.annotated_asset_id,''),COALESCE(asset.annotated_mime,''),
+	COALESCE(asset.annotated_digest,''),COALESCE(asset.original_source_digest,''),
+	artifact.created_at,artifact.updated_at`
+
 func scanGradingFinalArtifact(row rowScanner) (k12.GradingFinalArtifact, error) {
+	var artifact k12.GradingFinalArtifact
+	var coverageStatus string
+	err := row.Scan(
+		&artifact.ArtifactID,
+		&artifact.AgentName,
+		&artifact.JobID,
+		&artifact.StructureVersion,
+		&coverageStatus,
+		&artifact.TotalCount,
+		&artifact.PublishedCount,
+		&artifact.SkippedCount,
+		&artifact.OrderedCurrentDigestsJSON,
+		&artifact.CanonicalMarkdown,
+		&artifact.ArtifactDigest,
+		&artifact.SummaryInvocationID,
+		&artifact.AnnotatedAssetOwnerScope,
+		&artifact.AnnotatedAssetID,
+		&artifact.AnnotatedMIME,
+		&artifact.AnnotatedDigest,
+		&artifact.OriginalSourceDigest,
+		&artifact.CreatedAt,
+		&artifact.UpdatedAt,
+	)
+	artifact.CoverageStatus = k12.GradingFinalArtifactCoverageStatus(coverageStatus)
+	return artifact, err
+}
+
+func scanLegacyGradingFinalArtifact(row rowScanner) (k12.GradingFinalArtifact, error) {
 	var artifact k12.GradingFinalArtifact
 	var coverageStatus string
 	err := row.Scan(
@@ -44,6 +85,13 @@ func scanGradingFinalArtifact(row rowScanner) (k12.GradingFinalArtifact, error) 
 	return artifact, err
 }
 
+func gradingFinalArtifactAssetTableMissing(err error) bool {
+	return err != nil && strings.Contains(
+		err.Error(),
+		"no such table: k12_grading_final_artifact_assets",
+	)
+}
+
 func getGradingFinalArtifactVia(
 	ctx context.Context,
 	q dbQueryer,
@@ -51,12 +99,25 @@ func getGradingFinalArtifactVia(
 	artifactID string,
 ) (k12.GradingFinalArtifact, error) {
 	artifact, err := scanGradingFinalArtifact(q.QueryRowContext(ctx, `
-		SELECT `+gradingFinalArtifactColumns+`
-		FROM k12_grading_final_artifacts
-		WHERE agent_name=? AND artifact_id=?`,
+		SELECT `+gradingFinalArtifactSelectColumns+`
+		FROM k12_grading_final_artifacts AS artifact
+		LEFT JOIN k12_grading_final_artifact_assets AS asset
+		  ON asset.artifact_id=artifact.artifact_id
+		WHERE artifact.agent_name=? AND artifact.artifact_id=?`,
 		agentName,
 		artifactID,
 	))
+	// 升级中的旧库可能在 V89 执行前被短暂读取；只允许无批注图旧行退回
+	// 基表列。带批注图的提交仍必须等待 V89，不会伪造资产关系。
+	if gradingFinalArtifactAssetTableMissing(err) {
+		artifact, err = scanLegacyGradingFinalArtifact(q.QueryRowContext(ctx, `
+			SELECT `+gradingFinalArtifactColumns+`
+			FROM k12_grading_final_artifacts
+			WHERE agent_name=? AND artifact_id=?`,
+			agentName,
+			artifactID,
+		))
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return k12.GradingFinalArtifact{}, records.ErrNotFound
 	}
@@ -76,12 +137,23 @@ func getGradingFinalArtifactByJobVia(
 	jobID string,
 ) (k12.GradingFinalArtifact, error) {
 	artifact, err := scanGradingFinalArtifact(q.QueryRowContext(ctx, `
-		SELECT `+gradingFinalArtifactColumns+`
-		FROM k12_grading_final_artifacts
-		WHERE agent_name=? AND job_id=?`,
+		SELECT `+gradingFinalArtifactSelectColumns+`
+		FROM k12_grading_final_artifacts AS artifact
+		LEFT JOIN k12_grading_final_artifact_assets AS asset
+		  ON asset.artifact_id=artifact.artifact_id
+		WHERE artifact.agent_name=? AND artifact.job_id=?`,
 		agentName,
 		jobID,
 	))
+	if gradingFinalArtifactAssetTableMissing(err) {
+		artifact, err = scanLegacyGradingFinalArtifact(q.QueryRowContext(ctx, `
+			SELECT `+gradingFinalArtifactColumns+`
+			FROM k12_grading_final_artifacts
+			WHERE agent_name=? AND job_id=?`,
+			agentName,
+			jobID,
+		))
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return k12.GradingFinalArtifact{}, records.ErrNotFound
 	}
@@ -135,10 +207,12 @@ func (s *Store) GetCurrentGradingFinalArtifactByJob(
 		return k12.GradingFinalArtifact{}, records.ErrNotFound
 	}
 	artifact, err := scanGradingFinalArtifact(s.db.QueryRowContext(ctx, `
-		SELECT `+gradingFinalArtifactColumns+`
-		FROM k12_grading_final_artifacts
-		WHERE agent_name=? AND job_id=?
-		  AND finalization_generation=(
+		SELECT `+gradingFinalArtifactSelectColumns+`
+		FROM k12_grading_final_artifacts AS artifact
+		LEFT JOIN k12_grading_final_artifact_assets AS asset
+		  ON asset.artifact_id=artifact.artifact_id
+		WHERE artifact.agent_name=? AND artifact.job_id=?
+		  AND artifact.finalization_generation=(
 			SELECT finalization_generation
 			FROM k12_grading_jobs
 			WHERE agent_name=? AND record_id=?
@@ -148,6 +222,22 @@ func (s *Store) GetCurrentGradingFinalArtifactByJob(
 		agentName,
 		jobID,
 	))
+	if gradingFinalArtifactAssetTableMissing(err) {
+		artifact, err = scanLegacyGradingFinalArtifact(s.db.QueryRowContext(ctx, `
+			SELECT `+gradingFinalArtifactColumns+`
+			FROM k12_grading_final_artifacts
+			WHERE agent_name=? AND job_id=?
+			  AND finalization_generation=(
+				SELECT finalization_generation
+				FROM k12_grading_jobs
+				WHERE agent_name=? AND record_id=?
+			  )`,
+			agentName,
+			jobID,
+			agentName,
+			jobID,
+		))
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return k12.GradingFinalArtifact{}, records.ErrNotFound
 	}
@@ -198,6 +288,11 @@ func normalizeGradingFinalArtifact(
 	artifact.ArtifactID = strings.TrimSpace(artifact.ArtifactID)
 	artifact.ArtifactDigest = strings.TrimSpace(artifact.ArtifactDigest)
 	artifact.SummaryInvocationID = strings.TrimSpace(artifact.SummaryInvocationID)
+	artifact.AnnotatedAssetOwnerScope = strings.TrimSpace(artifact.AnnotatedAssetOwnerScope)
+	artifact.AnnotatedAssetID = strings.TrimSpace(artifact.AnnotatedAssetID)
+	artifact.AnnotatedMIME = strings.ToLower(strings.TrimSpace(artifact.AnnotatedMIME))
+	artifact.AnnotatedDigest = strings.TrimSpace(artifact.AnnotatedDigest)
+	artifact.OriginalSourceDigest = strings.TrimSpace(artifact.OriginalSourceDigest)
 	if artifact.StructureVersion == 0 {
 		artifact.StructureVersion = k12.GradingFinalArtifactStructureVersion
 	}
@@ -233,7 +328,82 @@ func sameGradingFinalArtifactContent(
 		stored.OrderedCurrentDigestsJSON == requested.OrderedCurrentDigestsJSON &&
 		stored.CanonicalMarkdown == requested.CanonicalMarkdown &&
 		stored.ArtifactDigest == requested.ArtifactDigest &&
-		stored.SummaryInvocationID == requested.SummaryInvocationID
+		stored.SummaryInvocationID == requested.SummaryInvocationID &&
+		stored.AnnotatedAssetOwnerScope == requested.AnnotatedAssetOwnerScope &&
+		stored.AnnotatedAssetID == requested.AnnotatedAssetID &&
+		stored.AnnotatedMIME == requested.AnnotatedMIME &&
+		stored.AnnotatedDigest == requested.AnnotatedDigest &&
+		stored.OriginalSourceDigest == requested.OriginalSourceDigest
+}
+
+func (s *Store) openGradingFinalAnnotatedAsset(
+	ctx context.Context,
+	artifact k12.GradingFinalArtifact,
+) (k12.GradingFinalAnnotatedAsset, error) {
+	if !artifact.HasAnnotatedAsset() {
+		return k12.GradingFinalAnnotatedAsset{}, ErrGradingFinalAnnotatedAssetUnavailable
+	}
+	metadata, err := s.GetReadyPageAsset(
+		ctx,
+		artifact.AnnotatedAssetOwnerScope,
+		artifact.AgentName,
+		artifact.AnnotatedAssetID,
+	)
+	if err != nil {
+		return k12.GradingFinalAnnotatedAsset{}, fmt.Errorf(
+			"%w: %v", ErrGradingFinalAnnotatedAssetUnavailable, err,
+		)
+	}
+	if metadata.MediaType != artifact.AnnotatedMIME ||
+		metadata.ContentDigest != artifact.AnnotatedDigest {
+		return k12.GradingFinalAnnotatedAsset{}, fmt.Errorf(
+			"%w: ready PageAsset metadata drifted",
+			ErrGradingFinalAnnotatedAssetUnavailable,
+		)
+	}
+	owner, file, err := assetstore.Parse(artifact.AnnotatedAssetID)
+	if err != nil || owner != artifact.AgentName {
+		return k12.GradingFinalAnnotatedAsset{}, fmt.Errorf(
+			"%w: annotated asset identity is invalid",
+			ErrGradingFinalAnnotatedAssetUnavailable,
+		)
+	}
+	raw, mime, err := assetstore.Read(owner, file)
+	if err != nil {
+		return k12.GradingFinalAnnotatedAsset{}, fmt.Errorf(
+			"%w: %v", ErrGradingFinalAnnotatedAssetUnavailable, err,
+		)
+	}
+	sum := sha256.Sum256(raw)
+	digest := hex.EncodeToString(sum[:])
+	if mime != artifact.AnnotatedMIME || digest != artifact.AnnotatedDigest {
+		return k12.GradingFinalAnnotatedAsset{}, fmt.Errorf(
+			"%w: annotated bytes drifted",
+			ErrGradingFinalAnnotatedAssetUnavailable,
+		)
+	}
+	return k12.GradingFinalAnnotatedAsset{
+		OwnerScope:           artifact.AnnotatedAssetOwnerScope,
+		AssetID:              artifact.AnnotatedAssetID,
+		MIME:                 artifact.AnnotatedMIME,
+		Digest:               artifact.AnnotatedDigest,
+		OriginalSourceDigest: artifact.OriginalSourceDigest,
+		Data:                 append([]byte(nil), raw...),
+	}, nil
+}
+
+// OpenGradingFinalAnnotatedAsset 只通过已冻结 final artifact 身份读取批注图。
+// 每次读取都重新校验 owner、ready 元数据、MIME 与实际字节摘要。
+func (s *Store) OpenGradingFinalAnnotatedAsset(
+	ctx context.Context,
+	agentName string,
+	artifactID string,
+) (k12.GradingFinalAnnotatedAsset, error) {
+	artifact, err := s.GetGradingFinalArtifact(ctx, agentName, artifactID)
+	if err != nil {
+		return k12.GradingFinalAnnotatedAsset{}, err
+	}
+	return s.openGradingFinalAnnotatedAsset(ctx, artifact)
 }
 
 // CommitGradingFinalArtifact freezes the only final grading artifact for a
@@ -257,6 +427,13 @@ func (s *Store) CommitGradingFinalArtifact(
 			"k12storage: invalid grading final artifact: %w",
 			err,
 		)
+	}
+	if artifact.HasAnnotatedAsset() {
+		if _, err := s.openGradingFinalAnnotatedAsset(ctx, artifact); err != nil {
+			return k12.GradingFinalArtifact{}, false, fmt.Errorf(
+				"%w: %v", ErrGradingFinalArtifactConflict, err,
+			)
+		}
 	}
 	if err := ensureAgentRegistered(ctx, s.db, artifact.AgentName); err != nil {
 		return k12.GradingFinalArtifact{}, false, err
@@ -326,6 +503,27 @@ func (s *Store) CommitGradingFinalArtifact(
 			"k12storage: commit grading final artifact: %w",
 			err,
 		)
+	}
+	if artifact.HasAnnotatedAsset() {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO k12_grading_final_artifact_assets (
+				artifact_id,agent_name,annotated_asset_owner_scope,
+				annotated_asset_id,annotated_mime,annotated_digest,
+				original_source_digest
+			) VALUES(?,?,?,?,?,?,?)
+			ON CONFLICT DO NOTHING`,
+			artifact.ArtifactID,
+			artifact.AgentName,
+			artifact.AnnotatedAssetOwnerScope,
+			artifact.AnnotatedAssetID,
+			artifact.AnnotatedMIME,
+			artifact.AnnotatedDigest,
+			artifact.OriginalSourceDigest,
+		); err != nil {
+			return k12.GradingFinalArtifact{}, false, fmt.Errorf(
+				"k12storage: bind grading final annotated asset: %w", err,
+			)
+		}
 	}
 	stored, err = getGradingFinalArtifactByJobVia(
 		ctx,

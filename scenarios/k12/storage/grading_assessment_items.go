@@ -71,6 +71,11 @@ func scanGradingAssessmentItem(row rowScanner) (k12.GradingAssessmentItem, error
 	if parentGuideID.Valid {
 		item.ParentGuideInvocationID = parentGuideID.String
 	}
+	if err := item.Validate(); err != nil {
+		return k12.GradingAssessmentItem{}, fmt.Errorf(
+			"k12storage: invalid grading assessment item: %w", err,
+		)
+	}
 	return item, nil
 }
 

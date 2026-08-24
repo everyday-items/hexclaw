@@ -18,6 +18,72 @@
       },
       "additionalProperties": false
     },
+    "groundingEvidenceReceipt": {
+      "type": "object",
+      "required": [
+        "textbook_binding_id",
+        "textbook_manifest_id",
+        "document_id",
+        "document_generation",
+        "vector_revision_id",
+        "query_digest",
+        "chunk_id",
+        "logical_page",
+        "pdf_page",
+        "source_digest",
+        "citation_digest"
+      ],
+      "properties": {
+        "textbook_binding_id": { "type": "string", "minLength": 1 },
+        "textbook_manifest_id": { "type": "string", "minLength": 1 },
+        "document_id": { "type": "string", "minLength": 1 },
+        "document_generation": { "type": "integer", "minimum": 1 },
+        "vector_revision_id": { "type": "string", "minLength": 1 },
+        "query_digest": { "type": "string", "minLength": 1 },
+        "chunk_id": { "type": "string", "minLength": 1 },
+        "logical_page": { "type": "integer", "minimum": 1 },
+        "pdf_page": { "type": "integer", "minimum": 1 },
+        "source_digest": { "type": "string", "minLength": 1 },
+        "citation_digest": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "problemGroundingReceipt": {
+      "type": "object",
+      "required": [
+        "problem_id",
+        "operation",
+        "identity_digest",
+        "textbook_binding_id",
+        "textbook_manifest_id",
+        "document_id",
+        "document_generation",
+        "vector_revision_id",
+        "query_digest",
+        "chunk_id",
+        "logical_page",
+        "pdf_page",
+        "source_digest",
+        "citation_digest"
+      ],
+      "properties": {
+        "problem_id": { "type": "string", "minLength": 1 },
+        "operation": { "enum": ["solve", "grade"] },
+        "identity_digest": { "type": "string", "minLength": 1 },
+        "textbook_binding_id": { "type": "string", "minLength": 1 },
+        "textbook_manifest_id": { "type": "string", "minLength": 1 },
+        "document_id": { "type": "string", "minLength": 1 },
+        "document_generation": { "type": "integer", "minimum": 1 },
+        "vector_revision_id": { "type": "string", "minLength": 1 },
+        "query_digest": { "type": "string", "minLength": 1 },
+        "chunk_id": { "type": "string", "minLength": 1 },
+        "logical_page": { "type": "integer", "minimum": 1 },
+        "pdf_page": { "type": "integer", "minimum": 1 },
+        "source_digest": { "type": "string", "minLength": 1 },
+        "citation_digest": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
     "target": {
       "type": "object",
       "required": ["type", "id"],
@@ -53,7 +119,19 @@
         "confirmation_candidates": { "type": "array", "items": { "type": "string" } },
         "target": { "$ref": "#/$defs/target" },
         "progress": { "$ref": "#/$defs/progress" },
-        "target_projection": { "type": "object" },
+        "target_projection": {
+          "type": "object",
+          "properties": {
+            "grounding_evidence_receipts": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/groundingEvidenceReceipt" }
+            },
+            "problem_grounding_receipts": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/problemGroundingReceipt" }
+            }
+          }
+        },
         "version": { "type": "integer" },
         "created_at": { "type": "integer" },
         "updated_at": { "type": "integer" },
@@ -103,7 +181,15 @@
         },
         "source_digest": { "type": "string", "minLength": 1 },
         "source_attachments": { "type": "array", "items": { "type": "object" } },
-        "operation_receipts": { "type": "array", "items": { "type": "object" } }
+        "operation_receipts": { "type": "array", "items": { "type": "object" } },
+        "grounding_evidence_receipts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/groundingEvidenceReceipt" }
+        },
+        "problem_grounding_receipts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/problemGroundingReceipt" }
+        }
       },
       "additionalProperties": false
     },

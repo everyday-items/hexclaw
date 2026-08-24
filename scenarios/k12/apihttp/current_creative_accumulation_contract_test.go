@@ -59,6 +59,28 @@ func doCurrent(
 	return rec, out
 }
 
+func waitCurrentAccumulationGeneration(
+	t *testing.T,
+	h http.Handler,
+	accumulationID, wantStatus string,
+) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		rec, detail := doCurrent(t, h, http.MethodGet,
+			"/accumulation/"+accumulationID+"?agent=mingming", "", nil)
+		generation, _ := detail["dictation_generation"].(map[string]any)
+		if rec.Code == http.StatusOK && generation["status"] == wantStatus {
+			return generation
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("accumulation generation did not reach %q: status=%d body=%v",
+				wantStatus, rec.Code, detail)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestCurrentAccumulationHTTPContentOnlyDetailDurableGenerationAndDelete(t *testing.T) {
 	deriver := &currentAccumulationDeriver{}
 	h := newServerWithSolver(t, fakeSolveExec{},
@@ -96,17 +118,20 @@ func TestCurrentAccumulationHTTPContentOnlyDetailDurableGenerationAndDelete(t *t
 	rec, generated := doCurrent(t, h, http.MethodPost,
 		"/accumulation/"+id+"/dictation-to-basket",
 		`{"agent":"mingming"}`, nil)
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("dictation command: status=%d body=%v", rec.Code, generated)
 	}
 	generation, _ := generated["dictation_generation"].(map[string]any)
-	if generation["status"] != k12.DictationCommitted ||
-		generation["generation_id"] == "" || generation["practice_item_id"] == "" {
+	if generation["status"] != k12.DictationQueued ||
+		generation["generation_id"] == "" || generation["practice_item_id"] != nil {
 		t.Fatalf("dictation generation response: %v", generated)
 	}
-	_, refreshed := doCurrent(t, h, http.MethodGet,
-		"/accumulation/"+id+"?agent=mingming", "", nil)
-	if refreshedGeneration, _ := refreshed["dictation_generation"].(map[string]any); refreshedGeneration["generation_id"] != generation["generation_id"] {
+	refreshedGeneration := waitCurrentAccumulationGeneration(
+		t, h, id, k12.DictationCommitted,
+	)
+	if refreshedGeneration["generation_id"] != generation["generation_id"] ||
+		refreshedGeneration["status"] != k12.DictationCommitted ||
+		refreshedGeneration["practice_item_id"] == "" {
 		t.Fatalf("detail did not read durable generation: command=%v detail=%v",
 			generation, refreshedGeneration)
 	}

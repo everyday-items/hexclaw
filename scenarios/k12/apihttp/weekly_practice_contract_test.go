@@ -95,9 +95,8 @@ func newWeeklyContractServer(
 	if _, err := db.Exec(`INSERT INTO agents(name) VALUES('mingming'),('other')`); err != nil {
 		t.Fatal(err)
 	}
-	delivery := &httpReceiptTransport{send: []usecase.DeliveryTransportAck{{
-		Status: k12.DeliveryDelivered, ExternalMessageID: "weekly-message-1",
-	}}}
+	targets := httpBatchTargets()
+	delivery := &httpBatchTransport{targets: targets[:1]}
 	rt, err := assembly.Wire(
 		db,
 		fakeSolveExec{},
@@ -420,6 +419,18 @@ func TestWeeklyPracticeHTTPContract_K12Weekly016To023(t *testing.T) {
 	exactKeys(t, sent, "batch_id", "agent_name", "object_kind", "object_id",
 		"dedupe_key", "content_digest", "status", "created_at", "updated_at",
 		"receipts")
+	receipts := sent["receipts"].([]any)
+	if len(receipts) != 2 {
+		t.Fatalf("weekly send receipts=%d want one direct target × (Markdown + frozen PDF): %v",
+			len(receipts), sent)
+	}
+	markdownReceipt := receipts[0].(map[string]any)
+	pdfReceipt := receipts[1].(map[string]any)
+	if markdownReceipt["part_kind"] != "markdown" || markdownReceipt["part_ordinal"] != float64(1) ||
+		pdfReceipt["part_kind"] != "artifact" || pdfReceipt["part_mime"] != "application/pdf" ||
+		pdfReceipt["part_ordinal"] != float64(2) {
+		t.Fatalf("weekly send target×part contract drifted: %v", receipts)
+	}
 
 	syncItem := trackItem(t, plan, k12.WeeklySectionTextbookConsolidation)
 	itemID := syncItem["item_id"].(string)

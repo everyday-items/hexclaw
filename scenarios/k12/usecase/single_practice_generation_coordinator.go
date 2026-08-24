@@ -11,10 +11,8 @@ import (
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 )
 
-// SinglePracticeGenerationCoordinator owns the in-process workers for durable
-// single-mistake generation jobs. SQLite remains the queue/source of truth;
-// this coordinator only collapses duplicate schedules and provides lifecycle
-// control to the composition root.
+// SinglePracticeGenerationCoordinator 管理错题与积累共享逐题任务的进程内 worker。
+// SQLite 是队列与状态真相源；本协调器只合并重复调度并提供生命周期控制。
 type SinglePracticeGenerationCoordinator struct {
 	Deps        *Deps
 	Records     *k12storage.Store
@@ -108,14 +106,23 @@ func (c *SinglePracticeGenerationCoordinator) StartAsync(
 				)
 			}
 		}()
-		if _, err := c.Deps.ProcessSinglePracticeGeneration(
-			runCtx, agentName, generationJobID,
-		); err != nil {
+		var processErr error
+		switch job.SourceKind {
+		case k12.PracticeGenerationSourceAccumulation:
+			_, _, _, processErr = c.Deps.ProcessAccumulationPracticeGeneration(
+				runCtx, agentName, generationJobID,
+			)
+		default:
+			_, processErr = c.Deps.ProcessSinglePracticeGeneration(
+				runCtx, agentName, generationJobID,
+			)
+		}
+		if processErr != nil {
 			slog.Warn(
 				"K12 single practice worker stopped at durable checkpoint",
 				"agent", agentName,
 				"generation_job_id", generationJobID,
-				"err", err,
+				"err", processErr,
 			)
 		}
 	}()

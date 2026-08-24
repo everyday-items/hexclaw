@@ -21,6 +21,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
+	"github.com/hexagon-codes/hexclaw/skill"
 )
 
 // CronRegistrar 是自动化沉淀「调度」缝：K12 产出声明式 CronSpec，由 composition root
@@ -1061,7 +1062,7 @@ func (h *handler) addAccumulation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, created, err := h.rt.Deps.CreateCurrentAccumulation(
-		r.Context(), agent, req.Content, commandKey,
+		skill.WithRoutedAgent(r.Context(), agent), agent, req.Content, commandKey,
 	)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
@@ -1099,9 +1100,12 @@ type dictationReq struct {
 	FullDictation bool   `json:"full_dictation"`
 }
 
-// accumDictationToBasket POST /accumulation/{id}/dictation-to-basket ——「生成默写题，加入练习集」
-// （§3.9 出口）：≤20 字全文默写 / 古诗默认补空 / >100 字拒绝（400）；装篮幂等去重，家长可移除。
+// accumDictationToBasket 接受积累默写持久任务，由共享逐题协调器异步生成、验证并原子入集。
 func (h *handler) accumDictationToBasket(w http.ResponseWriter, r *http.Request) {
+	if h.rt.PracticeGeneration == nil {
+		writeErr(w, http.StatusServiceUnavailable, "practice generation unavailable")
+		return
+	}
 	var req dictationReq
 	if !decodeStrict(w, r, &req) {
 		return
@@ -1118,7 +1122,12 @@ func (h *handler) accumDictationToBasket(w http.ResponseWriter, r *http.Request)
 		writeErr(w, httpStatusForK12Error(err, http.StatusBadRequest), err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	if generation.Status == k12.DictationQueued ||
+		generation.Status == k12.DictationGenerating ||
+		generation.Status == k12.DictationValidating {
+		h.rt.PracticeGeneration.StartAsync(req.Agent, generation.GenerationID)
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
 		"dictation_generation": accumulationGenerationDTO(&generation),
 	})
 }
@@ -1533,21 +1542,14 @@ func (h *handler) cronMistakeSheet(w http.ResponseWriter, r *http.Request) {
 	writeText(w, md)
 }
 
-// cronFillBasket POST /cron/fill-basket?agent=X —— §3.13 每周复习自动装篮（§3.8 装篮入口2）。
-// 调 FillBasketFromDue：到期复习项逐题原题重现装篮（added_via=weekly），幂等去重——
-// cron 重触发不重复装，重复调用安全。响应 {added, skipped}。
+// cronFillBasket 保留为旧定时脚本兼容端点；当前加入练习集只允许家长逐题显式触发。
 func (h *handler) cronFillBasket(w http.ResponseWriter, r *http.Request) {
 	agent := r.URL.Query().Get("agent")
 	if agent == "" {
 		writeErr(w, http.StatusBadRequest, "agent required")
 		return
 	}
-	added, skipped, err := h.rt.Deps.FillBasketFromDue(r.Context(), agent, "cron-weekly")
-	if err != nil {
-		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"added": added, "skipped": skipped})
+	writeJSON(w, http.StatusOK, map[string]any{"added": 0, "skipped": 0})
 }
 
 // cronDailyReminder GET /cron/daily-reminder?agent=X —— 每日复习提醒。

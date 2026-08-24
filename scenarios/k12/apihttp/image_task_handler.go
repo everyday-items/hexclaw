@@ -65,13 +65,15 @@ type imageTaskProgressDTO struct {
 }
 
 type imageTaskHomeworkProjectionDTO struct {
-	Kind              string                    `json:"kind"`
-	Stage             string                    `json:"stage"`
-	ConfirmationState string                    `json:"confirmation_state"`
-	AnchorState       string                    `json:"anchor_state"`
-	Recognition       map[string]any            `json:"recognition,omitempty"`
-	Progressive       imageTaskProgressiveDTO   `json:"progressive"`
-	FinalArtifact     *k12.GradingFinalArtifact `json:"final_artifact,omitempty"`
+	Kind                      string                             `json:"kind"`
+	Stage                     string                             `json:"stage"`
+	ConfirmationState         string                             `json:"confirmation_state"`
+	AnchorState               string                             `json:"anchor_state"`
+	Recognition               map[string]any                     `json:"recognition,omitempty"`
+	Progressive               imageTaskProgressiveDTO            `json:"progressive"`
+	FinalArtifact             *k12.GradingFinalArtifact          `json:"final_artifact,omitempty"`
+	GroundingEvidenceReceipts []usecase.GroundingEvidenceReceipt `json:"grounding_evidence_receipts"`
+	ProblemGroundingReceipts  []usecase.ProblemGroundingReceipt  `json:"problem_grounding_receipts"`
 }
 
 // imageTaskProgressiveDTO intentionally exposes only the ImageTask progress
@@ -232,7 +234,9 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 		projection := imageTaskHomeworkProjectionDTO{
 			Kind: "homework", Stage: "queued",
 			ConfirmationState: "pending", AnchorState: "pending",
-			Progressive: publicImageTaskProgressive(usecase.ImageTaskProgressiveSnapshot{}),
+			Progressive:               publicImageTaskProgressive(usecase.ImageTaskProgressiveSnapshot{}),
+			GroundingEvidenceReceipts: []usecase.GroundingEvidenceReceipt{},
+			ProblemGroundingReceipts:  []usecase.ProblemGroundingReceipt{},
 		}
 		if view.Homework.Status == k12.HomeworkSubmissionCancelled {
 			projection.Stage = "cancelled"
@@ -250,7 +254,17 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 			projection.ConfirmationState = view.HomeworkProjection.ConfirmationState
 			projection.AnchorState = view.HomeworkProjection.AnchorState
 			projection.Progressive = publicImageTaskProgressive(view.HomeworkProjection.Progressive)
-			projection.FinalArtifact = view.HomeworkProjection.FinalArtifact
+			projection.FinalArtifact = publicGradingFinalArtifact(
+				view.HomeworkProjection.FinalArtifact,
+			)
+			projection.GroundingEvidenceReceipts = append(
+				[]usecase.GroundingEvidenceReceipt{},
+				view.HomeworkProjection.GroundingEvidenceReceipts...,
+			)
+			projection.ProblemGroundingReceipts = append(
+				[]usecase.ProblemGroundingReceipt{},
+				view.HomeworkProjection.ProblemGroundingReceipts...,
+			)
 			projection.Recognition = map[string]any{
 				"subject": view.HomeworkProjection.Subject, "questions": questions,
 			}
@@ -331,6 +345,31 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 		}
 	}
 	return out
+}
+
+// publicGradingFinalArtifact 保留客户端所需的最终产物状态与 Markdown，
+// 不公开内部 Job、调用账本或 owner-scoped 资产身份。
+func publicGradingFinalArtifact(
+	artifact *k12.GradingFinalArtifact,
+) *k12.GradingFinalArtifact {
+	if artifact == nil {
+		return nil
+	}
+	if artifact.JobID == "" && artifact.SummaryInvocationID == "" &&
+		artifact.AnnotatedAssetOwnerScope == "" && artifact.AnnotatedAssetID == "" &&
+		artifact.AnnotatedMIME == "" && artifact.AnnotatedDigest == "" &&
+		artifact.OriginalSourceDigest == "" {
+		return artifact
+	}
+	out := *artifact
+	out.JobID = ""
+	out.SummaryInvocationID = ""
+	out.AnnotatedAssetOwnerScope = ""
+	out.AnnotatedAssetID = ""
+	out.AnnotatedMIME = ""
+	out.AnnotatedDigest = ""
+	out.OriginalSourceDigest = ""
+	return &out
 }
 
 func (h *handler) createImageTask(w http.ResponseWriter, r *http.Request) {
@@ -765,7 +804,7 @@ func (h *handler) getImageTaskResult(w http.ResponseWriter, r *http.Request) {
 			"kind": string(result.Dispatch.TaskIntent), "payload": payload,
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"dispatch_id":        result.Dispatch.DispatchID,
 		"task_intent":        result.Dispatch.TaskIntent,
 		"status":             result.Dispatch.Status,
@@ -773,5 +812,10 @@ func (h *handler) getImageTaskResult(w http.ResponseWriter, r *http.Request) {
 		"source_attachments": result.SourceAttachments,
 		"operation_receipts": result.OperationReceipts,
 		"result":             projection,
-	})
+	}
+	if result.Dispatch.TargetObjectType == k12.ImageTaskTargetHomeworkSubmission {
+		response["grounding_evidence_receipts"] = result.GroundingEvidenceReceipts
+		response["problem_grounding_receipts"] = result.ProblemGroundingReceipts
+	}
+	writeJSON(w, http.StatusOK, response)
 }

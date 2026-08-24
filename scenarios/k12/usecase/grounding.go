@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -39,10 +40,142 @@ type GroundingSnapshot struct {
 	VectorRevisionID   string
 }
 
+// GroundingEvidenceReceipt 只记录本次批改实际消费的教材命中身份，不包含
+// 教材正文、检索分数、提示词或儿童资料。
+type GroundingEvidenceReceipt struct {
+	TextbookBindingID  string `json:"textbook_binding_id"`
+	TextbookManifestID string `json:"textbook_manifest_id"`
+	DocumentID         string `json:"document_id"`
+	DocumentGeneration int64  `json:"document_generation"`
+	VectorRevisionID   string `json:"vector_revision_id"`
+	QueryDigest        string `json:"query_digest"`
+	ChunkID            string `json:"chunk_id"`
+	LogicalPage        int    `json:"logical_page"`
+	PDFPage            int    `json:"pdf_page"`
+	SourceDigest       string `json:"source_digest"`
+	CitationDigest     string `json:"citation_digest"`
+}
+
+// GroundingSnapshotResult 把本次 pinned 查询的可消费正文与命中回执绑定在
+// 同一返回值中，避免由另一次独立 search 事后补造引用。
+type GroundingSnapshotResult struct {
+	Text     string                     `json:"text"`
+	Found    bool                       `json:"found"`
+	Receipts []GroundingEvidenceReceipt `json:"receipts"`
+}
+
 // SnapshotGrounding is the canonical multi-query retrieval seam.
 type SnapshotGrounding interface {
 	FreezeGroundingSnapshot(ctx context.Context, requested GroundingSnapshot) (GroundingSnapshot, error)
 	GroundSnapshot(ctx context.Context, snapshot GroundingSnapshot, knowledgePoint, grade string) (text string, found bool, err error)
+}
+
+// SnapshotGroundingEvidence 是加法证据缝。旧实现仍可满足 SnapshotGrounding，
+// 但只有实现本接口并返回完整回执的命中才可声明为已核验教材依据。
+type SnapshotGroundingEvidence interface {
+	GroundSnapshotWithEvidence(
+		ctx context.Context,
+		snapshot GroundingSnapshot,
+		knowledgePoint, grade string,
+	) (GroundingSnapshotResult, error)
+}
+
+func (result GroundingSnapshotResult) validate(snapshot GroundingSnapshot) error {
+	if !result.Found {
+		if strings.TrimSpace(result.Text) != "" || len(result.Receipts) != 0 {
+			return fmt.Errorf("grounding: no-hit result carries evidence")
+		}
+		return nil
+	}
+	if strings.TrimSpace(result.Text) == "" || len(result.Receipts) == 0 {
+		return fmt.Errorf("grounding: verified hit has no receipt")
+	}
+	allowedSegments := make(map[string]struct{}, len(snapshot.SegmentRefs))
+	for _, segmentRef := range snapshot.SegmentRefs {
+		allowedSegments[segmentRef] = struct{}{}
+	}
+	type pageSegmentKey struct {
+		segmentRef  string
+		logicalPage int
+		pdfPage     int
+	}
+	pageSegments := make(map[pageSegmentKey]struct{})
+	for _, page := range snapshot.PageRefs {
+		for _, segmentRef := range page.SegmentRefs {
+			pageSegments[pageSegmentKey{
+				segmentRef: segmentRef, logicalPage: page.LogicalPage, pdfPage: page.PDFPage,
+			}] = struct{}{}
+		}
+	}
+	seen := make(map[GroundingEvidenceReceipt]struct{}, len(result.Receipts))
+	for index, receipt := range result.Receipts {
+		if receipt.TextbookBindingID != snapshot.TextbookBindingID ||
+			receipt.TextbookManifestID != snapshot.TextbookManifestID ||
+			receipt.DocumentID != snapshot.DocumentID ||
+			receipt.DocumentGeneration != snapshot.DocumentGeneration ||
+			receipt.VectorRevisionID != snapshot.VectorRevisionID ||
+			receipt.SourceDigest != snapshot.SourceDigest ||
+			receipt.ChunkID == "" || receipt.ChunkID != strings.TrimSpace(receipt.ChunkID) ||
+			receipt.LogicalPage < 1 || receipt.PDFPage < 1 ||
+			!validGroundingReceiptDigest(receipt.SourceDigest) ||
+			!validGroundingReceiptDigest(receipt.CitationDigest) ||
+			!strings.HasPrefix(receipt.QueryDigest, "sha256:") ||
+			!validGroundingReceiptDigest(strings.TrimPrefix(receipt.QueryDigest, "sha256:")) {
+			return fmt.Errorf("grounding: invalid evidence receipt %d", index)
+		}
+		if _, allowed := allowedSegments[receipt.ChunkID]; !allowed {
+			return fmt.Errorf("grounding: receipt chunk is outside frozen scope")
+		}
+		if _, allowed := pageSegments[pageSegmentKey{
+			segmentRef: receipt.ChunkID, logicalPage: receipt.LogicalPage, pdfPage: receipt.PDFPage,
+		}]; !allowed {
+			return fmt.Errorf("grounding: receipt page is outside frozen scope")
+		}
+		if _, duplicate := seen[receipt]; duplicate {
+			return fmt.Errorf("grounding: duplicate evidence receipt")
+		}
+		seen[receipt] = struct{}{}
+	}
+	return nil
+}
+
+func validateGroundingEvidenceReceiptIdentity(receipt GroundingEvidenceReceipt) error {
+	for _, value := range []string{
+		receipt.TextbookBindingID,
+		receipt.TextbookManifestID,
+		receipt.DocumentID,
+		receipt.VectorRevisionID,
+		receipt.ChunkID,
+	} {
+		if value == "" || value != strings.TrimSpace(value) {
+			return fmt.Errorf("grounding: invalid durable receipt identity")
+		}
+	}
+	if receipt.DocumentGeneration < 1 || receipt.LogicalPage < 1 || receipt.PDFPage < 1 ||
+		!validGroundingReceiptDigest(receipt.SourceDigest) ||
+		!validGroundingReceiptDigest(receipt.CitationDigest) ||
+		!strings.HasPrefix(receipt.QueryDigest, "sha256:") ||
+		!validGroundingReceiptDigest(strings.TrimPrefix(receipt.QueryDigest, "sha256:")) {
+		return fmt.Errorf("grounding: invalid durable receipt proof")
+	}
+	return nil
+}
+
+func validGroundingReceiptDigest(value string) bool {
+	if len(value) != 64 || value != strings.ToLower(value) {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 32
+}
+
+func cloneGroundingEvidenceReceipts(
+	values []GroundingEvidenceReceipt,
+) []GroundingEvidenceReceipt {
+	if len(values) == 0 {
+		return []GroundingEvidenceReceipt{}
+	}
+	return append([]GroundingEvidenceReceipt(nil), values...)
 }
 
 // validateTextbookSubject 校验分科教材学科：空 = 不分科旧语义（合法）；非空必须是六学科之一。

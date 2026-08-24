@@ -164,8 +164,8 @@ func (v *GradingAssessmentItem) Validate() error {
 			return fmt.Errorf("grading assessment %s must not claim model invocations", v.Status)
 		}
 	case GradingAssessmentOutOfScope:
-		if v.GradeInvocationID != "" {
-			return fmt.Errorf("out_of_scope must not claim a grade invocation")
+		if v.SolveInvocationID == "" || v.GradeInvocationID != "" {
+			return fmt.Errorf("out_of_scope requires solve only")
 		}
 	}
 	if v.ParentGuideInvocationID != "" &&

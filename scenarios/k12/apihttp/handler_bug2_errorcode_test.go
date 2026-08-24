@@ -11,6 +11,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/engineadapter"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/storage/migrate"
 
 	_ "modernc.org/sqlite"
@@ -62,7 +63,12 @@ func newRuntimeWithSolver(
 
 func newServerWithSolver(t *testing.T, exec engineadapter.SolveExecutor, opts ...assembly.Option) http.Handler {
 	t.Helper()
-	return apihttp.NewHandler(newRuntimeWithSolver(t, exec, opts...))
+	runtime := newRuntimeWithSolver(t, exec, opts...)
+	runtime.PracticeGeneration = &usecase.SinglePracticeGenerationCoordinator{
+		Deps: &runtime.Deps, Records: runtime.Records,
+		BaseContext: context.Background(),
+	}
+	return apihttp.NewHandler(runtime)
 }
 
 // memProfiles 是内存孩子档案存储（测试用），供 assembly.WithProfiles 注入年级确定性注入链路。

@@ -227,15 +227,15 @@ func (d *k12IMDeliverer) PrepareMessageForTargets(
 	if err != nil {
 		return nil, fmt.Errorf("发送内容校验失败，请重试: %w", err)
 	}
-	payloadJSON, err := json.Marshal(message)
+	parts, err := message.DeliveryParts()
 	if err != nil {
-		return nil, fmt.Errorf("冻结发送内容失败: %w", err)
+		return nil, fmt.Errorf("freeze delivery parts: %w", err)
 	}
 	renderJSON, err := json.Marshal(message.RenderManifest)
 	if err != nil {
 		return nil, fmt.Errorf("冻结渲染证据失败: %w", err)
 	}
-	out := make([]k12usecase.PreparedTextDelivery, 0, len(targets))
+	out := make([]k12usecase.PreparedTextDelivery, 0, len(targets)*len(parts))
 	seen := make(map[channel.Target]struct{}, len(targets))
 	for _, resolved := range targets {
 		target := channel.Target{
@@ -253,15 +253,25 @@ func (d *k12IMDeliverer) PrepareMessageForTargets(
 			return nil, fmt.Errorf("冻结发送目标失败：存在重复私聊目标")
 		}
 		seen[target] = struct{}{}
-		out = append(out, k12usecase.PreparedTextDelivery{
-			BindingID: strings.TrimSpace(resolved.BindingID),
-			Target: k12.DeliveryTarget{
-				Platform: target.Platform, InstanceID: target.InstanceID, ChatID: target.ChatID,
-				Label: strings.TrimSpace(resolved.Target.Label),
-			},
-			PayloadJSON: string(payloadJSON),
-			RenderJSON:  string(renderJSON),
-		})
+		for _, part := range parts {
+			payloadJSON, marshalErr := json.Marshal(part)
+			if marshalErr != nil {
+				return nil, fmt.Errorf("encode frozen delivery part: %w", marshalErr)
+			}
+			out = append(out, k12usecase.PreparedTextDelivery{
+				BindingID: strings.TrimSpace(resolved.BindingID),
+				Target: k12.DeliveryTarget{
+					Platform: target.Platform, InstanceID: target.InstanceID, ChatID: target.ChatID,
+					Label: strings.TrimSpace(resolved.Target.Label),
+				},
+				PartKind:    part.Kind,
+				PartMIME:    part.MIME,
+				PartOrdinal: part.Ordinal,
+				PartDigest:  part.Digest,
+				PayloadJSON: string(payloadJSON),
+				RenderJSON:  string(renderJSON),
+			})
+		}
 	}
 	return out, nil
 }
@@ -305,22 +315,49 @@ func (d *k12IMDeliverer) receiptBindingIsActive(receipt k12.DeliveryReceipt) boo
 	return false
 }
 
-func preparedChannelMessage(receipt k12.DeliveryReceipt) (channel.Message, error) {
+func preparedChannelPart(receipt k12.DeliveryReceipt) (channel.DeliveryPart, error) {
 	if got := deliveryPayloadDigest(receipt.PayloadJSON); got != receipt.PayloadDigest {
-		return channel.Message{}, fmt.Errorf("冻结发送内容摘要不匹配：want %s got %s", receipt.PayloadDigest, got)
+		return channel.DeliveryPart{}, fmt.Errorf("frozen delivery payload digest mismatch: want %s got %s", receipt.PayloadDigest, got)
 	}
-	var message channel.Message
-	if err := json.Unmarshal([]byte(receipt.PayloadJSON), &message); err != nil {
-		return channel.Message{}, fmt.Errorf("读取冻结发送内容失败: %w", err)
+	var part channel.DeliveryPart
+	if err := json.Unmarshal([]byte(receipt.PayloadJSON), &part); err != nil {
+		return channel.DeliveryPart{}, fmt.Errorf("decode frozen delivery part: %w", err)
 	}
-	if err := message.Validate(); err != nil {
-		return channel.Message{}, err
+	if validationErr := part.Validate(); validationErr != nil {
+		var legacyEnvelope struct {
+			Content        json.RawMessage `json:"Content"`
+			RenderManifest json.RawMessage `json:"RenderManifest"`
+		}
+		if err := json.Unmarshal([]byte(receipt.PayloadJSON), &legacyEnvelope); err != nil ||
+			len(legacyEnvelope.Content) == 0 || len(legacyEnvelope.RenderManifest) == 0 {
+			return channel.DeliveryPart{}, validationErr
+		}
+		// V84 回执冻结的是整份消息；升级后的单一子回执只恢复其首个 canonical Markdown part。
+		var legacyMessage channel.Message
+		if err := json.Unmarshal([]byte(receipt.PayloadJSON), &legacyMessage); err != nil {
+			return channel.DeliveryPart{}, fmt.Errorf("decode legacy frozen delivery message: %w", err)
+		}
+		legacyParts, err := legacyMessage.DeliveryParts()
+		if err != nil {
+			return channel.DeliveryPart{}, fmt.Errorf("derive legacy frozen delivery part: %w", err)
+		}
+		if len(legacyParts) == 0 || legacyParts[0].Kind != messagecontent.PartMarkdown || legacyParts[0].Ordinal != 1 {
+			return channel.DeliveryPart{}, fmt.Errorf("legacy frozen delivery message has no canonical Markdown part")
+		}
+		part = legacyParts[0]
 	}
-	renderJSON, err := json.Marshal(message.RenderManifest)
+	if err := part.Validate(); err != nil {
+		return channel.DeliveryPart{}, err
+	}
+	if part.Kind != receipt.PartKind || part.MIME != receipt.PartMIME ||
+		part.Ordinal != receipt.PartOrdinal || part.Digest != receipt.PartDigest {
+		return channel.DeliveryPart{}, fmt.Errorf("frozen delivery part identity does not match receipt")
+	}
+	renderJSON, err := json.Marshal(part.RenderManifest)
 	if err != nil || string(renderJSON) != receipt.RenderJSON {
-		return channel.Message{}, fmt.Errorf("冻结渲染证据不匹配")
+		return channel.DeliveryPart{}, fmt.Errorf("frozen delivery render evidence mismatch")
 	}
-	return message, nil
+	return part, nil
 }
 
 func usecaseAckFromChannel(ack channel.DeliveryAck, err error) k12usecase.DeliveryTransportAck {
@@ -353,21 +390,56 @@ func (d *k12IMDeliverer) SendPrepared(ctx context.Context, receipt k12.DeliveryR
 		err := fmt.Errorf("原投递绑定已经变更，请重新从当前页面发起发送")
 		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryFailed, Detail: err.Error()}, err
 	}
-	message, err := preparedChannelMessage(receipt)
+	part, err := preparedChannelPart(receipt)
 	if err != nil {
+		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryFailed, Detail: err.Error()}, err
+	}
+	part.PreparedResourceID = strings.TrimSpace(receipt.PreparedResourceID)
+	if err := part.Validate(); err != nil {
 		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryFailed, Detail: err.Error()}, err
 	}
 	port, err := d.channels.Get(receipt.Target.Platform)
 	if err != nil {
 		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryFailed, Detail: "绑定通道还没有接入"}, err
 	}
-	receiptPort, ok := port.(channel.ReceiptPort)
+	receiptPort, ok := port.(channel.PartReceiptPort)
 	if !ok {
-		err = fmt.Errorf("通道 %q 不支持可核验投递回执", receipt.Target.Platform)
+		err = fmt.Errorf("channel %q does not support delivery part receipts", receipt.Target.Platform)
 		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryFailed, Detail: err.Error()}, err
 	}
-	ack, sendErr := receiptPort.SendMessageWithReceipt(ctx, channelTargetFromReceipt(receipt), message)
+	ack, sendErr := receiptPort.SendPreparedPartWithReceipt(ctx, channelTargetFromReceipt(receipt), part)
 	return usecaseAckFromChannel(ack, sendErr), sendErr
+}
+
+// PrepareDeliveryPartResource 在任何可见 part 发送前准备并返回一个平台媒体引用。
+func (d *k12IMDeliverer) PrepareDeliveryPartResource(ctx context.Context, receipt k12.DeliveryReceipt) (string, error) {
+	if !d.receiptBindingIsActive(receipt) {
+		return "", fmt.Errorf("the original delivery binding is no longer active")
+	}
+	part, err := preparedChannelPart(receipt)
+	if err != nil {
+		return "", err
+	}
+	if part.Kind != messagecontent.PartArtifact || strings.TrimSpace(receipt.PreparedResourceID) != "" {
+		return "", fmt.Errorf("delivery media preparation requires one unprepared artifact part")
+	}
+	port, err := d.channels.Get(receipt.Target.Platform)
+	if err != nil {
+		return "", err
+	}
+	partPort, ok := port.(channel.PartReceiptPort)
+	if !ok {
+		return "", fmt.Errorf("channel %q does not support delivery part preparation", receipt.Target.Platform)
+	}
+	resourceID, err := partPort.PrepareDeliveryPartResource(ctx, channelTargetFromReceipt(receipt), part)
+	if err != nil {
+		return "", err
+	}
+	resourceID = strings.TrimSpace(resourceID)
+	if resourceID == "" {
+		return "", fmt.Errorf("delivery part preparation returned an empty resource id")
+	}
+	return resourceID, nil
 }
 
 func (d *k12IMDeliverer) QueryPrepared(ctx context.Context, receipt k12.DeliveryReceipt) (k12usecase.DeliveryTransportAck, error) {
@@ -590,17 +662,54 @@ func k12FinalArtifactAssessmentStatus(line string) (k12usecase.PhotoItemStatus, 
 	}
 }
 
-// adapterReplyFromChannelMessage 把 ChannelNeutralMessage（§6.10）投影为平台 adapter.Reply
-// （钉钉侧渲染入口；附件现状全为图片，base64 编码与收敛前 k12PhotoReply 逐字节一致）。
+// adapterReplyFromChannelMessage 把 ChannelNeutralMessage（§6.10）投影为平台 adapter.Reply。
+// 图片与批准的 PDF 保留各自媒体类型；附件 bytes 只做 base64 编码，不转成本地路径或 URL。
 func adapterReplyFromChannelMessage(msg channel.Message) *adapter.Reply {
 	reply := &adapter.Reply{Content: msg.Text, MessageContent: msg.Content, RenderManifest: msg.RenderManifest}
 	for _, att := range msg.Attachments {
+		attachmentType := ""
+		mime := strings.ToLower(strings.TrimSpace(att.MIME))
+		if strings.HasPrefix(mime, "image/") {
+			attachmentType = "image"
+		} else if mime == "application/pdf" {
+			attachmentType = "file"
+		}
 		reply.Attachments = append(reply.Attachments, adapter.Attachment{
-			Type: "image",
+			Type: attachmentType,
 			Name: att.Name,
 			Mime: att.MIME,
 			Data: base64.StdEncoding.EncodeToString(att.Data),
 		})
 	}
 	return reply
+}
+
+func adapterDeliveryPartFromChannelPart(part channel.DeliveryPart) adapter.DeliveryPart {
+	result := adapter.DeliveryPart{
+		Kind:               part.Kind,
+		MIME:               part.MIME,
+		Ordinal:            part.Ordinal,
+		Digest:             part.Digest,
+		Text:               part.Text,
+		MessageContent:     part.MessageContent,
+		RenderManifest:     part.RenderManifest,
+		PreparedResourceID: part.PreparedResourceID,
+	}
+	if part.Attachment == nil {
+		return result
+	}
+	mime := strings.ToLower(strings.TrimSpace(part.Attachment.MIME))
+	attachmentType := ""
+	if mime == "application/pdf" {
+		attachmentType = "file"
+	} else if strings.HasPrefix(mime, "image/") {
+		attachmentType = "image"
+	}
+	result.Attachment = &adapter.Attachment{
+		Type: attachmentType,
+		Name: part.Attachment.Name,
+		Mime: part.Attachment.MIME,
+		Data: base64.StdEncoding.EncodeToString(part.Attachment.Data),
+	}
+	return result
 }

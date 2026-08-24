@@ -99,9 +99,8 @@ func DefaultCronSpecs(baseURL, agentName string, deliver []string) []CronSpec {
 	rr := mk(KindReturnReminder, "回传提醒（每天）", "0 20 * * *", "return-reminder")
 	rr.Script = returnReminderScript(ep("return-reminder"))
 
-	// §3.13 每周复习两步（§3.8 装篮入口2）：先 POST fill-basket 自动装篮，再 GET mistake-sheet 出卷。
+	// 每周复习只整理并投递到期错题；加入练习集只由家长逐题显式触发。
 	ws := mk(KindWeeklySheet, "错题卷（每周五）", "0 19 * * 5", "mistake-sheet")
-	ws.Script = weeklyFillAndSheetScript(ep("fill-basket"), ep("mistake-sheet"))
 
 	return []CronSpec{
 		ws,
@@ -110,38 +109,6 @@ func DefaultCronSpecs(baseURL, agentName string, deliver []string) []CronSpec {
 		mk(KindSemesterSpring, "学期确认（3/1）", "0 9 1 3 *", "semester-check"),
 		mk(KindSemesterFall, "学期确认（9/1）", "0 9 1 9 *", "semester-check"),
 	}
-}
-
-// weeklyFillAndSheetScript 每周复习两步脚本（架构设计 §3.13 每周复习 · §3.8 装篮入口2）：
-// ① http_post fill-basket——到期错题自动装篮（端点幂等，重触发不重复装）；
-// ② http_get mistake-sheet——错题卷投递内容。
-// 装篮失败**不阻断**错题卷投递：只记 error 字段（进任务反馈），继续出卷——
-// 家长周五仍能收到本周错题卷，装篮问题另行显现，不静默也不放大。
-func weeklyFillAndSheetScript(fillURL, sheetURL string) string {
-	return fmt.Sprintf(`# K12 每周复习（§3.13 每周复习 · §3.8 装篮入口2 · 平台 cron · Starlark · 零 LLM）
-def run():
-    # 第一步：到期错题自动装篮（POST /cron/fill-basket，幂等——重复触发不重复装）。
-    fill_err = ""
-    fill = http_post('%s')
-    if fill["status"] < 200 or fill["status"] >= 300:
-        # 装篮失败不阻断错题卷投递（§3.13）：记 error 字段进任务反馈，继续出卷。
-        fill_err = "自动装篮失败: %%d" %% fill["status"]
-    # 第二步：错题卷投递内容（GET /cron/mistake-sheet）。
-    resp = http_get('%s')
-    if resp["status"] < 200 or resp["status"] >= 300:
-        return {"status": "error", "error": "K12 投递端点非 2xx: %%d" %% resp["status"]}
-    body = resp["body"]
-    if not body:
-        # 本周无到期错题——静默跳过，不打扰。
-        if fill_err:
-            return {"status": "success", "error": fill_err}
-        return {"status": "success"}
-    if fill_err:
-        return {"status": "success", "error": fill_err, "data": {"message": body}}
-    return {"status": "success", "data": {"message": body}}
-
-emit(run())
-`, fillURL, sheetURL)
 }
 
 // returnReminderScript 同 deliverScript，但把 404 当"本期无内容"静默跳过。

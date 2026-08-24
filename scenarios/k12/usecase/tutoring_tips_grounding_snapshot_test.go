@@ -81,6 +81,33 @@ func (s *tutoringGroundingSnapshotSpy) GroundSnapshot(
 	return "教材中的分数图示", true, nil
 }
 
+func (s *tutoringGroundingSnapshotSpy) GroundSnapshotWithEvidence(
+	_ context.Context,
+	snapshot usecase.GroundingSnapshot,
+	concept, _ string,
+) (usecase.GroundingSnapshotResult, error) {
+	s.queries = append(s.queries, snapshot)
+	s.active = "revision-b"
+	content := "教材中的分数图示"
+	page := snapshot.PageRefs[0]
+	return usecase.GroundingSnapshotResult{
+		Text: content, Found: true,
+		Receipts: []usecase.GroundingEvidenceReceipt{{
+			TextbookBindingID:  snapshot.TextbookBindingID,
+			TextbookManifestID: snapshot.TextbookManifestID,
+			DocumentID:         snapshot.DocumentID,
+			DocumentGeneration: snapshot.DocumentGeneration,
+			VectorRevisionID:   snapshot.VectorRevisionID,
+			QueryDigest:        "sha256:" + bug20260824Digest(concept),
+			ChunkID:            page.SegmentRefs[0],
+			LogicalPage:        page.LogicalPage,
+			PDFPage:            page.PDFPage,
+			SourceDigest:       snapshot.SourceDigest,
+			CitationDigest:     bug20260824Digest(content),
+		}},
+	}, nil
+}
+
 func TestBuildTutoringTipsFreezesOneScopedKnowledgeSnapshot(t *testing.T) {
 	d := newDataDeps(t, "mingming")
 	seedBUG20260726008ActiveTextbookBinding(t, d)

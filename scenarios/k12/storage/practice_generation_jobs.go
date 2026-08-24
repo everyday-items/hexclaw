@@ -23,7 +23,8 @@ func scanPracticeGenerationJob(row practiceGenerationJobScanner) (k12.PracticeGe
 	var resultJSON string
 	if err := row.Scan(
 		&job.GenerationJobID, &job.AgentName, &job.IdempotencyKey, &job.RequestDigest,
-		&job.Scope, &job.VariantsPerSource, &job.Difficulty, &job.Total, &job.Textbook,
+		&job.Scope, &job.SourceKind, &job.SourceID, &job.SourceVersion,
+		&job.VariantsPerSource, &job.Difficulty, &job.Total, &job.Textbook,
 		&job.Status, &job.ResultSetID, &resultJSON, &job.DeduplicatedCount,
 		&job.FailureReason, &job.SourceMistakeID, &job.SourceSummary,
 		&job.RequestSnapshot, &job.RouteSnapshot, &job.Attempt, &job.RetiredAt,
@@ -40,7 +41,8 @@ func scanPracticeGenerationJob(row practiceGenerationJobScanner) (k12.PracticeGe
 }
 
 const practiceGenerationJobSelect = `SELECT generation_job_id, agent_name, idempotency_key,
-	request_digest, scope, variants_per_source, difficulty, total, textbook, status,
+	request_digest, scope, source_kind, source_id, source_version,
+	variants_per_source, difficulty, total, textbook, status,
 	result_set_id, result_item_ids_json, deduplicated_count, failure_reason,
 	source_mistake_id, source_mistake_summary, request_snapshot_json, route_snapshot_json,
 	attempt, retired_at, generation_output_json, generation_output_attempt,
@@ -101,6 +103,175 @@ func (s *Store) GetLatestSinglePracticeGeneration(
 		return k12.PracticeGenerationJob{}, fmt.Errorf("k12storage: 读来源题最新 generation: %w", err)
 	}
 	return job, nil
+}
+
+// GetLatestPracticeGenerationBySource 按冻结来源身份读取唯一共享任务。
+func (s *Store) GetLatestPracticeGenerationBySource(
+	ctx context.Context,
+	agentName, sourceKind, sourceID string,
+	sourceVersion int,
+) (k12.PracticeGenerationJob, error) {
+	job, err := scanPracticeGenerationJob(s.db.QueryRowContext(ctx,
+		practiceGenerationJobSelect+` WHERE agent_name=? AND scope='single'
+			AND source_kind=? AND source_id=? AND source_version=?
+			ORDER BY created_at DESC, generation_job_id DESC LIMIT 1`,
+		strings.TrimSpace(agentName), strings.TrimSpace(sourceKind),
+		strings.TrimSpace(sourceID), sourceVersion,
+	))
+	if err == sql.ErrNoRows {
+		return k12.PracticeGenerationJob{}, records.ErrNotFound
+	}
+	if err != nil {
+		return k12.PracticeGenerationJob{}, fmt.Errorf(
+			"k12storage: read practice generation by source: %w", err,
+		)
+	}
+	return job, nil
+}
+
+// BeginPracticeGenerationJob 只持久化共享任务，不向公开 PracticeSet 写入占位项。
+func (s *Store) BeginPracticeGenerationJob(
+	ctx context.Context,
+	job k12.PracticeGenerationJob,
+) (k12.PracticeGenerationJob, bool, error) {
+	job.AgentName = strings.TrimSpace(job.AgentName)
+	job.IdempotencyKey = strings.TrimSpace(job.IdempotencyKey)
+	job.SourceKind = strings.TrimSpace(job.SourceKind)
+	job.SourceID = strings.TrimSpace(job.SourceID)
+	job.SourceSummary = strings.TrimSpace(job.SourceSummary)
+	job.RequestSnapshot = strings.TrimSpace(job.RequestSnapshot)
+	job.RouteSnapshot = strings.TrimSpace(job.RouteSnapshot)
+	if err := validatePracticeGenerationJob(job); err != nil {
+		return k12.PracticeGenerationJob{}, false, err
+	}
+	if job.Scope != "single" || job.SourceID == "" || job.SourceVersion < 0 ||
+		job.SourceSummary == "" || len(job.ResultItemIDs) != 1 ||
+		strings.TrimSpace(job.ResultItemIDs[0]) == "" || job.RequestSnapshot == "" ||
+		job.RouteSnapshot == "" {
+		return k12.PracticeGenerationJob{}, false, fmt.Errorf(
+			"k12storage: shared practice job missing source/snapshot/result identity",
+		)
+	}
+	switch job.SourceKind {
+	case k12.PracticeGenerationSourceMistake:
+		if job.SourceMistakeID == "" {
+			job.SourceMistakeID = job.SourceID
+		}
+		if job.SourceMistakeID != job.SourceID {
+			return k12.PracticeGenerationJob{}, false, fmt.Errorf(
+				"k12storage: mistake source identity mismatch",
+			)
+		}
+	case k12.PracticeGenerationSourceAccumulation:
+		if job.SourceMistakeID != "" {
+			return k12.PracticeGenerationJob{}, false, fmt.Errorf(
+				"k12storage: accumulation job cannot bind mistake source",
+			)
+		}
+	default:
+		return k12.PracticeGenerationJob{}, false, fmt.Errorf(
+			"k12storage: unsupported practice source kind %q", job.SourceKind,
+		)
+	}
+	if err := ensureAgentRegistered(ctx, s.db, job.AgentName); err != nil {
+		return k12.PracticeGenerationJob{}, false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return k12.PracticeGenerationJob{}, false, fmt.Errorf(
+			"k12storage: begin shared practice job transaction: %w", err,
+		)
+	}
+	defer tx.Rollback()
+	switch job.SourceKind {
+	case k12.PracticeGenerationSourceMistake:
+		var version int
+		if err := tx.QueryRowContext(ctx, `SELECT version FROM k12_mistakes
+			WHERE record_id=? AND agent_name=?`, job.SourceID, job.AgentName).Scan(&version); err == sql.ErrNoRows {
+			return k12.PracticeGenerationJob{}, false, records.ErrNotFound
+		} else if err != nil {
+			return k12.PracticeGenerationJob{}, false, err
+		} else if version != job.SourceVersion {
+			return k12.PracticeGenerationJob{}, false, records.ErrVersionConflict
+		}
+	case k12.PracticeGenerationSourceAccumulation:
+		var version int
+		var deletedAt sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT row_version,deleted_at
+			FROM k12_accumulations WHERE record_id=? AND agent_name=?`,
+			job.SourceID, job.AgentName,
+		).Scan(&version, &deletedAt); err == sql.ErrNoRows || deletedAt.Valid {
+			return k12.PracticeGenerationJob{}, false, records.ErrNotFound
+		} else if err != nil {
+			return k12.PracticeGenerationJob{}, false, err
+		} else if version != job.SourceVersion {
+			return k12.PracticeGenerationJob{}, false, records.ErrVersionConflict
+		}
+	}
+	job.Status = k12.PracticeGenerationQueued
+	job.ResultSetID = ""
+	job.Attempt = 0
+	job.FailureReason = ""
+	job.RetiredAt = 0
+	job.RetiredReason = ""
+	if job.CreatedAt <= 0 {
+		job.CreatedAt = nowUnix()
+	}
+	job.UpdatedAt = job.CreatedAt
+	resultJSON, err := json.Marshal(job.ResultItemIDs)
+	if err != nil {
+		return k12.PracticeGenerationJob{}, false, err
+	}
+	inserted, err := tx.ExecContext(ctx, `INSERT INTO k12_practice_generation_jobs(
+		generation_job_id,agent_name,idempotency_key,request_digest,scope,
+		source_kind,source_id,source_version,variants_per_source,difficulty,total,textbook,
+		status,result_set_id,result_item_ids_json,deduplicated_count,failure_reason,
+		source_mistake_id,source_mistake_summary,request_snapshot_json,route_snapshot_json,
+		attempt,generation_output_json,generation_output_attempt,validation_output_json,
+		validation_output_attempt,retired_at,retired_reason,created_at,updated_at
+	) VALUES(
+		?,?,?,?,?,?,?,?,?,?,?,?,?,'',?,0,'',?,?,?,?,0,'',0,'',0,0,'',?,?
+	) ON CONFLICT DO NOTHING`,
+		job.GenerationJobID, job.AgentName, job.IdempotencyKey, job.RequestDigest,
+		job.Scope, job.SourceKind, job.SourceID, job.SourceVersion,
+		job.VariantsPerSource, job.Difficulty, job.Total, job.Textbook, job.Status,
+		string(resultJSON), job.SourceMistakeID, job.SourceSummary,
+		job.RequestSnapshot, job.RouteSnapshot, job.CreatedAt, job.UpdatedAt,
+	)
+	if err != nil {
+		return k12.PracticeGenerationJob{}, false, fmt.Errorf(
+			"k12storage: persist shared practice job: %w", err,
+		)
+	}
+	created, _ := inserted.RowsAffected()
+	accepted, err := scanPracticeGenerationJob(tx.QueryRowContext(ctx,
+		practiceGenerationJobSelect+` WHERE agent_name=? AND
+			(idempotency_key=? OR (scope='single' AND source_kind=? AND
+			 source_id=? AND source_version=?))
+			ORDER BY CASE WHEN idempotency_key=? THEN 0 ELSE 1 END LIMIT 1`,
+		job.AgentName, job.IdempotencyKey, job.SourceKind, job.SourceID,
+		job.SourceVersion, job.IdempotencyKey,
+	))
+	if err != nil {
+		return k12.PracticeGenerationJob{}, false, fmt.Errorf(
+			"k12storage: read accepted shared practice job: %w", err,
+		)
+	}
+	if accepted.SourceKind != job.SourceKind || accepted.SourceID != job.SourceID ||
+		accepted.SourceVersion != job.SourceVersion ||
+		accepted.RequestDigest != job.RequestDigest ||
+		accepted.RequestSnapshot != job.RequestSnapshot ||
+		accepted.RouteSnapshot != job.RouteSnapshot {
+		return k12.PracticeGenerationJob{}, false, fmt.Errorf(
+			"k12storage: shared practice source identity is bound to another request",
+		)
+	}
+	if err := tx.Commit(); err != nil {
+		return k12.PracticeGenerationJob{}, false, fmt.Errorf(
+			"k12storage: commit shared practice job: %w", err,
+		)
+	}
+	return accepted, created == 1, nil
 }
 
 // BeginCustomPaperGeneration durably accepts one custom-paper command before
@@ -417,6 +588,117 @@ func validSingleGenerationTransition(from, to string) bool {
 	}
 }
 
+// AdvancePracticeGenerationJob 推进 job-only 共享任务；正式题目只能由
+// CommitPracticeGeneration 的同一事务写入。
+func (s *Store) AdvancePracticeGenerationJob(
+	ctx context.Context,
+	agentName, generationJobID, status string,
+	attempt int,
+	failureReason string,
+) (k12.PracticeGenerationJob, error) {
+	agentName = strings.TrimSpace(agentName)
+	generationJobID = strings.TrimSpace(generationJobID)
+	failureReason = strings.TrimSpace(failureReason)
+	if status == k12.PracticeGenerationCommitted {
+		return k12.PracticeGenerationJob{}, fmt.Errorf(
+			"k12storage: committed requires atomic practice item commit",
+		)
+	}
+	current, err := s.GetPracticeGenerationJobByID(ctx, agentName, generationJobID)
+	if err != nil {
+		return k12.PracticeGenerationJob{}, err
+	}
+	if current.Scope != "single" || current.SourceKind == "" ||
+		current.SourceID == "" || current.RetiredAt != 0 {
+		return k12.PracticeGenerationJob{}, fmt.Errorf(
+			"k12storage: shared practice job identity invalid or retired",
+		)
+	}
+	if !validSingleGenerationTransition(current.Status, status) {
+		return k12.PracticeGenerationJob{}, fmt.Errorf(
+			"k12storage: invalid shared practice transition %s->%s",
+			current.Status, status,
+		)
+	}
+	if attempt < current.Attempt {
+		return k12.PracticeGenerationJob{}, fmt.Errorf(
+			"k12storage: shared practice attempt regressed %d->%d",
+			current.Attempt, attempt,
+		)
+	}
+	if status == k12.PracticeGenerationFailed && failureReason == "" {
+		return k12.PracticeGenerationJob{}, fmt.Errorf(
+			"k12storage: failed shared practice job requires a reason",
+		)
+	}
+	if status != k12.PracticeGenerationFailed {
+		failureReason = ""
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE k12_practice_generation_jobs
+		SET status=?,attempt=?,failure_reason=?,updated_at=?
+		WHERE agent_name=? AND generation_job_id=? AND scope='single'
+		  AND source_kind=? AND source_id=? AND source_version=?
+		  AND status=? AND attempt=? AND retired_at=0`,
+		status, attempt, failureReason, nowUnix(), agentName, generationJobID,
+		current.SourceKind, current.SourceID, current.SourceVersion,
+		current.Status, current.Attempt,
+	)
+	if err != nil {
+		return k12.PracticeGenerationJob{}, fmt.Errorf(
+			"k12storage: advance shared practice job: %w", err,
+		)
+	}
+	if changed, _ := res.RowsAffected(); changed != 1 {
+		latest, getErr := s.GetPracticeGenerationJobByID(ctx, agentName, generationJobID)
+		if getErr == nil && latest.Status == status && latest.Attempt == attempt &&
+			latest.FailureReason == failureReason {
+			return latest, nil
+		}
+		return k12.PracticeGenerationJob{}, records.ErrVersionConflict
+	}
+	return s.GetPracticeGenerationJobByID(ctx, agentName, generationJobID)
+}
+
+// ReactivatePracticeGenerationJob 复用同一失败或已移除任务。已移除任务从
+// validating 检查点恢复，因此不会重新取得外部调用发送权。
+func (s *Store) ReactivatePracticeGenerationJob(
+	ctx context.Context,
+	agentName, generationJobID string,
+) (k12.PracticeGenerationJob, error) {
+	current, err := s.GetPracticeGenerationJobByID(
+		ctx, strings.TrimSpace(agentName), strings.TrimSpace(generationJobID),
+	)
+	if err != nil {
+		return k12.PracticeGenerationJob{}, err
+	}
+	status := ""
+	switch {
+	case current.Status == k12.PracticeGenerationFailed && current.RetiredAt == 0:
+		status = k12.PracticeGenerationQueued
+	case current.Status == k12.PracticeGenerationCommitted && current.RetiredAt != 0:
+		status = k12.PracticeGenerationValidating
+	case current.RetiredAt == 0:
+		return current, nil
+	default:
+		return k12.PracticeGenerationJob{}, records.ErrIllegalTransition
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE k12_practice_generation_jobs
+		SET status=?,failure_reason='',retired_at=0,retired_reason='',updated_at=?
+		WHERE agent_name=? AND generation_job_id=? AND status=? AND retired_at=?`,
+		status, nowUnix(), current.AgentName, current.GenerationJobID,
+		current.Status, current.RetiredAt,
+	)
+	if err != nil {
+		return k12.PracticeGenerationJob{}, fmt.Errorf(
+			"k12storage: reactivate shared practice job: %w", err,
+		)
+	}
+	if changed, _ := res.RowsAffected(); changed != 1 {
+		return k12.PracticeGenerationJob{}, records.ErrVersionConflict
+	}
+	return s.GetPracticeGenerationJobByID(ctx, current.AgentName, current.GenerationJobID)
+}
+
 func itemGenerationStatusForJob(status string) (string, bool) {
 	switch status {
 	case k12.PracticeGenerationQueued:
@@ -699,6 +981,32 @@ func (s *Store) CommitPracticeGeneration(ctx context.Context, rec *records.Agent
 	if rec.AgentName != job.AgentName || rec.Collection != k12.CollectionPracticeSet {
 		return nil, false, fmt.Errorf("k12storage: 组卷结果 owner/collection 与任务不一致")
 	}
+	if job.Scope == "single" && job.SourceKind != "" {
+		if len(job.ResultItemIDs) != 1 {
+			return nil, false, fmt.Errorf(
+				"k12storage: shared source commit requires exactly one result item",
+			)
+		}
+		fields, parseErr := k12.ParsePracticeSetFields(rec.Fields)
+		if parseErr != nil {
+			return nil, false, parseErr
+		}
+		matches := 0
+		for _, item := range fields.Items {
+			if item.ItemID == job.ResultItemIDs[0] &&
+				item.GenerationJobID == job.GenerationJobID &&
+				item.GenerationStatus == k12.PracticeItemGenerationReady &&
+				strings.TrimSpace(item.NormalizedContentHash) != "" &&
+				k12.PracticeItemPublishable(item) {
+				matches++
+			}
+		}
+		if matches != 1 {
+			return nil, false, fmt.Errorf(
+				"k12storage: shared source commit requires one ready verified hashed item",
+			)
+		}
+	}
 	schema, err := s.registry.Get(k12.CollectionPracticeSet)
 	if err != nil {
 		return nil, false, err
@@ -848,12 +1156,16 @@ func (s *Store) CommitPracticeGeneration(ctx context.Context, rec *records.Agent
 			return nil, false, err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE k12_practice_generation_jobs SET
+	updatedJob, err := tx.ExecContext(ctx, `UPDATE k12_practice_generation_jobs SET
         status=?, result_set_id=?, result_item_ids_json=?, deduplicated_count=?, failure_reason='', updated_at=?
         WHERE agent_name=? AND idempotency_key=? AND request_digest=?`,
 		k12.PracticeGenerationCommitted, rec.RecordID, string(resultJSON), job.DeduplicatedCount, job.UpdatedAt,
-		job.AgentName, job.IdempotencyKey, job.RequestDigest); err != nil {
+		job.AgentName, job.IdempotencyKey, job.RequestDigest)
+	if err != nil {
 		return nil, false, fmt.Errorf("k12storage: 提交组卷收据: %w", err)
+	}
+	if changed, _ := updatedJob.RowsAffected(); changed != 1 {
+		return nil, false, fmt.Errorf("k12storage: shared generation receipt was not uniquely committed")
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, false, fmt.Errorf("k12storage: 提交原子组卷事务: %w", err)

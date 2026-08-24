@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
@@ -64,8 +65,21 @@ type DeliveryMessage struct {
 type PreparedTextDelivery struct {
 	BindingID   string
 	Target      k12.DeliveryTarget
+	PartKind    messagecontent.PartKind
+	PartMIME    string
+	PartOrdinal int
+	PartDigest  string
 	PayloadJSON string
 	RenderJSON  string
+}
+
+// DeliveryPartResourcePreparer 在可见消息发送前准备冻结的媒体 part。
+// 成功返回的 provider 资源引用由回执账本持久化，重试不得重新读取源资源。
+type DeliveryPartResourcePreparer interface {
+	PrepareDeliveryPartResource(
+		ctx context.Context,
+		receipt k12.DeliveryReceipt,
+	) (preparedResourceID string, err error)
 }
 
 // DeliveryTransportAck uses the durable domain statuses directly: provider

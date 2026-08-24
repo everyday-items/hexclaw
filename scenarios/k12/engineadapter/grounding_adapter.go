@@ -58,6 +58,7 @@ var _ usecase.GroundingWriter = (*GroundingAdapter)(nil)
 var _ usecase.SubjectGrounding = (*GroundingAdapter)(nil)
 var _ usecase.SubjectGroundingWriter = (*GroundingAdapter)(nil)
 var _ usecase.SnapshotGrounding = (*GroundingAdapter)(nil)
+var _ usecase.SnapshotGroundingEvidence = (*GroundingAdapter)(nil)
 
 // GroundingSource 是 K12 家长上传**不分科**教材的 KB source 命名约定（旧语义，
 // 分科上线前的存量数据全在此桶）。Agent 名按原始字节做 URL-safe base64，既保留精确
@@ -190,17 +191,30 @@ func (a *GroundingAdapter) GroundSnapshot(
 	snapshot usecase.GroundingSnapshot,
 	knowledgePoint, grade string,
 ) (string, bool, error) {
+	result, err := a.GroundSnapshotWithEvidence(
+		ctx, snapshot, knowledgePoint, grade,
+	)
+	return result.Text, result.Found, err
+}
+
+// GroundSnapshotWithEvidence 将同一次 pinned 查询实际消费的命中和脱敏回执
+// 一起返回；回执不能由独立 Knowledge search 或 mutable active pointer 构造。
+func (a *GroundingAdapter) GroundSnapshotWithEvidence(
+	ctx context.Context,
+	snapshot usecase.GroundingSnapshot,
+	knowledgePoint, grade string,
+) (usecase.GroundingSnapshotResult, error) {
 	ctx = knowledge.WithRetrievalFreshnessPolicy(ctx, knowledge.RetrievalFreshnessEvergreen)
 	if strings.TrimSpace(snapshot.AgentName) == "" ||
 		strings.TrimSpace(snapshot.LearnerID) == "" ||
 		strings.TrimSpace(snapshot.Subject) == "" {
-		return "", false, fmt.Errorf("grounding: invalid frozen scope")
+		return usecase.GroundingSnapshotResult{}, fmt.Errorf("grounding: invalid frozen scope")
 	}
 	if snapshot.TextbookBindingID == "" {
-		return "", false, nil
+		return usecase.GroundingSnapshotResult{Receipts: []usecase.GroundingEvidenceReceipt{}}, nil
 	}
 	if err := validateTypedGroundingSnapshot(snapshot, true); err != nil {
-		return "", false, fmt.Errorf("grounding: invalid frozen typed scope: %w", err)
+		return usecase.GroundingSnapshotResult{}, fmt.Errorf("grounding: invalid frozen typed scope: %w", err)
 	}
 	query := strings.Join(nonEmptyGroundingFacts(
 		snapshot.Edition,
@@ -218,19 +232,21 @@ func (a *GroundingAdapter) GroundSnapshot(
 	}
 	pinnedQuerier, ok := a.kb.(kbPinnedHitQuerier)
 	if !ok {
-		return "", false, fmt.Errorf("grounding: pinned retrieval plan unavailable")
+		return usecase.GroundingSnapshotResult{}, fmt.Errorf("grounding: pinned retrieval plan unavailable")
 	}
 	pinned := snapshot.VectorRevisionID
 	_, hits, receipts, err := pinnedQuerier.QueryHitsWithFilterAtRevision(
 		ctx, pinned, query, a.topK, filter,
 	)
 	if err != nil {
-		return "", false, fmt.Errorf("grounding: pinned retrieval: %w", err)
+		return usecase.GroundingSnapshotResult{}, fmt.Errorf("grounding: pinned retrieval: %w", err)
 	}
 	if err := validateGroundingReceipts(receipts, pinned, query); err != nil {
-		return "", false, err
+		return usecase.GroundingSnapshotResult{}, err
 	}
-	return groundingTextFromVerifiedHits(snapshot, hits)
+	return groundingResultFromVerifiedHits(
+		snapshot, hits, "sha256:"+sha256Hex(query),
+	)
 }
 
 func validateTypedGroundingSnapshot(
@@ -318,14 +334,17 @@ func validateGroundingReceipts(
 	return nil
 }
 
-func groundingTextFromVerifiedHits(
+func groundingResultFromVerifiedHits(
 	snapshot usecase.GroundingSnapshot,
 	hits []knowledge.SearchHit,
-) (string, bool, error) {
+	queryDigest string,
+) (usecase.GroundingSnapshotResult, error) {
 	type pageRange struct{ from, to int }
 	allowedChunks := make(map[string]pageRange, len(snapshot.SegmentRefs))
+	chunkPages := make(map[string][]k12.TextbookGroundingPageRef, len(snapshot.SegmentRefs))
 	for _, pageRef := range snapshot.PageRefs {
 		for _, segmentRef := range pageRef.SegmentRefs {
+			chunkPages[segmentRef] = append(chunkPages[segmentRef], pageRef)
 			span, exists := allowedChunks[segmentRef]
 			if !exists {
 				allowedChunks[segmentRef] = pageRange{from: pageRef.PDFPage, to: pageRef.PDFPage}
@@ -342,6 +361,7 @@ func groundingTextFromVerifiedHits(
 	}
 
 	parts := make([]string, 0, len(hits))
+	receipts := make([]usecase.GroundingEvidenceReceipt, 0, len(hits))
 	seenHits := make(map[string]struct{}, len(hits))
 	for index, hit := range hits {
 		content := strings.TrimSpace(hit.Content)
@@ -359,13 +379,34 @@ func groundingTextFromVerifiedHits(
 			hit.SourceOffsetStart < 0 || hit.SourceOffsetEnd <= hit.SourceOffsetStart ||
 			!validSHA256(hit.CitationDigest) ||
 			hit.CitationDigest != sha256Hex(hit.Content) {
-			return "", false, fmt.Errorf("grounding: invalid pinned evidence hit %d", index)
+			return usecase.GroundingSnapshotResult{}, fmt.Errorf("grounding: invalid pinned evidence hit %d", index)
 		}
 		seenHits[hit.ChunkID] = struct{}{}
 		parts = append(parts, content)
+		for _, page := range chunkPages[hit.ChunkID] {
+			receipts = append(receipts, usecase.GroundingEvidenceReceipt{
+				TextbookBindingID:  snapshot.TextbookBindingID,
+				TextbookManifestID: snapshot.TextbookManifestID,
+				DocumentID:         snapshot.DocumentID,
+				DocumentGeneration: snapshot.DocumentGeneration,
+				VectorRevisionID:   snapshot.VectorRevisionID,
+				QueryDigest:        queryDigest,
+				ChunkID:            hit.ChunkID,
+				LogicalPage:        page.LogicalPage,
+				PDFPage:            page.PDFPage,
+				SourceDigest:       hit.SourceDigest,
+				CitationDigest:     hit.CitationDigest,
+			})
+		}
 	}
 	text := strings.Join(parts, "\n\n")
-	return text, text != "", nil
+	result := usecase.GroundingSnapshotResult{
+		Text: text, Found: text != "", Receipts: receipts,
+	}
+	if !result.Found {
+		result.Receipts = []usecase.GroundingEvidenceReceipt{}
+	}
+	return result, nil
 }
 
 func validPrefixedSHA256(value string) bool {

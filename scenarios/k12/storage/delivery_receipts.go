@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
@@ -15,7 +16,8 @@ import (
 var ErrDeliveryReceiptConflict = errors.New("delivery receipt immutable identity conflict")
 var ErrDeliveryBatchConflict = errors.New("delivery batch immutable identity conflict")
 
-const deliveryReceiptColumns = `delivery_id,batch_id,batch_ordinal,agent_name,object_kind,object_id,binding_id,
+const deliveryReceiptColumns = `delivery_id,batch_id,batch_ordinal,part_kind,part_mime,part_ordinal,
+    part_digest,prepared_resource_id,agent_name,object_kind,object_id,binding_id,
     platform,instance_id,chat_id,target_label,status,dedupe_key,payload_digest,payload_json,
     render_manifest_json,external_message_id,attempt,last_error,created_at,updated_at`
 
@@ -24,6 +26,8 @@ func scanDeliveryReceipt(row rowScanner) (k12.DeliveryReceipt, error) {
 	var status string
 	err := row.Scan(
 		&receipt.DeliveryID, &receipt.BatchID, &receipt.BatchOrdinal,
+		&receipt.PartKind, &receipt.PartMIME, &receipt.PartOrdinal,
+		&receipt.PartDigest, &receipt.PreparedResourceID,
 		&receipt.AgentName, &receipt.ObjectKind, &receipt.ObjectID,
 		&receipt.BindingID, &receipt.Target.Platform, &receipt.Target.InstanceID,
 		&receipt.Target.ChatID, &receipt.Target.Label, &status, &receipt.DedupeKey,
@@ -38,6 +42,15 @@ func scanDeliveryReceipt(row rowScanner) (k12.DeliveryReceipt, error) {
 func normalizeDeliveryReceipt(receipt k12.DeliveryReceipt) (k12.DeliveryReceipt, error) {
 	receipt.DeliveryID = strings.TrimSpace(receipt.DeliveryID)
 	receipt.BatchID = strings.TrimSpace(receipt.BatchID)
+	if receipt.PartKind == "" {
+		receipt.PartKind = messagecontent.PartMarkdown
+	}
+	receipt.PartMIME = strings.ToLower(strings.TrimSpace(receipt.PartMIME))
+	if receipt.PartOrdinal == 0 {
+		receipt.PartOrdinal = 1
+	}
+	receipt.PartDigest = strings.TrimSpace(receipt.PartDigest)
+	receipt.PreparedResourceID = strings.TrimSpace(receipt.PreparedResourceID)
 	receipt.AgentName = strings.TrimSpace(receipt.AgentName)
 	receipt.ObjectKind = strings.TrimSpace(receipt.ObjectKind)
 	receipt.ObjectID = strings.TrimSpace(receipt.ObjectID)
@@ -50,6 +63,9 @@ func normalizeDeliveryReceipt(receipt k12.DeliveryReceipt) (k12.DeliveryReceipt,
 	receipt.PayloadDigest = strings.TrimSpace(receipt.PayloadDigest)
 	receipt.PayloadJSON = strings.TrimSpace(receipt.PayloadJSON)
 	receipt.RenderJSON = strings.TrimSpace(receipt.RenderJSON)
+	if receipt.PartDigest == "" {
+		receipt.PartDigest = receipt.PayloadDigest
+	}
 	if receipt.DeliveryID == "" || receipt.AgentName == "" || receipt.ObjectKind == "" ||
 		receipt.ObjectID == "" || receipt.BindingID == "" || receipt.Target.Platform == "" ||
 		receipt.Target.ChatID == "" || receipt.DedupeKey == "" || receipt.PayloadDigest == "" ||
@@ -58,6 +74,24 @@ func normalizeDeliveryReceipt(receipt k12.DeliveryReceipt) (k12.DeliveryReceipt,
 	}
 	if receipt.BatchOrdinal < 0 || (receipt.BatchID != "" && receipt.BatchOrdinal < 1) {
 		return k12.DeliveryReceipt{}, fmt.Errorf("k12storage: DeliveryReceipt batch ordinal 非法")
+	}
+	if receipt.PartOrdinal < 1 {
+		return k12.DeliveryReceipt{}, fmt.Errorf("k12storage: delivery receipt part ordinal is invalid")
+	}
+	switch receipt.PartKind {
+	case messagecontent.PartMarkdown:
+		if receipt.PartMIME != "" {
+			return k12.DeliveryReceipt{}, fmt.Errorf("k12storage: markdown delivery part cannot declare MIME")
+		}
+	case messagecontent.PartArtifact:
+		if !strings.HasPrefix(receipt.PartMIME, "image/") && receipt.PartMIME != "application/pdf" {
+			return k12.DeliveryReceipt{}, fmt.Errorf("k12storage: unsupported delivery artifact MIME %q", receipt.PartMIME)
+		}
+	default:
+		return k12.DeliveryReceipt{}, fmt.Errorf("k12storage: unsupported delivery part kind %q", receipt.PartKind)
+	}
+	if receipt.PartDigest == "" {
+		return k12.DeliveryReceipt{}, fmt.Errorf("k12storage: delivery receipt part digest is required")
 	}
 	if strings.HasPrefix(receipt.Target.ChatID, "\x00") {
 		return k12.DeliveryReceipt{}, fmt.Errorf("k12storage: DeliveryReceipt 只允许 direct target")
@@ -73,6 +107,7 @@ func normalizeDeliveryReceipt(receipt k12.DeliveryReceipt) (k12.DeliveryReceipt,
 	}
 	receipt.UpdatedAt = receipt.CreatedAt
 	receipt.Status = k12.DeliveryPending
+	receipt.PreparedResourceID = ""
 	receipt.ExternalMessageID = ""
 	receipt.Attempt = 0
 	receipt.LastError = ""
@@ -81,6 +116,8 @@ func normalizeDeliveryReceipt(receipt k12.DeliveryReceipt) (k12.DeliveryReceipt,
 
 func deliveryIdentityEqual(a, b k12.DeliveryReceipt) bool {
 	return a.BatchID == b.BatchID && a.BatchOrdinal == b.BatchOrdinal &&
+		a.PartKind == b.PartKind && a.PartMIME == b.PartMIME &&
+		a.PartOrdinal == b.PartOrdinal && a.PartDigest == b.PartDigest &&
 		a.AgentName == b.AgentName && a.ObjectKind == b.ObjectKind && a.ObjectID == b.ObjectID &&
 		a.BindingID == b.BindingID && a.Target == b.Target && a.DedupeKey == b.DedupeKey &&
 		a.PayloadDigest == b.PayloadDigest && a.PayloadJSON == b.PayloadJSON && a.RenderJSON == b.RenderJSON
@@ -95,9 +132,11 @@ func (s *Store) PrepareDeliveryReceipt(ctx context.Context, input k12.DeliveryRe
 		return k12.DeliveryReceipt{}, false, err
 	}
 	res, err := s.db.ExecContext(ctx, `INSERT INTO k12_delivery_receipts (`+deliveryReceiptColumns+`)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(agent_name,dedupe_key) DO NOTHING`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(agent_name,dedupe_key) DO NOTHING`,
 		receipt.DeliveryID, receipt.BatchID, receipt.BatchOrdinal,
+		receipt.PartKind, receipt.PartMIME, receipt.PartOrdinal,
+		receipt.PartDigest, receipt.PreparedResourceID,
 		receipt.AgentName, receipt.ObjectKind, receipt.ObjectID,
 		receipt.BindingID, receipt.Target.Platform, receipt.Target.InstanceID,
 		receipt.Target.ChatID, receipt.Target.Label, receipt.Status, receipt.DedupeKey,
@@ -142,6 +181,47 @@ func (s *Store) GetDeliveryReceipt(ctx context.Context, agentName, deliveryID st
 	return receipt, nil
 }
 
+// SaveDeliveryPreparedResource 持久化媒体 part 的 provider 资源引用。
+// 该引用一经写入不得替换，失败批次重试只补仍为空的媒体 part。
+func (s *Store) SaveDeliveryPreparedResource(
+	ctx context.Context,
+	agentName, deliveryID, preparedResourceID string,
+) (k12.DeliveryReceipt, error) {
+	agentName = strings.TrimSpace(agentName)
+	deliveryID = strings.TrimSpace(deliveryID)
+	preparedResourceID = strings.TrimSpace(preparedResourceID)
+	if preparedResourceID == "" {
+		return k12.DeliveryReceipt{}, fmt.Errorf("k12storage: prepared resource id is required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE k12_delivery_receipts SET
+		prepared_resource_id=?,updated_at=?
+		WHERE agent_name=? AND delivery_id=? AND part_kind='artifact'
+		  AND status IN ('pending','failed')
+		  AND (prepared_resource_id='' OR prepared_resource_id=?)`,
+		preparedResourceID, nowUnix(), agentName, deliveryID, preparedResourceID,
+	)
+	if err != nil {
+		return k12.DeliveryReceipt{}, fmt.Errorf("k12storage: save prepared delivery resource: %w", err)
+	}
+	receipt, getErr := s.GetDeliveryReceipt(ctx, agentName, deliveryID)
+	if getErr != nil {
+		return k12.DeliveryReceipt{}, getErr
+	}
+	if changed, _ := res.RowsAffected(); changed == 1 {
+		return receipt, nil
+	}
+	if receipt.PartKind != messagecontent.PartArtifact {
+		return receipt, fmt.Errorf("%w: delivery receipt %s is not an artifact part", records.ErrIllegalTransition, deliveryID)
+	}
+	if receipt.PreparedResourceID != "" && receipt.PreparedResourceID != preparedResourceID {
+		return receipt, fmt.Errorf("%w: delivery receipt %s prepared resource differs", ErrDeliveryReceiptConflict, deliveryID)
+	}
+	if receipt.PreparedResourceID == preparedResourceID {
+		return receipt, nil
+	}
+	return receipt, fmt.Errorf("%w: delivery receipt %s cannot prepare resource from status %s", records.ErrIllegalTransition, deliveryID, receipt.Status)
+}
+
 const deliveryBatchColumns = `batch_id,agent_name,object_kind,object_id,dedupe_key,
     content_digest,created_at,updated_at`
 
@@ -173,9 +253,38 @@ func normalizeDeliveryBatch(input k12.DeliveryBatch) (k12.DeliveryBatch, error) 
 	}
 	input.UpdatedAt = input.CreatedAt
 	input.Status = ""
-	targets := make(map[string]struct{}, len(input.Receipts))
-	bindings := make(map[string]struct{}, len(input.Receipts))
+	closedTargets := make(map[string]struct{}, len(input.Receipts))
+	bindingTargets := make(map[string]string, len(input.Receipts))
 	normalized := make([]k12.DeliveryReceipt, 0, len(input.Receipts))
+	currentTarget := ""
+	currentBinding := ""
+	currentParts := make([]struct {
+		kind messagecontent.PartKind
+		mime string
+	}, 0)
+	var partTemplate []struct {
+		kind messagecontent.PartKind
+		mime string
+	}
+	finishTarget := func() error {
+		if currentTarget == "" {
+			return nil
+		}
+		if partTemplate == nil {
+			partTemplate = append(partTemplate, currentParts...)
+		} else {
+			if len(currentParts) != len(partTemplate) {
+				return fmt.Errorf("k12storage: delivery batch targets have different part counts")
+			}
+			for i := range currentParts {
+				if currentParts[i] != partTemplate[i] {
+					return fmt.Errorf("k12storage: delivery batch targets have different part manifests")
+				}
+			}
+		}
+		closedTargets[currentTarget] = struct{}{}
+		return nil
+	}
 	for i, child := range input.Receipts {
 		child.BatchID = input.BatchID
 		child.BatchOrdinal = i + 1
@@ -190,15 +299,35 @@ func normalizeDeliveryBatch(input k12.DeliveryBatch) (k12.DeliveryBatch, error) 
 		targetKey := strings.Join([]string{
 			child.Target.Platform, child.Target.InstanceID, child.Target.ChatID,
 		}, "\x00")
-		if _, exists := targets[targetKey]; exists {
-			return k12.DeliveryBatch{}, fmt.Errorf("k12storage: DeliveryBatch 含重复目标 %q", targetKey)
+		if currentTarget != targetKey {
+			if err := finishTarget(); err != nil {
+				return k12.DeliveryBatch{}, err
+			}
+			if _, exists := closedTargets[targetKey]; exists {
+				return k12.DeliveryBatch{}, fmt.Errorf("k12storage: delivery batch target parts are not contiguous")
+			}
+			currentTarget = targetKey
+			currentBinding = child.BindingID
+			currentParts = currentParts[:0]
 		}
-		if _, exists := bindings[child.BindingID]; exists {
-			return k12.DeliveryBatch{}, fmt.Errorf("k12storage: DeliveryBatch 含重复 binding %q", child.BindingID)
+		if child.BindingID != currentBinding {
+			return k12.DeliveryBatch{}, fmt.Errorf("k12storage: delivery batch target changed binding between parts")
 		}
-		targets[targetKey] = struct{}{}
-		bindings[child.BindingID] = struct{}{}
+		if existingTarget, exists := bindingTargets[child.BindingID]; exists && existingTarget != targetKey {
+			return k12.DeliveryBatch{}, fmt.Errorf("k12storage: delivery batch binding maps to multiple targets")
+		}
+		bindingTargets[child.BindingID] = targetKey
+		if child.PartOrdinal != len(currentParts)+1 {
+			return k12.DeliveryBatch{}, fmt.Errorf("k12storage: delivery batch part ordinals must be contiguous")
+		}
+		currentParts = append(currentParts, struct {
+			kind messagecontent.PartKind
+			mime string
+		}{kind: child.PartKind, mime: child.PartMIME})
 		normalized = append(normalized, child)
+	}
+	if err := finishTarget(); err != nil {
+		return k12.DeliveryBatch{}, err
 	}
 	input.Receipts = normalized
 	return input, nil
@@ -239,8 +368,10 @@ func insertDeliveryBatchChildren(
 ) error {
 	for _, receipt := range batch.Receipts {
 		if _, err := ex.ExecContext(ctx, `INSERT INTO k12_delivery_receipts (`+deliveryReceiptColumns+`)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			receipt.DeliveryID, receipt.BatchID, receipt.BatchOrdinal,
+			receipt.PartKind, receipt.PartMIME, receipt.PartOrdinal,
+			receipt.PartDigest, receipt.PreparedResourceID,
 			receipt.AgentName, receipt.ObjectKind, receipt.ObjectID,
 			receipt.BindingID, receipt.Target.Platform, receipt.Target.InstanceID,
 			receipt.Target.ChatID, receipt.Target.Label, receipt.Status, receipt.DedupeKey,
@@ -337,6 +468,55 @@ func (s *Store) GetDeliveryBatch(ctx context.Context, agentName, batchID string)
 	return getDeliveryBatchVia(
 		ctx, s.db, strings.TrimSpace(agentName), strings.TrimSpace(batchID),
 	)
+}
+
+// FailDeliveryBatchPreparationIfIncomplete 在任一媒体 part 仍未准备时，原子地把
+// 尚未跨越可见发送边界的 children 标记为明确失败。全部资源已就绪时不写入。
+func (s *Store) FailDeliveryBatchPreparationIfIncomplete(
+	ctx context.Context,
+	agentName, batchID, detail string,
+) (k12.DeliveryBatch, bool, error) {
+	agentName = strings.TrimSpace(agentName)
+	batchID = strings.TrimSpace(batchID)
+	detail = strings.TrimSpace(detail)
+	if agentName == "" || batchID == "" || detail == "" {
+		return k12.DeliveryBatch{}, false, fmt.Errorf("k12storage: batch preparation failure requires owner, batch and detail")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE k12_delivery_receipts SET
+		status=CASE WHEN status='pending' THEN 'failed' ELSE status END,
+		last_error=?,updated_at=?
+		WHERE agent_name=? AND batch_id=?
+		  AND (status='pending' OR (status='failed' AND attempt=0))
+		  AND EXISTS (
+			SELECT 1 FROM k12_delivery_receipts missing
+			WHERE missing.agent_name=? AND missing.batch_id=?
+			  AND missing.part_kind='artifact' AND missing.prepared_resource_id=''
+		  )`,
+		detail, nowUnix(), agentName, batchID, agentName, batchID,
+	)
+	if err != nil {
+		return k12.DeliveryBatch{}, false, fmt.Errorf("k12storage: fail incomplete delivery batch preparation: %w", err)
+	}
+	batch, getErr := s.GetDeliveryBatch(ctx, agentName, batchID)
+	if getErr != nil {
+		return k12.DeliveryBatch{}, false, getErr
+	}
+	incomplete := false
+	for _, receipt := range batch.Receipts {
+		if receipt.PartKind == messagecontent.PartArtifact && receipt.PreparedResourceID == "" {
+			incomplete = true
+			if receipt.Status != k12.DeliveryPending && receipt.Status != k12.DeliveryFailed {
+				return batch, true, fmt.Errorf("%w: unprepared artifact part %s already crossed send boundary", ErrDeliveryBatchConflict, receipt.DeliveryID)
+			}
+		}
+	}
+	if incomplete {
+		if changed, _ := res.RowsAffected(); changed == 0 {
+			return batch, true, fmt.Errorf("%w: incomplete delivery batch has no retryable children", ErrDeliveryBatchConflict)
+		}
+		return batch, true, nil
+	}
+	return batch, false, nil
 }
 
 func getDeliveryBatchVia(

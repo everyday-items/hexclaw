@@ -3,8 +3,6 @@ package usecase
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -203,7 +201,10 @@ func (o *GradingOrchestrator) finalizeGradingPage(
 		CanonicalMarkdown:         canonicalMarkdown,
 		SummaryInvocationID:       summaryInvocationID,
 	}
-	artifact.ArtifactDigest = gradingFinalArtifactDigest(artifact)
+	if err := o.freezeGradingFinalAnnotatedAsset(ctx, run, job, &artifact); err != nil {
+		return k12.GradingFinalArtifact{}, err
+	}
+	artifact.ArtifactDigest = k12.ComputeGradingFinalArtifactDigest(artifact)
 	stored, _, err := o.deps.Records.CommitGradingFinalArtifact(
 		ctx,
 		artifact,
@@ -213,6 +214,89 @@ func (o *GradingOrchestrator) finalizeGradingPage(
 		return k12.GradingFinalArtifact{}, err
 	}
 	return stored, nil
+}
+
+// freezeGradingFinalAnnotatedAsset 在提交 final artifact 前把进程内批注图
+// 提升为 owner-scoped PageAsset，并冻结原图与批注图的内容身份。
+func (o *GradingOrchestrator) freezeGradingFinalAnnotatedAsset(
+	ctx context.Context,
+	run *gradingRun,
+	job GradingJobView,
+	artifact *k12.GradingFinalArtifact,
+) error {
+	if run == nil || run.result == nil || run.result.AnnotatedImage == nil {
+		return nil
+	}
+	// 只有 ImageTask 在创建时冻结了不可伪造的 owner 与原图 PageAsset
+	// 关系；旧 direct-photo 调用没有该边界，继续保持既有无资产 final artifact。
+	if strings.TrimSpace(job.Fields.SourceKind) != "image_task" {
+		return nil
+	}
+	annotated := run.result.AnnotatedImage
+	if len(annotated.Data) == 0 {
+		return fmt.Errorf("%w: annotated image bytes are empty", ErrGradingFinalizationIncomplete)
+	}
+	dispatchID, err := gradingFinalImageTaskDispatchID(job)
+	if err != nil {
+		return err
+	}
+	dispatch, err := o.deps.Records.GetImageTaskDispatch(
+		ctx, job.Record.AgentName, dispatchID,
+	)
+	if err != nil {
+		return err
+	}
+	if len(dispatch.SourceAssetRefs) == 0 {
+		return fmt.Errorf("%w: image task has no original source asset", ErrGradingFinalizationIncomplete)
+	}
+	ownerScope, err := o.deps.Records.GetImageTaskOwnerScope(
+		ctx, job.Record.AgentName, dispatch.DispatchID,
+	)
+	if err != nil {
+		return err
+	}
+	repository := &PageAssetRepository{Records: o.deps.Records}
+	original, err := repository.OpenReady(
+		ctx, ownerScope, job.Record.AgentName, dispatch.SourceAssetRefs[0],
+	)
+	if err != nil {
+		return err
+	}
+	ready, err := repository.Persist(
+		ctx, ownerScope, job.Record.AgentName, annotated.Data,
+	)
+	if err != nil {
+		return err
+	}
+	if mime := strings.TrimSpace(annotated.MIME); mime != "" && mime != ready.Metadata.MediaType {
+		return fmt.Errorf("%w: annotated image MIME does not match persisted bytes", ErrGradingFinalizationIncomplete)
+	}
+	artifact.AnnotatedAssetOwnerScope = ownerScope
+	artifact.AnnotatedAssetID = ready.Metadata.PageAssetID
+	artifact.AnnotatedMIME = ready.Metadata.MediaType
+	artifact.AnnotatedDigest = ready.Metadata.ContentDigest
+	artifact.OriginalSourceDigest = original.Metadata.ContentDigest
+	return nil
+}
+
+func gradingFinalImageTaskDispatchID(job GradingJobView) (string, error) {
+	if job.Record == nil || strings.TrimSpace(job.Record.AgentName) == "" ||
+		strings.TrimSpace(job.Fields.SourceKind) != "image_task" ||
+		job.Fields.ConfirmationState != k12.GradingConfirmationConfirmed ||
+		job.Fields.ConfirmedVersion < 0 {
+		return "", fmt.Errorf("%w: annotated image job source is invalid", ErrGradingFinalizationIncomplete)
+	}
+	prefix := "image_task|"
+	suffix := fmt.Sprintf("|v%d", job.Fields.ConfirmedVersion)
+	key := strings.TrimSpace(job.Fields.IdempotencyKey)
+	if !strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, suffix) {
+		return "", fmt.Errorf("%w: annotated image source identity is invalid", ErrGradingFinalizationIncomplete)
+	}
+	dispatchID := strings.TrimSuffix(strings.TrimPrefix(key, prefix), suffix)
+	if strings.TrimSpace(dispatchID) == "" {
+		return "", fmt.Errorf("%w: annotated image dispatch identity is empty", ErrGradingFinalizationIncomplete)
+	}
+	return dispatchID, nil
 }
 
 // text webhook 不得把模型评估推断成已确认教材知识点；只有冻结 Problem
@@ -432,9 +516,21 @@ func (o *GradingOrchestrator) buildFinalTutoringTips(
 	if err != nil {
 		return TutoringTips{}, "", err
 	}
-	tips, err := o.deps.BuildTutoringTips(
-		ctx, job.Record.AgentName, job.Record.RecordID,
+	frozenGrounding, hasFrozenGrounding, err := gradingGroundingSnapshotFromItemInvocations(
+		ctx, o.deps, job.Record.AgentName, job.Record.RecordID,
 	)
+	var tips TutoringTips
+	if err == nil {
+		if hasFrozenGrounding {
+			tips, err = o.deps.buildTutoringTipsSubject(
+				ctx, job.Record.AgentName, job.Record.RecordID, &frozenGrounding,
+			)
+		} else {
+			tips, err = o.deps.BuildTutoringTips(
+				ctx, job.Record.AgentName, job.Record.RecordID,
+			)
+		}
+	}
 	if err != nil {
 		if invocationOutcomeUnknown(err) {
 			_, _ = o.deps.Records.MarkModelInvocationOutcomeUnknown(
@@ -496,6 +592,9 @@ func recoverFinalTutoringTips(
 	if err := decoder.Decode(&tips); err != nil {
 		return fail("durable result payload does not match the tutoring-tips contract")
 	}
+	if tips.GroundingEvidenceReceipts == nil {
+		tips.GroundingEvidenceReceipts = []GroundingEvidenceReceipt{}
+	}
 	if err := validateRecoveredFinalTutoringTips(job, tips); err != nil {
 		return fail(err.Error())
 	}
@@ -535,6 +634,20 @@ func validateRecoveredFinalTutoringTips(
 			tips.Sections[0].SourceLabel != TutoringTipsSourceAI) {
 		return fmt.Errorf("durable result overview section contract changed")
 	}
+	seenGroundingReceipts := make(map[GroundingEvidenceReceipt]struct{}, len(tips.GroundingEvidenceReceipts))
+	for _, receipt := range tips.GroundingEvidenceReceipts {
+		if err := validateGroundingEvidenceReceiptIdentity(receipt); err != nil {
+			return err
+		}
+		if _, duplicate := seenGroundingReceipts[receipt]; duplicate {
+			return fmt.Errorf("durable result contains a duplicate grounding receipt")
+		}
+		seenGroundingReceipts[receipt] = struct{}{}
+	}
+	if len(tips.GroundingEvidenceReceipts) == 0 &&
+		tips.Sections[0].SourceLabel == TutoringTipsSourceTextbook {
+		return fmt.Errorf("durable result claims textbook grounding without a receipt")
+	}
 	attentionTitle := strings.TrimSpace(tips.Sections[1].Title)
 	if attentionTitle == "要留意" || !strings.HasSuffix(attentionTitle, "要留意") ||
 		tips.Sections[1].SourceLabel != TutoringTipsSourceLearningEvidence {
@@ -568,16 +681,12 @@ func renderCanonicalGradingFinal(
 		}
 	}
 	if processIssueCount > 0 {
-		out.WriteString("## Grading summary\n\n")
-		fmt.Fprintf(
-			&out,
-			"This run determined **%d** questions: **%d correct / %d with process issues / %d requiring correction**.\n\n"+
-				"> A process issue has a correct final answer and is not recorded as wrong.\n\n",
-			correctCount+processIssueCount+wrongCount,
-			correctCount,
-			processIssueCount,
-			wrongCount,
-		)
+		out.WriteString("## 批改摘要\n\n")
+		fmt.Fprintf(&out, "**%d 道正确 / %d 道过程问题**\n\n", correctCount, processIssueCount)
+		if wrongCount > 0 {
+			fmt.Fprintf(&out, "另有 **%d 道需要订正**。\n\n", wrongCount)
+		}
+		out.WriteString("> 过程问题表示最终答案正确，但书写过程需要核对，不记为错题。\n\n")
 	}
 	for _, entry := range entries {
 		label := RecognizedQuestionSourceDisplayLabel(entry.question)
@@ -595,19 +704,16 @@ func renderCanonicalGradingFinal(
 			out.WriteString("**已跳过 · 未判断对错**\n\n")
 			continue
 		}
+		out.WriteString("**批改状态：** ")
+		out.WriteString(gradingAssessmentParentStatus(entry.assessment.Status))
+		out.WriteString("\n\n")
 		if entry.assessment.Status == k12.GradingAssessmentProcessIssue {
-			out.WriteString("**Grading status:** ⚠ Process issue (final answer correct; not recorded as wrong) · `correct_with_process_issue`\n\n")
 			writeCanonicalProcessIssueDetails(&out, entry.assessment.ResultJSON)
-		} else {
-			out.WriteString("**Grading status:** `")
-			out.WriteString(string(entry.assessment.Status))
-			out.WriteString("`\n\n")
-		}
-		var indented bytes.Buffer
-		if json.Indent(&indented, []byte(entry.assessment.ResultJSON), "", "  ") == nil {
-			out.WriteString("```json\n")
-			out.Write(indented.Bytes())
-			out.WriteString("\n```\n\n")
+		} else if details, status, ok := RenderCanonicalGradingAssessmentDetails(
+			entry.assessment.ResultJSON,
+		); ok && string(status) == string(entry.assessment.Status) && details != "" {
+			out.WriteString(details)
+			out.WriteString("\n\n")
 		}
 	}
 	if tips != nil {
@@ -628,23 +734,44 @@ func renderCanonicalGradingFinal(
 	return strings.TrimSpace(out.String())
 }
 
+func gradingAssessmentParentStatus(status k12.GradingAssessmentStatus) string {
+	switch status {
+	case k12.GradingAssessmentCorrect:
+		return "✅ 正确"
+	case k12.GradingAssessmentProcessIssue:
+		return "⚠ 过程问题（最终答案正确，不记为错题）"
+	case k12.GradingAssessmentWrong:
+		return "❌ 需要订正"
+	case k12.GradingAssessmentUnanswered:
+		return "⏸ 未作答"
+	case k12.GradingAssessmentAnswerUnclear:
+		return "⚠ 作答待补录"
+	case k12.GradingAssessmentBlankSolved:
+		return "📘 已生成家长辅导指南"
+	case k12.GradingAssessmentOutOfScope:
+		return "⛔ 超出当前年级范围"
+	default:
+		return "⚠ 待核对"
+	}
+}
+
 func writeCanonicalProcessIssueDetails(out *strings.Builder, resultJSON string) {
 	var item PhotoGradeItem
 	if json.Unmarshal([]byte(resultJSON), &item) != nil || item.Status != PhotoCorrectWithProcessIssue {
 		return
 	}
 	if wrongStep := strings.TrimSpace(item.Grade.Outcome.WrongStep); wrongStep != "" {
-		out.WriteString("**Process note:** ")
+		out.WriteString("**错误步骤：** ")
 		out.WriteString(photoInline(wrongStep, 300))
 		out.WriteString("\n\n")
 	}
 	if cause := strings.TrimSpace(item.Grade.Outcome.ErrorCause); cause != "" {
-		out.WriteString("**Cause:** ")
+		out.WriteString("**原因：** ")
 		out.WriteString(photoInline(cause, 300))
 		out.WriteString("\n\n")
 	}
 	if item.ParentGuide != nil {
-		out.WriteString("### How the parent can explain it\n\n")
+		out.WriteString("### 家长怎么讲\n\n")
 		writeParentTeachingGuideMarkdown(out, *item.ParentGuide)
 		out.WriteString("\n\n")
 	}
@@ -728,28 +855,4 @@ func RenderCanonicalGradingAssessmentDetails(resultJSON string) (string, PhotoIt
 		writeParentTeachingGuideMarkdown(&out, *item.ParentGuide)
 	}
 	return strings.TrimSpace(out.String()), item.Status, true
-}
-
-func gradingFinalArtifactDigest(artifact k12.GradingFinalArtifact) string {
-	raw, _ := json.Marshal(struct {
-		StructureVersion          int
-		CoverageStatus            k12.GradingFinalArtifactCoverageStatus
-		TotalCount                int
-		PublishedCount            int
-		SkippedCount              int
-		OrderedCurrentDigestsJSON string
-		CanonicalMarkdown         string
-		SummaryInvocationID       string
-	}{
-		artifact.StructureVersion,
-		artifact.CoverageStatus,
-		artifact.TotalCount,
-		artifact.PublishedCount,
-		artifact.SkippedCount,
-		artifact.OrderedCurrentDigestsJSON,
-		artifact.CanonicalMarkdown,
-		artifact.SummaryInvocationID,
-	})
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])
 }

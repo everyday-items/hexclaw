@@ -205,7 +205,7 @@ func TestBUG20260824CreativeWorkReplayReturnsFrozenBatchAfterSourceAssetIsDelete
 	sendPath := "/creative-works/" + workID + "/send"
 
 	firstRec, first := do(t, handler, http.MethodPost, sendPath, `{"agent":"mingming"}`)
-	if firstRec.Code != http.StatusOK || len(delivery.sends) != len(httpBatchTargets()) {
+	if firstRec.Code != http.StatusOK || len(delivery.sends) != 2*len(httpBatchTargets()) {
 		t.Fatalf("first send did not freeze every bound target: status=%d body=%v sends=%d",
 			firstRec.Code, first, len(delivery.sends))
 	}
@@ -281,11 +281,13 @@ func TestBUG20260824CreativeWorkReplayAuthorizesBeforeFrozenBatchLookup(t *testi
 	if err != nil {
 		t.Fatalf("read frozen batch after canceled request: %v", err)
 	}
-	if len(stored.Receipts) != 2 ||
-		stored.Receipts[0].Status != k12.DeliveryOutcomeUnknown ||
-		stored.Receipts[1].Status != k12.DeliveryPending ||
-		stored.Receipts[1].Attempt != 0 {
+	if len(stored.Receipts) != 4 || stored.Receipts[0].Status != k12.DeliveryOutcomeUnknown {
 		t.Fatalf("test precondition requires one attempted and one never-attempted child: %+v", stored.Receipts)
+	}
+	for _, receipt := range stored.Receipts[1:] {
+		if receipt.Status != k12.DeliveryPending || receipt.Attempt != 0 {
+			t.Fatalf("test precondition requires all later parts to remain pending: %+v", stored.Receipts)
+		}
 	}
 	sendsBefore := len(delivery.sends)
 	preparationsBefore := len(delivery.content)
@@ -514,7 +516,7 @@ func TestBUG20260824CreativeWorkReplayChangedLatestFeedbackCreatesNewBatch(t *te
 	if len(delivery.content) != 2 || delivery.content[0] == delivery.content[1] {
 		t.Errorf("changed latest feedback did not create two distinct canonical payloads: %#v", delivery.content)
 	}
-	if len(delivery.sends) != 2*len(httpBatchTargets()) || delivery.resolveCalls != 2 {
+	if len(delivery.sends) != 4*len(httpBatchTargets()) || delivery.resolveCalls != 2 {
 		t.Errorf(
 			"changed latest feedback did not create and send a new batch: sends=%d resolutions=%d",
 			len(delivery.sends), delivery.resolveCalls,
@@ -612,7 +614,7 @@ func TestBUG20260824CreativeWorkReplayRechecksFrozenBatchAfterAssetReadRace(t *t
 	if gateway.openCalls != 1 {
 		t.Errorf("asset race handling reopened mutable source bytes: open_calls=%d", gateway.openCalls)
 	}
-	if len(delivery.content) != 1 || len(delivery.sends) != len(httpBatchTargets()) || len(delivery.queries) != 0 {
+	if len(delivery.content) != 1 || len(delivery.sends) != 2*len(httpBatchTargets()) || len(delivery.queries) != 0 {
 		t.Errorf(
 			"asset race crossed delivery boundaries more than once: preparations=%d sends=%d queries=%d",
 			len(delivery.content), len(delivery.sends), len(delivery.queries),

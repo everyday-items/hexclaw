@@ -79,6 +79,7 @@ type SinglePracticeGenerationView struct {
 
 type singlePracticeRequestSnapshot struct {
 	SourceMistakeID string `json:"source_mistake_id"`
+	SourceVersion   int    `json:"source_version"`
 	SourceProblemID string `json:"source_problem_id"`
 	Question        string `json:"question"`
 	KnowledgePoint  string `json:"knowledge_point"`
@@ -138,6 +139,7 @@ func normalizeSinglePracticeRequest(
 	}
 	snapshot := singlePracticeRequestSnapshot{
 		SourceMistakeID: source.RecordID,
+		SourceVersion:   source.Version,
 		SourceProblemID: source.RecordID,
 		Question:        strings.TrimSpace(fields.Question),
 		KnowledgePoint:  strings.TrimSpace(fields.KnowledgePoint),
@@ -159,6 +161,60 @@ func normalizeSinglePracticeRequest(
 func singlePracticeDigest(requestJSON, routeJSON string) string {
 	sum := sha256.Sum256([]byte(requestJSON + "\n" + routeJSON))
 	return hex.EncodeToString(sum[:])
+}
+
+// commitSinglePracticeReadyItem 是错题与积累来源任务唯一的共享提交路径，
+// 在同一个 SQLite 事务内写入就绪练习项与任务完成收据。
+func (d Deps) commitSinglePracticeReadyItem(
+	ctx context.Context,
+	job k12.PracticeGenerationJob,
+	sourceSession, gradeTerm, newSetSourceKind string,
+	item k12.PracticeItem,
+) (*records.AgentRecord, bool, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		basket, err := d.findBasket(ctx, job.AgentName)
+		if err != nil {
+			return nil, false, err
+		}
+		var candidate *records.AgentRecord
+		expectedVersion := -1
+		if basket == nil {
+			candidate, err = k12.NewPracticeSetRecord(
+				job.AgentName, strings.TrimSpace(sourceSession),
+				k12.PracticeSetFields{
+					GradeTerm: strings.TrimSpace(gradeTerm), SourceKind: newSetSourceKind,
+					Title: basketTitle, Items: []k12.PracticeItem{item},
+				},
+			)
+		} else {
+			expectedVersion = basket.Record.Version
+			basket.Fields.Items = append(basket.Fields.Items, item)
+			basket.Fields.SourceKind = k12.AggregateSourceKind(
+				basket.Fields, basket.Fields.SourceKind,
+			)
+			var raw []byte
+			raw, err = json.Marshal(basket.Fields)
+			if err == nil {
+				candidate = basket.Record
+				candidate.Fields = string(raw)
+			}
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		job.Status = k12.PracticeGenerationCommitted
+		job.UpdatedAt = d.now()
+		stored, replay, commitErr := d.Records.CommitPracticeGeneration(
+			ctx, candidate, expectedVersion, job,
+		)
+		if commitErr == nil {
+			return stored, replay, nil
+		}
+		if !errors.Is(commitErr, records.ErrVersionConflict) || attempt == 1 {
+			return nil, false, commitErr
+		}
+	}
+	return nil, false, records.ErrVersionConflict
 }
 
 func (d Deps) singlePracticeSource(
@@ -199,15 +255,21 @@ func (d Deps) StartSinglePracticeGeneration(
 	if singlePracticeStateHidden(source) {
 		return d.singlePracticeView(ctx, source, fields, nil)
 	}
-	req, request, requestJSON, err := normalizeSinglePracticeRequest(ctx, d, source, fields, req)
+	req, _, requestJSON, err := normalizeSinglePracticeRequest(ctx, d, source, fields, req)
 	if err != nil {
 		return SinglePracticeGenerationView{}, err
 	}
-	// Exact command replay is resolved before consulting mutable route state.
+	// 精确命令重放必须先于可变路由状态解析。
+	persistedIdempotencyKey := fmt.Sprintf(
+		"%s:v%d", req.IdempotencyKey, source.Version,
+	)
 	if prior, getErr := d.Records.GetPracticeGenerationJob(
-		ctx, source.AgentName, req.IdempotencyKey,
+		ctx, source.AgentName, persistedIdempotencyKey,
 	); getErr == nil {
-		if prior.Scope != "single" || prior.SourceMistakeID != source.RecordID ||
+		if prior.Scope != "single" ||
+			prior.SourceKind != k12.PracticeGenerationSourceMistake ||
+			prior.SourceID != source.RecordID ||
+			prior.SourceVersion != source.Version ||
 			prior.RequestSnapshot != requestJSON {
 			return SinglePracticeGenerationView{}, fmt.Errorf(
 				"%w: idempotency_key 已绑定其他逐题生成请求", ErrInvalidInput,
@@ -217,11 +279,25 @@ func (d Deps) StartSinglePracticeGeneration(
 	} else if !errors.Is(getErr, records.ErrNotFound) {
 		return SinglePracticeGenerationView{}, getErr
 	}
-	// A different duplicate click for the same source converges to the active or
-	// terminal object; failed is retried through the explicit retry command.
-	if latest, latestErr := d.Records.GetLatestSinglePracticeGeneration(
-		ctx, source.AgentName, source.RecordID,
-	); latestErr == nil && latest.RetiredAt == 0 {
+	// 同一来源的新幂等命令收敛到已有任务；失败任务只通过显式重试恢复。
+	if latest, latestErr := d.Records.GetLatestPracticeGenerationBySource(
+		ctx, source.AgentName, k12.PracticeGenerationSourceMistake,
+		source.RecordID, source.Version,
+	); latestErr == nil {
+		if latest.RequestSnapshot != requestJSON {
+			return SinglePracticeGenerationView{}, fmt.Errorf(
+				"%w: mistake source is bound to another frozen request",
+				ErrInvalidInput,
+			)
+		}
+		if latest.RetiredAt != 0 {
+			latest, err = d.Records.ReactivatePracticeGenerationJob(
+				ctx, source.AgentName, latest.GenerationJobID,
+			)
+			if err != nil {
+				return SinglePracticeGenerationView{}, err
+			}
+		}
 		projected, projectErr := d.singlePracticeView(ctx, source, fields, &latest)
 		if projectErr != nil {
 			return SinglePracticeGenerationView{}, projectErr
@@ -259,9 +335,12 @@ func (d Deps) StartSinglePracticeGeneration(
 	job := k12.PracticeGenerationJob{
 		GenerationJobID:   jobID,
 		AgentName:         source.AgentName,
-		IdempotencyKey:    req.IdempotencyKey,
+		IdempotencyKey:    persistedIdempotencyKey,
 		RequestDigest:     singlePracticeDigest(requestJSON, routeJSON),
 		Scope:             "single",
+		SourceKind:        k12.PracticeGenerationSourceMistake,
+		SourceID:          source.RecordID,
+		SourceVersion:     source.Version,
 		VariantsPerSource: 1,
 		Difficulty:        req.Difficulty,
 		Total:             "1",
@@ -275,67 +354,11 @@ func (d Deps) StartSinglePracticeGeneration(
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}
-	placeholder := k12.PracticeItem{
-		ItemID:                 itemID,
-		SourceProblemID:        request.SourceProblemID,
-		SourceMistakeSummary:   job.SourceSummary,
-		Subject:                request.Subject,
-		AddedVia:               k12.PracticeAddedViaSingleVariant,
-		GenerationStatus:       k12.PracticeItemGenerationQueued,
-		VerificationStatus:     k12.PracticeItemPending,
-		GenerationJobID:        jobID,
-		VariantIndex:           1,
-		RequestedDifficulty:    req.Difficulty,
-		ActualDifficulty:       "",
-		QuestionMarkdown:       "",
-		ExpectedAnswerMarkdown: "",
+	accepted, _, err := d.Records.BeginPracticeGenerationJob(ctx, job)
+	if err != nil {
+		return SinglePracticeGenerationView{}, err
 	}
-	for attempt := 0; attempt < 2; attempt++ {
-		basket, findErr := d.findBasket(ctx, source.AgentName)
-		if findErr != nil {
-			return SinglePracticeGenerationView{}, findErr
-		}
-		var candidate *records.AgentRecord
-		expectedVersion := -1
-		if basket == nil {
-			candidate, err = k12.NewPracticeSetRecord(
-				source.AgentName,
-				req.SourceSession,
-				k12.PracticeSetFields{
-					GradeTerm:  req.Grade,
-					SourceKind: k12.PracticeSourceSingleVariant,
-					Title:      basketTitle,
-					Items:      []k12.PracticeItem{placeholder},
-				},
-			)
-		} else {
-			expectedVersion = basket.Record.Version
-			basket.Fields.Items = append(basket.Fields.Items, placeholder)
-			if basket.Fields.SourceKind != k12.PracticeSourceSingleVariant {
-				basket.Fields.SourceKind = k12.PracticeSourceMixed
-			}
-			var raw []byte
-			raw, err = json.Marshal(basket.Fields)
-			if err == nil {
-				candidate = basket.Record
-				candidate.Fields = string(raw)
-			}
-		}
-		if err != nil {
-			return SinglePracticeGenerationView{}, err
-		}
-		stored, accepted, _, beginErr := d.Records.BeginSinglePracticeGeneration(
-			ctx, candidate, expectedVersion, job,
-		)
-		if beginErr == nil {
-			_ = stored
-			return d.singlePracticeView(ctx, source, fields, &accepted)
-		}
-		if !errors.Is(beginErr, records.ErrVersionConflict) || attempt == 1 {
-			return SinglePracticeGenerationView{}, beginErr
-		}
-	}
-	return SinglePracticeGenerationView{}, records.ErrVersionConflict
+	return d.singlePracticeView(ctx, source, fields, &accepted)
 }
 
 func (d Deps) singlePracticeView(
@@ -409,8 +432,9 @@ func (d Deps) GetSinglePracticeGeneration(
 	if err != nil {
 		return SinglePracticeGenerationView{}, err
 	}
-	job, err := d.Records.GetLatestSinglePracticeGeneration(
-		ctx, source.AgentName, source.RecordID,
+	job, err := d.Records.GetLatestPracticeGenerationBySource(
+		ctx, source.AgentName, k12.PracticeGenerationSourceMistake,
+		source.RecordID, source.Version,
 	)
 	if errors.Is(err, records.ErrNotFound) {
 		return d.singlePracticeView(ctx, source, fields, nil)
@@ -615,7 +639,14 @@ func (d Deps) ProcessSinglePracticeGeneration(
 	if err != nil {
 		return SinglePracticeGenerationView{}, err
 	}
-	source, fields, err := d.singlePracticeSource(ctx, agentName, job.SourceMistakeID)
+	if job.Scope != "single" ||
+		job.SourceKind != k12.PracticeGenerationSourceMistake ||
+		job.SourceID == "" || job.SourceID != job.SourceMistakeID {
+		return SinglePracticeGenerationView{}, fmt.Errorf(
+			"%w: generation job is not a mistake task", ErrInvalidInput,
+		)
+	}
+	source, fields, err := d.singlePracticeSource(ctx, agentName, job.SourceID)
 	if err != nil {
 		return SinglePracticeGenerationView{}, err
 	}
@@ -630,9 +661,9 @@ func (d Deps) ProcessSinglePracticeGeneration(
 	}
 	if d.PracticeVariant == nil || d.Solver == nil {
 		err = fmt.Errorf("usecase: 未配置逐题生成或独立验算能力")
-		_, _ = d.Records.AdvanceSinglePracticeGeneration(
+		_, _ = d.Records.AdvancePracticeGenerationJob(
 			ctx, agentName, job.GenerationJobID,
-			k12.PracticeGenerationFailed, job.Attempt, k12.PracticeItem{}, err.Error(),
+			k12.PracticeGenerationFailed, job.Attempt, err.Error(),
 		)
 		return SinglePracticeGenerationView{}, err
 	}
@@ -661,10 +692,9 @@ func (d Deps) ProcessSinglePracticeGeneration(
 		if job.Attempt != boundedAttempt ||
 			(job.Status != k12.PracticeGenerationGenerating &&
 				job.Status != k12.PracticeGenerationValidating) {
-			job, err = d.Records.AdvanceSinglePracticeGeneration(
+			job, err = d.Records.AdvancePracticeGenerationJob(
 				ctx, agentName, job.GenerationJobID,
-				k12.PracticeGenerationGenerating, boundedAttempt,
-				k12.PracticeItem{}, "",
+				k12.PracticeGenerationGenerating, boundedAttempt, "",
 			)
 			if err != nil {
 				return SinglePracticeGenerationView{}, err
@@ -695,10 +725,9 @@ func (d Deps) ProcessSinglePracticeGeneration(
 			lastErr = fmt.Errorf("%w: 生成逐题变式: %v", ErrSolveFailed, generateErr)
 			if !retryable {
 				if errors.Is(generateErr, ErrModelInvocationRequiresReconciliation) {
-					_, _ = d.Records.AdvanceSinglePracticeGeneration(
+					_, _ = d.Records.AdvancePracticeGenerationJob(
 						context.WithoutCancel(ctx), agentName, job.GenerationJobID,
-						k12.PracticeGenerationFailed, job.Attempt,
-						k12.PracticeItem{}, generateErr.Error(),
+						k12.PracticeGenerationFailed, job.Attempt, generateErr.Error(),
 					)
 				}
 				return SinglePracticeGenerationView{}, generateErr
@@ -711,10 +740,9 @@ func (d Deps) ProcessSinglePracticeGeneration(
 			continue
 		}
 		if job.Status != k12.PracticeGenerationValidating {
-			job, err = d.Records.AdvanceSinglePracticeGeneration(
+			job, err = d.Records.AdvancePracticeGenerationJob(
 				ctx, agentName, job.GenerationJobID,
-				k12.PracticeGenerationValidating, boundedAttempt,
-				k12.PracticeItem{}, "",
+				k12.PracticeGenerationValidating, boundedAttempt, "",
 			)
 			if err != nil {
 				return SinglePracticeGenerationView{}, err
@@ -750,10 +778,9 @@ func (d Deps) ProcessSinglePracticeGeneration(
 			lastErr = fmt.Errorf("%w: 独立验算逐题变式: %v", ErrSolveFailed, validateErr)
 			if !retryable {
 				if errors.Is(validateErr, ErrModelInvocationRequiresReconciliation) {
-					_, _ = d.Records.AdvanceSinglePracticeGeneration(
+					_, _ = d.Records.AdvancePracticeGenerationJob(
 						context.WithoutCancel(ctx), agentName, job.GenerationJobID,
-						k12.PracticeGenerationFailed, job.Attempt,
-						k12.PracticeItem{}, validateErr.Error(),
+						k12.PracticeGenerationFailed, job.Attempt, validateErr.Error(),
 					)
 				}
 				return SinglePracticeGenerationView{}, validateErr
@@ -788,9 +815,24 @@ func (d Deps) ProcessSinglePracticeGeneration(
 			RequestedDifficulty:    request.Difficulty,
 			ActualDifficulty:       request.Difficulty,
 		}
-		job, err = d.Records.AdvanceSinglePracticeGeneration(
+		hash, _, hashErr := k12.StablePracticeProblemHash(k12.PracticeCandidateProblem{
+			Subject: ready.Subject, QuestionMarkdown: ready.QuestionMarkdown,
+			ExpectedAnswerMarkdown: ready.ExpectedAnswerMarkdown,
+		})
+		if hashErr != nil {
+			return SinglePracticeGenerationView{}, hashErr
+		}
+		ready.NormalizedContentHash = hash
+		job.Attempt = boundedAttempt
+		_, _, err = d.commitSinglePracticeReadyItem(
+			ctx, job, request.SourceSession, request.Grade,
+			k12.PracticeSourceSingleVariant, ready,
+		)
+		if err != nil {
+			return SinglePracticeGenerationView{}, err
+		}
+		job, err = d.Records.GetPracticeGenerationJobByID(
 			ctx, agentName, job.GenerationJobID,
-			k12.PracticeGenerationCommitted, boundedAttempt, ready, "",
 		)
 		if err != nil {
 			return SinglePracticeGenerationView{}, err
@@ -800,9 +842,9 @@ func (d Deps) ProcessSinglePracticeGeneration(
 	if lastErr == nil {
 		lastErr = fmt.Errorf("%w: 逐题生成超过重试预算", ErrSolveFailed)
 	}
-	job, failErr := d.Records.AdvanceSinglePracticeGeneration(
+	job, failErr := d.Records.AdvancePracticeGenerationJob(
 		ctx, agentName, job.GenerationJobID,
-		k12.PracticeGenerationFailed, job.Attempt, k12.PracticeItem{}, lastErr.Error(),
+		k12.PracticeGenerationFailed, job.Attempt, lastErr.Error(),
 	)
 	if failErr != nil {
 		return SinglePracticeGenerationView{}, errors.Join(lastErr, failErr)
@@ -822,8 +864,9 @@ func (d Deps) RetrySinglePracticeGeneration(
 	if singlePracticeStateHidden(source) {
 		return d.singlePracticeView(ctx, source, fields, nil)
 	}
-	job, err := d.Records.GetLatestSinglePracticeGeneration(
-		ctx, source.AgentName, source.RecordID,
+	job, err := d.Records.GetLatestPracticeGenerationBySource(
+		ctx, source.AgentName, k12.PracticeGenerationSourceMistake,
+		source.RecordID, source.Version,
 	)
 	if err != nil {
 		return SinglePracticeGenerationView{}, err
@@ -849,9 +892,8 @@ func (d Deps) RetrySinglePracticeGeneration(
 			)
 		}
 	}
-	job, err = d.Records.AdvanceSinglePracticeGeneration(
+	job, err = d.Records.ReactivatePracticeGenerationJob(
 		ctx, source.AgentName, job.GenerationJobID,
-		k12.PracticeGenerationQueued, job.Attempt, k12.PracticeItem{}, "",
 	)
 	if err != nil {
 		return SinglePracticeGenerationView{}, err

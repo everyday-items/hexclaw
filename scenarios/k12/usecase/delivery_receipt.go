@@ -12,6 +12,7 @@ import (
 
 	"github.com/hexagon-codes/toolkit/util/idgen"
 
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
@@ -98,6 +99,19 @@ func deliveryDedupeKey(agentName, objectKind, objectID, bindingID, payloadDigest
 	return deliveryDigest(strings.Join([]string{agentName, objectKind, objectID, bindingID, payloadDigest}, "\x00"))
 }
 
+func deliveryPartDedupeKey(
+	agentName, objectKind, objectID, bindingID string,
+	partKind messagecontent.PartKind,
+	partMIME string,
+	partOrdinal int,
+	partDigest, payloadDigest string,
+) string {
+	return deliveryDigest(strings.Join([]string{
+		agentName, objectKind, objectID, bindingID,
+		string(partKind), partMIME, fmt.Sprintf("%d", partOrdinal), partDigest, payloadDigest,
+	}, "\x00"))
+}
+
 func deliveryBatchDedupeKey(agentName, objectKind, objectID, contentDigest string) string {
 	return deliveryDigest(strings.Join([]string{agentName, objectKind, objectID, contentDigest}, "\x00"))
 }
@@ -145,16 +159,56 @@ func (d Deps) ReplayDeliveryBatchForMessageIdentity(
 	return d.sendDeliveryBatch(ctx, batch)
 }
 
+func normalizePreparedDelivery(prepared PreparedTextDelivery) PreparedTextDelivery {
+	prepared.BindingID = strings.TrimSpace(prepared.BindingID)
+	prepared.Target.Platform = strings.ToLower(strings.TrimSpace(prepared.Target.Platform))
+	prepared.Target.InstanceID = strings.TrimSpace(prepared.Target.InstanceID)
+	prepared.Target.ChatID = strings.TrimSpace(prepared.Target.ChatID)
+	prepared.Target.Label = strings.TrimSpace(prepared.Target.Label)
+	if prepared.PartKind == "" {
+		prepared.PartKind = messagecontent.PartMarkdown
+	}
+	prepared.PartMIME = strings.ToLower(strings.TrimSpace(prepared.PartMIME))
+	if prepared.PartOrdinal == 0 {
+		prepared.PartOrdinal = 1
+	}
+	prepared.PartDigest = strings.ToLower(strings.TrimSpace(prepared.PartDigest))
+	prepared.PayloadJSON = strings.TrimSpace(prepared.PayloadJSON)
+	prepared.RenderJSON = strings.TrimSpace(prepared.RenderJSON)
+	return prepared
+}
+
+func validDeliveryDigest(value string) bool {
+	raw, ok := strings.CutPrefix(value, "sha256:")
+	decoded, err := hex.DecodeString(raw)
+	return ok && err == nil && len(decoded) == sha256.Size
+}
+
 func validatePreparedDelivery(prepared PreparedTextDelivery) error {
-	if strings.TrimSpace(prepared.BindingID) == "" || strings.TrimSpace(prepared.Target.Platform) == "" ||
-		strings.TrimSpace(prepared.Target.ChatID) == "" || strings.TrimSpace(prepared.PayloadJSON) == "" {
-		return fmt.Errorf("%w: 投递目标或冻结载荷不完整", ErrInvalidInput)
+	if prepared.BindingID == "" || prepared.Target.Platform == "" ||
+		prepared.Target.ChatID == "" || prepared.PayloadJSON == "" {
+		return fmt.Errorf("%w: prepared delivery target or payload is incomplete", ErrInvalidInput)
+	}
+	if prepared.PartOrdinal < 1 || !validDeliveryDigest(prepared.PartDigest) {
+		return fmt.Errorf("%w: prepared delivery part identity is incomplete", ErrInvalidInput)
+	}
+	switch prepared.PartKind {
+	case messagecontent.PartMarkdown:
+		if prepared.PartMIME != "" {
+			return fmt.Errorf("%w: markdown delivery part cannot declare MIME", ErrInvalidInput)
+		}
+	case messagecontent.PartArtifact:
+		if !strings.HasPrefix(prepared.PartMIME, "image/") && prepared.PartMIME != "application/pdf" {
+			return fmt.Errorf("%w: unsupported delivery artifact MIME %q", ErrInvalidInput, prepared.PartMIME)
+		}
+	default:
+		return fmt.Errorf("%w: unsupported delivery part kind %q", ErrInvalidInput, prepared.PartKind)
 	}
 	if !json.Valid([]byte(prepared.PayloadJSON)) {
-		return fmt.Errorf("%w: 冻结投递载荷不是 JSON", ErrInvalidInput)
+		return fmt.Errorf("%w: prepared delivery payload is not JSON", ErrInvalidInput)
 	}
 	if prepared.RenderJSON != "" && !json.Valid([]byte(prepared.RenderJSON)) {
-		return fmt.Errorf("%w: 冻结渲染证据不是 JSON", ErrInvalidInput)
+		return fmt.Errorf("%w: prepared delivery render evidence is not JSON", ErrInvalidInput)
 	}
 	return nil
 }
@@ -231,7 +285,12 @@ func (d Deps) prepareTextForResolvedTargets(
 			ErrInvalidInput, len(prepared), len(targets),
 		)
 	}
+	partDigest := deliveryDigest(strings.TrimSpace(content))
 	for i := range prepared {
+		prepared[i] = normalizePreparedDelivery(prepared[i])
+		if prepared[i].PartDigest == "" {
+			prepared[i].PartDigest = partDigest
+		}
 		if err := validatePreparedDelivery(prepared[i]); err != nil {
 			return nil, fmt.Errorf("prepared delivery %d: %w", i+1, err)
 		}
@@ -241,6 +300,10 @@ func (d Deps) prepareTextForResolvedTargets(
 				"%w: prepared delivery %d changed its resolved binding target",
 				ErrInvalidInput, i+1,
 			)
+		}
+		if prepared[i].PartKind != messagecontent.PartMarkdown || prepared[i].PartMIME != "" ||
+			prepared[i].PartOrdinal != 1 || prepared[i].PartDigest != partDigest {
+			return nil, fmt.Errorf("%w: prepared text delivery changed its canonical part identity", ErrInvalidInput)
 		}
 	}
 	return prepared, nil
@@ -259,20 +322,40 @@ func (d Deps) prepareMessageForResolvedTargets(
 	if err != nil {
 		return nil, err
 	}
-	if len(prepared) != len(targets) {
+	partsPerTarget := len(message.Attachments) + 1
+	if len(prepared) != len(targets)*partsPerTarget {
 		return nil, fmt.Errorf(
-			"%w: prepared deliveries=%d resolved targets=%d",
-			ErrInvalidInput, len(prepared), len(targets),
+			"%w: prepared deliveries=%d resolved target-parts=%d",
+			ErrInvalidInput, len(prepared), len(targets)*partsPerTarget,
 		)
 	}
 	for i := range prepared {
+		prepared[i] = normalizePreparedDelivery(prepared[i])
+		targetIndex := i / partsPerTarget
+		partIndex := i % partsPerTarget
+		expectedKind := messagecontent.PartMarkdown
+		expectedMIME := ""
+		expectedDigest := deliveryDigest(message.Content)
+		if partIndex > 0 {
+			attachment := message.Attachments[partIndex-1]
+			expectedKind = messagecontent.PartArtifact
+			expectedMIME = attachment.MIME
+			expectedDigest = deliveryDigest(string(attachment.Data))
+		}
 		if err := validatePreparedDelivery(prepared[i]); err != nil {
 			return nil, fmt.Errorf("prepared delivery %d: %w", i+1, err)
 		}
-		if prepared[i].BindingID != targets[i].BindingID ||
-			prepared[i].Target != targets[i].Target {
+		if prepared[i].BindingID != targets[targetIndex].BindingID ||
+			prepared[i].Target != targets[targetIndex].Target {
 			return nil, fmt.Errorf(
 				"%w: prepared delivery %d changed its resolved binding target",
+				ErrInvalidInput, i+1,
+			)
+		}
+		if prepared[i].PartKind != expectedKind || prepared[i].PartMIME != expectedMIME ||
+			prepared[i].PartOrdinal != partIndex+1 || prepared[i].PartDigest != expectedDigest {
+			return nil, fmt.Errorf(
+				"%w: prepared delivery %d changed its canonical part identity",
 				ErrInvalidInput, i+1,
 			)
 		}
@@ -295,8 +378,15 @@ func (d Deps) resolveAndPrepareTextBatch(
 	if err != nil {
 		return nil, err
 	}
+	prepared = normalizePreparedDelivery(prepared)
+	if prepared.PartDigest == "" {
+		prepared.PartDigest = deliveryDigest(strings.TrimSpace(content))
+	}
 	if err := validatePreparedDelivery(prepared); err != nil {
 		return nil, err
+	}
+	if prepared.PartKind != messagecontent.PartMarkdown || prepared.PartMIME != "" || prepared.PartOrdinal != 1 {
+		return nil, fmt.Errorf("%w: prepared text delivery changed its canonical part identity", ErrInvalidInput)
 	}
 	return []PreparedTextDelivery{prepared}, nil
 }
@@ -336,6 +426,17 @@ func (d Deps) PrepareAndSendMessageBatch(
 	message DeliveryMessage,
 ) (k12.DeliveryBatch, bool, error) {
 	return d.prepareAndSendBatch(ctx, agentName, objectKind, objectID, message, nil)
+}
+
+// PrepareAndSendMessageBatchForTargets 使用调用方已经耐久冻结的私聊目标 exact-set。
+// 入站回复不得重新解析当前绑定，否则绑定变化会把结果发给不同的会话。
+func (d Deps) PrepareAndSendMessageBatchForTargets(
+	ctx context.Context,
+	agentName, objectKind, objectID string,
+	message DeliveryMessage,
+	targets []ResolvedDeliveryTarget,
+) (k12.DeliveryBatch, bool, error) {
+	return d.prepareAndSendBatch(ctx, agentName, objectKind, objectID, message, targets)
 }
 
 func (d Deps) prepareAndSendTextBatchWithTargets(
@@ -459,15 +560,22 @@ func (d Deps) buildPreparedMessageBatch(
 	for i, item := range prepared {
 		payloadDigest := deliveryDigest(item.PayloadJSON)
 		receipts = append(receipts, k12.DeliveryReceipt{
-			DeliveryID:    idgen.NanoID(),
-			BatchID:       batchID,
-			BatchOrdinal:  i + 1,
-			AgentName:     agentName,
-			ObjectKind:    objectKind,
-			ObjectID:      objectID,
-			BindingID:     item.BindingID,
-			Target:        item.Target,
-			DedupeKey:     deliveryDedupeKey(agentName, objectKind, objectID, item.BindingID, payloadDigest),
+			DeliveryID:   idgen.NanoID(),
+			BatchID:      batchID,
+			BatchOrdinal: i + 1,
+			PartKind:     item.PartKind,
+			PartMIME:     item.PartMIME,
+			PartOrdinal:  item.PartOrdinal,
+			PartDigest:   item.PartDigest,
+			AgentName:    agentName,
+			ObjectKind:   objectKind,
+			ObjectID:     objectID,
+			BindingID:    item.BindingID,
+			Target:       item.Target,
+			DedupeKey: deliveryPartDedupeKey(
+				agentName, objectKind, objectID, item.BindingID,
+				item.PartKind, item.PartMIME, item.PartOrdinal, item.PartDigest, payloadDigest,
+			),
 			PayloadDigest: payloadDigest,
 			PayloadJSON:   item.PayloadJSON,
 			RenderJSON:    item.RenderJSON,
@@ -484,6 +592,69 @@ func (d Deps) buildPreparedMessageBatch(
 	}, nil
 }
 
+// prepareDeliveryBatchResources 先准备并持久化全部媒体 part；只要仍有一个媒体
+// 资源缺失，整批可见消息发送次数必须保持为零。
+func (d Deps) prepareDeliveryBatchResources(
+	ctx context.Context,
+	batch k12.DeliveryBatch,
+) (k12.DeliveryBatch, error) {
+	hasArtifact := false
+	for _, receipt := range batch.Receipts {
+		if receipt.PartKind == messagecontent.PartArtifact {
+			hasArtifact = true
+			break
+		}
+	}
+	if !hasArtifact {
+		return batch, nil
+	}
+	preparer, canPrepare := d.Delivery.(DeliveryPartResourcePreparer)
+	persistCtx := context.WithoutCancel(ctx)
+	failures := make([]string, 0)
+	for _, receipt := range batch.Receipts {
+		if receipt.PartKind != messagecontent.PartArtifact || receipt.PreparedResourceID != "" {
+			continue
+		}
+		if receipt.Status != k12.DeliveryPending && receipt.Status != k12.DeliveryFailed {
+			failures = append(failures, fmt.Sprintf("part %d already crossed the send boundary", receipt.BatchOrdinal))
+			continue
+		}
+		if !canPrepare {
+			failures = append(failures, fmt.Sprintf("part %d media preparation is unavailable", receipt.BatchOrdinal))
+			continue
+		}
+		resourceID, err := preparer.PrepareDeliveryPartResource(ctx, receipt)
+		resourceID = strings.TrimSpace(resourceID)
+		if err != nil || resourceID == "" {
+			detail := "media preparation returned no resource id"
+			if err != nil {
+				detail = err.Error()
+			}
+			failures = append(failures, fmt.Sprintf("part %d: %s", receipt.BatchOrdinal, detail))
+			continue
+		}
+		if _, err := d.Records.SaveDeliveryPreparedResource(
+			persistCtx, receipt.AgentName, receipt.DeliveryID, resourceID,
+		); err != nil {
+			failures = append(failures, fmt.Sprintf("part %d: %s", receipt.BatchOrdinal, err))
+		}
+	}
+	detail := "delivery media preflight is incomplete"
+	if len(failures) > 0 {
+		detail += ": " + strings.Join(failures, "; ")
+	}
+	current, incomplete, err := d.Records.FailDeliveryBatchPreparationIfIncomplete(
+		persistCtx, batch.AgentName, batch.BatchID, detail,
+	)
+	if err != nil {
+		return current, err
+	}
+	if incomplete {
+		return current, errors.New(detail)
+	}
+	return current, nil
+}
+
 // sendDeliveryBatch starts only children that are durably pending. It is
 // intentionally separate from construction so callers cannot reach a provider
 // until their complete transaction has committed.
@@ -491,6 +662,11 @@ func (d Deps) sendDeliveryBatch(
 	ctx context.Context,
 	batch k12.DeliveryBatch,
 ) (k12.DeliveryBatch, error) {
+	var err error
+	batch, err = d.prepareDeliveryBatchResources(ctx, batch)
+	if err != nil {
+		return batch, err
+	}
 	for _, receipt := range batch.Receipts {
 		if receipt.Status != k12.DeliveryPending {
 			continue
@@ -505,7 +681,7 @@ func (d Deps) sendDeliveryBatch(
 			return current, err
 		}
 	}
-	batch, err := d.Records.GetDeliveryBatch(ctx, batch.AgentName, batch.BatchID)
+	batch, err = d.Records.GetDeliveryBatch(ctx, batch.AgentName, batch.BatchID)
 	return batch, err
 }
 
@@ -525,6 +701,10 @@ func (d Deps) RetryDeliveryBatch(ctx context.Context, agentName, batchID string)
 	batch, err := d.GetDeliveryBatch(ctx, agentName, batchID)
 	if err != nil {
 		return k12.DeliveryBatch{}, err
+	}
+	batch, err = d.prepareDeliveryBatchResources(ctx, batch)
+	if err != nil {
+		return batch, err
 	}
 	for _, receipt := range batch.Receipts {
 		if receipt.Status != k12.DeliveryFailed {
@@ -584,12 +764,23 @@ func (d Deps) PrepareAndSendText(ctx context.Context, agentName, objectKind, obj
 	if err != nil {
 		return k12.DeliveryReceipt{}, false, err
 	}
+	prepared = normalizePreparedDelivery(prepared)
+	if prepared.PartDigest == "" {
+		prepared.PartDigest = deliveryDigest(content)
+	}
 	if err := validatePreparedDelivery(prepared); err != nil {
 		return k12.DeliveryReceipt{}, false, err
+	}
+	if prepared.PartKind != messagecontent.PartMarkdown || prepared.PartMIME != "" || prepared.PartOrdinal != 1 {
+		return k12.DeliveryReceipt{}, false, fmt.Errorf("%w: prepared text delivery changed its canonical part identity", ErrInvalidInput)
 	}
 	payloadDigest := deliveryDigest(prepared.PayloadJSON)
 	receipt, created, err := d.Records.PrepareDeliveryReceipt(ctx, k12.DeliveryReceipt{
 		DeliveryID:    idgen.NanoID(),
+		PartKind:      prepared.PartKind,
+		PartMIME:      prepared.PartMIME,
+		PartOrdinal:   prepared.PartOrdinal,
+		PartDigest:    prepared.PartDigest,
 		AgentName:     agentName,
 		ObjectKind:    objectKind,
 		ObjectID:      objectID,
@@ -628,10 +819,25 @@ func (d Deps) RetryDeliveryReceipt(ctx context.Context, agentName, deliveryID st
 	if receipt.Status != k12.DeliveryFailed {
 		return receipt, fmt.Errorf("%w: 只有明确失败的消息可以重试；当前状态 %s 请查询结果", records.ErrIllegalTransition, receipt.Status)
 	}
+	if receipt.BatchID != "" {
+		batch, retryErr := d.RetryDeliveryBatch(ctx, receipt.AgentName, receipt.BatchID)
+		if retryErr != nil {
+			return receipt, retryErr
+		}
+		for _, child := range batch.Receipts {
+			if child.DeliveryID == receipt.DeliveryID {
+				return child, nil
+			}
+		}
+		return receipt, records.ErrNotFound
+	}
 	return d.sendPreparedDelivery(ctx, receipt)
 }
 
 func (d Deps) sendPreparedDelivery(ctx context.Context, receipt k12.DeliveryReceipt) (k12.DeliveryReceipt, error) {
+	if receipt.PartKind == messagecontent.PartArtifact && strings.TrimSpace(receipt.PreparedResourceID) == "" {
+		return receipt, fmt.Errorf("%w: artifact part has no prepared provider resource", records.ErrIllegalTransition)
+	}
 	started, began, err := d.Records.BeginDeliveryAttempt(ctx, receipt.AgentName, receipt.DeliveryID)
 	if err != nil {
 		return receipt, err
@@ -752,6 +958,13 @@ func (d Deps) RecoverDeliveryReceipts(ctx context.Context, agentName string) (in
 	if err != nil {
 		return 0, err
 	}
+	pendingBatchCounts := make(map[string]int)
+	for _, receipt := range receipts {
+		if receipt.Status == k12.DeliveryPending && receipt.BatchID != "" {
+			pendingBatchCounts[receipt.BatchID]++
+		}
+	}
+	handledPendingBatches := make(map[string]struct{}, len(pendingBatchCounts))
 	processed := 0
 	for _, receipt := range receipts {
 		select {
@@ -761,7 +974,23 @@ func (d Deps) RecoverDeliveryReceipts(ctx context.Context, agentName string) (in
 		}
 		switch receipt.Status {
 		case k12.DeliveryPending:
-			_, err = d.sendPreparedDelivery(ctx, receipt)
+			if receipt.BatchID == "" {
+				_, err = d.sendPreparedDelivery(ctx, receipt)
+				break
+			}
+			if _, handled := handledPendingBatches[receipt.BatchID]; handled {
+				continue
+			}
+			batch, getErr := d.Records.GetDeliveryBatch(ctx, receipt.AgentName, receipt.BatchID)
+			if getErr != nil {
+				return processed, getErr
+			}
+			_, err = d.sendDeliveryBatch(ctx, batch)
+			if err == nil {
+				handledPendingBatches[receipt.BatchID] = struct{}{}
+				processed += pendingBatchCounts[receipt.BatchID]
+				continue
+			}
 		case k12.DeliverySending:
 			if receipt.ExternalMessageID == "" {
 				_, err = d.Records.MarkDeliveryOutcomeUnknown(ctx, receipt.AgentName, receipt.DeliveryID,

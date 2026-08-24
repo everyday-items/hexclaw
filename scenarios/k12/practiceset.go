@@ -227,6 +227,9 @@ type PracticeGenerationJob struct {
 	IdempotencyKey    string   `json:"idempotency_key"`
 	RequestDigest     string   `json:"request_digest"`
 	Scope             string   `json:"scope"`
+	SourceKind        string   `json:"source_kind,omitempty"`
+	SourceID          string   `json:"source_id,omitempty"`
+	SourceVersion     int      `json:"source_version,omitempty"`
 	VariantsPerSource int      `json:"variants_per_source"`
 	Difficulty        string   `json:"difficulty"`
 	Total             string   `json:"total"`
@@ -250,6 +253,11 @@ type PracticeGenerationJob struct {
 	CreatedAt         int64    `json:"created_at"`
 	UpdatedAt         int64    `json:"updated_at"`
 }
+
+const (
+	PracticeGenerationSourceMistake      = "mistake"
+	PracticeGenerationSourceAccumulation = "accumulation"
+)
 
 const (
 	PracticeGenerationQueued     = "queued"

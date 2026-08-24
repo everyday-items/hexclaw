@@ -2,7 +2,10 @@ package usecase
 
 import (
 	"context"
+	"fmt"
 	"strings"
+
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
 // ImageTaskHomeworkProjection is an owner-scoped, read-only projection. It
@@ -59,6 +62,41 @@ func (o *GradingOrchestrator) ImageTaskHomeworkProjection(
 	if err != nil {
 		return ImageTaskHomeworkProjection{}, err
 	}
+	groundingReceipts := []GroundingEvidenceReceipt{}
+	if artifact := durableProjection.FinalArtifact; artifact != nil &&
+		strings.TrimSpace(artifact.SummaryInvocationID) != "" {
+		invocation, invocationErr := o.deps.Records.GetModelInvocation(
+			ctx, agentName, artifact.SummaryInvocationID,
+		)
+		if invocationErr != nil {
+			return ImageTaskHomeworkProjection{}, invocationErr
+		}
+		if invocation.JobID != job.Record.RecordID ||
+			invocation.Stage != k12.GradingStageProjecting ||
+			invocation.Status != k12.ModelInvocationSucceeded {
+			return ImageTaskHomeworkProjection{}, fmt.Errorf(
+				"usecase: final artifact grounding invocation is not the linked success",
+			)
+		}
+		tips, recoveryErr := recoverFinalTutoringTips(job, invocation)
+		if recoveryErr != nil {
+			return ImageTaskHomeworkProjection{}, recoveryErr
+		}
+		groundingReceipts = cloneGroundingEvidenceReceipts(
+			tips.GroundingEvidenceReceipts,
+		)
+	}
+	problemGroundingReceipts, err := o.projectProblemGroundingReceipts(
+		ctx,
+		agentName,
+		jobID,
+		questions,
+		job.Record.Status == k12.GradingStageCompleted,
+		len(groundingReceipts) > 0,
+	)
+	if err != nil {
+		return ImageTaskHomeworkProjection{}, err
+	}
 	return ImageTaskHomeworkProjection{
 		Stage: job.Record.Status, Retryable: job.Fields.Retryable,
 		ConfirmationState: job.Fields.ConfirmationState,
@@ -68,7 +106,9 @@ func (o *GradingOrchestrator) ImageTaskHomeworkProjection(
 		Progressive: imageTaskProgressiveSnapshotFromStorage(
 			durableProjection.ProgressiveSnapshot,
 		),
-		FinalArtifact: durableProjection.FinalArtifact,
+		FinalArtifact:             durableProjection.FinalArtifact,
+		GroundingEvidenceReceipts: groundingReceipts,
+		ProblemGroundingReceipts:  problemGroundingReceipts,
 	}, nil
 }
 

@@ -176,6 +176,12 @@ func TestCurrentDictationReturnsDurableGenerationAndListDetailShareIt(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	generation, _, _, err = d.ProcessAccumulationPracticeGeneration(
+		context.Background(), "xiaoming", generation.GenerationID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if generation.Status != k12.DictationCommitted ||
 		generation.GenerationID == "" || generation.PracticeItemID == "" {
 		t.Fatalf("generation not committed: %+v", generation)

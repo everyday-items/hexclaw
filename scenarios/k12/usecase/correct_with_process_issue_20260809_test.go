@@ -140,11 +140,16 @@ func TestREGK12CorrectWithProcessIssue20260809001DurableProjectionHasOneStatus(t
 			},
 		}}, nil)
 		for _, want := range []string{
-			"⚠ Process issue", "not recorded as wrong", "**Process note:** 300÷2÷2=50",
-			"**Cause:** 连续除法计算错误", "### How the parent can explain it",
+			"⚠ 过程问题（最终答案正确，不记为错题）", "**错误步骤：** 300÷2÷2=50",
+			"**原因：** 连续除法计算错误", "### 家长怎么讲",
 		} {
 			if !strings.Contains(final, want) {
 				t.Fatalf("final artifact/DingTalk source lacks %q:\n%s", want, final)
+			}
+		}
+		for _, forbidden := range []string{"correct_with_process_issue", "```json", "Grading status"} {
+			if strings.Contains(final, forbidden) {
+				t.Fatalf("final artifact/DingTalk source leaked %q:\n%s", forbidden, final)
 			}
 		}
 	})
@@ -165,12 +170,15 @@ func TestREGK12CorrectWithProcessIssue20260809001DurableProjectionHasOneStatus(t
 		}
 		final := renderCanonicalGradingFinal(entries, nil)
 		for _, want := range []string{
-			"14 correct / 2 with process issues / 0 requiring correction",
-			"A process issue has a correct final answer and is not recorded as wrong",
+			"14 道正确 / 2 道过程问题",
+			"过程问题表示最终答案正确，但书写过程需要核对，不记为错题",
 		} {
 			if !strings.Contains(final, want) {
 				t.Fatalf("final artifact/DingTalk summary lacks %q:\n%s", want, final)
 			}
+		}
+		if strings.Contains(final, "2 道错题") {
+			t.Fatalf("final artifact/DingTalk summary counted process issues as wrong:\n%s", final)
 		}
 	})
 }

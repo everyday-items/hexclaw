@@ -11,14 +11,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/channel"
 	"github.com/hexagon-codes/hexclaw/cron"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
@@ -28,6 +33,8 @@ import (
 type recordChannel struct {
 	name       string
 	sent       []recordedSend
+	prepared   []channel.DeliveryPart
+	sentParts  []channel.DeliveryPart
 	fail       error
 	sendAck    channel.DeliveryAck
 	queryAck   channel.DeliveryAck
@@ -73,6 +80,38 @@ func (c *recordChannel) QueryReceipt(_ context.Context, to channel.Target, exter
 	}
 	if ack.ExternalMessageID == "" {
 		ack.ExternalMessageID = externalMessageID
+	}
+	ack.Target = to
+	return ack, nil
+}
+
+func (c *recordChannel) PrepareDeliveryPartResource(
+	_ context.Context,
+	_ channel.Target,
+	part channel.DeliveryPart,
+) (string, error) {
+	if c.fail != nil {
+		return "", c.fail
+	}
+	c.prepared = append(c.prepared, part)
+	return "@media-part-" + strconv.Itoa(part.Ordinal), nil
+}
+
+func (c *recordChannel) SendPreparedPartWithReceipt(
+	_ context.Context,
+	to channel.Target,
+	part channel.DeliveryPart,
+) (channel.DeliveryAck, error) {
+	if c.fail != nil {
+		return channel.DeliveryAck{Status: channel.DeliveryFailed, Target: to}, c.fail
+	}
+	c.sentParts = append(c.sentParts, part)
+	ack := c.sendAck
+	if ack.Status == "" {
+		ack = channel.DeliveryAck{
+			ExternalMessageID: fmt.Sprintf("part:%s:%d", to.ChatID, part.Ordinal),
+			Status:            channel.DeliveryAccepted,
+		}
 	}
 	ack.Target = to
 	return ack, nil
@@ -208,7 +247,9 @@ func TestK12IMDelivererFreezesReceiptPayloadBeforeProviderSend(t *testing.T) {
 	}
 	receipt := k12.DeliveryReceipt{
 		DeliveryID: "delivery-24", AgentName: "child-a", BindingID: prepared.BindingID,
-		Target: prepared.Target, PayloadJSON: prepared.PayloadJSON, RenderJSON: prepared.RenderJSON,
+		Target: prepared.Target, PartKind: prepared.PartKind, PartMIME: prepared.PartMIME,
+		PartOrdinal: prepared.PartOrdinal, PartDigest: prepared.PartDigest,
+		PayloadJSON: prepared.PayloadJSON, RenderJSON: prepared.RenderJSON,
 		PayloadDigest: deliveryPayloadDigest(prepared.PayloadJSON), Status: k12.DeliverySending,
 	}
 	ack, err := d.SendPrepared(context.Background(), receipt)
@@ -218,17 +259,17 @@ func TestK12IMDelivererFreezesReceiptPayloadBeforeProviderSend(t *testing.T) {
 	if ack.Status != k12.DeliverySending || ack.ExternalMessageID != "pqk-24" {
 		t.Fatalf("provider acceptance must map to domain sending: %+v", ack)
 	}
-	if len(ding.sent) != 1 || !strings.Contains(ding.sent[0].text, "x²") ||
-		!strings.Contains(ding.sent[0].text, "12 cm") ||
-		strings.Contains(ding.sent[0].text, "\\,") ||
-		strings.Contains(ding.sent[0].text, "\\mathrm") {
-		t.Fatalf("send must reuse frozen readable projection exactly once: %+v", ding.sent)
+	if len(ding.sent) != 0 || len(ding.sentParts) != 1 || !strings.Contains(ding.sentParts[0].Text, "x²") ||
+		!strings.Contains(ding.sentParts[0].Text, "12 cm") ||
+		strings.Contains(ding.sentParts[0].Text, "\\,") ||
+		strings.Contains(ding.sentParts[0].Text, "\\mathrm") {
+		t.Fatalf("send must reuse one frozen readable part exactly once: %+v", ding.sentParts)
 	}
 	tampered := receipt
 	tampered.BindingID = "agent-rule:rebound"
 	badAck, badErr := d.SendPrepared(context.Background(), tampered)
-	if badErr == nil || badAck.Status != k12.DeliveryFailed || len(ding.sent) != 1 {
-		t.Fatalf("stale/rebound receipt must fail before send: ack=%+v sends=%d err=%v", badAck, len(ding.sent), badErr)
+	if badErr == nil || badAck.Status != k12.DeliveryFailed || len(ding.sentParts) != 1 {
+		t.Fatalf("stale/rebound receipt must fail before send: ack=%+v sends=%d err=%v", badAck, len(ding.sentParts), badErr)
 	}
 
 	ding.queryAck = channel.DeliveryAck{Status: channel.DeliveryDelivered}
@@ -237,6 +278,71 @@ func TestK12IMDelivererFreezesReceiptPayloadBeforeProviderSend(t *testing.T) {
 	})
 	if err != nil || queried.Status != k12.DeliveryDelivered || queried.ExternalMessageID != "pqk-24" || ding.queryCalls != 1 {
 		t.Fatalf("query must preserve provider evidence: ack=%+v calls=%d err=%v", queried, ding.queryCalls, err)
+	}
+}
+
+func TestK12IMDelivererMigratedWholeMessageReceiptSendsCanonicalMarkdownPart(t *testing.T) {
+	d, dispatcher, reg := newDelivererFixture(t)
+	ding := &recordChannel{name: "dingtalk"}
+	reg.Register(ding)
+	bindRule(t, dispatcher, "dingtalk", "bot-1", "mom-chat", "child-a")
+	d.MarkReady()
+
+	targets, err := d.ResolveTextTargets(context.Background(), "child-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyMessage, err := channel.NewCanonicalMarkdownMessageWithAttachments(
+		messagecontent.ProducerK12,
+		"zh-CN",
+		"## 旧版辅导内容\n\n请复习 **两位数加法**。",
+		"## 旧版辅导内容\n\n请复习 **两位数加法**。",
+		"",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts, err := legacyMessage.DeliveryParts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyPayload, err := json.Marshal(legacyMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRender, err := json.Marshal(legacyMessage.RenderManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := k12.DeliveryReceipt{
+		DeliveryID: "delivery-v84", AgentName: "child-a", BindingID: targets[0].BindingID,
+		Target: targets[0].Target, Status: k12.DeliverySending,
+		PartKind: parts[0].Kind, PartMIME: parts[0].MIME,
+		PartOrdinal: parts[0].Ordinal, PartDigest: parts[0].Digest,
+		PayloadDigest: deliveryPayloadDigest(string(legacyPayload)),
+		PayloadJSON:   string(legacyPayload), RenderJSON: string(legacyRender),
+	}
+
+	ack, err := d.SendPrepared(context.Background(), receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack.Status != k12.DeliverySending || len(ding.sentParts) != 1 || len(ding.sent) != 0 {
+		t.Fatalf("migrated whole-message receipt must send exactly one canonical part: ack=%+v parts=%d legacy=%d",
+			ack, len(ding.sentParts), len(ding.sent))
+	}
+	if got := ding.sentParts[0]; got.Kind != parts[0].Kind || got.Ordinal != 1 ||
+		got.Digest != parts[0].Digest || got.Text != parts[0].Text {
+		t.Fatalf("migrated canonical Markdown part changed: got=%+v want=%+v", got, parts[0])
+	}
+
+	tampered := receipt
+	tampered.PartDigest = tampered.PayloadDigest
+	badAck, badErr := d.SendPrepared(context.Background(), tampered)
+	if badErr == nil || badAck.Status != k12.DeliveryFailed || len(ding.sentParts) != 1 {
+		t.Fatalf("whole-message digest must fail before provider send: ack=%+v sends=%d err=%v",
+			badAck, len(ding.sentParts), badErr)
 	}
 }
 
@@ -260,37 +366,37 @@ func TestK12IMDelivererCreativeImageBridgePreservesMarkdownAndBytes(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(prepared) != 1 {
-		t.Fatalf("应只冻结一个物理投递目标，got %d", len(prepared))
+	if len(prepared) != 2 {
+		t.Fatalf("一个物理目标的 Markdown 与图片必须冻结两个 part，got %d", len(prepared))
 	}
 
-	var message channel.Message
-	if err := json.Unmarshal([]byte(prepared[0].PayloadJSON), &message); err != nil {
+	var markdownPart, imagePart channel.DeliveryPart
+	if err := json.Unmarshal([]byte(prepared[0].PayloadJSON), &markdownPart); err != nil {
 		t.Fatal(err)
 	}
-	if message.Text != canonical || message.Content == nil || message.Content.Markdown != canonical {
-		t.Fatalf("创作作品 Markdown 必须完整穿过冻结载荷: %#v", message.Content)
+	if err := json.Unmarshal([]byte(prepared[1].PayloadJSON), &imagePart); err != nil {
+		t.Fatal(err)
 	}
-	if message.RenderManifest == nil || !message.RenderManifest.CapabilitySnapshot.Markdown ||
-		!message.RenderManifest.CapabilitySnapshot.Attachments {
-		t.Fatalf("冻结载荷必须声明 Markdown 与附件能力: %#v", message.RenderManifest)
+	if markdownPart.Text != canonical || markdownPart.MessageContent == nil || markdownPart.MessageContent.Markdown != canonical {
+		t.Fatalf("创作作品 Markdown 必须完整穿过冻结载荷: %#v", markdownPart.MessageContent)
 	}
-	if len(message.Attachments) != 1 || message.Attachments[0].Name != "美术作品.png" ||
-		message.Attachments[0].MIME != "image/png" || !bytes.Equal(message.Attachments[0].Data, imageBytes) {
-		t.Fatalf("冻结载荷必须保留图片名称、MIME 与原始字节: %#v", message.Attachments)
+	if imagePart.RenderManifest == nil || !imagePart.RenderManifest.CapabilitySnapshot.Markdown ||
+		!imagePart.RenderManifest.CapabilitySnapshot.Attachments {
+		t.Fatalf("冻结载荷必须声明 Markdown 与附件能力: %#v", imagePart.RenderManifest)
+	}
+	if imagePart.Attachment == nil || imagePart.Attachment.Name != "美术作品.png" ||
+		imagePart.Attachment.MIME != "image/png" || !bytes.Equal(imagePart.Attachment.Data, imageBytes) {
+		t.Fatalf("冻结载荷必须保留单一图片名称、MIME 与原始字节: %#v", imagePart.Attachment)
 	}
 
-	reply := adapterReplyFromChannelMessage(message)
-	if reply == nil || reply.Content != canonical || reply.MessageContent == nil ||
-		reply.MessageContent.Markdown != canonical || reply.RenderManifest == nil {
-		t.Fatalf("adapter bridge 必须保留 Markdown 与渲染证据: %#v", reply)
+	adapterPart := adapterDeliveryPartFromChannelPart(imagePart)
+	if adapterPart.Text != "" || adapterPart.MessageContent == nil || adapterPart.RenderManifest == nil ||
+		adapterPart.Attachment == nil || adapterPart.Attachment.Type != "image" ||
+		adapterPart.Attachment.Name != "美术作品.png" || adapterPart.Attachment.Mime != "image/png" ||
+		adapterPart.Attachment.URL != "" {
+		t.Fatalf("adapter bridge 必须只生成当前图片 part: %#v", adapterPart)
 	}
-	if len(reply.Attachments) != 1 || reply.Attachments[0].Type != "image" ||
-		reply.Attachments[0].Name != "美术作品.png" || reply.Attachments[0].Mime != "image/png" ||
-		reply.Attachments[0].URL != "" {
-		t.Fatalf("adapter bridge 必须生成单一内联图片附件: %#v", reply.Attachments)
-	}
-	decoded, err := base64.StdEncoding.DecodeString(reply.Attachments[0].Data)
+	decoded, err := base64.StdEncoding.DecodeString(adapterPart.Attachment.Data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,15 +408,191 @@ func TestK12IMDelivererCreativeImageBridgePreservesMarkdownAndBytes(t *testing.T
 		name  string
 		value string
 	}{
-		{name: "冻结载荷", value: prepared[0].PayloadJSON},
-		{name: "通道正文", value: message.Text},
-		{name: "adapter 正文", value: reply.Content},
-		{name: "adapter 附件 URL", value: reply.Attachments[0].URL},
+		{name: "冻结载荷", value: prepared[1].PayloadJSON},
+		{name: "通道正文", value: markdownPart.Text},
+		{name: "adapter 正文", value: adapterPart.Text},
+		{name: "adapter 附件 URL", value: adapterPart.Attachment.URL},
 	} {
 		for _, forbidden := range []string{"asset://", "file://", "/Users/", `C:\\`} {
 			if strings.Contains(candidate.value, forbidden) {
 				t.Fatalf("%s 不得暴露 asset URI 或本地路径 %q: %q", candidate.name, forbidden, candidate.value)
 			}
+		}
+	}
+}
+
+func TestK12IMDelivererPDFBridgePreservesCanonicalArtifact(t *testing.T) {
+	d := &k12IMDeliverer{}
+	canonical := "## 本周练习卷\n\n请完成后拍照提交。"
+	pdfBytes := []byte("%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF\n")
+	prepared, err := d.PrepareMessageForTargets(context.Background(), k12usecase.DeliveryMessage{
+		Content: canonical,
+		Attachments: []k12usecase.DeliveryAttachment{{
+			Name: "本周练习卷.pdf",
+			MIME: "application/pdf",
+			Data: pdfBytes,
+		}},
+	}, []k12usecase.ResolvedDeliveryTarget{{
+		BindingID: "agent-rule:weekly-pdf",
+		Target: k12.DeliveryTarget{
+			Platform: "dingtalk", InstanceID: "bot-1", ChatID: "parent-1",
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared) != 2 {
+		t.Fatalf("一个物理目标的 Markdown 与 PDF 必须冻结两个 part，got %d", len(prepared))
+	}
+
+	var pdfPart channel.DeliveryPart
+	if err := json.Unmarshal([]byte(prepared[1].PayloadJSON), &pdfPart); err != nil {
+		t.Fatal(err)
+	}
+	if pdfPart.MessageContent == nil || pdfPart.RenderManifest == nil || len(pdfPart.MessageContent.Attachments) != 1 ||
+		len(pdfPart.RenderManifest.Parts) != 2 || pdfPart.Attachment == nil {
+		t.Fatalf("PDF canonical/manifest 证据不完整: part=%#v", pdfPart)
+	}
+	sum := sha256.Sum256(pdfBytes)
+	wantDigest := "sha256:" + hex.EncodeToString(sum[:])
+	ref := pdfPart.MessageContent.Attachments[0]
+	artifact := pdfPart.RenderManifest.Parts[1]
+	if ref.Name != "本周练习卷.pdf" || ref.MIME != "application/pdf" || ref.Digest != wantDigest ||
+		artifact.Kind != messagecontent.PartArtifact || artifact.ArtifactRef != ref.AssetID ||
+		artifact.ArtifactDigest != wantDigest {
+		t.Fatalf("PDF PartArtifact 与冻结 bytes/MIME 不一致: ref=%#v artifact=%#v", ref, artifact)
+	}
+
+	adapterPart := adapterDeliveryPartFromChannelPart(pdfPart)
+	if adapterPart.Text != "" || adapterPart.MessageContent == nil || adapterPart.RenderManifest == nil ||
+		adapterPart.Attachment == nil {
+		t.Fatalf("PDF adapter bridge 丢失 canonical 证据: %#v", adapterPart)
+	}
+	attachment := *adapterPart.Attachment
+	if attachment.Type != "file" || attachment.Name != "本周练习卷.pdf" ||
+		attachment.Mime != "application/pdf" || attachment.URL != "" {
+		t.Fatalf("PDF adapter bridge 必须生成内联 file 附件: %#v", attachment)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(attachment.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded, pdfBytes) {
+		t.Fatalf("PDF adapter bridge bytes 发生变化: got %x want %x", decoded, pdfBytes)
+	}
+}
+
+func TestK12IMDelivererRejectsUnsafeAttachmentsBeforeFreezingTargets(t *testing.T) {
+	tests := []struct {
+		name       string
+		attachment k12usecase.DeliveryAttachment
+	}{
+		{name: "URL", attachment: k12usecase.DeliveryAttachment{Name: "https://internal.invalid/work.png", MIME: "image/png", Data: []byte("image")}},
+		{name: "POSIX path", attachment: k12usecase.DeliveryAttachment{Name: "/Users/private/work.png", MIME: "image/png", Data: []byte("image")}},
+		{name: "Windows path", attachment: k12usecase.DeliveryAttachment{Name: `C:\Users\private\work.png`, MIME: "image/png", Data: []byte("image")}},
+		{name: "unsupported MIME", attachment: k12usecase.DeliveryAttachment{Name: "archive.zip", MIME: "application/zip", Data: []byte("archive")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &k12IMDeliverer{}
+			prepared, err := d.PrepareMessageForTargets(context.Background(), k12usecase.DeliveryMessage{
+				Content:     "## 学习资料",
+				Attachments: []k12usecase.DeliveryAttachment{tt.attachment},
+			}, []k12usecase.ResolvedDeliveryTarget{{
+				BindingID: "agent-rule:unsafe-attachment",
+				Target: k12.DeliveryTarget{
+					Platform: "dingtalk", InstanceID: "bot-1", ChatID: "parent-1",
+				},
+			}})
+			if err == nil {
+				t.Fatalf("不安全附件必须在冻结前失败: %#v", prepared)
+			}
+			if len(prepared) != 0 {
+				t.Fatalf("冻结失败不得返回任何可发送载荷: %#v", prepared)
+			}
+		})
+	}
+}
+
+func TestK12IMDelivererFreezesAndSendsTargetByPartWithoutWholeMessageReplay(t *testing.T) {
+	d, dispatcher, reg := newDelivererFixture(t)
+	ding := &recordChannel{name: "dingtalk"}
+	reg.Register(ding)
+	bindRule(t, dispatcher, "dingtalk", "bot-1", "parent-1", "child-a")
+	bindRule(t, dispatcher, "dingtalk", "bot-2", "parent-2", "child-a")
+	d.MarkReady()
+
+	targets, err := d.ResolveTextTargets(context.Background(), "child-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := d.PrepareMessageForTargets(
+		context.Background(),
+		k12usecase.DeliveryMessage{
+			Content: "## 本周练习\n\n请完成后订正。",
+			Attachments: []k12usecase.DeliveryAttachment{
+				{Name: "page.png", MIME: "image/png", Data: []byte("image-bytes")},
+				{Name: "practice.pdf", MIME: "application/pdf", Data: []byte("%PDF-1.7\n%%EOF\n")},
+			},
+		},
+		targets,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared) != 6 {
+		t.Fatalf("2 targets × 3 parts must freeze six payloads, got %d", len(prepared))
+	}
+	wantMIME := []string{"", "image/png", "application/pdf", "", "image/png", "application/pdf"}
+	for i, item := range prepared {
+		var part channel.DeliveryPart
+		if err := json.Unmarshal([]byte(item.PayloadJSON), &part); err != nil {
+			t.Fatalf("decode part %d: %v", i, err)
+		}
+		if err := part.Validate(); err != nil {
+			t.Fatalf("validate part %d: %v", i, err)
+		}
+		if part.Ordinal != i%3+1 || part.MIME != wantMIME[i] || item.PartOrdinal != part.Ordinal ||
+			item.PartKind != part.Kind || item.PartMIME != part.MIME || item.PartDigest != part.Digest {
+			t.Fatalf("part identity %d changed: prepared=%+v part=%+v", i, item, part)
+		}
+		receipt := k12.DeliveryReceipt{
+			DeliveryID:    fmt.Sprintf("delivery-%d", i),
+			AgentName:     "child-a",
+			BindingID:     item.BindingID,
+			Target:        item.Target,
+			PartKind:      item.PartKind,
+			PartMIME:      item.PartMIME,
+			PartOrdinal:   item.PartOrdinal,
+			PartDigest:    item.PartDigest,
+			PayloadJSON:   item.PayloadJSON,
+			RenderJSON:    item.RenderJSON,
+			PayloadDigest: deliveryPayloadDigest(item.PayloadJSON),
+			Status:        k12.DeliverySending,
+		}
+		if part.Kind == messagecontent.PartArtifact {
+			resourceID, prepareErr := d.PrepareDeliveryPartResource(context.Background(), receipt)
+			if prepareErr != nil {
+				t.Fatalf("prepare artifact %d: %v", i, prepareErr)
+			}
+			receipt.PreparedResourceID = resourceID
+		}
+		if _, sendErr := d.SendPrepared(context.Background(), receipt); sendErr != nil {
+			t.Fatalf("send part %d: %v", i, sendErr)
+		}
+	}
+	if len(ding.sent) != 0 || len(ding.sentParts) != 6 || len(ding.prepared) != 4 {
+		t.Fatalf("whole message replayed or part counts changed: legacy=%d parts=%d prepared=%d", len(ding.sent), len(ding.sentParts), len(ding.prepared))
+	}
+	for i, part := range ding.sentParts {
+		if part.Ordinal != i%3+1 {
+			t.Fatalf("target-major part order changed at %d: %+v", i, part)
+		}
+		if part.Kind == messagecontent.PartMarkdown && (part.Attachment != nil || part.PreparedResourceID != "") {
+			t.Fatalf("markdown part carried artifact data: %+v", part)
+		}
+		if part.Kind == messagecontent.PartArtifact && (part.Text != "" || part.Attachment == nil || part.PreparedResourceID == "") {
+			t.Fatalf("artifact part is incomplete: %+v", part)
 		}
 	}
 }
@@ -337,11 +619,11 @@ func TestK12FinalArtifactIMProjectionKeepsMarkdownAndOmitsInternalJSONEvidence(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	var payload channel.Message
+	var payload channel.DeliveryPart
 	if err := json.Unmarshal([]byte(prepared.PayloadJSON), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.Content == nil || payload.Content.Markdown != canonical {
+	if payload.MessageContent == nil || payload.MessageContent.Markdown != canonical {
 		t.Fatal("冻结 canonical source 必须保持完整且可追溯")
 	}
 	if payload.RenderManifest == nil || len(payload.RenderManifest.Parts) != 1 ||
@@ -393,7 +675,7 @@ func TestK12FinalArtifactIMProjectionKeepsActionableSolutionAndUserJSON(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	var payload channel.Message
+	var payload channel.DeliveryPart
 	if err := json.Unmarshal([]byte(prepared.PayloadJSON), &payload); err != nil {
 		t.Fatal(err)
 	}

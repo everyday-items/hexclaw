@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
 )
 
@@ -21,11 +22,14 @@ func TestBUG20260725014AccumulationDictationHTTPProjectsReAddAndRejoinsOnce(t *t
 	rec, firstResponse := doCurrent(t, h, http.MethodPost,
 		"/accumulation/"+accumulationID+"/dictation-to-basket",
 		`{"agent":"mingming"}`, nil)
-	first := firstResponse["dictation_generation"].(map[string]any)
-	if rec.Code != http.StatusOK || first["status"] != "committed" ||
-		first["practice_item_id"] == "" {
+	queued := firstResponse["dictation_generation"].(map[string]any)
+	if rec.Code != http.StatusAccepted || queued["status"] != k12.DictationQueued ||
+		queued["generation_id"] == "" {
 		t.Fatalf("first dictation: status=%d body=%v", rec.Code, firstResponse)
 	}
+	first := waitCurrentAccumulationGeneration(
+		t, h, accumulationID, k12.DictationCommitted,
+	)
 	firstItemID := first["practice_item_id"].(string)
 
 	rec, sets := doCurrent(t, h, http.MethodGet,
@@ -55,11 +59,18 @@ func TestBUG20260725014AccumulationDictationHTTPProjectsReAddAndRejoinsOnce(t *t
 	rec, secondResponse := doCurrent(t, h, http.MethodPost,
 		"/accumulation/"+accumulationID+"/dictation-to-basket",
 		`{"agent":"mingming"}`, nil)
-	second := secondResponse["dictation_generation"].(map[string]any)
-	if rec.Code != http.StatusOK || second["status"] != "committed" ||
-		second["practice_item_id"] == "" || second["practice_item_id"] == firstItemID {
+	reactivated := secondResponse["dictation_generation"].(map[string]any)
+	if rec.Code != http.StatusAccepted ||
+		reactivated["generation_id"] != first["generation_id"] {
 		t.Fatalf("second dictation: status=%d first=%v second=%v",
-			rec.Code, first, second)
+			rec.Code, first, reactivated)
+	}
+	second := waitCurrentAccumulationGeneration(
+		t, h, accumulationID, k12.DictationCommitted,
+	)
+	if second["generation_id"] != first["generation_id"] ||
+		second["practice_item_id"] != firstItemID {
+		t.Fatalf("re-add identity drifted: first=%v second=%v", first, second)
 	}
 	secondItemID := second["practice_item_id"]
 
@@ -67,7 +78,7 @@ func TestBUG20260725014AccumulationDictationHTTPProjectsReAddAndRejoinsOnce(t *t
 		"/accumulation/"+accumulationID+"/dictation-to-basket",
 		`{"agent":"mingming"}`, nil)
 	replay := replayResponse["dictation_generation"].(map[string]any)
-	if rec.Code != http.StatusOK || replay["generation_id"] != second["generation_id"] ||
+	if rec.Code != http.StatusAccepted || replay["generation_id"] != second["generation_id"] ||
 		replay["practice_item_id"] != secondItemID {
 		t.Fatalf("second command replay: status=%d second=%v replay=%v",
 			rec.Code, second, replay)

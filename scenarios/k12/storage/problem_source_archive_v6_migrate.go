@@ -99,6 +99,17 @@ func MigrateProblemSourceArchiveV6Owner(
 		item.AgentName = targetAgent
 		item.PageAssetID = mapped
 	}
+	annotatedRelationIndexes := make(map[string]int, len(out.FinalAnnotatedAssets))
+	for index := range out.FinalAnnotatedAssets {
+		relation := &out.FinalAnnotatedAssets[index]
+		annotatedRelationIndexes[relation.ArtifactID] = index
+		mapped, err := migratedProblemSourceAssetID(relation.AssetID, assetIDs)
+		if err != nil {
+			return ProblemSourceArchiveV6{}, err
+		}
+		relation.AgentName = targetAgent
+		relation.AssetID = mapped
+	}
 	for index := range out.Dispatches {
 		item := &out.Dispatches[index]
 		oldID := item.DispatchID
@@ -308,14 +319,17 @@ func MigrateProblemSourceArchiveV6Owner(
 			continue
 		}
 		artifact := state.Artifact
+		oldArtifactID := artifact.ArtifactID
+		hasAnnotatedAsset := artifact.HasAnnotatedAsset()
+		if (artifact.SummaryInvocationID != "" || hasAnnotatedAsset) &&
+			k12.ComputeGradingFinalArtifactDigest(*artifact) != artifact.ArtifactDigest {
+			return ProblemSourceArchiveV6{}, fmt.Errorf(
+				"problem-source final artifact %q digest is not canonical",
+				artifact.ArtifactID,
+			)
+		}
 		artifact.AgentName = targetAgent
 		if artifact.SummaryInvocationID != "" {
-			if problemSourceFinalArtifactDigest(*artifact) != artifact.ArtifactDigest {
-				return ProblemSourceArchiveV6{}, fmt.Errorf(
-					"problem-source final artifact %q digest is not canonical",
-					artifact.ArtifactID,
-				)
-			}
 			mapped := parentIDs[artifact.SummaryInvocationID]
 			if mapped == "" {
 				return ProblemSourceArchiveV6{}, fmt.Errorf(
@@ -324,12 +338,30 @@ func MigrateProblemSourceArchiveV6Owner(
 				)
 			}
 			artifact.SummaryInvocationID = mapped
-			artifact.ArtifactDigest = problemSourceFinalArtifactDigest(*artifact)
+		}
+		if hasAnnotatedAsset {
+			relationIndex, ok := annotatedRelationIndexes[oldArtifactID]
+			if !ok {
+				return ProblemSourceArchiveV6{}, fmt.Errorf(
+					"problem-source final annotated relation %q is missing",
+					oldArtifactID,
+				)
+			}
+			relation := &out.FinalAnnotatedAssets[relationIndex]
+			artifact.AnnotatedAssetID = relation.AssetID
+			artifact.AnnotatedAssetOwnerScope = relation.OwnerScope
+		}
+		if artifact.SummaryInvocationID != "" || hasAnnotatedAsset {
+			artifact.ArtifactDigest = k12.ComputeGradingFinalArtifactDigest(*artifact)
 		}
 		artifact.ArtifactID = migratedProblemSourceFinalArtifactID(
 			targetAgent, artifact.JobID, artifact.StructureVersion,
 			artifact.ArtifactDigest,
 		)
+		if hasAnnotatedAsset {
+			relation := &out.FinalAnnotatedAssets[annotatedRelationIndexes[oldArtifactID]]
+			relation.ArtifactID = artifact.ArtifactID
+		}
 	}
 	for index := range out.RecognitionPhysicalResults {
 		item := &out.RecognitionPhysicalResults[index]
@@ -440,30 +472,6 @@ func migratedProblemSourceSummaryResult(
 		return "", fmt.Errorf("encode migrated problem-source typed summary: %w", err)
 	}
 	return string(encoded), nil
-}
-
-func problemSourceFinalArtifactDigest(artifact k12.GradingFinalArtifact) string {
-	raw, _ := json.Marshal(struct {
-		StructureVersion          int
-		CoverageStatus            k12.GradingFinalArtifactCoverageStatus
-		TotalCount                int
-		PublishedCount            int
-		SkippedCount              int
-		OrderedCurrentDigestsJSON string
-		CanonicalMarkdown         string
-		SummaryInvocationID       string
-	}{
-		artifact.StructureVersion,
-		artifact.CoverageStatus,
-		artifact.TotalCount,
-		artifact.PublishedCount,
-		artifact.SkippedCount,
-		artifact.OrderedCurrentDigestsJSON,
-		artifact.CanonicalMarkdown,
-		artifact.SummaryInvocationID,
-	})
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])
 }
 
 func migratedProblemSourceFinalArtifactID(

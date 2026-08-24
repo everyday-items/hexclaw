@@ -1,10 +1,9 @@
 package k12storage_test
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -14,10 +13,12 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/viewcontract"
 )
 
 func TestProblemSourceArchiveV6RoundTripPreservesCurrentSourceTypedFactsAndRecoversOnlyFromCommittedResult(t *testing.T) {
+	t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
 	ctx := context.Background()
 	sourceStore, sourceDB := setup(t)
 	lease := seedProblemSourceRecognitionFixture(t, sourceStore, sourceDB, recognitionWork)
@@ -42,17 +43,30 @@ func TestProblemSourceArchiveV6RoundTripPreservesCurrentSourceTypedFactsAndRecov
 		"mingming", recognitionJob); updateGradingErr != nil {
 		t.Fatal(updateGradingErr)
 	}
+	annotatedBytes := annotatedArtifactPNG(t, 177)
+	annotatedReady, err := (&usecase.PageAssetRepository{Records: sourceStore}).Persist(
+		ctx, recognitionOwner, "mingming", annotatedBytes,
+	)
+	if err != nil {
+		t.Fatalf("persist archive annotated PageAsset: %v", err)
+	}
+	artifactInput := k12.GradingFinalArtifact{
+		AgentName: "mingming", JobID: recognitionJob,
+		StructureVersion: 1,
+		CoverageStatus:   k12.GradingFinalArtifactCoverageWithSkips,
+		TotalCount:       1, PublishedCount: 0, SkippedCount: 1,
+		OrderedCurrentDigestsJSON: `["skip-v6-generation-4"]`,
+		CanonicalMarkdown:         "# restored typed final artifact",
+		AnnotatedAssetOwnerScope:  recognitionOwner,
+		AnnotatedAssetID:          annotatedReady.Metadata.PageAssetID,
+		AnnotatedMIME:             annotatedReady.Metadata.MediaType,
+		AnnotatedDigest:           annotatedReady.Metadata.ContentDigest,
+		OriginalSourceDigest:      repeatHex("b", 64),
+	}
+	artifactInput.ArtifactDigest = k12.ComputeGradingFinalArtifactDigest(artifactInput)
 	finalArtifact, replay, err := sourceStore.CommitGradingFinalArtifact(
 		ctx,
-		k12.GradingFinalArtifact{
-			AgentName: "mingming", JobID: recognitionJob,
-			StructureVersion: 1,
-			CoverageStatus:   k12.GradingFinalArtifactCoverageWithSkips,
-			TotalCount:       1, PublishedCount: 0, SkippedCount: 1,
-			OrderedCurrentDigestsJSON: `["skip-v6-generation-4"]`,
-			CanonicalMarkdown:         "# restored typed final artifact",
-			ArtifactDigest:            repeatHex("f", 64),
-		},
+		artifactInput,
 		4,
 	)
 	if err != nil || replay {
@@ -63,9 +77,9 @@ func TestProblemSourceArchiveV6RoundTripPreservesCurrentSourceTypedFactsAndRecov
 	if err != nil {
 		t.Fatalf("export source archive: %v", err)
 	}
-	if len(archive.PageAssets) != 2 || len(archive.InputRevisions) != 6 ||
+	if len(archive.PageAssets) != 3 || len(archive.InputRevisions) != 6 ||
 		len(archive.ActionReceipts) != 1 || len(archive.ReprocessJobs) != 1 ||
-		len(archive.FinalizationGenerations) != 1 ||
+		len(archive.FinalizationGenerations) != 1 || len(archive.FinalAnnotatedAssets) != 1 ||
 		len(archive.RecognitionResults) != 1 || len(archive.RecognitionItems) != 2 ||
 		len(archive.RecognitionPhysicalResults) != 2 {
 		t.Fatalf("v6 source exact-set incomplete: %+v", archive)
@@ -101,6 +115,27 @@ func TestProblemSourceArchiveV6RoundTripPreservesCurrentSourceTypedFactsAndRecov
 		generation.Generation != 4 || generation.Artifact == nil ||
 		!reflect.DeepEqual(*generation.Artifact, finalArtifact) {
 		t.Fatalf("v6 source finalization generation drifted: %+v", generation)
+	}
+	if relation := archive.FinalAnnotatedAssets[0]; relation.ArtifactID != finalArtifact.ArtifactID ||
+		relation.OwnerScope != recognitionOwner ||
+		relation.AssetID != finalArtifact.AnnotatedAssetID ||
+		relation.Digest != finalArtifact.AnnotatedDigest ||
+		relation.OriginalSourceDigest != finalArtifact.OriginalSourceDigest {
+		t.Fatalf("v6 annotated final relation drifted: %+v", relation)
+	}
+	missingRelation := cloneProblemSourceArchiveV6ForTest(t, archive)
+	missingRelation.FinalAnnotatedAssets = nil
+	if err := k12storage.ValidateProblemSourceArchiveV6(
+		"mingming", missingRelation,
+	); err == nil || !strings.Contains(err.Error(), "annotated relation is missing") {
+		t.Fatalf("v6 archive accepted a missing annotated relation: %v", err)
+	}
+	driftedRelation := cloneProblemSourceArchiveV6ForTest(t, archive)
+	driftedRelation.FinalAnnotatedAssets[0].OriginalSourceDigest = repeatHex("c", 64)
+	if err := k12storage.ValidateProblemSourceArchiveV6(
+		"mingming", driftedRelation,
+	); err == nil {
+		t.Fatal("v6 archive accepted an annotated source digest drift")
 	}
 	if archive.ReprocessJobs[0].Status != k12storage.ProblemSourceReprocessRunning {
 		t.Fatalf("export must preserve original queue evidence: %+v", archive.ReprocessJobs[0])
@@ -148,6 +183,13 @@ func TestProblemSourceArchiveV6RoundTripPreservesCurrentSourceTypedFactsAndRecov
 	)
 	if err != nil || !reflect.DeepEqual(restoredArtifact, finalArtifact) {
 		t.Fatalf("restored final artifact drifted: got=%+v want=%+v err=%v", restoredArtifact, finalArtifact, err)
+	}
+	restoredAnnotated, err := targetStore.OpenGradingFinalAnnotatedAsset(
+		ctx, "mingming", restoredArtifact.ArtifactID,
+	)
+	if err != nil || restoredAnnotated.MIME != annotatedReady.Metadata.MediaType ||
+		!bytes.Equal(restoredAnnotated.Data, annotatedBytes) {
+		t.Fatalf("restored annotated bytes drifted: asset=%+v err=%v", restoredAnnotated, err)
 	}
 
 	restoredHeads, err := targetStore.ListCurrentProblemInputRevisions(
@@ -858,11 +900,24 @@ func TestProblemSourceArchiveV6RestoreAsRewritesTerminalV73DigestLineage(t *test
 		OrderedCurrentDigestsJSON: `["assessment-source"]`,
 		CanonicalMarkdown:         "# canonical source final",
 		SummaryInvocationID:       sourceSummaryID,
+		AnnotatedAssetOwnerScope:  recognitionOwner,
+		AnnotatedAssetID:          sourceAssetID,
+		AnnotatedMIME:             source.PageAssets[0].MediaType,
+		AnnotatedDigest:           source.PageAssets[0].ContentDigest,
+		OriginalSourceDigest:      source.PageAssets[0].ContentDigest,
 		CreatedAt:                 100,
 		UpdatedAt:                 100,
 	}
 	sourceArtifact.ArtifactDigest = problemSourceArchiveTestFinalArtifactDigest(sourceArtifact)
 	source.FinalizationGenerations[0].Artifact = &sourceArtifact
+	source.FinalAnnotatedAssets = []k12storage.ProblemSourceArchiveFinalAnnotatedAsset{{
+		ArtifactID: sourceArtifact.ArtifactID, AgentName: sourceArtifact.AgentName,
+		OwnerScope:           sourceArtifact.AnnotatedAssetOwnerScope,
+		AssetID:              sourceArtifact.AnnotatedAssetID,
+		MIME:                 sourceArtifact.AnnotatedMIME,
+		Digest:               sourceArtifact.AnnotatedDigest,
+		OriginalSourceDigest: sourceArtifact.OriginalSourceDigest,
+	}}
 	request := json.RawMessage(`{"action":"select_region","structure_version":1,"expected_input_revision":1,"payload":{"page_asset_id":"` + sourceAssetID + `","region":{"x":10,"y":20,"width":100,"height":80}}}`)
 	source.ActionReceipts[0].RequestJSON = append(json.RawMessage(nil), request...)
 	source.ReprocessJobs[0].RequestJSON = append(json.RawMessage(nil), request...)
@@ -927,8 +982,17 @@ func TestProblemSourceArchiveV6RestoreAsRewritesTerminalV73DigestLineage(t *test
 	if migratedArtifact == nil || migratedArtifact.AgentName != "target-tutor" ||
 		migratedArtifact.ArtifactID == sourceArtifact.ArtifactID ||
 		migratedArtifact.SummaryInvocationID == sourceSummaryID ||
-		migratedArtifact.ArtifactDigest == sourceArtifact.ArtifactDigest {
+		migratedArtifact.ArtifactDigest == sourceArtifact.ArtifactDigest ||
+		migratedArtifact.AnnotatedAssetID != targetAssetID ||
+		migratedArtifact.ArtifactDigest != k12.ComputeGradingFinalArtifactDigest(*migratedArtifact) {
 		t.Fatalf("restore-as final artifact lineage was not rewritten: %+v", migratedArtifact)
+	}
+	if len(migrated.FinalAnnotatedAssets) != 1 ||
+		migrated.FinalAnnotatedAssets[0].ArtifactID != migratedArtifact.ArtifactID ||
+		migrated.FinalAnnotatedAssets[0].AgentName != "target-tutor" ||
+		migrated.FinalAnnotatedAssets[0].OwnerScope != recognitionOwner ||
+		migrated.FinalAnnotatedAssets[0].AssetID != targetAssetID {
+		t.Fatalf("restore-as final annotated relation was not rewritten: %+v", migrated.FinalAnnotatedAssets)
 	}
 	for _, item := range migrated.RecognitionItems {
 		if item.InputDigest == "" || item.PageAssetID != targetAssetID {
@@ -997,27 +1061,7 @@ func TestProblemSourceArchiveV6RestoreAsRewritesTerminalV73DigestLineage(t *test
 func problemSourceArchiveTestFinalArtifactDigest(
 	artifact k12.GradingFinalArtifact,
 ) string {
-	raw, _ := json.Marshal(struct {
-		StructureVersion          int
-		CoverageStatus            k12.GradingFinalArtifactCoverageStatus
-		TotalCount                int
-		PublishedCount            int
-		SkippedCount              int
-		OrderedCurrentDigestsJSON string
-		CanonicalMarkdown         string
-		SummaryInvocationID       string
-	}{
-		artifact.StructureVersion,
-		artifact.CoverageStatus,
-		artifact.TotalCount,
-		artifact.PublishedCount,
-		artifact.SkippedCount,
-		artifact.OrderedCurrentDigestsJSON,
-		artifact.CanonicalMarkdown,
-		artifact.SummaryInvocationID,
-	})
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])
+	return k12.ComputeGradingFinalArtifactDigest(artifact)
 }
 
 func TestProblemSourceArchiveV6OutcomeUnknownPreservesReconciliationAuditAndNeverBecomesRetryable(t *testing.T) {

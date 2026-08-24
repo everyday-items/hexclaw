@@ -67,7 +67,7 @@ func TestHTTPFinalizeSendUsesServerResolvedBatch(t *testing.T) {
 }
 
 func TestHTTPDictationToBasket(t *testing.T) {
-	h := newServer(t)
+	h := newServerWithSolver(t, fakeSolveExec{})
 	accumID := addAccumulationHTTP(t, h, "桂花香")
 	rec, out := do(
 		t,
@@ -77,19 +77,29 @@ func TestHTTPDictationToBasket(t *testing.T) {
 		`{"agent":"mingming"}`,
 	)
 	generation, _ := out["dictation_generation"].(map[string]any)
-	if rec.Code != http.StatusOK ||
-		generation["status"] != k12.DictationCommitted ||
-		generation["generation_id"] == "" ||
-		generation["practice_item_id"] == "" {
+	if rec.Code != http.StatusAccepted ||
+		generation["status"] != k12.DictationQueued ||
+		generation["generation_id"] == "" {
 		t.Fatalf("默写出题装篮应返回持久 generation: code=%d %v", rec.Code, out)
 	}
+	committed := waitCurrentAccumulationGeneration(
+		t, h, accumID, k12.DictationCommitted,
+	)
+	if committed["generation_id"] != generation["generation_id"] ||
+		committed["practice_item_id"] == "" {
+		t.Fatalf("默写异步生成未原子提交: queued=%v committed=%v", generation, committed)
+	}
 
-	// >100 字长文 → 400。
+	// >100 字长文先持久受理，再由同一任务收敛为失败且不入集。
 	long := strings.Repeat("好句素材内容很长", 15)
 	longID := addAccumulationHTTP(t, h, long)
 	rec, _ = do(t, h, "POST", "/accumulation/"+longID+"/dictation-to-basket", `{"agent":"mingming"}`)
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf(">100 字应 400 拒绝, got %d", rec.Code)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf(">100 字持久任务应先受理, got %d", rec.Code)
+	}
+	failed := waitCurrentAccumulationGeneration(t, h, longID, k12.DictationFailed)
+	if failed["practice_item_id"] != nil {
+		t.Fatalf(">100 字失败任务不得公开练习项: %v", failed)
 	}
 }
 

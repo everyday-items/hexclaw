@@ -216,8 +216,8 @@ func TestWorkFeedbackInitialRetryReusesGenerationAndFailedRegenerationPreservesL
 	}
 }
 
-func TestAccumulationDictationGenerationPersistsAndReplaysOnePracticeItem(t *testing.T) {
-	store, _ := setup(t)
+func TestLegacyAccumulationDictationWriterIsFrozenAfterV86(t *testing.T) {
+	store, db := setup(t)
 	rec, err := k12.NewAccumRecord("mingming", "session", k12.AccumFields{
 		Subject: "语文", EntryType: "好词好句", Content: "桂花香",
 	})
@@ -228,29 +228,20 @@ func TestAccumulationDictationGenerationPersistsAndReplaysOnePracticeItem(t *tes
 	if err != nil || !created {
 		t.Fatalf("put accumulation: created=%v err=%v", created, err)
 	}
-	generation, created, err := store.PrepareAccumulationDictationGeneration(
+	_, _, err = store.PrepareAccumulationDictationGeneration(
 		context.Background(), "mingming", rec.RecordID, "dictation-1",
 		"sha256:dictation-1", `{"content":"桂花香","full_dictation":false}`,
 	)
-	if err != nil || !created || generation.Status != k12.DictationQueued {
-		t.Fatalf("prepare generation: created=%v generation=%+v err=%v", created, generation, err)
+	if err == nil {
+		t.Fatal("legacy accumulation generation writer remained writable after V86")
 	}
-	practiceItemID := "dictation-item-" + generation.GenerationID
-	committed, err := store.CommitAccumulationDictationGeneration(
-		context.Background(), "mingming", generation.GenerationID, practiceItemID,
-	)
-	if err != nil {
+	var legacyRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM k12_accumulation_dictation_generations
+		WHERE accumulation_id=?`, rec.RecordID).Scan(&legacyRows); err != nil {
 		t.Fatal(err)
 	}
-	replayed, created, err := store.PrepareAccumulationDictationGeneration(
-		context.Background(), "mingming", rec.RecordID, "dictation-1",
-		"sha256:dictation-1", `{"content":"桂花香","full_dictation":false}`,
-	)
-	if err != nil || created || replayed.GenerationID != committed.GenerationID ||
-		replayed.PracticeItemID != practiceItemID ||
-		replayed.Status != k12.DictationCommitted {
-		t.Fatalf("replay diverged: created=%v replay=%+v committed=%+v err=%v",
-			created, replayed, committed, err)
+	if legacyRows != 0 {
+		t.Fatalf("rejected legacy writer left rows=%d", legacyRows)
 	}
 }
 
@@ -315,7 +306,7 @@ func TestCurrentWorkAndAccumulationDeleteAreCASIdempotentTombstones(t *testing.T
 	}
 }
 
-func TestTombstoneDeleteDoesNotCascadeCommittedDictationAudit(t *testing.T) {
+func TestTombstoneDeleteDoesNotCascadeSharedAccumulationGenerationJob(t *testing.T) {
 	store, db := setup(t)
 	rec, err := k12.NewAccumRecord("mingming", "session", k12.AccumFields{
 		Subject: "语文", EntryType: "好词好句", Content: "积累",
@@ -326,15 +317,20 @@ func TestTombstoneDeleteDoesNotCascadeCommittedDictationAudit(t *testing.T) {
 	if _, err := store.Put(context.Background(), rec); err != nil {
 		t.Fatal(err)
 	}
-	generation, _, err := store.PrepareAccumulationDictationGeneration(
-		context.Background(), "mingming", rec.RecordID, "dictation", "sha256:dictation", `{}`,
-	)
-	if err != nil {
-		t.Fatal(err)
+	job := k12.PracticeGenerationJob{
+		GenerationJobID: "generation-1", AgentName: "mingming",
+		IdempotencyKey: "dictation:" + rec.RecordID + ":v1",
+		RequestDigest:  "sha256:dictation", Scope: "single",
+		SourceKind: k12.PracticeGenerationSourceAccumulation,
+		SourceID:   rec.RecordID, SourceVersion: 1,
+		SourceSummary:     "积累",
+		VariantsPerSource: 1, Difficulty: "same", Total: "1",
+		Status: k12.PracticeGenerationQueued, ResultItemIDs: []string{"practice-item-1"},
+		RequestSnapshot: `{"accumulation_id":"` + rec.RecordID + `","source_version":1}`,
+		RouteSnapshot:   `{"provider":"rule","model":"dictation-format-v1"}`,
+		CreatedAt:       100, UpdatedAt: 100,
 	}
-	if _, err := store.CommitAccumulationDictationGeneration(
-		context.Background(), "mingming", generation.GenerationID, "practice-item-1",
-	); err != nil {
+	if _, _, err := store.BeginPracticeGenerationJob(context.Background(), job); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.TombstoneCurrentObject(
@@ -343,12 +339,13 @@ func TestTombstoneDeleteDoesNotCascadeCommittedDictationAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 	var count int
-	if err := db.QueryRow(`SELECT count(*) FROM k12_accumulation_dictation_generations
-		WHERE accumulation_id=? AND practice_item_id='practice-item-1'`, rec.RecordID).
+	if err := db.QueryRow(`SELECT count(*) FROM k12_practice_generation_jobs
+		WHERE generation_job_id='generation-1' AND source_kind='accumulation'
+		  AND source_id=?`, rec.RecordID).
 		Scan(&count); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		t.Fatal(err)
 	}
 	if count != 1 {
-		t.Fatalf("delete cascaded dictation audit, count=%d", count)
+		t.Fatalf("delete cascaded shared accumulation generation, count=%d", count)
 	}
 }

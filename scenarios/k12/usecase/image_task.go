@@ -89,21 +89,22 @@ type imageTaskWorkFeedbackGenerator interface {
 }
 
 type ImageTaskCoordinator struct {
-	Records               *k12storage.Store
-	PageAssets            PageAssetGateway
-	Classifier            ImageTaskClassifier
-	WritingOCR            ImageTaskWritingOCR
-	Grading               imageTaskGradingStarter
-	WorkFeedback          imageTaskWorkFeedbackGenerator
-	ResolveRoute          ImageTaskRouteResolver
-	ResolveRouteDisplay   ImageTaskRouteDisplayResolver
-	ResolveGrade          ImageTaskGradeResolver
-	ReadAsset             ImageTaskAssetReader
-	SourceReprocess       *ProblemSourceReprocessWorker
-	GradingBudgetSnapshot k12.GradingBudgetSnapshot
-	Now                   func() int64
-	NewID                 func(kind string) string
-	BaseContext           context.Context
+	Records                        *k12storage.Store
+	PageAssets                     PageAssetGateway
+	Classifier                     ImageTaskClassifier
+	WritingOCR                     ImageTaskWritingOCR
+	Grading                        imageTaskGradingStarter
+	IMCompletedHomeworkRoutingGate ImageTaskIMCompletedHomeworkRoutingGate
+	WorkFeedback                   imageTaskWorkFeedbackGenerator
+	ResolveRoute                   ImageTaskRouteResolver
+	ResolveRouteDisplay            ImageTaskRouteDisplayResolver
+	ResolveGrade                   ImageTaskGradeResolver
+	ReadAsset                      ImageTaskAssetReader
+	SourceReprocess                *ProblemSourceReprocessWorker
+	GradingBudgetSnapshot          k12.GradingBudgetSnapshot
+	Now                            func() int64
+	NewID                          func(kind string) string
+	BaseContext                    context.Context
 
 	workerMu     sync.Mutex
 	agentWorkers agentWorkerFenceRegistry
@@ -144,14 +145,16 @@ type ImageTaskView struct {
 }
 
 type ImageTaskHomeworkProjection struct {
-	Stage             string
-	Retryable         bool
-	ConfirmationState string
-	AnchorState       string
-	Subject           string
-	Questions         []RecognizedQuestion
-	Progressive       ImageTaskProgressiveSnapshot
-	FinalArtifact     *k12.GradingFinalArtifact `json:"final_artifact,omitempty"`
+	Stage                     string
+	Retryable                 bool
+	ConfirmationState         string
+	AnchorState               string
+	Subject                   string
+	Questions                 []RecognizedQuestion
+	Progressive               ImageTaskProgressiveSnapshot
+	FinalArtifact             *k12.GradingFinalArtifact  `json:"final_artifact,omitempty"`
+	GroundingEvidenceReceipts []GroundingEvidenceReceipt `json:"grounding_evidence_receipts"`
+	ProblemGroundingReceipts  []ProblemGroundingReceipt  `json:"problem_grounding_receipts"`
 	// retryFailureKind is an internal retry-router fact. It must never be
 	// serialized by the public ImageTask projection, but lets the facade keep
 	// interactive deadline retries on their specialized parent-window path.
@@ -193,16 +196,27 @@ type imageTaskGradingCanceller interface {
 	CancelImageTaskHomework(context.Context, string, string) error
 }
 
+// ImageTaskIMCompletedHomeworkRoutingGate 在 IM 作业分类完成后、创建批改任务前，
+// 只读取入站收据中已经持久化的分流决定。其他图片来源不经过该门。
+type ImageTaskIMCompletedHomeworkRoutingGate interface {
+	AllowIMCompletedHomeworkGrading(
+		context.Context,
+		k12.ImageTaskDispatch,
+	) (bool, error)
+}
+
 type ImageTaskResult struct {
-	Kind                string
-	Dispatch            k12.ImageTaskDispatch
-	SourceAttachments   []ImageTaskSourceAttachmentReceipt
-	OperationReceipts   []ImageTaskOperationReceipt
-	Photo               *PhotoGradeResult
-	Creative            *k12.CreativeWorkIntake
-	CreativeDisplayName string
-	CreativeWork        *CreativeWorkView
-	FinalArtifact       *k12.GradingFinalArtifact `json:"final_artifact,omitempty"`
+	Kind                      string
+	Dispatch                  k12.ImageTaskDispatch
+	SourceAttachments         []ImageTaskSourceAttachmentReceipt
+	OperationReceipts         []ImageTaskOperationReceipt
+	Photo                     *PhotoGradeResult
+	Creative                  *k12.CreativeWorkIntake
+	CreativeDisplayName       string
+	CreativeWork              *CreativeWorkView
+	FinalArtifact             *k12.GradingFinalArtifact  `json:"final_artifact,omitempty"`
+	GroundingEvidenceReceipts []GroundingEvidenceReceipt `json:"grounding_evidence_receipts"`
+	ProblemGroundingReceipts  []ProblemGroundingReceipt  `json:"problem_grounding_receipts"`
 }
 
 type ImageTaskSourceAttachmentReceipt struct {
@@ -222,10 +236,6 @@ type ImageTaskOperationReceipt struct {
 	ResultDigest        string                          `json:"result_digest"`
 	RequestPolicyDigest string                          `json:"request_policy_digest,omitempty"`
 	RequestPolicy       *k12.ModelRequestPolicySnapshot `json:"request_policy,omitempty"`
-}
-
-type imageTaskPhotoResultReader interface {
-	PhotoResult(jobID string) (PhotoGradeResult, bool)
 }
 
 type ConfirmImageTaskInput struct {
@@ -1426,6 +1436,21 @@ func (c *ImageTaskCoordinator) continueTarget(
 		if view.Homework.GradingJobID != "" {
 			return view, nil
 		}
+		if view.Dispatch.SourceKind == k12.ImageTaskSourceIM &&
+			view.Dispatch.TaskIntent == k12.ImageTaskIntentCompletedHomework {
+			if c.IMCompletedHomeworkRoutingGate == nil {
+				return view, fmt.Errorf("usecase: IM completed-homework routing gate is unavailable")
+			}
+			allow, err := c.IMCompletedHomeworkRoutingGate.AllowIMCompletedHomeworkGrading(
+				ctx, view.Dispatch,
+			)
+			if err != nil {
+				return view, err
+			}
+			if !allow {
+				return view, nil
+			}
+		}
 		if c.Grading == nil {
 			return view, fmt.Errorf("usecase: homework image task grading orchestrator 未配置")
 		}
@@ -1778,8 +1803,10 @@ func (c *ImageTaskCoordinator) Result(
 	result := ImageTaskResult{
 		Kind: "pending", Dispatch: view.Dispatch, Creative: view.Creative,
 		CreativeDisplayName: view.CreativeDisplayName, CreativeWork: view.CreativeWork,
-		SourceAttachments: sourceAttachments,
-		OperationReceipts: make([]ImageTaskOperationReceipt, 0),
+		SourceAttachments:         sourceAttachments,
+		OperationReceipts:         make([]ImageTaskOperationReceipt, 0),
+		GroundingEvidenceReceipts: []GroundingEvidenceReceipt{},
+		ProblemGroundingReceipts:  []ProblemGroundingReceipt{},
 	}
 	if view.solveInvocation != nil {
 		result.OperationReceipts = append(
@@ -1805,6 +1832,14 @@ func (c *ImageTaskCoordinator) Result(
 		return result, nil
 	}
 	if view.Homework != nil && view.Homework.GradingJobID != "" {
+		if view.HomeworkProjection != nil {
+			result.GroundingEvidenceReceipts = cloneGroundingEvidenceReceipts(
+				view.HomeworkProjection.GroundingEvidenceReceipts,
+			)
+			result.ProblemGroundingReceipts = cloneProblemGroundingReceipts(
+				view.HomeworkProjection.ProblemGroundingReceipts,
+			)
+		}
 		invocations, listErr := c.Records.ListModelInvocations(
 			ctx, agentName, view.Homework.GradingJobID,
 		)
@@ -1843,15 +1878,29 @@ func (c *ImageTaskCoordinator) Result(
 		if result.FinalArtifact == nil {
 			return result, nil
 		}
-		reader, ok := c.Grading.(imageTaskPhotoResultReader)
-		if !ok {
-			return result, nil
+		photo := PhotoGradeResult{
+			Mode:          PhotoModeGrade,
+			TaskIntent:    photoTaskIntentFromDispatch(view.Dispatch.TaskIntent),
+			ResultSurface: PhotoSurfaceAnnotatedHomework,
+			Markdown:      result.FinalArtifact.CanonicalMarkdown,
 		}
-		photo, ok := reader.PhotoResult(view.Homework.GradingJobID)
-		if ok {
-			result.Kind = string(view.Dispatch.TaskIntent)
-			result.Photo = &photo
+		if view.Dispatch.TaskIntent == k12.ImageTaskIntentBlankWorksheet {
+			photo.Mode = PhotoModeSolve
+			photo.ResultSurface = PhotoSurfaceParentTeachingGuide
 		}
+		if result.FinalArtifact.HasAnnotatedAsset() {
+			asset, openErr := c.Records.OpenGradingFinalAnnotatedAsset(
+				ctx, agentName, result.FinalArtifact.ArtifactID,
+			)
+			if openErr != nil {
+				return ImageTaskResult{}, openErr
+			}
+			photo.AnnotatedImage = &RenderedPhoto{
+				Data: append([]byte(nil), asset.Data...), MIME: asset.MIME,
+			}
+		}
+		result.Kind = string(view.Dispatch.TaskIntent)
+		result.Photo = &photo
 	}
 	return result, nil
 }
@@ -1974,7 +2023,14 @@ func (c *ImageTaskCoordinator) readSourceImages(
 					err,
 				)
 			}
-			images[index] = ready.Data
+			canonical, err := canonicalProblemSourceImage(ready)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"%w: canonicalize PageAsset %d: %v",
+					ErrInvalidInput, index, err,
+				)
+			}
+			images[index] = canonical.Data
 		}
 		return images, nil
 	}

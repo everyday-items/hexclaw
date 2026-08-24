@@ -30,6 +30,14 @@ type problemSourceImageTransform struct {
 	Orientation int    `json:"orientation"`
 }
 
+// canonicalProblemSourceImage 为所有模型和批注阶段生成同一份无 EXIF PNG；
+// 原始 PageAsset bytes 与内容摘要保持不变。
+func canonicalProblemSourceImage(
+	ready ReadyPageAsset,
+) (problemSourceOCRImage, error) {
+	return normalizeProblemSourceOCRImage(ready, nil)
+}
+
 // normalizeProblemSourceOCRImage converts immutable PageAsset bytes into the
 // verified orientation-normalized source-pixel coordinate system. OCR always
 // receives a metadata-free PNG so a provider cannot apply EXIF a second time.

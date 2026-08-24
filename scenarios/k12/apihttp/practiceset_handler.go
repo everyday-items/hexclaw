@@ -145,6 +145,9 @@ func toPracticeSetDTO(v usecase.PracticeSetView) practiceSetDTO {
 	}
 	items := make([]practiceItemDTO, 0, len(v.Fields.Items))
 	for _, it := range v.Fields.Items {
+		if it.GenerationStatus != "" && it.GenerationStatus != k12.PracticeItemGenerationReady {
+			continue
+		}
 		items = append(items, practiceItemDTO{
 			ItemID: it.ItemID, SourceProblemID: it.SourceProblemID, Subject: it.Subject,
 			AddedVia: it.AddedVia,

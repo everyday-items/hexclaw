@@ -178,6 +178,7 @@ func (a *SolveAdapter) SolveSubject(ctx context.Context, subject, problem, grade
 	// 不注入 self_consistency 默认值：由 solve 自适应 triage。纯数字四则算式走本机精确求值器并给
 	// numeric_exec 强证据；复杂题仍走 solver + verifier。只有真正由调用方显式指定校验力度时，
 	// engine 才禁用快速路径。
+	problem = gradingProblemWithGrounding(ctx, problem)
 	args := map[string]any{"problem": problem}
 	if subject != "" {
 		args["subject"] = subject
@@ -274,6 +275,7 @@ func (a *SolveAdapter) Grade(ctx context.Context, problem, studentAnswer, _ stri
 
 // GradeSubject 与 Grade 相同，并把显式学科传给 grading 模式。
 func (a *SolveAdapter) GradeSubject(ctx context.Context, subject, problem, studentAnswer, _ string) (usecase.GradeOutcome, error) {
+	problem = gradingProblemWithGrounding(ctx, problem)
 	args := map[string]any{"problem": problem, "student_answer": studentAnswer}
 	if subject != "" {
 		args["subject"] = subject
@@ -287,11 +289,24 @@ func (a *SolveAdapter) GradeSubject(ctx context.Context, subject, problem, stude
 // 测试/第三方旧 executor 没实现时安全回退原完整批改链，兼容性优先。
 func (a *SolveAdapter) GradeVerified(ctx context.Context, subject, problem, studentAnswer, verifiedSolution string) (usecase.GradeOutcome, error) {
 	if exec, ok := a.exec.(VerifiedGradeExecutor); ok {
+		problem = gradingProblemWithGrounding(ctx, problem)
 		ctx = a.withGradingPhysicalCallInterceptor(ctx)
 		res, err := exec.GradeVerified(ctx, problem, verifiedSolution, studentAnswer)
 		return gradeOutcomeFromResult(res, err)
 	}
 	return a.GradeSubject(ctx, subject, problem, studentAnswer, verifiedSolution)
+}
+
+// gradingProblemWithGrounding 只把编排层已经核验的教材正文加入模型输入；
+// 持久回执、文档标识和 revision 摘要均不进入提示词。
+func gradingProblemWithGrounding(ctx context.Context, problem string) string {
+	evidence, ok := usecase.GradingGroundingForProvider(ctx)
+	if !ok {
+		return problem
+	}
+	return strings.TrimSpace(problem) +
+		"\n\nVerified textbook evidence (use it only to constrain the solution and grading; it is not the student's answer; do not expose internal source identifiers). Respond in Chinese:\n" +
+		strings.TrimSpace(evidence)
 }
 
 func gradeOutcomeFromResult(res *skill.Result, err error) (usecase.GradeOutcome, error) {

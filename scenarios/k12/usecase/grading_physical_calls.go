@@ -7,14 +7,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 )
 
-var ErrGradingPhysicalCallOutcomeUnknown = errors.New("grading physical call outcome unknown")
+var (
+	ErrGradingPhysicalCallOutcomeUnknown = errors.New("grading physical call outcome unknown")
+	ErrGradingGroundingUnavailable       = errors.New("grading grounding unavailable")
+)
 
 type GradingPhysicalCallSpec struct {
 	Operation     k12.GradingItemOperation
@@ -61,6 +66,653 @@ func HasGradingPhysicalCallExecutor(ctx context.Context) bool {
 	}
 	executor, ok := ctx.Value(gradingPhysicalCallContextKey{}).(GradingPhysicalCallExecutor)
 	return ok && executor != nil
+}
+
+const gradingGroundedPhysicalSchema = "k12_grading_grounded_physical_v1"
+
+type gradingGroundingContextKey struct{}
+
+type gradingProviderGrounding struct {
+	snapshot       GroundingSnapshot
+	text           string
+	receipts       []GroundingEvidenceReceipt
+	identityDigest string
+}
+
+type gradingStoredGrounding struct {
+	Snapshot       GroundingSnapshot          `json:"snapshot"`
+	Receipts       []GroundingEvidenceReceipt `json:"receipts"`
+	IdentityDigest string                     `json:"identity_digest"`
+}
+
+type gradingGroundedPhysicalEnvelope struct {
+	Schema    string                 `json:"schema"`
+	Payload   json.RawMessage        `json:"payload"`
+	Grounding gradingStoredGrounding `json:"grounding"`
+}
+
+// GradingGroundingForProvider 只向 Provider 适配器暴露已核验教材正文。
+// 适配器不得自行读取可变教材状态，也不得把持久回执标识写入生成内容。
+func GradingGroundingForProvider(ctx context.Context) (text string, ok bool) {
+	if ctx == nil {
+		return "", false
+	}
+	evidence, ok := ctx.Value(gradingGroundingContextKey{}).(gradingProviderGrounding)
+	if !ok || strings.TrimSpace(evidence.text) == "" ||
+		strings.TrimSpace(evidence.identityDigest) == "" {
+		return "", false
+	}
+	return evidence.text, true
+}
+
+// WithVerifiedGradingGrounding 把已经过 pinned scope 校验的教材命中绑定到 Provider 上下文。
+// 该入口只供适配器测试和批改编排复用，未命中或无完整引用时一律拒绝下发。
+func WithVerifiedGradingGrounding(
+	ctx context.Context,
+	snapshot GroundingSnapshot,
+	result GroundingSnapshotResult,
+) (context.Context, error) {
+	evidence, err := newGradingProviderGrounding(snapshot, result)
+	if err != nil {
+		return ctx, err
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("%w: grounding context is nil", ErrGradingGroundingUnavailable)
+	}
+	return withGradingProviderGrounding(ctx, evidence), nil
+}
+
+func withGradingProviderGrounding(
+	ctx context.Context,
+	evidence gradingProviderGrounding,
+) context.Context {
+	return context.WithValue(ctx, gradingGroundingContextKey{}, evidence)
+}
+
+func gradingGroundingIdentityDigest(
+	snapshot GroundingSnapshot,
+	receipts []GroundingEvidenceReceipt,
+) (string, error) {
+	raw, err := json.Marshal(struct {
+		Snapshot GroundingSnapshot          `json:"snapshot"`
+		Receipts []GroundingEvidenceReceipt `json:"receipts"`
+	}{snapshot, receipts})
+	if err != nil {
+		return "", err
+	}
+	return modelInvocationDigest([]byte("k12-grading-grounding-v1"), raw), nil
+}
+
+func newGradingProviderGrounding(
+	snapshot GroundingSnapshot,
+	result GroundingSnapshotResult,
+) (gradingProviderGrounding, error) {
+	if err := validateGradingGroundingSnapshot(snapshot); err != nil {
+		return gradingProviderGrounding{}, err
+	}
+	if err := result.validate(snapshot); err != nil {
+		return gradingProviderGrounding{}, fmt.Errorf(
+			"%w: %v", ErrGradingGroundingUnavailable, err,
+		)
+	}
+	if !result.Found {
+		return gradingProviderGrounding{}, fmt.Errorf(
+			"%w: pinned textbook query returned no evidence",
+			ErrGradingGroundingUnavailable,
+		)
+	}
+	digest, err := gradingGroundingIdentityDigest(snapshot, result.Receipts)
+	if err != nil {
+		return gradingProviderGrounding{}, err
+	}
+	return gradingProviderGrounding{
+		snapshot:       cloneGradingGroundingSnapshot(snapshot),
+		text:           strings.TrimSpace(result.Text),
+		receipts:       cloneGroundingEvidenceReceipts(result.Receipts),
+		identityDigest: digest,
+	}, nil
+}
+
+func gradingProviderGroundingFromContext(
+	ctx context.Context,
+) (gradingProviderGrounding, bool) {
+	if ctx == nil {
+		return gradingProviderGrounding{}, false
+	}
+	evidence, ok := ctx.Value(gradingGroundingContextKey{}).(gradingProviderGrounding)
+	if !ok || strings.TrimSpace(evidence.text) == "" ||
+		strings.TrimSpace(evidence.identityDigest) == "" || len(evidence.receipts) == 0 {
+		return gradingProviderGrounding{}, false
+	}
+	evidence.snapshot = cloneGradingGroundingSnapshot(evidence.snapshot)
+	evidence.receipts = cloneGroundingEvidenceReceipts(evidence.receipts)
+	return evidence, true
+}
+
+func cloneGradingGroundingSnapshot(snapshot GroundingSnapshot) GroundingSnapshot {
+	snapshot.SegmentRefs = append([]string(nil), snapshot.SegmentRefs...)
+	snapshot.PageRefs = append([]k12.TextbookGroundingPageRef(nil), snapshot.PageRefs...)
+	for index := range snapshot.PageRefs {
+		snapshot.PageRefs[index].SegmentRefs = append(
+			[]string(nil), snapshot.PageRefs[index].SegmentRefs...,
+		)
+	}
+	return snapshot
+}
+
+func validateGradingGroundingSnapshot(snapshot GroundingSnapshot) error {
+	if snapshot.AgentName == "" || snapshot.AgentName != strings.TrimSpace(snapshot.AgentName) ||
+		snapshot.LearnerID == "" || snapshot.LearnerID != strings.TrimSpace(snapshot.LearnerID) ||
+		snapshot.Subject != "数学" || strings.TrimSpace(snapshot.VectorRevisionID) == "" ||
+		snapshot.VectorRevisionID != strings.TrimSpace(snapshot.VectorRevisionID) {
+		return fmt.Errorf("%w: frozen textbook snapshot is incomplete", ErrGradingGroundingUnavailable)
+	}
+	if err := k12.ValidateTextbookGroundingScope(k12.TextbookGroundingScope{
+		TextbookBindingID:  snapshot.TextbookBindingID,
+		TextbookManifestID: snapshot.TextbookManifestID,
+		DocumentID:         snapshot.DocumentID,
+		DocumentGeneration: snapshot.DocumentGeneration,
+		SourceDigest:       snapshot.SourceDigest,
+		Edition:            snapshot.Edition,
+		Volume:             snapshot.Volume,
+		SegmentRefs:        append([]string(nil), snapshot.SegmentRefs...),
+		PageRefs:           append([]k12.TextbookGroundingPageRef(nil), snapshot.PageRefs...),
+	}); err != nil {
+		return fmt.Errorf("%w: %v", ErrGradingGroundingUnavailable, err)
+	}
+	return nil
+}
+
+func validateFrozenGradingGrounding(
+	requested GroundingSnapshot,
+	frozen GroundingSnapshot,
+) error {
+	if err := validateGradingGroundingSnapshot(frozen); err != nil {
+		return err
+	}
+	withoutRevision := cloneGradingGroundingSnapshot(frozen)
+	withoutRevision.VectorRevisionID = ""
+	if !reflect.DeepEqual(requested, withoutRevision) {
+		return fmt.Errorf(
+			"%w: grounding freeze changed the requested textbook scope",
+			ErrGradingGroundingUnavailable,
+		)
+	}
+	return nil
+}
+
+func validateStoredGradingGrounding(value gradingStoredGrounding) error {
+	if strings.TrimSpace(value.IdentityDigest) == "" || len(value.Receipts) == 0 {
+		return fmt.Errorf("%w: stored grounding identity is incomplete", ErrGradingGroundingUnavailable)
+	}
+	probe := GroundingSnapshotResult{
+		Text: "verified", Found: true,
+		Receipts: cloneGroundingEvidenceReceipts(value.Receipts),
+	}
+	if err := probe.validate(value.Snapshot); err != nil {
+		return fmt.Errorf("%w: %v", ErrGradingGroundingUnavailable, err)
+	}
+	digest, err := gradingGroundingIdentityDigest(value.Snapshot, value.Receipts)
+	if err != nil {
+		return err
+	}
+	if digest != value.IdentityDigest {
+		return fmt.Errorf("%w: stored grounding digest mismatch", ErrGradingGroundingUnavailable)
+	}
+	return nil
+}
+
+func encodeGroundedPhysicalPayload(
+	payload string,
+	evidence gradingProviderGrounding,
+) (string, error) {
+	if !json.Valid([]byte(payload)) {
+		return "", fmt.Errorf("physical result is not valid JSON")
+	}
+	stored := gradingStoredGrounding{
+		Snapshot:       evidence.snapshot,
+		Receipts:       cloneGroundingEvidenceReceipts(evidence.receipts),
+		IdentityDigest: evidence.identityDigest,
+	}
+	if err := validateStoredGradingGrounding(stored); err != nil {
+		return "", err
+	}
+	raw, err := json.Marshal(gradingGroundedPhysicalEnvelope{
+		Schema:    gradingGroundedPhysicalSchema,
+		Payload:   json.RawMessage(payload),
+		Grounding: stored,
+	})
+	return string(raw), err
+}
+
+func decodeGroundedPhysicalPayload(
+	stored string,
+	expected *gradingProviderGrounding,
+) (payload string, grounding *gradingStoredGrounding, enveloped bool, err error) {
+	if !json.Valid([]byte(stored)) {
+		return "", nil, false, fmt.Errorf("physical result is not valid JSON")
+	}
+	var envelope gradingGroundedPhysicalEnvelope
+	if unmarshalErr := json.Unmarshal([]byte(stored), &envelope); unmarshalErr != nil ||
+		envelope.Schema != gradingGroundedPhysicalSchema {
+		if expected != nil {
+			return "", nil, false, fmt.Errorf(
+				"%w: grounded invocation has no durable evidence envelope",
+				ErrModelInvocationRequiresReconciliation,
+			)
+		}
+		return stored, nil, false, nil
+	}
+	if !json.Valid(envelope.Payload) {
+		return "", nil, true, fmt.Errorf(
+			"%w: grounded invocation payload is invalid",
+			ErrModelInvocationRequiresReconciliation,
+		)
+	}
+	if validateErr := validateStoredGradingGrounding(envelope.Grounding); validateErr != nil {
+		return "", nil, true, validateErr
+	}
+	if expected != nil && envelope.Grounding.IdentityDigest != expected.identityDigest {
+		return "", nil, true, fmt.Errorf(
+			"%w: grounded invocation evidence identity mismatch",
+			ErrModelInvocationRequiresReconciliation,
+		)
+	}
+	value := envelope.Grounding
+	return string(envelope.Payload), &value, true, nil
+}
+
+type gradingGroundingSessionKey struct {
+	records   *k12storage.Store
+	agentName string
+	jobID     string
+}
+
+type gradingGroundingItemState struct {
+	mu       sync.Mutex
+	resolved bool
+	evidence gradingProviderGrounding
+	err      error
+}
+
+type gradingGroundingSession struct {
+	mu             sync.Mutex
+	initialized    bool
+	required       bool
+	snapshot       GroundingSnapshot
+	evidenceSource SnapshotGroundingEvidence
+	items          map[string]*gradingGroundingItemState
+	err            error
+}
+
+type gradingGroundingInvocationInspection struct {
+	snapshot           GroundingSnapshot
+	found              bool
+	relevantSucceeded  int
+	envelopedSucceeded int
+	directSucceeded    int
+}
+
+var gradingGroundingSessions sync.Map
+
+func prepareGradingItemGrounding(
+	ctx context.Context,
+	deps Deps,
+	job GradingJobView,
+	q RecognizedQuestion,
+	req GradeRequest,
+) (context.Context, bool, error) {
+	if strings.TrimSpace(req.Subject) != "数学" {
+		return ctx, false, nil
+	}
+	key := gradingGroundingSessionKey{
+		records:   deps.Records,
+		agentName: strings.TrimSpace(job.Record.AgentName),
+		jobID:     strings.TrimSpace(job.Record.RecordID),
+	}
+	loaded, _ := gradingGroundingSessions.LoadOrStore(key, &gradingGroundingSession{
+		items: make(map[string]*gradingGroundingItemState),
+	})
+	session := loaded.(*gradingGroundingSession)
+	if err := session.initialize(ctx, deps, job); err != nil {
+		return ctx, session.required, err
+	}
+	if !session.required {
+		return ctx, false, nil
+	}
+	evidence, err := session.resolveItem(ctx, q, req)
+	if err != nil {
+		return ctx, true, err
+	}
+	return withGradingProviderGrounding(ctx, evidence), true, nil
+}
+
+func (session *gradingGroundingSession) initialize(
+	ctx context.Context,
+	deps Deps,
+	job GradingJobView,
+) error {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.initialized {
+		return session.err
+	}
+	session.initialized = true
+	textbookOwnerID, err := resolveGradingGroundingTextbookOwner(ctx, deps, job)
+	if err != nil {
+		session.required = true
+		session.err = err
+		return err
+	}
+
+	inspection, err := inspectGradingGroundingInvocations(
+		ctx, deps, job.Record.AgentName, job.Record.RecordID,
+	)
+	if err != nil {
+		session.required = true
+		session.err = err
+		return err
+	}
+	if inspection.found {
+		evidenceSource, ok := deps.Grounding.(SnapshotGroundingEvidence)
+		if !ok {
+			session.required = true
+			session.err = fmt.Errorf(
+				"%w: pinned grounding evidence lookup is unavailable",
+				ErrGradingGroundingUnavailable,
+			)
+			return session.err
+		}
+		session.required = true
+		session.snapshot = cloneGradingGroundingSnapshot(inspection.snapshot)
+		session.evidenceSource = evidenceSource
+		return nil
+	}
+
+	if deps.Records == nil || textbookOwnerID == "" {
+		return nil
+	}
+	textbookScope := k12storage.TextbookScope{
+		OwnerID:   textbookOwnerID,
+		AgentName: strings.TrimSpace(job.Record.AgentName),
+		Subject:   "math",
+	}
+	scope, found, resolveErr := deps.Records.GetActiveTextbookGroundingScope(ctx, textbookScope)
+	if resolveErr != nil {
+		session.required = true
+		session.err = fmt.Errorf(
+			"%w: resolve active textbook scope: %v",
+			ErrGradingGroundingUnavailable, resolveErr,
+		)
+		return session.err
+	}
+	if !found {
+		_, handled, catalogErr := deps.Records.GetActiveTextbookCatalog(ctx, textbookScope)
+		if catalogErr != nil || handled {
+			session.required = true
+			if catalogErr != nil {
+				session.err = fmt.Errorf(
+					"%w: active textbook binding is incomplete: %v",
+					ErrGradingGroundingUnavailable, catalogErr,
+				)
+			} else {
+				session.err = fmt.Errorf(
+					"%w: active textbook binding has no verified grounding scope",
+					ErrGradingGroundingUnavailable,
+				)
+			}
+			return session.err
+		}
+		return nil
+	}
+	session.required = true
+	if inspection.directSucceeded > 0 {
+		session.err = fmt.Errorf(
+			"%w: existing item result has no durable grounding envelope",
+			ErrModelInvocationRequiresReconciliation,
+		)
+		return session.err
+	}
+	if err := k12.ValidateTextbookGroundingScope(scope); err != nil {
+		session.err = fmt.Errorf("%w: %v", ErrGradingGroundingUnavailable, err)
+		return session.err
+	}
+	snapshotter, snapshotOK := deps.Grounding.(SnapshotGrounding)
+	evidenceSource, evidenceOK := deps.Grounding.(SnapshotGroundingEvidence)
+	if !snapshotOK || !evidenceOK {
+		session.err = fmt.Errorf(
+			"%w: pinned grounding freeze and evidence lookup are required",
+			ErrGradingGroundingUnavailable,
+		)
+		return session.err
+	}
+	requested := GroundingSnapshot{
+		AgentName:          strings.TrimSpace(job.Record.AgentName),
+		LearnerID:          strings.TrimSpace(job.Record.AgentName),
+		Subject:            "数学",
+		TextbookBindingID:  scope.TextbookBindingID,
+		TextbookManifestID: scope.TextbookManifestID,
+		DocumentID:         scope.DocumentID,
+		DocumentGeneration: scope.DocumentGeneration,
+		SourceDigest:       scope.SourceDigest,
+		Edition:            scope.Edition,
+		Volume:             scope.Volume,
+		SegmentRefs:        append([]string(nil), scope.SegmentRefs...),
+		PageRefs:           append([]k12.TextbookGroundingPageRef(nil), scope.PageRefs...),
+	}
+	requested = cloneGradingGroundingSnapshot(requested)
+	frozen, freezeErr := snapshotter.FreezeGroundingSnapshot(ctx, requested)
+	if freezeErr != nil {
+		session.err = fmt.Errorf(
+			"%w: freeze textbook grounding: %v",
+			ErrGradingGroundingUnavailable, freezeErr,
+		)
+		return session.err
+	}
+	if err := validateFrozenGradingGrounding(requested, frozen); err != nil {
+		session.err = err
+		return err
+	}
+	session.snapshot = cloneGradingGroundingSnapshot(frozen)
+	session.evidenceSource = evidenceSource
+	return nil
+}
+
+func resolveGradingGroundingTextbookOwner(
+	ctx context.Context,
+	deps Deps,
+	job GradingJobView,
+) (string, error) {
+	if strings.TrimSpace(job.Fields.SourceKind) != "image_task" {
+		return strings.TrimSpace(deps.TextbookOwnerID), nil
+	}
+	if deps.Records == nil {
+		return "", fmt.Errorf(
+			"%w: ImageTask owner store is unavailable",
+			ErrGradingGroundingUnavailable,
+		)
+	}
+	dispatchID, err := gradingFinalImageTaskDispatchID(job)
+	if err != nil {
+		return "", fmt.Errorf(
+			"%w: ImageTask source identity is invalid: %v",
+			ErrGradingGroundingUnavailable, err,
+		)
+	}
+	ownerID, err := deps.Records.GetImageTaskOwnerScope(
+		ctx, job.Record.AgentName, dispatchID,
+	)
+	if err != nil {
+		return "", fmt.Errorf(
+			"%w: ImageTask owner scope is unavailable: %v",
+			ErrGradingGroundingUnavailable, err,
+		)
+	}
+	ownerID = strings.TrimSpace(ownerID)
+	if ownerID == "" {
+		return "", fmt.Errorf(
+			"%w: ImageTask owner scope is empty",
+			ErrGradingGroundingUnavailable,
+		)
+	}
+	return ownerID, nil
+}
+
+func (session *gradingGroundingSession) resolveItem(
+	ctx context.Context,
+	q RecognizedQuestion,
+	req GradeRequest,
+) (gradingProviderGrounding, error) {
+	itemKey := modelInvocationDigest(
+		[]byte(strings.TrimSpace(q.ProblemID)),
+		[]byte(strings.TrimSpace(q.AttemptID)),
+		[]byte(fmt.Sprintf("%d", q.ConfirmedVersion)),
+		[]byte(strings.TrimSpace(q.InputDigest)),
+	)
+	session.mu.Lock()
+	state := session.items[itemKey]
+	if state == nil {
+		state = &gradingGroundingItemState{}
+		session.items[itemKey] = state
+	}
+	snapshot := cloneGradingGroundingSnapshot(session.snapshot)
+	evidenceSource := session.evidenceSource
+	session.mu.Unlock()
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.resolved {
+		return state.evidence, state.err
+	}
+	state.resolved = true
+	query := gradingItemGroundingQuery(q, req)
+	result, err := evidenceSource.GroundSnapshotWithEvidence(
+		ctx, snapshot, query, strings.TrimSpace(req.Grade),
+	)
+	if err != nil {
+		state.err = fmt.Errorf(
+			"%w: pinned textbook query failed: %v",
+			ErrGradingGroundingUnavailable, err,
+		)
+		return gradingProviderGrounding{}, state.err
+	}
+	state.evidence, state.err = newGradingProviderGrounding(snapshot, result)
+	return state.evidence, state.err
+}
+
+func gradingItemGroundingQuery(q RecognizedQuestion, req GradeRequest) string {
+	values := make([]string, 0, len(req.KnowledgePoints))
+	for _, value := range req.KnowledgePoints {
+		if value = strings.TrimSpace(value); value != "" {
+			values = append(values, value)
+		}
+	}
+	if len(values) > 0 {
+		return strings.Join(values, "、")
+	}
+	if value := strings.TrimSpace(req.Problem); value != "" {
+		return value
+	}
+	return strings.TrimSpace(q.Question)
+}
+
+func inspectGradingGroundingInvocations(
+	ctx context.Context,
+	deps Deps,
+	agentName string,
+	jobID string,
+) (gradingGroundingInvocationInspection, error) {
+	var inspection gradingGroundingInvocationInspection
+	if deps.Records == nil {
+		return inspection, nil
+	}
+	invocations, err := deps.Records.ListGradingItemInvocations(ctx, agentName, jobID)
+	if err != nil {
+		return inspection, err
+	}
+	for _, invocation := range invocations {
+		if invocation.Status != k12.ModelInvocationSucceeded ||
+			!gradingGroundingRelevantOperation(invocation.Operation) {
+			continue
+		}
+		inspection.relevantSucceeded++
+		if invocation.ResultDigest != modelInvocationDigest([]byte(invocation.ResultJSON)) {
+			return inspection, fmt.Errorf(
+				"%w: invocation=%s result digest mismatch",
+				ErrModelInvocationRequiresReconciliation, invocation.InvocationID,
+			)
+		}
+		_, storedGrounding, enveloped, decodeErr := decodeGroundedPhysicalPayload(
+			invocation.ResultJSON, nil,
+		)
+		if decodeErr != nil {
+			return inspection, decodeErr
+		}
+		if !enveloped {
+			inspection.directSucceeded++
+			continue
+		}
+		inspection.envelopedSucceeded++
+		if storedGrounding == nil {
+			return inspection, fmt.Errorf(
+				"%w: invocation=%s grounding envelope is incomplete",
+				ErrModelInvocationRequiresReconciliation, invocation.InvocationID,
+			)
+		}
+		snapshot := cloneGradingGroundingSnapshot(storedGrounding.Snapshot)
+		if err := validateGradingGroundingSnapshot(snapshot); err != nil {
+			return inspection, err
+		}
+		if !inspection.found {
+			inspection.snapshot = snapshot
+			inspection.found = true
+			continue
+		}
+		if !reflect.DeepEqual(inspection.snapshot, snapshot) {
+			return inspection, fmt.Errorf(
+				"%w: item invocations carry inconsistent grounding snapshots",
+				ErrModelInvocationRequiresReconciliation,
+			)
+		}
+	}
+	if inspection.envelopedSucceeded > 0 && inspection.directSucceeded > 0 {
+		return inspection, fmt.Errorf(
+			"%w: item invocations only partially carry grounding envelopes",
+			ErrModelInvocationRequiresReconciliation,
+		)
+	}
+	return inspection, nil
+}
+
+func gradingGroundingRelevantOperation(operation k12.GradingItemOperation) bool {
+	switch operation {
+	case k12.GradingItemOperationSolve,
+		k12.GradingItemOperationSolveGenerate,
+		k12.GradingItemOperationSolveVerify,
+		k12.GradingItemOperationGrade:
+		return true
+	default:
+		return false
+	}
+}
+
+func gradingGroundingSnapshotFromItemInvocations(
+	ctx context.Context,
+	deps Deps,
+	agentName string,
+	jobID string,
+) (GroundingSnapshot, bool, error) {
+	inspection, err := inspectGradingGroundingInvocations(ctx, deps, agentName, jobID)
+	if err != nil {
+		return GroundingSnapshot{}, false, err
+	}
+	gradingGroundingSessions.Delete(gradingGroundingSessionKey{
+		records: deps.Records, agentName: strings.TrimSpace(agentName), jobID: strings.TrimSpace(jobID),
+	})
+	if !inspection.found {
+		return GroundingSnapshot{}, false, nil
+	}
+	return cloneGradingGroundingSnapshot(inspection.snapshot), true, nil
 }
 
 func ExecuteGradingPhysicalCall(
@@ -143,6 +795,15 @@ func (e *durableGradingPhysicalCallExecutor) ExecuteGradingPhysicalCall(
 		spec.RequestDigest == "" {
 		return zero, fmt.Errorf("%w: invalid physical grading call identity", ErrInvalidInput)
 	}
+	var expectedGrounding *gradingProviderGrounding
+	if grounding, ok := gradingProviderGroundingFromContext(ctx); ok {
+		expectedGrounding = &grounding
+		spec.RequestDigest = modelInvocationDigest(
+			[]byte("k12-grading-grounded-request-v1"),
+			[]byte(spec.RequestDigest),
+			[]byte(grounding.identityDigest),
+		)
+	}
 
 	commitCtx, cancelCommit := gradingDurableCommitContext(ctx)
 	invocations, err := e.o.deps.Records.ListGradingItemInvocations(
@@ -178,9 +839,15 @@ func (e *durableGradingPhysicalCallExecutor) ExecuteGradingPhysicalCall(
 				return zero, fmt.Errorf("%w: invocation=%s result digest mismatch",
 					ErrModelInvocationRequiresReconciliation, matching.InvocationID)
 			}
+			payload, _, _, decodeErr := decodeGroundedPhysicalPayload(
+				matching.ResultJSON, expectedGrounding,
+			)
+			if decodeErr != nil {
+				return zero, decodeErr
+			}
 			e.remember(spec.Operation, matching.InvocationID)
 			return GradingPhysicalCallResult{
-				Payload: matching.ResultJSON, InvocationID: matching.InvocationID,
+				Payload: payload, InvocationID: matching.InvocationID,
 			}, nil
 		case k12.ModelInvocationPrepared:
 			// Claim below.
@@ -292,10 +959,23 @@ func (e *durableGradingPhysicalCallExecutor) ExecuteGradingPhysicalCall(
 			ledgerErr,
 		)
 	}
+	storedPayload := payload
+	if expectedGrounding != nil {
+		storedPayload, err = encodeGroundedPhysicalPayload(payload, *expectedGrounding)
+		if err != nil {
+			commitCtx, cancelCommit = gradingDurableCommitContext(ctx)
+			defer cancelCommit()
+			_, ledgerErr := e.o.deps.Records.MarkGradingItemInvocationOutcomeUnknown(
+				commitCtx, e.job.Record.AgentName, invocation.InvocationID,
+				"local", "grounding_envelope_encode_failed",
+			)
+			return zero, errors.Join(gradingPhysicalNoRetryError{cause: err}, ledgerErr)
+		}
+	}
 	commitCtx, cancelCommit = gradingDurableCommitContext(ctx)
 	stored, err := e.o.deps.Records.MarkGradingItemInvocationSucceeded(
 		commitCtx, e.job.Record.AgentName, invocation.InvocationID,
-		modelInvocationDigest([]byte(payload)), payload,
+		modelInvocationDigest([]byte(storedPayload)), storedPayload,
 	)
 	cancelCommit()
 	if err != nil {
@@ -311,9 +991,15 @@ func (e *durableGradingPhysicalCallExecutor) ExecuteGradingPhysicalCall(
 			unknownErr,
 		)
 	}
+	returnedPayload, _, _, decodeErr := decodeGroundedPhysicalPayload(
+		stored.ResultJSON, expectedGrounding,
+	)
+	if decodeErr != nil {
+		return zero, decodeErr
+	}
 	e.remember(spec.Operation, stored.InvocationID)
 	return GradingPhysicalCallResult{
-		Payload: stored.ResultJSON, InvocationID: stored.InvocationID,
+		Payload: returnedPayload, InvocationID: stored.InvocationID,
 	}, nil
 }
 
@@ -376,7 +1062,20 @@ func executeDurableSolveOperation(
 	q RecognizedQuestion,
 	gradeReq GradeRequest,
 ) (SolveHomeworkResult, string, error) {
+	groundedCtx, groundingRequired, groundingErr := prepareGradingItemGrounding(
+		ctx, deps, job, q, gradeReq,
+	)
+	if groundingErr != nil {
+		return SolveHomeworkResult{}, "", groundingErr
+	}
+	ctx = groundedCtx
 	if !usesGradingPhysicalCalls(deps.Solver) {
+		if groundingRequired {
+			return SolveHomeworkResult{}, "", fmt.Errorf(
+				"%w: grounded grading requires durable physical solver calls",
+				ErrGradingGroundingUnavailable,
+			)
+		}
 		return executeGradingItemOperation(ctx, o, job, q,
 			k12.GradingItemOperationSolve,
 			struct {
@@ -415,11 +1114,24 @@ func executeDurableGradeOperation(
 	gradeReq GradeRequest,
 	solved SolveHomeworkResult,
 ) (GradeResult, string, error) {
+	groundedCtx, groundingRequired, groundingErr := prepareGradingItemGrounding(
+		ctx, deps, job, q, gradeReq,
+	)
+	if groundingErr != nil {
+		return GradeResult{}, "", groundingErr
+	}
+	ctx = groundedCtx
 	gradeCaller := any(deps.Grader)
 	if deps.VerifiedGrader != nil {
 		gradeCaller = deps.VerifiedGrader
 	}
 	if !usesGradingPhysicalCalls(gradeCaller) {
+		if groundingRequired {
+			return GradeResult{}, "", fmt.Errorf(
+				"%w: grounded grading requires durable physical grader calls",
+				ErrGradingGroundingUnavailable,
+			)
+		}
 		return executeGradingItemOperation(ctx, o, job, q,
 			k12.GradingItemOperationGrade,
 			struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/messagecontent"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	k12 "github.com/hexagon-codes/hexclaw/scenarios/k12"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
@@ -32,6 +34,165 @@ type k12ImageTaskFacade interface {
 	Result(context.Context, string, string) (k12usecase.ImageTaskResult, error)
 }
 
+// k12InboundPhotoRoutingCoordinator 是 composition root 对 V88 入站收据协调器使用的窄缝。
+// 图片任务门面可由装配层与该协调器组合；本入口不复制其 CAS 状态机。
+type k12InboundPhotoRoutingCoordinator interface {
+	Recoverable(context.Context, int) ([]k12usecase.InboundPhotoBundle, error)
+	ConfirmRouting(
+		context.Context,
+		string,
+		string,
+		int64,
+		k12usecase.InboundPhotoRoutingDecision,
+	) (k12usecase.InboundPhotoDispatch, error)
+}
+
+const k12InboundPhotoRecentPracticeWindow = 14 * 24 * 60 * 60
+
+var k12InboundPhotoPaperNoPattern = regexp.MustCompile(`(?i)P-[0-9]{4}-[0-9]{2,}`)
+
+type k12InboundPhotoPracticeRouteInput struct {
+	Now              int64
+	ExplicitDecision k12usecase.InboundPhotoRoutingDecision
+	RecognizedText   []string
+}
+
+type k12InboundPhotoPracticeRoute struct {
+	Decision      k12usecase.InboundPhotoRoutingDecision
+	PracticeSetID string
+}
+
+type k12InboundPhotoPracticeSetReader interface {
+	ListPracticeSets(context.Context, string) ([]k12usecase.PracticeSetView, error)
+}
+
+type k12InboundPhotoPracticeReturnInput struct {
+	AgentName     string
+	ReceiptID     string
+	PracticeSetID string
+	AssetID       string
+	Questions     []k12usecase.RecognizedQuestion
+}
+
+type k12InboundPhotoPracticeReturnState struct {
+	PracticeSetID   string
+	ReturnID        string
+	FinalArtifactID string
+}
+
+// k12InboundPhotoPracticeReturnPort 让 IM worker 只编排已存在的练习回传状态机。
+// Resume 必须先按稳定 receipt 查找既有绑定，避免重启后重新解析到另一张卷。
+type k12InboundPhotoPracticeReturnPort interface {
+	ResumePracticeReturn(context.Context, string, string) (k12InboundPhotoPracticeReturnState, error)
+	AdvancePracticeReturn(
+		context.Context,
+		k12InboundPhotoPracticeReturnInput,
+	) (k12InboundPhotoPracticeReturnState, error)
+}
+
+// resolveK12InboundPhotoPracticeRoute 只读取已固化练习卷事实并输出分流；
+// PracticeSet 回传追加和复批继续由既有用例状态机负责。
+func resolveK12InboundPhotoPracticeRoute(
+	input k12InboundPhotoPracticeRouteInput,
+	sets []k12usecase.PracticeSetView,
+) k12InboundPhotoPracticeRoute {
+	if input.ExplicitDecision == k12usecase.InboundPhotoRouteNewSubmission {
+		return k12InboundPhotoPracticeRoute{Decision: k12usecase.InboundPhotoRouteNewSubmission}
+	}
+	recognized := make(map[string]struct{})
+	for _, evidence := range input.RecognizedText {
+		for _, paperNo := range k12InboundPhotoPaperNoPattern.FindAllString(evidence, -1) {
+			recognized[strings.ToUpper(paperNo)] = struct{}{}
+		}
+	}
+	if len(recognized) > 0 {
+		if len(recognized) != 1 {
+			return k12InboundPhotoPracticeRoute{Decision: k12usecase.InboundPhotoRouteAskedUser}
+		}
+		var paperNo string
+		for candidate := range recognized {
+			paperNo = candidate
+		}
+		matches := make([]k12usecase.PracticeSetView, 0, 1)
+		for _, set := range sets {
+			if k12InboundPhotoUnreturnedPracticeSet(set) &&
+				strings.EqualFold(strings.TrimSpace(set.Fields.PaperNo), paperNo) {
+				matches = append(matches, set)
+			}
+		}
+		if len(matches) == 1 {
+			return k12InboundPhotoPracticeRoute{
+				Decision:      k12usecase.InboundPhotoRouteRegrade,
+				PracticeSetID: strings.TrimSpace(matches[0].Record.RecordID),
+			}
+		}
+		return k12InboundPhotoPracticeRoute{Decision: k12usecase.InboundPhotoRouteAskedUser}
+	}
+
+	recent := make([]k12usecase.PracticeSetView, 0, 1)
+	for _, set := range sets {
+		if !k12InboundPhotoUnreturnedPracticeSet(set) || set.Fields.FinalizedAt <= 0 ||
+			input.Now < set.Fields.FinalizedAt ||
+			input.Now-set.Fields.FinalizedAt > k12InboundPhotoRecentPracticeWindow {
+			continue
+		}
+		recent = append(recent, set)
+	}
+	if len(recent) == 1 {
+		return k12InboundPhotoPracticeRoute{
+			Decision:      k12usecase.InboundPhotoRouteRegrade,
+			PracticeSetID: strings.TrimSpace(recent[0].Record.RecordID),
+		}
+	}
+	return k12InboundPhotoPracticeRoute{Decision: k12usecase.InboundPhotoRouteAskedUser}
+}
+
+func k12InboundPhotoUnreturnedPracticeSet(set k12usecase.PracticeSetView) bool {
+	if set.Record == nil || strings.TrimSpace(set.Record.RecordID) == "" ||
+		strings.TrimSpace(set.Fields.PaperNo) == "" ||
+		(set.Record.Status != k12.PracticeStatusAssigned &&
+			set.Record.Status != k12.PracticeStatusSubmitted) {
+		return false
+	}
+	if set.Record.Status == k12.PracticeStatusAssigned && len(set.Fields.ReturnAssets) == 0 {
+		return true
+	}
+	for _, item := range set.Fields.Items {
+		if !k12.PracticeItemPublishable(item) {
+			continue
+		}
+		if !item.Returned {
+			return true
+		}
+	}
+	return false
+}
+
+func k12InboundPhotoExplicitRoutingDecision(
+	messageIntent string,
+) k12usecase.InboundPhotoRoutingDecision {
+	switch strings.TrimSpace(messageIntent) {
+	case "新作业", "新作业批改":
+		return k12usecase.InboundPhotoRouteNewSubmission
+	default:
+		return k12usecase.InboundPhotoRoutePending
+	}
+}
+
+// maybeHandleK12DingtalkRuntimeMessage 让 composition root 只把文字确认交给同步 handler；
+// 图片 callback 已在 ACK 前进入 V88，禁止再次等待模型或返回附件回复。
+func maybeHandleK12DingtalkRuntimeMessage(
+	ctx context.Context,
+	msg *adapter.Message,
+	router *agentrouter.Dispatcher,
+	runtime *k12DingtalkPhotoInboundRuntime,
+) (*adapter.Reply, bool, error) {
+	if runtime == nil || msg == nil || len(msg.Attachments) != 0 {
+		return nil, false, nil
+	}
+	return maybeHandleK12DingtalkPhoto(ctx, msg, router, runtime)
+}
+
 // maybeHandleK12DingtalkPhoto is the composition-root seam between generic IM
 // delivery and the unified K12 ImageTask facade. It deliberately requires an
 // explicit direct-message routing rule: a K12 default agent must not steal an
@@ -44,9 +205,29 @@ func maybeHandleK12DingtalkPhoto(
 	router *agentrouter.Dispatcher,
 	imageTasks k12ImageTaskFacade,
 ) (*adapter.Reply, bool, error) {
+	if routed := routeK12DingtalkTutor(msg, router); routed != nil {
+		if coordinator, ok := imageTasks.(k12InboundPhotoRoutingCoordinator); ok {
+			if decision, matched := k12PhotoRoutingConfirmationDecision(msg); matched {
+				reply, handled, err := confirmK12PendingPhotoRoute(
+					ctx, msg, routed.AgentName, decision, coordinator,
+				)
+				if handled || err != nil {
+					return reply, true, err
+				}
+			}
+		}
+	}
 	routed := routeK12DingtalkPhotoTutor(msg, router)
 	if routed == nil {
 		return nil, false, nil
+	}
+	if coordinator, ok := imageTasks.(k12InboundPhotoRoutingCoordinator); ok {
+		reply, blocked, err := guardK12PendingPhotoRoute(
+			ctx, msg, routed.AgentName, coordinator,
+		)
+		if blocked || err != nil {
+			return reply, true, err
+		}
 	}
 	if imageTasks == nil {
 		return nil, true, fmt.Errorf("K12 图片任务服务未配置")
@@ -101,6 +282,122 @@ func maybeHandleK12DingtalkPhoto(
 	return reply, true, err
 }
 
+func k12PhotoRoutingConfirmationDecision(
+	msg *adapter.Message,
+) (k12usecase.InboundPhotoRoutingDecision, bool) {
+	if msg == nil || len(msg.Attachments) != 0 {
+		return "", false
+	}
+	if action := strings.TrimSpace(msg.Metadata["interactive_action"]); action != "" {
+		switch action {
+		case string(k12usecase.InboundPhotoRouteRegrade):
+			return k12usecase.InboundPhotoRouteRegrade, true
+		case string(k12usecase.InboundPhotoRouteNewSubmission):
+			return k12usecase.InboundPhotoRouteNewSubmission, true
+		default:
+			return "", false
+		}
+	}
+	switch strings.TrimSpace(msg.Content) {
+	case "1":
+		return k12usecase.InboundPhotoRouteRegrade, true
+	case "2":
+		return k12usecase.InboundPhotoRouteNewSubmission, true
+	default:
+		return "", false
+	}
+}
+
+func confirmK12PendingPhotoRoute(
+	ctx context.Context,
+	msg *adapter.Message,
+	agentName string,
+	decision k12usecase.InboundPhotoRoutingDecision,
+	coordinator k12InboundPhotoRoutingCoordinator,
+) (*adapter.Reply, bool, error) {
+	bundles, err := coordinator.Recoverable(ctx, 100)
+	if err != nil {
+		return nil, true, err
+	}
+	candidates := pendingK12PhotoRouteBundles(bundles, msg, agentName)
+	if len(candidates) == 0 {
+		for _, bundle := range bundles {
+			if k12InboundPhotoBundleMatchesMessage(bundle, msg, agentName) &&
+				bundle.Dispatch.RoutingDecision == decision &&
+				bundle.Dispatch.ConfirmationStatus == k12storage.InboundPhotoConfirmationConfirmed {
+				return nil, true, nil
+			}
+		}
+		return nil, false, nil
+	}
+	if len(candidates) != 1 {
+		reply, replyErr := k12PhotoRoutingConfirmationReply()
+		return reply, true, replyErr
+	}
+	pending := candidates[0]
+	_, err = coordinator.ConfirmRouting(
+		ctx,
+		pending.Receipt.AgentName,
+		pending.Receipt.ReceiptID,
+		pending.Dispatch.Version,
+		decision,
+	)
+	return nil, true, err
+}
+
+func guardK12PendingPhotoRoute(
+	ctx context.Context,
+	msg *adapter.Message,
+	agentName string,
+	coordinator k12InboundPhotoRoutingCoordinator,
+) (*adapter.Reply, bool, error) {
+	bundles, err := coordinator.Recoverable(ctx, 100)
+	if err != nil {
+		return nil, true, err
+	}
+	if len(pendingK12PhotoRouteBundles(bundles, msg, agentName)) == 0 {
+		return nil, false, nil
+	}
+	reply, replyErr := k12PhotoRoutingConfirmationReply()
+	return reply, true, replyErr
+}
+
+func pendingK12PhotoRouteBundles(
+	bundles []k12usecase.InboundPhotoBundle,
+	msg *adapter.Message,
+	agentName string,
+) []k12usecase.InboundPhotoBundle {
+	if msg == nil {
+		return nil
+	}
+	candidates := make([]k12usecase.InboundPhotoBundle, 0, 1)
+	for _, bundle := range bundles {
+		if !k12InboundPhotoBundleMatchesMessage(bundle, msg, agentName) {
+			continue
+		}
+		if bundle.Dispatch.RoutingDecision == k12usecase.InboundPhotoRouteAskedUser &&
+			bundle.Dispatch.ConfirmationStatus == k12storage.InboundPhotoConfirmationWaiting {
+			candidates = append(candidates, bundle)
+		}
+	}
+	return candidates
+}
+
+func k12InboundPhotoBundleMatchesMessage(
+	bundle k12usecase.InboundPhotoBundle,
+	msg *adapter.Message,
+	agentName string,
+) bool {
+	if msg == nil {
+		return false
+	}
+	identity := bundle.Receipt.Identity
+	return bundle.Receipt.AgentName == strings.TrimSpace(agentName) &&
+		strings.ToLower(strings.TrimSpace(identity.Platform)) == string(msg.Platform) &&
+		strings.TrimSpace(identity.InstanceID) == strings.TrimSpace(msg.InstanceID) &&
+		strings.TrimSpace(identity.ChatID) == strings.TrimSpace(msg.ChatID)
+}
+
 func waitK12IMImageTaskResult(
 	ctx context.Context,
 	imageTasks k12ImageTaskFacade,
@@ -120,7 +417,7 @@ func waitK12IMImageTaskResult(
 		case k12.ImageTaskStatusCancelled:
 			return nil, fmt.Errorf("K12 图片任务已取消")
 		case k12.ImageTaskStatusAwaitingConfirmation:
-			return nil, fmt.Errorf("K12 图片任务需要家长确认图片类型")
+			return k12PhotoRoutingConfirmationReply()
 		}
 		if !homeworkConfirmed && view.HomeworkProjection != nil &&
 			view.HomeworkProjection.Stage == k12.GradingStageAwaitingConfirmation {
@@ -146,7 +443,7 @@ func waitK12IMImageTaskResult(
 		case "creative":
 			return k12CreativeWorkReply(result)
 		case "awaiting_confirmation":
-			return nil, fmt.Errorf("K12 图片任务需要家长确认识别内容")
+			return k12PhotoRoutingConfirmationReply()
 		}
 		select {
 		case <-ctx.Done():
@@ -154,6 +451,34 @@ func waitK12IMImageTaskResult(
 		case <-ticker.C:
 		}
 	}
+}
+
+const k12PhotoRoutingConfirmationText = "回复 1=练习卷回传，2=新作业批改"
+
+// k12PhotoRoutingConfirmationReply 用同一份渠道中立 Markdown 投影原生按钮与文字降级；
+// 两种入口只携带等价 route action，不在回调内猜测最终分流。
+func k12PhotoRoutingConfirmationReply() (*adapter.Reply, error) {
+	message, err := channel.NewCanonicalMarkdownMessageWithAttachments(
+		messagecontent.ProducerK12,
+		"zh-CN",
+		k12PhotoRoutingConfirmationText,
+		k12PhotoRoutingConfirmationText,
+		"",
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	reply := adapterReplyFromChannelMessage(message)
+	reply.Interactive = &adapter.InteractivePayload{
+		Type:   adapter.InteractiveTypeButtons,
+		Prompt: k12PhotoRoutingConfirmationText,
+		Buttons: []adapter.InteractiveButton{
+			{Label: "练习卷回传", Action: string(k12usecase.InboundPhotoRouteRegrade), Variant: adapter.ButtonPrimary},
+			{Label: "新作业批改", Action: string(k12usecase.InboundPhotoRouteNewSubmission), Variant: adapter.ButtonSecondary},
+		},
+	}
+	return reply, nil
 }
 
 func k12CreativeWorkReply(result k12usecase.ImageTaskResult) (*adapter.Reply, error) {
@@ -186,13 +511,17 @@ func k12CreativeWorkReply(result k12usecase.ImageTaskResult) (*adapter.Reply, er
 // K12-INV-015：当前渠道只允许 direct，群 conversation 永不进入业务流——群聊消息
 // （钉钉 conversation_type="2"）在此静默交还通用路径，绝不触发批改。
 func routeK12DingtalkPhotoTutor(msg *adapter.Message, router *agentrouter.Dispatcher) *agentrouter.RoutingResult {
+	if msg == nil || len(msg.Attachments) != 1 || strings.TrimSpace(msg.Attachments[0].Type) != "image" {
+		return nil
+	}
+	return routeK12DingtalkTutor(msg, router)
+}
+
+func routeK12DingtalkTutor(msg *adapter.Message, router *agentrouter.Dispatcher) *agentrouter.RoutingResult {
 	if msg == nil || router == nil || msg.Platform != adapter.PlatformDingtalk {
 		return nil
 	}
 	if msg.Metadata["conversation_type"] == "2" { // 钉钉群聊约定值（adapter/dingtalk 同一口径）
-		return nil
-	}
-	if len(msg.Attachments) != 1 || strings.TrimSpace(msg.Attachments[0].Type) != "image" {
 		return nil
 	}
 	routed := router.Route(agentrouter.RouteRequest{
