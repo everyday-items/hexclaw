@@ -24,44 +24,12 @@ func (d Deps) PrepareAndSendGradingFinalArtifactExact(
 	ctx context.Context,
 	agentName, finalArtifactID, expectedDigest string,
 ) (k12.DeliveryBatch, bool, error) {
-	return d.prepareAndSendGradingFinalArtifactExact(
-		ctx, agentName, finalArtifactID, expectedDigest, nil,
-	)
-}
-
-// PrepareAndSendGradingFinalArtifactForExpectedBindingExact 增加应用绑定的乐观
-// 绑定前置条件，同时保留与常规 DD-024 路径相同的不可变最终产物和对象标识。
-func (d Deps) PrepareAndSendGradingFinalArtifactForExpectedBindingExact(
-	ctx context.Context,
-	agentName, finalArtifactID, expectedDigest string,
-	expected ExpectedDeliveryBinding,
-) (k12.DeliveryBatch, bool, error) {
-	return d.prepareAndSendGradingFinalArtifactExact(
-		ctx, agentName, finalArtifactID, expectedDigest, &expected,
-	)
-}
-
-func (d Deps) prepareAndSendGradingFinalArtifactExact(
-	ctx context.Context,
-	agentName, finalArtifactID, expectedDigest string,
-	expected *ExpectedDeliveryBinding,
-) (k12.DeliveryBatch, bool, error) {
 	finalArtifact, err := d.getExactGradingFinalArtifact(
 		ctx, strings.TrimSpace(agentName), strings.TrimSpace(finalArtifactID),
 		strings.TrimSpace(expectedDigest),
 	)
 	if err != nil {
 		return k12.DeliveryBatch{}, false, err
-	}
-	if expected != nil {
-		return d.prepareAndSendTextBatchWithExpectedBinding(
-			ctx,
-			finalArtifact.AgentName,
-			k12.PrintSourceGradingFinalArtifact,
-			finalArtifact.ArtifactID+":"+finalArtifact.ArtifactDigest,
-			finalArtifact.CanonicalMarkdown,
-			*expected,
-		)
 	}
 	return d.PrepareAndSendTextBatch(
 		ctx,

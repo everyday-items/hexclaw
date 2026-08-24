@@ -1,11 +1,16 @@
 package apihttp
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
+	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
@@ -122,6 +127,40 @@ func toCreativeWorkDTO(v usecase.CreativeWorkView) creativeWorkDTO {
 	}
 }
 
+func (h *handler) creativeWorkDTOWithDeliveryBatch(
+	ctx context.Context,
+	agent string,
+	view usecase.CreativeWorkView,
+) (creativeWorkDTO, error) {
+	dto := toCreativeWorkDTO(view)
+	if view.GenerationState.Latest == nil || view.GenerationState.Latest.Feedback == nil {
+		return dto, nil
+	}
+	content, err := canonicalCreativeWorkText(view)
+	if err != nil {
+		return creativeWorkDTO{}, err
+	}
+	var attachments []usecase.DeliveryAttachmentIdentity
+	if strings.TrimSpace(dto.SourceAssetID) != "" {
+		identity, ok := creativeWorkAttachmentIdentity(agent, dto)
+		if !ok {
+			return dto, nil
+		}
+		attachments = []usecase.DeliveryAttachmentIdentity{identity}
+	}
+	batch, err := h.rt.Deps.GetDeliveryBatchForMessageIdentity(
+		ctx, agent, "creative_work", dto.WorkID, content, attachments,
+	)
+	if errors.Is(err, records.ErrNotFound) {
+		return dto, nil
+	}
+	if err != nil {
+		return creativeWorkDTO{}, err
+	}
+	dto.DeliveryBatchID = batch.BatchID
+	return dto, nil
+}
+
 type createWorkReq struct {
 	Agent    string `json:"agent"`
 	WorkType string `json:"work_type"`
@@ -173,7 +212,12 @@ func (h *handler) listCreativeWorks(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]creativeWorkDTO, 0, len(items))
 	for _, item := range items {
-		out = append(out, toCreativeWorkDTO(item))
+		dto, dtoErr := h.creativeWorkDTOWithDeliveryBatch(r.Context(), agent, item)
+		if dtoErr != nil {
+			writeErr(w, http.StatusInternalServerError, dtoErr.Error())
+			return
+		}
+		out = append(out, dto)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": out})
 }
@@ -191,7 +235,12 @@ func (h *handler) getCreativeWork(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, httpStatusForK12Error(err, http.StatusNotFound), err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, toCreativeWorkDTO(view))
+	dto, err := h.creativeWorkDTOWithDeliveryBatch(r.Context(), agent, view)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, dto)
 }
 
 func (h *handler) generateWorkFeedback(w http.ResponseWriter, r *http.Request) {
@@ -231,19 +280,129 @@ func (h *handler) sendCreativeWork(w http.ResponseWriter, r *http.Request) {
 		writeDeliveryError(w, err)
 		return
 	}
+	dto := toCreativeWorkDTO(view)
+	sourceAssetID := strings.TrimSpace(dto.SourceAssetID)
+	ownerScope := ""
+	if sourceAssetID != "" {
+		ownerScope, err = h.authorizedAgentOwnerScope(r.Context(), req.Agent)
+		if err != nil {
+			writeAssetScopeErr(w, err)
+			return
+		}
+	}
 	content, err := canonicalCreativeWorkText(view)
 	if err != nil {
 		writeDeliveryError(w, err)
 		return
 	}
-	batch, _, err := h.rt.Deps.PrepareAndSendTextBatch(
-		r.Context(), req.Agent, "creative_work", workID, content,
+	message := usecase.DeliveryMessage{Content: content}
+	if sourceAssetID != "" {
+		identity, hasIdentity := creativeWorkAttachmentIdentity(req.Agent, dto)
+		replayExisting := func() (k12.DeliveryBatch, bool, error) {
+			if !hasIdentity {
+				return k12.DeliveryBatch{}, false, nil
+			}
+			existing, lookupErr := h.rt.Deps.ReplayDeliveryBatchForMessageIdentity(
+				r.Context(), req.Agent, "creative_work", workID, content,
+				[]usecase.DeliveryAttachmentIdentity{identity},
+			)
+			if errors.Is(lookupErr, records.ErrNotFound) {
+				return k12.DeliveryBatch{}, false, nil
+			}
+			return existing, lookupErr == nil, lookupErr
+		}
+		if existing, found, replayErr := replayExisting(); replayErr != nil {
+			writeDeliveryError(w, replayErr)
+			return
+		} else if found {
+			writeJSON(w, http.StatusOK, existing)
+			return
+		}
+		gateway := h.pageAssetGateway()
+		if gateway == nil {
+			writeErr(w, http.StatusServiceUnavailable, "PageAsset repository unavailable")
+			return
+		}
+		ready, openErr := gateway.OpenReady(
+			r.Context(), ownerScope, req.Agent, sourceAssetID,
+		)
+		if openErr != nil {
+			if existing, found, replayErr := replayExisting(); replayErr != nil {
+				writeDeliveryError(w, replayErr)
+				return
+			} else if found {
+				writeJSON(w, http.StatusOK, existing)
+				return
+			}
+			if errors.Is(openErr, records.ErrScopeNotFound) ||
+				errors.Is(openErr, k12storage.ErrPageAssetNotFound) {
+				writeErr(w, http.StatusNotFound, "Creative work asset not found")
+				return
+			}
+			writeErr(w, http.StatusInternalServerError, "Creative work asset unavailable")
+			return
+		}
+		extension := ""
+		switch ready.Metadata.MediaType {
+		case "image/png":
+			extension = ".png"
+		case "image/jpeg":
+			extension = ".jpg"
+		case "image/gif":
+			extension = ".gif"
+		case "image/webp":
+			extension = ".webp"
+		default:
+			writeErr(w, http.StatusInternalServerError, "Creative work asset media type unavailable")
+			return
+		}
+		message.Attachments = []usecase.DeliveryAttachment{{
+			Name: dto.DisplayName + extension,
+			MIME: ready.Metadata.MediaType,
+			Data: append([]byte(nil), ready.Data...),
+		}}
+	}
+	batch, _, err := h.rt.Deps.PrepareAndSendMessageBatch(
+		r.Context(), req.Agent, "creative_work", workID, message,
 	)
 	if err != nil {
 		writeDeliveryError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, batch)
+}
+
+func creativeWorkAttachmentIdentity(
+	agent string,
+	dto creativeWorkDTO,
+) (usecase.DeliveryAttachmentIdentity, bool) {
+	assetAgent, file, err := assetstore.Parse(dto.SourceAssetID)
+	if err != nil || assetAgent != strings.TrimSpace(agent) {
+		return usecase.DeliveryAttachmentIdentity{}, false
+	}
+	dot := strings.LastIndexByte(file, '.')
+	if dot <= 0 {
+		return usecase.DeliveryAttachmentIdentity{}, false
+	}
+	extension := file[dot:]
+	mediaType := ""
+	switch extension {
+	case ".png":
+		mediaType = "image/png"
+	case ".jpg":
+		mediaType = "image/jpeg"
+	case ".gif":
+		mediaType = "image/gif"
+	case ".webp":
+		mediaType = "image/webp"
+	default:
+		return usecase.DeliveryAttachmentIdentity{}, false
+	}
+	return usecase.DeliveryAttachmentIdentity{
+		Name:          dto.DisplayName + extension,
+		MIME:          mediaType,
+		ContentDigest: "sha256:" + file[:dot],
+	}, true
 }
 
 func (h *handler) deleteCreativeWork(w http.ResponseWriter, r *http.Request) {
@@ -283,9 +442,6 @@ func canonicalCreativeWorkText(view usecase.CreativeWorkView) (string, error) {
 	}
 	if dto.ContentMarkdown != "" {
 		parts = append(parts, dto.ContentMarkdown)
-	}
-	if dto.SourceAssetID != "" {
-		parts = append(parts, "原图："+dto.SourceAssetID)
 	}
 	parts = append(parts, view.GenerationState.Latest.Feedback.ProjectionMarkdown)
 	return strings.Join(parts, "\n\n"), nil

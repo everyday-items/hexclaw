@@ -38,6 +38,13 @@ func TestK12ParentTeachingGuide_RealHexClawGPT(t *testing.T) {
 	if modelName == "" {
 		modelName = "gpt-5.6-sol"
 	}
+	reasoningEffort := strings.TrimSpace(os.Getenv("HEXCLAW_K12_PARENT_GUIDE_REASONING_EFFORT"))
+	if reasoningEffort == "" {
+		reasoningEffort = "low"
+	}
+	if reasoningEffort != "low" && reasoningEffort != "none" {
+		t.Fatalf("unsupported probe reasoning effort %q", reasoningEffort)
+	}
 	if router.DefaultName() != providerName {
 		t.Fatalf("unexpected real route provider=%q", router.DefaultName())
 	}
@@ -82,7 +89,7 @@ func TestK12ParentTeachingGuide_RealHexClawGPT(t *testing.T) {
 			llm.CompletionRequest{
 				Model: modelName,
 				Metadata: map[string]any{
-					"reasoning_effort": "low",
+					"reasoning_effort": reasoningEffort,
 				},
 				Messages: []llm.Message{
 					{Role: llm.RoleSystem, Content: "你是中小学家长辅导助手。只处理用户给出的这一道题及已验算解答，不得改写答案或完整方法，不得声称引用未提供的教材。answer 只能是已验算解答中明确出现的简短最终答案，禁止把整段解答塞入 answer。输出必须是单个 JSON 对象且不要代码围栏；必须且只能包含 answer、full_solution_steps、grade_level_method、likely_mistakes、parent_teaching_sequence、follow_up_questions、checking_method 七个字段，四个复数字段必须是非空字符串数组。每一项都要针对当前题目，不得输出可套用到任意题的通用建议。"},
@@ -122,6 +129,6 @@ func TestK12ParentTeachingGuide_RealHexClawGPT(t *testing.T) {
 		strings.Join(guide.LikelyMistakes, "\n"), strings.Join(guide.ParentTeachingSequence, "\n"),
 		strings.Join(guide.FollowUpQuestions, "\n"), guide.CheckingMethod,
 	}, "\x00")))
-	t.Logf("PARENT_GUIDE_OK provider=%s model=%s skill_source=%s prompt_sha256=%x result_sha256=%x fields=7",
-		providerName, modelName, skillSource, promptDigest, resultDigest)
+	t.Logf("PARENT_GUIDE_OK provider=%s model=%s reasoning_effort=%s skill_source=%s prompt_sha256=%x result_sha256=%x fields=7",
+		providerName, modelName, reasoningEffort, skillSource, promptDigest, resultDigest)
 }

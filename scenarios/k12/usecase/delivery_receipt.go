@@ -21,12 +21,128 @@ func deliveryDigest(value string) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
+func normalizeDeliveryMessage(message DeliveryMessage) (DeliveryMessage, error) {
+	message.Content = strings.TrimSpace(message.Content)
+	if message.Content == "" {
+		return DeliveryMessage{}, fmt.Errorf("%w: delivery content required", ErrInvalidInput)
+	}
+	attachments := make([]DeliveryAttachment, len(message.Attachments))
+	for i, attachment := range message.Attachments {
+		attachment.Name = strings.TrimSpace(attachment.Name)
+		attachment.MIME = strings.ToLower(strings.TrimSpace(attachment.MIME))
+		if attachment.Name == "" || attachment.MIME == "" || len(attachment.Data) == 0 {
+			return DeliveryMessage{}, fmt.Errorf(
+				"%w: delivery attachment %d is incomplete", ErrInvalidInput, i+1,
+			)
+		}
+		attachment.Data = append([]byte(nil), attachment.Data...)
+		attachments[i] = attachment
+	}
+	message.Attachments = attachments
+	return message, nil
+}
+
+func deliveryMessageDigest(message DeliveryMessage) string {
+	identities := make([]DeliveryAttachmentIdentity, 0, len(message.Attachments))
+	for _, attachment := range message.Attachments {
+		identities = append(identities, DeliveryAttachmentIdentity{
+			Name:          attachment.Name,
+			MIME:          attachment.MIME,
+			ContentDigest: deliveryDigest(string(attachment.Data)),
+		})
+	}
+	digest, _ := deliveryMessageIdentityDigest(message.Content, identities)
+	return digest
+}
+
+func deliveryMessageIdentityDigest(
+	content string,
+	attachments []DeliveryAttachmentIdentity,
+) (string, error) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return "", fmt.Errorf("%w: delivery content required", ErrInvalidInput)
+	}
+	if len(attachments) == 0 {
+		return deliveryDigest(content), nil
+	}
+	type attachmentDigest struct {
+		Name   string `json:"name"`
+		MIME   string `json:"mime"`
+		Digest string `json:"digest"`
+	}
+	normalized := make([]attachmentDigest, 0, len(attachments))
+	for i, attachment := range attachments {
+		attachment.Name = strings.TrimSpace(attachment.Name)
+		attachment.MIME = strings.ToLower(strings.TrimSpace(attachment.MIME))
+		attachment.ContentDigest = strings.ToLower(strings.TrimSpace(attachment.ContentDigest))
+		rawDigest, ok := strings.CutPrefix(attachment.ContentDigest, "sha256:")
+		decoded, err := hex.DecodeString(rawDigest)
+		if attachment.Name == "" || attachment.MIME == "" || !ok || err != nil || len(decoded) != sha256.Size {
+			return "", fmt.Errorf(
+				"%w: delivery attachment identity %d is incomplete", ErrInvalidInput, i+1,
+			)
+		}
+		normalized = append(normalized, attachmentDigest{
+			Name: attachment.Name, MIME: attachment.MIME, Digest: attachment.ContentDigest,
+		})
+	}
+	payload, _ := json.Marshal(struct {
+		Content     string             `json:"content"`
+		Attachments []attachmentDigest `json:"attachments"`
+	}{Content: content, Attachments: normalized})
+	return deliveryDigest(string(payload)), nil
+}
+
 func deliveryDedupeKey(agentName, objectKind, objectID, bindingID, payloadDigest string) string {
 	return deliveryDigest(strings.Join([]string{agentName, objectKind, objectID, bindingID, payloadDigest}, "\x00"))
 }
 
 func deliveryBatchDedupeKey(agentName, objectKind, objectID, contentDigest string) string {
 	return deliveryDigest(strings.Join([]string{agentName, objectKind, objectID, contentDigest}, "\x00"))
+}
+
+// GetDeliveryBatchForMessageIdentity 只读取与当前正文及附件身份完全一致的冻结批次。
+// 它不解析目标、不准备载荷，也不启动 pending 子回执或跨越渠道边界。
+func (d Deps) GetDeliveryBatchForMessageIdentity(
+	ctx context.Context,
+	agentName, objectKind, objectID, content string,
+	attachments []DeliveryAttachmentIdentity,
+) (k12.DeliveryBatch, error) {
+	agentName = strings.TrimSpace(agentName)
+	objectKind = strings.TrimSpace(objectKind)
+	objectID = strings.TrimSpace(objectID)
+	if agentName == "" || objectKind == "" || objectID == "" {
+		return k12.DeliveryBatch{}, fmt.Errorf("%w: agent/object/content required", ErrInvalidInput)
+	}
+	if d.Records == nil {
+		return k12.DeliveryBatch{}, ErrDeliveryUnavailable
+	}
+	contentDigest, err := deliveryMessageIdentityDigest(content, attachments)
+	if err != nil {
+		return k12.DeliveryBatch{}, err
+	}
+	return d.Records.GetDeliveryBatchByDedupe(
+		ctx,
+		agentName,
+		deliveryBatchDedupeKey(agentName, objectKind, objectID, contentDigest),
+	)
+}
+
+// ReplayDeliveryBatchForMessageIdentity 在任何附件读取或渠道准备前重放已冻结批次。
+// 已尝试的子回执保持不动，只有从未尝试的 pending 子回执会继续发送。
+func (d Deps) ReplayDeliveryBatchForMessageIdentity(
+	ctx context.Context,
+	agentName, objectKind, objectID, content string,
+	attachments []DeliveryAttachmentIdentity,
+) (k12.DeliveryBatch, error) {
+	batch, err := d.GetDeliveryBatchForMessageIdentity(
+		ctx, agentName, objectKind, objectID, content, attachments,
+	)
+	if err != nil {
+		return k12.DeliveryBatch{}, err
+	}
+	return d.sendDeliveryBatch(ctx, batch)
 }
 
 func validatePreparedDelivery(prepared PreparedTextDelivery) error {
@@ -130,6 +246,40 @@ func (d Deps) prepareTextForResolvedTargets(
 	return prepared, nil
 }
 
+func (d Deps) prepareMessageForResolvedTargets(
+	ctx context.Context,
+	message DeliveryMessage,
+	targets []ResolvedDeliveryTarget,
+) ([]PreparedTextDelivery, error) {
+	batchTransport, ok := d.Delivery.(BatchMessageDeliveryTransport)
+	if !ok {
+		return nil, ErrDeliveryUnavailable
+	}
+	prepared, err := batchTransport.PrepareMessageForTargets(ctx, message, targets)
+	if err != nil {
+		return nil, err
+	}
+	if len(prepared) != len(targets) {
+		return nil, fmt.Errorf(
+			"%w: prepared deliveries=%d resolved targets=%d",
+			ErrInvalidInput, len(prepared), len(targets),
+		)
+	}
+	for i := range prepared {
+		if err := validatePreparedDelivery(prepared[i]); err != nil {
+			return nil, fmt.Errorf("prepared delivery %d: %w", i+1, err)
+		}
+		if prepared[i].BindingID != targets[i].BindingID ||
+			prepared[i].Target != targets[i].Target {
+			return nil, fmt.Errorf(
+				"%w: prepared delivery %d changed its resolved binding target",
+				ErrInvalidInput, i+1,
+			)
+		}
+	}
+	return prepared, nil
+}
+
 func (d Deps) resolveAndPrepareTextBatch(
 	ctx context.Context,
 	agentName, content string,
@@ -151,6 +301,21 @@ func (d Deps) resolveAndPrepareTextBatch(
 	return []PreparedTextDelivery{prepared}, nil
 }
 
+func (d Deps) resolveAndPrepareMessageBatch(
+	ctx context.Context,
+	agentName string,
+	message DeliveryMessage,
+) ([]PreparedTextDelivery, error) {
+	if _, ok := d.Delivery.(BatchDeliveryTransport); !ok {
+		return nil, ErrDeliveryUnavailable
+	}
+	targets, err := d.ResolveDeliveryTargets(ctx, agentName)
+	if err != nil {
+		return nil, err
+	}
+	return d.prepareMessageForResolvedTargets(ctx, message, targets)
+}
+
 // PrepareAndSendTextBatch freezes one logical command and every current active
 // direct binding as child receipts in one transaction, then starts each pending
 // provider request. A command replay returns the frozen batch before consulting
@@ -159,7 +324,18 @@ func (d Deps) PrepareAndSendTextBatch(
 	ctx context.Context,
 	agentName, objectKind, objectID, content string,
 ) (k12.DeliveryBatch, bool, error) {
-	return d.prepareAndSendTextBatch(ctx, agentName, objectKind, objectID, content, nil, nil)
+	return d.prepareAndSendBatch(
+		ctx, agentName, objectKind, objectID, DeliveryMessage{Content: content}, nil,
+	)
+}
+
+// PrepareAndSendMessageBatch 冻结同一份正文与附件，为全部当前有效私聊目标创建子回执后发送。
+func (d Deps) PrepareAndSendMessageBatch(
+	ctx context.Context,
+	agentName, objectKind, objectID string,
+	message DeliveryMessage,
+) (k12.DeliveryBatch, bool, error) {
+	return d.prepareAndSendBatch(ctx, agentName, objectKind, objectID, message, nil)
 }
 
 func (d Deps) prepareAndSendTextBatchWithTargets(
@@ -170,130 +346,43 @@ func (d Deps) prepareAndSendTextBatchWithTargets(
 	if len(targets) == 0 {
 		return k12.DeliveryBatch{}, false, ErrNoActiveDirectBindings
 	}
-	return d.prepareAndSendTextBatch(ctx, agentName, objectKind, objectID, content, targets, nil)
-}
-
-func normalizeExpectedDeliveryBinding(
-	expected ExpectedDeliveryBinding,
-) (ExpectedDeliveryBinding, error) {
-	expected.BindingID = strings.TrimSpace(expected.BindingID)
-	expected.Platform = strings.ToLower(strings.TrimSpace(expected.Platform))
-	expected.InstanceID = strings.TrimSpace(expected.InstanceID)
-	expected.ChatID = strings.TrimSpace(expected.ChatID)
-	if expected.BindingID == "" || expected.Platform == "" ||
-		expected.InstanceID == "" || expected.ChatID == "" {
-		return ExpectedDeliveryBinding{}, fmt.Errorf(
-			"%w: expected binding requires binding_id/platform/instance_id/chat_id",
-			ErrInvalidInput,
-		)
-	}
-	return expected, nil
-}
-
-func expectedDeliveryBindingMatchesTarget(
-	expected ExpectedDeliveryBinding,
-	target ResolvedDeliveryTarget,
-) bool {
-	return expected.BindingID == target.BindingID &&
-		expected.Platform == target.Target.Platform &&
-		expected.InstanceID == target.Target.InstanceID &&
-		expected.ChatID == target.Target.ChatID
-}
-
-func expectedDeliveryBindingMatchesBatch(
-	expected ExpectedDeliveryBinding,
-	batch k12.DeliveryBatch,
-) bool {
-	if len(batch.Receipts) != 1 {
-		return false
-	}
-	receipt := batch.Receipts[0]
-	return expected.BindingID == receipt.BindingID &&
-		expected.Platform == receipt.Target.Platform &&
-		expected.InstanceID == receipt.Target.InstanceID &&
-		expected.ChatID == receipt.Target.ChatID
-}
-
-func (d Deps) replayExpectedDeliveryBatch(
-	ctx context.Context,
-	expected ExpectedDeliveryBinding,
-	batch k12.DeliveryBatch,
-) (k12.DeliveryBatch, error) {
-	if !expectedDeliveryBindingMatchesBatch(expected, batch) {
-		return k12.DeliveryBatch{}, ErrDeliveryBindingSnapshotConflict
-	}
-	receipt := batch.Receipts[0]
-	if receipt.Status != k12.DeliverySending &&
-		receipt.Status != k12.DeliveryOutcomeUnknown {
-		return batch, nil
-	}
-	// QueryDeliveryBatch 是现有的只查询收敛状态机。即使提供方仍无法证明
-	// 已进入终态，它也绝不会调用 SendPrepared，并会保留已冻结的回执和对象标识。
-	return d.QueryDeliveryBatch(ctx, batch.AgentName, batch.BatchID)
-}
-
-// prepareAndSendTextBatchWithExpectedBinding 执行应用绑定的单例 CAS，
-// 但不会把客户端期望值当作目标选择依据。首次创建时解析服务端持有的完整集合；
-// 重放时只与已经冻结的单例回执比较，绝不查询可变规则。
-func (d Deps) prepareAndSendTextBatchWithExpectedBinding(
-	ctx context.Context,
-	agentName, objectKind, objectID, content string,
-	expected ExpectedDeliveryBinding,
-) (k12.DeliveryBatch, bool, error) {
-	normalized, err := normalizeExpectedDeliveryBinding(expected)
-	if err != nil {
-		return k12.DeliveryBatch{}, false, err
-	}
-	return d.prepareAndSendTextBatch(
-		ctx, agentName, objectKind, objectID, content, nil, &normalized,
+	return d.prepareAndSendBatch(
+		ctx, agentName, objectKind, objectID, DeliveryMessage{Content: content}, targets,
 	)
 }
 
-func (d Deps) prepareAndSendTextBatch(
+func (d Deps) prepareAndSendBatch(
 	ctx context.Context,
-	agentName, objectKind, objectID, content string,
+	agentName, objectKind, objectID string,
+	message DeliveryMessage,
 	targets []ResolvedDeliveryTarget,
-	expected *ExpectedDeliveryBinding,
 ) (k12.DeliveryBatch, bool, error) {
 	agentName = strings.TrimSpace(agentName)
 	objectKind = strings.TrimSpace(objectKind)
 	objectID = strings.TrimSpace(objectID)
-	content = strings.TrimSpace(content)
-	if agentName == "" || objectKind == "" || objectID == "" || content == "" {
+	var err error
+	message, err = normalizeDeliveryMessage(message)
+	if err != nil {
+		return k12.DeliveryBatch{}, false, err
+	}
+	if agentName == "" || objectKind == "" || objectID == "" {
 		return k12.DeliveryBatch{}, false, fmt.Errorf("%w: agent/object/content required", ErrInvalidInput)
 	}
 	if d.Records == nil || d.Delivery == nil {
 		return k12.DeliveryBatch{}, false, ErrDeliveryUnavailable
 	}
-	contentDigest := deliveryDigest(content)
+	contentDigest := deliveryMessageDigest(message)
 	dedupeKey := deliveryBatchDedupeKey(agentName, objectKind, objectID, contentDigest)
 	existing, err := d.Records.GetDeliveryBatchByDedupe(ctx, agentName, dedupeKey)
 	if err == nil {
-		if expected != nil {
-			replayed, replayErr := d.replayExpectedDeliveryBatch(ctx, *expected, existing)
-			return replayed, false, replayErr
-		}
-		return existing, false, nil
+		existing, err = d.sendDeliveryBatch(ctx, existing)
+		return existing, false, err
 	}
 	if !errors.Is(err, records.ErrNotFound) {
 		return k12.DeliveryBatch{}, false, err
 	}
-	if expected != nil {
-		resolved, resolveErr := d.ResolveDeliveryTargets(ctx, agentName)
-		if errors.Is(resolveErr, ErrNoActiveDirectBindings) {
-			return k12.DeliveryBatch{}, false, ErrDeliveryBindingSnapshotConflict
-		}
-		if resolveErr != nil {
-			return k12.DeliveryBatch{}, false, resolveErr
-		}
-		if len(resolved) != 1 || !expectedDeliveryBindingMatchesTarget(*expected, resolved[0]) {
-			return k12.DeliveryBatch{}, false, ErrDeliveryBindingSnapshotConflict
-		}
-		// 冻结服务端权威解析流程返回的目标，而不是根据客户端字段重建目标。
-		targets = resolved
-	}
-	batch, err := d.buildPreparedTextBatch(
-		ctx, agentName, objectKind, objectID, content, targets,
+	batch, err := d.buildPreparedMessageBatch(
+		ctx, agentName, objectKind, objectID, message, targets,
 	)
 	if err != nil {
 		return k12.DeliveryBatch{}, false, err
@@ -303,11 +392,8 @@ func (d Deps) prepareAndSendTextBatch(
 		return batch, created, err
 	}
 	if !created {
-		if expected != nil {
-			replayed, replayErr := d.replayExpectedDeliveryBatch(ctx, *expected, batch)
-			return replayed, false, replayErr
-		}
-		return batch, false, nil
+		batch, err = d.sendDeliveryBatch(ctx, batch)
+		return batch, false, err
 	}
 	batch, err = d.sendDeliveryBatch(ctx, batch)
 	return batch, true, err
@@ -321,11 +407,26 @@ func (d Deps) buildPreparedTextBatch(
 	agentName, objectKind, objectID, content string,
 	targets []ResolvedDeliveryTarget,
 ) (k12.DeliveryBatch, error) {
+	return d.buildPreparedMessageBatch(
+		ctx, agentName, objectKind, objectID, DeliveryMessage{Content: content}, targets,
+	)
+}
+
+func (d Deps) buildPreparedMessageBatch(
+	ctx context.Context,
+	agentName, objectKind, objectID string,
+	message DeliveryMessage,
+	targets []ResolvedDeliveryTarget,
+) (k12.DeliveryBatch, error) {
 	agentName = strings.TrimSpace(agentName)
 	objectKind = strings.TrimSpace(objectKind)
 	objectID = strings.TrimSpace(objectID)
-	content = strings.TrimSpace(content)
-	if agentName == "" || objectKind == "" || objectID == "" || content == "" {
+	var err error
+	message, err = normalizeDeliveryMessage(message)
+	if err != nil {
+		return k12.DeliveryBatch{}, err
+	}
+	if agentName == "" || objectKind == "" || objectID == "" {
 		return k12.DeliveryBatch{}, fmt.Errorf(
 			"%w: agent/object/content required", ErrInvalidInput,
 		)
@@ -334,11 +435,16 @@ func (d Deps) buildPreparedTextBatch(
 		return k12.DeliveryBatch{}, ErrDeliveryUnavailable
 	}
 	var prepared []PreparedTextDelivery
-	var err error
 	if targets == nil {
-		prepared, err = d.resolveAndPrepareTextBatch(ctx, agentName, content)
+		if len(message.Attachments) == 0 {
+			prepared, err = d.resolveAndPrepareTextBatch(ctx, agentName, message.Content)
+		} else {
+			prepared, err = d.resolveAndPrepareMessageBatch(ctx, agentName, message)
+		}
+	} else if len(message.Attachments) == 0 {
+		prepared, err = d.prepareTextForResolvedTargets(ctx, message.Content, targets)
 	} else {
-		prepared, err = d.prepareTextForResolvedTargets(ctx, content, targets)
+		prepared, err = d.prepareMessageForResolvedTargets(ctx, message, targets)
 	}
 	if err != nil {
 		return k12.DeliveryBatch{}, err
@@ -346,7 +452,7 @@ func (d Deps) buildPreparedTextBatch(
 	if len(prepared) == 0 {
 		return k12.DeliveryBatch{}, ErrNoActiveDirectBindings
 	}
-	contentDigest := deliveryDigest(content)
+	contentDigest := deliveryMessageDigest(message)
 	dedupeKey := deliveryBatchDedupeKey(agentName, objectKind, objectID, contentDigest)
 	batchID := idgen.NanoID()
 	receipts := make([]k12.DeliveryReceipt, 0, len(prepared))
@@ -534,7 +640,7 @@ func (d Deps) sendPreparedDelivery(ctx context.Context, receipt k12.DeliveryRece
 		return started, nil
 	}
 	ack, sendErr := d.Delivery.SendPrepared(ctx, started)
-	return d.persistDeliverySendOutcome(ctx, started, ack, sendErr)
+	return d.persistDeliverySendOutcome(context.WithoutCancel(ctx), started, ack, sendErr)
 }
 
 func deliveryFailureDetail(ack DeliveryTransportAck, err error, fallback string) string {

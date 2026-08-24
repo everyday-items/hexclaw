@@ -188,14 +188,24 @@ func (d *k12IMDeliverer) ResolveTextTargets(
 }
 
 func (d *k12IMDeliverer) PrepareTextForTargets(
-	_ context.Context,
+	ctx context.Context,
 	content string,
+	targets []k12usecase.ResolvedDeliveryTarget,
+) ([]k12usecase.PreparedTextDelivery, error) {
+	return d.PrepareMessageForTargets(
+		ctx, k12usecase.DeliveryMessage{Content: content}, targets,
+	)
+}
+
+func (d *k12IMDeliverer) PrepareMessageForTargets(
+	_ context.Context,
+	source k12usecase.DeliveryMessage,
 	targets []k12usecase.ResolvedDeliveryTarget,
 ) ([]k12usecase.PreparedTextDelivery, error) {
 	if len(targets) == 0 {
 		return nil, k12usecase.ErrNoActiveDirectBindings
 	}
-	canonical := content
+	canonical := source.Content
 	// 批改最终产物的 canonical Markdown 保留逐题内部评估 JSON 以供审计；家长侧
 	// 钉钉消息只投影可读的题目、状态与辅导正文，避免把内部 JSON 送入平台载荷。
 	visible := k12FinalArtifactIMMarkdown(canonical)
@@ -204,8 +214,15 @@ func (d *k12IMDeliverer) PrepareTextForTargets(
 	if projected != visible {
 		fallbackReason = messagecontent.FallbackMathToReadableText
 	}
+	attachments := make([]channel.Attachment, 0, len(source.Attachments))
+	for _, attachment := range source.Attachments {
+		attachments = append(attachments, channel.Attachment{
+			Name: attachment.Name, MIME: attachment.MIME,
+			Data: append([]byte(nil), attachment.Data...),
+		})
+	}
 	message, err := channel.NewCanonicalMarkdownMessageWithAttachments(
-		messagecontent.ProducerK12, "zh-CN", canonical, projected, fallbackReason, nil,
+		messagecontent.ProducerK12, "zh-CN", canonical, projected, fallbackReason, attachments,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("发送内容校验失败，请重试: %w", err)

@@ -31,26 +31,31 @@ var ErrDeliveryQueryUnavailable = errors.New("delivery receipt cannot be queried
 // the TutorAgent currently has no active one-to-one IM binding.
 var ErrNoActiveDirectBindings = errors.New("no active direct delivery bindings")
 
-// ErrDeliveryBindingSnapshotConflict 表示乐观预期绑定前置条件不再匹配服务端持有的
-// 完整直连绑定快照。调用方必须重新解析应用绑定；失败命令不得创建投递账本记录，
-// 也不得触达提供方。
-var ErrDeliveryBindingSnapshotConflict = errors.New("delivery binding snapshot conflict")
-
-// ExpectedDeliveryBinding 是应用绑定投递命令接受的四字段乐观前置条件。
-// 它绝不选择接收方：服务端仍会解析权威的完整直连绑定集合，只在冻结批次前
-// 使用此值拒绝漂移。
-type ExpectedDeliveryBinding struct {
-	BindingID  string
-	Platform   string
-	InstanceID string
-	ChatID     string
-}
-
 // ResolvedDeliveryTarget is the immutable binding identity and normalized
 // direct target captured during a server-side binding-resolution pass.
 type ResolvedDeliveryTarget struct {
 	BindingID string
 	Target    k12.DeliveryTarget
+}
+
+// DeliveryAttachment 在 K12 应用边界内携带一个不可变附件；平台编码只属于渠道投影层。
+type DeliveryAttachment struct {
+	Name string
+	MIME string
+	Data []byte
+}
+
+// DeliveryAttachmentIdentity 描述无需重读附件字节即可复算的内容身份。
+type DeliveryAttachmentIdentity struct {
+	Name          string
+	MIME          string
+	ContentDigest string
+}
+
+// DeliveryMessage 是一个投递批次为全部已解析目标冻结的通道中立源消息。
+type DeliveryMessage struct {
+	Content     string
+	Attachments []DeliveryAttachment
 }
 
 // PreparedTextDelivery is the immutable, channel-neutral payload projection
@@ -92,6 +97,16 @@ type BatchDeliveryTransport interface {
 	PrepareTextForTargets(
 		ctx context.Context,
 		content string,
+		targets []ResolvedDeliveryTarget,
+	) ([]PreparedTextDelivery, error)
+}
+
+// BatchMessageDeliveryTransport 是附加的附件感知准备缝；纯文本 transport 继续原样使用
+// BatchDeliveryTransport。
+type BatchMessageDeliveryTransport interface {
+	PrepareMessageForTargets(
+		ctx context.Context,
+		message DeliveryMessage,
 		targets []ResolvedDeliveryTarget,
 	) ([]PreparedTextDelivery, error)
 }

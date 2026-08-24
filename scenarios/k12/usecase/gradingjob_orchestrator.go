@@ -2336,6 +2336,13 @@ func (p presetAnchorer) AnchorAnswers(context.Context, []byte, []RecognizedQuest
 	return append([]RecognizedQuestion(nil), p.questions...), nil
 }
 
+func (p presetAnchorer) AnchorAnswerGeometry(context.Context, []byte, []RecognizedQuestion) ([]RecognizedQuestion, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
+	return append([]RecognizedQuestion(nil), p.questions...), nil
+}
+
 // recordingAnnotator 包装现网 PhotoAnnotator，捕获渲染是否失败供 rendering 阶段回写（规则 2）。
 type recordingAnnotator struct {
 	inner   PhotoAnnotator

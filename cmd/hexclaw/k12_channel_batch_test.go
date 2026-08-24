@@ -49,4 +49,17 @@ func TestK12IMDelivererResolveDirectBindingsNormalizesDeduplicatesAndSorts(t *te
 	if targets[0].BindingID != "agent-rule:7" {
 		t.Fatalf("duplicate target must choose stable smallest binding identity, got %q", targets[0].BindingID)
 	}
+
+	prepared, err := d.PrepareTextForTargets(context.Background(), "作品与点评", targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared) != len(targets) {
+		t.Fatalf("prepared children=%d want one per deduplicated binding=%d", len(prepared), len(targets))
+	}
+	for i := range targets {
+		if prepared[i].BindingID != targets[i].BindingID || prepared[i].Target != targets[i].Target {
+			t.Fatalf("prepared child[%d]=%+v does not freeze target=%+v", i, prepared[i], targets[i])
+		}
+	}
 }

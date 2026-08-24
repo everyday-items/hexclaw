@@ -1,18 +1,26 @@
 package apihttp_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/hexagon-codes/hexclaw/channel"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assembly"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/engineadapter"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
+	"github.com/hexagon-codes/hexclaw/storage/migrate"
 )
 
 type httpBatchTransport struct {
@@ -21,6 +29,7 @@ type httpBatchTransport struct {
 	query   []usecase.DeliveryTransportAck
 	sends   []k12.DeliveryReceipt
 	queries []k12.DeliveryReceipt
+	content []string
 }
 
 func (f *httpBatchTransport) ResolveTextTargets(context.Context, string) ([]usecase.ResolvedDeliveryTarget, error) {
@@ -32,6 +41,7 @@ func (f *httpBatchTransport) PrepareTextForTargets(
 	content string,
 	targets []usecase.ResolvedDeliveryTarget,
 ) ([]usecase.PreparedTextDelivery, error) {
+	f.content = append(f.content, content)
 	payload, _ := json.Marshal(map[string]string{"text": content})
 	out := make([]usecase.PreparedTextDelivery, 0, len(targets))
 	for _, target := range targets {
@@ -41,6 +51,130 @@ func (f *httpBatchTransport) PrepareTextForTargets(
 		})
 	}
 	return out, nil
+}
+
+func (f *httpBatchTransport) PrepareMessageForTargets(
+	_ context.Context,
+	message usecase.DeliveryMessage,
+	targets []usecase.ResolvedDeliveryTarget,
+) ([]usecase.PreparedTextDelivery, error) {
+	f.content = append(f.content, message.Content)
+	attachments := make([]channel.Attachment, 0, len(message.Attachments))
+	for _, attachment := range message.Attachments {
+		attachments = append(attachments, channel.Attachment{
+			Name: attachment.Name, MIME: attachment.MIME,
+			Data: append([]byte(nil), attachment.Data...),
+		})
+	}
+	frozen, err := channel.NewCanonicalMarkdownMessageWithAttachments(
+		messagecontent.ProducerK12, "zh-CN", message.Content, message.Content, "", attachments,
+	)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := json.Marshal(frozen)
+	if err != nil {
+		return nil, err
+	}
+	render, err := json.Marshal(frozen.RenderManifest)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]usecase.PreparedTextDelivery, 0, len(targets))
+	for _, target := range targets {
+		out = append(out, usecase.PreparedTextDelivery{
+			BindingID: target.BindingID, Target: target.Target,
+			PayloadJSON: string(payload), RenderJSON: string(render),
+		})
+	}
+	return out, nil
+}
+
+func newCreativeWorkDeliveryHTTPFixture(
+	t *testing.T,
+	delivery usecase.DeliveryTransport,
+) (*assembly.K12, http.Handler) {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := migrate.Run(context.Background(), db, migrate.All); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO agents(name) VALUES('mingming'),('other')`); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := assembly.Wire(
+		db,
+		fakeSolveExec{},
+		assembly.WithDeliveryTransport(delivery),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runtime, apihttp.NewHandler(apihttp.Runtime{
+		Views: runtime.Registry.Views, Records: runtime.Records, Deps: runtime.Deps,
+	})
+}
+
+func seedReadyCreativeWork(
+	t *testing.T,
+	runtime *assembly.K12,
+	workType string,
+	source k12.CreativeWorkSourceSnapshot,
+) string {
+	t.Helper()
+	fields := k12.CreativeWorkFields{
+		WorkType: workType, DisplayName: source.DisplayName, WorkTitle: source.WorkTitle,
+	}
+	record, err := k12.NewCreativeWorkRecord("mingming", "", fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, created, err := runtime.Records.CreateCreativeWorkWithInitialGeneration(
+		context.Background(), record,
+		"creative-send-"+workType+"-"+source.SourceAssetID,
+		fmt.Sprintf("request:%x", sha256.Sum256([]byte(workType+source.SourceAssetID))),
+		source,
+	)
+	if err != nil || !created {
+		t.Fatalf("seed current creative work: created=%v err=%v", created, err)
+	}
+	dimension := "visible_detail"
+	capability := "text+vision"
+	observation := "画面中的树和房子层次清楚"
+	suggestion := "下次可以补一处风吹树叶的细节"
+	limitations := "仅依据本版本提交的可见画面进行观察，不评价能力高低"
+	if workType == k12.WorkTypeWriting {
+		dimension = "expression"
+		capability = "text"
+		observation = "柳枝像绿色的丝带这个比喻有可见依据"
+		suggestion = "下次可以补一个风吹时的声音细节"
+		limitations = "仅依据本版本提交的孩子原文进行观察，不评价能力高低"
+	}
+	feedback := k12.WorkFeedback{
+		FeedbackID:   "feedback-" + workType,
+		VersionID:    generation.GenerationID,
+		FeedbackType: workType,
+		EvidenceRefs: []string{"asset-ref:ready-source"},
+		Observations: []k12.WorkFeedbackObservation{{
+			Dimension: dimension, Evidence: observation,
+		}},
+		SourceSnapshot: k12.WorkFeedbackSourceSnapshot{
+			Source: k12.FeedbackSourceAI, MethodRef: "creative-send-red@1", Capability: capability,
+		},
+		Limitations: limitations,
+		Suggestions: []string{suggestion},
+	}
+	feedback.ProjectionMarkdown = k12.ProjectWorkFeedbackMarkdown(feedback)
+	if _, err := runtime.Records.CompleteWorkFeedbackGeneration(
+		context.Background(), "mingming", generation.GenerationID, feedback,
+	); err != nil {
+		t.Fatalf("complete creative feedback generation: %v", err)
+	}
+	return record.RecordID
 }
 
 func (*httpBatchTransport) PrepareText(context.Context, string, string) (usecase.PreparedTextDelivery, error) {
@@ -326,5 +460,256 @@ func TestCreativeWorkSendFreezesCurrentWorkAndLatestFeedback(t *testing.T) {
 		len(delivery.sends) != 2 {
 		t.Fatalf("creative work replay changed batch or resent: status=%d body=%v sends=%d",
 			rec.Code, replay, len(delivery.sends))
+	}
+}
+
+func TestCreativeWorkSendFreezesOriginalImageForEveryBoundTarget(t *testing.T) {
+	tests := []struct {
+		name        string
+		workType    string
+		displayName string
+		workTitle   string
+		content     string
+	}{
+		{
+			name:     "artwork original",
+			workType: k12.WorkTypeArt, displayName: "美术作品",
+			workTitle: "雨后的家", content: "",
+		},
+		{
+			name:     "writing photo original and canonical body",
+			workType: k12.WorkTypeWriting, displayName: "语文写作",
+			workTitle: "春天的校园", content: "柳枝像绿色的丝带",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
+			delivery := &httpBatchTransport{
+				targets: httpBatchTargets(),
+				send: []usecase.DeliveryTransportAck{
+					{Status: k12.DeliveryDelivered, ExternalMessageID: "creative-a"},
+					{Status: k12.DeliveryDelivered, ExternalMessageID: "creative-b"},
+				},
+			}
+			runtime, handler := newCreativeWorkDeliveryHTTPFixture(t, delivery)
+			original := tinyPNGBytes(t)
+			ready, err := (&usecase.PageAssetRepository{Records: runtime.Records}).Persist(
+				context.Background(), usecase.DefaultLocalOwnerScope, "mingming", original,
+			)
+			if err != nil {
+				t.Fatalf("persist source PageAsset: %v", err)
+			}
+			workID := seedReadyCreativeWork(t, runtime, tt.workType, k12.CreativeWorkSourceSnapshot{
+				WorkType: tt.workType, DisplayName: tt.displayName, WorkTitle: tt.workTitle,
+				ContentMarkdown: tt.content, SourceAssetID: ready.Metadata.PageAssetID,
+			})
+
+			rec, batch := do(
+				t, handler, http.MethodPost, "/creative-works/"+workID+"/send",
+				`{"agent":"mingming"}`,
+			)
+			children, _ := batch["receipts"].([]any)
+			if rec.Code != http.StatusOK || len(children) != len(httpBatchTargets()) ||
+				len(delivery.sends) != len(httpBatchTargets()) {
+				t.Fatalf(
+					"all-bound creative send: status=%d batch=%v receipts=%d sends=%d want=%d",
+					rec.Code, batch, len(children), len(delivery.sends), len(httpBatchTargets()),
+				)
+			}
+			if len(delivery.content) != 1 {
+				t.Fatalf("creative work must freeze one shared payload, preparations=%d", len(delivery.content))
+			}
+			if strings.Contains(delivery.content[0], assetstore.IDPrefix) {
+				t.Errorf("delivery body leaked internal asset identity: %q", delivery.content[0])
+			}
+			for _, expected := range []string{tt.displayName, tt.workTitle, tt.content, "## 可见证据"} {
+				if expected != "" && !strings.Contains(delivery.content[0], expected) {
+					t.Errorf("delivery body missing canonical work evidence %q: %q", expected, delivery.content[0])
+				}
+			}
+
+			wantDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(original))
+			var firstPayload string
+			wantInstances := []string{"bot-a", "bot-b"}
+			for i, sent := range delivery.sends {
+				if sent.Target.InstanceID != wantInstances[i] {
+					t.Errorf("child %d target=%q want %q", i, sent.Target.InstanceID, wantInstances[i])
+				}
+				if i == 0 {
+					firstPayload = sent.PayloadJSON
+				} else if sent.PayloadJSON != firstPayload {
+					t.Errorf("recipient %d payload differs from the first frozen payload", i)
+				}
+				if strings.Contains(sent.PayloadJSON, assetstore.IDPrefix) {
+					t.Errorf("recipient %d payload leaked asset://: %s", i, sent.PayloadJSON)
+				}
+				var frozen channel.Message
+				if err := json.Unmarshal([]byte(sent.PayloadJSON), &frozen); err != nil {
+					t.Errorf("recipient %d payload is not a channel message: %v", i, err)
+					continue
+				}
+				if len(frozen.Attachments) != 1 {
+					t.Errorf("recipient %d attachments=%d want one original image", i, len(frozen.Attachments))
+					continue
+				}
+				attachment := frozen.Attachments[0]
+				if attachment.MIME != "image/png" ||
+					!strings.HasSuffix(attachment.Name, ".png") ||
+					!bytes.Equal(attachment.Data, original) {
+					t.Errorf("recipient %d original attachment drift: %#v", i, attachment)
+				}
+				if frozen.Content == nil || strings.Contains(frozen.Content.Markdown, assetstore.IDPrefix) ||
+					len(frozen.Content.Attachments) != 1 {
+					t.Errorf("recipient %d canonical content missing or leaked internal asset: %#v", i, frozen.Content)
+					continue
+				}
+				ref := frozen.Content.Attachments[0]
+				if ref.Digest != wantDigest || ref.Name != attachment.Name || ref.MIME != attachment.MIME {
+					t.Errorf("recipient %d canonical attachment ref drift: %#v", i, ref)
+				}
+				if frozen.RenderManifest == nil ||
+					!frozen.RenderManifest.CapabilitySnapshot.Attachments ||
+					len(frozen.RenderManifest.Parts) != 2 ||
+					frozen.RenderManifest.Parts[0].Kind != messagecontent.PartMarkdown ||
+					frozen.RenderManifest.Parts[1].Kind != messagecontent.PartArtifact ||
+					frozen.RenderManifest.Parts[1].ArtifactDigest != wantDigest {
+					t.Errorf("recipient %d render manifest did not freeze markdown + original artifact: %#v", i, frozen.RenderManifest)
+				}
+			}
+
+			replayRec, replay := do(
+				t, handler, http.MethodPost, "/creative-works/"+workID+"/send",
+				`{"agent":"mingming"}`,
+			)
+			if replayRec.Code != http.StatusOK || replay["batch_id"] != batch["batch_id"] ||
+				len(delivery.sends) != len(httpBatchTargets()) {
+				t.Errorf(
+					"attachment replay changed batch or resent: status=%d first=%v replay=%v sends=%d",
+					replayRec.Code, batch["batch_id"], replay["batch_id"], len(delivery.sends),
+				)
+			}
+		})
+	}
+}
+
+func TestCreativeWorkSendAssetReadFailureCreatesNoDelivery(t *testing.T) {
+	tests := []struct {
+		name       string
+		prepareID  func(*testing.T, *assembly.K12) string
+		wantStatus int
+	}{
+		{
+			name: "missing original",
+			prepareID: func(_ *testing.T, _ *assembly.K12) string {
+				return assetstore.IDPrefix + "mingming/" + strings.Repeat("0", 64) + ".png"
+			},
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name: "original bytes fail integrity verification",
+			prepareID: func(t *testing.T, runtime *assembly.K12) string {
+				ready, err := (&usecase.PageAssetRepository{Records: runtime.Records}).Persist(
+					context.Background(), usecase.DefaultLocalOwnerScope, "mingming", tinyPNGBytes(t),
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				path, err := assetstore.PathFromID(ready.Metadata.PageAssetID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("corrupt-image-bytes"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return ready.Metadata.PageAssetID
+			},
+			wantStatus: http.StatusInternalServerError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
+			delivery := &httpBatchTransport{
+				targets: httpBatchTargets(),
+				send: []usecase.DeliveryTransportAck{
+					{Status: k12.DeliveryDelivered, ExternalMessageID: "must-not-send-a"},
+					{Status: k12.DeliveryDelivered, ExternalMessageID: "must-not-send-b"},
+				},
+			}
+			runtime, handler := newCreativeWorkDeliveryHTTPFixture(t, delivery)
+			assetID := tt.prepareID(t, runtime)
+			workID := seedReadyCreativeWork(t, runtime, k12.WorkTypeArt, k12.CreativeWorkSourceSnapshot{
+				WorkType: k12.WorkTypeArt, DisplayName: "美术作品", WorkTitle: "雨后的家",
+				SourceAssetID: assetID,
+			})
+
+			rec, body := do(
+				t, handler, http.MethodPost, "/creative-works/"+workID+"/send",
+				`{"agent":"mingming"}`,
+			)
+			if rec.Code != tt.wantStatus {
+				t.Errorf("asset failure status=%d want=%d body=%v", rec.Code, tt.wantStatus, body)
+			}
+			if len(delivery.content) != 0 || len(delivery.sends) != 0 {
+				t.Errorf(
+					"asset failure must stop before batch preparation/send: preparations=%d sends=%d",
+					len(delivery.content), len(delivery.sends),
+				)
+			}
+		})
+	}
+}
+
+func TestDeliveryBatchDigestIncludesAttachmentBytes(t *testing.T) {
+	delivery := &httpBatchTransport{
+		targets: httpBatchTargets(),
+		send: []usecase.DeliveryTransportAck{
+			{Status: k12.DeliveryDelivered, ExternalMessageID: "first-a"},
+			{Status: k12.DeliveryDelivered, ExternalMessageID: "first-b"},
+			{Status: k12.DeliveryDelivered, ExternalMessageID: "second-a"},
+			{Status: k12.DeliveryDelivered, ExternalMessageID: "second-b"},
+		},
+	}
+	runtime, _ := newCreativeWorkDeliveryHTTPFixture(t, delivery)
+	message := func(data string) usecase.DeliveryMessage {
+		return usecase.DeliveryMessage{
+			Content: "同一作品正文与点评",
+			Attachments: []usecase.DeliveryAttachment{{
+				Name: "美术作品.png", MIME: "image/png", Data: []byte(data),
+			}},
+		}
+	}
+
+	first, created, err := runtime.Deps.PrepareAndSendMessageBatch(
+		context.Background(), "mingming", "creative_work", "same-work", message("first-image"),
+	)
+	if err != nil || !created {
+		t.Fatalf("first attachment batch: created=%v err=%v", created, err)
+	}
+	second, created, err := runtime.Deps.PrepareAndSendMessageBatch(
+		context.Background(), "mingming", "creative_work", "same-work", message("second-image"),
+	)
+	if err != nil || !created {
+		t.Fatalf("changed attachment batch: created=%v err=%v", created, err)
+	}
+	if first.BatchID == second.BatchID || first.ContentDigest == second.ContentDigest {
+		t.Fatalf(
+			"attachment bytes must participate in idempotency: first=%s/%s second=%s/%s",
+			first.BatchID, first.ContentDigest, second.BatchID, second.ContentDigest,
+		)
+	}
+	if len(delivery.sends) != 4 {
+		t.Fatalf("two distinct attachment payloads must send two children each, sends=%d", len(delivery.sends))
+	}
+	replayed, created, err := runtime.Deps.PrepareAndSendMessageBatch(
+		context.Background(), "mingming", "creative_work", "same-work", message("first-image"),
+	)
+	if err != nil || created || replayed.BatchID != first.BatchID || len(delivery.sends) != 4 {
+		t.Fatalf(
+			"identical attachment replay changed batch or resent: created=%v batch=%s want=%s sends=%d err=%v",
+			created, replayed.BatchID, first.BatchID, len(delivery.sends), err,
+		)
 	}
 }

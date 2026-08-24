@@ -258,12 +258,12 @@ func TestK12C02ExpectedBindingSendRequiresExactSidecarCapabilityBeforeHandler(
 		})
 	}
 
-	// 精确匹配的 capability 会抵达实际挂载的路由；随后故意传入的
-	// 过期绑定会被 use-case CAS 拒绝，且仍不触发发送。
+	// 精确匹配的 capability 会抵达实际挂载的路由；请求中已删除的
+	// 单绑定快照必须被 strict JSON 合同拒绝，且不触发发送。
 	rec := request("Bearer " + capability)
-	if rec.Code != http.StatusConflict ||
-		!strings.Contains(rec.Body.String(), `"error":"binding_snapshot_conflict"`) {
+	if rec.Code != http.StatusBadRequest ||
+		!strings.Contains(rec.Body.String(), `unknown field \"expected_binding\"`) {
 		t.Fatalf("authorized mounted route status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	assertNoDeliverySideEffects("authorized binding drift")
+	assertNoDeliverySideEffects("authorized removed binding field")
 }
