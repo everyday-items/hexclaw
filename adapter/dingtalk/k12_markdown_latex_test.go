@@ -65,7 +65,18 @@ func TestK12DingTalkMarkdownLaTeXProjectionMatrix(t *testing.T) {
 
 func TestK12DingTalkDoubleEscapedSolutionUsesSampleMarkdown(t *testing.T) {
 	content := "## 解题步骤\n\n1. **列式**：$\\\\frac{3}{4} \\\\times 8 = 6$\n2. **验算**：$6 \\\\div 8 = \\\\frac{3}{4}$"
-	message := dingtalkMarkdownMessage(content)
+	reply := &adapter.Reply{
+		Content:  content,
+		Metadata: map[string]string{"producer_kind": "k12", "locale": "zh-CN"},
+	}
+	if err := ensureDingTalkRenderEvidence(reply); err != nil {
+		t.Fatalf("构造钉钉 channel manifest: %v", err)
+	}
+	projected, err := dingTalkManifestMarkdown(*reply.RenderManifest)
+	if err != nil {
+		t.Fatalf("读取钉钉 Markdown 投影: %v", err)
+	}
+	message := dingtalkMarkdownMessage(projected)
 	if message.MsgKey != "sampleMarkdown" {
 		t.Fatalf("钉钉解题消息类型 = %q, want sampleMarkdown", message.MsgKey)
 	}

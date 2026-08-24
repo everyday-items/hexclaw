@@ -672,7 +672,15 @@ func TestStopNoConnection(t *testing.T) {
 // BUG-20260712-P 接线锁（真机取证·钉钉解题回复）：sampleMarkdown 出站必须做 LaTeX 数学降级，
 // title/text 双字段都不得漏 \times 之类命令给用户。
 func TestBug20260712_MarkdownMessageNormalizesLatexMath(t *testing.T) {
-	msg := dingtalkMarkdownMessage(`( 4.5 \times 2 = 9 )` + "\n" + `( 4.5 \div 0.01 = 450 )`)
+	reply := &adapter.Reply{Content: `( 4.5 \times 2 = 9 )` + "\n" + `( 4.5 \div 0.01 = 450 )`}
+	if err := ensureDingTalkRenderEvidence(reply); err != nil {
+		t.Fatalf("构造钉钉 channel manifest: %v", err)
+	}
+	projected, err := dingTalkManifestMarkdown(*reply.RenderManifest)
+	if err != nil {
+		t.Fatalf("读取钉钉 Markdown 投影: %v", err)
+	}
+	msg := dingtalkMarkdownMessage(projected)
 	payload := string(msg.MsgParam)
 	if strings.Contains(payload, `\\times`) || strings.Contains(payload, `\\div`) {
 		t.Fatalf("LaTeX 命令漏给钉钉用户：%s", payload)

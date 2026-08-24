@@ -20,7 +20,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
-	"path/filepath"
+	"path"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -307,10 +307,7 @@ func uploadDingtalkImage(
 	if err := writer.WriteField("type", "image"); err != nil {
 		return "", fmt.Errorf("构造钉钉图片上传参数失败: %w", err)
 	}
-	name := strings.TrimSpace(filepath.Base(attachment.Name))
-	if name == "" || name == "." {
-		name = "graded-homework.png"
-	}
+	name := safeDingTalkAttachmentName(attachment.Name)
 	part, err := writer.CreateFormFile("media", name)
 	if err != nil {
 		return "", fmt.Errorf("构造钉钉图片上传文件失败: %w", err)
@@ -743,6 +740,10 @@ func (a *DingtalkAdapter) onChatBotMessage(_ context.Context, data *dtchatbot.Bo
 	if data == nil {
 		return []byte(""), nil
 	}
+	if data.ConversationType == "2" {
+		logger.Info("DingTalk group message ignored because v0.5 supports direct messages only")
+		return []byte(""), nil
+	}
 
 	event := dtEvent{
 		ConversationId:   data.ConversationId,
@@ -797,6 +798,11 @@ func (a *DingtalkAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "error", http.StatusBadRequest)
 		return
 	}
+	if event.ConversationType == "2" {
+		logger.Info("DingTalk group message ignored because v0.5 supports direct messages only")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 
 	// BUG-20260709：picture 消息正文为空但带 downloadCode，同样要进管道
 	if event.Text.Content != "" || event.Content.DownloadCode != "" {
@@ -816,6 +822,9 @@ func (a *DingtalkAdapter) handleWebhook(w http.ResponseWriter, r *http.Request) 
 // v0.4.0 F6：reply.Interactive 非空且 flag interactive.render.v1 OFF 时，
 // 自动追加文本 fallback 让按钮/选项/审批/卡片在钉钉基础可用。
 func (a *DingtalkAdapter) Send(ctx context.Context, chatID string, reply *adapter.Reply) error {
+	if _, isGroup := parseGroupQueueTarget(chatID); isGroup {
+		return errors.New("DingTalk v0.5 supports direct messages only")
+	}
 	adapter.MaybeApplyTextFallback(ctx, reply)
 	if err := ensureDingTalkRenderEvidence(reply); err != nil {
 		return fmt.Errorf("钉钉渲染协议校验失败: %w", err)
@@ -833,14 +842,23 @@ func (a *DingtalkAdapter) SendWithReceipt(ctx context.Context, chatID string, re
 	if _, isGroup := parseGroupQueueTarget(chatID); isGroup {
 		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("钉钉投递回执只支持一对一私聊")
 	}
+	if reply == nil {
+		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, errors.New("dingtalk: reply is required")
+	}
 	adapter.MaybeApplyTextFallback(ctx, reply)
 	if err := ensureDingTalkRenderEvidence(reply); err != nil {
 		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("钉钉渲染协议校验失败: %w", err)
 	}
 	var externalID string
+	var providerSendStarted atomic.Bool
 	send := func(sendCtx context.Context, target string, candidate *adapter.Reply) error {
 		var err error
-		externalID, err = a.sendReplyNowWithReceipt(sendCtx, target, candidate)
+		externalID, err = a.sendReplyNowWithReceipt(
+			sendCtx,
+			target,
+			candidate,
+			func() { providerSendStarted.Store(true) },
+		)
 		return err
 	}
 	var err error
@@ -851,7 +869,8 @@ func (a *DingtalkAdapter) SendWithReceipt(ctx context.Context, chatID string, re
 	}
 	if err != nil {
 		status := adapter.DeliveryFailed
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if providerSendStarted.Load() &&
+			(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 			status = adapter.DeliveryOutcomeUnknown
 		}
 		return adapter.DeliveryAck{Status: status}, err
@@ -897,16 +916,21 @@ func (a *DingtalkAdapter) QueryReceipt(ctx context.Context, externalMessageID st
 }
 
 func (a *DingtalkAdapter) sendReplyNow(ctx context.Context, chatID string, reply *adapter.Reply) error {
-	_, err := a.sendReplyNowWithReceipt(ctx, chatID, reply)
+	_, err := a.sendReplyNowWithReceipt(ctx, chatID, reply, nil)
 	return err
 }
 
-func (a *DingtalkAdapter) sendReplyNowWithReceipt(ctx context.Context, chatID string, reply *adapter.Reply) (string, error) {
+func (a *DingtalkAdapter) sendReplyNowWithReceipt(
+	ctx context.Context,
+	chatID string,
+	reply *adapter.Reply,
+	markProviderSendStarted func(),
+) (string, error) {
 	if reply == nil {
 		return "", nil
 	}
-	if conversationID, isGroup := parseGroupQueueTarget(chatID); isGroup {
-		return "", a.sendReplyToEventNow(ctx, dtEvent{ConversationType: "2", ConversationId: conversationID}, reply)
+	if _, isGroup := parseGroupQueueTarget(chatID); isGroup {
+		return "", errors.New("DingTalk v0.5 supports direct messages only")
 	}
 	token, err := a.getAccessToken(ctx)
 	if err != nil {
@@ -917,7 +941,16 @@ func (a *DingtalkAdapter) sendReplyNowWithReceipt(ctx context.Context, chatID st
 	if err != nil {
 		return "", fmt.Errorf("初始化钉钉官方 SDK 失败: %w", err)
 	}
-	msg := a.replyMessageWithAttachments(ctx, api, token, reply)
+	msg, err := a.replyMessageWithAttachments(ctx, api, token, reply)
+	if err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if markProviderSendStarted != nil {
+		markProviderSendStarted()
+	}
 	externalID, err := api.SendOTO(ctx, token, a.cfg.RobotCode, chatID, msg)
 	if err != nil {
 		return "", fmt.Errorf("发送消息失败: %w", err)
@@ -932,18 +965,7 @@ func (a *DingtalkAdapter) sendReplyToEvent(ctx context.Context, event dtEvent, r
 		return nil
 	}
 	if event.ConversationType == "2" {
-		conversationID := strings.TrimSpace(event.ConversationId)
-		if conversationID == "" {
-			return errors.New("钉钉群消息缺少 openConversationId，拒绝降级为私聊")
-		}
-		adapter.MaybeApplyTextFallback(ctx, reply)
-		if err := ensureDingTalkRenderEvidence(reply); err != nil {
-			return fmt.Errorf("钉钉渲染协议校验失败: %w", err)
-		}
-		if a.queue == nil {
-			return a.sendReplyToEventNow(ctx, event, reply)
-		}
-		return a.queue.Send(ctx, groupQueueTarget(conversationID), reply)
+		return nil
 	}
 	return a.Send(ctx, event.SenderStaffId, reply)
 }
@@ -954,6 +976,9 @@ func (a *DingtalkAdapter) sendReplyToEventNow(ctx context.Context, event dtEvent
 	if reply == nil {
 		return nil
 	}
+	if event.ConversationType == "2" {
+		return nil
+	}
 	token, err := a.getAccessToken(ctx)
 	if err != nil {
 		return fmt.Errorf("获取 Access Token 失败: %w", err)
@@ -962,19 +987,9 @@ func (a *DingtalkAdapter) sendReplyToEventNow(ctx context.Context, event dtEvent
 	if err != nil {
 		return fmt.Errorf("初始化钉钉官方 SDK 失败: %w", err)
 	}
-	msg := a.replyMessageWithAttachments(ctx, api, token, reply)
-	if event.ConversationType == "2" {
-		if strings.TrimSpace(event.ConversationId) == "" {
-			return errors.New("钉钉群消息缺少 openConversationId，拒绝降级为私聊")
-		}
-		groupAPI, ok := api.(dingtalkGroupOpenAPI)
-		if !ok {
-			return fmt.Errorf("钉钉 OpenAPI 不支持群会话发送")
-		}
-		if _, err := groupAPI.SendGroup(ctx, token, a.cfg.RobotCode, event.ConversationId, msg); err != nil {
-			return fmt.Errorf("发送群消息失败: %w", err)
-		}
-		return nil
+	msg, err := a.replyMessageWithAttachments(ctx, api, token, reply)
+	if err != nil {
+		return err
 	}
 	if _, err := api.SendOTO(ctx, token, a.cfg.RobotCode, event.SenderStaffId, msg); err != nil {
 		return fmt.Errorf("发送单聊消息失败: %w", err)
@@ -982,31 +997,39 @@ func (a *DingtalkAdapter) sendReplyToEventNow(ctx context.Context, event dtEvent
 	return nil
 }
 
-func (a *DingtalkAdapter) replyMessageWithAttachments(ctx context.Context, api dingtalkOpenAPI, token string, reply *adapter.Reply) dingtalkOutboundMessage {
-	content := reply.Content
+func (a *DingtalkAdapter) replyMessageWithAttachments(
+	ctx context.Context,
+	api dingtalkOpenAPI,
+	token string,
+	reply *adapter.Reply,
+) (dingtalkOutboundMessage, error) {
+	if err := ensureDingTalkRenderEvidence(reply); err != nil {
+		return dingtalkOutboundMessage{}, err
+	}
+	content, err := dingTalkManifestMarkdown(*reply.RenderManifest)
+	if err != nil {
+		return dingtalkOutboundMessage{}, err
+	}
 	for i, att := range reply.Attachments {
 		if !adapter.IsImageAttachment(att) {
-			content += "\n\n> ⚠️ 附件 “" + att.Name + "” 不是可发送的图片，已跳过。"
-			continue
+			return dingtalkOutboundMessage{}, errors.New("DingTalk only supports image attachments")
 		}
-		imageRef := strings.TrimSpace(att.URL)
-		if imageRef == "" {
-			mediaAPI, ok := api.(dingtalkMediaOpenAPI)
-			if !ok {
-				content += "\n\n> ⚠️ 批改已完成，但当前钉钉连接不支持上传批改图。"
-				continue
-			}
-			mediaID, err := mediaAPI.UploadImage(ctx, token, att)
-			if err != nil {
-				logger.Error("[dingtalk] 上传回复图片失败", "name", att.Name, "error", err)
-				content += "\n\n> ⚠️ 批改已完成，但批改图上传失败，请稍后重试。"
-				continue
-			}
-			imageRef = mediaID
+		if strings.TrimSpace(att.Data) == "" {
+			return dingtalkOutboundMessage{}, errors.New("DingTalk image attachment bytes are required")
+		}
+		mediaAPI, ok := api.(dingtalkMediaOpenAPI)
+		if !ok {
+			return dingtalkOutboundMessage{}, errors.New("DingTalk image upload capability is unavailable")
+		}
+		uploadAttachment := att
+		uploadAttachment.Name = safeDingTalkAttachmentName(att.Name)
+		imageRef, err := mediaAPI.UploadImage(ctx, token, uploadAttachment)
+		if err != nil {
+			logger.Error("[dingtalk] 上传回复图片失败", "name", uploadAttachment.Name, "error", err)
+			return dingtalkOutboundMessage{}, fmt.Errorf("DingTalk image upload failed: %w", err)
 		}
 		if !validDingtalkImageReference(imageRef) {
-			content += "\n\n> ⚠️ 批改已完成，但批改图地址无效，已拒绝发送。"
-			continue
+			return dingtalkOutboundMessage{}, errors.New("DingTalk image upload returned an invalid media reference")
 		}
 		alt := "批改后的作业"
 		if len(reply.Attachments) > 1 {
@@ -1014,7 +1037,16 @@ func (a *DingtalkAdapter) replyMessageWithAttachments(ctx context.Context, api d
 		}
 		content += "\n\n![" + alt + "](" + imageRef + ")"
 	}
-	return dingtalkMarkdownMessage(content)
+	return dingtalkMarkdownMessage(content), nil
+}
+
+func safeDingTalkAttachmentName(name string) string {
+	normalized := strings.ReplaceAll(strings.TrimSpace(name), "\\", "/")
+	base := strings.TrimSpace(path.Base(normalized))
+	if base == "" || base == "." || base == "/" {
+		return "graded-homework.png"
+	}
+	return base
 }
 
 func validDingtalkImageReference(ref string) bool {
@@ -1048,7 +1080,17 @@ func (a *DingtalkAdapter) sendThinkingFeedback(ctx context.Context, chatID strin
 		logger.Error("[dingtalk] 思考占位初始化 SDK 失败", "error", err)
 		return ""
 	}
-	key, err := api.SendOTO(ctx, token, a.cfg.RobotCode, chatID, dingtalkMarkdownMessage(dingtalkThinkingFeedback))
+	reply := &adapter.Reply{Content: dingtalkThinkingFeedback}
+	if err := ensureDingTalkRenderEvidence(reply); err != nil {
+		logger.Error("[dingtalk] processing feedback canonicalization failed", "error", err)
+		return ""
+	}
+	content, err := dingTalkManifestMarkdown(*reply.RenderManifest)
+	if err != nil {
+		logger.Error("[dingtalk] processing feedback projection failed", "error", err)
+		return ""
+	}
+	key, err := api.SendOTO(ctx, token, a.cfg.RobotCode, chatID, dingtalkMarkdownMessage(content))
 	if err != nil {
 		logger.Error("[dingtalk] 发送思考占位失败", "error", err)
 		return ""
@@ -1057,6 +1099,9 @@ func (a *DingtalkAdapter) sendThinkingFeedback(ctx context.Context, chatID strin
 }
 
 func (a *DingtalkAdapter) sendThinkingFeedbackForEvent(ctx context.Context, event dtEvent) string {
+	if event.ConversationType == "2" {
+		return ""
+	}
 	content := thinkingFeedbackForEvent(event)
 	if strings.TrimSpace(event.SenderStaffId) == "" && strings.TrimSpace(event.ConversationId) == "" {
 		return ""
@@ -1074,24 +1119,17 @@ func (a *DingtalkAdapter) sendThinkingFeedbackForEvent(ctx context.Context, even
 		logger.Error("[dingtalk] 处理进度初始化 SDK 失败", "error", err)
 		return ""
 	}
-	msg := dingtalkMarkdownMessage(content)
-	if event.ConversationType == "2" {
-		if strings.TrimSpace(event.ConversationId) == "" {
-			logger.Error("[dingtalk] 群处理进度缺少 openConversationId，拒绝降级私聊")
-			return ""
-		}
-		groupAPI, ok := api.(dingtalkGroupOpenAPI)
-		if !ok {
-			logger.Error("[dingtalk] 当前 SDK 不支持群处理进度")
-			return ""
-		}
-		key, sendErr := groupAPI.SendGroup(ctx, token, a.cfg.RobotCode, event.ConversationId, msg)
-		if sendErr != nil {
-			logger.Error("[dingtalk] 发送群处理进度失败", "error", sendErr)
-			return ""
-		}
-		return key
+	reply := &adapter.Reply{Content: content}
+	if err := ensureDingTalkRenderEvidence(reply); err != nil {
+		logger.Error("[dingtalk] processing feedback canonicalization failed", "error", err)
+		return ""
 	}
+	content, err = dingTalkManifestMarkdown(*reply.RenderManifest)
+	if err != nil {
+		logger.Error("[dingtalk] processing feedback projection failed", "error", err)
+		return ""
+	}
+	msg := dingtalkMarkdownMessage(content)
 	key, sendErr := api.SendOTO(ctx, token, a.cfg.RobotCode, event.SenderStaffId, msg)
 	if sendErr != nil {
 		logger.Error("[dingtalk] 发送单聊处理进度失败", "error", sendErr)
@@ -1125,6 +1163,9 @@ func (a *DingtalkAdapter) recallThinkingFeedbackForEvent(ctx context.Context, ev
 	if strings.TrimSpace(processQueryKey) == "" {
 		return
 	}
+	if event.ConversationType == "2" {
+		return
+	}
 	token, err := a.getAccessToken(ctx)
 	if err != nil {
 		logger.Error("[dingtalk] 撤回处理进度取 Access Token 失败", "error", err)
@@ -1133,21 +1174,6 @@ func (a *DingtalkAdapter) recallThinkingFeedbackForEvent(ctx context.Context, ev
 	api, err := a.apiClient()
 	if err != nil {
 		logger.Error("[dingtalk] 撤回处理进度初始化 SDK 失败", "error", err)
-		return
-	}
-	if event.ConversationType == "2" {
-		if strings.TrimSpace(event.ConversationId) == "" {
-			logger.Error("[dingtalk] 群处理进度撤回缺少 openConversationId，拒绝降级私聊")
-			return
-		}
-		groupAPI, ok := api.(dingtalkGroupOpenAPI)
-		if !ok {
-			logger.Error("[dingtalk] 当前 SDK 不支持群处理进度撤回")
-			return
-		}
-		if err := groupAPI.RecallGroup(ctx, token, a.cfg.RobotCode, event.ConversationId, []string{processQueryKey}); err != nil {
-			logger.Error("[dingtalk] 撤回群处理进度失败", "error", err)
-		}
 		return
 	}
 	if err := api.RecallOTO(ctx, token, a.cfg.RobotCode, []string{processQueryKey}); err != nil {
@@ -1168,11 +1194,7 @@ const dingtalkEmptyReplyFallback = "⚠️ 本次没有生成有效内容，请�
 // 首个非空行派生（有兜底），text 同理：正文为空/纯空白时用兜底文案，绝不产出空 text
 // （BUG-20260704，与 title 兜底对称，使非法载荷在构造点即不可表达）。
 func dingtalkMarkdownMessage(content string) dingtalkOutboundMessage {
-	content = restoreEscapedMarkdownNewlines(content)
-	// LaTeX 数学降级（BUG-20260712-P，真机取证：解题回复「( 4.5 \times 2 = 9 )」原样漏给
-	// 钉钉用户）：sampleMarkdown 渲染 markdown 子集但**不渲染 LaTeX**，出站前确定性转
-	// Unicode 数学符号（×÷≤≥√ 等），不靠 prompt 恳求模型改写法。
-	text := adapter.NormalizeMathText(content)
+	text := content
 	if strings.TrimSpace(text) == "" {
 		text = dingtalkEmptyReplyFallback
 	}
@@ -1227,14 +1249,13 @@ func (a *DingtalkAdapter) handleMessageContext(baseCtx context.Context, event dt
 	if a.handler == nil {
 		return
 	}
+	if event.ConversationType == "2" {
+		logger.Info("DingTalk group message ignored because v0.5 supports direct messages only")
+		return
+	}
 	if baseCtx == nil {
 		baseCtx = context.Background()
 	}
-	if event.ConversationType == "2" && strings.TrimSpace(event.ConversationId) == "" {
-		logger.Error("钉钉: 群消息缺少 openConversationId，无法安全回复原会话")
-		return
-	}
-
 	content := strings.TrimSpace(event.Text.Content)
 
 	ctx, cancel := context.WithTimeout(baseCtx, a.messageHandlerTimeoutFor(event))

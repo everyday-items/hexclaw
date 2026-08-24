@@ -30,7 +30,7 @@ func TestOnChatBotMessage_MapsToAdapterMessage(t *testing.T) {
 
 	data := &dtchatbot.BotCallbackDataModel{
 		ConversationId:   "conv-1",
-		ConversationType: "2",
+		ConversationType: "1",
 		SenderStaffId:    "staff-42",
 		SenderNick:       "张三",
 	}
@@ -61,8 +61,8 @@ func TestOnChatBotMessage_MapsToAdapterMessage(t *testing.T) {
 		if msg.Metadata["conversation_id"] != "conv-1" {
 			t.Errorf("conversation_id = %q, 期望 %q", msg.Metadata["conversation_id"], "conv-1")
 		}
-		if msg.Metadata["conversation_type"] != "2" {
-			t.Errorf("conversation_type = %q, 期望 %q", msg.Metadata["conversation_type"], "2")
+		if msg.Metadata["conversation_type"] != "1" {
+			t.Errorf("conversation_type = %q, 期望 %q", msg.Metadata["conversation_type"], "1")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("handler 未被调用（onChatBotMessage 应异步派发到 handleMessage）")

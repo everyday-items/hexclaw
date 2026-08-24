@@ -58,13 +58,11 @@ func (f *fakeConversationOpenAPI) UploadImage(_ context.Context, _ string, att a
 	return "@media-corrected-homework", nil
 }
 
-func TestBUG20260714_GroupPhotoReplyReturnsMarkdownAndCorrectedImageToOriginalConversation(t *testing.T) {
+func TestDingTalkV05GroupPhotoDoesNotCallOutboundProvider(t *testing.T) {
 	a := newTestAdapter()
 	fake := newFakeConversationOpenAPI()
 	a.openAPI = fake
-	var captured *adapter.Message
-	a.handler = func(_ context.Context, msg *adapter.Message) (*adapter.Reply, error) {
-		captured = msg
+	a.handler = func(_ context.Context, _ *adapter.Message) (*adapter.Reply, error) {
 		return &adapter.Reply{
 			Content: "## 作业批改完成\n\n正确 8 题，需订正 1 题。",
 			Attachments: []adapter.Attachment{{
@@ -78,29 +76,19 @@ func TestBUG20260714_GroupPhotoReplyReturnsMarkdownAndCorrectedImageToOriginalCo
 	event.Text.Content = "请批改"
 	a.handleMessage(event)
 
-	if captured == nil || captured.ChatID != "cid-family-group" {
-		t.Fatalf("group inbound ChatID must be original conversation id: %#v", captured)
-	}
 	if got := fake.SendCalls(); len(got) != 0 {
-		t.Fatalf("group reply must not fall back to OTO/private send: %#v", got)
+		t.Fatalf("v0.5 group event must not call SendOTO: %#v", got)
 	}
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	if len(fake.groupSends) != 2 {
-		t.Fatalf("want progress + final group messages, got %#v", fake.groupSends)
+	if len(fake.groupSends) != 0 {
+		t.Fatalf("v0.5 group event must not call SendGroup: %#v", fake.groupSends)
 	}
-	if fake.groupSends[0].ConversationID != "cid-family-group" || !strings.Contains(messageText(fake.groupSends[0].Message), "2–5 分钟") {
-		t.Fatalf("photo progress ETA not sent to original group: %#v", fake.groupSends[0])
+	if len(fake.uploads) != 0 {
+		t.Fatalf("v0.5 group event must not call UploadImage: %#v", fake.uploads)
 	}
-	finalText := messageText(fake.groupSends[1].Message)
-	if !strings.Contains(finalText, "作业批改完成") || !strings.Contains(finalText, "![@media-corrected-homework]") && !strings.Contains(finalText, "(@media-corrected-homework)") {
-		t.Fatalf("final group markdown missing corrected image media id: %q", finalText)
-	}
-	if len(fake.uploads) != 1 || fake.uploads[0].Name != "graded-homework.png" {
-		t.Fatalf("corrected PNG was not uploaded: %#v", fake.uploads)
-	}
-	if len(fake.groupRecalls) != 1 || len(fake.groupRecalls[0]) != 1 || fake.groupRecalls[0][0] != "group-key-0" {
-		t.Fatalf("progress placeholder should be recalled in same group: %#v", fake.groupRecalls)
+	if len(fake.groupRecalls) != 0 {
+		t.Fatalf("v0.5 group event must not call RecallGroup: %#v", fake.groupRecalls)
 	}
 }
 
