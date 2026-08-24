@@ -975,13 +975,46 @@ func (e *ReActEngine) matchSkillFastPath(msg *adapter.Message) (skill.Skill, boo
 //  5. 使用 ReAct Agent 处理
 //  6. 保存助手回复
 //  7. 返回回复
-func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapter.Reply, error) {
+func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (reply *adapter.Reply, processErr error) {
+	defer func() {
+		if processErr != nil || reply == nil {
+			return
+		}
+		var requestMetadata map[string]string
+		if msg != nil {
+			requestMetadata = msg.Metadata
+		}
+		if err := finalizeProducerReply(reply, requestMetadata); err != nil {
+			reply = nil
+			processErr = fmt.Errorf("finalize producer reply: %w", err)
+			return
+		}
+		if reply.AssistantMessageID == "" && reply.Metadata != nil {
+			reply.AssistantMessageID = reply.Metadata["assistant_message_id"]
+			if reply.AssistantMessageID == "" {
+				reply.AssistantMessageID = reply.Metadata["backend_message_id"]
+			}
+		}
+		if reply.AssistantMessageID != "" {
+			reply.BackendMessageID = reply.AssistantMessageID
+			reply.MessageID = reply.AssistantMessageID
+		}
+	}()
 	if err := validateIncomingMessage(msg); err != nil {
 		return nil, err
+	}
+	if replay, err := e.loadDurableAssistantReply(ctx, msg, false); err != nil {
+		return nil, err
+	} else if replay != nil {
+		return replay.reply, nil
 	}
 	if err := e.guardExplicitRoleExists(msg); err != nil {
 		return nil, err
 	}
+	ensureMessageMetadata(msg)
+	assistantMessageID := canonicalAssistantMessageID(msg)
+	msg.Metadata["assistant_message_id"] = assistantMessageID
+	ctx = session.WithAssistantMessageID(ctx, assistantMessageID)
 	ctx = labelMessageEgress(ctx, msg)
 	// Stamp the authenticated user so tool executions can trust it over
 	// LLM-supplied args (BUG-20260611 M7).
@@ -1028,6 +1061,11 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 	} else if unlock != nil {
 		defer unlock()
 	}
+	if replay, err := e.loadDurableAssistantReply(ctx, msg, false); err != nil {
+		return nil, err
+	} else if replay != nil {
+		return replay.reply, nil
+	}
 
 	// 2. 尝试快速路径: Skill 关键词匹配
 	if matched, ok := e.matchSkillFastPath(msg); ok {
@@ -1066,17 +1104,10 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 			assistantMessageID = record.ID
 		}
 
-		messageContent, renderManifest := canonicalProducerProjection(
-			messagecontent.ProducerSkill,
-			result.Content,
-			msg.Metadata["user_locale"],
-		)
 		return &adapter.Reply{
-			Content:        result.Content,
-			MessageContent: messageContent,
-			RenderManifest: renderManifest,
-			Metadata:       withReplyPersistError(withAssistantMessageID(result.Metadata, assistantMessageID), msg),
-			ToolCalls:      tc,
+			Content:   result.Content,
+			Metadata:  withReplyPersistError(withAssistantMessageID(result.Metadata, assistantMessageID), msg),
+			ToolCalls: tc,
 		}, nil
 	}
 
@@ -1820,7 +1851,7 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 	if msg.Metadata == nil {
 		msg.Metadata = make(map[string]string)
 	}
-	assistantMessageID := "msg-" + idgen.ShortID()
+	assistantMessageID := canonicalAssistantMessageID(msg)
 	msg.Metadata["assistant_message_id"] = assistantMessageID
 	ctx = session.WithAssistantMessageID(ctx, assistantMessageID)
 	ctx = session.WithReasoningDisclosureState(ctx)
@@ -1843,8 +1874,18 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 		var content strings.Builder
 		var terminal *adapter.ReplyChunk
 		for chunk := range raw {
+			if chunk != nil && chunk.Metadata != nil && chunk.Metadata[durableAssistantReplayMetaKey] == "true" {
+				delete(chunk.Metadata, durableAssistantReplayMetaKey)
+				out <- chunk
+				return
+			}
+			content.WriteString(chunk.Content)
+			if chunk.Done && chunk.Error == nil {
+				if err := finalizeProducerChunk(chunk, content.String(), msg.Metadata); err != nil {
+					chunk.Error = fmt.Errorf("finalize producer stream: %w", err)
+				}
+			}
 			decorated := wire.Decorate(chunk)
-			content.WriteString(decorated.Content)
 			if decorated.Done {
 				terminal = decorated
 				continue
@@ -1871,6 +1912,13 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 					content.String(),
 					session.AssistantMeta{
 						MessageID:           assistantMessageID,
+						Provider:            terminal.Metadata["provider"],
+						Model:               terminal.Metadata["model"],
+						AgentName:           msg.Metadata["role"],
+						RequestID:           messageRequestID(msg),
+						ToolCalls:           terminal.ToolCalls,
+						Blocks:              terminal.Blocks,
+						ReplyMetadata:       terminal.Metadata,
 						ReasoningDisclosure: snapshot.ReasoningDisclosure,
 						ReasoningReceipt:    &snapshot.ReasoningReceipt,
 						RuntimeEvents:       snapshot.RuntimeEvents,
@@ -1880,6 +1928,17 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, msg *adapter.Message) (
 			}
 			if persistErr != nil {
 				trace.L(ctx).Warn("Failed to persist assistant runtime snapshot", "message_id", assistantMessageID, "err", persistErr)
+				if terminal.Error == nil {
+					terminal.Error = persistErr
+					terminal.RuntimeEvent = &adapter.RuntimeEvent{
+						Version:        1,
+						EventID:        "terminal:" + string(adapter.RuntimeTerminalFailed),
+						Kind:           adapter.RuntimeEventTerminal,
+						TerminalStatus: adapter.RuntimeTerminalFailed,
+					}
+				}
+			} else if terminal.Metadata != nil {
+				delete(terminal.Metadata, persistErrorMetaKey)
 			}
 			cancel()
 		}
@@ -1895,6 +1954,11 @@ func (e *ReActEngine) processStream(
 ) (<-chan *adapter.ReplyChunk, error) {
 	if err := validateIncomingMessage(msg); err != nil {
 		return nil, err
+	}
+	if replay, ok, err := e.loadDurableAssistantStream(ctx, msg); err != nil {
+		return nil, err
+	} else if ok {
+		return replay, nil
 	}
 	if err := e.guardExplicitRoleExists(msg); err != nil {
 		return nil, err
@@ -1956,6 +2020,12 @@ func (e *ReActEngine) processStream(
 			sessionUnlock()
 		}
 	}()
+
+	if replay, ok, err := e.loadDurableAssistantStream(ctx, msg); err != nil {
+		return nil, err
+	} else if ok {
+		return replay, nil
+	}
 
 	// 2. 尝试快速路径: Skill 匹配 → 单 chunk 返回
 	if matched, ok := e.matchSkillFastPath(msg); ok {
@@ -2646,12 +2716,11 @@ func (e *ReActEngine) finalizeRuntimeStreamResult(
 	// streamed to the client (e.g. the cron claim-guard notice), so the
 	// caller can still deliver it as an extra chunk.
 	streamTail := ""
-	if cleaned, extracted := extractThinkTags(content); extracted != "" && strings.TrimSpace(reasoning) == "" {
+	cleaned, extracted := extractThinkTags(content)
+	if extracted != "" && strings.TrimSpace(reasoning) == "" {
 		reasoning = extracted
-		content = cleaned
-	} else {
-		content = cleaned
 	}
+	content = StripAllThinking(cleaned)
 	if strings.TrimSpace(content) == "" && strings.TrimSpace(reasoning) != "" {
 		cacheable = false
 		msgMeta["finish_reason"] = "reasoning_only"
@@ -4327,6 +4396,206 @@ func messageRequestID(msg *adapter.Message) string {
 	return msg.Metadata["request_id"]
 }
 
+// canonicalAssistantMessageID 为同一显式 request_id 生成跨同步、流式与进程重启稳定的
+// 助手消息主键。后缀与用户消息主键隔离，避免和 request_id 本身发生主键冲突。
+func canonicalAssistantMessageID(msg *adapter.Message) string {
+	if requestID := strings.TrimSpace(messageRequestID(msg)); requestID != "" {
+		return requestID + ":assistant"
+	}
+	return "msg-" + idgen.ShortID()
+}
+
+const durableAssistantReplayMetaKey = "_durable_assistant_replay"
+
+type durableAssistantMetadata struct {
+	Provider            string                          `json:"provider"`
+	Model               string                          `json:"model"`
+	AgentName           string                          `json:"agent_name"`
+	Reasoning           string                          `json:"reasoning"`
+	ToolCalls           []adapter.ToolCall              `json:"tool_calls"`
+	Blocks              []adapter.Block                 `json:"blocks"`
+	ReasoningDisclosure adapter.ReasoningDisclosure     `json:"reasoning_disclosure"`
+	ReasoningReceipt    *adapter.ReasoningReceipt       `json:"reasoning_receipt"`
+	RuntimeEvents       []adapter.SequencedRuntimeEvent `json:"runtime_events"`
+	LastSequence        uint64                          `json:"last_sequence"`
+}
+
+type durableAssistantReply struct {
+	reply         *adapter.Reply
+	reasoning     string
+	terminalEvent *adapter.RuntimeEvent
+}
+
+// loadDurableAssistantReply 在任何 Provider 调用前按会话与 request_id 查找已提交结果。
+// request_id 缺省时不启用幂等重放；重复事实或不完整流式终态一律失败关闭。
+func (e *ReActEngine) loadDurableAssistantReply(
+	ctx context.Context,
+	msg *adapter.Message,
+	requireRuntimeTerminal bool,
+) (*durableAssistantReply, error) {
+	if e == nil || e.store == nil || msg == nil {
+		return nil, nil
+	}
+	requestID := strings.TrimSpace(messageRequestID(msg))
+	sessionID := strings.TrimSpace(msg.SessionID)
+	if requestID == "" || sessionID == "" {
+		return nil, nil
+	}
+	sess, err := e.store.GetSession(ctx, sessionID)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load durable assistant reply session: %w", err)
+	}
+	if sess.UserID != msg.UserID {
+		return nil, fmt.Errorf("durable assistant session does not belong to current user")
+	}
+	count, err := e.store.CountMessages(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("load durable assistant reply count: %w", err)
+	}
+	if count == 0 {
+		return nil, nil
+	}
+	records, err := e.store.ListMessages(ctx, sessionID, count, 0)
+	if err != nil {
+		return nil, fmt.Errorf("load durable assistant reply history: %w", err)
+	}
+	var match *storage.MessageRecord
+	for _, record := range records {
+		if record == nil || record.Role != "assistant" || record.RequestID != requestID {
+			continue
+		}
+		if match != nil {
+			return nil, fmt.Errorf("multiple durable assistant replies for request %q", requestID)
+		}
+		match = record
+	}
+	if match == nil {
+		return nil, nil
+	}
+
+	rawMetadata := match.Metadata
+	if strings.TrimSpace(rawMetadata) == "" || strings.TrimSpace(rawMetadata) == "{}" {
+		rawMetadata = match.Meta
+	}
+	var persisted durableAssistantMetadata
+	if strings.TrimSpace(rawMetadata) != "" {
+		if err := json.Unmarshal([]byte(rawMetadata), &persisted); err != nil {
+			return nil, fmt.Errorf("decode durable assistant reply metadata: %w", err)
+		}
+	}
+	metadata := make(map[string]string)
+	var values map[string]any
+	if json.Unmarshal([]byte(rawMetadata), &values) == nil {
+		for key, value := range values {
+			if text, ok := value.(string); ok {
+				metadata[key] = text
+			}
+		}
+	}
+	delete(metadata, persistErrorMetaKey)
+	metadata["provider"] = persisted.Provider
+	metadata["model"] = persisted.Model
+	metadata["assistant_message_id"] = match.ID
+	metadata["backend_message_id"] = match.ID
+	metadata["message_id"] = match.ID
+
+	var terminal *adapter.RuntimeEvent
+	var terminalSequence uint64
+	for _, event := range persisted.RuntimeEvents {
+		if event.Event.Kind == adapter.RuntimeEventTerminal && event.Sequence >= terminalSequence {
+			copy := event.Event
+			terminal = &copy
+			terminalSequence = event.Sequence
+		}
+	}
+	if terminal != nil && terminal.TerminalStatus != adapter.RuntimeTerminalCompleted {
+		return nil, fmt.Errorf("durable assistant reply terminal is not completed")
+	}
+	if requireRuntimeTerminal && terminal == nil {
+		return nil, fmt.Errorf("durable assistant reply terminal is incomplete")
+	}
+	lastSequence := persisted.LastSequence
+	if lastSequence < terminalSequence {
+		lastSequence = terminalSequence
+	}
+	disclosure := persisted.ReasoningDisclosure
+	if disclosure.Visibility == "" {
+		disclosure.Visibility = adapter.ReasoningNotExposed
+	}
+	reply := &adapter.Reply{
+		Content:             match.Content,
+		Metadata:            metadata,
+		ToolCalls:           append([]adapter.ToolCall(nil), persisted.ToolCalls...),
+		Blocks:              append([]adapter.Block(nil), persisted.Blocks...),
+		AssistantMessageID:  match.ID,
+		BackendMessageID:    match.ID,
+		MessageID:           match.ID,
+		LastSequence:        lastSequence,
+		ReasoningDisclosure: disclosure,
+		ReasoningReceipt:    persisted.ReasoningReceipt,
+		RuntimeEvents:       append([]adapter.SequencedRuntimeEvent(nil), persisted.RuntimeEvents...),
+	}
+	return &durableAssistantReply{
+		reply:         reply,
+		reasoning:     persisted.Reasoning,
+		terminalEvent: terminal,
+	}, nil
+}
+
+func (r *durableAssistantReply) streamChunk(requestMetadata map[string]string) (*adapter.ReplyChunk, error) {
+	if r == nil || r.reply == nil {
+		return nil, fmt.Errorf("durable assistant reply is missing")
+	}
+	chunk := &adapter.ReplyChunk{
+		Content:             r.reply.Content,
+		Reasoning:           r.reasoning,
+		Done:                true,
+		Metadata:            cloneStringMap(r.reply.Metadata),
+		ToolCalls:           append([]adapter.ToolCall(nil), r.reply.ToolCalls...),
+		Blocks:              append([]adapter.Block(nil), r.reply.Blocks...),
+		AssistantMessageID:  r.reply.AssistantMessageID,
+		BackendMessageID:    r.reply.BackendMessageID,
+		MessageID:           r.reply.MessageID,
+		Sequence:            r.reply.LastSequence,
+		ReasoningDisclosure: r.reply.ReasoningDisclosure,
+		ReasoningReceipt:    r.reply.ReasoningReceipt,
+		RuntimeEvent:        r.terminalEvent,
+	}
+	if err := finalizeProducerChunk(chunk, r.reply.Content, requestMetadata); err != nil {
+		return nil, fmt.Errorf("finalize durable assistant replay: %w", err)
+	}
+	chunk.Metadata[durableAssistantReplayMetaKey] = "true"
+	return chunk, nil
+}
+
+func singleDurableAssistantChunk(chunk *adapter.ReplyChunk) <-chan *adapter.ReplyChunk {
+	ch := make(chan *adapter.ReplyChunk, 1)
+	ch <- chunk
+	close(ch)
+	return ch
+}
+
+func (e *ReActEngine) loadDurableAssistantStream(
+	ctx context.Context,
+	msg *adapter.Message,
+) (<-chan *adapter.ReplyChunk, bool, error) {
+	replay, err := e.loadDurableAssistantReply(ctx, msg, true)
+	if err != nil {
+		return nil, false, err
+	}
+	if replay == nil {
+		return nil, false, nil
+	}
+	chunk, err := replay.streamChunk(msg.Metadata)
+	if err != nil {
+		return nil, false, err
+	}
+	return singleDurableAssistantChunk(chunk), true, nil
+}
+
 // messagesHaveToolResult reports whether the conversation already contains a
 // tool-result message — i.e. a tool ran this turn and there is context worth
 // re-prompting the model to synthesize from.
@@ -4433,6 +4702,22 @@ func buildReplyMetadata(metadata map[string]string, providerName, modelName, ass
 		"provider": providerName,
 		"model":    modelName,
 	}
+	producer, locale, producerErr := resolveProducerContract(metadata)
+	if producerErr == nil {
+		replyMeta["producer_kind"] = string(producer)
+		replyMeta["locale"] = locale
+	} else {
+		// 非法显式 producer 保留给统一终态收口点拒绝，不能静默降级为 Chat。
+		replyMeta["producer_kind"] = metadata["producer_kind"]
+		locale = strings.TrimSpace(metadata["locale"])
+		if locale == "" {
+			locale = strings.TrimSpace(metadata["user_locale"])
+		}
+		if locale == "" {
+			locale = "und"
+		}
+		replyMeta["locale"] = locale
+	}
 	if metadata == nil {
 		return withAssistantMessageID(replyMeta, assistantMessageID)
 	}
@@ -4528,11 +4813,13 @@ func withAssistantMessageID(metadata map[string]string, assistantMessageID strin
 		return metadata
 	}
 
-	merged := make(map[string]string, len(metadata)+1)
+	merged := make(map[string]string, len(metadata)+3)
 	for key, value := range metadata {
 		merged[key] = value
 	}
+	merged["assistant_message_id"] = assistantMessageID
 	merged["backend_message_id"] = assistantMessageID
+	merged["message_id"] = assistantMessageID
 	return merged
 }
 
@@ -4697,16 +4984,29 @@ func applyAgentConfigToMetadata(metadata map[string]string, cfg *agentrouter.Age
 }
 
 func (e *ReActEngine) resolveLLMSelection(ctx context.Context, msg *adapter.Message) (llmSelection, error) {
+	providerHint := requestedProvider(msg.Metadata)
+	resolvedPinnedAgent := false
+	if providerHint == "" && requestedModel(msg.Metadata) == "" {
+		if pinned := strings.TrimSpace(msg.Metadata["pinned_agent"]); pinned != "" && !strings.EqualFold(pinned, "default") {
+			providerHint = e.applyPinnedAgent(msg, pinned, providerHint)
+			resolvedPinnedAgent = msg.Metadata["route_source"] == "pinned" && strings.TrimSpace(msg.Metadata["routed_agent"]) != ""
+			if !resolvedPinnedAgent {
+				return llmSelection{}, fmt.Errorf("pinned agent %q is not registered", pinned)
+			}
+		}
+	}
+
 	// BUG-20260712-#1：解题/批改(solve 源)的 solver/verifier 子 Agent 用配置的**强文本推理模型**，
 	// 不用视觉默认模型——glm-4v-flash 擅长看图却不擅长多步文本解题 + 写验证代码，会把错答案判成
 	// unverifiable 漏判、错题入不了库。配了 reasoning_model 就走它；未配则沿用默认路由(无回归)。
-	if sel, ok, err := e.reasoningSelectionForSolve(msg); err != nil {
-		return llmSelection{}, err
-	} else if ok {
-		return sel, nil
+	if !resolvedPinnedAgent {
+		if sel, ok, err := e.reasoningSelectionForSolve(msg); err != nil {
+			return llmSelection{}, err
+		} else if ok {
+			return sel, nil
+		}
 	}
 
-	providerHint := requestedProvider(msg.Metadata)
 	provider, providerName, err := e.resolveProvider(ctx, providerHint, msg)
 	if err != nil {
 		return llmSelection{}, err
@@ -4716,8 +5016,6 @@ func (e *ReActEngine) resolveLLMSelection(ctx context.Context, msg *adapter.Mess
 	if modelName != "" {
 		provider = wrapModelOverrideProvider(provider, modelName)
 	}
-	resolvedPinnedAgent := msg != nil && msg.Metadata["route_source"] == "pinned" && strings.TrimSpace(msg.Metadata["routed_agent"]) != ""
-
 	return llmSelection{
 		provider:         provider,
 		providerName:     providerName,

@@ -1423,19 +1423,22 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		canonical = canonicalChatContent(reply.Content, reply.Metadata)
 	}
 	writeJSON(w, http.StatusOK, ChatResponse{
-		Reply:              reply.Content,
-		MessageContent:     canonical,
-		RenderManifest:     reply.RenderManifest,
-		SessionID:          msg.SessionID,
-		Metadata:           reply.Metadata,
-		Usage:              reply.Usage,
-		ToolCalls:          reply.ToolCalls,
-		Blocks:             reply.Blocks,
-		KnowledgeHits:      reply.KnowledgeHits,
-		MemoryHits:         reply.MemoryHits,
-		AssistantMessageID: reply.Metadata["assistant_message_id"],
-		BackendMessageID:   reply.Metadata["backend_message_id"],
-		MessageID:          reply.Metadata["message_id"],
+		Reply:               reply.Content,
+		MessageContent:      canonical,
+		RenderManifest:      reply.RenderManifest,
+		SessionID:           msg.SessionID,
+		Metadata:            reply.Metadata,
+		Usage:               reply.Usage,
+		ToolCalls:           reply.ToolCalls,
+		Blocks:              reply.Blocks,
+		KnowledgeHits:       reply.KnowledgeHits,
+		MemoryHits:          reply.MemoryHits,
+		AssistantMessageID:  reply.AssistantMessageID,
+		BackendMessageID:    reply.BackendMessageID,
+		MessageID:           reply.MessageID,
+		LastSequence:        reply.LastSequence,
+		ReasoningDisclosure: reply.ReasoningDisclosure,
+		RuntimeEvents:       reply.RuntimeEvents,
 	})
 }
 
