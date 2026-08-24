@@ -511,6 +511,7 @@ func buildSelectorState(cfg config.LLMConfig) (map[string]hexagon.Provider, conf
 		}
 		logger.Info("[router] 加载 provider", "provider", name, "base_url", pc.BaseURL, "local", isLocalProviderNamed(name, pc))
 		providerNames = append(providerNames, name)
+		pc.ModelSpecs = cloneLLMModelSpecs(pc.ModelSpecs)
 		activeCfg.Providers[name] = pc
 	}
 
@@ -553,9 +554,65 @@ func cloneLLMConfig(cfg config.LLMConfig) config.LLMConfig {
 	cloned := cfg
 	cloned.Providers = make(map[string]config.LLMProviderConfig, len(cfg.Providers))
 	for name, provider := range cfg.Providers {
+		provider.ModelSpecs = cloneLLMModelSpecs(provider.ModelSpecs)
 		cloned.Providers[name] = provider
 	}
 	return cloned
+}
+
+func cloneLLMModelSpecs(specs []config.LLMProviderModelSpec) []config.LLMProviderModelSpec {
+	if specs == nil {
+		return nil
+	}
+	cloned := append([]config.LLMProviderModelSpec(nil), specs...)
+	if len(specs) == 0 {
+		cloned = make([]config.LLMProviderModelSpec, 0)
+	}
+	for i := range cloned {
+		cloned[i].ReasoningControl = cloneLLMReasoningControl(cloned[i].ReasoningControl)
+	}
+	return cloned
+}
+
+func cloneLLMReasoningControl(control *config.LLMReasoningControlSpec) *config.LLMReasoningControlSpec {
+	if control == nil {
+		return nil
+	}
+	cloned := *control
+	cloned.On = cloneLLMReasoningValue(control.On)
+	cloned.Off = cloneLLMReasoningValue(control.Off)
+	if control.AllowedEfforts != nil {
+		cloned.AllowedEfforts = append([]string(nil), control.AllowedEfforts...)
+		if len(control.AllowedEfforts) == 0 {
+			cloned.AllowedEfforts = make([]string, 0)
+		}
+	}
+	return &cloned
+}
+
+func cloneLLMReasoningValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(typed))
+		for key, item := range typed {
+			cloned[key] = cloneLLMReasoningValue(item)
+		}
+		return cloned
+	case map[any]any:
+		cloned := make(map[any]any, len(typed))
+		for key, item := range typed {
+			cloned[key] = cloneLLMReasoningValue(item)
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(typed))
+		for i, item := range typed {
+			cloned[i] = cloneLLMReasoningValue(item)
+		}
+		return cloned
+	default:
+		return value
+	}
 }
 
 // createProvider 根据配置创建 Provider 实例

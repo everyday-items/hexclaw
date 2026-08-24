@@ -6,10 +6,12 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/ai-core/llm/ollama"
+	"github.com/hexagon-codes/hexagon"
 	"github.com/hexagon-codes/hexclaw/config"
 	"gopkg.in/yaml.v3"
 )
@@ -41,6 +43,188 @@ func (p *reasoningCapabilityCaptureProvider) Models() []llm.ModelInfo { return n
 
 func (p *reasoningCapabilityCaptureProvider) CountTokens([]llm.Message) (int, error) {
 	return 0, nil
+}
+
+func TestReasoningConfigSnapshotsDeepCloneMutableControlState(t *testing.T) {
+	t.Run("cloneLLMConfig isolates its input", func(t *testing.T) {
+		input := reasoningSnapshotIsolationConfig()
+		cloned := cloneLLMConfig(input)
+
+		mutateReasoningSnapshot(t, cloned, "clone")
+		assertReasoningSnapshotState(t, input, "low", "enabled", "1024", "disabled", "0")
+
+		mutateReasoningSnapshot(t, input, "input")
+		assertReasoningSnapshotState(t, cloned, "clone", "clone", "clone", "clone", "clone")
+	})
+
+	t.Run("buildSelectorState isolates active config from its input", func(t *testing.T) {
+		input := reasoningSnapshotIsolationConfig()
+		_, active, _ := buildSelectorState(input)
+
+		mutateReasoningSnapshot(t, active, "active")
+		assertReasoningSnapshotState(t, input, "low", "enabled", "1024", "disabled", "0")
+
+		mutateReasoningSnapshot(t, input, "input")
+		assertReasoningSnapshotState(t, active, "active", "active", "active", "active", "active")
+	})
+
+	t.Run("ActiveConfig returns an isolated snapshot", func(t *testing.T) {
+		input := reasoningSnapshotIsolationConfig()
+		selector := NewWithProviders(input, map[string]hexagon.Provider{
+			"reasoning-provider": &reasoningCapabilityCaptureProvider{},
+		})
+
+		first := selector.ActiveConfig()
+		mutateReasoningSnapshot(t, first, "returned")
+		assertReasoningSnapshotState(t, selector.ActiveConfig(), "low", "enabled", "1024", "disabled", "0")
+
+		mutateReasoningSnapshot(t, input, "input")
+		assertReasoningSnapshotState(t, selector.ActiveConfig(), "low", "enabled", "1024", "disabled", "0")
+	})
+}
+
+func reasoningSnapshotIsolationConfig() config.LLMConfig {
+	return config.LLMConfig{
+		Default: "reasoning-provider",
+		Providers: map[string]config.LLMProviderConfig{
+			"reasoning-provider": {
+				APIKey:         "fake-router-key",
+				BaseURL:        "https://api.example.com/v1",
+				Model:          "effort-model",
+				Models:         []string{"effort-model", "nested-model"},
+				ModelSpecsMode: config.LLMModelSpecsModeExplicit,
+				ModelSpecs: []config.LLMProviderModelSpec{
+					{
+						ID:               "effort-model",
+						Capabilities:     []string{config.LLMModelCapabilityText},
+						ReasoningSupport: config.LLMReasoningSupportSupported,
+						ReasoningControl: &config.LLMReasoningControlSpec{
+							Dialect:        config.LLMReasoningDialectEffort,
+							On:             "high",
+							Off:            "none",
+							AllowedEfforts: []string{"low", "medium", "high"},
+						},
+					},
+					{
+						ID:               "nested-model",
+						Capabilities:     []string{config.LLMModelCapabilityText},
+						ReasoningSupport: config.LLMReasoningSupportSupported,
+						ReasoningControl: &config.LLMReasoningControlSpec{
+							Dialect: config.LLMReasoningDialectThinking,
+							On: map[string]any{
+								"type": "enabled",
+								"settings": []any{map[string]any{
+									"budget": "1024",
+								}},
+							},
+							Off: map[string]any{
+								"type": "disabled",
+								"settings": []any{map[string]any{
+									"budget": "0",
+								}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func mutateReasoningSnapshot(t *testing.T, cfg config.LLMConfig, marker string) {
+	t.Helper()
+	effort := reasoningSnapshotControl(t, cfg, "effort-model")
+	effort.AllowedEfforts[0] = marker
+
+	nested := reasoningSnapshotControl(t, cfg, "nested-model")
+	for _, value := range []any{nested.On, nested.Off} {
+		mapping, ok := value.(map[string]any)
+		if !ok {
+			t.Fatalf("nested reasoning value=%T, want map[string]any", value)
+		}
+		mapping["type"] = marker
+		settings, ok := mapping["settings"].([]any)
+		if !ok || len(settings) != 1 {
+			t.Fatalf("nested settings=%#v, want one entry", mapping["settings"])
+		}
+		entry, ok := settings[0].(map[string]any)
+		if !ok {
+			t.Fatalf("nested settings entry=%T, want map[string]any", settings[0])
+		}
+		entry["budget"] = marker
+	}
+}
+
+func assertReasoningSnapshotState(
+	t *testing.T,
+	cfg config.LLMConfig,
+	allowedFirst string,
+	onType string,
+	onBudget string,
+	offType string,
+	offBudget string,
+) {
+	t.Helper()
+	effort := reasoningSnapshotControl(t, cfg, "effort-model")
+	if got := effort.AllowedEfforts; !reflect.DeepEqual(got, []string{allowedFirst, "medium", "high"}) {
+		t.Fatalf("allowed_efforts=%v, want first value %q", got, allowedFirst)
+	}
+
+	nested := reasoningSnapshotControl(t, cfg, "nested-model")
+	for _, testCase := range []struct {
+		name       string
+		value      any
+		wantType   string
+		wantBudget string
+	}{
+		{name: "on", value: nested.On, wantType: onType, wantBudget: onBudget},
+		{name: "off", value: nested.Off, wantType: offType, wantBudget: offBudget},
+	} {
+		mapping, ok := testCase.value.(map[string]any)
+		if !ok {
+			t.Fatalf("%s value=%T, want map[string]any", testCase.name, testCase.value)
+		}
+		settings, ok := mapping["settings"].([]any)
+		if !ok || len(settings) != 1 {
+			t.Fatalf("%s settings=%#v, want one entry", testCase.name, mapping["settings"])
+		}
+		entry, ok := settings[0].(map[string]any)
+		if !ok {
+			t.Fatalf("%s settings entry=%T, want map[string]any", testCase.name, settings[0])
+		}
+		if mapping["type"] != testCase.wantType || entry["budget"] != testCase.wantBudget {
+			t.Fatalf(
+				"%s nested value=(type=%v budget=%v), want (type=%q budget=%q)",
+				testCase.name,
+				mapping["type"],
+				entry["budget"],
+				testCase.wantType,
+				testCase.wantBudget,
+			)
+		}
+	}
+}
+
+func reasoningSnapshotControl(
+	t *testing.T,
+	cfg config.LLMConfig,
+	modelID string,
+) *config.LLMReasoningControlSpec {
+	t.Helper()
+	provider, ok := cfg.Providers["reasoning-provider"]
+	if !ok {
+		t.Fatal("reasoning-provider is missing")
+	}
+	for _, spec := range provider.ModelSpecs {
+		if spec.ID == modelID {
+			if spec.ReasoningControl == nil {
+				t.Fatalf("model %q reasoning control is nil", modelID)
+			}
+			return spec.ReasoningControl
+		}
+	}
+	t.Fatalf("model %q is missing", modelID)
+	return nil
 }
 
 func TestReasoningCapabilityBoundaryUsesExactRequestedModel(t *testing.T) {

@@ -110,6 +110,18 @@ func TestReActEngine_SkillFastPath(t *testing.T) {
 	if reply.Metadata["backend_message_id"] == "" {
 		t.Fatal("同步回复应携带 backend_message_id")
 	}
+	// IM 通道会在发送前校验 canonical source 与 channel render manifest 成对存在；
+	// skill 快速路径不能只返回 MessageContent，否则钉钉会在调用 provider 前拒绝回复。
+	if reply.MessageContent == nil || reply.RenderManifest == nil {
+		t.Fatalf(
+			"skill 快速路径必须返回完整渲染证据对: content=%#v manifest=%#v",
+			reply.MessageContent,
+			reply.RenderManifest,
+		)
+	}
+	if err := reply.RenderManifest.ValidateFor(*reply.MessageContent); err != nil {
+		t.Fatalf("skill 快速路径渲染证据无效: %v", err)
+	}
 }
 
 func TestReActEngine_ProcessStream_SkillFastPath(t *testing.T) {

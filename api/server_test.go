@@ -292,7 +292,7 @@ func TestServer_ChatRejectsInvalidSamplingOverrides(t *testing.T) {
 	}
 }
 
-func TestServer_ChatReturnsUnderlyingErrorMessage(t *testing.T) {
+func TestServer_ChatReturnsDeadlineClassificationAndPublicMessage(t *testing.T) {
 	cfg := config.DefaultConfig()
 	eng := &mockEngine{err: context.DeadlineExceeded}
 	srv := NewServer(cfg, eng, nil, nil)
@@ -303,16 +303,19 @@ func TestServer_ChatReturnsUnderlyingErrorMessage(t *testing.T) {
 
 	srv.handleChat(w, req)
 
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("期望 500，实际 %d", w.Code)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("期望 503，实际 %d", w.Code)
 	}
 
-	var resp map[string]string
+	var resp map[string]any
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("解析响应失败: %v", err)
 	}
 	if got := resp["error"]; got != context.DeadlineExceeded.Error() {
 		t.Fatalf("错误文案未透传，实际 %q", got)
+	}
+	if resp["code"] != "UPSTREAM_UNAVAILABLE" || resp["retryable"] != true {
+		t.Fatalf("超时分类 = %#v, 期望 UPSTREAM_UNAVAILABLE/retryable", resp)
 	}
 }
 

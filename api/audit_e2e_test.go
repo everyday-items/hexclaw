@@ -504,10 +504,10 @@ func TestE2E_Auth_ChatRequiresAuth_NonLoopback(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 闭环 10：引擎错误跨层传播（引擎返错 → 500，错误文案不被吞）
+// 引擎超时按稳定错误分类跨层传播，公开错误文案不被吞。
 // ─────────────────────────────────────────────────────────────────────────────
 
-func TestE2E_Chat_EngineError_500_PropagatesMessage(t *testing.T) {
+func TestE2E_Chat_EngineDeadline_503_PropagatesClassification(t *testing.T) {
 	eng := &mockEngine{err: context.DeadlineExceeded}
 	srv := NewServer(config.DefaultConfig(), eng, nil, nil)
 	ts := httptest.NewServer(srv.routes())
@@ -515,13 +515,16 @@ func TestE2E_Chat_EngineError_500_PropagatesMessage(t *testing.T) {
 
 	resp := doJSON(t, ts, http.MethodPost, "/api/v1/chat", `{"message":"hi","user_id":"u1"}`)
 
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("引擎错误状态码 = %d, 期望 500", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("引擎超时状态码 = %d, 期望 503", resp.StatusCode)
 	}
 	out := decodeMap(t, resp)
 	// 错误信息应跨层透传到响应体 error 字段（不被吞成空串）
 	if msg, _ := out["error"].(string); msg == "" {
 		t.Fatalf("引擎错误未透传到响应 error 字段: %v", out)
+	}
+	if out["code"] != "UPSTREAM_UNAVAILABLE" || out["retryable"] != true {
+		t.Fatalf("引擎超时分类 = %#v, 期望 UPSTREAM_UNAVAILABLE/retryable", out)
 	}
 }
 

@@ -556,9 +556,67 @@ func cloneLLMConfig(cfg config.LLMConfig) config.LLMConfig {
 	cloned := cfg
 	cloned.Providers = make(map[string]config.LLMProviderConfig, len(cfg.Providers))
 	for name, provider := range cfg.Providers {
+		provider.ModelSpecs = cloneLLMModelSpecs(provider.ModelSpecs)
 		cloned.Providers[name] = provider
 	}
 	return cloned
+}
+
+func cloneLLMModelSpecs(specs []config.LLMProviderModelSpec) []config.LLMProviderModelSpec {
+	if specs == nil {
+		return nil
+	}
+	cloned := append([]config.LLMProviderModelSpec(nil), specs...)
+	if len(specs) == 0 {
+		cloned = make([]config.LLMProviderModelSpec, 0)
+	}
+	for i := range cloned {
+		cloned[i].ReasoningControl = cloneLLMReasoningControl(cloned[i].ReasoningControl)
+	}
+	return cloned
+}
+
+func cloneLLMReasoningControl(control *config.LLMReasoningControlSpec) *config.LLMReasoningControlSpec {
+	if control == nil {
+		return nil
+	}
+	cloned := &config.LLMReasoningControlSpec{
+		Dialect: control.Dialect,
+		On:      cloneLLMReasoningValue(control.On),
+		Off:     cloneLLMReasoningValue(control.Off),
+	}
+	if control.AllowedEfforts != nil {
+		cloned.AllowedEfforts = append([]string(nil), control.AllowedEfforts...)
+		if len(control.AllowedEfforts) == 0 {
+			cloned.AllowedEfforts = make([]string, 0)
+		}
+	}
+	return cloned
+}
+
+func cloneLLMReasoningValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(typed))
+		for key, item := range typed {
+			cloned[key] = cloneLLMReasoningValue(item)
+		}
+		return cloned
+	case map[any]any:
+		cloned := make(map[any]any, len(typed))
+		for key, item := range typed {
+			cloned[key] = cloneLLMReasoningValue(item)
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(typed))
+		for i, item := range typed {
+			cloned[i] = cloneLLMReasoningValue(item)
+		}
+		return cloned
+	default:
+		return value
+	}
 }
 
 // NewReActEngine 创建 ReAct 引擎
@@ -602,7 +660,7 @@ func (e *ReActEngine) ActiveLLMConfig() config.LLMConfig {
 	e.mu.RUnlock()
 
 	if router != nil {
-		return router.ActiveConfig()
+		return cloneLLMConfig(router.ActiveConfig())
 	}
 	return cfg
 }
@@ -611,15 +669,16 @@ func (e *ReActEngine) ActiveLLMConfig() config.LLMConfig {
 func (e *ReActEngine) ReloadLLMConfig(_ context.Context, llmCfg config.LLMConfig) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	next := cloneLLMConfig(llmCfg)
 
 	if e.router == nil {
-		e.router = llmrouter.NewWithProviders(llmCfg, map[string]hexagon.Provider{})
+		e.router = llmrouter.NewWithProviders(next, map[string]hexagon.Provider{})
 	}
-	if err := e.router.Reload(llmCfg); err != nil {
+	if err := e.router.Reload(next); err != nil {
 		return err
 	}
-	e.cache.Reconfigure(llmCacheOptions(llmCfg))
-	e.cfg.LLM = cloneLLMConfig(llmCfg)
+	e.cache.Reconfigure(llmCacheOptions(next))
+	e.cfg.LLM = cloneLLMConfig(next)
 	return nil
 }
 
@@ -1007,9 +1066,15 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (*adapt
 			assistantMessageID = record.ID
 		}
 
+		messageContent, renderManifest := canonicalProducerProjection(
+			messagecontent.ProducerSkill,
+			result.Content,
+			msg.Metadata["user_locale"],
+		)
 		return &adapter.Reply{
 			Content:        result.Content,
-			MessageContent: canonicalProducerContent(messagecontent.ProducerSkill, result.Content, msg.Metadata["user_locale"]),
+			MessageContent: messageContent,
+			RenderManifest: renderManifest,
 			Metadata:       withReplyPersistError(withAssistantMessageID(result.Metadata, assistantMessageID), msg),
 			ToolCalls:      tc,
 		}, nil
@@ -4651,12 +4716,13 @@ func (e *ReActEngine) resolveLLMSelection(ctx context.Context, msg *adapter.Mess
 	if modelName != "" {
 		provider = wrapModelOverrideProvider(provider, modelName)
 	}
+	resolvedPinnedAgent := msg != nil && msg.Metadata["route_source"] == "pinned" && strings.TrimSpace(msg.Metadata["routed_agent"]) != ""
 
 	return llmSelection{
 		provider:         provider,
 		providerName:     providerName,
 		modelName:        modelName,
-		explicitProvider: providerHint != "",
+		explicitProvider: providerHint != "" || resolvedPinnedAgent,
 	}, nil
 }
 

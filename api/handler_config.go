@@ -1283,13 +1283,15 @@ func (s *Server) handleFetchProviderModels(w http.ResponseWriter, r *http.Reques
 // （pricing / architecture.input_modalities / supported_parameters / context_length）。
 // 标准 OpenAI /models 只有裸 id，这些字段会缺省——前端按"有则展示、无则启发式兜底"处理。
 type providerModelInfo struct {
-	ID              string   `json:"id"`
-	Name            string   `json:"name,omitempty"`
-	ContextLength   int64    `json:"context_length,omitempty"`
-	PromptPrice     string   `json:"prompt_price,omitempty"`
-	CompletionPrice string   `json:"completion_price,omitempty"`
-	InputModalities []string `json:"input_modalities,omitempty"`
-	SupportsTools   bool     `json:"supports_tools,omitempty"`
+	ID               string                          `json:"id"`
+	Name             string                          `json:"name,omitempty"`
+	ContextLength    int64                           `json:"context_length,omitempty"`
+	PromptPrice      string                          `json:"prompt_price,omitempty"`
+	CompletionPrice  string                          `json:"completion_price,omitempty"`
+	InputModalities  []string                        `json:"input_modalities,omitempty"`
+	SupportsTools    bool                            `json:"supports_tools,omitempty"`
+	ReasoningSupport string                          `json:"reasoning_support,omitempty"`
+	ReasoningControl *config.LLMReasoningControlSpec `json:"reasoning_control,omitempty"`
 }
 
 // parseProviderModel 容错解析单个模型条目。
@@ -1336,7 +1338,66 @@ func parseProviderModel(raw json.RawMessage) (providerModelInfo, bool) {
 			}
 		}
 	}
+	info.ReasoningSupport, info.ReasoningControl = parseProviderModelReasoning(m, id)
 	return info, true
+}
+
+func parseProviderModelReasoning(m map[string]any, modelID string) (string, *config.LLMReasoningControlSpec) {
+	supportValue, hasSupport := m["reasoning_support"]
+	controlValue, hasControl := m["reasoning_control"]
+	if !hasSupport && !hasControl {
+		return "", nil
+	}
+	support, ok := supportValue.(string)
+	if !ok {
+		return config.LLMReasoningSupportUnknown, nil
+	}
+	switch support {
+	case config.LLMReasoningSupportSupported,
+		config.LLMReasoningSupportUnsupported,
+		config.LLMReasoningSupportUnknown:
+	default:
+		return config.LLMReasoningSupportUnknown, nil
+	}
+
+	var control *config.LLMReasoningControlSpec
+	if hasControl {
+		controlMap, ok := controlValue.(map[string]any)
+		if !ok {
+			return config.LLMReasoningSupportUnknown, nil
+		}
+		for key := range controlMap {
+			switch key {
+			case "dialect", "on", "off", "allowed_efforts":
+			default:
+				return config.LLMReasoningSupportUnknown, nil
+			}
+		}
+		encoded, err := json.Marshal(controlMap)
+		if err != nil {
+			return config.LLMReasoningSupportUnknown, nil
+		}
+		control = &config.LLMReasoningControlSpec{}
+		if err := json.Unmarshal(encoded, control); err != nil {
+			return config.LLMReasoningSupportUnknown, nil
+		}
+	}
+
+	provider := config.LLMProviderConfig{
+		Model:          modelID,
+		Models:         []string{modelID},
+		ModelSpecsMode: config.LLMModelSpecsModeExplicit,
+		ModelSpecs: []config.LLMProviderModelSpec{{
+			ID:               modelID,
+			Capabilities:     []string{config.LLMModelCapabilityText},
+			ReasoningSupport: support,
+			ReasoningControl: control,
+		}},
+	}
+	if err := config.ValidateProviderModelSpecs(provider); err != nil {
+		return config.LLMReasoningSupportUnknown, nil
+	}
+	return support, control
 }
 
 // anyPriceToString 把 string / number 形式的价格统一为字符串；无法识别返回空。

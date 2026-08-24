@@ -172,6 +172,94 @@ func TestActiveLLMConfig_ReturnsDeepImmutableSnapshot(t *testing.T) {
 	}
 }
 
+func TestActiveLLMConfig_ReasoningControlSnapshotIsMutationIsolated(t *testing.T) {
+	newFixture := func() (*Server, *mockEngine) {
+		cfg := config.DefaultConfig()
+		cfg.LLM.Providers = map[string]config.LLMProviderConfig{
+			"provider": {
+				ProviderInstanceID: providerModelCatalogTestInstanceID,
+				Models:             []string{"effort-model", "nested-model"},
+				ModelSpecsMode:     config.LLMModelSpecsModeExplicit,
+				ModelSpecs: []config.LLMProviderModelSpec{
+					{
+						ID:               "effort-model",
+						Capabilities:     []string{config.LLMModelCapabilityText},
+						ReasoningSupport: config.LLMReasoningSupportSupported,
+						ReasoningControl: &config.LLMReasoningControlSpec{
+							Dialect:        config.LLMReasoningDialectEffort,
+							On:             "high",
+							Off:            "none",
+							AllowedEfforts: []string{"low", "high"},
+						},
+					},
+					{
+						ID:               "nested-model",
+						Capabilities:     []string{config.LLMModelCapabilityText},
+						ReasoningSupport: config.LLMReasoningSupportSupported,
+						ReasoningControl: &config.LLMReasoningControlSpec{
+							Dialect: config.LLMReasoningDialectThink,
+							On: map[string]any{
+								"nested": []any{"on-original"},
+							},
+							Off: map[string]any{
+								"nested": []any{"off-original"},
+							},
+						},
+					},
+				},
+			},
+		}
+		engine := &mockEngine{activeLLM: cfg.LLM}
+		return NewServer(cfg, engine, nil, nil), engine
+	}
+
+	t.Run("control pointer", func(t *testing.T) {
+		srv, engine := newFixture()
+		snapshot := srv.activeLLMConfig()
+		snapshot.Providers["provider"].ModelSpecs[0].ReasoningControl.Dialect = "mutated"
+
+		got := engine.ActiveLLMConfig().Providers["provider"].ModelSpecs[0].ReasoningControl.Dialect
+		if got != config.LLMReasoningDialectEffort {
+			t.Fatalf("live reasoning dialect=%q after snapshot mutation", got)
+		}
+	})
+
+	t.Run("allowed efforts", func(t *testing.T) {
+		srv, engine := newFixture()
+		snapshot := srv.activeLLMConfig()
+		snapshot.Providers["provider"].ModelSpecs[0].ReasoningControl.AllowedEfforts[0] = "max"
+
+		got := engine.ActiveLLMConfig().Providers["provider"].ModelSpecs[0].ReasoningControl.AllowedEfforts[0]
+		if got != "low" {
+			t.Fatalf("live allowed effort=%q after snapshot mutation", got)
+		}
+	})
+
+	t.Run("nested on value", func(t *testing.T) {
+		srv, engine := newFixture()
+		snapshot := srv.activeLLMConfig()
+		on := snapshot.Providers["provider"].ModelSpecs[1].ReasoningControl.On.(map[string]any)
+		on["nested"].([]any)[0] = "on-mutated"
+
+		liveOn := engine.ActiveLLMConfig().Providers["provider"].ModelSpecs[1].ReasoningControl.On.(map[string]any)
+		if got := liveOn["nested"].([]any)[0]; got != "on-original" {
+			t.Fatalf("live nested on value=%v after snapshot mutation", got)
+		}
+	})
+
+	t.Run("nested off value", func(t *testing.T) {
+		srv, engine := newFixture()
+		snapshot := srv.activeLLMConfig()
+		off := snapshot.Providers["provider"].ModelSpecs[1].ReasoningControl.Off.(map[string]any)
+		off["nested"].([]any)[0] = "off-mutated"
+
+		liveOff := engine.ActiveLLMConfig().Providers["provider"].ModelSpecs[1].ReasoningControl.Off.(map[string]any)
+		if got := liveOff["nested"].([]any)[0]; got != "off-original" {
+			t.Fatalf("live nested off value=%v after snapshot mutation", got)
+		}
+	})
+}
+
 func TestActiveLLMConfig_PreservesNilAndExplicitEmptyCapabilitySemantics(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.LLM.Providers = map[string]config.LLMProviderConfig{

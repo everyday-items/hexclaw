@@ -20,6 +20,27 @@ func canonicalProducerContent(producer messagecontent.ProducerKind, markdown, lo
 	return &content
 }
 
+func canonicalProducerProjection(producer messagecontent.ProducerKind, markdown, locale string) (*messagecontent.MessageContent, *messagecontent.RenderManifest) {
+	content := canonicalProducerContent(producer, markdown, locale)
+	if content == nil {
+		return nil, nil
+	}
+	manifest, err := messagecontent.BuildManifest(*content, messagecontent.RenderRequest{
+		Surface:         messagecontent.SurfaceDesktop,
+		RendererVersion: "engine-markdown-v1",
+		Capabilities: messagecontent.CapabilitySnapshot{
+			Markdown: true,
+			TeXMath:  true,
+			MathML:   true,
+		},
+		Parts: []messagecontent.RenderPart{{Kind: messagecontent.PartMarkdown, Text: markdown}},
+	})
+	if err != nil {
+		return nil, nil
+	}
+	return content, &manifest
+}
+
 func withProducerMetadata(metadata map[string]string, producer messagecontent.ProducerKind, locale string) map[string]string {
 	result := make(map[string]string, len(metadata)+2)
 	for key, value := range metadata {

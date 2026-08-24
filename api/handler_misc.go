@@ -1219,6 +1219,49 @@ func (s *Server) validateAgentMetadataCapabilities(metadata map[string]string) e
 	return s.agentMetadataGuard(metadata)
 }
 
+func cloneLLMReasoningValueSnapshot(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(typed))
+		for key, item := range typed {
+			cloned[key] = cloneLLMReasoningValueSnapshot(item)
+		}
+		return cloned
+	case map[any]any:
+		cloned := make(map[any]any, len(typed))
+		for key, item := range typed {
+			cloned[key] = cloneLLMReasoningValueSnapshot(item)
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(typed))
+		for index, item := range typed {
+			cloned[index] = cloneLLMReasoningValueSnapshot(item)
+		}
+		return cloned
+	default:
+		return value
+	}
+}
+
+func cloneLLMReasoningControlSnapshot(control *config.LLMReasoningControlSpec) *config.LLMReasoningControlSpec {
+	if control == nil {
+		return nil
+	}
+	cloned := &config.LLMReasoningControlSpec{
+		Dialect: control.Dialect,
+		On:      cloneLLMReasoningValueSnapshot(control.On),
+		Off:     cloneLLMReasoningValueSnapshot(control.Off),
+	}
+	if control.AllowedEfforts != nil {
+		cloned.AllowedEfforts = append([]string(nil), control.AllowedEfforts...)
+		if len(control.AllowedEfforts) == 0 {
+			cloned.AllowedEfforts = make([]string, 0)
+		}
+	}
+	return cloned
+}
+
 func cloneLLMConfigSnapshot(source config.LLMConfig) config.LLMConfig {
 	clone := source
 	clone.Providers = make(map[string]config.LLMProviderConfig, len(source.Providers))
@@ -1238,6 +1281,7 @@ func cloneLLMConfigSnapshot(source config.LLMConfig) config.LLMConfig {
 					embedding := *spec.Embedding
 					specClone.Embedding = &embedding
 				}
+				specClone.ReasoningControl = cloneLLMReasoningControlSnapshot(spec.ReasoningControl)
 				providerClone.ModelSpecs[index] = specClone
 			}
 		}
