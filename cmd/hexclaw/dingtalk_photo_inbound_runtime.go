@@ -41,6 +41,10 @@ type k12InboundPhotoCoordinatorPort interface {
 	RecordFinalArtifact(context.Context, string, string, int64, string) (k12usecase.InboundPhotoDispatch, error)
 	BindReplyBatch(context.Context, string, string, int64, string) (k12usecase.InboundPhotoDispatch, error)
 	CompleteReply(context.Context, string, string, int64) (k12usecase.InboundPhotoDispatch, error)
+	FailTerminal(
+		context.Context, string, string, int64,
+		k12usecase.InboundPhotoTerminalStage, string,
+	) (k12usecase.InboundPhotoDispatch, error)
 }
 
 type k12InboundPhotoImageTaskPort interface {
@@ -66,36 +70,38 @@ type k12DingtalkPhotoReplyIdentityPort interface {
 }
 
 type k12DingtalkPhotoInboundRuntimeConfig struct {
-	BaseContext     context.Context
-	Router          *agentrouter.Dispatcher
-	Check           func(context.Context, *adapter.Message) error
-	Inbound         k12InboundPhotoCoordinatorPort
-	ImageTasks      k12InboundPhotoImageTaskPort
-	PracticeSets    k12InboundPhotoPracticeSetReader
-	PracticeReturns k12InboundPhotoPracticeReturnPort
-	Artifacts       k12InboundPhotoFinalArtifactReader
-	ReplyBatches    k12DingtalkPhotoReplyIdentityPort
-	Now             func() int64
-	PollInterval    time.Duration
-	RetryInterval   time.Duration
+	BaseContext       context.Context
+	Router            *agentrouter.Dispatcher
+	Check             func(context.Context, *adapter.Message) error
+	Inbound           k12InboundPhotoCoordinatorPort
+	ImageTasks        k12InboundPhotoImageTaskPort
+	PracticeSets      k12InboundPhotoPracticeSetReader
+	PracticeReturns   k12InboundPhotoPracticeReturnPort
+	Artifacts         k12InboundPhotoFinalArtifactReader
+	ReplyBatches      k12DingtalkPhotoReplyIdentityPort
+	Now               func() int64
+	PollInterval      time.Duration
+	RetryInterval     time.Duration
+	RestartCheckpoint k12DingtalkPhotoRestartCheckpointPort
 }
 
 // k12DingtalkPhotoInboundRuntime 只编排 V88、ImageTask、V89 与既有 DeliveryBatch；
 // 各自的幂等、CAS、媒体准备与回执状态机仍由原有领域实现唯一拥有。
 type k12DingtalkPhotoInboundRuntime struct {
-	baseCtx         context.Context
-	router          *agentrouter.Dispatcher
-	check           func(context.Context, *adapter.Message) error
-	inbound         k12InboundPhotoCoordinatorPort
-	imageTasks      k12InboundPhotoImageTaskPort
-	practiceSets    k12InboundPhotoPracticeSetReader
-	practiceReturns k12InboundPhotoPracticeReturnPort
-	artifacts       k12InboundPhotoFinalArtifactReader
-	replyBatches    k12DingtalkPhotoReplyIdentityPort
-	replies         *k12DingtalkPhotoReplyCoordinator
-	pollInterval    time.Duration
-	retryInterval   time.Duration
-	now             func() int64
+	baseCtx           context.Context
+	router            *agentrouter.Dispatcher
+	check             func(context.Context, *adapter.Message) error
+	inbound           k12InboundPhotoCoordinatorPort
+	imageTasks        k12InboundPhotoImageTaskPort
+	practiceSets      k12InboundPhotoPracticeSetReader
+	practiceReturns   k12InboundPhotoPracticeReturnPort
+	artifacts         k12InboundPhotoFinalArtifactReader
+	replyBatches      k12DingtalkPhotoReplyIdentityPort
+	replies           *k12DingtalkPhotoReplyCoordinator
+	pollInterval      time.Duration
+	retryInterval     time.Duration
+	now               func() int64
+	restartCheckpoint k12DingtalkPhotoRestartCheckpointPort
 
 	workerMu sync.Mutex
 	running  map[string]struct{}
@@ -129,6 +135,10 @@ func newK12DingtalkPhotoInboundRuntime(
 		now:     now,
 		running: make(map[string]struct{}),
 	}
+	runtime.restartCheckpoint = config.RestartCheckpoint
+	if runtime.restartCheckpoint == nil {
+		runtime.restartCheckpoint = newK12DingtalkPhotoRestartCheckpointFromEnvironment()
+	}
 	if config.ReplyBatches != nil {
 		runtime.replies = newK12DingtalkPhotoReplyCoordinator(config.ReplyBatches)
 	}
@@ -139,6 +149,15 @@ type k12DingtalkInboundPhotoCommand struct {
 	SchemaVersion   int    `json:"schema_version"`
 	SourceSessionID string `json:"source_session_id"`
 	MessageIntent   string `json:"message_intent"`
+	Provider        string `json:"provider"`
+	Model           string `json:"model"`
+}
+
+func normalizeK12DingtalkInboundPhotoRoute(provider, model string) (string, string, bool) {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	return provider, model, provider != "" && model != "" &&
+		!strings.EqualFold(provider, "auto") && !strings.EqualFold(model, "auto")
 }
 
 func k12DingtalkInboundIdentity(msg *adapter.Message) (k12usecase.InboundPhotoIdentity, error) {
@@ -212,9 +231,15 @@ func (r *k12DingtalkPhotoInboundRuntime) AdmitInboundPhoto(
 			return false, err
 		}
 	}
+	provider, model, exactRoute := normalizeK12DingtalkInboundPhotoRoute(
+		routed.AgentConfig.Provider, routed.AgentConfig.Model,
+	)
+	if !exactRoute {
+		return false, fmt.Errorf("DingTalk inbound TutorAgent route is incomplete")
+	}
 	commandJSON, err := json.Marshal(k12DingtalkInboundPhotoCommand{
-		SchemaVersion: 1, SourceSessionID: k12PhotoSourceSession(msg),
-		MessageIntent: strings.TrimSpace(msg.Content),
+		SchemaVersion: 2, SourceSessionID: k12PhotoSourceSession(msg),
+		MessageIntent: strings.TrimSpace(msg.Content), Provider: provider, Model: model,
 	})
 	if err != nil {
 		return false, fmt.Errorf("encode DingTalk inbound photo command: %w", err)
@@ -316,14 +341,30 @@ func (r *k12DingtalkPhotoInboundRuntime) advance(
 	ctx context.Context,
 	bundle k12usecase.InboundPhotoBundle,
 ) (bool, error) {
+	if bundle.Dispatch.TerminalStatus == k12usecase.InboundPhotoTerminalFailed {
+		return true, nil
+	}
 	if bundle.Dispatch.ReplyStatus == k12usecase.InboundPhotoReplyDelivered {
 		return true, nil
 	}
 	if bundle.Dispatch.ProcessingStatus == k12usecase.InboundPhotoFinalArtifactReady {
+		if bundle.Dispatch.ReplyStatus == k12usecase.InboundPhotoReplyReady &&
+			strings.TrimSpace(bundle.Dispatch.DeliveryBatchID) == "" {
+			if err := r.reachRestartCheckpoint(
+				ctx, k12DingtalkPhotoRestartCheckpointBeforeDeliverySend, bundle, "",
+			); err != nil {
+				return false, err
+			}
+		}
 		return r.advanceFinalReply(ctx, bundle)
 	}
 	switch bundle.Dispatch.ProcessingStatus {
 	case k12usecase.InboundPhotoAdmitted:
+		if err := r.reachRestartCheckpoint(
+			ctx, k12DingtalkPhotoRestartCheckpointAdmissionCommitted, bundle, "",
+		); err != nil {
+			return false, err
+		}
 		return false, r.createAndBindImageTask(ctx, bundle)
 	case k12usecase.InboundPhotoImageTaskSubmitted:
 		return r.advanceImageTask(ctx, bundle)
@@ -336,15 +377,23 @@ func (r *k12DingtalkPhotoInboundRuntime) createAndBindImageTask(
 	ctx context.Context,
 	bundle k12usecase.InboundPhotoBundle,
 ) error {
+	var command k12DingtalkInboundPhotoCommand
+	if err := json.Unmarshal([]byte(bundle.Receipt.CommandJSON), &command); err != nil {
+		return fmt.Errorf("decode DingTalk inbound photo command: %w", err)
+	}
+	provider, model, exactRoute := normalizeK12DingtalkInboundPhotoRoute(
+		command.Provider, command.Model,
+	)
+	if command.SchemaVersion != 2 || !exactRoute {
+		return fmt.Errorf("DingTalk inbound photo frozen route is incomplete")
+	}
+	command.Provider = provider
+	command.Model = model
 	ready, err := r.imageTasks.PersistPageAsset(
 		ctx, bundle.Receipt.OwnerScope, bundle.Receipt.AgentName, bundle.Asset.Bytes,
 	)
 	if err != nil {
 		return err
-	}
-	var command k12DingtalkInboundPhotoCommand
-	if err := json.Unmarshal([]byte(bundle.Receipt.CommandJSON), &command); err != nil {
-		return fmt.Errorf("decode DingTalk inbound photo command: %w", err)
 	}
 	view, _, err := r.imageTasks.Create(ctx, k12usecase.CreateImageTaskInput{
 		OwnerScope: bundle.Receipt.OwnerScope, AgentName: bundle.Receipt.AgentName,
@@ -353,6 +402,9 @@ func (r *k12DingtalkPhotoInboundRuntime) createAndBindImageTask(
 		SourceSessionID: command.SourceSessionID,
 		SourceAssetRefs: []string{ready.Metadata.PageAssetID},
 		MessageIntent:   command.MessageIntent, AttemptGeneration: 1,
+		RouteRequest: k12.ImageTaskRouteSnapshot{
+			Provider: command.Provider, Model: command.Model, SelectionSource: "explicit",
+		},
 	})
 	if err != nil {
 		return err
@@ -377,6 +429,27 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceImageTask(
 	)
 	if err != nil {
 		return false, err
+	}
+	if view.Dispatch.Status == k12.ImageTaskStatusFailed &&
+		!view.Dispatch.RetrySafe &&
+		view.ClassificationInvocationStatus != k12.ImageTaskInvocationOutcomeUnknown {
+		failureKind := strings.TrimSpace(view.Dispatch.FailureKind)
+		if failureKind == "" {
+			failureKind = "image_task_failed"
+		}
+		_, err := r.inbound.FailTerminal(
+			ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID, bundle.Dispatch.Version,
+			k12usecase.InboundPhotoTerminalStageImageTask, failureKind,
+		)
+		return err == nil, err
+	}
+	if view.HomeworkProjection != nil &&
+		view.HomeworkProjection.Stage == k12.GradingStageFailedTerminal {
+		_, err := r.inbound.FailTerminal(
+			ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID, bundle.Dispatch.Version,
+			k12usecase.InboundPhotoTerminalStageGrading, "grading_failed_terminal",
+		)
+		return err == nil, err
 	}
 	practiceRoutingConfigured := r.practiceSets != nil || r.practiceReturns != nil
 	if practiceRoutingConfigured && (r.practiceSets == nil || r.practiceReturns == nil) {
@@ -508,6 +581,12 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceImageTask(
 	if _, _, err := r.openValidatedFinalArtifact(ctx, validated); err != nil {
 		return false, err
 	}
+	if err := r.reachRestartCheckpoint(
+		ctx, k12DingtalkPhotoRestartCheckpointGradingModelCompleted,
+		bundle, result.FinalArtifact.ArtifactID,
+	); err != nil {
+		return false, err
+	}
 	_, err = r.inbound.RecordFinalArtifact(
 		ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID,
 		bundle.Dispatch.Version, result.FinalArtifact.ArtifactID,
@@ -598,6 +677,12 @@ func (r *k12DingtalkPhotoInboundRuntime) advancePracticeReturn(
 	if _, _, err := r.openValidatedFinalArtifact(ctx, validated); err != nil {
 		return false, err
 	}
+	if err := r.reachRestartCheckpoint(
+		ctx, k12DingtalkPhotoRestartCheckpointGradingModelCompleted,
+		bundle, state.FinalArtifactID,
+	); err != nil {
+		return false, err
+	}
 	_, err = r.inbound.RecordFinalArtifact(
 		ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID,
 		bundle.Dispatch.Version, state.FinalArtifactID,
@@ -683,14 +768,33 @@ func (r *k12DingtalkPhotoInboundRuntime) completeBoundReply(
 	if err := validateK12DingtalkPhotoReplyBatch(batch, target, batch.Receipts[1].PartMIME); err != nil {
 		return false, err
 	}
-	if batch.Status != k12.DeliveryBatchDelivered {
-		return batch.Status == k12.DeliveryBatchFailed ||
-			batch.Status == k12.DeliveryBatchPartialFailed, nil
+	if batch.Status == k12.DeliveryBatchFailed || batch.Status == k12.DeliveryBatchPartialFailed {
+		failureKind := "delivery_batch_failed"
+		if batch.Status == k12.DeliveryBatchPartialFailed {
+			failureKind = "delivery_batch_partial_failed"
+		}
+		_, err := r.inbound.FailTerminal(
+			ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID, bundle.Dispatch.Version,
+			k12usecase.InboundPhotoTerminalStageDelivery, failureKind,
+		)
+		return err == nil, err
 	}
-	_, err = r.inbound.CompleteReply(
+	if batch.Status != k12.DeliveryBatchDelivered {
+		return false, nil
+	}
+	completed, err := r.inbound.CompleteReply(
 		ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID, bundle.Dispatch.Version,
 	)
-	return err == nil, err
+	if err != nil {
+		return false, err
+	}
+	bundle.Dispatch = completed
+	if err := r.reachRestartCheckpoint(
+		ctx, k12DingtalkPhotoRestartCheckpointAfterDeliverySend, bundle, "",
+	); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (r *k12DingtalkPhotoInboundRuntime) openValidatedFinalArtifact(
@@ -797,10 +901,33 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceFinalReply(
 	if batch.Status != k12.DeliveryBatchDelivered {
 		return false, nil
 	}
-	_, err = r.inbound.CompleteReply(
+	completed, err := r.inbound.CompleteReply(
 		ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID, bundle.Dispatch.Version,
 	)
-	return err == nil, err
+	if err != nil {
+		return false, err
+	}
+	bundle.Dispatch = completed
+	if err := r.reachRestartCheckpoint(
+		ctx, k12DingtalkPhotoRestartCheckpointAfterDeliverySend, bundle, "",
+	); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (r *k12DingtalkPhotoInboundRuntime) reachRestartCheckpoint(
+	ctx context.Context,
+	stage k12DingtalkPhotoRestartCheckpointStage,
+	bundle k12usecase.InboundPhotoBundle,
+	finalArtifactID string,
+) error {
+	if r == nil || r.restartCheckpoint == nil {
+		return nil
+	}
+	return r.restartCheckpoint.Reach(ctx, k12DingtalkPhotoRestartCheckpoint{
+		Stage: stage, Bundle: bundle, FinalArtifactID: strings.TrimSpace(finalArtifactID),
+	})
 }
 
 // 下列方法让文字确认入口与旧同步入口消费同一个运行时门面。

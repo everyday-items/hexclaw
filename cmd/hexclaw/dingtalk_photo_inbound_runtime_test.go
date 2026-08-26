@@ -21,6 +21,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/messagecontent"
 	"github.com/hexagon-codes/hexclaw/records"
+	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	k12 "github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
@@ -39,6 +40,7 @@ type inboundPhotoCoordinatorFake struct {
 	recordedImageTaskID     string
 	beforeRecordImageTask   func()
 	resumeCalls             int
+	terminalCalls           int
 }
 
 func (f *inboundPhotoCoordinatorFake) Admit(
@@ -150,7 +152,7 @@ func inboundPhotoBundleFixture(raw []byte) k12usecase.InboundPhotoBundle {
 				ProviderMessageID: "provider-message-1",
 			},
 			CommandDigest: "sha256:" + strings.Repeat("1", 64),
-			CommandJSON:   `{"schema_version":1,"source_session_id":"parent-1","message_intent":"请批改作业"}`,
+			CommandJSON:   `{"schema_version":2,"source_session_id":"parent-1","message_intent":"请批改作业","provider":"hexclaw-gpt","model":"gpt-5.6-sol"}`,
 		},
 		Asset: k12usecase.InboundPhotoAsset{
 			AssetID: "asset-1", ReceiptID: "receipt-1", Name: "homework.png",
@@ -200,6 +202,40 @@ func TestDingTalkPhotoAdmissionResumesFrozenIdentityBeforeMutableRouting(t *test
 	}
 }
 
+func TestDingTalkPhotoAdmissionRejectsTutorAgentWithoutExactProviderModel(t *testing.T) {
+	for _, route := range []struct{ provider, model string }{
+		{},
+		{provider: "auto", model: "auto"},
+	} {
+		t.Run(route.provider+"/"+route.model, func(t *testing.T) {
+			coordinator := &inboundPhotoCoordinatorFake{
+				bundle:    inboundPhotoBundleFixture([]byte("unused")),
+				resumeErr: records.ErrNotFound,
+			}
+			router := k12PhotoTestRouter(t, true, k12TutorScenario)
+			if route.provider != "" {
+				if err := router.UpdateAgent(agentrouter.AgentConfig{
+					Name: "child-tutor", Provider: route.provider, Model: route.model,
+					Metadata: map[string]string{"scenario": k12TutorScenario},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			runtime := newK12DingtalkPhotoInboundRuntime(k12DingtalkPhotoInboundRuntimeConfig{
+				BaseContext: context.Background(), Router: router, Inbound: coordinator,
+			})
+
+			handled, err := runtime.AdmitInboundPhoto(context.Background(), k12PhotoTestMessage())
+			if err == nil || handled {
+				t.Fatalf("non-exact admission = handled %v, err %v", handled, err)
+			}
+			if len(coordinator.admissions) != 0 {
+				t.Fatalf("non-exact admission reached durable receipt: %+v", coordinator.admissions)
+			}
+		})
+	}
+}
+
 func TestDingTalkPhotoAdmissionConflictNACKsInsteadOfFallingThrough(t *testing.T) {
 	coordinator := &inboundPhotoCoordinatorFake{
 		bundle:   inboundPhotoBundleFixture([]byte("first-photo")),
@@ -226,8 +262,17 @@ func TestDingTalkPhotoFirstAdmissionFreezesExplicitK12Binding(t *testing.T) {
 		bundle: inboundPhotoBundleFixture([]byte("unused")), resumeErr: records.ErrNotFound,
 	}
 	checks := 0
+	router := k12PhotoTestRouter(t, true, k12TutorScenario)
+	if err := router.UpdateAgent(agentrouter.AgentConfig{
+		Name: "child-tutor", Provider: "hexclaw-gpt", Model: "gpt-5.6-sol",
+		Metadata: map[string]string{
+			"scenario": k12TutorScenario, k12.MetaKeyGradeTerm: "五年级下",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	runtime := newK12DingtalkPhotoInboundRuntime(k12DingtalkPhotoInboundRuntimeConfig{
-		BaseContext: context.Background(), Router: k12PhotoTestRouter(t, true, "k12-tutor"),
+		BaseContext: context.Background(), Router: router,
 		Check:   func(context.Context, *adapter.Message) error { checks++; return nil },
 		Inbound: coordinator,
 	})
@@ -250,8 +295,9 @@ func TestDingTalkPhotoFirstAdmissionFreezesExplicitK12Binding(t *testing.T) {
 	}
 	var command k12DingtalkInboundPhotoCommand
 	if err := json.Unmarshal([]byte(admission.CommandJSON), &command); err != nil ||
-		command.SchemaVersion != 1 || command.SourceSessionID != "family-group" ||
-		command.MessageIntent != msg.Content {
+		command.SchemaVersion != 2 || command.SourceSessionID != "family-group" ||
+		command.MessageIntent != msg.Content || command.Provider != "hexclaw-gpt" ||
+		command.Model != "gpt-5.6-sol" {
 		t.Fatalf("frozen command = %#v, err %v", command, err)
 	}
 }
@@ -566,7 +612,7 @@ func TestDingTalkPhotoWorkerBindsOneImageTaskBeforeStartingIt(t *testing.T) {
 	}
 	bundle := inboundPhotoBundleFixture(raw)
 	bundle.Receipt.AgentName = "child-tutor"
-	bundle.Receipt.CommandJSON = `{"schema_version":1,"source_session_id":"family-group","message_intent":"请批改"}`
+	bundle.Receipt.CommandJSON = `{"schema_version":2,"source_session_id":"family-group","message_intent":"请批改","provider":"hexclaw-gpt","model":"gpt-5.6-sol"}`
 	coordinator := &inboundPhotoCoordinatorFake{bundle: bundle}
 	images := &fakeK12ImageTaskFacade{}
 	coordinator.beforeRecordImageTask = func() {
@@ -587,8 +633,39 @@ func TestDingTalkPhotoWorkerBindsOneImageTaskBeforeStartingIt(t *testing.T) {
 	if got := images.createInput.SourceRef; got != "dingtalk-inbound:receipt-1" {
 		t.Fatalf("replay-stable ImageTask source_ref = %q", got)
 	}
+	if got := images.createInput.RouteRequest; got.Provider != "hexclaw-gpt" ||
+		got.Model != "gpt-5.6-sol" || got.SelectionSource != "explicit" {
+		t.Fatalf("ImageTask did not use the frozen inbound route: %+v", got)
+	}
 	if strings.Join(images.events, ",") != "persist,create,start" {
 		t.Fatalf("ImageTask events = %v", images.events)
+	}
+}
+
+func TestDingTalkPhotoWorkerRejectsReceiptWithoutFrozenProviderModel(t *testing.T) {
+	for name, commandJSON := range map[string]string{
+		"missing": `{"schema_version":1,"source_session_id":"family-group","message_intent":"请批改"}`,
+		"auto":    `{"schema_version":2,"source_session_id":"family-group","message_intent":"请批改","provider":"auto","model":"auto"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
+			bundle := inboundPhotoBundleFixture([]byte("source-photo"))
+			bundle.Receipt.CommandJSON = commandJSON
+			coordinator := &inboundPhotoCoordinatorFake{bundle: bundle}
+			images := &fakeK12ImageTaskFacade{}
+			runtime := newK12DingtalkPhotoInboundRuntime(k12DingtalkPhotoInboundRuntimeConfig{
+				BaseContext: context.Background(), Inbound: coordinator, ImageTasks: images,
+			})
+
+			done, err := runtime.advance(context.Background(), bundle)
+			if err == nil || done {
+				t.Fatalf("non-exact frozen route = done %v, err %v", done, err)
+			}
+			if len(images.events) != 0 || images.startCalls != 0 || coordinator.recordedImageTaskID != "" {
+				t.Fatalf("non-exact frozen route crossed ImageTask boundary: events=%v start=%d task=%q",
+					images.events, images.startCalls, coordinator.recordedImageTaskID)
+			}
+		})
 	}
 }
 
