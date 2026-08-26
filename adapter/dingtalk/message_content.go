@@ -225,11 +225,11 @@ func validateDingTalkDeliveryPartCanonicalEvidence(part adapter.DeliveryPart, re
 			return errors.New("DingTalk artifact delivery part does not match canonical attachment")
 		}
 		if requireBytes {
-			digest, assetID, err := dingTalkAttachmentIdentity(attachment)
+			digest, _, err := dingTalkAttachmentIdentity(attachment)
 			if err != nil {
 				return err
 			}
-			if digest != part.Digest || assetID != ref.AssetID {
+			if digest != part.Digest || !dingTalkCanonicalArtifactRefMatchesDigest(ref.AssetID, digest) {
 				return errors.New("DingTalk artifact delivery part bytes do not match canonical attachment")
 			}
 		}
@@ -237,6 +237,23 @@ func validateDingTalkDeliveryPartCanonicalEvidence(part adapter.DeliveryPart, re
 		return fmt.Errorf("DingTalk delivery part kind %q is unsupported", part.Kind)
 	}
 	return nil
+}
+
+func dingTalkCanonicalArtifactRefMatchesDigest(assetID, digest string) bool {
+	if !validDingTalkSHA256Digest(digest) {
+		return false
+	}
+	rawDigest, _ := strings.CutPrefix(digest, "sha256:")
+	decoded, _ := hex.DecodeString(rawDigest)
+	if hex.EncodeToString(decoded) != rawDigest {
+		return false
+	}
+	switch assetID {
+	case "attachment:" + rawDigest, "inline:" + rawDigest:
+		return true
+	default:
+		return false
+	}
 }
 
 func validDingTalkSHA256Digest(value string) bool {
