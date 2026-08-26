@@ -191,3 +191,23 @@ func (c *InboundPhotoCoordinator) CompleteReply(
 		return nil
 	})
 }
+
+// FailTerminal 只冻结内部永久失败事实，不改变已完成的处理或回复检查点。
+func (c *InboundPhotoCoordinator) FailTerminal(
+	ctx context.Context,
+	agentName, receiptID string,
+	expectedVersion int64,
+	stage InboundPhotoTerminalStage,
+	failureKind string,
+) (InboundPhotoDispatch, error) {
+	failureKind = strings.TrimSpace(failureKind)
+	if stage == "" || failureKind == "" {
+		return InboundPhotoDispatch{}, fmt.Errorf("%w: inbound photo terminal facts are incomplete", ErrInvalidInput)
+	}
+	return c.advance(ctx, agentName, receiptID, expectedVersion, func(next *InboundPhotoDispatchState) error {
+		next.TerminalStatus = InboundPhotoTerminalFailed
+		next.TerminalStage = stage
+		next.FailureKind = failureKind
+		return nil
+	})
+}

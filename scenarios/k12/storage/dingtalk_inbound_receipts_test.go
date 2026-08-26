@@ -60,7 +60,7 @@ func inboundAdmission(messageID string, image []byte) k12storage.InboundPhotoAdm
 		AssetName:   "homework.jpg",
 		AssetMIME:   "image/jpeg",
 		AssetBytes:  append([]byte(nil), image...),
-		CommandJSON: `{"kind":"k12_photo","intent":"grade_homework"}`,
+		CommandJSON: `{"schema_version":2,"kind":"k12_photo","intent":"grade_homework","provider":"hexclaw-gpt","model":"gpt-5.6-sol"}`,
 	}
 }
 
@@ -106,7 +106,7 @@ func TestInboundPhotoAdmissionIsAtomicAndProviderIdentityIsTheDedupeOwner(t *tes
 	mutableReplay.BindingID = "binding-derived-after-restart"
 	mutableReplay.AssetName = "provider-renamed.png"
 	mutableReplay.AssetMIME = "image/png"
-	mutableReplay.CommandJSON = `{"kind":"k12_photo","intent":"rederived_after_restart"}`
+	mutableReplay.CommandJSON = `{"schema_version":2,"kind":"k12_photo","intent":"rederived_after_restart","provider":"other-provider","model":"other-model"}`
 	replayed, created, err = store.AdmitInboundPhoto(ctx, mutableReplay)
 	if err != nil {
 		t.Fatalf("same provider identity and image digest must restore the frozen admission: %v", err)

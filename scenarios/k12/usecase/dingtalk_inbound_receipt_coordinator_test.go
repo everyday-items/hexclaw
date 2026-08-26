@@ -59,6 +59,9 @@ func (f *inboundPhotoRepositoryFake) CompareAndSwapInboundPhotoDispatch(
 	f.bundle.Dispatch.FinalArtifactID = next.FinalArtifactID
 	f.bundle.Dispatch.ReplyStatus = next.ReplyStatus
 	f.bundle.Dispatch.DeliveryBatchID = next.DeliveryBatchID
+	f.bundle.Dispatch.TerminalStatus = next.TerminalStatus
+	f.bundle.Dispatch.TerminalStage = next.TerminalStage
+	f.bundle.Dispatch.FailureKind = next.FailureKind
 	f.bundle.Dispatch.Version++
 	return f.bundle.Dispatch, nil
 }

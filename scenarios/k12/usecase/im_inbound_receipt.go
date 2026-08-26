@@ -18,6 +18,8 @@ type InboundPhotoProcessingStatus = k12storage.InboundPhotoProcessingStatus
 type InboundPhotoRoutingDecision = k12storage.InboundPhotoRoutingDecision
 type InboundPhotoConfirmationStatus = k12storage.InboundPhotoConfirmationStatus
 type InboundPhotoReplyStatus = k12storage.InboundPhotoReplyStatus
+type InboundPhotoTerminalStatus = k12storage.InboundPhotoTerminalStatus
+type InboundPhotoTerminalStage = k12storage.InboundPhotoTerminalStage
 
 // ErrInboundPhotoConflict 保留仓储与用例层一致的外部消息冲突判定。
 var ErrInboundPhotoConflict = k12storage.ErrInboundPhotoConflict
@@ -40,6 +42,12 @@ const (
 	InboundPhotoReplyReady     = k12storage.InboundPhotoReplyReady
 	InboundPhotoReplyBound     = k12storage.InboundPhotoReplyBound
 	InboundPhotoReplyDelivered = k12storage.InboundPhotoReplyDelivered
+
+	InboundPhotoTerminalFailed = k12storage.InboundPhotoTerminalFailed
+
+	InboundPhotoTerminalStageImageTask = k12storage.InboundPhotoTerminalStageImageTask
+	InboundPhotoTerminalStageGrading   = k12storage.InboundPhotoTerminalStageGrading
+	InboundPhotoTerminalStageDelivery  = k12storage.InboundPhotoTerminalStageDelivery
 )
 
 // InboundPhotoRepository 是 callback admission 与重启 worker 共享的唯一耐久 port。

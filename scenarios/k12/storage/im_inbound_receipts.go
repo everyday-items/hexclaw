@@ -23,6 +23,8 @@ type InboundPhotoProcessingStatus string
 type InboundPhotoRoutingDecision string
 type InboundPhotoConfirmationStatus string
 type InboundPhotoReplyStatus string
+type InboundPhotoTerminalStatus string
+type InboundPhotoTerminalStage string
 
 const (
 	InboundPhotoAdmitted           InboundPhotoProcessingStatus = "admitted"
@@ -42,6 +44,12 @@ const (
 	InboundPhotoReplyReady     InboundPhotoReplyStatus = "ready"
 	InboundPhotoReplyBound     InboundPhotoReplyStatus = "bound"
 	InboundPhotoReplyDelivered InboundPhotoReplyStatus = "delivered"
+
+	InboundPhotoTerminalFailed InboundPhotoTerminalStatus = "failed"
+
+	InboundPhotoTerminalStageImageTask InboundPhotoTerminalStage = "image_task"
+	InboundPhotoTerminalStageGrading   InboundPhotoTerminalStage = "grading"
+	InboundPhotoTerminalStageDelivery  InboundPhotoTerminalStage = "delivery"
 )
 
 // InboundPhotoIdentity 是外部 direct 消息的唯一身份；图片摘要不参与该身份。
@@ -95,6 +103,9 @@ type InboundPhotoDispatchState struct {
 	FinalArtifactID    string
 	ReplyStatus        InboundPhotoReplyStatus
 	DeliveryBatchID    string
+	TerminalStatus     InboundPhotoTerminalStatus
+	TerminalStage      InboundPhotoTerminalStage
+	FailureKind        string
 }
 
 type InboundPhotoDispatch struct {
@@ -189,7 +200,8 @@ const inboundPhotoBundleSelect = `SELECT
 	a.content_digest,a.asset_bytes,a.created_at,
 	d.dispatch_id,d.receipt_id,d.processing_status,d.routing_decision,
 	d.confirmation_status,d.image_task_id,d.final_artifact_id,d.reply_status,
-	d.delivery_batch_id,d.version,d.created_at,d.updated_at
+	d.delivery_batch_id,d.terminal_status,d.terminal_stage,d.failure_kind,
+	d.version,d.created_at,d.updated_at
 	FROM k12_im_inbound_receipts AS r
 	JOIN k12_im_inbound_assets AS a ON a.receipt_id=r.receipt_id
 	JOIN k12_im_inbound_dispatches AS d ON d.receipt_id=r.receipt_id`
@@ -210,7 +222,9 @@ func scanInboundPhotoBundle(row rowScanner) (InboundPhotoBundle, error) {
 		&bundle.Dispatch.ProcessingStatus, &bundle.Dispatch.RoutingDecision,
 		&bundle.Dispatch.ConfirmationStatus, &bundle.Dispatch.ImageTaskID,
 		&bundle.Dispatch.FinalArtifactID, &bundle.Dispatch.ReplyStatus,
-		&bundle.Dispatch.DeliveryBatchID, &bundle.Dispatch.Version,
+		&bundle.Dispatch.DeliveryBatchID, &bundle.Dispatch.TerminalStatus,
+		&bundle.Dispatch.TerminalStage, &bundle.Dispatch.FailureKind,
+		&bundle.Dispatch.Version,
 		&bundle.Dispatch.CreatedAt, &bundle.Dispatch.UpdatedAt,
 	); err != nil {
 		return InboundPhotoBundle{}, err
@@ -401,13 +415,76 @@ func normalizeInboundPhotoDispatchState(state InboundPhotoDispatchState) Inbound
 	state.ImageTaskID = strings.TrimSpace(state.ImageTaskID)
 	state.FinalArtifactID = strings.TrimSpace(state.FinalArtifactID)
 	state.DeliveryBatchID = strings.TrimSpace(state.DeliveryBatchID)
+	state.TerminalStage = InboundPhotoTerminalStage(strings.TrimSpace(string(state.TerminalStage)))
+	state.FailureKind = strings.TrimSpace(state.FailureKind)
 	return state
+}
+
+func inboundPhotoFailureKindIsStructured(kind string) bool {
+	if kind == "" {
+		return false
+	}
+	for i, r := range kind {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || (r == '_' && i > 0) {
+			continue
+		}
+		return false
+	}
+	return !strings.HasSuffix(kind, "_")
+}
+
+func validateInboundPhotoTerminalTransition(
+	current InboundPhotoDispatch, next InboundPhotoDispatchState,
+) error {
+	if current.TerminalStatus != "" {
+		return fmt.Errorf("%w: inbound photo dispatch is already terminal", records.ErrIllegalTransition)
+	}
+	switch next.TerminalStatus {
+	case "":
+		if next.TerminalStage != "" || next.FailureKind != "" {
+			return fmt.Errorf("k12storage: incomplete inbound photo terminal state")
+		}
+		return nil
+	case InboundPhotoTerminalFailed:
+		switch next.TerminalStage {
+		case InboundPhotoTerminalStageImageTask, InboundPhotoTerminalStageGrading:
+			if current.ProcessingStatus != InboundPhotoImageTaskSubmitted || current.ImageTaskID == "" {
+				return fmt.Errorf("k12storage: task terminal stage requires a submitted image task")
+			}
+		case InboundPhotoTerminalStageDelivery:
+			if current.ReplyStatus != InboundPhotoReplyBound || current.DeliveryBatchID == "" {
+				return fmt.Errorf("k12storage: delivery terminal stage requires a bound delivery batch")
+			}
+		default:
+			return fmt.Errorf("k12storage: invalid inbound photo terminal stage")
+		}
+		if !inboundPhotoFailureKindIsStructured(next.FailureKind) {
+			return fmt.Errorf("k12storage: invalid inbound photo failure kind")
+		}
+		currentState := current.State()
+		currentState.TerminalStatus = ""
+		currentState.TerminalStage = ""
+		currentState.FailureKind = ""
+		nonTerminalNext := next
+		nonTerminalNext.TerminalStatus = ""
+		nonTerminalNext.TerminalStage = ""
+		nonTerminalNext.FailureKind = ""
+		if currentState != nonTerminalNext {
+			return fmt.Errorf("k12storage: terminal transition changed inbound photo checkpoint")
+		}
+		return nil
+	default:
+		return fmt.Errorf("k12storage: invalid inbound photo terminal status")
+	}
 }
 
 func validateInboundPhotoDispatchTransition(
 	current InboundPhotoDispatch, next InboundPhotoDispatchState,
 ) error {
 	next = normalizeInboundPhotoDispatchState(next)
+	if err := validateInboundPhotoTerminalTransition(current, next); err != nil {
+		return err
+	}
 	currentProcessing := inboundPhotoProcessingRank(current.ProcessingStatus)
 	nextProcessing := inboundPhotoProcessingRank(next.ProcessingStatus)
 	if currentProcessing < 0 || nextProcessing < currentProcessing || nextProcessing > currentProcessing+1 {
@@ -531,13 +608,15 @@ func (s *Store) CompareAndSwapInboundPhotoDispatch(
 	updatedAt := nowUnix()
 	result, err := s.db.ExecContext(ctx, `UPDATE k12_im_inbound_dispatches SET
 		processing_status=?,routing_decision=?,confirmation_status=?,image_task_id=?,
-		final_artifact_id=?,reply_status=?,delivery_batch_id=?,version=version+1,updated_at=?
+		final_artifact_id=?,reply_status=?,delivery_batch_id=?,terminal_status=?,terminal_stage=?,
+		failure_kind=?,version=version+1,updated_at=?
 		WHERE receipt_id=? AND version=? AND EXISTS(
 			SELECT 1 FROM k12_im_inbound_receipts AS receipt
 			WHERE receipt.receipt_id=k12_im_inbound_dispatches.receipt_id AND receipt.agent_name=?
 		)`, next.ProcessingStatus, next.RoutingDecision, next.ConfirmationStatus,
 		next.ImageTaskID, next.FinalArtifactID, next.ReplyStatus, next.DeliveryBatchID,
-		updatedAt, receiptID, expectedVersion, strings.TrimSpace(agentName),
+		next.TerminalStatus, next.TerminalStage, next.FailureKind, updatedAt,
+		receiptID, expectedVersion, strings.TrimSpace(agentName),
 	)
 	if err != nil {
 		return InboundPhotoDispatch{}, fmt.Errorf("k12storage: advance inbound photo dispatch: %w", err)
@@ -558,7 +637,7 @@ func (s *Store) ListRecoverableInboundPhotos(
 		return nil, fmt.Errorf("k12storage: inbound photo recovery limit is invalid")
 	}
 	rows, err := s.db.QueryContext(ctx, inboundPhotoBundleSelect+`
-		WHERE d.reply_status!='delivered'
+		WHERE d.terminal_status='' AND d.reply_status!='delivered'
 		ORDER BY d.updated_at,d.dispatch_id LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("k12storage: list recoverable inbound photos: %w", err)
