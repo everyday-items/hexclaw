@@ -112,7 +112,10 @@ func (s *apiPermanentAssistantFailureStore) SaveMessage(ctx context.Context, msg
 	return s.Store.SaveMessage(ctx, msg)
 }
 
-func TestCHATAssistantPersistenceAtomicPermanentFailureReturnsNon2xxWithoutProviderRecall(t *testing.T) {
+func newAPIAssistantPersistenceFailureHarness(
+	t *testing.T,
+) (*Server, *mockllm.LLMProvider, *apiPermanentAssistantFailureStore) {
+	t.Helper()
 	dir := t.TempDir()
 	real, err := sqlitestore.New(filepath.Join(dir, "chat-persistence.db"))
 	if err != nil {
@@ -140,8 +143,12 @@ func TestCHATAssistantPersistenceAtomicPermanentFailureReturnsNon2xxWithoutProvi
 		t.Fatalf("start engine: %v", err)
 	}
 	t.Cleanup(func() { _ = eng.Stop(context.Background()) })
+	return NewServer(cfg, eng, nil, real), provider, failing
+}
 
-	srv := NewServer(cfg, eng, nil, real)
+func TestCHATAssistantPersistenceAtomicPermanentFailureReturnsNon2xxWithoutProviderRecall(t *testing.T) {
+	srv, provider, failing := newAPIAssistantPersistenceFailureHarness(t)
+
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", strings.NewReader(`{"message":"persist this","user_id":"persistence-user"}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -150,6 +157,30 @@ func TestCHATAssistantPersistenceAtomicPermanentFailureReturnsNon2xxWithoutProvi
 
 	if rec.Code < http.StatusBadRequest {
 		t.Fatalf("status=%d, want non-2xx when assistant is not durable, body=%s", rec.Code, rec.Body.String())
+	}
+	if got := len(provider.Calls()); got != 1 {
+		t.Fatalf("provider calls=%d, want exactly 1", got)
+	}
+	if got := failing.attempts.Load(); got < 2 {
+		t.Fatalf("assistant persistence attempts=%d, want primary plus same-reply fallback", got)
+	}
+}
+
+func TestCHATAssistantPersistenceAtomicSSEFailureEmitsErrorWithoutDoneOrProviderRecall(t *testing.T) {
+	srv, provider, failing := newAPIAssistantPersistenceFailureHarness(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", strings.NewReader(`{"message":"persist this over sse","user_id":"persistence-user"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+
+	srv.handleChat(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"error"`) {
+		t.Fatalf("SSE body omitted terminal error: %s", body)
+	}
+	if strings.Contains(body, "[DONE]") {
+		t.Fatalf("SSE persistence failure emitted success marker: %s", body)
 	}
 	if got := len(provider.Calls()); got != 1 {
 		t.Fatalf("provider calls=%d, want exactly 1", got)

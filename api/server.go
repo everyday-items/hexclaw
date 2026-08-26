@@ -23,6 +23,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hexagon-codes/toolkit/util/logger"
@@ -1291,6 +1293,27 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// 请求级结构化日志
 	logger := trace.NewRequest(userID, "").With("source", "chat", "provider", req.Provider, "model", req.Model)
 	ctx := trace.WithLogger(r.Context(), logger)
+	// 普通聊天会产生不可撤销的模型计费与可见回复，transport 不得在结果不明确时自动重放。
+	ctx = llm.WithOperationSafety(ctx, llm.OperationSafetyNonIdempotent)
+	var physicalProviderCalls atomic.Int32
+	if os.Getenv("HEXCLAW_TEST_OBSERVE_CHAT_PHYSICAL_CALLS") == "1" {
+		requestIDSum := sha256.Sum256([]byte(msg.Metadata["request_id"]))
+		ctx = llm.WithBeforeSendHookForAction(ctx, "stream", func(context.Context) error {
+			physicalProviderCalls.Add(1)
+			return nil
+		})
+		defer func() {
+			s.logCollector.Add(
+				"info",
+				"chat",
+				"显式用户请求物理模型调用计数",
+				map[string]any{
+					"request_id_sha256":       fmt.Sprintf("%x", requestIDSum),
+					"physical_provider_calls": physicalProviderCalls.Load(),
+				},
+			)
+		}()
+	}
 	logger.Info("← 收到消息", "content_len", len([]rune(req.Message)), "platform", string(msg.Platform))
 
 	// 安全网关检查
