@@ -146,6 +146,63 @@ func (c *InboundPhotoCoordinator) ConfirmRouting(
 	})
 }
 
+// RequestRoutingConfirmationWithSnapshot 在推进 waiting 状态的同时冻结候选顺序；
+// 仓储不支持扩展时由调用方继续使用旧的单阶段协议。
+func (c *InboundPhotoCoordinator) RequestRoutingConfirmationWithSnapshot(
+	ctx context.Context,
+	agentName, receiptID string,
+	expectedVersion int64,
+	snapshot InboundPhotoRoutingSnapshot,
+) (InboundPhotoDispatch, error) {
+	if c == nil || c.repository == nil {
+		return InboundPhotoDispatch{}, fmt.Errorf("usecase: inbound photo repository is unavailable")
+	}
+	repository, ok := c.repository.(InboundPhotoRoutingSnapshotRepository)
+	if !ok {
+		return InboundPhotoDispatch{}, fmt.Errorf("usecase: inbound photo routing snapshot repository is unavailable")
+	}
+	return repository.SaveInboundPhotoRoutingSnapshot(
+		ctx, strings.TrimSpace(agentName), strings.TrimSpace(receiptID), expectedVersion, snapshot,
+	)
+}
+
+// GetRoutingSnapshot 返回重启后同一收据的候选快照，不重新读取练习集列表。
+func (c *InboundPhotoCoordinator) GetRoutingSnapshot(
+	ctx context.Context, agentName, receiptID string,
+) (InboundPhotoRoutingSnapshot, error) {
+	if c == nil || c.repository == nil {
+		return InboundPhotoRoutingSnapshot{}, fmt.Errorf("usecase: inbound photo repository is unavailable")
+	}
+	repository, ok := c.repository.(InboundPhotoRoutingSnapshotRepository)
+	if !ok {
+		return InboundPhotoRoutingSnapshot{}, fmt.Errorf("usecase: inbound photo routing snapshot repository is unavailable")
+	}
+	return repository.GetInboundPhotoRoutingSnapshot(
+		ctx, strings.TrimSpace(agentName), strings.TrimSpace(receiptID),
+	)
+}
+
+// ConfirmRoutingSelection 只接受冻结候选中的 practiceSetID，避免确认后再次按可变列表漂移。
+func (c *InboundPhotoCoordinator) ConfirmRoutingSelection(
+	ctx context.Context,
+	agentName, receiptID string,
+	expectedVersion int64,
+	decision InboundPhotoRoutingDecision,
+	practiceSetID string,
+) (InboundPhotoDispatch, error) {
+	if c == nil || c.repository == nil {
+		return InboundPhotoDispatch{}, fmt.Errorf("usecase: inbound photo repository is unavailable")
+	}
+	repository, ok := c.repository.(InboundPhotoRoutingSnapshotRepository)
+	if !ok {
+		return InboundPhotoDispatch{}, fmt.Errorf("usecase: inbound photo routing snapshot repository is unavailable")
+	}
+	return repository.ConfirmInboundPhotoRoutingSelection(
+		ctx, strings.TrimSpace(agentName), strings.TrimSpace(receiptID), expectedVersion, decision,
+		strings.TrimSpace(practiceSetID),
+	)
+}
+
 func (c *InboundPhotoCoordinator) RecordFinalArtifact(
 	ctx context.Context,
 	agentName, receiptID string,

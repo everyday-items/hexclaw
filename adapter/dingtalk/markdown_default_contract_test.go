@@ -45,7 +45,7 @@ func TestDingTalkAllOutboundPathsPreferMarkdown(t *testing.T) {
 			Type: "image",
 			Name: "creative-work.png",
 			Mime: "image/png",
-			Data: base64.StdEncoding.EncodeToString([]byte("test-image-bytes")),
+			Data: base64.StdEncoding.EncodeToString(testPNGBytes(t)),
 		}},
 	}); err != nil {
 		t.Fatalf("发送带图 Markdown 回复: %v", err)

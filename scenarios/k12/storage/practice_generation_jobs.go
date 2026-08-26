@@ -880,10 +880,11 @@ func (s *Store) saveSinglePracticeStageOutput(
 		SET %s=?, %s=?, updated_at=?
 		WHERE agent_name=? AND generation_job_id=? AND scope='single'
 		  AND retired_at=0 AND status=? AND attempt=?
-		  AND (%s='' OR (%s=? AND %s=?))`,
-		outputColumn, attemptColumn, outputColumn, attemptColumn, outputColumn),
+		  AND (%s='' OR %s<? OR (%s=? AND %s=?))`,
+		outputColumn, attemptColumn, outputColumn, attemptColumn,
+		attemptColumn, outputColumn),
 		outputJSON, attempt, nowUnix(), agentName, generationJobID,
-		expectedStatus, attempt, attempt, outputJSON,
+		expectedStatus, attempt, attempt, attempt, outputJSON,
 	)
 	if err != nil {
 		return k12.PracticeGenerationJob{}, fmt.Errorf(

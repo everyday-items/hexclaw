@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/hexagon-codes/toolkit/util/idgen"
@@ -75,6 +76,109 @@ type SinglePracticeGenerationView struct {
 	Item             *k12.PracticeItem             `json:"item,omitempty"`
 	ParentConfirmed  bool                          `json:"parent_confirmed,omitempty"`
 	EvidenceMastered bool                          `json:"evidence_mastered,omitempty"`
+}
+
+// PracticeGenerationInvocationReceipt 是逐题物理模型调用账本的脱敏只读投影。
+type PracticeGenerationInvocationReceipt struct {
+	Stage                    string                    `json:"stage"`
+	Attempt                  int                       `json:"attempt"`
+	Status                   k12.ModelInvocationStatus `json:"status"`
+	Provider                 string                    `json:"provider"`
+	Model                    string                    `json:"model"`
+	Route                    string                    `json:"route"`
+	ProviderInstanceIDDigest string                    `json:"provider_instance_id_digest"`
+	ConfigFingerprint        string                    `json:"config_fingerprint"`
+	CapabilityReceiptDigest  string                    `json:"capability_receipt_digest"`
+	ProbePolicyVersion       string                    `json:"probe_policy_version"`
+	RequestDigest            string                    `json:"request_digest"`
+	ResultDigest             string                    `json:"result_digest"`
+	ExternalRequestIDDigest  string                    `json:"external_request_id_digest,omitempty"`
+	FailureKind              string                    `json:"failure_kind,omitempty"`
+	CreatedAt                int64                     `json:"created_at"`
+	UpdatedAt                int64                     `json:"updated_at"`
+	ReceiptDigest            string                    `json:"receipt_digest"`
+}
+
+// PracticeGenerationReceiptView 只包含安装边界验收所需的持久事实。
+type PracticeGenerationReceiptView struct {
+	SchemaVersion         int                                   `json:"schema_version"`
+	SourceKind            string                                `json:"source_kind"`
+	GenerationJobIDDigest string                                `json:"generation_job_id_digest"`
+	GenerationStatus      string                                `json:"generation_status"`
+	ReceiptExactSetDigest string                                `json:"receipt_exact_set_digest"`
+	Receipts              []PracticeGenerationInvocationReceipt `json:"receipts"`
+}
+
+type practiceGenerationReceiptDigestPayload struct {
+	Stage                    string                    `json:"stage"`
+	Attempt                  int                       `json:"attempt"`
+	Status                   k12.ModelInvocationStatus `json:"status"`
+	Provider                 string                    `json:"provider"`
+	Model                    string                    `json:"model"`
+	Route                    string                    `json:"route"`
+	ProviderInstanceIDDigest string                    `json:"provider_instance_id_digest"`
+	ConfigFingerprint        string                    `json:"config_fingerprint"`
+	CapabilityReceiptDigest  string                    `json:"capability_receipt_digest"`
+	ProbePolicyVersion       string                    `json:"probe_policy_version"`
+	RequestDigest            string                    `json:"request_digest"`
+	ResultDigest             string                    `json:"result_digest"`
+	ExternalRequestIDDigest  string                    `json:"external_request_id_digest,omitempty"`
+	FailureKind              string                    `json:"failure_kind,omitempty"`
+	CreatedAt                int64                     `json:"created_at"`
+	UpdatedAt                int64                     `json:"updated_at"`
+}
+
+func practiceGenerationPublicDigest(domain, value string) string {
+	sum := sha256.Sum256([]byte(domain + "\x00" + value))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func projectPracticeGenerationInvocation(
+	invocation k12.ModelInvocation,
+) (PracticeGenerationInvocationReceipt, error) {
+	route := k12.NormalizeGradingModelSnapshot(invocation.RouteSnapshot)
+	receipt := PracticeGenerationInvocationReceipt{
+		Stage: invocation.Stage, Attempt: invocation.Attempt, Status: invocation.Status,
+		Provider: route.Provider, Model: route.Model, Route: route.Route,
+		ConfigFingerprint:       route.ConfigFingerprint,
+		CapabilityReceiptDigest: route.CapabilityReceiptDigest,
+		ProbePolicyVersion:      route.ProbePolicyVersion,
+		RequestDigest:           invocation.RequestDigest, ResultDigest: invocation.ResultDigest,
+		FailureKind: invocation.FailureKind,
+		CreatedAt:   invocation.CreatedAt, UpdatedAt: invocation.UpdatedAt,
+	}
+	if strings.TrimSpace(route.ProviderInstanceID) != "" {
+		receipt.ProviderInstanceIDDigest = practiceGenerationPublicDigest(
+			"practice-generation-provider-instance", route.ProviderInstanceID,
+		)
+	}
+	if strings.TrimSpace(invocation.ExternalRequestID) != "" {
+		receipt.ExternalRequestIDDigest = practiceGenerationPublicDigest(
+			"practice-generation-external-request", invocation.ExternalRequestID,
+		)
+	}
+	payload := practiceGenerationReceiptDigestPayload{
+		Stage: receipt.Stage, Attempt: receipt.Attempt, Status: receipt.Status,
+		Provider: receipt.Provider, Model: receipt.Model, Route: receipt.Route,
+		ProviderInstanceIDDigest: receipt.ProviderInstanceIDDigest,
+		ConfigFingerprint:        receipt.ConfigFingerprint,
+		CapabilityReceiptDigest:  receipt.CapabilityReceiptDigest,
+		ProbePolicyVersion:       receipt.ProbePolicyVersion,
+		RequestDigest:            receipt.RequestDigest, ResultDigest: receipt.ResultDigest,
+		ExternalRequestIDDigest: receipt.ExternalRequestIDDigest,
+		FailureKind:             receipt.FailureKind,
+		CreatedAt:               receipt.CreatedAt, UpdatedAt: receipt.UpdatedAt,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return PracticeGenerationInvocationReceipt{}, fmt.Errorf(
+			"usecase: encode practice generation receipt: %w", err,
+		)
+	}
+	receipt.ReceiptDigest = practiceGenerationPublicDigest(
+		"practice-generation-receipt", string(encoded),
+	)
+	return receipt, nil
 }
 
 type singlePracticeRequestSnapshot struct {
@@ -445,6 +549,68 @@ func (d Deps) GetSinglePracticeGeneration(
 	return d.singlePracticeView(ctx, source, fields, &job)
 }
 
+// GetSinglePracticeGenerationReceipts 从来源错题解析最新任务并投影脱敏调用回执。
+func (d Deps) GetSinglePracticeGenerationReceipts(
+	ctx context.Context,
+	agentName, sourceMistakeID string,
+) (PracticeGenerationReceiptView, error) {
+	agentName = strings.TrimSpace(agentName)
+	sourceMistakeID = strings.TrimSpace(sourceMistakeID)
+	if agentName == "" || sourceMistakeID == "" {
+		return PracticeGenerationReceiptView{}, fmt.Errorf(
+			"%w: agent and source mistake are required", ErrInvalidInput,
+		)
+	}
+	source, _, err := d.singlePracticeSource(ctx, agentName, sourceMistakeID)
+	if err != nil {
+		return PracticeGenerationReceiptView{}, err
+	}
+	job, err := d.Records.GetLatestPracticeGenerationBySource(
+		ctx, source.AgentName, k12.PracticeGenerationSourceMistake,
+		source.RecordID, source.Version,
+	)
+	if err != nil {
+		return PracticeGenerationReceiptView{}, err
+	}
+	invocations, err := d.Records.ListPracticeGenerationInvocations(
+		ctx, source.AgentName, job.GenerationJobID,
+	)
+	if err != nil {
+		return PracticeGenerationReceiptView{}, err
+	}
+	receipts := make([]PracticeGenerationInvocationReceipt, 0, len(invocations))
+	receiptDigests := make([]string, 0, len(invocations))
+	for _, invocation := range invocations {
+		receipt, projectErr := projectPracticeGenerationInvocation(invocation)
+		if projectErr != nil {
+			return PracticeGenerationReceiptView{}, projectErr
+		}
+		receipts = append(receipts, receipt)
+		receiptDigests = append(receiptDigests, receipt.ReceiptDigest)
+	}
+	sort.Slice(receipts, func(i, j int) bool {
+		if receipts[i].Stage != receipts[j].Stage {
+			return receipts[i].Stage < receipts[j].Stage
+		}
+		if receipts[i].Attempt != receipts[j].Attempt {
+			return receipts[i].Attempt < receipts[j].Attempt
+		}
+		return receipts[i].ReceiptDigest < receipts[j].ReceiptDigest
+	})
+	sort.Strings(receiptDigests)
+	return PracticeGenerationReceiptView{
+		SchemaVersion: 1, SourceKind: k12.PracticeGenerationSourceMistake,
+		GenerationJobIDDigest: practiceGenerationPublicDigest(
+			"practice-generation-job", job.GenerationJobID,
+		),
+		GenerationStatus: job.Status,
+		ReceiptExactSetDigest: practiceGenerationPublicDigest(
+			"practice-generation-receipt-set", strings.Join(receiptDigests, "\n"),
+		),
+		Receipts: receipts,
+	}, nil
+}
+
 func singlePracticePrompt(request singlePracticeRequestSnapshot) string {
 	difficultyCN := map[string]string{
 		"same": "同等难度", "easier": "更简单", "harder": "更难",
@@ -687,7 +853,8 @@ func (d Deps) ProcessSinglePracticeGeneration(
 		job.Status == k12.PracticeGenerationValidating) && job.Attempt > 0 {
 		firstAttempt = job.Attempt
 	}
-	lastAttempt := firstAttempt + 2
+	// 一次命令只授权当前 attempt；验证失败后由显式 retry 授权下一 attempt。
+	lastAttempt := firstAttempt
 	for boundedAttempt := firstAttempt; boundedAttempt <= lastAttempt; boundedAttempt++ {
 		if job.Attempt != boundedAttempt ||
 			(job.Status != k12.PracticeGenerationGenerating &&

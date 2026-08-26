@@ -83,6 +83,34 @@ func resolveK12WorkFeedbackRouteWithCapabilityReceipt(
 	if err != nil {
 		return k12.ImageTaskRouteSnapshot{}, err
 	}
+	return freezeK12WorkFeedbackRouteCapabilityReceipt(
+		ctx, router, receipts, workType, route,
+	)
+}
+
+func resolveK12RequestedWorkFeedbackRouteWithCapabilityReceipt(
+	ctx context.Context,
+	router *llmrouter.Selector,
+	receipts storage.ModelCapabilityProbeReceiptStore,
+	workType string,
+	requested k12.ImageTaskRouteSnapshot,
+) (k12.ImageTaskRouteSnapshot, error) {
+	route, err := resolveK12RequestedWorkFeedbackRoute(router, workType, requested)
+	if err != nil {
+		return k12.ImageTaskRouteSnapshot{}, err
+	}
+	return freezeK12WorkFeedbackRouteCapabilityReceipt(
+		ctx, router, receipts, workType, route,
+	)
+}
+
+func freezeK12WorkFeedbackRouteCapabilityReceipt(
+	ctx context.Context,
+	router *llmrouter.Selector,
+	receipts storage.ModelCapabilityProbeReceiptStore,
+	workType string,
+	route k12.ImageTaskRouteSnapshot,
+) (k12.ImageTaskRouteSnapshot, error) {
 	probeKind := config.LLMModelCapabilityText
 	if strings.TrimSpace(workType) == k12.WorkTypeArt {
 		probeKind = config.LLMModelCapabilityVision

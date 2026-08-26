@@ -107,6 +107,81 @@ type DeliveryPart struct {
 	PreparedResourceID string                         `json:"-"`
 }
 
+// PreparedEnvelope 是作品点评一次物理外发的冻结图文载荷。
+// Parts 必须完整保留同一份 K12 canonical 证据，并按 Markdown、图片顺序排列。
+type PreparedEnvelope struct {
+	Parts []DeliveryPart `json:"parts"`
+}
+
+// Validate 校验组合消息只包含同源、连续且已完成媒体准备的 Markdown + 图片。
+func (e PreparedEnvelope) Validate() error {
+	if len(e.Parts) < 2 {
+		return errors.New("channel: prepared envelope requires markdown and at least one image")
+	}
+	first := e.Parts[0]
+	if err := first.Validate(); err != nil {
+		return fmt.Errorf("channel: prepared envelope part 1 is invalid: %w", err)
+	}
+	if first.Kind != messagecontent.PartMarkdown || first.Ordinal != 1 {
+		return errors.New("channel: prepared envelope must start with markdown")
+	}
+	if first.MessageContent.ProducerKind != messagecontent.ProducerK12 {
+		return errors.New("channel: prepared envelope requires K12 canonical content")
+	}
+	if len(first.RenderManifest.Parts) != len(first.MessageContent.Attachments)+1 {
+		return errors.New("channel: prepared envelope canonical artifacts do not match the render manifest")
+	}
+	imagePrefixParts := 1
+	seenPDF := false
+	for i, attachment := range first.MessageContent.Attachments {
+		renderPart := first.RenderManifest.Parts[i+1]
+		if renderPart.Kind != messagecontent.PartArtifact || renderPart.ArtifactRef != attachment.AssetID ||
+			renderPart.ArtifactDigest != attachment.Digest || renderPart.AltText != attachment.AltText {
+			return errors.New("channel: prepared envelope canonical artifact order does not match the render manifest")
+		}
+		mime := strings.ToLower(strings.TrimSpace(attachment.MIME))
+		switch {
+		case strings.HasPrefix(mime, "image/") && mime != "image/":
+			if seenPDF {
+				return errors.New("channel: prepared envelope images must form one continuous prefix")
+			}
+			imagePrefixParts++
+		case mime == "application/pdf":
+			seenPDF = true
+		default:
+			return errors.New("channel: prepared envelope canonical suffix must contain only PDFs")
+		}
+	}
+	if imagePrefixParts < 2 || len(e.Parts) != imagePrefixParts {
+		return errors.New("channel: prepared envelope must contain the complete image prefix without PDFs")
+	}
+
+	for i := 1; i < len(e.Parts); i++ {
+		part := e.Parts[i]
+		if err := part.Validate(); err != nil {
+			return fmt.Errorf("channel: prepared envelope part %d is invalid: %w", i+1, err)
+		}
+		if part.Ordinal != i+1 || part.Kind != messagecontent.PartArtifact {
+			return errors.New("channel: prepared envelope parts must be ordered markdown followed by images")
+		}
+		mime := strings.ToLower(strings.TrimSpace(part.MIME))
+		if !strings.HasPrefix(mime, "image/") || mime == "image/" {
+			return errors.New("channel: prepared envelope artifacts must be images")
+		}
+		if strings.TrimSpace(part.PreparedResourceID) == "" {
+			return errors.New("channel: prepared envelope image has no prepared resource")
+		}
+		if part.MessageContent.ContentID != first.MessageContent.ContentID ||
+			part.MessageContent.SourceDigest != first.MessageContent.SourceDigest ||
+			part.RenderManifest.RenderID != first.RenderManifest.RenderID ||
+			part.RenderManifest.ContentID != first.RenderManifest.ContentID ||
+			part.RenderManifest.SourceDigest != first.RenderManifest.SourceDigest {
+			return errors.New("channel: prepared envelope parts do not share one canonical root")
+		}
+	}
+	return nil
+}
+
 // DeliveryParts 把一份 canonical 消息冻结为 Markdown 在前、附件随后的一组单 part 载荷。
 func (m Message) DeliveryParts() ([]DeliveryPart, error) {
 	if err := m.Validate(); err != nil {
@@ -390,4 +465,18 @@ type PartReceiptPort interface {
 	ReceiptPort
 	PrepareDeliveryPartResource(ctx context.Context, to Target, part DeliveryPart) (preparedResourceID string, err error)
 	SendPreparedPartWithReceipt(ctx context.Context, to Target, part DeliveryPart) (DeliveryAck, error)
+}
+
+// PreparedEnvelopeReceiptPort 是 CreativeWork 图文同卡外发的可选能力。
+// 旧 PartReceiptPort 方法集保持不变，不支持本能力的实现不得静默退回逐 part 发送。
+type PreparedEnvelopeReceiptPort interface {
+	PartReceiptPort
+	SendPreparedEnvelopeWithReceipt(ctx context.Context, to Target, envelope PreparedEnvelope) (DeliveryAck, error)
+}
+
+// PreparedEnvelopePreflightPort 在组 CAS 前执行平台组合消息的只读完整校验。
+// 它与发送能力分离，避免旧 PartReceiptPort 被反向扩大。
+type PreparedEnvelopePreflightPort interface {
+	Port
+	PreflightPreparedEnvelope(ctx context.Context, to Target, envelope PreparedEnvelope) error
 }

@@ -59,9 +59,10 @@ type ingestPageCheckpointRepository interface {
 }
 
 type workerIngestPageProgress struct {
-	repository ingestPageCheckpointRepository
-	lease      func() JobLease
-	now        func() time.Time
+	repository  ingestPageCheckpointRepository
+	invocations OCRPageInvocationProgress
+	lease       func() JobLease
+	now         func() time.Time
 }
 
 func (p workerIngestPageProgress) SetPageTotal(ctx context.Context, digest string, total int64) error {
@@ -86,6 +87,68 @@ func (p workerIngestPageProgress) SaveSegmentPlan(
 	segments []IngestSegmentPlan,
 ) error {
 	return p.repository.SaveIngestSegmentPlan(ctx, p.lease(), p.now(), digest, segments)
+}
+
+func (p workerIngestPageProgress) ClaimOCRPageInvocation(
+	ctx context.Context,
+	_lease JobLease,
+	_now time.Time,
+	claim OCRPageInvocationClaim,
+) (OCRPageInvocation, error) {
+	if p.invocations == nil {
+		return OCRPageInvocation{}, ErrOCRPageInvocationLedgerUnavailable
+	}
+	return p.invocations.ClaimOCRPageInvocation(ctx, p.lease(), p.now(), claim)
+}
+
+func (p workerIngestPageProgress) ClaimOCRPageInvocationContext(
+	ctx context.Context,
+	claim OCRPageInvocationClaim,
+) (OCRPageInvocation, error) {
+	return p.ClaimOCRPageInvocation(ctx, p.lease(), p.now(), claim)
+}
+
+func (p workerIngestPageProgress) SaveOCRPageInvocation(
+	ctx context.Context,
+	_lease JobLease,
+	_now time.Time,
+	invocation OCRPageInvocation,
+	result OCRPageInvocationResult,
+) error {
+	if p.invocations == nil {
+		return ErrOCRPageInvocationLedgerUnavailable
+	}
+	return p.invocations.SaveOCRPageInvocation(ctx, p.lease(), p.now(), invocation, result)
+}
+
+func (p workerIngestPageProgress) SaveOCRPageInvocationContext(
+	ctx context.Context,
+	invocation OCRPageInvocation,
+	result OCRPageInvocationResult,
+) error {
+	return p.SaveOCRPageInvocation(ctx, p.lease(), p.now(), invocation, result)
+}
+
+func (p workerIngestPageProgress) MarkOCRPageInvocationOutcomeUnknown(
+	ctx context.Context,
+	_lease JobLease,
+	_now time.Time,
+	invocation OCRPageInvocation,
+	lastError string,
+) error {
+	marker, ok := p.invocations.(OCRPageInvocationOutcomeMarker)
+	if !ok {
+		return ErrOCRPageInvocationLedgerUnavailable
+	}
+	return marker.MarkOCRPageInvocationOutcomeUnknown(ctx, p.lease(), p.now(), invocation, lastError)
+}
+
+func (p workerIngestPageProgress) MarkOCRPageInvocationOutcomeUnknownContext(
+	ctx context.Context,
+	invocation OCRPageInvocation,
+	lastError string,
+) error {
+	return p.MarkOCRPageInvocationOutcomeUnknown(ctx, p.lease(), p.now(), invocation, lastError)
 }
 
 type SemanticIndexWorkerConfig struct {
@@ -562,6 +625,10 @@ func (w *SemanticIndexWorker) prepareIngestWithHeartbeat(
 		} else {
 			progress := workerIngestPageProgress{
 				repository: pageRepository,
+				invocations: func() OCRPageInvocationProgress {
+					value, _ := w.repository.(OCRPageInvocationProgress)
+					return value
+				}(),
 				lease: func() JobLease {
 					state.Lock()
 					defer state.Unlock()
@@ -604,6 +671,7 @@ func isPermanentSemanticWorkerError(err error) bool {
 	return errors.Is(err, ErrUnsupportedKnowledgeJob) ||
 		errors.Is(err, ErrVisionModelRequired) ||
 		errors.Is(err, ErrEmbeddingBatchOutcomeUnknown) ||
+		errors.Is(err, ErrOCRPageInvocationOutcomeUnknown) ||
 		errors.Is(err, ErrInvalidDocumentUpload) ||
 		errors.Is(err, ErrProfileUnavailable) ||
 		errors.Is(err, ErrInvalidEmbeddingResult) ||

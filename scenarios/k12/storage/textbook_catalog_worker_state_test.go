@@ -125,3 +125,102 @@ func TestREGTextbookCatalog_RecoveryPinsExactIngestSnapshotAndDetectsDrift(t *te
 		t.Fatalf("source drift error=%v want incomplete/fail-closed", err)
 	}
 }
+
+func TestREGTextbookCatalog_AcceptsCompletedPageFactsFromPriorIngestLease(t *testing.T) {
+	store, _, _ := seedTextbookCatalogMaterialization(t)
+	db := store.DB()
+	// 任务成功收口会递增任务 epoch；已完成页仍保留生成它们的旧租约 epoch。
+	if _, err := db.Exec(`UPDATE kb_knowledge_jobs
+		SET lease_epoch=2 WHERE job_id='catalog-ingest'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM k12_textbook_catalog_jobs
+		WHERE manifest_id='catalog-manifest'`); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	now := time.UnixMilli(10_000)
+	if err := store.RecoverTextbookCatalogJobs(ctx, now, 8); err != nil {
+		t.Fatalf("recover prior-lease page facts: %v", err)
+	}
+	var state, ingestJobID, sourcePlanDigest string
+	if err := db.QueryRow(`SELECT state,ingest_job_id,source_plan_digest
+		FROM k12_textbook_catalog_jobs WHERE manifest_id='catalog-manifest'`).Scan(
+		&state, &ingestJobID, &sourcePlanDigest,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if state != "queued" || ingestJobID != "catalog-ingest" || len(sourcePlanDigest) != 64 {
+		t.Fatalf("recovered catalog state=%s ingest=%s plan=%q", state, ingestJobID, sourcePlanDigest)
+	}
+	claim, found, err := store.ClaimTextbookCatalogJob(ctx, "worker", now, 30*time.Second)
+	if err != nil || !found || claim.IngestJobID != "catalog-ingest" ||
+		claim.SourcePlanDigest != sourcePlanDigest {
+		t.Fatalf("claim prior-lease source=%+v found=%v err=%v", claim, found, err)
+	}
+	if _, err := store.LoadTextbookCatalogSource(ctx, claim, now.Add(time.Second)); err != nil {
+		t.Fatalf("load prior-lease source: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE kb_ingest_page_checkpoints
+		SET lease_epoch=3 WHERE job_id='catalog-ingest'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadTextbookCatalogSource(ctx, claim, now.Add(2*time.Second)); !errors.Is(err, k12storage.ErrTextbookCatalogSourceIncomplete) {
+		t.Fatalf("future-lease page facts error=%v want incomplete", err)
+	}
+}
+
+func TestREGTextbookCatalog_ReopensOnlySourceEvidenceTerminalAfterFactsComplete(t *testing.T) {
+	store, _, _ := seedTextbookCatalogMaterialization(t)
+	db := store.DB()
+	if _, err := db.Exec(`UPDATE kb_knowledge_jobs
+		SET lease_epoch=2 WHERE job_id='catalog-ingest'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE k12_textbook_catalog_jobs
+		SET state='failed_terminal',failure_code='source_evidence_incomplete',
+		    ingest_job_id='catalog-ingest',source_plan_digest='',last_error='识别失败'
+		WHERE job_id='catalog-job'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE k12_textbook_manifests
+		SET state='failed_terminal',retryable=0,failure_message='识别失败'
+		WHERE manifest_id='catalog-manifest'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecoverTextbookCatalogJobs(context.Background(), time.UnixMilli(10_000), 8); err != nil {
+		t.Fatalf("recover source-evidence terminal: %v", err)
+	}
+	var state, manifestState, ingestJobID, sourcePlanDigest string
+	if err := db.QueryRow(`SELECT state,ingest_job_id,source_plan_digest
+		FROM k12_textbook_catalog_jobs WHERE job_id='catalog-job'`).Scan(
+		&state, &ingestJobID, &sourcePlanDigest,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT state FROM k12_textbook_manifests
+		WHERE manifest_id='catalog-manifest'`).Scan(&manifestState); err != nil {
+		t.Fatal(err)
+	}
+	if state != "queued" || manifestState != "extracting" || ingestJobID != "catalog-ingest" ||
+		len(sourcePlanDigest) != 64 {
+		t.Fatalf("reopened source-evidence terminal job=%s manifest=%s ingest=%s plan=%q",
+			state, manifestState, ingestJobID, sourcePlanDigest)
+	}
+	if _, err := db.Exec(`UPDATE k12_textbook_catalog_jobs
+		SET state='failed_terminal',failure_code='evidence_incomplete',
+		    last_error='catalog proof incomplete'
+		WHERE job_id='catalog-job'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecoverTextbookCatalogJobs(context.Background(), time.UnixMilli(11_000), 8); err != nil {
+		t.Fatalf("recover unrelated terminal: %v", err)
+	}
+	if err := db.QueryRow(`SELECT state FROM k12_textbook_catalog_jobs
+		WHERE job_id='catalog-job'`).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "failed_terminal" {
+		t.Fatalf("unrelated terminal state=%s want failed_terminal", state)
+	}
+}

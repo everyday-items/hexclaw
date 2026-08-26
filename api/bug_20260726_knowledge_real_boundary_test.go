@@ -111,6 +111,7 @@ func newBug20260726KnowledgeHarness(
 		migrate.KnowledgeIngestExecutionV46,
 		migrate.KnowledgeUploadOperationsV71,
 		migrate.KnowledgeOCRRouteReceiptsV87,
+		migrate.K12KnowledgeInvocationLedgersV91,
 	}); err != nil {
 		t.Fatal(err)
 	}

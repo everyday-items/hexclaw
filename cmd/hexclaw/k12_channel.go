@@ -38,11 +38,14 @@ import (
 // 配置/留缝未实现都诚实报错——文案家长向（§4.11），HTTP 层据此降级（501/409）；
 // 前端展示持久化回执并仅允许明确失败重试，绝不以复制或平台受理冒充已送达。
 type k12IMDeliverer struct {
-	router   *agentrouter.Dispatcher
-	channels *channel.Registry
-	mu       sync.RWMutex
-	ready    bool
+	router            *agentrouter.Dispatcher
+	channels          *channel.Registry
+	mu                sync.RWMutex
+	ready             bool
+	resolveInstanceID func(platform, instanceRef string) (string, error)
 }
+
+var _ k12usecase.DeliveryEnvelopeTransport = (*k12IMDeliverer)(nil)
 
 func channelAckFromAdapter(ack adapter.DeliveryAck, target channel.Target) channel.DeliveryAck {
 	status := channel.DeliveryOutcomeUnknown
@@ -66,6 +69,15 @@ func (d *k12IMDeliverer) MarkReady() {
 	d.mu.Unlock()
 }
 
+// SetInstanceResolver 回填运行实例解析器；绑定目标必须在批次冻结前转换为稳定实例 ID。
+func (d *k12IMDeliverer) SetInstanceResolver(
+	resolve func(platform, instanceRef string) (string, error),
+) {
+	d.mu.Lock()
+	d.resolveInstanceID = resolve
+	d.mu.Unlock()
+}
+
 type resolvedDirectBinding struct {
 	rule   agentrouter.Rule
 	target channel.Target
@@ -83,6 +95,7 @@ func normalizeDirectRule(rule agentrouter.Rule) agentrouter.Rule {
 func (d *k12IMDeliverer) resolveDirectBindings(agentName string) ([]resolvedDirectBinding, error) {
 	d.mu.RLock()
 	ready := d.ready
+	resolveInstanceID := d.resolveInstanceID
 	d.mu.RUnlock()
 	if !ready {
 		return nil, fmt.Errorf("发送通道还没就绪，稍等片刻再试")
@@ -95,12 +108,22 @@ func (d *k12IMDeliverer) resolveDirectBindings(agentName string) ([]resolvedDire
 			continue
 		}
 		target := channel.Target{Platform: rule.Platform, InstanceID: rule.InstanceID, ChatID: rule.ChatID}
-		if err := target.EnsureDirect(); err != nil {
+		if err := target.EnsureDirect(); err != nil || target.Platform == "" {
 			continue
 		}
-		if target.Platform == "" {
-			continue
+		instanceID := target.InstanceID
+		if resolveInstanceID != nil {
+			var err error
+			instanceID, err = resolveInstanceID(target.Platform, instanceID)
+			if err != nil {
+				return nil, fmt.Errorf("resolve direct binding instance: %w", err)
+			}
+			instanceID = strings.TrimSpace(instanceID)
 		}
+		if instanceID == "" {
+			return nil, fmt.Errorf("resolve direct binding instance: stable instance ID is required")
+		}
+		target.InstanceID = instanceID
 		candidates = append(candidates, resolvedDirectBinding{rule: rule, target: target})
 	}
 	sort.Slice(candidates, func(i, j int) bool {
@@ -303,14 +326,33 @@ func channelTargetFromReceipt(receipt k12.DeliveryReceipt) channel.Target {
 }
 
 func (d *k12IMDeliverer) receiptBindingIsActive(receipt k12.DeliveryReceipt) bool {
+	target := channelTargetFromReceipt(receipt)
+	target.Platform = strings.ToLower(strings.TrimSpace(target.Platform))
+	target.InstanceID = strings.TrimSpace(target.InstanceID)
+	target.ChatID = strings.TrimSpace(target.ChatID)
+	if target.Platform == "" || target.InstanceID == "" || target.ChatID == "" {
+		return false
+	}
+	d.mu.RLock()
+	resolveInstanceID := d.resolveInstanceID
+	d.mu.RUnlock()
 	for _, rule := range d.router.ListRules() {
 		rule = normalizeDirectRule(rule)
 		if rule.AgentName != receipt.AgentName || stableBindingID(rule) != receipt.BindingID {
 			continue
 		}
-		return channelTargetFromReceipt(receipt) == (channel.Target{
-			Platform: rule.Platform, InstanceID: rule.InstanceID, ChatID: rule.ChatID,
-		})
+		if rule.Platform != target.Platform || rule.ChatID != target.ChatID {
+			return false
+		}
+		if resolveInstanceID == nil {
+			return rule.InstanceID == target.InstanceID
+		}
+		instanceRef := rule.InstanceID
+		if instanceRef == "" {
+			instanceRef = target.InstanceID
+		}
+		resolved, err := resolveInstanceID(rule.Platform, instanceRef)
+		return err == nil && strings.TrimSpace(resolved) == target.InstanceID
 	}
 	return false
 }
@@ -383,6 +425,161 @@ func usecaseAckFromChannel(ack channel.DeliveryAck, err error) k12usecase.Delive
 	}
 }
 
+type creativeEnvelopePhase uint8
+
+const (
+	creativeEnvelopePreflight creativeEnvelopePhase = iota
+	creativeEnvelopeSend
+	creativeEnvelopeQuery
+)
+
+// preparedCreativeWorkEnvelope 从同一物理目标的 component 回执恢复一次图文同卡外发。
+// 恢复过程只读取已冻结的 canonical 证据与媒体引用；任何身份或状态漂移都会在通道调用前失败。
+func (d *k12IMDeliverer) preparedCreativeWorkEnvelope(
+	receipts []k12.DeliveryReceipt,
+	phase creativeEnvelopePhase,
+) (channel.Target, channel.PreparedEnvelope, error) {
+	if len(receipts) < 2 {
+		return channel.Target{}, channel.PreparedEnvelope{}, fmt.Errorf(
+			"creative work delivery envelope requires markdown and at least one image",
+		)
+	}
+	first := receipts[0]
+	target := channelTargetFromReceipt(first)
+	if strings.TrimSpace(first.ObjectKind) != "creative_work" ||
+		strings.TrimSpace(first.BatchID) == "" ||
+		strings.TrimSpace(first.AgentName) == "" ||
+		strings.TrimSpace(first.ObjectID) == "" ||
+		strings.TrimSpace(first.BindingID) == "" ||
+		strings.TrimSpace(target.Platform) == "" ||
+		strings.TrimSpace(target.InstanceID) == "" ||
+		strings.TrimSpace(target.ChatID) == "" {
+		return channel.Target{}, channel.PreparedEnvelope{}, fmt.Errorf(
+			"creative work delivery envelope identity is incomplete",
+		)
+	}
+	if err := target.EnsureDirect(); err != nil {
+		return channel.Target{}, channel.PreparedEnvelope{}, err
+	}
+	if phase == creativeEnvelopeQuery {
+		if first.Attempt < 1 {
+			return channel.Target{}, channel.PreparedEnvelope{}, fmt.Errorf("creative work delivery envelope has no attempt")
+		}
+		if (first.Status != k12.DeliverySending && first.Status != k12.DeliveryOutcomeUnknown) ||
+			strings.TrimSpace(first.ExternalMessageID) == "" {
+			return channel.Target{}, channel.PreparedEnvelope{}, fmt.Errorf(
+				"creative work delivery envelope is not in a queryable shared state",
+			)
+		}
+	} else if phase == creativeEnvelopeSend {
+		if first.Attempt < 1 {
+			return channel.Target{}, channel.PreparedEnvelope{}, fmt.Errorf("creative work delivery envelope has no attempt")
+		}
+		if first.Status != k12.DeliverySending || strings.TrimSpace(first.ExternalMessageID) != "" {
+			return channel.Target{}, channel.PreparedEnvelope{}, fmt.Errorf(
+				"creative work delivery envelope is not in a sendable shared state",
+			)
+		}
+		if !d.receiptBindingIsActive(first) {
+			return channel.Target{}, channel.PreparedEnvelope{}, fmt.Errorf(
+				"the original delivery binding is no longer active",
+			)
+		}
+	} else {
+		if (first.Status != k12.DeliveryPending && first.Status != k12.DeliveryFailed) ||
+			strings.TrimSpace(first.ExternalMessageID) != "" {
+			return channel.Target{}, channel.PreparedEnvelope{}, fmt.Errorf(
+				"creative work delivery envelope is not in a preflightable shared state",
+			)
+		}
+		if !d.receiptBindingIsActive(first) {
+			return channel.Target{}, channel.PreparedEnvelope{}, fmt.Errorf(
+				"the original delivery binding is no longer active",
+			)
+		}
+	}
+
+	parts := make([]channel.DeliveryPart, 0, len(receipts))
+	for i, receipt := range receipts {
+		if receipt.AgentName != first.AgentName || receipt.ObjectKind != first.ObjectKind ||
+			receipt.ObjectID != first.ObjectID || receipt.BatchID != first.BatchID ||
+			receipt.BindingID != first.BindingID || channelTargetFromReceipt(receipt) != target ||
+			receipt.BatchOrdinal != first.BatchOrdinal+i || receipt.PartOrdinal != i+1 ||
+			receipt.Status != first.Status || receipt.Attempt != first.Attempt ||
+			receipt.ExternalMessageID != first.ExternalMessageID {
+			return channel.Target{}, channel.PreparedEnvelope{}, fmt.Errorf(
+				"creative work delivery envelope components do not share one frozen identity",
+			)
+		}
+		part, err := preparedChannelPart(receipt)
+		if err != nil {
+			return channel.Target{}, channel.PreparedEnvelope{}, err
+		}
+		part.PreparedResourceID = strings.TrimSpace(receipt.PreparedResourceID)
+		parts = append(parts, part)
+	}
+	envelope := channel.PreparedEnvelope{Parts: parts}
+	if err := envelope.Validate(); err != nil {
+		return channel.Target{}, channel.PreparedEnvelope{}, err
+	}
+	return target, envelope, nil
+}
+
+// SendPreparedEnvelope 只用于 creative_work 的同一目标 Markdown+图片组合消息。
+// 不支持组合能力的通道直接失败，禁止降级为逐 part 外发而制造第二个图片气泡。
+func (d *k12IMDeliverer) SendPreparedEnvelope(
+	ctx context.Context,
+	receipts []k12.DeliveryReceipt,
+) (k12usecase.DeliveryTransportAck, error) {
+	target, envelope, err := d.preparedCreativeWorkEnvelope(receipts, creativeEnvelopeSend)
+	if err != nil {
+		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryFailed, Detail: err.Error()}, err
+	}
+	port, err := d.channels.Get(target.Platform)
+	if err != nil {
+		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryFailed, Detail: err.Error()}, err
+	}
+	envelopePort, ok := port.(channel.PreparedEnvelopeReceiptPort)
+	if !ok {
+		err = fmt.Errorf("channel %q does not support prepared delivery envelopes", target.Platform)
+		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryFailed, Detail: err.Error()}, err
+	}
+	ack, sendErr := envelopePort.SendPreparedEnvelopeWithReceipt(ctx, target, envelope)
+	return usecaseAckFromChannel(ack, sendErr), sendErr
+}
+
+// PreflightPreparedEnvelope 在组 CAS 前用冻结载荷和已持久化媒体引用执行平台完整校验。
+func (d *k12IMDeliverer) PreflightPreparedEnvelope(
+	ctx context.Context,
+	receipts []k12.DeliveryReceipt,
+) error {
+	target, envelope, err := d.preparedCreativeWorkEnvelope(receipts, creativeEnvelopePreflight)
+	if err != nil {
+		return err
+	}
+	port, err := d.channels.Get(target.Platform)
+	if err != nil {
+		return err
+	}
+	preflight, ok := port.(channel.PreparedEnvelopePreflightPort)
+	if !ok {
+		return fmt.Errorf("channel %q does not support prepared envelope preflight", target.Platform)
+	}
+	return preflight.PreflightPreparedEnvelope(ctx, target, envelope)
+}
+
+// QueryPreparedEnvelope 对共享 external ID 只查询一次，并把 provider 结果交给组状态机统一收敛。
+func (d *k12IMDeliverer) QueryPreparedEnvelope(
+	ctx context.Context,
+	receipts []k12.DeliveryReceipt,
+) (k12usecase.DeliveryTransportAck, error) {
+	_, _, err := d.preparedCreativeWorkEnvelope(receipts, creativeEnvelopeQuery)
+	if err != nil {
+		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryOutcomeUnknown, Detail: err.Error()}, err
+	}
+	return d.QueryPrepared(ctx, receipts[0])
+}
+
 // SendPrepared is only reached after Store.PrepareDeliveryReceipt and
 // BeginDeliveryAttempt. Unsupported channels fail visibly in that same row.
 func (d *k12IMDeliverer) SendPrepared(ctx context.Context, receipt k12.DeliveryReceipt) (k12usecase.DeliveryTransportAck, error) {
@@ -443,6 +640,10 @@ func (d *k12IMDeliverer) PrepareDeliveryPartResource(ctx context.Context, receip
 }
 
 func (d *k12IMDeliverer) QueryPrepared(ctx context.Context, receipt k12.DeliveryReceipt) (k12usecase.DeliveryTransportAck, error) {
+	if strings.TrimSpace(receipt.Target.InstanceID) == "" {
+		err := fmt.Errorf("query prepared delivery requires a stable instance ID")
+		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryOutcomeUnknown, Detail: err.Error()}, err
+	}
 	port, err := d.channels.Get(receipt.Target.Platform)
 	if err != nil {
 		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryOutcomeUnknown, Detail: "绑定通道暂时不可查询"}, err
@@ -712,4 +913,12 @@ func adapterDeliveryPartFromChannelPart(part channel.DeliveryPart) adapter.Deliv
 		Data: base64.StdEncoding.EncodeToString(part.Attachment.Data),
 	}
 	return result
+}
+
+func adapterPreparedEnvelopeFromChannelEnvelope(envelope channel.PreparedEnvelope) adapter.PreparedEnvelope {
+	parts := make([]adapter.DeliveryPart, 0, len(envelope.Parts))
+	for _, part := range envelope.Parts {
+		parts = append(parts, adapterDeliveryPartFromChannelPart(part))
+	}
+	return adapter.PreparedEnvelope{Parts: parts}
 }

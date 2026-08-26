@@ -276,6 +276,12 @@ type DeliveryPart struct {
 	PreparedResourceID string                         `json:"-"`
 }
 
+// PreparedEnvelope 把同一规范内容中已经准备好的多个 part 作为一次平台可见消息发送。
+// Parts 必须保持 RenderManifest 的冻结顺序；适配器不得在发送阶段重新准备媒体资源。
+type PreparedEnvelope struct {
+	Parts []DeliveryPart `json:"parts"`
+}
+
 // DeliveryReceiptAdapter is an optional capability implemented by adapters
 // whose provider offers an external message ID and a status-query endpoint.
 // Callers must feature-detect this interface; basic Adapter.Send remains the
@@ -292,6 +298,20 @@ type DeliveryPartAdapter interface {
 	DeliveryReceiptAdapter
 	PrepareDeliveryPartResource(ctx context.Context, part DeliveryPart) (preparedResourceID string, err error)
 	SendPreparedPartWithReceipt(ctx context.Context, chatID string, part DeliveryPart) (DeliveryAck, error)
+}
+
+// PreparedEnvelopeAdapter 是把多个已准备 part 原子投影为一条平台消息的可选能力。
+// 调用方必须先按业务对象进行能力门控；不支持该能力时不得拆分回退为多条可见消息。
+type PreparedEnvelopeAdapter interface {
+	DeliveryPartAdapter
+	SendPreparedEnvelopeWithReceipt(ctx context.Context, chatID string, envelope PreparedEnvelope) (DeliveryAck, error)
+}
+
+// PreparedEnvelopeValidator 在任何凭证、上传或发送边界前校验平台组合消息。
+// 校验只消费已经冻结的载荷与平台资源引用，不得访问 Provider。
+type PreparedEnvelopeValidator interface {
+	PreparedEnvelopeAdapter
+	ValidatePreparedEnvelope(envelope PreparedEnvelope) error
 }
 
 // WebhookAdapter 表示可挂载到统一 HTTP ingress 的适配器。

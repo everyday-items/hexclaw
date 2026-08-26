@@ -20,6 +20,9 @@ type InboundPhotoConfirmationStatus = k12storage.InboundPhotoConfirmationStatus
 type InboundPhotoReplyStatus = k12storage.InboundPhotoReplyStatus
 type InboundPhotoTerminalStatus = k12storage.InboundPhotoTerminalStatus
 type InboundPhotoTerminalStage = k12storage.InboundPhotoTerminalStage
+type InboundPhotoRoutingStage = k12storage.InboundPhotoRoutingStage
+type InboundPhotoRoutingCandidate = k12storage.InboundPhotoRoutingCandidate
+type InboundPhotoRoutingSnapshot = k12storage.InboundPhotoRoutingSnapshot
 
 // ErrInboundPhotoConflict 保留仓储与用例层一致的外部消息冲突判定。
 var ErrInboundPhotoConflict = k12storage.ErrInboundPhotoConflict
@@ -48,6 +51,9 @@ const (
 	InboundPhotoTerminalStageImageTask = k12storage.InboundPhotoTerminalStageImageTask
 	InboundPhotoTerminalStageGrading   = k12storage.InboundPhotoTerminalStageGrading
 	InboundPhotoTerminalStageDelivery  = k12storage.InboundPhotoTerminalStageDelivery
+
+	InboundPhotoRoutingStageIntent    = k12storage.InboundPhotoRoutingStageIntent
+	InboundPhotoRoutingStageCandidate = k12storage.InboundPhotoRoutingStageCandidate
 )
 
 // InboundPhotoRepository 是 callback admission 与重启 worker 共享的唯一耐久 port。
@@ -63,4 +69,18 @@ type InboundPhotoRepository interface {
 		context.Context, string, string, int64, InboundPhotoDispatchState,
 	) (InboundPhotoDispatch, error)
 	ListRecoverableInboundPhotos(context.Context, int) ([]InboundPhotoBundle, error)
+}
+
+// InboundPhotoRoutingSnapshotRepository 是多候选确认的可选扩展；保持旧 port 不变，
+// 使无候选/测试装配仍可复用既有 V88 协议。
+type InboundPhotoRoutingSnapshotRepository interface {
+	SaveInboundPhotoRoutingSnapshot(
+		context.Context, string, string, int64, InboundPhotoRoutingSnapshot,
+	) (InboundPhotoDispatch, error)
+	GetInboundPhotoRoutingSnapshot(
+		context.Context, string, string,
+	) (InboundPhotoRoutingSnapshot, error)
+	ConfirmInboundPhotoRoutingSelection(
+		context.Context, string, string, int64, InboundPhotoRoutingDecision, string,
+	) (InboundPhotoDispatch, error)
 }

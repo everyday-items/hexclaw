@@ -341,6 +341,10 @@ type gradingGroundingSession struct {
 	required       bool
 	snapshot       GroundingSnapshot
 	evidenceSource SnapshotGroundingEvidence
+	retrieval      *k12storage.Store
+	ownerID        string
+	agentName      string
+	jobID          string
 	items          map[string]*gradingGroundingItemState
 	err            error
 }
@@ -404,6 +408,10 @@ func (session *gradingGroundingSession) initialize(
 		session.err = err
 		return err
 	}
+	session.retrieval = deps.Records
+	session.ownerID = strings.TrimSpace(textbookOwnerID)
+	session.agentName = strings.TrimSpace(job.Record.AgentName)
+	session.jobID = strings.TrimSpace(job.Record.RecordID)
 
 	inspection, err := inspectGradingGroundingInvocations(
 		ctx, deps, job.Record.AgentName, job.Record.RecordID,
@@ -586,6 +594,68 @@ func (session *gradingGroundingSession) resolveItem(
 	}
 	state.resolved = true
 	query := gradingItemGroundingQuery(q, req)
+	if session.retrieval != nil && session.ownerID != "" && session.agentName != "" && session.jobID != "" {
+		claim := groundingRetrievalClaim(session.ownerID, session.agentName, session.jobID, q, itemKey, snapshot, query)
+		invocation, claimErr := session.retrieval.ClaimGroundingRetrievalInvocation(ctx, claim)
+		if claimErr == nil {
+			if !invocation.Fresh {
+				if invocation.Status != k12storage.GroundingRetrievalInvocationStatusSucceeded {
+					state.err = fmt.Errorf(
+						"%w: grounding retrieval invocation=%s status=%s",
+						ErrModelInvocationRequiresReconciliation, invocation.InvocationID, invocation.Status,
+					)
+					return gradingProviderGrounding{}, state.err
+				}
+				storedResult, decodeErr := decodeGroundingRetrievalResult(invocation, snapshot, claim)
+				if decodeErr != nil {
+					state.err = decodeErr
+					return gradingProviderGrounding{}, state.err
+				}
+				state.evidence, state.err = newGradingProviderGrounding(snapshot, storedResult)
+				return state.evidence, state.err
+			}
+			result, queryErr := evidenceSource.GroundSnapshotWithEvidence(
+				ctx, snapshot, query, strings.TrimSpace(req.Grade),
+			)
+			if queryErr != nil {
+				if marker, ok := any(session.retrieval).(interface {
+					MarkGroundingRetrievalInvocationOutcomeUnknown(context.Context, k12storage.GroundingRetrievalInvocation, string) error
+				}); ok {
+					_ = marker.MarkGroundingRetrievalInvocationOutcomeUnknown(ctx, invocation, queryErr.Error())
+				}
+				state.err = fmt.Errorf(
+					"%w: pinned textbook query failed: %v",
+					ErrGradingGroundingUnavailable, queryErr,
+				)
+				return gradingProviderGrounding{}, state.err
+			}
+			evidence, evidenceErr := newGradingProviderGrounding(snapshot, result)
+			if evidenceErr != nil {
+				state.err = evidenceErr
+				return gradingProviderGrounding{}, state.err
+			}
+			resultJSON, marshalErr := json.Marshal(result)
+			if marshalErr != nil {
+				state.err = fmt.Errorf("%w: encode grounding retrieval result: %v", ErrGradingGroundingUnavailable, marshalErr)
+				return gradingProviderGrounding{}, state.err
+			}
+			queryReceiptDigest, hitSetDigest, citationSetDigest := groundingRetrievalResultDigests(result)
+			if saveErr := session.retrieval.SaveGroundingRetrievalInvocation(ctx, invocation,
+				k12storage.GroundingRetrievalInvocationResult{
+					ResultJSON: string(resultJSON), QueryReceiptDigest: queryReceiptDigest,
+					HitSetDigest: hitSetDigest, CitationSetDigest: citationSetDigest,
+				}); saveErr != nil {
+				state.err = fmt.Errorf("%w: persist grounding retrieval result: %v", ErrGradingGroundingUnavailable, saveErr)
+				return gradingProviderGrounding{}, state.err
+			}
+			state.evidence = evidence
+			return state.evidence, nil
+		} else if !errors.Is(claimErr, k12storage.ErrGroundingRetrievalInvocationLedgerUnavailable) &&
+			!strings.Contains(strings.ToLower(claimErr.Error()), "no such table") {
+			state.err = fmt.Errorf("%w: claim grounding retrieval invocation: %v", ErrGradingGroundingUnavailable, claimErr)
+			return gradingProviderGrounding{}, state.err
+		}
+	}
 	result, err := evidenceSource.GroundSnapshotWithEvidence(
 		ctx, snapshot, query, strings.TrimSpace(req.Grade),
 	)
@@ -598,6 +668,77 @@ func (session *gradingGroundingSession) resolveItem(
 	}
 	state.evidence, state.err = newGradingProviderGrounding(snapshot, result)
 	return state.evidence, state.err
+}
+
+func groundingRetrievalClaim(
+	ownerID, agentName, jobID string,
+	q RecognizedQuestion,
+	itemKey string,
+	snapshot GroundingSnapshot,
+	query string,
+) k12storage.GroundingRetrievalInvocationClaim {
+	problemID := strings.TrimSpace(q.ProblemID)
+	if problemID == "" {
+		problemID = itemKey
+	}
+	snapshotRaw, _ := json.Marshal(snapshot)
+	queryRaw := []byte(query)
+	scopeRaw, _ := json.Marshal(struct {
+		BindingID  string                         `json:"binding_id"`
+		Manifest   string                         `json:"manifest_id"`
+		Document   string                         `json:"document_id"`
+		Generation int64                          `json:"generation"`
+		Segments   []string                       `json:"segments"`
+		Pages      []k12.TextbookGroundingPageRef `json:"pages"`
+	}{snapshot.TextbookBindingID, snapshot.TextbookManifestID, snapshot.DocumentID,
+		snapshot.DocumentGeneration, snapshot.SegmentRefs, snapshot.PageRefs})
+	return k12storage.GroundingRetrievalInvocationClaim{
+		OwnerID: ownerID, AgentName: agentName, JobID: jobID, ProblemID: problemID,
+		Operation:               "k12_grounding_retrieval",
+		GroundingSnapshotDigest: strings.TrimPrefix(modelInvocationDigest(snapshotRaw), "sha256:"),
+		QueryDigest:             strings.TrimPrefix(modelInvocationDigest(queryRaw), "sha256:"),
+		DocumentID:              snapshot.DocumentID, DocumentGeneration: snapshot.DocumentGeneration,
+		RevisionID: snapshot.VectorRevisionID, ScopeDigest: strings.TrimPrefix(modelInvocationDigest(scopeRaw), "sha256:"),
+	}
+}
+
+func groundingRetrievalResultDigests(result GroundingSnapshotResult) (string, string, string) {
+	receiptsRaw, _ := json.Marshal(result.Receipts)
+	hitIDs := make([]string, 0, len(result.Receipts))
+	citations := make([]string, 0, len(result.Receipts))
+	for _, receipt := range result.Receipts {
+		hitIDs = append(hitIDs, receipt.ChunkID)
+		citations = append(citations, receipt.CitationDigest)
+	}
+	hitRaw, _ := json.Marshal(hitIDs)
+	citationRaw, _ := json.Marshal(citations)
+	return strings.TrimPrefix(modelInvocationDigest(receiptsRaw), "sha256:"),
+		strings.TrimPrefix(modelInvocationDigest(hitRaw), "sha256:"),
+		strings.TrimPrefix(modelInvocationDigest(citationRaw), "sha256:")
+}
+
+func decodeGroundingRetrievalResult(
+	invocation k12storage.GroundingRetrievalInvocation,
+	snapshot GroundingSnapshot,
+	claim k12storage.GroundingRetrievalInvocationClaim,
+) (GroundingSnapshotResult, error) {
+	var result GroundingSnapshotResult
+	if !json.Valid([]byte(invocation.ResultJSON)) {
+		return GroundingSnapshotResult{}, fmt.Errorf("%w: grounding retrieval result is invalid JSON", ErrModelInvocationRequiresReconciliation)
+	}
+	if err := json.Unmarshal([]byte(invocation.ResultJSON), &result); err != nil {
+		return GroundingSnapshotResult{}, fmt.Errorf("%w: decode grounding retrieval result: %v", ErrModelInvocationRequiresReconciliation, err)
+	}
+	if err := result.validate(snapshot); err != nil {
+		return GroundingSnapshotResult{}, fmt.Errorf("%w: stored grounding retrieval result: %v", ErrModelInvocationRequiresReconciliation, err)
+	}
+	queryReceiptDigest, hitSetDigest, citationSetDigest := groundingRetrievalResultDigests(result)
+	if invocation.QueryDigest != claim.QueryDigest || invocation.GroundingSnapshotDigest != claim.GroundingSnapshotDigest ||
+		invocation.QueryReceiptDigest != queryReceiptDigest || invocation.HitSetDigest != hitSetDigest ||
+		invocation.CitationSetDigest != citationSetDigest {
+		return GroundingSnapshotResult{}, fmt.Errorf("%w: grounding retrieval result digest mismatch", ErrModelInvocationRequiresReconciliation)
+	}
+	return result, nil
 }
 
 func gradingItemGroundingQuery(q RecognizedQuestion, req GradeRequest) string {

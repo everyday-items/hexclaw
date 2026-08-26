@@ -25,6 +25,12 @@ type InboundPhotoConfirmationStatus string
 type InboundPhotoReplyStatus string
 type InboundPhotoTerminalStatus string
 type InboundPhotoTerminalStage string
+type InboundPhotoRoutingStage string
+
+const (
+	InboundPhotoRoutingStageIntent    InboundPhotoRoutingStage = "intent"
+	InboundPhotoRoutingStageCandidate InboundPhotoRoutingStage = "candidate"
+)
 
 const (
 	InboundPhotoAdmitted           InboundPhotoProcessingStatus = "admitted"
@@ -126,6 +132,30 @@ type InboundPhotoBundle struct {
 	Receipt  InboundPhotoReceipt
 	Asset    InboundPhotoAsset
 	Dispatch InboundPhotoDispatch
+}
+
+// InboundPhotoRoutingCandidate 是一次候选快照中的可展示事实；PracticeSetID 只在服务端
+// 选择确认时使用，渠道文案必须通过序号、卷面号和日期投影，不能暴露该内部 ID。
+type InboundPhotoRoutingCandidate struct {
+	PracticeSetID string `json:"practice_set_id"`
+	PaperNo       string `json:"paper_no"`
+	Title         string `json:"title,omitempty"`
+	SentAt        int64  `json:"sent_at"`
+}
+
+// InboundPhotoRoutingSnapshot 冻结候选顺序和确认结果，重启后只能读取此快照，不能重新
+// 依据可变练习集列表推导另一张卷。
+type InboundPhotoRoutingSnapshot struct {
+	ReceiptID             string                         `json:"receipt_id"`
+	Stage                 InboundPhotoRoutingStage       `json:"stage"`
+	SnapshotDigest        string                         `json:"snapshot_digest"`
+	RequestDigest         string                         `json:"request_digest,omitempty"`
+	Candidates            []InboundPhotoRoutingCandidate `json:"candidates"`
+	SelectedPracticeSetID string                         `json:"selected_practice_set_id,omitempty"`
+	SelectionDigest       string                         `json:"selection_digest,omitempty"`
+	Version               int64                          `json:"version"`
+	CreatedAt             int64                          `json:"created_at"`
+	UpdatedAt             int64                          `json:"updated_at"`
 }
 
 func inboundPhotoDigest(value []byte) string {

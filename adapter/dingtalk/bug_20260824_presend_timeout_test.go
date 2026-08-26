@@ -64,14 +64,15 @@ func assertDefinitePreSendFailure(
 	}
 }
 
-func imageReplyForPreSendStage() *adapter.Reply {
+func imageReplyForPreSendStage(t *testing.T) *adapter.Reply {
+	t.Helper()
 	return &adapter.Reply{
 		Content: "## 作品与点评",
 		Attachments: []adapter.Attachment{{
 			Type: "image",
 			Name: "creative-work.png",
 			Mime: "image/png",
-			Data: base64.StdEncoding.EncodeToString([]byte("creative-work-png")),
+			Data: base64.StdEncoding.EncodeToString(testPNGBytes(t)),
 		}},
 	}
 }
@@ -124,7 +125,7 @@ func TestSendWithReceiptPreSendAttachmentDeadlineIsFailed(t *testing.T) {
 	client := newDirectReceiptTestAdapter(t)
 	client.openAPI = openAPI
 
-	ack, err := client.SendWithReceipt(context.Background(), "user-1", imageReplyForPreSendStage())
+	ack, err := client.SendWithReceipt(context.Background(), "user-1", imageReplyForPreSendStage(t))
 
 	assertDefinitePreSendFailure(t, ack, err, context.DeadlineExceeded, base)
 	if openAPI.uploadCalls != 1 {
@@ -144,7 +145,7 @@ func TestSendWithReceiptPreSendAttachmentCancellationIsFailed(t *testing.T) {
 	client := newDirectReceiptTestAdapter(t)
 	client.openAPI = openAPI
 
-	ack, err := client.SendWithReceipt(context.Background(), "user-1", imageReplyForPreSendStage())
+	ack, err := client.SendWithReceipt(context.Background(), "user-1", imageReplyForPreSendStage(t))
 
 	assertDefinitePreSendFailure(t, ack, err, context.Canceled, base)
 	if openAPI.uploadCalls != 1 {
@@ -173,7 +174,7 @@ func TestSendWithReceiptPreSendConstructedMessageContextFailuresAreFailed(t *tes
 			client := newDirectReceiptTestAdapter(t)
 			client.openAPI = openAPI
 
-			ack, err := client.SendWithReceipt(stageCtx, "user-1", imageReplyForPreSendStage())
+			ack, err := client.SendWithReceipt(stageCtx, "user-1", imageReplyForPreSendStage(t))
 
 			assertDefinitePreSendFailure(t, ack, err, stageErr, base)
 			if openAPI.uploadCalls != 1 {

@@ -6,6 +6,43 @@ import (
 	"testing"
 )
 
+func assertApprovedWorkFeedbackProjection(
+	t *testing.T,
+	markdown, limitation string,
+) {
+	t.Helper()
+	wantHeadings := []string{
+		"## 可见证据",
+		"## 先这样肯定",
+		"## 家长可以这样问或讲",
+		"## 下一次只试一个点",
+	}
+	gotHeadings := make([]string, 0, len(wantHeadings))
+	for _, line := range strings.Split(markdown, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "## ") {
+			gotHeadings = append(gotHeadings, line)
+		}
+	}
+	if strings.Join(gotHeadings, "\x00") != strings.Join(wantHeadings, "\x00") {
+		t.Fatalf("作品点评 H2 顺序 = %#v，期望 %#v；markdown=%q", gotHeadings, wantHeadings, markdown)
+	}
+	if strings.Contains(markdown, "## 说明") {
+		t.Fatalf("能力限制只能作为四段后的轻量正文，不能形成第五个 H2：%q", markdown)
+	}
+	if strings.Count(markdown, limitation) != 1 {
+		t.Fatalf("能力限制出现次数 = %d，期望 1；markdown=%q", strings.Count(markdown, limitation), markdown)
+	}
+	lastSection := strings.Index(markdown, "## 下一次只试一个点")
+	limitationAt := strings.LastIndex(markdown, limitation)
+	if lastSection < 0 || limitationAt <= lastSection {
+		t.Fatalf("能力限制必须位于第四段之后：section=%d limitation=%d markdown=%q", lastSection, limitationAt, markdown)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(markdown), limitation) {
+		t.Fatalf("能力限制必须是投影最后一个非空内容块：%q", markdown)
+	}
+}
+
 func TestWorkFeedbackCanonicalContractAndStrictJSON(t *testing.T) {
 	feedback := WorkFeedback{
 		FeedbackID:   "feedback-1",
@@ -97,11 +134,12 @@ func TestProjectWorkFeedbackMarkdownIsDeterministicFromCanonicalFields(t *testin
 		Suggestions: []string{"由孩子补充一个听觉细节。"},
 	}
 	got := ProjectWorkFeedbackMarkdown(feedback)
-	for _, want := range []string{"## 可见证据", "使用了可见的比喻句。", "## 先这样肯定", "## 家长可以这样问或讲", "## 下一次只试一个点", "由孩子补充一个听觉细节。", "## 说明", "只依据已确认原文。"} {
+	for _, want := range []string{"使用了可见的比喻句。", "由孩子补充一个听觉细节。", "只依据已确认原文。"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("deterministic projection missing %q: %q", want, got)
 		}
 	}
+	assertApprovedWorkFeedbackProjection(t, got, feedback.Limitations)
 	if strings.Contains(got, "feedback_id") || strings.Contains(got, "allowed_actions") {
 		t.Fatalf("display projection must not leak internal schema: %q", got)
 	}
@@ -126,13 +164,13 @@ func TestProjectWorkFeedbackMarkdownUsesApprovedParentFacingFourPartProjection(t
 		"## 家长可以这样问或讲",
 		"## 下一次只试一个点",
 		"保留主体位置，再加强最亮与最暗处的差别。",
-		"## 说明",
 		"只依据当前原图中可见内容，不猜测创作意图。",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("approved parent-facing projection missing %q: %q", want, got)
 		}
 	}
+	assertApprovedWorkFeedbackProjection(t, got, feedback.Limitations)
 	for _, retiredHeading := range []string{"## 观察与依据", "## 下一步建议", "## 能力与证据限制"} {
 		if strings.Contains(got, retiredHeading) {
 			t.Fatalf("retired projection heading %q must not remain: %q", retiredHeading, got)

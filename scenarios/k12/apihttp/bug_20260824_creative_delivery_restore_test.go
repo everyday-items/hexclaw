@@ -235,11 +235,14 @@ func assertNoCreativeRestoreBoundaryCalls(
 	t.Helper()
 	if delivery.resolveCalls != 0 || delivery.prepareCalls != 0 ||
 		delivery.sendCalls != 0 || delivery.queryCalls != 0 ||
-		len(delivery.content) != 0 || len(delivery.sends) != 0 || len(delivery.queries) != 0 {
+		len(delivery.content) != 0 || len(delivery.sends) != 0 || len(delivery.queries) != 0 ||
+		len(delivery.envelopePreflights) != 0 || len(delivery.envelopeSends) != 0 ||
+		len(delivery.envelopeQueries) != 0 {
 		t.Fatalf(
-			"read-only creative restore crossed delivery boundary: resolve=%d prepare=%d send=%d query=%d content=%d sends=%d queries=%d",
+			"read-only creative restore crossed delivery boundary: resolve=%d prepare=%d send=%d query=%d content=%d sends=%d queries=%d envelope_preflights=%d envelope_sends=%d envelope_queries=%d",
 			delivery.resolveCalls, delivery.prepareCalls, delivery.sendCalls, delivery.queryCalls,
 			len(delivery.content), len(delivery.sends), len(delivery.queries),
+			len(delivery.envelopePreflights), len(delivery.envelopeSends), len(delivery.envelopeQueries),
 		)
 	}
 }

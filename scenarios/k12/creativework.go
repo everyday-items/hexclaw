@@ -279,7 +279,7 @@ func ProjectWorkFeedbackMarkdown(feedback WorkFeedback) string {
 		b.WriteByte('\n')
 	}
 	if limitation := strings.TrimSpace(feedback.Limitations); limitation != "" {
-		b.WriteString("\n## 说明\n\n")
+		b.WriteString("\n说明：")
 		b.WriteString(limitation)
 		b.WriteByte('\n')
 	}

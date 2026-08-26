@@ -7,7 +7,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
-func TestProblemGroundingProjectionRejectsMixedStatusMissingSolveOperation(t *testing.T) {
+func TestProblemGroundingProjectionAcceptsDeterministicOutOfScopeWithoutProviderOperation(t *testing.T) {
 	o, jobID, grounding, solver, grader := completedProblemGroundingFixture(t)
 	items, err := o.deps.Records.ListGradingAssessmentItems(
 		context.Background(), "mingming", jobID,
@@ -26,15 +26,21 @@ func TestProblemGroundingProjectionRejectsMixedStatusMissingSolveOperation(t *te
 	}
 	freezesBefore, legacyBefore, queriesBefore := grounding.snapshot()
 	solveBefore, gradeBefore := solver.callCount(), grader.callCount()
-	if _, err := o.ImageTaskHomeworkProjection(
+	projection, err := o.ImageTaskHomeworkProjection(
 		context.Background(), "mingming", jobID,
-	); err == nil {
-		t.Fatal("completed public projection accepted out_of_scope without solve")
+	)
+	if err != nil {
+		t.Fatalf("completed public projection rejected deterministic out_of_scope: %v", err)
+	}
+	for _, receipt := range projection.ProblemGroundingReceipts {
+		if receipt.ProblemID == items[0].ProblemID {
+			t.Fatalf("deterministic out_of_scope fabricated provider receipt: %+v", receipt)
+		}
 	}
 	freezesAfter, legacyAfter, queriesAfter := grounding.snapshot()
 	if freezesAfter != freezesBefore || legacyAfter != legacyBefore ||
 		len(queriesAfter) != len(queriesBefore) ||
 		solver.callCount() != solveBefore || grader.callCount() != gradeBefore {
-		t.Fatal("fail-closed projection performed external work")
+		t.Fatal("read-only projection performed external work")
 	}
 }

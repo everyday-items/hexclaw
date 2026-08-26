@@ -658,13 +658,78 @@ func (m *Manager) resolveRunningAdapter(target string) adapter.Adapter {
 	return adp
 }
 
+// resolveRunningAdapterByStableID 只按持久化实例 ID 解析运行中的适配器，
+// 不允许回退到实例名或 provider，避免冻结投递被发送到其他实例。
+func (m *Manager) resolveRunningAdapterByStableID(target string) adapter.Adapter {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	names := make([]string, 0, len(m.running))
+	for name := range m.running {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if md, ok := m.metadata[name]; ok && md.ID == target {
+			return m.running[name]
+		}
+	}
+	return nil
+}
+
+// ResolveRunningInstanceID 把 K12 绑定中的稳定 ID、精确实例名或单实例旧配置
+// 解析为运行实例的持久 ID。空引用只允许命中同平台唯一运行实例，禁止选择首实例。
+func (m *Manager) ResolveRunningInstanceID(platform, instanceRef string) (string, error) {
+	platform = strings.ToLower(strings.TrimSpace(platform))
+	instanceRef = strings.TrimSpace(instanceRef)
+	if platform == "" {
+		return "", fmt.Errorf("platform is required to resolve a running instance")
+	}
+
+	type candidate struct {
+		id   string
+		name string
+	}
+	m.mu.RLock()
+	names := make([]string, 0, len(m.running))
+	for name := range m.running {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	candidates := make([]candidate, 0, len(names))
+	for _, name := range names {
+		metadata := m.metadata[name]
+		if metadata == nil || strings.ToLower(strings.TrimSpace(metadata.Provider)) != platform {
+			continue
+		}
+		metadataName := strings.TrimSpace(metadata.Name)
+		metadataID := strings.TrimSpace(metadata.ID)
+		if instanceRef != "" && instanceRef != metadataID && instanceRef != metadataName && instanceRef != name {
+			continue
+		}
+		candidates = append(candidates, candidate{id: metadataID, name: name})
+	}
+	m.mu.RUnlock()
+
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("no running %s instance matches %q", platform, instanceRef)
+	}
+	if len(candidates) != 1 {
+		return "", fmt.Errorf("running %s instance reference %q is ambiguous", platform, instanceRef)
+	}
+	if candidates[0].id == "" {
+		return "", fmt.Errorf("running %s instance %q has no stable ID", platform, candidates[0].name)
+	}
+	return candidates[0].id, nil
+}
+
 // SendWithReceipt requires a provider-backed external message identifier. It
 // deliberately refuses adapters that only implement basic Send so callers can
 // never convert a local nil error into a false "delivered" claim.
 func (m *Manager) SendWithReceipt(ctx context.Context, target, chatID string, reply *adapter.Reply) (adapter.DeliveryAck, error) {
-	adp := m.resolveRunningAdapter(target)
+	adp := m.resolveRunningAdapterByStableID(target)
 	if adp == nil {
-		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("no running adapter for target %q", target)
+		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("no running adapter for stable instance %q", target)
 	}
 	receiptAdapter, ok := adp.(adapter.DeliveryReceiptAdapter)
 	if !ok {
@@ -676,9 +741,9 @@ func (m *Manager) SendWithReceipt(ctx context.Context, target, chatID string, re
 // PrepareDeliveryPartResource 按稳定实例定位平台适配器并准备一个媒体 part。
 // 该阶段不得发送可见消息；返回值由上层回执账本持久化后才能进入发送阶段。
 func (m *Manager) PrepareDeliveryPartResource(ctx context.Context, target string, part adapter.DeliveryPart) (string, error) {
-	adp := m.resolveRunningAdapter(target)
+	adp := m.resolveRunningAdapterByStableID(target)
 	if adp == nil {
-		return "", fmt.Errorf("no running adapter for target %q", target)
+		return "", fmt.Errorf("no running adapter for stable instance %q", target)
 	}
 	partAdapter, ok := adp.(adapter.DeliveryPartAdapter)
 	if !ok {
@@ -693,9 +758,9 @@ func (m *Manager) SendPreparedPartWithReceipt(
 	target, chatID string,
 	part adapter.DeliveryPart,
 ) (adapter.DeliveryAck, error) {
-	adp := m.resolveRunningAdapter(target)
+	adp := m.resolveRunningAdapterByStableID(target)
 	if adp == nil {
-		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("no running adapter for target %q", target)
+		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("no running adapter for stable instance %q", target)
 	}
 	partAdapter, ok := adp.(adapter.DeliveryPartAdapter)
 	if !ok {
@@ -704,13 +769,60 @@ func (m *Manager) SendPreparedPartWithReceipt(
 	return partAdapter.SendPreparedPartWithReceipt(ctx, chatID, part)
 }
 
+// SendPreparedEnvelopeWithReceipt 按稳定实例发送一个已经冻结并完成媒体准备的组合消息。
+// 该能力必须由适配器显式实现，禁止回退为逐 part 发送。
+func (m *Manager) SendPreparedEnvelopeWithReceipt(
+	ctx context.Context,
+	target, chatID string,
+	envelope adapter.PreparedEnvelope,
+) (adapter.DeliveryAck, error) {
+	if strings.TrimSpace(target) == "" || strings.TrimSpace(chatID) == "" {
+		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("prepared envelope target and chat ID are required")
+	}
+	adp := m.resolveRunningAdapterByStableID(target)
+	if adp == nil {
+		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("no running adapter for stable instance %q", target)
+	}
+	envelopeAdapter, ok := adp.(adapter.PreparedEnvelopeAdapter)
+	if !ok {
+		return adapter.DeliveryAck{Status: adapter.DeliveryFailed}, fmt.Errorf("adapter %q does not support prepared envelopes", adp.Name())
+	}
+	return envelopeAdapter.SendPreparedEnvelopeWithReceipt(ctx, chatID, envelope)
+}
+
+// PreflightPreparedEnvelope 按稳定实例执行只读平台组合消息校验。
+func (m *Manager) PreflightPreparedEnvelope(
+	ctx context.Context,
+	target, chatID string,
+	envelope adapter.PreparedEnvelope,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if strings.TrimSpace(target) == "" || strings.TrimSpace(chatID) == "" {
+		return fmt.Errorf("prepared envelope target and chat ID are required")
+	}
+	adp := m.resolveRunningAdapterByStableID(target)
+	if adp == nil {
+		return fmt.Errorf("no running adapter for stable instance %q", target)
+	}
+	validator, ok := adp.(adapter.PreparedEnvelopeValidator)
+	if !ok {
+		return fmt.Errorf("adapter %q does not support prepared envelope preflight", adp.Name())
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return validator.ValidatePreparedEnvelope(envelope)
+}
+
 // QueryReceipt reconciles an accepted or outcome-unknown proactive message
 // without resending it. The same stable instance target used at send time must
 // be retained by the domain receipt.
 func (m *Manager) QueryReceipt(ctx context.Context, target, externalMessageID string) (adapter.DeliveryAck, error) {
-	adp := m.resolveRunningAdapter(target)
+	adp := m.resolveRunningAdapterByStableID(target)
 	if adp == nil {
-		return adapter.DeliveryAck{ExternalMessageID: externalMessageID, Status: adapter.DeliveryOutcomeUnknown}, fmt.Errorf("no running adapter for target %q", target)
+		return adapter.DeliveryAck{ExternalMessageID: externalMessageID, Status: adapter.DeliveryOutcomeUnknown}, fmt.Errorf("no running adapter for stable instance %q", target)
 	}
 	receiptAdapter, ok := adp.(adapter.DeliveryReceiptAdapter)
 	if !ok {

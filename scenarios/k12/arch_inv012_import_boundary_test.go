@@ -27,6 +27,7 @@ var inv012Dirs = []string{".", "usecase", "storage"}
 // 误放行 "scenarios/k12/engineadapter" 这类反向依赖）。
 var inv012AllowedImportPrefixes = []string{
 	"github.com/hexagon-codes/hexclaw/internal/sqliteutil", // 存储层完整 SQLite 事务的 BUSY/BUSY_SNAPSHOT 有界重试
+	"github.com/hexagon-codes/hexclaw/messagecontent",      // 全 producer 共用的领域中性 canonical 内容协议；仅依赖标准库与 mathtext 标准库叶
 	"github.com/hexagon-codes/hexclaw/records",
 	"github.com/hexagon-codes/hexclaw/scenario",
 	"github.com/hexagon-codes/hexclaw/scenarios/k12",              // 领域根包（usecase/storage 引用）
@@ -60,6 +61,16 @@ func inv012Allowed(path string) bool {
 		}
 	}
 	return false
+}
+
+func TestINV012MessageContentAllowlistIsExact(t *testing.T) {
+	const messageContent = "github.com/hexagon-codes/hexclaw/messagecontent"
+	if !inv012Allowed(messageContent) {
+		t.Fatalf("K12-INV-012 messagecontent %q must be explicitly allowlisted", messageContent)
+	}
+	if inv012Allowed(messageContent + "/nested") {
+		t.Fatalf("K12-INV-012 messagecontent allowlist must not allow subpackages")
+	}
 }
 
 func TestINV012_DomainLayersDoNotImportIMPlatformTypes(t *testing.T) {

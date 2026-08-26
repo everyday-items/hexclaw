@@ -158,29 +158,24 @@ func TestFailedReceiptHasExplicitSafeRetryAndUnknownRejectsIt(t *testing.T) {
 }
 
 func TestTutoringTipsSendUsesTheSameDurableReceiptProtocol(t *testing.T) {
-	delivery := &httpReceiptTransport{send: []usecase.DeliveryTransportAck{{
-		Status: k12.DeliverySending, ExternalMessageID: "pqk-tips",
-	}}}
+	delivery := &httpBatchTransport{
+		targets: []usecase.ResolvedDeliveryTarget{{
+			BindingID: "agent-rule:24",
+			Target: k12.DeliveryTarget{
+				Platform: "dingtalk", InstanceID: "bot-1", ChatID: "staff-1", Label: "钉钉 · 妈妈",
+			},
+		}},
+		send: []usecase.DeliveryTransportAck{
+			{Status: k12.DeliverySending, ExternalMessageID: "pqk-tips-markdown"},
+			{Status: k12.DeliverySending, ExternalMessageID: "pqk-tips-image"},
+		},
+	}
 	const (
 		artifactID = "grading-final-http"
 		content    = "【这份作业的辅导要点】五年级下\n知识点回顾\n小数乘法"
-		digest     = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	)
 	h := newServerWithReceiptTransport(t, delivery, func(db *sql.DB) {
-		if _, err := db.Exec(`
-			INSERT INTO k12_grading_jobs
-				(record_id,agent_name,status,dedupe_key,created_at,updated_at)
-			VALUES('job-http','mingming','completed','job-http',100,100);
-			INSERT INTO k12_grading_final_artifacts
-				(artifact_id,agent_name,job_id,structure_version,coverage_status,
-				 total_count,published_count,skipped_count,ordered_current_digests_json,
-				 canonical_markdown,artifact_digest,summary_invocation_id,created_at,updated_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			artifactID, "mingming", "job-http", 1, "complete",
-			1, 1, 0, `["`+digest+`"]`, content, digest, "summary-http", 100, 100,
-		); err != nil {
-			t.Fatal(err)
-		}
+		seedAnnotatedGradingFinalArtifact(t, db, artifactID, "http", content)
 	})
 	rec, out := do(t, h, "POST", "/tutoring-tips/send", `{
 		"agent":"mingming","final_artifact_id":"grading-final-http"
@@ -191,5 +186,8 @@ func TestTutoringTipsSendUsesTheSameDurableReceiptProtocol(t *testing.T) {
 	}
 	if len(delivery.content) != 1 || delivery.content[0] != content {
 		t.Fatalf("tutoring-tips content was not sent: %v", delivery.content)
+	}
+	if len(delivery.sends) != 2 {
+		t.Fatalf("tutoring-tips must freeze Markdown and annotated image receipts: sends=%d", len(delivery.sends))
 	}
 }

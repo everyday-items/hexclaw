@@ -1,13 +1,21 @@
 package dingtalk
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+	"net/http"
 	"strings"
 	"unicode"
+
+	_ "golang.org/x/image/webp"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/messagecontent"
@@ -273,7 +281,9 @@ func dingTalkAttachmentIdentity(attachment adapter.Attachment) (string, string, 
 }
 
 func dingTalkAttachmentBytes(attachment adapter.Attachment) ([]byte, error) {
-	if !adapter.IsImageAttachment(attachment) && !isDingTalkPDFAttachment(attachment) {
+	isPDF := isDingTalkPDFAttachment(attachment)
+	isImage := adapter.IsImageAttachment(attachment) && !isPDF
+	if !isImage && !isPDF {
 		return nil, errors.New("DingTalk attachment type is unsupported")
 	}
 	if strings.TrimSpace(attachment.URL) != "" {
@@ -289,12 +299,29 @@ func dingTalkAttachmentBytes(attachment adapter.Attachment) ([]byte, error) {
 	if encoded == "" {
 		return nil, errors.New("DingTalk attachment bytes are required")
 	}
+	if isImage && base64.StdEncoding.DecodedLen(len(encoded)) > dingtalkMaxOutboundImageBytes+2 {
+		return nil, fmt.Errorf("DingTalk image attachment exceeds the %d MiB limit", dingtalkMaxOutboundImageBytes>>20)
+	}
 	raw, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil || len(raw) == 0 {
 		return nil, errors.New("DingTalk attachment bytes are invalid")
 	}
-	if isDingTalkPDFAttachment(attachment) && !strings.HasPrefix(string(raw), "%PDF-") {
+	if isPDF && !strings.HasPrefix(string(raw), "%PDF-") {
 		return nil, errors.New("DingTalk PDF attachment bytes have invalid magic")
+	}
+	if !isImage {
+		return raw, nil
+	}
+	if len(raw) > dingtalkMaxOutboundImageBytes {
+		return nil, fmt.Errorf("DingTalk image attachment exceeds the %d MiB limit", dingtalkMaxOutboundImageBytes>>20)
+	}
+	declaredMIME := strings.ToLower(strings.TrimSpace(attachment.Mime))
+	detectedMIME := strings.ToLower(strings.TrimSpace(http.DetectContentType(raw)))
+	if declaredMIME != detectedMIME {
+		return nil, fmt.Errorf("DingTalk image attachment MIME mismatch: declared %q detected %q", declaredMIME, detectedMIME)
+	}
+	if _, _, err := image.Decode(bytes.NewReader(raw)); err != nil {
+		return nil, fmt.Errorf("DingTalk image attachment cannot be decoded: %w", err)
 	}
 	return raw, nil
 }

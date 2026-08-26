@@ -632,7 +632,8 @@ func validateTextbookCatalogPageProofTx(
 		WHERE j.kind='ingest' AND j.owner_id=? AND j.document_id=?
 		  AND j.document_generation=? AND j.state='succeeded'
 		  AND j.pages_total IS NOT NULL AND j.pages_done=j.pages_total
-		  AND p.pages_total=j.pages_total AND p.lease_epoch=j.lease_epoch
+		  AND p.pages_total=j.pages_total AND p.lease_epoch>0
+		  AND p.lease_epoch<=j.lease_epoch
 		  AND p.page_number=? AND p.source_digest=?
 		  AND (?='' OR j.job_id=?)
 		ORDER BY COALESCE(j.finished_at,j.updated_at) DESC,j.created_at DESC,j.job_id DESC

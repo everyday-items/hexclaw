@@ -663,11 +663,35 @@ func (d Deps) sendDeliveryBatch(
 	batch k12.DeliveryBatch,
 ) (k12.DeliveryBatch, error) {
 	var err error
+	if _, _, err = creativeDeliveryEnvelopeGroups(batch); err != nil {
+		return batch, err
+	}
 	batch, err = d.prepareDeliveryBatchResources(ctx, batch)
 	if err != nil {
 		return batch, err
 	}
+	groups, groupedIDs, err := creativeDeliveryEnvelopeGroups(batch)
+	if err != nil {
+		return batch, err
+	}
+	for _, group := range groups {
+		if group[0].Status != k12.DeliveryPending {
+			continue
+		}
+		if _, sendErr := d.sendPreparedDeliveryEnvelope(ctx, batch, group); sendErr != nil {
+			current, getErr := d.Records.GetDeliveryBatch(
+				ctx, batch.AgentName, batch.BatchID,
+			)
+			if getErr != nil {
+				return batch, getErr
+			}
+			return current, sendErr
+		}
+	}
 	for _, receipt := range batch.Receipts {
+		if _, grouped := groupedIDs[receipt.DeliveryID]; grouped {
+			continue
+		}
 		if receipt.Status != k12.DeliveryPending {
 			continue
 		}
@@ -702,11 +726,33 @@ func (d Deps) RetryDeliveryBatch(ctx context.Context, agentName, batchID string)
 	if err != nil {
 		return k12.DeliveryBatch{}, err
 	}
+	if _, _, err = creativeDeliveryEnvelopeGroups(batch); err != nil {
+		return batch, err
+	}
 	batch, err = d.prepareDeliveryBatchResources(ctx, batch)
 	if err != nil {
 		return batch, err
 	}
+	groups, groupedIDs, err := creativeDeliveryEnvelopeGroups(batch)
+	if err != nil {
+		return batch, err
+	}
+	for _, group := range groups {
+		if group[0].Status != k12.DeliveryFailed {
+			continue
+		}
+		if _, sendErr := d.sendPreparedDeliveryEnvelope(ctx, batch, group); sendErr != nil {
+			current, getErr := d.GetDeliveryBatch(ctx, batch.AgentName, batch.BatchID)
+			if getErr != nil {
+				return k12.DeliveryBatch{}, getErr
+			}
+			return current, sendErr
+		}
+	}
 	for _, receipt := range batch.Receipts {
+		if _, grouped := groupedIDs[receipt.DeliveryID]; grouped {
+			continue
+		}
 		if receipt.Status != k12.DeliveryFailed {
 			continue
 		}
@@ -731,7 +777,26 @@ func (d Deps) QueryDeliveryBatch(ctx context.Context, agentName, batchID string)
 	if err != nil {
 		return k12.DeliveryBatch{}, err
 	}
+	groups, groupedIDs, err := creativeDeliveryEnvelopeGroups(batch)
+	if err != nil {
+		return batch, err
+	}
+	for _, group := range groups {
+		if group[0].Status != k12.DeliverySending && group[0].Status != k12.DeliveryOutcomeUnknown {
+			continue
+		}
+		if _, queryErr := d.queryPreparedDeliveryEnvelope(ctx, group); queryErr != nil {
+			current, getErr := d.GetDeliveryBatch(ctx, batch.AgentName, batch.BatchID)
+			if getErr != nil {
+				return k12.DeliveryBatch{}, getErr
+			}
+			return current, queryErr
+		}
+	}
 	for _, receipt := range batch.Receipts {
+		if _, grouped := groupedIDs[receipt.DeliveryID]; grouped {
+			continue
+		}
 		if receipt.Status != k12.DeliverySending && receipt.Status != k12.DeliveryOutcomeUnknown {
 			continue
 		}
@@ -834,6 +899,515 @@ func (d Deps) RetryDeliveryReceipt(ctx context.Context, agentName, deliveryID st
 	return d.sendPreparedDelivery(ctx, receipt)
 }
 
+func deliveryEnvelopeTargetKey(receipt k12.DeliveryReceipt) string {
+	return strings.Join([]string{
+		receipt.BindingID,
+		strings.ToLower(strings.TrimSpace(receipt.Target.Platform)),
+		strings.TrimSpace(receipt.Target.InstanceID),
+		strings.TrimSpace(receipt.Target.ChatID),
+	}, "\x00")
+}
+
+type creativeEnvelopeArtifactExpectation struct {
+	mime    string
+	digest  string
+	ordinal int
+	image   bool
+}
+
+// creativeEnvelopeArtifactExpectations 从 Markdown 回执的完整 canonical 证据中
+// 恢复应存在的连续图片前缀与尾随 PDF。旧版非 canonical 载荷返回 known=false。
+func creativeEnvelopeArtifactExpectations(
+	receipt k12.DeliveryReceipt,
+) (expected []creativeEnvelopeArtifactExpectation, known bool, err error) {
+	var manifest messagecontent.RenderManifest
+	if json.Unmarshal([]byte(receipt.RenderJSON), &manifest) != nil {
+		return nil, false, nil
+	}
+	var payload struct {
+		MessageContent *messagecontent.MessageContent `json:"message_content"`
+		LegacyContent  *messagecontent.MessageContent `json:"Content"`
+	}
+	if json.Unmarshal([]byte(receipt.PayloadJSON), &payload) != nil {
+		return nil, false, nil
+	}
+	content := payload.MessageContent
+	if content == nil {
+		content = payload.LegacyContent
+	}
+	if content == nil {
+		return nil, false, nil
+	}
+	if err := manifest.ValidateFor(*content); err != nil {
+		return nil, true, fmt.Errorf("%w: invalid creative delivery canonical evidence: %v", records.ErrIllegalTransition, err)
+	}
+	if len(manifest.Parts) != len(content.Attachments)+1 ||
+		manifest.Parts[0].Kind != messagecontent.PartMarkdown {
+		return nil, true, fmt.Errorf("%w: creative delivery canonical artifact projection is incomplete", records.ErrIllegalTransition)
+	}
+	seenPDF := false
+	for i, attachment := range content.Attachments {
+		renderPart := manifest.Parts[i+1]
+		if renderPart.Kind != messagecontent.PartArtifact ||
+			renderPart.ArtifactRef != attachment.AssetID ||
+			renderPart.ArtifactDigest != attachment.Digest ||
+			renderPart.AltText != attachment.AltText {
+			return nil, true, fmt.Errorf("%w: creative delivery canonical artifact identity diverged", records.ErrIllegalTransition)
+		}
+		mime := strings.ToLower(strings.TrimSpace(attachment.MIME))
+		switch {
+		case strings.HasPrefix(mime, "image/") && mime != "image/":
+			if seenPDF {
+				return nil, true, fmt.Errorf("%w: creative delivery canonical images are not contiguous", records.ErrIllegalTransition)
+			}
+			expected = append(expected, creativeEnvelopeArtifactExpectation{
+				mime: mime, digest: attachment.Digest, ordinal: i + 2, image: true,
+			})
+		case mime == "application/pdf":
+			seenPDF = true
+			expected = append(expected, creativeEnvelopeArtifactExpectation{
+				mime: mime, digest: attachment.Digest, ordinal: i + 2,
+			})
+		default:
+			return nil, true, fmt.Errorf("%w: creative delivery canonical artifact MIME is unsupported", records.ErrIllegalTransition)
+		}
+	}
+	return expected, true, nil
+}
+
+type creativeDeliveryPayloadEvidence struct {
+	Kind           messagecontent.PartKind        `json:"kind"`
+	MIME           string                         `json:"mime,omitempty"`
+	Ordinal        int                            `json:"ordinal"`
+	Digest         string                         `json:"digest"`
+	Text           string                         `json:"text,omitempty"`
+	Attachment     *creativeDeliveryAttachment    `json:"attachment,omitempty"`
+	MessageContent *messagecontent.MessageContent `json:"message_content"`
+	RenderManifest *messagecontent.RenderManifest `json:"render_manifest"`
+}
+
+type creativeDeliveryAttachment struct {
+	Name string `json:"Name"`
+	MIME string `json:"MIME"`
+	Data []byte `json:"Data"`
+}
+
+func validateCreativeDeliveryTargetIntegrity(
+	batch k12.DeliveryBatch,
+	parts []k12.DeliveryReceipt,
+) error {
+	if len(parts) == 0 {
+		return nil
+	}
+	first := parts[0]
+	if strings.TrimSpace(first.BindingID) == "" ||
+		strings.TrimSpace(first.Target.InstanceID) == "" || strings.TrimSpace(first.Target.ChatID) == "" {
+		return fmt.Errorf("%w: creative delivery target identity is incomplete", records.ErrIllegalTransition)
+	}
+	payloads := make([]creativeDeliveryPayloadEvidence, len(parts))
+	hasCanonicalPayload := false
+	requiresCanonicalPayload := false
+	for i, receipt := range parts {
+		if receipt.AgentName != batch.AgentName || receipt.ObjectKind != batch.ObjectKind ||
+			receipt.ObjectID != batch.ObjectID || receipt.BatchID != batch.BatchID {
+			return fmt.Errorf("%w: creative delivery component root identity diverged", records.ErrIllegalTransition)
+		}
+		if receipt.BindingID != first.BindingID || receipt.Target != first.Target {
+			return fmt.Errorf("%w: creative delivery component target identity diverged", records.ErrIllegalTransition)
+		}
+		if receipt.BatchOrdinal != first.BatchOrdinal+i || receipt.PartOrdinal != i+1 {
+			return fmt.Errorf("%w: creative delivery component order diverged", records.ErrIllegalTransition)
+		}
+		if receipt.PartKind == messagecontent.PartMarkdown && strings.TrimSpace(receipt.PreparedResourceID) != "" {
+			return fmt.Errorf("%w: creative delivery Markdown has an unexpected prepared resource", records.ErrIllegalTransition)
+		}
+		if receipt.PayloadDigest != deliveryDigest(receipt.PayloadJSON) {
+			return fmt.Errorf("%w: creative delivery component payload digest diverged", records.ErrIllegalTransition)
+		}
+		if receipt.RenderJSON != first.RenderJSON {
+			return fmt.Errorf("%w: creative delivery component render evidence diverged", records.ErrIllegalTransition)
+		}
+		if err := json.Unmarshal([]byte(receipt.PayloadJSON), &payloads[i]); err != nil {
+			return fmt.Errorf("%w: creative delivery component payload is invalid", records.ErrIllegalTransition)
+		}
+		if payloads[i].MessageContent != nil || payloads[i].RenderManifest != nil {
+			hasCanonicalPayload = true
+		}
+		mime := strings.ToLower(strings.TrimSpace(receipt.PartMIME))
+		if receipt.PartKind == messagecontent.PartArtifact && strings.HasPrefix(mime, "image/") && mime != "image/" {
+			requiresCanonicalPayload = true
+		}
+	}
+	if !hasCanonicalPayload {
+		if requiresCanonicalPayload {
+			return fmt.Errorf("%w: creative delivery envelope requires canonical payload evidence", records.ErrIllegalTransition)
+		}
+		return nil
+	}
+	firstPayload := payloads[0]
+	if firstPayload.MessageContent == nil || firstPayload.RenderManifest == nil {
+		return fmt.Errorf("%w: creative delivery canonical payload is incomplete", records.ErrIllegalTransition)
+	}
+	attachmentIdentities := make([]DeliveryAttachmentIdentity, 0, len(firstPayload.MessageContent.Attachments))
+	for _, attachment := range firstPayload.MessageContent.Attachments {
+		attachmentIdentities = append(attachmentIdentities, DeliveryAttachmentIdentity{
+			Name:          attachment.Name,
+			MIME:          attachment.MIME,
+			ContentDigest: attachment.Digest,
+		})
+	}
+	contentDigest, err := deliveryMessageIdentityDigest(
+		firstPayload.MessageContent.Markdown,
+		attachmentIdentities,
+	)
+	if err != nil || batch.ContentDigest != contentDigest ||
+		batch.DedupeKey != deliveryBatchDedupeKey(
+			batch.AgentName,
+			batch.ObjectKind,
+			batch.ObjectID,
+			contentDigest,
+		) {
+		return fmt.Errorf("%w: creative delivery batch root identity diverged", records.ErrIllegalTransition)
+	}
+	firstContentJSON, err := json.Marshal(firstPayload.MessageContent)
+	if err != nil {
+		return fmt.Errorf("%w: creative delivery canonical content is invalid", records.ErrIllegalTransition)
+	}
+	firstManifestJSON, err := json.Marshal(firstPayload.RenderManifest)
+	if err != nil {
+		return fmt.Errorf("%w: creative delivery canonical render evidence is invalid", records.ErrIllegalTransition)
+	}
+	for i, receipt := range parts {
+		payload := payloads[i]
+		if receipt.DedupeKey != deliveryPartDedupeKey(
+			receipt.AgentName,
+			receipt.ObjectKind,
+			receipt.ObjectID,
+			receipt.BindingID,
+			receipt.PartKind,
+			receipt.PartMIME,
+			receipt.PartOrdinal,
+			receipt.PartDigest,
+			receipt.PayloadDigest,
+		) {
+			return fmt.Errorf("%w: creative delivery component dedupe identity diverged", records.ErrIllegalTransition)
+		}
+		if payload.MessageContent == nil || payload.RenderManifest == nil {
+			return fmt.Errorf("%w: creative delivery canonical payload is incomplete", records.ErrIllegalTransition)
+		}
+		if payload.Kind != receipt.PartKind || payload.MIME != receipt.PartMIME ||
+			payload.Ordinal != receipt.PartOrdinal || payload.Digest != receipt.PartDigest {
+			return fmt.Errorf("%w: creative delivery canonical part identity diverged", records.ErrIllegalTransition)
+		}
+		if err := payload.RenderManifest.ValidateFor(*payload.MessageContent); err != nil {
+			return fmt.Errorf("%w: invalid creative delivery canonical evidence: %v", records.ErrIllegalTransition, err)
+		}
+		if payload.Ordinal < 1 || payload.Ordinal > len(payload.RenderManifest.Parts) {
+			return fmt.Errorf("%w: creative delivery canonical part ordinal is invalid", records.ErrIllegalTransition)
+		}
+		selected := payload.RenderManifest.Parts[payload.Ordinal-1]
+		if selected.Kind != payload.Kind {
+			return fmt.Errorf("%w: creative delivery canonical projection kind diverged", records.ErrIllegalTransition)
+		}
+		switch payload.Kind {
+		case messagecontent.PartMarkdown:
+			if payload.Ordinal != 1 || payload.MIME != "" || payload.Attachment != nil ||
+				payload.Text != selected.Text || payload.Digest != deliveryDigest(payload.MessageContent.Markdown) {
+				return fmt.Errorf("%w: creative delivery Markdown payload diverged", records.ErrIllegalTransition)
+			}
+		case messagecontent.PartArtifact:
+			attachmentIndex := payload.Ordinal - 2
+			if attachmentIndex < 0 || attachmentIndex >= len(payload.MessageContent.Attachments) ||
+				payload.Text != "" || payload.Attachment == nil {
+				return fmt.Errorf("%w: creative delivery artifact payload is incomplete", records.ErrIllegalTransition)
+			}
+			canonicalAttachment := payload.MessageContent.Attachments[attachmentIndex]
+			if payload.Attachment.Name != canonicalAttachment.Name ||
+				payload.Attachment.MIME != payload.MIME || payload.MIME != canonicalAttachment.MIME ||
+				payload.Digest != canonicalAttachment.Digest ||
+				deliveryDigest(string(payload.Attachment.Data)) != payload.Digest ||
+				selected.ArtifactRef != canonicalAttachment.AssetID ||
+				selected.ArtifactDigest != canonicalAttachment.Digest ||
+				selected.AltText != canonicalAttachment.AltText {
+				return fmt.Errorf("%w: creative delivery artifact payload diverged", records.ErrIllegalTransition)
+			}
+		default:
+			return fmt.Errorf("%w: creative delivery canonical part kind is unsupported", records.ErrIllegalTransition)
+		}
+		contentJSON, err := json.Marshal(payload.MessageContent)
+		if err != nil || string(contentJSON) != string(firstContentJSON) {
+			return fmt.Errorf("%w: creative delivery canonical content diverged", records.ErrIllegalTransition)
+		}
+		manifestJSON, err := json.Marshal(payload.RenderManifest)
+		if err != nil || string(manifestJSON) != string(firstManifestJSON) || string(manifestJSON) != receipt.RenderJSON {
+			return fmt.Errorf("%w: creative delivery canonical render evidence diverged", records.ErrIllegalTransition)
+		}
+	}
+	return nil
+}
+
+// creativeDeliveryEnvelopeGroups 为每个作品投递目标恢复有序的 Markdown+图片组件组；
+// PDF 继续作为独立物理消息。
+func creativeDeliveryEnvelopeGroups(
+	batch k12.DeliveryBatch,
+) ([][]k12.DeliveryReceipt, map[string]struct{}, error) {
+	groupedIDs := make(map[string]struct{})
+	if strings.TrimSpace(batch.ObjectKind) != "creative_work" {
+		return nil, groupedIDs, nil
+	}
+	targetOrder := make([]string, 0)
+	byTarget := make(map[string][]k12.DeliveryReceipt)
+	for _, receipt := range batch.Receipts {
+		if strings.TrimSpace(receipt.BindingID) == "" ||
+			strings.TrimSpace(receipt.Target.Platform) == "" ||
+			strings.TrimSpace(receipt.Target.InstanceID) == "" ||
+			strings.TrimSpace(receipt.Target.ChatID) == "" {
+			return nil, nil, fmt.Errorf("%w: creative delivery target identity is incomplete", records.ErrIllegalTransition)
+		}
+		key := deliveryEnvelopeTargetKey(receipt)
+		if _, exists := byTarget[key]; !exists {
+			targetOrder = append(targetOrder, key)
+		}
+		byTarget[key] = append(byTarget[key], receipt)
+	}
+	groups := make([][]k12.DeliveryReceipt, 0, len(targetOrder))
+	for _, key := range targetOrder {
+		parts := byTarget[key]
+		if len(parts) == 0 {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(parts[0].Target.Platform)) != "dingtalk" {
+			continue
+		}
+		if err := validateCreativeDeliveryTargetIntegrity(batch, parts); err != nil {
+			return nil, nil, err
+		}
+		group := make([]k12.DeliveryReceipt, 0, len(parts))
+		for _, receipt := range parts {
+			switch {
+			case receipt.PartKind == messagecontent.PartMarkdown && receipt.PartOrdinal == 1:
+				if len(group) != 0 {
+					return nil, nil, fmt.Errorf("%w: creative delivery envelope has duplicate or unordered Markdown", records.ErrIllegalTransition)
+				}
+				group = append(group, receipt)
+			case receipt.PartKind == messagecontent.PartArtifact && strings.HasPrefix(receipt.PartMIME, "image/"):
+				if len(group) == 0 || receipt.PartOrdinal != len(group)+1 {
+					return nil, nil, fmt.Errorf("%w: creative delivery envelope image order is invalid", records.ErrIllegalTransition)
+				}
+				group = append(group, receipt)
+			case receipt.PartKind == messagecontent.PartArtifact && receipt.PartMIME == "application/pdf":
+				// PDF 继续沿用独立 sampleFile 投递，不进入作品图文卡片。
+			default:
+				return nil, nil, fmt.Errorf("%w: creative delivery envelope contains an unsupported component", records.ErrIllegalTransition)
+			}
+		}
+		if len(group) == 0 {
+			return nil, nil, fmt.Errorf("%w: creative delivery envelope has no Markdown component", records.ErrIllegalTransition)
+		}
+		expectedArtifacts, known, err := creativeEnvelopeArtifactExpectations(group[0])
+		if err != nil {
+			return nil, nil, err
+		}
+		if known {
+			if len(parts) != len(expectedArtifacts)+1 {
+				return nil, nil, fmt.Errorf("%w: creative delivery artifact component count diverged", records.ErrIllegalTransition)
+			}
+			expectedImageCount := 0
+			for i, expected := range expectedArtifacts {
+				actual := parts[i+1]
+				if actual.PartKind != messagecontent.PartArtifact ||
+					actual.PartOrdinal != expected.ordinal ||
+					strings.ToLower(strings.TrimSpace(actual.PartMIME)) != expected.mime ||
+					actual.PartDigest != expected.digest {
+					return nil, nil, fmt.Errorf("%w: creative delivery artifact component identity diverged", records.ErrIllegalTransition)
+				}
+				if expected.image {
+					expectedImageCount++
+				}
+			}
+			if len(group) != expectedImageCount+1 {
+				return nil, nil, fmt.Errorf("%w: creative delivery envelope image component count diverged", records.ErrIllegalTransition)
+			}
+		}
+		if len(group) < 2 {
+			continue
+		}
+		first := group[0]
+		for _, receipt := range group[1:] {
+			if receipt.Status != first.Status || receipt.Attempt != first.Attempt ||
+				receipt.ExternalMessageID != first.ExternalMessageID || receipt.LastError != first.LastError {
+				return nil, nil, fmt.Errorf("%w: creative delivery envelope component state diverged", records.ErrIllegalTransition)
+			}
+		}
+		for _, receipt := range group {
+			groupedIDs[receipt.DeliveryID] = struct{}{}
+		}
+		groups = append(groups, group)
+	}
+	return groups, groupedIDs, nil
+}
+
+func deliveryReceiptIDs(receipts []k12.DeliveryReceipt) []string {
+	ids := make([]string, 0, len(receipts))
+	for _, receipt := range receipts {
+		ids = append(ids, receipt.DeliveryID)
+	}
+	return ids
+}
+
+func (d Deps) sendPreparedDeliveryEnvelope(
+	ctx context.Context,
+	batch k12.DeliveryBatch,
+	receipts []k12.DeliveryReceipt,
+) ([]k12.DeliveryReceipt, error) {
+	transport, ok := d.Delivery.(DeliveryEnvelopeTransport)
+	if !ok {
+		return receipts, fmt.Errorf("%w: creative delivery envelope transport unavailable", ErrDeliveryUnavailable)
+	}
+	for _, receipt := range receipts {
+		if receipt.PartKind == messagecontent.PartArtifact && strings.TrimSpace(receipt.PreparedResourceID) == "" {
+			return receipts, fmt.Errorf("%w: creative delivery envelope image has no prepared provider resource", records.ErrIllegalTransition)
+		}
+	}
+	preflight, ok := d.Delivery.(DeliveryEnvelopePreflightTransport)
+	if !ok {
+		return receipts, fmt.Errorf("%w: creative delivery envelope preflight unavailable", ErrDeliveryUnavailable)
+	}
+	if err := preflight.PreflightPreparedEnvelope(ctx, receipts); err != nil {
+		return receipts, err
+	}
+	started, began, err := d.Records.BeginDeliveryGroupAttempt(ctx, batch, receipts)
+	if err != nil {
+		return receipts, err
+	}
+	if !began {
+		return started, nil
+	}
+	ack, sendErr := transport.SendPreparedEnvelope(ctx, started)
+	return d.persistDeliveryEnvelopeSendOutcome(context.WithoutCancel(ctx), started, ack, sendErr)
+}
+
+func (d Deps) persistDeliveryEnvelopeSendOutcome(
+	ctx context.Context,
+	receipts []k12.DeliveryReceipt,
+	ack DeliveryTransportAck,
+	sendErr error,
+) ([]k12.DeliveryReceipt, error) {
+	ids := deliveryReceiptIDs(receipts)
+	if id := strings.TrimSpace(ack.ExternalMessageID); id != "" {
+		accepted, err := d.Records.MarkDeliveryGroupAccepted(ctx, receipts[0].AgentName, ids, id)
+		if err != nil {
+			return receipts, err
+		}
+		receipts = accepted
+	}
+	status := ack.Status
+	if status == "" {
+		if errors.Is(sendErr, context.Canceled) || errors.Is(sendErr, context.DeadlineExceeded) {
+			status = k12.DeliveryOutcomeUnknown
+		} else {
+			status = k12.DeliveryFailed
+		}
+	}
+	switch status {
+	case k12.DeliverySending:
+		if receipts[0].ExternalMessageID == "" {
+			return d.Records.MarkDeliveryGroupOutcomeUnknown(ctx, receipts[0].AgentName, ids,
+				deliveryFailureDetail(ack, sendErr, "provider accepted the envelope without a query id"))
+		}
+		return receipts, nil
+	case k12.DeliveryDelivered:
+		if receipts[0].ExternalMessageID == "" {
+			return d.Records.MarkDeliveryGroupOutcomeUnknown(ctx, receipts[0].AgentName, ids,
+				"provider reported delivery without a verifiable message id")
+		}
+		return d.Records.MarkDeliveryGroupDelivered(ctx, receipts[0].AgentName, ids)
+	case k12.DeliveryFailed:
+		return d.Records.MarkDeliveryGroupFailed(ctx, receipts[0].AgentName, ids,
+			deliveryFailureDetail(ack, sendErr, "provider rejected the creative delivery envelope"))
+	case k12.DeliveryOutcomeUnknown:
+		return d.Records.MarkDeliveryGroupOutcomeUnknown(ctx, receipts[0].AgentName, ids,
+			deliveryFailureDetail(ack, sendErr, "creative delivery envelope outcome is unknown"))
+	default:
+		return d.Records.MarkDeliveryGroupOutcomeUnknown(ctx, receipts[0].AgentName, ids,
+			fmt.Sprintf("provider returned unknown envelope delivery status %q", status))
+	}
+}
+
+func (d Deps) queryPreparedDeliveryEnvelope(
+	ctx context.Context,
+	receipts []k12.DeliveryReceipt,
+) ([]k12.DeliveryReceipt, error) {
+	first := receipts[0]
+	if first.Status == k12.DeliveryDelivered || first.Status == k12.DeliveryFailed {
+		return receipts, nil
+	}
+	transport, ok := d.Delivery.(DeliveryEnvelopeTransport)
+	if !ok {
+		return receipts, fmt.Errorf("%w: creative delivery envelope query unavailable", ErrDeliveryQueryUnavailable)
+	}
+	if first.Status != k12.DeliverySending && first.Status != k12.DeliveryOutcomeUnknown {
+		return receipts, fmt.Errorf("%w: creative delivery envelope status %s does not need a query", records.ErrIllegalTransition, first.Status)
+	}
+	if strings.TrimSpace(first.ExternalMessageID) == "" {
+		return receipts, fmt.Errorf("%w: creative delivery envelope has no query id", ErrDeliveryQueryUnavailable)
+	}
+	ack, queryErr := transport.QueryPreparedEnvelope(ctx, receipts)
+	if ack.ExternalMessageID == "" {
+		ack.ExternalMessageID = first.ExternalMessageID
+	}
+	ids := deliveryReceiptIDs(receipts)
+	if queryErr != nil || ack.Status == k12.DeliveryOutcomeUnknown || ack.Status == "" {
+		if first.Status == k12.DeliverySending {
+			return d.Records.MarkDeliveryGroupOutcomeUnknown(ctx, first.AgentName, ids,
+				deliveryFailureDetail(ack, queryErr, "creative delivery envelope result is not available yet"))
+		}
+		return receipts, nil
+	}
+	switch ack.Status {
+	case k12.DeliverySending:
+		return d.Records.ReconcileDeliveryGroup(ctx, first.AgentName, ids,
+			k12.DeliverySending, ack.ExternalMessageID, "")
+	case k12.DeliveryDelivered:
+		return d.Records.ReconcileDeliveryGroup(ctx, first.AgentName, ids,
+			k12.DeliveryDelivered, ack.ExternalMessageID, "")
+	case k12.DeliveryFailed:
+		return d.Records.ReconcileDeliveryGroup(ctx, first.AgentName, ids,
+			k12.DeliveryFailed, ack.ExternalMessageID,
+			deliveryFailureDetail(ack, queryErr, "provider confirmed the creative delivery envelope failed"))
+	default:
+		return receipts, fmt.Errorf("%w: unknown creative delivery envelope query status %q", ErrInvalidInput, ack.Status)
+	}
+}
+
+func (d Deps) creativeDeliveryEnvelopeForReceipt(
+	ctx context.Context,
+	receipt k12.DeliveryReceipt,
+) ([]k12.DeliveryReceipt, bool, error) {
+	if receipt.BatchID == "" || receipt.ObjectKind != "creative_work" {
+		return nil, false, nil
+	}
+	batch, err := d.Records.GetDeliveryBatch(ctx, receipt.AgentName, receipt.BatchID)
+	if err != nil {
+		return nil, false, err
+	}
+	groups, groupedIDs, err := creativeDeliveryEnvelopeGroups(batch)
+	if err != nil {
+		return nil, false, err
+	}
+	if _, grouped := groupedIDs[receipt.DeliveryID]; !grouped {
+		return nil, false, nil
+	}
+	for _, group := range groups {
+		for _, component := range group {
+			if component.DeliveryID == receipt.DeliveryID {
+				return group, true, nil
+			}
+		}
+	}
+	return nil, false, fmt.Errorf("%w: creative delivery envelope group is missing", records.ErrIllegalTransition)
+}
+
 func (d Deps) sendPreparedDelivery(ctx context.Context, receipt k12.DeliveryReceipt) (k12.DeliveryReceipt, error) {
 	if receipt.PartKind == messagecontent.PartArtifact && strings.TrimSpace(receipt.PreparedResourceID) == "" {
 		return receipt, fmt.Errorf("%w: artifact part has no prepared provider resource", records.ErrIllegalTransition)
@@ -910,6 +1484,17 @@ func (d Deps) QueryDeliveryReceipt(ctx context.Context, agentName, deliveryID st
 	if err != nil {
 		return k12.DeliveryReceipt{}, err
 	}
+	if group, grouped, groupErr := d.creativeDeliveryEnvelopeForReceipt(ctx, receipt); groupErr != nil {
+		return receipt, groupErr
+	} else if grouped {
+		updated, queryErr := d.queryPreparedDeliveryEnvelope(ctx, group)
+		for _, component := range updated {
+			if component.DeliveryID == receipt.DeliveryID {
+				return component, queryErr
+			}
+		}
+		return receipt, queryErr
+	}
 	if receipt.Status == k12.DeliveryDelivered || receipt.Status == k12.DeliveryFailed {
 		return receipt, nil
 	}
@@ -965,12 +1550,38 @@ func (d Deps) RecoverDeliveryReceipts(ctx context.Context, agentName string) (in
 		}
 	}
 	handledPendingBatches := make(map[string]struct{}, len(pendingBatchCounts))
+	handledEnvelopeGroups := make(map[string]struct{})
 	processed := 0
 	for _, receipt := range receipts {
 		select {
 		case <-ctx.Done():
 			return processed, ctx.Err()
 		default:
+		}
+		group, grouped, groupErr := d.creativeDeliveryEnvelopeForReceipt(ctx, receipt)
+		if groupErr != nil {
+			return processed, groupErr
+		}
+		if grouped && receipt.Status != k12.DeliveryPending {
+			groupKey := group[0].DeliveryID
+			if _, handled := handledEnvelopeGroups[groupKey]; handled {
+				continue
+			}
+			handledEnvelopeGroups[groupKey] = struct{}{}
+			if group[0].Status == k12.DeliverySending && group[0].ExternalMessageID == "" {
+				_, err = d.Records.MarkDeliveryGroupOutcomeUnknown(
+					ctx, group[0].AgentName, deliveryReceiptIDs(group),
+					"application restart found no query id for the creative delivery envelope",
+				)
+			} else if (group[0].Status == k12.DeliverySending || group[0].Status == k12.DeliveryOutcomeUnknown) &&
+				group[0].ExternalMessageID != "" {
+				_, err = d.queryPreparedDeliveryEnvelope(ctx, group)
+			}
+			if err != nil && !errors.Is(err, ErrDeliveryQueryUnavailable) {
+				return processed, err
+			}
+			processed += len(group)
+			continue
 		}
 		switch receipt.Status {
 		case k12.DeliveryPending:

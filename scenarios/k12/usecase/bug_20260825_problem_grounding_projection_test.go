@@ -207,7 +207,8 @@ func TestK12ProblemGroundingProjectionPublishesMultiChunkSolveGradeExactSet(t *t
 }
 
 // 公开 operation exact-set 跟随已持久的 assessment 状态：可判分题
-// 为 solve+grade，out_of_scope 只有 solve，unanswered/unclear 不得调用 Provider。
+// 为 solve+grade；本用例中由 Provider 返回的 out_of_scope 只有 solve；
+// unanswered/unclear 不得调用 Provider。
 func TestK12ProblemGroundingProjectionUsesAssessmentStatusOperationExactSet(t *testing.T) {
 	const outOfScopeProblem = "999+1="
 	grounding := &gradingItemPinnedGrounding{active: "revision-a"}

@@ -24,12 +24,34 @@ import (
 )
 
 type httpBatchTransport struct {
-	targets []usecase.ResolvedDeliveryTarget
-	send    []usecase.DeliveryTransportAck
-	query   []usecase.DeliveryTransportAck
-	sends   []k12.DeliveryReceipt
-	queries []k12.DeliveryReceipt
-	content []string
+	targets            []usecase.ResolvedDeliveryTarget
+	send               []usecase.DeliveryTransportAck
+	query              []usecase.DeliveryTransportAck
+	sends              []k12.DeliveryReceipt
+	envelopePreflights [][]k12.DeliveryReceipt
+	envelopeSends      [][]k12.DeliveryReceipt
+	queries            []k12.DeliveryReceipt
+	envelopeQueries    [][]k12.DeliveryReceipt
+	content            []string
+}
+
+// PreflightPreparedEnvelope 使用生产通道校验器核验测试夹具的完整 canonical 证据。
+func (f *httpBatchTransport) PreflightPreparedEnvelope(
+	_ context.Context,
+	receipts []k12.DeliveryReceipt,
+) error {
+	frozen := append([]k12.DeliveryReceipt(nil), receipts...)
+	f.envelopePreflights = append(f.envelopePreflights, frozen)
+	parts := make([]channel.DeliveryPart, 0, len(frozen))
+	for _, receipt := range frozen {
+		var part channel.DeliveryPart
+		if err := json.Unmarshal([]byte(receipt.PayloadJSON), &part); err != nil {
+			return err
+		}
+		part.PreparedResourceID = receipt.PreparedResourceID
+		parts = append(parts, part)
+	}
+	return (channel.PreparedEnvelope{Parts: parts}).Validate()
 }
 
 func (f *httpBatchTransport) ResolveTextTargets(context.Context, string) ([]usecase.ResolvedDeliveryTarget, error) {
@@ -72,56 +94,26 @@ func (f *httpBatchTransport) PrepareMessageForTargets(
 	if err != nil {
 		return nil, err
 	}
+	parts, err := frozen.DeliveryParts()
+	if err != nil {
+		return nil, err
+	}
 	render, err := json.Marshal(frozen.RenderManifest)
 	if err != nil {
 		return nil, err
 	}
-	type frozenPartIdentity struct {
-		Kind    messagecontent.PartKind `json:"kind"`
-		MIME    string                  `json:"mime,omitempty"`
-		Ordinal int                     `json:"ordinal"`
-		Digest  string                  `json:"digest"`
-	}
-	type frozenPartPayload struct {
-		channel.Message
-		DeliveryPart frozenPartIdentity `json:"_delivery_part"`
-	}
-	digestBytes := func(value []byte) string {
-		sum := sha256.Sum256(value)
-		return fmt.Sprintf("sha256:%x", sum)
-	}
-	build := func(kind messagecontent.PartKind, mime string, ordinal int, digest string) (string, error) {
-		payload, marshalErr := json.Marshal(frozenPartPayload{
-			Message: frozen,
-			DeliveryPart: frozenPartIdentity{
-				Kind: kind, MIME: mime, Ordinal: ordinal, Digest: digest,
-			},
-		})
-		return string(payload), marshalErr
-	}
-	markdownDigest := digestBytes([]byte(strings.TrimSpace(message.Content)))
-	out := make([]usecase.PreparedTextDelivery, 0, len(targets)*(len(message.Attachments)+1))
+	out := make([]usecase.PreparedTextDelivery, 0, len(targets)*len(parts))
 	for _, target := range targets {
-		payload, marshalErr := build(messagecontent.PartMarkdown, "", 1, markdownDigest)
-		if marshalErr != nil {
-			return nil, marshalErr
-		}
-		out = append(out, usecase.PreparedTextDelivery{
-			BindingID: target.BindingID, Target: target.Target,
-			PartKind: messagecontent.PartMarkdown, PartOrdinal: 1, PartDigest: markdownDigest,
-			PayloadJSON: string(payload), RenderJSON: string(render),
-		})
-		for i, attachment := range message.Attachments {
-			digest := digestBytes(attachment.Data)
-			payload, marshalErr = build(messagecontent.PartArtifact, attachment.MIME, i+2, digest)
+		for _, part := range parts {
+			payload, marshalErr := json.Marshal(part)
 			if marshalErr != nil {
 				return nil, marshalErr
 			}
 			out = append(out, usecase.PreparedTextDelivery{
 				BindingID: target.BindingID, Target: target.Target,
-				PartKind: messagecontent.PartArtifact, PartMIME: attachment.MIME,
-				PartOrdinal: i + 2, PartDigest: digest,
-				PayloadJSON: payload, RenderJSON: string(render),
+				PartKind: part.Kind, PartMIME: part.MIME,
+				PartOrdinal: part.Ordinal, PartDigest: part.Digest,
+				PayloadJSON: string(payload), RenderJSON: string(render),
 			})
 		}
 	}
@@ -138,6 +130,7 @@ func (*httpBatchTransport) PrepareDeliveryPartResource(
 func newCreativeWorkDeliveryHTTPFixture(
 	t *testing.T,
 	delivery usecase.DeliveryTransport,
+	options ...assembly.Option,
 ) (*assembly.K12, http.Handler) {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:")
@@ -151,11 +144,8 @@ func newCreativeWorkDeliveryHTTPFixture(
 	if _, err := db.Exec(`INSERT INTO agents(name) VALUES('mingming'),('other')`); err != nil {
 		t.Fatal(err)
 	}
-	runtime, err := assembly.Wire(
-		db,
-		fakeSolveExec{},
-		assembly.WithDeliveryTransport(delivery),
-	)
+	options = append([]assembly.Option{assembly.WithDeliveryTransport(delivery)}, options...)
+	runtime, err := assembly.Wire(db, fakeSolveExec{}, options...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,6 +231,26 @@ func (f *httpBatchTransport) SendPrepared(
 	return ack, ack.Err
 }
 
+// SendPreparedEnvelope 暴露每个物理目标的一次组合发送，组件行仍分别持久化。
+func (f *httpBatchTransport) SendPreparedEnvelope(
+	_ context.Context,
+	receipts []k12.DeliveryReceipt,
+) (usecase.DeliveryTransportAck, error) {
+	f.envelopeSends = append(
+		f.envelopeSends,
+		append([]k12.DeliveryReceipt(nil), receipts...),
+	)
+	if len(f.send) == 0 {
+		return usecase.DeliveryTransportAck{
+			Status:            k12.DeliveryDelivered,
+			ExternalMessageID: fmt.Sprintf("http-envelope-%d", len(f.envelopeSends)),
+		}, nil
+	}
+	ack := f.send[0]
+	f.send = f.send[1:]
+	return ack, ack.Err
+}
+
 func (f *httpBatchTransport) QueryPrepared(
 	_ context.Context,
 	receipt k12.DeliveryReceipt,
@@ -249,6 +259,45 @@ func (f *httpBatchTransport) QueryPrepared(
 	ack := f.query[0]
 	f.query = f.query[1:]
 	return ack, ack.Err
+}
+
+func (f *httpBatchTransport) QueryPreparedEnvelope(
+	_ context.Context,
+	receipts []k12.DeliveryReceipt,
+) (usecase.DeliveryTransportAck, error) {
+	f.envelopeQueries = append(
+		f.envelopeQueries,
+		append([]k12.DeliveryReceipt(nil), receipts...),
+	)
+	ack := f.query[0]
+	f.query = f.query[1:]
+	return ack, ack.Err
+}
+
+func assertHTTPCompositeEnvelopeSends(
+	t *testing.T,
+	delivery *httpBatchTransport,
+	want int,
+) {
+	t.Helper()
+	if len(delivery.envelopePreflights) != want ||
+		len(delivery.envelopeSends) != want || len(delivery.sends) != 0 {
+		t.Fatalf(
+			"creative physical sends: preflights=%d envelopes=%d want=%d legacy_part_sends=%d",
+			len(delivery.envelopePreflights), len(delivery.envelopeSends), want, len(delivery.sends),
+		)
+	}
+	for i, envelope := range delivery.envelopeSends {
+		preflight := delivery.envelopePreflights[i]
+		if len(preflight) != len(envelope) {
+			t.Fatalf("creative physical envelope %d preflight parts=%d sends=%d", i, len(preflight), len(envelope))
+		}
+		if len(envelope) != 2 || envelope[0].BindingID != envelope[1].BindingID ||
+			envelope[0].PartKind != messagecontent.PartMarkdown || envelope[0].PartOrdinal != 1 ||
+			envelope[1].PartKind != messagecontent.PartArtifact || envelope[1].PartOrdinal != 2 {
+			t.Fatalf("creative physical envelope %d lost its ordered two component rows: %+v", i, envelope)
+		}
+	}
 }
 
 func httpBatchTargets() []usecase.ResolvedDeliveryTarget {
@@ -520,21 +569,26 @@ func TestCreativeWorkSendFreezesOriginalImageForEveryBoundTarget(t *testing.T) {
 		displayName string
 		workTitle   string
 		content     string
+		limitation  string
 	}{
 		{
 			name:     "artwork original",
 			workType: k12.WorkTypeArt, displayName: "美术作品",
-			workTitle: "雨后的家", content: "",
+			workTitle:  "雨后的家",
+			limitation: "仅依据本版本提交的可见画面进行观察，不评价能力高低",
 		},
 		{
 			name:     "writing photo original and canonical body",
 			workType: k12.WorkTypeWriting, displayName: "语文写作",
-			workTitle: "春天的校园", content: "柳枝像绿色的丝带",
+			workTitle:  "春天的校园",
+			content:    "柳枝像绿色的丝带",
+			limitation: "仅依据本版本提交的孩子原文进行观察，不评价能力高低",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
+			modelCalls := 0
 			delivery := &httpBatchTransport{
 				targets: httpBatchTargets(),
 				send: []usecase.DeliveryTransportAck{
@@ -542,7 +596,16 @@ func TestCreativeWorkSendFreezesOriginalImageForEveryBoundTarget(t *testing.T) {
 					{Status: k12.DeliveryDelivered, ExternalMessageID: "creative-b"},
 				},
 			}
-			runtime, handler := newCreativeWorkDeliveryHTTPFixture(t, delivery)
+			runtime, handler := newCreativeWorkDeliveryHTTPFixture(
+				t,
+				delivery,
+				assembly.WithWorkFeedbackGenerator(engineadapter.WorkFeedbackGenerateFunc(
+					func(context.Context, string, string, string) (string, error) {
+						modelCalls++
+						return "", fmt.Errorf("creative send must not call the model")
+					},
+				)),
+			)
 			original := tinyPNGBytes(t)
 			ready, err := (&usecase.PageAssetRepository{Records: runtime.Records}).Persist(
 				context.Background(), usecase.DefaultLocalOwnerScope, "mingming", original,
@@ -561,12 +624,20 @@ func TestCreativeWorkSendFreezesOriginalImageForEveryBoundTarget(t *testing.T) {
 			)
 			children, _ := batch["receipts"].([]any)
 			wantChildren := len(httpBatchTargets()) * 2
-			if rec.Code != http.StatusOK || len(children) != wantChildren ||
-				len(delivery.sends) != wantChildren {
+			if rec.Code != http.StatusOK || len(children) != wantChildren {
 				t.Fatalf(
-					"all-bound creative send: status=%d batch=%v receipts=%d sends=%d want=%d",
-					rec.Code, batch, len(children), len(delivery.sends), wantChildren,
+					"all-bound creative send: status=%d batch=%v receipts=%d want=%d",
+					rec.Code, batch, len(children), wantChildren,
 				)
+			}
+			if len(delivery.envelopeSends) != len(httpBatchTargets()) || len(delivery.sends) != 0 {
+				t.Errorf(
+					"creative work must send one physical envelope per target: envelopes=%d want=%d legacy_part_sends=%d",
+					len(delivery.envelopeSends), len(httpBatchTargets()), len(delivery.sends),
+				)
+			}
+			if modelCalls != 0 {
+				t.Errorf("creative send called the model %d times; want zero", modelCalls)
 			}
 			if len(delivery.content) != 1 {
 				t.Fatalf("creative work must freeze one shared payload, preparations=%d", len(delivery.content))
@@ -579,71 +650,137 @@ func TestCreativeWorkSendFreezesOriginalImageForEveryBoundTarget(t *testing.T) {
 					t.Errorf("delivery body missing canonical work evidence %q: %q", expected, delivery.content[0])
 				}
 			}
+			wantHeadings := []string{
+				"可见证据",
+				"先这样肯定",
+				"家长可以这样问或讲",
+				"下一次只试一个点",
+			}
+			var headings []string
+			for _, line := range strings.Split(delivery.content[0], "\n") {
+				if strings.HasPrefix(line, "## ") {
+					headings = append(headings, strings.TrimSpace(strings.TrimPrefix(line, "## ")))
+				}
+			}
+			if strings.Join(headings, "|") != strings.Join(wantHeadings, "|") {
+				t.Errorf("creative markdown H2 sequence=%v want=%v", headings, wantHeadings)
+			}
+			if strings.Contains(delivery.content[0], "## 说明") {
+				t.Errorf("creative limitation must be light text rather than an H2: %q", delivery.content[0])
+			}
+			lastH2 := strings.LastIndex(delivery.content[0], "## 下一次只试一个点")
+			limitation := strings.LastIndex(delivery.content[0], tt.limitation)
+			if lastH2 < 0 || limitation <= lastH2 {
+				t.Errorf("creative limitation must follow the four fixed H2 sections: %q", delivery.content[0])
+			}
 
 			wantDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(original))
+			batchID, ok := batch["batch_id"].(string)
+			if !ok || batchID == "" {
+				t.Fatalf("creative response has no batch_id: %v", batch)
+			}
+			stored, err := runtime.Deps.GetDeliveryBatch(context.Background(), "mingming", batchID)
+			if err != nil {
+				t.Fatalf("load frozen creative batch: %v", err)
+			}
+			if len(stored.Receipts) != wantChildren {
+				t.Fatalf("stored creative component rows=%d want=%d: %+v", len(stored.Receipts), wantChildren, stored)
+			}
+			seenExternal := make(map[string]struct{}, len(httpBatchTargets()))
 			firstPayloadByPart := make(map[int]string, 2)
-			wantInstances := []string{"bot-a", "bot-b"}
-			for i, sent := range delivery.sends {
-				targetIndex := i / 2
-				partIndex := i % 2
-				if sent.Target.InstanceID != wantInstances[targetIndex] {
-					t.Errorf("child %d target=%q want %q", i, sent.Target.InstanceID, wantInstances[targetIndex])
+			for targetIndex, target := range httpBatchTargets() {
+				group := make([]k12.DeliveryReceipt, 0, 2)
+				for _, receipt := range stored.Receipts {
+					if receipt.BindingID == target.BindingID {
+						group = append(group, receipt)
+					}
 				}
-				wantKind := messagecontent.PartMarkdown
-				wantMIME := ""
-				if partIndex == 1 {
-					wantKind = messagecontent.PartArtifact
-					wantMIME = "image/png"
+				if len(group) != 2 {
+					t.Fatalf("target %s component rows=%d want=2: %+v", target.BindingID, len(group), group)
 				}
-				if sent.PartKind != wantKind || sent.PartMIME != wantMIME || sent.PartOrdinal != partIndex+1 {
-					t.Errorf("child %d part identity drift: %+v", i, sent)
+				markdown, image := group[0], group[1]
+				if markdown.Target.InstanceID != target.Target.InstanceID || image.Target.InstanceID != target.Target.InstanceID ||
+					markdown.PartKind != messagecontent.PartMarkdown || markdown.PartOrdinal != 1 ||
+					image.PartKind != messagecontent.PartArtifact || image.PartMIME != "image/png" || image.PartOrdinal != 2 {
+					t.Errorf("target %s lost ordered markdown + final image identity: %+v", target.BindingID, group)
 				}
-				if partIndex == 1 && sent.PreparedResourceID == "" {
-					t.Errorf("child %d artifact has no prepared provider resource", i)
+				if image.PreparedResourceID == "" {
+					t.Errorf("target %s artifact has no prepared provider resource", target.BindingID)
 				}
-				if first, exists := firstPayloadByPart[partIndex]; !exists {
-					firstPayloadByPart[partIndex] = sent.PayloadJSON
-				} else if sent.PayloadJSON != first {
-					t.Errorf("target %d changed frozen part %d payload", targetIndex, partIndex+1)
+				if markdown.Attempt != 1 || image.Attempt != 1 ||
+					markdown.Status != k12.DeliveryDelivered || image.Status != k12.DeliveryDelivered ||
+					markdown.ExternalMessageID == "" || markdown.ExternalMessageID != image.ExternalMessageID ||
+					markdown.LastError != image.LastError {
+					t.Errorf("target %s component state is not one atomic envelope: %+v", target.BindingID, group)
+				} else {
+					if _, duplicate := seenExternal[markdown.ExternalMessageID]; duplicate {
+						t.Errorf("different targets shared external_message_id %q", markdown.ExternalMessageID)
+					}
+					seenExternal[markdown.ExternalMessageID] = struct{}{}
 				}
-				if strings.Contains(sent.PayloadJSON, assetstore.IDPrefix) {
-					t.Errorf("recipient %d payload leaked asset://: %s", i, sent.PayloadJSON)
+				for partIndex, sent := range group {
+					if first, exists := firstPayloadByPart[partIndex]; !exists {
+						firstPayloadByPart[partIndex] = sent.PayloadJSON
+					} else if sent.PayloadJSON != first {
+						t.Errorf("target %d changed frozen part %d payload", targetIndex, partIndex+1)
+					}
+					if strings.Contains(sent.PayloadJSON, assetstore.IDPrefix) {
+						t.Errorf("target %d payload leaked asset://: %s", targetIndex, sent.PayloadJSON)
+					}
+					var frozen channel.DeliveryPart
+					if err := json.Unmarshal([]byte(sent.PayloadJSON), &frozen); err != nil {
+						t.Errorf("target %d payload is not a canonical delivery part: %v", targetIndex, err)
+						continue
+					}
+					if frozen.Kind != sent.PartKind || frozen.MIME != sent.PartMIME ||
+						frozen.Ordinal != sent.PartOrdinal || frozen.Digest != sent.PartDigest {
+						t.Errorf("target %d canonical part identity drift: payload=%+v receipt=%+v", targetIndex, frozen, sent)
+					}
+					if frozen.MessageContent == nil || strings.Contains(frozen.MessageContent.Markdown, assetstore.IDPrefix) ||
+						len(frozen.MessageContent.Attachments) != 1 {
+						t.Errorf("target %d canonical content missing or leaked internal asset: %#v", targetIndex, frozen.MessageContent)
+						continue
+					}
+					ref := frozen.MessageContent.Attachments[0]
+					if ref.Digest != wantDigest || ref.MIME != "image/png" || !strings.HasSuffix(ref.Name, ".png") {
+						t.Errorf("target %d canonical attachment ref drift: %#v", targetIndex, ref)
+					}
+					if frozen.RenderManifest == nil ||
+						!frozen.RenderManifest.CapabilitySnapshot.Attachments ||
+						len(frozen.RenderManifest.Parts) != 2 ||
+						frozen.RenderManifest.Parts[0].Kind != messagecontent.PartMarkdown ||
+						frozen.RenderManifest.Parts[1].Kind != messagecontent.PartArtifact ||
+						frozen.RenderManifest.Parts[1].ArtifactDigest != wantDigest {
+						t.Errorf("target %d render manifest did not freeze markdown followed by final original image: %#v", targetIndex, frozen.RenderManifest)
+					}
+					switch frozen.Kind {
+					case messagecontent.PartMarkdown:
+						if frozen.Text != delivery.content[0] || frozen.Attachment != nil {
+							t.Errorf("target %d Markdown part projection drift: %+v", targetIndex, frozen)
+						}
+					case messagecontent.PartArtifact:
+						if frozen.Attachment == nil || frozen.Attachment.MIME != "image/png" ||
+							!strings.HasSuffix(frozen.Attachment.Name, ".png") ||
+							!bytes.Equal(frozen.Attachment.Data, original) {
+							t.Errorf("target %d original attachment drift: %#v", targetIndex, frozen.Attachment)
+						}
+					}
 				}
-				var frozen channel.Message
-				if err := json.Unmarshal([]byte(sent.PayloadJSON), &frozen); err != nil {
-					t.Errorf("recipient %d payload is not a channel message: %v", i, err)
-					continue
-				}
-				if len(frozen.Attachments) != 1 {
-					t.Errorf("recipient %d attachments=%d want one original image", i, len(frozen.Attachments))
-					continue
-				}
-				attachment := frozen.Attachments[0]
-				if attachment.MIME != "image/png" ||
-					!strings.HasSuffix(attachment.Name, ".png") ||
-					!bytes.Equal(attachment.Data, original) {
-					t.Errorf("recipient %d original attachment drift: %#v", i, attachment)
-				}
-				if frozen.Content == nil || strings.Contains(frozen.Content.Markdown, assetstore.IDPrefix) ||
-					len(frozen.Content.Attachments) != 1 {
-					t.Errorf("recipient %d canonical content missing or leaked internal asset: %#v", i, frozen.Content)
-					continue
-				}
-				ref := frozen.Content.Attachments[0]
-				if ref.Digest != wantDigest || ref.Name != attachment.Name || ref.MIME != attachment.MIME {
-					t.Errorf("recipient %d canonical attachment ref drift: %#v", i, ref)
-				}
-				if frozen.RenderManifest == nil ||
-					!frozen.RenderManifest.CapabilitySnapshot.Attachments ||
-					len(frozen.RenderManifest.Parts) != 2 ||
-					frozen.RenderManifest.Parts[0].Kind != messagecontent.PartMarkdown ||
-					frozen.RenderManifest.Parts[1].Kind != messagecontent.PartArtifact ||
-					frozen.RenderManifest.Parts[1].ArtifactDigest != wantDigest {
-					t.Errorf("recipient %d render manifest did not freeze markdown + original artifact: %#v", i, frozen.RenderManifest)
-				}
+			}
+			if len(seenExternal) != len(httpBatchTargets()) {
+				t.Errorf("unique physical external IDs=%d want=%d", len(seenExternal), len(httpBatchTargets()))
 			}
 			if firstPayloadByPart[0] == firstPayloadByPart[1] {
 				t.Error("markdown and artifact receipts must have independent payload identities")
+			}
+			if len(delivery.envelopeSends) == len(httpBatchTargets()) {
+				for i, envelope := range delivery.envelopeSends {
+					if len(envelope) != 2 || envelope[0].BindingID != envelope[1].BindingID ||
+						envelope[0].PartOrdinal != 1 || envelope[1].PartOrdinal != 2 ||
+						envelope[1].PartKind != messagecontent.PartArtifact {
+						t.Errorf("physical envelope %d did not receive one target's ordered markdown + final image: %+v", i, envelope)
+					}
+				}
 			}
 
 			replayRec, replay := do(
@@ -651,10 +788,10 @@ func TestCreativeWorkSendFreezesOriginalImageForEveryBoundTarget(t *testing.T) {
 				`{"agent":"mingming"}`,
 			)
 			if replayRec.Code != http.StatusOK || replay["batch_id"] != batch["batch_id"] ||
-				len(delivery.sends) != wantChildren {
+				len(delivery.envelopeSends) != len(httpBatchTargets()) || len(delivery.sends) != 0 || modelCalls != 0 {
 				t.Errorf(
-					"attachment replay changed batch or resent: status=%d first=%v replay=%v sends=%d",
-					replayRec.Code, batch["batch_id"], replay["batch_id"], len(delivery.sends),
+					"attachment replay changed batch, resent, or called model: status=%d first=%v replay=%v envelopes=%d legacy=%d model_calls=%d",
+					replayRec.Code, batch["batch_id"], replay["batch_id"], len(delivery.envelopeSends), len(delivery.sends), modelCalls,
 				)
 			}
 		})
@@ -699,6 +836,7 @@ func TestCreativeWorkSendAssetReadFailureCreatesNoDelivery(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("HEXCLAW_ASSET_ROOT", t.TempDir())
+			modelCalls := 0
 			delivery := &httpBatchTransport{
 				targets: httpBatchTargets(),
 				send: []usecase.DeliveryTransportAck{
@@ -706,7 +844,16 @@ func TestCreativeWorkSendAssetReadFailureCreatesNoDelivery(t *testing.T) {
 					{Status: k12.DeliveryDelivered, ExternalMessageID: "must-not-send-b"},
 				},
 			}
-			runtime, handler := newCreativeWorkDeliveryHTTPFixture(t, delivery)
+			runtime, handler := newCreativeWorkDeliveryHTTPFixture(
+				t,
+				delivery,
+				assembly.WithWorkFeedbackGenerator(engineadapter.WorkFeedbackGenerateFunc(
+					func(context.Context, string, string, string) (string, error) {
+						modelCalls++
+						return "", fmt.Errorf("asset failure must not call the model")
+					},
+				)),
+			)
 			assetID := tt.prepareID(t, runtime)
 			workID := seedReadyCreativeWork(t, runtime, k12.WorkTypeArt, k12.CreativeWorkSourceSnapshot{
 				WorkType: k12.WorkTypeArt, DisplayName: "美术作品", WorkTitle: "雨后的家",
@@ -720,10 +867,19 @@ func TestCreativeWorkSendAssetReadFailureCreatesNoDelivery(t *testing.T) {
 			if rec.Code != tt.wantStatus {
 				t.Errorf("asset failure status=%d want=%d body=%v", rec.Code, tt.wantStatus, body)
 			}
-			if len(delivery.content) != 0 || len(delivery.sends) != 0 {
+			if batchID, exists := body["batch_id"]; exists && batchID != nil && batchID != "" {
+				t.Errorf("asset failure exposed a delivery batch id: %v", body)
+			}
+			var batches int
+			if err := runtime.Records.DB().QueryRow(`SELECT count(*) FROM k12_delivery_batches`).Scan(&batches); err != nil {
+				t.Fatalf("count delivery batches after asset failure: %v", err)
+			}
+			if batches != 0 || len(delivery.content) != 0 || len(delivery.envelopePreflights) != 0 ||
+				len(delivery.envelopeSends) != 0 ||
+				len(delivery.sends) != 0 || modelCalls != 0 {
 				t.Errorf(
-					"asset failure must stop before batch preparation/send: preparations=%d sends=%d",
-					len(delivery.content), len(delivery.sends),
+					"asset failure must stop before batch/preparation/preflight/send/model: batches=%d preparations=%d preflights=%d envelopes=%d legacy_sends=%d model_calls=%d",
+					batches, len(delivery.content), len(delivery.envelopePreflights), len(delivery.envelopeSends), len(delivery.sends), modelCalls,
 				)
 			}
 		})
@@ -768,16 +924,16 @@ func TestDeliveryBatchDigestIncludesAttachmentBytes(t *testing.T) {
 			first.BatchID, first.ContentDigest, second.BatchID, second.ContentDigest,
 		)
 	}
-	if len(delivery.sends) != 8 {
-		t.Fatalf("two attachment batches must send two parts to each of two targets, sends=%d", len(delivery.sends))
-	}
+	wantEnvelopeSends := 2 * len(httpBatchTargets())
+	assertHTTPCompositeEnvelopeSends(t, delivery, wantEnvelopeSends)
 	replayed, created, err := runtime.Deps.PrepareAndSendMessageBatch(
 		context.Background(), "mingming", "creative_work", "same-work", message("first-image"),
 	)
-	if err != nil || created || replayed.BatchID != first.BatchID || len(delivery.sends) != 8 {
+	if err != nil || created || replayed.BatchID != first.BatchID ||
+		len(delivery.envelopeSends) != wantEnvelopeSends || len(delivery.sends) != 0 {
 		t.Fatalf(
-			"identical attachment replay changed batch or resent: created=%v batch=%s want=%s sends=%d err=%v",
-			created, replayed.BatchID, first.BatchID, len(delivery.sends), err,
+			"identical attachment replay changed batch or resent: created=%v batch=%s want=%s envelopes=%d legacy=%d err=%v",
+			created, replayed.BatchID, first.BatchID, len(delivery.envelopeSends), len(delivery.sends), err,
 		)
 	}
 }

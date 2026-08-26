@@ -38,6 +38,7 @@ type publicImageTaskDispatch struct {
 	ProviderDisplayName       *string               `json:"provider_display_name"`
 	ModelID                   *string               `json:"model_id"`
 	Retryable                 bool                  `json:"retryable"`
+	FailureKind               *string               `json:"failure_kind,omitempty"`
 	IntentEvidence            []string              `json:"intent_evidence"`
 	IntentConfidence          float64               `json:"intent_confidence"`
 	ConfirmationCandidates    []k12.ImageTaskIntent `json:"confirmation_candidates"`
@@ -339,12 +340,23 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 	}
 	if dispatch.Status == k12.ImageTaskStatusFailed {
 		out.Retryable = dispatch.RetrySafe
+		out.FailureKind = publicImageTaskFailureKind(dispatch)
 		out.Progress.State = "failed"
 		if strings.Contains(dispatch.FailureKind, "outcome_unknown") {
 			out.Progress.State = "recovering"
 		}
 	}
 	return out
+}
+
+func publicImageTaskFailureKind(dispatch k12.ImageTaskDispatch) *string {
+	if dispatch.Status != k12.ImageTaskStatusFailed ||
+		strings.TrimSpace(dispatch.FailureKind) == "" ||
+		strings.Contains(dispatch.FailureKind, "outcome_unknown") {
+		return nil
+	}
+	failureKind := dispatch.FailureKind
+	return &failureKind
 }
 
 // publicGradingFinalArtifact 保留客户端所需的最终产物状态与 Markdown，
@@ -812,6 +824,9 @@ func (h *handler) getImageTaskResult(w http.ResponseWriter, r *http.Request) {
 		"source_attachments": result.SourceAttachments,
 		"operation_receipts": result.OperationReceipts,
 		"result":             projection,
+	}
+	if failureKind := publicImageTaskFailureKind(result.Dispatch); failureKind != nil {
+		response["failure_kind"] = *failureKind
 	}
 	if result.Dispatch.TargetObjectType == k12.ImageTaskTargetHomeworkSubmission {
 		response["grounding_evidence_receipts"] = result.GroundingEvidenceReceipts

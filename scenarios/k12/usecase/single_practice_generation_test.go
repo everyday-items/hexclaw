@@ -79,6 +79,29 @@ func (v *countingSinglePracticeValidator) Solve(
 	return singlePracticeValidator{}.Solve(context.Background(), "", "", "")
 }
 
+type weakSinglePracticeValidator struct {
+	calls  int
+	strong bool
+}
+
+func (v *weakSinglePracticeValidator) Solve(
+	_ context.Context,
+	_, _, _ string,
+) (usecase.SolveResult, error) {
+	v.calls++
+	evidenceType := usecase.EvidenceHeuristic
+	if v.strong {
+		evidenceType = usecase.EvidenceNumericExec
+	}
+	return usecase.SolveResult{
+		Solution: "## 解答\n同源模型复核\n\n## 答案\n10",
+		Evidence: usecase.SolveEvidence{
+			Verdict:      usecase.VerdictAgree,
+			EvidenceType: evidenceType,
+		},
+	}, nil
+}
+
 func singlePracticeTestDigest(parts ...[]byte) string {
 	h := sha256.New()
 	for _, part := range parts {
@@ -241,6 +264,118 @@ func TestSinglePracticeGeneration_FailureRetryReusesFrozenJobWithoutPublicPlaceh
 	)
 	if err != nil || joined.State != usecase.SinglePracticeJoined {
 		t.Fatalf("retry process: joined=%+v err=%v", joined, err)
+	}
+}
+
+func TestSinglePracticeGeneration_WeakValidationFailsOneClickWithoutHiddenSecondAttempt(t *testing.T) {
+	d := newDataDeps(t)
+	generator := &singlePracticeGenerator{}
+	validator := &weakSinglePracticeValidator{}
+	d.Solver = validator
+	d.PracticeVariant = generator
+	d.PracticeGenerationRoute = func(
+		_ context.Context,
+		_ k12.GradingModelSnapshot,
+	) (k12.GradingModelSnapshot, error) {
+		return k12.GradingModelSnapshot{
+			Provider: "provider-a", Model: "model-a", Route: "provider-a/model-a",
+			Capability: "text",
+		}, nil
+	}
+	sourceID := seedSinglePracticeMistake(t, d, "")
+	pending, err := d.StartSinglePracticeGeneration(
+		context.Background(), "xiaoming", sourceID,
+		singlePracticeRequest("single:"+sourceID+":weak-validation"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = d.ProcessSinglePracticeGeneration(
+		context.Background(), "xiaoming", pending.GenerationJobID,
+	); err == nil {
+		t.Fatal("weak validation unexpectedly committed a practice item")
+	}
+	if generator.calls != 1 || validator.calls != 1 {
+		t.Fatalf(
+			"one click must call generate and validate once each, got generator=%d validator=%d",
+			generator.calls, validator.calls,
+		)
+	}
+	invocations, err := d.Records.ListPracticeGenerationInvocations(
+		context.Background(), "xiaoming", pending.GenerationJobID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(invocations) != 2 ||
+		invocations[0].Attempt != 1 || invocations[1].Attempt != 1 ||
+		invocations[0].Status != k12.ModelInvocationSucceeded ||
+		invocations[1].Status != k12.ModelInvocationSucceeded {
+		t.Fatalf("one click created hidden provider attempts: %+v", invocations)
+	}
+}
+
+func TestSinglePracticeGeneration_ExplicitRetryAdvancesCheckpointAttempt(t *testing.T) {
+	d := newDataDeps(t)
+	generator := &singlePracticeGenerator{}
+	validator := &weakSinglePracticeValidator{}
+	d.Solver = validator
+	d.PracticeVariant = generator
+	d.PracticeGenerationRoute = func(
+		_ context.Context,
+		_ k12.GradingModelSnapshot,
+	) (k12.GradingModelSnapshot, error) {
+		return k12.GradingModelSnapshot{
+			Provider: "provider-a", Model: "model-a", Route: "provider-a/model-a",
+			Capability: "text",
+		}, nil
+	}
+	sourceID := seedSinglePracticeMistake(t, d, "")
+	pending, err := d.StartSinglePracticeGeneration(
+		context.Background(), "xiaoming", sourceID,
+		singlePracticeRequest("single:"+sourceID+":explicit-retry"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = d.ProcessSinglePracticeGeneration(
+		context.Background(), "xiaoming", pending.GenerationJobID,
+	); err == nil {
+		t.Fatal("weak validation unexpectedly committed a practice item")
+	}
+	validator.strong = true
+	requeued, err := d.RetrySinglePracticeGeneration(
+		context.Background(), "xiaoming", sourceID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined, err := d.ProcessSinglePracticeGeneration(
+		context.Background(), "xiaoming", requeued.GenerationJobID,
+	)
+	if err != nil || joined.State != usecase.SinglePracticeJoined {
+		t.Fatalf("explicit retry did not commit: view=%+v err=%v", joined, err)
+	}
+	if generator.calls != 2 || validator.calls != 2 {
+		t.Fatalf(
+			"explicit retry must authorize exactly one new attempt, got generator=%d validator=%d",
+			generator.calls, validator.calls,
+		)
+	}
+	invocations, err := d.Records.ListPracticeGenerationInvocations(
+		context.Background(), "xiaoming", pending.GenerationJobID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(invocations) != 4 {
+		t.Fatalf("explicit retry receipt count=%d receipts=%+v", len(invocations), invocations)
+	}
+	for _, invocation := range invocations {
+		if invocation.Status != k12.ModelInvocationSucceeded ||
+			(invocation.Attempt != 1 && invocation.Attempt != 2) {
+			t.Fatalf("explicit retry receipt did not converge: %+v", invocation)
+		}
 	}
 }
 

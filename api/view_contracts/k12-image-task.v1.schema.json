@@ -165,6 +165,11 @@
         "provider_display_name": { "type": ["string", "null"] },
         "model_id": { "type": ["string", "null"] },
         "retryable": { "type": "boolean" },
+        "failure_kind": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9](?:[a-z0-9_]*[a-z0-9])?$"
+        },
         "intent_evidence": { "type": "array", "items": { "type": "string" } },
         "intent_confidence": { "type": "number" },
         "confirmation_candidates": { "type": "array", "items": { "type": "string" } },
@@ -216,6 +221,11 @@
         "dispatch_id": { "type": "string", "minLength": 1 },
         "task_intent": { "enum": ["completed_homework", "blank_worksheet", "writing", "artwork", "unknown"] },
         "status": { "enum": ["routing", "awaiting_confirmation", "routed", "failed", "cancelled"] },
+        "failure_kind": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9](?:[a-z0-9_]*[a-z0-9])?$"
+        },
         "result": {
           "oneOf": [
             { "type": "null" },

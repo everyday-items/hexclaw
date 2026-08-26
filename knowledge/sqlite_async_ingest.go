@@ -1209,8 +1209,40 @@ func (r *SQLiteSemanticIndexRepository) SaveIngestPageCheckpoint(
 		}
 	}
 	if !equalIngestPageCheckpoints(existing, checkpoint) {
-		return fmt.Errorf("%w: conflicting immutable page checkpoint %d",
-			ErrInvalidDocumentUpload, checkpoint.PageNumber)
+		// 来源偏移是 canonical 文本中的派生坐标，不属于页面正文身份。
+		// 同一页正文、摘要、来源和回执不变时，允许缺失偏移补齐，或因前序
+		// OCR 页后来补齐而发生的合法坐标移动原子更新；不能用零值覆盖已有坐标。
+		if checkpoint.SourceOffsetEnd <= checkpoint.SourceOffsetStart &&
+			(existing.SourceOffsetStart != 0 || existing.SourceOffsetEnd != 0) {
+			return fmt.Errorf("%w: conflicting immutable page checkpoint %d",
+				ErrInvalidDocumentUpload, checkpoint.PageNumber)
+		}
+		withoutOffsetsExisting, withoutOffsetsIncoming := existing, checkpoint
+		withoutOffsetsExisting.SourceOffsetStart = 0
+		withoutOffsetsExisting.SourceOffsetEnd = 0
+		withoutOffsetsIncoming.SourceOffsetStart = 0
+		withoutOffsetsIncoming.SourceOffsetEnd = 0
+		if !equalIngestPageCheckpoints(withoutOffsetsExisting, withoutOffsetsIncoming) {
+			return fmt.Errorf("%w: conflicting immutable page checkpoint %d",
+				ErrInvalidDocumentUpload, checkpoint.PageNumber)
+		}
+		if checkpoint.SourceOffsetEnd <= checkpoint.SourceOffsetStart {
+			return fmt.Errorf("%w: invalid derived page offset %d",
+				ErrInvalidDocumentUpload, checkpoint.PageNumber)
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE kb_ingest_page_checkpoints
+			SET source_offset_start=?,source_offset_end=?,lease_epoch=?,updated_at=?
+			WHERE job_id=? AND page_number=? AND source_digest=? AND pages_total=?`,
+			checkpoint.SourceOffsetStart, checkpoint.SourceOffsetEnd, lease.Epoch, nowMillis,
+			job.JobID, checkpoint.PageNumber, checkpoint.SourceDigest, checkpoint.PagesTotal)
+		if err != nil {
+			return err
+		}
+		if rows, _ := res.RowsAffected(); rows != 1 {
+			return ErrJobFenced
+		}
+		existing.SourceOffsetStart = checkpoint.SourceOffsetStart
+		existing.SourceOffsetEnd = checkpoint.SourceOffsetEnd
 	}
 	var pagesDone int64
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM kb_ingest_page_checkpoints

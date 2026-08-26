@@ -138,6 +138,7 @@ func NewHandler(rt Runtime) http.Handler {
 	mux.HandleFunc("POST /mistakes/{record_id}/restore", h.restoreMistake)
 	mux.HandleFunc("POST /mistakes/{record_id}/practice-generation", h.startPracticeGeneration)
 	mux.HandleFunc("GET /mistakes/{record_id}/practice-generation", h.getPracticeGeneration)
+	mux.HandleFunc("GET /mistakes/{record_id}/practice-generation/receipts", h.getPracticeGenerationReceipts)
 	mux.HandleFunc("POST /mistakes/{record_id}/practice-generation/retry", h.retryPracticeGeneration)
 	mux.HandleFunc("POST /mistakes/{record_id}/practice-candidate-selection", h.openPracticeCandidateSelection)
 	mux.HandleFunc("POST /practice-candidate-selections/{id}/batches", h.generatePracticeCandidateBatch)
@@ -893,6 +894,32 @@ func (h *handler) getPracticeGeneration(w http.ResponseWriter, r *http.Request) 
 	)
 	if err != nil {
 		writeErr(w, httpStatusForK12Error(err, http.StatusInternalServerError), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (h *handler) getPracticeGenerationReceipts(w http.ResponseWriter, r *http.Request) {
+	agentName := strings.TrimSpace(r.URL.Query().Get("agent"))
+	sourceID := strings.TrimSpace(r.PathValue("record_id"))
+	if agentName == "" || sourceID == "" {
+		writeErr(w, http.StatusBadRequest, "agent and record_id are required")
+		return
+	}
+	if _, err := h.authorizedAgentOwnerScope(r.Context(), agentName); err != nil {
+		if errors.Is(err, errAgentScopeNotFound) {
+			writeErr(w, http.StatusNotFound, "practice generation receipts not found")
+			return
+		}
+		writeErr(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
+	view, err := h.rt.Deps.GetSinglePracticeGenerationReceipts(
+		r.Context(), agentName, sourceID,
+	)
+	if err != nil {
+		status := httpStatusForK12Error(err, http.StatusInternalServerError)
+		writeErr(w, status, "practice generation receipts unavailable")
 		return
 	}
 	writeJSON(w, http.StatusOK, view)

@@ -283,6 +283,13 @@ func parseTextbookTOC(pages []k12storage.TextbookCatalogSourcePage) ([]extracted
 	units := make([]extractedTextbookUnit, 0)
 	for _, page := range pages {
 		for _, line := range strings.Split(page.Content, "\n") {
+			// PDF 文本层可能用全角空格等 Unicode 空白分隔目录字段；只归一分隔符，字段校验仍由正则和页证据完成。
+			line = strings.Map(func(r rune) rune {
+				if unicode.IsSpace(r) {
+					return ' '
+				}
+				return r
+			}, line)
 			if match := textbookTOCMajorPattern.FindStringSubmatch(line); len(match) == 4 {
 				ordinal, _ := strconv.Atoi(match[1])
 				pageFrom, _ := strconv.Atoi(match[3])

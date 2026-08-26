@@ -18,8 +18,9 @@ func TestImageTaskBudgetPreflightFailureConvergesToDurableSolveReceipt(t *testin
 	}}
 	coordinator, grading := newImageTaskCoordinatorForTest(t, classifier)
 	grading.startErr = fmt.Errorf(
-		"%w: public image_task requires a frozen grading budget policy",
+		"%w: %w: public image_task requires a frozen grading budget policy",
 		ErrInvalidInput,
+		errGradingBudgetMissing,
 	)
 
 	view, created, runErr := createAndRunImageTask(
@@ -43,6 +44,7 @@ func TestImageTaskBudgetPreflightFailureConvergesToDurableSolveReceipt(t *testin
 		t.Fatalf("Result: %v", err)
 	}
 	if result.Dispatch.Status != k12.ImageTaskStatusFailed ||
+		result.Dispatch.FailureKind != "grading_budget_missing" ||
 		!result.Dispatch.RetrySafe {
 		t.Fatalf("dispatch did not converge to retry-safe failed: %+v", result.Dispatch)
 	}

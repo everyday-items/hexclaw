@@ -102,6 +102,28 @@ type DeliveryTransport interface {
 	QueryPrepared(ctx context.Context, receipt k12.DeliveryReceipt) (DeliveryTransportAck, error)
 }
 
+// DeliveryEnvelopeTransport 是作品正文与原图同卡投递的可选能力。
+// 组件回执仍分别冻结；物理发送与查询必须以同一有序组件组为单位。
+type DeliveryEnvelopeTransport interface {
+	SendPreparedEnvelope(
+		ctx context.Context,
+		receipts []k12.DeliveryReceipt,
+	) (DeliveryTransportAck, error)
+	QueryPreparedEnvelope(
+		ctx context.Context,
+		receipts []k12.DeliveryReceipt,
+	) (DeliveryTransportAck, error)
+}
+
+// DeliveryEnvelopePreflightTransport 在组 CAS 前校验已准备的平台资源；
+// 能力缺失或校验失败时不得降级为逐 part 发送。
+type DeliveryEnvelopePreflightTransport interface {
+	PreflightPreparedEnvelope(
+		ctx context.Context,
+		receipts []k12.DeliveryReceipt,
+	) error
+}
+
 // BatchDeliveryTransport resolves all current active direct bindings and then
 // prepares one frozen payload per resolved target. ResolveTextTargets is split
 // from payload preparation so aggregate commands can fail with zero bindings

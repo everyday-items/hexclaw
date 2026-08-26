@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/channel"
+	"github.com/hexagon-codes/hexclaw/messagecontent"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/apihttp"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
@@ -35,12 +36,15 @@ func (f *cancelFirstCreativeReplayTransport) ResolveTextTargets(
 	return f.httpBatchTransport.ResolveTextTargets(ctx, agent)
 }
 
-func (f *cancelFirstCreativeReplayTransport) SendPrepared(
+func (f *cancelFirstCreativeReplayTransport) SendPreparedEnvelope(
 	_ context.Context,
-	receipt k12.DeliveryReceipt,
+	receipts []k12.DeliveryReceipt,
 ) (usecase.DeliveryTransportAck, error) {
-	f.sends = append(f.sends, receipt)
-	if len(f.sends) == 1 {
+	f.envelopeSends = append(
+		f.envelopeSends,
+		append([]k12.DeliveryReceipt(nil), receipts...),
+	)
+	if len(f.envelopeSends) == 1 {
 		f.cancel()
 		return usecase.DeliveryTransportAck{
 			Status:            k12.DeliveryOutcomeUnknown,
@@ -205,23 +209,26 @@ func TestBUG20260824CreativeWorkReplayReturnsFrozenBatchAfterSourceAssetIsDelete
 	sendPath := "/creative-works/" + workID + "/send"
 
 	firstRec, first := do(t, handler, http.MethodPost, sendPath, `{"agent":"mingming"}`)
-	if firstRec.Code != http.StatusOK || len(delivery.sends) != 2*len(httpBatchTargets()) {
-		t.Fatalf("first send did not freeze every bound target: status=%d body=%v sends=%d",
-			firstRec.Code, first, len(delivery.sends))
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first send did not freeze every bound target: status=%d body=%v",
+			firstRec.Code, first)
 	}
+	assertHTTPCompositeEnvelopeSends(t, delivery, len(httpBatchTargets()))
 	firstBatchID, _ := first["batch_id"].(string)
 	if firstBatchID == "" {
 		t.Fatalf("first send did not return a frozen batch id: %v", first)
 	}
-	var frozen channel.Message
-	if err := json.Unmarshal([]byte(delivery.sends[0].PayloadJSON), &frozen); err != nil {
+	var frozen channel.DeliveryPart
+	if err := json.Unmarshal([]byte(delivery.envelopeSends[0][1].PayloadJSON), &frozen); err != nil {
 		t.Fatalf("decode first frozen payload: %v", err)
 	}
-	if len(frozen.Attachments) != 1 || !bytes.Equal(frozen.Attachments[0].Data, original) {
-		t.Fatalf("first send did not freeze original image bytes: %#v", frozen.Attachments)
+	if frozen.Kind != messagecontent.PartArtifact || frozen.Ordinal != 2 ||
+		frozen.Attachment == nil || !bytes.Equal(frozen.Attachment.Data, original) ||
+		frozen.MessageContent == nil || frozen.RenderManifest == nil {
+		t.Fatalf("first send did not freeze canonical original image part: %#v", frozen)
 	}
 	preparationsBeforeReplay := len(delivery.content)
-	sendsBeforeReplay := len(delivery.sends)
+	envelopesBeforeReplay := len(delivery.envelopeSends)
 
 	assetPath, err := assetstore.PathFromID(ready.Metadata.PageAssetID)
 	if err != nil {
@@ -243,9 +250,9 @@ func TestBUG20260824CreativeWorkReplayReturnsFrozenBatchAfterSourceAssetIsDelete
 		t.Errorf("replay prepared mutable creative-work content again: before=%d after=%d",
 			preparationsBeforeReplay, len(delivery.content))
 	}
-	if len(delivery.sends) != sendsBeforeReplay {
-		t.Errorf("replay resent a frozen delivery: before=%d after=%d",
-			sendsBeforeReplay, len(delivery.sends))
+	if len(delivery.envelopeSends) != envelopesBeforeReplay || len(delivery.sends) != 0 {
+		t.Errorf("replay resent a frozen delivery: envelopes=%d->%d legacy=%d",
+			envelopesBeforeReplay, len(delivery.envelopeSends), len(delivery.sends))
 	}
 }
 
@@ -281,17 +288,24 @@ func TestBUG20260824CreativeWorkReplayAuthorizesBeforeFrozenBatchLookup(t *testi
 	if err != nil {
 		t.Fatalf("read frozen batch after canceled request: %v", err)
 	}
-	if len(stored.Receipts) != 4 || stored.Receipts[0].Status != k12.DeliveryOutcomeUnknown {
-		t.Fatalf("test precondition requires one attempted and one never-attempted child: %+v", stored.Receipts)
+	if len(stored.Receipts) != 4 {
+		t.Fatalf("test precondition requires two two-component target groups: %+v", stored.Receipts)
 	}
-	for _, receipt := range stored.Receipts[1:] {
-		if receipt.Status != k12.DeliveryPending || receipt.Attempt != 0 {
-			t.Fatalf("test precondition requires all later parts to remain pending: %+v", stored.Receipts)
+	for _, receipt := range stored.Receipts[:2] {
+		if receipt.Status != k12.DeliveryOutcomeUnknown || receipt.Attempt != 1 ||
+			receipt.ExternalMessageID != "creative-replay-unknown-a" {
+			t.Fatalf("test precondition requires the first whole group to be outcome_unknown: %+v", stored.Receipts)
 		}
 	}
-	sendsBefore := len(delivery.sends)
+	for _, receipt := range stored.Receipts[2:] {
+		if receipt.Status != k12.DeliveryPending || receipt.Attempt != 0 {
+			t.Fatalf("test precondition requires the later whole group to remain pending: %+v", stored.Receipts)
+		}
+	}
+	envelopesBefore := len(delivery.envelopeSends)
 	preparationsBefore := len(delivery.content)
 	queriesBefore := len(delivery.queries)
+	envelopeQueriesBefore := len(delivery.envelopeQueries)
 	resolutionsBefore := delivery.resolveCalls
 	authorizeCalls := 0
 	remoteHandler := apihttp.NewHandler(apihttp.Runtime{
@@ -316,13 +330,18 @@ func TestBUG20260824CreativeWorkReplayAuthorizesBeforeFrozenBatchLookup(t *testi
 	if authorizeCalls != 1 {
 		t.Errorf("owner-to-agent authorization must run exactly once before replay lookup: calls=%d", authorizeCalls)
 	}
-	if len(delivery.sends) != sendsBefore {
-		t.Errorf("unauthorized replay started a pending child: before=%d after=%d", sendsBefore, len(delivery.sends))
-	}
-	if len(delivery.content) != preparationsBefore || len(delivery.queries) != queriesBefore {
+	if len(delivery.envelopeSends) != envelopesBefore || len(delivery.sends) != 0 {
 		t.Errorf(
-			"unauthorized replay crossed preparation/query boundaries: preparations=%d->%d queries=%d->%d",
+			"unauthorized replay started a pending group: envelopes=%d->%d legacy=%d",
+			envelopesBefore, len(delivery.envelopeSends), len(delivery.sends),
+		)
+	}
+	if len(delivery.content) != preparationsBefore || len(delivery.queries) != queriesBefore ||
+		len(delivery.envelopeQueries) != envelopeQueriesBefore {
+		t.Errorf(
+			"unauthorized replay crossed preparation/query boundaries: preparations=%d->%d queries=%d->%d envelope_queries=%d->%d",
 			preparationsBefore, len(delivery.content), queriesBefore, len(delivery.queries),
+			envelopeQueriesBefore, len(delivery.envelopeQueries),
 		)
 	}
 	if delivery.resolveCalls != resolutionsBefore {
@@ -413,8 +432,10 @@ func TestBUG20260824CreativeWorkReplaySecondMissPreservesOriginalAssetError(t *t
 				PageAssets: gateway,
 			})
 			sendsBefore := len(delivery.sends)
+			envelopesBefore := len(delivery.envelopeSends)
 			preparationsBefore := len(delivery.content)
 			queriesBefore := len(delivery.queries)
+			envelopeQueriesBefore := len(delivery.envelopeQueries)
 			resolutionsBefore := delivery.resolveCalls
 
 			rec, _ := do(
@@ -431,13 +452,16 @@ func TestBUG20260824CreativeWorkReplaySecondMissPreservesOriginalAssetError(t *t
 				t.Errorf("asset failure must retain one mutable read attempt: open_calls=%d", gateway.openCalls)
 			}
 			if len(delivery.sends) != sendsBefore ||
+				len(delivery.envelopeSends) != envelopesBefore ||
 				len(delivery.content) != preparationsBefore ||
 				len(delivery.queries) != queriesBefore ||
+				len(delivery.envelopeQueries) != envelopeQueriesBefore ||
 				delivery.resolveCalls != resolutionsBefore {
 				t.Errorf(
-					"second miss crossed delivery boundaries: sends=%d->%d preparations=%d->%d queries=%d->%d resolutions=%d->%d",
-					sendsBefore, len(delivery.sends), preparationsBefore, len(delivery.content),
-					queriesBefore, len(delivery.queries), resolutionsBefore, delivery.resolveCalls,
+					"second miss crossed delivery boundaries: sends=%d->%d envelopes=%d->%d preparations=%d->%d queries=%d->%d envelope_queries=%d->%d resolutions=%d->%d",
+					sendsBefore, len(delivery.sends), envelopesBefore, len(delivery.envelopeSends),
+					preparationsBefore, len(delivery.content), queriesBefore, len(delivery.queries),
+					envelopeQueriesBefore, len(delivery.envelopeQueries), resolutionsBefore, delivery.resolveCalls,
 				)
 			}
 			if strings.Contains(rec.Body.String(), stale.BatchID) ||
@@ -516,14 +540,19 @@ func TestBUG20260824CreativeWorkReplayChangedLatestFeedbackCreatesNewBatch(t *te
 	if len(delivery.content) != 2 || delivery.content[0] == delivery.content[1] {
 		t.Errorf("changed latest feedback did not create two distinct canonical payloads: %#v", delivery.content)
 	}
-	if len(delivery.sends) != 4*len(httpBatchTargets()) || delivery.resolveCalls != 2 {
+	wantEnvelopeSends := 2 * len(httpBatchTargets())
+	if delivery.resolveCalls != 2 {
 		t.Errorf(
-			"changed latest feedback did not create and send a new batch: sends=%d resolutions=%d",
-			len(delivery.sends), delivery.resolveCalls,
+			"changed latest feedback target resolutions=%d want=2",
+			delivery.resolveCalls,
 		)
 	}
-	if len(delivery.queries) != 0 {
-		t.Errorf("changed latest feedback queried an unrelated frozen batch: queries=%d", len(delivery.queries))
+	assertHTTPCompositeEnvelopeSends(t, &delivery.httpBatchTransport, wantEnvelopeSends)
+	if len(delivery.queries) != 0 || len(delivery.envelopeQueries) != 0 {
+		t.Errorf(
+			"changed latest feedback queried an unrelated frozen batch: queries=%d envelope_queries=%d",
+			len(delivery.queries), len(delivery.envelopeQueries),
+		)
 	}
 }
 
@@ -614,10 +643,11 @@ func TestBUG20260824CreativeWorkReplayRechecksFrozenBatchAfterAssetReadRace(t *t
 	if gateway.openCalls != 1 {
 		t.Errorf("asset race handling reopened mutable source bytes: open_calls=%d", gateway.openCalls)
 	}
-	if len(delivery.content) != 1 || len(delivery.sends) != 2*len(httpBatchTargets()) || len(delivery.queries) != 0 {
+	if len(delivery.content) != 1 || len(delivery.envelopeQueries) != 0 || len(delivery.queries) != 0 {
 		t.Errorf(
-			"asset race crossed delivery boundaries more than once: preparations=%d sends=%d queries=%d",
-			len(delivery.content), len(delivery.sends), len(delivery.queries),
+			"asset race crossed preparation/query boundaries more than once: preparations=%d queries=%d envelope_queries=%d",
+			len(delivery.content), len(delivery.queries), len(delivery.envelopeQueries),
 		)
 	}
+	assertHTTPCompositeEnvelopeSends(t, delivery, len(httpBatchTargets()))
 }

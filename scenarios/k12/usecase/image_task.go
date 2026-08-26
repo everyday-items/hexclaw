@@ -74,6 +74,11 @@ type imageTaskGradingParentWindowRetrier interface {
 }
 
 type ImageTaskRouteResolver func(k12.ImageTaskRouteSnapshot) (k12.ImageTaskRouteSnapshot, error)
+type ImageTaskWorkFeedbackRouteResolver func(
+	context.Context,
+	string,
+	k12.ImageTaskRouteSnapshot,
+) (k12.ImageTaskRouteSnapshot, error)
 type ImageTaskRouteDisplayResolver func(k12.ImageTaskRouteSnapshot) (string, string)
 type ImageTaskAssetReader func(agentName, assetRef string) ([]byte, error)
 type ImageTaskGradeResolver func(context.Context, string) (string, error)
@@ -97,6 +102,7 @@ type ImageTaskCoordinator struct {
 	IMCompletedHomeworkRoutingGate ImageTaskIMCompletedHomeworkRoutingGate
 	WorkFeedback                   imageTaskWorkFeedbackGenerator
 	ResolveRoute                   ImageTaskRouteResolver
+	ResolveWorkFeedbackRoute       ImageTaskWorkFeedbackRouteResolver
 	ResolveRouteDisplay            ImageTaskRouteDisplayResolver
 	ResolveGrade                   ImageTaskGradeResolver
 	ReadAsset                      ImageTaskAssetReader
@@ -1377,6 +1383,50 @@ func imageTaskWorkFeedbackContext(
 	return withWorkFeedbackRouteSnapshot(ctx, snapshot)
 }
 
+func (c *ImageTaskCoordinator) resolveWorkFeedbackRoute(
+	ctx context.Context,
+	view ImageTaskView,
+) (k12.ImageTaskRouteSnapshot, error) {
+	var (
+		route k12.ImageTaskRouteSnapshot
+		err   error
+	)
+	switch {
+	case view.feedbackInvocation != nil:
+		route = view.feedbackInvocation.RouteSnapshot
+	case view.Dispatch.RoutingProvenance == k12.ImageTaskRoutingModelClassified:
+		route = view.Dispatch.RoutePolicySnapshot
+	case view.Dispatch.RoutingProvenance == k12.ImageTaskRoutingParentSelected:
+		if c.ResolveWorkFeedbackRoute == nil {
+			return k12.ImageTaskRouteSnapshot{}, errors.New(
+				"usecase: image task work-feedback route resolver is not configured",
+			)
+		}
+		if view.Creative == nil {
+			return k12.ImageTaskRouteSnapshot{}, errors.New(
+				"usecase: image task work-feedback creative intake is missing",
+			)
+		}
+		route, err = c.ResolveWorkFeedbackRoute(
+			ctx,
+			view.Creative.WorkType,
+			view.Dispatch.OperationRouteRequest,
+		)
+		if err != nil {
+			return k12.ImageTaskRouteSnapshot{}, err
+		}
+	default:
+		return k12.ImageTaskRouteSnapshot{}, errors.New(
+			"usecase: image task work-feedback routing provenance is invalid",
+		)
+	}
+	route = k12.NormalizeImageTaskRouteSnapshot(route)
+	if err := route.Validate(); err != nil {
+		return k12.ImageTaskRouteSnapshot{}, err
+	}
+	return route, nil
+}
+
 func (c *ImageTaskCoordinator) continueCreativeFeedback(
 	ctx context.Context,
 	view ImageTaskView,
@@ -1413,10 +1463,11 @@ func (c *ImageTaskCoordinator) continueCreativeFeedback(
 		c.now(),
 	)
 	defer cancelAutomatic()
-	feedbackCtx := imageTaskWorkFeedbackContext(
-		automaticCtx,
-		view.Dispatch.RoutePolicySnapshot,
-	)
+	feedbackRoute, err := c.resolveWorkFeedbackRoute(automaticCtx, projected)
+	if err != nil {
+		return projected, err
+	}
+	feedbackCtx := imageTaskWorkFeedbackContext(automaticCtx, feedbackRoute)
 	if _, err := c.WorkFeedback.GenerateWorkFeedback(
 		feedbackCtx, view.Dispatch.AgentName, view.Creative.PromotedWorkID,
 	); err != nil {
@@ -1488,6 +1539,7 @@ func (c *ImageTaskCoordinator) continueTarget(
 				if persistErr := c.failHomeworkSolvePreflight(
 					context.WithoutCancel(ctx),
 					view.Dispatch,
+					err,
 				); persistErr != nil {
 					return view, errors.Join(
 						err,
@@ -1642,6 +1694,7 @@ func (c *ImageTaskCoordinator) continueTarget(
 func (c *ImageTaskCoordinator) failHomeworkSolvePreflight(
 	ctx context.Context,
 	dispatch k12.ImageTaskDispatch,
+	cause error,
 ) error {
 	now := c.now()
 	_, err := c.Records.FailHomeworkSolvePreflight(
@@ -1669,9 +1722,22 @@ func (c *ImageTaskCoordinator) failHomeworkSolvePreflight(
 			CreatedAt:     now,
 			UpdatedAt:     now,
 		},
-		"grading_budget_policy_invalid",
+		imageTaskGradingPreflightFailureKind(cause),
 	)
 	return err
+}
+
+func imageTaskGradingPreflightFailureKind(cause error) string {
+	switch {
+	case errors.Is(cause, errGradingBudgetMissing):
+		return "grading_budget_missing"
+	case errors.Is(cause, errGradingBudgetPolicyInvalid):
+		return "grading_budget_policy_invalid"
+	case errors.Is(cause, ErrModelRequestPolicyInvalid):
+		return "grading_model_request_policy_invalid"
+	default:
+		return "grading_request_invalid"
+	}
 }
 
 func photoTaskIntentFromDispatch(intent k12.ImageTaskIntent) PhotoTaskIntent {
@@ -2437,10 +2503,11 @@ func (c *ImageTaskCoordinator) Retry(
 			c.now(),
 		)
 		defer cancelAutomatic()
-		feedbackCtx := imageTaskWorkFeedbackContext(
-			automaticCtx,
-			dispatch.RoutePolicySnapshot,
-		)
+		feedbackRoute, routeErr := c.resolveWorkFeedbackRoute(automaticCtx, current)
+		if routeErr != nil {
+			return current, routeErr
+		}
+		feedbackCtx := imageTaskWorkFeedbackContext(automaticCtx, feedbackRoute)
 		if _, err := c.WorkFeedback.GenerateWorkFeedback(
 			feedbackCtx, agentName, current.Creative.PromotedWorkID,
 		); err != nil {

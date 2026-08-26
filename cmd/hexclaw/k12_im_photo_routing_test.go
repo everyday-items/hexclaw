@@ -77,7 +77,7 @@ func TestResolveK12InboundPhotoPracticeRoute_FrozenPriorityMatrix(t *testing.T) 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := resolveK12InboundPhotoPracticeRoute(tt.input, tt.sets)
-			if got != tt.want {
+			if got.Decision != tt.want.Decision || got.PracticeSetID != tt.want.PracticeSetID {
 				t.Fatalf("route=%+v want=%+v", got, tt.want)
 			}
 		})

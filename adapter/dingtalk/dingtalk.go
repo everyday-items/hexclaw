@@ -241,6 +241,67 @@ type dingtalkOutboundMessage struct {
 	MsgParam string
 }
 
+type dingtalkDefiniteProviderRejection interface {
+	definiteDingTalkProviderRejection()
+}
+
+type dingtalkDefiniteProviderRejectionError struct {
+	cause error
+}
+
+func (e *dingtalkDefiniteProviderRejectionError) Error() string {
+	if e == nil || e.cause == nil {
+		return "DingTalk provider rejected the request"
+	}
+	return e.cause.Error()
+}
+
+func (e *dingtalkDefiniteProviderRejectionError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (*dingtalkDefiniteProviderRejectionError) definiteDingTalkProviderRejection() {}
+
+func markDingTalkDefiniteProviderRejection(err error) error {
+	if err == nil {
+		return nil
+	}
+	var rejection dingtalkDefiniteProviderRejection
+	if errors.As(err, &rejection) {
+		return err
+	}
+	return &dingtalkDefiniteProviderRejectionError{cause: err}
+}
+
+func dingTalkReceiptFailureStatus(providerSendStarted bool, err error) adapter.DeliveryStatus {
+	if !providerSendStarted {
+		return adapter.DeliveryFailed
+	}
+	var rejection dingtalkDefiniteProviderRejection
+	if errors.As(err, &rejection) {
+		return adapter.DeliveryFailed
+	}
+	return adapter.DeliveryOutcomeUnknown
+}
+
+func isDingTalkDefiniteProviderRejectionStatus(status int) bool {
+	switch status {
+	case http.StatusBadRequest,
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusConflict,
+		http.StatusUnprocessableEntity,
+		http.StatusTooManyRequests:
+		return true
+	default:
+		return false
+	}
+}
+
 // groupQueueTargetPrefix lets the existing per-adapter SendQueue serialize
 // both OTO and group replies without exposing conversation type in the public
 // adapter.Send signature. A NUL-prefixed value cannot collide with a DingTalk
@@ -297,35 +358,12 @@ func uploadDingtalkImage(
 	if httpClient == nil {
 		return "", errors.New("钉钉图片上传 HTTP 客户端为空")
 	}
-	if !adapter.IsImageAttachment(attachment) {
+	if !adapter.IsImageAttachment(attachment) || isDingTalkPDFAttachment(attachment) {
 		return "", fmt.Errorf("钉钉仅支持上传图片附件: %s", attachment.Name)
 	}
-	if err := validateDingTalkAttachmentName(attachment.Name); err != nil {
-		return "", err
-	}
-	encoded := strings.TrimSpace(attachment.Data)
-	if encoded == "" {
-		return "", errors.New("钉钉图片上传内容为空")
-	}
-	if strings.HasPrefix(strings.ToLower(encoded), "data:") {
-		return "", errors.New("DingTalk image upload data URI sources are forbidden")
-	}
-	if base64.StdEncoding.DecodedLen(len(encoded)) > dingtalkMaxOutboundImageBytes {
-		return "", fmt.Errorf("钉钉回复图片超过 %dMB 上限", dingtalkMaxOutboundImageBytes>>20)
-	}
-	raw, err := base64.StdEncoding.DecodeString(encoded)
+	raw, err := dingTalkAttachmentBytes(attachment)
 	if err != nil {
-		return "", fmt.Errorf("解码钉钉回复图片失败: %w", err)
-	}
-	if len(raw) == 0 {
-		return "", errors.New("钉钉图片上传内容为空")
-	}
-	if len(raw) > dingtalkMaxOutboundImageBytes {
-		return "", fmt.Errorf("钉钉回复图片超过 %dMB 上限", dingtalkMaxOutboundImageBytes>>20)
-	}
-	detectedMIME := http.DetectContentType(raw)
-	if !strings.HasPrefix(strings.ToLower(detectedMIME), "image/") {
-		return "", fmt.Errorf("钉钉回复附件真实内容不是图片: %s", detectedMIME)
+		return "", err
 	}
 
 	u, err := url.Parse(strings.TrimSpace(endpoint))
@@ -492,7 +530,7 @@ func dingTalkPDFFileName(attachment adapter.Attachment) string {
 
 func validDingTalkFileMediaID(mediaID string) bool {
 	trimmed := strings.TrimSpace(mediaID)
-	return strings.HasPrefix(trimmed, "@") && len(trimmed) <= 512 &&
+	return strings.HasPrefix(trimmed, "@") && len(trimmed) > 1 && len(trimmed) <= 512 &&
 		!strings.ContainsAny(trimmed, "\r\n\t /\\:[]()")
 }
 
@@ -633,20 +671,34 @@ func (c *officialDingtalkOpenAPI) SendOTO(_ context.Context, accessToken, robotC
 		c.runtime,
 	)
 	if err != nil {
+		var sdkErr *tea.SDKError
+		if errors.As(err, &sdkErr) && sdkErr.StatusCode != nil &&
+			isDingTalkDefiniteProviderRejectionStatus(*sdkErr.StatusCode) {
+			return "", markDingTalkDefiniteProviderRejection(err)
+		}
 		return "", err
 	}
-	if resp != nil && resp.StatusCode != nil && *resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("钉钉机器人发送返回 %d", *resp.StatusCode)
+	if resp != nil && resp.StatusCode != nil &&
+		isDingTalkDefiniteProviderRejectionStatus(int(*resp.StatusCode)) {
+		return "", markDingTalkDefiniteProviderRejection(
+			fmt.Errorf("钉钉机器人发送返回 %d", *resp.StatusCode),
+		)
 	}
 	if resp != nil && resp.Body != nil {
 		if len(resp.Body.InvalidStaffIdList) > 0 {
-			return "", fmt.Errorf("钉钉机器人发送失败，无效用户: %s", joinStringPtrs(resp.Body.InvalidStaffIdList))
+			return "", markDingTalkDefiniteProviderRejection(
+				fmt.Errorf("钉钉机器人发送失败，无效用户: %s", joinStringPtrs(resp.Body.InvalidStaffIdList)),
+			)
 		}
 		if len(resp.Body.FilteredStaffIdList) > 0 {
-			return "", fmt.Errorf("钉钉机器人发送被过滤: %s", joinStringPtrs(resp.Body.FilteredStaffIdList))
+			return "", markDingTalkDefiniteProviderRejection(
+				fmt.Errorf("钉钉机器人发送被过滤: %s", joinStringPtrs(resp.Body.FilteredStaffIdList)),
+			)
 		}
 		if len(resp.Body.FlowControlledStaffIdList) > 0 {
-			return "", fmt.Errorf("钉钉机器人发送被限流: %s", joinStringPtrs(resp.Body.FlowControlledStaffIdList))
+			return "", markDingTalkDefiniteProviderRejection(
+				fmt.Errorf("钉钉机器人发送被限流: %s", joinStringPtrs(resp.Body.FlowControlledStaffIdList)),
+			)
 		}
 		if resp.Body.ProcessQueryKey != nil {
 			return *resp.Body.ProcessQueryKey, nil
@@ -1044,12 +1096,9 @@ func (a *DingtalkAdapter) SendWithReceipt(ctx context.Context, chatID string, re
 		err = a.queue.SendWith(ctx, chatID, reply, send)
 	}
 	if err != nil {
-		status := adapter.DeliveryFailed
-		if providerSendStarted.Load() &&
-			(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-			status = adapter.DeliveryOutcomeUnknown
-		}
-		return adapter.DeliveryAck{Status: status}, err
+		return adapter.DeliveryAck{
+			Status: dingTalkReceiptFailureStatus(providerSendStarted.Load(), err),
+		}, err
 	}
 	if strings.TrimSpace(externalID) == "" {
 		return adapter.DeliveryAck{Status: adapter.DeliveryOutcomeUnknown}, fmt.Errorf("钉钉已受理发送但未返回 processQueryKey，结果待核实")
@@ -1160,17 +1209,77 @@ func (a *DingtalkAdapter) SendPreparedPartWithReceipt(ctx context.Context, chatI
 		err = a.queue.SendWith(ctx, chatID, &adapter.Reply{}, send)
 	}
 	if err != nil {
-		status := adapter.DeliveryFailed
-		if providerSendStarted.Load() &&
-			(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-			status = adapter.DeliveryOutcomeUnknown
-		}
-		return adapter.DeliveryAck{Status: status}, err
+		return adapter.DeliveryAck{
+			Status: dingTalkReceiptFailureStatus(providerSendStarted.Load(), err),
+		}, err
 	}
 	if strings.TrimSpace(externalID) == "" {
 		return adapter.DeliveryAck{Status: adapter.DeliveryOutcomeUnknown}, errors.New("DingTalk accepted the delivery part without a processQueryKey")
 	}
 	return adapter.DeliveryAck{ExternalMessageID: externalID, Status: adapter.DeliveryAccepted}, nil
+}
+
+// SendPreparedEnvelopeWithReceipt 把同一规范内容的 Markdown 与已准备图片引用合成为一条消息。
+// 所有校验都在获取凭证和调用 provider 之前完成，发送阶段不会重新上传图片。
+func (a *DingtalkAdapter) SendPreparedEnvelopeWithReceipt(
+	ctx context.Context,
+	chatID string,
+	envelope adapter.PreparedEnvelope,
+) (adapter.DeliveryAck, error) {
+	failed := adapter.DeliveryAck{Status: adapter.DeliveryFailed}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if strings.TrimSpace(chatID) == "" {
+		return failed, errors.New("DingTalk prepared envelope chat ID is required")
+	}
+	if _, isGroup := parseGroupQueueTarget(chatID); isGroup {
+		return failed, errors.New("DingTalk prepared envelopes support direct messages only")
+	}
+	message, err := dingTalkPreparedEnvelopeMessage(envelope)
+	if err != nil {
+		return failed, err
+	}
+	token, err := a.getAccessToken(ctx)
+	if err != nil {
+		return failed, fmt.Errorf("DingTalk prepared envelope access token failed: %w", err)
+	}
+	api, err := a.apiClient()
+	if err != nil {
+		return failed, fmt.Errorf("DingTalk prepared envelope API initialization failed: %w", err)
+	}
+
+	var externalID string
+	var providerSendStarted atomic.Bool
+	send := func(sendCtx context.Context, target string, _ *adapter.Reply) error {
+		if err := sendCtx.Err(); err != nil {
+			return err
+		}
+		providerSendStarted.Store(true)
+		var sendErr error
+		externalID, sendErr = api.SendOTO(sendCtx, token, a.cfg.RobotCode, target, message)
+		return sendErr
+	}
+	if a.queue == nil {
+		err = send(ctx, chatID, &adapter.Reply{})
+	} else {
+		err = a.queue.SendWith(ctx, chatID, &adapter.Reply{}, send)
+	}
+	if err != nil {
+		return adapter.DeliveryAck{
+			Status: dingTalkReceiptFailureStatus(providerSendStarted.Load(), err),
+		}, err
+	}
+	if strings.TrimSpace(externalID) == "" {
+		return adapter.DeliveryAck{Status: adapter.DeliveryOutcomeUnknown}, errors.New("DingTalk accepted the prepared envelope without a processQueryKey")
+	}
+	return adapter.DeliveryAck{ExternalMessageID: externalID, Status: adapter.DeliveryAccepted}, nil
+}
+
+// ValidatePreparedEnvelope 只构造并校验钉钉组合消息，不取凭证、不上传、不发送。
+func (a *DingtalkAdapter) ValidatePreparedEnvelope(envelope adapter.PreparedEnvelope) error {
+	_, err := dingTalkPreparedEnvelopeMessage(envelope)
+	return err
 }
 
 func validateDingTalkDeliveryPartAttachment(part adapter.DeliveryPart, attachment adapter.Attachment, requireBytes bool) error {
@@ -1204,6 +1313,9 @@ func dingTalkPreparedPartMessage(part adapter.DeliveryPart) (dingtalkOutboundMes
 		if part.Attachment != nil || strings.TrimSpace(part.PreparedResourceID) != "" || strings.TrimSpace(part.Text) == "" {
 			return dingtalkOutboundMessage{}, errors.New("DingTalk markdown delivery part has an invalid shape")
 		}
+		if err := validateDingTalkVisibleContent(part.Text); err != nil {
+			return dingtalkOutboundMessage{}, err
+		}
 		return dingtalkMarkdownMessage(part.Text), nil
 	case messagecontent.PartArtifact:
 		if strings.TrimSpace(part.Text) != "" || part.Attachment == nil || !validDingTalkFileMediaID(part.PreparedResourceID) {
@@ -1225,6 +1337,95 @@ func dingTalkPreparedPartMessage(part adapter.DeliveryPart) (dingtalkOutboundMes
 	default:
 		return dingtalkOutboundMessage{}, fmt.Errorf("DingTalk delivery part kind %q is unsupported", part.Kind)
 	}
+}
+
+func dingTalkPreparedEnvelopeMessage(envelope adapter.PreparedEnvelope) (dingtalkOutboundMessage, error) {
+	if len(envelope.Parts) < 2 {
+		return dingtalkOutboundMessage{}, errors.New("DingTalk prepared envelope requires Markdown and at least one image")
+	}
+
+	first := envelope.Parts[0]
+	if err := validateDingTalkDeliveryPartCanonicalEvidence(first, true); err != nil {
+		return dingtalkOutboundMessage{}, err
+	}
+	if first.Kind != messagecontent.PartMarkdown || first.Ordinal != 1 || first.Attachment != nil ||
+		strings.TrimSpace(first.PreparedResourceID) != "" || strings.TrimSpace(first.Text) == "" {
+		return dingtalkOutboundMessage{}, errors.New("DingTalk prepared envelope must start with one Markdown part")
+	}
+	canonical := first.MessageContent
+	manifest := first.RenderManifest
+	if len(manifest.Parts) != len(canonical.Attachments)+1 {
+		return dingtalkOutboundMessage{}, errors.New("DingTalk prepared envelope canonical attachment projection is incomplete")
+	}
+	imageCount := 0
+	seenPDF := false
+	for index := 1; index < len(manifest.Parts); index++ {
+		projected := manifest.Parts[index]
+		attachment := canonical.Attachments[index-1]
+		if projected.Kind != messagecontent.PartArtifact ||
+			projected.ArtifactRef != attachment.AssetID ||
+			projected.ArtifactDigest != attachment.Digest ||
+			projected.AltText != attachment.AltText {
+			return dingtalkOutboundMessage{}, errors.New("DingTalk prepared envelope canonical artifact projection is invalid")
+		}
+		switch mime := strings.ToLower(strings.TrimSpace(attachment.MIME)); {
+		case strings.HasPrefix(mime, "image/"):
+			if seenPDF {
+				return dingtalkOutboundMessage{}, errors.New("DingTalk prepared envelope images must precede trailing PDF artifacts")
+			}
+			imageCount++
+		case mime == "application/pdf":
+			seenPDF = true
+		default:
+			return dingtalkOutboundMessage{}, errors.New("DingTalk prepared envelope canonical artifact type is unsupported")
+		}
+	}
+	if imageCount == 0 {
+		return dingtalkOutboundMessage{}, errors.New("DingTalk prepared envelope requires at least one canonical image")
+	}
+	if len(envelope.Parts) != imageCount+1 {
+		return dingtalkOutboundMessage{}, errors.New("DingTalk prepared envelope must cover the complete canonical image prefix")
+	}
+	contentID := first.MessageContent.ContentID
+	renderID := first.RenderManifest.RenderID
+	content := first.Text
+
+	for index := 1; index < len(envelope.Parts); index++ {
+		part := envelope.Parts[index]
+		if err := validateDingTalkDeliveryPartCanonicalEvidence(part, true); err != nil {
+			return dingtalkOutboundMessage{}, err
+		}
+		if part.MessageContent.ContentID != contentID || part.RenderManifest.RenderID != renderID {
+			return dingtalkOutboundMessage{}, errors.New("DingTalk prepared envelope parts must share canonical render evidence")
+		}
+		if part.Ordinal != index+1 || part.Kind != messagecontent.PartArtifact || part.Attachment == nil ||
+			strings.TrimSpace(part.Text) != "" {
+			return dingtalkOutboundMessage{}, errors.New("DingTalk prepared envelope image parts are out of order")
+		}
+		attachment := *part.Attachment
+		if isDingTalkPDFAttachment(attachment) || !adapter.IsImageAttachment(attachment) {
+			return dingtalkOutboundMessage{}, errors.New("DingTalk prepared envelope supports image artifacts only")
+		}
+		if err := validateDingTalkDeliveryPartAttachment(part, attachment, false); err != nil {
+			return dingtalkOutboundMessage{}, err
+		}
+		imageRef := strings.TrimSpace(part.PreparedResourceID)
+		if !validDingtalkImageReference(imageRef) {
+			return dingtalkOutboundMessage{}, errors.New("DingTalk prepared envelope image reference is invalid")
+		}
+		alt := strings.TrimSpace(manifest.Parts[index].AltText)
+		if alt == "" {
+			alt = "作品原图"
+		}
+		if hasUnsafeDingTalkMarkdownLabelCharacters(alt) {
+			return dingtalkOutboundMessage{}, errors.New("DingTalk prepared envelope image alt text contains unsafe Markdown characters")
+		}
+		content += "\n\n![" + alt + "](" + imageRef + ")"
+	}
+	if err := validateDingTalkVisibleContent(content); err != nil {
+		return dingtalkOutboundMessage{}, err
+	}
+	return dingtalkMarkdownMessage(content), nil
 }
 
 func (a *DingtalkAdapter) QueryReceipt(ctx context.Context, externalMessageID string) (adapter.DeliveryAck, error) {
@@ -1406,10 +1607,14 @@ func validateDingTalkAttachmentName(name string) error {
 	if hasDingTalkAttachmentNameScheme(trimmed) {
 		return errors.New("DingTalk attachment name must not contain a URI scheme or drive prefix")
 	}
-	if strings.ContainsAny(trimmed, "\r\n[]()!`<>") {
+	if hasUnsafeDingTalkMarkdownLabelCharacters(trimmed) {
 		return errors.New("DingTalk attachment name contains unsafe Markdown characters")
 	}
 	return nil
+}
+
+func hasUnsafeDingTalkMarkdownLabelCharacters(value string) bool {
+	return strings.ContainsAny(value, "\r\n[]()!`<>")
 }
 
 func hasDingTalkAttachmentNameScheme(name string) bool {

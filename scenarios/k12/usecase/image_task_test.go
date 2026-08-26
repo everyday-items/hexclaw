@@ -210,6 +210,30 @@ func imageTaskRouteForTest(requested k12.ImageTaskRouteSnapshot) (k12.ImageTaskR
 	return requested, nil
 }
 
+func imageTaskWorkFeedbackRouteForTest(
+	_ context.Context,
+	workType string,
+	requested k12.ImageTaskRouteSnapshot,
+) (k12.ImageTaskRouteSnapshot, error) {
+	requested.Provider = strings.TrimSpace(requested.Provider)
+	requested.Model = strings.TrimSpace(requested.Model)
+	if requested.Provider == "" || requested.Model == "" {
+		return k12.ImageTaskRouteSnapshot{}, errors.New("requested work-feedback route is incomplete")
+	}
+	requested.Route = requested.Provider + "/" + requested.Model
+	requested.Capability = "text"
+	requested.PromptVersion = "writing-feedback-v1"
+	if workType == k12.WorkTypeArt {
+		requested.Capability = "text+vision"
+		requested.PromptVersion = "art-feedback-v1"
+	}
+	if requested.SelectionSource == "" {
+		requested.SelectionSource = "auto"
+	}
+	requested.PolicyVersion = "work-feedback-routing-v1"
+	return requested, nil
+}
+
 const imageTaskAssetForTest = "asset://mingming/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png"
 
 func newImageTaskCoordinatorForTest(t *testing.T, classifier *imageTaskClassifierStub) (*ImageTaskCoordinator, *imageTaskGradingStub) {
@@ -321,6 +345,21 @@ func assertCurrentCreativeIntakePromotion(
 
 func TestManualArtworkSkipsClassificationAndWaitsForCommit(t *testing.T) {
 	coordinator, _ := newImageTaskCoordinatorForTest(t, nil)
+	feedbackSolver := coordinator.WorkFeedback.(*Deps).Solver.(*imageTaskFeedbackSolver)
+	workFeedbackRouteCalls := 0
+	coordinator.ResolveWorkFeedbackRoute = func(
+		ctx context.Context,
+		workType string,
+		requested k12.ImageTaskRouteSnapshot,
+	) (k12.ImageTaskRouteSnapshot, error) {
+		workFeedbackRouteCalls++
+		if workType != k12.WorkTypeArt ||
+			requested.Provider != "hexclaw-gpt" ||
+			requested.Model != "gpt-5.6-sol" {
+			t.Fatalf("unexpected work-feedback route request: workType=%q route=%+v", workType, requested)
+		}
+		return imageTaskWorkFeedbackRouteForTest(ctx, workType, requested)
+	}
 	coordinator.ResolveRoute = nil
 	input := testCreateImageTaskInput()
 	input.CreativeEntry = &k12.ImageTaskCreativeEntry{
@@ -384,10 +423,127 @@ func TestManualArtworkSkipsClassificationAndWaitsForCommit(t *testing.T) {
 	if err := invocation.RouteSnapshot.Validate(); err != nil {
 		t.Fatalf("automatic feedback route snapshot not frozen: %+v err=%v", invocation, err)
 	}
-	if invocation.RouteSnapshot.Provider != "new-default" ||
-		invocation.RouteSnapshot.Model != "model-b" ||
-		invocation.RouteSnapshot.Route != "new-default/model-b" {
-		t.Fatalf("automatic feedback did not use the independent feedback route: %+v", invocation)
+	if invocation.RouteSnapshot.Provider != "hexclaw-gpt" ||
+		invocation.RouteSnapshot.Model != "gpt-5.6-sol" ||
+		invocation.RouteSnapshot.Route != "hexclaw-gpt/gpt-5.6-sol" {
+		t.Fatalf("automatic feedback did not inherit the requested parent route: %+v", invocation)
+	}
+	if feedbackSolver.routeCalls != 0 || workFeedbackRouteCalls != 1 {
+		t.Fatalf("automatic feedback route calls: mutable_default=%d request_aware=%d, want 0/1",
+			feedbackSolver.routeCalls, workFeedbackRouteCalls)
+	}
+}
+
+func prepareManualArtworkForFeedback(
+	t *testing.T,
+	coordinator *ImageTaskCoordinator,
+) (CreateImageTaskInput, ImageTaskView) {
+	t.Helper()
+	input := testCreateImageTaskInput()
+	input.CreativeEntry = &k12.ImageTaskCreativeEntry{
+		Kind: k12.CreativeWorkEntryNewWork, TaskIntent: k12.ImageTaskIntentArtwork,
+	}
+	prepared, created, err := coordinator.Create(context.Background(), input)
+	if err != nil || !created {
+		t.Fatalf("manual artwork create: created=%v err=%v", created, err)
+	}
+	committed, err := coordinator.Confirm(context.Background(), ConfirmImageTaskInput{
+		AgentName: input.AgentName, DispatchID: prepared.Dispatch.DispatchID,
+		ExpectedVersion: prepared.Dispatch.Version,
+		Creative: &ConfirmCreativeImageTaskInput{
+			Action: CreativeImageTaskActionCommit, WorkTitle: "彩虹和小猫",
+		},
+	})
+	if err != nil {
+		t.Fatalf("manual artwork commit: %v", err)
+	}
+	return input, committed
+}
+
+func TestManualArtworkWorkFeedbackRetryReusesFrozenRequestedRoute(t *testing.T) {
+	coordinator, _ := newImageTaskCoordinatorForTest(t, nil)
+	solver := coordinator.WorkFeedback.(*Deps).Solver.(*imageTaskFeedbackSolver)
+	solver.err = definitiveImageTaskTestError{message: "provider unavailable"}
+	requestAwareCalls := 0
+	coordinator.ResolveWorkFeedbackRoute = func(
+		ctx context.Context,
+		workType string,
+		requested k12.ImageTaskRouteSnapshot,
+	) (k12.ImageTaskRouteSnapshot, error) {
+		requestAwareCalls++
+		return imageTaskWorkFeedbackRouteForTest(ctx, workType, requested)
+	}
+	input, committed := prepareManualArtworkForFeedback(t, coordinator)
+	if _, err := coordinator.Run(
+		context.Background(), input.AgentName, committed.Dispatch.DispatchID,
+	); err == nil {
+		t.Fatal("first work-feedback provider failure was hidden")
+	}
+	failed, err := coordinator.Get(
+		context.Background(), input.AgentName, committed.Dispatch.DispatchID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.CreativeFeedback != "feedback_failed" || requestAwareCalls != 1 ||
+		solver.routeCalls != 0 || len(solver.snapshots) != 1 {
+		t.Fatalf("first attempt route state drifted: view=%+v requestAware=%d default=%d snapshots=%+v",
+			failed, requestAwareCalls, solver.routeCalls, solver.snapshots)
+	}
+
+	solver.err = nil
+	coordinator.ResolveWorkFeedbackRoute = func(
+		context.Context, string, k12.ImageTaskRouteSnapshot,
+	) (k12.ImageTaskRouteSnapshot, error) {
+		requestAwareCalls++
+		return k12.ImageTaskRouteSnapshot{}, errors.New("retry must not resolve a mutable route")
+	}
+	retried, err := coordinator.Retry(
+		context.Background(), input.AgentName, committed.Dispatch.DispatchID,
+		failed.Dispatch.Version,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requestAwareCalls != 1 || solver.routeCalls != 0 || len(solver.snapshots) != 2 ||
+		solver.snapshots[1] != solver.snapshots[0] ||
+		retried.CreativeFeedback != "feedback_ready" {
+		t.Fatalf("retry did not reuse the frozen requested route: requestAware=%d default=%d snapshots=%+v view=%+v",
+			requestAwareCalls, solver.routeCalls, solver.snapshots, retried)
+	}
+}
+
+func TestManualArtworkWorkFeedbackRouteResolutionFailsClosed(t *testing.T) {
+	tests := []struct {
+		name     string
+		resolver ImageTaskWorkFeedbackRouteResolver
+	}{
+		{name: "missing"},
+		{
+			name: "invalid",
+			resolver: func(
+				context.Context, string, k12.ImageTaskRouteSnapshot,
+			) (k12.ImageTaskRouteSnapshot, error) {
+				return k12.ImageTaskRouteSnapshot{}, nil
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			coordinator, _ := newImageTaskCoordinatorForTest(t, nil)
+			solver := coordinator.WorkFeedback.(*Deps).Solver.(*imageTaskFeedbackSolver)
+			coordinator.ResolveWorkFeedbackRoute = tt.resolver
+			input, committed := prepareManualArtworkForFeedback(t, coordinator)
+			if _, err := coordinator.Run(
+				context.Background(), input.AgentName, committed.Dispatch.DispatchID,
+			); err == nil {
+				t.Fatal("missing or invalid request-aware route resolver was accepted")
+			}
+			if solver.calls != 0 || solver.routeCalls != 0 {
+				t.Fatalf("route failure reached provider/default resolver: provider=%d default=%d",
+					solver.calls, solver.routeCalls)
+			}
+		})
 	}
 }
 

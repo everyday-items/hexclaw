@@ -24,6 +24,8 @@ var (
 	ErrModelInvocationRequiresReconciliation = errors.New("model invocation requires reconciliation")
 	ErrModelRequestPolicyInvalid             = errors.New("model request policy invalid")
 	ErrGradingOrchestratorShutdown           = errors.New("grading orchestrator is shut down")
+	errGradingBudgetMissing                  = errors.New("grading budget missing")
+	errGradingBudgetPolicyInvalid            = errors.New("grading budget policy invalid")
 )
 
 // GradingOrchestrator 统一 GradingJob 编排器（架构设计 §6.7 状态机 / §6.15 单机执行模型·二阶段）。
@@ -214,16 +216,18 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 		return GradingJobView{}, false, err
 	}
 	if strings.TrimSpace(in.SourceKind) == "image_task" {
-		if in.BudgetSnapshot.PolicyVersion <= 0 {
+		if in.BudgetSnapshot.PolicyVersion == 0 {
 			return GradingJobView{}, false, fmt.Errorf(
-				"%w: public image_task requires a frozen grading budget policy",
+				"%w: %w: public image_task requires a frozen grading budget policy",
 				ErrInvalidInput,
+				errGradingBudgetMissing,
 			)
 		}
 		if err := in.BudgetSnapshot.Validate(); err != nil {
 			return GradingJobView{}, false, fmt.Errorf(
-				"%w: invalid public image_task grading budget: %v",
+				"%w: %w: invalid public image_task grading budget: %v",
 				ErrInvalidInput,
+				errGradingBudgetPolicyInvalid,
 				err,
 			)
 		}
@@ -252,8 +256,9 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 			v.Fields.ModelSnapshot,
 		); policyErr != nil {
 			return GradingJobView{}, false, fmt.Errorf(
-				"%w: stored grading model request policy is invalid: %v",
+				"%w: %w: stored grading model request policy is invalid: %v",
 				ErrInvalidInput,
+				ErrModelRequestPolicyInvalid,
 				policyErr,
 			)
 		}
@@ -331,8 +336,9 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 		}
 		if policyErr := k12.ValidateGradingRecognizingRequestPolicy(snap); policyErr != nil {
 			return GradingJobView{}, false, fmt.Errorf(
-				"%w: invalid recognizing request policy: %v",
+				"%w: %w: invalid recognizing request policy: %v",
 				ErrInvalidInput,
+				ErrModelRequestPolicyInvalid,
 				policyErr,
 			)
 		}

@@ -2498,7 +2498,20 @@ Set source only when the material explicitly names a work, title, or another rel
 				Records: k12rt.Records, PageAssets: k12PageAssets,
 				Classifier: imageTaskAdapter,
 				WritingOCR: imageTaskAdapter, Grading: k12GradingOrch,
-				WorkFeedback:          &k12rt.Deps,
+				WorkFeedback: &k12rt.Deps,
+				ResolveWorkFeedbackRoute: func(
+					requestCtx context.Context,
+					workType string,
+					requested k12.ImageTaskRouteSnapshot,
+				) (k12.ImageTaskRouteSnapshot, error) {
+					return resolveK12RequestedWorkFeedbackRouteWithCapabilityReceipt(
+						requestCtx,
+						router,
+						k12ModelCapabilityReceipts,
+						workType,
+						requested,
+					)
+				},
 				BaseContext:           ctx,
 				GradingBudgetSnapshot: k12rt.Deps.GradingBudgetSnapshot,
 				ResolveGrade: func(
@@ -2952,6 +2965,7 @@ Set source only when the material explicitly names a work, title, or another rel
 	}
 
 	instanceMgr := instances.NewManager(store.DB())
+	k12Deliver.SetInstanceResolver(instanceMgr.ResolveRunningInstanceID)
 	// 回填钉钉通道真实发送函数（ChannelPort 收敛：与 cron Deliverer / send_message 同走
 	// instanceMgr.Send → adapter.Send，per-platform SendQueue 限速同源），并标记
 	// K12「发送到手机」链路就绪。
@@ -2960,25 +2974,40 @@ Set source only when the material explicitly names a work, title, or another rel
 	})
 	dingtalkChannel.SetReceiptTransport(
 		func(ctx context.Context, to channel.Target, msg channel.Message) (channel.DeliveryAck, error) {
-			ack, err := instanceMgr.SendWithReceipt(ctx, to.SendKey(), to.ChatID, adapterReplyFromChannelMessage(msg))
+			ack, err := instanceMgr.SendWithReceipt(ctx, strings.TrimSpace(to.InstanceID), to.ChatID, adapterReplyFromChannelMessage(msg))
 			return channelAckFromAdapter(ack, to), err
 		},
 		func(ctx context.Context, to channel.Target, externalMessageID string) (channel.DeliveryAck, error) {
-			ack, err := instanceMgr.QueryReceipt(ctx, to.SendKey(), externalMessageID)
+			ack, err := instanceMgr.QueryReceipt(ctx, strings.TrimSpace(to.InstanceID), externalMessageID)
 			return channelAckFromAdapter(ack, to), err
 		},
 	)
 	dingtalkChannel.SetDeliveryPartTransport(
 		func(ctx context.Context, to channel.Target, part channel.DeliveryPart) (string, error) {
 			return instanceMgr.PrepareDeliveryPartResource(
-				ctx, to.SendKey(), adapterDeliveryPartFromChannelPart(part),
+				ctx, strings.TrimSpace(to.InstanceID), adapterDeliveryPartFromChannelPart(part),
 			)
 		},
 		func(ctx context.Context, to channel.Target, part channel.DeliveryPart) (channel.DeliveryAck, error) {
 			ack, err := instanceMgr.SendPreparedPartWithReceipt(
-				ctx, to.SendKey(), to.ChatID, adapterDeliveryPartFromChannelPart(part),
+				ctx, strings.TrimSpace(to.InstanceID), to.ChatID, adapterDeliveryPartFromChannelPart(part),
 			)
 			return channelAckFromAdapter(ack, to), err
+		},
+	)
+	dingtalkChannel.SetPreparedEnvelopeTransport(
+		func(ctx context.Context, to channel.Target, envelope channel.PreparedEnvelope) (channel.DeliveryAck, error) {
+			ack, err := instanceMgr.SendPreparedEnvelopeWithReceipt(
+				ctx, strings.TrimSpace(to.InstanceID), to.ChatID, adapterPreparedEnvelopeFromChannelEnvelope(envelope),
+			)
+			return channelAckFromAdapter(ack, to), err
+		},
+	)
+	dingtalkChannel.SetPreparedEnvelopePreflight(
+		func(ctx context.Context, to channel.Target, envelope channel.PreparedEnvelope) error {
+			return instanceMgr.PreflightPreparedEnvelope(
+				ctx, strings.TrimSpace(to.InstanceID), to.ChatID, adapterPreparedEnvelopeFromChannelEnvelope(envelope),
+			)
 		},
 	)
 	k12Deliver.MarkReady()
@@ -3011,23 +3040,6 @@ Set source only when the material explicitly names a work, title, or another rel
 	}
 	if err := instanceMgr.SeedFromConfig(ctx, cfg); err != nil {
 		return fmt.Errorf("写入平台实例种子失败: %w", err)
-	}
-	// DD-024 restart recovery runs only after live provider instances exist.
-	// Pending rows were never attempted and may start once; sending/unknown rows
-	// are query-only, so a process crash can never turn into a blind duplicate.
-	if k12Runtime != nil && k12Runtime.Deps.Delivery != nil {
-		go func() {
-			for _, agent := range agentRouter.ListAgents() {
-				recovered, recoverErr := k12Runtime.Deps.RecoverDeliveryReceipts(ctx, agent.Name)
-				if recoverErr != nil {
-					logger.Warn("K12 投递回执恢复失败", "agent", agent.Name, "error", recoverErr)
-					continue
-				}
-				if recovered > 0 {
-					logger.Info("K12 投递回执恢复完成", "agent", agent.Name, "recovered", recovered)
-				}
-			}
-		}()
 	}
 	// 历史明文 config_json 静态加密回填（box 未注入时为 no-op）。
 	if n, eerr := instanceMgr.EncryptExistingAtRest(ctx); eerr != nil {
@@ -3202,6 +3214,23 @@ Set source only when the material explicitly names a work, title, or another rel
 	}
 	if err := instanceMgr.StartEnabled(ctx); err != nil {
 		return fmt.Errorf("启动平台实例失败: %w", err)
+	}
+	// DD-024 restart recovery runs only after live provider instances exist.
+	// Pending rows were never attempted and may start once; sending/unknown rows
+	// are query-only, so a process crash can never turn into a blind duplicate.
+	if k12Runtime != nil && k12Runtime.Deps.Delivery != nil {
+		go func() {
+			for _, agent := range agentRouter.ListAgents() {
+				recovered, recoverErr := k12Runtime.Deps.RecoverDeliveryReceipts(ctx, agent.Name)
+				if recoverErr != nil {
+					logger.Warn("K12 投递回执恢复失败", "agent", agent.Name, "error", recoverErr)
+					continue
+				}
+				if recovered > 0 {
+					logger.Info("K12 投递回执恢复完成", "agent", agent.Name, "recovered", recovered)
+				}
+			}
+		}()
 	}
 	if k12DingtalkPhotos != nil {
 		if recovered, recoverErr := k12DingtalkPhotos.Recover(ctx); recoverErr != nil {

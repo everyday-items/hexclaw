@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/channel"
 	"github.com/hexagon-codes/hexclaw/messagecontent"
+	"github.com/hexagon-codes/hexclaw/records"
 	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	k12 "github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
@@ -47,6 +50,20 @@ type k12InboundPhotoRoutingCoordinator interface {
 	) (k12usecase.InboundPhotoDispatch, error)
 }
 
+// k12InboundPhotoRoutingSnapshotCoordinator 是 V91 多候选确认的可选扩展；旧装配仍可
+// 继续使用单阶段 ConfirmRouting，生产装配优先走冻结快照协议。
+type k12InboundPhotoRoutingSnapshotCoordinator interface {
+	k12InboundPhotoRoutingCoordinator
+	RequestRoutingConfirmationWithSnapshot(
+		context.Context, string, string, int64, k12usecase.InboundPhotoRoutingSnapshot,
+	) (k12usecase.InboundPhotoDispatch, error)
+	GetRoutingSnapshot(context.Context, string, string) (k12usecase.InboundPhotoRoutingSnapshot, error)
+	ConfirmRoutingSelection(
+		context.Context, string, string, int64,
+		k12usecase.InboundPhotoRoutingDecision, string,
+	) (k12usecase.InboundPhotoDispatch, error)
+}
+
 const k12InboundPhotoRecentPracticeWindow = 14 * 24 * 60 * 60
 
 var k12InboundPhotoPaperNoPattern = regexp.MustCompile(`(?i)P-[0-9]{4}-[0-9]{2,}`)
@@ -60,6 +77,7 @@ type k12InboundPhotoPracticeRouteInput struct {
 type k12InboundPhotoPracticeRoute struct {
 	Decision      k12usecase.InboundPhotoRoutingDecision
 	PracticeSetID string
+	Candidates    []k12usecase.InboundPhotoRoutingCandidate
 }
 
 type k12InboundPhotoPracticeSetReader interface {
@@ -126,7 +144,10 @@ func resolveK12InboundPhotoPracticeRoute(
 				PracticeSetID: strings.TrimSpace(matches[0].Record.RecordID),
 			}
 		}
-		return k12InboundPhotoPracticeRoute{Decision: k12usecase.InboundPhotoRouteAskedUser}
+		return k12InboundPhotoPracticeRoute{
+			Decision:   k12usecase.InboundPhotoRouteAskedUser,
+			Candidates: k12InboundPhotoPracticeCandidates(matches),
+		}
 	}
 
 	recent := make([]k12usecase.PracticeSetView, 0, 1)
@@ -144,7 +165,39 @@ func resolveK12InboundPhotoPracticeRoute(
 			PracticeSetID: strings.TrimSpace(recent[0].Record.RecordID),
 		}
 	}
-	return k12InboundPhotoPracticeRoute{Decision: k12usecase.InboundPhotoRouteAskedUser}
+	return k12InboundPhotoPracticeRoute{
+		Decision:   k12usecase.InboundPhotoRouteAskedUser,
+		Candidates: k12InboundPhotoPracticeCandidates(recent),
+	}
+}
+
+func k12InboundPhotoPracticeCandidates(
+	sets []k12usecase.PracticeSetView,
+) []k12usecase.InboundPhotoRoutingCandidate {
+	candidates := make([]k12usecase.InboundPhotoRoutingCandidate, 0, len(sets))
+	for _, set := range sets {
+		if set.Record == nil || strings.TrimSpace(set.Record.RecordID) == "" ||
+			strings.TrimSpace(set.Fields.PaperNo) == "" || set.Fields.FinalizedAt <= 0 {
+			continue
+		}
+		title := strings.TrimSpace(set.Fields.Title)
+		candidates = append(candidates, k12usecase.InboundPhotoRoutingCandidate{
+			PracticeSetID: strings.TrimSpace(set.Record.RecordID),
+			PaperNo:       strings.TrimSpace(set.Fields.PaperNo),
+			Title:         title,
+			SentAt:        set.Fields.FinalizedAt,
+		})
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].SentAt != candidates[j].SentAt {
+			return candidates[i].SentAt > candidates[j].SentAt
+		}
+		if candidates[i].PaperNo != candidates[j].PaperNo {
+			return candidates[i].PaperNo < candidates[j].PaperNo
+		}
+		return candidates[i].PracticeSetID < candidates[j].PracticeSetID
+	})
+	return candidates
 }
 
 func k12InboundPhotoUnreturnedPracticeSet(set k12usecase.PracticeSetView) bool {
@@ -207,7 +260,12 @@ func maybeHandleK12DingtalkPhoto(
 ) (*adapter.Reply, bool, error) {
 	if routed := routeK12DingtalkTutor(msg, router); routed != nil {
 		if coordinator, ok := imageTasks.(k12InboundPhotoRoutingCoordinator); ok {
-			if decision, matched := k12PhotoRoutingConfirmationDecision(msg); matched {
+			decision, matched := k12PhotoRoutingConfirmationDecision(msg)
+			if !matched && k12PhotoRoutingCandidateSelectionMessage(msg) {
+				// 多候选阶段使用纯序号；具体候选身份由冻结快照校验，不能在入口猜测。
+				matched = true
+			}
+			if matched {
 				reply, handled, err := confirmK12PendingPhotoRoute(
 					ctx, msg, routed.AgentName, decision, coordinator,
 				)
@@ -308,6 +366,16 @@ func k12PhotoRoutingConfirmationDecision(
 	}
 }
 
+func k12PhotoRoutingCandidateSelectionMessage(msg *adapter.Message) bool {
+	if msg == nil || len(msg.Attachments) != 0 {
+		return false
+	}
+	if strings.TrimSpace(msg.Metadata["routing_candidate_index"]) != "" {
+		return true
+	}
+	return regexp.MustCompile(`^[0-9]+$`).MatchString(strings.TrimSpace(msg.Content))
+}
+
 func confirmK12PendingPhotoRoute(
 	ctx context.Context,
 	msg *adapter.Message,
@@ -321,6 +389,29 @@ func confirmK12PendingPhotoRoute(
 	}
 	candidates := pendingK12PhotoRouteBundles(bundles, msg, agentName)
 	if len(candidates) == 0 {
+		// 第二阶段的数字回复不能在确认后重新解释成第一阶段的
+		// `2=新作业批改`。已确认收据仍保留候选快照，重投时先按
+		// 冻结快照核对同一 ordinal，命中后直接幂等结束。
+		if snapshotCoordinator, ok := coordinator.(k12InboundPhotoRoutingSnapshotCoordinator); ok {
+			for _, bundle := range bundles {
+				if !k12InboundPhotoBundleMatchesMessage(bundle, msg, agentName) ||
+					bundle.Dispatch.RoutingDecision != k12usecase.InboundPhotoRouteRegrade ||
+					bundle.Dispatch.ConfirmationStatus != k12storage.InboundPhotoConfirmationConfirmed {
+					continue
+				}
+				snapshot, snapshotErr := snapshotCoordinator.GetRoutingSnapshot(
+					ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID,
+				)
+				if snapshotErr != nil || snapshot.Stage != k12usecase.InboundPhotoRoutingStageCandidate ||
+					snapshot.SelectedPracticeSetID == "" {
+					continue
+				}
+				index, valid := k12PhotoRoutingCandidateIndex(msg, len(snapshot.Candidates))
+				if valid && snapshot.Candidates[index-1].PracticeSetID == snapshot.SelectedPracticeSetID {
+					return nil, true, nil
+				}
+			}
+		}
 		for _, bundle := range bundles {
 			if k12InboundPhotoBundleMatchesMessage(bundle, msg, agentName) &&
 				bundle.Dispatch.RoutingDecision == decision &&
@@ -335,6 +426,57 @@ func confirmK12PendingPhotoRoute(
 		return reply, true, replyErr
 	}
 	pending := candidates[0]
+	if snapshotCoordinator, ok := coordinator.(k12InboundPhotoRoutingSnapshotCoordinator); ok {
+		snapshot, snapshotErr := snapshotCoordinator.GetRoutingSnapshot(
+			ctx, pending.Receipt.AgentName, pending.Receipt.ReceiptID,
+		)
+		if snapshotErr != nil &&
+			!errors.Is(snapshotErr, records.ErrNotFound) &&
+			!errors.Is(snapshotErr, errK12InboundPhotoRoutingSnapshotUnavailable) {
+			return nil, true, snapshotErr
+		}
+		if snapshotErr == nil {
+			if snapshot.Stage == k12usecase.InboundPhotoRoutingStageCandidate {
+				index, valid := k12PhotoRoutingCandidateIndex(msg, len(snapshot.Candidates))
+				if !valid {
+					reply, replyErr := k12PhotoRoutingCandidateReply(snapshot)
+					return reply, true, replyErr
+				}
+				_, err := snapshotCoordinator.ConfirmRoutingSelection(
+					ctx, pending.Receipt.AgentName, pending.Receipt.ReceiptID,
+					pending.Dispatch.Version, k12usecase.InboundPhotoRouteRegrade,
+					snapshot.Candidates[index-1].PracticeSetID,
+				)
+				return nil, true, err
+			}
+			if snapshot.Stage == k12usecase.InboundPhotoRoutingStageIntent &&
+				decision == k12usecase.InboundPhotoRouteRegrade && len(snapshot.Candidates) > 1 {
+				snapshot.Stage = k12usecase.InboundPhotoRoutingStageCandidate
+				dispatch, err := snapshotCoordinator.RequestRoutingConfirmationWithSnapshot(
+					ctx, pending.Receipt.AgentName, pending.Receipt.ReceiptID,
+					pending.Dispatch.Version, snapshot,
+				)
+				if err != nil {
+					return nil, true, err
+				}
+				_ = dispatch
+				reply, replyErr := k12PhotoRoutingCandidateReply(snapshot)
+				return reply, true, replyErr
+			}
+			if snapshot.Stage == k12usecase.InboundPhotoRoutingStageIntent &&
+				decision == k12usecase.InboundPhotoRouteRegrade && len(snapshot.Candidates) == 1 {
+				_, err := snapshotCoordinator.ConfirmRoutingSelection(
+					ctx, pending.Receipt.AgentName, pending.Receipt.ReceiptID,
+					pending.Dispatch.Version, decision, snapshot.Candidates[0].PracticeSetID,
+				)
+				return nil, true, err
+			}
+		}
+	}
+	if decision == "" {
+		reply, replyErr := k12PhotoRoutingConfirmationReply()
+		return reply, true, replyErr
+	}
 	_, err = coordinator.ConfirmRouting(
 		ctx,
 		pending.Receipt.AgentName,
@@ -343,6 +485,24 @@ func confirmK12PendingPhotoRoute(
 		decision,
 	)
 	return nil, true, err
+}
+
+func k12PhotoRoutingCandidateIndex(msg *adapter.Message, total int) (int, bool) {
+	if msg == nil || total <= 0 {
+		return 0, false
+	}
+	value := strings.TrimSpace(msg.Metadata["routing_candidate_index"])
+	if value == "" {
+		value = strings.TrimSpace(msg.Content)
+	}
+	var index int
+	if _, err := fmt.Sscanf(value, "%d", &index); err != nil || index < 1 || index > total {
+		return 0, false
+	}
+	if fmt.Sprintf("%d", index) != value {
+		return 0, false
+	}
+	return index, true
 }
 
 func guardK12PendingPhotoRoute(
@@ -479,6 +639,33 @@ func k12PhotoRoutingConfirmationReply() (*adapter.Reply, error) {
 		},
 	}
 	return reply, nil
+}
+
+func k12PhotoRoutingCandidateText(snapshot k12usecase.InboundPhotoRoutingSnapshot) string {
+	lines := []string{"检测到多份未回传练习卷，请回复序号选择要回传的卷："}
+	for index, candidate := range snapshot.Candidates {
+		line := fmt.Sprintf("%d. ", index+1)
+		if title := strings.TrimSpace(candidate.Title); title != "" {
+			line += title + " · "
+		}
+		line += "卷面号 " + strings.TrimSpace(candidate.PaperNo)
+		if candidate.SentAt > 0 {
+			line += " · 发送日期 " + time.Unix(candidate.SentAt, 0).Format("2006-01-02")
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func k12PhotoRoutingCandidateReply(snapshot k12usecase.InboundPhotoRoutingSnapshot) (*adapter.Reply, error) {
+	text := k12PhotoRoutingCandidateText(snapshot)
+	message, err := channel.NewCanonicalMarkdownMessageWithAttachments(
+		messagecontent.ProducerK12, "zh-CN", text, text, "", nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return adapterReplyFromChannelMessage(message), nil
 }
 
 func k12CreativeWorkReply(result k12usecase.ImageTaskResult) (*adapter.Reply, error) {

@@ -61,6 +61,7 @@ export interface K12ImageTaskDispatch {
   dispatch_id: string
   task_intent: string
   status: string
+  failure_kind?: string
   progress: { operation: string; state: string }
   version: number
   [key: string]: unknown
@@ -74,6 +75,7 @@ export interface K12ImageTaskDispatchResponse {
   dispatch: K12ImageTaskDispatch & Record<string, unknown>
 }
 export interface K12ImageTaskResultResponse extends Record<string, unknown> {
+  failure_kind?: string
   result: Record<string, unknown>
 }
 export type K12ImageTaskProblemSourceAction = 'correct_text' | 'select_region' | 'retake' | 'skip' | 'resume'

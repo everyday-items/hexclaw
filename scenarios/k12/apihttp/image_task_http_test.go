@@ -30,7 +30,16 @@ import (
 type imageTaskClassifierHTTPStub struct {
 	calls  int
 	result usecase.ImageTaskClassification
+	err    error
 }
+
+type imageTaskClassifierHTTPDefinitiveError struct{}
+
+func (imageTaskClassifierHTTPDefinitiveError) Error() string {
+	return "provider failed with private detail"
+}
+
+func (imageTaskClassifierHTTPDefinitiveError) ProviderResponseStatusCode() int { return 503 }
 
 type imageTaskHTTPWritingOCRStub struct {
 	result usecase.ImageTaskWritingOCRResult
@@ -66,6 +75,9 @@ func (s *imageTaskClassifierHTTPStub) ClassifyImageTask(
 	context.Context, usecase.ImageTaskClassificationInput,
 ) (usecase.ImageTaskClassification, error) {
 	s.calls++
+	if s.err != nil {
+		return usecase.ImageTaskClassification{}, s.err
+	}
 	if s.result.Intent != "" {
 		return s.result, nil
 	}
@@ -74,6 +86,96 @@ func (s *imageTaskClassifierHTTPStub) ClassifyImageTask(
 		IntentEvidence: []string{"visible crayon illustration"},
 		Confidence:     0.99,
 	}, nil
+}
+
+func TestImageTaskFailedPublicEndpointsProjectSameStructuredFailureKind(t *testing.T) {
+	fixture := newImageTaskHTTPFixture(t)
+	fixture.classifier.err = imageTaskClassifierHTTPDefinitiveError{}
+	rec, out := do(t, fixture.handler, http.MethodPost, "/image-tasks",
+		createImageTaskBody(fixture.assetID, "message-failed"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create image task: %d %#v", rec.Code, out)
+	}
+	dispatchID, _ := out["dispatch"].(map[string]any)["dispatch_id"].(string)
+	if dispatchID == "" {
+		t.Fatalf("missing dispatch identity: %#v", out)
+	}
+
+	_, out = waitImageTaskHTTPState(t, fixture, dispatchID, func(dispatch map[string]any) bool {
+		return dispatch["status"] == string(k12.ImageTaskStatusFailed)
+	})
+	failedDispatch := out["dispatch"].(map[string]any)
+	const wantFailureKind = "classification_provider_failed"
+	if failedDispatch["failure_kind"] != wantFailureKind {
+		t.Fatalf("dispatch failure_kind=%#v, want %q; dispatch=%#v",
+			failedDispatch["failure_kind"], wantFailureKind, failedDispatch)
+	}
+	if body, _ := json.Marshal(failedDispatch); strings.Contains(string(body), "private detail") {
+		t.Fatalf("dispatch leaked error detail: %s", body)
+	}
+
+	rec, result := do(t, fixture.handler, http.MethodGet,
+		"/image-tasks/"+dispatchID+"/result?agent=mingming", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("result status=%d body=%#v", rec.Code, result)
+	}
+	if result["status"] != string(k12.ImageTaskStatusFailed) ||
+		result["failure_kind"] != wantFailureKind {
+		t.Fatalf("result failure projection drift: %#v", result)
+	}
+	if strings.Contains(rec.Body.String(), "private detail") {
+		t.Fatalf("result leaked error detail: %s", rec.Body.String())
+	}
+}
+
+func TestImageTaskRecoveringPublicEndpointsOmitInternalOutcomeUnknownFailureKind(t *testing.T) {
+	fixture := newImageTaskHTTPFixture(t)
+	fixture.classifier.err = imageTaskClassifierHTTPDefinitiveError{}
+	rec, out := do(t, fixture.handler, http.MethodPost, "/image-tasks",
+		createImageTaskBody(fixture.assetID, "message-recovering"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create image task: %d %#v", rec.Code, out)
+	}
+	dispatchID, _ := out["dispatch"].(map[string]any)["dispatch_id"].(string)
+	if dispatchID == "" {
+		t.Fatalf("missing dispatch identity: %#v", out)
+	}
+	_, out = waitImageTaskHTTPState(t, fixture, dispatchID, func(dispatch map[string]any) bool {
+		return dispatch["status"] == string(k12.ImageTaskStatusFailed)
+	})
+	if _, err := fixture.db.ExecContext(t.Context(), `
+		UPDATE k12_image_task_dispatches
+		SET failure_kind = ?, retry_safe = 0
+		WHERE dispatch_id = ?`, "classification_outcome_unknown", dispatchID); err != nil {
+		t.Fatalf("seed recovering dispatch: %v", err)
+	}
+
+	rec, out = do(t, fixture.handler, http.MethodGet,
+		"/image-tasks/"+dispatchID+"?agent=mingming", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dispatch status=%d body=%#v", rec.Code, out)
+	}
+	dispatch := out["dispatch"].(map[string]any)
+	if _, exists := dispatch["failure_kind"]; exists {
+		t.Fatalf("recovering dispatch leaked internal failure_kind: %#v", dispatch)
+	}
+	progress, _ := dispatch["progress"].(map[string]any)
+	if progress["state"] != "recovering" {
+		t.Fatalf("recovering dispatch state=%#v, want recovering", progress["state"])
+	}
+
+	rec, result := do(t, fixture.handler, http.MethodGet,
+		"/image-tasks/"+dispatchID+"/result?agent=mingming", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("result status=%d body=%#v", rec.Code, result)
+	}
+	if _, exists := result["failure_kind"]; exists {
+		t.Fatalf("recovering result leaked internal failure_kind: %#v", result)
+	}
+	dispatch, _ = result["dispatch"].(map[string]any)
+	if _, exists := dispatch["failure_kind"]; exists {
+		t.Fatalf("recovering result dispatch leaked internal failure_kind: %#v", dispatch)
+	}
 }
 
 type imageTaskHTTPFixture struct {

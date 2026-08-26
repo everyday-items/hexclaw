@@ -25,6 +25,10 @@ const (
 	k12DingtalkInboundRecoveryLimit   = 100
 )
 
+var errK12InboundPhotoRoutingSnapshotUnavailable = errors.New(
+	"DingTalk inbound photo routing snapshot is unavailable",
+)
+
 type k12InboundPhotoCoordinatorPort interface {
 	Admit(context.Context, k12usecase.InboundPhotoAdmission) (k12usecase.InboundPhotoBundle, bool, error)
 	Resume(context.Context, string, string) (k12usecase.InboundPhotoBundle, error)
@@ -479,9 +483,7 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceImageTask(
 		case k12usecase.InboundPhotoRouteRegrade:
 			return r.advancePracticeReturn(ctx, bundle, view, route.PracticeSetID)
 		case k12usecase.InboundPhotoRouteAskedUser:
-			dispatch, err := r.inbound.RequestRoutingConfirmation(
-				ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID, bundle.Dispatch.Version,
-			)
+			dispatch, err := r.requestRoutingConfirmation(ctx, bundle, route.Candidates)
 			if err != nil {
 				return false, err
 			}
@@ -511,9 +513,7 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceImageTask(
 	case k12.ImageTaskStatusAwaitingConfirmation:
 		switch bundle.Dispatch.RoutingDecision {
 		case k12usecase.InboundPhotoRoutePending:
-			dispatch, err := r.inbound.RequestRoutingConfirmation(
-				ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID, bundle.Dispatch.Version,
-			)
+			dispatch, err := r.requestRoutingConfirmation(ctx, bundle, nil)
 			if err != nil {
 				return false, err
 			}
@@ -615,6 +615,26 @@ func (r *k12DingtalkPhotoInboundRuntime) resolvePracticeRoute(
 	}, sets), nil
 }
 
+func (r *k12DingtalkPhotoInboundRuntime) requestRoutingConfirmation(
+	ctx context.Context,
+	bundle k12usecase.InboundPhotoBundle,
+	candidates []k12usecase.InboundPhotoRoutingCandidate,
+) (k12usecase.InboundPhotoDispatch, error) {
+	if coordinator, ok := r.inbound.(k12InboundPhotoRoutingSnapshotCoordinator); ok {
+		return coordinator.RequestRoutingConfirmationWithSnapshot(
+			ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID, bundle.Dispatch.Version,
+			k12usecase.InboundPhotoRoutingSnapshot{
+				ReceiptID:  bundle.Receipt.ReceiptID,
+				Stage:      k12usecase.InboundPhotoRoutingStageIntent,
+				Candidates: append([]k12usecase.InboundPhotoRoutingCandidate(nil), candidates...),
+			},
+		)
+	}
+	return r.inbound.RequestRoutingConfirmation(
+		ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID, bundle.Dispatch.Version,
+	)
+}
+
 func (r *k12DingtalkPhotoInboundRuntime) advancePracticeReturn(
 	ctx context.Context,
 	bundle k12usecase.InboundPhotoBundle,
@@ -625,6 +645,25 @@ func (r *k12DingtalkPhotoInboundRuntime) advancePracticeReturn(
 		ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID,
 	)
 	if errors.Is(err, records.ErrNotFound) {
+		if strings.TrimSpace(practiceSetID) == "" {
+			// 多候选确认后的复批必须消费持久化的选中卷号；只有旧的
+			// 单候选协议没有快照时，才允许回退到实时练习集解析。
+			if snapshotCoordinator, ok := r.inbound.(k12InboundPhotoRoutingSnapshotCoordinator); ok {
+				snapshot, snapshotErr := snapshotCoordinator.GetRoutingSnapshot(
+					ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID,
+				)
+				if snapshotErr == nil && snapshot.Stage == k12usecase.InboundPhotoRoutingStageCandidate {
+					practiceSetID = strings.TrimSpace(snapshot.SelectedPracticeSetID)
+					if practiceSetID == "" {
+						return false, fmt.Errorf("DingTalk practice-return selected candidate is incomplete")
+					}
+				} else if snapshotErr != nil &&
+					!errors.Is(snapshotErr, records.ErrNotFound) &&
+					!errors.Is(snapshotErr, errK12InboundPhotoRoutingSnapshotUnavailable) {
+					return false, snapshotErr
+				}
+			}
+		}
 		if strings.TrimSpace(practiceSetID) == "" {
 			route, routeErr := r.resolvePracticeRoute(ctx, bundle, view)
 			if routeErr != nil {
@@ -708,10 +747,24 @@ func (r *k12DingtalkPhotoInboundRuntime) sendRoutingConfirmation(
 	if r.replyBatches == nil {
 		return fmt.Errorf("DingTalk photo routing confirmation delivery is unavailable")
 	}
+	content := k12PhotoRoutingConfirmationText
+	if coordinator, ok := r.inbound.(k12InboundPhotoRoutingSnapshotCoordinator); ok {
+		snapshot, snapshotErr := coordinator.GetRoutingSnapshot(
+			ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID,
+		)
+		if snapshotErr != nil &&
+			!errors.Is(snapshotErr, records.ErrNotFound) &&
+			!errors.Is(snapshotErr, errK12InboundPhotoRoutingSnapshotUnavailable) {
+			return snapshotErr
+		}
+		if snapshotErr == nil && snapshot.Stage == k12usecase.InboundPhotoRoutingStageCandidate {
+			content = k12PhotoRoutingCandidateText(snapshot)
+		}
+	}
 	_, _, err := r.replyBatches.PrepareAndSendMessageBatchForTargets(
 		ctx, bundle.Receipt.AgentName, k12DingtalkPhotoRoutingObjectKind,
 		bundle.Receipt.ReceiptID,
-		k12usecase.DeliveryMessage{Content: k12PhotoRoutingConfirmationText},
+		k12usecase.DeliveryMessage{Content: content},
 		[]k12usecase.ResolvedDeliveryTarget{inboundPhotoFrozenTarget(bundle)},
 	)
 	return err
@@ -1021,6 +1074,74 @@ func (r *k12DingtalkPhotoInboundRuntime) ConfirmRouting(
 ) (k12usecase.InboundPhotoDispatch, error) {
 	dispatch, err := r.inbound.ConfirmRouting(
 		ctx, agentName, receiptID, expectedVersion, decision,
+	)
+	if err == nil {
+		r.schedule(agentName, receiptID)
+	}
+	return dispatch, err
+}
+
+// RequestRoutingConfirmationWithSnapshot 将二阶段候选快照转发到耐久协调器；
+// runtime 只负责把确认成功后的 worker 重新纳入同一收据，不复制存储状态机。
+func (r *k12DingtalkPhotoInboundRuntime) RequestRoutingConfirmationWithSnapshot(
+	ctx context.Context,
+	agentName, receiptID string,
+	expectedVersion int64,
+	snapshot k12usecase.InboundPhotoRoutingSnapshot,
+) (k12usecase.InboundPhotoDispatch, error) {
+	if r == nil || r.inbound == nil {
+		return k12usecase.InboundPhotoDispatch{}, errK12InboundPhotoRoutingSnapshotUnavailable
+	}
+	coordinator, ok := r.inbound.(interface {
+		RequestRoutingConfirmationWithSnapshot(
+			context.Context, string, string, int64, k12usecase.InboundPhotoRoutingSnapshot,
+		) (k12usecase.InboundPhotoDispatch, error)
+	})
+	if !ok {
+		return k12usecase.InboundPhotoDispatch{}, errK12InboundPhotoRoutingSnapshotUnavailable
+	}
+	return coordinator.RequestRoutingConfirmationWithSnapshot(
+		ctx, agentName, receiptID, expectedVersion, snapshot,
+	)
+}
+
+// GetRoutingSnapshot 只读取冻结候选，不重新读取可变练习集列表。
+func (r *k12DingtalkPhotoInboundRuntime) GetRoutingSnapshot(
+	ctx context.Context, agentName, receiptID string,
+) (k12usecase.InboundPhotoRoutingSnapshot, error) {
+	if r == nil || r.inbound == nil {
+		return k12usecase.InboundPhotoRoutingSnapshot{}, errK12InboundPhotoRoutingSnapshotUnavailable
+	}
+	coordinator, ok := r.inbound.(interface {
+		GetRoutingSnapshot(context.Context, string, string) (k12usecase.InboundPhotoRoutingSnapshot, error)
+	})
+	if !ok {
+		return k12usecase.InboundPhotoRoutingSnapshot{}, errK12InboundPhotoRoutingSnapshotUnavailable
+	}
+	return coordinator.GetRoutingSnapshot(ctx, agentName, receiptID)
+}
+
+// ConfirmRoutingSelection 只提交冻结候选中的 practice set，并让恢复 worker 接续复批。
+func (r *k12DingtalkPhotoInboundRuntime) ConfirmRoutingSelection(
+	ctx context.Context,
+	agentName, receiptID string,
+	expectedVersion int64,
+	decision k12usecase.InboundPhotoRoutingDecision,
+	practiceSetID string,
+) (k12usecase.InboundPhotoDispatch, error) {
+	if r == nil || r.inbound == nil {
+		return k12usecase.InboundPhotoDispatch{}, errK12InboundPhotoRoutingSnapshotUnavailable
+	}
+	coordinator, ok := r.inbound.(interface {
+		ConfirmRoutingSelection(
+			context.Context, string, string, int64, k12usecase.InboundPhotoRoutingDecision, string,
+		) (k12usecase.InboundPhotoDispatch, error)
+	})
+	if !ok {
+		return k12usecase.InboundPhotoDispatch{}, errK12InboundPhotoRoutingSnapshotUnavailable
+	}
+	dispatch, err := coordinator.ConfirmRoutingSelection(
+		ctx, agentName, receiptID, expectedVersion, decision, practiceSetID,
 	)
 	if err == nil {
 		r.schedule(agentName, receiptID)

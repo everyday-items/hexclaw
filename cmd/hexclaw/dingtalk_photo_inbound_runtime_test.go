@@ -438,6 +438,54 @@ type finalReplyBatchFake struct {
 	lastTargets    []k12usecase.ResolvedDeliveryTarget
 }
 
+// routingSnapshotReadErrorCoordinator 模拟候选确认快照在重启后被检测出摘要漂移；
+// 这种错误不能退回发送首阶段通用提示，避免把损坏的候选状态继续暴露给用户。
+type routingSnapshotReadErrorCoordinator struct {
+	*inboundPhotoCoordinatorFake
+	snapshotErr error
+}
+
+func (f *routingSnapshotReadErrorCoordinator) RequestRoutingConfirmationWithSnapshot(
+	context.Context, string, string, int64, k12usecase.InboundPhotoRoutingSnapshot,
+) (k12usecase.InboundPhotoDispatch, error) {
+	return f.bundle.Dispatch, nil
+}
+
+func (f *routingSnapshotReadErrorCoordinator) GetRoutingSnapshot(
+	context.Context, string, string,
+) (k12usecase.InboundPhotoRoutingSnapshot, error) {
+	return k12usecase.InboundPhotoRoutingSnapshot{}, f.snapshotErr
+}
+
+func (f *routingSnapshotReadErrorCoordinator) ConfirmRoutingSelection(
+	context.Context, string, string, int64,
+	k12usecase.InboundPhotoRoutingDecision, string,
+) (k12usecase.InboundPhotoDispatch, error) {
+	return f.bundle.Dispatch, nil
+}
+
+func TestDingTalkPhotoRoutingConfirmationFailsClosedWhenSnapshotReadErrors(t *testing.T) {
+	bundle := inboundPhotoBundleFixture([]byte("source-photo"))
+	bundle.Dispatch.RoutingDecision = k12usecase.InboundPhotoRouteAskedUser
+	bundle.Dispatch.ConfirmationStatus = k12usecase.InboundPhotoConfirmationWaiting
+	coordinator := &routingSnapshotReadErrorCoordinator{
+		inboundPhotoCoordinatorFake: &inboundPhotoCoordinatorFake{bundle: bundle},
+		snapshotErr:                 errors.New("routing snapshot digest mismatch"),
+	}
+	batches := &finalReplyBatchFake{}
+	runtime := newK12DingtalkPhotoInboundRuntime(k12DingtalkPhotoInboundRuntimeConfig{
+		Inbound: coordinator, ReplyBatches: batches,
+	})
+
+	err := runtime.sendRoutingConfirmation(context.Background(), bundle)
+	if err == nil || !strings.Contains(err.Error(), "routing snapshot digest mismatch") {
+		t.Fatalf("snapshot read error must stop routing confirmation, got %v", err)
+	}
+	if batches.prepareCalls != 0 {
+		t.Fatalf("snapshot read error must not send a fallback confirmation, prepare calls=%d", batches.prepareCalls)
+	}
+}
+
 func (f *finalReplyBatchFake) GetDeliveryBatchForMessageIdentity(
 	context.Context, string, string, string, string,
 	[]k12usecase.DeliveryAttachmentIdentity,

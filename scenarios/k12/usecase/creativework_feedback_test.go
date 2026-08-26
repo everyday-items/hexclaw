@@ -10,6 +10,43 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
+func assertApprovedStructuredFeedbackProjection(
+	t *testing.T,
+	markdown, limitation string,
+) {
+	t.Helper()
+	wantHeadings := []string{
+		"## 可见证据",
+		"## 先这样肯定",
+		"## 家长可以这样问或讲",
+		"## 下一次只试一个点",
+	}
+	gotHeadings := make([]string, 0, len(wantHeadings))
+	for _, line := range strings.Split(markdown, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "## ") {
+			gotHeadings = append(gotHeadings, line)
+		}
+	}
+	if strings.Join(gotHeadings, "\x00") != strings.Join(wantHeadings, "\x00") {
+		t.Fatalf("作品点评 H2 顺序 = %#v，期望 %#v；markdown=%q", gotHeadings, wantHeadings, markdown)
+	}
+	if strings.Contains(markdown, "## 说明") {
+		t.Fatalf("能力限制只能作为四段后的轻量正文，不能形成第五个 H2：%q", markdown)
+	}
+	if strings.Count(markdown, limitation) != 1 {
+		t.Fatalf("能力限制出现次数 = %d，期望 1；markdown=%q", strings.Count(markdown, limitation), markdown)
+	}
+	lastSection := strings.Index(markdown, "## 下一次只试一个点")
+	limitationAt := strings.LastIndex(markdown, limitation)
+	if lastSection < 0 || limitationAt <= lastSection {
+		t.Fatalf("能力限制必须位于第四段之后：section=%d limitation=%d markdown=%q", lastSection, limitationAt, markdown)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(markdown), limitation) {
+		t.Fatalf("能力限制必须是投影最后一个非空内容块：%q", markdown)
+	}
+}
+
 // fakeWorkFeedbackSolver 同时实现 Solver（占位）与 WorkFeedbackGenerator（fake executor），
 // 契约测试用：可控输出/可控失败，并记录用例传给 Skill 层的生成请求。
 type fakeWorkFeedbackSolver struct {
@@ -429,10 +466,12 @@ func TestBuildStructuredWorkFeedback_StripsProjectionMarkdownFromCanonicalFields
 		!strings.Contains(feedback.ProjectionMarkdown, "## 可见证据") ||
 		!strings.Contains(feedback.ProjectionMarkdown, "## 先这样肯定") ||
 		!strings.Contains(feedback.ProjectionMarkdown, "## 家长可以这样问或讲") ||
-		!strings.Contains(feedback.ProjectionMarkdown, "## 下一次只试一个点") ||
-		!strings.Contains(feedback.ProjectionMarkdown, "## 说明") {
+		!strings.Contains(feedback.ProjectionMarkdown, "## 下一次只试一个点") {
 		t.Fatalf("display projection must be deterministically generated from canonical fields, got %q", feedback.ProjectionMarkdown)
 	}
+	assertApprovedStructuredFeedbackProjection(
+		t, feedback.ProjectionMarkdown, feedback.Limitations,
+	)
 }
 
 // TestGenerateWorkFeedback_Art_INV011_Rejected INV-011 拦截对美术输出同样生效：

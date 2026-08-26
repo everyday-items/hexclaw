@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"path"
 	"strings"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -31,11 +32,26 @@ func (d Deps) PrepareAndSendGradingFinalArtifactExact(
 	if err != nil {
 		return k12.DeliveryBatch{}, false, err
 	}
-	return d.PrepareAndSendTextBatch(
+	annotated, err := d.Records.OpenGradingFinalAnnotatedAsset(
+		ctx,
+		finalArtifact.AgentName,
+		finalArtifact.ArtifactID,
+	)
+	if err != nil {
+		return k12.DeliveryBatch{}, false, err
+	}
+	return d.PrepareAndSendMessageBatch(
 		ctx,
 		finalArtifact.AgentName,
 		k12.PrintSourceGradingFinalArtifact,
 		finalArtifact.ArtifactID+":"+finalArtifact.ArtifactDigest,
-		finalArtifact.CanonicalMarkdown,
+		DeliveryMessage{
+			Content: finalArtifact.CanonicalMarkdown,
+			Attachments: []DeliveryAttachment{{
+				Name: "批注原图" + path.Ext(finalArtifact.AnnotatedAssetID),
+				MIME: annotated.MIME,
+				Data: annotated.Data,
+			}},
+		},
 	)
 }

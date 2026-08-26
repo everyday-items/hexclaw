@@ -5,6 +5,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -420,7 +422,7 @@ func extractPDFForAsyncIngestWithProgress(
 		if checkpoint, ok := completed[page]; ok {
 			result.Pages[page-1] = documentPageExtraction{
 				PageNumber: page, SourcePageFrom: page, SourcePageTo: page,
-				Mode: checkpoint.ExtractionMode, Text: checkpoint.Content,
+				Mode: checkpoint.ExtractionMode, Text: strings.TrimSpace(checkpoint.Content),
 			}
 			continue
 		}
@@ -433,15 +435,11 @@ func extractPDFForAsyncIngestWithProgress(
 			result.Pages[page-1].Mode = "ocr_vlm"
 			result.Pages[page-1].Text = ""
 			visualPages = append(visualPages, page)
-		} else if progress != nil {
-			if err := progress.CommitPage(ctx, knowledge.IngestPageCheckpoint{
-				PageNumber: page, PagesTotal: int64(info.PageCount), SourceDigest: sourceDigest,
-				ExtractionMode: "text", Content: text,
-			}); err != nil {
-				return result, err
-			}
 		}
 	}
+	// 所有页都先进入同一 canonical 文本坐标系，再提交 checkpoint；这样文本页、
+	// 已完成 OCR 页和后续 OCR 页不会各自维护一套偏移算法。
+	assignPDFPageSourceOffsets(result.Pages)
 	pagePlans := make([]knowledge.IngestPagePlan, 0, len(result.Pages))
 	for _, page := range result.Pages {
 		mode := knowledge.IngestSegmentText
@@ -476,6 +474,7 @@ func extractPDFForAsyncIngestWithProgress(
 			PagesTotal: info.PageCount, FailedPages: failedPages, Reasons: reasons,
 		}
 	}
+	invocationProgress, invocationSupported := progress.(knowledge.OCRPageInvocationContextProgress)
 
 	failed := make(map[int]string)
 	permanentFailure := false
@@ -550,25 +549,85 @@ func extractPDFForAsyncIngestWithProgress(
 				start = len(visualPages)
 				break
 			}
-			pageCtx, cancelPage := context.WithTimeout(totalCtx, limits.PageTimeout)
-			caption, captionErr := kb.CaptionImageWithRouteReceipt(
-				pageCtx, renderedPage.Data, "image/png",
+			var (
+				caption    knowledge.CaptionResult
+				captionErr error
+				invocation knowledge.OCRPageInvocation
 			)
-			cancelPage()
-			if captionErr != nil {
-				if ctx.Err() != nil {
-					return result, ctx.Err()
+			if invocationSupported {
+				route, routeOK := knowledge.VisionRouteSnapshotFromContext(ctx)
+				if !routeOK {
+					return result, knowledge.ErrInvalidVisionRouteSnapshot
 				}
-				failed[page] = "OCR/VLM failed: " + captionErr.Error()
-				continue
+				route = route.Canonical()
+				requestDigest := pdfOCRPageRequestDigest(
+					sourceDigest, page, info.PageCount, renderedPage.Data, route,
+				)
+				invocation, captionErr = invocationProgress.ClaimOCRPageInvocationContext(
+					ctx, knowledge.OCRPageInvocationClaim{
+						PageNumber: page, PagesTotal: int64(info.PageCount), SourceDigest: sourceDigest,
+						RequestDigest: requestDigest, Provider: route.ProviderName, Model: route.Model,
+					},
+				)
+				if errors.Is(captionErr, knowledge.ErrOCRPageInvocationLedgerUnavailable) {
+					invocationSupported = false
+					captionErr = nil
+				} else if captionErr != nil {
+					return result, captionErr
+				} else if !invocation.Fresh {
+					if invocation.Status != knowledge.OCRPageInvocationStatusSucceeded ||
+						strings.TrimSpace(invocation.Content) == "" {
+						return result, knowledge.ErrOCRPageInvocationOutcomeUnknown
+					}
+					caption.Content = invocation.Content
+					caption.RouteReceipt = invocation.RouteReceipt
+				}
 			}
-			result.Pages[page-1].Text = caption.Content
+			if !invocationSupported || invocation.Fresh {
+				pageCtx, cancelPage := context.WithTimeout(totalCtx, limits.PageTimeout)
+				caption, captionErr = kb.CaptionImageWithRouteReceipt(
+					pageCtx, renderedPage.Data, "image/png",
+				)
+				cancelPage()
+				if captionErr != nil {
+					if invocationSupported && invocation.Fresh {
+						if marker, ok := progress.(knowledge.OCRPageInvocationContextOutcomeMarker); ok {
+							markErr := marker.MarkOCRPageInvocationOutcomeUnknownContext(
+								ctx, invocation, captionErr.Error(),
+							)
+							if markErr != nil && !errors.Is(markErr, knowledge.ErrOCRPageInvocationLedgerUnavailable) {
+								return result, markErr
+							}
+						}
+						return result, knowledge.ErrOCRPageInvocationOutcomeUnknown
+					}
+					if ctx.Err() != nil {
+						return result, ctx.Err()
+					}
+					failed[page] = "OCR/VLM failed: " + captionErr.Error()
+					continue
+				}
+			}
+			result.Pages[page-1].Text = strings.TrimSpace(caption.Content)
+			assignPDFPageSourceOffsets(result.Pages)
 			if progress != nil {
 				receipt := caption.RouteReceipt
+				if invocationSupported && invocation.Fresh {
+					if err := invocationProgress.SaveOCRPageInvocationContext(
+						ctx, invocation,
+						knowledge.OCRPageInvocationResult{Content: result.Pages[page-1].Text, RouteReceipt: receipt},
+					); err != nil {
+						if !errors.Is(err, knowledge.ErrOCRPageInvocationLedgerUnavailable) {
+							return result, err
+						}
+					}
+				}
 				if err := progress.CommitPage(ctx, knowledge.IngestPageCheckpoint{
 					PageNumber: page, PagesTotal: int64(info.PageCount), SourceDigest: sourceDigest,
 					ExtractionMode: "ocr_vlm", Content: result.Pages[page-1].Text,
-					OCRRouteReceipt: &receipt,
+					SourceOffsetStart: result.Pages[page-1].SourceOffsetFrom,
+					SourceOffsetEnd:   result.Pages[page-1].SourceOffsetTo,
+					OCRRouteReceipt:   &receipt,
 				}); err != nil {
 					return result, err
 				}
@@ -590,8 +649,70 @@ func extractPDFForAsyncIngestWithProgress(
 			Cause: cause,
 		}
 	}
+	// OCR 页可能位于文本页之前；在 OCR 全部完成后重新计算一次完整页序，
+	// 再统一提交文本页和已完成页，避免先提交的后续文本页占用错误坐标。
+	assignPDFPageSourceOffsets(result.Pages)
+	if progress != nil {
+		for page := 1; page <= info.PageCount; page++ {
+			pageResult := result.Pages[page-1]
+			if strings.TrimSpace(pageResult.Text) == "" {
+				continue
+			}
+			if pageResult.SourceOffsetTo <= pageResult.SourceOffsetFrom {
+				return result, fmt.Errorf("%w: missing canonical PDF page offset %d", knowledge.ErrInvalidDocumentUpload, page)
+			}
+			checkpoint, completedPage := completed[page]
+			if completedPage {
+				checkpoint.SourceOffsetStart = pageResult.SourceOffsetFrom
+				checkpoint.SourceOffsetEnd = pageResult.SourceOffsetTo
+			} else {
+				checkpoint = knowledge.IngestPageCheckpoint{
+					PageNumber: page, PagesTotal: int64(info.PageCount), SourceDigest: sourceDigest,
+					ExtractionMode: pageResult.Mode, Content: pageResult.Text,
+					SourceOffsetStart: pageResult.SourceOffsetFrom, SourceOffsetEnd: pageResult.SourceOffsetTo,
+				}
+			}
+			if pageResult.Mode == "ocr_vlm" {
+				// OCR 新页已在 Provider 成功后提交过一次；再次提交只用于
+				// 让重试/历史页与最终 canonical 坐标保持同一事实。
+				if checkpoint.OCRRouteReceipt == nil {
+					if invocation, ok := completed[page]; ok {
+						checkpoint.OCRRouteReceipt = invocation.OCRRouteReceipt
+					}
+				}
+				if checkpoint.OCRRouteReceipt == nil {
+					// 新 OCR 页的 receipt 已由当前循环构造并提交；此处跳过，
+					// 避免在没有 route receipt 的情况下伪造 checkpoint。
+					continue
+				}
+			}
+			if err := progress.CommitPage(ctx, checkpoint); err != nil {
+				return result, err
+			}
+		}
+	}
 	result.Text = joinPDFPageExtractions(result.Pages)
 	return result, nil
+}
+
+func pdfOCRPageRequestDigest(
+	sourceDigest string,
+	page, pagesTotal int,
+	image []byte,
+	route knowledge.VisionRouteSnapshot,
+) string {
+	imageSum := sha256.Sum256(image)
+	route = route.Canonical()
+	h := sha256.New()
+	for _, part := range [][]byte{
+		[]byte("knowledge-pdf-page-ocr-v1"),
+		[]byte(sourceDigest), []byte(fmt.Sprintf("%d/%d", page, pagesTotal)),
+		imageSum[:], []byte(route.Fingerprint), []byte(route.ProviderName), []byte(route.Model),
+	} {
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write(part)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func firstResourceGovernor(governors []*resourcegov.Governor) *resourcegov.Governor {
@@ -680,6 +801,7 @@ func boundedPDFPageRange(first, last, maximum int) []int {
 }
 
 func joinPDFPageExtractions(pages []documentPageExtraction) string {
+	assignPDFPageSourceOffsets(pages)
 	var b strings.Builder
 	for _, page := range pages {
 		if strings.TrimSpace(page.Text) == "" {
@@ -690,11 +812,34 @@ func joinPDFPageExtractions(pages []documentPageExtraction) string {
 		}
 		fmt.Fprintf(&b, "## PDF 第 %d 页\n\n<!-- source_page_span=%d-%d -->\n\n",
 			page.PageNumber, page.SourcePageFrom, page.SourcePageTo)
-		pages[page.PageNumber-1].SourceOffsetFrom = int64(b.Len())
 		b.WriteString(strings.TrimSpace(page.Text))
-		pages[page.PageNumber-1].SourceOffsetTo = int64(b.Len())
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// assignPDFPageSourceOffsets 为每个非空页计算 canonical 文本中的内容范围。
+// 页标题和来源注释属于 canonical 文本，但不计入该页正文范围；范围以 UTF-8 字节计。
+func assignPDFPageSourceOffsets(pages []documentPageExtraction) {
+	var cursor int64
+	hasPreviousPage := false
+	for index := range pages {
+		pages[index].SourceOffsetFrom = 0
+		pages[index].SourceOffsetTo = 0
+		text := strings.TrimSpace(pages[index].Text)
+		if text == "" {
+			continue
+		}
+		if hasPreviousPage {
+			cursor += int64(len("\n\n"))
+		}
+		prefix := fmt.Sprintf("## PDF 第 %d 页\n\n<!-- source_page_span=%d-%d -->\n\n",
+			pages[index].PageNumber, pages[index].SourcePageFrom, pages[index].SourcePageTo)
+		cursor += int64(len(prefix))
+		pages[index].SourceOffsetFrom = cursor
+		cursor += int64(len(text))
+		pages[index].SourceOffsetTo = cursor
+		hasPreviousPage = true
+	}
 }
 
 func inspectPDFDocument(ctx context.Context, path string) (pdfDocumentInfo, error) {
@@ -754,7 +899,8 @@ func extractPDFTextPagesFromPath(
 	}()
 	stdout := &boundedFileWriter{file: spool, limit: maxTextBytes}
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, bin, "-enc", "UTF-8", "-q", path, "-")
+	// 保留 PDF 页面布局，确保页脚数字仍位于本页正文末尾，供教材目录的确定性页码证据使用。
+	cmd := exec.CommandContext(ctx, bin, "-layout", "-enc", "UTF-8", "-q", path, "-")
 	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
 	cmd.Stdout = stdout
 	cmd.Stderr = &stderr

@@ -91,6 +91,31 @@ func TestTextbookCatalogCheckpointExtractorPrefersCurrentApprovalYearAcrossPDFLi
 	}
 }
 
+func TestTextbookCatalogCheckpointExtractorAcceptsUnicodeTOCWhitespace(t *testing.T) {
+	source := syntheticTextbookCatalogSource()
+	source.Pages[1].Content = "目 录\n1　观察物体（三）　1\n2　因数和倍数　2\n"
+	source.Pages[1].ContentDigest = testTextbookContentDigest(source.Pages[1].Content)
+	publication, err := (TextbookCatalogCheckpointExtractor{}).Extract(
+		context.Background(), source,
+	)
+	if err != nil {
+		t.Fatalf("extract catalog with full-width TOC whitespace: %v", err)
+	}
+	var catalog struct {
+		Units []struct {
+			Title    string `json:"title"`
+			PageFrom int    `json:"page_from"`
+		} `json:"units"`
+	}
+	if err := json.Unmarshal(publication.CatalogJSON, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Units) != 2 || catalog.Units[0].Title != "观察物体（三）" ||
+		catalog.Units[0].PageFrom != 1 || catalog.Units[1].PageFrom != 2 {
+		t.Fatalf("unicode TOC units=%+v", catalog.Units)
+	}
+}
+
 func TestTextbookCatalogCheckpointExtractorFailsClosedOnMissingVersionOrPage(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -188,6 +188,85 @@ type OCRRouteReceipt struct {
 	Fake      bool   `json:"fake"`
 }
 
+// OCRPageInvocationStatus 是逐页 OCR 调用的耐久状态。running/outcome_unknown
+// 只能由同一调用的恢复/对账路径处理，不能盲目再次调用 Provider。
+type OCRPageInvocationStatus string
+
+const (
+	OCRPageInvocationStatusPrepared       OCRPageInvocationStatus = "prepared"
+	OCRPageInvocationStatusRunning        OCRPageInvocationStatus = "running"
+	OCRPageInvocationStatusSucceeded      OCRPageInvocationStatus = "succeeded"
+	OCRPageInvocationStatusFailed         OCRPageInvocationStatus = "failed"
+	OCRPageInvocationStatusOutcomeUnknown OCRPageInvocationStatus = "outcome_unknown"
+)
+
+var ErrOCRPageInvocationOutcomeUnknown = errors.New("knowledge: OCR page invocation outcome unknown")
+var ErrOCRPageInvocationLedgerUnavailable = errors.New("knowledge: OCR page invocation ledger unavailable")
+
+// OCRPageInvocationClaim 是调用前冻结的逐页身份；JobID 由持有的 JobLease 提供，
+// 防止调用方用另一个任务覆盖同一页的事实。
+type OCRPageInvocationClaim struct {
+	PageNumber    int
+	PagesTotal    int64
+	SourceDigest  string
+	RequestDigest string
+	Provider      string
+	Model         string
+}
+
+// OCRPageInvocation 是 OCR 调用的内部耐久投影。Content 只用于同一任务恢复页检查点，
+// 不进入公开接口或日志；RouteReceipt 仍需通过既有冻结路由校验。
+type OCRPageInvocation struct {
+	InvocationID  string
+	JobID         string
+	PageNumber    int
+	PagesTotal    int64
+	SourceDigest  string
+	RequestDigest string
+	Provider      string
+	Model         string
+	Operation     string
+	Status        OCRPageInvocationStatus
+	Content       string
+	ContentDigest string
+	RouteReceipt  OCRRouteReceipt
+	LeaseEpoch    int64
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	Fresh         bool `json:"-"`
+}
+
+// OCRPageInvocationResult 是 Provider 成功后的最小结果；保存成功事实与内容摘要
+// 后，下一次 worker 可直接复用，不会再次触发相同 VLM 请求。
+type OCRPageInvocationResult struct {
+	Content      string
+	RouteReceipt OCRRouteReceipt
+}
+
+// OCRPageInvocationProgress 是 IngestPageProgress 的可选耐久扩展。旧的文本页与
+// 外部测试实现无需实现该接口，只有实际 OCR 页在调用 VLM 前后使用它。
+type OCRPageInvocationProgress interface {
+	ClaimOCRPageInvocation(context.Context, JobLease, time.Time, OCRPageInvocationClaim) (OCRPageInvocation, error)
+	SaveOCRPageInvocation(context.Context, JobLease, time.Time, OCRPageInvocation, OCRPageInvocationResult) error
+}
+
+// OCRPageInvocationContextProgress 是 worker 已绑定租约后的适配面；调用方无需
+// 直接接触 lease epoch，避免以空租约执行账本写入。
+type OCRPageInvocationContextProgress interface {
+	ClaimOCRPageInvocationContext(context.Context, OCRPageInvocationClaim) (OCRPageInvocation, error)
+	SaveOCRPageInvocationContext(context.Context, OCRPageInvocation, OCRPageInvocationResult) error
+}
+
+// OCRPageInvocationOutcomeMarker 在 Provider 未返回可验证结果时把调用停在
+// outcome_unknown，恢复路径只能先对账，不能直接再次调用。
+type OCRPageInvocationOutcomeMarker interface {
+	MarkOCRPageInvocationOutcomeUnknown(context.Context, JobLease, time.Time, OCRPageInvocation, string) error
+}
+
+type OCRPageInvocationContextOutcomeMarker interface {
+	MarkOCRPageInvocationOutcomeUnknownContext(context.Context, OCRPageInvocation, string) error
+}
+
 const (
 	OCRRouteOperationPDFPage = "knowledge_pdf_page_ocr"
 	OCRRouteStatusSucceeded  = "succeeded"

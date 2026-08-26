@@ -118,7 +118,8 @@ func loadTextbookCatalogSourceSnapshot(
 		}
 		if page.PDFPage != len(snapshot.Pages)+1 ||
 			page.SourceOffsetFrom < 0 || page.SourceOffsetTo <= page.SourceOffsetFrom ||
-			page.SourceOffsetFrom < previousOffsetTo || checkpointLeaseEpoch != jobLeaseEpoch ||
+			page.SourceOffsetFrom < previousOffsetTo || checkpointLeaseEpoch <= 0 ||
+			checkpointLeaseEpoch > jobLeaseEpoch ||
 			sha256Hex([]byte(content)) != page.ContentDigest {
 			rows.Close()
 			return textbookCatalogSourceSnapshot{}, "", ErrTextbookCatalogSourceIncomplete
@@ -435,9 +436,12 @@ func (s *Store) RecoverTextbookCatalogJobs(
 		j.document_id,j.document_generation,j.source_digest
 		FROM k12_textbook_catalog_jobs j
 		JOIN k12_textbook_manifests m ON m.manifest_id=j.manifest_id
-		WHERE j.state IN ('queued','retry_wait','failed_retryable')
+		WHERE (j.state IN ('queued','retry_wait','failed_retryable')
+		       OR (j.state='failed_terminal' AND j.failure_code='source_evidence_incomplete'))
 		  AND (j.ingest_job_id='' OR length(j.source_plan_digest)<>64)
-		  AND m.state IN ('extracting','failed_retryable')
+		  AND (m.state IN ('extracting','failed_retryable')
+		       OR (j.state='failed_terminal' AND j.failure_code='source_evidence_incomplete'
+		           AND m.state='failed_terminal'))
 		ORDER BY j.created_at,j.job_id LIMIT ?`, limit)
 	if err != nil {
 		return err
@@ -491,7 +495,8 @@ func (s *Store) RecoverTextbookCatalogJobs(
 			SET ingest_job_id=?,source_plan_digest=?,extractor_contract=?,
 			    request_digest=?,state=?,failure_code=?,last_error=?,
 			    next_attempt_at=0,lease_owner='',lease_expires_at=0,updated_at=?
-			WHERE job_id=? AND state IN ('queued','retry_wait','failed_retryable')
+			WHERE job_id=? AND (state IN ('queued','retry_wait','failed_retryable')
+			  OR (state='failed_terminal' AND failure_code='source_evidence_incomplete'))
 			  AND (ingest_job_id='' OR length(source_plan_digest)<>64)`,
 			ingestJobID, sourcePlanDigest, TextbookCatalogExtractorContract,
 			requestDigest, state, failureCode, lastError, nowMilli, item.jobID,
@@ -509,7 +514,7 @@ func (s *Store) RecoverTextbookCatalogJobs(
 		} else {
 			if _, err := tx.ExecContext(ctx, `UPDATE k12_textbook_manifests
 				SET state='extracting',retryable=0,failure_message='',updated_at=?
-				WHERE manifest_id=? AND state='failed_retryable'`,
+				WHERE manifest_id=? AND state IN ('failed_retryable','failed_terminal')`,
 				nowMilli, item.manifestID,
 			); err != nil {
 				return err

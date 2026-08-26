@@ -72,7 +72,7 @@ func TestSendWithReceiptImageUploadFailureIsFailClosed(t *testing.T) {
 			Content: "## 作品与点评",
 			Attachments: []adapter.Attachment{{
 				Type: "image", Name: "creative-work.png", Mime: "image/png",
-				Data: base64.StdEncoding.EncodeToString([]byte("creative-work-png")),
+				Data: base64.StdEncoding.EncodeToString(testPNGBytes(t)),
 			}},
 		}
 	}
