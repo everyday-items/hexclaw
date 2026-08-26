@@ -2532,6 +2532,9 @@ func (e *ReActEngine) processStreamRuntime(
 		// BUG-1：把工具循环收集的 reply-safe 元数据落到 msg.Metadata，finalizeRuntimeStreamResult
 		// 克隆 msg.Metadata 作 msgMeta 并经 buildReplyMetadata 转发（record chip 等）。
 		applyToolReplyMeta(streamCtx, msg)
+		if visibleContent := sink.visibleContent.String(); visibleContent != "" {
+			result.Content = visibleContent
+		}
 		finalContent, streamTail, metadata, usage, toolCalls := e.finalizeRuntimeStreamResult(ctx, sessionID, msg, provider, req, result, providerName, modelName, cacheInput, maxTurnsHit, sink.thinkingDuration())
 		if ctx.Err() != nil {
 			return
@@ -2564,10 +2567,11 @@ func (e *ReActEngine) processStreamRuntime(
 }
 
 type replyChunkRuntimeSink struct {
-	ch          chan<- *adapter.ReplyChunk
-	sentContent bool
-	started     chan<- error
-	startOnce   sync.Once
+	ch             chan<- *adapter.ReplyChunk
+	sentContent    bool
+	visibleContent strings.Builder
+	started        chan<- error
+	startOnce      sync.Once
 	// reasoning 计时（BUG-20260703 B3）：runtime 流式路径的思考时长在此采样，
 	// finalize 时经 thinkingDuration() 透出+落库。与 legacy 流式路径同语义：
 	// 首个 reasoning 增量起表，其后首个 content 增量停表。
@@ -2639,6 +2643,7 @@ func (s *replyChunkRuntimeSink) Emit(ctx context.Context, event hruntime.Event) 
 	}
 	if event.Chunk.Content != "" {
 		s.sentContent = true
+		s.visibleContent.WriteString(event.Chunk.Content)
 		if !s.reasoningStart.IsZero() && s.reasoningEnd.IsZero() {
 			s.reasoningEnd = time.Now()
 		}

@@ -2,8 +2,10 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -23,6 +25,17 @@ import (
 )
 
 const assistantPersistenceRecord = `{"collection":"mistake","status":"new"}`
+
+const (
+	assistantPersistenceFixturePrefix = "HEXCLAW-ASSISTANT-PERSISTENCE-ATOMIC-001\n"
+	assistantPersistenceFixtureBytes  = 766
+	assistantPersistenceFixtureSHA256 = "2a609030951de7616b5d756ecabc8d323eed7f5b5c59660a51d291e4698ffebb"
+)
+
+var assistantPersistenceFixedFixture = assistantPersistenceFixturePrefix + strings.Repeat(
+	"x",
+	assistantPersistenceFixtureBytes-len(assistantPersistenceFixturePrefix),
+)
 
 type assistantPersistenceProbeSkill struct{}
 
@@ -670,8 +683,14 @@ func TestCHATAssistantPersistenceAtomicSyncRestartReplaysExactReplyWithoutProvid
 	const (
 		sessionID = "sess-assistant-sync-restart"
 		requestID = "req-assistant-sync-restart"
-		content   = "durable synchronous answer"
 	)
+	content := assistantPersistenceFixedFixture
+	if got := len([]byte(content)); got != assistantPersistenceFixtureBytes {
+		t.Fatalf("fixed fixture bytes=%d, want %d", got, assistantPersistenceFixtureBytes)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(content))); got != assistantPersistenceFixtureSHA256 {
+		t.Fatalf("fixed fixture sha256=%q, want %q", got, assistantPersistenceFixtureSHA256)
+	}
 	dbPath := filepath.Join(t.TempDir(), "assistant-sync-restart.db")
 	real, err := sqlitestore.New(dbPath)
 	if err != nil {

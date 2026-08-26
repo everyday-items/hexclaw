@@ -106,7 +106,8 @@ func TestBug20260703_B5_StreamDoneChunkBlocksEndWithFinalText(t *testing.T) {
 // toolThenTextStreamProvider 流式先发一次工具调用（turn 1），工具结果回填后吐最终
 // 正文（turn 2）——离线复刻「web_search 后作答」的多步流式工具轮。
 type toolThenTextStreamProvider struct {
-	finalAnswer string
+	firstContent string
+	finalAnswer  string
 }
 
 func (p *toolThenTextStreamProvider) Name() string { return "test" }
@@ -135,7 +136,10 @@ func (p *toolThenTextStreamProvider) Stream(_ context.Context, req hexagon.Compl
 		body = `data: {"choices":[{"index":0,"delta":{"content":"` + p.finalAnswer + `"},"finish_reason":"stop"}]}` + "\n\n" +
 			`data: [DONE]` + "\n\n"
 	} else {
-		body = `data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"web_search","arguments":"{\"q\":\"杭州天气\"}"}}]}}]}` + "\n\n" +
+		if p.firstContent != "" {
+			body = `data: {"choices":[{"index":0,"delta":{"content":"` + p.firstContent + `"}}]}` + "\n\n"
+		}
+		body += `data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"web_search","arguments":"{\"q\":\"杭州天气\"}"}}]}}]}` + "\n\n" +
 			`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n" +
 			`data: [DONE]` + "\n\n"
 	}
@@ -147,3 +151,75 @@ func (p *toolThenTextStreamProvider) Models() []llm.ModelInfo {
 }
 
 func (p *toolThenTextStreamProvider) CountTokens([]llm.Message) (int, error) { return 0, nil }
+
+func TestProcessStreamPersistsAllVisibleMultiTurnContent(t *testing.T) {
+	const (
+		firstContent = "I will check first. "
+		finalAnswer  = "The verified answer is 12."
+	)
+	provider := &toolThenTextStreamProvider{
+		firstContent: firstContent,
+		finalAnswer:  finalAnswer,
+	}
+	store, err := sqlitestore.New(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Init(context.Background()); err != nil {
+		t.Fatalf("initialize store: %v", err)
+	}
+	cfg := config.DefaultConfig()
+	cfg.Compaction.Enabled = false
+	cfg.Knowledge.Enabled = false
+	cfg.FileMemory.Enabled = false
+	cfg.FileMemory.AutoMemory = "off"
+	cfg.LLM.Default = "test"
+	cfg.LLM.Providers = map[string]config.LLMProviderConfig{"test": {Model: "mock-model"}}
+	router := llmrouter.NewWithProviders(cfg.LLM, map[string]hexagon.Provider{"test": provider})
+	eng := NewReActEngine(cfg, router, store, skill.NewRegistry())
+	if err := eng.Start(context.Background()); err != nil {
+		t.Fatalf("start engine: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Stop(context.Background()) })
+
+	msg := &adapter.Message{
+		ID:        "request-multi-turn-visible-content",
+		Platform:  adapter.PlatformAPI,
+		UserID:    "user-multi-turn-visible-content",
+		SessionID: "session-multi-turn-visible-content",
+		Content:   "Use the tool and answer.",
+		Metadata: map[string]string{
+			"request_id": "request-multi-turn-visible-content",
+		},
+	}
+	stream, err := eng.ProcessStream(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("ProcessStream: %v", err)
+	}
+	var visible strings.Builder
+	var terminal *adapter.ReplyChunk
+	for chunk := range stream {
+		if chunk == nil {
+			continue
+		}
+		visible.WriteString(chunk.Content)
+		if chunk.Done {
+			copy := *chunk
+			terminal = &copy
+		}
+	}
+	if terminal == nil || terminal.Error != nil {
+		t.Fatalf("terminal chunk: %+v", terminal)
+	}
+	if got, want := visible.String(), firstContent+finalAnswer; got != want {
+		t.Fatalf("visible content=%q want=%q", got, want)
+	}
+	persisted, err := store.GetMessage(context.Background(), terminal.AssistantMessageID)
+	if err != nil {
+		t.Fatalf("get persisted assistant: %v", err)
+	}
+	if persisted.Content != visible.String() {
+		t.Fatalf("persisted content=%q visible content=%q", persisted.Content, visible.String())
+	}
+}

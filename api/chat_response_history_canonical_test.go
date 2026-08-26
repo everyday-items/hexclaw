@@ -18,6 +18,7 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/hexclaw/adapter"
 	"github.com/hexagon-codes/hexclaw/config"
 	enginepkg "github.com/hexagon-codes/hexclaw/engine"
 	"github.com/hexagon-codes/hexclaw/llmrouter"
@@ -33,6 +34,57 @@ type apiCanonicalHistoryStreamProvider struct {
 	streamCalls   atomic.Int32
 	completeCalls atomic.Int32
 }
+
+type apiMultiTurnToolStreamProvider struct {
+	streamCalls atomic.Int32
+}
+
+func (*apiMultiTurnToolStreamProvider) Name() string { return "test" }
+
+func (p *apiMultiTurnToolStreamProvider) Complete(_ context.Context, req hexagon.CompletionRequest) (*hexagon.CompletionResponse, error) {
+	for _, message := range req.Messages {
+		if message.Role == llm.RoleTool {
+			return &hexagon.CompletionResponse{Content: "The verified answer is 12."}, nil
+		}
+	}
+	return &hexagon.CompletionResponse{
+		Content: "I will check first. ",
+		ToolCalls: []llm.ToolCall{{
+			ID:        "api-multi-turn-tool",
+			Name:      "web_search",
+			Arguments: `{"q":"6+6"}`,
+		}},
+	}, nil
+}
+
+func (p *apiMultiTurnToolStreamProvider) Stream(_ context.Context, req hexagon.CompletionRequest) (*hexagon.LLMStream, error) {
+	p.streamCalls.Add(1)
+	hasToolResult := false
+	for _, message := range req.Messages {
+		if message.Role == llm.RoleTool {
+			hasToolResult = true
+			break
+		}
+	}
+	if hasToolResult {
+		return llm.NewStream(strings.NewReader(
+			"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The verified answer is 12.\"},\"finish_reason\":\"stop\"}]}\n\n"+
+				"data: [DONE]\n\n",
+		), llm.StreamOpenAIFormat), nil
+	}
+	return llm.NewStream(strings.NewReader(
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will check first. \"}}]}\n\n"+
+			"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"api-multi-turn-tool\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"q\\\":\\\"6+6\\\"}\"}}]}}]}\n\n"+
+			"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"+
+			"data: [DONE]\n\n",
+	), llm.StreamOpenAIFormat), nil
+}
+
+func (*apiMultiTurnToolStreamProvider) Models() []llm.ModelInfo {
+	return []llm.ModelInfo{{ID: "mock-model", Name: "Mock Model"}}
+}
+
+func (*apiMultiTurnToolStreamProvider) CountTokens([]llm.Message) (int, error) { return 1, nil }
 
 func (*apiCanonicalHistoryStreamProvider) Name() string { return "test" }
 
@@ -317,5 +369,160 @@ func TestChatAPIResponseAndPublicHistoryShareCanonicalAssistantBytesAcrossRestar
 	}
 	if len(historyAfterReplay.Messages) != 2 {
 		t.Fatalf("restart replay changed durable history rows=%d, want user+assistant only", len(historyAfterReplay.Messages))
+	}
+}
+
+func apiMultiTurnRequest(
+	t *testing.T,
+	client *http.Client,
+	url string,
+	body []byte,
+	sse bool,
+) ChatResponse {
+	t.Helper()
+	if !sse {
+		var response ChatResponse
+		apiCanonicalHistoryDoJSON(t, client, http.MethodPost, url, body, &response)
+		return response
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new SSE request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("SSE request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read SSE response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("SSE status=%d body=%s", resp.StatusCode, raw)
+	}
+	frames := sseFrames(string(raw))
+	if len(frames) < 2 || frames[len(frames)-1] != "[DONE]" {
+		t.Fatalf("invalid SSE frames: %q", frames)
+	}
+	var visible strings.Builder
+	var terminal adapter.ReplyChunk
+	for _, frame := range frames[:len(frames)-1] {
+		var chunk adapter.ReplyChunk
+		if err := json.Unmarshal([]byte(frame), &chunk); err != nil {
+			t.Fatalf("decode SSE chunk: %v frame=%q", err, frame)
+		}
+		visible.WriteString(chunk.Content)
+		if chunk.Done {
+			terminal = chunk
+		}
+	}
+	if terminal.AssistantMessageID == "" {
+		t.Fatalf("SSE terminal assistant identity is empty: %s", raw)
+	}
+	return ChatResponse{
+		Reply:              visible.String(),
+		AssistantMessageID: terminal.AssistantMessageID,
+		BackendMessageID:   terminal.BackendMessageID,
+		MessageID:          terminal.MessageID,
+	}
+}
+
+func apiMultiTurnAssertEqual(t *testing.T, response ChatResponse, history []*storage.MessageRecord) {
+	t.Helper()
+	const expected = "I will check first. The verified answer is 12."
+	assistant := apiCanonicalHistoryAssistant(t, history)
+	if response.Reply != expected || assistant.Content != expected {
+		t.Fatalf("multi-turn response/history differ: response=%q history=%q", response.Reply, assistant.Content)
+	}
+	if response.AssistantMessageID == "" || response.AssistantMessageID != assistant.ID {
+		t.Fatalf("multi-turn assistant identity differs: response=%q history=%q", response.AssistantMessageID, assistant.ID)
+	}
+	if apiCanonicalHistoryDigest(response.Reply) != apiCanonicalHistoryDigest(assistant.Content) {
+		t.Fatal("multi-turn response/history SHA-256 digests differ")
+	}
+}
+
+func TestChatAPIMultiTurnToolVisibleBytesMatchHistoryAcrossJSONSSEAndRestart(t *testing.T) {
+	for _, sse := range []bool{false, true} {
+		name := "json"
+		if sse {
+			name = "sse"
+		}
+		t.Run(name, func(t *testing.T) {
+			const requestID = "req-api-multi-turn"
+			sessionID := "sess-api-multi-turn-" + name
+			cfg := apiCanonicalHistoryConfig()
+			cfg.LLM.Tools.Enabled = "on"
+			dbPath := filepath.Join(t.TempDir(), "api-multi-turn.db")
+			store, err := sqlitestore.New(dbPath)
+			if err != nil {
+				t.Fatalf("new sqlite store: %v", err)
+			}
+			if err := store.Init(context.Background()); err != nil {
+				t.Fatalf("init sqlite store: %v", err)
+			}
+			provider := &apiMultiTurnToolStreamProvider{}
+			eng := newAPICanonicalHistoryEngine(t, cfg, store, provider)
+			httpServer := httptest.NewServer(NewServer(cfg, eng, nil, store).routes())
+
+			requestBody, err := json.Marshal(ChatRequest{
+				Message:   "Use the tool and answer.",
+				SessionID: sessionID,
+				Provider:  "test",
+				Model:     "mock-model",
+				RequestID: requestID,
+			})
+			if err != nil {
+				t.Fatalf("marshal chat request: %v", err)
+			}
+			first := apiMultiTurnRequest(t, httpServer.Client(), httpServer.URL+"/api/v1/chat", requestBody, sse)
+			var firstHistory struct {
+				Messages []*storage.MessageRecord `json:"messages"`
+			}
+			apiCanonicalHistoryDoJSON(t, httpServer.Client(), http.MethodGet, httpServer.URL+"/api/v1/sessions/"+sessionID+"/messages?limit=50", nil, &firstHistory)
+			apiMultiTurnAssertEqual(t, first, firstHistory.Messages)
+			if got := provider.streamCalls.Load(); got != 2 {
+				t.Fatalf("multi-turn provider stream calls=%d, want 2", got)
+			}
+
+			httpServer.Close()
+			if err := eng.Stop(context.Background()); err != nil {
+				t.Fatalf("stop first engine: %v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatalf("close first store: %v", err)
+			}
+
+			restartedStore, err := sqlitestore.New(dbPath)
+			if err != nil {
+				t.Fatalf("reopen sqlite store: %v", err)
+			}
+			t.Cleanup(func() { _ = restartedStore.Close() })
+			if err := restartedStore.Init(context.Background()); err != nil {
+				t.Fatalf("init restarted store: %v", err)
+			}
+			restartedProvider := &apiMultiTurnToolStreamProvider{}
+			restartedEngine := newAPICanonicalHistoryEngine(t, cfg, restartedStore, restartedProvider)
+			t.Cleanup(func() { _ = restartedEngine.Stop(context.Background()) })
+			restartedServer := httptest.NewServer(NewServer(cfg, restartedEngine, nil, restartedStore).routes())
+			t.Cleanup(restartedServer.Close)
+
+			var restartedHistory struct {
+				Messages []*storage.MessageRecord `json:"messages"`
+			}
+			apiCanonicalHistoryDoJSON(t, restartedServer.Client(), http.MethodGet, restartedServer.URL+"/api/v1/sessions/"+sessionID+"/messages?limit=50", nil, &restartedHistory)
+			apiMultiTurnAssertEqual(t, first, restartedHistory.Messages)
+			replay := apiMultiTurnRequest(t, restartedServer.Client(), restartedServer.URL+"/api/v1/chat", requestBody, sse)
+			apiMultiTurnAssertEqual(t, replay, restartedHistory.Messages)
+			if replay.Reply != first.Reply || replay.AssistantMessageID != first.AssistantMessageID {
+				t.Fatalf("multi-turn replay differs: first=%+v replay=%+v", first, replay)
+			}
+			if got := restartedProvider.streamCalls.Load(); got != 0 {
+				t.Fatalf("provider called %d times during restart replay, want 0", got)
+			}
+		})
 	}
 }
