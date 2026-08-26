@@ -46,12 +46,18 @@ func TestImageTaskBudgetPreflightFailureConvergesToDurableSolveReceipt(t *testin
 		!result.Dispatch.RetrySafe {
 		t.Fatalf("dispatch did not converge to retry-safe failed: %+v", result.Dispatch)
 	}
-	if len(result.OperationReceipts) != 1 {
-		t.Fatalf("expected one terminal solve receipt: %+v", result.OperationReceipts)
+	if len(result.OperationReceipts) != 2 {
+		t.Fatalf("expected classification and terminal solve receipts: %+v", result.OperationReceipts)
 	}
-	receipt := result.OperationReceipts[0]
+	var receipt ImageTaskOperationReceipt
+	for _, candidate := range result.OperationReceipts {
+		if candidate.Operation == "solve" {
+			receipt = candidate
+		}
+	}
 	if receipt.InvocationID == "" ||
 		receipt.Operation != "solve" ||
+		receipt.CanonicalInputDigest != view.Dispatch.SourceDigest ||
 		receipt.Status != string(k12.ImageTaskInvocationFailed) ||
 		receipt.Attempt != 1 ||
 		receipt.Provider != "hexclaw-gpt" ||

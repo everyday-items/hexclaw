@@ -133,6 +133,31 @@ func TestImageTaskResultProjectsLinkedRedactedRecognizingPhysicalReceipt(t *test
 	if err != nil {
 		t.Fatalf("complete recognizing parent: %v", err)
 	}
+	locating, locatingCreated, err := coordinator.Records.PrepareModelInvocation(
+		ctx,
+		k12.ModelInvocation{
+			InvocationID: "locating-parent-receipt", AgentName: parent.AgentName,
+			JobID: parent.JobID, Stage: k12.GradingStageLocating,
+			RequestDigest: "sha256:SECRET-LOCATING-REQUEST-DIGEST",
+			RouteSnapshot: parent.RouteSnapshot, Attempt: 1, CreatedAt: 1102,
+		},
+	)
+	if err != nil || !locatingCreated {
+		t.Fatalf("prepare locating invocation: created=%v err=%v", locatingCreated, err)
+	}
+	locating, err = coordinator.Records.MarkModelInvocationSent(
+		ctx, locating.AgentName, locating.InvocationID, "SECRET-LOCATING-IDEMPOTENCY-KEY",
+	)
+	if err != nil {
+		t.Fatalf("mark locating invocation sent: %v", err)
+	}
+	locating, err = coordinator.Records.MarkModelInvocationSucceeded(
+		ctx, locating.AgentName, locating.InvocationID,
+		"sha256:locating-result", "SECRET-LOCATING-EXTERNAL-REQUEST-ID",
+	)
+	if err != nil {
+		t.Fatalf("complete locating invocation: %v", err)
+	}
 
 	result, err := coordinator.Result(
 		ctx,
@@ -142,12 +167,17 @@ func TestImageTaskResultProjectsLinkedRedactedRecognizingPhysicalReceipt(t *test
 	if err != nil {
 		t.Fatalf("image task result: %v", err)
 	}
-	if len(result.OperationReceipts) != 2 {
-		t.Fatalf("recognizing receipts=%d, want parent+child: %+v", len(result.OperationReceipts), result.OperationReceipts)
+	if len(result.OperationReceipts) != 4 {
+		t.Fatalf("operation receipts=%d, want classification+recognizing parent+child+locating: %+v", len(result.OperationReceipts), result.OperationReceipts)
 	}
 	receipts := make(map[string]ImageTaskOperationReceipt, len(result.OperationReceipts))
 	for _, receipt := range result.OperationReceipts {
 		receipts[receipt.InvocationID] = receipt
+	}
+	classificationReceipt, ok := receipts[view.Dispatch.ClassificationInvocationID]
+	if !ok || classificationReceipt.Operation != string(k12.ImageTaskOperationClassification) ||
+		classificationReceipt.CanonicalInputDigest != view.Dispatch.SourceDigest {
+		t.Fatalf("classification canonical receipt missing or drifted: %+v", result.OperationReceipts)
 	}
 	parentReceipt, ok := receipts[parent.InvocationID]
 	if !ok {
@@ -157,19 +187,31 @@ func TestImageTaskResultProjectsLinkedRedactedRecognizingPhysicalReceipt(t *test
 	if !ok {
 		t.Fatalf("physical recognizing receipt missing: %+v", result.OperationReceipts)
 	}
+	locatingReceipt, ok := receipts[locating.InvocationID]
+	if !ok {
+		t.Fatalf("locating receipt missing: %+v", result.OperationReceipts)
+	}
 	if parentReceipt.ParentInvocationID != "" ||
 		parentReceipt.PhysicalUnit != "" ||
 		parentReceipt.Operation != k12.GradingStageRecognizing ||
 		parentReceipt.Status != string(k12.ModelInvocationSucceeded) ||
-		parentReceipt.ResultDigest != "sha256:recognizing-result" {
+		parentReceipt.ResultDigest != "sha256:recognizing-result" ||
+		parentReceipt.CanonicalInputDigest != view.Dispatch.SourceDigest {
 		t.Fatalf("logical recognizing receipt drift: %+v", parentReceipt)
 	}
 	if physicalReceipt.ParentInvocationID != parent.InvocationID ||
 		physicalReceipt.PhysicalUnit != string(k12.RecognitionPhysicalUnitWholePage) ||
 		physicalReceipt.Operation != k12.GradingStageRecognizing ||
 		physicalReceipt.Status != string(k12.ModelInvocationSucceeded) ||
-		physicalReceipt.ResultDigest != physical.ResultDigest {
+		physicalReceipt.ResultDigest != physical.ResultDigest ||
+		physicalReceipt.CanonicalInputDigest != view.Dispatch.SourceDigest {
 		t.Fatalf("physical receipt association drift: %+v", physicalReceipt)
+	}
+	if locatingReceipt.Operation != k12.GradingStageLocating ||
+		locatingReceipt.Status != string(k12.ModelInvocationSucceeded) ||
+		locatingReceipt.ResultDigest != locating.ResultDigest ||
+		locatingReceipt.CanonicalInputDigest != view.Dispatch.SourceDigest {
+		t.Fatalf("locating receipt canonical digest drift: %+v", locatingReceipt)
 	}
 	for _, receipt := range []ImageTaskOperationReceipt{parentReceipt, physicalReceipt} {
 		if receipt.Provider != route.Provider ||
@@ -186,6 +228,7 @@ func TestImageTaskResultProjectsLinkedRedactedRecognizingPhysicalReceipt(t *test
 		t,
 		parentReceipt,
 		"attempt",
+		"canonical_input_digest",
 		"invocation_id",
 		"model",
 		"operation",
@@ -199,6 +242,7 @@ func TestImageTaskResultProjectsLinkedRedactedRecognizingPhysicalReceipt(t *test
 		t,
 		physicalReceipt,
 		"attempt",
+		"canonical_input_digest",
 		"invocation_id",
 		"model",
 		"operation",

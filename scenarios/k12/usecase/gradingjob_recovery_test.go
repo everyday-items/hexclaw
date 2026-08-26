@@ -120,6 +120,7 @@ func TestGradingRecovery_ClearImageTaskAtConfirmationCheckpointAutoFreezes(t *te
 	}}}
 	d := recoveryDeps(t, rec, nil, nil)
 	d.ParentTeachingGuide = &parentTeachingGuideSpy{}
+	seedGradingImageTaskOwnerScopeForTest(t, d, "recover-auto-freeze")
 	o1 := newRecoverableOrchestrator(t, d, dir)
 	v, _, err := o1.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "image_task", SourceKey: "recover-auto-freeze",

@@ -1080,12 +1080,18 @@ func TestImageTaskCoordinatorRoutesHomeworkToInternalGradingWithoutLeakingModelC
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.OperationReceipts) != 1 ||
-		result.OperationReceipts[0].Operation != "solve" ||
-		result.OperationReceipts[0].Provider != "hexclaw-gpt" ||
-		result.OperationReceipts[0].Model != "gpt-5.6-sol" ||
-		result.OperationReceipts[0].Status != "succeeded" ||
-		result.OperationReceipts[0].ResultDigest != "sha256:terminal-answer" {
+	var solveReceipt ImageTaskOperationReceipt
+	for _, receipt := range result.OperationReceipts {
+		if receipt.Operation == "solve" {
+			solveReceipt = receipt
+		}
+	}
+	if len(result.OperationReceipts) != 2 ||
+		solveReceipt.Provider != "hexclaw-gpt" ||
+		solveReceipt.Model != "gpt-5.6-sol" ||
+		solveReceipt.Status != "succeeded" ||
+		solveReceipt.CanonicalInputDigest != view.Dispatch.SourceDigest ||
+		solveReceipt.ResultDigest != "sha256:terminal-answer" {
 		t.Fatalf("solve receipt not projected from durable grading ledger: %+v", result.OperationReceipts)
 	}
 }

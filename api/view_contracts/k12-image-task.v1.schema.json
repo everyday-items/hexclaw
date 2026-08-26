@@ -84,6 +84,57 @@
       },
       "additionalProperties": false
     },
+    "operationReceipt": {
+      "type": "object",
+      "required": [
+        "invocation_id",
+        "operation",
+        "canonical_input_digest",
+        "status",
+        "attempt",
+        "result_digest"
+      ],
+      "properties": {
+        "invocation_id": { "type": "string", "minLength": 1 },
+        "parent_invocation_id": { "type": "string", "minLength": 1 },
+        "physical_unit": { "type": "string", "minLength": 1 },
+        "operation": { "type": "string", "minLength": 1 },
+        "canonical_input_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "provider": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "status": { "type": "string", "minLength": 1 },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "result_digest": {
+          "type": "string",
+          "pattern": "^(|sha256:[0-9a-f]{64})$"
+        },
+        "request_policy_digest": { "type": "string", "minLength": 1 },
+        "request_policy": {
+          "type": "object",
+          "required": ["policy_version", "stage", "thinking", "reasoning_effort"],
+          "properties": {
+            "policy_version": { "type": "string", "minLength": 1 },
+            "stage": { "type": "string", "minLength": 1 },
+            "thinking": { "type": "string", "minLength": 1 },
+            "reasoning_effort": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "operation": { "not": { "const": "annotation" } } },
+            "required": ["operation"]
+          },
+          "then": { "required": ["provider", "model"] }
+        }
+      ],
+      "additionalProperties": false
+    },
     "target": {
       "type": "object",
       "required": ["type", "id"],
@@ -179,9 +230,15 @@
             }
           ]
         },
-        "source_digest": { "type": "string", "minLength": 1 },
+        "source_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
         "source_attachments": { "type": "array", "items": { "type": "object" } },
-        "operation_receipts": { "type": "array", "items": { "type": "object" } },
+        "operation_receipts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/operationReceipt" }
+        },
         "grounding_evidence_receipts": {
           "type": "array",
           "items": { "$ref": "#/$defs/groundingEvidenceReceipt" }

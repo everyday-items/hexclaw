@@ -9,6 +9,40 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
+func seedGradingImageTaskOwnerScopeForTest(t *testing.T, d Deps, dispatchID string) {
+	t.Helper()
+	coordinator := &ImageTaskCoordinator{
+		Records:      d.Records,
+		Classifier:   &imageTaskClassifierStub{},
+		ResolveRoute: imageTaskRouteForTest,
+		ReadAsset: func(agentName, assetRef string) ([]byte, error) {
+			if agentName != "mingming" || assetRef != imageTaskAssetForTest {
+				t.Fatalf("unexpected ImageTask source %q %q", agentName, assetRef)
+			}
+			return []byte("grading-image-task-owner-scope"), nil
+		},
+		Now: d.now,
+		NewID: func(kind string) string {
+			switch kind {
+			case "dispatch":
+				return dispatchID
+			case "classification":
+				return dispatchID + "-classification"
+			default:
+				return dispatchID + "-" + kind
+			}
+		},
+	}
+	input := testCreateImageTaskInput()
+	input.OwnerScope = "grading-owner"
+	input.SourceRef = dispatchID + "-source"
+	input.SourceSessionID = dispatchID + "-session"
+	view, created, err := coordinator.Create(context.Background(), input)
+	if err != nil || !created || view.Dispatch.DispatchID != dispatchID {
+		t.Fatalf("seed ImageTask owner scope: dispatch=%q created=%v err=%v", view.Dispatch.DispatchID, created, err)
+	}
+}
+
 func TestImageTaskPhotoGrading_ClearFormattedOCRAutoFreezesAndCompletes(t *testing.T) {
 	ctx := context.Background()
 	rec := &countingRecognizer{questions: []RecognizedQuestion{
@@ -25,6 +59,7 @@ func TestImageTaskPhotoGrading_ClearFormattedOCRAutoFreezesAndCompletes(t *testi
 	}}
 	d := recoveryDeps(t, rec, nil, nil)
 	d.ParentTeachingGuide = &parentTeachingGuideSpy{}
+	seedGradingImageTaskOwnerScopeForTest(t, d, "clear-formatted-auto-freeze")
 	o := newRecoverableOrchestrator(t, d, t.TempDir())
 	v, _, err := o.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "image_task", SourceKey: "clear-formatted-auto-freeze",
@@ -117,6 +152,7 @@ func TestImageTaskPhotoGrading_MissingConfidenceRequiresConfirmation(t *testing.
 		AnswerState: AnswerStatePresent, StudentAnswer: "15",
 	}}}
 	d := recoveryDeps(t, rec, nil, nil)
+	seedGradingImageTaskOwnerScopeForTest(t, d, "missing-confidence")
 	o := newRecoverableOrchestrator(t, d, t.TempDir())
 	v, _, err := o.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
 		Photo: orchestratorPhotoRequest(), SourceKind: "image_task", SourceKey: "missing-confidence",

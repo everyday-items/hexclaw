@@ -132,16 +132,18 @@ type CreateImageTaskInput struct {
 }
 
 type ImageTaskView struct {
-	Dispatch                   k12.ImageTaskDispatch
-	Homework                   *k12.HomeworkSubmission
-	HomeworkProjection         *ImageTaskHomeworkProjection
-	Creative                   *k12.CreativeWorkIntake
-	CreativeDisplayName        string
-	CreativeWork               *CreativeWorkView
-	CreativeFeedback           string
-	ActiveInvocationDeadlineAt int64
-	solveInvocation            *k12.ImageTaskInvocation
-	feedbackInvocation         *k12.ImageTaskInvocation
+	Dispatch k12.ImageTaskDispatch
+	// ClassificationInvocationStatus 只供内部编排区分明确失败与结果未知，不进入公开 DTO。
+	ClassificationInvocationStatus k12.ImageTaskInvocationStatus `json:"-"`
+	Homework                       *k12.HomeworkSubmission
+	HomeworkProjection             *ImageTaskHomeworkProjection
+	Creative                       *k12.CreativeWorkIntake
+	CreativeDisplayName            string
+	CreativeWork                   *CreativeWorkView
+	CreativeFeedback               string
+	ActiveInvocationDeadlineAt     int64
+	solveInvocation                *k12.ImageTaskInvocation
+	feedbackInvocation             *k12.ImageTaskInvocation
 }
 
 type ImageTaskHomeworkProjection struct {
@@ -225,17 +227,18 @@ type ImageTaskSourceAttachmentReceipt struct {
 }
 
 type ImageTaskOperationReceipt struct {
-	InvocationID        string                          `json:"invocation_id"`
-	ParentInvocationID  string                          `json:"parent_invocation_id,omitempty"`
-	PhysicalUnit        string                          `json:"physical_unit,omitempty"`
-	Operation           string                          `json:"operation"`
-	Provider            string                          `json:"provider"`
-	Model               string                          `json:"model"`
-	Status              string                          `json:"status"`
-	Attempt             int                             `json:"attempt"`
-	ResultDigest        string                          `json:"result_digest"`
-	RequestPolicyDigest string                          `json:"request_policy_digest,omitempty"`
-	RequestPolicy       *k12.ModelRequestPolicySnapshot `json:"request_policy,omitempty"`
+	InvocationID         string                          `json:"invocation_id"`
+	ParentInvocationID   string                          `json:"parent_invocation_id,omitempty"`
+	PhysicalUnit         string                          `json:"physical_unit,omitempty"`
+	Operation            string                          `json:"operation"`
+	CanonicalInputDigest string                          `json:"canonical_input_digest"`
+	Provider             string                          `json:"provider,omitempty"`
+	Model                string                          `json:"model,omitempty"`
+	Status               string                          `json:"status"`
+	Attempt              int                             `json:"attempt"`
+	ResultDigest         string                          `json:"result_digest"`
+	RequestPolicyDigest  string                          `json:"request_policy_digest,omitempty"`
+	RequestPolicy        *k12.ModelRequestPolicySnapshot `json:"request_policy,omitempty"`
 }
 
 type ConfirmImageTaskInput struct {
@@ -1207,6 +1210,7 @@ func (c *ImageTaskCoordinator) projectTarget(
 			invocation.Status == k12.ImageTaskInvocationSent {
 			view.ActiveInvocationDeadlineAt = invocation.DeadlineAt
 		}
+		view.ClassificationInvocationStatus = invocation.Status
 	}
 	if dispatch.TargetObjectType == "" || dispatch.TargetObjectID == "" {
 		return view, nil
@@ -1808,16 +1812,30 @@ func (c *ImageTaskCoordinator) Result(
 		GroundingEvidenceReceipts: []GroundingEvidenceReceipt{},
 		ProblemGroundingReceipts:  []ProblemGroundingReceipt{},
 	}
+	if strings.TrimSpace(view.Dispatch.ClassificationInvocationID) != "" {
+		invocation, invocationErr := c.Records.GetImageTaskInvocation(
+			ctx,
+			view.Dispatch.AgentName,
+			view.Dispatch.ClassificationInvocationID,
+		)
+		if invocationErr != nil {
+			return ImageTaskResult{}, invocationErr
+		}
+		result.OperationReceipts = append(
+			result.OperationReceipts,
+			imageTaskInvocationReceipt(invocation, view.Dispatch.SourceDigest),
+		)
+	}
 	if view.solveInvocation != nil {
 		result.OperationReceipts = append(
 			result.OperationReceipts,
-			imageTaskInvocationReceipt(*view.solveInvocation),
+			imageTaskInvocationReceipt(*view.solveInvocation, view.Dispatch.SourceDigest),
 		)
 	}
 	if view.feedbackInvocation != nil {
 		result.OperationReceipts = append(
 			result.OperationReceipts,
-			imageTaskInvocationReceipt(*view.feedbackInvocation),
+			imageTaskInvocationReceipt(*view.feedbackInvocation, view.Dispatch.SourceDigest),
 		)
 	}
 	if view.Dispatch.Status == k12.ImageTaskStatusAwaitingConfirmation ||
@@ -1849,7 +1867,7 @@ func (c *ImageTaskCoordinator) Result(
 		for _, invocation := range invocations {
 			result.OperationReceipts = append(
 				result.OperationReceipts,
-				modelInvocationReceipt(invocation),
+				modelInvocationReceipt(invocation, view.Dispatch.SourceDigest),
 			)
 		}
 		physicalInvocations, listPhysicalErr := c.Records.ListModelPhysicalInvocations(
@@ -1863,7 +1881,21 @@ func (c *ImageTaskCoordinator) Result(
 		for _, invocation := range physicalInvocations {
 			result.OperationReceipts = append(
 				result.OperationReceipts,
-				modelPhysicalInvocationReceipt(invocation),
+				modelPhysicalInvocationReceipt(invocation, view.Dispatch.SourceDigest),
+			)
+		}
+		itemInvocations, listItemsErr := c.Records.ListGradingItemInvocations(
+			ctx,
+			agentName,
+			view.Homework.GradingJobID,
+		)
+		if listItemsErr != nil {
+			return ImageTaskResult{}, listItemsErr
+		}
+		for _, invocation := range itemInvocations {
+			result.OperationReceipts = append(
+				result.OperationReceipts,
+				gradingItemInvocationReceipt(invocation, view.Dispatch.SourceDigest),
 			)
 		}
 		finalArtifact, finalArtifactErr := c.Records.GetGradingFinalArtifactByJob(
@@ -1889,6 +1921,10 @@ func (c *ImageTaskCoordinator) Result(
 			photo.ResultSurface = PhotoSurfaceParentTeachingGuide
 		}
 		if result.FinalArtifact.HasAnnotatedAsset() {
+			result.OperationReceipts = append(
+				result.OperationReceipts,
+				gradingAnnotationReceipt(*result.FinalArtifact, view.Dispatch.SourceDigest),
+			)
 			asset, openErr := c.Records.OpenGradingFinalAnnotatedAsset(
 				ctx, agentName, result.FinalArtifact.ArtifactID,
 			)
@@ -1903,6 +1939,36 @@ func (c *ImageTaskCoordinator) Result(
 		result.Photo = &photo
 	}
 	return result, nil
+}
+
+func gradingItemInvocationReceipt(
+	invocation k12.GradingItemInvocation,
+	canonicalInputDigest string,
+) ImageTaskOperationReceipt {
+	return ImageTaskOperationReceipt{
+		InvocationID:         invocation.InvocationID,
+		Operation:            string(invocation.Operation),
+		CanonicalInputDigest: canonicalInputDigest,
+		Provider:             invocation.RouteSnapshot.Provider,
+		Model:                invocation.RouteSnapshot.Model,
+		Status:               string(invocation.Status),
+		Attempt:              invocation.OperationAttempt,
+		ResultDigest:         invocation.ResultDigest,
+	}
+}
+
+func gradingAnnotationReceipt(
+	artifact k12.GradingFinalArtifact,
+	canonicalInputDigest string,
+) ImageTaskOperationReceipt {
+	return ImageTaskOperationReceipt{
+		InvocationID:         "annotation:" + artifact.ArtifactID,
+		Operation:            "annotation",
+		CanonicalInputDigest: canonicalInputDigest,
+		Status:               string(k12.ModelInvocationSucceeded),
+		Attempt:              1,
+		ResultDigest:         "sha256:" + artifact.AnnotatedDigest,
+	}
 }
 
 func (c *ImageTaskCoordinator) sourceAttachmentReceipts(
@@ -1925,27 +1991,33 @@ func (c *ImageTaskCoordinator) sourceAttachmentReceipts(
 
 func imageTaskInvocationReceipt(
 	invocation k12.ImageTaskInvocation,
+	canonicalInputDigest string,
 ) ImageTaskOperationReceipt {
 	return ImageTaskOperationReceipt{
-		InvocationID: invocation.InvocationID,
-		Operation:    string(invocation.Operation),
-		Provider:     invocation.RouteSnapshot.Provider,
-		Model:        invocation.RouteSnapshot.Model,
-		Status:       string(invocation.Status),
-		Attempt:      invocation.Attempt,
-		ResultDigest: invocation.ResultDigest,
+		InvocationID:         invocation.InvocationID,
+		Operation:            string(invocation.Operation),
+		CanonicalInputDigest: canonicalInputDigest,
+		Provider:             invocation.RouteSnapshot.Provider,
+		Model:                invocation.RouteSnapshot.Model,
+		Status:               string(invocation.Status),
+		Attempt:              invocation.Attempt,
+		ResultDigest:         invocation.ResultDigest,
 	}
 }
 
-func modelInvocationReceipt(invocation k12.ModelInvocation) ImageTaskOperationReceipt {
+func modelInvocationReceipt(
+	invocation k12.ModelInvocation,
+	canonicalInputDigest string,
+) ImageTaskOperationReceipt {
 	receipt := ImageTaskOperationReceipt{
-		InvocationID: invocation.InvocationID,
-		Operation:    invocation.Stage,
-		Provider:     invocation.RouteSnapshot.Provider,
-		Model:        invocation.RouteSnapshot.Model,
-		Status:       string(invocation.Status),
-		Attempt:      invocation.Attempt,
-		ResultDigest: invocation.ResultDigest,
+		InvocationID:         invocation.InvocationID,
+		Operation:            invocation.Stage,
+		CanonicalInputDigest: canonicalInputDigest,
+		Provider:             invocation.RouteSnapshot.Provider,
+		Model:                invocation.RouteSnapshot.Model,
+		Status:               string(invocation.Status),
+		Attempt:              invocation.Attempt,
+		ResultDigest:         invocation.ResultDigest,
 	}
 	policy := k12.NormalizeModelRequestPolicySnapshot(invocation.RequestPolicySnapshot)
 	if !policy.IsZero() {
@@ -1957,17 +2029,19 @@ func modelInvocationReceipt(invocation k12.ModelInvocation) ImageTaskOperationRe
 
 func modelPhysicalInvocationReceipt(
 	invocation k12.ModelPhysicalInvocation,
+	canonicalInputDigest string,
 ) ImageTaskOperationReceipt {
 	receipt := ImageTaskOperationReceipt{
-		InvocationID:       invocation.PhysicalInvocationID,
-		ParentInvocationID: invocation.ParentInvocationID,
-		PhysicalUnit:       string(invocation.PhysicalUnit),
-		Operation:          invocation.Stage,
-		Provider:           invocation.RouteSnapshot.Provider,
-		Model:              invocation.RouteSnapshot.Model,
-		Status:             string(invocation.Status),
-		Attempt:            invocation.Attempt,
-		ResultDigest:       invocation.ResultDigest,
+		InvocationID:         invocation.PhysicalInvocationID,
+		ParentInvocationID:   invocation.ParentInvocationID,
+		PhysicalUnit:         string(invocation.PhysicalUnit),
+		Operation:            invocation.Stage,
+		CanonicalInputDigest: canonicalInputDigest,
+		Provider:             invocation.RouteSnapshot.Provider,
+		Model:                invocation.RouteSnapshot.Model,
+		Status:               string(invocation.Status),
+		Attempt:              invocation.Attempt,
+		ResultDigest:         invocation.ResultDigest,
 	}
 	policy := k12.NormalizeModelRequestPolicySnapshot(
 		invocation.RequestPolicySnapshot,

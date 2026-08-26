@@ -668,7 +668,7 @@ func TestBug20260730RecognizingPolicyReceiptIsAllowlistedAndRedacted(t *testing.
 		Attempt:                1,
 		ResultDigest:           "sha256:result",
 		ExternalRequestID:      "sensitive-external-request-id",
-	})
+	}, "sha256:canonical-input")
 	raw, err := json.Marshal(receipt)
 	if err != nil {
 		t.Fatal(err)
@@ -680,6 +680,7 @@ func TestBug20260730RecognizingPolicyReceiptIsAllowlistedAndRedacted(t *testing.
 	for _, key := range []string{
 		"invocation_id",
 		"operation",
+		"canonical_input_digest",
 		"provider",
 		"model",
 		"status",
@@ -692,7 +693,7 @@ func TestBug20260730RecognizingPolicyReceiptIsAllowlistedAndRedacted(t *testing.
 			t.Fatalf("allowlisted receipt field %q missing: %s", key, raw)
 		}
 	}
-	if len(fields) != 9 {
+	if len(fields) != 10 {
 		t.Fatalf("receipt exposed fields outside the allowlist: %s", raw)
 	}
 	if fields["request_policy_digest"] != policy.Digest() {
@@ -742,7 +743,7 @@ func TestBug20260730RecognizingPhysicalReceiptIsAllowlistedAndRedacted(t *testin
 		Attempt:               1,
 		ResultDigest:          "sha256:physical-result",
 		ExternalRequestID:     "sensitive-physical-external-request-id",
-	})
+	}, "sha256:canonical-input")
 	raw, err := json.Marshal(receipt)
 	if err != nil {
 		t.Fatal(err)
@@ -756,6 +757,7 @@ func TestBug20260730RecognizingPhysicalReceiptIsAllowlistedAndRedacted(t *testin
 		"parent_invocation_id",
 		"physical_unit",
 		"operation",
+		"canonical_input_digest",
 		"provider",
 		"model",
 		"status",
@@ -768,7 +770,7 @@ func TestBug20260730RecognizingPhysicalReceiptIsAllowlistedAndRedacted(t *testin
 			t.Fatalf("allowlisted physical receipt field %q missing: %s", key, raw)
 		}
 	}
-	if len(fields) != 11 {
+	if len(fields) != 12 {
 		t.Fatalf("physical receipt exposed fields outside the allowlist: %s", raw)
 	}
 	if fields["parent_invocation_id"] != "parent-dd036-receipt" ||

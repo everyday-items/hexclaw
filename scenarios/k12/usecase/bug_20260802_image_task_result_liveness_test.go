@@ -151,6 +151,53 @@ func TestBUG20260802ImageTaskResultReadsOnlyDurableFinalArtifact(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("create/run image task: created=%v err=%v", created, err)
 	}
+	if err := coordinator.Records.PutProblemAttemptSnapshot(
+		context.Background(),
+		k12.ProblemAttemptSnapshot{
+			Problems: []k12.Problem{{
+				ProblemID: "problem-final-result-liveness", AgentName: "mingming",
+				SubmissionID: persistedJob.Fields.SubmissionID, PageAssetID: "page-final-result-liveness",
+				Ordinal: 1, ProblemKind: k12.ProblemKindStandalone,
+				StemRaw: "1+1=", StemMarkdown: "1+1=", CanonicalVersion: 1,
+				CreatedAt: 1000, UpdatedAt: 1000,
+			}},
+			Attempts: []k12.Attempt{{
+				AttemptID: "attempt-final-result-liveness", AgentName: "mingming",
+				SubmissionID: persistedJob.Fields.SubmissionID, ProblemID: "problem-final-result-liveness",
+				AnswerState: "present", AnswerRaw: "2", AnswerMarkdown: "2",
+				ConfirmedVersion: 1, InputDigest: "sha256:confirmed-input",
+				CreatedAt: 1000, UpdatedAt: 1000,
+			}},
+		},
+	); err != nil {
+		t.Fatalf("persist problem/attempt fixture: %v", err)
+	}
+	itemInvocation, itemCreated, err := coordinator.Records.PrepareGradingItemInvocation(
+		context.Background(),
+		k12.GradingItemInvocation{
+			InvocationID: "grade-final-result-liveness", AgentName: "mingming",
+			JobID: grading.resolvedJobID(), ProblemID: "problem-final-result-liveness",
+			AttemptID: "attempt-final-result-liveness", Operation: k12.GradingItemOperationGrade,
+			OperationAttempt: 1, RequestDigest: "sha256:grade-request",
+			RouteSnapshot: persistedJob.Fields.ModelSnapshot, CreatedAt: 1000,
+		},
+	)
+	if err != nil || !itemCreated {
+		t.Fatalf("prepare grading item invocation: created=%v err=%v", itemCreated, err)
+	}
+	itemInvocation, err = coordinator.Records.MarkGradingItemInvocationSent(
+		context.Background(), itemInvocation.AgentName, itemInvocation.InvocationID,
+	)
+	if err != nil {
+		t.Fatalf("mark grading item invocation sent: %v", err)
+	}
+	itemInvocation, err = coordinator.Records.MarkGradingItemInvocationSucceeded(
+		context.Background(), itemInvocation.AgentName, itemInvocation.InvocationID,
+		"sha256:grade-result", `{"verdict":"correct"}`,
+	)
+	if err != nil {
+		t.Fatalf("complete grading item invocation: %v", err)
+	}
 	repository := &PageAssetRepository{Records: coordinator.Records}
 	annotatedBytes := validPNGFixture(t, "image-task-final-result-liveness")
 	annotated, err := repository.Persist(
@@ -208,6 +255,25 @@ func TestBUG20260802ImageTaskResultReadsOnlyDurableFinalArtifact(t *testing.T) {
 	if !reflect.DeepEqual(got.GroundingEvidenceReceipts, wantGroundingReceipts) {
 		t.Fatalf("completed Result grounding receipts=%+v want %+v",
 			got.GroundingEvidenceReceipts, wantGroundingReceipts)
+	}
+	var gradeReceipt, annotationReceipt *ImageTaskOperationReceipt
+	for i := range got.OperationReceipts {
+		switch got.OperationReceipts[i].Operation {
+		case string(k12.GradingItemOperationGrade):
+			gradeReceipt = &got.OperationReceipts[i]
+		case "annotation":
+			annotationReceipt = &got.OperationReceipts[i]
+		}
+	}
+	if gradeReceipt == nil || gradeReceipt.InvocationID != itemInvocation.InvocationID ||
+		gradeReceipt.CanonicalInputDigest != view.Dispatch.SourceDigest ||
+		gradeReceipt.ResultDigest != itemInvocation.ResultDigest {
+		t.Fatalf("grade receipt missing or canonical digest drifted: %+v", got.OperationReceipts)
+	}
+	if annotationReceipt == nil ||
+		annotationReceipt.CanonicalInputDigest != view.Dispatch.SourceDigest ||
+		annotationReceipt.ResultDigest != "sha256:"+artifact.AnnotatedDigest {
+		t.Fatalf("annotation receipt missing or canonical digest drifted: %+v", got.OperationReceipts)
 	}
 	if removed, removeErr := assetstore.Remove(
 		"mingming", artifact.AnnotatedAssetID,
