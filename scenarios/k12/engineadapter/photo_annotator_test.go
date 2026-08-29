@@ -8,6 +8,7 @@ import (
 	"image/draw"
 	"image/jpeg"
 	"image/png"
+	"math"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
@@ -191,7 +192,7 @@ func TestPhotoAnnotator_UsesVerifiedAnswerBBoxRightEdge(t *testing.T) {
 	}
 }
 
-func TestLayoutPhotoMarks_ResolvesActualPixelCollisionWithoutDroppingVerdicts(t *testing.T) {
+func TestLayoutPhotoMarks_PreservesTrustedAnchorsWhenGlyphsCollide(t *testing.T) {
 	marks := []usecase.PhotoAnnotation{
 		{QuestionNumber: 1, BBox: usecase.BBox{X: 0.50, Y: 0.20, W: 0.10, H: 0.08}, Correct: true},
 		{QuestionNumber: 2, BBox: usecase.BBox{X: 0.50, Y: 0.20, W: 0.10, H: 0.08}, Correct: false},
@@ -200,8 +201,15 @@ func TestLayoutPhotoMarks_ResolvesActualPixelCollisionWithoutDroppingVerdicts(t 
 	if len(placements) != len(marks) {
 		t.Fatalf("pixel layout dropped a verified verdict: got=%d want=%d", len(placements), len(marks))
 	}
-	if placements[0].bounds.Overlaps(placements[1].bounds) {
-		t.Fatalf("pixel layout left verdict glyphs overlapping: first=%v second=%v", placements[0].bounds, placements[1].bounds)
+	for index, mark := range marks {
+		base, ok := basePhotoMarkPlacement(image.Rect(0, 0, 1280, 1707), mark)
+		if !ok {
+			t.Fatalf("mark %d did not produce a trusted base placement", index+1)
+		}
+		drift := math.Hypot(float64(placements[index].cx-base.cx), float64(placements[index].cy-base.cy))
+		if drift > float64(base.radius) {
+			t.Fatalf("mark %d moved outside its trusted answer neighborhood: drift=%.1f radius=%d", index+1, drift, base.radius)
+		}
 	}
 }
 

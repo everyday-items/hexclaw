@@ -168,6 +168,11 @@ func layoutPhotoMarks(bounds image.Rectangle, marks []usecase.PhotoAnnotation) [
 		selected := candidates[0]
 		bestOverlap := photoMarkOverlapArea(selected.bounds, occupied)
 		for _, candidate := range candidates {
+			// 标记必须留在自己的可信答案锚点邻域内。碰撞时宁可保留原锚点
+			// 让两个可信标记局部重叠，也不能为了消除像素重叠把标记移到另一题。
+			if !withinTrustedPhotoMarkNeighborhood(base, candidate) {
+				continue
+			}
 			overlap := photoMarkOverlapArea(candidate.bounds, occupied)
 			if overlap == 0 {
 				selected = candidate
@@ -183,6 +188,13 @@ func layoutPhotoMarks(bounds image.Rectangle, marks []usecase.PhotoAnnotation) [
 		occupied = append(occupied, selected.bounds)
 	}
 	return placements
+}
+
+func withinTrustedPhotoMarkNeighborhood(base, candidate photoMarkPlacement) bool {
+	maxDrift := maxInt(1, base.radius)
+	dx := candidate.cx - base.cx
+	dy := candidate.cy - base.cy
+	return dx*dx+dy*dy <= maxDrift*maxDrift
 }
 
 func basePhotoMarkPlacement(bounds image.Rectangle, mark usecase.PhotoAnnotation) (photoMarkPlacement, bool) {

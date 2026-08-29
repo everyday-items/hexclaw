@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	agentrouter "github.com/hexagon-codes/hexclaw/router"
 	k12 "github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 	k12usecase "github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
@@ -292,6 +293,38 @@ func TestK12DingtalkPhotoPracticeReturnUsesSelectedSnapshotAfterMutableListChang
 	}
 	if sets.calls != 0 {
 		t.Fatalf("selected candidate recovery must not reread mutable practice sets: calls=%d", sets.calls)
+	}
+}
+
+func TestK12DingtalkPhotoRoutingConfirmationUsesFrozenAgentAfterBindingChanges(t *testing.T) {
+	coordinator := newRoutingSnapshotFacade()
+	router := agentrouter.New()
+	router.LoadAll(
+		[]agentrouter.AgentConfig{
+			{Name: "general", Metadata: map[string]string{"scenario": "general"}},
+			{Name: "child-tutor", Metadata: map[string]string{
+				"scenario": k12TutorScenario, k12.MetaKeyGradeTerm: "五年级下",
+			}},
+		},
+		"general",
+		[]agentrouter.Rule{{
+			Platform: "dingtalk", InstanceID: "bot-1", ChatID: "family-group",
+			AgentName: "general",
+		}},
+	)
+	selection := k12PhotoTestMessage()
+	selection.Attachments = nil
+	selection.Content = "1"
+
+	reply, handled, err := maybeHandleK12DingtalkPhoto(
+		context.Background(), selection, router, coordinator,
+	)
+	if err != nil || !handled || reply == nil {
+		t.Fatalf("frozen K12 route must own confirmation after current binding changes: handled=%v reply=%#v err=%v", handled, reply, err)
+	}
+	if coordinator.state.snapshot.Stage != k12usecase.InboundPhotoRoutingStageCandidate ||
+		coordinator.state.requestCalls != 1 || coordinator.state.confirmCalls != 0 {
+		t.Fatalf("confirmation did not advance the frozen route snapshot: snapshot=%+v requests=%d confirms=%d", coordinator.state.snapshot, coordinator.state.requestCalls, coordinator.state.confirmCalls)
 	}
 }
 

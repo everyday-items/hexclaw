@@ -258,7 +258,11 @@ func maybeHandleK12DingtalkPhoto(
 	router *agentrouter.Dispatcher,
 	imageTasks k12ImageTaskFacade,
 ) (*adapter.Reply, bool, error) {
-	if routed := routeK12DingtalkTutor(msg, router); routed != nil {
+	// 文字确认必须按入站照片收据中冻结的 Agent 恢复，不能因当前绑定已切换
+	// 而把原命令交给通用会话。只有 direct 钉钉文字且内容确实像确认动作时
+	// 才读取待确认收据，避免拦截普通消息或群聊消息。
+	if msg != nil && msg.Platform == adapter.PlatformDingtalk &&
+		msg.Metadata["conversation_type"] != "2" {
 		if coordinator, ok := imageTasks.(k12InboundPhotoRoutingCoordinator); ok {
 			decision, matched := k12PhotoRoutingConfirmationDecision(msg)
 			if !matched && k12PhotoRoutingCandidateSelectionMessage(msg) {
@@ -266,8 +270,10 @@ func maybeHandleK12DingtalkPhoto(
 				matched = true
 			}
 			if matched {
+				// agentName 为空表示按 durable receipt 的冻结 Agent 匹配；
+				// current router 只代表当前配置，不能覆盖已接纳任务的路由事实。
 				reply, handled, err := confirmK12PendingPhotoRoute(
-					ctx, msg, routed.AgentName, decision, coordinator,
+					ctx, msg, "", decision, coordinator,
 				)
 				if handled || err != nil {
 					return reply, true, err
@@ -552,7 +558,8 @@ func k12InboundPhotoBundleMatchesMessage(
 		return false
 	}
 	identity := bundle.Receipt.Identity
-	return bundle.Receipt.AgentName == strings.TrimSpace(agentName) &&
+	return (strings.TrimSpace(agentName) == "" ||
+		bundle.Receipt.AgentName == strings.TrimSpace(agentName)) &&
 		strings.ToLower(strings.TrimSpace(identity.Platform)) == string(msg.Platform) &&
 		strings.TrimSpace(identity.InstanceID) == strings.TrimSpace(msg.InstanceID) &&
 		strings.TrimSpace(identity.ChatID) == strings.TrimSpace(msg.ChatID)
