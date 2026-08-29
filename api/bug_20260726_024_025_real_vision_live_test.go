@@ -13,6 +13,7 @@ import (
 
 	"github.com/hexagon-codes/ai-core/llm"
 	"github.com/hexagon-codes/hexagon"
+	"github.com/hexagon-codes/hexagon/rag/splitter"
 	"github.com/hexagon-codes/hexclaw/config"
 	"github.com/hexagon-codes/hexclaw/egress"
 	"github.com/hexagon-codes/hexclaw/knowledge"
@@ -112,6 +113,10 @@ func TestBUG20260726024And025RealVisionProviderIngest(t *testing.T) {
 		store,
 		store,
 		nil,
+		knowledge.WithSplitter(splitter.NewMarkdownSplitter(
+			splitter.WithMarkdownChunkSize(400),
+			splitter.WithMarkdownChunkOverlap(80),
+		)),
 		knowledge.WithCaptioner(captioner),
 	)
 	h.manager = manager

@@ -179,6 +179,9 @@ func TestBUG20260728008And012RealTextbookPDFWithLocalOllama(t *testing.T) {
 		}
 		documentChunkCounts = append(documentChunkCounts, document.ChunkCount)
 	}
+	documentChunkInputs := semanticTextbookChunkInputs(
+		t, ctx, db, append([]string{textbook.DocumentID}, distractorDocumentIDs...),
+	)
 
 	oraclePage := extractSemanticTextbookOraclePage(t, ctx, fixture)
 	results, routeRan, receipt, err := runtime.Searcher.SearchWithReceipt(
@@ -191,7 +194,7 @@ func TestBUG20260728008And012RealTextbookPDFWithLocalOllama(t *testing.T) {
 		t, results, routeRan, receipt, textbook.DocumentID, documentGeneration,
 		activeRevisionID, policy.ActiveRevision, documentContent, oraclePage,
 	)
-	assertSemanticTextbookEmbeddingEvidence(t, counter, plan.Model, documentChunkCounts, 1)
+	assertSemanticTextbookEmbeddingEvidence(t, counter, plan.Model, documentChunkCounts, documentChunkInputs, 1)
 
 	requestsBeforeRestart := len(counter.snapshot())
 	vectorsBeforeRestart := textbookVectors
@@ -324,18 +327,36 @@ func (c *semanticTextbookSparsePageCaptioner) Caption(
 	image []byte,
 	mime string,
 ) (string, error) {
+	result, err := c.CaptionWithReceipt(ctx, image, mime)
+	return result.Content, err
+}
+
+func (c *semanticTextbookSparsePageCaptioner) CaptionWithReceipt(
+	ctx context.Context,
+	image []byte,
+	mime string,
+) (knowledge.CaptionResult, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return knowledge.CaptionResult{}, err
 	}
 	call := int(c.calls.Add(1))
 	if call > len(semanticTextbookSparsePages) {
-		return "", fmt.Errorf("unexpected sparse textbook page caption call %d", call)
+		return knowledge.CaptionResult{}, fmt.Errorf("unexpected sparse textbook page caption call %d", call)
 	}
 	if len(image) == 0 || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(mime)), "image/") {
-		return "", fmt.Errorf("invalid rendered textbook page for caption call %d", call)
+		return knowledge.CaptionResult{}, fmt.Errorf("invalid rendered textbook page for caption call %d", call)
 	}
-	return fmt.Sprintf("Scanned textbook page %d with cover or publication information.",
-		semanticTextbookSparsePages[call-1]), nil
+	return knowledge.CaptionResult{
+		Content: fmt.Sprintf("Scanned textbook page %d with cover or publication information.",
+			semanticTextbookSparsePages[call-1]),
+		RouteReceipt: knowledge.OCRRouteReceipt{
+			Provider:  semanticTextbookCaptionerRoute().ProviderName,
+			Model:     semanticTextbookCaptionerRoute().Model,
+			Operation: knowledge.OCRRouteOperationPDFPage,
+			Status:    knowledge.OCRRouteStatusSucceeded,
+			Fake:      false,
+		},
+	}, nil
 }
 
 func (c *semanticTextbookSparsePageCaptioner) Calls() int {
@@ -494,6 +515,39 @@ func semanticTextbookVectorFacts(
 	return chunks, vectors
 }
 
+func semanticTextbookChunkInputs(
+	t *testing.T,
+	ctx context.Context,
+	db *sql.DB,
+	documentIDs []string,
+) []string {
+	t.Helper()
+	inputs := make([]string, 0)
+	for _, documentID := range documentIDs {
+		rows, err := db.QueryContext(ctx, `SELECT content FROM kb_chunks
+			WHERE doc_id=? ORDER BY chunk_index, id`, documentID)
+		if err != nil {
+			t.Fatalf("list semantic textbook chunks for %q: %v", documentID, err)
+		}
+		for rows.Next() {
+			var content string
+			if err := rows.Scan(&content); err != nil {
+				_ = rows.Close()
+				t.Fatalf("read semantic textbook chunk for %q: %v", documentID, err)
+			}
+			inputs = append(inputs, content)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			t.Fatalf("iterate semantic textbook chunks for %q: %v", documentID, err)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatalf("close semantic textbook chunks for %q: %v", documentID, err)
+		}
+	}
+	return inputs
+}
+
 func extractSemanticTextbookOraclePage(
 	t *testing.T,
 	ctx context.Context,
@@ -501,7 +555,7 @@ func extractSemanticTextbookOraclePage(
 ) string {
 	t.Helper()
 	page := strconv.Itoa(semanticTextbookOraclePage)
-	output, err := exec.CommandContext(ctx, "pdftotext", "-f", page, "-l", page, fixture, "-").Output()
+	output, err := exec.CommandContext(ctx, "pdftotext", "-layout", "-f", page, "-l", page, fixture, "-").Output()
 	if err != nil {
 		t.Fatalf("extract physical textbook page %d: %v", semanticTextbookOraclePage, err)
 	}
@@ -615,19 +669,32 @@ func assertSemanticTextbookEmbeddingEvidence(
 	counter *semanticLiveEmbeddingCounter,
 	model string,
 	documentChunkCounts []int,
+	documentChunkInputs []string,
 	queryRequests int,
 ) {
 	t.Helper()
-	documentInputs, wantDocumentRequests := 0, 0
+	documentInputs := 0
 	for _, chunkCount := range documentChunkCounts {
 		if chunkCount <= 0 {
 			t.Fatalf("document chunk count must be positive, got %d in %v", chunkCount, documentChunkCounts)
 		}
 		documentInputs += chunkCount
-		wantDocumentRequests += (chunkCount + 1) / 2
+	}
+	if len(documentChunkInputs) != documentInputs {
+		t.Fatalf("durable chunk inputs=%d, want %d from per-document chunks %v",
+			len(documentChunkInputs), documentInputs, documentChunkCounts)
+	}
+	wantDocumentValues := make(map[string]struct{}, len(documentChunkInputs))
+	for _, input := range documentChunkInputs {
+		input = semanticTextbookClampRunes(strings.TrimSpace(input), 400)
+		if input == "" {
+			t.Fatal("durable document chunk input is empty")
+		}
+		wantDocumentValues[input] = struct{}{}
 	}
 	records := counter.snapshot()
 	documentRequestCount, observedDocumentInputs, observedQueryRequests := 0, 0, 0
+	observedDocumentValues := make(map[string]int, len(wantDocumentValues))
 	var previousFinished time.Time
 	for _, record := range records {
 		if record.model != model || record.httpStatus != http.StatusOK {
@@ -658,14 +725,40 @@ func assertSemanticTextbookEmbeddingEvidence(
 			record.deadlineRemaining > 120*time.Second {
 			t.Fatalf("document embedding deadline=%v, want production budget about 120s", record.deadlineRemaining)
 		}
+		for _, input := range record.inputValues {
+			if _, ok := wantDocumentValues[input]; !ok {
+				t.Fatalf("unexpected physical document embedding input %q", semanticTextbookSafeSnippet(input))
+			}
+			observedDocumentValues[input]++
+		}
 	}
-	if documentRequestCount != wantDocumentRequests || observedDocumentInputs != documentInputs ||
+	if documentRequestCount < (len(wantDocumentValues)+1)/2 ||
+		documentRequestCount > len(wantDocumentValues) ||
+		observedDocumentInputs < len(wantDocumentValues) || observedDocumentInputs > documentInputs ||
 		observedQueryRequests != queryRequests {
-		t.Fatalf("embedding evidence documents=%d requests/%d inputs queries=%d, want %d/%d/%d from per-document chunks %v",
-			documentRequestCount, observedDocumentInputs, observedQueryRequests,
-			wantDocumentRequests, documentInputs, queryRequests, documentChunkCounts)
+		t.Fatalf("embedding evidence documents=%d requests/%d unique_inputs=%d/%d inputs queries=%d, want request range [%d,%d] and query count %d from per-document chunks %v",
+			documentRequestCount, observedDocumentInputs,
+			len(observedDocumentValues), len(wantDocumentValues), observedQueryRequests,
+			(len(wantDocumentValues)+1)/2, len(wantDocumentValues), queryRequests, documentChunkCounts)
+	}
+	for input := range wantDocumentValues {
+		if observedDocumentValues[input] == 0 {
+			t.Fatalf("unique durable chunk was not sent to the configured embedding model: %q",
+				semanticTextbookSafeSnippet(input))
+		}
 	}
 	if got := counter.chatRequests.Load(); got != 0 {
 		t.Fatalf("chat requests=%d, want zero", got)
 	}
+}
+
+func semanticTextbookClampRunes(value string, max int) string {
+	if max <= 0 {
+		return value
+	}
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return string(runes[:max])
 }
