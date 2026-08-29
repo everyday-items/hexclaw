@@ -637,11 +637,11 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 		}
 	}
 	b.WriteString("## 📊 作业批改完成\n\n")
-	fmt.Fprintf(&b, "- **%d** questions recognized\n- **%d** correct", len(result.Items), correct)
+	fmt.Fprintf(&b, "- 共识别 **%d** 道题\n- **%d** 道正确", len(result.Items), correct)
 	if processIssue > 0 {
-		fmt.Fprintf(&b, ", **%d** with process issues", processIssue)
+		fmt.Fprintf(&b, "，**%d** 道过程问题", processIssue)
 	}
-	fmt.Fprintf(&b, ", **%d** requiring correction", wrong)
+	fmt.Fprintf(&b, "，**%d** 道需要订正", wrong)
 	if unanswered > 0 {
 		fmt.Fprintf(&b, "，未作答 **%d** 题", unanswered)
 	}
@@ -682,24 +682,24 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 		b.WriteString("\n")
 	}
 	if processIssue > 0 {
-		fmt.Fprintf(&b, "### ⚠️ Process issues (%d)\n\n", processIssue)
-		b.WriteString("> The final answer is correct. Only process issues supported by clear evidence are shown below, and they are not recorded as wrong.\n\n")
+		fmt.Fprintf(&b, "### ⚠️ 过程问题（%d）\n\n", processIssue)
+		b.WriteString("> 过程问题表示最终答案正确，但书写过程需要核对，不记为错题。\n\n")
 		for _, item := range result.Items {
 			if item.Status != PhotoCorrectWithProcessIssue {
 				continue
 			}
 			fmt.Fprintf(&b, "#### %s\n\n", photoQuestionReference(item.Recognized))
-			fmt.Fprintf(&b, "- **Question:** %s\n- **Your answer:** %s",
+			fmt.Fprintf(&b, "- **题目：** %s\n- **你的作答：** %s",
 				photoInline(photoQuestionStem(item.Recognized), 240),
 				photoInline(item.Recognized.StudentAnswer, 300))
 			if item.Grade.Outcome.WrongStep != "" {
-				fmt.Fprintf(&b, "\n- **Process note:** %s", photoInline(item.Grade.Outcome.WrongStep, 300))
+				fmt.Fprintf(&b, "\n- **错误步骤：** %s", photoInline(item.Grade.Outcome.WrongStep, 300))
 			}
 			if item.Grade.Outcome.ErrorCause != "" {
-				fmt.Fprintf(&b, "\n- **Cause:** %s", photoInline(item.Grade.Outcome.ErrorCause, 300))
+				fmt.Fprintf(&b, "\n- **原因：** %s", photoInline(item.Grade.Outcome.ErrorCause, 300))
 			}
 			if item.ParentGuide != nil {
-				b.WriteString("\n\n##### How the parent can explain it\n\n")
+				b.WriteString("\n\n##### 家长怎么讲\n\n")
 				writeParentTeachingGuideMarkdown(&b, *item.ParentGuide)
 			}
 			b.WriteString("\n\n")

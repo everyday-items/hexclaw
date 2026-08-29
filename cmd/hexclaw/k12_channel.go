@@ -803,9 +803,40 @@ func k12FinalArtifactIMMarkdown(markdown string) string {
 		if strings.HasPrefix(trimmed, "# ") || strings.HasPrefix(trimmed, "## ") {
 			assessmentStatus = ""
 		}
+		if trimmed == "## Grading summary" {
+			visible = append(visible, "## 批改摘要")
+			replaced = true
+			continue
+		}
+		if summary, ok := k12FinalArtifactLegacySummaryLine(trimmed); ok {
+			visible = append(visible, summary)
+			replaced = true
+			continue
+		}
+		if trimmed == "> A process issue has a correct final answer and is not recorded as wrong." {
+			visible = append(visible, "> 过程问题表示最终答案正确，但书写过程需要核对，不记为错题。")
+			replaced = true
+			continue
+		}
 		if status, ok := k12FinalArtifactAssessmentStatus(trimmed); ok {
 			assessmentStatus = status
-			visible = append(visible, line)
+			visible = append(visible, "**批改状态：** "+k12FinalArtifactParentStatus(status))
+			replaced = true
+			continue
+		}
+		if strings.HasPrefix(trimmed, "**Process note:**") {
+			visible = append(visible, strings.Replace(line, "**Process note:**", "**错误步骤：**", 1))
+			replaced = true
+			continue
+		}
+		if strings.HasPrefix(trimmed, "**Cause:**") {
+			visible = append(visible, strings.Replace(line, "**Cause:**", "**原因：**", 1))
+			replaced = true
+			continue
+		}
+		if trimmed == "### How the parent can explain it" {
+			visible = append(visible, "### 家长怎么讲")
+			replaced = true
 			continue
 		}
 		if assessmentStatus != "" && trimmed == "```json" {
@@ -856,11 +887,86 @@ func k12FinalArtifactAssessmentStatus(line string) (k12usecase.PhotoItemStatus, 
 		k12usecase.PhotoAnswerUnclear,
 		k12usecase.PhotoBlankSolved,
 		k12usecase.PhotoOutOfScope,
-		k12usecase.PhotoUntrusted:
+		k12usecase.PhotoUntrusted,
+		k12usecase.PhotoFailed:
 		return status, true
 	default:
 		return "", false
 	}
+}
+
+func k12FinalArtifactParentStatus(status k12usecase.PhotoItemStatus) string {
+	switch status {
+	case k12usecase.PhotoCorrect:
+		return "✅ 正确"
+	case k12usecase.PhotoCorrectWithProcessIssue:
+		return "⚠ 过程问题（最终答案正确，不记为错题）"
+	case k12usecase.PhotoWrong:
+		return "❌ 需要订正"
+	case k12usecase.PhotoUnanswered:
+		return "⏸ 未作答"
+	case k12usecase.PhotoAnswerUnclear:
+		return "⚠ 作答待补录"
+	case k12usecase.PhotoBlankSolved:
+		return "📘 已生成家长辅导指南"
+	case k12usecase.PhotoOutOfScope:
+		return "⛔ 超出当前年级范围"
+	default:
+		return "⚠ 待核对"
+	}
+}
+
+func k12FinalArtifactLegacySummaryLine(line string) (string, bool) {
+	const prefix = "This run determined **"
+	if !strings.HasPrefix(line, prefix) {
+		return "", false
+	}
+	rest := strings.TrimPrefix(line, prefix)
+	totalEnd := strings.Index(rest, "**")
+	if totalEnd < 0 {
+		return "", false
+	}
+	rest = rest[totalEnd+2:]
+	const metricsPrefix = " questions: **"
+	if !strings.HasPrefix(rest, metricsPrefix) {
+		return "", false
+	}
+	metricsWithSuffix := strings.TrimPrefix(rest, metricsPrefix)
+	metricsEnd := strings.Index(metricsWithSuffix, "**")
+	if metricsEnd < 0 {
+		return "", false
+	}
+	metrics := metricsWithSuffix[:metricsEnd]
+	correct, ok := k12FinalArtifactLegacySummaryCount(metrics, "correct")
+	if !ok {
+		return "", false
+	}
+	processIssue, ok := k12FinalArtifactLegacySummaryCount(metrics, "with process issues")
+	if !ok {
+		return "", false
+	}
+	wrong, ok := k12FinalArtifactLegacySummaryCount(metrics, "requiring correction")
+	if !ok {
+		return "", false
+	}
+	result := fmt.Sprintf("**%d 道正确 / %d 道过程问题**", correct, processIssue)
+	if wrong > 0 {
+		result += fmt.Sprintf("\n\n另有 **%d 道需要订正**。", wrong)
+	}
+	return result, true
+}
+
+func k12FinalArtifactLegacySummaryCount(metrics, marker string) (int, bool) {
+	markerIndex := strings.Index(metrics, marker)
+	if markerIndex < 0 {
+		return 0, false
+	}
+	countText := strings.TrimSpace(metrics[:markerIndex])
+	if slashIndex := strings.LastIndex(countText, "/"); slashIndex >= 0 {
+		countText = strings.TrimSpace(countText[slashIndex+1:])
+	}
+	count, err := strconv.Atoi(countText)
+	return count, err == nil && count >= 0
 }
 
 // adapterReplyFromChannelMessage 把 ChannelNeutralMessage（§6.10）投影为平台 adapter.Reply。

@@ -110,7 +110,9 @@ func TestREGK12CorrectWithProcessIssue20260809001DurableProjectionHasOneStatus(t
 		}
 
 		markdown := photoGradeMarkdown(PhotoGradeResult{Mode: PhotoModeGrade, Items: []PhotoGradeItem{item}})
-		for _, want := range []string{"Process issues (1)", "300÷2÷2=50", "not recorded as wrong", "How the parent can explain it"} {
+		for _, want := range []string{
+			"过程问题（1）", "300÷2÷2=50", "过程问题表示最终答案正确，但书写过程需要核对，不记为错题", "家长怎么讲",
+		} {
 			if !strings.Contains(markdown, want) {
 				t.Fatalf("photo markdown lacks %q:\n%s", want, markdown)
 			}
