@@ -91,8 +91,8 @@ func TestProviderHTTPClientPreservesLogicalHostAndResolvedIPForFakeIPDiagnosis(t
 		name string
 		ip   string
 	}{
-		{name: "benchmark IPv4", ip: "198.18.0.115"},
-		{name: "ULA IPv6", ip: "fdfe:dcba:9876::40"},
+		{name: "benchmark IPv4", ip: "198.19.0.115"},
+		{name: "ULA IPv6", ip: "2001:db8::40"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -530,7 +530,7 @@ func TestProviderDialPolicyRequiresExactPrivateAuthorizationAndAlwaysBlocksMetad
 func TestProviderDialPolicyRejectsReservedAndBenchmarkTargets(t *testing.T) {
 	for _, ip := range []string{
 		"192.0.2.1",
-		"198.18.0.1",
+		"198.19.0.1",
 		"198.51.100.1",
 		"203.0.113.1",
 		"240.0.0.1",

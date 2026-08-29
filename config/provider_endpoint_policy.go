@@ -68,6 +68,29 @@ func providerPlainHTTPAuthorized(
 	return ip == nil || ip.IsPrivate()
 }
 
+// providerEndpointIsClashFakeIP reports whether ip is a synthetic fake IP
+// produced by Clash/Mihomo enhanced-mode DNS (198.18.0.0/16 and the default
+// fdfe:dcba:9876::/64). These addresses are intercepted by the TUN stack and
+// forwarded to the real public origin; they must not be treated as a
+// special-purpose or private block for hostname-based provider endpoints.
+// Literal IP endpoints (e.g. http://198.18.0.1) remain blocked to preserve
+// SSRF protection for IP-literal URLs.
+func providerEndpointIsClashFakeIP(logicalHost string, ip net.IP) bool {
+	if net.ParseIP(logicalHost) != nil {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 198 && ip4[1] == 18
+	}
+	addr, err := netip.ParseAddr(ip.String())
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	fakeIPv6Prefix := netip.MustParsePrefix("fdfe:dcba:9876::/64")
+	return fakeIPv6Prefix.Contains(addr)
+}
+
 // ValidateProviderResolvedEndpointAccess applies the provider endpoint policy
 // to an IP selected by DNS resolution before a TCP connection is opened.
 // Loopback is allowed only for an explicitly loopback logical host. RFC1918
@@ -80,6 +103,9 @@ func ValidateProviderResolvedEndpointAccess(
 	logicalHost = normalizeProviderEndpointHost(logicalHost)
 	if ip == nil {
 		return fmt.Errorf("provider endpoint resolved to an invalid address")
+	}
+	if providerEndpointIsClashFakeIP(logicalHost, ip) {
+		return nil
 	}
 	if providerEndpointIPAlwaysBlocked(ip) {
 		return fmt.Errorf("provider endpoint resolved to a blocked special-purpose address")
