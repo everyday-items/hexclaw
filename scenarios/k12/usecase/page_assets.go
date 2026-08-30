@@ -285,11 +285,15 @@ func (r *PageAssetRepository) Persist(
 			return ReadyPageAsset{}, err
 		}
 	case k12storage.PageAssetStorageCorrupt:
-		return ReadyPageAsset{}, fmt.Errorf(
-			"%w: corrupt identity %s",
-			k12storage.ErrPageAssetConflict,
+		stored, err = r.Records.RepairCorruptPageAssetStaging(
+			ctx,
+			ownerScope,
+			agentName,
 			stored.PageAssetID,
 		)
+		if err != nil {
+			return ReadyPageAsset{}, err
+		}
 	}
 	if stored.StorageState != k12storage.PageAssetStorageStaging {
 		return ReadyPageAsset{}, fmt.Errorf(

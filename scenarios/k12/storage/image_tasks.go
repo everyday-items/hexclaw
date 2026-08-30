@@ -2554,6 +2554,10 @@ func (s *Store) RestartImageTaskAutomaticWindow(
               AND automatic_deadline_at>0
               AND automatic_deadline_at<=?
             )
+            OR (
+              status='routed'
+              AND target_object_type='creative_work_intake'
+            )
           )`,
 		imageTaskAutomaticBudgetSeconds, now,
 		now+imageTaskAutomaticBudgetSeconds, imageTaskAutomaticBudgetSeconds,

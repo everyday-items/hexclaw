@@ -147,9 +147,11 @@ type ImageTaskView struct {
 	CreativeDisplayName            string
 	CreativeWork                   *CreativeWorkView
 	CreativeFeedback               string
-	ActiveInvocationDeadlineAt     int64
-	solveInvocation                *k12.ImageTaskInvocation
-	feedbackInvocation             *k12.ImageTaskInvocation
+	// CreativeFeedbackRetryable 只投影当前作品点评调用账本的安全重试事实。
+	CreativeFeedbackRetryable  bool
+	ActiveInvocationDeadlineAt int64
+	solveInvocation            *k12.ImageTaskInvocation
+	feedbackInvocation         *k12.ImageTaskInvocation
 }
 
 type ImageTaskHomeworkProjection struct {
@@ -1324,6 +1326,8 @@ func (c *ImageTaskCoordinator) projectTarget(
 				if view.CreativeFeedback != "feedback_ready" {
 					view.CreativeFeedback = publicCreativeFeedbackInvocationState(invocation)
 				}
+				view.CreativeFeedbackRetryable =
+					invocation.Status == k12.ImageTaskInvocationFailed && invocation.RetrySafe
 				view.feedbackInvocation = &invocation
 				if invocation.Status == k12.ImageTaskInvocationPrepared ||
 					invocation.Status == k12.ImageTaskInvocationSent {
@@ -1395,7 +1399,24 @@ func (c *ImageTaskCoordinator) resolveWorkFeedbackRoute(
 	case view.feedbackInvocation != nil:
 		route = view.feedbackInvocation.RouteSnapshot
 	case view.Dispatch.RoutingProvenance == k12.ImageTaskRoutingModelClassified:
-		route = view.Dispatch.RoutePolicySnapshot
+		if c.ResolveWorkFeedbackRoute == nil {
+			return k12.ImageTaskRouteSnapshot{}, errors.New(
+				"usecase: image task work-feedback route resolver is not configured",
+			)
+		}
+		if view.Creative == nil {
+			return k12.ImageTaskRouteSnapshot{}, errors.New(
+				"usecase: image task work-feedback creative intake is missing",
+			)
+		}
+		route, err = c.ResolveWorkFeedbackRoute(
+			ctx,
+			view.Creative.WorkType,
+			view.Dispatch.RoutePolicySnapshot,
+		)
+		if err != nil {
+			return k12.ImageTaskRouteSnapshot{}, err
+		}
 	case view.Dispatch.RoutingProvenance == k12.ImageTaskRoutingParentSelected:
 		if c.ResolveWorkFeedbackRoute == nil {
 			return k12.ImageTaskRouteSnapshot{}, errors.New(
@@ -1520,9 +1541,10 @@ func (c *ImageTaskCoordinator) continueTarget(
 		job, _, err := c.Grading.StartPhotoGradingJob(ctx, StartPhotoGradingInput{
 			Photo: PhotoGradeRequest{
 				AgentName: view.Dispatch.AgentName, SourceSession: view.Dispatch.SourceSessionID,
-				Image:      append([]byte(nil), images[0]...),
-				TaskIntent: photoTaskIntentFromDispatch(view.Dispatch.TaskIntent),
-				Grade:      strings.TrimSpace(grade),
+				SourcePageAssetID: view.Dispatch.SourceAssetRefs[0],
+				Image:             append([]byte(nil), images[0]...),
+				TaskIntent:        photoTaskIntentFromDispatch(view.Dispatch.TaskIntent),
+				Grade:             strings.TrimSpace(grade),
 			},
 			SourceKind: "image_task", SourceKey: view.Dispatch.DispatchID,
 			ModelSnapshot:  gradingSnapshotFromImageRoute(view.Dispatch.RoutePolicySnapshot),
@@ -2479,23 +2501,21 @@ func (c *ImageTaskCoordinator) Retry(
 	if current.Creative != nil &&
 		current.Creative.Status == k12.CreativeWorkIntakePromoted {
 		if current.CreativeFeedback != "feedback_failed" ||
+			!current.CreativeFeedbackRetryable ||
 			c.WorkFeedback == nil {
 			return current, k12storage.ErrImageTaskInvalidState
 		}
-		dispatch := current.Dispatch
-		if dispatch.Status == k12.ImageTaskStatusFailed && dispatch.RetrySafe {
-			dispatch, err = c.Records.RestartImageTaskAutomaticWindow(
-				ctx,
-				agentName,
-				dispatchID,
-				expectedVersion,
-				c.now(),
-			)
-			if err != nil {
-				return current, err
-			}
-			current.Dispatch = dispatch
+		dispatch, err := c.Records.RestartImageTaskAutomaticWindow(
+			ctx,
+			agentName,
+			dispatchID,
+			expectedVersion,
+			c.now(),
+		)
+		if err != nil {
+			return current, err
 		}
+		current.Dispatch = dispatch
 		automaticCtx, cancelAutomatic := withImageTaskAutomaticWindow(
 			ctx,
 			dispatch.DispatchID,

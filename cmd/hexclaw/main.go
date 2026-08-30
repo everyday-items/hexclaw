@@ -2423,9 +2423,12 @@ Set source only when the material explicitly names a work, title, or another rel
 					),
 				)
 			}
-			// Freeze the validated release policy at composition. Every subsequent
-			// CreateGradingJob copies this value; retries only read the Job snapshot.
-			k12rt.Deps.GradingBudgetSnapshot = k12GradingBudgetSnapshotFromConfig(cfg.K12.GradingBudget)
+			// 配置缺省时采用可运行的操作基线；显式配置仍原样冻结到每个 Job。
+			gradingBudget := cfg.K12.GradingBudget
+			if gradingBudget.IsZero() {
+				gradingBudget = config.DefaultK12GradingBudget()
+			}
+			k12rt.Deps.GradingBudgetSnapshot = k12GradingBudgetSnapshotFromConfig(gradingBudget)
 			k12Runtime = k12rt
 			k12InboundPhotos = k12usecase.NewInboundPhotoCoordinator(k12rt.Records)
 			logger.Info("K12 场景已按 Manifest v2 安装",
@@ -2504,6 +2507,15 @@ Set source only when the material explicitly names a work, title, or another rel
 					workType string,
 					requested k12.ImageTaskRouteSnapshot,
 				) (k12.ImageTaskRouteSnapshot, error) {
+					requested = k12.NormalizeImageTaskRouteSnapshot(requested)
+					if requested.SelectionSource == "auto" {
+						return resolveK12WorkFeedbackRouteWithCapabilityReceipt(
+							requestCtx,
+							router,
+							k12ModelCapabilityReceipts,
+							workType,
+						)
+					}
 					return resolveK12RequestedWorkFeedbackRouteWithCapabilityReceipt(
 						requestCtx,
 						router,

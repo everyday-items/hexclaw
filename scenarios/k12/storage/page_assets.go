@@ -574,3 +574,51 @@ func (s *Store) RetryPageAssetStaging(
 		stored.StorageState,
 	)
 }
+
+// RepairCorruptPageAssetStaging 只供已逐字段重验身份一致的上传执行专用 CAS。
+func (s *Store) RepairCorruptPageAssetStaging(
+	ctx context.Context,
+	ownerScope, agentName, pageAssetID string,
+) (PageAssetMetadata, error) {
+	ownerScope, agentName, pageAssetID, err := normalizePageAssetScope(
+		ownerScope,
+		agentName,
+		pageAssetID,
+	)
+	if err != nil {
+		return PageAssetMetadata{}, err
+	}
+	now := nowUnix()
+	if now <= 0 {
+		now = 1
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE k12_page_assets
+		SET storage_state='staging',ready_at=0,last_error='',
+		    updated_at=MAX(updated_at+1,?)
+		WHERE owner_scope=? AND agent_name=? AND page_asset_id=?
+		  AND storage_state='corrupt'`,
+		now,
+		ownerScope,
+		agentName,
+		pageAssetID,
+	)
+	if err != nil {
+		return PageAssetMetadata{}, fmt.Errorf("k12storage: repair corrupt PageAsset staging: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return PageAssetMetadata{}, fmt.Errorf("k12storage: repair corrupt PageAsset staging rows: %w", err)
+	}
+	stored, err := s.getPageAsset(ctx, ownerScope, agentName, pageAssetID)
+	if err != nil {
+		return PageAssetMetadata{}, err
+	}
+	if rows == 1 {
+		return stored, nil
+	}
+	return PageAssetMetadata{}, fmt.Errorf(
+		"%w: cannot repair %s PageAsset",
+		ErrPageAssetConflict,
+		stored.StorageState,
+	)
+}

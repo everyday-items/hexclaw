@@ -1255,9 +1255,14 @@ func (o *GradingOrchestrator) persistRecognizedPhotoFacts(
 	release := o.acquirePageAssetLock(run.agentName, photoImageDigest(run.req.Image))
 	defer release()
 
-	assetID, created, err := o.deps.PageAssets.Ensure(run.agentName, run.req.Image)
-	if err != nil {
-		return fmt.Errorf("usecase: 固化识题原图资产: %w", err)
+	assetID := strings.TrimSpace(run.req.SourcePageAssetID)
+	created := false
+	if assetID == "" {
+		var err error
+		assetID, created, err = o.deps.PageAssets.Ensure(run.agentName, run.req.Image)
+		if err != nil {
+			return fmt.Errorf("usecase: 固化识题原图资产: %w", err)
+		}
 	}
 	if strings.TrimSpace(assetID) == "" {
 		if created {

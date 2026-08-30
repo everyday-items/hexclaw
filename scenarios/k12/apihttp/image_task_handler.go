@@ -244,6 +244,9 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 		}
 		if view.Homework.Status == k12.HomeworkSubmissionFailed {
 			projection.Stage = "failed_terminal"
+			if dispatch.RetrySafe {
+				projection.Stage = "failed_retryable"
+			}
 		}
 		if view.HomeworkProjection != nil {
 			questions := make([]recognizedQuestionDTO, 0, len(view.HomeworkProjection.Questions))
@@ -341,10 +344,15 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 	if dispatch.Status == k12.ImageTaskStatusFailed {
 		out.Retryable = dispatch.RetrySafe
 		out.FailureKind = publicImageTaskFailureKind(dispatch)
-		out.Progress.State = "failed"
-		if strings.Contains(dispatch.FailureKind, "outcome_unknown") {
-			out.Progress.State = "recovering"
+		if out.Progress.Operation == "classification" {
+			out.Progress.State = "failed"
+			if strings.Contains(dispatch.FailureKind, "outcome_unknown") {
+				out.Progress.State = "recovering"
+			}
 		}
+	}
+	if view.CreativeFeedback == "feedback_failed" {
+		out.Retryable = view.CreativeFeedbackRetryable
 	}
 	return out
 }

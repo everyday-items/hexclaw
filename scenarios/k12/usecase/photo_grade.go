@@ -69,11 +69,12 @@ const (
 )
 
 type PhotoGradeRequest struct {
-	AgentName     string
-	Subject       string
-	Grade         string
-	SourceSession string
-	Image         []byte
+	AgentName         string
+	Subject           string
+	Grade             string
+	SourceSession     string
+	SourcePageAssetID string
+	Image             []byte
 	// TaskIntent is frozen by ImageTaskDispatch. Empty preserves the legacy
 	// direct-photo path which infers intent from recognition evidence.
 	TaskIntent PhotoTaskIntent

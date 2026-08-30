@@ -169,6 +169,42 @@ func TestPageAssetRepository_ReadyDriftMarksCorrupt(t *testing.T) {
 	})
 }
 
+func TestPageAssetRepository_ExactReuploadRepairsCorruptAsset(t *testing.T) {
+	repository, store, db := newPageAssetRepository(t)
+	ctx := context.Background()
+	data := pageAssetPNG(t, 3, 2, color.NRGBA{R: 0x7e, G: 0xb1, B: 0x6f, A: 0xff})
+	ready, err := repository.Persist(ctx, "guardian-1", "mingming", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := assetstore.PathFromID(ready.Metadata.PageAssetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := repository.OpenReady(ctx, "guardian-1", "mingming", ready.Metadata.PageAssetID); !errors.Is(err, usecase.ErrPageAssetIntegrity) {
+		t.Fatalf("missing ready file must fail with integrity error: %v", err)
+	}
+	assertPageAssetCorrupt(t, db, store, ready.Metadata)
+
+	repaired, err := repository.Persist(ctx, "guardian-1", "mingming", data)
+	if err != nil {
+		t.Fatalf("exact reupload must repair corrupt asset: %v", err)
+	}
+	if repaired.Metadata.PageAssetID != ready.Metadata.PageAssetID ||
+		repaired.Metadata.StorageState != k12storage.PageAssetStorageReady ||
+		!bytes.Equal(repaired.Data, data) {
+		t.Fatalf("repaired PageAsset fact drift: %+v", repaired.Metadata)
+	}
+	state, lastError := pageAssetState(t, db, ready.Metadata.PageAssetID)
+	if state != string(k12storage.PageAssetStorageReady) || lastError != "" {
+		t.Fatalf("repaired row state=%q last_error=%q", state, lastError)
+	}
+}
+
 func TestPageAssetRepository_JPEGEXIFOrientationsFiveThroughEightSwapDimensions(t *testing.T) {
 	repository, _, _ := newPageAssetRepository(t)
 	ctx := context.Background()

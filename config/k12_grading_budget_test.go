@@ -1,6 +1,7 @@
 package config
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -23,13 +24,20 @@ func validK12GradingBudgetConfig() K12GradingBudgetConfig {
 	}
 }
 
-func TestDefaultK12GradingBudgetRemainsUnfrozenUntilRealBenchmarkCompletes(t *testing.T) {
-	cfg := DefaultConfig()
-	if cfg.K12.GradingBudget.PolicyVersion != 0 {
-		t.Fatalf("default policy_version=%d, want strict unfrozen 0", cfg.K12.GradingBudget.PolicyVersion)
+func TestDefaultK12GradingBudgetProvidesRunnableOperationalBaseline(t *testing.T) {
+	want := validK12GradingBudgetConfig()
+	got := DefaultK12GradingBudget()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("default grading budget=%+v, want %+v", got, want)
 	}
+
+	cfg := DefaultConfig()
+	if !cfg.K12.GradingBudget.IsZero() {
+		t.Fatalf("persisted default must not claim release calibration: %+v", cfg.K12.GradingBudget)
+	}
+	cfg.K12.GradingBudget = got
 	if err := cfg.Validate(); err != nil {
-		t.Fatalf("unfrozen shipping default must validate: %v", err)
+		t.Fatalf("operational grading baseline must validate: %v", err)
 	}
 }
 

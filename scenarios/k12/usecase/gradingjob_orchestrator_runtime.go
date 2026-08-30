@@ -1172,16 +1172,17 @@ func joinOCRRiskReasons(reasons []OCRRiskReason) string {
 
 // gradingRunFile run.json 结构（原图独立存 image.bin，避免每次改写都重写大字节）。
 type gradingRunFile struct {
-	AgentName     string               `json:"agent_name"`
-	TextOnly      bool                 `json:"text_only,omitempty"`
-	Subject       string               `json:"subject,omitempty"`
-	Grade         string               `json:"grade,omitempty"`
-	SourceSession string               `json:"source_session,omitempty"`
-	Questions     []RecognizedQuestion `json:"questions,omitempty"`
-	Anchored      []RecognizedQuestion `json:"anchored,omitempty"`
-	AnchorFailed  bool                 `json:"anchor_failed,omitempty"`
-	RenderFailure string               `json:"render_failure,omitempty"`
-	Result        *PhotoGradeResult    `json:"result,omitempty"`
+	AgentName         string               `json:"agent_name"`
+	TextOnly          bool                 `json:"text_only,omitempty"`
+	Subject           string               `json:"subject,omitempty"`
+	Grade             string               `json:"grade,omitempty"`
+	SourceSession     string               `json:"source_session,omitempty"`
+	SourcePageAssetID string               `json:"source_page_asset_id,omitempty"`
+	Questions         []RecognizedQuestion `json:"questions,omitempty"`
+	Anchored          []RecognizedQuestion `json:"anchored,omitempty"`
+	AnchorFailed      bool                 `json:"anchor_failed,omitempty"`
+	RenderFailure     string               `json:"render_failure,omitempty"`
+	Result            *PhotoGradeResult    `json:"result,omitempty"`
 }
 
 type gradingRecognitionAuditFile struct {
@@ -1240,8 +1241,8 @@ func (o *GradingOrchestrator) persistRun(jobID string, run *gradingRun) error {
 	}
 	meta := gradingRunFile{
 		AgentName: run.agentName, TextOnly: run.textOnly, Subject: run.req.Subject, Grade: run.req.Grade,
-		SourceSession: run.req.SourceSession,
-		Questions:     run.questions, Anchored: run.anchored, AnchorFailed: run.anchorFailed,
+		SourceSession: run.req.SourceSession, SourcePageAssetID: run.req.SourcePageAssetID,
+		Questions: run.questions, Anchored: run.anchored, AnchorFailed: run.anchorFailed,
 		RenderFailure: run.renderFailure, Result: run.result,
 	}
 	raw, err := json.Marshal(meta)
@@ -1309,7 +1310,7 @@ func (o *GradingOrchestrator) ensureRun(ctx context.Context, jobID string) (*gra
 		agentName: meta.AgentName, textOnly: meta.TextOnly,
 		req: PhotoGradeRequest{
 			AgentName: meta.AgentName, Subject: meta.Subject, Grade: meta.Grade,
-			SourceSession: meta.SourceSession, Image: image,
+			SourceSession: meta.SourceSession, SourcePageAssetID: meta.SourcePageAssetID, Image: image,
 		},
 		questions: questions, anchored: meta.Anchored, anchorFailed: meta.AnchorFailed,
 		renderFailure: meta.RenderFailure, result: meta.Result,

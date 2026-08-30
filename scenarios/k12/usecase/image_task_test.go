@@ -267,9 +267,10 @@ func newImageTaskCoordinatorForTest(t *testing.T, classifier *imageTaskClassifie
 		WritingOCR: &imageTaskOCRStub{result: ImageTaskWritingOCRResult{
 			Raw: "我的好爸爸", CanonicalContent: "我的好爸爸", Confidence: 0.99,
 		}},
-		Grading:      gr,
-		WorkFeedback: &feedbackDeps,
-		ResolveRoute: imageTaskRouteForTest,
+		Grading:                  gr,
+		WorkFeedback:             &feedbackDeps,
+		ResolveRoute:             imageTaskRouteForTest,
+		ResolveWorkFeedbackRoute: imageTaskWorkFeedbackRouteForTest,
 		ReadAsset: func(agent, ref string) ([]byte, error) {
 			if agent != "mingming" || ref != imageTaskAssetForTest {
 				t.Fatalf("unexpected owner/ref %q %q", agent, ref)
@@ -660,7 +661,8 @@ func restartImageTaskCoordinator(
 		Records: original.Records, Classifier: classifier,
 		WritingOCR: original.WritingOCR, Grading: original.Grading,
 		WorkFeedback: original.WorkFeedback, ResolveRoute: original.ResolveRoute,
-		ResolveGrade: original.ResolveGrade, ReadAsset: original.ReadAsset,
+		ResolveWorkFeedbackRoute: original.ResolveWorkFeedbackRoute,
+		ResolveGrade:             original.ResolveGrade, ReadAsset: original.ReadAsset,
 		Now: original.Now, NewID: original.NewID,
 	}
 }
@@ -1569,6 +1571,34 @@ func TestImageTaskCoordinatorWorkFeedbackRetryReusesFrozenRoute(t *testing.T) {
 		Confidence:     0.99,
 	}}
 	coordinator, _ := newImageTaskCoordinatorForTest(t, classifier)
+	coordinator.ResolveRoute = func(requested k12.ImageTaskRouteSnapshot) (k12.ImageTaskRouteSnapshot, error) {
+		route, err := imageTaskRouteForTest(requested)
+		if err != nil {
+			return k12.ImageTaskRouteSnapshot{}, err
+		}
+		route.ProviderInstanceID = "provider-instance"
+		route.ConfigFingerprint = "classification-fingerprint"
+		route.CapabilityReceiptDigest = "classification-vision-receipt"
+		route.ProbePolicyVersion = "probe-v1"
+		return route, nil
+	}
+	feedbackRouteCalls := 0
+	coordinator.ResolveWorkFeedbackRoute = func(
+		ctx context.Context,
+		workType string,
+		requested k12.ImageTaskRouteSnapshot,
+	) (k12.ImageTaskRouteSnapshot, error) {
+		feedbackRouteCalls++
+		route, err := imageTaskWorkFeedbackRouteForTest(ctx, workType, requested)
+		if err != nil {
+			return k12.ImageTaskRouteSnapshot{}, err
+		}
+		route.ConfigFingerprint = "feedback-fingerprint"
+		route.CapabilityReceiptDigest = "feedback-vision-receipt"
+		return route, nil
+	}
+	now := int64(1000)
+	coordinator.Now = func() int64 { return now }
 	feedbackDeps := coordinator.WorkFeedback.(*Deps)
 	solver := feedbackDeps.Solver.(*imageTaskFeedbackSolver)
 	solver.err = definitiveImageTaskTestError{message: "provider unavailable"}
@@ -1583,13 +1613,14 @@ func TestImageTaskCoordinatorWorkFeedbackRetryReusesFrozenRoute(t *testing.T) {
 	}
 	if failed.Creative == nil ||
 		failed.Creative.Status != k12.CreativeWorkIntakePromoted ||
-		failed.CreativeFeedback != "feedback_failed" {
+		failed.CreativeFeedback != "feedback_failed" ||
+		!failed.CreativeFeedbackRetryable {
 		t.Fatalf("feedback failure did not preserve promoted work/recovery state: %+v", failed)
 	}
-	if solver.routeCalls != 0 || len(solver.snapshots) != 1 ||
+	if solver.routeCalls != 0 || feedbackRouteCalls != 1 || len(solver.snapshots) != 1 ||
 		solver.snapshots[0].Route != "hexclaw-gpt/gpt-5.6-sol" {
-		t.Fatalf("ImageTask feedback drifted to mutable default: routes=%d snapshots=%+v",
-			solver.routeCalls, solver.snapshots)
+		t.Fatalf("ImageTask feedback drifted to mutable default: routes=%d requested_routes=%d snapshots=%+v",
+			solver.routeCalls, feedbackRouteCalls, solver.snapshots)
 	}
 	workID := failed.Creative.PromotedWorkID
 	assertCurrentCreativeIntakePromotion(t, coordinator, failed.Creative)
@@ -1600,10 +1631,17 @@ func TestImageTaskCoordinatorWorkFeedbackRetryReusesFrozenRoute(t *testing.T) {
 	)
 	if getErr != nil ||
 		invocation.RouteSnapshot.Provider != "hexclaw-gpt" ||
-		invocation.RouteSnapshot.Model != "gpt-5.6-sol" {
-		t.Fatalf("durable feedback route did not inherit dispatch snapshot: invocation=%+v err=%v",
-			invocation, getErr)
+		invocation.RouteSnapshot.Model != "gpt-5.6-sol" ||
+		invocation.RouteSnapshot.Capability != "text+vision" ||
+		invocation.RouteSnapshot.CapabilityReceiptDigest != "feedback-vision-receipt" ||
+		invocation.RouteSnapshot.CapabilityReceiptDigest ==
+			failed.Dispatch.RoutePolicySnapshot.CapabilityReceiptDigest {
+		t.Fatalf("durable feedback route did not freeze feedback capability receipt: invocation=%+v dispatch=%+v err=%v",
+			invocation, failed.Dispatch.RoutePolicySnapshot, getErr)
 	}
+	oldVersion := failed.Dispatch.Version
+	oldDeadline := failed.Dispatch.AutomaticDeadlineAt
+	now = oldDeadline + 1
 
 	solver.err = nil
 	solver.routeErr = errors.New("mutable default must not be resolved during retry")
@@ -1613,11 +1651,19 @@ func TestImageTaskCoordinatorWorkFeedbackRetryReusesFrozenRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if solver.routeCalls != 0 || solver.calls != 2 ||
+	if retried.Dispatch.Version != oldVersion+1 ||
+		retried.Dispatch.AutomaticStartedAt != now ||
+		retried.Dispatch.AutomaticDeadlineAt != now+k12.ImageTaskAutomaticBudgetSeconds {
+		t.Fatalf(
+			"expired creative feedback retry did not refresh the same dispatch window: before=%+v after=%+v now=%d",
+			failed.Dispatch, retried.Dispatch, now,
+		)
+	}
+	if solver.routeCalls != 0 || feedbackRouteCalls != 1 || solver.calls != 2 ||
 		len(solver.snapshots) != 2 ||
 		solver.snapshots[1] != solver.snapshots[0] {
-		t.Fatalf("feedback retry drifted frozen route: routes=%d calls=%d snapshots=%+v",
-			solver.routeCalls, solver.calls, solver.snapshots)
+		t.Fatalf("feedback retry drifted frozen route: routes=%d requested_routes=%d calls=%d snapshots=%+v",
+			solver.routeCalls, feedbackRouteCalls, solver.calls, solver.snapshots)
 	}
 	if retried.CreativeFeedback != "feedback_ready" ||
 		retried.CreativeWork == nil ||

@@ -149,7 +149,7 @@ func (a *SolveAdapter) withGradingPhysicalCallInterceptor(ctx context.Context) c
 				func(providerCtx context.Context) (string, error) {
 					result, callErr := next(providerCtx, spec)
 					if callErr != nil {
-						return "", callErr
+						return "", providerResponseError(callErr)
 					}
 					raw, marshalErr := json.Marshal(result)
 					return string(raw), marshalErr

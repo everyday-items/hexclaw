@@ -94,6 +94,28 @@ func (c K12GradingBudgetConfig) IsZero() bool {
 		c.PhysicalCallCapMillis == 0 && c.WorkerHardCap == 0 && c.EffectiveConcurrency == 0
 }
 
+// DefaultK12GradingBudget 返回零配置运行时使用的保守操作基线。
+// 它不会写入默认配置，也不替代独立的真实性能发布校准门。
+func DefaultK12GradingBudget() K12GradingBudgetConfig {
+	return K12GradingBudgetConfig{
+		PolicyVersion:          1,
+		RecognitionPlanVersion: 1,
+		QueuedSeconds:          60,
+		NormalizingSeconds:     60,
+		RecognizingSeconds:     120,
+		LocatingSeconds:        60,
+		RenderingSeconds:       60,
+		ProjectingSeconds:      60,
+		AssessingBuckets: []K12AssessingBudgetBucketConfig{
+			{MaxProblems: 1, Seconds: 90},
+			{MaxProblems: 8, Seconds: 180},
+			{MaxProblems: 16, Seconds: 300},
+			{MaxProblems: 32, Seconds: 540},
+		},
+		ItemConcurrency: 2,
+	}
+}
+
 // ResourceGovernorConfig bounds process-wide expensive resources shared by
 // interactive grading/query and durable Knowledge work.
 type ResourceGovernorConfig struct {
