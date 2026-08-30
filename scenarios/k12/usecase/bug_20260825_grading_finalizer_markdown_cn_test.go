@@ -46,21 +46,30 @@ func TestBUGK12DingTalkPhotoMarkdownLocalization20260825(t *testing.T) {
 		beforeDigest[index] = entry.assessment.ResultDigest
 	}
 
-	markdown := renderCanonicalGradingFinal(entries, nil)
+	markdown := renderCanonicalGradingFinal(entries, &TutoringTips{Sections: []TutoringTipsSection{
+		{Title: "旧概览", Content: "No reliable explanation was generated this time."},
+		{Title: "旧学情", Content: "problem-internal-history"},
+		{Title: "旧逐题讲解", Content: "problem-internal-guide"},
+	}})
 	for _, want := range []string{
 		"## 批改摘要",
-		"**14 道正确 / 2 道过程问题**",
+		"**共 16 题 · 14 题正确 · 2 题过程需关注**",
 		"过程问题表示最终答案正确，但书写过程需要核对，不记为错题。",
-		"## 第 15 题",
+		"## 需关注的题",
+		"### 第 15 题",
+		"**原始作答：** 11250",
+		"**正确答案：** 11250",
 		"**批改状态：** ⚠ 过程问题（最终答案正确，不记为错题）",
 		"**错误步骤：** 300 ÷ 2 ÷ 2 = 50",
 		"**原因：** 该步算术不成立：300 ÷ 2 = 150，150 ÷ 2 = 75，不是 50；当前书写过程不能支持最终答案。",
 		"### 家长怎么讲",
 		"先让孩子只验这一行的两次除法，再从这一步重新核对后续算式；不要用已经正确的最终答案倒推过程。",
-		"## 第 16 题",
+		"### 第 16 题",
 		"**错误步骤：** 42 = 18 × 2",
 		"**原因：** 等号两边不相等，且原过程中的算式相互矛盾，无法作为最终答案 29 的可复核证据。",
 		"逐行做等号检查，先算出 18 × 2 = 36 并标出冲突，再请孩子从上一条可信算式重新写到最终答案。",
+		"## 已答对的题",
+		"其余 14 题已答对。",
 	} {
 		if !strings.Contains(markdown, want) {
 			t.Fatalf("canonical parent markdown lacks %q:\n%s", want, markdown)
@@ -76,6 +85,10 @@ func TestBUGK12DingTalkPhotoMarkdownLocalization20260825(t *testing.T) {
 		`"Status"`,
 		`"internal"`,
 		"2 道错题",
+		"# 这份作业的辅导要点",
+		"No reliable explanation",
+		"problem-internal",
+		"\n### 第 1 题\n",
 	} {
 		if strings.Contains(markdown, forbidden) {
 			t.Fatalf("canonical parent markdown leaked %q:\n%s", forbidden, markdown)

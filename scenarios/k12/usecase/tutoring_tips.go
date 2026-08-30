@@ -373,19 +373,14 @@ func (d Deps) tutoringTipsOverviewWithGrounding(ctx context.Context, grounding t
 	var content strings.Builder
 	verifiedGroundedCount := 0
 	for _, concept := range concepts {
-		if ctx.Err() != nil {
-			fmt.Fprintf(&content, "### %s\n\nNo reliable explanation was generated this time. Please check it against the current textbook.\n\n", concept)
-			continue
-		}
 		if d.Grounding != nil {
 			if result, err := d.groundTutoringConcept(ctx, grounding, subject, concept, grade); err == nil && result.found {
 				verified := len(result.receipts) > 0
 				if grounding.required && !verified {
-					fmt.Fprintf(&content, "### %s\n\nNo reliable explanation was generated this time. Please check it against the current textbook.\n\n", concept)
+					fmt.Fprintf(&content, "### %s\n\n暂未找到可核验的课本讲解，请以当前教材为准。\n\n", concept)
 					continue
 				}
-				teaching := groundedTutoringTipsMarkdown(ctx, d.TutoringTipsReview, subject, concept, grade, result.text)
-				fmt.Fprintf(&content, "### %s\n\n%s\n\n", concept, teaching)
+				fmt.Fprintf(&content, "### %s\n\n%s\n\n", concept, strings.TrimSpace(result.text))
 				if verified || (grounding.snapshotter == nil && grounding.receipts == nil) {
 					verifiedGroundedCount++
 				}
@@ -398,22 +393,14 @@ func (d Deps) tutoringTipsOverviewWithGrounding(ctx context.Context, grounding t
 			}
 		}
 		if ctx.Err() != nil {
-			fmt.Fprintf(&content, "### %s\n\nNo reliable explanation was generated this time. Please check it against the current textbook.\n\n", concept)
+			fmt.Fprintf(&content, "### %s\n\n暂未找到可核验的课本讲解，请以当前教材为准。\n\n", concept)
 			continue
 		}
 		if grounding.required {
-			fmt.Fprintf(&content, "### %s\n\nNo reliable explanation was generated this time. Please check it against the current textbook.\n\n", concept)
+			fmt.Fprintf(&content, "### %s\n\n暂未找到可核验的课本讲解，请以当前教材为准。\n\n", concept)
 			continue
 		}
-		if d.TutoringTipsReview != nil {
-			if text, err := awaitTutoringTipsCall(ctx, func() (string, error) {
-				return d.TutoringTipsReview.GenerateTutoringTipsReview(ctx, subject, concept, grade)
-			}); err == nil && strings.TrimSpace(text) != "" {
-				fmt.Fprintf(&content, "### %s\n\n%s\n\n", concept, strings.TrimSpace(text))
-				continue
-			}
-		}
-		fmt.Fprintf(&content, "### %s\n\nNo reliable explanation was generated this time. Please check it against the current textbook.\n\n", concept)
+		fmt.Fprintf(&content, "### %s\n\n结合课本例题回顾概念、计算步骤和验算方法。\n\n", concept)
 	}
 	label := TutoringTipsSourceTextbook
 	if verifiedGroundedCount != len(concepts) {
@@ -581,22 +568,22 @@ func tutoringTipsLearningEvidence(childName string, history []ReviewItem) Tutori
 
 func tutoringTipsPerProblem(problems []TutoringTipsProblem) TutoringTipsSection {
 	var content strings.Builder
-	for _, problem := range problems {
+	for index, problem := range problems {
 		label := RecognizedQuestionSourceDisplayLabel(RecognizedQuestion{
 			SourceSectionLabel: problem.SourceSectionLabel,
 			DisplayLabel:       problem.DisplayLabel,
 			SystemDisplayLabel: problem.SystemDisplayLabel,
 		})
 		if label == "" {
-			label = problem.ProblemID
+			label = fmt.Sprintf("第 %d 题", index+1)
 		}
-		if label == problem.ProblemID {
-			fmt.Fprintf(&content, "### %s\n\n", label)
-		} else {
-			fmt.Fprintf(&content, "### %s · %s\n\n", label, problem.ProblemID)
-		}
+		fmt.Fprintf(&content, "### %s\n\n", label)
 		fmt.Fprintf(&content, "%s\n\n", problem.StemMarkdown)
-		content.WriteString("先请孩子用自己的话说清题目在问什么；再问他准备使用哪个已经学过的知识点、为什么；完成后请他自己检查步骤、符号和单位。\n\n")
+		if len(problem.ConceptIDs) > 0 {
+			fmt.Fprintf(&content, "先让孩子说清题意，再引导他判断要用到的知识点（%s）并说明理由；完成后自己检查步骤、符号和单位。\n\n", strings.Join(problem.ConceptIDs, "、"))
+		} else {
+			content.WriteString("先让孩子说清题意，再引导他选择已经学过的方法并说明理由；完成后自己检查步骤、符号和单位。\n\n")
+		}
 	}
 	return TutoringTipsSection{
 		Title: "每道题怎么带（不直接给答案）", Content: strings.TrimSpace(content.String()),

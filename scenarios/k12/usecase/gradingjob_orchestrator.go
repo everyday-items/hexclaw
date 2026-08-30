@@ -1321,6 +1321,7 @@ func (o *GradingOrchestrator) startAnchorAsync(jobID string, run *gradingRun, sn
 
 	image := append([]byte(nil), run.req.Image...)
 	frozen := cloneRecognizedQuestions(run.questions)
+	taskIntent := run.req.TaskIntent
 	go func() {
 		defer o.finishWorker()
 		defer func() {
@@ -1336,7 +1337,9 @@ func (o *GradingOrchestrator) startAnchorAsync(jobID string, run *gradingRun, sn
 			o.mu.Unlock()
 		}()
 
-		anchored, state, digest, failed := o.executeAnchor(jobID, run.agentName, image, frozen, snapshot)
+		anchored, state, digest, failed := o.executeAnchorForTask(
+			jobID, run.agentName, image, frozen, snapshot, taskIntent,
+		)
 		ctx := o.gradingBaseContext()
 		l := o.jobLock(jobID)
 		l.Lock()
@@ -1385,7 +1388,26 @@ func (o *GradingOrchestrator) anchorDoneChannel(jobID string) <-chan struct{} {
 
 // executeAnchor 只包围锚点外部调用的 deadline。超时是可审计的 degraded，而不是任务失败；
 // 后续仍使用冻结的文字事实完成 assessing/rendering/projecting。
-func (o *GradingOrchestrator) executeAnchor(jobID, agentName string, image []byte, frozen []RecognizedQuestion, snapshot k12.GradingModelSnapshot) ([]RecognizedQuestion, string, string, bool) {
+func (o *GradingOrchestrator) executeAnchor(
+	jobID, agentName string,
+	image []byte,
+	frozen []RecognizedQuestion,
+	snapshot k12.GradingModelSnapshot,
+) ([]RecognizedQuestion, string, string, bool) {
+	return o.executeAnchorForTask(jobID, agentName, image, frozen, snapshot, "")
+}
+
+func (o *GradingOrchestrator) executeAnchorForTask(
+	jobID, agentName string,
+	image []byte,
+	frozen []RecognizedQuestion,
+	snapshot k12.GradingModelSnapshot,
+	taskIntent PhotoTaskIntent,
+) ([]RecognizedQuestion, string, string, bool) {
+	// 空白卷没有学生作答痕迹，不发起只用于答案区域的定位模型调用。
+	if taskIntent == PhotoTaskBlankWorksheet {
+		return nil, k12.GradingAnchorDegraded, "anchor:blank_worksheet", false
+	}
 	if o.deps.AnswerAnchorer == nil || !hasAnswerCandidate(frozen) {
 		return nil, k12.GradingAnchorDegraded, "anchor:absent", false
 	}

@@ -188,7 +188,7 @@ func (d Deps) freezePracticePrintArtifact(ctx context.Context, job k12.PracticeP
 		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, fmt.Errorf("usecase: read practice print artifact: %w", getErr)
 	}
 
-	render, err := d.renderPrintableArtifact(ctx, artifact)
+	render, err := d.renderPrintableArtifact(ctx, artifact, "")
 	if err != nil {
 		return k12.PrintArtifact{}, k12.PrintArtifactRender{}, err
 	}

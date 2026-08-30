@@ -384,13 +384,25 @@ func (o *SolveSkill) GradeVerified(ctx context.Context, problem, verifiedSolutio
 			}
 		}
 	}
+	if _, computed, ok := solveLinearEquation(problem); ok {
+		verifiedValue, verifiedOK := arithmeticAnswerValue(strings.NewReplacer("$", "", `\times`, "×").Replace(groundTruth))
+		comparisonAnswer := strings.NewReplacer("$", "", `\times`, "×").Replace(studentAnswer)
+		if verifiedOK && verifiedValue == computed && !strings.ContainsAny(comparisonAnswer, "\r\n") {
+			if studentValue, answerOK := arithmeticAnswerValue(comparisonAnswer); answerOK {
+				finalAnswerCorrect := studentValue == computed
+				assess := deterministicGradeAssessment(finalAnswerCorrect, finalAnswerCorrect, false)
+				return deterministicGradeResult(studentAnswer, "x = "+computed, "grading_deterministic_linear_equation", assess), nil
+			}
+		}
+	}
 	if solution, ok := solveElementaryWordProblemDetailed(problem); ok && solution.problemIssue == "" {
 		expected := answerQuantity{value: solution.value, unit: solution.unit}
 		verified, verifiedOK := parseAnswerQuantity(groundTruth)
 		// 单位是应用题答案的一部分；verifiedSolution 缺单位、单位冲突或数值冲突时都不走快路。
 		if verifiedOK && quantitiesEqual(verified, expected) {
-			if student, studentOK := parseAnswerQuantity(studentAnswer); studentOK {
-				workValid, conclusive := validateStudentArithmeticWork(studentAnswer)
+			comparisonAnswer := strings.NewReplacer("$", "", `\times`, "×").Replace(studentAnswer)
+			if student, studentOK := parseAnswerQuantity(comparisonAnswer); studentOK {
+				workValid, conclusive := validateStudentArithmeticWork(comparisonAnswer)
 				if conclusive {
 					finalAnswerCorrect := quantitiesEqual(student, expected)
 					assess := deterministicGradeAssessment(

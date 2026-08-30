@@ -9,6 +9,17 @@ import (
 
 type GradingItemOperation string
 
+type GradingExecutionKind string
+
+const (
+	GradingExecutionProvider           GradingExecutionKind = "provider"
+	GradingExecutionLocalDeterministic GradingExecutionKind = "local_deterministic"
+)
+
+func (k GradingExecutionKind) Valid() bool {
+	return k == GradingExecutionProvider || k == GradingExecutionLocalDeterministic
+}
+
 const (
 	// GradingItemOperationSolve is retained only for historical/third-party
 	// logical ledgers. Current production grading records each physical solver
@@ -28,8 +39,8 @@ func (o GradingItemOperation) Valid() bool {
 		o == GradingItemOperationParentGuide
 }
 
-// GradingItemInvocation records one durable provider request. CostReceiptID is
-// assigned atomically with the succeeded transition and is globally unique.
+// GradingItemInvocation 记录一次可恢复的题目逻辑执行。本机确定性执行仍保留任务冻结路由
+// 作为恢复上下文，但只有物理调用账本可以证明真实 Provider 请求。
 type GradingItemInvocation struct {
 	InvocationID     string                `json:"item_invocation_id"`
 	AgentName        string                `json:"agent_name"`
@@ -37,6 +48,7 @@ type GradingItemInvocation struct {
 	ProblemID        string                `json:"problem_id"`
 	AttemptID        string                `json:"attempt_id"`
 	Operation        GradingItemOperation  `json:"operation"`
+	ExecutionKind    GradingExecutionKind  `json:"execution_kind"`
 	OperationAttempt int                   `json:"operation_attempt"`
 	RequestDigest    string                `json:"request_digest"`
 	RouteSnapshot    GradingModelSnapshot  `json:"route_snapshot"`
@@ -61,9 +73,12 @@ func (v *GradingItemInvocation) ValidateIdentity() error {
 	v.AttemptID = strings.TrimSpace(v.AttemptID)
 	v.RequestDigest = strings.TrimSpace(v.RequestDigest)
 	v.CostReceiptID = strings.TrimSpace(v.CostReceiptID)
+	if v.ExecutionKind == "" {
+		v.ExecutionKind = GradingExecutionProvider
+	}
 	v.RouteSnapshot = NormalizeGradingModelSnapshot(v.RouteSnapshot)
 	if v.InvocationID == "" || v.AgentName == "" || v.JobID == "" || v.ProblemID == "" ||
-		v.AttemptID == "" || v.RequestDigest == "" || v.OperationAttempt < 1 || !v.Operation.Valid() ||
+		v.AttemptID == "" || v.RequestDigest == "" || v.OperationAttempt < 1 || !v.Operation.Valid() || !v.ExecutionKind.Valid() ||
 		v.RouteSnapshot.Provider == "" || v.RouteSnapshot.Model == "" || v.RouteSnapshot.Route == "" {
 		return fmt.Errorf("grading item invocation missing id/owner/job/problem/attempt/operation/digest/route")
 	}

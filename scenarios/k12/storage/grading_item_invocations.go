@@ -15,14 +15,14 @@ import (
 var ErrGradingItemInvocationConflict = errors.New("grading item invocation immutable identity conflict")
 
 const gradingItemInvocationColumns = `item_invocation_id,agent_name,job_id,problem_id,attempt_id,
-    operation,operation_attempt,request_digest,provider,model,route_snapshot_json,status,
+    operation,execution_kind,operation_attempt,request_digest,provider,model,route_snapshot_json,status,
     cost_receipt_id,result_digest,result_json,failure_class,failure_code,created_at,updated_at`
 
 func scanGradingItemInvocation(row rowScanner) (k12.GradingItemInvocation, error) {
 	var item k12.GradingItemInvocation
-	var operation, status, routeJSON string
+	var operation, executionKind, status, routeJSON string
 	err := row.Scan(&item.InvocationID, &item.AgentName, &item.JobID, &item.ProblemID, &item.AttemptID,
-		&operation, &item.OperationAttempt, &item.RequestDigest,
+		&operation, &executionKind, &item.OperationAttempt, &item.RequestDigest,
 		&item.RouteSnapshot.Provider, &item.RouteSnapshot.Model, &routeJSON, &status,
 		&item.CostReceiptID, &item.ResultDigest, &item.ResultJSON, &item.FailureClass, &item.FailureCode,
 		&item.CreatedAt, &item.UpdatedAt)
@@ -34,6 +34,7 @@ func scanGradingItemInvocation(row rowScanner) (k12.GradingItemInvocation, error
 	}
 	item.RouteSnapshot = k12.NormalizeGradingModelSnapshot(item.RouteSnapshot)
 	item.Operation = k12.GradingItemOperation(operation)
+	item.ExecutionKind = k12.GradingExecutionKind(executionKind)
 	item.Status = k12.ModelInvocationStatus(status)
 	return item, nil
 }
@@ -41,6 +42,7 @@ func scanGradingItemInvocation(row rowScanner) (k12.GradingItemInvocation, error
 func sameGradingItemIdentity(a, b k12.GradingItemInvocation) bool {
 	return a.AgentName == b.AgentName && a.JobID == b.JobID && a.ProblemID == b.ProblemID &&
 		a.AttemptID == b.AttemptID && a.Operation == b.Operation &&
+		a.ExecutionKind == b.ExecutionKind &&
 		a.OperationAttempt == b.OperationAttempt && a.RequestDigest == b.RequestDigest &&
 		a.RouteSnapshot == b.RouteSnapshot
 }
@@ -85,10 +87,10 @@ func (s *Store) PrepareGradingItemInvocation(ctx context.Context, item k12.Gradi
 		return k12.GradingItemInvocation{}, false, fmt.Errorf("k12storage: marshal grading item route: %w", err)
 	}
 	res, err := s.db.ExecContext(ctx, `INSERT INTO k12_grading_item_invocations (`+gradingItemInvocationColumns+`)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(job_id,problem_id,operation,operation_attempt) DO NOTHING`,
 		item.InvocationID, item.AgentName, item.JobID, item.ProblemID, item.AttemptID,
-		item.Operation, item.OperationAttempt, item.RequestDigest,
+		item.Operation, item.ExecutionKind, item.OperationAttempt, item.RequestDigest,
 		item.RouteSnapshot.Provider, item.RouteSnapshot.Model, string(routeJSON), item.Status,
 		"", "", "", "", "", item.CreatedAt, item.UpdatedAt)
 	if err != nil {
@@ -217,9 +219,17 @@ func (s *Store) MarkGradingItemInvocationSucceeded(ctx context.Context, agentNam
 	if resultDigest == "" || resultJSON == "" || !json.Valid([]byte(resultJSON)) {
 		return k12.GradingItemInvocation{}, fmt.Errorf("k12storage: successful grading item invocation requires digest and valid result JSON")
 	}
+	current, err := s.GetGradingItemInvocation(ctx, agentName, invocationID)
+	if err != nil {
+		return k12.GradingItemInvocation{}, err
+	}
+	costReceiptID := ""
+	if current.ExecutionKind == k12.GradingExecutionProvider {
+		costReceiptID = "cost-" + invocationID
+	}
 	return s.transitionGradingItemInvocation(ctx, agentName, invocationID,
 		k12.ModelInvocationSent, k12.ModelInvocationSucceeded,
-		"cost-"+invocationID, resultDigest, resultJSON, "", "")
+		costReceiptID, resultDigest, resultJSON, "", "")
 }
 
 func (s *Store) MarkGradingItemInvocationFailed(ctx context.Context, agentName, invocationID, failureClass, failureCode string) (k12.GradingItemInvocation, error) {

@@ -489,13 +489,24 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 				solveInvocationID, "", "", k12storage.GradingAssessmentEffects{})
 		}
 		guideRequest := parentTeachingGuideRequest(gradeReq, solved, GradeOutcome{})
-		rawGuide, parentGuideInvocationID, err := executeGradingItemOperation(ctx, o, job, q,
+		guideExecutionKind := k12.GradingExecutionProvider
+		var deterministicGuide *ParentTeachingGuide
+		if guide, ok := deterministicParentTeachingGuideForEvidence(guideRequest, solved.Evidence); ok {
+			guideExecutionKind = k12.GradingExecutionLocalDeterministic
+			deterministicGuide = &guide
+		}
+		rawGuide, parentGuideInvocationID, err := executeGradingItemOperationWithKind(ctx, o, job, q,
 			k12.GradingItemOperationParentGuide,
+			guideExecutionKind,
 			struct {
-				InputDigest string                     `json:"input_digest"`
-				Request     ParentTeachingGuideRequest `json:"request"`
-			}{q.InputDigest, guideRequest},
+				ExecutionKind k12.GradingExecutionKind   `json:"execution_kind"`
+				InputDigest   string                     `json:"input_digest"`
+				Request       ParentTeachingGuideRequest `json:"request"`
+			}{guideExecutionKind, q.InputDigest, guideRequest},
 			func(callCtx context.Context) (ParentTeachingGuide, error) {
+				if deterministicGuide != nil {
+					return *deterministicGuide, nil
+				}
 				return deps.generateParentTeachingGuide(callCtx, guideRequest)
 			})
 		if err != nil {
@@ -575,13 +586,24 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 	parentGuideInvocationID := ""
 	if item.Status == PhotoWrong || item.Status == PhotoCorrectWithProcessIssue {
 		guideRequest := parentTeachingGuideRequest(gradeReq, solved, graded.Outcome)
-		rawGuide, invocationID, guideErr := executeGradingItemOperation(ctx, o, job, q,
+		guideExecutionKind := k12.GradingExecutionProvider
+		var deterministicGuide *ParentTeachingGuide
+		if guide, ok := deterministicParentTeachingGuideForEvidence(guideRequest, solved.Evidence); ok {
+			guideExecutionKind = k12.GradingExecutionLocalDeterministic
+			deterministicGuide = &guide
+		}
+		rawGuide, invocationID, guideErr := executeGradingItemOperationWithKind(ctx, o, job, q,
 			k12.GradingItemOperationParentGuide,
+			guideExecutionKind,
 			struct {
-				InputDigest string                     `json:"input_digest"`
-				Request     ParentTeachingGuideRequest `json:"request"`
-			}{q.InputDigest, guideRequest},
+				ExecutionKind k12.GradingExecutionKind   `json:"execution_kind"`
+				InputDigest   string                     `json:"input_digest"`
+				Request       ParentTeachingGuideRequest `json:"request"`
+			}{guideExecutionKind, q.InputDigest, guideRequest},
 			func(callCtx context.Context) (ParentTeachingGuide, error) {
+				if deterministicGuide != nil {
+					return *deterministicGuide, nil
+				}
 				return deps.generateParentTeachingGuide(callCtx, guideRequest)
 			})
 		if guideErr != nil {
@@ -637,6 +659,21 @@ func executeGradingItemOperation[T any](
 	request any,
 	call func(context.Context) (T, error),
 ) (T, string, error) {
+	return executeGradingItemOperationWithKind(
+		ctx, o, job, q, operation, k12.GradingExecutionProvider, request, call,
+	)
+}
+
+func executeGradingItemOperationWithKind[T any](
+	ctx context.Context,
+	o *GradingOrchestrator,
+	job GradingJobView,
+	q RecognizedQuestion,
+	operation k12.GradingItemOperation,
+	executionKind k12.GradingExecutionKind,
+	request any,
+	call func(context.Context) (T, error),
+) (T, string, error) {
 	var zero T
 	if err := ctx.Err(); err != nil {
 		return zero, "", err
@@ -664,7 +701,7 @@ func executeGradingItemOperation[T any](
 		// The same request digest must never be rebound to a different item or
 		// route. A different digest, however, is a legitimate immutable input
 		// revision and receives a new operation attempt below.
-		if err := validateGradingItemInvocationIdentity(*candidate, job, q, requestDigest); err != nil {
+		if err := validateGradingItemInvocationIdentity(*candidate, job, q, requestDigest, executionKind); err != nil {
 			return zero, candidate.InvocationID, err
 		}
 		if latest == nil || candidate.OperationAttempt > latest.OperationAttempt {
@@ -696,7 +733,12 @@ func executeGradingItemOperation[T any](
 					ErrGradingItemInvocationFailed, latest.InvocationID, latest.FailureClass, latest.FailureCode)
 			}
 			latest = nil
-		case k12.ModelInvocationSent, k12.ModelInvocationOutcomeUnknown, k12.ModelInvocationReconciled:
+		case k12.ModelInvocationSent:
+			if latest.ExecutionKind != k12.GradingExecutionLocalDeterministic {
+				return zero, latest.InvocationID, fmt.Errorf("%w: invocation=%s status=%s",
+					ErrModelInvocationRequiresReconciliation, latest.InvocationID, latest.Status)
+			}
+		case k12.ModelInvocationOutcomeUnknown, k12.ModelInvocationReconciled:
 			return zero, latest.InvocationID, fmt.Errorf("%w: invocation=%s status=%s",
 				ErrModelInvocationRequiresReconciliation, latest.InvocationID, latest.Status)
 		default:
@@ -719,13 +761,14 @@ func executeGradingItemOperation[T any](
 		invocation, _, err = o.deps.Records.PrepareGradingItemInvocation(ctx, k12.GradingItemInvocation{
 			InvocationID: "gradingitem-" + idgen.ShortID(), AgentName: job.Record.AgentName,
 			JobID: job.Record.RecordID, ProblemID: q.ProblemID, AttemptID: q.AttemptID,
-			Operation: operation, OperationAttempt: currentAttempt, RequestDigest: requestDigest,
+			Operation: operation, ExecutionKind: executionKind,
+			OperationAttempt: currentAttempt, RequestDigest: requestDigest,
 			RouteSnapshot: job.Fields.ModelSnapshot, CreatedAt: o.deps.now(), UpdatedAt: o.deps.now(),
 		})
 		if err != nil {
 			return zero, "", err
 		}
-		if err := validateGradingItemInvocationIdentity(invocation, job, q, requestDigest); err != nil {
+		if err := validateGradingItemInvocationIdentity(invocation, job, q, requestDigest, executionKind); err != nil {
 			return zero, invocation.InvocationID, err
 		}
 		if invocation.Status != k12.ModelInvocationPrepared {
@@ -733,25 +776,34 @@ func executeGradingItemOperation[T any](
 				ErrModelInvocationRequiresReconciliation, invocation.InvocationID, invocation.Status)
 		}
 	}
-	claimCtx, cancelClaim := gradingDurableCommitContext(ctx)
-	invocation, claimed, err := o.deps.Records.ClaimGradingItemInvocationSent(
-		claimCtx, job.Record.AgentName, invocation.InvocationID,
-	)
-	cancelClaim()
-	if err != nil {
-		return zero, invocation.InvocationID, err
-	}
-	if !claimed {
-		return zero, invocation.InvocationID, fmt.Errorf(
-			"%w: invocation=%s concurrently claimed with status=%s",
-			ErrModelInvocationRequiresReconciliation, invocation.InvocationID, invocation.Status,
+	if invocation.Status == k12.ModelInvocationPrepared {
+		claimCtx, cancelClaim := gradingDurableCommitContext(ctx)
+		invocation, claimed, claimErr := o.deps.Records.ClaimGradingItemInvocationSent(
+			claimCtx, job.Record.AgentName, invocation.InvocationID,
 		)
+		cancelClaim()
+		if claimErr != nil {
+			return zero, invocation.InvocationID, claimErr
+		}
+		if !claimed {
+			return zero, invocation.InvocationID, fmt.Errorf(
+				"%w: invocation=%s concurrently claimed with status=%s",
+				ErrModelInvocationRequiresReconciliation, invocation.InvocationID, invocation.Status,
+			)
+		}
 	}
 	callCtx, cancelCall := gradingIndependentCallContext(ctx, job.Fields.ModelSnapshot.TimeoutMS)
 	result, callErr := call(callCtx)
 	callCtxErr := callCtx.Err()
 	cancelCall()
 	if callErr != nil {
+		if invocation.ExecutionKind == k12.GradingExecutionLocalDeterministic {
+			commitCtx, cancelCommit := gradingDurableCommitContext(ctx)
+			_, ledgerErr := o.deps.Records.MarkGradingItemInvocationFailed(
+				commitCtx, job.Record.AgentName, invocation.InvocationID, "local_execution", "deterministic_failed")
+			cancelCommit()
+			return zero, invocation.InvocationID, errors.Join(callErr, ledgerErr)
+		}
 		ambiguousTransport := !definitiveProviderResponse(callErr)
 		if invocationOutcomeUnknown(callErr) || invocationOutcomeUnknown(callCtxErr) || ambiguousTransport {
 			commitCtx, cancelCommit := gradingDurableCommitContext(ctx)
@@ -852,12 +904,14 @@ func validateGradingItemInvocationIdentity(
 	job GradingJobView,
 	q RecognizedQuestion,
 	requestDigest string,
+	executionKind k12.GradingExecutionKind,
 ) error {
 	wantRoute := k12.NormalizeGradingModelSnapshot(job.Fields.ModelSnapshot)
 	gotRoute := k12.NormalizeGradingModelSnapshot(invocation.RouteSnapshot)
 	if invocation.AgentName != job.Record.AgentName || invocation.JobID != job.Record.RecordID ||
 		invocation.ProblemID != q.ProblemID || invocation.AttemptID != q.AttemptID ||
-		invocation.RequestDigest != requestDigest || gotRoute.Provider != wantRoute.Provider ||
+		invocation.RequestDigest != requestDigest || invocation.ExecutionKind != executionKind ||
+		gotRoute.Provider != wantRoute.Provider ||
 		gotRoute.Model != wantRoute.Model || gotRoute.Route != wantRoute.Route {
 		return fmt.Errorf("%w: invocation=%s immutable identity drift", ErrModelInvocationRequiresReconciliation, invocation.InvocationID)
 	}

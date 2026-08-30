@@ -97,8 +97,12 @@ func (o *GradingOrchestrator) ImageTaskHomeworkProjection(
 	if err != nil {
 		return ImageTaskHomeworkProjection{}, err
 	}
+	completedAt := int64(0)
+	if job.Record.Status == k12.GradingStageCompleted {
+		completedAt = job.Record.UpdatedAt
+	}
 	return ImageTaskHomeworkProjection{
-		Stage: job.Record.Status, Retryable: job.Fields.Retryable,
+		Stage: job.Record.Status, CompletedAt: completedAt, Retryable: job.Fields.Retryable,
 		ConfirmationState: job.Fields.ConfirmationState,
 		AnchorState:       job.Fields.AnchorState, Subject: subject,
 		retryFailureKind: job.Fields.FailureKind,

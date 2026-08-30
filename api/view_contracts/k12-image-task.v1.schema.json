@@ -89,6 +89,7 @@
       "required": [
         "invocation_id",
         "operation",
+        "execution_kind",
         "canonical_input_digest",
         "status",
         "attempt",
@@ -99,6 +100,7 @@
         "parent_invocation_id": { "type": "string", "minLength": 1 },
         "physical_unit": { "type": "string", "minLength": 1 },
         "operation": { "type": "string", "minLength": 1 },
+        "execution_kind": { "enum": ["provider", "local_deterministic"] },
         "canonical_input_digest": {
           "type": "string",
           "pattern": "^sha256:[0-9a-f]{64}$"
@@ -127,10 +129,18 @@
       "allOf": [
         {
           "if": {
-            "properties": { "operation": { "not": { "const": "annotation" } } },
-            "required": ["operation"]
+            "properties": { "execution_kind": { "const": "provider" } },
+            "required": ["execution_kind"]
           },
-          "then": { "required": ["provider", "model"] }
+          "then": { "required": ["provider", "model"] },
+          "else": {
+            "not": {
+              "anyOf": [
+                { "required": ["provider"] },
+                { "required": ["model"] }
+              ]
+            }
+          }
         }
       ],
       "additionalProperties": false

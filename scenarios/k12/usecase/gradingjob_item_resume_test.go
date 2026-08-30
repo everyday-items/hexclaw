@@ -30,9 +30,10 @@ var errItemResumeProvider503 = &itemResumeProviderResponseError{
 }
 
 type itemResumeSolver struct {
-	mu        sync.Mutex
-	calls     map[string]int
-	solutions map[string]string
+	mu           sync.Mutex
+	calls        map[string]int
+	solutions    map[string]string
+	evidenceType EvidenceType
 }
 
 func (s *itemResumeSolver) Solve(_ context.Context, problem, _, _ string) (SolveResult, error) {
@@ -43,9 +44,18 @@ func (s *itemResumeSolver) Solve(_ context.Context, problem, _, _ string) (Solve
 	if solution == "" {
 		solution = "2"
 	}
+	evidenceType := s.evidenceType
+	if evidenceType == "" {
+		evidenceType = EvidenceNumericExec
+	}
+	evidence := SolveEvidence{Verdict: VerdictAgree, EvidenceType: evidenceType}
+	if evidenceType == EvidenceHeterogeneousModel {
+		evidence.SolverModel = "test-solver-model"
+		evidence.VerifierModel = "test-verifier-model"
+	}
 	return SolveResult{
 		Solution: solution,
-		Evidence: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec},
+		Evidence: evidence,
 	}, nil
 }
 

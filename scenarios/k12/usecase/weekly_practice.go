@@ -899,7 +899,7 @@ func (d Deps) PrepareWeeklyPracticeOutput(ctx context.Context, agent, planID str
 			return WeeklyPrepareOutputResult{}, artifactErr
 		}
 	}
-	render, err := d.renderPrintableArtifact(ctx, artifact)
+	render, err := d.renderPrintableArtifact(ctx, artifact, "")
 	if err != nil {
 		return WeeklyPrepareOutputResult{}, err
 	}

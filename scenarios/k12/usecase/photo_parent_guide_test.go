@@ -9,12 +9,18 @@ import (
 	"testing"
 )
 
-type blankWorksheetSolver struct{}
+type blankWorksheetSolver struct {
+	evidenceType EvidenceType
+}
 
-func (blankWorksheetSolver) Solve(_ context.Context, problem, _, _ string) (SolveResult, error) {
+func (s blankWorksheetSolver) Solve(_ context.Context, problem, _, _ string) (SolveResult, error) {
+	evidenceType := s.evidenceType
+	if evidenceType == "" {
+		evidenceType = EvidenceNumericExec
+	}
 	return SolveResult{
 		Solution: blankWorksheetVerifiedSolution(problem),
-		Evidence: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec},
+		Evidence: SolveEvidence{Verdict: VerdictAgree, EvidenceType: evidenceType},
 	}, nil
 }
 
@@ -75,7 +81,7 @@ func (s *parentTeachingGuideSpy) snapshot() []ParentTeachingGuideRequest {
 }
 
 func TestGradeHomeworkPhotoBlankWorksheetBuildsCompleteProblemSpecificParentGuides(t *testing.T) {
-	d, _ := newPipeline(t, blankWorksheetSolver{}, fakeGrader{}, nil)
+	d, _ := newPipeline(t, blankWorksheetSolver{evidenceType: EvidenceHeuristic}, fakeGrader{}, nil)
 	generator := &parentTeachingGuideSpy{}
 	d.ParentTeachingGuide = generator
 	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{
@@ -171,7 +177,7 @@ func (incompleteParentTeachingGuide) GenerateParentTeachingGuide(
 }
 
 func TestGradeHomeworkPhotoBlankWorksheetRejectsIncompleteGenericGuide(t *testing.T) {
-	d, _ := newPipeline(t, blankWorksheetSolver{}, fakeGrader{}, nil)
+	d, _ := newPipeline(t, blankWorksheetSolver{evidenceType: EvidenceHeuristic}, fakeGrader{}, nil)
 	d.ParentTeachingGuide = incompleteParentTeachingGuide{}
 	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{{
 		Question: "2+2=", Subject: "数学", AnswerState: AnswerStateBlank,
@@ -233,7 +239,7 @@ func TestSolveHomeworkProblemLegacyClientDoesNotRequireParentGuideGenerator(t *t
 }
 
 func TestBlankWorksheetGuidePassesOnlyNonEmptyRecognizedKnowledgePointsAsGenerationFacts(t *testing.T) {
-	d, _ := newPipeline(t, blankWorksheetSolver{}, fakeGrader{}, nil)
+	d, _ := newPipeline(t, blankWorksheetSolver{evidenceType: EvidenceHeuristic}, fakeGrader{}, nil)
 	generator := &parentTeachingGuideSpy{}
 	d.ParentTeachingGuide = generator
 	result, err := d.SolveBlankWorksheetProblem(context.Background(), GradeRequest{
@@ -284,7 +290,7 @@ func (intermediateResultAnswerGuide) GenerateParentTeachingGuide(
 }
 
 func TestBlankWorksheetGuideRejectsIntermediateResultAsFinalAnswer(t *testing.T) {
-	d, _ := newPipeline(t, blankWorksheetSolver{}, fakeGrader{}, nil)
+	d, _ := newPipeline(t, blankWorksheetSolver{evidenceType: EvidenceHeuristic}, fakeGrader{}, nil)
 	d.ParentTeachingGuide = intermediateResultAnswerGuide{}
 
 	result, err := d.SolveBlankWorksheetProblem(context.Background(), GradeRequest{

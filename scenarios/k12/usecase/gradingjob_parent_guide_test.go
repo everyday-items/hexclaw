@@ -36,8 +36,8 @@ func TestGradingJobBlankWorksheetCommitsAndReplaysPerItemParentGuide(t *testing.
 	if !ok || len(result.Items) != 2 {
 		t.Fatalf("blank worksheet result missing: ok=%v result=%#v", ok, result)
 	}
-	if calls := generator.snapshot(); len(calls) != 2 {
-		t.Fatalf("generator calls=%d, want one separate durable parent-guide operation per item: %#v", len(calls), calls)
+	if calls := generator.snapshot(); len(calls) != 0 {
+		t.Fatalf("numeric-exec parent guides must not call Provider: %#v", calls)
 	}
 	invocations, err := o.deps.Records.ListGradingItemInvocations(
 		context.Background(), "mingming", jobID,

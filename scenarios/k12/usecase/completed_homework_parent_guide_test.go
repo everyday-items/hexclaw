@@ -55,7 +55,7 @@ func (s *completedHomeworkParentGuideSpy) snapshot() []ParentTeachingGuideReques
 }
 
 func TestCompletedHomeworkGeneratesSevenItemGuideOnlyForVerifiedWrongItem(t *testing.T) {
-	solver := &itemResumeSolver{calls: map[string]int{}}
+	solver := &itemResumeSolver{calls: map[string]int{}, evidenceType: EvidenceHeterogeneousModel}
 	grader := &itemResumeGrader{
 		calls: map[string]int{},
 		outcomes: map[string]GradeOutcome{
@@ -278,7 +278,7 @@ func TestCompletedHomeworkCorrectOnlyPageMakesZeroParentGuideCalls(t *testing.T)
 }
 
 func TestCompletedHomeworkRejectsGuideAnswerOutsideVerifiedSolutionWithoutChangingWrongFacts(t *testing.T) {
-	solver := &itemResumeSolver{calls: map[string]int{}}
+	solver := &itemResumeSolver{calls: map[string]int{}, evidenceType: EvidenceHeterogeneousModel}
 	grader := &itemResumeGrader{
 		calls: map[string]int{},
 		outcomes: map[string]GradeOutcome{
@@ -327,7 +327,8 @@ func TestCompletedHomeworkRejectsGuideAnswerOutsideVerifiedSolutionWithoutChangi
 
 func TestCompletedHomeworkRejectsIntermediateValueAsGuideAnswer(t *testing.T) {
 	solver := &itemResumeSolver{
-		calls: map[string]int{},
+		calls:        map[string]int{},
+		evidenceType: EvidenceHeterogeneousModel,
 		solutions: map[string]string{
 			"q-wrong": "## 过程\n\n1+1=2\n\n继续计算得到 3\n\n## 答案\n\n3",
 		},
@@ -362,7 +363,7 @@ func TestCompletedHomeworkRejectsIntermediateValueAsGuideAnswer(t *testing.T) {
 }
 
 func TestCompletedHomeworkParentGuideOutcomeUnknownIsNeverResent(t *testing.T) {
-	solver := &itemResumeSolver{calls: map[string]int{}}
+	solver := &itemResumeSolver{calls: map[string]int{}, evidenceType: EvidenceHeterogeneousModel}
 	grader := &itemResumeGrader{
 		calls: map[string]int{},
 		outcomes: map[string]GradeOutcome{

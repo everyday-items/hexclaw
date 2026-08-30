@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -32,6 +33,8 @@ type PreparePrintableArtifactRequest struct {
 	SourceRef         string
 	Title             string
 	CanonicalMarkdown string
+	// RenderMarkdown 只在首次冻结 PDF 时承载同源媒体，不进入公开 Artifact 或 Desktop。
+	RenderMarkdown string
 }
 
 type PrintableArtifactView struct {
@@ -108,12 +111,15 @@ func samePrintArtifact(left, right k12.PrintArtifact) bool {
 }
 
 func (d Deps) renderPrintableArtifact(ctx context.Context,
-	artifact k12.PrintArtifact) (k12.PrintArtifactRender, error) {
+	artifact k12.PrintArtifact, renderMarkdown string) (k12.PrintArtifactRender, error) {
 	if d.Renderer == nil {
 		return k12.PrintArtifactRender{},
 			fmt.Errorf("%w: PDF renderer 未配置", ErrRenderUnavailable)
 	}
-	pdf, contentType, err := d.Renderer.Render(ctx, artifact.CanonicalMarkdown, "pdf")
+	if strings.TrimSpace(renderMarkdown) == "" {
+		renderMarkdown = artifact.CanonicalMarkdown
+	}
+	pdf, contentType, err := d.Renderer.Render(ctx, renderMarkdown, "pdf")
 	if err != nil {
 		return k12.PrintArtifactRender{},
 			fmt.Errorf("%w: %v", ErrRenderUnavailable, err)
@@ -163,7 +169,7 @@ func (d Deps) PreparePrintableArtifact(ctx context.Context,
 		return PrintableArtifactView{}, false,
 			fmt.Errorf("usecase: 取打印 Artifact: %w", getErr)
 	}
-	render, err := d.renderPrintableArtifact(ctx, artifact)
+	render, err := d.renderPrintableArtifact(ctx, artifact, req.RenderMarkdown)
 	if err != nil {
 		return PrintableArtifactView{}, false, err
 	}
@@ -346,17 +352,41 @@ func (d Deps) RetryGenericPrint(ctx context.Context, agentName, jobID string) (G
 	return GenericPrintView{Job: job, Artifact: artifact}, nil
 }
 
-func gradingFinalArtifactPrintRequest(
+func (d Deps) gradingFinalArtifactPrintRequest(
+	ctx context.Context,
 	artifact k12.GradingFinalArtifact,
 	title string,
-) PreparePrintableArtifactRequest {
-	return PreparePrintableArtifactRequest{
+) (PreparePrintableArtifactRequest, error) {
+	req := PreparePrintableArtifactRequest{
 		AgentName:         artifact.AgentName,
 		SourceKind:        k12.PrintSourceGradingFinalArtifact,
 		SourceRef:         "final_artifact:" + artifact.ArtifactID + ":" + artifact.ArtifactDigest,
 		Title:             title,
 		CanonicalMarkdown: artifact.CanonicalMarkdown,
 	}
+	if !artifact.HasAnnotatedAsset() {
+		return req, nil
+	}
+	annotated, err := d.Records.OpenGradingFinalAnnotatedAsset(
+		ctx, artifact.AgentName, artifact.ArtifactID,
+	)
+	if err != nil {
+		return PreparePrintableArtifactRequest{}, err
+	}
+	imageMarkdown := "![](data:" + annotated.MIME + ";base64," +
+		base64.StdEncoding.EncodeToString(annotated.Data) + "){width=92%}"
+	const heading = "# 作业批改结果"
+	canonical := strings.TrimSpace(artifact.CanonicalMarkdown)
+	if strings.HasPrefix(canonical, heading) {
+		body := strings.TrimSpace(strings.TrimPrefix(canonical, heading))
+		req.RenderMarkdown = heading + "\n\n" + imageMarkdown
+		if body != "" {
+			req.RenderMarkdown += "\n\n" + body
+		}
+	} else {
+		req.RenderMarkdown = imageMarkdown + "\n\n" + canonical
+	}
+	return req, nil
 }
 
 func (d Deps) getExactGradingFinalArtifact(
@@ -400,8 +430,12 @@ func (d Deps) PrepareGradingFinalArtifactPDFExact(
 	if err != nil {
 		return PrintableArtifactView{}, false, err
 	}
+	req, err := d.gradingFinalArtifactPrintRequest(ctx, finalArtifact, title)
+	if err != nil {
+		return PrintableArtifactView{}, false, err
+	}
 	return d.PreparePrintableArtifact(
-		ctx, gradingFinalArtifactPrintRequest(finalArtifact, title),
+		ctx, req,
 	)
 }
 
@@ -417,13 +451,15 @@ func (d Deps) PrepareGradingFinalArtifactPrint(
 	if err != nil {
 		return GenericPrintView{}, false, err
 	}
-	req := gradingFinalArtifactPrintRequest(finalArtifact, title)
-	return d.PrepareGenericPrint(ctx, PrepareGenericPrintRequest{
-		AgentName:         req.AgentName,
-		IdempotencyKey:    idempotencyKey,
-		SourceKind:        req.SourceKind,
-		SourceRef:         req.SourceRef,
-		Title:             req.Title,
-		CanonicalMarkdown: req.CanonicalMarkdown,
-	})
+	req, err := d.gradingFinalArtifactPrintRequest(ctx, finalArtifact, title)
+	if err != nil {
+		return GenericPrintView{}, false, err
+	}
+	printable, _, err := d.PreparePrintableArtifact(ctx, req)
+	if err != nil {
+		return GenericPrintView{}, false, err
+	}
+	return d.PrepareGenericPrintFromArtifact(
+		ctx, finalArtifact.AgentName, idempotencyKey, printable.Artifact.ArtifactID,
+	)
 }

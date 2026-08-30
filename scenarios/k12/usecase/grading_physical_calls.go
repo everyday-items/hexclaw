@@ -1236,8 +1236,9 @@ func executeDurableSolveOperation(
 				ErrGradingGroundingUnavailable,
 			)
 		}
-		return executeGradingItemOperation(ctx, o, job, q,
+		return executeGradingItemOperationWithKind(ctx, o, job, q,
 			k12.GradingItemOperationSolve,
+			k12.GradingExecutionProvider,
 			struct {
 				InputDigest string       `json:"input_digest"`
 				Request     GradeRequest `json:"request"`
@@ -1263,13 +1264,14 @@ func executeDurableSolveOperation(
 			err = fmt.Errorf("%w: physical solver returned without a durable invocation",
 				ErrModelInvocationRequiresReconciliation)
 		} else {
-			return executeGradingItemOperation(ctx, o, job, q,
+			return executeGradingItemOperationWithKind(ctx, o, job, q,
 				k12.GradingItemOperationSolve,
+				k12.GradingExecutionLocalDeterministic,
 				struct {
-					ExecutionKind string       `json:"execution_kind"`
-					InputDigest   string       `json:"input_digest"`
-					Request       GradeRequest `json:"request"`
-				}{"local_deterministic", q.InputDigest, gradeReq},
+					ExecutionKind k12.GradingExecutionKind `json:"execution_kind"`
+					InputDigest   string                   `json:"input_digest"`
+					Request       GradeRequest             `json:"request"`
+				}{k12.GradingExecutionLocalDeterministic, q.InputDigest, gradeReq},
 				func(context.Context) (SolveHomeworkResult, error) {
 					return result, nil
 				})
@@ -1305,8 +1307,9 @@ func executeDurableGradeOperation(
 				ErrGradingGroundingUnavailable,
 			)
 		}
-		return executeGradingItemOperation(ctx, o, job, q,
+		return executeGradingItemOperationWithKind(ctx, o, job, q,
 			k12.GradingItemOperationGrade,
+			k12.GradingExecutionProvider,
 			struct {
 				InputDigest string              `json:"input_digest"`
 				Request     GradeRequest        `json:"request"`
@@ -1330,14 +1333,15 @@ func executeDurableGradeOperation(
 			err = fmt.Errorf("%w: physical grader returned without a durable invocation",
 				ErrModelInvocationRequiresReconciliation)
 		} else {
-			return executeGradingItemOperation(ctx, o, job, q,
+			return executeGradingItemOperationWithKind(ctx, o, job, q,
 				k12.GradingItemOperationGrade,
+				k12.GradingExecutionLocalDeterministic,
 				struct {
-					ExecutionKind string              `json:"execution_kind"`
-					InputDigest   string              `json:"input_digest"`
-					Request       GradeRequest        `json:"request"`
-					Solved        SolveHomeworkResult `json:"solved"`
-				}{"local_deterministic", q.InputDigest, gradeReq, solved},
+					ExecutionKind k12.GradingExecutionKind `json:"execution_kind"`
+					InputDigest   string                   `json:"input_digest"`
+					Request       GradeRequest             `json:"request"`
+					Solved        SolveHomeworkResult      `json:"solved"`
+				}{k12.GradingExecutionLocalDeterministic, q.InputDigest, gradeReq, solved},
 				func(context.Context) (GradeResult, error) {
 					return result, nil
 				})

@@ -758,6 +758,10 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 
 func writeParentTeachingGuideMarkdown(b *strings.Builder, guide ParentTeachingGuide) {
 	fmt.Fprintf(b, "**答案：** %s\n\n", photoInline(guide.Answer, 600))
+	writeParentTeachingGuideDetailsMarkdown(b, guide)
+}
+
+func writeParentTeachingGuideDetailsMarkdown(b *strings.Builder, guide ParentTeachingGuide) {
 	writeParentGuideListMarkdown(b, "**必要步骤：**", guide.FullSolutionSteps)
 	fmt.Fprintf(b, "**本年级方法：** %s\n\n", photoInline(guide.GradeLevelMethod, 1200))
 	writeParentGuideListMarkdown(b, "**易错点：**", guide.LikelyMistakes)

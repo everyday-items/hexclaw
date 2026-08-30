@@ -185,9 +185,8 @@ func (o *GradingOrchestrator) finalizeGradingPage(
 	}
 	canonicalMarkdown := renderCanonicalGradingFinal(entries, tips)
 	if coverage == k12.GradingFinalArtifactCoverageGeneralGuidance {
-		canonicalMarkdown += "\n\n# General guidance\n\n" +
-			"No verified textbook grounding is available. " +
-			"The item-level assessment and parent guidance above are general guidance and are not based on a textbook."
+		canonicalMarkdown += "\n\n## 说明\n\n" +
+			"本次没有可核验的课本依据，以上批改与家长讲法为通用参考。"
 	}
 	artifact := k12.GradingFinalArtifact{
 		AgentName:                 job.Record.AgentName,
@@ -662,12 +661,16 @@ func validateRecoveredFinalTutoringTips(
 
 func renderCanonicalGradingFinal(
 	entries []gradingFinalEntry,
-	tips *TutoringTips,
+	_ *TutoringTips,
 ) string {
 	var out strings.Builder
 	out.WriteString("# 作业批改结果\n\n")
-	correctCount, processIssueCount, wrongCount := 0, 0, 0
+	correctCount, processIssueCount, attentionCount, skippedCount := 0, 0, 0, 0
 	for _, entry := range entries {
+		if entry.skip != nil {
+			skippedCount++
+			continue
+		}
 		if entry.assessment == nil {
 			continue
 		}
@@ -676,27 +679,43 @@ func renderCanonicalGradingFinal(
 			correctCount++
 		case k12.GradingAssessmentProcessIssue:
 			processIssueCount++
-		case k12.GradingAssessmentWrong:
-			wrongCount++
+		default:
+			attentionCount++
 		}
 	}
+	out.WriteString("## 批改摘要\n\n")
+	fmt.Fprintf(&out, "**共 %d 题 · %d 题正确", len(entries), correctCount)
 	if processIssueCount > 0 {
-		out.WriteString("## 批改摘要\n\n")
-		fmt.Fprintf(&out, "**%d 道正确 / %d 道过程问题**\n\n", correctCount, processIssueCount)
-		if wrongCount > 0 {
-			fmt.Fprintf(&out, "另有 **%d 道需要订正**。\n\n", wrongCount)
-		}
+		fmt.Fprintf(&out, " · %d 题过程需关注", processIssueCount)
+	}
+	if attentionCount > 0 {
+		fmt.Fprintf(&out, " · %d 题需关注", attentionCount)
+	}
+	if skippedCount > 0 {
+		fmt.Fprintf(&out, " · %d 题未判断", skippedCount)
+	}
+	out.WriteString("**\n\n")
+	if processIssueCount > 0 {
 		out.WriteString("> 过程问题表示最终答案正确，但书写过程需要核对，不记为错题。\n\n")
 	}
+
+	detailCount := processIssueCount + attentionCount + skippedCount
+	if detailCount > 0 {
+		out.WriteString("## 需关注的题\n\n")
+	}
 	for _, entry := range entries {
+		if entry.skip == nil && (entry.assessment == nil || entry.assessment.Status == k12.GradingAssessmentCorrect) {
+			continue
+		}
 		label := RecognizedQuestionSourceDisplayLabel(entry.question)
 		if label == "" {
-			label = strings.TrimSpace(entry.question.ProblemID)
+			label = "题目位置待确认"
 		}
-		out.WriteString("## ")
+		out.WriteString("### ")
 		out.WriteString(label)
 		out.WriteString("\n\n")
-		if question := strings.TrimSpace(entry.question.CanonicalMarkdown); question != "" {
+		if question := strings.TrimSpace(entry.question.CanonicalMarkdown); question != "" &&
+			(entry.assessment == nil || entry.assessment.Status != k12.GradingAssessmentProcessIssue) {
 			out.WriteString(question)
 			out.WriteString("\n\n")
 		}
@@ -716,19 +735,12 @@ func renderCanonicalGradingFinal(
 			out.WriteString("\n\n")
 		}
 	}
-	if tips != nil {
-		out.WriteString("# 这份作业的辅导要点\n\n")
-		for _, section := range tips.Sections {
-			out.WriteString("## ")
-			out.WriteString(strings.TrimSpace(section.Title))
-			out.WriteString("\n\n")
-			out.WriteString(strings.TrimSpace(section.Content))
-			out.WriteString("\n\n")
-			if source := strings.TrimSpace(section.SourceLabel); source != "" {
-				out.WriteString("_")
-				out.WriteString(source)
-				out.WriteString("_\n\n")
-			}
+	if correctCount > 0 {
+		out.WriteString("## 已答对的题\n\n")
+		if detailCount > 0 {
+			fmt.Fprintf(&out, "其余 %d 题已答对。\n\n", correctCount)
+		} else {
+			fmt.Fprintf(&out, "%d 题已答对。\n\n", correctCount)
 		}
 	}
 	return strings.TrimSpace(out.String())
@@ -760,6 +772,7 @@ func writeCanonicalProcessIssueDetails(out *strings.Builder, resultJSON string) 
 	if json.Unmarshal([]byte(resultJSON), &item) != nil || item.Status != PhotoCorrectWithProcessIssue {
 		return
 	}
+	writeCanonicalGradingVisibleAnswers(out, item)
 	if wrongStep := strings.TrimSpace(item.Grade.Outcome.WrongStep); wrongStep != "" {
 		out.WriteString("**错误步骤：** ")
 		out.WriteString(photoInline(wrongStep, 300))
@@ -772,7 +785,27 @@ func writeCanonicalProcessIssueDetails(out *strings.Builder, resultJSON string) 
 	}
 	if item.ParentGuide != nil {
 		out.WriteString("### 家长怎么讲\n\n")
-		writeParentTeachingGuideMarkdown(out, *item.ParentGuide)
+		writeParentTeachingGuideDetailsMarkdown(out, *item.ParentGuide)
+		out.WriteString("\n\n")
+	}
+}
+
+func writeCanonicalGradingVisibleAnswers(out *strings.Builder, item PhotoGradeItem) {
+	studentAnswer := strings.TrimSpace(item.Recognized.AnswerCanonicalMarkdown)
+	if studentAnswer == "" {
+		studentAnswer = strings.TrimSpace(item.Recognized.StudentAnswer)
+	}
+	if studentAnswer == "" {
+		studentAnswer = strings.TrimSpace(item.Recognized.AnswerRawTranscription)
+	}
+	if studentAnswer != "" {
+		out.WriteString("**原始作答：** ")
+		out.WriteString(photoInline(studentAnswer, 600))
+		out.WriteString("\n\n")
+	}
+	if item.ParentGuide != nil && strings.TrimSpace(item.ParentGuide.Answer) != "" {
+		out.WriteString("**正确答案：** ")
+		out.WriteString(photoInline(item.ParentGuide.Answer, 600))
 		out.WriteString("\n\n")
 	}
 }
@@ -836,23 +869,24 @@ func RenderCanonicalGradingAssessmentDetails(resultJSON string) (string, PhotoIt
 	}
 
 	var out strings.Builder
+	writeCanonicalGradingVisibleAnswers(&out, item)
 	switch item.Status {
 	case PhotoWrong:
-		out.WriteString("### 订正参考\n\n")
-		out.WriteString(photoMarkdownQuote(item.Grade.Solution, 1000))
 		if wrongStep := strings.TrimSpace(item.Grade.Outcome.WrongStep); wrongStep != "" {
-			out.WriteString("\n\n**第一个错步：** ")
+			out.WriteString("**第一个错步：** ")
 			out.WriteString(photoInline(wrongStep, 300))
+			out.WriteString("\n\n")
 		}
 		if cause := strings.TrimSpace(item.Grade.Outcome.ErrorCause); cause != "" {
-			out.WriteString("\n\n**错因：** ")
+			out.WriteString("**错因：** ")
 			out.WriteString(photoInline(cause, 300))
+			out.WriteString("\n\n")
 		}
-		out.WriteString("\n\n### 家长怎么讲\n\n")
-		writeParentTeachingGuideMarkdown(&out, *item.ParentGuide)
+		out.WriteString("### 家长怎么讲\n\n")
+		writeParentTeachingGuideDetailsMarkdown(&out, *item.ParentGuide)
 	case PhotoBlankSolved:
 		out.WriteString("### 家长辅导指南\n\n")
-		writeParentTeachingGuideMarkdown(&out, *item.ParentGuide)
+		writeParentTeachingGuideDetailsMarkdown(&out, *item.ParentGuide)
 	}
 	return strings.TrimSpace(out.String()), item.Status, true
 }

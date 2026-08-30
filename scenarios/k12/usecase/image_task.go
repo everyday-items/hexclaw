@@ -156,6 +156,7 @@ type ImageTaskView struct {
 
 type ImageTaskHomeworkProjection struct {
 	Stage                     string
+	CompletedAt               int64
 	Retryable                 bool
 	ConfirmationState         string
 	AnchorState               string
@@ -239,6 +240,7 @@ type ImageTaskOperationReceipt struct {
 	ParentInvocationID   string                          `json:"parent_invocation_id,omitempty"`
 	PhysicalUnit         string                          `json:"physical_unit,omitempty"`
 	Operation            string                          `json:"operation"`
+	ExecutionKind        string                          `json:"execution_kind,omitempty"`
 	CanonicalInputDigest string                          `json:"canonical_input_digest"`
 	Provider             string                          `json:"provider,omitempty"`
 	Model                string                          `json:"model,omitempty"`
@@ -2004,6 +2006,40 @@ func (c *ImageTaskCoordinator) Result(
 			ResultSurface: PhotoSurfaceAnnotatedHomework,
 			Markdown:      result.FinalArtifact.CanonicalMarkdown,
 		}
+		if view.HomeworkProjection == nil {
+			return ImageTaskResult{}, fmt.Errorf("usecase: final image task result missing homework projection")
+		}
+		questions := RecognizedQuestionsForAssessment(
+			cloneRecognizedQuestions(view.HomeworkProjection.Questions),
+		)
+		assessments, assessmentErr := c.Records.ListGradingAssessmentItems(
+			ctx, agentName, view.Homework.GradingJobID,
+		)
+		if assessmentErr != nil {
+			return ImageTaskResult{}, assessmentErr
+		}
+		assessmentByProblem := make(map[string]k12.GradingAssessmentItem, len(assessments))
+		for _, assessment := range assessments {
+			assessmentByProblem[assessment.ProblemID] = assessment
+		}
+		photo.Items = make([]PhotoGradeItem, 0, len(assessments))
+		for _, question := range questions {
+			assessment, ok := assessmentByProblem[question.ProblemID]
+			if !ok {
+				continue
+			}
+			item, replayErr := replayGradingAssessmentItem(question, assessment)
+			if replayErr != nil {
+				return ImageTaskResult{}, replayErr
+			}
+			photo.Items = append(photo.Items, item)
+			delete(assessmentByProblem, question.ProblemID)
+		}
+		if len(photo.Items) != result.FinalArtifact.PublishedCount || len(assessmentByProblem) != 0 {
+			return ImageTaskResult{}, fmt.Errorf(
+				"usecase: final image task result assessment exact-set mismatch",
+			)
+		}
 		if view.Dispatch.TaskIntent == k12.ImageTaskIntentBlankWorksheet {
 			photo.Mode = PhotoModeSolve
 			photo.ResultSurface = PhotoSurfaceParentTeachingGuide
@@ -2033,16 +2069,20 @@ func gradingItemInvocationReceipt(
 	invocation k12.GradingItemInvocation,
 	canonicalInputDigest string,
 ) ImageTaskOperationReceipt {
-	return ImageTaskOperationReceipt{
+	receipt := ImageTaskOperationReceipt{
 		InvocationID:         invocation.InvocationID,
 		Operation:            string(invocation.Operation),
+		ExecutionKind:        string(invocation.ExecutionKind),
 		CanonicalInputDigest: canonicalInputDigest,
-		Provider:             invocation.RouteSnapshot.Provider,
-		Model:                invocation.RouteSnapshot.Model,
 		Status:               string(invocation.Status),
 		Attempt:              invocation.OperationAttempt,
 		ResultDigest:         invocation.ResultDigest,
 	}
+	if invocation.ExecutionKind == k12.GradingExecutionProvider {
+		receipt.Provider = invocation.RouteSnapshot.Provider
+		receipt.Model = invocation.RouteSnapshot.Model
+	}
+	return receipt
 }
 
 func gradingAnnotationReceipt(
@@ -2052,6 +2092,7 @@ func gradingAnnotationReceipt(
 	return ImageTaskOperationReceipt{
 		InvocationID:         "annotation:" + artifact.ArtifactID,
 		Operation:            "annotation",
+		ExecutionKind:        string(k12.GradingExecutionLocalDeterministic),
 		CanonicalInputDigest: canonicalInputDigest,
 		Status:               string(k12.ModelInvocationSucceeded),
 		Attempt:              1,
@@ -2084,6 +2125,7 @@ func imageTaskInvocationReceipt(
 	return ImageTaskOperationReceipt{
 		InvocationID:         invocation.InvocationID,
 		Operation:            string(invocation.Operation),
+		ExecutionKind:        string(k12.GradingExecutionProvider),
 		CanonicalInputDigest: canonicalInputDigest,
 		Provider:             invocation.RouteSnapshot.Provider,
 		Model:                invocation.RouteSnapshot.Model,
@@ -2100,6 +2142,7 @@ func modelInvocationReceipt(
 	receipt := ImageTaskOperationReceipt{
 		InvocationID:         invocation.InvocationID,
 		Operation:            invocation.Stage,
+		ExecutionKind:        string(k12.GradingExecutionProvider),
 		CanonicalInputDigest: canonicalInputDigest,
 		Provider:             invocation.RouteSnapshot.Provider,
 		Model:                invocation.RouteSnapshot.Model,
@@ -2124,6 +2167,7 @@ func modelPhysicalInvocationReceipt(
 		ParentInvocationID:   invocation.ParentInvocationID,
 		PhysicalUnit:         string(invocation.PhysicalUnit),
 		Operation:            invocation.Stage,
+		ExecutionKind:        string(k12.GradingExecutionProvider),
 		CanonicalInputDigest: canonicalInputDigest,
 		Provider:             invocation.RouteSnapshot.Provider,
 		Model:                invocation.RouteSnapshot.Model,

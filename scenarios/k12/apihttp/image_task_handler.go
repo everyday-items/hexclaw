@@ -68,6 +68,7 @@ type imageTaskProgressDTO struct {
 type imageTaskHomeworkProjectionDTO struct {
 	Kind                      string                             `json:"kind"`
 	Stage                     string                             `json:"stage"`
+	CompletedAt               int64                              `json:"completed_at,omitempty"`
 	ConfirmationState         string                             `json:"confirmation_state"`
 	AnchorState               string                             `json:"anchor_state"`
 	Recognition               map[string]any                     `json:"recognition,omitempty"`
@@ -254,6 +255,7 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 				questions = append(questions, recognizedQuestionToDTO(question, true))
 			}
 			projection.Stage = publicImageTaskProgressState(view.HomeworkProjection.Stage)
+			projection.CompletedAt = view.HomeworkProjection.CompletedAt
 			out.Retryable = view.HomeworkProjection.Retryable
 			projection.ConfirmationState = view.HomeworkProjection.ConfirmationState
 			projection.AnchorState = view.HomeworkProjection.AnchorState

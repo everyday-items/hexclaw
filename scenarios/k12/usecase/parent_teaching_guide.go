@@ -80,9 +80,12 @@ func (d Deps) SolveBlankWorksheetProblem(
 	}
 	req.Subject = subject
 	guideRequest := parentTeachingGuideRequest(req, solved, GradeOutcome{})
-	guide, err := d.generateParentTeachingGuide(ctx, guideRequest)
-	if err != nil {
-		return result, err
+	guide, deterministic := deterministicParentTeachingGuideForEvidence(guideRequest, solved.Evidence)
+	if !deterministic {
+		guide, err = d.generateParentTeachingGuide(ctx, guideRequest)
+		if err != nil {
+			return result, err
+		}
 	}
 	guide, err = finalizeParentTeachingGuide(guide, solved.Solution)
 	if err != nil {
@@ -144,6 +147,165 @@ func finalizeParentTeachingGuide(
 		)
 	}
 	return guide, nil
+}
+
+// deterministicNumericParentTeachingGuide 仅为已经通过本机数值执行验算的题目
+// 生成家长讲解。答案无法从验算结果中唯一确定时，调用方继续使用 Provider。
+func deterministicNumericParentTeachingGuide(
+	req ParentTeachingGuideRequest,
+) (ParentTeachingGuide, bool) {
+	answer, ok := deterministicNumericAnswer(req.VerifiedSolution)
+	if !ok {
+		return ParentTeachingGuide{}, false
+	}
+	steps := verifiedFullSolutionSteps(req.VerifiedSolution)
+	knowledge := strings.Join(normalizeParentGuideList(req.KnowledgePoints), "、")
+	if knowledge == "" {
+		knowledge = "题目中的运算顺序和数量关系"
+	}
+	guide := ParentTeachingGuide{
+		Answer:            answer,
+		FullSolutionSteps: steps,
+		GradeLevelMethod:  fmt.Sprintf("用%s已学的「%s」方法，按题目顺序逐步计算。", req.Grade, knowledge),
+		LikelyMistakes: []string{
+			fmt.Sprintf("没有先判断本题的「%s」和运算顺序", knowledge),
+			"计算完成后没有检查结果",
+		},
+		ParentTeachingSequence: []string{
+			fmt.Sprintf("先让孩子说出本题考查的「%s」以及先算什么", knowledge),
+			"再请孩子独立计算并说清每一步",
+			"最后用逆运算或代入原式检查答案",
+		},
+		FollowUpQuestions: []string{
+			fmt.Sprintf("为什么这道题要用「%s」来解？", knowledge),
+			"换一种方法验算，结果是否相同？",
+		},
+		CheckingMethod: "把答案代入原式，并用逆运算复核。",
+	}
+	if strings.Contains(req.VerifiedSolution, "题目信息矛盾") {
+		guide.GradeLevelMethod = fmt.Sprintf("先用%s已学的「%s」检查题目条件是否一致。", req.Grade, knowledge)
+		guide.LikelyMistakes = []string{
+			"没有先检查最大公约数能否整除最小公倍数",
+			"题目条件矛盾时仍继续猜排数和座位号",
+		}
+		guide.ParentTeachingSequence = []string{
+			"先和孩子核对题面中的 13 和 72",
+			"再检查最大公约数是否能整除最小公倍数",
+			"确认原题数值后再继续求排数和座位号",
+		}
+		guide.FollowUpQuestions = []string{
+			"13 能整除 72 吗？",
+			"如果不能，这说明题目中的哪个条件需要核对？",
+		}
+		guide.CheckingMethod = "核对最大公约数必须能整除最小公倍数这一必要条件。"
+	}
+	wrongStep := strings.TrimSpace(req.WrongStep)
+	errorCause := strings.TrimSpace(req.ErrorCause)
+	if wrongStep != "" || errorCause != "" {
+		if errorCause == "" {
+			errorCause = "计算过程没有通过程序验算"
+		}
+		if wrongStep == "" {
+			wrongStep = "需要重新核对的计算步骤"
+		}
+		guide.LikelyMistakes = []string{
+			fmt.Sprintf("%s：%s", wrongStep, errorCause),
+			"只核对最终答案，没有逐步检查等式和单位",
+		}
+		guide.ParentTeachingSequence = []string{
+			"先请孩子复述自己的原始解题思路",
+			fmt.Sprintf("一起定位到「%s」，让孩子说明这一步为什么成立", wrongStep),
+			"请孩子按本年级方法独立重算，再与程序验算结果核对",
+			"最后回看原题条件、符号和单位",
+		}
+		guide.FollowUpQuestions = []string{
+			fmt.Sprintf("「%s」这一步可以怎样验算？", wrongStep),
+			"修正后，把答案代回原题还能成立吗？",
+		}
+		guide.CheckingMethod = "从首个问题步骤开始逐式验算，再把最终答案代回原题核对。"
+	}
+	guide, err := finalizeParentTeachingGuide(guide, req.VerifiedSolution)
+	if err != nil {
+		return ParentTeachingGuide{}, false
+	}
+	return guide, true
+}
+
+// deterministicParentTeachingGuideForEvidence 统一 durable 与直接路径的执行选择；
+// 本机证据或答案唯一性不足时，调用方继续使用冻结的 Provider。
+func deterministicParentTeachingGuideForEvidence(
+	req ParentTeachingGuideRequest,
+	evidence SolveEvidence,
+) (ParentTeachingGuide, bool) {
+	if evidence.EvidenceType != EvidenceNumericExec {
+		return ParentTeachingGuide{}, false
+	}
+	return deterministicNumericParentTeachingGuide(req)
+}
+
+// deterministicNumericAnswer 只接受明确答案段或单行数值执行结果，避免从
+// 多解、解释性段落中猜测答案。
+func deterministicNumericAnswer(verifiedSolution string) (string, bool) {
+	scope, explicit := explicitVerifiedAnswerScope(verifiedSolution)
+	if explicit {
+		return deterministicExplicitNumericAnswer(scope)
+	}
+	if issue := strings.TrimSpace(verifiedSolution); strings.Contains(issue, "题目信息矛盾") &&
+		strings.Contains(issue, "请核对") && len([]rune(issue)) <= 256 {
+		return issue, true
+	}
+	lines := normalizeParentGuideList(strings.Split(strings.ReplaceAll(verifiedSolution, "\r\n", "\n"), "\n"))
+	if len(lines) != 1 {
+		return "", false
+	}
+	candidate := lines[0]
+	for _, prefix := range []string{"解：", "解:", "得：", "得:"} {
+		candidate = strings.TrimSpace(strings.TrimPrefix(candidate, prefix))
+	}
+	if strings.Contains(candidate, "或") {
+		return "", false
+	}
+	candidate = strings.ReplaceAll(candidate, "＝", "=")
+	if index := strings.LastIndex(candidate, "="); index >= 0 {
+		candidate = candidate[index+1:]
+	}
+	return deterministicNumericAnswerCandidate(candidate)
+}
+
+func deterministicExplicitNumericAnswer(value string) (string, bool) {
+	value = strings.TrimSpace(strings.NewReplacer("**", "", "__", "", "`", "").Replace(value))
+	if value == "" || strings.ContainsAny(value, "\r\n") || len([]rune(value)) > 160 {
+		return "", false
+	}
+	for _, ambiguous := range []string{"或", "可能", "多解", "不唯一", "不确定", "无法确定", "不能确定"} {
+		if strings.Contains(value, ambiguous) {
+			return "", false
+		}
+	}
+	for _, r := range value {
+		if unicode.IsDigit(r) {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func deterministicNumericAnswerCandidate(value string) (string, bool) {
+	value = strings.TrimSpace(strings.NewReplacer("**", "", "__", "", "`", "").Replace(value))
+	if value == "" || strings.ContainsAny(value, "\r\n。；;") || len([]rune(value)) > 64 {
+		return "", false
+	}
+	hasDigit := false
+	for _, r := range value {
+		if unicode.IsDigit(r) {
+			hasDigit = true
+			break
+		}
+	}
+	if !hasDigit {
+		return "", false
+	}
+	return value, true
 }
 
 func normalizeParentTeachingGuide(guide ParentTeachingGuide) ParentTeachingGuide {
