@@ -190,9 +190,8 @@ func (a *SolveAdapter) SolveSubject(ctx context.Context, subject, problem, grade
 		args["constraint"] = constraint
 	}
 	if usecase.HasGradingPhysicalCallExecutor(ctx) {
-		// Durable grading requires an explicit solver + verifier pair. This also
-		// prevents deterministic fast paths from producing a fake provider ledger.
-		args["self_consistency"] = 1
+		// 持久批改仍拦截复杂题的真实 solver / verifier 调用；本机可精确计算的题先走
+		// numeric_exec 快路，由用例层单独持久化本地确定性结果。
 		ctx = a.withGradingPhysicalCallInterceptor(ctx)
 	}
 	res, err := a.exec.Execute(ctx, args)

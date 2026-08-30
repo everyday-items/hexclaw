@@ -16,8 +16,10 @@ var (
 	rectangleYieldRe         = regexp.MustCompile(`^(?:[0-9]+[.．、])?(?:一个)?周长(?:是|为)?` + elementaryNumberPattern + `米的长方形(?:鱼塘)?[，,。.]?长是宽的` + elementaryNumberPattern + `倍[，,。.]?(?:如果)?每平方米(?:鱼塘)?(?:可)?产鱼` + elementaryNumberPattern + `千克[，,。.]?(?:一共|总共)(?:可|能)?产鱼多少千克[?？。.]?$`)
 	openCubeFishTankRe       = regexp.MustCompile(`^(?:小明的爸爸)?用玻璃做了一个棱长(?:是|为)?` + elementaryNumberPattern + `(?:dm|分米)的正方体鱼缸[。.]制作(?:这个|该)鱼缸时[，,]?至少需要玻璃多少平方米[?？](?:小明)?在鱼缸里注入` + elementaryNumberPattern + `(?:L|l|升)的水[，,]?水面高度(?:是|为)?多少分米[?？。.]?$`)
 	ticketGCDLCMRe           = regexp.MustCompile(`^(?:小明)?有(?:一)?张([0-9]+)至([0-9]+)排的电影票[，,]这张票的排数和座位号的最大公约数是([0-9]+)[，,]最小公倍数是([0-9]+)[，,](?:小明)?这张电影票是[（(][）)]排[（(][）)]号[。.]?$`)
+	sixNumberBalanceRe       = regexp.MustCompile(`^(?:[0-9]+[.．、])?在下列六个数[:：]([0-9]+)[、,，]([0-9]+)[、,，]([0-9]+)[、,，]([0-9]+)[、,，]([0-9]+)[、,，]([0-9]+)中划去(?:一个)?数[（(]?[）)]?后[，,]?能使其中3个数的和(?:是|为)?另外2个数(?:的)?和的2倍[。.]?$`)
 
 	finalQuantityMarkerRe = regexp.MustCompile(`(?i)(?:答案?|答)\s*(?:是|为)?\s*[:：]?\s*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)\s*(平方米|千克|公斤|m²|m2|kg|克|米|g|m)?`)
+	removedNumberMarkerRe = regexp.MustCompile(`划去(?:数)?\s*[:：]?\s*([+\-]?[0-9]+)`)
 	bareQuantityRe        = regexp.MustCompile(`(?i)^\s*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)\s*(平方米|千克|公斤|m²|m2|kg|克|米|g|m)?\s*$`)
 	equationQuantityRe    = regexp.MustCompile(`(?i)[=＝]\s*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)\s*(平方米|千克|公斤|m²|m2|kg|克|米|g|m)?`)
 	studentEquationRe     = regexp.MustCompile(`([+\-]?[0-9][0-9.\s()（）\[\]+\-×÷*/]*?)\s*[=＝]\s*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)`)
@@ -133,6 +135,68 @@ func solveElementaryWordProblemDetailed(problem string) (elementaryWordSolution,
 		return elementaryWordSolution{}, false
 	}
 
+	if m := sixNumberBalanceRe.FindStringSubmatch(problem); len(m) == 7 {
+		numbers := make([]int, 6)
+		for i := range numbers {
+			value, ok := new(big.Int).SetString(m[i+1], 10)
+			if !ok || !value.IsInt64() {
+				return elementaryWordSolution{}, false
+			}
+			numbers[i] = int(value.Int64())
+		}
+		type balanceMatch struct {
+			removed int
+			pair    [2]int
+			triple  [3]int
+		}
+		matchesByRemoved := make(map[int]balanceMatch)
+		for removedIndex, removed := range numbers {
+			remaining := make([]int, 0, 5)
+			for i, value := range numbers {
+				if i != removedIndex {
+					remaining = append(remaining, value)
+				}
+			}
+			for left := 0; left < len(remaining); left++ {
+				for right := left + 1; right < len(remaining); right++ {
+					pairSum := remaining[left] + remaining[right]
+					triple := [3]int{}
+					tripleIndex := 0
+					tripleSum := 0
+					for i, value := range remaining {
+						if i == left || i == right {
+							continue
+						}
+						triple[tripleIndex] = value
+						tripleIndex++
+						tripleSum += value
+					}
+					if tripleSum == 2*pairSum {
+						matchesByRemoved[removed] = balanceMatch{
+							removed: removed,
+							pair:    [2]int{remaining[left], remaining[right]},
+							triple:  triple,
+						}
+					}
+				}
+			}
+		}
+		if len(matchesByRemoved) != 1 {
+			return elementaryWordSolution{}, false
+		}
+		var matched balanceMatch
+		for _, candidate := range matchesByRemoved {
+			matched = candidate
+		}
+		answer := fmt.Sprintf("%d", matched.removed)
+		worked := fmt.Sprintf("先分别尝试划去一个数，再把剩下的 5 个数分成 3 个数和 2 个数两组。\n划去 %d 后：\n%d+%d+%d = %d\n%d+%d = %d\n%d = %d×2\n\n答案：划去 %d。",
+			matched.removed,
+			matched.triple[0], matched.triple[1], matched.triple[2], matched.triple[0]+matched.triple[1]+matched.triple[2],
+			matched.pair[0], matched.pair[1], matched.pair[0]+matched.pair[1],
+			matched.triple[0]+matched.triple[1]+matched.triple[2], matched.pair[0]+matched.pair[1], matched.removed)
+		return elementaryWordSolution{worked: worked, value: answer, knowledgePoint: "数的组合与倍数关系"}, true
+	}
+
 	return elementaryWordSolution{}, false
 }
 
@@ -164,12 +228,25 @@ func elementaryWordAllowedByConstraint(problem, constraint string) bool {
 		hasGCD := strings.Contains(c, "最大公约数") || strings.Contains(c, "最大公因数")
 		return hasGCD && strings.Contains(c, "最小公倍数")
 	}
+	if sixNumberBalanceRe.MatchString(p) {
+		return strings.Contains(c, "整数") || strings.Contains(c, "倍数") ||
+			strings.Contains(c, "加法") || strings.Contains(c, "乘法") ||
+			strings.Contains(c, "数的组合")
+	}
 	return false
 }
 
 func parseAnswerQuantity(answer string) (answerQuantity, bool) {
 	if strings.TrimSpace(answer) == "" || len(answer) > 1024 {
 		return answerQuantity{}, false
+	}
+	if matches := removedNumberMarkerRe.FindAllStringSubmatch(answer, -1); len(matches) > 0 {
+		match := matches[len(matches)-1]
+		_, value, ok := solveTrivialArithmetic(match[1])
+		if !ok {
+			return answerQuantity{}, false
+		}
+		return answerQuantity{value: value}, true
 	}
 	var match []string
 	if matches := finalQuantityMarkerRe.FindAllStringSubmatch(answer, -1); len(matches) > 0 {

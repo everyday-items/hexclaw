@@ -790,6 +790,9 @@ func inspectGradingGroundingInvocations(
 			return inspection, decodeErr
 		}
 		if !enveloped {
+			if localDeterministicGradingInvocation(invocation) {
+				continue
+			}
 			inspection.directSucceeded++
 			continue
 		}
@@ -823,6 +826,22 @@ func inspectGradingGroundingInvocations(
 		)
 	}
 	return inspection, nil
+}
+
+// localDeterministicGradingInvocation 只识别本机 numeric_exec 的 solve / grade 回执；
+// 它们不属于 Provider 物理调用，不参与教材证据封套完整性计数。
+func localDeterministicGradingInvocation(invocation k12.GradingItemInvocation) bool {
+	if invocation.Operation != k12.GradingItemOperationSolve &&
+		invocation.Operation != k12.GradingItemOperationGrade {
+		return false
+	}
+	var result struct {
+		Evidence SolveEvidence `json:"Evidence"`
+	}
+	if err := json.Unmarshal([]byte(invocation.ResultJSON), &result); err != nil {
+		return false
+	}
+	return result.Evidence.EvidenceType == EvidenceNumericExec
 }
 
 func gradingGroundingRelevantOperation(operation k12.GradingItemOperation) bool {
@@ -1240,8 +1259,21 @@ func executeDurableSolveOperation(
 		k12.GradingItemOperationSolveGenerate,
 	)
 	if err == nil && invocationID == "" {
-		err = fmt.Errorf("%w: physical solver returned without a durable invocation",
-			ErrModelInvocationRequiresReconciliation)
+		if result.Evidence.EvidenceType != EvidenceNumericExec {
+			err = fmt.Errorf("%w: physical solver returned without a durable invocation",
+				ErrModelInvocationRequiresReconciliation)
+		} else {
+			return executeGradingItemOperation(ctx, o, job, q,
+				k12.GradingItemOperationSolve,
+				struct {
+					ExecutionKind string       `json:"execution_kind"`
+					InputDigest   string       `json:"input_digest"`
+					Request       GradeRequest `json:"request"`
+				}{"local_deterministic", q.InputDigest, gradeReq},
+				func(context.Context) (SolveHomeworkResult, error) {
+					return result, nil
+				})
+		}
 	}
 	return result, invocationID, err
 }
@@ -1294,8 +1326,22 @@ func executeDurableGradeOperation(
 	result, err := deps.gradeSolvedHomeworkProblem(itemCtx, gradeReq, solved)
 	invocationID := executor.lastInvocation(k12.GradingItemOperationGrade)
 	if err == nil && invocationID == "" {
-		err = fmt.Errorf("%w: physical grader returned without a durable invocation",
-			ErrModelInvocationRequiresReconciliation)
+		if result.Evidence.EvidenceType != EvidenceNumericExec {
+			err = fmt.Errorf("%w: physical grader returned without a durable invocation",
+				ErrModelInvocationRequiresReconciliation)
+		} else {
+			return executeGradingItemOperation(ctx, o, job, q,
+				k12.GradingItemOperationGrade,
+				struct {
+					ExecutionKind string              `json:"execution_kind"`
+					InputDigest   string              `json:"input_digest"`
+					Request       GradeRequest        `json:"request"`
+					Solved        SolveHomeworkResult `json:"solved"`
+				}{"local_deterministic", q.InputDigest, gradeReq, solved},
+				func(context.Context) (GradeResult, error) {
+					return result, nil
+				})
+		}
 	}
 	return result, invocationID, err
 }
