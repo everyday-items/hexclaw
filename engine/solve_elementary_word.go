@@ -21,7 +21,7 @@ var (
 	finalQuantityMarkerRe = regexp.MustCompile(`(?i)(?:答案?|答)\s*(?:是|为)?\s*[:：]?\s*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)\s*(平方米|千克|公斤|m²|m2|kg|克|米|g|m)?`)
 	removedNumberMarkerRe = regexp.MustCompile(`划去(?:数)?\s*[:：]?\s*([+\-]?[0-9]+)`)
 	bareQuantityRe        = regexp.MustCompile(`(?i)^\s*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)\s*(平方米|千克|公斤|m²|m2|kg|克|米|g|m)?\s*$`)
-	equationQuantityRe    = regexp.MustCompile(`(?i)[=＝]\s*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)\s*(平方米|千克|公斤|m²|m2|kg|克|米|g|m)?`)
+	equationQuantityRe    = regexp.MustCompile(`(?i)[=＝]\s*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)(?:\s*(?:[（(]\s*)?(平方米|千克|公斤|m²|m\^?2|kg|克|米|g|m)(?:\s*[）)])?)?`)
 	studentEquationRe     = regexp.MustCompile(`([+\-]?[0-9][0-9.\s()（）\[\]+\-×÷*/]*?)\s*[=＝]\s*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)`)
 )
 
@@ -272,7 +272,7 @@ func normalizeAnswerUnit(unit string) string {
 		return "千克"
 	case "克", "g":
 		return "克"
-	case "平方米", "m²", "m2":
+	case "平方米", "m²", "m2", "m^2":
 		return "平方米"
 	case "米", "m":
 		return "米"

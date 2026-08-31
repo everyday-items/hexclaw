@@ -26,6 +26,9 @@ const (
 	RecognitionLayoutBatchTargetLimitV2 = 4
 	recognitionLayoutTargetLimitV2      = 32
 	recognitionLayoutUnitOrdinalLimitV2 = 9999
+	recognitionLayoutContactPaddingV2   = 8
+	recognitionLayoutContactGapV2       = 8
+	recognitionLayoutContactHeightV2    = 640
 )
 
 var ErrRecognitionLayoutPlanInvalid = errors.New("recognition layout plan invalid")
@@ -152,10 +155,19 @@ func BuildRecognitionLayoutPlanV2(input RecognitionLayoutPlanInputV2) (Recogniti
 		})
 	}
 
-	for start, ordinal := 0, 1; start < len(plan.Targets); start, ordinal = start+RecognitionLayoutBatchTargetLimitV2, ordinal+1 {
-		end := start + RecognitionLayoutBatchTargetLimitV2
-		if end > len(plan.Targets) {
-			end = len(plan.Targets)
+	for start, ordinal := 0, 1; start < len(plan.Targets); ordinal++ {
+		end := start
+		height := 2 * recognitionLayoutContactPaddingV2
+		for end < len(plan.Targets) && end-start < RecognitionLayoutBatchTargetLimitV2 {
+			nextHeight := height + plan.Targets[end].Region.Height
+			if end > start {
+				nextHeight += recognitionLayoutContactGapV2
+			}
+			if end > start && nextHeight > recognitionLayoutContactHeightV2 {
+				break
+			}
+			height = nextHeight
+			end++
 		}
 		unit, unitErr := RecognitionLayoutBatchUnitV2(ordinal)
 		if unitErr != nil {
@@ -177,6 +189,7 @@ func BuildRecognitionLayoutPlanV2(input RecognitionLayoutPlanInputV2) (Recogniti
 			TargetIDs:   targetIDs,
 			InputDigest: recognitionLayoutSHA256(batchImage),
 		})
+		start = end
 	}
 
 	digest, err := recognitionLayoutAuthorizedPlanDigestV2(plan)
@@ -548,8 +561,6 @@ func recognitionLayoutContactSheetPNG(
 			RecognitionLayoutBatchTargetLimitV2,
 		)
 	}
-	const padding = 8
-	const gap = 8
 	maxWidth, contentHeight := 0, 0
 	for _, target := range targets {
 		if target.Region.Width > maxWidth {
@@ -557,8 +568,8 @@ func recognitionLayoutContactSheetPNG(
 		}
 		contentHeight += target.Region.Height
 	}
-	width := maxWidth + 2*padding
-	height := contentHeight + 2*padding + gap*(len(targets)-1)
+	width := maxWidth + 2*recognitionLayoutContactPaddingV2
+	height := contentHeight + 2*recognitionLayoutContactPaddingV2 + recognitionLayoutContactGapV2*(len(targets)-1)
 	if width <= 0 || height <= 0 {
 		return nil, fmt.Errorf(
 			"%w: contact sheet dimensions overflowed",
@@ -567,12 +578,12 @@ func recognitionLayoutContactSheetPNG(
 	}
 	sheet := image.NewRGBA(image.Rect(0, 0, width, height))
 	draw.Draw(sheet, sheet.Bounds(), &image.Uniform{C: color.White}, image.Point{}, draw.Src)
-	top := padding
+	top := recognitionLayoutContactPaddingV2
 	for _, target := range targets {
 		destination := image.Rect(
-			padding,
+			recognitionLayoutContactPaddingV2,
 			top,
-			padding+target.Region.Width,
+			recognitionLayoutContactPaddingV2+target.Region.Width,
 			top+target.Region.Height,
 		)
 		draw.Draw(
@@ -582,7 +593,7 @@ func recognitionLayoutContactSheetPNG(
 			image.Pt(target.Region.X, target.Region.Y),
 			draw.Src,
 		)
-		top += target.Region.Height + gap
+		top += target.Region.Height + recognitionLayoutContactGapV2
 	}
 	var encoded bytes.Buffer
 	if err := png.Encode(&encoded, sheet); err != nil {

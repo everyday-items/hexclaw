@@ -328,7 +328,7 @@ server:
 
 # 进程级重资源预算（K12 批改与 Knowledge 摄取/查询共用）
 resource_governor:
-  vlm_concurrency: 1
+  vlm_concurrency: 2
   accelerator_concurrency: 1
   cpu_heavy_concurrency: 2
   sqlite_write_concurrency: 1

@@ -1853,15 +1853,14 @@ func recognitionLayoutQuestionSourceIdentityV2(
 	if json.Unmarshal(raw, &fields) != nil || fields == nil {
 		return false, false
 	}
-	var sourceNumberPath *[]string
+	var sourceNumberPath []string
 	var displayLabel *string
 	if json.Unmarshal(fields["source_number_path"], &sourceNumberPath) != nil ||
-		sourceNumberPath == nil ||
 		json.Unmarshal(fields["display_label"], &displayLabel) != nil ||
 		displayLabel == nil {
 		return false, false
 	}
-	return !slices.Equal(*sourceNumberPath, target.SourceNumberPath) ||
+	return !slices.Equal(sourceNumberPath, target.SourceNumberPath) ||
 		*displayLabel != target.DisplayLabel, true
 }
 

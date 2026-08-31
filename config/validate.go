@@ -211,10 +211,10 @@ func (c *Config) Validate() error {
 					Rule: "v2 requires physical_call_cap_millis=120000 and worker_hard_cap=2", Suggest: "Use the approved fixed limits",
 				})
 			}
-			if gradingBudget.EffectiveConcurrency != 1 {
+			if gradingBudget.EffectiveConcurrency < 1 || gradingBudget.EffectiveConcurrency > 2 {
 				errs = append(errs, &ValidationError{
 					Field: "k12.grading_budget.effective_concurrency", Value: fmt.Sprintf("%d", gradingBudget.EffectiveConcurrency),
-					Rule: "The current release configuration requires a value of 1", Suggest: "effective=2 requires approved measurements for all four buckets",
+					Rule: "v2 effective_concurrency must be 1 or 2", Suggest: "Use a value within the approved worker hard cap",
 				})
 			}
 			wantRecognizingSeconds := (b.UpTo32ProblemsMillis + 999) / 1000

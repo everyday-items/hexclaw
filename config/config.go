@@ -98,11 +98,11 @@ func (c K12GradingBudgetConfig) IsZero() bool {
 // 它不会写入默认配置，也不替代独立的真实性能发布校准门。
 func DefaultK12GradingBudget() K12GradingBudgetConfig {
 	return K12GradingBudgetConfig{
-		PolicyVersion:          1,
-		RecognitionPlanVersion: 1,
+		PolicyVersion:          2,
+		RecognitionPlanVersion: 2,
 		QueuedSeconds:          60,
 		NormalizingSeconds:     60,
-		RecognizingSeconds:     120,
+		RecognizingSeconds:     300,
 		LocatingSeconds:        60,
 		RenderingSeconds:       60,
 		ProjectingSeconds:      60,
@@ -113,6 +113,15 @@ func DefaultK12GradingBudget() K12GradingBudgetConfig {
 			{MaxProblems: 32, Seconds: 540},
 		},
 		ItemConcurrency: 2,
+		RecognizingBuckets: K12RecognizingBudgetBucketsConfig{
+			UpTo1ProblemMillis:   60_000,
+			UpTo8ProblemsMillis:  120_000,
+			UpTo16ProblemsMillis: 300_000,
+			UpTo32ProblemsMillis: 300_000,
+		},
+		PhysicalCallCapMillis: 120_000,
+		WorkerHardCap:         2,
+		EffectiveConcurrency:  2,
 	}
 }
 

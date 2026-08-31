@@ -1416,12 +1416,22 @@ func (o *GradingOrchestrator) executeAnchorForTask(
 	if err != nil {
 		return nil, k12.GradingAnchorDegraded, "anchor:ledger_job_missing", true
 	}
+	policy := k12.ModelRequestPolicySnapshot{}
+	if k12.NormalizeGradingModelSnapshot(snapshot).Model == k12.RecognizingPolicyModel {
+		policy = k12.ApprovedLocatingRequestPolicy()
+	}
 	requestRaw, _ := json.Marshal(struct {
 		ImageDigest string               `json:"image_digest"`
 		Questions   []RecognizedQuestion `json:"questions"`
 	}{modelInvocationDigest(image), frozen})
-	invocation, err := o.beginModelInvocation(baseCtx, job, k12.GradingStageLocating,
-		modelInvocationDigest([]byte(k12.GradingStageLocating), requestRaw))
+	policyRaw, _ := json.Marshal(policy)
+	invocation, err := o.beginModelInvocationWithPolicy(
+		baseCtx,
+		job,
+		k12.GradingStageLocating,
+		modelInvocationDigest([]byte(k12.GradingStageLocating), requestRaw, policyRaw),
+		policy,
+	)
 	if err != nil {
 		return nil, k12.GradingAnchorDegraded, "anchor:outcome_unknown", true
 	}
@@ -1453,6 +1463,9 @@ func (o *GradingOrchestrator) executeAnchorForTask(
 		}
 	}
 	ctx, cancel := context.WithDeadline(baseCtx, anchorDeadline)
+	if !invocation.RequestPolicySnapshot.IsZero() {
+		ctx = k12.WithGradingModelRequestPolicy(ctx, invocation.RequestPolicySnapshot)
+	}
 	unregisterProvider := o.registerGradingModelCall(jobID, cancel)
 	if current, readErr := o.deps.GetGradingJob(context.WithoutCancel(ctx), agentName, jobID); readErr != nil {
 		cancel()
@@ -2203,13 +2216,13 @@ func recognitionLayoutStageStartedAtV2(
 	budgetMillis := job.Fields.BudgetSnapshot.RecognizingBuckets.
 		UpTo32ProblemsMillis
 	budgetSeconds := (budgetMillis + 999) / 1000
-	stageStartedAtSeconds := job.Fields.Deadline - budgetSeconds
+	stageStartedAtSeconds := parent.CreatedAt
 	if budgetMillis <= 0 || budgetSeconds <= 0 ||
-		job.Fields.Deadline <= 0 || stageStartedAtSeconds <= 0 ||
-		parent.CreatedAt < stageStartedAtSeconds ||
-		parent.CreatedAt > stageStartedAtSeconds+1 {
+		stageStartedAtSeconds <= 0 ||
+		job.Fields.Deadline <= stageStartedAtSeconds ||
+		job.Fields.Deadline > stageStartedAtSeconds+budgetSeconds {
 		return 0, fmt.Errorf(
-			"%w: recognizing job deadline is not the trusted v2 32-problem ceiling",
+			"%w: recognizing job deadline exceeds the trusted v2 or parent ceiling",
 			ErrModelRequestPolicyInvalid,
 		)
 	}

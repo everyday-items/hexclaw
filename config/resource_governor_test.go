@@ -7,7 +7,7 @@ import (
 
 func TestDefaultResourceGovernorConfigIsBounded(t *testing.T) {
 	cfg := DefaultConfig().ResourceGovernor
-	if cfg.VLMConcurrency != 1 || cfg.AcceleratorConcurrency != 1 ||
+	if cfg.VLMConcurrency != 2 || cfg.AcceleratorConcurrency != 1 ||
 		cfg.CPUHeavyConcurrency != 2 || cfg.SQLiteWriteConcurrency != 1 {
 		t.Fatalf("unexpected process resource defaults: %+v", cfg)
 	}

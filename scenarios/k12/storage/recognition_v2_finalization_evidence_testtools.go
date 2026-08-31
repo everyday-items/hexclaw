@@ -342,7 +342,7 @@ func (s *Store) loadRecognitionV2FinalizationEvidenceSnapshotTx(
 	if headerRoute.Provider != "hexclaw-gpt" ||
 		headerRoute.Model != k12.RecognizingPolicyModel ||
 		headerRoute.Route != "hexclaw-gpt/"+k12.RecognizingPolicyModel ||
-		authority.Header.EffectiveConcurrency != 1 ||
+		authority.Header.EffectiveConcurrency != 2 ||
 		authority.Header.BudgetBuckets.UpTo8ProblemsMillis <
 			authority.Header.BudgetBuckets.UpTo1ProblemMillis ||
 		authority.Header.BudgetBuckets.UpTo16ProblemsMillis <

@@ -275,6 +275,7 @@ func (a *SolveAdapter) Grade(ctx context.Context, problem, studentAnswer, _ stri
 // GradeSubject 与 Grade 相同，并把显式学科传给 grading 模式。
 func (a *SolveAdapter) GradeSubject(ctx context.Context, subject, problem, studentAnswer, _ string) (usecase.GradeOutcome, error) {
 	problem = gradingProblemWithGrounding(ctx, problem)
+	studentAnswer = usecase.CanonicalPlainTextFallback(studentAnswer)
 	args := map[string]any{"problem": problem, "student_answer": studentAnswer}
 	if subject != "" {
 		args["subject"] = subject
@@ -289,6 +290,7 @@ func (a *SolveAdapter) GradeSubject(ctx context.Context, subject, problem, stude
 func (a *SolveAdapter) GradeVerified(ctx context.Context, subject, problem, studentAnswer, verifiedSolution string) (usecase.GradeOutcome, error) {
 	if exec, ok := a.exec.(VerifiedGradeExecutor); ok {
 		problem = gradingProblemWithGrounding(ctx, problem)
+		studentAnswer = usecase.CanonicalPlainTextFallback(studentAnswer)
 		ctx = a.withGradingPhysicalCallInterceptor(ctx)
 		res, err := exec.GradeVerified(ctx, problem, verifiedSolution, studentAnswer)
 		return gradeOutcomeFromResult(res, err)
@@ -299,6 +301,7 @@ func (a *SolveAdapter) GradeVerified(ctx context.Context, subject, problem, stud
 // gradingProblemWithGrounding 只把编排层已经核验的教材正文加入模型输入；
 // 持久回执、文档标识和 revision 摘要均不进入提示词。
 func gradingProblemWithGrounding(ctx context.Context, problem string) string {
+	problem = usecase.CanonicalPlainTextFallback(problem)
 	evidence, ok := usecase.GradingGroundingForProvider(ctx)
 	if !ok {
 		return problem
@@ -370,10 +373,11 @@ func evidenceFromMeta(m map[string]string) usecase.SolveEvidence {
 	default:
 		ev.Verdict = usecase.VerdictUnverifiable
 	}
-	// 证据强弱按 solve 下发的 solve_evidence 定，与 verdict 解耦。
+	// 证据来源按 solve 下发的 solve_evidence 定，与 verdict 解耦。程序也可能确定性证明
+	// 题面条件矛盾，此时 verdict=unverifiable，但执行来源仍是 numeric_exec。
 	switch {
-	case ev.Verdict == usecase.VerdictAgree && m["solve_evidence"] == "numeric_exec":
-		ev.EvidenceType = usecase.EvidenceNumericExec // 强：code_exec 客观重算相等
+	case m["solve_evidence"] == "numeric_exec":
+		ev.EvidenceType = usecase.EvidenceNumericExec // 程序客观计算或校验题面条件
 	case ev.Verdict == usecase.VerdictAgree || ev.Verdict == usecase.VerdictDisagree:
 		ev.EvidenceType = usecase.EvidenceHeuristic // 弱：模型口头判定，未程序验算
 	default:

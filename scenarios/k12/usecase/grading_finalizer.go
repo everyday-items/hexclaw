@@ -391,15 +391,32 @@ func gradingOperationSupersededByCurrentAssessment(
 		referenceID = assessment.ParentGuideInvocationID
 	}
 	reference, ok := invocationByID[referenceID]
-	return ok &&
-		reference.InvocationID != invocation.InvocationID &&
-		reference.AgentName == invocation.AgentName &&
-		reference.JobID == invocation.JobID &&
-		reference.ProblemID == invocation.ProblemID &&
-		reference.AttemptID == invocation.AttemptID &&
-		reference.Operation == invocation.Operation &&
-		reference.OperationAttempt > invocation.OperationAttempt &&
-		reference.Status == k12.ModelInvocationSucceeded
+	if !ok ||
+		reference.InvocationID == invocation.InvocationID ||
+		reference.AgentName != invocation.AgentName {
+		return false
+	}
+	if reference.JobID != invocation.JobID ||
+		reference.ProblemID != invocation.ProblemID ||
+		reference.AttemptID != invocation.AttemptID ||
+		reference.Status != k12.ModelInvocationSucceeded {
+		return false
+	}
+	if reference.Operation == invocation.Operation {
+		return reference.OperationAttempt > invocation.OperationAttempt
+	}
+	if invocation.Operation != k12.GradingItemOperationSolve &&
+		invocation.Operation != k12.GradingItemOperationSolveGenerate &&
+		invocation.Operation != k12.GradingItemOperationSolveVerify {
+		return false
+	}
+	if reference.Operation != k12.GradingItemOperationSolve &&
+		reference.Operation != k12.GradingItemOperationSolveGenerate &&
+		reference.Operation != k12.GradingItemOperationSolveVerify {
+		return false
+	}
+	return reference.CreatedAt >= invocation.UpdatedAt &&
+		assessment.UpdatedAt >= invocation.UpdatedAt
 }
 
 func mergeFinalStructureVersion(current, candidate int) (int, error) {

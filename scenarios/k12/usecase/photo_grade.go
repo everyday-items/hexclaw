@@ -516,6 +516,23 @@ var photoChineseFractionToken = regexp.MustCompile(`[零〇一二两三四五六
 func photoGradeKnowledgePoints(question RecognizedQuestion) []string {
 	points := append([]string(nil), question.KnowledgePoints...)
 	problem := strings.TrimSpace(question.Question)
+	// 小学简易方程常被视觉模型同时标为“解方程”和初中词表“一元一次方程”。
+	// 已有小学标签时收敛重复术语，避免同一道题被较晚年级的同义标签误判超纲。
+	hasElementaryEquation := false
+	for _, point := range points {
+		normalized := strings.TrimSpace(point)
+		if normalized == "解方程" || normalized == "简易方程" {
+			hasElementaryEquation = true
+			break
+		}
+	}
+	if hasElementaryEquation {
+		for i, point := range points {
+			if strings.TrimSpace(point) == "一元一次方程" {
+				points[i] = "简易方程"
+			}
+		}
+	}
 	// Natural-language “a number's m/n” applications belong to the fifth-grade meaning of
 	// fractions even though their solution can be rewritten with multiplication/division. Only
 	// normalize that wording; explicit fraction ×/÷ expressions remain the formal sixth-grade unit.

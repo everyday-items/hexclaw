@@ -13,6 +13,7 @@ const (
 	// RecognizingRequestPolicyVersion 控制共享的 DD-036 线上协议策略。
 	// 它有意与 recognition_plan_version V1/V2 保持独立。
 	RecognizingRequestPolicyVersion = "dd036-recognizing-v1"
+	LocatingRequestPolicyVersion    = "k12-locating-v1"
 	RecognizingPolicyModel          = "gpt-5.6-sol"
 )
 
@@ -36,6 +37,15 @@ func ApprovedRecognizingRequestPolicy() ModelRequestPolicySnapshot {
 	}
 }
 
+func ApprovedLocatingRequestPolicy() ModelRequestPolicySnapshot {
+	return ModelRequestPolicySnapshot{
+		PolicyVersion:   LocatingRequestPolicyVersion,
+		Stage:           GradingStageLocating,
+		Thinking:        "off",
+		ReasoningEffort: "none",
+	}
+}
+
 func NormalizeModelRequestPolicySnapshot(
 	policy ModelRequestPolicySnapshot,
 ) ModelRequestPolicySnapshot {
@@ -52,6 +62,10 @@ func (policy ModelRequestPolicySnapshot) IsZero() bool {
 
 func (policy ModelRequestPolicySnapshot) IsApprovedRecognizing() bool {
 	return NormalizeModelRequestPolicySnapshot(policy) == ApprovedRecognizingRequestPolicy()
+}
+
+func (policy ModelRequestPolicySnapshot) IsApprovedLocating() bool {
+	return NormalizeModelRequestPolicySnapshot(policy) == ApprovedLocatingRequestPolicy()
 }
 
 func (policy ModelRequestPolicySnapshot) Digest() string {
@@ -100,6 +114,17 @@ func ValidateModelInvocationRequestPolicy(
 	stage = strings.TrimSpace(stage)
 	route = NormalizeGradingModelSnapshot(route)
 	policy = NormalizeModelRequestPolicySnapshot(policy)
+	if stage == GradingStageLocating {
+		// 历史 locating invocation 的零策略仍可读；新 Sol 调用由
+		// 编排器显式冻结独立的低延迟策略。
+		if policy.IsZero() {
+			return nil
+		}
+		if route.Model != RecognizingPolicyModel || !policy.IsApprovedLocating() {
+			return fmt.Errorf("locating request policy is not approved for model %q", route.Model)
+		}
+		return nil
+	}
 	if stage != GradingStageRecognizing {
 		if !policy.IsZero() {
 			return fmt.Errorf("request policy is forbidden for stage %q", stage)

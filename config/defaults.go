@@ -186,7 +186,7 @@ func DefaultConfig() *Config {
 			MaxCost:     5.0,
 		},
 		ResourceGovernor: ResourceGovernorConfig{
-			VLMConcurrency:         1,
+			VLMConcurrency:         2,
 			AcceleratorConcurrency: 1,
 			CPUHeavyConcurrency:    2,
 			SQLiteWriteConcurrency: 1,

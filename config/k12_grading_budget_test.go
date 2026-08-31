@@ -26,6 +26,16 @@ func validK12GradingBudgetConfig() K12GradingBudgetConfig {
 
 func TestDefaultK12GradingBudgetProvidesRunnableOperationalBaseline(t *testing.T) {
 	want := validK12GradingBudgetConfig()
+	want.PolicyVersion = 2
+	want.RecognitionPlanVersion = 2
+	want.RecognizingSeconds = 300
+	want.RecognizingBuckets = K12RecognizingBudgetBucketsConfig{
+		UpTo1ProblemMillis: 60_000, UpTo8ProblemsMillis: 120_000,
+		UpTo16ProblemsMillis: 300_000, UpTo32ProblemsMillis: 300_000,
+	}
+	want.PhysicalCallCapMillis = 120_000
+	want.WorkerHardCap = 2
+	want.EffectiveConcurrency = 2
 	got := DefaultK12GradingBudget()
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("default grading budget=%+v, want %+v", got, want)
@@ -55,7 +65,7 @@ func TestValidateK12GradingBudgetRequiresCompleteMeasuredPolicy(t *testing.T) {
 	}
 }
 
-func TestValidateK12GradingBudgetReleaseKeepsV2EffectiveConcurrencyAtOne(t *testing.T) {
+func TestValidateK12GradingBudgetReleaseAllowsBoundedV2Concurrency(t *testing.T) {
 	cfg := DefaultConfig()
 	budget := validK12GradingBudgetConfig()
 	budget.RecognitionPlanVersion = 2
@@ -72,8 +82,12 @@ func TestValidateK12GradingBudgetReleaseKeepsV2EffectiveConcurrencyAtOne(t *test
 		t.Fatalf("complete release v2 policy should validate: %v", err)
 	}
 	cfg.K12.GradingBudget.EffectiveConcurrency = 2
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("release effective=2 within worker hard cap should validate: %v", err)
+	}
+	cfg.K12.GradingBudget.EffectiveConcurrency = 3
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "effective_concurrency") {
-		t.Fatalf("release effective=2 without approved calibration must fail exact field: %v", err)
+		t.Fatalf("release effective=3 above worker hard cap must fail exact field: %v", err)
 	}
 }
 

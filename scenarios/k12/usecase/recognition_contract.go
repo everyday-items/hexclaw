@@ -44,6 +44,7 @@ const ocrConfidenceConfirmationThreshold = 0.90
 
 var (
 	latexFraction = regexp.MustCompile(`\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}`)
+	latexText     = regexp.MustCompile(`\\text\s*\{([^{}]*)\}`)
 )
 
 var ocrReasonOrder = []OCRRiskReason{
@@ -234,6 +235,7 @@ func CanonicalPlainTextFallback(markdown string) string {
 		}
 		out = next
 	}
+	out = latexText.ReplaceAllString(out, `$1`)
 	out = strings.NewReplacer(
 		`\times`, "×", `\div`, "÷", `\cdot`, "·",
 		`\leq`, "≤", `\geq`, "≥", `\neq`, "≠",

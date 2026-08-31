@@ -160,15 +160,11 @@ func k12VisionRequestMetadata(
 	if !frozen {
 		return nil, "", fmt.Errorf("K12 recognizing request policy has no frozen route")
 	}
-	if err := k12.ValidateModelInvocationRequestPolicy(
-		k12.GradingStageRecognizing,
-		snapshot,
-		policy,
-	); err != nil {
+	if err := k12.ValidateModelInvocationRequestPolicy(policy.Stage, snapshot, policy); err != nil {
 		return nil, "", err
 	}
-	if !policy.IsApprovedRecognizing() {
-		return nil, "", fmt.Errorf("K12 recognizing request policy is not approved")
+	if !policy.IsApprovedRecognizing() && !policy.IsApprovedLocating() {
+		return nil, "", fmt.Errorf("K12 vision request policy is not approved")
 	}
 	return map[string]any{"thinking": policy.Thinking},
 		llm.ReasoningPolicyScopeStructuredVisionRecognition,

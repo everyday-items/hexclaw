@@ -200,7 +200,7 @@ func TestK12LiveRecognitionPlanV2EvidenceExportsFinalizedClaimLineage(t *testing
 		evidence.SelectedBucketMaxProblems != 8 ||
 		evidence.BudgetBucketsMillis != fixture.buckets ||
 		evidence.PhysicalCallCapMillis != 120_000 ||
-		evidence.AdapterWorkerHardCap != 2 || evidence.EffectiveConcurrency != 1 {
+		evidence.AdapterWorkerHardCap != 2 || evidence.EffectiveConcurrency != 2 {
 		t.Fatalf("wrong frozen budget projection: %+v", evidence)
 	}
 	if evidence.CandidateResultCount != 4 || evidence.QuestionCount != 3 ||
@@ -754,11 +754,11 @@ func newRecognitionV2EvidenceFixture(
 	buckets := k12.RecognitionLayoutBudgetBucketsV2{
 		UpTo1ProblemMillis:   60_000,
 		UpTo8ProblemsMillis:  120_000,
-		UpTo16ProblemsMillis: 180_000,
+		UpTo16ProblemsMillis: 300_000,
 		UpTo32ProblemsMillis: 300_000,
 	}
 	budget := k12.GradingBudgetSnapshot{
-		PolicyVersion: 1,
+		PolicyVersion: 2,
 		StageSeconds: k12.GradingStageBudgets{
 			Queued: 60, Normalizing: 60, Recognizing: 300,
 			Locating: 60, Rendering: 60, Projecting: 60,
@@ -774,7 +774,7 @@ func newRecognitionV2EvidenceFixture(
 		RecognizingBuckets:     buckets,
 		PhysicalCallCapMillis:  120_000,
 		WorkerHardCap:          2,
-		EffectiveConcurrency:   1,
+		EffectiveConcurrency:   2,
 	}
 	jobRecord, err := k12.NewGradingJobRecord(targetAgent, sessionID, k12.GradingJobFields{
 		SubmissionID:      submissionID,
@@ -906,7 +906,7 @@ func newRecognitionV2EvidenceFixture(
 		PhysicalCallCapMillis:    120_000,
 		BudgetBuckets:            buckets,
 		AdapterWorkerHardCap:     2,
-		EffectiveConcurrency:     1,
+		EffectiveConcurrency:     2,
 	}
 	headerDigest, err := k12.RecognitionLayoutPlanHeaderDigestV2(header)
 	if err != nil {
