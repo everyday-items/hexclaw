@@ -387,6 +387,8 @@ var recognizedArabicFraction = regexp.MustCompile(`\d+\s*/\s*\d+`)
 var recognizedChineseFraction = regexp.MustCompile(`[零〇一二两三四五六七八九十百]+\s*分之\s*[零〇一二两三四五六七八九十百]+`)
 var unreadableAnswerDescription = regexp.MustCompile(`(?i)(无可辨认|无法辨认|不能辨认|辨认不清|无法识别|未能识别|看不清|不可读|字迹模糊|答案模糊|no discernible answer|unreadable|illegible|cannot read|not legible)`)
 var blankAnswerDescription = regexp.MustCompile(`(?i)^(未作答|没有作答|无作答|空白|未填写|no answer|blank|unanswered)[。.!！]?$`)
+var emptyPrintedAnswerSlot = regexp.MustCompile(`[（(][[:space:]　]*[）)]`)
+var numericAnswerToken = regexp.MustCompile(`[-+]?[0-9]+([.][0-9]+)?(/[0-9]+)?`)
 
 // sanitizeModelJSON 只修复模型在 JSON 字符串值中输出的 LaTeX/非法反斜杠转义。
 // 绝不能在反序列化前把整段 JSON 当数学文本规范化：那会改写 bbox_1000 等协议键。
@@ -1029,6 +1031,8 @@ func RecognizedQuestionsFromLayoutFinalizationV2(
 			if parseErr != nil {
 				return fail("candidate %q question: %v", target.TargetID, parseErr)
 			}
+			region := target.Region
+			question.SourceRegion = &region
 			questions = append(questions, question)
 		case k12.RecognitionLayoutCandidateNonQuestionV2:
 			if !bytes.Equal(candidate.ResultJSON, []byte(`{}`)) {
@@ -1926,10 +1930,55 @@ func parseRecognitionLayoutQuestionV2(
 	if err != nil || len(questions) != 1 {
 		return usecase.RecognizedQuestion{}, fmt.Errorf("recognition is not one valid question")
 	}
+	questions[0] = clearPrintedFillBlankCandidateV2(questions[0])
 	if err := validateRecognitionProtocolResult(questions); err != nil {
 		return usecase.RecognizedQuestion{}, err
 	}
 	return questions[0], nil
+}
+
+// clearPrintedFillBlankCandidateV2 只清理填空题中可确定为印刷候选重复的单一数字。
+// 答案或任一证据含题干之外的书写内容时，保留原始识题事实。
+func clearPrintedFillBlankCandidateV2(
+	question usecase.RecognizedQuestion,
+) usecase.RecognizedQuestion {
+	if question.AnswerState != usecase.AnswerStatePresent ||
+		len(question.AnswerEvidenceTranscriptions) == 0 {
+		return question
+	}
+	printed := strings.TrimSpace(question.RawTranscription)
+	if printed == "" {
+		printed = strings.TrimSpace(question.Question)
+	}
+	if !emptyPrintedAnswerSlot.MatchString(printed) {
+		return question
+	}
+	answer := strings.TrimSpace(adapter.NormalizeMathText(question.AnswerRawTranscription))
+	answerTokens := numericAnswerToken.FindAllString(answer, -1)
+	if len(answerTokens) != 1 || answerTokens[0] != answer {
+		return question
+	}
+	printedTokens := numericAnswerToken.FindAllString(
+		strings.TrimSpace(adapter.NormalizeMathText(printed)),
+		-1,
+	)
+	if !slices.Contains(printedTokens, answer) {
+		return question
+	}
+	for _, evidence := range question.AnswerEvidenceTranscriptions {
+		normalized := strings.TrimSpace(adapter.NormalizeMathText(evidence))
+		evidenceTokens := numericAnswerToken.FindAllString(normalized, -1)
+		if len(evidenceTokens) != 1 || evidenceTokens[0] != normalized || normalized != answer {
+			return question
+		}
+	}
+	question.AnswerState = usecase.AnswerStateBlank
+	question.StudentAnswer = ""
+	question.AnswerRawTranscription = ""
+	question.AnswerCanonicalMarkdown = ""
+	question.AnswerEvidenceTranscriptions = nil
+	question.BBox = nil
+	return usecase.NormalizeRecognizedQuestion(question)
 }
 
 func recognitionLayoutExactFieldsV2(

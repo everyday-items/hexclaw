@@ -1197,7 +1197,8 @@ var triageHardKeywords = []string{"证明", "求证", "讨论", "推导", "解�
 func assessComplexity(problem string) solveComplexity {
 	p := strings.TrimSpace(problem)
 	runes := []rune(p)
-	if triageMultiPart.MatchString(p) || len(runes) > 120 {
+	multiPartInput := elementaryParenthesizedFractionRe.ReplaceAllString(p, "$1/$2")
+	if triageMultiPart.MatchString(multiPartInput) || len(runes) > 120 {
 		return complexityHard
 	}
 	for _, kw := range triageHardKeywords {

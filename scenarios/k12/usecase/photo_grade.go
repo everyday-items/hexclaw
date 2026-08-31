@@ -176,6 +176,12 @@ func (d Deps) gradeHomeworkPhotoWithAssessorInput(
 
 	imageWarning := ""
 	hasPresent, hasUnclear := photoAnswerCandidates(questions)
+	if req.TaskIntent == PhotoTaskBlankWorksheet && !hasPresent && hasUnclear &&
+		!photoHasExplicitUnclearAnswerEvidence(questions) {
+		// 空白卷上只有擦痕等模糊视觉信号、没有任何答案转录证据时，
+		// 不把它升级为已作答候选，也不发起答案区域定位。
+		hasUnclear = false
+	}
 	anchorVerified := false
 	if (hasPresent || hasUnclear) && d.AnswerAnchorer != nil {
 		anchored, anchorErr := d.anchorHomeworkGeometry(ctx, req.Image, questions)
@@ -463,6 +469,25 @@ func photoAnswerCandidates(questions []RecognizedQuestion) (present, unclear boo
 		}
 	}
 	return present, unclear
+}
+
+func photoHasExplicitUnclearAnswerEvidence(questions []RecognizedQuestion) bool {
+	for _, question := range questions {
+		normalized := NormalizeRecognizedQuestion(question)
+		if normalized.AnswerState != AnswerStateUnclear {
+			continue
+		}
+		if strings.TrimSpace(question.AnswerRawTranscription) != "" ||
+			strings.TrimSpace(question.AnswerCanonicalMarkdown) != "" {
+			return true
+		}
+		for _, evidence := range question.AnswerEvidenceTranscriptions {
+			if strings.TrimSpace(evidence) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func firstNonEmpty(a, b string) string {

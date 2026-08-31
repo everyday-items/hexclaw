@@ -17,6 +17,7 @@ import (
 	"sync"
 
 	"github.com/hexagon-codes/hexclaw/adapter"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 	"github.com/hexagon-codes/toolkit/util/logger"
 )
@@ -51,10 +52,11 @@ const (
 var _ usecase.AnswerAnchorer = (*RecognizerAdapter)(nil)
 
 type answerBBoxTarget struct {
-	Index        int    `json:"index"`
-	QuestionHint string `json:"question_hint"`
-	AnswerHint   string `json:"answer_hint"`
-	AnswerState  string `json:"answer_state"`
+	Index        int                    `json:"index"`
+	QuestionHint string                 `json:"question_hint"`
+	AnswerHint   string                 `json:"answer_hint"`
+	AnswerState  string                 `json:"answer_state"`
+	SourceRegion *k12.SourcePixelRegion `json:"source_region_px,omitempty"`
 }
 
 type answerLocatorResult struct {
@@ -153,11 +155,17 @@ func (a *RecognizerAdapter) AnchorAnswerGeometry(
 		if out[i].AnswerState == usecase.AnswerStatePresent {
 			answerHint = compactAnswerAnchorHint(out[i].StudentAnswer, answerLocatorAnswerHintRunes)
 		}
+		var sourceRegion *k12.SourcePixelRegion
+		if out[i].SourceRegion != nil {
+			region := *out[i].SourceRegion
+			sourceRegion = &region
+		}
 		targets = append(targets, answerBBoxTarget{
 			Index:        i + 1,
 			QuestionHint: compactAnswerAnchorHint(out[i].Question, answerLocatorQuestionHintRunes),
 			AnswerHint:   answerHint,
 			AnswerState:  string(out[i].AnswerState),
+			SourceRegion: sourceRegion,
 		})
 	}
 	if len(targets) == 0 {
@@ -185,13 +193,14 @@ func (a *RecognizerAdapter) AnchorAnswerGeometry(
 		return nil, fmt.Errorf("answer anchorer: 编码定位目标: %w", err)
 	}
 	locatorPrompt := fmt.Sprintf(`这是“批量答案定位”，不是识题，也不要计算答案。
+原页实际像素为 %d×%d。每个目标如带 source_region_px，它就是该题在原页像素坐标中的唯一允许区域；不得选择区域外或相邻题的笔迹。
 图片中原页只展示一次，并叠加 4 列 × 12 行等距坐标网格。整页左上角为 (0,0)，右下角为 (1000,1000)。
 下面是本页的目标提示；省略号仅表示长文本中段被压缩：%s
 answer_state=present 表示答案文字已可靠誊录；answer_state=unclear 只是核心识别发现了疑似笔迹，尚未证明那里真有学生作答。
 逐个匹配印刷题干与对应学生手写答案，返回该学生答案全部手写墨迹在整页内的紧贴框 bbox_1000=[left,top,right,bottom]。
 对于 unclear，只有肉眼能确认存在学生手写笔迹或涂改时才返回框；如果只是印刷字、横线、表格线、阴影、折痕或空白，必须省略。
-框内不得包含印刷题干、表格线或相邻题答案；标题、纯印刷内容、相邻题答案都不能选。不能唯一确认位置的目标直接省略。
-严格只输出紧凑 JSON 数组，每个对象仅含整数 index、bbox_1000；四个坐标范围均为 0..1000 且 right>left、bottom>top。index 必须原样回传。`, string(targetJSON))
+框内不得包含印刷题干、表格线或相邻题答案；标题、纯印刷内容、相邻题答案都不能选。带 source_region_px 的目标，其 bbox_1000 中心点换算回原页像素后必须位于该区域内；不能满足就直接省略。
+严格只输出紧凑 JSON 数组，每个对象仅含整数 index、bbox_1000；四个坐标范围均为 0..1000 且 right>left、bottom>top。index 必须原样回传。`, cfg.Width, cfg.Height, string(targetJSON))
 	rawLocated, err := a.callVision(ctx, locatorImage, locatorPrompt)
 	if err != nil {
 		return nil, fmt.Errorf("answer anchorer: 批量定位调用失败: %w", err)
@@ -218,6 +227,9 @@ answer_state=present 表示答案文字已可靠誊录；answer_state=unclear �
 		}
 		bbox, ok := refinePageAnswerBBox(fullPage, result.BBox1000)
 		if !ok {
+			continue
+		}
+		if !answerBBoxBelongsToSourceRegion(src.Bounds(), bbox, out[questionIndex].SourceRegion) {
 			continue
 		}
 		if !semanticBBoxHasVisibleInk(src, semanticBBoxRect(src.Bounds(), bbox)) {
@@ -1309,6 +1321,32 @@ func refinePageAnswerBBox(tile usecase.BBox, coords []float64) (usecase.BBox, bo
 		return usecase.BBox{}, false
 	}
 	return refined, true
+}
+
+func answerBBoxBelongsToSourceRegion(
+	bounds image.Rectangle,
+	bbox usecase.BBox,
+	region *k12.SourcePixelRegion,
+) bool {
+	if region == nil {
+		return true
+	}
+	if bounds.Empty() || region.Width <= 0 || region.Height <= 0 {
+		return false
+	}
+	allowed := image.Rect(
+		region.X,
+		region.Y,
+		region.X+region.Width,
+		region.Y+region.Height,
+	).Intersect(bounds)
+	if allowed.Empty() {
+		return false
+	}
+	centerX := float64(bounds.Min.X) + (bbox.X+bbox.W/2)*float64(bounds.Dx())
+	centerY := float64(bounds.Min.Y) + (bbox.Y+bbox.H/2)*float64(bounds.Dy())
+	return centerX >= float64(allowed.Min.X) && centerX < float64(allowed.Max.X) &&
+		centerY >= float64(allowed.Min.Y) && centerY < float64(allowed.Max.Y)
 }
 
 func semanticBBoxRect(bounds image.Rectangle, bbox usecase.BBox) image.Rectangle {
