@@ -515,7 +515,7 @@ var photoChineseFractionToken = regexp.MustCompile(`[零〇一二两三四五六
 // “分数乘法” unit creates a false out-of-scope verdict.
 func photoGradeKnowledgePoints(question RecognizedQuestion) []string {
 	points := append([]string(nil), question.KnowledgePoints...)
-	problem := strings.TrimSpace(question.Question)
+	problem := strings.TrimSpace(question.Question + "\n" + question.RawTranscription)
 	// 小学简易方程常被视觉模型同时标为“解方程”和初中词表“一元一次方程”。
 	// 已有小学标签时收敛重复术语，避免同一道题被较晚年级的同义标签误判超纲。
 	hasElementaryEquation := false

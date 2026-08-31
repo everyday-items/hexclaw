@@ -237,10 +237,11 @@ const recognitionLayoutManifestPromptV2 = `This is the compact layout-manifest s
 Locate only the region of each independently answerable question. Section headings, headers, footers, and decoration are not targets. Split horizontal arithmetic, fill-in-the-blank, and multiple-choice questions into individual items. Give each independently answerable subquestion in a compound question its own target.
 Output exactly one JSON object whose only top-level field is targets: {"targets":[...]}.
 Each targets item must contain exactly the following fields; none may be omitted:
-{"manifest_ref":"manifest_0001","manifest_order":1,"source_number_path":["一","1"],"display_label":"一、1","region":{"x":0,"y":0,"width":1,"height":1}}
+{"manifest_ref":"manifest_0001","manifest_order":1,"source_number_path":["一","1"],"display_label":"一、1","source_section_path":["一"],"source_section_label":"一、直接写得数","region":{"x":0,"y":0,"width":1,"height":1}}
 Rules:
 - Number manifest_ref consecutively from manifest_0001, and manifest_order consecutively from 1.
 - Copy only visible source numbering into source_number_path/display_label and emit them together. Without visible numbering, use [] and "". Never invent numbering from position.
+- Copy the visible owning section heading into source_section_path/source_section_label and emit them together for every target in that section. Without a visible owning section heading, use [] and "". Never infer a section from position or subject.
 - region uses original-image pixel coordinates and must fully cover the question text and answer area without including an adjacent question. x, y, width, and height must all be integers.
 - Do not output question transcription, student work, answers, subject, knowledge points, parent/child question content, grading conclusions, or any other field.
 - List every target from top to bottom and left to right within each row. Do not omit, duplicate, or merge targets, and do not split out section headings.
@@ -251,19 +252,23 @@ Output exactly one JSON object whose only top-level field is items: {"items":[..
 Each items entry must contain exactly target_id, kind, and recognition:
 - target_id must reproduce the authorized ID verbatim.
 - kind must be question or non_question.
-- When kind=question, recognition must be a problem_kind=standalone recognition object. Its source-numbering fields must exactly match the authorized list. Copy only printed text into the question and only text already written by the student into the answer.
+- When kind=question, recognition must be a problem_kind=standalone recognition object. Its source-numbering and source-section fields must exactly match the authorized list. Copy only printed text into the question and only text already written by the student into the answer.
+- For every standalone recognition, parent_problem_id and subproblem_no must both be empty strings. Printed numbering belongs only in source_number_path and display_label; never copy it into subproblem_no.
 - When kind=non_question, recognition must be null.
 A question recognition uses these structured-recognition fields: problem_id, problem_kind, parent_problem_id, subproblem_no, source_number_path, display_label, source_section_path, source_section_label, question, canonical_markdown, subject, knowledge_points, answer_state, student_answer, answer_canonical_markdown, recognition_confidence, ocr_signals, evidence_transcriptions, answer_evidence_transcriptions. Do not output any field outside this list.
+Printed numbers in the question, choices, or candidate list are never student answers merely because they are visible. For fill-in prompts such as 划去数（ ）, present is allowed only when separate handwriting is visibly written inside or beside the blank, or in an independent working area. With no separate handwriting, return blank with empty student_answer and answer_canonical_markdown; never solve the problem or copy a printed candidate. answer_evidence_transcriptions may contain only independently visible student handwriting.
 answer_state must be blank, present, or unclear. present requires a legible student_answer; blank and unclear require an empty student_answer. subject must be 数学, 语文, 英语, 物理, 化学, or empty.
 The authorized target list, in order, follows:
 `
 
 var recognitionLayoutManifestTargetFieldsV2 = map[string]struct{}{
-	"manifest_ref":       {},
-	"manifest_order":     {},
-	"source_number_path": {},
-	"display_label":      {},
-	"region":             {},
+	"manifest_ref":         {},
+	"manifest_order":       {},
+	"source_number_path":   {},
+	"display_label":        {},
+	"source_section_path":  {},
+	"source_section_label": {},
+	"region":               {},
 }
 
 var recognitionLayoutRegionFieldsV2 = map[string]struct{}{
@@ -1462,19 +1467,25 @@ func buildRecognitionLayoutBatchPromptV2(
 	targets []k12.RecognitionLayoutTargetV2,
 ) (string, error) {
 	descriptors := make([]struct {
-		TargetID         string   `json:"target_id"`
-		SourceNumberPath []string `json:"source_number_path"`
-		DisplayLabel     string   `json:"display_label"`
+		TargetID           string   `json:"target_id"`
+		SourceNumberPath   []string `json:"source_number_path"`
+		DisplayLabel       string   `json:"display_label"`
+		SourceSectionPath  []string `json:"source_section_path"`
+		SourceSectionLabel string   `json:"source_section_label"`
 	}, 0, len(targets))
 	for _, target := range targets {
 		descriptors = append(descriptors, struct {
-			TargetID         string   `json:"target_id"`
-			SourceNumberPath []string `json:"source_number_path"`
-			DisplayLabel     string   `json:"display_label"`
+			TargetID           string   `json:"target_id"`
+			SourceNumberPath   []string `json:"source_number_path"`
+			DisplayLabel       string   `json:"display_label"`
+			SourceSectionPath  []string `json:"source_section_path"`
+			SourceSectionLabel string   `json:"source_section_label"`
 		}{
-			TargetID:         target.TargetID,
-			SourceNumberPath: append([]string(nil), target.SourceNumberPath...),
-			DisplayLabel:     target.DisplayLabel,
+			TargetID:           target.TargetID,
+			SourceNumberPath:   append([]string(nil), target.SourceNumberPath...),
+			DisplayLabel:       target.DisplayLabel,
+			SourceSectionPath:  append([]string(nil), target.SourceSectionPath...),
+			SourceSectionLabel: target.SourceSectionLabel,
 		})
 	}
 	encoded, err := json.Marshal(descriptors)
@@ -1531,10 +1542,14 @@ func parseRecognitionLayoutManifestTargetV2(
 	var manifestOrder *int
 	var sourceNumberPath []string
 	var displayLabel *string
+	var sourceSectionPath []string
+	var sourceSectionLabel *string
 	if json.Unmarshal(fields["manifest_ref"], &manifestRef) != nil || manifestRef == nil ||
 		json.Unmarshal(fields["manifest_order"], &manifestOrder) != nil || manifestOrder == nil ||
 		json.Unmarshal(fields["source_number_path"], &sourceNumberPath) != nil || sourceNumberPath == nil ||
-		json.Unmarshal(fields["display_label"], &displayLabel) != nil || displayLabel == nil {
+		json.Unmarshal(fields["display_label"], &displayLabel) != nil || displayLabel == nil ||
+		json.Unmarshal(fields["source_section_path"], &sourceSectionPath) != nil || sourceSectionPath == nil ||
+		json.Unmarshal(fields["source_section_label"], &sourceSectionLabel) != nil || sourceSectionLabel == nil {
 		return k12.RecognitionLayoutManifestTargetV2{}, fmt.Errorf("field type is invalid")
 	}
 	region, err := parseRecognitionLayoutRegionV2(fields["region"])
@@ -1542,11 +1557,13 @@ func parseRecognitionLayoutManifestTargetV2(
 		return k12.RecognitionLayoutManifestTargetV2{}, err
 	}
 	return k12.RecognitionLayoutManifestTargetV2{
-		ManifestRef:      *manifestRef,
-		ManifestOrder:    *manifestOrder,
-		SourceNumberPath: append([]string(nil), sourceNumberPath...),
-		DisplayLabel:     *displayLabel,
-		Region:           region,
+		ManifestRef:        *manifestRef,
+		ManifestOrder:      *manifestOrder,
+		SourceNumberPath:   append([]string(nil), sourceNumberPath...),
+		DisplayLabel:       *displayLabel,
+		SourceSectionPath:  append([]string(nil), sourceSectionPath...),
+		SourceSectionLabel: *sourceSectionLabel,
+		Region:             region,
 	}, nil
 }
 
@@ -1855,13 +1872,20 @@ func recognitionLayoutQuestionSourceIdentityV2(
 	}
 	var sourceNumberPath []string
 	var displayLabel *string
+	var sourceSectionPath []string
+	var sourceSectionLabel *string
 	if json.Unmarshal(fields["source_number_path"], &sourceNumberPath) != nil ||
 		json.Unmarshal(fields["display_label"], &displayLabel) != nil ||
-		displayLabel == nil {
+		displayLabel == nil ||
+		json.Unmarshal(fields["source_section_path"], &sourceSectionPath) != nil ||
+		json.Unmarshal(fields["source_section_label"], &sourceSectionLabel) != nil ||
+		sourceSectionLabel == nil {
 		return false, false
 	}
 	return !slices.Equal(sourceNumberPath, target.SourceNumberPath) ||
-		*displayLabel != target.DisplayLabel, true
+		*displayLabel != target.DisplayLabel ||
+		!slices.Equal(sourceSectionPath, target.SourceSectionPath) ||
+		*sourceSectionLabel != target.SourceSectionLabel, true
 }
 
 func parseRecognitionLayoutQuestionV2(
@@ -1874,7 +1898,8 @@ func parseRecognitionLayoutQuestionV2(
 		return usecase.RecognizedQuestion{}, fmt.Errorf("recognition fields are invalid")
 	}
 	for _, required := range []string{
-		"problem_kind", "source_number_path", "display_label", "question",
+		"problem_kind", "source_number_path", "display_label",
+		"source_section_path", "source_section_label", "question",
 	} {
 		if _, exists := fields[required]; !exists {
 			return usecase.RecognizedQuestion{}, fmt.Errorf("recognition is missing %s", required)
@@ -1883,7 +1908,7 @@ func parseRecognitionLayoutQuestionV2(
 	sourceConflict, sourceValid := recognitionLayoutQuestionSourceIdentityV2(raw, target)
 	if !sourceValid {
 		return usecase.RecognizedQuestion{}, fmt.Errorf(
-			"recognition source numbering types are invalid",
+			"recognition source identity types are invalid",
 		)
 	}
 	if sourceConflict {

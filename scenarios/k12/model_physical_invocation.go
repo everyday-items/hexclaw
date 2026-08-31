@@ -632,6 +632,18 @@ func ValidateRecognitionLayoutPlanV2(plan RecognitionLayoutPlanV2) error {
 				index+1,
 			)
 		}
+		if err := validateRecognitionLayoutSourceNumberV2(
+			target.SourceNumberPath,
+			target.DisplayLabel,
+		); err != nil {
+			return err
+		}
+		if err := validateRecognitionLayoutSourceSectionV2(
+			target.SourceSectionPath,
+			target.SourceSectionLabel,
+		); err != nil {
+			return err
+		}
 		targetIDs[index] = target.TargetID
 	}
 	if _, err := RecognitionLayoutTargetExactSetDigestV2(targetIDs); err != nil {

@@ -357,12 +357,13 @@ func (d Deps) gradingFinalArtifactPrintRequest(
 	artifact k12.GradingFinalArtifact,
 	title string,
 ) (PreparePrintableArtifactRequest, error) {
+	canonical := d.gradingFinalArtifactPrintableMarkdown(ctx, artifact)
 	req := PreparePrintableArtifactRequest{
 		AgentName:         artifact.AgentName,
 		SourceKind:        k12.PrintSourceGradingFinalArtifact,
 		SourceRef:         "final_artifact:" + artifact.ArtifactID + ":" + artifact.ArtifactDigest,
 		Title:             title,
-		CanonicalMarkdown: artifact.CanonicalMarkdown,
+		CanonicalMarkdown: canonical,
 	}
 	if !artifact.HasAnnotatedAsset() {
 		return req, nil
@@ -376,7 +377,7 @@ func (d Deps) gradingFinalArtifactPrintRequest(
 	imageMarkdown := "![](data:" + annotated.MIME + ";base64," +
 		base64.StdEncoding.EncodeToString(annotated.Data) + "){width=92%}"
 	const heading = "# 作业批改结果"
-	canonical := strings.TrimSpace(artifact.CanonicalMarkdown)
+	canonical = strings.TrimSpace(canonical)
 	if strings.HasPrefix(canonical, heading) {
 		body := strings.TrimSpace(strings.TrimPrefix(canonical, heading))
 		req.RenderMarkdown = heading + "\n\n" + imageMarkdown
@@ -387,6 +388,82 @@ func (d Deps) gradingFinalArtifactPrintRequest(
 		req.RenderMarkdown = imageMarkdown + "\n\n" + canonical
 	}
 	return req, nil
+}
+
+// gradingFinalArtifactPrintableMarkdown 只在当前结构化回执仍与冻结摘要完全一致时，
+// 用现行用户投影重放历史结果；批改事实和 final artifact 本身保持只读。
+func (d Deps) gradingFinalArtifactPrintableMarkdown(
+	ctx context.Context,
+	artifact k12.GradingFinalArtifact,
+) string {
+	orchestrator := &GradingOrchestrator{deps: d}
+	questions, ok := orchestrator.typedRecognizedQuestions(
+		ctx, artifact.JobID, artifact.AgentName,
+	)
+	if !ok {
+		return artifact.CanonicalMarkdown
+	}
+	questions = RecognizedQuestionsForAssessment(questions)
+	assessments, err := d.Records.ListGradingAssessmentItems(
+		ctx, artifact.AgentName, artifact.JobID,
+	)
+	if err != nil {
+		return artifact.CanonicalMarkdown
+	}
+	skips, err := d.Records.ListCurrentProblemSkipReceipts(
+		ctx, artifact.AgentName, artifact.JobID,
+	)
+	if err != nil {
+		return artifact.CanonicalMarkdown
+	}
+	assessmentByProblem := make(map[string]k12.GradingAssessmentItem, len(assessments))
+	for _, assessment := range assessments {
+		assessmentByProblem[assessment.ProblemID] = assessment
+	}
+	skipByProblem := make(map[string]k12.ProblemSkipReceipt, len(skips))
+	for _, skip := range skips {
+		skipByProblem[skip.ProblemID] = skip
+	}
+	entries := make([]gradingFinalEntry, 0, len(questions))
+	orderedDigests := make([]string, 0, len(questions))
+	publishedCount, skippedCount := 0, 0
+	for _, question := range questions {
+		assessment, hasAssessment := assessmentByProblem[question.ProblemID]
+		skip, hasSkip := skipByProblem[question.ProblemID]
+		if hasAssessment == hasSkip {
+			return artifact.CanonicalMarkdown
+		}
+		entry := gradingFinalEntry{question: question}
+		if hasAssessment {
+			if assessment.CurrentDisposition != k12.GradingAssessmentDispositionCurrent ||
+				assessment.ConfirmedVersion != question.ConfirmedVersion ||
+				assessment.InputRevision != question.ConfirmedVersion {
+				return artifact.CanonicalMarkdown
+			}
+			entry.assessment = &assessment
+			orderedDigests = append(orderedDigests, assessment.ResultDigest)
+			publishedCount++
+			delete(assessmentByProblem, question.ProblemID)
+		} else {
+			if skip.CurrentDisposition != k12.GradingAssessmentDispositionCurrent ||
+				skip.InputRevision != question.ConfirmedVersion {
+				return artifact.CanonicalMarkdown
+			}
+			entry.skip = &skip
+			orderedDigests = append(orderedDigests, skip.ResultDigest)
+			skippedCount++
+			delete(skipByProblem, question.ProblemID)
+		}
+		entries = append(entries, entry)
+	}
+	orderedJSON, err := json.Marshal(orderedDigests)
+	if err != nil || len(assessmentByProblem) != 0 || len(skipByProblem) != 0 ||
+		len(entries) != artifact.TotalCount || publishedCount != artifact.PublishedCount ||
+		skippedCount != artifact.SkippedCount ||
+		string(orderedJSON) != strings.TrimSpace(artifact.OrderedCurrentDigestsJSON) {
+		return artifact.CanonicalMarkdown
+	}
+	return renderCanonicalGradingFinal(entries, nil)
 }
 
 func (d Deps) getExactGradingFinalArtifact(

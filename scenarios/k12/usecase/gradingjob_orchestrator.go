@@ -308,9 +308,14 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 	} else {
 		var trustedRecognitionPolicy *k12.GradingBudgetSnapshot
 		if o.deps.GradingBudgetSnapshot.IsFrozen() {
+			var taskIntent PhotoTaskIntent
+			if strings.TrimSpace(in.SourceKind) == "image_task" {
+				taskIntent = in.Photo.TaskIntent
+			}
 			selected, selectErr := trustedPhotoRecognitionCreationPolicy(
 				o.deps.GradingBudgetSnapshot,
 				in.Photo.Image,
+				taskIntent,
 			)
 			if selectErr != nil {
 				return GradingJobView{}, false, fmt.Errorf(
@@ -377,6 +382,7 @@ func (o *GradingOrchestrator) StartPhotoGradingJob(ctx context.Context, in Start
 func trustedPhotoRecognitionCreationPolicy(
 	trusted k12.GradingBudgetSnapshot,
 	image []byte,
+	taskIntent PhotoTaskIntent,
 ) (k12.GradingBudgetSnapshot, error) {
 	if err := trusted.Validate(); err != nil {
 		return k12.GradingBudgetSnapshot{}, err
@@ -385,7 +391,8 @@ func trustedPhotoRecognitionCreationPolicy(
 	case k12.RecognitionPlanVersionV1:
 		return trusted, nil
 	case k12.RecognitionPlanVersionV2:
-		if k12.ClassifyRecognitionPage(image) == k12.RecognitionPageDense {
+		if taskIntent != PhotoTaskBlankWorksheet &&
+			k12.ClassifyRecognitionPage(image) == k12.RecognitionPageDense {
 			return trusted, nil
 		}
 		selected := trusted

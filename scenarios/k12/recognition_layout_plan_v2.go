@@ -43,11 +43,13 @@ type RecognitionLayoutManifestSuccessV2 struct {
 // RecognitionLayoutManifestTargetV2 是从模型接收的受限语义输出。
 // ManifestRef 仅为响应内引用，校验后即丢弃；持久 TargetID 由服务端派生。
 type RecognitionLayoutManifestTargetV2 struct {
-	ManifestRef      string            `json:"manifest_ref"`
-	ManifestOrder    int               `json:"manifest_order"`
-	SourceNumberPath []string          `json:"source_number_path"`
-	DisplayLabel     string            `json:"display_label"`
-	Region           SourcePixelRegion `json:"region"`
+	ManifestRef        string            `json:"manifest_ref"`
+	ManifestOrder      int               `json:"manifest_order"`
+	SourceNumberPath   []string          `json:"source_number_path"`
+	DisplayLabel       string            `json:"display_label"`
+	SourceSectionPath  []string          `json:"source_section_path,omitempty"`
+	SourceSectionLabel string            `json:"source_section_label,omitempty"`
+	Region             SourcePixelRegion `json:"region"`
 }
 
 type RecognitionLayoutPlanInputV2 struct {
@@ -59,11 +61,13 @@ type RecognitionLayoutPlanInputV2 struct {
 // RecognitionLayoutTargetV2 仅包含本地派生的持久事实。
 // 源裁剪字节或模型选择的持久标识均不会进入计划。
 type RecognitionLayoutTargetV2 struct {
-	TargetID         string            `json:"target_id"`
-	SourceNumberPath []string          `json:"source_number_path"`
-	DisplayLabel     string            `json:"display_label"`
-	Region           SourcePixelRegion `json:"region"`
-	CropDigest       string            `json:"crop_digest"`
+	TargetID           string            `json:"target_id"`
+	SourceNumberPath   []string          `json:"source_number_path"`
+	DisplayLabel       string            `json:"display_label"`
+	SourceSectionPath  []string          `json:"source_section_path,omitempty"`
+	SourceSectionLabel string            `json:"source_section_label,omitempty"`
+	Region             SourcePixelRegion `json:"region"`
+	CropDigest         string            `json:"crop_digest"`
 }
 
 type RecognitionLayoutBatchV2 struct {
@@ -119,6 +123,27 @@ func BuildRecognitionLayoutPlanV2(input RecognitionLayoutPlanInputV2) (Recogniti
 	if targetErr := validateRecognitionLayoutManifestTargetsV2(targets, pageBounds); targetErr != nil {
 		return RecognitionLayoutPlanV2{}, targetErr
 	}
+	for index := range targets {
+		region := targets[index].Region
+		rightmost := true
+		for otherIndex := range targets {
+			if otherIndex == index {
+				continue
+			}
+			other := targets[otherIndex].Region
+			verticalOverlap := region.Y < other.Y+other.Height &&
+				other.Y < region.Y+region.Height
+			if verticalOverlap && other.X > region.X {
+				rightmost = false
+				break
+			}
+		}
+		if rightmost {
+			// 页边最右题目的手写答案可能越出模型紧框；只补一段页内右侧证据上下文。
+			region.Width += min(region.Height, pageBounds.Dx()-region.X-region.Width)
+			targets[index].Region = region
+		}
+	}
 	sort.SliceStable(targets, func(left, right int) bool {
 		if targets[left].Region.Y != targets[right].Region.Y {
 			return targets[left].Region.Y < targets[right].Region.Y
@@ -148,10 +173,12 @@ func BuildRecognitionLayoutPlanV2(input RecognitionLayoutPlanInputV2) (Recogniti
 				index+1,
 				target.Region,
 			),
-			SourceNumberPath: append([]string{}, target.SourceNumberPath...),
-			DisplayLabel:     target.DisplayLabel,
-			Region:           target.Region,
-			CropDigest:       recognitionLayoutSHA256(crop),
+			SourceNumberPath:   append([]string{}, target.SourceNumberPath...),
+			DisplayLabel:       target.DisplayLabel,
+			SourceSectionPath:  append([]string{}, target.SourceSectionPath...),
+			SourceSectionLabel: target.SourceSectionLabel,
+			Region:             target.Region,
+			CropDigest:         recognitionLayoutSHA256(crop),
 		})
 	}
 
@@ -455,6 +482,12 @@ func validateRecognitionLayoutManifestTargetsV2(
 		); err != nil {
 			return err
 		}
+		if err := validateRecognitionLayoutSourceSectionV2(
+			target.SourceSectionPath,
+			target.SourceSectionLabel,
+		); err != nil {
+			return err
+		}
 		if err := validateRecognitionLayoutRegionV2(target.Region, pageBounds); err != nil {
 			return err
 		}
@@ -502,6 +535,31 @@ func validateRecognitionLayoutSourceNumberV2(path []string, label string) error 
 		if token == "" || strings.TrimSpace(token) != token {
 			return fmt.Errorf(
 				"%w: source number path contains an empty or non-canonical token",
+				ErrRecognitionLayoutPlanInvalid,
+			)
+		}
+	}
+	return nil
+}
+
+func validateRecognitionLayoutSourceSectionV2(path []string, label string) error {
+	labelPresent := label != ""
+	if labelPresent && strings.TrimSpace(label) != label {
+		return fmt.Errorf(
+			"%w: source section label is non-canonical",
+			ErrRecognitionLayoutPlanInvalid,
+		)
+	}
+	if (len(path) > 0) != labelPresent {
+		return fmt.Errorf(
+			"%w: source section path and label must be paired",
+			ErrRecognitionLayoutPlanInvalid,
+		)
+	}
+	for _, token := range path {
+		if token == "" || strings.TrimSpace(token) != token {
+			return fmt.Errorf(
+				"%w: source section path contains an empty or non-canonical token",
 				ErrRecognitionLayoutPlanInvalid,
 			)
 		}
