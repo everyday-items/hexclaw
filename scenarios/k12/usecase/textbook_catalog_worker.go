@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -61,36 +62,95 @@ func (w *TextbookCatalogWorker) RunOnce(ctx context.Context) (bool, error) {
 	if err != nil || !found {
 		return false, err
 	}
+	startedAt := time.Now()
+	jobRef := shortSHA1([]byte(claim.JobID))
+	var stageMu sync.RWMutex
+	stage := "source_loading"
+	setStage := func(next string) {
+		stageMu.Lock()
+		stage = next
+		stageMu.Unlock()
+	}
+	currentStage := func() string {
+		stageMu.RLock()
+		defer stageMu.RUnlock()
+		return stage
+	}
+	logResult := func(status, finalStage, failureCode string, resultErr error) {
+		args := []any{
+			"job_ref", jobRef,
+			"status", status,
+			"stage", finalStage,
+			"elapsed_ms", time.Since(startedAt).Milliseconds(),
+			"attempt", claim.Attempt,
+		}
+		if failureCode != "" {
+			args = append(args, "failure_code", failureCode)
+		}
+		if resultErr != nil {
+			args = append(args, "error_type", fmt.Sprintf("%T", resultErr))
+		}
+		slog.Info("K12 textbook catalog job finished", args...)
+	}
+	slog.Info("K12 textbook catalog job started",
+		"job_ref", jobRef,
+		"status", "started",
+		"stage", stage,
+		"elapsed_ms", int64(0),
+		"attempt", claim.Attempt)
 	if claim.Attempt < 1 || claim.Attempt > w.config.MaxAttempts {
 		err = fmt.Errorf("catalog attempt %d exceeds bounded policy", claim.Attempt)
-		return true, w.recordFailure(ctx, claim, err, true)
+		resultErr := w.recordFailure(ctx, claim, err, true)
+		logResult("failed", "attempt_rejected", "catalog_transient_failure", resultErr)
+		return true, resultErr
 	}
 
 	operationCtx, cancel := context.WithTimeout(ctx, w.config.ExtractTimeout)
 	defer cancel()
-	stopHeartbeat := w.startHeartbeat(operationCtx, cancel, claim)
+	stopHeartbeat := w.startHeartbeat(
+		operationCtx, cancel, claim, startedAt, jobRef, currentStage,
+	)
 	source, err := w.repository.LoadTextbookCatalogSource(operationCtx, claim, w.now())
 	var publication k12storage.TextbookCatalogPublication
 	if err == nil {
+		setStage("extracting")
 		publication, err = w.extractor.Extract(operationCtx, source)
 	}
 	if heartbeatErr := stopHeartbeat(); heartbeatErr != nil {
+		logResult("failed", "heartbeat", "heartbeat_failed", heartbeatErr)
 		return true, heartbeatErr
 	}
 	if err == nil {
+		setStage("publishing")
 		err = w.repository.PublishTextbookCatalog(ctx, claim, publication, w.now())
 	}
 	if err == nil {
+		logResult("succeeded", "completed", "", nil)
 		return true, nil
 	}
 	if errors.Is(err, k12storage.ErrTextbookCatalogJobFenced) {
+		logResult("failed", currentStage(), "catalog_job_fenced", err)
 		return true, err
 	}
 	terminal := errors.Is(err, ErrTextbookCatalogEvidenceInsufficient) ||
 		errors.Is(err, k12storage.ErrTextbookCatalogSourceIncomplete) ||
 		errors.Is(err, records.ErrIllegalTransition) ||
 		claim.Attempt >= w.config.MaxAttempts
-	return true, w.recordFailure(ctx, claim, err, terminal)
+	failureCode := "catalog_transient_failure"
+	if errors.Is(err, ErrTextbookCatalogEvidenceInsufficient) ||
+		errors.Is(err, k12storage.ErrTextbookCatalogSourceIncomplete) ||
+		errors.Is(err, records.ErrIllegalTransition) {
+		failureCode = "catalog_evidence_incomplete"
+	}
+	resultErr := w.recordFailure(ctx, claim, err, terminal)
+	status := "retry_wait"
+	finalStage := "retry_scheduled"
+	if terminal {
+		status = "failed"
+		finalStage = "failed"
+	}
+	logResult(status, finalStage, failureCode, resultErr)
+	return true, resultErr
 }
 
 func (w *TextbookCatalogWorker) valid() error {
@@ -162,6 +222,9 @@ func (w *TextbookCatalogWorker) startHeartbeat(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	claim k12storage.TextbookCatalogJobClaim,
+	startedAt time.Time,
+	jobRef string,
+	currentStage func() string,
 ) func() error {
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -172,6 +235,7 @@ func (w *TextbookCatalogWorker) startHeartbeat(
 		defer close(done)
 		ticker := time.NewTicker(w.config.HeartbeatInterval)
 		defer ticker.Stop()
+		lastHeartbeatLog := time.Now()
 		for {
 			select {
 			case <-stop:
@@ -188,6 +252,15 @@ func (w *TextbookCatalogWorker) startHeartbeat(
 					mu.Unlock()
 					cancel()
 					return
+				}
+				if time.Since(lastHeartbeatLog) >= 30*time.Second {
+					lastHeartbeatLog = time.Now()
+					slog.Info("K12 textbook catalog job heartbeat",
+						"job_ref", jobRef,
+						"status", "running",
+						"stage", currentStage(),
+						"elapsed_ms", time.Since(startedAt).Milliseconds(),
+						"attempt", claim.Attempt)
 				}
 			}
 		}

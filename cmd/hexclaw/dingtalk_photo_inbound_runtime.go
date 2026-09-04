@@ -222,10 +222,10 @@ func (r *k12DingtalkPhotoInboundRuntime) AdmitInboundPhoto(
 		}
 		slog.Info("K12 DingTalk inbound photo admitted",
 			"stage", "admitted",
-			"agent", bundle.Receipt.AgentName,
-			"receipt_id", bundle.Receipt.ReceiptID,
+			"agent_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.AgentName),
+			"receipt_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.ReceiptID),
 			"resumed", true,
-			"duration_ms", time.Since(startedAt).Milliseconds(),
+			"elapsed_ms", time.Since(startedAt).Milliseconds(),
 		)
 		r.schedule(bundle.Receipt.AgentName, bundle.Receipt.ReceiptID)
 		return true, nil
@@ -273,10 +273,10 @@ func (r *k12DingtalkPhotoInboundRuntime) AdmitInboundPhoto(
 	}
 	slog.Info("K12 DingTalk inbound photo admitted",
 		"stage", "admitted",
-		"agent", bundle.Receipt.AgentName,
-		"receipt_id", bundle.Receipt.ReceiptID,
+		"agent_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.AgentName),
+		"receipt_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.ReceiptID),
 		"resumed", false,
-		"duration_ms", time.Since(startedAt).Milliseconds(),
+		"elapsed_ms", time.Since(startedAt).Milliseconds(),
 	)
 	r.schedule(bundle.Receipt.AgentName, bundle.Receipt.ReceiptID)
 	return true, nil
@@ -329,16 +329,16 @@ func (r *k12DingtalkPhotoInboundRuntime) run(agentName, receiptID string) {
 		if err != nil {
 			if !errors.Is(err, records.ErrVersionConflict) {
 				slog.Warn("K12 DingTalk inbound photo worker will retry",
-					"agent", agentName,
-					"receipt", receiptID,
-					"dispatch_id", bundle.Dispatch.DispatchID,
-					"image_task_id", bundle.Dispatch.ImageTaskID,
-					"delivery_batch_id", bundle.Dispatch.DeliveryBatchID,
+					"agent_ref", k12DingtalkPhotoRestartCheckpointValueDigest(agentName),
+					"receipt_ref", k12DingtalkPhotoRestartCheckpointValueDigest(receiptID),
+					"dispatch_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Dispatch.DispatchID),
+					"image_task_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Dispatch.ImageTaskID),
+					"delivery_batch_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Dispatch.DeliveryBatchID),
 					"processing_status", bundle.Dispatch.ProcessingStatus,
 					"routing_decision", bundle.Dispatch.RoutingDecision,
 					"reply_status", bundle.Dispatch.ReplyStatus,
 					"terminal_status", bundle.Dispatch.TerminalStatus,
-					"attempt_duration_ms", time.Since(attemptStartedAt).Milliseconds(),
+					"elapsed_ms", time.Since(attemptStartedAt).Milliseconds(),
 					"error_type", fmt.Sprintf("%T", err),
 				)
 			}
@@ -449,10 +449,10 @@ func (r *k12DingtalkPhotoInboundRuntime) createAndBindImageTask(
 	}
 	slog.Info("K12 DingTalk inbound photo image task submitted",
 		"stage", "image_task_submitted",
-		"agent", bundle.Receipt.AgentName,
-		"receipt_id", bundle.Receipt.ReceiptID,
-		"dispatch_id", view.Dispatch.DispatchID,
-		"page_asset_id", ready.Metadata.PageAssetID,
+		"agent_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.AgentName),
+		"receipt_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.ReceiptID),
+		"dispatch_ref", k12DingtalkPhotoRestartCheckpointValueDigest(view.Dispatch.DispatchID),
+		"page_asset_ref", k12DingtalkPhotoRestartCheckpointValueDigest(ready.Metadata.PageAssetID),
 		"provider", command.Provider,
 		"model", command.Model,
 	)
@@ -592,7 +592,6 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceImageTask(
 		r.imageTasks.StartAsync(bundle.Receipt.AgentName, bundle.Dispatch.ImageTaskID)
 		return false, nil
 	}
-	r.imageTasks.StartAsync(bundle.Receipt.AgentName, bundle.Dispatch.ImageTaskID)
 	result, err := r.imageTasks.Result(
 		ctx, bundle.Receipt.AgentName, bundle.Dispatch.ImageTaskID,
 	)
@@ -600,6 +599,9 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceImageTask(
 		return false, err
 	}
 	if result.FinalArtifact == nil {
+		if view.Homework == nil || strings.TrimSpace(view.Homework.GradingJobID) == "" {
+			r.imageTasks.StartAsync(bundle.Receipt.AgentName, bundle.Dispatch.ImageTaskID)
+		}
 		return false, nil
 	}
 	if bundle.Dispatch.RoutingDecision == k12usecase.InboundPhotoRoutePending {
@@ -633,10 +635,10 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceImageTask(
 	}
 	slog.Info("K12 DingTalk inbound photo final artifact ready",
 		"stage", "final_artifact_ready",
-		"agent", bundle.Receipt.AgentName,
-		"receipt_id", bundle.Receipt.ReceiptID,
-		"image_task_id", bundle.Dispatch.ImageTaskID,
-		"final_artifact_id", result.FinalArtifact.ArtifactID,
+		"agent_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.AgentName),
+		"receipt_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.ReceiptID),
+		"image_task_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Dispatch.ImageTaskID),
+		"final_artifact_ref", k12DingtalkPhotoRestartCheckpointValueDigest(result.FinalArtifact.ArtifactID),
 	)
 	return false, nil
 }
@@ -808,12 +810,6 @@ func (r *k12DingtalkPhotoInboundRuntime) sendRoutingConfirmation(
 			content = k12PhotoRoutingCandidateText(snapshot)
 		}
 	}
-	slog.Info("K12 DingTalk inbound photo routing confirmation prepared",
-		"stage", "routing_confirmation_prepared",
-		"agent", bundle.Receipt.AgentName,
-		"receipt_id", bundle.Receipt.ReceiptID,
-		"routing_decision", bundle.Dispatch.RoutingDecision,
-	)
 	startedAt := time.Now()
 	batch, _, err := r.replyBatches.PrepareAndSendMessageBatchForTargets(
 		ctx, bundle.Receipt.AgentName, k12DingtalkPhotoRoutingObjectKind,
@@ -821,20 +817,18 @@ func (r *k12DingtalkPhotoInboundRuntime) sendRoutingConfirmation(
 		k12usecase.DeliveryMessage{Content: content},
 		[]k12usecase.ResolvedDeliveryTarget{inboundPhotoFrozenTarget(bundle)},
 	)
-	log := slog.Info
 	if err != nil {
-		log = slog.Warn
+		return err
 	}
-	log("K12 DingTalk inbound photo routing confirmation send result",
+	slog.Info("K12 DingTalk inbound photo routing confirmation send result",
 		"stage", "routing_confirmation_send_result",
-		"agent", bundle.Receipt.AgentName,
-		"receipt_id", bundle.Receipt.ReceiptID,
-		"delivery_batch_id", batch.BatchID,
+		"agent_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.AgentName),
+		"receipt_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.ReceiptID),
+		"delivery_batch_ref", k12DingtalkPhotoRestartCheckpointValueDigest(batch.BatchID),
 		"delivery_status", batch.Status,
-		"duration_ms", time.Since(startedAt).Milliseconds(),
-		"error_type", fmt.Sprintf("%T", err),
+		"elapsed_ms", time.Since(startedAt).Milliseconds(),
 	)
-	return err
+	return nil
 }
 
 func validateInboundFinalArtifact(
@@ -916,9 +910,9 @@ func (r *k12DingtalkPhotoInboundRuntime) completeBoundReply(
 	}
 	slog.Info("K12 DingTalk inbound photo reply delivered",
 		"stage", "reply_delivered",
-		"agent", bundle.Receipt.AgentName,
-		"receipt_id", bundle.Receipt.ReceiptID,
-		"delivery_batch_id", bundle.Dispatch.DeliveryBatchID,
+		"agent_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.AgentName),
+		"receipt_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.ReceiptID),
+		"delivery_batch_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Dispatch.DeliveryBatchID),
 		"delivery_status", batch.Status,
 		"part_count", len(batch.Receipts),
 	)
@@ -1005,10 +999,10 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceFinalReply(
 		bundle.Dispatch = bound
 		slog.Info("K12 DingTalk inbound photo delivery batch bound",
 			"stage", "delivery_batch_bound",
-			"agent", bundle.Receipt.AgentName,
-			"receipt_id", bundle.Receipt.ReceiptID,
-			"final_artifact_id", artifact.ArtifactID,
-			"delivery_batch_id", existing.BatchID,
+			"agent_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.AgentName),
+			"receipt_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.ReceiptID),
+			"final_artifact_ref", k12DingtalkPhotoRestartCheckpointValueDigest(artifact.ArtifactID),
+			"delivery_batch_ref", k12DingtalkPhotoRestartCheckpointValueDigest(existing.BatchID),
 			"delivery_status", existing.Status,
 			"reused", true,
 		)
@@ -1031,13 +1025,13 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceFinalReply(
 		bundle.Dispatch = bound
 		slog.Info("K12 DingTalk inbound photo delivery batch bound",
 			"stage", "delivery_batch_bound",
-			"agent", bundle.Receipt.AgentName,
-			"receipt_id", bundle.Receipt.ReceiptID,
-			"final_artifact_id", artifact.ArtifactID,
-			"delivery_batch_id", batch.BatchID,
+			"agent_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.AgentName),
+			"receipt_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.ReceiptID),
+			"final_artifact_ref", k12DingtalkPhotoRestartCheckpointValueDigest(artifact.ArtifactID),
+			"delivery_batch_ref", k12DingtalkPhotoRestartCheckpointValueDigest(batch.BatchID),
 			"delivery_status", batch.Status,
 			"reused", false,
-			"delivery_duration_ms", time.Since(deliveryStartedAt).Milliseconds(),
+			"elapsed_ms", time.Since(deliveryStartedAt).Milliseconds(),
 			"send_error", deliverErr != nil,
 		)
 	}
@@ -1064,10 +1058,10 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceFinalReply(
 	}
 	slog.Info("K12 DingTalk inbound photo reply delivered",
 		"stage", "reply_delivered",
-		"agent", bundle.Receipt.AgentName,
-		"receipt_id", bundle.Receipt.ReceiptID,
-		"final_artifact_id", artifact.ArtifactID,
-		"delivery_batch_id", bundle.Dispatch.DeliveryBatchID,
+		"agent_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.AgentName),
+		"receipt_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Receipt.ReceiptID),
+		"final_artifact_ref", k12DingtalkPhotoRestartCheckpointValueDigest(artifact.ArtifactID),
+		"delivery_batch_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Dispatch.DeliveryBatchID),
 		"delivery_status", batch.Status,
 		"part_count", len(batch.Receipts),
 	)

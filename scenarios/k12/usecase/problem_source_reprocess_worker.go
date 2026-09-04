@@ -234,6 +234,31 @@ func (w *ProblemSourceReprocessWorker) RunOnce(ctx context.Context) (bool, error
 	if err != nil || !claimed {
 		return false, err
 	}
+	startedAt := time.Now()
+	jobRef := shortSHA1([]byte(job.WorkID))
+	slog.Info("K12 source reprocess job started",
+		"job_ref", jobRef,
+		"status", "started",
+		"stage", "processing",
+		"elapsed_ms", int64(0),
+		"attempt", job.AttemptCount)
+	lastHeartbeatLog := time.Now()
+	logResult := func(status, stage, failureCode string, resultErr error) {
+		args := []any{
+			"job_ref", jobRef,
+			"status", status,
+			"stage", stage,
+			"elapsed_ms", time.Since(startedAt).Milliseconds(),
+			"attempt", job.AttemptCount,
+		}
+		if failureCode != "" {
+			args = append(args, "failure_code", failureCode)
+		}
+		if resultErr != nil {
+			args = append(args, "error_type", fmt.Sprintf("%T", resultErr))
+		}
+		slog.Info("K12 source reprocess job finished", args...)
+	}
 
 	processErr, heartbeatErr := w.processWithHeartbeat(
 		ctx,
@@ -242,6 +267,15 @@ func (w *ProblemSourceReprocessWorker) RunOnce(ctx context.Context) (bool, error
 			_, heartbeatErr := w.Records.HeartbeatProblemSourceReprocessJob(
 				heartbeatCtx, job.Lease(), w.now(), leaseDuration,
 			)
+			if heartbeatErr == nil && time.Since(lastHeartbeatLog) >= 30*time.Second {
+				lastHeartbeatLog = time.Now()
+				slog.Info("K12 source reprocess job heartbeat",
+					"job_ref", jobRef,
+					"status", "running",
+					"stage", "processing",
+					"elapsed_ms", time.Since(startedAt).Milliseconds(),
+					"attempt", job.AttemptCount)
+			}
 			return heartbeatErr
 		},
 		func(processCtx context.Context) error {
@@ -254,12 +288,15 @@ func (w *ProblemSourceReprocessWorker) RunOnce(ctx context.Context) (bool, error
 				context.WithoutCancel(ctx), problemSourceReprocessCommitTimeout,
 			)
 			defer cancelCommit()
-			return true, w.Records.ReleaseProblemSourceReprocessJob(
+			resultErr := w.Records.ReleaseProblemSourceReprocessJob(
 				commitCtx, job.Lease(), w.now(),
 			)
+			logResult("released", "lease_released", "", resultErr)
+			return true, resultErr
 		}
 		// The old worker no longer has authority. In particular, never translate
 		// a fencing loss into a second terminal mutation.
+		logResult("failed", "heartbeat", "heartbeat_failed", heartbeatErr)
 		return true, heartbeatErr
 	}
 
@@ -269,9 +306,11 @@ func (w *ProblemSourceReprocessWorker) RunOnce(ctx context.Context) (bool, error
 	)
 	defer cancelCommit()
 	if processErr == nil {
-		return true, w.Records.CompleteProblemSourceReprocessSucceeded(
+		resultErr := w.Records.CompleteProblemSourceReprocessSucceeded(
 			commitCtx, job.Lease(), settledAt,
 		)
+		logResult("succeeded", "completed", "", resultErr)
+		return true, resultErr
 	}
 
 	failure := problemSourceReprocessFailure(processErr)
@@ -281,32 +320,42 @@ func (w *ProblemSourceReprocessWorker) RunOnce(ctx context.Context) (bool, error
 		if code := strings.TrimSpace(confirmation.Code); code != "" {
 			failure.Code = boundedProblemSourceReprocessText(code, 128)
 		}
-		return true, w.Records.CompleteProblemSourceReprocessNeedsConfirmation(
+		resultErr := w.Records.CompleteProblemSourceReprocessNeedsConfirmation(
 			commitCtx, job.Lease(), failure, settledAt,
 		)
+		logResult("needs_confirmation", "parked", failure.Code, resultErr)
+		return true, resultErr
 	case errors.Is(processErr, ErrGradingPhysicalCallOutcomeUnknown),
 		errors.Is(processErr, ErrRecognitionPhysicalCallOutcomeUnknown),
 		errors.Is(processErr, ErrRecognitionPhysicalCallObservedInFlight),
 		errors.Is(processErr, ErrModelInvocationRequiresReconciliation):
 		failure.Code = "provider_outcome_unknown"
 		failure.RetryAt = settledAt.Add(defaultProblemSourceReprocessReconcileGrace)
-		return true, w.Records.MarkProblemSourceReprocessOutcomeUnknown(
+		resultErr := w.Records.MarkProblemSourceReprocessOutcomeUnknown(
 			commitCtx, job.Lease(), failure, settledAt,
 		)
+		logResult("outcome_unknown", "reconciliation_scheduled", failure.Code, resultErr)
+		return true, resultErr
 	case problemSourceReprocessLifecycleInterrupted(ctx, processErr):
-		return true, w.Records.ReleaseProblemSourceReprocessJob(
+		resultErr := w.Records.ReleaseProblemSourceReprocessJob(
 			commitCtx, job.Lease(), settledAt,
 		)
+		logResult("released", "lease_released", "", resultErr)
+		return true, resultErr
 	case job.AttemptCount >= maxAttempts:
 		failure.Code = "automatic_attempts_exhausted"
-		return true, w.Records.CompleteProblemSourceReprocessNeedsConfirmation(
+		resultErr := w.Records.CompleteProblemSourceReprocessNeedsConfirmation(
 			commitCtx, job.Lease(), failure, settledAt,
 		)
+		logResult("needs_confirmation", "attempts_exhausted", failure.Code, resultErr)
+		return true, resultErr
 	default:
 		failure.RetryAt = settledAt.Add(problemSourceReprocessRetryDelay(job.AttemptCount))
-		return true, w.Records.FailProblemSourceReprocessRetryable(
+		resultErr := w.Records.FailProblemSourceReprocessRetryable(
 			commitCtx, job.Lease(), failure, settledAt,
 		)
+		logResult("retry_wait", "retry_scheduled", failure.Code, resultErr)
+		return true, resultErr
 	}
 }
 
@@ -316,6 +365,32 @@ func (w *ProblemSourceReprocessWorker) reconcileOutcomeUnknown(
 	leaseDuration time.Duration,
 	heartbeatInterval time.Duration,
 ) (bool, error) {
+	startedAt := time.Now()
+	jobRef := shortSHA1([]byte(job.WorkID))
+	attempt := job.ReconciliationAttemptCount
+	slog.Info("K12 source reprocess reconciliation started",
+		"job_ref", jobRef,
+		"status", "started",
+		"stage", "reconciling",
+		"elapsed_ms", int64(0),
+		"attempt", attempt)
+	lastHeartbeatLog := time.Now()
+	logResult := func(status, stage, failureCode string, resultErr error) {
+		args := []any{
+			"job_ref", jobRef,
+			"status", status,
+			"stage", stage,
+			"elapsed_ms", time.Since(startedAt).Milliseconds(),
+			"attempt", attempt,
+		}
+		if failureCode != "" {
+			args = append(args, "failure_code", failureCode)
+		}
+		if resultErr != nil {
+			args = append(args, "error_type", fmt.Sprintf("%T", resultErr))
+		}
+		slog.Info("K12 source reprocess reconciliation finished", args...)
+	}
 	processErr, heartbeatErr := w.processWithHeartbeat(
 		ctx,
 		heartbeatInterval,
@@ -323,6 +398,15 @@ func (w *ProblemSourceReprocessWorker) reconcileOutcomeUnknown(
 			_, heartbeatErr := w.Records.HeartbeatProblemSourceReprocessOutcomeUnknownReconciliation(
 				heartbeatCtx, job.ReconciliationLease(), w.now(), leaseDuration,
 			)
+			if heartbeatErr == nil && time.Since(lastHeartbeatLog) >= 30*time.Second {
+				lastHeartbeatLog = time.Now()
+				slog.Info("K12 source reprocess reconciliation heartbeat",
+					"job_ref", jobRef,
+					"status", "running",
+					"stage", "reconciling",
+					"elapsed_ms", time.Since(startedAt).Milliseconds(),
+					"attempt", attempt)
+			}
 			return heartbeatErr
 		},
 		func(processCtx context.Context) error {
@@ -338,10 +422,13 @@ func (w *ProblemSourceReprocessWorker) reconcileOutcomeUnknown(
 				context.WithoutCancel(ctx), problemSourceReprocessCommitTimeout,
 			)
 			defer cancelCommit()
-			return true, w.Records.ReleaseProblemSourceReprocessOutcomeUnknownReconciliation(
+			resultErr := w.Records.ReleaseProblemSourceReprocessOutcomeUnknownReconciliation(
 				commitCtx, job.ReconciliationLease(), w.now(),
 			)
+			logResult("released", "lease_released", "", resultErr)
+			return true, resultErr
 		}
+		logResult("failed", "heartbeat", "heartbeat_failed", heartbeatErr)
 		return true, heartbeatErr
 	}
 
@@ -358,12 +445,15 @@ func (w *ProblemSourceReprocessWorker) reconcileOutcomeUnknown(
 			k12storage.ProblemSourceReprocessFailure{},
 			settledAt,
 		)
+		logResult("succeeded", "reconciled", "", err)
 		return true, err
 	}
 	if problemSourceReprocessLifecycleInterrupted(ctx, processErr) {
-		return true, w.Records.ReleaseProblemSourceReprocessOutcomeUnknownReconciliation(
+		resultErr := w.Records.ReleaseProblemSourceReprocessOutcomeUnknownReconciliation(
 			commitCtx, job.ReconciliationLease(), settledAt,
 		)
+		logResult("released", "lease_released", "", resultErr)
+		return true, resultErr
 	}
 
 	failure := problemSourceReprocessFailure(processErr)
@@ -376,6 +466,7 @@ func (w *ProblemSourceReprocessWorker) reconcileOutcomeUnknown(
 		failure,
 		settledAt,
 	)
+	logResult("needs_confirmation", "reconciliation_unresolved", failure.Code, err)
 	return true, err
 }
 
@@ -564,14 +655,15 @@ func (w *ProblemSourceReprocessWorker) runDrain(ctx context.Context) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			slog.Error("K12 source reprocess worker panic; durable lease will recover",
-				"panic", recovered)
+				"error_type", fmt.Sprintf("%T", recovered))
 			w.finishDrain()
 		}
 	}()
 	for {
 		processed, err := w.RunOnce(ctx)
 		if err != nil {
-			slog.Warn("K12 source reprocess worker stopped at durable checkpoint", "err", err)
+			slog.Warn("K12 source reprocess worker stopped at durable checkpoint",
+				"error_type", fmt.Sprintf("%T", err))
 			w.finishDrain()
 			return
 		}

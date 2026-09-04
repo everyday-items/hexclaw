@@ -832,11 +832,27 @@ func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
 		finishHeartbeat := func() {
 			stopHeartbeatOnce.Do(func() {
 				stopHeartbeat()
-				<-heartbeatStopped
+				timer := time.NewTimer(time.Second)
+				defer timer.Stop()
+				select {
+				case <-heartbeatStopped:
+				case <-timer.C:
+					slog.Warn("K12 ImageTask heartbeat stop timed out",
+						"stage", "heartbeat_stop_timeout",
+						"timeout_ms", int64(time.Second/time.Millisecond),
+					)
+				}
 			})
 		}
 		go func() {
 			defer close(heartbeatStopped)
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					slog.Warn("K12 ImageTask heartbeat panic",
+						"panic_type", fmt.Sprintf("%T", recovered),
+					)
+				}
+			}()
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
 			for {
