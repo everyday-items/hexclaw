@@ -220,10 +220,6 @@ func (o *GradingOrchestrator) beginTrackedContext(parent context.Context) (conte
 // 同一 Job 已在推进中时记录一次 rerun 信号，当前轮退出前至少再读一次状态机；这样确认
 // 与锚点同时回位时不会因 active 守卫吞掉最后一次续跑。panic 不逃逸（§6.15）。
 func (o *GradingOrchestrator) StartAsync(jobID string) bool {
-	jobRef := ""
-	if trimmedJobID := strings.TrimSpace(jobID); trimmedJobID != "" {
-		jobRef = shortSHA1([]byte(trimmedJobID))
-	}
 	run := o.lookup(jobID)
 	agentName := ""
 	if run != nil {
@@ -231,7 +227,8 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 	}
 	logScheduling := func(accepted bool, reason string) {
 		slog.Info("K12 GradingJob scheduling decision",
-			"job_ref", jobRef,
+			"agent_id", agentName,
+			"job_id", jobID,
 			"accepted", accepted,
 			"reason", reason,
 		)
@@ -268,29 +265,39 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 		defer o.finishWorker()
 		baseCtx := o.gradingBaseContext()
 		stage := ""
-		submissionRef := ""
-		dispatchRef := ""
+		submissionID := ""
+		dispatchID := ""
+		parentAutomaticAttemptID := ""
+		jobFields := k12.GradingJobFields{}
 		for {
 			reconciledForReplay := false
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
 						slog.Error("K12 批改任务异步推进 panic（已捕获，任务留在当前落库状态）",
-							"job_ref", jobRef,
+							"agent_id", agentName,
+							"job_id", jobID,
+							"dispatch_id", dispatchID,
+							"submission_id", submissionID,
+							"parent_automatic_attempt_id", parentAutomaticAttemptID,
+							"stage", stage,
 							"panicked", true,
 							"panic_type", fmt.Sprintf("%T", r),
+							"panic", r,
 						)
 					}
 				}()
 				if agentName != "" {
 					if current, err := o.deps.GetGradingJob(baseCtx, agentName, jobID); err == nil && current.Record != nil {
 						stage = current.Record.Status
+						jobFields = current.Fields
+						parentAutomaticAttemptID = current.Fields.ParentAutomaticAttemptID
 						if current.Fields.SubmissionID != "" {
-							submissionRef = shortSHA1([]byte(current.Fields.SubmissionID))
+							submissionID = current.Fields.SubmissionID
 							if homework, err := o.deps.Records.GetHomeworkSubmission(
 								baseCtx, agentName, current.Fields.SubmissionID,
 							); err == nil && homework.DispatchID != "" {
-								dispatchRef = shortSHA1([]byte(homework.DispatchID))
+								dispatchID = homework.DispatchID
 							}
 						}
 					}
@@ -305,40 +312,52 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 					case <-baseCtx.Done():
 						queueWaitHeartbeat.Stop()
 						slog.Info("K12 GradingJob semaphore wait stopped",
-							"job_ref", jobRef,
-							"dispatch_ref", dispatchRef,
-							"submission_ref", submissionRef,
+							"agent_id", agentName,
+							"job_id", jobID,
+							"dispatch_id", dispatchID,
+							"submission_id", submissionID,
+							"parent_automatic_attempt_id", parentAutomaticAttemptID,
 							"stage", stage,
+							"job_fields", jobFields,
 							"elapsed_ms", time.Since(queueWaitStarted).Milliseconds(),
 							"reason", "runtime_cancelled",
 						)
 						return
 					case <-queueWaitHeartbeat.C:
 						slog.Info("K12 GradingJob semaphore wait heartbeat",
-							"job_ref", jobRef,
-							"dispatch_ref", dispatchRef,
-							"submission_ref", submissionRef,
+							"agent_id", agentName,
+							"job_id", jobID,
+							"dispatch_id", dispatchID,
+							"submission_id", submissionID,
+							"parent_automatic_attempt_id", parentAutomaticAttemptID,
 							"stage", stage,
+							"job_fields", jobFields,
 							"elapsed_ms", time.Since(queueWaitStarted).Milliseconds(),
 						)
 					}
 				}
 				queueWaitHeartbeat.Stop()
 				slog.Info("K12 GradingJob semaphore acquired",
-					"job_ref", jobRef,
-					"dispatch_ref", dispatchRef,
-					"submission_ref", submissionRef,
+					"agent_id", agentName,
+					"job_id", jobID,
+					"dispatch_id", dispatchID,
+					"submission_id", submissionID,
+					"parent_automatic_attempt_id", parentAutomaticAttemptID,
 					"stage", stage,
+					"job_fields", jobFields,
 					"elapsed_ms", time.Since(queueWaitStarted).Milliseconds(),
 				)
 				defer func() { <-o.sem }()
 
 				runStarted := time.Now()
 				slog.Info("K12 GradingJob Run started",
-					"job_ref", jobRef,
-					"dispatch_ref", dispatchRef,
-					"submission_ref", submissionRef,
+					"agent_id", agentName,
+					"job_id", jobID,
+					"dispatch_id", dispatchID,
+					"submission_id", submissionID,
+					"parent_automatic_attempt_id", parentAutomaticAttemptID,
 					"stage", stage,
+					"job_fields", jobFields,
 					"elapsed_ms", int64(0),
 				)
 
@@ -354,7 +373,13 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 						case <-heartbeatStopped:
 						case <-timer.C:
 							slog.Warn("K12 GradingJob heartbeat stop timed out",
+								"agent_id", agentName,
+								"job_id", jobID,
+								"dispatch_id", dispatchID,
+								"submission_id", submissionID,
+								"parent_automatic_attempt_id", parentAutomaticAttemptID,
 								"stage", "heartbeat_stop_timeout",
+								"run_stage", stage,
 								"timeout_ms", int64(time.Second/time.Millisecond),
 							)
 						}
@@ -365,7 +390,14 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 					defer func() {
 						if recovered := recover(); recovered != nil {
 							slog.Warn("K12 GradingJob heartbeat panic",
+								"agent_id", agentName,
+								"job_id", jobID,
+								"dispatch_id", dispatchID,
+								"submission_id", submissionID,
+								"parent_automatic_attempt_id", parentAutomaticAttemptID,
+								"stage", stage,
 								"panic_type", fmt.Sprintf("%T", recovered),
+								"panic", recovered,
 							)
 						}
 					}()
@@ -377,7 +409,13 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 							return
 						case <-ticker.C:
 							heartbeatStage := stage
-							heartbeatSubmissionRef := submissionRef
+							heartbeatSubmissionID := submissionID
+							heartbeatDispatchID := dispatchID
+							heartbeatParentAutomaticAttemptID := parentAutomaticAttemptID
+							heartbeatJobFields := jobFields
+							var heartbeatQuestions []RecognizedQuestion
+							var heartbeatAttemptIDs []string
+							var heartbeatAssessmentItems []k12.GradingAssessmentItem
 							questionTotal := 0
 							questionCompleted := 0
 							hasQuestionTotal := false
@@ -387,12 +425,25 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 									heartbeatCtx, agentName, jobID,
 								); err == nil && current.Record != nil {
 									heartbeatStage = current.Record.Status
+									heartbeatJobFields = current.Fields
+									heartbeatParentAutomaticAttemptID = current.Fields.ParentAutomaticAttemptID
 									if current.Fields.SubmissionID != "" {
-										heartbeatSubmissionRef = shortSHA1([]byte(current.Fields.SubmissionID))
+										heartbeatSubmissionID = current.Fields.SubmissionID
+										if homework, err := o.deps.Records.GetHomeworkSubmission(
+											heartbeatCtx, agentName, current.Fields.SubmissionID,
+										); err == nil {
+											heartbeatDispatchID = homework.DispatchID
+										}
 										if snapshot, err := o.deps.Records.GetProblemAttemptSnapshot(
 											heartbeatCtx, agentName, current.Fields.SubmissionID,
 										); err == nil {
 											if questions, err := RecognizedQuestionsFromProblemAttemptSnapshot(snapshot); err == nil {
+												heartbeatQuestions = questions
+												for _, question := range questions {
+													if question.AttemptID != "" {
+														heartbeatAttemptIDs = append(heartbeatAttemptIDs, question.AttemptID)
+													}
+												}
 												questionTotal = len(questions)
 												hasQuestionTotal = true
 											}
@@ -401,23 +452,34 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 									if items, err := o.deps.Records.ListGradingAssessmentItems(
 										heartbeatCtx, agentName, jobID,
 									); err == nil {
+										heartbeatAssessmentItems = items
 										questionCompleted = len(items)
 										hasQuestionCompleted = true
 									}
 								}
 							}
 							attrs := []any{
-								"job_ref", jobRef,
-								"dispatch_ref", dispatchRef,
-								"submission_ref", heartbeatSubmissionRef,
+								"agent_id", agentName,
+								"job_id", jobID,
+								"dispatch_id", heartbeatDispatchID,
+								"submission_id", heartbeatSubmissionID,
+								"parent_automatic_attempt_id", heartbeatParentAutomaticAttemptID,
 								"stage", heartbeatStage,
+								"job_fields", heartbeatJobFields,
 								"elapsed_ms", time.Since(runStarted).Milliseconds(),
 							}
 							if hasQuestionTotal {
-								attrs = append(attrs, "questions_total", questionTotal)
+								attrs = append(attrs,
+									"questions_total", questionTotal,
+									"attempt_ids", heartbeatAttemptIDs,
+									"questions", heartbeatQuestions,
+								)
 							}
 							if hasQuestionCompleted {
-								attrs = append(attrs, "questions_completed", questionCompleted)
+								attrs = append(attrs,
+									"questions_completed", questionCompleted,
+									"assessment_items", heartbeatAssessmentItems,
+								)
 							}
 							slog.Info("K12 GradingJob Run heartbeat", attrs...)
 						}
@@ -428,36 +490,95 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 				view, err := o.RunGradingJob(baseCtx, jobID)
 				finishHeartbeat()
 				finishedStage := stage
-				finishedSubmissionRef := submissionRef
+				finishedSubmissionID := submissionID
+				finishedDispatchID := dispatchID
+				finishedParentAutomaticAttemptID := parentAutomaticAttemptID
+				finishedJobFields := jobFields
 				terminal := false
 				if view.Record != nil {
 					finishedStage = view.Record.Status
 					terminal = k12.GradingStageTerminal(finishedStage)
+					finishedJobFields = view.Fields
+					finishedParentAutomaticAttemptID = view.Fields.ParentAutomaticAttemptID
 					if view.Fields.SubmissionID != "" {
-						finishedSubmissionRef = shortSHA1([]byte(view.Fields.SubmissionID))
+						finishedSubmissionID = view.Fields.SubmissionID
 					}
 				}
-				slog.Info("K12 GradingJob Run finished",
-					"job_ref", jobRef,
-					"dispatch_ref", dispatchRef,
-					"submission_ref", finishedSubmissionRef,
+				var finishedQuestions []RecognizedQuestion
+				var finishedAttemptIDs []string
+				var finishedAssessmentItems []k12.GradingAssessmentItem
+				if agentName != "" && finishedSubmissionID != "" {
+					if homework, lookupErr := o.deps.Records.GetHomeworkSubmission(
+						baseCtx, agentName, finishedSubmissionID,
+					); lookupErr == nil {
+						finishedDispatchID = homework.DispatchID
+					}
+					if snapshot, snapshotErr := o.deps.Records.GetProblemAttemptSnapshot(
+						baseCtx, agentName, finishedSubmissionID,
+					); snapshotErr == nil {
+						if questions, questionsErr := RecognizedQuestionsFromProblemAttemptSnapshot(snapshot); questionsErr == nil {
+							finishedQuestions = questions
+							for _, question := range questions {
+								if question.AttemptID != "" {
+									finishedAttemptIDs = append(finishedAttemptIDs, question.AttemptID)
+								}
+							}
+						}
+					}
+				}
+				if agentName != "" {
+					if items, itemsErr := o.deps.Records.ListGradingAssessmentItems(
+						baseCtx, agentName, jobID,
+					); itemsErr == nil {
+						finishedAssessmentItems = items
+					}
+				}
+				finishedAttrs := []any{
+					"agent_id", agentName,
+					"job_id", jobID,
+					"dispatch_id", finishedDispatchID,
+					"submission_id", finishedSubmissionID,
+					"parent_automatic_attempt_id", finishedParentAutomaticAttemptID,
 					"stage", finishedStage,
+					"job_fields", finishedJobFields,
 					"elapsed_ms", time.Since(runStarted).Milliseconds(),
 					"terminal", terminal,
 					"failed", err != nil,
-				)
+					"questions_total", len(finishedQuestions),
+					"attempt_ids", finishedAttemptIDs,
+					"questions", finishedQuestions,
+					"questions_completed", len(finishedAssessmentItems),
+					"assessment_items", finishedAssessmentItems,
+				}
+				if err != nil {
+					finishedAttrs = append(finishedAttrs, "error", err)
+				}
+				slog.Info("K12 GradingJob Run finished", finishedAttrs...)
 				if err != nil {
 					if errors.Is(err, ErrGradingSourceRecognitionPending) {
 						// Source worker owns the V73 transition. This is a durable
 						// scheduling stop, not a failed model attempt and not a retry.
-						slog.Info("K12 批改任务等待 V73 来源识别结果，保持 assessing", "job_ref", jobRef)
+						slog.Info("K12 批改任务等待 V73 来源识别结果，保持 assessing",
+							"agent_id", agentName,
+							"job_id", jobID,
+							"dispatch_id", finishedDispatchID,
+							"submission_id", finishedSubmissionID,
+							"parent_automatic_attempt_id", finishedParentAutomaticAttemptID,
+							"stage", finishedStage,
+							"error", err,
+						)
 					} else {
 						// 阶段失败已由状态机安全落 failed_retryable/failed_terminal；此处仅取证。
 						slog.Warn("K12 批改任务异步推进结束于错误（状态机已落库对应失败态）",
-							"job_ref", jobRef,
+							"agent_id", agentName,
+							"job_id", jobID,
+							"dispatch_id", finishedDispatchID,
+							"submission_id", finishedSubmissionID,
+							"parent_automatic_attempt_id", finishedParentAutomaticAttemptID,
 							"stage", finishedStage,
+							"job_fields", finishedJobFields,
 							"failed", true,
-							"error_type", fmt.Sprintf("%T", err),
+							"error", err,
 						)
 					}
 				}
@@ -468,10 +589,15 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 					)
 					if reconcileErr != nil {
 						slog.Warn("K12 批改任务即时结果对账未收敛，保持结果未知且禁止重发",
-							"job_ref", jobRef,
+							"agent_id", agentName,
+							"job_id", jobID,
+							"dispatch_id", finishedDispatchID,
+							"submission_id", finishedSubmissionID,
+							"parent_automatic_attempt_id", finishedParentAutomaticAttemptID,
 							"stage", view.Fields.FailedStage,
+							"job_fields", view.Fields,
 							"reconciled", false,
-							"error_type", fmt.Sprintf("%T", reconcileErr),
+							"error", reconcileErr,
 						)
 					} else if reconciled && next.Record != nil &&
 						next.Record.Status == k12.GradingStageQueued {

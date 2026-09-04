@@ -235,9 +235,21 @@ func (w *ProblemSourceReprocessWorker) RunOnce(ctx context.Context) (bool, error
 		return false, err
 	}
 	startedAt := time.Now()
-	jobRef := shortSHA1([]byte(job.WorkID))
+	var taskErr error
 	slog.Info("K12 source reprocess job started",
-		"job_ref", jobRef,
+		"work_id", job.WorkID,
+		"command_receipt_id", job.CommandReceiptID,
+		"job_id", job.JobID,
+		"dispatch_id", job.DispatchID,
+		"problem_id", job.ProblemID,
+		"agent_name", job.AgentName,
+		"owner_scope", job.OwnerScope,
+		"action", job.Action,
+		"affected_problem_count", len(job.AffectedProblemIDs),
+		"input_digest", job.InputDigest,
+		"lease_epoch", job.LeaseEpoch,
+		"structure_version", job.StructureVersion,
+		"input_revision", job.InputRevision,
 		"status", "started",
 		"stage", "processing",
 		"elapsed_ms", int64(0),
@@ -245,7 +257,19 @@ func (w *ProblemSourceReprocessWorker) RunOnce(ctx context.Context) (bool, error
 	lastHeartbeatLog := time.Now()
 	logResult := func(status, stage, failureCode string, resultErr error) {
 		args := []any{
-			"job_ref", jobRef,
+			"work_id", job.WorkID,
+			"command_receipt_id", job.CommandReceiptID,
+			"job_id", job.JobID,
+			"dispatch_id", job.DispatchID,
+			"problem_id", job.ProblemID,
+			"agent_name", job.AgentName,
+			"owner_scope", job.OwnerScope,
+			"action", job.Action,
+			"affected_problem_count", len(job.AffectedProblemIDs),
+			"input_digest", job.InputDigest,
+			"lease_epoch", job.LeaseEpoch,
+			"structure_version", job.StructureVersion,
+			"input_revision", job.InputRevision,
 			"status", status,
 			"stage", stage,
 			"elapsed_ms", time.Since(startedAt).Milliseconds(),
@@ -254,8 +278,15 @@ func (w *ProblemSourceReprocessWorker) RunOnce(ctx context.Context) (bool, error
 		if failureCode != "" {
 			args = append(args, "failure_code", failureCode)
 		}
+		if taskErr != nil {
+			args = append(args, "error", taskErr)
+		}
 		if resultErr != nil {
-			args = append(args, "error_type", fmt.Sprintf("%T", resultErr))
+			key := "error"
+			if taskErr != nil {
+				key = "transition_error"
+			}
+			args = append(args, key, resultErr)
 		}
 		slog.Info("K12 source reprocess job finished", args...)
 	}
@@ -270,7 +301,17 @@ func (w *ProblemSourceReprocessWorker) RunOnce(ctx context.Context) (bool, error
 			if heartbeatErr == nil && time.Since(lastHeartbeatLog) >= 30*time.Second {
 				lastHeartbeatLog = time.Now()
 				slog.Info("K12 source reprocess job heartbeat",
-					"job_ref", jobRef,
+					"work_id", job.WorkID,
+					"command_receipt_id", job.CommandReceiptID,
+					"job_id", job.JobID,
+					"dispatch_id", job.DispatchID,
+					"problem_id", job.ProblemID,
+					"agent_name", job.AgentName,
+					"owner_scope", job.OwnerScope,
+					"action", job.Action,
+					"affected_problem_count", len(job.AffectedProblemIDs),
+					"input_digest", job.InputDigest,
+					"lease_epoch", job.LeaseEpoch,
 					"status", "running",
 					"stage", "processing",
 					"elapsed_ms", time.Since(startedAt).Milliseconds(),
@@ -282,7 +323,9 @@ func (w *ProblemSourceReprocessWorker) RunOnce(ctx context.Context) (bool, error
 			return w.Processor.ProcessProblemSourceReprocess(processCtx, job)
 		},
 	)
+	taskErr = processErr
 	if heartbeatErr != nil {
+		taskErr = heartbeatErr
 		if problemSourceReprocessLifecycleInterrupted(ctx, heartbeatErr) {
 			commitCtx, cancelCommit := context.WithTimeout(
 				context.WithoutCancel(ctx), problemSourceReprocessCommitTimeout,
@@ -296,7 +339,7 @@ func (w *ProblemSourceReprocessWorker) RunOnce(ctx context.Context) (bool, error
 		}
 		// The old worker no longer has authority. In particular, never translate
 		// a fencing loss into a second terminal mutation.
-		logResult("failed", "heartbeat", "heartbeat_failed", heartbeatErr)
+		logResult("failed", "heartbeat", "heartbeat_failed", nil)
 		return true, heartbeatErr
 	}
 
@@ -366,10 +409,22 @@ func (w *ProblemSourceReprocessWorker) reconcileOutcomeUnknown(
 	heartbeatInterval time.Duration,
 ) (bool, error) {
 	startedAt := time.Now()
-	jobRef := shortSHA1([]byte(job.WorkID))
 	attempt := job.ReconciliationAttemptCount
+	var taskErr error
 	slog.Info("K12 source reprocess reconciliation started",
-		"job_ref", jobRef,
+		"work_id", job.WorkID,
+		"command_receipt_id", job.CommandReceiptID,
+		"job_id", job.JobID,
+		"dispatch_id", job.DispatchID,
+		"problem_id", job.ProblemID,
+		"agent_name", job.AgentName,
+		"owner_scope", job.OwnerScope,
+		"action", job.Action,
+		"affected_problem_count", len(job.AffectedProblemIDs),
+		"input_digest", job.InputDigest,
+		"reconciliation_epoch", job.ReconciliationEpoch,
+		"structure_version", job.StructureVersion,
+		"input_revision", job.InputRevision,
 		"status", "started",
 		"stage", "reconciling",
 		"elapsed_ms", int64(0),
@@ -377,7 +432,19 @@ func (w *ProblemSourceReprocessWorker) reconcileOutcomeUnknown(
 	lastHeartbeatLog := time.Now()
 	logResult := func(status, stage, failureCode string, resultErr error) {
 		args := []any{
-			"job_ref", jobRef,
+			"work_id", job.WorkID,
+			"command_receipt_id", job.CommandReceiptID,
+			"job_id", job.JobID,
+			"dispatch_id", job.DispatchID,
+			"problem_id", job.ProblemID,
+			"agent_name", job.AgentName,
+			"owner_scope", job.OwnerScope,
+			"action", job.Action,
+			"affected_problem_count", len(job.AffectedProblemIDs),
+			"input_digest", job.InputDigest,
+			"reconciliation_epoch", job.ReconciliationEpoch,
+			"structure_version", job.StructureVersion,
+			"input_revision", job.InputRevision,
 			"status", status,
 			"stage", stage,
 			"elapsed_ms", time.Since(startedAt).Milliseconds(),
@@ -386,8 +453,15 @@ func (w *ProblemSourceReprocessWorker) reconcileOutcomeUnknown(
 		if failureCode != "" {
 			args = append(args, "failure_code", failureCode)
 		}
+		if taskErr != nil {
+			args = append(args, "error", taskErr)
+		}
 		if resultErr != nil {
-			args = append(args, "error_type", fmt.Sprintf("%T", resultErr))
+			key := "error"
+			if taskErr != nil {
+				key = "transition_error"
+			}
+			args = append(args, key, resultErr)
 		}
 		slog.Info("K12 source reprocess reconciliation finished", args...)
 	}
@@ -401,7 +475,17 @@ func (w *ProblemSourceReprocessWorker) reconcileOutcomeUnknown(
 			if heartbeatErr == nil && time.Since(lastHeartbeatLog) >= 30*time.Second {
 				lastHeartbeatLog = time.Now()
 				slog.Info("K12 source reprocess reconciliation heartbeat",
-					"job_ref", jobRef,
+					"work_id", job.WorkID,
+					"command_receipt_id", job.CommandReceiptID,
+					"job_id", job.JobID,
+					"dispatch_id", job.DispatchID,
+					"problem_id", job.ProblemID,
+					"agent_name", job.AgentName,
+					"owner_scope", job.OwnerScope,
+					"action", job.Action,
+					"affected_problem_count", len(job.AffectedProblemIDs),
+					"input_digest", job.InputDigest,
+					"reconciliation_epoch", job.ReconciliationEpoch,
 					"status", "running",
 					"stage", "reconciling",
 					"elapsed_ms", time.Since(startedAt).Milliseconds(),
@@ -416,7 +500,9 @@ func (w *ProblemSourceReprocessWorker) reconcileOutcomeUnknown(
 			)
 		},
 	)
+	taskErr = processErr
 	if heartbeatErr != nil {
+		taskErr = heartbeatErr
 		if problemSourceReprocessLifecycleInterrupted(ctx, heartbeatErr) {
 			commitCtx, cancelCommit := context.WithTimeout(
 				context.WithoutCancel(ctx), problemSourceReprocessCommitTimeout,
@@ -428,7 +514,7 @@ func (w *ProblemSourceReprocessWorker) reconcileOutcomeUnknown(
 			logResult("released", "lease_released", "", resultErr)
 			return true, resultErr
 		}
-		logResult("failed", "heartbeat", "heartbeat_failed", heartbeatErr)
+		logResult("failed", "heartbeat", "heartbeat_failed", nil)
 		return true, heartbeatErr
 	}
 
@@ -655,7 +741,7 @@ func (w *ProblemSourceReprocessWorker) runDrain(ctx context.Context) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			slog.Error("K12 source reprocess worker panic; durable lease will recover",
-				"error_type", fmt.Sprintf("%T", recovered))
+				"panic", recovered)
 			w.finishDrain()
 		}
 	}()
@@ -663,7 +749,7 @@ func (w *ProblemSourceReprocessWorker) runDrain(ctx context.Context) {
 		processed, err := w.RunOnce(ctx)
 		if err != nil {
 			slog.Warn("K12 source reprocess worker stopped at durable checkpoint",
-				"error_type", fmt.Sprintf("%T", err))
+				"error", err)
 			w.finishDrain()
 			return
 		}

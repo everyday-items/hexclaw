@@ -1103,8 +1103,19 @@ func putProblemTx(ctx context.Context, tx *sql.Tx, problem k12.Problem) error {
 			problem.ProblemID, problem.CanonicalVersion, existing.CanonicalVersion)
 	}
 	if problem.CanonicalVersion == existing.CanonicalVersion {
-		if !problemCanonicalFactsEqual(existing, problem) {
+		if problemCanonicalFactsEqual(existing, problem) {
+			return nil
+		}
+		if !problemCanonicalContentFactsEqual(existing, problem) {
 			return fmt.Errorf("%w: Problem %s same canonical version changed facts", ErrProblemAttemptConflict, problem.ProblemID)
+		}
+		// 确认策略由当前识别证据重新计算，不属于题目规范正文的版本化事实。
+		_, err = tx.ExecContext(ctx, `UPDATE k12_problems SET confirmation_required=?,
+            confirmation_reasons_json=?,updated_at=? WHERE agent_name=? AND problem_id=?`,
+			boolInt(problem.ConfirmationRequired), string(reasonsJSON), problem.UpdatedAt,
+			problem.AgentName, problem.ProblemID)
+		if err != nil {
+			return fmt.Errorf("k12storage: update Problem %s confirmation policy: %w", problem.ProblemID, err)
 		}
 		return nil
 	}
@@ -1121,11 +1132,15 @@ func putProblemTx(ctx context.Context, tx *sql.Tx, problem k12.Problem) error {
 }
 
 func problemCanonicalFactsEqual(a, b k12.Problem) bool {
-	return a.Subject == b.Subject && a.StemMarkdown == b.StemMarkdown &&
-		reflect.DeepEqual(a.ConceptIDs, b.ConceptIDs) &&
-		floatPtrEqual(a.TranscriptionConfidence, b.TranscriptionConfidence) &&
+	return problemCanonicalContentFactsEqual(a, b) &&
 		a.ConfirmationRequired == b.ConfirmationRequired &&
 		reflect.DeepEqual(a.ConfirmationReasons, b.ConfirmationReasons)
+}
+
+func problemCanonicalContentFactsEqual(a, b k12.Problem) bool {
+	return a.Subject == b.Subject && a.StemMarkdown == b.StemMarkdown &&
+		reflect.DeepEqual(a.ConceptIDs, b.ConceptIDs) &&
+		floatPtrEqual(a.TranscriptionConfidence, b.TranscriptionConfidence)
 }
 
 func putAttemptTx(ctx context.Context, tx *sql.Tx, attempt k12.Attempt) error {

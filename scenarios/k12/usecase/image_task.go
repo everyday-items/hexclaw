@@ -739,18 +739,15 @@ func (c *ImageTaskCoordinator) expireImageTaskGapIfDue(
 func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
 	agentName = strings.TrimSpace(agentName)
 	dispatchID = strings.TrimSpace(dispatchID)
-	dispatchRef := ""
-	submissionRef := ""
-	jobRef := ""
+	submissionID := ""
+	jobID := ""
 	stage := ""
-	if dispatchID != "" {
-		dispatchRef = shortSHA1([]byte(dispatchID))
-	}
 	logScheduling := func(accepted bool, reason string) {
 		slog.Info("K12 ImageTask scheduling decision",
-			"dispatch_ref", dispatchRef,
-			"submission_ref", submissionRef,
-			"job_ref", jobRef,
+			"agent_id", agentName,
+			"dispatch_id", dispatchID,
+			"submission_id", submissionID,
+			"job_id", jobID,
 			"stage", stage,
 			"accepted", accepted,
 			"reason", reason,
@@ -774,7 +771,12 @@ func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
 	stage = string(dispatch.Status)
 	if dispatch.TargetObjectType == k12.ImageTaskTargetHomeworkSubmission &&
 		dispatch.TargetObjectID != "" {
-		submissionRef = shortSHA1([]byte(dispatch.TargetObjectID))
+		submissionID = dispatch.TargetObjectID
+		if homework, lookupErr := c.Records.GetHomeworkSubmission(
+			context.Background(), agentName, submissionID,
+		); lookupErr == nil {
+			jobID = homework.GradingJobID
+		}
 	}
 	key := agentName + "\x00" + dispatchID
 	c.workerMu.Lock()
@@ -811,18 +813,27 @@ func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				slog.Error("K12 ImageTask worker panic; durable checkpoint retained",
-					"dispatch_ref", dispatchRef,
+					"agent_id", agentName,
+					"dispatch_id", dispatchID,
+					"submission_id", submissionID,
+					"job_id", jobID,
+					"stage", stage,
 					"panicked", true,
 					"panic_type", fmt.Sprintf("%T", recovered),
+					"panic", recovered,
 				)
 			}
 		}()
 		runStarted := time.Now()
 		slog.Info("K12 ImageTask Run started",
-			"dispatch_ref", dispatchRef,
-			"submission_ref", submissionRef,
-			"job_ref", jobRef,
+			"agent_id", agentName,
+			"dispatch_id", dispatchID,
+			"submission_id", submissionID,
+			"job_id", jobID,
 			"stage", dispatch.Status,
+			"attempt_generation", dispatch.AttemptGeneration,
+			"classification_invocation_id", dispatch.ClassificationInvocationID,
+			"dispatch_context", dispatch,
 			"elapsed_ms", int64(0),
 		)
 
@@ -838,7 +849,13 @@ func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
 				case <-heartbeatStopped:
 				case <-timer.C:
 					slog.Warn("K12 ImageTask heartbeat stop timed out",
+						"agent_id", agentName,
+						"dispatch_id", dispatchID,
+						"submission_id", submissionID,
+						"job_id", jobID,
 						"stage", "heartbeat_stop_timeout",
+						"run_stage", stage,
+						"attempt_generation", dispatch.AttemptGeneration,
 						"timeout_ms", int64(time.Second/time.Millisecond),
 					)
 				}
@@ -849,7 +866,13 @@ func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
 			defer func() {
 				if recovered := recover(); recovered != nil {
 					slog.Warn("K12 ImageTask heartbeat panic",
+						"agent_id", agentName,
+						"dispatch_id", dispatchID,
+						"submission_id", submissionID,
+						"job_id", jobID,
+						"stage", stage,
 						"panic_type", fmt.Sprintf("%T", recovered),
+						"panic", recovered,
 					)
 				}
 			}()
@@ -861,21 +884,53 @@ func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
 					return
 				case <-ticker.C:
 					heartbeatStage := string(dispatch.Status)
-					heartbeatSubmissionRef := submissionRef
+					heartbeatSubmissionID := submissionID
+					heartbeatJobID := jobID
+					heartbeatDispatch := dispatch
+					var heartbeatHomework *k12.HomeworkSubmission
+					var heartbeatQuestions []RecognizedQuestion
+					var heartbeatAttemptIDs []string
 					if current, err := c.Records.GetImageTaskDispatch(
 						heartbeatCtx, agentName, dispatchID,
 					); err == nil {
 						heartbeatStage = string(current.Status)
+						heartbeatDispatch = current
 						if current.TargetObjectType == k12.ImageTaskTargetHomeworkSubmission &&
 							current.TargetObjectID != "" {
-							heartbeatSubmissionRef = shortSHA1([]byte(current.TargetObjectID))
+							heartbeatSubmissionID = current.TargetObjectID
+							if homework, homeworkErr := c.Records.GetHomeworkSubmission(
+								heartbeatCtx, agentName, current.TargetObjectID,
+							); homeworkErr == nil {
+								heartbeatHomework = &homework
+								heartbeatJobID = homework.GradingJobID
+							}
+							if snapshot, snapshotErr := c.Records.GetProblemAttemptSnapshot(
+								heartbeatCtx, agentName, current.TargetObjectID,
+							); snapshotErr == nil {
+								if questions, questionsErr := RecognizedQuestionsFromProblemAttemptSnapshot(snapshot); questionsErr == nil {
+									heartbeatQuestions = questions
+									for _, question := range questions {
+										if question.AttemptID != "" {
+											heartbeatAttemptIDs = append(heartbeatAttemptIDs, question.AttemptID)
+										}
+									}
+								}
+							}
 						}
 					}
 					slog.Info("K12 ImageTask Run heartbeat",
-						"dispatch_ref", dispatchRef,
-						"submission_ref", heartbeatSubmissionRef,
-						"job_ref", jobRef,
+						"agent_id", agentName,
+						"dispatch_id", dispatchID,
+						"submission_id", heartbeatSubmissionID,
+						"job_id", heartbeatJobID,
 						"stage", heartbeatStage,
+						"attempt_generation", heartbeatDispatch.AttemptGeneration,
+						"classification_invocation_id", heartbeatDispatch.ClassificationInvocationID,
+						"dispatch_context", heartbeatDispatch,
+						"homework_context", heartbeatHomework,
+						"questions_total", len(heartbeatQuestions),
+						"attempt_ids", heartbeatAttemptIDs,
+						"questions", heartbeatQuestions,
 						"elapsed_ms", time.Since(runStarted).Milliseconds(),
 					)
 				}
@@ -889,15 +944,15 @@ func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
 		if view.Dispatch.Status != "" {
 			finishedStage = string(view.Dispatch.Status)
 		}
-		finishedSubmissionRef := submissionRef
-		finishedJobRef := jobRef
+		finishedSubmissionID := submissionID
+		finishedJobID := jobID
 		terminal := view.Dispatch.Status == k12.ImageTaskStatusFailed ||
 			view.Dispatch.Status == k12.ImageTaskStatusCancelled
 		if view.Homework != nil {
 			finishedStage = "homework/queued"
-			finishedSubmissionRef = shortSHA1([]byte(view.Homework.SubmissionID))
+			finishedSubmissionID = view.Homework.SubmissionID
 			if view.Homework.GradingJobID != "" {
-				finishedJobRef = shortSHA1([]byte(view.Homework.GradingJobID))
+				finishedJobID = view.Homework.GradingJobID
 			}
 		}
 		if view.HomeworkProjection != nil {
@@ -906,21 +961,60 @@ func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
 		} else if view.Creative != nil {
 			finishedStage = "creative/" + string(view.Creative.Status)
 		}
-		slog.Info("K12 ImageTask Run finished",
-			"dispatch_ref", dispatchRef,
-			"submission_ref", finishedSubmissionRef,
-			"job_ref", finishedJobRef,
+		finishedQuestions := []RecognizedQuestion(nil)
+		if view.HomeworkProjection != nil {
+			finishedQuestions = view.HomeworkProjection.Questions
+		} else if finishedSubmissionID != "" {
+			if snapshot, snapshotErr := c.Records.GetProblemAttemptSnapshot(
+				runCtx, agentName, finishedSubmissionID,
+			); snapshotErr == nil {
+				if questions, questionsErr := RecognizedQuestionsFromProblemAttemptSnapshot(snapshot); questionsErr == nil {
+					finishedQuestions = questions
+				}
+			}
+		}
+		finishedAttemptIDs := make([]string, 0, len(finishedQuestions))
+		for _, question := range finishedQuestions {
+			if question.AttemptID != "" {
+				finishedAttemptIDs = append(finishedAttemptIDs, question.AttemptID)
+			}
+		}
+		finishedAttrs := []any{
+			"agent_id", agentName,
+			"dispatch_id", dispatchID,
+			"submission_id", finishedSubmissionID,
+			"job_id", finishedJobID,
 			"stage", finishedStage,
+			"attempt_generation", view.Dispatch.AttemptGeneration,
+			"classification_invocation_id", view.Dispatch.ClassificationInvocationID,
+			"dispatch_context", view.Dispatch,
+			"homework_context", view.Homework,
+			"homework_projection", view.HomeworkProjection,
+			"questions_total", len(finishedQuestions),
+			"attempt_ids", finishedAttemptIDs,
+			"questions", finishedQuestions,
 			"elapsed_ms", time.Since(runStarted).Milliseconds(),
 			"terminal", terminal,
 			"failed", err != nil,
-		)
+		}
+		if err != nil {
+			finishedAttrs = append(finishedAttrs, "error", err)
+		}
+		slog.Info("K12 ImageTask Run finished", finishedAttrs...)
 		if err != nil {
 			slog.Warn("K12 ImageTask worker stopped at durable checkpoint",
-				"dispatch_ref", dispatchRef,
+				"agent_id", agentName,
+				"dispatch_id", dispatchID,
+				"submission_id", finishedSubmissionID,
+				"job_id", finishedJobID,
 				"stage", finishedStage,
+				"dispatch_context", view.Dispatch,
+				"homework_context", view.Homework,
+				"homework_projection", view.HomeworkProjection,
+				"attempt_ids", finishedAttemptIDs,
+				"questions", finishedQuestions,
 				"failed", true,
-				"error_type", fmt.Sprintf("%T", err),
+				"error", err,
 			)
 		}
 	}()
@@ -1734,10 +1828,13 @@ func (c *ImageTaskCoordinator) continueTarget(
 			}
 		}
 		slog.Info("K12 ImageTask handed off to GradingJob",
-			"dispatch_ref", shortSHA1([]byte(view.Dispatch.DispatchID)),
-			"submission_ref", shortSHA1([]byte(submission.SubmissionID)),
-			"job_ref", shortSHA1([]byte(job.Record.RecordID)),
+			"agent_id", view.Dispatch.AgentName,
+			"dispatch_id", view.Dispatch.DispatchID,
+			"submission_id", submission.SubmissionID,
+			"job_id", job.Record.RecordID,
+			"parent_automatic_attempt_id", job.Fields.ParentAutomaticAttemptID,
 			"stage", job.Record.Status,
+			"job_fields", job.Fields,
 			"accepted", accepted,
 			"elapsed_ms", elapsedMS,
 		)

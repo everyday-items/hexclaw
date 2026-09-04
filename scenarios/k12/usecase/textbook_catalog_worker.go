@@ -63,7 +63,6 @@ func (w *TextbookCatalogWorker) RunOnce(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	startedAt := time.Now()
-	jobRef := shortSHA1([]byte(claim.JobID))
 	var stageMu sync.RWMutex
 	stage := "source_loading"
 	setStage := func(next string) {
@@ -78,7 +77,17 @@ func (w *TextbookCatalogWorker) RunOnce(ctx context.Context) (bool, error) {
 	}
 	logResult := func(status, finalStage, failureCode string, resultErr error) {
 		args := []any{
-			"job_ref", jobRef,
+			"job_id", claim.JobID,
+			"manifest_id", claim.ManifestID,
+			"owner_id", claim.OwnerID,
+			"document_id", claim.DocumentID,
+			"document_generation", claim.DocumentGeneration,
+			"ingest_job_id", claim.IngestJobID,
+			"source_digest", claim.SourceDigest,
+			"request_digest", claim.RequestDigest,
+			"source_plan_digest", claim.SourcePlanDigest,
+			"extractor_contract", claim.ExtractorContract,
+			"lease_epoch", claim.LeaseEpoch,
 			"status", status,
 			"stage", finalStage,
 			"elapsed_ms", time.Since(startedAt).Milliseconds(),
@@ -88,12 +97,22 @@ func (w *TextbookCatalogWorker) RunOnce(ctx context.Context) (bool, error) {
 			args = append(args, "failure_code", failureCode)
 		}
 		if resultErr != nil {
-			args = append(args, "error_type", fmt.Sprintf("%T", resultErr))
+			args = append(args, "error", resultErr)
 		}
 		slog.Info("K12 textbook catalog job finished", args...)
 	}
 	slog.Info("K12 textbook catalog job started",
-		"job_ref", jobRef,
+		"job_id", claim.JobID,
+		"manifest_id", claim.ManifestID,
+		"owner_id", claim.OwnerID,
+		"document_id", claim.DocumentID,
+		"document_generation", claim.DocumentGeneration,
+		"ingest_job_id", claim.IngestJobID,
+		"source_digest", claim.SourceDigest,
+		"request_digest", claim.RequestDigest,
+		"source_plan_digest", claim.SourcePlanDigest,
+		"extractor_contract", claim.ExtractorContract,
+		"lease_epoch", claim.LeaseEpoch,
 		"status", "started",
 		"stage", stage,
 		"elapsed_ms", int64(0),
@@ -108,13 +127,42 @@ func (w *TextbookCatalogWorker) RunOnce(ctx context.Context) (bool, error) {
 	operationCtx, cancel := context.WithTimeout(ctx, w.config.ExtractTimeout)
 	defer cancel()
 	stopHeartbeat := w.startHeartbeat(
-		operationCtx, cancel, claim, startedAt, jobRef, currentStage,
+		operationCtx, cancel, claim, startedAt, currentStage,
 	)
 	source, err := w.repository.LoadTextbookCatalogSource(operationCtx, claim, w.now())
 	var publication k12storage.TextbookCatalogPublication
 	if err == nil {
 		setStage("extracting")
+		slog.Info("K12 textbook catalog source loaded",
+			"job_id", claim.JobID,
+			"manifest_id", claim.ManifestID,
+			"owner_id", claim.OwnerID,
+			"document_id", claim.DocumentID,
+			"document_generation", claim.DocumentGeneration,
+			"ingest_job_id", source.IngestJobID,
+			"document_title", source.DocumentTitle,
+			"source_digest", source.SourceDigest,
+			"source_plan_digest", source.SourcePlanDigest,
+			"page_count", len(source.Pages),
+			"status", "running",
+			"stage", "extracting",
+			"elapsed_ms", time.Since(startedAt).Milliseconds(),
+			"attempt", claim.Attempt)
 		publication, err = w.extractor.Extract(operationCtx, source)
+		if err == nil {
+			slog.Info("K12 textbook catalog extraction completed",
+				"job_id", claim.JobID,
+				"manifest_id", claim.ManifestID,
+				"owner_id", claim.OwnerID,
+				"document_id", claim.DocumentID,
+				"document_generation", claim.DocumentGeneration,
+				"catalog_json_bytes", len(publication.CatalogJSON),
+				"page_proof_count", len(publication.PageProofs),
+				"status", "running",
+				"stage", "extracted",
+				"elapsed_ms", time.Since(startedAt).Milliseconds(),
+				"attempt", claim.Attempt)
+		}
 	}
 	if heartbeatErr := stopHeartbeat(); heartbeatErr != nil {
 		logResult("failed", "heartbeat", "heartbeat_failed", heartbeatErr)
@@ -122,6 +170,18 @@ func (w *TextbookCatalogWorker) RunOnce(ctx context.Context) (bool, error) {
 	}
 	if err == nil {
 		setStage("publishing")
+		slog.Info("K12 textbook catalog publication started",
+			"job_id", claim.JobID,
+			"manifest_id", claim.ManifestID,
+			"owner_id", claim.OwnerID,
+			"document_id", claim.DocumentID,
+			"document_generation", claim.DocumentGeneration,
+			"catalog_json_bytes", len(publication.CatalogJSON),
+			"page_proof_count", len(publication.PageProofs),
+			"status", "running",
+			"stage", "publishing",
+			"elapsed_ms", time.Since(startedAt).Milliseconds(),
+			"attempt", claim.Attempt)
 		err = w.repository.PublishTextbookCatalog(ctx, claim, publication, w.now())
 	}
 	if err == nil {
@@ -223,7 +283,6 @@ func (w *TextbookCatalogWorker) startHeartbeat(
 	cancel context.CancelFunc,
 	claim k12storage.TextbookCatalogJobClaim,
 	startedAt time.Time,
-	jobRef string,
 	currentStage func() string,
 ) func() error {
 	stop := make(chan struct{})
@@ -256,7 +315,17 @@ func (w *TextbookCatalogWorker) startHeartbeat(
 				if time.Since(lastHeartbeatLog) >= 30*time.Second {
 					lastHeartbeatLog = time.Now()
 					slog.Info("K12 textbook catalog job heartbeat",
-						"job_ref", jobRef,
+						"job_id", claim.JobID,
+						"manifest_id", claim.ManifestID,
+						"owner_id", claim.OwnerID,
+						"document_id", claim.DocumentID,
+						"document_generation", claim.DocumentGeneration,
+						"ingest_job_id", claim.IngestJobID,
+						"source_digest", claim.SourceDigest,
+						"request_digest", claim.RequestDigest,
+						"source_plan_digest", claim.SourcePlanDigest,
+						"extractor_contract", claim.ExtractorContract,
+						"lease_epoch", claim.LeaseEpoch,
 						"status", "running",
 						"stage", currentStage(),
 						"elapsed_ms", time.Since(startedAt).Milliseconds(),

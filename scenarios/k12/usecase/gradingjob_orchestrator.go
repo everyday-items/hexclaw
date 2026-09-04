@@ -1359,10 +1359,83 @@ func (o *GradingOrchestrator) startAnchorAsync(jobID string, run *gradingRun, sn
 	taskIntent := run.req.TaskIntent
 	go func() {
 		defer o.finishWorker()
+		startedAt := time.Now()
+		terminalStatus := "failed"
+		heartbeatCtx, stopHeartbeat := context.WithCancel(o.gradingBaseContext())
+		heartbeatStopped := make(chan struct{})
+		slog.Info("K12 GradingJob anchor started",
+			"job_id", jobID,
+			"agent_id", run.agentName,
+			"stage", k12.GradingStageLocating,
+			"task_intent", taskIntent,
+			"questions", frozen,
+			"questions_total", len(frozen),
+			"image_bytes", len(image),
+			"model", k12.NormalizeGradingModelSnapshot(snapshot).Model,
+			"elapsed_ms", int64(0),
+		)
+		go func() {
+			defer close(heartbeatStopped)
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					slog.Warn("K12 GradingJob anchor heartbeat stopped",
+						"job_id", jobID,
+						"agent_id", run.agentName,
+						"stage", k12.GradingStageLocating,
+						"panic_type", fmt.Sprintf("%T", recovered),
+						"panic", recovered,
+					)
+				}
+			}()
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-heartbeatCtx.Done():
+					return
+				case <-ticker.C:
+					slog.Info("K12 GradingJob anchor heartbeat",
+						"job_id", jobID,
+						"agent_id", run.agentName,
+						"stage", k12.GradingStageLocating,
+						"questions_total", len(frozen),
+						"elapsed_ms", time.Since(startedAt).Milliseconds(),
+					)
+				}
+			}
+		}()
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("K12 批改任务锚点分支 panic（任务保留 anchor pending）", "job", jobID, "panic", r)
+				terminalStatus = "panicked"
+				slog.Error("K12 批改任务锚点分支 panic（任务保留 anchor pending）",
+					"job_id", jobID,
+					"agent_id", run.agentName,
+					"panic_type", fmt.Sprintf("%T", r),
+					"panic", r,
+				)
 			}
+			stopHeartbeat()
+			select {
+			case <-heartbeatStopped:
+			case <-time.After(time.Second):
+				slog.Warn("K12 GradingJob anchor heartbeat stop timed out",
+					"job_id", jobID,
+					"agent_id", run.agentName,
+					"stage", k12.GradingStageLocating,
+					"timeout_ms", int64(time.Second/time.Millisecond),
+				)
+			}
+			logTerminal := slog.Info
+			if terminalStatus == "failed" || terminalStatus == "panicked" {
+				logTerminal = slog.Warn
+			}
+			logTerminal("K12 GradingJob anchor finished",
+				"job_id", jobID,
+				"agent_id", run.agentName,
+				"stage", k12.GradingStageLocating,
+				"status", terminalStatus,
+				"elapsed_ms", time.Since(startedAt).Milliseconds(),
+			)
 			o.mu.Lock()
 			delete(o.anchorActive, jobID)
 			if current := o.anchorDone[jobID]; current == done {
@@ -1381,6 +1454,7 @@ func (o *GradingOrchestrator) startAnchorAsync(jobID string, run *gradingRun, sn
 		v, err := o.deps.GetGradingJob(ctx, run.agentName, jobID)
 		if err != nil || v.Fields.AnchorState != k12.GradingAnchorPending ||
 			(v.Record.Status != k12.GradingStageAwaitingConfirmation && v.Record.Status != k12.GradingStageLocating) {
+			terminalStatus = "superseded"
 			l.Unlock()
 			return
 		}
@@ -1406,9 +1480,14 @@ func (o *GradingOrchestrator) startAnchorAsync(jobID string, run *gradingRun, sn
 		}
 		l.Unlock()
 		if err != nil {
-			slog.Warn("K12 批改任务锚点结果写回失败（保留当前状态供恢复）", "job", jobID, "err", err)
+			slog.Warn("K12 批改任务锚点结果写回失败（保留当前状态供恢复）",
+				"job_id", jobID,
+				"agent_id", run.agentName,
+				"error", err,
+			)
 			return
 		}
+		terminalStatus = "completed"
 		if v.Record.Status == k12.GradingStageAssessing {
 			o.StartAsync(jobID)
 		}

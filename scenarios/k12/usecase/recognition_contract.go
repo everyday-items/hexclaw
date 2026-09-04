@@ -67,10 +67,9 @@ func EvaluateOCRConfirmationRisk(q RecognizedQuestion) RecognizedQuestion {
 	q = normalizeRecognizedQuestionFacts(q)
 	reasons := make(map[OCRRiskReason]struct{}, len(q.ConfirmationReasons)+4)
 	for _, reason := range q.ConfirmationReasons {
-		// Re-evaluate checkpoints written by the former policy. A persisted
-		// fraction/decimal/negative/unit reason describes content shape only and
-		// must not survive as independent uncertainty.
-		if independentOCRUncertaintyReason(reason) {
+		// 旧检查点中的内容形态原因与 evidence_conflict 均按当前事实重算，
+		// 避免已合并的多行互补证据永久停留在确认态。
+		if reason != OCRRiskEvidenceConflict && independentOCRUncertaintyReason(reason) {
 			reasons[reason] = struct{}{}
 		}
 	}
@@ -84,7 +83,8 @@ func EvaluateOCRConfirmationRisk(q RecognizedQuestion) RecognizedQuestion {
 			reasons[OCRRiskUnclearHandwriting] = struct{}{}
 		}
 	}
-	if distinctEvidenceCount(q.EvidenceTranscriptions) > 1 || distinctEvidenceCount(q.AnswerEvidenceTranscriptions) > 1 {
+	if evidenceTranscriptionsConflict(q.RawTranscription, q.EvidenceTranscriptions) ||
+		evidenceTranscriptionsConflict(q.AnswerRawTranscription, q.AnswerEvidenceTranscriptions) {
 		reasons[OCRRiskEvidenceConflict] = struct{}{}
 	}
 	if q.RecognitionConfidence != nil && *q.RecognitionConfidence < ocrConfidenceConfirmationThreshold {
@@ -133,6 +133,27 @@ func distinctEvidenceCount(values []string) int {
 		}
 	}
 	return len(set)
+}
+
+// evidenceTranscriptionsConflict 区分同一多行作答的互补片段与真正互斥的独立读数。
+// 各片段按原顺序拼接后等于完整抄录时，它们共同构成一次证据，不是冲突。
+func evidenceTranscriptionsConflict(transcription string, values []string) bool {
+	if distinctEvidenceCount(values) <= 1 {
+		return false
+	}
+	normalize := func(value string) string {
+		value = strings.Join(strings.Fields(CanonicalPlainTextFallback(value)), "")
+		return strings.NewReplacer(
+			"。", "", "；", "", "，", "", "：", "", "、", "", ";", "", ":", "",
+		).Replace(value)
+	}
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = normalize(value); value != "" {
+			parts = append(parts, value)
+		}
+	}
+	return normalize(transcription) == "" || strings.Join(parts, "") != normalize(transcription)
 }
 
 // CanonicalMarkdownValid 做不猜测语义的结构校验：UTF-8、花括号、\(...\)/\[...\]
