@@ -544,13 +544,31 @@ func validateTextbookCatalogPublication(
 		pageRef := &catalog.PageRefs[index]
 		proof := &publication.PageProofs[index]
 		if pageRef.LogicalPage != catalog.PageMin+index || pageRef.PDFPage <= previousPDFPage ||
+			(index > 0 && pageRef.PDFPage != previousPDFPage+1) ||
 			pageRef.LogicalPage != proof.LogicalPage || pageRef.PDFPage != proof.PDFPage ||
-			proof.EvidencePage != proof.PDFPage || proof.Method != "printed_anchor" ||
+			proof.EvidencePage != proof.PDFPage ||
 			proof.EvidenceOffsetFrom < 0 || proof.EvidenceOffsetTo <= proof.EvidenceOffsetFrom ||
 			!validSHA256Digest(proof.EvidenceDigest) || len(pageRef.SegmentRefs) == 0 ||
 			!sameExactSegmentRefs(pageRef.SegmentRefs, proof.SegmentRefs) {
 			return textbookCatalogDocument{}, nil, "", "",
 				fmt.Errorf("%w: invalid textbook page proof", records.ErrIllegalTransition)
+		}
+		switch proof.Method {
+		case "printed_anchor":
+		case "adjacent_printed_anchors":
+			if index == 0 || index+1 >= len(catalog.PageRefs) || proof.EvidenceOffsetFrom != 0 ||
+				publication.PageProofs[index-1].Method != "printed_anchor" ||
+				publication.PageProofs[index+1].Method != "printed_anchor" ||
+				catalog.PageRefs[index-1].PDFPage+1 != pageRef.PDFPage ||
+				pageRef.PDFPage+1 != catalog.PageRefs[index+1].PDFPage ||
+				catalog.PageRefs[index-1].LogicalPage+1 != pageRef.LogicalPage ||
+				pageRef.LogicalPage+1 != catalog.PageRefs[index+1].LogicalPage {
+				return textbookCatalogDocument{}, nil, "", "",
+					fmt.Errorf("%w: invalid interpolated textbook page proof", records.ErrIllegalTransition)
+			}
+		default:
+			return textbookCatalogDocument{}, nil, "", "",
+				fmt.Errorf("%w: invalid textbook page proof method", records.ErrIllegalTransition)
 		}
 		seenSegments := make(map[string]struct{}, len(pageRef.SegmentRefs))
 		for segmentIndex, segmentRef := range pageRef.SegmentRefs {
@@ -653,10 +671,21 @@ func validateTextbookCatalogPageProofTx(
 		return fmt.Errorf("k12storage: load textbook page checkpoint: %w", err)
 	}
 	if contentDigest != proof.EvidenceDigest || sha256Hex([]byte(content)) != contentDigest ||
-		proof.EvidenceOffsetTo > len(content) ||
-		strings.TrimSpace(content[proof.EvidenceOffsetFrom:proof.EvidenceOffsetTo]) !=
-			strconv.Itoa(pageRef.LogicalPage) {
+		proof.EvidenceOffsetTo > len(content) {
 		return fmt.Errorf("%w: textbook printed-page evidence mismatch", records.ErrIllegalTransition)
+	}
+	switch proof.Method {
+	case "printed_anchor":
+		if strings.TrimSpace(content[proof.EvidenceOffsetFrom:proof.EvidenceOffsetTo]) !=
+			strconv.Itoa(pageRef.LogicalPage) {
+			return fmt.Errorf("%w: textbook printed-page evidence mismatch", records.ErrIllegalTransition)
+		}
+	case "adjacent_printed_anchors":
+		if proof.EvidenceOffsetFrom != 0 || proof.EvidenceOffsetTo != len(content) {
+			return fmt.Errorf("%w: textbook interpolated-page evidence mismatch", records.ErrIllegalTransition)
+		}
+	default:
+		return fmt.Errorf("%w: textbook page evidence method mismatch", records.ErrIllegalTransition)
 	}
 	for _, segmentRef := range proof.SegmentRefs {
 		var exists int

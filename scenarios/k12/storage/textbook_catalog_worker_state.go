@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const TextbookCatalogExtractorContract = "checkpoint-toc-footer-v1"
+const TextbookCatalogExtractorContract = "checkpoint-toc-footer-v2"
 
 var ErrTextbookCatalogSourceIncomplete = errors.New("textbook catalog source evidence incomplete")
 
@@ -431,18 +431,24 @@ func (s *Store) RecoverTextbookCatalogJobs(
 	type pendingSnapshot struct {
 		jobID, manifestID, ownerID, documentID, sourceDigest string
 		generation                                           int64
+		staleExtractor                                       int
 	}
 	legacyRows, err := tx.QueryContext(ctx, `SELECT j.job_id,j.manifest_id,j.owner_id,
-		j.document_id,j.document_generation,j.source_digest
+		j.document_id,j.document_generation,j.source_digest,
+		CASE WHEN j.state='failed_terminal' AND j.failure_code='catalog_evidence_incomplete'
+		          AND j.extractor_contract<>? THEN 1 ELSE 0 END
 		FROM k12_textbook_catalog_jobs j
 		JOIN k12_textbook_manifests m ON m.manifest_id=j.manifest_id
-		WHERE (j.state IN ('queued','retry_wait','failed_retryable')
-		       OR (j.state='failed_terminal' AND j.failure_code='source_evidence_incomplete'))
-		  AND (j.ingest_job_id='' OR length(j.source_plan_digest)<>64)
-		  AND (m.state IN ('extracting','failed_retryable')
-		       OR (j.state='failed_terminal' AND j.failure_code='source_evidence_incomplete'
-		           AND m.state='failed_terminal'))
-		ORDER BY j.created_at,j.job_id LIMIT ?`, limit)
+		WHERE (((j.state IN ('queued','retry_wait','failed_retryable')
+		          OR (j.state='failed_terminal' AND j.failure_code='source_evidence_incomplete'))
+		         AND (j.ingest_job_id='' OR length(j.source_plan_digest)<>64)
+		         AND (m.state IN ('extracting','failed_retryable')
+		          OR (j.state='failed_terminal' AND j.failure_code='source_evidence_incomplete'
+		              AND m.state='failed_terminal')))
+		    OR (j.state='failed_terminal' AND j.failure_code='catalog_evidence_incomplete'
+		        AND j.extractor_contract<>? AND m.state='failed_terminal'))
+		ORDER BY j.created_at,j.job_id LIMIT ?`,
+		TextbookCatalogExtractorContract, TextbookCatalogExtractorContract, limit)
 	if err != nil {
 		return err
 	}
@@ -450,7 +456,8 @@ func (s *Store) RecoverTextbookCatalogJobs(
 	for legacyRows.Next() {
 		var item pendingSnapshot
 		if err := legacyRows.Scan(&item.jobID, &item.manifestID, &item.ownerID,
-			&item.documentID, &item.generation, &item.sourceDigest); err != nil {
+			&item.documentID, &item.generation, &item.sourceDigest,
+			&item.staleExtractor); err != nil {
 			legacyRows.Close()
 			return err
 		}
@@ -494,12 +501,18 @@ func (s *Store) RecoverTextbookCatalogJobs(
 		if _, err := tx.ExecContext(ctx, `UPDATE k12_textbook_catalog_jobs
 			SET ingest_job_id=?,source_plan_digest=?,extractor_contract=?,
 			    request_digest=?,state=?,failure_code=?,last_error=?,
+			    attempt=CASE WHEN ?=1 THEN 0 ELSE attempt END,
+			    result_digest=CASE WHEN ?=1 THEN '' ELSE result_digest END,
 			    next_attempt_at=0,lease_owner='',lease_expires_at=0,updated_at=?
-			WHERE job_id=? AND (state IN ('queued','retry_wait','failed_retryable')
+			WHERE job_id=? AND (((state IN ('queued','retry_wait','failed_retryable')
 			  OR (state='failed_terminal' AND failure_code='source_evidence_incomplete'))
-			  AND (ingest_job_id='' OR length(source_plan_digest)<>64)`,
+			  AND (ingest_job_id='' OR length(source_plan_digest)<>64))
+			  OR (?=1 AND state='failed_terminal'
+			      AND failure_code='catalog_evidence_incomplete' AND extractor_contract<>?))`,
 			ingestJobID, sourcePlanDigest, TextbookCatalogExtractorContract,
-			requestDigest, state, failureCode, lastError, nowMilli, item.jobID,
+			requestDigest, state, failureCode, lastError,
+			item.staleExtractor, item.staleExtractor, nowMilli, item.jobID,
+			item.staleExtractor, TextbookCatalogExtractorContract,
 		); err != nil {
 			return err
 		}

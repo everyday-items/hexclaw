@@ -47,6 +47,7 @@ var (
 	textbookApprovalYearPattern = regexp.MustCompile(`([12][0-9]{3})\s*年\s*经国家教材委员会专家委员会审核通过`)
 	textbookEditionYearPattern  = regexp.MustCompile(`（\s*([12][0-9]{3})\s*年版\s*）`)
 	textbookTOCMajorPattern     = regexp.MustCompile(`^\s*([1-9][0-9]*)\s+(.+?)\s+([1-9][0-9]*)\s*$`)
+	textbookTOCChinesePattern   = regexp.MustCompile(`^\s*([一二三四五六七八九])\s+(.+?)\s+([1-9][0-9]*)\s*$`)
 	textbookTOCChildPattern     = regexp.MustCompile(`^\s{2,}(\S.*?)\s+([1-9][0-9]*)\s*$`)
 )
 
@@ -96,12 +97,14 @@ type textbookCatalogJSONPage struct {
 }
 
 type printedPageAnchor struct {
-	LogicalPage int
-	PDFPage     int
-	OffsetFrom  int
-	OffsetTo    int
-	Digest      string
-	Segments    []string
+	LogicalPage  int
+	PDFPage      int
+	EvidencePage int
+	OffsetFrom   int
+	OffsetTo     int
+	Digest       string
+	Method       string
+	Segments     []string
 }
 
 func (TextbookCatalogCheckpointExtractor) Extract(
@@ -150,19 +153,61 @@ func (TextbookCatalogCheckpointExtractor) Extract(
 		}
 		anchors = append(anchors, printedPageAnchor{
 			LogicalPage: logicalPage, PDFPage: page.PDFPage,
-			OffsetFrom: from, OffsetTo: to, Digest: page.ContentDigest,
+			EvidencePage: page.PDFPage,
+			OffsetFrom:   from, OffsetTo: to, Digest: page.ContentDigest,
+			Method:   "printed_anchor",
 			Segments: segments,
 		})
 	}
-	if tocStart < 0 || len(anchors) == 0 {
+	if tocStart < 0 || len(anchors) < 2 {
 		return fail("table of contents or printed footer is missing")
 	}
+	pageOffset := anchors[0].LogicalPage - anchors[0].PDFPage
 	for index, anchor := range anchors {
-		if index > 0 && (anchor.LogicalPage != anchors[index-1].LogicalPage+1 ||
-			anchor.PDFPage <= anchors[index-1].PDFPage) {
-			return fail("printed page anchors are not complete and monotonic")
+		if anchor.LogicalPage-anchor.PDFPage != pageOffset {
+			return fail("printed page anchors have conflicting offsets")
+		}
+		if index > 0 {
+			previous := anchors[index-1]
+			pdfGap := anchor.PDFPage - previous.PDFPage
+			if pdfGap < 1 || pdfGap > 2 || anchor.LogicalPage-previous.LogicalPage != pdfGap {
+				return fail("printed page anchors are not complete and monotonic")
+			}
 		}
 	}
+	explicitByPDFPage := make(map[int]printedPageAnchor, len(anchors))
+	for _, anchor := range anchors {
+		explicitByPDFPage[anchor.PDFPage] = anchor
+	}
+	firstAnchorPDF := anchors[0].PDFPage
+	lastAnchorPDF := anchors[len(anchors)-1].PDFPage
+	completedAnchors := make([]printedPageAnchor, 0, lastAnchorPDF-firstAnchorPDF+1)
+	for pdfPage := firstAnchorPDF; pdfPage <= lastAnchorPDF; pdfPage++ {
+		if anchor, ok := explicitByPDFPage[pdfPage]; ok {
+			completedAnchors = append(completedAnchors, anchor)
+			continue
+		}
+		previous, previousOK := explicitByPDFPage[pdfPage-1]
+		next, nextOK := explicitByPDFPage[pdfPage+1]
+		if !previousOK || !nextOK ||
+			previous.LogicalPage+2 != next.LogicalPage {
+			return fail("printed page anchors are not complete and monotonic")
+		}
+		page := source.Pages[pdfPage-1]
+		segments := append([]string(nil), page.SegmentRefs...)
+		sort.Strings(segments)
+		if len(segments) == 0 || hasEmptyOrDuplicateTextbookString(segments) {
+			return fail("interpolated page has no exact chunk proof")
+		}
+		// 只补齐被前后两个可信页脚夹住的单页；正文和 chunk 仍取该物理页自身事实。
+		completedAnchors = append(completedAnchors, printedPageAnchor{
+			LogicalPage: pdfPage + pageOffset,
+			PDFPage:     pdfPage, EvidencePage: pdfPage,
+			OffsetFrom: 0, OffsetTo: len(page.Content), Digest: page.ContentDigest,
+			Method: "adjacent_printed_anchors", Segments: segments,
+		})
+	}
+	anchors = completedAnchors
 
 	fullText := allText.String()
 	if !strings.Contains(fullText, "人民教育出版社") {
@@ -190,13 +235,18 @@ func (TextbookCatalogCheckpointExtractor) Extract(
 	if strings.EqualFold(filepath.Ext(title), ".pdf") {
 		title = strings.TrimSuffix(title, filepath.Ext(title))
 	}
-	if title == "" || !strings.Contains(
-		normalizeTextbookEvidence(fullText), normalizeTextbookEvidence(title),
-	) {
+	fullTextEvidence := normalizeTextbookEvidence(fullText)
+	titleEvidence := normalizeTextbookEvidence(title)
+	titleConfirmed := strings.Contains(fullTextEvidence, titleEvidence)
+	if !titleConfirmed {
+		// 上传名可带封面不会逐字重复的固定版本前缀，核心年级与册次仍须命中正文。
+		titleCore := strings.TrimPrefix(strings.TrimPrefix(titleEvidence, "人教版"), "小学")
+		titleConfirmed = titleCore != "" && strings.Contains(fullTextEvidence, titleCore)
+	}
+	if title == "" || !titleConfirmed {
 		return fail("trusted document title is not confirmed by page text")
 	}
 
-	firstAnchorPDF := anchors[0].PDFPage
 	if tocStart+1 >= firstAnchorPDF {
 		return fail("table of contents is not before textbook body")
 	}
@@ -267,9 +317,9 @@ func (TextbookCatalogCheckpointExtractor) Extract(
 		})
 		proofs = append(proofs, k12storage.TextbookCatalogPageProof{
 			LogicalPage: anchor.LogicalPage, PDFPage: anchor.PDFPage,
-			EvidencePage: anchor.PDFPage, EvidenceOffsetFrom: anchor.OffsetFrom,
+			EvidencePage: anchor.EvidencePage, EvidenceOffsetFrom: anchor.OffsetFrom,
 			EvidenceOffsetTo: anchor.OffsetTo, EvidenceDigest: anchor.Digest,
-			Method: "printed_anchor", SegmentRefs: append([]string(nil), anchor.Segments...),
+			Method: anchor.Method, SegmentRefs: append([]string(nil), anchor.Segments...),
 		})
 	}
 	encoded, err := json.Marshal(catalog)
@@ -290,10 +340,24 @@ func parseTextbookTOC(pages []k12storage.TextbookCatalogSourcePage) ([]extracted
 				}
 				return r
 			}, line)
-			if match := textbookTOCMajorPattern.FindStringSubmatch(line); len(match) == 4 {
-				ordinal, _ := strconv.Atoi(match[1])
-				pageFrom, _ := strconv.Atoi(match[3])
-				title := strings.TrimSpace(match[2])
+			trimmedLeft := strings.TrimLeft(line, " ")
+			if strings.HasPrefix(trimmedLeft, "#") {
+				line = strings.TrimSpace(strings.TrimLeft(trimmedLeft, "#"))
+			}
+			majorMatch := textbookTOCMajorPattern.FindStringSubmatch(line)
+			ordinal := 0
+			if len(majorMatch) != 4 {
+				majorMatch = textbookTOCChinesePattern.FindStringSubmatch(line)
+				if len(majorMatch) == 4 {
+					ordinal = strings.Index("一二三四五六七八九", majorMatch[1])/len("一") + 1
+				}
+			}
+			if len(majorMatch) == 4 {
+				if ordinal == 0 {
+					ordinal, _ = strconv.Atoi(majorMatch[1])
+				}
+				pageFrom, _ := strconv.Atoi(majorMatch[3])
+				title := strings.TrimSpace(majorMatch[2])
 				if title == "" || ordinal != len(units)+1 {
 					return nil, fmt.Errorf("TOC unit sequence is ambiguous")
 				}

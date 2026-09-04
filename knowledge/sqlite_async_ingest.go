@@ -435,18 +435,20 @@ func queueFailedTextRetryTx(
 	nowMillis int64,
 	visionRoute *VisionRouteSnapshot,
 ) error {
-	var failedRoots int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM kb_knowledge_jobs
+	var predecessorJobID string
+	err := tx.QueryRowContext(ctx, `SELECT job_id FROM kb_knowledge_jobs
 		WHERE owner_id=? AND corpus_uid=? AND document_id=? AND document_generation=?
-		  AND kind='ingest' AND state='failed' AND cancel_requested=0`,
-		ownerID, corpusUID, documentID, generation).Scan(&failedRoots); err != nil {
-		return err
-	}
-	if failedRoots == 0 {
+		  AND kind='ingest' AND state='failed' AND cancel_requested=0
+		ORDER BY COALESCE(finished_at,updated_at) DESC,job_id DESC
+		LIMIT 1`, ownerID, corpusUID, documentID, generation).Scan(&predecessorJobID)
+	if errors.Is(err, sql.ErrNoRows) {
 		return ErrDocumentRetryNotAllowed
 	}
+	if err != nil {
+		return err
+	}
 	var digest, extension, mediaType string
-	err := tx.QueryRowContext(ctx, `SELECT blob_sha256,extension,media_type
+	err = tx.QueryRowContext(ctx, `SELECT blob_sha256,extension,media_type
 		FROM kb_ingest_document_sources
 		WHERE owner_id=? AND corpus_uid=? AND document_id=? AND content_generation=?`,
 		ownerID, corpusUID, documentID, generation).Scan(&digest, &extension, &mediaType)
@@ -496,6 +498,69 @@ func queueFailedTextRetryTx(
 	}
 	if err := persistVisionRouteSnapshotTx(ctx, tx, jobID, visionRoute, nowMillis); err != nil {
 		return err
+	}
+	if err := inheritSucceededOCRPagesTx(ctx, tx, predecessorJobID, jobID, digest); err != nil {
+		return err
+	}
+	return nil
+}
+
+// inheritSucceededOCRPagesTx 只继承已由同一路由成功提交的 OCR 页事实。
+func inheritSucceededOCRPagesTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	predecessorJobID, newJobID, sourceDigest string,
+) error {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO kb_ingest_page_checkpoints
+		(job_id,page_number,pages_total,source_digest,extraction_mode,content,content_digest,
+		 source_offset_start,source_offset_end,lease_epoch,created_at,updated_at)
+		SELECT ?,c.page_number,c.pages_total,c.source_digest,c.extraction_mode,c.content,c.content_digest,
+		       c.source_offset_start,c.source_offset_end,c.lease_epoch,c.created_at,c.updated_at
+		FROM kb_ingest_page_checkpoints c
+		JOIN kb_knowledge_jobs oldj ON oldj.job_id=c.job_id
+		JOIN kb_knowledge_jobs newj ON newj.job_id=?
+		JOIN kb_ingest_execution_snapshots oldr ON oldr.job_id=oldj.job_id
+		JOIN kb_ingest_execution_snapshots newr ON newr.job_id=newj.job_id
+		JOIN kb_ingest_page_route_receipts rr
+		  ON rr.job_id=c.job_id AND rr.page_number=c.page_number
+		WHERE c.job_id=? AND c.source_digest=? AND c.extraction_mode='ocr_vlm'
+		  AND oldj.kind='ingest' AND oldj.state='failed' AND oldj.cancel_requested=0
+		  AND newj.kind='ingest' AND newj.state='queued'
+		  AND oldj.owner_id=newj.owner_id
+		  AND oldj.corpus_uid=newj.corpus_uid
+		  AND oldj.document_id=newj.document_id
+		  AND oldj.document_generation=newj.document_generation
+		  AND oldr.provider_name=newr.provider_name AND oldr.model=newr.model
+		  AND rr.status='succeeded' AND rr.pages_total=c.pages_total
+		  AND rr.source_digest=c.source_digest AND rr.content_digest=c.content_digest
+		  AND rr.provider=oldr.provider_name AND rr.model=oldr.model
+		  AND rr.operation=?`, newJobID, newJobID, predecessorJobID, sourceDigest,
+		OCRRouteOperationPDFPage); err != nil {
+		return fmt.Errorf("knowledge: inherit succeeded OCR checkpoints: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO kb_ingest_page_route_receipts
+		(job_id,page_number,pages_total,provider,model,operation,status,source_digest,
+		 content_digest,fake,created_at)
+		SELECT ?,rr.page_number,rr.pages_total,rr.provider,rr.model,rr.operation,rr.status,
+		       rr.source_digest,rr.content_digest,rr.fake,rr.created_at
+		FROM kb_ingest_page_route_receipts rr
+		JOIN kb_ingest_page_checkpoints oldc
+		  ON oldc.job_id=rr.job_id AND oldc.page_number=rr.page_number
+		JOIN kb_ingest_page_checkpoints newc
+		  ON newc.job_id=? AND newc.page_number=rr.page_number
+		JOIN kb_ingest_execution_snapshots oldr ON oldr.job_id=rr.job_id
+		JOIN kb_ingest_execution_snapshots newr ON newr.job_id=newc.job_id
+		WHERE rr.job_id=? AND rr.source_digest=? AND rr.status='succeeded'
+		  AND rr.pages_total=oldc.pages_total
+		  AND rr.source_digest=oldc.source_digest AND rr.content_digest=oldc.content_digest
+		  AND newc.extraction_mode='ocr_vlm'
+		  AND newc.pages_total=oldc.pages_total
+		  AND newc.source_digest=oldc.source_digest AND newc.content_digest=oldc.content_digest
+		  AND oldr.provider_name=newr.provider_name AND oldr.model=newr.model
+		  AND rr.provider=oldr.provider_name AND rr.model=oldr.model
+		  AND rr.operation=?`, newJobID, newJobID, predecessorJobID, sourceDigest,
+		OCRRouteOperationPDFPage); err != nil {
+		return fmt.Errorf("knowledge: inherit succeeded OCR route receipts: %w", err)
 	}
 	return nil
 }

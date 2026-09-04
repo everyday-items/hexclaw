@@ -127,7 +127,8 @@ func (s *Store) GetActiveTextbookGroundingScope(
 		}
 		if logicalPage < 1 || pdfPage < 1 || evidencePage != pdfPage ||
 			evidenceOffsetStart < 0 || evidenceOffsetEnd <= evidenceOffsetStart ||
-			!validSHA256Digest(evidenceDigest) || method != "printed_anchor" ||
+			!validSHA256Digest(evidenceDigest) ||
+			(method != "printed_anchor" && method != "adjacent_printed_anchors") ||
 			verificationState != "verified" || documentID != scope.DocumentID ||
 			documentGeneration != scope.DocumentGeneration || sourceDigest != scope.SourceDigest {
 			mappingRows.Close()
