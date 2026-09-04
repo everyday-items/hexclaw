@@ -1933,13 +1933,24 @@ func (s *Scheduler) checkAndExecute(now time.Time) {
 			continue
 		}
 		delay := staggerFor(job.ID, s.staggerMax)
-		go func(j *Job) {
+		queuedAt := time.Now()
+		runtime := ""
+		if job.Spec != nil {
+			runtime = job.Spec.Runtime
+		}
+		slog.Info("[cron] job lifecycle",
+			"source", "cron", "job", job.ID, "runtime", runtime,
+			"stage", "due_to_queue", "elapsed_ms", queuedAt.Sub(job.NextRunAt).Milliseconds(), "status", "queued")
+		go func(j *Job, queuedAt time.Time, runtime string, delay time.Duration) {
 			if delay > 0 {
 				timer := time.NewTimer(delay)
 				select {
 				case <-timer.C:
 				case <-s.stopCh:
 					timer.Stop()
+					slog.Info("[cron] job lifecycle",
+						"source", "cron", "job", j.ID, "runtime", runtime,
+						"stage", "queue", "elapsed_ms", time.Since(queuedAt).Milliseconds(), "status", "canceled")
 					return
 				}
 			}
@@ -1949,11 +1960,17 @@ func (s *Scheduler) checkAndExecute(now time.Time) {
 				case s.sem <- struct{}{}:
 					defer func() { <-s.sem }()
 				case <-s.stopCh:
+					slog.Info("[cron] job lifecycle",
+						"source", "cron", "job", j.ID, "runtime", runtime,
+						"stage", "queue", "elapsed_ms", time.Since(queuedAt).Milliseconds(), "status", "canceled")
 					return
 				}
 			}
+			slog.Info("[cron] job lifecycle",
+				"source", "cron", "job", j.ID, "runtime", runtime,
+				"stage", "queue", "elapsed_ms", time.Since(queuedAt).Milliseconds(), "status", "ready")
 			s.executeJob(j)
-		}(job)
+		}(job, queuedAt, runtime, delay)
 	}
 }
 
@@ -2124,10 +2141,21 @@ func (s *Scheduler) executeJob(job *Job) {
 		return // 上一次执行尚未完成（进程内去重）
 	}
 	defer s.running.Delete(job.ID)
+	executeStarted := time.Now()
+	runtime := ""
+	if job.Spec != nil {
+		runtime = job.Spec.Runtime
+		if runtime == RuntimePython3 && looksLikeStarlark(job.Spec.Script) {
+			runtime = RuntimeStarlark
+		}
+	}
 
 	// 跨副本去重：进程内 sync.Map 只防单实例重入，多副本部署时同一到期刻度会被多个
 	// 实例同时触发。claimJob 用 DB 原子领取保证一个到期刻度只跑一个副本。
 	if !s.claimJob(job) {
+		slog.Info("[cron] job lifecycle",
+			"source", "cron", "job", job.ID, "runtime", runtime,
+			"stage", "execute", "elapsed_ms", time.Since(executeStarted).Milliseconds(), "status", "not_claimed")
 		return // 另一副本已领取本到期刻度
 	}
 
@@ -2145,6 +2173,9 @@ func (s *Scheduler) executeJob(job *Job) {
 		ec, cancel := earlyCtx()
 		defer cancel()
 		_, _ = s.persistHistoryForGeneration(ec, job, "error", "", "Spec 为 nil — 请重新创建任务", 0, now, "", "", 0, nil)
+		slog.Info("[cron] job lifecycle",
+			"source", "cron", "job", job.ID, "runtime", runtime,
+			"stage", "execute", "elapsed_ms", time.Since(executeStarted).Milliseconds(), "status", "error")
 		return
 	}
 	// context_from 线性任务链：执行前把上游最近一次产物注入本任务（仅读最近一条，
@@ -2162,6 +2193,22 @@ func (s *Scheduler) executeJob(job *Job) {
 	// §13.3(2)：把 job lifecycle（ID + generation）带进 ctx。Stable-key
 	// replacement 复用 ID；generation 隔离防旧脚本迟到 state_set 污染新定义。
 	runCtx = withStateJob(runCtx, job)
+	heartbeatCtx, stopHeartbeat := context.WithCancel(runCtx)
+	defer stopHeartbeat()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				slog.Info("[cron] job heartbeat",
+					"source", "cron", "job", job.ID, "runtime", runtime,
+					"stage", "execute", "elapsed_ms", time.Since(executeStarted).Milliseconds(), "status", "running")
+			}
+		}
+	}()
 
 	var result *RunResult
 	var runErr error
@@ -2175,15 +2222,13 @@ func (s *Scheduler) executeJob(job *Job) {
 			result = s.runAgentJob(runCtx, job)
 		}
 	} else {
-		runtime := job.Spec.Runtime
 		// Backstop: a script tagged python3 but using Starlark host builtins (emit /
 		// kb_ingest / ...) was mis-routed — e.g. a weak compiler model declared python3
 		// while emitting Starlark. Run it on the engine it was actually written for
 		// instead of failing with NameError at python runtime; also self-heals already
 		// persisted jobs without a re-compile.
-		if runtime == RuntimePython3 && looksLikeStarlark(job.Spec.Script) {
+		if job.Spec.Runtime == RuntimePython3 && runtime == RuntimeStarlark {
 			slog.Warn("[cron] script tagged python3 but uses Starlark builtins — routing to Starlark engine", "source", "cron", "id", job.ID)
-			runtime = RuntimeStarlark
 		}
 		engine := s.engineFor(runtime)
 		if engine == nil {
@@ -2239,12 +2284,24 @@ func (s *Scheduler) executeJob(job *Job) {
 		result.Status = "error"
 		result.Error = runErr.Error()
 	}
-	logger.Info("[cron] 脚本任务结束",
-		"name", job.Name, "id", job.ID,
-		"status", result.Status, "exit", result.ExitCode, "duration_ms", result.DurationMs)
+	stopHeartbeat()
+	slog.Info("[cron] job lifecycle",
+		"source", "cron", "job", job.ID, "runtime", runtime,
+		"stage", "execute", "elapsed_ms", time.Since(executeStarted).Milliseconds(),
+		"status", result.Status, "exit", result.ExitCode)
 
 	// Update job state (the persistence ctx is created after the run finishes,
 	// see the note at the top of this function).
+	persistStarted := time.Now()
+	persistStatus := "success"
+	persistLogged := false
+	defer func() {
+		if !persistLogged {
+			slog.Info("[cron] job lifecycle",
+				"source", "cron", "job", job.ID, "runtime", runtime,
+				"stage", "persist", "elapsed_ms", time.Since(persistStarted).Milliseconds(), "status", persistStatus)
+		}
+	}()
 	dbCtx, dbCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer dbCancel()
 	now = time.Now()
@@ -2285,6 +2342,7 @@ func (s *Scheduler) executeJob(job *Job) {
 		}
 		if err != nil {
 			logger.Error("Cron: 更新任务状态失败", "error", err)
+			persistStatus = "error"
 			if job.Generation != "" {
 				return
 			}
@@ -2293,6 +2351,7 @@ func (s *Scheduler) executeJob(job *Job) {
 			// therefore means this run was superseded or removed. Legacy/test jobs
 			// without a generation retain the historical no-row fail-open behavior.
 			if job.Generation != "" {
+				persistStatus = "stale"
 				slog.Info("[cron] 已忽略旧世代执行结果",
 					"source", "cron", "id", job.ID, "generation", job.Generation)
 				return
@@ -2303,6 +2362,7 @@ func (s *Scheduler) executeJob(job *Job) {
 	s.mu.Lock()
 	if !s.currentJobGenerationLocked(job) {
 		s.mu.Unlock()
+		persistStatus = "stale"
 		return
 	}
 	if j, ok := s.jobs[job.ID]; ok {
@@ -2335,27 +2395,40 @@ func (s *Scheduler) executeJob(job *Job) {
 	)
 	if historyErr != nil {
 		logger.Error("Cron: 写入执行历史失败", "error", historyErr)
+		persistStatus = "error"
 	}
 	if !persisted {
+		if persistStatus == "success" {
+			persistStatus = "stale"
+		}
 		slog.Info("[cron] 已忽略旧世代历史与投递", "source", "cron", "id", job.ID, "generation", job.Generation)
 		return
 	}
 	// History/pruning may consume most of dbCtx's budget. Delivery is a new
 	// external boundary and must get a fresh generation-check deadline.
 	if !s.jobGenerationCurrentFresh(job) {
+		persistStatus = "stale"
 		return
 	}
+	persistLogged = true
+	slog.Info("[cron] job lifecycle",
+		"source", "cron", "job", job.ID, "runtime", runtime,
+		"stage", "persist", "elapsed_ms", time.Since(persistStarted).Milliseconds(), "status", persistStatus)
 
+	deliveryStarted := time.Now()
+	deliveryStatus := "attempted"
 	if result.Status == "success" {
 		s.resolveSelfHealVerification(dbCtx, job, result)
 		// §13.3(2) only_if_changed：产物与上次相同 → 跳过投递（执行已跑、取过数）。
 		// 否则按 deliver 目标投递（脚本与 agent 结果同走）。
 		if job.OnlyIfChanged && s.outputUnchangedForGeneration(job, result) {
+			deliveryStatus = "skipped_unchanged"
 			slog.Info("[cron] only_if_changed：产物未变，跳过投递", "source", "cron", "id", job.ID, "name", job.Name)
 		} else {
 			s.deliverResult(job, result)
 		}
 	} else {
+		deliveryStatus = "failure_handled"
 		_, pendingHeal := s.selfHealPendingMarker(job)
 		if pendingHeal {
 			s.resolveSelfHealVerification(dbCtx, job, result)
@@ -2374,6 +2447,10 @@ func (s *Scheduler) executeJob(job *Job) {
 			s.maybeSelfHeal(dbCtx, job, result)
 		}
 	}
+	slog.Info("[cron] job lifecycle",
+		"source", "cron", "job", job.ID, "runtime", runtime,
+		"stage", "delivery", "elapsed_ms", time.Since(deliveryStarted).Milliseconds(),
+		"status", deliveryStatus, "total_elapsed_ms", time.Since(executeStarted).Milliseconds())
 }
 
 // maybeFailureDeliver routes a failure summary to the job's FailureDeliver

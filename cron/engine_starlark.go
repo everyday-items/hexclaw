@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
@@ -382,12 +383,21 @@ func (e *StarlarkEngine) builtinHTTP(ctx context.Context, method string) func(*s
 		if token := e.loopbackCapability(); token != "" && isLoopbackURL(url) {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
+		started := time.Now()
 		resp, err := e.client.Do(req)
 		if err != nil {
+			slog.Info("[cron] starlark external call",
+				"source", "cron", "job", stateJobIDFrom(ctx), "runtime", RuntimeStarlark,
+				"stage", "http", "elapsed_ms", time.Since(started).Milliseconds(),
+				"status", "error", "method", method, "host", req.URL.Hostname())
 			return nil, fmt.Errorf("%s: %w", b.Name(), err)
 		}
 		defer resp.Body.Close()
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, e.maxBody))
+		slog.Info("[cron] starlark external call",
+			"source", "cron", "job", stateJobIDFrom(ctx), "runtime", RuntimeStarlark,
+			"stage", "http", "elapsed_ms", time.Since(started).Milliseconds(),
+			"status", "success", "method", method, "host", req.URL.Hostname(), "http_status", resp.StatusCode)
 		out := starlark.NewDict(2)
 		_ = out.SetKey(starlark.String("status"), starlark.MakeInt(resp.StatusCode))
 		_ = out.SetKey(starlark.String("body"), starlark.String(string(data)))
@@ -424,10 +434,17 @@ func (e *StarlarkEngine) builtinKBIngest(ctx context.Context) func(*starlark.Thr
 		if strings.TrimSpace(content) == "" {
 			return nil, fmt.Errorf("kb_ingest: content must not be empty")
 		}
+		started := time.Now()
 		id, err := e.kbIngest(ctx, title, content, source)
 		if err != nil {
+			slog.Info("[cron] starlark external call",
+				"source", "cron", "job", stateJobIDFrom(ctx), "runtime", RuntimeStarlark,
+				"stage", "kb_ingest", "elapsed_ms", time.Since(started).Milliseconds(), "status", "error")
 			return nil, fmt.Errorf("kb_ingest: %w", err)
 		}
+		slog.Info("[cron] starlark external call",
+			"source", "cron", "job", stateJobIDFrom(ctx), "runtime", RuntimeStarlark,
+			"stage", "kb_ingest", "elapsed_ms", time.Since(started).Milliseconds(), "status", "success")
 		out := starlark.NewDict(1)
 		_ = out.SetKey(starlark.String("id"), starlark.String(id))
 		return out, nil
