@@ -341,7 +341,8 @@ func (d *k12IMDeliverer) receiptBindingIsActive(receipt k12.DeliveryReceipt) boo
 		if rule.AgentName != receipt.AgentName || stableBindingID(rule) != receipt.BindingID {
 			continue
 		}
-		if rule.Platform != target.Platform || rule.ChatID != target.ChatID {
+		if rule.Platform != target.Platform ||
+			(rule.ChatID != "" && rule.ChatID != target.ChatID) {
 			return false
 		}
 		if resolveInstanceID == nil {

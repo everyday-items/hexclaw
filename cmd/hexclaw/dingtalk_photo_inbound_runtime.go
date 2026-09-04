@@ -186,6 +186,7 @@ func (r *k12DingtalkPhotoInboundRuntime) AdmitInboundPhoto(
 	ctx context.Context,
 	msg *adapter.Message,
 ) (bool, error) {
+	startedAt := time.Now()
 	if r == nil || r.inbound == nil {
 		return false, fmt.Errorf("DingTalk inbound photo runtime is unavailable")
 	}
@@ -219,6 +220,13 @@ func (r *k12DingtalkPhotoInboundRuntime) AdmitInboundPhoto(
 		if err != nil {
 			return false, err
 		}
+		slog.Info("K12 DingTalk inbound photo admitted",
+			"stage", "admitted",
+			"agent", bundle.Receipt.AgentName,
+			"receipt_id", bundle.Receipt.ReceiptID,
+			"resumed", true,
+			"duration_ms", time.Since(startedAt).Milliseconds(),
+		)
 		r.schedule(bundle.Receipt.AgentName, bundle.Receipt.ReceiptID)
 		return true, nil
 	}
@@ -263,6 +271,13 @@ func (r *k12DingtalkPhotoInboundRuntime) AdmitInboundPhoto(
 	if err != nil {
 		return false, err
 	}
+	slog.Info("K12 DingTalk inbound photo admitted",
+		"stage", "admitted",
+		"agent", bundle.Receipt.AgentName,
+		"receipt_id", bundle.Receipt.ReceiptID,
+		"resumed", false,
+		"duration_ms", time.Since(startedAt).Milliseconds(),
+	)
 	r.schedule(bundle.Receipt.AgentName, bundle.Receipt.ReceiptID)
 	return true, nil
 }
@@ -301,6 +316,7 @@ func (r *k12DingtalkPhotoInboundRuntime) run(agentName, receiptID string) {
 		if err := r.baseCtx.Err(); err != nil {
 			return
 		}
+		attemptStartedAt := time.Now()
 		bundle, err := r.inbound.Resume(r.baseCtx, agentName, receiptID)
 		done := false
 		if err == nil {
@@ -312,7 +328,19 @@ func (r *k12DingtalkPhotoInboundRuntime) run(agentName, receiptID string) {
 		delay := r.pollInterval
 		if err != nil {
 			if !errors.Is(err, records.ErrVersionConflict) {
-				slog.Warn("K12 DingTalk inbound photo worker will retry", "receipt", receiptID, "error", err)
+				slog.Warn("K12 DingTalk inbound photo worker will retry",
+					"agent", agentName,
+					"receipt", receiptID,
+					"dispatch_id", bundle.Dispatch.DispatchID,
+					"image_task_id", bundle.Dispatch.ImageTaskID,
+					"delivery_batch_id", bundle.Dispatch.DeliveryBatchID,
+					"processing_status", bundle.Dispatch.ProcessingStatus,
+					"routing_decision", bundle.Dispatch.RoutingDecision,
+					"reply_status", bundle.Dispatch.ReplyStatus,
+					"terminal_status", bundle.Dispatch.TerminalStatus,
+					"attempt_duration_ms", time.Since(attemptStartedAt).Milliseconds(),
+					"error_type", fmt.Sprintf("%T", err),
+				)
 			}
 			delay = r.retryInterval
 		}
@@ -419,6 +447,15 @@ func (r *k12DingtalkPhotoInboundRuntime) createAndBindImageTask(
 	); err != nil {
 		return err
 	}
+	slog.Info("K12 DingTalk inbound photo image task submitted",
+		"stage", "image_task_submitted",
+		"agent", bundle.Receipt.AgentName,
+		"receipt_id", bundle.Receipt.ReceiptID,
+		"dispatch_id", view.Dispatch.DispatchID,
+		"page_asset_id", ready.Metadata.PageAssetID,
+		"provider", command.Provider,
+		"model", command.Model,
+	)
 	// V88 已冻结 task identity 后才允许模型 worker 越过执行边界。
 	r.imageTasks.StartAsync(bundle.Receipt.AgentName, view.Dispatch.DispatchID)
 	return nil
@@ -591,7 +628,17 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceImageTask(
 		ctx, bundle.Receipt.AgentName, bundle.Receipt.ReceiptID,
 		bundle.Dispatch.Version, result.FinalArtifact.ArtifactID,
 	)
-	return false, err
+	if err != nil {
+		return false, err
+	}
+	slog.Info("K12 DingTalk inbound photo final artifact ready",
+		"stage", "final_artifact_ready",
+		"agent", bundle.Receipt.AgentName,
+		"receipt_id", bundle.Receipt.ReceiptID,
+		"image_task_id", bundle.Dispatch.ImageTaskID,
+		"final_artifact_id", result.FinalArtifact.ArtifactID,
+	)
+	return false, nil
 }
 
 func (r *k12DingtalkPhotoInboundRuntime) resolvePracticeRoute(
@@ -761,11 +808,31 @@ func (r *k12DingtalkPhotoInboundRuntime) sendRoutingConfirmation(
 			content = k12PhotoRoutingCandidateText(snapshot)
 		}
 	}
-	_, _, err := r.replyBatches.PrepareAndSendMessageBatchForTargets(
+	slog.Info("K12 DingTalk inbound photo routing confirmation prepared",
+		"stage", "routing_confirmation_prepared",
+		"agent", bundle.Receipt.AgentName,
+		"receipt_id", bundle.Receipt.ReceiptID,
+		"routing_decision", bundle.Dispatch.RoutingDecision,
+	)
+	startedAt := time.Now()
+	batch, _, err := r.replyBatches.PrepareAndSendMessageBatchForTargets(
 		ctx, bundle.Receipt.AgentName, k12DingtalkPhotoRoutingObjectKind,
 		bundle.Receipt.ReceiptID,
 		k12usecase.DeliveryMessage{Content: content},
 		[]k12usecase.ResolvedDeliveryTarget{inboundPhotoFrozenTarget(bundle)},
+	)
+	log := slog.Info
+	if err != nil {
+		log = slog.Warn
+	}
+	log("K12 DingTalk inbound photo routing confirmation send result",
+		"stage", "routing_confirmation_send_result",
+		"agent", bundle.Receipt.AgentName,
+		"receipt_id", bundle.Receipt.ReceiptID,
+		"delivery_batch_id", batch.BatchID,
+		"delivery_status", batch.Status,
+		"duration_ms", time.Since(startedAt).Milliseconds(),
+		"error_type", fmt.Sprintf("%T", err),
 	)
 	return err
 }
@@ -847,6 +914,14 @@ func (r *k12DingtalkPhotoInboundRuntime) completeBoundReply(
 	); err != nil {
 		return false, err
 	}
+	slog.Info("K12 DingTalk inbound photo reply delivered",
+		"stage", "reply_delivered",
+		"agent", bundle.Receipt.AgentName,
+		"receipt_id", bundle.Receipt.ReceiptID,
+		"delivery_batch_id", bundle.Dispatch.DeliveryBatchID,
+		"delivery_status", batch.Status,
+		"part_count", len(batch.Receipts),
+	)
 	return true, nil
 }
 
@@ -928,11 +1003,21 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceFinalReply(
 			return false, err
 		}
 		bundle.Dispatch = bound
+		slog.Info("K12 DingTalk inbound photo delivery batch bound",
+			"stage", "delivery_batch_bound",
+			"agent", bundle.Receipt.AgentName,
+			"receipt_id", bundle.Receipt.ReceiptID,
+			"final_artifact_id", artifact.ArtifactID,
+			"delivery_batch_id", existing.BatchID,
+			"delivery_status", existing.Status,
+			"reused", true,
+		)
 		return r.completeBoundReply(ctx, bundle)
 	}
 	if !errors.Is(lookupErr, records.ErrNotFound) {
 		return false, lookupErr
 	}
+	deliveryStartedAt := time.Now()
 	batch, _, deliverErr := r.replies.Deliver(ctx, command)
 	if strings.TrimSpace(batch.BatchID) != "" {
 		persistCtx := context.WithoutCancel(ctx)
@@ -944,6 +1029,17 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceFinalReply(
 			return false, errors.Join(deliverErr, bindErr)
 		}
 		bundle.Dispatch = bound
+		slog.Info("K12 DingTalk inbound photo delivery batch bound",
+			"stage", "delivery_batch_bound",
+			"agent", bundle.Receipt.AgentName,
+			"receipt_id", bundle.Receipt.ReceiptID,
+			"final_artifact_id", artifact.ArtifactID,
+			"delivery_batch_id", batch.BatchID,
+			"delivery_status", batch.Status,
+			"reused", false,
+			"delivery_duration_ms", time.Since(deliveryStartedAt).Milliseconds(),
+			"send_error", deliverErr != nil,
+		)
 	}
 	if deliverErr != nil {
 		return false, deliverErr
@@ -966,6 +1062,15 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceFinalReply(
 	); err != nil {
 		return false, err
 	}
+	slog.Info("K12 DingTalk inbound photo reply delivered",
+		"stage", "reply_delivered",
+		"agent", bundle.Receipt.AgentName,
+		"receipt_id", bundle.Receipt.ReceiptID,
+		"final_artifact_id", artifact.ArtifactID,
+		"delivery_batch_id", bundle.Dispatch.DeliveryBatchID,
+		"delivery_status", batch.Status,
+		"part_count", len(batch.Receipts),
+	)
 	return true, nil
 }
 

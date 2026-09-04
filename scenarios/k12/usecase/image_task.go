@@ -737,31 +737,59 @@ func (c *ImageTaskCoordinator) expireImageTaskGapIfDue(
 // checkpoint. It is deliberately separate from Create: POST acceptance returns
 // the dispatch identity before any classifier/OCR/feedback provider call.
 func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
-	if c == nil || c.Records == nil {
-		return false
-	}
 	agentName = strings.TrimSpace(agentName)
 	dispatchID = strings.TrimSpace(dispatchID)
-	if agentName == "" || dispatchID == "" {
+	dispatchRef := ""
+	submissionRef := ""
+	jobRef := ""
+	stage := ""
+	if dispatchID != "" {
+		dispatchRef = shortSHA1([]byte(dispatchID))
+	}
+	logScheduling := func(accepted bool, reason string) {
+		slog.Info("K12 ImageTask scheduling decision",
+			"dispatch_ref", dispatchRef,
+			"submission_ref", submissionRef,
+			"job_ref", jobRef,
+			"stage", stage,
+			"accepted", accepted,
+			"reason", reason,
+		)
+	}
+	if c == nil || c.Records == nil {
+		logScheduling(false, "coordinator_unavailable")
 		return false
 	}
-	if _, err := c.Records.GetImageTaskDispatch(
-		context.Background(), agentName, dispatchID,
-	); err != nil {
+	if agentName == "" || dispatchID == "" {
+		logScheduling(false, "invalid_identity")
 		return false
+	}
+	dispatch, err := c.Records.GetImageTaskDispatch(
+		context.Background(), agentName, dispatchID,
+	)
+	if err != nil {
+		logScheduling(false, "dispatch_lookup_failed")
+		return false
+	}
+	stage = string(dispatch.Status)
+	if dispatch.TargetObjectType == k12.ImageTaskTargetHomeworkSubmission &&
+		dispatch.TargetObjectID != "" {
+		submissionRef = shortSHA1([]byte(dispatch.TargetObjectID))
 	}
 	key := agentName + "\x00" + dispatchID
 	c.workerMu.Lock()
 	c.initWorkerRuntimeLocked()
 	if c.sealed {
 		c.workerMu.Unlock()
+		logScheduling(false, "coordinator_sealed")
 		return false
 	}
-	runCtx, finishWorker, accepted := c.agentWorkers.start(
+	runCtx, finishWorker, workerAccepted := c.agentWorkers.start(
 		c.runCtx, agentName, key,
 	)
-	if !accepted {
+	if !workerAccepted {
 		c.workerMu.Unlock()
+		logScheduling(false, "worker_fenced_or_active")
 		return false
 	}
 	if c.workerCount == 0 {
@@ -769,6 +797,7 @@ func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
 	}
 	c.workerCount++
 	c.workerMu.Unlock()
+	logScheduling(true, "new_worker")
 	go func() {
 		defer func() {
 			c.workerMu.Lock()
@@ -782,12 +811,101 @@ func (c *ImageTaskCoordinator) StartAsync(agentName, dispatchID string) bool {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				slog.Error("K12 ImageTask worker panic; durable checkpoint retained",
-					"agent", agentName, "dispatch_id", dispatchID, "panic", recovered)
+					"dispatch_ref", dispatchRef,
+					"panicked", true,
+					"panic_type", fmt.Sprintf("%T", recovered),
+				)
 			}
 		}()
-		if _, err := c.Run(runCtx, agentName, dispatchID); err != nil {
+		runStarted := time.Now()
+		slog.Info("K12 ImageTask Run started",
+			"dispatch_ref", dispatchRef,
+			"submission_ref", submissionRef,
+			"job_ref", jobRef,
+			"stage", dispatch.Status,
+			"elapsed_ms", int64(0),
+		)
+
+		heartbeatCtx, stopHeartbeat := context.WithCancel(runCtx)
+		heartbeatStopped := make(chan struct{})
+		var stopHeartbeatOnce sync.Once
+		finishHeartbeat := func() {
+			stopHeartbeatOnce.Do(func() {
+				stopHeartbeat()
+				<-heartbeatStopped
+			})
+		}
+		go func() {
+			defer close(heartbeatStopped)
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-heartbeatCtx.Done():
+					return
+				case <-ticker.C:
+					heartbeatStage := string(dispatch.Status)
+					heartbeatSubmissionRef := submissionRef
+					if current, err := c.Records.GetImageTaskDispatch(
+						heartbeatCtx, agentName, dispatchID,
+					); err == nil {
+						heartbeatStage = string(current.Status)
+						if current.TargetObjectType == k12.ImageTaskTargetHomeworkSubmission &&
+							current.TargetObjectID != "" {
+							heartbeatSubmissionRef = shortSHA1([]byte(current.TargetObjectID))
+						}
+					}
+					slog.Info("K12 ImageTask Run heartbeat",
+						"dispatch_ref", dispatchRef,
+						"submission_ref", heartbeatSubmissionRef,
+						"job_ref", jobRef,
+						"stage", heartbeatStage,
+						"elapsed_ms", time.Since(runStarted).Milliseconds(),
+					)
+				}
+			}
+		}()
+		defer finishHeartbeat()
+
+		view, err := c.Run(runCtx, agentName, dispatchID)
+		finishHeartbeat()
+		finishedStage := string(dispatch.Status)
+		if view.Dispatch.Status != "" {
+			finishedStage = string(view.Dispatch.Status)
+		}
+		finishedSubmissionRef := submissionRef
+		finishedJobRef := jobRef
+		terminal := view.Dispatch.Status == k12.ImageTaskStatusFailed ||
+			view.Dispatch.Status == k12.ImageTaskStatusCancelled
+		if view.Homework != nil {
+			finishedStage = "homework/queued"
+			finishedSubmissionRef = shortSHA1([]byte(view.Homework.SubmissionID))
+			if view.Homework.GradingJobID != "" {
+				finishedJobRef = shortSHA1([]byte(view.Homework.GradingJobID))
+			}
+		}
+		if view.HomeworkProjection != nil {
+			finishedStage = "homework/" + view.HomeworkProjection.Stage
+			terminal = k12.GradingStageTerminal(view.HomeworkProjection.Stage)
+		} else if view.Creative != nil {
+			finishedStage = "creative/" + string(view.Creative.Status)
+		}
+		slog.Info("K12 ImageTask Run finished",
+			"dispatch_ref", dispatchRef,
+			"submission_ref", finishedSubmissionRef,
+			"job_ref", finishedJobRef,
+			"stage", finishedStage,
+			"elapsed_ms", time.Since(runStarted).Milliseconds(),
+			"terminal", terminal,
+			"failed", err != nil,
+		)
+		if err != nil {
 			slog.Warn("K12 ImageTask worker stopped at durable checkpoint",
-				"agent", agentName, "dispatch_id", dispatchID, "err", err)
+				"dispatch_ref", dispatchRef,
+				"stage", finishedStage,
+				"failed", true,
+				"error_type", fmt.Sprintf("%T", err),
+			)
 		}
 	}()
 	return true
@@ -1591,7 +1709,22 @@ func (c *ImageTaskCoordinator) continueTarget(
 			return view, err
 		}
 		view.Homework = &submission
-		c.Grading.StartAsync(job.Record.RecordID)
+		accepted := c.Grading.StartAsync(job.Record.RecordID)
+		elapsedMS := int64(0)
+		if view.Dispatch.AutomaticStartedAt > 0 {
+			elapsedSeconds := c.now() - view.Dispatch.AutomaticStartedAt
+			if elapsedSeconds > 0 {
+				elapsedMS = elapsedSeconds * int64(time.Second/time.Millisecond)
+			}
+		}
+		slog.Info("K12 ImageTask handed off to GradingJob",
+			"dispatch_ref", shortSHA1([]byte(view.Dispatch.DispatchID)),
+			"submission_ref", shortSHA1([]byte(submission.SubmissionID)),
+			"job_ref", shortSHA1([]byte(job.Record.RecordID)),
+			"stage", job.Record.Status,
+			"accepted", accepted,
+			"elapsed_ms", elapsedMS,
+		)
 		return view, nil
 	}
 	if view.Creative == nil {

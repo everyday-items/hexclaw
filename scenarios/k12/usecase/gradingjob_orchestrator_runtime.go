@@ -220,9 +220,26 @@ func (o *GradingOrchestrator) beginTrackedContext(parent context.Context) (conte
 // 同一 Job 已在推进中时记录一次 rerun 信号，当前轮退出前至少再读一次状态机；这样确认
 // 与锚点同时回位时不会因 active 守卫吞掉最后一次续跑。panic 不逃逸（§6.15）。
 func (o *GradingOrchestrator) StartAsync(jobID string) bool {
+	jobRef := ""
+	if trimmedJobID := strings.TrimSpace(jobID); trimmedJobID != "" {
+		jobRef = shortSHA1([]byte(trimmedJobID))
+	}
+	run := o.lookup(jobID)
+	agentName := ""
+	if run != nil {
+		agentName = run.agentName
+	}
+	logScheduling := func(accepted bool, reason string) {
+		slog.Info("K12 GradingJob scheduling decision",
+			"job_ref", jobRef,
+			"accepted", accepted,
+			"reason", reason,
+		)
+	}
 	o.mu.Lock()
 	if o.sealed {
 		o.mu.Unlock()
+		logScheduling(false, "orchestrator_sealed")
 		return false
 	}
 	if o.active == nil {
@@ -234,41 +251,198 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 		}
 		o.rerun[jobID] = true
 		o.mu.Unlock()
+		logScheduling(true, "active_rerun")
 		return true
 	}
 	o.active[jobID] = true
 	if !o.beginWorkerLocked() {
 		delete(o.active, jobID)
 		o.mu.Unlock()
+		logScheduling(false, "worker_lifecycle_closed")
 		return false
 	}
 	o.mu.Unlock()
+	logScheduling(true, "new_worker")
 
 	go func() {
 		defer o.finishWorker()
+		baseCtx := o.gradingBaseContext()
+		stage := ""
+		submissionRef := ""
+		dispatchRef := ""
 		for {
 			reconciledForReplay := false
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						slog.Error("K12 批改任务异步推进 panic（已捕获，任务留在当前落库状态）", "job", jobID, "panic", r)
+						slog.Error("K12 批改任务异步推进 panic（已捕获，任务留在当前落库状态）",
+							"job_ref", jobRef,
+							"panicked", true,
+							"panic_type", fmt.Sprintf("%T", r),
+						)
 					}
 				}()
-				select {
-				case o.sem <- struct{}{}:
-				case <-o.gradingBaseContext().Done():
-					return
+				if agentName != "" {
+					if current, err := o.deps.GetGradingJob(baseCtx, agentName, jobID); err == nil && current.Record != nil {
+						stage = current.Record.Status
+						if current.Fields.SubmissionID != "" {
+							submissionRef = shortSHA1([]byte(current.Fields.SubmissionID))
+							if homework, err := o.deps.Records.GetHomeworkSubmission(
+								baseCtx, agentName, current.Fields.SubmissionID,
+							); err == nil && homework.DispatchID != "" {
+								dispatchRef = shortSHA1([]byte(homework.DispatchID))
+							}
+						}
+					}
 				}
+				queueWaitStarted := time.Now()
+				queueWaitHeartbeat := time.NewTicker(30 * time.Second)
+				acquired := false
+				for !acquired {
+					select {
+					case o.sem <- struct{}{}:
+						acquired = true
+					case <-baseCtx.Done():
+						queueWaitHeartbeat.Stop()
+						slog.Info("K12 GradingJob semaphore wait stopped",
+							"job_ref", jobRef,
+							"dispatch_ref", dispatchRef,
+							"submission_ref", submissionRef,
+							"stage", stage,
+							"elapsed_ms", time.Since(queueWaitStarted).Milliseconds(),
+							"reason", "runtime_cancelled",
+						)
+						return
+					case <-queueWaitHeartbeat.C:
+						slog.Info("K12 GradingJob semaphore wait heartbeat",
+							"job_ref", jobRef,
+							"dispatch_ref", dispatchRef,
+							"submission_ref", submissionRef,
+							"stage", stage,
+							"elapsed_ms", time.Since(queueWaitStarted).Milliseconds(),
+						)
+					}
+				}
+				queueWaitHeartbeat.Stop()
+				slog.Info("K12 GradingJob semaphore acquired",
+					"job_ref", jobRef,
+					"dispatch_ref", dispatchRef,
+					"submission_ref", submissionRef,
+					"stage", stage,
+					"elapsed_ms", time.Since(queueWaitStarted).Milliseconds(),
+				)
 				defer func() { <-o.sem }()
-				view, err := o.RunGradingJob(o.gradingBaseContext(), jobID)
+
+				runStarted := time.Now()
+				slog.Info("K12 GradingJob Run started",
+					"job_ref", jobRef,
+					"dispatch_ref", dispatchRef,
+					"submission_ref", submissionRef,
+					"stage", stage,
+					"elapsed_ms", int64(0),
+				)
+
+				heartbeatCtx, stopHeartbeat := context.WithCancel(baseCtx)
+				heartbeatStopped := make(chan struct{})
+				var stopHeartbeatOnce sync.Once
+				finishHeartbeat := func() {
+					stopHeartbeatOnce.Do(func() {
+						stopHeartbeat()
+						<-heartbeatStopped
+					})
+				}
+				go func() {
+					defer close(heartbeatStopped)
+					ticker := time.NewTicker(30 * time.Second)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-heartbeatCtx.Done():
+							return
+						case <-ticker.C:
+							heartbeatStage := stage
+							heartbeatSubmissionRef := submissionRef
+							questionTotal := 0
+							questionCompleted := 0
+							hasQuestionTotal := false
+							hasQuestionCompleted := false
+							if agentName != "" {
+								if current, err := o.deps.GetGradingJob(
+									heartbeatCtx, agentName, jobID,
+								); err == nil && current.Record != nil {
+									heartbeatStage = current.Record.Status
+									if current.Fields.SubmissionID != "" {
+										heartbeatSubmissionRef = shortSHA1([]byte(current.Fields.SubmissionID))
+										if snapshot, err := o.deps.Records.GetProblemAttemptSnapshot(
+											heartbeatCtx, agentName, current.Fields.SubmissionID,
+										); err == nil {
+											if questions, err := RecognizedQuestionsFromProblemAttemptSnapshot(snapshot); err == nil {
+												questionTotal = len(questions)
+												hasQuestionTotal = true
+											}
+										}
+									}
+									if items, err := o.deps.Records.ListGradingAssessmentItems(
+										heartbeatCtx, agentName, jobID,
+									); err == nil {
+										questionCompleted = len(items)
+										hasQuestionCompleted = true
+									}
+								}
+							}
+							attrs := []any{
+								"job_ref", jobRef,
+								"dispatch_ref", dispatchRef,
+								"submission_ref", heartbeatSubmissionRef,
+								"stage", heartbeatStage,
+								"elapsed_ms", time.Since(runStarted).Milliseconds(),
+							}
+							if hasQuestionTotal {
+								attrs = append(attrs, "questions_total", questionTotal)
+							}
+							if hasQuestionCompleted {
+								attrs = append(attrs, "questions_completed", questionCompleted)
+							}
+							slog.Info("K12 GradingJob Run heartbeat", attrs...)
+						}
+					}
+				}()
+				defer finishHeartbeat()
+
+				view, err := o.RunGradingJob(baseCtx, jobID)
+				finishHeartbeat()
+				finishedStage := stage
+				finishedSubmissionRef := submissionRef
+				terminal := false
+				if view.Record != nil {
+					finishedStage = view.Record.Status
+					terminal = k12.GradingStageTerminal(finishedStage)
+					if view.Fields.SubmissionID != "" {
+						finishedSubmissionRef = shortSHA1([]byte(view.Fields.SubmissionID))
+					}
+				}
+				slog.Info("K12 GradingJob Run finished",
+					"job_ref", jobRef,
+					"dispatch_ref", dispatchRef,
+					"submission_ref", finishedSubmissionRef,
+					"stage", finishedStage,
+					"elapsed_ms", time.Since(runStarted).Milliseconds(),
+					"terminal", terminal,
+					"failed", err != nil,
+				)
 				if err != nil {
 					if errors.Is(err, ErrGradingSourceRecognitionPending) {
 						// Source worker owns the V73 transition. This is a durable
 						// scheduling stop, not a failed model attempt and not a retry.
-						slog.Info("K12 批改任务等待 V73 来源识别结果，保持 assessing", "job", jobID)
+						slog.Info("K12 批改任务等待 V73 来源识别结果，保持 assessing", "job_ref", jobRef)
 					} else {
 						// 阶段失败已由状态机安全落 failed_retryable/failed_terminal；此处仅取证。
-						slog.Warn("K12 批改任务异步推进结束于错误（状态机已落库对应失败态）", "job", jobID, "err", err)
+						slog.Warn("K12 批改任务异步推进结束于错误（状态机已落库对应失败态）",
+							"job_ref", jobRef,
+							"stage", finishedStage,
+							"failed", true,
+							"error_type", fmt.Sprintf("%T", err),
+						)
 					}
 				}
 				if view.Record != nil && view.Record.Status == k12.GradingStageOutcomeUnknown {
@@ -278,7 +452,11 @@ func (o *GradingOrchestrator) StartAsync(jobID string) bool {
 					)
 					if reconcileErr != nil {
 						slog.Warn("K12 批改任务即时结果对账未收敛，保持结果未知且禁止重发",
-							"job", jobID, "stage", view.Fields.FailedStage, "err", reconcileErr)
+							"job_ref", jobRef,
+							"stage", view.Fields.FailedStage,
+							"reconciled", false,
+							"error_type", fmt.Sprintf("%T", reconcileErr),
+						)
 					} else if reconciled && next.Record != nil &&
 						next.Record.Status == k12.GradingStageQueued {
 						reconciledForReplay = true
