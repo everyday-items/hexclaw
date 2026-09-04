@@ -480,7 +480,10 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceImageTask(
 	if err != nil {
 		return false, err
 	}
+	homeworkCompleted := view.HomeworkProjection != nil &&
+		view.HomeworkProjection.Stage == k12.GradingStageCompleted
 	if view.Dispatch.Status == k12.ImageTaskStatusFailed &&
+		!homeworkCompleted &&
 		!view.Dispatch.RetrySafe &&
 		view.ClassificationInvocationStatus != k12.ImageTaskInvocationOutcomeUnknown {
 		failureKind := strings.TrimSpace(view.Dispatch.FailureKind)
@@ -494,6 +497,7 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceImageTask(
 		return err == nil, err
 	}
 	if view.Dispatch.Status == k12.ImageTaskStatusFailed &&
+		!homeworkCompleted &&
 		view.Dispatch.RetrySafe &&
 		bundle.Dispatch.RoutingDecision == k12usecase.InboundPhotoRouteNewSubmission {
 		retryStartedAt := time.Now()
@@ -599,7 +603,10 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceImageTask(
 	}
 	switch view.Dispatch.Status {
 	case k12.ImageTaskStatusFailed:
-		return false, fmt.Errorf("DingTalk inbound photo image task failed")
+		// 子批改任务已完成时直接读取其最终产物，旧的父任务失败态不再触发重试。
+		if !homeworkCompleted {
+			return false, fmt.Errorf("DingTalk inbound photo image task failed")
+		}
 	case k12.ImageTaskStatusCancelled:
 		return true, nil
 	case k12.ImageTaskStatusAwaitingConfirmation:
